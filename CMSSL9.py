@@ -1,12 +1,13 @@
-import os, math, copy, torch, polars as pl, numpy as np
+import os, math, copy, json, csv, zipfile, io, glob
+from collections import deque
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Tuple, Generator, Optional
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
 import math
 from einops import rearrange, repeat
 import torch._functorch.config as ft_config
@@ -401,8 +402,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # ---------------------------  Core hyper-params  ---------------------------
-LOOKBACK        = 120
-BATCH_SIZE      = 256
+LOOKBACK        = 512  # number of tokens spanning ~20s
+BATCH_SIZE      = 64
 DMODEL          = 64
 MAMBA_LAYERS    = 3
 CONV_KERNELS    = [9,17,25,33]
@@ -418,7 +419,21 @@ EPOCHS          = 200
 LR              = 7e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
-FEATURES        = ['Open','High','Low','Close','Volume','VWAP','PCT', 'PastVol_5M']
+BASE_FEATURES   = [
+    'mid','microprice','smartprice','spread',
+    'bid_size','ask_size',
+    'cum_bid_L5','cum_ask_L5','cum_bid_L10','cum_ask_L10',
+    'ofi_l1','ofi_l5',
+    'buy_vol_1s','sell_vol_1s','buy_count_1s','sell_count_1s',
+    'buy_mean_1s','sell_mean_1s','buy_max_1s','sell_max_1s',
+    'quote_count_1s','trade_count_1s',
+    'std_log_mid_100ms','std_log_mid_1s',
+    'ema_microprice_25ms','ema_microprice_100ms','ema_microprice_500ms',
+    'ema_sp_25ms','ema_sp_100ms','ema_sp_500ms',
+    'rsi_microprice_100ms','vpin','daily_rv','ewma7d','ewma30d','var10s_over_ewma7d'
+]
+AUX_FEATURES    = ['dt','is_trade']
+FEATURES        = BASE_FEATURES + AUX_FEATURES
 NUM_HEADS       = 4
 WARMUP_EPOCHS   = max(1, int(EPOCHS * 0.05))  # Warmup over first 5% of epochs
 
@@ -435,7 +450,7 @@ DELTA_RET       = 0.005
 DELTA_LOGVOL    = 0.02
 
 # CPC settings
-CPC_DELTAS_TOK  = [1, 2, 3]  # horizon in tokens; on L2, scale these
+CPC_DELTAS_TOK  = [25, 50, 100]  # token gaps roughly matching short real-time spans
 #---------------------------------------------------------------------------
 
 # ---------------------------  Building blocks  ----------------------------
@@ -908,34 +923,337 @@ class SAM(torch.optim.Optimizer):
         return norm
 
 # ------------------------  Data  --------------------------
-class AAVEDataset(Dataset):
-    def __init__(self, df, features, lookback: int):
-        self.x = df[features].to_numpy()
-        self.y_return = df['Return'].to_numpy()
-        self.y_vol = df['TargetVol'].to_numpy()
-        self.L = lookback
-    def __len__(self):
-        return len(self.x) - self.L + 1
-    def __getitem__(self, idx):
-        return (torch.tensor(self.x[idx:idx + self.L], dtype=torch.float32),
-                torch.tensor([self.y_return[idx + self.L - 1], self.y_vol[idx + self.L - 1]], dtype=torch.float32))
 
-def rebuild_csv():
-    fmt = "%Y-%m-%d %H:%M:%S"
-    df = pl.read_csv("AAVE_minute_data.csv").rename({"open": "Open", "high": "High", "low": "Low",
-                                                     "close": "Close", "volume": "Volume", "vwap": "VWAP"})
-    df = df.with_columns(pl.col("datetime").str.strptime(pl.Datetime, fmt))
-    df = df.with_columns(pl.col("Close").pct_change().alias("PCT"))
-    past_var = (pl.col("PCT").shift(1)**2 + pl.col("PCT").shift(2)**2 + pl.col("PCT").shift(3)**2 + pl.col("PCT").shift(4)**2 + pl.col("PCT").shift(5)**2) / 5
-    df = df.with_columns(past_var.sqrt().alias("PastVol_5M"))
-    df = df.with_columns((pl.col("Volume") / (pl.col("VWAP") + 1e-8)).map_elements(lambda v: math.log(1 + v), return_dtype=pl.Float32).alias("Volume"))
-    df = df.with_columns(pl.col("VWAP").map_elements(lambda v: math.log(1 + v), return_dtype=pl.Float32).alias("VWAP"))
-    df = df.with_row_index("idx")
-    df = df.with_columns((pl.col("Close").shift(-5) / pl.col("Close") - 1).alias("Return"))
-    future_var = (pl.col("PCT").shift(-1)**2 + pl.col("PCT").shift(-2)**2 + pl.col("PCT").shift(-3)**2 + pl.col("PCT").shift(-4)**2 + pl.col("PCT").shift(-5)**2) / 5
-    df = df.with_columns(future_var.sqrt().alias("FutureVol"))
-    df = df.with_columns(pl.col("FutureVol").map_elements(lambda v: math.log(v + 1e-8), return_dtype=pl.Float32).alias("TargetVol"))
-    return df.filter(pl.col("PCT").is_not_null() & pl.col("Return").is_not_null() & pl.col("TargetVol").is_not_null() & pl.col("PastVol_5M").is_not_null())
+"""Event-driven data pipeline for Bybit L2 order book and trade history."""
+
+# --------------------  Data ingestion & merging  ---------------------
+
+class BybitRawIter:
+    """Iterate over Bybit L2 order book (.data) and trade history (.csv) files."""
+
+    def __init__(self, ob_zip: str, th_zip: str):
+        self.ob_zip = ob_zip
+        self.th_zip = th_zip
+
+    def ob_iter(self) -> Generator[Tuple[int, int, dict], None, None]:
+        with zipfile.ZipFile(self.ob_zip) as z:
+            name = z.namelist()[0]
+            with z.open(name) as f:
+                for line in f:
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    ts = int(obj.get("ts", obj.get("cts", 0)))
+                    seq = obj["data"].get("seq", 0)
+                    yield ts, seq, obj
+
+    def trade_iter(self) -> Generator[Tuple[int, int, dict], None, None]:
+        with zipfile.ZipFile(self.th_zip) as z:
+            name = z.namelist()[0]
+            with z.open(name) as f:
+                reader = csv.DictReader(io.TextIOWrapper(f))
+                seq = 0
+                for row in reader:
+                    seq += 1
+                    ts = int(float(row["timestamp"]) * 1000)
+                    row["seq"] = seq
+                    yield ts, seq, row
+
+
+def merge_event_time(ob_iter: Generator[Tuple[int, int, dict], None, None],
+                     tr_iter: Generator[Tuple[int, int, dict], None, None]) -> Generator[Tuple[str, int, int, dict], None, None]:
+    """Merge OB and trade iterators by timestamp and sequence."""
+    ob_item = next(ob_iter, None)
+    tr_item = next(tr_iter, None)
+    last_ts = -1
+    while ob_item or tr_item:
+        if tr_item is None or (ob_item and ob_item[0] <= tr_item[0]):
+            ts, seq, data = ob_item
+            ob_item = next(ob_iter, None)
+            etype = "ob"
+        else:
+            ts, seq, data = tr_item
+            tr_item = next(tr_iter, None)
+            etype = "trade"
+        if ts < last_ts:
+            raise ValueError("Non-monotonic timestamps in event stream")
+        last_ts = ts
+        yield etype, ts, seq, data
+
+
+# ---------------------  Rolling normalization  ---------------------
+
+class RollingZScore:
+    def __init__(self, window_ms: int = 60000):
+        self.window = window_ms
+        self.buf = deque()
+        self.sum = None
+        self.sumsq = None
+
+    def update(self, x: np.ndarray, t: int) -> np.ndarray:
+        x = x.astype(np.float32)
+        if self.sum is None:
+            self.sum = np.zeros_like(x)
+            self.sumsq = np.zeros_like(x)
+        self.buf.append((t, x))
+        self.sum += x
+        self.sumsq += x * x
+        while self.buf and t - self.buf[0][0] > self.window:
+            _, x0 = self.buf.popleft()
+            self.sum -= x0
+            self.sumsq -= x0 * x0
+        n = max(1, len(self.buf))
+        mean = self.sum / n
+        var = self.sumsq / n - mean * mean
+        std = np.sqrt(np.clip(var, 1e-6, None))
+        return (x - mean) / std
+
+
+# -------------------------  Feature engine  -------------------------
+
+class FeatureEngine:
+    """Maintain in-memory state and compute features on each event."""
+
+    def __init__(self, depth: int = 10):
+        self.depth = depth
+        self.bids: Dict[float, float] = {}
+        self.asks: Dict[float, float] = {}
+        self.trades = deque()
+        self.quotes = deque()
+        self.mid_history = deque()
+        self.prev_bid_size = self.prev_ask_size = 0.0
+        self.last_ts: Optional[int] = None
+        self.ema_mp_25 = self.ema_mp_100 = self.ema_mp_500 = None
+        self.ema_sp_25 = self.ema_sp_100 = self.ema_sp_500 = None
+        self.rsi_gain = self.rsi_loss = None
+        self.vpin_window = deque()
+        self.daily_rv = self.ewma7d = self.ewma30d = 0.0
+
+    def _prune(self, deq: deque, t: int, window: int):
+        while deq and t - deq[0][0] > window:
+            deq.popleft()
+
+    def _book_best(self):
+        bid = max(self.bids.keys()) if self.bids else 0.0
+        ask = min(self.asks.keys()) if self.asks else 0.0
+        bsz = self.bids.get(bid, 0.0)
+        asz = self.asks.get(ask, 0.0)
+        return bid, ask, bsz, asz
+
+    def _update_book(self, data: dict):
+        tp = data.get("type")
+        bids = data["data"].get("b", [])
+        asks = data["data"].get("a", [])
+        if tp == "snapshot":
+            self.bids = {float(p): float(q) for p, q in bids[:self.depth]}
+            self.asks = {float(p): float(q) for p, q in asks[:self.depth]}
+        else:
+            for p, q in bids:
+                p = float(p); q = float(q)
+                if q == 0:
+                    self.bids.pop(p, None)
+                else:
+                    self.bids[p] = q
+            for p, q in asks:
+                p = float(p); q = float(q)
+                if q == 0:
+                    self.asks.pop(p, None)
+                else:
+                    self.asks[p] = q
+
+    def on_event(self, etype: str, data: dict, ts: int) -> float:
+        if etype == "ob":
+            self.quotes.append((ts, 1))
+            self._update_book(data)
+        else:
+            side = data["side"].lower()
+            qty = float(data["size"])
+            price = float(data["price"])
+            self.trades.append((ts, side, qty, price))
+
+        bid, ask, bsz, asz = self._book_best()
+        mid = (bid + ask) / 2 if bid and ask else 0.0
+        mp = (ask * bsz + bid * asz) / (bsz + asz + 1e-8)
+        sp = (ask / (asz + 1e-8) + bid / (bsz + 1e-8)) / (1 / (asz + 1e-8) + 1 / (bsz + 1e-8))
+        spr = ask - bid
+
+        dt = 0 if self.last_ts is None else max(1, ts - self.last_ts)
+        for attr, val, halflife in [
+            ("ema_mp_25", mp, 25),
+            ("ema_mp_100", mp, 100),
+            ("ema_mp_500", mp, 500),
+            ("ema_sp_25", spr, 25),
+            ("ema_sp_100", spr, 100),
+            ("ema_sp_500", spr, 500),
+        ]:
+            cur = getattr(self, attr)
+            alpha = 1 - math.exp(-dt / halflife)
+            setattr(self, attr, (1 - alpha) * (cur if cur is not None else val) + alpha * val)
+
+        delta_mp = mp - (self.mid_history[-1][1] if self.mid_history else mp)
+        gain = max(delta_mp, 0.0)
+        loss = max(-delta_mp, 0.0)
+        alpha_rsi = 1 - math.exp(-dt / 100)
+        self.rsi_gain = (1 - alpha_rsi) * (self.rsi_gain or 0.0) + alpha_rsi * gain
+        self.rsi_loss = (1 - alpha_rsi) * (self.rsi_loss or 0.0) + alpha_rsi * loss
+
+        self.mid_history.append((ts, mid))
+        self.last_ts = ts
+        return mid
+
+    def snapshot(self, ts: int) -> np.ndarray:
+        lookback_ms = 20000
+        self._prune(self.trades, ts, lookback_ms)
+        self._prune(self.quotes, ts, lookback_ms)
+        self._prune(self.mid_history, ts, 20000)
+
+        bid, ask, bsz, asz = self._book_best()
+        mid = (bid + ask) / 2 if bid and ask else 0.0
+        mp = (ask * bsz + bid * asz) / (bsz + asz + 1e-8)
+        sp = (ask / (asz + 1e-8) + bid / (bsz + 1e-8)) / (1 / (asz + 1e-8) + 1 / (bsz + 1e-8))
+        spr = ask - bid
+
+        def cum_depth(book: Dict[float, float], reverse: bool, n: int) -> float:
+            prices = sorted(book.keys(), reverse=reverse)[:n]
+            return sum(book[p] for p in prices)
+
+        cum_bid5 = cum_depth(self.bids, True, 5)
+        cum_ask5 = cum_depth(self.asks, False, 5)
+        cum_bid10 = cum_depth(self.bids, True, 10)
+        cum_ask10 = cum_depth(self.asks, False, 10)
+
+        ofi_l1 = (bsz - self.prev_bid_size) - (asz - self.prev_ask_size)
+        ofi_l5 = (cum_bid5 - self.prev_bid_size) - (cum_ask5 - self.prev_ask_size)
+        self.prev_bid_size, self.prev_ask_size = bsz, asz
+
+        self._prune(self.trades, ts, 1000)
+        buys = [q for t, s, q, p in self.trades if s == 'buy']
+        sells = [q for t, s, q, p in self.trades if s == 'sell']
+        buy_vol = sum(buys)
+        sell_vol = sum(sells)
+        buy_count = len(buys)
+        sell_count = len(sells)
+        buy_mean = buy_vol / buy_count if buy_count else 0.0
+        sell_mean = sell_vol / sell_count if sell_count else 0.0
+        buy_max = max(buys) if buys else 0.0
+        sell_max = max(sells) if sells else 0.0
+
+        self._prune(self.quotes, ts, 1000)
+        quote_count = len(self.quotes)
+        trade_count = len(self.trades)
+
+        self._prune(self.mid_history, ts, 1000)
+        mids_1s = [m for t, m in self.mid_history]
+        logrets = np.diff(np.log(mids_1s)) if len(mids_1s) > 1 else np.array([0.0])
+        std_1s = float(np.std(logrets))
+        self._prune(self.mid_history, ts, 100)
+        mids_100 = [m for t, m in self.mid_history]
+        logrets100 = np.diff(np.log(mids_100)) if len(mids_100) > 1 else np.array([0.0])
+        std_100 = float(np.std(logrets100))
+
+        rs = self.rsi_gain / (self.rsi_loss + 1e-8)
+        rsi = 100 - 100 / (1 + rs)
+
+        self.vpin_window.append((ts, buy_vol - sell_vol))
+        self._prune(self.vpin_window, ts, 1000)
+        vpin = (sum(abs(v) for _, v in self.vpin_window) / (sum(abs(v) for _, v in self.vpin_window) + 1e-8))
+
+        ret = 0.0 if len(self.mid_history) < 2 else math.log(mid / self.mid_history[-2][1])
+        self.daily_rv = 0.9995 * self.daily_rv + 0.0005 * ret * ret
+        self.ewma7d = 0.9999 * self.ewma7d + 0.0001 * ret * ret
+        self.ewma30d = 0.99997 * self.ewma30d + 0.00003 * ret * ret
+        var10s = ret * ret
+        var_ratio = var10s / (self.ewma7d + 1e-8)
+
+        feat = np.array([
+            mid, mp, sp, spr,
+            bsz, asz,
+            cum_bid5, cum_ask5, cum_bid10, cum_ask10,
+            ofi_l1, ofi_l5,
+            buy_vol, sell_vol, buy_count, sell_count,
+            buy_mean, sell_mean, buy_max, sell_max,
+            quote_count, trade_count,
+            std_100, std_1s,
+            self.ema_mp_25 or mp, self.ema_mp_100 or mp, self.ema_mp_500 or mp,
+            self.ema_sp_25 or spr, self.ema_sp_100 or spr, self.ema_sp_500 or spr,
+            rsi, vpin, self.daily_rv, self.ewma7d, self.ewma30d, var_ratio
+        ], dtype=np.float32)
+        return feat
+
+
+class LabelBuilder:
+    def __init__(self, delta_ms: int = 5, horizon_ms: int = 1000):
+        self.delta = delta_ms
+        self.horizon = horizon_ms
+        self.wait_delta = deque()
+        self.wait_horizon = deque()
+
+    def on_decision(self, t: int):
+        self.wait_delta.append({'t': t, 't_delta': t + self.delta})
+
+    def on_event(self, t: int, mid: float) -> List[Tuple[int, float]]:
+        matured = []
+        while self.wait_delta and t >= self.wait_delta[0]['t_delta']:
+            item = self.wait_delta.popleft()
+            item['mid0'] = mid
+            item['t_mature'] = item['t_delta'] + self.horizon
+            self.wait_horizon.append(item)
+        while self.wait_horizon and t >= self.wait_horizon[0]['t_mature']:
+            item = self.wait_horizon.popleft()
+            ret = math.log(mid / item['mid0'])
+            matured.append((item['t'], ret))
+        return matured
+
+
+class HFTDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.float32)
+
+    def __len__(self) -> int:
+        return len(self.X)
+
+    def __getitem__(self, idx: int):
+        return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
+
+
+def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndarray]:
+    fe = FeatureEngine()
+    normalizer = RollingZScore()
+    labeler = LabelBuilder()
+    tokens = deque(maxlen=LOOKBACK)
+    pending = deque()
+    X_list, y_list = [], []
+    last_ts = None
+
+    for ob_zip, th_zip in week_files:
+        raw = BybitRawIter(ob_zip, th_zip)
+        merged = merge_event_time(raw.ob_iter(), raw.trade_iter())
+        for etype, ts, seq, data in merged:
+            mid = fe.on_event(etype, data, ts)
+            feat = fe.snapshot(ts)
+            norm_feat = normalizer.update(feat, ts)
+            dt = 0.0 if last_ts is None else (ts - last_ts) / 1000.0
+            last_ts = ts
+            aux = np.array([dt, 1.0 if etype == 'trade' else 0.0], dtype=np.float32)
+            token = np.concatenate([norm_feat, aux])
+            tokens.append(token)
+            matured = labeler.on_event(ts, mid)
+            while pending and matured and pending[0][0] <= matured[0][0]:
+                t0, seq_arr = pending.popleft()
+                for mt in matured:
+                    if mt[0] == t0:
+                        ret = mt[1]
+                        X_list.append(seq_arr)
+                        y_list.append([ret, math.log(abs(ret) + 1e-8)])
+                        matured.remove(mt)
+                        break
+            if len(tokens) == LOOKBACK:
+                seq_arr = np.stack(tokens, axis=0)
+                labeler.on_decision(ts)
+                pending.append((ts, seq_arr))
+    return np.array(X_list), np.array(y_list)
+
 
 # --------------------  Utils: EMA-normalized losses + Huber  ---------------------
 def huber_loss(pred: torch.Tensor, target: torch.Tensor, delta: float) -> torch.Tensor:
@@ -958,28 +1276,28 @@ def get_mask_ratio(epoch: int) -> float:
 
 def train_and_evaluate():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    df = rebuild_csv()
-    total = len(df)
-    tr, val = int(0.7 * total), int(0.85 * total)
-    scaler = StandardScaler().fit(df[:tr][FEATURES].to_numpy())
-    df_train = df[:tr].with_columns(pl.DataFrame(scaler.transform(df[:tr][FEATURES].to_numpy()), schema=FEATURES))
-    df_val = df[tr:val].with_columns(pl.DataFrame(scaler.transform(df[tr:val][FEATURES].to_numpy()), schema=FEATURES))
-    df_test = df[val:].with_columns(pl.DataFrame(scaler.transform(df[val:][FEATURES].to_numpy()), schema=FEATURES))
 
-    num_pos_train = (df_train['Return'] > 0).sum()
-    print(f"Train positive returns: {num_pos_train} / {len(df_train)} ({num_pos_train / len(df_train):.2%})")
-    num_pos_val = (df_val['Return'] > 0).sum()
-    print(f"Val positive returns: {num_pos_val} / {len(df_val)} ({num_pos_val / len(df_val):.2%})")
-    num_pos_test = (df_test['Return'] > 0).sum()
-    print(f"Test positive returns: {num_pos_test} / {len(df_test)} ({num_pos_test / len(df_test):.2%})")
+    ob_files = sorted(glob.glob(os.path.expanduser("~/BTCUSDT_OB_*.zip")))
+    th_files = sorted(glob.glob(os.path.expanduser("~/BTCUSDT_TH_*.zip")))
+    week_files = list(zip(ob_files, th_files))
+    X, y = stream_bybit(week_files)
+    total = len(X)
+    tr, val = int(0.6 * total), int(0.8 * total)
 
-    ds_train = AAVEDataset(df_train, FEATURES, LOOKBACK)
-    ds_val = AAVEDataset(df_val, FEATURES, LOOKBACK)
-    ds_test = AAVEDataset(df_test, FEATURES, LOOKBACK)
+    ds_train = HFTDataset(X[:tr], y[:tr])
+    ds_val = HFTDataset(X[tr:val], y[tr:val])
+    ds_test = HFTDataset(X[val:], y[val:])
 
-    dl_train = DataLoader(ds_train, BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=4)
-    dl_val   = DataLoader(ds_val,   BATCH_SIZE, shuffle=False, num_workers=8)
-    dl_test  = DataLoader(ds_test,  BATCH_SIZE, shuffle=False, num_workers=8)
+    num_pos_train = int((y[:tr,0] > 0).sum())
+    print(f"Train positive returns: {num_pos_train} / {tr} ({num_pos_train / max(tr,1):.2%})")
+    num_pos_val = int((y[tr:val,0] > 0).sum())
+    print(f"Val positive returns: {num_pos_val} / {val - tr} ({num_pos_val / max(val - tr,1):.2%})")
+    num_pos_test = int((y[val:,0] > 0).sum())
+    print(f"Test positive returns: {num_pos_test} / {total - val} ({num_pos_test / max(total - val,1):.2%})")
+
+    dl_train = DataLoader(ds_train, BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=4)
+    dl_val   = DataLoader(ds_val,   BATCH_SIZE, shuffle=False, num_workers=4)
+    dl_test  = DataLoader(ds_test,  BATCH_SIZE, shuffle=False, num_workers=4)
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, len(FEATURES), LOOKBACK)
     model = SAMBA(args).to(device)
