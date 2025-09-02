@@ -1873,61 +1873,86 @@ def train_and_evaluate():
 
         # =====================  Validation  =====================
         model.eval()
-        val_logits_all, val_ypos_all = [], []
-        val_ret_loss_sum = 0.0
-        val_vol_loss_sum = 0.0
-        val_sample_total = 0
-        val_acc_sum = 0
-        val_total = 0
 
-        with torch.no_grad():
-            for x, y_targets in dl_val:
-                x = x.to(device)
-                y_return = y_targets[:, 0].to(device)
-                y_logvol = y_targets[:, 1].to(device)
+        if is_ssl_pretrain:
+            # During SSL pretraining, only track unsupervised losses
+            val_recon_sum = 0.0
+            val_cpc_sum = 0.0
+            val_batches = 0
 
-                ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
+            with torch.no_grad():
+                for x, _ in dl_val:
+                    x = x.to(device)
+                    _, _, _, h_clean, h_masked, mask_idx, cpc_loss = model(x, mask_ratio=mratio)
 
-                # Huber losses (per-sample), accumulate weighted by batch size
-                batch_ret_loss = huber_loss(ret_pred, y_return, DELTA_RET).item()
-                batch_vol_loss = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL).item()
-                batch_n = x.size(0)
-                val_ret_loss_sum += batch_ret_loss * batch_n
-                val_vol_loss_sum += batch_vol_loss * batch_n
-                val_sample_total += batch_n
+                    B = x.size(0)
+                    batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, mask_idx.shape[1])
+                    recon = F.mse_loss(h_masked[batch_idx, mask_idx], h_clean.detach()[batch_idx, mask_idx])
+                    val_recon_sum += recon.item()
+                    val_cpc_sum += cpc_loss.item()
+                    val_batches += 1
 
-                # AUC collection
-                val_logits_all.append(dir_pred_logits.view(-1).detach().cpu())
-                val_ypos_all.append((y_return > 0).to(torch.int32).view(-1).cpu())
+            avg_recon = val_recon_sum / max(1, val_batches)
+            avg_cpc = val_cpc_sum / max(1, val_batches)
+            print(f"val_recon={avg_recon:.4e}, val_cpc={avg_cpc:.4e}")
 
-                # Accuracy (flatten to avoid broadcasting surprises)
-                logits_flat = dir_pred_logits.view(-1)
-                predicted_class = (logits_flat > 0).to(torch.int32)
-                true_class = (y_return > 0).to(torch.int32).view(-1)
-                val_acc_sum += (predicted_class == true_class).sum().item()
-                val_total   += true_class.numel()
+        else:
+            # Full supervised validation during fine-tuning
+            val_logits_all, val_ypos_all = [], []
+            val_ret_loss_sum = 0.0
+            val_vol_loss_sum = 0.0
+            val_sample_total = 0
+            val_acc_sum = 0
+            val_total = 0
 
-        avg_val_ret_loss = val_ret_loss_sum / max(1, val_sample_total)
-        avg_val_vol_loss = val_vol_loss_sum / max(1, val_sample_total)
-        val_accuracy = val_acc_sum / max(1, val_total)
-        val_logits_all = torch.cat(val_logits_all)
-        val_ypos_all   = torch.cat(val_ypos_all)
-        val_auc = binary_auc_from_logits(val_logits_all, val_ypos_all)
-        print(f"val_ret_huber={avg_val_ret_loss:.4e}, val_logvol_huber={avg_val_vol_loss:.4e}, "
-            f"val_acc={val_accuracy:.4f}, val_auc={val_auc:.4f}")
+            with torch.no_grad():
+                for x, y_targets in dl_val:
+                    x = x.to(device)
+                    y_return = y_targets[:, 0].to(device)
+                    y_logvol = y_targets[:, 1].to(device)
 
-        scheduler.step(avg_val_ret_loss)
-        if avg_val_ret_loss < best and not is_ssl_pretrain:
-            best = avg_val_ret_loss
-            print(f"New best validation loss (return Huber): {best:.4e}")
-            no_imp = 0
-            torch.save(model.state_dict(), 'best.pth')
-        elif not is_ssl_pretrain:
-            no_imp += 1
-            print(f"no improve {no_imp}/{PATIENCE}")
-            if no_imp >= PATIENCE:
-                print("Early stopping triggered.")
-                break
+                    ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
+
+                    # Huber losses (per-sample), accumulate weighted by batch size
+                    batch_ret_loss = huber_loss(ret_pred, y_return, DELTA_RET).item()
+                    batch_vol_loss = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL).item()
+                    batch_n = x.size(0)
+                    val_ret_loss_sum += batch_ret_loss * batch_n
+                    val_vol_loss_sum += batch_vol_loss * batch_n
+                    val_sample_total += batch_n
+
+                    # AUC collection
+                    val_logits_all.append(dir_pred_logits.view(-1).detach().cpu())
+                    val_ypos_all.append((y_return > 0).to(torch.int32).view(-1).cpu())
+
+                    # Accuracy (flatten to avoid broadcasting surprises)
+                    logits_flat = dir_pred_logits.view(-1)
+                    predicted_class = (logits_flat > 0).to(torch.int32)
+                    true_class = (y_return > 0).to(torch.int32).view(-1)
+                    val_acc_sum += (predicted_class == true_class).sum().item()
+                    val_total   += true_class.numel()
+
+            avg_val_ret_loss = val_ret_loss_sum / max(1, val_sample_total)
+            avg_val_vol_loss = val_vol_loss_sum / max(1, val_sample_total)
+            val_accuracy = val_acc_sum / max(1, val_total)
+            val_logits_all = torch.cat(val_logits_all)
+            val_ypos_all   = torch.cat(val_ypos_all)
+            val_auc = binary_auc_from_logits(val_logits_all, val_ypos_all)
+            print(f"val_ret_huber={avg_val_ret_loss:.4e}, val_logvol_huber={avg_val_vol_loss:.4e}, "
+                  f"val_acc={val_accuracy:.4f}, val_auc={val_auc:.4f}")
+
+            scheduler.step(avg_val_ret_loss)
+            if avg_val_ret_loss < best and not is_ssl_pretrain:
+                best = avg_val_ret_loss
+                print(f"New best validation loss (return Huber): {best:.4e}")
+                no_imp = 0
+                torch.save(model.state_dict(), 'best.pth')
+            else:
+                no_imp += 1
+                print(f"no improve {no_imp}/{PATIENCE}")
+                if no_imp >= PATIENCE:
+                    print("Early stopping triggered.")
+                    break
 
 
     # =====================  Test  =====================
