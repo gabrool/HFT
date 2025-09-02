@@ -676,10 +676,11 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         self.depatch = DepatchSampling(in_feats=in_feats, seq_len=seq_len, patch_size=patch_size, stride=stride)
         self.patch_count = (seq_len - patch_size) // stride + 1
         self.patch_size = patch_size
-        self.d_model_internal = d_model // in_feats
+        self.d_model_internal = max(1, d_model // in_feats)
         self.output_linear = nn.Linear(patch_size, self.d_model_internal)
-        self.encoder = ConvEncoder(d_model=self.d_model_internal, d_ff=d_ff, kernel_size=dw_ks, dropout=dropout, activation=act, 
+        self.encoder = ConvEncoder(d_model=self.d_model_internal, d_ff=d_ff, kernel_size=dw_ks, dropout=dropout, activation=act,
                                    n_layers=n_layers, enable_res_param=enable_res_param, norm=norm, re_param=re_param, small_ks=re_param_kernel)
+        self.final_proj = nn.Linear(self.d_model_internal * in_feats, d_model)
     def forward(self, x):
         out_patch = self.depatch(x)  # [B, feats, patch_count, patch_size]
         out = self.output_linear(out_patch)  # [B, feats, patch_count, d_model_internal]
@@ -690,7 +691,8 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         out = out.permute(0, 2, 1)  # [B * feats, patch_count, d_model_internal]
         out = out.reshape(B, out.shape[0] // B, out.shape[1], self.d_model_internal)  # [B, feats, patch_count, d_model_internal]
         out = out.permute(0, 2, 3, 1)  # [B, patch_count, d_model_internal, feats]
-        out = out.reshape(B, self.depatch.patch_count, self.d_model_internal * out.shape[3])  # [B, patch_count, d_model]
+        out = out.reshape(B, self.depatch.patch_count, self.d_model_internal * out.shape[3])  # [B, patch_count, d_model_internal * feats]
+        out = self.final_proj(out)  # [B, patch_count, d_model]
         return out
 
 # ------------  Mamba wrapper + pooling ------------
@@ -851,7 +853,7 @@ class SAMBA(nn.Module):
         Eval path returns predictions only.
         """
         x_permuted = x.permute(0, 2, 1)
-        h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D]
+        h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
 
         # Student (clean)
         pooled, h_clean = self.mamba(h_tokens, embedded=True)
