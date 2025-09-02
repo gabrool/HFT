@@ -844,7 +844,7 @@ class SAMBA(nn.Module):
         return total / count
 
 
-    def forward(self, x, mask_ratio=0.0):
+    def forward(self, x, mask_ratio=0.0, mask_idx: torch.Tensor = None):
         """
         Training path returns: pooled, ret_pred, vol_pred, dir_logits, 
         h_clean (student), h_masked (student on masked input), mask_idx, cpc_loss.
@@ -865,8 +865,13 @@ class SAMBA(nn.Module):
 
         # Masked pass (student) for reconstruction distillation in Mamba space
         B, L, D = h_tokens.shape
-        mcnt = max(1, int(mask_ratio * L))
-        mask_idx = torch.stack([torch.randperm(L, device=x.device)[:mcnt] for _ in range(B)])  # [B, mcnt]
+        if mask_idx is None:
+            mcnt = max(1, int(mask_ratio * L))
+            mask_idx = torch.stack(
+                [torch.randperm(L, device=x.device)[:mcnt] for _ in range(B)]
+            )  # [B, mcnt]
+        else:
+            mcnt = mask_idx.shape[1]
         h_masked_input = h_tokens.clone()
         batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, mcnt)
         h_masked_input[batch_idx, mask_idx] = self.mask_token  # replace masked tokens
@@ -1820,7 +1825,7 @@ def train_and_evaluate():
             opt.first_step(zero_grad=True)
 
             # ========== SAM pass #2 ==========
-            ret_pred2, vol_pred2, dir_pred_logits2, h_clean2, h_masked2, _, cpc_loss2 = model(x, mask_ratio=mratio)
+            ret_pred2, vol_pred2, dir_pred_logits2, h_clean2, h_masked2, _, cpc_loss2 = model(x, mask_ratio=mratio, mask_idx=mask_idx)
 
             # Use original mask_idx from pass #1 to align recon targets
             recon2 = F.mse_loss(h_masked2[batch_idx, mask_idx], h_clean2.detach()[batch_idx, mask_idx])
