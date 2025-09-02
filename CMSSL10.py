@@ -804,31 +804,30 @@ class SAMBA(nn.Module):
         for p_t, p_s in zip(self.mamba_teacher.parameters(), self.mamba.parameters()):
             p_t.data.mul_(m).add_(p_s.data, alpha=(1.0 - m))
 
-    def compute_cpc_loss(self, h_clean: torch.Tensor, h_teacher: torch.Tensor, x_tokens: torch.Tensor) -> torch.Tensor:
-        # x_tokens: [B, L, F]; last 3 features are [dt_ms, is_trade, events_100ms]
-        dt = x_tokens[..., -3].clamp_min(0.0)  # [B,L]
-        cum_t = torch.cumsum(dt, dim=1)  # ms from left to right inside sequence
+    def compute_cpc_loss(self, h_clean: torch.Tensor, h_teacher: torch.Tensor, dt_patch: torch.Tensor) -> torch.Tensor:
+        # dt_patch: [B, P] patch-level time deltas
+        cum_t = torch.cumsum(dt_patch, dim=1)  # ms from left to right in patch space
 
         total = 0.0
         count = 0
-        B, L, D = h_clean.shape
+        B, P, D = h_clean.shape
         for dms in CPC_DELTAS_MS:
             # For each (b, i), we need j >= i with cum_t[b,j] - cum_t[b,i] >= dms
             # Build j by scanning once per sequence via broadcasting
-            t_i = cum_t.unsqueeze(2)                # [B,L,1]
-            t_j = cum_t.unsqueeze(1)                # [B,1,L]
+            t_i = cum_t.unsqueeze(2)                # [B,P,1]
+            t_j = cum_t.unsqueeze(1)                # [B,1,P]
             # mask of valid targets
             valid = (t_j - t_i) >= dms
             # take first True along last dim
-            idx_j = valid.float().argmax(dim=2)     # [B,L] (argmax=0 if none; handle via mask)
+            idx_j = valid.float().argmax(dim=2)     # [B,P] (argmax=0 if none; handle via mask)
             has = valid.any(dim=2)
             # gather teacher targets at j
-            gather_j = idx_j.clamp(max=L-1)
-            b_idx = torch.arange(B, device=h_clean.device).unsqueeze(-1).expand(B,L)
-            h_tgt = h_teacher[b_idx, gather_j]  # [B,L,D]
-            proj = self.cpc_predictors[f"ms{dms}"](h_clean)  # [B,L,D]
+            gather_j = idx_j
+            b_idx = torch.arange(B, device=h_clean.device).unsqueeze(-1).expand(B, P)
+            h_tgt = h_teacher[b_idx, gather_j]  # [B,P,D]
+            proj = self.cpc_predictors[f"ms{dms}"](h_clean)  # [B,P,D]
             # InfoNCE-like cosine distance with stop-grad target
-            loss = 1.0 - F.cosine_similarity(proj, h_tgt.detach(), dim=-1)  # [B,L]
+            loss = 1.0 - F.cosine_similarity(proj, h_tgt.detach(), dim=-1)  # [B,P]
             total += (loss * has.float()).sum()
             count += has.float().sum().clamp_min(1.0)
         return total / count
@@ -842,6 +841,10 @@ class SAMBA(nn.Module):
         """
         x_permuted = x.permute(0, 2, 1)
         h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
+        dt_raw = x[..., -3].clamp_min(0.0)
+        ps = self.depatch_proj_encoder.depatch.patch_size
+        stride = self.depatch_proj_encoder.depatch.box_coder.patch_stride
+        dt_patch = dt_raw.unfold(1, ps, stride).sum(-1)
 
         # Student (clean)
         pooled, h_clean = self.mamba(h_tokens, embedded=True)
@@ -869,7 +872,7 @@ class SAMBA(nn.Module):
         _, h_masked = self.mamba(h_masked_input, embedded=True)
 
         # CPC loss (computed here so both SAM passes align)
-        cpc_loss = self.compute_cpc_loss(h_clean, h_teacher_clean, x)
+        cpc_loss = self.compute_cpc_loss(h_clean, h_teacher_clean, dt_patch)
 
         return ret, vol, dir_logits, h_clean, h_masked, mask_idx, cpc_loss
 
