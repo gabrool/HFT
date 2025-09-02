@@ -421,21 +421,9 @@ EPOCHS          = 200
 LR              = 7e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
-BASE_FEATURES   = [
-    'mid','microprice','smartprice','spread',
-    'bid_size','ask_size',
-    'cum_bid_L5','cum_ask_L5','cum_bid_L10','cum_ask_L10',
-    'ofi_l1','ofi_l5',
-    'buy_vol_1s','sell_vol_1s','buy_count_1s','sell_count_1s',
-    'buy_mean_1s','sell_mean_1s','buy_max_1s','sell_max_1s',
-    'quote_count_1s','trade_count_1s',
-    'std_log_mid_100ms','std_log_mid_1s',
-    'ema_microprice_25ms','ema_microprice_100ms','ema_microprice_500ms',
-    'ema_sp_25ms','ema_sp_100ms','ema_sp_500ms',
-    'rsi_microprice_100ms','vpin','daily_rv','ewma7d','ewma30d','var10s_over_ewma7d'
-]
-AUX_FEATURES    = ['dt','is_trade','events_100ms']
-FEATURES        = BASE_FEATURES + AUX_FEATURES
+# Number of auxiliary channels appended after the base feature vector
+# These correspond to [dt_ms, is_trade, events_100ms]
+AUX_DIM        = 3
 NUM_HEADS       = 4
 WARMUP_EPOCHS   = max(1, int(EPOCHS * 0.05))  # Warmup over first 5% of epochs
 
@@ -1095,6 +1083,12 @@ class FeatureEngine:
         self.z_m2: Optional[np.ndarray] = None  # EWMA of x^2 (for var = m2 - mean^2)
         self._feat_dim: Optional[int] = None
 
+    def feature_dim(self) -> int:
+        """Return feature dimension including auxiliary channels."""
+        if self._feat_dim is None:
+            raise ValueError("Feature dimension unknown before first event")
+        return self._feat_dim + AUX_DIM
+
     # -------------------------------------------------------------------------
     # Helpers (kept inside the class)
     # -------------------------------------------------------------------------
@@ -1675,11 +1669,17 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
     # At the end there may be some pending sequences without matured labels
     # (e.g., decisions near the file tail). We drop those quietly.
     if len(X_list) == 0:
-        return np.empty((0, LOOKBACK, 0), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+        feat_dim = fe.feature_dim() if fe._feat_dim is not None else 0
+        return (
+            np.empty((0, LOOKBACK, 0), dtype=np.float32),
+            np.empty((0, 2), dtype=np.float32),
+            feat_dim,
+        )
 
     X = np.stack(X_list, axis=0).astype(np.float32)  # [N, L, F]
     Y = np.stack(y_list, axis=0).astype(np.float32)  # [N, 2] -> [return, log-vol or your 2nd target]
-    return X, Y
+    feat_dim = fe.feature_dim()
+    return X, Y, feat_dim
 
 
 # --------------------  Utils: EMA-normalized losses + Huber  ---------------------
@@ -1726,7 +1726,7 @@ def train_and_evaluate():
     ob_files = sorted(glob.glob(os.path.expanduser("~/BTCUSDT_OB_*.zip")))
     th_files = sorted(glob.glob(os.path.expanduser("~/BTCUSDT_TH_*.zip")))
     week_files = list(zip(ob_files, th_files))
-    X, y = stream_bybit(week_files)
+    X, y, feat_dim = stream_bybit(week_files)
     total = len(X)
     tr, val = int(0.6 * total), int(0.8 * total)
 
@@ -1745,7 +1745,8 @@ def train_and_evaluate():
     dl_val   = DataLoader(ds_val,   BATCH_SIZE, shuffle=False, num_workers=4)
     dl_test  = DataLoader(ds_test,  BATCH_SIZE, shuffle=False, num_workers=4)
 
-    args = ModelArgs(DMODEL, MAMBA_LAYERS, len(FEATURES), LOOKBACK)
+    assert X.shape[-1] == feat_dim, "Feature dimension mismatch"
+    args = ModelArgs(DMODEL, MAMBA_LAYERS, feat_dim, LOOKBACK)
     model = SAMBA(args).to(device)
 
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
