@@ -962,8 +962,7 @@ class BybitRawIter:
                     yield ts, seq, row
 
 
-def merge_event_time(ob_iter: Generator[Tuple[int, int, dict], None, None],
-                     tr_iter: Generator[Tuple[int, int, dict], None, None]) -> Generator[Tuple[str, int, int, dict], None, None]:
+def merge_event_time(ob_iter, tr_iter, B: int = 0):
     """Merge OB and trade iterators by timestamp and sequence."""
     ob_item = next(ob_iter, None)
     tr_item = next(tr_iter, None)
@@ -977,7 +976,7 @@ def merge_event_time(ob_iter: Generator[Tuple[int, int, dict], None, None],
             ts, seq, data = tr_item
             tr_item = next(tr_iter, None)
             etype = "trade"
-        if ts < last_ts:
+        if ts + B < last_ts:
             raise ValueError("Non-monotonic timestamps in event stream")
         last_ts = ts
         yield etype, ts, seq, data
@@ -1637,7 +1636,7 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
 
     for ob_zip, th_zip in week_files:
         raw = BybitRawIter(ob_zip, th_zip)
-        # B=0 per your spec (strictly non-decreasing engine time)
+        # B defaults to 0 for strict ordering
         merged = merge_event_time(raw.ob_iter(), raw.trade_iter(), B=0)
 
         for e in merged:
