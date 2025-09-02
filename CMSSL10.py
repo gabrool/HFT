@@ -1202,12 +1202,19 @@ class FeatureEngine:
         """
         Accepts multiple event shapes:
         - Tuple ('ob'|'trade', data:dict, ts_ms:int)
+        - Tuple ('ob'|'trade', ts_ms:int, seq:int, data:dict)
         - Dict-like OB: {'type': 'snapshot'|'delta', 'data': {...}, 'ts': int, ...}
         - Dict-like trade: {'timestamp': float|str, 'price': str|float, 'size': str|float, 'side': 'Buy'|'Sell'|'buy'|'sell', ...}
         Returns: (etype, ts_ms, payload)
         etype in {'ob','trade'}
         """
         # Tuple form
+        if isinstance(e, tuple) and len(e) == 4 and isinstance(e[0], str):
+            etype = e[0].lower()
+            ts_ms = int(e[1])
+            payload = e[3]  # ignore sequence
+            return etype, ts_ms, payload
+
         if isinstance(e, tuple) and len(e) == 3 and isinstance(e[0], str):
             etype = e[0].lower()
             ts_ms = int(e[2])
