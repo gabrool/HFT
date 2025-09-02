@@ -1177,11 +1177,6 @@ class FeatureEngine:
         while deq and (now_ms - deq[0][0] > window_ms):
             deq.popleft()
 
-    def dt_since_last_event(self) -> float:
-        if self._last_event_ts is None:
-            return 0.0
-        return float(max(0, (self._last_event_ts - (self.last_ts or self._last_event_ts))))
-
     def event_density_100ms(self) -> float:
         # events per 0.1s
         if not self.ev_100ms:
@@ -1259,7 +1254,7 @@ class FeatureEngine:
 
         self._sorted_ladders()
 
-    def _update_trade_windows(self, ts_ms: int, trade_evt: dict):
+    def _update_trade_windows(self, ts_ms: int, trade_evt: dict, dt_ms: float):
         side = str(trade_evt['side']).lower()  # 'buy'|'sell'
         price = float(trade_evt['price'])
         size = float(trade_evt['size'])
@@ -1268,11 +1263,7 @@ class FeatureEngine:
         self._prune_deque_ms(self.trades_25ms, ts_ms, 25)
         self._prune_deque_ms(self.trades_100ms, ts_ms, 100)
 
-        # Update volume-regime (vol/sec) EWMAs using dt since last event
-        if self._last_event_ts is None:
-            dt_ms = 1.0
-        else:
-            dt_ms = max(1.0, ts_ms - self._last_event_ts)
+        # Update volume-regime (vol/sec) EWMAs using provided dt_ms
         vol_rate = size / (dt_ms / 1000.0)  # base per second
         self.v_ewma_short = self._ewma_update(self.v_ewma_short, vol_rate, dt_ms, 30_000)       # ~30s HL
         self.v_ewma_long  = self._ewma_update(self.v_ewma_long,  vol_rate, dt_ms, 86_400_000)   # ~1d HL
@@ -1366,12 +1357,13 @@ class FeatureEngine:
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
-    def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool]:
+    def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
         """
         Process a single merged event and return:
-            ts_ms, feature_vector (z-scored), mid, is_trade
+            ts_ms, feature_vector (z-scored), mid, is_trade, dt_ms
         """
         etype, ts_ms, payload = self._parse_event(e)
+        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
 
         # Event density
         self.ev_100ms.append(ts_ms)
@@ -1382,7 +1374,7 @@ class FeatureEngine:
         if etype == 'ob':
             self._update_book_from_ob(payload)
         else:
-            self._update_trade_windows(ts_ms, payload)
+            self._update_trade_windows(ts_ms, payload, dt_ms)
 
         # Compute basic ladders + best quotes
         self._sorted_ladders()
@@ -1426,7 +1418,6 @@ class FeatureEngine:
         slope_a = self._lin_slope(xa, ya)
 
         # Pressure (EWMA of OFI L1)
-        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
         self.press_100ms = self._ewma_update(self.press_100ms, ofi_l1, dt_ms, 100)
         self.press_1s    = self._ewma_update(self.press_1s,    ofi_l1, dt_ms, 1_000)
         self.press_5s    = self._ewma_update(self.press_5s,    ofi_l1, dt_ms, 5_000)
@@ -1565,7 +1556,7 @@ class FeatureEngine:
         self.last_ts = ts_ms
         self._last_event_ts = ts_ms
 
-        return ts_ms, feat_z, mid, is_trade
+        return ts_ms, feat_z, mid, is_trade, dt_ms
 
 
 class LabelBuilder:
@@ -1648,10 +1639,9 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
 
         for e in merged:
             # 1) Update features with this event
-            ts_ms, feat, mid, is_trade = fe.on_event(e)  # feat already z-scored
+            ts_ms, feat, mid, is_trade, dt_ms = fe.on_event(e)  # feat already z-scored
 
             # 2) Build token with aux channels
-            dt_ms = fe.dt_since_last_event()
             events_100ms = fe.event_density_100ms()
             token = np.concatenate(
                 [feat, np.array([dt_ms, float(is_trade), events_100ms], dtype=np.float32)]
