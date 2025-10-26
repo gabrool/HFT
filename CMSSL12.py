@@ -1768,6 +1768,14 @@ class LabelBuilder:
         # Maintain recent midprice history as (timestamp, mid)
         self.price_history = deque()
         self.history_span = (self.horizons[-1] if self.horizons else 0) + self.delta + 1000
+        # Decisions waiting to reach t_delta: items are (t_delta, t_mature)
+        self.wait_delta = deque()
+        # Decisions with entry price recorded, waiting to reach t_mature: (t_mature, mid0)
+        self.wait_mature = deque()
+
+        # Maintain recent midprice history as (timestamp, mid)
+        self.price_history = deque()
+        self.history_span = self.h + self.delta + 1000
 
         self.last_ts = -10**15
         self.last_mid = None
@@ -1832,6 +1840,24 @@ class LabelBuilder:
                     label = np.array(returns + vols, dtype=np.float32)
                     out.append(label)
                     del self.decisions[decision_id]
+        # Move items whose t_delta has passed into wait_mature, recording the midprice at t_delta
+        while self.wait_delta and self.wait_delta[0][0] <= t:
+            t_delta, t_mature = self.wait_delta.popleft()
+            mid0 = self._price_at(t_delta)
+            self.wait_mature.append((t_mature, mid0))
+
+        # Mature any items whose horizon has passed; compute labels using fixed-horizon returns
+        while self.wait_mature and self.wait_mature[0][0] <= t:
+            t_mature, mid0 = self.wait_mature.popleft()
+            mid_T = self._price_at(t_mature)
+
+            e = 1e-12
+            mid0_safe = max(e, mid0)
+            mid_T_safe = max(e, mid_T)
+            y_ret = math.log(mid_T_safe / mid0_safe)
+            y_vol = 0.5 * (y_ret ** 2)
+
+            out.append(np.array([y_ret, y_vol], dtype=np.float32))
 
         self.last_ts = t
         self.last_mid = m
@@ -2085,6 +2111,41 @@ def train_and_evaluate():
             f"  horizon {horizon_ms:>4} ms → pos_mag[{lo_pos:.3e}, {hi_pos:.3e}], "
             f"neg_mag[{lo_neg:.3e}, {hi_neg:.3e}]"
         )
+    y_train_ret = y_tr[:, 0].astype(np.float32)
+    pos_returns = y_train_ret[y_train_ret > 0]
+    neg_returns = y_train_ret[y_train_ret < 0]
+
+    def _compute_trim_bounds(arr: np.ndarray) -> Tuple[float, float]:
+        if arr.size == 0:
+            return float("inf"), float("-inf")
+        try:
+            lo = float(np.quantile(arr, DIR_MASK_TAIL_FRACTION, method="linear"))
+            hi = float(np.quantile(arr, 1.0 - DIR_MASK_TAIL_FRACTION, method="linear"))
+        except TypeError:
+            lo = float(np.quantile(arr, DIR_MASK_TAIL_FRACTION, interpolation="linear"))
+            hi = float(np.quantile(arr, 1.0 - DIR_MASK_TAIL_FRACTION, interpolation="linear"))
+        return lo, hi
+
+    pos_lo, pos_hi = _compute_trim_bounds(pos_returns)
+    neg_lo, neg_hi = _compute_trim_bounds(neg_returns)
+    print(
+        "[dir-mask quantiles] pos:[{:.3e}, {:.3e}] neg:[{:.3e}, {:.3e}] (tail frac {:.2%})".format(
+            pos_lo, pos_hi, neg_lo, neg_hi, DIR_MASK_TAIL_FRACTION
+        )
+    )
+
+    def build_dir_mask(y_ret: torch.Tensor) -> torch.Tensor:
+        pos = y_ret > 0
+        neg = y_ret < 0
+
+        lo_pos = torch.tensor(pos_lo, device=y_ret.device, dtype=y_ret.dtype)
+        hi_pos = torch.tensor(pos_hi, device=y_ret.device, dtype=y_ret.dtype)
+        lo_neg = torch.tensor(neg_lo, device=y_ret.device, dtype=y_ret.dtype)
+        hi_neg = torch.tensor(neg_hi, device=y_ret.device, dtype=y_ret.dtype)
+
+        keep_pos = pos & (y_ret >= lo_pos) & (y_ret <= hi_pos)
+        keep_neg = neg & (y_ret >= lo_neg) & (y_ret <= hi_neg)
+        return keep_pos | keep_neg
 
     pos_bounds_tensor = torch.tensor(pos_bounds, dtype=torch.float32)
     neg_bounds_tensor = torch.tensor(neg_bounds, dtype=torch.float32)
@@ -2338,6 +2399,20 @@ def train_and_evaluate():
             val_bce_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
             val_acc_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
             val_masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            # Full supervised validation during fine-tuning
+            val_logits_all, val_ypos_all = [], []
+            val_logits_masked, val_ypos_masked = [], []
+            val_ret_loss_sum = 0.0
+            val_vol_loss_sum = 0.0
+            val_sample_total = 0
+            val_acc_sum = 0
+            val_total = 0
+            val_bce_unmasked_sum = 0.0
+            val_bce_unmasked_count = 0
+            val_bce_masked_sum = 0.0
+            val_bce_masked_count = 0
+            val_acc_masked_sum = 0
+            val_masked_total = 0
 
             with torch.no_grad():
                 for x, y_targets in dl_val:
@@ -2461,6 +2536,72 @@ def train_and_evaluate():
             if weighted_val_ret < best and not is_ssl_pretrain:
                 best = weighted_val_ret
                 print(f"New best validation loss (weighted return Huber): {best:.4e}")
+                    logits_flat = dir_pred_logits.view(-1)
+                    targets_flat = (y_return > 0).to(torch.float32).view(-1)
+
+                    # Directional BCE (unmasked)
+                    val_bce_unmasked_sum += F.binary_cross_entropy_with_logits(
+                        logits_flat, targets_flat, reduction='sum'
+                    ).item()
+                    val_bce_unmasked_count += logits_flat.numel()
+
+                    # AUC collection (unmasked)
+                    val_logits_all.append(logits_flat.detach().cpu())
+                    val_ypos_all.append(targets_flat.to(torch.int32).cpu())
+
+                    # Accuracy (flatten to avoid broadcasting surprises)
+                    predicted_class = (logits_flat > 0).to(torch.int32)
+                    true_class = targets_flat.to(torch.int32)
+                    val_acc_sum += (predicted_class == true_class).sum().item()
+                    val_total   += true_class.numel()
+
+                    # Masked directional metrics
+                    mask_flat = build_dir_mask(y_return).view(-1)
+                    if mask_flat.any():
+                        masked_logits = logits_flat[mask_flat]
+                        masked_targets = targets_flat[mask_flat]
+                        val_bce_masked_sum += F.binary_cross_entropy_with_logits(
+                            masked_logits, masked_targets, reduction='sum'
+                        ).item()
+                        val_bce_masked_count += masked_logits.numel()
+                        val_logits_masked.append(masked_logits.detach().cpu())
+                        val_ypos_masked.append(masked_targets.to(torch.int32).cpu())
+                        pred_masked = (masked_logits > 0).to(torch.int32)
+                        true_masked = masked_targets.to(torch.int32)
+                        val_acc_masked_sum += (pred_masked == true_masked).sum().item()
+                        val_masked_total += true_masked.numel()
+
+            avg_val_ret_loss = val_ret_loss_sum / max(1, val_sample_total)
+            avg_val_vol_loss = val_vol_loss_sum / max(1, val_sample_total)
+            val_accuracy = val_acc_sum / max(1, val_total)
+            val_logits_all = torch.cat(val_logits_all)
+            val_ypos_all   = torch.cat(val_ypos_all)
+            val_auc = binary_auc_from_logits(val_logits_all, val_ypos_all)
+            val_dir_bce = val_bce_unmasked_sum / max(1, val_bce_unmasked_count)
+
+            if val_bce_masked_count > 0:
+                val_logits_masked_t = torch.cat(val_logits_masked)
+                val_ypos_masked_t = torch.cat(val_ypos_masked)
+                val_auc_masked = binary_auc_from_logits(val_logits_masked_t, val_ypos_masked_t)
+                val_dir_bce_masked = val_bce_masked_sum / val_bce_masked_count
+                val_acc_masked = val_acc_masked_sum / max(1, val_masked_total)
+                masked_metrics_str = (
+                    f"val_dir_bce_masked={val_dir_bce_masked:.4e}, "
+                    f"val_acc_masked={val_acc_masked:.4f}, val_auc_masked={val_auc_masked:.4f}"
+                )
+            else:
+                masked_metrics_str = "val_dir_bce_masked=nan, val_acc_masked=nan, val_auc_masked=nan"
+
+            print(
+                f"val_ret_huber={avg_val_ret_loss:.4e}, val_logvol_huber={avg_val_vol_loss:.4e}, "
+                f"val_dir_bce={val_dir_bce:.4e}, val_acc={val_accuracy:.4f}, val_auc={val_auc:.4f}, "
+                f"{masked_metrics_str}"
+            )
+
+            scheduler.step(avg_val_ret_loss)
+            if avg_val_ret_loss < best and not is_ssl_pretrain:
+                best = avg_val_ret_loss
+                print(f"New best validation loss (return Huber): {best:.4e}")
                 no_imp = 0
                 torch.save(model.state_dict(), 'best.pth')
             else:
