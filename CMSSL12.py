@@ -1156,6 +1156,7 @@ class FeatureEngine:
 
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute σ and VR
+        self.ret_hist_20ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_25ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_50ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_100ms: Deque[Tuple[int, float]] = deque()
@@ -1561,6 +1562,7 @@ class FeatureEngine:
         self.last_mid_for_ret = mid
 
         # push to windows
+        self.ret_hist_20ms.append((ts_ms, r))
         self.ret_hist_25ms.append((ts_ms, r))
         self.ret_hist_50ms.append((ts_ms, r))
         self.ret_hist_100ms.append((ts_ms, r))
@@ -1569,6 +1571,7 @@ class FeatureEngine:
         self.ret_hist_1s.append((ts_ms, r))
         self.ret_hist_5s.append((ts_ms, r))
 
+        self._prune_deque_ms(self.ret_hist_20ms, ts_ms, 20)
         self._prune_deque_ms(self.ret_hist_25ms, ts_ms, 25)
         self._prune_deque_ms(self.ret_hist_50ms, ts_ms, 50)
         self._prune_deque_ms(self.ret_hist_100ms, ts_ms, 100)
@@ -1826,6 +1829,7 @@ class FeatureEngine:
 
         # Returns & vol stats (populate histories + compute σ and VR)
         self._add_return(ts_ms, mid)
+        _, var_20 = self._stats_from_returns(self.ret_hist_20ms)
         _, var_25 = self._stats_from_returns(self.ret_hist_25ms)
         _, var_50 = self._stats_from_returns(self.ret_hist_50ms)
         _, var_100 = self._stats_from_returns(self.ret_hist_100ms)
@@ -1833,6 +1837,7 @@ class FeatureEngine:
         _, var_500 = self._stats_from_returns(self.ret_hist_500ms)
         _, var_1s = self._stats_from_returns(self.ret_hist_1s)
         _, var_5s = self._stats_from_returns(self.ret_hist_5s)
+        std_20 = math.sqrt(max(0.0, var_20))
         std_25 = math.sqrt(max(0.0, var_25))
         std_50 = math.sqrt(max(0.0, var_50))
         std_100 = math.sqrt(max(0.0, var_100))
@@ -1843,6 +1848,8 @@ class FeatureEngine:
         # Variance ratio: 1s variance vs 10 * 100ms variance (1s = 10×100ms)
         vr = (var_1s / max(10.0 * var_100, 1e-12)) if var_100 > 0 else 0.0
         vr_1s_250 = var_1s / max(4.0 * var_250, 1e-12) if var_250 > 0 else 0.0
+        var_ratio_500_100 = var_500 / max(var_100, 1e-12) if var_100 > 0 else 0.0
+        var_ratio_100_20 = var_100 / max(var_20, 1e-12) if var_20 > 0 else 0.0
 
         # Short-horizon regime summaries (vol & flow)
         regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
@@ -1942,8 +1949,9 @@ class FeatureEngine:
             float(n_spread_chg_250ms), float(n_spread_chg_1s),
 
             # --- returns & vol stats ---
-            std_25, std_50, std_100, std_250, std_500, std_1s, std_5s,
+            std_20, std_25, std_50, std_100, std_250, std_500, std_1s, std_5s,
             vr, vr_1s_250,
+            var_ratio_500_100, var_ratio_100_20,
 
             # --- EMAs & technicals ---
             (self.ema_mp_25 if self.ema_mp_25 is not None else micro),
