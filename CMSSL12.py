@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Deque, Any, List, Dict, Tuple, Generator, Optional
+from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import math
@@ -411,6 +411,11 @@ DMODEL          = 320
 MAMBA_LAYERS    = 4
 CONV_KERNELS    = [9,17,25,33]
 DFF_CONV        = 4 * DMODEL
+
+# Prediction horizons (in milliseconds)
+HORIZONS_MS     = [50, 100, 250, 500, 1000]
+NUM_HORIZONS    = len(HORIZONS_MS)
+HORIZON_WEIGHTS = [1.0 for _ in HORIZONS_MS]
 
 # Masking / SSL schedule
 SSL_PRETRAIN_EPOCHS = 15     # Pretrain epochs (recon + CPC only)
@@ -861,19 +866,19 @@ class SAMBA(nn.Module):
             nn.Linear(args.d_model, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(head_hidden_dim, 1)
+            nn.Linear(head_hidden_dim, NUM_HORIZONS)
         )
         self.volatility_head = nn.Sequential(
             nn.Linear(args.d_model, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(head_hidden_dim, 1)  # predicts log-vol
+            nn.Linear(head_hidden_dim, NUM_HORIZONS)  # predicts log-vol per horizon
         )
         self.direction_head = nn.Sequential(
             nn.Linear(args.d_model, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(head_hidden_dim, 1)
+            nn.Linear(head_hidden_dim, NUM_HORIZONS)
         )
 
     @torch.no_grad()
@@ -928,9 +933,9 @@ class SAMBA(nn.Module):
 
         # Student (clean)
         pooled, h_clean = self.mamba(h_tokens, embedded=True)
-        ret = self.return_head(pooled).squeeze(-1)
-        vol = self.volatility_head(pooled).squeeze(-1)
-        dir_logits = self.direction_head(pooled).squeeze(-1)
+        ret = self.return_head(pooled)
+        vol = self.volatility_head(pooled)
+        dir_logits = self.direction_head(pooled)
 
         # Teacher (clean, no grad) for CPC
         with torch.no_grad():
@@ -1743,27 +1748,29 @@ class FeatureEngine:
 
 
 class LabelBuilder:
-    def __init__(self, delta_ms: int = 5, horizon_ms: int = 1000):
+    def __init__(self, delta_ms: int = 5, horizons_ms: Optional[List[int]] = None):
         self.delta = int(delta_ms)
-        self.h = int(horizon_ms)
+        self.horizons = sorted(horizons_ms if horizons_ms is not None else HORIZONS_MS)
+        assert len(self.horizons) > 0, "At least one horizon required"
+        self.max_h = int(self.horizons[-1])
 
-        # Decisions waiting to reach t_delta: items are (t_delta, t_mature)
-        self.wait_delta = deque()
-        # Decisions with entry price recorded, waiting to reach t_mature: (t_mature, mid0)
-        self.wait_mature = deque()
+        # Decisions waiting to reach t_delta (entry time): items are t_delta timestamps
+        self.wait_delta: Deque[int] = deque()
+        # Decisions with entry price recorded, waiting to reach final maturity:
+        # entries are (t_ready, t_delta, mid_entry)
+        self.wait_mature: Deque[Tuple[int, int, float]] = deque()
 
         # Maintain recent midprice history as (timestamp, mid)
-        self.price_history = deque()
-        self.history_span = self.h + self.delta + 1000
+        self.price_history: Deque[Tuple[int, float]] = deque()
+        self.history_span = self.max_h + self.delta + 1000
 
         self.last_ts = -10**15
-        self.last_mid = None
+        self.last_mid: Optional[float] = None
 
     # ---- decision API ----
     def on_decision(self, t_now_ms: int):
         t_delta = t_now_ms + self.delta
-        t_mature = t_delta + self.h
-        self.wait_delta.append((t_delta, t_mature))
+        self.wait_delta.append(t_delta)
 
     def on_event(self, t_ms: int, mid_current: float):
         out = []
@@ -1774,23 +1781,29 @@ class LabelBuilder:
         self._record_price(t, m)
 
         # Move items whose t_delta has passed into wait_mature, recording the midprice at t_delta
-        while self.wait_delta and self.wait_delta[0][0] <= t:
-            t_delta, t_mature = self.wait_delta.popleft()
+        while self.wait_delta and self.wait_delta[0] <= t:
+            t_delta = self.wait_delta.popleft()
             mid0 = self._price_at(t_delta)
-            self.wait_mature.append((t_mature, mid0))
+            t_ready = t_delta + self.max_h
+            self.wait_mature.append((t_ready, t_delta, mid0))
 
         # Mature any items whose horizon has passed; compute labels using fixed-horizon returns
         while self.wait_mature and self.wait_mature[0][0] <= t:
-            t_mature, mid0 = self.wait_mature.popleft()
-            mid_T = self._price_at(t_mature)
+            _, t_delta, mid0 = self.wait_mature.popleft()
 
             e = 1e-12
             mid0_safe = max(e, mid0)
-            mid_T_safe = max(e, mid_T)
-            y_ret = math.log(mid_T_safe / mid0_safe)
-            y_vol = 0.5 * (y_ret ** 2)
 
-            out.append(np.array([y_ret, y_vol], dtype=np.float32))
+            returns = []
+            vols = []
+            for horizon in self.horizons:
+                mid_T = self._price_at(t_delta + int(horizon))
+                mid_T_safe = max(e, mid_T)
+                y_ret = math.log(mid_T_safe / mid0_safe)
+                returns.append(y_ret)
+                vols.append(0.5 * (y_ret ** 2))
+
+            out.append(np.array(returns + vols, dtype=np.float32))
 
         self.last_ts = t
         self.last_mid = m
@@ -1851,7 +1864,7 @@ def build_sequence_from_tokens(tokens: Deque[np.ndarray], lookback: int) -> np.n
 
 def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndarray]:
     fe = FeatureEngine()
-    labeler = LabelBuilder(delta_ms=5, horizon_ms=1000)
+    labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
 
     tokens: Deque[np.ndarray] = deque(maxlen=LOOKBACK)  # token = [features..., dt_ms, is_trade, events_100ms]
     pending_seqs: Deque[np.ndarray] = deque()           # sequences waiting for labels (FIFO)
@@ -1919,13 +1932,31 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
 
 
 # --------------------  Utils: EMA-normalized losses + Huber  ---------------------
-def huber_loss(pred: torch.Tensor, target: torch.Tensor, delta: float) -> torch.Tensor:
-    """Mean Huber (Smooth L1 with custom delta)."""
+def huber_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    delta: float,
+    weights: Optional[torch.Tensor] = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Huber loss with optional per-dimension weights and reduction control."""
     diff = pred - target
     abs_diff = diff.abs()
-    quadratic = torch.minimum(abs_diff, torch.tensor(delta, device=pred.device))
+    delta_tensor = torch.tensor(delta, device=pred.device, dtype=pred.dtype)
+    quadratic = torch.minimum(abs_diff, delta_tensor)
     linear = abs_diff - quadratic
-    return (0.5 * quadratic**2 / delta + linear).mean()
+    loss = 0.5 * quadratic**2 / delta_tensor + linear
+
+    if weights is not None:
+        loss = loss * weights
+
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "none":
+        return loss
+    if reduction == "dim_mean":
+        return loss.mean(dim=0)
+    raise ValueError(f"Unsupported reduction '{reduction}'")
 
 def ema_update(name: str, value: float, ema_dict: Dict[str, float], decay: float = EMA_DECAY) -> float:
     old = ema_dict.get(name, 1.0)
@@ -2006,9 +2037,7 @@ def train_and_evaluate():
     n_te = len(y_te)
     print(f"[sizes] train={n_tr}  val={n_va}  test={n_te}")
 
-    y_train_ret = y_tr[:, 0].astype(np.float32)
-    pos_returns = y_train_ret[y_train_ret > 0]
-    neg_returns = y_train_ret[y_train_ret < 0]
+    y_train_ret = y_tr[:, :NUM_HORIZONS].astype(np.float32)
 
     def _compute_trim_bounds(arr: np.ndarray) -> Tuple[float, float]:
         if arr.size == 0:
@@ -2021,33 +2050,64 @@ def train_and_evaluate():
             hi = float(np.quantile(arr, 1.0 - DIR_MASK_TAIL_FRACTION, interpolation="linear"))
         return lo, hi
 
-    pos_lo, pos_hi = _compute_trim_bounds(pos_returns)
-    neg_lo, neg_hi = _compute_trim_bounds(neg_returns)
-    print(
-        "[dir-mask quantiles] pos:[{:.3e}, {:.3e}] neg:[{:.3e}, {:.3e}] (tail frac {:.2%})".format(
-            pos_lo, pos_hi, neg_lo, neg_hi, DIR_MASK_TAIL_FRACTION
+    pos_lo_list: List[float] = []
+    pos_hi_list: List[float] = []
+    neg_lo_list: List[float] = []
+    neg_hi_list: List[float] = []
+
+    print("[dir-mask quantiles]")
+    for idx, horizon in enumerate(HORIZONS_MS):
+        horizon_returns = y_train_ret[:, idx]
+        pos_returns = horizon_returns[horizon_returns > 0]
+        neg_returns = horizon_returns[horizon_returns < 0]
+
+        pos_lo, pos_hi = _compute_trim_bounds(pos_returns)
+        # For negatives we operate on magnitude
+        neg_lo, neg_hi = _compute_trim_bounds((-neg_returns))
+
+        pos_lo_list.append(pos_lo)
+        pos_hi_list.append(pos_hi)
+        neg_lo_list.append(neg_lo)
+        neg_hi_list.append(neg_hi)
+
+        print(
+            f"  {horizon}ms → pos:[{pos_lo:.3e}, {pos_hi:.3e}]  neg|mag:[{neg_lo:.3e}, {neg_hi:.3e}]"
+            f" (tail frac {DIR_MASK_TAIL_FRACTION:.2%})"
         )
-    )
+
+    pos_lo_arr = np.array(pos_lo_list, dtype=np.float32)
+    pos_hi_arr = np.array(pos_hi_list, dtype=np.float32)
+    neg_lo_arr = np.array(neg_lo_list, dtype=np.float32)
+    neg_hi_arr = np.array(neg_hi_list, dtype=np.float32)
 
     def build_dir_mask(y_ret: torch.Tensor) -> torch.Tensor:
         pos = y_ret > 0
         neg = y_ret < 0
 
-        lo_pos = torch.tensor(pos_lo, device=y_ret.device, dtype=y_ret.dtype)
-        hi_pos = torch.tensor(pos_hi, device=y_ret.device, dtype=y_ret.dtype)
-        lo_neg = torch.tensor(neg_lo, device=y_ret.device, dtype=y_ret.dtype)
-        hi_neg = torch.tensor(neg_hi, device=y_ret.device, dtype=y_ret.dtype)
+        lo_pos = torch.tensor(pos_lo_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
+        hi_pos = torch.tensor(pos_hi_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
+        lo_neg = torch.tensor(neg_lo_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
+        hi_neg = torch.tensor(neg_hi_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
 
+        mag_neg = (-y_ret).clamp_min(0.0)
         keep_pos = pos & (y_ret >= lo_pos) & (y_ret <= hi_pos)
-        keep_neg = neg & (y_ret >= lo_neg) & (y_ret <= hi_neg)
+        keep_neg = neg & (mag_neg >= lo_neg) & (mag_neg <= hi_neg)
         return keep_pos | keep_neg
 
-    num_pos_train = int((y_tr[:,0] > 0).sum())
-    print(f"Train positive returns: {num_pos_train} / {n_tr} ({num_pos_train / max(n_tr,1):.2%})")
-    num_pos_val = int((y_va[:,0] > 0).sum())
-    print(f"Val positive returns: {num_pos_val} / {n_va} ({num_pos_val / max(n_va,1):.2%})")
-    num_pos_test = int((y_te[:,0] > 0).sum())
-    print(f"Test positive returns: {num_pos_test} / {n_te} ({num_pos_test / max(n_te,1):.2%})")
+    def _format_pos_counts(arr: np.ndarray, total: int) -> str:
+        parts = []
+        for horizon, count in zip(HORIZONS_MS, arr.astype(int)):
+            frac = count / max(total, 1)
+            parts.append(f"{horizon}ms {int(count)} ({frac:.2%})")
+        return "; ".join(parts)
+
+    num_pos_train = (y_tr[:, :NUM_HORIZONS] > 0).sum(axis=0)
+    num_pos_val = (y_va[:, :NUM_HORIZONS] > 0).sum(axis=0)
+    num_pos_test = (y_te[:, :NUM_HORIZONS] > 0).sum(axis=0)
+
+    print(f"Train positive returns: {_format_pos_counts(num_pos_train, n_tr)}")
+    print(f"Val positive returns: {_format_pos_counts(num_pos_val, n_va)}")
+    print(f"Test positive returns: {_format_pos_counts(num_pos_test, n_te)}")
 
     dl_train = DataLoader(ds_train, BATCH_SIZE, shuffle=True, drop_last=True, num_workers=8, pin_memory=True, prefetch_factor=4)
     dl_val   = DataLoader(ds_val,   BATCH_SIZE, shuffle=False, num_workers=4)
@@ -2056,6 +2116,44 @@ def train_and_evaluate():
     assert X_tr.shape[-1] == feat_dim, "Feature dimension mismatch"
     args = ModelArgs(DMODEL, MAMBA_LAYERS, feat_dim, LOOKBACK)
     model = SAMBA(args).to(device)
+
+    horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
+    horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
+    horizon_weights_np = horizon_weights_cpu.numpy()
+
+    def compute_directional_loss(logits: torch.Tensor, y_ret: torch.Tensor) -> torch.Tensor:
+        mask = build_dir_mask(y_ret)
+        if not mask.any():
+            return torch.tensor(0.0, device=logits.device)
+
+        y_dir = (y_ret > 0).float()
+        losses = []
+        weights = []
+        for h_idx in range(NUM_HORIZONS):
+            mask_h = mask[:, h_idx]
+            if mask_h.any():
+                loss_h = F.binary_cross_entropy_with_logits(
+                    logits[mask_h, h_idx], y_dir[mask_h, h_idx], reduction='mean'
+                )
+                losses.append(loss_h)
+                weights.append(horizon_weights[h_idx])
+
+        if not losses:
+            return torch.tensor(0.0, device=logits.device)
+
+        loss_stack = torch.stack(losses)
+        weight_stack = torch.stack(weights)
+        return (loss_stack * weight_stack).sum() / weight_stack.sum()
+
+    def format_metric(values: Iterable[float], fmt: str) -> str:
+        formatted = []
+        for horizon, value in zip(HORIZONS_MS, values):
+            val = float(value)
+            if math.isnan(val) or math.isinf(val):
+                formatted.append(f"{horizon}ms:nan")
+            else:
+                formatted.append(f"{horizon}ms:{fmt.format(val)}")
+        return '[' + ', '.join(formatted) + ']'
 
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt.base_optimizer, mode='min', factor=0.5, patience=7)
@@ -2106,17 +2204,11 @@ def train_and_evaluate():
                 ep_recon += recon.item(); ep_cpc += cpc_loss.item()
             else:
                 # Fine-tune: supervised + tiny SSL auxiliaries (EMA-normalized)
-                y_ret, y_logvol = y[:, 0], y[:, 1]
-                mse_ret = huber_loss(ret_pred, y_ret, DELTA_RET)
-                mse_vol = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL)
-                y_dir = (y_ret > 0).float()
-                mask = build_dir_mask(y_ret)
-
-                if mask.any():
-                    bce_loss = F.binary_cross_entropy_with_logits(dir_pred_logits[mask], y_dir[mask], reduction='mean')
-                else:
-                    # no directional samples to train on in this batch → zero loss contribution (keeps EMA stable too)
-                    bce_loss = torch.tensor(0.0, device=y_ret.device)
+                y_ret = y[:, :NUM_HORIZONS]
+                y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+                mse_ret = huber_loss(ret_pred, y_ret, DELTA_RET, weights=horizon_weights)
+                mse_vol = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL, weights=horizon_weights)
+                bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
                 ema_ret   = ema_update('ret',    mse_ret.item(),  ema_ft)
                 ema_vol   = ema_update('logvol', mse_vol.item(),  ema_ft)
@@ -2146,15 +2238,11 @@ def train_and_evaluate():
                 ema_cpc   = ema_pre['cpc']
                 loss2 = LAMBDA_RECON_PT * (recon2 / (ema_recon + 1e-8)) + LAMBDA_CPC_PT * (cpc_loss2 / (ema_cpc + 1e-8))
             else:
-                y_ret, y_logvol = y[:, 0], y[:, 1]
-                mse_ret2 = huber_loss(ret_pred2, y_ret, DELTA_RET)
-                mse_vol2 = huber_loss(vol_pred2, y_logvol, DELTA_LOGVOL)
-                y_dir = (y_ret > 0).float()
-                mask  = build_dir_mask(y_ret)
-                if mask.any():
-                    bce_loss2 = F.binary_cross_entropy_with_logits(dir_pred_logits2[mask], y_dir[mask], reduction='mean')
-                else:
-                    bce_loss2 = torch.tensor(0.0, device=y_ret.device)
+                y_ret = y[:, :NUM_HORIZONS]
+                y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+                mse_ret2 = huber_loss(ret_pred2, y_ret, DELTA_RET, weights=horizon_weights)
+                mse_vol2 = huber_loss(vol_pred2, y_logvol, DELTA_LOGVOL, weights=horizon_weights)
+                bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
 
                 ema_ret   = ema_ft['ret']
                 ema_vol   = ema_ft['logvol']
@@ -2214,94 +2302,113 @@ def train_and_evaluate():
             # Full supervised validation during fine-tuning
             val_logits_all, val_ypos_all = [], []
             val_logits_masked, val_ypos_masked = [], []
-            val_ret_loss_sum = 0.0
-            val_vol_loss_sum = 0.0
+            val_ret_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_vol_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
             val_sample_total = 0
-            val_acc_sum = 0
-            val_total = 0
-            val_bce_unmasked_sum = 0.0
-            val_bce_unmasked_count = 0
-            val_bce_masked_sum = 0.0
-            val_bce_masked_count = 0
-            val_acc_masked_sum = 0
-            val_masked_total = 0
+            val_acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_bce_unmasked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_bce_unmasked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_bce_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_acc_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
+
+            val_logits_all = [[] for _ in range(NUM_HORIZONS)]
+            val_ypos_all = [[] for _ in range(NUM_HORIZONS)]
+            val_logits_masked = [[] for _ in range(NUM_HORIZONS)]
+            val_ypos_masked = [[] for _ in range(NUM_HORIZONS)]
 
             with torch.no_grad():
                 for x, y_targets in dl_val:
                     x = x.to(device)
-                    y_return = y_targets[:, 0].to(device)
-                    y_logvol = y_targets[:, 1].to(device)
+                    y_targets = y_targets.to(device)
+                    y_return = y_targets[:, :NUM_HORIZONS]
+                    y_logvol = y_targets[:, NUM_HORIZONS:2 * NUM_HORIZONS]
 
                     ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
 
-                    # Huber losses (per-sample), accumulate weighted by batch size
-                    batch_ret_loss = huber_loss(ret_pred, y_return, DELTA_RET).item()
-                    batch_vol_loss = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL).item()
+                    ret_loss_elem = huber_loss(ret_pred, y_return, DELTA_RET, reduction='none')
+                    vol_loss_elem = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL, reduction='none')
                     batch_n = x.size(0)
-                    val_ret_loss_sum += batch_ret_loss * batch_n
-                    val_vol_loss_sum += batch_vol_loss * batch_n
+
+                    val_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
+                    val_vol_loss_sum += vol_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
                     val_sample_total += batch_n
 
-                    logits_flat = dir_pred_logits.view(-1)
-                    targets_flat = (y_return > 0).to(torch.float32).view(-1)
+                    y_dir = (y_return > 0).to(torch.float32)
+                    bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
+                    val_bce_unmasked_sum += bce_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
+                    val_bce_unmasked_count += batch_n
 
-                    # Directional BCE (unmasked)
-                    val_bce_unmasked_sum += F.binary_cross_entropy_with_logits(
-                        logits_flat, targets_flat, reduction='sum'
-                    ).item()
-                    val_bce_unmasked_count += logits_flat.numel()
+                    pred_class = (dir_pred_logits > 0).to(torch.int32)
+                    true_class = y_dir.to(torch.int32)
+                    val_acc_sum += (pred_class == true_class).sum(dim=0).detach().cpu().numpy().astype(np.float64)
+                    val_total += batch_n
 
-                    # AUC collection (unmasked)
-                    val_logits_all.append(logits_flat.detach().cpu())
-                    val_ypos_all.append(targets_flat.to(torch.int32).cpu())
+                    for h_idx in range(NUM_HORIZONS):
+                        val_logits_all[h_idx].append(dir_pred_logits[:, h_idx].detach().cpu())
+                        val_ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
 
-                    # Accuracy (flatten to avoid broadcasting surprises)
-                    predicted_class = (logits_flat > 0).to(torch.int32)
-                    true_class = targets_flat.to(torch.int32)
-                    val_acc_sum += (predicted_class == true_class).sum().item()
-                    val_total   += true_class.numel()
+                    mask = build_dir_mask(y_return)
+                    for h_idx in range(NUM_HORIZONS):
+                        mask_h = mask[:, h_idx]
+                        if mask_h.any():
+                            logits_h = dir_pred_logits[mask_h, h_idx]
+                            targets_h = y_dir[mask_h, h_idx]
+                            val_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
+                                logits_h, targets_h, reduction='sum'
+                            ).item()
+                            val_bce_masked_count[h_idx] += mask_h.sum().item()
+                            val_logits_masked[h_idx].append(logits_h.detach().cpu())
+                            val_ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
+                            val_acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
+                            val_masked_total[h_idx] += mask_h.sum().item()
 
-                    # Masked directional metrics
-                    mask_flat = build_dir_mask(y_return).view(-1)
-                    if mask_flat.any():
-                        masked_logits = logits_flat[mask_flat]
-                        masked_targets = targets_flat[mask_flat]
-                        val_bce_masked_sum += F.binary_cross_entropy_with_logits(
-                            masked_logits, masked_targets, reduction='sum'
-                        ).item()
-                        val_bce_masked_count += masked_logits.numel()
-                        val_logits_masked.append(masked_logits.detach().cpu())
-                        val_ypos_masked.append(masked_targets.to(torch.int32).cpu())
-                        pred_masked = (masked_logits > 0).to(torch.int32)
-                        true_masked = masked_targets.to(torch.int32)
-                        val_acc_masked_sum += (pred_masked == true_masked).sum().item()
-                        val_masked_total += true_masked.numel()
+            avg_val_ret_loss_per_h = val_ret_loss_sum / max(1, val_sample_total)
+            avg_val_vol_loss_per_h = val_vol_loss_sum / max(1, val_sample_total)
+            val_dir_bce_per_h = np.divide(
+                val_bce_unmasked_sum,
+                np.maximum(val_bce_unmasked_count, 1.0)
+            )
+            val_accuracy_per_h = np.divide(val_acc_sum, np.maximum(val_total, 1.0))
 
-            avg_val_ret_loss = val_ret_loss_sum / max(1, val_sample_total)
-            avg_val_vol_loss = val_vol_loss_sum / max(1, val_sample_total)
-            val_accuracy = val_acc_sum / max(1, val_total)
-            val_logits_all = torch.cat(val_logits_all)
-            val_ypos_all   = torch.cat(val_ypos_all)
-            val_auc = binary_auc_from_logits(val_logits_all, val_ypos_all)
-            val_dir_bce = val_bce_unmasked_sum / max(1, val_bce_unmasked_count)
+            val_auc_per_h = []
+            for h_idx in range(NUM_HORIZONS):
+                if val_logits_all[h_idx]:
+                    logits_cat = torch.cat(val_logits_all[h_idx])
+                    ypos_cat = torch.cat(val_ypos_all[h_idx])
+                    val_auc_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
+                else:
+                    val_auc_per_h.append(float('nan'))
 
-            if val_bce_masked_count > 0:
-                val_logits_masked_t = torch.cat(val_logits_masked)
-                val_ypos_masked_t = torch.cat(val_ypos_masked)
-                val_auc_masked = binary_auc_from_logits(val_logits_masked_t, val_ypos_masked_t)
-                val_dir_bce_masked = val_bce_masked_sum / val_bce_masked_count
-                val_acc_masked = val_acc_masked_sum / max(1, val_masked_total)
-                masked_metrics_str = (
-                    f"val_dir_bce_masked={val_dir_bce_masked:.4e}, "
-                    f"val_acc_masked={val_acc_masked:.4f}, val_auc_masked={val_auc_masked:.4f}"
-                )
-            else:
-                masked_metrics_str = "val_dir_bce_masked=nan, val_acc_masked=nan, val_auc_masked=nan"
+            val_dir_bce_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_acc_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_auc_masked_per_h: List[float] = []
+            for h_idx in range(NUM_HORIZONS):
+                if val_bce_masked_count[h_idx] > 0:
+                    val_dir_bce_masked_per_h[h_idx] = val_bce_masked_sum[h_idx] / val_bce_masked_count[h_idx]
+                    val_acc_masked_per_h[h_idx] = val_acc_masked_sum[h_idx] / max(val_masked_total[h_idx], 1.0)
+                    logits_cat = torch.cat(val_logits_masked[h_idx])
+                    ypos_cat = torch.cat(val_ypos_masked[h_idx])
+                    val_auc_masked_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
+                else:
+                    val_auc_masked_per_h.append(float('nan'))
+
+            avg_val_ret_loss = float(np.dot(avg_val_ret_loss_per_h, horizon_weights_np) / max(horizon_weights_cpu.sum().item(), 1e-12))
+            avg_val_vol_loss = float(np.dot(avg_val_vol_loss_per_h, horizon_weights_np) / max(horizon_weights_cpu.sum().item(), 1e-12))
 
             print(
-                f"val_ret_huber={avg_val_ret_loss:.4e}, val_logvol_huber={avg_val_vol_loss:.4e}, "
-                f"val_dir_bce={val_dir_bce:.4e}, val_acc={val_accuracy:.4f}, val_auc={val_auc:.4f}, "
-                f"{masked_metrics_str}"
+                f"val_ret_huber={format_metric(avg_val_ret_loss_per_h, '{:.4e}')}, "
+                f"val_logvol_huber={format_metric(avg_val_vol_loss_per_h, '{:.4e}')}, "
+                f"val_dir_bce={format_metric(val_dir_bce_per_h, '{:.4e}')}, "
+                f"val_acc={format_metric(val_accuracy_per_h, '{:.4f}')}, "
+                f"val_auc={format_metric(val_auc_per_h, '{:.4f}')}"
+            )
+            print(
+                f"  masked_val_dir_bce={format_metric(val_dir_bce_masked_per_h, '{:.4e}')}, "
+                f"masked_val_acc={format_metric(val_acc_masked_per_h, '{:.4f}')}, "
+                f"masked_val_auc={format_metric(val_auc_masked_per_h, '{:.4f}')}"
             )
 
             scheduler.step(avg_val_ret_loss)
@@ -2320,30 +2427,108 @@ def train_and_evaluate():
 
     # =====================  Test  =====================
     model.eval()
-    tot, acc = 0, 0
-    test_logits_all, test_ypos_all = [], []
+    test_ret_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_vol_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_sample_total = 0
+    test_acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_bce_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_bce_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_bce_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_acc_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
+
+    test_logits_all = [[] for _ in range(NUM_HORIZONS)]
+    test_ypos_all = [[] for _ in range(NUM_HORIZONS)]
+    test_logits_masked = [[] for _ in range(NUM_HORIZONS)]
+    test_ypos_masked = [[] for _ in range(NUM_HORIZONS)]
 
     with torch.no_grad():
         for x, y in dl_test:
             x = x.to(device)
             y = y.to(device)
+            y_return = y[:, :NUM_HORIZONS]
+            y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+
             ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
 
-            logits_flat = dir_pred_logits.view(-1)
-            pred = (logits_flat > 0).to(torch.int32)
+            ret_loss_elem = huber_loss(ret_pred, y_return, DELTA_RET, reduction='none')
+            vol_loss_elem = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL, reduction='none')
+            batch_n = x.size(0)
 
-            true = (y[:, 0] > 0).to(torch.int32).view(-1)
+            test_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
+            test_vol_loss_sum += vol_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
+            test_sample_total += batch_n
 
-            acc += (pred.cpu() == true.cpu()).sum().item()
-            tot += true.numel()
+            y_dir = (y_return > 0).to(torch.float32)
+            bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
+            test_bce_sum += bce_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
+            test_bce_count += batch_n
 
-            test_logits_all.append(logits_flat.detach().cpu())
-            test_ypos_all.append(true.detach().cpu())
+            pred_class = (dir_pred_logits > 0).to(torch.int32)
+            true_class = y_dir.to(torch.int32)
+            test_acc_sum += (pred_class == true_class).sum(dim=0).detach().cpu().numpy().astype(np.float64)
+            test_total += batch_n
 
-    test_logits_all = torch.cat(test_logits_all)
-    test_ypos_all   = torch.cat(test_ypos_all)
-    test_auc = binary_auc_from_logits(test_logits_all, test_ypos_all)
-    print(f"Test acc {acc/max(1, tot):.4f}, Test AUC {test_auc:.4f}")
+            for h_idx in range(NUM_HORIZONS):
+                test_logits_all[h_idx].append(dir_pred_logits[:, h_idx].detach().cpu())
+                test_ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
+
+            mask = build_dir_mask(y_return)
+            for h_idx in range(NUM_HORIZONS):
+                mask_h = mask[:, h_idx]
+                if mask_h.any():
+                    logits_h = dir_pred_logits[mask_h, h_idx]
+                    targets_h = y_dir[mask_h, h_idx]
+                    test_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
+                        logits_h, targets_h, reduction='sum'
+                    ).item()
+                    test_bce_masked_count[h_idx] += mask_h.sum().item()
+                    test_logits_masked[h_idx].append(logits_h.detach().cpu())
+                    test_ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
+                    test_acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
+                    test_masked_total[h_idx] += mask_h.sum().item()
+
+    avg_test_ret_loss_per_h = test_ret_loss_sum / max(1, test_sample_total)
+    avg_test_vol_loss_per_h = test_vol_loss_sum / max(1, test_sample_total)
+    test_dir_bce_per_h = np.divide(test_bce_sum, np.maximum(test_bce_count, 1.0))
+    test_accuracy_per_h = np.divide(test_acc_sum, np.maximum(test_total, 1.0))
+
+    test_auc_per_h = []
+    for h_idx in range(NUM_HORIZONS):
+        if test_logits_all[h_idx]:
+            logits_cat = torch.cat(test_logits_all[h_idx])
+            ypos_cat = torch.cat(test_ypos_all[h_idx])
+            test_auc_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
+        else:
+            test_auc_per_h.append(float('nan'))
+
+    test_dir_bce_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+    test_acc_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+    test_auc_masked_per_h: List[float] = []
+    for h_idx in range(NUM_HORIZONS):
+        if test_bce_masked_count[h_idx] > 0:
+            test_dir_bce_masked_per_h[h_idx] = test_bce_masked_sum[h_idx] / test_bce_masked_count[h_idx]
+            test_acc_masked_per_h[h_idx] = test_acc_masked_sum[h_idx] / max(test_masked_total[h_idx], 1.0)
+            logits_cat = torch.cat(test_logits_masked[h_idx])
+            ypos_cat = torch.cat(test_ypos_masked[h_idx])
+            test_auc_masked_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
+        else:
+            test_auc_masked_per_h.append(float('nan'))
+
+    print(
+        f"Test_ret_huber={format_metric(avg_test_ret_loss_per_h, '{:.4e}')}, "
+        f"Test_logvol_huber={format_metric(avg_test_vol_loss_per_h, '{:.4e}')}, "
+        f"Test_dir_bce={format_metric(test_dir_bce_per_h, '{:.4e}')}, "
+        f"Test_acc={format_metric(test_accuracy_per_h, '{:.4f}')}, "
+        f"Test_auc={format_metric(test_auc_per_h, '{:.4f}')}"
+    )
+    print(
+        f"  masked_Test_dir_bce={format_metric(test_dir_bce_masked_per_h, '{:.4e}')}, "
+        f"masked_Test_acc={format_metric(test_acc_masked_per_h, '{:.4f}')}, "
+        f"masked_Test_auc={format_metric(test_auc_masked_per_h, '{:.4f}')}"
+    )
 
 
 if __name__ == "__main__":
