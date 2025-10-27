@@ -1179,8 +1179,11 @@ class FeatureEngine:
         self.trades_100ms: Deque[Tuple[int, float, float, str]] = deque()
         self.trades_250ms: Deque[Tuple[int,float,float,str]] = deque()
 
-        # ---------- Event density (100 ms) ----------
+        # ---------- Event density (25/100/250/500 ms) ----------
+        self.ev_25ms: Deque[int] = deque()
         self.ev_100ms: Deque[int] = deque()
+        self.ev_250ms: Deque[int] = deque()
+        self.ev_500ms: Deque[int] = deque()
         self.ev_1s:    Deque[int] = deque()
 
         # ---------- Volume regime EWMAs (vol/sec) ----------
@@ -1279,13 +1282,26 @@ class FeatureEngine:
         while deq and (now_ms - deq[0][0] > window_ms):
             deq.popleft()
 
+    def _event_density(self, deq: Deque[int], window_ms: int) -> float:
+        if not deq:
+            return 0.0
+        now = deq[-1]
+        self._prune_ts_deque(deq, now, window_ms)
+        window_secs = window_ms / 1000.0
+        return len(deq) / window_secs if window_secs > 0 else 0.0
+
+    def event_density_25ms(self) -> float:
+        return self._event_density(self.ev_25ms, 25)
+
     def event_density_100ms(self) -> float:
         # events per 0.1s
-        if not self.ev_100ms:
-            return 0.0
-        now = self.ev_100ms[-1]
-        self._prune_ts_deque(self.ev_100ms, now, 100)
-        return len(self.ev_100ms) / 0.1
+        return self._event_density(self.ev_100ms, 100)
+
+    def event_density_250ms(self) -> float:
+        return self._event_density(self.ev_250ms, 250)
+
+    def event_density_500ms(self) -> float:
+        return self._event_density(self.ev_500ms, 500)
 
     def _prune_ts_deque(self, deq: Deque[int], now_ms: int, window_ms: int):
         while deq and (now_ms - deq[0] > window_ms):
@@ -1471,8 +1487,14 @@ class FeatureEngine:
         dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
 
         # Event density
+        self.ev_25ms.append(ts_ms)
+        self._prune_ts_deque(self.ev_25ms, ts_ms, 25)
         self.ev_100ms.append(ts_ms)
         self._prune_ts_deque(self.ev_100ms, ts_ms, 100)
+        self.ev_250ms.append(ts_ms)
+        self._prune_ts_deque(self.ev_250ms, ts_ms, 250)
+        self.ev_500ms.append(ts_ms)
+        self._prune_ts_deque(self.ev_500ms, ts_ms, 500)
         self.ev_1s.append(ts_ms)
         self._prune_ts_deque(self.ev_1s, ts_ms, 1000)
 
@@ -1708,7 +1730,10 @@ class FeatureEngine:
             quotes_1s,
             trade_cnt_100ms,
             len(all_trades_recent),
+            self.event_density_25ms(),
             self.event_density_100ms(),  # events per 0.1s (helper)
+            self.event_density_250ms(),
+            self.event_density_500ms(),
 
             # --- best-level churn & depletion & spread-change stats ---
             len(self.bid1_changes_1s), len(self.ask1_changes_1s),
