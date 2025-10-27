@@ -2100,14 +2100,19 @@ def train_and_evaluate():
     neg_lo_arr = np.array(neg_lo_list, dtype=np.float32)
     neg_hi_arr = np.array(neg_hi_list, dtype=np.float32)
 
+    pos_lo_t = torch.from_numpy(pos_lo_arr)
+    pos_hi_t = torch.from_numpy(pos_hi_arr)
+    neg_lo_t = torch.from_numpy(neg_lo_arr)
+    neg_hi_t = torch.from_numpy(neg_hi_arr)
+
     def build_dir_mask(y_ret: torch.Tensor) -> torch.Tensor:
         pos = y_ret > 0
         neg = y_ret < 0
 
-        lo_pos = torch.tensor(pos_lo_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
-        hi_pos = torch.tensor(pos_hi_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
-        lo_neg = torch.tensor(neg_lo_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
-        hi_neg = torch.tensor(neg_hi_arr, device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
+        lo_pos = pos_lo_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
+        hi_pos = pos_hi_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
+        lo_neg = neg_lo_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
+        hi_neg = neg_hi_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
 
         mag_neg = (-y_ret).clamp_min(0.0)
         keep_pos = pos & (y_ret >= lo_pos) & (y_ret <= hi_pos)
