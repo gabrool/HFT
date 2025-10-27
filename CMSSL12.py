@@ -1156,14 +1156,24 @@ class FeatureEngine:
 
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute σ and VR
-        self.ret_hist: Deque[Tuple[int, float]] = deque()          # up to 1d
         self.ret_hist_25ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_50ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_100ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_250ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_500ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_1s: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_10s: Deque[Tuple[int, float]] = deque()
+        self.ret_hist_5s: Deque[Tuple[int, float]] = deque()
+
+        self.regime_windows_ms: Tuple[int, ...] = (500, 1_000, 5_000)
+        self.rv_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
+        self.realized_vol: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
+        self.volume_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
+        self.flow_regime: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
+        self._regime_return_deques: Dict[int, Deque[Tuple[int, float]]] = {
+            500: self.ret_hist_500ms,
+            1_000: self.ret_hist_1s,
+            5_000: self.ret_hist_5s,
+        }
         self.last_mid_for_ret: Optional[float] = None
 
         # ---------- Spread ----------
@@ -1198,6 +1208,7 @@ class FeatureEngine:
         self.trades_250ms: Deque[Tuple[int, float, float, str]] = deque()
         self.trades_500ms: Deque[Tuple[int, float, float, str]] = deque()
         self.trades_1s: Deque[Tuple[int, float, float, str]] = deque()
+        self.trades_5s: Deque[Tuple[int, float, float, str]] = deque()
 
         self.trade_windows: Tuple[int, ...] = (25, 50, 100, 250, 500)
         self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str]]] = {
@@ -1230,20 +1241,12 @@ class FeatureEngine:
         self.ev_500ms: Deque[int] = deque()
         self.ev_1s:    Deque[int] = deque()
 
-        # ---------- Volume regime EWMAs (vol/sec) ----------
-        self.v_ewma_short: float = 0.0   # ~30s half-life
-        self.v_ewma_long: float = 0.0    # ~1d half-life
-
         # ---------- VPIN state ----------
         self.vpin_Vb: Optional[float] = None          # dynamic bucket size (in base-volume)
         self.vpin_cum_buy: float = 0.0
         self.vpin_cum_sell: float = 0.0
         self.vpin_cum: float = 0.0
         self.vpin_phi: Deque[float] = deque(maxlen=50)
-
-        # ---------- Multi-day EWMAs of r^2 ----------
-        self.ewma7d: float = 0.0
-        self.ewma30d: float = 0.0
 
         # ---------- EWMAs for microprice and spread (short/med/long) ----------
         self.ema_mp_25: Optional[float] = None
@@ -1512,14 +1515,16 @@ class FeatureEngine:
             self._prune_deque_ms(deq, ts_ms, window)
         self.trades_1s.append(entry)
         self._prune_deque_ms(self.trades_1s, ts_ms, 1_000)
+        self.trades_5s.append(entry)
+        self._prune_deque_ms(self.trades_5s, ts_ms, 5_000)
 
         # Update volume-regime (vol/sec) EWMAs using provided dt_ms
         vol_rate = size / (dt_ms / 1000.0)  # base per second
-        self.v_ewma_short = self._ewma_update(self.v_ewma_short, vol_rate, dt_ms, 10_000)       # ~30s HL
-        self.v_ewma_long  = self._ewma_update(self.v_ewma_long,  vol_rate, dt_ms, 86_400_000)   # ~1d HL
+        for hl in self.regime_windows_ms:
+            self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_ms, hl)
 
         # VPIN bucket sizing and accumulation
-        v_per_sec = max(self.v_ewma_short, 1e-9)
+        v_per_sec = max(self.volume_ewma[1_000], 1e-9)
         Vb = max(v_per_sec * self.vpin_target_bucket_secs, 1e-9)
         self.vpin_Vb = Vb if self.vpin_Vb is None else (0.9 * self.vpin_Vb + 0.1 * Vb)
 
@@ -1556,14 +1561,13 @@ class FeatureEngine:
         self.last_mid_for_ret = mid
 
         # push to windows
-        self.ret_hist.append((ts_ms, r))           # ~1d bag (we prune lazily when we need 1d)
         self.ret_hist_25ms.append((ts_ms, r))
         self.ret_hist_50ms.append((ts_ms, r))
         self.ret_hist_100ms.append((ts_ms, r))
         self.ret_hist_250ms.append((ts_ms, r))
         self.ret_hist_500ms.append((ts_ms, r))
         self.ret_hist_1s.append((ts_ms, r))
-        self.ret_hist_10s.append((ts_ms, r))
+        self.ret_hist_5s.append((ts_ms, r))
 
         self._prune_deque_ms(self.ret_hist_25ms, ts_ms, 25)
         self._prune_deque_ms(self.ret_hist_50ms, ts_ms, 50)
@@ -1571,15 +1575,16 @@ class FeatureEngine:
         self._prune_deque_ms(self.ret_hist_250ms, ts_ms, 250)
         self._prune_deque_ms(self.ret_hist_500ms, ts_ms, 500)
         self._prune_deque_ms(self.ret_hist_1s, ts_ms, 1_000)
-        self._prune_deque_ms(self.ret_hist_10s, ts_ms, 10_000)
-        # keep up to 1d for RV
-        while self.ret_hist and (ts_ms - self.ret_hist[0][0] > 86_400_000):
-            self.ret_hist.popleft()
+        self._prune_deque_ms(self.ret_hist_5s, ts_ms, 5_000)
 
-        # update multi-day EWMA of r^2 (continuous in ms time)
+        # update short-horizon EWMA and realized vol caches
         dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
         r2 = r * r
-        self.ewma7d  = self._ewma_update(self.ewma7d,  r2, dt_ms, 7 * 86_400_000)
+        for hl in self.regime_windows_ms:
+            self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
+
+        for ms, deq in self._regime_return_deques.items():
+            self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in deq))
         return r
 
     def _stats_from_returns(self, deq: Deque[Tuple[int, float]]) -> Tuple[float, float]:
@@ -1761,6 +1766,7 @@ class FeatureEngine:
             for ms in self.trade_windows
         }
         stats_1s = self._compute_trade_window_stats(self.trades_1s, mid)
+        stats_5s = self._compute_trade_window_stats(self.trades_5s, mid)
 
         # Quote/trade tempo (1s windows)
         quotes_1s = float(len(self.quotes_1s))
@@ -1778,6 +1784,14 @@ class FeatureEngine:
         trade_imb_1s = stats_1s["imbalance"]
         net_vol_1s = stats_1s["net_flow"]
         trade_through_1s = stats_1s["trade_through"]
+
+        regime_flow = {
+            500: trade_stats.get(500, stats_1s)["imbalance"],
+            1_000: stats_1s["imbalance"],
+            5_000: stats_5s["imbalance"],
+        }
+        for ms, val in regime_flow.items():
+            self.flow_regime[ms] = val
 
         # Spread
         if self.last_spread is None or spread != self.last_spread:
@@ -1818,20 +1832,26 @@ class FeatureEngine:
         _, var_250 = self._stats_from_returns(self.ret_hist_250ms)
         _, var_500 = self._stats_from_returns(self.ret_hist_500ms)
         _, var_1s = self._stats_from_returns(self.ret_hist_1s)
+        _, var_5s = self._stats_from_returns(self.ret_hist_5s)
         std_25 = math.sqrt(max(0.0, var_25))
         std_50 = math.sqrt(max(0.0, var_50))
         std_100 = math.sqrt(max(0.0, var_100))
         std_250 = math.sqrt(max(0.0, var_250))
         std_500 = math.sqrt(max(0.0, var_500))
         std_1s = math.sqrt(max(0.0, var_1s))
+        std_5s = math.sqrt(max(0.0, var_5s))
         # Variance ratio: 1s variance vs 10 * 100ms variance (1s = 10×100ms)
         vr = (var_1s / max(10.0 * var_100, 1e-12)) if var_100 > 0 else 0.0
         vr_1s_250 = var_1s / max(4.0 * var_250, 1e-12) if var_250 > 0 else 0.0
 
-        # Multi-day √RV and √EWMA (7d, 30d)
-        rv_1d = math.sqrt(sum(x * x for _, x in self.ret_hist)) if self.ret_hist else 0.0
-        sqrt_ewma7d = math.sqrt(max(self.ewma7d, 1e-18))
-        sqrt_ewma30d = math.sqrt(max(self.ewma30d, 1e-18))
+        # Short-horizon regime summaries (vol & flow)
+        regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
+        regime_realized = {ms: self.realized_vol[ms] for ms in self.regime_windows_ms}
+        regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
+        regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
+        vol_ratio_short_long = regime_volume[500] / max(regime_volume[5_000], 1e-9)
+        realized_ratio_short_long = regime_realized[500] / max(regime_realized[5_000], 1e-12)
+        flow_diff_short_long = regime_flow_snapshot[500] - regime_flow_snapshot[5_000]
 
         # EMA (microprice & spread) and RSI(micro)
         for attr, val, hl in [
@@ -1873,9 +1893,6 @@ class FeatureEngine:
         mad = abs(micro - (self.cci_mean if self.cci_mean is not None else micro))
         self.cci_mad = ema_ms(getattr(self, 'cci_mad', None), mad, 200.0)
         cci = 0.015 * ((micro - (self.cci_mean or micro)) / max(self.cci_mad or 1e-12, 1e-12))
-
-        # Volume regime factor (short vs long)
-        vol_regime = self.v_ewma_short / max(self.v_ewma_long, 1e-9)
 
         # VPIN value (avg of last M φ)
         vpin = (sum(self.vpin_phi) / len(self.vpin_phi)) if self.vpin_phi else 0.0
@@ -1925,7 +1942,7 @@ class FeatureEngine:
             float(n_spread_chg_250ms), float(n_spread_chg_1s),
 
             # --- returns & vol stats ---
-            std_25, std_50, std_100, std_250, std_500, std_1s,
+            std_25, std_50, std_100, std_250, std_500, std_1s, std_5s,
             vr, vr_1s_250,
 
             # --- EMAs & technicals ---
@@ -1942,7 +1959,12 @@ class FeatureEngine:
             cci,
 
             # --- regime & risks ---
-            vol_regime, vpin, rv_1d, sqrt_ewma7d, sqrt_ewma30d,
+            self.volume_ewma[500], self.volume_ewma[1_000], self.volume_ewma[5_000],
+            regime_realized[500], regime_realized[1_000], regime_realized[5_000],
+            regime_vol_ewma[500], regime_vol_ewma[1_000], regime_vol_ewma[5_000],
+            self.flow_regime[500], self.flow_regime[1_000], self.flow_regime[5_000],
+            vol_ratio_short_long, realized_ratio_short_long, flow_diff_short_long,
+            vpin,
         ]
 
         # --- per-horizon trade stats & liquidity metrics (25/50/100/250/500 ms) ---
