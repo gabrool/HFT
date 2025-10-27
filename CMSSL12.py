@@ -1220,6 +1220,37 @@ class FeatureEngine:
         self.press_1s: float = 0.0
         self.press_5s: float = 0.0
 
+        # ---------- Fast EMA state for microstructure signals ----------
+        self.ema_half_lives_ms = (25, 100, 500)
+        self.ema_indicator_names = (
+            "bid1",
+            "ask1",
+            "mid",
+            "spread",
+            "micro",
+            "smart",
+            "gap_a",
+            "gap_b",
+            "cum_bid1",
+            "cum_ask1",
+            "cum_bid3",
+            "cum_ask3",
+            "slope_a",
+            "slope_b",
+            "obi_l1",
+            "obi_l3",
+            "obi_l5",
+            "ofi_l1",
+            "ofi_l3",
+            "ofi_l5",
+            "micro_premia",
+            "smart_premia",
+        )
+        self.ema_states: Dict[int, Dict[str, Optional[float]]] = {
+            hl: {name: None for name in self.ema_indicator_names}
+            for hl in self.ema_half_lives_ms
+        }
+
         # ---------- Rolling z-score state (per-feature EWMA mean/var) ----------
         self.z_mean: Optional[np.ndarray] = None
         self.z_m2: Optional[np.ndarray] = None  # EWMA of x^2 (for var = m2 - mean^2)
@@ -1243,6 +1274,17 @@ class FeatureEngine:
         hl = self._alpha_half_life_ms(hl_ms_cfg)
         alpha = 1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl))
         return (1.0 - alpha) * prev + alpha * x
+
+    def _update_indicator_emas(self, signals: Dict[str, float], dt_ms: float) -> None:
+        for hl in self.ema_half_lives_ms:
+            state = self.ema_states[hl]
+            for name in self.ema_indicator_names:
+                value = signals[name]
+                prev = state[name]
+                if prev is None:
+                    state[name] = value
+                else:
+                    state[name] = self._ewma_update(prev, value, dt_ms, hl)
 
     def _lin_slope(self, xs: List[float], ys: List[float], eps: float = 1e-12) -> float:
         n = len(xs)
@@ -1531,6 +1573,8 @@ class FeatureEngine:
         gap_b = max(0.0, bid1 - bid2)
 
         # Cum depths
+        cum_bid1 = self._cum_depth(self.bid_lvls, 1)
+        cum_ask1 = self._cum_depth(self.ask_lvls, 1)
         cum_bid3 = self._cum_depth(self.bid_lvls, 3)
         cum_ask3 = self._cum_depth(self.ask_lvls, 3)
         cum_bid5 = self._cum_depth(self.bid_lvls, 5)
@@ -1560,6 +1604,32 @@ class FeatureEngine:
         xa, ya = self._levels_to_xy(self.ask_lvls, mid, False, 5)
         slope_b = self._lin_slope(xb, yb)
         slope_a = self._lin_slope(xa, ya)
+
+        indicator_values = {
+            "bid1": bid1,
+            "ask1": ask1,
+            "mid": mid,
+            "spread": spread,
+            "micro": micro,
+            "smart": smart,
+            "gap_a": gap_a,
+            "gap_b": gap_b,
+            "cum_bid1": cum_bid1,
+            "cum_ask1": cum_ask1,
+            "cum_bid3": cum_bid3,
+            "cum_ask3": cum_ask3,
+            "slope_a": slope_a,
+            "slope_b": slope_b,
+            "obi_l1": obi_l1,
+            "obi_l3": obi_l3,
+            "obi_l5": obi_l5,
+            "ofi_l1": ofi_l1,
+            "ofi_l3": ofi_l3,
+            "ofi_l5": ofi_l5,
+            "micro_premia": micro_premia,
+            "smart_premia": smart_premia,
+        }
+        self._update_indicator_emas(indicator_values, dt_ms)
 
         # Pressure (EWMA of OFI L1)
         self.press_50ms  = self._ewma_update(getattr(self, 'press_50ms', 0.0), ofi_l1, dt_ms,  50)
@@ -1705,7 +1775,7 @@ class FeatureEngine:
         vpin = (sum(self.vpin_phi) / len(self.vpin_phi)) if self.vpin_phi else 0.0
 
         # Build raw feature vector
-        feat = np.array([
+        feat_list = [
             # --- price/state ---
             bid1, ask1, mid, micro, smart, spread, gap_a, gap_b,
             bsz1, asz1,
@@ -1769,7 +1839,27 @@ class FeatureEngine:
 
             # --- regime & risks ---
             vol_regime, vpin, rv_1d, sqrt_ewma7d, sqrt_ewma30d,
-        ], dtype=np.float64)
+        ]
+
+        # --- indicator EMAs (25/100/500 ms) ---
+        for hl in self.ema_half_lives_ms:
+            state = self.ema_states[hl]
+            for name in self.ema_indicator_names:
+                ema_val = state[name]
+                if ema_val is None:
+                    ema_val = indicator_values[name]
+                feat_list.append(ema_val)
+
+        # --- indicator EMA residuals (raw - EMA) ---
+        for hl in self.ema_half_lives_ms:
+            state = self.ema_states[hl]
+            for name in self.ema_indicator_names:
+                ema_val = state[name]
+                if ema_val is None:
+                    ema_val = indicator_values[name]
+                feat_list.append(indicator_values[name] - ema_val)
+
+        feat = np.array(feat_list, dtype=np.float64)
 
         # Rolling z-score normalization
         feat_z = self._zscore(feat, dt_ms)
