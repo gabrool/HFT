@@ -1275,6 +1275,7 @@ class FeatureEngine:
         self.ema_sp_25: Optional[float] = None
         self.ema_sp_100: Optional[float] = None
         self.ema_sp_500: Optional[float] = None
+        self.ema_sp_1000: Optional[float] = None
 
         # ---------- RSI on microprice (EWMA gains/losses) ----------
         self.rsi_gain: Optional[float] = None
@@ -1933,17 +1934,37 @@ class FeatureEngine:
         flow_diff_short_long = regime_flow_snapshot[500] - regime_flow_snapshot[5_000]
 
         # EMA (microprice & spread) and RSI(micro)
-        for attr, val, hl in [
-            ("ema_mp_25", micro, 50),
-            ("ema_mp_100", micro, 200),
-            ("ema_mp_500", micro, 800),
-            ("ema_sp_25", spread, 50),
-            ("ema_sp_100", spread, 200),
-            ("ema_sp_500", spread, 800),
+        for attr, val, hl, use_half_life in [
+            ("ema_mp_25", micro, 50, False),
+            ("ema_mp_100", micro, 200, False),
+            ("ema_mp_500", micro, 800, False),
+            ("ema_sp_25", spread, 50, False),
+            ("ema_sp_100", spread, 100, True),
+            ("ema_sp_500", spread, 500, True),
+            ("ema_sp_1000", spread, 1000, True),
         ]:
             cur = getattr(self, attr)
-            alpha = 1.0 - math.exp(-dt_ms / float(max(1, hl)))
-            setattr(self, attr, (1.0 - alpha) * (cur if cur is not None else val) + alpha * val)
+            if use_half_life:
+                prev = cur if cur is not None else val
+                updated = self._ewma_update(prev, val, dt_ms, hl)
+            else:
+                alpha = 1.0 - math.exp(-dt_ms / float(max(1, hl)))
+                updated = (1.0 - alpha) * (cur if cur is not None else val) + alpha * val
+            setattr(self, attr, updated)
+
+        spread_ema_vals = {
+            100: self.ema_sp_100 if self.ema_sp_100 is not None else spread,
+            500: self.ema_sp_500 if self.ema_sp_500 is not None else spread,
+            1000: self.ema_sp_1000 if self.ema_sp_1000 is not None else spread,
+        }
+        spread_ratios = {
+            hl: spread / max(val, 1e-9)
+            for hl, val in spread_ema_vals.items()
+        }
+        spread_log_ratios = {
+            hl: math.log(max(spread, 1e-9)) - math.log(max(val, 1e-9))
+            for hl, val in spread_ema_vals.items()
+        }
 
         # RSI on microprice (use EWMA gains/losses with ~100ms smoothing)
         delta_mp = micro - (self.ema_mp_25 if self.ema_mp_25 is not None else micro)
@@ -2033,6 +2054,9 @@ class FeatureEngine:
             (self.ema_sp_25 if self.ema_sp_25 is not None else spread),
             (self.ema_sp_100 if self.ema_sp_100 is not None else spread),
             (self.ema_sp_500 if self.ema_sp_500 is not None else spread),
+            (self.ema_sp_1000 if self.ema_sp_1000 is not None else spread),
+            spread_ratios[100], spread_ratios[500], spread_ratios[1000],
+            spread_log_ratios[100], spread_log_ratios[500], spread_log_ratios[1000],
             rsi,
             macd_raw,
             (self.macd_sig if getattr(self, 'macd_sig', None) is not None else 0.0),
