@@ -1145,6 +1145,8 @@ class FeatureEngine:
         self.ask_lvls: List[Tuple[float, float]] = []  # sorted asc by price
         self.prev_bsz: float = 0.0
         self.prev_asz: float = 0.0
+        self.prev_cum_bid3: float = 0.0
+        self.prev_cum_ask3: float = 0.0
         self.prev_cum_bid5: float = 0.0
         self.prev_cum_ask5: float = 0.0
 
@@ -1529,21 +1531,24 @@ class FeatureEngine:
         gap_b = max(0.0, bid1 - bid2)
 
         # Cum depths
+        cum_bid3 = self._cum_depth(self.bid_lvls, 3)
+        cum_ask3 = self._cum_depth(self.ask_lvls, 3)
         cum_bid5 = self._cum_depth(self.bid_lvls, 5)
         cum_ask5 = self._cum_depth(self.ask_lvls, 5)
         cum_bid10 = self._cum_depth(self.bid_lvls, 10)
         cum_ask10 = self._cum_depth(self.ask_lvls, 10)
 
-        # OFI (L1 and L5)
+        # OFI (L1/L3/L5)
         ofi_l1 = (bsz1 - self.prev_bsz) - (asz1 - self.prev_asz)
+        ofi_l3 = (cum_bid3 - self.prev_cum_bid3) - (cum_ask3 - self.prev_cum_ask3)
         ofi_l5 = (cum_bid5 - self.prev_cum_bid5) - (cum_ask5 - self.prev_cum_ask5)
         self.prev_bsz, self.prev_asz = bsz1, asz1
+        self.prev_cum_bid3, self.prev_cum_ask3 = cum_bid3, cum_ask3
         self.prev_cum_bid5, self.prev_cum_ask5 = cum_bid5, cum_ask5
 
         # OBI (L1, L3 and L5)
         obi_l1 = (bsz1 - asz1) / max(bsz1 + asz1, 1e-12)
-        obi_l3 = (self._cum_depth(self.bid_lvls, 3) - self._cum_depth(self.ask_lvls, 3)) \
-                / max(self._cum_depth(self.bid_lvls, 3) + self._cum_depth(self.ask_lvls, 3), 1e-12)
+        obi_l3 = (cum_bid3 - cum_ask3) / max(cum_bid3 + cum_ask3, 1e-12)
         obi_l5 = (cum_bid5 - cum_ask5) / max(cum_bid5 + cum_ask5, 1e-12)
 
         # Micro-premia vs spread
@@ -1710,7 +1715,7 @@ class FeatureEngine:
             slope_b, slope_a,
 
             # --- imbalance & premia ---
-            ofi_l1, ofi_l5,
+            ofi_l1, ofi_l3, ofi_l5,
             obi_l1, obi_l3, obi_l5,
             micro_premia, smart_premia,
 
