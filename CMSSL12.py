@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable
+from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable, Union
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import math
@@ -441,9 +441,13 @@ LAMBDA_CPC_FT   = 0.02
 LAMBDA_RECON_PT = 1.00
 LAMBDA_CPC_PT   = 0.50
 
-# Huber deltas (tuned conservative defaults)
-DELTA_RET       = 1e-4
-DELTA_LOGVOL    = 0.02
+# Huber deltas (per horizon).
+# We start from calibrated 50ms thresholds (1e-4 return, 0.02 log-vol)
+# and scale them ~sqrt(horizon) to reflect the diffusive growth in magnitude
+# as horizons lengthen.
+_DELTA_BASE_H = HORIZONS_MS[0]
+DELTA_RET       = [1e-4 * math.sqrt(h / _DELTA_BASE_H) for h in HORIZONS_MS]
+DELTA_LOGVOL    = [0.02 * math.sqrt(h / _DELTA_BASE_H) for h in HORIZONS_MS]
 
 # CPC settings
 CPC_DELTAS_MS   = [25, 50, 100]  # 25/50/100 ms
@@ -1935,14 +1939,30 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
 def huber_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    delta: float,
+    delta: Union[float, Iterable[float], torch.Tensor],
     weights: Optional[torch.Tensor] = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
     """Huber loss with optional per-dimension weights and reduction control."""
     diff = pred - target
     abs_diff = diff.abs()
-    delta_tensor = torch.tensor(delta, device=pred.device, dtype=pred.dtype)
+    delta_tensor = torch.as_tensor(delta, device=pred.device, dtype=pred.dtype)
+    if delta_tensor.ndim == 0:
+        delta_tensor = delta_tensor.view(1)
+    delta_tensor = delta_tensor.view(1, -1)
+
+    if diff.ndim == 0:
+        delta_tensor = delta_tensor.view(())
+    else:
+        target_shape = (1,) * (diff.ndim - 1) + (-1,)
+        delta_tensor = delta_tensor.view(*target_shape)
+        if delta_tensor.shape[-1] not in (1, diff.shape[-1]):
+            raise ValueError(
+                "delta must broadcast to the last dimension of pred/target"
+            )
+        if delta_tensor.shape[-1] == 1 and diff.shape[-1] != 1:
+            delta_tensor = delta_tensor.expand(*delta_tensor.shape[:-1], diff.shape[-1])
+
     quadratic = torch.minimum(abs_diff, delta_tensor)
     linear = abs_diff - quadratic
     loss = 0.5 * quadratic**2 / delta_tensor + linear
@@ -2118,6 +2138,8 @@ def train_and_evaluate():
     model = SAMBA(args).to(device)
 
     horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
+    delta_ret_tensor = torch.as_tensor(DELTA_RET, dtype=torch.float32, device=device)
+    delta_logvol_tensor = torch.as_tensor(DELTA_LOGVOL, dtype=torch.float32, device=device)
     horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
     horizon_weights_np = horizon_weights_cpu.numpy()
 
@@ -2206,8 +2228,8 @@ def train_and_evaluate():
                 # Fine-tune: supervised + tiny SSL auxiliaries (EMA-normalized)
                 y_ret = y[:, :NUM_HORIZONS]
                 y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
-                mse_ret = huber_loss(ret_pred, y_ret, DELTA_RET, weights=horizon_weights)
-                mse_vol = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL, weights=horizon_weights)
+                mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
+                mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
                 bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
                 ema_ret   = ema_update('ret',    mse_ret.item(),  ema_ft)
@@ -2240,8 +2262,8 @@ def train_and_evaluate():
             else:
                 y_ret = y[:, :NUM_HORIZONS]
                 y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
-                mse_ret2 = huber_loss(ret_pred2, y_ret, DELTA_RET, weights=horizon_weights)
-                mse_vol2 = huber_loss(vol_pred2, y_logvol, DELTA_LOGVOL, weights=horizon_weights)
+                mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
+                mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
                 bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
 
                 ema_ret   = ema_ft['ret']
@@ -2328,8 +2350,8 @@ def train_and_evaluate():
 
                     ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
 
-                    ret_loss_elem = huber_loss(ret_pred, y_return, DELTA_RET, reduction='none')
-                    vol_loss_elem = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL, reduction='none')
+                    ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
+                    vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
                     batch_n = x.size(0)
 
                     val_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
@@ -2453,8 +2475,8 @@ def train_and_evaluate():
 
             ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
 
-            ret_loss_elem = huber_loss(ret_pred, y_return, DELTA_RET, reduction='none')
-            vol_loss_elem = huber_loss(vol_pred, y_logvol, DELTA_LOGVOL, reduction='none')
+            ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
+            vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
             batch_n = x.size(0)
 
             test_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
