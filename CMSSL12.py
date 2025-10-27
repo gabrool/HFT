@@ -1921,12 +1921,12 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
         feat_dim = fe.feature_dim() if fe._feat_dim is not None else 0
         return (
             np.empty((0, LOOKBACK, 0), dtype=np.float32),
-            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2 * NUM_HORIZONS), dtype=np.float32),
             feat_dim,
         )
 
     X = np.stack(X_list, axis=0).astype(np.float32)  # [N, L, F]
-    Y = np.stack(y_list, axis=0).astype(np.float32)  # [N, 2] -> [return, log-vol or your 2nd target]
+    Y = np.stack(y_list, axis=0).astype(np.float32)  # [N, 2 * NUM_HORIZONS] -> [returns || log-vol targets]
     feat_dim = fe.feature_dim()
     return X, Y, feat_dim
 
