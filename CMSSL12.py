@@ -1145,6 +1145,8 @@ class FeatureEngine:
         self.ask_lvls: List[Tuple[float, float]] = []  # sorted asc by price
         self.prev_bsz: float = 0.0
         self.prev_asz: float = 0.0
+        self.prev_bsz2: float = 0.0
+        self.prev_asz2: float = 0.0
         self.prev_cum_bid3: float = 0.0
         self.prev_cum_ask3: float = 0.0
         self.prev_cum_bid5: float = 0.0
@@ -1201,6 +1203,23 @@ class FeatureEngine:
         self.last_bid1 = None; self.last_ask1 = None
         self.neg_dbsz_250 = 0.0; self.neg_dasz_250 = 0.0
         self.sz_deltas_250ms: Deque[Tuple[int,float,float]] = deque()
+
+        # ---------- Liquidity replenishment tracking (L1/L2) ----------
+        self.replen_windows_ms: Tuple[int, ...] = (25, 50, 100, 250, 500)
+        self._replen_keys: Tuple[Tuple[str, int, str], ...] = tuple(
+            (side, level, kind)
+            for side in ("bid", "ask")
+            for level in (1, 2)
+            for kind in ("add", "rem")
+        )
+        self.replen_deques: Dict[int, Dict[Tuple[str, int, str], Deque[Tuple[int, float]]]] = {
+            window: {key: deque() for key in self._replen_keys}
+            for window in self.replen_windows_ms
+        }
+        self.replen_sums: Dict[int, Dict[Tuple[str, int, str], float]] = {
+            window: {key: 0.0 for key in self._replen_keys}
+            for window in self.replen_windows_ms
+        }
 
         # ---------- Trades windows for short VWAP & bursts ----------
         self.trades_25ms: Deque[Tuple[int, float, float, str]] = deque()   # (ts, price, size, side)
@@ -1441,6 +1460,38 @@ class FeatureEngine:
         while deq and (now_ms - deq[0] > window_ms):
             deq.popleft()
 
+    def _prune_replen_windows(self, now_ms: int):
+        for window, key_map in self.replen_deques.items():
+            max_age = window
+            sums_map = self.replen_sums[window]
+            for key, dq in key_map.items():
+                while dq and (now_ms - dq[0][0] > max_age):
+                    _, val = dq.popleft()
+                    sums_map[key] -= val
+
+    def _record_replenishment(self, ts_ms: int, deltas: Dict[Tuple[str, int, str], float]):
+        if not deltas:
+            return
+        for window in self.replen_windows_ms:
+            key_map = self.replen_deques[window]
+            sums_map = self.replen_sums[window]
+            for key, value in deltas.items():
+                if value <= 0.0:
+                    continue
+                dq = key_map[key]
+                dq.append((ts_ms, value))
+                sums_map[key] += value
+
+    def _replenishment_rates(self) -> Dict[int, Dict[Tuple[str, int, str], float]]:
+        rates: Dict[int, Dict[Tuple[str, int, str], float]] = {}
+        for window in self.replen_windows_ms:
+            scale = float(window) if window > 0 else 1.0
+            rates[window] = {
+                key: self.replen_sums[window][key] / scale
+                for key in self.replen_sums[window]
+            }
+        return rates
+
     # -------------------------------------------------------------------------
     # Event ingestion & feature build
     # -------------------------------------------------------------------------
@@ -1629,6 +1680,12 @@ class FeatureEngine:
         """
         etype, ts_ms, payload = self._parse_event(e)
         dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
+        prev_bid_l1 = self.prev_bsz
+        prev_ask_l1 = self.prev_asz
+        prev_bid_l2 = self.prev_bsz2
+        prev_ask_l2 = self.prev_asz2
+
+        self._prune_replen_windows(ts_ms)
 
         # Event density
         self.ev_25ms.append(ts_ms)
@@ -1677,6 +1734,20 @@ class FeatureEngine:
         gap_a = max(0.0, ask2 - ask1)
         gap_b = max(0.0, bid1 - bid2)
 
+        bsz2 = self.bid_lvls[1][1] if len(self.bid_lvls) > 1 else 0.0
+        asz2 = self.ask_lvls[1][1] if len(self.ask_lvls) > 1 else 0.0
+        replen_deltas = {
+            ("bid", 1, "add"): max(bsz1 - prev_bid_l1, 0.0),
+            ("bid", 1, "rem"): max(prev_bid_l1 - bsz1, 0.0),
+            ("ask", 1, "add"): max(asz1 - prev_ask_l1, 0.0),
+            ("ask", 1, "rem"): max(prev_ask_l1 - asz1, 0.0),
+            ("bid", 2, "add"): max(bsz2 - prev_bid_l2, 0.0),
+            ("bid", 2, "rem"): max(prev_bid_l2 - bsz2, 0.0),
+            ("ask", 2, "add"): max(asz2 - prev_ask_l2, 0.0),
+            ("ask", 2, "rem"): max(prev_ask_l2 - asz2, 0.0),
+        }
+        self._record_replenishment(ts_ms, replen_deltas)
+
         # Cum depths
         cum_bid1 = self._cum_depth(self.bid_lvls, 1)
         cum_ask1 = self._cum_depth(self.ask_lvls, 1)
@@ -1692,6 +1763,7 @@ class FeatureEngine:
         ofi_l3 = (cum_bid3 - self.prev_cum_bid3) - (cum_ask3 - self.prev_cum_ask3)
         ofi_l5 = (cum_bid5 - self.prev_cum_bid5) - (cum_ask5 - self.prev_cum_ask5)
         self.prev_bsz, self.prev_asz = bsz1, asz1
+        self.prev_bsz2, self.prev_asz2 = bsz2, asz2
         self.prev_cum_bid3, self.prev_cum_ask3 = cum_bid3, cum_ask3
         self.prev_cum_bid5, self.prev_cum_ask5 = cum_bid5, cum_ask5
 
@@ -1905,6 +1977,7 @@ class FeatureEngine:
         vpin = (sum(self.vpin_phi) / len(self.vpin_phi)) if self.vpin_phi else 0.0
 
         horizon_list = list(self.trade_windows)
+        replen_rates = self._replenishment_rates()
 
         # Build raw feature vector
         feat_list = [
@@ -1988,6 +2061,17 @@ class FeatureEngine:
                 float(quote_counts.get(ms, 0)),
                 float(spread_change_counts.get(ms, 0)),
             ])
+
+        # --- L1/L2 liquidity replenishment/cancellation rates (size/ms) ---
+        for ms in horizon_list:
+            rates = replen_rates[ms]
+            for level in (1, 2):
+                feat_list.extend([
+                    rates[("bid", level, "add")],
+                    rates[("bid", level, "rem")],
+                    rates[("ask", level, "add")],
+                    rates[("ask", level, "rem")],
+                ])
 
         # --- VWAPs vs mid/micro across horizons ---
         for ms in horizon_list:
