@@ -877,7 +877,8 @@ class SAMBA(nn.Module):
         self.mask_token = nn.Parameter(torch.randn(1, 1, args.d_model))
         self.cpc_deltas = CPC_DELTAS_MS
         self.cpc_predictors = nn.ModuleDict({
-        f"ms{d}": nn.Linear(self.args.d_model, self.args.d_model, bias=False) for d in CPC_DELTAS_MS
+            f"ms{d}": nn.Linear(self.args.d_model, 2 * self.args.d_model, bias=False)
+            for d in CPC_DELTAS_MS
         })
         # EMA teacher for CPC targets (teacher = EMA(student))
         self.mamba_teacher = copy.deepcopy(self.mamba)
@@ -916,7 +917,14 @@ class SAMBA(nn.Module):
             p_t.data.mul_(m).add_(p_s.data, alpha=(1.0 - m))
 
     def compute_cpc_loss(self, h_student: torch.Tensor, h_teacher: torch.Tensor, dt_patch: torch.Tensor) -> torch.Tensor:
-        # dt_patch: [B, P] patch-level time deltas
+        """CPC loss between student forward states and teacher bidirectional targets.
+
+        Args:
+            h_student: [B, P, D] forward student states (anchors).
+            h_teacher: [B, P, 2D] teacher fused states computed without future leakage.
+            dt_patch: [B, P] patch-level time deltas.
+        """
+        # dt_patch encodes ms progression along the patch dimension
         cum_t = torch.cumsum(dt_patch, dim=1)  # ms from left to right in patch space
 
         total = 0.0
@@ -935,8 +943,8 @@ class SAMBA(nn.Module):
             # gather teacher targets at j
             gather_j = idx_j
             b_idx = torch.arange(B, device=h_student.device).unsqueeze(-1).expand(B, P)
-            h_tgt = h_teacher[b_idx, gather_j]  # [B,P,D]
-            proj = self.cpc_predictors[f"ms{dms}"](h_student)  # [B,P,D]
+            h_tgt = h_teacher[b_idx, gather_j]  # [B,P,2D]
+            proj = self.cpc_predictors[f"ms{dms}"](h_student)  # [B,P,2D]
             # InfoNCE-like cosine distance with stop-grad target
             loss = 1.0 - F.cosine_similarity(proj, h_tgt.detach(), dim=-1)  # [B,P]
             total += (loss * has.float()).sum()
@@ -963,9 +971,8 @@ class SAMBA(nn.Module):
         vol = self.volatility_head(pooled)
         dir_logits = self.direction_head(pooled)
 
-        # Teacher (clean, no grad) for CPC (forward stream only)
-        with torch.no_grad():
-            _, _, h_teacher_fwd = self.mamba_teacher(h_tokens, embedded=True)
+        # Teacher (clean, no grad) for CPC (bidirectional over observed past window)
+        h_teacher_fused = self.compute_teacher_cpc_targets(h_tokens)
 
         # Masked pass (student) for reconstruction distillation in Mamba space
         B, L, D = h_tokens.shape
@@ -983,9 +990,37 @@ class SAMBA(nn.Module):
         _, h_masked, _ = self.mamba(h_masked_input, embedded=True)
 
         # CPC loss (computed here so both SAM passes align)
-        cpc_loss = self.compute_cpc_loss(h_clean_fwd, h_teacher_fwd, dt_patch)
-
+        cpc_loss = self.compute_cpc_loss(h_clean_fwd, h_teacher_fused, dt_patch)
+        
         return ret, vol, dir_logits, h_clean, h_masked, mask_idx, cpc_loss
+
+    @torch.no_grad()
+    def compute_teacher_cpc_targets(self, h_tokens: torch.Tensor) -> torch.Tensor:
+        """Compute teacher representations for CPC without peeking past prediction horizons.
+
+        Runs the teacher forward stack once (causal) and recomputes the backward
+        stack on prefixes so each position only uses information available up to
+        that timestep. Returns fused [B, L, 2D] tensors.
+        """
+        teacher = self.mamba_teacher
+
+        # Forward stack is causal, so a single pass suffices.
+        x_fwd = teacher._run_stack(h_tokens, teacher.blocks_fwd, teacher.ffns_fwd)
+        h_fwd = teacher.norm_fwd(x_fwd)
+
+        B, L, _ = h_tokens.shape
+        bwd_states = []
+        for end in range(1, L + 1):
+            prefix = h_tokens[:, :end]
+            rev_prefix = torch.flip(prefix, dims=[1])
+            x_bwd_rev = teacher._run_stack(rev_prefix, teacher.blocks_bwd, teacher.ffns_bwd)
+            # The first element in reversed space corresponds to the latest original index.
+            x_bwd_last = x_bwd_rev[:, 0]
+            h_bwd_last = teacher.norm_bwd(x_bwd_last)
+            bwd_states.append(h_bwd_last)
+
+        h_bwd = torch.stack(bwd_states, dim=1)
+        return torch.cat([h_fwd, h_bwd], dim=-1)
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
