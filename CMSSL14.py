@@ -803,11 +803,12 @@ class ChannelFFN(nn.Module):
 
 class GatedPooling(nn.Module):
     """O(L) learned-query / gated pooling."""
-    def __init__(self, d_model, d_hidden=None):
+    def __init__(self, d_in, d_hidden=None):
         super().__init__()
-        d_hidden = d_hidden or d_model
-        self.W = nn.Linear(d_model, d_hidden)
+        d_hidden = d_hidden or d_in
+        self.W = nn.Linear(d_in, d_hidden)
         self.u = nn.Parameter(torch.randn(d_hidden))
+
     def forward(self, h):  # h: [B, L, D]
         g = torch.tanh(self.W(h))        # [B, L, H]
         scores = torch.matmul(g, self.u) # [B, L]
@@ -816,26 +817,46 @@ class GatedPooling(nn.Module):
         return z
 
 class Mamba(nn.Module):
-    """Causal (forward-only) Mamba stack + channel-FFN + gated pooling."""
+    """Bidirectional (forward/backward) Mamba stacks with gated pooling."""
+
     def __init__(self, args: ModelArgs, ff_hid: int):
         super().__init__()
         self.args = args
         self.emb = nn.Linear(args.vocab_size, args.d_model)
         _init_small(self.emb)
-        self.blocks = nn.ModuleList([ResidualBlock(args) for _ in range(args.n_layer)])
-        self.ffns = nn.ModuleList([ChannelFFN(args.d_model, ff_hid) for _ in range(args.n_layer)])
-        self.norm = nn.LayerNorm(args.d_model)
-        self.pool = GatedPooling(args.d_model)
+
+        self.blocks_fwd = nn.ModuleList([ResidualBlock(args) for _ in range(args.n_layer)])
+        self.ffns_fwd = nn.ModuleList([ChannelFFN(args.d_model, ff_hid) for _ in range(args.n_layer)])
+
+        self.blocks_bwd = nn.ModuleList([ResidualBlock(args) for _ in range(args.n_layer)])
+        self.ffns_bwd = nn.ModuleList([ChannelFFN(args.d_model, ff_hid) for _ in range(args.n_layer)])
+
+        self.norm_fwd = nn.LayerNorm(args.d_model)
+        self.norm_bwd = nn.LayerNorm(args.d_model)
+        self.pool = GatedPooling(2 * args.d_model)
+
+    def _run_stack(self, x, blocks, ffns):
+        for blk, ffn in zip(blocks, ffns):
+            x = blk(x)
+            x = ffn(x)
+        return x
 
     def forward(self, x, embedded=False):
         if not embedded:
             x = self.emb(x)  # project features to d_model
-        for i in range(self.args.n_layer):
-            x = self.blocks[i](x)    # causal Mamba
-            x = self.ffns[i](x)      # channel mixing (no time LN)
-        h = self.norm(x)
+
+        x_fwd = self._run_stack(x, self.blocks_fwd, self.ffns_fwd)
+
+        x_bwd_in = torch.flip(x, dims=[1])
+        x_bwd = self._run_stack(x_bwd_in, self.blocks_bwd, self.ffns_bwd)
+        x_bwd = torch.flip(x_bwd, dims=[1])
+
+        h_fwd = self.norm_fwd(x_fwd)
+        h_bwd = self.norm_bwd(x_bwd)
+        h = torch.cat([h_fwd, h_bwd], dim=-1)
+
         pooled = self.pool(h)
-        return pooled, h
+        return pooled, h, h_fwd
 
 # -------------  SAMBA -------------
 class SAMBA(nn.Module):
@@ -849,7 +870,7 @@ class SAMBA(nn.Module):
             enable_res_param=True, norm='layer', re_param=True, re_param_kernel=3, 
             patch_size=8, stride=4
         )
-        # Mamba backbone (forward-only) + pooling
+        # Mamba backbone (forward/backward fusion) + pooling
         self.mamba = Mamba(args, ff_hid=DMODEL)
 
         # SSL bits
@@ -865,21 +886,22 @@ class SAMBA(nn.Module):
         self.teacher_momentum = 0.99
 
         # Heads
-        head_hidden_dim = args.d_model * 2
+        fused_dim = args.d_model * 2
+        head_hidden_dim = fused_dim * 2
         self.return_head = nn.Sequential(
-            nn.Linear(args.d_model, head_hidden_dim),
+            nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(head_hidden_dim, NUM_HORIZONS)
         )
         self.volatility_head = nn.Sequential(
-            nn.Linear(args.d_model, head_hidden_dim),
+            nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(head_hidden_dim, NUM_HORIZONS)  # predicts log-vol per horizon
         )
         self.direction_head = nn.Sequential(
-            nn.Linear(args.d_model, head_hidden_dim),
+            nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(head_hidden_dim, NUM_HORIZONS)
@@ -893,13 +915,13 @@ class SAMBA(nn.Module):
         for p_t, p_s in zip(self.mamba_teacher.parameters(), self.mamba.parameters()):
             p_t.data.mul_(m).add_(p_s.data, alpha=(1.0 - m))
 
-    def compute_cpc_loss(self, h_clean: torch.Tensor, h_teacher: torch.Tensor, dt_patch: torch.Tensor) -> torch.Tensor:
+    def compute_cpc_loss(self, h_student: torch.Tensor, h_teacher: torch.Tensor, dt_patch: torch.Tensor) -> torch.Tensor:
         # dt_patch: [B, P] patch-level time deltas
         cum_t = torch.cumsum(dt_patch, dim=1)  # ms from left to right in patch space
 
         total = 0.0
         count = 0
-        B, P, D = h_clean.shape
+        B, P, D = h_student.shape
         for dms in CPC_DELTAS_MS:
             # For each (b, i), we need j >= i with cum_t[b,j] - cum_t[b,i] >= dms
             # Build j by scanning once per sequence via broadcasting
@@ -912,9 +934,9 @@ class SAMBA(nn.Module):
             has = valid.any(dim=2)
             # gather teacher targets at j
             gather_j = idx_j
-            b_idx = torch.arange(B, device=h_clean.device).unsqueeze(-1).expand(B, P)
+            b_idx = torch.arange(B, device=h_student.device).unsqueeze(-1).expand(B, P)
             h_tgt = h_teacher[b_idx, gather_j]  # [B,P,D]
-            proj = self.cpc_predictors[f"ms{dms}"](h_clean)  # [B,P,D]
+            proj = self.cpc_predictors[f"ms{dms}"](h_student)  # [B,P,D]
             # InfoNCE-like cosine distance with stop-grad target
             loss = 1.0 - F.cosine_similarity(proj, h_tgt.detach(), dim=-1)  # [B,P]
             total += (loss * has.float()).sum()
@@ -924,8 +946,8 @@ class SAMBA(nn.Module):
 
     def forward(self, x, mask_ratio=0.0, mask_idx: torch.Tensor = None):
         """
-        Training path returns: pooled, ret_pred, vol_pred, dir_logits, 
-        h_clean (student), h_masked (student on masked input), mask_idx, cpc_loss.
+        Training path returns: pooled, ret_pred, vol_pred, dir_logits,
+        h_clean (student fused), h_masked (student fused on masked input), mask_idx, cpc_loss.
         Eval path returns predictions only.
         """
         x_permuted = x.permute(0, 2, 1)
@@ -936,14 +958,14 @@ class SAMBA(nn.Module):
         dt_patch = dt_raw.unfold(1, ps, stride).sum(-1)
 
         # Student (clean)
-        pooled, h_clean = self.mamba(h_tokens, embedded=True)
+        pooled, h_clean, h_clean_fwd = self.mamba(h_tokens, embedded=True)
         ret = self.return_head(pooled)
         vol = self.volatility_head(pooled)
         dir_logits = self.direction_head(pooled)
 
-        # Teacher (clean, no grad) for CPC
+        # Teacher (clean, no grad) for CPC (forward stream only)
         with torch.no_grad():
-            _, h_teacher_clean = self.mamba_teacher(h_tokens, embedded=True)
+            _, _, h_teacher_fwd = self.mamba_teacher(h_tokens, embedded=True)
 
         # Masked pass (student) for reconstruction distillation in Mamba space
         B, L, D = h_tokens.shape
@@ -958,10 +980,10 @@ class SAMBA(nn.Module):
         batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, mcnt)
         h_masked_input[batch_idx, mask_idx] = self.mask_token  # replace masked tokens
 
-        _, h_masked = self.mamba(h_masked_input, embedded=True)
+        _, h_masked, _ = self.mamba(h_masked_input, embedded=True)
 
         # CPC loss (computed here so both SAM passes align)
-        cpc_loss = self.compute_cpc_loss(h_clean, h_teacher_clean, dt_patch)
+        cpc_loss = self.compute_cpc_loss(h_clean_fwd, h_teacher_fwd, dt_patch)
 
         return ret, vol, dir_logits, h_clean, h_masked, mask_idx, cpc_loss
 
