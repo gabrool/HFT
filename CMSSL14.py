@@ -1155,6 +1155,9 @@ class FeatureEngine:
         # ---------- Time bookkeeping ----------
         self.last_ts: Optional[int] = None
         self._last_event_ts: Optional[int] = None
+        self.last_trade_ts: Optional[int] = None
+        self.last_bid1_update_ts: Optional[int] = None
+        self.last_ask1_update_ts: Optional[int] = None
 
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute σ and VR
@@ -1182,6 +1185,9 @@ class FeatureEngine:
         # ---------- Spread ----------
         self.last_spread: Optional[float] = None
         self.last_spread_ts: Optional[int] = None
+        self.spread_delta_windows: Tuple[int, ...] = (25, 50, 100, 250, 500)
+        self.spread_history: Deque[Tuple[int, float]] = deque()
+        self.spread_history_window_ms: int = 1_000
         self.spread_changes_25ms: Deque[int] = deque()
         self.spread_changes_50ms: Deque[int] = deque()
         self.spread_changes_100ms: Deque[int] = deque()
@@ -1198,8 +1204,11 @@ class FeatureEngine:
         }
 
         # ---------- Best-level churn & depletion ----------
-        self.bid1_changes_1s: Deque[int] = deque()
-        self.ask1_changes_1s: Deque[int] = deque()
+        self.bestlvl_windows: Tuple[int, ...] = (50, 100, 250, 500, 1_000)
+        self._bid1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
+        self._ask1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
+        self.bid1_changes_1s = self._bid1_change_deques[1_000]
+        self.ask1_changes_1s = self._ask1_change_deques[1_000]
         self.last_bid1 = None; self.last_ask1 = None
         self.neg_dbsz_250 = 0.0; self.neg_dasz_250 = 0.0
         self.sz_deltas_250ms: Deque[Tuple[int,float,float]] = deque()
@@ -1293,6 +1302,7 @@ class FeatureEngine:
             "ask1",
             "mid",
             "spread",
+            "spread_norm",
             "micro",
             "smart",
             "gap_a",
@@ -1604,6 +1614,8 @@ class FeatureEngine:
             self.vpin_cum_sell -= sell_bucket
             self.vpin_cum -= self.vpin_Vb
 
+        self.last_trade_ts = ts_ms
+
     def _add_return(self, ts_ms: int, mid: float):
         if mid <= 0.0:
             return 0.0
@@ -1728,6 +1740,21 @@ class FeatureEngine:
             micro = smart = mid
 
         spread = max(0.0, ask1 - bid1)
+        spread_norm = spread / max(mid, 1e-9)
+
+        self._prune_deque_ms(self.spread_history, ts_ms, self.spread_history_window_ms)
+        spread_deltas: Dict[int, float] = {}
+        for window in self.spread_delta_windows:
+            target = ts_ms - window
+            ref_val = None
+            for t_prev, spread_prev in reversed(self.spread_history):
+                ref_val = spread_prev
+                if t_prev <= target:
+                    break
+            if ref_val is None:
+                ref_val = spread
+            spread_deltas[window] = spread - ref_val
+        self.spread_history.append((ts_ms, spread))
 
         # Gaps (best->second)
         ask2 = self.ask_lvls[1][0] if len(self.ask_lvls) > 1 else ask1
@@ -1788,6 +1815,7 @@ class FeatureEngine:
             "ask1": ask1,
             "mid": mid,
             "spread": spread,
+            "spread_norm": spread_norm,
             "micro": micro,
             "smart": smart,
             "gap_a": gap_a,
@@ -1876,14 +1904,37 @@ class FeatureEngine:
                 self._prune_ts_deque(deq, ts_ms, window)
             self.last_spread = spread
             self.last_spread_ts = ts_ms
+        else:
+            for window, deq in self._spread_change_deques.items():
+                self._prune_ts_deque(deq, ts_ms, window)
 
         # Best-level churn & depletion
-        if self.last_bid1 is not None and bid1 != self.last_bid1:
-            self.bid1_changes_1s.append(ts_ms)
-        if self.last_ask1 is not None and ask1 != self.last_ask1:
-            self.ask1_changes_1s.append(ts_ms)
-        self._prune_ts_deque(self.bid1_changes_1s, ts_ms, 1000)
-        self._prune_ts_deque(self.ask1_changes_1s, ts_ms, 1000)
+        bid_level_changed = (
+            self.last_bid1 is None
+            or bid1 != self.last_bid1
+            or bsz1 != prev_bid_l1
+        )
+        ask_level_changed = (
+            self.last_ask1 is None
+            or ask1 != self.last_ask1
+            or asz1 != prev_ask_l1
+        )
+
+        for window, dq in self._bid1_change_deques.items():
+            if bid_level_changed:
+                dq.append(ts_ms)
+            self._prune_ts_deque(dq, ts_ms, window)
+
+        for window, dq in self._ask1_change_deques.items():
+            if ask_level_changed:
+                dq.append(ts_ms)
+            self._prune_ts_deque(dq, ts_ms, window)
+
+        if bid_level_changed:
+            self.last_bid1_update_ts = ts_ms
+        if ask_level_changed:
+            self.last_ask1_update_ts = ts_ms
+
         self.last_bid1, self.last_ask1 = bid1, ask1
 
         # size depletion (only negative deltas accumulated over 250ms)
@@ -1894,8 +1945,22 @@ class FeatureEngine:
         neg_depl_b = sum(x for _, x, _ in self.sz_deltas_250ms)
         neg_depl_a = sum(x for _, _, x in self.sz_deltas_250ms)
 
+        dt_since_trade = float(ts_ms - self.last_trade_ts) if self.last_trade_ts is not None else 0.0
+        dt_since_bid1_update = (
+            float(ts_ms - self.last_bid1_update_ts)
+            if self.last_bid1_update_ts is not None
+            else 0.0
+        )
+        dt_since_ask1_update = (
+            float(ts_ms - self.last_ask1_update_ts)
+            if self.last_ask1_update_ts is not None
+            else 0.0
+        )
+
         quote_counts = {ms: len(self._quote_window_deques[ms]) for ms in self.trade_windows}
         spread_change_counts = {ms: len(self._spread_change_deques[ms]) for ms in self.trade_windows}
+        bid1_change_counts = {ms: len(self._bid1_change_deques[ms]) for ms in self.bestlvl_windows}
+        ask1_change_counts = {ms: len(self._ask1_change_deques[ms]) for ms in self.bestlvl_windows}
         time_since_spread_change = (ts_ms - (self.last_spread_ts or ts_ms))
         n_spread_chg_250ms = spread_change_counts.get(250, 0)
         n_spread_chg_1s = len(self._spread_change_deques[1000])
@@ -1966,8 +2031,20 @@ class FeatureEngine:
             for hl, val in spread_ema_vals.items()
         }
 
+        spread_delta_norms: Dict[int, float] = {}
+        for window, delta in spread_deltas.items():
+            if window <= 50:
+                baseline = self.ema_sp_25 if self.ema_sp_25 is not None else spread
+            elif window <= 150:
+                baseline = self.ema_sp_100 if self.ema_sp_100 is not None else spread
+            else:
+                baseline = self.ema_sp_500 if self.ema_sp_500 is not None else spread
+            spread_delta_norms[window] = delta / max(baseline, 1e-9)
+
         # RSI on microprice (use EWMA gains/losses with ~100ms smoothing)
         delta_mp = micro - (self.ema_mp_25 if self.ema_mp_25 is not None else micro)
+        micro_minus_ema25 = delta_mp
+        micro_minus_ema100 = micro - (self.ema_mp_100 if self.ema_mp_100 is not None else micro)
         gain = max(delta_mp, 0.0)
         loss = max(-delta_mp, 0.0)
         alpha_rsi = 1.0 - math.exp(-dt_ms / 200.0)
@@ -2003,7 +2080,7 @@ class FeatureEngine:
         # Build raw feature vector
         feat_list = [
             # --- price/state ---
-            bid1, ask1, mid, micro, smart, spread, gap_a, gap_b,
+            bid1, ask1, mid, micro, smart, spread, spread_norm, gap_a, gap_b,
             bsz1, asz1,
 
             # --- depth/shape ---
@@ -2035,12 +2112,30 @@ class FeatureEngine:
             self.event_density_100ms(),  # events per 0.1s (helper)
             self.event_density_250ms(),
             self.event_density_500ms(),
+            dt_since_trade,
 
             # --- best-level churn & depletion & spread-change stats ---
-            len(self.bid1_changes_1s), len(self.ask1_changes_1s),
+            float(bid1_change_counts.get(50, 0)),
+            float(bid1_change_counts.get(100, 0)),
+            float(bid1_change_counts.get(250, 0)),
+            float(bid1_change_counts.get(500, 0)),
+            float(bid1_change_counts.get(1_000, 0)),
+            float(ask1_change_counts.get(50, 0)),
+            float(ask1_change_counts.get(100, 0)),
+            float(ask1_change_counts.get(250, 0)),
+            float(ask1_change_counts.get(500, 0)),
+            float(ask1_change_counts.get(1_000, 0)),
             neg_depl_b, neg_depl_a,
             float(time_since_spread_change),
             float(n_spread_chg_250ms), float(n_spread_chg_1s),
+            dt_since_bid1_update,
+            dt_since_ask1_update,
+            spread_deltas.get(25, 0.0), spread_deltas.get(50, 0.0),
+            spread_deltas.get(100, 0.0), spread_deltas.get(250, 0.0),
+            spread_deltas.get(500, 0.0),
+            spread_delta_norms.get(25, 0.0), spread_delta_norms.get(50, 0.0),
+            spread_delta_norms.get(100, 0.0), spread_delta_norms.get(250, 0.0),
+            spread_delta_norms.get(500, 0.0),
 
             # --- returns & vol stats ---
             std_20, std_25, std_50, std_100, std_250, std_500, std_1s, std_5s,
@@ -2057,6 +2152,8 @@ class FeatureEngine:
             (self.ema_sp_1000 if self.ema_sp_1000 is not None else spread),
             spread_ratios[100], spread_ratios[500], spread_ratios[1000],
             spread_log_ratios[100], spread_log_ratios[500], spread_log_ratios[1000],
+            micro_minus_ema25,
+            micro_minus_ema100,
             rsi,
             macd_raw,
             (self.macd_sig if getattr(self, 'macd_sig', None) is not None else 0.0),
