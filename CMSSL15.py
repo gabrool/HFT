@@ -1140,11 +1140,12 @@ def merge_event_time(ob_iter, tr_iter, B: int = 0):
     tr_item = next(tr_iter, None)
     last_ts = -1
     while ob_item or tr_item:
-        if tr_item is None or (ob_item and ob_item[0] <= tr_item[0]):
+        if ob_item and (tr_item is None or ob_item[0] < tr_item[0]):
             ts, seq, data = ob_item
             ob_item = next(ob_iter, None)
             etype = "ob"
         else:
+            # Prefer the trade when timestamps tie to preserve causal ordering.
             ts, seq, data = tr_item
             tr_item = next(tr_iter, None)
             etype = "trade"
