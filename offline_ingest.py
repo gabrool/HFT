@@ -45,7 +45,12 @@ AUX_DIM     = 3
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-from CMSSL16 import FeatureEngine, LabelBuilder, merge_event_time  # reuse exactly
+from CMSSL16 import (
+    FeatureEngine,
+    LabelBuilder,
+    merge_event_time,
+    build_sequence_from_tokens,
+)  # reuse exactly
 
 # fast json if available
 try:
@@ -201,19 +206,15 @@ def th_iter_plain(csv_path: str):
             yield ts, seq, row
 
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
-    # exact tail order: [dt_ms, is_trade, events_100ms]
+    # exact tail order: [log_dt_ms, is_trade, events_100ms]
     events_100ms = fe.event_density_100ms()
-    return np.concatenate([
-        np.asarray(feat_z, dtype=np.float32),
-        np.array([dt_ms, float(is_trade), events_100ms], dtype=np.float32)
-    ], axis=0).astype(np.float32)
-
-def pad_left_repeat(x: np.ndarray, L: int) -> np.ndarray:
-    k, F = x.shape
-    if k >= L: return x[-L:]
-    if k == 0: return np.zeros((L, F), dtype=np.float32)
-    pad = np.repeat(x[:1], L - k, axis=0)
-    return np.concatenate([pad, x], axis=0)
+    aux_tail = np.array(
+        [np.log1p(float(dt_ms)), float(is_trade), events_100ms],
+        dtype=np.float32,
+    )
+    return np.concatenate(
+        [np.asarray(feat_z, dtype=np.float32), aux_tail], axis=0
+    ).astype(np.float32, copy=False)
 
 # ---------- chunk writer (preallocated) ----------
 class ChunkWriter:
@@ -305,8 +306,8 @@ def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
             cw = ChunkWriter(out_dir, LOOKBACK, F, RAM_BUDGET, CHUNK_SIZE)
         tokens_buf.append(tok)
 
-        seq = pad_left_repeat(np.stack(list(tokens_buf), axis=0), LOOKBACK)
-        pending_seqs.append(seq.astype(np.float32))
+        seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
+        pending_seqs.append(seq.astype(np.float32, copy=False))
         labeler.on_decision(int(ts_ms))
 
         matured = labeler.on_event(int(ts_ms), float(mid))
@@ -326,7 +327,7 @@ def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
         "week": wk,
         "lookback": int(LOOKBACK),
         "feature_dim": feature_dim,
-        "aux_tail": ["dt_ms", "is_trade", "events_100ms"],
+        "aux_tail": ["log_dt_ms", "is_trade", "events_100ms"],
         "chunks": chunks,
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
