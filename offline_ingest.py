@@ -32,13 +32,9 @@ KEEP_WEEKS    = int(os.environ.get("BYBIT_KEEP_WEEKS", "24"))
 
 # Parallelism / sequence geometry
 WORKERS     = int(os.environ.get("BYBIT_WORKERS", "8"))
-LOOKBACK    = int(os.environ.get("BYBIT_LOOKBACK", "1024"))
-
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "0"))
-
-AUX_DIM     = 3
 
 
 # import your training utilities
@@ -50,6 +46,10 @@ from CMSSL16 import (
     LabelBuilder,
     merge_event_time,
     build_sequence_from_tokens,
+    HORIZONS_MS,
+    NUM_HORIZONS,
+    LOOKBACK,
+    AUX_DIM,
 )  # reuse exactly
 
 # fast json if available
@@ -238,7 +238,7 @@ class ChunkWriter:
         # preallocate separate buffers
         self.X_core = np.empty((self.N, self.L, self.F_core), dtype=np.float32)  # cast on flush
         self.X_aux  = np.empty((self.N, self.L, AUX_DIM),     dtype=np.float32)  # keep fp32
-        self.Y      = np.empty((self.N, 2), dtype=np.float32)
+        self.Y      = np.empty((self.N, 2 * NUM_HORIZONS), dtype=np.float32)
         self.i = 0
         self.cid = 0
         self.chunks_meta = []
@@ -285,7 +285,7 @@ def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
     ensure_dir(out_dir)
 
     fe = FeatureEngine()
-    labeler = LabelBuilder(delta_ms=5, horizon_ms=1000)
+    labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
 
     tokens_buf: deque = deque(maxlen=LOOKBACK)  # rolling tokens
     pending_seqs: deque = deque()              # one seq per decision (FIFO)
@@ -322,26 +322,31 @@ def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
 
     # meta
     chunks = [] if cw is None else cw.chunks_meta
-    feature_dim = 0 if F is None else int(F)
+    feature_dim_total = None if F is None else int(F)
+    feature_dim_core = None if F is None else int(F - AUX_DIM)
+    label_dim = int(2 * NUM_HORIZONS)
     meta = {
         "week": wk,
         "lookback": int(LOOKBACK),
-        "feature_dim": feature_dim,
+        "feature_dim_total": feature_dim_total,
+        "feature_dim_core": feature_dim_core,
         "aux_tail": ["log_dt_ms", "is_trade", "events_100ms"],
         "chunks": chunks,
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if cw is None else int(cw.N),
-        "feature_core": 0 if F is None else int(F - AUX_DIM),
         "aux_dim": int(AUX_DIM),
+        "label_dim": label_dim,
+        "horizons_ms": [int(h) for h in HORIZONS_MS],
         "core_dtype": "float32"
     }
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
     total_seqs = sum(c["n"] for c in chunks)
+    feat_print = feature_dim_total if feature_dim_total is not None else 0
     print(f"[done ] {wk} chunks={len(chunks)} total_seqs={total_seqs} "
-          f"L={LOOKBACK} F={feature_dim} chunkN={meta['chunk_size_used']}")
+          f"L={LOOKBACK} F={feat_print} chunkN={meta['chunk_size_used']}")
 
 # --------------- driver ----------------
 def main():
