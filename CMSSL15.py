@@ -2414,16 +2414,19 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
     y_list: List[np.ndarray] = []
 
     total_weeks = len(week_files)
+    last_global_ts: Optional[int] = None
     for w_idx, (ob_zip, th_zip) in enumerate(week_files, 1):
         print(f"[week {w_idx}/{total_weeks}] OB={os.path.basename(ob_zip)} | TH={os.path.basename(th_zip)}")
         raw = BybitRawIter(ob_zip, th_zip)
-        merged = merge_event_time(raw.ob_iter(), raw.trade_iter(), B=0)
+        merged_iter = merge_event_time(raw.ob_iter(), raw.trade_iter(), B=0)
 
         last_log = time.time()
         event_count = 0
         last_ts_ms = None
 
-        for e in merged:
+        def process_event(e: Any) -> int:
+            nonlocal event_count, last_ts_ms, last_log
+
             event_count += 1
 
             # 1) Update features with this event
@@ -2432,7 +2435,9 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
 
             # 2) Build token with aux channels
             events_100ms = fe.event_density_100ms()
-            token = np.concatenate([feat, np.array([dt_ms, float(is_trade), events_100ms], dtype=np.float32)]).astype(np.float32)
+            token = np.concatenate(
+                [feat, np.array([dt_ms, float(is_trade), events_100ms], dtype=np.float32)]
+            ).astype(np.float32)
             tokens.append(token)
 
             # 3) Build sequence at every event
@@ -2453,7 +2458,24 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
             if event_count % 500_000 == 0 or (time.time() - last_log) > 5:
                 print(f"  [progress] events={event_count:,}  last_ts={last_ts_ms}")
                 last_log = time.time()
-        
+
+            return int(ts_ms)
+
+        first_event = next(merged_iter, None)
+        if first_event is not None:
+            prev_global_ts = last_global_ts
+            ts_first = process_event(first_event)
+            if prev_global_ts is not None and ts_first < prev_global_ts:
+                raise ValueError("Non-monotonic timestamps across weeks")
+            last_global_ts = ts_first
+
+        for e in merged_iter:
+            prev_global_ts = last_global_ts
+            ts_ms = process_event(e)
+            if prev_global_ts is not None and ts_ms < prev_global_ts:
+                raise ValueError("Non-monotonic timestamps across weeks")
+            last_global_ts = ts_ms
+
         print(f"[week {w_idx}] done: events={event_count:,}, sequences={len(X_list):,} so far")
 
     # At the end there may be some pending sequences without matured labels
