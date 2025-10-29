@@ -279,54 +279,80 @@ class ChunkWriter:
         self.cid += 1
         self.i = 0
 
-# --------------- core per-week ---------------
-def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
-    out_dir = os.path.join(out_root, wk)
-    ensure_dir(out_dir)
+# --------------- dataset-wide processing ---------------
+def _compute_dataset_span(pairs: List[Tuple[str, str, str]]):
+    if not pairs:
+        return None, None
+    starts = []
+    ends = []
+    for wk, _ob_path, _th_path in pairs:
+        start_dt, end_dt, _ = _parse_week_key_any(
+            _normalise_ob_prefix(f"BTCUSDT_OB_{wk}")
+        )
+        starts.append(start_dt)
+        ends.append(end_dt)
+    return min(starts), max(ends)
+
+
+def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
+    ensure_dir(out_root)
 
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
 
-    tokens_buf: deque = deque(maxlen=LOOKBACK)  # rolling tokens
-    pending_seqs: deque = deque()              # one seq per decision (FIFO)
+    tokens_buf: deque = deque(maxlen=LOOKBACK)
+    pending_seqs: deque = deque()
 
     F = None
-    cw = None  # ChunkWriter will be created once F is known
+    cw = None
+    total_sequences = 0
 
-    print(f"[start] {wk} L={LOOKBACK} budget={RAM_BUDGET}MB")
+    ds_start, ds_end = _compute_dataset_span(pairs)
+    start_iso = ds_start.date().isoformat() if ds_start else None
+    end_iso = ds_end.date().isoformat() if ds_end else None
 
-    merged = merge_event_time(ob_iter_plain(ob_path), th_iter_plain(th_path), B=0)
+    print(
+        f"[start] ingest weeks={len(pairs)} L={LOOKBACK} budget={RAM_BUDGET}MB"
+    )
 
-    for e in merged:
-        ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(e)
-        tok = build_token(fe, feat_z, is_trade, dt_ms)
-        if F is None:
-            F = tok.shape[0]
-            ensure_dir(out_dir)
-            cw = ChunkWriter(out_dir, LOOKBACK, F, RAM_BUDGET, CHUNK_SIZE)
-        tokens_buf.append(tok)
+    for idx, (wk, ob_path, th_path) in enumerate(pairs, 1):
+        print(f"[week ] {idx}/{len(pairs)} {wk}")
+        merged = merge_event_time(
+            ob_iter_plain(ob_path), th_iter_plain(th_path), B=0
+        )
 
-        seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
-        pending_seqs.append(seq.astype(np.float32, copy=False))
-        labeler.on_decision(int(ts_ms))
+        for e in merged:
+            ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(e)
+            tok = build_token(fe, feat_z, is_trade, dt_ms)
+            if F is None:
+                F = tok.shape[0]
+                cw = ChunkWriter(out_root, LOOKBACK, F, RAM_BUDGET, CHUNK_SIZE)
+            tokens_buf.append(tok)
 
-        matured = labeler.on_event(int(ts_ms), float(mid))
-        for yy in matured:
-            if not pending_seqs:
-                raise RuntimeError("Matured label available but no pending sequences to pair")
-            cw.add(pending_seqs.popleft(), yy.astype(np.float32, copy=False))
+            seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
+            pending_seqs.append(seq.astype(np.float32, copy=False))
+            labeler.on_decision(int(ts_ms))
 
-    # flush remainder
+            matured = labeler.on_event(int(ts_ms), float(mid))
+            for yy in matured:
+                if not pending_seqs:
+                    raise RuntimeError(
+                        "Matured label available but no pending sequences to pair"
+                    )
+                cw.add(pending_seqs.popleft(), yy.astype(np.float32, copy=False))
+                total_sequences += 1
+
     if cw is not None:
         cw.flush()
 
-    # meta
     chunks = [] if cw is None else cw.chunks_meta
     feature_dim_total = None if F is None else int(F)
     feature_dim_core = None if F is None else int(F - AUX_DIM)
     label_dim = int(2 * NUM_HORIZONS)
     meta = {
-        "week": wk,
+        "dataset_start": start_iso,
+        "dataset_end": end_iso,
+        "weeks": [wk for wk, _ob, _th in pairs],
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
@@ -338,15 +364,16 @@ def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
         "aux_dim": int(AUX_DIM),
         "label_dim": label_dim,
         "horizons_ms": [int(h) for h in HORIZONS_MS],
-        "core_dtype": "float32"
+        "core_dtype": "float32",
+        "total_sequences": int(total_sequences),
     }
-    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+    with open(os.path.join(out_root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    total_seqs = sum(c["n"] for c in chunks)
-    feat_print = feature_dim_total if feature_dim_total is not None else 0
-    print(f"[done ] {wk} chunks={len(chunks)} total_seqs={total_seqs} "
-          f"L={LOOKBACK} F={feat_print} chunkN={meta['chunk_size_used']}")
+    print(
+        f"[done ] dataset chunks={len(chunks)} total_seqs={total_sequences} "
+        f"L={LOOKBACK} F={feature_dim_total or 0} chunkN={meta['chunk_size_used']}"
+    )
 
 # --------------- driver ----------------
 def main():
@@ -367,35 +394,11 @@ def main():
     print(f"[paths] OB_DIR={OB_DIR}")
     print(f"[paths] TH_DIR={TH_DIR}")
     print(f"[out  ] OUT_ROOT={OUT_ROOT}")
-    print(f"[plan ] weeks={len(pairs)} workers={WORKERS} "
-          f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
 
-    if WORKERS <= 1:
-        for i, (wk, ob_p, th_p) in enumerate(pairs, 1):
-            print(f"\n[{i}/{len(pairs)}] {wk}")
-            try:
-                process_week(wk, ob_p, th_p, OUT_ROOT)
-            except Exception as e:
-                print(f"[error] {wk}: {e}")
-    else:
-        # parallel-by-week (be careful on SATA/external SSDs)
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        try:
-            from tqdm import tqdm
-        except Exception:
-            class tqdm:
-                def __init__(self, total=0, desc="", dynamic_ncols=True): self.n=0; self.total=total; print(f"{desc}: 0/{total}")
-                def update(self, k): self.n+=k; print(f"progress: {self.n}/{self.total}")
-                def close(self): pass
-        with ProcessPoolExecutor(max_workers=WORKERS) as ex, tqdm(total=len(pairs), desc="Weeks done", dynamic_ncols=True) as pbar:
-            futs = {ex.submit(process_week, wk, ob_p, th_p, OUT_ROOT): wk for (wk, ob_p, th_p) in pairs}
-            for fut in as_completed(futs):
-                wk = futs[fut]
-                try:
-                    fut.result()
-                except Exception as e:
-                    print(f"[error] {wk}: {e}")
-                pbar.update(1)
+    if WORKERS > 1:
+        print("[warn ] WORKERS>1 requested but process_all runs sequentially; using 1 worker")
+
+    process_all(pairs, OUT_ROOT)
 
 if __name__ == "__main__":
     main()
