@@ -2413,9 +2413,47 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
     X_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
 
-    total_weeks = len(week_files)
+    parsed_weeks: List[Tuple[datetime, datetime, str, str]] = []
+    for ob_zip, th_zip in week_files:
+        ob_base = os.path.basename(ob_zip)
+        th_base = os.path.basename(th_zip)
+
+        # Normalise prefix so both files parse through _parse_week_key_any
+        ob_key = ob_base.replace("BTCUSDT_TH_", "BTCUSDT_OB_", 1)
+        th_key = th_base.replace("BTCUSDT_TH_", "BTCUSDT_OB_", 1)
+
+        try:
+            start_ob, end_ob, _ = _parse_week_key_any(ob_key)
+        except ValueError as exc:
+            raise ValueError(f"Failed to parse week range from OB file '{ob_base}': {exc}") from exc
+
+        try:
+            start_th, end_th, _ = _parse_week_key_any(th_key)
+        except ValueError as exc:
+            raise ValueError(f"Failed to parse week range from TH file '{th_base}': {exc}") from exc
+
+        if (start_ob, end_ob) != (start_th, end_th):
+            raise ValueError(
+                "Mismatch between OB/TH week ranges: "
+                f"OB='{ob_base}' ({start_ob.date()}→{end_ob.date()}) vs "
+                f"TH='{th_base}' ({start_th.date()}→{end_th.date()})"
+            )
+
+        parsed_weeks.append((start_ob, end_ob, ob_zip, th_zip))
+
+    for idx in range(1, len(parsed_weeks)):
+        prev_start, prev_end, prev_ob, prev_th = parsed_weeks[idx - 1]
+        curr_start, curr_end, curr_ob, curr_th = parsed_weeks[idx]
+        if curr_end <= prev_end:
+            raise ValueError(
+                "Week files must be strictly increasing by end date: "
+                f"'{os.path.basename(curr_ob)}'/'{os.path.basename(curr_th)}' (end={curr_end.date()}) "
+                f"not after '{os.path.basename(prev_ob)}'/'{os.path.basename(prev_th)}' (end={prev_end.date()})"
+            )
+
+    total_weeks = len(parsed_weeks)
     last_global_ts: Optional[int] = None
-    for w_idx, (ob_zip, th_zip) in enumerate(week_files, 1):
+    for w_idx, (start_dt, end_dt, ob_zip, th_zip) in enumerate(parsed_weeks, 1):
         print(f"[week {w_idx}/{total_weeks}] OB={os.path.basename(ob_zip)} | TH={os.path.basename(th_zip)}")
         raw = BybitRawIter(ob_zip, th_zip)
         merged_iter = merge_event_time(raw.ob_iter(), raw.trade_iter(), B=0)
