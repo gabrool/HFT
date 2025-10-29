@@ -71,44 +71,123 @@ def list_glob(dir_path: str, pattern: str) -> List[str]:
     import glob
     return sorted(glob.glob(os.path.join(dir_path, pattern)))
 
-def week_key_from_stem(stem: str, prefix: str) -> str:
-    return stem[len(prefix):] if stem.startswith(prefix) else stem
+def _normalise_ob_prefix(base: str) -> str:
+    if base.startswith("BTCUSDT_OB_"):
+        return base
+    if base.startswith("BTCUSDT_TH_"):
+        return "BTCUSDT_OB_" + base[len("BTCUSDT_TH_"):]
+    return base
 
-def pair_weeks(ob_dir: str, th_dir: str) -> List[Tuple[str, str, str]]:
-    ob_files = list_glob(ob_dir, "BTCUSDT_OB_*.jsonl")
-    th_files = list_glob(th_dir, "BTCUSDT_TH_*.csv")
-    ob_map = { week_key_from_stem(os.path.splitext(os.path.basename(p))[0], "BTCUSDT_OB_"): p for p in ob_files }
-    th_map = { week_key_from_stem(os.path.splitext(os.path.basename(p))[0], "BTCUSDT_TH_"): p for p in th_files }
-    common = sorted(set(ob_map) & set(th_map))
-    return [(wk, ob_map[wk], th_map[wk]) for wk in common]
+def _week_key(path: str, prefix: str) -> str:
+    base = os.path.basename(path)
+    base = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', base)
+    return base.replace(prefix, "")
 
-def _parse_week_key(wk: str):
-    # Supports "DD-MM-YYYY-to-DD-MM-YYYY" and "YYYY-MM-DD-to-YYYY-MM-DD"
+def _parse_week_key_any(base: str):
+    wk = re.sub(r'^(BTCUSDT_(?:OB|TH)_)', '', base)
+    wk = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', wk)
     m = re.match(r"(\d{2}-\d{2}-\d{4})-to-(\d{2}-\d{2}-\d{4})", wk)
     if m:
         s = datetime.strptime(m.group(1), "%d-%m-%Y")
         e = datetime.strptime(m.group(2), "%d-%m-%Y")
-        return s, e
+        return s, e, wk
     m = re.match(r"(\d{4}-\d{2}-\d{2})-to-(\d{4}-\d{2}-\d{2})", wk)
     if m:
         s = datetime.strptime(m.group(1), "%Y-%m-%d")
         e = datetime.strptime(m.group(2), "%Y-%m-%d")
-        return s, e
-    raise ValueError(f"Unrecognized week key format: {wk}")
+        return s, e, wk
+    raise ValueError(f"Unrecognized week key: {base}")
 
-def _slice_last_weeks(pairs, last_end_iso: str, k: int):
+def _parse_week_from_pair(ob_path: str, th_path: str):
+    ob_base = os.path.basename(ob_path)
+    th_base = os.path.basename(th_path)
+    ob_key = _normalise_ob_prefix(ob_base)
+    th_key = _normalise_ob_prefix(th_base)
+    try:
+        start_ob, end_ob, wk = _parse_week_key_any(ob_key)
+    except ValueError as exc:
+        raise ValueError(f"Failed to parse week range from OB file '{ob_base}': {exc}") from exc
+    try:
+        start_th, end_th, _ = _parse_week_key_any(th_key)
+    except ValueError as exc:
+        raise ValueError(f"Failed to parse week range from TH file '{th_base}': {exc}") from exc
+    if (start_ob, end_ob) != (start_th, end_th):
+        raise ValueError(
+            "Mismatch between OB/TH week ranges: "
+            f"OB='{ob_base}' ({start_ob.date()}→{end_ob.date()}) vs "
+            f"TH='{th_base}' ({start_th.date()}→{end_th.date()})"
+        )
+    return start_ob, end_ob, wk
+
+def pair_weeks(ob_dir: str, th_dir: str) -> List[Tuple[str, str, str]]:
+    ob_files = list_glob(ob_dir, "BTCUSDT_OB_*.jsonl")
+    th_files = list_glob(th_dir, "BTCUSDT_TH_*.csv")
+
+    ob_map = { _week_key(p, "BTCUSDT_OB_"): p for p in ob_files }
+    th_map = { _week_key(p, "BTCUSDT_TH_"): p for p in th_files }
+
+    common = sorted(set(ob_map) & set(th_map))
+    if not common:
+        return []
+
+    missing_ob = sorted(set(th_map) - set(ob_map))
+    missing_th = sorted(set(ob_map) - set(th_map))
+    if missing_ob:
+        print(f"Warning: missing OB for weeks: {missing_ob}")
+    if missing_th:
+        print(f"Warning: missing TH for weeks: {missing_th}")
+
+    rows = []
+    for wk_key in common:
+        ob_path = ob_map[wk_key]
+        th_path = th_map[wk_key]
+        start_dt, end_dt, wk = _parse_week_from_pair(ob_path, th_path)
+        rows.append((end_dt, start_dt, wk, ob_path, th_path))
+
+    rows.sort()
+    return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in rows]
+
+def _slice_last_weeks_pairs(pairs: List[Tuple[str, str, str]], last_end_iso: str, k: int):
+    if not pairs:
+        return []
+
     target_end = datetime.strptime(last_end_iso, "%Y-%m-%d")
     rows = []
     for wk, ob_p, th_p in pairs:
-        s, e = _parse_week_key(wk)
-        rows.append((e, s, wk, ob_p, th_p))
-    rows.sort()  # by end date
+        start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
+        rows.append((end_dt, start_dt, wk, ob_p, th_p))
+    rows.sort()
 
-    # find the index of the row whose end date == target_end (or the nearest <= if exact not present)
-    idx = max(i for i,(e,_,_,_,_) in enumerate(rows) if e <= target_end)
+    try:
+        idx = max(i for i,(e,_,_,_,_) in enumerate(rows) if e <= target_end)
+    except ValueError as exc:
+        raise ValueError(
+            f"No week ending on/before {last_end_iso} found. "
+            "Check BYBIT_LAST_WEEK_END or available data."
+        ) from exc
+
     lo = max(0, idx - (k - 1))
     sel = rows[lo:idx+1]
-    return [(wk, ob_p, th_p) for (_,_,wk,ob_p,th_p) in sel]
+    return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in sel]
+
+def _assert_week_order(pairs: List[Tuple[str, str, str]]):
+    if not pairs:
+        return
+
+    parsed = []
+    for wk, ob_p, th_p in pairs:
+        start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
+        parsed.append((start_dt, end_dt, ob_p, th_p, wk))
+
+    for idx in range(1, len(parsed)):
+        _prev_start, prev_end, prev_ob, prev_th, _prev_wk = parsed[idx - 1]
+        _curr_start, curr_end, curr_ob, curr_th, _curr_wk = parsed[idx]
+        if curr_end <= prev_end:
+            raise ValueError(
+                "Week files must be strictly increasing by end date: "
+                f"'{os.path.basename(curr_ob)}'/'{os.path.basename(curr_th)}' (end={curr_end.date()}) "
+                f"not after '{os.path.basename(prev_ob)}'/'{os.path.basename(prev_th)}' (end={prev_end.date()})"
+            )
 
 def ob_iter_plain(jsonl_path: str):
     seq = 0
@@ -334,7 +413,9 @@ def main():
         print(f"No week pairs found under OB_DIR={OB_DIR} and TH_DIR={TH_DIR}")
         return
     
-    pairs = _slice_last_weeks(pairs, LAST_WEEK_END, KEEP_WEEKS)
+    pairs = _slice_last_weeks_pairs(pairs, LAST_WEEK_END, KEEP_WEEKS)
+
+    _assert_week_order(pairs)
 
     print(f"[plan ] weeks={len(pairs)} workers={WORKERS} gate={DECISION_DT}ms "
         f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
