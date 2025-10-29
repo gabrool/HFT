@@ -3,7 +3,6 @@
 Decision-time ingest (memory-safe):
 - Snapshot ONE [LOOKBACK, F] sequence at each decision time.
 - Use a RAM budget to auto-size chunked writes (avoid huge in-RAM lists).
-- Minimal logging; optional heartbeat file.
 
 Env (defaults are SSD-friendly):
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
@@ -12,13 +11,11 @@ Env (defaults are SSD-friendly):
   BYBIT_MAX_WEEKS=0
   BYBIT_WORKERS=1
   BYBIT_LOOKBACK=1024
-  BYBIT_DECISION_INTERVAL_MS=500   # start practical; lower later if desired
   BYBIT_RAM_BUDGET_MB=512          # memory budget for one chunk
   BYBIT_CHUNK_SIZE=0               # 0 = auto from budget; else fixed size
-  BYBIT_HEARTBEAT_SEC=0
 """
 
-import os, sys, csv, json, time, re
+import os, sys, csv, json, re
 from typing import List, Tuple
 from collections import deque
 import numpy as np
@@ -37,15 +34,9 @@ KEEP_WEEKS    = int(os.environ.get("BYBIT_KEEP_WEEKS", "24"))
 WORKERS     = int(os.environ.get("BYBIT_WORKERS", "8"))
 LOOKBACK    = int(os.environ.get("BYBIT_LOOKBACK", "1024"))
 
-# Hybrid gating
-DECISION_DT = int(os.environ.get("BYBIT_DECISION_INTERVAL_MS", "250"))  # backstop
-MIN_GAP_MS  = int(os.environ.get("BYBIT_MIN_GAP_MS",          "250"))   # minimum spacing
-REQUIRE_EVENT_FOR_EARLY = bool(int(os.environ.get("BYBIT_REQUIRE_EVENT", "1")))  # 1 = early fires require event
-
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "0"))
-HEARTBEAT   = float(os.environ.get("BYBIT_HEARTBEAT_SEC", "0"))
 
 AUX_DIM     = 3
 
@@ -291,22 +282,17 @@ class ChunkWriter:
 def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
     out_dir = os.path.join(out_root, wk)
     ensure_dir(out_dir)
-    progress_path = os.path.join(out_dir, "progress.txt")
 
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=5, horizon_ms=1000)
 
     tokens_buf: deque = deque(maxlen=LOOKBACK)  # rolling tokens
     pending_seqs: deque = deque()              # one seq per decision (FIFO)
-    MAX_PENDING = max(1000, int(1000 / max(1, DECISION_DT)) * 5)  # guardrail
 
     F = None
     cw = None  # ChunkWriter will be created once F is known
 
-    next_hb = time.time() + HEARTBEAT if HEARTBEAT > 0 else float("inf")
-    last_decision_ts = -10**15
-
-    print(f"[start] {wk} gate={DECISION_DT}ms L={LOOKBACK} budget={RAM_BUDGET}MB")
+    print(f"[start] {wk} L={LOOKBACK} budget={RAM_BUDGET}MB")
 
     merged = merge_event_time(ob_iter_plain(ob_path), th_iter_plain(th_path), B=0)
 
@@ -319,62 +305,15 @@ def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
             cw = ChunkWriter(out_dir, LOOKBACK, F, RAM_BUDGET, CHUNK_SIZE)
         tokens_buf.append(tok)
 
-        # --- hybrid gating (event-aware with 250 ms backstop) ---
-        # Fire if:
-        #  (a) a trade happened OR mid changed, AND at least MIN_GAP_MS since last decision
-        #  (b) OR the backstop (DECISION_DT) elapsed since last decision
-        trigger_event = bool(is_trade) or (getattr(process_week, "_last_mid", None) != mid)
-        enough_gap = (ts_ms - last_decision_ts) >= MIN_GAP_MS
-        backstop = (ts_ms - last_decision_ts) >= DECISION_DT
+        seq = pad_left_repeat(np.stack(list(tokens_buf), axis=0), LOOKBACK)
+        pending_seqs.append(seq.astype(np.float32))
+        labeler.on_decision(int(ts_ms))
 
-        should_decide = False
-        if REQUIRE_EVENT_FOR_EARLY:
-            if (trigger_event and enough_gap) or backstop:
-                should_decide = True
-        else:
-            # allow time-only early decision if enough_gap
-            if enough_gap and (trigger_event or backstop):
-                should_decide = True
-
-        if should_decide:
-            seq = pad_left_repeat(np.vstack(tokens_buf), LOOKBACK)
-            pending_seqs.append(seq.astype(np.float32))
-            labeler.on_decision(int(ts_ms))
-            last_decision_ts = ts_ms
-
-        setattr(process_week, "_last_mid", mid)
-
-        # matured labels -> pair with oldest decision
         matured = labeler.on_event(int(ts_ms), float(mid))
-        if matured:
-            for yy in matured:
-                if not pending_seqs:
-                    continue  # shouldn't happen
-                cw.add(pending_seqs.popleft(), np.asarray(yy, dtype=np.float32))
-
-        # guardrail: avoid unbounded pending growth (e.g., if DECISION_DT=0)
-        if len(pending_seqs) > MAX_PENDING:
-            # drop oldest to prevent RAM blowup; also record a warning
-            dropped = len(pending_seqs) - MAX_PENDING
-            for _ in range(dropped):
-                pending_seqs.popleft()
-            try:
-                with open(os.path.join(out_dir, "warnings.txt"), "a") as w:
-                    w.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} dropped {dropped} pending seqs\n")
-            except Exception:
-                pass
-
-        # heartbeat to file only (no console spam)
-        if time.time() >= next_hb:
-            try:
-                with open(progress_path, "w") as hb:
-                    hb.write(f"chunks={0 if cw is None else cw.cid} "
-                             f"in_chunk={0 if cw is None else cw.i} "
-                             f"pending={len(pending_seqs)} "
-                             f"time={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            except Exception:
-                pass
-            next_hb = time.time() + HEARTBEAT
+        for yy in matured:
+            if not pending_seqs:
+                raise RuntimeError("Matured label available but no pending sequences to pair")
+            cw.add(pending_seqs.popleft(), yy.astype(np.float32, copy=False))
 
     # flush remainder
     if cw is not None:
@@ -390,10 +329,9 @@ def process_week(wk: str, ob_path: str, th_path: str, out_root: str):
         "aux_tail": ["dt_ms", "is_trade", "events_100ms"],
         "chunks": chunks,
         "dtype": "float32",
-        "decision_interval_ms": int(DECISION_DT),
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if cw is None else int(cw.N),
-        "feature_core": int(F - AUX_DIM),
+        "feature_core": 0 if F is None else int(F - AUX_DIM),
         "aux_dim": int(AUX_DIM),
         "core_dtype": "float32"
     }
@@ -417,13 +355,13 @@ def main():
 
     _assert_week_order(pairs)
 
-    print(f"[plan ] weeks={len(pairs)} workers={WORKERS} gate={DECISION_DT}ms "
-        f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
+    print(f"[plan ] weeks={len(pairs)} workers={WORKERS} "
+          f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
 
     print(f"[paths] OB_DIR={OB_DIR}")
     print(f"[paths] TH_DIR={TH_DIR}")
     print(f"[out  ] OUT_ROOT={OUT_ROOT}")
-    print(f"[plan ] weeks={len(pairs)} workers={WORKERS} gate={DECISION_DT}ms "
+    print(f"[plan ] weeks={len(pairs)} workers={WORKERS} "
           f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
 
     if WORKERS <= 1:
