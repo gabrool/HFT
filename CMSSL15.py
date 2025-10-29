@@ -428,7 +428,7 @@ LR              = 5e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Number of auxiliary channels appended after the base feature vector
-# These correspond to [dt_ms, is_trade, events_100ms]
+# These correspond to [log_dt_ms, is_trade, events_100ms]
 AUX_DIM        = 3
 NUM_HEADS       = 5
 WARMUP_EPOCHS   = max(1, int(EPOCHS * 0.05))  # Warmup over first 5% of epochs
@@ -960,7 +960,10 @@ class SAMBA(nn.Module):
         """
         x_permuted = x.permute(0, 2, 1)
         h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
-        dt_raw = x[..., -3].clamp_min(0.0)
+        # Tokens expose log1p(dt_ms); invert to recover raw millisecond gaps for CPC geometry.
+        log_dt = x[..., -3]
+        log_dt = log_dt.clamp_min(0.0)
+        dt_raw = torch.expm1(log_dt).clamp_min(0.0)
         ps = self.depatch_proj_encoder.depatch.patch_size
         stride = self.depatch_proj_encoder.depatch.box_coder.patch_stride
         dt_patch = dt_raw.unfold(1, ps, stride).sum(-1)
@@ -2403,7 +2406,7 @@ def build_sequence_from_tokens(tokens: Deque[np.ndarray], lookback: int) -> np.n
     return np.concatenate([pad_block, arr], axis=0)
 
 
-def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndarray]:
+def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndarray, int]:
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
 
@@ -2502,18 +2505,16 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
 
         first_event = next(merged_iter, None)
         if first_event is not None:
-            prev_global_ts = last_global_ts
-            ts_first = process_event(first_event)
-            if prev_global_ts is not None and ts_first < prev_global_ts:
+            ts_candidate = int(first_event[1])
+            if last_global_ts is not None and ts_candidate < last_global_ts:
                 raise ValueError("Non-monotonic timestamps across weeks")
-            last_global_ts = ts_first
+            last_global_ts = process_event(first_event)
 
         for e in merged_iter:
-            prev_global_ts = last_global_ts
-            ts_ms = process_event(e)
-            if prev_global_ts is not None and ts_ms < prev_global_ts:
+            ts_candidate = int(e[1])
+            if last_global_ts is not None and ts_candidate < last_global_ts:
                 raise ValueError("Non-monotonic timestamps across weeks")
-            last_global_ts = ts_ms
+            last_global_ts = process_event(e)
 
         print(f"[week {w_idx}] done: events={event_count:,}, sequences={len(X_list):,} so far")
 
