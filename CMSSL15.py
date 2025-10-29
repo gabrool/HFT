@@ -2394,8 +2394,8 @@ def build_sequence_from_tokens(tokens: Deque[np.ndarray], lookback: int) -> np.n
 
     pad_n = lookback - len(tokens)
     first = tokens[0].copy()
-    # last channels are [dt_ms, is_trade, events_100ms] — leave is_trade=0, density=0 for pads
-    first[-3] = PAD_DT_FOR_LEFT  # dt_ms
+    # last channels are [log_dt_ms, is_trade, events_100ms] — leave is_trade=0, density=0 for pads
+    first[-3] = PAD_DT_FOR_LEFT  # log_dt_ms (log1p(0) = 0)
     first[-2] = 0.0              # is_trade
     first[-1] = 0.0              # events_100ms
     pad_block = np.repeat(first[None, :], pad_n, axis=0)
@@ -2407,7 +2407,7 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
 
-    tokens: Deque[np.ndarray] = deque(maxlen=LOOKBACK)  # token = [features..., dt_ms, is_trade, events_100ms]
+    tokens: Deque[np.ndarray] = deque(maxlen=LOOKBACK)  # token = [features..., log_dt_ms, is_trade, events_100ms]
     pending_seqs: Deque[np.ndarray] = deque()           # sequences waiting for labels (FIFO)
 
     X_list: List[np.ndarray] = []
@@ -2473,8 +2473,9 @@ def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndar
 
             # 2) Build token with aux channels
             events_100ms = fe.event_density_100ms()
+            log_dt_ms = float(np.log1p(dt_ms))
             token = np.concatenate(
-                [feat, np.array([dt_ms, float(is_trade), events_100ms], dtype=np.float32)]
+                [feat, np.array([log_dt_ms, float(is_trade), events_100ms], dtype=np.float32)]
             ).astype(np.float32)
             tokens.append(token)
 
