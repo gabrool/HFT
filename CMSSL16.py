@@ -1292,22 +1292,28 @@ class FeatureEngine:
         }
 
         # ---------- Trades windows for short VWAP & bursts ----------
-        self.trades_25ms: Deque[Tuple[int, float, float, str]] = deque()   # (ts, price, size, side)
-        self.trades_50ms: Deque[Tuple[int, float, float, str]] = deque()
-        self.trades_100ms: Deque[Tuple[int, float, float, str]] = deque()
-        self.trades_250ms: Deque[Tuple[int, float, float, str]] = deque()
-        self.trades_500ms: Deque[Tuple[int, float, float, str]] = deque()
-        self.trades_1s: Deque[Tuple[int, float, float, str]] = deque()
-        self.trades_5s: Deque[Tuple[int, float, float, str]] = deque()
+        # (ts, price, size, side, tick_sign, is_zero_tick)
+        self.trades_25ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
+        self.trades_50ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
+        self.trades_100ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
+        self.trades_250ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
+        self.trades_500ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
+        self.trades_1s: Deque[Tuple[int, float, float, str, int, int]] = deque()
+        self.trades_5s: Deque[Tuple[int, float, float, str, int, int]] = deque()
 
         self.trade_windows: Tuple[int, ...] = (25, 50, 100, 250, 500)
-        self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str]]] = {
+        self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str, int, int]]] = {
             25: self.trades_25ms,
             50: self.trades_50ms,
             100: self.trades_100ms,
             250: self.trades_250ms,
             500: self.trades_500ms,
         }
+
+        # Tick-direction tracking
+        self.last_tick_sign: int = 0
+        self.last_is_zero_tick: int = 0
+        self.last_trade_price: Optional[float] = None
 
         # ---------- Quote windows (25/50/100/250/500/1000 ms) ----------
         self.quotes_25ms: Deque[int] = deque()
@@ -1424,13 +1430,14 @@ class FeatureEngine:
                     state[name] = self._ewma_update(prev, value, dt_ms, hl)
 
     def _compute_trade_window_stats(
-        self, trades: Deque[Tuple[int, float, float, str]], mid: float
+        self, trades: Deque[Tuple[int, float, float, str, int, int]], mid: float
     ) -> Dict[str, float]:
         buy_vol = sell_vol = 0.0
         buy_cnt = sell_cnt = 0
         buy_max = sell_max = 0.0
         trade_through = 0.0
-        for _, price, size, side in trades:
+        for entry in trades:
+            _, price, size, side, *_ = entry
             if side == "buy":
                 buy_vol += size
                 buy_cnt += 1
@@ -1629,11 +1636,63 @@ class FeatureEngine:
 
         self._sorted_ladders()
 
+    def _interpret_tick_direction(self, tick_dir: Any) -> Tuple[int, int]:
+        tick_sign = 0
+        is_zero_tick = 0
+
+        if isinstance(tick_dir, (int, float)):
+            if tick_dir > 0:
+                tick_sign = 1
+            elif tick_dir < 0:
+                tick_sign = -1
+            else:
+                tick_sign = 0
+                is_zero_tick = 1
+        elif isinstance(tick_dir, str):
+            norm = tick_dir.strip().lower()
+            cleaned = norm.replace("-", "").replace("_", "").replace(" ", "")
+            if 'plus' in cleaned or cleaned in {"plustick", "uptick", "up", "buy", "bid"}:
+                tick_sign = 1
+            elif 'minus' in cleaned or cleaned in {"minustick", "downtick", "down", "sell", "ask"}:
+                tick_sign = -1
+            elif cleaned in {"zerotick", "flat", "unchanged", "0"}:
+                tick_sign = 0
+            if 'zero' in cleaned or cleaned in {"zerotick", "flat", "unchanged", "0"}:
+                is_zero_tick = 1
+
+        return int(tick_sign), int(is_zero_tick)
+
     def _update_trade_windows(self, ts_ms: int, trade_evt: dict, dt_ms: float):
         side = str(trade_evt['side']).lower()  # 'buy'|'sell'
         price = float(trade_evt['price'])
         size = float(trade_evt['size'])
-        entry = (ts_ms, price, size, side)
+
+        tick_dir = trade_evt.get("tickDirection")
+        tick_sign = int(self.last_tick_sign)
+        is_zero_tick = int(self.last_is_zero_tick)
+
+        if tick_dir is not None:
+            tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
+
+        if self.last_trade_price is not None:
+            if price > self.last_trade_price:
+                tick_sign, is_zero_tick = 1, 0
+            elif price < self.last_trade_price:
+                tick_sign, is_zero_tick = -1, 0
+            else:
+                if tick_sign == 0 and is_zero_tick == 0:
+                    tick_sign = self.last_tick_sign if self.last_tick_sign != 0 else 0
+                if is_zero_tick == 0:
+                    is_zero_tick = 1
+        else:
+            if tick_sign == 0 and is_zero_tick == 0:
+                tick_sign, is_zero_tick = 0, 0
+
+        self.last_tick_sign = tick_sign
+        self.last_is_zero_tick = is_zero_tick
+        self.last_trade_price = price
+
+        entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
         for window, deq in self._trade_window_deques.items():
             deq.append(entry)
             self._prune_deque_ms(deq, ts_ms, window)
@@ -2174,6 +2233,8 @@ class FeatureEngine:
             self.event_density_250ms(),
             self.event_density_500ms(),
             dt_since_trade,
+            float(self.last_tick_sign),
+            float(self.last_is_zero_tick),
 
             # --- best-level churn & depletion & spread-change stats ---
             float(bid1_change_counts.get(50, 0)),
