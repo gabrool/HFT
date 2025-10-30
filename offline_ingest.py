@@ -190,6 +190,34 @@ def _assert_week_order(pairs: List[Tuple[str, str, str]]):
 
 _DEC_THOUSAND = Decimal("1000")
 
+
+def _event_ts(event) -> int:
+    """Extract the first integer-like timestamp from an event tuple."""
+    if event is None:
+        raise ValueError("Expected an event tuple, got None")
+
+    for idx in (0, 1):
+        if len(event) <= idx:
+            continue
+        candidate = event[idx]
+        try:
+            ts = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(candidate, bool):
+            continue
+        if isinstance(candidate, float) and not candidate.is_integer():
+            continue
+        if isinstance(candidate, np.floating) and not candidate.is_integer():
+            continue
+        return ts
+
+    raise ValueError(
+        "Event does not expose an integer timestamp at positions 0 or 1: "
+        f"{event!r}"
+    )
+
+
 def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
     for _ts, seq, row in tr_iter:
         ts_decimal = (Decimal(row["timestamp"]) * _DEC_THOUSAND).to_integral_value(
@@ -325,7 +353,7 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
             print(f"[skip ] {wk} yielded no events")
             continue
 
-        ts_first = int(first_event[1])
+        ts_first = _event_ts(first_event)
         if last_global_ts is not None and ts_first < last_global_ts:
             raise ValueError(
                 "Non-monotonic timestamps across weeks: "
