@@ -1310,10 +1310,11 @@ class FeatureEngine:
             500: self.trades_500ms,
         }
 
-        # Tick-direction tracking
+        # Tick-direction & RPI tracking
         self.last_tick_sign: int = 0
         self.last_is_zero_tick: int = 0
         self.last_trade_price: Optional[float] = None
+        self.last_is_rpi: int = 0
 
         # ---------- Quote windows (25/50/100/250/500/1000 ms) ----------
         self.quotes_25ms: Deque[int] = deque()
@@ -1670,6 +1671,29 @@ class FeatureEngine:
         tick_dir = trade_evt.get("tickDirection")
         tick_sign = int(self.last_tick_sign)
         is_zero_tick = int(self.last_is_zero_tick)
+        is_rpi = int(self.last_is_rpi)
+
+        rpi_raw = trade_evt.get("RPI")
+        if rpi_raw is None:
+            rpi_raw = trade_evt.get("rpi")
+
+        if rpi_raw is not None:
+            if isinstance(rpi_raw, str):
+                rpi_norm = rpi_raw.strip().lower()
+                if rpi_norm in {"1", "true", "t", "yes", "y"}:
+                    is_rpi = 1
+                elif rpi_norm in {"0", "false", "f", "no", "n", ""}:
+                    is_rpi = 0
+                else:
+                    try:
+                        is_rpi = 1 if float(rpi_norm) != 0.0 else 0
+                    except ValueError:
+                        pass
+            else:
+                try:
+                    is_rpi = 1 if float(rpi_raw) != 0.0 else 0
+                except (TypeError, ValueError):
+                    pass
 
         if tick_dir is not None:
             tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
@@ -1691,6 +1715,7 @@ class FeatureEngine:
         self.last_tick_sign = tick_sign
         self.last_is_zero_tick = is_zero_tick
         self.last_trade_price = price
+        self.last_is_rpi = is_rpi
 
         entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
         for window, deq in self._trade_window_deques.items():
@@ -2235,6 +2260,7 @@ class FeatureEngine:
             dt_since_trade,
             float(self.last_tick_sign),
             float(self.last_is_zero_tick),
+            float(self.last_is_rpi),
 
             # --- best-level churn & depletion & spread-change stats ---
             float(bid1_change_counts.get(50, 0)),
