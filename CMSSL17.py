@@ -1990,11 +1990,11 @@ class FeatureEngine:
         self.press_2s    = self._ewma_update(getattr(self, 'press_2s',   0.0), ofi_l1, dt_ms, 2_000)
 
         # Short VWAPs (25/50/100/250/500 ms) and rel to mid/micro
-        def vwap_in(win: Deque[Tuple[int, float, float, str]]) -> float:
-            vol = sum(s for _, _, s, _ in win)
+        def vwap_in(win: Deque[Tuple[int, float, float, str, int, int]]) -> float:
+            vol = sum(s for _, _, s, *_ in win)
             if vol <= 1e-12:
                 return mid
-            pxv = sum(p * s for _, p, s, _ in win)
+            pxv = sum(p * s for _, p, s, *_ in win)
             return pxv / vol
 
         vwap_per_ms: Dict[int, float] = {
