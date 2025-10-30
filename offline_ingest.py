@@ -16,8 +16,10 @@ Env (defaults are SSD-friendly):
 """
 
 import os, sys, csv, json, re
-from typing import List, Tuple
+from typing import List, Tuple, Iterable
 from collections import deque
+from decimal import Decimal, ROUND_HALF_EVEN
+import itertools
 import numpy as np
 from datetime import datetime
 
@@ -50,6 +52,7 @@ from CMSSL16 import (
     NUM_HORIZONS,
     LOOKBACK,
     AUX_DIM,
+    BybitRawIter,
 )  # reuse exactly
 
 # fast json if available
@@ -185,25 +188,14 @@ def _assert_week_order(pairs: List[Tuple[str, str, str]]):
                 f"not after '{os.path.basename(prev_ob)}'/'{os.path.basename(prev_th)}' (end={prev_end.date()})"
             )
 
-def ob_iter_plain(jsonl_path: str):
-    seq = 0
-    with open(jsonl_path, "rt", encoding="utf-8") as f:
-        for line in f:
-            if not line: continue
-            obj = fast_json_loads(line)
-            ts = int(obj.get("ts", obj.get("cts", 0)))
-            seq += 1
-            yield ts, seq, obj
+_DEC_THOUSAND = Decimal("1000")
 
-def th_iter_plain(csv_path: str):
-    seq = 0
-    with open(csv_path, "rt", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            seq += 1
-            ts = int(float(row["timestamp"]) * 1000)
-            row["seq"] = seq
-            yield ts, seq, row
+def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
+    for _ts, seq, row in tr_iter:
+        ts_decimal = (Decimal(row["timestamp"]) * _DEC_THOUSAND).to_integral_value(
+            rounding=ROUND_HALF_EVEN
+        )
+        yield int(ts_decimal), seq, row
 
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
     # exact tail order: [log_dt_ms, is_trade, events_100ms]
@@ -228,7 +220,11 @@ class ChunkWriter:
         self.core_dtype = np.float32
 
         # compute chunk size (keep as you already had it)
-        bytes_per_seq = (self.L * self.F_core * 4) + (self.L * AUX_DIM * 4) + (2 * 4)
+        bytes_per_seq = (
+            (self.L * self.F_core * 4)
+            + (self.L * AUX_DIM * 4)
+            + (2 * NUM_HORIZONS * 4)
+        )
         if chunk_size_override > 0:
             self.N = int(chunk_size_override)
         else:
@@ -315,13 +311,30 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
         f"[start] ingest weeks={len(pairs)} L={LOOKBACK} budget={RAM_BUDGET}MB"
     )
 
+    last_global_ts = None
+
     for idx, (wk, ob_path, th_path) in enumerate(pairs, 1):
         print(f"[week ] {idx}/{len(pairs)} {wk}")
+        raw = BybitRawIter(ob_path, th_path)
         merged = merge_event_time(
-            ob_iter_plain(ob_path), th_iter_plain(th_path), B=0
+            raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0
         )
 
-        for e in merged:
+        first_event = next(merged, None)
+        if first_event is None:
+            print(f"[skip ] {wk} yielded no events")
+            continue
+
+        ts_first = int(first_event[1])
+        if last_global_ts is not None and ts_first < last_global_ts:
+            raise ValueError(
+                "Non-monotonic timestamps across weeks: "
+                f"week {wk} starts at {ts_first} < last seen {last_global_ts}"
+            )
+
+        week_iter = itertools.chain((first_event,), merged)
+
+        for e in week_iter:
             ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(e)
             tok = build_token(fe, feat_z, is_trade, dt_ms)
             if F is None:
@@ -341,6 +354,8 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
                     )
                 cw.add(pending_seqs.popleft(), yy.astype(np.float32, copy=False))
                 total_sequences += 1
+
+            last_global_ts = int(ts_ms)
 
     if cw is not None:
         cw.flush()
