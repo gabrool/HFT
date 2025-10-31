@@ -547,11 +547,16 @@ def train_from_offline():
 
             # ===== SAM pass #2 =====
             ret_pred2, vol_pred2, dir_pred_logits2, h_clean2, h_masked2, _, cpc_loss2 = model(
-                x, mask_ratio=mratio, mask_idx=mask_idx
+                x,
+                mask_ratio=mratio,
+                mask_idx=mask_idx,  # reuse original mask locations for pass #2
             )
 
             # Recompute recon using original mask indices
-            recon2 = F.mse_loss(h_masked2[batch_idx, mask_idx], h_clean2.detach()[batch_idx, mask_idx])
+            recon2 = F.mse_loss(
+                h_masked2[batch_idx, mask_idx],
+                h_clean2.detach()[batch_idx, mask_idx],
+            )
             if is_ssl_pretrain:
                 # reuse same loss components
                 loss2 = LAMBDA_RECON_PT * (recon2 / (ema_pre['recon'] + 1e-8)) + LAMBDA_CPC_PT * (cpc_loss2 / (ema_pre['cpc'] + 1e-8))
