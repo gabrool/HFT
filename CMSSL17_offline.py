@@ -751,10 +751,10 @@ def train_from_offline():
                   f"Acc(all)={fmt_arr(val_acc, '{:.3%}')}  Acc(mask)={fmt_arr(val_acc_masked, '{:.3%}')}  "
                   f"AUC(all)={fmt_arr(val_auc, '{:.3f}')}  AUC(mask)={fmt_arr(val_auc_masked, '{:.3f}')}")
 
-            scheduler.step(avg_val_ret_loss)
-
             # checkpointing policy like CMSSL17: track best avg_val_ret_loss during fine-tuning
             if not is_ssl_pretrain:
+                scheduler.step(avg_val_ret_loss)
+
                 if avg_val_ret_loss < best:
                     best = float(avg_val_ret_loss)
                     no_imp = 0
