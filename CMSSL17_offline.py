@@ -464,6 +464,8 @@ def train_from_offline():
     pos_lo, pos_hi, neg_lo, neg_hi = compute_dir_mask_quantiles_from_ytrain(y_train_for_quant)
     build_dir_mask = make_build_dir_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi)
     horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
+    horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
+    horizon_weights_np = horizon_weights_cpu.numpy()
     delta_ret_tensor = torch.as_tensor(DELTA_RET, dtype=torch.float32, device=device)
     delta_logvol_tensor = torch.as_tensor(DELTA_LOGVOL, dtype=torch.float32, device=device)
     compute_directional_loss = compute_directional_loss_fn(build_dir_mask, horizon_weights)
@@ -641,9 +643,16 @@ def train_from_offline():
                         val_masked_total[h_idx] += mask_h.sum().item()
 
             # Aggregate metrics
-            val_ret_loss = val_ret_loss_sum / max(val_sample_total, 1)
-            val_vol_loss = val_vol_loss_sum / max(val_sample_total, 1)
-            val_loss = (val_ret_loss + val_vol_loss).mean()
+            avg_val_ret_loss_per_h = val_ret_loss_sum / max(val_sample_total, 1)
+            avg_val_vol_loss_per_h = val_vol_loss_sum / max(val_sample_total, 1)
+            avg_val_ret_loss = float(
+                np.dot(avg_val_ret_loss_per_h, horizon_weights_np)
+                / max(horizon_weights_cpu.sum().item(), 1e-12)
+            )
+            avg_val_vol_loss = float(
+                np.dot(avg_val_vol_loss_per_h, horizon_weights_np)
+                / max(horizon_weights_cpu.sum().item(), 1e-12)
+            )
 
             # BCE
             val_bce_unmasked = val_bce_unmasked_sum / np.maximum(val_bce_unmasked_count, 1)
@@ -683,32 +692,34 @@ def train_from_offline():
                         parts.append(f"{h}ms:{fmt.format(val)}")
                 return "[" + ", ".join(parts) + "]"
 
-            print(f"[val] ret={fmt_arr(val_ret_loss)}  vol={fmt_arr(val_vol_loss)}  "
+            print(f"[val] ret={fmt_arr(avg_val_ret_loss_per_h)} (w_avg={avg_val_ret_loss:.4e})  "
+                  f"vol={fmt_arr(avg_val_vol_loss_per_h)} (w_avg={avg_val_vol_loss:.4e})  "
                   f"BCE(all)={fmt_arr(val_bce_unmasked)}  BCE(mask)={fmt_arr(val_bce_masked)}  "
                   f"Acc(all)={fmt_arr(val_acc, '{:.3%}')}  Acc(mask)={fmt_arr(val_acc_masked, '{:.3%}')}  "
                   f"AUC(all)={fmt_arr(val_auc, '{:.3f}')}  AUC(mask)={fmt_arr(val_auc_masked, '{:.3f}')}")
 
-            scheduler.step(val_loss)
+            scheduler.step(avg_val_ret_loss)
 
-            # checkpointing policy like CMSSL17: track best val_loss
-            if val_loss < best:
-                best = float(val_loss)
-                no_imp = 0
-                ckpt = {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "args": {
-                        "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
-                        "feat_dim": F_total, "LOOKBACK": LOOKBACK,
-                        "HORIZONS_MS": HORIZONS_MS,
-                    },
-                    "best_val_loss": best,
-                }
-                out_ckpt = out_root / "cmssl17_offline_best.pt"
-                torch.save(ckpt, out_ckpt)
-                print(f"[ckpt] saved best to {out_ckpt}")
-            else:
-                no_imp += 1
+            # checkpointing policy like CMSSL17: track best avg_val_ret_loss during fine-tuning
+            if not is_ssl_pretrain:
+                if avg_val_ret_loss < best:
+                    best = float(avg_val_ret_loss)
+                    no_imp = 0
+                    ckpt = {
+                        "epoch": epoch,
+                        "model": model.state_dict(),
+                        "args": {
+                            "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
+                            "feat_dim": F_total, "LOOKBACK": LOOKBACK,
+                            "HORIZONS_MS": HORIZONS_MS,
+                        },
+                        "best_val_loss": best,
+                    }
+                    out_ckpt = out_root / "cmssl17_offline_best.pt"
+                    torch.save(ckpt, out_ckpt)
+                    print(f"[ckpt] saved best to {out_ckpt}")
+                else:
+                    no_imp += 1
 
         # (Optional) early stop on long stagnation
         # if no_imp > 50: break
