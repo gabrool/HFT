@@ -331,6 +331,7 @@ class WeekWriterRouter:
         self.week_counts: Dict[str, int] = defaultdict(int)
         self.week_decision_span: Dict[str, List[int]] = {}
         self.chunk_size_used: int = 0
+        self.week_metas: Dict[str, dict] = {}
 
     def _ensure_writer(self, week_key: str) -> ChunkWriter:
         if week_key in self.writers:
@@ -369,11 +370,22 @@ class WeekWriterRouter:
 
     def _finalize_week(self, week_key: str):
         writer = self.writers.pop(week_key, None)
+        span = self.week_decision_span.pop(week_key, None)
+        total_sequences = int(self.week_counts.get(week_key, 0))
         if writer is None:
+            # Week already finalised or produced no data.
             return
         writer.flush()
         meta_path = os.path.join(self.out_root, week_key, "meta_week.json")
-        span = self.week_decision_span.get(week_key)
+        chunks_meta = [
+            {
+                "chunk": int(entry["chunk"]),
+                "n": int(entry["n"]),
+                "files": dict(entry["files"]),
+            }
+            for entry in writer.chunks_meta
+        ]
+        rows_total = int(sum(entry["n"] for entry in chunks_meta))
         meta = {
             "week": week_key,
             "lookback": self.lookback,
@@ -382,8 +394,11 @@ class WeekWriterRouter:
             "label_dim": int(2 * NUM_HORIZONS),
             "horizons_ms": [int(h) for h in HORIZONS_MS],
             "chunk_size_used": int(writer.N),
-            "chunks": writer.chunks_meta,
-            "total_sequences": int(self.week_counts.get(week_key, 0)),
+            "chunks": chunks_meta,
+            "chunk_count": int(len(chunks_meta)),
+            "rows_total": rows_total,
+            "total_sequences": total_sequences,
+            "meta_path": os.path.join(week_key, "meta_week.json"),
         }
         if span:
             meta["decision_ts_range"] = {
@@ -392,6 +407,7 @@ class WeekWriterRouter:
             }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
+        self.week_metas[week_key] = meta
 
     def close_old_writers(self, watermark_ms: int):
         to_close = []
@@ -404,6 +420,9 @@ class WeekWriterRouter:
 
     def flush_all(self):
         for wk in list(self.writers.keys()):
+            self._finalize_week(wk)
+        # If any metadata spans remain (e.g. weeks with no chunks), clear them.
+        for wk in list(self.week_decision_span.keys()):
             self._finalize_week(wk)
 # --------------- dataset-wide processing ---------------
 def _compute_dataset_span(pairs: List[Tuple[str, str, str]]):
@@ -593,15 +612,33 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
     feature_dim_total = None if F is None else int(F)
     feature_dim_core = None if F is None else int(F - AUX_DIM)
     label_dim = int(2 * NUM_HORIZONS)
+    week_meta_records = {} if router is None else dict(router.week_metas)
+    weeks_in_order = [wk for wk, _ob, _th in pairs]
+    week_counts = {
+        wk: int(0 if router is None else router.week_counts.get(wk, 0))
+        for wk in weeks_in_order
+    }
+    total_chunks = sum(
+        int(week_meta.get("chunk_count", len(week_meta.get("chunks", []))))
+        for week_meta in week_meta_records.values()
+    )
+    rows_via_week_metas = sum(
+        int(week_meta.get("rows_total", week_meta.get("total_sequences", 0)))
+        for week_meta in week_meta_records.values()
+    )
+    weeks_meta_paths = {
+        wk: week_meta_records[wk].get("meta_path", os.path.join(wk, "meta_week.json"))
+        for wk in week_meta_records.keys()
+    }
+
     meta = {
         "dataset_start": start_iso,
         "dataset_end": end_iso,
-        "weeks": [wk for wk, _ob, _th in pairs],
+        "weeks": weeks_in_order,
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
         "aux_tail": ["log_dt_ms", "is_trade", "events_100ms"],
-        "chunks": [],
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
@@ -610,7 +647,10 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
         "horizons_ms": [int(h) for h in HORIZONS_MS],
         "core_dtype": "float32",
         "total_sequences": int(total_sequences),
-        "week_counts": {wk: int(cnt) for wk, cnt in ({} if router is None else router.week_counts).items()},
+        "week_counts": week_counts,
+        "total_chunks": int(total_chunks),
+        "rows_total_from_weeks": int(rows_via_week_metas),
+        "weeks_meta": weeks_meta_paths,
     }
     with open(os.path.join(out_root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
