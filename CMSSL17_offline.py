@@ -533,14 +533,18 @@ def train_from_offline():
                 ep_ret += mse_ret.item(); ep_logvol += mse_vol.item(); ep_bce += bce_loss.item(); ep_recon += recon.item(); ep_cpc += cpc_loss.item()
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.first_step(zero_grad=True)
 
             # ===== SAM pass #2 =====
-            ret_pred2, vol_pred2, dir_pred_logits2, *_ = model(x, mask_ratio=mratio)
+            ret_pred2, vol_pred2, dir_pred_logits2, h_clean2, h_masked2, _, cpc_loss2 = model(
+                x, mask_ratio=mratio, mask_idx=mask_idx
+            )
+
+            # Recompute recon using original mask indices
+            recon2 = F.mse_loss(h_masked2[batch_idx, mask_idx], h_clean2.detach()[batch_idx, mask_idx])
             if is_ssl_pretrain:
                 # reuse same loss components
-                loss2 = LAMBDA_RECON_PT * (recon / (ema_pre['recon'] + 1e-8)) + LAMBDA_CPC_PT * (cpc_loss / (ema_pre['cpc'] + 1e-8))
+                loss2 = LAMBDA_RECON_PT * (recon2 / (ema_pre['recon'] + 1e-8)) + LAMBDA_CPC_PT * (cpc_loss2 / (ema_pre['cpc'] + 1e-8))
             else:
                 y_ret = y[:, :NUM_HORIZONS]
                 y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
@@ -550,8 +554,8 @@ def train_from_offline():
                 loss2 = (mse_ret2 / (ema_ft['ret'] + 1e-8) +
                          mse_vol2 / (ema_ft['logvol'] + 1e-8) +
                          LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8)) +
-                         LAMBDA_RECON_FT * (recon / (ema_ft['recon'] + 1e-8)) +
-                         LAMBDA_CPC_FT   * (cpc_loss / (ema_ft['cpc'] + 1e-8)))
+                         LAMBDA_RECON_FT * (recon2 / (ema_ft['recon'] + 1e-8)) +
+                         LAMBDA_CPC_FT   * (cpc_loss2 / (ema_ft['cpc'] + 1e-8)))
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.second_step(zero_grad=True)
