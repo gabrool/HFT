@@ -442,6 +442,13 @@ def train_from_offline():
 
         # fit (optional) PCA on training core dims
         pca_model, _F_total_unused = maybe_fit_pca_core(tr_weeks, PCA_VAR_ENV)
+        if pca_model is not None:
+            n_components = getattr(pca_model, "n_components_", None)
+            if n_components is not None:
+                F_total = int(n_components + AUX_DIM)
+                print(f"[PCA] Using reduced feature dim: core={n_components}, aux={AUX_DIM} → F_total={F_total}")
+            else:
+                print("[warn] PCA model missing n_components_; keeping original feature dim.")
         # Build datasets
         ds_train = NpyChunksDataset(tr_refs, F_total, pca_core=pca_model)
         ds_val   = NpyChunksDataset(va_refs, F_total, pca_core=pca_model)
