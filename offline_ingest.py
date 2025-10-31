@@ -16,12 +16,12 @@ Env (defaults are SSD-friendly):
 """
 
 import os, sys, csv, json, re
-from typing import List, Tuple, Iterable
-from collections import deque
+from typing import List, Tuple, Iterable, Dict
+from collections import deque, defaultdict
 from decimal import Decimal, ROUND_HALF_EVEN
 import itertools
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ---------------- config ----------------
 OB_DIR      = os.environ.get("BYBIT_OB_DIR",   "/home/gabrool/Documents/OB")
@@ -53,6 +53,8 @@ from CMSSL17 import (
     AUX_DIM,
     BybitRawIter,
 )  # reuse exactly
+
+GRACE_MS = max(int(h) for h in HORIZONS_MS)
 
 # fast json if available
 try:
@@ -302,6 +304,104 @@ class ChunkWriter:
         self.cid += 1
         self.i = 0
 
+
+class WeekWriterRouter:
+    def __init__(
+        self,
+        out_root: str,
+        lookback: int,
+        feature_dim: int,
+        ram_budget_mb: int,
+        chunk_size_override: int,
+        week_index: List[Tuple[str, int, int]],
+    ):
+        self.out_root = out_root
+        self.lookback = int(lookback)
+        self.feature_dim = int(feature_dim)
+        self.ram_budget_mb = int(ram_budget_mb)
+        self.chunk_size_override = int(chunk_size_override)
+        self.week_index = list(week_index)
+        self.week_bounds: Dict[str, Tuple[int, int]] = {
+            wk: (start, end) for wk, start, end in self.week_index
+        }
+        self.writers: Dict[str, ChunkWriter] = {}
+        self.week_counts: Dict[str, int] = defaultdict(int)
+        self.week_decision_span: Dict[str, List[int]] = {}
+        self.chunk_size_used: int = 0
+
+    def _ensure_writer(self, week_key: str) -> ChunkWriter:
+        if week_key in self.writers:
+            return self.writers[week_key]
+        week_dir = os.path.join(self.out_root, week_key)
+        ensure_dir(week_dir)
+        writer = ChunkWriter(
+            week_dir,
+            self.lookback,
+            self.feature_dim,
+            self.ram_budget_mb,
+            self.chunk_size_override,
+        )
+        self.writers[week_key] = writer
+        if not self.chunk_size_used:
+            self.chunk_size_used = int(writer.N)
+        return writer
+
+    def _find_week_key(self, ts_ms: int) -> str:
+        for wk, start_ms, end_ms in self.week_index:
+            if start_ms <= ts_ms < end_ms:
+                return wk
+        raise ValueError(f"No week found for decision timestamp {ts_ms}")
+
+    def add(self, ts_decision_ms: int, seq: np.ndarray, label: np.ndarray):
+        wk = self._find_week_key(ts_decision_ms)
+        writer = self._ensure_writer(wk)
+        writer.add(seq, label)
+        self.week_counts[wk] += 1
+        if wk not in self.week_decision_span:
+            self.week_decision_span[wk] = [ts_decision_ms, ts_decision_ms]
+        else:
+            span = self.week_decision_span[wk]
+            span[0] = min(span[0], ts_decision_ms)
+            span[1] = max(span[1], ts_decision_ms)
+
+    def _finalize_week(self, week_key: str):
+        writer = self.writers.pop(week_key, None)
+        if writer is None:
+            return
+        writer.flush()
+        meta_path = os.path.join(self.out_root, week_key, "meta_week.json")
+        span = self.week_decision_span.get(week_key)
+        meta = {
+            "week": week_key,
+            "lookback": self.lookback,
+            "feature_dim_total": self.feature_dim,
+            "feature_dim_core": self.feature_dim - AUX_DIM,
+            "label_dim": int(2 * NUM_HORIZONS),
+            "horizons_ms": [int(h) for h in HORIZONS_MS],
+            "chunk_size_used": int(writer.N),
+            "chunks": writer.chunks_meta,
+            "total_sequences": int(self.week_counts.get(week_key, 0)),
+        }
+        if span:
+            meta["decision_ts_range"] = {
+                "min": int(span[0]),
+                "max": int(span[1]),
+            }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+    def close_old_writers(self, watermark_ms: int):
+        to_close = []
+        for wk, writer in list(self.writers.items()):
+            _start_ms, end_ms = self.week_bounds[wk]
+            if end_ms + GRACE_MS < watermark_ms:
+                to_close.append(wk)
+        for wk in to_close:
+            self._finalize_week(wk)
+
+    def flush_all(self):
+        for wk in list(self.writers.keys()):
+            self._finalize_week(wk)
 # --------------- dataset-wide processing ---------------
 def _compute_dataset_span(pairs: List[Tuple[str, str, str]]):
     if not pairs:
@@ -317,6 +417,25 @@ def _compute_dataset_span(pairs: List[Tuple[str, str, str]]):
     return min(starts), max(ends)
 
 
+def _dt_to_epoch_ms(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _build_week_index(pairs: List[Tuple[str, str, str]]):
+    index = []
+    for wk, _ob_path, _th_path in pairs:
+        start_dt, end_dt, _ = _parse_week_key_any(
+            _normalise_ob_prefix(f"BTCUSDT_OB_{wk}")
+        )
+        start_ms = _dt_to_epoch_ms(start_dt)
+        end_ms = _dt_to_epoch_ms(end_dt + timedelta(days=1))
+        index.append((wk, start_ms, end_ms))
+    index.sort(key=lambda x: x[1])
+    return index
+
+
 def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
     ensure_dir(out_root)
 
@@ -327,12 +446,14 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
     pending_seqs: deque = deque()
 
     F = None
-    cw = None
+    router: WeekWriterRouter = None  # type: ignore
     total_sequences = 0
 
     ds_start, ds_end = _compute_dataset_span(pairs)
     start_iso = ds_start.date().isoformat() if ds_start else None
     end_iso = ds_end.date().isoformat() if ds_end else None
+
+    week_index = _build_week_index(pairs)
 
     print(
         f"[start] ingest weeks={len(pairs)} L={LOOKBACK} budget={RAM_BUDGET}MB"
@@ -366,12 +487,20 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
             tok = build_token(fe, feat_z, is_trade, dt_ms)
             if F is None:
                 F = tok.shape[0]
-                cw = ChunkWriter(out_root, LOOKBACK, F, RAM_BUDGET, CHUNK_SIZE)
+                router = WeekWriterRouter(
+                    out_root,
+                    LOOKBACK,
+                    F,
+                    RAM_BUDGET,
+                    CHUNK_SIZE,
+                    week_index,
+                )
             tokens_buf.append(tok)
 
             seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
-            pending_seqs.append(seq.astype(np.float32, copy=False))
-            labeler.on_decision(int(ts_ms))
+            ts_decision = int(ts_ms)
+            pending_seqs.append((ts_decision, seq.astype(np.float32, copy=False)))
+            labeler.on_decision(ts_decision)
 
             matured = labeler.on_event(int(ts_ms), float(mid))
             for yy in matured:
@@ -379,15 +508,20 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
                     raise RuntimeError(
                         "Matured label available but no pending sequences to pair"
                     )
-                cw.add(pending_seqs.popleft(), yy.astype(np.float32, copy=False))
+                if router is None:
+                    raise RuntimeError("Router not initialised before label maturity")
+                ts_ready, seq_ready = pending_seqs.popleft()
+                router.add(ts_ready, seq_ready, yy.astype(np.float32, copy=False))
                 total_sequences += 1
 
             last_global_ts = int(ts_ms)
 
-    if cw is not None:
-        cw.flush()
+            if router is not None:
+                router.close_old_writers(int(ts_ms))
 
-    chunks = [] if cw is None else cw.chunks_meta
+    if router is not None:
+        router.flush_all()
+
     feature_dim_total = None if F is None else int(F)
     feature_dim_core = None if F is None else int(F - AUX_DIM)
     label_dim = int(2 * NUM_HORIZONS)
@@ -399,22 +533,26 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
         "aux_tail": ["log_dt_ms", "is_trade", "events_100ms"],
-        "chunks": chunks,
+        "chunks": [],
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
-        "chunk_size_used": 0 if cw is None else int(cw.N),
+        "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
         "aux_dim": int(AUX_DIM),
         "label_dim": label_dim,
         "horizons_ms": [int(h) for h in HORIZONS_MS],
         "core_dtype": "float32",
         "total_sequences": int(total_sequences),
+        "week_counts": {wk: int(cnt) for wk, cnt in ({} if router is None else router.week_counts).items()},
     }
     with open(os.path.join(out_root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
+    chunk_summary = 0 if router is None else sum(router.week_counts.values())
+
     print(
-        f"[done ] dataset chunks={len(chunks)} total_seqs={total_sequences} "
-        f"L={LOOKBACK} F={feature_dim_total or 0} chunkN={meta['chunk_size_used']}"
+        f"[done ] dataset weeks={len(pairs)} total_seqs={total_sequences} "
+        f"L={LOOKBACK} F={feature_dim_total or 0} chunkN={meta['chunk_size_used']} "
+        f"routed={chunk_summary}"
     )
 
 # --------------- driver ----------------
