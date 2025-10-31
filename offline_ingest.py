@@ -16,7 +16,9 @@ Env (defaults are SSD-friendly):
 """
 
 import os, sys, csv, json, re
-from typing import List, Tuple, Iterable, Dict
+import queue
+import threading
+from typing import List, Tuple, Iterable, Dict, Optional
 from collections import deque, defaultdict
 from decimal import Decimal, ROUND_HALF_EVEN
 import itertools
@@ -55,6 +57,7 @@ from CMSSL17 import (
 )  # reuse exactly
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
+EVENT_QUEUE_MAXSIZE = 4096
 
 # fast json if available
 try:
@@ -436,6 +439,51 @@ def _build_week_index(pairs: List[Tuple[str, str, str]]):
     return index
 
 
+class EventFeeder:
+    def __init__(
+        self,
+        pairs: List[Tuple[str, str, str]],
+        maxsize: int = EVENT_QUEUE_MAXSIZE,
+    ):
+        self.pairs = list(pairs)
+        self.queue: "queue.Queue[Tuple[str, Optional[str], Optional[object]]]" = queue.Queue(maxsize=maxsize)
+        self._last_first_ts: Optional[int] = None
+
+    def _put(self, item: Tuple[str, Optional[str], Optional[object]]):
+        self.queue.put(item)
+
+    def run(self):
+        try:
+            for wk, ob_path, th_path in self.pairs:
+                raw = BybitRawIter(ob_path, th_path)
+                merged = merge_event_time(
+                    raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0
+                )
+
+                first_event = next(merged, None)
+                if first_event is None:
+                    self._put(("first", wk, None))
+                    self._put(("eof", wk, None))
+                    continue
+
+                ts_first = _event_ts(first_event)
+                if self._last_first_ts is not None and ts_first < self._last_first_ts:
+                    raise ValueError(
+                        "Non-monotonic timestamps across weeks: "
+                        f"week {wk} starts at {ts_first} < last seen {self._last_first_ts}"
+                    )
+                self._last_first_ts = ts_first
+
+                self._put(("first", wk, first_event))
+                for event in merged:
+                    self._put(("evt", wk, event))
+                self._put(("eof", wk, None))
+
+            self._put(("eof", None, None))
+        except Exception as exc:
+            self._put(("eof", None, exc))
+
+
 def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
     ensure_dir(out_root)
 
@@ -459,65 +507,85 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
         f"[start] ingest weeks={len(pairs)} L={LOOKBACK} budget={RAM_BUDGET}MB"
     )
 
-    last_global_ts = None
+    last_global_ts: Optional[int] = None
 
-    for idx, (wk, ob_path, th_path) in enumerate(pairs, 1):
-        print(f"[week ] {idx}/{len(pairs)} {wk}")
-        raw = BybitRawIter(ob_path, th_path)
-        merged = merge_event_time(
-            raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0
-        )
+    feeder = EventFeeder(pairs)
+    producer_thread = threading.Thread(target=feeder.run, daemon=True)
+    producer_thread.start()
+    q = feeder.queue
 
-        first_event = next(merged, None)
-        if first_event is None:
-            print(f"[skip ] {wk} yielded no events")
+    week_total = len(pairs)
+    week_counter = 0
+
+    while True:
+        kind, wk, payload = q.get()
+
+        if kind == "first":
+            if wk is None:
+                raise RuntimeError("Received 'first' marker without a week key")
+            week_counter += 1
+            print(f"[week ] {week_counter}/{week_total} {wk}")
+            if payload is None:
+                print(f"[skip ] {wk} yielded no events")
+                continue
+            ts_first = _event_ts(payload)
+            if last_global_ts is not None and ts_first < last_global_ts:
+                raise ValueError(
+                    "Non-monotonic timestamps across weeks: "
+                    f"week {wk} starts at {ts_first} < last seen {last_global_ts}"
+                )
+            event = payload
+        elif kind == "evt":
+            event = payload
+        elif kind == "eof":
+            if isinstance(payload, Exception):
+                raise payload
+            if wk is None:
+                break
+            continue
+        else:
+            raise RuntimeError(f"Unknown feeder message kind: {kind}")
+
+        if event is None:
             continue
 
-        ts_first = _event_ts(first_event)
-        if last_global_ts is not None and ts_first < last_global_ts:
-            raise ValueError(
-                "Non-monotonic timestamps across weeks: "
-                f"week {wk} starts at {ts_first} < last seen {last_global_ts}"
+        ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(event)
+        tok = build_token(fe, feat_z, is_trade, dt_ms)
+        if F is None:
+            F = tok.shape[0]
+            router = WeekWriterRouter(
+                out_root,
+                LOOKBACK,
+                F,
+                RAM_BUDGET,
+                CHUNK_SIZE,
+                week_index,
             )
+        tokens_buf.append(tok)
 
-        week_iter = itertools.chain((first_event,), merged)
+        seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
+        ts_decision = int(ts_ms)
+        pending_seqs.append((ts_decision, seq.astype(np.float32, copy=False)))
+        labeler.on_decision(ts_decision)
 
-        for e in week_iter:
-            ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(e)
-            tok = build_token(fe, feat_z, is_trade, dt_ms)
-            if F is None:
-                F = tok.shape[0]
-                router = WeekWriterRouter(
-                    out_root,
-                    LOOKBACK,
-                    F,
-                    RAM_BUDGET,
-                    CHUNK_SIZE,
-                    week_index,
+        matured = labeler.on_event(int(ts_ms), float(mid))
+        for yy in matured:
+            if not pending_seqs:
+                raise RuntimeError(
+                    "Matured label available but no pending sequences to pair"
                 )
-            tokens_buf.append(tok)
+            if router is None:
+                raise RuntimeError("Router not initialised before label maturity")
+            ts_ready, seq_ready = pending_seqs.popleft()
+            router.add(ts_ready, seq_ready, yy.astype(np.float32, copy=False))
+            total_sequences += 1
 
-            seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
-            ts_decision = int(ts_ms)
-            pending_seqs.append((ts_decision, seq.astype(np.float32, copy=False)))
-            labeler.on_decision(ts_decision)
+        last_global_ts = int(ts_ms)
 
-            matured = labeler.on_event(int(ts_ms), float(mid))
-            for yy in matured:
-                if not pending_seqs:
-                    raise RuntimeError(
-                        "Matured label available but no pending sequences to pair"
-                    )
-                if router is None:
-                    raise RuntimeError("Router not initialised before label maturity")
-                ts_ready, seq_ready = pending_seqs.popleft()
-                router.add(ts_ready, seq_ready, yy.astype(np.float32, copy=False))
-                total_sequences += 1
+        if router is not None:
+            router.close_old_writers(int(ts_ms))
 
-            last_global_ts = int(ts_ms)
-
-            if router is not None:
-                router.close_old_writers(int(ts_ms))
+    producer_thread.join()
 
     if router is not None:
         router.flush_all()
