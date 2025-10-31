@@ -29,7 +29,6 @@ TH_DIR      = os.environ.get("BYBIT_TH_DIR",   "/home/gabrool/Documents/TH")
 OUT_ROOT    = os.environ.get("BYBIT_OUT_ROOT", "/media/gabrool/Expansion/Gabriel/bybit_offline_dt")
 
 # Week selection: anchor on a known last-week end date, keep the last K weeks
-LAST_WEEK_END = os.environ.get("BYBIT_LAST_WEEK_END", "2025-08-27")  # ISO date (YYYY-MM-DD)
 KEEP_WEEKS    = int(os.environ.get("BYBIT_KEEP_WEEKS", "24"))
 
 # Parallelism / sequence geometry
@@ -427,7 +426,20 @@ def main():
         print(f"No week pairs found under OB_DIR={OB_DIR} and TH_DIR={TH_DIR}")
         return
     
-    pairs = _slice_last_weeks_pairs(pairs, LAST_WEEK_END, KEEP_WEEKS)
+    raw_last_week_end = os.environ.get("BYBIT_LAST_WEEK_END", "")
+    explicit_last_week_end = raw_last_week_end.strip()
+    normalized_last_week_end = explicit_last_week_end.lower()
+
+    if normalized_last_week_end in ("", "latest", "auto"):
+        max_end_dt = max(
+            _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))[1]
+            for wk, _ob, _th in pairs
+        )
+        last_week_end = max_end_dt.date().isoformat()
+    else:
+        last_week_end = explicit_last_week_end
+
+    pairs = _slice_last_weeks_pairs(pairs, last_week_end, KEEP_WEEKS)
 
     _assert_week_order(pairs)
 
