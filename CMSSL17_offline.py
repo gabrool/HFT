@@ -51,7 +51,7 @@ from CMSSL17 import (  # type: ignore
     SAMBA, ModelArgs,
     # core hypers
     LOOKBACK, AUX_DIM, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
-    BATCH_SIZE, EPOCHS, WARMUP_EPOCHS, LR,
+    BATCH_SIZE, EPOCHS, WARMUP_EPOCHS, LR, PATIENCE,
     # schedules / deltas / lambdas
     SSL_PRETRAIN_EPOCHS, MASK_PRETRAIN, MASK_FINETUNE, DIR_MASK_TAIL_FRACTION,
     DELTA_RET, DELTA_LOGVOL,
@@ -489,6 +489,7 @@ def train_from_offline():
     ema_ft  = {'ret': 1.0, 'logvol': 1.0, 'bce': 1.0, 'recon': 1.0, 'cpc': 1.0}
 
     for epoch in range(EPOCHS):
+        early_stop_triggered = False
         # Warmup LR
         warmup_factor = min(1.0, (epoch + 1) / WARMUP_EPOCHS) if epoch < WARMUP_EPOCHS else 1.0
         for pg in opt.base_optimizer.param_groups:
@@ -720,6 +721,13 @@ def train_from_offline():
                     print(f"[ckpt] saved best to {out_ckpt}")
                 else:
                     no_imp += 1
+                    print(f"no improve {no_imp}/{PATIENCE}")
+                    if no_imp >= PATIENCE:
+                        print("Early stopping triggered.")
+                        early_stop_triggered = True
+
+        if early_stop_triggered:
+            break
 
         # (Optional) early stop on long stagnation
         # if no_imp > 50: break
