@@ -270,9 +270,46 @@ def maybe_fit_pca_core(train_week_paths: List[Path], target_variance: float):
         return None, None
 
     if PCA_INCREMENTAL:
-        ipca = IncrementalPCA(n_components=target_variance)
+        print(f"[PCA] Sampling core rows for PCA variance targeting (target var={target_variance}) ...")
+        sample_rows: List[np.ndarray] = []
+        rows_collected = 0
+        sample_row_cap = 200_000
+        sample_chunk_cap = 5
+        chunks_seen = 0
+        for wp in train_week_paths:
+            if chunks_seen >= sample_chunk_cap or rows_collected >= sample_row_cap:
+                break
+            wm = read_json(wp)
+            d = wp.parent
+            for ch in wm.get("chunks", []):
+                if chunks_seen >= sample_chunk_cap or rows_collected >= sample_row_cap:
+                    break
+                Xc = np.load(d / ch["files"]["core"])
+                n = Xc.shape[0]
+                core2d = Xc.reshape(n * Xc.shape[1], F_core)
+                if rows_collected + core2d.shape[0] > sample_row_cap:
+                    needed = sample_row_cap - rows_collected
+                    if needed > 0:
+                        sample_rows.append(core2d[:needed])
+                        rows_collected += needed
+                else:
+                    sample_rows.append(core2d)
+                    rows_collected += core2d.shape[0]
+                chunks_seen += 1
+        if not sample_rows:
+            return None, None
+        sample2d = np.concatenate(sample_rows, axis=0)
+        full_pca = PCA(svd_solver="full")
+        full_pca.fit(sample2d)
+        cumvar = np.cumsum(full_pca.explained_variance_ratio_)
+        max_components = cumvar.shape[0]
+        k = int(np.searchsorted(cumvar, target_variance) + 1)
+        k = max(1, min(k, max_components))
+        print(f"[PCA] Sampled {rows_collected:,} rows → keeping {k} components (~{cumvar[k-1]:.3f} variance)")
+
+        ipca = IncrementalPCA(n_components=k)
         total_rows = 0
-        print(f"[PCA] Fitting IncrementalPCA (target var={target_variance}) on core dims ({F_core}) ...")
+        print(f"[PCA] Fitting IncrementalPCA over all training chunks with k={k} ...")
         for wp in train_week_paths:
             wm = read_json(wp)
             d = wp.parent
@@ -283,7 +320,7 @@ def maybe_fit_pca_core(train_week_paths: List[Path], target_variance: float):
                 ipca.partial_fit(core2d)
                 total_rows += core2d.shape[0]
         print(f"[PCA] IncrementalPCA trained on ~{total_rows:,} rows")
-        return ipca, F_total
+        return ipca, k + AUX_DIM
     else:
         # Full PCA on concatenated core from all train chunks (may be RAM heavy)
         print(f"[PCA] Fitting full PCA (target var={target_variance}) on core dims ({F_core}) ...")
