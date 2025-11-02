@@ -33,6 +33,12 @@ OUT_ROOT    = os.environ.get("BYBIT_OUT_ROOT", "/media/gabrool/Expansion/Gabriel
 # Week selection: anchor on a known last-week end date, keep the last K weeks
 KEEP_WEEKS    = int(os.environ.get("BYBIT_KEEP_WEEKS", "24"))
 
+# Optional PCA dimensionality reduction on the core features
+PCA_VAR_TARGET      = float(os.environ.get("BYBIT_PCA_VAR", "0"))
+PCA_MAX_SAMPLE_ROWS = int(os.environ.get("BYBIT_PCA_MAX_ROWS", "200000"))
+PCA_BATCH_SIZE      = int(os.environ.get("BYBIT_PCA_BATCH", "4096"))
+PCA_MODEL_FILENAME  = os.environ.get("BYBIT_PCA_MODEL", "pca_model.npz")
+
 # Parallelism / sequence geometry
 WORKERS     = int(os.environ.get("BYBIT_WORKERS", "8"))
 # Memory & chunking
@@ -195,6 +201,26 @@ def _assert_week_order(pairs: List[Tuple[str, str, str]]):
 _DEC_THOUSAND = Decimal("1000")
 
 
+def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], List[str], List[str]]:
+    """Mirror CMSSL17_offline.choose_splits for week-key tuples."""
+    weeks = [wk for wk, _ob, _th in pairs]
+    if len(weeks) >= 24:
+        weeks = weeks[-24:]
+        tr, va, te = weeks[:18], weeks[18:21], weeks[21:24]
+    else:
+        n = len(weeks)
+        if n == 0:
+            return [], [], []
+        n_tr = max(1, int(round(n * 0.75)))
+        n_rest = n - n_tr
+        n_va = max(1, int(round(n_rest / 2)))
+        n_te = max(1, n - n_tr - n_va)
+        tr = weeks[:n_tr]
+        va = weeks[n_tr:n_tr + n_va]
+        te = weeks[n_tr + n_va:n_tr + n_va + n_te]
+    return tr, va, te
+
+
 def _event_ts(event) -> int:
     """Extract the first integer-like timestamp from an event tuple."""
     if event is None:
@@ -317,6 +343,7 @@ class WeekWriterRouter:
         ram_budget_mb: int,
         chunk_size_override: int,
         week_index: List[Tuple[str, int, int]],
+        pca_meta: Optional[dict] = None,
     ):
         self.out_root = out_root
         self.lookback = int(lookback)
@@ -332,6 +359,7 @@ class WeekWriterRouter:
         self.week_decision_span: Dict[str, List[int]] = {}
         self.chunk_size_used: int = 0
         self.week_metas: Dict[str, dict] = {}
+        self.pca_meta = dict(pca_meta) if pca_meta is not None else {}
 
     def _ensure_writer(self, week_key: str) -> ChunkWriter:
         if week_key in self.writers:
@@ -404,6 +432,15 @@ class WeekWriterRouter:
             meta["decision_ts_range"] = {
                 "min": int(span[0]),
                 "max": int(span[1]),
+            }
+        if self.pca_meta:
+            meta["pca"] = dict(self.pca_meta)
+        else:
+            meta["pca"] = {
+                "applied": False,
+                "var_kept": float(PCA_VAR_TARGET),
+                "k": 0,
+                "model_path": None,
             }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
@@ -503,8 +540,263 @@ class EventFeeder:
             self._put(("eof", None, exc))
 
 
-def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
+def _stream_core_features(pairs: List[Tuple[str, str, str]]):
+    """Yield core feature vectors (z-scored) for the given week pairs."""
+    if not pairs:
+        return
+
+    fe = FeatureEngine()
+
+    feeder = EventFeeder(pairs)
+    producer_thread = threading.Thread(target=feeder.run, daemon=True)
+    producer_thread.start()
+    q = feeder.queue
+
+    last_global_ts: Optional[int] = None
+    try:
+        while True:
+            kind, wk, payload = q.get()
+
+            if kind == "first":
+                if wk is None:
+                    raise RuntimeError("Received 'first' marker without a week key")
+                if payload is None:
+                    continue
+                event = payload
+            elif kind == "evt":
+                event = payload
+            elif kind == "eof":
+                if isinstance(payload, Exception):
+                    raise payload
+                if wk is None:
+                    break
+                continue
+            else:
+                raise RuntimeError(f"Unknown feeder message kind: {kind}")
+
+            if event is None:
+                continue
+
+            ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_event(event)
+            if last_global_ts is not None and ts_ms < last_global_ts:
+                raise ValueError(
+                    "Non-monotonic timestamps across weeks during PCA stream: "
+                    f"week {wk} event {ts_ms} < last {last_global_ts}"
+                )
+            last_global_ts = int(ts_ms)
+            yield np.asarray(feat_z, dtype=np.float32)
+    finally:
+        producer_thread.join()
+
+
+def _select_pca_components(sample_rows: np.ndarray, target_var: float) -> int:
+    if sample_rows.ndim != 2 or sample_rows.size == 0:
+        return 0
+    n_samples, n_features = sample_rows.shape
+    if n_samples == 0 or n_features == 0:
+        return 0
+    target = float(max(0.0, min(1.0, target_var)))
+    if target <= 0.0:
+        return 0
+
+    mean_vec = np.mean(sample_rows, axis=0, keepdims=True)
+    centered = sample_rows - mean_vec
+    try:
+        _u, s, _vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return min(n_samples, n_features)
+    denom = max(1, n_samples - 1)
+    explained = (s ** 2) / denom
+    total = float(np.sum(explained))
+    if not np.isfinite(total) or total <= 0.0:
+        return min(n_samples, n_features)
+    ratios = np.cumsum(explained / total)
+    k_idx = int(np.searchsorted(ratios, target, side="left"))
+    k = max(1, min(n_features, n_samples, k_idx + 1))
+    return k
+
+
+def maybe_fit_pca_model(
+    pairs: List[Tuple[str, str, str]],
+    out_root: str,
+    train_weeks: List[str],
+    target_var: float,
+    sample_limit: int,
+    batch_size: int,
+    model_filename: str,
+):
+    meta = {
+        "applied": False,
+        "var_kept": float(target_var),
+        "k": 0,
+        "model_path": None,
+    }
+
+    if target_var <= 0.0:
+        return meta
+
+    try:
+        from sklearn.decomposition import IncrementalPCA  # type: ignore
+    except Exception as exc:
+        print(f"[pca  ] sklearn unavailable ({exc}); skipping PCA fit")
+        return meta
+
+    train_set = set(train_weeks)
+    train_pairs = [p for p in pairs if p[0] in train_set]
+    if not train_pairs:
+        print("[pca  ] No training weeks available; skipping PCA fit")
+        return meta
+
+    sample_limit = max(1, int(sample_limit))
+    batch_size = int(batch_size)
+
+    sample_rows: List[np.ndarray] = []
+    sample_array: Optional[np.ndarray] = None
+    pad_rows: Optional[np.ndarray] = None
+    ipca = None
+    fitted_rows = 0
+    total_rows = 0
+    pending: List[np.ndarray] = []
+    n_components = 0
+
+    def flush_pending(force: bool = False):
+        nonlocal pending, fitted_rows
+        if ipca is None or not pending:
+            return
+        need = max(1, ipca.n_components)
+        thresh = max(need, batch_size) if batch_size > 0 else need
+        if not force and len(pending) < thresh:
+            return
+        arr = np.asarray(pending, dtype=np.float32)
+        actual_rows = arr.shape[0]
+        if actual_rows < need:
+            source = pad_rows if pad_rows is not None and pad_rows.size else sample_array
+            if source is not None and source.shape[0] >= need:
+                pad_needed = need - actual_rows
+                arr = np.vstack([arr, source[:pad_needed]])
+        ipca.partial_fit(arr)
+        fitted_rows += actual_rows
+        pending = []
+
+    def ensure_ipca(force: bool = False):
+        nonlocal ipca, sample_array, pad_rows, n_components, fitted_rows
+        if ipca is not None:
+            return
+        if not sample_rows:
+            return
+        if not force and len(sample_rows) < sample_limit:
+            return
+        sample_array = np.asarray(sample_rows, dtype=np.float32)
+        n_components = _select_pca_components(sample_array, target_var)
+        if n_components <= 0:
+            return
+        ipca = IncrementalPCA(
+            n_components=n_components,
+            batch_size=None if batch_size <= 0 else max(batch_size, n_components),
+        )
+        ipca.partial_fit(sample_array)
+        fitted_rows += sample_array.shape[0]
+        pad_rows = sample_array[:n_components].copy()
+        sample_rows.clear()
+
+    for feat in _stream_core_features(train_pairs):
+        total_rows += 1
+        vec = np.asarray(feat, dtype=np.float32)
+        if ipca is None:
+            sample_rows.append(vec)
+            ensure_ipca()
+            continue
+        pending.append(vec)
+        flush_pending()
+
+    ensure_ipca(force=True)
+
+    if ipca is None:
+        print("[pca  ] Unable to initialise PCA (insufficient data); skipping")
+        return meta
+
+    flush_pending(force=True)
+
+    model_path = os.path.join(out_root, model_filename)
+    ensure_dir(os.path.dirname(model_path))
+    np.savez(
+        model_path,
+        mean=ipca.mean_.astype(np.float32, copy=False),
+        components=ipca.components_.astype(np.float32, copy=False),
+        explained_variance_ratio=ipca.explained_variance_ratio_.astype(np.float32, copy=False),
+    )
+
+    meta.update(
+        {
+            "applied": True,
+            "k": int(ipca.n_components),
+            "model_path": model_filename,
+            "rows_fitted": int(fitted_rows),
+            "rows_total": int(total_rows),
+            "sample_rows": int(sample_array.shape[0] if sample_array is not None else 0),
+        }
+    )
+
+    print(
+        f"[pca  ] applied target={target_var:.4f} k={meta['k']} "
+        f"sample={meta.get('sample_rows', 0)} fitted={meta.get('rows_fitted', 0)}"
+    )
+
+    return meta
+
+
+def _summarise_pca_meta(meta: Optional[dict]) -> dict:
+    base = {
+        "applied": False,
+        "var_kept": float(PCA_VAR_TARGET),
+        "k": 0,
+        "model_path": None,
+    }
+    if not meta:
+        return base
+    applied = bool(meta.get("applied", False))
+    base.update(
+        {
+            "applied": applied,
+            "var_kept": float(meta.get("var_kept", base["var_kept"])),
+            "k": int(meta.get("k", 0) if applied else 0),
+            "model_path": meta.get("model_path") if applied else None,
+        }
+    )
+    return base
+
+
+def process_all(
+    pairs: List[Tuple[str, str, str]],
+    out_root: str,
+    pca_meta: dict,
+    split_info: Optional[Dict[str, List[str]]] = None,
+):
     ensure_dir(out_root)
+
+    pca_summary = _summarise_pca_meta(pca_meta)
+    pca_mean: Optional[np.ndarray] = None
+    pca_components: Optional[np.ndarray] = None
+    pca_var_ratio: Optional[np.ndarray] = None
+
+    if pca_summary["applied"]:
+        model_path = pca_summary.get("model_path")
+        full_model_path = os.path.join(out_root, model_path) if model_path else ""
+        try:
+            with np.load(full_model_path) as data:
+                pca_mean = data["mean"].astype(np.float32)
+                pca_components = data["components"].astype(np.float32)
+                if "explained_variance_ratio" in data:
+                    pca_var_ratio = data["explained_variance_ratio"].astype(np.float32)
+        except Exception as exc:
+            print(f"[pca  ] Failed to load PCA model '{full_model_path}': {exc}; disabling PCA")
+            pca_mean = None
+            pca_components = None
+            pca_var_ratio = None
+            pca_summary = _summarise_pca_meta({
+                "applied": False,
+                "var_kept": pca_summary.get("var_kept", PCA_VAR_TARGET),
+            })
 
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
@@ -569,7 +861,16 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
             continue
 
         ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(event)
-        tok = build_token(fe, feat_z, is_trade, dt_ms)
+        feat_core = feat_z
+        if pca_components is not None and pca_mean is not None:
+            if np.asarray(feat_z).shape[-1] != pca_mean.shape[0]:
+                raise ValueError(
+                    f"PCA mean/components dimension {pca_mean.shape[0]} does not match "
+                    f"feature dimension {np.asarray(feat_z).shape[-1]}"
+                )
+            centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
+            feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
+        tok = build_token(fe, feat_core, is_trade, dt_ms)
         if F is None:
             F = tok.shape[0]
             router = WeekWriterRouter(
@@ -579,6 +880,7 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
                 RAM_BUDGET,
                 CHUNK_SIZE,
                 week_index,
+                pca_meta=pca_summary,
             )
         tokens_buf.append(tok)
 
@@ -652,6 +954,13 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
         "rows_total_from_weeks": int(rows_via_week_metas),
         "weeks_meta": weeks_meta_paths,
     }
+    meta["pca"] = dict(pca_summary)
+    if pca_var_ratio is not None:
+        meta["pca"]["explained_variance_ratio"] = [float(x) for x in pca_var_ratio]
+    if split_info:
+        meta["splits"] = {
+            key: list(vals) for key, vals in split_info.items()
+        }
     with open(os.path.join(out_root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -661,6 +970,11 @@ def process_all(pairs: List[Tuple[str, str, str]], out_root: str):
         f"[done ] dataset weeks={len(pairs)} total_seqs={total_sequences} "
         f"L={LOOKBACK} F={feature_dim_total or 0} chunkN={meta['chunk_size_used']} "
         f"routed={chunk_summary}"
+    )
+    print(
+        f"[pca  ] summary applied={pca_summary['applied']} "
+        f"var_kept={pca_summary['var_kept']:.4f} k={pca_summary['k']} "
+        f"model={pca_summary['model_path']}"
     )
 
 # --------------- driver ----------------
@@ -699,7 +1013,26 @@ def main():
     if WORKERS > 1:
         print("[warn ] WORKERS>1 requested but process_all runs sequentially; using 1 worker")
 
-    process_all(pairs, OUT_ROOT)
+    train_weeks, val_weeks, test_weeks = classify_week_splits(pairs)
+    split_info = {
+        "train": train_weeks,
+        "val": val_weeks,
+        "test": test_weeks,
+    }
+    print(
+        f"[split] train={len(train_weeks)} val={len(val_weeks)} test={len(test_weeks)}"
+    )
+    pca_fit_meta = maybe_fit_pca_model(
+        pairs,
+        OUT_ROOT,
+        train_weeks,
+        PCA_VAR_TARGET,
+        PCA_MAX_SAMPLE_ROWS,
+        PCA_BATCH_SIZE,
+        PCA_MODEL_FILENAME,
+    )
+
+    process_all(pairs, OUT_ROOT, pca_fit_meta, split_info=split_info)
 
 if __name__ == "__main__":
     main()
