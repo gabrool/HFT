@@ -10,8 +10,6 @@ from OUT_ROOT/meta.json and week meta files, avoiding any online feature buildin
 Env vars:
   BYBIT_OUT_ROOT=/path/to/offline_ingest_output_root      (REQUIRED)
   BYBIT_USE_IN_MEMORY=0|1   # 1 = load all chunks into RAM (faster but memory heavy). Default 0
-  BYBIT_PCA_VAR=0|float     # 0 disables PCA; else keep variance fraction (e.g. 0.99). Default 0
-  BYBIT_PCA_INCREMENTAL=0|1 # 1 = fit IncrementalPCA on training chunks (memory-safe). Default 1
   BYBIT_WORKERS=8           # dataloader workers. Default 8 for train, 4 for val/test.
 
 Splits:
@@ -66,8 +64,6 @@ from CMSSL17 import (  # type: ignore
 # ---------------- Config via env ----------------
 OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
 USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "0")) == 1
-PCA_VAR_ENV = float(os.environ.get("BYBIT_PCA_VAR", "0"))
-PCA_INCREMENTAL = int(os.environ.get("BYBIT_PCA_INCREMENTAL", "1")) == 1
 WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 
@@ -143,17 +139,16 @@ def build_chunk_refs(meta_week_path: Path) -> List[ChunkRef]:
 
 # ---------------- Dataset (streaming from .npy chunks) ----------------
 class NpyChunksDataset(Dataset):
-    def __init__(self, chunk_refs: List[ChunkRef], feature_dim_total: int, pca_core=None):
+    def __init__(self, chunk_refs: List[ChunkRef], feature_dim_total: int):
         """
         chunk_refs: list of chunks in chronological order (kept as given)
         feature_dim_total: F (including AUX_DIM)
-        pca_core: fitted PCA/IncrementalPCA to apply on core features, or None
         """
         self.refs = list(chunk_refs)
         self.F = int(feature_dim_total)
         self.F_core = self.F - AUX_DIM
-        assert self.F_core > 0
-        self.pca = pca_core
+        if self.F_core <= 0:
+            raise ValueError(f"feature_dim_total ({self.F}) must exceed AUX_DIM ({AUX_DIM})")
 
         # prefix sums for O(log N) lookup
         self.starts = []
@@ -215,15 +210,12 @@ class NpyChunksDataset(Dataset):
         ci, offset = self._locate(idx)
         Xc, Xa, Y = self._load_chunk(ci)
         core = np.asarray(Xc[offset], dtype=np.float32)   # [L, F_core]
-        if self.pca is not None:
-            L, F_core = core.shape
-            core2d = core.reshape(-1, F_core)
-            core_p = self.pca.transform(core2d).astype(np.float32, copy=False).reshape(L, -1)
-            aux = np.asarray(Xa[offset], dtype=np.float32)
-            x = np.concatenate([core_p, aux], axis=-1)
-        else:
-            aux = np.asarray(Xa[offset], dtype=np.float32)
-            x = np.concatenate([core, aux], axis=-1)
+        if core.shape[-1] != self.F_core:
+            raise ValueError(
+                f"Core feature dim mismatch: expected {self.F_core}, found {core.shape[-1]}"
+            )
+        aux = np.asarray(Xa[offset], dtype=np.float32)
+        x = np.concatenate([core, aux], axis=-1)
         y = np.asarray(Y[offset], dtype=np.float32)
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -251,94 +243,6 @@ def load_split_in_memory(split_week_paths: List[Path]) -> Tuple[np.ndarray, np.n
     X = np.concatenate(Xs, axis=0).astype(np.float32, copy=False)
     y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
     return X, y, int(feat_dim)
-
-# ---------------- PCA fitting (optional) ----------------
-def maybe_fit_pca_core(train_week_paths: List[Path], target_variance: float):
-    if target_variance <= 0:
-        return None, None  # disabled
-    try:
-        from sklearn.decomposition import PCA, IncrementalPCA
-    except Exception as e:
-        print(f"[warn] sklearn not available for PCA ({e}). Proceeding without PCA.")
-        return None, None
-
-    # Discover feature dims from first week
-    w0 = read_json(train_week_paths[0])
-    F_total = int(w0["feature_dim_total"])
-    F_core = F_total - AUX_DIM
-    if F_core <= 0:
-        return None, None
-
-    if PCA_INCREMENTAL:
-        print(f"[PCA] Sampling core rows for PCA variance targeting (target var={target_variance}) ...")
-        sample_rows: List[np.ndarray] = []
-        rows_collected = 0
-        sample_row_cap = 200_000
-        sample_chunk_cap = 5
-        chunks_seen = 0
-        for wp in train_week_paths:
-            if chunks_seen >= sample_chunk_cap or rows_collected >= sample_row_cap:
-                break
-            wm = read_json(wp)
-            d = wp.parent
-            for ch in wm.get("chunks", []):
-                if chunks_seen >= sample_chunk_cap or rows_collected >= sample_row_cap:
-                    break
-                Xc = np.load(d / ch["files"]["core"])
-                n = Xc.shape[0]
-                core2d = Xc.reshape(n * Xc.shape[1], F_core)
-                if rows_collected + core2d.shape[0] > sample_row_cap:
-                    needed = sample_row_cap - rows_collected
-                    if needed > 0:
-                        sample_rows.append(core2d[:needed])
-                        rows_collected += needed
-                else:
-                    sample_rows.append(core2d)
-                    rows_collected += core2d.shape[0]
-                chunks_seen += 1
-        if not sample_rows:
-            return None, None
-        sample2d = np.concatenate(sample_rows, axis=0)
-        full_pca = PCA(svd_solver="full")
-        full_pca.fit(sample2d)
-        cumvar = np.cumsum(full_pca.explained_variance_ratio_)
-        max_components = cumvar.shape[0]
-        k = int(np.searchsorted(cumvar, target_variance) + 1)
-        k = max(1, min(k, max_components))
-        print(f"[PCA] Sampled {rows_collected:,} rows → keeping {k} components (~{cumvar[k-1]:.3f} variance)")
-
-        ipca = IncrementalPCA(n_components=k)
-        total_rows = 0
-        print(f"[PCA] Fitting IncrementalPCA over all training chunks with k={k} ...")
-        for wp in train_week_paths:
-            wm = read_json(wp)
-            d = wp.parent
-            for ch in wm.get("chunks", []):
-                Xc = np.load(d / ch["files"]["core"])
-                n = Xc.shape[0]
-                core2d = Xc.reshape(n * Xc.shape[1], F_core)  # [n*L, F_core]
-                ipca.partial_fit(core2d)
-                total_rows += core2d.shape[0]
-        print(f"[PCA] IncrementalPCA trained on ~{total_rows:,} rows")
-        return ipca, k + AUX_DIM
-    else:
-        # Full PCA on concatenated core from all train chunks (may be RAM heavy)
-        print(f"[PCA] Fitting full PCA (target var={target_variance}) on core dims ({F_core}) ...")
-        core_rows = []
-        for wp in train_week_paths:
-            wm = read_json(wp)
-            d = wp.parent
-            for ch in wm.get("chunks", []):
-                Xc = np.load(d / ch["files"]["core"])
-                n = Xc.shape[0]
-                core_rows.append(Xc.reshape(n * Xc.shape[1], F_core))
-        if not core_rows:
-            return None, None
-        core2d = np.concatenate(core_rows, axis=0)
-        pca = PCA(n_components=target_variance, svd_solver="full")
-        pca.fit(core2d)
-        print(f"[PCA] kept {pca.n_components_} PCs (target var={target_variance})")
-        return pca, F_total
 
 # ---------------- Directional-mask quantiles from TRAIN set ----------------
 def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -422,6 +326,27 @@ def train_from_offline():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
+    pca_info = meta.get("pca", {}) or {}
+    if pca_info:
+        applied = bool(pca_info.get("applied", False))
+        summary_parts = [f"applied={applied}"]
+        var_kept = pca_info.get("var_kept")
+        if isinstance(var_kept, (int, float)):
+            summary_parts.append(f"var_kept={float(var_kept):.4f}")
+        elif var_kept is not None:
+            summary_parts.append(f"var_kept={var_kept}")
+        k = pca_info.get("k")
+        if k is not None:
+            try:
+                summary_parts.append(f"k={int(k)}")
+            except (TypeError, ValueError):
+                summary_parts.append(f"k={k}")
+        model_path = pca_info.get("model_path")
+        if model_path:
+            summary_parts.append(f"model={model_path}")
+        print(f"[pca-meta] {' '.join(summary_parts)}")
+        if not applied:
+            print("[warn] PCA metadata indicates the dataset was not reduced; training will use original feature dimensionality.")
     week_meta_paths = resolve_week_meta_paths(out_root, meta)
     if not week_meta_paths:
         raise RuntimeError("No week meta files were found under OUT_ROOT")
@@ -437,7 +362,6 @@ def train_from_offline():
         elif feat_dim_total != fm:
             raise ValueError(f"Feature dim mismatch: saw {feat_dim_total} then {fm}")
     F_total = int(feat_dim_total or 0)
-    F_core = F_total - AUX_DIM
 
     # ---- build datasets or fully load ----
     if USE_IN_MEMORY:
@@ -445,26 +369,6 @@ def train_from_offline():
         X_va, y_va, feat_dim2 = load_split_in_memory(va_weeks)
         X_te, y_te, feat_dim3 = load_split_in_memory(te_weeks)
         assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
-        # optional PCA (full style, like CMSSL17.py) on *core* dims
-        pca_model = None
-        if PCA_VAR_ENV > 0:
-            try:
-                from sklearn.decomposition import PCA
-                pca = PCA(n_components=PCA_VAR_ENV, svd_solver="full")
-                core2d = X_tr[:, :, :F_core].reshape(-1, F_core)
-                pca.fit(core2d)
-                def _apply(arr):
-                    n, L, _ = arr.shape
-                    core = arr[:, :, :F_core].reshape(-1, F_core)
-                    core_p = pca.transform(core).astype(np.float32, copy=False).reshape(n, L, -1)
-                    return np.concatenate([core_p, arr[:, :, F_core:]], axis=-1)
-                X_tr = _apply(X_tr); X_va = _apply(X_va); X_te = _apply(X_te)
-                new_feat_dim = X_tr.shape[-1]
-                print(f"[PCA] kept {new_feat_dim - AUX_DIM} PCs (+{AUX_DIM} aux) → feat_dim={new_feat_dim}")
-                F_total = int(new_feat_dim)
-            except Exception as e:
-                print(f"[warn] PCA requested but failed ({e}); continuing without PCA.")
-
         ds_train = HFTDataset(X_tr, y_tr)  # reuse CMSSL17 dataset class
         ds_val   = HFTDataset(X_va, y_va)
         ds_test  = HFTDataset(X_te, y_te)
@@ -477,19 +381,10 @@ def train_from_offline():
         for w in va_weeks: va_refs.extend(build_chunk_refs(w))
         for w in te_weeks: te_refs.extend(build_chunk_refs(w))
 
-        # fit (optional) PCA on training core dims
-        pca_model, _F_total_unused = maybe_fit_pca_core(tr_weeks, PCA_VAR_ENV)
-        if pca_model is not None:
-            n_components = getattr(pca_model, "n_components_", None)
-            if n_components is not None:
-                F_total = int(n_components + AUX_DIM)
-                print(f"[PCA] Using reduced feature dim: core={n_components}, aux={AUX_DIM} → F_total={F_total}")
-            else:
-                print("[warn] PCA model missing n_components_; keeping original feature dim.")
         # Build datasets
-        ds_train = NpyChunksDataset(tr_refs, F_total, pca_core=pca_model)
-        ds_val   = NpyChunksDataset(va_refs, F_total, pca_core=pca_model)
-        ds_test  = NpyChunksDataset(te_refs, F_total, pca_core=pca_model)
+        ds_train = NpyChunksDataset(tr_refs, F_total)
+        ds_val   = NpyChunksDataset(va_refs, F_total)
+        ds_test  = NpyChunksDataset(te_refs, F_total)
         # Collect y_train for mask quantiles (labels are small; fine to concat in RAM)
         y_list = []
         for r in tr_refs:
