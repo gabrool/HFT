@@ -32,6 +32,7 @@ OUT_ROOT    = os.environ.get("BYBIT_OUT_ROOT", "/media/gabrool/Expansion/Gabriel
 
 # Week selection: anchor on a known last-week end date, keep the last K weeks
 KEEP_WEEKS    = int(os.environ.get("BYBIT_KEEP_WEEKS", "24"))
+RAW_BYBIT_WEEKS = os.environ.get("BYBIT_WEEKS", "")
 
 # Optional PCA dimensionality reduction on the core features
 PCA_VAR_TARGET      = float(os.environ.get("BYBIT_PCA_VAR", "0"))
@@ -75,6 +76,12 @@ except Exception:
 
 # --------------- utils ------------------
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
+
+
+def _parse_requested_weeks(raw: str) -> List[str]:
+    items = [wk.strip() for wk in re.split(r"[\s,]+", raw) if wk.strip()]
+    # Preserve potential duplicates in the env var for explicit validation later
+    return items
 
 def list_glob(dir_path: str, pattern: str) -> List[str]:
     import glob
@@ -1011,26 +1018,42 @@ def main():
     if not pairs:
         print(f"No week pairs found under OB_DIR={OB_DIR} and TH_DIR={TH_DIR}")
         return
-    
-    raw_last_week_end = os.environ.get("BYBIT_LAST_WEEK_END", "")
-    explicit_last_week_end = raw_last_week_end.strip()
-    normalized_last_week_end = explicit_last_week_end.lower()
 
-    if normalized_last_week_end in ("", "latest", "auto"):
-        max_end_dt = max(
-            _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))[1]
-            for wk, _ob, _th in pairs
-        )
-        last_week_end = max_end_dt.date().isoformat()
+    requested_weeks = _parse_requested_weeks(RAW_BYBIT_WEEKS)
+
+    if requested_weeks:
+        week_lookup = {wk for wk, _ob, _th in pairs}
+        missing = [wk for wk in requested_weeks if wk not in week_lookup]
+        if missing:
+            raise ValueError(
+                f"Requested BYBIT_WEEKS not found in available data: {', '.join(missing)}"
+            )
+
+        requested_set = set(requested_weeks)
+        pairs = [pair for pair in pairs if pair[0] in requested_set]
     else:
-        last_week_end = explicit_last_week_end
+        raw_last_week_end = os.environ.get("BYBIT_LAST_WEEK_END", "")
+        explicit_last_week_end = raw_last_week_end.strip()
+        normalized_last_week_end = explicit_last_week_end.lower()
 
-    pairs = _slice_last_weeks_pairs(pairs, last_week_end, KEEP_WEEKS)
+        if normalized_last_week_end in ("", "latest", "auto"):
+            max_end_dt = max(
+                _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))[1]
+                for wk, _ob, _th in pairs
+            )
+            last_week_end = max_end_dt.date().isoformat()
+        else:
+            last_week_end = explicit_last_week_end
+
+        pairs = _slice_last_weeks_pairs(pairs, last_week_end, KEEP_WEEKS)
 
     _assert_week_order(pairs)
 
+    chosen_weeks = [wk for wk, _ob, _th in pairs]
+
     print(f"[plan ] weeks={len(pairs)} workers={WORKERS} "
           f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
+    print(f"[weeks] {', '.join(chosen_weeks)}")
 
     print(f"[paths] OB_DIR={OB_DIR}")
     print(f"[paths] TH_DIR={TH_DIR}")
