@@ -39,6 +39,7 @@ PCA_VAR_TARGET      = float(os.environ.get("BYBIT_PCA_VAR", "0"))
 PCA_MAX_SAMPLE_ROWS = int(os.environ.get("BYBIT_PCA_MAX_ROWS", "200000"))
 PCA_BATCH_SIZE      = int(os.environ.get("BYBIT_PCA_BATCH", "4096"))
 PCA_MODEL_FILENAME  = os.environ.get("BYBIT_PCA_MODEL", "pca_model.npz")
+PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 
 # Parallelism / sequence geometry
 WORKERS     = int(os.environ.get("BYBIT_WORKERS", "8"))
@@ -642,6 +643,7 @@ def maybe_fit_pca_model(
     sample_limit: int,
     batch_size: int,
     model_filename: str,
+    use_existing: int,
 ):
     meta = {
         "applied": False,
@@ -653,6 +655,26 @@ def maybe_fit_pca_model(
     batches = 0
 
     if target_var <= 0.0:
+        return meta
+
+    if int(use_existing) == 1:
+        model_path = os.path.join(out_root, model_filename)
+        try:
+            with np.load(model_path) as data:
+                components = data["components"]
+                k = int(components.shape[0]) if components.size else 0
+                if k <= 0:
+                    raise ValueError("PCA model has no components")
+        except Exception as exc:
+            print(f"[pca  ] Failed to reuse PCA model '{model_path}': {exc}; disabling PCA")
+            return meta
+
+        meta.update({
+            "applied": True,
+            "k": k,
+            "model_path": model_filename,
+        })
+        print(f"[pca  ] Reusing existing PCA model '{model_path}' (k={k})")
         return meta
 
     try:
@@ -1079,6 +1101,7 @@ def main():
         PCA_MAX_SAMPLE_ROWS,
         PCA_BATCH_SIZE,
         PCA_MODEL_FILENAME,
+        PCA_USE_EXISTING,
     )
 
     process_all(pairs, OUT_ROOT, pca_fit_meta, split_info=split_info)
