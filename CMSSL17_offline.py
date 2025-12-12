@@ -489,6 +489,47 @@ def train_from_offline():
         # we still need y_tr to build directional mask quantiles
         y_train_for_quant = y_tr
 
+    else:
+        def refs_for_weeks(weeks: List[Path]) -> List[ChunkRef]:
+            refs: List[ChunkRef] = []
+            for wp in weeks:
+                refs.extend(build_chunk_refs(wp))
+            return refs
+
+        tr_refs = refs_for_weeks(tr_weeks)
+        va_refs = refs_for_weeks(va_weeks)
+        te_refs = refs_for_weeks(te_weeks)
+
+        ds_train = NpyChunksDataset(tr_refs, F_total)
+        ds_val   = NpyChunksDataset(va_refs, F_total)
+        ds_test  = NpyChunksDataset(te_refs, F_total)
+        print(
+            f"[offline-data] train N={len(ds_train)}, "
+            f"val N={len(ds_val)}, test N={len(ds_test)}"
+        )
+
+        # Build y_train_for_quant without loading features into RAM
+        if len(ds_train) == 0:
+            y_train_for_quant = np.empty((0, 2 * NUM_HORIZONS), dtype=np.float32)
+        else:
+            dl_prepass = DataLoader(
+                ds_train,
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                drop_last=False,
+                num_workers=WORKERS_TRAIN,
+                pin_memory=True,
+            )
+            y_parts: List[np.ndarray] = []
+            with torch.no_grad():
+                for _, y_batch in tqdm(dl_prepass, desc="[prepass y_train quantiles]"):
+                    y_parts.append(y_batch.numpy())
+            y_train_for_quant = (
+                np.concatenate(y_parts, axis=0)
+                if y_parts
+                else np.empty((0, 2 * NUM_HORIZONS), dtype=np.float32)
+            )
+
 
     # ---------------- directional mask quantiles & loss closure ----------------
     pos_lo, pos_hi, neg_lo, neg_hi = compute_dir_mask_quantiles_from_ytrain(y_train_for_quant)
