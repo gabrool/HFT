@@ -1222,9 +1222,6 @@ class FeatureEngine:
 
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute σ and VR
-        self.ret_hist_20ms: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_25ms: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_50ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_100ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_250ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_500ms: Deque[Tuple[int, float]] = deque()
@@ -1246,18 +1243,14 @@ class FeatureEngine:
         # ---------- Spread ----------
         self.last_spread: Optional[float] = None
         self.last_spread_ts: Optional[int] = None
-        self.spread_delta_windows: Tuple[int, ...] = (25, 50, 100, 250, 500)
+        self.spread_delta_windows: Tuple[int, ...] = (100, 250, 500)
         self.spread_history: Deque[Tuple[int, float]] = deque()
         self.spread_history_window_ms: int = 1_000
-        self.spread_changes_25ms: Deque[int] = deque()
-        self.spread_changes_50ms: Deque[int] = deque()
         self.spread_changes_100ms: Deque[int] = deque()
         self.spread_changes_250ms: Deque[int] = deque()
         self.spread_changes_500ms: Deque[int] = deque()
         self.spread_changes_1s: Deque[int] = deque()
         self._spread_change_deques: Dict[int, Deque[int]] = {
-            25: self.spread_changes_25ms,
-            50: self.spread_changes_50ms,
             100: self.spread_changes_100ms,
             250: self.spread_changes_250ms,
             500: self.spread_changes_500ms,
@@ -1265,7 +1258,7 @@ class FeatureEngine:
         }
 
         # ---------- Best-level churn & depletion ----------
-        self.bestlvl_windows: Tuple[int, ...] = (50, 100, 250, 500, 1_000)
+        self.bestlvl_windows: Tuple[int, ...] = (100, 250, 500, 1_000)
         self._bid1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self._ask1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self.bid1_changes_1s = self._bid1_change_deques[1_000]
@@ -1275,7 +1268,7 @@ class FeatureEngine:
         self.sz_deltas_250ms: Deque[Tuple[int,float,float]] = deque()
 
         # ---------- Liquidity replenishment tracking (L1/L2) ----------
-        self.replen_windows_ms: Tuple[int, ...] = (25, 50, 100, 250, 500)
+        self.replen_windows_ms: Tuple[int, ...] = (100, 250, 500)
         self._replen_keys: Tuple[Tuple[str, int, str], ...] = tuple(
             (side, level, kind)
             for side in ("bid", "ask")
@@ -1308,23 +1301,18 @@ class FeatureEngine:
         self.last_trade_price: Optional[float] = None
         self.last_is_rpi: int = 0
 
-        # ---------- Quote windows (25/50/100/250/500/1000 ms) ----------
-        self.quotes_25ms: Deque[int] = deque()
-        self.quotes_50ms: Deque[int] = deque()
+        # ---------- Quote windows (100/250/500/1000 ms) ----------
         self.quotes_100ms: Deque[int] = deque()
         self.quotes_250ms: Deque[int] = deque()
         self.quotes_500ms: Deque[int] = deque()
         self.quotes_1s: Deque[int] = deque()
         self._quote_window_deques: Dict[int, Deque[int]] = {
-            25: self.quotes_25ms,
-            50: self.quotes_50ms,
             100: self.quotes_100ms,
             250: self.quotes_250ms,
             500: self.quotes_500ms,
         }
 
-        # ---------- Event density (25/100/250/500 ms) ----------
-        self.ev_25ms: Deque[int] = deque()
+        # ---------- Event density (100/250/500 ms) ----------
         self.ev_100ms: Deque[int] = deque()
         self.ev_250ms: Deque[int] = deque()
         self.ev_500ms: Deque[int] = deque()
@@ -1338,10 +1326,8 @@ class FeatureEngine:
         self.vpin_phi: Deque[float] = deque(maxlen=50)
 
         # ---------- EWMAs for microprice and spread (short/med/long) ----------
-        self.ema_mp_25: Optional[float] = None
         self.ema_mp_100: Optional[float] = None
         self.ema_mp_500: Optional[float] = None
-        self.ema_sp_25: Optional[float] = None
         self.ema_sp_100: Optional[float] = None
         self.ema_sp_500: Optional[float] = None
         self.ema_sp_1000: Optional[float] = None
@@ -1356,7 +1342,7 @@ class FeatureEngine:
         self.press_5s: float = 0.0
 
         # ---------- Fast EMA state for microstructure signals ----------
-        self.ema_half_lives_ms = (25, 100, 500)
+        self.ema_half_lives_ms = (100, 500)
         self.ema_indicator_names = (
             "bid1",
             "ask1",
@@ -1514,9 +1500,6 @@ class FeatureEngine:
         self._prune_ts_deque(deq, now, window_ms)
         window_secs = window_ms / 1000.0
         return len(deq) / window_secs if window_secs > 0 else 0.0
-
-    def event_density_25ms(self) -> float:
-        return self._event_density(self.ev_25ms, 25)
 
     def event_density_100ms(self) -> float:
         # events per 0.1s
@@ -1759,18 +1742,12 @@ class FeatureEngine:
         self.last_mid_for_ret = mid
 
         # push to windows
-        self.ret_hist_20ms.append((ts_ms, r))
-        self.ret_hist_25ms.append((ts_ms, r))
-        self.ret_hist_50ms.append((ts_ms, r))
         self.ret_hist_100ms.append((ts_ms, r))
         self.ret_hist_250ms.append((ts_ms, r))
         self.ret_hist_500ms.append((ts_ms, r))
         self.ret_hist_1s.append((ts_ms, r))
         self.ret_hist_5s.append((ts_ms, r))
 
-        self._prune_deque_ms(self.ret_hist_20ms, ts_ms, 20)
-        self._prune_deque_ms(self.ret_hist_25ms, ts_ms, 25)
-        self._prune_deque_ms(self.ret_hist_50ms, ts_ms, 50)
         self._prune_deque_ms(self.ret_hist_100ms, ts_ms, 100)
         self._prune_deque_ms(self.ret_hist_250ms, ts_ms, 250)
         self._prune_deque_ms(self.ret_hist_500ms, ts_ms, 500)
@@ -1834,8 +1811,6 @@ class FeatureEngine:
         self._prune_replen_windows(ts_ms)
 
         # Event density
-        self.ev_25ms.append(ts_ms)
-        self._prune_ts_deque(self.ev_25ms, ts_ms, 25)
         self.ev_100ms.append(ts_ms)
         self._prune_ts_deque(self.ev_100ms, ts_ms, 100)
         self.ev_250ms.append(ts_ms)
@@ -1971,7 +1946,6 @@ class FeatureEngine:
         self._update_indicator_emas(indicator_values, dt_ms)
 
         # Pressure (EWMA of OFI L1)
-        self.press_50ms  = self._ewma_update(getattr(self, 'press_50ms', 0.0), ofi_l1, dt_ms,  50)
         self.press_100ms = self._ewma_update(self.press_100ms, ofi_l1, dt_ms, 100)
         self.press_250ms = self._ewma_update(getattr(self, 'press_250ms',0.0), ofi_l1, dt_ms, 250)
         self.press_1s    = self._ewma_update(self.press_1s,    ofi_l1, dt_ms, 1_000)
@@ -2105,17 +2079,11 @@ class FeatureEngine:
 
         # Returns & vol stats (populate histories + compute σ and VR)
         self._add_return(ts_ms, mid)
-        _, var_20 = self._stats_from_returns(self.ret_hist_20ms)
-        _, var_25 = self._stats_from_returns(self.ret_hist_25ms)
-        _, var_50 = self._stats_from_returns(self.ret_hist_50ms)
         _, var_100 = self._stats_from_returns(self.ret_hist_100ms)
         _, var_250 = self._stats_from_returns(self.ret_hist_250ms)
         _, var_500 = self._stats_from_returns(self.ret_hist_500ms)
         _, var_1s = self._stats_from_returns(self.ret_hist_1s)
         _, var_5s = self._stats_from_returns(self.ret_hist_5s)
-        std_20 = math.sqrt(max(0.0, var_20))
-        std_25 = math.sqrt(max(0.0, var_25))
-        std_50 = math.sqrt(max(0.0, var_50))
         std_100 = math.sqrt(max(0.0, var_100))
         std_250 = math.sqrt(max(0.0, var_250))
         std_500 = math.sqrt(max(0.0, var_500))
@@ -2125,7 +2093,6 @@ class FeatureEngine:
         vr = (var_1s / max(10.0 * var_100, 1e-12)) if var_100 > 0 else 0.0
         vr_1s_250 = var_1s / max(4.0 * var_250, 1e-12) if var_250 > 0 else 0.0
         var_ratio_500_100 = var_500 / max(var_100, 1e-12) if var_100 > 0 else 0.0
-        var_ratio_100_20 = var_100 / max(var_20, 1e-12) if var_20 > 0 else 0.0
 
         # Short-horizon regime summaries (vol & flow)
         regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
@@ -2138,10 +2105,8 @@ class FeatureEngine:
 
         # EMA (microprice & spread) and RSI(micro)
         for attr, val, hl, use_half_life in [
-            ("ema_mp_25", micro, 50, False),
             ("ema_mp_100", micro, 200, False),
             ("ema_mp_500", micro, 800, False),
-            ("ema_sp_25", spread, 50, False),
             ("ema_sp_100", spread, 100, True),
             ("ema_sp_500", spread, 500, True),
             ("ema_sp_1000", spread, 1000, True),
@@ -2171,18 +2136,15 @@ class FeatureEngine:
 
         spread_delta_norms: Dict[int, float] = {}
         for window, delta in spread_deltas.items():
-            if window <= 50:
-                baseline = self.ema_sp_25 if self.ema_sp_25 is not None else spread
-            elif window <= 150:
+            if window <= 150:
                 baseline = self.ema_sp_100 if self.ema_sp_100 is not None else spread
             else:
                 baseline = self.ema_sp_500 if self.ema_sp_500 is not None else spread
             spread_delta_norms[window] = delta / max(baseline, 1e-9)
 
         # RSI on microprice (use EWMA gains/losses with ~100ms smoothing)
-        delta_mp = micro - (self.ema_mp_25 if self.ema_mp_25 is not None else micro)
-        micro_minus_ema25 = delta_mp
-        micro_minus_ema100 = micro - (self.ema_mp_100 if self.ema_mp_100 is not None else micro)
+        delta_mp = micro - (self.ema_mp_100 if self.ema_mp_100 is not None else micro)
+        micro_minus_ema100 = delta_mp
         gain = max(delta_mp, 0.0)
         loss = max(-delta_mp, 0.0)
         alpha_rsi = 1.0 - math.exp(-dt_ms / 200.0)
@@ -2231,7 +2193,6 @@ class FeatureEngine:
             micro_premia, smart_premia,
 
             # --- pressure (decayed OFI) ---
-            getattr(self, 'press_50ms', 0.0),
             self.press_100ms,
             getattr(self, 'press_250ms', 0.0),
             self.press_1s,
@@ -2245,7 +2206,6 @@ class FeatureEngine:
             # --- tempo ---
             quotes_1s,
             trade_cnt_1s,
-            self.event_density_25ms(),
             self.event_density_100ms(),  # events per 0.1s (helper)
             self.event_density_250ms(),
             self.event_density_500ms(),
@@ -2255,12 +2215,10 @@ class FeatureEngine:
             float(self.last_is_rpi),
 
             # --- best-level churn & depletion & spread-change stats ---
-            float(bid1_change_counts.get(50, 0)),
             float(bid1_change_counts.get(100, 0)),
             float(bid1_change_counts.get(250, 0)),
             float(bid1_change_counts.get(500, 0)),
             float(bid1_change_counts.get(1_000, 0)),
-            float(ask1_change_counts.get(50, 0)),
             float(ask1_change_counts.get(100, 0)),
             float(ask1_change_counts.get(250, 0)),
             float(ask1_change_counts.get(500, 0)),
@@ -2270,29 +2228,24 @@ class FeatureEngine:
             float(n_spread_chg_250ms), float(n_spread_chg_1s),
             dt_since_bid1_update,
             dt_since_ask1_update,
-            spread_deltas.get(25, 0.0), spread_deltas.get(50, 0.0),
             spread_deltas.get(100, 0.0), spread_deltas.get(250, 0.0),
             spread_deltas.get(500, 0.0),
-            spread_delta_norms.get(25, 0.0), spread_delta_norms.get(50, 0.0),
             spread_delta_norms.get(100, 0.0), spread_delta_norms.get(250, 0.0),
             spread_delta_norms.get(500, 0.0),
 
             # --- returns & vol stats ---
-            std_20, std_25, std_50, std_100, std_250, std_500, std_1s, std_5s,
+            std_100, std_250, std_500, std_1s, std_5s,
             vr, vr_1s_250,
-            var_ratio_500_100, var_ratio_100_20,
+            var_ratio_500_100,
 
             # --- EMAs & technicals ---
-            (self.ema_mp_25 if self.ema_mp_25 is not None else micro),
             (self.ema_mp_100 if self.ema_mp_100 is not None else micro),
             (self.ema_mp_500 if self.ema_mp_500 is not None else micro),
-            (self.ema_sp_25 if self.ema_sp_25 is not None else spread),
             (self.ema_sp_100 if self.ema_sp_100 is not None else spread),
             (self.ema_sp_500 if self.ema_sp_500 is not None else spread),
             (self.ema_sp_1000 if self.ema_sp_1000 is not None else spread),
             spread_ratios[100], spread_ratios[500], spread_ratios[1000],
             spread_log_ratios[100], spread_log_ratios[500], spread_log_ratios[1000],
-            micro_minus_ema25,
             micro_minus_ema100,
             rsi,
             macd_raw,
@@ -2340,7 +2293,7 @@ class FeatureEngine:
         for ms in trade_horizons:
             feat_list.append(vwap_vs_micro[ms])
 
-        # --- indicator EMAs (25/100/500 ms) ---
+        # --- indicator EMAs (100/500 ms) ---
         for hl in self.ema_half_lives_ms:
             state = self.ema_states[hl]
             for name in self.ema_indicator_names:
