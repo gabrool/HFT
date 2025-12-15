@@ -1130,11 +1130,55 @@ class BybitRawIter:
         with _open_text(self.th_zip) as f:
             reader = csv.DictReader(f)
             seq = 0
+            pending_rows: List[Tuple[int, dict]] = []
+            pending_sec: Optional[int] = None
+
+            def flush_pending():
+                nonlocal pending_rows, pending_sec
+                if not pending_rows:
+                    return
+
+                n = len(pending_rows)
+                base_ms = int(pending_sec or 0) * 1000
+                step = 1000.0 / float(n)
+
+                for idx, (row_seq, row) in enumerate(pending_rows):
+                    # Spread trades uniformly across the 1s bucket so they can
+                    # interleave sensibly with the 100 ms order-book stream.
+                    offset = min(999, int((idx + 0.5) * step))
+                    ts = base_ms + offset
+                    row["seq"] = row_seq
+                    yield ts, row_seq, row
+
+                pending_rows = []
+                pending_sec = None
+
             for row in reader:
                 seq += 1
-                ts = int(float(row["timestamp"]) * 1000)
-                row["seq"] = seq
-                yield ts, seq, row
+                ts_float = float(row["timestamp"])
+                ts_ms_raw = int(ts_float * 1000)
+                sec = ts_ms_raw // 1000
+                has_subsecond = ts_ms_raw != sec * 1000
+
+                if has_subsecond:
+                    # Preserve existing millisecond precision and flush any
+                    # buffered whole-second rows first.
+                    yield from flush_pending()
+                    row["seq"] = seq
+                    yield ts_ms_raw, seq, row
+                    continue
+
+                if pending_sec is None:
+                    pending_sec = sec
+
+                if sec != pending_sec:
+                    yield from flush_pending()
+                    pending_sec = sec
+
+                pending_rows.append((seq, row))
+
+            # Flush tail bucket
+            yield from flush_pending()
 
 
 def merge_event_time(ob_iter, tr_iter, B: int = 0):
