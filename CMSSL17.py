@@ -1291,23 +1291,15 @@ class FeatureEngine:
             for window in self.replen_windows_ms
         }
 
-        # ---------- Trades windows for short VWAP & bursts ----------
+        # ---------- Trades windows (>= 1s) ----------
         # (ts, price, size, side, tick_sign, is_zero_tick)
-        self.trades_25ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
-        self.trades_50ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
-        self.trades_100ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
-        self.trades_250ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
-        self.trades_500ms: Deque[Tuple[int, float, float, str, int, int]] = deque()
         self.trades_1s: Deque[Tuple[int, float, float, str, int, int]] = deque()
         self.trades_5s: Deque[Tuple[int, float, float, str, int, int]] = deque()
 
-        self.trade_windows: Tuple[int, ...] = (25, 50, 100, 250, 500)
+        self.trade_windows: Tuple[int, ...] = (1_000, 5_000)
         self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str, int, int]]] = {
-            25: self.trades_25ms,
-            50: self.trades_50ms,
-            100: self.trades_100ms,
-            250: self.trades_250ms,
-            500: self.trades_500ms,
+            1_000: self.trades_1s,
+            5_000: self.trades_5s,
         }
 
         # Tick-direction & RPI tracking
@@ -1721,10 +1713,6 @@ class FeatureEngine:
         for window, deq in self._trade_window_deques.items():
             deq.append(entry)
             self._prune_deque_ms(deq, ts_ms, window)
-        self.trades_1s.append(entry)
-        self._prune_deque_ms(self.trades_1s, ts_ms, 1_000)
-        self.trades_5s.append(entry)
-        self._prune_deque_ms(self.trades_5s, ts_ms, 5_000)
 
         # Update volume-regime (vol/sec) EWMAs using provided dt_ms
         vol_rate = size / (dt_ms / 1000.0)  # base per second
@@ -1989,7 +1977,7 @@ class FeatureEngine:
         self.press_1s    = self._ewma_update(self.press_1s,    ofi_l1, dt_ms, 1_000)
         self.press_2s    = self._ewma_update(getattr(self, 'press_2s',   0.0), ofi_l1, dt_ms, 2_000)
 
-        # Short VWAPs (25/50/100/250/500 ms) and rel to mid/micro
+        # VWAPs (>=1s) and rel to mid/micro
         def vwap_in(win: Deque[Tuple[int, float, float, str, int, int]]) -> float:
             vol = sum(s for _, _, s, *_ in win)
             if vol <= 1e-12:
@@ -1998,28 +1986,28 @@ class FeatureEngine:
             return pxv / vol
 
         vwap_per_ms: Dict[int, float] = {
-            ms: vwap_in(self._trade_window_deques[ms]) for ms in self.trade_windows
+            1_000: vwap_in(self.trades_1s),
+            5_000: vwap_in(self.trades_5s),
         }
         vwap_vs_mid = {
             ms: (vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0 if mid > 0 else 0.0
-            for ms in self.trade_windows
+            for ms in vwap_per_ms
         }
         vwap_vs_micro = {
             ms: (vwap_per_ms[ms] / max(micro, 1e-12)) - 1.0 if micro > 0 else 0.0
-            for ms in self.trade_windows
+            for ms in vwap_per_ms
         }
 
-        # Trade stats per horizon and 1s tempo
-        trade_stats = {
-            ms: self._compute_trade_window_stats(self._trade_window_deques[ms], mid)
-            for ms in self.trade_windows
-        }
+        # Trade stats per horizon and tempo
         stats_1s = self._compute_trade_window_stats(self.trades_1s, mid)
         stats_5s = self._compute_trade_window_stats(self.trades_5s, mid)
+        trade_stats = {
+            1_000: stats_1s,
+            5_000: stats_5s,
+        }
 
         # Quote/trade tempo (1s windows)
         quotes_1s = float(len(self.quotes_1s))
-        trade_cnt_100ms = float(trade_stats[100]["buy_cnt"] + trade_stats[100]["sell_cnt"])
         trade_cnt_1s = float(stats_1s["buy_cnt"] + stats_1s["sell_cnt"])
         buy_vol_1s = stats_1s["buy_vol"]
         sell_vol_1s = stats_1s["sell_vol"]
@@ -2035,7 +2023,6 @@ class FeatureEngine:
         trade_through_1s = stats_1s["trade_through"]
 
         regime_flow = {
-            500: trade_stats.get(500, stats_1s)["imbalance"],
             1_000: stats_1s["imbalance"],
             5_000: stats_5s["imbalance"],
         }
@@ -2102,8 +2089,14 @@ class FeatureEngine:
             else 0.0
         )
 
-        quote_counts = {ms: len(self._quote_window_deques[ms]) for ms in self.trade_windows}
-        spread_change_counts = {ms: len(self._spread_change_deques[ms]) for ms in self.trade_windows}
+        quote_counts = {
+            1_000: len(self.quotes_1s),
+            5_000: len(self.quotes_1s),
+        }
+        spread_change_counts = {
+            1_000: len(self._spread_change_deques[1_000]),
+            5_000: 0,
+        }
         bid1_change_counts = {ms: len(self._bid1_change_deques[ms]) for ms in self.bestlvl_windows}
         ask1_change_counts = {ms: len(self._ask1_change_deques[ms]) for ms in self.bestlvl_windows}
         time_since_spread_change = (ts_ms - (self.last_spread_ts or ts_ms))
@@ -2141,7 +2134,7 @@ class FeatureEngine:
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
         vol_ratio_short_long = regime_volume[500] / max(regime_volume[5_000], 1e-9)
         realized_ratio_short_long = regime_realized[500] / max(regime_realized[5_000], 1e-12)
-        flow_diff_short_long = regime_flow_snapshot[500] - regime_flow_snapshot[5_000]
+        flow_diff_short_long = regime_flow_snapshot[1_000] - regime_flow_snapshot[5_000]
 
         # EMA (microprice & spread) and RSI(micro)
         for attr, val, hl, use_half_life in [
@@ -2219,7 +2212,7 @@ class FeatureEngine:
         # VPIN value (avg of last M φ)
         vpin = (sum(self.vpin_phi) / len(self.vpin_phi)) if self.vpin_phi else 0.0
 
-        horizon_list = list(self.trade_windows)
+        trade_horizons = list(self.trade_windows)
         replen_rates = self._replenishment_rates()
 
         # Build raw feature vector
@@ -2251,7 +2244,6 @@ class FeatureEngine:
 
             # --- tempo ---
             quotes_1s,
-            trade_cnt_100ms,
             trade_cnt_1s,
             self.event_density_25ms(),
             self.event_density_100ms(),  # events per 0.1s (helper)
@@ -2312,13 +2304,13 @@ class FeatureEngine:
             self.volume_ewma[500], self.volume_ewma[1_000], self.volume_ewma[5_000],
             regime_realized[500], regime_realized[1_000], regime_realized[5_000],
             regime_vol_ewma[500], regime_vol_ewma[1_000], regime_vol_ewma[5_000],
-            self.flow_regime[500], self.flow_regime[1_000], self.flow_regime[5_000],
+            self.flow_regime[1_000], self.flow_regime[5_000],
             vol_ratio_short_long, realized_ratio_short_long, flow_diff_short_long,
             vpin,
         ]
 
-        # --- per-horizon trade stats & liquidity metrics (25/50/100/250/500 ms) ---
-        for ms in horizon_list:
+        # --- per-horizon trade stats & liquidity metrics (>=1s) ---
+        for ms in trade_horizons:
             stats = trade_stats[ms]
             feat_list.extend([
                 stats["buy_vol"], stats["sell_vol"],
@@ -2332,7 +2324,7 @@ class FeatureEngine:
             ])
 
         # --- L1/L2 liquidity replenishment/cancellation rates (size/ms) ---
-        for ms in horizon_list:
+        for ms in self.replen_windows_ms:
             rates = replen_rates[ms]
             for level in (1, 2):
                 feat_list.extend([
@@ -2343,9 +2335,9 @@ class FeatureEngine:
                 ])
 
         # --- VWAPs vs mid/micro across horizons ---
-        for ms in horizon_list:
+        for ms in trade_horizons:
             feat_list.append(vwap_vs_mid[ms])
-        for ms in horizon_list:
+        for ms in trade_horizons:
             feat_list.append(vwap_vs_micro[ms])
 
         # --- indicator EMAs (25/100/500 ms) ---
