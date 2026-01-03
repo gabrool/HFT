@@ -663,16 +663,12 @@ def train_from_offline():
                 )
                 bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
-                ema_ret = ema_update('ret', mse_ret.item(), ema_ft)
-                ema_logvol = ema_update('logvol', mse_vol.item(), ema_ft)
                 ema_ret_masked = ema_update('ret_masked', mse_ret_masked.item(), ema_ft)
                 ema_logvol_masked = ema_update('logvol_masked', mse_vol_masked.item(), ema_ft)
                 ema_bce = ema_update('bce', bce_loss.item(), ema_ft)
                 ema_recon = ema_update('recon', recon.item(), ema_ft)
                 ema_cpc = ema_update('cpc', cpc_loss.item(), ema_ft)
-                loss = (mse_ret / (ema_ret + 1e-8) +
-                        mse_vol / (ema_logvol + 1e-8) +
-                        LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
+                loss = (LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
                         LAMBDA_VOL_MASKED * (mse_vol_masked / (ema_logvol_masked + 1e-8)) +
                         LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8)) +
                         LAMBDA_RECON_FT * (recon / (ema_recon + 1e-8)) +
@@ -712,9 +708,7 @@ def train_from_offline():
                     vol_pred2, y_logvol, delta_logvol_tensor, mask2, horizon_weights
                 )
                 bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
-                loss2 = (mse_ret2 / (ema_ft['ret'] + 1e-8) +
-                         mse_vol2 / (ema_ft['logvol'] + 1e-8) +
-                         LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
+                loss2 = (LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
                          LAMBDA_VOL_MASKED * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
                          LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8)) +
                          LAMBDA_RECON_FT * (recon2 / (ema_ft['recon'] + 1e-8)) +
