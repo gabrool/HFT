@@ -56,6 +56,7 @@ from CMSSL17 import (  # type: ignore
     EMA_DECAY, LAMBDA_BCE, LAMBDA_RET_MASKED, LAMBDA_VOL_MASKED,
     LAMBDA_RECON_FT, LAMBDA_CPC_FT, LAMBDA_RECON_PT, LAMBDA_CPC_PT,
     DMODEL, MAMBA_LAYERS,
+    PRIMARY_METRIC_HORIZON_MS,
     # utils
     huber_loss, ema_update, binary_auc_from_logits,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
@@ -907,11 +908,19 @@ def train_from_offline():
             if not is_ssl_pretrain:
                 primary_metric_value, primary_metric_label = compute_primary_metric(
                     val_auc_masked,
-                    avg_val_ret_loss_masked,
-                    avg_val_vol_loss_masked,
+                    val_ret_loss_masked_per_h,
                 )
                 if math.isfinite(primary_metric_value):
-                    print(f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f}")
+                    idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+                    masked_auc = float(val_auc_masked[idx]) if idx < len(val_auc_masked) else float("nan")
+                    masked_ret_loss = (
+                        float(val_ret_loss_masked_per_h[idx]) if idx < len(val_ret_loss_masked_per_h) else float("nan")
+                    )
+                    print(
+                        f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
+                        f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={masked_ret_loss:.6f}, "
+                        f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={masked_auc:.6f}]"
+                    )
                     scheduler.step(primary_metric_value)
 
                     if is_metric_improved(primary_metric_value, best, primary_metric_mode):
