@@ -438,6 +438,8 @@ EMA_DECAY       = 0.99
 LAMBDA_BCE      = 1.00
 LAMBDA_RET      = 0.50
 LAMBDA_VOL      = 0.50
+LAMBDA_RET_MASKED = 0.0
+LAMBDA_VOL_MASKED = 0.0
 LAMBDA_RECON_FT = 0.00
 LAMBDA_CPC_FT   = 0.00
 LAMBDA_RECON_PT = 0.00
@@ -2875,6 +2877,30 @@ def train_and_evaluate():
         weight_stack = torch.stack(weights)
         return (loss_stack * weight_stack).sum() / weight_stack.sum()
 
+    def compute_masked_regression_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        delta: torch.Tensor,
+        mask: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if not mask.any():
+            return torch.tensor(0.0, device=pred.device)
+        loss_elem = huber_loss(pred, target, delta, reduction='none')
+        losses = []
+        weight_list = []
+        for h_idx in range(NUM_HORIZONS):
+            mask_h = mask[:, h_idx]
+            if mask_h.any():
+                loss_h = loss_elem[mask_h, h_idx].mean()
+                losses.append(loss_h)
+                weight_list.append(weights[h_idx])
+        if not losses:
+            return torch.tensor(0.0, device=pred.device)
+        loss_stack = torch.stack(losses)
+        weight_stack = torch.stack(weight_list)
+        return (loss_stack * weight_stack).sum() / weight_stack.sum()
+
     def format_metric(values: Iterable[float], fmt: str) -> str:
         formatted = []
         for horizon, value in zip(HORIZONS_MS, values):
@@ -2894,7 +2920,15 @@ def train_and_evaluate():
 
     # EMA meters for loss normalization
     ema_pre = {'recon': 1.0, 'cpc': 1.0}
-    ema_ft  = {'ret': 1.0, 'logvol': 1.0, 'bce': 1.0, 'recon': 1.0, 'cpc': 1.0}
+    ema_ft  = {
+        'ret': 1.0,
+        'logvol': 1.0,
+        'ret_masked': 1.0,
+        'logvol_masked': 1.0,
+        'bce': 1.0,
+        'recon': 1.0,
+        'cpc': 1.0,
+    }
 
     for epoch in range(EPOCHS):
         # LR warmup
@@ -2910,7 +2944,7 @@ def train_and_evaluate():
         pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS} ({'SSL-Pre' if is_ssl_pretrain else 'FT'}) mask={mratio:.2f}")
 
         # Epoch trackers
-        ep_ret = ep_logvol = ep_bce = ep_recon = ep_cpc = 0.0
+        ep_ret = ep_logvol = ep_ret_masked = ep_logvol_masked = ep_bce = ep_recon = ep_cpc = 0.0
         n_batches = 0
 
         for x, y in pbar:
@@ -2938,21 +2972,34 @@ def train_and_evaluate():
                 y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
                 mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
                 mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
+                mask = build_dir_mask(y_ret)
+                mse_ret_masked = compute_masked_regression_loss(
+                    ret_pred, y_ret, delta_ret_tensor, mask, horizon_weights
+                )
+                mse_vol_masked = compute_masked_regression_loss(
+                    vol_pred, y_logvol, delta_logvol_tensor, mask, horizon_weights
+                )
                 bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
-                ema_ret   = ema_update('ret',    mse_ret.item(),  ema_ft)
-                ema_vol   = ema_update('logvol', mse_vol.item(),  ema_ft)
-                ema_bce   = ema_update('bce',    bce_loss.item(), ema_ft)
-                ema_recon = ema_update('recon',  recon.item(),    ema_ft)
-                ema_cpc   = ema_update('cpc',    cpc_loss.item(), ema_ft)
+                ema_ret = ema_update('ret', mse_ret.item(), ema_ft)
+                ema_vol = ema_update('logvol', mse_vol.item(), ema_ft)
+                ema_ret_masked = ema_update('ret_masked', mse_ret_masked.item(), ema_ft)
+                ema_vol_masked = ema_update('logvol_masked', mse_vol_masked.item(), ema_ft)
+                ema_bce = ema_update('bce', bce_loss.item(), ema_ft)
+                ema_recon = ema_update('recon', recon.item(), ema_ft)
+                ema_cpc = ema_update('cpc', cpc_loss.item(), ema_ft)
 
                 loss = LAMBDA_RET      * (mse_ret / (ema_ret + 1e-8)) \
                      + LAMBDA_VOL      * (mse_vol / (ema_vol + 1e-8)) \
+                     + LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) \
+                     + LAMBDA_VOL_MASKED * (mse_vol_masked / (ema_vol_masked + 1e-8)) \
                      + LAMBDA_BCE      * (bce_loss / (ema_bce + 1e-8)) \
                      + LAMBDA_RECON_FT * (recon     / (ema_recon + 1e-8)) \
                      + LAMBDA_CPC_FT   * (cpc_loss  / (ema_cpc + 1e-8))
 
-                ep_ret += mse_ret.item(); ep_logvol += mse_vol.item(); ep_bce += bce_loss.item()
+                ep_ret += mse_ret.item(); ep_logvol += mse_vol.item()
+                ep_ret_masked += mse_ret_masked.item(); ep_logvol_masked += mse_vol_masked.item()
+                ep_bce += bce_loss.item()
                 ep_recon += recon.item(); ep_cpc += cpc_loss.item()
 
             loss.backward()
@@ -2973,16 +3020,27 @@ def train_and_evaluate():
                 y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
                 mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
                 mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
+                mask2 = build_dir_mask(y_ret)
+                mse_ret2_masked = compute_masked_regression_loss(
+                    ret_pred2, y_ret, delta_ret_tensor, mask2, horizon_weights
+                )
+                mse_vol2_masked = compute_masked_regression_loss(
+                    vol_pred2, y_logvol, delta_logvol_tensor, mask2, horizon_weights
+                )
                 bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
 
-                ema_ret   = ema_ft['ret']
-                ema_vol   = ema_ft['logvol']
-                ema_bce   = ema_ft['bce']
+                ema_ret = ema_ft['ret']
+                ema_vol = ema_ft['logvol']
+                ema_ret_masked = ema_ft['ret_masked']
+                ema_vol_masked = ema_ft['logvol_masked']
+                ema_bce = ema_ft['bce']
                 ema_recon = ema_ft['recon']
-                ema_cpc   = ema_ft['cpc']
+                ema_cpc = ema_ft['cpc']
 
                 loss2 = LAMBDA_RET      * (mse_ret2 / (ema_ret + 1e-8)) \
                       + LAMBDA_VOL      * (mse_vol2 / (ema_vol + 1e-8)) \
+                      + LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ret_masked + 1e-8)) \
+                      + LAMBDA_VOL_MASKED * (mse_vol2_masked / (ema_vol_masked + 1e-8)) \
                       + LAMBDA_BCE      * (bce_loss2 / (ema_bce + 1e-8)) \
                       + LAMBDA_RECON_FT * (recon2     / (ema_recon + 1e-8)) \
                       + LAMBDA_CPC_FT   * (cpc_loss2  / (ema_cpc + 1e-8))
@@ -3002,8 +3060,15 @@ def train_and_evaluate():
         if is_ssl_pretrain:
             print(f"Ep{epoch+1} (SSL-Pre) avg: recon={ep_recon/max(1,n_batches):.4e}, cpc={ep_cpc/max(1,n_batches):.4e}")
         else:
-            print(f"Ep{epoch+1} (FT) avg: ret={ep_ret/max(1,n_batches):.4e}, logvol={ep_logvol/max(1,n_batches):.4e}, "
-                  f"bce={ep_bce/max(1,n_batches):.4e}, recon={ep_recon/max(1,n_batches):.4e}, cpc={ep_cpc/max(1,n_batches):.4e}")
+            print(
+                f"Ep{epoch+1} (FT) avg: ret={ep_ret/max(1,n_batches):.4e}, "
+                f"logvol={ep_logvol/max(1,n_batches):.4e}, "
+                f"ret_masked={ep_ret_masked/max(1,n_batches):.4e}, "
+                f"logvol_masked={ep_logvol_masked/max(1,n_batches):.4e}, "
+                f"bce={ep_bce/max(1,n_batches):.4e}, "
+                f"recon={ep_recon/max(1,n_batches):.4e}, "
+                f"cpc={ep_cpc/max(1,n_batches):.4e}"
+            )
 
         # =====================  Validation  =====================
         model.eval()
@@ -3036,6 +3101,10 @@ def train_and_evaluate():
             val_logits_masked, val_ypos_masked = [], []
             val_ret_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
             val_vol_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_ret_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_ret_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_vol_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_vol_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
             val_sample_total = 0
             val_acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
             val_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
@@ -3086,6 +3155,12 @@ def train_and_evaluate():
                     for h_idx in range(NUM_HORIZONS):
                         mask_h = mask[:, h_idx]
                         if mask_h.any():
+                            ret_masked_h = ret_loss_elem[mask_h, h_idx]
+                            vol_masked_h = vol_loss_elem[mask_h, h_idx]
+                            val_ret_loss_masked_sum[h_idx] += ret_masked_h.sum().item()
+                            val_ret_loss_masked_count[h_idx] += mask_h.sum().item()
+                            val_vol_loss_masked_sum[h_idx] += vol_masked_h.sum().item()
+                            val_vol_loss_masked_count[h_idx] += mask_h.sum().item()
                             logits_h = dir_pred_logits[mask_h, h_idx]
                             targets_h = y_dir[mask_h, h_idx]
                             val_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
@@ -3099,6 +3174,16 @@ def train_and_evaluate():
 
             avg_val_ret_loss_per_h = val_ret_loss_sum / max(1, val_sample_total)
             avg_val_vol_loss_per_h = val_vol_loss_sum / max(1, val_sample_total)
+            val_ret_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_vol_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            ret_masked_valid = val_ret_loss_masked_count > 0
+            vol_masked_valid = val_vol_loss_masked_count > 0
+            val_ret_loss_masked_per_h[ret_masked_valid] = (
+                val_ret_loss_masked_sum[ret_masked_valid] / val_ret_loss_masked_count[ret_masked_valid]
+            )
+            val_vol_loss_masked_per_h[vol_masked_valid] = (
+                val_vol_loss_masked_sum[vol_masked_valid] / val_vol_loss_masked_count[vol_masked_valid]
+            )
             val_dir_bce_per_h = np.divide(
                 val_bce_unmasked_sum,
                 np.maximum(val_bce_unmasked_count, 1.0)
@@ -3129,6 +3214,14 @@ def train_and_evaluate():
 
             avg_val_ret_loss = float(np.dot(avg_val_ret_loss_per_h, horizon_weights_np) / max(horizon_weights_cpu.sum().item(), 1e-12))
             avg_val_vol_loss = float(np.dot(avg_val_vol_loss_per_h, horizon_weights_np) / max(horizon_weights_cpu.sum().item(), 1e-12))
+            ret_masked_weights = horizon_weights_np[ret_masked_valid]
+            vol_masked_weights = horizon_weights_np[vol_masked_valid]
+            avg_val_ret_loss_masked = float(
+                np.dot(val_ret_loss_masked_per_h[ret_masked_valid], ret_masked_weights) / max(ret_masked_weights.sum(), 1e-12)
+            ) if ret_masked_weights.size else float('nan')
+            avg_val_vol_loss_masked = float(
+                np.dot(val_vol_loss_masked_per_h[vol_masked_valid], vol_masked_weights) / max(vol_masked_weights.sum(), 1e-12)
+            ) if vol_masked_weights.size else float('nan')
 
             print(
                 f"val_ret_huber={format_metric(avg_val_ret_loss_per_h, '{:.4e}')}, "
@@ -3136,6 +3229,10 @@ def train_and_evaluate():
                 f"val_dir_bce={format_metric(val_dir_bce_per_h, '{:.4e}')}, "
                 f"val_acc={format_metric(val_accuracy_per_h, '{:.4f}')}, "
                 f"val_auc={format_metric(val_auc_per_h, '{:.4f}')}"
+            )
+            print(
+                f"  masked_val_ret_huber={format_metric(val_ret_loss_masked_per_h, '{:.4e}')} (w_avg={avg_val_ret_loss_masked:.4e}), "
+                f"masked_val_logvol_huber={format_metric(val_vol_loss_masked_per_h, '{:.4e}')} (w_avg={avg_val_vol_loss_masked:.4e})"
             )
             print(
                 f"  masked_val_dir_bce={format_metric(val_dir_bce_masked_per_h, '{:.4e}')}, "
@@ -3161,6 +3258,10 @@ def train_and_evaluate():
     model.eval()
     test_ret_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
     test_vol_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_ret_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_ret_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_vol_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+    test_vol_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
     test_sample_total = 0
     test_acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
     test_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
@@ -3211,6 +3312,12 @@ def train_and_evaluate():
             for h_idx in range(NUM_HORIZONS):
                 mask_h = mask[:, h_idx]
                 if mask_h.any():
+                    ret_masked_h = ret_loss_elem[mask_h, h_idx]
+                    vol_masked_h = vol_loss_elem[mask_h, h_idx]
+                    test_ret_loss_masked_sum[h_idx] += ret_masked_h.sum().item()
+                    test_ret_loss_masked_count[h_idx] += mask_h.sum().item()
+                    test_vol_loss_masked_sum[h_idx] += vol_masked_h.sum().item()
+                    test_vol_loss_masked_count[h_idx] += mask_h.sum().item()
                     logits_h = dir_pred_logits[mask_h, h_idx]
                     targets_h = y_dir[mask_h, h_idx]
                     test_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
@@ -3224,6 +3331,16 @@ def train_and_evaluate():
 
     avg_test_ret_loss_per_h = test_ret_loss_sum / max(1, test_sample_total)
     avg_test_vol_loss_per_h = test_vol_loss_sum / max(1, test_sample_total)
+    test_ret_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+    test_vol_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+    test_ret_masked_valid = test_ret_loss_masked_count > 0
+    test_vol_masked_valid = test_vol_loss_masked_count > 0
+    test_ret_loss_masked_per_h[test_ret_masked_valid] = (
+        test_ret_loss_masked_sum[test_ret_masked_valid] / test_ret_loss_masked_count[test_ret_masked_valid]
+    )
+    test_vol_loss_masked_per_h[test_vol_masked_valid] = (
+        test_vol_loss_masked_sum[test_vol_masked_valid] / test_vol_loss_masked_count[test_vol_masked_valid]
+    )
     test_dir_bce_per_h = np.divide(test_bce_sum, np.maximum(test_bce_count, 1.0))
     test_accuracy_per_h = np.divide(test_acc_sum, np.maximum(test_total, 1.0))
 
@@ -3249,12 +3366,27 @@ def train_and_evaluate():
         else:
             test_auc_masked_per_h.append(float('nan'))
 
+    test_ret_masked_weights = horizon_weights_np[test_ret_masked_valid]
+    test_vol_masked_weights = horizon_weights_np[test_vol_masked_valid]
+    avg_test_ret_loss_masked = float(
+        np.dot(test_ret_loss_masked_per_h[test_ret_masked_valid], test_ret_masked_weights)
+        / max(test_ret_masked_weights.sum(), 1e-12)
+    ) if test_ret_masked_weights.size else float('nan')
+    avg_test_vol_loss_masked = float(
+        np.dot(test_vol_loss_masked_per_h[test_vol_masked_valid], test_vol_masked_weights)
+        / max(test_vol_masked_weights.sum(), 1e-12)
+    ) if test_vol_masked_weights.size else float('nan')
+
     print(
         f"Test_ret_huber={format_metric(avg_test_ret_loss_per_h, '{:.4e}')}, "
         f"Test_logvol_huber={format_metric(avg_test_vol_loss_per_h, '{:.4e}')}, "
         f"Test_dir_bce={format_metric(test_dir_bce_per_h, '{:.4e}')}, "
         f"Test_acc={format_metric(test_accuracy_per_h, '{:.4f}')}, "
         f"Test_auc={format_metric(test_auc_per_h, '{:.4f}')}"
+    )
+    print(
+        f"  masked_Test_ret_huber={format_metric(test_ret_loss_masked_per_h, '{:.4e}')} (w_avg={avg_test_ret_loss_masked:.4e}), "
+        f"masked_Test_logvol_huber={format_metric(test_vol_loss_masked_per_h, '{:.4e}')} (w_avg={avg_test_vol_loss_masked:.4e})"
     )
     print(
         f"  masked_Test_dir_bce={format_metric(test_dir_bce_masked_per_h, '{:.4e}')}, "
