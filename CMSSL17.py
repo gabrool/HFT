@@ -3036,17 +3036,13 @@ def train_and_evaluate():
                 )
                 bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
-                ema_ret = ema_update('ret', mse_ret.item(), ema_ft)
-                ema_vol = ema_update('logvol', mse_vol.item(), ema_ft)
                 ema_ret_masked = ema_update('ret_masked', mse_ret_masked.item(), ema_ft)
                 ema_vol_masked = ema_update('logvol_masked', mse_vol_masked.item(), ema_ft)
                 ema_bce = ema_update('bce', bce_loss.item(), ema_ft)
                 ema_recon = ema_update('recon', recon.item(), ema_ft)
                 ema_cpc = ema_update('cpc', cpc_loss.item(), ema_ft)
 
-                loss = LAMBDA_RET      * (mse_ret / (ema_ret + 1e-8)) \
-                     + LAMBDA_VOL      * (mse_vol / (ema_vol + 1e-8)) \
-                     + LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) \
+                loss = LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) \
                      + LAMBDA_VOL_MASKED * (mse_vol_masked / (ema_vol_masked + 1e-8)) \
                      + LAMBDA_BCE      * (bce_loss / (ema_bce + 1e-8)) \
                      + LAMBDA_RECON_FT * (recon     / (ema_recon + 1e-8)) \
@@ -3084,17 +3080,13 @@ def train_and_evaluate():
                 )
                 bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
 
-                ema_ret = ema_ft['ret']
-                ema_vol = ema_ft['logvol']
                 ema_ret_masked = ema_ft['ret_masked']
                 ema_vol_masked = ema_ft['logvol_masked']
                 ema_bce = ema_ft['bce']
                 ema_recon = ema_ft['recon']
                 ema_cpc = ema_ft['cpc']
 
-                loss2 = LAMBDA_RET      * (mse_ret2 / (ema_ret + 1e-8)) \
-                      + LAMBDA_VOL      * (mse_vol2 / (ema_vol + 1e-8)) \
-                      + LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ret_masked + 1e-8)) \
+                loss2 = LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ret_masked + 1e-8)) \
                       + LAMBDA_VOL_MASKED * (mse_vol2_masked / (ema_vol_masked + 1e-8)) \
                       + LAMBDA_BCE      * (bce_loss2 / (ema_bce + 1e-8)) \
                       + LAMBDA_RECON_FT * (recon2     / (ema_recon + 1e-8)) \
