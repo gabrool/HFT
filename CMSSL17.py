@@ -427,6 +427,13 @@ EPOCHS          = 200
 LR              = 5e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
+# Primary metric config (used for LR scheduler + early stopping)
+PRIMARY_METRIC = "masked_auc_1000ms"  # options: "masked_auc_1000ms", "masked_auc_retvol_combo"
+PRIMARY_METRIC_HORIZON_MS = 1000
+PRIMARY_METRIC_AUC_WEIGHT = 1.0
+PRIMARY_METRIC_RET_WEIGHT = 0.25
+PRIMARY_METRIC_VOL_WEIGHT = 0.25
+SINGLE_WEEK_PATIENCE = 3
 # Number of auxiliary channels appended after the base feature vector
 # These correspond to [log_dt_ms, is_trade, events_100ms]
 AUX_DIM        = 3
@@ -2708,6 +2715,44 @@ def binary_auc_from_logits(logits: torch.Tensor, targets_pos: torch.Tensor) -> f
     auc = (ranks[y==1].sum() - n_pos*(n_pos+1)/2.0) / (n_pos*n_neg)
     return float(auc)
 
+def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
+    metric = metric_name or PRIMARY_METRIC
+    if metric in {"masked_auc_1000ms", "masked_auc_retvol_combo"}:
+        return "max"
+    if metric in {"masked_retvol_loss"}:
+        return "min"
+    raise ValueError(f"Unsupported primary metric '{metric}'")
+
+def compute_primary_metric(
+    val_auc_masked_per_h: Iterable[float],
+    avg_val_ret_loss_masked: float,
+    avg_val_vol_loss_masked: float,
+) -> Tuple[float, str]:
+    if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
+        raise ValueError(
+            f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
+        )
+    idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+    val_auc_masked_list = list(val_auc_masked_per_h)
+    auc_val = float(val_auc_masked_list[idx]) if idx < len(val_auc_masked_list) else float("nan")
+    if PRIMARY_METRIC == "masked_auc_1000ms":
+        return auc_val, f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms"
+    if PRIMARY_METRIC == "masked_auc_retvol_combo":
+        combo = (
+            PRIMARY_METRIC_AUC_WEIGHT * auc_val
+            - PRIMARY_METRIC_RET_WEIGHT * avg_val_ret_loss_masked
+            - PRIMARY_METRIC_VOL_WEIGHT * avg_val_vol_loss_masked
+        )
+        return combo, f"combo_auc_retvol_{PRIMARY_METRIC_HORIZON_MS}ms"
+    raise ValueError(f"Unsupported primary metric '{PRIMARY_METRIC}'")
+
+def is_metric_improved(value: float, best: float, mode: str) -> bool:
+    if mode == "min":
+        return value < best
+    if mode == "max":
+        return value > best
+    raise ValueError(f"Unsupported mode '{mode}'")
+
 # --------------------  Training loop  ---------------------
 def get_mask_ratio(epoch: int) -> float:
     return MASK_PRETRAIN if epoch < SSL_PRETRAIN_EPOCHS else MASK_FINETUNE
@@ -2911,11 +2956,21 @@ def train_and_evaluate():
                 formatted.append(f"{horizon}ms:{fmt.format(val)}")
         return '[' + ', '.join(formatted) + ']'
 
+    primary_metric_mode = get_primary_metric_mode()
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt.base_optimizer, mode='min', factor=0.5, patience=7)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt.base_optimizer,
+        mode=primary_metric_mode,
+        factor=0.5,
+        patience=7,
+    )
     torch.cuda.empty_cache()
 
-    best = float('inf')
+    early_stop_patience = SINGLE_WEEK_PATIENCE if len(train_weeks) <= 1 else PATIENCE
+    if early_stop_patience != PATIENCE:
+        print(f"[early-stop] using short patience={early_stop_patience} for single-week training")
+
+    best = -float('inf') if primary_metric_mode == "max" else float('inf')
     no_imp = 0
 
     # EMA meters for loss normalization
@@ -3266,18 +3321,27 @@ def train_and_evaluate():
                 f"masked_val_logit_std={format_metric(val_logit_std_masked, '{:.3f}')}"
             )
 
-            scheduler.step(avg_val_ret_loss)
-            if avg_val_ret_loss < best and not is_ssl_pretrain:
-                best = avg_val_ret_loss
-                print(f"New best validation loss (return Huber): {best:.4e}")
-                no_imp = 0
-                torch.save(model.state_dict(), 'best.pth')
+            primary_metric_value, primary_metric_label = compute_primary_metric(
+                val_auc_masked_per_h,
+                avg_val_ret_loss_masked,
+                avg_val_vol_loss_masked,
+            )
+            if math.isfinite(primary_metric_value):
+                print(f"primary_metric({primary_metric_label})={primary_metric_value:.6f}")
+                scheduler.step(primary_metric_value)
+                if not is_ssl_pretrain and is_metric_improved(primary_metric_value, best, primary_metric_mode):
+                    best = primary_metric_value
+                    print(f"New best primary metric ({primary_metric_label}): {best:.6f}")
+                    no_imp = 0
+                    torch.save(model.state_dict(), 'best.pth')
+                elif not is_ssl_pretrain:
+                    no_imp += 1
+                    print(f"no improve {no_imp}/{early_stop_patience}")
+                    if no_imp >= early_stop_patience:
+                        print("Early stopping triggered.")
+                        break
             else:
-                no_imp += 1
-                print(f"no improve {no_imp}/{PATIENCE}")
-                if no_imp >= PATIENCE:
-                    print("Early stopping triggered.")
-                    break
+                print(f"primary_metric({primary_metric_label})=nan (skipping scheduler/early stop)")
 
 
     # =====================  Test  =====================

@@ -58,6 +58,7 @@ from CMSSL17 import (  # type: ignore
     DMODEL, MAMBA_LAYERS,
     # utils
     huber_loss, ema_update, binary_auc_from_logits,
+    SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     # optimizer
     SAM,
 )
@@ -418,6 +419,10 @@ def train_from_offline():
 
     print(f"[weeks] train={len(tr_weeks)} val={len(va_weeks)} test={len(te_weeks)}")
 
+    early_stop_patience = SINGLE_WEEK_PATIENCE if len(tr_weeks) <= 1 else PATIENCE
+    if early_stop_patience != PATIENCE:
+        print(f"[early-stop] using short patience={early_stop_patience} for single-week training")
+
 
     # feature dim sanity
     feat_dim_total = None
@@ -585,12 +590,19 @@ def train_from_offline():
     # ---------------- Model ----------------
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
     model = SAMBA(args).to(device)
+    primary_metric_mode = get_primary_metric_mode()
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt.base_optimizer, mode='min', factor=0.5, patience=7)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt.base_optimizer,
+        mode=primary_metric_mode,
+        factor=0.5,
+        patience=7,
+    )
     torch.cuda.empty_cache()
 
     # ---------------- Epoch loop ----------------
-    best = float('inf'); no_imp = 0
+    best = -float('inf') if primary_metric_mode == "max" else float('inf')
+    no_imp = 0
     ema_pre = {'recon': 1.0, 'cpc': 1.0}
     ema_ft  = {
         'ret': 1.0,
@@ -897,32 +909,41 @@ def train_from_offline():
                   f"logit_mean(mask)={fmt_arr(val_logit_mean_masked, '{:.3f}')}  "
                   f"logit_std(mask)={fmt_arr(val_logit_std_masked, '{:.3f}')}")
 
-            # checkpointing policy like CMSSL17: track best avg_val_ret_loss during fine-tuning
+            # checkpointing policy: track best primary metric during fine-tuning
             if not is_ssl_pretrain:
-                scheduler.step(avg_val_ret_loss)
+                primary_metric_value, primary_metric_label = compute_primary_metric(
+                    val_auc_masked,
+                    avg_val_ret_loss_masked,
+                    avg_val_vol_loss_masked,
+                )
+                if math.isfinite(primary_metric_value):
+                    print(f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f}")
+                    scheduler.step(primary_metric_value)
 
-                if avg_val_ret_loss < best:
-                    best = float(avg_val_ret_loss)
-                    no_imp = 0
-                    ckpt = {
-                        "epoch": epoch,
-                        "model": model.state_dict(),
-                        "args": {
-                            "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
-                            "feat_dim": F_total, "LOOKBACK": LOOKBACK,
-                            "HORIZONS_MS": HORIZONS_MS,
-                        },
-                        "best_val_loss": best,
-                    }
-                    out_ckpt = out_root / "cmssl17_offline_best.pt"
-                    torch.save(ckpt, out_ckpt)
-                    print(f"[ckpt] saved best to {out_ckpt}")
+                    if is_metric_improved(primary_metric_value, best, primary_metric_mode):
+                        best = float(primary_metric_value)
+                        no_imp = 0
+                        ckpt = {
+                            "epoch": epoch,
+                            "model": model.state_dict(),
+                            "args": {
+                                "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
+                                "feat_dim": F_total, "LOOKBACK": LOOKBACK,
+                                "HORIZONS_MS": HORIZONS_MS,
+                            },
+                            "best_primary_metric": best,
+                        }
+                        out_ckpt = out_root / "cmssl17_offline_best.pt"
+                        torch.save(ckpt, out_ckpt)
+                        print(f"[ckpt] saved best to {out_ckpt}")
+                    else:
+                        no_imp += 1
+                        print(f"no improve {no_imp}/{early_stop_patience}")
+                        if no_imp >= early_stop_patience:
+                            print("Early stopping triggered.")
+                            early_stop_triggered = True
                 else:
-                    no_imp += 1
-                    print(f"no improve {no_imp}/{PATIENCE}")
-                    if no_imp >= PATIENCE:
-                        print("Early stopping triggered.")
-                        early_stop_triggered = True
+                    print(f"[val] primary_metric({primary_metric_label})=nan (skipping scheduler/early stop)")
 
         if early_stop_triggered:
             break
