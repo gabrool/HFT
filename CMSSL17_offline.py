@@ -844,17 +844,29 @@ def train_from_offline():
             # AUCs
             val_auc = np.zeros(NUM_HORIZONS, dtype=np.float64)
             val_auc_masked = np.zeros(NUM_HORIZONS, dtype=np.float64)
+            val_pos_rate_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_mean_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_std_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_pos_rate_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_mean_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
             for h_idx in range(NUM_HORIZONS):
                 if val_logits_all[h_idx]:
                     logits_cat = torch.cat(val_logits_all[h_idx], dim=0).view(-1)
                     ypos_cat   = torch.cat(val_ypos_all[h_idx], dim=0).view(-1)
                     val_auc[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
+                    val_pos_rate_all[h_idx] = float(ypos_cat.float().mean().item())
+                    val_logit_mean_all[h_idx] = float(logits_cat.mean().item())
+                    val_logit_std_all[h_idx] = float(logits_cat.std(unbiased=False).item())
                 else:
                     val_auc[h_idx] = float('nan')
                 if val_logits_masked[h_idx]:
                     logits_cat = torch.cat(val_logits_masked[h_idx], dim=0).view(-1)
                     ypos_cat   = torch.cat(val_ypos_masked[h_idx], dim=0).view(-1)
                     val_auc_masked[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
+                    val_pos_rate_masked[h_idx] = float(ypos_cat.float().mean().item())
+                    val_logit_mean_masked[h_idx] = float(logits_cat.mean().item())
+                    val_logit_std_masked[h_idx] = float(logits_cat.std(unbiased=False).item())
                 else:
                     val_auc_masked[h_idx] = float('nan')
 
@@ -878,6 +890,12 @@ def train_from_offline():
                   f"BCE(all)={fmt_arr(val_bce_unmasked)}  BCE(mask)={fmt_arr(val_bce_masked)}  "
                   f"Acc(all)={fmt_arr(val_acc, '{:.3%}')}  Acc(mask)={fmt_arr(val_acc_masked, '{:.3%}')}  "
                   f"AUC(all)={fmt_arr(val_auc, '{:.3f}')}  AUC(mask)={fmt_arr(val_auc_masked, '{:.3f}')}")
+            print(f"[val_diag] pos_rate(all)={fmt_arr(val_pos_rate_all, '{:.3%}')}  "
+                  f"logit_mean(all)={fmt_arr(val_logit_mean_all, '{:.3f}')}  "
+                  f"logit_std(all)={fmt_arr(val_logit_std_all, '{:.3f}')}  "
+                  f"pos_rate(mask)={fmt_arr(val_pos_rate_masked, '{:.3%}')}  "
+                  f"logit_mean(mask)={fmt_arr(val_logit_mean_masked, '{:.3f}')}  "
+                  f"logit_std(mask)={fmt_arr(val_logit_std_masked, '{:.3f}')}")
 
             # checkpointing policy like CMSSL17: track best avg_val_ret_loss during fine-tuning
             if not is_ssl_pretrain:

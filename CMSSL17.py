@@ -3191,17 +3191,28 @@ def train_and_evaluate():
             val_accuracy_per_h = np.divide(val_acc_sum, np.maximum(val_total, 1.0))
 
             val_auc_per_h = []
+            val_pos_rate_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_mean_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_std_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
             for h_idx in range(NUM_HORIZONS):
                 if val_logits_all[h_idx]:
                     logits_cat = torch.cat(val_logits_all[h_idx])
                     ypos_cat = torch.cat(val_ypos_all[h_idx])
                     val_auc_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
+                    logits_flat = logits_cat.view(-1)
+                    ypos_flat = ypos_cat.view(-1)
+                    val_pos_rate_all[h_idx] = float(ypos_flat.float().mean().item())
+                    val_logit_mean_all[h_idx] = float(logits_flat.mean().item())
+                    val_logit_std_all[h_idx] = float(logits_flat.std(unbiased=False).item())
                 else:
                     val_auc_per_h.append(float('nan'))
 
             val_dir_bce_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
             val_acc_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
             val_auc_masked_per_h: List[float] = []
+            val_pos_rate_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_mean_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+            val_logit_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
             for h_idx in range(NUM_HORIZONS):
                 if val_bce_masked_count[h_idx] > 0:
                     val_dir_bce_masked_per_h[h_idx] = val_bce_masked_sum[h_idx] / val_bce_masked_count[h_idx]
@@ -3209,6 +3220,11 @@ def train_and_evaluate():
                     logits_cat = torch.cat(val_logits_masked[h_idx])
                     ypos_cat = torch.cat(val_ypos_masked[h_idx])
                     val_auc_masked_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
+                    logits_flat = logits_cat.view(-1)
+                    ypos_flat = ypos_cat.view(-1)
+                    val_pos_rate_masked[h_idx] = float(ypos_flat.float().mean().item())
+                    val_logit_mean_masked[h_idx] = float(logits_flat.mean().item())
+                    val_logit_std_masked[h_idx] = float(logits_flat.std(unbiased=False).item())
                 else:
                     val_auc_masked_per_h.append(float('nan'))
 
@@ -3238,6 +3254,16 @@ def train_and_evaluate():
                 f"  masked_val_dir_bce={format_metric(val_dir_bce_masked_per_h, '{:.4e}')}, "
                 f"masked_val_acc={format_metric(val_acc_masked_per_h, '{:.4f}')}, "
                 f"masked_val_auc={format_metric(val_auc_masked_per_h, '{:.4f}')}"
+            )
+            print(
+                f"  val_pos_rate={format_metric(val_pos_rate_all, '{:.3%}')}, "
+                f"val_logit_mean={format_metric(val_logit_mean_all, '{:.3f}')}, "
+                f"val_logit_std={format_metric(val_logit_std_all, '{:.3f}')}"
+            )
+            print(
+                f"  masked_val_pos_rate={format_metric(val_pos_rate_masked, '{:.3%}')}, "
+                f"masked_val_logit_mean={format_metric(val_logit_mean_masked, '{:.3f}')}, "
+                f"masked_val_logit_std={format_metric(val_logit_std_masked, '{:.3f}')}"
             )
 
             scheduler.step(avg_val_ret_loss)
