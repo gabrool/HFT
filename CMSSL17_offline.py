@@ -261,7 +261,11 @@ class NpyChunksDataset(Dataset):
         core = np.asarray(Xc[idx_in_file], dtype=np.float32)
         aux  = np.asarray(Xa[idx_in_file], dtype=np.float32)
         x = np.concatenate([core, aux], axis=-1)
+        if not x.flags.writeable:
+            x = x.copy()
         y = np.asarray(Y[idx_in_file], dtype=np.float32)
+        if not y.flags.writeable:
+            y = y.copy()
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
