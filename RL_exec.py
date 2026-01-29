@@ -19,13 +19,26 @@ def load_cmssl(out_root: str, ckpt_path: str, device="cuda"):
     return model, meta
 
 @torch.no_grad()
-def cmssl_predict(model, x_core, x_aux, device="cuda"):
+def cmssl_predict(model, x_core, x_aux, meta, device="cuda"):
     # x_core: [B, L, F_core]  x_aux: [B, L, AUX_DIM]
     x_core = torch.as_tensor(x_core, device=device)
-    x_aux  = torch.as_tensor(x_aux, device=device)
-    out = model(x_core, x_aux)
-    # adapt this unpacking to your SAMBA forward output order
-    return out
+    x_aux = torch.as_tensor(x_aux, device=device)
+    x = torch.cat([x_core, x_aux], dim=-1)
+    mask_idx = torch.empty((x.shape[0], 0), dtype=torch.long, device=device)
+    ret_pred, vol_pred, dir_logits, *_ = model(x, mask_ratio=0.0, mask_idx=mask_idx)
+    horizons = meta.get("horizons_ms", [])
+    expected_h = len(horizons)
+    assert expected_h > 0, "meta['horizons_ms'] must be non-empty"
+    assert ret_pred.shape[-1] == expected_h, (
+        f"ret_pred shape {ret_pred.shape} does not match horizons {expected_h}"
+    )
+    assert vol_pred.shape[-1] == expected_h, (
+        f"vol_pred shape {vol_pred.shape} does not match horizons {expected_h}"
+    )
+    assert dir_logits.shape[-1] == expected_h, (
+        f"dir_logits shape {dir_logits.shape} does not match horizons {expected_h}"
+    )
+    return ret_pred, vol_pred, dir_logits
 
 
 def iter_chunk_batches(out_root: str):
