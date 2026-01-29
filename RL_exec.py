@@ -628,6 +628,153 @@ class TradingBatch:
     spread_bps: np.ndarray
 
 
+@dataclass
+class MarketMakingBatch:
+    features: np.ndarray
+    spread_bps: np.ndarray
+    best_bid: np.ndarray
+    best_ask: np.ndarray
+    snapshot_mask: Optional[np.ndarray] = None
+
+
+class MarketMakingEnv:
+    def __init__(
+        self,
+        batch: MarketMakingBatch,
+        *,
+        maker_rebate_bps: float = 0.0,
+        inventory_penalty: float = 0.0,
+        max_inventory: Optional[float] = None,
+        fill_size: float = 1.0,
+        fill_tolerance: float = 1e-6,
+    ):
+        self.features = batch.features
+        self.spread_bps = batch.spread_bps
+        self.best_bid = batch.best_bid
+        self.best_ask = batch.best_ask
+        self.snapshot_mask = (
+            batch.snapshot_mask if batch.snapshot_mask is not None else np.ones_like(self.best_bid, dtype=bool)
+        )
+        self.maker_rebate_bps = maker_rebate_bps
+        self.inventory_penalty = inventory_penalty
+        self.max_inventory = max_inventory
+        self.fill_size = fill_size
+        self.fill_tolerance = fill_tolerance
+
+        self.n = len(self.spread_bps)
+        self.idx = 0
+        self.cash = 0.0
+        self.inventory = 0.0
+        self.total_reward = 0.0
+        self.prev_equity = 0.0
+
+    def reset(self) -> np.ndarray:
+        self.idx = 0
+        self.cash = 0.0
+        self.inventory = 0.0
+        self.total_reward = 0.0
+        mid = self._mid_price(self.idx)
+        self.prev_equity = self.cash + self.inventory * mid
+        return self._build_observation(self.idx)
+
+    def _mid_price(self, idx: int) -> float:
+        return float((self.best_bid[idx] + self.best_ask[idx]) / 2.0)
+
+    def _build_observation(self, idx: int) -> np.ndarray:
+        mid = self._mid_price(idx)
+        spread = float(self.best_ask[idx] - self.best_bid[idx])
+        extra = np.array([self.inventory, self.cash, mid, spread], dtype=np.float32)
+        return np.concatenate([self.features[idx].astype(np.float32), extra], axis=0)
+
+    def _parse_action(self, action: Any) -> Tuple[float, float]:
+        if isinstance(action, (list, tuple, np.ndarray)) and len(action) == 2:
+            return float(action[0]), float(action[1])
+        if np.isscalar(action):
+            return float(action), float(action)
+        raise ValueError("Action must be a scalar or (bid_delta_bps, ask_delta_bps).")
+
+    def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
+        mid = self._mid_price(idx)
+        spread_bps = float(self.spread_bps[idx])
+        half_spread = mid * spread_bps * 1e-4 / 2.0
+        bid = mid - half_spread
+        ask = mid + half_spread
+        return bid, ask, mid
+
+    def _apply_deltas(self, bid: float, ask: float, mid: float, action: Any) -> Tuple[float, float]:
+        bid_delta_bps, ask_delta_bps = self._parse_action(action)
+        bid += mid * bid_delta_bps * 1e-4
+        ask += mid * ask_delta_bps * 1e-4
+        return bid, ask
+
+    def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
+        best_bid = float(self.best_bid[idx])
+        best_ask = float(self.best_ask[idx])
+        bid = min(bid, best_bid)
+        ask = max(ask, best_ask)
+        if bid >= ask:
+            bid = best_bid
+            ask = best_ask
+        return bid, ask
+
+    def _apply_fills(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
+        if not bool(self.snapshot_mask[idx]):
+            return 0.0, 0.0
+        best_bid = float(self.best_bid[idx])
+        best_ask = float(self.best_ask[idx])
+        buy_fill = 0.0
+        sell_fill = 0.0
+        if bid >= best_bid - self.fill_tolerance:
+            buy_fill = self.fill_size
+            self.cash -= bid * buy_fill
+            self.inventory += buy_fill
+        if ask <= best_ask + self.fill_tolerance:
+            sell_fill = self.fill_size
+            self.cash += ask * sell_fill
+            self.inventory -= sell_fill
+        return buy_fill, sell_fill
+
+    def _compute_penalty(self) -> float:
+        penalty = self.inventory_penalty * abs(self.inventory)
+        if self.max_inventory is not None and abs(self.inventory) > self.max_inventory:
+            penalty += self.inventory_penalty * (abs(self.inventory) - self.max_inventory)
+        return penalty
+
+    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
+        bid, ask, mid = self._baseline_quotes(self.idx)
+        bid, ask = self._apply_deltas(bid, ask, mid, action)
+        bid, ask = self._enforce_passive(bid, ask, self.idx)
+        buy_fill, sell_fill = self._apply_fills(bid, ask, self.idx)
+
+        equity = self.cash + self.inventory * mid
+        delta_equity = equity - self.prev_equity
+        rebate_notional = buy_fill * bid + sell_fill * ask
+        rebate = rebate_notional * self.maker_rebate_bps * 1e-4
+        penalty = self._compute_penalty()
+        reward = delta_equity + rebate - penalty
+
+        self.prev_equity = equity
+        self.total_reward += reward
+        self.idx += 1
+        done = self.idx >= self.n
+        next_obs = self._build_observation(self.idx - 1 if done else self.idx)
+        info = {
+            "reward": float(reward),
+            "total_reward": float(self.total_reward),
+            "cash": float(self.cash),
+            "inventory": float(self.inventory),
+            "equity": float(equity),
+            "delta_equity": float(delta_equity),
+            "rebate": float(rebate),
+            "penalty": float(penalty),
+            "bid": float(bid),
+            "ask": float(ask),
+            "buy_fill": float(buy_fill),
+            "sell_fill": float(sell_fill),
+        }
+        return next_obs, float(reward), done, info
+
+
 class TradingEnv:
     def __init__(self, batch: TradingBatch):
         self.features = batch.features
