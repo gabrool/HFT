@@ -827,6 +827,7 @@ class MarketMakingEnv:
         max_inventory: Optional[float] = None,
         fill_size: float = 1.0,
         fill_tolerance: float = 1e-6,
+        delta_bps_limit: Optional[float] = None,
     ):
         self.features = batch.features
         self.spread_bps = batch.spread_bps
@@ -841,6 +842,7 @@ class MarketMakingEnv:
         self.max_inventory = max_inventory
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
+        self.delta_bps_limit = delta_bps_limit
 
         self.n = len(self.spread_bps)
         self.idx = 0
@@ -886,6 +888,9 @@ class MarketMakingEnv:
 
     def _apply_deltas(self, bid: float, ask: float, mid: float, action: Any) -> Tuple[float, float]:
         bid_delta_bps, ask_delta_bps = self._parse_action(action)
+        if self.delta_bps_limit is not None:
+            bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
+            ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
         bid += mid * bid_delta_bps * 1e-4
         ask += mid * ask_delta_bps * 1e-4
         return bid, ask
@@ -1637,6 +1642,8 @@ def run_pipeline(
     fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "1.0"))
+    delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
+    delta_bps_limit = float(delta_bps_limit_str) if delta_bps_limit_str else None
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
@@ -1645,6 +1652,7 @@ def run_pipeline(
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
+        delta_bps_limit=delta_bps_limit,
     )
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
@@ -1653,6 +1661,7 @@ def run_pipeline(
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
+        delta_bps_limit=delta_bps_limit,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
@@ -1661,6 +1670,7 @@ def run_pipeline(
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
+        delta_bps_limit=delta_bps_limit,
     )
 
     mm_ppo_config = PPOConfig(
@@ -1698,6 +1708,7 @@ def run_pipeline(
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
+        delta_bps_limit=delta_bps_limit,
     )
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0))
 
@@ -1723,6 +1734,7 @@ def run_pipeline(
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
+        delta_bps_limit=delta_bps_limit,
     )
     rl_metrics = evaluate_market_making(rl_env, rl_policy_fn)
 
