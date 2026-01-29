@@ -1265,22 +1265,6 @@ def run_pipeline(
 
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
 
-    joined_train = build_joined_split(
-        out_root,
-        splits["train"],
-        model,
-        meta,
-        device,
-        split_label="train",
-    )
-    joined_val = build_joined_split(
-        out_root,
-        splits["val"],
-        model,
-        meta,
-        device,
-        split_label="val",
-    )
     joined_test = build_joined_split(
         out_root,
         splits["test"],
@@ -1300,15 +1284,8 @@ def run_pipeline(
         },
     )
 
-    joined = {
-        key: np.concatenate([joined_train[key], joined_val[key], joined_test[key]], axis=0)
-        for key in joined_train.keys()
-    }
-    order = np.argsort(joined["ts"])
-    joined = {key: value[order] for key, value in joined.items()}
-
-    splits_rl = chronological_split(joined, ratios=(0.6, 0.2, 0.2))
-    persist_split_bounds(out_root, splits_rl["bounds"], total=len(joined["ts"]))
+    splits_rl = chronological_split(joined_test, ratios=(0.6, 0.2, 0.2))
+    persist_split_bounds(out_root, splits_rl["bounds"], total=len(joined_test["ts"]))
 
     def _to_env(split: Dict[str, np.ndarray]) -> TradingEnv:
         returns = split["y"][:, 0]
