@@ -516,7 +516,6 @@ def align_snapshots_to_decisions(
     decision_ts: np.ndarray,
     snapshot_ts: np.ndarray,
     snapshots: np.ndarray,
-    tolerance_ms: int = 50,
     label: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if snapshot_ts.ndim != 1:
@@ -531,56 +530,32 @@ def align_snapshots_to_decisions(
     if snapshot_ts.size and np.any(np.diff(snapshot_ts) < 0):
         raise ValueError("snapshot_ts must be monotonically non-decreasing after sorting")
     insert_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
-    right_idx = np.clip(insert_idx, 0, len(snapshot_ts) - 1)
-    left_idx = np.clip(insert_idx - 1, 0, len(snapshot_ts) - 1)
-    left_diff = np.abs(snapshot_ts[left_idx] - decision_ts)
-    right_diff = np.abs(snapshot_ts[right_idx] - decision_ts)
-    choose_right = right_diff < left_diff
-    idx = np.where(choose_right, right_idx, left_idx)
-    aligned = snapshots[idx]
-    delta = snapshot_ts[idx] - decision_ts
-    abs_delta = np.abs(delta)
-    mask = abs_delta <= tolerance_ms
-    match_rate = float(np.mean(mask)) if mask.size else 0.0
+    valid = insert_idx < len(snapshot_ts)
+    matched = valid & (snapshot_ts[insert_idx] == decision_ts)
+    aligned = np.full((decision_ts.shape[0], snapshots.shape[1]), np.nan, dtype=np.float32)
+    if np.any(matched):
+        aligned[matched] = snapshots[insert_idx[matched]].astype(np.float32)
+    match_rate = float(np.mean(matched)) if matched.size else 0.0
     if label:
-        median_dt = float(np.median(delta)) if delta.size else float("nan")
-        median_abs_dt = float(np.median(abs_delta)) if abs_delta.size else float("nan")
         print(
             "[snapshot alignment]",
             f"split={label}",
             f"match_rate={match_rate:.6f}",
-            f"median_dt={median_dt:.1f}ms",
-            f"median_abs_dt={median_abs_dt:.1f}ms",
-            f"tolerance={tolerance_ms}ms",
+            "mode=exact",
         )
-    if not np.all(mask):
-        mismatch_delta = delta[~mask]
-        mismatch_abs = abs_delta[~mask]
-        sample_count = min(5, mismatch_delta.size)
-        sample_indices = np.flatnonzero(~mask)[:sample_count]
+    if not np.all(matched):
+        mismatch_idx = np.flatnonzero(~matched)
+        sample_count = min(5, mismatch_idx.size)
         samples = [
-            (int(decision_ts[i]), int(snapshot_ts[idx[i]]), int(delta[i]))
-            for i in sample_indices
+            int(decision_ts[i])
+            for i in mismatch_idx[:sample_count]
         ]
-        print(
-            "[snapshot alignment] mismatches:",
-            f"count={mismatch_delta.size}",
-            f"match_rate={match_rate:.6f}",
-            f"min_dt={mismatch_delta.min():.1f}ms",
-            f"max_dt={mismatch_delta.max():.1f}ms",
-            f"median_dt={float(np.median(mismatch_delta)):.1f}ms",
-            f"min_abs_dt={float(mismatch_abs.min()):.1f}ms",
-            f"max_abs_dt={float(mismatch_abs.max()):.1f}ms",
-            f"median_abs_dt={float(np.median(mismatch_abs)):.1f}ms",
-            f"samples={samples}",
+        raise ValueError(
+            "Exact snapshot alignment failed; "
+            f"missing={mismatch_idx.size} match_rate={match_rate:.6f} "
+            f"samples={samples}"
         )
-    assert match_rate >= 0.995, (
-        f"Snapshot match rate {match_rate:.6f} below 0.995 "
-        f"(tolerance={tolerance_ms}ms)."
-    )
-    aligned = aligned.astype(np.float32)
-    aligned[~mask] = np.nan
-    return aligned, mask
+    return aligned, matched
 
 
 def _resolve_horizon_indices(meta: dict, targets: Iterable[int]) -> Dict[int, int]:
