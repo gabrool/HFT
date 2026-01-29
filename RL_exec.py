@@ -43,3 +43,17 @@ def iter_chunk_batches(out_root: str):
             y = np.load(week_dir / files["y"])
             ts = np.load(week_dir / files["ts"])
             yield week, int(entry.get("chunk", 0)), ts, x_core, x_aux, y
+
+
+def spread_bps_from_vol_pred(vol_pred, spread_mult=1.0):
+    """
+    Convert model vol predictions into a spread size in basis points.
+
+    vol_pred is trained against y_logvol (log volatility), so we recover
+    sigma by exponentiating the log-vol and then scale to bps.
+    If the model ever switches to predicting log-variance, use
+    sigma = exp(0.5 * logvar) instead.
+    """
+    sigma = np.exp(vol_pred)
+    sigma_bps = 1e4 * sigma
+    return spread_mult * sigma_bps
