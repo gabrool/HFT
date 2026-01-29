@@ -827,6 +827,7 @@ def train_from_offline():
                 primary_metric_value, primary_metric_label = compute_primary_metric(
                     val_auc_masked,
                     val_ret_loss_masked_per_h,
+                    val_vol_loss_masked_per_h,
                 )
                 if math.isfinite(primary_metric_value):
                     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
@@ -834,9 +835,13 @@ def train_from_offline():
                     masked_ret_loss = (
                         float(val_ret_loss_masked_per_h[idx]) if idx < len(val_ret_loss_masked_per_h) else float("nan")
                     )
+                    masked_vol_loss = (
+                        float(val_vol_loss_masked_per_h[idx]) if idx < len(val_vol_loss_masked_per_h) else float("nan")
+                    )
                     print(
                         f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
                         f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={masked_ret_loss:.6f}, "
+                        f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={masked_vol_loss:.6f}, "
                         f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={masked_auc:.6f}]"
                     )
                     scheduler.step(primary_metric_value)
