@@ -22,6 +22,15 @@ RAW_SNAPSHOT_PATHS = [
 RAW_SNAPSHOT_EXPECTED_STEP_MS = 100
 RAW_SNAPSHOT_TOLERANCE_MS = 20
 RAW_SNAPSHOT_MAX_IRREGULAR_FRAC = 0.05
+RAW_SNAPSHOT_FEATURE_COLUMNS = [
+    "best_bid",
+    "best_ask",
+    "mid",
+    "spread_bps",
+    "mid_ret_1",
+    "vol_short",
+    "vol_long",
+]
 SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
 
@@ -497,10 +506,15 @@ def report_pretrain_diagnostics(out_root: str, splits: Dict[str, Dict[str, int]]
         f"Test split duration {duration_ms}ms not ~3.5 days."
     )
 
-    snapshot_ts, _snapshots = load_raw_snapshots(out_root, test_split["week"])
-    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-    snapshot_ts = np.sort(snapshot_ts)
-    filtered = snapshot_ts[(snapshot_ts >= start_ms) & (snapshot_ts < end_ms)]
+    if RAW_SNAPSHOT_PATHS:
+        snapshot_df = load_raw_snapshot_features(out_root)
+        snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
+        filtered = snapshot_ts
+    else:
+        snapshot_ts, _snapshots = load_raw_snapshots(out_root, test_split["week"])
+        snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+        snapshot_ts = np.sort(snapshot_ts)
+        filtered = snapshot_ts[(snapshot_ts >= start_ms) & (snapshot_ts < end_ms)]
     if filtered.size == 0:
         raise ValueError("No raw snapshots found inside the CMSSL test split range.")
     _ensure_monotonic(filtered, "Raw snapshot (filtered)")
@@ -698,7 +712,18 @@ def build_joined_split(
 ) -> Dict[str, np.ndarray]:
     x_core, x_aux, y, ts = load_split_arrays(out_root, split)
     cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
-    snapshot_ts, snapshots = load_raw_snapshots(out_root, split["week"])
+    if RAW_SNAPSHOT_PATHS:
+        test_split = get_cmssl_splits(out_root)["test"]
+        if split != test_split:
+            raise ValueError(
+                "RAW_SNAPSHOT_PATHS only supports CMSSL test split alignment. "
+                f"Requested split={split} test_split={test_split}"
+            )
+        snapshot_df = load_raw_snapshot_features(out_root)
+        snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
+        snapshots = snapshot_df[RAW_SNAPSHOT_FEATURE_COLUMNS].to_numpy(dtype=np.float32)
+    else:
+        snapshot_ts, snapshots = load_raw_snapshots(out_root, split["week"])
     aligned_snapshots, snapshot_mask = align_snapshots_to_decisions(
         ts,
         snapshot_ts,
