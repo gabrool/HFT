@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -460,11 +461,63 @@ def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.nda
     raise ValueError(f"Unsupported raw snapshot layout in {path}")
 
 
+def _format_ts(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).isoformat()
+
+
+def _format_duration_ms(duration_ms: int) -> str:
+    seconds = duration_ms / 1000.0
+    minutes = seconds / 60.0
+    hours = minutes / 60.0
+    days = hours / 24.0
+    return f"{duration_ms}ms (~{days:.2f}d)"
+
+
+def _ensure_monotonic(ts: np.ndarray, label: str) -> None:
+    if ts.size and np.any(np.diff(ts) < 0):
+        raise ValueError(f"{label} timestamps must be monotonically non-decreasing.")
+
+
+def report_pretrain_diagnostics(out_root: str, splits: Dict[str, Dict[str, int]]) -> None:
+    test_split = splits["test"]
+    start_ms = int(test_split["start"])
+    end_ms = int(test_split["end"])
+    duration_ms = end_ms - start_ms
+    print(
+        "[cmssl split:test]",
+        f"week={test_split['week']}",
+        f"start={_format_ts(start_ms)}",
+        f"end={_format_ts(end_ms)}",
+        f"duration={_format_duration_ms(duration_ms)}",
+    )
+    expected_week_ms = 7 * 24 * 60 * 60 * 1000
+    expected_half_ms = int(expected_week_ms / 2.0)
+    tolerance_ms = 60 * 60 * 1000
+    assert abs(duration_ms - expected_half_ms) <= tolerance_ms, (
+        f"Test split duration {duration_ms}ms not ~3.5 days."
+    )
+
+    snapshot_ts, _snapshots = load_raw_snapshots(out_root, test_split["week"])
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshot_ts = np.sort(snapshot_ts)
+    filtered = snapshot_ts[(snapshot_ts >= start_ms) & (snapshot_ts < end_ms)]
+    if filtered.size == 0:
+        raise ValueError("No raw snapshots found inside the CMSSL test split range.")
+    _ensure_monotonic(filtered, "Raw snapshot (filtered)")
+    print(
+        "[raw snapshots:test]",
+        f"count={filtered.size}",
+        f"start={_format_ts(int(filtered[0]))}",
+        f"end={_format_ts(int(filtered[-1]))}",
+    )
+
+
 def align_snapshots_to_decisions(
     decision_ts: np.ndarray,
     snapshot_ts: np.ndarray,
     snapshots: np.ndarray,
     tolerance_ms: int = 50,
+    label: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
@@ -489,6 +542,17 @@ def align_snapshots_to_decisions(
     abs_delta = np.abs(delta)
     mask = abs_delta <= tolerance_ms
     match_rate = float(np.mean(mask)) if mask.size else 0.0
+    if label:
+        median_dt = float(np.median(delta)) if delta.size else float("nan")
+        median_abs_dt = float(np.median(abs_delta)) if abs_delta.size else float("nan")
+        print(
+            "[snapshot alignment]",
+            f"split={label}",
+            f"match_rate={match_rate:.6f}",
+            f"median_dt={median_dt:.1f}ms",
+            f"median_abs_dt={median_abs_dt:.1f}ms",
+            f"tolerance={tolerance_ms}ms",
+        )
     if not np.all(mask):
         mismatch_delta = delta[~mask]
         mismatch_abs = abs_delta[~mask]
@@ -604,11 +668,17 @@ def build_joined_split(
     meta: dict,
     device: str,
     batch_size: int = 256,
+    split_label: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     x_core, x_aux, y, ts = load_split_arrays(out_root, split)
     cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
     snapshot_ts, snapshots = load_raw_snapshots(out_root, split["week"])
-    aligned_snapshots, snapshot_mask = align_snapshots_to_decisions(ts, snapshot_ts, snapshots)
+    aligned_snapshots, snapshot_mask = align_snapshots_to_decisions(
+        ts,
+        snapshot_ts,
+        snapshots,
+        label=split_label,
+    )
     return join_features(ts, y, cmssl_out, aligned_snapshots, snapshot_mask, meta)
 
 
@@ -1216,11 +1286,34 @@ def run_pipeline(
     meta = load_global_meta(Path(out_root))
     splits = build_two_week_time_splits(out_root)
 
+    report_pretrain_diagnostics(out_root, splits)
+
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
 
-    joined_train = build_joined_split(out_root, splits["train"], model, meta, device)
-    joined_val = build_joined_split(out_root, splits["val"], model, meta, device)
-    joined_test = build_joined_split(out_root, splits["test"], model, meta, device)
+    joined_train = build_joined_split(
+        out_root,
+        splits["train"],
+        model,
+        meta,
+        device,
+        split_label="train",
+    )
+    joined_val = build_joined_split(
+        out_root,
+        splits["val"],
+        model,
+        meta,
+        device,
+        split_label="val",
+    )
+    joined_test = build_joined_split(
+        out_root,
+        splits["test"],
+        model,
+        meta,
+        device,
+        split_label="test",
+    )
 
     num_h = len(meta.get("horizons_ms", []))
     cmssl_report = report_cmssl_metrics(
