@@ -280,6 +280,35 @@ def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], 
     return tr, va, te
 
 
+def _sort_pairs_by_end(pairs: List[Tuple[str, str, str]]) -> List[Tuple[str, str, str]]:
+    rows = []
+    for wk, ob_p, th_p in pairs:
+        _start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
+        rows.append((end_dt, wk, ob_p, th_p))
+    rows.sort()
+    return [(wk, ob_p, th_p) for _end, wk, ob_p, th_p in rows]
+
+
+def _assert_two_consecutive_weeks(pairs: List[Tuple[str, str, str]]) -> Tuple[str, str]:
+    if len(pairs) != 2:
+        raise ValueError(f"Expected exactly two weeks after selection; got {len(pairs)}.")
+
+    (wk1, _ob1, _th1), (wk2, _ob2, _th2) = pairs
+    s1, e1, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk1}"))
+    s2, e2, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk2}"))
+
+    if e1 >= e2:
+        raise ValueError(
+            "Weeks must be in chronological order by end date: "
+            f"'{wk1}' ends {e1.date()} >= '{wk2}' ends {e2.date()}"
+        )
+    if s2.date() != (e1.date() + timedelta(days=1)):
+        raise ValueError(
+            "Weeks must be consecutive (no gaps/overlaps): "
+            f"'{wk1}' ({s1.date()}–{e1.date()}) then '{wk2}' ({s2.date()}–{e2.date()})"
+        )
+    return wk1, wk2
+
 
 def _event_ts(event) -> int:
     """Extract the first integer-like timestamp from an event tuple."""
@@ -1066,6 +1095,37 @@ def process_all(
                 "files": dict(entry.get("files", {})),
             })
 
+    split_ranges = None
+    if split_info and len(weeks_in_order) == 2:
+        wk1, wk2 = weeks_in_order
+        week2_meta = week_meta_records.get(wk2)
+        if not week2_meta or "decision_ts_range" not in week2_meta:
+            raise ValueError(
+                f"Missing decision_ts_range for week '{wk2}'; cannot derive val/test split ranges."
+            )
+        decision_range = week2_meta["decision_ts_range"]
+        min_ts = int(decision_range["min"])
+        max_ts = int(decision_range["max"])
+        if max_ts <= min_ts:
+            raise ValueError(
+                f"Week '{wk2}' decision_ts_range invalid: min={min_ts} max={max_ts}"
+            )
+        span_ms = max_ts - min_ts
+        expected_ms = int(timedelta(days=7).total_seconds() * 1000)
+        tolerance_ms = int(timedelta(hours=12).total_seconds() * 1000)
+        if not (expected_ms - tolerance_ms <= span_ms <= expected_ms + tolerance_ms):
+            raise AssertionError(
+                f"Week '{wk2}' decision_ts_range span {span_ms}ms "
+                f"not within ~7 days ({expected_ms}±{tolerance_ms}ms)."
+            )
+        midpoint = min_ts + span_ms // 2
+        split_ranges = {
+            "train_week": wk1,
+            "holdout_week": wk2,
+            "val_ts_range": {"min": min_ts, "max": midpoint},
+            "test_ts_range": {"min": midpoint, "max": max_ts},
+        }
+
     meta = {
         "dataset_start": start_iso,
         "dataset_end": end_iso,
@@ -1092,9 +1152,9 @@ def process_all(
     if pca_var_ratio is not None:
         meta["pca"]["explained_variance_ratio"] = [float(x) for x in pca_var_ratio]
     if split_info:
-        meta["splits"] = {
-            key: list(vals) for key, vals in split_info.items()
-        }
+        meta["splits"] = {key: list(vals) for key, vals in split_info.items()}
+        if split_ranges:
+            meta["splits"].update(split_ranges)
     with open(os.path.join(out_root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -1123,6 +1183,10 @@ def main():
     requested_weeks = _parse_requested_weeks(RAW_BYBIT_WEEKS)
 
     if requested_weeks:
+        if len(requested_weeks) != 2:
+            raise ValueError(
+                f"BYBIT_WEEKS must specify exactly two weeks; got {len(requested_weeks)}."
+            )
         week_lookup = {wk for wk, _ob, _th in pairs}
         missing = [wk for wk in requested_weeks if wk not in week_lookup]
         if missing:
@@ -1148,7 +1212,16 @@ def main():
 
         pairs = _slice_last_weeks_pairs(pairs, last_week_end, KEEP_WEEKS)
 
+    pairs = _sort_pairs_by_end(pairs)
+    if len(pairs) < 2:
+        raise ValueError(
+            f"Need at least two weeks of data after selection; found {len(pairs)}."
+        )
+    if len(pairs) > 2:
+        pairs = pairs[-2:]
+
     _assert_week_order(pairs)
+    _assert_two_consecutive_weeks(pairs)
 
     chosen_weeks = [wk for wk, _ob, _th in pairs]
 
