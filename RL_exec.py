@@ -31,8 +31,21 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "vol_short",
     "vol_long",
 ]
+FEATURE_EXTRA_DIM = 5
 SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
+DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
+DEFAULT_MM_VOL_HORIZON_MS = 1000
+DEFAULT_MM_S_MIN_BPS = 0.0
+DEFAULT_MM_K_SIGMA = 0.5
+DEFAULT_MM_K_INV = 0.0
+DEFAULT_MM_K_ALPHA = 1.0
+DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
+DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
+DEFAULT_MM_INV_REF_NOTIONAL = 1.0
+DEFAULT_MM_P250_WEIGHT = 0.0
+DEFAULT_MM_P500_WEIGHT = 0.0
+DEFAULT_MM_P1000_WEIGHT = 1.0
 
 
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
@@ -160,12 +173,82 @@ def alpha_from_probs(p_up: np.ndarray, sigma_bps: np.ndarray) -> np.ndarray:
     return (p_up - 0.5) * 2.0 * sigma_bps
 
 
-def half_spread(mid: float, spread_bps: float) -> float:
-    return mid * spread_bps * 1e-4 / 2.0
+def bps_to_px(mid: float, bps: float) -> float:
+    return mid * bps * 1e-4
 
 
-def skew(mid: float, alpha_bps: float) -> float:
-    return mid * alpha_bps * 1e-4
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    return float(raw) if raw else float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else int(default)
+
+
+def _env_int_list(name: str, default: List[int]) -> List[int]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return list(default)
+    return [int(item) for item in raw.split(",") if item.strip()]
+
+
+@dataclass(frozen=True)
+class BaselineQuoteConfig:
+    s_min_bps: float
+    k_sigma: float
+    k_inv: float
+    k_alpha: float
+    spread_floor_bps: float
+    spread_cap_bps: float
+    inv_ref_notional: float
+    vol_horizon_ms: int
+    horizons_ms: List[int]
+    p250_weight: float
+    p500_weight: float
+    p1000_weight: float
+
+
+def load_baseline_quote_config() -> BaselineQuoteConfig:
+    return BaselineQuoteConfig(
+        s_min_bps=_env_float("BYBIT_MM_S_MIN_BPS", DEFAULT_MM_S_MIN_BPS),
+        k_sigma=_env_float("BYBIT_MM_K_SIGMA", DEFAULT_MM_K_SIGMA),
+        k_inv=_env_float("BYBIT_MM_K_INV", DEFAULT_MM_K_INV),
+        k_alpha=_env_float("BYBIT_MM_K_ALPHA", DEFAULT_MM_K_ALPHA),
+        spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
+        spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
+        inv_ref_notional=_env_float("BYBIT_MM_INV_REF_NOTIONAL", DEFAULT_MM_INV_REF_NOTIONAL),
+        vol_horizon_ms=_env_int("BYBIT_MM_VOL_HORIZON_MS", DEFAULT_MM_VOL_HORIZON_MS),
+        horizons_ms=_env_int_list("BYBIT_MM_HORIZONS_MS", DEFAULT_MM_HORIZONS_MS),
+        p250_weight=_env_float("BYBIT_MM_P250_WEIGHT", DEFAULT_MM_P250_WEIGHT),
+        p500_weight=_env_float("BYBIT_MM_P500_WEIGHT", DEFAULT_MM_P500_WEIGHT),
+        p1000_weight=_env_float("BYBIT_MM_P1000_WEIGHT", DEFAULT_MM_P1000_WEIGHT),
+    )
+
+
+def _infer_num_horizons(feature_dim: int) -> int:
+    base_dim = feature_dim - len(RAW_SNAPSHOT_FEATURE_COLUMNS) - FEATURE_EXTRA_DIM
+    if base_dim <= 0 or base_dim % 4 != 0:
+        raise ValueError(
+            "Feature dimension does not align with expected horizon layout: "
+            f"feature_dim={feature_dim} base_dim={base_dim}"
+        )
+    return base_dim // 4
+
+
+def _normalize_horizons(num_h: int, horizons: List[int]) -> List[int]:
+    if len(horizons) == num_h:
+        return list(horizons)
+    if len(horizons) > num_h:
+        return list(horizons[:num_h])
+    return list(range(num_h))
+
+
+def _resolve_horizon_index(target_ms: int, horizons: List[int], fallback_idx: int) -> int:
+    if target_ms in horizons:
+        return horizons.index(target_ms)
+    return min(fallback_idx, len(horizons) - 1)
 
 
 def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -843,6 +926,17 @@ class MarketMakingEnv:
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
         self.delta_bps_limit = delta_bps_limit
+        self._baseline_cfg = load_baseline_quote_config()
+        self._num_h = _infer_num_horizons(self.features.shape[-1])
+        self._horizons_ms = _normalize_horizons(self._num_h, self._baseline_cfg.horizons_ms)
+        self._vol_horizon_idx = _resolve_horizon_index(
+            self._baseline_cfg.vol_horizon_ms,
+            self._horizons_ms,
+            fallback_idx=min(self._num_h - 1, 2),
+        )
+        self._p250_idx = _resolve_horizon_index(250, self._horizons_ms, fallback_idx=0)
+        self._p500_idx = _resolve_horizon_index(500, self._horizons_ms, fallback_idx=min(1, self._num_h - 1))
+        self._p1000_idx = _resolve_horizon_index(1000, self._horizons_ms, fallback_idx=min(2, self._num_h - 1))
 
         self.n = len(self.spread_bps)
         self.idx = 0
@@ -876,14 +970,36 @@ class MarketMakingEnv:
             return float(action), float(action)
         raise ValueError("Action must be a scalar or (bid_delta_bps, ask_delta_bps).")
 
+    def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
+        return self.features[idx, start:end]
+
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
+        cfg = self._baseline_cfg
         mid = self._mid_price(idx)
-        spread_bps = float(self.spread_bps[idx])
-        alpha_bps = float(self.alpha_bps[idx])
-        baseline_half_spread = half_spread(mid, spread_bps)
-        baseline_skew = skew(mid, alpha_bps)
-        bid = mid - baseline_half_spread + baseline_skew
-        ask = mid + baseline_half_spread + baseline_skew
+        vol_pred = self._feature_slice(idx, self._num_h, 2 * self._num_h)
+        p_up = self._feature_slice(idx, 3 * self._num_h, 4 * self._num_h)
+        sigma_bps = 1e4 * float(sigma_from_vol(vol_pred[self._vol_horizon_idx]))
+        p250 = float(p_up[self._p250_idx])
+        p500 = float(p_up[self._p500_idx])
+        p1000 = float(p_up[self._p1000_idx])
+        weight_sum = cfg.p250_weight + cfg.p500_weight + cfg.p1000_weight
+        if weight_sum > 0.0:
+            p_weighted = (
+                cfg.p250_weight * p250 + cfg.p500_weight * p500 + cfg.p1000_weight * p1000
+            ) / weight_sum
+        else:
+            p_weighted = 0.5
+        alpha = (p_weighted - 0.5) * 2.0 * sigma_bps
+        half_spread_bps = cfg.s_min_bps + cfg.k_sigma * sigma_bps
+        half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+        inv_ref = cfg.inv_ref_notional if cfg.inv_ref_notional > 0.0 else 1.0
+        inv_notional = self.inventory * mid
+        skew_bps = cfg.k_inv * (inv_notional / inv_ref) - cfg.k_alpha * alpha
+        half_spread_px = bps_to_px(mid, half_spread_bps)
+        skew_px = bps_to_px(mid, skew_bps)
+        # Plan: spread = s_min + k_sigma*sigma (floored/capped), skew = k_inv*inv - k_alpha*alpha.
+        bid = mid - half_spread_px - skew_px
+        ask = mid + half_spread_px - skew_px
         return bid, ask, mid
 
     def _apply_deltas(self, bid: float, ask: float, mid: float, action: Any) -> Tuple[float, float]:
