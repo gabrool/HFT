@@ -593,6 +593,7 @@ def join_features(
         "spread_bps": spread_bps.astype(np.float32),
         "alpha_bps": alpha_bps.astype(np.float32),
         "snapshot_mask": snapshot_mask.astype(np.bool_),
+        "snapshots": snapshots.astype(np.float32),
     }
 
 
@@ -876,6 +877,15 @@ class PolicyValueNet(nn.Module):
         return logits, value
 
 
+class MarketPolicyNet(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: Iterable[int] = (128, 128)):
+        super().__init__()
+        self.net = MLP(input_dim, hidden_dims, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 @dataclass
 class PPOConfig:
     gamma: float = 0.99
@@ -1072,12 +1082,137 @@ def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -
     }
 
 
+def _fill_forward(arr: np.ndarray) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    out = arr.copy()
+    isnan = np.isnan(out)
+    if not np.any(isnan):
+        return out
+    idx = np.where(~isnan, np.arange(out.size), 0)
+    np.maximum.accumulate(idx, out=idx)
+    out = out[idx]
+    if np.isnan(out[0]):
+        first_valid = np.flatnonzero(~isnan)
+        if first_valid.size:
+            out[: first_valid[0]] = out[first_valid[0]]
+    return out
+
+
+def build_market_batch(split: Dict[str, np.ndarray]) -> MarketMakingBatch:
+    snapshots = split.get("snapshots")
+    if snapshots is None:
+        raise ValueError("snapshots missing from split data; ensure join_features stores snapshots.")
+    if snapshots.ndim != 2 or snapshots.shape[1] < 2:
+        raise ValueError(f"Expected snapshots with >=2 columns, got {snapshots.shape}")
+    best_bid = snapshots[:, 0].astype(np.float32)
+    best_ask = snapshots[:, 1].astype(np.float32)
+    best_bid = _fill_forward(best_bid)
+    best_ask = _fill_forward(best_ask)
+    return MarketMakingBatch(
+        features=split["features"],
+        spread_bps=split["spread_bps"],
+        best_bid=best_bid,
+        best_ask=best_ask,
+        alpha_bps=split.get("alpha_bps"),
+        snapshot_mask=split.get("snapshot_mask"),
+    )
+
+
+def _inventory_distribution(inventory: np.ndarray) -> Dict[str, float]:
+    if inventory.size == 0:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0, "p05": 0.0, "p50": 0.0, "p95": 0.0}
+    return {
+        "min": float(np.min(inventory)),
+        "max": float(np.max(inventory)),
+        "mean": float(np.mean(inventory)),
+        "std": float(np.std(inventory)),
+        "p05": float(np.quantile(inventory, 0.05)),
+        "p50": float(np.quantile(inventory, 0.50)),
+        "p95": float(np.quantile(inventory, 0.95)),
+    }
+
+
+def evaluate_market_making(
+    env: MarketMakingEnv,
+    policy_fn,
+) -> Dict[str, Any]:
+    obs = env.reset()
+    equity_curve: List[float] = []
+    inventory_curve: List[float] = []
+    turnover = 0.0
+    fill_count = 0
+    fill_opps = 0
+    initial_equity = env.prev_equity
+
+    done = False
+    while not done:
+        action = policy_fn(obs)
+        obs, _reward, done, info = env.step(action)
+        equity_curve.append(info["equity"])
+        inventory_curve.append(info["inventory"])
+        turnover += abs(info["buy_fill"]) + abs(info["sell_fill"])
+        fill_count += int(info["buy_fill"] > 0.0) + int(info["sell_fill"] > 0.0)
+        if env.snapshot_mask[env.idx - 1]:
+            fill_opps += 2
+
+    equity_arr = np.array(equity_curve, dtype=np.float32)
+    returns = np.diff(np.concatenate([[initial_equity], equity_arr]))
+    sharpe = compute_sharpe(returns)
+    max_drawdown = compute_max_drawdown(returns)
+    fill_rate = float(fill_count / fill_opps) if fill_opps > 0 else 0.0
+    inventory_arr = np.array(inventory_curve, dtype=np.float32)
+
+    return {
+        "equity_curve": equity_arr,
+        "sharpe": sharpe,
+        "max_drawdown": max_drawdown,
+        "turnover": float(turnover),
+        "fill_rate": fill_rate,
+        "inventory_distribution": _inventory_distribution(inventory_arr),
+    }
+
+
+def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
+    inv = metrics["inventory_distribution"]
+    return (
+        f"{label}: sharpe={metrics['sharpe']:.4f} "
+        f"max_dd={metrics['max_drawdown']:.4f} "
+        f"turnover={metrics['turnover']:.4f} "
+        f"fill_rate={metrics['fill_rate']:.4f} "
+        f"inv[min={inv['min']:.2f}, p50={inv['p50']:.2f}, max={inv['max']:.2f}]"
+    )
+
+
+def load_market_policy(
+    input_dim: int,
+    device: str = "cuda",
+    ckpt_path: Optional[str] = None,
+) -> Optional[MarketPolicyNet]:
+    if not ckpt_path:
+        return None
+    path = Path(ckpt_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
+    ckpt = torch.load(path, map_location=device)
+    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    hidden_dims = ckpt.get("hidden_dims") if isinstance(ckpt, dict) else None
+    if hidden_dims is None:
+        hidden_dims = tuple(
+            int(x) for x in os.environ.get("BYBIT_MM_POLICY_HIDDEN", "128,128").split(",")
+        )
+    model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims).to(device)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    return model
+
+
 def run_pipeline(
     out_root: str,
     ckpt_path: str,
     device: str = "cuda",
     ppo_epochs: int = 10,
-) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, Any]:
     meta = load_global_meta(Path(out_root))
     splits = build_two_week_time_splits(out_root)
 
@@ -1151,11 +1286,62 @@ def run_pipeline(
     val_report = evaluate_policy(val_env, ppo_model, device=device)
     test_report = evaluate_policy(test_env, ppo_model, device=device)
 
+    mm_batch = build_market_batch(splits_rl["test"])
+    mm_obs_dim = mm_batch.features.shape[-1] + 4
+    maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
+    inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
+    max_inventory_str = os.environ.get("BYBIT_MM_MAX_INVENTORY", "").strip()
+    max_inventory = float(max_inventory_str) if max_inventory_str else None
+    fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
+    fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
+    delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "1.0"))
+
+    baseline_env = MarketMakingEnv(
+        mm_batch,
+        maker_rebate_bps=maker_rebate_bps,
+        inventory_penalty=inventory_penalty,
+        max_inventory=max_inventory,
+        fill_size=fill_size,
+        fill_tolerance=fill_tolerance,
+    )
+    baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0))
+
+    mm_policy_path = os.environ.get("BYBIT_MM_RL_CKPT", "").strip()
+    mm_policy = load_market_policy(mm_obs_dim, device=device, ckpt_path=mm_policy_path or None)
+    if mm_policy is None:
+        print("[mm eval] no BYBIT_MM_RL_CKPT provided; using baseline deltas for RL run.")
+        rl_policy_fn = lambda _obs: (0.0, 0.0)
+        rl_policy_loaded = False
+    else:
+        rl_policy_loaded = True
+
+        def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float]:
+            obs_t = torch.from_numpy(obs).float().to(device)
+            with torch.no_grad():
+                deltas = mm_policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
+            return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale)
+
+    rl_env = MarketMakingEnv(
+        mm_batch,
+        maker_rebate_bps=maker_rebate_bps,
+        inventory_penalty=inventory_penalty,
+        max_inventory=max_inventory,
+        fill_size=fill_size,
+        fill_tolerance=fill_tolerance,
+    )
+    rl_metrics = evaluate_market_making(rl_env, rl_policy_fn)
+
+    print("[mm eval]", _format_mm_summary("baseline", baseline_metrics))
+    print("[mm eval]", _format_mm_summary("baseline+rl", rl_metrics))
+
     return {
         "cmssl_test": cmssl_report,
         "ppo_val": val_report,
         "ppo_val_best": best_val,
         "ppo_test": test_report,
+        "mm_baseline": baseline_metrics,
+        "mm_rl": rl_metrics,
+        "mm_rl_policy_loaded": {"loaded": rl_policy_loaded},
     }
 
 
