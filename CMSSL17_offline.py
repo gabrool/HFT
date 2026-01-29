@@ -30,7 +30,6 @@ This script attempts to *import* model and utils from CMSSL17.py to avoid duplic
 """
 
 import os, sys, json, math, gc, glob, re
-from dataclasses import dataclass
 from typing import List, Dict, Tuple, Iterable, Optional
 from pathlib import Path
 import numpy as np
@@ -38,6 +37,15 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+
+from offline_tokens import (
+    read_json,
+    load_global_meta,
+    resolve_week_meta_paths,
+    ChunkRef,
+    build_chunk_refs,
+    slice_week_chunks,
+)
 
 # ---------------- Import from CMSSL17 ----------------
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,34 +80,6 @@ WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
-# ---------------- Helper: read meta ----------------
-def read_json(path: Path) -> dict:
-    with open(path, "r") as f:
-        return json.load(f)
-
-def load_global_meta(out_root: Path) -> dict:
-    meta_path = out_root / "meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(f"Not found: {meta_path}. Did you run offline_ingest.py?")
-    meta = read_json(meta_path)
-    # sanity
-    assert isinstance(meta.get("weeks", []), list) or isinstance(meta.get("week_counts", {}), dict), "Malformed meta.json"
-    return meta
-
-def resolve_week_meta_paths(out_root: Path, meta: dict) -> List[Path]:
-    w2m = meta.get("weeks_meta", {})
-    weeks = meta.get("weeks", [])
-    if w2m and weeks:
-        # preferred path: explicit mapping and ordered list provided
-        return [out_root / w2m[w] for w in weeks if w in w2m]
-    # fallback: scan each week dir
-    paths = []
-    for w in weeks:
-        p = out_root / w / "meta_week.json"
-        if p.exists():
-            paths.append(p)
-    return paths
-
 def choose_splits(week_meta_paths: List[Path]) -> Tuple[List[Path], List[Path], List[Path]]:
     weeks = week_meta_paths
     if len(weeks) >= 10:
@@ -115,72 +95,6 @@ def choose_splits(week_meta_paths: List[Path]) -> Tuple[List[Path], List[Path], 
         va = weeks[n_tr:n_tr + n_va]
         te = weeks[n_tr + n_va:]
     return tr, va, te
-
-# ---------------- Chunk refs ----------------
-@dataclass
-class ChunkRef:
-    week_dir: Path
-    core_file: Path
-    aux_file: Path
-    y_file: Path
-    n: int
-    offset: int = 0
-
-def build_chunk_refs(meta_week_path: Path) -> List[ChunkRef]:
-    wmeta = read_json(meta_week_path)
-    week_dir = meta_week_path.parent
-    refs: List[ChunkRef] = []
-    for ch in wmeta.get("chunks", []):
-        files = ch["files"]
-        refs.append(ChunkRef(
-            week_dir=week_dir,
-            core_file=week_dir / files["core"],
-            aux_file=week_dir / files["aux"],
-            y_file=week_dir / files["y"],
-            n=int(ch["n"]),
-            offset=0,
-        ))
-    return refs
-
-def slice_week_chunks(meta_week_path: Path, start_idx: int, end_idx: int) -> List[ChunkRef]:
-    """
-    Build ChunkRefs that cover only [start_idx, end_idx) of a given week,
-    assuming chunks are in chronological order.
-    """
-    assert 0 <= start_idx <= end_idx
-    wmeta = read_json(meta_week_path)
-    week_dir = meta_week_path.parent
-    chunks = wmeta.get("chunks", [])
-    refs: List[ChunkRef] = []
-
-    cursor = 0  # global index of first row in current chunk
-    for ch in chunks:
-        ch_n = int(ch["n"])
-        chunk_start = cursor
-        chunk_end = cursor + ch_n
-
-        # intersection with [start_idx, end_idx)
-        s = max(start_idx, chunk_start)
-        e = min(end_idx, chunk_end)
-        if e > s:
-            offset_in_chunk = s - chunk_start
-            n_here = e - s
-            files = ch["files"]
-            refs.append(ChunkRef(
-                week_dir=week_dir,
-                core_file=week_dir / files["core"],
-                aux_file=week_dir / files["aux"],
-                y_file=week_dir / files["y"],
-                n=n_here,
-                offset=offset_in_chunk,
-            ))
-
-        cursor = chunk_end
-        if cursor >= end_idx:
-            break
-
-    return refs
-
 
 # ---------------- Dataset (streaming from .npy chunks) ----------------
 class NpyChunksDataset(Dataset):

@@ -1,11 +1,12 @@
-import json, torch
+import torch
 import numpy as np
 from pathlib import Path
 from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK
+from offline_tokens import iter_week_chunks, load_global_meta
 
 def load_cmssl(out_root: str, ckpt_path: str, device="cuda"):
     out_root = Path(out_root)
-    meta = json.loads((out_root / "meta.json").read_text())
+    meta = load_global_meta(out_root)
     feat_dim = int(meta["feature_dim_total"])  # includes AUX_DIM already
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, feat_dim, LOOKBACK)
@@ -29,13 +30,8 @@ def cmssl_predict(model, x_core, x_aux, device="cuda"):
 
 def iter_chunk_batches(out_root: str):
     out_root = Path(out_root)
-    meta = json.loads((out_root / "meta.json").read_text())
-    for week in meta.get("weeks", []):
-        week_dir = out_root / week
-        week_meta_path = week_dir / "meta_week.json"
-        if not week_meta_path.exists():
-            continue
-        week_meta = json.loads(week_meta_path.read_text())
+    meta = load_global_meta(out_root)
+    for week, week_meta, week_dir in iter_week_chunks(out_root, meta=meta):
         for entry in week_meta.get("chunks", []):
             files = entry.get("files", {})
             x_core = np.load(week_dir / files["core"])
