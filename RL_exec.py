@@ -931,6 +931,27 @@ class MarketPolicyNet(nn.Module):
         return self.net(x)
 
 
+class MarketPolicyValueNet(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        policy_hidden: Iterable[int] = (128, 128),
+        value_hidden: Iterable[int] = (128, 128),
+        action_dim: int = 2,
+        init_log_std: float = -0.5,
+    ):
+        super().__init__()
+        self.policy_net = MLP(input_dim, policy_hidden, action_dim)
+        self.value_net = MLP(input_dim, value_hidden, 1)
+        self.log_std = nn.Parameter(torch.full((action_dim,), init_log_std))
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean = self.policy_net(x)
+        value = self.value_net(x).squeeze(-1)
+        log_std = torch.clamp(self.log_std, min=-6.0, max=2.0)
+        return mean, log_std, value
+
+
 @dataclass
 class PPOConfig:
     gamma: float = 0.99
@@ -1034,6 +1055,88 @@ def ppo_update(
             loss.backward()
             optimizer.step()
 
+
+def collect_market_rollout(
+    env: MarketMakingEnv,
+    model: MarketPolicyValueNet,
+    device: str,
+    delta_scale: float = 1.0,
+) -> Dict[str, torch.Tensor]:
+    obs_list = []
+    action_list = []
+    logp_list = []
+    value_list = []
+    reward_list = []
+    done_list = []
+
+    obs = env.reset()
+    done = False
+    while not done:
+        obs_t = torch.from_numpy(obs).float().to(device)
+        mean, log_std, value = model(obs_t.unsqueeze(0))
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mean, std)
+        action = dist.sample()
+        logp = dist.log_prob(action).sum(dim=-1)
+        scaled_action = (action.squeeze(0) * delta_scale).cpu().numpy()
+        next_obs, reward, done, _info = env.step(scaled_action)
+
+        obs_list.append(obs_t)
+        action_list.append(action.squeeze(0))
+        logp_list.append(logp.squeeze(0))
+        value_list.append(value.squeeze(0))
+        reward_list.append(torch.tensor(reward, dtype=torch.float32, device=device))
+        done_list.append(torch.tensor(done, dtype=torch.float32, device=device))
+        obs = next_obs
+
+    return {
+        "obs": torch.stack(obs_list),
+        "actions": torch.stack(action_list),
+        "logp": torch.stack(logp_list),
+        "values": torch.stack(value_list),
+        "rewards": torch.stack(reward_list),
+        "dones": torch.stack(done_list),
+    }
+
+
+def ppo_update_market(
+    model: MarketPolicyValueNet,
+    optimizer: optim.Optimizer,
+    rollout: Dict[str, torch.Tensor],
+    config: PPOConfig,
+    device: str,
+):
+    obs = rollout["obs"].to(device)
+    actions = rollout["actions"].to(device)
+    old_logp = rollout["logp"].detach().to(device)
+    values = rollout["values"].detach().to(device)
+    rewards = rollout["rewards"].to(device)
+    dones = rollout["dones"].to(device)
+
+    advantages, returns = compute_gae(rewards, values, dones, config.gamma, config.gae_lambda)
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    n = obs.shape[0]
+    indices = torch.arange(n)
+    for _ in range(config.update_epochs):
+        perm = indices[torch.randperm(n)]
+        for start in range(0, n, config.batch_size):
+            mb_idx = perm[start:start + config.batch_size]
+            mean, log_std, value = model(obs[mb_idx])
+            std = log_std.exp()
+            dist = torch.distributions.Normal(mean, std)
+            logp = dist.log_prob(actions[mb_idx]).sum(dim=-1)
+            ratio = torch.exp(logp - old_logp[mb_idx])
+            clip_adv = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * advantages[mb_idx]
+            policy_loss = -(torch.min(ratio * advantages[mb_idx], clip_adv)).mean()
+            value_loss = nn.functional.mse_loss(value, returns[mb_idx])
+            entropy_loss = dist.entropy().sum(dim=-1).mean()
+            loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
 def compute_sharpe(returns: np.ndarray) -> float:
     if returns.size == 0:
         return 0.0
@@ -1111,6 +1214,68 @@ def evaluate_policy(env: TradingEnv, model: PolicyValueNet, device: str = "cuda"
         "sharpe": compute_sharpe(rewards_arr),
         "max_drawdown": compute_max_drawdown(rewards_arr),
     }
+
+
+def evaluate_market_policy(
+    env: MarketMakingEnv,
+    policy: MarketPolicyNet,
+    device: str = "cuda",
+    delta_scale: float = 1.0,
+) -> Dict[str, Any]:
+    def _policy_fn(obs: np.ndarray) -> Tuple[float, float]:
+        obs_t = torch.from_numpy(obs).float().to(device)
+        with torch.no_grad():
+            deltas = policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
+        return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale)
+
+    return evaluate_market_making(env, _policy_fn)
+
+
+def train_market_ppo(
+    train_env: MarketMakingEnv,
+    val_env: MarketMakingEnv,
+    input_dim: int,
+    device: str = "cuda",
+    epochs: int = 10,
+    config: Optional[PPOConfig] = None,
+    ckpt_path: Optional[Path] = None,
+    delta_scale: float = 1.0,
+) -> Tuple[MarketPolicyValueNet, Dict[str, Any]]:
+    config = config or PPOConfig()
+    model = MarketPolicyValueNet(
+        input_dim,
+        policy_hidden=config.policy_hidden,
+        value_hidden=config.value_hidden,
+    ).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    best_report: Dict[str, Any] = {"sharpe": -np.inf}
+
+    for epoch in range(epochs):
+        rollout = collect_market_rollout(train_env, model, device, delta_scale=delta_scale)
+        ppo_update_market(model, optimizer, rollout, config, device)
+        if (epoch + 1) % config.val_every == 0:
+            eval_policy = MarketPolicyNet(input_dim, hidden_dims=config.policy_hidden).to(device)
+            eval_policy.load_state_dict(model.policy_net.state_dict(), strict=True)
+            report = evaluate_market_policy(val_env, eval_policy, device=device, delta_scale=delta_scale)
+            sharpe = report["sharpe"]
+            drawdown = report["max_drawdown"]
+            guard = config.max_drawdown_guard
+            if sharpe > best_report.get("sharpe", -np.inf) and (guard is None or drawdown <= guard):
+                best_report = report
+                if ckpt_path:
+                    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {
+                            "mean_state_dict": model.policy_net.state_dict(),
+                            "value_state_dict": model.value_net.state_dict(),
+                            "log_std": model.log_std.detach().cpu().numpy(),
+                            "hidden_dims": tuple(config.policy_hidden),
+                            "config": config.__dict__,
+                            "val_report": report,
+                        },
+                        ckpt_path,
+                    )
+    return model, best_report
 
 
 def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -1233,14 +1398,19 @@ def load_market_policy(
     input_dim: int,
     device: str = "cuda",
     ckpt_path: Optional[str] = None,
-) -> Optional[MarketPolicyNet]:
+) -> Tuple[Optional[MarketPolicyNet], Optional[np.ndarray]]:
     if not ckpt_path:
-        return None
+        return None, None
     path = Path(ckpt_path)
     if not path.exists():
         raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
     ckpt = torch.load(path, map_location=device)
-    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    if isinstance(ckpt, dict) and "mean_state_dict" in ckpt:
+        state = ckpt["mean_state_dict"]
+        log_std = ckpt.get("log_std")
+    else:
+        state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        log_std = None
     hidden_dims = ckpt.get("hidden_dims") if isinstance(ckpt, dict) else None
     if hidden_dims is None:
         hidden_dims = tuple(
@@ -1249,7 +1419,7 @@ def load_market_policy(
     model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
-    return model
+    return model, None if log_std is None else np.asarray(log_std, dtype=np.float32)
 
 
 def run_pipeline(
@@ -1331,8 +1501,10 @@ def run_pipeline(
     val_report = evaluate_policy(val_env, ppo_model, device=device)
     test_report = evaluate_policy(test_env, ppo_model, device=device)
 
-    mm_batch = build_market_batch(splits_rl["test"])
-    mm_obs_dim = mm_batch.features.shape[-1] + 4
+    mm_train_batch = build_market_batch(splits_rl["train"])
+    mm_val_batch = build_market_batch(splits_rl["val"])
+    mm_test_batch = build_market_batch(splits_rl["test"])
+    mm_obs_dim = mm_train_batch.features.shape[-1] + 4
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     max_inventory_str = os.environ.get("BYBIT_MM_MAX_INVENTORY", "").strip()
@@ -1341,8 +1513,61 @@ def run_pipeline(
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "1.0"))
 
+    mm_train_env = MarketMakingEnv(
+        mm_train_batch,
+        maker_rebate_bps=maker_rebate_bps,
+        inventory_penalty=inventory_penalty,
+        max_inventory=max_inventory,
+        fill_size=fill_size,
+        fill_tolerance=fill_tolerance,
+    )
+    mm_val_env = MarketMakingEnv(
+        mm_val_batch,
+        maker_rebate_bps=maker_rebate_bps,
+        inventory_penalty=inventory_penalty,
+        max_inventory=max_inventory,
+        fill_size=fill_size,
+        fill_tolerance=fill_tolerance,
+    )
+    mm_test_env = MarketMakingEnv(
+        mm_test_batch,
+        maker_rebate_bps=maker_rebate_bps,
+        inventory_penalty=inventory_penalty,
+        max_inventory=max_inventory,
+        fill_size=fill_size,
+        fill_tolerance=fill_tolerance,
+    )
+
+    mm_ppo_config = PPOConfig(
+        lr=float(os.environ.get("BYBIT_MM_PPO_LR", "3e-4")),
+        update_epochs=int(os.environ.get("BYBIT_MM_PPO_UPDATE_EPOCHS", "4")),
+        batch_size=int(os.environ.get("BYBIT_MM_PPO_BATCH_SIZE", "256")),
+        clip_ratio=float(os.environ.get("BYBIT_MM_PPO_CLIP_RATIO", "0.2")),
+        gamma=float(os.environ.get("BYBIT_MM_PPO_GAMMA", "0.99")),
+        gae_lambda=float(os.environ.get("BYBIT_MM_PPO_GAE_LAMBDA", "0.95")),
+        entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.01")),
+        value_coef=float(os.environ.get("BYBIT_MM_PPO_VALUE_COEF", "0.5")),
+        policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")),
+        value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
+        val_every=int(os.environ.get("BYBIT_MM_PPO_VAL_EVERY", "1")),
+        max_drawdown_guard=float(os.environ.get("BYBIT_MM_PPO_MAX_DRAWDOWN", "nan")),
+    )
+    if np.isnan(mm_ppo_config.max_drawdown_guard):
+        mm_ppo_config.max_drawdown_guard = None
+    mm_best_ckpt = Path(os.environ.get("BYBIT_MM_PPO_BEST_CKPT", Path(out_root) / "mm_ppo_best.pt"))
+    train_market_ppo(
+        mm_train_env,
+        mm_val_env,
+        mm_obs_dim,
+        device=device,
+        epochs=int(os.environ.get("BYBIT_MM_PPO_EPOCHS", str(ppo_epochs))),
+        config=mm_ppo_config,
+        ckpt_path=mm_best_ckpt,
+        delta_scale=delta_scale,
+    )
+
     baseline_env = MarketMakingEnv(
-        mm_batch,
+        mm_test_batch,
         maker_rebate_bps=maker_rebate_bps,
         inventory_penalty=inventory_penalty,
         max_inventory=max_inventory,
@@ -1351,8 +1576,8 @@ def run_pipeline(
     )
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0))
 
-    mm_policy_path = os.environ.get("BYBIT_MM_RL_CKPT", "").strip()
-    mm_policy = load_market_policy(mm_obs_dim, device=device, ckpt_path=mm_policy_path or None)
+    mm_policy_path = os.environ.get("BYBIT_MM_RL_CKPT", "").strip() or str(mm_best_ckpt)
+    mm_policy, _log_std = load_market_policy(mm_obs_dim, device=device, ckpt_path=mm_policy_path or None)
     if mm_policy is None:
         print("[mm eval] no BYBIT_MM_RL_CKPT provided; using baseline deltas for RL run.")
         rl_policy_fn = lambda _obs: (0.0, 0.0)
@@ -1367,7 +1592,7 @@ def run_pipeline(
             return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale)
 
     rl_env = MarketMakingEnv(
-        mm_batch,
+        mm_test_batch,
         maker_rebate_bps=maker_rebate_bps,
         inventory_penalty=inventory_penalty,
         max_inventory=max_inventory,
