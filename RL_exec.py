@@ -72,7 +72,7 @@ def _decision_ts_bounds(week_key: str, week_meta: dict) -> tuple[int, int]:
     return ts_min, ts_max
 
 
-def build_two_week_time_splits(out_root: str) -> dict:
+def get_cmssl_splits(out_root: str) -> dict:
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
     weeks = list(meta.get("weeks", []))
@@ -89,9 +89,14 @@ def build_two_week_time_splits(out_root: str) -> dict:
     week2_min, week2_max = _decision_ts_bounds(week2_key, week_meta_map[week2_key])
 
     week2_span = week2_max - week2_min
-    week2_half = week2_span / 2.0
-    expected_half_ms = 3.5 * 24 * 60 * 60 * 1000
+    expected_week_ms = 7 * 24 * 60 * 60 * 1000
+    expected_half_ms = expected_week_ms / 2.0
     tolerance_ms = 60 * 60 * 1000
+    assert abs(week2_span - expected_week_ms) <= tolerance_ms, (
+        f"week2 span {week2_span:.0f}ms not ~7 days"
+    )
+
+    week2_half = week2_span / 2.0
     assert abs(week2_half - expected_half_ms) <= tolerance_ms, (
         f"week2 half span {week2_half:.0f}ms not ~3.5 days"
     )
@@ -102,6 +107,10 @@ def build_two_week_time_splits(out_root: str) -> dict:
         "val": {"week": week2_key, "start": week2_min, "end": week2_mid},
         "test": {"week": week2_key, "start": week2_mid, "end": week2_max},
     }
+
+
+def build_two_week_time_splits(out_root: str) -> dict:
+    return get_cmssl_splits(out_root)
 
 
 def spread_bps_from_vol_pred(vol_pred, spread_mult: float = 1.0):
