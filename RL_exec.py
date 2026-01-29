@@ -504,16 +504,24 @@ def _ensure_sorted_near_regular(ts: np.ndarray) -> None:
         )
 
 
-def load_raw_snapshot_features(out_root: str) -> pd.DataFrame:
+def load_raw_snapshot_features(
+    out_root: str,
+    *,
+    split: Optional[Dict[str, int]] = None,
+    meta: Optional[dict] = None,
+) -> pd.DataFrame:
     if not RAW_SNAPSHOT_PATHS:
         raise ValueError("RAW_SNAPSHOT_PATHS is empty. Set RAW_SNAPSHOT_PATHS or env var.")
+    if split is None:
+        if meta is None:
+            meta = load_global_meta(Path(out_root))
+        split = resolve_test_split(out_root, meta)
     frames = [_load_snapshot_frame(path) for path in RAW_SNAPSHOT_PATHS]
     df = pd.concat(frames, ignore_index=True)
     df = df.dropna(subset=["ts", "best_bid", "best_ask"]).copy()
     df["ts"] = df["ts"].astype(np.int64)
     df = df.sort_values("ts").reset_index(drop=True)
     _ensure_sorted_near_regular(df["ts"].to_numpy())
-    split = get_cmssl_splits(out_root)["test"]
     df = df[(df["ts"] >= split["start"]) & (df["ts"] < split["end"])].copy()
     _ensure_sorted_near_regular(df["ts"].to_numpy())
     df["mid"] = (df["best_bid"] + df["best_ask"]) / 2.0
@@ -604,8 +612,8 @@ def _ensure_monotonic(ts: np.ndarray, label: str) -> None:
         raise ValueError(f"{label} timestamps must be monotonically non-decreasing.")
 
 
-def report_pretrain_diagnostics(out_root: str, splits: Dict[str, Dict[str, int]]) -> None:
-    test_split = splits["test"]
+def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
+    test_split = resolve_test_split(out_root, meta)
     start_ms = int(test_split["start"])
     end_ms = int(test_split["end"])
     duration_ms = end_ms - start_ms
@@ -624,7 +632,7 @@ def report_pretrain_diagnostics(out_root: str, splits: Dict[str, Dict[str, int]]
     )
 
     if RAW_SNAPSHOT_PATHS:
-        snapshot_df = load_raw_snapshot_features(out_root)
+        snapshot_df = load_raw_snapshot_features(out_root, split=test_split, meta=meta)
         snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
         filtered = snapshot_ts
     else:
@@ -830,13 +838,13 @@ def build_joined_split(
     x_core, x_aux, y, ts = load_split_arrays(out_root, split)
     cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
     if RAW_SNAPSHOT_PATHS:
-        test_split = get_cmssl_splits(out_root)["test"]
+        test_split = resolve_test_split(out_root, meta)
         if split != test_split:
             raise ValueError(
                 "RAW_SNAPSHOT_PATHS only supports CMSSL test split alignment. "
                 f"Requested split={split} test_split={test_split}"
             )
-        snapshot_df = load_raw_snapshot_features(out_root)
+        snapshot_df = load_raw_snapshot_features(out_root, split=split, meta=meta)
         snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
         snapshots = snapshot_df[RAW_SNAPSHOT_FEATURE_COLUMNS].to_numpy(dtype=np.float32)
     else:
@@ -1769,15 +1777,15 @@ def run_pipeline(
     ppo_epochs: int = 10,
 ) -> Dict[str, Any]:
     meta = load_global_meta(Path(out_root))
-    splits = build_two_week_time_splits(out_root)
+    test_split = resolve_test_split(out_root, meta)
 
-    report_pretrain_diagnostics(out_root, splits)
+    report_pretrain_diagnostics(out_root, meta)
 
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
 
     joined_test = build_joined_split(
         out_root,
-        splits["test"],
+        test_split,
         model,
         meta,
         device,
