@@ -924,12 +924,32 @@ class MarketMakingEnv:
         return penalty
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
+        next_idx = self.idx + 1
+        if next_idx >= self.n:
+            mid = self._mid_price(self.idx)
+            equity = self.cash + self.inventory * mid
+            info = {
+                "reward": 0.0,
+                "total_reward": float(self.total_reward),
+                "cash": float(self.cash),
+                "inventory": float(self.inventory),
+                "equity": float(equity),
+                "delta_equity": 0.0,
+                "rebate": 0.0,
+                "penalty": 0.0,
+                "bid": 0.0,
+                "ask": 0.0,
+                "buy_fill": 0.0,
+                "sell_fill": 0.0,
+            }
+            return self._build_observation(self.idx), 0.0, True, info
         bid, ask, mid = self._baseline_quotes(self.idx)
         bid, ask = self._apply_deltas(bid, ask, mid, action)
         bid, ask = self._enforce_passive(bid, ask, self.idx)
-        buy_fill, sell_fill = self._apply_fills(bid, ask, self.idx)
+        buy_fill, sell_fill = self._apply_fills(bid, ask, next_idx)
 
-        equity = self.cash + self.inventory * mid
+        mid_next = self._mid_price(next_idx)
+        equity = self.cash + self.inventory * mid_next
         delta_equity = equity - self.prev_equity
         rebate_notional = buy_fill * bid + sell_fill * ask
         rebate = rebate_notional * self.maker_rebate_bps * 1e-4
@@ -938,9 +958,9 @@ class MarketMakingEnv:
 
         self.prev_equity = equity
         self.total_reward += reward
-        self.idx += 1
-        done = self.idx >= self.n
-        next_obs = self._build_observation(self.idx - 1 if done else self.idx)
+        self.idx = next_idx
+        done = self.idx >= self.n - 1
+        next_obs = self._build_observation(self.idx)
         info = {
             "reward": float(reward),
             "total_reward": float(self.total_reward),
