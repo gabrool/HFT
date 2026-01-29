@@ -908,15 +908,16 @@ class MarketMakingEnv:
     def _apply_fills(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         if not bool(self.snapshot_mask[idx]):
             return 0.0, 0.0
-        best_bid = float(self.best_bid[idx])
-        best_ask = float(self.best_ask[idx])
+        best_bid_next = float(self.best_bid[idx])
+        best_ask_next = float(self.best_ask[idx])
         buy_fill = 0.0
         sell_fill = 0.0
-        if bid >= best_bid - self.fill_tolerance:
+        # Evaluate fills against the next snapshot's opposite side.
+        if best_ask_next <= bid + self.fill_tolerance:
             buy_fill = self.fill_size
             self.cash -= bid * buy_fill
             self.inventory += buy_fill
-        if ask <= best_ask + self.fill_tolerance:
+        if best_bid_next >= ask - self.fill_tolerance:
             sell_fill = self.fill_size
             self.cash += ask * sell_fill
             self.inventory -= sell_fill
