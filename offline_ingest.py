@@ -1088,11 +1088,16 @@ def process_all(
     chunk_files = []
     for wk, week_meta in week_meta_records.items():
         for entry in week_meta.get("chunks", []):
+            files = dict(entry.get("files", {}))
+            if "ts" not in files:
+                raise ValueError(
+                    f"Missing ts file entry for week={wk} chunk={entry.get('chunk')}"
+                )
             chunk_files.append({
                 "week": wk,
                 "chunk": int(entry.get("chunk", 0)),
                 "n": int(entry.get("n", 0)),
-                "files": dict(entry.get("files", {})),
+                "files": files,
             })
 
     split_ranges = None
