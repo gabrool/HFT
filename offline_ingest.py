@@ -353,16 +353,18 @@ class ChunkWriter:
         self.X_core = np.empty((self.N, self.L, self.F_core), dtype=np.float32)  # cast on flush
         self.X_aux  = np.empty((self.N, self.L, AUX_DIM),     dtype=np.float32)  # keep fp32
         self.Y      = np.empty((self.N, 2 * NUM_HORIZONS), dtype=np.float32)
+        self.TS     = np.empty((self.N,), dtype=np.int64)
         self.i = 0
         self.cid = 0
         self.chunks_meta = []
 
-    def add(self, seq: np.ndarray, y: np.ndarray):
+    def add(self, ts_decision_ms: int, seq: np.ndarray, y: np.ndarray):
         core = seq[:, :self.F_core]
         aux  = seq[:, self.F_core:]
         self.X_core[self.i] = core
         self.X_aux[self.i]  = aux
         self.Y[self.i]      = y
+        self.TS[self.i]     = ts_decision_ms
         self.i += 1
         if self.i >= self.N:
             self.flush()
@@ -372,6 +374,7 @@ class ChunkWriter:
         x_core_path = os.path.join(self.out_dir, f"Xcore_{self.cid:03d}.npy")
         x_aux_path  = os.path.join(self.out_dir, f"Xaux_{self.cid:03d}.npy")
         y_path      = os.path.join(self.out_dir, f"y_{self.cid:03d}.npy")
+        ts_path     = os.path.join(self.out_dir, f"ts_{self.cid:03d}.npy")
 
         # optional: warn if core would overflow fp16
         if self.core_dtype == np.float16:
@@ -382,13 +385,15 @@ class ChunkWriter:
         np.save(x_core_path, self.X_core[:self.i].astype(self.core_dtype, copy=False))
         np.save(x_aux_path,  self.X_aux[:self.i])                 # fp32
         np.save(y_path,      self.Y[:self.i])                     # fp32
+        np.save(ts_path,     self.TS[:self.i])                    # int64
 
         self.chunks_meta.append({
             "chunk": int(self.cid),
             "n": int(self.i),
             "files": {"core": os.path.basename(x_core_path),
                       "aux":  os.path.basename(x_aux_path),
-                      "y":    os.path.basename(y_path)}
+                      "y":    os.path.basename(y_path),
+                      "ts":   os.path.basename(ts_path)}
         })
         self.cid += 1
         self.i = 0
@@ -459,7 +464,7 @@ class WeekWriterRouter:
     def add(self, ts_decision_ms: int, seq: np.ndarray, label: np.ndarray):
         wk = self._find_week_key(ts_decision_ms)
         writer = self._ensure_writer(wk)
-        writer.add(seq, label)
+        writer.add(ts_decision_ms, seq, label)
         self.week_counts[wk] += 1
         if wk not in self.week_decision_span:
             self.week_decision_span[wk] = [ts_decision_ms, ts_decision_ms]
@@ -1051,6 +1056,15 @@ def process_all(
         wk: week_meta_records[wk].get("meta_path", os.path.join(wk, "meta_week.json"))
         for wk in week_meta_records.keys()
     }
+    chunk_files = []
+    for wk, week_meta in week_meta_records.items():
+        for entry in week_meta.get("chunks", []):
+            chunk_files.append({
+                "week": wk,
+                "chunk": int(entry.get("chunk", 0)),
+                "n": int(entry.get("n", 0)),
+                "files": dict(entry.get("files", {})),
+            })
 
     meta = {
         "dataset_start": start_iso,
@@ -1072,6 +1086,7 @@ def process_all(
         "total_chunks": int(total_chunks),
         "rows_total_from_weeks": int(rows_via_week_metas),
         "weeks_meta": weeks_meta_paths,
+        "chunks": chunk_files,
     }
     meta["pca"] = dict(pca_summary)
     if pca_var_ratio is not None:
