@@ -435,6 +435,34 @@ def load_raw_snapshot_features(out_root: str) -> pd.DataFrame:
     return df
 
 
+def _compute_snapshot_feature_matrix(
+    snapshot_ts: np.ndarray,
+    snapshots: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshots = np.asarray(snapshots)
+    if snapshot_ts.ndim != 1:
+        raise ValueError("snapshot_ts must be 1D.")
+    if snapshots.ndim != 2 or snapshots.shape[1] < 2:
+        raise ValueError(f"Snapshots must be 2D with >=2 columns, got {snapshots.shape}.")
+    order = np.argsort(snapshot_ts)
+    snapshot_ts = snapshot_ts[order]
+    snapshots = snapshots[order]
+    best_bid = snapshots[:, 0].astype(np.float64)
+    best_ask = snapshots[:, 1].astype(np.float64)
+    mid = (best_bid + best_ask) / 2.0
+    spread_bps = (best_ask - best_bid) / mid * 1e4
+    mid_ret_1 = np.log(mid)
+    mid_ret_1 = np.concatenate([[np.nan], np.diff(mid_ret_1)])
+    mid_ret_series = pd.Series(mid_ret_1)
+    vol_short = mid_ret_series.rolling(SHORT_VOL_WINDOW, min_periods=1).std().to_numpy()
+    vol_long = mid_ret_series.rolling(LONG_VOL_WINDOW, min_periods=1).std().to_numpy()
+    features = np.column_stack(
+        [best_bid, best_ask, mid, spread_bps, mid_ret_1, vol_short, vol_long]
+    )
+    return snapshot_ts, features
+
+
 def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
     week_dir = _find_week_dir(Path(out_root), week_key)
     candidates = [
@@ -723,7 +751,8 @@ def build_joined_split(
         snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
         snapshots = snapshot_df[RAW_SNAPSHOT_FEATURE_COLUMNS].to_numpy(dtype=np.float32)
     else:
-        snapshot_ts, snapshots = load_raw_snapshots(out_root, split["week"])
+        snapshot_ts, raw_snapshots = load_raw_snapshots(out_root, split["week"])
+        snapshot_ts, snapshots = _compute_snapshot_feature_matrix(snapshot_ts, raw_snapshots)
     aligned_snapshots, snapshot_mask = align_snapshots_to_decisions(
         ts,
         snapshot_ts,
