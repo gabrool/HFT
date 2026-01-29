@@ -842,22 +842,37 @@ class TradingEnv:
         return next_obs, reward, done, info
 
 
-class PolicyValueNet(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 128, action_dim: int = 3):
+class MLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: Iterable[int], output_dim: int):
         super().__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-        self.policy_head = nn.Linear(hidden_dim, action_dim)
-        self.value_head = nn.Linear(hidden_dim, 1)
+        layers: List[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class PolicyValueNet(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        policy_hidden: Iterable[int] = (128, 128),
+        value_hidden: Iterable[int] = (128, 128),
+        action_dim: int = 3,
+    ):
+        super().__init__()
+        self.policy_net = MLP(input_dim, policy_hidden, action_dim)
+        self.value_net = MLP(input_dim, value_hidden, 1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.shared(x)
-        logits = self.policy_head(h)
-        value = self.value_head(h).squeeze(-1)
+        logits = self.policy_net(x)
+        value = self.value_net(x).squeeze(-1)
         return logits, value
 
 
@@ -869,6 +884,12 @@ class PPOConfig:
     lr: float = 3e-4
     update_epochs: int = 4
     batch_size: int = 256
+    entropy_coef: float = 0.01
+    value_coef: float = 0.5
+    policy_hidden: Tuple[int, ...] = (128, 128)
+    value_hidden: Tuple[int, ...] = (128, 128)
+    val_every: int = 1
+    max_drawdown_guard: Optional[float] = None
 
 
 def collect_rollout(env: TradingEnv, model: PolicyValueNet, device: str) -> Dict[str, torch.Tensor]:
@@ -952,22 +973,70 @@ def ppo_update(
             policy_loss = -(torch.min(ratio * advantages[mb_idx], clip_adv)).mean()
             value_loss = nn.functional.mse_loss(value, returns[mb_idx])
             entropy_loss = dist.entropy().mean()
-            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
+            loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+def compute_sharpe(returns: np.ndarray) -> float:
+    if returns.size == 0:
+        return 0.0
+    mean = returns.mean()
+    std = returns.std(ddof=1) if returns.size > 1 else 0.0
+    if std <= 0:
+        return 0.0
+    return float(mean / std * np.sqrt(returns.size))
 
-def train_ppo(env: TradingEnv, input_dim: int, device: str = "cuda", epochs: int = 10) -> PolicyValueNet:
-    model = PolicyValueNet(input_dim).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=3e-4)
-    config = PPOConfig()
 
-    for _ in range(epochs):
-        rollout = collect_rollout(env, model, device)
+def compute_max_drawdown(returns: np.ndarray) -> float:
+    if returns.size == 0:
+        return 0.0
+    cumulative = np.cumsum(returns)
+    peak = np.maximum.accumulate(cumulative)
+    drawdown = peak - cumulative
+    return float(drawdown.max(initial=0.0))
+
+
+def train_ppo(
+    train_env: TradingEnv,
+    val_env: TradingEnv,
+    input_dim: int,
+    device: str = "cuda",
+    epochs: int = 10,
+    config: Optional[PPOConfig] = None,
+    ckpt_path: Optional[Path] = None,
+) -> Tuple[PolicyValueNet, Dict[str, float]]:
+    config = config or PPOConfig()
+    model = PolicyValueNet(
+        input_dim,
+        policy_hidden=config.policy_hidden,
+        value_hidden=config.value_hidden,
+    ).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    best_report: Dict[str, float] = {"sharpe": -np.inf}
+
+    for epoch in range(epochs):
+        rollout = collect_rollout(train_env, model, device)
         ppo_update(model, optimizer, rollout, config, device)
-    return model
+        if (epoch + 1) % config.val_every == 0:
+            report = evaluate_policy(val_env, model, device=device)
+            sharpe = report["sharpe"]
+            drawdown = report["max_drawdown"]
+            guard = config.max_drawdown_guard
+            if sharpe > best_report.get("sharpe", -np.inf) and (guard is None or drawdown <= guard):
+                best_report = report
+                if ckpt_path:
+                    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {
+                            "state_dict": model.state_dict(),
+                            "config": config.__dict__,
+                            "val_report": report,
+                        },
+                        ckpt_path,
+                    )
+    return model, best_report
 
 
 def evaluate_policy(env: TradingEnv, model: PolicyValueNet, device: str = "cuda") -> Dict[str, float]:
@@ -984,6 +1053,8 @@ def evaluate_policy(env: TradingEnv, model: PolicyValueNet, device: str = "cuda"
     return {
         "total_reward": float(rewards_arr.sum()),
         "mean_reward": float(rewards_arr.mean()) if rewards_arr.size else 0.0,
+        "sharpe": compute_sharpe(rewards_arr),
+        "max_drawdown": compute_max_drawdown(rewards_arr),
     }
 
 
@@ -1050,7 +1121,32 @@ def run_pipeline(
     test_env = _to_env(splits_rl["test"])
 
     input_dim = train_env.features.shape[-1]
-    ppo_model = train_ppo(train_env, input_dim, device=device, epochs=ppo_epochs)
+    ppo_config = PPOConfig(
+        lr=float(os.environ.get("BYBIT_PPO_LR", "3e-4")),
+        update_epochs=int(os.environ.get("BYBIT_PPO_UPDATE_EPOCHS", "4")),
+        batch_size=int(os.environ.get("BYBIT_PPO_BATCH_SIZE", "256")),
+        clip_ratio=float(os.environ.get("BYBIT_PPO_CLIP_RATIO", "0.2")),
+        gamma=float(os.environ.get("BYBIT_PPO_GAMMA", "0.99")),
+        gae_lambda=float(os.environ.get("BYBIT_PPO_GAE_LAMBDA", "0.95")),
+        entropy_coef=float(os.environ.get("BYBIT_PPO_ENTROPY_COEF", "0.01")),
+        value_coef=float(os.environ.get("BYBIT_PPO_VALUE_COEF", "0.5")),
+        policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_PPO_POLICY_HIDDEN", "128,128").split(",")),
+        value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_PPO_VALUE_HIDDEN", "128,128").split(",")),
+        val_every=int(os.environ.get("BYBIT_PPO_VAL_EVERY", "1")),
+        max_drawdown_guard=float(os.environ.get("BYBIT_PPO_MAX_DRAWDOWN", "nan")),
+    )
+    if np.isnan(ppo_config.max_drawdown_guard):
+        ppo_config.max_drawdown_guard = None
+    best_ckpt = Path(os.environ.get("BYBIT_PPO_BEST_CKPT", Path(out_root) / "ppo_best.pt"))
+    ppo_model, best_val = train_ppo(
+        train_env,
+        val_env,
+        input_dim,
+        device=device,
+        epochs=ppo_epochs,
+        config=ppo_config,
+        ckpt_path=best_ckpt,
+    )
 
     val_report = evaluate_policy(val_env, ppo_model, device=device)
     test_report = evaluate_policy(test_env, ppo_model, device=device)
@@ -1058,6 +1154,7 @@ def run_pipeline(
     return {
         "cmssl_test": cmssl_report,
         "ppo_val": val_report,
+        "ppo_val_best": best_val,
         "ppo_test": test_report,
     }
 
@@ -1074,4 +1171,5 @@ if __name__ == "__main__":
     report = run_pipeline(out_root, ckpt_path, device=device, ppo_epochs=ppo_epochs)
     print("[cmssl test]", report["cmssl_test"])
     print("[ppo val]", report["ppo_val"])
+    print("[ppo val best]", report["ppo_val_best"])
     print("[ppo test]", report["ppo_test"])
