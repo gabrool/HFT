@@ -213,71 +213,52 @@ def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], 
     """
     Decide which weeks belong to train/val/test.
 
-    Special case:
-      - If there are exactly 2 weeks, we interpret them as a pair of
-        consecutive weeks:
-          * the earlier week is TRAIN
-          * the later week is used for both VAL and TEST
-        (The actual half/half split inside the second week is enforced later
-         when building datasets / loaders.)
-
-    For other numbers of weeks, we fall back to the old behaviour.
+    Required behaviour:
+      - Exactly 2 consecutive weeks are required.
+      - The earlier week is TRAIN.
+      - The later week is split half/half by time into VAL/TEST.
+        (The half/half split is enforced later using timestamps.)
     """
     weeks = [wk for wk, _ob, _th in pairs]
     n = len(weeks)
 
-    if n == 0:
-        return [], [], []
-
-    # --- Special case: exactly two weeks, must be consecutive ---
-    if n == 2:
-        wk1, wk2 = weeks
-
-        # Parse their date ranges
-        s1, e1, _ = _parse_week_key_any(
-            _normalise_ob_prefix(f"BTCUSDT_OB_{wk1}")
-        )
-        s2, e2, _ = _parse_week_key_any(
-            _normalise_ob_prefix(f"BTCUSDT_OB_{wk2}")
+    if n != 2:
+        raise ValueError(
+            f"classify_week_splits requires exactly two weeks; got {n}."
         )
 
-        # Ensure chronological order by end date
-        if e1 >= e2:
-            raise ValueError(
-                "classify_week_splits expects the first week to end "
-                f"before the second week: got '{wk1}' (end {e1.date()}) "
-                f"and '{wk2}' (end {e2.date()})"
-            )
+    wk1, wk2 = weeks
 
-        # Check that they are consecutive weeks:
-        # second week must start the day after the first ends
-        if s2.date() != (e1.date() + timedelta(days=1)):
-            raise ValueError(
-                "classify_week_splits expects a pair of consecutive weeks; "
-                f"got '{wk1}' ({s1.date()}–{e1.date()}) and "
-                f"'{wk2}' ({s2.date()}–{e2.date()})"
-            )
+    # Parse their date ranges
+    s1, e1, _ = _parse_week_key_any(
+        _normalise_ob_prefix(f"BTCUSDT_OB_{wk1}")
+    )
+    s2, e2, _ = _parse_week_key_any(
+        _normalise_ob_prefix(f"BTCUSDT_OB_{wk2}")
+    )
 
-        # First week = train; second week = val + test
-        train_weeks = [wk1]
-        val_weeks   = [wk2]
-        test_weeks  = [wk2]
-        return train_weeks, val_weeks, test_weeks
+    # Ensure chronological order by end date
+    if e1 >= e2:
+        raise ValueError(
+            "classify_week_splits expects the first week to end "
+            f"before the second week: got '{wk1}' (end {e1.date()}) "
+            f"and '{wk2}' (end {e2.date()})"
+        )
 
-    # --- Fallback: old behaviour for other scenarios ---
-    if n >= 24:
-        weeks = weeks[-24:]
-        tr, va, te = weeks[:18], weeks[18:21], weeks[21:24]
-    else:
-        n_tr = max(1, int(round(n * 0.75)))
-        n_rest = n - n_tr
-        n_va = max(1, int(round(n_rest / 2)))
-        n_te = max(1, n - n_tr - n_va)
-        tr = weeks[:n_tr]
-        va = weeks[n_tr:n_tr + n_va]
-        te = weeks[n_tr + n_va:n_tr + n_va + n_te]
+    # Check that they are consecutive weeks:
+    # second week must start the day after the first ends
+    if s2.date() != (e1.date() + timedelta(days=1)):
+        raise ValueError(
+            "classify_week_splits expects a pair of consecutive weeks; "
+            f"got '{wk1}' ({s1.date()}–{e1.date()}) and "
+            f"'{wk2}' ({s2.date()}–{e2.date()})"
+        )
 
-    return tr, va, te
+    # First week = train; second week = val + test
+    train_weeks = [wk1]
+    val_weeks = [wk2]
+    test_weeks = [wk2]
+    return train_weeks, val_weeks, test_weeks
 
 
 def _sort_pairs_by_end(pairs: List[Tuple[str, str, str]]) -> List[Tuple[str, str, str]]:
@@ -1103,11 +1084,17 @@ def process_all(
     split_ranges = None
     if split_info and len(weeks_in_order) == 2:
         wk1, wk2 = weeks_in_order
+        week1_meta = week_meta_records.get(wk1)
         week2_meta = week_meta_records.get(wk2)
+        if not week1_meta or "decision_ts_range" not in week1_meta:
+            raise ValueError(
+                f"Missing decision_ts_range for week '{wk1}'; cannot derive train split range."
+            )
         if not week2_meta or "decision_ts_range" not in week2_meta:
             raise ValueError(
                 f"Missing decision_ts_range for week '{wk2}'; cannot derive val/test split ranges."
             )
+        train_range = week1_meta["decision_ts_range"]
         decision_range = week2_meta["decision_ts_range"]
         min_ts = int(decision_range["min"])
         max_ts = int(decision_range["max"])
@@ -1127,6 +1114,10 @@ def process_all(
         split_ranges = {
             "train_week": wk1,
             "holdout_week": wk2,
+            "train_ts_range": {
+                "min": int(train_range["min"]),
+                "max": int(train_range["max"]),
+            },
             "val_ts_range": {"min": min_ts, "max": midpoint},
             "test_ts_range": {"min": midpoint, "max": max_ts},
         }
@@ -1188,34 +1179,19 @@ def main():
     requested_weeks = _parse_requested_weeks(RAW_BYBIT_WEEKS)
 
     if requested_weeks:
-        if len(requested_weeks) != 2:
-            raise ValueError(
-                f"BYBIT_WEEKS must specify exactly two weeks; got {len(requested_weeks)}."
-            )
         week_lookup = {wk for wk, _ob, _th in pairs}
         missing = [wk for wk in requested_weeks if wk not in week_lookup]
         if missing:
             raise ValueError(
                 f"Requested BYBIT_WEEKS not found in available data: {', '.join(missing)}"
             )
-
-        requested_set = set(requested_weeks)
-        pairs = [pair for pair in pairs if pair[0] in requested_set]
-    else:
-        raw_last_week_end = os.environ.get("BYBIT_LAST_WEEK_END", "")
-        explicit_last_week_end = raw_last_week_end.strip()
-        normalized_last_week_end = explicit_last_week_end.lower()
-
-        if normalized_last_week_end in ("", "latest", "auto"):
-            max_end_dt = max(
-                _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))[1]
-                for wk, _ob, _th in pairs
+        requested_unique = list(dict.fromkeys(requested_weeks))
+        if len(requested_unique) < 2:
+            raise ValueError(
+                f"BYBIT_WEEKS must include at least two distinct weeks; got {len(requested_unique)}."
             )
-            last_week_end = max_end_dt.date().isoformat()
-        else:
-            last_week_end = explicit_last_week_end
-
-        pairs = _slice_last_weeks_pairs(pairs, last_week_end, KEEP_WEEKS)
+        requested_set = set(requested_unique)
+        pairs = [pair for pair in pairs if pair[0] in requested_set]
 
     pairs = _sort_pairs_by_end(pairs)
     if len(pairs) < 2:
