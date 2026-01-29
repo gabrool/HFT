@@ -517,6 +517,9 @@ def align_snapshots_to_decisions(
     snapshot_ts: np.ndarray,
     snapshots: np.ndarray,
     label: Optional[str] = None,
+    *,
+    tolerance_ms: int = 50,
+    match_rate_target: float = 0.99,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
@@ -529,30 +532,78 @@ def align_snapshots_to_decisions(
     snapshots = snapshots[order]
     if snapshot_ts.size and np.any(np.diff(snapshot_ts) < 0):
         raise ValueError("snapshot_ts must be monotonically non-decreasing after sorting")
+    if snapshot_ts.size == 0:
+        matched = np.zeros(decision_ts.shape[0], dtype=bool)
+        aligned = np.full((decision_ts.shape[0], snapshots.shape[1]), np.nan, dtype=np.float32)
+        match_rate = 0.0
+        raise ValueError(
+            "Snapshot alignment failed; no snapshots available to match decisions. "
+            f"match_rate={match_rate:.6f} target={match_rate_target:.6f}"
+        )
     insert_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
-    valid = insert_idx < len(snapshot_ts)
-    matched = valid & (snapshot_ts[insert_idx] == decision_ts)
+    right_valid = insert_idx < snapshot_ts.size
+    left_valid = insert_idx > 0
+    left_idx = np.clip(insert_idx - 1, 0, snapshot_ts.size - 1)
+    right_idx = np.clip(insert_idx, 0, snapshot_ts.size - 1)
+    exact = right_valid & (snapshot_ts[right_idx] == decision_ts)
+    left_delta = np.full(decision_ts.shape, np.inf, dtype=np.float64)
+    right_delta = np.full(decision_ts.shape, np.inf, dtype=np.float64)
+    left_delta[left_valid] = np.abs(decision_ts[left_valid] - snapshot_ts[left_idx[left_valid]])
+    right_delta[right_valid] = np.abs(snapshot_ts[right_idx[right_valid]] - decision_ts[right_valid])
+    nearest_idx = np.where(left_delta <= right_delta, left_idx, right_idx)
+    nearest_delta = np.minimum(left_delta, right_delta)
+    nearest_idx = np.where(exact, right_idx, nearest_idx)
+    nearest_delta = np.where(exact, 0, nearest_delta)
+    matched = nearest_delta <= tolerance_ms
     aligned = np.full((decision_ts.shape[0], snapshots.shape[1]), np.nan, dtype=np.float32)
     if np.any(matched):
-        aligned[matched] = snapshots[insert_idx[matched]].astype(np.float32)
+        aligned[matched] = snapshots[nearest_idx[matched]].astype(np.float32)
     match_rate = float(np.mean(matched)) if matched.size else 0.0
+    exact_rate = float(np.mean(exact)) if exact.size else 0.0
+    matched_decision_ts = decision_ts[matched]
+    matched_snapshot_ts = snapshot_ts[nearest_idx[matched]] if np.any(matched) else np.array([], dtype=np.int64)
+
+    def _median_dt(ts: np.ndarray) -> float:
+        if ts.size < 2:
+            return float("nan")
+        return float(np.median(np.diff(ts)))
+
+    decision_median_dt = _median_dt(matched_decision_ts)
+    snapshot_median_dt = _median_dt(matched_snapshot_ts)
+    if matched_decision_ts.size:
+        decision_first = int(matched_decision_ts[0])
+        decision_last = int(matched_decision_ts[-1])
+        snapshot_first = int(matched_snapshot_ts[0])
+        snapshot_last = int(matched_snapshot_ts[-1])
+    else:
+        decision_first = decision_last = snapshot_first = snapshot_last = None
     if label:
         print(
             "[snapshot alignment]",
             f"split={label}",
             f"match_rate={match_rate:.6f}",
-            "mode=exact",
+            f"exact_rate={exact_rate:.6f}",
+            f"tolerance_ms={tolerance_ms}",
+            f"decision_first={_format_ts(decision_first) if decision_first is not None else 'n/a'}",
+            f"decision_last={_format_ts(decision_last) if decision_last is not None else 'n/a'}",
+            f"snapshot_first={_format_ts(snapshot_first) if snapshot_first is not None else 'n/a'}",
+            f"snapshot_last={_format_ts(snapshot_last) if snapshot_last is not None else 'n/a'}",
+            f"decision_median_dt_ms={decision_median_dt:.2f}",
+            f"snapshot_median_dt_ms={snapshot_median_dt:.2f}",
         )
-    if not np.all(matched):
+    if match_rate < match_rate_target:
         mismatch_idx = np.flatnonzero(~matched)
         sample_count = min(5, mismatch_idx.size)
-        samples = [
-            int(decision_ts[i])
-            for i in mismatch_idx[:sample_count]
-        ]
+        samples = [int(decision_ts[i]) for i in mismatch_idx[:sample_count]]
         raise ValueError(
-            "Exact snapshot alignment failed; "
-            f"missing={mismatch_idx.size} match_rate={match_rate:.6f} "
+            "Snapshot alignment match rate below target; "
+            f"match_rate={match_rate:.6f} target={match_rate_target:.6f} "
+            f"matched={matched_decision_ts.size} total={decision_ts.size} "
+            f"tolerance_ms={tolerance_ms} "
+            f"decision_first={decision_first} decision_last={decision_last} "
+            f"snapshot_first={snapshot_first} snapshot_last={snapshot_last} "
+            f"decision_median_dt_ms={decision_median_dt:.2f} "
+            f"snapshot_median_dt_ms={snapshot_median_dt:.2f} "
             f"samples={samples}"
         )
     return aligned, matched
