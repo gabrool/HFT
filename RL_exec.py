@@ -257,23 +257,193 @@ def _resolve_horizon_index(target_ms: int, horizons: List[int], fallback_idx: in
     return min(fallback_idx, len(horizons) - 1)
 
 
+def _load_ts_from_npy(path: Path, expected_len: int, label: str) -> Optional[np.ndarray]:
+    if not path.exists():
+        return None
+    arr = np.load(path)
+    if arr.ndim != 1 or arr.shape[0] != expected_len:
+        print(
+            "[ts reconstruct]",
+            f"skip={label}",
+            f"path={path}",
+            f"reason=shape_mismatch",
+            f"expected_len={expected_len}",
+            f"got_shape={arr.shape}",
+        )
+        return None
+    return arr.astype(np.int64, copy=False)
+
+
+def _load_chunk_ts_alternate(
+    week_dir: Path,
+    chunk_idx: int,
+    expected_len: int,
+) -> Optional[np.ndarray]:
+    candidates = [
+        week_dir / f"ts_{chunk_idx:03d}.npy",
+        week_dir / f"ts_{chunk_idx}.npy",
+    ]
+    for path in candidates:
+        ts = _load_ts_from_npy(path, expected_len, label="candidate")
+        if ts is not None:
+            return ts
+    pattern_hits = sorted(week_dir.glob(f"*{chunk_idx:03d}*ts*.npy"))
+    for path in pattern_hits:
+        ts = _load_ts_from_npy(path, expected_len, label="pattern")
+        if ts is not None:
+            return ts
+    fallback_hits = sorted(week_dir.glob("*_ts.npy"))
+    if len(fallback_hits) == 1:
+        return _load_ts_from_npy(fallback_hits[0], expected_len, label="fallback")
+    for path in fallback_hits:
+        ts = _load_ts_from_npy(path, expected_len, label="fallback")
+        if ts is not None:
+            return ts
+    return None
+
+
+def _ensure_ts_alignment(
+    ts: np.ndarray,
+    *,
+    label: str,
+    expected_len: int,
+    snapshot_ts: Optional[np.ndarray] = None,
+    chunk_offset: Optional[int] = None,
+) -> None:
+    if ts.ndim != 1 or ts.shape[0] != expected_len:
+        raise ValueError(
+            f"{label} timestamps length mismatch: expected {expected_len}, got {ts.shape}"
+        )
+    _ensure_monotonic(ts, label)
+    if snapshot_ts is not None and chunk_offset is not None:
+        end = chunk_offset + expected_len
+        if end > snapshot_ts.shape[0]:
+            raise ValueError(
+                f"{label} snapshot alignment overflow: chunk_offset={chunk_offset} "
+                f"expected_len={expected_len} snapshot_len={snapshot_ts.shape[0]}"
+            )
+        expected_slice = snapshot_ts[chunk_offset:end]
+        if not np.array_equal(ts, expected_slice):
+            delta = np.abs(ts - expected_slice)
+            max_delta = int(delta.max()) if delta.size else 0
+            raise ValueError(
+                f"{label} reconstructed ts misaligned with snapshot timeline. "
+                f"chunk_offset={chunk_offset} max_delta_ms={max_delta}"
+            )
+        print(
+            "[ts reconstruct]",
+            f"label={label}",
+            f"len={expected_len}",
+            f"start={_format_ts(int(ts[0])) if ts.size else 'n/a'}",
+            f"end={_format_ts(int(ts[-1])) if ts.size else 'n/a'}",
+            "alignment=ok",
+        )
+
+
+def _load_week_snapshot_ts(out_root: Path, week_key: str, week_meta: dict) -> np.ndarray:
+    try:
+        snapshot_ts, _raw_snapshots = load_raw_snapshots(out_root, week_key)
+        snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+        return np.sort(snapshot_ts)
+    except (FileNotFoundError, ValueError) as exc:
+        if RAW_SNAPSHOT_PATHS:
+            ts_range = week_meta.get("decision_ts_range")
+            if not ts_range:
+                raise ValueError(
+                    f"Missing decision_ts_range for week {week_key}; "
+                    "cannot filter RAW_SNAPSHOT_PATHS for timestamp reconstruction."
+                ) from exc
+            split = {
+                "week": week_key,
+                "start": int(ts_range["min"]),
+                "end": int(ts_range["max"]),
+            }
+            snapshot_df = load_raw_snapshot_features(str(out_root), split=split, meta=None)
+            snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
+            return np.sort(snapshot_ts)
+        raise
+
+
+def _reconstruct_chunk_ts_from_snapshots(
+    snapshot_ts: np.ndarray,
+    *,
+    chunk_offset: int,
+    expected_len: int,
+    label: str,
+) -> np.ndarray:
+    if snapshot_ts.ndim != 1:
+        raise ValueError("snapshot_ts must be 1D for reconstruction.")
+    if chunk_offset < 0:
+        raise ValueError(f"chunk_offset must be >= 0, got {chunk_offset}")
+    end = chunk_offset + expected_len
+    if end > snapshot_ts.shape[0]:
+        raise ValueError(
+            f"Insufficient snapshot timestamps for reconstruction: "
+            f"chunk_offset={chunk_offset} expected_len={expected_len} "
+            f"snapshot_len={snapshot_ts.shape[0]}"
+        )
+    ts = snapshot_ts[chunk_offset:end].astype(np.int64, copy=False)
+    _ensure_ts_alignment(
+        ts,
+        label=label,
+        expected_len=expected_len,
+        snapshot_ts=snapshot_ts,
+        chunk_offset=chunk_offset,
+    )
+    return ts
+
+
 def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     x_core_list: List[np.ndarray] = []
     x_aux_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
     ts_list: List[np.ndarray] = []
-    for week, _chunk, ts, x_core, x_aux, y in iter_chunk_batches(out_root):
+    out_root_path = Path(out_root)
+    meta = load_global_meta(out_root_path)
+    week_meta_map = {wk: (wmeta, wk_dir) for wk, wmeta, wk_dir in iter_week_chunks(out_root_path, meta=meta)}
+    snapshot_ts_cache: Dict[str, np.ndarray] = {}
+    chunk_offsets: Dict[str, int] = {}
+    for week, chunk_idx, ts, x_core, x_aux, y in iter_chunk_batches(out_root):
         if week != split["week"]:
             continue
+        n_rows = x_core.shape[0]
+        chunk_offset = chunk_offsets.get(week, 0)
         if ts is None:
-            raise ValueError("Chunk timestamps missing; cannot filter by split range.")
+            week_meta, week_dir = week_meta_map.get(week, (None, None))
+            if week_dir is None or week_meta is None:
+                raise ValueError(f"Missing week meta for {week}; cannot recover timestamps.")
+            ts = _load_chunk_ts_alternate(week_dir, chunk_idx, n_rows)
+            if ts is None:
+                snapshot_ts = snapshot_ts_cache.get(week)
+                if snapshot_ts is None:
+                    snapshot_ts = _load_week_snapshot_ts(out_root_path, week, week_meta)
+                    snapshot_ts_cache[week] = snapshot_ts
+                    expected_total = int(sum(ch.get("n", 0) for ch in week_meta.get("chunks", [])))
+                    if expected_total and snapshot_ts.shape[0] < expected_total:
+                        raise ValueError(
+                            f"Snapshot timeline shorter than token count for week {week}. "
+                            f"snapshots={snapshot_ts.shape[0]} tokens={expected_total}"
+                        )
+                ts = _reconstruct_chunk_ts_from_snapshots(
+                    snapshot_ts,
+                    chunk_offset=chunk_offset,
+                    expected_len=n_rows,
+                    label=f"{week}/chunk{chunk_idx:03d}",
+                )
+            _ensure_ts_alignment(
+                ts,
+                label=f"{week}/chunk{chunk_idx:03d}",
+                expected_len=n_rows,
+            )
         mask = (ts >= split["start"]) & (ts < split["end"])
         if not np.any(mask):
+            chunk_offsets[week] = chunk_offset + n_rows
             continue
         x_core_list.append(x_core[mask])
         x_aux_list.append(x_aux[mask])
         y_list.append(y[mask])
         ts_list.append(ts[mask])
+        chunk_offsets[week] = chunk_offset + n_rows
     if not x_core_list:
         raise ValueError(f"No data found for split {split}")
     x_core_all = np.concatenate(x_core_list, axis=0)
