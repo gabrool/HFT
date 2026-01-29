@@ -46,6 +46,12 @@ DEFAULT_MM_INV_REF_NOTIONAL = 1.0
 DEFAULT_MM_P250_WEIGHT = 0.0
 DEFAULT_MM_P500_WEIGHT = 0.0
 DEFAULT_MM_P1000_WEIGHT = 1.0
+# Scaling factors for observation features.
+# Notional and cash scales are denominated in quote currency.
+# Time-since-fill scale is in environment steps (1 step per snapshot).
+DEFAULT_MM_NOTIONAL_SCALE = 1e4
+DEFAULT_MM_CASH_SCALE = 1e4
+DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
 
 
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
@@ -932,6 +938,12 @@ class MarketMakingEnv:
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
         self.delta_bps_limit = delta_bps_limit
+        self.notional_scale = _env_float("BYBIT_MM_NOTIONAL_SCALE", DEFAULT_MM_NOTIONAL_SCALE)
+        self.cash_scale = _env_float("BYBIT_MM_CASH_SCALE", DEFAULT_MM_CASH_SCALE)
+        self.time_since_fill_scale = _env_float(
+            "BYBIT_MM_TIME_SINCE_FILL_SCALE",
+            DEFAULT_MM_TIME_SINCE_FILL_SCALE,
+        )
         self._baseline_cfg = load_baseline_quote_config()
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._horizons_ms = _normalize_horizons(self._num_h, self._baseline_cfg.horizons_ms)
@@ -950,14 +962,24 @@ class MarketMakingEnv:
         self.inventory = 0.0
         self.total_reward = 0.0
         self.prev_equity = 0.0
+        self.time_since_last_fill = 0.0
+        self._obs_count = 0
+        self._obs_mean: Optional[np.ndarray] = None
+        self._obs_m2: Optional[np.ndarray] = None
+        self._obs_continuous_mask: Optional[np.ndarray] = None
 
     def reset(self) -> np.ndarray:
         self.idx = 0
         self.cash = 0.0
         self.inventory = 0.0
         self.total_reward = 0.0
+        self.time_since_last_fill = 0.0
         mid = self._mid_price(self.idx)
         self.prev_equity = self.cash + self.inventory * mid
+        self._obs_count = 0
+        self._obs_mean = None
+        self._obs_m2 = None
+        self._obs_continuous_mask = None
         return self._build_observation(self.idx)
 
     def _mid_price(self, idx: int) -> float:
@@ -966,8 +988,57 @@ class MarketMakingEnv:
     def _build_observation(self, idx: int) -> np.ndarray:
         mid = self._mid_price(idx)
         spread = float(self.best_ask[idx] - self.best_bid[idx])
-        extra = np.array([self.inventory, self.cash, mid, spread], dtype=np.float32)
-        return np.concatenate([self.features[idx].astype(np.float32), extra], axis=0)
+        inv_notional = self.inventory * mid
+        inv_notional_scaled = inv_notional / self.notional_scale if self.notional_scale else 0.0
+        cash_scaled = self.cash / self.cash_scale if self.cash_scale else 0.0
+        time_since_last_fill_scaled = (
+            self.time_since_last_fill / self.time_since_fill_scale if self.time_since_fill_scale else 0.0
+        )
+        extra = np.array(
+            [
+                self.inventory,
+                self.cash,
+                mid,
+                spread,
+                inv_notional_scaled,
+                cash_scaled,
+                time_since_last_fill_scaled,
+            ],
+            dtype=np.float32,
+        )
+        obs = np.concatenate([self.features[idx].astype(np.float32), extra], axis=0)
+        return self._normalize_observation(obs)
+
+    def _continuous_mask(self, obs_dim: int) -> np.ndarray:
+        mask = np.ones(obs_dim, dtype=bool)
+        prob_start = 3 * self._num_h
+        prob_end = 4 * self._num_h
+        if prob_end <= obs_dim:
+            mask[prob_start:prob_end] = False
+        return mask
+
+    def _update_obs_stats(self, obs: np.ndarray) -> None:
+        if self._obs_mean is None or self._obs_m2 is None:
+            self._obs_mean = np.zeros_like(obs, dtype=np.float64)
+            self._obs_m2 = np.zeros_like(obs, dtype=np.float64)
+        self._obs_count += 1
+        delta = obs - self._obs_mean
+        self._obs_mean += delta / self._obs_count
+        delta2 = obs - self._obs_mean
+        self._obs_m2 += delta * delta2
+
+    def _normalize_observation(self, obs: np.ndarray) -> np.ndarray:
+        if self._obs_continuous_mask is None:
+            self._obs_continuous_mask = self._continuous_mask(obs.shape[0])
+        self._update_obs_stats(obs)
+        if self._obs_count < 2 or self._obs_mean is None or self._obs_m2 is None:
+            return obs
+        var = self._obs_m2 / max(self._obs_count - 1, 1)
+        std = np.sqrt(np.maximum(var, 1e-6))
+        normalized = obs.copy()
+        mask = self._obs_continuous_mask
+        normalized[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
+        return normalized
 
     def _parse_action(self, action: Any) -> Tuple[float, float]:
         if isinstance(action, (list, tuple, np.ndarray)) and len(action) == 2:
@@ -1079,6 +1150,10 @@ class MarketMakingEnv:
         inv_prev = self.inventory
         buy_fill, sell_fill = self._apply_fills(bid, ask, next_idx)
         inv_new = self.inventory
+        if buy_fill > 0.0 or sell_fill > 0.0:
+            self.time_since_last_fill = 0.0
+        else:
+            self.time_since_last_fill += 1.0
 
         mid_next = self._mid_price(next_idx)
         equity = self.cash + self.inventory * mid_next
@@ -1769,7 +1844,7 @@ def run_pipeline(
     mm_train_batch = build_market_batch(splits_rl["train"])
     mm_val_batch = build_market_batch(splits_rl["val"])
     mm_test_batch = build_market_batch(splits_rl["test"])
-    mm_obs_dim = mm_train_batch.features.shape[-1] + 4
+    mm_obs_dim = mm_train_batch.features.shape[-1] + 7
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     max_inventory_str = os.environ.get("BYBIT_MM_MAX_INVENTORY", "").strip()
