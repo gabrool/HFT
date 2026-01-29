@@ -127,7 +127,12 @@ def build_two_week_time_splits(out_root: str) -> dict:
     return get_cmssl_splits(out_root)
 
 
-def spread_bps_from_vol_pred(vol_pred, spread_mult: float = 1.0):
+def sigma_from_vol(log_vol: np.ndarray) -> np.ndarray:
+    """Recover volatility from log-vol predictions."""
+    return np.exp(log_vol)
+
+
+def spread_bps_from_vol_pred(vol_pred: np.ndarray, spread_mult: float = 1.0) -> np.ndarray:
     """
     Convert model vol predictions into a spread size in basis points.
 
@@ -136,9 +141,21 @@ def spread_bps_from_vol_pred(vol_pred, spread_mult: float = 1.0):
     If the model ever switches to predicting log-variance, use
     sigma = exp(0.5 * logvar) instead.
     """
-    sigma = np.exp(vol_pred)
-    sigma_bps = 1e4 * sigma
+    sigma_bps = 1e4 * sigma_from_vol(vol_pred)
     return spread_mult * sigma_bps
+
+
+def alpha_from_probs(p_up: np.ndarray, sigma_bps: np.ndarray) -> np.ndarray:
+    """Convert directional probabilities into a signed alpha in bps."""
+    return (p_up - 0.5) * 2.0 * sigma_bps
+
+
+def half_spread(mid: float, spread_bps: float) -> float:
+    return mid * spread_bps * 1e-4 / 2.0
+
+
+def skew(mid: float, alpha_bps: float) -> float:
+    return mid * alpha_bps * 1e-4
 
 
 def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -529,20 +546,30 @@ def join_features(
     vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
     p_up = _sigmoid(dir_logits)
-    horizon_idx = _resolve_horizon_indices(meta, targets=[250, 500, 1000])
-    idx_250 = horizon_idx[250]
-    idx_500 = horizon_idx[500]
-    idx_1000 = horizon_idx[1000]
+    horizons = [int(h) for h in meta.get("horizons_ms", [])]
+    if not horizons:
+        raise ValueError("meta['horizons_ms'] must be non-empty")
+    sorted_horizons = sorted(set(horizons))
+    short_h = sorted_horizons[0]
+    long_h = sorted_horizons[-1]
+    mid_h = sorted_horizons[len(sorted_horizons) // 2]
+    horizon_idx = _resolve_horizon_indices(meta, targets=[short_h, mid_h, long_h])
+    idx_short = horizon_idx[short_h]
+    idx_mid = horizon_idx[mid_h]
+    idx_long = horizon_idx[long_h]
     conf = np.abs(p_up - 0.5) * 2.0
     align_all = np.logical_or(
         np.all(p_up >= 0.5, axis=1),
         np.all(p_up <= 0.5, axis=1),
     ).astype(np.float32)
-    diff_250_1000 = p_up[:, idx_250] - p_up[:, idx_1000]
-    diff_500_1000 = p_up[:, idx_500] - p_up[:, idx_1000]
-    conf_1000 = conf[:, idx_1000]
+    diff_short_long = p_up[:, idx_short] - p_up[:, idx_long]
+    diff_mid_long = p_up[:, idx_mid] - p_up[:, idx_long]
+    conf_long = conf[:, idx_long]
     conf_min = np.min(conf, axis=1)
-    spread_bps = spread_bps_from_vol_pred(vol_pred[:, 0])
+    sigma = sigma_from_vol(vol_pred)
+    sigma_bps = 1e4 * sigma
+    spread_bps = spread_bps_from_vol_pred(vol_pred[:, idx_short])
+    alpha_bps = alpha_from_probs(p_up[:, idx_long], sigma_bps[:, idx_long])
 
     features = np.concatenate(
         [
@@ -551,9 +578,9 @@ def join_features(
             dir_logits,
             p_up,
             align_all[:, None],
-            diff_250_1000[:, None],
-            diff_500_1000[:, None],
-            conf_1000[:, None],
+            diff_short_long[:, None],
+            diff_mid_long[:, None],
+            conf_long[:, None],
             conf_min[:, None],
             snapshots,
         ],
@@ -564,6 +591,7 @@ def join_features(
         "features": features.astype(np.float32),
         "y": y.astype(np.float32),
         "spread_bps": spread_bps.astype(np.float32),
+        "alpha_bps": alpha_bps.astype(np.float32),
         "snapshot_mask": snapshot_mask.astype(np.bool_),
     }
 
@@ -634,6 +662,7 @@ class MarketMakingBatch:
     spread_bps: np.ndarray
     best_bid: np.ndarray
     best_ask: np.ndarray
+    alpha_bps: Optional[np.ndarray] = None
     snapshot_mask: Optional[np.ndarray] = None
 
 
@@ -652,6 +681,7 @@ class MarketMakingEnv:
         self.spread_bps = batch.spread_bps
         self.best_bid = batch.best_bid
         self.best_ask = batch.best_ask
+        self.alpha_bps = batch.alpha_bps if batch.alpha_bps is not None else np.zeros_like(self.spread_bps)
         self.snapshot_mask = (
             batch.snapshot_mask if batch.snapshot_mask is not None else np.ones_like(self.best_bid, dtype=bool)
         )
@@ -696,9 +726,11 @@ class MarketMakingEnv:
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         mid = self._mid_price(idx)
         spread_bps = float(self.spread_bps[idx])
-        half_spread = mid * spread_bps * 1e-4 / 2.0
-        bid = mid - half_spread
-        ask = mid + half_spread
+        alpha_bps = float(self.alpha_bps[idx])
+        baseline_half_spread = half_spread(mid, spread_bps)
+        baseline_skew = skew(mid, alpha_bps)
+        bid = mid - baseline_half_spread + baseline_skew
+        ask = mid + baseline_half_spread + baseline_skew
         return bid, ask, mid
 
     def _apply_deltas(self, bid: float, ask: float, mid: float, action: Any) -> Tuple[float, float]:
