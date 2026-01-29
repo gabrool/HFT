@@ -446,18 +446,56 @@ def align_snapshots_to_decisions(
     decision_ts: np.ndarray,
     snapshot_ts: np.ndarray,
     snapshots: np.ndarray,
-    tolerance_ms: int = 1000,
+    tolerance_ms: int = 50,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
+    if decision_ts.ndim != 1:
+        raise ValueError("decision_ts must be 1D")
+    if decision_ts.size and np.any(np.diff(decision_ts) < 0):
+        raise ValueError("decision_ts must be monotonically non-decreasing")
     order = np.argsort(snapshot_ts)
     snapshot_ts = snapshot_ts[order]
     snapshots = snapshots[order]
-    idx = np.searchsorted(snapshot_ts, decision_ts, side="right") - 1
-    idx = np.clip(idx, 0, len(snapshot_ts) - 1)
+    if snapshot_ts.size and np.any(np.diff(snapshot_ts) < 0):
+        raise ValueError("snapshot_ts must be monotonically non-decreasing after sorting")
+    insert_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
+    right_idx = np.clip(insert_idx, 0, len(snapshot_ts) - 1)
+    left_idx = np.clip(insert_idx - 1, 0, len(snapshot_ts) - 1)
+    left_diff = np.abs(snapshot_ts[left_idx] - decision_ts)
+    right_diff = np.abs(snapshot_ts[right_idx] - decision_ts)
+    choose_right = right_diff < left_diff
+    idx = np.where(choose_right, right_idx, left_idx)
     aligned = snapshots[idx]
-    delta = np.abs(snapshot_ts[idx] - decision_ts)
-    mask = delta <= tolerance_ms
+    delta = snapshot_ts[idx] - decision_ts
+    abs_delta = np.abs(delta)
+    mask = abs_delta <= tolerance_ms
+    match_rate = float(np.mean(mask)) if mask.size else 0.0
+    if not np.all(mask):
+        mismatch_delta = delta[~mask]
+        mismatch_abs = abs_delta[~mask]
+        sample_count = min(5, mismatch_delta.size)
+        sample_indices = np.flatnonzero(~mask)[:sample_count]
+        samples = [
+            (int(decision_ts[i]), int(snapshot_ts[idx[i]]), int(delta[i]))
+            for i in sample_indices
+        ]
+        print(
+            "[snapshot alignment] mismatches:",
+            f"count={mismatch_delta.size}",
+            f"match_rate={match_rate:.6f}",
+            f"min_dt={mismatch_delta.min():.1f}ms",
+            f"max_dt={mismatch_delta.max():.1f}ms",
+            f"median_dt={float(np.median(mismatch_delta)):.1f}ms",
+            f"min_abs_dt={float(mismatch_abs.min()):.1f}ms",
+            f"max_abs_dt={float(mismatch_abs.max()):.1f}ms",
+            f"median_abs_dt={float(np.median(mismatch_abs)):.1f}ms",
+            f"samples={samples}",
+        )
+    assert match_rate >= 0.995, (
+        f"Snapshot match rate {match_rate:.6f} below 0.995 "
+        f"(tolerance={tolerance_ms}ms)."
+    )
     aligned = aligned.astype(np.float32)
     aligned[~mask] = np.nan
     return aligned, mask
