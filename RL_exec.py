@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -601,7 +602,23 @@ def chronological_split(
         "train": _slice(idx_train),
         "val": _slice(idx_val),
         "test": _slice(idx_test),
+        "bounds": {
+            "train": {"start": 0, "end": n_train},
+            "val": {"start": n_train, "end": n_train + n_val},
+            "test": {"start": n_train + n_val, "end": n},
+        },
     }
+
+
+def persist_split_bounds(out_root: str, bounds: Dict[str, Dict[str, int]], total: int) -> Path:
+    out_root = Path(out_root)
+    payload = {
+        "total": total,
+        "bounds": bounds,
+    }
+    path = out_root / "rl_exec_split_bounds.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return path
 
 
 @dataclass
@@ -838,6 +855,7 @@ def run_pipeline(
     joined = {key: value[order] for key, value in joined.items()}
 
     splits_rl = chronological_split(joined, ratios=(0.6, 0.2, 0.2))
+    persist_split_bounds(out_root, splits_rl["bounds"], total=len(joined["ts"]))
 
     def _to_env(split: Dict[str, np.ndarray]) -> TradingEnv:
         returns = split["y"][:, 0]
