@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -59,7 +59,8 @@ def iter_chunk_batches(out_root: str):
             x_core = np.load(week_dir / files["core"])
             x_aux = np.load(week_dir / files["aux"])
             y = np.load(week_dir / files["y"])
-            ts = np.load(week_dir / files["ts"])
+            ts_path = files.get("ts")
+            ts = np.load(week_dir / ts_path) if ts_path else None
             yield week, int(entry.get("chunk", 0)), ts, x_core, x_aux, y
 
 
@@ -135,6 +136,8 @@ def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray,
     for week, _chunk, ts, x_core, x_aux, y in iter_chunk_batches(out_root):
         if week != split["week"]:
             continue
+        if ts is None:
+            raise ValueError("Chunk timestamps missing; cannot filter by split range.")
         mask = (ts >= split["start"]) & (ts < split["end"])
         if not np.any(mask):
             continue
@@ -150,6 +153,83 @@ def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray,
     ts_all = np.concatenate(ts_list, axis=0)
     order = np.argsort(ts_all)
     return x_core_all[order], x_aux_all[order], y_all[order], ts_all[order]
+
+
+def resolve_test_split(out_root: str, meta: dict) -> Dict[str, int]:
+    splits = meta.get("splits", {})
+    test_range = splits.get("test_ts_range")
+    holdout_week = splits.get("holdout_week")
+    if test_range and holdout_week:
+        return {
+            "week": holdout_week,
+            "start": int(test_range["min"]),
+            "end": int(test_range["max"]),
+        }
+    return get_cmssl_splits(out_root)["test"]
+
+
+def _build_windowed_inputs(
+    x_core: np.ndarray,
+    x_aux: np.ndarray,
+    ts: np.ndarray,
+    lookback: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if x_core.ndim == 3:
+        if ts.shape[0] != x_core.shape[0]:
+            raise ValueError("Timestamp length does not match windowed inputs.")
+        return x_core, x_aux, ts
+    if x_core.ndim != 2:
+        raise ValueError(f"Expected x_core to be 2D or 3D, got {x_core.ndim}D")
+    if ts.ndim != 1 or ts.shape[0] != x_core.shape[0]:
+        raise ValueError("Raw token timestamps must be 1D and match x_core rows.")
+    n, feat_dim = x_core.shape
+    if n < lookback:
+        return (
+            np.empty((0, lookback, feat_dim), dtype=x_core.dtype),
+            np.empty((0, lookback, x_aux.shape[1]), dtype=x_aux.dtype),
+            np.empty((0,), dtype=ts.dtype),
+        )
+    window_count = n - lookback + 1
+    x_core_win = np.empty((window_count, lookback, feat_dim), dtype=x_core.dtype)
+    x_aux_win = np.empty((window_count, lookback, x_aux.shape[1]), dtype=x_aux.dtype)
+    for i in range(lookback - 1, n):
+        start = i - lookback + 1
+        x_core_win[start] = x_core[start:i + 1]
+        x_aux_win[start] = x_aux[start:i + 1]
+    return x_core_win, x_aux_win, ts[lookback - 1:]
+
+
+def load_test_windowed_inputs(
+    out_root: str,
+    meta: dict,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    split = resolve_test_split(out_root, meta)
+    x_core, x_aux, _y, ts = load_split_arrays(out_root, split)
+    return _build_windowed_inputs(x_core, x_aux, ts, lookback=LOOKBACK)
+
+
+def run_cmssl_test_window_inference(
+    out_root: str,
+    ckpt_path: str,
+    device: str = "cuda",
+    batch_size: int = 256,
+) -> Dict[str, Any]:
+    model, meta = load_cmssl(out_root, ckpt_path, device=device)
+    x_core, x_aux, ts = load_test_windowed_inputs(out_root, meta)
+    cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
+    horizons = meta.get("horizons_ms", [])
+    output: Dict[str, Dict[int, np.ndarray]] = {
+        "horizons_ms": horizons,
+        "ret_pred": {},
+        "vol_pred": {},
+        "dir_logits": {},
+    }
+    for idx, ts_val in enumerate(ts):
+        ts_key = int(ts_val)
+        output["ret_pred"][ts_key] = cmssl_out["ret_pred"][idx]
+        output["vol_pred"][ts_key] = cmssl_out["vol_pred"][idx]
+        output["dir_logits"][ts_key] = cmssl_out["dir_logits"][idx]
+    return output
 
 
 def run_cmssl_inference(
