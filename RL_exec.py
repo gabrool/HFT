@@ -907,6 +907,9 @@ class MarketMakingEnv:
         *,
         maker_rebate_bps: float = 0.0,
         inventory_penalty: float = 0.0,
+        inv_soft: float = 1.0,
+        lambda_inv: float = 0.0,
+        lambda_turn: float = 0.0,
         max_inventory: Optional[float] = None,
         fill_size: float = 1.0,
         fill_tolerance: float = 1e-6,
@@ -922,6 +925,9 @@ class MarketMakingEnv:
         )
         self.maker_rebate_bps = maker_rebate_bps
         self.inventory_penalty = inventory_penalty
+        self.inv_soft = inv_soft
+        self.lambda_inv = lambda_inv
+        self.lambda_turn = lambda_turn
         self.max_inventory = max_inventory
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
@@ -1059,6 +1065,8 @@ class MarketMakingEnv:
                 "delta_equity": 0.0,
                 "rebate": 0.0,
                 "penalty": 0.0,
+                "inv_penalty": 0.0,
+                "turnover_penalty": 0.0,
                 "bid": 0.0,
                 "ask": 0.0,
                 "buy_fill": 0.0,
@@ -1068,7 +1076,9 @@ class MarketMakingEnv:
         bid, ask, mid = self._baseline_quotes(self.idx)
         bid, ask = self._apply_deltas(bid, ask, mid, action)
         bid, ask = self._enforce_passive(bid, ask, self.idx)
+        inv_prev = self.inventory
         buy_fill, sell_fill = self._apply_fills(bid, ask, next_idx)
+        inv_new = self.inventory
 
         mid_next = self._mid_price(next_idx)
         equity = self.cash + self.inventory * mid_next
@@ -1076,7 +1086,13 @@ class MarketMakingEnv:
         rebate_notional = buy_fill * bid + sell_fill * ask
         rebate = rebate_notional * self.maker_rebate_bps * 1e-4
         penalty = self._compute_penalty()
-        reward = delta_equity + rebate - penalty
+        inv_notional = inv_new * mid_next
+        excess = max(0.0, abs(inv_notional) - self.inv_soft)
+        inv_penalty = (
+            self.lambda_inv * (excess / self.inv_soft) ** 2 if self.inv_soft > 0.0 else 0.0
+        )
+        turnover_penalty = self.lambda_turn * abs(inv_new - inv_prev)
+        reward = delta_equity + rebate - penalty - inv_penalty - turnover_penalty
 
         self.prev_equity = equity
         self.total_reward += reward
@@ -1092,6 +1108,8 @@ class MarketMakingEnv:
             "delta_equity": float(delta_equity),
             "rebate": float(rebate),
             "penalty": float(penalty),
+            "inv_penalty": float(inv_penalty),
+            "turnover_penalty": float(turnover_penalty),
             "bid": float(bid),
             "ask": float(ask),
             "buy_fill": float(buy_fill),
