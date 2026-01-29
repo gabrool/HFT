@@ -501,16 +501,46 @@ def align_snapshots_to_decisions(
     return aligned, mask
 
 
+def _resolve_horizon_indices(meta: dict, targets: Iterable[int]) -> Dict[int, int]:
+    horizons = [int(h) for h in meta.get("horizons_ms", [])]
+    if not horizons:
+        raise ValueError("meta['horizons_ms'] must be non-empty")
+    index_map = {h: idx for idx, h in enumerate(horizons)}
+    missing = [h for h in targets if h not in index_map]
+    if missing:
+        raise ValueError(f"Requested horizons not in meta: {missing}")
+    return {h: index_map[h] for h in targets}
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 def join_features(
     decision_ts: np.ndarray,
     y: np.ndarray,
     cmssl_out: Dict[str, np.ndarray],
     snapshots: np.ndarray,
     snapshot_mask: np.ndarray,
+    meta: dict,
 ) -> Dict[str, np.ndarray]:
     ret_pred = cmssl_out["ret_pred"]
     vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
+    p_up = _sigmoid(dir_logits)
+    horizon_idx = _resolve_horizon_indices(meta, targets=[250, 500, 1000])
+    idx_250 = horizon_idx[250]
+    idx_500 = horizon_idx[500]
+    idx_1000 = horizon_idx[1000]
+    conf = np.abs(p_up - 0.5) * 2.0
+    align_all = np.logical_or(
+        np.all(p_up >= 0.5, axis=1),
+        np.all(p_up <= 0.5, axis=1),
+    ).astype(np.float32)
+    diff_250_1000 = p_up[:, idx_250] - p_up[:, idx_1000]
+    diff_500_1000 = p_up[:, idx_500] - p_up[:, idx_1000]
+    conf_1000 = conf[:, idx_1000]
+    conf_min = np.min(conf, axis=1)
     spread_bps = spread_bps_from_vol_pred(vol_pred[:, 0])
 
     features = np.concatenate(
@@ -518,6 +548,12 @@ def join_features(
             ret_pred,
             vol_pred,
             dir_logits,
+            p_up,
+            align_all[:, None],
+            diff_250_1000[:, None],
+            diff_500_1000[:, None],
+            conf_1000[:, None],
+            conf_min[:, None],
             snapshots,
         ],
         axis=-1,
@@ -543,7 +579,7 @@ def build_joined_split(
     cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
     snapshot_ts, snapshots = load_raw_snapshots(out_root, split["week"])
     aligned_snapshots, snapshot_mask = align_snapshots_to_decisions(ts, snapshot_ts, snapshots)
-    return join_features(ts, y, cmssl_out, aligned_snapshots, snapshot_mask)
+    return join_features(ts, y, cmssl_out, aligned_snapshots, snapshot_mask, meta)
 
 
 def chronological_split(
