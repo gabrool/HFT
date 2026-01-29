@@ -4,12 +4,24 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK
 from offline_tokens import iter_week_chunks, load_global_meta
+
+RAW_SNAPSHOT_PATHS = [
+    Path(p)
+    for p in os.environ.get("RAW_SNAPSHOT_PATHS", "").split(",")
+    if p
+]
+RAW_SNAPSHOT_EXPECTED_STEP_MS = 100
+RAW_SNAPSHOT_TOLERANCE_MS = 20
+RAW_SNAPSHOT_MAX_IRREGULAR_FRAC = 0.05
+SHORT_VOL_WINDOW = 50
+LONG_VOL_WINDOW = 200
 
 
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
@@ -264,6 +276,135 @@ def _find_week_dir(out_root: Path, week_key: str) -> Path:
         if wk == week_key:
             return wk_dir
     raise ValueError(f"Unable to locate week directory for {week_key}")
+
+
+def _load_snapshot_frame(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Snapshot path not found: {path}")
+    if path.suffix == ".parquet":
+        df = pd.read_parquet(path)
+    elif path.suffix in {".csv", ".gz", ".bz2"}:
+        df = pd.read_csv(path)
+    elif path.suffix == ".npz":
+        data = np.load(path)
+        if {"ts", "best_bid", "best_ask"}.issubset(data.files):
+            df = pd.DataFrame(
+                {
+                    "ts": data["ts"],
+                    "best_bid": data["best_bid"],
+                    "best_ask": data["best_ask"],
+                }
+            )
+        elif {"timestamps", "best_bid", "best_ask"}.issubset(data.files):
+            df = pd.DataFrame(
+                {
+                    "ts": data["timestamps"],
+                    "best_bid": data["best_bid"],
+                    "best_ask": data["best_ask"],
+                }
+            )
+        elif {"ts", "snapshots"}.issubset(data.files):
+            snaps = data["snapshots"]
+            if snaps.ndim != 2 or snaps.shape[1] < 2:
+                raise ValueError(f"Unsupported snapshots array shape in {path}: {snaps.shape}")
+            df = pd.DataFrame(
+                {
+                    "ts": data["ts"],
+                    "best_bid": snaps[:, 0],
+                    "best_ask": snaps[:, 1],
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported npz layout in {path}")
+    elif path.suffix == ".npy":
+        arr = np.load(path)
+        if arr.dtype.names:
+            if {"ts", "best_bid", "best_ask"}.issubset(arr.dtype.names):
+                df = pd.DataFrame(
+                    {
+                        "ts": arr["ts"],
+                        "best_bid": arr["best_bid"],
+                        "best_ask": arr["best_ask"],
+                    }
+                )
+            elif {"ts", "snapshot"}.issubset(arr.dtype.names):
+                snaps = arr["snapshot"]
+                df = pd.DataFrame(
+                    {
+                        "ts": arr["ts"],
+                        "best_bid": snaps[:, 0],
+                        "best_ask": snaps[:, 1],
+                    }
+                )
+            elif {"ts", "snapshots"}.issubset(arr.dtype.names):
+                snaps = arr["snapshots"]
+                df = pd.DataFrame(
+                    {
+                        "ts": arr["ts"],
+                        "best_bid": snaps[:, 0],
+                        "best_ask": snaps[:, 1],
+                    }
+                )
+            else:
+                raise ValueError(f"Unsupported structured snapshot dtype in {path}")
+        else:
+            if arr.ndim != 2 or arr.shape[1] < 3:
+                raise ValueError(f"Unsupported raw snapshot array shape in {path}: {arr.shape}")
+            df = pd.DataFrame(
+                {
+                    "ts": arr[:, 0],
+                    "best_bid": arr[:, 1],
+                    "best_ask": arr[:, 2],
+                }
+            )
+    else:
+        raise ValueError(f"Unsupported snapshot file type: {path.suffix}")
+    missing = {"ts", "best_bid", "best_ask"} - set(df.columns)
+    if missing:
+        raise ValueError(f"Snapshot data missing columns {missing} in {path}")
+    return df[["ts", "best_bid", "best_ask"]]
+
+
+def _ensure_sorted_near_regular(ts: np.ndarray) -> None:
+    if ts.ndim != 1:
+        raise ValueError("Snapshot timestamps must be 1D.")
+    if len(ts) < 2:
+        return
+    if np.any(np.diff(ts) < 0):
+        raise ValueError("Snapshot timestamps must be sorted in ascending order.")
+    deltas = np.diff(ts)
+    median_step = float(np.median(deltas))
+    if abs(median_step - RAW_SNAPSHOT_EXPECTED_STEP_MS) > RAW_SNAPSHOT_TOLERANCE_MS:
+        raise ValueError(
+            "Snapshot cadence not close to 100ms. "
+            f"Median step {median_step:.2f}ms."
+        )
+    irregular_frac = np.mean(np.abs(deltas - RAW_SNAPSHOT_EXPECTED_STEP_MS) > RAW_SNAPSHOT_TOLERANCE_MS)
+    if irregular_frac > RAW_SNAPSHOT_MAX_IRREGULAR_FRAC:
+        raise ValueError(
+            "Snapshot timestamps are too irregular. "
+            f"{irregular_frac:.2%} exceed tolerance."
+        )
+
+
+def load_raw_snapshot_features(out_root: str) -> pd.DataFrame:
+    if not RAW_SNAPSHOT_PATHS:
+        raise ValueError("RAW_SNAPSHOT_PATHS is empty. Set RAW_SNAPSHOT_PATHS or env var.")
+    frames = [_load_snapshot_frame(path) for path in RAW_SNAPSHOT_PATHS]
+    df = pd.concat(frames, ignore_index=True)
+    df = df.dropna(subset=["ts", "best_bid", "best_ask"]).copy()
+    df["ts"] = df["ts"].astype(np.int64)
+    df = df.sort_values("ts").reset_index(drop=True)
+    _ensure_sorted_near_regular(df["ts"].to_numpy())
+    split = get_cmssl_splits(out_root)["test"]
+    df = df[(df["ts"] >= split["start"]) & (df["ts"] < split["end"])].copy()
+    _ensure_sorted_near_regular(df["ts"].to_numpy())
+    df["mid"] = (df["best_bid"] + df["best_ask"]) / 2.0
+    df["spread_bps"] = (df["best_ask"] - df["best_bid"]) / df["mid"] * 1e4
+    df["mid_ret_1"] = np.log(df["mid"]).diff()
+    df["vol_short"] = df["mid_ret_1"].rolling(SHORT_VOL_WINDOW, min_periods=1).std()
+    df["vol_long"] = df["mid_ret_1"].rolling(LONG_VOL_WINDOW, min_periods=1).std()
+    return df
 
 
 def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
