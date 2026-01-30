@@ -1394,8 +1394,10 @@ class MarketMakingEnv:
     def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         best_bid = float(self.best_bid[idx])
         best_ask = float(self.best_ask[idx])
-        bid = min(bid, best_bid)
-        ask = max(ask, best_ask)
+        mid = 0.5 * (best_bid + best_ask)
+        eps = max(1e-8, mid * 1e-6)
+        bid = min(bid, best_ask - eps)
+        ask = max(ask, best_bid + eps)
         if bid >= ask:
             bid = best_bid
             ask = best_ask
