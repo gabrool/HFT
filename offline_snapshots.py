@@ -101,11 +101,13 @@ class SnapshotSeries:
         self.best_ask.append(float(ask))
 
     def to_npz(self, path: Path) -> None:
+        snapshots = np.column_stack([self.best_bid, self.best_ask]).astype(np.float32)
         np.savez_compressed(
             path,
             ts=np.asarray(self.ts, dtype=np.int64),
             best_bid=np.asarray(self.best_bid, dtype=np.float32),
             best_ask=np.asarray(self.best_ask, dtype=np.float32),
+            snapshots=snapshots,
         )
 
 

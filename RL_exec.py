@@ -836,6 +836,12 @@ def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.nda
         data = np.load(path)
         if "ts" in data and "snapshots" in data:
             return data["ts"], data["snapshots"]
+        if {"ts", "best_bid", "best_ask"}.issubset(data.files):
+            snapshots = np.column_stack([data["best_bid"], data["best_ask"]])
+            return data["ts"], snapshots
+        if {"timestamps", "best_bid", "best_ask"}.issubset(data.files):
+            snapshots = np.column_stack([data["best_bid"], data["best_ask"]])
+            return data["timestamps"], snapshots
         if "timestamps" in data and "X" in data:
             return data["timestamps"], data["X"]
         raise ValueError(f"Unsupported npz layout in {path}")
