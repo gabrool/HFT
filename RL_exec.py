@@ -1568,6 +1568,7 @@ class PolicyValueNet(nn.Module):
 class MarketPolicyNet(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: Iterable[int] = (128, 128)):
         super().__init__()
+        # MarketPolicyNet wraps its MLP under .net for compatibility with checkpoints.
         self.net = MLP(input_dim, hidden_dims, 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1897,9 +1898,12 @@ def train_market_ppo(
         rollout = collect_market_rollout(train_env, model, device, delta_scale=delta_scale)
         ppo_update_market(model, optimizer, rollout, config, device)
         if (epoch + 1) % config.val_every == 0:
-            eval_policy = MarketPolicyNet(input_dim, hidden_dims=config.policy_hidden).to(device)
-            eval_policy.load_state_dict(model.policy_net.state_dict(), strict=True)
-            report = evaluate_market_policy(val_env, eval_policy, device=device, delta_scale=delta_scale)
+            report = evaluate_market_policy(
+                val_env,
+                model.policy_net,
+                device=device,
+                delta_scale=delta_scale,
+            )
             sharpe = report["sharpe"]
             drawdown = report["max_drawdown"]
             guard = config.max_drawdown_guard
@@ -2060,7 +2064,7 @@ def load_market_policy(
             int(x) for x in os.environ.get("BYBIT_MM_POLICY_HIDDEN", "128,128").split(",")
         )
     model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims).to(device)
-    model.load_state_dict(state, strict=True)
+    model.net.load_state_dict(state, strict=True)
     model.eval()
     return model, None if log_std is None else np.asarray(log_std, dtype=np.float32)
 
