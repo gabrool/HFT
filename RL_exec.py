@@ -52,6 +52,13 @@ DEFAULT_MM_P1000_WEIGHT = 1.0
 DEFAULT_MM_NOTIONAL_SCALE = 1e4
 DEFAULT_MM_CASH_SCALE = 1e4
 DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
+SNAPSHOT_ALIGN_MATCH_RATE_TARGET = max(
+    0.995,
+    float(os.environ.get("SNAPSHOT_ALIGN_MATCH_RATE_TARGET", "0.995")),
+)
+SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
+    os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
+)
 
 
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
@@ -828,7 +835,7 @@ def align_snapshots_to_decisions(
     label: Optional[str] = None,
     *,
     tolerance_ms: int = 50,
-    match_rate_target: float = 0.99,
+    match_rate_target: float = SNAPSHOT_ALIGN_MATCH_RATE_TARGET,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
@@ -879,6 +886,8 @@ def align_snapshots_to_decisions(
 
     decision_median_dt = _median_dt(matched_decision_ts)
     snapshot_median_dt = _median_dt(matched_snapshot_ts)
+    snapshot_bound_first = int(snapshot_ts[0]) if snapshot_ts.size else None
+    snapshot_bound_last = int(snapshot_ts[-1]) if snapshot_ts.size else None
     if matched_decision_ts.size:
         decision_first = int(matched_decision_ts[0])
         decision_last = int(matched_decision_ts[-1])
@@ -886,6 +895,24 @@ def align_snapshots_to_decisions(
         snapshot_last = int(matched_snapshot_ts[-1])
     else:
         decision_first = decision_last = snapshot_first = snapshot_last = None
+    if matched_decision_ts.size:
+        assert snapshot_bound_first is not None and snapshot_bound_last is not None
+        assert (
+            abs(decision_first - snapshot_bound_first) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
+        ), (
+            "First matched decision timestamp is too far from snapshot start; "
+            f"decision_first={decision_first} snapshot_bound_first={snapshot_bound_first} "
+            f"delta_ms={abs(decision_first - snapshot_bound_first)} "
+            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}"
+        )
+        assert (
+            abs(decision_last - snapshot_bound_last) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
+        ), (
+            "Last matched decision timestamp is too far from snapshot end; "
+            f"decision_last={decision_last} snapshot_bound_last={snapshot_bound_last} "
+            f"delta_ms={abs(decision_last - snapshot_bound_last)} "
+            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}"
+        )
     if label:
         print(
             "[snapshot alignment]",
@@ -897,6 +924,8 @@ def align_snapshots_to_decisions(
             f"decision_last={_format_ts(decision_last) if decision_last is not None else 'n/a'}",
             f"snapshot_first={_format_ts(snapshot_first) if snapshot_first is not None else 'n/a'}",
             f"snapshot_last={_format_ts(snapshot_last) if snapshot_last is not None else 'n/a'}",
+            f"snapshot_bound_first={_format_ts(snapshot_bound_first) if snapshot_bound_first is not None else 'n/a'}",
+            f"snapshot_bound_last={_format_ts(snapshot_bound_last) if snapshot_bound_last is not None else 'n/a'}",
             f"decision_median_dt_ms={decision_median_dt:.2f}",
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f}",
         )
@@ -911,6 +940,7 @@ def align_snapshots_to_decisions(
             f"tolerance_ms={tolerance_ms} "
             f"decision_first={decision_first} decision_last={decision_last} "
             f"snapshot_first={snapshot_first} snapshot_last={snapshot_last} "
+            f"snapshot_bound_first={snapshot_bound_first} snapshot_bound_last={snapshot_bound_last} "
             f"decision_median_dt_ms={decision_median_dt:.2f} "
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f} "
             f"samples={samples}"
