@@ -974,6 +974,20 @@ def join_features(
     ret_pred = cmssl_out["ret_pred"]
     vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
+    if snapshot_mask.shape[0] != decision_ts.shape[0]:
+        raise ValueError(
+            "snapshot_mask length does not match decision_ts length: "
+            f"{snapshot_mask.shape[0]} vs {decision_ts.shape[0]}"
+        )
+    matched_mask = snapshot_mask.astype(bool)
+    if not np.all(matched_mask):
+        decision_ts = decision_ts[matched_mask]
+        y = y[matched_mask]
+        ret_pred = ret_pred[matched_mask]
+        vol_pred = vol_pred[matched_mask]
+        dir_logits = dir_logits[matched_mask]
+        snapshots = snapshots[matched_mask]
+        snapshot_mask = snapshot_mask[matched_mask]
     p_up = _sigmoid(dir_logits)
     horizons = [int(h) for h in meta.get("horizons_ms", [])]
     if not horizons:
