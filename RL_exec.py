@@ -1436,10 +1436,12 @@ class MarketMakingEnv:
                 self.inventory -= sell_fill
         return buy_fill, sell_fill
 
-    def _compute_penalty(self) -> float:
-        penalty = self.inventory_penalty * abs(self.inventory)
-        if self.max_inventory is not None and abs(self.inventory) > self.max_inventory:
-            penalty += self.inventory_penalty * (abs(self.inventory) - self.max_inventory)
+    def _compute_penalty(self, mid: float) -> float:
+        # Penalize inventory exposure in notional terms.
+        inventory_notional = self.inventory * mid
+        penalty = self.inventory_penalty * abs(inventory_notional)
+        if self.max_inventory is not None and abs(inventory_notional) > self.max_inventory:
+            penalty += self.inventory_penalty * (abs(inventory_notional) - self.max_inventory)
         return penalty
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
@@ -1480,7 +1482,7 @@ class MarketMakingEnv:
         delta_equity = equity - self.prev_equity
         rebate_notional = buy_fill * bid + sell_fill * ask
         rebate = rebate_notional * self.maker_rebate_bps * 1e-4
-        penalty = self._compute_penalty()
+        penalty = self._compute_penalty(mid_next)
         inv_notional = inv_new * mid_next
         excess = max(0.0, abs(inv_notional) - self.inv_soft)
         inv_penalty = (
