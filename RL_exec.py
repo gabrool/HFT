@@ -967,7 +967,8 @@ def join_features(
     conf_min = np.min(conf, axis=1)
     sigma = sigma_from_vol(vol_pred)
     sigma_bps = 1e4 * sigma
-    spread_bps = spread_bps_from_vol_pred(vol_pred[:, idx_short])
+    snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
+    spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
     alpha_bps = alpha_from_probs(p_up[:, idx_long], sigma_bps[:, idx_long])
 
     features = np.concatenate(
