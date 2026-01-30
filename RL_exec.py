@@ -1356,9 +1356,11 @@ class MarketMakingEnv:
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         cfg = self._baseline_cfg
         mid = self._mid_price(idx)
+        ret_pred = self._feature_slice(idx, 0, self._num_h)
         vol_pred = self._feature_slice(idx, self._num_h, 2 * self._num_h)
         p_up = self._feature_slice(idx, 3 * self._num_h, 4 * self._num_h)
         sigma_bps = 1e4 * float(sigma_from_vol(vol_pred[self._vol_horizon_idx]))
+        ret_forecast_bps = 1e4 * float(ret_pred[self._vol_horizon_idx])
         p250 = float(p_up[self._p250_idx])
         p500 = float(p_up[self._p500_idx])
         p1000 = float(p_up[self._p1000_idx])
@@ -1369,8 +1371,17 @@ class MarketMakingEnv:
             ) / weight_sum
         else:
             p_weighted = 0.5
-        alpha = (p_weighted - 0.5) * 2.0 * sigma_bps
-        half_spread_bps = cfg.s_min_bps + cfg.k_sigma * sigma_bps
+        # Blend the explicit return forecast with probability-weighted sigma to steer skew.
+        alpha = (p_weighted - 0.5) * 2.0 * sigma_bps + ret_forecast_bps
+        s_min_bps = cfg.s_min_bps
+        snapshot_offset = 4 * self._num_h + FEATURE_EXTRA_DIM
+        spread_idx = snapshot_offset + RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
+        if spread_idx < self.features.shape[1]:
+            observed_spread_bps = float(self.features[idx, spread_idx])
+            if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
+                # Anchor the minimum spread to the observed half-spread when snapshots are available.
+                s_min_bps = max(s_min_bps, 0.5 * observed_spread_bps)
+        half_spread_bps = s_min_bps + cfg.k_sigma * sigma_bps
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         inv_ref = cfg.inv_ref_notional if cfg.inv_ref_notional > 0.0 else 1.0
         inv_notional = self.inventory * mid
