@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK
+from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK, FeatureEngine, _open_text
 from offline_tokens import iter_week_chunks, load_global_meta
 
 RAW_SNAPSHOT_PATHS = [
@@ -31,6 +31,7 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "vol_short",
     "vol_long",
 ]
+RAW_OB_DIR = os.environ.get("BYBIT_OB_DIR", "").strip()
 FEATURE_EXTRA_DIM = 5
 SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
@@ -659,6 +660,83 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
     return df[["ts", "best_bid", "best_ask"]]
 
 
+def _resolve_ob_path(week_key: str, ob_dir: str) -> Path:
+    if not ob_dir:
+        raise FileNotFoundError(
+            "BYBIT_OB_DIR not set; cannot reconstruct snapshots from delta stream."
+        )
+    prefix = "BTCUSDT_OB_"
+    if week_key.startswith(prefix):
+        pattern = f"{week_key}*"
+    else:
+        pattern = f"{prefix}{week_key}*"
+    candidates = sorted(Path(ob_dir).glob(pattern))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No OB delta stream found for week {week_key} in {ob_dir} "
+            f"matching {pattern}"
+        )
+    return candidates[0]
+
+
+def _iter_ob_events(ob_path: Path) -> Iterable[Dict[str, Any]]:
+    with _open_text(str(ob_path)) as f:
+        for line in f:
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+def _reconstruct_snapshots_from_ob_stream(ob_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    fe = FeatureEngine()
+    ts_list: List[int] = []
+    bids: List[float] = []
+    asks: List[float] = []
+
+    next_sample_ts: Optional[int] = None
+    last_bid: Optional[float] = None
+    last_ask: Optional[float] = None
+
+    for raw in _iter_ob_events(ob_path):
+        etype, ts_ms, payload = fe._parse_event(raw)
+        if etype != "ob":
+            continue
+
+        if last_bid is not None and last_ask is not None and next_sample_ts is not None:
+            while next_sample_ts < ts_ms:
+                ts_list.append(int(next_sample_ts))
+                bids.append(float(last_bid))
+                asks.append(float(last_ask))
+                next_sample_ts += RAW_SNAPSHOT_EXPECTED_STEP_MS
+
+        fe._update_book_from_ob(payload)
+        bid, ask, _bsz, _asz = fe._book_best()
+        if bid <= 0.0 or ask <= 0.0:
+            continue
+
+        if next_sample_ts is None:
+            next_sample_ts = int(ts_ms)
+
+        while next_sample_ts <= ts_ms:
+            ts_list.append(int(next_sample_ts))
+            bids.append(float(bid))
+            asks.append(float(ask))
+            next_sample_ts += RAW_SNAPSHOT_EXPECTED_STEP_MS
+
+        last_bid = bid
+        last_ask = ask
+
+    snapshot_ts = np.asarray(ts_list, dtype=np.int64)
+    snapshots = np.column_stack([bids, asks]).astype(np.float32)
+    return snapshot_ts, snapshots
+
+
+def _cache_reconstructed_snapshots(week_dir: Path, snapshot_ts: np.ndarray, snapshots: np.ndarray) -> Path:
+    out_path = week_dir / "snapshots.npz"
+    np.savez_compressed(out_path, ts=snapshot_ts, snapshots=snapshots)
+    return out_path
+
+
 def _ensure_sorted_near_regular(ts: np.ndarray) -> None:
     if ts.ndim != 1:
         raise ValueError("Snapshot timestamps must be 1D.")
@@ -747,10 +825,12 @@ def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.nda
     ]
     path = next((p for p in candidates if p.exists()), None)
     if path is None:
-        raise FileNotFoundError(
-            f"No raw snapshot file found in {week_dir}. Expected one of: "
-            f"{', '.join(p.name for p in candidates)}"
-        )
+        ob_path = _resolve_ob_path(week_key, RAW_OB_DIR)
+        snapshot_ts, snapshots = _reconstruct_snapshots_from_ob_stream(ob_path)
+        if snapshot_ts.size == 0:
+            raise ValueError(f"No snapshots reconstructed from {ob_path}")
+        _cache_reconstructed_snapshots(week_dir, snapshot_ts, snapshots)
+        return snapshot_ts, snapshots
 
     if path.suffix == ".npz":
         data = np.load(path)
