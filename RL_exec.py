@@ -1486,7 +1486,8 @@ class MarketMakingEnv:
         inv_penalty = (
             self.lambda_inv * (excess / self.inv_soft) ** 2 if self.inv_soft > 0.0 else 0.0
         )
-        turnover_penalty = self.lambda_turn * abs(inv_new - inv_prev)
+        turnover_notional = buy_fill * bid + sell_fill * ask
+        turnover_penalty = self.lambda_turn * turnover_notional
         reward = delta_equity + rebate - penalty - inv_penalty - turnover_penalty
 
         self.prev_equity = equity
