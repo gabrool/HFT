@@ -60,6 +60,8 @@ DEFAULT_MM_P1000_WEIGHT = 1.0
 DEFAULT_MM_NOTIONAL_SCALE = 1e4
 DEFAULT_MM_CASH_SCALE = 1e4
 DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
+DEFAULT_MM_TAKER_FEE_BPS = 1.7
+DEFAULT_MM_TAKER_THRESHOLD = 0.25
 SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
     os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
 )
@@ -1212,13 +1214,6 @@ def persist_split_bounds(out_root: str, bounds: Dict[str, Dict[str, int]], total
 
 
 @dataclass
-class TradingBatch:
-    features: np.ndarray
-    returns: np.ndarray
-    spread_bps: np.ndarray
-
-
-@dataclass
 class MarketMakingBatch:
     features: np.ndarray
     spread_bps: np.ndarray
@@ -1233,6 +1228,9 @@ class MarketMakingEnv:
         batch: MarketMakingBatch,
         *,
         maker_rebate_bps: float = 0.0,
+        taker_fee_bps: float = DEFAULT_MM_TAKER_FEE_BPS,
+        allow_taker: bool = True,
+        taker_threshold: float = DEFAULT_MM_TAKER_THRESHOLD,
         inventory_penalty: float = 0.0,
         inv_soft: float = 1.0,
         lambda_inv: float = 0.0,
@@ -1248,6 +1246,9 @@ class MarketMakingEnv:
         self.best_ask = batch.best_ask
         self.alpha_bps = batch.alpha_bps if batch.alpha_bps is not None else np.zeros_like(self.spread_bps)
         self.maker_rebate_bps = maker_rebate_bps
+        self.taker_fee_bps = taker_fee_bps
+        self.allow_taker = allow_taker
+        self.taker_threshold = taker_threshold
         self.inventory_penalty = inventory_penalty
         self.inv_soft = inv_soft
         self.lambda_inv = lambda_inv
@@ -1358,12 +1359,15 @@ class MarketMakingEnv:
         normalized[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
         return normalized
 
-    def _parse_action(self, action: Any) -> Tuple[float, float]:
-        if isinstance(action, (list, tuple, np.ndarray)) and len(action) == 2:
-            return float(action[0]), float(action[1])
+    def _parse_action(self, action: Any) -> Tuple[float, float, float]:
+        if isinstance(action, (list, tuple, np.ndarray)):
+            if len(action) == 3:
+                return float(action[0]), float(action[1]), float(action[2])
+            if len(action) == 2:
+                return float(action[0]), float(action[1]), 0.0
         if np.isscalar(action):
-            return float(action), float(action)
-        raise ValueError("Action must be a scalar or (bid_delta_bps, ask_delta_bps).")
+            return float(action), float(action), 0.0
+        raise ValueError("Action must be a scalar or (bid_delta_bps, ask_delta_bps[, taker_signal]).")
 
     def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
         return self.features[idx, start:end]
@@ -1409,7 +1413,7 @@ class MarketMakingEnv:
         return bid, ask, mid
 
     def _apply_deltas(self, bid: float, ask: float, mid: float, action: Any) -> Tuple[float, float]:
-        bid_delta_bps, ask_delta_bps = self._parse_action(action)
+        bid_delta_bps, ask_delta_bps, _taker_signal = self._parse_action(action)
         if self.delta_bps_limit is not None:
             bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
             ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
@@ -1460,6 +1464,25 @@ class MarketMakingEnv:
                 self.inventory -= sell_fill
         return buy_fill, sell_fill
 
+    def _apply_taker(self, idx: int, taker_signal: float) -> Tuple[float, float]:
+        if not self.allow_taker:
+            return 0.0, 0.0
+        if abs(taker_signal) < self.taker_threshold:
+            return 0.0, 0.0
+        best_bid = float(self.best_bid[idx])
+        best_ask = float(self.best_ask[idx])
+        buy_fill = 0.0
+        sell_fill = 0.0
+        if taker_signal > 0.0:
+            buy_fill = self.fill_size
+            self.cash -= best_ask * buy_fill
+            self.inventory += buy_fill
+        elif taker_signal < 0.0:
+            sell_fill = self.fill_size
+            self.cash += best_bid * sell_fill
+            self.inventory -= sell_fill
+        return buy_fill, sell_fill
+
     def _compute_penalty(self, mid: float) -> float:
         # Penalize inventory exposure in notional terms.
         inventory_notional = self.inventory * mid
@@ -1486,17 +1509,25 @@ class MarketMakingEnv:
                 "turnover_penalty": 0.0,
                 "bid": 0.0,
                 "ask": 0.0,
-                "buy_fill": 0.0,
-                "sell_fill": 0.0,
+                "maker_buy": 0.0,
+                "maker_sell": 0.0,
+                "taker_buy": 0.0,
+                "taker_sell": 0.0,
+                "taker_fee": 0.0,
             }
             return self._build_observation(self.idx), 0.0, True, info
         bid, ask, mid = self._baseline_quotes(self.idx)
         bid, ask = self._apply_deltas(bid, ask, mid, action)
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
-        buy_fill, sell_fill = self._apply_fills(bid, ask, next_idx)
+        _bid_delta, _ask_delta, taker_signal = self._parse_action(action)
+        taker_buy, taker_sell = self._apply_taker(self.idx, taker_signal)
+        maker_buy = 0.0
+        maker_sell = 0.0
+        if taker_buy == 0.0 and taker_sell == 0.0:
+            maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
         inv_new = self.inventory
-        if buy_fill > 0.0 or sell_fill > 0.0:
+        if maker_buy > 0.0 or maker_sell > 0.0 or taker_buy > 0.0 or taker_sell > 0.0:
             self.time_since_last_fill = 0.0
         else:
             self.time_since_last_fill += 1.0
@@ -1504,17 +1535,19 @@ class MarketMakingEnv:
         mid_next = self._mid_price(next_idx)
         equity = self.cash + self.inventory * mid_next
         delta_equity = equity - self.prev_equity
-        rebate_notional = buy_fill * bid + sell_fill * ask
-        rebate = rebate_notional * self.maker_rebate_bps * 1e-4
+        maker_rebate_notional = maker_buy * bid + maker_sell * ask
+        rebate = maker_rebate_notional * self.maker_rebate_bps * 1e-4
+        taker_notional = taker_buy * float(self.best_ask[self.idx]) + taker_sell * float(self.best_bid[self.idx])
+        taker_fee = taker_notional * self.taker_fee_bps * 1e-4
         penalty = self._compute_penalty(mid_next)
         inv_notional = inv_new * mid_next
         excess = max(0.0, abs(inv_notional) - self.inv_soft)
         inv_penalty = (
             self.lambda_inv * (excess / self.inv_soft) ** 2 if self.inv_soft > 0.0 else 0.0
         )
-        turnover_notional = buy_fill * bid + sell_fill * ask
+        turnover_notional = maker_rebate_notional + taker_notional
         turnover_penalty = self.lambda_turn * turnover_notional
-        reward = delta_equity + rebate - penalty - inv_penalty - turnover_penalty
+        reward = delta_equity + rebate - taker_fee - penalty - inv_penalty - turnover_penalty
 
         self.prev_equity = equity
         self.total_reward += reward
@@ -1529,50 +1562,18 @@ class MarketMakingEnv:
             "equity": float(equity),
             "delta_equity": float(delta_equity),
             "rebate": float(rebate),
+            "taker_fee": float(taker_fee),
             "penalty": float(penalty),
             "inv_penalty": float(inv_penalty),
             "turnover_penalty": float(turnover_penalty),
             "bid": float(bid),
             "ask": float(ask),
-            "buy_fill": float(buy_fill),
-            "sell_fill": float(sell_fill),
+            "maker_buy": float(maker_buy),
+            "maker_sell": float(maker_sell),
+            "taker_buy": float(taker_buy),
+            "taker_sell": float(taker_sell),
         }
         return next_obs, float(reward), done, info
-
-
-class TradingEnv:
-    def __init__(self, batch: TradingBatch):
-        self.features = batch.features
-        self.returns = batch.returns
-        self.spread_bps = batch.spread_bps
-        self.n = len(self.returns)
-        self.idx = 0
-        self.position = 0
-        self.total_reward = 0.0
-
-    def reset(self) -> np.ndarray:
-        self.idx = 0
-        self.position = 0
-        self.total_reward = 0.0
-        return self.features[self.idx]
-
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
-        action_map = {0: -1, 1: 0, 2: 1}
-        action_sign = action_map.get(action, 0)
-        ret = float(self.returns[self.idx])
-        spread_cost = float(self.spread_bps[self.idx]) * 1e-4
-        turnover = abs(action_sign - self.position)
-        reward = action_sign * ret - turnover * spread_cost
-        self.total_reward += reward
-        self.position = action_sign
-        self.idx += 1
-        done = self.idx >= self.n
-        next_obs = self.features[self.idx - 1] if done else self.features[self.idx]
-        info = {
-            "reward": reward,
-            "total_reward": self.total_reward,
-        }
-        return next_obs, reward, done, info
 
 
 class MLP(nn.Module):
@@ -1591,29 +1592,11 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class PolicyValueNet(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        policy_hidden: Iterable[int] = (128, 128),
-        value_hidden: Iterable[int] = (128, 128),
-        action_dim: int = 3,
-    ):
-        super().__init__()
-        self.policy_net = MLP(input_dim, policy_hidden, action_dim)
-        self.value_net = MLP(input_dim, value_hidden, 1)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits = self.policy_net(x)
-        value = self.value_net(x).squeeze(-1)
-        return logits, value
-
-
 class MarketPolicyNet(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: Iterable[int] = (128, 128)):
+    def __init__(self, input_dim: int, hidden_dims: Iterable[int] = (128, 128), action_dim: int = 3):
         super().__init__()
         # MarketPolicyNet wraps its MLP under .net for compatibility with checkpoints.
-        self.net = MLP(input_dim, hidden_dims, 2)
+        self.net = MLP(input_dim, hidden_dims, action_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -1625,7 +1608,7 @@ class MarketPolicyValueNet(nn.Module):
         input_dim: int,
         policy_hidden: Iterable[int] = (128, 128),
         value_hidden: Iterable[int] = (128, 128),
-        action_dim: int = 2,
+        action_dim: int = 3,
         init_log_std: float = -0.5,
     ):
         super().__init__()
@@ -1656,42 +1639,6 @@ class PPOConfig:
     max_drawdown_guard: Optional[float] = None
 
 
-def collect_rollout(env: TradingEnv, model: PolicyValueNet, device: str) -> Dict[str, torch.Tensor]:
-    obs_list = []
-    action_list = []
-    logp_list = []
-    value_list = []
-    reward_list = []
-    done_list = []
-
-    obs = env.reset()
-    done = False
-    while not done:
-        obs_t = torch.from_numpy(obs).float().to(device)
-        logits, value = model(obs_t.unsqueeze(0))
-        dist = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        logp = dist.log_prob(action)
-        next_obs, reward, done, _info = env.step(int(action.item()))
-
-        obs_list.append(obs_t)
-        action_list.append(action)
-        logp_list.append(logp)
-        value_list.append(value.squeeze(0))
-        reward_list.append(torch.tensor(reward, dtype=torch.float32, device=device))
-        done_list.append(torch.tensor(done, dtype=torch.float32, device=device))
-        obs = next_obs
-
-    return {
-        "obs": torch.stack(obs_list),
-        "actions": torch.stack(action_list),
-        "logp": torch.stack(logp_list),
-        "values": torch.stack(value_list),
-        "rewards": torch.stack(reward_list),
-        "dones": torch.stack(done_list),
-    }
-
-
 def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, gamma: float, lam: float):
     advantages = torch.zeros_like(rewards)
     last_gae = 0.0
@@ -1706,49 +1653,12 @@ def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor
     return advantages, returns
 
 
-def ppo_update(
-    model: PolicyValueNet,
-    optimizer: optim.Optimizer,
-    rollout: Dict[str, torch.Tensor],
-    config: PPOConfig,
-    device: str,
-):
-    obs = rollout["obs"].to(device)
-    actions = rollout["actions"].to(device)
-    old_logp = rollout["logp"].detach().to(device)
-    values = rollout["values"].detach().to(device)
-    rewards = rollout["rewards"].to(device)
-    dones = rollout["dones"].to(device)
-
-    advantages, returns = compute_gae(rewards, values, dones, config.gamma, config.gae_lambda)
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    n = obs.shape[0]
-    indices = torch.arange(n)
-    for _ in range(config.update_epochs):
-        perm = indices[torch.randperm(n)]
-        for start in range(0, n, config.batch_size):
-            mb_idx = perm[start:start + config.batch_size]
-            logits, value = model(obs[mb_idx])
-            dist = torch.distributions.Categorical(logits=logits)
-            logp = dist.log_prob(actions[mb_idx])
-            ratio = torch.exp(logp - old_logp[mb_idx])
-            clip_adv = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * advantages[mb_idx]
-            policy_loss = -(torch.min(ratio * advantages[mb_idx], clip_adv)).mean()
-            value_loss = nn.functional.mse_loss(value, returns[mb_idx])
-            entropy_loss = dist.entropy().mean()
-            loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-
 def collect_market_rollout(
     env: MarketMakingEnv,
     model: MarketPolicyValueNet,
     device: str,
     delta_scale: float = 1.0,
+    taker_scale: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     obs_list = []
     action_list = []
@@ -1766,7 +1676,14 @@ def collect_market_rollout(
         dist = torch.distributions.Normal(mean, std)
         action = dist.sample()
         logp = dist.log_prob(action).sum(dim=-1)
-        scaled_action = (action.squeeze(0) * delta_scale).cpu().numpy()
+        action_np = action.squeeze(0).cpu().numpy()
+        if action_np.shape[0] >= 3:
+            scaled_action = np.array(
+                [action_np[0] * delta_scale, action_np[1] * delta_scale, action_np[2] * taker_scale],
+                dtype=np.float32,
+            )
+        else:
+            scaled_action = np.array([action_np[0] * delta_scale, action_np[1] * delta_scale], dtype=np.float32)
         next_obs, reward, done, _info = env.step(scaled_action)
 
         obs_list.append(obs_t)
@@ -1844,77 +1761,24 @@ def compute_max_drawdown(returns: np.ndarray) -> float:
     return float(drawdown.max(initial=0.0))
 
 
-def train_ppo(
-    train_env: TradingEnv,
-    val_env: TradingEnv,
-    input_dim: int,
-    device: str = "cuda",
-    epochs: int = 10,
-    config: Optional[PPOConfig] = None,
-    ckpt_path: Optional[Path] = None,
-) -> Tuple[PolicyValueNet, Dict[str, float]]:
-    config = config or PPOConfig()
-    model = PolicyValueNet(
-        input_dim,
-        policy_hidden=config.policy_hidden,
-        value_hidden=config.value_hidden,
-    ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    best_report: Dict[str, float] = {"sharpe": -np.inf}
-
-    for epoch in range(epochs):
-        rollout = collect_rollout(train_env, model, device)
-        ppo_update(model, optimizer, rollout, config, device)
-        if (epoch + 1) % config.val_every == 0:
-            report = evaluate_policy(val_env, model, device=device)
-            sharpe = report["sharpe"]
-            drawdown = report["max_drawdown"]
-            guard = config.max_drawdown_guard
-            if sharpe > best_report.get("sharpe", -np.inf) and (guard is None or drawdown <= guard):
-                best_report = report
-                if ckpt_path:
-                    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(
-                        {
-                            "state_dict": model.state_dict(),
-                            "config": config.__dict__,
-                            "val_report": report,
-                        },
-                        ckpt_path,
-                    )
-    return model, best_report
-
-
-def evaluate_policy(env: TradingEnv, model: PolicyValueNet, device: str = "cuda") -> Dict[str, float]:
-    obs = env.reset()
-    done = False
-    rewards = []
-    while not done:
-        obs_t = torch.from_numpy(obs).float().to(device)
-        logits, _value = model(obs_t.unsqueeze(0))
-        action = torch.argmax(logits, dim=-1)
-        obs, reward, done, _info = env.step(int(action.item()))
-        rewards.append(reward)
-    rewards_arr = np.array(rewards, dtype=np.float32)
-    return {
-        "total_reward": float(rewards_arr.sum()),
-        "mean_reward": float(rewards_arr.mean()) if rewards_arr.size else 0.0,
-        "sharpe": compute_sharpe(rewards_arr),
-        "max_drawdown": compute_max_drawdown(rewards_arr),
-    }
-
-
 def evaluate_market_policy(
     env: MarketMakingEnv,
     policy: MarketPolicyNet,
     device: str = "cuda",
     delta_scale: float = 1.0,
+    taker_scale: float = 1.0,
 ) -> Dict[str, Any]:
-    def _policy_fn(obs: np.ndarray) -> Tuple[float, float]:
+    def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
         obs_t = torch.from_numpy(obs).float().to(device)
         with torch.no_grad():
             deltas = policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-        return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale)
+        if deltas.shape[0] >= 3:
+            return (
+                float(deltas[0] * delta_scale),
+                float(deltas[1] * delta_scale),
+                float(deltas[2] * taker_scale),
+            )
+        return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
 
     return evaluate_market_making(env, _policy_fn)
 
@@ -1928,18 +1792,26 @@ def train_market_ppo(
     config: Optional[PPOConfig] = None,
     ckpt_path: Optional[Path] = None,
     delta_scale: float = 1.0,
+    taker_scale: float = 1.0,
 ) -> Tuple[MarketPolicyValueNet, Dict[str, Any]]:
     config = config or PPOConfig()
     model = MarketPolicyValueNet(
         input_dim,
         policy_hidden=config.policy_hidden,
         value_hidden=config.value_hidden,
+        action_dim=int(os.environ.get("BYBIT_MM_ACTION_DIM", "3")),
     ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     best_report: Dict[str, Any] = {"sharpe": -np.inf}
 
     for epoch in range(epochs):
-        rollout = collect_market_rollout(train_env, model, device, delta_scale=delta_scale)
+        rollout = collect_market_rollout(
+            train_env,
+            model,
+            device,
+            delta_scale=delta_scale,
+            taker_scale=taker_scale,
+        )
         ppo_update_market(model, optimizer, rollout, config, device)
         if (epoch + 1) % config.val_every == 0:
             report = evaluate_market_policy(
@@ -1947,6 +1819,7 @@ def train_market_ppo(
                 model.policy_net,
                 device=device,
                 delta_scale=delta_scale,
+                taker_scale=taker_scale,
             )
             sharpe = report["sharpe"]
             drawdown = report["max_drawdown"]
@@ -1961,6 +1834,7 @@ def train_market_ppo(
                             "value_state_dict": model.value_net.state_dict(),
                             "log_std": model.log_std.detach().cpu().numpy(),
                             "hidden_dims": tuple(config.policy_hidden),
+                            "action_dim": model.log_std.shape[0],
                             "config": config.__dict__,
                             "val_report": report,
                         },
@@ -2051,8 +1925,13 @@ def evaluate_market_making(
         obs, _reward, done, info = env.step(action)
         equity_curve.append(info["equity"])
         inventory_curve.append(info["inventory"])
-        turnover += abs(info["buy_fill"]) + abs(info["sell_fill"])
-        fill_count += int(info["buy_fill"] > 0.0) + int(info["sell_fill"] > 0.0)
+        turnover += abs(info["maker_buy"]) + abs(info["maker_sell"]) + abs(info["taker_buy"]) + abs(info["taker_sell"])
+        fill_count += (
+            int(info["maker_buy"] > 0.0)
+            + int(info["maker_sell"] > 0.0)
+            + int(info["taker_buy"] > 0.0)
+            + int(info["taker_sell"] > 0.0)
+        )
         fill_opps += 2
 
     equity_arr = np.array(equity_curve, dtype=np.float32)
@@ -2105,7 +1984,13 @@ def load_market_policy(
         hidden_dims = tuple(
             int(x) for x in os.environ.get("BYBIT_MM_POLICY_HIDDEN", "128,128").split(",")
         )
-    model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims).to(device)
+    if isinstance(ckpt, dict) and "action_dim" in ckpt:
+        action_dim = int(ckpt["action_dim"])
+    elif log_std is not None:
+        action_dim = int(np.asarray(log_std).shape[0])
+    else:
+        action_dim = int(os.environ.get("BYBIT_MM_ACTION_DIM", "3"))
+    model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims, action_dim=action_dim).to(device)
     model.net.load_state_dict(state, strict=True)
     model.eval()
     return model, None if log_std is None else np.asarray(log_std, dtype=np.float32)
@@ -2146,50 +2031,6 @@ def run_pipeline(
     splits_rl = chronological_split(joined_test, ratios=(0.6, 0.2, 0.2))
     persist_split_bounds(out_root, splits_rl["bounds"], total=len(joined_test["ts"]))
 
-    def _to_env(split: Dict[str, np.ndarray]) -> TradingEnv:
-        returns = split["y"][:, 0]
-        batch = TradingBatch(
-            features=split["features"],
-            returns=returns,
-            spread_bps=split["spread_bps"],
-        )
-        return TradingEnv(batch)
-
-    train_env = _to_env(splits_rl["train"])
-    val_env = _to_env(splits_rl["val"])
-    test_env = _to_env(splits_rl["test"])
-
-    input_dim = train_env.features.shape[-1]
-    ppo_config = PPOConfig(
-        lr=float(os.environ.get("BYBIT_PPO_LR", "3e-4")),
-        update_epochs=int(os.environ.get("BYBIT_PPO_UPDATE_EPOCHS", "4")),
-        batch_size=int(os.environ.get("BYBIT_PPO_BATCH_SIZE", "256")),
-        clip_ratio=float(os.environ.get("BYBIT_PPO_CLIP_RATIO", "0.2")),
-        gamma=float(os.environ.get("BYBIT_PPO_GAMMA", "0.99")),
-        gae_lambda=float(os.environ.get("BYBIT_PPO_GAE_LAMBDA", "0.95")),
-        entropy_coef=float(os.environ.get("BYBIT_PPO_ENTROPY_COEF", "0.01")),
-        value_coef=float(os.environ.get("BYBIT_PPO_VALUE_COEF", "0.5")),
-        policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_PPO_POLICY_HIDDEN", "128,128").split(",")),
-        value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_PPO_VALUE_HIDDEN", "128,128").split(",")),
-        val_every=int(os.environ.get("BYBIT_PPO_VAL_EVERY", "1")),
-        max_drawdown_guard=float(os.environ.get("BYBIT_PPO_MAX_DRAWDOWN", "nan")),
-    )
-    if np.isnan(ppo_config.max_drawdown_guard):
-        ppo_config.max_drawdown_guard = None
-    best_ckpt = Path(os.environ.get("BYBIT_PPO_BEST_CKPT", Path(out_root) / "ppo_best.pt"))
-    ppo_model, best_val = train_ppo(
-        train_env,
-        val_env,
-        input_dim,
-        device=device,
-        epochs=ppo_epochs,
-        config=ppo_config,
-        ckpt_path=best_ckpt,
-    )
-
-    val_report = evaluate_policy(val_env, ppo_model, device=device)
-    test_report = evaluate_policy(test_env, ppo_model, device=device)
-
     mm_train_batch = build_market_batch(splits_rl["train"])
     mm_val_batch = build_market_batch(splits_rl["val"])
     mm_test_batch = build_market_batch(splits_rl["test"])
@@ -2201,12 +2042,19 @@ def run_pipeline(
     fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "1.0"))
+    taker_scale = float(os.environ.get("BYBIT_MM_TAKER_SCALE", "1.0"))
+    allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
+    taker_fee_bps = float(os.environ.get("BYBIT_MM_TAKER_FEE_BPS", str(DEFAULT_MM_TAKER_FEE_BPS)))
+    taker_threshold = float(os.environ.get("BYBIT_MM_TAKER_THRESHOLD", str(DEFAULT_MM_TAKER_THRESHOLD)))
     delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
     delta_bps_limit = float(delta_bps_limit_str) if delta_bps_limit_str else None
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
         maker_rebate_bps=maker_rebate_bps,
+        taker_fee_bps=taker_fee_bps,
+        allow_taker=allow_taker,
+        taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
         max_inventory=max_inventory,
         fill_size=fill_size,
@@ -2216,6 +2064,9 @@ def run_pipeline(
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
         maker_rebate_bps=maker_rebate_bps,
+        taker_fee_bps=taker_fee_bps,
+        allow_taker=allow_taker,
+        taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
         max_inventory=max_inventory,
         fill_size=fill_size,
@@ -2225,6 +2076,9 @@ def run_pipeline(
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
         maker_rebate_bps=maker_rebate_bps,
+        taker_fee_bps=taker_fee_bps,
+        allow_taker=allow_taker,
+        taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
         max_inventory=max_inventory,
         fill_size=fill_size,
@@ -2258,37 +2112,50 @@ def run_pipeline(
         config=mm_ppo_config,
         ckpt_path=mm_best_ckpt,
         delta_scale=delta_scale,
+        taker_scale=taker_scale,
     )
 
     baseline_env = MarketMakingEnv(
         mm_test_batch,
         maker_rebate_bps=maker_rebate_bps,
+        taker_fee_bps=taker_fee_bps,
+        allow_taker=False,
+        taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
     )
-    baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0))
+    baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
     mm_policy_path = os.environ.get("BYBIT_MM_RL_CKPT", "").strip() or str(mm_best_ckpt)
     mm_policy, _log_std = load_market_policy(mm_obs_dim, device=device, ckpt_path=mm_policy_path or None)
     if mm_policy is None:
         print("[mm eval] no BYBIT_MM_RL_CKPT provided; using baseline deltas for RL run.")
-        rl_policy_fn = lambda _obs: (0.0, 0.0)
+        rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
         rl_policy_loaded = False
     else:
         rl_policy_loaded = True
 
-        def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float]:
+        def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
             obs_t = torch.from_numpy(obs).float().to(device)
             with torch.no_grad():
                 deltas = mm_policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-            return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale)
+            if deltas.shape[0] >= 3:
+                return (
+                    float(deltas[0] * delta_scale),
+                    float(deltas[1] * delta_scale),
+                    float(deltas[2] * taker_scale),
+                )
+            return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
 
     rl_env = MarketMakingEnv(
         mm_test_batch,
         maker_rebate_bps=maker_rebate_bps,
+        taker_fee_bps=taker_fee_bps,
+        allow_taker=allow_taker,
+        taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
         max_inventory=max_inventory,
         fill_size=fill_size,
@@ -2302,9 +2169,6 @@ def run_pipeline(
 
     return {
         "cmssl_test": cmssl_report,
-        "ppo_val": val_report,
-        "ppo_val_best": best_val,
-        "ppo_test": test_report,
         "mm_baseline": baseline_metrics,
         "mm_rl": rl_metrics,
         "mm_rl_policy_loaded": {"loaded": rl_policy_loaded},
@@ -2322,6 +2186,5 @@ if __name__ == "__main__":
 
     report = run_pipeline(out_root, ckpt_path, device=device, ppo_epochs=ppo_epochs)
     print("[cmssl test]", report["cmssl_test"])
-    print("[ppo val]", report["ppo_val"])
-    print("[ppo val best]", report["ppo_val_best"])
-    print("[ppo test]", report["ppo_test"])
+    print("[mm baseline]", report["mm_baseline"])
+    print("[mm rl]", report["mm_rl"])
