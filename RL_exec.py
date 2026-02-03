@@ -172,19 +172,6 @@ def sigma_from_vol(log_vol: np.ndarray) -> np.ndarray:
     return np.exp(log_vol)
 
 
-def spread_bps_from_vol_pred(vol_pred: np.ndarray, spread_mult: float = 1.0) -> np.ndarray:
-    """
-    Convert model vol predictions into a spread size in basis points.
-
-    vol_pred is trained against y_logvol (log volatility), so we recover
-    sigma by exponentiating the log-vol and then scale to bps.
-    If the model ever switches to predicting log-variance, use
-    sigma = exp(0.5 * logvar) instead.
-    """
-    sigma_bps = 1e4 * sigma_from_vol(vol_pred)
-    return spread_mult * sigma_bps
-
-
 def alpha_from_probs(p_up: np.ndarray, sigma_bps: np.ndarray) -> np.ndarray:
     """Convert directional probabilities into a signed alpha in bps."""
     return (p_up - 0.5) * 2.0 * sigma_bps
