@@ -977,7 +977,7 @@ def align_snapshots_to_decisions(
     *,
     tolerance_ms: int = 50,
     match_rate_target: float = SNAPSHOT_ALIGN_MATCH_RATE_TARGET,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
     if decision_ts.ndim != 1:
@@ -990,8 +990,6 @@ def align_snapshots_to_decisions(
     if snapshot_ts.size and np.any(np.diff(snapshot_ts) < 0):
         raise ValueError("snapshot_ts must be monotonically non-decreasing after sorting")
     if snapshot_ts.size == 0:
-        matched = np.zeros(decision_ts.shape[0], dtype=bool)
-        aligned = np.full((decision_ts.shape[0], snapshots.shape[1]), np.nan, dtype=np.float32)
         match_rate = 0.0
         raise ValueError(
             "Snapshot alignment failed; no snapshots available to match decisions. "
@@ -1090,7 +1088,7 @@ def align_snapshots_to_decisions(
             f"decision_median_dt_ms={decision_median_dt:.2f} "
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f} "
         )
-    return aligned, matched
+    return aligned
 
 
 def _resolve_horizon_indices(meta: dict, targets: Iterable[int]) -> Dict[int, int]:
@@ -1113,26 +1111,11 @@ def join_features(
     y: np.ndarray,
     cmssl_out: Dict[str, np.ndarray],
     snapshots: np.ndarray,
-    snapshot_mask: np.ndarray,
     meta: dict,
 ) -> Dict[str, np.ndarray]:
     ret_pred = cmssl_out["ret_pred"]
     vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
-    if snapshot_mask.shape[0] != decision_ts.shape[0]:
-        raise ValueError(
-            "snapshot_mask length does not match decision_ts length: "
-            f"{snapshot_mask.shape[0]} vs {decision_ts.shape[0]}"
-        )
-    matched_mask = snapshot_mask.astype(bool)
-    if not np.all(matched_mask):
-        decision_ts = decision_ts[matched_mask]
-        y = y[matched_mask]
-        ret_pred = ret_pred[matched_mask]
-        vol_pred = vol_pred[matched_mask]
-        dir_logits = dir_logits[matched_mask]
-        snapshots = snapshots[matched_mask]
-        snapshot_mask = snapshot_mask[matched_mask]
     p_up = _sigmoid(dir_logits)
     horizons = [int(h) for h in meta.get("horizons_ms", [])]
     if not horizons:
@@ -1181,7 +1164,6 @@ def join_features(
         "y": y.astype(np.float32),
         "spread_bps": spread_bps.astype(np.float32),
         "alpha_bps": alpha_bps.astype(np.float32),
-        "snapshot_mask": snapshot_mask.astype(np.bool_),
         "snapshots": snapshots.astype(np.float32),
     }
 
@@ -1210,14 +1192,13 @@ def build_joined_split(
     else:
         snapshot_ts, raw_snapshots = load_raw_snapshots(out_root, split["week"])
         snapshot_ts, snapshots = _compute_snapshot_feature_matrix(snapshot_ts, raw_snapshots)
-    aligned_snapshots, snapshot_mask = align_snapshots_to_decisions(
+    aligned_snapshots = align_snapshots_to_decisions(
         ts,
         snapshot_ts,
         snapshots,
         label=split_label,
     )
-    assert snapshot_mask.all(), "Snapshot alignment mask contains unmatched decisions."
-    return join_features(ts, y, cmssl_out, aligned_snapshots, snapshot_mask, meta)
+    return join_features(ts, y, cmssl_out, aligned_snapshots, meta)
 
 
 def chronological_split(
@@ -1272,7 +1253,6 @@ class MarketMakingBatch:
     best_bid: np.ndarray
     best_ask: np.ndarray
     alpha_bps: Optional[np.ndarray] = None
-    snapshot_mask: Optional[np.ndarray] = None
 
 
 class MarketMakingEnv:
@@ -1295,9 +1275,6 @@ class MarketMakingEnv:
         self.best_bid = batch.best_bid
         self.best_ask = batch.best_ask
         self.alpha_bps = batch.alpha_bps if batch.alpha_bps is not None else np.zeros_like(self.spread_bps)
-        self.snapshot_mask = (
-            batch.snapshot_mask if batch.snapshot_mask is not None else np.ones_like(self.best_bid, dtype=bool)
-        )
         self.maker_rebate_bps = maker_rebate_bps
         self.inventory_penalty = inventory_penalty
         self.inv_soft = inv_soft
@@ -1481,8 +1458,6 @@ class MarketMakingEnv:
         return bid, ask
 
     def _apply_fills(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
-        if not bool(self.snapshot_mask[idx]):
-            return 0.0, 0.0
         touch_epsilon = 1e-9
         best_bid_next = float(self.best_bid[idx])
         best_ask_next = float(self.best_ask[idx])
@@ -2069,7 +2044,6 @@ def build_market_batch(split: Dict[str, np.ndarray]) -> MarketMakingBatch:
         best_bid=best_bid,
         best_ask=best_ask,
         alpha_bps=split.get("alpha_bps"),
-        snapshot_mask=split.get("snapshot_mask"),
     )
 
 
@@ -2107,8 +2081,7 @@ def evaluate_market_making(
         inventory_curve.append(info["inventory"])
         turnover += abs(info["buy_fill"]) + abs(info["sell_fill"])
         fill_count += int(info["buy_fill"] > 0.0) + int(info["sell_fill"] > 0.0)
-        if env.snapshot_mask[env.idx - 1]:
-            fill_opps += 2
+        fill_opps += 2
 
     equity_arr = np.array(equity_curve, dtype=np.float32)
     returns = np.diff(np.concatenate([[initial_equity], equity_arr]))
