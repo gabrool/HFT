@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -836,10 +837,10 @@ def _compute_snapshot_feature_matrix(
 def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
     week_dir = _find_week_dir(Path(out_root), week_key)
     candidates = [
-        week_dir / "raw_snapshots.npz",
         week_dir / "snapshots.npz",
-        week_dir / "raw_snapshots.npy",
+        week_dir / "raw_snapshots.npz",
         week_dir / "snapshots.npy",
+        week_dir / "raw_snapshots.npy",
     ]
     path = next((p for p in candidates if p.exists()), None)
     if path is None:
@@ -853,25 +854,61 @@ def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.nda
     if path.suffix == ".npz":
         data = np.load(path)
         if "ts" in data and "snapshots" in data:
+            if path.name != "snapshots.npz":
+                warnings.warn(
+                    f"Non-canonical snapshot filename {path.name}; "
+                    "prefer snapshots.npz with ts/snapshots fields.",
+                    UserWarning,
+                )
             return data["ts"], data["snapshots"]
         if {"ts", "best_bid", "best_ask"}.issubset(data.files):
+            warnings.warn(
+                f"Non-canonical snapshot fields in {path.name}; "
+                "expected ts/snapshots.",
+                UserWarning,
+            )
             snapshots = np.column_stack([data["best_bid"], data["best_ask"]])
             return data["ts"], snapshots
         if {"timestamps", "best_bid", "best_ask"}.issubset(data.files):
+            warnings.warn(
+                f"Non-canonical snapshot fields in {path.name}; "
+                "expected ts/snapshots.",
+                UserWarning,
+            )
             snapshots = np.column_stack([data["best_bid"], data["best_ask"]])
             return data["timestamps"], snapshots
         if "timestamps" in data and "X" in data:
+            warnings.warn(
+                f"Non-canonical snapshot fields in {path.name}; "
+                "expected ts/snapshots.",
+                UserWarning,
+            )
             return data["timestamps"], data["X"]
         raise ValueError(f"Unsupported npz layout in {path}")
 
     arr = np.load(path)
     if arr.dtype.names:
         if "ts" in arr.dtype.names and "snapshot" in arr.dtype.names:
+            warnings.warn(
+                f"Non-canonical snapshot layout in {path.name}; "
+                "expected ts/snapshots arrays.",
+                UserWarning,
+            )
             return arr["ts"], arr["snapshot"]
         if "ts" in arr.dtype.names and "snapshots" in arr.dtype.names:
+            warnings.warn(
+                f"Non-canonical snapshot layout in {path.name}; "
+                "expected ts/snapshots in an npz.",
+                UserWarning,
+            )
             return arr["ts"], arr["snapshots"]
     ts_path = path.with_name("snapshots_ts.npy")
     if ts_path.exists():
+        warnings.warn(
+            f"Non-canonical snapshot layout using {path.name} + snapshots_ts.npy; "
+            "expected snapshots.npz with ts/snapshots.",
+            UserWarning,
+        )
         return np.load(ts_path), arr
     raise ValueError(f"Unsupported raw snapshot layout in {path}")
 
