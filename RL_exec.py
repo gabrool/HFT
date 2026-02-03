@@ -1082,6 +1082,9 @@ def join_features(
     ret_pred = cmssl_out["ret_pred"]
     vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
+    snapshot_mask = cmssl_out.get("snapshot_mask")
+    if snapshot_mask is not None:
+        assert np.all(snapshot_mask), "snapshot_mask contains unmatched decisions; alignment should be exact."
     p_up = _sigmoid(dir_logits)
     horizons = [int(h) for h in meta.get("horizons_ms", [])]
     if not horizons:
@@ -1124,7 +1127,7 @@ def join_features(
         ],
         axis=-1,
     )
-    return {
+    output = {
         "ts": decision_ts,
         "features": features.astype(np.float32),
         "y": y.astype(np.float32),
@@ -1132,6 +1135,9 @@ def join_features(
         "alpha_bps": alpha_bps.astype(np.float32),
         "snapshots": snapshots.astype(np.float32),
     }
+    if snapshot_mask is not None:
+        output["snapshot_mask"] = snapshot_mask.astype(bool)
+    return output
 
 
 def build_joined_split(
