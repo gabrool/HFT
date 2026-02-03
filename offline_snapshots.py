@@ -2,7 +2,7 @@
 """
 Rebuild 100ms order-book snapshots from Bybit OB delta streams.
 
-Outputs files compatible with RL_exec.load_raw_snapshot_features/load_raw_snapshots.
+Outputs canonical snapshots.npz files compatible with RL_exec.load_raw_snapshots.
 
 Env defaults:
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
@@ -105,8 +105,6 @@ class SnapshotSeries:
         np.savez_compressed(
             path,
             ts=np.asarray(self.ts, dtype=np.int64),
-            best_bid=np.asarray(self.best_bid, dtype=np.float32),
-            best_ask=np.asarray(self.best_ask, dtype=np.float32),
             snapshots=snapshots,
         )
 
@@ -162,7 +160,7 @@ def resolve_weeks(ob_files: Iterable[str], requested: Optional[List[str]]) -> Li
 def write_week_snapshots(out_root: str, week_key: str, series: SnapshotSeries, *, overwrite: bool) -> Path:
     week_dir = Path(out_root) / week_key
     week_dir.mkdir(parents=True, exist_ok=True)
-    out_path = week_dir / "raw_snapshots.npz"
+    out_path = week_dir / "snapshots.npz"
     if out_path.exists() and not overwrite:
         raise FileExistsError(f"Snapshot file exists: {out_path} (use --overwrite)")
     series.to_npz(out_path)
