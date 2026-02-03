@@ -1012,13 +1012,21 @@ def align_snapshots_to_decisions(
     nearest_idx = np.where(exact, right_idx, nearest_idx)
     nearest_delta = np.where(exact, 0, nearest_delta)
     matched = nearest_delta <= tolerance_ms
-    aligned = np.full((decision_ts.shape[0], snapshots.shape[1]), np.nan, dtype=np.float32)
-    if np.any(matched):
-        aligned[matched] = snapshots[nearest_idx[matched]].astype(np.float32)
     match_rate = float(np.mean(matched)) if matched.size else 0.0
     exact_rate = float(np.mean(exact)) if exact.size else 0.0
     matched_decision_ts = decision_ts[matched]
     matched_snapshot_ts = snapshot_ts[nearest_idx[matched]] if np.any(matched) else np.array([], dtype=np.int64)
+    if matched.size and not np.all(matched):
+        mismatch_idx = np.flatnonzero(~matched)
+        sample_count = min(5, mismatch_idx.size)
+        samples = [int(decision_ts[i]) for i in mismatch_idx[:sample_count]]
+        raise ValueError(
+            "Snapshot alignment failed; decisions outside tolerance. "
+            f"unmatched={mismatch_idx.size} total={decision_ts.size} "
+            f"match_rate={match_rate:.6f} tolerance_ms={tolerance_ms} "
+            f"samples={samples}"
+        )
+    aligned = snapshots[nearest_idx].astype(np.float32) if decision_ts.size else snapshots[:0].astype(np.float32)
 
     def _median_dt(ts: np.ndarray) -> float:
         if ts.size < 2:
@@ -1071,9 +1079,6 @@ def align_snapshots_to_decisions(
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f}",
         )
     if match_rate < match_rate_target:
-        mismatch_idx = np.flatnonzero(~matched)
-        sample_count = min(5, mismatch_idx.size)
-        samples = [int(decision_ts[i]) for i in mismatch_idx[:sample_count]]
         raise ValueError(
             "Snapshot alignment match rate below target; "
             f"match_rate={match_rate:.6f} target={match_rate_target:.6f} "
@@ -1084,7 +1089,6 @@ def align_snapshots_to_decisions(
             f"snapshot_bound_first={snapshot_bound_first} snapshot_bound_last={snapshot_bound_last} "
             f"decision_median_dt_ms={decision_median_dt:.2f} "
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f} "
-            f"samples={samples}"
         )
     return aligned, matched
 
@@ -1212,6 +1216,7 @@ def build_joined_split(
         snapshots,
         label=split_label,
     )
+    assert snapshot_mask.all(), "Snapshot alignment mask contains unmatched decisions."
     return join_features(ts, y, cmssl_out, aligned_snapshots, snapshot_mask, meta)
 
 
