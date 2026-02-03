@@ -163,10 +163,6 @@ def get_cmssl_splits(out_root: str) -> dict:
     }
 
 
-def build_two_week_time_splits(out_root: str) -> dict:
-    return get_cmssl_splits(out_root)
-
-
 def sigma_from_vol(log_vol: np.ndarray) -> np.ndarray:
     """Recover volatility from log-vol predictions."""
     return np.exp(log_vol)
