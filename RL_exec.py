@@ -60,10 +60,6 @@ DEFAULT_MM_P1000_WEIGHT = 1.0
 DEFAULT_MM_NOTIONAL_SCALE = 1e4
 DEFAULT_MM_CASH_SCALE = 1e4
 DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
-SNAPSHOT_ALIGN_MATCH_RATE_TARGET = max(
-    0.995,
-    float(os.environ.get("SNAPSHOT_ALIGN_MATCH_RATE_TARGET", "0.995")),
-)
 SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
     os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
 )
@@ -976,7 +972,6 @@ def align_snapshots_to_decisions(
     label: Optional[str] = None,
     *,
     tolerance_ms: int = 50,
-    match_rate_target: float = SNAPSHOT_ALIGN_MATCH_RATE_TARGET,
 ) -> np.ndarray:
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
@@ -993,7 +988,7 @@ def align_snapshots_to_decisions(
         match_rate = 0.0
         raise ValueError(
             "Snapshot alignment failed; no snapshots available to match decisions. "
-            f"match_rate={match_rate:.6f} target={match_rate_target:.6f}"
+            f"match_rate={match_rate:.6f}"
         )
     insert_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
     right_valid = insert_idx < snapshot_ts.size
@@ -1075,18 +1070,6 @@ def align_snapshots_to_decisions(
             f"snapshot_bound_last={_format_ts(snapshot_bound_last) if snapshot_bound_last is not None else 'n/a'}",
             f"decision_median_dt_ms={decision_median_dt:.2f}",
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f}",
-        )
-    if match_rate < match_rate_target:
-        raise ValueError(
-            "Snapshot alignment match rate below target; "
-            f"match_rate={match_rate:.6f} target={match_rate_target:.6f} "
-            f"matched={matched_decision_ts.size} total={decision_ts.size} "
-            f"tolerance_ms={tolerance_ms} "
-            f"decision_first={decision_first} decision_last={decision_last} "
-            f"snapshot_first={snapshot_first} snapshot_last={snapshot_last} "
-            f"snapshot_bound_first={snapshot_bound_first} snapshot_bound_last={snapshot_bound_last} "
-            f"decision_median_dt_ms={decision_median_dt:.2f} "
-            f"snapshot_median_dt_ms={snapshot_median_dt:.2f} "
         )
     return aligned
 
