@@ -500,6 +500,17 @@ class WeekWriterRouter:
             }
             for entry in writer.chunks_meta
         ]
+        for entry in chunks_meta:
+            ts_file = entry.get("files", {}).get("ts")
+            if not ts_file:
+                raise ValueError(
+                    f"Chunk {entry.get('chunk')} in week '{week_key}' missing ts file metadata."
+                )
+            ts_path = os.path.join(self.out_root, week_key, ts_file)
+            if not os.path.exists(ts_path):
+                raise FileNotFoundError(
+                    f"Chunk {entry.get('chunk')} in week '{week_key}' missing ts file '{ts_file}'."
+                )
         rows_total = int(sum(entry["n"] for entry in chunks_meta))
         meta = {
             "week": week_key,
