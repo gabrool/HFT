@@ -32,6 +32,12 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "vol_long",
 ]
 RAW_OB_DIR = os.environ.get("BYBIT_OB_DIR", "").strip()
+ALLOW_TS_RECONSTRUCT = os.environ.get("BYBIT_ALLOW_TS_RECONSTRUCT", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 FEATURE_EXTRA_DIM = 5
 SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
@@ -402,6 +408,12 @@ def _reconstruct_chunk_ts_from_snapshots(
 
 
 def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load CMSSL tensors for a split, requiring per-chunk decision timestamps by default.
+
+    Decision timestamps are the authoritative alignment source. Snapshot timelines must
+    be generated from the same raw delta stream as the decisions if reconstruction is enabled.
+    """
     x_core_list: List[np.ndarray] = []
     x_aux_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
@@ -417,6 +429,12 @@ def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray,
         n_rows = x_core.shape[0]
         chunk_offset = chunk_offsets.get(week, 0)
         if ts is None:
+            if not ALLOW_TS_RECONSTRUCT:
+                raise ValueError(
+                    f"Missing decision timestamps for {week}/chunk{chunk_idx:03d}. "
+                    "Ensure meta_week.json includes ts_*.npy entries, or set "
+                    "BYBIT_ALLOW_TS_RECONSTRUCT=true to enable snapshot-based recovery."
+                )
             week_meta, week_dir = week_meta_map.get(week, (None, None))
             if week_dir is None or week_meta is None:
                 raise ValueError(f"Missing week meta for {week}; cannot recover timestamps.")
