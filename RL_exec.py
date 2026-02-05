@@ -1689,7 +1689,8 @@ def collect_market_rollout(
     obs = env.reset()
     done = False
     while not done:
-        obs_t = torch.from_numpy(obs).float().to(device)
+        obs_cpu = torch.from_numpy(obs).float()
+        obs_t = obs_cpu.to(device)
         mean, log_std, value = model(obs_t.unsqueeze(0))
         std = log_std.exp()
         dist = torch.distributions.Normal(mean, std)
@@ -1705,12 +1706,12 @@ def collect_market_rollout(
             scaled_action = np.array([action_np[0] * delta_scale, action_np[1] * delta_scale], dtype=np.float32)
         next_obs, reward, done, _info = env.step(scaled_action)
 
-        obs_list.append(obs_t)
-        action_list.append(action.squeeze(0))
-        logp_list.append(logp.squeeze(0))
-        value_list.append(value.squeeze(0))
-        reward_list.append(torch.tensor(reward, dtype=torch.float32, device=device))
-        done_list.append(torch.tensor(done, dtype=torch.float32, device=device))
+        obs_list.append(obs_cpu)
+        action_list.append(action.squeeze(0).detach().cpu())
+        logp_list.append(logp.squeeze(0).detach().cpu())
+        value_list.append(value.squeeze(0).detach().cpu())
+        reward_list.append(torch.tensor(reward, dtype=torch.float32))
+        done_list.append(torch.tensor(done, dtype=torch.float32))
         obs = next_obs
 
     return {
@@ -1730,12 +1731,12 @@ def ppo_update_market(
     config: PPOConfig,
     device: str,
 ):
-    obs = rollout["obs"].to(device)
-    actions = rollout["actions"].to(device)
-    old_logp = rollout["logp"].detach().to(device)
-    values = rollout["values"].detach().to(device)
-    rewards = rollout["rewards"].to(device)
-    dones = rollout["dones"].to(device)
+    obs = rollout["obs"]
+    actions = rollout["actions"]
+    old_logp = rollout["logp"].detach()
+    values = rollout["values"].detach()
+    rewards = rollout["rewards"]
+    dones = rollout["dones"]
 
     advantages, returns = compute_gae(rewards, values, dones, config.gamma, config.gae_lambda)
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -1746,14 +1747,20 @@ def ppo_update_market(
         perm = indices[torch.randperm(n)]
         for start in range(0, n, config.batch_size):
             mb_idx = perm[start:start + config.batch_size]
-            mean, log_std, value = model(obs[mb_idx])
+            mb_obs = obs[mb_idx].to(device)
+            mb_actions = actions[mb_idx].to(device)
+            mb_old_logp = old_logp[mb_idx].to(device)
+            mb_advantages = advantages[mb_idx].to(device)
+            mb_returns = returns[mb_idx].to(device)
+
+            mean, log_std, value = model(mb_obs)
             std = log_std.exp()
             dist = torch.distributions.Normal(mean, std)
-            logp = dist.log_prob(actions[mb_idx]).sum(dim=-1)
-            ratio = torch.exp(logp - old_logp[mb_idx])
-            clip_adv = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * advantages[mb_idx]
-            policy_loss = -(torch.min(ratio * advantages[mb_idx], clip_adv)).mean()
-            value_loss = nn.functional.mse_loss(value, returns[mb_idx])
+            logp = dist.log_prob(mb_actions).sum(dim=-1)
+            ratio = torch.exp(logp - mb_old_logp)
+            clip_adv = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * mb_advantages
+            policy_loss = -(torch.min(ratio * mb_advantages, clip_adv)).mean()
+            value_loss = nn.functional.mse_loss(value, mb_returns)
             entropy_loss = dist.entropy().sum(dim=-1).mean()
             loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
 
