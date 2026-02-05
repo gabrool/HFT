@@ -2165,19 +2165,7 @@ def run_pipeline(
                 )
             return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
 
-    rl_env = MarketMakingEnv(
-        mm_test_batch,
-        maker_rebate_bps=maker_rebate_bps,
-        taker_fee_bps=taker_fee_bps,
-        allow_taker=allow_taker,
-        taker_threshold=taker_threshold,
-        inventory_penalty=inventory_penalty,
-        max_inventory=max_inventory,
-        fill_size=fill_size,
-        fill_tolerance=fill_tolerance,
-        delta_bps_limit=delta_bps_limit,
-    )
-    rl_metrics = evaluate_market_making(rl_env, rl_policy_fn)
+    rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
 
     print("[mm eval]", _format_mm_summary("baseline", baseline_metrics))
     print("[mm eval]", _format_mm_summary("baseline+rl", rl_metrics))
