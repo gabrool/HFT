@@ -2085,7 +2085,6 @@ def run_pipeline(
     mm_train_batch = build_market_batch(splits_rl["train"])
     mm_val_batch = build_market_batch(splits_rl["val"])
     mm_test_batch = build_market_batch(splits_rl["test"])
-    mm_obs_dim = mm_train_batch.features.shape[-1] + 3
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     # Inventory/turnover penalties applied inside MarketMakingEnv.step().
@@ -2119,6 +2118,8 @@ def run_pipeline(
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
     )
+    mm_obs = mm_train_env.reset()
+    mm_obs_dim = mm_obs.shape[0]
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
         maker_rebate_bps=maker_rebate_bps,
