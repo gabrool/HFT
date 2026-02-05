@@ -2058,6 +2058,10 @@ def run_pipeline(
     mm_obs_dim = mm_train_batch.features.shape[-1] + 3
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
+    # Inventory/turnover penalties applied inside MarketMakingEnv.step().
+    inv_soft = float(os.environ.get("BYBIT_MM_INV_SOFT", "1.0"))
+    lambda_inv = float(os.environ.get("BYBIT_MM_LAMBDA_INV", "0.0"))
+    lambda_turn = float(os.environ.get("BYBIT_MM_LAMBDA_TURN", "0.0"))
     max_inventory_str = os.environ.get("BYBIT_MM_MAX_INVENTORY", "").strip()
     max_inventory = float(max_inventory_str) if max_inventory_str else None
     fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
@@ -2077,6 +2081,9 @@ def run_pipeline(
         allow_taker=allow_taker,
         taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
+        inv_soft=inv_soft,
+        lambda_inv=lambda_inv,
+        lambda_turn=lambda_turn,
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
@@ -2089,6 +2096,9 @@ def run_pipeline(
         allow_taker=allow_taker,
         taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
+        inv_soft=inv_soft,
+        lambda_inv=lambda_inv,
+        lambda_turn=lambda_turn,
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
@@ -2101,6 +2111,9 @@ def run_pipeline(
         allow_taker=allow_taker,
         taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
+        inv_soft=inv_soft,
+        lambda_inv=lambda_inv,
+        lambda_turn=lambda_turn,
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
@@ -2143,6 +2156,9 @@ def run_pipeline(
         allow_taker=False,
         taker_threshold=taker_threshold,
         inventory_penalty=inventory_penalty,
+        inv_soft=inv_soft,
+        lambda_inv=lambda_inv,
+        lambda_turn=lambda_turn,
         max_inventory=max_inventory,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
