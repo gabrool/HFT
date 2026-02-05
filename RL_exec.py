@@ -1491,6 +1491,8 @@ class MarketMakingEnv:
         return penalty
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
+        # Execution convention: both maker and taker fills are priced using the next snapshot
+        # (next_idx). We quote on self.idx, then advance state after applying fills at next_idx.
         next_idx = self.idx + 1
         if next_idx >= self.n:
             mid = self._mid_price(self.idx)
@@ -1522,7 +1524,7 @@ class MarketMakingEnv:
         inv_prev = self.inventory
         _, _, taker_signal = self._parse_action(action)
         maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
-        taker_buy, taker_sell = self._apply_taker(self.idx, taker_signal)
+        taker_buy, taker_sell = self._apply_taker(next_idx, taker_signal)
         inv_new = self.inventory
         inv_change = inv_new - inv_prev
         if maker_buy > 0.0 or maker_sell > 0.0 or taker_buy > 0.0 or taker_sell > 0.0:
@@ -1533,7 +1535,7 @@ class MarketMakingEnv:
         mid_next = self._mid_price(next_idx)
         maker_rebate_notional = maker_buy * bid + maker_sell * ask
         rebate = maker_rebate_notional * self.maker_rebate_bps * 1e-4
-        taker_notional = taker_buy * float(self.best_ask[self.idx]) + taker_sell * float(self.best_bid[self.idx])
+        taker_notional = taker_buy * float(self.best_ask[next_idx]) + taker_sell * float(self.best_bid[next_idx])
         taker_fee = taker_notional * self.taker_fee_bps * 1e-4
         self.cash += rebate - taker_fee
         equity = self.cash + self.inventory * mid_next
