@@ -1506,6 +1506,7 @@ class MarketMakingEnv:
                 "penalty": 0.0,
                 "inv_penalty": 0.0,
                 "turnover_penalty": 0.0,
+                "mid": float(mid),
                 "bid": 0.0,
                 "ask": 0.0,
                 "maker_buy": 0.0,
@@ -1564,6 +1565,7 @@ class MarketMakingEnv:
             "penalty": float(penalty),
             "inv_penalty": float(inv_penalty),
             "turnover_penalty": float(turnover_penalty),
+            "mid": float(mid),
             "bid": float(bid),
             "ask": float(ask),
             "bid_delta_bps": float(bid_delta_bps),
@@ -1940,7 +1942,7 @@ def evaluate_market_making(
         inventory_curve.append(info["inventory"])
         steps += 1
         step_qty = abs(info["maker_buy"]) + abs(info["maker_sell"]) + abs(info["taker_buy"]) + abs(info["taker_sell"])
-        step_mid = float(info.get("mid", env._mid_price(env.idx)))
+        step_mid = float(info.get("mid", env._mid_price(env.idx - 1)))
         step_taker_qty = abs(info["taker_buy"]) + abs(info["taker_sell"])
         turnover_qty += step_qty
         step_notional = step_qty * step_mid
