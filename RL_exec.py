@@ -1521,11 +1521,8 @@ class MarketMakingEnv:
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
         _bid_delta, _ask_delta, taker_signal = self._parse_action(action)
+        maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
         taker_buy, taker_sell = self._apply_taker(self.idx, taker_signal)
-        maker_buy = 0.0
-        maker_sell = 0.0
-        if taker_buy == 0.0 and taker_sell == 0.0:
-            maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
         inv_new = self.inventory
         if maker_buy > 0.0 or maker_sell > 0.0 or taker_buy > 0.0 or taker_sell > 0.0:
             self.time_since_last_fill = 0.0
