@@ -202,6 +202,19 @@ def _resolve_ppo_epochs(default: int) -> int:
     return _env_int(PPO_EPOCHS_ENV, default)
 
 
+def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return None
+    seed = int(raw)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print("[seed]", f"{env_name}={seed}")
+    return seed
+
+
 @dataclass(frozen=True)
 class BaselineQuoteConfig:
     s_min_bps: float
@@ -2253,6 +2266,8 @@ if __name__ == "__main__":
 
     if not out_root or not ckpt_path:
         raise SystemExit("Set BYBIT_OUT_ROOT and BYBIT_CMSSL_CKPT before running.")
+
+    _set_seed_from_env()
 
     print(
         "[rl exec config]",
