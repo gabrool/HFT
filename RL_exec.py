@@ -1832,7 +1832,6 @@ def train_market_ppo(
                         {
                             "policy_state_dict": model.policy_net.state_dict(),
                             "value_state_dict": model.value_net.state_dict(),
-                            "log_std": model.log_std.detach().cpu().numpy(),
                             "hidden_dims": tuple(config.policy_hidden),
                             "action_dim": model.log_std.shape[0],
                             "config": config.__dict__,
@@ -1966,19 +1965,18 @@ def load_market_policy(
     input_dim: int,
     device: str = "cuda",
     ckpt_path: Optional[str] = None,
-) -> Tuple[Optional[MarketPolicyNet], Optional[np.ndarray]]:
+) -> Optional[MarketPolicyNet]:
+    """Load a deterministic market policy (mean-action inference only)."""
     if not ckpt_path:
-        return None, None
+        return None
     path = Path(ckpt_path)
     if not path.exists():
         raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
     ckpt = torch.load(path, map_location=device)
     if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
         state = ckpt["policy_state_dict"]
-        log_std = ckpt.get("log_std")
     else:
         state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-        log_std = None
     hidden_dims = ckpt.get("hidden_dims") if isinstance(ckpt, dict) else None
     if hidden_dims is None:
         hidden_dims = tuple(
@@ -1986,14 +1984,12 @@ def load_market_policy(
         )
     if isinstance(ckpt, dict) and "action_dim" in ckpt:
         action_dim = int(ckpt["action_dim"])
-    elif log_std is not None:
-        action_dim = int(np.asarray(log_std).shape[0])
     else:
         action_dim = int(os.environ.get("BYBIT_MM_ACTION_DIM", "3"))
     model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims, action_dim=action_dim).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
-    return model, None if log_std is None else np.asarray(log_std, dtype=np.float32)
+    return model
 
 
 def run_pipeline(
@@ -2130,7 +2126,7 @@ def run_pipeline(
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
     mm_policy_path = os.environ.get("BYBIT_MM_RL_CKPT", "").strip() or str(mm_best_ckpt)
-    mm_policy, _log_std = load_market_policy(mm_obs_dim, device=device, ckpt_path=mm_policy_path or None)
+    mm_policy = load_market_policy(mm_obs_dim, device=device, ckpt_path=mm_policy_path or None)
     if mm_policy is None:
         print("[mm eval] no BYBIT_MM_RL_CKPT provided; using baseline deltas for RL run.")
         rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
