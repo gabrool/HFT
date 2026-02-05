@@ -1921,7 +1921,8 @@ def evaluate_market_making(
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
-    turnover = 0.0
+    turnover_qty = 0.0
+    turnover_notional = 0.0
     fill_count = 0
     fill_opps = 0
     initial_equity = env.prev_equity
@@ -1932,7 +1933,10 @@ def evaluate_market_making(
         obs, _reward, done, info = env.step(action)
         equity_curve.append(info["equity"])
         inventory_curve.append(info["inventory"])
-        turnover += abs(info["maker_buy"]) + abs(info["maker_sell"]) + abs(info["taker_buy"]) + abs(info["taker_sell"])
+        step_qty = abs(info["maker_buy"]) + abs(info["maker_sell"]) + abs(info["taker_buy"]) + abs(info["taker_sell"])
+        step_mid = float(info.get("mid", env._mid_price(env.idx)))
+        turnover_qty += step_qty
+        turnover_notional += step_qty * step_mid
         fill_count += (
             int(info["maker_buy"] > 0.0)
             + int(info["maker_sell"] > 0.0)
@@ -1961,7 +1965,8 @@ def evaluate_market_making(
         "equity_curve": equity_arr,
         "sharpe": sharpe,
         "max_drawdown": max_drawdown,
-        "turnover": float(turnover),
+        "turnover_qty": float(turnover_qty),
+        "turnover_notional": float(turnover_notional),
         "fill_rate": fill_rate,
         "inventory_distribution": _inventory_distribution(inventory_arr),
     }
@@ -1972,7 +1977,8 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
     return (
         f"{label}: sharpe={metrics['sharpe']:.4f} "
         f"max_dd={metrics['max_drawdown']:.4f} "
-        f"turnover={metrics['turnover']:.4f} "
+        f"turnover_notional={metrics['turnover_notional']:.4f} "
+        f"turnover_qty={metrics['turnover_qty']:.4f} "
         f"fill_rate={metrics['fill_rate']:.4f} "
         f"inv[min={inv['min']:.2f}, p50={inv['p50']:.2f}, max={inv['max']:.2f}]"
     )
