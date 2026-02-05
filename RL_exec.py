@@ -1924,10 +1924,12 @@ def evaluate_market_making(
     inventory_curve: List[float] = []
     turnover_qty = 0.0
     turnover_notional = 0.0
+    taker_notional = 0.0
+    taker_fee_total = 0.0
     maker_fill_count = 0
-    taker_fill_count = 0
     maker_opps = 0
-    taker_opps = 0
+    taker_steps = 0
+    steps = 0
     initial_equity = env.prev_equity
 
     done = False
@@ -1936,14 +1938,18 @@ def evaluate_market_making(
         obs, _reward, done, info = env.step(action)
         equity_curve.append(info["equity"])
         inventory_curve.append(info["inventory"])
+        steps += 1
         step_qty = abs(info["maker_buy"]) + abs(info["maker_sell"]) + abs(info["taker_buy"]) + abs(info["taker_sell"])
         step_mid = float(info.get("mid", env._mid_price(env.idx)))
+        step_taker_qty = abs(info["taker_buy"]) + abs(info["taker_sell"])
         turnover_qty += step_qty
-        turnover_notional += step_qty * step_mid
+        step_notional = step_qty * step_mid
+        turnover_notional += step_notional
+        taker_notional += step_taker_qty * step_mid
+        taker_fee_total += float(info.get("taker_fee", 0.0))
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
-        taker_fill_count += int(info["taker_buy"] > 0.0) + int(info["taker_sell"] > 0.0)
         maker_opps += 2
-        taker_opps += 2
+        taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
 
     equity_arr = np.array(equity_curve, dtype=np.float32)
     # Per-snapshot percentage returns; annualization uses the snapshot cadence.
@@ -1959,7 +1965,9 @@ def evaluate_market_making(
     sharpe = compute_sharpe(returns, steps_per_year)
     max_drawdown = compute_max_drawdown(returns)
     maker_fill_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
-    taker_fill_rate = float(taker_fill_count / taker_opps) if taker_opps > 0 else 0.0
+    taker_usage_frequency = float(taker_steps / steps) if steps > 0 else 0.0
+    taker_volume_share = float(taker_notional / turnover_notional) if turnover_notional > 0 else 0.0
+    fee_drag = float(taker_fee_total / turnover_notional) if turnover_notional > 0 else 0.0
     inventory_arr = np.array(inventory_curve, dtype=np.float32)
 
     return {
@@ -1969,7 +1977,9 @@ def evaluate_market_making(
         "turnover_qty": float(turnover_qty),
         "turnover_notional": float(turnover_notional),
         "maker_fill_rate": maker_fill_rate,
-        "taker_fill_rate": taker_fill_rate,
+        "taker_usage_frequency": taker_usage_frequency,
+        "taker_volume_share": taker_volume_share,
+        "fee_drag": fee_drag,
         "inventory_distribution": _inventory_distribution(inventory_arr),
     }
 
@@ -1982,7 +1992,9 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
         f"turnover_notional={metrics['turnover_notional']:.4f} "
         f"turnover_qty={metrics['turnover_qty']:.4f} "
         f"maker_fill_rate={metrics['maker_fill_rate']:.4f} "
-        f"taker_fill_rate={metrics['taker_fill_rate']:.4f} "
+        f"taker_usage_freq={metrics['taker_usage_frequency']:.4f} "
+        f"taker_volume_share={metrics['taker_volume_share']:.4f} "
+        f"fee_drag={metrics['fee_drag']:.4f} "
         f"inv[min={inv['min']:.2f}, p50={inv['p50']:.2f}, max={inv['max']:.2f}]"
     )
 
