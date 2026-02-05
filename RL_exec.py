@@ -527,6 +527,7 @@ def run_cmssl_test_window_inference(
     device: str = "cuda",
     batch_size: int = 256,
 ) -> Dict[str, Any]:
+    """Run CMSSL inference over test windowed inputs for offline diagnostics."""
     model, meta = load_cmssl(out_root, ckpt_path, device=device)
     x_core, x_aux, ts = load_test_windowed_inputs(out_root, meta)
     cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
@@ -2236,6 +2237,12 @@ if __name__ == "__main__":
     ckpt_path = os.environ.get("BYBIT_CMSSL_CKPT", "").strip()
     device = os.environ.get("BYBIT_DEVICE", "cuda")
     ppo_epochs = _resolve_ppo_epochs(10)
+    run_cmssl_test_window = os.environ.get("BYBIT_RUN_CMSSL_TEST_WINDOW", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
 
     if not out_root or not ckpt_path:
         raise SystemExit("Set BYBIT_OUT_ROOT and BYBIT_CMSSL_CKPT before running.")
@@ -2257,3 +2264,7 @@ if __name__ == "__main__":
     print("[cmssl test]", report["cmssl_test"])
     print("[mm baseline]", report["mm_baseline"])
     print("[mm rl]", report["mm_rl"])
+    if run_cmssl_test_window:
+        print("[cmssl test window] running windowed inference for diagnostics.")
+        test_window_report = run_cmssl_test_window_inference(out_root, ckpt_path, device=device)
+        print("[cmssl test window] completed", json.dumps({"horizons_ms": test_window_report["horizons_ms"]}))
