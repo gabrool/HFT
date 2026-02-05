@@ -1305,10 +1305,6 @@ class MarketMakingEnv:
         return float((self.best_bid[idx] + self.best_ask[idx]) / 2.0)
 
     def _build_observation(self, idx: int) -> np.ndarray:
-        mid = self._mid_price(idx)
-        spread = float(self.best_ask[idx] - self.best_bid[idx])
-        inv_notional = self.inventory * mid
-        inv_notional_scaled = inv_notional / self.notional_scale if self.notional_scale else 0.0
         cash_scaled = self.cash / self.cash_scale if self.cash_scale else 0.0
         time_since_last_fill_scaled = (
             self.time_since_last_fill / self.time_since_fill_scale if self.time_since_fill_scale else 0.0
@@ -1316,10 +1312,6 @@ class MarketMakingEnv:
         extra = np.array(
             [
                 self.inventory,
-                self.cash,
-                mid,
-                spread,
-                inv_notional_scaled,
                 cash_scaled,
                 time_since_last_fill_scaled,
             ],
@@ -2052,7 +2044,7 @@ def run_pipeline(
     mm_train_batch = build_market_batch(splits_rl["train"])
     mm_val_batch = build_market_batch(splits_rl["val"])
     mm_test_batch = build_market_batch(splits_rl["test"])
-    mm_obs_dim = mm_train_batch.features.shape[-1] + 7
+    mm_obs_dim = mm_train_batch.features.shape[-1] + 3
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     max_inventory_str = os.environ.get("BYBIT_MM_MAX_INVENTORY", "").strip()
