@@ -1742,14 +1742,22 @@ def ppo_update_market(
             loss.backward()
             optimizer.step()
 
-def compute_sharpe(returns: np.ndarray) -> float:
-    if returns.size == 0:
+def _steps_per_year_from_snapshot_ms(step_ms: float) -> float:
+    if step_ms <= 0:
+        return 0.0
+    steps_per_second = 1000.0 / step_ms
+    return steps_per_second * 60.0 * 60.0 * 24.0 * 365.0
+
+
+def compute_sharpe(returns: np.ndarray, steps_per_year: float) -> float:
+    """Compute annualized Sharpe for per-step percentage returns."""
+    if returns.size == 0 or steps_per_year <= 0:
         return 0.0
     mean = returns.mean()
     std = returns.std(ddof=1) if returns.size > 1 else 0.0
     if std <= 0:
         return 0.0
-    return float(mean / std * np.sqrt(returns.size))
+    return float(mean / std * np.sqrt(steps_per_year))
 
 
 def compute_max_drawdown(returns: np.ndarray) -> float:
@@ -1934,8 +1942,17 @@ def evaluate_market_making(
         fill_opps += 2
 
     equity_arr = np.array(equity_curve, dtype=np.float32)
-    returns = np.diff(np.concatenate([[initial_equity], equity_arr]))
-    sharpe = compute_sharpe(returns)
+    # Per-snapshot percentage returns; annualization uses the snapshot cadence.
+    prev_equity = np.concatenate([[initial_equity], equity_arr[:-1]])
+    returns = np.divide(
+        equity_arr,
+        prev_equity,
+        out=np.zeros_like(equity_arr),
+        where=prev_equity != 0,
+    ) - 1.0
+    step_ms = _env_float("BYBIT_MM_SNAPSHOT_STEP_MS", RAW_SNAPSHOT_EXPECTED_STEP_MS)
+    steps_per_year = _steps_per_year_from_snapshot_ms(step_ms)
+    sharpe = compute_sharpe(returns, steps_per_year)
     max_drawdown = compute_max_drawdown(returns)
     fill_rate = float(fill_count / fill_opps) if fill_opps > 0 else 0.0
     inventory_arr = np.array(inventory_curve, dtype=np.float32)
