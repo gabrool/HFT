@@ -54,6 +54,8 @@ DEFAULT_MM_INV_REF_NOTIONAL = 1.0
 DEFAULT_MM_P250_WEIGHT = 0.0
 DEFAULT_MM_P500_WEIGHT = 0.0
 DEFAULT_MM_P1000_WEIGHT = 1.0
+# PPO training epochs environment variable (used across entrypoint/config helpers).
+PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
 # Scaling factors for observation features.
 # Notional and cash scales are denominated in quote currency.
 # Time-since-fill scale is in environment steps (1 step per snapshot).
@@ -194,6 +196,10 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
     if not raw:
         return list(default)
     return [int(item) for item in raw.split(",") if item.strip()]
+
+
+def _resolve_ppo_epochs(default: int) -> int:
+    return _env_int(PPO_EPOCHS_ENV, default)
 
 
 @dataclass(frozen=True)
@@ -2123,7 +2129,7 @@ def run_pipeline(
         mm_val_env,
         mm_obs_dim,
         device=device,
-        epochs=int(os.environ.get("BYBIT_MM_PPO_EPOCHS", str(ppo_epochs))),
+        epochs=_resolve_ppo_epochs(ppo_epochs),
         config=mm_ppo_config,
         ckpt_path=mm_best_ckpt,
         delta_scale=delta_scale,
@@ -2182,11 +2188,24 @@ if __name__ == "__main__":
     out_root = os.environ.get("BYBIT_OUT_ROOT", "").strip()
     ckpt_path = os.environ.get("BYBIT_CMSSL_CKPT", "").strip()
     device = os.environ.get("BYBIT_DEVICE", "cuda")
-    ppo_epochs = int(os.environ.get("BYBIT_PPO_EPOCHS", "10"))
+    ppo_epochs = _resolve_ppo_epochs(10)
 
     if not out_root or not ckpt_path:
         raise SystemExit("Set BYBIT_OUT_ROOT and BYBIT_CMSSL_CKPT before running.")
 
+    print(
+        "[rl exec config]",
+        json.dumps(
+            {
+                "out_root": out_root,
+                "ckpt_path": ckpt_path,
+                "device": device,
+                "ppo_epochs": ppo_epochs,
+                "ppo_epochs_env": PPO_EPOCHS_ENV,
+            },
+            sort_keys=True,
+        ),
+    )
     report = run_pipeline(out_root, ckpt_path, device=device, ppo_epochs=ppo_epochs)
     print("[cmssl test]", report["cmssl_test"])
     print("[mm baseline]", report["mm_baseline"])
