@@ -1341,14 +1341,13 @@ class MarketMakingEnv:
     def _normalize_observation(self, obs: np.ndarray) -> np.ndarray:
         if self._obs_continuous_mask is None:
             self._obs_continuous_mask = self._continuous_mask(obs.shape[0])
-        self._update_obs_stats(obs)
-        if self._obs_count < 2 or self._obs_mean is None or self._obs_m2 is None:
-            return obs
-        var = self._obs_m2 / max(self._obs_count - 1, 1)
-        std = np.sqrt(np.maximum(var, 1e-6))
         normalized = obs.copy()
-        mask = self._obs_continuous_mask
-        normalized[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
+        if self._obs_count >= 2 and self._obs_mean is not None and self._obs_m2 is not None:
+            var = self._obs_m2 / max(self._obs_count - 1, 1)
+            std = np.sqrt(np.maximum(var, 1e-6))
+            mask = self._obs_continuous_mask
+            normalized[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
+        self._update_obs_stats(obs)
         return normalized
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
