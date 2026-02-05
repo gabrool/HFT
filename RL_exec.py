@@ -1530,12 +1530,13 @@ class MarketMakingEnv:
             self.time_since_last_fill += 1.0
 
         mid_next = self._mid_price(next_idx)
-        equity = self.cash + self.inventory * mid_next
-        delta_equity = equity - self.prev_equity
         maker_rebate_notional = maker_buy * bid + maker_sell * ask
         rebate = maker_rebate_notional * self.maker_rebate_bps * 1e-4
         taker_notional = taker_buy * float(self.best_ask[self.idx]) + taker_sell * float(self.best_bid[self.idx])
         taker_fee = taker_notional * self.taker_fee_bps * 1e-4
+        self.cash += rebate - taker_fee
+        equity = self.cash + self.inventory * mid_next
+        delta_equity = equity - self.prev_equity
         penalty = self._compute_penalty(mid_next)
         inv_notional = inv_new * mid_next
         excess = max(0.0, abs(inv_notional) - self.inv_soft)
@@ -1544,7 +1545,7 @@ class MarketMakingEnv:
         )
         turnover_notional = maker_rebate_notional + taker_notional
         turnover_penalty = self.lambda_turn * turnover_notional
-        reward = delta_equity + rebate - taker_fee - penalty - inv_penalty - turnover_penalty
+        reward = delta_equity - penalty - inv_penalty - turnover_penalty
 
         self.prev_equity = equity
         self.total_reward += reward
