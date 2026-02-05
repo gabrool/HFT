@@ -1403,14 +1403,16 @@ class MarketMakingEnv:
         ask = mid + half_spread_px - skew_px
         return bid, ask, mid
 
-    def _apply_deltas(self, bid: float, ask: float, mid: float, action: Any) -> Tuple[float, float]:
+    def _apply_deltas(
+        self, bid: float, ask: float, mid: float, action: Any
+    ) -> Tuple[float, float, float, float]:
         bid_delta_bps, ask_delta_bps, _taker_signal = self._parse_action(action)
         if self.delta_bps_limit is not None:
             bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
             ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
         bid += mid * bid_delta_bps * 1e-4
         ask += mid * ask_delta_bps * 1e-4
-        return bid, ask
+        return bid, ask, bid_delta_bps, ask_delta_bps
 
     def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         best_bid = float(self.best_bid[idx])
@@ -1508,13 +1510,14 @@ class MarketMakingEnv:
             }
             return self._build_observation(self.idx), 0.0, True, info
         bid, ask, mid = self._baseline_quotes(self.idx)
-        bid, ask = self._apply_deltas(bid, ask, mid, action)
+        bid, ask, bid_delta_bps, ask_delta_bps = self._apply_deltas(bid, ask, mid, action)
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
-        _bid_delta, _ask_delta, taker_signal = self._parse_action(action)
+        _, _, taker_signal = self._parse_action(action)
         maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
         taker_buy, taker_sell = self._apply_taker(self.idx, taker_signal)
         inv_new = self.inventory
+        inv_change = inv_new - inv_prev
         if maker_buy > 0.0 or maker_sell > 0.0 or taker_buy > 0.0 or taker_sell > 0.0:
             self.time_since_last_fill = 0.0
         else:
@@ -1556,6 +1559,9 @@ class MarketMakingEnv:
             "turnover_penalty": float(turnover_penalty),
             "bid": float(bid),
             "ask": float(ask),
+            "bid_delta_bps": float(bid_delta_bps),
+            "ask_delta_bps": float(ask_delta_bps),
+            "inv_change": float(inv_change),
             "maker_buy": float(maker_buy),
             "maker_sell": float(maker_sell),
             "taker_buy": float(taker_buy),
