@@ -1923,8 +1923,10 @@ def evaluate_market_making(
     inventory_curve: List[float] = []
     turnover_qty = 0.0
     turnover_notional = 0.0
-    fill_count = 0
-    fill_opps = 0
+    maker_fill_count = 0
+    taker_fill_count = 0
+    maker_opps = 0
+    taker_opps = 0
     initial_equity = env.prev_equity
 
     done = False
@@ -1937,13 +1939,10 @@ def evaluate_market_making(
         step_mid = float(info.get("mid", env._mid_price(env.idx)))
         turnover_qty += step_qty
         turnover_notional += step_qty * step_mid
-        fill_count += (
-            int(info["maker_buy"] > 0.0)
-            + int(info["maker_sell"] > 0.0)
-            + int(info["taker_buy"] > 0.0)
-            + int(info["taker_sell"] > 0.0)
-        )
-        fill_opps += 2
+        maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
+        taker_fill_count += int(info["taker_buy"] > 0.0) + int(info["taker_sell"] > 0.0)
+        maker_opps += 2
+        taker_opps += 2
 
     equity_arr = np.array(equity_curve, dtype=np.float32)
     # Per-snapshot percentage returns; annualization uses the snapshot cadence.
@@ -1958,7 +1957,8 @@ def evaluate_market_making(
     steps_per_year = _steps_per_year_from_snapshot_ms(step_ms)
     sharpe = compute_sharpe(returns, steps_per_year)
     max_drawdown = compute_max_drawdown(returns)
-    fill_rate = float(fill_count / fill_opps) if fill_opps > 0 else 0.0
+    maker_fill_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
+    taker_fill_rate = float(taker_fill_count / taker_opps) if taker_opps > 0 else 0.0
     inventory_arr = np.array(inventory_curve, dtype=np.float32)
 
     return {
@@ -1967,7 +1967,8 @@ def evaluate_market_making(
         "max_drawdown": max_drawdown,
         "turnover_qty": float(turnover_qty),
         "turnover_notional": float(turnover_notional),
-        "fill_rate": fill_rate,
+        "maker_fill_rate": maker_fill_rate,
+        "taker_fill_rate": taker_fill_rate,
         "inventory_distribution": _inventory_distribution(inventory_arr),
     }
 
@@ -1979,7 +1980,8 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
         f"max_dd={metrics['max_drawdown']:.4f} "
         f"turnover_notional={metrics['turnover_notional']:.4f} "
         f"turnover_qty={metrics['turnover_qty']:.4f} "
-        f"fill_rate={metrics['fill_rate']:.4f} "
+        f"maker_fill_rate={metrics['maker_fill_rate']:.4f} "
+        f"taker_fill_rate={metrics['taker_fill_rate']:.4f} "
         f"inv[min={inv['min']:.2f}, p50={inv['p50']:.2f}, max={inv['max']:.2f}]"
     )
 
