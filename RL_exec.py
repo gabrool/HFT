@@ -1612,7 +1612,7 @@ class MarketPolicyValueNet(nn.Module):
         init_log_std: float = -0.5,
     ):
         super().__init__()
-        self.policy_net = MLP(input_dim, policy_hidden, action_dim)
+        self.policy_net = MarketPolicyNet(input_dim, hidden_dims=policy_hidden, action_dim=action_dim)
         self.value_net = MLP(input_dim, value_hidden, 1)
         self.log_std = nn.Parameter(torch.full((action_dim,), init_log_std))
 
@@ -1830,7 +1830,7 @@ def train_market_ppo(
                     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(
                         {
-                            "mean_state_dict": model.policy_net.state_dict(),
+                            "policy_state_dict": model.policy_net.state_dict(),
                             "value_state_dict": model.value_net.state_dict(),
                             "log_std": model.log_std.detach().cpu().numpy(),
                             "hidden_dims": tuple(config.policy_hidden),
@@ -1973,8 +1973,8 @@ def load_market_policy(
     if not path.exists():
         raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
     ckpt = torch.load(path, map_location=device)
-    if isinstance(ckpt, dict) and "mean_state_dict" in ckpt:
-        state = ckpt["mean_state_dict"]
+    if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
+        state = ckpt["policy_state_dict"]
         log_std = ckpt.get("log_std")
     else:
         state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
@@ -1991,7 +1991,7 @@ def load_market_policy(
     else:
         action_dim = int(os.environ.get("BYBIT_MM_ACTION_DIM", "3"))
     model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims, action_dim=action_dim).to(device)
-    model.net.load_state_dict(state, strict=True)
+    model.load_state_dict(state, strict=True)
     model.eval()
     return model, None if log_std is None else np.asarray(log_std, dtype=np.float32)
 
