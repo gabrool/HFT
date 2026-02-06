@@ -1806,12 +1806,17 @@ def compute_sharpe(returns: np.ndarray, steps_per_year: float) -> float:
     return float(mean / std * np.sqrt(steps_per_year))
 
 
-def compute_max_drawdown(returns: np.ndarray) -> float:
-    if returns.size == 0:
+def compute_max_drawdown(equity_curve: np.ndarray) -> float:
+    """Compute max drawdown as the largest peak-to-trough equity decline."""
+    if equity_curve.size == 0:
         return 0.0
-    cumulative = np.cumsum(returns)
-    peak = np.maximum.accumulate(cumulative)
-    drawdown = peak - cumulative
+    peak = np.maximum.accumulate(equity_curve)
+    drawdown = np.divide(
+        peak - equity_curve,
+        peak,
+        out=np.zeros_like(equity_curve),
+        where=peak != 0,
+    )
     return float(drawdown.max(initial=0.0))
 
 
@@ -2008,7 +2013,7 @@ def evaluate_market_making(
     step_ms = _env_float("BYBIT_MM_SNAPSHOT_STEP_MS", RAW_SNAPSHOT_EXPECTED_STEP_MS)
     steps_per_year = _steps_per_year_from_snapshot_ms(step_ms)
     sharpe = compute_sharpe(returns, steps_per_year)
-    max_drawdown = compute_max_drawdown(returns)
+    max_drawdown = compute_max_drawdown(equity_arr)
     maker_fill_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
     taker_usage_frequency = float(taker_steps / steps) if steps > 0 else 0.0
     taker_volume_share = float(taker_notional / turnover_notional) if turnover_notional > 0 else 0.0
