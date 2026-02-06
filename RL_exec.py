@@ -775,6 +775,33 @@ def _ensure_sorted_near_regular(ts: np.ndarray) -> None:
         )
 
 
+def _sanitize_snapshot_features(df_or_array: Any) -> Any:
+    target_cols = ["mid_ret_1", "vol_short", "vol_long", "spread_bps"]
+    if isinstance(df_or_array, pd.DataFrame):
+        out = df_or_array.copy()
+        present_cols = [col for col in target_cols if col in out.columns]
+        if not present_cols:
+            return out
+        out[present_cols] = out[present_cols].replace([np.inf, -np.inf], np.nan)
+        out[present_cols] = out[present_cols].ffill().fillna(0.0)
+        return out
+
+    arr = np.asarray(df_or_array).copy()
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D snapshot feature array, got shape={arr.shape}.")
+    col_idx = {
+        name: RAW_SNAPSHOT_FEATURE_COLUMNS.index(name)
+        for name in target_cols
+        if name in RAW_SNAPSHOT_FEATURE_COLUMNS and RAW_SNAPSHOT_FEATURE_COLUMNS.index(name) < arr.shape[1]
+    }
+    for idx in col_idx.values():
+        col = arr[:, idx].astype(np.float64, copy=False)
+        col[~np.isfinite(col)] = np.nan
+        col = pd.Series(col).ffill().fillna(0.0).to_numpy(dtype=arr.dtype, copy=False)
+        arr[:, idx] = col
+    return arr
+
+
 def load_raw_snapshot_features(
     out_root: str,
     *,
@@ -800,7 +827,7 @@ def load_raw_snapshot_features(
     df["mid_ret_1"] = np.log(df["mid"]).diff()
     df["vol_short"] = df["mid_ret_1"].rolling(SHORT_VOL_WINDOW, min_periods=1).std()
     df["vol_long"] = df["mid_ret_1"].rolling(LONG_VOL_WINDOW, min_periods=1).std()
-    return df
+    return _sanitize_snapshot_features(df)
 
 
 def _compute_snapshot_feature_matrix(
@@ -828,7 +855,7 @@ def _compute_snapshot_feature_matrix(
     features = np.column_stack(
         [best_bid, best_ask, mid, spread_bps, mid_ret_1, vol_short, vol_long]
     )
-    return snapshot_ts, features
+    return snapshot_ts, _sanitize_snapshot_features(features)
 
 
 def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -1141,6 +1168,13 @@ def join_features(
         ],
         axis=-1,
     )
+    if not np.all(np.isfinite(features)):
+        bad_rows = np.where(~np.isfinite(features).all(axis=1))[0]
+        sample_rows = bad_rows[:5].tolist()
+        raise ValueError(
+            "join_features produced non-finite values in feature tensor. "
+            f"bad_row_count={len(bad_rows)} sample_rows={sample_rows} features_shape={features.shape}"
+        )
     output = {
         "ts": decision_ts,
         "features": features.astype(np.float32),
