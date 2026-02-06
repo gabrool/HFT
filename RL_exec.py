@@ -62,6 +62,7 @@ PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
 DEFAULT_MM_NOTIONAL_SCALE = 1e4
 DEFAULT_MM_CASH_SCALE = 1e4
 DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
+DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
@@ -1259,6 +1260,7 @@ class MarketMakingEnv:
         fill_size: float = 1.0,
         fill_tolerance: float = 1e-6,
         delta_bps_limit: Optional[float] = None,
+        initial_cash: Optional[float] = None,
     ):
         self.features = batch.features
         self.spread_bps = batch.spread_bps
@@ -1277,6 +1279,11 @@ class MarketMakingEnv:
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
         self.delta_bps_limit = delta_bps_limit
+        self.initial_cash = (
+            float(initial_cash)
+            if initial_cash is not None
+            else _env_float("BYBIT_MM_INITIAL_CASH", DEFAULT_MM_INITIAL_CASH)
+        )
         self.notional_scale = _env_float("BYBIT_MM_NOTIONAL_SCALE", DEFAULT_MM_NOTIONAL_SCALE)
         self.cash_scale = _env_float("BYBIT_MM_CASH_SCALE", DEFAULT_MM_CASH_SCALE)
         self.time_since_fill_scale = _env_float(
@@ -1297,10 +1304,10 @@ class MarketMakingEnv:
 
         self.n = len(self.spread_bps)
         self.idx = 0
-        self.cash = 0.0
+        self.cash = self.initial_cash
         self.inventory = 0.0
         self.total_reward = 0.0
-        self.prev_equity = 0.0
+        self.prev_equity = self.initial_cash
         self.time_since_last_fill = 0.0
         self._obs_count = 0
         self._obs_mean: Optional[np.ndarray] = None
@@ -1312,7 +1319,7 @@ class MarketMakingEnv:
 
     def reset(self) -> np.ndarray:
         self.idx = 0
-        self.cash = 0.0
+        self.cash = self.initial_cash
         self.inventory = 0.0
         self.total_reward = 0.0
         self.time_since_last_fill = 0.0
