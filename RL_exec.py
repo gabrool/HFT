@@ -1720,6 +1720,10 @@ def collect_market_rollout(
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
+    # Canonical action space for rollout + PPO is the *env action space*.
+    # The policy predicts normalized parameters, then we apply a fixed affine
+    # transform (scale-only) to mean/std so sampling, env stepping, and stored
+    # actions/log-probs all refer to the exact same (scaled) action tensor.
     obs_list = []
     action_list = []
     logp_list = []
@@ -1734,22 +1738,23 @@ def collect_market_rollout(
         obs_t = obs_cpu.to(device)
         mean, log_std, value = model(obs_t.unsqueeze(0))
         std = log_std.exp()
-        dist = torch.distributions.Normal(mean, std)
-        action = dist.sample()
-        logp = dist.log_prob(action).sum(dim=-1)
-        action_np = action.squeeze(0).cpu().numpy()
-        if action_np.shape[0] >= 3:
-            scaled_action = np.array(
-                [action_np[0] * delta_scale, action_np[1] * delta_scale, action_np[2] * taker_scale],
-                dtype=np.float32,
-            )
-        else:
-            scaled_action = np.array([action_np[0] * delta_scale, action_np[1] * delta_scale], dtype=np.float32)
-        next_obs, reward, done, _info = env.step(scaled_action)
+
+        action_scale = torch.ones_like(mean)
+        action_scale[..., :2] = delta_scale
+        if action_scale.shape[-1] >= 3:
+            action_scale[..., 2] = taker_scale
+
+        mean_env = mean * action_scale
+        std_env = std * action_scale
+        dist_env = torch.distributions.Normal(mean_env, std_env)
+        action_env = dist_env.sample()
+        logp_env = dist_env.log_prob(action_env).sum(dim=-1)
+
+        next_obs, reward, done, _info = env.step(action_env.squeeze(0).cpu().numpy())
 
         obs_list.append(obs_cpu)
-        action_list.append(action.squeeze(0).detach().cpu())
-        logp_list.append(logp.squeeze(0).detach().cpu())
+        action_list.append(action_env.squeeze(0).detach().cpu())
+        logp_list.append(logp_env.squeeze(0).detach().cpu())
         value_list.append(value.squeeze(0).detach().cpu())
         reward_list.append(torch.tensor(reward, dtype=torch.float32))
         done_list.append(torch.tensor(done, dtype=torch.float32))
@@ -1771,7 +1776,12 @@ def ppo_update_market(
     rollout: Dict[str, torch.Tensor],
     config: PPOConfig,
     device: str,
+    delta_scale: float = 1.0,
+    taker_scale: float = 1.0,
 ):
+    # PPO loss is computed in the same env action space used during rollout.
+    # Stored rollout["actions"]/rollout["logp"] are scaled env actions/log-probs,
+    # so we rebuild the Normal distribution in env scale before ratio/log-prob.
     obs = rollout["obs"]
     actions = rollout["actions"]
     old_logp = rollout["logp"].detach()
@@ -1796,13 +1806,21 @@ def ppo_update_market(
 
             mean, log_std, value = model(mb_obs)
             std = log_std.exp()
-            dist = torch.distributions.Normal(mean, std)
-            logp = dist.log_prob(mb_actions).sum(dim=-1)
+
+            action_scale = torch.ones_like(mean)
+            action_scale[..., :2] = delta_scale
+            if action_scale.shape[-1] >= 3:
+                action_scale[..., 2] = taker_scale
+
+            mean_env = mean * action_scale
+            std_env = std * action_scale
+            dist_env = torch.distributions.Normal(mean_env, std_env)
+            logp = dist_env.log_prob(mb_actions).sum(dim=-1)
             ratio = torch.exp(logp - mb_old_logp)
             clip_adv = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * mb_advantages
             policy_loss = -(torch.min(ratio * mb_advantages, clip_adv)).mean()
             value_loss = nn.functional.mse_loss(value, mb_returns)
-            entropy_loss = dist.entropy().sum(dim=-1).mean()
+            entropy_loss = dist_env.entropy().sum(dim=-1).mean()
             loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
 
             optimizer.zero_grad()
@@ -1892,7 +1910,15 @@ def train_market_ppo(
             delta_scale=delta_scale,
             taker_scale=taker_scale,
         )
-        ppo_update_market(model, optimizer, rollout, config, device)
+        ppo_update_market(
+            model,
+            optimizer,
+            rollout,
+            config,
+            device,
+            delta_scale=delta_scale,
+            taker_scale=taker_scale,
+        )
         if (epoch + 1) % config.val_every == 0:
             report = evaluate_market_policy(
                 val_env,
