@@ -1261,6 +1261,8 @@ class MarketMakingEnv:
         fill_tolerance: float = 1e-6,
         delta_bps_limit: Optional[float] = None,
         initial_cash: Optional[float] = None,
+        obs_norm_state: Optional[dict] = None,
+        freeze_obs_norm: bool = False,
     ):
         self.features = batch.features
         self.spread_bps = batch.spread_bps
@@ -1313,9 +1315,12 @@ class MarketMakingEnv:
         self._obs_mean: Optional[np.ndarray] = None
         self._obs_m2: Optional[np.ndarray] = None
         self._obs_continuous_mask: Optional[np.ndarray] = None
+        self.freeze_obs_norm = bool(freeze_obs_norm)
         self._episode_obs_count = 0
         self._episode_obs_mean: Optional[np.ndarray] = None
         self._episode_obs_m2: Optional[np.ndarray] = None
+        if obs_norm_state is not None:
+            self.set_obs_norm_state(obs_norm_state, freeze=freeze_obs_norm)
 
     def reset(self) -> np.ndarray:
         self.idx = 0
@@ -1377,6 +1382,50 @@ class MarketMakingEnv:
         delta2 = obs - self._episode_obs_mean
         self._episode_obs_m2 += delta * delta2
 
+    def get_obs_norm_state(self) -> Dict[str, Any]:
+        return {
+            "count": int(self._obs_count),
+            "mean": self._obs_mean.astype(np.float64).tolist() if self._obs_mean is not None else None,
+            "m2": self._obs_m2.astype(np.float64).tolist() if self._obs_m2 is not None else None,
+            "continuous_mask": (
+                self._obs_continuous_mask.astype(bool).tolist()
+                if self._obs_continuous_mask is not None
+                else None
+            ),
+        }
+
+    def set_obs_norm_state(self, state: Dict[str, Any], freeze: bool = True) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("obs normalization state must be a dictionary.")
+        count = int(state.get("count", 0))
+        mean_raw = state.get("mean")
+        m2_raw = state.get("m2")
+        mask_raw = state.get("continuous_mask")
+        mean = None if mean_raw is None else np.asarray(mean_raw, dtype=np.float64)
+        m2 = None if m2_raw is None else np.asarray(m2_raw, dtype=np.float64)
+        mask = None if mask_raw is None else np.asarray(mask_raw, dtype=bool)
+        if count < 0:
+            raise ValueError(f"obs normalization count must be non-negative, got {count}")
+        if (mean is None) ^ (m2 is None):
+            raise ValueError("obs normalization state must provide both mean and m2 or neither.")
+        if mean is not None and mean.shape != m2.shape:
+            raise ValueError(
+                f"obs normalization mean/m2 shape mismatch: mean={mean.shape} m2={m2.shape}"
+            )
+        if mask is not None and mean is not None and mask.shape != mean.shape:
+            raise ValueError(
+                "obs normalization continuous_mask shape mismatch: "
+                f"mask={mask.shape} mean={mean.shape}"
+            )
+        if count == 0:
+            mean = None
+            m2 = None
+        self._obs_count = count
+        self._obs_mean = mean
+        self._obs_m2 = m2
+        self._obs_continuous_mask = mask
+        self.freeze_obs_norm = bool(freeze)
+
     def _normalize_observation(self, obs: np.ndarray) -> np.ndarray:
         if self._obs_continuous_mask is None:
             self._obs_continuous_mask = self._continuous_mask(obs.shape[0])
@@ -1386,7 +1435,8 @@ class MarketMakingEnv:
             std = np.sqrt(np.maximum(var, 1e-6))
             mask = self._obs_continuous_mask
             normalized[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
-        self._update_obs_stats(obs)
+        if not self.freeze_obs_norm:
+            self._update_obs_stats(obs)
         self._update_episode_obs_stats(obs)
         return normalized
 
@@ -1898,6 +1948,7 @@ def train_market_ppo(
                             "action_dim": model.log_std.shape[0],
                             "config": config.__dict__,
                             "val_report": val_report,
+                            "obs_norm_state": train_env.get_obs_norm_state(),
                         },
                         ckpt_path,
                     )
@@ -2215,6 +2266,9 @@ def run_pipeline(
         delta_scale=delta_scale,
         taker_scale=taker_scale,
     )
+    train_obs_norm_state = mm_train_env.get_obs_norm_state()
+    mm_val_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
+    mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
 
     baseline_env = MarketMakingEnv(
         mm_test_batch,
@@ -2230,6 +2284,8 @@ def run_pipeline(
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
+        obs_norm_state=train_obs_norm_state,
+        freeze_obs_norm=True,
     )
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
