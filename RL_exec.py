@@ -66,6 +66,7 @@ DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
 DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
+DEFAULT_MM_DELTA_BPS_FALLBACK_LIMIT = 250.0
 SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
     os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
 )
@@ -1425,6 +1426,14 @@ class MarketMakingEnv:
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
         self.delta_bps_limit = delta_bps_limit
+        self.delta_bps_fallback_limit = _env_float(
+            "BYBIT_MM_DELTA_BPS_FALLBACK_LIMIT",
+            DEFAULT_MM_DELTA_BPS_FALLBACK_LIMIT,
+        )
+        if self.delta_bps_limit is None and self.delta_bps_fallback_limit <= 0.0:
+            raise ValueError(
+                "BYBIT_MM_DELTA_BPS_FALLBACK_LIMIT must be positive when delta_bps_limit is unset."
+            )
         self.initial_cash = (
             float(initial_cash)
             if initial_cash is not None
@@ -1731,9 +1740,13 @@ class MarketMakingEnv:
     def _apply_deltas(
         self, bid: float, ask: float, mid: float, bid_delta_bps: float, ask_delta_bps: float
     ) -> Tuple[float, float, float, float]:
-        if self.delta_bps_limit is not None:
-            bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
-            ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
+        effective_limit = (
+            self.delta_bps_limit
+            if self.delta_bps_limit is not None
+            else self.delta_bps_fallback_limit
+        )
+        bid_delta_bps = float(np.clip(bid_delta_bps, -effective_limit, effective_limit))
+        ask_delta_bps = float(np.clip(ask_delta_bps, -effective_limit, effective_limit))
         bid += mid * bid_delta_bps * 1e-4
         ask += mid * ask_delta_bps * 1e-4
         return bid, ask, bid_delta_bps, ask_delta_bps
