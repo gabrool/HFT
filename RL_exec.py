@@ -40,6 +40,7 @@ ALLOW_TS_RECONSTRUCT = os.environ.get("BYBIT_ALLOW_TS_RECONSTRUCT", "false").str
     "y",
 }
 FEATURE_EXTRA_DIM = 5
+ENV_OBS_EXTRA_STATE_DIM = 3
 SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
 DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
@@ -252,6 +253,37 @@ def _infer_num_horizons(feature_dim: int) -> int:
             f"feature_dim={feature_dim} base_dim={base_dim}"
         )
     return base_dim // 4
+
+
+def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, slice]:
+    """Schema for join_features() tensor layout (excluding env extra state).
+
+    Layout order:
+      [ret(h), vol(h), logits(h), p_up(h), align/conf-delta/conf metrics(5), snapshots(snapshot_dim)]
+    """
+    offset = 0
+    layout = {
+        "ret": slice(offset, offset + num_horizons),
+    }
+    offset += num_horizons
+    layout["vol"] = slice(offset, offset + num_horizons)
+    offset += num_horizons
+    layout["dir_logits"] = slice(offset, offset + num_horizons)
+    offset += num_horizons
+    layout["p_up"] = slice(offset, offset + num_horizons)
+    offset += num_horizons
+    layout["align_all"] = slice(offset, offset + 1)
+    offset += 1
+    layout["diff_short_long"] = slice(offset, offset + 1)
+    offset += 1
+    layout["diff_mid_long"] = slice(offset, offset + 1)
+    offset += 1
+    layout["conf_long"] = slice(offset, offset + 1)
+    offset += 1
+    layout["conf_min"] = slice(offset, offset + 1)
+    offset += 1
+    layout["snapshots"] = slice(offset, offset + snapshot_dim)
+    return layout
 
 
 def _normalize_horizons(num_h: int, horizons: List[int]) -> List[int]:
@@ -1133,6 +1165,21 @@ def join_features(
     snapshots: np.ndarray,
     meta: dict,
 ) -> Dict[str, np.ndarray]:
+    """Join model outputs and snapshot state into a single feature tensor.
+
+    Per-row layout (excluding environment-only extra state):
+      1) ret_pred[h]
+      2) vol_pred[h]
+      3) dir_logits[h]
+      4) p_up[h]
+      5) align/conf deltas and confidence metrics:
+         - align_all
+         - diff_short_long
+         - diff_mid_long
+         - conf_long
+         - conf_min
+      6) snapshot features from RAW_SNAPSHOT_FEATURE_COLUMNS
+    """
     ret_pred = cmssl_out["ret_pred"]
     vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
@@ -1160,6 +1207,7 @@ def join_features(
     diff_mid_long = p_up[:, idx_mid] - p_up[:, idx_long]
     conf_long = conf[:, idx_long]
     conf_min = np.min(conf, axis=1)
+    layout = _joined_feature_layout(ret_pred.shape[1], snapshots.shape[1])
     snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
     features = np.concatenate(
@@ -1177,6 +1225,12 @@ def join_features(
         ],
         axis=-1,
     )
+    expected_feature_dim = layout["snapshots"].stop
+    if features.shape[1] != expected_feature_dim:
+        raise ValueError(
+            "join_features layout mismatch: "
+            f"features_shape={features.shape} expected_dim={expected_feature_dim}"
+        )
     if not np.all(np.isfinite(features)):
         bad_rows = np.where(~np.isfinite(features).all(axis=1))[0]
         sample_rows = bad_rows[:5].tolist()
@@ -1334,6 +1388,8 @@ class MarketMakingEnv:
         self._p250_idx = _resolve_horizon_index(250, self._horizons_ms, fallback_idx=0)
         self._p500_idx = _resolve_horizon_index(500, self._horizons_ms, fallback_idx=min(1, self._num_h - 1))
         self._p1000_idx = _resolve_horizon_index(1000, self._horizons_ms, fallback_idx=min(2, self._num_h - 1))
+        self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
+        self._validate_feature_layout()
 
         self.n = len(self.spread_bps)
         self.idx = 0
@@ -1379,12 +1435,33 @@ class MarketMakingEnv:
         obs = np.concatenate([self.features[idx].astype(np.float32), extra], axis=0)
         return self._normalize_observation(obs)
 
+    def _validate_feature_layout(self) -> None:
+        expected_feature_dim = self._feature_layout["snapshots"].stop
+        actual_feature_dim = int(self.features.shape[-1])
+        if actual_feature_dim != expected_feature_dim:
+            raise ValueError(
+                "MarketMakingEnv feature layout drift detected: "
+                f"actual_feature_dim={actual_feature_dim} expected_feature_dim={expected_feature_dim} "
+                f"num_horizons={self._num_h} snapshot_dim={len(RAW_SNAPSHOT_FEATURE_COLUMNS)}"
+            )
+
     def _continuous_mask(self, obs_dim: int) -> np.ndarray:
+        expected_obs_dim = self._feature_layout["snapshots"].stop + ENV_OBS_EXTRA_STATE_DIM
+        if obs_dim != expected_obs_dim:
+            raise ValueError(
+                "Observation dimension mismatch for normalization mask: "
+                f"obs_dim={obs_dim} expected_obs_dim={expected_obs_dim}"
+            )
         mask = np.ones(obs_dim, dtype=bool)
-        prob_start = 3 * self._num_h
-        prob_end = 4 * self._num_h
-        if prob_end <= obs_dim:
-            mask[prob_start:prob_end] = False
+        bounded_feature_keys = (
+            "p_up",
+            "align_all",
+            "conf_long",
+            "conf_min",
+        )
+        for key in bounded_feature_keys:
+            feature_slice = self._feature_layout[key]
+            mask[feature_slice] = False
         return mask
 
     def _update_obs_stats(self, obs: np.ndarray) -> None:
@@ -1488,7 +1565,7 @@ class MarketMakingEnv:
         # Blend the explicit return forecast with probability-weighted sigma to steer skew.
         alpha = (p_weighted - 0.5) * 2.0 * sigma_bps + ret_forecast_bps
         s_min_bps = cfg.s_min_bps
-        snapshot_offset = 4 * self._num_h + FEATURE_EXTRA_DIM
+        snapshot_offset = self._feature_layout["snapshots"].start
         spread_idx = snapshot_offset + RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
         if spread_idx < self.features.shape[1]:
             observed_spread_bps = float(self.features[idx, spread_idx])
