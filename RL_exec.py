@@ -1420,6 +1420,7 @@ class MarketMakingEnv:
         self.inv_soft = inv_soft
         self.lambda_inv = lambda_inv
         self.lambda_turn = lambda_turn
+        self.stack_inventory_penalties = _env_bool("BYBIT_MM_STACK_INVENTORY_PENALTIES", False)
         self.max_inventory = max_inventory
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
@@ -1807,6 +1808,13 @@ class MarketMakingEnv:
             penalty += self.inventory_penalty * (abs(inventory_notional) - self.max_inventory)
         return penalty
 
+    def _combine_inventory_penalties(self, linear_penalty: float, quadratic_penalty: float) -> float:
+        # Both terms penalize inventory risk. Default to non-stacking behavior to avoid
+        # double-charging the same exposure unless explicitly enabled.
+        if self.stack_inventory_penalties:
+            return linear_penalty + quadratic_penalty
+        return max(linear_penalty, quadratic_penalty)
+
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
         # Execution convention: both maker and taker fills are priced using the next snapshot
         # (next_idx). We quote on self.idx, then advance state after applying fills at next_idx.
@@ -1865,9 +1873,10 @@ class MarketMakingEnv:
         inv_penalty = (
             self.lambda_inv * (excess / self.inv_soft) ** 2 if self.inv_soft > 0.0 else 0.0
         )
+        inventory_penalty_total = self._combine_inventory_penalties(penalty, inv_penalty)
         turnover_notional = maker_rebate_notional + taker_notional
         turnover_penalty = self.lambda_turn * turnover_notional
-        reward = delta_equity - penalty - inv_penalty - turnover_penalty
+        reward = delta_equity - inventory_penalty_total - turnover_penalty
 
         self.prev_equity = equity
         self.total_reward += reward
@@ -1885,6 +1894,7 @@ class MarketMakingEnv:
             "taker_fee": float(taker_fee),
             "penalty": float(penalty),
             "inv_penalty": float(inv_penalty),
+            "inventory_penalty_total": float(inventory_penalty_total),
             "turnover_penalty": float(turnover_penalty),
             "mid": float(mid),
             "bid": float(bid),
