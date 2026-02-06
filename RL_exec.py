@@ -1886,6 +1886,9 @@ def train_market_ppo(
             if sharpe > best_report.get("sharpe", -np.inf) and (guard is None or drawdown <= guard):
                 best_report = report
                 if ckpt_path:
+                    val_report = {
+                        k: v for k, v in report.items() if k not in {"equity_curve"}
+                    }  # Prevent oversized checkpoints from embedding full curves.
                     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(
                         {
@@ -1894,7 +1897,7 @@ def train_market_ppo(
                             "hidden_dims": tuple(config.policy_hidden),
                             "action_dim": model.log_std.shape[0],
                             "config": config.__dict__,
-                            "val_report": report,
+                            "val_report": val_report,
                         },
                         ckpt_path,
                     )
