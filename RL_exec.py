@@ -2179,6 +2179,10 @@ def train_market_ppo(
             taker_scale=taker_scale,
         )
         if (epoch + 1) % config.val_every == 0:
+            # Keep validation normalization aligned with training normalization at
+            # checkpoint-selection time; otherwise validation Sharpe is not
+            # comparable across epochs.
+            val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
             report = evaluate_market_policy(
                 val_env,
                 model.policy_net,
