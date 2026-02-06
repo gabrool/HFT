@@ -57,10 +57,10 @@ DEFAULT_MM_P500_WEIGHT = 0.0
 DEFAULT_MM_P1000_WEIGHT = 1.0
 # PPO training epochs environment variable (used across entrypoint/config helpers).
 PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
-# Scaling factors for observation features.
-# Notional and cash scales are denominated in quote currency.
+# Scaling factors for market-making observation extra-state features.
+# Inventory notional and cash scales are denominated in quote currency.
 # Time-since-fill scale is in environment steps (1 step per snapshot).
-DEFAULT_MM_NOTIONAL_SCALE = 1e4
+DEFAULT_MM_INVENTORY_NOTIONAL_SCALE = 1e4
 DEFAULT_MM_CASH_SCALE = 1e4
 DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
 DEFAULT_MM_INITIAL_CASH = 1_000_000.0
@@ -1371,7 +1371,10 @@ class MarketMakingEnv:
             if initial_cash is not None
             else _env_float("BYBIT_MM_INITIAL_CASH", DEFAULT_MM_INITIAL_CASH)
         )
-        self.notional_scale = _env_float("BYBIT_MM_NOTIONAL_SCALE", DEFAULT_MM_NOTIONAL_SCALE)
+        self.inventory_notional_scale = _env_float(
+            "BYBIT_MM_INVENTORY_NOTIONAL_SCALE",
+            _env_float("BYBIT_MM_NOTIONAL_SCALE", DEFAULT_MM_INVENTORY_NOTIONAL_SCALE),
+        )
         self.cash_scale = _env_float("BYBIT_MM_CASH_SCALE", DEFAULT_MM_CASH_SCALE)
         self.time_since_fill_scale = _env_float(
             "BYBIT_MM_TIME_SINCE_FILL_SCALE",
@@ -1420,13 +1423,17 @@ class MarketMakingEnv:
         return float((self.best_bid[idx] + self.best_ask[idx]) / 2.0)
 
     def _build_observation(self, idx: int) -> np.ndarray:
+        mid = self._mid_price(idx)
+        inventory_notional_scaled = (
+            (self.inventory * mid) / self.inventory_notional_scale if self.inventory_notional_scale else 0.0
+        )
         cash_scaled = self.cash / self.cash_scale if self.cash_scale else 0.0
         time_since_last_fill_scaled = (
             self.time_since_last_fill / self.time_since_fill_scale if self.time_since_fill_scale else 0.0
         )
         extra = np.array(
             [
-                self.inventory,
+                inventory_notional_scaled,
                 cash_scaled,
                 time_since_last_fill_scaled,
             ],
@@ -1444,6 +1451,13 @@ class MarketMakingEnv:
                 f"actual_feature_dim={actual_feature_dim} expected_feature_dim={expected_feature_dim} "
                 f"num_horizons={self._num_h} snapshot_dim={len(RAW_SNAPSHOT_FEATURE_COLUMNS)}"
             )
+
+    def get_observation_scaling_config(self) -> Dict[str, float]:
+        return {
+            "inventory_notional_scale": float(self.inventory_notional_scale),
+            "cash_scale": float(self.cash_scale),
+            "time_since_fill_scale": float(self.time_since_fill_scale),
+        }
 
     def _continuous_mask(self, obs_dim: int) -> np.ndarray:
         expected_obs_dim = self._feature_layout["snapshots"].stop + ENV_OBS_EXTRA_STATE_DIM
@@ -2327,6 +2341,7 @@ def run_pipeline(
     )
     mm_obs = mm_train_env.reset()
     mm_obs_dim = mm_obs.shape[0]
+    print("[mm obs scaling]", json.dumps(mm_train_env.get_observation_scaling_config(), sort_keys=True))
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
         maker_rebate_bps=maker_rebate_bps,
@@ -2437,6 +2452,7 @@ def run_pipeline(
 
     return {
         "cmssl_test": cmssl_report,
+        "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
         "mm_baseline": baseline_metrics,
         "mm_rl": rl_metrics,
         "mm_rl_policy_loaded": {"loaded": rl_policy_loaded},
@@ -2475,6 +2491,7 @@ if __name__ == "__main__":
     )
     report = run_pipeline(out_root, ckpt_path, device=device, ppo_epochs=ppo_epochs)
     print("[cmssl test]", report["cmssl_test"])
+    print("[mm obs scaling]", report["mm_obs_scaling"])
     print("[mm baseline]", report["mm_baseline"])
     print("[mm rl]", report["mm_rl"])
     if run_cmssl_test_window:
