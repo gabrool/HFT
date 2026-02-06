@@ -1316,9 +1316,6 @@ class MarketMakingEnv:
         self._obs_m2: Optional[np.ndarray] = None
         self._obs_continuous_mask: Optional[np.ndarray] = None
         self.freeze_obs_norm = bool(freeze_obs_norm)
-        self._episode_obs_count = 0
-        self._episode_obs_mean: Optional[np.ndarray] = None
-        self._episode_obs_m2: Optional[np.ndarray] = None
         if obs_norm_state is not None:
             self.set_obs_norm_state(obs_norm_state, freeze=freeze_obs_norm)
 
@@ -1330,9 +1327,6 @@ class MarketMakingEnv:
         self.time_since_last_fill = 0.0
         mid = self._mid_price(self.idx)
         self.prev_equity = self.cash + self.inventory * mid
-        self._episode_obs_count = 0
-        self._episode_obs_mean = None
-        self._episode_obs_m2 = None
         return self._build_observation(self.idx)
 
     def _mid_price(self, idx: int) -> float:
@@ -1371,16 +1365,6 @@ class MarketMakingEnv:
         self._obs_mean += delta / self._obs_count
         delta2 = obs - self._obs_mean
         self._obs_m2 += delta * delta2
-
-    def _update_episode_obs_stats(self, obs: np.ndarray) -> None:
-        if self._episode_obs_mean is None or self._episode_obs_m2 is None:
-            self._episode_obs_mean = np.zeros_like(obs, dtype=np.float64)
-            self._episode_obs_m2 = np.zeros_like(obs, dtype=np.float64)
-        self._episode_obs_count += 1
-        delta = obs - self._episode_obs_mean
-        self._episode_obs_mean += delta / self._episode_obs_count
-        delta2 = obs - self._episode_obs_mean
-        self._episode_obs_m2 += delta * delta2
 
     def get_obs_norm_state(self) -> Dict[str, Any]:
         return {
@@ -1437,7 +1421,6 @@ class MarketMakingEnv:
             normalized[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
         if not self.freeze_obs_norm:
             self._update_obs_stats(obs)
-        self._update_episode_obs_stats(obs)
         return normalized
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
