@@ -173,11 +173,6 @@ def sigma_from_vol(log_vol: np.ndarray) -> np.ndarray:
     return np.exp(log_vol)
 
 
-def alpha_from_probs(p_up: np.ndarray, sigma_bps: np.ndarray) -> np.ndarray:
-    """Convert directional probabilities into a signed alpha in bps."""
-    return (p_up - 0.5) * 2.0 * sigma_bps
-
-
 def bps_to_px(mid: float, bps: float) -> float:
     return mid * bps * 1e-4
 
@@ -1129,12 +1124,8 @@ def join_features(
     diff_mid_long = p_up[:, idx_mid] - p_up[:, idx_long]
     conf_long = conf[:, idx_long]
     conf_min = np.min(conf, axis=1)
-    sigma = sigma_from_vol(vol_pred)
-    sigma_bps = 1e4 * sigma
     snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
-    alpha_bps = alpha_from_probs(p_up[:, idx_long], sigma_bps[:, idx_long])
-
     features = np.concatenate(
         [
             ret_pred,
@@ -1155,7 +1146,6 @@ def join_features(
         "features": features.astype(np.float32),
         "y": y.astype(np.float32),
         "spread_bps": spread_bps.astype(np.float32),
-        "alpha_bps": alpha_bps.astype(np.float32),
         "snapshots": snapshots.astype(np.float32),
     }
     if snapshot_mask is not None:
@@ -1240,7 +1230,6 @@ class MarketMakingBatch:
     spread_bps: np.ndarray
     best_bid: np.ndarray
     best_ask: np.ndarray
-    alpha_bps: Optional[np.ndarray] = None
 
 
 class MarketMakingEnv:
@@ -1268,7 +1257,6 @@ class MarketMakingEnv:
         self.spread_bps = batch.spread_bps
         self.best_bid = batch.best_bid
         self.best_ask = batch.best_ask
-        self.alpha_bps = batch.alpha_bps if batch.alpha_bps is not None else np.zeros_like(self.spread_bps)
         self.maker_rebate_bps = maker_rebate_bps
         self.taker_fee_bps = taker_fee_bps
         self.allow_taker = allow_taker
@@ -1984,7 +1972,6 @@ def build_market_batch(split: Dict[str, np.ndarray]) -> MarketMakingBatch:
         spread_bps=split["spread_bps"],
         best_bid=best_bid,
         best_ask=best_ask,
-        alpha_bps=split.get("alpha_bps"),
     )
 
 
