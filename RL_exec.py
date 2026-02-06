@@ -1500,8 +1500,13 @@ class MarketMakingEnv:
         if obs_norm_state is not None:
             self.set_obs_norm_state(obs_norm_state, freeze=freeze_obs_norm)
 
-    def reset(self) -> np.ndarray:
-        self.idx = 0
+    def reset(self, start_idx: int = 0) -> np.ndarray:
+        max_start = max(0, self.n - 2)
+        if start_idx < 0 or start_idx > max_start:
+            raise ValueError(
+                f"start_idx out of bounds: start_idx={start_idx} valid=[0, {max_start}]"
+            )
+        self.idx = int(start_idx)
         self.cash = self.initial_cash
         self.inventory = 0.0
         self.total_reward = 0.0
@@ -1956,6 +1961,9 @@ class PPOConfig:
     value_hidden: Tuple[int, ...] = (128, 128)
     val_every: int = 1
     max_drawdown_guard: Optional[float] = None
+    rollout_horizon: int = 2048
+    rollouts_per_epoch: int = 1
+    randomize_rollout_start: bool = True
 
 
 def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, gamma: float, lam: float):
@@ -1978,6 +1986,9 @@ def collect_market_rollout(
     device: str,
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
+    horizon: int = 2048,
+    rollouts_per_epoch: int = 1,
+    randomize_start: bool = True,
 ) -> Dict[str, torch.Tensor]:
     # Canonical action space for rollout + PPO is the *env action space*.
     # The policy predicts normalized parameters, then we apply a fixed affine
@@ -1990,34 +2001,45 @@ def collect_market_rollout(
     reward_list = []
     done_list = []
 
-    obs = env.reset()
-    done = False
-    while not done:
-        obs_cpu = torch.from_numpy(obs).float()
-        obs_t = obs_cpu.to(device)
-        mean, log_std, value = model(obs_t.unsqueeze(0))
-        std = log_std.exp()
+    if horizon <= 0:
+        raise ValueError(f"horizon must be positive, got {horizon}")
+    if rollouts_per_epoch <= 0:
+        raise ValueError(f"rollouts_per_epoch must be positive, got {rollouts_per_epoch}")
 
-        action_scale = torch.ones_like(mean)
-        action_scale[..., :2] = delta_scale
-        if action_scale.shape[-1] >= 3:
-            action_scale[..., 2] = taker_scale
+    max_start = max(0, env.n - 2)
+    for _ in range(rollouts_per_epoch):
+        start_idx = int(np.random.randint(0, max_start + 1)) if randomize_start else 0
+        obs = env.reset(start_idx=start_idx)
+        done = False
+        steps = 0
+        while not done and steps < horizon:
+            obs_cpu = torch.from_numpy(obs).float()
+            obs_t = obs_cpu.to(device)
+            mean, log_std, value = model(obs_t.unsqueeze(0))
+            std = log_std.exp()
 
-        mean_env = mean * action_scale
-        std_env = std * action_scale
-        dist_env = torch.distributions.Normal(mean_env, std_env)
-        action_env = dist_env.sample()
-        logp_env = dist_env.log_prob(action_env).sum(dim=-1)
+            action_scale = torch.ones_like(mean)
+            action_scale[..., :2] = delta_scale
+            if action_scale.shape[-1] >= 3:
+                action_scale[..., 2] = taker_scale
 
-        next_obs, reward, done, _info = env.step(action_env.squeeze(0).cpu().numpy())
+            mean_env = mean * action_scale
+            std_env = std * action_scale
+            dist_env = torch.distributions.Normal(mean_env, std_env)
+            action_env = dist_env.sample()
+            logp_env = dist_env.log_prob(action_env).sum(dim=-1)
 
-        obs_list.append(obs_cpu)
-        action_list.append(action_env.squeeze(0).detach().cpu())
-        logp_list.append(logp_env.squeeze(0).detach().cpu())
-        value_list.append(value.squeeze(0).detach().cpu())
-        reward_list.append(torch.tensor(reward, dtype=torch.float32))
-        done_list.append(torch.tensor(done, dtype=torch.float32))
-        obs = next_obs
+            next_obs, reward, env_done, _info = env.step(action_env.squeeze(0).cpu().numpy())
+            steps += 1
+            done = bool(env_done) or steps >= horizon
+
+            obs_list.append(obs_cpu)
+            action_list.append(action_env.squeeze(0).detach().cpu())
+            logp_list.append(logp_env.squeeze(0).detach().cpu())
+            value_list.append(value.squeeze(0).detach().cpu())
+            reward_list.append(torch.tensor(reward, dtype=torch.float32))
+            done_list.append(torch.tensor(float(done), dtype=torch.float32))
+            obs = next_obs
 
     return {
         "obs": torch.stack(obs_list),
@@ -2168,6 +2190,9 @@ def train_market_ppo(
             device,
             delta_scale=delta_scale,
             taker_scale=taker_scale,
+            horizon=config.rollout_horizon,
+            rollouts_per_epoch=config.rollouts_per_epoch,
+            randomize_start=config.randomize_rollout_start,
         )
         ppo_update_market(
             model,
@@ -2579,6 +2604,10 @@ def run_pipeline(
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
         val_every=int(os.environ.get("BYBIT_MM_PPO_VAL_EVERY", "1")),
         max_drawdown_guard=float(os.environ.get("BYBIT_MM_PPO_MAX_DRAWDOWN", "nan")),
+        rollout_horizon=int(os.environ.get("BYBIT_MM_PPO_ROLLOUT_HORIZON", "2048")),
+        rollouts_per_epoch=int(os.environ.get("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", "1")),
+        randomize_rollout_start=os.environ.get("BYBIT_MM_PPO_RANDOMIZE_START", "true").strip().lower()
+        in {"1", "true", "yes", "y", "on"},
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
