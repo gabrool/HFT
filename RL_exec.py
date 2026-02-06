@@ -1327,6 +1327,7 @@ class MarketMakingBatch:
     spread_bps: np.ndarray
     best_bid: np.ndarray
     best_ask: np.ndarray
+    decision_ts: Optional[np.ndarray] = None
 
 
 class MarketMakingEnv:
@@ -1354,6 +1355,7 @@ class MarketMakingEnv:
         self.spread_bps = batch.spread_bps
         self.best_bid = batch.best_bid
         self.best_ask = batch.best_ask
+        self.decision_ts = batch.decision_ts
         self.maker_rebate_bps = maker_rebate_bps
         self.taker_fee_bps = taker_fee_bps
         self.allow_taker = allow_taker
@@ -2127,12 +2129,51 @@ def build_market_batch(split: Dict[str, np.ndarray]) -> MarketMakingBatch:
     best_ask = snapshots[:, 1].astype(np.float32)
     best_bid = _fill_forward(best_bid)
     best_ask = _fill_forward(best_ask)
+    decision_ts = split.get("ts")
+    if decision_ts is not None:
+        decision_ts = np.asarray(decision_ts, dtype=np.int64)
+        if decision_ts.ndim != 1:
+            raise ValueError("split['ts'] must be a 1D array.")
+        if decision_ts.shape[0] != split["features"].shape[0]:
+            raise ValueError(
+                "split['ts'] length mismatch: "
+                f"expected {split['features'].shape[0]}, got {decision_ts.shape[0]}"
+            )
+        _ensure_monotonic(decision_ts, "split")
     return MarketMakingBatch(
         features=split["features"],
         spread_bps=split["spread_bps"],
         best_bid=best_bid,
         best_ask=best_ask,
+        decision_ts=decision_ts,
     )
+
+
+def _resolve_eval_step_ms(env: MarketMakingEnv, steps: int) -> Dict[str, Any]:
+    fallback_step_ms = _env_float("BYBIT_MM_SNAPSHOT_STEP_MS", RAW_SNAPSHOT_EXPECTED_STEP_MS)
+    decision_ts = env.decision_ts
+    if decision_ts is None or decision_ts.size < 2 or steps <= 0:
+        return {
+            "step_ms": float(fallback_step_ms),
+            "source": "env_var_fallback",
+            "diff_count": 0,
+        }
+
+    eval_count = min(int(steps) + 1, int(decision_ts.size))
+    diffs = np.diff(decision_ts[:eval_count])
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.size == 0:
+        return {
+            "step_ms": float(fallback_step_ms),
+            "source": "env_var_fallback",
+            "diff_count": 0,
+        }
+
+    return {
+        "step_ms": float(np.median(positive_diffs)),
+        "source": "decision_ts_median_diff",
+        "diff_count": int(positive_diffs.size),
+    }
 
 
 def _inventory_distribution(inventory: np.ndarray) -> Dict[str, float]:
@@ -2198,7 +2239,8 @@ def evaluate_market_making(
         out=np.zeros_like(equity_arr),
         where=prev_equity != 0,
     ) - 1.0
-    step_ms = _env_float("BYBIT_MM_SNAPSHOT_STEP_MS", RAW_SNAPSHOT_EXPECTED_STEP_MS)
+    cadence = _resolve_eval_step_ms(env, steps)
+    step_ms = float(cadence["step_ms"])
     steps_per_year = _steps_per_year_from_snapshot_ms(step_ms)
     sharpe = compute_sharpe(returns, steps_per_year)
     max_drawdown = compute_max_drawdown(equity_arr)
@@ -2219,6 +2261,12 @@ def evaluate_market_making(
         "taker_volume_share": taker_volume_share,
         "fee_drag": fee_drag,
         "inventory_distribution": _inventory_distribution(inventory_arr),
+        "cadence": {
+            "step_ms": step_ms,
+            "steps_per_year": float(steps_per_year),
+            "source": cadence["source"],
+            "diff_count": cadence["diff_count"],
+        },
     }
 
 
