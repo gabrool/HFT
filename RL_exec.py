@@ -188,6 +188,13 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else int(default)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 def _env_int_list(name: str, default: List[int]) -> List[int]:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -286,18 +293,51 @@ def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, sl
     return layout
 
 
-def _normalize_horizons(num_h: int, horizons: List[int]) -> List[int]:
+def _normalize_horizons(
+    num_h: int,
+    horizons: List[int],
+    *,
+    allow_fallback: bool,
+    has_explicit_env_mapping: bool,
+) -> List[int]:
     if len(horizons) == num_h:
         return list(horizons)
-    if len(horizons) > num_h:
-        return list(horizons[:num_h])
-    return list(range(num_h))
+    if allow_fallback and not has_explicit_env_mapping:
+        raise ValueError(
+            "Horizon fallback is enabled, but BYBIT_MM_HORIZONS_MS is not explicitly set. "
+            "Provide BYBIT_MM_HORIZONS_MS with exactly one horizon per model output "
+            f"(expected={num_h})."
+        )
+    raise ValueError(
+        "Horizon count mismatch between model outputs and configured horizons: "
+        f"num_model_horizons={num_h} configured_horizons={horizons} configured_count={len(horizons)}. "
+        "Set BYBIT_MM_HORIZONS_MS to exactly match model horizons."
+    )
 
 
-def _resolve_horizon_index(target_ms: int, horizons: List[int], fallback_idx: int) -> int:
+def _resolve_horizon_index(
+    target_ms: int,
+    horizons: List[int],
+    *,
+    label: str,
+    allow_fallback: bool,
+) -> int:
     if target_ms in horizons:
         return horizons.index(target_ms)
-    return min(fallback_idx, len(horizons) - 1)
+    if allow_fallback and horizons:
+        nearest_idx = min(range(len(horizons)), key=lambda i: abs(horizons[i] - target_ms))
+        print(
+            "[mm horizons]",
+            f"fallback_resolve label={label}",
+            f"target_ms={target_ms}",
+            f"resolved_ms={horizons[nearest_idx]}",
+            f"resolved_idx={nearest_idx}",
+        )
+        return nearest_idx
+    raise ValueError(
+        "Required horizon is not available in configured horizon mapping: "
+        f"label={label} target_ms={target_ms} configured_horizons={horizons}."
+    )
 
 
 def _load_ts_from_npy(path: Path, expected_len: int, label: str) -> Optional[np.ndarray]:
@@ -1382,17 +1422,50 @@ class MarketMakingEnv:
             "BYBIT_MM_TIME_SINCE_FILL_SCALE",
             DEFAULT_MM_TIME_SINCE_FILL_SCALE,
         )
+        self._allow_horizon_fallback = _env_bool("BYBIT_MM_ALLOW_HORIZON_FALLBACK", False)
+        self._has_explicit_horizons_env = bool(os.environ.get("BYBIT_MM_HORIZONS_MS", "").strip())
         self._baseline_cfg = load_baseline_quote_config()
         self._num_h = _infer_num_horizons(self.features.shape[-1])
-        self._horizons_ms = _normalize_horizons(self._num_h, self._baseline_cfg.horizons_ms)
+        self._horizons_ms = _normalize_horizons(
+            self._num_h,
+            self._baseline_cfg.horizons_ms,
+            allow_fallback=self._allow_horizon_fallback,
+            has_explicit_env_mapping=self._has_explicit_horizons_env,
+        )
         self._vol_horizon_idx = _resolve_horizon_index(
             self._baseline_cfg.vol_horizon_ms,
             self._horizons_ms,
-            fallback_idx=min(self._num_h - 1, 2),
+            label="vol",
+            allow_fallback=self._allow_horizon_fallback,
         )
-        self._p250_idx = _resolve_horizon_index(250, self._horizons_ms, fallback_idx=0)
-        self._p500_idx = _resolve_horizon_index(500, self._horizons_ms, fallback_idx=min(1, self._num_h - 1))
-        self._p1000_idx = _resolve_horizon_index(1000, self._horizons_ms, fallback_idx=min(2, self._num_h - 1))
+        self._p250_idx = _resolve_horizon_index(
+            250,
+            self._horizons_ms,
+            label="p250",
+            allow_fallback=self._allow_horizon_fallback,
+        )
+        self._p500_idx = _resolve_horizon_index(
+            500,
+            self._horizons_ms,
+            label="p500",
+            allow_fallback=self._allow_horizon_fallback,
+        )
+        self._p1000_idx = _resolve_horizon_index(
+            1000,
+            self._horizons_ms,
+            label="p1000",
+            allow_fallback=self._allow_horizon_fallback,
+        )
+        print(
+            "[mm horizons]",
+            f"resolved_horizons_ms={self._horizons_ms}",
+            f"vol_ms={self._baseline_cfg.vol_horizon_ms}",
+            f"vol_idx={self._vol_horizon_idx}",
+            f"p250_idx={self._p250_idx}",
+            f"p500_idx={self._p500_idx}",
+            f"p1000_idx={self._p1000_idx}",
+            f"allow_fallback={self._allow_horizon_fallback}",
+        )
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
 
