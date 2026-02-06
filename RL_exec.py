@@ -563,10 +563,19 @@ def run_cmssl_inference(
     batch_size: int = 256,
     device: str = "cuda",
 ) -> Dict[str, np.ndarray]:
+    """Run CMSSL inference for batched inputs; empty batches are valid."""
     ret_preds: List[np.ndarray] = []
     vol_preds: List[np.ndarray] = []
     dir_logits_list: List[np.ndarray] = []
+    num_h = len(meta["horizons_ms"])
     n = x_core.shape[0]
+    if n == 0:
+        empty = np.empty((0, num_h), dtype=np.float32)
+        return {
+            "ret_pred": empty.copy(),
+            "vol_pred": empty.copy(),
+            "dir_logits": empty.copy(),
+        }
     for i in range(0, n, batch_size):
         xc = x_core[i:i + batch_size]
         xa = x_aux[i:i + batch_size]
@@ -575,9 +584,9 @@ def run_cmssl_inference(
         vol_preds.append(vol_pred.detach().cpu().numpy())
         dir_logits_list.append(dir_logits.detach().cpu().numpy())
     return {
-        "ret_pred": np.concatenate(ret_preds, axis=0),
-        "vol_pred": np.concatenate(vol_preds, axis=0),
-        "dir_logits": np.concatenate(dir_logits_list, axis=0),
+        "ret_pred": np.concatenate(ret_preds, axis=0).astype(np.float32, copy=False),
+        "vol_pred": np.concatenate(vol_preds, axis=0).astype(np.float32, copy=False),
+        "dir_logits": np.concatenate(dir_logits_list, axis=0).astype(np.float32, copy=False),
     }
 
 
