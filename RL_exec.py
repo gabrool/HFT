@@ -1548,14 +1548,47 @@ class MarketMakingEnv:
         return normalized
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
+        """Parse an action into (bid_delta_bps, ask_delta_bps, taker_signal).
+
+        Accepted action formats:
+        - Scalar: applies the same delta to bid and ask, with no taker signal.
+        - Length-2 sequence: interpreted as (bid_delta_bps, ask_delta_bps), taker=0.
+        - Length-3 sequence: interpreted as (bid_delta_bps, ask_delta_bps, taker_signal).
+        """
+        bid_delta_bps: float
+        ask_delta_bps: float
+        taker_signal: float
+
         if isinstance(action, (list, tuple, np.ndarray)):
             if len(action) == 3:
-                return float(action[0]), float(action[1]), float(action[2])
-            if len(action) == 2:
-                return float(action[0]), float(action[1]), 0.0
-        if np.isscalar(action):
-            return float(action), float(action), 0.0
-        raise ValueError("Action must be a scalar or (bid_delta_bps, ask_delta_bps[, taker_signal]).")
+                bid_delta_bps = float(action[0])
+                ask_delta_bps = float(action[1])
+                taker_signal = float(action[2])
+            elif len(action) == 2:
+                bid_delta_bps = float(action[0])
+                ask_delta_bps = float(action[1])
+                taker_signal = 0.0
+            else:
+                raise ValueError(
+                    "Action sequence must be length 2 or 3: "
+                    "(bid_delta_bps, ask_delta_bps[, taker_signal])."
+                )
+        elif np.isscalar(action):
+            bid_delta_bps = float(action)
+            ask_delta_bps = float(action)
+            taker_signal = 0.0
+        else:
+            raise ValueError(
+                "Action must be a scalar or (bid_delta_bps, ask_delta_bps[, taker_signal])."
+            )
+
+        if not np.all(np.isfinite([bid_delta_bps, ask_delta_bps, taker_signal])):
+            raise ValueError(
+                "Action components must be finite: "
+                f"bid_delta_bps={bid_delta_bps}, ask_delta_bps={ask_delta_bps}, "
+                f"taker_signal={taker_signal}"
+            )
+        return bid_delta_bps, ask_delta_bps, taker_signal
 
     def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
         return self.features[idx, start:end]
@@ -1601,9 +1634,8 @@ class MarketMakingEnv:
         return bid, ask, mid
 
     def _apply_deltas(
-        self, bid: float, ask: float, mid: float, action: Any
+        self, bid: float, ask: float, mid: float, bid_delta_bps: float, ask_delta_bps: float
     ) -> Tuple[float, float, float, float]:
-        bid_delta_bps, ask_delta_bps, _taker_signal = self._parse_action(action)
         if self.delta_bps_limit is not None:
             bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
             ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
@@ -1709,11 +1741,13 @@ class MarketMakingEnv:
                 "taker_fee": 0.0,
             }
             return self._build_observation(self.idx), 0.0, True, info
+        bid_delta_bps, ask_delta_bps, taker_signal = self._parse_action(action)
         bid, ask, mid = self._baseline_quotes(self.idx)
-        bid, ask, bid_delta_bps, ask_delta_bps = self._apply_deltas(bid, ask, mid, action)
+        bid, ask, bid_delta_bps, ask_delta_bps = self._apply_deltas(
+            bid, ask, mid, bid_delta_bps, ask_delta_bps
+        )
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
-        _, _, taker_signal = self._parse_action(action)
         maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
         taker_buy, taker_sell = self._apply_taker(next_idx, taker_signal)
         inv_new = self.inventory
