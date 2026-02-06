@@ -2043,13 +2043,17 @@ def evaluate_market_making(
         equity_curve.append(info["equity"])
         inventory_curve.append(info["inventory"])
         steps += 1
-        step_qty = abs(info["maker_buy"]) + abs(info["maker_sell"]) + abs(info["taker_buy"]) + abs(info["taker_sell"])
-        step_mid = float(info.get("mid", env._mid_price(env.idx - 1)))
-        step_taker_qty = abs(info["taker_buy"]) + abs(info["taker_sell"])
+        maker_buy = abs(float(info["maker_buy"]))
+        maker_sell = abs(float(info["maker_sell"]))
+        taker_buy = abs(float(info["taker_buy"]))
+        taker_sell = abs(float(info["taker_sell"]))
+        step_qty = maker_buy + maker_sell + taker_buy + taker_sell
         turnover_qty += step_qty
-        step_notional = step_qty * step_mid
+        maker_notional = maker_buy * float(info.get("bid", 0.0)) + maker_sell * float(info.get("ask", 0.0))
+        step_taker_notional = taker_buy * float(env.best_ask[env.idx]) + taker_sell * float(env.best_bid[env.idx])
+        step_notional = maker_notional + step_taker_notional
         turnover_notional += step_notional
-        taker_notional += step_taker_qty * step_mid
+        taker_notional += step_taker_notional
         taker_fee_total += float(info.get("taker_fee", 0.0))
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
         maker_opps += 2
