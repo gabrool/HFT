@@ -72,6 +72,12 @@ SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
 )
 
 
+def require(condition: bool, msg: str, exc_type: type[Exception] = ValueError) -> None:
+    """Raise a typed exception when a runtime precondition fails."""
+    if not condition:
+        raise exc_type(msg)
+
+
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
@@ -97,16 +103,16 @@ def cmssl_predict(model, x_core, x_aux, meta, device: str = "cuda"):
     ret_pred, vol_pred, dir_logits, *_ = model(x, mask_ratio=0.0, mask_idx=mask_idx)
     horizons = meta.get("horizons_ms", [])
     expected_h = len(horizons)
-    assert expected_h > 0, "meta['horizons_ms'] must be non-empty"
-    assert ret_pred.shape[-1] == expected_h, (
+    require(expected_h > 0, "meta['horizons_ms'] must be non-empty")
+    require(ret_pred.shape[-1] == expected_h, (
         f"ret_pred shape {ret_pred.shape} does not match horizons {expected_h}"
-    )
-    assert vol_pred.shape[-1] == expected_h, (
+    ))
+    require(vol_pred.shape[-1] == expected_h, (
         f"vol_pred shape {vol_pred.shape} does not match horizons {expected_h}"
-    )
-    assert dir_logits.shape[-1] == expected_h, (
+    ))
+    require(dir_logits.shape[-1] == expected_h, (
         f"dir_logits shape {dir_logits.shape} does not match horizons {expected_h}"
-    )
+    ))
     return ret_pred, vol_pred, dir_logits
 
 
@@ -126,10 +132,10 @@ def iter_chunk_batches(out_root: str):
 
 def _decision_ts_bounds(week_key: str, week_meta: dict) -> tuple[int, int]:
     ts_range = week_meta.get("decision_ts_range")
-    assert ts_range, f"week {week_key} missing decision_ts_range in meta_week.json"
+    require(ts_range, f"week {week_key} missing decision_ts_range in meta_week.json")
     ts_min = int(ts_range["min"])
     ts_max = int(ts_range["max"])
-    assert ts_min < ts_max, f"week {week_key} has invalid decision_ts_range: {ts_range}"
+    require(ts_min < ts_max, f"week {week_key} has invalid decision_ts_range: {ts_range}")
     return ts_min, ts_max
 
 
@@ -137,14 +143,14 @@ def get_cmssl_splits(out_root: str) -> dict:
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
     weeks = list(meta.get("weeks", []))
-    assert len(weeks) == 2, f"expected exactly 2 weeks, found {len(weeks)}"
+    require(len(weeks) == 2, f"expected exactly 2 weeks, found {len(weeks)}")
 
     week_meta_map = {wk: wmeta for wk, wmeta, _ in iter_week_chunks(out_root, meta=meta)}
-    assert len(week_meta_map) == 2, f"expected two week metas, found {len(week_meta_map)}"
+    require(len(week_meta_map) == 2, f"expected two week metas, found {len(week_meta_map)}")
     week1_key, week2_key = weeks
-    assert week1_key in week_meta_map and week2_key in week_meta_map, (
+    require(week1_key in week_meta_map and week2_key in week_meta_map, (
         f"week keys {weeks} do not match week metas {list(week_meta_map.keys())}"
-    )
+    ))
 
     week1_min, week1_max = _decision_ts_bounds(week1_key, week_meta_map[week1_key])
     week2_min, week2_max = _decision_ts_bounds(week2_key, week_meta_map[week2_key])
@@ -153,14 +159,14 @@ def get_cmssl_splits(out_root: str) -> dict:
     expected_week_ms = 7 * 24 * 60 * 60 * 1000
     expected_half_ms = expected_week_ms / 2.0
     tolerance_ms = 60 * 60 * 1000
-    assert abs(week2_span - expected_week_ms) <= tolerance_ms, (
+    require(abs(week2_span - expected_week_ms) <= tolerance_ms, (
         f"week2 span {week2_span:.0f}ms not ~7 days"
-    )
+    ))
 
     week2_half = week2_span / 2.0
-    assert abs(week2_half - expected_half_ms) <= tolerance_ms, (
+    require(abs(week2_half - expected_half_ms) <= tolerance_ms, (
         f"week2 half span {week2_half:.0f}ms not ~3.5 days"
-    )
+    ))
 
     week2_mid = int(week2_min + week2_half)
     return {
@@ -1051,9 +1057,9 @@ def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
     expected_week_ms = 7 * 24 * 60 * 60 * 1000
     expected_half_ms = int(expected_week_ms / 2.0)
     tolerance_ms = 60 * 60 * 1000
-    assert abs(duration_ms - expected_half_ms) <= tolerance_ms, (
+    require(abs(duration_ms - expected_half_ms) <= tolerance_ms, (
         f"Test split duration {duration_ms}ms not ~3.5 days."
-    )
+    ))
 
     if RAW_SNAPSHOT_PATHS:
         snapshot_df = load_raw_snapshot_features(out_root, split=test_split, meta=meta)
@@ -1162,27 +1168,29 @@ def align_snapshots_to_decisions(
     else:
         decision_first = decision_last = snapshot_first = snapshot_last = None
     if matched_decision_ts.size and not allow_partial_match:
-        assert snapshot_first is not None and snapshot_last is not None
+        require(
+            snapshot_first is not None and snapshot_last is not None,
+            "Matched snapshot bounds are unexpectedly missing during strict alignment.",
+            RuntimeError,
+        )
         if expected_bounds is None:
             expected_first = snapshot_first
             expected_last = snapshot_last
         else:
             expected_first, expected_last = expected_bounds
-        assert (
-            abs(decision_first - expected_first) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
-        ), (
+        require(
+            abs(decision_first - expected_first) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS,
             "First matched decision timestamp is too far from alignment start bound; "
             f"decision_first={decision_first} expected_bound_first={expected_first} "
             f"delta_ms={abs(decision_first - expected_first)} "
-            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}"
+            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}",
         )
-        assert (
-            abs(decision_last - expected_last) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
-        ), (
+        require(
+            abs(decision_last - expected_last) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS,
             "Last matched decision timestamp is too far from alignment end bound; "
             f"decision_last={decision_last} expected_bound_last={expected_last} "
             f"delta_ms={abs(decision_last - expected_last)} "
-            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}"
+            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}",
         )
     if label:
         print(
@@ -1377,7 +1385,7 @@ def chronological_split(
     data: Dict[str, np.ndarray],
     ratios: Tuple[float, float, float] = (0.6, 0.2, 0.2),
 ) -> Dict[str, Dict[str, np.ndarray]]:
-    assert abs(sum(ratios) - 1.0) < 1e-6
+    require(abs(sum(ratios) - 1.0) < 1e-6, f"ratios must sum to 1.0; got {ratios}")
     n = len(data["ts"])
     n_train = int(n * ratios[0])
     n_val = int(n * ratios[1])
