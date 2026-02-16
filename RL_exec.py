@@ -2552,13 +2552,20 @@ def load_market_policy(
     input_dim: int,
     device: str = "cuda",
     ckpt_path: Optional[str] = None,
+    require_checkpoint: bool = False,
 ) -> Optional[MarketPolicyNet]:
     """Load a deterministic market policy (mean-action inference only)."""
     if not ckpt_path:
         return None
     path = Path(ckpt_path)
     if not path.exists():
-        raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
+        if require_checkpoint:
+            raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
+        warnings.warn(
+            f"Market policy checkpoint not found: {ckpt_path}. Falling back to baseline policy.",
+            RuntimeWarning,
+        )
+        return None
     ckpt = torch.load(path, map_location=device)
     if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
         state = ckpt["policy_state_dict"]
@@ -2705,6 +2712,7 @@ def run_pipeline(
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
     mm_best_ckpt = Path(os.environ.get("BYBIT_MM_PPO_BEST_CKPT", Path(out_root) / "mm_ppo_best.pt"))
+    require_rl_ckpt = _env_bool("BYBIT_MM_REQUIRE_RL_CKPT", False)
     train_market_ppo(
         mm_train_env,
         mm_val_env,
@@ -2740,9 +2748,33 @@ def run_pipeline(
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
     mm_policy_path = os.environ.get("BYBIT_MM_RL_CKPT", "").strip() or str(mm_best_ckpt)
-    mm_policy = load_market_policy(mm_obs_dim, device=device, ckpt_path=mm_policy_path or None)
+    resolved_mm_policy_path = str(Path(mm_policy_path).expanduser().resolve()) if mm_policy_path else None
+
+    if resolved_mm_policy_path is None:
+        mm_policy = None
+        rl_policy_reason = "no path provided"
+    elif not Path(resolved_mm_policy_path).exists():
+        missing_msg = (
+            f"[mm eval] no checkpoint saved/found at {resolved_mm_policy_path}; "
+            "using baseline deltas for RL run."
+        )
+        if require_rl_ckpt:
+            raise FileNotFoundError(missing_msg)
+        warnings.warn(missing_msg, RuntimeWarning)
+        mm_policy = None
+        rl_policy_reason = "missing checkpoint"
+    else:
+        mm_policy = load_market_policy(
+            mm_obs_dim,
+            device=device,
+            ckpt_path=resolved_mm_policy_path,
+            require_checkpoint=require_rl_ckpt,
+        )
+        rl_policy_reason = "loaded" if mm_policy is not None else "missing checkpoint"
+
     if mm_policy is None:
-        print("[mm eval] no BYBIT_MM_RL_CKPT provided; using baseline deltas for RL run.")
+        if rl_policy_reason == "no path provided":
+            print("[mm eval] no policy path provided; using baseline deltas for RL run.")
         rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
         rl_policy_loaded = False
     else:
@@ -2770,7 +2802,12 @@ def run_pipeline(
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
         "mm_baseline": baseline_metrics,
         "mm_rl": rl_metrics,
-        "mm_rl_policy_loaded": {"loaded": rl_policy_loaded},
+        "mm_rl_policy_loaded": {
+            "loaded": rl_policy_loaded,
+            "reason": rl_policy_reason,
+            "path": resolved_mm_policy_path,
+            "require_checkpoint": require_rl_ckpt,
+        },
     }
 
 
