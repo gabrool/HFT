@@ -67,6 +67,7 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 DEFAULT_MM_DELTA_BPS_FALLBACK_LIMIT = 250.0
+DEFAULT_MM_INV_SOFT_UNITS = 5.0
 SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
     os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
 )
@@ -1855,11 +1856,12 @@ class MarketMakingEnv:
         return buy_fill, sell_fill
 
     def _compute_penalty(self, mid: float) -> float:
-        # Penalize inventory exposure in notional terms.
-        inventory_notional = self.inventory * mid
-        penalty = self.inventory_penalty * abs(inventory_notional)
-        if self.max_inventory is not None and abs(inventory_notional) > self.max_inventory:
-            penalty += self.inventory_penalty * (abs(inventory_notional) - self.max_inventory)
+        # Industry convention: apply linear inventory penalty only for breaching
+        # an explicit hard inventory cap, measured in base units.
+        inv_abs = abs(self.inventory)
+        penalty = 0.0
+        if self.max_inventory is not None and inv_abs > self.max_inventory:
+            penalty += self.inventory_penalty * (inv_abs - self.max_inventory)
         return penalty
 
     def _combine_inventory_penalties(self, linear_penalty: float, quadratic_penalty: float) -> float:
@@ -1922,8 +1924,9 @@ class MarketMakingEnv:
         equity = self.cash + self.inventory * mid_next
         delta_equity = equity - self.prev_equity
         penalty = self._compute_penalty(mid_next)
-        inv_notional = inv_new * mid_next
-        excess = max(0.0, abs(inv_notional) - self.inv_soft)
+        # Quadratic regularizer uses base-unit inventory with a dead-zone inv_soft.
+        inv_abs = abs(inv_new)
+        excess = max(0.0, inv_abs - self.inv_soft)
         inv_penalty = (
             self.lambda_inv * (excess / self.inv_soft) ** 2 if self.inv_soft > 0.0 else 0.0
         )
@@ -2627,9 +2630,10 @@ def run_pipeline(
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     # Inventory/turnover penalties applied inside MarketMakingEnv.step().
-    inv_soft = float(os.environ.get("BYBIT_MM_INV_SOFT", "1.0"))
+    inv_soft = float(os.environ.get("BYBIT_MM_INV_SOFT", str(DEFAULT_MM_INV_SOFT_UNITS)))
     lambda_inv = float(os.environ.get("BYBIT_MM_LAMBDA_INV", "0.0"))
     lambda_turn = float(os.environ.get("BYBIT_MM_LAMBDA_TURN", "0.0"))
+    # max_inventory is in base units (e.g., BTC), not notional quote currency.
     max_inventory_str = os.environ.get("BYBIT_MM_MAX_INVENTORY", "").strip()
     max_inventory = float(max_inventory_str) if max_inventory_str else None
     fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
