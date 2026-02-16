@@ -1083,6 +1083,8 @@ def align_snapshots_to_decisions(
     *,
     tolerance_ms: int = 50,
     allow_partial_match: bool = False,
+    expected_bounds: Optional[Tuple[int, int]] = None,
+    raw_snapshot_bounds: Optional[Tuple[Optional[int], Optional[int]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Nearest-neighbor snapshot alignment for decision timestamps.
 
@@ -1145,8 +1147,13 @@ def align_snapshots_to_decisions(
 
     decision_median_dt = _median_dt(matched_decision_ts)
     snapshot_median_dt = _median_dt(matched_snapshot_ts)
-    snapshot_bound_first = int(snapshot_ts[0]) if snapshot_ts.size else None
-    snapshot_bound_last = int(snapshot_ts[-1]) if snapshot_ts.size else None
+    effective_bound_first = int(snapshot_ts[0]) if snapshot_ts.size else None
+    effective_bound_last = int(snapshot_ts[-1]) if snapshot_ts.size else None
+    if raw_snapshot_bounds is None:
+        raw_bound_first = effective_bound_first
+        raw_bound_last = effective_bound_last
+    else:
+        raw_bound_first, raw_bound_last = raw_snapshot_bounds
     if matched_decision_ts.size and not allow_partial_match:
         decision_first = int(matched_decision_ts[0])
         decision_last = int(matched_decision_ts[-1])
@@ -1155,21 +1162,26 @@ def align_snapshots_to_decisions(
     else:
         decision_first = decision_last = snapshot_first = snapshot_last = None
     if matched_decision_ts.size and not allow_partial_match:
-        assert snapshot_bound_first is not None and snapshot_bound_last is not None
+        assert snapshot_first is not None and snapshot_last is not None
+        if expected_bounds is None:
+            expected_first = snapshot_first
+            expected_last = snapshot_last
+        else:
+            expected_first, expected_last = expected_bounds
         assert (
-            abs(decision_first - snapshot_bound_first) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
+            abs(decision_first - expected_first) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
         ), (
-            "First matched decision timestamp is too far from snapshot start; "
-            f"decision_first={decision_first} snapshot_bound_first={snapshot_bound_first} "
-            f"delta_ms={abs(decision_first - snapshot_bound_first)} "
+            "First matched decision timestamp is too far from alignment start bound; "
+            f"decision_first={decision_first} expected_bound_first={expected_first} "
+            f"delta_ms={abs(decision_first - expected_first)} "
             f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}"
         )
         assert (
-            abs(decision_last - snapshot_bound_last) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
+            abs(decision_last - expected_last) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS
         ), (
-            "Last matched decision timestamp is too far from snapshot end; "
-            f"decision_last={decision_last} snapshot_bound_last={snapshot_bound_last} "
-            f"delta_ms={abs(decision_last - snapshot_bound_last)} "
+            "Last matched decision timestamp is too far from alignment end bound; "
+            f"decision_last={decision_last} expected_bound_last={expected_last} "
+            f"delta_ms={abs(decision_last - expected_last)} "
             f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}"
         )
     if label:
@@ -1183,8 +1195,12 @@ def align_snapshots_to_decisions(
             f"decision_last={_format_ts(decision_last) if decision_last is not None else 'n/a'}",
             f"snapshot_first={_format_ts(snapshot_first) if snapshot_first is not None else 'n/a'}",
             f"snapshot_last={_format_ts(snapshot_last) if snapshot_last is not None else 'n/a'}",
-            f"snapshot_bound_first={_format_ts(snapshot_bound_first) if snapshot_bound_first is not None else 'n/a'}",
-            f"snapshot_bound_last={_format_ts(snapshot_bound_last) if snapshot_bound_last is not None else 'n/a'}",
+            f"raw_week_bounds_first={_format_ts(raw_bound_first) if raw_bound_first is not None else 'n/a'}",
+            f"raw_week_bounds_last={_format_ts(raw_bound_last) if raw_bound_last is not None else 'n/a'}",
+            f"effective_alignment_bounds_first={_format_ts(effective_bound_first) if effective_bound_first is not None else 'n/a'}",
+            f"effective_alignment_bounds_last={_format_ts(effective_bound_last) if effective_bound_last is not None else 'n/a'}",
+            f"expected_bounds_first={_format_ts(expected_bounds[0]) if expected_bounds is not None else 'n/a'}",
+            f"expected_bounds_last={_format_ts(expected_bounds[1]) if expected_bounds is not None else 'n/a'}",
             f"decision_median_dt_ms={decision_median_dt:.2f}",
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f}",
             f"allow_partial_match={allow_partial_match}",
@@ -1328,6 +1344,21 @@ def build_joined_split(
     else:
         snapshot_ts, raw_snapshots = load_raw_snapshots(out_root, split["week"])
         snapshot_ts, snapshots = _compute_snapshot_feature_matrix(snapshot_ts, raw_snapshots)
+
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshots = np.asarray(snapshots, dtype=np.float32)
+    raw_snapshot_bounds = (
+        int(snapshot_ts.min()) if snapshot_ts.size else None,
+        int(snapshot_ts.max()) if snapshot_ts.size else None,
+    )
+    align_window_margin_ms = max(SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS, 1000)
+    window_start = int(split["start"]) - align_window_margin_ms
+    window_end = int(split["end"]) + align_window_margin_ms
+    effective_mask = (snapshot_ts >= window_start) & (snapshot_ts <= window_end)
+    if np.any(effective_mask):
+        snapshot_ts = snapshot_ts[effective_mask]
+        snapshots = snapshots[effective_mask]
+
     allow_partial_match = _env_bool("BYBIT_MM_ALLOW_PARTIAL_SNAPSHOT_MATCH", False)
     aligned_snapshots, matched_mask = align_snapshots_to_decisions(
         ts,
@@ -1335,6 +1366,8 @@ def build_joined_split(
         snapshots,
         label=split_label,
         allow_partial_match=allow_partial_match,
+        expected_bounds=(int(split["start"]), int(split["end"])),
+        raw_snapshot_bounds=raw_snapshot_bounds,
     )
     cmssl_out["snapshot_mask"] = matched_mask
     return join_features(ts, y, cmssl_out, aligned_snapshots, meta)
