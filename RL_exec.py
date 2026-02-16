@@ -26,6 +26,9 @@ RAW_SNAPSHOT_MAX_IRREGULAR_FRAC = 0.05
 RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "best_bid",
     "best_ask",
+    "best_bid_size",
+    "best_ask_size",
+    "imbalance",
     "mid",
     "spread_bps",
     "mid_ret_1",
@@ -40,7 +43,7 @@ ALLOW_TS_RECONSTRUCT = os.environ.get("BYBIT_ALLOW_TS_RECONSTRUCT", "false").str
     "y",
 }
 FEATURE_EXTRA_DIM = 5
-ENV_OBS_EXTRA_STATE_DIM = 3
+ENV_OBS_EXTRA_STATE_DIM = 14
 SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
 DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
@@ -63,6 +66,10 @@ PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
 DEFAULT_MM_INVENTORY_NOTIONAL_SCALE = 1e4
 DEFAULT_MM_CASH_SCALE = 1e4
 DEFAULT_MM_TIME_SINCE_FILL_SCALE = 1000.0
+DEFAULT_MM_FILL_NOTIONAL_SCALE = 1e4
+DEFAULT_MM_PNL_NOTIONAL_SCALE = 1e4
+DEFAULT_MM_MARKOUT_NOTIONAL_SCALE = 1e4
+DEFAULT_MM_FILL_EMA_WINDOW_STEPS = 3
 DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
@@ -693,6 +700,8 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
                     "ts": data["ts"],
                     "best_bid": data["best_bid"],
                     "best_ask": data["best_ask"],
+                    "best_bid_size": data["best_bid_size"] if "best_bid_size" in data.files else 0.0,
+                    "best_ask_size": data["best_ask_size"] if "best_ask_size" in data.files else 0.0,
                 }
             )
         elif {"timestamps", "best_bid", "best_ask"}.issubset(data.files):
@@ -701,6 +710,8 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
                     "ts": data["timestamps"],
                     "best_bid": data["best_bid"],
                     "best_ask": data["best_ask"],
+                    "best_bid_size": data["best_bid_size"] if "best_bid_size" in data.files else 0.0,
+                    "best_ask_size": data["best_ask_size"] if "best_ask_size" in data.files else 0.0,
                 }
             )
         elif {"ts", "snapshots"}.issubset(data.files):
@@ -712,6 +723,8 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
                     "ts": data["ts"],
                     "best_bid": snaps[:, 0],
                     "best_ask": snaps[:, 1],
+                    "best_bid_size": snaps[:, 2] if snaps.shape[1] > 2 else 0.0,
+                    "best_ask_size": snaps[:, 3] if snaps.shape[1] > 3 else 0.0,
                 }
             )
         else:
@@ -725,6 +738,8 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
                         "ts": arr["ts"],
                         "best_bid": arr["best_bid"],
                         "best_ask": arr["best_ask"],
+                        "best_bid_size": arr["best_bid_size"] if "best_bid_size" in arr.dtype.names else 0.0,
+                        "best_ask_size": arr["best_ask_size"] if "best_ask_size" in arr.dtype.names else 0.0,
                     }
                 )
             elif {"ts", "snapshot"}.issubset(arr.dtype.names):
@@ -734,6 +749,8 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
                         "ts": arr["ts"],
                         "best_bid": snaps[:, 0],
                         "best_ask": snaps[:, 1],
+                        "best_bid_size": snaps[:, 2] if snaps.shape[1] > 2 else 0.0,
+                        "best_ask_size": snaps[:, 3] if snaps.shape[1] > 3 else 0.0,
                     }
                 )
             elif {"ts", "snapshots"}.issubset(arr.dtype.names):
@@ -743,6 +760,8 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
                         "ts": arr["ts"],
                         "best_bid": snaps[:, 0],
                         "best_ask": snaps[:, 1],
+                        "best_bid_size": snaps[:, 2] if snaps.shape[1] > 2 else 0.0,
+                        "best_ask_size": snaps[:, 3] if snaps.shape[1] > 3 else 0.0,
                     }
                 )
             else:
@@ -755,6 +774,8 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
                     "ts": arr[:, 0],
                     "best_bid": arr[:, 1],
                     "best_ask": arr[:, 2],
+                    "best_bid_size": arr[:, 3] if arr.shape[1] > 3 else 0.0,
+                    "best_ask_size": arr[:, 4] if arr.shape[1] > 4 else 0.0,
                 }
             )
     else:
@@ -762,7 +783,10 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
     missing = {"ts", "best_bid", "best_ask"} - set(df.columns)
     if missing:
         raise ValueError(f"Snapshot data missing columns {missing} in {path}")
-    return df[["ts", "best_bid", "best_ask"]]
+    for col in ("best_bid_size", "best_ask_size"):
+        if col not in df.columns:
+            df[col] = 0.0
+    return df[["ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"]]
 
 
 def _resolve_ob_path(week_key: str, ob_dir: str) -> Path:
@@ -797,25 +821,37 @@ def _reconstruct_snapshots_from_ob_stream(ob_path: Path) -> Tuple[np.ndarray, np
     ts_list: List[int] = []
     bids: List[float] = []
     asks: List[float] = []
+    bid_sizes: List[float] = []
+    ask_sizes: List[float] = []
 
     next_sample_ts: Optional[int] = None
     last_bid: Optional[float] = None
     last_ask: Optional[float] = None
+    last_bid_size: Optional[float] = None
+    last_ask_size: Optional[float] = None
 
     for raw in _iter_ob_events(ob_path):
         etype, ts_ms, payload = fe._parse_event(raw)
         if etype != "ob":
             continue
 
-        if last_bid is not None and last_ask is not None and next_sample_ts is not None:
+        if (
+            last_bid is not None
+            and last_ask is not None
+            and last_bid_size is not None
+            and last_ask_size is not None
+            and next_sample_ts is not None
+        ):
             while next_sample_ts < ts_ms:
                 ts_list.append(int(next_sample_ts))
                 bids.append(float(last_bid))
                 asks.append(float(last_ask))
+                bid_sizes.append(float(last_bid_size))
+                ask_sizes.append(float(last_ask_size))
                 next_sample_ts += RAW_SNAPSHOT_EXPECTED_STEP_MS
 
         fe._update_book_from_ob(payload)
-        bid, ask, _bsz, _asz = fe._book_best()
+        bid, ask, bsz, asz = fe._book_best()
         if bid <= 0.0 or ask <= 0.0:
             continue
 
@@ -826,13 +862,17 @@ def _reconstruct_snapshots_from_ob_stream(ob_path: Path) -> Tuple[np.ndarray, np
             ts_list.append(int(next_sample_ts))
             bids.append(float(bid))
             asks.append(float(ask))
+            bid_sizes.append(float(max(bsz, 0.0)))
+            ask_sizes.append(float(max(asz, 0.0)))
             next_sample_ts += RAW_SNAPSHOT_EXPECTED_STEP_MS
 
         last_bid = bid
         last_ask = ask
+        last_bid_size = float(max(bsz, 0.0))
+        last_ask_size = float(max(asz, 0.0))
 
     snapshot_ts = np.asarray(ts_list, dtype=np.int64)
-    snapshots = np.column_stack([bids, asks]).astype(np.float32)
+    snapshots = np.column_stack([bids, asks, bid_sizes, ask_sizes]).astype(np.float32)
     return snapshot_ts, snapshots
 
 
@@ -865,7 +905,7 @@ def _ensure_sorted_near_regular(ts: np.ndarray) -> None:
 
 
 def _sanitize_snapshot_features(df_or_array: Any) -> Any:
-    target_cols = ["mid_ret_1", "vol_short", "vol_long", "spread_bps"]
+    target_cols = ["best_bid_size", "best_ask_size", "imbalance", "mid_ret_1", "vol_short", "vol_long", "spread_bps"]
     if isinstance(df_or_array, pd.DataFrame):
         out = df_or_array.copy()
         present_cols = [col for col in target_cols if col in out.columns]
@@ -905,6 +945,10 @@ def load_raw_snapshot_features(
         split = resolve_test_split(out_root, meta)
     frames = [_load_snapshot_frame(path) for path in RAW_SNAPSHOT_PATHS]
     df = pd.concat(frames, ignore_index=True)
+    if "best_bid_size" not in df.columns:
+        df["best_bid_size"] = 0.0
+    if "best_ask_size" not in df.columns:
+        df["best_ask_size"] = 0.0
     df = df.dropna(subset=["ts", "best_bid", "best_ask"]).copy()
     df["ts"] = df["ts"].astype(np.int64)
     df = df.sort_values("ts").reset_index(drop=True)
@@ -912,6 +956,8 @@ def load_raw_snapshot_features(
     df = df[(df["ts"] >= split["start"]) & (df["ts"] < split["end"])].copy()
     _ensure_sorted_near_regular(df["ts"].to_numpy())
     df["mid"] = (df["best_bid"] + df["best_ask"]) / 2.0
+    denom = (df["best_bid_size"] + df["best_ask_size"]).replace(0.0, np.nan)
+    df["imbalance"] = ((df["best_bid_size"] - df["best_ask_size"]) / denom).fillna(0.0)
     df["spread_bps"] = (df["best_ask"] - df["best_bid"]) / df["mid"] * 1e4
     df["mid_ret_1"] = np.log(df["mid"]).diff()
     df["vol_short"] = df["mid_ret_1"].rolling(SHORT_VOL_WINDOW, min_periods=1).std()
@@ -934,7 +980,15 @@ def _compute_snapshot_feature_matrix(
     snapshots = snapshots[order]
     best_bid = snapshots[:, 0].astype(np.float64)
     best_ask = snapshots[:, 1].astype(np.float64)
+    if snapshots.shape[1] >= 4:
+        best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
+        best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
+    else:
+        best_bid_size = np.zeros_like(best_bid)
+        best_ask_size = np.zeros_like(best_ask)
     mid = (best_bid + best_ask) / 2.0
+    eps = 1e-9
+    imbalance = (best_bid_size - best_ask_size) / (best_bid_size + best_ask_size + eps)
     spread_bps = (best_ask - best_bid) / mid * 1e4
     mid_ret_1 = np.log(mid)
     mid_ret_1 = np.concatenate([[np.nan], np.diff(mid_ret_1)])
@@ -942,7 +996,7 @@ def _compute_snapshot_feature_matrix(
     vol_short = mid_ret_series.rolling(SHORT_VOL_WINDOW, min_periods=1).std().to_numpy()
     vol_long = mid_ret_series.rolling(LONG_VOL_WINDOW, min_periods=1).std().to_numpy()
     features = np.column_stack(
-        [best_bid, best_ask, mid, spread_bps, mid_ret_1, vol_short, vol_long]
+        [best_bid, best_ask, best_bid_size, best_ask_size, imbalance, mid, spread_bps, mid_ret_1, vol_short, vol_long]
     )
     return snapshot_ts, _sanitize_snapshot_features(features)
 
@@ -1490,6 +1544,23 @@ class MarketMakingEnv:
             "BYBIT_MM_TIME_SINCE_FILL_SCALE",
             DEFAULT_MM_TIME_SINCE_FILL_SCALE,
         )
+        self.fill_notional_scale = _env_float(
+            "BYBIT_MM_FILL_NOTIONAL_SCALE",
+            DEFAULT_MM_FILL_NOTIONAL_SCALE,
+        )
+        self.pnl_notional_scale = _env_float(
+            "BYBIT_MM_PNL_NOTIONAL_SCALE",
+            DEFAULT_MM_PNL_NOTIONAL_SCALE,
+        )
+        self.markout_notional_scale = _env_float(
+            "BYBIT_MM_MARKOUT_NOTIONAL_SCALE",
+            DEFAULT_MM_MARKOUT_NOTIONAL_SCALE,
+        )
+        self.fill_ema_window_steps = max(
+            1,
+            _env_int("BYBIT_MM_FILL_EMA_WINDOW_STEPS", DEFAULT_MM_FILL_EMA_WINDOW_STEPS),
+        )
+        self.fill_ema_alpha = 2.0 / (float(self.fill_ema_window_steps) + 1.0)
         self._allow_horizon_fallback = _env_bool("BYBIT_MM_ALLOW_HORIZON_FALLBACK", False)
         self._has_explicit_horizons_env = bool(os.environ.get("BYBIT_MM_HORIZONS_MS", "").strip())
         self._baseline_cfg = load_baseline_quote_config()
@@ -1544,6 +1615,17 @@ class MarketMakingEnv:
         self.total_reward = 0.0
         self.prev_equity = self.initial_cash
         self.time_since_last_fill = 0.0
+        self.avg_entry_price = 0.0
+        self.last_maker_buy_notional = 0.0
+        self.last_maker_sell_notional = 0.0
+        self.last_taker_buy_notional = 0.0
+        self.last_taker_sell_notional = 0.0
+        self.last_net_fill_notional = 0.0
+        self.last_gross_fill_notional = 0.0
+        self.ema_net_fill_notional = 0.0
+        self.ema_gross_fill_notional = 0.0
+        self.ema_maker_buy_markout = 0.0
+        self.ema_maker_sell_markout = 0.0
         self._obs_count = 0
         self._obs_mean: Optional[np.ndarray] = None
         self._obs_m2: Optional[np.ndarray] = None
@@ -1563,6 +1645,17 @@ class MarketMakingEnv:
         self.inventory = 0.0
         self.total_reward = 0.0
         self.time_since_last_fill = 0.0
+        self.avg_entry_price = 0.0
+        self.last_maker_buy_notional = 0.0
+        self.last_maker_sell_notional = 0.0
+        self.last_taker_buy_notional = 0.0
+        self.last_taker_sell_notional = 0.0
+        self.last_net_fill_notional = 0.0
+        self.last_gross_fill_notional = 0.0
+        self.ema_net_fill_notional = 0.0
+        self.ema_gross_fill_notional = 0.0
+        self.ema_maker_buy_markout = 0.0
+        self.ema_maker_sell_markout = 0.0
         mid = self._mid_price(self.idx)
         self.prev_equity = self.cash + self.inventory * mid
         return self._build_observation(self.idx)
@@ -1579,11 +1672,28 @@ class MarketMakingEnv:
         time_since_last_fill_scaled = (
             self.time_since_last_fill / self.time_since_fill_scale if self.time_since_fill_scale else 0.0
         )
+        unrealized_pnl_notional = (
+            self.inventory * (mid - self.avg_entry_price) if self.inventory != 0.0 else 0.0
+        )
+        unrealized_pnl_scaled = (
+            unrealized_pnl_notional / self.pnl_notional_scale if self.pnl_notional_scale else 0.0
+        )
         extra = np.array(
             [
                 inventory_notional_scaled,
                 cash_scaled,
                 time_since_last_fill_scaled,
+                self.last_maker_buy_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                self.last_maker_sell_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                self.last_taker_buy_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                self.last_taker_sell_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                self.last_net_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                self.last_gross_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                self.ema_net_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                self.ema_gross_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
+                unrealized_pnl_scaled,
+                self.ema_maker_buy_markout / self.markout_notional_scale if self.markout_notional_scale else 0.0,
+                self.ema_maker_sell_markout / self.markout_notional_scale if self.markout_notional_scale else 0.0,
             ],
             dtype=np.float32,
         )
@@ -1605,6 +1715,10 @@ class MarketMakingEnv:
             "inventory_notional_scale": float(self.inventory_notional_scale),
             "cash_scale": float(self.cash_scale),
             "time_since_fill_scale": float(self.time_since_fill_scale),
+            "fill_notional_scale": float(self.fill_notional_scale),
+            "pnl_notional_scale": float(self.pnl_notional_scale),
+            "markout_notional_scale": float(self.markout_notional_scale),
+            "fill_ema_window_steps": int(self.fill_ema_window_steps),
         }
 
     def _continuous_mask(self, obs_dim: int) -> np.ndarray:
@@ -1855,6 +1969,34 @@ class MarketMakingEnv:
             self.inventory -= sell_fill
         return buy_fill, sell_fill
 
+
+    def _next_avg_entry_price(
+        self,
+        prev_inv: float,
+        prev_avg: float,
+        side: int,
+        qty: float,
+        price: float,
+    ) -> Tuple[float, float]:
+        if qty <= 0.0:
+            return prev_avg, prev_inv
+        signed_qty = float(side) * qty
+        new_inv = prev_inv + signed_qty
+        if prev_inv == 0.0 or np.sign(prev_inv) == np.sign(signed_qty):
+            base_qty = abs(prev_inv)
+            total_qty = base_qty + qty
+            next_avg = (prev_avg * base_qty + price * qty) / total_qty if total_qty > 0.0 else 0.0
+            return float(next_avg), float(new_inv)
+        # Trade is against existing position.
+        if abs(signed_qty) < abs(prev_inv):
+            return float(prev_avg), float(new_inv)
+        if abs(signed_qty) == abs(prev_inv):
+            return 0.0, 0.0
+        return float(price), float(new_inv)
+
+    def _ema_update(self, prev: float, value: float) -> float:
+        return (1.0 - self.fill_ema_alpha) * prev + self.fill_ema_alpha * value
+
     def _compute_penalty(self, mid: float) -> float:
         # Industry convention: apply linear inventory penalty only for breaching
         # an explicit hard inventory cap, measured in base units.
@@ -1897,6 +2039,20 @@ class MarketMakingEnv:
                 "taker_buy": 0.0,
                 "taker_sell": 0.0,
                 "taker_fee": 0.0,
+                "maker_buy_notional": float(self.last_maker_buy_notional),
+                "maker_sell_notional": float(self.last_maker_sell_notional),
+                "taker_buy_notional": float(self.last_taker_buy_notional),
+                "taker_sell_notional": float(self.last_taker_sell_notional),
+                "net_fill_notional": float(self.last_net_fill_notional),
+                "gross_fill_notional": float(self.last_gross_fill_notional),
+                "ema_net_fill_notional": float(self.ema_net_fill_notional),
+                "ema_gross_fill_notional": float(self.ema_gross_fill_notional),
+                "avg_entry_price": float(self.avg_entry_price),
+                "unrealized_pnl_notional": float(self.inventory * (mid - self.avg_entry_price) if self.inventory != 0.0 else 0.0),
+                "maker_buy_markout": 0.0,
+                "maker_sell_markout": 0.0,
+                "ema_maker_buy_markout": float(self.ema_maker_buy_markout),
+                "ema_maker_sell_markout": float(self.ema_maker_sell_markout),
             }
             return self._build_observation(self.idx), 0.0, True, info
         bid_delta_bps, ask_delta_bps, taker_signal = self._parse_action(action)
@@ -1908,6 +2064,15 @@ class MarketMakingEnv:
         inv_prev = self.inventory
         maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
         taker_buy, taker_sell = self._apply_taker(next_idx, taker_signal)
+        best_ask_next = float(self.best_ask[next_idx])
+        best_bid_next = float(self.best_bid[next_idx])
+        avg_tracker = float(self.avg_entry_price)
+        inv_tracker = float(inv_prev)
+        avg_tracker, inv_tracker = self._next_avg_entry_price(inv_tracker, avg_tracker, 1, maker_buy, bid)
+        avg_tracker, inv_tracker = self._next_avg_entry_price(inv_tracker, avg_tracker, -1, maker_sell, ask)
+        avg_tracker, inv_tracker = self._next_avg_entry_price(inv_tracker, avg_tracker, 1, taker_buy, best_ask_next)
+        avg_tracker, inv_tracker = self._next_avg_entry_price(inv_tracker, avg_tracker, -1, taker_sell, best_bid_next)
+        self.avg_entry_price = avg_tracker if inv_tracker != 0.0 else 0.0
         inv_new = self.inventory
         inv_change = inv_new - inv_prev
         if maker_buy > 0.0 or maker_sell > 0.0 or taker_buy > 0.0 or taker_sell > 0.0:
@@ -1918,9 +2083,31 @@ class MarketMakingEnv:
         mid_next = self._mid_price(next_idx)
         maker_rebate_notional = maker_buy * bid + maker_sell * ask
         rebate = maker_rebate_notional * self.maker_rebate_bps * 1e-4
-        taker_notional = taker_buy * float(self.best_ask[next_idx]) + taker_sell * float(self.best_bid[next_idx])
+        taker_notional = taker_buy * best_ask_next + taker_sell * best_bid_next
         taker_fee = taker_notional * self.taker_fee_bps * 1e-4
         self.cash += rebate - taker_fee
+
+        maker_buy_notional = maker_buy * bid
+        maker_sell_notional = maker_sell * ask
+        taker_buy_notional = taker_buy * best_ask_next
+        taker_sell_notional = taker_sell * best_bid_next
+        buy_notional_total = maker_buy_notional + taker_buy_notional
+        sell_notional_total = maker_sell_notional + taker_sell_notional
+        net_fill_notional = buy_notional_total - sell_notional_total
+        gross_fill_notional = buy_notional_total + sell_notional_total
+        maker_buy_markout = (mid_next - bid) * maker_buy if maker_buy > 0.0 else 0.0
+        maker_sell_markout = (ask - mid_next) * maker_sell if maker_sell > 0.0 else 0.0
+
+        self.last_maker_buy_notional = maker_buy_notional
+        self.last_maker_sell_notional = maker_sell_notional
+        self.last_taker_buy_notional = taker_buy_notional
+        self.last_taker_sell_notional = taker_sell_notional
+        self.last_net_fill_notional = net_fill_notional
+        self.last_gross_fill_notional = gross_fill_notional
+        self.ema_net_fill_notional = self._ema_update(self.ema_net_fill_notional, net_fill_notional)
+        self.ema_gross_fill_notional = self._ema_update(self.ema_gross_fill_notional, gross_fill_notional)
+        self.ema_maker_buy_markout = self._ema_update(self.ema_maker_buy_markout, maker_buy_markout)
+        self.ema_maker_sell_markout = self._ema_update(self.ema_maker_sell_markout, maker_sell_markout)
         equity = self.cash + self.inventory * mid_next
         delta_equity = equity - self.prev_equity
         penalty = self._compute_penalty(mid_next)
@@ -1963,6 +2150,20 @@ class MarketMakingEnv:
             "maker_sell": float(maker_sell),
             "taker_buy": float(taker_buy),
             "taker_sell": float(taker_sell),
+            "maker_buy_notional": float(maker_buy_notional),
+            "maker_sell_notional": float(maker_sell_notional),
+            "taker_buy_notional": float(taker_buy_notional),
+            "taker_sell_notional": float(taker_sell_notional),
+            "net_fill_notional": float(net_fill_notional),
+            "gross_fill_notional": float(gross_fill_notional),
+            "ema_net_fill_notional": float(self.ema_net_fill_notional),
+            "ema_gross_fill_notional": float(self.ema_gross_fill_notional),
+            "avg_entry_price": float(self.avg_entry_price),
+            "unrealized_pnl_notional": float(self.inventory * (mid_next - self.avg_entry_price) if self.inventory != 0.0 else 0.0),
+            "maker_buy_markout": float(maker_buy_markout),
+            "maker_sell_markout": float(maker_sell_markout),
+            "ema_maker_buy_markout": float(self.ema_maker_buy_markout),
+            "ema_maker_sell_markout": float(self.ema_maker_sell_markout),
         }
         return next_obs, float(reward), done, info
 
