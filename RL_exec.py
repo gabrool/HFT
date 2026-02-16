@@ -2030,16 +2030,23 @@ class PPOConfig:
     randomize_rollout_start: bool = True
 
 
-def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, gamma: float, lam: float):
+def compute_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    next_values: torch.Tensor,
+    terminals: torch.Tensor,
+    gamma: float,
+    lam: float,
+):
+    # `terminals` only marks true environment terminations. Rollout truncation
+    # (e.g., horizon cutoff) still bootstraps from `next_values`.
     advantages = torch.zeros_like(rewards)
     last_gae = 0.0
-    next_value = 0.0
     for t in reversed(range(len(rewards))):
-        mask = 1.0 - dones[t]
-        delta = rewards[t] + gamma * next_value * mask - values[t]
+        mask = 1.0 - terminals[t]
+        delta = rewards[t] + gamma * next_values[t] * mask - values[t]
         last_gae = delta + gamma * lam * mask * last_gae
         advantages[t] = last_gae
-        next_value = values[t]
     returns = advantages + values
     return advantages, returns
 
@@ -2062,7 +2069,10 @@ def collect_market_rollout(
     action_list = []
     logp_list = []
     value_list = []
+    next_value_list = []
     reward_list = []
+    terminated_list = []
+    truncated_list = []
     done_list = []
 
     if horizon <= 0:
@@ -2095,13 +2105,28 @@ def collect_market_rollout(
 
             next_obs, reward, env_done, _info = env.step(action_env.squeeze(0).cpu().numpy())
             steps += 1
-            done = bool(env_done) or steps >= horizon
+            terminated = bool(env_done)
+            # Truncation means the rollout horizon ended; it is not a true
+            # environment terminal state and should continue to bootstrap.
+            truncated = (not terminated) and (steps >= horizon)
+            done = terminated or truncated
+
+            if terminated:
+                next_value = torch.tensor(0.0, dtype=torch.float32)
+            else:
+                with torch.no_grad():
+                    next_obs_t = torch.from_numpy(next_obs).float().to(device)
+                    _next_mean, _next_log_std, next_value_t = model(next_obs_t.unsqueeze(0))
+                    next_value = next_value_t.squeeze(0).detach().cpu()
 
             obs_list.append(obs_cpu)
             action_list.append(action_env.squeeze(0).detach().cpu())
             logp_list.append(logp_env.squeeze(0).detach().cpu())
             value_list.append(value.squeeze(0).detach().cpu())
+            next_value_list.append(next_value)
             reward_list.append(torch.tensor(reward, dtype=torch.float32))
+            terminated_list.append(torch.tensor(float(terminated), dtype=torch.float32))
+            truncated_list.append(torch.tensor(float(truncated), dtype=torch.float32))
             done_list.append(torch.tensor(float(done), dtype=torch.float32))
             obs = next_obs
 
@@ -2110,7 +2135,10 @@ def collect_market_rollout(
         "actions": torch.stack(action_list),
         "logp": torch.stack(logp_list),
         "values": torch.stack(value_list),
+        "next_values": torch.stack(next_value_list),
         "rewards": torch.stack(reward_list),
+        "terminated": torch.stack(terminated_list),
+        "truncated": torch.stack(truncated_list),
         "dones": torch.stack(done_list),
     }
 
@@ -2131,10 +2159,11 @@ def ppo_update_market(
     actions = rollout["actions"]
     old_logp = rollout["logp"].detach()
     values = rollout["values"].detach()
+    next_values = rollout["next_values"].detach()
     rewards = rollout["rewards"]
-    dones = rollout["dones"]
+    terminals = rollout["terminated"]
 
-    advantages, returns = compute_gae(rewards, values, dones, config.gamma, config.gae_lambda)
+    advantages, returns = compute_gae(rewards, values, next_values, terminals, config.gamma, config.gae_lambda)
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     n = obs.shape[0]
