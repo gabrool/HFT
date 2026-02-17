@@ -1614,7 +1614,7 @@ class MarketMakingEnv:
         self.inventory = 0.0
         self.total_reward = 0.0
         self.prev_equity = self.initial_cash
-        self.time_since_last_fill = 0.0
+        self.time_since_last_fill = self._initial_time_since_last_fill()
         self.avg_entry_price = 0.0
         self.last_maker_buy_notional = 0.0
         self.last_maker_sell_notional = 0.0
@@ -1644,7 +1644,9 @@ class MarketMakingEnv:
         self.cash = self.initial_cash
         self.inventory = 0.0
         self.total_reward = 0.0
-        self.time_since_last_fill = 0.0
+        # Episode startup semantics: no prior fill is represented by a large sentinel
+        # so the feature is distinct from "just filled" (0.0).
+        self.time_since_last_fill = self._initial_time_since_last_fill()
         self.avg_entry_price = 0.0
         self.last_maker_buy_notional = 0.0
         self.last_maker_sell_notional = 0.0
@@ -1663,6 +1665,13 @@ class MarketMakingEnv:
     def _mid_price(self, idx: int) -> float:
         return float((self.best_bid[idx] + self.best_ask[idx]) / 2.0)
 
+    def _initial_time_since_last_fill(self) -> float:
+        # Prefer a startup value near 1.0 after scaling. This signals "no fill yet"
+        # at episode start while keeping 0.0 reserved for a fresh fill event.
+        if self.time_since_fill_scale > 0.0:
+            return float(self.time_since_fill_scale)
+        return 1.0
+
     def _build_observation(self, idx: int) -> np.ndarray:
         mid = self._mid_price(idx)
         inventory_notional_scaled = (
@@ -1679,7 +1688,9 @@ class MarketMakingEnv:
             unrealized_pnl_notional / self.pnl_notional_scale if self.pnl_notional_scale else 0.0
         )
         # Fill-notional `last_*` fields capture the last non-zero fill aggregates.
-        # On no-fill steps they persist while `time_since_last_fill` continues to increase.
+        # At reset, `time_since_last_fill` starts at a sentinel for "no prior fill"
+        # (scaled value ~1.0); a real fill sets it to 0.0 and no-fill steps increment it.
+        # `last_*` values persist on no-fill steps.
         extra = np.array(
             [
                 inventory_notional_scaled,
