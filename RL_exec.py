@@ -2101,11 +2101,17 @@ class MarketMakingEnv:
         maker_buy_markout = (mid_next - bid) * maker_buy if maker_buy > 0.0 else 0.0
         maker_sell_markout = (ask - mid_next) * maker_sell if maker_sell > 0.0 else 0.0
 
-        if had_fill:
+        if maker_buy > 0.0:
             self.last_maker_buy_notional = maker_buy_notional
+        if maker_sell > 0.0:
             self.last_maker_sell_notional = maker_sell_notional
+        if taker_buy > 0.0:
             self.last_taker_buy_notional = taker_buy_notional
+        if taker_sell > 0.0:
             self.last_taker_sell_notional = taker_sell_notional
+        # Channel-specific last_* tracks the last non-zero event for that channel,
+        # while net/gross track the last step with any fill.
+        if had_fill:
             self.last_net_fill_notional = net_fill_notional
             self.last_gross_fill_notional = gross_fill_notional
         self.ema_net_fill_notional = self._ema_update(self.ema_net_fill_notional, net_fill_notional)
