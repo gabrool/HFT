@@ -1541,10 +1541,27 @@ class MarketMakingEnv:
             if initial_cash is not None
             else _env_float("BYBIT_MM_INITIAL_CASH", DEFAULT_MM_INITIAL_CASH)
         )
-        self.inventory_notional_scale = _env_float(
+        inventory_notional_scale_raw = os.environ.get(
             "BYBIT_MM_INVENTORY_NOTIONAL_SCALE",
-            _env_float("BYBIT_MM_NOTIONAL_SCALE", DEFAULT_MM_INVENTORY_NOTIONAL_SCALE),
-        )
+            "",
+        ).strip()
+        if not inventory_notional_scale_raw:
+            raise ValueError(
+                "Missing required env var BYBIT_MM_INVENTORY_NOTIONAL_SCALE "
+                "(quote notional, USD)."
+            )
+        try:
+            self.inventory_notional_scale = float(inventory_notional_scale_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "BYBIT_MM_INVENTORY_NOTIONAL_SCALE must be a finite float "
+                "in quote notional (USD)."
+            ) from exc
+        if not np.isfinite(self.inventory_notional_scale) or self.inventory_notional_scale <= 0.0:
+            raise ValueError(
+                "BYBIT_MM_INVENTORY_NOTIONAL_SCALE must be finite and > 0 "
+                "in quote notional (USD)."
+            )
         self.cash_scale = _env_float("BYBIT_MM_CASH_SCALE", DEFAULT_MM_CASH_SCALE)
         self.time_since_fill_scale = _env_float(
             "BYBIT_MM_TIME_SINCE_FILL_SCALE",
@@ -2871,6 +2888,8 @@ def run_pipeline(
     # Required inventory risk knobs (quote notional, USD):
     #   BYBIT_MM_INV_SOFT_NOTIONAL
     #   BYBIT_MM_MAX_INV_NOTIONAL
+    #   BYBIT_MM_INVENTORY_NOTIONAL_SCALE
+    # Migration: BYBIT_MM_NOTIONAL_SCALE removed; set BYBIT_MM_INVENTORY_NOTIONAL_SCALE explicitly.
     # Units are quote notional (USD), not base units.
     inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
     if not inv_soft_notional_str:
