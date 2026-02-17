@@ -74,9 +74,7 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 DEFAULT_MM_DELTA_BPS_FALLBACK_LIMIT = 250.0
-# Inventory regularization thresholds are denominated in quote notional (USD).
-DEFAULT_MM_INV_SOFT_NOTIONAL = 50_000.0
-DEFAULT_MM_MAX_INV_NOTIONAL: Optional[float] = None
+# Inventory risk thresholds are denominated in quote notional (USD).
 SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
     os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
 )
@@ -1495,10 +1493,10 @@ class MarketMakingEnv:
         allow_taker: bool = True,
         taker_threshold: float = DEFAULT_MM_TAKER_THRESHOLD,
         inventory_penalty: float = 0.0,
-        inv_soft_notional: float = DEFAULT_MM_INV_SOFT_NOTIONAL,
+        inv_soft_notional: float,
         lambda_inv: float = 0.0,
         lambda_turn: float = 0.0,
-        max_inventory_notional: Optional[float] = None,
+        max_inventory_notional: float,
         fill_size: float = 1.0,
         fill_tolerance: float = 1e-6,
         delta_bps_limit: Optional[float] = None,
@@ -1516,15 +1514,17 @@ class MarketMakingEnv:
         self.allow_taker = allow_taker
         self.taker_threshold = taker_threshold
         self.inventory_penalty = inventory_penalty
+        if inv_soft_notional <= 0.0:
+            raise ValueError("inv_soft_notional must be > 0 in quote notional (USD).")
+        if max_inventory_notional <= 0.0:
+            raise ValueError("max_inventory_notional must be > 0 in quote notional (USD).")
+        if max_inventory_notional < inv_soft_notional:
+            raise ValueError("max_inventory_notional must be >= inv_soft_notional.")
         self.inv_soft_notional = inv_soft_notional
-        # Backward-compatible alias for legacy references.
-        self.inv_soft = self.inv_soft_notional
         self.lambda_inv = lambda_inv
         self.lambda_turn = lambda_turn
         self.stack_inventory_penalties = _env_bool("BYBIT_MM_STACK_INVENTORY_PENALTIES", False)
         self.max_inventory_notional = max_inventory_notional
-        # Backward-compatible alias for legacy references.
-        self.max_inventory = self.max_inventory_notional
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
         self.delta_bps_limit = delta_bps_limit
@@ -2021,7 +2021,7 @@ class MarketMakingEnv:
         # an explicit hard inventory cap, measured in quote notional (USD).
         inv_notional = abs(self.inventory * mid)
         penalty = 0.0
-        if self.max_inventory_notional is not None and inv_notional > self.max_inventory_notional:
+        if inv_notional > self.max_inventory_notional:
             penalty += self.inventory_penalty * (inv_notional - self.max_inventory_notional)
         return penalty
 
@@ -2868,35 +2868,25 @@ def run_pipeline(
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     # Inventory/turnover penalties applied inside MarketMakingEnv.step().
+    # Required inventory risk knobs (quote notional, USD):
+    #   BYBIT_MM_INV_SOFT_NOTIONAL
+    #   BYBIT_MM_MAX_INV_NOTIONAL
+    # Units are quote notional (USD), not base units.
     inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
-    if inv_soft_notional_str:
-        inv_soft_notional = float(inv_soft_notional_str)
-    else:
-        legacy_inv_soft_str = os.environ.get("BYBIT_MM_INV_SOFT", "").strip()
-        if legacy_inv_soft_str:
-            warnings.warn(
-                "BYBIT_MM_INV_SOFT is deprecated; use BYBIT_MM_INV_SOFT_NOTIONAL (USD quote notional).",
-                DeprecationWarning,
-            )
-            inv_soft_notional = float(legacy_inv_soft_str)
-        else:
-            inv_soft_notional = DEFAULT_MM_INV_SOFT_NOTIONAL
+    if not inv_soft_notional_str:
+        raise ValueError(
+            "Missing required env var BYBIT_MM_INV_SOFT_NOTIONAL (quote notional, USD)."
+        )
+    inv_soft_notional = float(inv_soft_notional_str)
     lambda_inv = float(os.environ.get("BYBIT_MM_LAMBDA_INV", "0.0"))
     lambda_turn = float(os.environ.get("BYBIT_MM_LAMBDA_TURN", "0.0"))
     # Hard inventory cap in quote notional (USD).
     max_inventory_notional_str = os.environ.get("BYBIT_MM_MAX_INV_NOTIONAL", "").strip()
-    if max_inventory_notional_str:
-        max_inventory_notional = float(max_inventory_notional_str)
-    else:
-        legacy_max_inventory_str = os.environ.get("BYBIT_MM_MAX_INVENTORY", "").strip()
-        if legacy_max_inventory_str:
-            warnings.warn(
-                "BYBIT_MM_MAX_INVENTORY is deprecated; use BYBIT_MM_MAX_INV_NOTIONAL (USD quote notional).",
-                DeprecationWarning,
-            )
-            max_inventory_notional = float(legacy_max_inventory_str)
-        else:
-            max_inventory_notional = DEFAULT_MM_MAX_INV_NOTIONAL
+    if not max_inventory_notional_str:
+        raise ValueError(
+            "Missing required env var BYBIT_MM_MAX_INV_NOTIONAL (quote notional, USD)."
+        )
+    max_inventory_notional = float(max_inventory_notional_str)
     fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "1.0"))
@@ -2906,11 +2896,12 @@ def run_pipeline(
     taker_threshold = float(os.environ.get("BYBIT_MM_TAKER_THRESHOLD", str(DEFAULT_MM_TAKER_THRESHOLD)))
     delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
     delta_bps_limit = float(delta_bps_limit_str) if delta_bps_limit_str else None
-    if inv_soft_notional <= 0.0 and lambda_inv != 0.0:
-        warnings.warn(
-            "BYBIT_MM_INV_SOFT_NOTIONAL <= 0 disables quadratic inventory regularization.",
-            RuntimeWarning,
-        )
+    if inv_soft_notional <= 0.0:
+        raise ValueError("BYBIT_MM_INV_SOFT_NOTIONAL must be > 0 (quote notional, USD).")
+    if max_inventory_notional <= 0.0:
+        raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be > 0 (quote notional, USD).")
+    if max_inventory_notional < inv_soft_notional:
+        raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be >= BYBIT_MM_INV_SOFT_NOTIONAL.")
     if lambda_inv > 0.0 and inv_soft_notional > 0.0:
         print(
             "[mm config warning]",
