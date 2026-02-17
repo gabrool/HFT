@@ -2110,8 +2110,12 @@ class MarketMakingEnv:
             self.last_gross_fill_notional = gross_fill_notional
         self.ema_net_fill_notional = self._ema_update(self.ema_net_fill_notional, net_fill_notional)
         self.ema_gross_fill_notional = self._ema_update(self.ema_gross_fill_notional, gross_fill_notional)
-        self.ema_maker_buy_markout = self._ema_update(self.ema_maker_buy_markout, maker_buy_markout)
-        self.ema_maker_sell_markout = self._ema_update(self.ema_maker_sell_markout, maker_sell_markout)
+        # EMA of conditional markout given maker fill.
+        # Interpretable as adverse-selection quality (not maker-fill activity intensity).
+        if maker_buy > 0.0:
+            self.ema_maker_buy_markout = self._ema_update(self.ema_maker_buy_markout, maker_buy_markout)
+        if maker_sell > 0.0:
+            self.ema_maker_sell_markout = self._ema_update(self.ema_maker_sell_markout, maker_sell_markout)
         equity = self.cash + self.inventory * mid_next
         delta_equity = equity - self.prev_equity
         penalty = self._compute_penalty(mid_next)
