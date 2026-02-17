@@ -1678,6 +1678,8 @@ class MarketMakingEnv:
         unrealized_pnl_scaled = (
             unrealized_pnl_notional / self.pnl_notional_scale if self.pnl_notional_scale else 0.0
         )
+        # Fill-notional `last_*` fields capture the last non-zero fill aggregates.
+        # On no-fill steps they persist while `time_since_last_fill` continues to increase.
         extra = np.array(
             [
                 inventory_notional_scaled,
@@ -2075,7 +2077,8 @@ class MarketMakingEnv:
         self.avg_entry_price = avg_tracker if inv_tracker != 0.0 else 0.0
         inv_new = self.inventory
         inv_change = inv_new - inv_prev
-        if maker_buy > 0.0 or maker_sell > 0.0 or taker_buy > 0.0 or taker_sell > 0.0:
+        had_fill = maker_buy > 0.0 or maker_sell > 0.0 or taker_buy > 0.0 or taker_sell > 0.0
+        if had_fill:
             self.time_since_last_fill = 0.0
         else:
             self.time_since_last_fill += 1.0
@@ -2098,12 +2101,13 @@ class MarketMakingEnv:
         maker_buy_markout = (mid_next - bid) * maker_buy if maker_buy > 0.0 else 0.0
         maker_sell_markout = (ask - mid_next) * maker_sell if maker_sell > 0.0 else 0.0
 
-        self.last_maker_buy_notional = maker_buy_notional
-        self.last_maker_sell_notional = maker_sell_notional
-        self.last_taker_buy_notional = taker_buy_notional
-        self.last_taker_sell_notional = taker_sell_notional
-        self.last_net_fill_notional = net_fill_notional
-        self.last_gross_fill_notional = gross_fill_notional
+        if had_fill:
+            self.last_maker_buy_notional = maker_buy_notional
+            self.last_maker_sell_notional = maker_sell_notional
+            self.last_taker_buy_notional = taker_buy_notional
+            self.last_taker_sell_notional = taker_sell_notional
+            self.last_net_fill_notional = net_fill_notional
+            self.last_gross_fill_notional = gross_fill_notional
         self.ema_net_fill_notional = self._ema_update(self.ema_net_fill_notional, net_fill_notional)
         self.ema_gross_fill_notional = self._ema_update(self.ema_gross_fill_notional, gross_fill_notional)
         self.ema_maker_buy_markout = self._ema_update(self.ema_maker_buy_markout, maker_buy_markout)
