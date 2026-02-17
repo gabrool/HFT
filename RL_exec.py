@@ -74,7 +74,6 @@ DEFAULT_MM_FILL_EMA_WINDOW_STEPS = 3
 DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
-DEFAULT_MM_DELTA_BPS_FALLBACK_LIMIT = 250.0
 # Inventory risk thresholds are denominated in quote notional (USD).
 SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
     os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
@@ -1493,7 +1492,7 @@ class MarketMakingEnv:
         max_inventory_notional: float,
         fill_size: float = 1.0,
         fill_tolerance: float = 1e-6,
-        delta_bps_limit: Optional[float] = None,
+        delta_bps_limit: float = 0.0,
         initial_cash: Optional[float] = None,
         obs_norm_state: Optional[dict] = None,
         freeze_obs_norm: bool = False,
@@ -1521,14 +1520,10 @@ class MarketMakingEnv:
         self.max_inventory_notional = max_inventory_notional
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
-        self.delta_bps_limit = delta_bps_limit
-        self.delta_bps_fallback_limit = _env_float(
-            "BYBIT_MM_DELTA_BPS_FALLBACK_LIMIT",
-            DEFAULT_MM_DELTA_BPS_FALLBACK_LIMIT,
-        )
-        if self.delta_bps_limit is None and self.delta_bps_fallback_limit <= 0.0:
+        self.delta_bps_limit = float(delta_bps_limit)
+        if not np.isfinite(self.delta_bps_limit) or self.delta_bps_limit <= 0.0:
             raise ValueError(
-                "BYBIT_MM_DELTA_BPS_FALLBACK_LIMIT must be positive when delta_bps_limit is unset."
+                "delta_bps_limit must be finite and > 0 in basis points (bps)."
             )
         self.initial_cash = (
             float(initial_cash)
@@ -1918,13 +1913,8 @@ class MarketMakingEnv:
     def _apply_deltas(
         self, bid: float, ask: float, mid: float, bid_delta_bps: float, ask_delta_bps: float
     ) -> Tuple[float, float, float, float]:
-        effective_limit = (
-            self.delta_bps_limit
-            if self.delta_bps_limit is not None
-            else self.delta_bps_fallback_limit
-        )
-        bid_delta_bps = float(np.clip(bid_delta_bps, -effective_limit, effective_limit))
-        ask_delta_bps = float(np.clip(ask_delta_bps, -effective_limit, effective_limit))
+        bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
+        ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
         bid += mid * bid_delta_bps * 1e-4
         ask += mid * ask_delta_bps * 1e-4
         return bid, ask, bid_delta_bps, ask_delta_bps
@@ -2875,6 +2865,8 @@ def run_pipeline(
     #   BYBIT_MM_INV_SOFT_NOTIONAL
     #   BYBIT_MM_MAX_INV_NOTIONAL
     #   BYBIT_MM_INVENTORY_NOTIONAL_SCALE
+    # Required delta control knob (basis points, bps):
+    #   BYBIT_MM_DELTA_BPS_LIMIT
     # Migration: BYBIT_MM_NOTIONAL_SCALE removed; set BYBIT_MM_INVENTORY_NOTIONAL_SCALE explicitly.
     # Units are quote notional (USD), not base units.
     inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
@@ -2900,7 +2892,20 @@ def run_pipeline(
     taker_fee_bps = float(os.environ.get("BYBIT_MM_TAKER_FEE_BPS", str(DEFAULT_MM_TAKER_FEE_BPS)))
     taker_threshold = float(os.environ.get("BYBIT_MM_TAKER_THRESHOLD", str(DEFAULT_MM_TAKER_THRESHOLD)))
     delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
-    delta_bps_limit = float(delta_bps_limit_str) if delta_bps_limit_str else None
+    if not delta_bps_limit_str:
+        raise ValueError(
+            "Missing required env var BYBIT_MM_DELTA_BPS_LIMIT (basis points, bps)."
+        )
+    try:
+        delta_bps_limit = float(delta_bps_limit_str)
+    except ValueError as exc:
+        raise ValueError(
+            "BYBIT_MM_DELTA_BPS_LIMIT must be a finite float in basis points (bps)."
+        ) from exc
+    if not np.isfinite(delta_bps_limit) or delta_bps_limit <= 0.0:
+        raise ValueError(
+            "BYBIT_MM_DELTA_BPS_LIMIT must be finite and > 0 in basis points (bps)."
+        )
     if inv_soft_notional <= 0.0:
         raise ValueError("BYBIT_MM_INV_SOFT_NOTIONAL must be > 0 (quote notional, USD).")
     if max_inventory_notional <= 0.0:
