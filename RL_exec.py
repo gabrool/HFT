@@ -46,6 +46,7 @@ FEATURE_EXTRA_DIM = 5
 ENV_OBS_EXTRA_STATE_DIM = 14
 SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
+# CMSSL market-making horizon contract is fixed: exactly [250, 500, 1000] ms.
 DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
 DEFAULT_MM_VOL_HORIZON_MS = 1000
 DEFAULT_MM_S_MIN_BPS = 0.0
@@ -260,6 +261,7 @@ def load_baseline_quote_config() -> BaselineQuoteConfig:
         spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
         inv_ref_notional=_env_float("BYBIT_MM_INV_REF_NOTIONAL", DEFAULT_MM_INV_REF_NOTIONAL),
         vol_horizon_ms=_env_int("BYBIT_MM_VOL_HORIZON_MS", DEFAULT_MM_VOL_HORIZON_MS),
+        # CMSSL MM contract is fixed to [250, 500, 1000]; any deviation is a hard error.
         horizons_ms=_env_int_list("BYBIT_MM_HORIZONS_MS", DEFAULT_MM_HORIZONS_MS),
         p250_weight=_env_float("BYBIT_MM_P250_WEIGHT", DEFAULT_MM_P250_WEIGHT),
         p500_weight=_env_float("BYBIT_MM_P500_WEIGHT", DEFAULT_MM_P500_WEIGHT),
@@ -311,23 +313,26 @@ def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, sl
 def _normalize_horizons(
     num_h: int,
     horizons: List[int],
-    *,
-    allow_fallback: bool,
-    has_explicit_env_mapping: bool,
 ) -> List[int]:
     if len(horizons) == num_h:
         return list(horizons)
-    if allow_fallback and not has_explicit_env_mapping:
-        raise ValueError(
-            "Horizon fallback is enabled, but BYBIT_MM_HORIZONS_MS is not explicitly set. "
-            "Provide BYBIT_MM_HORIZONS_MS with exactly one horizon per model output "
-            f"(expected={num_h})."
-        )
     raise ValueError(
         "Horizon count mismatch between model outputs and configured horizons: "
         f"num_model_horizons={num_h} configured_horizons={horizons} configured_count={len(horizons)}. "
-        "Set BYBIT_MM_HORIZONS_MS to exactly match model horizons."
+        "Set BYBIT_MM_HORIZONS_MS to exactly match model horizons; mismatches are hard errors."
     )
+
+
+def _validate_fixed_cmssl_horizons(horizons: List[int]) -> List[int]:
+    expected_horizons = [250, 500, 1000]
+    unique_sorted = sorted(set(horizons))
+    if unique_sorted != expected_horizons:
+        raise ValueError(
+            "CMSSL horizon contract violation: configured horizons must be exactly "
+            f"{expected_horizons}, got configured_horizons={horizons} "
+            f"(unique_sorted={unique_sorted})."
+        )
+    return expected_horizons
 
 
 def _resolve_horizon_index(
@@ -335,20 +340,9 @@ def _resolve_horizon_index(
     horizons: List[int],
     *,
     label: str,
-    allow_fallback: bool,
 ) -> int:
     if target_ms in horizons:
         return horizons.index(target_ms)
-    if allow_fallback and horizons:
-        nearest_idx = min(range(len(horizons)), key=lambda i: abs(horizons[i] - target_ms))
-        print(
-            "[mm horizons]",
-            f"fallback_resolve label={label}",
-            f"target_ms={target_ms}",
-            f"resolved_ms={horizons[nearest_idx]}",
-            f"resolved_idx={nearest_idx}",
-        )
-        return nearest_idx
     raise ValueError(
         "Required horizon is not available in configured horizon mapping: "
         f"label={label} target_ms={target_ms} configured_horizons={horizons}."
@@ -1584,39 +1578,32 @@ class MarketMakingEnv:
             _env_int("BYBIT_MM_FILL_EMA_WINDOW_STEPS", DEFAULT_MM_FILL_EMA_WINDOW_STEPS),
         )
         self.fill_ema_alpha = 2.0 / (float(self.fill_ema_window_steps) + 1.0)
-        self._allow_horizon_fallback = _env_bool("BYBIT_MM_ALLOW_HORIZON_FALLBACK", False)
-        self._has_explicit_horizons_env = bool(os.environ.get("BYBIT_MM_HORIZONS_MS", "").strip())
         self._baseline_cfg = load_baseline_quote_config()
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._horizons_ms = _normalize_horizons(
             self._num_h,
             self._baseline_cfg.horizons_ms,
-            allow_fallback=self._allow_horizon_fallback,
-            has_explicit_env_mapping=self._has_explicit_horizons_env,
         )
+        self._horizons_ms = _validate_fixed_cmssl_horizons(self._horizons_ms)
         self._vol_horizon_idx = _resolve_horizon_index(
             self._baseline_cfg.vol_horizon_ms,
             self._horizons_ms,
             label="vol",
-            allow_fallback=self._allow_horizon_fallback,
         )
         self._p250_idx = _resolve_horizon_index(
             250,
             self._horizons_ms,
             label="p250",
-            allow_fallback=self._allow_horizon_fallback,
         )
         self._p500_idx = _resolve_horizon_index(
             500,
             self._horizons_ms,
             label="p500",
-            allow_fallback=self._allow_horizon_fallback,
         )
         self._p1000_idx = _resolve_horizon_index(
             1000,
             self._horizons_ms,
             label="p1000",
-            allow_fallback=self._allow_horizon_fallback,
         )
         print(
             "[mm horizons]",
@@ -1626,7 +1613,6 @@ class MarketMakingEnv:
             f"p250_idx={self._p250_idx}",
             f"p500_idx={self._p500_idx}",
             f"p1000_idx={self._p1000_idx}",
-            f"allow_fallback={self._allow_horizon_fallback}",
         )
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
