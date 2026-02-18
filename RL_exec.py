@@ -1136,15 +1136,13 @@ def align_snapshots_to_decisions(
     label: Optional[str] = None,
     *,
     tolerance_ms: int = 50,
-    allow_partial_match: bool = False,
     expected_bounds: Optional[Tuple[int, int]] = None,
     raw_snapshot_bounds: Optional[Tuple[Optional[int], Optional[int]]] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Nearest-neighbor snapshot alignment for decision timestamps.
+) -> np.ndarray:
+    """Strict nearest-neighbor snapshot alignment for decision timestamps.
 
-    Returns aligned snapshots for every decision row and a bool mask indicating
-    which rows were within `tolerance_ms`. If `allow_partial_match` is False,
-    unmatched rows raise immediately.
+    Returns aligned snapshots for every decision row. Any unmatched decision
+    timestamp (outside `tolerance_ms`) raises immediately.
     """
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
@@ -1182,7 +1180,7 @@ def align_snapshots_to_decisions(
     exact_rate = float(np.mean(exact)) if exact.size else 0.0
     matched_decision_ts = decision_ts[matched]
     matched_snapshot_ts = snapshot_ts[nearest_idx[matched]] if np.any(matched) else np.array([], dtype=np.int64)
-    if matched.size and not np.all(matched) and not allow_partial_match:
+    if matched.size and not np.all(matched):
         mismatch_idx = np.flatnonzero(~matched)
         sample_count = min(5, mismatch_idx.size)
         samples = [int(decision_ts[i]) for i in mismatch_idx[:sample_count]]
@@ -1208,14 +1206,14 @@ def align_snapshots_to_decisions(
         raw_bound_last = effective_bound_last
     else:
         raw_bound_first, raw_bound_last = raw_snapshot_bounds
-    if matched_decision_ts.size and not allow_partial_match:
+    if matched_decision_ts.size:
         decision_first = int(matched_decision_ts[0])
         decision_last = int(matched_decision_ts[-1])
         snapshot_first = int(matched_snapshot_ts[0])
         snapshot_last = int(matched_snapshot_ts[-1])
     else:
         decision_first = decision_last = snapshot_first = snapshot_last = None
-    if matched_decision_ts.size and not allow_partial_match:
+    if matched_decision_ts.size:
         require(
             snapshot_first is not None and snapshot_last is not None,
             "Matched snapshot bounds are unexpectedly missing during strict alignment.",
@@ -1259,9 +1257,8 @@ def align_snapshots_to_decisions(
             f"expected_bounds_last={_format_ts(expected_bounds[1]) if expected_bounds is not None else 'n/a'}",
             f"decision_median_dt_ms={decision_median_dt:.2f}",
             f"snapshot_median_dt_ms={snapshot_median_dt:.2f}",
-            f"allow_partial_match={allow_partial_match}",
         )
-    return aligned, matched.astype(bool, copy=False)
+    return aligned
 
 
 def _resolve_horizon_indices(meta: dict, targets: Iterable[int]) -> Dict[int, int]:
@@ -1304,14 +1301,6 @@ def join_features(
     ret_pred = cmssl_out["ret_pred"]
     vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
-    snapshot_mask = cmssl_out.get("snapshot_mask")
-    if snapshot_mask is not None:
-        snapshot_mask = np.asarray(snapshot_mask, dtype=bool)
-        if snapshot_mask.shape != (decision_ts.shape[0],):
-            raise ValueError(
-                "snapshot_mask shape mismatch: "
-                f"expected {(decision_ts.shape[0],)}, got {snapshot_mask.shape}"
-            )
     p_up = _sigmoid(dir_logits)
     horizons = [int(h) for h in meta.get("horizons_ms", [])]
     if not horizons:
@@ -1371,8 +1360,6 @@ def join_features(
         "spread_bps": spread_bps.astype(np.float32),
         "snapshots": snapshots.astype(np.float32),
     }
-    if snapshot_mask is not None:
-        output["snapshot_mask"] = snapshot_mask.astype(bool)
     return output
 
 
@@ -1415,17 +1402,14 @@ def build_joined_split(
         snapshot_ts = snapshot_ts[effective_mask]
         snapshots = snapshots[effective_mask]
 
-    allow_partial_match = _env_bool("BYBIT_MM_ALLOW_PARTIAL_SNAPSHOT_MATCH", False)
-    aligned_snapshots, matched_mask = align_snapshots_to_decisions(
+    aligned_snapshots = align_snapshots_to_decisions(
         ts,
         snapshot_ts,
         snapshots,
         label=split_label,
-        allow_partial_match=allow_partial_match,
         expected_bounds=(int(split["start"]), int(split["end"])),
         raw_snapshot_bounds=raw_snapshot_bounds,
     )
-    cmssl_out["snapshot_mask"] = matched_mask
     return join_features(ts, y, cmssl_out, aligned_snapshots, meta)
 
 
@@ -2599,24 +2583,6 @@ def _fill_forward(arr: np.ndarray) -> np.ndarray:
 
 
 def build_market_batch(split: Dict[str, np.ndarray]) -> MarketMakingBatch:
-    if "snapshot_mask" in split:
-        # Partial snapshot alignment keeps array lengths intact upstream; filter
-        # unmatched rows here so RL batches only see valid aligned snapshots.
-        snapshot_mask = np.asarray(split["snapshot_mask"], dtype=bool)
-        if snapshot_mask.ndim != 1:
-            raise ValueError("split['snapshot_mask'] must be a 1D bool array.")
-        if snapshot_mask.shape[0] != split["features"].shape[0]:
-            raise ValueError(
-                "split['snapshot_mask'] length mismatch: "
-                f"expected {split['features'].shape[0]}, got {snapshot_mask.shape[0]}"
-            )
-        if not np.all(snapshot_mask):
-            split = {
-                key: value[snapshot_mask]
-                for key, value in split.items()
-                if isinstance(value, np.ndarray) and value.shape[0] == snapshot_mask.shape[0]
-            }
-
     snapshots = split.get("snapshots")
     if snapshots is None:
         raise ValueError("snapshots missing from split data; ensure join_features stores snapshots.")
