@@ -139,8 +139,8 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
     next_sample_ts: Optional[int] = None
     last_bid: Optional[float] = None
     last_ask: Optional[float] = None
-    last_bid_size: Optional[float] = None
-    last_ask_size: Optional[float] = None
+    last_bsz: Optional[float] = None
+    last_asz: Optional[float] = None
 
     for raw in iter_ob_events(ob_path):
         etype, ts_ms, payload = fe._parse_event(raw)
@@ -150,30 +150,33 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
         if (
             last_bid is not None
             and last_ask is not None
-            and last_bid_size is not None
-            and last_ask_size is not None
+            and last_bsz is not None
+            and last_asz is not None
             and next_sample_ts is not None
         ):
             while next_sample_ts < ts_ms:
-                series.append(next_sample_ts, last_bid, last_ask, last_bid_size, last_ask_size)
+                series.append(next_sample_ts, last_bid, last_ask, last_bsz, last_asz)
                 next_sample_ts += 100
 
         fe._update_book_from_ob(payload)
-        bid, ask, bid_size, ask_size = fe._book_best()
-        if bid <= 0.0 or ask <= 0.0:
+        bid, ask, bsz, asz = fe._book_best()
+        # Startup policy: do not sample until all four top-of-book values are known.
+        if bid <= 0.0 or ask <= 0.0 or bsz is None or asz is None:
             continue
+        bsz = max(float(bsz), 0.0)
+        asz = max(float(asz), 0.0)
 
         if next_sample_ts is None:
             next_sample_ts = int(ts_ms)
 
         while next_sample_ts <= ts_ms:
-            series.append(next_sample_ts, bid, ask, bid_size, ask_size)
+            series.append(next_sample_ts, bid, ask, bsz, asz)
             next_sample_ts += 100
 
         last_bid = bid
         last_ask = ask
-        last_bid_size = bid_size
-        last_ask_size = ask_size
+        last_bsz = bsz
+        last_asz = asz
 
     return series
 
