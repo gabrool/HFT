@@ -18,6 +18,7 @@ Env (defaults are SSD-friendly):
 import os, sys, csv, json, re, time
 import queue
 import threading
+from pathlib import Path
 from typing import List, Tuple, Iterable, Dict, Optional
 from collections import deque, defaultdict
 from decimal import Decimal, ROUND_HALF_EVEN
@@ -100,6 +101,15 @@ def _week_key(path: str, prefix: str) -> str:
     base = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', base)
     return base.replace(prefix, "")
 
+def extract_week_key_from_name(name: str) -> str:
+    m = re.search(r"\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}", name)
+    if m:
+        return m.group(0)
+    m = re.search(r"\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2}", name)
+    if m:
+        return m.group(0)
+    raise ValueError(f"Could not extract week key from file name: {name}")
+
 def _parse_week_key_any(base: str):
     wk = re.sub(r'^(BTCUSDT_(?:OB|TH)_)', '', base)
     wk = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', wk)
@@ -137,11 +147,11 @@ def _parse_week_from_pair(ob_path: str, th_path: str):
     return start_ob, end_ob, wk
 
 def pair_weeks(ob_dir: str, th_dir: str) -> List[Tuple[str, str, str]]:
-    ob_files = list_glob(ob_dir, "BTCUSDT_OB_*.jsonl")
-    th_files = list_glob(th_dir, "BTCUSDT_TH_*.csv")
+    ob_files = sorted(str(p) for p in Path(ob_dir).glob("BTCUSDT_OB_*"))
+    th_files = sorted(str(p) for p in Path(th_dir).glob("BTCUSDT_TH_*"))
 
-    ob_map = { _week_key(p, "BTCUSDT_OB_"): p for p in ob_files }
-    th_map = { _week_key(p, "BTCUSDT_TH_"): p for p in th_files }
+    ob_map = { extract_week_key_from_name(os.path.basename(p)): p for p in ob_files }
+    th_map = { extract_week_key_from_name(os.path.basename(p)): p for p in th_files }
 
     common = sorted(set(ob_map) & set(th_map))
     if not common:
