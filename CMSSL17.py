@@ -478,24 +478,48 @@ def _list_files(patterns):
         out.extend(glob.glob(pat))
     return out
 
-def _week_key(path: str, prefix: str) -> str:
-    # e.g. BTCUSDT_TH_2024-W35.zip -> 2024-W35
+def _week_key(path: str, prefix: str = "") -> str:
+    # Canonical week keys are date-ranges in one of two supported formats.
+    # We extract by regex-search so the key can be found regardless of suffixes.
     base = os.path.basename(path)
-    base = re.sub(r'\.(zip|gz)$', '', base)  # strip extension
+    m = re.search(r"(\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2})", base)
+    if m:
+        return m.group(1)
+
+    # Backward-compatible fallback for legacy names.
+    base = re.sub(r'\.(zip|gz|jsonl|csv)$', '', base)
     return base.replace(prefix, "")
+
+
+def _choose_week_files(candidates: List[str], label: str, prefix: str) -> Dict[str, str]:
+    ext_rank = {".zip": 0, ".gz": 1, ".jsonl": 2, ".csv": 3}
+    grouped: Dict[str, List[str]] = {}
+    for path in sorted(candidates):
+        key = _week_key(path, prefix)
+        grouped.setdefault(key, []).append(path)
+
+    chosen: Dict[str, str] = {}
+    for key, paths in grouped.items():
+        if len(paths) > 1:
+            print(f"Warning: duplicate {label} files for week {key}: {paths}")
+
+        def _sort_key(p: str):
+            ext = os.path.splitext(p)[1].lower()
+            return (ext_rank.get(ext, 4), p)
+
+        chosen[key] = min(paths, key=_sort_key)
+    return chosen
 
 def _pair_by_week(data_root: str):
     ob_candidates = _list_files([
-        os.path.join(data_root, "OB", "BTCUSDT_OB_*.zip"),
-        os.path.join(data_root, "OB", "BTCUSDT_OB_*.gz"),
+        os.path.join(data_root, "OB", "BTCUSDT_OB_*"),
     ])
     th_candidates = _list_files([
-        os.path.join(data_root, "TH", "BTCUSDT_TH_*.zip"),
-        os.path.join(data_root, "TH", "BTCUSDT_TH_*.gz"),
+        os.path.join(data_root, "TH", "BTCUSDT_TH_*"),
     ])
 
-    ob_map = { _week_key(p, "BTCUSDT_OB_"): p for p in ob_candidates }
-    th_map = { _week_key(p, "BTCUSDT_TH_"): p for p in th_candidates }
+    ob_map = _choose_week_files(ob_candidates, "OB", "BTCUSDT_OB_")
+    th_map = _choose_week_files(th_candidates, "TH", "BTCUSDT_TH_")
 
     common = sorted(set(ob_map) & set(th_map))
     if not common:
