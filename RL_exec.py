@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK, FeatureEngine, _open_text
+from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK
 from offline_tokens import iter_week_chunks, load_global_meta
 
 RAW_SNAPSHOT_PATHS = [
@@ -35,13 +35,6 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "vol_short",
     "vol_long",
 ]
-RAW_OB_DIR = os.environ.get("BYBIT_OB_DIR", "").strip()
-ALLOW_TS_RECONSTRUCT = os.environ.get("BYBIT_ALLOW_TS_RECONSTRUCT", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-}
 FEATURE_EXTRA_DIM = 5
 ENV_OBS_EXTRA_STATE_DIM = 14
 SHORT_VOL_WINDOW = 50
@@ -348,205 +341,34 @@ def _resolve_horizon_index(
     )
 
 
-def _load_ts_from_npy(path: Path, expected_len: int, label: str) -> Optional[np.ndarray]:
-    if not path.exists():
-        return None
-    arr = np.load(path)
-    if arr.ndim != 1 or arr.shape[0] != expected_len:
-        print(
-            "[ts reconstruct]",
-            f"skip={label}",
-            f"path={path}",
-            f"reason=shape_mismatch",
-            f"expected_len={expected_len}",
-            f"got_shape={arr.shape}",
-        )
-        return None
-    return arr.astype(np.int64, copy=False)
-
-
-def _load_chunk_ts_alternate(
-    week_dir: Path,
-    chunk_idx: int,
-    expected_len: int,
-) -> Optional[np.ndarray]:
-    candidates = [
-        week_dir / f"ts_{chunk_idx:03d}.npy",
-        week_dir / f"ts_{chunk_idx}.npy",
-    ]
-    for path in candidates:
-        ts = _load_ts_from_npy(path, expected_len, label="candidate")
-        if ts is not None:
-            return ts
-    pattern_hits = sorted(week_dir.glob(f"*{chunk_idx:03d}*ts*.npy"))
-    for path in pattern_hits:
-        ts = _load_ts_from_npy(path, expected_len, label="pattern")
-        if ts is not None:
-            return ts
-    fallback_hits = sorted(week_dir.glob("*_ts.npy"))
-    if len(fallback_hits) == 1:
-        return _load_ts_from_npy(fallback_hits[0], expected_len, label="fallback")
-    for path in fallback_hits:
-        ts = _load_ts_from_npy(path, expected_len, label="fallback")
-        if ts is not None:
-            return ts
-    return None
-
-
-def _ensure_ts_alignment(
-    ts: np.ndarray,
-    *,
-    label: str,
-    expected_len: int,
-    snapshot_ts: Optional[np.ndarray] = None,
-    chunk_offset: Optional[int] = None,
-) -> None:
-    if ts.ndim != 1 or ts.shape[0] != expected_len:
-        raise ValueError(
-            f"{label} timestamps length mismatch: expected {expected_len}, got {ts.shape}"
-        )
-    _ensure_monotonic(ts, label)
-    if snapshot_ts is not None and chunk_offset is not None:
-        end = chunk_offset + expected_len
-        if end > snapshot_ts.shape[0]:
-            raise ValueError(
-                f"{label} snapshot alignment overflow: chunk_offset={chunk_offset} "
-                f"expected_len={expected_len} snapshot_len={snapshot_ts.shape[0]}"
-            )
-        expected_slice = snapshot_ts[chunk_offset:end]
-        if not np.array_equal(ts, expected_slice):
-            delta = np.abs(ts - expected_slice)
-            max_delta = int(delta.max()) if delta.size else 0
-            raise ValueError(
-                f"{label} reconstructed ts misaligned with snapshot timeline. "
-                f"chunk_offset={chunk_offset} max_delta_ms={max_delta}"
-            )
-        print(
-            "[ts reconstruct]",
-            f"label={label}",
-            f"len={expected_len}",
-            f"start={_format_ts(int(ts[0])) if ts.size else 'n/a'}",
-            f"end={_format_ts(int(ts[-1])) if ts.size else 'n/a'}",
-            "alignment=ok",
-        )
-
-
-def _load_week_snapshot_ts(out_root: Path, week_key: str, week_meta: dict) -> np.ndarray:
-    try:
-        snapshot_ts, _raw_snapshots = load_raw_snapshots(out_root, week_key)
-        snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-        return np.sort(snapshot_ts)
-    except (FileNotFoundError, ValueError) as exc:
-        if RAW_SNAPSHOT_PATHS:
-            ts_range = week_meta.get("decision_ts_range")
-            if not ts_range:
-                raise ValueError(
-                    f"Missing decision_ts_range for week {week_key}; "
-                    "cannot filter RAW_SNAPSHOT_PATHS for timestamp reconstruction."
-                ) from exc
-            split = {
-                "week": week_key,
-                "start": int(ts_range["min"]),
-                "end": int(ts_range["max"]),
-            }
-            snapshot_df = load_raw_snapshot_features(str(out_root), split=split, meta=None)
-            snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
-            return np.sort(snapshot_ts)
-        raise
-
-
-def _reconstruct_chunk_ts_from_snapshots(
-    snapshot_ts: np.ndarray,
-    *,
-    chunk_offset: int,
-    expected_len: int,
-    label: str,
-) -> np.ndarray:
-    if snapshot_ts.ndim != 1:
-        raise ValueError("snapshot_ts must be 1D for reconstruction.")
-    if chunk_offset < 0:
-        raise ValueError(f"chunk_offset must be >= 0, got {chunk_offset}")
-    end = chunk_offset + expected_len
-    if end > snapshot_ts.shape[0]:
-        raise ValueError(
-            f"Insufficient snapshot timestamps for reconstruction: "
-            f"chunk_offset={chunk_offset} expected_len={expected_len} "
-            f"snapshot_len={snapshot_ts.shape[0]}"
-        )
-    ts = snapshot_ts[chunk_offset:end].astype(np.int64, copy=False)
-    _ensure_ts_alignment(
-        ts,
-        label=label,
-        expected_len=expected_len,
-        snapshot_ts=snapshot_ts,
-        chunk_offset=chunk_offset,
-    )
-    return ts
-
-
 def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Load CMSSL tensors for a split, requiring per-chunk decision timestamps by default.
-
-    Decision timestamps are the authoritative alignment source. Snapshot timelines must
-    be generated from the same raw delta stream as the decisions if reconstruction is enabled.
-    """
+    """Load CMSSL tensors for a split using canonical per-chunk decision timestamps."""
     x_core_list: List[np.ndarray] = []
     x_aux_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
     ts_list: List[np.ndarray] = []
-    out_root_path = Path(out_root)
-    meta = load_global_meta(out_root_path)
-    week_meta_map = {wk: (wmeta, wk_dir) for wk, wmeta, wk_dir in iter_week_chunks(out_root_path, meta=meta)}
-    snapshot_ts_cache: Dict[str, np.ndarray] = {}
-    chunk_offsets: Dict[str, int] = {}
     for week, chunk_idx, ts, x_core, x_aux, y in iter_chunk_batches(out_root):
         if week != split["week"]:
             continue
         n_rows = x_core.shape[0]
-        chunk_offset = chunk_offsets.get(week, 0)
         if ts is None:
-            if not ALLOW_TS_RECONSTRUCT:
-                raise ValueError(
-                    f"Missing decision timestamps for {week}/chunk{chunk_idx:03d}. "
-                    "Ensure meta_week.json includes ts_*.npy entries, or set "
-                    "BYBIT_ALLOW_TS_RECONSTRUCT=true to enable snapshot-based recovery."
-                )
-            week_meta, week_dir = week_meta_map.get(week, (None, None))
-            if week_dir is None or week_meta is None:
-                raise ValueError(f"Missing week meta for {week}; cannot recover timestamps.")
-            ts = _load_chunk_ts_alternate(week_dir, chunk_idx, n_rows)
-            if ts is None:
-                snapshot_ts = snapshot_ts_cache.get(week)
-                if snapshot_ts is None:
-                    snapshot_ts = _load_week_snapshot_ts(out_root_path, week, week_meta)
-                    snapshot_ts_cache[week] = snapshot_ts
-                    expected_total = int(sum(ch.get("n", 0) for ch in week_meta.get("chunks", [])))
-                    if expected_total and snapshot_ts.shape[0] < expected_total:
-                        raise ValueError(
-                            f"Snapshot timeline shorter than token count for week {week}. "
-                            f"snapshots={snapshot_ts.shape[0]} tokens={expected_total}"
-                        )
-                ts = _reconstruct_chunk_ts_from_snapshots(
-                    snapshot_ts,
-                    chunk_offset=chunk_offset,
-                    expected_len=n_rows,
-                    label=f"{week}/chunk{chunk_idx:03d}",
-                )
-            _ensure_ts_alignment(
-                ts,
-                label=f"{week}/chunk{chunk_idx:03d}",
-                expected_len=n_rows,
+            raise ValueError(
+                f"Missing decision timestamps for {week}/chunk{chunk_idx:03d}. "
+                "Ensure meta_week.json includes ts_*.npy entries."
             )
+        if ts.ndim != 1 or ts.shape[0] != n_rows:
+            raise ValueError(
+                f"{week}/chunk{chunk_idx:03d} timestamps length mismatch: "
+                f"expected {n_rows}, got {ts.shape}"
+            )
+        _ensure_monotonic(ts, f"{week}/chunk{chunk_idx:03d}")
         mask = (ts >= split["start"]) & (ts < split["end"])
         if not np.any(mask):
-            chunk_offsets[week] = chunk_offset + n_rows
             continue
         x_core_list.append(x_core[mask])
         x_aux_list.append(x_aux[mask])
         y_list.append(y[mask])
         ts_list.append(ts[mask])
-        chunk_offsets[week] = chunk_offset + n_rows
     if not x_core_list:
         raise ValueError(f"No data found for split {split}")
     x_core_all = np.concatenate(x_core_list, axis=0)
@@ -782,99 +604,6 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
     return df[["ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"]]
 
 
-def _resolve_ob_path(week_key: str, ob_dir: str) -> Path:
-    if not ob_dir:
-        raise FileNotFoundError(
-            "BYBIT_OB_DIR not set; cannot reconstruct snapshots from delta stream."
-        )
-    prefix = "BTCUSDT_OB_"
-    if week_key.startswith(prefix):
-        pattern = f"{week_key}*"
-    else:
-        pattern = f"{prefix}{week_key}*"
-    candidates = sorted(Path(ob_dir).glob(pattern))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No OB delta stream found for week {week_key} in {ob_dir} "
-            f"matching {pattern}"
-        )
-    return candidates[0]
-
-
-def _iter_ob_events(ob_path: Path) -> Iterable[Dict[str, Any]]:
-    with _open_text(str(ob_path)) as f:
-        for line in f:
-            if not line:
-                continue
-            yield json.loads(line)
-
-
-def _reconstruct_snapshots_from_ob_stream(ob_path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    fe = FeatureEngine()
-    ts_list: List[int] = []
-    bids: List[float] = []
-    asks: List[float] = []
-    bid_sizes: List[float] = []
-    ask_sizes: List[float] = []
-
-    next_sample_ts: Optional[int] = None
-    last_bid: Optional[float] = None
-    last_ask: Optional[float] = None
-    last_bid_size: Optional[float] = None
-    last_ask_size: Optional[float] = None
-
-    for raw in _iter_ob_events(ob_path):
-        etype, ts_ms, payload = fe._parse_event(raw)
-        if etype != "ob":
-            continue
-
-        if (
-            last_bid is not None
-            and last_ask is not None
-            and last_bid_size is not None
-            and last_ask_size is not None
-            and next_sample_ts is not None
-        ):
-            while next_sample_ts < ts_ms:
-                ts_list.append(int(next_sample_ts))
-                bids.append(float(last_bid))
-                asks.append(float(last_ask))
-                bid_sizes.append(float(last_bid_size))
-                ask_sizes.append(float(last_ask_size))
-                next_sample_ts += RAW_SNAPSHOT_EXPECTED_STEP_MS
-
-        fe._update_book_from_ob(payload)
-        bid, ask, bsz, asz = fe._book_best()
-        if bid <= 0.0 or ask <= 0.0:
-            continue
-
-        if next_sample_ts is None:
-            next_sample_ts = int(ts_ms)
-
-        while next_sample_ts <= ts_ms:
-            ts_list.append(int(next_sample_ts))
-            bids.append(float(bid))
-            asks.append(float(ask))
-            bid_sizes.append(float(max(bsz, 0.0)))
-            ask_sizes.append(float(max(asz, 0.0)))
-            next_sample_ts += RAW_SNAPSHOT_EXPECTED_STEP_MS
-
-        last_bid = bid
-        last_ask = ask
-        last_bid_size = float(max(bsz, 0.0))
-        last_ask_size = float(max(asz, 0.0))
-
-    snapshot_ts = np.asarray(ts_list, dtype=np.int64)
-    snapshots = np.column_stack([bids, asks, bid_sizes, ask_sizes]).astype(np.float32)
-    return snapshot_ts, snapshots
-
-
-def _cache_reconstructed_snapshots(week_dir: Path, snapshot_ts: np.ndarray, snapshots: np.ndarray) -> Path:
-    out_path = week_dir / "snapshots.npz"
-    np.savez_compressed(out_path, ts=snapshot_ts, snapshots=snapshots)
-    return out_path
-
-
 def _ensure_sorted_near_regular(ts: np.ndarray) -> None:
     if ts.ndim != 1:
         raise ValueError("Snapshot timestamps must be 1D.")
@@ -996,81 +725,17 @@ def _compute_snapshot_feature_matrix(
 
 def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
     week_dir = _find_week_dir(Path(out_root), week_key)
-    candidates = [
-        week_dir / "snapshots.npz",
-        week_dir / "raw_snapshots.npz",
-        week_dir / "snapshots.npy",
-        week_dir / "raw_snapshots.npy",
-    ]
-    path = next((p for p in candidates if p.exists()), None)
-    if path is None:
-        ob_path = _resolve_ob_path(week_key, RAW_OB_DIR)
-        snapshot_ts, snapshots = _reconstruct_snapshots_from_ob_stream(ob_path)
-        if snapshot_ts.size == 0:
-            raise ValueError(f"No snapshots reconstructed from {ob_path}")
-        _cache_reconstructed_snapshots(week_dir, snapshot_ts, snapshots)
-        return snapshot_ts, snapshots
+    canonical_path = week_dir / "snapshots.npz"
+    if not canonical_path.exists():
+        raise FileNotFoundError("Run offline_snapshots.py first.")
 
-    if path.suffix == ".npz":
-        data = np.load(path)
-        if "ts" in data and "snapshots" in data:
-            if path.name != "snapshots.npz":
-                warnings.warn(
-                    f"Non-canonical snapshot filename {path.name}; "
-                    "prefer snapshots.npz with ts/snapshots fields.",
-                    UserWarning,
-                )
-            return data["ts"], data["snapshots"]
-        if {"ts", "best_bid", "best_ask"}.issubset(data.files):
-            warnings.warn(
-                f"Non-canonical snapshot fields in {path.name}; "
-                "expected ts/snapshots.",
-                UserWarning,
-            )
-            snapshots = np.column_stack([data["best_bid"], data["best_ask"]])
-            return data["ts"], snapshots
-        if {"timestamps", "best_bid", "best_ask"}.issubset(data.files):
-            warnings.warn(
-                f"Non-canonical snapshot fields in {path.name}; "
-                "expected ts/snapshots.",
-                UserWarning,
-            )
-            snapshots = np.column_stack([data["best_bid"], data["best_ask"]])
-            return data["timestamps"], snapshots
-        if "timestamps" in data and "X" in data:
-            warnings.warn(
-                f"Non-canonical snapshot fields in {path.name}; "
-                "expected ts/snapshots.",
-                UserWarning,
-            )
-            return data["timestamps"], data["X"]
-        raise ValueError(f"Unsupported npz layout in {path}")
-
-    arr = np.load(path)
-    if arr.dtype.names:
-        if "ts" in arr.dtype.names and "snapshot" in arr.dtype.names:
-            warnings.warn(
-                f"Non-canonical snapshot layout in {path.name}; "
-                "expected ts/snapshots arrays.",
-                UserWarning,
-            )
-            return arr["ts"], arr["snapshot"]
-        if "ts" in arr.dtype.names and "snapshots" in arr.dtype.names:
-            warnings.warn(
-                f"Non-canonical snapshot layout in {path.name}; "
-                "expected ts/snapshots in an npz.",
-                UserWarning,
-            )
-            return arr["ts"], arr["snapshots"]
-    ts_path = path.with_name("snapshots_ts.npy")
-    if ts_path.exists():
-        warnings.warn(
-            f"Non-canonical snapshot layout using {path.name} + snapshots_ts.npy; "
-            "expected snapshots.npz with ts/snapshots.",
-            UserWarning,
+    data = np.load(canonical_path)
+    if not {"ts", "snapshots"}.issubset(data.files):
+        raise ValueError(
+            f"Expected canonical snapshots at {out_root}/{week_key}/snapshots.npz "
+            "with fields ts and snapshots. Generate them with offline_snapshots.py."
         )
-        return np.load(ts_path), arr
-    raise ValueError(f"Unsupported raw snapshot layout in {path}")
+    return data["ts"], data["snapshots"]
 
 
 def _format_ts(ts_ms: int) -> str:
