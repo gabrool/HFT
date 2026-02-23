@@ -101,6 +101,42 @@ def _week_key(path: str, prefix: str) -> str:
     base = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', base)
     return base.replace(prefix, "")
 
+
+_EXT_PRIORITY = {
+    ".zip": 0,
+    ".gz": 1,
+    ".jsonl": 2,
+    ".csv": 3,
+}
+
+
+def _choose_preferred_week_file(wk_key: str, candidates: List[str], side: str) -> str:
+    def _sort_key(path: str):
+        p = Path(path)
+        ext_rank = _EXT_PRIORITY.get(p.suffix, 4)
+        return (ext_rank, p.name, str(p))
+
+    chosen = min(candidates, key=_sort_key)
+    if len(candidates) > 1:
+        alternatives = sorted([p for p in candidates if p != chosen], key=_sort_key)
+        print(
+            f"Warning: duplicate {side} files for week '{wk_key}'; "
+            f"chosen='{chosen}', alternatives={alternatives}"
+        )
+    return chosen
+
+
+def _build_week_file_map(files: List[str], side: str) -> Dict[str, str]:
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for path in files:
+        wk_key = extract_week_key_from_name(os.path.basename(path))
+        groups[wk_key].append(path)
+
+    return {
+        wk_key: _choose_preferred_week_file(wk_key, candidates, side)
+        for wk_key, candidates in groups.items()
+    }
+
 def extract_week_key_from_name(name: str) -> str:
     m = re.search(r"\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}", name)
     if m:
@@ -150,8 +186,8 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[Tuple[str, str, str]]:
     ob_files = sorted(str(p) for p in Path(ob_dir).glob("BTCUSDT_OB_*"))
     th_files = sorted(str(p) for p in Path(th_dir).glob("BTCUSDT_TH_*"))
 
-    ob_map = { extract_week_key_from_name(os.path.basename(p)): p for p in ob_files }
-    th_map = { extract_week_key_from_name(os.path.basename(p)): p for p in th_files }
+    ob_map = _build_week_file_map(ob_files, "OB")
+    th_map = _build_week_file_map(th_files, "TH")
 
     common = sorted(set(ob_map) & set(th_map))
     if not common:
