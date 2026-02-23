@@ -319,11 +319,17 @@ def _event_ts(event) -> int:
 
 
 def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
-    for _ts, seq, row in tr_iter:
-        ts_decimal = (Decimal(row["timestamp"]) * _DEC_THOUSAND).to_integral_value(
-            rounding=ROUND_HALF_EVEN
-        )
-        yield int(ts_decimal), seq, row
+    for ts_ms, seq, row in tr_iter:
+        t_raw = str(row.get("timestamp", ""))
+        if "." in t_raw or "e" in t_raw or "E" in t_raw:
+            ts_decimal = (Decimal(t_raw) * _DEC_THOUSAND).to_integral_value(
+                rounding=ROUND_HALF_EVEN
+            )
+            yield int(ts_decimal), seq, row
+            continue
+
+        # Whole-second trades must preserve BybitRawIter.trade_iter() bucket spreading.
+        yield int(ts_ms), seq, row
 
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
     # exact tail order: [log_dt_ms, is_trade, events_100ms]
