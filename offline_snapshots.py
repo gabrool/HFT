@@ -110,13 +110,21 @@ class SnapshotSeries:
         self.best_ask_size.append(float(ask_size))
 
     def to_npz(self, path: Path) -> None:
+        """Save canonical snapshot arrays.
+
+        Schema:
+          - ts: int64 ms timestamps
+          - snapshots: float32 [N,4] = (best_bid, best_ask, best_bid_size, best_ask_size)
+        """
         # Invariant: all per-row arrays must remain equal length.
         n_rows = len(self.ts)
         if not (
             n_rows == len(self.best_bid) == len(self.best_ask) == len(self.best_bid_size) == len(self.best_ask_size)
         ):
             raise ValueError("SnapshotSeries arrays have mismatched lengths")
-        snapshots = np.column_stack([self.best_bid, self.best_ask]).astype(np.float32)
+        snapshots = np.column_stack(
+            [self.best_bid, self.best_ask, self.best_bid_size, self.best_ask_size]
+        ).astype(np.float32)
         np.savez_compressed(
             path,
             ts=np.asarray(self.ts, dtype=np.int64),
