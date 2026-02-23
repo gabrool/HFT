@@ -49,10 +49,14 @@ def _parse_requested_weeks(raw: str) -> List[str]:
     return items
 
 
-def _week_key(path: str, prefix: str) -> str:
-    base = os.path.basename(path)
-    base = re.sub(r"\.(?:zip|gz|jsonl|csv)$", "", base)
-    return base.replace(prefix, "")
+def extract_week_key_from_name(name: str) -> str:
+    m = re.search(r"\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}", name)
+    if m:
+        return m.group(0)
+    m = re.search(r"\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2}", name)
+    if m:
+        return m.group(0)
+    raise ValueError(f"Could not extract week key from file name: {name}")
 
 
 def _parse_week_key_any(base: str) -> Tuple[datetime, datetime, str]:
@@ -146,13 +150,17 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
 
 
 def resolve_weeks(ob_files: Iterable[str], requested: Optional[List[str]]) -> List[Tuple[str, str]]:
+    requested_set = None
+    if requested:
+        requested_set = {extract_week_key_from_name(wk) for wk in requested}
+
     rows = []
     for path in ob_files:
-        wk_key = _week_key(path, "BTCUSDT_OB_")
-        if requested and wk_key not in requested:
+        wk_key = extract_week_key_from_name(os.path.basename(path))
+        if requested_set and wk_key not in requested_set:
             continue
-        start_dt, end_dt, wk = _parse_week_key_any(f"BTCUSDT_OB_{wk_key}")
-        rows.append((end_dt, wk, path))
+        _start_dt, end_dt, _wk = _parse_week_key_any(wk_key)
+        rows.append((end_dt, wk_key, path))
     rows.sort()
     return [(wk, path) for _end, wk, path in rows]
 
