@@ -98,13 +98,24 @@ class SnapshotSeries:
     ts: List[int]
     best_bid: List[float]
     best_ask: List[float]
+    best_bid_size: List[float]
+    best_ask_size: List[float]
 
-    def append(self, ts_ms: int, bid: float, ask: float) -> None:
+    def append(self, ts_ms: int, bid: float, ask: float, bid_size: float, ask_size: float) -> None:
+        # Invariant: every per-row series must be appended in lockstep.
         self.ts.append(int(ts_ms))
         self.best_bid.append(float(bid))
         self.best_ask.append(float(ask))
+        self.best_bid_size.append(float(bid_size))
+        self.best_ask_size.append(float(ask_size))
 
     def to_npz(self, path: Path) -> None:
+        # Invariant: all per-row arrays must remain equal length.
+        n_rows = len(self.ts)
+        if not (
+            n_rows == len(self.best_bid) == len(self.best_ask) == len(self.best_bid_size) == len(self.best_ask_size)
+        ):
+            raise ValueError("SnapshotSeries arrays have mismatched lengths")
         snapshots = np.column_stack([self.best_bid, self.best_ask]).astype(np.float32)
         np.savez_compressed(
             path,
@@ -115,24 +126,32 @@ class SnapshotSeries:
 
 def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
     fe = FeatureEngine()
-    series = SnapshotSeries(ts=[], best_bid=[], best_ask=[])
+    series = SnapshotSeries(ts=[], best_bid=[], best_ask=[], best_bid_size=[], best_ask_size=[])
 
     next_sample_ts: Optional[int] = None
     last_bid: Optional[float] = None
     last_ask: Optional[float] = None
+    last_bid_size: Optional[float] = None
+    last_ask_size: Optional[float] = None
 
     for raw in iter_ob_events(ob_path):
         etype, ts_ms, payload = fe._parse_event(raw)
         if etype != "ob":
             continue
 
-        if last_bid is not None and last_ask is not None and next_sample_ts is not None:
+        if (
+            last_bid is not None
+            and last_ask is not None
+            and last_bid_size is not None
+            and last_ask_size is not None
+            and next_sample_ts is not None
+        ):
             while next_sample_ts < ts_ms:
-                series.append(next_sample_ts, last_bid, last_ask)
+                series.append(next_sample_ts, last_bid, last_ask, last_bid_size, last_ask_size)
                 next_sample_ts += 100
 
         fe._update_book_from_ob(payload)
-        bid, ask, _bsz, _asz = fe._book_best()
+        bid, ask, bid_size, ask_size = fe._book_best()
         if bid <= 0.0 or ask <= 0.0:
             continue
 
@@ -140,11 +159,13 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
             next_sample_ts = int(ts_ms)
 
         while next_sample_ts <= ts_ms:
-            series.append(next_sample_ts, bid, ask)
+            series.append(next_sample_ts, bid, ask, bid_size, ask_size)
             next_sample_ts += 100
 
         last_bid = bid
         last_ask = ask
+        last_bid_size = bid_size
+        last_ask_size = ask_size
 
     return series
 
