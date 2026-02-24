@@ -975,8 +975,8 @@ def build_joined_split(
         snapshot_ts = snapshot_ts[effective_mask]
         snapshots = snapshots[effective_mask]
 
-    aligned_idx = align_snapshots_to_decisions(snapshot_ts, ts)
-    aligned_snapshots = snapshots[aligned_idx]
+    snap_idx = align_snapshots_to_decisions(snapshot_ts, ts)
+    aligned_snapshots = snapshots[snap_idx]
     return join_features(ts, y, cmssl_out, aligned_snapshots, meta)
 
 
