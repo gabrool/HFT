@@ -80,12 +80,25 @@ WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
 def _range_from_splits(splits: dict, key: str) -> tuple[int, int]:
-    bounds = splits.get(key)
-    if not isinstance(bounds, dict) or "min" not in bounds or "max" not in bounds:
-        raise KeyError(
-            f"meta['splits']['{key}'] is missing or malformed; expected {{min,max}} shape"
-        )
-    return int(bounds["min"]), int(bounds["max"])
+    if key not in splits:
+        raise KeyError(f"meta['splits'] missing required key '{key}'.")
+
+    bounds = splits[key]
+    if not isinstance(bounds, dict):
+        raise ValueError(f"meta['splits']['{key}'] must be a dict.")
+    if "min" not in bounds or "max" not in bounds:
+        raise KeyError(f"meta['splits']['{key}'] must include both 'min' and 'max'.")
+
+    try:
+        lo = int(bounds["min"])
+        hi = int(bounds["max"])
+    except (TypeError, ValueError):
+        raise ValueError(f"meta['splits']['{key}'] min/max must be integers.")
+
+    if lo >= hi:
+        raise ValueError(f"meta['splits']['{key}'] must satisfy min < max.")
+
+    return lo, hi
 
 
 def require_complete_splits(meta: dict) -> dict:
@@ -116,17 +129,10 @@ def require_complete_splits(meta: dict) -> dict:
         raise KeyError("meta['splits']['holdout_week'] must be a non-empty string. Rerun offline_ingest.")
 
     def _parse_half_open_range(name: str) -> tuple[int, int]:
-        bounds = splits.get(name)
-        if not isinstance(bounds, dict) or "min" not in bounds or "max" not in bounds:
-            raise KeyError(f"meta['splits']['{name}'] must be a dict with integer-like min/max. Rerun offline_ingest.")
         try:
-            lo = int(bounds["min"])
-            hi = int(bounds["max"])
-        except (TypeError, ValueError):
-            raise KeyError(f"meta['splits']['{name}'] min/max must be integer-like. Rerun offline_ingest.")
-        if lo >= hi:
-            raise ValueError(f"meta['splits']['{name}'] must satisfy min < max (half-open [min,max)).")
-        return lo, hi
+            return _range_from_splits(splits, name)
+        except (KeyError, ValueError) as exc:
+            raise type(exc)(f"{exc} Rerun offline_ingest.")
 
     tr_lo, tr_hi = _parse_half_open_range("train_ts_range")
     va_lo, va_hi = _parse_half_open_range("val_ts_range")
