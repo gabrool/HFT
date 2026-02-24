@@ -280,13 +280,14 @@ _DEC_THOUSAND = Decimal("1000")
 
 def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], List[str], List[str]]:
     """
-    Decide which weeks belong to train/val/test.
+    Apply the N-week split policy for train/val/test assignment.
 
-    Required behaviour:
-      - At least 2 weeks are required.
-      - All but the most recent week are TRAIN.
-      - The most recent week is split half/half by time into VAL/TEST.
-        (The half/half split is enforced later using timestamps.)
+    Policy:
+      - n >= 2 weeks are required.
+      - Weeks are assumed already ordered/consecutive (validated in main()).
+      - All earlier weeks are TRAIN.
+      - The final week is the holdout week for both VAL and TEST.
+      - VAL/TEST half/half is enforced downstream using timestamps.
     """
     weeks = [wk for wk, _ob, _th in pairs]
     n = len(weeks)
@@ -297,9 +298,8 @@ def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], 
         )
 
     train_weeks = weeks[:-1]
-    holdout_week = weeks[-1]
-    val_weeks = [holdout_week]
-    test_weeks = [holdout_week]
+    val_weeks = [weeks[-1]]
+    test_weeks = [weeks[-1]]
     return train_weeks, val_weeks, test_weeks
 
 
