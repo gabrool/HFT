@@ -299,32 +299,6 @@ class NpyChunksDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-# ---------------- In-memory convenience (optional) ----------------
-def load_split_in_memory(split_week_paths: List[Path]) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Concatenate all chunks fully into RAM. Returns X [N, L, F], y [N, 2H], F"""
-    Xs, Ys = [], []
-    feat_dim = None
-    for wp in split_week_paths:
-        wmeta = read_json(wp)
-        F_total = int(wmeta["feature_dim_total"])
-        if feat_dim is None:
-            feat_dim = F_total
-        elif feat_dim != F_total:
-            raise ValueError(f"Feature dim mismatch between weeks: {feat_dim} vs {F_total}")
-        for ch in wmeta.get("chunks", []):
-            d = wp.parent
-            Xc = np.load(d / ch["files"]["core"])
-            Xa = np.load(d / ch["files"]["aux"])
-            Y  = np.load(d / ch["files"]["y"])
-            Xs.append(np.concatenate([Xc, Xa], axis=-1))
-            Ys.append(Y)
-    if not Xs:
-        return np.empty((0, LOOKBACK, feat_dim or 0), np.float32), np.empty((0, 2*NUM_HORIZONS), np.float32), (feat_dim or 0)
-    X = np.concatenate(Xs, axis=0).astype(np.float32, copy=False)
-    y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
-    return X, y, int(feat_dim)
-
-
 def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) -> Tuple[np.ndarray, np.ndarray, int]:
     """Load rows in start <= ts < end across weeks into RAM. Returns X [N, L, F], y [N, 2H], F."""
     if end < start:
