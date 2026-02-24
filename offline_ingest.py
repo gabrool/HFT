@@ -31,8 +31,7 @@ OB_DIR      = os.environ.get("BYBIT_OB_DIR",   "/home/gabrool/Documents/OB")
 TH_DIR      = os.environ.get("BYBIT_TH_DIR",   "/home/gabrool/Documents/TH")
 OUT_ROOT    = os.environ.get("BYBIT_OUT_ROOT", "/media/gabrool/Expansion/Gabriel/bybit_offline_dt")
 
-# Week selection: anchor on a known last-week end date, keep the last K weeks
-KEEP_WEEKS    = int(os.environ.get("BYBIT_KEEP_WEEKS", "24"))
+# Week selection: use discovered week pairs; optionally restrict with BYBIT_WEEKS.
 RAW_BYBIT_WEEKS = os.environ.get("BYBIT_WEEKS", "")
 
 # Optional PCA dimensionality reduction on the core features
@@ -209,29 +208,6 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[Tuple[str, str, str]]:
 
     rows.sort()
     return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in rows]
-
-def _slice_last_weeks_pairs(pairs: List[Tuple[str, str, str]], last_end_iso: str, k: int):
-    if not pairs:
-        return []
-
-    target_end = datetime.strptime(last_end_iso, "%Y-%m-%d")
-    rows = []
-    for wk, ob_p, th_p in pairs:
-        start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
-        rows.append((end_dt, start_dt, wk, ob_p, th_p))
-    rows.sort()
-
-    try:
-        idx = max(i for i,(e,_,_,_,_) in enumerate(rows) if e <= target_end)
-    except ValueError as exc:
-        raise ValueError(
-            f"No week ending on/before {last_end_iso} found. "
-            "Check BYBIT_LAST_WEEK_END or available data."
-        ) from exc
-
-    lo = max(0, idx - (k - 1))
-    sel = rows[lo:idx+1]
-    return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in sel]
 
 def _assert_week_order(pairs: List[Tuple[str, str, str]]):
     if not pairs:
@@ -1216,8 +1192,12 @@ def process_all(
 # --------------- driver ----------------
 def main():
     ensure_dir(OUT_ROOT)
+    # Week selection contract:
+    #   1) start from all discovered OB/TH week pairs on disk
+    #   2) optionally filter explicitly via BYBIT_WEEKS
+    # No implicit "last K weeks" or anchor-date selection is applied.
     pairs = pair_weeks(OB_DIR, TH_DIR)
-    
+
     if not pairs:
         print(f"No week pairs found under OB_DIR={OB_DIR} and TH_DIR={TH_DIR}")
         return
