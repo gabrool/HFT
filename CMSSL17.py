@@ -1711,10 +1711,27 @@ class FeatureEngine:
             return etype, ts_ms, e[1]
 
         if isinstance(e, dict):
-            # OB event?
-            if 'data' in e and 'ts' in e and ('orderbook' in str(e.get('topic','')) or e.get('type') in ('snapshot','delta')):
-                ts_ms = coerce_ts_ms(e['ts'])
-                return 'ob', ts_ms, e
+            data = e.get("data", e)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                data = data[0]
+
+            is_ob = (
+                isinstance(data, dict)
+                and ("b" in data or "a" in data)
+                and (isinstance(data.get("b", []), list) or isinstance(data.get("a", []), list))
+            )
+
+            if is_ob:
+                ts_raw = e.get("ts")
+                if ts_raw is None:
+                    ts_raw = e.get("cts")
+                if ts_raw is None and isinstance(data, dict):
+                    ts_raw = data.get("ts")
+                if ts_raw is None and isinstance(data, dict):
+                    ts_raw = data.get("cts")
+                if ts_raw is None:
+                    raise ValueError(f"Missing OB timestamp in event: {e}")
+                return "ob", coerce_ts_ms(ts_raw), e
             # Trade event?
             if 'timestamp' in e and 'price' in e and 'size' in e and 'side' in e:
                 ts_ms = coerce_ts_ms(e['timestamp'])
