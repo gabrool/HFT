@@ -13,9 +13,15 @@ Env vars:
   BYBIT_WORKERS=4           # dataloader workers. Default 8 for train, 4 for val/test.
 
 Splits:
-  Uses the same week ordering produced by offline_ingest (strictly increasing by end date).
-  If there are >=24 weeks, it uses exactly the last 24 with a (18/3/3) chronological split.
-  Otherwise it falls back to 75%/12.5%/12.5% rounded.
+  Primary contract:
+  - read meta.json["splits"]
+  - use train_ts_range, val_ts_range, test_ts_range
+  - apply half-open masks start <= ts < end using per-chunk ts_*.npy
+
+  Fallbacks:
+  - if meta["splits"] is missing or incomplete, use choose_splits()
+  - choose_splits(): if at least 10 weeks are available, use the last 10 with a
+    chronological 6/2/2 split; otherwise use 75%/12.5%/12.5% (rounded)
 
 Files layout expected (created by offline_ingest.py):
   OUT_ROOT/
@@ -355,10 +361,6 @@ def train_from_offline():
 
     # ---- build datasets or fully load ----
     if USE_IN_MEMORY:
-        # Special case: exactly two weeks, with splits train=[week1], val=[week2], test=[week2].
-        # In this setup we want:
-        #   - Week 1: all TRAIN
-        #   - Week 2: first half VAL, second half TEST
         weeks_order = meta.get("weeks", [])
         splits = meta.get("splits") or {}
         special_two_week = False
@@ -372,15 +374,12 @@ def train_from_offline():
                 special_two_week = True
 
         if special_two_week:
-            # Map back to meta_week.json paths
             weeks_meta_map = meta["weeks_meta"]
             wk1_meta = out_root / weeks_meta_map[weeks_order[0]]
             wk2_meta = out_root / weeks_meta_map[weeks_order[1]]
 
-            # TRAIN: all of week 1
             X_tr, y_tr, feat_dim1 = load_split_in_memory([wk1_meta])
 
-            # VAL+TEST: split week 2 in half by sample index
             X_w2, y_w2, feat_dim2 = load_split_in_memory([wk2_meta])
             assert feat_dim1 == feat_dim2 == F_total, "feat dim mismatch between week 1 and week 2"
 
@@ -397,7 +396,6 @@ def train_from_offline():
             f"test=second_half({weeks_order[1]}) N={len(y_te)}"
         )
         else:
-            # Generic behavior: just load the splits as given
             X_tr, y_tr, feat_dim1 = load_split_in_memory(tr_weeks)
             X_va, y_va, feat_dim2 = load_split_in_memory(va_weeks)
             X_te, y_te, feat_dim3 = load_split_in_memory(te_weeks)
