@@ -102,6 +102,15 @@ def choose_splits(week_meta_paths: List[Path]) -> Tuple[List[Path], List[Path], 
         te = weeks[n_tr + n_va:]
     return tr, va, te
 
+
+def _range_from_splits(splits: dict, key: str) -> tuple[int, int]:
+    bounds = splits.get(key)
+    if not isinstance(bounds, dict) or "min" not in bounds or "max" not in bounds:
+        raise KeyError(
+            f"meta['splits']['{key}'] is missing or malformed; expected {{min,max}} shape"
+        )
+    return int(bounds["min"]), int(bounds["max"])
+
 # ---------------- Dataset (streaming from .npy chunks) ----------------
 class NpyChunksDataset(Dataset):
     def __init__(self, chunk_refs: List[ChunkRef], feature_dim_total: int):
