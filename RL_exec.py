@@ -68,9 +68,6 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 # Inventory risk thresholds are denominated in quote notional (USD).
-SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS = int(
-    os.environ.get("SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS", "3000")
-)
 
 
 def require(condition: bool, msg: str, exc_type: type[Exception] = ValueError) -> None:
@@ -967,10 +964,11 @@ def build_joined_split(
 
     snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
     snapshots = np.asarray(snapshots, dtype=np.float32)
-    align_window_margin_ms = max(SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS, 1000)
-    window_start = int(split["start"]) - align_window_margin_ms
-    window_end = int(split["end"]) + align_window_margin_ms
-    effective_mask = (snapshot_ts >= window_start) & (snapshot_ts <= window_end)
+    # Under exact-match alignment, restrict snapshots to the declared split range
+    # so that any out-of-range decision timestamp fails fast and deterministically.
+    window_start = int(split["start"])
+    window_end = int(split["end"])
+    effective_mask = (snapshot_ts >= window_start) & (snapshot_ts < window_end)
     if np.any(effective_mask):
         snapshot_ts = snapshot_ts[effective_mask]
         snapshots = snapshots[effective_mask]
