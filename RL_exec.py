@@ -513,30 +513,31 @@ def _ffill_1d(x: np.ndarray) -> np.ndarray:
     return out
 
 
-def _rolling_std_min_periods_one(values: np.ndarray, window: int) -> np.ndarray:
-    x = np.asarray(values, dtype=np.float64)
+def _rolling_std_ignore_nan(x: np.ndarray, window: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
     n = x.size
     if n == 0:
         return np.empty(0, dtype=np.float64)
     finite = np.isfinite(x)
-    xv = np.where(finite, x, 0.0)
-    xv2 = xv * xv
-    cnt_cum = np.cumsum(finite.astype(np.int64))
-    sum_cum = np.cumsum(xv)
-    sum2_cum = np.cumsum(xv2)
+    x_finite = np.where(finite, x, 0.0)
+    x_finite_sq = x_finite * x_finite
 
-    cnt = cnt_cum.copy()
-    sums = sum_cum.copy()
-    sumsq = sum2_cum.copy()
+    csum = np.cumsum(x_finite)
+    csum2 = np.cumsum(x_finite_sq)
+    count_csum = np.cumsum(finite.astype(np.int64))
+
+    count = count_csum.copy()
+    sums = csum.copy()
+    sumsq = csum2.copy()
     if window < n:
-        cnt[window:] -= cnt_cum[:-window]
-        sums[window:] -= sum_cum[:-window]
-        sumsq[window:] -= sum2_cum[:-window]
+        count[window:] -= count_csum[:-window]
+        sums[window:] -= csum[:-window]
+        sumsq[window:] -= csum2[:-window]
 
     out = np.full(n, np.nan, dtype=np.float64)
-    valid = cnt > 1
-    var_num = sumsq[valid] - (sums[valid] * sums[valid]) / cnt[valid]
-    out[valid] = np.sqrt(np.maximum(var_num / (cnt[valid] - 1), 0.0))
+    valid = count > 1
+    var_num = sumsq[valid] - (sums[valid] * sums[valid]) / count[valid]
+    out[valid] = np.sqrt(np.maximum(var_num / (count[valid] - 1), 0.0))
     return out
 
 
@@ -583,8 +584,8 @@ def _compute_snapshot_feature_matrix(
     spread_bps = (best_ask - best_bid) / mid * 1e4
     mid_ret_1 = np.log(mid)
     mid_ret_1 = np.concatenate([[np.nan], np.diff(mid_ret_1)])
-    vol_short = _rolling_std_min_periods_one(mid_ret_1, SHORT_VOL_WINDOW)
-    vol_long = _rolling_std_min_periods_one(mid_ret_1, LONG_VOL_WINDOW)
+    vol_short = _rolling_std_ignore_nan(mid_ret_1, SHORT_VOL_WINDOW)
+    vol_long = _rolling_std_ignore_nan(mid_ret_1, LONG_VOL_WINDOW)
     features = np.column_stack(
         [best_bid, best_ask, best_bid_size, best_ask_size, imbalance, mid, spread_bps, mid_ret_1, vol_short, vol_long]
     )
