@@ -13,16 +13,10 @@ Env vars:
   BYBIT_WORKERS=4           # dataloader workers. Default 8 for train, 4 for val/test.
 
 Splits:
-  Primary contract:
   - read meta.json["splits"]
+  - use explicit train/val/test week keys
   - use train_ts_range, val_ts_range, test_ts_range
   - apply half-open masks start <= ts < end using per-chunk ts_*.npy
-
-  Fallbacks:
-  - if meta["splits"] is missing or incomplete, use choose_splits()
-  - choose_splits(): if at least 10 weeks are available, use the last 10 with a
-    chronological 6 train / 2 val / 2 test split; otherwise approximate
-    75%/12.5%/12.5% using rounding with minimum-1-per-split safeguards
 
 Files layout expected (created by offline_ingest.py):
   OUT_ROOT/
@@ -37,7 +31,7 @@ This script attempts to *import* model and utils from CMSSL17.py to avoid duplic
 """
 
 import os, sys, math
-from typing import List, Dict, Tuple, Iterable, Optional
+from typing import List, Dict, Tuple, Iterable
 from pathlib import Path
 import numpy as np
 import torch
@@ -50,7 +44,6 @@ from offline_tokens import (
     load_global_meta,
     resolve_week_meta_paths,
     ChunkRef,
-    build_chunk_refs,
 )
 
 # ---------------- Import from CMSSL17 ----------------
@@ -85,32 +78,6 @@ WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "4"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
-
-def choose_splits(week_meta_paths: List[Path]) -> Tuple[List[Path], List[Path], List[Path]]:
-    """
-    Choose chronological train/val/test week splits.
-
-    Rules:
-    - If at least 10 weeks are available, keep only the most recent 10 and split
-      as 6 train / 2 val / 2 test (chronological).
-    - Otherwise, approximate 75% / 12.5% / 12.5% using rounding, with minimum-1
-      safeguards for each split.
-    """
-    weeks = week_meta_paths
-    if len(weeks) >= 10:
-        weeks = weeks[-10:]
-        tr, va, te = weeks[:6], weeks[6:8], weeks[8:10]
-    else:
-        n = len(weeks)
-        n_tr = max(1, int(round(n * 0.75)))
-        n_rest = n - n_tr
-        n_va = max(1, int(round(n_rest / 2)))
-        n_te = max(1, n - n_tr - n_va)
-        tr = weeks[:n_tr]
-        va = weeks[n_tr:n_tr + n_va]
-        te = weeks[n_tr + n_va:]
-    return tr, va, te
-
 
 def _range_from_splits(splits: dict, key: str) -> tuple[int, int]:
     bounds = splits.get(key)
@@ -452,20 +419,11 @@ def train_from_offline():
     weeks_meta_map = meta.get("weeks_meta", {})
     weeks_order = meta.get("weeks", [])
 
-    def split_range_if_present(key: str) -> Optional[Tuple[int, int]]:
-        try:
-            return _range_from_splits(splits, key)
-        except (KeyError, TypeError, ValueError):
-            return None
-
     split_ranges = {
-        "train": split_range_if_present("train_ts_range"),
-        "val": split_range_if_present("val_ts_range"),
-        "test": split_range_if_present("test_ts_range"),
+        "train": _range_from_splits(splits, "train_ts_range"),
+        "val": _range_from_splits(splits, "val_ts_range"),
+        "test": _range_from_splits(splits, "test_ts_range"),
     }
-
-    have_split_week_keys = all(isinstance(splits.get(k), list) for k in ("train", "val", "test"))
-    have_split_ranges = all(split_ranges[k] is not None for k in ("train", "val", "test"))
 
     key_to_meta: Dict[str, Path] = {}
     if weeks_meta_map and weeks_order:
@@ -475,26 +433,23 @@ def train_from_offline():
             if wk in weeks_meta_map
         }
 
-    def keys_to_paths(keys: List[str]) -> List[Path]:
-        return [key_to_meta[k] for k in keys if k in key_to_meta]
+    if not all(isinstance(splits.get(k), list) for k in ("train", "val", "test")):
+        raise KeyError("meta['splits'] must include list-valued 'train', 'val', and 'test' week keys")
+    if not key_to_meta:
+        raise KeyError("meta must include non-empty 'weeks' and 'weeks_meta' for split week-key mapping")
 
-    has_complete_split_metadata = (
-        have_split_week_keys
-        and have_split_ranges
-        and bool(key_to_meta)
-    )
+    def keys_to_paths(keys: List[str], split_name: str) -> List[Path]:
+        missing = [k for k in keys if k not in key_to_meta]
+        if missing:
+            raise KeyError(f"Split '{split_name}' references unknown week key(s): {missing}")
+        return [key_to_meta[k] for k in keys]
 
-    if has_complete_split_metadata:
-        tr_weeks = keys_to_paths(splits.get("train", []))
-        va_weeks = keys_to_paths(splits.get("val", []))
-        te_weeks = keys_to_paths(splits.get("test", []))
+    tr_weeks = keys_to_paths(splits["train"], "train")
+    va_weeks = keys_to_paths(splits["val"], "val")
+    te_weeks = keys_to_paths(splits["test"], "test")
 
-        if not (tr_weeks and va_weeks and te_weeks):
-            print("[split-meta] incomplete week-key mapping; falling back to choose_splits() without ts slicing")
-            has_complete_split_metadata = False
-            tr_weeks, va_weeks, te_weeks = choose_splits(week_meta_paths)
-    else:
-        tr_weeks, va_weeks, te_weeks = choose_splits(week_meta_paths)
+    if not (tr_weeks and va_weeks and te_weeks):
+        raise ValueError("Split metadata must resolve to at least one week for train/val/test")
 
     print(f"[weeks] train={len(tr_weeks)} val={len(va_weeks)} test={len(te_weeks)}")
 
@@ -514,25 +469,19 @@ def train_from_offline():
     F_total = int(feat_dim_total or 0)
 
     # ---- build datasets or fully load ----
-    if USE_IN_MEMORY:
-        if has_complete_split_metadata:
-            tr_start, tr_end = split_ranges["train"]
-            va_start, va_end = split_ranges["val"]
-            te_start, te_end = split_ranges["test"]
+    tr_start, tr_end = split_ranges["train"]
+    va_start, va_end = split_ranges["val"]
+    te_start, te_end = split_ranges["test"]
 
-            X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
-            X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
-            X_te, y_te, feat_dim3 = load_split_in_memory_ts(te_weeks, te_start, te_end)
-            assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
-            print(
-                f"[offline-split-ts] train=[{tr_start},{tr_end}) N={len(y_tr)} "
-                f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
-            )
-        else:
-            X_tr, y_tr, feat_dim1 = load_split_in_memory(tr_weeks)
-            X_va, y_va, feat_dim2 = load_split_in_memory(va_weeks)
-            X_te, y_te, feat_dim3 = load_split_in_memory(te_weeks)
-            assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
+    if USE_IN_MEMORY:
+        X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
+        X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
+        X_te, y_te, feat_dim3 = load_split_in_memory_ts(te_weeks, te_start, te_end)
+        assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
+        print(
+            f"[offline-split-ts] train=[{tr_start},{tr_end}) N={len(y_tr)} "
+            f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
+        )
 
         # Build in-RAM datasets
         ds_train = HFTDataset(X_tr, y_tr)
@@ -546,35 +495,20 @@ def train_from_offline():
         y_train_for_quant = y_tr
 
     else:
-        def refs_for_weeks(weeks: List[Path]) -> List[ChunkRef]:
-            refs: List[ChunkRef] = []
-            for wp in weeks:
-                refs.extend(build_chunk_refs(wp))
-            return refs
-
         def refs_for_weeks_timerange(weeks: List[Path], start: int, end: int) -> List[ChunkRef]:
             refs: List[ChunkRef] = []
             for wp in weeks:
                 refs.extend(build_chunk_refs_by_ts(wp, start, end))
             return refs
 
-        if has_complete_split_metadata:
-            tr_start, tr_end = split_ranges["train"]
-            va_start, va_end = split_ranges["val"]
-            te_start, te_end = split_ranges["test"]
-
-            tr_refs = refs_for_weeks_timerange(tr_weeks, tr_start, tr_end)
-            va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
-            te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
-            print(
-                f"[offline-split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
-                f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
-                f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
-            )
-        else:
-            tr_refs = refs_for_weeks(tr_weeks)
-            va_refs = refs_for_weeks(va_weeks)
-            te_refs = refs_for_weeks(te_weeks)
+        tr_refs = refs_for_weeks_timerange(tr_weeks, tr_start, tr_end)
+        va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
+        te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
+        print(
+            f"[offline-split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
+            f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
+            f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
+        )
 
         ds_train = NpyChunksDataset(tr_refs, F_total)
         ds_val   = NpyChunksDataset(va_refs, F_total)
