@@ -1749,7 +1749,11 @@ class MarketMakingEnv:
         if had_fill:
             self.time_since_last_fill = 0.0
         else:
-            self.time_since_last_fill += 1.0
+            dt_ms = 1
+            if self.decision_ts is not None:
+                dt_ms = int(self.decision_ts[next_idx]) - int(self.decision_ts[self.idx])
+            dt_ms = max(1, dt_ms)
+            self.time_since_last_fill += float(dt_ms) / float(RAW_SNAPSHOT_EXPECTED_STEP_MS)
 
         mid_next = self._mid_price(next_idx)
         maker_rebate_notional = maker_buy * bid + maker_sell * ask
