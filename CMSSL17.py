@@ -1733,8 +1733,20 @@ class FeatureEngine:
                     raise ValueError(f"Missing OB timestamp in event: {e}")
                 return "ob", coerce_ts_ms(ts_raw), e
             # Trade event?
-            if 'timestamp' in e and 'price' in e and 'size' in e and 'side' in e:
-                ts_ms = coerce_ts_ms(e['timestamp'])
+            if 'price' in e and 'size' in e and 'side' in e:
+                t_raw = e.get("timestamp")
+                if t_raw is None:
+                    t_raw = e.get("ts")
+                if t_raw is None:
+                    t_raw = e.get("T")
+                if t_raw is None:
+                    raise ValueError(f"Missing trade timestamp in event: {e}")
+
+                try:
+                    ts_ms = coerce_ts_ms(t_raw)
+                except ValueError as exc:
+                    raise ValueError(f"Unparseable trade timestamp in event: {e}") from exc
+
                 return 'trade', ts_ms, e
 
         raise ValueError(f"Unrecognized event shape: {type(e)} :: {e}")
