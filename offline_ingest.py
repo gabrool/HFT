@@ -1009,35 +1009,37 @@ def process_all(
             continue
 
         ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(event)
-        feat_core = feat_z
-        if pca_components is not None and pca_mean is not None:
-            if np.asarray(feat_z).shape[-1] != pca_mean.shape[0]:
-                raise ValueError(
-                    f"PCA mean/components dimension {pca_mean.shape[0]} does not match "
-                    f"feature dimension {np.asarray(feat_z).shape[-1]}"
-                )
-            centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
-            feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
-        tok = build_token(fe, feat_core, is_trade, dt_ms)
-        if F is None:
-            F = tok.shape[0]
-            router = WeekWriterRouter(
-                out_root,
-                LOOKBACK,
-                F,
-                RAM_BUDGET,
-                CHUNK_SIZE,
-                week_index,
-                pca_meta=pca_summary,
-            )
-        tokens_buf.append(tok)
-
-        seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
-        ts_decision = int(ts_ms)
-        pending_seqs.append((ts_decision, seq.astype(np.float32, copy=False)))
-        labeler.on_decision(ts_decision)
-
         matured = labeler.on_event(int(ts_ms), float(mid))
+
+        if not is_trade:
+            feat_core = feat_z
+            if pca_components is not None and pca_mean is not None:
+                if np.asarray(feat_z).shape[-1] != pca_mean.shape[0]:
+                    raise ValueError(
+                        f"PCA mean/components dimension {pca_mean.shape[0]} does not match "
+                        f"feature dimension {np.asarray(feat_z).shape[-1]}"
+                    )
+                centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
+                feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
+            tok = build_token(fe, feat_core, is_trade, dt_ms)
+            if F is None:
+                F = tok.shape[0]
+                router = WeekWriterRouter(
+                    out_root,
+                    LOOKBACK,
+                    F,
+                    RAM_BUDGET,
+                    CHUNK_SIZE,
+                    week_index,
+                    pca_meta=pca_summary,
+                )
+            tokens_buf.append(tok)
+
+            seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
+            ts_decision = int(ts_ms)
+            pending_seqs.append((ts_decision, seq.astype(np.float32, copy=False)))
+            labeler.on_decision(ts_decision)
+
         for yy in matured:
             if not pending_seqs:
                 raise RuntimeError(
