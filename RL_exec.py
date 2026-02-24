@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,14 +14,7 @@ import torch.optim as optim
 from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK
 from offline_tokens import iter_week_chunks, load_global_meta
 
-RAW_SNAPSHOT_PATHS = [
-    Path(p)
-    for p in os.environ.get("RAW_SNAPSHOT_PATHS", "").split(",")
-    if p
-]
 RAW_SNAPSHOT_EXPECTED_STEP_MS = 100
-RAW_SNAPSHOT_TOLERANCE_MS = 20
-RAW_SNAPSHOT_MAX_IRREGULAR_FRAC = 0.05
 RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "best_bid",
     "best_ask",
@@ -506,148 +498,50 @@ def _find_week_dir(out_root: Path, week_key: str) -> Path:
     raise ValueError(f"Unable to locate week directory for {week_key}")
 
 
-def _load_snapshot_frame(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Snapshot path not found: {path}")
-    if path.suffix == ".parquet":
-        df = pd.read_parquet(path)
-    elif path.suffix in {".csv", ".gz", ".bz2"}:
-        df = pd.read_csv(path)
-    elif path.suffix == ".npz":
-        data = np.load(path)
-        if {"ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"}.issubset(data.files):
-            df = pd.DataFrame(
-                {
-                    "ts": data["ts"],
-                    "best_bid": data["best_bid"],
-                    "best_ask": data["best_ask"],
-                    "best_bid_size": data["best_bid_size"],
-                    "best_ask_size": data["best_ask_size"],
-                }
-            )
-        elif {"timestamps", "best_bid", "best_ask", "best_bid_size", "best_ask_size"}.issubset(data.files):
-            df = pd.DataFrame(
-                {
-                    "ts": data["timestamps"],
-                    "best_bid": data["best_bid"],
-                    "best_ask": data["best_ask"],
-                    "best_bid_size": data["best_bid_size"],
-                    "best_ask_size": data["best_ask_size"],
-                }
-            )
-        elif {"ts", "snapshots"}.issubset(data.files):
-            snaps = data["snapshots"]
-            if snaps.ndim != 2 or snaps.shape[1] != 4:
-                raise ValueError(f"Unsupported snapshots array shape in {path}: {snaps.shape}; expected [N,4]")
-            df = pd.DataFrame(
-                {
-                    "ts": data["ts"],
-                    "best_bid": snaps[:, 0],
-                    "best_ask": snaps[:, 1],
-                    "best_bid_size": snaps[:, 2],
-                    "best_ask_size": snaps[:, 3],
-                }
-            )
-        else:
-            raise ValueError(f"Unsupported npz layout in {path}")
-    elif path.suffix == ".npy":
-        arr = np.load(path)
-        if arr.dtype.names:
-            if {"ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"}.issubset(arr.dtype.names):
-                df = pd.DataFrame(
-                    {
-                        "ts": arr["ts"],
-                        "best_bid": arr["best_bid"],
-                        "best_ask": arr["best_ask"],
-                        "best_bid_size": arr["best_bid_size"],
-                        "best_ask_size": arr["best_ask_size"],
-                    }
-                )
-            elif {"ts", "snapshot"}.issubset(arr.dtype.names):
-                snaps = arr["snapshot"]
-                if snaps.ndim != 2 or snaps.shape[1] != 4:
-                    raise ValueError(f"Unsupported snapshot array shape in {path}: {snaps.shape}; expected [N,4]")
-                df = pd.DataFrame(
-                    {
-                        "ts": arr["ts"],
-                        "best_bid": snaps[:, 0],
-                        "best_ask": snaps[:, 1],
-                        "best_bid_size": snaps[:, 2],
-                        "best_ask_size": snaps[:, 3],
-                    }
-                )
-            elif {"ts", "snapshots"}.issubset(arr.dtype.names):
-                snaps = arr["snapshots"]
-                if snaps.ndim != 2 or snaps.shape[1] != 4:
-                    raise ValueError(f"Unsupported snapshots array shape in {path}: {snaps.shape}; expected [N,4]")
-                df = pd.DataFrame(
-                    {
-                        "ts": arr["ts"],
-                        "best_bid": snaps[:, 0],
-                        "best_ask": snaps[:, 1],
-                        "best_bid_size": snaps[:, 2],
-                        "best_ask_size": snaps[:, 3],
-                    }
-                )
-            else:
-                raise ValueError(f"Unsupported structured snapshot dtype in {path}")
-        else:
-            if arr.ndim != 2 or arr.shape[1] < 5:
-                raise ValueError(f"Unsupported raw snapshot array shape in {path}: {arr.shape}")
-            df = pd.DataFrame(
-                {
-                    "ts": arr[:, 0],
-                    "best_bid": arr[:, 1],
-                    "best_ask": arr[:, 2],
-                    "best_bid_size": arr[:, 3],
-                    "best_ask_size": arr[:, 4],
-                }
-            )
-    else:
-        raise ValueError(f"Unsupported snapshot file type: {path.suffix}")
-    missing = {"ts", "best_bid", "best_ask"} - set(df.columns)
-    if missing:
-        raise ValueError(f"Snapshot data missing columns {missing} in {path}")
-    required_size_cols = {"best_bid_size", "best_ask_size"}
-    missing_sizes = required_size_cols - set(df.columns)
-    if missing_sizes:
-        raise ValueError(f"Snapshot data missing required size columns {missing_sizes} in {path}")
-    return df[["ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"]]
+def _ffill_nan_1d(values: np.ndarray) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float64).copy()
+    if out.size == 0:
+        return out
+    mask = np.isnan(out)
+    if np.all(mask):
+        out[:] = 0.0
+        return out
+    idx = np.where(~mask, np.arange(out.size), 0)
+    np.maximum.accumulate(idx, out=idx)
+    out = out[idx]
+    out[np.isnan(out)] = 0.0
+    return out
 
 
-def _ensure_sorted_near_regular(ts: np.ndarray) -> None:
-    if ts.ndim != 1:
-        raise ValueError("Snapshot timestamps must be 1D.")
-    if len(ts) < 2:
-        return
-    if np.any(np.diff(ts) < 0):
-        raise ValueError("Snapshot timestamps must be sorted in ascending order.")
-    deltas = np.diff(ts)
-    median_step = float(np.median(deltas))
-    if abs(median_step - RAW_SNAPSHOT_EXPECTED_STEP_MS) > RAW_SNAPSHOT_TOLERANCE_MS:
-        raise ValueError(
-            "Snapshot cadence not close to 100ms. "
-            f"Median step {median_step:.2f}ms."
-        )
-    irregular_frac = np.mean(np.abs(deltas - RAW_SNAPSHOT_EXPECTED_STEP_MS) > RAW_SNAPSHOT_TOLERANCE_MS)
-    if irregular_frac > RAW_SNAPSHOT_MAX_IRREGULAR_FRAC:
-        raise ValueError(
-            "Snapshot timestamps are too irregular. "
-            f"{irregular_frac:.2%} exceed tolerance."
-        )
+def _rolling_std_min_periods_one(values: np.ndarray, window: int) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    finite = np.isfinite(x)
+    xv = np.where(finite, x, 0.0)
+    xv2 = xv * xv
+    cnt_cum = np.cumsum(finite.astype(np.int64))
+    sum_cum = np.cumsum(xv)
+    sum2_cum = np.cumsum(xv2)
+
+    cnt = cnt_cum.copy()
+    sums = sum_cum.copy()
+    sumsq = sum2_cum.copy()
+    if window < n:
+        cnt[window:] -= cnt_cum[:-window]
+        sums[window:] -= sum_cum[:-window]
+        sumsq[window:] -= sum2_cum[:-window]
+
+    out = np.full(n, np.nan, dtype=np.float64)
+    valid = cnt > 1
+    var_num = sumsq[valid] - (sums[valid] * sums[valid]) / cnt[valid]
+    out[valid] = np.sqrt(np.maximum(var_num / (cnt[valid] - 1), 0.0))
+    return out
 
 
 def _sanitize_snapshot_features(df_or_array: Any) -> Any:
     target_cols = ["best_bid_size", "best_ask_size", "imbalance", "mid_ret_1", "vol_short", "vol_long", "spread_bps"]
-    if isinstance(df_or_array, pd.DataFrame):
-        out = df_or_array.copy()
-        present_cols = [col for col in target_cols if col in out.columns]
-        if not present_cols:
-            return out
-        out[present_cols] = out[present_cols].replace([np.inf, -np.inf], np.nan)
-        out[present_cols] = out[present_cols].ffill().fillna(0.0)
-        return out
-
     arr = np.asarray(df_or_array).copy()
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D snapshot feature array, got shape={arr.shape}.")
@@ -659,43 +553,9 @@ def _sanitize_snapshot_features(df_or_array: Any) -> Any:
     for idx in col_idx.values():
         col = arr[:, idx].astype(np.float64, copy=False)
         col[~np.isfinite(col)] = np.nan
-        col = pd.Series(col).ffill().fillna(0.0).to_numpy(dtype=arr.dtype, copy=False)
+        col = _ffill_nan_1d(col).astype(arr.dtype, copy=False)
         arr[:, idx] = col
     return arr
-
-
-def load_raw_snapshot_features(
-    out_root: str,
-    *,
-    split: Optional[Dict[str, Any]] = None,
-    meta: Optional[dict] = None,
-) -> pd.DataFrame:
-    if not RAW_SNAPSHOT_PATHS:
-        raise ValueError("RAW_SNAPSHOT_PATHS is empty. Set RAW_SNAPSHOT_PATHS or env var.")
-    if split is None:
-        if meta is None:
-            meta = load_global_meta(Path(out_root))
-        split = resolve_test_split(out_root, meta)
-    frames = [_load_snapshot_frame(path) for path in RAW_SNAPSHOT_PATHS]
-    df = pd.concat(frames, ignore_index=True)
-    missing_sizes = {"best_bid_size", "best_ask_size"} - set(df.columns)
-    if missing_sizes:
-        raise ValueError(f"Raw snapshot input is missing required size columns: {missing_sizes}")
-    df = df.dropna(subset=["ts", "best_bid", "best_ask"]).copy()
-    df["ts"] = df["ts"].astype(np.int64)
-    df = df.sort_values("ts").reset_index(drop=True)
-    _ensure_sorted_near_regular(df["ts"].to_numpy())
-    df = df[(df["ts"] >= split["start"]) & (df["ts"] < split["end"])].copy()
-    _ensure_sorted_near_regular(df["ts"].to_numpy())
-    df["mid"] = (df["best_bid"] + df["best_ask"]) / 2.0
-    denom = (df["best_bid_size"] + df["best_ask_size"]).replace(0.0, np.nan)
-    # Imbalance is always computed from canonical best_bid_size/best_ask_size inputs.
-    df["imbalance"] = ((df["best_bid_size"] - df["best_ask_size"]) / denom).fillna(0.0)
-    df["spread_bps"] = (df["best_ask"] - df["best_bid"]) / df["mid"] * 1e4
-    df["mid_ret_1"] = np.log(df["mid"]).diff()
-    df["vol_short"] = df["mid_ret_1"].rolling(SHORT_VOL_WINDOW, min_periods=1).std()
-    df["vol_long"] = df["mid_ret_1"].rolling(LONG_VOL_WINDOW, min_periods=1).std()
-    return _sanitize_snapshot_features(df)
 
 
 def _compute_snapshot_feature_matrix(
@@ -721,9 +581,8 @@ def _compute_snapshot_feature_matrix(
     spread_bps = (best_ask - best_bid) / mid * 1e4
     mid_ret_1 = np.log(mid)
     mid_ret_1 = np.concatenate([[np.nan], np.diff(mid_ret_1)])
-    mid_ret_series = pd.Series(mid_ret_1)
-    vol_short = mid_ret_series.rolling(SHORT_VOL_WINDOW, min_periods=1).std().to_numpy()
-    vol_long = mid_ret_series.rolling(LONG_VOL_WINDOW, min_periods=1).std().to_numpy()
+    vol_short = _rolling_std_min_periods_one(mid_ret_1, SHORT_VOL_WINDOW)
+    vol_long = _rolling_std_min_periods_one(mid_ret_1, LONG_VOL_WINDOW)
     features = np.column_stack(
         [best_bid, best_ask, best_bid_size, best_ask_size, imbalance, mid, spread_bps, mid_ret_1, vol_short, vol_long]
     )
@@ -787,19 +646,14 @@ def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
         f"Test split duration {duration_ms}ms not ~3.5 days."
     ))
 
-    if RAW_SNAPSHOT_PATHS:
-        snapshot_df = load_raw_snapshot_features(out_root, split=test_split, meta=meta)
-        snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
-        filtered = snapshot_ts
-    else:
-        snapshot_ts_parts: List[np.ndarray] = []
-        for week in _split_weeks(test_split):
-            week_snapshot_ts, _snapshots = load_raw_snapshots(out_root, week)
-            snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
-        snapshot_ts = np.concatenate(snapshot_ts_parts, axis=0)
-        snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-        snapshot_ts = np.sort(snapshot_ts)
-        filtered = snapshot_ts[(snapshot_ts >= start_ms) & (snapshot_ts < end_ms)]
+    snapshot_ts_parts: List[np.ndarray] = []
+    for week in _split_weeks(test_split):
+        week_snapshot_ts, _snapshots = load_raw_snapshots(out_root, week)
+        snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
+    snapshot_ts = np.concatenate(snapshot_ts_parts, axis=0)
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshot_ts = np.sort(snapshot_ts)
+    filtered = snapshot_ts[(snapshot_ts >= start_ms) & (snapshot_ts < end_ms)]
     if filtered.size == 0:
         raise ValueError("No raw snapshots found inside the CMSSL test split range.")
     _ensure_monotonic(filtered, "Raw snapshot (filtered)")
