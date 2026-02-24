@@ -42,7 +42,6 @@ from tqdm import tqdm
 from offline_tokens import (
     read_json,
     load_global_meta,
-    resolve_week_meta_paths,
     ChunkRef,
 )
 
@@ -466,6 +465,8 @@ def train_from_offline():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
+    splits = require_complete_splits(meta)
+
     pca_info = meta.get("pca", {}) or {}
     if pca_info:
         applied = bool(pca_info.get("applied", False))
@@ -487,14 +488,10 @@ def train_from_offline():
         print(f"[pca-meta] {' '.join(summary_parts)}")
         if not applied:
             print("[warn] PCA metadata indicates the dataset was not reduced; training will use original feature dimensionality.")
-    week_meta_paths = resolve_week_meta_paths(out_root, meta)
-    if not week_meta_paths:
-        raise RuntimeError("No week meta files were found under OUT_ROOT")
 
-    validated_splits = require_complete_splits(meta)
-    splits = validated_splits["splits"]
-    weeks_order = validated_splits["weeks_in_order"]
-    split_ranges = validated_splits["split_ranges"]
+    split_defs = splits["splits"]
+    weeks_order = splits["weeks_in_order"]
+    split_ranges = splits["split_ranges"]
     weeks_meta_map = meta.get("weeks_meta", {})
 
     key_to_meta: Dict[str, Path] = {}
@@ -514,9 +511,9 @@ def train_from_offline():
             raise KeyError(f"Split '{split_name}' references unknown week key(s): {missing}")
         return [key_to_meta[k] for k in keys]
 
-    tr_weeks = keys_to_paths(splits["train"], "train")
-    va_weeks = keys_to_paths(splits["val"], "val")
-    te_weeks = keys_to_paths(splits["test"], "test")
+    tr_weeks = keys_to_paths(split_defs["train"], "train")
+    va_weeks = keys_to_paths(split_defs["val"], "val")
+    te_weeks = keys_to_paths(split_defs["test"], "test")
 
     if not (tr_weeks and va_weeks and te_weeks):
         raise ValueError("Split metadata must resolve to at least one week for train/val/test")
