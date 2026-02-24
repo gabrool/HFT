@@ -131,49 +131,42 @@ def iter_chunk_batches(out_root: str):
             yield week, int(entry.get("chunk", 0)), ts, x_core, x_aux, y
 
 
-def _decision_ts_bounds(week_key: str, week_meta: dict) -> tuple[int, int]:
-    ts_range = week_meta.get("decision_ts_range")
-    require(ts_range, f"week {week_key} missing decision_ts_range in meta_week.json")
-    ts_min = int(ts_range["min"])
-    ts_max = int(ts_range["max"])
-    require(ts_min < ts_max, f"week {week_key} has invalid decision_ts_range: {ts_range}")
-    return ts_min, ts_max
-
-
 def get_cmssl_splits(out_root: str) -> dict:
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
-    weeks = list(meta.get("weeks", []))
-    require(len(weeks) == 2, f"expected exactly 2 weeks, found {len(weeks)}")
+    splits = meta.get("splits", {})
 
-    week_meta_map = {wk: wmeta for wk, wmeta, _ in iter_week_chunks(out_root, meta=meta)}
-    require(len(week_meta_map) == 2, f"expected two week metas, found {len(week_meta_map)}")
-    week1_key, week2_key = weeks
-    require(week1_key in week_meta_map and week2_key in week_meta_map, (
-        f"week keys {weeks} do not match week metas {list(week_meta_map.keys())}"
+    missing = [
+        key for key in ("train", "holdout_week", "train_ts_range", "val_ts_range", "test_ts_range")
+        if key not in splits
+    ]
+    require(not missing, (
+        "meta.json missing split ranges — rerun offline_ingest to generate canonical splits"
+    ))
+    require(isinstance(splits["train"], list), (
+        "meta.json missing split ranges — rerun offline_ingest to generate canonical splits"
     ))
 
-    week1_min, week1_max = _decision_ts_bounds(week1_key, week_meta_map[week1_key])
-    week2_min, week2_max = _decision_ts_bounds(week2_key, week_meta_map[week2_key])
+    train_ts_range = splits["train_ts_range"]
+    val_ts_range = splits["val_ts_range"]
+    test_ts_range = splits["test_ts_range"]
 
-    week2_span = week2_max - week2_min
-    expected_week_ms = 7 * 24 * 60 * 60 * 1000
-    expected_half_ms = expected_week_ms / 2.0
-    tolerance_ms = 60 * 60 * 1000
-    require(abs(week2_span - expected_week_ms) <= tolerance_ms, (
-        f"week2 span {week2_span:.0f}ms not ~7 days"
-    ))
-
-    week2_half = week2_span / 2.0
-    require(abs(week2_half - expected_half_ms) <= tolerance_ms, (
-        f"week2 half span {week2_half:.0f}ms not ~3.5 days"
-    ))
-
-    week2_mid = int(week2_min + week2_half)
     return {
-        "train": {"week": week1_key, "start": week1_min, "end": week1_max},
-        "val": {"week": week2_key, "start": week2_min, "end": week2_mid},
-        "test": {"week": week2_key, "start": week2_mid, "end": week2_max},
+        "train": {
+            "weeks": splits["train"],
+            "start": int(train_ts_range["min"]),
+            "end": int(train_ts_range["max"]),
+        },
+        "val": {
+            "weeks": [splits["holdout_week"]],
+            "start": int(val_ts_range["min"]),
+            "end": int(val_ts_range["max"]),
+        },
+        "test": {
+            "weeks": [splits["holdout_week"]],
+            "start": int(test_ts_range["min"]),
+            "end": int(test_ts_range["max"]),
+        },
     }
 
 
