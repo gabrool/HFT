@@ -331,6 +331,15 @@ def _resolve_horizon_index(
     )
 
 
+def _split_weeks(split: dict) -> list[str]:
+    weeks = split.get("weeks")
+    if weeks:
+        return list(weeks)
+    if "week" in split:
+        return [split["week"]]
+    raise KeyError("split must contain 'week' or 'weeks'")
+
+
 def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load CMSSL tensors for a split.
 
@@ -339,7 +348,7 @@ def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray,
         split: Split config with either ``week`` (single week key) or ``weeks``
             (list of week keys), plus ``start``/``end`` timestamp bounds.
     """
-    weeks = split.get("weeks") or [split["week"]]
+    weeks = _split_weeks(split)
     x_core_list: List[np.ndarray] = []
     x_aux_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
@@ -783,7 +792,11 @@ def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
         snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
         filtered = snapshot_ts
     else:
-        snapshot_ts, _snapshots = load_raw_snapshots(out_root, test_split["week"])
+        snapshot_ts_parts: List[np.ndarray] = []
+        for week in _split_weeks(test_split):
+            week_snapshot_ts, _snapshots = load_raw_snapshots(out_root, week)
+            snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
+        snapshot_ts = np.concatenate(snapshot_ts_parts, axis=0)
         snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
         snapshot_ts = np.sort(snapshot_ts)
         filtered = snapshot_ts[(snapshot_ts >= start_ms) & (snapshot_ts < end_ms)]
@@ -959,7 +972,14 @@ def build_joined_split(
         snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
         snapshots = snapshot_df[RAW_SNAPSHOT_FEATURE_COLUMNS].to_numpy(dtype=np.float32)
     else:
-        snapshot_ts, raw_snapshots = load_raw_snapshots(out_root, split["week"])
+        snapshot_ts_parts: List[np.ndarray] = []
+        raw_snapshot_parts: List[np.ndarray] = []
+        for week in _split_weeks(split):
+            week_snapshot_ts, week_raw_snapshots = load_raw_snapshots(out_root, week)
+            snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
+            raw_snapshot_parts.append(np.asarray(week_raw_snapshots))
+        snapshot_ts = np.concatenate(snapshot_ts_parts, axis=0)
+        raw_snapshots = np.concatenate(raw_snapshot_parts, axis=0)
         snapshot_ts, snapshots = _compute_snapshot_feature_matrix(snapshot_ts, raw_snapshots)
 
     snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
