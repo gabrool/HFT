@@ -314,6 +314,13 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
                     f"Expected 1D ts array in chunk {idx} ({week_dir / ts_rel}), got shape={ts_arr.shape}"
                 )
 
+            # Safety check: searchsorted semantics require non-decreasing input.
+            if ts_arr.size > 1 and not np.all(ts_arr[1:] >= ts_arr[:-1]):
+                raise ValueError(
+                    f"Timestamp file is not non-decreasing for chunk {idx} in {wp}: "
+                    f"{week_dir / ts_rel}; ts must be non-decreasing for range slicing"
+                )
+
             l = int(np.searchsorted(ts_arr, start, side="left"))
             r = int(np.searchsorted(ts_arr, end, side="left"))
             if r <= l:
