@@ -509,37 +509,37 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
         df = pd.read_csv(path)
     elif path.suffix == ".npz":
         data = np.load(path)
-        if {"ts", "best_bid", "best_ask"}.issubset(data.files):
+        if {"ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"}.issubset(data.files):
             df = pd.DataFrame(
                 {
                     "ts": data["ts"],
                     "best_bid": data["best_bid"],
                     "best_ask": data["best_ask"],
-                    "best_bid_size": data["best_bid_size"] if "best_bid_size" in data.files else 0.0,
-                    "best_ask_size": data["best_ask_size"] if "best_ask_size" in data.files else 0.0,
+                    "best_bid_size": data["best_bid_size"],
+                    "best_ask_size": data["best_ask_size"],
                 }
             )
-        elif {"timestamps", "best_bid", "best_ask"}.issubset(data.files):
+        elif {"timestamps", "best_bid", "best_ask", "best_bid_size", "best_ask_size"}.issubset(data.files):
             df = pd.DataFrame(
                 {
                     "ts": data["timestamps"],
                     "best_bid": data["best_bid"],
                     "best_ask": data["best_ask"],
-                    "best_bid_size": data["best_bid_size"] if "best_bid_size" in data.files else 0.0,
-                    "best_ask_size": data["best_ask_size"] if "best_ask_size" in data.files else 0.0,
+                    "best_bid_size": data["best_bid_size"],
+                    "best_ask_size": data["best_ask_size"],
                 }
             )
         elif {"ts", "snapshots"}.issubset(data.files):
             snaps = data["snapshots"]
-            if snaps.ndim != 2 or snaps.shape[1] < 2:
-                raise ValueError(f"Unsupported snapshots array shape in {path}: {snaps.shape}")
+            if snaps.ndim != 2 or snaps.shape[1] != 4:
+                raise ValueError(f"Unsupported snapshots array shape in {path}: {snaps.shape}; expected [N,4]")
             df = pd.DataFrame(
                 {
                     "ts": data["ts"],
                     "best_bid": snaps[:, 0],
                     "best_ask": snaps[:, 1],
-                    "best_bid_size": snaps[:, 2] if snaps.shape[1] > 2 else 0.0,
-                    "best_ask_size": snaps[:, 3] if snaps.shape[1] > 3 else 0.0,
+                    "best_bid_size": snaps[:, 2],
+                    "best_ask_size": snaps[:, 3],
                 }
             )
         else:
@@ -547,50 +547,54 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
     elif path.suffix == ".npy":
         arr = np.load(path)
         if arr.dtype.names:
-            if {"ts", "best_bid", "best_ask"}.issubset(arr.dtype.names):
+            if {"ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"}.issubset(arr.dtype.names):
                 df = pd.DataFrame(
                     {
                         "ts": arr["ts"],
                         "best_bid": arr["best_bid"],
                         "best_ask": arr["best_ask"],
-                        "best_bid_size": arr["best_bid_size"] if "best_bid_size" in arr.dtype.names else 0.0,
-                        "best_ask_size": arr["best_ask_size"] if "best_ask_size" in arr.dtype.names else 0.0,
+                        "best_bid_size": arr["best_bid_size"],
+                        "best_ask_size": arr["best_ask_size"],
                     }
                 )
             elif {"ts", "snapshot"}.issubset(arr.dtype.names):
                 snaps = arr["snapshot"]
+                if snaps.ndim != 2 or snaps.shape[1] != 4:
+                    raise ValueError(f"Unsupported snapshot array shape in {path}: {snaps.shape}; expected [N,4]")
                 df = pd.DataFrame(
                     {
                         "ts": arr["ts"],
                         "best_bid": snaps[:, 0],
                         "best_ask": snaps[:, 1],
-                        "best_bid_size": snaps[:, 2] if snaps.shape[1] > 2 else 0.0,
-                        "best_ask_size": snaps[:, 3] if snaps.shape[1] > 3 else 0.0,
+                        "best_bid_size": snaps[:, 2],
+                        "best_ask_size": snaps[:, 3],
                     }
                 )
             elif {"ts", "snapshots"}.issubset(arr.dtype.names):
                 snaps = arr["snapshots"]
+                if snaps.ndim != 2 or snaps.shape[1] != 4:
+                    raise ValueError(f"Unsupported snapshots array shape in {path}: {snaps.shape}; expected [N,4]")
                 df = pd.DataFrame(
                     {
                         "ts": arr["ts"],
                         "best_bid": snaps[:, 0],
                         "best_ask": snaps[:, 1],
-                        "best_bid_size": snaps[:, 2] if snaps.shape[1] > 2 else 0.0,
-                        "best_ask_size": snaps[:, 3] if snaps.shape[1] > 3 else 0.0,
+                        "best_bid_size": snaps[:, 2],
+                        "best_ask_size": snaps[:, 3],
                     }
                 )
             else:
                 raise ValueError(f"Unsupported structured snapshot dtype in {path}")
         else:
-            if arr.ndim != 2 or arr.shape[1] < 3:
+            if arr.ndim != 2 or arr.shape[1] < 5:
                 raise ValueError(f"Unsupported raw snapshot array shape in {path}: {arr.shape}")
             df = pd.DataFrame(
                 {
                     "ts": arr[:, 0],
                     "best_bid": arr[:, 1],
                     "best_ask": arr[:, 2],
-                    "best_bid_size": arr[:, 3] if arr.shape[1] > 3 else 0.0,
-                    "best_ask_size": arr[:, 4] if arr.shape[1] > 4 else 0.0,
+                    "best_bid_size": arr[:, 3],
+                    "best_ask_size": arr[:, 4],
                 }
             )
     else:
@@ -598,9 +602,10 @@ def _load_snapshot_frame(path: Path) -> pd.DataFrame:
     missing = {"ts", "best_bid", "best_ask"} - set(df.columns)
     if missing:
         raise ValueError(f"Snapshot data missing columns {missing} in {path}")
-    for col in ("best_bid_size", "best_ask_size"):
-        if col not in df.columns:
-            df[col] = 0.0
+    required_size_cols = {"best_bid_size", "best_ask_size"}
+    missing_sizes = required_size_cols - set(df.columns)
+    if missing_sizes:
+        raise ValueError(f"Snapshot data missing required size columns {missing_sizes} in {path}")
     return df[["ts", "best_bid", "best_ask", "best_bid_size", "best_ask_size"]]
 
 
@@ -667,10 +672,9 @@ def load_raw_snapshot_features(
         split = resolve_test_split(out_root, meta)
     frames = [_load_snapshot_frame(path) for path in RAW_SNAPSHOT_PATHS]
     df = pd.concat(frames, ignore_index=True)
-    if "best_bid_size" not in df.columns:
-        df["best_bid_size"] = 0.0
-    if "best_ask_size" not in df.columns:
-        df["best_ask_size"] = 0.0
+    missing_sizes = {"best_bid_size", "best_ask_size"} - set(df.columns)
+    if missing_sizes:
+        raise ValueError(f"Raw snapshot input is missing required size columns: {missing_sizes}")
     df = df.dropna(subset=["ts", "best_bid", "best_ask"]).copy()
     df["ts"] = df["ts"].astype(np.int64)
     df = df.sort_values("ts").reset_index(drop=True)
@@ -679,6 +683,7 @@ def load_raw_snapshot_features(
     _ensure_sorted_near_regular(df["ts"].to_numpy())
     df["mid"] = (df["best_bid"] + df["best_ask"]) / 2.0
     denom = (df["best_bid_size"] + df["best_ask_size"]).replace(0.0, np.nan)
+    # Imbalance is always computed from canonical best_bid_size/best_ask_size inputs.
     df["imbalance"] = ((df["best_bid_size"] - df["best_ask_size"]) / denom).fillna(0.0)
     df["spread_bps"] = (df["best_ask"] - df["best_bid"]) / df["mid"] * 1e4
     df["mid_ret_1"] = np.log(df["mid"]).diff()
@@ -695,7 +700,7 @@ def _compute_snapshot_feature_matrix(
     snapshots = np.asarray(snapshots)
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D.")
-    if snapshots.ndim != 2 or snapshots.shape[1] < 4:
+    if snapshots.ndim != 2 or snapshots.shape[1] != 4:
         raise ValueError("Snapshots must be [N,4] with bid/ask and sizes. Rebuild snapshots.")
     order = np.argsort(snapshot_ts)
     snapshot_ts = snapshot_ts[order]
@@ -732,12 +737,12 @@ def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.nda
             "with fields ts and snapshots. Generate them with offline_snapshots.py."
         )
     snapshots = data["snapshots"]
-    if snapshots.ndim != 2 or snapshots.shape[1] < 4:
+    if snapshots.ndim != 2 or snapshots.shape[1] != 4:
         raise ValueError(
             f"{canonical_path} has snapshots shape {snapshots.shape}; expected [N,4] (bid, ask, bid_size, ask_size). "
             "Re-run offline_snapshots (1).py to regenerate."
         )
-    return data["ts"], snapshots[:, :4]
+    return data["ts"], snapshots
 
 
 def _format_ts(ts_ms: int) -> str:
