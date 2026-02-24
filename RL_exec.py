@@ -593,6 +593,7 @@ def _compute_snapshot_feature_matrix(
 
 
 def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load canonical raw snapshots only (no alternate ingestion fallbacks)."""
     week_dir = _find_week_dir(Path(out_root), week_key)
     canonical_path = week_dir / "snapshots.npz"
     if not canonical_path.exists():
@@ -837,6 +838,8 @@ def build_joined_split(
             device=device,
         )
 
+        # Canonical snapshot flow: load_raw_snapshots(...) ->
+        # _compute_snapshot_feature_matrix(...).
         week_snapshot_ts, week_raw_snapshots = load_raw_snapshots(out_root, wk)
         snapshot_ts, snapshots = _compute_snapshot_feature_matrix(
             np.asarray(week_snapshot_ts, dtype=np.int64),
