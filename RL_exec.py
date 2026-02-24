@@ -331,7 +331,7 @@ def _resolve_horizon_index(
     )
 
 
-def _split_weeks(split: dict) -> list[str]:
+def _split_weeks(split: Dict[str, Any]) -> list[str]:
     weeks = split.get("weeks")
     if weeks:
         return list(weeks)
@@ -385,7 +385,7 @@ def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray,
     return x_core_all[order], x_aux_all[order], y_all[order], ts_all[order]
 
 
-def resolve_test_split(out_root: str, meta: dict) -> Dict[str, int]:
+def resolve_test_split(out_root: str, meta: dict) -> Dict[str, Any]:
     splits = meta.get("splits", {})
     test_range = splits.get("test_ts_range")
     holdout_week = splits.get("holdout_week")
@@ -667,7 +667,7 @@ def _sanitize_snapshot_features(df_or_array: Any) -> Any:
 def load_raw_snapshot_features(
     out_root: str,
     *,
-    split: Optional[Dict[str, int]] = None,
+    split: Optional[Dict[str, Any]] = None,
     meta: Optional[dict] = None,
 ) -> pd.DataFrame:
     if not RAW_SNAPSHOT_PATHS:
@@ -952,7 +952,7 @@ def join_features(
 
 def build_joined_split(
     out_root: str,
-    split: Dict[str, int],
+    split: Dict[str, Any],
     model,
     meta: dict,
     device: str,
