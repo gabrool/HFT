@@ -432,23 +432,50 @@ def train_from_offline():
     if not week_meta_paths:
         raise RuntimeError("No week meta files were found under OUT_ROOT")
 
+    splits = meta.get("splits") or {}
     weeks_meta_map = meta.get("weeks_meta", {})
     weeks_order = meta.get("weeks", [])
 
-    splits = meta.get("splits") or {}
-    if splits and weeks_meta_map and weeks_order:
-        # map week key -> meta_week.json Path
-        key_to_meta = {wk: out_root / weeks_meta_map[wk] for wk in weeks_order if wk in weeks_meta_map}
+    def split_range_if_present(key: str) -> Optional[Tuple[int, int]]:
+        try:
+            return _range_from_splits(splits, key)
+        except (KeyError, TypeError, ValueError):
+            return None
 
-        def keys_to_paths(keys):
-            return [key_to_meta[k] for k in keys if k in key_to_meta]
+    split_ranges = {
+        "train": split_range_if_present("train_ts_range"),
+        "val": split_range_if_present("val_ts_range"),
+        "test": split_range_if_present("test_ts_range"),
+    }
 
+    have_split_week_keys = all(isinstance(splits.get(k), list) for k in ("train", "val", "test"))
+    have_split_ranges = all(split_ranges[k] is not None for k in ("train", "val", "test"))
+
+    key_to_meta: Dict[str, Path] = {}
+    if weeks_meta_map and weeks_order:
+        key_to_meta = {
+            wk: out_root / weeks_meta_map[wk]
+            for wk in weeks_order
+            if wk in weeks_meta_map
+        }
+
+    def keys_to_paths(keys: List[str]) -> List[Path]:
+        return [key_to_meta[k] for k in keys if k in key_to_meta]
+
+    has_complete_split_metadata = (
+        have_split_week_keys
+        and have_split_ranges
+        and bool(key_to_meta)
+    )
+
+    if has_complete_split_metadata:
         tr_weeks = keys_to_paths(splits.get("train", []))
         va_weeks = keys_to_paths(splits.get("val", []))
         te_weeks = keys_to_paths(splits.get("test", []))
 
-        # Simple sanity: if nothing was resolved, fall back to heuristic
-        if not (tr_weeks or va_weeks or te_weeks):
+        if not (tr_weeks and va_weeks and te_weeks):
+            print("[split-meta] incomplete week-key mapping; falling back to choose_splits() without ts slicing")
+            has_complete_split_metadata = False
             tr_weeks, va_weeks, te_weeks = choose_splits(week_meta_paths)
     else:
         tr_weeks, va_weeks, te_weeks = choose_splits(week_meta_paths)
@@ -472,19 +499,10 @@ def train_from_offline():
 
     # ---- build datasets or fully load ----
     if USE_IN_MEMORY:
-        weeks_order = meta.get("weeks", [])
-        splits = meta.get("splits") or {}
-        special_two_week = False
-
-        have_ts_ranges = all(
-            isinstance(splits.get(k), dict) and "min" in splits.get(k, {}) and "max" in splits.get(k, {})
-            for k in ("train_ts_range", "val_ts_range", "test_ts_range")
-        )
-
-        if have_ts_ranges:
-            tr_start, tr_end = _range_from_splits(splits, "train_ts_range")
-            va_start, va_end = _range_from_splits(splits, "val_ts_range")
-            te_start, te_end = _range_from_splits(splits, "test_ts_range")
+        if has_complete_split_metadata:
+            tr_start, tr_end = split_ranges["train"]
+            va_start, va_end = split_ranges["val"]
+            te_start, te_end = split_ranges["test"]
 
             X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
             X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
@@ -495,41 +513,10 @@ def train_from_offline():
                 f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
             )
         else:
-            if len(weeks_order) == 2 and splits:
-                wk1, wk2 = weeks_order
-                tr_keys = splits.get("train", [])
-                va_keys = splits.get("val", [])
-                te_keys = splits.get("test", [])
-                if tr_keys == [wk1] and va_keys == [wk2] and te_keys == [wk2]:
-                    special_two_week = True
-
-            if special_two_week:
-                weeks_meta_map = meta["weeks_meta"]
-                wk1_meta = out_root / weeks_meta_map[weeks_order[0]]
-                wk2_meta = out_root / weeks_meta_map[weeks_order[1]]
-
-                X_tr, y_tr, feat_dim1 = load_split_in_memory([wk1_meta])
-
-                X_w2, y_w2, feat_dim2 = load_split_in_memory([wk2_meta])
-                assert feat_dim1 == feat_dim2 == F_total, "feat dim mismatch between week 1 and week 2"
-
-                N2 = X_w2.shape[0]
-                mid = N2 // 2  # first half val, second half test
-
-                X_va, y_va = X_w2[:mid],  y_w2[:mid]
-                X_te, y_te = X_w2[mid:], y_w2[mid:]
-
-                print(
-                f"[offline-split] weeks={weeks_order} -> "
-                f"train={weeks_order[0]} N={len(y_tr)}, "
-                f"val=first_half({weeks_order[1]}) N={len(y_va)}, "
-                f"test=second_half({weeks_order[1]}) N={len(y_te)}"
-            )
-            else:
-                X_tr, y_tr, feat_dim1 = load_split_in_memory(tr_weeks)
-                X_va, y_va, feat_dim2 = load_split_in_memory(va_weeks)
-                X_te, y_te, feat_dim3 = load_split_in_memory(te_weeks)
-                assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
+            X_tr, y_tr, feat_dim1 = load_split_in_memory(tr_weeks)
+            X_va, y_va, feat_dim2 = load_split_in_memory(va_weeks)
+            X_te, y_te, feat_dim3 = load_split_in_memory(te_weeks)
+            assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
 
         # Build in-RAM datasets
         ds_train = HFTDataset(X_tr, y_tr)
@@ -543,32 +530,26 @@ def train_from_offline():
         y_train_for_quant = y_tr
 
     else:
-        splits = meta.get("splits") or {}
-        have_ts_ranges = all(
-            isinstance(splits.get(k), dict) and "min" in splits.get(k, {}) and "max" in splits.get(k, {})
-            for k in ("train_ts_range", "val_ts_range", "test_ts_range")
-        )
-
         def refs_for_weeks(weeks: List[Path]) -> List[ChunkRef]:
             refs: List[ChunkRef] = []
             for wp in weeks:
                 refs.extend(build_chunk_refs(wp))
             return refs
 
-        if have_ts_ranges:
-            tr_start, tr_end = _range_from_splits(splits, "train_ts_range")
-            va_start, va_end = _range_from_splits(splits, "val_ts_range")
-            te_start, te_end = _range_from_splits(splits, "test_ts_range")
+        def refs_for_weeks_timerange(weeks: List[Path], start: int, end: int) -> List[ChunkRef]:
+            refs: List[ChunkRef] = []
+            for wp in weeks:
+                refs.extend(build_chunk_refs_by_ts(wp, start, end))
+            return refs
 
-            tr_refs: List[ChunkRef] = []
-            va_refs: List[ChunkRef] = []
-            te_refs: List[ChunkRef] = []
-            for wp in tr_weeks:
-                tr_refs.extend(build_chunk_refs_by_ts(wp, tr_start, tr_end))
-            for wp in va_weeks:
-                va_refs.extend(build_chunk_refs_by_ts(wp, va_start, va_end))
-            for wp in te_weeks:
-                te_refs.extend(build_chunk_refs_by_ts(wp, te_start, te_end))
+        if has_complete_split_metadata:
+            tr_start, tr_end = split_ranges["train"]
+            va_start, va_end = split_ranges["val"]
+            te_start, te_end = split_ranges["test"]
+
+            tr_refs = refs_for_weeks_timerange(tr_weeks, tr_start, tr_end)
+            va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
+            te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
             print(
                 f"[offline-split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
                 f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
