@@ -633,12 +633,16 @@ def _ensure_monotonic(ts: np.ndarray, label: str) -> None:
 
 def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
     test_split = resolve_test_split(out_root, meta)
+    split_weeks = _split_weeks(test_split)
+    if not split_weeks:
+        raise ValueError("Test split contains no weeks.")
+    split_weeks_label = ",".join(split_weeks)
     start_ms = int(test_split["start"])
     end_ms = int(test_split["end"])
     duration_ms = end_ms - start_ms
     print(
         "[cmssl split:test]",
-        f"week={test_split['week']}",
+        f"weeks={split_weeks_label}",
         f"start={_format_ts(start_ms)}",
         f"end={_format_ts(end_ms)}",
         f"duration={_format_duration_ms(duration_ms)}",
@@ -651,7 +655,7 @@ def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
     ))
 
     canonical_snapshot_ts_parts: List[np.ndarray] = []
-    for week in _split_weeks(test_split):
+    for week in split_weeks:
         week_snapshot_ts, _snapshots = load_raw_snapshots(out_root, week)
         canonical_snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
     canonical_snapshot_ts = np.concatenate(canonical_snapshot_ts_parts, axis=0)
