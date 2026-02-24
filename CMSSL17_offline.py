@@ -477,7 +477,7 @@ def train_from_offline():
         }
 
     if not key_to_meta:
-        raise KeyError("meta must include non-empty 'weeks' and 'weeks_meta' for split week-key mapping")
+        raise KeyError("meta must include non-empty 'weeks_in_order' and 'weeks_meta' for split week-key mapping")
 
     def keys_to_paths(keys: List[str], split_name: str) -> List[Path]:
         missing = [k for k in keys if k not in key_to_meta]
