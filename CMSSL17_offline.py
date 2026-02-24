@@ -21,7 +21,8 @@ Splits:
   Fallbacks:
   - if meta["splits"] is missing or incomplete, use choose_splits()
   - choose_splits(): if at least 10 weeks are available, use the last 10 with a
-    chronological 6/2/2 split; otherwise use 75%/12.5%/12.5% (rounded)
+    chronological 6 train / 2 val / 2 test split; otherwise approximate
+    75%/12.5%/12.5% using rounding with minimum-1-per-split safeguards
 
 Files layout expected (created by offline_ingest.py):
   OUT_ROOT/
@@ -87,6 +88,15 @@ WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
 def choose_splits(week_meta_paths: List[Path]) -> Tuple[List[Path], List[Path], List[Path]]:
+    """
+    Choose chronological train/val/test week splits.
+
+    Rules:
+    - If at least 10 weeks are available, keep only the most recent 10 and split
+      as 6 train / 2 val / 2 test (chronological).
+    - Otherwise, approximate 75% / 12.5% / 12.5% using rounding, with minimum-1
+      safeguards for each split.
+    """
     weeks = week_meta_paths
     if len(weeks) >= 10:
         weeks = weeks[-10:]
