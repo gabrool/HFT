@@ -957,7 +957,6 @@ def build_joined_split(
     meta: dict,
     device: str,
     batch_size: int = 256,
-    split_label: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     week_outputs: List[Dict[str, np.ndarray]] = []
     for wk in _split_weeks(split):
@@ -2439,7 +2438,6 @@ def run_pipeline(
         model,
         meta,
         device,
-        split_label="test",
     )
 
     num_h = len(meta.get("horizons_ms", []))
