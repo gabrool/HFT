@@ -498,18 +498,18 @@ def _find_week_dir(out_root: Path, week_key: str) -> Path:
     raise ValueError(f"Unable to locate week directory for {week_key}")
 
 
-def _ffill_nan_1d(values: np.ndarray) -> np.ndarray:
-    out = np.asarray(values, dtype=np.float64).copy()
+def _ffill_1d(x: np.ndarray) -> np.ndarray:
+    out = np.asarray(x, dtype=np.float64).copy()
     if out.size == 0:
         return out
-    mask = np.isnan(out)
-    if np.all(mask):
+    finite_mask = np.isfinite(out)
+    if not np.any(finite_mask):
         out[:] = 0.0
         return out
-    idx = np.where(~mask, np.arange(out.size), 0)
+    idx = np.where(finite_mask, np.arange(out.size), 0)
     np.maximum.accumulate(idx, out=idx)
     out = out[idx]
-    out[np.isnan(out)] = 0.0
+    out[~np.isfinite(out)] = 0.0
     return out
 
 
@@ -540,9 +540,9 @@ def _rolling_std_min_periods_one(values: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
-def _sanitize_snapshot_features(df_or_array: Any) -> Any:
+def _sanitize_snapshot_features(arr: np.ndarray) -> np.ndarray:
     target_cols = ["best_bid_size", "best_ask_size", "imbalance", "mid_ret_1", "vol_short", "vol_long", "spread_bps"]
-    arr = np.asarray(df_or_array).copy()
+    arr = np.asarray(arr).copy()
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D snapshot feature array, got shape={arr.shape}.")
     col_idx = {
@@ -553,7 +553,9 @@ def _sanitize_snapshot_features(df_or_array: Any) -> Any:
     for idx in col_idx.values():
         col = arr[:, idx].astype(np.float64, copy=False)
         col[~np.isfinite(col)] = np.nan
-        col = _ffill_nan_1d(col).astype(arr.dtype, copy=False)
+        col = _ffill_1d(col)
+        col[~np.isfinite(col)] = 0.0
+        col = col.astype(arr.dtype, copy=False)
         arr[:, idx] = col
     return arr
 
