@@ -402,6 +402,28 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+
+def coerce_ts_ms(value: Union[int, float, str]) -> int:
+    """Convert a timestamp-like value to integer milliseconds."""
+    if value is None:
+        raise ValueError("Timestamp value is missing (None)")
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            raise ValueError("Timestamp value is missing (empty string)")
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unparseable timestamp value: {value!r}") from exc
+
+    if not math.isfinite(numeric):
+        raise ValueError(f"Unparseable timestamp value: {value!r}")
+
+    return int(numeric * 1000.0) if abs(numeric) < 1e12 else int(numeric)
+
+
 # ---------------------------  Core hyper-params  ---------------------------
 LOOKBACK        = 100        # number of tokens spanning ~10s
 WINDOW_MS       = 10_000     # time-based window span (10s)
@@ -1691,13 +1713,11 @@ class FeatureEngine:
         if isinstance(e, dict):
             # OB event?
             if 'data' in e and 'ts' in e and ('orderbook' in str(e.get('topic','')) or e.get('type') in ('snapshot','delta')):
-                ts_ms = int(e['ts'])
+                ts_ms = coerce_ts_ms(e['ts'])
                 return 'ob', ts_ms, e
             # Trade event?
             if 'timestamp' in e and 'price' in e and 'size' in e and 'side' in e:
-                t_raw = e['timestamp']
-                # Bybit sample shows seconds with fractional; convert to ms
-                ts_ms = int(float(t_raw) * 1000.0)
+                ts_ms = coerce_ts_ms(e['timestamp'])
                 return 'trade', ts_ms, e
 
         raise ValueError(f"Unrecognized event shape: {type(e)} :: {e}")
