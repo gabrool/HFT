@@ -252,6 +252,29 @@ def _assert_week_order(pairs: List[Tuple[str, str, str]]):
                 f"not after '{os.path.basename(prev_ob)}'/'{os.path.basename(prev_th)}' (end={prev_end.date()})"
             )
 
+
+def _assert_weeks_consecutive(pairs: List[Tuple[str, str, str]]):
+    if len(pairs) < 2:
+        return
+
+    parsed = []
+    for wk, _ob_p, _th_p in pairs:
+        start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
+        parsed.append((start_dt, end_dt, wk))
+
+    parsed.sort(key=lambda row: row[1])
+    for idx in range(1, len(parsed)):
+        prev_start, prev_end, prev_wk = parsed[idx - 1]
+        next_start, next_end, next_wk = parsed[idx]
+        expected_next_start = prev_end.date() + timedelta(days=1)
+        if next_start.date() != expected_next_start:
+            relation = "gap" if next_start.date() > expected_next_start else "overlap"
+            raise ValueError(
+                f"Weeks must be consecutive with no gaps/overlaps; detected {relation} between "
+                f"'{prev_wk}' ({prev_start.date()}–{prev_end.date()}) and "
+                f"'{next_wk}' ({next_start.date()}–{next_end.date()})."
+            )
+
 _DEC_THOUSAND = Decimal("1000")
 
 
@@ -287,27 +310,6 @@ def _sort_pairs_by_end(pairs: List[Tuple[str, str, str]]) -> List[Tuple[str, str
         rows.append((end_dt, wk, ob_p, th_p))
     rows.sort()
     return [(wk, ob_p, th_p) for _end, wk, ob_p, th_p in rows]
-
-
-def _assert_two_consecutive_weeks(pairs: List[Tuple[str, str, str]]) -> Tuple[str, str]:
-    if len(pairs) != 2:
-        raise ValueError(f"Expected exactly two weeks after selection; got {len(pairs)}.")
-
-    (wk1, _ob1, _th1), (wk2, _ob2, _th2) = pairs
-    s1, e1, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk1}"))
-    s2, e2, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk2}"))
-
-    if e1 >= e2:
-        raise ValueError(
-            "Weeks must be in chronological order by end date: "
-            f"'{wk1}' ends {e1.date()} >= '{wk2}' ends {e2.date()}"
-        )
-    if s2.date() != (e1.date() + timedelta(days=1)):
-        raise ValueError(
-            "Weeks must be consecutive (no gaps/overlaps): "
-            f"'{wk1}' ({s1.date()}–{e1.date()}) then '{wk2}' ({s2.date()}–{e2.date()})"
-        )
-    return wk1, wk2
 
 
 def _event_ts(event) -> int:
@@ -1242,6 +1244,7 @@ def main():
         )
 
     _assert_week_order(pairs)
+    _assert_weeks_consecutive(pairs)
 
     chosen_weeks = [wk for wk, _ob, _th in pairs]
 
