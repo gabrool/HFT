@@ -959,45 +959,59 @@ def build_joined_split(
     batch_size: int = 256,
     split_label: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
-    x_core, x_aux, y, ts = load_split_arrays(out_root, split)
-    cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
-    if RAW_SNAPSHOT_PATHS:
-        test_split = resolve_test_split(out_root, meta)
-        if split != test_split:
-            raise ValueError(
-                "RAW_SNAPSHOT_PATHS only supports CMSSL test split alignment. "
-                f"Requested split={split} test_split={test_split}"
-            )
-        snapshot_df = load_raw_snapshot_features(out_root, split=split, meta=meta)
-        snapshot_ts = snapshot_df["ts"].to_numpy(dtype=np.int64)
-        snapshots = snapshot_df[RAW_SNAPSHOT_FEATURE_COLUMNS].to_numpy(dtype=np.float32)
-    else:
-        snapshot_ts_parts: List[np.ndarray] = []
-        raw_snapshot_parts: List[np.ndarray] = []
-        for week in _split_weeks(split):
-            week_snapshot_ts, week_raw_snapshots = load_raw_snapshots(out_root, week)
-            snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
-            raw_snapshot_parts.append(np.asarray(week_raw_snapshots))
-        snapshot_ts = np.concatenate(snapshot_ts_parts, axis=0)
-        raw_snapshots = np.concatenate(raw_snapshot_parts, axis=0)
-        snapshot_ts, snapshots = _compute_snapshot_feature_matrix(snapshot_ts, raw_snapshots)
+    week_outputs: List[Dict[str, np.ndarray]] = []
+    for wk in _split_weeks(split):
+        wk_split = {"week": wk, "start": split["start"], "end": split["end"]}
+        try:
+            x_core, x_aux, y, ts = load_split_arrays(out_root, wk_split)
+        except ValueError as exc:
+            if str(exc).startswith("No data found for split"):
+                continue
+            raise
 
-    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-    snapshots = np.asarray(snapshots, dtype=np.float32)
-    # Under exact-match alignment, restrict snapshots to the declared split range
-    # so that any out-of-range decision timestamp fails fast and deterministically.
-    window_start = int(split["start"])
-    window_end = int(split["end"])
-    effective_mask = (snapshot_ts >= window_start) & (snapshot_ts < window_end)
-    if np.any(effective_mask):
-        snapshot_ts = snapshot_ts[effective_mask]
-        snapshots = snapshots[effective_mask]
+        if ts.shape[0] == 0:
+            continue
 
-    snap_idx = align_snapshots_to_decisions(snapshot_ts, ts)
-    assert snapshot_ts[snap_idx].shape == ts.shape
-    assert np.all(snapshot_ts[snap_idx] == ts)
-    aligned_snapshots = snapshots[snap_idx]
-    return join_features(ts, y, cmssl_out, aligned_snapshots, meta)
+        cmssl_out = run_cmssl_inference(
+            model,
+            meta,
+            x_core,
+            x_aux,
+            batch_size=batch_size,
+            device=device,
+        )
+
+        week_snapshot_ts, week_raw_snapshots = load_raw_snapshots(out_root, wk)
+        snapshot_ts, snapshots = _compute_snapshot_feature_matrix(
+            np.asarray(week_snapshot_ts, dtype=np.int64),
+            np.asarray(week_raw_snapshots),
+        )
+        snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+        snapshots = np.asarray(snapshots, dtype=np.float32)
+
+        window_start = int(split["start"])
+        window_end = int(split["end"])
+        effective_mask = (snapshot_ts >= window_start) & (snapshot_ts < window_end)
+        if np.any(effective_mask):
+            snapshot_ts = snapshot_ts[effective_mask]
+            snapshots = snapshots[effective_mask]
+
+        snap_idx = align_snapshots_to_decisions(snapshot_ts, ts)
+        assert snapshot_ts[snap_idx].shape == ts.shape
+        assert np.all(snapshot_ts[snap_idx] == ts)
+        aligned_snapshots = snapshots[snap_idx]
+        week_outputs.append(join_features(ts, y, cmssl_out, aligned_snapshots, meta))
+
+    if not week_outputs:
+        raise ValueError(f"No data found for split {split}")
+
+    return {
+        "ts": np.concatenate([wk["ts"] for wk in week_outputs], axis=0),
+        "features": np.concatenate([wk["features"] for wk in week_outputs], axis=0),
+        "y": np.concatenate([wk["y"] for wk in week_outputs], axis=0),
+        "spread_bps": np.concatenate([wk["spread_bps"] for wk in week_outputs], axis=0),
+        "snapshots": np.vstack([wk["snapshots"] for wk in week_outputs]),
+    }
 
 
 def chronological_split(
