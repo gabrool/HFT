@@ -341,14 +341,21 @@ def _resolve_horizon_index(
     )
 
 
-def load_split_arrays(out_root: str, split: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load CMSSL tensors for a split using canonical per-chunk decision timestamps."""
+def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load CMSSL tensors for a split.
+
+    Args:
+        out_root: Output root containing CMSSL chunk artifacts.
+        split: Split config with either ``week`` (single week key) or ``weeks``
+            (list of week keys), plus ``start``/``end`` timestamp bounds.
+    """
+    weeks = split.get("weeks") or [split["week"]]
     x_core_list: List[np.ndarray] = []
     x_aux_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
     ts_list: List[np.ndarray] = []
     for week, chunk_idx, ts, x_core, x_aux, y in iter_chunk_batches(out_root):
-        if week != split["week"]:
+        if week not in weeks:
             continue
         n_rows = x_core.shape[0]
         if ts is None:
