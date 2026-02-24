@@ -974,6 +974,8 @@ def build_joined_split(
         snapshots = snapshots[effective_mask]
 
     snap_idx = align_snapshots_to_decisions(snapshot_ts, ts)
+    assert snapshot_ts[snap_idx].shape == ts.shape
+    assert np.all(snapshot_ts[snap_idx] == ts)
     aligned_snapshots = snapshots[snap_idx]
     return join_features(ts, y, cmssl_out, aligned_snapshots, meta)
 
