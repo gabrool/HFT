@@ -273,6 +273,58 @@ def load_split_in_memory(split_week_paths: List[Path]) -> Tuple[np.ndarray, np.n
     y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
     return X, y, int(feat_dim)
 
+
+def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Load rows in start <= ts < end across weeks into RAM. Returns X [N, L, F], y [N, 2H], F."""
+    if end < start:
+        raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
+
+    Xs, Ys = [], []
+    feat_dim = None
+    for wp in split_week_paths:
+        wmeta = read_json(wp)
+        F_total = int(wmeta["feature_dim_total"])
+        if feat_dim is None:
+            feat_dim = F_total
+        elif feat_dim != F_total:
+            raise ValueError(f"Feature dim mismatch between weeks: {feat_dim} vs {F_total}")
+
+        week_dir = wp.parent
+        for idx, ch in enumerate(wmeta.get("chunks", [])):
+            files = ch.get("files", {})
+            ts_rel = files.get("ts")
+            if not ts_rel:
+                raise KeyError(
+                    f"Chunk {idx} in {wp} is missing files['ts']; cannot slice by timestamp"
+                )
+
+            ts_arr = np.load(week_dir / ts_rel, mmap_mode="r")
+            if ts_arr.ndim != 1:
+                raise ValueError(
+                    f"Expected 1D ts array in chunk {idx} ({week_dir / ts_rel}), got shape={ts_arr.shape}"
+                )
+
+            l = int(np.searchsorted(ts_arr, start, side="left"))
+            r = int(np.searchsorted(ts_arr, end, side="left"))
+            if r <= l:
+                continue
+
+            Xc = np.load(week_dir / files["core"])
+            Xa = np.load(week_dir / files["aux"])
+            Y = np.load(week_dir / files["y"])
+            Xs.append(np.concatenate([Xc[l:r], Xa[l:r]], axis=-1))
+            Ys.append(Y[l:r])
+
+    if not Xs:
+        return (
+            np.empty((0, LOOKBACK, feat_dim or 0), np.float32),
+            np.empty((0, 2 * NUM_HORIZONS), np.float32),
+            (feat_dim or 0),
+        )
+    X = np.concatenate(Xs, axis=0).astype(np.float32, copy=False)
+    y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
+    return X, y, int(feat_dim)
+
 # ---------------- Directional-mask quantiles from TRAIN set ----------------
 def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     y_ret = y_train[:, :NUM_HORIZONS].astype(np.float32)
@@ -424,41 +476,60 @@ def train_from_offline():
         splits = meta.get("splits") or {}
         special_two_week = False
 
-        if len(weeks_order) == 2 and splits:
-            wk1, wk2 = weeks_order
-            tr_keys = splits.get("train", [])
-            va_keys = splits.get("val", [])
-            te_keys = splits.get("test", [])
-            if tr_keys == [wk1] and va_keys == [wk2] and te_keys == [wk2]:
-                special_two_week = True
-
-        if special_two_week:
-            weeks_meta_map = meta["weeks_meta"]
-            wk1_meta = out_root / weeks_meta_map[weeks_order[0]]
-            wk2_meta = out_root / weeks_meta_map[weeks_order[1]]
-
-            X_tr, y_tr, feat_dim1 = load_split_in_memory([wk1_meta])
-
-            X_w2, y_w2, feat_dim2 = load_split_in_memory([wk2_meta])
-            assert feat_dim1 == feat_dim2 == F_total, "feat dim mismatch between week 1 and week 2"
-
-            N2 = X_w2.shape[0]
-            mid = N2 // 2  # first half val, second half test
-
-            X_va, y_va = X_w2[:mid],  y_w2[:mid]
-            X_te, y_te = X_w2[mid:], y_w2[mid:]
-
-            print(
-            f"[offline-split] weeks={weeks_order} -> "
-            f"train={weeks_order[0]} N={len(y_tr)}, "
-            f"val=first_half({weeks_order[1]}) N={len(y_va)}, "
-            f"test=second_half({weeks_order[1]}) N={len(y_te)}"
+        have_ts_ranges = all(
+            isinstance(splits.get(k), dict) and "min" in splits.get(k, {}) and "max" in splits.get(k, {})
+            for k in ("train_ts_range", "val_ts_range", "test_ts_range")
         )
-        else:
-            X_tr, y_tr, feat_dim1 = load_split_in_memory(tr_weeks)
-            X_va, y_va, feat_dim2 = load_split_in_memory(va_weeks)
-            X_te, y_te, feat_dim3 = load_split_in_memory(te_weeks)
+
+        if have_ts_ranges:
+            tr_start, tr_end = _range_from_splits(splits, "train_ts_range")
+            va_start, va_end = _range_from_splits(splits, "val_ts_range")
+            te_start, te_end = _range_from_splits(splits, "test_ts_range")
+
+            X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
+            X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
+            X_te, y_te, feat_dim3 = load_split_in_memory_ts(te_weeks, te_start, te_end)
             assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
+            print(
+                f"[offline-split-ts] train=[{tr_start},{tr_end}) N={len(y_tr)} "
+                f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
+            )
+        else:
+            if len(weeks_order) == 2 and splits:
+                wk1, wk2 = weeks_order
+                tr_keys = splits.get("train", [])
+                va_keys = splits.get("val", [])
+                te_keys = splits.get("test", [])
+                if tr_keys == [wk1] and va_keys == [wk2] and te_keys == [wk2]:
+                    special_two_week = True
+
+            if special_two_week:
+                weeks_meta_map = meta["weeks_meta"]
+                wk1_meta = out_root / weeks_meta_map[weeks_order[0]]
+                wk2_meta = out_root / weeks_meta_map[weeks_order[1]]
+
+                X_tr, y_tr, feat_dim1 = load_split_in_memory([wk1_meta])
+
+                X_w2, y_w2, feat_dim2 = load_split_in_memory([wk2_meta])
+                assert feat_dim1 == feat_dim2 == F_total, "feat dim mismatch between week 1 and week 2"
+
+                N2 = X_w2.shape[0]
+                mid = N2 // 2  # first half val, second half test
+
+                X_va, y_va = X_w2[:mid],  y_w2[:mid]
+                X_te, y_te = X_w2[mid:], y_w2[mid:]
+
+                print(
+                f"[offline-split] weeks={weeks_order} -> "
+                f"train={weeks_order[0]} N={len(y_tr)}, "
+                f"val=first_half({weeks_order[1]}) N={len(y_va)}, "
+                f"test=second_half({weeks_order[1]}) N={len(y_te)}"
+            )
+            else:
+                X_tr, y_tr, feat_dim1 = load_split_in_memory(tr_weeks)
+                X_va, y_va, feat_dim2 = load_split_in_memory(va_weeks)
+                X_te, y_te, feat_dim3 = load_split_in_memory(te_weeks)
+                assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
 
         # Build in-RAM datasets
         ds_train = HFTDataset(X_tr, y_tr)
@@ -472,15 +543,41 @@ def train_from_offline():
         y_train_for_quant = y_tr
 
     else:
+        splits = meta.get("splits") or {}
+        have_ts_ranges = all(
+            isinstance(splits.get(k), dict) and "min" in splits.get(k, {}) and "max" in splits.get(k, {})
+            for k in ("train_ts_range", "val_ts_range", "test_ts_range")
+        )
+
         def refs_for_weeks(weeks: List[Path]) -> List[ChunkRef]:
             refs: List[ChunkRef] = []
             for wp in weeks:
                 refs.extend(build_chunk_refs(wp))
             return refs
 
-        tr_refs = refs_for_weeks(tr_weeks)
-        va_refs = refs_for_weeks(va_weeks)
-        te_refs = refs_for_weeks(te_weeks)
+        if have_ts_ranges:
+            tr_start, tr_end = _range_from_splits(splits, "train_ts_range")
+            va_start, va_end = _range_from_splits(splits, "val_ts_range")
+            te_start, te_end = _range_from_splits(splits, "test_ts_range")
+
+            tr_refs: List[ChunkRef] = []
+            va_refs: List[ChunkRef] = []
+            te_refs: List[ChunkRef] = []
+            for wp in tr_weeks:
+                tr_refs.extend(build_chunk_refs_by_ts(wp, tr_start, tr_end))
+            for wp in va_weeks:
+                va_refs.extend(build_chunk_refs_by_ts(wp, va_start, va_end))
+            for wp in te_weeks:
+                te_refs.extend(build_chunk_refs_by_ts(wp, te_start, te_end))
+            print(
+                f"[offline-split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
+                f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
+                f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
+            )
+        else:
+            tr_refs = refs_for_weeks(tr_weeks)
+            va_refs = refs_for_weeks(va_weeks)
+            te_refs = refs_for_weeks(te_weeks)
 
         ds_train = NpyChunksDataset(tr_refs, F_total)
         ds_val   = NpyChunksDataset(va_refs, F_total)
