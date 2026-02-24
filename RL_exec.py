@@ -646,16 +646,16 @@ def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
         f"Test split duration {duration_ms}ms not ~3.5 days."
     ))
 
-    snapshot_ts_parts: List[np.ndarray] = []
+    canonical_snapshot_ts_parts: List[np.ndarray] = []
     for week in _split_weeks(test_split):
         week_snapshot_ts, _snapshots = load_raw_snapshots(out_root, week)
-        snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
-    snapshot_ts = np.concatenate(snapshot_ts_parts, axis=0)
-    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-    snapshot_ts = np.sort(snapshot_ts)
-    filtered = snapshot_ts[(snapshot_ts >= start_ms) & (snapshot_ts < end_ms)]
+        canonical_snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
+    canonical_snapshot_ts = np.concatenate(canonical_snapshot_ts_parts, axis=0)
+    canonical_snapshot_ts = np.asarray(canonical_snapshot_ts, dtype=np.int64)
+    canonical_snapshot_ts = np.sort(canonical_snapshot_ts)
+    filtered = canonical_snapshot_ts[(canonical_snapshot_ts >= start_ms) & (canonical_snapshot_ts < end_ms)]
     if filtered.size == 0:
-        raise ValueError("No raw snapshots found inside the CMSSL test split range.")
+        raise ValueError("No canonical raw snapshots found inside the CMSSL test split range.")
     _ensure_monotonic(filtered, "Raw snapshot (filtered)")
     print(
         "[raw snapshots:test]",
