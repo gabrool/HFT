@@ -802,135 +802,40 @@ def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
 
 
 def align_snapshots_to_decisions(
-    decision_ts: np.ndarray,
     snapshot_ts: np.ndarray,
-    snapshots: np.ndarray,
-    label: Optional[str] = None,
-    *,
-    tolerance_ms: int = 50,
-    expected_bounds: Optional[Tuple[int, int]] = None,
-    raw_snapshot_bounds: Optional[Tuple[Optional[int], Optional[int]]] = None,
+    decision_ts: np.ndarray,
 ) -> np.ndarray:
-    """Strict nearest-neighbor snapshot alignment for decision timestamps.
-
-    Returns aligned snapshots for every decision row. Any unmatched decision
-    timestamp (outside `tolerance_ms`) raises immediately.
-    """
+    """Return exact snapshot indices for each decision timestamp."""
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D")
     if decision_ts.ndim != 1:
         raise ValueError("decision_ts must be 1D")
+    if snapshot_ts.size and np.any(np.diff(snapshot_ts) <= 0):
+        raise ValueError("snapshot_ts must be strictly increasing (np.diff(snapshot_ts) > 0)")
     if decision_ts.size and np.any(np.diff(decision_ts) < 0):
-        raise ValueError("decision_ts must be monotonically non-decreasing")
-    order = np.argsort(snapshot_ts)
-    snapshot_ts = snapshot_ts[order]
-    snapshots = snapshots[order]
-    if snapshot_ts.size and np.any(np.diff(snapshot_ts) < 0):
-        raise ValueError("snapshot_ts must be monotonically non-decreasing after sorting")
-    if snapshot_ts.size == 0:
-        match_rate = 0.0
-        raise ValueError(
-            "Snapshot alignment failed; no snapshots available to match decisions. "
-            f"match_rate={match_rate:.6f}"
-        )
-    insert_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
-    right_valid = insert_idx < snapshot_ts.size
-    left_valid = insert_idx > 0
-    left_idx = np.clip(insert_idx - 1, 0, snapshot_ts.size - 1)
-    right_idx = np.clip(insert_idx, 0, snapshot_ts.size - 1)
-    exact = right_valid & (snapshot_ts[right_idx] == decision_ts)
-    left_delta = np.full(decision_ts.shape, np.inf, dtype=np.float64)
-    right_delta = np.full(decision_ts.shape, np.inf, dtype=np.float64)
-    left_delta[left_valid] = np.abs(decision_ts[left_valid] - snapshot_ts[left_idx[left_valid]])
-    right_delta[right_valid] = np.abs(snapshot_ts[right_idx[right_valid]] - decision_ts[right_valid])
-    nearest_idx = np.where(left_delta <= right_delta, left_idx, right_idx)
-    nearest_delta = np.minimum(left_delta, right_delta)
-    nearest_idx = np.where(exact, right_idx, nearest_idx)
-    nearest_delta = np.where(exact, 0, nearest_delta)
-    matched = nearest_delta <= tolerance_ms
-    match_rate = float(np.mean(matched)) if matched.size else 0.0
-    exact_rate = float(np.mean(exact)) if exact.size else 0.0
-    matched_decision_ts = decision_ts[matched]
-    matched_snapshot_ts = snapshot_ts[nearest_idx[matched]] if np.any(matched) else np.array([], dtype=np.int64)
-    if matched.size and not np.all(matched):
-        mismatch_idx = np.flatnonzero(~matched)
-        sample_count = min(5, mismatch_idx.size)
-        samples = [int(decision_ts[i]) for i in mismatch_idx[:sample_count]]
-        raise ValueError(
-            "Snapshot alignment failed; decisions outside tolerance. "
-            f"unmatched={mismatch_idx.size} total={decision_ts.size} "
-            f"match_rate={match_rate:.6f} tolerance_ms={tolerance_ms} "
-            f"samples={samples}"
-        )
-    aligned = snapshots[nearest_idx].astype(np.float32) if decision_ts.size else snapshots[:0].astype(np.float32)
+        raise ValueError("decision_ts must be monotonically non-decreasing (np.diff(decision_ts) >= 0)")
 
-    def _median_dt(ts: np.ndarray) -> float:
-        if ts.size < 2:
-            return float("nan")
-        return float(np.median(np.diff(ts)))
-
-    decision_median_dt = _median_dt(matched_decision_ts)
-    snapshot_median_dt = _median_dt(matched_snapshot_ts)
-    effective_bound_first = int(snapshot_ts[0]) if snapshot_ts.size else None
-    effective_bound_last = int(snapshot_ts[-1]) if snapshot_ts.size else None
-    if raw_snapshot_bounds is None:
-        raw_bound_first = effective_bound_first
-        raw_bound_last = effective_bound_last
-    else:
-        raw_bound_first, raw_bound_last = raw_snapshot_bounds
-    if matched_decision_ts.size:
-        decision_first = int(matched_decision_ts[0])
-        decision_last = int(matched_decision_ts[-1])
-        snapshot_first = int(matched_snapshot_ts[0])
-        snapshot_last = int(matched_snapshot_ts[-1])
-    else:
-        decision_first = decision_last = snapshot_first = snapshot_last = None
-    if matched_decision_ts.size:
-        require(
-            snapshot_first is not None and snapshot_last is not None,
-            "Matched snapshot bounds are unexpectedly missing during strict alignment.",
-            RuntimeError,
-        )
-        if expected_bounds is None:
-            expected_first = snapshot_first
-            expected_last = snapshot_last
+    index = {int(t): i for i, t in enumerate(snapshot_ts)}
+    aligned_idx = np.empty(decision_ts.shape[0], dtype=np.int64)
+    missing: List[int] = []
+    for i, ts_i in enumerate(decision_ts):
+        idx = index.get(int(ts_i))
+        if idx is None:
+            missing.append(int(ts_i))
+            aligned_idx[i] = -1
         else:
-            expected_first, expected_last = expected_bounds
-        require(
-            abs(decision_first - expected_first) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS,
-            "First matched decision timestamp is too far from alignment start bound; "
-            f"decision_first={decision_first} expected_bound_first={expected_first} "
-            f"delta_ms={abs(decision_first - expected_first)} "
-            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}",
+            aligned_idx[i] = int(idx)
+
+    if missing:
+        sample_count = min(5, len(missing))
+        raise ValueError(
+            "Snapshot alignment failed; exact timestamp matches missing. "
+            f"missing={len(missing)} total={decision_ts.size} "
+            f"samples={missing[:sample_count]}. "
+            "Run offline_snapshots.py and ensure decision_policy=ob_only; "
+            "timestamps must land on snapshot grid"
         )
-        require(
-            abs(decision_last - expected_last) <= SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS,
-            "Last matched decision timestamp is too far from alignment end bound; "
-            f"decision_last={decision_last} expected_bound_last={expected_last} "
-            f"delta_ms={abs(decision_last - expected_last)} "
-            f"tolerance_ms={SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS}",
-        )
-    if label:
-        print(
-            "[snapshot alignment]",
-            f"split={label}",
-            f"match_rate={match_rate:.6f}",
-            f"exact_rate={exact_rate:.6f}",
-            f"tolerance_ms={tolerance_ms}",
-            f"decision_first={_format_ts(decision_first) if decision_first is not None else 'n/a'}",
-            f"decision_last={_format_ts(decision_last) if decision_last is not None else 'n/a'}",
-            f"snapshot_first={_format_ts(snapshot_first) if snapshot_first is not None else 'n/a'}",
-            f"snapshot_last={_format_ts(snapshot_last) if snapshot_last is not None else 'n/a'}",
-            f"raw_week_bounds_first={_format_ts(raw_bound_first) if raw_bound_first is not None else 'n/a'}",
-            f"raw_week_bounds_last={_format_ts(raw_bound_last) if raw_bound_last is not None else 'n/a'}",
-            f"effective_alignment_bounds_first={_format_ts(effective_bound_first) if effective_bound_first is not None else 'n/a'}",
-            f"effective_alignment_bounds_last={_format_ts(effective_bound_last) if effective_bound_last is not None else 'n/a'}",
-            f"expected_bounds_first={_format_ts(expected_bounds[0]) if expected_bounds is not None else 'n/a'}",
-            f"expected_bounds_last={_format_ts(expected_bounds[1]) if expected_bounds is not None else 'n/a'}",
-            f"decision_median_dt_ms={decision_median_dt:.2f}",
-            f"snapshot_median_dt_ms={snapshot_median_dt:.2f}",
-        )
-    return aligned
+    return aligned_idx
 
 
 def _resolve_horizon_indices(meta: dict, targets: Iterable[int]) -> Dict[int, int]:
@@ -1062,10 +967,6 @@ def build_joined_split(
 
     snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
     snapshots = np.asarray(snapshots, dtype=np.float32)
-    raw_snapshot_bounds = (
-        int(snapshot_ts.min()) if snapshot_ts.size else None,
-        int(snapshot_ts.max()) if snapshot_ts.size else None,
-    )
     align_window_margin_ms = max(SNAPSHOT_ALIGN_BOUNDS_TOLERANCE_MS, 1000)
     window_start = int(split["start"]) - align_window_margin_ms
     window_end = int(split["end"]) + align_window_margin_ms
@@ -1074,14 +975,8 @@ def build_joined_split(
         snapshot_ts = snapshot_ts[effective_mask]
         snapshots = snapshots[effective_mask]
 
-    aligned_snapshots = align_snapshots_to_decisions(
-        ts,
-        snapshot_ts,
-        snapshots,
-        label=split_label,
-        expected_bounds=(int(split["start"]), int(split["end"])),
-        raw_snapshot_bounds=raw_snapshot_bounds,
-    )
+    aligned_idx = align_snapshots_to_decisions(snapshot_ts, ts)
+    aligned_snapshots = snapshots[aligned_idx]
     return join_features(ts, y, cmssl_out, aligned_snapshots, meta)
 
 
