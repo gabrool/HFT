@@ -260,50 +260,23 @@ def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], 
     Decide which weeks belong to train/val/test.
 
     Required behaviour:
-      - Exactly 2 consecutive weeks are required.
-      - The earlier week is TRAIN.
-      - The later week is split half/half by time into VAL/TEST.
+      - At least 2 weeks are required.
+      - All but the most recent week are TRAIN.
+      - The most recent week is split half/half by time into VAL/TEST.
         (The half/half split is enforced later using timestamps.)
     """
     weeks = [wk for wk, _ob, _th in pairs]
     n = len(weeks)
 
-    if n != 2:
+    if n < 2:
         raise ValueError(
-            f"classify_week_splits requires exactly two weeks; got {n}."
+            f"classify_week_splits requires at least two weeks; got {n}."
         )
 
-    wk1, wk2 = weeks
-
-    # Parse their date ranges
-    s1, e1, _ = _parse_week_key_any(
-        _normalise_ob_prefix(f"BTCUSDT_OB_{wk1}")
-    )
-    s2, e2, _ = _parse_week_key_any(
-        _normalise_ob_prefix(f"BTCUSDT_OB_{wk2}")
-    )
-
-    # Ensure chronological order by end date
-    if e1 >= e2:
-        raise ValueError(
-            "classify_week_splits expects the first week to end "
-            f"before the second week: got '{wk1}' (end {e1.date()}) "
-            f"and '{wk2}' (end {e2.date()})"
-        )
-
-    # Check that they are consecutive weeks:
-    # second week must start the day after the first ends
-    if s2.date() != (e1.date() + timedelta(days=1)):
-        raise ValueError(
-            "classify_week_splits expects a pair of consecutive weeks; "
-            f"got '{wk1}' ({s1.date()}–{e1.date()}) and "
-            f"'{wk2}' ({s2.date()}–{e2.date()})"
-        )
-
-    # First week = train; second week = val + test
-    train_weeks = [wk1]
-    val_weeks = [wk2]
-    test_weeks = [wk2]
+    train_weeks = weeks[:-1]
+    holdout_week = weeks[-1]
+    val_weeks = [holdout_week]
+    test_weeks = [holdout_week]
     return train_weeks, val_weeks, test_weeks
 
 
@@ -1267,11 +1240,8 @@ def main():
         raise ValueError(
             f"Need at least two weeks of data after selection; found {len(pairs)}."
         )
-    if len(pairs) > 2:
-        pairs = pairs[-2:]
 
     _assert_week_order(pairs)
-    _assert_two_consecutive_weeks(pairs)
 
     chosen_weeks = [wk for wk, _ob, _th in pairs]
 
