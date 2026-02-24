@@ -88,6 +88,76 @@ def _range_from_splits(splits: dict, key: str) -> tuple[int, int]:
     return int(bounds["min"]), int(bounds["max"])
 
 
+def require_complete_splits(meta: dict) -> dict:
+    splits = meta.get("splits")
+    if not isinstance(splits, dict):
+        raise KeyError(
+            "meta.json missing required key 'splits'. Run offline_ingest to generate offline dataset metadata."
+        )
+
+    weeks_in_order = meta.get("weeks_in_order")
+    if not isinstance(weeks_in_order, list) or not weeks_in_order:
+        raise KeyError("meta.json missing required non-empty key 'weeks_in_order'. Rerun offline_ingest.")
+
+    required_keys = {
+        "train", "val", "test", "holdout_week",
+        "train_ts_range", "val_ts_range", "test_ts_range",
+    }
+    if not required_keys.issubset(splits):
+        raise KeyError("meta['splits'] missing train/val/test/holdout_week or *_ts_range. Rerun offline_ingest.")
+
+    for key in ("train", "val", "test"):
+        vals = splits.get(key)
+        if not isinstance(vals, list) or not vals or not all(isinstance(w, str) and w for w in vals):
+            raise KeyError(f"meta['splits']['{key}'] must be a non-empty list[str]. Rerun offline_ingest.")
+
+    holdout_week = splits.get("holdout_week")
+    if not isinstance(holdout_week, str) or not holdout_week:
+        raise KeyError("meta['splits']['holdout_week'] must be a non-empty string. Rerun offline_ingest.")
+
+    def _parse_half_open_range(name: str) -> tuple[int, int]:
+        bounds = splits.get(name)
+        if not isinstance(bounds, dict) or "min" not in bounds or "max" not in bounds:
+            raise KeyError(f"meta['splits']['{name}'] must be a dict with integer-like min/max. Rerun offline_ingest.")
+        try:
+            lo = int(bounds["min"])
+            hi = int(bounds["max"])
+        except (TypeError, ValueError):
+            raise KeyError(f"meta['splits']['{name}'] min/max must be integer-like. Rerun offline_ingest.")
+        if lo >= hi:
+            raise ValueError(f"meta['splits']['{name}'] must satisfy min < max (half-open [min,max)).")
+        return lo, hi
+
+    tr_lo, tr_hi = _parse_half_open_range("train_ts_range")
+    va_lo, va_hi = _parse_half_open_range("val_ts_range")
+    te_lo, te_hi = _parse_half_open_range("test_ts_range")
+
+    if max(va_lo, te_lo) < min(va_hi, te_hi):
+        raise ValueError("meta['splits'] val_ts_range and test_ts_range must not overlap.")
+
+    if holdout_week not in splits["val"] or holdout_week not in splits["test"]:
+        raise ValueError("meta['splits']['holdout_week'] must be included in both val and test week lists.")
+
+    known_weeks = set(weeks_in_order)
+    all_refs = set(splits["train"]) | set(splits["val"]) | set(splits["test"]) | {holdout_week}
+    missing_weeks = sorted(w for w in all_refs if w not in known_weeks)
+    if missing_weeks:
+        raise KeyError(f"meta['splits'] references week(s) not present in meta['weeks_in_order']: {missing_weeks}")
+
+    if holdout_week != weeks_in_order[-1]:
+        raise ValueError("meta['splits']['holdout_week'] must equal weeks_in_order[-1].")
+
+    return {
+        "splits": splits,
+        "weeks_in_order": weeks_in_order,
+        "split_ranges": {
+            "train": (tr_lo, tr_hi),
+            "val": (va_lo, va_hi),
+            "test": (te_lo, te_hi),
+        },
+    }
+
+
 def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[ChunkRef]:
     """
     Build ChunkRefs for rows whose timestamps satisfy start <= ts < end.
@@ -415,15 +485,11 @@ def train_from_offline():
     if not week_meta_paths:
         raise RuntimeError("No week meta files were found under OUT_ROOT")
 
-    splits = meta.get("splits") or {}
+    validated_splits = require_complete_splits(meta)
+    splits = validated_splits["splits"]
+    weeks_order = validated_splits["weeks_in_order"]
+    split_ranges = validated_splits["split_ranges"]
     weeks_meta_map = meta.get("weeks_meta", {})
-    weeks_order = meta.get("weeks", [])
-
-    split_ranges = {
-        "train": _range_from_splits(splits, "train_ts_range"),
-        "val": _range_from_splits(splits, "val_ts_range"),
-        "test": _range_from_splits(splits, "test_ts_range"),
-    }
 
     key_to_meta: Dict[str, Path] = {}
     if weeks_meta_map and weeks_order:
@@ -433,8 +499,6 @@ def train_from_offline():
             if wk in weeks_meta_map
         }
 
-    if not all(isinstance(splits.get(k), list) for k in ("train", "val", "test")):
-        raise KeyError("meta['splits'] must include list-valued 'train', 'val', and 'test' week keys")
     if not key_to_meta:
         raise KeyError("meta must include non-empty 'weeks' and 'weeks_meta' for split week-key mapping")
 
