@@ -111,6 +111,56 @@ def _range_from_splits(splits: dict, key: str) -> tuple[int, int]:
         )
     return int(bounds["min"]), int(bounds["max"])
 
+
+def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[ChunkRef]:
+    """
+    Build ChunkRefs for rows whose timestamps satisfy start <= ts < end.
+
+    The function performs contiguous slicing per chunk via searchsorted on each
+    chunk's ts file and avoids materializing full boolean masks / index lists.
+    """
+    if end < start:
+        raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
+
+    wmeta = read_json(meta_week_path)
+    week_dir = meta_week_path.parent
+    refs: List[ChunkRef] = []
+
+    for idx, ch in enumerate(wmeta.get("chunks", [])):
+        files = ch.get("files", {})
+        ts_rel = files.get("ts")
+        if not ts_rel:
+            raise KeyError(
+                f"Chunk {idx} in {meta_week_path} is missing files['ts']; cannot slice by timestamp"
+            )
+
+        ts_arr = np.load(week_dir / ts_rel, mmap_mode="r")
+        if ts_arr.ndim != 1:
+            raise ValueError(
+                f"Expected 1D ts array in chunk {idx} ({week_dir / ts_rel}), got shape={ts_arr.shape}"
+            )
+
+        # Safety check: searchsorted semantics require non-decreasing input.
+        if ts_arr.size > 1 and not np.all(ts_arr[1:] >= ts_arr[:-1]):
+            raise ValueError(
+                f"Timestamp file is not non-decreasing for chunk {idx}: {week_dir / ts_rel}"
+            )
+
+        l = int(np.searchsorted(ts_arr, start, side="left"))
+        r = int(np.searchsorted(ts_arr, end, side="left"))
+
+        if r > l:
+            refs.append(ChunkRef(
+                week_dir=week_dir,
+                core_file=week_dir / files["core"],
+                aux_file=week_dir / files["aux"],
+                y_file=week_dir / files["y"],
+                n=r - l,
+                offset=l,
+            ))
+
+    return refs
+
 # ---------------- Dataset (streaming from .npy chunks) ----------------
 class NpyChunksDataset(Dataset):
     def __init__(self, chunk_refs: List[ChunkRef], feature_dim_total: int):
