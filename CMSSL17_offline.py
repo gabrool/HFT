@@ -36,7 +36,7 @@ Files layout expected (created by offline_ingest.py):
 This script attempts to *import* model and utils from CMSSL17.py to avoid duplication.
 """
 
-import os, sys, json, math, gc, glob, re
+import os, sys, math
 from typing import List, Dict, Tuple, Iterable, Optional
 from pathlib import Path
 import numpy as np
@@ -51,7 +51,6 @@ from offline_tokens import (
     resolve_week_meta_paths,
     ChunkRef,
     build_chunk_refs,
-    slice_week_chunks,
 )
 
 # ---------------- Import from CMSSL17 ----------------
@@ -68,7 +67,7 @@ from CMSSL17 import (  # type: ignore
     # schedules / deltas / lambdas
     SSL_PRETRAIN_EPOCHS, MASK_PRETRAIN, MASK_FINETUNE, DIR_MASK_TAIL_FRACTION,
     DELTA_RET, DELTA_LOGVOL,
-    EMA_DECAY, LAMBDA_BCE, LAMBDA_RET_MASKED, LAMBDA_VOL_MASKED,
+    LAMBDA_BCE, LAMBDA_RET_MASKED, LAMBDA_VOL_MASKED,
     LAMBDA_RECON_FT, LAMBDA_CPC_FT, LAMBDA_RECON_PT, LAMBDA_CPC_PT,
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC_HORIZON_MS,
