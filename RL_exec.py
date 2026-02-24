@@ -1349,7 +1349,11 @@ class MarketMakingEnv:
         )
         # Fill-notional `last_*` fields capture the last non-zero fill aggregates.
         # At reset, `time_since_last_fill` starts at a sentinel for "no prior fill"
-        # (scaled value ~1.0); a real fill sets it to 0.0 and no-fill steps increment it.
+        # (scaled value ~1.0). A real fill sets it to 0.0. On no-fill steps, it is
+        # incremented by (decision_ts[next_idx] - decision_ts[idx]) / RAW_SNAPSHOT_EXPECTED_STEP_MS,
+        # i.e., accumulated in RAW_SNAPSHOT_EXPECTED_STEP_MS-equivalent units rather
+        # than fixed "1 snapshot == 1 step" units. Under jitter this keeps intent
+        # explicit: ~100ms gaps contribute ~1.0, ~300ms gaps contribute ~3.0.
         # `last_*` values persist on no-fill steps.
         extra = np.array(
             [
