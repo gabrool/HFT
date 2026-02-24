@@ -695,19 +695,15 @@ def _compute_snapshot_feature_matrix(
     snapshots = np.asarray(snapshots)
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D.")
-    if snapshots.ndim != 2 or snapshots.shape[1] < 2:
-        raise ValueError(f"Snapshots must be 2D with >=2 columns, got {snapshots.shape}.")
+    if snapshots.ndim != 2 or snapshots.shape[1] < 4:
+        raise ValueError(f"Snapshots must be 2D with >=4 columns, got {snapshots.shape}.")
     order = np.argsort(snapshot_ts)
     snapshot_ts = snapshot_ts[order]
     snapshots = snapshots[order]
     best_bid = snapshots[:, 0].astype(np.float64)
     best_ask = snapshots[:, 1].astype(np.float64)
-    if snapshots.shape[1] >= 4:
-        best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
-        best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
-    else:
-        best_bid_size = np.zeros_like(best_bid)
-        best_ask_size = np.zeros_like(best_ask)
+    best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
+    best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
     mid = (best_bid + best_ask) / 2.0
     eps = 1e-9
     imbalance = (best_bid_size - best_ask_size) / (best_bid_size + best_ask_size + eps)
@@ -735,7 +731,13 @@ def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.nda
             f"Expected canonical snapshots at {out_root}/{week_key}/snapshots.npz "
             "with fields ts and snapshots. Generate them with offline_snapshots.py."
         )
-    return data["ts"], data["snapshots"]
+    snapshots = data["snapshots"]
+    if snapshots.ndim != 2 or snapshots.shape[1] < 4:
+        raise ValueError(
+            f"{canonical_path} has snapshots shape {snapshots.shape}; expected [N,4] (bid, ask, bid_size, ask_size). "
+            "Re-run offline_snapshots (1).py to regenerate."
+        )
+    return data["ts"], snapshots[:, :4]
 
 
 def _format_ts(ts_ms: int) -> str:
