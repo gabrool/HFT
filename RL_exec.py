@@ -996,6 +996,9 @@ def build_joined_split(
             snapshot_ts = snapshot_ts[effective_mask]
             snapshots = snapshots[effective_mask]
 
+        # Perform exact-match decision/snapshot alignment week-by-week so split
+        # boundaries follow the authoritative `weeks` ordering without cross-week
+        # ambiguity at week edges.
         snap_idx = align_snapshots_to_decisions(snapshot_ts, ts)
         assert snapshot_ts[snap_idx].shape == ts.shape
         assert np.all(snapshot_ts[snap_idx] == ts)
@@ -1005,13 +1008,35 @@ def build_joined_split(
     if not week_outputs:
         raise ValueError(f"No data found for split {split}")
 
-    return {
+    out = {
         "ts": np.concatenate([wk["ts"] for wk in week_outputs], axis=0),
         "features": np.concatenate([wk["features"] for wk in week_outputs], axis=0),
         "y": np.concatenate([wk["y"] for wk in week_outputs], axis=0),
         "spread_bps": np.concatenate([wk["spread_bps"] for wk in week_outputs], axis=0),
         "snapshots": np.vstack([wk["snapshots"] for wk in week_outputs]),
     }
+
+    expected_rows = out["ts"].shape[0]
+    for key, value in out.items():
+        if value.shape[0] != expected_rows:
+            raise ValueError(
+                "build_joined_split row-count mismatch after weekly concatenation: "
+                f"ts_rows={expected_rows} {key}_rows={value.shape[0]}"
+            )
+
+    ts_all = out["ts"]
+    ts_diff = np.diff(ts_all)
+    bad_idx = np.where(ts_diff <= 0)[0]
+    if bad_idx.size > 0:
+        first_bad = int(bad_idx[0])
+        raise ValueError(
+            "build_joined_split requires strictly increasing concatenated timestamps "
+            "(weeks order is preserved; outputs are not resorted). "
+            f"first_bad_index={first_bad} ts_prev={int(ts_all[first_bad])} "
+            f"ts_next={int(ts_all[first_bad + 1])} diff={int(ts_diff[first_bad])}"
+        )
+
+    return out
 
 
 def chronological_split(
