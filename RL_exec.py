@@ -696,7 +696,7 @@ def _compute_snapshot_feature_matrix(
     if snapshot_ts.ndim != 1:
         raise ValueError("snapshot_ts must be 1D.")
     if snapshots.ndim != 2 or snapshots.shape[1] < 4:
-        raise ValueError(f"Snapshots must be 2D with >=4 columns, got {snapshots.shape}.")
+        raise ValueError("Snapshots must be [N,4] with bid/ask and sizes. Rebuild snapshots.")
     order = np.argsort(snapshot_ts)
     snapshot_ts = snapshot_ts[order]
     snapshots = snapshots[order]
