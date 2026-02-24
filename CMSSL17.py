@@ -1172,13 +1172,22 @@ class BybitRawIter:
         self.th_zip = th_zip
 
     def ob_iter(self):
-        # OB is line-delimited JSON
+        # OB is line-delimited JSON.
+        # Missing/invalid timestamps are hard errors to preserve monotonicity guarantees.
         with _open_text(self.ob_zip) as f:
             for line in f:
                 if not line:
                     continue
                 obj = json.loads(line)
-                ts = int(obj.get("ts", obj.get("cts", 0)))
+                ts_raw = obj.get("ts") or obj.get("cts")
+                if ts_raw is None or (isinstance(ts_raw, str) and not ts_raw.strip()):
+                    raise ValueError(f"Missing OB timestamp in payload: {obj}")
+                try:
+                    ts = coerce_ts_ms(ts_raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid OB timestamp {ts_raw!r} in payload: {obj}"
+                    ) from exc
                 seq = obj["data"].get("seq", 0)
                 yield ts, seq, obj
 
