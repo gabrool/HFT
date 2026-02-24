@@ -1693,8 +1693,11 @@ class FeatureEngine:
         Accepts multiple event shapes:
         - Tuple ('ob'|'trade', data:dict, ts_ms:int)
         - Tuple ('ob'|'trade', ts_ms:int, seq:int, data:dict)
-        - Dict-like OB: {'type': 'snapshot'|'delta', 'data': {...}, 'ts': int, ...}
+        - Dict-like OB: recognized by orderbook shape (`b`/`a` arrays), not topic/type strings.
+          Timestamp can be provided via `ts` or `cts`, either on the top-level event dict
+          or inside `data`.
         - Dict-like trade: {'timestamp': float|str, 'price': str|float, 'size': str|float, 'side': 'Buy'|'Sell'|'buy'|'sell', ...}
+        Tuple input behavior is supported and unchanged.
         Returns: (etype, ts_ms, payload)
         etype in {'ob','trade'}
         """
