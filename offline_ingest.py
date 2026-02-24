@@ -46,6 +46,8 @@ WORKERS     = int(os.environ.get("BYBIT_WORKERS", "8"))
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "4096"))
+DECISION_POLICY = "ob_only"
+DECISION_NOMINAL_STEP_MS = 100
 
 
 # import your training utilities
@@ -523,6 +525,8 @@ class WeekWriterRouter:
         rows_total = int(sum(entry["n"] for entry in chunks_meta))
         meta = {
             "week": week_key,
+            "decision_policy": DECISION_POLICY,
+            "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
             "lookback": self.lookback,
             "feature_dim_total": self.feature_dim,
             "feature_dim_core": self.feature_dim - AUX_DIM,
@@ -1150,6 +1154,8 @@ def process_all(
         "dataset_start": start_iso,
         "dataset_end": end_iso,
         "weeks": weeks_in_order,
+        "decision_policy": DECISION_POLICY,
+        "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
