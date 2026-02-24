@@ -1126,44 +1126,46 @@ def process_all(
             })
 
     split_ranges = None
-    if split_info and len(weeks_in_order) == 2:
-        wk1, wk2 = weeks_in_order
-        week1_meta = week_meta_records.get(wk1)
-        week2_meta = week_meta_records.get(wk2)
-        if not week1_meta or "decision_ts_range" not in week1_meta:
+    if split_info and len(weeks_in_order) >= 2:
+        holdout_week = weeks_in_order[-1]
+        train_weeks = weeks_in_order[:-1]
+
+        train_week_mins = []
+        train_week_maxs = []
+        for wk in train_weeks:
+            wk_meta = week_meta_records.get(wk)
+            if not wk_meta or "decision_ts_range" not in wk_meta:
+                raise ValueError(
+                    f"Missing decision_ts_range for week '{wk}'; cannot derive train split range."
+                )
+            decision_range = wk_meta["decision_ts_range"]
+            train_week_mins.append(int(decision_range["min"]))
+            train_week_maxs.append(int(decision_range["max"]))
+
+        holdout_meta = week_meta_records.get(holdout_week)
+        if not holdout_meta or "decision_ts_range" not in holdout_meta:
             raise ValueError(
-                f"Missing decision_ts_range for week '{wk1}'; cannot derive train split range."
+                f"Missing decision_ts_range for week '{holdout_week}'; cannot derive val/test split ranges."
             )
-        if not week2_meta or "decision_ts_range" not in week2_meta:
+
+        holdout_range = holdout_meta["decision_ts_range"]
+        holdout_min = int(holdout_range["min"])
+        holdout_max = int(holdout_range["max"])
+        if holdout_max <= holdout_min:
             raise ValueError(
-                f"Missing decision_ts_range for week '{wk2}'; cannot derive val/test split ranges."
+                f"Week '{holdout_week}' decision_ts_range invalid: min={holdout_min} max={holdout_max}"
             )
-        train_range = week1_meta["decision_ts_range"]
-        decision_range = week2_meta["decision_ts_range"]
-        min_ts = int(decision_range["min"])
-        max_ts = int(decision_range["max"])
-        if max_ts <= min_ts:
-            raise ValueError(
-                f"Week '{wk2}' decision_ts_range invalid: min={min_ts} max={max_ts}"
-            )
-        span_ms = max_ts - min_ts
-        expected_ms = int(timedelta(days=7).total_seconds() * 1000)
-        tolerance_ms = int(timedelta(hours=12).total_seconds() * 1000)
-        if not (expected_ms - tolerance_ms <= span_ms <= expected_ms + tolerance_ms):
-            raise AssertionError(
-                f"Week '{wk2}' decision_ts_range span {span_ms}ms "
-                f"not within ~7 days ({expected_ms}±{tolerance_ms}ms)."
-            )
-        midpoint = min_ts + span_ms // 2
+
+        midpoint = holdout_min + (holdout_max - holdout_min) // 2
         split_ranges = {
-            "train_week": wk1,
-            "holdout_week": wk2,
+            "train_week": train_weeks[-1],
+            "holdout_week": holdout_week,
             "train_ts_range": {
-                "min": int(train_range["min"]),
-                "max": int(train_range["max"]),
+                "min": min(train_week_mins),
+                "max": max(train_week_maxs),
             },
-            "val_ts_range": {"min": min_ts, "max": midpoint},
-            "test_ts_range": {"min": midpoint, "max": max_ts},
+            "val_ts_range": {"min": holdout_min, "max": midpoint},
+            "test_ts_range": {"min": midpoint, "max": holdout_max},
         }
 
     meta = {
