@@ -17,14 +17,8 @@ def load_global_meta(out_root: Path) -> dict:
         raise FileNotFoundError(f"Not found: {meta_path}. Did you run offline_ingest.py?")
     meta = read_json(meta_path)
     weeks_in_order = meta.get("weeks_in_order")
-    weeks = weeks_in_order if weeks_in_order is not None else meta.get("weeks")
-
-    if not (isinstance(weeks, list) and weeks):
-        raise ValueError("Malformed meta.json: missing non-empty 'weeks_in_order' (preferred) or 'weeks'")
-
-    legacy_weeks = meta.get("weeks")
-    if isinstance(weeks_in_order, list) and isinstance(legacy_weeks, list) and weeks_in_order != legacy_weeks:
-        raise ValueError("Malformed meta.json: 'weeks_in_order' and 'weeks' differ")
+    if not (isinstance(weeks_in_order, list) and weeks_in_order):
+        raise ValueError("Malformed meta.json: missing non-empty 'weeks_in_order'. Rerun offline_ingest.")
 
     week_counts = meta.get("week_counts")
     if week_counts is not None and not isinstance(week_counts, dict):
