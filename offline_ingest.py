@@ -708,7 +708,7 @@ class EventFeeder:
 
 
 def _stream_core_features(pairs: List[Tuple[str, str, str]]):
-    """Yield core feature vectors (z-scored) for the given week pairs."""
+    """Stream OB decision-candidate core feature vectors (z-scored) for PCA fitting."""
     if not pairs:
         return
 
@@ -756,6 +756,8 @@ def _stream_core_features(pairs: List[Tuple[str, str, str]]):
                     f"week {wk} event {ts_ms} < last {last_global_ts}"
                 )
             last_global_ts = int(ts_ms)
+            if _is_trade:
+                continue
             sample_count += 1
             now = time.monotonic()
             if now - last_log >= 300:
