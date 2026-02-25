@@ -38,6 +38,10 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 from huggingface_hub import PyTorchModelHubMixin
 
+# NOTE FOR CONTRIBUTORS:
+# This file is a library module. Offline dataset creation is implemented in
+# offline_ingest.py. Do not add ingestion scripts here.
+
 ft_config.donated_buffer = False
 torch.cuda.empty_cache()
 
@@ -2588,4 +2592,3 @@ def is_metric_improved(value: float, best: float, mode: str) -> bool:
 # --------------------  Training loop  ---------------------
 def get_mask_ratio(epoch: int) -> float:
     return MASK_PRETRAIN if epoch < SSL_PRETRAIN_EPOCHS else MASK_FINETUNE
-
