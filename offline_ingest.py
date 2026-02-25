@@ -1033,7 +1033,7 @@ def process_all(
                 feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
 
             grid_ts = quantize_ts_ms(int(ts_ms), DECISION_NOMINAL_STEP_MS, DECISION_GUARD_MS)
-            matured = labeler.on_event(grid_ts, float(mid))
+            matured = None
 
             is_new_tick = last_grid_ts is None or grid_ts > last_grid_ts
             is_collision = (last_grid_ts is not None and grid_ts == last_grid_ts)
@@ -1058,6 +1058,8 @@ def process_all(
                 pending_seqs.append((grid_ts, seq.astype(np.float32, copy=False)))
                 # Decision frontier must advance only on a new decision-time tick.
                 labeler.on_decision(grid_ts)
+                # register decision at tick first, then advance/update tick price.
+                matured = labeler.on_event(grid_ts, float(mid))
                 last_grid_ts = grid_ts
                 last_tick_dt_ms = int(dt_tick)
             elif is_collision:
@@ -1073,11 +1075,14 @@ def process_all(
                 seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
                 # Collision updates the current decision token/sequence in place.
                 pending_seqs[-1] = (grid_ts, seq.astype(np.float32, copy=False))
+                matured = labeler.on_event(grid_ts, float(mid))
             else:
                 raise RuntimeError(
                     f"Non-monotone grid timestamp: grid_ts={grid_ts} < last_grid_ts={last_grid_ts}"
                 )
 
+            if matured is None:
+                raise RuntimeError("Matured labels were not produced for OB event")
             for yy in matured:
                 if not pending_seqs:
                     raise RuntimeError(
