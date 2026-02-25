@@ -501,16 +501,13 @@ def _list_files(patterns):
     return out
 
 def _week_key(path: str, prefix: str = "") -> str:
-    # Canonical week keys are date-ranges in one of two supported formats.
-    # We extract by regex-search so the key can be found regardless of suffixes.
+    # Strict canonical week keys are required and must contain a supported
+    # date-range format in the filename.
     base = os.path.basename(path)
     m = re.search(r"(\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2})", base)
     if m:
         return m.group(1)
-
-    # Backward-compatible fallback for legacy names.
-    base = re.sub(r'\.(zip|gz|jsonl|csv)$', '', base)
-    return base.replace(prefix, "")
+    raise ValueError(f"Could not extract canonical week key from filename: {base}")
 
 
 def _choose_week_files(candidates: List[str], label: str, prefix: str) -> Dict[str, str]:
