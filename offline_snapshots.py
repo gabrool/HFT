@@ -27,7 +27,7 @@ from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from CMSSL17 import FeatureEngine, _open_text
+from CMSSL17 import FeatureEngine, _open_text, quantize_ts_ms
 
 
 # fast json if available
@@ -151,7 +151,8 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
     last_asz: Optional[float] = None
 
     for raw in iter_ob_events(ob_path):
-        etype, ts_ms, payload = fe._parse_event(raw)
+        etype, ts_ms_raw, payload = fe._parse_event(raw)
+        ts_ms = quantize_ts_ms(ts_ms_raw, 100, 49)
         if etype != "ob":
             continue
 
@@ -173,6 +174,17 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
             continue
         bsz = max(float(bsz), 0.0)
         asz = max(float(asz), 0.0)
+
+        if series.ts and series.ts[-1] == ts_ms:
+            series.best_bid[-1] = float(bid)
+            series.best_ask[-1] = float(ask)
+            series.best_bid_size[-1] = float(bsz)
+            series.best_ask_size[-1] = float(asz)
+            last_bid = bid
+            last_ask = ask
+            last_bsz = bsz
+            last_asz = asz
+            continue
 
         if next_sample_ts is None:
             next_sample_ts = int(ts_ms)
