@@ -58,8 +58,6 @@ if HERE not in sys.path:
 from CMSSL17 import (
     FeatureEngine,
     LabelBuilder,
-    merge_event_time,
-    build_sequence_from_tokens,
     quantize_ts_ms,
     HORIZONS_MS,
     NUM_HORIZONS,
@@ -81,6 +79,49 @@ except Exception:
 
 # --------------- utils ------------------
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
+
+
+def merge_event_time(ob_iter, tr_iter, B: int = 0):
+    """Merge OB and trade iterators by timestamp and sequence."""
+    ob_item = next(ob_iter, None)
+    tr_item = next(tr_iter, None)
+    last_ts = -1
+    while ob_item or tr_item:
+        if ob_item and (tr_item is None or ob_item[0] < tr_item[0]):
+            ts, seq, data = ob_item
+            ob_item = next(ob_iter, None)
+            etype = "ob"
+        else:
+            # Prefer the trade when timestamps tie to preserve causal ordering.
+            ts, seq, data = tr_item
+            tr_item = next(tr_iter, None)
+            etype = "trade"
+        if ts + B < last_ts:
+            raise ValueError("Non-monotonic timestamps in event stream")
+        last_ts = ts
+        yield etype, ts, seq, data
+
+
+def build_sequence_from_tokens(tokens: deque, lookback: int) -> np.ndarray:
+    """
+    Build a fixed-length [L, F] sequence from a deque of tokens (each 1D np.array of size F).
+    - If len(tokens) >= L: trim older (deque already keeps last L if maxlen=L).
+    - If len(tokens) <  L: left-pad by repeating the earliest token.
+      Important: set aux Δt for pads to 0 so padding doesn't distort time/CPC.
+    """
+    assert len(tokens) >= 1
+    if len(tokens) >= lookback:
+        return np.stack(list(tokens), axis=0)
+
+    pad_n = lookback - len(tokens)
+    first = tokens[0].copy()
+    # Last channels are [log_dt_ms, is_trade, events_100ms].
+    first[-3] = 0.0
+    first[-2] = 0.0
+    first[-1] = 0.0
+    pad_block = np.repeat(first[None, :], pad_n, axis=0)
+    arr = np.stack(list(tokens), axis=0)
+    return np.concatenate([pad_block, arr], axis=0)
 
 
 def _parse_requested_weeks(raw: str) -> List[str]:

@@ -1263,27 +1263,6 @@ class BybitRawIter:
             yield from flush_pending()
 
 
-def merge_event_time(ob_iter, tr_iter, B: int = 0):
-    """Merge OB and trade iterators by timestamp and sequence."""
-    ob_item = next(ob_iter, None)
-    tr_item = next(tr_iter, None)
-    last_ts = -1
-    while ob_item or tr_item:
-        if ob_item and (tr_item is None or ob_item[0] < tr_item[0]):
-            ts, seq, data = ob_item
-            ob_item = next(ob_iter, None)
-            etype = "ob"
-        else:
-            # Prefer the trade when timestamps tie to preserve causal ordering.
-            ts, seq, data = tr_item
-            tr_item = next(tr_iter, None)
-            etype = "trade"
-        if ts + B < last_ts:
-            raise ValueError("Non-monotonic timestamps in event stream")
-        last_ts = ts
-        yield etype, ts, seq, data
-
-
 # ---------------------  Rolling normalization  ---------------------
 
 class RollingZScore:
@@ -2611,156 +2590,6 @@ class HFTDataset(Dataset):
         return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
     
 
-def build_sequence_from_tokens(tokens: Deque[np.ndarray], lookback: int) -> np.ndarray:
-    """
-    Build a fixed-length [L, F] sequence from a deque of tokens (each 1D np.array of size F).
-    - If len(tokens) >= L: trim older (deque already keeps last L if maxlen=L).
-    - If len(tokens) <  L: left-pad by repeating the earliest token.
-      Important: we set aux Δt for pads to 0 so padding doesn't distort time/CPC.
-    """
-    assert len(tokens) >= 1
-    if len(tokens) >= lookback:
-        return np.stack(list(tokens), axis=0)
-
-    pad_n = lookback - len(tokens)
-    first = tokens[0].copy()
-    # last channels are [log_dt_ms, is_trade, events_100ms] — leave is_trade=0, density=0 for pads
-    first[-3] = PAD_DT_FOR_LEFT  # log_dt_ms (log1p(0) = 0)
-    first[-2] = 0.0              # is_trade
-    first[-1] = 0.0              # events_100ms
-    pad_block = np.repeat(first[None, :], pad_n, axis=0)
-    arr = np.stack(list(tokens), axis=0)
-    return np.concatenate([pad_block, arr], axis=0)
-
-
-def stream_bybit(week_files: List[Tuple[str, str]]) -> Tuple[np.ndarray, np.ndarray, int]:
-    fe = FeatureEngine()
-    labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
-
-    tokens: Deque[np.ndarray] = deque(maxlen=LOOKBACK)  # token = [features..., log_dt_ms, is_trade, events_100ms]
-    pending_seqs: Deque[np.ndarray] = deque()           # sequences waiting for labels (FIFO)
-
-    X_list: List[np.ndarray] = []
-    y_list: List[np.ndarray] = []
-
-    parsed_weeks: List[Tuple[datetime, datetime, str, str]] = []
-    for ob_zip, th_zip in week_files:
-        ob_base = os.path.basename(ob_zip)
-        th_base = os.path.basename(th_zip)
-
-        # Normalise prefix so both files parse through _parse_week_key_any
-        ob_key = ob_base.replace("BTCUSDT_TH_", "BTCUSDT_OB_", 1)
-        th_key = th_base.replace("BTCUSDT_TH_", "BTCUSDT_OB_", 1)
-
-        try:
-            start_ob, end_ob, _ = _parse_week_key_any(ob_key)
-        except ValueError as exc:
-            raise ValueError(f"Failed to parse week range from OB file '{ob_base}': {exc}") from exc
-
-        try:
-            start_th, end_th, _ = _parse_week_key_any(th_key)
-        except ValueError as exc:
-            raise ValueError(f"Failed to parse week range from TH file '{th_base}': {exc}") from exc
-
-        if (start_ob, end_ob) != (start_th, end_th):
-            raise ValueError(
-                "Mismatch between OB/TH week ranges: "
-                f"OB='{ob_base}' ({start_ob.date()}→{end_ob.date()}) vs "
-                f"TH='{th_base}' ({start_th.date()}→{end_th.date()})"
-            )
-
-        parsed_weeks.append((start_ob, end_ob, ob_zip, th_zip))
-
-    for idx in range(1, len(parsed_weeks)):
-        prev_start, prev_end, prev_ob, prev_th = parsed_weeks[idx - 1]
-        curr_start, curr_end, curr_ob, curr_th = parsed_weeks[idx]
-        if curr_end <= prev_end:
-            raise ValueError(
-                "Week files must be strictly increasing by end date: "
-                f"'{os.path.basename(curr_ob)}'/'{os.path.basename(curr_th)}' (end={curr_end.date()}) "
-                f"not after '{os.path.basename(prev_ob)}'/'{os.path.basename(prev_th)}' (end={prev_end.date()})"
-            )
-
-    total_weeks = len(parsed_weeks)
-    last_global_ts: Optional[int] = None
-    for w_idx, (start_dt, end_dt, ob_zip, th_zip) in enumerate(parsed_weeks, 1):
-        print(f"[week {w_idx}/{total_weeks}] OB={os.path.basename(ob_zip)} | TH={os.path.basename(th_zip)}")
-        raw = BybitRawIter(ob_zip, th_zip)
-        merged_iter = merge_event_time(raw.ob_iter(), raw.trade_iter(), B=0)
-
-        last_log = time.time()
-        event_count = 0
-        last_ts_ms = None
-
-        def process_event(e: Any) -> int:
-            nonlocal event_count, last_ts_ms, last_log
-
-            event_count += 1
-
-            # 1) Update features with this event
-            ts_ms, feat, mid, is_trade, dt_ms = fe.on_event(e)
-            last_ts_ms = ts_ms
-
-            # 2) Build token with aux channels
-            events_100ms = fe.event_density_100ms()
-            log_dt_ms = float(np.log1p(dt_ms))
-            token = np.concatenate(
-                [feat, np.array([log_dt_ms, float(is_trade), events_100ms], dtype=np.float32)]
-            ).astype(np.float32)
-            tokens.append(token)
-
-            # 3) Build sequence at every event
-            seq = build_sequence_from_tokens(tokens, LOOKBACK)
-            pending_seqs.append(seq)
-
-            # 4–6) Labels
-            labeler.on_decision(int(ts_ms))
-            matured_list = labeler.on_event(int(ts_ms), float(mid))
-            for y in matured_list:
-                if pending_seqs:
-                    X_list.append(pending_seqs.popleft())
-                    y_list.append(y.astype(np.float32))
-                else:
-                    # Shouldn't happen with FIFO; guard anyway
-                    pass
-
-            if event_count % 500_000 == 0 or (time.time() - last_log) > 5:
-                print(f"  [progress] events={event_count:,}  last_ts={last_ts_ms}")
-                last_log = time.time()
-
-            return int(ts_ms)
-
-        first_event = next(merged_iter, None)
-        if first_event is not None:
-            ts_candidate = int(first_event[1])
-            if last_global_ts is not None and ts_candidate < last_global_ts:
-                raise ValueError("Non-monotonic timestamps across weeks")
-            last_global_ts = process_event(first_event)
-
-        for e in merged_iter:
-            ts_candidate = int(e[1])
-            if last_global_ts is not None and ts_candidate < last_global_ts:
-                raise ValueError("Non-monotonic timestamps across weeks")
-            last_global_ts = process_event(e)
-
-        print(f"[week {w_idx}] done: events={event_count:,}, sequences={len(X_list):,} so far")
-
-    # At the end there may be some pending sequences without matured labels
-    # (e.g., decisions near the file tail). We drop those quietly.
-    if len(X_list) == 0:
-        feat_dim = fe.feature_dim() if fe._feat_dim is not None else 0
-        return (
-            np.empty((0, LOOKBACK, 0), dtype=np.float32),
-            np.empty((0, 2 * NUM_HORIZONS), dtype=np.float32),
-            feat_dim,
-        )
-
-    X = np.stack(X_list, axis=0).astype(np.float32)  # [N, L, F]
-    Y = np.stack(y_list, axis=0).astype(np.float32)  # [N, 2 * NUM_HORIZONS] -> [returns || log-vol targets]
-    feat_dim = fe.feature_dim()
-    return X, Y, feat_dim
-
-
 # --------------------  Utils: EMA-normalized losses + Huber  ---------------------
 def huber_loss(
     pred: torch.Tensor,
@@ -2890,10 +2719,10 @@ def train_and_evaluate():
     val_weeks   = week_files[6:8]
     test_weeks  = week_files[8:10]
 
-    # 2) Stream each split separately (no leakage across splits)
-    X_tr, y_tr, feat_dim = stream_bybit(train_weeks)
-    X_va, y_va, _        = stream_bybit(val_weeks)
-    X_te, y_te, _        = stream_bybit(test_weeks)
+    # 2) Legacy inline streaming was removed.
+    raise RuntimeError(
+        "stream_bybit() has been removed from CMSSL17.py; use offline_ingest.py for data ingestion."
+    )
 
     F_core = max(0, feat_dim - AUX_DIM)
 
