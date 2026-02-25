@@ -67,9 +67,26 @@ def require(condition: bool, msg: str, exc_type: type[Exception] = ValueError) -
         raise exc_type(msg)
 
 
+def _require_grid_quantized_decision_meta(meta: Dict[str, Any]) -> None:
+    contract_error = (
+        "Dataset not built with grid-quantized decisions; "
+        "rerun offline_ingest/offline_snapshots."
+    )
+    time_grid = meta.get("time_grid")
+    if not isinstance(time_grid, dict):
+        raise ValueError(contract_error)
+    if int(time_grid.get("step_ms", -1)) != 100:
+        raise ValueError(contract_error)
+    if int(time_grid.get("guard_ms", -1)) != 49:
+        raise ValueError(contract_error)
+    if meta.get("decision_policy") != "ob_only_grid_quantized":
+        raise ValueError(contract_error)
+
+
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
+    _require_grid_quantized_decision_meta(meta)
     feat_dim = int(meta["feature_dim_total"])  # includes AUX_DIM already
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, feat_dim, LOOKBACK)
@@ -122,6 +139,7 @@ def iter_chunk_batches(out_root: str):
 def get_cmssl_splits(out_root: str) -> dict:
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
+    _require_grid_quantized_decision_meta(meta)
     splits = meta.get("splits", {})
 
     missing = [
@@ -370,11 +388,16 @@ def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray,
     x_aux_all = np.concatenate(x_aux_list, axis=0)
     y_all = np.concatenate(y_list, axis=0)
     ts_all = np.concatenate(ts_list, axis=0)
+    if not np.all(ts_all % RAW_SNAPSHOT_EXPECTED_STEP_MS == 0):
+        raise ValueError(
+            f"Decision timestamps must be on {RAW_SNAPSHOT_EXPECTED_STEP_MS}ms grid."
+        )
     order = np.argsort(ts_all)
     return x_core_all[order], x_aux_all[order], y_all[order], ts_all[order]
 
 
 def resolve_test_split(out_root: str, meta: dict) -> Dict[str, Any]:
+    _require_grid_quantized_decision_meta(meta)
     splits = meta.get("splits", {})
     test_range = splits.get("test_ts_range")
     holdout_week = splits.get("holdout_week")
@@ -701,7 +724,8 @@ def align_snapshots_to_decisions(
             "Snapshot alignment failed; exact timestamp matches missing. "
             f"missing={len(missing)} total={decision_ts.size} "
             f"samples={missing[:sample_count]}. "
-            "Run offline_snapshots.py and ensure decision_policy=ob_only; "
+            "Run offline_snapshots.py and ensure "
+            "decision_policy=ob_only_grid_quantized with guard_ms=49; "
             "timestamps must land on snapshot grid"
         )
     return aligned_idx
