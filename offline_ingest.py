@@ -46,8 +46,9 @@ WORKERS     = int(os.environ.get("BYBIT_WORKERS", "8"))
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "4096"))
-DECISION_POLICY = "ob_only"
+DECISION_POLICY = "ob_only_grid_quantized"
 DECISION_NOMINAL_STEP_MS = 100
+DECISION_GUARD_MS = 49
 
 
 # import your training utilities
@@ -59,6 +60,7 @@ from CMSSL17 import (
     LabelBuilder,
     merge_event_time,
     build_sequence_from_tokens,
+    quantize_ts_ms,
     HORIZONS_MS,
     NUM_HORIZONS,
     LOOKBACK,
@@ -527,6 +529,7 @@ class WeekWriterRouter:
             "week": week_key,
             "decision_policy": DECISION_POLICY,
             "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
+            "decision_guard_ms": int(DECISION_GUARD_MS),
             "lookback": self.lookback,
             "feature_dim_total": self.feature_dim,
             "feature_dim_core": self.feature_dim - AUX_DIM,
@@ -954,6 +957,8 @@ def process_all(
 
     tokens_buf: deque = deque(maxlen=LOOKBACK)
     pending_seqs: deque = deque()
+    last_grid_ts: Optional[int] = None
+    last_tick_dt_ms: Optional[int] = None
 
     F = None
     router: WeekWriterRouter = None  # type: ignore
@@ -1025,24 +1030,45 @@ def process_all(
                     )
                 centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
                 feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
-            tok = build_token(fe, feat_core, is_trade, dt_ms)
-            if F is None:
-                F = tok.shape[0]
-                router = WeekWriterRouter(
-                    out_root,
-                    LOOKBACK,
-                    F,
-                    RAM_BUDGET,
-                    CHUNK_SIZE,
-                    week_index,
-                    pca_meta=pca_summary,
-                )
-            tokens_buf.append(tok)
 
-            seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
-            ts_decision = int(ts_ms)
-            pending_seqs.append((ts_decision, seq.astype(np.float32, copy=False)))
-            labeler.on_decision(ts_decision)
+            grid_ts = quantize_ts_ms(int(ts_ms), DECISION_NOMINAL_STEP_MS, DECISION_GUARD_MS)
+            if last_grid_ts is None or grid_ts > last_grid_ts:
+                dt_tick = DECISION_NOMINAL_STEP_MS if last_grid_ts is None else int(grid_ts - last_grid_ts)
+                tok = build_token(fe, feat_core, is_trade, dt_tick)
+                if F is None:
+                    F = tok.shape[0]
+                    router = WeekWriterRouter(
+                        out_root,
+                        LOOKBACK,
+                        F,
+                        RAM_BUDGET,
+                        CHUNK_SIZE,
+                        week_index,
+                        pca_meta=pca_summary,
+                    )
+                tokens_buf.append(tok)
+
+                seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
+                pending_seqs.append((grid_ts, seq.astype(np.float32, copy=False)))
+                labeler.on_decision(grid_ts)
+                last_grid_ts = grid_ts
+                last_tick_dt_ms = int(dt_tick)
+            elif grid_ts == last_grid_ts:
+                if not pending_seqs:
+                    raise RuntimeError("Grid collision observed but no pending sequence to overwrite")
+                if last_tick_dt_ms is None:
+                    raise RuntimeError("Grid collision observed without last_tick_dt_ms state")
+                tok = build_token(fe, feat_core, is_trade, int(last_tick_dt_ms))
+                if not tokens_buf:
+                    raise RuntimeError("Grid collision observed but token buffer is empty")
+                tokens_buf[-1] = tok
+
+                seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
+                pending_seqs[-1] = (grid_ts, seq.astype(np.float32, copy=False))
+            else:
+                raise RuntimeError(
+                    f"Non-monotone grid timestamp: grid_ts={grid_ts} < last_grid_ts={last_grid_ts}"
+                )
 
         for yy in matured:
             if not pending_seqs:
@@ -1158,6 +1184,11 @@ def process_all(
         "weeks_in_order": weeks_in_order,
         "decision_policy": DECISION_POLICY,
         "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
+        "time_grid": {
+            "step_ms": 100,
+            "guard_ms": 49,
+            "mode": "nearest",
+        },
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
