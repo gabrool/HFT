@@ -953,7 +953,9 @@ def process_all(
             })
 
     fe = FeatureEngine()
-    labeler = LabelBuilder(delta_ms=5, horizons_ms=HORIZONS_MS)
+    # Label timing is aligned to the same quantized 100ms grid as decisions.
+    # Entry references use decision_ts directly (no sub-grid delay).
+    labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
 
     tokens_buf: deque = deque(maxlen=LOOKBACK)
     pending_seqs: deque = deque()
