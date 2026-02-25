@@ -101,13 +101,17 @@ def _range_from_splits(splits: dict, key: str) -> tuple[int, int]:
 
 
 def require_complete_splits(meta: dict) -> dict:
-    splits = meta.get("splits")
-    if not isinstance(splits, dict):
+    if "splits" not in meta:
         raise KeyError(
             "meta.json missing required key 'splits'. Run offline_ingest to generate offline dataset metadata."
         )
+    splits = meta["splits"]
+    if not isinstance(splits, dict):
+        raise KeyError("meta['splits'] must be a dict. Rerun offline_ingest.")
 
-    weeks_in_order = meta.get("weeks_in_order")
+    if "weeks_in_order" not in meta:
+        raise KeyError("meta.json missing required key 'weeks_in_order'. Rerun offline_ingest.")
+    weeks_in_order = meta["weeks_in_order"]
     if not isinstance(weeks_in_order, list) or not weeks_in_order:
         raise KeyError("meta.json missing required non-empty key 'weeks_in_order'. Rerun offline_ingest.")
 
@@ -119,11 +123,11 @@ def require_complete_splits(meta: dict) -> dict:
         raise KeyError("meta['splits'] missing train/val/test/holdout_week or *_ts_range. Rerun offline_ingest.")
 
     for key in ("train", "val", "test"):
-        vals = splits.get(key)
+        vals = splits[key]
         if not isinstance(vals, list) or not vals or not all(isinstance(w, str) and w for w in vals):
             raise KeyError(f"meta['splits']['{key}'] must be a non-empty list[str]. Rerun offline_ingest.")
 
-    holdout_week = splits.get("holdout_week")
+    holdout_week = splits["holdout_week"]
     if not isinstance(holdout_week, str) or not holdout_week:
         raise KeyError("meta['splits']['holdout_week'] must be a non-empty string. Rerun offline_ingest.")
 
