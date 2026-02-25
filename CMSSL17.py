@@ -424,6 +424,7 @@ def coerce_ts_ms(value: Union[int, float, str]) -> int:
     return int(numeric * 1000.0) if abs(numeric) < 1e12 else int(numeric)
 
 
+
 # ---------------------------  Core hyper-params  ---------------------------
 LOOKBACK        = 100        # number of tokens spanning ~10s
 WINDOW_MS       = 10_000     # time-based window span (10s)
@@ -459,6 +460,8 @@ SINGLE_WEEK_PATIENCE = 3
 # Number of auxiliary channels appended after the base feature vector
 # These correspond to [log_dt_ms, is_trade, events_100ms]
 AUX_DIM        = 3
+TIME_GRID_STEP_MS = 100
+TIME_GRID_GUARD_MS = 49
 NUM_HEADS       = 8
 WARMUP_EPOCHS   = max(1, int(EPOCHS * 0.05))  # Warmup over first 5% of epochs
 
@@ -492,6 +495,22 @@ DATA_ROOT = os.environ.get("BYBIT_DATA_ROOT", os.path.expanduser("~/Gabriel"))
 USE_PCA = False
 PCA_VAR = 0.99
 #---------------------------------------------------------------------------
+
+def quantize_ts_ms(
+    ts_ms: int,
+    step_ms: int = TIME_GRID_STEP_MS,
+    guard_ms: int = TIME_GRID_GUARD_MS,
+) -> int:
+    t = int(ts_ms)
+    step = int(step_ms)
+    guard = int(guard_ms)
+    grid = ((t + step // 2) // step) * step
+    if abs(t - grid) > guard:
+        raise ValueError(
+            f"Timestamp {t}ms is off-grid by {abs(t - grid)}ms (guard={guard}ms, step={step}ms)"
+        )
+    return int(grid)
+
 
 
 def _list_files(patterns):
