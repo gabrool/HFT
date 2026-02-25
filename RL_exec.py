@@ -324,11 +324,9 @@ def _resolve_horizon_index(
 
 def _split_weeks(split: Dict[str, Any]) -> list[str]:
     weeks = split.get("weeks")
-    if weeks:
+    if isinstance(weeks, list) and len(weeks) > 0:
         return list(weeks)
-    if "week" in split:
-        return [split["week"]]
-    raise KeyError("split must contain 'week' or 'weeks'")
+    raise KeyError("split must contain non-empty 'weeks' list")
 
 
 def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -336,8 +334,8 @@ def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray,
 
     Args:
         out_root: Output root containing CMSSL chunk artifacts.
-        split: Split config with either ``week`` (single week key) or ``weeks``
-            (list of week keys), plus ``start``/``end`` timestamp bounds.
+        split: Split config with ``weeks`` (non-empty list of week keys),
+            plus ``start``/``end`` timestamp bounds.
     """
     weeks = _split_weeks(split)
     x_core_list: List[np.ndarray] = []
@@ -382,7 +380,7 @@ def resolve_test_split(out_root: str, meta: dict) -> Dict[str, Any]:
     holdout_week = splits.get("holdout_week")
     if test_range and holdout_week:
         return {
-            "week": holdout_week,
+            "weeks": [holdout_week],
             "start": int(test_range["min"]),
             "end": int(test_range["max"]),
         }
@@ -821,7 +819,7 @@ def build_joined_split(
 ) -> Dict[str, np.ndarray]:
     week_outputs: List[Dict[str, np.ndarray]] = []
     for wk in _split_weeks(split):
-        wk_split = {"week": wk, "start": split["start"], "end": split["end"]}
+        wk_split = {"weeks": [wk], "start": split["start"], "end": split["end"]}
         try:
             x_core, x_aux, y, ts = load_split_arrays(out_root, wk_split)
         except ValueError as exc:
