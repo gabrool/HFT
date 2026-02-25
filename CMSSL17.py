@@ -2518,8 +2518,9 @@ class LabelBuilder:
         # entries are (t_ready, t_delta, mid_entry)
         self.wait_mature: Deque[Tuple[int, int, float]] = deque()
 
-        # Maintain recent midprice history as (timestamp, mid)
-        self.price_history: Deque[Tuple[int, float]] = deque()
+        # Maintain recent midprice history as parallel deques (timestamp, mid)
+        self.price_ts: Deque[int] = deque()
+        self.price_mid: Deque[float] = deque()
         self.history_span = self.max_h + self.delta + 1000
 
         self.last_ts = -10**15
@@ -2568,22 +2569,34 @@ class LabelBuilder:
         return out
 
     # ---- price history helpers ----
+    def _push_price(self, ts: int, mid: float):
+        if self.price_ts:
+            last_ts = self.price_ts[-1]
+            assert ts >= last_ts, "price timestamps must be non-decreasing"
+            if ts == last_ts:
+                self.price_mid[-1] = float(mid)
+                return
+
+        self.price_ts.append(ts)
+        self.price_mid.append(float(mid))
+
     def _record_price(self, t: int, m: float):
-        self.price_history.append((t, m))
+        self._push_price(t, m)
         cutoff = t - self.history_span
-        while len(self.price_history) > 1 and self.price_history[0][0] < cutoff:
-            self.price_history.popleft()
+        while len(self.price_ts) > 1 and self.price_ts[0] < cutoff:
+            self.price_ts.popleft()
+            self.price_mid.popleft()
 
     def _price_at(self, t_query: int) -> float:
-        if not self.price_history:
+        if not self.price_ts:
             return self.last_mid if self.last_mid is not None else 0.0
 
-        for ts, mid in reversed(self.price_history):
+        for ts, mid in zip(reversed(self.price_ts), reversed(self.price_mid)):
             if ts <= t_query:
                 return mid
 
         # If query precedes the oldest stored timestamp, fall back to the earliest mid
-        return self.price_history[0][1]
+        return self.price_mid[0]
 
 
 class HFTDataset(Dataset):
