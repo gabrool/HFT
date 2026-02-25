@@ -5,8 +5,7 @@ Rebuild 100ms order-book snapshots from Bybit OB delta streams.
 Outputs canonical snapshots.npz files compatible with RL_exec.load_raw_snapshots.
 The snapshots payload is always a 4-column top-of-book matrix:
   (best_bid, best_ask, best_bid_size, best_ask_size).
-RL execution expects this exact schema; legacy 2-column (bid, ask) snapshots
-are deprecated and unsupported.
+RL execution expects this exact canonical schema.
 
 Env defaults:
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
@@ -123,8 +122,7 @@ class SnapshotSeries:
         Example row:
           snapshots[i] = [63125.5, 63126.0, 4.2, 3.8]
 
-        RL execution requires this 4-field format. Historical 2-field
-        (bid, ask) snapshots are deprecated/unsupported.
+        RL execution requires this canonical 4-field format.
         """
         # Invariant: all per-row arrays must remain equal length.
         n_rows = len(self.ts)
