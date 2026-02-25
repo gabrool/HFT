@@ -1033,7 +1033,10 @@ def process_all(
             grid_ts = quantize_ts_ms(int(ts_ms), DECISION_NOMINAL_STEP_MS, DECISION_GUARD_MS)
             matured = labeler.on_event(grid_ts, float(mid))
 
-            if last_grid_ts is None or grid_ts > last_grid_ts:
+            is_new_tick = last_grid_ts is None or grid_ts > last_grid_ts
+            is_collision = (last_grid_ts is not None and grid_ts == last_grid_ts)
+
+            if is_new_tick:
                 dt_tick = DECISION_NOMINAL_STEP_MS if last_grid_ts is None else int(grid_ts - last_grid_ts)
                 tok = build_token(fe, feat_core, is_trade, dt_tick)
                 if F is None:
@@ -1051,10 +1054,11 @@ def process_all(
 
                 seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
                 pending_seqs.append((grid_ts, seq.astype(np.float32, copy=False)))
+                # Decision frontier must advance only on a new decision-time tick.
                 labeler.on_decision(grid_ts)
                 last_grid_ts = grid_ts
                 last_tick_dt_ms = int(dt_tick)
-            elif grid_ts == last_grid_ts:
+            elif is_collision:
                 if not pending_seqs:
                     raise RuntimeError("Grid collision observed but no pending sequence to overwrite")
                 if last_tick_dt_ms is None:
@@ -1065,6 +1069,7 @@ def process_all(
                 tokens_buf[-1] = tok
 
                 seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
+                # Collision updates the current decision token/sequence in place.
                 pending_seqs[-1] = (grid_ts, seq.astype(np.float32, copy=False))
             else:
                 raise RuntimeError(
