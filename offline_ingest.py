@@ -64,7 +64,7 @@ from CMSSL17 import (
     LOOKBACK,
     AUX_DIM,
     BybitRawIter,
-)  # reuse exactly
+)  # keep shared model/data constants only; ingest helpers are local below
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
@@ -82,6 +82,7 @@ def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 
 def merge_event_time(ob_iter, tr_iter, B: int = 0):
+    """Local ingest merge to avoid coupling offline ingest to CMSSL17 helpers."""
     """Merge OB and trade iterators by timestamp and sequence."""
     ob_item = next(ob_iter, None)
     tr_item = next(tr_iter, None)
@@ -103,6 +104,7 @@ def merge_event_time(ob_iter, tr_iter, B: int = 0):
 
 
 def build_sequence_from_tokens(tokens: deque, lookback: int) -> np.ndarray:
+    """Local sequence builder used by ingest; intentionally not imported from CMSSL17."""
     """
     Build a fixed-length [L, F] sequence from a deque of tokens (each 1D np.array of size F).
     - If len(tokens) >= L: trim older (deque already keeps last L if maxlen=L).
