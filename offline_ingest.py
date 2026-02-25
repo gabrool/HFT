@@ -1018,7 +1018,6 @@ def process_all(
             continue
 
         ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(event)
-        matured = labeler.on_event(int(ts_ms), float(mid))
 
         if not is_trade:
             feat_core = feat_z
@@ -1032,6 +1031,8 @@ def process_all(
                 feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
 
             grid_ts = quantize_ts_ms(int(ts_ms), DECISION_NOMINAL_STEP_MS, DECISION_GUARD_MS)
+            matured = labeler.on_event(grid_ts, float(mid))
+
             if last_grid_ts is None or grid_ts > last_grid_ts:
                 dt_tick = DECISION_NOMINAL_STEP_MS if last_grid_ts is None else int(grid_ts - last_grid_ts)
                 tok = build_token(fe, feat_core, is_trade, dt_tick)
@@ -1070,16 +1071,16 @@ def process_all(
                     f"Non-monotone grid timestamp: grid_ts={grid_ts} < last_grid_ts={last_grid_ts}"
                 )
 
-        for yy in matured:
-            if not pending_seqs:
-                raise RuntimeError(
-                    "Matured label available but no pending sequences to pair"
-                )
-            if router is None:
-                raise RuntimeError("Router not initialised before label maturity")
-            ts_ready, seq_ready = pending_seqs.popleft()
-            router.add(ts_ready, seq_ready, yy.astype(np.float32, copy=False))
-            total_sequences += 1
+            for yy in matured:
+                if not pending_seqs:
+                    raise RuntimeError(
+                        "Matured label available but no pending sequences to pair"
+                    )
+                if router is None:
+                    raise RuntimeError("Router not initialised before label maturity")
+                ts_ready, seq_ready = pending_seqs.popleft()
+                router.add(ts_ready, seq_ready, yy.astype(np.float32, copy=False))
+                total_sequences += 1
 
         last_global_ts = int(ts_ms)
 
