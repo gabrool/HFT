@@ -16,13 +16,41 @@ def load_global_meta(out_root: Path) -> dict:
     if not meta_path.exists():
         raise FileNotFoundError(f"Not found: {meta_path}. Did you run offline_ingest.py?")
     meta = read_json(meta_path)
+
+    def _meta_error(detail: str) -> ValueError:
+        return ValueError(f"Malformed meta.json: {detail}. Please rerun offline_ingest.py.")
+
     weeks_in_order = meta.get("weeks_in_order")
     if not (isinstance(weeks_in_order, list) and weeks_in_order):
-        raise ValueError("Malformed meta.json: missing non-empty 'weeks_in_order'. Rerun offline_ingest.")
+        raise _meta_error("missing non-empty 'weeks_in_order'")
+
+    weeks_meta = meta.get("weeks_meta")
+    if not (isinstance(weeks_meta, dict) and weeks_meta):
+        raise _meta_error("missing non-empty 'weeks_meta'")
+
+    time_grid = meta.get("time_grid")
+    if not isinstance(time_grid, dict):
+        raise _meta_error("missing 'time_grid' object")
+
+    step_ms = time_grid.get("step_ms")
+    if step_ms != 100:
+        raise _meta_error(f"'time_grid.step_ms' must be 100 (got {step_ms!r})")
+
+    guard_ms = time_grid.get("guard_ms")
+    if guard_ms != 49:
+        raise _meta_error(f"'time_grid.guard_ms' must be 49 (got {guard_ms!r})")
+
+    decision_policy = meta.get("decision_policy")
+    if not isinstance(decision_policy, str) or (
+        decision_policy != "ob_only_grid_quantized" and "grid" not in decision_policy
+    ):
+        raise _meta_error(
+            "missing/invalid 'decision_policy' (must be 'ob_only_grid_quantized' or contain 'grid')"
+        )
 
     week_counts = meta.get("week_counts")
     if week_counts is not None and not isinstance(week_counts, dict):
-        raise ValueError("Malformed meta.json: 'week_counts' must be a dict when present")
+        raise _meta_error("'week_counts' must be a dict when present")
 
     return meta
 
