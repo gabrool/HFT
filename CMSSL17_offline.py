@@ -75,6 +75,9 @@ OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
 USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "1")) == 1
 WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "4"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
+EXPECTED_GRID_STEP_MS = 100
+EXPECTED_GRID_GUARD_MS = 49
+EXPECTED_DECISION_POLICY = "ob_only_grid_quantized"
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
@@ -114,6 +117,40 @@ def require_complete_splits(meta: dict) -> dict:
     weeks_in_order = meta["weeks_in_order"]
     if not isinstance(weeks_in_order, list) or not weeks_in_order:
         raise KeyError("meta.json missing required non-empty key 'weeks_in_order'. Rerun offline_ingest.")
+
+    time_grid = meta.get("time_grid")
+    if not isinstance(time_grid, dict):
+        raise KeyError(
+            "meta.json missing required key 'time_grid'. "
+            "Rerun offline_ingest so timestamps are exported on the canonical 100ms grid."
+        )
+    step_ms = time_grid.get("step_ms")
+    guard_ms = time_grid.get("guard_ms")
+    try:
+        step_ms_int = int(step_ms)
+        guard_ms_int = int(guard_ms)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "meta.json has invalid time_grid types. "
+            f"Expected integer step_ms/guard_ms, got step_ms={step_ms!r}, guard_ms={guard_ms!r}. "
+            "Rerun offline_ingest to regenerate grid-quantized splits."
+        )
+    if step_ms_int != EXPECTED_GRID_STEP_MS or guard_ms_int != EXPECTED_GRID_GUARD_MS:
+        raise ValueError(
+            "meta.json has incompatible time_grid settings. "
+            f"Expected step_ms={EXPECTED_GRID_STEP_MS}, guard_ms={EXPECTED_GRID_GUARD_MS}; "
+            f"got step_ms={step_ms_int!r}, guard_ms={guard_ms_int!r}. "
+            "Rerun offline_ingest to regenerate grid-quantized splits."
+        )
+
+    decision_policy = meta.get("decision_policy")
+    if decision_policy != EXPECTED_DECISION_POLICY:
+        raise ValueError(
+            "meta.json has incompatible decision_policy. "
+            f"Expected '{EXPECTED_DECISION_POLICY}' (canonical grid-quantized policy); "
+            f"got {decision_policy!r}. "
+            "Rerun offline_ingest to regenerate metadata with grid quantization enabled."
+        )
 
     required_keys = {
         "train", "val", "test", "holdout_week",
@@ -199,6 +236,16 @@ def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[C
         if ts_arr.size > 1 and not np.all(ts_arr[1:] >= ts_arr[:-1]):
             raise ValueError(
                 f"Timestamp file is not non-decreasing for chunk {idx}: {week_dir / ts_rel}"
+            )
+
+        if ts_arr.size and not np.all(ts_arr % EXPECTED_GRID_STEP_MS == 0):
+            bad_i = int(np.flatnonzero(ts_arr % EXPECTED_GRID_STEP_MS != 0)[0])
+            bad_ts = int(ts_arr[bad_i])
+            raise ValueError(
+                "Off-grid timestamp detected while building chunk refs. "
+                f"week_meta={meta_week_path}, chunk={idx}, ts_file={week_dir / ts_rel}, "
+                f"bad_index={bad_i}, bad_ts={bad_ts}. "
+                "Rerun offline_ingest to regenerate grid-aligned timestamps."
             )
 
         l = int(np.searchsorted(ts_arr, start, side="left"))
@@ -344,6 +391,17 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
             r = int(np.searchsorted(ts_arr, end, side="left"))
             if r <= l:
                 continue
+
+            if not np.all(ts_arr[l:r] % EXPECTED_GRID_STEP_MS == 0):
+                rel_i = int(np.flatnonzero(ts_arr[l:r] % EXPECTED_GRID_STEP_MS != 0)[0])
+                bad_i = l + rel_i
+                bad_ts = int(ts_arr[bad_i])
+                raise ValueError(
+                    "Off-grid timestamp detected in selected split range. "
+                    f"week_meta={wp}, chunk={idx}, ts_file={week_dir / ts_rel}, "
+                    f"slice=({l}:{r}), bad_index={bad_i}, bad_ts={bad_ts}. "
+                    "Rerun offline_ingest to regenerate grid-aligned timestamps."
+                )
 
             Xc = np.load(week_dir / files["core"])
             Xa = np.load(week_dir / files["aux"])
