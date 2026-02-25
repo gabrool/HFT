@@ -28,16 +28,25 @@ def load_global_meta(out_root: Path) -> dict:
 
 
 def resolve_week_meta_paths(out_root: Path, meta: dict) -> List[Path]:
-    w2m = meta.get("weeks_meta", {})
-    weeks = meta.get("weeks_in_order") or meta.get("weeks") or []
-    if w2m and weeks:
-        return [out_root / w2m[w] for w in weeks if w in w2m]
-    paths = []
-    for w in weeks:
-        p = out_root / w / "meta_week.json"
-        if p.exists():
-            paths.append(p)
-    return paths
+    weeks = meta.get("weeks_in_order")
+    if not (isinstance(weeks, list) and weeks):
+        raise ValueError("Malformed meta.json: missing non-empty 'weeks_in_order'.")
+
+    weeks_meta = meta.get("weeks_meta")
+    if not isinstance(weeks_meta, dict) or not weeks_meta:
+        raise ValueError("Malformed meta.json: missing non-empty 'weeks_meta' mapping.")
+
+    missing_weeks = [w for w in weeks if w not in weeks_meta]
+    if missing_weeks:
+        sample_missing = ", ".join(missing_weeks[:5])
+        if len(missing_weeks) > 5:
+            sample_missing += ", ..."
+        raise ValueError(
+            "Malformed meta.json: 'weeks_meta' is missing entries for weeks listed in "
+            f"'weeks_in_order': {sample_missing}."
+        )
+
+    return [out_root / weeks_meta[w] for w in weeks]
 
 
 def iter_week_chunks(out_root: Path, meta: Optional[dict] = None) -> Iterable[Tuple[str, dict, Path]]:
