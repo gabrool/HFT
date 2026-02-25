@@ -10,9 +10,12 @@ Env (defaults are SSD-friendly):
   BYBIT_OUT_ROOT=/media/gabrool/Expansion/Gabriel/bybit_offline_dt
   BYBIT_MAX_WEEKS=0
   BYBIT_WORKERS=1
-  BYBIT_LOOKBACK=512
   BYBIT_RAM_BUDGET_MB=512          # memory budget for one chunk
   BYBIT_CHUNK_SIZE=4096               # 0 = auto from budget; else fixed size
+
+Sequence length note:
+  LOOKBACK is imported from CMSSL17 and fixed by CMSSL17.LOOKBACK (currently 100).
+  There is no ingest env var for sequence length.
 """
 
 import os, sys, csv, json, re, time
@@ -65,6 +68,7 @@ from CMSSL17 import (
     AUX_DIM,
     BybitRawIter,
 )  # keep shared model/data constants only; ingest helpers are local below
+# LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
