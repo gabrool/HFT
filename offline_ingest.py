@@ -1150,11 +1150,12 @@ def process_all(
             "test_ts_range": {"min": midpoint, "max": holdout_max},
         }
 
+    # Dataset metadata contract: `weeks_in_order` is the only supported key for
+    # week ordering in OUT_ROOT/meta.json.
     meta = {
         "dataset_start": start_iso,
         "dataset_end": end_iso,
         "weeks_in_order": weeks_in_order,
-        "weeks": weeks_in_order,  # Backward-compatibility alias; may be removed in a future release.
         "decision_policy": DECISION_POLICY,
         "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
         "lookback": int(LOOKBACK),
