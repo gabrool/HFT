@@ -61,7 +61,6 @@ DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 # Inventory risk thresholds are denominated in quote notional (USD).
 
-
 def require(condition: bool, msg: str, exc_type: type[Exception] = ValueError) -> None:
     """Raise a typed exception when a runtime precondition fails."""
     if not condition:
