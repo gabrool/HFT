@@ -4,18 +4,23 @@ Decision-time ingest (memory-safe):
 - Snapshot ONE [LOOKBACK, F] sequence at each decision time.
 - Use a RAM budget to auto-size chunked writes (avoid huge in-RAM lists).
 
-Env (defaults are SSD-friendly):
+Environment variables (read via os.environ.get in this module):
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
   BYBIT_TH_DIR=/home/gabrool/Documents/TH
   BYBIT_OUT_ROOT=/media/gabrool/Expansion/Gabriel/bybit_offline_dt
-  BYBIT_MAX_WEEKS=0
-  BYBIT_WORKERS=1
-  BYBIT_RAM_BUDGET_MB=512          # memory budget for one chunk
-  BYBIT_CHUNK_SIZE=4096               # 0 = auto from budget; else fixed size
+  BYBIT_WEEKS=""                    # optional comma/space-separated week keys
+  BYBIT_PCA_VAR=0.99
+  BYBIT_PCA_MAX_ROWS=200000
+  BYBIT_PCA_BATCH=4096
+  BYBIT_PCA_MODEL=pca_model.npz
+  BYBIT_PCA_USE_EXISTING=0
+  BYBIT_WORKERS=8
+  BYBIT_RAM_BUDGET_MB=512            # memory budget for one chunk
+  BYBIT_CHUNK_SIZE=4096              # 0 = auto from budget; else fixed size
 
-Sequence length note:
-  LOOKBACK is imported from CMSSL17 and fixed by CMSSL17.LOOKBACK (currently 100).
-  There is no ingest env var for sequence length.
+Shared constants from CMSSL17:
+  LOOKBACK (and related model/data constants) are defined in CMSSL17.py.
+  If these values are intentionally changed, update them in CMSSL17.py.
 """
 
 import os, sys, csv, json, re, time
