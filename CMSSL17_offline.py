@@ -1048,7 +1048,7 @@ def train_from_offline():
                         no_imp = 0
                         ckpt = {
                             "epoch": epoch,
-                            "model": model.state_dict(),
+                            "state_dict": model.state_dict(),
                             "args": {
                                 "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
                                 "feat_dim": F_total, "LOOKBACK": LOOKBACK,
