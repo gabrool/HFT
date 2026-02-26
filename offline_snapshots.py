@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Rebuild 100ms order-book snapshots from Bybit OB delta streams.
+Rebuild order-book snapshots from Bybit OB delta streams.
+
+Time-grid contract is centralized in CMSSL17.py.
 
 Outputs canonical snapshots.npz files compatible with RL_exec.load_raw_snapshots.
 The snapshots payload is always a 4-column top-of-book matrix:
@@ -27,7 +29,13 @@ from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from CMSSL17 import FeatureEngine, _open_text, quantize_ts_ms
+from CMSSL17 import (
+    FeatureEngine,
+    TIME_GRID_GUARD_MS,
+    TIME_GRID_STEP_MS,
+    _open_text,
+    quantize_ts_ms,
+)
 
 
 # fast json if available
@@ -152,7 +160,7 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
 
     for raw in iter_ob_events(ob_path):
         etype, ts_ms_raw, payload = fe._parse_event(raw)
-        ts_ms = quantize_ts_ms(ts_ms_raw, 100, 49)
+        ts_ms = quantize_ts_ms(ts_ms_raw, TIME_GRID_STEP_MS, TIME_GRID_GUARD_MS)
         if etype != "ob":
             continue
 
@@ -165,7 +173,7 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
         ):
             while next_sample_ts < ts_ms:
                 series.append(next_sample_ts, last_bid, last_ask, last_bsz, last_asz)
-                next_sample_ts += 100
+                next_sample_ts += TIME_GRID_STEP_MS
 
         fe._update_book_from_ob(payload)
         bid, ask, bsz, asz = fe._book_best()
@@ -191,7 +199,7 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
 
         while next_sample_ts <= ts_ms:
             series.append(next_sample_ts, bid, ask, bsz, asz)
-            next_sample_ts += 100
+            next_sample_ts += TIME_GRID_STEP_MS
 
         last_bid = bid
         last_ask = ask

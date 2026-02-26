@@ -28,6 +28,8 @@ Files layout expected (created by offline_ingest.py):
       ...
 
 This script attempts to *import* model and utils from CMSSL17.py to avoid duplication.
+
+Time-grid contract is centralized in CMSSL17.py.
 """
 
 import os, sys, math
@@ -68,6 +70,8 @@ from CMSSL17 import (  # type: ignore
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     # optimizer
     SAM,
+    TIME_GRID_STEP_MS,
+    TIME_GRID_GUARD_MS,
 )
 
 # ---------------- Config via env ----------------
@@ -75,8 +79,8 @@ OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
 USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "1")) == 1
 WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "4"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
-EXPECTED_GRID_STEP_MS = 100
-EXPECTED_GRID_GUARD_MS = 49
+EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
+EXPECTED_GRID_GUARD_MS = int(TIME_GRID_GUARD_MS)
 EXPECTED_DECISION_POLICY = "ob_only_grid_quantized"
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
@@ -122,7 +126,7 @@ def require_complete_splits(meta: dict) -> dict:
     if not isinstance(time_grid, dict):
         raise KeyError(
             "meta.json missing required key 'time_grid'. "
-            "Rerun offline_ingest so timestamps are exported on the canonical 100ms grid."
+            f"Rerun offline_ingest so timestamps are exported on the canonical {EXPECTED_GRID_STEP_MS}ms grid."
         )
     step_ms = time_grid.get("step_ms")
     guard_ms = time_grid.get("guard_ms")

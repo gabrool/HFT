@@ -20,6 +20,7 @@ Environment variables (read via os.environ.get in this module):
 Shared constants from CMSSL17:
   LOOKBACK (and related model/data constants) are defined in CMSSL17.py.
   If these values are intentionally changed, update them in CMSSL17.py.
+  The decision-time grid contract is centralized in CMSSL17.py.
 """
 
 import os, sys, csv, json, re, time
@@ -52,10 +53,6 @@ PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "4096"))
 DECISION_POLICY = "ob_only_grid_quantized"
-DECISION_NOMINAL_STEP_MS = 100
-DECISION_GUARD_MS = 49
-
-
 # import your training utilities
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -69,8 +66,13 @@ from CMSSL17 import (
     LOOKBACK,
     AUX_DIM,
     BybitRawIter,
+    TIME_GRID_STEP_MS,
+    TIME_GRID_GUARD_MS,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
+
+DECISION_NOMINAL_STEP_MS = int(TIME_GRID_STEP_MS)
+DECISION_GUARD_MS = int(TIME_GRID_GUARD_MS)
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
@@ -1249,8 +1251,8 @@ def process_all(
         "decision_policy": DECISION_POLICY,
         "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
         "time_grid": {
-            "step_ms": 100,
-            "guard_ms": 49,
+            "step_ms": int(DECISION_NOMINAL_STEP_MS),
+            "guard_ms": int(DECISION_GUARD_MS),
             "mode": "nearest",
         },
         "lookback": int(LOOKBACK),

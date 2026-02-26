@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from CMSSL17 import TIME_GRID_GUARD_MS, TIME_GRID_STEP_MS
+
+# Time-grid contract is centralized in CMSSL17.py.
+
 
 def read_json(path: Path) -> dict:
     with open(path, "r") as f:
@@ -33,12 +37,16 @@ def load_global_meta(out_root: Path) -> dict:
         raise _meta_error("missing 'time_grid' object")
 
     step_ms = time_grid.get("step_ms")
-    if step_ms != 100:
-        raise _meta_error(f"'time_grid.step_ms' must be 100 (got {step_ms!r})")
+    if step_ms != TIME_GRID_STEP_MS:
+        raise _meta_error(
+            f"'time_grid.step_ms' must be {TIME_GRID_STEP_MS} (got {step_ms!r})"
+        )
 
     guard_ms = time_grid.get("guard_ms")
-    if guard_ms != 49:
-        raise _meta_error(f"'time_grid.guard_ms' must be 49 (got {guard_ms!r})")
+    if guard_ms != TIME_GRID_GUARD_MS:
+        raise _meta_error(
+            f"'time_grid.guard_ms' must be {TIME_GRID_GUARD_MS} (got {guard_ms!r})"
+        )
 
     decision_policy = meta.get("decision_policy")
     if not isinstance(decision_policy, str) or (
