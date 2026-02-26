@@ -64,10 +64,9 @@ from CMSSL17 import (  # type: ignore
     LOOKBACK, AUX_DIM, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
     BATCH_SIZE, EPOCHS, WARMUP_EPOCHS, LR, PATIENCE,
     # schedules / deltas / lambdas
-    SSL_PRETRAIN_EPOCHS, MASK_PRETRAIN, MASK_FINETUNE, DIR_MASK_TAIL_FRACTION,
+    MASK_FINETUNE, DIR_MASK_TAIL_FRACTION,
     DELTA_RET, DELTA_LOGVOL,
     LAMBDA_BCE, LAMBDA_RET_MASKED, LAMBDA_VOL_MASKED,
-    LAMBDA_RECON_FT, LAMBDA_CPC_FT, LAMBDA_RECON_PT, LAMBDA_CPC_PT,
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC_HORIZON_MS,
     # utils
@@ -719,15 +718,12 @@ def train_from_offline():
     # ---------------- Epoch loop ----------------
     best = -float('inf') if primary_metric_mode == "max" else float('inf')
     no_imp = 0
-    ema_pre = {'recon': 1.0, 'cpc': 1.0}
     ema_ft  = {
         'ret': 1.0,
         'logvol': 1.0,
         'ret_masked': 1.0,
         'logvol_masked': 1.0,
         'bce': 1.0,
-        'recon': 1.0,
-        'cpc': 1.0,
     }
 
     for epoch in range(EPOCHS):
@@ -739,11 +735,10 @@ def train_from_offline():
 
         model.train()
         total_loss = 0.0
-        mratio = MASK_PRETRAIN if epoch < SSL_PRETRAIN_EPOCHS else MASK_FINETUNE
-        is_ssl_pretrain = (epoch < SSL_PRETRAIN_EPOCHS)
+        mratio = MASK_FINETUNE
 
-        pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS} ({'SSL-Pre' if is_ssl_pretrain else 'FT'}) mask={mratio:.2f}")
-        ep_ret = ep_logvol = ep_ret_masked = ep_logvol_masked = ep_bce = ep_recon = ep_cpc = 0.0
+        pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS} mask={mratio:.2f}")
+        ep_ret = ep_logvol = ep_ret_masked = ep_logvol_masked = ep_bce = 0.0
         n_batches = 0
 
         for x, y in pbar:
@@ -751,101 +746,65 @@ def train_from_offline():
 
             # ===== SAM pass #1 =====
             opt.base_optimizer.zero_grad()
-            ret_pred, vol_pred, dir_pred_logits, h_clean, h_masked, mask_idx, cpc_loss = model(x, mask_ratio=mratio)
+            ret_pred, vol_pred, dir_pred_logits = model(x, mask_ratio=mratio)
 
-            # Recon (Mamba-space distillation): target = h_clean (stop-grad)
-            B = x.size(0)
-            batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, mask_idx.shape[1])
-            recon = F.mse_loss(h_masked[batch_idx, mask_idx], h_clean.detach()[batch_idx, mask_idx])
+            y_ret = y[:, :NUM_HORIZONS]
+            y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+            mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
+            mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
+            mask = build_dir_mask(y_ret)
+            mse_ret_masked = compute_masked_regression_loss(
+                ret_pred, y_ret, delta_ret_tensor, mask, horizon_weights
+            )
+            mse_vol_masked = compute_masked_regression_loss(
+                vol_pred, y_logvol, delta_logvol_tensor, mask, horizon_weights
+            )
+            bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
-            if is_ssl_pretrain:
-                # Pretrain: recon + CPC only (EMA-normalized)
-                ema_recon = ema_update('recon', recon.item(), ema_pre)
-                ema_cpc   = ema_update('cpc',   cpc_loss.item(), ema_pre)
-                loss = LAMBDA_RECON_PT * (recon / (ema_recon + 1e-8)) + LAMBDA_CPC_PT * (cpc_loss / (ema_cpc + 1e-8))
-                ep_recon += recon.item(); ep_cpc += cpc_loss.item()
-            else:
-                # Fine-tune: supervised + tiny SSL auxiliaries (EMA-normalized)
-                y_ret = y[:, :NUM_HORIZONS]
-                y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
-                mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
-                mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-                mask = build_dir_mask(y_ret)
-                mse_ret_masked = compute_masked_regression_loss(
-                    ret_pred, y_ret, delta_ret_tensor, mask, horizon_weights
-                )
-                mse_vol_masked = compute_masked_regression_loss(
-                    vol_pred, y_logvol, delta_logvol_tensor, mask, horizon_weights
-                )
-                bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
-
-                ema_ret_masked = ema_update('ret_masked', mse_ret_masked.item(), ema_ft)
-                ema_logvol_masked = ema_update('logvol_masked', mse_vol_masked.item(), ema_ft)
-                ema_bce = ema_update('bce', bce_loss.item(), ema_ft)
-                ema_recon = ema_update('recon', recon.item(), ema_ft)
-                ema_cpc = ema_update('cpc', cpc_loss.item(), ema_ft)
-                loss = (LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
-                        LAMBDA_VOL_MASKED * (mse_vol_masked / (ema_logvol_masked + 1e-8)) +
-                        LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8)) +
-                        LAMBDA_RECON_FT * (recon / (ema_recon + 1e-8)) +
-                        LAMBDA_CPC_FT   * (cpc_loss / (ema_cpc + 1e-8)))
-                ep_ret += mse_ret.item(); ep_logvol += mse_vol.item()
-                ep_ret_masked += mse_ret_masked.item(); ep_logvol_masked += mse_vol_masked.item()
-                ep_bce += bce_loss.item(); ep_recon += recon.item(); ep_cpc += cpc_loss.item()
+            ema_ret_masked = ema_update('ret_masked', mse_ret_masked.item(), ema_ft)
+            ema_logvol_masked = ema_update('logvol_masked', mse_vol_masked.item(), ema_ft)
+            ema_bce = ema_update('bce', bce_loss.item(), ema_ft)
+            loss = (LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
+                    LAMBDA_VOL_MASKED * (mse_vol_masked / (ema_logvol_masked + 1e-8)) +
+                    LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8)))
+            ep_ret += mse_ret.item(); ep_logvol += mse_vol.item()
+            ep_ret_masked += mse_ret_masked.item(); ep_logvol_masked += mse_vol_masked.item()
+            ep_bce += bce_loss.item()
 
             loss.backward()
             opt.first_step(zero_grad=True)
 
             # ===== SAM pass #2 =====
-            ret_pred2, vol_pred2, dir_pred_logits2, h_clean2, h_masked2, _, cpc_loss2 = model(
-                x,
-                mask_ratio=mratio,
-                mask_idx=mask_idx,  # reuse original mask locations for pass #2
+            ret_pred2, vol_pred2, dir_pred_logits2 = model(x, mask_ratio=mratio)
+            y_ret = y[:, :NUM_HORIZONS]
+            y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+            mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
+            mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
+            mask2 = build_dir_mask(y_ret)
+            mse_ret2_masked = compute_masked_regression_loss(
+                ret_pred2, y_ret, delta_ret_tensor, mask2, horizon_weights
             )
-
-            # Recompute recon using original mask indices
-            recon2 = F.mse_loss(
-                h_masked2[batch_idx, mask_idx],
-                h_clean2.detach()[batch_idx, mask_idx],
+            mse_vol2_masked = compute_masked_regression_loss(
+                vol_pred2, y_logvol, delta_logvol_tensor, mask2, horizon_weights
             )
-            if is_ssl_pretrain:
-                # reuse same loss components
-                loss2 = LAMBDA_RECON_PT * (recon2 / (ema_pre['recon'] + 1e-8)) + LAMBDA_CPC_PT * (cpc_loss2 / (ema_pre['cpc'] + 1e-8))
-            else:
-                y_ret = y[:, :NUM_HORIZONS]
-                y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
-                mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
-                mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-                mask2 = build_dir_mask(y_ret)
-                mse_ret2_masked = compute_masked_regression_loss(
-                    ret_pred2, y_ret, delta_ret_tensor, mask2, horizon_weights
-                )
-                mse_vol2_masked = compute_masked_regression_loss(
-                    vol_pred2, y_logvol, delta_logvol_tensor, mask2, horizon_weights
-                )
-                bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
-                loss2 = (LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
-                         LAMBDA_VOL_MASKED * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
-                         LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8)) +
-                         LAMBDA_RECON_FT * (recon2 / (ema_ft['recon'] + 1e-8)) +
-                         LAMBDA_CPC_FT   * (cpc_loss2 / (ema_ft['cpc'] + 1e-8)))
+            bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
+            loss2 = (LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
+                     LAMBDA_VOL_MASKED * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
+                     LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8)))
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.second_step(zero_grad=True)
 
             total_loss += float(loss.item())
             n_batches += 1
-            if is_ssl_pretrain:
-                pbar.set_postfix(loss=f"{(total_loss/n_batches):.4f}", recon=f"{ep_recon/max(1,n_batches):.4f}", cpc=f"{ep_cpc/max(1,n_batches):.4f}")
-            else:
-                pbar.set_postfix(
-                    loss=f"{(total_loss/n_batches):.4f}",
-                    ret=f"{ep_ret/max(1,n_batches):.4f}",
-                    vol=f"{ep_logvol/max(1,n_batches):.4f}",
-                    ret_m=f"{ep_ret_masked/max(1,n_batches):.4f}",
-                    vol_m=f"{ep_logvol_masked/max(1,n_batches):.4f}",
-                    bce=f"{ep_bce/max(1,n_batches):.4f}",
-                )
+            pbar.set_postfix(
+                loss=f"{(total_loss/n_batches):.4f}",
+                ret=f"{ep_ret/max(1,n_batches):.4f}",
+                vol=f"{ep_logvol/max(1,n_batches):.4f}",
+                ret_m=f"{ep_ret_masked/max(1,n_batches):.4f}",
+                vol_m=f"{ep_logvol_masked/max(1,n_batches):.4f}",
+                bce=f"{ep_bce/max(1,n_batches):.4f}",
+            )
 
         # ---------------- Validation ----------------
         model.eval()
@@ -878,7 +837,7 @@ def train_from_offline():
                 y_return = y_targets[:, :NUM_HORIZONS]
                 y_logvol = y_targets[:, NUM_HORIZONS:2 * NUM_HORIZONS]
 
-                ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
+                ret_pred, vol_pred, dir_pred_logits = model(x, mask_ratio=0.0)
 
                 ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
                 vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
@@ -1104,7 +1063,7 @@ def train_from_offline():
             y_return = y[:, :NUM_HORIZONS]
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
 
-            ret_pred, vol_pred, dir_pred_logits, *_ = model(x, mask_ratio=0.0)
+            ret_pred, vol_pred, dir_pred_logits = model(x, mask_ratio=0.0)
 
             ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
             vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
