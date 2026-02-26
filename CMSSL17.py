@@ -880,19 +880,6 @@ class SAMBA(nn.Module):
         # Mamba backbone (forward/backward fusion) + pooling
         self.mamba = Mamba(args, ff_hid=DMODEL)
 
-        # SSL bits
-        self.mask_token = nn.Parameter(torch.randn(1, 1, args.d_model))
-        self.cpc_deltas = CPC_DELTAS_MS
-        self.cpc_predictors = nn.ModuleDict({
-            f"ms{d}": nn.Linear(self.args.d_model, 2 * self.args.d_model, bias=False)
-            for d in CPC_DELTAS_MS
-        })
-        # EMA teacher for CPC targets (teacher = EMA(student))
-        self.mamba_teacher = copy.deepcopy(self.mamba)
-        for p in self.mamba_teacher.parameters():
-            p.requires_grad = False
-        self.teacher_momentum = 0.99
-
         # Heads
         fused_dim = args.d_model * 2
         head_hidden_dim = fused_dim * 2
@@ -915,122 +902,16 @@ class SAMBA(nn.Module):
             nn.Linear(head_hidden_dim, NUM_HORIZONS)
         )
 
-    @torch.no_grad()
-    def update_teacher(self, m: float = None):
-        """EMA update for teacher parameters."""
-        if m is None:
-            m = self.teacher_momentum
-        for p_t, p_s in zip(self.mamba_teacher.parameters(), self.mamba.parameters()):
-            p_t.data.mul_(m).add_(p_s.data, alpha=(1.0 - m))
-
-    def compute_cpc_loss(self, h_student: torch.Tensor, h_teacher: torch.Tensor, dt_patch: torch.Tensor) -> torch.Tensor:
-        """CPC loss between student forward states and teacher bidirectional targets.
-
-        Args:
-            h_student: [B, P, D] forward student states (anchors).
-            h_teacher: [B, P, 2D] teacher fused states computed without future leakage.
-            dt_patch: [B, P] patch-level time deltas.
-        """
-        # dt_patch encodes ms progression along the patch dimension
-        cum_t = torch.cumsum(dt_patch, dim=1)  # ms from left to right in patch space
-
-        total = 0.0
-        count = 0
-        B, P, D = h_student.shape
-        for dms in CPC_DELTAS_MS:
-            # For each (b, i), we need j >= i with cum_t[b,j] - cum_t[b,i] >= dms
-            # Build j by scanning once per sequence via broadcasting
-            t_i = cum_t.unsqueeze(2)                # [B,P,1]
-            t_j = cum_t.unsqueeze(1)                # [B,1,P]
-            # mask of valid targets
-            valid = (t_j - t_i) >= dms
-            # take first True along last dim
-            idx_j = valid.float().argmax(dim=2)     # [B,P] (argmax=0 if none; handle via mask)
-            has = valid.any(dim=2)
-            # gather teacher targets at j
-            gather_j = idx_j
-            b_idx = torch.arange(B, device=h_student.device).unsqueeze(-1).expand(B, P)
-            h_tgt = h_teacher[b_idx, gather_j]  # [B,P,2D]
-            proj = self.cpc_predictors[f"ms{dms}"](h_student)  # [B,P,2D]
-            # InfoNCE-like cosine distance with stop-grad target
-            loss = 1.0 - F.cosine_similarity(proj, h_tgt.detach(), dim=-1)  # [B,P]
-            total += (loss * has.float()).sum()
-            count += has.float().sum().clamp_min(1.0)
-        return total / count
-
-
-    def forward(self, x, mask_ratio=0.0, mask_idx: torch.Tensor = None):
-        """
-        Training path returns: pooled, ret_pred, vol_pred, dir_logits,
-        h_clean (student fused), h_masked (student fused on masked input), mask_idx, cpc_loss.
-        Eval path returns predictions only.
-        """
+    def forward(self, x):
         x_permuted = x.permute(0, 2, 1)
         h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
-        # Tokens expose log1p(dt_ms); invert to recover raw millisecond gaps for CPC geometry.
-        log_dt = x[..., -3]
-        log_dt = log_dt.clamp_min(0.0)
-        dt_raw = torch.expm1(log_dt).clamp_min(0.0)
-        ps = self.depatch_proj_encoder.depatch.patch_size
-        stride = self.depatch_proj_encoder.depatch.box_coder.patch_stride
-        dt_patch = dt_raw.unfold(1, ps, stride).sum(-1)
 
-        # Student (clean)
-        pooled, h_clean, h_clean_fwd = self.mamba(h_tokens, embedded=True)
+        pooled, _, _ = self.mamba(h_tokens, embedded=True)
         ret = self.return_head(pooled)
         vol = self.volatility_head(pooled)
         dir_logits = self.direction_head(pooled)
 
-        # Teacher (clean, no grad) for CPC (bidirectional over observed past window)
-        h_teacher_fused = self.compute_teacher_cpc_targets(h_tokens)
-
-        # Masked pass (student) for reconstruction distillation in Mamba space
-        B, L, D = h_tokens.shape
-        if mask_idx is None:
-            mcnt = max(1, int(mask_ratio * L))
-            mask_idx = torch.stack(
-                [torch.randperm(L, device=x.device)[:mcnt] for _ in range(B)]
-            )  # [B, mcnt]
-        else:
-            mcnt = mask_idx.shape[1]
-        h_masked_input = h_tokens.clone()
-        batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, mcnt)
-        h_masked_input[batch_idx, mask_idx] = self.mask_token  # replace masked tokens
-
-        _, h_masked, _ = self.mamba(h_masked_input, embedded=True)
-
-        # CPC loss (computed here so both SAM passes align)
-        cpc_loss = self.compute_cpc_loss(h_clean_fwd, h_teacher_fused, dt_patch)
-        
-        return ret, vol, dir_logits, h_clean, h_masked, mask_idx, cpc_loss
-
-    @torch.no_grad()
-    def compute_teacher_cpc_targets(self, h_tokens: torch.Tensor) -> torch.Tensor:
-        """Compute teacher representations for CPC without peeking past prediction horizons.
-
-        Runs the teacher forward stack once (causal) and recomputes the backward
-        stack on prefixes so each position only uses information available up to
-        that timestep. Returns fused [B, L, 2D] tensors.
-        """
-        teacher = self.mamba_teacher
-
-        # Forward stack is causal, so a single pass suffices.
-        x_fwd = teacher._run_stack(h_tokens, teacher.blocks_fwd, teacher.ffns_fwd)
-        h_fwd = teacher.norm_fwd(x_fwd)
-
-        B, L, _ = h_tokens.shape
-        bwd_states = []
-        for end in range(1, L + 1):
-            prefix = h_tokens[:, :end]
-            rev_prefix = torch.flip(prefix, dims=[1])
-            x_bwd_rev = teacher._run_stack(rev_prefix, teacher.blocks_bwd, teacher.ffns_bwd)
-            # The first element in reversed space corresponds to the latest original index.
-            x_bwd_last = x_bwd_rev[:, 0]
-            h_bwd_last = teacher.norm_bwd(x_bwd_last)
-            bwd_states.append(h_bwd_last)
-
-        h_bwd = torch.stack(bwd_states, dim=1)
-        return torch.cat([h_fwd, h_bwd], dim=-1)
+        return ret, vol, dir_logits
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
