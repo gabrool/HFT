@@ -516,8 +516,6 @@ EMA_DECAY       = 0.99
 LAMBDA_BCE      = 1.00
 LAMBDA_RET      = 0.50
 LAMBDA_VOL      = 0.50
-LAMBDA_RET_MASKED = 0.0
-LAMBDA_VOL_MASKED = 0.0
 
 # Huber deltas (per horizon).
 # We start from calibrated 250ms thresholds (1e-4 return, 0.02 log-vol)

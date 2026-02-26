@@ -66,7 +66,7 @@ from CMSSL17 import (  # type: ignore
     # schedules / deltas / lambdas
     DIR_MASK_TAIL_FRACTION,
     DELTA_RET, DELTA_LOGVOL,
-    LAMBDA_BCE, LAMBDA_RET_MASKED, LAMBDA_VOL_MASKED,
+    LAMBDA_BCE, LAMBDA_RET, LAMBDA_VOL,
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC_HORIZON_MS,
     # utils
@@ -795,8 +795,8 @@ def train_from_offline():
             ema_ret_masked = ema_update('ret_masked', mse_ret_masked.item(), ema_ft)
             ema_logvol_masked = ema_update('logvol_masked', mse_vol_masked.item(), ema_ft)
             ema_bce = ema_update('bce', bce_loss.item(), ema_ft)
-            loss = (LAMBDA_RET_MASKED * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
-                    LAMBDA_VOL_MASKED * (mse_vol_masked / (ema_logvol_masked + 1e-8)) +
+            loss = (LAMBDA_RET * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
+                    LAMBDA_VOL * (mse_vol_masked / (ema_logvol_masked + 1e-8)) +
                     LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8)))
             ep_ret += mse_ret.item(); ep_logvol += mse_vol.item()
             ep_ret_masked += mse_ret_masked.item(); ep_logvol_masked += mse_vol_masked.item()
@@ -819,8 +819,8 @@ def train_from_offline():
                 vol_pred2, y_logvol, delta_logvol_tensor, noise_filter_mask2, horizon_weights
             )
             bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
-            loss2 = (LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
-                     LAMBDA_VOL_MASKED * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
+            loss2 = (LAMBDA_RET * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
+                     LAMBDA_VOL * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
                      LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8)))
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
