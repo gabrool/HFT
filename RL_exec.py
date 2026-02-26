@@ -109,7 +109,44 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
 
     ckpt = torch.load(ckpt_path, map_location=device)
     state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    model.load_state_dict(state, strict=True)
+    require(isinstance(state, dict), "CMSSL checkpoint state_dict must be a mapping")
+
+    model_state = model.state_dict()
+    filtered_state = {}
+    for key, value in state.items():
+        k = key[7:] if isinstance(key, str) and key.startswith("module.") else key
+        if k in model_state:
+            filtered_state[k] = value
+
+    loaded = model.load_state_dict(filtered_state, strict=False)
+    if loaded.unexpected_keys:
+        warnings.warn(
+            f"Ignoring unexpected CMSSL checkpoint keys: {loaded.unexpected_keys[:10]}"
+            + (" ..." if len(loaded.unexpected_keys) > 10 else "")
+        )
+    if loaded.missing_keys:
+        warnings.warn(
+            f"CMSSL checkpoint missing model keys: {loaded.missing_keys[:10]}"
+            + (" ..." if len(loaded.missing_keys) > 10 else "")
+        )
+
+    loaded_keys = set(filtered_state.keys())
+    required_prefixes = (
+        "depatch_proj_encoder.",
+        "mamba.",
+        "return_head.",
+        "volatility_head.",
+        "direction_head.",
+    )
+    missing_components = [
+        prefix for prefix in required_prefixes
+        if not any(k.startswith(prefix) for k in loaded_keys)
+    ]
+    require(
+        not missing_components,
+        "CMSSL checkpoint is incompatible; required components not loaded: "
+        + ", ".join(missing_components),
+    )
     model.eval()
     return model, meta
 
@@ -120,8 +157,7 @@ def cmssl_predict(model, x_core, x_aux, meta, device: str = "cuda"):
     x_core = torch.as_tensor(x_core, device=device)
     x_aux = torch.as_tensor(x_aux, device=device)
     x = torch.cat([x_core, x_aux], dim=-1)
-    mask_idx = torch.empty((x.shape[0], 0), dtype=torch.long, device=device)
-    ret_pred, vol_pred, dir_logits, *_ = model(x, mask_ratio=0.0, mask_idx=mask_idx)
+    ret_pred, vol_pred, dir_logits = model(x)
     horizons = meta.get("horizons_ms", [])
     expected_h = len(horizons)
     require(expected_h > 0, "meta['horizons_ms'] must be non-empty")
