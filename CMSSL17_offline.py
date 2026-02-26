@@ -48,6 +48,11 @@ from offline_tokens import (
 )
 
 # ---------------- Import from CMSSL17 ----------------
+# Configure CUDA allocator only for this entrypoint execution to avoid
+# import-time side effects when CMSSL17 is used as a library module.
+if __name__ == "__main__":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)

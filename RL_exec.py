@@ -11,6 +11,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+# Configure CUDA allocator only when this script is run directly, so
+# importing RL_exec as a module does not mutate global environment state.
+if __name__ == "__main__":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from CMSSL17 import (
     SAMBA,
     ModelArgs,
