@@ -11,10 +11,20 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from CMSSL17 import SAMBA, ModelArgs, DMODEL, MAMBA_LAYERS, LOOKBACK
+from CMSSL17 import (
+    SAMBA,
+    ModelArgs,
+    DMODEL,
+    MAMBA_LAYERS,
+    LOOKBACK,
+    TIME_GRID_GUARD_MS,
+    TIME_GRID_STEP_MS,
+)
 from offline_tokens import iter_week_chunks, load_global_meta
 
-RAW_SNAPSHOT_EXPECTED_STEP_MS = 100
+RAW_SNAPSHOT_EXPECTED_STEP_MS = int(TIME_GRID_STEP_MS)
+RAW_SNAPSHOT_EXPECTED_GUARD_MS = int(TIME_GRID_GUARD_MS)
+# Time-grid contract is centralized in CMSSL17.py.
 RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "best_bid",
     "best_ask",
@@ -75,9 +85,9 @@ def _require_grid_quantized_decision_meta(meta: Dict[str, Any]) -> None:
     time_grid = meta.get("time_grid")
     if not isinstance(time_grid, dict):
         raise ValueError(contract_error)
-    if int(time_grid.get("step_ms", -1)) != 100:
+    if int(time_grid.get("step_ms", -1)) != RAW_SNAPSHOT_EXPECTED_STEP_MS:
         raise ValueError(contract_error)
-    if int(time_grid.get("guard_ms", -1)) != 49:
+    if int(time_grid.get("guard_ms", -1)) != RAW_SNAPSHOT_EXPECTED_GUARD_MS:
         raise ValueError(contract_error)
     if meta.get("decision_policy") != "ob_only_grid_quantized":
         raise ValueError(contract_error)
@@ -725,7 +735,7 @@ def align_snapshots_to_decisions(
             f"missing={len(missing)} total={decision_ts.size} "
             f"samples={missing[:sample_count]}. "
             "Run offline_snapshots.py and ensure "
-            "decision_policy=ob_only_grid_quantized with guard_ms=49; "
+            f"decision_policy=ob_only_grid_quantized with guard_ms={RAW_SNAPSHOT_EXPECTED_GUARD_MS}; "
             "timestamps must land on snapshot grid"
         )
     return aligned_idx
