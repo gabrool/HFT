@@ -404,7 +404,6 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 ssm_state.zero_()
         return conv_state, ssm_state
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 _TS_SECONDS_THRESHOLD = Decimal("1e12")
