@@ -457,11 +457,27 @@ def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndar
         pos_lo_list.append(pos_lo); pos_hi_list.append(pos_hi)
         neg_lo_list.append(neg_lo); neg_hi_list.append(neg_hi)
         print(f"  {horizon}ms → pos:[{pos_lo:.3e}, {pos_hi:.3e}]  neg|mag:[{neg_lo:.3e}, {neg_hi:.3e}] (tail {DIR_MASK_TAIL_FRACTION:.2%})")
+
+    pos_lo_arr = np.array(pos_lo_list, dtype=np.float32)
+    pos_hi_arr = np.array(pos_hi_list, dtype=np.float32)
+    neg_lo_arr = np.array(neg_lo_list, dtype=np.float32)
+    neg_hi_arr = np.array(neg_hi_list, dtype=np.float32)
+
+    pos_mask = y_ret > 0
+    neg_mask = y_ret < 0
+    neg_mag = -y_ret
+    keep_mask = (
+        (pos_mask & (y_ret >= pos_lo_arr) & (y_ret <= pos_hi_arr))
+        | (neg_mask & (neg_mag >= neg_lo_arr) & (neg_mag <= neg_hi_arr))
+    )
+    removed_row_pct = 100.0 * float((~keep_mask.any(axis=1)).mean())
+    print(f"[directional-noise-filter] removed rows/timestamps: {removed_row_pct:.2f}%")
+
     return (
-        np.array(pos_lo_list, dtype=np.float32),
-        np.array(pos_hi_list, dtype=np.float32),
-        np.array(neg_lo_list, dtype=np.float32),
-        np.array(neg_hi_list, dtype=np.float32),
+        pos_lo_arr,
+        pos_hi_arr,
+        neg_lo_arr,
+        neg_hi_arr,
     )
 
 def make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi):
