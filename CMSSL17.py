@@ -465,6 +465,24 @@ SINGLE_WEEK_PATIENCE = 3
 AUX_DIM        = 3
 TIME_GRID_STEP_MS = 100
 TIME_GRID_GUARD_MS = 49
+
+
+def quantize_ts_ms(
+    ts_ms: int,
+    step_ms: int = TIME_GRID_STEP_MS,
+    guard_ms: int = TIME_GRID_GUARD_MS,
+) -> int:
+    t = int(ts_ms)
+    step = int(step_ms)
+    guard = int(guard_ms)
+    grid = ((t + step // 2) // step) * step
+    if abs(t - grid) > guard:
+        raise ValueError(
+            f"Timestamp {t}ms is off-grid by {abs(t - grid)}ms (guard={guard}ms, step={step}ms)"
+        )
+    return int(grid)
+
+
 NUM_HEADS       = 8
 WARMUP_EPOCHS   = max(1, int(EPOCHS * 0.05))  # Warmup over first 5% of epochs
 
