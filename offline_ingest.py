@@ -14,7 +14,6 @@ Environment variables (read via os.environ.get in this module):
   BYBIT_PCA_BATCH=4096
   BYBIT_PCA_MODEL=pca_model.npz
   BYBIT_PCA_USE_EXISTING=0
-  BYBIT_WORKERS=8
   BYBIT_RAM_BUDGET_MB=512            # memory budget for one chunk
   BYBIT_CHUNK_SIZE=4096              # 0 = auto from budget; else fixed size
 
@@ -49,8 +48,6 @@ PCA_BATCH_SIZE      = int(os.environ.get("BYBIT_PCA_BATCH", "4096"))
 PCA_MODEL_FILENAME  = os.environ.get("BYBIT_PCA_MODEL", "pca_model.npz")
 PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 
-# Parallelism / sequence geometry
-WORKERS     = int(os.environ.get("BYBIT_WORKERS", "8"))
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "4096"))
@@ -1338,7 +1335,7 @@ def main():
 
     chosen_weeks = [wk for wk, _ob, _th in pairs]
 
-    print(f"[plan ] weeks={len(pairs)} workers={WORKERS} "
+    print(f"[plan ] weeks={len(pairs)} "
           f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
     print(f"[weeks] {', '.join(chosen_weeks)}")
 
@@ -1346,8 +1343,6 @@ def main():
     print(f"[paths] TH_DIR={TH_DIR}")
     print(f"[out  ] OUT_ROOT={OUT_ROOT}")
 
-    if WORKERS > 1:
-        print("[warn ] WORKERS>1 requested but process_all runs sequentially; using 1 worker")
 
     train_weeks, val_weeks, test_weeks = classify_week_splits(pairs)
     split_info = {
