@@ -1,5 +1,6 @@
 import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time
 from collections import deque
+from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
 import numpy as np
 import torch
 import torch.nn as nn
@@ -406,10 +407,25 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
-def coerce_ts_ms(value: Union[int, float, str]) -> int:
-    """Convert a timestamp-like value to integer milliseconds."""
+_TS_SECONDS_THRESHOLD = Decimal("1e12")
+_TS_MILLI_SCALE = Decimal("1000")
+
+
+def timestamp_to_ms_half_even(value: Union[int, float, str]) -> int:
+    """Convert timestamp-like values to integer milliseconds.
+
+    Policy:
+      - Values with absolute magnitude < 1e12 are interpreted as seconds and
+        scaled by 1000.
+      - Larger magnitudes are interpreted as millisecond-like values.
+      - Conversion to integer milliseconds uses bankers rounding
+        (ROUND_HALF_EVEN) so .5 ties are deterministic and unbiased.
+    """
     if value is None:
         raise ValueError("Timestamp value is missing (None)")
+
+    if isinstance(value, bool):
+        raise ValueError(f"Unparseable timestamp value: {value!r}")
 
     if isinstance(value, str):
         value = value.strip()
@@ -417,14 +433,29 @@ def coerce_ts_ms(value: Union[int, float, str]) -> int:
             raise ValueError("Timestamp value is missing (empty string)")
 
     try:
-        numeric = float(value)
-    except (TypeError, ValueError) as exc:
+        if isinstance(value, str):
+            numeric = Decimal(value)
+        elif isinstance(value, int):
+            numeric = Decimal(value)
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError(f"Unparseable timestamp value: {value!r}")
+            numeric = Decimal(str(value))
+        else:
+            numeric = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
         raise ValueError(f"Unparseable timestamp value: {value!r}") from exc
 
-    if not math.isfinite(numeric):
+    if not numeric.is_finite():
         raise ValueError(f"Unparseable timestamp value: {value!r}")
 
-    return int(numeric * 1000.0) if abs(numeric) < 1e12 else int(numeric)
+    scaled = numeric * _TS_MILLI_SCALE if abs(numeric) < _TS_SECONDS_THRESHOLD else numeric
+    return int(scaled.to_integral_value(rounding=ROUND_HALF_EVEN))
+
+
+def coerce_ts_ms(value: Union[int, float, str]) -> int:
+    """Convert a timestamp-like value to integer milliseconds."""
+    return timestamp_to_ms_half_even(value)
 
 
 

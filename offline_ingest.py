@@ -29,7 +29,6 @@ import threading
 from pathlib import Path
 from typing import List, Tuple, Iterable, Dict, Optional
 from collections import deque, defaultdict
-from decimal import Decimal, ROUND_HALF_EVEN
 import itertools
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -68,6 +67,7 @@ from CMSSL17 import (
     BybitRawIter,
     TIME_GRID_STEP_MS,
     TIME_GRID_GUARD_MS,
+    timestamp_to_ms_half_even,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
 
@@ -306,7 +306,6 @@ def _assert_weeks_consecutive(pairs: List[Tuple[str, str, str]]):
                 f"'{next_wk}' ({next_start.date()}–{next_end.date()})."
             )
 
-_DEC_THOUSAND = Decimal("1000")
 
 
 def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], List[str], List[str]]:
@@ -374,20 +373,18 @@ def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
     for ts_ms, seq, row in tr_iter:
         t_raw = row.get("timestamp", "")
         try:
-            ts_dec_ms = (Decimal(t_raw) * _DEC_THOUSAND).to_integral_value(
-                rounding=ROUND_HALF_EVEN
-            )
-        except Exception:
+            ts_ms_precise = timestamp_to_ms_half_even(t_raw)
+        except ValueError:
             # Safe fallback for missing/unparseable timestamp values.
             yield int(ts_ms), seq, row
             continue
 
         # Whole-second trades must preserve BybitRawIter.trade_iter() bucket spreading.
-        if int(ts_dec_ms) % 1000 == 0:
+        if ts_ms_precise % 1000 == 0:
             yield int(ts_ms), seq, row
             continue
 
-        yield int(ts_dec_ms), seq, row
+        yield ts_ms_precise, seq, row
 
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
     # exact tail order: [log_dt_ms, is_trade, events_100ms]
