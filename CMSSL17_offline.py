@@ -470,8 +470,22 @@ def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndar
         (pos_mask & (y_ret >= pos_lo_arr) & (y_ret <= pos_hi_arr))
         | (neg_mask & (neg_mag >= neg_lo_arr) & (neg_mag <= neg_hi_arr))
     )
-    removed_row_pct = 100.0 * float((~keep_mask.any(axis=1)).mean())
-    print(f"[directional-noise-filter] removed rows/timestamps: {removed_row_pct:.2f}%")
+    kept_per_h = keep_mask.mean(axis=0)
+    per_horizon_line = " | ".join(
+        f"{horizon}ms={float(kept):.2%}" for horizon, kept in zip(HORIZONS_MS, kept_per_h)
+    )
+    print(f"[dir-mask] kept per horizon: {per_horizon_line}")
+
+    main_idx = NUM_HORIZONS - 1
+    main_kept = float(keep_mask[:, main_idx].mean())
+    main_removed = 1.0 - main_kept
+    print(
+        f"[dir-mask] main horizon {HORIZONS_MS[main_idx]}ms kept={main_kept:.2%}, removed={main_removed:.2%}"
+    )
+
+    none_kept = float((~keep_mask.any(axis=1)).mean())
+    all_kept = float((keep_mask.all(axis=1)).mean())
+    print(f"[dir-mask] row sanity: none_kept={none_kept:.2%}, all_kept={all_kept:.2%}")
 
     return (
         pos_lo_arr,
