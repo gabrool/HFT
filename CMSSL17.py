@@ -1244,11 +1244,13 @@ class FeatureEngine:
         self.spread_changes_250ms: Deque[int] = deque()
         self.spread_changes_500ms: Deque[int] = deque()
         self.spread_changes_1s: Deque[int] = deque()
+        self.spread_changes_5s: Deque[int] = deque()
         self._spread_change_deques: Dict[int, Deque[int]] = {
             100: self.spread_changes_100ms,
             250: self.spread_changes_250ms,
             500: self.spread_changes_500ms,
             1000: self.spread_changes_1s,
+            5_000: self.spread_changes_5s,
         }
 
         # ---------- Best-level churn & depletion ----------
@@ -1300,10 +1302,13 @@ class FeatureEngine:
         self.quotes_250ms: Deque[int] = deque()
         self.quotes_500ms: Deque[int] = deque()
         self.quotes_1s: Deque[int] = deque()
+        self.quotes_5s: Deque[int] = deque()
         self._quote_window_deques: Dict[int, Deque[int]] = {
             100: self.quotes_100ms,
             250: self.quotes_250ms,
             500: self.quotes_500ms,
+            1_000: self.quotes_1s,
+            5_000: self.quotes_5s,
         }
 
         # ---------- Event density (100/250/500 ms) ----------
@@ -1874,7 +1879,6 @@ class FeatureEngine:
             self._update_book_from_ob(payload)
             for window, deq in self._quote_window_deques.items():
                 self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
-            self._append_ts_with_guard(self.quotes_1s, ts_ms, 1_000, is_ob_event=True)
         else:
             self._update_trade_windows(ts_ms, payload, dt_ms)
 
@@ -2112,11 +2116,11 @@ class FeatureEngine:
 
         quote_counts = {
             1_000: len(self.quotes_1s),
-            5_000: len(self.quotes_1s),
+            5_000: len(self.quotes_5s),
         }
         spread_change_counts = {
             1_000: len(self._spread_change_deques[1_000]),
-            5_000: 0,
+            5_000: len(self._spread_change_deques[5_000]),
         }
         bid1_change_counts = {ms: len(self._bid1_change_deques[ms]) for ms in self.bestlvl_windows}
         ask1_change_counts = {ms: len(self._ask1_change_deques[ms]) for ms in self.bestlvl_windows}
