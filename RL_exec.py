@@ -717,23 +717,19 @@ def align_snapshots_to_decisions(
     if decision_ts.size and np.any(np.diff(decision_ts) < 0):
         raise ValueError("decision_ts must be monotonically non-decreasing (np.diff(decision_ts) >= 0)")
 
-    index = {int(t): i for i, t in enumerate(snapshot_ts)}
-    aligned_idx = np.empty(decision_ts.shape[0], dtype=np.int64)
-    missing: List[int] = []
-    for i, ts_i in enumerate(decision_ts):
-        idx = index.get(int(ts_i))
-        if idx is None:
-            missing.append(int(ts_i))
-            aligned_idx[i] = -1
-        else:
-            aligned_idx[i] = int(idx)
+    aligned_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
+    in_bounds = aligned_idx < snapshot_ts.shape[0]
+    exact_match = np.zeros(decision_ts.shape[0], dtype=bool)
+    exact_match[in_bounds] = snapshot_ts[aligned_idx[in_bounds]] == decision_ts[in_bounds]
+    missing_mask = ~exact_match
 
-    if missing:
-        sample_count = min(5, len(missing))
+    if np.any(missing_mask):
+        missing = decision_ts[missing_mask]
+        sample_count = min(5, int(missing.shape[0]))
         raise ValueError(
             "Snapshot alignment failed; exact timestamp matches missing. "
-            f"missing={len(missing)} total={decision_ts.size} "
-            f"samples={missing[:sample_count]}. "
+            f"missing={missing.shape[0]} total={decision_ts.size} "
+            f"samples={missing[:sample_count].tolist()}. "
             "Run offline_snapshots.py and ensure "
             f"decision_policy=ob_only_grid_quantized with guard_ms={RAW_SNAPSHOT_EXPECTED_GUARD_MS}; "
             "timestamps must land on snapshot grid"
