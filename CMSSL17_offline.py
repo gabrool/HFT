@@ -427,8 +427,10 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
     y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
     return X, y, int(feat_dim)
 
-# ---------------- Directional-mask quantiles from TRAIN set ----------------
+# ---------------- Directional-noise filter quantiles from TRAIN set ----------------
 def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    # Label-space noise trimming: keep only mid-quantile return magnitudes per direction/horizon;
+    # this is unrelated to token masking or masked-reconstruction objectives.
     y_ret = y_train[:, :NUM_HORIZONS].astype(np.float32)
     def _compute_trim_bounds(arr: np.ndarray) -> Tuple[float, float]:
         if arr.size == 0:
@@ -445,7 +447,7 @@ def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndar
     pos_hi_list = []
     neg_lo_list = []
     neg_hi_list = []
-    print("[dir-mask quantiles]")
+    print("[directional-noise-filter quantiles]")
     for idx, horizon in enumerate(HORIZONS_MS):
         horizon_returns = y_ret[:, idx]
         pos_returns = horizon_returns[horizon_returns > 0]
@@ -462,13 +464,14 @@ def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndar
         np.array(neg_hi_list, dtype=np.float32),
     )
 
-def make_build_dir_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi):
+def make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi):
+    # Build a label-space noise filter mask (mid-quantile magnitude keeper), not an SSL token mask.
     pos_lo_t = torch.from_numpy(pos_lo)
     pos_hi_t = torch.from_numpy(pos_hi)
     neg_lo_t = torch.from_numpy(neg_lo)
     neg_hi_t = torch.from_numpy(neg_hi)
 
-    def build_dir_mask(y_ret: torch.Tensor) -> torch.Tensor:
+    def build_directional_noise_filter_mask(y_ret: torch.Tensor) -> torch.Tensor:
         pos = y_ret > 0
         neg = y_ret < 0
         lo_pos = pos_lo_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
@@ -479,21 +482,21 @@ def make_build_dir_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi):
         keep_pos = pos & (y_ret >= lo_pos) & (y_ret <= hi_pos)
         keep_neg = neg & (mag_neg >= lo_neg) & (mag_neg <= hi_neg)
         return keep_pos | keep_neg
-    return build_dir_mask
+    return build_directional_noise_filter_mask
 
-def compute_directional_loss_fn(build_dir_mask_fn, horizon_weights: torch.Tensor):
+def compute_directional_loss_fn(build_directional_noise_filter_mask_fn, horizon_weights: torch.Tensor):
     def compute_directional_loss(logits: torch.Tensor, y_ret: torch.Tensor) -> torch.Tensor:
-        mask = build_dir_mask_fn(y_ret)
-        if not mask.any():
+        noise_filter_mask = build_directional_noise_filter_mask_fn(y_ret)
+        if not noise_filter_mask.any():
             return torch.tensor(0.0, device=logits.device)
         y_dir = (y_ret > 0).float()
         losses = []
         weights = []
         for h_idx in range(NUM_HORIZONS):
-            mask_h = mask[:, h_idx]
-            if mask_h.any():
+            noise_filter_mask_h = noise_filter_mask[:, h_idx]
+            if noise_filter_mask_h.any():
                 loss_h = F.binary_cross_entropy_with_logits(
-                    logits[mask_h, h_idx], y_dir[mask_h, h_idx], reduction='mean'
+                    logits[noise_filter_mask_h, h_idx], y_dir[noise_filter_mask_h, h_idx], reduction='mean'
                 )
                 losses.append(loss_h)
                 weights.append(horizon_weights[h_idx])
@@ -652,32 +655,32 @@ def train_from_offline():
             )
 
 
-    # ---------------- directional mask quantiles & loss closure ----------------
+    # ---------------- directional-noise filter quantiles & loss closure ----------------
     pos_lo, pos_hi, neg_lo, neg_hi = compute_dir_mask_quantiles_from_ytrain(y_train_for_quant)
-    build_dir_mask = make_build_dir_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi)
+    build_directional_noise_filter_mask = make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi)
     horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
     horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
     horizon_weights_np = horizon_weights_cpu.numpy()
     delta_ret_tensor = torch.as_tensor(DELTA_RET, dtype=torch.float32, device=device)
     delta_logvol_tensor = torch.as_tensor(DELTA_LOGVOL, dtype=torch.float32, device=device)
-    compute_directional_loss = compute_directional_loss_fn(build_dir_mask, horizon_weights)
+    compute_directional_loss = compute_directional_loss_fn(build_directional_noise_filter_mask, horizon_weights)
 
     def compute_masked_regression_loss(
         pred: torch.Tensor,
         target: torch.Tensor,
         delta: torch.Tensor,
-        mask: torch.Tensor,
+        noise_filter_mask: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
-        if not mask.any():
+        if not noise_filter_mask.any():
             return torch.tensor(0.0, device=pred.device)
         loss_elem = huber_loss(pred, target, delta, reduction='none')
         losses = []
         weight_list = []
         for h_idx in range(NUM_HORIZONS):
-            mask_h = mask[:, h_idx]
-            if mask_h.any():
-                loss_h = loss_elem[mask_h, h_idx].mean()
+            noise_filter_mask_h = noise_filter_mask[:, h_idx]
+            if noise_filter_mask_h.any():
+                loss_h = loss_elem[noise_filter_mask_h, h_idx].mean()
                 losses.append(loss_h)
                 weight_list.append(weights[h_idx])
         if not losses:
@@ -752,12 +755,12 @@ def train_from_offline():
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
             mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
             mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-            mask = build_dir_mask(y_ret)
+            noise_filter_mask = build_directional_noise_filter_mask(y_ret)
             mse_ret_masked = compute_masked_regression_loss(
-                ret_pred, y_ret, delta_ret_tensor, mask, horizon_weights
+                ret_pred, y_ret, delta_ret_tensor, noise_filter_mask, horizon_weights
             )
             mse_vol_masked = compute_masked_regression_loss(
-                vol_pred, y_logvol, delta_logvol_tensor, mask, horizon_weights
+                vol_pred, y_logvol, delta_logvol_tensor, noise_filter_mask, horizon_weights
             )
             bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
@@ -780,12 +783,12 @@ def train_from_offline():
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
             mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
             mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-            mask2 = build_dir_mask(y_ret)
+            noise_filter_mask2 = build_directional_noise_filter_mask(y_ret)
             mse_ret2_masked = compute_masked_regression_loss(
-                ret_pred2, y_ret, delta_ret_tensor, mask2, horizon_weights
+                ret_pred2, y_ret, delta_ret_tensor, noise_filter_mask2, horizon_weights
             )
             mse_vol2_masked = compute_masked_regression_loss(
-                vol_pred2, y_logvol, delta_logvol_tensor, mask2, horizon_weights
+                vol_pred2, y_logvol, delta_logvol_tensor, noise_filter_mask2, horizon_weights
             )
             bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
             loss2 = (LAMBDA_RET_MASKED * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
@@ -861,26 +864,26 @@ def train_from_offline():
                     val_logits_all[h_idx].append(dir_pred_logits[:, h_idx].detach().cpu())
                     val_ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
 
-                mask = build_dir_mask(y_return)
+                noise_filter_mask = build_directional_noise_filter_mask(y_return)
                 for h_idx in range(NUM_HORIZONS):
-                    mask_h = mask[:, h_idx]
-                    if mask_h.any():
-                        ret_masked_h = ret_loss_elem[mask_h, h_idx]
-                        vol_masked_h = vol_loss_elem[mask_h, h_idx]
+                    noise_filter_mask_h = noise_filter_mask[:, h_idx]
+                    if noise_filter_mask_h.any():
+                        ret_masked_h = ret_loss_elem[noise_filter_mask_h, h_idx]
+                        vol_masked_h = vol_loss_elem[noise_filter_mask_h, h_idx]
                         val_ret_loss_masked_sum[h_idx] += ret_masked_h.sum().item()
-                        val_ret_loss_masked_count[h_idx] += mask_h.sum().item()
+                        val_ret_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
                         val_vol_loss_masked_sum[h_idx] += vol_masked_h.sum().item()
-                        val_vol_loss_masked_count[h_idx] += mask_h.sum().item()
-                        logits_h = dir_pred_logits[mask_h, h_idx]
-                        targets_h = y_dir[mask_h, h_idx]
+                        val_vol_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
+                        logits_h = dir_pred_logits[noise_filter_mask_h, h_idx]
+                        targets_h = y_dir[noise_filter_mask_h, h_idx]
                         val_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
                             logits_h, targets_h, reduction='sum'
                         ).item()
-                        val_bce_masked_count[h_idx] += mask_h.sum().item()
+                        val_bce_masked_count[h_idx] += noise_filter_mask_h.sum().item()
                         val_logits_masked[h_idx].append(logits_h.detach().cpu())
                         val_ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
                         val_acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
-                        val_masked_total[h_idx] += mask_h.sum().item()
+                        val_masked_total[h_idx] += noise_filter_mask_h.sum().item()
 
             # Aggregate metrics
             avg_val_ret_loss_per_h = val_ret_loss_sum / max(val_sample_total, 1)
@@ -1087,26 +1090,26 @@ def train_from_offline():
                 test_logits_all[h_idx].append(dir_pred_logits[:, h_idx].detach().cpu())
                 test_ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
 
-            mask = build_dir_mask(y_return)
+            noise_filter_mask = build_directional_noise_filter_mask(y_return)
             for h_idx in range(NUM_HORIZONS):
-                mask_h = mask[:, h_idx]
-                if mask_h.any():
-                    ret_masked_h = ret_loss_elem[mask_h, h_idx]
-                    vol_masked_h = vol_loss_elem[mask_h, h_idx]
+                noise_filter_mask_h = noise_filter_mask[:, h_idx]
+                if noise_filter_mask_h.any():
+                    ret_masked_h = ret_loss_elem[noise_filter_mask_h, h_idx]
+                    vol_masked_h = vol_loss_elem[noise_filter_mask_h, h_idx]
                     test_ret_loss_masked_sum[h_idx] += ret_masked_h.sum().item()
-                    test_ret_loss_masked_count[h_idx] += mask_h.sum().item()
+                    test_ret_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
                     test_vol_loss_masked_sum[h_idx] += vol_masked_h.sum().item()
-                    test_vol_loss_masked_count[h_idx] += mask_h.sum().item()
-                    logits_h = dir_pred_logits[mask_h, h_idx]
-                    targets_h = y_dir[mask_h, h_idx]
+                    test_vol_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
+                    logits_h = dir_pred_logits[noise_filter_mask_h, h_idx]
+                    targets_h = y_dir[noise_filter_mask_h, h_idx]
                     test_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
                         logits_h, targets_h, reduction='sum'
                     ).item()
-                    test_bce_masked_count[h_idx] += mask_h.sum().item()
+                    test_bce_masked_count[h_idx] += noise_filter_mask_h.sum().item()
                     test_logits_masked[h_idx].append(logits_h.detach().cpu())
                     test_ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
                     test_acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
-                    test_masked_total[h_idx] += mask_h.sum().item()
+                    test_masked_total[h_idx] += noise_filter_mask_h.sum().item()
 
     avg_test_ret_loss_per_h = test_ret_loss_sum / max(1, test_sample_total)
     avg_test_vol_loss_per_h = test_vol_loss_sum / max(1, test_sample_total)
