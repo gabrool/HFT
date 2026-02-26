@@ -473,11 +473,6 @@ HORIZONS_MS     = [250, 500, 1000]
 NUM_HORIZONS    = len(HORIZONS_MS)
 HORIZON_WEIGHTS = [0.05, 0.1, 1.0]
 
-# Masking / SSL schedule
-SSL_PRETRAIN_EPOCHS = 0      # Pretrain epochs (recon + CPC only)
-MASK_PRETRAIN       = 0.0    # Pretrain mask ratio
-MASK_FINETUNE       = 0.0    # Fine-tune mask ratio
-
 DIR_MASK_TAIL_FRACTION = 0.02
 EPOCHS          = 200
 LR              = 5e-4
@@ -523,10 +518,6 @@ LAMBDA_RET      = 0.50
 LAMBDA_VOL      = 0.50
 LAMBDA_RET_MASKED = 0.0
 LAMBDA_VOL_MASKED = 0.0
-LAMBDA_RECON_FT = 0.00
-LAMBDA_CPC_FT   = 0.00
-LAMBDA_RECON_PT = 0.00
-LAMBDA_CPC_PT   = 0.00
 
 # Huber deltas (per horizon).
 # We start from calibrated 250ms thresholds (1e-4 return, 0.02 log-vol)
@@ -535,9 +526,6 @@ LAMBDA_CPC_PT   = 0.00
 _DELTA_BASE_H = HORIZONS_MS[0]
 DELTA_RET       = [1e-4 * math.sqrt(h / _DELTA_BASE_H) for h in HORIZONS_MS]
 DELTA_LOGVOL    = [0.02 * math.sqrt(h / _DELTA_BASE_H) for h in HORIZONS_MS]
-
-# CPC settings
-CPC_DELTAS_MS   = [25, 50, 100]  # 25/50/100 ms
 
 # ---------------------------  Building blocks  ----------------------------
 @dataclass
@@ -2523,5 +2511,3 @@ def is_metric_improved(value: float, best: float, mode: str) -> bool:
     raise ValueError(f"Unsupported mode '{mode}'")
 
 # --------------------  Training loop  ---------------------
-def get_mask_ratio(epoch: int) -> float:
-    return MASK_PRETRAIN if epoch < SSL_PRETRAIN_EPOCHS else MASK_FINETUNE

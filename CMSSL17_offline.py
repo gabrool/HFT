@@ -64,7 +64,7 @@ from CMSSL17 import (  # type: ignore
     LOOKBACK, AUX_DIM, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
     BATCH_SIZE, EPOCHS, WARMUP_EPOCHS, LR, PATIENCE,
     # schedules / deltas / lambdas
-    MASK_FINETUNE, DIR_MASK_TAIL_FRACTION,
+    DIR_MASK_TAIL_FRACTION,
     DELTA_RET, DELTA_LOGVOL,
     LAMBDA_BCE, LAMBDA_RET_MASKED, LAMBDA_VOL_MASKED,
     DMODEL, MAMBA_LAYERS,
@@ -430,7 +430,7 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
 # ---------------- Directional-noise filter quantiles from TRAIN set ----------------
 def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     # Label-space noise trimming: keep only mid-quantile return magnitudes per direction/horizon;
-    # this is unrelated to token masking or masked-reconstruction objectives.
+    # this is unrelated to model token dropout objectives.
     y_ret = y_train[:, :NUM_HORIZONS].astype(np.float32)
     def _compute_trim_bounds(arr: np.ndarray) -> Tuple[float, float]:
         if arr.size == 0:
@@ -738,9 +738,7 @@ def train_from_offline():
 
         model.train()
         total_loss = 0.0
-        mratio = MASK_FINETUNE
-
-        pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS} mask={mratio:.2f}")
+        pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
         ep_ret = ep_logvol = ep_ret_masked = ep_logvol_masked = ep_bce = 0.0
         n_batches = 0
 
@@ -749,7 +747,7 @@ def train_from_offline():
 
             # ===== SAM pass #1 =====
             opt.base_optimizer.zero_grad()
-            ret_pred, vol_pred, dir_pred_logits = model(x, mask_ratio=mratio)
+            ret_pred, vol_pred, dir_pred_logits = model(x)
 
             y_ret = y[:, :NUM_HORIZONS]
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
@@ -778,7 +776,7 @@ def train_from_offline():
             opt.first_step(zero_grad=True)
 
             # ===== SAM pass #2 =====
-            ret_pred2, vol_pred2, dir_pred_logits2 = model(x, mask_ratio=mratio)
+            ret_pred2, vol_pred2, dir_pred_logits2 = model(x)
             y_ret = y[:, :NUM_HORIZONS]
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
             mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
@@ -840,7 +838,7 @@ def train_from_offline():
                 y_return = y_targets[:, :NUM_HORIZONS]
                 y_logvol = y_targets[:, NUM_HORIZONS:2 * NUM_HORIZONS]
 
-                ret_pred, vol_pred, dir_pred_logits = model(x, mask_ratio=0.0)
+                ret_pred, vol_pred, dir_pred_logits = model(x)
 
                 ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
                 vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
@@ -1066,7 +1064,7 @@ def train_from_offline():
             y_return = y[:, :NUM_HORIZONS]
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
 
-            ret_pred, vol_pred, dir_pred_logits = model(x, mask_ratio=0.0)
+            ret_pred, vol_pred, dir_pred_logits = model(x)
 
             ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
             vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
