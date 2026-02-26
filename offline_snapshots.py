@@ -111,14 +111,24 @@ class SnapshotSeries:
     best_ask: List[float]
     best_bid_size: List[float]
     best_ask_size: List[float]
+    time_since_last_ob_update_ms: List[float]
 
-    def append(self, ts_ms: int, bid: float, ask: float, bid_size: float, ask_size: float) -> None:
+    def append(
+        self,
+        ts_ms: int,
+        bid: float,
+        ask: float,
+        bid_size: float,
+        ask_size: float,
+        stale_ms: float,
+    ) -> None:
         # Invariant: every per-row series must be appended in lockstep.
         self.ts.append(int(ts_ms))
         self.best_bid.append(float(bid))
         self.best_ask.append(float(ask))
         self.best_bid_size.append(float(bid_size))
         self.best_ask_size.append(float(ask_size))
+        self.time_since_last_ob_update_ms.append(max(float(stale_ms), 0.0))
 
     def to_npz(self, path: Path) -> None:
         """Save canonical snapshot arrays.
@@ -135,7 +145,12 @@ class SnapshotSeries:
         # Invariant: all per-row arrays must remain equal length.
         n_rows = len(self.ts)
         if not (
-            n_rows == len(self.best_bid) == len(self.best_ask) == len(self.best_bid_size) == len(self.best_ask_size)
+            n_rows
+            == len(self.best_bid)
+            == len(self.best_ask)
+            == len(self.best_bid_size)
+            == len(self.best_ask_size)
+            == len(self.time_since_last_ob_update_ms)
         ):
             raise ValueError("SnapshotSeries arrays have mismatched lengths")
         snapshots = np.column_stack(
@@ -145,18 +160,27 @@ class SnapshotSeries:
             path,
             ts=np.asarray(self.ts, dtype=np.int64),
             snapshots=snapshots,
+            time_since_last_ob_update_ms=np.asarray(self.time_since_last_ob_update_ms, dtype=np.float32),
         )
 
 
 def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
     fe = FeatureEngine()
-    series = SnapshotSeries(ts=[], best_bid=[], best_ask=[], best_bid_size=[], best_ask_size=[])
+    series = SnapshotSeries(
+        ts=[],
+        best_bid=[],
+        best_ask=[],
+        best_bid_size=[],
+        best_ask_size=[],
+        time_since_last_ob_update_ms=[],
+    )
 
     next_sample_ts: Optional[int] = None
     last_bid: Optional[float] = None
     last_ask: Optional[float] = None
     last_bsz: Optional[float] = None
     last_asz: Optional[float] = None
+    last_ob_update_ts: Optional[int] = None
 
     for raw in iter_ob_events(ob_path):
         etype, ts_ms_raw, payload = fe._parse_event(raw)
@@ -170,9 +194,11 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
             and last_bsz is not None
             and last_asz is not None
             and next_sample_ts is not None
+            and last_ob_update_ts is not None
         ):
             while next_sample_ts < ts_ms:
-                series.append(next_sample_ts, last_bid, last_ask, last_bsz, last_asz)
+                stale_ms = max(next_sample_ts - last_ob_update_ts, 0)
+                series.append(next_sample_ts, last_bid, last_ask, last_bsz, last_asz, stale_ms)
                 next_sample_ts += TIME_GRID_STEP_MS
 
         fe._update_book_from_ob(payload)
@@ -188,23 +214,27 @@ def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
             series.best_ask[-1] = float(ask)
             series.best_bid_size[-1] = float(bsz)
             series.best_ask_size[-1] = float(asz)
+            series.time_since_last_ob_update_ms[-1] = 0.0
             last_bid = bid
             last_ask = ask
             last_bsz = bsz
             last_asz = asz
+            last_ob_update_ts = int(ts_ms)
             continue
 
         if next_sample_ts is None:
             next_sample_ts = int(ts_ms)
 
         while next_sample_ts <= ts_ms:
-            series.append(next_sample_ts, bid, ask, bsz, asz)
+            stale_ms = max(next_sample_ts - ts_ms, 0)
+            series.append(next_sample_ts, bid, ask, bsz, asz, stale_ms)
             next_sample_ts += TIME_GRID_STEP_MS
 
         last_bid = bid
         last_ask = ask
         last_bsz = bsz
         last_asz = asz
+        last_ob_update_ts = int(ts_ms)
 
     return series
 

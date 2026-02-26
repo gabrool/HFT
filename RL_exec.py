@@ -35,6 +35,7 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "best_ask",
     "best_bid_size",
     "best_ask_size",
+    "time_since_last_ob_update_ms",
     "imbalance",
     "mid",
     "spread_bps",
@@ -613,7 +614,16 @@ def _rolling_std_ignore_nan(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def _sanitize_snapshot_features(arr: np.ndarray) -> np.ndarray:
-    target_cols = ["best_bid_size", "best_ask_size", "imbalance", "mid_ret_1", "vol_short", "vol_long", "spread_bps"]
+    target_cols = [
+        "best_bid_size",
+        "best_ask_size",
+        "time_since_last_ob_update_ms",
+        "imbalance",
+        "mid_ret_1",
+        "vol_short",
+        "vol_long",
+        "spread_bps",
+    ]
     arr = np.asarray(arr).copy()
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D snapshot feature array, got shape={arr.shape}.")
@@ -635,6 +645,7 @@ def _sanitize_snapshot_features(arr: np.ndarray) -> np.ndarray:
 def _compute_snapshot_feature_matrix(
     snapshot_ts: np.ndarray,
     snapshots: np.ndarray,
+    time_since_last_ob_update_ms: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
     snapshots = np.asarray(snapshots)
@@ -649,6 +660,13 @@ def _compute_snapshot_feature_matrix(
     best_ask = snapshots[:, 1].astype(np.float64)
     best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
     best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
+    if time_since_last_ob_update_ms is None:
+        time_since_last_ob_update_ms = np.zeros_like(best_bid, dtype=np.float64)
+    else:
+        time_since_last_ob_update_ms = np.asarray(time_since_last_ob_update_ms, dtype=np.float64)
+        if time_since_last_ob_update_ms.ndim != 1 or time_since_last_ob_update_ms.shape[0] != snapshot_ts.shape[0]:
+            raise ValueError("time_since_last_ob_update_ms must be shape [N].")
+        time_since_last_ob_update_ms = np.maximum(time_since_last_ob_update_ms[order], 0.0)
     mid = (best_bid + best_ask) / 2.0
     eps = 1e-9
     imbalance = (best_bid_size - best_ask_size) / (best_bid_size + best_ask_size + eps)
@@ -658,12 +676,24 @@ def _compute_snapshot_feature_matrix(
     vol_short = _rolling_std_ignore_nan(mid_ret_1, SHORT_VOL_WINDOW)
     vol_long = _rolling_std_ignore_nan(mid_ret_1, LONG_VOL_WINDOW)
     features = np.column_stack(
-        [best_bid, best_ask, best_bid_size, best_ask_size, imbalance, mid, spread_bps, mid_ret_1, vol_short, vol_long]
+        [
+            best_bid,
+            best_ask,
+            best_bid_size,
+            best_ask_size,
+            time_since_last_ob_update_ms,
+            imbalance,
+            mid,
+            spread_bps,
+            mid_ret_1,
+            vol_short,
+            vol_long,
+        ]
     )
     return snapshot_ts, _sanitize_snapshot_features(features)
 
 
-def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Load canonical raw snapshots only (no alternate ingestion fallbacks)."""
     week_dir = _find_week_dir(Path(out_root), week_key)
     canonical_path = week_dir / "snapshots.npz"
@@ -682,7 +712,8 @@ def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.nda
             f"{canonical_path} has snapshots shape {snapshots.shape}; expected [N,4] (bid, ask, bid_size, ask_size). "
             "Re-run offline_snapshots (1).py to regenerate."
         )
-    return data["ts"], snapshots
+    stale_ms = data["time_since_last_ob_update_ms"] if "time_since_last_ob_update_ms" in data.files else None
+    return data["ts"], snapshots, stale_ms
 
 
 def _format_ts(ts_ms: int) -> str:
@@ -727,7 +758,7 @@ def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
 
     canonical_snapshot_ts_parts: List[np.ndarray] = []
     for week in split_weeks:
-        week_snapshot_ts, _snapshots = load_raw_snapshots(out_root, week)
+        week_snapshot_ts, _snapshots, _stale_ms = load_raw_snapshots(out_root, week)
         canonical_snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
     canonical_snapshot_ts = np.concatenate(canonical_snapshot_ts_parts, axis=0)
     canonical_snapshot_ts = np.asarray(canonical_snapshot_ts, dtype=np.int64)
@@ -912,10 +943,11 @@ def build_joined_split(
 
         # Canonical snapshot flow: load_raw_snapshots(...) ->
         # _compute_snapshot_feature_matrix(...).
-        week_snapshot_ts, week_raw_snapshots = load_raw_snapshots(out_root, wk)
+        week_snapshot_ts, week_raw_snapshots, week_stale_ms = load_raw_snapshots(out_root, wk)
         snapshot_ts, snapshots = _compute_snapshot_feature_matrix(
             np.asarray(week_snapshot_ts, dtype=np.int64),
             np.asarray(week_raw_snapshots),
+            None if week_stale_ms is None else np.asarray(week_stale_ms, dtype=np.float64),
         )
         snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
         snapshots = np.asarray(snapshots, dtype=np.float32)
