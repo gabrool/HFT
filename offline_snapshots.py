@@ -80,26 +80,16 @@ def extract_week_key_from_name(name: str) -> str:
     m = re.search(r"\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}", name)
     if m:
         return m.group(0)
-    m = re.search(r"\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2}", name)
-    if m:
-        return m.group(0)
     raise ValueError(f"Could not extract week key from file name: {name}")
 
 
-def _parse_week_key_any(base: str) -> Tuple[datetime, datetime, str]:
-    wk = re.sub(r"^(BTCUSDT_(?:OB|TH)_)", "", base)
-    wk = re.sub(r"\.(?:zip|gz|jsonl|csv)$", "", wk)
-    m = re.match(r"(\d{2}-\d{2}-\d{4})-to-(\d{2}-\d{2}-\d{4})", wk)
-    if m:
-        s = datetime.strptime(m.group(1), "%d-%m-%Y")
-        e = datetime.strptime(m.group(2), "%d-%m-%Y")
-        return s, e, wk
-    m = re.match(r"(\d{4}-\d{2}-\d{2})-to-(\d{4}-\d{2}-\d{2})", wk)
-    if m:
-        s = datetime.strptime(m.group(1), "%Y-%m-%d")
-        e = datetime.strptime(m.group(2), "%Y-%m-%d")
-        return s, e, wk
-    raise ValueError(f"Unrecognized week key: {base}")
+def _parse_week_key(week_key: str) -> Tuple[datetime, datetime, str]:
+    m = re.fullmatch(r"(\d{2}-\d{2}-\d{4})-to-(\d{2}-\d{2}-\d{4})", week_key)
+    if not m:
+        raise ValueError(f"Unrecognized week key: {week_key}")
+    s = datetime.strptime(m.group(1), "%d-%m-%Y")
+    e = datetime.strptime(m.group(2), "%d-%m-%Y")
+    return s, e, week_key
 
 
 def _build_ob_daily_map(ob_dir: str) -> dict[date, str]:
@@ -310,7 +300,7 @@ def filter_weeks(weeks_in_order: List[str], requested: Optional[List[str]]) -> L
 
 
 def daily_ob_paths_for_week(week_key: str, ob_by_day: dict[date, str]) -> List[str]:
-    start_dt, end_dt, _ = _parse_week_key_any("BTCUSDT_OB_" + week_key)
+    start_dt, end_dt, _ = _parse_week_key(week_key)
     d0, d1 = start_dt.date(), end_dt.date()
     paths = []
     missing = []
