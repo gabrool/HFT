@@ -35,7 +35,7 @@ Shared constants from CMSSL17:
   The decision-time grid contract is centralized in CMSSL17.py.
 """
 
-import os, sys, csv, json, re, time
+import os, sys, csv, json, re, time, logging
 import queue
 import threading
 from pathlib import Path
@@ -44,6 +44,8 @@ from collections import deque, defaultdict
 import itertools
 import numpy as np
 from datetime import date, datetime, timezone, timedelta
+
+logger = logging.getLogger(__name__)
 
 # ---------------- config ----------------
 OB_DIR      = os.environ.get("BYBIT_OB_DIR",   "/home/gabrool/Documents/OB")
@@ -495,12 +497,12 @@ def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
         try:
             ts_ms_precise = timestamp_to_ms_half_even(t_raw)
         except ValueError:
+            logger.warning(
+                "Falling back to coarse trade timestamp for seq=%s raw_timestamp=%r",
+                seq,
+                t_raw,
+            )
             # Safe fallback for missing/unparseable timestamp values.
-            yield int(ts_ms), seq, row
-            continue
-
-        # Whole-second trades must preserve BybitRawIter.trade_iter() bucket spreading.
-        if ts_ms_precise % 1000 == 0:
             yield int(ts_ms), seq, row
             continue
 
