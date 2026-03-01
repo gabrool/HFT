@@ -437,6 +437,15 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
     ob_by_day = _build_ob_daily_map(ob_dir)
     th_by_day = _build_th_daily_map(th_dir)
 
+    missing_th_days = sorted(set(ob_by_day) - set(th_by_day))
+    missing_ob_days = sorted(set(th_by_day) - set(ob_by_day))
+    if missing_th_days:
+        missing_th_fmt = [d.strftime("%Y-%m-%d") for d in missing_th_days]
+        print(f"Warning: missing TH for days with OB data: {missing_th_fmt}")
+    if missing_ob_days:
+        missing_ob_fmt = [d.strftime("%Y-%m-%d") for d in missing_ob_days]
+        print(f"Warning: missing OB for days with TH data: {missing_ob_fmt}")
+
     common_days = sorted(set(ob_by_day) & set(th_by_day))
     if not common_days:
         return []
