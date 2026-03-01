@@ -1720,10 +1720,16 @@ class FeatureEngine:
             deq.append(entry)
             self._update_trade_window_state_with_insert(window, entry)
 
-        # Update volume-regime (vol/sec) EWMAs using provided dt_ms
-        vol_rate = size / (dt_ms / 1000.0)  # base per second
+        dt_trade_ms = (
+            max(1.0, float(ts_ms - self.last_trade_ts))
+            if self.last_trade_ts is not None
+            else max(1.0, float(dt_ms))
+        )
+
+        # Update volume-regime (vol/sec) EWMAs using trade-arrival timing
+        vol_rate = size / (dt_trade_ms / 1000.0)  # base per second
         for hl in self.regime_windows_ms:
-            self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_ms, hl)
+            self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
 
         # VPIN bucket sizing and accumulation
         v_per_sec = max(self.volume_ewma[1_000], 1e-9)
