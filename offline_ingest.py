@@ -387,8 +387,6 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
 def _week_path_label(paths: List[str]) -> str:
     if not paths:
         return "[]"
-    if len(paths) == 1:
-        return os.path.basename(paths[0])
     return f"{os.path.basename(paths[0])} ... {os.path.basename(paths[-1])} ({len(paths)} files)"
 
 
@@ -883,8 +881,8 @@ class EventFeeder:
 
     def run(self):
         try:
-            for wk, ob_path, th_path in self.pairs:
-                merged = _iter_week_merged_events(wk, ob_path, th_path)
+            for wk, ob_paths, th_paths in self.pairs:
+                merged = _iter_week_merged_events(wk, ob_paths, th_paths)
 
                 first_event = next(merged, None)
                 if first_event is None:
