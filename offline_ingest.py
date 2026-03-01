@@ -153,23 +153,6 @@ def _parse_requested_weeks(raw: str) -> List[str]:
     # Preserve potential duplicates in the env var for explicit validation later
     return items
 
-def list_glob(dir_path: str, pattern: str) -> List[str]:
-    import glob
-    return sorted(glob.glob(os.path.join(dir_path, pattern)))
-
-def _normalise_ob_prefix(base: str) -> str:
-    if base.startswith("BTCUSDT_OB_"):
-        return base
-    if base.startswith("BTCUSDT_TH_"):
-        return "BTCUSDT_OB_" + base[len("BTCUSDT_TH_"):]
-    return base
-
-def _week_key(path: str, prefix: str) -> str:
-    base = os.path.basename(path)
-    base = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', base)
-    return base.replace(prefix, "")
-
-
 _EXT_PRIORITY = {
     ".zip": 0,
     ".gz": 1,
@@ -187,22 +170,6 @@ TH_DAILY_RE = re.compile(
     r"^BTCUSDT(?P<d>\d{4}-\d{2}-\d{2})\.csv(\.(gz|gzip))?$",
     re.IGNORECASE,
 )
-
-
-def _choose_preferred_week_file(wk_key: str, candidates: List[str], side: str) -> str:
-    def _sort_key(path: str):
-        p = Path(path)
-        ext_rank = _EXT_PRIORITY.get(p.suffix, 4)
-        return (ext_rank, p.name, str(p))
-
-    chosen = min(candidates, key=_sort_key)
-    if len(candidates) > 1:
-        alternatives = sorted([p for p in candidates if p != chosen], key=_sort_key)
-        print(
-            f"Warning: duplicate {side} files for week '{wk_key}'; "
-            f"chosen='{chosen}', alternatives={alternatives}"
-        )
-    return chosen
 
 
 def _choose_preferred_daily_file(day: date, candidates: List[str], side: str) -> str:
@@ -238,18 +205,6 @@ def _choose_preferred_daily_file(day: date, candidates: List[str], side: str) ->
             f"chosen='{chosen}', alternatives={alternatives}"
         )
     return chosen
-
-
-def _build_week_file_map(files: List[str], side: str) -> Dict[str, str]:
-    groups: Dict[str, List[str]] = defaultdict(list)
-    for path in files:
-        wk_key = extract_week_key_from_name(os.path.basename(path))
-        groups[wk_key].append(path)
-
-    return {
-        wk_key: _choose_preferred_week_file(wk_key, candidates, side)
-        for wk_key, candidates in groups.items()
-    }
 
 
 def _build_ob_daily_map(ob_dir: str) -> Dict[date, str]:
@@ -355,9 +310,7 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
 
     return groups
 
-def _parse_week_key_any(base: str):
-    wk = re.sub(r'^(BTCUSDT_(?:OB|TH)_)', '', base)
-    wk = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', wk)
+def _parse_week_key_any(wk: str):
     m = re.match(r"(\d{2}-\d{2}-\d{4})-to-(\d{2}-\d{2}-\d{4})", wk)
     if m:
         s = datetime.strptime(m.group(1), "%d-%m-%Y")
@@ -368,28 +321,7 @@ def _parse_week_key_any(base: str):
         s = datetime.strptime(m.group(1), "%Y-%m-%d")
         e = datetime.strptime(m.group(2), "%Y-%m-%d")
         return s, e, wk
-    raise ValueError(f"Unrecognized week key: {base}")
-
-def _parse_week_from_pair(ob_path: str, th_path: str):
-    ob_base = os.path.basename(ob_path)
-    th_base = os.path.basename(th_path)
-    ob_key = _normalise_ob_prefix(ob_base)
-    th_key = _normalise_ob_prefix(th_base)
-    try:
-        start_ob, end_ob, wk = _parse_week_key_any(ob_key)
-    except ValueError as exc:
-        raise ValueError(f"Failed to parse week range from OB file '{ob_base}': {exc}") from exc
-    try:
-        start_th, end_th, _ = _parse_week_key_any(th_key)
-    except ValueError as exc:
-        raise ValueError(f"Failed to parse week range from TH file '{th_base}': {exc}") from exc
-    if (start_ob, end_ob) != (start_th, end_th):
-        raise ValueError(
-            "Mismatch between OB/TH week ranges: "
-            f"OB='{ob_base}' ({start_ob.date()}→{end_ob.date()}) vs "
-            f"TH='{th_base}' ({start_th.date()}→{end_th.date()})"
-        )
-    return start_ob, end_ob, wk
+    raise ValueError(f"Unrecognized week key: {wk}")
 
 WeekPath = Union[str, List[str]]
 WeekPair = Tuple[str, WeekPath, WeekPath]
@@ -414,8 +346,29 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
         ob_files = sorted(str(p) for p in weekly_ob)
         th_files = sorted(str(p) for p in weekly_th)
 
-        ob_map = _build_week_file_map(ob_files, "OB")
-        th_map = _build_week_file_map(th_files, "TH")
+        def _build_grouped_week_map(files: List[str], side: str) -> Dict[str, str]:
+            groups: Dict[str, List[str]] = defaultdict(list)
+            for path in files:
+                wk_key = extract_week_key_from_name(os.path.basename(path))
+                groups[wk_key].append(path)
+
+            chosen_map: Dict[str, str] = {}
+            for wk_key, candidates in groups.items():
+                chosen = min(candidates, key=lambda p: (_EXT_PRIORITY.get(Path(p).suffix, 4), Path(p).name, str(p)))
+                if len(candidates) > 1:
+                    alternatives = sorted(
+                        [p for p in candidates if p != chosen],
+                        key=lambda p: (_EXT_PRIORITY.get(Path(p).suffix, 4), Path(p).name, str(p)),
+                    )
+                    print(
+                        f"Warning: duplicate {side} files for week '{wk_key}'; "
+                        f"chosen='{chosen}', alternatives={alternatives}"
+                    )
+                chosen_map[wk_key] = chosen
+            return chosen_map
+
+        ob_map = _build_grouped_week_map(ob_files, "OB")
+        th_map = _build_grouped_week_map(th_files, "TH")
 
         common = sorted(set(ob_map) & set(th_map))
         if not common:
@@ -432,7 +385,13 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
         for wk_key in common:
             ob_path = ob_map[wk_key]
             th_path = th_map[wk_key]
-            start_dt, end_dt, wk = _parse_week_from_pair(ob_path, th_path)
+            try:
+                start_dt, end_dt, wk = _parse_week_key_any(wk_key)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Failed to parse week range from aligned files '{os.path.basename(ob_path)}' "
+                    f"and '{os.path.basename(th_path)}': {exc}"
+                ) from exc
             rows.append((end_dt, start_dt, wk, ob_path, th_path))
 
         rows.sort()
@@ -490,7 +449,7 @@ def _assert_week_order(pairs: List[WeekPair]):
 
     parsed = []
     for wk, ob_p, th_p in pairs:
-        start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
+        start_dt, end_dt, _ = _parse_week_key_any(wk)
         parsed.append((start_dt, end_dt, ob_p, th_p, wk))
 
     for idx in range(1, len(parsed)):
@@ -510,7 +469,7 @@ def _assert_weeks_consecutive(pairs: List[WeekPair]):
 
     parsed = []
     for wk, _ob_p, _th_p in pairs:
-        start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
+        start_dt, end_dt, _ = _parse_week_key_any(wk)
         parsed.append((start_dt, end_dt, wk))
 
     parsed.sort(key=lambda row: row[1])
@@ -556,7 +515,7 @@ def classify_week_splits(pairs: List[WeekPair]) -> Tuple[List[str], List[str], L
 def _sort_pairs_by_end(pairs: List[WeekPair]) -> List[WeekPair]:
     rows = []
     for wk, ob_p, th_p in pairs:
-        _start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
+        _start_dt, end_dt, _ = _parse_week_key_any(wk)
         rows.append((end_dt, wk, ob_p, th_p))
     rows.sort()
     return [(wk, ob_p, th_p) for _end, wk, ob_p, th_p in rows]
@@ -851,9 +810,7 @@ def _compute_dataset_span(pairs: List[WeekPair]):
     starts = []
     ends = []
     for wk, _ob_path, _th_path in pairs:
-        start_dt, end_dt, _ = _parse_week_key_any(
-            _normalise_ob_prefix(f"BTCUSDT_OB_{wk}")
-        )
+        start_dt, end_dt, _ = _parse_week_key_any(wk)
         starts.append(start_dt)
         ends.append(end_dt)
     return min(starts), max(ends)
@@ -868,9 +825,7 @@ def _dt_to_epoch_ms(dt: datetime) -> int:
 def _build_week_index(pairs: List[WeekPair]):
     index = []
     for wk, _ob_path, _th_path in pairs:
-        start_dt, end_dt, _ = _parse_week_key_any(
-            _normalise_ob_prefix(f"BTCUSDT_OB_{wk}")
-        )
+        start_dt, end_dt, _ = _parse_week_key_any(wk)
         start_ms = _dt_to_epoch_ms(start_dt)
         end_ms = _dt_to_epoch_ms(end_dt + timedelta(days=1))
         index.append((wk, start_ms, end_ms))
