@@ -898,6 +898,32 @@ def _iter_week_merged_events(
         # Daily chaining mode (list of per-day file pairs).
         ob_list = list(ob_paths)
         th_list = list(th_paths)
+
+        def _daily_path_day(path: str, side: str) -> date:
+            name = os.path.basename(path)
+            pattern = OB_DAILY_RE if side == "OB" else TH_DAILY_RE
+            m = pattern.match(name)
+            if not m:
+                raise ValueError(
+                    f"Could not parse daily date for {side} file '{name}' in week={week_key}"
+                )
+            return _parse_ymd_date(m.group("d"))
+
+        def _assert_daily_side_sorted(paths: List[str], side: str):
+            prev_day: Optional[date] = None
+            prev_name: Optional[str] = None
+            for path in paths:
+                day = _daily_path_day(path, side)
+                if prev_day is not None and day <= prev_day:
+                    raise ValueError(
+                        f"Daily file list is not sorted ascending by day: week={week_key} side={side} "
+                        f"prev={prev_name}({prev_day.isoformat()}) curr={os.path.basename(path)}({day.isoformat()})"
+                    )
+                prev_day = day
+                prev_name = os.path.basename(path)
+
+        _assert_daily_side_sorted(ob_list, "OB")
+        _assert_daily_side_sorted(th_list, "TH")
     elif (ob_is_str and th_is_list) or (ob_is_list and th_is_str):
         raise ValueError(
             "WeekPath type mismatch: OB is list but TH is str (or vice versa)."
