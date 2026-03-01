@@ -404,6 +404,8 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
         - Legacy weekly mode: `ob_paths`/`th_paths` are single file-path strings.
         - Daily fallback mode: `ob_paths`/`th_paths` are ordered 7-element lists,
           one path per day in the block.
+          Daily ingest is strict: OB/TH must have exact day parity before
+          grouping into 7-day weeks.
     """
     weekly_ob = list(Path(ob_dir).glob("BTCUSDT_OB_*"))
     weekly_th = list(Path(th_dir).glob("BTCUSDT_TH_*"))
@@ -441,12 +443,20 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
 
     missing_th_days = sorted(set(ob_by_day) - set(th_by_day))
     missing_ob_days = sorted(set(th_by_day) - set(ob_by_day))
-    if missing_th_days:
-        missing_th_fmt = [d.strftime("%Y-%m-%d") for d in missing_th_days]
-        print(f"Warning: missing TH for days with OB data: {missing_th_fmt}")
-    if missing_ob_days:
-        missing_ob_fmt = [d.strftime("%Y-%m-%d") for d in missing_ob_days]
-        print(f"Warning: missing OB for days with TH data: {missing_ob_fmt}")
+
+    def _format_missing_days(days: List[date]) -> str:
+        days_fmt = [d.strftime("%Y-%m-%d") for d in days]
+        if len(days_fmt) <= 10:
+            return f"count={len(days_fmt)}, full={days_fmt}"
+        sample = days_fmt[:5] + ["..."] + days_fmt[-5:]
+        return f"count={len(days_fmt)}, sample={sample}"
+
+    if missing_th_days or missing_ob_days:
+        raise ValueError(
+            "Daily ingest requires exact OB/TH date parity before week grouping. "
+            f"Missing TH days (present in OB): {_format_missing_days(missing_th_days)}. "
+            f"Missing OB days (present in TH): {_format_missing_days(missing_ob_days)}."
+        )
 
     common_days = sorted(set(ob_by_day) & set(th_by_day))
     if not common_days:
