@@ -308,12 +308,15 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
     return groups
 
 def _parse_week_key_any(wk: str):
-    m = re.match(r"(\d{2}-\d{2}-\d{4})-to-(\d{2}-\d{2}-\d{4})", wk)
+    m = re.fullmatch(r"(\d{2}-\d{2}-\d{4})-to-(\d{2}-\d{2}-\d{4})", wk)
     if m:
         s = datetime.strptime(m.group(1), "%d-%m-%Y")
         e = datetime.strptime(m.group(2), "%d-%m-%Y")
         return s, e, wk
-    raise ValueError(f"Unrecognized week key: {wk}")
+    raise ValueError(
+        "Unrecognized week key format. Expected 'DD-MM-YYYY-to-DD-MM-YYYY', "
+        f"got: {wk!r}"
+    )
 
 WeekPaths = List[str]
 WeekPair = Tuple[str, WeekPaths, WeekPaths]
