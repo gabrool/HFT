@@ -1055,7 +1055,7 @@ def _select_pca_components(sample_rows: np.ndarray, target_var: float) -> int:
 
 
 def maybe_fit_pca_model(
-    pairs: List[Tuple[str, str, str]],
+    pairs: List[WeekPair],
     out_root: str,
     train_weeks: List[str],
     target_var: float,
@@ -1064,6 +1064,13 @@ def maybe_fit_pca_model(
     model_filename: str,
     use_existing: int,
 ):
+    """Fit (or reuse) a PCA model using the training subset of mixed week pairs.
+
+    Each pair is ``(week_key, ob_paths, th_paths)`` where ``ob_paths`` and
+    ``th_paths`` may be either:
+    - a single weekly file path (legacy weekly layout), or
+    - a list of daily file paths for that 7-day week block.
+    """
     meta = {
         "applied": False,
         "var_kept": float(target_var),
@@ -1234,11 +1241,12 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
 
 
 def process_all(
-    pairs: List[Tuple[str, str, str]],
+    pairs: List[WeekPair],
     out_root: str,
     pca_meta: dict,
     split_info: Optional[Dict[str, List[str]]] = None,
 ):
+    """Run ingest across week pairs with weekly or daily OB/TH path variants."""
     ensure_dir(out_root)
 
     pca_summary = _summarise_pca_meta(pca_meta)
