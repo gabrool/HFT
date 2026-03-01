@@ -7,7 +7,7 @@ Decision-time ingest (memory-safe):
 Input layout support:
 - Legacy weekly OB/TH layout remains supported.
 - Daily layout is also supported:
-  - OB: YYYY-MM-DD_BTCUSDT_ob200.data.zip (and similar ob* variants).
+  - OB: YYYY-MM-DD_BTCUSDT_<ob*-containing-stem>*.zip.
   - TH: BTCUSDTYYYY-MM-DD.csv.gz, with tolerant handling for .csv / .csv.gzip.
 - pair_weeks() groups daily files into canonical 7-day keys:
   DD-MM-YYYY-to-DD-MM-YYYY.
@@ -177,8 +177,10 @@ _EXT_PRIORITY = {
     ".csv": 3,
 }
 
+# Daily OB names must start with YYYY-MM-DD_BTCUSDT_, include "ob" in the
+# stem (to avoid unrelated BTCUSDT zips), and end in .zip.
 OB_DAILY_RE = re.compile(
-    r"^(?P<d>\d{4}-\d{2}-\d{2})_BTCUSDT_.*ob.*\.data\.zip$",
+    r"^(?P<d>\d{4}-\d{2}-\d{2})_BTCUSDT_.*ob.*\.zip$",
     re.IGNORECASE,
 )
 TH_DAILY_RE = re.compile(
