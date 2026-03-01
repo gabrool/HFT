@@ -39,7 +39,7 @@ import os, sys, csv, json, re, time
 import queue
 import threading
 from pathlib import Path
-from typing import List, Tuple, Iterable, Dict, Optional, Union
+from typing import List, Tuple, Iterable, Dict, Optional
 from collections import deque, defaultdict
 import itertools
 import numpy as np
@@ -323,8 +323,8 @@ def _parse_week_key_any(wk: str):
         return s, e, wk
     raise ValueError(f"Unrecognized week key: {wk}")
 
-WeekPath = Union[str, List[str]]
-WeekPair = Tuple[str, WeekPath, WeekPath]
+WeekPaths = List[str]
+WeekPair = Tuple[str, WeekPaths, WeekPaths]
 
 
 def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
@@ -333,11 +333,10 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
 
     Returns:
         List of (week_key, ob_paths, th_paths), ordered by block end date ascending.
-        - Legacy weekly mode: `ob_paths`/`th_paths` are single file-path strings.
-        - Daily fallback mode: `ob_paths`/`th_paths` are ordered 7-element lists,
-          one path per day in the block.
-          Daily ingest is strict: OB/TH must have exact day parity before
-          grouping into 7-day weeks.
+        `ob_paths`/`th_paths` are ordered file-path lists. Weekly files are
+        represented as single-element lists; daily fallback mode uses 7-element
+        lists (one path per day in the block). Daily ingest is strict: OB/TH
+        must have exact day parity before grouping into 7-day weeks.
     """
     weekly_ob = list(Path(ob_dir).glob("BTCUSDT_OB_*"))
     weekly_th = list(Path(th_dir).glob("BTCUSDT_TH_*"))
@@ -392,7 +391,7 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
                     f"Failed to parse week range from aligned files '{os.path.basename(ob_path)}' "
                     f"and '{os.path.basename(th_path)}': {exc}"
                 ) from exc
-            rows.append((end_dt, start_dt, wk, ob_path, th_path))
+            rows.append((end_dt, start_dt, wk, [ob_path], [th_path]))
 
         rows.sort()
         return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in rows]
@@ -433,9 +432,7 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
     return [(wk, ob_p, th_p) for (_end, _start, wk, ob_p, th_p) in rows]
 
 
-def _week_path_label(paths: WeekPath) -> str:
-    if isinstance(paths, str):
-        return os.path.basename(paths)
+def _week_path_label(paths: List[str]) -> str:
     if not paths:
         return "[]"
     if len(paths) == 1:
@@ -837,69 +834,48 @@ def _build_week_index(pairs: List[WeekPair]):
 
 def _iter_week_merged_events(
     week_key: str,
-    ob_paths: WeekPath,
-    th_paths: WeekPath,
+    ob_paths: List[str],
+    th_paths: List[str],
 ):
-    ob_is_str = isinstance(ob_paths, str)
-    th_is_str = isinstance(th_paths, str)
-    ob_is_list = isinstance(ob_paths, list)
-    th_is_list = isinstance(th_paths, list)
+    ob_list = list(ob_paths)
+    th_list = list(th_paths)
 
-    if ob_is_str and th_is_str:
-        # Legacy weekly mode (single-file pair).
-        ob_list = [ob_paths]
-        th_list = [th_paths]
-    elif ob_is_list and th_is_list:
-        # Daily chaining mode (list of per-day file pairs).
-        ob_list = list(ob_paths)
-        th_list = list(th_paths)
+    def _daily_path_day(path: str, side: str) -> date:
+        name = os.path.basename(path)
+        pattern = OB_DAILY_RE if side == "OB" else TH_DAILY_RE
+        m = pattern.match(name)
+        if not m:
+            raise ValueError(
+                f"Could not parse daily date for {side} file '{name}' in week={week_key}"
+            )
+        return _parse_ymd_date(m.group("d"))
 
-        def _daily_path_day(path: str, side: str) -> date:
-            name = os.path.basename(path)
-            pattern = OB_DAILY_RE if side == "OB" else TH_DAILY_RE
-            m = pattern.match(name)
-            if not m:
+    def _assert_daily_side_sorted(paths: List[str], side: str):
+        prev_day: Optional[date] = None
+        prev_name: Optional[str] = None
+        for path in paths:
+            day = _daily_path_day(path, side)
+            if prev_day is not None and day <= prev_day:
                 raise ValueError(
-                    f"Could not parse daily date for {side} file '{name}' in week={week_key}"
+                    f"Daily file list is not sorted ascending by day: week={week_key} side={side} "
+                    f"prev={prev_name}({prev_day.isoformat()}) curr={os.path.basename(path)}({day.isoformat()})"
                 )
-            return _parse_ymd_date(m.group("d"))
+            prev_day = day
+            prev_name = os.path.basename(path)
 
-        def _assert_daily_side_sorted(paths: List[str], side: str):
-            prev_day: Optional[date] = None
-            prev_name: Optional[str] = None
-            for path in paths:
-                day = _daily_path_day(path, side)
-                if prev_day is not None and day <= prev_day:
-                    raise ValueError(
-                        f"Daily file list is not sorted ascending by day: week={week_key} side={side} "
-                        f"prev={prev_name}({prev_day.isoformat()}) curr={os.path.basename(path)}({day.isoformat()})"
-                    )
-                prev_day = day
-                prev_name = os.path.basename(path)
+    _assert_daily_side_sorted(ob_list, "OB")
+    _assert_daily_side_sorted(th_list, "TH")
 
-        _assert_daily_side_sorted(ob_list, "OB")
-        _assert_daily_side_sorted(th_list, "TH")
-
-        for ob_p, th_p in zip(ob_list, th_list):
-            ob_day = _daily_path_day(ob_p, "OB")
-            th_day = _daily_path_day(th_p, "TH")
-            if ob_day != th_day:
-                raise ValueError(
-                    "Daily OB/TH day mismatch: "
-                    f"week_key={week_key} "
-                    f"ob={os.path.basename(ob_p)}({ob_day.isoformat()}) "
-                    f"th={os.path.basename(th_p)}({th_day.isoformat()})"
-                )
-    elif (ob_is_str and th_is_list) or (ob_is_list and th_is_str):
-        raise ValueError(
-            "WeekPath type mismatch: OB is list but TH is str (or vice versa)."
-        )
-    else:
-        raise TypeError(
-            "WeekPath must be str (legacy weekly mode) or list[str] "
-            f"(daily chaining mode), got ob={type(ob_paths).__name__} "
-            f"th={type(th_paths).__name__}"
-        )
+    for ob_p, th_p in zip(ob_list, th_list):
+        ob_day = _daily_path_day(ob_p, "OB")
+        th_day = _daily_path_day(th_p, "TH")
+        if ob_day != th_day:
+            raise ValueError(
+                "Daily OB/TH day mismatch: "
+                f"week_key={week_key} "
+                f"ob={os.path.basename(ob_p)}({ob_day.isoformat()}) "
+                f"th={os.path.basename(th_p)}({th_day.isoformat()})"
+            )
 
     if len(ob_list) != len(th_list):
         raise ValueError(
@@ -1083,9 +1059,7 @@ def maybe_fit_pca_model(
     """Fit (or reuse) a PCA model using the training subset of mixed week pairs.
 
     Each pair is ``(week_key, ob_paths, th_paths)`` where ``ob_paths`` and
-    ``th_paths`` may be either:
-    - a single weekly file path (legacy weekly layout), or
-    - a list of daily file paths for that 7-day week block.
+    ``th_paths`` are ordered file-path lists.
     """
     meta = {
         "applied": False,
