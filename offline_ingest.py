@@ -7,7 +7,6 @@ Decision-time ingest (memory-safe):
 Input layout support:
 - OB: YYYY-MM-DD_BTCUSDT_...ob...*.zip.
 - TH: BTCUSDTYYYY-MM-DD.csv.gz, with tolerant handling for .csv / .csv.gzip.
-- Only daily OB/TH inputs are supported; older week-level filename schemes are intentionally not accepted.
 
 Downstream ingest contract:
 - pair_weeks() groups aligned daily OB/TH files into consecutive 7-day blocks
