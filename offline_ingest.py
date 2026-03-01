@@ -88,6 +88,8 @@ DECISION_GUARD_MS = int(TIME_GRID_GUARD_MS)
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
+# Weekly chaining guard for multi-file weeks. Strict by default (non-decreasing).
+WEEK_CHAIN_TS_TOLERANCE_MS = 0
 
 # fast json if available
 try:
@@ -857,7 +859,11 @@ def _build_week_index(pairs: List[WeekPair]):
 
 
 
-def _iter_week_merged_events(ob_paths: WeekPath, th_paths: WeekPath):
+def _iter_week_merged_events(
+    week_key: str,
+    ob_paths: WeekPath,
+    th_paths: WeekPath,
+):
     if isinstance(ob_paths, str):
         ob_list = [ob_paths]
     else:
@@ -874,9 +880,38 @@ def _iter_week_merged_events(ob_paths: WeekPath, th_paths: WeekPath):
             f"ob={len(ob_list)} th={len(th_list)}"
         )
 
+    last_ts_global: Optional[int] = None
+    prev_ob_name: Optional[str] = None
+    prev_th_name: Optional[str] = None
+
     for ob_path, th_path in zip(ob_list, th_list):
+        ob_name = os.path.basename(ob_path)
+        th_name = os.path.basename(th_path)
         raw = BybitRawIter(ob_path, th_path)
-        yield from merge_event_time(raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0)
+        for event in merge_event_time(raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0):
+            _etype, ts, _seq, _data = event
+            if (
+                last_ts_global is not None
+                and ts + WEEK_CHAIN_TS_TOLERANCE_MS < last_ts_global
+            ):
+                prev_pair = (
+                    f"{prev_ob_name} | {prev_th_name}"
+                    if prev_ob_name is not None and prev_th_name is not None
+                    else "<week-start>"
+                )
+                raise ValueError(
+                    "Non-monotonic timestamps while chaining daily files within week: "
+                    f"week={week_key} "
+                    f"prev_day_files={prev_pair} "
+                    f"curr_day_files={ob_name} | {th_name} "
+                    f"prev_ts={last_ts_global} curr_ts={ts} "
+                    f"tolerance_ms={WEEK_CHAIN_TS_TOLERANCE_MS}"
+                )
+
+            last_ts_global = ts
+            prev_ob_name = ob_name
+            prev_th_name = th_name
+            yield event
 
 class EventFeeder:
     def __init__(
@@ -894,7 +929,7 @@ class EventFeeder:
     def run(self):
         try:
             for wk, ob_path, th_path in self.pairs:
-                merged = _iter_week_merged_events(ob_path, th_path)
+                merged = _iter_week_merged_events(wk, ob_path, th_path)
 
                 first_event = next(merged, None)
                 if first_event is None:
