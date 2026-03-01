@@ -244,9 +244,6 @@ def extract_week_key_from_name(name: str) -> str:
     m = re.search(r"\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}", name)
     if m:
         return m.group(0)
-    m = re.search(r"\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2}", name)
-    if m:
-        return m.group(0)
     raise ValueError(f"Could not extract week key from file name: {name}")
 
 
@@ -315,11 +312,6 @@ def _parse_week_key_any(wk: str):
     if m:
         s = datetime.strptime(m.group(1), "%d-%m-%Y")
         e = datetime.strptime(m.group(2), "%d-%m-%Y")
-        return s, e, wk
-    m = re.match(r"(\d{4}-\d{2}-\d{2})-to-(\d{4}-\d{2}-\d{2})", wk)
-    if m:
-        s = datetime.strptime(m.group(1), "%Y-%m-%d")
-        e = datetime.strptime(m.group(2), "%Y-%m-%d")
         return s, e, wk
     raise ValueError(f"Unrecognized week key: {wk}")
 
