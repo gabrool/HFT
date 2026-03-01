@@ -930,6 +930,17 @@ def _iter_week_merged_events(
 
         _assert_daily_side_sorted(ob_list, "OB")
         _assert_daily_side_sorted(th_list, "TH")
+
+        for ob_p, th_p in zip(ob_list, th_list):
+            ob_day = _daily_path_day(ob_p, "OB")
+            th_day = _daily_path_day(th_p, "TH")
+            if ob_day != th_day:
+                raise ValueError(
+                    "Daily OB/TH day mismatch: "
+                    f"week_key={week_key} "
+                    f"ob={os.path.basename(ob_p)}({ob_day.isoformat()}) "
+                    f"th={os.path.basename(th_p)}({th_day.isoformat()})"
+                )
     elif (ob_is_str and th_is_list) or (ob_is_list and th_is_str):
         raise ValueError(
             "WeekPath type mismatch: OB is list but TH is str (or vice versa)."
