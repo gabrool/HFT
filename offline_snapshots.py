@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -66,14 +66,6 @@ def _parse_requested_weeks(raw: str) -> List[str]:
 
 def _parse_ymd_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
-
-
-def _daily_ob_day(path_or_name: str) -> date:
-    name = Path(path_or_name).name
-    m = OB_DAILY_RE.match(name)
-    if not m:
-        raise ValueError(f"Not a daily OB filename: {name}")
-    return _parse_ymd_date(m.group("d"))
 
 
 def extract_week_key_from_name(name: str) -> str:
@@ -272,10 +264,6 @@ def build_snapshots_from_ob_files(ob_paths: List[str]) -> SnapshotSeries:
         last_ob_update_ts = int(ts_ms)
 
     return series
-
-
-def build_snapshots_from_ob(ob_path: str) -> SnapshotSeries:
-    return build_snapshots_from_ob_files([ob_path])
 
 
 def load_weeks_in_order(out_root: str) -> List[str]:
