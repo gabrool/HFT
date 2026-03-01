@@ -217,12 +217,21 @@ def build_snapshots_from_ob_files(ob_paths: List[str]) -> SnapshotSeries:
     last_bsz: Optional[float] = None
     last_asz: Optional[float] = None
     last_ob_update_ts: Optional[int] = None
+    last_seen_ts_ms: Optional[int] = None
 
     for raw in iter_ob_events_many(ob_paths):
         etype, ts_ms_raw, payload = fe._parse_event(raw)
         ts_ms = quantize_ts_ms(ts_ms_raw, TIME_GRID_STEP_MS, TIME_GRID_GUARD_MS)
         if etype != "ob":
             continue
+        if last_seen_ts_ms is not None and ts_ms < last_seen_ts_ms:
+            raise ValueError(
+                "Non-decreasing quantized OB timestamps violated: "
+                f"previous_ts_ms={last_seen_ts_ms} current_ts_ms={ts_ms} "
+                f"raw_ts_ms={ts_ms_raw}. "
+                "Ordering across daily OB files may be broken."
+            )
+        last_seen_ts_ms = ts_ms
 
         if (
             last_bid is not None
