@@ -329,75 +329,27 @@ WeekPair = Tuple[str, WeekPaths, WeekPaths]
 
 def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
     """
-    Discover aligned OB/TH week inputs.
+    Discover aligned OB/TH daily inputs and emit 7-day week groups.
 
     Returns:
         List of (week_key, ob_paths, th_paths), ordered by block end date ascending.
-        `ob_paths`/`th_paths` are ordered file-path lists. Weekly files are
-        represented as single-element lists; daily fallback mode uses 7-element
-        lists (one path per day in the block). Daily ingest is strict: OB/TH
-        must have exact day parity before grouping into 7-day weeks.
+        `ob_paths`/`th_paths` are ordered 7-element file-path lists (one per
+        day in each week block). Day parity is strict: OB/TH must have exact
+        matching daily coverage before grouping.
     """
-    weekly_ob = list(Path(ob_dir).glob("BTCUSDT_OB_*"))
-    weekly_th = list(Path(th_dir).glob("BTCUSDT_TH_*"))
-
-    if weekly_ob and weekly_th:
-        ob_files = sorted(str(p) for p in weekly_ob)
-        th_files = sorted(str(p) for p in weekly_th)
-
-        def _build_grouped_week_map(files: List[str], side: str) -> Dict[str, str]:
-            groups: Dict[str, List[str]] = defaultdict(list)
-            for path in files:
-                wk_key = extract_week_key_from_name(os.path.basename(path))
-                groups[wk_key].append(path)
-
-            chosen_map: Dict[str, str] = {}
-            for wk_key, candidates in groups.items():
-                chosen = min(candidates, key=lambda p: (_EXT_PRIORITY.get(Path(p).suffix, 4), Path(p).name, str(p)))
-                if len(candidates) > 1:
-                    alternatives = sorted(
-                        [p for p in candidates if p != chosen],
-                        key=lambda p: (_EXT_PRIORITY.get(Path(p).suffix, 4), Path(p).name, str(p)),
-                    )
-                    print(
-                        f"Warning: duplicate {side} files for week '{wk_key}'; "
-                        f"chosen='{chosen}', alternatives={alternatives}"
-                    )
-                chosen_map[wk_key] = chosen
-            return chosen_map
-
-        ob_map = _build_grouped_week_map(ob_files, "OB")
-        th_map = _build_grouped_week_map(th_files, "TH")
-
-        common = sorted(set(ob_map) & set(th_map))
-        if not common:
-            return []
-
-        missing_ob = sorted(set(th_map) - set(ob_map))
-        missing_th = sorted(set(ob_map) - set(th_map))
-        if missing_ob:
-            print(f"Warning: missing OB for weeks: {missing_ob}")
-        if missing_th:
-            print(f"Warning: missing TH for weeks: {missing_th}")
-
-        rows = []
-        for wk_key in common:
-            ob_path = ob_map[wk_key]
-            th_path = th_map[wk_key]
-            try:
-                start_dt, end_dt, wk = _parse_week_key_any(wk_key)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Failed to parse week range from aligned files '{os.path.basename(ob_path)}' "
-                    f"and '{os.path.basename(th_path)}': {exc}"
-                ) from exc
-            rows.append((end_dt, start_dt, wk, [ob_path], [th_path]))
-
-        rows.sort()
-        return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in rows]
-
     ob_by_day = _build_ob_daily_map(ob_dir)
     th_by_day = _build_th_daily_map(th_dir)
+
+    if not ob_by_day:
+        raise ValueError(
+            "No OB daily files found. Expected filenames like "
+            "'2024-01-15_BTCUSDT_orderbook.ob.zip' (YYYY-MM-DD_BTCUSDT_*ob*.zip)."
+        )
+    if not th_by_day:
+        raise ValueError(
+            "No TH daily files found. Expected filenames like "
+            "'BTCUSDT2024-01-15.csv.gz' (BTCUSDTYYYY-MM-DD.csv[.gz|.gzip])."
+        )
 
     missing_th_days = sorted(set(ob_by_day) - set(th_by_day))
     missing_ob_days = sorted(set(th_by_day) - set(ob_by_day))
