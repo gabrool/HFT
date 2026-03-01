@@ -880,21 +880,11 @@ def _build_week_index(pairs: List[WeekPair]):
 
 
 
-def _iter_week_merged_events(
+def _iter_week_events(
     week_key: str,
-    ob_paths: WeekPath,
-    th_paths: WeekPath,
+    ob_list: List[str],
+    th_list: List[str],
 ):
-    if isinstance(ob_paths, str):
-        ob_list = [ob_paths]
-    else:
-        ob_list = list(ob_paths)
-
-    if isinstance(th_paths, str):
-        th_list = [th_paths]
-    else:
-        th_list = list(th_paths)
-
     if len(ob_list) != len(th_list):
         raise ValueError(
             "Mismatched OB/TH file counts within week block: "
@@ -950,7 +940,17 @@ class EventFeeder:
     def run(self):
         try:
             for wk, ob_path, th_path in self.pairs:
-                merged = _iter_week_merged_events(wk, ob_path, th_path)
+                if isinstance(ob_path, str) and isinstance(th_path, str):
+                    raw = BybitRawIter(ob_path, th_path)
+                    merged = merge_event_time(
+                        raw.ob_iter(),
+                        _trade_iter_precise(raw.trade_iter()),
+                        B=0,
+                    )
+                else:
+                    ob_list = [ob_path] if isinstance(ob_path, str) else list(ob_path)
+                    th_list = [th_path] if isinstance(th_path, str) else list(th_path)
+                    merged = _iter_week_events(wk, ob_list, th_list)
 
                 first_event = next(merged, None)
                 if first_event is None:
