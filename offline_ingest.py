@@ -1006,10 +1006,10 @@ def maybe_fit_pca_model(
     model_filename: str,
     use_existing: int,
 ):
-    """Fit (or reuse) a PCA model using the training subset of mixed week pairs.
+    """Fit (or reuse) a PCA model using the training subset of week-keyed daily paths.
 
     Each pair is ``(week_key, ob_paths, th_paths)`` where ``ob_paths`` and
-    ``th_paths`` are ordered file-path lists.
+    ``th_paths`` are ordered lists of per-day file paths for that week.
     """
     meta = {
         "applied": False,
@@ -1186,7 +1186,7 @@ def process_all(
     pca_meta: dict,
     split_info: Optional[Dict[str, List[str]]] = None,
 ):
-    """Run ingest across week pairs with weekly or daily OB/TH path variants."""
+    """Run ingest across week pairs composed of ordered daily OB/TH file lists."""
     ensure_dir(out_root)
 
     pca_summary = _summarise_pca_meta(pca_meta)
