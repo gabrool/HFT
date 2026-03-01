@@ -27,7 +27,7 @@ import os, sys, csv, json, re, time
 import queue
 import threading
 from pathlib import Path
-from typing import List, Tuple, Iterable, Dict, Optional
+from typing import List, Tuple, Iterable, Dict, Optional, Union
 from collections import deque, defaultdict
 import itertools
 import numpy as np
@@ -375,35 +375,81 @@ def _parse_week_from_pair(ob_path: str, th_path: str):
         )
     return start_ob, end_ob, wk
 
-def pair_weeks(ob_dir: str, th_dir: str) -> List[Tuple[str, str, str]]:
-    ob_files = sorted(str(p) for p in Path(ob_dir).glob("BTCUSDT_OB_*"))
-    th_files = sorted(str(p) for p in Path(th_dir).glob("BTCUSDT_TH_*"))
+WeekPath = Union[str, List[str]]
+WeekPair = Tuple[str, WeekPath, WeekPath]
 
-    ob_map = _build_week_file_map(ob_files, "OB")
-    th_map = _build_week_file_map(th_files, "TH")
 
-    common = sorted(set(ob_map) & set(th_map))
-    if not common:
+def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
+    """
+    Discover aligned OB/TH week inputs.
+
+    Returns:
+        List of (week_key, ob_paths, th_paths), ordered by block end date ascending.
+        - Legacy weekly mode: `ob_paths`/`th_paths` are single file-path strings.
+        - Daily fallback mode: `ob_paths`/`th_paths` are ordered 7-element lists,
+          one path per day in the block.
+    """
+    weekly_ob = list(Path(ob_dir).glob("BTCUSDT_OB_*"))
+    weekly_th = list(Path(th_dir).glob("BTCUSDT_TH_*"))
+
+    if weekly_ob and weekly_th:
+        ob_files = sorted(str(p) for p in weekly_ob)
+        th_files = sorted(str(p) for p in weekly_th)
+
+        ob_map = _build_week_file_map(ob_files, "OB")
+        th_map = _build_week_file_map(th_files, "TH")
+
+        common = sorted(set(ob_map) & set(th_map))
+        if not common:
+            return []
+
+        missing_ob = sorted(set(th_map) - set(ob_map))
+        missing_th = sorted(set(ob_map) - set(th_map))
+        if missing_ob:
+            print(f"Warning: missing OB for weeks: {missing_ob}")
+        if missing_th:
+            print(f"Warning: missing TH for weeks: {missing_th}")
+
+        rows = []
+        for wk_key in common:
+            ob_path = ob_map[wk_key]
+            th_path = th_map[wk_key]
+            start_dt, end_dt, wk = _parse_week_from_pair(ob_path, th_path)
+            rows.append((end_dt, start_dt, wk, ob_path, th_path))
+
+        rows.sort()
+        return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in rows]
+
+    ob_by_day = _build_ob_daily_map(ob_dir)
+    th_by_day = _build_th_daily_map(th_dir)
+
+    common_days = sorted(set(ob_by_day) & set(th_by_day))
+    if not common_days:
         return []
 
-    missing_ob = sorted(set(th_map) - set(ob_map))
-    missing_th = sorted(set(ob_map) - set(th_map))
-    if missing_ob:
-        print(f"Warning: missing OB for weeks: {missing_ob}")
-    if missing_th:
-        print(f"Warning: missing TH for weeks: {missing_th}")
-
+    week_blocks = _group_common_days_into_weeks(common_days)
     rows = []
-    for wk_key in common:
-        ob_path = ob_map[wk_key]
-        th_path = th_map[wk_key]
-        start_dt, end_dt, wk = _parse_week_from_pair(ob_path, th_path)
-        rows.append((end_dt, start_dt, wk, ob_path, th_path))
+    for block in week_blocks:
+        week_key = _week_key_from_dates(block[0], block[-1])
+        ob_paths = [ob_by_day[d] for d in block]
+        th_paths = [th_by_day[d] for d in block]
+        rows.append((block[-1], block[0], week_key, ob_paths, th_paths))
 
     rows.sort()
-    return [(wk, ob_p, th_p) for (_, _, wk, ob_p, th_p) in rows]
+    return [(wk, ob_p, th_p) for (_end, _start, wk, ob_p, th_p) in rows]
 
-def _assert_week_order(pairs: List[Tuple[str, str, str]]):
+
+def _week_path_label(paths: WeekPath) -> str:
+    if isinstance(paths, str):
+        return os.path.basename(paths)
+    if not paths:
+        return "[]"
+    if len(paths) == 1:
+        return os.path.basename(paths[0])
+    return f"{os.path.basename(paths[0])} ... {os.path.basename(paths[-1])} ({len(paths)} files)"
+
+
+def _assert_week_order(pairs: List[WeekPair]):
     if not pairs:
         return
 
@@ -418,12 +464,12 @@ def _assert_week_order(pairs: List[Tuple[str, str, str]]):
         if curr_end <= prev_end:
             raise ValueError(
                 "Week files must be strictly increasing by end date: "
-                f"'{os.path.basename(curr_ob)}'/'{os.path.basename(curr_th)}' (end={curr_end.date()}) "
-                f"not after '{os.path.basename(prev_ob)}'/'{os.path.basename(prev_th)}' (end={prev_end.date()})"
+                f"'{_week_path_label(curr_ob)}'/'{_week_path_label(curr_th)}' (end={curr_end.date()}) "
+                f"not after '{_week_path_label(prev_ob)}'/'{_week_path_label(prev_th)}' (end={prev_end.date()})"
             )
 
 
-def _assert_weeks_consecutive(pairs: List[Tuple[str, str, str]]):
+def _assert_weeks_consecutive(pairs: List[WeekPair]):
     if len(pairs) < 2:
         return
 
@@ -447,7 +493,7 @@ def _assert_weeks_consecutive(pairs: List[Tuple[str, str, str]]):
 
 
 
-def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], List[str], List[str]]:
+def classify_week_splits(pairs: List[WeekPair]) -> Tuple[List[str], List[str], List[str]]:
     """
     Apply the N-week split policy for train/val/test assignment.
 
@@ -472,7 +518,7 @@ def classify_week_splits(pairs: List[Tuple[str, str, str]]) -> Tuple[List[str], 
     return train_weeks, val_weeks, test_weeks
 
 
-def _sort_pairs_by_end(pairs: List[Tuple[str, str, str]]) -> List[Tuple[str, str, str]]:
+def _sort_pairs_by_end(pairs: List[WeekPair]) -> List[WeekPair]:
     rows = []
     for wk, ob_p, th_p in pairs:
         _start_dt, end_dt, _ = _parse_week_key_any(_normalise_ob_prefix(f"BTCUSDT_OB_{wk}"))
@@ -764,7 +810,7 @@ class WeekWriterRouter:
         for wk in list(self.week_decision_span.keys()):
             self._finalize_week(wk)
 # --------------- dataset-wide processing ---------------
-def _compute_dataset_span(pairs: List[Tuple[str, str, str]]):
+def _compute_dataset_span(pairs: List[WeekPair]):
     if not pairs:
         return None, None
     starts = []
@@ -784,7 +830,7 @@ def _dt_to_epoch_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _build_week_index(pairs: List[Tuple[str, str, str]]):
+def _build_week_index(pairs: List[WeekPair]):
     index = []
     for wk, _ob_path, _th_path in pairs:
         start_dt, end_dt, _ = _parse_week_key_any(
@@ -797,10 +843,33 @@ def _build_week_index(pairs: List[Tuple[str, str, str]]):
     return index
 
 
+
+
+def _iter_week_merged_events(ob_paths: WeekPath, th_paths: WeekPath):
+    if isinstance(ob_paths, str):
+        ob_list = [ob_paths]
+    else:
+        ob_list = list(ob_paths)
+
+    if isinstance(th_paths, str):
+        th_list = [th_paths]
+    else:
+        th_list = list(th_paths)
+
+    if len(ob_list) != len(th_list):
+        raise ValueError(
+            "Mismatched OB/TH file counts within week block: "
+            f"ob={len(ob_list)} th={len(th_list)}"
+        )
+
+    for ob_path, th_path in zip(ob_list, th_list):
+        raw = BybitRawIter(ob_path, th_path)
+        yield from merge_event_time(raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0)
+
 class EventFeeder:
     def __init__(
         self,
-        pairs: List[Tuple[str, str, str]],
+        pairs: List[WeekPair],
         maxsize: int = EVENT_QUEUE_MAXSIZE,
     ):
         self.pairs = list(pairs)
@@ -813,10 +882,7 @@ class EventFeeder:
     def run(self):
         try:
             for wk, ob_path, th_path in self.pairs:
-                raw = BybitRawIter(ob_path, th_path)
-                merged = merge_event_time(
-                    raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0
-                )
+                merged = _iter_week_merged_events(ob_path, th_path)
 
                 first_event = next(merged, None)
                 if first_event is None:
@@ -842,7 +908,7 @@ class EventFeeder:
             self._put(("eof", None, exc))
 
 
-def _stream_core_features(pairs: List[Tuple[str, str, str]]):
+def _stream_core_features(pairs: List[WeekPair]):
     """Stream OB decision-candidate core feature vectors (z-scored) for PCA fitting."""
     if not pairs:
         return
