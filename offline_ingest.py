@@ -286,6 +286,59 @@ def _parse_ymd_date(s: str) -> date:
 def _week_key_from_dates(d0: date, d6: date) -> str:
     return f"{d0.strftime('%d-%m-%Y')}-to-{d6.strftime('%d-%m-%Y')}"
 
+
+def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = True) -> List[List[date]]:
+    """
+    Partition sorted common days into non-overlapping 7-day blocks.
+
+    Args:
+        common_days: Sorted list of dates known to exist in both OB/TH maps.
+        strict: If True, raise on any day-to-day gap inside a 7-day block.
+            If False, skip invalid blocks and continue.
+
+    Returns:
+        A list of valid week blocks (each block has exactly 7 dates).
+    """
+    groups: List[List[date]] = []
+    total_days = len(common_days)
+    usable_days = (total_days // 7) * 7
+
+    if usable_days < total_days:
+        trailing = common_days[usable_days:]
+        print(
+            "Warning: ignoring trailing partial week "
+            f"({len(trailing)} day(s)): {[d.isoformat() for d in trailing]}"
+        )
+
+    for start_idx in range(0, usable_days, 7):
+        block = common_days[start_idx:start_idx + 7]
+        gap_idx = None
+        for i in range(1, len(block)):
+            expected = block[i - 1] + timedelta(days=1)
+            if block[i] != expected:
+                gap_idx = i
+                break
+
+        if gap_idx is not None:
+            prev_day = block[gap_idx - 1]
+            curr_day = block[gap_idx]
+            expected_day = prev_day + timedelta(days=1)
+            msg = (
+                "Non-consecutive days inside 7-day block: "
+                f"block_idx={start_idx // 7}, "
+                f"span={block[0].isoformat()}..{block[-1].isoformat()}, "
+                f"expected={expected_day.isoformat()}, got={curr_day.isoformat()}, "
+                f"full_block={[d.isoformat() for d in block]}"
+            )
+            if strict:
+                raise ValueError(msg)
+            print(f"Warning: {msg}; skipping block")
+            continue
+
+        groups.append(block)
+
+    return groups
+
 def _parse_week_key_any(base: str):
     wk = re.sub(r'^(BTCUSDT_(?:OB|TH)_)', '', base)
     wk = re.sub(r'\.(?:zip|gz|jsonl|csv)$', '', wk)
