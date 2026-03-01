@@ -885,15 +885,29 @@ def _iter_week_merged_events(
     ob_paths: WeekPath,
     th_paths: WeekPath,
 ):
-    if isinstance(ob_paths, str):
-        ob_list = [ob_paths]
-    else:
-        ob_list = list(ob_paths)
+    ob_is_str = isinstance(ob_paths, str)
+    th_is_str = isinstance(th_paths, str)
+    ob_is_list = isinstance(ob_paths, list)
+    th_is_list = isinstance(th_paths, list)
 
-    if isinstance(th_paths, str):
+    if ob_is_str and th_is_str:
+        # Legacy weekly mode (single-file pair).
+        ob_list = [ob_paths]
         th_list = [th_paths]
-    else:
+    elif ob_is_list and th_is_list:
+        # Daily chaining mode (list of per-day file pairs).
+        ob_list = list(ob_paths)
         th_list = list(th_paths)
+    elif (ob_is_str and th_is_list) or (ob_is_list and th_is_str):
+        raise ValueError(
+            "WeekPath type mismatch: OB is list but TH is str (or vice versa)."
+        )
+    else:
+        raise TypeError(
+            "WeekPath must be str (legacy weekly mode) or list[str] "
+            f"(daily chaining mode), got ob={type(ob_paths).__name__} "
+            f"th={type(th_paths).__name__}"
+        )
 
     if len(ob_list) != len(th_list):
         raise ValueError(
