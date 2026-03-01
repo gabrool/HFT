@@ -104,8 +104,7 @@ def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 
 def merge_event_time(ob_iter, tr_iter, B: int = 0):
-    """Local ingest merge to avoid coupling offline ingest to CMSSL17 helpers."""
-    """Merge OB and trade iterators by timestamp and sequence."""
+    """Merge OB/trade events by timestamp/sequence with a monotonicity guard."""
     ob_item = next(ob_iter, None)
     tr_item = next(tr_iter, None)
     last_ts = -1
