@@ -59,6 +59,24 @@ RAW_BYBIT_WEEKS = os.environ.get("BYBIT_WEEKS", "")
 OB_DAILY_RE = re.compile(r"^(?P<d>\d{4}-\d{2}-\d{2})_BTCUSDT_.*ob.*\.zip$", re.IGNORECASE)
 
 
+def _ob_ext_rank(path: str) -> int:
+    lower_path = str(path).lower()
+    if lower_path.endswith(".data.zip"):
+        return 0
+    p = Path(path)
+    if p.suffix.lower() == ".zip":
+        return 1
+    return 2
+
+
+def _choose_preferred_daily_ob_path(candidates: List[str]) -> str:
+    def _sort_key(path: str) -> tuple[int, str, str]:
+        p = Path(path)
+        return (_ob_ext_rank(path), p.name, str(p))
+
+    return min(candidates, key=_sort_key)
+
+
 def _parse_requested_weeks(raw: str) -> List[str]:
     items = [wk.strip() for wk in re.split(r"[\s,]+", raw) if wk.strip()]
     return items
@@ -98,12 +116,12 @@ def _build_ob_daily_map(ob_dir: str) -> dict[date, str]:
         if current is None:
             by_day[day] = candidate
             continue
-        winner = min(Path(current).name, path.name)
-        if winner != Path(current).name:
+        chosen = _choose_preferred_daily_ob_path([current, candidate])
+        if chosen != current:
             by_day[day] = candidate
         print(
             f"[warn] duplicate daily OB for {day.isoformat()}: "
-            f"{Path(current).name} vs {path.name}; using {winner}"
+            f"{Path(current).name} vs {path.name}; using {Path(chosen).name}"
         )
     return by_day
 
