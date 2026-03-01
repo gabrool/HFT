@@ -31,7 +31,7 @@ from typing import List, Tuple, Iterable, Dict, Optional
 from collections import deque, defaultdict
 import itertools
 import numpy as np
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 
 # ---------------- config ----------------
 OB_DIR      = os.environ.get("BYBIT_OB_DIR",   "/home/gabrool/Documents/OB")
@@ -163,6 +163,15 @@ _EXT_PRIORITY = {
     ".csv": 3,
 }
 
+OB_DAILY_RE = re.compile(
+    r"^(?P<d>\d{4}-\d{2}-\d{2})_BTCUSDT_.*ob.*\.data\.zip$",
+    re.IGNORECASE,
+)
+TH_DAILY_RE = re.compile(
+    r"^BTCUSDT(?P<d>\d{4}-\d{2}-\d{2})\.csv(\.gz)?$",
+    re.IGNORECASE,
+)
+
 
 def _choose_preferred_week_file(wk_key: str, candidates: List[str], side: str) -> str:
     def _sort_key(path: str):
@@ -199,6 +208,14 @@ def extract_week_key_from_name(name: str) -> str:
     if m:
         return m.group(0)
     raise ValueError(f"Could not extract week key from file name: {name}")
+
+
+def _parse_ymd_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def _week_key_from_dates(d0: date, d6: date) -> str:
+    return f"{d0.strftime('%d-%m-%Y')}-to-{d6.strftime('%d-%m-%Y')}"
 
 def _parse_week_key_any(base: str):
     wk = re.sub(r'^(BTCUSDT_(?:OB|TH)_)', '', base)
