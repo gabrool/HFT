@@ -189,6 +189,41 @@ def _choose_preferred_week_file(wk_key: str, candidates: List[str], side: str) -
     return chosen
 
 
+def _choose_preferred_daily_file(day: date, candidates: List[str], side: str) -> str:
+    def _ext_rank(path: str) -> int:
+        lower_path = str(path).lower()
+        if side.upper() == "TH":
+            if lower_path.endswith(".csv.gz"):
+                return _EXT_PRIORITY[".gz"]
+            if lower_path.endswith(".csv.gzip"):
+                return _EXT_PRIORITY[".gz"] + 1
+            if lower_path.endswith(".csv"):
+                return _EXT_PRIORITY[".csv"]
+            return 4
+
+        if side.upper() == "OB":
+            if lower_path.endswith(".data.zip"):
+                return _EXT_PRIORITY[".zip"]
+            p = Path(path)
+            return _EXT_PRIORITY.get(p.suffix.lower(), 4)
+
+        p = Path(path)
+        return _EXT_PRIORITY.get(p.suffix.lower(), 4)
+
+    def _sort_key(path: str):
+        p = Path(path)
+        return (_ext_rank(path), p.name, str(p))
+
+    chosen = min(candidates, key=_sort_key)
+    if len(candidates) > 1:
+        alternatives = sorted([p for p in candidates if p != chosen], key=_sort_key)
+        print(
+            f"Warning: duplicate {side} files for day '{day.isoformat()}'; "
+            f"chosen='{chosen}', alternatives={alternatives}"
+        )
+    return chosen
+
+
 def _build_week_file_map(files: List[str], side: str) -> Dict[str, str]:
     groups: Dict[str, List[str]] = defaultdict(list)
     for path in files:
