@@ -489,7 +489,7 @@ SINGLE_WEEK_PATIENCE = 3
 # These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
 AUX_DIM        = 5
 TIME_GRID_STEP_MS = 100
-TIME_GRID_GUARD_MS = 49
+TIME_GRID_GUARD_MS = 50
 
 
 def quantize_ts_ms(
@@ -500,7 +500,21 @@ def quantize_ts_ms(
     t = int(ts_ms)
     step = int(step_ms)
     guard = int(guard_ms)
-    grid = ((t + step // 2) // step) * step
+
+    k = t // step
+    lower = k * step
+    upper = (k + 1) * step
+    d_lower = t - lower
+    d_upper = upper - t
+
+    if d_lower < d_upper:
+        grid = lower
+    elif d_upper < d_lower:
+        grid = upper
+    else:
+        # Exact half-step: choose half-even using lower-grid index parity.
+        grid = lower if (k % 2 == 0) else upper
+
     if abs(t - grid) > guard:
         raise ValueError(
             f"Timestamp {t}ms is off-grid by {abs(t - grid)}ms (guard={guard}ms, step={step}ms)"
