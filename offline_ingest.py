@@ -180,7 +180,7 @@ OB_DAILY_RE = re.compile(
     re.IGNORECASE,
 )
 TH_DAILY_RE = re.compile(
-    r"^BTCUSDT(?P<d>\d{4}-\d{2}-\d{2})\.csv(\.gz)?$",
+    r"^BTCUSDT(?P<d>\d{4}-\d{2}-\d{2})\.csv(\.(gz|gzip))?$",
     re.IGNORECASE,
 )
 
