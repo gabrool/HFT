@@ -1634,9 +1634,8 @@ class FeatureEngine:
         self.last_is_rpi = is_rpi
 
         entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
-        for window, deq in self._trade_window_deques.items():
+        for _, deq in self._trade_window_deques.items():
             deq.append(entry)
-            self._prune_deque_ms(deq, ts_ms, window)
 
         # Update volume-regime (vol/sec) EWMAs using provided dt_ms
         vol_rate = size / (dt_ms / 1000.0)  # base per second
@@ -1744,6 +1743,8 @@ class FeatureEngine:
         prev_ask_l2 = self.prev_asz2
 
         self._prune_replen_windows(ts_ms)
+        for window, deq in self._trade_window_deques.items():
+            self._prune_deque_ms(deq, ts_ms, window)
 
         # Event density
         self._append_ts_with_guard(self.ev_100ms, ts_ms, 100, is_ob_event=(etype == 'ob'))
