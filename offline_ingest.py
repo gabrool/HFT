@@ -5,22 +5,16 @@ Decision-time ingest (memory-safe):
 - Use a RAM budget to auto-size chunked writes (avoid huge in-RAM lists).
 
 Input layout support:
-- Legacy weekly OB/TH layout remains supported.
-- Daily layout is also supported:
-  - OB: YYYY-MM-DD_BTCUSDT_<ob*-containing-stem>*.zip.
-  - TH: BTCUSDTYYYY-MM-DD.csv.gz, with tolerant handling for .csv / .csv.gzip.
-- pair_weeks() groups daily files into canonical 7-day keys:
-  DD-MM-YYYY-to-DD-MM-YYYY.
+- OB: YYYY-MM-DD_BTCUSDT_...ob...*.zip.
+- TH: BTCUSDTYYYY-MM-DD.csv.gz, with tolerant handling for .csv / .csv.gzip.
 
 Downstream ingest contract:
+- pair_weeks() groups aligned daily OB/TH files into consecutive 7-day blocks
+  and emits canonical week keys: DD-MM-YYYY-to-DD-MM-YYYY.
 - pair_weeks() and all ingest entry points operate on WeekPair tuples:
-  (week_key, ob_paths, th_paths).
-- For each side (OB/TH), the week path value may be either:
-  - a single legacy weekly file path (str), or
-  - a list of daily file paths (List[str]) for that week.
-- Event streaming is chained per week; when daily lists are provided, files are
-  streamed in day order and timestamp monotonicity is enforced across day
-  boundaries.
+  (week_key, ob_paths: List[str], th_paths: List[str]).
+- Event streaming is chained per week; daily files are processed in day order
+  and timestamp monotonicity is enforced across day boundaries.
 
 Environment variables (read via os.environ.get in this module):
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
