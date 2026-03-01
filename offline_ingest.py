@@ -4,6 +4,18 @@ Decision-time ingest (memory-safe):
 - Snapshot ONE [LOOKBACK, F] sequence at each decision time.
 - Use a RAM budget to auto-size chunked writes (avoid huge in-RAM lists).
 
+Input layout support:
+- Legacy weekly OB/TH layout remains supported.
+- Daily layout is also supported:
+  - OB: YYYY-MM-DD_BTCUSDT_ob200.data.zip (and similar ob* variants).
+  - TH: BTCUSDTYYYY-MM-DD.csv.gz, with tolerant handling for .csv / .csv.gzip.
+- pair_weeks() groups daily files into canonical 7-day keys:
+  DD-MM-YYYY-to-DD-MM-YYYY.
+
+Scope note:
+- This is Step A groundwork for mixed weekly/daily discovery + pairing.
+- Downstream list-consuming logic is intentionally handled in later steps.
+
 Environment variables (read via os.environ.get in this module):
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
   BYBIT_TH_DIR=/home/gabrool/Documents/TH
