@@ -12,9 +12,15 @@ Input layout support:
 - pair_weeks() groups daily files into canonical 7-day keys:
   DD-MM-YYYY-to-DD-MM-YYYY.
 
-Scope note:
-- This is Step A groundwork for mixed weekly/daily discovery + pairing.
-- Downstream list-consuming logic is intentionally handled in later steps.
+Downstream ingest contract:
+- pair_weeks() and all ingest entry points operate on WeekPair tuples:
+  (week_key, ob_paths, th_paths).
+- For each side (OB/TH), the week path value may be either:
+  - a single legacy weekly file path (str), or
+  - a list of daily file paths (List[str]) for that week.
+- Event streaming is chained per week; when daily lists are provided, files are
+  streamed in day order and timestamp monotonicity is enforced across day
+  boundaries.
 
 Environment variables (read via os.environ.get in this module):
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
