@@ -1168,6 +1168,10 @@ class FeatureEngine:
             1_000: self.trades_1s,
             5_000: self.trades_5s,
         }
+        self.trade_window_state: Dict[int, Dict[str, Any]] = {
+            window: self._new_trade_window_state()
+            for window in self.trade_windows
+        }
 
         # Tick-direction & RPI tracking
         self.last_tick_sign: int = 0
@@ -1261,6 +1265,20 @@ class FeatureEngine:
             raise ValueError("Feature dimension unknown before first event")
         return self._feat_dim + AUX_DIM
 
+    def _new_trade_window_state(self) -> Dict[str, Any]:
+        return {
+            "buy_cnt": 0,
+            "sell_cnt": 0,
+            "buy_vol": 0.0,
+            "sell_vol": 0.0,
+            "signed_px_sum": 0.0,
+            "signed_cnt": 0.0,
+            "pxv_sum": 0.0,
+            "vol_sum": 0.0,
+            "buy_max_q": deque(),
+            "sell_max_q": deque(),
+        }
+
     # -------------------------------------------------------------------------
     # Helpers (kept inside the class)
     # -------------------------------------------------------------------------
@@ -1285,27 +1303,87 @@ class FeatureEngine:
                 else:
                     state[name] = self._ewma_update(prev, value, dt_ms, hl)
 
-    def _compute_trade_window_stats(
-        self, trades: Deque[Tuple[int, float, float, str, int, int]], mid: float
-    ) -> Dict[str, float]:
-        buy_vol = sell_vol = 0.0
-        buy_cnt = sell_cnt = 0
-        buy_max = sell_max = 0.0
-        trade_through = 0.0
-        for entry in trades:
-            _, price, size, side, *_ = entry
-            if side == "buy":
-                buy_vol += size
-                buy_cnt += 1
-                buy_max = max(buy_max, size)
-                direction = 1.0
-            else:
-                sell_vol += size
-                sell_cnt += 1
-                sell_max = max(sell_max, size)
-                direction = -1.0
-            if mid > 0.0:
-                trade_through += direction * ((price / mid) - 1.0)
+    def _update_trade_window_state_with_insert(
+        self,
+        window_ms: int,
+        entry: Tuple[int, float, float, str, int, int],
+    ) -> None:
+        ts_ms, price, size, side, *_ = entry
+        state = self.trade_window_state[window_ms]
+
+        state["pxv_sum"] += price * size
+        state["vol_sum"] += size
+
+        if side == "buy":
+            state["buy_cnt"] += 1
+            state["buy_vol"] += size
+            state["signed_px_sum"] += price
+            state["signed_cnt"] += 1.0
+            q = state["buy_max_q"]
+            while q and q[-1][1] <= size:
+                q.pop()
+            q.append((ts_ms, size))
+        else:
+            state["sell_cnt"] += 1
+            state["sell_vol"] += size
+            state["signed_px_sum"] -= price
+            state["signed_cnt"] -= 1.0
+            q = state["sell_max_q"]
+            while q and q[-1][1] <= size:
+                q.pop()
+            q.append((ts_ms, size))
+
+    def _update_trade_window_state_with_expire(
+        self,
+        window_ms: int,
+        entry: Tuple[int, float, float, str, int, int],
+    ) -> None:
+        ts_ms, price, size, side, *_ = entry
+        state = self.trade_window_state[window_ms]
+
+        state["pxv_sum"] -= price * size
+        state["vol_sum"] -= size
+
+        if side == "buy":
+            state["buy_cnt"] -= 1
+            state["buy_vol"] -= size
+            state["signed_px_sum"] -= price
+            state["signed_cnt"] -= 1.0
+            q = state["buy_max_q"]
+            if q and q[0][0] == ts_ms and abs(q[0][1] - size) <= 1e-12:
+                q.popleft()
+        else:
+            state["sell_cnt"] -= 1
+            state["sell_vol"] -= size
+            state["signed_px_sum"] += price
+            state["signed_cnt"] += 1.0
+            q = state["sell_max_q"]
+            if q and q[0][0] == ts_ms and abs(q[0][1] - size) <= 1e-12:
+                q.popleft()
+
+        state["buy_cnt"] = max(0, state["buy_cnt"])
+        state["sell_cnt"] = max(0, state["sell_cnt"])
+        state["buy_vol"] = max(0.0, state["buy_vol"])
+        state["sell_vol"] = max(0.0, state["sell_vol"])
+        state["vol_sum"] = max(0.0, state["vol_sum"])
+        if state["buy_cnt"] == 0 and state["sell_cnt"] == 0:
+            state["signed_px_sum"] = 0.0
+            state["signed_cnt"] = 0.0
+
+    def _prune_trade_window(self, now_ms: int, window_ms: int) -> None:
+        deq = self._trade_window_deques[window_ms]
+        while deq and (now_ms - deq[0][0] > window_ms):
+            expired = deq.popleft()
+            self._update_trade_window_state_with_expire(window_ms, expired)
+
+    def _compute_trade_window_stats(self, window_ms: int, mid: float) -> Dict[str, float]:
+        state = self.trade_window_state[window_ms]
+        buy_vol = float(state["buy_vol"])
+        sell_vol = float(state["sell_vol"])
+        buy_cnt = float(state["buy_cnt"])
+        sell_cnt = float(state["sell_cnt"])
+        buy_max = float(state["buy_max_q"][0][1]) if state["buy_max_q"] else 0.0
+        sell_max = float(state["sell_max_q"][0][1]) if state["sell_max_q"] else 0.0
 
         buy_mean = buy_vol / buy_cnt if buy_cnt > 0 else 0.0
         sell_mean = sell_vol / sell_cnt if sell_cnt > 0 else 0.0
@@ -1315,11 +1393,15 @@ class FeatureEngine:
         imbalance = net_flow / denom
         toxicity = abs(net_flow) / denom
 
+        trade_through = 0.0
+        if mid > 0.0:
+            trade_through = (float(state["signed_px_sum"]) / mid) - float(state["signed_cnt"])
+
         return {
             "buy_vol": buy_vol,
             "sell_vol": sell_vol,
-            "buy_cnt": float(buy_cnt),
-            "sell_cnt": float(sell_cnt),
+            "buy_cnt": buy_cnt,
+            "sell_cnt": sell_cnt,
             "buy_mean": buy_mean,
             "sell_mean": sell_mean,
             "buy_max": buy_max,
@@ -1327,7 +1409,7 @@ class FeatureEngine:
             "net_flow": net_flow,
             "imbalance": imbalance,
             "toxicity": toxicity,
-            "trade_through": trade_through if mid > 0.0 else 0.0,
+            "trade_through": trade_through,
         }
 
     def _lin_slope(self, xs: List[float], ys: List[float], eps: float = 1e-12) -> float:
@@ -1634,8 +1716,9 @@ class FeatureEngine:
         self.last_is_rpi = is_rpi
 
         entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
-        for _, deq in self._trade_window_deques.items():
+        for window, deq in self._trade_window_deques.items():
             deq.append(entry)
+            self._update_trade_window_state_with_insert(window, entry)
 
         # Update volume-regime (vol/sec) EWMAs using provided dt_ms
         vol_rate = size / (dt_ms / 1000.0)  # base per second
@@ -1743,8 +1826,8 @@ class FeatureEngine:
         prev_ask_l2 = self.prev_asz2
 
         self._prune_replen_windows(ts_ms)
-        for window, deq in self._trade_window_deques.items():
-            self._prune_deque_ms(deq, ts_ms, window)
+        for window in self._trade_window_deques:
+            self._prune_trade_window(ts_ms, window)
 
         # Event density
         self._append_ts_with_guard(self.ev_100ms, ts_ms, 100, is_ob_event=(etype == 'ob'))
@@ -1881,16 +1964,13 @@ class FeatureEngine:
         self.press_2s    = self._ewma_update(getattr(self, 'press_2s',   0.0), ofi_l1, dt_ms, 2_000)
 
         # VWAPs (>=1s) and rel to mid/micro
-        def vwap_in(win: Deque[Tuple[int, float, float, str, int, int]]) -> float:
-            vol = sum(s for _, _, s, *_ in win)
-            if vol <= 1e-12:
-                return mid
-            pxv = sum(p * s for _, p, s, *_ in win)
-            return pxv / vol
-
         vwap_per_ms: Dict[int, float] = {
-            1_000: vwap_in(self.trades_1s),
-            5_000: vwap_in(self.trades_5s),
+            window: (
+                self.trade_window_state[window]["pxv_sum"] / self.trade_window_state[window]["vol_sum"]
+                if self.trade_window_state[window]["vol_sum"] > 1e-12
+                else mid
+            )
+            for window in self.trade_windows
         }
         vwap_vs_mid = {
             ms: (vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0 if mid > 0 else 0.0
@@ -1902,8 +1982,8 @@ class FeatureEngine:
         }
 
         # Trade stats per horizon and tempo
-        stats_1s = self._compute_trade_window_stats(self.trades_1s, mid)
-        stats_5s = self._compute_trade_window_stats(self.trades_5s, mid)
+        stats_1s = self._compute_trade_window_stats(1_000, mid)
+        stats_5s = self._compute_trade_window_stats(5_000, mid)
         trade_stats = {
             1_000: stats_1s,
             5_000: stats_5s,
