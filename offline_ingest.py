@@ -235,6 +235,40 @@ def _build_week_file_map(files: List[str], side: str) -> Dict[str, str]:
         for wk_key, candidates in groups.items()
     }
 
+
+def _build_ob_daily_map(ob_dir: str) -> Dict[date, str]:
+    groups: Dict[date, List[str]] = defaultdict(list)
+    for p in Path(ob_dir).iterdir():
+        if not p.is_file():
+            continue
+        m = OB_DAILY_RE.match(p.name)
+        if not m:
+            continue
+        day = _parse_ymd_date(m.group("d"))
+        groups[day].append(str(p))
+
+    return {
+        day: _choose_preferred_daily_file(day, candidates, "OB")
+        for day, candidates in groups.items()
+    }
+
+
+def _build_th_daily_map(th_dir: str) -> Dict[date, str]:
+    groups: Dict[date, List[str]] = defaultdict(list)
+    for p in Path(th_dir).iterdir():
+        if not p.is_file():
+            continue
+        m = TH_DAILY_RE.match(p.name)
+        if not m:
+            continue
+        day = _parse_ymd_date(m.group("d"))
+        groups[day].append(str(p))
+
+    return {
+        day: _choose_preferred_daily_file(day, candidates, "TH")
+        for day, candidates in groups.items()
+    }
+
 def extract_week_key_from_name(name: str) -> str:
     m = re.search(r"\d{2}-\d{2}-\d{4}-to-\d{2}-\d{2}-\d{4}", name)
     if m:
