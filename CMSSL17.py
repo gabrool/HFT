@@ -486,8 +486,8 @@ PRIMARY_METRIC_RET_WEIGHT = 0.25
 PRIMARY_METRIC_VOL_WEIGHT = 0.25
 SINGLE_WEEK_PATIENCE = 3
 # Number of auxiliary channels appended after the base feature vector
-# These correspond to [log_dt_ms, is_trade, events_100ms]
-AUX_DIM        = 3
+# These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
+AUX_DIM        = 5
 TIME_GRID_STEP_MS = 100
 TIME_GRID_GUARD_MS = 49
 
@@ -2135,9 +2135,6 @@ class FeatureEngine:
             # --- tempo ---
             quotes_1s,
             trade_cnt_1s,
-            self.event_density_100ms(),  # events per 0.1s (helper)
-            self.event_density_250ms(),
-            self.event_density_500ms(),
             dt_since_trade,
             float(self.last_tick_sign),
             float(self.last_is_zero_tick),

@@ -140,10 +140,8 @@ def build_sequence_from_tokens(tokens: deque, lookback: int) -> np.ndarray:
 
     pad_n = lookback - len(tokens)
     first = tokens[0].copy()
-    # Last channels are [log_dt_ms, is_trade, events_100ms].
-    first[-3] = 0.0
-    first[-2] = 0.0
-    first[-1] = 0.0
+    # Last channels are [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms].
+    first[-AUX_DIM:] = 0.0
     pad_block = np.repeat(first[None, :], pad_n, axis=0)
     arr = np.stack(list(tokens), axis=0)
     return np.concatenate([pad_block, arr], axis=0)
@@ -509,10 +507,15 @@ def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
         yield ts_ms_precise, seq, row
 
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
-    # exact tail order: [log_dt_ms, is_trade, events_100ms]
-    events_100ms = fe.event_density_100ms()
+    # exact tail order: [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
     aux_tail = np.array(
-        [np.log1p(float(dt_ms)), float(is_trade), events_100ms],
+        [
+            np.log1p(float(dt_ms)),
+            float(is_trade),
+            np.log1p(fe.event_density_100ms()),
+            np.log1p(fe.event_density_250ms()),
+            np.log1p(fe.event_density_500ms()),
+        ],
         dtype=np.float32,
     )
     return np.concatenate(
@@ -1462,7 +1465,7 @@ def process_all(
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
-        "aux_tail": ["log_dt_ms", "is_trade", "events_100ms"],
+        "aux_tail": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_250ms", "log_events_500ms"],
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
