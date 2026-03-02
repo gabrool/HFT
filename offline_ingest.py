@@ -66,6 +66,39 @@ PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "4096"))
 DECISION_POLICY = "ob_only_grid_quantized"
+
+
+def _env_bool_int(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    v = str(raw).strip().lower()
+    if v in {"1", "true", "t", "yes", "y", "on"}:
+        return 1
+    if v in {"0", "false", "f", "no", "n", "off"}:
+        return 0
+    return int(v)
+
+
+# Quality/repair env config (parsed once at import time)
+BYBIT_DAY_CLIP = int(os.environ.get("BYBIT_DAY_CLIP", "1"))
+BYBIT_TS_BACKSTEP_CLAMP_MS = int(os.environ.get("BYBIT_TS_BACKSTEP_CLAMP_MS", "5000"))
+BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
+BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
+BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
+BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
+
+
+def quality_env_config() -> Dict[str, object]:
+    """Serializable quality/repair env knobs for reports/metadata."""
+    return {
+        "day_clip": int(BYBIT_DAY_CLIP),
+        "ts_backstep_clamp_ms": int(BYBIT_TS_BACKSTEP_CLAMP_MS),
+        "strict_data": int(BYBIT_STRICT_DATA),
+        "bad_examples_n": int(BYBIT_BAD_EXAMPLES_N),
+        "bad_frac_abort": float(BYBIT_BAD_FRAC_ABORT),
+        "bad_abs_abort": int(BYBIT_BAD_ABS_ABORT),
+    }
 # import your training utilities
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -90,8 +123,9 @@ DECISION_GUARD_MS = int(TIME_GRID_GUARD_MS)
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
-# Weekly chaining guard for multi-file weeks. Strict by default (non-decreasing).
-WEEK_CHAIN_TS_TOLERANCE_MS = 0
+# Weekly chaining guard for multi-file weeks.
+WEEK_CHAIN_TS_TOLERANCE_MS = int(BYBIT_TS_BACKSTEP_CLAMP_MS)
+DAY_CLIP_DELTA = timedelta(days=BYBIT_DAY_CLIP)
 
 # fast json if available
 try:
@@ -281,7 +315,7 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
         block = common_days[start_idx:start_idx + 7]
         gap_idx = None
         for i in range(1, len(block)):
-            expected = block[i - 1] + timedelta(days=1)
+            expected = block[i - 1] + DAY_CLIP_DELTA
             if block[i] != expected:
                 gap_idx = i
                 break
@@ -289,7 +323,7 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
         if gap_idx is not None:
             prev_day = block[gap_idx - 1]
             curr_day = block[gap_idx]
-            expected_day = prev_day + timedelta(days=1)
+            expected_day = prev_day + DAY_CLIP_DELTA
             msg = (
                 "Non-consecutive days inside 7-day block: "
                 f"block_idx={start_idx // 7}, "
@@ -366,7 +400,7 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
     if not common_days:
         return []
 
-    week_blocks = _group_common_days_into_weeks(common_days)
+    week_blocks = _group_common_days_into_weeks(common_days, strict=bool(BYBIT_STRICT_DATA))
     rows = []
     for block in week_blocks:
         week_key = _week_key_from_dates(block[0], block[-1])
@@ -417,7 +451,7 @@ def _assert_weeks_consecutive(pairs: List[WeekPair]):
     for idx in range(1, len(parsed)):
         prev_start, prev_end, prev_wk = parsed[idx - 1]
         next_start, next_end, next_wk = parsed[idx]
-        expected_next_start = prev_end.date() + timedelta(days=1)
+        expected_next_start = prev_end.date() + DAY_CLIP_DELTA
         if next_start.date() != expected_next_start:
             relation = "gap" if next_start.date() > expected_next_start else "overlap"
             raise ValueError(
@@ -773,7 +807,7 @@ def _build_week_index(pairs: List[WeekPair]):
     for wk, _ob_path, _th_path in pairs:
         start_dt, end_dt, _ = _parse_week_key_any(wk)
         start_ms = _dt_to_epoch_ms(start_dt)
-        end_ms = _dt_to_epoch_ms(end_dt + timedelta(days=1))
+        end_ms = _dt_to_epoch_ms(end_dt + DAY_CLIP_DELTA)
         index.append((wk, start_ms, end_ms))
     index.sort(key=lambda x: x[1])
     return index
@@ -1479,6 +1513,7 @@ def process_all(
         "rows_total_from_weeks": int(rows_via_week_metas),
         "weeks_meta": weeks_meta_paths,
         "chunks": chunk_files,
+        "quality_config": quality_env_config(),
     }
     meta["pca"] = dict(pca_summary)
     if pca_var_ratio is not None:
