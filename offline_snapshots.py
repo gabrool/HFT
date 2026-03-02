@@ -360,7 +360,19 @@ class WeekQuality:
         }
 
 
-def build_snapshots_from_ob_files(ob_paths: List[str]) -> SnapshotSeries:
+def _day_bad_abs_and_total(day_quality: DayQuality) -> tuple[int, int]:
+    """Compute corruption and total counts for snapshot day quality."""
+    bad_abs = 0
+    for namespace in ("parse", "event", "quantize", "backstep", "day_clip"):
+        for key, value in day_quality.counters.get(namespace, {}).items():
+            key_l = str(key).lower()
+            if "drop" in key_l or "error" in key_l or "bad" in key_l:
+                bad_abs += int(value)
+    total = int(day_quality.counters.get("event", {}).get("total", 0))
+    return int(bad_abs), int(total)
+
+
+def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality) -> SnapshotSeries:
     fe = FeatureEngine()
     series = SnapshotSeries(
         ts=[],
@@ -386,107 +398,216 @@ def build_snapshots_from_ob_files(ob_paths: List[str]) -> SnapshotSeries:
         day = _parse_ymd_date(day_match.group("d"))
         day_start_ms, day_end_ms = _utc_day_bounds_ms(day)
 
-        parse_fail = 0
-        non_ob = 0
-        day_clipped = 0
-        quantize_drop = 0
-        backstep_drop = 0
-        backstep_clamp = 0
+        dq_day = DayQuality(day=day.isoformat(), ob_path=ob_path, counters={})
+        aborted_for_corruption = False
 
-        for raw in iter_ob_events(ob_path):
-            try:
-                etype, ts_ms_raw, payload = fe._parse_event(raw)
-            except Exception:
-                parse_fail += 1
-                continue
-            if etype != "ob":
-                non_ob += 1
-                continue
-
-            ts_ms_raw = int(ts_ms_raw)
-            if BYBIT_DAY_CLIP and (ts_ms_raw < day_start_ms or ts_ms_raw >= day_end_ms):
-                day_clipped += 1
-                continue
-
-            try:
-                ts_ms = quantize_ts_ms(ts_ms_raw, TIME_GRID_STEP_MS, TIME_GRID_GUARD_MS)
-            except Exception:
-                quantize_drop += 1
-                continue
-
-            repaired_ts_ms = ts_ms
-            if last_seen_ts_ms is not None and repaired_ts_ms < last_seen_ts_ms:
-                backstep_ms = last_seen_ts_ms - repaired_ts_ms
-                if BYBIT_STRICT_DATA:
-                    raise ValueError(
-                        "Non-decreasing quantized OB timestamps violated: "
-                        f"previous_ts_ms={last_seen_ts_ms} current_ts_ms={repaired_ts_ms} "
-                        f"raw_ts_ms={ts_ms_raw}. strict_data=1"
-                    )
-                if backstep_ms <= BYBIT_TS_BACKSTEP_CLAMP_MS:
-                    repaired_ts_ms = last_seen_ts_ms
-                    backstep_clamp += 1
-                else:
-                    backstep_drop += 1
+        with _open_text(ob_path) as f:
+            for line_no, line in enumerate(f, start=1):
+                dq_day.increment_counter("event", "total")
+                if not line:
                     continue
-            last_seen_ts_ms = repaired_ts_ms
+                try:
+                    raw = fast_json_loads(line)
+                except Exception:
+                    dq_day.increment_counter("parse", "bad_json")
+                    dq_day.append_example(
+                        "bad_json",
+                        {"line": int(line_no), "sample": line[:200].rstrip()},
+                    )
+                    raw = None
 
-            if (
-                last_bid is not None
-                and last_ask is not None
-                and last_bsz is not None
-                and last_asz is not None
-                and next_sample_ts is not None
-                and last_ob_update_ts is not None
-            ):
-                while next_sample_ts < repaired_ts_ms:
-                    stale_ms = max(next_sample_ts - last_ob_update_ts, 0)
-                    series.append(next_sample_ts, last_bid, last_ask, last_bsz, last_asz, stale_ms)
+                if raw is not None:
+                    try:
+                        etype, ts_ms_raw, payload = fe._parse_event(raw)
+                    except Exception:
+                        dq_day.increment_counter("parse", "parse_fail")
+                        dq_day.append_example("parse_fail", {"line": int(line_no)})
+                        raw = None
+
+                if raw is None:
+                    bad_abs, total = _day_bad_abs_and_total(dq_day)
+                    bad_frac = float(bad_abs) / float(max(1, total))
+                    if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                        aborted_for_corruption = True
+                        dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                        week_quality.tainted = True
+                        week_quality.append_note(
+                            "[warn] corruption abort day="
+                            f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
+                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                        )
+                        break
+                    continue
+
+                if etype != "ob":
+                    dq_day.increment_counter("event", "non_ob")
+                    bad_abs, total = _day_bad_abs_and_total(dq_day)
+                    bad_frac = float(bad_abs) / float(max(1, total))
+                    if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                        aborted_for_corruption = True
+                        dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                        week_quality.tainted = True
+                        week_quality.append_note(
+                            "[warn] corruption abort day="
+                            f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
+                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                        )
+                        break
+                    continue
+
+                ts_ms_raw = int(ts_ms_raw)
+                dq_day.update_raw_ts(ts_ms_raw)
+                if BYBIT_DAY_CLIP and (ts_ms_raw < day_start_ms or ts_ms_raw >= day_end_ms):
+                    dq_day.increment_counter("day_clip", "clipped")
+                    dq_day.append_example("day_clip", {"line": int(line_no), "ts_raw": int(ts_ms_raw)})
+                    bad_abs, total = _day_bad_abs_and_total(dq_day)
+                    bad_frac = float(bad_abs) / float(max(1, total))
+                    if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                        aborted_for_corruption = True
+                        dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                        week_quality.tainted = True
+                        week_quality.append_note(
+                            "[warn] corruption abort day="
+                            f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
+                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                        )
+                        break
+                    continue
+
+                try:
+                    ts_ms = quantize_ts_ms(ts_ms_raw, TIME_GRID_STEP_MS, TIME_GRID_GUARD_MS)
+                except Exception:
+                    dq_day.increment_counter("quantize", "drop")
+                    dq_day.append_example("quantize_drop", {"line": int(line_no), "ts_raw": int(ts_ms_raw)})
+                    bad_abs, total = _day_bad_abs_and_total(dq_day)
+                    bad_frac = float(bad_abs) / float(max(1, total))
+                    if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                        aborted_for_corruption = True
+                        dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                        week_quality.tainted = True
+                        week_quality.append_note(
+                            "[warn] corruption abort day="
+                            f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
+                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                        )
+                        break
+                    continue
+
+                repaired_ts_ms = ts_ms
+                if last_seen_ts_ms is not None and repaired_ts_ms < last_seen_ts_ms:
+                    backstep_ms = last_seen_ts_ms - repaired_ts_ms
+                    if BYBIT_STRICT_DATA:
+                        raise ValueError(
+                            "Non-decreasing quantized OB timestamps violated: "
+                            f"previous_ts_ms={last_seen_ts_ms} current_ts_ms={repaired_ts_ms} "
+                            f"raw_ts_ms={ts_ms_raw}. strict_data=1"
+                        )
+                    if backstep_ms <= BYBIT_TS_BACKSTEP_CLAMP_MS:
+                        repaired_ts_ms = last_seen_ts_ms
+                        dq_day.increment_counter("backstep", "clamp")
+                    else:
+                        dq_day.increment_counter("backstep", "drop")
+                        dq_day.append_example(
+                            "backstep_drop",
+                            {"line": int(line_no), "prev_ts": int(last_seen_ts_ms), "curr_ts": int(ts_ms)},
+                        )
+                        bad_abs, total = _day_bad_abs_and_total(dq_day)
+                        bad_frac = float(bad_abs) / float(max(1, total))
+                        if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                            aborted_for_corruption = True
+                            dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                            week_quality.tainted = True
+                            week_quality.append_note(
+                                "[warn] corruption abort day="
+                                f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
+                                f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                            )
+                            break
+                        continue
+                last_seen_ts_ms = repaired_ts_ms
+                dq_day.update_output_ts(repaired_ts_ms)
+
+                if (
+                    last_bid is not None
+                    and last_ask is not None
+                    and last_bsz is not None
+                    and last_asz is not None
+                    and next_sample_ts is not None
+                    and last_ob_update_ts is not None
+                ):
+                    while next_sample_ts < repaired_ts_ms:
+                        stale_ms = max(next_sample_ts - last_ob_update_ts, 0)
+                        series.append(next_sample_ts, last_bid, last_ask, last_bsz, last_asz, stale_ms)
+                        next_sample_ts += TIME_GRID_STEP_MS
+
+                fe._update_book_from_ob(payload)
+                bid, ask, bsz, asz = fe._book_best()
+                if bid <= 0.0 or ask <= 0.0 or bsz is None or asz is None:
+                    continue
+                bsz = max(float(bsz), 0.0)
+                asz = max(float(asz), 0.0)
+
+                if series.ts and series.ts[-1] == repaired_ts_ms:
+                    series.best_bid[-1] = float(bid)
+                    series.best_ask[-1] = float(ask)
+                    series.best_bid_size[-1] = float(bsz)
+                    series.best_ask_size[-1] = float(asz)
+                    series.time_since_last_ob_update_ms[-1] = 0.0
+                    last_bid = bid
+                    last_ask = ask
+                    last_bsz = bsz
+                    last_asz = asz
+                    last_ob_update_ts = int(repaired_ts_ms)
+                    continue
+
+                if next_sample_ts is None:
+                    next_sample_ts = int(repaired_ts_ms)
+
+                while next_sample_ts <= repaired_ts_ms:
+                    stale_ms = max(next_sample_ts - repaired_ts_ms, 0)
+                    series.append(next_sample_ts, bid, ask, bsz, asz, stale_ms)
                     next_sample_ts += TIME_GRID_STEP_MS
 
-            fe._update_book_from_ob(payload)
-            bid, ask, bsz, asz = fe._book_best()
-            # Startup policy: do not sample until all four top-of-book values are known.
-            if bid <= 0.0 or ask <= 0.0 or bsz is None or asz is None:
-                continue
-            bsz = max(float(bsz), 0.0)
-            asz = max(float(asz), 0.0)
-
-            if series.ts and series.ts[-1] == repaired_ts_ms:
-                series.best_bid[-1] = float(bid)
-                series.best_ask[-1] = float(ask)
-                series.best_bid_size[-1] = float(bsz)
-                series.best_ask_size[-1] = float(asz)
-                series.time_since_last_ob_update_ms[-1] = 0.0
                 last_bid = bid
                 last_ask = ask
                 last_bsz = bsz
                 last_asz = asz
                 last_ob_update_ts = int(repaired_ts_ms)
-                continue
 
-            if next_sample_ts is None:
-                next_sample_ts = int(repaired_ts_ms)
+                bad_abs, total = _day_bad_abs_and_total(dq_day)
+                bad_frac = float(bad_abs) / float(max(1, total))
+                if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                    aborted_for_corruption = True
+                    dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                    week_quality.tainted = True
+                    week_quality.append_note(
+                        "[warn] corruption abort day="
+                        f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
+                        f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                    )
+                    break
 
-            while next_sample_ts <= repaired_ts_ms:
-                stale_ms = max(next_sample_ts - repaired_ts_ms, 0)
-                series.append(next_sample_ts, bid, ask, bsz, asz, stale_ms)
-                next_sample_ts += TIME_GRID_STEP_MS
+        bad_abs, total = _day_bad_abs_and_total(dq_day)
+        dq_day.increment_counter("event", "bad_abs", bad_abs)
+        dq_day.increment_counter("event", "bad_total", total)
+        week_quality.add_day(dq_day)
 
-            last_bid = bid
-            last_ask = ask
-            last_bsz = bsz
-            last_asz = asz
-            last_ob_update_ts = int(repaired_ts_ms)
-
-        if parse_fail or non_ob or day_clipped or quantize_drop or backstep_drop or backstep_clamp:
+        parse_bad_json = dq_day.counters.get("parse", {}).get("bad_json", 0)
+        parse_fail = dq_day.counters.get("parse", {}).get("parse_fail", 0)
+        non_ob = dq_day.counters.get("event", {}).get("non_ob", 0)
+        day_clipped = dq_day.counters.get("day_clip", {}).get("clipped", 0)
+        quantize_drop = dq_day.counters.get("quantize", {}).get("drop", 0)
+        backstep_drop = dq_day.counters.get("backstep", {}).get("drop", 0)
+        backstep_clamp = dq_day.counters.get("backstep", {}).get("clamp", 0)
+        if parse_bad_json or parse_fail or non_ob or day_clipped or quantize_drop or backstep_drop or backstep_clamp or aborted_for_corruption:
             print(
                 f"[quality] {Path(ob_path).name}: "
-                f"parse_fail={parse_fail:,} non_ob={non_ob:,} day_clipped={day_clipped:,} "
+                f"bad_json={parse_bad_json:,} parse_fail={parse_fail:,} non_ob={non_ob:,} day_clipped={day_clipped:,} "
                 f"quantize_drop={quantize_drop:,} backstep_clamp={backstep_clamp:,} "
-                f"backstep_drop={backstep_drop:,}"
+                f"backstep_drop={backstep_drop:,} aborted={int(aborted_for_corruption)}"
             )
 
+    week_quality.recompute_totals()
     return series
 
 
@@ -574,12 +695,22 @@ def main() -> int:
             f"ob={os.path.basename(ob_paths[0])}...{os.path.basename(ob_paths[-1])} "
             f"({len(ob_paths)} files)"
         )
-        series = build_snapshots_from_ob_files(ob_paths)
+        week_quality = WeekQuality(week_key=wk, days=[], totals={})
+        series = build_snapshots_from_ob_files(ob_paths, week_quality)
+        quality_path = Path(args.out_root) / wk / "snapshots_quality.json"
+        quality_payload = {
+            "config": quality_env_config(),
+            **week_quality.to_dict(),
+        }
+        quality_path.parent.mkdir(parents=True, exist_ok=True)
+        quality_path.write_text(json.dumps(quality_payload, indent=2), encoding="utf-8")
         if not series.ts:
             print(f"  [skip] no snapshots produced for {wk}")
+            print(f"  [quality] {quality_path}")
             continue
         out_path = write_week_snapshots(args.out_root, wk, series, overwrite=args.overwrite)
         print(f"  [write] {out_path} rows={len(series.ts):,}")
+        print(f"  [quality] {quality_path}")
 
     return 0
 
