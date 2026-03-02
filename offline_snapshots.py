@@ -26,7 +26,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -193,8 +193,8 @@ def iter_ob_events_many(ob_paths: List[str]):
 
 def _utc_day_bounds_ms(day: date) -> tuple[int, int]:
     assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
-    start = datetime(day.year, day.month, day.day)
-    end = start + ONE_DAY
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
