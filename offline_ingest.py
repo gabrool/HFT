@@ -1126,6 +1126,7 @@ def _iter_week_merged_events(
             f"ob={len(ob_list)} th={len(th_list)}"
         )
 
+    strict_mode = bool(BYBIT_STRICT_DATA)
     last_ts_global: Optional[int] = None
     prev_ob_name: Optional[str] = None
     prev_th_name: Optional[str] = None
@@ -1143,7 +1144,7 @@ def _iter_week_merged_events(
         )
         ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day)
         th_iter = safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day)
-        for event in merge_event_time(ob_iter, th_iter, dq_day=dq_day, strict=bool(BYBIT_STRICT_DATA), B=0):
+        for event in merge_event_time(ob_iter, th_iter, dq_day=dq_day, strict=strict_mode, B=0):
             _etype, ts, _seq, _data = event
             if (
                 last_ts_global is not None
@@ -1154,14 +1155,44 @@ def _iter_week_merged_events(
                     if prev_ob_name is not None and prev_th_name is not None
                     else "<week-start>"
                 )
-                raise ValueError(
-                    "Non-monotonic timestamps while chaining daily files within week: "
-                    f"week={week_key} "
-                    f"prev_day_files={prev_pair} "
-                    f"curr_day_files={ob_name} | {th_name} "
-                    f"prev_ts={last_ts_global} curr_ts={ts} "
-                    f"tolerance_ms={WEEK_CHAIN_TS_TOLERANCE_MS}"
-                )
+                backstep_ms = int(last_ts_global - ts)
+                if strict_mode:
+                    raise ValueError(
+                        "Non-monotonic timestamps while chaining daily files within week: "
+                        f"week={week_key} "
+                        f"prev_day_files={prev_pair} "
+                        f"curr_day_files={ob_name} | {th_name} "
+                        f"prev_ts={last_ts_global} curr_ts={ts} "
+                        f"tolerance_ms={WEEK_CHAIN_TS_TOLERANCE_MS}"
+                    )
+
+                if backstep_ms <= WEEK_CHAIN_TS_TOLERANCE_MS:
+                    dq_day.increment_counter("chain", "chain_clamped_backstep")
+                    dq_day.append_example(
+                        "chain_backstep",
+                        {
+                            "a": "clamp",
+                            "p": prev_pair,
+                            "c": f"{ob_name} | {th_name}",
+                            "prev_ts": int(last_ts_global),
+                            "curr_ts": int(ts),
+                        },
+                    )
+                    event = (_etype, int(last_ts_global), _seq, _data)
+                    ts = int(last_ts_global)
+                else:
+                    dq_day.increment_counter("chain", "chain_dropped_big_backstep")
+                    dq_day.append_example(
+                        "chain_backstep",
+                        {
+                            "a": "drop",
+                            "p": prev_pair,
+                            "c": f"{ob_name} | {th_name}",
+                            "prev_ts": int(last_ts_global),
+                            "curr_ts": int(ts),
+                        },
+                    )
+                    continue
 
             last_ts_global = ts
             prev_ob_name = ob_name
