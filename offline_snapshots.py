@@ -78,7 +78,7 @@ BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
 BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
 BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
-DAY_CLIP_DELTA = timedelta(days=BYBIT_DAY_CLIP)
+ONE_DAY = timedelta(days=1)
 
 
 def quality_env_config() -> dict[str, object]:
@@ -192,8 +192,9 @@ def iter_ob_events_many(ob_paths: List[str]):
 
 
 def _utc_day_bounds_ms(day: date) -> tuple[int, int]:
+    assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     start = datetime(day.year, day.month, day.day)
-    end = start + timedelta(days=1)
+    end = start + ONE_DAY
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
@@ -633,6 +634,7 @@ def filter_weeks(weeks_in_order: List[str], requested: Optional[List[str]]) -> L
 
 
 def daily_ob_paths_for_week(week_key: str, ob_by_day: dict[date, str]) -> List[str]:
+    assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     start_dt, end_dt, _ = _parse_week_key(week_key)
     d0, d1 = start_dt.date(), end_dt.date()
     paths = []
@@ -644,7 +646,7 @@ def daily_ob_paths_for_week(week_key: str, ob_by_day: dict[date, str]) -> List[s
             missing.append(d.strftime("%Y-%m-%d"))
         else:
             paths.append(p)
-        d += DAY_CLIP_DELTA
+        d += ONE_DAY
     if missing:
         raise ValueError(f"Missing daily OB files for week={week_key}: {missing}")
     return paths
