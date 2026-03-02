@@ -59,6 +59,40 @@ RAW_BYBIT_WEEKS = os.environ.get("BYBIT_WEEKS", "")
 OB_DAILY_RE = re.compile(r"^(?P<d>\d{4}-\d{2}-\d{2})_BTCUSDT_.*ob.*\.zip$", re.IGNORECASE)
 
 
+def _env_bool_int(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    v = str(raw).strip().lower()
+    if v in {"1", "true", "t", "yes", "y", "on"}:
+        return 1
+    if v in {"0", "false", "f", "no", "n", "off"}:
+        return 0
+    return int(v)
+
+
+# Quality/repair env config (parsed once at import time)
+BYBIT_DAY_CLIP = int(os.environ.get("BYBIT_DAY_CLIP", "1"))
+BYBIT_TS_BACKSTEP_CLAMP_MS = int(os.environ.get("BYBIT_TS_BACKSTEP_CLAMP_MS", "5000"))
+BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
+BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
+BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
+BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
+DAY_CLIP_DELTA = timedelta(days=BYBIT_DAY_CLIP)
+
+
+def quality_env_config() -> dict[str, object]:
+    """Serializable quality/repair env knobs for reports/metadata."""
+    return {
+        "day_clip": int(BYBIT_DAY_CLIP),
+        "ts_backstep_clamp_ms": int(BYBIT_TS_BACKSTEP_CLAMP_MS),
+        "strict_data": int(BYBIT_STRICT_DATA),
+        "bad_examples_n": int(BYBIT_BAD_EXAMPLES_N),
+        "bad_frac_abort": float(BYBIT_BAD_FRAC_ABORT),
+        "bad_abs_abort": int(BYBIT_BAD_ABS_ABORT),
+    }
+
+
 def _ob_ext_rank(path: str) -> int:
     lower_path = str(path).lower()
     if lower_path.endswith(".data.zip"):
@@ -224,12 +258,16 @@ def build_snapshots_from_ob_files(ob_paths: List[str]) -> SnapshotSeries:
         ts_ms = quantize_ts_ms(ts_ms_raw, TIME_GRID_STEP_MS, TIME_GRID_GUARD_MS)
         if etype != "ob":
             continue
-        if last_seen_ts_ms is not None and ts_ms < last_seen_ts_ms:
+        if (
+            last_seen_ts_ms is not None
+            and ts_ms + BYBIT_TS_BACKSTEP_CLAMP_MS < last_seen_ts_ms
+        ):
             raise ValueError(
                 "Non-decreasing quantized OB timestamps violated: "
                 f"previous_ts_ms={last_seen_ts_ms} current_ts_ms={ts_ms} "
                 f"raw_ts_ms={ts_ms_raw}. "
-                "Ordering across daily OB files may be broken."
+                "Ordering across daily OB files may be broken. "
+                f"backstep_clamp_ms={BYBIT_TS_BACKSTEP_CLAMP_MS}"
             )
         last_seen_ts_ms = ts_ms
 
@@ -317,7 +355,7 @@ def daily_ob_paths_for_week(week_key: str, ob_by_day: dict[date, str]) -> List[s
             missing.append(d.strftime("%Y-%m-%d"))
         else:
             paths.append(p)
-        d += timedelta(days=1)
+        d += DAY_CLIP_DELTA
     if missing:
         raise ValueError(f"Missing daily OB files for week={week_key}: {missing}")
     return paths
