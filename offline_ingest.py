@@ -240,7 +240,7 @@ except Exception:
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 
-def merge_event_time(ob_iter, tr_iter, B: int = 0):
+def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, strict: bool = True, B: int = 0):
     """Merge OB/trade events by timestamp/sequence with a monotonicity guard."""
     ob_item = next(ob_iter, None)
     tr_item = next(tr_iter, None)
@@ -256,8 +256,29 @@ def merge_event_time(ob_iter, tr_iter, B: int = 0):
             tr_item = next(tr_iter, None)
             etype = "trade"
         if ts + B < last_ts:
-            raise ValueError("Non-monotonic timestamps in event stream")
+            backstep_ms = int(last_ts - ts)
+            if strict:
+                raise ValueError("Non-monotonic timestamps in event stream")
+
+            if backstep_ms <= BYBIT_TS_BACKSTEP_CLAMP_MS:
+                if dq_day is not None:
+                    dq_day.increment_counter("merge", "merge_clamped_backstep")
+                    dq_day.append_example(
+                        "merge_backstep",
+                        {"kind": "clamp", "s": etype[0], "d": backstep_ms, "in": int(ts), "out": int(last_ts)},
+                    )
+                ts = last_ts
+            else:
+                if dq_day is not None:
+                    dq_day.increment_counter("merge", "merge_dropped_big_backstep")
+                    dq_day.append_example(
+                        "merge_backstep",
+                        {"kind": "drop", "s": etype[0], "d": backstep_ms, "in": int(ts), "last": int(last_ts)},
+                    )
+                continue
         last_ts = ts
+        if dq_day is not None:
+            dq_day.update_output_ts(last_ts)
         yield etype, ts, seq, data
 
 
@@ -1122,7 +1143,7 @@ def _iter_week_merged_events(
         )
         ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day)
         th_iter = safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day)
-        for event in merge_event_time(ob_iter, th_iter, B=0):
+        for event in merge_event_time(ob_iter, th_iter, dq_day=dq_day, strict=bool(BYBIT_STRICT_DATA), B=0):
             _etype, ts, _seq, _data = event
             if (
                 last_ts_global is not None
