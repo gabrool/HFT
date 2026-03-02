@@ -1317,7 +1317,7 @@ def _stream_core_features(pairs: List[WeekPair]):
     last_log = time.monotonic()
     last_wk = None
 
-    feeder = EventFeeder(pairs)
+    feeder = EventFeeder(pairs, collect_quality=False)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
     producer_thread.start()
     q = feeder.queue
@@ -1344,7 +1344,8 @@ def _stream_core_features(pairs: List[WeekPair]):
                     break
                 continue
             else:
-                raise RuntimeError(f"Unknown feeder message kind: {kind}")
+                print(f"[pca ] ignoring feeder message kind={kind!r} week={wk}", flush=True)
+                continue
 
             if event is None:
                 continue
@@ -1674,7 +1675,8 @@ def process_all(
                 break
             continue
         else:
-            raise RuntimeError(f"Unknown feeder message kind: {kind}")
+            print(f"[ingest] ignoring feeder message kind={kind!r} week={wk}", flush=True)
+            continue
 
         if event is None:
             continue
