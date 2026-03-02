@@ -234,6 +234,109 @@ class SnapshotSeries:
         )
 
 
+@dataclass
+class DayQuality:
+    day: str
+    ob_path: str
+    counters: dict[str, dict[str, int]]
+    raw_ts_min: Optional[int] = None
+    raw_ts_max: Optional[int] = None
+    out_ts_min: Optional[int] = None
+    out_ts_max: Optional[int] = None
+    examples: Optional[dict[str, list[dict[str, object]]]] = None
+    abort_flags: Optional[dict[str, bool]] = None
+
+    def __post_init__(self) -> None:
+        if self.examples is None:
+            self.examples = {}
+        if self.abort_flags is None:
+            self.abort_flags = {}
+
+    def increment_counter(self, namespace: str, key: str, amount: int = 1) -> None:
+        ns = self.counters.setdefault(namespace, {})
+        ns[key] = int(ns.get(key, 0) + amount)
+
+    def update_raw_ts(self, ts_ms: int) -> None:
+        ts = int(ts_ms)
+        self.raw_ts_min = ts if self.raw_ts_min is None else min(self.raw_ts_min, ts)
+        self.raw_ts_max = ts if self.raw_ts_max is None else max(self.raw_ts_max, ts)
+
+    def update_output_ts(self, ts_ms: int) -> None:
+        ts = int(ts_ms)
+        self.out_ts_min = ts if self.out_ts_min is None else min(self.out_ts_min, ts)
+        self.out_ts_max = ts if self.out_ts_max is None else max(self.out_ts_max, ts)
+
+    def append_example(self, category: str, payload: dict[str, object]) -> None:
+        assert self.examples is not None
+        bucket = self.examples.setdefault(category, [])
+        if len(bucket) < BYBIT_BAD_EXAMPLES_N:
+            bucket.append(dict(payload))
+
+    def set_abort_flag(self, flag: str, value: bool = True) -> None:
+        assert self.abort_flags is not None
+        self.abort_flags[flag] = bool(value)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "day": self.day,
+            "ob_path": self.ob_path,
+            "counters": {ns: dict(vals) for ns, vals in self.counters.items()},
+            "raw_ts": {"min": self.raw_ts_min, "max": self.raw_ts_max},
+            "output_ts": {"min": self.out_ts_min, "max": self.out_ts_max},
+            "examples": {k: list(v) for k, v in (self.examples or {}).items()},
+            "abort_flags": dict(self.abort_flags or {}),
+        }
+
+
+@dataclass
+class WeekQuality:
+    week_key: str
+    days: list[DayQuality]
+    totals: dict[str, dict[str, int]]
+    tainted: bool = False
+    notes: Optional[list[str]] = None
+
+    def __post_init__(self) -> None:
+        if self.notes is None:
+            self.notes = []
+
+    def add_day(self, day_quality: DayQuality) -> None:
+        self.days.append(day_quality)
+
+    def increment_total(self, namespace: str, key: str, amount: int = 1) -> None:
+        ns = self.totals.setdefault(namespace, {})
+        ns[key] = int(ns.get(key, 0) + amount)
+
+    def append_note(self, note: str) -> None:
+        assert self.notes is not None
+        self.notes.append(str(note))
+
+    def recompute_totals(self) -> None:
+        self.totals = {
+            "parse": {},
+            "event": {},
+            "quantize": {},
+            "backstep": {},
+            "day_clip": {},
+        }
+        for day in self.days:
+            for namespace, values in day.counters.items():
+                ns = self.totals.setdefault(namespace, {})
+                for key, value in values.items():
+                    ns[key] = int(ns.get(key, 0) + int(value))
+            if any((day.abort_flags or {}).values()):
+                self.tainted = True
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "week_key": self.week_key,
+            "days": [d.to_dict() for d in self.days],
+            "totals": {ns: dict(vals) for ns, vals in self.totals.items()},
+            "tainted": bool(self.tainted),
+            "notes": list(self.notes or []),
+        }
+
+
 def build_snapshots_from_ob_files(ob_paths: List[str]) -> SnapshotSeries:
     fe = FeatureEngine()
     series = SnapshotSeries(
