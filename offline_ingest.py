@@ -1256,11 +1256,14 @@ class EventFeeder:
         self,
         pairs: List[WeekPair],
         maxsize: int = EVENT_QUEUE_MAXSIZE,
+        collect_quality: bool = True,
     ):
         self.pairs = list(pairs)
         self.queue: "queue.Queue[Tuple[str, Optional[str], Optional[object]]]" = queue.Queue(maxsize=maxsize)
         self._last_first_ts: Optional[int] = None
+        self.collect_quality = bool(collect_quality)
         self.week_qualities: Dict[str, WeekQuality] = {}
+        self.quality_by_week: Dict[str, Dict[str, object]] = {}
 
     def _put(self, item: Tuple[str, Optional[str], Optional[object]]):
         self.queue.put(item)
@@ -1268,12 +1271,17 @@ class EventFeeder:
     def run(self):
         try:
             for wk, ob_paths, th_paths in self.pairs:
-                week_quality = WeekQuality(week_key=wk)
-                self.week_qualities[wk] = week_quality
+                week_quality: Optional[WeekQuality] = None
+                if self.collect_quality:
+                    week_quality = WeekQuality(week_key=wk)
+                    self.week_qualities[wk] = week_quality
                 merged = _iter_week_merged_events(wk, ob_paths, th_paths, week_quality=week_quality)
 
                 first_event = next(merged, None)
                 if first_event is None:
+                    if week_quality is not None:
+                        week_quality.recompute_totals()
+                        self.quality_by_week[wk] = week_quality.to_dict()
                     self._put(("first", wk, None))
                     self._put(("eof", wk, None))
                     continue
@@ -1289,6 +1297,9 @@ class EventFeeder:
                 self._put(("first", wk, first_event))
                 for event in merged:
                     self._put(("evt", wk, event))
+                if week_quality is not None:
+                    week_quality.recompute_totals()
+                    self.quality_by_week[wk] = week_quality.to_dict()
                 self._put(("eof", wk, None))
 
             self._put(("eof", None, None))
@@ -1763,20 +1774,7 @@ def process_all(
     feature_dim_core = None if F is None else int(F - AUX_DIM)
     label_dim = int(2 * NUM_HORIZONS)
     week_meta_records = {} if router is None else dict(router.week_metas)
-    week_quality_records = {
-        wk: wq for wk, wq in feeder.week_qualities.items()
-    }
-
-    for wk, week_quality in week_quality_records.items():
-        week_quality.recompute_totals()
-        quality_payload = week_quality.to_dict()
-        if wk in week_meta_records:
-            week_meta_records[wk]["quality"] = quality_payload
-            meta_rel_path = week_meta_records[wk].get("meta_path")
-            if meta_rel_path:
-                meta_abs_path = os.path.join(out_root, str(meta_rel_path))
-                with open(meta_abs_path, "w") as f:
-                    json.dump(week_meta_records[wk], f, indent=2)
+    week_quality_records = dict(feeder.quality_by_week)
     weeks_in_order = [wk for wk, _ob, _th in pairs]
     week_counts = {
         wk: int(0 if router is None else router.week_counts.get(wk, 0))
@@ -1808,6 +1806,48 @@ def process_all(
                 "n": int(entry.get("n", 0)),
                 "files": files,
             })
+
+
+    quality_week_totals: Dict[str, Dict[str, int]] = {"ob": {}, "th": {}, "merge": {}, "chain": {}}
+    quality_week_tainted = 0
+    quality_day_count = 0
+    quality_day_tainted = 0
+    for wk in weeks_in_order:
+        week_quality = week_quality_records.get(wk)
+        if not week_quality:
+            continue
+        if bool(week_quality.get("tainted", False)):
+            quality_week_tainted += 1
+        days = list(week_quality.get("days", []))
+        quality_day_count += len(days)
+        quality_day_tainted += sum(1 for day in days if any(day.get("abort_flags", {}).values()))
+        for namespace, values in week_quality.get("totals", {}).items():
+            ns_totals = quality_week_totals.setdefault(namespace, {})
+            for key, value in values.items():
+                ns_totals[key] = int(ns_totals.get(key, 0) + int(value))
+
+    data_quality_dataset = {
+        "quality_config": quality_env_config(),
+        "weeks": {wk: week_quality_records[wk] for wk in weeks_in_order if wk in week_quality_records},
+        "totals": quality_week_totals,
+        "flags": {
+            "tainted": bool(quality_week_tainted > 0),
+            "tainted_week_count": int(quality_week_tainted),
+            "week_count": int(len(week_quality_records)),
+            "day_count": int(quality_day_count),
+            "tainted_day_count": int(quality_day_tainted),
+        },
+    }
+
+    for wk in weeks_in_order:
+        if wk not in week_quality_records:
+            continue
+        week_quality_path = os.path.join(out_root, wk, "data_quality.json")
+        with open(week_quality_path, "w") as f:
+            json.dump(week_quality_records[wk], f, indent=2)
+
+    with open(os.path.join(out_root, "_data_quality.json"), "w") as f:
+        json.dump(data_quality_dataset, f, indent=2)
 
     split_ranges = None
     if split_info and len(weeks_in_order) >= 2:
@@ -1882,11 +1922,7 @@ def process_all(
         "rows_total_from_weeks": int(rows_via_week_metas),
         "weeks_meta": weeks_meta_paths,
         "chunks": chunk_files,
-        "quality_config": quality_env_config(),
-        "quality": {
-            "weeks": {wk: wq.to_dict() for wk, wq in week_quality_records.items()},
-            "tainted": bool(any(wq.tainted for wq in week_quality_records.values())),
-        },
+        "data_quality_path": "_data_quality.json",
     }
     meta["pca"] = dict(pca_summary)
     if pca_var_ratio is not None:
