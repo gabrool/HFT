@@ -200,6 +200,21 @@ class WeekQuality:
             "tainted": bool(self.tainted),
             "notes": list(self.notes),
         }
+
+
+def _day_bad_abs_and_total(day_quality: DayQuality) -> Tuple[int, int]:
+    """Compute corruption and input totals for a day quality record."""
+    bad_abs = 0
+    for namespace in ("ob", "th", "merge", "chain"):
+        for key, value in day_quality.counters.get(namespace, {}).items():
+            key_l = str(key).lower()
+            if "drop" in key_l or "error" in key_l or "bad" in key_l:
+                bad_abs += int(value)
+
+    total_ob = int(day_quality.counters.get("ob", {}).get("total", 0))
+    total_th = int(day_quality.counters.get("th", {}).get("total", 0))
+    total = total_ob + total_th
+    return int(bad_abs), int(total)
 # import your training utilities
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -1079,6 +1094,7 @@ def _iter_week_merged_events(
     week_key: str,
     ob_paths: List[str],
     th_paths: List[str],
+    week_quality: Optional[WeekQuality] = None,
 ):
     ob_list = list(ob_paths)
     th_list = list(th_paths)
@@ -1142,6 +1158,7 @@ def _iter_week_merged_events(
             ob_path=ob_path,
             th_path=th_path,
         )
+        aborted_for_corruption = False
         ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day)
         th_iter = safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day)
         for event in merge_event_time(ob_iter, th_iter, dq_day=dq_day, strict=strict_mode, B=0):
@@ -1199,6 +1216,41 @@ def _iter_week_merged_events(
             prev_th_name = th_name
             yield event
 
+            bad_abs, total = _day_bad_abs_and_total(dq_day)
+            bad_frac = float(bad_abs) / float(max(1, total))
+            if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                aborted_for_corruption = True
+                dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                if week_quality is not None:
+                    week_quality.tainted = True
+                    week_quality.append_note(
+                        "[warn] corruption abort day="
+                        f"{dq_day.day} week={week_key} bad_abs={bad_abs} total={total} "
+                        f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                    )
+                break
+
+        bad_abs, total = _day_bad_abs_and_total(dq_day)
+        bad_frac = float(bad_abs) / float(max(1, total))
+        if (not aborted_for_corruption) and (
+            bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT
+        ):
+            aborted_for_corruption = True
+            dq_day.set_abort_flag("aborted_due_to_corruption", True)
+            if week_quality is not None:
+                week_quality.tainted = True
+                week_quality.append_note(
+                    "[warn] corruption abort day="
+                    f"{dq_day.day} week={week_key} bad_abs={bad_abs} total={total} "
+                    f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                )
+        dq_day.increment_counter("merge", "bad_abs", bad_abs)
+        dq_day.increment_counter("merge", "total", total)
+        if week_quality is not None:
+            week_quality.add_day(dq_day)
+        if aborted_for_corruption:
+            continue
+
 class EventFeeder:
     def __init__(
         self,
@@ -1208,6 +1260,7 @@ class EventFeeder:
         self.pairs = list(pairs)
         self.queue: "queue.Queue[Tuple[str, Optional[str], Optional[object]]]" = queue.Queue(maxsize=maxsize)
         self._last_first_ts: Optional[int] = None
+        self.week_qualities: Dict[str, WeekQuality] = {}
 
     def _put(self, item: Tuple[str, Optional[str], Optional[object]]):
         self.queue.put(item)
@@ -1215,7 +1268,9 @@ class EventFeeder:
     def run(self):
         try:
             for wk, ob_paths, th_paths in self.pairs:
-                merged = _iter_week_merged_events(wk, ob_paths, th_paths)
+                week_quality = WeekQuality(week_key=wk)
+                self.week_qualities[wk] = week_quality
+                merged = _iter_week_merged_events(wk, ob_paths, th_paths, week_quality=week_quality)
 
                 first_event = next(merged, None)
                 if first_event is None:
@@ -1708,6 +1763,20 @@ def process_all(
     feature_dim_core = None if F is None else int(F - AUX_DIM)
     label_dim = int(2 * NUM_HORIZONS)
     week_meta_records = {} if router is None else dict(router.week_metas)
+    week_quality_records = {
+        wk: wq for wk, wq in feeder.week_qualities.items()
+    }
+
+    for wk, week_quality in week_quality_records.items():
+        week_quality.recompute_totals()
+        quality_payload = week_quality.to_dict()
+        if wk in week_meta_records:
+            week_meta_records[wk]["quality"] = quality_payload
+            meta_rel_path = week_meta_records[wk].get("meta_path")
+            if meta_rel_path:
+                meta_abs_path = os.path.join(out_root, str(meta_rel_path))
+                with open(meta_abs_path, "w") as f:
+                    json.dump(week_meta_records[wk], f, indent=2)
     weeks_in_order = [wk for wk, _ob, _th in pairs]
     week_counts = {
         wk: int(0 if router is None else router.week_counts.get(wk, 0))
@@ -1814,6 +1883,10 @@ def process_all(
         "weeks_meta": weeks_meta_paths,
         "chunks": chunk_files,
         "quality_config": quality_env_config(),
+        "quality": {
+            "weeks": {wk: wq.to_dict() for wk, wq in week_quality_records.items()},
+            "tainted": bool(any(wq.tainted for wq in week_quality_records.values())),
+        },
     }
     meta["pca"] = dict(pca_summary)
     if pca_var_ratio is not None:
