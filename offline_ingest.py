@@ -212,7 +212,7 @@ from CMSSL17 import (
     NUM_HORIZONS,
     LOOKBACK,
     AUX_DIM,
-    BybitRawIter,
+    _open_text,
     TIME_GRID_STEP_MS,
     TIME_GRID_GUARD_MS,
     timestamp_to_ms_half_even,
@@ -641,6 +641,144 @@ def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
 
         yield ts_ms_precise, seq, row
 
+
+def _try_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day):
+    total = 0
+    emitted = 0
+    last_ts_out: Optional[int] = None
+    day_clip_enabled = bool(BYBIT_DAY_CLIP)
+
+    with _open_text(ob_path) as f:
+        for line_no, line in enumerate(f, start=1):
+            total += 1
+            dq_day.increment_counter("ob", "total")
+            if not line or not line.strip():
+                dq_day.increment_counter("ob", "blank_line")
+                continue
+            try:
+                obj = fast_json_loads(line)
+            except Exception:
+                dq_day.increment_counter("ob", "bad_json")
+                dq_day.append_example("ob_bad_json", {"line_no": line_no, "line": line[:256]})
+                continue
+
+            ts_raw = obj.get("ts")
+            if ts_raw is None:
+                ts_raw = obj.get("cts")
+            if ts_raw is None or (isinstance(ts_raw, str) and not ts_raw.strip()):
+                dq_day.increment_counter("ob", "missing_ts")
+                dq_day.append_example("ob_missing_ts", {"line_no": line_no, "payload": obj})
+                continue
+            try:
+                ts_ms = timestamp_to_ms_half_even(ts_raw)
+            except Exception:
+                dq_day.increment_counter("ob", "bad_ts")
+                dq_day.append_example("ob_bad_ts", {"line_no": line_no, "ts_raw": ts_raw, "payload": obj})
+                continue
+
+            dq_day.update_raw_ts(ts_ms)
+
+            if day_clip_enabled and (ts_ms < day_start_ms or ts_ms >= day_end_ms):
+                dq_day.increment_counter("ob", "clipped_day")
+                continue
+
+            if last_ts_out is not None and ts_ms < last_ts_out:
+                backstep_ms = last_ts_out - ts_ms
+                if backstep_ms <= BYBIT_TS_BACKSTEP_CLAMP_MS:
+                    dq_day.increment_counter("ob", "clamped_backstep")
+                    dq_day.append_example(
+                        "ob_clamped_backstep",
+                        {"line_no": line_no, "backstep_ms": backstep_ms, "ts_in": ts_ms, "ts_out": last_ts_out},
+                    )
+                    ts_ms = last_ts_out
+                else:
+                    dq_day.increment_counter("ob", "dropped_backstep")
+                    dq_day.append_example(
+                        "ob_dropped_backstep",
+                        {"line_no": line_no, "backstep_ms": backstep_ms, "ts_in": ts_ms, "last_ts_out": last_ts_out},
+                    )
+                    continue
+
+            data = obj.get("data")
+            if isinstance(data, dict):
+                seq = _try_int(data.get("seq"), 0)
+            else:
+                dq_day.increment_counter("ob", "missing_data")
+                seq = 0
+
+            last_ts_out = int(ts_ms)
+            emitted += 1
+            dq_day.increment_counter("ob", "emitted")
+            dq_day.update_output_ts(last_ts_out)
+            yield last_ts_out, seq, obj
+
+    dq_day.increment_counter("ob", "total_seen", total)
+    dq_day.increment_counter("ob", "total_emitted", emitted)
+
+
+def safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day):
+    total = 0
+    emitted = 0
+    last_ts_out: Optional[int] = None
+    day_clip_enabled = bool(BYBIT_DAY_CLIP)
+
+    with _open_text(th_path) as f:
+        reader = csv.DictReader(f)
+        for seq, row in enumerate(reader, start=1):
+            total += 1
+            dq_day.increment_counter("th", "total")
+            t_raw = row.get("timestamp")
+            if t_raw is None or (isinstance(t_raw, str) and not t_raw.strip()):
+                dq_day.increment_counter("th", "missing_ts")
+                dq_day.append_example("th_missing_ts", {"seq": seq, "row": row})
+                continue
+            try:
+                ts_ms = timestamp_to_ms_half_even(t_raw)
+            except Exception:
+                dq_day.increment_counter("th", "bad_ts")
+                dq_day.append_example("th_bad_ts", {"seq": seq, "ts_raw": t_raw, "row": row})
+                continue
+
+            dq_day.update_raw_ts(ts_ms)
+
+            if day_clip_enabled and (ts_ms < day_start_ms or ts_ms >= day_end_ms):
+                dq_day.increment_counter("th", "clipped_day")
+                continue
+
+            if last_ts_out is not None and ts_ms < last_ts_out:
+                backstep_ms = last_ts_out - ts_ms
+                if backstep_ms <= BYBIT_TS_BACKSTEP_CLAMP_MS:
+                    dq_day.increment_counter("th", "clamped_backstep")
+                    dq_day.append_example(
+                        "th_clamped_backstep",
+                        {"seq": seq, "backstep_ms": backstep_ms, "ts_in": ts_ms, "ts_out": last_ts_out},
+                    )
+                    ts_ms = last_ts_out
+                else:
+                    dq_day.increment_counter("th", "dropped_backstep")
+                    dq_day.append_example(
+                        "th_dropped_backstep",
+                        {"seq": seq, "backstep_ms": backstep_ms, "ts_in": ts_ms, "last_ts_out": last_ts_out},
+                    )
+                    continue
+
+            row["seq"] = seq
+            last_ts_out = int(ts_ms)
+            emitted += 1
+            dq_day.increment_counter("th", "emitted")
+            dq_day.update_output_ts(last_ts_out)
+            yield last_ts_out, seq, row
+
+    dq_day.increment_counter("th", "total_seen", total)
+    dq_day.increment_counter("th", "total_emitted", emitted)
+
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
     # exact tail order: [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
     aux_tail = np.array(
@@ -974,8 +1112,17 @@ def _iter_week_merged_events(
     for ob_path, th_path in zip(ob_list, th_list):
         ob_name = os.path.basename(ob_path)
         th_name = os.path.basename(th_path)
-        raw = BybitRawIter(ob_path, th_path)
-        for event in merge_event_time(raw.ob_iter(), _trade_iter_precise(raw.trade_iter()), B=0):
+        day = _daily_path_day(ob_path, "OB")
+        day_start_ms = _dt_to_epoch_ms(datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc))
+        day_end_ms = _dt_to_epoch_ms(datetime.combine(day + DAY_CLIP_DELTA, datetime.min.time(), tzinfo=timezone.utc))
+        dq_day = DayQuality(
+            day=day.isoformat(),
+            ob_path=ob_path,
+            th_path=th_path,
+        )
+        ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day)
+        th_iter = safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day)
+        for event in merge_event_time(ob_iter, th_iter, B=0):
             _etype, ts, _seq, _data = event
             if (
                 last_ts_global is not None
