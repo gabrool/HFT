@@ -38,6 +38,7 @@ Shared constants from CMSSL17:
 import os, sys, csv, json, re, time, logging
 import queue
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Iterable, Dict, Optional
 from collections import deque, defaultdict
@@ -99,6 +100,106 @@ def quality_env_config() -> Dict[str, object]:
         "bad_frac_abort": float(BYBIT_BAD_FRAC_ABORT),
         "bad_abs_abort": int(BYBIT_BAD_ABS_ABORT),
     }
+
+
+@dataclass
+class DayQuality:
+    day: str
+    ob_path: str
+    th_path: str
+    counters: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            "ob": {},
+            "th": {},
+            "merge": {},
+            "chain": {},
+        }
+    )
+    raw_ts_min: Optional[int] = None
+    raw_ts_max: Optional[int] = None
+    out_ts_min: Optional[int] = None
+    out_ts_max: Optional[int] = None
+    examples: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
+    abort_flags: Dict[str, bool] = field(default_factory=dict)
+
+    def increment_counter(self, namespace: str, key: str, amount: int = 1) -> None:
+        ns = self.counters.setdefault(namespace, {})
+        ns[key] = int(ns.get(key, 0) + amount)
+
+    def update_raw_ts(self, ts_ms: int) -> None:
+        ts = int(ts_ms)
+        self.raw_ts_min = ts if self.raw_ts_min is None else min(self.raw_ts_min, ts)
+        self.raw_ts_max = ts if self.raw_ts_max is None else max(self.raw_ts_max, ts)
+
+    def update_output_ts(self, ts_ms: int) -> None:
+        ts = int(ts_ms)
+        self.out_ts_min = ts if self.out_ts_min is None else min(self.out_ts_min, ts)
+        self.out_ts_max = ts if self.out_ts_max is None else max(self.out_ts_max, ts)
+
+    def append_example(self, category: str, payload: Dict[str, object]) -> None:
+        bucket = self.examples.setdefault(category, [])
+        if len(bucket) < BYBIT_BAD_EXAMPLES_N:
+            bucket.append(dict(payload))
+
+    def set_abort_flag(self, flag: str, value: bool = True) -> None:
+        self.abort_flags[flag] = bool(value)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "day": self.day,
+            "ob_path": self.ob_path,
+            "th_path": self.th_path,
+            "counters": {ns: dict(vals) for ns, vals in self.counters.items()},
+            "raw_ts": {"min": self.raw_ts_min, "max": self.raw_ts_max},
+            "output_ts": {"min": self.out_ts_min, "max": self.out_ts_max},
+            "examples": {k: list(v) for k, v in self.examples.items()},
+            "abort_flags": dict(self.abort_flags),
+        }
+
+
+@dataclass
+class WeekQuality:
+    week_key: str
+    days: List[DayQuality] = field(default_factory=list)
+    totals: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            "ob": {},
+            "th": {},
+            "merge": {},
+            "chain": {},
+        }
+    )
+    tainted: bool = False
+    notes: List[str] = field(default_factory=list)
+
+    def add_day(self, day_quality: DayQuality) -> None:
+        self.days.append(day_quality)
+
+    def increment_total(self, namespace: str, key: str, amount: int = 1) -> None:
+        ns = self.totals.setdefault(namespace, {})
+        ns[key] = int(ns.get(key, 0) + amount)
+
+    def append_note(self, note: str) -> None:
+        self.notes.append(str(note))
+
+    def recompute_totals(self) -> None:
+        self.totals = {"ob": {}, "th": {}, "merge": {}, "chain": {}}
+        for day in self.days:
+            for namespace, values in day.counters.items():
+                ns = self.totals.setdefault(namespace, {})
+                for key, value in values.items():
+                    ns[key] = int(ns.get(key, 0) + int(value))
+            if any(day.abort_flags.values()):
+                self.tainted = True
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "week_key": self.week_key,
+            "days": [d.to_dict() for d in self.days],
+            "totals": {ns: dict(vals) for ns, vals in self.totals.items()},
+            "tainted": bool(self.tainted),
+            "notes": list(self.notes),
+        }
 # import your training utilities
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
