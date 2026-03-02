@@ -88,6 +88,7 @@ BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
 BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
 BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
+ONE_DAY = timedelta(days=1)
 
 
 def quality_env_config() -> Dict[str, object]:
@@ -241,7 +242,6 @@ GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
 # Weekly chaining guard for multi-file weeks.
 WEEK_CHAIN_TS_TOLERANCE_MS = int(BYBIT_TS_BACKSTEP_CLAMP_MS)
-DAY_CLIP_DELTA = timedelta(days=BYBIT_DAY_CLIP)
 
 # fast json if available
 try:
@@ -438,6 +438,7 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
         A list of valid week blocks (each block has exactly 7 dates).
     """
     groups: List[List[date]] = []
+    assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     total_days = len(common_days)
     usable_days = (total_days // 7) * 7
 
@@ -452,7 +453,7 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
         block = common_days[start_idx:start_idx + 7]
         gap_idx = None
         for i in range(1, len(block)):
-            expected = block[i - 1] + DAY_CLIP_DELTA
+            expected = block[i - 1] + ONE_DAY
             if block[i] != expected:
                 gap_idx = i
                 break
@@ -460,7 +461,7 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
         if gap_idx is not None:
             prev_day = block[gap_idx - 1]
             curr_day = block[gap_idx]
-            expected_day = prev_day + DAY_CLIP_DELTA
+            expected_day = prev_day + ONE_DAY
             msg = (
                 "Non-consecutive days inside 7-day block: "
                 f"block_idx={start_idx // 7}, "
@@ -585,10 +586,11 @@ def _assert_weeks_consecutive(pairs: List[WeekPair]):
         parsed.append((start_dt, end_dt, wk))
 
     parsed.sort(key=lambda row: row[1])
+    assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     for idx in range(1, len(parsed)):
         prev_start, prev_end, prev_wk = parsed[idx - 1]
         next_start, next_end, next_wk = parsed[idx]
-        expected_next_start = prev_end.date() + DAY_CLIP_DELTA
+        expected_next_start = prev_end.date() + ONE_DAY
         if next_start.date() != expected_next_start:
             relation = "gap" if next_start.date() > expected_next_start else "overlap"
             raise ValueError(
@@ -1082,7 +1084,7 @@ def _build_week_index(pairs: List[WeekPair]):
     for wk, _ob_path, _th_path in pairs:
         start_dt, end_dt, _ = _parse_week_key_any(wk)
         start_ms = _dt_to_epoch_ms(start_dt)
-        end_ms = _dt_to_epoch_ms(end_dt + DAY_CLIP_DELTA)
+        end_ms = _dt_to_epoch_ms(end_dt + ONE_DAY)
         index.append((wk, start_ms, end_ms))
     index.sort(key=lambda x: x[1])
     return index
@@ -1143,6 +1145,7 @@ def _iter_week_merged_events(
         )
 
     strict_mode = bool(BYBIT_STRICT_DATA)
+    assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     last_ts_global: Optional[int] = None
     prev_ob_name: Optional[str] = None
     prev_th_name: Optional[str] = None
@@ -1152,7 +1155,7 @@ def _iter_week_merged_events(
         th_name = os.path.basename(th_path)
         day = _daily_path_day(ob_path, "OB")
         day_start_ms = _dt_to_epoch_ms(datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc))
-        day_end_ms = _dt_to_epoch_ms(datetime.combine(day + DAY_CLIP_DELTA, datetime.min.time(), tzinfo=timezone.utc))
+        day_end_ms = _dt_to_epoch_ms(datetime.combine(day + ONE_DAY, datetime.min.time(), tzinfo=timezone.utc))
         dq_day = DayQuality(
             day=day.isoformat(),
             ob_path=ob_path,
