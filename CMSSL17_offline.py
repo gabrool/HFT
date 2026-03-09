@@ -1148,23 +1148,29 @@ def train_from_offline():
 
     with torch.no_grad():
         for x, y in dl_test:
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             y_return = y[:, :NUM_HORIZONS]
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
 
-            ret_pred, vol_pred, dir_pred_logits = model(x)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                ret_pred, vol_pred, dir_pred_logits = model(x)
+                ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
+                vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
+                y_dir = (y_return > 0).to(torch.float32)
+                bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
 
-            ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
-            vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
+            ret_loss_elem = ret_loss_elem.float()
+            vol_loss_elem = vol_loss_elem.float()
+            dir_pred_logits = dir_pred_logits.float()
+            bce_elem = bce_elem.float()
+
             batch_n = x.size(0)
 
             test_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
             test_vol_loss_sum += vol_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
             test_sample_total += batch_n
 
-            y_dir = (y_return > 0).to(torch.float32)
-            bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
             test_bce_sum += bce_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
             test_bce_count += batch_n
 
