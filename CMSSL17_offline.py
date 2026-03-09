@@ -849,6 +849,7 @@ def train_from_offline():
             ep_bce += float(bce_loss.detach().float().cpu())
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.first_step(zero_grad=True)
 
             # ===== SAM pass #2 =====
