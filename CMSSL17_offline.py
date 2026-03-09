@@ -799,60 +799,87 @@ def train_from_offline():
         n_batches = 0
 
         for x, y in pbar:
-            x, y = x.to(device), y.to(device)
-
-            # ===== SAM pass #1 =====
-            opt.base_optimizer.zero_grad()
-            ret_pred, vol_pred, dir_pred_logits = model(x)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
             y_ret = y[:, :NUM_HORIZONS]
             y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
-            mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
-            mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-            noise_filter_mask = build_directional_noise_filter_mask(y_ret)
-            mse_ret_masked = compute_masked_regression_loss(
-                ret_pred, y_ret, delta_ret_tensor, noise_filter_mask, horizon_weights
-            )
-            mse_vol_masked = compute_masked_regression_loss(
-                vol_pred, y_logvol, delta_logvol_tensor, noise_filter_mask, horizon_weights
-            )
-            bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
 
-            ema_ret_masked = ema_update('ret_masked', mse_ret_masked.item(), ema_ft)
-            ema_logvol_masked = ema_update('logvol_masked', mse_vol_masked.item(), ema_ft)
-            ema_bce = ema_update('bce', bce_loss.item(), ema_ft)
-            loss = (LAMBDA_RET * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
+            # ===== SAM pass #1 =====
+            opt.base_optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                ret_pred, vol_pred, dir_pred_logits = model(x)
+                mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
+                mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
+                noise_filter_mask = build_directional_noise_filter_mask(y_ret)
+                mse_ret_masked = compute_masked_regression_loss(
+                    ret_pred, y_ret, delta_ret_tensor, noise_filter_mask, horizon_weights
+                )
+                mse_vol_masked = compute_masked_regression_loss(
+                    vol_pred, y_logvol, delta_logvol_tensor, noise_filter_mask, horizon_weights
+                )
+                bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
+                loss = (
+                    LAMBDA_RET * (mse_ret_masked / (ema_ft['ret_masked'] + 1e-8)) +
+                    LAMBDA_VOL * (mse_vol_masked / (ema_ft['logvol_masked'] + 1e-8)) +
+                    LAMBDA_BCE * (bce_loss / (ema_ft['bce'] + 1e-8))
+                )
+
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite training loss in SAM pass #1: {float(loss.detach().float().cpu())}"
+                )
+
+            ema_ret_masked = ema_update('ret_masked', float(mse_ret_masked.detach().float().cpu()), ema_ft)
+            ema_logvol_masked = ema_update('logvol_masked', float(mse_vol_masked.detach().float().cpu()), ema_ft)
+            ema_bce = ema_update('bce', float(bce_loss.detach().float().cpu()), ema_ft)
+
+            # recompute normalized loss after EMA update, still under autocast-style tensor types
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                loss = (
+                    LAMBDA_RET * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
                     LAMBDA_VOL * (mse_vol_masked / (ema_logvol_masked + 1e-8)) +
-                    LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8)))
-            ep_ret += mse_ret.item(); ep_logvol += mse_vol.item()
-            ep_ret_masked += mse_ret_masked.item(); ep_logvol_masked += mse_vol_masked.item()
-            ep_bce += bce_loss.item()
+                    LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8))
+                )
+
+            ep_ret += float(mse_ret.detach().float().cpu())
+            ep_logvol += float(mse_vol.detach().float().cpu())
+            ep_ret_masked += float(mse_ret_masked.detach().float().cpu())
+            ep_logvol_masked += float(mse_vol_masked.detach().float().cpu())
+            ep_bce += float(bce_loss.detach().float().cpu())
 
             loss.backward()
             opt.first_step(zero_grad=True)
 
             # ===== SAM pass #2 =====
-            ret_pred2, vol_pred2, dir_pred_logits2 = model(x)
-            y_ret = y[:, :NUM_HORIZONS]
-            y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
-            mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
-            mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-            noise_filter_mask2 = build_directional_noise_filter_mask(y_ret)
-            mse_ret2_masked = compute_masked_regression_loss(
-                ret_pred2, y_ret, delta_ret_tensor, noise_filter_mask2, horizon_weights
-            )
-            mse_vol2_masked = compute_masked_regression_loss(
-                vol_pred2, y_logvol, delta_logvol_tensor, noise_filter_mask2, horizon_weights
-            )
-            bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
-            loss2 = (LAMBDA_RET * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
-                     LAMBDA_VOL * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
-                     LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8)))
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                ret_pred2, vol_pred2, dir_pred_logits2 = model(x)
+                mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
+                mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
+                noise_filter_mask2 = build_directional_noise_filter_mask(y_ret)
+                mse_ret2_masked = compute_masked_regression_loss(
+                    ret_pred2, y_ret, delta_ret_tensor, noise_filter_mask2, horizon_weights
+                )
+                mse_vol2_masked = compute_masked_regression_loss(
+                    vol_pred2, y_logvol, delta_logvol_tensor, noise_filter_mask2, horizon_weights
+                )
+                bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
+                loss2 = (
+                    LAMBDA_RET * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
+                    LAMBDA_VOL * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
+                    LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8))
+                )
+
+            if not torch.isfinite(loss2):
+                raise RuntimeError(
+                    f"Non-finite training loss in SAM pass #2: {float(loss2.detach().float().cpu())}"
+                )
+
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.second_step(zero_grad=True)
 
-            total_loss += float(loss.item())
+            total_loss += float(loss.detach().float().cpu())
             n_batches += 1
             pbar.set_postfix(
                 loss=f"{(total_loss/n_batches):.4f}",
