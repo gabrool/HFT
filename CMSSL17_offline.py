@@ -1069,7 +1069,7 @@ def train_from_offline():
                   f"logit_std(mask)={fmt_arr(val_logit_std_masked, '{:.3f}')}")
 
             # checkpointing policy: track best primary metric during fine-tuning
-            if not is_ssl_pretrain:
+            if True:
                 primary_metric_value, primary_metric_label = compute_primary_metric(
                     val_auc_masked,
                     val_ret_loss_masked_per_h,
