@@ -916,23 +916,29 @@ def train_from_offline():
             val_ypos_masked   = [[] for _ in range(NUM_HORIZONS)]
 
             for x, y_targets in dl_val:
-                x = x.to(device)
-                y_targets = y_targets.to(device)
+                x = x.to(device, non_blocking=True)
+                y_targets = y_targets.to(device, non_blocking=True)
                 y_return = y_targets[:, :NUM_HORIZONS]
                 y_logvol = y_targets[:, NUM_HORIZONS:2 * NUM_HORIZONS]
 
-                ret_pred, vol_pred, dir_pred_logits = model(x)
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                    ret_pred, vol_pred, dir_pred_logits = model(x)
+                    ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
+                    vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
+                    y_dir = (y_return > 0).to(torch.float32)
+                    bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
 
-                ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
-                vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
+                ret_loss_elem = ret_loss_elem.float()
+                vol_loss_elem = vol_loss_elem.float()
+                dir_pred_logits = dir_pred_logits.float()
+                bce_elem = bce_elem.float()
+
                 batch_n = x.size(0)
 
                 val_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
                 val_vol_loss_sum += vol_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
                 val_sample_total += batch_n
 
-                y_dir = (y_return > 0).to(torch.float32)
-                bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
                 val_bce_unmasked_sum += bce_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
                 val_bce_unmasked_count += batch_n
 
