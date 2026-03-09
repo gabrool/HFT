@@ -1070,7 +1070,7 @@ def train_from_offline():
                   f"logit_std(mask)={fmt_arr(val_logit_std_masked, '{:.3f}')}")
 
             # checkpointing policy: track best primary metric during fine-tuning
-              primary_metric_value, primary_metric_label = compute_primary_metric(
+            primary_metric_value, primary_metric_label = compute_primary_metric(
                   val_auc_masked,
                   val_ret_loss_masked_per_h,
                   val_vol_loss_masked_per_h,
