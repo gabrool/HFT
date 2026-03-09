@@ -1074,7 +1074,7 @@ def train_from_offline():
                   val_auc_masked,
                   val_ret_loss_masked_per_h,
                   val_vol_loss_masked_per_h,
-              )
+            )
               if math.isfinite(primary_metric_value):
                   idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
                   masked_auc = float(val_auc_masked[idx]) if idx < len(val_auc_masked) else float("nan")
