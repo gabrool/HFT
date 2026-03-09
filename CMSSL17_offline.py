@@ -636,9 +636,9 @@ def train_from_offline():
         ds_val   = HFTDataset(X_va, y_va)
         ds_test  = HFTDataset(X_te, y_te)
         print(
-        f"[offline-data] train N={len(ds_train)}, "
-        f"val N={len(ds_val)}, test N={len(ds_test)}"
-    )
+            f"[offline-data] train N={len(ds_train)}, "
+            f"val N={len(ds_val)}, test N={len(ds_test)}"
+        )
         # we still need y_tr to build directional mask quantiles
         y_train_for_quant = y_tr
 
