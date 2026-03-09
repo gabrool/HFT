@@ -741,7 +741,7 @@ def train_from_offline():
         drop_last=True,
         num_workers=WORKERS_TRAIN,
         pin_memory=True,
-        prefetch_factor=6 if WORKERS_TRAIN > 0 else None,
+        prefetch_factor=8 if WORKERS_TRAIN > 0 else None,
         persistent_workers=(WORKERS_TRAIN > 0),
     )
     dl_val = DataLoader(
