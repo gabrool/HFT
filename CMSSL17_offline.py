@@ -1114,7 +1114,7 @@ def train_from_offline():
                       if no_imp >= early_stop_patience:
                           print("Early stopping triggered.")
                           early_stop_triggered = True
-              else:
+            else:
                   print(f"[val] primary_metric({primary_metric_label})=nan (skipping scheduler/early stop)")
 
         if early_stop_triggered:
