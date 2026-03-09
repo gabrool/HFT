@@ -81,7 +81,7 @@ from CMSSL17 import (  # type: ignore
 # ---------------- Config via env ----------------
 OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
 USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "1")) == 1
-WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "4"))
+WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "0")) == 1
 EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
