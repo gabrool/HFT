@@ -541,6 +541,9 @@ def compute_directional_loss_fn(build_directional_noise_filter_mask_fn, horizon_
 # ---------------- Train/Eval ----------------
 def train_from_offline():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    amp_enabled = AMP_ENABLED and device.type == "cuda"
+    amp_dtype = torch.bfloat16
+    print(f"[amp] enabled={amp_enabled} dtype=bf16")
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
     splits = require_complete_splits(meta)
