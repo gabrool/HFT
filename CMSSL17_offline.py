@@ -734,10 +734,32 @@ def train_from_offline():
         return '[' + ', '.join(formatted) + ']'
 
     # ---------------- DataLoaders ----------------
-    dl_train = DataLoader(ds_train, BATCH_SIZE, shuffle=True, drop_last=True,
-                          num_workers=WORKERS_TRAIN, pin_memory=True, prefetch_factor=8 if WORKERS_TRAIN>0 else None)
-    dl_val   = DataLoader(ds_val,   BATCH_SIZE, shuffle=False, num_workers=max(1, WORKERS_VAL), pin_memory=True)
-    dl_test  = DataLoader(ds_test,  BATCH_SIZE, shuffle=False, num_workers=max(1, WORKERS_VAL), pin_memory=True)
+    dl_train = DataLoader(
+        ds_train,
+        BATCH_SIZE,
+        shuffle=True,
+        drop_last=True,
+        num_workers=WORKERS_TRAIN,
+        pin_memory=True,
+        prefetch_factor=6 if WORKERS_TRAIN > 0 else None,
+        persistent_workers=(WORKERS_TRAIN > 0),
+    )
+    dl_val = DataLoader(
+        ds_val,
+        BATCH_SIZE,
+        shuffle=False,
+        num_workers=max(1, WORKERS_VAL),
+        pin_memory=True,
+        persistent_workers=(max(1, WORKERS_VAL) > 0),
+    )
+    dl_test = DataLoader(
+        ds_test,
+        BATCH_SIZE,
+        shuffle=False,
+        num_workers=max(1, WORKERS_VAL),
+        pin_memory=True,
+        persistent_workers=(max(1, WORKERS_VAL) > 0),
+    )
 
     # ---------------- Model ----------------
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
