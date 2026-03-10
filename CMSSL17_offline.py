@@ -85,6 +85,8 @@ WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "0")) == 1
 LOG_EVERY     = int(os.environ.get("BYBIT_LOG_EVERY", "50"))
+CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
+MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
 EXPECTED_GRID_GUARD_MS = int(TIME_GRID_GUARD_MS)
 EXPECTED_DECISION_POLICY = "ob_only_grid_quantized"
@@ -586,6 +588,15 @@ def compute_directional_loss_fn(build_directional_noise_filter_mask_fn, horizon_
 
 # ---------------- Train/Eval ----------------
 def train_from_offline():
+    if CUDNN_BENCHMARK:
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        try:
+            torch.set_float32_matmul_precision(MATMUL_PRECISION)
+        except Exception as exc:
+            print(f"[warn] failed to set float32 matmul precision to '{MATMUL_PRECISION}': {exc}")
+    print(f"[startup] cudnn_benchmark={CUDNN_BENCHMARK} matmul_precision={MATMUL_PRECISION}")
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     amp_enabled = AMP_ENABLED and device.type == "cuda"
     amp_dtype = torch.bfloat16
