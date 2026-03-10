@@ -471,7 +471,7 @@ DFF_CONV        = 2 * DMODEL
 # Prediction horizons (in milliseconds)
 HORIZONS_MS     = [250, 500, 1000]
 NUM_HORIZONS    = len(HORIZONS_MS)
-HORIZON_WEIGHTS = [0.05, 0.1, 1.0]
+HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
 DIR_MASK_TAIL_FRACTION = 0.02
 EPOCHS          = 200
