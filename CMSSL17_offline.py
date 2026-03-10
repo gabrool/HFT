@@ -84,6 +84,8 @@ USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "1")) == 1
 WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "0")) == 1
+COMPILE_ENABLED = int(os.environ.get("BYBIT_TORCH_COMPILE", "0")) == 1
+COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "default").strip()
 LOG_EVERY     = int(os.environ.get("BYBIT_LOG_EVERY", "50"))
 CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
@@ -586,6 +588,12 @@ def compute_directional_loss_fn(build_directional_noise_filter_mask_fn, horizon_
         return (loss_stack * weight_stack).sum() / weight_stack.sum()
     return compute_directional_loss
 
+
+def get_model_state_dict_for_ckpt(model: torch.nn.Module) -> dict:
+    if hasattr(model, "_orig_mod"):
+        return model._orig_mod.state_dict()
+    return model.state_dict()
+
 # ---------------- Train/Eval ----------------
 def train_from_offline():
     if CUDNN_BENCHMARK:
@@ -864,6 +872,15 @@ def train_from_offline():
     # ---------------- Model ----------------
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
     model = SAMBA(args).to(device)
+    if COMPILE_ENABLED:
+        if hasattr(torch, "compile"):
+            try:
+                model = torch.compile(model, mode=COMPILE_MODE)
+                print(f"[compile] enabled mode={COMPILE_MODE}")
+            except Exception as exc:
+                print(f"[warn] torch.compile failed ({exc}); continuing in eager mode")
+        else:
+            print("[warn] BYBIT_TORCH_COMPILE=1 but torch.compile is unavailable; continuing in eager mode")
     primary_metric_mode = get_primary_metric_mode()
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     torch.cuda.empty_cache()
@@ -1321,7 +1338,7 @@ def train_from_offline():
                 )
                 ckpt = {
                     "epoch": epoch,
-                    "state_dict": model.state_dict(),
+                    "state_dict": get_model_state_dict_for_ckpt(model),
                     "args": {
                         "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
                         "feat_dim": F_total, "LOOKBACK": LOOKBACK,
