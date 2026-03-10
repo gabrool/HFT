@@ -84,6 +84,7 @@ USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "1")) == 1
 WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "0")) == 1
+LOG_EVERY     = int(os.environ.get("BYBIT_LOG_EVERY", "50"))
 EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
 EXPECTED_GRID_GUARD_MS = int(TIME_GRID_GUARD_MS)
 EXPECTED_DECISION_POLICY = "ob_only_grid_quantized"
@@ -782,12 +783,17 @@ def train_from_offline():
     for epoch in range(EPOCHS):
         early_stop_triggered = False
         model.train()
-        total_loss = 0.0
         pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
-        ep_ret = ep_logvol = ep_ret_masked = ep_logvol_masked = ep_bce = 0.0
+        num_train_batches = len(dl_train)
+        running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+        running_ret_t = torch.zeros((), device=device, dtype=torch.float32)
+        running_vol_t = torch.zeros((), device=device, dtype=torch.float32)
+        running_ret_masked_t = torch.zeros((), device=device, dtype=torch.float32)
+        running_vol_masked_t = torch.zeros((), device=device, dtype=torch.float32)
+        running_bce_t = torch.zeros((), device=device, dtype=torch.float32)
         n_batches = 0
 
-        for x, y in pbar:
+        for batch_idx, (x, y) in enumerate(pbar):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
@@ -831,11 +837,11 @@ def train_from_offline():
                     LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8))
                 )
 
-            ep_ret += float(mse_ret.detach().float().cpu())
-            ep_logvol += float(mse_vol.detach().float().cpu())
-            ep_ret_masked += float(mse_ret_masked.detach().float().cpu())
-            ep_logvol_masked += float(mse_vol_masked.detach().float().cpu())
-            ep_bce += float(bce_loss.detach().float().cpu())
+            running_ret_t += mse_ret.detach().float()
+            running_vol_t += mse_vol.detach().float()
+            running_ret_masked_t += mse_ret_masked.detach().float()
+            running_vol_masked_t += mse_vol_masked.detach().float()
+            running_bce_t += bce_loss.detach().float()
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
@@ -869,16 +875,37 @@ def train_from_offline():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.second_step(zero_grad=True)
 
-            total_loss += float(loss.detach().float().cpu())
+            running_loss_t += loss.detach().float()
             n_batches += 1
-            pbar.set_postfix(
-                loss=f"{(total_loss/n_batches):.4f}",
-                ret=f"{ep_ret/max(1,n_batches):.4f}",
-                vol=f"{ep_logvol/max(1,n_batches):.4f}",
-                ret_m=f"{ep_ret_masked/max(1,n_batches):.4f}",
-                vol_m=f"{ep_logvol_masked/max(1,n_batches):.4f}",
-                bce=f"{ep_bce/max(1,n_batches):.4f}",
-            )
+            should_log_batch = ((batch_idx + 1) % LOG_EVERY == 0) or ((batch_idx + 1) == num_train_batches)
+            if should_log_batch:
+                denom = float(max(1, n_batches))
+                running_loss = float(running_loss_t.detach().cpu())
+                running_ret = float(running_ret_t.detach().cpu())
+                running_vol = float(running_vol_t.detach().cpu())
+                running_ret_masked = float(running_ret_masked_t.detach().cpu())
+                running_vol_masked = float(running_vol_masked_t.detach().cpu())
+                running_bce = float(running_bce_t.detach().cpu())
+
+                pbar.set_postfix(
+                    loss=f"{(running_loss / denom):.4f}",
+                    ret=f"{(running_ret / denom):.4f}",
+                    vol=f"{(running_vol / denom):.4f}",
+                    ret_m=f"{(running_ret_masked / denom):.4f}",
+                    vol_m=f"{(running_vol_masked / denom):.4f}",
+                    bce=f"{(running_bce / denom):.4f}",
+                )
+
+        epoch_train_loss = float(running_loss_t.detach().cpu()) / float(max(1, n_batches))
+        epoch_train_ret = float(running_ret_t.detach().cpu()) / float(max(1, n_batches))
+        epoch_train_vol = float(running_vol_t.detach().cpu()) / float(max(1, n_batches))
+        epoch_train_ret_masked = float(running_ret_masked_t.detach().cpu()) / float(max(1, n_batches))
+        epoch_train_vol_masked = float(running_vol_masked_t.detach().cpu()) / float(max(1, n_batches))
+        epoch_train_bce = float(running_bce_t.detach().cpu()) / float(max(1, n_batches))
+        print(
+            f"[train] loss={epoch_train_loss:.4f} ret={epoch_train_ret:.4f} vol={epoch_train_vol:.4f} "
+            f"ret(mask)={epoch_train_ret_masked:.4f} vol(mask)={epoch_train_vol_masked:.4f} bce={epoch_train_bce:.4f}"
+        )
 
         # ---------------- Validation ----------------
         model.eval()
