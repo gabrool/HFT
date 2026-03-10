@@ -32,8 +32,8 @@ This script attempts to *import* model and utils from CMSSL17.py to avoid duplic
 Time-grid contract is centralized in CMSSL17.py.
 """
 
-import os, sys, math
-from typing import List, Dict, Tuple, Iterable
+import os, sys, math, json
+from typing import List, Dict, Tuple, Iterable, Optional, Any
 from pathlib import Path
 import numpy as np
 import torch
@@ -496,6 +496,51 @@ def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndar
         neg_hi_arr,
     )
 
+
+def load_quantile_cache(path: Path) -> Optional[Tuple[Dict[str, np.ndarray], Dict[str, Any]]]:
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as cached:
+            bounds = {
+                "pos_lo": np.asarray(cached["pos_lo"], dtype=np.float32),
+                "pos_hi": np.asarray(cached["pos_hi"], dtype=np.float32),
+                "neg_lo": np.asarray(cached["neg_lo"], dtype=np.float32),
+                "neg_hi": np.asarray(cached["neg_hi"], dtype=np.float32),
+            }
+            meta_json = str(cached["metadata_json"].item())
+        metadata = json.loads(meta_json)
+    except Exception as exc:
+        print(f"[dir-mask-cache] invalid cache at {path}: {exc}")
+        return None
+    return bounds, metadata
+
+
+def save_quantile_cache(path: Path, bounds: Dict[str, np.ndarray], metadata: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        pos_lo=np.asarray(bounds["pos_lo"], dtype=np.float32),
+        pos_hi=np.asarray(bounds["pos_hi"], dtype=np.float32),
+        neg_lo=np.asarray(bounds["neg_lo"], dtype=np.float32),
+        neg_hi=np.asarray(bounds["neg_hi"], dtype=np.float32),
+        metadata_json=np.array(json.dumps(metadata, sort_keys=True), dtype=np.str_),
+    )
+
+
+def quantile_cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
+    required_keys = (
+        "tail_fraction",
+        "horizons_ms",
+        "train_week_keys",
+        "train_ts_start",
+        "train_ts_end",
+        "decision_policy",
+        "expected_grid_step_ms",
+        "expected_grid_guard_ms",
+    )
+    return all(cached_meta.get(k) == current_meta.get(k) for k in required_keys)
+
 def make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi):
     # Build a label-space noise filter mask (mid-quantile magnitude keeper), not an SSL token mask.
     pos_lo_t = torch.from_numpy(pos_lo)
@@ -593,7 +638,8 @@ def train_from_offline():
             raise KeyError(f"Split '{split_name}' references unknown week key(s): {missing}")
         return [key_to_meta[k] for k in keys]
 
-    tr_weeks = keys_to_paths(split_defs["train"], "train")
+    train_week_keys = split_defs["train"]
+    tr_weeks = keys_to_paths(train_week_keys, "train")
     va_weeks = keys_to_paths(split_defs["val"], "val")
     te_weeks = keys_to_paths(split_defs["test"], "test")
 
@@ -622,6 +668,29 @@ def train_from_offline():
     va_start, va_end = split_ranges["val"]
     te_start, te_end = split_ranges["test"]
 
+    quantile_cache_path = out_root / "dir_mask_quantiles_cache.npz"
+    current_meta = {
+        "tail_fraction": float(DIR_MASK_TAIL_FRACTION),
+        "horizons_ms": [int(h) for h in HORIZONS_MS],
+        "train_week_keys": list(train_week_keys),
+        "train_ts_start": int(tr_start),
+        "train_ts_end": int(tr_end),
+        "decision_policy": EXPECTED_DECISION_POLICY,
+        "expected_grid_step_ms": int(EXPECTED_GRID_STEP_MS),
+        "expected_grid_guard_ms": int(EXPECTED_GRID_GUARD_MS),
+    }
+    cached_quantiles = load_quantile_cache(quantile_cache_path)
+    cached_bounds = None
+    if cached_quantiles is None:
+        print(f"[dir-mask-cache] miss path={quantile_cache_path} (prepass required)")
+    else:
+        cached_bounds, cached_meta = cached_quantiles
+        if quantile_cache_matches(cached_meta, current_meta):
+            print(f"[dir-mask-cache] hit path={quantile_cache_path} (prepass skipped)")
+        else:
+            cached_bounds = None
+            print(f"[dir-mask-cache] metadata mismatch path={quantile_cache_path} (prepass required)")
+
     if USE_IN_MEMORY:
         X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
         X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
@@ -640,8 +709,8 @@ def train_from_offline():
             f"[offline-data] train N={len(ds_train)}, "
             f"val N={len(ds_val)}, test N={len(ds_test)}"
         )
-        # we still need y_tr to build directional mask quantiles
-        y_train_for_quant = y_tr
+        # we still need y_tr to build directional mask quantiles unless cache hit
+        y_train_for_quant = None if cached_bounds is not None else y_tr
 
     else:
         def refs_for_weeks_timerange(weeks: List[Path], start: int, end: int) -> List[ChunkRef]:
@@ -667,8 +736,10 @@ def train_from_offline():
             f"val N={len(ds_val)}, test N={len(ds_test)}"
         )
 
-        # Build y_train_for_quant without loading features into RAM
-        if len(ds_train) == 0:
+        # Build y_train_for_quant without loading features into RAM unless cache hit.
+        if cached_bounds is not None:
+            y_train_for_quant = None
+        elif len(ds_train) == 0:
             y_train_for_quant = np.empty((0, 2 * NUM_HORIZONS), dtype=np.float32)
         else:
             dl_prepass = DataLoader(
@@ -691,7 +762,24 @@ def train_from_offline():
 
 
     # ---------------- directional-noise filter quantiles & loss closure ----------------
-    pos_lo, pos_hi, neg_lo, neg_hi = compute_dir_mask_quantiles_from_ytrain(y_train_for_quant)
+    if cached_bounds is not None:
+        pos_lo = cached_bounds["pos_lo"]
+        pos_hi = cached_bounds["pos_hi"]
+        neg_lo = cached_bounds["neg_lo"]
+        neg_hi = cached_bounds["neg_hi"]
+    else:
+        pos_lo, pos_hi, neg_lo, neg_hi = compute_dir_mask_quantiles_from_ytrain(y_train_for_quant)
+        save_quantile_cache(
+            quantile_cache_path,
+            {
+                "pos_lo": pos_lo,
+                "pos_hi": pos_hi,
+                "neg_lo": neg_lo,
+                "neg_hi": neg_hi,
+            },
+            current_meta,
+        )
+        print(f"[dir-mask-cache] saved path={quantile_cache_path}")
     build_directional_noise_filter_mask = make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi)
     horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
     horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
