@@ -84,9 +84,9 @@ USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "0")) == 1
 WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "1")) == 1
-COMPILE_ENABLED = int(os.environ.get("BYBIT_TORCH_COMPILE", "0")) == 1
+COMPILE_ENABLED = int(os.environ.get("BYBIT_TORCH_COMPILE", "1")) == 1
 COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "default").strip()
-LOG_EVERY     = max(1, int(os.environ.get("BYBIT_LOG_EVERY", "50")))
+LOG_EVERY     = max(1, int(os.environ.get("BYBIT_LOG_EVERY", "100")))
 CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
