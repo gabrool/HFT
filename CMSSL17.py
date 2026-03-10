@@ -475,10 +475,10 @@ HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
 DIR_MASK_TAIL_FRACTION = 0.02
 EPOCHS          = 200
-LR              = 5e-4
+LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
-# Primary metric config (used for LR scheduler + early stopping)
+# Primary metric config (used for checkpointing + early stopping)
 PRIMARY_METRIC = "masked_ret_vol_loss_auc_ratio_1000ms"  # options: "masked_ret_vol_loss_auc_ratio_1000ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
 PRIMARY_METRIC_AUC_WEIGHT = 1.0
@@ -523,8 +523,6 @@ def quantize_ts_ms(
 
 
 NUM_HEADS       = 8
-WARMUP_EPOCHS   = max(1, int(EPOCHS * 0.05))  # Warmup over first 5% of epochs
-
 # Loss mixing (fixed lambdas), with EMA normalization per loss
 EMA_DECAY       = 0.99
 LAMBDA_BCE      = 1.00

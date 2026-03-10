@@ -62,7 +62,7 @@ from CMSSL17 import (  # type: ignore
     SAMBA, ModelArgs,
     # core hypers
     LOOKBACK, AUX_DIM, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
-    BATCH_SIZE, EPOCHS, WARMUP_EPOCHS, LR, PATIENCE,
+    BATCH_SIZE, EPOCHS, LR, PATIENCE,
     # schedules / deltas / lambdas
     DIR_MASK_TAIL_FRACTION,
     DELTA_RET, DELTA_LOGVOL,
@@ -766,12 +766,6 @@ def train_from_offline():
     model = SAMBA(args).to(device)
     primary_metric_mode = get_primary_metric_mode()
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt.base_optimizer,
-        mode=primary_metric_mode,
-        factor=0.5,
-        patience=7,
-    )
     torch.cuda.empty_cache()
 
     # ---------------- Epoch loop ----------------
@@ -787,11 +781,6 @@ def train_from_offline():
 
     for epoch in range(EPOCHS):
         early_stop_triggered = False
-        # Warmup LR
-        warmup_factor = min(1.0, (epoch + 1) / WARMUP_EPOCHS) if epoch < WARMUP_EPOCHS else 1.0
-        for pg in opt.base_optimizer.param_groups:
-            pg['lr'] = LR * warmup_factor
-
         model.train()
         total_loss = 0.0
         pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
@@ -1071,51 +1060,49 @@ def train_from_offline():
 
             # checkpointing policy: track best primary metric during fine-tuning
             primary_metric_value, primary_metric_label = compute_primary_metric(
-                  val_auc_masked,
-                  val_ret_loss_masked_per_h,
-                  val_vol_loss_masked_per_h,
+                val_auc_masked,
+                val_ret_loss_masked_per_h,
+                val_vol_loss_masked_per_h,
             )
             if math.isfinite(primary_metric_value):
-                  idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-                  masked_auc = float(val_auc_masked[idx]) if idx < len(val_auc_masked) else float("nan")
-                  masked_ret_loss = (
-                      float(val_ret_loss_masked_per_h[idx]) if idx < len(val_ret_loss_masked_per_h) else float("nan")
-                  )
-                  masked_vol_loss = (
-                      float(val_vol_loss_masked_per_h[idx]) if idx < len(val_vol_loss_masked_per_h) else float("nan")
-                  )
-                  print(
-                      f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
-                      f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={masked_ret_loss:.6f}, "
-                      f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={masked_vol_loss:.6f}, "
-                      f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={masked_auc:.6f}]"
-                  )
-                  scheduler.step(primary_metric_value)
-
-                  if is_metric_improved(primary_metric_value, best, primary_metric_mode):
-                      best = float(primary_metric_value)
-                      no_imp = 0
-                      ckpt = {
-                          "epoch": epoch,
-                          "state_dict": model.state_dict(),
-                          "args": {
-                              "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
-                              "feat_dim": F_total, "LOOKBACK": LOOKBACK,
-                              "HORIZONS_MS": HORIZONS_MS,
-                          },
-                          "best_primary_metric": best,
-                      }
-                      out_ckpt = out_root / "cmssl17_offline_best.pt"
-                      torch.save(ckpt, out_ckpt)
-                      print(f"[ckpt] saved best to {out_ckpt}")
-                  else:
-                      no_imp += 1
-                      print(f"no improve {no_imp}/{early_stop_patience}")
-                      if no_imp >= early_stop_patience:
-                          print("Early stopping triggered.")
-                          early_stop_triggered = True
+                idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+                masked_auc = float(val_auc_masked[idx]) if idx < len(val_auc_masked) else float("nan")
+                masked_ret_loss = (
+                    float(val_ret_loss_masked_per_h[idx]) if idx < len(val_ret_loss_masked_per_h) else float("nan")
+                )
+                masked_vol_loss = (
+                    float(val_vol_loss_masked_per_h[idx]) if idx < len(val_vol_loss_masked_per_h) else float("nan")
+                )
+                print(
+                    f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
+                    f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={masked_ret_loss:.6f}, "
+                    f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={masked_vol_loss:.6f}, "
+                    f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={masked_auc:.6f}]"
+                )
+                if is_metric_improved(primary_metric_value, best, primary_metric_mode):
+                    best = float(primary_metric_value)
+                    no_imp = 0
+                    ckpt = {
+                        "epoch": epoch,
+                        "state_dict": model.state_dict(),
+                        "args": {
+                            "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
+                            "feat_dim": F_total, "LOOKBACK": LOOKBACK,
+                            "HORIZONS_MS": HORIZONS_MS,
+                        },
+                        "best_primary_metric": best,
+                    }
+                    out_ckpt = out_root / "cmssl17_offline_best.pt"
+                    torch.save(ckpt, out_ckpt)
+                    print(f"[ckpt] saved best to {out_ckpt}")
+                else:
+                    no_imp += 1
+                    print(f"no improve {no_imp}/{early_stop_patience}")
+                    if no_imp >= early_stop_patience:
+                        print("Early stopping triggered.")
+                        early_stop_triggered = True
             else:
-                  print(f"[val] primary_metric({primary_metric_label})=nan (skipping scheduler/early stop)")
+                print(f"[val] primary_metric({primary_metric_label})=nan (skipping early stop)")
 
         if early_stop_triggered:
             break
