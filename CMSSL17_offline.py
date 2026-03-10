@@ -882,6 +882,8 @@ def train_from_offline():
                 print(f"[warn] torch.compile failed ({exc}); continuing in eager mode")
         else:
             print("[warn] BYBIT_TORCH_COMPILE=1 but torch.compile is unavailable; continuing in eager mode")
+    else:
+        print("[compile] enabled=False")
     primary_metric_mode = get_primary_metric_mode()
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     torch.cuda.empty_cache()
