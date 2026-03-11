@@ -1175,8 +1175,8 @@ def train_from_offline():
         pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
         num_train_batches = len(dl_train)
         val_points = sorted({
-            max(1, min(num_train_batches, int(round(x))))
-            for x in np.linspace(1, num_train_batches, VAL_EVENTS_PER_EPOCH)
+            max(1, min(num_train_batches, int(round(num_train_batches * k / VAL_EVENTS_PER_EPOCH))))
+            for k in range(1, VAL_EVENTS_PER_EPOCH + 1)
         })
         val_points_set = set(val_points)
         val_points_total = len(val_points)
