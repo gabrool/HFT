@@ -1284,8 +1284,9 @@ def train_from_offline():
 
                 if math.isfinite(primary_metric_value):
                     print(
-                        f"[val-fast] epoch={epoch+1} event={val_event_in_epoch} batch={batch_idx+1}/{num_train_batches} "
-                        f"step={global_step} primary_metric({primary_metric_label})={primary_metric_value:.6f} "
+                        f"[val-fast] epoch={epoch+1}/{EPOCHS} batch={batch_idx+1}/{num_train_batches} "
+                        f"global_step={global_step} event={val_event_in_epoch}/{VAL_EVENTS_PER_EPOCH} "
+                        f"primary_metric({primary_metric_label})={primary_metric_value:.6f} "
                         f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_ret_loss']):.6f}, "
                         f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_vol_loss']):.6f}, "
                         f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_auc']):.6f}, "
@@ -1325,6 +1326,10 @@ def train_from_offline():
                         )
                         ckpt = {
                             "epoch": epoch,
+                            "batch_idx": batch_idx,
+                            "global_step": global_step,
+                            "num_train_batches": num_train_batches,
+                            "val_event_in_epoch": val_event_in_epoch,
                             "state_dict": get_model_state_dict_for_ckpt(model),
                             "args": {
                                 "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
@@ -1335,7 +1340,10 @@ def train_from_offline():
                         }
                         out_ckpt = out_root / "cmssl17_offline_best.pt"
                         torch.save(ckpt, out_ckpt)
-                        print(f"[ckpt] saved best to {out_ckpt}")
+                        print(
+                            f"[ckpt] saved best epoch={epoch+1}/{EPOCHS} batch={batch_idx+1}/{num_train_batches} "
+                            f"global_step={global_step} to {out_ckpt}"
+                        )
                     else:
                         no_imp += 1
                         print(f"no improve {no_imp}/{early_stop_patience}")
@@ -1345,8 +1353,14 @@ def train_from_offline():
                             break
                 else:
                     print(
-                        f"[val-fast] epoch={epoch+1} event={val_event_in_epoch} batch={batch_idx+1}/{num_train_batches} "
-                        f"step={global_step} primary_metric({primary_metric_label})=nan (skipping early stop)"
+                        f"[val-fast] epoch={epoch+1}/{EPOCHS} batch={batch_idx+1}/{num_train_batches} "
+                        f"global_step={global_step} event={val_event_in_epoch}/{VAL_EVENTS_PER_EPOCH} "
+                        f"primary_metric({primary_metric_label})=nan "
+                        f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_ret_loss']):.6f}, "
+                        f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_vol_loss']):.6f}, "
+                        f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_auc']):.6f}, "
+                        f"masked_acc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_acc']):.3%}] "
+                        f"(skipping early stop)"
                     )
 
             should_log_batch = ((batch_idx + 1) % LOG_EVERY == 0) or ((batch_idx + 1) == num_train_batches)
