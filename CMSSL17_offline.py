@@ -87,6 +87,7 @@ AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "1")) == 1
 COMPILE_ENABLED = int(os.environ.get("BYBIT_TORCH_COMPILE", "1")) == 1
 COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "default").strip()
 LOG_EVERY     = max(1, int(os.environ.get("BYBIT_LOG_EVERY", "100")))
+VAL_EVENTS_PER_EPOCH = max(1, int(os.environ.get("BYBIT_VAL_EVENTS_PER_EPOCH", "10")))
 CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
@@ -604,7 +605,7 @@ def train_from_offline():
         except Exception as exc:
             print(f"[warn] failed to set float32 matmul precision to '{MATMUL_PRECISION}': {exc}")
     print(f"[startup] cudnn_benchmark={CUDNN_BENCHMARK} matmul_precision={MATMUL_PRECISION}")
-    print(f"[startup] log_every={LOG_EVERY}")
+    print(f"[startup] log_every={LOG_EVERY} val_events_per_epoch={VAL_EVENTS_PER_EPOCH}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     amp_enabled = AMP_ENABLED and device.type == "cuda"
@@ -899,6 +900,7 @@ def train_from_offline():
         'bce': 1.0,
     }
     primary_horizon_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+    global_step = 0
 
     def run_validation(*, primary_horizon_idx: int, full_metrics: bool) -> dict:
         model.eval()
@@ -1172,6 +1174,9 @@ def train_from_offline():
         model.train()
         pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
         num_train_batches = len(dl_train)
+        val_interval = max(1, num_train_batches // VAL_EVENTS_PER_EPOCH)
+        val_event_in_epoch = 0
+        last_val_batch = -1
         running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
         running_ret_t = torch.zeros((), device=device, dtype=torch.float32)
         running_vol_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -1261,9 +1266,88 @@ def train_from_offline():
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.second_step(zero_grad=True)
+            global_step += 1
 
             running_loss_t += loss.detach().float()
             n_batches += 1
+
+            should_validate = (
+                ((batch_idx + 1) % val_interval == 0) or ((batch_idx + 1) == num_train_batches)
+            )
+            if should_validate and batch_idx != last_val_batch:
+                last_val_batch = batch_idx
+                val_event_in_epoch += 1
+
+                fast_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=False)
+                primary_metric_value = float(fast_val["primary_metric_value"])
+                primary_metric_label = str(fast_val["primary_metric_label"])
+
+                if math.isfinite(primary_metric_value):
+                    print(
+                        f"[val-fast] epoch={epoch+1} event={val_event_in_epoch} batch={batch_idx+1}/{num_train_batches} "
+                        f"step={global_step} primary_metric({primary_metric_label})={primary_metric_value:.6f} "
+                        f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_ret_loss']):.6f}, "
+                        f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_vol_loss']):.6f}, "
+                        f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_auc']):.6f}, "
+                        f"masked_acc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_acc']):.3%}]"
+                    )
+                    if is_metric_improved(primary_metric_value, best, primary_metric_mode):
+                        best = float(primary_metric_value)
+                        no_imp = 0
+                        full_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=True)
+                        print(
+                            f"[val] ret={format_metric(full_val['avg_val_ret_loss_per_h'], '{:.5f}')} "
+                            f"(w_avg={float(full_val['avg_val_ret_loss']):.4e})  "
+                            f"vol={format_metric(full_val['avg_val_vol_loss_per_h'], '{:.5f}')} "
+                            f"(w_avg={float(full_val['avg_val_vol_loss']):.4e})  "
+                            f"ret(mask)={format_metric(full_val['val_ret_loss_masked_per_h'], '{:.5f}')} "
+                            f"(w_avg={float(full_val['avg_val_ret_loss_masked']):.4e})  "
+                            f"vol(mask)={format_metric(full_val['val_vol_loss_masked_per_h'], '{:.5f}')} "
+                            f"(w_avg={float(full_val['avg_val_vol_loss_masked']):.4e})  "
+                            f"BCE(all)={format_metric(full_val['val_bce_unmasked'], '{:.5f}')}  "
+                            f"BCE(mask)={format_metric(full_val['val_bce_masked'], '{:.5f}')}  "
+                            f"Acc(all)={format_metric(full_val['val_acc'], '{:.3%}')}  "
+                            f"Acc(mask)={format_metric(full_val['val_acc_masked'], '{:.3%}')}  "
+                            f"AUC(all)={format_metric(full_val['val_auc'], '{:.3f}')}  "
+                            f"AUC(mask)={format_metric(full_val['val_auc_masked'], '{:.3f}')}")
+                        print(
+                            f"[val_diag] pos_rate(all)={format_metric(full_val['val_pos_rate_all'], '{:.3%}')}  "
+                            f"logit_mean(all)={format_metric(full_val['val_logit_mean_all'], '{:.3f}')}  "
+                            f"logit_std(all)={format_metric(full_val['val_logit_std_all'], '{:.3f}')}  "
+                            f"pos_rate(mask)={format_metric(full_val['val_pos_rate_masked'], '{:.3%}')}  "
+                            f"logit_mean(mask)={format_metric(full_val['val_logit_mean_masked'], '{:.3f}')}  "
+                            f"logit_std(mask)={format_metric(full_val['val_logit_std_masked'], '{:.3f}')}")
+                        print(
+                            f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
+                            f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_ret_loss']):.6f}, "
+                            f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_vol_loss']):.6f}, "
+                            f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_auc']):.6f}]"
+                        )
+                        ckpt = {
+                            "epoch": epoch,
+                            "state_dict": get_model_state_dict_for_ckpt(model),
+                            "args": {
+                                "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
+                                "feat_dim": F_total, "LOOKBACK": LOOKBACK,
+                                "HORIZONS_MS": HORIZONS_MS,
+                            },
+                            "best_primary_metric": best,
+                        }
+                        out_ckpt = out_root / "cmssl17_offline_best.pt"
+                        torch.save(ckpt, out_ckpt)
+                        print(f"[ckpt] saved best to {out_ckpt}")
+                    else:
+                        no_imp += 1
+                        print(f"no improve {no_imp}/{early_stop_patience}")
+                        if no_imp >= early_stop_patience:
+                            print("Early stopping triggered.")
+                            early_stop_triggered = True
+                else:
+                    print(
+                        f"[val-fast] epoch={epoch+1} event={val_event_in_epoch} batch={batch_idx+1}/{num_train_batches} "
+                        f"step={global_step} primary_metric({primary_metric_label})=nan (skipping early stop)"
+                    )
+
             should_log_batch = ((batch_idx + 1) % LOG_EVERY == 0) or ((batch_idx + 1) == num_train_batches)
             if should_log_batch:
                 denom = float(max(1, n_batches))
@@ -1283,6 +1367,9 @@ def train_from_offline():
                     bce=f"{(running_bce / denom):.4f}",
                 )
 
+            if early_stop_triggered:
+                break
+
         epoch_train_loss = float(running_loss_t.detach().cpu()) / float(max(1, n_batches))
         epoch_train_ret = float(running_ret_t.detach().cpu()) / float(max(1, n_batches))
         epoch_train_vol = float(running_vol_t.detach().cpu()) / float(max(1, n_batches))
@@ -1293,73 +1380,6 @@ def train_from_offline():
             f"[train] loss={epoch_train_loss:.4f} ret={epoch_train_ret:.4f} vol={epoch_train_vol:.4f} "
             f"ret(mask)={epoch_train_ret_masked:.4f} vol(mask)={epoch_train_vol_masked:.4f} bce={epoch_train_bce:.4f}"
         )
-
-        # ---------------- Validation ----------------
-        fast_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=False)
-        primary_metric_value = float(fast_val["primary_metric_value"])
-        primary_metric_label = str(fast_val["primary_metric_label"])
-
-        if math.isfinite(primary_metric_value):
-            print(
-                f"[val-fast] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
-                f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_ret_loss']):.6f}, "
-                f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_vol_loss']):.6f}, "
-                f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_auc']):.6f}, "
-                f"masked_acc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_acc']):.3%}]"
-            )
-            if is_metric_improved(primary_metric_value, best, primary_metric_mode):
-                best = float(primary_metric_value)
-                no_imp = 0
-                full_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=True)
-                print(
-                    f"[val] ret={format_metric(full_val['avg_val_ret_loss_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_ret_loss']):.4e})  "
-                    f"vol={format_metric(full_val['avg_val_vol_loss_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_vol_loss']):.4e})  "
-                    f"ret(mask)={format_metric(full_val['val_ret_loss_masked_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_ret_loss_masked']):.4e})  "
-                    f"vol(mask)={format_metric(full_val['val_vol_loss_masked_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_vol_loss_masked']):.4e})  "
-                    f"BCE(all)={format_metric(full_val['val_bce_unmasked'], '{:.5f}')}  "
-                    f"BCE(mask)={format_metric(full_val['val_bce_masked'], '{:.5f}')}  "
-                    f"Acc(all)={format_metric(full_val['val_acc'], '{:.3%}')}  "
-                    f"Acc(mask)={format_metric(full_val['val_acc_masked'], '{:.3%}')}  "
-                    f"AUC(all)={format_metric(full_val['val_auc'], '{:.3f}')}  "
-                    f"AUC(mask)={format_metric(full_val['val_auc_masked'], '{:.3f}')}")
-                print(
-                    f"[val_diag] pos_rate(all)={format_metric(full_val['val_pos_rate_all'], '{:.3%}')}  "
-                    f"logit_mean(all)={format_metric(full_val['val_logit_mean_all'], '{:.3f}')}  "
-                    f"logit_std(all)={format_metric(full_val['val_logit_std_all'], '{:.3f}')}  "
-                    f"pos_rate(mask)={format_metric(full_val['val_pos_rate_masked'], '{:.3%}')}  "
-                    f"logit_mean(mask)={format_metric(full_val['val_logit_mean_masked'], '{:.3f}')}  "
-                    f"logit_std(mask)={format_metric(full_val['val_logit_std_masked'], '{:.3f}')}")
-                print(
-                    f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
-                    f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_ret_loss']):.6f}, "
-                    f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_vol_loss']):.6f}, "
-                    f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_auc']):.6f}]"
-                )
-                ckpt = {
-                    "epoch": epoch,
-                    "state_dict": get_model_state_dict_for_ckpt(model),
-                    "args": {
-                        "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
-                        "feat_dim": F_total, "LOOKBACK": LOOKBACK,
-                        "HORIZONS_MS": HORIZONS_MS,
-                    },
-                    "best_primary_metric": best,
-                }
-                out_ckpt = out_root / "cmssl17_offline_best.pt"
-                torch.save(ckpt, out_ckpt)
-                print(f"[ckpt] saved best to {out_ckpt}")
-            else:
-                no_imp += 1
-                print(f"no improve {no_imp}/{early_stop_patience}")
-                if no_imp >= early_stop_patience:
-                    print("Early stopping triggered.")
-                    early_stop_triggered = True
-        else:
-            print(f"[val-fast] primary_metric({primary_metric_label})=nan (skipping early stop)")
 
         if early_stop_triggered:
             break
