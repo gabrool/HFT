@@ -1342,6 +1342,7 @@ def train_from_offline():
                         if no_imp >= early_stop_patience:
                             print("Early stopping triggered.")
                             early_stop_triggered = True
+                            break
                 else:
                     print(
                         f"[val-fast] epoch={epoch+1} event={val_event_in_epoch} batch={batch_idx+1}/{num_train_batches} "
