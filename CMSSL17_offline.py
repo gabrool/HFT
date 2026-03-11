@@ -1174,9 +1174,13 @@ def train_from_offline():
         model.train()
         pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
         num_train_batches = len(dl_train)
-        val_interval = max(1, num_train_batches // VAL_EVENTS_PER_EPOCH)
+        val_points = sorted({
+            max(1, min(num_train_batches, int(round(x))))
+            for x in np.linspace(1, num_train_batches, VAL_EVENTS_PER_EPOCH)
+        })
+        val_points_set = set(val_points)
+        val_points_total = len(val_points)
         val_event_in_epoch = 0
-        last_val_batch = -1
         running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
         running_ret_t = torch.zeros((), device=device, dtype=torch.float32)
         running_vol_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -1271,21 +1275,20 @@ def train_from_offline():
             running_loss_t += loss.detach().float()
             n_batches += 1
 
-            should_validate = (
-                ((batch_idx + 1) % val_interval == 0) or ((batch_idx + 1) == num_train_batches)
-            )
-            if should_validate and batch_idx != last_val_batch:
-                last_val_batch = batch_idx
+            should_validate = (batch_idx + 1) in val_points_set
+            if should_validate:
                 val_event_in_epoch += 1
 
+                model.eval()
                 fast_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=False)
+                model.train()
                 primary_metric_value = float(fast_val["primary_metric_value"])
                 primary_metric_label = str(fast_val["primary_metric_label"])
 
                 if math.isfinite(primary_metric_value):
                     print(
                         f"[val-fast] epoch={epoch+1}/{EPOCHS} batch={batch_idx+1}/{num_train_batches} "
-                        f"global_step={global_step} event={val_event_in_epoch}/{VAL_EVENTS_PER_EPOCH} "
+                        f"global_step={global_step} event={val_event_in_epoch}/{val_points_total} "
                         f"primary_metric({primary_metric_label})={primary_metric_value:.6f} "
                         f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_ret_loss']):.6f}, "
                         f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_vol_loss']):.6f}, "
@@ -1295,7 +1298,9 @@ def train_from_offline():
                     if is_metric_improved(primary_metric_value, best, primary_metric_mode):
                         best = float(primary_metric_value)
                         no_imp = 0
+                        model.eval()
                         full_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=True)
+                        model.train()
                         print(
                             f"[val] ret={format_metric(full_val['avg_val_ret_loss_per_h'], '{:.5f}')} "
                             f"(w_avg={float(full_val['avg_val_ret_loss']):.4e})  "
@@ -1354,7 +1359,7 @@ def train_from_offline():
                 else:
                     print(
                         f"[val-fast] epoch={epoch+1}/{EPOCHS} batch={batch_idx+1}/{num_train_batches} "
-                        f"global_step={global_step} event={val_event_in_epoch}/{VAL_EVENTS_PER_EPOCH} "
+                        f"global_step={global_step} event={val_event_in_epoch}/{val_points_total} "
                         f"primary_metric({primary_metric_label})=nan "
                         f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_ret_loss']):.6f}, "
                         f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_vol_loss']):.6f}, "
