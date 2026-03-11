@@ -873,7 +873,7 @@ class SAMBA(nn.Module):
             in_feats=args.vocab_size, seq_len=args.seq_in, d_model=args.d_model, 
             dw_ks=[3,3,5,5,7,7], n_layers=6, d_ff=256, dropout=0.1, act='gelu', 
             enable_res_param=True, norm='layer', re_param=True, re_param_kernel=3, 
-            patch_size=5, stride=2
+            patch_size=8, stride=4
         )
         # Mamba backbone (forward/backward fusion) + pooling
         self.mamba = Mamba(args, ff_hid=DMODEL)
