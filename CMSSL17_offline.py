@@ -86,7 +86,7 @@ WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "0")) == 1
 COMPILE_ENABLED = int(os.environ.get("BYBIT_TORCH_COMPILE", "0")) == 1
 COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "default").strip()
-LOG_EVERY     = int(os.environ.get("BYBIT_LOG_EVERY", "50"))
+LOG_EVERY     = max(1, int(os.environ.get("BYBIT_LOG_EVERY", "50")))
 CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
@@ -881,6 +881,8 @@ def train_from_offline():
                 print(f"[warn] torch.compile failed ({exc}); continuing in eager mode")
         else:
             print("[warn] BYBIT_TORCH_COMPILE=1 but torch.compile is unavailable; continuing in eager mode")
+    else:
+        print("[compile] enabled=False")
     primary_metric_mode = get_primary_metric_mode()
     opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     torch.cuda.empty_cache()
