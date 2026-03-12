@@ -9,7 +9,7 @@ from OUT_ROOT/meta.json and week meta files, avoiding any online feature buildin
 
 Env vars:
   BYBIT_OUT_ROOT=/path/to/offline_ingest_output_root      (REQUIRED)
-  BYBIT_USE_IN_MEMORY=0|1   # 1 = load all chunks into RAM (faster but memory heavy). Default 1
+  BYBIT_USE_IN_MEMORY=0|1   # 1 = load all chunks into RAM (faster but memory heavy). Default 0
   BYBIT_WORKERS=8           # train DataLoader workers. Default 8; val/test use max(1, min(4, BYBIT_WORKERS//2)).
 
 Split metadata requirement:
