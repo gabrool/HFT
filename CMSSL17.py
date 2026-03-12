@@ -526,8 +526,8 @@ NUM_HEADS       = 8
 # Loss mixing (fixed lambdas), with EMA normalization per loss
 EMA_DECAY       = 0.99
 LAMBDA_BCE      = 1.00
-LAMBDA_RET      = 0.75
-LAMBDA_VOL      = 0.75
+LAMBDA_RET      = 0.50
+LAMBDA_VOL      = 0.50
 
 # Huber deltas (per horizon).
 # We start from calibrated 250ms thresholds (1e-4 return, 0.02 log-vol)
