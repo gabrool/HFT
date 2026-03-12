@@ -683,7 +683,7 @@ class DepatchSampling(nn.Module):
         return output # (B, C, patch_count, patch_size)
 
 class _ConvEncoderLayer(nn.Module):
-    def __init__(self, kernel_size, d_model, d_ff=256, dropout=0.1, activation="gelu", 
+    def __init__(self, kernel_size, d_model, d_ff=128, dropout=0.1, activation="gelu", 
                  enable_res_param=True, norm='batch', re_param=True, small_ks=3):
         super(_ConvEncoderLayer, self).__init__()
         self.norm_tp = norm
