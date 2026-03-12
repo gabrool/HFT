@@ -752,7 +752,7 @@ class ConvEncoder(nn.Module):
         return output
 
 class ConvTimeNetFeatureExtractor(nn.Module):
-    def __init__(self, in_feats, seq_len, d_model, dw_ks, n_layers, d_ff=128, dropout=0.1, act='gelu', 
+    def __init__(self, in_feats, seq_len, d_model, dw_ks, n_layers, d_ff=256, dropout=0.1, act='gelu', 
                  enable_res_param=True, norm='batch', re_param=True, re_param_kernel=3, patch_size=2, stride=1):
         super(ConvTimeNetFeatureExtractor, self).__init__()
         self.depatch = DepatchSampling(in_feats=in_feats, seq_len=seq_len, patch_size=patch_size, stride=stride)
