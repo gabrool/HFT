@@ -484,7 +484,7 @@ PRIMARY_METRIC_HORIZON_MS = 1000
 PRIMARY_METRIC_AUC_WEIGHT = 1.0
 PRIMARY_METRIC_RET_WEIGHT = 0.25
 PRIMARY_METRIC_VOL_WEIGHT = 0.25
-SINGLE_WEEK_PATIENCE = 3
+SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
 # These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
 AUX_DIM        = 5
