@@ -2805,9 +2805,11 @@ def run_pipeline(
     rl_eval_performed = False
     rl_checkpoint_origin = "none"
     external_rl_ckpt = os.environ.get("BYBIT_MM_RL_CKPT", "").strip()
+    external_ckpt_explicit = bool(external_rl_ckpt)
     resolved_external_rl_ckpt = (
         str(Path(external_rl_ckpt).expanduser().resolve()) if external_rl_ckpt else None
     )
+    strict_fail_reason: Optional[str] = None
     if run_mode == "eval":
         if not external_rl_ckpt:
             raise SystemExit(
@@ -2824,13 +2826,20 @@ def run_pipeline(
                 f"BYBIT_MM_RL_CKPT does not exist for run_mode=eval: {resolved_eval_ckpt}"
             )
     elif run_mode == "train_eval":
-        if require_rl_ckpt and not external_rl_ckpt:
+        if require_rl_ckpt and not external_ckpt_explicit:
             raise SystemExit(
                 "BYBIT_MM_REQUIRE_RL_CKPT=true requires explicit BYBIT_MM_RL_CKPT when run_mode=train_eval."
             )
-        if resolved_external_rl_ckpt is not None:
+        # In train_eval, explicit BYBIT_MM_RL_CKPT is treated as user intent;
+        # missing path is fatal, no baseline fallback.
+        if external_ckpt_explicit:
             resolved_eval_ckpt = resolved_external_rl_ckpt
             rl_checkpoint_origin = "external"
+            if resolved_eval_ckpt is None or not Path(resolved_eval_ckpt).exists():
+                strict_fail_reason = "explicit external checkpoint missing"
+                raise FileNotFoundError(
+                    f"{strict_fail_reason}: {resolved_eval_ckpt}"
+                )
         else:
             resolved_eval_ckpt = str(mm_best_ckpt.expanduser().resolve())
             rl_checkpoint_origin = "fresh_train"
@@ -2858,6 +2867,9 @@ def run_pipeline(
             raise FileNotFoundError(
                 f"BYBIT_MM_RL_CKPT does not exist for run_mode=eval: {resolved_eval_ckpt}"
             )
+        elif run_mode == "train_eval" and external_ckpt_explicit:
+            strict_fail_reason = "explicit external checkpoint missing"
+            raise FileNotFoundError(f"{strict_fail_reason}: {resolved_eval_ckpt}")
 
     if run_mode in {"train", "train_eval"}:
         print(f"[mm train] starting PPO training (run_mode={run_mode})")
@@ -2960,21 +2972,24 @@ def run_pipeline(
             mm_policy = None
             rl_policy_reason = "no path provided"
         elif not Path(resolved_eval_ckpt).exists():
-            missing_msg = (
-                f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; "
-                "using baseline deltas for RL run."
-            )
+            if run_mode == "train_eval" and external_ckpt_explicit:
+                strict_fail_reason = "explicit external checkpoint missing"
+                raise FileNotFoundError(f"{strict_fail_reason}: {resolved_eval_ckpt}")
+            missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using baseline deltas for RL run."
             if require_rl_ckpt:
                 raise FileNotFoundError(missing_msg)
             warnings.warn(missing_msg, RuntimeWarning)
             mm_policy = None
             rl_policy_reason = "missing checkpoint"
         else:
+            policy_require_checkpoint = require_rl_ckpt or (
+                run_mode == "train_eval" and external_ckpt_explicit
+            )
             mm_policy = load_market_policy(
                 mm_obs_dim,
                 device=device,
                 ckpt_path=resolved_eval_ckpt,
-                require_checkpoint=require_rl_ckpt,
+                require_checkpoint=policy_require_checkpoint,
                 checkpoint_data=eval_ckpt_payload,
             )
             rl_policy_reason = "loaded" if mm_policy is not None else "missing checkpoint"
@@ -3016,7 +3031,9 @@ def run_pipeline(
             "rl_checkpoint_origin": rl_checkpoint_origin,
             "rl_checkpoint_path": resolved_eval_ckpt,
             "external_rl_ckpt_requested": bool(external_rl_ckpt),
+            "external_rl_ckpt_explicit": external_ckpt_explicit,
             "obs_norm_source": obs_norm_source,
+            "strict_fail_reason": strict_fail_reason,
         },
         "mm_run_state": {
             "trained_this_run": trained_this_run,
@@ -3031,8 +3048,10 @@ def run_pipeline(
             "reason": rl_policy_reason,
             "path": resolved_eval_ckpt,
             "require_checkpoint": require_rl_ckpt,
+            "external_rl_ckpt_explicit": external_ckpt_explicit,
             "checkpoint_origin": rl_checkpoint_origin,
             "trained_this_run": trained_this_run,
+            "strict_fail_reason": strict_fail_reason,
         },
     }
 
