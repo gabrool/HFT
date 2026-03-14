@@ -2478,9 +2478,11 @@ def evaluate_market_making(
         ts_source = "synthetic_from_cadence"
         ts_ms = np.arange(steps, dtype=np.int64) * int(max(step_ms, 1.0))
     else:
-        ts_ms = np.asarray(ts_raw, dtype=np.int64)
-        if ts_ms.size >= steps:
-            ts_ms = ts_ms[:steps]
+        ts_arr = np.asarray(ts_raw, dtype=np.int64)
+        # Equity points are post-step (next_idx), so decision_ts must be shifted by +1 for bucketed metrics.
+        ts_shifted = ts_arr[1:steps + 1]
+        if ts_shifted.size == steps:
+            ts_ms = ts_shifted
         else:
             ts_source = "synthetic_from_cadence"
             ts_ms = np.arange(steps, dtype=np.int64) * int(max(step_ms, 1.0))
