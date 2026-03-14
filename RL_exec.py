@@ -275,6 +275,92 @@ def _resolve_ppo_epochs(default: int) -> int:
     return _env_int(PPO_EPOCHS_ENV, default)
 
 
+@dataclass(frozen=True)
+class EvalCheckpointResolution:
+    resolved_eval_ckpt: Optional[str]
+    checkpoint_origin: str
+    external_ckpt_explicit: bool
+    checkpoint_payload: Optional[Dict[str, Any]]
+    rl_eval_expected: bool
+
+
+def _resolve_eval_checkpoint(
+    run_mode: str,
+    mm_best_ckpt: Path,
+    external_rl_ckpt_raw: str,
+    require_rl_ckpt: bool,
+    trained_this_run: bool,
+) -> EvalCheckpointResolution:
+    external_rl_ckpt = external_rl_ckpt_raw.strip()
+    external_ckpt_explicit = bool(external_rl_ckpt)
+    resolved_external_rl_ckpt = (
+        str(Path(external_rl_ckpt).expanduser().resolve()) if external_rl_ckpt else None
+    )
+    mm_best_ckpt_resolved = str(mm_best_ckpt.expanduser().resolve())
+
+    if run_mode == "eval":
+        if not external_rl_ckpt:
+            raise SystemExit(
+                "BYBIT_MM_RL_CKPT must be set to a non-empty checkpoint path when run_mode=eval."
+            )
+        resolved_eval_ckpt = resolved_external_rl_ckpt
+        if resolved_eval_ckpt is None:
+            raise SystemExit(
+                "Unable to resolve BYBIT_MM_RL_CKPT when run_mode=eval; provide a valid file path."
+            )
+        if not Path(resolved_eval_ckpt).exists():
+            raise FileNotFoundError(
+                f"BYBIT_MM_RL_CKPT does not exist for run_mode=eval: {resolved_eval_ckpt}"
+            )
+        return EvalCheckpointResolution(
+            resolved_eval_ckpt=resolved_eval_ckpt,
+            checkpoint_origin="external",
+            external_ckpt_explicit=external_ckpt_explicit,
+            checkpoint_payload=torch.load(Path(resolved_eval_ckpt), map_location="cpu"),
+            rl_eval_expected=True,
+        )
+
+    if run_mode == "train_eval":
+        if require_rl_ckpt and not external_ckpt_explicit:
+            raise SystemExit(
+                "BYBIT_MM_REQUIRE_RL_CKPT=true requires explicit BYBIT_MM_RL_CKPT when run_mode=train_eval."
+            )
+        # In train_eval, explicit BYBIT_MM_RL_CKPT is treated as user intent;
+        # missing path is fatal, no baseline fallback.
+        if external_ckpt_explicit:
+            resolved_eval_ckpt = resolved_external_rl_ckpt
+            if resolved_eval_ckpt is None or not Path(resolved_eval_ckpt).exists():
+                raise FileNotFoundError(
+                    f"explicit external checkpoint missing: {resolved_eval_ckpt}"
+                )
+            return EvalCheckpointResolution(
+                resolved_eval_ckpt=resolved_eval_ckpt,
+                checkpoint_origin="external",
+                external_ckpt_explicit=external_ckpt_explicit,
+                checkpoint_payload=torch.load(Path(resolved_eval_ckpt), map_location="cpu"),
+                rl_eval_expected=True,
+            )
+        return EvalCheckpointResolution(
+            resolved_eval_ckpt=mm_best_ckpt_resolved,
+            checkpoint_origin="fresh_train",
+            external_ckpt_explicit=external_ckpt_explicit,
+            checkpoint_payload=None,
+            rl_eval_expected=True,
+        )
+
+    return EvalCheckpointResolution(
+        resolved_eval_ckpt=(
+            resolved_external_rl_ckpt
+            if resolved_external_rl_ckpt is not None
+            else mm_best_ckpt_resolved
+        ),
+        checkpoint_origin="external" if resolved_external_rl_ckpt is not None else "none",
+        external_ckpt_explicit=external_ckpt_explicit,
+        checkpoint_payload=None,
+        rl_eval_expected=False,
+    )
+
+
 def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
     raw = os.environ.get(env_name, "").strip()
     if not raw:
@@ -2800,73 +2886,26 @@ def run_pipeline(
         mm_ppo_config.max_drawdown_guard = None
     mm_best_ckpt = Path(os.environ.get("BYBIT_MM_PPO_BEST_CKPT", Path(out_root) / "mm_ppo_best.pt"))
     require_rl_ckpt = _env_bool("BYBIT_MM_REQUIRE_RL_CKPT", False)
+    external_rl_ckpt = os.environ.get("BYBIT_MM_RL_CKPT", "")
 
     trained_this_run = False
     rl_eval_performed = False
-    rl_checkpoint_origin = "none"
-    external_rl_ckpt = os.environ.get("BYBIT_MM_RL_CKPT", "").strip()
-    external_ckpt_explicit = bool(external_rl_ckpt)
-    resolved_external_rl_ckpt = (
-        str(Path(external_rl_ckpt).expanduser().resolve()) if external_rl_ckpt else None
+    eval_ckpt_resolution = _resolve_eval_checkpoint(
+        run_mode=run_mode,
+        mm_best_ckpt=mm_best_ckpt,
+        external_rl_ckpt_raw=external_rl_ckpt,
+        require_rl_ckpt=require_rl_ckpt,
+        trained_this_run=trained_this_run,
     )
-    if run_mode == "eval":
-        if not external_rl_ckpt:
-            raise SystemExit(
-                "BYBIT_MM_RL_CKPT must be set to a non-empty checkpoint path when run_mode=eval."
-            )
-        resolved_eval_ckpt = resolved_external_rl_ckpt
-        rl_checkpoint_origin = "external"
-        if resolved_eval_ckpt is None:
-            raise SystemExit(
-                "Unable to resolve BYBIT_MM_RL_CKPT when run_mode=eval; provide a valid file path."
-            )
-        if not Path(resolved_eval_ckpt).exists():
-            raise FileNotFoundError(
-                f"BYBIT_MM_RL_CKPT does not exist for run_mode=eval: {resolved_eval_ckpt}"
-            )
-    elif run_mode == "train_eval":
-        if require_rl_ckpt and not external_ckpt_explicit:
-            raise SystemExit(
-                "BYBIT_MM_REQUIRE_RL_CKPT=true requires explicit BYBIT_MM_RL_CKPT when run_mode=train_eval."
-            )
-        # In train_eval, explicit BYBIT_MM_RL_CKPT is treated as user intent;
-        # missing path is fatal, no baseline fallback.
-        if external_ckpt_explicit:
-            resolved_eval_ckpt = resolved_external_rl_ckpt
-            rl_checkpoint_origin = "external"
-            if resolved_eval_ckpt is None or not Path(resolved_eval_ckpt).exists():
-                raise FileNotFoundError(
-                    f"explicit external checkpoint missing: {resolved_eval_ckpt}"
-                )
-        else:
-            resolved_eval_ckpt = str(mm_best_ckpt.expanduser().resolve())
-            rl_checkpoint_origin = "fresh_train"
-    else:
-        resolved_eval_ckpt = (
-            resolved_external_rl_ckpt
-            if resolved_external_rl_ckpt is not None
-            else str(mm_best_ckpt.expanduser().resolve())
-        )
-        rl_checkpoint_origin = "external" if resolved_external_rl_ckpt is not None else "none"
+    resolved_eval_ckpt = eval_ckpt_resolution.resolved_eval_ckpt
+    rl_checkpoint_origin = eval_ckpt_resolution.checkpoint_origin
+    external_ckpt_explicit = eval_ckpt_resolution.external_ckpt_explicit
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
     obs_norm_source = "env_default"
-    eval_ckpt_payload = None
+    eval_ckpt_payload = eval_ckpt_resolution.checkpoint_payload
 
-    use_external_eval_ckpt = run_mode == "eval" or (
-        run_mode == "train_eval" and rl_checkpoint_origin == "external"
-    )
-    if use_external_eval_ckpt and resolved_eval_ckpt:
-        eval_ckpt_path = Path(resolved_eval_ckpt)
-        if eval_ckpt_path.exists():
-            eval_ckpt_payload = torch.load(eval_ckpt_path, map_location="cpu")
-        elif run_mode == "eval":
-            # Preserve strict eval-mode contract while keeping explicit behavior local.
-            raise FileNotFoundError(
-                f"BYBIT_MM_RL_CKPT does not exist for run_mode=eval: {resolved_eval_ckpt}"
-            )
-        elif run_mode == "train_eval" and external_ckpt_explicit:
-            raise FileNotFoundError(f"explicit external checkpoint missing: {resolved_eval_ckpt}")
+    use_external_eval_ckpt = rl_checkpoint_origin == "external"
 
     if run_mode in {"train", "train_eval"}:
         print(f"[mm train] starting PPO training (run_mode={run_mode})")
@@ -2969,8 +3008,6 @@ def run_pipeline(
             mm_policy = None
             rl_policy_reason = "no path provided"
         elif not Path(resolved_eval_ckpt).exists():
-            if run_mode == "train_eval" and external_ckpt_explicit:
-                raise FileNotFoundError(f"explicit external checkpoint missing: {resolved_eval_ckpt}")
             missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using baseline deltas for RL run."
             if require_rl_ckpt:
                 raise FileNotFoundError(missing_msg)
@@ -3029,7 +3066,11 @@ def run_pipeline(
             "rl_checkpoint_path": resolved_eval_ckpt,
             "external_rl_ckpt_requested": bool(external_rl_ckpt),
             "external_rl_ckpt_explicit": external_ckpt_explicit,
-            "external_rl_ckpt_resolved_path": resolved_external_rl_ckpt,
+            "external_rl_ckpt_resolved_path": (
+                str(Path(external_rl_ckpt.strip()).expanduser().resolve())
+                if external_rl_ckpt.strip()
+                else None
+            ),
             "obs_norm_source": obs_norm_source,
             "require_rl_ckpt": require_rl_ckpt,
         },
