@@ -2883,62 +2883,70 @@ def run_pipeline(
     )
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
-    if run_mode == "eval":
-        mm_policy = load_market_policy(
-            mm_obs_dim,
-            device=device,
-            ckpt_path=resolved_eval_ckpt,
-            require_checkpoint=True,
-        )
-        require(mm_policy is not None, "Failed to load eval policy checkpoint")
-        rl_policy_reason = "loaded"
-    elif resolved_eval_ckpt is None:
-        mm_policy = None
-        rl_policy_reason = "no path provided"
-    elif not Path(resolved_eval_ckpt).exists():
-        missing_msg = (
-            f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; "
-            "using baseline deltas for RL run."
-        )
-        if require_rl_ckpt:
-            raise FileNotFoundError(missing_msg)
-        warnings.warn(missing_msg, RuntimeWarning)
-        mm_policy = None
-        rl_policy_reason = "missing checkpoint"
-    else:
-        mm_policy = load_market_policy(
-            mm_obs_dim,
-            device=device,
-            ckpt_path=resolved_eval_ckpt,
-            require_checkpoint=require_rl_ckpt,
-        )
-        rl_policy_reason = "loaded" if mm_policy is not None else "missing checkpoint"
-
-    if mm_policy is None:
-        if rl_policy_reason == "no path provided":
-            print("[mm eval] no policy path provided; using baseline deltas for RL run.")
-        rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
-        rl_policy_loaded = False
-    else:
-        rl_policy_loaded = True
-
-        def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
-            obs_t = torch.from_numpy(obs).float().to(device)
-            with torch.no_grad():
-                deltas = mm_policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-            if deltas.shape[0] >= 3:
-                return (
-                    float(deltas[0] * delta_scale),
-                    float(deltas[1] * delta_scale),
-                    float(deltas[2] * taker_scale),
-                )
-            return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
-
-    rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
-    rl_eval_performed = True
-
+    rl_metrics = None
     print("[mm eval]", _format_mm_summary("baseline", baseline_metrics))
-    print("[mm eval]", _format_mm_summary("baseline+rl", rl_metrics))
+
+    if run_mode == "train":
+        rl_policy_loaded = False
+        rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
+        resolved_eval_ckpt = None
+        rl_eval_performed = False
+        print("[mm eval] baseline evaluated; RL eval skipped due to run mode train.")
+    else:
+        if run_mode == "eval":
+            mm_policy = load_market_policy(
+                mm_obs_dim,
+                device=device,
+                ckpt_path=resolved_eval_ckpt,
+                require_checkpoint=True,
+            )
+            require(mm_policy is not None, "Failed to load eval policy checkpoint")
+            rl_policy_reason = "loaded"
+        elif resolved_eval_ckpt is None:
+            mm_policy = None
+            rl_policy_reason = "no path provided"
+        elif not Path(resolved_eval_ckpt).exists():
+            missing_msg = (
+                f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; "
+                "using baseline deltas for RL run."
+            )
+            if require_rl_ckpt:
+                raise FileNotFoundError(missing_msg)
+            warnings.warn(missing_msg, RuntimeWarning)
+            mm_policy = None
+            rl_policy_reason = "missing checkpoint"
+        else:
+            mm_policy = load_market_policy(
+                mm_obs_dim,
+                device=device,
+                ckpt_path=resolved_eval_ckpt,
+                require_checkpoint=require_rl_ckpt,
+            )
+            rl_policy_reason = "loaded" if mm_policy is not None else "missing checkpoint"
+
+        if mm_policy is None:
+            if rl_policy_reason == "no path provided":
+                print("[mm eval] no policy path provided; using baseline deltas for RL run.")
+            rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
+            rl_policy_loaded = False
+        else:
+            rl_policy_loaded = True
+
+            def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
+                obs_t = torch.from_numpy(obs).float().to(device)
+                with torch.no_grad():
+                    deltas = mm_policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
+                if deltas.shape[0] >= 3:
+                    return (
+                        float(deltas[0] * delta_scale),
+                        float(deltas[1] * delta_scale),
+                        float(deltas[2] * taker_scale),
+                    )
+                return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
+
+        rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
+        rl_eval_performed = True
+        print("[mm eval]", _format_mm_summary("baseline+rl", rl_metrics))
 
     return {
         "cmssl_test": cmssl_report,
