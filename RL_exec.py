@@ -1677,6 +1677,12 @@ class MarketMakingEnv:
         if next_idx >= self.n:
             mid = self._mid_price(self.idx)
             hard_cap_qty = self._inventory_cap_qty(mid)
+            pre_hard_cap_qty = hard_cap_qty
+            pre_buy_room_qty = self._remaining_inventory_room(1, mid)
+            pre_sell_room_qty = self._remaining_inventory_room(-1, mid)
+            post_hard_cap_qty = hard_cap_qty
+            post_buy_room_qty = pre_buy_room_qty
+            post_sell_room_qty = pre_sell_room_qty
             equity = self.cash + self.inventory * mid
             info = {
                 "reward": 0.0,
@@ -1693,9 +1699,16 @@ class MarketMakingEnv:
                 "turnover_penalty": 0.0,
                 "mid": float(mid),
                 "hard_max_inventory_notional": float(self.hard_max_inventory_notional),
-                "hard_cap_qty": float(hard_cap_qty),
-                "buy_room_qty": float(self._remaining_inventory_room(1, mid)),
-                "sell_room_qty": float(self._remaining_inventory_room(-1, mid)),
+                "pre_hard_cap_qty": float(pre_hard_cap_qty),
+                "pre_buy_room_qty": float(pre_buy_room_qty),
+                "pre_sell_room_qty": float(pre_sell_room_qty),
+                "post_hard_cap_qty": float(post_hard_cap_qty),
+                "post_buy_room_qty": float(post_buy_room_qty),
+                "post_sell_room_qty": float(post_sell_room_qty),
+                # Backward compatibility aliases map to post-fill diagnostics.
+                "hard_cap_qty": float(post_hard_cap_qty),
+                "buy_room_qty": float(post_buy_room_qty),
+                "sell_room_qty": float(post_sell_room_qty),
                 "bid": 0.0,
                 "ask": 0.0,
                 "maker_buy": 0.0,
@@ -1730,6 +1743,12 @@ class MarketMakingEnv:
         )
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
+        mid_for_cap = self._mid_price(next_idx)
+        pre_hard_cap_qty = self._inventory_cap_qty(mid_for_cap)
+        pre_buy_room_qty = self._remaining_inventory_room(1, mid_for_cap)
+        pre_sell_room_qty = self._remaining_inventory_room(-1, mid_for_cap)
+        # Clipping is evaluated per fill attempt, so maker/taker clipped amounts reflect
+        # evolving inventory after each in-step fill is applied.
         maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
         taker_buy, taker_sell = self._apply_taker(next_idx, taker_signal)
         best_ask_next = float(self.best_ask[next_idx])
@@ -1813,6 +1832,9 @@ class MarketMakingEnv:
         self.idx = next_idx
         done = self.idx >= self.n - 1
         next_obs = self._build_observation(self.idx)
+        post_hard_cap_qty = self._inventory_cap_qty(mid_next)
+        post_buy_room_qty = self._remaining_inventory_room(1, mid_next)
+        post_sell_room_qty = self._remaining_inventory_room(-1, mid_next)
         info = {
             "reward": float(reward),
             "total_reward": float(self.total_reward),
@@ -1830,9 +1852,16 @@ class MarketMakingEnv:
             "turnover_penalty": float(turnover_penalty),
             "mid": float(mid_next),
             "hard_max_inventory_notional": float(self.hard_max_inventory_notional),
-            "hard_cap_qty": float(self._inventory_cap_qty(mid_next)),
-            "buy_room_qty": float(self._remaining_inventory_room(1, mid_next)),
-            "sell_room_qty": float(self._remaining_inventory_room(-1, mid_next)),
+            "pre_hard_cap_qty": float(pre_hard_cap_qty),
+            "pre_buy_room_qty": float(pre_buy_room_qty),
+            "pre_sell_room_qty": float(pre_sell_room_qty),
+            "post_hard_cap_qty": float(post_hard_cap_qty),
+            "post_buy_room_qty": float(post_buy_room_qty),
+            "post_sell_room_qty": float(post_sell_room_qty),
+            # Backward compatibility aliases map to post-fill diagnostics.
+            "hard_cap_qty": float(post_hard_cap_qty),
+            "buy_room_qty": float(post_buy_room_qty),
+            "sell_room_qty": float(post_sell_room_qty),
             "bid": float(bid),
             "ask": float(ask),
             "bid_delta_bps": float(bid_delta_bps),
