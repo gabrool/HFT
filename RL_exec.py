@@ -1535,6 +1535,8 @@ class MarketMakingEnv:
         return bid, ask
 
     def _inventory_cap_qty(self, mid: float) -> float:
+        # Threshold contract: hard_max_inventory_notional is only for execution-time
+        # fill clipping; _compute_penalty uses max_inventory_notional as the soft trigger.
         return self.hard_max_inventory_notional / max(mid, 1e-12)
 
     def _remaining_inventory_room(self, side: int, mid: float) -> float:
@@ -1653,8 +1655,8 @@ class MarketMakingEnv:
         return (1.0 - self.fill_ema_alpha) * prev + self.fill_ema_alpha * value
 
     def _compute_penalty(self, mid: float) -> float:
-        # Industry convention: apply linear inventory penalty only for breaching
-        # an explicit hard inventory cap, measured in quote notional (USD).
+        # Linear inventory penalty trigger uses max_inventory_notional (soft/penalty
+        # threshold, quote notional USD), not the hard execution clipping cap.
         inv_notional = abs(self.inventory * mid)
         penalty = 0.0
         if inv_notional > self.max_inventory_notional:
