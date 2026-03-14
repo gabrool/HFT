@@ -3083,14 +3083,11 @@ def run_pipeline(
             "ppo_best_ckpt_path": str(mm_best_ckpt.expanduser().resolve()),
             "rl_eval_performed": rl_eval_performed,
             "rl_checkpoint_origin": rl_checkpoint_origin,
+            # Canonical evaluated policy checkpoint path consumed by downstream readers.
             "rl_checkpoint_path": resolved_eval_ckpt,
-            "external_rl_ckpt_requested": bool(external_rl_ckpt),
+            # Preserve user provenance (raw request) without duplicating resolved path state.
+            "external_rl_ckpt_requested": external_rl_ckpt.strip() or None,
             "external_rl_ckpt_explicit": external_ckpt_explicit,
-            "external_rl_ckpt_resolved_path": (
-                str(Path(external_rl_ckpt.strip()).expanduser().resolve())
-                if run_mode != "train" and external_rl_ckpt.strip()
-                else None
-            ),
             "obs_norm_source": obs_norm_source,
             "require_rl_ckpt": require_rl_ckpt,
         },
