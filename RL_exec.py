@@ -2296,8 +2296,8 @@ def train_market_ppo(
                 delta_scale=delta_scale,
                 taker_scale=taker_scale,
             )
-            # Keep legacy step-level Sharpe as the checkpoint selector in this
-            # patch; newer metrics are additive diagnostics only.
+            # Intentional in this patch: checkpoint selection remains on legacy
+            # report["sharpe"] with optional max_drawdown_guard.
             sharpe = report["sharpe"]
             drawdown = report["max_drawdown"]
             guard = config.max_drawdown_guard
@@ -2860,6 +2860,8 @@ def run_pipeline(
             )
 
     if run_mode in {"train", "train_eval"}:
+        # This call keeps existing checkpoint-selection behavior (legacy
+        # report["sharpe"] + optional max_drawdown_guard) unchanged.
         train_market_ppo(
             mm_train_env,
             mm_val_env,
