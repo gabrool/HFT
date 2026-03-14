@@ -2614,7 +2614,9 @@ def run_pipeline(
     ckpt_path: str,
     device: str = "cuda",
     ppo_epochs: int = 10,
+    run_mode: str = "train",
 ) -> Dict[str, Any]:
+    print(f"[mm run mode] {run_mode}")
     meta = load_global_meta(Path(out_root))
     test_split = resolve_test_split(out_root, meta)
 
@@ -2901,6 +2903,7 @@ if __name__ == "__main__":
     ckpt_path = os.environ.get("BYBIT_CMSSL_CKPT", "").strip()
     device = os.environ.get("BYBIT_DEVICE", "cuda")
     ppo_epochs = _resolve_ppo_epochs(10)
+    run_mode = _resolve_run_mode("train")
     run_cmssl_test_window = os.environ.get("BYBIT_RUN_CMSSL_TEST_WINDOW", "").strip().lower() in {
         "1",
         "true",
@@ -2922,11 +2925,18 @@ if __name__ == "__main__":
                 "device": device,
                 "ppo_epochs": ppo_epochs,
                 "ppo_epochs_env": PPO_EPOCHS_ENV,
+                "run_mode": run_mode,
             },
             sort_keys=True,
         ),
     )
-    report = run_pipeline(out_root, ckpt_path, device=device, ppo_epochs=ppo_epochs)
+    report = run_pipeline(
+        out_root,
+        ckpt_path,
+        device=device,
+        ppo_epochs=ppo_epochs,
+        run_mode=run_mode,
+    )
     print("[cmssl test]", report["cmssl_test"])
     print("[mm obs scaling]", report["mm_obs_scaling"])
     print("[mm baseline]", report["mm_baseline"])
