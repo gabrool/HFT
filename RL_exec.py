@@ -2657,6 +2657,35 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
     )
 
 
+def _summarize_array_for_log(arr: np.ndarray) -> Dict[str, Any]:
+    arr_np = np.asarray(arr)
+    summary: Dict[str, Any] = {
+        "type": "ndarray",
+        "dtype": str(arr_np.dtype),
+        "shape": list(arr_np.shape),
+    }
+    if arr_np.size > 0 and np.issubdtype(arr_np.dtype, np.number):
+        summary.update(
+            {
+                "min": float(np.min(arr_np)),
+                "max": float(np.max(arr_np)),
+            }
+        )
+    else:
+        summary["size"] = int(arr_np.size)
+    return summary
+
+
+def _summarize_for_log(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return _summarize_array_for_log(value)
+    if isinstance(value, dict):
+        return {k: _summarize_for_log(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_summarize_for_log(v) for v in value]
+    return value
+
+
 def load_market_policy(
     input_dim: int,
     device: str = "cuda",
@@ -3099,6 +3128,7 @@ if __name__ == "__main__":
         "yes",
         "y",
     }
+    verbose_reports = _env_bool("BYBIT_MM_VERBOSE_REPORTS", False)
 
     if not out_root or not ckpt_path:
         raise SystemExit("Set BYBIT_OUT_ROOT and BYBIT_CMSSL_CKPT before running.")
@@ -3128,11 +3158,18 @@ if __name__ == "__main__":
     )
     print("[cmssl test]", report["cmssl_test"])
     print("[mm obs scaling]", report["mm_obs_scaling"])
-    print("[mm baseline]", report["mm_baseline"])
+    # Keep default logs compact so routine runs stay readable; full reports are opt-in.
+    print("[mm eval]", _format_mm_summary("baseline", report["mm_baseline"]))
     if report["mm_rl"] is None:
         print("[mm rl] skipped (mm_rl is None)")
     else:
-        print("[mm rl]", report["mm_rl"])
+        print("[mm eval]", _format_mm_summary("baseline+rl", report["mm_rl"]))
+    if verbose_reports:
+        print("[mm baseline verbose]", _summarize_for_log(report["mm_baseline"]))
+        if report["mm_rl"] is None:
+            print("[mm rl verbose] skipped (mm_rl is None)")
+        else:
+            print("[mm rl verbose]", _summarize_for_log(report["mm_rl"]))
     if run_cmssl_test_window:
         print("[cmssl test window] running windowed inference for diagnostics.")
         test_window_report = run_cmssl_test_window_inference(out_root, ckpt_path, device=device)
