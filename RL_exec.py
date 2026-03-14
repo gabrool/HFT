@@ -2807,11 +2807,26 @@ def run_pipeline(
     resolved_external_rl_ckpt = (
         str(Path(external_rl_ckpt).expanduser().resolve()) if external_rl_ckpt else None
     )
-    resolved_eval_ckpt = (
-        resolved_external_rl_ckpt
-        if resolved_external_rl_ckpt is not None
-        else str(mm_best_ckpt.expanduser().resolve())
-    )
+    if run_mode == "eval":
+        if not external_rl_ckpt:
+            raise SystemExit(
+                "BYBIT_MM_RL_CKPT must be set to a non-empty checkpoint path when run_mode=eval."
+            )
+        resolved_eval_ckpt = resolved_external_rl_ckpt
+        if resolved_eval_ckpt is None:
+            raise SystemExit(
+                "Unable to resolve BYBIT_MM_RL_CKPT when run_mode=eval; provide a valid file path."
+            )
+        if not Path(resolved_eval_ckpt).exists():
+            raise FileNotFoundError(
+                f"BYBIT_MM_RL_CKPT does not exist for run_mode=eval: {resolved_eval_ckpt}"
+            )
+    else:
+        resolved_eval_ckpt = (
+            resolved_external_rl_ckpt
+            if resolved_external_rl_ckpt is not None
+            else str(mm_best_ckpt.expanduser().resolve())
+        )
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
     obs_norm_source = "none"
@@ -2835,7 +2850,9 @@ def run_pipeline(
         mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
         obs_norm_source = "train_env"
     else:
-        rl_checkpoint_origin = "external" if resolved_external_rl_ckpt is not None else "default"
+        rl_checkpoint_origin = "external" if run_mode == "eval" else (
+            "external" if resolved_external_rl_ckpt is not None else "default"
+        )
         train_obs_norm_state = None
         eval_ckpt = Path(resolved_eval_ckpt)
         if eval_ckpt.exists():
@@ -2866,7 +2883,16 @@ def run_pipeline(
     )
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
-    if resolved_eval_ckpt is None:
+    if run_mode == "eval":
+        mm_policy = load_market_policy(
+            mm_obs_dim,
+            device=device,
+            ckpt_path=resolved_eval_ckpt,
+            require_checkpoint=True,
+        )
+        require(mm_policy is not None, "Failed to load eval policy checkpoint")
+        rl_policy_reason = "loaded"
+    elif resolved_eval_ckpt is None:
         mm_policy = None
         rl_policy_reason = "no path provided"
     elif not Path(resolved_eval_ckpt).exists():
