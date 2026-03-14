@@ -2127,6 +2127,55 @@ def compute_max_drawdown(equity_curve: np.ndarray) -> float:
     return float(drawdown.max(initial=0.0))
 
 
+def compute_capital_returns(equity_curve: np.ndarray, initial_equity: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute fixed-capital per-step PnL and returns from an equity curve.
+
+    Returns are normalized by initial equity (with a small floor) rather than
+    prior equity, making them robust when running equity gets near zero or
+    temporarily negative.
+    """
+    if equity_curve.size == 0:
+        empty = np.array([], dtype=np.float32)
+        return empty, empty
+    prev = np.concatenate([[initial_equity], equity_curve[:-1]])
+    pnl_changes = equity_curve - prev
+    capital_base = max(float(initial_equity), 1e-12)
+    capital_returns = pnl_changes / capital_base
+    return pnl_changes, capital_returns
+
+
+def aggregate_returns_by_time(ts_ms: np.ndarray, returns: np.ndarray, bucket_ms: int) -> np.ndarray:
+    """Aggregate per-step returns into fixed time buckets by summation."""
+    if ts_ms.size != returns.size:
+        raise ValueError("ts_ms and returns must have equal length")
+    if ts_ms.size == 0:
+        return np.array([], dtype=np.float32)
+    if bucket_ms <= 0:
+        raise ValueError("bucket_ms must be positive")
+
+    ts_arr = np.asarray(ts_ms, dtype=np.int64)
+    ret_arr = np.asarray(returns, dtype=np.float32)
+    bucket_idx = (ts_arr - ts_arr[0]) // int(bucket_ms)
+    _, inverse = np.unique(bucket_idx, return_inverse=True)
+    agg = np.zeros(int(inverse.max()) + 1, dtype=np.float32)
+    np.add.at(agg, inverse, ret_arr)
+    return agg
+
+
+def compute_sortino(returns: np.ndarray, periods_per_year: float) -> float:
+    """Compute annualized Sortino ratio from periodic returns."""
+    if returns.size < 2 or periods_per_year <= 0:
+        return 0.0
+    mean = float(np.mean(returns))
+    downside = returns[returns < 0]
+    if downside.size == 0:
+        return 0.0
+    downside_std = float(np.std(downside, ddof=1)) if downside.size > 1 else float(np.std(downside, ddof=0))
+    if downside_std <= 0:
+        return 0.0
+    return float(mean / downside_std * np.sqrt(periods_per_year))
+
+
 def evaluate_market_policy(
     env: MarketMakingEnv,
     policy: MarketPolicyNet,
@@ -2382,6 +2431,27 @@ def evaluate_market_making(
     step_ms = float(cadence["step_ms"])
     steps_per_year = _steps_per_year_from_snapshot_ms(step_ms)
     sharpe = compute_sharpe(returns, steps_per_year)
+    pnl_changes, capital_returns = compute_capital_returns(equity_arr, initial_equity)
+
+    ts_source = "env.decision_ts"
+    ts_raw = getattr(env, "decision_ts", None)
+    if ts_raw is None:
+        ts_source = "synthetic_from_cadence"
+        ts_ms = np.arange(steps, dtype=np.int64) * int(max(step_ms, 1.0))
+    else:
+        ts_ms = np.asarray(ts_raw, dtype=np.int64)
+        if ts_ms.size >= steps:
+            ts_ms = ts_ms[:steps]
+        else:
+            ts_source = "synthetic_from_cadence"
+            ts_ms = np.arange(steps, dtype=np.int64) * int(max(step_ms, 1.0))
+
+    capital_returns_5m = aggregate_returns_by_time(ts_ms, capital_returns, 5 * 60 * 1000)
+    capital_returns_1h = aggregate_returns_by_time(ts_ms, capital_returns, 60 * 60 * 1000)
+    sharpe_5m = compute_sharpe(capital_returns_5m, 365.0 * 24.0 * 12.0)
+    sharpe_1h = compute_sharpe(capital_returns_1h, 365.0 * 24.0)
+    sortino_5m = compute_sortino(capital_returns_5m, 365.0 * 24.0 * 12.0)
+    sortino_1h = compute_sortino(capital_returns_1h, 365.0 * 24.0)
     max_drawdown = compute_max_drawdown(equity_arr)
     maker_fill_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
     taker_usage_frequency = float(taker_steps / steps) if steps > 0 else 0.0
@@ -2392,6 +2462,10 @@ def evaluate_market_making(
     return {
         "equity_curve": equity_arr,
         "sharpe": sharpe,
+        "sharpe_5m": sharpe_5m,
+        "sharpe_1h": sharpe_1h,
+        "sortino_5m": sortino_5m,
+        "sortino_1h": sortino_1h,
         "max_drawdown": max_drawdown,
         "turnover_qty": float(turnover_qty),
         "turnover_notional": float(turnover_notional),
@@ -2405,6 +2479,7 @@ def evaluate_market_making(
             "steps_per_year": float(steps_per_year),
             "source": cadence["source"],
             "diff_count": cadence["diff_count"],
+            "timestamp_source": ts_source,
         },
     }
 
