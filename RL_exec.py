@@ -3000,7 +3000,6 @@ def run_pipeline(
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
     rl_metrics = None
-    print("[mm eval]", _format_mm_summary("baseline", baseline_metrics))
 
     eval_action = "skipped" if run_mode == "train" else "performed"
     print(
@@ -3071,7 +3070,6 @@ def run_pipeline(
 
         rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
         rl_eval_performed = True
-        print("[mm eval]", _format_mm_summary("baseline+rl", rl_metrics))
 
     return {
         "cmssl_test": cmssl_report,
@@ -3147,6 +3145,7 @@ if __name__ == "__main__":
     )
     print("[cmssl test]", report["cmssl_test"])
     print("[mm obs scaling]", report["mm_obs_scaling"])
+    # Ownership: __main__ prints MM summaries once; run_pipeline() only returns metrics.
     # Keep default logs compact so routine runs stay readable; full reports are opt-in.
     print("[mm eval]", _format_mm_summary("baseline", report["mm_baseline"]))
     if report["mm_rl"] is None:
