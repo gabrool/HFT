@@ -2860,6 +2860,7 @@ def run_pipeline(
             )
 
     if run_mode in {"train", "train_eval"}:
+        print(f"[mm train] starting PPO training (run_mode={run_mode})")
         # This call keeps existing checkpoint-selection behavior (legacy
         # report["sharpe"] + optional max_drawdown_guard) unchanged.
         train_market_ppo(
@@ -2879,6 +2880,10 @@ def run_pipeline(
         if not use_external_eval_ckpt:
             mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
         obs_norm_source = "train_env"
+        print(
+            "[mm train] completed PPO training; best checkpoint path="
+            f"{mm_best_ckpt.expanduser().resolve()}"
+        )
     else:
         train_obs_norm_state = None
 
@@ -2926,8 +2931,18 @@ def run_pipeline(
         resolved_eval_ckpt = None
         rl_eval_performed = False
         rl_checkpoint_origin = "none"
-        print("[mm eval] baseline evaluated; RL eval skipped due to run mode train.")
+        print("[mm eval] baseline only; RL skipped because run_mode=train.")
     else:
+        if run_mode == "eval":
+            print(
+                "[mm eval] loading external RL checkpoint "
+                f"(origin={rl_checkpoint_origin}, path={resolved_eval_ckpt})"
+            )
+        elif run_mode == "train_eval" and rl_checkpoint_origin == "fresh_train":
+            print(
+                "[mm eval] using freshly trained checkpoint "
+                f"(origin={rl_checkpoint_origin}, path={resolved_eval_ckpt})"
+            )
         print(
             f"[mm eval] RL checkpoint source={rl_checkpoint_origin} path={resolved_eval_ckpt}"
         )
@@ -3064,7 +3079,10 @@ if __name__ == "__main__":
     print("[cmssl test]", report["cmssl_test"])
     print("[mm obs scaling]", report["mm_obs_scaling"])
     print("[mm baseline]", report["mm_baseline"])
-    print("[mm rl]", report["mm_rl"])
+    if report["mm_rl"] is None:
+        print("[mm rl] skipped (mm_rl is None)")
+    else:
+        print("[mm rl]", report["mm_rl"])
     if run_cmssl_test_window:
         print("[cmssl test window] running windowed inference for diagnostics.")
         test_window_report = run_cmssl_test_window_inference(out_root, ckpt_path, device=device)
