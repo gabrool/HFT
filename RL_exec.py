@@ -2455,6 +2455,8 @@ def evaluate_market_making(
     sortino_5m = compute_sortino(capital_returns_5m, 365.0 * 24.0 * 12.0)
     sortino_1h = compute_sortino(capital_returns_1h, 365.0 * 24.0)
     max_drawdown = compute_max_drawdown(equity_arr)
+    final_equity = float(equity_arr[-1]) if equity_arr.size > 0 else float(initial_equity)
+    pnl_curve = equity_arr - float(initial_equity)
     maker_fill_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
     taker_usage_frequency = float(taker_steps / steps) if steps > 0 else 0.0
     taker_volume_share = float(taker_notional / turnover_notional) if turnover_notional > 0 else 0.0
@@ -2468,7 +2470,10 @@ def evaluate_market_making(
     inventory_arr = np.array(inventory_curve, dtype=np.float32)
 
     return {
+        "initial_equity": float(initial_equity),
+        "final_equity": final_equity,
         "equity_curve": equity_arr,
+        "pnl_curve": pnl_curve,
         "sharpe": sharpe,
         "sharpe_5m": sharpe_5m,
         "sharpe_1h": sharpe_1h,
