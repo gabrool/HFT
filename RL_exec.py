@@ -289,7 +289,6 @@ def _resolve_eval_checkpoint(
     mm_best_ckpt: Path,
     external_rl_ckpt_raw: str,
     require_rl_ckpt: bool,
-    trained_this_run: bool,
 ) -> EvalCheckpointResolution:
     external_rl_ckpt = external_rl_ckpt_raw.strip()
     external_ckpt_explicit = bool(external_rl_ckpt)
@@ -2931,7 +2930,6 @@ def run_pipeline(
             mm_best_ckpt=mm_best_ckpt,
             external_rl_ckpt_raw=external_rl_ckpt,
             require_rl_ckpt=require_rl_ckpt,
-            trained_this_run=trained_this_run,
         )
         resolved_eval_ckpt = eval_ckpt_resolution.resolved_eval_ckpt
         rl_checkpoint_origin = eval_ckpt_resolution.checkpoint_origin
