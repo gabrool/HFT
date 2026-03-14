@@ -2803,7 +2803,7 @@ def run_pipeline(
 
     trained_this_run = False
     rl_eval_performed = False
-    rl_checkpoint_origin = "unresolved"
+    rl_checkpoint_origin = "none"
     external_rl_ckpt = os.environ.get("BYBIT_MM_RL_CKPT", "").strip()
     resolved_external_rl_ckpt = (
         str(Path(external_rl_ckpt).expanduser().resolve()) if external_rl_ckpt else None
@@ -2840,10 +2840,10 @@ def run_pipeline(
             if resolved_external_rl_ckpt is not None
             else str(mm_best_ckpt.expanduser().resolve())
         )
-        rl_checkpoint_origin = "external" if resolved_external_rl_ckpt is not None else "default"
+        rl_checkpoint_origin = "external" if resolved_external_rl_ckpt is not None else "none"
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
-    obs_norm_source = "none"
+    obs_norm_source = "env_default"
     eval_ckpt_payload = None
 
     use_external_eval_ckpt = run_mode == "eval" or (
@@ -2885,7 +2885,7 @@ def run_pipeline(
         if isinstance(eval_ckpt_payload, dict) and "obs_norm_state" in eval_ckpt_payload:
             eval_obs_norm_state = eval_ckpt_payload["obs_norm_state"]
             mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-            obs_norm_source = "eval_checkpoint"
+            obs_norm_source = "checkpoint"
         else:
             eval_obs_norm_state = None
             warnings.warn(
@@ -2923,6 +2923,7 @@ def run_pipeline(
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
         resolved_eval_ckpt = None
         rl_eval_performed = False
+        rl_checkpoint_origin = "none"
         print("[mm eval] baseline evaluated; RL eval skipped due to run mode train.")
     else:
         print(
@@ -2990,6 +2991,16 @@ def run_pipeline(
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
         "mm_baseline": baseline_metrics,
         "mm_rl": rl_metrics,
+        "mm_run_context": {
+            "run_mode": run_mode,
+            "ppo_trained_this_run": trained_this_run,
+            "ppo_best_ckpt_path": str(mm_best_ckpt.expanduser().resolve()),
+            "rl_eval_performed": rl_eval_performed,
+            "rl_checkpoint_origin": rl_checkpoint_origin,
+            "rl_checkpoint_path": resolved_eval_ckpt,
+            "external_rl_ckpt_requested": bool(external_rl_ckpt),
+            "obs_norm_source": obs_norm_source,
+        },
         "mm_run_state": {
             "trained_this_run": trained_this_run,
             "rl_eval_performed": rl_eval_performed,
@@ -3003,6 +3014,8 @@ def run_pipeline(
             "reason": rl_policy_reason,
             "path": resolved_eval_ckpt,
             "require_checkpoint": require_rl_ckpt,
+            "checkpoint_origin": rl_checkpoint_origin,
+            "trained_this_run": trained_this_run,
         },
     }
 
