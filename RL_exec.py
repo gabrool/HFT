@@ -261,6 +261,16 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
     return [int(item) for item in raw.split(",") if item.strip()]
 
 
+def _resolve_run_mode(default: str = "train") -> str:
+    """Resolve run mode: train (artifact generation), eval (external evaluation), train_eval (combined flow)."""
+    accepted_modes = {"train", "eval", "train_eval"}
+    mode = os.environ.get("BYBIT_MM_RUN_MODE", default).strip().lower()
+    if mode not in accepted_modes:
+        accepted = ", ".join(sorted(accepted_modes))
+        raise ValueError(f"Invalid BYBIT_MM_RUN_MODE='{mode}'. Accepted values: {accepted}")
+    return mode
+
+
 def _resolve_ppo_epochs(default: int) -> int:
     return _env_int(PPO_EPOCHS_ENV, default)
 
