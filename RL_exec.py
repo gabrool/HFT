@@ -2389,6 +2389,7 @@ def evaluate_market_making(
     turnover_notional = 0.0
     taker_notional = 0.0
     taker_fee_total = 0.0
+    maker_rebate_total = 0.0
     maker_fill_count = 0
     maker_opps = 0
     taker_steps = 0
@@ -2414,6 +2415,7 @@ def evaluate_market_making(
         turnover_notional += step_notional
         taker_notional += step_taker_notional
         taker_fee_total += float(info.get("taker_fee", 0.0))
+        maker_rebate_total += float(info.get("rebate", 0.0))
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
         maker_opps += 2
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
@@ -2456,7 +2458,13 @@ def evaluate_market_making(
     maker_fill_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
     taker_usage_frequency = float(taker_steps / steps) if steps > 0 else 0.0
     taker_volume_share = float(taker_notional / turnover_notional) if turnover_notional > 0 else 0.0
-    fee_drag = float(taker_fee_total / turnover_notional) if turnover_notional > 0 else 0.0
+    gross_taker_fees_paid = float(taker_fee_total)
+    gross_maker_rebates_earned = float(maker_rebate_total)
+    net_fee_cost = float(taker_fee_total - maker_rebate_total)
+    # Compatibility: fee_drag now reflects net fees (taker fees minus maker rebates).
+    fee_drag = float(net_fee_cost / turnover_notional) if turnover_notional > 0 else 0.0
+    net_fee_bps_on_turnover = float(1e4 * net_fee_cost / turnover_notional) if turnover_notional > 0 else 0.0
+    net_fee_pct_initial_equity = float(net_fee_cost / max(initial_equity, 1e-12))
     inventory_arr = np.array(inventory_curve, dtype=np.float32)
 
     return {
@@ -2472,6 +2480,11 @@ def evaluate_market_making(
         "maker_fill_rate": maker_fill_rate,
         "taker_usage_frequency": taker_usage_frequency,
         "taker_volume_share": taker_volume_share,
+        "gross_taker_fees_paid": gross_taker_fees_paid,
+        "gross_maker_rebates_earned": gross_maker_rebates_earned,
+        "net_fee_cost": net_fee_cost,
+        "net_fee_bps_on_turnover": net_fee_bps_on_turnover,
+        "net_fee_pct_initial_equity": net_fee_pct_initial_equity,
         "fee_drag": fee_drag,
         "inventory_distribution": _inventory_distribution(inventory_arr),
         "cadence": {
