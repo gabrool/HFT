@@ -2799,20 +2799,52 @@ def run_pipeline(
         mm_ppo_config.max_drawdown_guard = None
     mm_best_ckpt = Path(os.environ.get("BYBIT_MM_PPO_BEST_CKPT", Path(out_root) / "mm_ppo_best.pt"))
     require_rl_ckpt = _env_bool("BYBIT_MM_REQUIRE_RL_CKPT", False)
-    train_market_ppo(
-        mm_train_env,
-        mm_val_env,
-        mm_obs_dim,
-        device=device,
-        epochs=_resolve_ppo_epochs(ppo_epochs),
-        config=mm_ppo_config,
-        ckpt_path=mm_best_ckpt,
-        delta_scale=delta_scale,
-        taker_scale=taker_scale,
+
+    trained_this_run = False
+    rl_eval_performed = False
+    rl_checkpoint_origin = "unresolved"
+    external_rl_ckpt = os.environ.get("BYBIT_MM_RL_CKPT", "").strip()
+    resolved_external_rl_ckpt = (
+        str(Path(external_rl_ckpt).expanduser().resolve()) if external_rl_ckpt else None
     )
-    train_obs_norm_state = mm_train_env.get_obs_norm_state()
-    mm_val_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
-    mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
+    resolved_eval_ckpt = (
+        resolved_external_rl_ckpt
+        if resolved_external_rl_ckpt is not None
+        else str(mm_best_ckpt.expanduser().resolve())
+    )
+    rl_policy_loaded = False
+    rl_policy_reason = "not evaluated"
+    obs_norm_source = "none"
+
+    if run_mode in {"train", "train_eval"}:
+        train_market_ppo(
+            mm_train_env,
+            mm_val_env,
+            mm_obs_dim,
+            device=device,
+            epochs=_resolve_ppo_epochs(ppo_epochs),
+            config=mm_ppo_config,
+            ckpt_path=mm_best_ckpt,
+            delta_scale=delta_scale,
+            taker_scale=taker_scale,
+        )
+        trained_this_run = True
+        rl_checkpoint_origin = "trained_this_run" if resolved_external_rl_ckpt is None else "external"
+        train_obs_norm_state = mm_train_env.get_obs_norm_state()
+        mm_val_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
+        mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
+        obs_norm_source = "train_env"
+    else:
+        rl_checkpoint_origin = "external" if resolved_external_rl_ckpt is not None else "default"
+        train_obs_norm_state = None
+        eval_ckpt = Path(resolved_eval_ckpt)
+        if eval_ckpt.exists():
+            eval_ckpt_state = torch.load(eval_ckpt, map_location="cpu")
+            if isinstance(eval_ckpt_state, dict) and "obs_norm_state" in eval_ckpt_state:
+                train_obs_norm_state = eval_ckpt_state["obs_norm_state"]
+                mm_val_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
+                mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
+                obs_norm_source = "eval_checkpoint"
 
     baseline_env = MarketMakingEnv(
         mm_test_batch,
@@ -2834,15 +2866,12 @@ def run_pipeline(
     )
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
-    mm_policy_path = os.environ.get("BYBIT_MM_RL_CKPT", "").strip() or str(mm_best_ckpt)
-    resolved_mm_policy_path = str(Path(mm_policy_path).expanduser().resolve()) if mm_policy_path else None
-
-    if resolved_mm_policy_path is None:
+    if resolved_eval_ckpt is None:
         mm_policy = None
         rl_policy_reason = "no path provided"
-    elif not Path(resolved_mm_policy_path).exists():
+    elif not Path(resolved_eval_ckpt).exists():
         missing_msg = (
-            f"[mm eval] no checkpoint saved/found at {resolved_mm_policy_path}; "
+            f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; "
             "using baseline deltas for RL run."
         )
         if require_rl_ckpt:
@@ -2854,7 +2883,7 @@ def run_pipeline(
         mm_policy = load_market_policy(
             mm_obs_dim,
             device=device,
-            ckpt_path=resolved_mm_policy_path,
+            ckpt_path=resolved_eval_ckpt,
             require_checkpoint=require_rl_ckpt,
         )
         rl_policy_reason = "loaded" if mm_policy is not None else "missing checkpoint"
@@ -2880,6 +2909,7 @@ def run_pipeline(
             return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
 
     rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
+    rl_eval_performed = True
 
     print("[mm eval]", _format_mm_summary("baseline", baseline_metrics))
     print("[mm eval]", _format_mm_summary("baseline+rl", rl_metrics))
@@ -2889,10 +2919,18 @@ def run_pipeline(
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
         "mm_baseline": baseline_metrics,
         "mm_rl": rl_metrics,
+        "mm_run_state": {
+            "trained_this_run": trained_this_run,
+            "rl_eval_performed": rl_eval_performed,
+            "rl_checkpoint_origin": rl_checkpoint_origin,
+            "resolved_external_rl_ckpt": resolved_external_rl_ckpt,
+            "resolved_eval_ckpt": resolved_eval_ckpt,
+            "obs_norm_source": obs_norm_source,
+        },
         "mm_rl_policy_loaded": {
             "loaded": rl_policy_loaded,
             "reason": rl_policy_reason,
-            "path": resolved_mm_policy_path,
+            "path": resolved_eval_ckpt,
             "require_checkpoint": require_rl_ckpt,
         },
     }
