@@ -2518,13 +2518,19 @@ def run_pipeline(
     inv_soft_notional = float(inv_soft_notional_str)
     lambda_inv = float(os.environ.get("BYBIT_MM_LAMBDA_INV", "0.0"))
     lambda_turn = float(os.environ.get("BYBIT_MM_LAMBDA_TURN", "0.0"))
-    # Hard inventory cap in quote notional (USD).
+    # Soft threshold (reward penalty trigger) and hard pre-fill clipping cap, both in USD notionals.
     max_inventory_notional_str = os.environ.get("BYBIT_MM_MAX_INV_NOTIONAL", "").strip()
     if not max_inventory_notional_str:
         raise ValueError(
             "Missing required env var BYBIT_MM_MAX_INV_NOTIONAL (quote notional, USD)."
         )
     max_inventory_notional = float(max_inventory_notional_str)
+    hard_max_inventory_notional_str = os.environ.get("BYBIT_MM_HARD_MAX_INV_NOTIONAL", "").strip()
+    hard_max_inventory_notional = (
+        float(hard_max_inventory_notional_str)
+        if hard_max_inventory_notional_str
+        else float(max_inventory_notional)
+    )
     fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "1.0"))
@@ -2553,6 +2559,14 @@ def run_pipeline(
         raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be > 0 (quote notional, USD).")
     if max_inventory_notional < inv_soft_notional:
         raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be >= BYBIT_MM_INV_SOFT_NOTIONAL.")
+    if not np.isfinite(hard_max_inventory_notional) or hard_max_inventory_notional <= 0.0:
+        raise ValueError(
+            "BYBIT_MM_HARD_MAX_INV_NOTIONAL must be finite and > 0 (quote notional, USD)."
+        )
+    if hard_max_inventory_notional < max_inventory_notional:
+        raise ValueError(
+            "BYBIT_MM_HARD_MAX_INV_NOTIONAL must be >= BYBIT_MM_MAX_INV_NOTIONAL."
+        )
     if lambda_inv > 0.0 and inv_soft_notional > 0.0:
         print(
             "[mm config warning]",
@@ -2573,6 +2587,7 @@ def run_pipeline(
         lambda_inv=lambda_inv,
         lambda_turn=lambda_turn,
         max_inventory_notional=max_inventory_notional,
+        hard_max_inventory_notional=hard_max_inventory_notional,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
@@ -2591,6 +2606,7 @@ def run_pipeline(
         lambda_inv=lambda_inv,
         lambda_turn=lambda_turn,
         max_inventory_notional=max_inventory_notional,
+        hard_max_inventory_notional=hard_max_inventory_notional,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
@@ -2606,6 +2622,7 @@ def run_pipeline(
         lambda_inv=lambda_inv,
         lambda_turn=lambda_turn,
         max_inventory_notional=max_inventory_notional,
+        hard_max_inventory_notional=hard_max_inventory_notional,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
@@ -2659,6 +2676,7 @@ def run_pipeline(
         lambda_inv=lambda_inv,
         lambda_turn=lambda_turn,
         max_inventory_notional=max_inventory_notional,
+        hard_max_inventory_notional=hard_max_inventory_notional,
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
