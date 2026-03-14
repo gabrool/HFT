@@ -281,7 +281,6 @@ class EvalCheckpointResolution:
     checkpoint_origin: str
     external_ckpt_explicit: bool
     checkpoint_payload: Optional[Dict[str, Any]]
-    rl_eval_expected: bool
 
 
 def _resolve_eval_checkpoint(
@@ -316,7 +315,6 @@ def _resolve_eval_checkpoint(
             checkpoint_origin="external",
             external_ckpt_explicit=external_ckpt_explicit,
             checkpoint_payload=torch.load(Path(resolved_eval_ckpt), map_location="cpu"),
-            rl_eval_expected=True,
         )
 
     if run_mode == "train_eval":
@@ -337,14 +335,12 @@ def _resolve_eval_checkpoint(
                 checkpoint_origin="external",
                 external_ckpt_explicit=external_ckpt_explicit,
                 checkpoint_payload=torch.load(Path(resolved_eval_ckpt), map_location="cpu"),
-                rl_eval_expected=True,
             )
         return EvalCheckpointResolution(
             resolved_eval_ckpt=mm_best_ckpt_resolved,
             checkpoint_origin="fresh_train",
             external_ckpt_explicit=external_ckpt_explicit,
             checkpoint_payload=None,
-            rl_eval_expected=True,
         )
 
     return EvalCheckpointResolution(
@@ -356,7 +352,6 @@ def _resolve_eval_checkpoint(
         checkpoint_origin="external" if resolved_external_rl_ckpt is not None else "none",
         external_ckpt_explicit=external_ckpt_explicit,
         checkpoint_payload=None,
-        rl_eval_expected=False,
     )
 
 
