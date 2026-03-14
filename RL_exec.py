@@ -2503,17 +2503,22 @@ def evaluate_market_making(
 
 
 def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
-    inv = metrics["inventory_distribution"]
+    inv = metrics.get("inventory_distribution") or {}
     return (
-        f"{label}: sharpe={metrics['sharpe']:.4f} "
-        f"max_dd={metrics['max_drawdown']:.4f} "
-        f"turnover_notional={metrics['turnover_notional']:.4f} "
-        f"turnover_qty={metrics['turnover_qty']:.4f} "
-        f"maker_fill_rate={metrics['maker_fill_rate']:.4f} "
-        f"taker_usage_freq={metrics['taker_usage_frequency']:.4f} "
-        f"taker_volume_share={metrics['taker_volume_share']:.4f} "
-        f"fee_drag={metrics['fee_drag']:.4f} "
-        f"inv[min={inv['min']:.2f}, p50={inv['p50']:.2f}, max={inv['max']:.2f}]"
+        f"{label}: sharpe={float(metrics.get('sharpe', 0.0)):.4f} "
+        f"sharpe_5m={float(metrics.get('sharpe_5m', 0.0)):.4f} "
+        f"sharpe_1h={float(metrics.get('sharpe_1h', 0.0)):.4f} "
+        f"sortino_5m={float(metrics.get('sortino_5m', 0.0)):.4f} "
+        f"sortino_1h={float(metrics.get('sortino_1h', 0.0)):.4f} "
+        f"max_dd={float(metrics.get('max_drawdown', 0.0)):.4f} "
+        f"turnover_notional={float(metrics.get('turnover_notional', 0.0)):.4f} "
+        f"turnover_qty={float(metrics.get('turnover_qty', 0.0)):.4f} "
+        f"maker_fill_rate={float(metrics.get('maker_fill_rate', 0.0)):.4f} "
+        f"taker_usage_freq={float(metrics.get('taker_usage_frequency', 0.0)):.4f} "
+        f"taker_volume_share={float(metrics.get('taker_volume_share', 0.0)):.4f} "
+        f"fee_drag={float(metrics.get('fee_drag', 0.0)):.4f} "
+        f"net_fee_bps_on_turnover={float(metrics.get('net_fee_bps_on_turnover', 0.0)):.4f} "
+        f"inv[min={float(inv.get('min', 0.0)):.2f}, p50={float(inv.get('p50', 0.0)):.2f}, max={float(inv.get('max', 0.0)):.2f}]"
     )
 
 
