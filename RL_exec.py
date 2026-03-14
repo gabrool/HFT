@@ -3009,24 +3009,20 @@ def run_pipeline(
     rl_metrics = None
     print("[mm eval]", _format_mm_summary("baseline", baseline_metrics))
 
+    eval_action = "skipped" if run_mode == "train" else "performed"
+    print(
+        "[mm eval] "
+        f"mode={run_mode} "
+        f"checkpoint_origin={rl_checkpoint_origin} "
+        f"resolved_path={resolved_eval_ckpt if resolved_eval_ckpt is not None else 'none'} "
+        f"eval_action={eval_action}"
+    )
+
     if run_mode == "train":
         rl_policy_loaded = False
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
         print("[mm eval] baseline only; RL skipped because run_mode=train.")
     else:
-        if run_mode == "eval":
-            print(
-                "[mm eval] loading external RL checkpoint "
-                f"(origin={rl_checkpoint_origin}, path={resolved_eval_ckpt})"
-            )
-        elif run_mode == "train_eval" and rl_checkpoint_origin == "fresh_train":
-            print(
-                "[mm eval] using freshly trained checkpoint "
-                f"(origin={rl_checkpoint_origin}, path={resolved_eval_ckpt})"
-            )
-        print(
-            f"[mm eval] RL checkpoint source={rl_checkpoint_origin} path={resolved_eval_ckpt}"
-        )
         if run_mode == "eval":
             mm_policy = load_market_policy(
                 mm_obs_dim,
