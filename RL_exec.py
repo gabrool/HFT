@@ -2251,6 +2251,8 @@ def train_market_ppo(
                 delta_scale=delta_scale,
                 taker_scale=taker_scale,
             )
+            # Keep legacy step-level Sharpe as the checkpoint selector in this
+            # patch; newer metrics are additive diagnostics only.
             sharpe = report["sharpe"]
             drawdown = report["max_drawdown"]
             guard = config.max_drawdown_guard
