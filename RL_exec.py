@@ -1569,16 +1569,18 @@ class MarketMakingEnv:
         sell_fill = 0.0
         self.last_maker_buy_clipped = 0.0
         self.last_maker_sell_clipped = 0.0
+        # Hard inventory cap is defined in quote notional and converted to base qty using midpoint for symmetric long/short treatment.
+        mid_for_cap = self._mid_price(idx)
         # Evaluate fills against the next snapshot's opposite side.
         if best_ask_next <= bid + self.fill_tolerance:
             requested_buy = self.fill_size
-            clipped_buy = self._clip_fill_qty(1, requested_buy, bid)
+            clipped_buy = self._clip_fill_qty(1, requested_buy, mid_for_cap)
             self.last_maker_buy_clipped = requested_buy - clipped_buy
             buy_fill = self._apply_signed_fill(1, clipped_buy, bid)
         # Keep deterministic buy-then-sell processing; second fill sees updated inventory.
         if best_bid_next >= ask - self.fill_tolerance:
             requested_sell = self.fill_size
-            clipped_sell = self._clip_fill_qty(-1, requested_sell, ask)
+            clipped_sell = self._clip_fill_qty(-1, requested_sell, mid_for_cap)
             self.last_maker_sell_clipped = requested_sell - clipped_sell
             sell_fill = self._apply_signed_fill(-1, clipped_sell, ask)
         # Heuristic: if we're at the touch and the next best moves away, we got hit.
@@ -1586,13 +1588,13 @@ class MarketMakingEnv:
         if buy_fill == 0.0 and abs(bid - best_bid_prev) <= touch_tolerance:
             if best_bid_next < best_bid_prev - touch_epsilon:
                 requested_buy = self.fill_size
-                clipped_buy = self._clip_fill_qty(1, requested_buy, bid)
+                clipped_buy = self._clip_fill_qty(1, requested_buy, mid_for_cap)
                 self.last_maker_buy_clipped = requested_buy - clipped_buy
                 buy_fill = self._apply_signed_fill(1, clipped_buy, bid)
         if sell_fill == 0.0 and abs(ask - best_ask_prev) <= touch_tolerance:
             if best_ask_next > best_ask_prev + touch_epsilon:
                 requested_sell = self.fill_size
-                clipped_sell = self._clip_fill_qty(-1, requested_sell, ask)
+                clipped_sell = self._clip_fill_qty(-1, requested_sell, mid_for_cap)
                 self.last_maker_sell_clipped = requested_sell - clipped_sell
                 sell_fill = self._apply_signed_fill(-1, clipped_sell, ask)
         return buy_fill, sell_fill
@@ -1606,16 +1608,18 @@ class MarketMakingEnv:
             return 0.0, 0.0
         best_bid = float(self.best_bid[idx])
         best_ask = float(self.best_ask[idx])
+        # Hard inventory cap is defined in quote notional and converted to base qty using midpoint for symmetric long/short treatment.
+        mid_for_cap = self._mid_price(idx)
         buy_fill = 0.0
         sell_fill = 0.0
         if taker_signal > 0.0:
             requested_buy = self.fill_size
-            clipped_buy = self._clip_fill_qty(1, requested_buy, best_ask)
+            clipped_buy = self._clip_fill_qty(1, requested_buy, mid_for_cap)
             self.last_taker_buy_clipped = requested_buy - clipped_buy
             buy_fill = self._apply_signed_fill(1, clipped_buy, best_ask)
         elif taker_signal < 0.0:
             requested_sell = self.fill_size
-            clipped_sell = self._clip_fill_qty(-1, requested_sell, best_bid)
+            clipped_sell = self._clip_fill_qty(-1, requested_sell, mid_for_cap)
             self.last_taker_sell_clipped = requested_sell - clipped_sell
             sell_fill = self._apply_signed_fill(-1, clipped_sell, best_bid)
         return buy_fill, sell_fill
@@ -1822,11 +1826,11 @@ class MarketMakingEnv:
             "inventory_excess_notional": float(excess_notional),
             "inventory_penalty_total": float(inventory_penalty_total),
             "turnover_penalty": float(turnover_penalty),
-            "mid": float(mid),
+            "mid": float(mid_next),
             "hard_max_inventory_notional": float(self.hard_max_inventory_notional),
-            "hard_cap_qty": float(self._inventory_cap_qty(mid)),
-            "buy_room_qty": float(self._remaining_inventory_room(1, mid)),
-            "sell_room_qty": float(self._remaining_inventory_room(-1, mid)),
+            "hard_cap_qty": float(self._inventory_cap_qty(mid_next)),
+            "buy_room_qty": float(self._remaining_inventory_room(1, mid_next)),
+            "sell_room_qty": float(self._remaining_inventory_room(-1, mid_next)),
             "bid": float(bid),
             "ask": float(ask),
             "bid_delta_bps": float(bid_delta_bps),
