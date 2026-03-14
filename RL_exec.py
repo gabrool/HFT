@@ -2887,25 +2887,32 @@ def run_pipeline(
     mm_best_ckpt = Path(os.environ.get("BYBIT_MM_PPO_BEST_CKPT", Path(out_root) / "mm_ppo_best.pt"))
     require_rl_ckpt = _env_bool("BYBIT_MM_REQUIRE_RL_CKPT", False)
     external_rl_ckpt = os.environ.get("BYBIT_MM_RL_CKPT", "")
+    external_ckpt_explicit = bool(external_rl_ckpt.strip())
 
     trained_this_run = False
-    rl_eval_performed = False
-    eval_ckpt_resolution = _resolve_eval_checkpoint(
-        run_mode=run_mode,
-        mm_best_ckpt=mm_best_ckpt,
-        external_rl_ckpt_raw=external_rl_ckpt,
-        require_rl_ckpt=require_rl_ckpt,
-        trained_this_run=trained_this_run,
-    )
-    resolved_eval_ckpt = eval_ckpt_resolution.resolved_eval_ckpt
-    rl_checkpoint_origin = eval_ckpt_resolution.checkpoint_origin
-    external_ckpt_explicit = eval_ckpt_resolution.external_ckpt_explicit
+    if run_mode == "train":
+        resolved_eval_ckpt = None
+        rl_checkpoint_origin = "none"
+        eval_ckpt_payload = None
+        use_external_eval_ckpt = False
+        rl_eval_performed = False
+    else:
+        eval_ckpt_resolution = _resolve_eval_checkpoint(
+            run_mode=run_mode,
+            mm_best_ckpt=mm_best_ckpt,
+            external_rl_ckpt_raw=external_rl_ckpt,
+            require_rl_ckpt=require_rl_ckpt,
+            trained_this_run=trained_this_run,
+        )
+        resolved_eval_ckpt = eval_ckpt_resolution.resolved_eval_ckpt
+        rl_checkpoint_origin = eval_ckpt_resolution.checkpoint_origin
+        external_ckpt_explicit = eval_ckpt_resolution.external_ckpt_explicit
+        eval_ckpt_payload = eval_ckpt_resolution.checkpoint_payload
+        use_external_eval_ckpt = rl_checkpoint_origin == "external"
+
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
     obs_norm_source = "env_default"
-    eval_ckpt_payload = eval_ckpt_resolution.checkpoint_payload
-
-    use_external_eval_ckpt = rl_checkpoint_origin == "external"
 
     if run_mode in {"train", "train_eval"}:
         print(f"[mm train] starting PPO training (run_mode={run_mode})")
@@ -2976,9 +2983,6 @@ def run_pipeline(
     if run_mode == "train":
         rl_policy_loaded = False
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
-        resolved_eval_ckpt = None
-        rl_eval_performed = False
-        rl_checkpoint_origin = "none"
         print("[mm eval] baseline only; RL skipped because run_mode=train.")
     else:
         if run_mode == "eval":
@@ -3068,7 +3072,7 @@ def run_pipeline(
             "external_rl_ckpt_explicit": external_ckpt_explicit,
             "external_rl_ckpt_resolved_path": (
                 str(Path(external_rl_ckpt.strip()).expanduser().resolve())
-                if external_rl_ckpt.strip()
+                if run_mode != "train" and external_rl_ckpt.strip()
                 else None
             ),
             "obs_norm_source": obs_norm_source,
