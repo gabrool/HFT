@@ -3029,24 +3029,15 @@ def run_pipeline(
             "rl_checkpoint_path": resolved_eval_ckpt,
             "external_rl_ckpt_requested": bool(external_rl_ckpt),
             "external_rl_ckpt_explicit": external_ckpt_explicit,
+            "external_rl_ckpt_resolved_path": resolved_external_rl_ckpt,
             "obs_norm_source": obs_norm_source,
-        },
-        "mm_run_state": {
-            "trained_this_run": trained_this_run,
-            "rl_eval_performed": rl_eval_performed,
-            "rl_checkpoint_origin": rl_checkpoint_origin,
-            "resolved_external_rl_ckpt": resolved_external_rl_ckpt,
-            "resolved_eval_ckpt": resolved_eval_ckpt,
-            "obs_norm_source": obs_norm_source,
+            "require_rl_ckpt": require_rl_ckpt,
         },
         "mm_rl_policy_loaded": {
             "loaded": rl_policy_loaded,
             "reason": rl_policy_reason,
             "path": resolved_eval_ckpt,
             "require_checkpoint": require_rl_ckpt,
-            "external_rl_ckpt_explicit": external_ckpt_explicit,
-            "checkpoint_origin": rl_checkpoint_origin,
-            "trained_this_run": trained_this_run,
         },
     }
 
