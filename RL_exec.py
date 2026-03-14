@@ -2576,6 +2576,7 @@ def load_market_policy(
     device: str = "cuda",
     ckpt_path: Optional[str] = None,
     require_checkpoint: bool = False,
+    checkpoint_data: Optional[Any] = None,
 ) -> Optional[MarketPolicyNet]:
     """Load a deterministic market policy (mean-action inference only)."""
     if not ckpt_path:
@@ -2589,7 +2590,7 @@ def load_market_policy(
             RuntimeWarning,
         )
         return None
-    ckpt = torch.load(path, map_location=device)
+    ckpt = checkpoint_data if checkpoint_data is not None else torch.load(path, map_location=device)
     if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
         state = ckpt["policy_state_dict"]
     else:
@@ -2843,6 +2844,20 @@ def run_pipeline(
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
     obs_norm_source = "none"
+    eval_ckpt_payload = None
+
+    use_external_eval_ckpt = run_mode == "eval" or (
+        run_mode == "train_eval" and rl_checkpoint_origin == "external"
+    )
+    if use_external_eval_ckpt and resolved_eval_ckpt:
+        eval_ckpt_path = Path(resolved_eval_ckpt)
+        if eval_ckpt_path.exists():
+            eval_ckpt_payload = torch.load(eval_ckpt_path, map_location="cpu")
+        elif run_mode == "eval":
+            # Preserve strict eval-mode contract while keeping explicit behavior local.
+            raise FileNotFoundError(
+                f"BYBIT_MM_RL_CKPT does not exist for run_mode=eval: {resolved_eval_ckpt}"
+            )
 
     if run_mode in {"train", "train_eval"}:
         train_market_ppo(
@@ -2859,18 +2874,26 @@ def run_pipeline(
         trained_this_run = True
         train_obs_norm_state = mm_train_env.get_obs_norm_state()
         mm_val_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
-        mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
+        if not use_external_eval_ckpt:
+            mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
         obs_norm_source = "train_env"
     else:
         train_obs_norm_state = None
-        eval_ckpt = Path(resolved_eval_ckpt)
-        if eval_ckpt.exists():
-            eval_ckpt_state = torch.load(eval_ckpt, map_location="cpu")
-            if isinstance(eval_ckpt_state, dict) and "obs_norm_state" in eval_ckpt_state:
-                train_obs_norm_state = eval_ckpt_state["obs_norm_state"]
-                mm_val_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
-                mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
-                obs_norm_source = "eval_checkpoint"
+
+    eval_obs_norm_state = train_obs_norm_state
+    if use_external_eval_ckpt:
+        if isinstance(eval_ckpt_payload, dict) and "obs_norm_state" in eval_ckpt_payload:
+            eval_obs_norm_state = eval_ckpt_payload["obs_norm_state"]
+            mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+            obs_norm_source = "eval_checkpoint"
+        else:
+            eval_obs_norm_state = None
+            warnings.warn(
+                "External RL checkpoint missing obs_norm_state; using environment default "
+                "normalization for compatibility.",
+                RuntimeWarning,
+            )
+            obs_norm_source = "env_default"
 
     baseline_env = MarketMakingEnv(
         mm_test_batch,
@@ -2887,9 +2910,9 @@ def run_pipeline(
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
-        obs_norm_state=train_obs_norm_state,
-        freeze_obs_norm=True,
     )
+    if eval_obs_norm_state is not None:
+        baseline_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
 
     rl_metrics = None
@@ -2911,6 +2934,7 @@ def run_pipeline(
                 device=device,
                 ckpt_path=resolved_eval_ckpt,
                 require_checkpoint=True,
+                checkpoint_data=eval_ckpt_payload,
             )
             require(mm_policy is not None, "Failed to load eval policy checkpoint")
             rl_policy_reason = "loaded"
@@ -2933,6 +2957,7 @@ def run_pipeline(
                 device=device,
                 ckpt_path=resolved_eval_ckpt,
                 require_checkpoint=require_rl_ckpt,
+                checkpoint_data=eval_ckpt_payload,
             )
             rl_policy_reason = "loaded" if mm_policy is not None else "missing checkpoint"
 
