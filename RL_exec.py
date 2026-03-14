@@ -1063,6 +1063,7 @@ class MarketMakingEnv:
         lambda_inv: float = 0.0,
         lambda_turn: float = 0.0,
         max_inventory_notional: float,
+        hard_max_inventory_notional: Optional[float] = None,
         fill_size: float = 1.0,
         fill_tolerance: float = 1e-6,
         delta_bps_limit: float = 0.0,
@@ -1091,6 +1092,23 @@ class MarketMakingEnv:
         self.lambda_turn = lambda_turn
         self.stack_inventory_penalties = _env_bool("BYBIT_MM_STACK_INVENTORY_PENALTIES", False)
         self.max_inventory_notional = max_inventory_notional
+        # Hard cap (if explicitly set) must be >= soft maker/taker control cap.
+        self.hard_max_inventory_notional = (
+            float(hard_max_inventory_notional)
+            if hard_max_inventory_notional is not None
+            else float(max_inventory_notional)
+        )
+        if (
+            not np.isfinite(self.hard_max_inventory_notional)
+            or self.hard_max_inventory_notional <= 0.0
+        ):
+            raise ValueError(
+                "hard_max_inventory_notional must be finite and > 0 in quote notional (USD)."
+            )
+        if self.hard_max_inventory_notional < self.max_inventory_notional:
+            raise ValueError(
+                "hard_max_inventory_notional must be >= max_inventory_notional."
+            )
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
         self.delta_bps_limit = float(delta_bps_limit)
@@ -1203,6 +1221,10 @@ class MarketMakingEnv:
         self.ema_gross_fill_notional = 0.0
         self.ema_maker_buy_markout = 0.0
         self.ema_maker_sell_markout = 0.0
+        self.last_maker_buy_clipped = 0.0
+        self.last_maker_sell_clipped = 0.0
+        self.last_taker_buy_clipped = 0.0
+        self.last_taker_sell_clipped = 0.0
         self._obs_count = 0
         self._obs_mean: Optional[np.ndarray] = None
         self._obs_m2: Optional[np.ndarray] = None
@@ -1235,6 +1257,10 @@ class MarketMakingEnv:
         self.ema_gross_fill_notional = 0.0
         self.ema_maker_buy_markout = 0.0
         self.ema_maker_sell_markout = 0.0
+        self.last_maker_buy_clipped = 0.0
+        self.last_maker_sell_clipped = 0.0
+        self.last_taker_buy_clipped = 0.0
+        self.last_taker_sell_clipped = 0.0
         mid = self._mid_price(self.idx)
         self.prev_equity = self.cash + self.inventory * mid
         return self._build_observation(self.idx)
@@ -1508,6 +1534,31 @@ class MarketMakingEnv:
             ask = best_ask
         return bid, ask
 
+    def _inventory_cap_qty(self, mid: float) -> float:
+        return self.hard_max_inventory_notional / max(mid, 1e-12)
+
+    def _remaining_inventory_room(self, side: int, mid: float) -> float:
+        cap_qty = self._inventory_cap_qty(mid)
+        if side > 0:
+            return max(0.0, cap_qty - self.inventory)
+        if side < 0:
+            return max(0.0, cap_qty + self.inventory)
+        raise ValueError("side must be +1 (buy) or -1 (sell).")
+
+    def _clip_fill_qty(self, side: int, requested_qty: float, mid: float) -> float:
+        if requested_qty <= 0.0:
+            return 0.0
+        room_qty = self._remaining_inventory_room(side, mid)
+        return float(min(requested_qty, room_qty))
+
+    def _apply_signed_fill(self, side: int, qty: float, price: float) -> float:
+        if qty <= 0.0:
+            return 0.0
+        signed_qty = float(side) * float(qty)
+        self.cash -= price * signed_qty
+        self.inventory += signed_qty
+        return float(qty)
+
     def _apply_fills(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         touch_epsilon = 1e-9
         best_bid_next = float(self.best_bid[idx])
@@ -1516,30 +1567,39 @@ class MarketMakingEnv:
         best_ask_prev = float(self.best_ask[idx - 1]) if idx > 0 else best_ask_next
         buy_fill = 0.0
         sell_fill = 0.0
+        self.last_maker_buy_clipped = 0.0
+        self.last_maker_sell_clipped = 0.0
         # Evaluate fills against the next snapshot's opposite side.
         if best_ask_next <= bid + self.fill_tolerance:
-            buy_fill = self.fill_size
-            self.cash -= bid * buy_fill
-            self.inventory += buy_fill
+            requested_buy = self.fill_size
+            clipped_buy = self._clip_fill_qty(1, requested_buy, bid)
+            self.last_maker_buy_clipped = requested_buy - clipped_buy
+            buy_fill = self._apply_signed_fill(1, clipped_buy, bid)
+        # Keep deterministic buy-then-sell processing; second fill sees updated inventory.
         if best_bid_next >= ask - self.fill_tolerance:
-            sell_fill = self.fill_size
-            self.cash += ask * sell_fill
-            self.inventory -= sell_fill
+            requested_sell = self.fill_size
+            clipped_sell = self._clip_fill_qty(-1, requested_sell, ask)
+            self.last_maker_sell_clipped = requested_sell - clipped_sell
+            sell_fill = self._apply_signed_fill(-1, clipped_sell, ask)
         # Heuristic: if we're at the touch and the next best moves away, we got hit.
         touch_tolerance = max(self.fill_tolerance, touch_epsilon)
         if buy_fill == 0.0 and abs(bid - best_bid_prev) <= touch_tolerance:
             if best_bid_next < best_bid_prev - touch_epsilon:
-                buy_fill = self.fill_size
-                self.cash -= bid * buy_fill
-                self.inventory += buy_fill
+                requested_buy = self.fill_size
+                clipped_buy = self._clip_fill_qty(1, requested_buy, bid)
+                self.last_maker_buy_clipped = requested_buy - clipped_buy
+                buy_fill = self._apply_signed_fill(1, clipped_buy, bid)
         if sell_fill == 0.0 and abs(ask - best_ask_prev) <= touch_tolerance:
             if best_ask_next > best_ask_prev + touch_epsilon:
-                sell_fill = self.fill_size
-                self.cash += ask * sell_fill
-                self.inventory -= sell_fill
+                requested_sell = self.fill_size
+                clipped_sell = self._clip_fill_qty(-1, requested_sell, ask)
+                self.last_maker_sell_clipped = requested_sell - clipped_sell
+                sell_fill = self._apply_signed_fill(-1, clipped_sell, ask)
         return buy_fill, sell_fill
 
     def _apply_taker(self, idx: int, taker_signal: float) -> Tuple[float, float]:
+        self.last_taker_buy_clipped = 0.0
+        self.last_taker_sell_clipped = 0.0
         if not self.allow_taker:
             return 0.0, 0.0
         if abs(taker_signal) < self.taker_threshold:
@@ -1549,13 +1609,15 @@ class MarketMakingEnv:
         buy_fill = 0.0
         sell_fill = 0.0
         if taker_signal > 0.0:
-            buy_fill = self.fill_size
-            self.cash -= best_ask * buy_fill
-            self.inventory += buy_fill
+            requested_buy = self.fill_size
+            clipped_buy = self._clip_fill_qty(1, requested_buy, best_ask)
+            self.last_taker_buy_clipped = requested_buy - clipped_buy
+            buy_fill = self._apply_signed_fill(1, clipped_buy, best_ask)
         elif taker_signal < 0.0:
-            sell_fill = self.fill_size
-            self.cash += best_bid * sell_fill
-            self.inventory -= sell_fill
+            requested_sell = self.fill_size
+            clipped_sell = self._clip_fill_qty(-1, requested_sell, best_bid)
+            self.last_taker_sell_clipped = requested_sell - clipped_sell
+            sell_fill = self._apply_signed_fill(-1, clipped_sell, best_bid)
         return buy_fill, sell_fill
 
 
@@ -1608,6 +1670,7 @@ class MarketMakingEnv:
         next_idx = self.idx + 1
         if next_idx >= self.n:
             mid = self._mid_price(self.idx)
+            hard_cap_qty = self._inventory_cap_qty(mid)
             equity = self.cash + self.inventory * mid
             info = {
                 "reward": 0.0,
@@ -1623,6 +1686,10 @@ class MarketMakingEnv:
                 "inventory_excess_notional": 0.0,
                 "turnover_penalty": 0.0,
                 "mid": float(mid),
+                "hard_max_inventory_notional": float(self.hard_max_inventory_notional),
+                "hard_cap_qty": float(hard_cap_qty),
+                "buy_room_qty": float(self._remaining_inventory_room(1, mid)),
+                "sell_room_qty": float(self._remaining_inventory_room(-1, mid)),
                 "bid": 0.0,
                 "ask": 0.0,
                 "maker_buy": 0.0,
@@ -1644,6 +1711,10 @@ class MarketMakingEnv:
                 "maker_sell_markout": 0.0,
                 "ema_maker_buy_markout": float(self.ema_maker_buy_markout),
                 "ema_maker_sell_markout": float(self.ema_maker_sell_markout),
+                "maker_buy_clipped": float(self.last_maker_buy_clipped),
+                "maker_sell_clipped": float(self.last_maker_sell_clipped),
+                "taker_buy_clipped": float(self.last_taker_buy_clipped),
+                "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
             return self._build_observation(self.idx), 0.0, True, info
         bid_delta_bps, ask_delta_bps, taker_signal = self._parse_action(action)
@@ -1752,6 +1823,10 @@ class MarketMakingEnv:
             "inventory_penalty_total": float(inventory_penalty_total),
             "turnover_penalty": float(turnover_penalty),
             "mid": float(mid),
+            "hard_max_inventory_notional": float(self.hard_max_inventory_notional),
+            "hard_cap_qty": float(self._inventory_cap_qty(mid)),
+            "buy_room_qty": float(self._remaining_inventory_room(1, mid)),
+            "sell_room_qty": float(self._remaining_inventory_room(-1, mid)),
             "bid": float(bid),
             "ask": float(ask),
             "bid_delta_bps": float(bid_delta_bps),
@@ -1775,6 +1850,10 @@ class MarketMakingEnv:
             "maker_sell_markout": float(maker_sell_markout),
             "ema_maker_buy_markout": float(self.ema_maker_buy_markout),
             "ema_maker_sell_markout": float(self.ema_maker_sell_markout),
+            "maker_buy_clipped": float(self.last_maker_buy_clipped),
+            "maker_sell_clipped": float(self.last_maker_sell_clipped),
+            "taker_buy_clipped": float(self.last_taker_buy_clipped),
+            "taker_sell_clipped": float(self.last_taker_sell_clipped),
         }
         return next_obs, float(reward), done, info
 
