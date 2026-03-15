@@ -275,6 +275,16 @@ def _resolve_ppo_epochs(default: int) -> int:
     return _env_int(PPO_EPOCHS_ENV, default)
 
 
+def _torch_load_trusted_checkpoint(path, map_location):
+    """
+    Load a trusted project checkpoint with full pickle semantics.
+
+    PyTorch 2.6+ defaults torch.load to weights_only=True, which breaks rich
+    PPO checkpoints that intentionally include non-weight metadata.
+    """
+    return torch.load(path, map_location=map_location, weights_only=False)
+
+
 @dataclass(frozen=True)
 class EvalCheckpointResolution:
     resolved_eval_ckpt: Optional[str]
@@ -314,7 +324,10 @@ def _resolve_eval_checkpoint(
             resolved_eval_ckpt=resolved_eval_ckpt,
             checkpoint_origin="external",
             external_ckpt_explicit=external_ckpt_explicit,
-            checkpoint_payload=torch.load(Path(resolved_eval_ckpt), map_location="cpu"),
+            checkpoint_payload=_torch_load_trusted_checkpoint(
+                Path(resolved_eval_ckpt),
+                map_location="cpu",
+            ),
         )
 
     if run_mode == "train_eval":
@@ -334,7 +347,10 @@ def _resolve_eval_checkpoint(
                 resolved_eval_ckpt=resolved_eval_ckpt,
                 checkpoint_origin="external",
                 external_ckpt_explicit=external_ckpt_explicit,
-                checkpoint_payload=torch.load(Path(resolved_eval_ckpt), map_location="cpu"),
+                checkpoint_payload=_torch_load_trusted_checkpoint(
+                    Path(resolved_eval_ckpt),
+                    map_location="cpu",
+                ),
             )
         return EvalCheckpointResolution(
             resolved_eval_ckpt=mm_best_ckpt_resolved,
@@ -2699,7 +2715,11 @@ def load_market_policy(
             RuntimeWarning,
         )
         return None
-    ckpt = checkpoint_data if checkpoint_data is not None else torch.load(path, map_location=device)
+    ckpt = (
+        checkpoint_data
+        if checkpoint_data is not None
+        else _torch_load_trusted_checkpoint(path, map_location=device)
+    )
     if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
         state = ckpt["policy_state_dict"]
     else:
