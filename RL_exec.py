@@ -2287,6 +2287,14 @@ def ppo_update_market(
     terminals = rollout["terminated"]
 
     advantages, returns = compute_gae(rewards, values, next_values, terminals, config.gamma, config.gae_lambda)
+    # Reuse a fixed per-dimension action scale across minibatches; broadcasting
+    # applies it over the batch dimension.
+    action_dim = int(actions.shape[-1])
+    action_scale = torch.ones(action_dim, device=device, dtype=torch.float32)
+    action_scale[:2] = delta_scale
+    if action_dim >= 3:
+        action_scale[2] = taker_scale
+
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     n = obs.shape[0]
@@ -2303,11 +2311,6 @@ def ppo_update_market(
 
             mean, log_std, value = model(mb_obs)
             std = log_std.exp()
-
-            action_scale = torch.ones_like(mean)
-            action_scale[..., :2] = delta_scale
-            if action_scale.shape[-1] >= 3:
-                action_scale[..., 2] = taker_scale
 
             mean_env = mean * action_scale
             std_env = std * action_scale
