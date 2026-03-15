@@ -273,6 +273,24 @@ def _resolve_cmssl_batch_size(default: int = 256) -> int:
     return _env_int("BYBIT_MM_CMSSL_BATCH_SIZE", default)
 
 
+def _resolve_rollout_storage(default: str = "gpu") -> str:
+    storage = os.environ.get("BYBIT_MM_ROLLOUT_STORAGE", default).strip().lower()
+    allowed = {"gpu", "cpu"}
+    if storage not in allowed:
+        raise ValueError(
+            f"Invalid BYBIT_MM_ROLLOUT_STORAGE='{storage}'. Allowed values: {sorted(allowed)}"
+        )
+    return storage
+
+
+def _configure_tf32_from_env() -> bool:
+    enabled = _env_bool("BYBIT_MM_ENABLE_TF32", False)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = enabled
+        torch.backends.cudnn.allow_tf32 = enabled
+    return enabled
+
+
 def _timing_enabled() -> bool:
     return _env_bool("BYBIT_MM_ENABLE_TIMING", False)
 
@@ -280,6 +298,24 @@ def _timing_enabled() -> bool:
 def _timing_log(message: str) -> None:
     if _timing_enabled():
         print(f"[timing] {message}")
+
+
+LOG_2PI = float(np.log(2.0 * np.pi))
+
+
+def _diag_gaussian_sample(mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    eps = torch.randn_like(mean)
+    action = mean + std * eps
+    return action, eps
+
+
+def _diag_gaussian_logprob(x: torch.Tensor, mean: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
+    z = (x - mean) / torch.exp(log_std)
+    return (-0.5 * (z * z + 2.0 * log_std + LOG_2PI)).sum(dim=-1)
+
+
+def _diag_gaussian_entropy(log_std: torch.Tensor) -> torch.Tensor:
+    return (log_std + 0.5 * (1.0 + LOG_2PI)).sum(dim=-1)
 
 
 def _maybe_compile_module(module: torch.nn.Module, *, enabled: bool, label: str) -> torch.nn.Module:
@@ -1038,21 +1074,54 @@ def join_features(
     layout = _joined_feature_layout(ret_pred.shape[1], snapshots.shape[1])
     snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
-    features = np.concatenate(
-        [
-            ret_pred,
-            vol_pred,
-            dir_logits,
-            p_up,
-            align_all[:, None],
-            diff_short_long[:, None],
-            diff_mid_long[:, None],
-            conf_long[:, None],
-            conf_min[:, None],
-            snapshots,
-        ],
-        axis=-1,
-    )
+    if _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False):
+        n_rows = int(ret_pred.shape[0])
+        expected_feature_dim = layout["snapshots"].stop
+        features = np.empty((n_rows, expected_feature_dim), dtype=np.float32)
+        cursor = 0
+
+        d = ret_pred.shape[1]
+        features[:, cursor:cursor + d] = ret_pred
+        cursor += d
+        d = vol_pred.shape[1]
+        features[:, cursor:cursor + d] = vol_pred
+        cursor += d
+        d = dir_logits.shape[1]
+        features[:, cursor:cursor + d] = dir_logits
+        cursor += d
+        d = p_up.shape[1]
+        features[:, cursor:cursor + d] = p_up
+        cursor += d
+
+        features[:, cursor] = align_all
+        cursor += 1
+        features[:, cursor] = diff_short_long
+        cursor += 1
+        features[:, cursor] = diff_mid_long
+        cursor += 1
+        features[:, cursor] = conf_long
+        cursor += 1
+        features[:, cursor] = conf_min
+        cursor += 1
+
+        d = snapshots.shape[1]
+        features[:, cursor:cursor + d] = snapshots
+    else:
+        features = np.concatenate(
+            [
+                ret_pred,
+                vol_pred,
+                dir_logits,
+                p_up,
+                align_all[:, None],
+                diff_short_long[:, None],
+                diff_mid_long[:, None],
+                conf_long[:, None],
+                conf_min[:, None],
+                snapshots,
+            ],
+            axis=-1,
+        )
     expected_feature_dim = layout["snapshots"].stop
     if features.shape[1] != expected_feature_dim:
         raise ValueError(
@@ -1137,13 +1206,37 @@ def build_joined_split(
     if not week_outputs:
         raise ValueError(f"No data found for split {split}")
 
-    out = {
-        "ts": np.concatenate([wk["ts"] for wk in week_outputs], axis=0),
-        "features": np.concatenate([wk["features"] for wk in week_outputs], axis=0),
-        "y": np.concatenate([wk["y"] for wk in week_outputs], axis=0),
-        "spread_bps": np.concatenate([wk["spread_bps"] for wk in week_outputs], axis=0),
-        "snapshots": np.vstack([wk["snapshots"] for wk in week_outputs]),
-    }
+    if _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False):
+        total_rows = int(sum(wk["ts"].shape[0] for wk in week_outputs))
+        feature_dim = int(week_outputs[0]["features"].shape[1])
+        y_dim = int(week_outputs[0]["y"].shape[1])
+        snapshot_dim = int(week_outputs[0]["snapshots"].shape[1])
+
+        out = {
+            "ts": np.empty((total_rows,), dtype=week_outputs[0]["ts"].dtype),
+            "features": np.empty((total_rows, feature_dim), dtype=week_outputs[0]["features"].dtype),
+            "y": np.empty((total_rows, y_dim), dtype=week_outputs[0]["y"].dtype),
+            "spread_bps": np.empty((total_rows,), dtype=week_outputs[0]["spread_bps"].dtype),
+            "snapshots": np.empty((total_rows, snapshot_dim), dtype=week_outputs[0]["snapshots"].dtype),
+        }
+        cursor = 0
+        for wk in week_outputs:
+            rows = int(wk["ts"].shape[0])
+            end = cursor + rows
+            out["ts"][cursor:end] = wk["ts"]
+            out["features"][cursor:end] = wk["features"]
+            out["y"][cursor:end] = wk["y"]
+            out["spread_bps"][cursor:end] = wk["spread_bps"]
+            out["snapshots"][cursor:end] = wk["snapshots"]
+            cursor = end
+    else:
+        out = {
+            "ts": np.concatenate([wk["ts"] for wk in week_outputs], axis=0),
+            "features": np.concatenate([wk["features"] for wk in week_outputs], axis=0),
+            "y": np.concatenate([wk["y"] for wk in week_outputs], axis=0),
+            "spread_bps": np.concatenate([wk["spread_bps"] for wk in week_outputs], axis=0),
+            "snapshots": np.vstack([wk["snapshots"] for wk in week_outputs]),
+        }
 
     expected_rows = out["ts"].shape[0]
     for key, value in out.items():
@@ -2156,6 +2249,9 @@ def collect_market_rollout(
     horizon: int = 2048,
     rollouts_per_epoch: int = 1,
     randomize_start: bool = True,
+    rollout_storage: str = "gpu",
+    pin_memory: bool = True,
+    non_blocking: bool = True,
 ) -> Dict[str, torch.Tensor]:
     # Canonical action space for rollout + PPO is the *env action space*.
     # The policy predicts normalized parameters, then we apply a fixed affine
@@ -2169,15 +2265,31 @@ def collect_market_rollout(
         raise ValueError(f"rollouts_per_epoch must be positive, got {rollouts_per_epoch}")
 
     max_steps = horizon * rollouts_per_epoch
+    storage = rollout_storage.strip().lower()
+    if storage not in {"gpu", "cpu"}:
+        raise ValueError(f"rollout_storage must be one of ['gpu', 'cpu'], got {rollout_storage}")
+
+    target_device = torch.device(device)
+    use_gpu_storage = storage == "gpu"
+    if use_gpu_storage and target_device.type != "cuda":
+        use_gpu_storage = False
+        storage = "cpu"
+
+    use_pinned = bool(pin_memory and storage == "cpu" and target_device.type == "cuda")
+    storage_device = target_device if use_gpu_storage else torch.device("cpu")
+
     obs_buf: Optional[torch.Tensor] = None
     next_obs_buf: Optional[torch.Tensor] = None
     actions_buf: Optional[torch.Tensor] = None
-    logp_buf = torch.empty((max_steps,), dtype=torch.float32)
-    values_buf = torch.empty((max_steps,), dtype=torch.float32)
-    rewards_buf = torch.empty((max_steps,), dtype=torch.float32)
-    terminated_buf = torch.empty((max_steps,), dtype=torch.float32)
-    truncated_buf = torch.empty((max_steps,), dtype=torch.float32)
-    dones_buf = torch.empty((max_steps,), dtype=torch.float32)
+    alloc_kwargs = {"device": storage_device}
+    if use_pinned:
+        alloc_kwargs["pin_memory"] = True
+    logp_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    values_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    rewards_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    terminated_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    truncated_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    dones_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
     action_dim = int(model.log_std.shape[0])
@@ -2196,19 +2308,19 @@ def collect_market_rollout(
             obs_cpu = torch.from_numpy(obs).float()
             if obs_buf is None:
                 obs_dim = int(obs_cpu.shape[0])
-                obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32)
-                next_obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32)
-                actions_buf = torch.empty((max_steps, action_dim), dtype=torch.float32)
-            obs_t = obs_cpu.to(device)
+                obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32, **alloc_kwargs)
+                next_obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32, **alloc_kwargs)
+                actions_buf = torch.empty((max_steps, action_dim), dtype=torch.float32, **alloc_kwargs)
+            obs_t = obs_cpu.to(target_device, non_blocking=non_blocking)
             with torch.inference_mode():
                 mean, log_std, value = model(obs_t.unsqueeze(0))
                 std = log_std.exp()
 
                 mean_env = mean * action_scale
                 std_env = std * action_scale
-                dist_env = torch.distributions.Normal(mean_env, std_env)
-                action_env = dist_env.sample()
-                logp_env = dist_env.log_prob(action_env).sum(dim=-1)
+                log_std_env = torch.log(std_env)
+                action_env, _eps = _diag_gaussian_sample(mean_env, std_env)
+                logp_env = _diag_gaussian_logprob(action_env, mean_env, log_std_env)
 
             next_obs, reward, env_done, _info = env.step(action_env.squeeze(0).cpu().numpy())
             steps += 1
@@ -2224,11 +2336,19 @@ def collect_market_rollout(
                 obs_buf is not None and next_obs_buf is not None and actions_buf is not None,
                 "rollout buffers not initialized",
             )
-            obs_buf[idx] = obs_cpu
-            next_obs_buf[idx] = torch.from_numpy(next_obs).float()
-            actions_buf[idx] = action_env.squeeze(0).detach().cpu()
-            logp_buf[idx] = logp_env.squeeze(0).detach().cpu()
-            values_buf[idx] = value.squeeze(0).detach().cpu()
+            next_obs_cpu = torch.from_numpy(next_obs).float()
+            if use_gpu_storage:
+                obs_buf[idx].copy_(obs_t)
+                next_obs_buf[idx].copy_(next_obs_cpu.to(target_device, non_blocking=non_blocking))
+                actions_buf[idx].copy_(action_env.squeeze(0).detach())
+                logp_buf[idx] = logp_env.squeeze(0).detach()
+                values_buf[idx] = value.squeeze(0).detach()
+            else:
+                obs_buf[idx].copy_(obs_cpu)
+                next_obs_buf[idx].copy_(next_obs_cpu)
+                actions_buf[idx].copy_(action_env.squeeze(0).detach().cpu())
+                logp_buf[idx] = logp_env.squeeze(0).detach().cpu()
+                values_buf[idx] = value.squeeze(0).detach().cpu()
             rewards_buf[idx] = float(reward)
             terminated_buf[idx] = float(terminated)
             truncated_buf[idx] = float(truncated)
@@ -2238,19 +2358,26 @@ def collect_market_rollout(
     if obs_buf is None or next_obs_buf is None or actions_buf is None:
         raise RuntimeError("No rollout transitions collected.")
 
-    next_values_buf = torch.zeros((cursor,), dtype=torch.float32)
+    next_values_buf = torch.zeros((cursor,), dtype=torch.float32, **alloc_kwargs)
     bootstrap_mask = terminated_buf[:cursor] == 0.0
+    bootstrap_batches = 0
     if torch.any(bootstrap_mask):
         boot_indices = torch.nonzero(bootstrap_mask, as_tuple=False).squeeze(-1)
         infer_bs = 4096
         with torch.inference_mode():
             for start in range(0, int(boot_indices.shape[0]), infer_bs):
+                bootstrap_batches += 1
                 idx = boot_indices[start:start + infer_bs]
-                batch_next_obs = next_obs_buf[idx].to(device)
+                batch_next_obs = next_obs_buf[idx].to(target_device, non_blocking=non_blocking)
                 _next_mean, _next_log_std, next_value = model(batch_next_obs)
-                next_values_buf[idx] = next_value.detach().cpu()
+                if use_gpu_storage:
+                    next_values_buf[idx] = next_value.detach()
+                else:
+                    next_values_buf[idx] = next_value.detach().cpu()
 
-    _timing_log(f"rollout steps={cursor} secs={time.perf_counter() - t0:.4f}")
+    _timing_log(
+        f"rollout storage={storage} steps={cursor} bootstrap_batches={bootstrap_batches} secs={time.perf_counter() - t0:.4f}"
+    )
 
     return {
         "obs": obs_buf[:cursor],
@@ -2273,6 +2400,7 @@ def ppo_update_market(
     device: str,
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
+    non_blocking: bool = True,
 ):
     t0 = time.perf_counter()
     # PPO loss is computed in the same env action space used during rollout.
@@ -2298,36 +2426,49 @@ def ppo_update_market(
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     n = obs.shape[0]
-    indices = torch.arange(n)
+    target_device = torch.device(device)
+    same_device = obs.device == target_device
+    indices = torch.arange(n, device=obs.device)
     for _ in range(config.update_epochs):
-        perm = indices[torch.randperm(n)]
+        perm = indices[torch.randperm(n, device=obs.device)]
         for start in range(0, n, config.batch_size):
             mb_idx = perm[start:start + config.batch_size]
-            mb_obs = obs[mb_idx].to(device)
-            mb_actions = actions[mb_idx].to(device)
-            mb_old_logp = old_logp[mb_idx].to(device)
-            mb_advantages = advantages[mb_idx].to(device)
-            mb_returns = returns[mb_idx].to(device)
+            if same_device:
+                mb_obs = obs[mb_idx]
+                mb_actions = actions[mb_idx]
+                mb_old_logp = old_logp[mb_idx]
+                mb_advantages = advantages[mb_idx]
+                mb_returns = returns[mb_idx]
+            else:
+                mb_idx_cpu = mb_idx.cpu() if mb_idx.device.type != "cpu" else mb_idx
+                mb_obs = obs[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
+                mb_actions = actions[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
+                mb_old_logp = old_logp[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
+                mb_advantages = advantages[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
+                mb_returns = returns[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
 
             mean, log_std, value = model(mb_obs)
             std = log_std.exp()
 
             mean_env = mean * action_scale
             std_env = std * action_scale
-            dist_env = torch.distributions.Normal(mean_env, std_env)
-            logp = dist_env.log_prob(mb_actions).sum(dim=-1)
+            log_std_env = torch.log(std_env)
+            logp = _diag_gaussian_logprob(mb_actions, mean_env, log_std_env)
             ratio = torch.exp(logp - mb_old_logp)
             clip_adv = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * mb_advantages
             policy_loss = -(torch.min(ratio * mb_advantages, clip_adv)).mean()
             value_loss = nn.functional.mse_loss(value, mb_returns)
-            entropy_loss = dist_env.entropy().sum(dim=-1).mean()
+            entropy_loss = _diag_gaussian_entropy(log_std_env).mean()
             loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-    _timing_log(f"ppo_update secs={time.perf_counter() - t0:.4f}")
+    storage = "gpu" if obs.device.type == target_device.type else "cpu"
+    _timing_log(
+        f"ppo_update storage={storage} on_device={same_device} manual_gaussian=true secs={time.perf_counter() - t0:.4f}"
+    )
 
 def _steps_per_year_from_snapshot_ms(step_ms: float) -> float:
     if step_ms <= 0:
@@ -2418,18 +2559,34 @@ def evaluate_market_policy(
     taker_scale: float = 1.0,
 ) -> Dict[str, Any]:
     def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
-        obs_t = torch.from_numpy(obs).float().to(device)
-        with torch.inference_mode():
-            deltas = policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-        if deltas.shape[0] >= 3:
-            return (
-                float(deltas[0] * delta_scale),
-                float(deltas[1] * delta_scale),
-                float(deltas[2] * taker_scale),
-            )
-        return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
+        return _policy_action_from_obs_numpy(
+            obs,
+            policy,
+            device,
+            delta_scale,
+            taker_scale,
+        )
 
     return evaluate_market_making(env, _policy_fn)
+
+
+def _policy_action_from_obs_numpy(
+    obs: np.ndarray,
+    policy: torch.nn.Module,
+    device: str,
+    delta_scale: float,
+    taker_scale: float,
+) -> Tuple[float, float, float]:
+    obs_t = torch.from_numpy(obs).float().to(device)
+    with torch.inference_mode():
+        deltas = policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
+    if deltas.shape[0] >= 3:
+        return (
+            float(deltas[0] * delta_scale),
+            float(deltas[1] * delta_scale),
+            float(deltas[2] * taker_scale),
+        )
+    return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
 
 
 def train_market_ppo(
@@ -2442,6 +2599,9 @@ def train_market_ppo(
     ckpt_path: Optional[Path] = None,
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
+    rollout_storage: str = "gpu",
+    pin_rollout_memory: bool = True,
+    non_blocking_transfers: bool = True,
 ) -> Tuple[MarketPolicyValueNet, Dict[str, Any]]:
     config = config or PPOConfig()
     model = MarketPolicyValueNet(
@@ -2469,6 +2629,9 @@ def train_market_ppo(
             horizon=config.rollout_horizon,
             rollouts_per_epoch=config.rollouts_per_epoch,
             randomize_start=config.randomize_rollout_start,
+            rollout_storage=rollout_storage,
+            pin_memory=pin_rollout_memory,
+            non_blocking=non_blocking_transfers,
         )
         ppo_update_market(
             model,
@@ -2478,6 +2641,7 @@ def train_market_ppo(
             device,
             delta_scale=delta_scale,
             taker_scale=taker_scale,
+            non_blocking=non_blocking_transfers,
         )
         if (epoch + 1) % config.val_every == 0:
             # Keep validation normalization aligned with training normalization at
@@ -2860,6 +3024,19 @@ def run_pipeline(
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
 
     cmssl_batch_size = _resolve_cmssl_batch_size()
+    rollout_storage = _resolve_rollout_storage("gpu")
+    pin_rollout_memory = _env_bool("BYBIT_MM_PIN_ROLLOUT_MEMORY", True)
+    non_blocking_transfers = _env_bool("BYBIT_MM_NONBLOCKING_TRANSFERS", True)
+    preallocate_join_features = _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False)
+    _timing_log(
+        "run_config "
+        f"cmssl_batch_size={cmssl_batch_size} "
+        f"rollout_storage={rollout_storage} "
+        f"compile_cmssl={_env_bool('BYBIT_MM_COMPILE_CMSSL', False)} "
+        f"compile_ppo={_env_bool('BYBIT_MM_COMPILE_PPO', False)} "
+        f"tf32={_env_bool('BYBIT_MM_ENABLE_TF32', False)} "
+        f"preallocate_join_features={preallocate_join_features}"
+    )
     joined_test = build_joined_split(
         out_root,
         test_split,
@@ -3077,6 +3254,9 @@ def run_pipeline(
             ckpt_path=mm_best_ckpt,
             delta_scale=delta_scale,
             taker_scale=taker_scale,
+            rollout_storage=rollout_storage,
+            pin_rollout_memory=pin_rollout_memory,
+            non_blocking_transfers=non_blocking_transfers,
         )
         trained_this_run = True
         train_obs_norm_state = mm_train_env.get_obs_norm_state()
@@ -3186,16 +3366,13 @@ def run_pipeline(
             rl_policy_loaded = True
 
             def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
-                obs_t = torch.from_numpy(obs).float().to(device)
-                with torch.inference_mode():
-                    deltas = mm_policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-                if deltas.shape[0] >= 3:
-                    return (
-                        float(deltas[0] * delta_scale),
-                        float(deltas[1] * delta_scale),
-                        float(deltas[2] * taker_scale),
-                    )
-                return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
+                return _policy_action_from_obs_numpy(
+                    obs,
+                    mm_policy,
+                    device,
+                    delta_scale,
+                    taker_scale,
+                )
 
         rl_eval_t0 = time.perf_counter()
         rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
@@ -3249,6 +3426,7 @@ if __name__ == "__main__":
         raise SystemExit("Set BYBIT_OUT_ROOT and BYBIT_CMSSL_CKPT before running.")
 
     _set_seed_from_env()
+    tf32_enabled = _configure_tf32_from_env()
 
     print(
         "[rl exec config]",
@@ -3260,6 +3438,7 @@ if __name__ == "__main__":
                 "ppo_epochs": ppo_epochs,
                 "ppo_epochs_env": PPO_EPOCHS_ENV,
                 "run_mode": run_mode,
+                "tf32_enabled": tf32_enabled,
             },
             sort_keys=True,
         ),
