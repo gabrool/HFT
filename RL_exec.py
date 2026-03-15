@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import warnings
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -100,6 +101,7 @@ def _require_grid_quantized_decision_meta(meta: Dict[str, Any]) -> None:
 
 
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
+    t0 = time.perf_counter()
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
     _require_grid_quantized_decision_meta(meta)
@@ -149,10 +151,16 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
         + ", ".join(missing_components),
     )
     model.eval()
+    model = _maybe_compile_module(
+        model,
+        enabled=_env_bool("BYBIT_MM_COMPILE_CMSSL", False),
+        label="cmssl",
+    )
+    _timing_log(f"load_cmssl secs={time.perf_counter() - t0:.4f}")
     return model, meta
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def cmssl_predict(model, x_core, x_aux, meta, device: str = "cuda"):
     # x_core: [B, L, F_core]  x_aux: [B, L, AUX_DIM]
     x_core = torch.as_tensor(x_core, device=device)
@@ -259,6 +267,40 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
     if not raw:
         return list(default)
     return [int(item) for item in raw.split(",") if item.strip()]
+
+
+def _resolve_cmssl_batch_size(default: int = 256) -> int:
+    return _env_int("BYBIT_MM_CMSSL_BATCH_SIZE", default)
+
+
+def _timing_enabled() -> bool:
+    return _env_bool("BYBIT_MM_ENABLE_TIMING", False)
+
+
+def _timing_log(message: str) -> None:
+    if _timing_enabled():
+        print(f"[timing] {message}")
+
+
+def _maybe_compile_module(module: torch.nn.Module, *, enabled: bool, label: str) -> torch.nn.Module:
+    if not enabled:
+        return module
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        warnings.warn(
+            f"torch.compile unavailable; skipping compile for {label}.",
+            RuntimeWarning,
+        )
+        return module
+    mode = os.environ.get("BYBIT_MM_COMPILE_MODE", "reduce-overhead")
+    try:
+        return compile_fn(module, mode=mode, fullgraph=False)
+    except Exception as exc:
+        warnings.warn(
+            f"torch.compile failed for {label}: {exc}. Falling back to eager module.",
+            RuntimeWarning,
+        )
+        return module
 
 
 def _resolve_run_mode(default: str = "train") -> str:
@@ -612,12 +654,20 @@ def run_cmssl_test_window_inference(
     out_root: str,
     ckpt_path: str,
     device: str = "cuda",
-    batch_size: int = 256,
+    batch_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run CMSSL inference over test windowed inputs for offline diagnostics."""
     model, meta = load_cmssl(out_root, ckpt_path, device=device)
     x_core, x_aux, ts = load_test_windowed_inputs(out_root, meta)
-    cmssl_out = run_cmssl_inference(model, meta, x_core, x_aux, batch_size=batch_size, device=device)
+    resolved_batch_size = _resolve_cmssl_batch_size() if batch_size is None else int(batch_size)
+    cmssl_out = run_cmssl_inference(
+        model,
+        meta,
+        x_core,
+        x_aux,
+        batch_size=resolved_batch_size,
+        device=device,
+    )
     horizons = meta.get("horizons_ms", [])
     output: Dict[str, Dict[int, np.ndarray]] = {
         "horizons_ms": horizons,
@@ -642,9 +692,7 @@ def run_cmssl_inference(
     device: str = "cuda",
 ) -> Dict[str, np.ndarray]:
     """Run CMSSL inference for batched inputs; empty batches are valid."""
-    ret_preds: List[np.ndarray] = []
-    vol_preds: List[np.ndarray] = []
-    dir_logits_list: List[np.ndarray] = []
+    t0 = time.perf_counter()
     num_h = len(meta["horizons_ms"])
     n = x_core.shape[0]
     if n == 0:
@@ -654,17 +702,28 @@ def run_cmssl_inference(
             "vol_pred": empty.copy(),
             "dir_logits": empty.copy(),
         }
+    ret_out = np.empty((n, num_h), dtype=np.float32)
+    vol_out = np.empty((n, num_h), dtype=np.float32)
+    logits_out = np.empty((n, num_h), dtype=np.float32)
     for i in range(0, n, batch_size):
-        xc = x_core[i:i + batch_size]
-        xa = x_aux[i:i + batch_size]
+        j = min(i + batch_size, n)
+        xc = x_core[i:j]
+        xa = x_aux[i:j]
         ret_pred, vol_pred, dir_logits = cmssl_predict(model, xc, xa, meta, device=device)
-        ret_preds.append(ret_pred.detach().cpu().numpy())
-        vol_preds.append(vol_pred.detach().cpu().numpy())
-        dir_logits_list.append(dir_logits.detach().cpu().numpy())
+        ret_out[i:j] = ret_pred.detach().cpu().numpy().astype(np.float32, copy=False)
+        vol_out[i:j] = vol_pred.detach().cpu().numpy().astype(np.float32, copy=False)
+        logits_out[i:j] = dir_logits.detach().cpu().numpy().astype(np.float32, copy=False)
+    elapsed = time.perf_counter() - t0
+    if elapsed > 0.0:
+        _timing_log(
+            f"cmssl_inference rows={n} batch_size={batch_size} secs={elapsed:.4f} rows_per_sec={n / elapsed:.2f}"
+        )
+    else:
+        _timing_log(f"cmssl_inference rows={n} batch_size={batch_size} secs={elapsed:.4f}")
     return {
-        "ret_pred": np.concatenate(ret_preds, axis=0).astype(np.float32, copy=False),
-        "vol_pred": np.concatenate(vol_preds, axis=0).astype(np.float32, copy=False),
-        "dir_logits": np.concatenate(dir_logits_list, axis=0).astype(np.float32, copy=False),
+        "ret_pred": ret_out,
+        "vol_pred": vol_out,
+        "dir_logits": logits_out,
     }
 
 
@@ -1025,6 +1084,7 @@ def build_joined_split(
     device: str,
     batch_size: int = 256,
 ) -> Dict[str, np.ndarray]:
+    t0 = time.perf_counter()
     week_outputs: List[Dict[str, np.ndarray]] = []
     for wk in _split_weeks(split):
         wk_split = {"weeks": [wk], "start": split["start"], "end": split["end"]}
@@ -1105,6 +1165,7 @@ def build_joined_split(
             f"ts_next={int(ts_all[first_bad + 1])} diff={int(ts_diff[first_bad])}"
         )
 
+    _timing_log(f"build_joined_split rows={out['ts'].shape[0]} secs={time.perf_counter() - t0:.4f}")
     return out
 
 
@@ -2100,20 +2161,30 @@ def collect_market_rollout(
     # The policy predicts normalized parameters, then we apply a fixed affine
     # transform (scale-only) to mean/std so sampling, env stepping, and stored
     # actions/log-probs all refer to the exact same (scaled) action tensor.
-    obs_list = []
-    action_list = []
-    logp_list = []
-    value_list = []
-    next_value_list = []
-    reward_list = []
-    terminated_list = []
-    truncated_list = []
-    done_list = []
+    t0 = time.perf_counter()
 
     if horizon <= 0:
         raise ValueError(f"horizon must be positive, got {horizon}")
     if rollouts_per_epoch <= 0:
         raise ValueError(f"rollouts_per_epoch must be positive, got {rollouts_per_epoch}")
+
+    max_steps = horizon * rollouts_per_epoch
+    obs_buf: Optional[torch.Tensor] = None
+    next_obs_buf: Optional[torch.Tensor] = None
+    actions_buf: Optional[torch.Tensor] = None
+    logp_buf = torch.empty((max_steps,), dtype=torch.float32)
+    values_buf = torch.empty((max_steps,), dtype=torch.float32)
+    rewards_buf = torch.empty((max_steps,), dtype=torch.float32)
+    terminated_buf = torch.empty((max_steps,), dtype=torch.float32)
+    truncated_buf = torch.empty((max_steps,), dtype=torch.float32)
+    dones_buf = torch.empty((max_steps,), dtype=torch.float32)
+    cursor = 0
+
+    action_dim = int(model.log_std.shape[0])
+    action_scale = torch.ones(action_dim, device=device, dtype=torch.float32)
+    action_scale[:2] = delta_scale
+    if action_dim >= 3:
+        action_scale[2] = taker_scale
 
     max_start = max(0, env.n - 2)
     for _ in range(rollouts_per_epoch):
@@ -2123,20 +2194,21 @@ def collect_market_rollout(
         steps = 0
         while not done and steps < horizon:
             obs_cpu = torch.from_numpy(obs).float()
+            if obs_buf is None:
+                obs_dim = int(obs_cpu.shape[0])
+                obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32)
+                next_obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32)
+                actions_buf = torch.empty((max_steps, action_dim), dtype=torch.float32)
             obs_t = obs_cpu.to(device)
-            mean, log_std, value = model(obs_t.unsqueeze(0))
-            std = log_std.exp()
+            with torch.inference_mode():
+                mean, log_std, value = model(obs_t.unsqueeze(0))
+                std = log_std.exp()
 
-            action_scale = torch.ones_like(mean)
-            action_scale[..., :2] = delta_scale
-            if action_scale.shape[-1] >= 3:
-                action_scale[..., 2] = taker_scale
-
-            mean_env = mean * action_scale
-            std_env = std * action_scale
-            dist_env = torch.distributions.Normal(mean_env, std_env)
-            action_env = dist_env.sample()
-            logp_env = dist_env.log_prob(action_env).sum(dim=-1)
+                mean_env = mean * action_scale
+                std_env = std * action_scale
+                dist_env = torch.distributions.Normal(mean_env, std_env)
+                action_env = dist_env.sample()
+                logp_env = dist_env.log_prob(action_env).sum(dim=-1)
 
             next_obs, reward, env_done, _info = env.step(action_env.squeeze(0).cpu().numpy())
             steps += 1
@@ -2146,35 +2218,50 @@ def collect_market_rollout(
             truncated = (not terminated) and (steps >= horizon)
             done = terminated or truncated
 
-            if terminated:
-                next_value = torch.tensor(0.0, dtype=torch.float32)
-            else:
-                with torch.no_grad():
-                    next_obs_t = torch.from_numpy(next_obs).float().to(device)
-                    _next_mean, _next_log_std, next_value_t = model(next_obs_t.unsqueeze(0))
-                    next_value = next_value_t.squeeze(0).detach().cpu()
-
-            obs_list.append(obs_cpu)
-            action_list.append(action_env.squeeze(0).detach().cpu())
-            logp_list.append(logp_env.squeeze(0).detach().cpu())
-            value_list.append(value.squeeze(0).detach().cpu())
-            next_value_list.append(next_value)
-            reward_list.append(torch.tensor(reward, dtype=torch.float32))
-            terminated_list.append(torch.tensor(float(terminated), dtype=torch.float32))
-            truncated_list.append(torch.tensor(float(truncated), dtype=torch.float32))
-            done_list.append(torch.tensor(float(done), dtype=torch.float32))
+            idx = cursor
+            cursor += 1
+            require(
+                obs_buf is not None and next_obs_buf is not None and actions_buf is not None,
+                "rollout buffers not initialized",
+            )
+            obs_buf[idx] = obs_cpu
+            next_obs_buf[idx] = torch.from_numpy(next_obs).float()
+            actions_buf[idx] = action_env.squeeze(0).detach().cpu()
+            logp_buf[idx] = logp_env.squeeze(0).detach().cpu()
+            values_buf[idx] = value.squeeze(0).detach().cpu()
+            rewards_buf[idx] = float(reward)
+            terminated_buf[idx] = float(terminated)
+            truncated_buf[idx] = float(truncated)
+            dones_buf[idx] = float(done)
             obs = next_obs
 
+    if obs_buf is None or next_obs_buf is None or actions_buf is None:
+        raise RuntimeError("No rollout transitions collected.")
+
+    next_values_buf = torch.zeros((cursor,), dtype=torch.float32)
+    bootstrap_mask = terminated_buf[:cursor] == 0.0
+    if torch.any(bootstrap_mask):
+        boot_indices = torch.nonzero(bootstrap_mask, as_tuple=False).squeeze(-1)
+        infer_bs = 4096
+        with torch.inference_mode():
+            for start in range(0, int(boot_indices.shape[0]), infer_bs):
+                idx = boot_indices[start:start + infer_bs]
+                batch_next_obs = next_obs_buf[idx].to(device)
+                _next_mean, _next_log_std, next_value = model(batch_next_obs)
+                next_values_buf[idx] = next_value.detach().cpu()
+
+    _timing_log(f"rollout steps={cursor} secs={time.perf_counter() - t0:.4f}")
+
     return {
-        "obs": torch.stack(obs_list),
-        "actions": torch.stack(action_list),
-        "logp": torch.stack(logp_list),
-        "values": torch.stack(value_list),
-        "next_values": torch.stack(next_value_list),
-        "rewards": torch.stack(reward_list),
-        "terminated": torch.stack(terminated_list),
-        "truncated": torch.stack(truncated_list),
-        "dones": torch.stack(done_list),
+        "obs": obs_buf[:cursor],
+        "actions": actions_buf[:cursor],
+        "logp": logp_buf[:cursor],
+        "values": values_buf[:cursor],
+        "next_values": next_values_buf,
+        "rewards": rewards_buf[:cursor],
+        "terminated": terminated_buf[:cursor],
+        "truncated": truncated_buf[:cursor],
+        "dones": dones_buf[:cursor],
     }
 
 
@@ -2187,6 +2274,7 @@ def ppo_update_market(
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
 ):
+    t0 = time.perf_counter()
     # PPO loss is computed in the same env action space used during rollout.
     # Stored rollout["actions"]/rollout["logp"] are scaled env actions/log-probs,
     # so we rebuild the Normal distribution in env scale before ratio/log-prob.
@@ -2235,6 +2323,8 @@ def ppo_update_market(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+    _timing_log(f"ppo_update secs={time.perf_counter() - t0:.4f}")
 
 def _steps_per_year_from_snapshot_ms(step_ms: float) -> float:
     if step_ms <= 0:
@@ -2326,7 +2416,7 @@ def evaluate_market_policy(
 ) -> Dict[str, Any]:
     def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
         obs_t = torch.from_numpy(obs).float().to(device)
-        with torch.no_grad():
+        with torch.inference_mode():
             deltas = policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
         if deltas.shape[0] >= 3:
             return (
@@ -2357,10 +2447,16 @@ def train_market_ppo(
         value_hidden=config.value_hidden,
         action_dim=int(os.environ.get("BYBIT_MM_ACTION_DIM", "3")),
     ).to(device)
+    model = _maybe_compile_module(
+        model,
+        enabled=_env_bool("BYBIT_MM_COMPILE_PPO", False),
+        label="ppo_train",
+    )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     best_report: Dict[str, Any] = {"sharpe": -np.inf}
 
     for epoch in range(epochs):
+        epoch_t0 = time.perf_counter()
         rollout = collect_market_rollout(
             train_env,
             model,
@@ -2416,6 +2512,7 @@ def train_market_ppo(
                         },
                         ckpt_path,
                     )
+        _timing_log(f"epoch={epoch + 1} total_secs={time.perf_counter() - epoch_t0:.4f}")
     return model, best_report
 
 
@@ -2736,6 +2833,11 @@ def load_market_policy(
     model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims, action_dim=action_dim).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
+    model = _maybe_compile_module(
+        model,
+        enabled=_env_bool("BYBIT_MM_COMPILE_PPO", False),
+        label="ppo_eval_policy",
+    )
     return model
 
 
@@ -2754,12 +2856,14 @@ def run_pipeline(
 
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
 
+    cmssl_batch_size = _resolve_cmssl_batch_size()
     joined_test = build_joined_split(
         out_root,
         test_split,
         model,
         meta,
         device,
+        batch_size=cmssl_batch_size,
     )
 
     num_h = len(meta.get("horizons_ms", []))
@@ -3017,7 +3121,9 @@ def run_pipeline(
     )
     if eval_obs_norm_state is not None:
         baseline_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+    baseline_eval_t0 = time.perf_counter()
     baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
+    _timing_log(f"evaluate_market_making baseline secs={time.perf_counter() - baseline_eval_t0:.4f}")
 
     rl_metrics = None
 
@@ -3078,7 +3184,7 @@ def run_pipeline(
 
             def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
                 obs_t = torch.from_numpy(obs).float().to(device)
-                with torch.no_grad():
+                with torch.inference_mode():
                     deltas = mm_policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
                 if deltas.shape[0] >= 3:
                     return (
@@ -3088,7 +3194,9 @@ def run_pipeline(
                     )
                 return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
 
+        rl_eval_t0 = time.perf_counter()
         rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
+        _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
         rl_eval_performed = True
 
     return {
