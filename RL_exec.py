@@ -2427,7 +2427,14 @@ def ppo_update_market(
 
     n = obs.shape[0]
     target_device = torch.device(device)
-    same_device = obs.device == target_device
+    if obs.device.type != target_device.type:
+        same_device = False
+    elif target_device.type != "cuda":
+        same_device = True
+    else:
+        # torch.device("cuda") leaves index unspecified; treat any CUDA tensor on
+        # the current target GPU as already on-device in this fast path.
+        same_device = (target_device.index is None) or (obs.device.index == target_device.index)
     indices = torch.arange(n, device=obs.device)
     for _ in range(config.update_epochs):
         perm = indices[torch.randperm(n, device=obs.device)]
