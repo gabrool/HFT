@@ -2664,7 +2664,7 @@ def train_market_ppo(
     rollout_storage: str = "gpu",
     pin_rollout_memory: bool = True,
     non_blocking_transfers: bool = True,
-) -> Tuple[MarketPolicyValueNet, Dict[str, Any]]:
+) -> Tuple[MarketPolicyValueNet, Dict[str, Any], bool]:
     config = config or PPOConfig()
     model = MarketPolicyValueNet(
         input_dim,
@@ -2680,6 +2680,7 @@ def train_market_ppo(
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     best_report: Optional[Dict[str, Any]] = None
     best_selection_key: Optional[Tuple[float, float, float]] = None
+    saved_new_ckpt_this_run = False
 
     for epoch in range(epochs):
         epoch_t0 = time.perf_counter()
@@ -2770,11 +2771,12 @@ def train_market_ppo(
                             },
                             ckpt_path,
                         )
+                        saved_new_ckpt_this_run = True
         _timing_log(f"epoch={epoch + 1} total_secs={time.perf_counter() - epoch_t0:.4f}")
     if best_report is None:
         print("[mm ckpt] no validation checkpoint satisfied selection filters; no new PPO checkpoint saved.")
-        return model, {}
-    return model, best_report
+        return model, {}, saved_new_ckpt_this_run
+    return model, best_report, saved_new_ckpt_this_run
 
 
 def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -3395,10 +3397,11 @@ def run_pipeline(
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
     obs_norm_source = "env_default"
+    saved_new_ckpt_this_run = False
 
     if run_mode in {"train", "train_eval"}:
         print(f"[mm train] starting PPO training (run_mode={run_mode})")
-        _trained_model, best_val_report = train_market_ppo(
+        _trained_model, best_val_report, saved_new_ckpt_this_run = train_market_ppo(
             mm_train_env,
             mm_val_env,
             mm_obs_dim,
@@ -3422,6 +3425,17 @@ def run_pipeline(
             print(_format_mm_summary("[mm train] best_val", best_val_report))
         else:
             print("[mm train] no validation checkpoint satisfied selection filters.")
+            if (
+                run_mode == "train_eval"
+                and not external_ckpt_explicit
+                and not saved_new_ckpt_this_run
+            ):
+                resolved_eval_ckpt = None
+                rl_checkpoint_origin = "none"
+                print(
+                    "[mm eval] no new training checkpoint saved this run; "
+                    "ignoring stale default best-checkpoint path."
+                )
         print(
             "[mm train] completed PPO training; best checkpoint path="
             f"{mm_best_ckpt.expanduser().resolve()}"
