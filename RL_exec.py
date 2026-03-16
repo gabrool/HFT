@@ -2596,6 +2596,61 @@ def _policy_action_from_obs_numpy(
     return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
 
 
+def _safe_metric_for_tiebreak(x: Any) -> float:
+    x_float = float(x)
+    return x_float if np.isfinite(x_float) else float("-inf")
+
+
+def _checkpoint_selection_metrics(report: Dict[str, Any]) -> Dict[str, float]:
+    initial_equity = float(report.get("initial_equity", 0.0))
+    final_equity = float(report.get("final_equity", initial_equity))
+    net_fee_cost = float(report.get("net_fee_cost", 0.0))
+
+    denom = max(initial_equity, 1e-12)
+    net_pnl = final_equity - initial_equity
+    net_pnl_pct = net_pnl / denom
+    gross_pnl = net_pnl + net_fee_cost
+    gross_pnl_pct = gross_pnl / denom
+
+    return {
+        "net_pnl": net_pnl,
+        "net_pnl_pct": net_pnl_pct,
+        "gross_pnl": gross_pnl,
+        "gross_pnl_pct": gross_pnl_pct,
+        "max_drawdown": float(report.get("max_drawdown", float("inf"))),
+        "sharpe_1h": _safe_metric_for_tiebreak(report.get("sharpe_1h", float("-inf"))),
+        "sortino_1h": _safe_metric_for_tiebreak(report.get("sortino_1h", float("-inf"))),
+    }
+
+
+def _checkpoint_survives_filters(sel: Dict[str, float], dd_cap: Optional[float]) -> Tuple[bool, str]:
+    if not np.isfinite(sel["net_pnl_pct"]):
+        return False, "non_finite_net_pnl_pct"
+    if sel["net_pnl_pct"] <= 0.0:
+        return False, "non_positive_net_pnl_pct"
+    if not np.isfinite(sel["max_drawdown"]):
+        return False, "non_finite_max_drawdown"
+    if dd_cap is not None and sel["max_drawdown"] > dd_cap:
+        return False, "drawdown_cap_exceeded"
+    return True, "ok"
+
+
+def _checkpoint_key(sel: Dict[str, float]) -> Tuple[float, float, float]:
+    return (
+        float(sel["net_pnl_pct"]),
+        float(sel["sharpe_1h"]),
+        float(sel["sortino_1h"]),
+    )
+
+
+def _strip_large_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
+    drop_keys = {
+        "equity_curve",
+        "pnl_curve",
+    }
+    return {k: v for k, v in report.items() if k not in drop_keys}
+
+
 def train_market_ppo(
     train_env: MarketMakingEnv,
     val_env: MarketMakingEnv,
@@ -2623,7 +2678,8 @@ def train_market_ppo(
         label="ppo_train",
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    best_report: Dict[str, Any] = {"sharpe": -np.inf}
+    best_report: Optional[Dict[str, Any]] = None
+    best_selection_key: Optional[Tuple[float, float, float]] = None
 
     for epoch in range(epochs):
         epoch_t0 = time.perf_counter()
@@ -2652,8 +2708,7 @@ def train_market_ppo(
         )
         if (epoch + 1) % config.val_every == 0:
             # Keep validation normalization aligned with training normalization at
-            # checkpoint-selection time; otherwise validation Sharpe is not
-            # comparable across epochs.
+            # checkpoint-selection time.
             val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
             report = evaluate_market_policy(
                 val_env,
@@ -2662,31 +2717,63 @@ def train_market_ppo(
                 delta_scale=delta_scale,
                 taker_scale=taker_scale,
             )
-            # Intentional in this patch: checkpoint selection remains on legacy
-            # report["sharpe"] with optional max_drawdown_guard.
-            sharpe = report["sharpe"]
-            drawdown = report["max_drawdown"]
+            sel = _checkpoint_selection_metrics(report)
             guard = config.max_drawdown_guard
-            if sharpe > best_report.get("sharpe", -np.inf) and (guard is None or drawdown <= guard):
-                best_report = report
-                if ckpt_path:
-                    val_report = {
-                        k: v for k, v in report.items() if k not in {"equity_curve"}
-                    }  # Prevent oversized checkpoints from embedding full curves.
-                    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(
-                        {
-                            "policy_state_dict": model.policy_net.state_dict(),
-                            "value_state_dict": model.value_net.state_dict(),
-                            "hidden_dims": tuple(config.policy_hidden),
-                            "action_dim": model.log_std.shape[0],
-                            "config": config.__dict__,
-                            "val_report": val_report,
-                            "obs_norm_state": train_env.get_obs_norm_state(),
-                        },
-                        ckpt_path,
+            candidate_ok, candidate_reason = _checkpoint_survives_filters(sel, guard)
+            print(
+                "[mm val] "
+                f"epoch={epoch + 1} "
+                f"net_pnl_pct={sel['net_pnl_pct']:.6f} "
+                f"sharpe_1h={sel['sharpe_1h']:.4f} "
+                f"sortino_1h={sel['sortino_1h']:.4f} "
+                f"max_dd={sel['max_drawdown']:.4f} "
+                f"candidate={candidate_ok} "
+                f"reason={candidate_reason}"
+            )
+            if candidate_ok:
+                candidate_key = _checkpoint_key(sel)
+                if best_selection_key is None or candidate_key > best_selection_key:
+                    best_selection_key = candidate_key
+                    best_report = report
+                    print(
+                        "[mm ckpt] "
+                        f"epoch={epoch + 1} "
+                        "selected=true "
+                        f"net_pnl_pct={sel['net_pnl_pct']:.6f} "
+                        f"sharpe_1h={sel['sharpe_1h']:.4f} "
+                        f"sortino_1h={sel['sortino_1h']:.4f} "
+                        f"max_dd={sel['max_drawdown']:.4f}"
                     )
+                    if ckpt_path:
+                        val_report = _strip_large_report_fields(report)
+                        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save(
+                            {
+                                "policy_state_dict": model.policy_net.state_dict(),
+                                "value_state_dict": model.value_net.state_dict(),
+                                "hidden_dims": tuple(config.policy_hidden),
+                                "action_dim": model.log_std.shape[0],
+                                "config": config.__dict__,
+                                "val_report": val_report,
+                                "obs_norm_state": train_env.get_obs_norm_state(),
+                                "selection_policy": {
+                                    "primary_metric": "net_pnl_pct",
+                                    "filters": {
+                                        "net_pnl_pct_positive": True,
+                                        "max_drawdown_le": guard,
+                                    },
+                                    "tie_breakers": ["sharpe_1h", "sortino_1h"],
+                                },
+                                "selection_metrics": sel,
+                                "selection_key": list(candidate_key),
+                                "selection_epoch": epoch + 1,
+                            },
+                            ckpt_path,
+                        )
         _timing_log(f"epoch={epoch + 1} total_secs={time.perf_counter() - epoch_t0:.4f}")
+    if best_report is None:
+        print("[mm ckpt] no validation checkpoint satisfied selection filters; no new PPO checkpoint saved.")
+        return model, {}
     return model, best_report
 
 
@@ -2808,15 +2895,38 @@ def evaluate_market_making(
     maker_opps = 0
     taker_steps = 0
     steps = 0
+    total_reward = 0.0
+    total_delta_equity = 0.0
+    total_inventory_penalty = 0.0
+    total_turnover_penalty = 0.0
+    total_maker_buy_markout = 0.0
+    total_maker_sell_markout = 0.0
+    maker_buy_clipped_steps = 0
+    maker_sell_clipped_steps = 0
+    taker_buy_clipped_steps = 0
+    taker_sell_clipped_steps = 0
+    last_mid = 0.0
     initial_equity = env.prev_equity
 
     done = False
     while not done:
         action = policy_fn(obs)
-        obs, _reward, done, info = env.step(action)
+        obs, reward, done, info = env.step(action)
         equity_curve.append(info["equity"])
         inventory_curve.append(info["inventory"])
         steps += 1
+        total_reward += float(reward)
+        total_delta_equity += float(info.get("delta_equity", 0.0))
+        total_inventory_penalty += float(info.get("inventory_penalty", 0.0))
+        total_turnover_penalty += float(info.get("turnover_penalty", 0.0))
+        total_maker_buy_markout += float(info.get("maker_buy_markout", 0.0))
+        total_maker_sell_markout += float(info.get("maker_sell_markout", 0.0))
+        maker_buy_clipped_steps += int(bool(info.get("maker_buy_clipped", False)))
+        maker_sell_clipped_steps += int(bool(info.get("maker_sell_clipped", False)))
+        taker_buy_clipped_steps += int(bool(info.get("taker_buy_clipped", False)))
+        taker_sell_clipped_steps += int(bool(info.get("taker_sell_clipped", False)))
+        last_mid = float(info.get("mid", 0.0))
+
         maker_buy = abs(float(info["maker_buy"]))
         maker_sell = abs(float(info["maker_sell"]))
         taker_buy = abs(float(info["taker_buy"]))
@@ -2884,10 +2994,23 @@ def evaluate_market_making(
     net_fee_bps_on_turnover = float(1e4 * net_fee_cost / turnover_notional) if turnover_notional > 0 else 0.0
     net_fee_pct_initial_equity = float(net_fee_cost / max(initial_equity, 1e-12))
     inventory_arr = np.array(inventory_curve, dtype=np.float32)
+    denom = max(float(initial_equity), 1e-12)
+    net_pnl = float(final_equity - float(initial_equity))
+    net_pnl_pct = float(net_pnl / denom)
+    gross_pnl = float(net_pnl + net_fee_cost)
+    gross_pnl_pct = float(gross_pnl / denom)
+    ending_inventory_qty = float(inventory_arr[-1]) if inventory_arr.size > 0 else 0.0
+    ending_inventory_notional = float(abs(ending_inventory_qty * last_mid))
+    maker_turnover_notional = float(turnover_notional - taker_notional)
+    maker_turnover_share = float(maker_turnover_notional / turnover_notional) if turnover_notional > 0 else 0.0
 
     return {
         "initial_equity": float(initial_equity),
         "final_equity": final_equity,
+        "net_pnl": net_pnl,
+        "net_pnl_pct": net_pnl_pct,
+        "gross_pnl": gross_pnl,
+        "gross_pnl_pct": gross_pnl_pct,
         "equity_curve": equity_arr,
         "pnl_curve": pnl_curve,
         "sharpe": sharpe,
@@ -2898,15 +3021,33 @@ def evaluate_market_making(
         "max_drawdown": max_drawdown,
         "turnover_qty": float(turnover_qty),
         "turnover_notional": float(turnover_notional),
+        "maker_turnover_notional": maker_turnover_notional,
+        "maker_turnover_share": maker_turnover_share,
         "maker_fill_rate": maker_fill_rate,
+        "maker_fill_count": int(maker_fill_count),
+        "maker_opportunities": int(maker_opps),
         "taker_usage_frequency": taker_usage_frequency,
         "taker_volume_share": taker_volume_share,
+        "taker_steps": int(taker_steps),
+        "steps": int(steps),
         "gross_taker_fees_paid": gross_taker_fees_paid,
         "gross_maker_rebates_earned": gross_maker_rebates_earned,
         "net_fee_cost": net_fee_cost,
         "net_fee_bps_on_turnover": net_fee_bps_on_turnover,
         "net_fee_pct_initial_equity": net_fee_pct_initial_equity,
         "fee_drag": fee_drag,
+        "ending_inventory_qty": ending_inventory_qty,
+        "ending_inventory_notional": ending_inventory_notional,
+        "total_reward": float(total_reward),
+        "total_delta_equity": float(total_delta_equity),
+        "total_inventory_penalty": float(total_inventory_penalty),
+        "total_turnover_penalty": float(total_turnover_penalty),
+        "total_maker_buy_markout": float(total_maker_buy_markout),
+        "total_maker_sell_markout": float(total_maker_sell_markout),
+        "maker_buy_clipped_steps": int(maker_buy_clipped_steps),
+        "maker_sell_clipped_steps": int(maker_sell_clipped_steps),
+        "taker_buy_clipped_steps": int(taker_buy_clipped_steps),
+        "taker_sell_clipped_steps": int(taker_sell_clipped_steps),
         "inventory_distribution": _inventory_distribution(inventory_arr),
         "cadence": {
             "step_ms": step_ms,
@@ -2921,7 +3062,12 @@ def evaluate_market_making(
 def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
     inv = metrics.get("inventory_distribution") or {}
     return (
-        f"{label}: sharpe={float(metrics.get('sharpe', 0.0)):.4f} "
+        f"{label}: final_equity={float(metrics.get('final_equity', 0.0)):.4f} "
+        f"net_pnl={float(metrics.get('net_pnl', 0.0)):.4f} "
+        f"net_pnl_pct={float(metrics.get('net_pnl_pct', 0.0)):.6f} "
+        f"gross_pnl={float(metrics.get('gross_pnl', 0.0)):.4f} "
+        f"gross_pnl_pct={float(metrics.get('gross_pnl_pct', 0.0)):.6f} "
+        f"sharpe={float(metrics.get('sharpe', 0.0)):.4f} "
         f"sharpe_5m={float(metrics.get('sharpe_5m', 0.0)):.4f} "
         f"sharpe_1h={float(metrics.get('sharpe_1h', 0.0)):.4f} "
         f"sortino_5m={float(metrics.get('sortino_5m', 0.0)):.4f} "
@@ -2932,7 +3078,10 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
         f"maker_fill_rate={float(metrics.get('maker_fill_rate', 0.0)):.4f} "
         f"taker_usage_freq={float(metrics.get('taker_usage_frequency', 0.0)):.4f} "
         f"taker_volume_share={float(metrics.get('taker_volume_share', 0.0)):.4f} "
-        f"fee_drag={float(metrics.get('fee_drag', 0.0)):.4f} "
+        f"gross_taker_fees_paid={float(metrics.get('gross_taker_fees_paid', 0.0)):.4f} "
+        f"gross_maker_rebates_earned={float(metrics.get('gross_maker_rebates_earned', 0.0)):.4f} "
+        f"net_fee_cost={float(metrics.get('net_fee_cost', 0.0)):.4f} "
+        f"fee_drag={float(metrics.get('fee_drag', 0.0)):.6f} "
         f"net_fee_bps_on_turnover={float(metrics.get('net_fee_bps_on_turnover', 0.0)):.4f} "
         f"inv[min={float(inv.get('min', 0.0)):.2f}, p50={float(inv.get('p50', 0.0)):.2f}, max={float(inv.get('max', 0.0)):.2f}]"
     )
@@ -3249,9 +3398,7 @@ def run_pipeline(
 
     if run_mode in {"train", "train_eval"}:
         print(f"[mm train] starting PPO training (run_mode={run_mode})")
-        # This call keeps existing checkpoint-selection behavior (legacy
-        # report["sharpe"] + optional max_drawdown_guard) unchanged.
-        train_market_ppo(
+        _trained_model, best_val_report = train_market_ppo(
             mm_train_env,
             mm_val_env,
             mm_obs_dim,
@@ -3271,6 +3418,10 @@ def run_pipeline(
         if not use_external_eval_ckpt:
             mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
         obs_norm_source = "train_env"
+        if best_val_report:
+            print(_format_mm_summary("[mm train] best_val", best_val_report))
+        else:
+            print("[mm train] no validation checkpoint satisfied selection filters.")
         print(
             "[mm train] completed PPO training; best checkpoint path="
             f"{mm_best_ckpt.expanduser().resolve()}"
