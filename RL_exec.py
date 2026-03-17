@@ -2328,7 +2328,7 @@ def collect_market_rollout(
                 next_obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32, **alloc_kwargs)
                 actions_buf = torch.empty((max_steps, action_dim), dtype=torch.float32, **alloc_kwargs)
             obs_t = obs_cpu.to(target_device, non_blocking=non_blocking)
-            with torch.inference_mode():
+            with torch.no_grad():
                 mean, log_std, value = model(obs_t.unsqueeze(0))
                 std = log_std.exp()
 
@@ -2380,7 +2380,7 @@ def collect_market_rollout(
     if torch.any(bootstrap_mask):
         boot_indices = torch.nonzero(bootstrap_mask, as_tuple=False).squeeze(-1)
         infer_bs = 4096
-        with torch.inference_mode():
+        with torch.no_grad():
             for start in range(0, int(boot_indices.shape[0]), infer_bs):
                 bootstrap_batches += 1
                 idx = boot_indices[start:start + infer_bs]
@@ -2601,7 +2601,7 @@ def _policy_action_from_obs_numpy(
     taker_scale: float,
 ) -> Tuple[float, float, float]:
     obs_t = torch.from_numpy(obs).float().to(device)
-    with torch.inference_mode():
+    with torch.no_grad():
         deltas = policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
     if deltas.shape[0] >= 3:
         return (
