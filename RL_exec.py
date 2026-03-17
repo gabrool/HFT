@@ -2186,7 +2186,7 @@ class MarketPolicyValueNet(nn.Module):
         policy_hidden: Iterable[int] = (128, 128),
         value_hidden: Iterable[int] = (128, 128),
         action_dim: int = 3,
-        init_log_std: float = -0.5,
+        init_log_std: float = -3.0,
     ):
         super().__init__()
         self.policy_net = MarketPolicyNet(input_dim, hidden_dims=policy_hidden, action_dim=action_dim)
@@ -2687,6 +2687,7 @@ def train_market_ppo(
         policy_hidden=config.policy_hidden,
         value_hidden=config.value_hidden,
         action_dim=int(os.environ.get("BYBIT_MM_ACTION_DIM", "3")),
+        init_log_std=config.init_log_std,
     ).to(device)
     if config.zero_residual_init:
         _init_zero_residual_policy(model, config.init_log_std)
