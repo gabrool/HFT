@@ -269,7 +269,7 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
     return [int(item) for item in raw.split(",") if item.strip()]
 
 
-def _resolve_cmssl_batch_size(default: int = 256) -> int:
+def _resolve_cmssl_batch_size(default: int = 32768) -> int:
     return _env_int("BYBIT_MM_CMSSL_BATCH_SIZE", default)
 
 
