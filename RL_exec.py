@@ -2200,6 +2200,20 @@ class MarketPolicyValueNet(nn.Module):
         return mean, log_std, value
 
 
+def _init_zero_residual_policy(model: MarketPolicyValueNet, init_log_std: float) -> None:
+    final_policy_linear: Optional[nn.Linear] = None
+    for module in model.policy_net.net.net:
+        if isinstance(module, nn.Linear):
+            final_policy_linear = module
+    if final_policy_linear is None:
+        raise RuntimeError("Could not find final policy linear layer for zero-residual init")
+    with torch.no_grad():
+        final_policy_linear.weight.zero_()
+        if final_policy_linear.bias is not None:
+            final_policy_linear.bias.zero_()
+        model.log_std.fill_(init_log_std)
+
+
 @dataclass
 class PPOConfig:
     gamma: float = 0.99
@@ -2214,9 +2228,11 @@ class PPOConfig:
     value_hidden: Tuple[int, ...] = (128, 128)
     val_every: int = 1
     max_drawdown_guard: Optional[float] = None
-    rollout_horizon: int = 2048
-    rollouts_per_epoch: int = 1
+    rollout_horizon: int = 32768
+    rollouts_per_epoch: int = 16
     randomize_rollout_start: bool = True
+    zero_residual_init: bool = True
+    init_log_std: float = -3.0
 
 
 def compute_gae(
@@ -2672,10 +2688,20 @@ def train_market_ppo(
         value_hidden=config.value_hidden,
         action_dim=int(os.environ.get("BYBIT_MM_ACTION_DIM", "3")),
     ).to(device)
+    if config.zero_residual_init:
+        _init_zero_residual_policy(model, config.init_log_std)
     model = _maybe_compile_module(
         model,
         enabled=_env_bool("BYBIT_MM_COMPILE_PPO", False),
         label="ppo_train",
+    )
+    print(
+        "[mm ppo init] "
+        f"rollout_horizon={config.rollout_horizon} "
+        f"rollouts_per_epoch={config.rollouts_per_epoch} "
+        f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
+        f"zero_residual_init={config.zero_residual_init} "
+        f"init_log_std={config.init_log_std:.4f}"
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     best_report: Optional[Dict[str, Any]] = None
@@ -3360,12 +3386,13 @@ def run_pipeline(
         value_coef=float(os.environ.get("BYBIT_MM_PPO_VALUE_COEF", "0.5")),
         policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")),
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
-        val_every=int(os.environ.get("BYBIT_MM_PPO_VAL_EVERY", "1")),
-        max_drawdown_guard=float(os.environ.get("BYBIT_MM_PPO_MAX_DRAWDOWN", "nan")),
-        rollout_horizon=int(os.environ.get("BYBIT_MM_PPO_ROLLOUT_HORIZON", "2048")),
-        rollouts_per_epoch=int(os.environ.get("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", "1")),
-        randomize_rollout_start=os.environ.get("BYBIT_MM_PPO_RANDOMIZE_START", "true").strip().lower()
-        in {"1", "true", "yes", "y", "on"},
+        val_every=_env_int("BYBIT_MM_PPO_VAL_EVERY", 1),
+        max_drawdown_guard=_env_float("BYBIT_MM_PPO_MAX_DRAWDOWN", float("nan")),
+        rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 32768),
+        rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
+        randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
+        zero_residual_init=_env_bool("BYBIT_MM_PPO_ZERO_RESIDUAL_INIT", True),
+        init_log_std=_env_float("BYBIT_MM_PPO_INIT_LOG_STD", -3.0),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
