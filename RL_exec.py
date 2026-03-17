@@ -1151,7 +1151,7 @@ def build_joined_split(
     model,
     meta: dict,
     device: str,
-    batch_size: int = 256,
+    batch_size: int = 32768,
 ) -> Dict[str, np.ndarray]:
     t0 = time.perf_counter()
     week_outputs: List[Dict[str, np.ndarray]] = []
