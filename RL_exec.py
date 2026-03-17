@@ -724,7 +724,7 @@ def run_cmssl_inference(
     meta: dict,
     x_core: np.ndarray,
     x_aux: np.ndarray,
-    batch_size: int = 256,
+    batch_size: int = 32768,
     device: str = "cuda",
 ) -> Dict[str, np.ndarray]:
     """Run CMSSL inference for batched inputs; empty batches are valid."""
