@@ -5,7 +5,7 @@ import warnings
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -327,6 +327,10 @@ def _diag_gaussian_logprob(x: torch.Tensor, mean: torch.Tensor, log_std: torch.T
 
 def _diag_gaussian_entropy(log_std: torch.Tensor) -> torch.Tensor:
     return (log_std + 0.5 * (1.0 + LOG_2PI)).sum(dim=-1)
+
+
+def _resolve_market_action_dim(allow_taker: bool) -> int:
+    return 3 if bool(allow_taker) else 2
 
 
 def _ppo_action_bounds(
@@ -2437,7 +2441,8 @@ def collect_market_rollout(
                     action_high,
                 )
 
-            next_obs, reward, env_done, _info = env.step(action_env.squeeze(0).cpu().numpy())
+            env_action = _market_env_action_tuple(action_env.squeeze(0).detach().cpu().numpy())
+            next_obs, reward, env_done, _info = env.step(env_action)
             steps += 1
             terminated = bool(env_done)
             # Truncation means the rollout horizon ended; it is not a true
@@ -2695,6 +2700,13 @@ def evaluate_market_policy(
     return evaluate_market_making(env, _policy_fn)
 
 
+def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float]:
+    action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
+    require(action_arr.shape[0] >= 2, f"Expected at least 2 action dimensions, got shape={action_arr.shape}")
+    taker_delta = float(action_arr[2]) if action_arr.shape[0] >= 3 else 0.0
+    return float(action_arr[0]), float(action_arr[1]), taker_delta
+
+
 def evaluate_market_policy_ppo(
     env: MarketMakingEnv,
     model: MarketPolicyValueNet,
@@ -2716,9 +2728,7 @@ def evaluate_market_policy_ppo(
             taker_scale=taker_scale,
             env=env,
         )
-        if action.shape[0] >= 3:
-            return float(action[0]), float(action[1]), float(action[2])
-        return float(action[0]), float(action[1]), 0.0
+        return _market_env_action_tuple(action)
 
     return evaluate_market_making(env, _policy_fn)
 
@@ -2975,7 +2985,7 @@ def load_market_ppo_model(
         value_hidden_dims = tuple(
             int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")
         )
-    action_dim = int(ckpt.get("action_dim", os.environ.get("BYBIT_MM_ACTION_DIM", "3")))
+    action_dim = int(ckpt.get("action_dim", _resolve_market_action_dim(True)))
 
     model = MarketPolicyValueNet(
         input_dim,
@@ -3046,11 +3056,12 @@ def train_market_ppo(
     stochastic_val_seed = _env_int("BYBIT_MM_PPO_VAL_SEED", 0)
     compile_enabled = _env_bool("BYBIT_MM_COMPILE_PPO", False)
     compile_mode = os.environ.get("BYBIT_MM_COMPILE_MODE", "reduce-overhead")
+    action_dim = _resolve_market_action_dim(train_env.allow_taker)
     model = MarketPolicyValueNet(
         input_dim,
         policy_hidden=config.policy_hidden,
         value_hidden=config.value_hidden,
-        action_dim=int(os.environ.get("BYBIT_MM_ACTION_DIM", "3")),
+        action_dim=action_dim,
         init_log_std=config.init_log_std,
     ).to(device)
     if config.zero_residual_init:
@@ -3097,11 +3108,13 @@ def train_market_ppo(
     )
     print(
         "[mm ppo bounds] "
+        f"action_dim={action_dim} "
         f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
         f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
         f"env_delta_bps_limit={train_env.delta_bps_limit:.4f} "
         f"allow_taker={train_env.allow_taker} "
         f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
+        f"env_action={_market_env_action_tuple(bounded_probe_action)} "
         f"bounded_before_step={within_bounds}"
     )
     print(
@@ -3725,7 +3738,7 @@ def load_market_policy(
     if isinstance(ckpt, dict) and "action_dim" in ckpt:
         action_dim = int(ckpt["action_dim"])
     else:
-        action_dim = int(os.environ.get("BYBIT_MM_ACTION_DIM", "3"))
+        action_dim = _resolve_market_action_dim(True)
     model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims, action_dim=action_dim).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
