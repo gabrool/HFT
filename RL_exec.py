@@ -3017,8 +3017,9 @@ def load_market_ppo_model(
     if not isinstance(state, dict):
         if not has_any_canonical_metadata:
             raise ValueError(
-                "Legacy deterministic market-policy checkpoints are no longer supported. "
-                "Re-export or retrain under the PPO checkpoint format."
+                "Unsupported RL checkpoint format. Only canonical full PPO checkpoints are supported. "
+                "Re-export or retrain under the PPO checkpoint format with model_state_dict, "
+                "policy_hidden_dims, value_hidden_dims, and action_dim."
             )
         raise ValueError(
             "Malformed canonical market PPO checkpoint: model_state_dict is missing or not a mapping."
