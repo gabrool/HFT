@@ -3433,7 +3433,7 @@ def evaluate_market_making(
     steps = 0
     total_reward = 0.0
     total_delta_equity = 0.0
-    total_inventory_penalty = 0.0
+    inventory_penalty_total = 0.0
     total_turnover_penalty = 0.0
     total_maker_buy_markout = 0.0
     total_maker_sell_markout = 0.0
@@ -3453,7 +3453,10 @@ def evaluate_market_making(
         steps += 1
         total_reward += float(reward)
         total_delta_equity += float(info.get("delta_equity", 0.0))
-        total_inventory_penalty += float(info.get("inventory_penalty", 0.0))
+        step_inventory_penalty_total = info.get("inventory_penalty_total")
+        if step_inventory_penalty_total is None:
+            step_inventory_penalty_total = info.get("inventory_penalty", 0.0)
+        inventory_penalty_total += float(step_inventory_penalty_total)
         total_turnover_penalty += float(info.get("turnover_penalty", 0.0))
         total_maker_buy_markout += float(info.get("maker_buy_markout", 0.0))
         total_maker_sell_markout += float(info.get("maker_sell_markout", 0.0))
@@ -3576,7 +3579,7 @@ def evaluate_market_making(
         "ending_inventory_notional": ending_inventory_notional,
         "total_reward": float(total_reward),
         "total_delta_equity": float(total_delta_equity),
-        "total_inventory_penalty": float(total_inventory_penalty),
+        "inventory_penalty_total": float(inventory_penalty_total),
         "total_turnover_penalty": float(total_turnover_penalty),
         "total_maker_buy_markout": float(total_maker_buy_markout),
         "total_maker_sell_markout": float(total_maker_sell_markout),
@@ -3619,6 +3622,7 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
         f"net_fee_cost={float(metrics.get('net_fee_cost', 0.0)):.4f} "
         f"fee_drag={float(metrics.get('fee_drag', 0.0)):.6f} "
         f"net_fee_bps_on_turnover={float(metrics.get('net_fee_bps_on_turnover', 0.0)):.4f} "
+        f"inventory_penalty_total={float(metrics.get('inventory_penalty_total', 0.0)):.4f} "
         f"inv[min={float(inv.get('min', 0.0)):.2f}, p50={float(inv.get('p50', 0.0)):.2f}, max={float(inv.get('max', 0.0)):.2f}]"
     )
 
