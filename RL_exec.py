@@ -2692,7 +2692,6 @@ def evaluate_market_policy(
     device: str = "cuda",
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
-    deterministic_action_semantics: Optional[str] = None,
 ) -> Dict[str, Any]:
     def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
         return _policy_action_from_obs_numpy(
@@ -2702,7 +2701,6 @@ def evaluate_market_policy(
             delta_scale,
             taker_scale,
             env=env,
-            deterministic_action_semantics=deterministic_action_semantics,
         )
 
     return evaluate_market_making(env, _policy_fn)
@@ -2741,70 +2739,13 @@ def evaluate_market_policy_ppo(
     return evaluate_market_making(env, _policy_fn)
 
 
-def _normalize_deterministic_action_semantics(value: Optional[str]) -> str:
-    if value is None:
-        return "bounded_harmonized"
-    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "bounded": "bounded_harmonized",
-        "harmonized": "bounded_harmonized",
-        "ppo_bounded": "bounded_harmonized",
-        "legacy": "legacy_linear",
-        "linear": "legacy_linear",
-    }
-    normalized = aliases.get(normalized, normalized)
-    allowed = {"bounded_harmonized", "legacy_linear"}
-    require(
-        normalized in allowed,
-        f"Unsupported deterministic action semantics '{value}'. Allowed: {sorted(allowed)}",
-    )
-    return normalized
-
-
-def _resolve_deterministic_action_semantics(
-    checkpoint_data: Optional[Any] = None,
-) -> Tuple[str, str]:
-    raw_env = os.environ.get("BYBIT_MM_DETERMINISTIC_ACTION_SEMANTICS", "").strip()
-    if raw_env:
-        return _normalize_deterministic_action_semantics(raw_env), "env"
-    if isinstance(checkpoint_data, dict):
-        for key in (
-            "deterministic_action_semantics",
-            "policy_action_semantics",
-            "action_semantics",
-        ):
-            raw = checkpoint_data.get(key)
-            if raw is not None:
-                return _normalize_deterministic_action_semantics(raw), f"checkpoint:{key}"
-    return "bounded_harmonized", "default"
-
-
-def _legacy_linear_market_action(
-    raw_action: torch.Tensor,
-    delta_scale: float,
-    taker_scale: float,
-) -> torch.Tensor:
-    scale = raw_action.new_ones(raw_action.shape[-1])
-    if raw_action.shape[-1] >= 1:
-        scale[0] = float(delta_scale)
-    if raw_action.shape[-1] >= 2:
-        scale[1] = float(delta_scale)
-    if raw_action.shape[-1] >= 3:
-        scale[2] = float(taker_scale)
-    return raw_action * scale
-
-
 def _deterministic_env_action_from_model_output(
     raw_action: torch.Tensor,
     *,
     env: Optional[MarketMakingEnv],
     delta_scale: float,
     taker_scale: float,
-    deterministic_action_semantics: str,
 ) -> torch.Tensor:
-    semantics = _normalize_deterministic_action_semantics(deterministic_action_semantics)
-    if semantics == "legacy_linear":
-        return _legacy_linear_market_action(raw_action, delta_scale, taker_scale)
     action_low, action_high = _ppo_action_bounds(
         env,
         int(raw_action.shape[-1]),
@@ -2823,13 +2764,7 @@ def _policy_action_from_obs_numpy(
     taker_scale: float,
     *,
     env: Optional[MarketMakingEnv] = None,
-    deterministic_action_semantics: Optional[str] = None,
 ) -> Tuple[float, float, float]:
-    semantics = _normalize_deterministic_action_semantics(
-        deterministic_action_semantics
-        if deterministic_action_semantics is not None
-        else getattr(policy, "deterministic_action_semantics", None)
-    )
     obs_t = torch.from_numpy(obs).float().to(device)
     with torch.no_grad():
         raw_action = policy(obs_t.unsqueeze(0)).squeeze(0)
@@ -2838,7 +2773,6 @@ def _policy_action_from_obs_numpy(
             env=env,
             delta_scale=delta_scale,
             taker_scale=taker_scale,
-            deterministic_action_semantics=semantics,
         )
     return _market_env_action_tuple(action_env.cpu().numpy())
 
@@ -3016,10 +2950,6 @@ def save_market_ppo_checkpoint(
     torch.save(payload, ckpt_path)
 
 
-class LegacyPPOCheckpointError(ValueError):
-    """Raised when a checkpoint is recognized as a legacy deterministic payload."""
-
-
 def _is_new_format_market_ppo_checkpoint(ckpt: Dict[str, Any]) -> bool:
     if "model_state_dict" in ckpt:
         return True
@@ -3028,12 +2958,6 @@ def _is_new_format_market_ppo_checkpoint(ckpt: Dict[str, Any]) -> bool:
         return format_version is not None and int(format_version) >= 2
     except (TypeError, ValueError):
         return False
-
-
-def _is_legacy_market_policy_checkpoint(ckpt: Dict[str, Any]) -> bool:
-    if "policy_state_dict" in ckpt:
-        return True
-    return "state_dict" in ckpt and "model_state_dict" not in ckpt
 
 
 def load_market_ppo_model(
@@ -3085,31 +3009,18 @@ def load_market_ppo_model(
         action_dim=action_dim,
     ).to(device)
 
-    if _is_new_format_market_ppo_checkpoint(ckpt):
-        state = ckpt.get("model_state_dict")
-        if not isinstance(state, dict):
-            raise ValueError(
-                "Malformed new-format market PPO checkpoint: format_version>=2 or model_state_dict "
-                "was detected, but model_state_dict is missing or not a mapping."
-            )
-        model.load_state_dict(state, strict=True)
-    else:
-        policy_state = ckpt.get("policy_state_dict")
-        value_state = ckpt.get("value_state_dict")
-        if not isinstance(policy_state, dict) or not isinstance(value_state, dict):
-            raise LegacyPPOCheckpointError(
-                "Legacy market PPO checkpoint detected, but it cannot be loaded into the PPO "
-                "policy/value model because policy_state_dict and value_state_dict are required."
-            )
-        model.policy_net.load_state_dict(policy_state, strict=True)
-        model.value_net.load_state_dict(value_state, strict=True)
-        if "log_std" in ckpt:
-            model.log_std.data.copy_(torch.as_tensor(ckpt["log_std"], device=model.log_std.device))
-        else:
-            warnings.warn(
-                "Legacy market PPO checkpoint loaded without saved log_std; using constructor-default log_std.",
-                RuntimeWarning,
-            )
+    if not _is_new_format_market_ppo_checkpoint(ckpt):
+        raise ValueError(
+            "Legacy deterministic market-policy checkpoints are no longer supported. "
+            "Re-export or retrain under the PPO checkpoint format."
+        )
+    state = ckpt.get("model_state_dict")
+    if not isinstance(state, dict):
+        raise ValueError(
+            "Malformed new-format market PPO checkpoint: format_version>=2 or model_state_dict "
+            "was detected, but model_state_dict is missing or not a mapping."
+        )
+    model.load_state_dict(state, strict=True)
 
     model.eval()
     model = _maybe_compile_module(
@@ -3137,13 +3048,6 @@ def train_market_ppo(
     config = config or PPOConfig()
     checkpoint_metric_mode = _resolve_checkpoint_metric_mode()
     validation_modes = ("deterministic", "stochastic")
-    legacy_val_stochastic_raw = os.environ.get("BYBIT_MM_PPO_VAL_STOCHASTIC", "")
-    if legacy_val_stochastic_raw.strip():
-        warnings.warn(
-            "BYBIT_MM_PPO_VAL_STOCHASTIC is deprecated: train_market_ppo() always runs both "
-            "deterministic and stochastic validation, and this variable no longer changes behavior.",
-            DeprecationWarning,
-        )
     stochastic_val_seed = _env_int("BYBIT_MM_PPO_VAL_SEED", 0)
     compile_enabled = _env_bool("BYBIT_MM_COMPILE_PPO", False)
     compile_mode = os.environ.get("BYBIT_MM_COMPILE_MODE", "reduce-overhead")
@@ -3771,104 +3675,22 @@ def load_market_policy(
         if checkpoint_data is not None
         else _torch_load_trusted_checkpoint(path, map_location=device)
     )
-    deterministic_action_semantics, deterministic_semantics_source = (
-        _resolve_deterministic_action_semantics(ckpt)
+    ppo_model = load_market_ppo_model(
+        input_dim,
+        device=device,
+        ckpt_path=ckpt_path,
+        require_checkpoint=require_checkpoint,
+        checkpoint_data=ckpt,
     )
-    if isinstance(ckpt, dict) and _is_new_format_market_ppo_checkpoint(ckpt):
-        ppo_model = load_market_ppo_model(
-            input_dim,
-            device=device,
-            ckpt_path=ckpt_path,
-            require_checkpoint=require_checkpoint,
-            checkpoint_data=ckpt,
-        )
-        if ppo_model is None:
-            return None
-        setattr(ppo_model.policy_net, "deterministic_action_semantics", "bounded_harmonized")
-        setattr(ppo_model.policy_net, "deterministic_action_semantics_source", "ppo_checkpoint")
-        return ppo_model.policy_net
-
-    if isinstance(ckpt, dict):
-        if "policy_state_dict" in ckpt:
-            state = ckpt["policy_state_dict"]
-            warnings.warn(
-                "Legacy market policy checkpoint detected via policy_state_dict; loading with "
-                "deterministic fallback compatibility path.",
-                RuntimeWarning,
-            )
-        elif "state_dict" in ckpt and "model_state_dict" not in ckpt:
-            state = ckpt["state_dict"]
-            warnings.warn(
-                "Legacy market policy checkpoint detected via deterministic state_dict; loading "
-                "with fallback compatibility path.",
-                RuntimeWarning,
-            )
-        else:
-            try:
-                ppo_model = load_market_ppo_model(
-                    input_dim,
-                    device=device,
-                    ckpt_path=ckpt_path,
-                    require_checkpoint=require_checkpoint,
-                    checkpoint_data=ckpt,
-                )
-            except LegacyPPOCheckpointError:
-                ppo_model = None
-            else:
-                if ppo_model is None:
-                    return None
-                setattr(ppo_model.policy_net, "deterministic_action_semantics", "bounded_harmonized")
-                setattr(ppo_model.policy_net, "deterministic_action_semantics_source", "ppo_checkpoint")
-                return ppo_model.policy_net
-            if not _is_legacy_market_policy_checkpoint(ckpt):
-                raise ValueError(
-                    "Malformed market PPO checkpoint: payload is not a recognized legacy "
-                    "deterministic format and new-format PPO loading failed."
-                )
-            raise LegacyPPOCheckpointError(
-                "Legacy market checkpoint detected, but deterministic fallback could not "
-                "identify a compatible state_dict payload."
-            )
-    else:
-        state = ckpt
-        warnings.warn(
-            "Legacy market policy checkpoint detected as a raw state_dict payload; loading with "
-            "deterministic fallback compatibility path.",
-            RuntimeWarning,
-        )
-    hidden_dims = ckpt.get("hidden_dims") if isinstance(ckpt, dict) else None
-    if hidden_dims is None:
-        hidden_dims = tuple(
-            int(x) for x in os.environ.get("BYBIT_MM_POLICY_HIDDEN", "128,128").split(",")
-        )
-    if isinstance(ckpt, dict) and "action_dim" in ckpt:
-        action_dim = int(ckpt["action_dim"])
-    else:
-        action_dim = _resolve_market_action_dim(True)
-    model = MarketPolicyNet(input_dim, hidden_dims=hidden_dims, action_dim=action_dim).to(device)
-    model.load_state_dict(state, strict=True)
-    model.eval()
-    model = _maybe_compile_module(
-        model,
-        enabled=_env_bool("BYBIT_MM_COMPILE_PPO", False),
-        label="ppo_eval_policy",
-    )
-    setattr(model, "deterministic_action_semantics", deterministic_action_semantics)
-    setattr(model, "deterministic_action_semantics_source", deterministic_semantics_source)
-    setattr(model, "checkpoint_path", str(path.expanduser().resolve()))
+    if ppo_model is None:
+        return None
+    setattr(ppo_model.policy_net, "checkpoint_path", str(path.expanduser().resolve()))
     print(
         "[mm deterministic policy] "
         f"path={path.expanduser().resolve()} "
-        f"action_semantics={deterministic_action_semantics} "
-        f"source={deterministic_semantics_source}"
+        "action_semantics=bounded_harmonized source=code"
     )
-    if deterministic_action_semantics == "legacy_linear":
-        warnings.warn(
-            "Deterministic market policy evaluation is using explicit legacy_linear action "
-            "semantics for checkpoint compatibility.",
-            RuntimeWarning,
-        )
-    return model
+    return ppo_model.policy_net
 
 
 def run_pipeline(
@@ -3934,7 +3756,6 @@ def run_pipeline(
     #   BYBIT_MM_INVENTORY_NOTIONAL_SCALE
     # Required delta control knob (basis points, bps):
     #   BYBIT_MM_DELTA_BPS_LIMIT
-    # Migration: BYBIT_MM_NOTIONAL_SCALE removed; set BYBIT_MM_INVENTORY_NOTIONAL_SCALE explicitly.
     # Units are quote notional (USD), not base units.
     inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
     if not inv_soft_notional_str:
@@ -4103,8 +3924,6 @@ def run_pipeline(
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
     rl_policy_eval_mode = "deterministic_mean"
-    rl_deterministic_action_semantics = None
-    rl_deterministic_action_semantics_source = None
     obs_norm_source = "env_default"
     saved_new_ckpt_this_run = False
 
@@ -4252,8 +4071,6 @@ def run_pipeline(
         if mm_ppo_model is not None:
             rl_policy_loaded = True
             rl_policy_eval_mode = "stochastic_sample" if ppo_eval_stochastic else "deterministic_mean"
-            rl_deterministic_action_semantics = "bounded_harmonized"
-            rl_deterministic_action_semantics_source = "ppo_eval"
             stochastic_generator = None
             if ppo_eval_stochastic:
                 stochastic_generator = torch.Generator(device=torch.device(device).type)
@@ -4279,21 +4096,7 @@ def run_pipeline(
             else:
                 rl_policy_loaded = True
                 rl_policy_eval_mode = "deterministic_mean"
-                rl_deterministic_action_semantics = getattr(
-                    mm_policy,
-                    "deterministic_action_semantics",
-                    "bounded_harmonized",
-                )
-                rl_deterministic_action_semantics_source = getattr(
-                    mm_policy,
-                    "deterministic_action_semantics_source",
-                    "default",
-                )
-                print(
-                    "[mm eval] deterministic policy action semantics="
-                    f"{rl_deterministic_action_semantics} "
-                    f"source={rl_deterministic_action_semantics_source}"
-                )
+                print("[mm eval] deterministic policy action semantics=bounded_harmonized source=code")
 
                 def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
                     return _policy_action_from_obs_numpy(
@@ -4303,7 +4106,6 @@ def run_pipeline(
                         delta_scale,
                         taker_scale,
                         env=mm_test_env,
-                        deterministic_action_semantics=rl_deterministic_action_semantics,
                     )
 
             rl_eval_t0 = time.perf_counter()
@@ -4330,8 +4132,6 @@ def run_pipeline(
             "external_rl_ckpt_explicit": external_ckpt_explicit,
             "obs_norm_source": obs_norm_source,
             "require_rl_ckpt": require_rl_ckpt,
-            "deterministic_action_semantics": rl_deterministic_action_semantics,
-            "deterministic_action_semantics_source": rl_deterministic_action_semantics_source,
         },
         "mm_rl_policy_loaded": {
             "loaded": rl_policy_loaded,
@@ -4339,8 +4139,6 @@ def run_pipeline(
             "path": resolved_eval_ckpt,
             "require_checkpoint": require_rl_ckpt,
             "eval_mode": rl_policy_eval_mode,
-            "deterministic_action_semantics": rl_deterministic_action_semantics,
-            "deterministic_action_semantics_source": rl_deterministic_action_semantics_source,
             "ppo_eval_stochastic": ppo_eval_stochastic if run_mode != "train" else False,
             "ppo_eval_seed": ppo_eval_seed if run_mode != "train" else None,
         },
