@@ -3022,11 +3022,14 @@ def train_market_ppo(
             )
             deterministic_sel = _checkpoint_selection_metrics(deterministic_report)
             stochastic_sel = _checkpoint_selection_metrics(stochastic_report)
-            selected_mode = checkpoint_metric_mode
-            selected_report = deterministic_report if selected_mode == "deterministic" else stochastic_report
-            selected_sel = deterministic_sel if selected_mode == "deterministic" else stochastic_sel
             guard = config.max_drawdown_guard
-            candidate_ok, candidate_reason = _checkpoint_survives_filters(selected_sel, guard)
+            det_candidate_ok, det_candidate_reason = _checkpoint_survives_filters(
+                deterministic_sel, guard
+            )
+            stoch_candidate_ok, stoch_candidate_reason = _checkpoint_survives_filters(
+                stochastic_sel, guard
+            )
+            selected_mode = checkpoint_metric_mode
             print(
                 "[mm val deterministic] "
                 f"epoch={epoch + 1} "
@@ -3035,8 +3038,9 @@ def train_market_ppo(
                 f"sortino_1h={deterministic_sel['sortino_1h']:.4f} "
                 f"max_dd={deterministic_sel['max_drawdown']:.4f} "
                 "policy=mean "
-                f"candidate={candidate_ok} "
-                f"reason={candidate_reason}"
+                f"candidate_mode={selected_mode} "
+                f"candidate={det_candidate_ok} "
+                f"reason={det_candidate_reason}"
             )
             print(
                 "[mm val stochastic] "
@@ -3047,9 +3051,16 @@ def train_market_ppo(
                 f"max_dd={stochastic_sel['max_drawdown']:.4f} "
                 f"seed={stochastic_val_seed} "
                 f"candidate_mode={selected_mode} "
-                f"candidate={candidate_ok} "
-                f"reason={candidate_reason}"
+                f"candidate={stoch_candidate_ok} "
+                f"reason={stoch_candidate_reason}"
             )
+            selected_report = (
+                deterministic_report if selected_mode == "deterministic" else stochastic_report
+            )
+            selected_sel = (
+                deterministic_sel if selected_mode == "deterministic" else stochastic_sel
+            )
+            candidate_ok, candidate_reason = _checkpoint_survives_filters(selected_sel, guard)
             if candidate_ok:
                 candidate_key = _checkpoint_key(selected_sel)
                 if best_selection_key is None or candidate_key > best_selection_key:
