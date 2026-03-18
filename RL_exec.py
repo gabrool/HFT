@@ -384,12 +384,20 @@ def _sample_bounded_ppo_action(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     std = log_std.exp()
     latent_action, _eps = _diag_gaussian_sample(mean, std, generator=generator)
-    squashed = torch.tanh(latent_action)
-    action_mid = 0.5 * (action_high + action_low)
-    action_half_range = 0.5 * (action_high - action_low)
-    action_env = action_mid + action_half_range * squashed
+    action_env = _postprocess_bounded_env_action(latent_action, action_low, action_high)
     logp = _squashed_gaussian_log_prob(latent_action, mean, log_std, action_low, action_high)
     return action_env, logp, latent_action
+
+
+def _postprocess_bounded_env_action(
+    latent_action: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+) -> torch.Tensor:
+    squashed_action = torch.tanh(latent_action)
+    action_mid = 0.5 * (action_high + action_low)
+    action_half_range = 0.5 * (action_high - action_low)
+    return action_mid + action_half_range * squashed_action
 
 
 def _bounded_ppo_mean_action(
@@ -397,10 +405,7 @@ def _bounded_ppo_mean_action(
     action_low: torch.Tensor,
     action_high: torch.Tensor,
 ) -> torch.Tensor:
-    squashed_mean = torch.tanh(mean)
-    action_mid = 0.5 * (action_high + action_low)
-    action_half_range = 0.5 * (action_high - action_low)
-    return action_mid + action_half_range * squashed_mean
+    return _postprocess_bounded_env_action(mean, action_low, action_high)
 
 
 def _bounded_ppo_latent_action(
@@ -2687,6 +2692,7 @@ def evaluate_market_policy(
     device: str = "cuda",
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
+    deterministic_action_semantics: Optional[str] = None,
 ) -> Dict[str, Any]:
     def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
         return _policy_action_from_obs_numpy(
@@ -2695,6 +2701,8 @@ def evaluate_market_policy(
             device,
             delta_scale,
             taker_scale,
+            env=env,
+            deterministic_action_semantics=deterministic_action_semantics,
         )
 
     return evaluate_market_making(env, _policy_fn)
@@ -2733,23 +2741,106 @@ def evaluate_market_policy_ppo(
     return evaluate_market_making(env, _policy_fn)
 
 
+def _normalize_deterministic_action_semantics(value: Optional[str]) -> str:
+    if value is None:
+        return "bounded_harmonized"
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "bounded": "bounded_harmonized",
+        "harmonized": "bounded_harmonized",
+        "ppo_bounded": "bounded_harmonized",
+        "legacy": "legacy_linear",
+        "linear": "legacy_linear",
+    }
+    normalized = aliases.get(normalized, normalized)
+    allowed = {"bounded_harmonized", "legacy_linear"}
+    require(
+        normalized in allowed,
+        f"Unsupported deterministic action semantics '{value}'. Allowed: {sorted(allowed)}",
+    )
+    return normalized
+
+
+def _resolve_deterministic_action_semantics(
+    checkpoint_data: Optional[Any] = None,
+) -> Tuple[str, str]:
+    raw_env = os.environ.get("BYBIT_MM_DETERMINISTIC_ACTION_SEMANTICS", "").strip()
+    if raw_env:
+        return _normalize_deterministic_action_semantics(raw_env), "env"
+    if isinstance(checkpoint_data, dict):
+        for key in (
+            "deterministic_action_semantics",
+            "policy_action_semantics",
+            "action_semantics",
+        ):
+            raw = checkpoint_data.get(key)
+            if raw is not None:
+                return _normalize_deterministic_action_semantics(raw), f"checkpoint:{key}"
+    return "bounded_harmonized", "default"
+
+
+def _legacy_linear_market_action(
+    raw_action: torch.Tensor,
+    delta_scale: float,
+    taker_scale: float,
+) -> torch.Tensor:
+    scale = raw_action.new_ones(raw_action.shape[-1])
+    if raw_action.shape[-1] >= 1:
+        scale[0] = float(delta_scale)
+    if raw_action.shape[-1] >= 2:
+        scale[1] = float(delta_scale)
+    if raw_action.shape[-1] >= 3:
+        scale[2] = float(taker_scale)
+    return raw_action * scale
+
+
+def _deterministic_env_action_from_model_output(
+    raw_action: torch.Tensor,
+    *,
+    env: Optional[MarketMakingEnv],
+    delta_scale: float,
+    taker_scale: float,
+    deterministic_action_semantics: str,
+) -> torch.Tensor:
+    semantics = _normalize_deterministic_action_semantics(deterministic_action_semantics)
+    if semantics == "legacy_linear":
+        return _legacy_linear_market_action(raw_action, delta_scale, taker_scale)
+    action_low, action_high = _ppo_action_bounds(
+        env,
+        int(raw_action.shape[-1]),
+        raw_action.device,
+        delta_scale,
+        taker_scale,
+    )
+    return _postprocess_bounded_env_action(raw_action, action_low, action_high)
+
+
 def _policy_action_from_obs_numpy(
     obs: np.ndarray,
     policy: torch.nn.Module,
     device: str,
     delta_scale: float,
     taker_scale: float,
+    *,
+    env: Optional[MarketMakingEnv] = None,
+    deterministic_action_semantics: Optional[str] = None,
 ) -> Tuple[float, float, float]:
+    semantics = _normalize_deterministic_action_semantics(
+        deterministic_action_semantics
+        if deterministic_action_semantics is not None
+        else getattr(policy, "deterministic_action_semantics", None)
+    )
     obs_t = torch.from_numpy(obs).float().to(device)
     with torch.no_grad():
-        deltas = policy(obs_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-    if deltas.shape[0] >= 3:
-        return (
-            float(deltas[0] * delta_scale),
-            float(deltas[1] * delta_scale),
-            float(deltas[2] * taker_scale),
+        raw_action = policy(obs_t.unsqueeze(0)).squeeze(0)
+        action_env = _deterministic_env_action_from_model_output(
+            raw_action,
+            env=env,
+            delta_scale=delta_scale,
+            taker_scale=taker_scale,
+            deterministic_action_semantics=semantics,
         )
-    return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
+    return _market_env_action_tuple(action_env.cpu().numpy())
 
 
 def _ppo_action_from_obs_numpy(
@@ -3680,6 +3771,9 @@ def load_market_policy(
         if checkpoint_data is not None
         else _torch_load_trusted_checkpoint(path, map_location=device)
     )
+    deterministic_action_semantics, deterministic_semantics_source = (
+        _resolve_deterministic_action_semantics(ckpt)
+    )
     if isinstance(ckpt, dict) and _is_new_format_market_ppo_checkpoint(ckpt):
         ppo_model = load_market_ppo_model(
             input_dim,
@@ -3688,7 +3782,11 @@ def load_market_policy(
             require_checkpoint=require_checkpoint,
             checkpoint_data=ckpt,
         )
-        return ppo_model.policy_net if ppo_model is not None else None
+        if ppo_model is None:
+            return None
+        setattr(ppo_model.policy_net, "deterministic_action_semantics", "bounded_harmonized")
+        setattr(ppo_model.policy_net, "deterministic_action_semantics_source", "ppo_checkpoint")
+        return ppo_model.policy_net
 
     if isinstance(ckpt, dict):
         if "policy_state_dict" in ckpt:
@@ -3717,7 +3815,11 @@ def load_market_policy(
             except LegacyPPOCheckpointError:
                 ppo_model = None
             else:
-                return ppo_model.policy_net if ppo_model is not None else None
+                if ppo_model is None:
+                    return None
+                setattr(ppo_model.policy_net, "deterministic_action_semantics", "bounded_harmonized")
+                setattr(ppo_model.policy_net, "deterministic_action_semantics_source", "ppo_checkpoint")
+                return ppo_model.policy_net
             if not _is_legacy_market_policy_checkpoint(ckpt):
                 raise ValueError(
                     "Malformed market PPO checkpoint: payload is not a recognized legacy "
@@ -3751,6 +3853,21 @@ def load_market_policy(
         enabled=_env_bool("BYBIT_MM_COMPILE_PPO", False),
         label="ppo_eval_policy",
     )
+    setattr(model, "deterministic_action_semantics", deterministic_action_semantics)
+    setattr(model, "deterministic_action_semantics_source", deterministic_semantics_source)
+    setattr(model, "checkpoint_path", str(path.expanduser().resolve()))
+    print(
+        "[mm deterministic policy] "
+        f"path={path.expanduser().resolve()} "
+        f"action_semantics={deterministic_action_semantics} "
+        f"source={deterministic_semantics_source}"
+    )
+    if deterministic_action_semantics == "legacy_linear":
+        warnings.warn(
+            "Deterministic market policy evaluation is using explicit legacy_linear action "
+            "semantics for checkpoint compatibility.",
+            RuntimeWarning,
+        )
     return model
 
 
@@ -3986,6 +4103,8 @@ def run_pipeline(
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
     rl_policy_eval_mode = "deterministic_mean"
+    rl_deterministic_action_semantics = None
+    rl_deterministic_action_semantics_source = None
     obs_norm_source = "env_default"
     saved_new_ckpt_this_run = False
 
@@ -4133,6 +4252,8 @@ def run_pipeline(
         if mm_ppo_model is not None:
             rl_policy_loaded = True
             rl_policy_eval_mode = "stochastic_sample" if ppo_eval_stochastic else "deterministic_mean"
+            rl_deterministic_action_semantics = "bounded_harmonized"
+            rl_deterministic_action_semantics_source = "ppo_eval"
             stochastic_generator = None
             if ppo_eval_stochastic:
                 stochastic_generator = torch.Generator(device=torch.device(device).type)
@@ -4158,6 +4279,21 @@ def run_pipeline(
             else:
                 rl_policy_loaded = True
                 rl_policy_eval_mode = "deterministic_mean"
+                rl_deterministic_action_semantics = getattr(
+                    mm_policy,
+                    "deterministic_action_semantics",
+                    "bounded_harmonized",
+                )
+                rl_deterministic_action_semantics_source = getattr(
+                    mm_policy,
+                    "deterministic_action_semantics_source",
+                    "default",
+                )
+                print(
+                    "[mm eval] deterministic policy action semantics="
+                    f"{rl_deterministic_action_semantics} "
+                    f"source={rl_deterministic_action_semantics_source}"
+                )
 
                 def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
                     return _policy_action_from_obs_numpy(
@@ -4166,6 +4302,8 @@ def run_pipeline(
                         device,
                         delta_scale,
                         taker_scale,
+                        env=mm_test_env,
+                        deterministic_action_semantics=rl_deterministic_action_semantics,
                     )
 
             rl_eval_t0 = time.perf_counter()
@@ -4192,6 +4330,8 @@ def run_pipeline(
             "external_rl_ckpt_explicit": external_ckpt_explicit,
             "obs_norm_source": obs_norm_source,
             "require_rl_ckpt": require_rl_ckpt,
+            "deterministic_action_semantics": rl_deterministic_action_semantics,
+            "deterministic_action_semantics_source": rl_deterministic_action_semantics_source,
         },
         "mm_rl_policy_loaded": {
             "loaded": rl_policy_loaded,
@@ -4199,6 +4339,8 @@ def run_pipeline(
             "path": resolved_eval_ckpt,
             "require_checkpoint": require_rl_ckpt,
             "eval_mode": rl_policy_eval_mode,
+            "deterministic_action_semantics": rl_deterministic_action_semantics,
+            "deterministic_action_semantics_source": rl_deterministic_action_semantics_source,
             "ppo_eval_stochastic": ppo_eval_stochastic if run_mode != "train" else False,
             "ppo_eval_seed": ppo_eval_seed if run_mode != "train" else None,
         },
