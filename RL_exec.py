@@ -301,10 +301,21 @@ def _timing_log(message: str) -> None:
 
 
 LOG_2PI = float(np.log(2.0 * np.pi))
+_SQUASH_EPS = 1e-6
 
 
-def _diag_gaussian_sample(mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    eps = torch.randn_like(mean)
+def _diag_gaussian_sample(
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    eps = torch.randn(
+        mean.shape,
+        generator=generator,
+        device=mean.device,
+        dtype=mean.dtype,
+    )
     action = mean + std * eps
     return action, eps
 
@@ -318,17 +329,86 @@ def _diag_gaussian_entropy(log_std: torch.Tensor) -> torch.Tensor:
     return (log_std + 0.5 * (1.0 + LOG_2PI)).sum(dim=-1)
 
 
-def _market_action_scale_tensor(
+def _ppo_action_bounds(
+    env: Optional["MarketMakingEnv"],
     action_dim: int,
     device: torch.device | str,
     delta_scale: float,
     taker_scale: float,
-) -> torch.Tensor:
-    action_scale = torch.ones(action_dim, device=device, dtype=torch.float32)
-    action_scale[:2] = delta_scale
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    low = torch.full((action_dim,), -1.0, device=device, dtype=torch.float32)
+    high = torch.full((action_dim,), 1.0, device=device, dtype=torch.float32)
+    if action_dim >= 1:
+        delta_limit = abs(float(delta_scale))
+        if env is not None:
+            delta_limit = min(delta_limit, float(env.delta_bps_limit))
+        low[0] = -delta_limit
+        high[0] = delta_limit
+    if action_dim >= 2:
+        low[1] = low[0]
+        high[1] = high[0]
     if action_dim >= 3:
-        action_scale[2] = taker_scale
-    return action_scale
+        taker_limit = abs(float(taker_scale)) if env is None or env.allow_taker else 0.0
+        low[2] = -taker_limit
+        high[2] = taker_limit
+    return low, high
+
+
+def _squashed_gaussian_log_prob(
+    latent_action: torch.Tensor,
+    mean: torch.Tensor,
+    log_std: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+) -> torch.Tensor:
+    base_log_prob = _diag_gaussian_logprob(latent_action, mean, log_std)
+    squashed = torch.tanh(latent_action)
+    half_range = 0.5 * (action_high - action_low)
+    log_det = torch.log(half_range.clamp_min(_SQUASH_EPS)) + torch.log1p(
+        -(squashed * squashed).clamp(max=1.0 - _SQUASH_EPS)
+    )
+    return base_log_prob - log_det.sum(dim=-1)
+
+
+def _sample_bounded_ppo_action(
+    mean: torch.Tensor,
+    log_std: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    std = log_std.exp()
+    latent_action, _eps = _diag_gaussian_sample(mean, std, generator=generator)
+    squashed = torch.tanh(latent_action)
+    action_mid = 0.5 * (action_high + action_low)
+    action_half_range = 0.5 * (action_high - action_low)
+    action_env = action_mid + action_half_range * squashed
+    logp = _squashed_gaussian_log_prob(latent_action, mean, log_std, action_low, action_high)
+    return action_env, logp, latent_action
+
+
+def _bounded_ppo_mean_action(
+    mean: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+) -> torch.Tensor:
+    squashed_mean = torch.tanh(mean)
+    action_mid = 0.5 * (action_high + action_low)
+    action_half_range = 0.5 * (action_high - action_low)
+    return action_mid + action_half_range * squashed_mean
+
+
+def _bounded_ppo_latent_action(
+    action_env: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+) -> torch.Tensor:
+    action_mid = 0.5 * (action_high + action_low)
+    action_half_range = 0.5 * (action_high - action_low)
+    squashed = (action_env - action_mid) / action_half_range.clamp_min(_SQUASH_EPS)
+    squashed = squashed.clamp(min=-1.0 + _SQUASH_EPS, max=1.0 - _SQUASH_EPS)
+    return torch.atanh(squashed)
 
 
 def _maybe_compile_module(module: torch.nn.Module, *, enabled: bool, label: str) -> torch.nn.Module:
@@ -2287,10 +2367,9 @@ def collect_market_rollout(
     pin_memory: bool = True,
     non_blocking: bool = True,
 ) -> Dict[str, torch.Tensor]:
-    # Canonical action space for rollout + PPO is the *env action space*.
-    # The policy predicts normalized parameters, then we apply a fixed affine
-    # transform (scale-only) to mean/std so sampling, env stepping, and stored
-    # actions/log-probs all refer to the exact same (scaled) action tensor.
+    # Canonical PPO action space is the bounded env-facing action tensor.
+    # We sample in latent Gaussian space, squash with tanh, then affinely map
+    # into env units so rollout actions/log-probs match executed actions.
     t0 = time.perf_counter()
 
     if horizon <= 0:
@@ -2327,9 +2406,10 @@ def collect_market_rollout(
     cursor = 0
 
     action_dim = int(model.log_std.shape[0])
-    action_scale = _market_action_scale_tensor(
+    action_low, action_high = _ppo_action_bounds(
+        env,
         action_dim,
-        device,
+        target_device,
         delta_scale,
         taker_scale,
     )
@@ -2350,13 +2430,12 @@ def collect_market_rollout(
             obs_t = obs_cpu.to(target_device, non_blocking=non_blocking)
             with torch.no_grad():
                 mean, log_std, value = model(obs_t.unsqueeze(0))
-                std = log_std.exp()
-
-                mean_env = mean * action_scale
-                std_env = std * action_scale
-                log_std_env = torch.log(std_env)
-                action_env, _eps = _diag_gaussian_sample(mean_env, std_env)
-                logp_env = _diag_gaussian_logprob(action_env, mean_env, log_std_env)
+                action_env, logp_env, _latent_action = _sample_bounded_ppo_action(
+                    mean,
+                    log_std,
+                    action_low,
+                    action_high,
+                )
 
             next_obs, reward, env_done, _info = env.step(action_env.squeeze(0).cpu().numpy())
             steps += 1
@@ -2437,11 +2516,11 @@ def ppo_update_market(
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
     non_blocking: bool = True,
+    env: Optional[MarketMakingEnv] = None,
 ):
     t0 = time.perf_counter()
-    # PPO loss is computed in the same env action space used during rollout.
-    # Stored rollout["actions"]/rollout["logp"] are scaled env actions/log-probs,
-    # so we rebuild the Normal distribution in env scale before ratio/log-prob.
+    # PPO loss is recomputed from the same bounded env-facing action
+    # parameterization used during rollout collection.
     obs = rollout["obs"]
     actions = rollout["actions"]
     old_logp = rollout["logp"].detach()
@@ -2451,15 +2530,7 @@ def ppo_update_market(
     terminals = rollout["terminated"]
 
     advantages, returns = compute_gae(rewards, values, next_values, terminals, config.gamma, config.gae_lambda)
-    # Reuse a fixed per-dimension action scale across minibatches; broadcasting
-    # applies it over the batch dimension.
     action_dim = int(actions.shape[-1])
-    action_scale = _market_action_scale_tensor(
-        action_dim,
-        device,
-        delta_scale,
-        taker_scale,
-    )
 
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -2473,6 +2544,13 @@ def ppo_update_market(
         # torch.device("cuda") leaves index unspecified; treat any CUDA tensor on
         # the current target GPU as already on-device in this fast path.
         same_device = (target_device.index is None) or (obs.device.index == target_device.index)
+    action_low, action_high = _ppo_action_bounds(
+        env,
+        action_dim,
+        target_device,
+        delta_scale,
+        taker_scale,
+    )
     indices = torch.arange(n, device=obs.device)
     for _ in range(config.update_epochs):
         perm = indices[torch.randperm(n, device=obs.device)]
@@ -2493,17 +2571,19 @@ def ppo_update_market(
                 mb_returns = returns[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
 
             mean, log_std, value = model(mb_obs)
-            std = log_std.exp()
-
-            mean_env = mean * action_scale
-            std_env = std * action_scale
-            log_std_env = torch.log(std_env)
-            logp = _diag_gaussian_logprob(mb_actions, mean_env, log_std_env)
+            latent_actions = _bounded_ppo_latent_action(mb_actions, action_low, action_high)
+            logp = _squashed_gaussian_log_prob(
+                latent_actions,
+                mean,
+                log_std,
+                action_low,
+                action_high,
+            )
             ratio = torch.exp(logp - mb_old_logp)
             clip_adv = torch.clamp(ratio, 1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * mb_advantages
             policy_loss = -(torch.min(ratio * mb_advantages, clip_adv)).mean()
             value_loss = nn.functional.mse_loss(value, mb_returns)
-            entropy_loss = _diag_gaussian_entropy(log_std_env).mean()
+            entropy_loss = _diag_gaussian_entropy(log_std).mean()
             loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
 
             optimizer.zero_grad(set_to_none=True)
@@ -2634,6 +2714,7 @@ def evaluate_market_policy_ppo(
             device=device,
             delta_scale=delta_scale,
             taker_scale=taker_scale,
+            env=env,
         )
         if action.shape[0] >= 3:
             return float(action[0]), float(action[1]), float(action[2])
@@ -2670,9 +2751,11 @@ def _ppo_action_from_obs_numpy(
     device: str = "cuda",
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
+    env: Optional[MarketMakingEnv] = None,
 ) -> np.ndarray:
     obs_t = torch.from_numpy(obs_np).float().to(device)
-    action_scale = _market_action_scale_tensor(
+    action_low, action_high = _ppo_action_bounds(
+        env,
         int(model.log_std.shape[0]),
         obs_t.device,
         delta_scale,
@@ -2680,18 +2763,16 @@ def _ppo_action_from_obs_numpy(
     )
     with torch.no_grad():
         mean, log_std, _value = model(obs_t.unsqueeze(0))
-        mean_env = mean * action_scale
         if not stochastic:
-            action_env = mean_env
+            action_env = _bounded_ppo_mean_action(mean, action_low, action_high)
         else:
-            std_env = log_std.exp() * action_scale
-            eps = torch.randn(
-                mean_env.shape,
+            action_env, _logp, _latent_action = _sample_bounded_ppo_action(
+                mean,
+                log_std,
+                action_low,
+                action_high,
                 generator=generator,
-                device=mean_env.device,
-                dtype=mean_env.dtype,
             )
-            action_env = mean_env + std_env * eps
     return action_env.squeeze(0).cpu().numpy()
 
 
@@ -2995,6 +3076,34 @@ def train_market_ppo(
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
     probe_obs = _build_market_probe_obs_batch(val_env, batch_size=8, device=device)
+    action_low, action_high = _ppo_action_bounds(
+        train_env,
+        int(model.log_std.shape[0]),
+        device,
+        delta_scale,
+        taker_scale,
+    )
+    with torch.no_grad():
+        bounded_probe_action = _bounded_ppo_mean_action(
+            model.policy_net(probe_obs[:1]),
+            action_low,
+            action_high,
+        ).squeeze(0).detach().cpu().numpy()
+    bounds_low_np = action_low.detach().cpu().numpy()
+    bounds_high_np = action_high.detach().cpu().numpy()
+    within_bounds = bool(
+        np.all(bounded_probe_action >= bounds_low_np - 1e-6)
+        and np.all(bounded_probe_action <= bounds_high_np + 1e-6)
+    )
+    print(
+        "[mm ppo bounds] "
+        f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
+        f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
+        f"env_delta_bps_limit={train_env.delta_bps_limit:.4f} "
+        f"allow_taker={train_env.allow_taker} "
+        f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
+        f"bounded_before_step={within_bounds}"
+    )
     print(
         "[mm ppo probe] "
         f"batch={int(probe_obs.shape[0])} "
@@ -3034,6 +3143,7 @@ def train_market_ppo(
             delta_scale=delta_scale,
             taker_scale=taker_scale,
             non_blocking=non_blocking_transfers,
+            env=train_env,
         )
         final_policy_linear = _find_final_policy_linear_layer(model)
         with torch.no_grad():
@@ -3057,9 +3167,10 @@ def train_market_ppo(
             # Keep validation normalization aligned with training normalization at
             # checkpoint-selection time before running both validation modes.
             val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
-            deterministic_report = evaluate_market_policy(
+            deterministic_report = evaluate_market_policy_ppo(
                 val_env,
-                model.policy_net,
+                model,
+                stochastic=False,
                 device=device,
                 delta_scale=delta_scale,
                 taker_scale=taker_scale,
