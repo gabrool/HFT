@@ -2745,6 +2745,124 @@ def _strip_large_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in report.items() if k not in drop_keys}
 
 
+def save_market_ppo_checkpoint(
+    ckpt_path: Path,
+    model: MarketPolicyValueNet,
+    *,
+    policy_hidden_dims: Iterable[int],
+    value_hidden_dims: Iterable[int],
+    obs_dim: int,
+    action_dim: int,
+    val_report: Dict[str, Any],
+    obs_norm_state: Dict[str, Any],
+    selection_epoch: int,
+    selection_metrics: Dict[str, float],
+    selection_key: Tuple[float, float, float],
+    checkpoint_metric_mode: str,
+    selection_policy: Optional[Dict[str, Any]] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "format_version": 2,
+        "model_state_dict": model.state_dict(),
+        "policy_hidden_dims": tuple(int(x) for x in policy_hidden_dims),
+        "value_hidden_dims": tuple(int(x) for x in value_hidden_dims),
+        "obs_dim": int(obs_dim),
+        "action_dim": int(action_dim),
+        "val_report": _strip_large_report_fields(val_report),
+        "obs_norm_state": obs_norm_state,
+        "selection_metrics": dict(selection_metrics),
+        "selection_key": list(selection_key),
+        "selection_epoch": int(selection_epoch),
+        "checkpoint_metric_mode": str(checkpoint_metric_mode),
+        "selection_policy": selection_policy or {},
+    }
+    if extra_metadata:
+        payload.update(extra_metadata)
+    torch.save(payload, ckpt_path)
+
+
+def load_market_ppo_model(
+    input_dim: int,
+    device: str = "cuda",
+    ckpt_path: Optional[str] = None,
+    require_checkpoint: bool = False,
+    checkpoint_data: Optional[Any] = None,
+) -> Optional[MarketPolicyValueNet]:
+    if not ckpt_path:
+        return None
+    path = Path(ckpt_path)
+    if not path.exists():
+        if require_checkpoint:
+            raise FileNotFoundError(f"Market PPO checkpoint not found: {ckpt_path}")
+        warnings.warn(
+            f"Market PPO checkpoint not found: {ckpt_path}. Falling back to baseline policy.",
+            RuntimeWarning,
+        )
+        return None
+    ckpt = (
+        checkpoint_data
+        if checkpoint_data is not None
+        else _torch_load_trusted_checkpoint(path, map_location=device)
+    )
+    if not isinstance(ckpt, dict):
+        raise ValueError(
+            "Unsupported PPO checkpoint payload type; expected a mapping for market PPO loading."
+        )
+
+    policy_hidden_dims = ckpt.get("policy_hidden_dims")
+    if policy_hidden_dims is None:
+        policy_hidden_dims = ckpt.get("hidden_dims")
+    if policy_hidden_dims is None:
+        policy_hidden_dims = tuple(
+            int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")
+        )
+    value_hidden_dims = ckpt.get("value_hidden_dims")
+    if value_hidden_dims is None:
+        value_hidden_dims = tuple(
+            int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")
+        )
+    action_dim = int(ckpt.get("action_dim", os.environ.get("BYBIT_MM_ACTION_DIM", "3")))
+
+    model = MarketPolicyValueNet(
+        input_dim,
+        policy_hidden=policy_hidden_dims,
+        value_hidden=value_hidden_dims,
+        action_dim=action_dim,
+    ).to(device)
+
+    if "format_version" in ckpt and int(ckpt["format_version"]) >= 2:
+        state = ckpt.get("model_state_dict")
+        if not isinstance(state, dict):
+            raise ValueError("PPO checkpoint format_version>=2 requires model_state_dict")
+        model.load_state_dict(state, strict=True)
+    else:
+        policy_state = ckpt.get("policy_state_dict")
+        value_state = ckpt.get("value_state_dict")
+        if not isinstance(policy_state, dict) or not isinstance(value_state, dict):
+            raise ValueError(
+                "Legacy PPO checkpoint must contain policy_state_dict and value_state_dict"
+            )
+        model.policy_net.load_state_dict(policy_state, strict=True)
+        model.value_net.load_state_dict(value_state, strict=True)
+        if "log_std" in ckpt:
+            model.log_std.data.copy_(torch.as_tensor(ckpt["log_std"], device=model.log_std.device))
+        else:
+            warnings.warn(
+                "Legacy PPO checkpoint loaded without saved log_std; using constructor-default log_std.",
+                RuntimeWarning,
+            )
+
+    model.eval()
+    model = _maybe_compile_module(
+        model,
+        enabled=_env_bool("BYBIT_MM_COMPILE_PPO", False),
+        label="ppo_eval_model",
+    )
+    return model
+
+
 def train_market_ppo(
     train_env: MarketMakingEnv,
     val_env: MarketMakingEnv,
@@ -2874,30 +2992,35 @@ def train_market_ppo(
                         f"max_dd={sel['max_drawdown']:.4f}"
                     )
                     if ckpt_path:
-                        val_report = _strip_large_report_fields(deterministic_report)
-                        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-                        torch.save(
-                            {
-                                "policy_state_dict": model.policy_net.state_dict(),
-                                "value_state_dict": model.value_net.state_dict(),
-                                "hidden_dims": tuple(config.policy_hidden),
-                                "action_dim": model.log_std.shape[0],
-                                "config": config.__dict__,
-                                "val_report": val_report,
-                                "obs_norm_state": train_env.get_obs_norm_state(),
-                                "selection_policy": {
-                                    "primary_metric": "net_pnl_pct",
-                                    "filters": {
-                                        "net_pnl_pct_positive": True,
-                                        "max_drawdown_le": guard,
-                                    },
-                                    "tie_breakers": ["sharpe_1h", "sortino_1h"],
-                                },
-                                "selection_metrics": sel,
-                                "selection_key": list(candidate_key),
-                                "selection_epoch": epoch + 1,
-                            },
+                        save_market_ppo_checkpoint(
                             ckpt_path,
+                            model,
+                            policy_hidden_dims=config.policy_hidden,
+                            value_hidden_dims=config.value_hidden,
+                            obs_dim=input_dim,
+                            action_dim=int(model.log_std.shape[0]),
+                            val_report=deterministic_report,
+                            obs_norm_state=train_env.get_obs_norm_state(),
+                            selection_epoch=epoch + 1,
+                            selection_metrics=sel,
+                            selection_key=candidate_key,
+                            checkpoint_metric_mode="max",
+                            selection_policy={
+                                "primary_metric": "net_pnl_pct",
+                                "filters": {
+                                    "net_pnl_pct_positive": True,
+                                    "max_drawdown_le": guard,
+                                },
+                                "tie_breakers": ["sharpe_1h", "sortino_1h"],
+                            },
+                            extra_metadata={
+                                "config": config.__dict__,
+                                "validation_metadata": {
+                                    "deterministic_report": _strip_large_report_fields(deterministic_report),
+                                    "stochastic_report": _strip_large_report_fields(stochastic_report),
+                                    "stochastic_val_seed": stochastic_val_seed,
+                                },
+                            },
                         )
                         saved_new_ckpt_this_run = True
         _timing_log(f"epoch={epoch + 1} total_secs={time.perf_counter() - epoch_t0:.4f}")
@@ -3254,6 +3377,18 @@ def load_market_policy(
     checkpoint_data: Optional[Any] = None,
 ) -> Optional[MarketPolicyNet]:
     """Load a deterministic market policy (mean-action inference only)."""
+    try:
+        ppo_model = load_market_ppo_model(
+            input_dim,
+            device=device,
+            ckpt_path=ckpt_path,
+            require_checkpoint=require_checkpoint,
+            checkpoint_data=checkpoint_data,
+        )
+    except ValueError:
+        ppo_model = None
+    if ppo_model is not None:
+        return ppo_model.policy_net
     if not ckpt_path:
         return None
     path = Path(ckpt_path)
@@ -3525,6 +3660,7 @@ def run_pipeline(
 
     rl_policy_loaded = False
     rl_policy_reason = "not evaluated"
+    rl_policy_eval_mode = "deterministic_mean"
     obs_norm_source = "env_default"
     saved_new_ckpt_this_run = False
 
@@ -3610,6 +3746,8 @@ def run_pipeline(
     _timing_log(f"evaluate_market_making baseline secs={time.perf_counter() - baseline_eval_t0:.4f}")
 
     rl_metrics = None
+    ppo_eval_stochastic = _env_bool("BYBIT_MM_PPO_EVAL_STOCHASTIC", False)
+    ppo_eval_seed = _env_int("BYBIT_MM_PPO_EVAL_SEED", 0)
 
     eval_action = "skipped" if run_mode == "train" else "performed"
     print(
@@ -3625,60 +3763,89 @@ def run_pipeline(
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
         print("[mm eval] baseline only; RL skipped because run_mode=train.")
     else:
+        mm_ppo_model: Optional[MarketPolicyValueNet] = None
+        mm_policy: Optional[MarketPolicyNet] = None
         if run_mode == "eval":
-            mm_policy = load_market_policy(
+            mm_ppo_model = load_market_ppo_model(
                 mm_obs_dim,
                 device=device,
                 ckpt_path=resolved_eval_ckpt,
                 require_checkpoint=True,
                 checkpoint_data=eval_ckpt_payload,
             )
-            require(mm_policy is not None, "Failed to load eval policy checkpoint")
+            require(mm_ppo_model is not None, "Failed to load eval PPO checkpoint")
             rl_policy_reason = "loaded"
         elif resolved_eval_ckpt is None:
-            mm_policy = None
             rl_policy_reason = "no path provided"
         elif not Path(resolved_eval_ckpt).exists():
             missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using baseline deltas for RL run."
             if require_rl_ckpt:
                 raise FileNotFoundError(missing_msg)
             warnings.warn(missing_msg, RuntimeWarning)
-            mm_policy = None
             rl_policy_reason = "missing checkpoint"
         else:
             policy_require_checkpoint = require_rl_ckpt or (
                 run_mode == "train_eval" and external_ckpt_explicit
             )
-            mm_policy = load_market_policy(
+            mm_ppo_model = load_market_ppo_model(
                 mm_obs_dim,
                 device=device,
                 ckpt_path=resolved_eval_ckpt,
                 require_checkpoint=policy_require_checkpoint,
                 checkpoint_data=eval_ckpt_payload,
             )
-            rl_policy_reason = "loaded" if mm_policy is not None else "missing checkpoint"
-
-        if mm_policy is None:
-            if rl_policy_reason == "no path provided":
-                print("[mm eval] no policy path provided; using baseline deltas for RL run.")
-            rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
-            rl_policy_loaded = False
-        else:
-            rl_policy_loaded = True
-
-            def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
-                return _policy_action_from_obs_numpy(
-                    obs,
-                    mm_policy,
-                    device,
-                    delta_scale,
-                    taker_scale,
+            if mm_ppo_model is None:
+                mm_policy = load_market_policy(
+                    mm_obs_dim,
+                    device=device,
+                    ckpt_path=resolved_eval_ckpt,
+                    require_checkpoint=policy_require_checkpoint,
+                    checkpoint_data=eval_ckpt_payload,
                 )
+            rl_policy_reason = "loaded" if (mm_ppo_model is not None or mm_policy is not None) else "missing checkpoint"
 
-        rl_eval_t0 = time.perf_counter()
-        rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
-        _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
-        rl_eval_performed = True
+        if mm_ppo_model is not None:
+            rl_policy_loaded = True
+            rl_policy_eval_mode = "stochastic_sample" if ppo_eval_stochastic else "deterministic_mean"
+            stochastic_generator = None
+            if ppo_eval_stochastic:
+                stochastic_generator = torch.Generator(device=torch.device(device).type)
+                stochastic_generator.manual_seed(ppo_eval_seed)
+            rl_eval_t0 = time.perf_counter()
+            rl_metrics = evaluate_market_policy_ppo(
+                mm_test_env,
+                mm_ppo_model,
+                stochastic=ppo_eval_stochastic,
+                device=device,
+                delta_scale=delta_scale,
+                taker_scale=taker_scale,
+                generator=stochastic_generator,
+            )
+            _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
+            rl_eval_performed = True
+        else:
+            if mm_policy is None:
+                if rl_policy_reason == "no path provided":
+                    print("[mm eval] no policy path provided; using baseline deltas for RL run.")
+                rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
+                rl_policy_loaded = False
+            else:
+                rl_policy_loaded = True
+                rl_policy_eval_mode = "deterministic_mean"
+
+                def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
+                    return _policy_action_from_obs_numpy(
+                        obs,
+                        mm_policy,
+                        device,
+                        delta_scale,
+                        taker_scale,
+                    )
+
+            rl_eval_t0 = time.perf_counter()
+            rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
+            _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
+            rl_eval_performed = True
 
     return {
         "cmssl_test": cmssl_report,
@@ -3705,6 +3872,9 @@ def run_pipeline(
             "reason": rl_policy_reason,
             "path": resolved_eval_ckpt,
             "require_checkpoint": require_rl_ckpt,
+            "eval_mode": rl_policy_eval_mode,
+            "ppo_eval_stochastic": ppo_eval_stochastic if run_mode != "train" else False,
+            "ppo_eval_seed": ppo_eval_seed if run_mode != "train" else None,
         },
     }
 
