@@ -2750,6 +2750,24 @@ def _strip_large_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in report.items() if k not in drop_keys}
 
 
+def _build_best_validation_summary(
+    best_report: Dict[str, Any],
+    *,
+    best_report_mode: str,
+    checkpoint_metric_mode: str,
+    selection_metrics: Dict[str, float],
+    selection_epoch: int,
+) -> Dict[str, Any]:
+    summary = _strip_large_report_fields(best_report)
+    summary.update({
+        "best_report_mode": str(best_report_mode),
+        "checkpoint_metric_mode": str(checkpoint_metric_mode),
+        "selection_metrics": dict(selection_metrics),
+        "selection_epoch": int(selection_epoch),
+    })
+    return summary
+
+
 def _resolve_checkpoint_metric_mode() -> str:
     mode = os.environ.get("BYBIT_MM_PPO_CHECKPOINT_METRIC_MODE", "deterministic").strip().lower()
     allowed = {"deterministic", "stochastic"}
@@ -2784,6 +2802,7 @@ def save_market_ppo_checkpoint(
     obs_dim: int,
     action_dim: int,
     val_report: Dict[str, Any],
+    val_report_mode: str,
     obs_norm_state: Dict[str, Any],
     selection_epoch: int,
     selection_metrics: Dict[str, float],
@@ -2801,6 +2820,8 @@ def save_market_ppo_checkpoint(
         "obs_dim": int(obs_dim),
         "action_dim": int(action_dim),
         "val_report": _strip_large_report_fields(val_report),
+        "val_report_mode": str(val_report_mode),
+        "best_report_mode": str(val_report_mode),
         "obs_norm_state": obs_norm_state,
         "selection_metrics": dict(selection_metrics),
         "selection_key": list(selection_key),
@@ -2983,6 +3004,9 @@ def train_market_ppo(
         f"stochastic_val_seed={stochastic_val_seed}"
     )
     best_report: Optional[Dict[str, Any]] = None
+    best_report_mode: Optional[str] = None
+    best_selection_metrics: Optional[Dict[str, float]] = None
+    best_selection_epoch: Optional[int] = None
     best_selection_key: Optional[Tuple[float, float, float]] = None
     saved_new_ckpt_this_run = False
 
@@ -3097,6 +3121,9 @@ def train_market_ppo(
                 if best_selection_key is None or candidate_key > best_selection_key:
                     best_selection_key = candidate_key
                     best_report = selected_report
+                    best_report_mode = selected_mode
+                    best_selection_metrics = dict(selected_sel)
+                    best_selection_epoch = epoch + 1
                     print(
                         "[mm ckpt] "
                         f"epoch={epoch + 1} "
@@ -3116,6 +3143,7 @@ def train_market_ppo(
                             obs_dim=input_dim,
                             action_dim=int(model.log_std.shape[0]),
                             val_report=selected_report,
+                            val_report_mode=selected_mode,
                             obs_norm_state=train_env.get_obs_norm_state(),
                             selection_epoch=epoch + 1,
                             selection_metrics=selected_sel,
@@ -3137,6 +3165,7 @@ def train_market_ppo(
                                     "deterministic_selection_metrics": dict(deterministic_sel),
                                     "stochastic_selection_metrics": dict(stochastic_sel),
                                     "checkpoint_metric_mode": selected_mode,
+                                    "best_report_mode": selected_mode,
                                     "ppo_validation_modes": list(validation_modes),
                                     "stochastic_val_seed": stochastic_val_seed,
                                 },
@@ -3147,7 +3176,17 @@ def train_market_ppo(
     if best_report is None:
         print("[mm ckpt] no validation checkpoint satisfied selection filters; no new PPO checkpoint saved.")
         return model, {}, saved_new_ckpt_this_run
-    return model, best_report, saved_new_ckpt_this_run
+    require(best_report_mode is not None, "best_report_mode missing for selected PPO checkpoint")
+    require(best_selection_metrics is not None, "selection metrics missing for selected PPO checkpoint")
+    require(best_selection_epoch is not None, "selection epoch missing for selected PPO checkpoint")
+    best_summary = _build_best_validation_summary(
+        best_report,
+        best_report_mode=best_report_mode,
+        checkpoint_metric_mode=checkpoint_metric_mode,
+        selection_metrics=best_selection_metrics,
+        selection_epoch=best_selection_epoch,
+    )
+    return model, best_summary, saved_new_ckpt_this_run
 
 
 def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -3845,7 +3884,8 @@ def run_pipeline(
             mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
         obs_norm_source = "train_env"
         if best_val_report:
-            print(_format_mm_summary("[mm train] best_val", best_val_report))
+            best_val_mode = str(best_val_report.get("best_report_mode", "unknown"))
+            print(_format_mm_summary(f"[mm train] best_val mode={best_val_mode}", best_val_report))
         else:
             print("[mm train] no validation checkpoint satisfied selection filters.")
             if (
