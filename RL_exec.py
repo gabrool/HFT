@@ -2933,7 +2933,14 @@ def train_market_ppo(
 ) -> Tuple[MarketPolicyValueNet, Dict[str, Any], bool]:
     config = config or PPOConfig()
     checkpoint_metric_mode = _resolve_checkpoint_metric_mode()
-    val_stochastic_default = _env_bool("BYBIT_MM_PPO_VAL_STOCHASTIC", False)
+    validation_modes = ("deterministic", "stochastic")
+    legacy_val_stochastic_raw = os.environ.get("BYBIT_MM_PPO_VAL_STOCHASTIC", "")
+    if legacy_val_stochastic_raw.strip():
+        warnings.warn(
+            "BYBIT_MM_PPO_VAL_STOCHASTIC is deprecated: train_market_ppo() always runs both "
+            "deterministic and stochastic validation, and this variable no longer changes behavior.",
+            DeprecationWarning,
+        )
     stochastic_val_seed = _env_int("BYBIT_MM_PPO_VAL_SEED", 0)
     compile_enabled = _env_bool("BYBIT_MM_COMPILE_PPO", False)
     compile_mode = os.environ.get("BYBIT_MM_COMPILE_MODE", "reduce-overhead")
@@ -2972,7 +2979,7 @@ def train_market_ppo(
         f"batch={int(probe_obs.shape[0])} "
         f"source=val_env "
         f"checkpoint_metric_mode={checkpoint_metric_mode} "
-        f"val_stochastic_default={val_stochastic_default} "
+        f"validation_modes={list(validation_modes)} "
         f"stochastic_val_seed={stochastic_val_seed}"
     )
     best_report: Optional[Dict[str, Any]] = None
@@ -3024,7 +3031,7 @@ def train_market_ppo(
         )
         if (epoch + 1) % config.val_every == 0:
             # Keep validation normalization aligned with training normalization at
-            # checkpoint-selection time.
+            # checkpoint-selection time before running both validation modes.
             val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
             deterministic_report = evaluate_market_policy(
                 val_env,
@@ -3130,7 +3137,7 @@ def train_market_ppo(
                                     "deterministic_selection_metrics": dict(deterministic_sel),
                                     "stochastic_selection_metrics": dict(stochastic_sel),
                                     "checkpoint_metric_mode": selected_mode,
-                                    "val_stochastic_default": val_stochastic_default,
+                                    "ppo_validation_modes": list(validation_modes),
                                     "stochastic_val_seed": stochastic_val_seed,
                                 },
                             },
