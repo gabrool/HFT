@@ -2950,16 +2950,6 @@ def save_market_ppo_checkpoint(
     torch.save(payload, ckpt_path)
 
 
-def _is_new_format_market_ppo_checkpoint(ckpt: Dict[str, Any]) -> bool:
-    if "model_state_dict" in ckpt:
-        return True
-    format_version = ckpt.get("format_version")
-    try:
-        return format_version is not None and int(format_version) >= 2
-    except (TypeError, ValueError):
-        return False
-
-
 def _canonical_market_ppo_arch_field(ckpt: Dict[str, Any], field_name: str) -> Tuple[int, ...]:
     value = ckpt.get(field_name)
     canonical_error = (
@@ -3021,6 +3011,19 @@ def load_market_ppo_model(
             "Unsupported PPO checkpoint payload type; expected a mapping for market PPO loading."
         )
 
+    state = ckpt.get("model_state_dict")
+    canonical_metadata_fields = ("policy_hidden_dims", "value_hidden_dims", "action_dim")
+    has_any_canonical_metadata = any(field in ckpt for field in canonical_metadata_fields)
+    if not isinstance(state, dict):
+        if not has_any_canonical_metadata:
+            raise ValueError(
+                "Legacy deterministic market-policy checkpoints are no longer supported. "
+                "Re-export or retrain under the PPO checkpoint format."
+            )
+        raise ValueError(
+            "Malformed canonical market PPO checkpoint: model_state_dict is missing or not a mapping."
+        )
+
     policy_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "policy_hidden_dims")
     value_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "value_hidden_dims")
     action_dim = _canonical_market_ppo_action_dim(ckpt)
@@ -3032,17 +3035,6 @@ def load_market_ppo_model(
         action_dim=action_dim,
     ).to(device)
 
-    if not _is_new_format_market_ppo_checkpoint(ckpt):
-        raise ValueError(
-            "Legacy deterministic market-policy checkpoints are no longer supported. "
-            "Re-export or retrain under the PPO checkpoint format."
-        )
-    state = ckpt.get("model_state_dict")
-    if not isinstance(state, dict):
-        raise ValueError(
-            "Malformed new-format market PPO checkpoint: format_version>=2 or model_state_dict "
-            "was detected, but model_state_dict is missing or not a mapping."
-        )
     model.load_state_dict(state, strict=True)
 
     model.eval()
