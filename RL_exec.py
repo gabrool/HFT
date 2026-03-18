@@ -2213,13 +2213,18 @@ class MarketPolicyValueNet(nn.Module):
         return mean, log_std, value
 
 
-def _init_zero_residual_policy(model: MarketPolicyValueNet, init_log_std: float) -> None:
+def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
     final_policy_linear: Optional[nn.Linear] = None
     for module in model.policy_net.net.net:
         if isinstance(module, nn.Linear):
             final_policy_linear = module
     if final_policy_linear is None:
-        raise RuntimeError("Could not find final policy linear layer for zero-residual init")
+        raise RuntimeError("Could not find final policy linear layer")
+    return final_policy_linear
+
+
+def _init_zero_residual_policy(model: MarketPolicyValueNet, init_log_std: float) -> None:
+    final_policy_linear = _find_final_policy_linear_layer(model)
     with torch.no_grad():
         final_policy_linear.weight.zero_()
         if final_policy_linear.bias is not None:
@@ -2745,6 +2750,31 @@ def _strip_large_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in report.items() if k not in drop_keys}
 
 
+def _resolve_checkpoint_metric_mode() -> str:
+    mode = os.environ.get("BYBIT_MM_PPO_CHECKPOINT_METRIC_MODE", "deterministic").strip().lower()
+    allowed = {"deterministic", "stochastic"}
+    if mode not in allowed:
+        accepted = ", ".join(sorted(allowed))
+        raise ValueError(
+            f"Invalid BYBIT_MM_PPO_CHECKPOINT_METRIC_MODE='{mode}'. Accepted values: {accepted}"
+        )
+    return mode
+
+
+def _build_market_probe_obs_batch(
+    env: MarketMakingEnv,
+    *,
+    batch_size: int = 8,
+    device: str = "cuda",
+) -> torch.Tensor:
+    if env.n <= 0:
+        raise ValueError("Cannot build PPO probe batch from an empty market-making env")
+    probe_count = max(1, min(int(batch_size), int(env.n)))
+    probe_indices = np.linspace(0, env.n - 1, num=probe_count, dtype=int)
+    probe_obs = [env.reset(start_idx=int(idx)).astype(np.float32, copy=True) for idx in probe_indices]
+    return torch.as_tensor(np.stack(probe_obs, axis=0), device=device)
+
+
 def save_market_ppo_checkpoint(
     ckpt_path: Path,
     model: MarketPolicyValueNet,
@@ -2878,7 +2908,11 @@ def train_market_ppo(
     non_blocking_transfers: bool = True,
 ) -> Tuple[MarketPolicyValueNet, Dict[str, Any], bool]:
     config = config or PPOConfig()
+    checkpoint_metric_mode = _resolve_checkpoint_metric_mode()
+    val_stochastic_default = _env_bool("BYBIT_MM_PPO_VAL_STOCHASTIC", False)
     stochastic_val_seed = _env_int("BYBIT_MM_PPO_VAL_SEED", 0)
+    compile_enabled = _env_bool("BYBIT_MM_COMPILE_PPO", False)
+    compile_mode = os.environ.get("BYBIT_MM_COMPILE_MODE", "reduce-overhead")
     model = MarketPolicyValueNet(
         input_dim,
         policy_hidden=config.policy_hidden,
@@ -2888,9 +2922,14 @@ def train_market_ppo(
     ).to(device)
     if config.zero_residual_init:
         _init_zero_residual_policy(model, config.init_log_std)
+    print(
+        "[mm ppo compile] "
+        f"enabled={compile_enabled} "
+        f"mode={compile_mode}"
+    )
     model = _maybe_compile_module(
         model,
-        enabled=_env_bool("BYBIT_MM_COMPILE_PPO", False),
+        enabled=compile_enabled,
         label="ppo_train",
     )
     print(
@@ -2902,6 +2941,16 @@ def train_market_ppo(
         f"init_log_std={config.init_log_std:.4f}"
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
+    probe_obs = _build_market_probe_obs_batch(val_env, batch_size=8, device=device)
+    print(
+        "[mm ppo probe] "
+        f"batch={int(probe_obs.shape[0])} "
+        f"source=val_env "
+        f"checkpoint_metric_mode={checkpoint_metric_mode} "
+        f"val_stochastic_default={val_stochastic_default} "
+        f"stochastic_val_seed={stochastic_val_seed}"
+    )
     best_report: Optional[Dict[str, Any]] = None
     best_selection_key: Optional[Tuple[float, float, float]] = None
     saved_new_ckpt_this_run = False
@@ -2931,6 +2980,24 @@ def train_market_ppo(
             taker_scale=taker_scale,
             non_blocking=non_blocking_transfers,
         )
+        final_policy_linear = _find_final_policy_linear_layer(model)
+        with torch.no_grad():
+            probe_mean_abs = model.policy_net(probe_obs).abs().mean(dim=0).detach().cpu().numpy()
+            log_std_values = model.log_std.detach().cpu().numpy()
+            policy_weight_l2 = float(final_policy_linear.weight.detach().norm(2).item())
+            policy_bias_l2 = (
+                float(final_policy_linear.bias.detach().norm(2).item())
+                if final_policy_linear.bias is not None
+                else 0.0
+            )
+        print(
+            "[mm ppo stats] "
+            f"epoch={epoch + 1} "
+            f"log_std={np.array2string(log_std_values, precision=4, floatmode='fixed')} "
+            f"policy_head_weight_l2={policy_weight_l2:.6f} "
+            f"policy_head_bias_l2={policy_bias_l2:.6f} "
+            f"probe_mean_abs={np.array2string(probe_mean_abs, precision=6, floatmode='fixed')}"
+        )
         if (epoch + 1) % config.val_every == 0:
             # Keep validation normalization aligned with training normalization at
             # checkpoint-selection time.
@@ -2953,17 +3020,20 @@ def train_market_ppo(
                 taker_scale=taker_scale,
                 generator=stochastic_generator,
             )
-            sel = _checkpoint_selection_metrics(deterministic_report)
+            deterministic_sel = _checkpoint_selection_metrics(deterministic_report)
             stochastic_sel = _checkpoint_selection_metrics(stochastic_report)
+            selected_mode = checkpoint_metric_mode
+            selected_report = deterministic_report if selected_mode == "deterministic" else stochastic_report
+            selected_sel = deterministic_sel if selected_mode == "deterministic" else stochastic_sel
             guard = config.max_drawdown_guard
-            candidate_ok, candidate_reason = _checkpoint_survives_filters(sel, guard)
+            candidate_ok, candidate_reason = _checkpoint_survives_filters(selected_sel, guard)
             print(
                 "[mm val deterministic] "
                 f"epoch={epoch + 1} "
-                f"net_pnl_pct={sel['net_pnl_pct']:.6f} "
-                f"sharpe_1h={sel['sharpe_1h']:.4f} "
-                f"sortino_1h={sel['sortino_1h']:.4f} "
-                f"max_dd={sel['max_drawdown']:.4f} "
+                f"net_pnl_pct={deterministic_sel['net_pnl_pct']:.6f} "
+                f"sharpe_1h={deterministic_sel['sharpe_1h']:.4f} "
+                f"sortino_1h={deterministic_sel['sortino_1h']:.4f} "
+                f"max_dd={deterministic_sel['max_drawdown']:.4f} "
                 "policy=mean "
                 f"candidate={candidate_ok} "
                 f"reason={candidate_reason}"
@@ -2975,21 +3045,25 @@ def train_market_ppo(
                 f"sharpe_1h={stochastic_sel['sharpe_1h']:.4f} "
                 f"sortino_1h={stochastic_sel['sortino_1h']:.4f} "
                 f"max_dd={stochastic_sel['max_drawdown']:.4f} "
-                f"seed={stochastic_val_seed}"
+                f"seed={stochastic_val_seed} "
+                f"candidate_mode={selected_mode} "
+                f"candidate={candidate_ok} "
+                f"reason={candidate_reason}"
             )
             if candidate_ok:
-                candidate_key = _checkpoint_key(sel)
+                candidate_key = _checkpoint_key(selected_sel)
                 if best_selection_key is None or candidate_key > best_selection_key:
                     best_selection_key = candidate_key
-                    best_report = deterministic_report
+                    best_report = selected_report
                     print(
                         "[mm ckpt] "
                         f"epoch={epoch + 1} "
                         "selected=true "
-                        f"net_pnl_pct={sel['net_pnl_pct']:.6f} "
-                        f"sharpe_1h={sel['sharpe_1h']:.4f} "
-                        f"sortino_1h={sel['sortino_1h']:.4f} "
-                        f"max_dd={sel['max_drawdown']:.4f}"
+                        f"metric_mode={selected_mode} "
+                        f"net_pnl_pct={selected_sel['net_pnl_pct']:.6f} "
+                        f"sharpe_1h={selected_sel['sharpe_1h']:.4f} "
+                        f"sortino_1h={selected_sel['sortino_1h']:.4f} "
+                        f"max_dd={selected_sel['max_drawdown']:.4f}"
                     )
                     if ckpt_path:
                         save_market_ppo_checkpoint(
@@ -2999,12 +3073,12 @@ def train_market_ppo(
                             value_hidden_dims=config.value_hidden,
                             obs_dim=input_dim,
                             action_dim=int(model.log_std.shape[0]),
-                            val_report=deterministic_report,
+                            val_report=selected_report,
                             obs_norm_state=train_env.get_obs_norm_state(),
                             selection_epoch=epoch + 1,
-                            selection_metrics=sel,
+                            selection_metrics=selected_sel,
                             selection_key=candidate_key,
-                            checkpoint_metric_mode="max",
+                            checkpoint_metric_mode=selected_mode,
                             selection_policy={
                                 "primary_metric": "net_pnl_pct",
                                 "filters": {
@@ -3018,6 +3092,10 @@ def train_market_ppo(
                                 "validation_metadata": {
                                     "deterministic_report": _strip_large_report_fields(deterministic_report),
                                     "stochastic_report": _strip_large_report_fields(stochastic_report),
+                                    "deterministic_selection_metrics": dict(deterministic_sel),
+                                    "stochastic_selection_metrics": dict(stochastic_sel),
+                                    "checkpoint_metric_mode": selected_mode,
+                                    "val_stochastic_default": val_stochastic_default,
                                     "stochastic_val_seed": stochastic_val_seed,
                                 },
                             },
