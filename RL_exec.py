@@ -318,6 +318,19 @@ def _diag_gaussian_entropy(log_std: torch.Tensor) -> torch.Tensor:
     return (log_std + 0.5 * (1.0 + LOG_2PI)).sum(dim=-1)
 
 
+def _market_action_scale_tensor(
+    action_dim: int,
+    device: torch.device | str,
+    delta_scale: float,
+    taker_scale: float,
+) -> torch.Tensor:
+    action_scale = torch.ones(action_dim, device=device, dtype=torch.float32)
+    action_scale[:2] = delta_scale
+    if action_dim >= 3:
+        action_scale[2] = taker_scale
+    return action_scale
+
+
 def _maybe_compile_module(module: torch.nn.Module, *, enabled: bool, label: str) -> torch.nn.Module:
     if not enabled:
         return module
@@ -2309,10 +2322,12 @@ def collect_market_rollout(
     cursor = 0
 
     action_dim = int(model.log_std.shape[0])
-    action_scale = torch.ones(action_dim, device=device, dtype=torch.float32)
-    action_scale[:2] = delta_scale
-    if action_dim >= 3:
-        action_scale[2] = taker_scale
+    action_scale = _market_action_scale_tensor(
+        action_dim,
+        device,
+        delta_scale,
+        taker_scale,
+    )
 
     max_start = max(0, env.n - 2)
     for _ in range(rollouts_per_epoch):
@@ -2434,10 +2449,12 @@ def ppo_update_market(
     # Reuse a fixed per-dimension action scale across minibatches; broadcasting
     # applies it over the batch dimension.
     action_dim = int(actions.shape[-1])
-    action_scale = torch.ones(action_dim, device=device, dtype=torch.float32)
-    action_scale[:2] = delta_scale
-    if action_dim >= 3:
-        action_scale[2] = taker_scale
+    action_scale = _market_action_scale_tensor(
+        action_dim,
+        device,
+        delta_scale,
+        taker_scale,
+    )
 
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -2593,6 +2610,33 @@ def evaluate_market_policy(
     return evaluate_market_making(env, _policy_fn)
 
 
+def evaluate_market_policy_ppo(
+    env: MarketMakingEnv,
+    model: MarketPolicyValueNet,
+    *,
+    stochastic: bool,
+    device: str = "cuda",
+    delta_scale: float = 1.0,
+    taker_scale: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+) -> Dict[str, Any]:
+    def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
+        action = _ppo_action_from_obs_numpy(
+            model,
+            obs,
+            stochastic=stochastic,
+            generator=generator,
+            device=device,
+            delta_scale=delta_scale,
+            taker_scale=taker_scale,
+        )
+        if action.shape[0] >= 3:
+            return float(action[0]), float(action[1]), float(action[2])
+        return float(action[0]), float(action[1]), 0.0
+
+    return evaluate_market_making(env, _policy_fn)
+
+
 def _policy_action_from_obs_numpy(
     obs: np.ndarray,
     policy: torch.nn.Module,
@@ -2610,6 +2654,40 @@ def _policy_action_from_obs_numpy(
             float(deltas[2] * taker_scale),
         )
     return float(deltas[0] * delta_scale), float(deltas[1] * delta_scale), 0.0
+
+
+def _ppo_action_from_obs_numpy(
+    model: MarketPolicyValueNet,
+    obs_np: np.ndarray,
+    stochastic: bool,
+    generator: Optional[torch.Generator] = None,
+    *,
+    device: str = "cuda",
+    delta_scale: float = 1.0,
+    taker_scale: float = 1.0,
+) -> np.ndarray:
+    obs_t = torch.from_numpy(obs_np).float().to(device)
+    action_scale = _market_action_scale_tensor(
+        int(model.log_std.shape[0]),
+        obs_t.device,
+        delta_scale,
+        taker_scale,
+    )
+    with torch.no_grad():
+        mean, log_std, _value = model(obs_t.unsqueeze(0))
+        mean_env = mean * action_scale
+        if not stochastic:
+            action_env = mean_env
+        else:
+            std_env = log_std.exp() * action_scale
+            eps = torch.randn(
+                mean_env.shape,
+                generator=generator,
+                device=mean_env.device,
+                dtype=mean_env.dtype,
+            )
+            action_env = mean_env + std_env * eps
+    return action_env.squeeze(0).cpu().numpy()
 
 
 def _safe_metric_for_tiebreak(x: Any) -> float:
@@ -2682,6 +2760,7 @@ def train_market_ppo(
     non_blocking_transfers: bool = True,
 ) -> Tuple[MarketPolicyValueNet, Dict[str, Any], bool]:
     config = config or PPOConfig()
+    stochastic_val_seed = _env_int("BYBIT_MM_PPO_VAL_SEED", 0)
     model = MarketPolicyValueNet(
         input_dim,
         policy_hidden=config.policy_hidden,
@@ -2738,31 +2817,53 @@ def train_market_ppo(
             # Keep validation normalization aligned with training normalization at
             # checkpoint-selection time.
             val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
-            report = evaluate_market_policy(
+            deterministic_report = evaluate_market_policy(
                 val_env,
                 model.policy_net,
                 device=device,
                 delta_scale=delta_scale,
                 taker_scale=taker_scale,
             )
-            sel = _checkpoint_selection_metrics(report)
+            stochastic_generator = torch.Generator(device=torch.device(device).type)
+            stochastic_generator.manual_seed(stochastic_val_seed)
+            stochastic_report = evaluate_market_policy_ppo(
+                val_env,
+                model,
+                stochastic=True,
+                device=device,
+                delta_scale=delta_scale,
+                taker_scale=taker_scale,
+                generator=stochastic_generator,
+            )
+            sel = _checkpoint_selection_metrics(deterministic_report)
+            stochastic_sel = _checkpoint_selection_metrics(stochastic_report)
             guard = config.max_drawdown_guard
             candidate_ok, candidate_reason = _checkpoint_survives_filters(sel, guard)
             print(
-                "[mm val] "
+                "[mm val deterministic] "
                 f"epoch={epoch + 1} "
                 f"net_pnl_pct={sel['net_pnl_pct']:.6f} "
                 f"sharpe_1h={sel['sharpe_1h']:.4f} "
                 f"sortino_1h={sel['sortino_1h']:.4f} "
                 f"max_dd={sel['max_drawdown']:.4f} "
+                "policy=mean "
                 f"candidate={candidate_ok} "
                 f"reason={candidate_reason}"
+            )
+            print(
+                "[mm val stochastic] "
+                f"epoch={epoch + 1} "
+                f"net_pnl_pct={stochastic_sel['net_pnl_pct']:.6f} "
+                f"sharpe_1h={stochastic_sel['sharpe_1h']:.4f} "
+                f"sortino_1h={stochastic_sel['sortino_1h']:.4f} "
+                f"max_dd={stochastic_sel['max_drawdown']:.4f} "
+                f"seed={stochastic_val_seed}"
             )
             if candidate_ok:
                 candidate_key = _checkpoint_key(sel)
                 if best_selection_key is None or candidate_key > best_selection_key:
                     best_selection_key = candidate_key
-                    best_report = report
+                    best_report = deterministic_report
                     print(
                         "[mm ckpt] "
                         f"epoch={epoch + 1} "
@@ -2773,7 +2874,7 @@ def train_market_ppo(
                         f"max_dd={sel['max_drawdown']:.4f}"
                     )
                     if ckpt_path:
-                        val_report = _strip_large_report_fields(report)
+                        val_report = _strip_large_report_fields(deterministic_report)
                         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
                         torch.save(
                             {
