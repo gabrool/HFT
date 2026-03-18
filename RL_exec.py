@@ -2813,6 +2813,26 @@ def save_market_ppo_checkpoint(
     torch.save(payload, ckpt_path)
 
 
+class LegacyPPOCheckpointError(ValueError):
+    """Raised when a checkpoint is recognized as a legacy deterministic payload."""
+
+
+def _is_new_format_market_ppo_checkpoint(ckpt: Dict[str, Any]) -> bool:
+    if "model_state_dict" in ckpt:
+        return True
+    format_version = ckpt.get("format_version")
+    try:
+        return format_version is not None and int(format_version) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_legacy_market_policy_checkpoint(ckpt: Dict[str, Any]) -> bool:
+    if "policy_state_dict" in ckpt:
+        return True
+    return "state_dict" in ckpt and "model_state_dict" not in ckpt
+
+
 def load_market_ppo_model(
     input_dim: int,
     device: str = "cuda",
@@ -2862,17 +2882,21 @@ def load_market_ppo_model(
         action_dim=action_dim,
     ).to(device)
 
-    if "format_version" in ckpt and int(ckpt["format_version"]) >= 2:
+    if _is_new_format_market_ppo_checkpoint(ckpt):
         state = ckpt.get("model_state_dict")
         if not isinstance(state, dict):
-            raise ValueError("PPO checkpoint format_version>=2 requires model_state_dict")
+            raise ValueError(
+                "Malformed new-format market PPO checkpoint: format_version>=2 or model_state_dict "
+                "was detected, but model_state_dict is missing or not a mapping."
+            )
         model.load_state_dict(state, strict=True)
     else:
         policy_state = ckpt.get("policy_state_dict")
         value_state = ckpt.get("value_state_dict")
         if not isinstance(policy_state, dict) or not isinstance(value_state, dict):
-            raise ValueError(
-                "Legacy PPO checkpoint must contain policy_state_dict and value_state_dict"
+            raise LegacyPPOCheckpointError(
+                "Legacy market PPO checkpoint detected, but it cannot be loaded into the PPO "
+                "policy/value model because policy_state_dict and value_state_dict are required."
             )
         model.policy_net.load_state_dict(policy_state, strict=True)
         model.value_net.load_state_dict(value_state, strict=True)
@@ -2880,7 +2904,7 @@ def load_market_ppo_model(
             model.log_std.data.copy_(torch.as_tensor(ckpt["log_std"], device=model.log_std.device))
         else:
             warnings.warn(
-                "Legacy PPO checkpoint loaded without saved log_std; using constructor-default log_std.",
+                "Legacy market PPO checkpoint loaded without saved log_std; using constructor-default log_std.",
                 RuntimeWarning,
             )
 
@@ -3466,18 +3490,6 @@ def load_market_policy(
     checkpoint_data: Optional[Any] = None,
 ) -> Optional[MarketPolicyNet]:
     """Load a deterministic market policy (mean-action inference only)."""
-    try:
-        ppo_model = load_market_ppo_model(
-            input_dim,
-            device=device,
-            ckpt_path=ckpt_path,
-            require_checkpoint=require_checkpoint,
-            checkpoint_data=checkpoint_data,
-        )
-    except ValueError:
-        ppo_model = None
-    if ppo_model is not None:
-        return ppo_model.policy_net
     if not ckpt_path:
         return None
     path = Path(ckpt_path)
@@ -3494,10 +3506,60 @@ def load_market_policy(
         if checkpoint_data is not None
         else _torch_load_trusted_checkpoint(path, map_location=device)
     )
-    if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
-        state = ckpt["policy_state_dict"]
+    if isinstance(ckpt, dict) and _is_new_format_market_ppo_checkpoint(ckpt):
+        ppo_model = load_market_ppo_model(
+            input_dim,
+            device=device,
+            ckpt_path=ckpt_path,
+            require_checkpoint=require_checkpoint,
+            checkpoint_data=ckpt,
+        )
+        return ppo_model.policy_net if ppo_model is not None else None
+
+    if isinstance(ckpt, dict):
+        if "policy_state_dict" in ckpt:
+            state = ckpt["policy_state_dict"]
+            warnings.warn(
+                "Legacy market policy checkpoint detected via policy_state_dict; loading with "
+                "deterministic fallback compatibility path.",
+                RuntimeWarning,
+            )
+        elif "state_dict" in ckpt and "model_state_dict" not in ckpt:
+            state = ckpt["state_dict"]
+            warnings.warn(
+                "Legacy market policy checkpoint detected via deterministic state_dict; loading "
+                "with fallback compatibility path.",
+                RuntimeWarning,
+            )
+        else:
+            try:
+                ppo_model = load_market_ppo_model(
+                    input_dim,
+                    device=device,
+                    ckpt_path=ckpt_path,
+                    require_checkpoint=require_checkpoint,
+                    checkpoint_data=ckpt,
+                )
+            except LegacyPPOCheckpointError:
+                ppo_model = None
+            else:
+                return ppo_model.policy_net if ppo_model is not None else None
+            if not _is_legacy_market_policy_checkpoint(ckpt):
+                raise ValueError(
+                    "Malformed market PPO checkpoint: payload is not a recognized legacy "
+                    "deterministic format and new-format PPO loading failed."
+                )
+            raise LegacyPPOCheckpointError(
+                "Legacy market checkpoint detected, but deterministic fallback could not "
+                "identify a compatible state_dict payload."
+            )
     else:
-        state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        state = ckpt
+        warnings.warn(
+            "Legacy market policy checkpoint detected as a raw state_dict payload; loading with "
+            "deterministic fallback compatibility path.",
+            RuntimeWarning,
+        )
     hidden_dims = ckpt.get("hidden_dims") if isinstance(ckpt, dict) else None
     if hidden_dims is None:
         hidden_dims = tuple(
