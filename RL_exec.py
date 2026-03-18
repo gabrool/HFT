@@ -2960,6 +2960,39 @@ def _is_new_format_market_ppo_checkpoint(ckpt: Dict[str, Any]) -> bool:
         return False
 
 
+def _canonical_market_ppo_arch_field(ckpt: Dict[str, Any], field_name: str) -> Tuple[int, ...]:
+    value = ckpt.get(field_name)
+    canonical_error = (
+        "Only canonical PPO checkpoints are supported; checkpoint must include "
+        f"'{field_name}' and be re-exported or retrained if missing/malformed."
+    )
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(canonical_error)
+    try:
+        dims = tuple(int(x) for x in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(canonical_error) from exc
+    if any(dim <= 0 for dim in dims):
+        raise ValueError(canonical_error)
+    return dims
+
+
+def _canonical_market_ppo_action_dim(ckpt: Dict[str, Any]) -> int:
+    canonical_error = (
+        "Only canonical PPO checkpoints are supported; checkpoint must include "
+        "'action_dim' and be re-exported or retrained if missing/malformed."
+    )
+    try:
+        action_dim = int(ckpt["action_dim"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(canonical_error) from exc
+    if action_dim <= 0:
+        raise ValueError(canonical_error)
+    return action_dim
+
+
 def load_market_ppo_model(
     input_dim: int,
     device: str = "cuda",
@@ -2988,19 +3021,9 @@ def load_market_ppo_model(
             "Unsupported PPO checkpoint payload type; expected a mapping for market PPO loading."
         )
 
-    policy_hidden_dims = ckpt.get("policy_hidden_dims")
-    if policy_hidden_dims is None:
-        policy_hidden_dims = ckpt.get("hidden_dims")
-    if policy_hidden_dims is None:
-        policy_hidden_dims = tuple(
-            int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")
-        )
-    value_hidden_dims = ckpt.get("value_hidden_dims")
-    if value_hidden_dims is None:
-        value_hidden_dims = tuple(
-            int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")
-        )
-    action_dim = int(ckpt.get("action_dim", _resolve_market_action_dim(True)))
+    policy_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "policy_hidden_dims")
+    value_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "value_hidden_dims")
+    action_dim = _canonical_market_ppo_action_dim(ckpt)
 
     model = MarketPolicyValueNet(
         input_dim,
