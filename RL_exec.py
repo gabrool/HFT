@@ -2067,10 +2067,6 @@ class MarketMakingEnv:
                 "post_hard_cap_qty": float(post_hard_cap_qty),
                 "post_buy_room_qty": float(post_buy_room_qty),
                 "post_sell_room_qty": float(post_sell_room_qty),
-                # Backward compatibility aliases map to post-fill diagnostics.
-                "hard_cap_qty": float(post_hard_cap_qty),
-                "buy_room_qty": float(post_buy_room_qty),
-                "sell_room_qty": float(post_sell_room_qty),
                 "bid": 0.0,
                 "ask": 0.0,
                 "maker_buy": 0.0,
@@ -2220,10 +2216,6 @@ class MarketMakingEnv:
             "post_hard_cap_qty": float(post_hard_cap_qty),
             "post_buy_room_qty": float(post_buy_room_qty),
             "post_sell_room_qty": float(post_sell_room_qty),
-            # Backward compatibility aliases map to post-fill diagnostics.
-            "hard_cap_qty": float(post_hard_cap_qty),
-            "buy_room_qty": float(post_buy_room_qty),
-            "sell_room_qty": float(post_sell_room_qty),
             "bid": float(bid),
             "ask": float(ask),
             "bid_delta_bps": float(bid_delta_bps),
