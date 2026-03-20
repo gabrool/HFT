@@ -3788,7 +3788,7 @@ def run_pipeline(
     )
     fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
-    delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "1.0"))
+    delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "10.0"))
     taker_scale = float(os.environ.get("BYBIT_MM_TAKER_SCALE", "1.0"))
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
     taker_fee_bps = float(os.environ.get("BYBIT_MM_TAKER_FEE_BPS", str(DEFAULT_MM_TAKER_FEE_BPS)))
