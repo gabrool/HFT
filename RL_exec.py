@@ -2533,7 +2533,7 @@ def ppo_update_market(
     taker_scale: float = 1.0,
     non_blocking: bool = True,
     env: Optional[MarketMakingEnv] = None,
-):
+) -> Dict[str, float]:
     t0 = time.perf_counter()
     # PPO loss is recomputed from the same bounded env-facing action
     # parameterization used during rollout collection.
@@ -2568,6 +2568,8 @@ def ppo_update_market(
         taker_scale,
     )
     indices = torch.arange(n, device=obs.device)
+    action_mag_loss_total = 0.0
+    action_mag_loss_batches = 0
     for _ in range(config.update_epochs):
         perm = indices[torch.randperm(n, device=obs.device)]
         for start in range(0, n, config.batch_size):
@@ -2617,10 +2619,19 @@ def ppo_update_market(
             loss.backward()
             optimizer.step()
 
+            action_mag_loss_total += action_mag_loss.detach().item()
+            action_mag_loss_batches += 1
+
     storage = "gpu" if obs.device.type == target_device.type else "cpu"
     _timing_log(
         f"ppo_update storage={storage} on_device={same_device} manual_gaussian=true secs={time.perf_counter() - t0:.4f}"
     )
+    avg_action_mag_loss = (
+        action_mag_loss_total / action_mag_loss_batches
+        if action_mag_loss_batches > 0
+        else 0.0
+    )
+    return {"action_mag_loss": avg_action_mag_loss}
 
 def _steps_per_year_from_snapshot_ms(step_ms: float) -> float:
     if step_ms <= 0:
@@ -3115,7 +3126,9 @@ def train_market_ppo(
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
         f"zero_residual_init={config.zero_residual_init} "
-        f"init_log_std={config.init_log_std:.4f}"
+        f"init_log_std={config.init_log_std:.4f} "
+        f"action_mag_coef={config.action_mag_coef:.6f} "
+        f"action_mag_power={config.action_mag_power:.2f}"
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
@@ -3180,7 +3193,7 @@ def train_market_ppo(
             pin_memory=pin_rollout_memory,
             non_blocking=non_blocking_transfers,
         )
-        ppo_update_market(
+        ppo_update_summary = ppo_update_market(
             model,
             optimizer,
             rollout,
@@ -3211,6 +3224,7 @@ def train_market_ppo(
         print(
             "[mm ppo stats] "
             f"epoch={epoch + 1} "
+            f"action_mag_loss={ppo_update_summary['action_mag_loss']:.6f} "
             f"log_std={np.array2string(log_std_values, precision=4, floatmode='fixed')} "
             f"policy_head_weight_l2={policy_weight_l2:.6f} "
             f"policy_head_bias_l2={policy_bias_l2:.6f} "
