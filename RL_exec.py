@@ -3890,7 +3890,7 @@ def run_pipeline(
         clip_ratio=float(os.environ.get("BYBIT_MM_PPO_CLIP_RATIO", "0.2")),
         gamma=float(os.environ.get("BYBIT_MM_PPO_GAMMA", "0.99")),
         gae_lambda=float(os.environ.get("BYBIT_MM_PPO_GAE_LAMBDA", "0.95")),
-        entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.01")),
+        entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.0")),
         value_coef=float(os.environ.get("BYBIT_MM_PPO_VALUE_COEF", "0.5")),
         policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")),
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
