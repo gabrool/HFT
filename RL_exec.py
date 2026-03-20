@@ -408,6 +408,18 @@ def _bounded_ppo_mean_action(
     return _postprocess_bounded_env_action(mean, action_low, action_high)
 
 
+def _bounded_mean_action_penalty(
+    mean: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    power: float = 2.0,
+) -> torch.Tensor:
+    bounded_mean = _bounded_ppo_mean_action(mean, action_low, action_high)
+    bound_mag = torch.maximum(action_low.abs(), action_high.abs())
+    normalized_mag = bounded_mean / torch.clamp(bound_mag, min=1e-12)
+    return (normalized_mag.abs() ** power).mean()
+
+
 def _bounded_ppo_latent_action(
     action_env: torch.Tensor,
     action_low: torch.Tensor,
@@ -2575,6 +2587,12 @@ def ppo_update_market(
                 mb_returns = returns[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
 
             mean, log_std, value = model(mb_obs)
+            action_mag_loss = _bounded_mean_action_penalty(
+                mean,
+                action_low,
+                action_high,
+                power=config.action_mag_power,
+            )
             latent_actions = _bounded_ppo_latent_action(mb_actions, action_low, action_high)
             logp = _squashed_gaussian_log_prob(
                 latent_actions,
@@ -2588,7 +2606,12 @@ def ppo_update_market(
             policy_loss = -(torch.min(ratio * mb_advantages, clip_adv)).mean()
             value_loss = nn.functional.mse_loss(value, mb_returns)
             entropy_loss = _diag_gaussian_entropy(log_std).mean()
-            loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy_loss
+            loss = (
+                policy_loss
+                + config.value_coef * value_loss
+                - config.entropy_coef * entropy_loss
+                + config.action_mag_coef * action_mag_loss
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
