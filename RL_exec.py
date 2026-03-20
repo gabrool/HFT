@@ -3900,7 +3900,7 @@ def run_pipeline(
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
         zero_residual_init=_env_bool("BYBIT_MM_PPO_ZERO_RESIDUAL_INIT", True),
-        init_log_std=_env_float("BYBIT_MM_PPO_INIT_LOG_STD", -3.0),
+        init_log_std=_env_float("BYBIT_MM_PPO_INIT_LOG_STD", -1.5),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
