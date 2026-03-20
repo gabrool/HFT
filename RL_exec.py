@@ -3168,7 +3168,14 @@ def train_market_ppo(
         )
         final_policy_linear = _find_final_policy_linear_layer(model)
         with torch.no_grad():
-            probe_mean_abs = model.policy_net(probe_obs).abs().mean(dim=0).detach().cpu().numpy()
+            probe_mean = model.policy_net(probe_obs)
+            bounded_probe_actions = _bounded_ppo_mean_action(probe_mean, action_low, action_high)
+            probe_mean_abs = probe_mean.abs().mean(dim=0).detach().cpu().numpy()
+            bounded_probe_mean_action_mag = bounded_probe_actions.abs().mean(dim=0).detach().cpu().numpy()
+            action_bound_magnitude = torch.maximum(action_low.abs(), action_high.abs())
+            saturation_fraction = (
+                bounded_probe_actions.abs() >= (0.95 * action_bound_magnitude)
+            ).float().mean(dim=0).detach().cpu().numpy()
             log_std_values = model.log_std.detach().cpu().numpy()
             policy_weight_l2 = float(final_policy_linear.weight.detach().norm(2).item())
             policy_bias_l2 = (
@@ -3182,7 +3189,9 @@ def train_market_ppo(
             f"log_std={np.array2string(log_std_values, precision=4, floatmode='fixed')} "
             f"policy_head_weight_l2={policy_weight_l2:.6f} "
             f"policy_head_bias_l2={policy_bias_l2:.6f} "
-            f"probe_mean_abs={np.array2string(probe_mean_abs, precision=6, floatmode='fixed')}"
+            f"probe_mean_abs={np.array2string(probe_mean_abs, precision=6, floatmode='fixed')} "
+            f"bounded_probe_mean_action_mag={np.array2string(bounded_probe_mean_action_mag, precision=6, floatmode='fixed')} "
+            f"saturation_fraction={np.array2string(saturation_fraction, precision=6, floatmode='fixed')}"
         )
         if (epoch + 1) % config.val_every == 0:
             # Keep validation normalization aligned with training normalization at
