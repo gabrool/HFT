@@ -2322,6 +2322,8 @@ class PPOConfig:
     update_epochs: int = 4
     batch_size: int = 32768
     entropy_coef: float = 0.01
+    action_mag_coef: float = 0.0
+    action_mag_power: float = 2.0
     value_coef: float = 0.5
     policy_hidden: Tuple[int, ...] = (128, 128)
     value_hidden: Tuple[int, ...] = (128, 128)
@@ -3905,6 +3907,8 @@ def run_pipeline(
         gamma=float(os.environ.get("BYBIT_MM_PPO_GAMMA", "0.99")),
         gae_lambda=float(os.environ.get("BYBIT_MM_PPO_GAE_LAMBDA", "0.95")),
         entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.0")),
+        action_mag_coef=_env_float("BYBIT_MM_PPO_ACTION_MAG_COEF", 0.0),
+        action_mag_power=_env_float("BYBIT_MM_PPO_ACTION_MAG_POWER", 2.0),
         value_coef=float(os.environ.get("BYBIT_MM_PPO_VALUE_COEF", "0.5")),
         policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")),
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
