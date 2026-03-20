@@ -4123,29 +4123,19 @@ def run_pipeline(
 
     eval_obs_norm_state = train_obs_norm_state
     if use_external_eval_ckpt:
-        if isinstance(eval_ckpt_payload, dict) and "obs_norm_state" in eval_ckpt_payload:
-            eval_obs_norm_state = eval_ckpt_payload["obs_norm_state"]
-            if not _obs_norm_state_is_ready(eval_obs_norm_state):
-                warnings.warn(
-                    "External RL checkpoint obs_norm_state is present but not ready; using environment default "
-                    "normalization for compatibility.",
-                    RuntimeWarning,
-                )
-                eval_obs_norm_state = None
-                mm_test_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
-                obs_norm_source = "env_default"
-            else:
-                mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-                obs_norm_source = "checkpoint"
-        else:
-            eval_obs_norm_state = None
-            warnings.warn(
-                "External RL checkpoint missing obs_norm_state; using environment default "
-                "normalization for compatibility.",
-                RuntimeWarning,
+        if not isinstance(eval_ckpt_payload, dict) or "obs_norm_state" not in eval_ckpt_payload:
+            raise RuntimeError(
+                "External RL checkpoint evaluation requires obs_norm_state; the checkpoint is incomplete or malformed. "
+                "Re-save the checkpoint from the new codepath or provide one with valid prefitted frozen observation normalization."
             )
-            mm_test_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
-            obs_norm_source = "env_default"
+        eval_obs_norm_state = eval_ckpt_payload["obs_norm_state"]
+        if not _obs_norm_state_is_ready(eval_obs_norm_state):
+            raise RuntimeError(
+                "External RL checkpoint contains an unusable obs_norm_state (count < 2 or missing mean/m2). "
+                "Evaluation requires a valid prefitted frozen observation normalization state."
+            )
+        mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+        obs_norm_source = "checkpoint"
 
     baseline_env = MarketMakingEnv(
         mm_test_batch,
