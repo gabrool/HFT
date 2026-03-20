@@ -2895,9 +2895,14 @@ def _build_market_probe_obs_batch(
 ) -> torch.Tensor:
     if env.n <= 0:
         raise ValueError("Cannot build PPO probe batch from an empty market-making env")
-    probe_count = max(1, min(int(batch_size), int(env.n)))
-    probe_indices = np.linspace(0, env.n - 1, num=probe_count, dtype=int)
-    probe_obs = [env.reset(start_idx=int(idx)).astype(np.float32, copy=True) for idx in probe_indices]
+
+    max_start = max(0, env.n - 2)
+    probe_count = max(1, min(int(batch_size), max_start + 1))
+    probe_indices = np.linspace(0, max_start, num=probe_count, dtype=int)
+    probe_obs = [
+        env.reset(start_idx=int(idx)).astype(np.float32, copy=True)
+        for idx in probe_indices
+    ]
     return torch.as_tensor(np.stack(probe_obs, axis=0), device=device)
 
 
