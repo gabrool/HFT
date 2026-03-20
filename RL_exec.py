@@ -84,6 +84,20 @@ def require(condition: bool, msg: str, exc_type: type[Exception] = ValueError) -
         raise exc_type(msg)
 
 
+def _empty_obs_norm_state() -> Dict[str, Any]:
+    return {"count": 0, "mean": None, "m2": None, "continuous_mask": None}
+
+
+def _obs_norm_state_is_ready(state: Dict[str, Any]) -> bool:
+    if not isinstance(state, dict):
+        return False
+    try:
+        count = int(state.get("count", 0))
+    except (TypeError, ValueError):
+        return False
+    return count >= 2 and state.get("mean") is not None and state.get("m2") is not None
+
+
 def _require_grid_quantized_decision_meta(meta: Dict[str, Any]) -> None:
     contract_error = (
         "Dataset not built with grid-quantized decisions; "
@@ -1756,6 +1770,9 @@ class MarketMakingEnv:
             ),
         }
 
+    def has_obs_norm_state(self) -> bool:
+        return _obs_norm_state_is_ready(self.get_obs_norm_state())
+
     def set_obs_norm_state(self, state: Dict[str, Any], freeze: bool = True) -> None:
         if not isinstance(state, dict):
             raise ValueError("obs normalization state must be a dictionary.")
@@ -2923,6 +2940,40 @@ def _resolve_checkpoint_metric_mode() -> str:
     return mode
 
 
+def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
+    """Fit observation normalization on the train split before PPO consumes observations."""
+    train_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
+    _ = train_env.reset(start_idx=0)
+    done = False
+    while not done:
+        _, _, done, _ = train_env.step((0.0, 0.0, 0.0))
+    state = train_env.get_obs_norm_state()
+    if not _obs_norm_state_is_ready(state):
+        raise RuntimeError(
+            "Train-only observation-normalization prefit did not produce a ready state; "
+            "ensure the train env has at least two observations."
+        )
+    mean = np.asarray(state["mean"], dtype=np.float64)
+    m2 = np.asarray(state["m2"], dtype=np.float64)
+    mask_raw = state.get("continuous_mask")
+    mask = None if mask_raw is None else np.asarray(mask_raw, dtype=bool)
+    if mean.shape != m2.shape:
+        raise RuntimeError(
+            f"Prefitted obs normalization mean/m2 shape mismatch: mean={mean.shape} m2={m2.shape}"
+        )
+    if mask is not None and mask.shape != mean.shape:
+        raise RuntimeError(
+            "Prefitted obs normalization continuous_mask shape mismatch: "
+            f"mask={mask.shape} mean={mean.shape}"
+        )
+    return {
+        "count": int(state["count"]),
+        "mean": mean.tolist(),
+        "m2": m2.tolist(),
+        "continuous_mask": None if mask is None else mask.tolist(),
+    }
+
+
 def _build_market_probe_obs_batch(
     env: MarketMakingEnv,
     *,
@@ -3131,7 +3182,31 @@ def train_market_ppo(
         f"action_mag_power={config.action_mag_power:.2f}"
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
+    train_obs_norm_state = train_env.get_obs_norm_state()
+    if not _obs_norm_state_is_ready(train_obs_norm_state) or not train_env.freeze_obs_norm:
+        raise RuntimeError(
+            "PPO requires prefitted frozen observation normalization; call "
+            "prefit_market_obs_norm() before train_market_ppo()."
+        )
+    val_obs_norm_state = val_env.get_obs_norm_state()
+    if not _obs_norm_state_is_ready(val_obs_norm_state) or not val_env.freeze_obs_norm:
+        raise RuntimeError(
+            "Validation env must share the prefitted frozen observation normalization before "
+            "train_market_ppo() probe construction."
+        )
+    if train_obs_norm_state != val_obs_norm_state:
+        raise RuntimeError(
+            "Train/validation observation normalization states differ; install the same prefitted "
+            "frozen state on both envs before train_market_ppo()."
+        )
+    prefitted_obs_count = int(train_obs_norm_state["count"])
+    print(
+        "[mm ppo obs norm] "
+        f"count={prefitted_obs_count} "
+        f"train_frozen={train_env.freeze_obs_norm} "
+        f"val_frozen={val_env.freeze_obs_norm}"
+    )
+    assert prefitted_obs_count >= 2, "prefitted observation normalization must have count >= 2"
     probe_obs = _build_market_probe_obs_batch(val_env, batch_size=8, device=device)
     action_low, action_high = _ppo_action_bounds(
         train_env,
@@ -3180,6 +3255,7 @@ def train_market_ppo(
 
     for epoch in range(epochs):
         epoch_t0 = time.perf_counter()
+        obs_count_before_rollout = int(train_env.get_obs_norm_state()["count"])
         rollout = collect_market_rollout(
             train_env,
             model,
@@ -3203,6 +3279,11 @@ def train_market_ppo(
             taker_scale=taker_scale,
             non_blocking=non_blocking_transfers,
             env=train_env,
+        )
+        obs_count_after_rollout = int(train_env.get_obs_norm_state()["count"])
+        assert train_env.freeze_obs_norm is True, "train env obs normalization must stay frozen during PPO"
+        assert obs_count_after_rollout == obs_count_before_rollout, (
+            "train env obs normalization count drifted during PPO despite frozen normalization"
         )
         final_policy_linear = _find_final_policy_linear_layer(model)
         with torch.no_grad():
@@ -3233,9 +3314,8 @@ def train_market_ppo(
             f"saturation_fraction={np.array2string(saturation_fraction, precision=6, floatmode='fixed')}"
         )
         if (epoch + 1) % config.val_every == 0:
-            # Keep validation normalization aligned with training normalization at
-            # checkpoint-selection time before running both validation modes.
-            val_env.set_obs_norm_state(train_env.get_obs_norm_state(), freeze=True)
+            assert train_env.freeze_obs_norm is True, "train env obs normalization must stay frozen during PPO"
+            assert val_env.freeze_obs_norm is True, "val env obs normalization must stay frozen during PPO"
             deterministic_report = evaluate_market_policy_ppo(
                 val_env,
                 model,
@@ -3900,8 +3980,6 @@ def run_pipeline(
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
     )
-    mm_obs = mm_train_env.reset()
-    mm_obs_dim = mm_obs.shape[0]
     print("[mm obs scaling]", json.dumps(mm_train_env.get_observation_scaling_config(), sort_keys=True))
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
@@ -3934,6 +4012,17 @@ def run_pipeline(
         fill_size=fill_size,
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
+    )
+    prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
+    mm_train_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
+    mm_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
+    mm_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
+    mm_obs = mm_train_env.reset()
+    mm_obs_dim = mm_obs.shape[0]
+    print(
+        "[mm obs norm] "
+        f"source=train_prefit count={int(prefitted_obs_norm_state['count'])} "
+        f"obs_dim={mm_obs_dim} frozen={mm_train_env.freeze_obs_norm}"
     )
 
     mm_ppo_config = PPOConfig(
@@ -4008,10 +4097,7 @@ def run_pipeline(
         )
         trained_this_run = True
         train_obs_norm_state = mm_train_env.get_obs_norm_state()
-        mm_val_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
-        if not use_external_eval_ckpt:
-            mm_test_env.set_obs_norm_state(train_obs_norm_state, freeze=True)
-        obs_norm_source = "train_env"
+        obs_norm_source = "train_prefit"
         if best_val_report:
             best_val_mode = str(best_val_report.get("best_report_mode", "unknown"))
             print(_format_mm_summary(f"[mm train] best_val mode={best_val_mode}", best_val_report))
@@ -4039,8 +4125,18 @@ def run_pipeline(
     if use_external_eval_ckpt:
         if isinstance(eval_ckpt_payload, dict) and "obs_norm_state" in eval_ckpt_payload:
             eval_obs_norm_state = eval_ckpt_payload["obs_norm_state"]
-            mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-            obs_norm_source = "checkpoint"
+            if not _obs_norm_state_is_ready(eval_obs_norm_state):
+                warnings.warn(
+                    "External RL checkpoint obs_norm_state is present but not ready; using environment default "
+                    "normalization for compatibility.",
+                    RuntimeWarning,
+                )
+                eval_obs_norm_state = None
+                mm_test_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
+                obs_norm_source = "env_default"
+            else:
+                mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+                obs_norm_source = "checkpoint"
         else:
             eval_obs_norm_state = None
             warnings.warn(
@@ -4048,6 +4144,7 @@ def run_pipeline(
                 "normalization for compatibility.",
                 RuntimeWarning,
             )
+            mm_test_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
             obs_norm_source = "env_default"
 
     baseline_env = MarketMakingEnv(
