@@ -468,13 +468,36 @@ def _maybe_compile_module(module: torch.nn.Module, *, enabled: bool, label: str)
 
 
 def _resolve_run_mode(default: str = "train") -> str:
-    """Resolve run mode: train (artifact generation), eval (external evaluation), train_eval (combined flow)."""
-    accepted_modes = {"train", "eval", "train_eval"}
+    """Resolve run mode: train, eval, train_eval, or baseline-only evaluation."""
+    accepted_modes = {"baseline", "train", "eval", "train_eval"}
     mode = os.environ.get("BYBIT_MM_RUN_MODE", default).strip().lower()
     if mode not in accepted_modes:
         accepted = ", ".join(sorted(accepted_modes))
         raise ValueError(f"Invalid BYBIT_MM_RUN_MODE='{mode}'. Accepted values: {accepted}")
     return mode
+
+
+def _resolve_baseline_eval_split(default: str = "val") -> str:
+    accepted_splits = {"val", "test"}
+    split_name = os.environ.get("BYBIT_MM_BASELINE_EVAL_SPLIT", default).strip().lower()
+    if split_name not in accepted_splits:
+        accepted = ", ".join(sorted(accepted_splits))
+        raise ValueError(
+            f"Invalid BYBIT_MM_BASELINE_EVAL_SPLIT='{split_name}'. Accepted values: {accepted}"
+        )
+    return split_name
+
+
+def _select_baseline_env(
+    split_name: str,
+    mm_val_env: "MarketMakingEnv",
+    mm_test_env: "MarketMakingEnv",
+) -> Tuple[str, "MarketMakingEnv"]:
+    if split_name == "val":
+        return "val", mm_val_env
+    if split_name == "test":
+        return "test", mm_test_env
+    raise ValueError(f"Unsupported baseline split '{split_name}'")
 
 
 def _resolve_ppo_epochs(default: int) -> int:
@@ -4013,16 +4036,57 @@ def run_pipeline(
         fill_tolerance=fill_tolerance,
         delta_bps_limit=delta_bps_limit,
     )
+    baseline_val_env = MarketMakingEnv(
+        mm_val_batch,
+        maker_rebate_bps=maker_rebate_bps,
+        taker_fee_bps=taker_fee_bps,
+        allow_taker=False,
+        taker_threshold=taker_threshold,
+        inventory_penalty=inventory_penalty,
+        inv_soft_notional=inv_soft_notional,
+        lambda_inv=lambda_inv,
+        lambda_turn=lambda_turn,
+        max_inventory_notional=max_inventory_notional,
+        hard_max_inventory_notional=hard_max_inventory_notional,
+        fill_size=fill_size,
+        fill_tolerance=fill_tolerance,
+        delta_bps_limit=delta_bps_limit,
+    )
+    baseline_test_env = MarketMakingEnv(
+        mm_test_batch,
+        maker_rebate_bps=maker_rebate_bps,
+        taker_fee_bps=taker_fee_bps,
+        allow_taker=False,
+        taker_threshold=taker_threshold,
+        inventory_penalty=inventory_penalty,
+        inv_soft_notional=inv_soft_notional,
+        lambda_inv=lambda_inv,
+        lambda_turn=lambda_turn,
+        max_inventory_notional=max_inventory_notional,
+        hard_max_inventory_notional=hard_max_inventory_notional,
+        fill_size=fill_size,
+        fill_tolerance=fill_tolerance,
+        delta_bps_limit=delta_bps_limit,
+    )
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
     mm_train_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
+    baseline_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
+    baseline_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_obs = mm_train_env.reset()
     mm_obs_dim = mm_obs.shape[0]
     print(
         "[mm obs norm] "
         f"source=train_prefit count={int(prefitted_obs_norm_state['count'])} "
         f"obs_dim={mm_obs_dim} frozen={mm_train_env.freeze_obs_norm}"
+    )
+
+    baseline_eval_split = _resolve_baseline_eval_split()
+    baseline_split_name, baseline_eval_env = _select_baseline_env(
+        baseline_eval_split,
+        baseline_val_env,
+        baseline_test_env,
     )
 
     mm_ppo_config = PPOConfig(
@@ -4054,7 +4118,7 @@ def run_pipeline(
     external_ckpt_explicit = bool(external_rl_ckpt.strip())
 
     trained_this_run = False
-    if run_mode == "train":
+    if run_mode in {"train", "baseline"}:
         resolved_eval_ckpt = None
         rl_checkpoint_origin = "none"
         eval_ckpt_payload = None
@@ -4135,35 +4199,24 @@ def run_pipeline(
                 "Evaluation requires a valid prefitted frozen observation normalization state."
             )
         mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+        baseline_val_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+        baseline_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         obs_norm_source = "checkpoint"
 
-    baseline_env = MarketMakingEnv(
-        mm_test_batch,
-        maker_rebate_bps=maker_rebate_bps,
-        taker_fee_bps=taker_fee_bps,
-        allow_taker=False,
-        taker_threshold=taker_threshold,
-        inventory_penalty=inventory_penalty,
-        inv_soft_notional=inv_soft_notional,
-        lambda_inv=lambda_inv,
-        lambda_turn=lambda_turn,
-        max_inventory_notional=max_inventory_notional,
-        hard_max_inventory_notional=hard_max_inventory_notional,
-        fill_size=fill_size,
-        fill_tolerance=fill_tolerance,
-        delta_bps_limit=delta_bps_limit,
-    )
     if eval_obs_norm_state is not None:
-        baseline_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+        baseline_eval_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
     baseline_eval_t0 = time.perf_counter()
-    baseline_metrics = evaluate_market_making(baseline_env, lambda _obs: (0.0, 0.0, 0.0))
-    _timing_log(f"evaluate_market_making baseline secs={time.perf_counter() - baseline_eval_t0:.4f}")
+    baseline_metrics = evaluate_market_making(baseline_eval_env, lambda _obs: (0.0, 0.0, 0.0))
+    _timing_log(
+        "evaluate_market_making baseline "
+        f"split={baseline_split_name} secs={time.perf_counter() - baseline_eval_t0:.4f}"
+    )
 
     rl_metrics = None
     ppo_eval_stochastic = _env_bool("BYBIT_MM_PPO_EVAL_STOCHASTIC", False)
     ppo_eval_seed = _env_int("BYBIT_MM_PPO_EVAL_SEED", 0)
 
-    eval_action = "skipped" if run_mode == "train" else "performed"
+    eval_action = "skipped" if run_mode in {"train", "baseline"} else "performed"
     print(
         "[mm eval] "
         f"mode={run_mode} "
@@ -4176,6 +4229,10 @@ def run_pipeline(
         rl_policy_loaded = False
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
         print("[mm eval] baseline only; RL skipped because run_mode=train.")
+    elif run_mode == "baseline":
+        rl_policy_loaded = False
+        rl_policy_reason = "skipped_baseline_mode"
+        print("[mm eval] baseline only; RL skipped because run_mode=baseline.")
     else:
         mm_ppo_model: Optional[MarketPolicyValueNet] = None
         mm_policy: Optional[MarketPolicyNet] = None
@@ -4271,6 +4328,7 @@ def run_pipeline(
         # Fatal failures are surfaced via exceptions rather than persisted in provenance state.
         "mm_run_context": {
             "run_mode": run_mode,
+            "baseline_eval_split": baseline_split_name,
             "ppo_trained_this_run": trained_this_run,
             "ppo_best_ckpt_path": str(mm_best_ckpt.expanduser().resolve()),
             "rl_eval_performed": rl_eval_performed,
