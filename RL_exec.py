@@ -959,28 +959,25 @@ def temporary_baseline_quote_env_from_config(
 
 def _infer_num_horizons(feature_dim: int) -> int:
     base_dim = feature_dim - len(RAW_SNAPSHOT_FEATURE_COLUMNS) - FEATURE_EXTRA_DIM
-    if base_dim <= 0 or base_dim % 4 != 0:
+    if base_dim <= 0 or base_dim % 2 != 0:
         raise ValueError(
-            "Feature dimension does not align with expected horizon layout: "
+            "Feature dimension does not align with expected CMSSL horizon layout "
+            "[dir_logits(h), p_up(h), extras(5), snapshots]: "
             f"feature_dim={feature_dim} base_dim={base_dim}"
         )
-    return base_dim // 4
+    return base_dim // 2
 
 
 def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, slice]:
     """Schema for join_features() tensor layout (excluding env extra state).
 
     Layout order:
-      [ret(h), vol(h), logits(h), p_up(h), align/conf-delta/conf metrics(5), snapshots(snapshot_dim)]
+      [dir_logits(h), p_up(h), align/conf-delta/conf metrics(5), snapshots(snapshot_dim)]
     """
     offset = 0
     layout = {
-        "ret": slice(offset, offset + num_horizons),
+        "dir_logits": slice(offset, offset + num_horizons),
     }
-    offset += num_horizons
-    layout["vol"] = slice(offset, offset + num_horizons)
-    offset += num_horizons
-    layout["dir_logits"] = slice(offset, offset + num_horizons)
     offset += num_horizons
     layout["p_up"] = slice(offset, offset + num_horizons)
     offset += num_horizons
@@ -1486,6 +1483,55 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
 
+def _validate_cmssl_join_inputs(
+    dir_logits: np.ndarray,
+    snapshots: np.ndarray,
+    *,
+    label: str,
+) -> Dict[str, Any]:
+    dir_logits = np.asarray(dir_logits)
+    snapshots = np.asarray(snapshots)
+    if dir_logits.ndim != 2:
+        raise ValueError(f"{label} dir_logits must be 2D, got shape={dir_logits.shape}")
+    if snapshots.ndim != 2:
+        raise ValueError(f"{label} snapshots must be 2D, got shape={snapshots.shape}")
+    if dir_logits.shape[0] != snapshots.shape[0]:
+        raise ValueError(
+            f"{label} row mismatch between dir_logits and snapshots: "
+            f"dir_logits={dir_logits.shape} snapshots={snapshots.shape}"
+        )
+    if snapshots.shape[1] != len(RAW_SNAPSHOT_FEATURE_COLUMNS):
+        raise ValueError(
+            f"{label} snapshot width mismatch: snapshots={snapshots.shape[1]} "
+            f"expected={len(RAW_SNAPSHOT_FEATURE_COLUMNS)}"
+        )
+    num_h = dir_logits.shape[1]
+    layout = _joined_feature_layout(num_h, snapshots.shape[1])
+    expected_dim = layout["snapshots"].stop
+    return {"num_h": num_h, "layout": layout, "expected_dim": expected_dim}
+
+
+def _extract_joined_feature_blocks(features: np.ndarray, *, label: str) -> Dict[str, np.ndarray]:
+    features = np.asarray(features)
+    if features.ndim != 2:
+        raise ValueError(f"{label} features must be 2D, got shape={features.shape}")
+    num_h = _infer_num_horizons(int(features.shape[1]))
+    layout = _joined_feature_layout(num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
+    expected_dim = layout["snapshots"].stop
+    if features.shape[1] != expected_dim:
+        raise ValueError(
+            f"{label} features have incompatible joined width: actual={features.shape[1]} expected={expected_dim} "
+            f"for layout=[dir_logits({num_h}), p_up({num_h}), extras({FEATURE_EXTRA_DIM}), snapshots({len(RAW_SNAPSHOT_FEATURE_COLUMNS)})]."
+        )
+    return {
+        "num_h": num_h,
+        "layout": layout,
+        "dir_logits": features[:, layout["dir_logits"]],
+        "p_up": features[:, layout["p_up"]],
+        "snapshots": features[:, layout["snapshots"]],
+    }
+
+
 def join_features(
     decision_ts: np.ndarray,
     y: np.ndarray,
@@ -1496,11 +1542,9 @@ def join_features(
     """Join model outputs and snapshot state into a single feature tensor.
 
     Per-row layout (excluding environment-only extra state):
-      1) ret_pred[h]
-      2) vol_pred[h]
-      3) dir_logits[h]
-      4) p_up[h]
-      5) align/conf deltas and confidence metrics:
+      1) dir_logits[h]
+      2) p_up[h]
+      3) align/conf deltas and confidence metrics:
          - align_all
          - diff_short_long
          - diff_mid_long
@@ -1508,9 +1552,9 @@ def join_features(
          - conf_min
       6) snapshot features from RAW_SNAPSHOT_FEATURE_COLUMNS
     """
-    ret_pred = cmssl_out["ret_pred"]
-    vol_pred = cmssl_out["vol_pred"]
-    dir_logits = cmssl_out["dir_logits"]
+    dir_logits = np.asarray(cmssl_out["dir_logits"], dtype=np.float32)
+    validation = _validate_cmssl_join_inputs(dir_logits, snapshots, label="join_features")
+    layout = validation["layout"]
     p_up = _sigmoid(dir_logits)
     horizons = [int(h) for h in meta.get("horizons_ms", [])]
     if not horizons:
@@ -1532,21 +1576,14 @@ def join_features(
     diff_mid_long = p_up[:, idx_mid] - p_up[:, idx_long]
     conf_long = conf[:, idx_long]
     conf_min = np.min(conf, axis=1)
-    layout = _joined_feature_layout(ret_pred.shape[1], snapshots.shape[1])
     snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
     if _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False):
-        n_rows = int(ret_pred.shape[0])
-        expected_feature_dim = layout["snapshots"].stop
+        n_rows = int(dir_logits.shape[0])
+        expected_feature_dim = validation["expected_dim"]
         features = np.empty((n_rows, expected_feature_dim), dtype=np.float32)
         cursor = 0
 
-        d = ret_pred.shape[1]
-        features[:, cursor:cursor + d] = ret_pred
-        cursor += d
-        d = vol_pred.shape[1]
-        features[:, cursor:cursor + d] = vol_pred
-        cursor += d
         d = dir_logits.shape[1]
         features[:, cursor:cursor + d] = dir_logits
         cursor += d
@@ -1570,8 +1607,6 @@ def join_features(
     else:
         features = np.concatenate(
             [
-                ret_pred,
-                vol_pred,
                 dir_logits,
                 p_up,
                 align_all[:, None],
@@ -1583,7 +1618,7 @@ def join_features(
             ],
             axis=-1,
         )
-    expected_feature_dim = layout["snapshots"].stop
+    expected_feature_dim = validation["expected_dim"]
     if features.shape[1] != expected_feature_dim:
         raise ValueError(
             "join_features layout mismatch: "
@@ -2200,11 +2235,9 @@ class MarketMakingEnv:
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         cfg = self._baseline_cfg
         mid = self._mid_price(idx)
-        ret_pred = self._feature_slice(idx, 0, self._num_h)
-        vol_pred = self._feature_slice(idx, self._num_h, 2 * self._num_h)
-        p_up = self._feature_slice(idx, 3 * self._num_h, 4 * self._num_h)
-        sigma_bps = 1e4 * float(sigma_from_vol(vol_pred[self._vol_horizon_idx]))
-        ret_forecast_bps = 1e4 * float(ret_pred[self._vol_horizon_idx])
+        p_up = self._feature_slice(idx, self._feature_layout["p_up"].start, self._feature_layout["p_up"].stop)
+        sigma_bps = 0.0
+        ret_forecast_bps = 0.0
         p250 = float(p_up[self._p250_idx])
         p500 = float(p_up[self._p500_idx])
         p1000 = float(p_up[self._p1000_idx])
@@ -3967,8 +4000,7 @@ def evaluate_market_making(
         maker_opps += 2
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
         if collect_vol_bucket_report and bucket_cfg is not None:
-            vol_pred = env._feature_slice(idx_before_step, env._num_h, 2 * env._num_h)
-            sigma_bps_selected_steps.append(1e4 * float(sigma_from_vol(vol_pred[vol_idx])))
+            sigma_bps_selected_steps.append(0.0)
             delta_equity_steps.append(float(info.get("delta_equity", 0.0)))
             reward_steps.append(float(reward))
             maker_buy_steps.append(maker_buy)
@@ -4211,16 +4243,13 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
     """Precompute baseline-only arrays once so each trial only runs quote math + fills."""
     num_h = _infer_num_horizons(batch.features.shape[-1])
     horizons_ms = _validate_fixed_cmssl_horizons(_normalize_horizons(num_h, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS)))
-    layout = _joined_feature_layout(num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
-    ret_by_horizon = np.asarray(batch.features[:, layout["ret_pred"]], dtype=np.float64)
-    vol_pred = np.asarray(batch.features[:, layout["vol_pred"]], dtype=np.float64)
-    sigma_bps_by_horizon = 1e4 * sigma_from_vol(vol_pred)
-    p_up_by_horizon = np.asarray(batch.features[:, layout["p_up"]], dtype=np.float64)
-    snapshot_block = np.asarray(batch.features[:, layout["snapshots"]], dtype=np.float64)
+    extracted = _extract_joined_feature_blocks(batch.features, label=f"prepare_fast_baseline_batch[{split_name}]")
+    p_up_by_horizon = np.asarray(extracted["p_up"], dtype=np.float64)
+    snapshot_block = np.asarray(extracted["snapshots"], dtype=np.float64)
+    sigma_bps_by_horizon = np.zeros_like(p_up_by_horizon, dtype=np.float64)
     spread_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     observed_spread_bps = snapshot_block[:, spread_idx]
-    horizon_idx = {h: _resolve_horizon_index(h, horizons_ms, label=f"fast_{h}") for h in horizons_ms}
-    alpha_ret_forecast_bps_by_horizon = {h: 1e4 * ret_by_horizon[:, idx] for h, idx in horizon_idx.items()}
+    alpha_ret_forecast_bps_by_horizon = {h: np.zeros(batch.features.shape[0], dtype=np.float64) for h in horizons_ms}
     best_bid = np.asarray(batch.best_bid, dtype=np.float64)
     best_ask = np.asarray(batch.best_ask, dtype=np.float64)
     mid = 0.5 * (best_bid + best_ask)
@@ -4255,7 +4284,7 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
         mid_next=mid_next,
         observed_spread_bps=observed_spread_bps,
         decision_ts=None if batch.decision_ts is None else np.asarray(batch.decision_ts, dtype=np.int64),
-        ret_by_horizon=ret_by_horizon,
+        ret_by_horizon=np.zeros_like(p_up_by_horizon, dtype=np.float64),
         sigma_bps_by_horizon=sigma_bps_by_horizon,
         p_up_by_horizon=p_up_by_horizon,
         p250=p_up_by_horizon[:, _resolve_horizon_index(250, horizons_ms, label="p250")],
@@ -4566,13 +4595,15 @@ def prepare_baseline_context(
         device,
         batch_size=cmssl_batch_size,
     )
-    num_h = len(meta.get("horizons_ms", []))
+    extracted = _extract_joined_feature_blocks(joined_test["features"], label="prepare_baseline_context.joined_test")
+    num_h = extracted["num_h"]
+    zeros = np.zeros((joined_test["features"].shape[0], num_h), dtype=np.float32)
     cmssl_report = report_cmssl_metrics(
         joined_test["y"],
         {
-            "ret_pred": joined_test["features"][:, :num_h],
-            "vol_pred": joined_test["features"][:, num_h:2 * num_h],
-            "dir_logits": joined_test["features"][:, 2 * num_h:3 * num_h],
+            "ret_pred": zeros,
+            "vol_pred": zeros,
+            "dir_logits": extracted["dir_logits"],
         },
     )
 
@@ -4692,13 +4723,15 @@ def run_pipeline(
         batch_size=cmssl_batch_size,
     )
 
-    num_h = len(meta.get("horizons_ms", []))
+    extracted = _extract_joined_feature_blocks(joined_test["features"], label="run_pipeline.joined_test")
+    num_h = extracted["num_h"]
+    zeros = np.zeros((joined_test["features"].shape[0], num_h), dtype=np.float32)
     cmssl_report = report_cmssl_metrics(
         joined_test["y"],
         {
-            "ret_pred": joined_test["features"][:, :num_h],
-            "vol_pred": joined_test["features"][:, num_h:2 * num_h],
-            "dir_logits": joined_test["features"][:, 2 * num_h:3 * num_h],
+            "ret_pred": zeros,
+            "vol_pred": zeros,
+            "dir_logits": extracted["dir_logits"],
         },
     )
 
