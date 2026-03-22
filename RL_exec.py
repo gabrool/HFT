@@ -57,9 +57,12 @@ SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
 # CMSSL market-making horizon contract is fixed: exactly [250, 500, 1000] ms.
 DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
-DEFAULT_MM_S_MIN_BPS = 0.0
-DEFAULT_MM_K_INV = 0.0
-DEFAULT_MM_K_ALPHA = 1.0
+DEFAULT_MM_BASE_HALF_SPREAD_BPS = 0.0
+DEFAULT_MM_ALPHA_CENTER_SCALE = 1.0
+DEFAULT_MM_INVENTORY_CENTER_SCALE = 0.0
+DEFAULT_MM_VOL_WIDTH_SCALE = 1.0
+DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE = 0.0
+DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE = 0.0
 DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
@@ -708,9 +711,12 @@ def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
 
 @dataclass(frozen=True)
 class BaselineQuoteConfig:
-    s_min_bps: float
-    k_inv: float
-    k_alpha: float
+    base_half_spread_bps: float
+    alpha_center_scale: float
+    inventory_center_scale: float
+    vol_width_scale: float
+    uncertainty_width_scale: float
+    inventory_side_widen_scale: float
     obs_spread_anchor_frac: float
     spread_floor_bps: float
     spread_cap_bps: float
@@ -779,9 +785,12 @@ class PreparedBaselineContext:
 
 def load_baseline_quote_config() -> BaselineQuoteConfig:
     return BaselineQuoteConfig(
-        s_min_bps=_env_float("BYBIT_MM_S_MIN_BPS", DEFAULT_MM_S_MIN_BPS),
-        k_inv=_env_float("BYBIT_MM_K_INV", DEFAULT_MM_K_INV),
-        k_alpha=_env_float("BYBIT_MM_K_ALPHA", DEFAULT_MM_K_ALPHA),
+        base_half_spread_bps=_env_float("BYBIT_MM_BASE_HALF_SPREAD_BPS", DEFAULT_MM_BASE_HALF_SPREAD_BPS),
+        alpha_center_scale=_env_float("BYBIT_MM_ALPHA_CENTER_SCALE", DEFAULT_MM_ALPHA_CENTER_SCALE),
+        inventory_center_scale=_env_float("BYBIT_MM_INVENTORY_CENTER_SCALE", DEFAULT_MM_INVENTORY_CENTER_SCALE),
+        vol_width_scale=_env_float("BYBIT_MM_VOL_WIDTH_SCALE", DEFAULT_MM_VOL_WIDTH_SCALE),
+        uncertainty_width_scale=_env_float("BYBIT_MM_UNCERTAINTY_WIDTH_SCALE", DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE),
+        inventory_side_widen_scale=_env_float("BYBIT_MM_INVENTORY_SIDE_WIDEN_SCALE", DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE),
         obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
         spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
         spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
@@ -799,12 +808,24 @@ def _validate_baseline_quote_config(cfg: BaselineQuoteConfig, *, tol: float = 1e
     weight_sum = float(cfg.p250_weight + cfg.p500_weight + cfg.p1000_weight)
     if abs(weight_sum - 1.0) > tol:
         raise ValueError(f"Baseline horizon weights must sum to 1.0; got {weight_sum:.12f}")
+    if not np.isfinite(cfg.base_half_spread_bps) or cfg.base_half_spread_bps < 0.0:
+        raise ValueError("base_half_spread_bps must be finite and >= 0.0")
+    if not np.isfinite(cfg.alpha_center_scale):
+        raise ValueError("alpha_center_scale must be finite")
+    if not np.isfinite(cfg.inventory_center_scale):
+        raise ValueError("inventory_center_scale must be finite")
+    if not np.isfinite(cfg.vol_width_scale) or cfg.vol_width_scale < 0.0:
+        raise ValueError("vol_width_scale must be finite and >= 0.0")
+    if not np.isfinite(cfg.uncertainty_width_scale) or cfg.uncertainty_width_scale < 0.0:
+        raise ValueError("uncertainty_width_scale must be finite and >= 0.0")
+    if not np.isfinite(cfg.inventory_side_widen_scale) or cfg.inventory_side_widen_scale < 0.0:
+        raise ValueError("inventory_side_widen_scale must be finite and >= 0.0")
     if cfg.inv_ref_notional <= 0.0:
         raise ValueError("inv_ref_notional must be > 0")
     if not np.isfinite(cfg.obs_spread_anchor_frac) or cfg.obs_spread_anchor_frac < 0.0:
         raise ValueError(
             "obs_spread_anchor_frac must be finite and >= 0.0 "
-            "(0.5 reproduces the legacy anchor, 0.0 disables it)"
+            "(applies a floor using the observed spread before width scaling)"
         )
     if cfg.spread_cap_bps < cfg.spread_floor_bps:
         raise ValueError("spread_cap_bps must be >= spread_floor_bps")
@@ -813,9 +834,12 @@ def _validate_baseline_quote_config(cfg: BaselineQuoteConfig, *, tol: float = 1e
 
 def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> BaselineQuoteConfig:
     cfg = BaselineQuoteConfig(
-        s_min_bps=float(mapping.get("s_min_bps", DEFAULT_MM_S_MIN_BPS)),
-        k_inv=float(mapping.get("k_inv", DEFAULT_MM_K_INV)),
-        k_alpha=float(mapping.get("k_alpha", DEFAULT_MM_K_ALPHA)),
+        base_half_spread_bps=float(mapping.get("base_half_spread_bps", DEFAULT_MM_BASE_HALF_SPREAD_BPS)),
+        alpha_center_scale=float(mapping.get("alpha_center_scale", DEFAULT_MM_ALPHA_CENTER_SCALE)),
+        inventory_center_scale=float(mapping.get("inventory_center_scale", DEFAULT_MM_INVENTORY_CENTER_SCALE)),
+        vol_width_scale=float(mapping.get("vol_width_scale", DEFAULT_MM_VOL_WIDTH_SCALE)),
+        uncertainty_width_scale=float(mapping.get("uncertainty_width_scale", DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE)),
+        inventory_side_widen_scale=float(mapping.get("inventory_side_widen_scale", DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE)),
         obs_spread_anchor_frac=float(mapping.get("obs_spread_anchor_frac", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC)),
         spread_floor_bps=float(mapping.get("spread_floor_bps", DEFAULT_MM_SPREAD_FLOOR_BPS)),
         spread_cap_bps=float(mapping.get("spread_cap_bps", DEFAULT_MM_SPREAD_CAP_BPS)),
@@ -829,9 +853,12 @@ def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> Basel
 
 
 BASELINE_QUOTE_ENV_VAR_MAP: Tuple[Tuple[str, str], ...] = (
-    ("s_min_bps", "BYBIT_MM_S_MIN_BPS"),
-    ("k_inv", "BYBIT_MM_K_INV"),
-    ("k_alpha", "BYBIT_MM_K_ALPHA"),
+    ("base_half_spread_bps", "BYBIT_MM_BASE_HALF_SPREAD_BPS"),
+    ("alpha_center_scale", "BYBIT_MM_ALPHA_CENTER_SCALE"),
+    ("inventory_center_scale", "BYBIT_MM_INVENTORY_CENTER_SCALE"),
+    ("vol_width_scale", "BYBIT_MM_VOL_WIDTH_SCALE"),
+    ("uncertainty_width_scale", "BYBIT_MM_UNCERTAINTY_WIDTH_SCALE"),
+    ("inventory_side_widen_scale", "BYBIT_MM_INVENTORY_SIDE_WIDEN_SCALE"),
     ("obs_spread_anchor_frac", "BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC"),
     ("spread_floor_bps", "BYBIT_MM_SPREAD_FLOOR_BPS"),
     ("spread_cap_bps", "BYBIT_MM_SPREAD_CAP_BPS"),
@@ -2175,11 +2202,11 @@ class MarketMakingEnv:
             p_weighted = 0.5
         alpha = (p_weighted - 0.5) * 2.0
         confidence = abs(alpha)
-        anchored_s_min_bps = cfg.s_min_bps
+        anchored_half_spread_bps = cfg.base_half_spread_bps
         snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
         observed_spread_bps = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")])
         if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-            anchored_s_min_bps = max(anchored_s_min_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
+            anchored_half_spread_bps = max(anchored_half_spread_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
         realized_vol_proxy_bps = 0.0
         for name in ("vol_short", "vol_long"):
             if name in RAW_SNAPSHOT_FEATURE_COLUMNS:
@@ -2187,15 +2214,20 @@ class MarketMakingEnv:
                     realized_vol_proxy_bps,
                     1e4 * max(0.0, float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index(name)])),
                 )
-        half_spread_bps = anchored_s_min_bps + confidence * realized_vol_proxy_bps
-        half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         inv_ref = cfg.inv_ref_notional if cfg.inv_ref_notional > 0.0 else 1.0
         inv_notional = self.inventory * mid
-        skew_bps = cfg.k_inv * (inv_notional / inv_ref) - cfg.k_alpha * alpha
-        half_spread_px = bps_to_px(mid, half_spread_bps)
-        skew_px = bps_to_px(mid, skew_bps)
-        bid = mid - half_spread_px - skew_px
-        ask = mid + half_spread_px - skew_px
+        inv_ratio = inv_notional / inv_ref
+        width_bps = (
+            anchored_half_spread_bps
+            + cfg.vol_width_scale * realized_vol_proxy_bps
+            + cfg.uncertainty_width_scale * (1.0 - confidence)
+        )
+        width_bps = float(np.clip(width_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+        bid_half_spread_bps = width_bps + cfg.inventory_side_widen_scale * max(inv_ratio, 0.0)
+        ask_half_spread_bps = width_bps + cfg.inventory_side_widen_scale * max(-inv_ratio, 0.0)
+        center_bps = cfg.alpha_center_scale * alpha - cfg.inventory_center_scale * inv_ratio
+        bid = mid + bps_to_px(mid, center_bps - bid_half_spread_bps)
+        ask = mid + bps_to_px(mid, center_bps + ask_half_spread_bps)
         return bid, ask, mid
 
     def _apply_deltas(
@@ -4233,7 +4265,7 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
         vol_long=vol_long,
     )
 
-def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, vol_short, vol_long, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, s_min_bps, obs_spread_anchor_frac, k_inv, k_alpha, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
+def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, vol_short, vol_long, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, base_half_spread_bps, obs_spread_anchor_frac, alpha_center_scale, inventory_center_scale, vol_width_scale, uncertainty_width_scale, inventory_side_widen_scale, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
     steps = len(mid)
     equity_curve = np.zeros(steps, dtype=np.float64)
     inventory_curve = np.zeros(steps, dtype=np.float64)
@@ -4272,22 +4304,23 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
             p_weighted = 0.5
         alpha = (p_weighted - 0.5) * 2.0
         confidence = abs(alpha)
-        anchored_s_min_bps = s_min_bps
+        anchored_half_spread_bps = base_half_spread_bps
         observed_spread_bps_i = observed_spread_bps[idx]
         if np.isfinite(observed_spread_bps_i) and observed_spread_bps_i > 0.0:
-            anchored_s_min_bps = max(anchored_s_min_bps, obs_spread_anchor_frac * observed_spread_bps_i)
+            anchored_half_spread_bps = max(anchored_half_spread_bps, obs_spread_anchor_frac * observed_spread_bps_i)
         realized_vol_proxy_bps = 1e4 * max(0.0, max(vol_short[idx], vol_long[idx]))
-        half_spread_bps = anchored_s_min_bps + confidence * realized_vol_proxy_bps
-        if half_spread_bps < spread_floor_bps:
-            half_spread_bps = spread_floor_bps
-        if half_spread_bps > spread_cap_bps:
-            half_spread_bps = spread_cap_bps
         inv_notional = inventory * mid_i
-        skew_bps = k_inv * (inv_notional / inv_ref_notional) - k_alpha * alpha
-        half_spread_px = mid_i * half_spread_bps * 1e-4
-        skew_px = mid_i * skew_bps * 1e-4
-        bid = mid_i - half_spread_px - skew_px
-        ask = mid_i + half_spread_px - skew_px
+        inv_ratio = inv_notional / inv_ref_notional
+        width_bps = anchored_half_spread_bps + vol_width_scale * realized_vol_proxy_bps + uncertainty_width_scale * (1.0 - confidence)
+        if width_bps < spread_floor_bps:
+            width_bps = spread_floor_bps
+        if width_bps > spread_cap_bps:
+            width_bps = spread_cap_bps
+        bid_half_spread_bps = width_bps + inventory_side_widen_scale * max(inv_ratio, 0.0)
+        ask_half_spread_bps = width_bps + inventory_side_widen_scale * max(-inv_ratio, 0.0)
+        center_bps = alpha_center_scale * alpha - inventory_center_scale * inv_ratio
+        bid = mid_i + mid_i * (center_bps - bid_half_spread_bps) * 1e-4
+        ask = mid_i + mid_i * (center_bps + ask_half_spread_bps) * 1e-4
         eps = max(1e-8, mid_i * 1e-6)
         curr_best_bid = best_bid[idx]
         curr_best_ask = best_ask[idx]
@@ -4403,7 +4436,7 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
     print(f"[baseline fast] backend={backend} split={prepared_batch.split_name}")
     # Pass the precomputed previous-book arrays directly; shifted current arrays break touch/move-away parity.
     result = kernel(
-        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
+        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.base_half_spread_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.alpha_center_scale, quote_cfg.inventory_center_scale, quote_cfg.vol_width_scale, quote_cfg.uncertainty_width_scale, quote_cfg.inventory_side_widen_scale, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
     )
     (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
     initial_equity = prepared_batch.initial_cash
