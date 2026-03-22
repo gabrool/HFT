@@ -218,6 +218,35 @@ def require_complete_splits(meta: dict) -> dict:
     }
 
 
+def _label_dim_error(source: str, observed: Any) -> ValueError:
+    return ValueError(
+        f"{source} has label_dim={observed!r}, but CMSSL17_offline.py now requires "
+        f"label_dim={NUM_HORIZONS}. Old offline datasets with 2 * NUM_HORIZONS labels are no longer supported; "
+        "rebuild the offline data with offline_ingest.py."
+    )
+
+
+def validate_dataset_label_dim(meta: dict, source: str) -> None:
+    label_dim = meta.get("label_dim")
+    if label_dim is None:
+        raise ValueError(
+            f"{source} is missing label_dim metadata. Rebuild the offline data with offline_ingest.py."
+        )
+    try:
+        label_dim_int = int(label_dim)
+    except (TypeError, ValueError):
+        raise _label_dim_error(source, label_dim)
+    if label_dim_int != NUM_HORIZONS:
+        raise _label_dim_error(source, label_dim_int)
+
+
+def validate_loaded_label_array(y: np.ndarray, source: str) -> None:
+    if y.ndim != 2:
+        raise ValueError(f"{source} must be 2D, got shape={y.shape}")
+    if y.shape[1] != NUM_HORIZONS:
+        raise _label_dim_error(source, y.shape[1])
+
+
 def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[ChunkRef]:
     """
     Build ChunkRefs for rows whose timestamps satisfy start <= ts < end.
@@ -229,6 +258,7 @@ def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[C
         raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
 
     wmeta = read_json(meta_week_path)
+    validate_dataset_label_dim(wmeta, f"week metadata {meta_week_path}")
     week_dir = meta_week_path.parent
     refs: List[ChunkRef] = []
 
@@ -336,6 +366,7 @@ class NpyChunksDataset(Dataset):
         Xc = np.load(ref.core_file, mmap_mode='r')
         Xa = np.load(ref.aux_file,  mmap_mode='r')
         Y  = np.load(ref.y_file,    mmap_mode='r')
+        validate_loaded_label_array(Y, f"label file {ref.y_file}")
         self._cache[key] = (Xc, Xa, Y)
         self._lru.append(key)
         if len(self._lru) > self._cap:
@@ -365,7 +396,7 @@ class NpyChunksDataset(Dataset):
 
 
 def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Load rows in start <= ts < end across weeks into RAM. Returns X [N, L, F], y [N, 2H], F."""
+    """Load rows in start <= ts < end across weeks into RAM. Returns X [N, L, F], y [N, H], F."""
     if end < start:
         raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
 
@@ -373,6 +404,7 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
     feat_dim = None
     for wp in split_week_paths:
         wmeta = read_json(wp)
+        validate_dataset_label_dim(wmeta, f"week metadata {wp}")
         F_total = int(wmeta["feature_dim_total"])
         if feat_dim is None:
             feat_dim = F_total
@@ -420,13 +452,14 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
             Xc = np.load(week_dir / files["core"])
             Xa = np.load(week_dir / files["aux"])
             Y = np.load(week_dir / files["y"])
+            validate_loaded_label_array(Y, f"label file {week_dir / files['y']}")
             Xs.append(np.concatenate([Xc[l:r], Xa[l:r]], axis=-1))
             Ys.append(Y[l:r])
 
     if not Xs:
         return (
             np.empty((0, LOOKBACK, feat_dim or 0), np.float32),
-            np.empty((0, 2 * NUM_HORIZONS), np.float32),
+            np.empty((0, NUM_HORIZONS), np.float32),
             (feat_dim or 0),
         )
     X = np.concatenate(Xs, axis=0).astype(np.float32, copy=False)
@@ -612,6 +645,7 @@ def train_from_offline():
     print(f"[amp] enabled={amp_enabled} dtype=bf16")
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
+    validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
     splits = require_complete_splits(meta)
 
     pca_info = meta.get("pca", {}) or {}
@@ -673,10 +707,12 @@ def train_from_offline():
         print(f"[early-stop] using short patience={early_stop_patience} for single-week training")
 
 
-    # feature dim sanity
+    # feature/label dim sanity
     feat_dim_total = None
     for wp in tr_weeks + va_weeks + te_weeks:
-        fm = int(read_json(wp)["feature_dim_total"])
+        week_meta = read_json(wp)
+        validate_dataset_label_dim(week_meta, f"week metadata {wp}")
+        fm = int(week_meta["feature_dim_total"])
         if feat_dim_total is None:
             feat_dim_total = fm
         elif feat_dim_total != fm:
@@ -760,7 +796,7 @@ def train_from_offline():
         if cached_bounds is not None:
             y_train_for_quant = None
         elif len(ds_train) == 0:
-            y_train_for_quant = np.empty((0, 2 * NUM_HORIZONS), dtype=np.float32)
+            y_train_for_quant = np.empty((0, NUM_HORIZONS), dtype=np.float32)
         else:
             dl_prepass = DataLoader(
                 ds_train,
@@ -777,7 +813,7 @@ def train_from_offline():
             y_train_for_quant = (
                 np.concatenate(y_parts, axis=0)
                 if y_parts
-                else np.empty((0, 2 * NUM_HORIZONS), dtype=np.float32)
+                else np.empty((0, NUM_HORIZONS), dtype=np.float32)
             )
 
 
@@ -917,7 +953,7 @@ def train_from_offline():
                     x = x.to(device, non_blocking=True)
                     y_targets = y_targets.to(device, non_blocking=True)
                     y_return = y_targets[:, :NUM_HORIZONS]
-                    y_logvol = y_targets[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+                    y_logvol = y_targets
 
                     with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                         ret_pred, vol_pred, dir_pred_logits = model(x)
@@ -1016,7 +1052,7 @@ def train_from_offline():
                 x = x.to(device, non_blocking=True)
                 y_targets = y_targets.to(device, non_blocking=True)
                 y_return = y_targets[:, :NUM_HORIZONS]
-                y_logvol = y_targets[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+                y_logvol = y_targets
 
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                     ret_pred, vol_pred, dir_pred_logits = model(x)
@@ -1185,7 +1221,7 @@ def train_from_offline():
             y = y.to(device, non_blocking=True)
 
             y_ret = y[:, :NUM_HORIZONS]
-            y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+            y_logvol = y
 
             # ===== SAM pass #1 =====
             opt.base_optimizer.zero_grad(set_to_none=True)
@@ -1395,7 +1431,7 @@ def train_from_offline():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             y_return = y[:, :NUM_HORIZONS]
-            y_logvol = y[:, NUM_HORIZONS:2 * NUM_HORIZONS]
+            y_logvol = y
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                 ret_pred, vol_pred, dir_pred_logits = model(x)
