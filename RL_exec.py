@@ -200,15 +200,16 @@ def cmssl_predict(model, x_core, x_aux, meta, device: str = "cuda"):
     x_core = torch.as_tensor(x_core, device=device)
     x_aux = torch.as_tensor(x_aux, device=device)
     x = torch.cat([x_core, x_aux], dim=-1)
-    model_out = model(x)
-    require(isinstance(model_out, (tuple, list)) and len(model_out) >= 1, "CMSSL model must return direction logits")
-    dir_logits = model_out[-1]
+    dir_logits = model(x)
+    require(torch.is_tensor(dir_logits), "CMSSL model(x) must return a tensor of direction logits")
     horizons = meta.get("horizons_ms", [])
     expected_h = len(horizons)
     require(expected_h > 0, "meta['horizons_ms'] must be non-empty")
-    require(dir_logits.shape[-1] == expected_h, (
-        f"dir_logits shape {dir_logits.shape} does not match horizons {expected_h}"
-    ))
+    expected_shape = (x.shape[0], expected_h)
+    require(
+        tuple(dir_logits.shape) == expected_shape,
+        f"CMSSL model(x) must return shape {expected_shape}; got {tuple(dir_logits.shape)}",
+    )
     return dir_logits
 
 
@@ -967,7 +968,7 @@ def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, sl
     """Schema for join_features() tensor layout (excluding env extra state).
 
     Layout order:
-      [logits(h), p_up(h), align/conf-delta/conf metrics(5), snapshots(snapshot_dim)]
+      [dir_logits(h), p_up(h), confidence/alignment scalars(5), snapshots(snapshot_dim)]
     """
     offset = 0
     layout = {
@@ -1478,7 +1479,7 @@ def join_features(
     Per-row layout (excluding environment-only extra state):
       1) dir_logits[h]
       2) p_up[h]
-      3) align/conf deltas and confidence metrics:
+      3) confidence/alignment scalars:
          - align_all
          - diff_short_long
          - diff_mid_long
@@ -2161,7 +2162,7 @@ class MarketMakingEnv:
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         cfg = self._baseline_cfg
         mid = self._mid_price(idx)
-        p_up = self._feature_slice(idx, self._num_h, 2 * self._num_h)
+        p_up = self._feature_slice(idx, self._feature_layout["p_up"].start, self._feature_layout["p_up"].stop)
         p250 = float(p_up[self._p250_idx])
         p500 = float(p_up[self._p500_idx])
         p1000 = float(p_up[self._p1000_idx])
@@ -2174,15 +2175,19 @@ class MarketMakingEnv:
             p_weighted = 0.5
         alpha = (p_weighted - 0.5) * 2.0
         confidence = abs(alpha)
-        s_min_bps = cfg.s_min_bps
+        anchored_s_min_bps = cfg.s_min_bps
         snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
         observed_spread_bps = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")])
-        vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
-        vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
-        realized_vol_proxy_bps = 1e4 * max(0.0, vol_short, vol_long)
         if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-            s_min_bps = max(s_min_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
-        half_spread_bps = s_min_bps + confidence * realized_vol_proxy_bps
+            anchored_s_min_bps = max(anchored_s_min_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
+        realized_vol_proxy_bps = 0.0
+        for name in ("vol_short", "vol_long"):
+            if name in RAW_SNAPSHOT_FEATURE_COLUMNS:
+                realized_vol_proxy_bps = max(
+                    realized_vol_proxy_bps,
+                    1e4 * max(0.0, float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index(name)])),
+                )
+        half_spread_bps = anchored_s_min_bps + confidence * realized_vol_proxy_bps
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         inv_ref = cfg.inv_ref_notional if cfg.inv_ref_notional > 0.0 else 1.0
         inv_notional = self.inventory * mid
