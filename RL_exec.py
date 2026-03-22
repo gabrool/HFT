@@ -3814,18 +3814,90 @@ def train_market_ppo(
     return model, best_summary, saved_new_ckpt_this_run
 
 
-def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -> Dict[str, float]:
-    num_h = y_true.shape[1] // 2
-    y_ret = y_true[:, :num_h]
-    y_vol = y_true[:, num_h:]
-    ret_pred = cmssl_out["ret_pred"]
-    vol_pred = cmssl_out["vol_pred"]
-    ret_mae = float(np.mean(np.abs(ret_pred - y_ret)))
-    vol_mae = float(np.mean(np.abs(vol_pred - y_vol)))
-    return {
-        "ret_mae": ret_mae,
-        "vol_mae": vol_mae,
+def _binary_auc_score(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    y_score = np.asarray(y_score, dtype=np.float64).reshape(-1)
+    if y_true.shape != y_score.shape:
+        raise ValueError(f"AUC shape mismatch: y_true={y_true.shape} y_score={y_score.shape}")
+    pos = y_true >= 0.5
+    n_pos = int(np.sum(pos))
+    n_neg = int(y_true.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(y_score, kind="mergesort")
+    sorted_scores = y_score[order]
+    sorted_true = y_true[order]
+    ranks = np.empty_like(sorted_scores, dtype=np.float64)
+    start = 0
+    n = sorted_scores.size
+    while start < n:
+        end = start + 1
+        while end < n and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        avg_rank = 0.5 * (start + end - 1) + 1.0
+        ranks[start:end] = avg_rank
+        start = end
+    pos_rank_sum = float(np.sum(ranks[sorted_true >= 0.5]))
+    auc = (pos_rank_sum - (n_pos * (n_pos + 1) / 2.0)) / (n_pos * n_neg)
+    return float(auc)
+
+
+def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    y_true = np.asarray(y_true, dtype=np.float32)
+    dir_logits = np.asarray(cmssl_out["dir_logits"], dtype=np.float32)
+    if y_true.ndim != 2:
+        raise ValueError(f"CMSSL labels must be 2D, got shape={y_true.shape}")
+    if dir_logits.ndim != 2:
+        raise ValueError(f"CMSSL dir_logits must be 2D, got shape={dir_logits.shape}")
+    num_h = int(dir_logits.shape[1])
+    if y_true.shape[0] != dir_logits.shape[0]:
+        raise ValueError(
+            f"CMSSL label/logit row mismatch: y_true={y_true.shape} dir_logits={dir_logits.shape}"
+        )
+    if y_true.shape[1] == 2 * num_h:
+        raise ValueError(
+            "report_cmssl_metrics() no longer accepts legacy [2 * NUM_HORIZONS] regression labels. "
+            "Regenerate offline chunks with direction-only labels and retrain the CMSSL model before rerunning RL_exec.py."
+        )
+    if y_true.shape[1] != num_h:
+        raise ValueError(
+            f"CMSSL labels must have shape [N, NUM_HORIZONS]={num_h}, got {y_true.shape}."
+        )
+    if not np.all(np.isfinite(y_true)):
+        raise ValueError("CMSSL labels contain non-finite values")
+    y_dir = y_true.astype(np.float32, copy=False)
+    if np.any((y_dir < 0.0) | (y_dir > 1.0)):
+        raise ValueError(
+            "CMSSL direction labels must be binary probabilities in [0, 1]; "
+            f"got min={float(np.min(y_dir)):.6f} max={float(np.max(y_dir)):.6f}"
+        )
+    p_up = _sigmoid(dir_logits)
+    p_up = np.clip(p_up, 1e-7, 1.0 - 1e-7)
+    bce = -np.mean(y_dir * np.log(p_up) + (1.0 - y_dir) * np.log(1.0 - p_up), axis=0)
+    pred_up = (p_up >= 0.5).astype(np.float32)
+    acc = np.mean(pred_up == y_dir, axis=0)
+    auc = np.array([
+        _binary_auc_score(y_dir[:, idx], p_up[:, idx]) for idx in range(num_h)
+    ], dtype=np.float64)
+    logit_mean = np.mean(dir_logits, axis=0)
+    logit_std = np.std(dir_logits, axis=0)
+    pos_rate = np.mean(y_dir, axis=0)
+    pred_pos_rate = np.mean(pred_up, axis=0)
+    prob_mean = np.mean(p_up, axis=0)
+    report: Dict[str, Any] = {
+        "dir_bce": float(np.mean(bce)),
+        "dir_acc": float(np.mean(acc)),
+        "dir_auc": float(np.nanmean(auc)) if not np.all(np.isnan(auc)) else float("nan"),
+        "per_horizon_bce": [float(x) for x in bce],
+        "per_horizon_acc": [float(x) for x in acc],
+        "per_horizon_auc": [None if np.isnan(x) else float(x) for x in auc],
+        "label_positive_rate": [float(x) for x in pos_rate],
+        "pred_positive_rate": [float(x) for x in pred_pos_rate],
+        "mean_p_up": [float(x) for x in prob_mean],
+        "mean_logit": [float(x) for x in logit_mean],
+        "std_logit": [float(x) for x in logit_std],
     }
+    return report
 
 
 def _fill_forward(arr: np.ndarray) -> np.ndarray:
@@ -4596,15 +4668,9 @@ def prepare_baseline_context(
         batch_size=cmssl_batch_size,
     )
     extracted = _extract_joined_feature_blocks(joined_test["features"], label="prepare_baseline_context.joined_test")
-    num_h = extracted["num_h"]
-    zeros = np.zeros((joined_test["features"].shape[0], num_h), dtype=np.float32)
     cmssl_report = report_cmssl_metrics(
         joined_test["y"],
-        {
-            "ret_pred": zeros,
-            "vol_pred": zeros,
-            "dir_logits": extracted["dir_logits"],
-        },
+        {"dir_logits": extracted["dir_logits"]},
     )
 
     splits_rl = chronological_split(joined_test, ratios=(0.6, 0.2, 0.2))
@@ -4724,15 +4790,9 @@ def run_pipeline(
     )
 
     extracted = _extract_joined_feature_blocks(joined_test["features"], label="run_pipeline.joined_test")
-    num_h = extracted["num_h"]
-    zeros = np.zeros((joined_test["features"].shape[0], num_h), dtype=np.float32)
     cmssl_report = report_cmssl_metrics(
         joined_test["y"],
-        {
-            "ret_pred": zeros,
-            "vol_pred": zeros,
-            "dir_logits": extracted["dir_logits"],
-        },
+        {"dir_logits": extracted["dir_logits"]},
     )
 
     splits_rl = chronological_split(joined_test, ratios=(0.6, 0.2, 0.2))
