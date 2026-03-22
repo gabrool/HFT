@@ -828,85 +828,6 @@ def _resolve_baseline_quote_config(
     return resolve_baseline_quote_config_from_mapping(baseline_config)
 
 
-def resolve_baseline_vol_bucket_edges_bps() -> List[float]:
-    raw_value = os.environ.get("BYBIT_MM_BASELINE_VOL_BUCKET_BPS", "0.5,1.0,2.0,4.0,8.0")
-    edges = [float(part.strip()) for part in raw_value.split(",") if part.strip()]
-    if not edges:
-        raise ValueError("BYBIT_MM_BASELINE_VOL_BUCKET_BPS must contain at least one positive edge")
-    prev = 0.0
-    for edge in edges:
-        if not np.isfinite(edge) or edge <= 0.0:
-            raise ValueError("Baseline vol bucket edges must be finite and > 0")
-        if edge <= prev:
-            raise ValueError("Baseline vol bucket edges must be strictly increasing")
-        prev = edge
-    return edges
-
-
-def build_vol_bucket_report(
-    *,
-    bucket_signal_bps: np.ndarray,
-    delta_equity_per_step: np.ndarray,
-    reward_per_step: np.ndarray,
-    maker_buy_per_step: np.ndarray,
-    maker_sell_per_step: np.ndarray,
-    turnover_notional_per_step: np.ndarray,
-    maker_buy_markout_per_step: Optional[np.ndarray] = None,
-    maker_sell_markout_per_step: Optional[np.ndarray] = None,
-    initial_equity: float,
-    bucket_edges_bps: Optional[Sequence[float]] = None,
-) -> Dict[str, Any]:
-    signal_arr = np.asarray(bucket_signal_bps, dtype=np.float64)
-    delta_arr = np.asarray(delta_equity_per_step, dtype=np.float64)
-    reward_arr = np.asarray(reward_per_step, dtype=np.float64)
-    maker_buy_arr = np.asarray(maker_buy_per_step, dtype=np.float64)
-    maker_sell_arr = np.asarray(maker_sell_per_step, dtype=np.float64)
-    turnover_arr = np.asarray(turnover_notional_per_step, dtype=np.float64)
-    if bucket_edges_bps is None:
-        bucket_edges = resolve_baseline_vol_bucket_edges_bps()
-    else:
-        bucket_edges = [float(edge) for edge in bucket_edges_bps]
-    total_steps = int(signal_arr.size)
-    safe_signal = np.where(np.isfinite(signal_arr), signal_arr, np.inf)
-    bucket_indices = np.searchsorted(np.asarray(bucket_edges, dtype=np.float64), safe_signal, side="right")
-    report_rows: List[Dict[str, Any]] = []
-    maker_buy_markout_arr = None if maker_buy_markout_per_step is None else np.asarray(maker_buy_markout_per_step, dtype=np.float64)
-    maker_sell_markout_arr = None if maker_sell_markout_per_step is None else np.asarray(maker_sell_markout_per_step, dtype=np.float64)
-    for bucket_index in range(len(bucket_edges) + 1):
-        mask = bucket_indices == bucket_index
-        step_count = int(np.count_nonzero(mask))
-        maker_buy_fills = int(np.count_nonzero(maker_buy_arr[mask] > 0.0))
-        maker_sell_fills = int(np.count_nonzero(maker_sell_arr[mask] > 0.0))
-        maker_fill_count = maker_buy_fills + maker_sell_fills
-        maker_opportunities = 2 * step_count
-        lower = 0.0 if bucket_index == 0 else float(bucket_edges[bucket_index - 1])
-        upper = None if bucket_index == len(bucket_edges) else float(bucket_edges[bucket_index])
-        bucket_row: Dict[str, Any] = {
-            "bucket_index": bucket_index,
-            "bucket_lower_bps": lower,
-            "bucket_upper_bps": upper,
-            "bucket_label": f"[{lower:.4f}, inf)" if upper is None else f"[{lower:.4f}, {upper:.4f})",
-            "step_count": step_count,
-            "step_fraction": float(step_count / total_steps) if total_steps > 0 else 0.0,
-            "maker_fill_count": maker_fill_count,
-            "maker_buy_fills": maker_buy_fills,
-            "maker_sell_fills": maker_sell_fills,
-            "maker_opportunities": maker_opportunities,
-            "maker_fill_rate": float(maker_fill_count / maker_opportunities) if maker_opportunities > 0 else 0.0,
-            "turnover_notional": float(np.sum(turnover_arr[mask])) if step_count > 0 else 0.0,
-            "delta_equity": float(np.sum(delta_arr[mask])) if step_count > 0 else 0.0,
-            "reward": float(np.sum(reward_arr[mask])) if step_count > 0 else 0.0,
-            "net_pnl_pct_contrib": float(np.sum(delta_arr[mask]) / max(initial_equity, 1e-12)) if step_count > 0 else 0.0,
-        }
-        if maker_buy_markout_arr is not None:
-            bucket_row["maker_buy_markout"] = float(np.sum(maker_buy_markout_arr[mask])) if step_count > 0 else 0.0
-        if maker_sell_markout_arr is not None:
-            bucket_row["maker_sell_markout"] = float(np.sum(maker_sell_markout_arr[mask])) if step_count > 0 else 0.0
-        report_rows.append(bucket_row)
-    return {
-        "vol_bucket_edges_bps": bucket_edges,
-        "vol_bucket_report": report_rows,
-    }
 
 
 @contextmanager
@@ -3944,21 +3865,7 @@ def _inventory_distribution(inventory: np.ndarray) -> Dict[str, float]:
 def evaluate_market_making(
     env: MarketMakingEnv,
     policy_fn,
-    *,
-    collect_vol_bucket_report: bool = False,
-    baseline_cfg: Optional[BaselineQuoteConfig] = None,
 ) -> Dict[str, Any]:
-    bucket_cfg = None
-    bucket_signal_bps_steps: List[float] = []
-    delta_equity_steps: List[float] = []
-    reward_steps: List[float] = []
-    maker_buy_steps: List[float] = []
-    maker_sell_steps: List[float] = []
-    turnover_notional_steps: List[float] = []
-    maker_buy_markout_steps: List[float] = []
-    maker_sell_markout_steps: List[float] = []
-    if collect_vol_bucket_report:
-        bucket_cfg = _validate_baseline_quote_config(load_baseline_quote_config() if baseline_cfg is None else baseline_cfg)
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -4023,15 +3930,6 @@ def evaluate_market_making(
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
         maker_opps += 2
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
-        if collect_vol_bucket_report and bucket_cfg is not None:
-            bucket_signal_bps_steps.append(float(info.get("observed_spread_bps", 0.0)))
-            delta_equity_steps.append(float(info.get("delta_equity", 0.0)))
-            reward_steps.append(float(reward))
-            maker_buy_steps.append(maker_buy)
-            maker_sell_steps.append(maker_sell)
-            turnover_notional_steps.append(float(step_notional))
-            maker_buy_markout_steps.append(float(info.get("maker_buy_markout", 0.0)))
-            maker_sell_markout_steps.append(float(info.get("maker_sell_markout", 0.0)))
 
     equity_arr = np.array(equity_curve, dtype=np.float32)
     # Per-snapshot percentage returns; annualization uses the snapshot cadence.
@@ -4146,20 +4044,6 @@ def evaluate_market_making(
             "timestamp_source": ts_source,
         },
     }
-    if collect_vol_bucket_report and bucket_cfg is not None:
-        metrics.update(
-            build_vol_bucket_report(
-                bucket_signal_bps=np.asarray(bucket_signal_bps_steps, dtype=np.float64),
-                delta_equity_per_step=np.asarray(delta_equity_steps, dtype=np.float64),
-                reward_per_step=np.asarray(reward_steps, dtype=np.float64),
-                maker_buy_per_step=np.asarray(maker_buy_steps, dtype=np.float64),
-                maker_sell_per_step=np.asarray(maker_sell_steps, dtype=np.float64),
-                turnover_notional_per_step=np.asarray(turnover_notional_steps, dtype=np.float64),
-                maker_buy_markout_per_step=np.asarray(maker_buy_markout_steps, dtype=np.float64),
-                maker_sell_markout_per_step=np.asarray(maker_sell_markout_steps, dtype=np.float64),
-                initial_equity=float(initial_equity),
-            )
-        )
     return metrics
 
 
@@ -4523,19 +4407,6 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
         "inventory_mean_abs_notional": float(inventory_abs_sum / steps) if steps > 0 else 0.0, "inventory_max_abs_notional": float(inventory_abs_max), "inventory_distribution": inventory_dist,
         "cadence": {"step_ms": float(step_ms), "steps_per_year": float(steps_per_year), "source": "decision_ts_median_diff" if diff_count > 0 else "env_var_fallback", "diff_count": int(diff_count), "timestamp_source": "decision_ts" if prepared_batch.decision_ts is not None else "synthetic_from_cadence"},
     }
-    metrics.update(
-        build_vol_bucket_report(
-            bucket_signal_bps=np.asarray(prepared_batch.observed_spread_bps[:-1], dtype=np.float64),
-            delta_equity_per_step=np.asarray(delta_equity_curve, dtype=np.float64),
-            reward_per_step=np.asarray(reward_curve, dtype=np.float64),
-            maker_buy_per_step=np.asarray(maker_buy_curve, dtype=np.float64),
-            maker_sell_per_step=np.asarray(maker_sell_curve, dtype=np.float64),
-            turnover_notional_per_step=np.asarray(turnover_notional_curve, dtype=np.float64),
-            maker_buy_markout_per_step=np.asarray(maker_buy_markout_curve, dtype=np.float64),
-            maker_sell_markout_per_step=np.asarray(maker_sell_markout_curve, dtype=np.float64),
-            initial_equity=float(initial_equity),
-        )
-    )
     return metrics
 
 
@@ -4549,8 +4420,6 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
         env_metrics = evaluate_market_making(
             build_baseline_eval_env(batch, context.env_kwargs_common),
             lambda _obs: (0.0, 0.0, 0.0),
-            collect_vol_bucket_report=True,
-            baseline_cfg=quote_cfg,
         )
     fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg)
     for key in ("net_pnl_pct", "maker_fill_rate", "maker_fill_count", "maker_buy_fills", "maker_sell_fills", "turnover_notional", "inventory_mean_abs_notional", "inventory_max_abs_notional"):
@@ -4560,10 +4429,6 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
             raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
         if lhs is not None and rhs is not None and not np.isclose(float(lhs), float(rhs), atol=atol, rtol=rtol):
             raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
-    env_bucket_report = env_metrics.get("vol_bucket_report") or []
-    fast_bucket_report = fast_metrics.get("vol_bucket_report") or []
-    if len(env_bucket_report) != len(fast_bucket_report):
-        raise AssertionError("Baseline parity mismatch vol_bucket_report length")
 
 
 def build_baseline_eval_env(
@@ -4680,8 +4545,6 @@ def evaluate_prepared_baseline(
             baseline_metrics = evaluate_market_making(
                 env,
                 lambda _obs: (0.0, 0.0, 0.0),
-                collect_vol_bucket_report=True,
-                baseline_cfg=fast_quote_cfg,
             )
     return {
         "cmssl_test": context.cmssl_report,
