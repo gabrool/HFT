@@ -479,11 +479,9 @@ LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "masked_ret_vol_loss_auc_ratio_1000ms"  # options: "masked_ret_vol_loss_auc_ratio_1000ms"
+PRIMARY_METRIC = "masked_auc_1000ms"  # options: "masked_auc_<horizon>ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
 PRIMARY_METRIC_AUC_WEIGHT = 1.0
-PRIMARY_METRIC_RET_WEIGHT = 0.25
-PRIMARY_METRIC_VOL_WEIGHT = 0.25
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
 # These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
@@ -526,16 +524,7 @@ NUM_HEADS       = 8
 # Loss mixing (fixed lambdas), with EMA normalization per loss
 EMA_DECAY       = 0.99
 LAMBDA_BCE      = 1.00
-LAMBDA_RET      = 0.50
-LAMBDA_VOL      = 0.50
 
-# Huber deltas (per horizon).
-# We start from calibrated 250ms thresholds (1e-4 return, 0.02 log-vol)
-# and scale them ~sqrt(horizon) to reflect the diffusive growth in magnitude
-# as horizons lengthen.
-_DELTA_BASE_H = HORIZONS_MS[0]
-DELTA_RET       = [1e-4 * math.sqrt(h / _DELTA_BASE_H) for h in HORIZONS_MS]
-DELTA_LOGVOL    = [0.02 * math.sqrt(h / _DELTA_BASE_H) for h in HORIZONS_MS]
 
 # ---------------------------  Building blocks  ----------------------------
 @dataclass
@@ -881,18 +870,6 @@ class SAMBA(nn.Module):
         # Heads
         fused_dim = args.d_model * 2
         head_hidden_dim = fused_dim * 2
-        self.return_head = nn.Sequential(
-            nn.Linear(fused_dim, head_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(head_hidden_dim, NUM_HORIZONS)
-        )
-        self.volatility_head = nn.Sequential(
-            nn.Linear(fused_dim, head_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(head_hidden_dim, NUM_HORIZONS)  # predicts log-vol per horizon
-        )
         self.direction_head = nn.Sequential(
             nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
@@ -905,11 +882,9 @@ class SAMBA(nn.Module):
         h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
 
         pooled, _, _ = self.mamba(h_tokens, embedded=True)
-        ret = self.return_head(pooled)
-        vol = self.volatility_head(pooled)
         dir_logits = self.direction_head(pooled)
 
-        return ret, vol, dir_logits
+        return dir_logits
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
@@ -2397,15 +2372,13 @@ class LabelBuilder:
             mid0_safe = max(e, mid0)
 
             returns = []
-            vols = []
             for horizon in self.horizons:
                 mid_T = self._price_at(t_delta + int(horizon))
                 mid_T_safe = max(e, mid_T)
                 y_ret = math.log(mid_T_safe / mid0_safe)
                 returns.append(y_ret)
-                vols.append(0.5 * (y_ret ** 2))
 
-            out.append(np.array(returns + vols, dtype=np.float32))
+            out.append(np.array(returns, dtype=np.float32))
 
         self.last_ts = t
         self.last_mid = m
@@ -2524,14 +2497,14 @@ def binary_auc_from_logits(logits: torch.Tensor, targets_pos: torch.Tensor) -> f
 
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
     metric = metric_name or PRIMARY_METRIC
-    if metric in {"masked_ret_vol_loss_auc_ratio_1000ms"}:
-        return "min"
+    if metric.startswith("masked_auc_") and metric.endswith("ms"):
+        return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
 def compute_primary_metric(
     val_auc_masked_per_h: Iterable[float],
-    val_ret_loss_masked_per_h: Iterable[float],
-    val_vol_loss_masked_per_h: Iterable[float],
+    val_ret_loss_masked_per_h: Optional[Iterable[float]] = None,
+    val_vol_loss_masked_per_h: Optional[Iterable[float]] = None,
 ) -> Tuple[float, str]:
     if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
         raise ValueError(
@@ -2539,25 +2512,13 @@ def compute_primary_metric(
         )
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
     val_auc_masked_list = list(val_auc_masked_per_h)
-    val_ret_loss_masked_list = list(val_ret_loss_masked_per_h)
-    val_vol_loss_masked_list = list(val_vol_loss_masked_per_h)
     auc_val = float(val_auc_masked_list[idx]) if idx < len(val_auc_masked_list) else float("nan")
-    ret_loss_val = (
-        float(val_ret_loss_masked_list[idx]) if idx < len(val_ret_loss_masked_list) else float("nan")
-    )
-    vol_loss_val = (
-        float(val_vol_loss_masked_list[idx]) if idx < len(val_vol_loss_masked_list) else float("nan")
-    )
-    if PRIMARY_METRIC == "masked_ret_vol_loss_auc_ratio_1000ms":
-        if (
-            not math.isfinite(auc_val)
-            or not math.isfinite(ret_loss_val)
-            or not math.isfinite(vol_loss_val)
-            or auc_val <= 0.0
-        ):
-            return float("nan"), f"masked_ret_vol_loss_auc_ratio_{PRIMARY_METRIC_HORIZON_MS}ms"
-        ratio = (ret_loss_val + vol_loss_val) / (2.0 * auc_val)
-        return ratio, f"masked_ret_vol_loss_auc_ratio_{PRIMARY_METRIC_HORIZON_MS}ms"
+
+    expected_metric = f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms"
+    if PRIMARY_METRIC == expected_metric:
+        if not math.isfinite(auc_val):
+            return float("nan"), expected_metric
+        return auc_val, expected_metric
     raise ValueError(f"Unsupported primary metric '{PRIMARY_METRIC}'")
 
 def is_metric_improved(value: float, best: float, mode: str) -> bool:
