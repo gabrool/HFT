@@ -2426,55 +2426,7 @@ class HFTDataset(Dataset):
         return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
     
 
-# --------------------  Utils: EMA-normalized losses + Huber  ---------------------
-def huber_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    delta: Union[float, Iterable[float], torch.Tensor],
-    weights: Optional[torch.Tensor] = None,
-    reduction: str = "mean",
-) -> torch.Tensor:
-    """Huber loss with optional per-dimension weights and reduction control."""
-    diff = pred - target
-    abs_diff = diff.abs()
-    delta_tensor = torch.as_tensor(delta, device=pred.device, dtype=pred.dtype)
-    if delta_tensor.ndim == 0:
-        delta_tensor = delta_tensor.view(1)
-    delta_tensor = delta_tensor.view(1, -1)
-
-    if diff.ndim == 0:
-        delta_tensor = delta_tensor.view(())
-    else:
-        target_shape = (1,) * (diff.ndim - 1) + (-1,)
-        delta_tensor = delta_tensor.view(*target_shape)
-        if delta_tensor.shape[-1] not in (1, diff.shape[-1]):
-            raise ValueError(
-                "delta must broadcast to the last dimension of pred/target"
-            )
-        if delta_tensor.shape[-1] == 1 and diff.shape[-1] != 1:
-            delta_tensor = delta_tensor.expand(*delta_tensor.shape[:-1], diff.shape[-1])
-
-    quadratic = torch.minimum(abs_diff, delta_tensor)
-    linear = abs_diff - quadratic
-    loss = 0.5 * quadratic**2 / delta_tensor + linear
-
-    if weights is not None:
-        loss = loss * weights
-
-    if reduction == "mean":
-        return loss.mean()
-    if reduction == "none":
-        return loss
-    if reduction == "dim_mean":
-        return loss.mean(dim=0)
-    raise ValueError(f"Unsupported reduction '{reduction}'")
-
-def ema_update(name: str, value: float, ema_dict: Dict[str, float], decay: float = EMA_DECAY) -> float:
-    old = ema_dict.get(name, 1.0)
-    new = decay * old + (1.0 - decay) * value
-    ema_dict[name] = new
-    return new
-
+# --------------------  Utils ---------------------
 def binary_auc_from_logits(logits: torch.Tensor, targets_pos: torch.Tensor) -> float:
     """
     Compute ROC AUC from logits without sklearn.
@@ -2500,9 +2452,7 @@ def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
         return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
-def compute_primary_metric(
-    val_auc_masked_per_h: Iterable[float],
-) -> Tuple[float, str]:
+def compute_primary_metric(val_auc_masked_per_h: Iterable[float]) -> Tuple[float, str]:
     if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
         raise ValueError(
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
