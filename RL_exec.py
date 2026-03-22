@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+try:
+    import numba
+    HAS_NUMBA = True
+except Exception:
+    numba = None
+    HAS_NUMBA = False
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -710,6 +716,43 @@ class BaselineQuoteConfig:
 
 
 @dataclass(frozen=True)
+class PreparedFastBaselineBatch:
+    split_name: str
+    rows: int
+    initial_cash: float
+    fill_size: float
+    maker_rebate_bps: float
+    taker_fee_bps: float
+    fill_tolerance: float
+    delta_bps_limit: float
+    inventory_penalty: float
+    inv_soft_notional: float
+    lambda_inv: float
+    lambda_turn: float
+    max_inventory_notional: float
+    hard_max_inventory_notional: float
+    fill_ema_alpha: float
+    best_bid: np.ndarray
+    best_ask: np.ndarray
+    best_bid_next: np.ndarray
+    best_ask_next: np.ndarray
+    best_bid_prev: np.ndarray
+    best_ask_prev: np.ndarray
+    mid: np.ndarray
+    mid_next: np.ndarray
+    observed_spread_bps: np.ndarray
+    observed_half_spread_floor_bps: np.ndarray
+    decision_ts: Optional[np.ndarray]
+    ret_by_horizon: np.ndarray
+    sigma_bps_by_horizon: np.ndarray
+    p_up_by_horizon: np.ndarray
+    p250: np.ndarray
+    p500: np.ndarray
+    p1000: np.ndarray
+    alpha_ret_forecast_bps_by_horizon: Dict[int, np.ndarray]
+
+
+@dataclass(frozen=True)
 class PreparedBaselineContext:
     out_root: str
     ckpt_path: str
@@ -720,6 +763,8 @@ class PreparedBaselineContext:
     splits_rl_bounds: Dict[str, Any]
     mm_val_batch: "MarketMakingBatch"
     mm_test_batch: "MarketMakingBatch"
+    fast_val_batch: Optional[PreparedFastBaselineBatch]
+    fast_test_batch: Optional[PreparedFastBaselineBatch]
     env_kwargs_common: Dict[str, Any]
     run_config: Dict[str, Any]
     joined_rows: int
@@ -742,6 +787,37 @@ def load_baseline_quote_config() -> BaselineQuoteConfig:
         p500_weight=_env_float("BYBIT_MM_P500_WEIGHT", DEFAULT_MM_P500_WEIGHT),
         p1000_weight=_env_float("BYBIT_MM_P1000_WEIGHT", DEFAULT_MM_P1000_WEIGHT),
     )
+
+
+def _validate_baseline_quote_config(cfg: BaselineQuoteConfig, *, tol: float = 1e-6) -> BaselineQuoteConfig:
+    horizons = _validate_fixed_cmssl_horizons(_normalize_horizons(len(cfg.horizons_ms), cfg.horizons_ms))
+    weight_sum = float(cfg.p250_weight + cfg.p500_weight + cfg.p1000_weight)
+    if abs(weight_sum - 1.0) > tol:
+        raise ValueError(f"Baseline horizon weights must sum to 1.0; got {weight_sum:.12f}")
+    if cfg.inv_ref_notional <= 0.0:
+        raise ValueError("inv_ref_notional must be > 0")
+    if cfg.spread_cap_bps < cfg.spread_floor_bps:
+        raise ValueError("spread_cap_bps must be >= spread_floor_bps")
+    _resolve_horizon_index(cfg.vol_horizon_ms, horizons, label="vol")
+    return BaselineQuoteConfig(**{**cfg.__dict__, "horizons_ms": horizons})
+
+
+def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> BaselineQuoteConfig:
+    cfg = BaselineQuoteConfig(
+        s_min_bps=float(mapping.get("s_min_bps", DEFAULT_MM_S_MIN_BPS)),
+        k_sigma=float(mapping.get("k_sigma", DEFAULT_MM_K_SIGMA)),
+        k_inv=float(mapping.get("k_inv", DEFAULT_MM_K_INV)),
+        k_alpha=float(mapping.get("k_alpha", DEFAULT_MM_K_ALPHA)),
+        spread_floor_bps=float(mapping.get("spread_floor_bps", DEFAULT_MM_SPREAD_FLOOR_BPS)),
+        spread_cap_bps=float(mapping.get("spread_cap_bps", DEFAULT_MM_SPREAD_CAP_BPS)),
+        inv_ref_notional=float(mapping.get("inv_ref_notional", DEFAULT_MM_INV_REF_NOTIONAL)),
+        vol_horizon_ms=int(mapping.get("vol_horizon_ms", DEFAULT_MM_VOL_HORIZON_MS)),
+        horizons_ms=[int(h) for h in mapping.get("horizons_ms", DEFAULT_MM_HORIZONS_MS)],
+        p250_weight=float(mapping.get("p250_weight", DEFAULT_MM_P250_WEIGHT)),
+        p500_weight=float(mapping.get("p500_weight", DEFAULT_MM_P500_WEIGHT)),
+        p1000_weight=float(mapping.get("p1000_weight", DEFAULT_MM_P1000_WEIGHT)),
+    )
+    return _validate_baseline_quote_config(cfg)
 
 
 def _infer_num_horizons(feature_dim: int) -> int:
@@ -3954,6 +4030,277 @@ def load_market_policy(
     return ppo_model.policy_net
 
 
+def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], *, env_kwargs_common: Dict[str, Any], split_name: str) -> PreparedFastBaselineBatch:
+    """Precompute baseline-only arrays once so each trial only runs quote math + fills."""
+    num_h = _infer_num_horizons(batch.features.shape[-1])
+    horizons_ms = _validate_fixed_cmssl_horizons(_normalize_horizons(num_h, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS)))
+    layout = _joined_feature_layout(num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
+    ret_by_horizon = np.asarray(batch.features[:, layout["ret_pred"]], dtype=np.float64)
+    vol_pred = np.asarray(batch.features[:, layout["vol_pred"]], dtype=np.float64)
+    sigma_bps_by_horizon = 1e4 * sigma_from_vol(vol_pred)
+    p_up_by_horizon = np.asarray(batch.features[:, layout["p_up"]], dtype=np.float64)
+    snapshot_block = np.asarray(batch.features[:, layout["snapshots"]], dtype=np.float64)
+    spread_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
+    observed_spread_bps = snapshot_block[:, spread_idx]
+    observed_half_spread_floor_bps = np.where(
+        np.isfinite(observed_spread_bps) & (observed_spread_bps > 0.0),
+        0.5 * observed_spread_bps,
+        0.0,
+    )
+    horizon_idx = {h: _resolve_horizon_index(h, horizons_ms, label=f"fast_{h}") for h in horizons_ms}
+    alpha_ret_forecast_bps_by_horizon = {h: 1e4 * ret_by_horizon[:, idx] for h, idx in horizon_idx.items()}
+    best_bid = np.asarray(batch.best_bid, dtype=np.float64)
+    best_ask = np.asarray(batch.best_ask, dtype=np.float64)
+    mid = 0.5 * (best_bid + best_ask)
+    best_bid_next = np.concatenate([best_bid[1:], best_bid[-1:]])
+    best_ask_next = np.concatenate([best_ask[1:], best_ask[-1:]])
+    best_bid_prev = np.concatenate([best_bid[:1], best_bid[:-1]])
+    best_ask_prev = np.concatenate([best_ask[:1], best_ask[:-1]])
+    mid_next = np.concatenate([mid[1:], mid[-1:]])
+    return PreparedFastBaselineBatch(
+        split_name=split_name,
+        rows=int(batch.features.shape[0]),
+        initial_cash=float(_env_float("BYBIT_MM_INITIAL_CASH", DEFAULT_MM_INITIAL_CASH)),
+        fill_size=float(env_kwargs_common["fill_size"]),
+        maker_rebate_bps=float(env_kwargs_common["maker_rebate_bps"]),
+        taker_fee_bps=float(env_kwargs_common["taker_fee_bps"]),
+        fill_tolerance=float(env_kwargs_common["fill_tolerance"]),
+        delta_bps_limit=float(env_kwargs_common["delta_bps_limit"]),
+        inventory_penalty=float(env_kwargs_common["inventory_penalty"]),
+        inv_soft_notional=float(env_kwargs_common["inv_soft_notional"]),
+        lambda_inv=float(env_kwargs_common["lambda_inv"]),
+        lambda_turn=float(env_kwargs_common["lambda_turn"]),
+        max_inventory_notional=float(env_kwargs_common["max_inventory_notional"]),
+        hard_max_inventory_notional=float(env_kwargs_common["hard_max_inventory_notional"]),
+        fill_ema_alpha=2.0 / float(max(1, _env_int("BYBIT_MM_FILL_EMA_WINDOW_STEPS", DEFAULT_MM_FILL_EMA_WINDOW_STEPS)) + 1.0),
+        best_bid=best_bid,
+        best_ask=best_ask,
+        best_bid_next=best_bid_next,
+        best_ask_next=best_ask_next,
+        best_bid_prev=best_bid_prev,
+        best_ask_prev=best_ask_prev,
+        mid=mid,
+        mid_next=mid_next,
+        observed_spread_bps=observed_spread_bps,
+        observed_half_spread_floor_bps=observed_half_spread_floor_bps,
+        decision_ts=None if batch.decision_ts is None else np.asarray(batch.decision_ts, dtype=np.int64),
+        ret_by_horizon=ret_by_horizon,
+        sigma_bps_by_horizon=sigma_bps_by_horizon,
+        p_up_by_horizon=p_up_by_horizon,
+        p250=p_up_by_horizon[:, _resolve_horizon_index(250, horizons_ms, label="p250")],
+        p500=p_up_by_horizon[:, _resolve_horizon_index(500, horizons_ms, label="p500")],
+        p1000=p_up_by_horizon[:, _resolve_horizon_index(1000, horizons_ms, label="p1000")],
+        alpha_ret_forecast_bps_by_horizon=alpha_ret_forecast_bps_by_horizon,
+    )
+
+
+def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_half_spread_floor_bps, sigma_bps, ret_forecast_bps, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, s_min_bps, k_sigma, k_inv, k_alpha, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
+    steps = len(mid)
+    equity_curve = np.zeros(steps, dtype=np.float64)
+    inventory_curve = np.zeros(steps, dtype=np.float64)
+    cash = initial_cash
+    inventory = 0.0
+    prev_equity = initial_cash
+    total_reward = 0.0
+    total_delta_equity = 0.0
+    inventory_penalty_total = 0.0
+    total_turnover_penalty = 0.0
+    total_maker_buy_markout = 0.0
+    total_maker_sell_markout = 0.0
+    turnover_qty = 0.0
+    turnover_notional = 0.0
+    maker_rebate_total = 0.0
+    maker_fill_count = 0
+    maker_buy_fills = 0
+    maker_sell_fills = 0
+    maker_buy_clipped_steps = 0
+    maker_sell_clipped_steps = 0
+    inventory_abs_sum = 0.0
+    inventory_abs_max = 0.0
+    for idx in range(steps):
+        mid_i = mid[idx]
+        sigma_bps_i = sigma_bps[idx]
+        weight_sum = p250_weight + p500_weight + p1000_weight
+        if weight_sum > 0.0:
+            p_weighted = (p250_weight * p250[idx] + p500_weight * p500[idx] + p1000_weight * p1000[idx]) / weight_sum
+        else:
+            p_weighted = 0.5
+        alpha = (p_weighted - 0.5) * 2.0 * sigma_bps_i + ret_forecast_bps[idx]
+        half_spread_bps = max(s_min_bps, observed_half_spread_floor_bps[idx]) + k_sigma * sigma_bps_i
+        if half_spread_bps < spread_floor_bps:
+            half_spread_bps = spread_floor_bps
+        if half_spread_bps > spread_cap_bps:
+            half_spread_bps = spread_cap_bps
+        inv_notional = inventory * mid_i
+        skew_bps = k_inv * (inv_notional / inv_ref_notional) - k_alpha * alpha
+        half_spread_px = mid_i * half_spread_bps * 1e-4
+        skew_px = mid_i * skew_bps * 1e-4
+        bid = mid_i - half_spread_px - skew_px
+        ask = mid_i + half_spread_px - skew_px
+        eps = max(1e-8, mid_i * 1e-6)
+        curr_best_bid = best_bid[idx]
+        curr_best_ask = best_ask[idx]
+        if bid > curr_best_ask - eps:
+            bid = curr_best_ask - eps
+        if ask < curr_best_bid + eps:
+            ask = curr_best_bid + eps
+        if bid >= ask:
+            bid = curr_best_bid
+            ask = curr_best_ask
+        mid_cap = mid_next[idx]
+        cap_qty = hard_max_inventory_notional / max(mid_cap, 1e-12)
+        buy_fill = 0.0
+        sell_fill = 0.0
+        buy_clip = 0.0
+        sell_clip = 0.0
+        if best_ask_next[idx] <= bid + fill_tolerance:
+            room = max(0.0, cap_qty - inventory)
+            buy_fill = min(fill_size, room)
+            buy_clip = fill_size - buy_fill
+            cash -= bid * buy_fill
+            inventory += buy_fill
+        if best_bid_next[idx] >= ask - fill_tolerance:
+            room = max(0.0, cap_qty + inventory)
+            sell_fill = min(fill_size, room)
+            sell_clip = fill_size - sell_fill
+            cash += ask * sell_fill
+            inventory -= sell_fill
+        touch_tolerance = max(fill_tolerance, 1e-9)
+        if buy_fill == 0.0 and abs(bid - best_bid_prev[idx]) <= touch_tolerance and best_bid_next[idx] < best_bid_prev[idx] - 1e-9:
+            room = max(0.0, cap_qty - inventory)
+            buy_fill = min(fill_size, room)
+            buy_clip = fill_size - buy_fill
+            cash -= bid * buy_fill
+            inventory += buy_fill
+        if sell_fill == 0.0 and abs(ask - best_ask_prev[idx]) <= touch_tolerance and best_ask_next[idx] > best_ask_prev[idx] + 1e-9:
+            room = max(0.0, cap_qty + inventory)
+            sell_fill = min(fill_size, room)
+            sell_clip = fill_size - sell_fill
+            cash += ask * sell_fill
+            inventory -= sell_fill
+        maker_buy_notional = buy_fill * bid
+        maker_sell_notional = sell_fill * ask
+        maker_rebate_notional = maker_buy_notional + maker_sell_notional
+        rebate = maker_rebate_notional * maker_rebate_bps * 1e-4
+        cash += rebate
+        equity = cash + inventory * mid_next[idx]
+        delta_equity = equity - prev_equity
+        inv_abs_notional = abs(inventory * mid_next[idx])
+        penalty = 0.0
+        if inv_abs_notional > max_inventory_notional:
+            penalty += inventory_penalty * (inv_abs_notional - max_inventory_notional)
+        excess_notional = max(0.0, inv_abs_notional - inv_soft_notional)
+        inv_penalty = lambda_inv * (excess_notional / inv_soft_notional) ** 2 if inv_soft_notional > 0.0 else 0.0
+        penalty_total = penalty if penalty > inv_penalty else inv_penalty
+        turnover_penalty = lambda_turn * maker_rebate_notional
+        reward = delta_equity - penalty_total - turnover_penalty
+        total_reward += reward
+        total_delta_equity += delta_equity
+        inventory_penalty_total += penalty_total
+        total_turnover_penalty += turnover_penalty
+        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 else 0.0
+        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 else 0.0
+        total_maker_buy_markout += maker_buy_markout
+        total_maker_sell_markout += maker_sell_markout
+        turnover_qty += buy_fill + sell_fill
+        turnover_notional += maker_rebate_notional
+        maker_rebate_total += rebate
+        maker_fill_count += (1 if buy_fill > 0.0 else 0) + (1 if sell_fill > 0.0 else 0)
+        maker_buy_fills += 1 if buy_fill > 0.0 else 0
+        maker_sell_fills += 1 if sell_fill > 0.0 else 0
+        maker_buy_clipped_steps += 1 if buy_clip > 0.0 else 0
+        maker_sell_clipped_steps += 1 if sell_clip > 0.0 else 0
+        inventory_abs_sum += inv_abs_notional
+        if inv_abs_notional > inventory_abs_max:
+            inventory_abs_max = inv_abs_notional
+        equity_curve[idx] = equity
+        inventory_curve[idx] = inventory
+        prev_equity = equity
+    diff_count = 0
+    step_ms = float(RAW_SNAPSHOT_EXPECTED_STEP_MS)
+    if decision_ts is not None and len(decision_ts) >= 2:
+        diffs = np.diff(decision_ts[: steps + 1])
+        positive = diffs[diffs > 0]
+        if positive.size > 0:
+            step_ms = float(np.median(positive))
+            diff_count = int(positive.size)
+    return (equity_curve, inventory_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count)
+
+
+_evaluate_prepared_baseline_fast_kernel_py = _fast_kernel_impl
+if HAS_NUMBA:
+    _evaluate_prepared_baseline_fast_kernel_numba = numba.njit(cache=True)(_fast_kernel_impl)
+else:
+    _evaluate_prepared_baseline_fast_kernel_numba = None
+
+
+def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, quote_cfg: BaselineQuoteConfig, *, use_numba: Optional[bool] = None) -> Dict[str, Any]:
+    quote_cfg = _validate_baseline_quote_config(quote_cfg)
+    vol_idx = _resolve_horizon_index(quote_cfg.vol_horizon_ms, quote_cfg.horizons_ms, label="vol")
+    kernel = _evaluate_prepared_baseline_fast_kernel_py
+    backend = "python"
+    allow_numba = _env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA) if use_numba is None else bool(use_numba)
+    if allow_numba and _evaluate_prepared_baseline_fast_kernel_numba is not None:
+        kernel = _evaluate_prepared_baseline_fast_kernel_numba
+        backend = "numba"
+    print(f"[baseline fast] backend={backend} split={prepared_batch.split_name}")
+    result = kernel(
+        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_half_spread_floor_bps[:-1], prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], prepared_batch.alpha_ret_forecast_bps_by_horizon[quote_cfg.vol_horizon_ms][:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.k_sigma, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
+    )
+    (equity_curve, inventory_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
+    initial_equity = prepared_batch.initial_cash
+    prev_equity = np.concatenate([[initial_equity], equity_curve[:-1]]) if equity_curve.size else np.empty(0, dtype=np.float64)
+    returns = np.divide(equity_curve, prev_equity, out=np.zeros_like(equity_curve), where=prev_equity != 0) - 1.0 if equity_curve.size else np.empty(0, dtype=np.float64)
+    steps = int(equity_curve.size)
+    steps_per_year = _steps_per_year_from_snapshot_ms(step_ms)
+    sharpe = compute_sharpe(returns, steps_per_year)
+    ts_ms = prepared_batch.decision_ts[1: steps + 1] if prepared_batch.decision_ts is not None and prepared_batch.decision_ts.size >= steps + 1 else np.arange(steps, dtype=np.int64) * int(max(step_ms, 1.0))
+    capital_returns_5m = aggregate_returns_by_time(ts_ms, returns, 5 * 60 * 1000)
+    capital_returns_1h = aggregate_returns_by_time(ts_ms, returns, 60 * 60 * 1000)
+    sharpe_5m = compute_sharpe(capital_returns_5m, 365.0 * 24.0 * 12.0)
+    sharpe_1h = compute_sharpe(capital_returns_1h, 365.0 * 24.0)
+    sortino_5m = compute_sortino(capital_returns_5m, 365.0 * 24.0 * 12.0)
+    sortino_1h = compute_sortino(capital_returns_1h, 365.0 * 24.0)
+    max_drawdown = compute_max_drawdown(equity_curve)
+    final_equity = float(equity_curve[-1]) if equity_curve.size else float(initial_equity)
+    net_pnl = final_equity - initial_equity
+    net_pnl_pct = net_pnl / max(initial_equity, 1e-12)
+    gross_pnl = net_pnl - maker_rebate_total
+    inventory_dist = _inventory_distribution(inventory_curve.astype(np.float32))
+    maker_opportunities = 2 * steps
+    maker_fill_rate = float(maker_fill_count / maker_opportunities) if maker_opportunities > 0 else 0.0
+    ending_inventory_qty = float(inventory_curve[-1]) if inventory_curve.size else 0.0
+    ending_inventory_notional = float(abs(ending_inventory_qty * (prepared_batch.mid_next[-2] if steps > 0 else 0.0)))
+    return {
+        "initial_equity": float(initial_equity), "final_equity": float(final_equity), "net_pnl": float(net_pnl), "net_pnl_pct": float(net_pnl_pct),
+        "gross_pnl": float(gross_pnl), "gross_pnl_pct": float(gross_pnl / max(initial_equity, 1e-12)), "equity_curve": equity_curve.astype(np.float32), "pnl_curve": (equity_curve - initial_equity).astype(np.float32),
+        "sharpe": float(sharpe), "sharpe_5m": float(sharpe_5m), "sharpe_1h": float(sharpe_1h), "sortino_5m": float(sortino_5m), "sortino_1h": float(sortino_1h),
+        "max_drawdown": float(max_drawdown), "max_dd": float(max_drawdown), "turnover_qty": float(turnover_qty), "turnover_notional": float(turnover_notional), "maker_turnover_notional": float(turnover_notional), "maker_turnover_share": 1.0 if turnover_notional > 0 else 0.0,
+        "maker_fill_rate": maker_fill_rate, "maker_fill_count": int(maker_fill_count), "maker_opportunities": int(maker_opportunities), "maker_buy_fills": int(maker_buy_fills), "maker_sell_fills": int(maker_sell_fills),
+        "taker_usage_frequency": 0.0, "taker_volume_share": 0.0, "taker_steps": 0, "steps": steps,
+        "gross_taker_fees_paid": 0.0, "gross_maker_rebates_earned": float(maker_rebate_total), "net_fee_cost": float(-maker_rebate_total), "net_fee_bps_on_turnover": float(-1e4 * maker_rebate_total / turnover_notional) if turnover_notional > 0 else 0.0, "net_fee_pct_initial_equity": float(-maker_rebate_total / max(initial_equity, 1e-12)), "fee_drag": float(-maker_rebate_total / turnover_notional) if turnover_notional > 0 else 0.0,
+        "ending_inventory_qty": ending_inventory_qty, "ending_inventory_notional": ending_inventory_notional, "total_reward": float(total_reward), "total_delta_equity": float(total_delta_equity), "inventory_penalty_total": float(inventory_penalty_total), "total_turnover_penalty": float(total_turnover_penalty),
+        "total_maker_buy_markout": float(total_maker_buy_markout), "total_maker_sell_markout": float(total_maker_sell_markout), "maker_buy_clipped_steps": int(maker_buy_clipped_steps), "maker_sell_clipped_steps": int(maker_sell_clipped_steps), "taker_buy_clipped_steps": 0, "taker_sell_clipped_steps": 0,
+        "inventory_mean_abs_notional": float(inventory_abs_sum / steps) if steps > 0 else 0.0, "inventory_max_abs_notional": float(inventory_abs_max), "inventory_distribution": inventory_dist,
+        "cadence": {"step_ms": float(step_ms), "steps_per_year": float(steps_per_year), "source": "decision_ts_median_diff" if diff_count > 0 else "env_var_fallback", "diff_count": int(diff_count), "timestamp_source": "decision_ts" if prepared_batch.decision_ts is not None else "synthetic_from_cadence"},
+    }
+
+
+def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: str, quote_cfg: BaselineQuoteConfig, *, atol: float = 1e-9, rtol: float = 1e-6) -> None:
+    fast_batch = context.fast_val_batch if eval_split == "val" else context.fast_test_batch
+    if fast_batch is None:
+        raise ValueError("Fast baseline batch unavailable for parity check")
+    env_metrics = evaluate_market_making(build_baseline_eval_env(context.mm_val_batch if eval_split == "val" else context.mm_test_batch, context.env_kwargs_common), lambda _obs: (0.0, 0.0, 0.0))
+    fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg)
+    for key in ("net_pnl_pct", "maker_fill_rate", "maker_fill_count", "maker_buy_fills", "maker_sell_fills", "turnover_notional", "inventory_mean_abs_notional", "inventory_max_abs_notional"):
+        lhs = env_metrics.get(key, env_metrics.get("max_drawdown") if key == "max_dd" else None)
+        rhs = fast_metrics.get(key)
+        if isinstance(lhs, (int, np.integer)) and lhs != rhs:
+            raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
+        if lhs is not None and rhs is not None and not np.isclose(float(lhs), float(rhs), atol=atol, rtol=rtol):
+            raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
+
+
 def build_baseline_eval_env(
     batch: MarketMakingBatch,
     env_kwargs_common: Dict[str, Any],
@@ -4024,6 +4371,10 @@ def prepare_baseline_context(
     print(
         f"[baseline prep] joined_rows={joined_rows} val_rows={val_rows} test_rows={test_rows}"
     )
+    fast_val_batch = prepare_fast_baseline_batch(mm_val_batch, meta, env_kwargs_common=env_kwargs_common, split_name="val")
+    fast_test_batch = prepare_fast_baseline_batch(mm_test_batch, meta, env_kwargs_common=env_kwargs_common, split_name="test")
+    print(f"[baseline prep] fast cache ready split=val rows={fast_val_batch.rows}")
+    print(f"[baseline prep] fast cache ready split=test rows={fast_test_batch.rows}")
     return PreparedBaselineContext(
         out_root=str(out_root),
         ckpt_path=str(ckpt_path),
@@ -4034,6 +4385,8 @@ def prepare_baseline_context(
         splits_rl_bounds=splits_rl["bounds"],
         mm_val_batch=mm_val_batch,
         mm_test_batch=mm_test_batch,
+        fast_val_batch=fast_val_batch,
+        fast_test_batch=fast_test_batch,
         env_kwargs_common=env_kwargs_common,
         run_config=run_config,
         joined_rows=joined_rows,
@@ -4045,13 +4398,22 @@ def evaluate_prepared_baseline(
     context: PreparedBaselineContext,
     *,
     eval_split: str,
+    baseline_config: Optional[Dict[str, Any] | BaselineQuoteConfig] = None,
+    fast_mode: Optional[bool] = None,
+    use_numba: Optional[bool] = None,
 ) -> Dict[str, Any]:
     if eval_split not in {"val", "test"}:
         raise ValueError(f"Unsupported baseline split '{eval_split}'")
     batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
-    print(f"[baseline eval cached] split={eval_split}")
-    env = build_baseline_eval_env(batch, context.env_kwargs_common)
-    baseline_metrics = evaluate_market_making(env, lambda _obs: (0.0, 0.0, 0.0))
+    fast_batch = context.fast_val_batch if eval_split == "val" else context.fast_test_batch
+    quote_cfg = load_baseline_quote_config() if baseline_config is None else (baseline_config if isinstance(baseline_config, BaselineQuoteConfig) else resolve_baseline_quote_config_from_mapping(baseline_config))
+    fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
+    print(f"[baseline eval cached] split={eval_split} fast_mode={fast_enabled}")
+    if fast_enabled and fast_batch is not None:
+        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, use_numba=use_numba)
+    else:
+        env = build_baseline_eval_env(batch, context.env_kwargs_common)
+        baseline_metrics = evaluate_market_making(env, lambda _obs: (0.0, 0.0, 0.0))
     return {
         "cmssl_test": context.cmssl_report,
         "mm_baseline": baseline_metrics,
@@ -4062,6 +4424,8 @@ def evaluate_prepared_baseline(
             "prepared_context_reuse": True,
             "joined_rows": context.joined_rows,
             "cmssl_batch_size": context.cmssl_batch_size,
+            "fast_baseline_mode": bool(fast_enabled and fast_batch is not None),
+            "fast_baseline_numba": bool(use_numba if use_numba is not None else _env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA)),
         },
     }
 

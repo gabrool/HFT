@@ -25,11 +25,11 @@ import csv
 import itertools
 import json
 import math
+import multiprocessing as mp
 import os
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -55,8 +55,13 @@ DEFAULT_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
     "k_alpha": [0.5, 1.0, 1.5, 2.0, 3.0],
     "spread_floor_bps": [0.0, 0.25, 0.5],
     "spread_cap_bps": [6.0, 8.0, 10.0],
-    "vol_horizon_ms": [1000],
-    "weights": [(0.0, 0.0, 1.0)],
+    "vol_horizon_ms": [500, 1000],
+    "weights": [
+        (0.0, 0.0, 1.0),
+        (0.2, 0.3, 0.5),
+        (0.3, 0.4, 0.3),
+        (1.0, 0.0, 0.0),
+    ],
     "k_inv": [0.0],
     "inv_ref_notional": [1.0],
 }
@@ -142,20 +147,10 @@ WEIGHT_ARG_KEYS = {
     "p1000_weight": "anchor_p1000_weight",
 }
 
-
-@contextmanager
-def temporary_env(overrides: Dict[str, str]) -> Iterator[None]:
-    previous = {key: os.environ.get(key) for key in overrides}
-    try:
-        for key, value in overrides.items():
-            os.environ[key] = value
-        yield
-    finally:
-        for key, old_value in previous.items():
-            if old_value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = old_value
+_WORKER_PREPARED_CONTEXT: Optional[RL_exec.PreparedBaselineContext] = None
+_WORKER_EVAL_SPLIT: Optional[str] = None
+_WORKER_FAST_MODE: bool = True
+_WORKER_USE_NUMBA: Optional[bool] = None
 
 
 def resolve_required_path(value: Optional[str], env_name: str) -> str:
@@ -451,15 +446,36 @@ def generate_trial_plan(
     raise ValueError(f"Unsupported search mode: {args.search_mode}")
 
 
-def config_to_env_overrides(config: Dict[str, Any], eval_split: str) -> Dict[str, str]:
-    validate_baseline_config(config)
-    overrides = {
-        "BYBIT_MM_RUN_MODE": "baseline",
-        "BYBIT_MM_BASELINE_EVAL_SPLIT": eval_split,
-    }
-    for key, env_name in BASELINE_PARAM_ENV_MAP.items():
-        overrides[env_name] = str(config[key])
-    return overrides
+def initialize_results_files(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.stat().st_size == 0:
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+    jsonl_path = path.with_suffix(".jsonl")
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path.touch(exist_ok=True)
+    return jsonl_path
+
+
+def append_row_csv(path: Path, row: Dict[str, Any]) -> None:
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
+        writer.writerow({column: row.get(column) for column in RESULT_COLUMNS})
+
+
+def append_row_jsonl(path: Path, row: Dict[str, Any]) -> None:
+    with path.open("a") as handle:
+        handle.write(json.dumps(row, sort_keys=True, default=str))
+        handle.write("\n")
+
+
+def _init_worker(prepared_context: RL_exec.PreparedBaselineContext, eval_split: str, fast_mode: bool, use_numba: Optional[bool]) -> None:
+    global _WORKER_PREPARED_CONTEXT, _WORKER_EVAL_SPLIT, _WORKER_FAST_MODE, _WORKER_USE_NUMBA
+    _WORKER_PREPARED_CONTEXT = prepared_context
+    _WORKER_EVAL_SPLIT = eval_split
+    _WORKER_FAST_MODE = fast_mode
+    _WORKER_USE_NUMBA = use_numba
 
 
 def _safe_metric(metrics: Dict[str, Any], key: str) -> Any:
@@ -523,7 +539,12 @@ def flatten_report_row(
         "inventory_mean_abs_notional",
         "inventory_max_abs_notional",
     ):
-        row[metric_key] = _safe_metric(baseline, metric_key)
+        if metric_key == "max_dd":
+            row[metric_key] = _safe_metric(baseline, "max_dd")
+            if row[metric_key] is None:
+                row[metric_key] = _safe_metric(baseline, "max_drawdown")
+        else:
+            row[metric_key] = _safe_metric(baseline, metric_key)
     return row
 
 
@@ -565,13 +586,16 @@ def evaluate_baseline_config(
     grid_index: Optional[int],
     factor_name: Optional[str],
     factor_value_label_text: Optional[str],
+    fast_mode: bool,
+    use_numba: Optional[bool],
 ) -> Dict[str, Any]:
-    overrides = config_to_env_overrides(config, eval_split)
-    with temporary_env(overrides):
-        report = RL_exec.evaluate_prepared_baseline(
-            prepared_context,
-            eval_split=eval_split,
-        )
+    report = RL_exec.evaluate_prepared_baseline(
+        prepared_context,
+        eval_split=eval_split,
+        baseline_config=config,
+        fast_mode=fast_mode,
+        use_numba=use_numba,
+    )
     return flatten_report_row(
         config,
         report,
@@ -586,6 +610,47 @@ def evaluate_baseline_config(
         factor_name=factor_name,
         factor_value_label_text=factor_value_label_text,
     )
+
+
+def _execute_trial_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    prepared_context = _WORKER_PREPARED_CONTEXT
+    eval_split = _WORKER_EVAL_SPLIT
+    if prepared_context is None or eval_split is None:
+        raise RuntimeError("Worker prepared context not initialized")
+    config = payload["config"]
+    try:
+        row = evaluate_baseline_config(
+            config,
+            prepared_context=prepared_context,
+            eval_split=eval_split,
+            trial=payload["trial"],
+            seed=payload["seed"],
+            search_mode=payload["search_mode"],
+            anchor_config=payload["anchor_config"],
+            varied_factors=payload["varied_factors"],
+            changed_factors=payload["changed_factors"],
+            grid_index=payload["grid_index"],
+            factor_name=payload["factor_name"],
+            factor_value_label_text=payload["factor_value_label"],
+            fast_mode=_WORKER_FAST_MODE,
+            use_numba=_WORKER_USE_NUMBA,
+        )
+    except Exception as exc:
+        row = make_error_row(
+            config,
+            trial=payload["trial"],
+            seed=payload["seed"],
+            eval_split=eval_split,
+            search_mode=payload["search_mode"],
+            anchor_config=payload["anchor_config"],
+            varied_factors=payload["varied_factors"],
+            changed_factors=payload["changed_factors"],
+            grid_index=payload["grid_index"],
+            factor_name=payload["factor_name"],
+            factor_value_label_text=payload["factor_value_label"],
+            exc=exc,
+        )
+    return row
 
 
 def make_error_row(
@@ -632,23 +697,6 @@ def make_error_row(
     return row
 
 
-def write_rows_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({column: row.get(column) for column in RESULT_COLUMNS})
-
-
-def write_rows_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, default=str))
-            handle.write("\n")
-
-
 def print_leaderboard(rows: List[Dict[str, Any]], *, top_k: int, label: str) -> None:
     ranked = [row for row in rows if row.get("status") == "ok"]
     ranked.sort(key=lambda item: item.get("score", -math.inf), reverse=True)
@@ -692,6 +740,12 @@ def build_metadata(
         "vary_factors": list(vary_factors),
         "planned_trials": planned_trials,
         "n_trials_ignored": args.search_mode in {"grid", "one-factor"},
+        "fast_baseline_mode": not args.disable_fast_baseline,
+        "fast_baseline_numba": not args.disable_numba,
+        "workers": args.workers,
+        "worker_chunk_size": args.worker_chunk_size,
+        "start_method": args.start_method,
+        "append_results_mode": True,
     }
     if args.search_mode == "grid":
         metadata["grid_size"] = planned_trials
@@ -736,6 +790,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-weight-preset", choices=tuple(WEIGHT_PRESETS), default=None)
     parser.add_argument("--min-fill-rate", type=float, default=0.002)
     parser.add_argument("--max-drawdown", type=float, default=None)
+    parser.add_argument("--workers", type=int, default=1, help="CPU workers for validation trials; start with 4-8 on large hosts.")
+    parser.add_argument("--worker-chunk-size", type=int, default=1)
+    parser.add_argument("--start-method", choices=("auto", "fork", "spawn"), default="auto")
+    parser.add_argument("--disable-fast-baseline", action="store_true")
+    parser.add_argument("--disable-numba", action="store_true")
     return parser.parse_args()
 
 
@@ -762,11 +821,13 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     results_csv = Path(args.results_csv)
-    results_jsonl = results_csv.with_suffix(".jsonl")
+    results_jsonl = initialize_results_files(results_csv)
     metadata_json = results_csv.with_suffix(".metadata.json")
 
     rows: List[Dict[str, Any]] = []
     prepared_context = RL_exec.prepare_baseline_context(out_root, ckpt_path, device=args.device)
+    fast_mode = not args.disable_fast_baseline
+    use_numba = None if not args.disable_fast_baseline and not args.disable_numba else False
     anchor_config = resolve_anchor_config(args)
     vary_factors = resolve_vary_factors(args)
     trial_plan = generate_trial_plan(args, rng=rng, space=DEFAULT_SEARCH_SPACE, anchor_config=anchor_config)
@@ -790,63 +851,54 @@ def main() -> None:
     )
 
     total_trials = len(trial_plan)
-    for trial, plan_entry in enumerate(trial_plan):
-        config = plan_entry["config"]
-        try:
-            row = evaluate_baseline_config(
-                config,
-                prepared_context=prepared_context,
-                eval_split=args.eval_split,
-                trial=trial,
-                seed=args.seed,
-                search_mode=plan_entry["search_mode"],
-                anchor_config=anchor_config,
-                varied_factors=plan_entry["varied_factors"],
-                changed_factors=plan_entry["changed_factors"],
-                grid_index=plan_entry["grid_index"],
-                factor_name=plan_entry["factor_name"],
-                factor_value_label_text=plan_entry["factor_value_label"],
-            )
+    payloads = [
+        {
+            "trial": trial,
+            "seed": args.seed,
+            "config": plan_entry["config"],
+            "search_mode": plan_entry["search_mode"],
+            "anchor_config": anchor_config,
+            "varied_factors": plan_entry["varied_factors"],
+            "changed_factors": plan_entry["changed_factors"],
+            "grid_index": plan_entry["grid_index"],
+            "factor_name": plan_entry["factor_name"],
+            "factor_value_label": plan_entry["factor_value_label"],
+        }
+        for trial, plan_entry in enumerate(trial_plan)
+    ]
+    start_method = args.start_method
+    if start_method == "auto":
+        start_method = "fork" if os.name == "posix" else "spawn"
+    if args.workers <= 1:
+        _init_worker(prepared_context, args.eval_split, fast_mode, use_numba)
+        trial_iter: Iterable[Dict[str, Any]] = (_execute_trial_payload(payload) for payload in payloads)
+    else:
+        ctx = mp.get_context(start_method)
+        pool = ctx.Pool(
+            processes=args.workers,
+            initializer=_init_worker,
+            initargs=(prepared_context, args.eval_split, fast_mode, use_numba),
+        )
+        trial_iter = pool.imap(_execute_trial_payload, payloads, chunksize=max(1, args.worker_chunk_size))
+    try:
+        for row in trial_iter:
             row["score"] = score_baseline_row(
                 row,
                 min_fill_rate=args.min_fill_rate,
                 max_drawdown=args.max_drawdown,
             )
+            rows.append(row)
+            append_row_csv(results_csv, row)
+            append_row_jsonl(results_jsonl, row)
             if args.verbose:
-                if args.search_mode == "grid":
-                    print(
-                        f"[trial {trial + 1}/{total_trials}] ok mode=grid score={row['score']:.6f} "
-                        f"varied={plan_entry['varied_factors']} config={config}"
-                    )
-                elif args.search_mode == "one-factor":
-                    print(
-                        f"[trial {trial + 1}/{total_trials}] ok mode=one-factor factor={row.get('factor_name')} "
-                        f"value={row.get('factor_value_label')} score={row['score']:.6f} config={config}"
-                    )
-                else:
-                    print(
-                        f"[trial {trial}] ok mode=random score={row['score']:.6f} split={row['baseline_eval_split']} "
-                        f"pnl={row.get('net_pnl_pct')} fill_rate={row.get('maker_fill_rate')} config={config}"
-                    )
-        except Exception as exc:
-            row = make_error_row(
-                config,
-                trial=trial,
-                seed=args.seed,
-                eval_split=args.eval_split,
-                search_mode=plan_entry["search_mode"],
-                anchor_config=anchor_config,
-                varied_factors=plan_entry["varied_factors"],
-                changed_factors=plan_entry["changed_factors"],
-                grid_index=plan_entry["grid_index"],
-                factor_name=plan_entry["factor_name"],
-                factor_value_label_text=plan_entry["factor_value_label"],
-                exc=exc,
-            )
-            print(f"[trial {trial}] error {type(exc).__name__}: {exc}")
-        rows.append(row)
-        write_rows_csv(results_csv, rows)
-        write_rows_jsonl(results_jsonl, rows)
+                print(
+                    f"[trial {row['trial'] + 1}/{total_trials}] status={row['status']} score={row.get('score')} "
+                    f"split={row.get('baseline_eval_split')} config={{s_min_bps={row.get('s_min_bps')}, k_sigma={row.get('k_sigma')}, k_alpha={row.get('k_alpha')}, spread_cap_bps={row.get('spread_cap_bps')}}}"
+                )
+    finally:
+        if args.workers > 1:
+            pool.close()
+            pool.join()
 
     print_leaderboard(rows, top_k=args.top_k, label=f"baseline sweep {args.eval_split}")
 
@@ -864,7 +916,7 @@ def main() -> None:
         top_rows = [row for row in best_rows[: args.top_k]]
         retest_rows: List[Dict[str, Any]] = []
         retest_csv = results_csv.with_name(f"{results_csv.stem}_topk_test.csv")
-        retest_jsonl = retest_csv.with_suffix(".jsonl")
+        retest_jsonl = initialize_results_files(retest_csv)
         for rank, row in enumerate(top_rows, start=1):
             config = {key: row[key] for key in BASELINE_PARAM_ENV_MAP}
             row_metadata = build_retest_row_metadata(row, anchor_config)
@@ -882,6 +934,8 @@ def main() -> None:
                     grid_index=row_metadata["grid_index"],
                     factor_name=row_metadata["factor_name"],
                     factor_value_label_text=row_metadata["factor_value_label"],
+                    fast_mode=fast_mode,
+                    use_numba=use_numba,
                 )
                 retest_row["score"] = score_baseline_row(
                     retest_row,
@@ -905,8 +959,8 @@ def main() -> None:
                 )
                 print(f"[retest rank {rank}] error {type(exc).__name__}: {exc}")
             retest_rows.append(retest_row)
-            write_rows_csv(retest_csv, retest_rows)
-            write_rows_jsonl(retest_jsonl, retest_rows)
+            append_row_csv(retest_csv, retest_row)
+            append_row_jsonl(retest_jsonl, retest_row)
         print_leaderboard(retest_rows, top_k=args.top_k, label="baseline sweep test retest")
 
 
