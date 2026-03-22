@@ -62,6 +62,7 @@ DEFAULT_MM_S_MIN_BPS = 0.0
 DEFAULT_MM_K_SIGMA = 0.5
 DEFAULT_MM_K_INV = 0.0
 DEFAULT_MM_K_ALPHA = 1.0
+DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
 DEFAULT_MM_INV_REF_NOTIONAL = 1.0
@@ -706,6 +707,7 @@ class BaselineQuoteConfig:
     k_sigma: float
     k_inv: float
     k_alpha: float
+    obs_spread_anchor_frac: float
     spread_floor_bps: float
     spread_cap_bps: float
     inv_ref_notional: float
@@ -742,7 +744,6 @@ class PreparedFastBaselineBatch:
     mid: np.ndarray
     mid_next: np.ndarray
     observed_spread_bps: np.ndarray
-    observed_half_spread_floor_bps: np.ndarray
     decision_ts: Optional[np.ndarray]
     ret_by_horizon: np.ndarray
     sigma_bps_by_horizon: np.ndarray
@@ -778,6 +779,7 @@ def load_baseline_quote_config() -> BaselineQuoteConfig:
         k_sigma=_env_float("BYBIT_MM_K_SIGMA", DEFAULT_MM_K_SIGMA),
         k_inv=_env_float("BYBIT_MM_K_INV", DEFAULT_MM_K_INV),
         k_alpha=_env_float("BYBIT_MM_K_ALPHA", DEFAULT_MM_K_ALPHA),
+        obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
         spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
         spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
         inv_ref_notional=_env_float("BYBIT_MM_INV_REF_NOTIONAL", DEFAULT_MM_INV_REF_NOTIONAL),
@@ -797,6 +799,11 @@ def _validate_baseline_quote_config(cfg: BaselineQuoteConfig, *, tol: float = 1e
         raise ValueError(f"Baseline horizon weights must sum to 1.0; got {weight_sum:.12f}")
     if cfg.inv_ref_notional <= 0.0:
         raise ValueError("inv_ref_notional must be > 0")
+    if not np.isfinite(cfg.obs_spread_anchor_frac) or cfg.obs_spread_anchor_frac < 0.0:
+        raise ValueError(
+            "obs_spread_anchor_frac must be finite and >= 0.0 "
+            "(0.5 reproduces the legacy anchor, 0.0 disables it)"
+        )
     if cfg.spread_cap_bps < cfg.spread_floor_bps:
         raise ValueError("spread_cap_bps must be >= spread_floor_bps")
     _resolve_horizon_index(cfg.vol_horizon_ms, horizons, label="vol")
@@ -809,6 +816,7 @@ def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> Basel
         k_sigma=float(mapping.get("k_sigma", DEFAULT_MM_K_SIGMA)),
         k_inv=float(mapping.get("k_inv", DEFAULT_MM_K_INV)),
         k_alpha=float(mapping.get("k_alpha", DEFAULT_MM_K_ALPHA)),
+        obs_spread_anchor_frac=float(mapping.get("obs_spread_anchor_frac", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC)),
         spread_floor_bps=float(mapping.get("spread_floor_bps", DEFAULT_MM_SPREAD_FLOOR_BPS)),
         spread_cap_bps=float(mapping.get("spread_cap_bps", DEFAULT_MM_SPREAD_CAP_BPS)),
         inv_ref_notional=float(mapping.get("inv_ref_notional", DEFAULT_MM_INV_REF_NOTIONAL)),
@@ -826,6 +834,7 @@ BASELINE_QUOTE_ENV_VAR_MAP: Tuple[Tuple[str, str], ...] = (
     ("k_sigma", "BYBIT_MM_K_SIGMA"),
     ("k_inv", "BYBIT_MM_K_INV"),
     ("k_alpha", "BYBIT_MM_K_ALPHA"),
+    ("obs_spread_anchor_frac", "BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC"),
     ("spread_floor_bps", "BYBIT_MM_SPREAD_FLOOR_BPS"),
     ("spread_cap_bps", "BYBIT_MM_SPREAD_CAP_BPS"),
     ("inv_ref_notional", "BYBIT_MM_INV_REF_NOTIONAL"),
@@ -844,6 +853,87 @@ def _resolve_baseline_quote_config(
     if isinstance(baseline_config, BaselineQuoteConfig):
         return _validate_baseline_quote_config(baseline_config)
     return resolve_baseline_quote_config_from_mapping(baseline_config)
+
+
+def resolve_baseline_vol_bucket_edges_bps() -> List[float]:
+    raw_value = os.environ.get("BYBIT_MM_BASELINE_VOL_BUCKET_BPS", "0.5,1.0,2.0,4.0,8.0")
+    edges = [float(part.strip()) for part in raw_value.split(",") if part.strip()]
+    if not edges:
+        raise ValueError("BYBIT_MM_BASELINE_VOL_BUCKET_BPS must contain at least one positive edge")
+    prev = 0.0
+    for edge in edges:
+        if not np.isfinite(edge) or edge <= 0.0:
+            raise ValueError("Baseline vol bucket edges must be finite and > 0")
+        if edge <= prev:
+            raise ValueError("Baseline vol bucket edges must be strictly increasing")
+        prev = edge
+    return edges
+
+
+def build_vol_bucket_report(
+    *,
+    sigma_bps_selected: np.ndarray,
+    delta_equity_per_step: np.ndarray,
+    reward_per_step: np.ndarray,
+    maker_buy_per_step: np.ndarray,
+    maker_sell_per_step: np.ndarray,
+    turnover_notional_per_step: np.ndarray,
+    maker_buy_markout_per_step: Optional[np.ndarray] = None,
+    maker_sell_markout_per_step: Optional[np.ndarray] = None,
+    initial_equity: float,
+    bucket_edges_bps: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    sigma_arr = np.asarray(sigma_bps_selected, dtype=np.float64)
+    delta_arr = np.asarray(delta_equity_per_step, dtype=np.float64)
+    reward_arr = np.asarray(reward_per_step, dtype=np.float64)
+    maker_buy_arr = np.asarray(maker_buy_per_step, dtype=np.float64)
+    maker_sell_arr = np.asarray(maker_sell_per_step, dtype=np.float64)
+    turnover_arr = np.asarray(turnover_notional_per_step, dtype=np.float64)
+    if bucket_edges_bps is None:
+        bucket_edges = resolve_baseline_vol_bucket_edges_bps()
+    else:
+        bucket_edges = [float(edge) for edge in bucket_edges_bps]
+    total_steps = int(sigma_arr.size)
+    safe_sigma = np.where(np.isfinite(sigma_arr), sigma_arr, np.inf)
+    bucket_indices = np.searchsorted(np.asarray(bucket_edges, dtype=np.float64), safe_sigma, side="right")
+    report_rows: List[Dict[str, Any]] = []
+    maker_buy_markout_arr = None if maker_buy_markout_per_step is None else np.asarray(maker_buy_markout_per_step, dtype=np.float64)
+    maker_sell_markout_arr = None if maker_sell_markout_per_step is None else np.asarray(maker_sell_markout_per_step, dtype=np.float64)
+    for bucket_index in range(len(bucket_edges) + 1):
+        mask = bucket_indices == bucket_index
+        step_count = int(np.count_nonzero(mask))
+        maker_buy_fills = int(np.count_nonzero(maker_buy_arr[mask] > 0.0))
+        maker_sell_fills = int(np.count_nonzero(maker_sell_arr[mask] > 0.0))
+        maker_fill_count = maker_buy_fills + maker_sell_fills
+        maker_opportunities = 2 * step_count
+        lower = 0.0 if bucket_index == 0 else float(bucket_edges[bucket_index - 1])
+        upper = None if bucket_index == len(bucket_edges) else float(bucket_edges[bucket_index])
+        bucket_row: Dict[str, Any] = {
+            "bucket_index": bucket_index,
+            "bucket_lower_bps": lower,
+            "bucket_upper_bps": upper,
+            "bucket_label": f"[{lower:.4f}, inf)" if upper is None else f"[{lower:.4f}, {upper:.4f})",
+            "step_count": step_count,
+            "step_fraction": float(step_count / total_steps) if total_steps > 0 else 0.0,
+            "maker_fill_count": maker_fill_count,
+            "maker_buy_fills": maker_buy_fills,
+            "maker_sell_fills": maker_sell_fills,
+            "maker_opportunities": maker_opportunities,
+            "maker_fill_rate": float(maker_fill_count / maker_opportunities) if maker_opportunities > 0 else 0.0,
+            "turnover_notional": float(np.sum(turnover_arr[mask])) if step_count > 0 else 0.0,
+            "delta_equity": float(np.sum(delta_arr[mask])) if step_count > 0 else 0.0,
+            "reward": float(np.sum(reward_arr[mask])) if step_count > 0 else 0.0,
+            "net_pnl_pct_contrib": float(np.sum(delta_arr[mask]) / max(initial_equity, 1e-12)) if step_count > 0 else 0.0,
+        }
+        if maker_buy_markout_arr is not None:
+            bucket_row["maker_buy_markout"] = float(np.sum(maker_buy_markout_arr[mask])) if step_count > 0 else 0.0
+        if maker_sell_markout_arr is not None:
+            bucket_row["maker_sell_markout"] = float(np.sum(maker_sell_markout_arr[mask])) if step_count > 0 else 0.0
+        report_rows.append(bucket_row)
+    return {
+        "vol_bucket_edges_bps": bucket_edges,
+        "vol_bucket_report": report_rows,
+    }
 
 
 @contextmanager
@@ -2133,8 +2223,7 @@ class MarketMakingEnv:
         if spread_idx < self.features.shape[1]:
             observed_spread_bps = float(self.features[idx, spread_idx])
             if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-                # Anchor the minimum spread to the observed half-spread when snapshots are available.
-                s_min_bps = max(s_min_bps, 0.5 * observed_spread_bps)
+                s_min_bps = max(s_min_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
         half_spread_bps = s_min_bps + cfg.k_sigma * sigma_bps
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         inv_ref = cfg.inv_ref_notional if cfg.inv_ref_notional > 0.0 else 1.0
@@ -3797,7 +3886,22 @@ def _inventory_distribution(inventory: np.ndarray) -> Dict[str, float]:
 def evaluate_market_making(
     env: MarketMakingEnv,
     policy_fn,
+    *,
+    collect_vol_bucket_report: bool = False,
+    baseline_cfg: Optional[BaselineQuoteConfig] = None,
 ) -> Dict[str, Any]:
+    bucket_cfg = None
+    sigma_bps_selected_steps: List[float] = []
+    delta_equity_steps: List[float] = []
+    reward_steps: List[float] = []
+    maker_buy_steps: List[float] = []
+    maker_sell_steps: List[float] = []
+    turnover_notional_steps: List[float] = []
+    maker_buy_markout_steps: List[float] = []
+    maker_sell_markout_steps: List[float] = []
+    if collect_vol_bucket_report:
+        bucket_cfg = _validate_baseline_quote_config(load_baseline_quote_config() if baseline_cfg is None else baseline_cfg)
+        vol_idx = _resolve_horizon_index(bucket_cfg.vol_horizon_ms, bucket_cfg.horizons_ms, label="baseline_bucket_vol")
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -3825,6 +3929,7 @@ def evaluate_market_making(
 
     done = False
     while not done:
+        idx_before_step = env.idx
         action = policy_fn(obs)
         obs, reward, done, info = env.step(action)
         equity_curve.append(info["equity"])
@@ -3861,6 +3966,16 @@ def evaluate_market_making(
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
         maker_opps += 2
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
+        if collect_vol_bucket_report and bucket_cfg is not None:
+            vol_pred = env._feature_slice(idx_before_step, env._num_h, 2 * env._num_h)
+            sigma_bps_selected_steps.append(1e4 * float(sigma_from_vol(vol_pred[vol_idx])))
+            delta_equity_steps.append(float(info.get("delta_equity", 0.0)))
+            reward_steps.append(float(reward))
+            maker_buy_steps.append(maker_buy)
+            maker_sell_steps.append(maker_sell)
+            turnover_notional_steps.append(float(step_notional))
+            maker_buy_markout_steps.append(float(info.get("maker_buy_markout", 0.0)))
+            maker_sell_markout_steps.append(float(info.get("maker_sell_markout", 0.0)))
 
     equity_arr = np.array(equity_curve, dtype=np.float32)
     # Per-snapshot percentage returns; annualization uses the snapshot cadence.
@@ -3922,7 +4037,7 @@ def evaluate_market_making(
     maker_turnover_notional = float(turnover_notional - taker_notional)
     maker_turnover_share = float(maker_turnover_notional / turnover_notional) if turnover_notional > 0 else 0.0
 
-    return {
+    metrics = {
         "initial_equity": float(initial_equity),
         "final_equity": final_equity,
         "net_pnl": net_pnl,
@@ -3975,6 +4090,21 @@ def evaluate_market_making(
             "timestamp_source": ts_source,
         },
     }
+    if collect_vol_bucket_report and bucket_cfg is not None:
+        metrics.update(
+            build_vol_bucket_report(
+                sigma_bps_selected=np.asarray(sigma_bps_selected_steps, dtype=np.float64),
+                delta_equity_per_step=np.asarray(delta_equity_steps, dtype=np.float64),
+                reward_per_step=np.asarray(reward_steps, dtype=np.float64),
+                maker_buy_per_step=np.asarray(maker_buy_steps, dtype=np.float64),
+                maker_sell_per_step=np.asarray(maker_sell_steps, dtype=np.float64),
+                turnover_notional_per_step=np.asarray(turnover_notional_steps, dtype=np.float64),
+                maker_buy_markout_per_step=np.asarray(maker_buy_markout_steps, dtype=np.float64),
+                maker_sell_markout_per_step=np.asarray(maker_sell_markout_steps, dtype=np.float64),
+                initial_equity=float(initial_equity),
+            )
+        )
+    return metrics
 
 
 def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
@@ -4089,11 +4219,6 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
     snapshot_block = np.asarray(batch.features[:, layout["snapshots"]], dtype=np.float64)
     spread_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     observed_spread_bps = snapshot_block[:, spread_idx]
-    observed_half_spread_floor_bps = np.where(
-        np.isfinite(observed_spread_bps) & (observed_spread_bps > 0.0),
-        0.5 * observed_spread_bps,
-        0.0,
-    )
     horizon_idx = {h: _resolve_horizon_index(h, horizons_ms, label=f"fast_{h}") for h in horizons_ms}
     alpha_ret_forecast_bps_by_horizon = {h: 1e4 * ret_by_horizon[:, idx] for h, idx in horizon_idx.items()}
     best_bid = np.asarray(batch.best_bid, dtype=np.float64)
@@ -4129,7 +4254,6 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
         mid=mid,
         mid_next=mid_next,
         observed_spread_bps=observed_spread_bps,
-        observed_half_spread_floor_bps=observed_half_spread_floor_bps,
         decision_ts=None if batch.decision_ts is None else np.asarray(batch.decision_ts, dtype=np.int64),
         ret_by_horizon=ret_by_horizon,
         sigma_bps_by_horizon=sigma_bps_by_horizon,
@@ -4141,10 +4265,17 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
     )
 
 
-def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_half_spread_floor_bps, sigma_bps, ret_forecast_bps, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, s_min_bps, k_sigma, k_inv, k_alpha, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
+def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, sigma_bps, ret_forecast_bps, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, s_min_bps, obs_spread_anchor_frac, k_sigma, k_inv, k_alpha, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
     steps = len(mid)
     equity_curve = np.zeros(steps, dtype=np.float64)
     inventory_curve = np.zeros(steps, dtype=np.float64)
+    delta_equity_curve = np.zeros(steps, dtype=np.float64)
+    reward_curve = np.zeros(steps, dtype=np.float64)
+    maker_buy_curve = np.zeros(steps, dtype=np.float64)
+    maker_sell_curve = np.zeros(steps, dtype=np.float64)
+    turnover_notional_curve = np.zeros(steps, dtype=np.float64)
+    maker_buy_markout_curve = np.zeros(steps, dtype=np.float64)
+    maker_sell_markout_curve = np.zeros(steps, dtype=np.float64)
     cash = initial_cash
     inventory = 0.0
     prev_equity = initial_cash
@@ -4173,7 +4304,11 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
         else:
             p_weighted = 0.5
         alpha = (p_weighted - 0.5) * 2.0 * sigma_bps_i + ret_forecast_bps[idx]
-        half_spread_bps = max(s_min_bps, observed_half_spread_floor_bps[idx]) + k_sigma * sigma_bps_i
+        anchored_s_min_bps = s_min_bps
+        observed_spread_bps_i = observed_spread_bps[idx]
+        if np.isfinite(observed_spread_bps_i) and observed_spread_bps_i > 0.0:
+            anchored_s_min_bps = max(anchored_s_min_bps, obs_spread_anchor_frac * observed_spread_bps_i)
+        half_spread_bps = anchored_s_min_bps + k_sigma * sigma_bps_i
         if half_spread_bps < spread_floor_bps:
             half_spread_bps = spread_floor_bps
         if half_spread_bps > spread_cap_bps:
@@ -4241,12 +4376,19 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
         penalty_total = penalty if penalty > inv_penalty else inv_penalty
         turnover_penalty = lambda_turn * maker_rebate_notional
         reward = delta_equity - penalty_total - turnover_penalty
+        delta_equity_curve[idx] = delta_equity
+        reward_curve[idx] = reward
         total_reward += reward
         total_delta_equity += delta_equity
         inventory_penalty_total += penalty_total
         total_turnover_penalty += turnover_penalty
         maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 else 0.0
         maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 else 0.0
+        maker_buy_curve[idx] = buy_fill
+        maker_sell_curve[idx] = sell_fill
+        turnover_notional_curve[idx] = maker_rebate_notional
+        maker_buy_markout_curve[idx] = maker_buy_markout
+        maker_sell_markout_curve[idx] = maker_sell_markout
         total_maker_buy_markout += maker_buy_markout
         total_maker_sell_markout += maker_sell_markout
         turnover_qty += buy_fill + sell_fill
@@ -4271,7 +4413,7 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
         if positive.size > 0:
             step_ms = float(np.median(positive))
             diff_count = int(positive.size)
-    return (equity_curve, inventory_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count)
+    return (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count)
 
 
 _evaluate_prepared_baseline_fast_kernel_py = _fast_kernel_impl
@@ -4293,9 +4435,9 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
     print(f"[baseline fast] backend={backend} split={prepared_batch.split_name}")
     # Pass the precomputed previous-book arrays directly; shifted current arrays break touch/move-away parity.
     result = kernel(
-        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_half_spread_floor_bps[:-1], prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], prepared_batch.alpha_ret_forecast_bps_by_horizon[quote_cfg.vol_horizon_ms][:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.k_sigma, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
+        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], prepared_batch.alpha_ret_forecast_bps_by_horizon[quote_cfg.vol_horizon_ms][:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.k_sigma, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
     )
-    (equity_curve, inventory_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
+    (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
     initial_equity = prepared_batch.initial_cash
     prev_equity = np.concatenate([[initial_equity], equity_curve[:-1]]) if equity_curve.size else np.empty(0, dtype=np.float64)
     returns = np.divide(equity_curve, prev_equity, out=np.zeros_like(equity_curve), where=prev_equity != 0) - 1.0 if equity_curve.size else np.empty(0, dtype=np.float64)
@@ -4319,7 +4461,7 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
     maker_fill_rate = float(maker_fill_count / maker_opportunities) if maker_opportunities > 0 else 0.0
     ending_inventory_qty = float(inventory_curve[-1]) if inventory_curve.size else 0.0
     ending_inventory_notional = float(abs(ending_inventory_qty * (prepared_batch.mid_next[-2] if steps > 0 else 0.0)))
-    return {
+    metrics = {
         "initial_equity": float(initial_equity), "final_equity": float(final_equity), "net_pnl": float(net_pnl), "net_pnl_pct": float(net_pnl_pct),
         "gross_pnl": float(gross_pnl), "gross_pnl_pct": float(gross_pnl / max(initial_equity, 1e-12)), "equity_curve": equity_curve.astype(np.float32), "pnl_curve": (equity_curve - initial_equity).astype(np.float32),
         "sharpe": float(sharpe), "sharpe_5m": float(sharpe_5m), "sharpe_1h": float(sharpe_1h), "sortino_5m": float(sortino_5m), "sortino_1h": float(sortino_1h),
@@ -4332,6 +4474,20 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
         "inventory_mean_abs_notional": float(inventory_abs_sum / steps) if steps > 0 else 0.0, "inventory_max_abs_notional": float(inventory_abs_max), "inventory_distribution": inventory_dist,
         "cadence": {"step_ms": float(step_ms), "steps_per_year": float(steps_per_year), "source": "decision_ts_median_diff" if diff_count > 0 else "env_var_fallback", "diff_count": int(diff_count), "timestamp_source": "decision_ts" if prepared_batch.decision_ts is not None else "synthetic_from_cadence"},
     }
+    metrics.update(
+        build_vol_bucket_report(
+            sigma_bps_selected=np.asarray(prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], dtype=np.float64),
+            delta_equity_per_step=np.asarray(delta_equity_curve, dtype=np.float64),
+            reward_per_step=np.asarray(reward_curve, dtype=np.float64),
+            maker_buy_per_step=np.asarray(maker_buy_curve, dtype=np.float64),
+            maker_sell_per_step=np.asarray(maker_sell_curve, dtype=np.float64),
+            turnover_notional_per_step=np.asarray(turnover_notional_curve, dtype=np.float64),
+            maker_buy_markout_per_step=np.asarray(maker_buy_markout_curve, dtype=np.float64),
+            maker_sell_markout_per_step=np.asarray(maker_sell_markout_curve, dtype=np.float64),
+            initial_equity=float(initial_equity),
+        )
+    )
+    return metrics
 
 
 def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: str, quote_cfg: BaselineQuoteConfig, *, atol: float = 1e-9, rtol: float = 1e-6) -> None:
@@ -4341,7 +4497,12 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
     quote_cfg = _validate_baseline_quote_config(quote_cfg)
     batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
     with temporary_baseline_quote_env_from_config(quote_cfg):
-        env_metrics = evaluate_market_making(build_baseline_eval_env(batch, context.env_kwargs_common), lambda _obs: (0.0, 0.0, 0.0))
+        env_metrics = evaluate_market_making(
+            build_baseline_eval_env(batch, context.env_kwargs_common),
+            lambda _obs: (0.0, 0.0, 0.0),
+            collect_vol_bucket_report=True,
+            baseline_cfg=quote_cfg,
+        )
     fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg)
     for key in ("net_pnl_pct", "maker_fill_rate", "maker_fill_count", "maker_buy_fills", "maker_sell_fills", "turnover_notional", "inventory_mean_abs_notional", "inventory_max_abs_notional"):
         lhs = env_metrics.get(key, env_metrics.get("max_drawdown") if key == "max_dd" else None)
@@ -4350,6 +4511,10 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
             raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
         if lhs is not None and rhs is not None and not np.isclose(float(lhs), float(rhs), atol=atol, rtol=rtol):
             raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
+    env_bucket_report = env_metrics.get("vol_bucket_report") or []
+    fast_bucket_report = fast_metrics.get("vol_bucket_report") or []
+    if len(env_bucket_report) != len(fast_bucket_report):
+        raise AssertionError("Baseline parity mismatch vol_bucket_report length")
 
 
 def build_baseline_eval_env(
@@ -4467,7 +4632,12 @@ def evaluate_prepared_baseline(
         # The generic env path still resolves quote settings from env vars, so install the structured config temporarily.
         with temporary_baseline_quote_env_from_config(quote_cfg):
             env = build_baseline_eval_env(batch, context.env_kwargs_common)
-            baseline_metrics = evaluate_market_making(env, lambda _obs: (0.0, 0.0, 0.0))
+            baseline_metrics = evaluate_market_making(
+                env,
+                lambda _obs: (0.0, 0.0, 0.0),
+                collect_vol_bucket_report=True,
+                baseline_cfg=fast_quote_cfg,
+            )
     return {
         "cmssl_test": context.cmssl_report,
         "mm_baseline": baseline_metrics,
