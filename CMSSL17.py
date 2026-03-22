@@ -479,11 +479,8 @@ LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "masked_ret_vol_loss_auc_ratio_1000ms"  # options: "masked_ret_vol_loss_auc_ratio_1000ms"
+PRIMARY_METRIC = "auc_1000ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
-PRIMARY_METRIC_AUC_WEIGHT = 1.0
-PRIMARY_METRIC_RET_WEIGHT = 0.25
-PRIMARY_METRIC_VOL_WEIGHT = 0.25
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
 # These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
@@ -2503,40 +2500,23 @@ def binary_auc_from_logits(logits: torch.Tensor, targets_pos: torch.Tensor) -> f
 
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
     metric = metric_name or PRIMARY_METRIC
-    if metric in {"masked_ret_vol_loss_auc_ratio_1000ms"}:
-        return "min"
+    if metric == f"auc_{PRIMARY_METRIC_HORIZON_MS}ms":
+        return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
 def compute_primary_metric(
-    val_auc_masked_per_h: Iterable[float],
-    val_ret_loss_masked_per_h: Iterable[float],
-    val_vol_loss_masked_per_h: Iterable[float],
+    val_auc_per_h: Iterable[float],
 ) -> Tuple[float, str]:
     if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
         raise ValueError(
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
         )
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    val_auc_masked_list = list(val_auc_masked_per_h)
-    val_ret_loss_masked_list = list(val_ret_loss_masked_per_h)
-    val_vol_loss_masked_list = list(val_vol_loss_masked_per_h)
-    auc_val = float(val_auc_masked_list[idx]) if idx < len(val_auc_masked_list) else float("nan")
-    ret_loss_val = (
-        float(val_ret_loss_masked_list[idx]) if idx < len(val_ret_loss_masked_list) else float("nan")
-    )
-    vol_loss_val = (
-        float(val_vol_loss_masked_list[idx]) if idx < len(val_vol_loss_masked_list) else float("nan")
-    )
-    if PRIMARY_METRIC == "masked_ret_vol_loss_auc_ratio_1000ms":
-        if (
-            not math.isfinite(auc_val)
-            or not math.isfinite(ret_loss_val)
-            or not math.isfinite(vol_loss_val)
-            or auc_val <= 0.0
-        ):
-            return float("nan"), f"masked_ret_vol_loss_auc_ratio_{PRIMARY_METRIC_HORIZON_MS}ms"
-        ratio = (ret_loss_val + vol_loss_val) / (2.0 * auc_val)
-        return ratio, f"masked_ret_vol_loss_auc_ratio_{PRIMARY_METRIC_HORIZON_MS}ms"
+    val_auc_list = list(val_auc_per_h)
+    auc_metric_name = f"auc_{PRIMARY_METRIC_HORIZON_MS}ms"
+    auc_val = float(val_auc_list[idx]) if idx < len(val_auc_list) else float("nan")
+    if PRIMARY_METRIC == auc_metric_name:
+        return auc_val, auc_metric_name
     raise ValueError(f"Unsupported primary metric '{PRIMARY_METRIC}'")
 
 def is_metric_improved(value: float, best: float, mode: str) -> bool:
