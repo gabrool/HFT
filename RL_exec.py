@@ -728,6 +728,16 @@ class BaselineQuoteConfig:
 
 
 @dataclass(frozen=True)
+class BaselineAlphaCalibration:
+    slope_by_horizon: np.ndarray
+    winsor_lower_bps_by_horizon: np.ndarray
+    winsor_upper_bps_by_horizon: np.ndarray
+    fit_count_by_horizon: np.ndarray
+    horizons_ms: np.ndarray
+    diagnostics: Dict[str, Any]
+
+
+@dataclass(frozen=True)
 class PreparedFastBaselineBatch:
     split_name: str
     rows: int
@@ -757,6 +767,7 @@ class PreparedFastBaselineBatch:
     dir_logits_by_horizon: np.ndarray
     p_up_by_horizon: np.ndarray
     direction_confidence_by_horizon: np.ndarray
+    future_ret_by_horizon: np.ndarray
     p250: np.ndarray
     p500: np.ndarray
     p1000: np.ndarray
@@ -777,6 +788,7 @@ class PreparedBaselineContext:
     mm_test_batch: "MarketMakingBatch"
     fast_val_batch: Optional[PreparedFastBaselineBatch]
     fast_test_batch: Optional[PreparedFastBaselineBatch]
+    baseline_alpha_calibration: BaselineAlphaCalibration
     env_kwargs_common: Dict[str, Any]
     run_config: Dict[str, Any]
     joined_rows: int
@@ -1763,6 +1775,7 @@ class MarketMakingBatch:
     spread_bps: np.ndarray
     best_bid: np.ndarray
     best_ask: np.ndarray
+    future_ret_by_horizon: Optional[np.ndarray] = None
     decision_ts: Optional[np.ndarray] = None
 
 
@@ -3833,11 +3846,22 @@ def build_market_batch(split: Dict[str, np.ndarray]) -> MarketMakingBatch:
                 f"expected {split['features'].shape[0]}, got {decision_ts.shape[0]}"
             )
         _ensure_monotonic(decision_ts, "split")
+    future_ret_by_horizon = split.get("y")
+    if future_ret_by_horizon is not None:
+        future_ret_by_horizon = np.asarray(future_ret_by_horizon, dtype=np.float32)
+        if future_ret_by_horizon.ndim != 2:
+            raise ValueError("split['y'] must be a 2D horizon target matrix.")
+        if future_ret_by_horizon.shape[0] != split["features"].shape[0]:
+            raise ValueError(
+                "split['y'] row mismatch: "
+                f"expected {split['features'].shape[0]}, got {future_ret_by_horizon.shape[0]}"
+            )
     return MarketMakingBatch(
         features=split["features"],
         spread_bps=split["spread_bps"],
         best_bid=best_bid,
         best_ask=best_ask,
+        future_ret_by_horizon=future_ret_by_horizon,
         decision_ts=decision_ts,
     )
 
@@ -4208,6 +4232,65 @@ def load_market_policy(
     return ppo_model.policy_net
 
 
+def _fit_baseline_alpha_calibration(
+    prepared_batch: PreparedFastBaselineBatch,
+    horizons_ms: Sequence[int],
+    *,
+    eps: float = 1e-12,
+) -> BaselineAlphaCalibration:
+    score_by_horizon = np.asarray(2.0 * prepared_batch.p_up_by_horizon - 1.0, dtype=np.float64)
+    target_bps_by_horizon = np.asarray(prepared_batch.future_ret_by_horizon, dtype=np.float64) * 1e4
+    if score_by_horizon.shape != target_bps_by_horizon.shape:
+        raise ValueError(
+            "Calibration inputs must have matching score/target shapes: "
+            f"score_shape={score_by_horizon.shape} target_shape={target_bps_by_horizon.shape}"
+        )
+    num_h = score_by_horizon.shape[1]
+    slope_by_horizon = np.zeros(num_h, dtype=np.float64)
+    winsor_lower = np.zeros(num_h, dtype=np.float64)
+    winsor_upper = np.zeros(num_h, dtype=np.float64)
+    fit_count = np.zeros(num_h, dtype=np.int64)
+    score_mean = np.zeros(num_h, dtype=np.float64)
+    target_mean_bps = np.zeros(num_h, dtype=np.float64)
+    target_std_bps = np.zeros(num_h, dtype=np.float64)
+    winsorized_fraction = np.zeros(num_h, dtype=np.float64)
+    for h in range(num_h):
+        score_h = score_by_horizon[:, h]
+        target_h = target_bps_by_horizon[:, h]
+        valid = np.isfinite(score_h) & np.isfinite(target_h)
+        fit_count[h] = int(np.sum(valid))
+        if fit_count[h] == 0:
+            continue
+        score_valid = score_h[valid]
+        target_valid = target_h[valid]
+        lower = float(np.quantile(target_valid, 0.01))
+        upper = float(np.quantile(target_valid, 0.99))
+        winsor_lower[h] = lower
+        winsor_upper[h] = upper
+        target_winsor = np.clip(target_valid, lower, upper)
+        denom = float(np.sum(score_valid * score_valid))
+        slope_by_horizon[h] = float(np.sum(score_valid * target_winsor) / max(denom, eps))
+        score_mean[h] = float(np.mean(score_valid))
+        target_mean_bps[h] = float(np.mean(target_winsor))
+        target_std_bps[h] = float(np.std(target_winsor))
+        winsorized_fraction[h] = float(np.mean(target_valid != target_winsor))
+    return BaselineAlphaCalibration(
+        slope_by_horizon=slope_by_horizon,
+        winsor_lower_bps_by_horizon=winsor_lower,
+        winsor_upper_bps_by_horizon=winsor_upper,
+        fit_count_by_horizon=fit_count,
+        horizons_ms=np.asarray(horizons_ms, dtype=np.int64),
+        diagnostics={
+            "score_mean_by_horizon": score_mean,
+            "target_mean_bps_by_horizon": target_mean_bps,
+            "target_std_bps_by_horizon": target_std_bps,
+            "winsorized_fraction_by_horizon": winsorized_fraction,
+            "eps": float(eps),
+            "fit_split": prepared_batch.split_name,
+        },
+    )
+
+
 def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], *, env_kwargs_common: Dict[str, Any], split_name: str) -> PreparedFastBaselineBatch:
     """Precompute baseline-only arrays once so each trial only runs quote math + fills."""
     num_h = _infer_num_horizons(batch.features.shape[-1])
@@ -4216,6 +4299,14 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
     dir_logits_by_horizon = np.asarray(batch.features[:, layout["dir_logits"]], dtype=np.float64)
     p_up_by_horizon = np.asarray(batch.features[:, layout["p_up"]], dtype=np.float64)
     direction_confidence_by_horizon = np.abs(2.0 * p_up_by_horizon - 1.0)
+    if batch.future_ret_by_horizon is None:
+        raise ValueError("MarketMakingBatch.future_ret_by_horizon is required for baseline calibration.")
+    future_ret_by_horizon = np.asarray(batch.future_ret_by_horizon, dtype=np.float64)
+    if future_ret_by_horizon.shape != p_up_by_horizon.shape:
+        raise ValueError(
+            "Future-return horizon target matrix must align with model horizon outputs: "
+            f"targets_shape={future_ret_by_horizon.shape} p_up_shape={p_up_by_horizon.shape}"
+        )
     snapshot_block = np.asarray(batch.features[:, layout["snapshots"]], dtype=np.float64)
     spread_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     observed_spread_bps = snapshot_block[:, spread_idx]
@@ -4258,6 +4349,7 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
         dir_logits_by_horizon=dir_logits_by_horizon,
         p_up_by_horizon=p_up_by_horizon,
         direction_confidence_by_horizon=direction_confidence_by_horizon,
+        future_ret_by_horizon=future_ret_by_horizon,
         p250=p_up_by_horizon[:, _resolve_horizon_index(250, horizons_ms, label="p250")],
         p500=p_up_by_horizon[:, _resolve_horizon_index(500, horizons_ms, label="p500")],
         p1000=p_up_by_horizon[:, _resolve_horizon_index(1000, horizons_ms, label="p1000")],
@@ -4533,7 +4625,7 @@ def prepare_baseline_context(
     device: str = "cuda",
 ) -> PreparedBaselineContext:
     print("[baseline prep] building shared CMSSL/joined context")
-    meta = load_global_meta(Path(out_root))
+    meta = dict(load_global_meta(Path(out_root)))
     test_split = resolve_test_split(out_root, meta)
     report_pretrain_diagnostics(out_root, meta)
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
@@ -4587,8 +4679,24 @@ def prepare_baseline_context(
         f"[baseline prep] joined_rows={joined_rows} val_rows={val_rows} test_rows={test_rows}"
     )
     fast_val_batch = prepare_fast_baseline_batch(mm_val_batch, meta, env_kwargs_common=env_kwargs_common, split_name="val")
-    fast_test_batch = prepare_fast_baseline_batch(mm_test_batch, meta, env_kwargs_common=env_kwargs_common, split_name="test")
     print(f"[baseline prep] fast cache ready split=val rows={fast_val_batch.rows}")
+    baseline_alpha_calibration = _fit_baseline_alpha_calibration(fast_val_batch, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS))
+    calibration_summary = {
+        "fit_split": baseline_alpha_calibration.diagnostics["fit_split"],
+        "horizons_ms": baseline_alpha_calibration.horizons_ms.tolist(),
+        "slope_bps_by_unit_score": np.round(baseline_alpha_calibration.slope_by_horizon, 6).tolist(),
+        "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
+    }
+    print(f"[baseline prep] alpha calibration {json.dumps(calibration_summary, sort_keys=True)}")
+    meta["baseline_alpha_calibration"] = {
+        "horizons_ms": baseline_alpha_calibration.horizons_ms.astype(int).tolist(),
+        "slope_by_horizon": baseline_alpha_calibration.slope_by_horizon.tolist(),
+        "winsor_lower_bps_by_horizon": baseline_alpha_calibration.winsor_lower_bps_by_horizon.tolist(),
+        "winsor_upper_bps_by_horizon": baseline_alpha_calibration.winsor_upper_bps_by_horizon.tolist(),
+        "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
+        "diagnostics": _summarize_for_log(baseline_alpha_calibration.diagnostics),
+    }
+    fast_test_batch = prepare_fast_baseline_batch(mm_test_batch, meta, env_kwargs_common=env_kwargs_common, split_name="test")
     print(f"[baseline prep] fast cache ready split=test rows={fast_test_batch.rows}")
     return PreparedBaselineContext(
         out_root=str(out_root),
@@ -4602,6 +4710,7 @@ def prepare_baseline_context(
         mm_test_batch=mm_test_batch,
         fast_val_batch=fast_val_batch,
         fast_test_batch=fast_test_batch,
+        baseline_alpha_calibration=baseline_alpha_calibration,
         env_kwargs_common=env_kwargs_common,
         run_config=run_config,
         joined_rows=joined_rows,
