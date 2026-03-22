@@ -729,7 +729,7 @@ class BaselineQuoteConfig:
 
 @dataclass(frozen=True)
 class BaselineAlphaCalibration:
-    slope_by_horizon: np.ndarray
+    score_to_bps_slope_by_horizon: np.ndarray
     winsor_lower_bps_by_horizon: np.ndarray
     winsor_upper_bps_by_horizon: np.ndarray
     fit_count_by_horizon: np.ndarray
@@ -1923,6 +1923,10 @@ class MarketMakingEnv:
             f"p500_idx={self._p500_idx}",
             f"p1000_idx={self._p1000_idx}",
         )
+        self._baseline_alpha_calibration = self._fit_batch_baseline_alpha_calibration(batch)
+        self._score_to_bps_slope_250 = float(self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p250_idx])
+        self._score_to_bps_slope_500 = float(self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p500_idx])
+        self._score_to_bps_slope_1000 = float(self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p1000_idx])
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
 
@@ -2199,6 +2203,58 @@ class MarketMakingEnv:
     def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
         return self.features[idx, start:end]
 
+    @staticmethod
+    def _width_from_market_state(
+        cfg: BaselineQuoteConfig,
+        observed_spread_bps: float,
+        vol_short: float,
+        vol_long: float,
+        p250: float,
+        p500: float,
+        p1000: float,
+    ) -> float:
+        obs_anchor_bps = cfg.base_half_spread_bps
+        if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
+            obs_anchor_bps = max(obs_anchor_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
+        sigma_bps = 1e4 * max(0.0, vol_short, vol_long)
+        disagreement = max(abs(p250 - p500), abs(p250 - p1000), abs(p500 - p1000))
+        uncertainty_ref_bps = sigma_bps + 1e4 * disagreement
+        half_spread_bps = obs_anchor_bps + cfg.vol_width_scale * sigma_bps + cfg.uncertainty_width_scale * uncertainty_ref_bps
+        return float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+
+    def _fit_batch_baseline_alpha_calibration(self, batch: MarketMakingBatch) -> BaselineAlphaCalibration:
+        if batch.future_ret_by_horizon is None:
+            zeros = np.zeros(self._num_h, dtype=np.float64)
+            return BaselineAlphaCalibration(
+                score_to_bps_slope_by_horizon=zeros,
+                winsor_lower_bps_by_horizon=zeros.copy(),
+                winsor_upper_bps_by_horizon=zeros.copy(),
+                fit_count_by_horizon=np.zeros(self._num_h, dtype=np.int64),
+                horizons_ms=np.asarray(self._horizons_ms, dtype=np.int64),
+                diagnostics={"fit_split": "env_missing_targets"},
+            )
+        prepared_batch = prepare_fast_baseline_batch(
+            batch,
+            {"horizons_ms": self._horizons_ms},
+            env_kwargs_common={
+                "initial_cash": self.initial_cash,
+                "fill_size": self.fill_size,
+                "maker_rebate_bps": self.maker_rebate_bps,
+                "taker_fee_bps": self.taker_fee_bps,
+                "fill_tolerance": self.fill_tolerance,
+                "delta_bps_limit": self.delta_bps_limit,
+                "inventory_penalty": self.inventory_penalty,
+                "inv_soft_notional": self.inv_soft_notional,
+                "lambda_inv": self.lambda_inv,
+                "lambda_turn": self.lambda_turn,
+                "max_inventory_notional": self.max_inventory_notional,
+                "hard_max_inventory_notional": self.hard_max_inventory_notional,
+                "fill_ema_alpha": self.fill_ema_alpha,
+            },
+            split_name="env",
+        )
+        return _fit_baseline_alpha_calibration(prepared_batch, self._horizons_ms)
+
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         cfg = self._baseline_cfg
         mid = self._mid_price(idx)
@@ -2206,41 +2262,29 @@ class MarketMakingEnv:
         p250 = float(p_up[self._p250_idx])
         p500 = float(p_up[self._p500_idx])
         p1000 = float(p_up[self._p1000_idx])
-        weight_sum = cfg.p250_weight + cfg.p500_weight + cfg.p1000_weight
-        if weight_sum > 0.0:
-            p_weighted = (
-                cfg.p250_weight * p250 + cfg.p500_weight * p500 + cfg.p1000_weight * p1000
-            ) / weight_sum
-        else:
-            p_weighted = 0.5
-        alpha = (p_weighted - 0.5) * 2.0
-        confidence = abs(alpha)
-        anchored_half_spread_bps = cfg.base_half_spread_bps
+        score_250 = 2.0 * p250 - 1.0
+        score_500 = 2.0 * p500 - 1.0
+        score_1000 = 2.0 * p1000 - 1.0
+        alpha_center_bps = cfg.alpha_center_scale * (
+            cfg.p250_weight * self._score_to_bps_slope_250 * score_250
+            + cfg.p500_weight * self._score_to_bps_slope_500 * score_500
+            + cfg.p1000_weight * self._score_to_bps_slope_1000 * score_1000
+        )
+        inv_notional = self.inventory * mid
+        inventory_center_bps = cfg.inventory_center_scale * (inv_notional / cfg.inv_ref_notional)
+        reservation_bps = alpha_center_bps - inventory_center_bps
         snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
         observed_spread_bps = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")])
-        if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-            anchored_half_spread_bps = max(anchored_half_spread_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
-        realized_vol_proxy_bps = 0.0
-        for name in ("vol_short", "vol_long"):
-            if name in RAW_SNAPSHOT_FEATURE_COLUMNS:
-                realized_vol_proxy_bps = max(
-                    realized_vol_proxy_bps,
-                    1e4 * max(0.0, float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index(name)])),
-                )
-        inv_ref = cfg.inv_ref_notional if cfg.inv_ref_notional > 0.0 else 1.0
-        inv_notional = self.inventory * mid
-        inv_ratio = inv_notional / inv_ref
-        width_bps = (
-            anchored_half_spread_bps
-            + cfg.vol_width_scale * realized_vol_proxy_bps
-            + cfg.uncertainty_width_scale * (1.0 - confidence)
-        )
-        width_bps = float(np.clip(width_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
-        bid_half_spread_bps = width_bps + cfg.inventory_side_widen_scale * max(inv_ratio, 0.0)
-        ask_half_spread_bps = width_bps + cfg.inventory_side_widen_scale * max(-inv_ratio, 0.0)
-        center_bps = cfg.alpha_center_scale * alpha - cfg.inventory_center_scale * inv_ratio
-        bid = mid + bps_to_px(mid, center_bps - bid_half_spread_bps)
-        ask = mid + bps_to_px(mid, center_bps + ask_half_spread_bps)
+        vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
+        vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
+        half_spread_bps = self._width_from_market_state(cfg, observed_spread_bps, vol_short, vol_long, p250, p500, p1000)
+        extra_widen_bps = cfg.inventory_side_widen_scale * max(0.0, abs(inv_notional) - self.inv_soft_notional) / self.inv_soft_notional
+        bid_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional > 0.0 else 0.0)
+        ask_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional < 0.0 else 0.0)
+        bid_enabled = inv_notional < self.max_inventory_notional
+        ask_enabled = inv_notional > -self.max_inventory_notional
+        bid = mid + bps_to_px(mid, reservation_bps - bid_half_spread_bps) if bid_enabled else np.nan
+        ask = mid + bps_to_px(mid, reservation_bps + ask_half_spread_bps) if ask_enabled else np.nan
         return bid, ask, mid
 
     def _apply_deltas(
@@ -2248,8 +2292,10 @@ class MarketMakingEnv:
     ) -> Tuple[float, float, float, float]:
         bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
         ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
-        bid += mid * bid_delta_bps * 1e-4
-        ask += mid * ask_delta_bps * 1e-4
+        if np.isfinite(bid):
+            bid += mid * bid_delta_bps * 1e-4
+        if np.isfinite(ask):
+            ask += mid * ask_delta_bps * 1e-4
         return bid, ask, bid_delta_bps, ask_delta_bps
 
     def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
@@ -2257,9 +2303,11 @@ class MarketMakingEnv:
         best_ask = float(self.best_ask[idx])
         mid = 0.5 * (best_bid + best_ask)
         eps = max(1e-8, mid * 1e-6)
-        bid = min(bid, best_ask - eps)
-        ask = max(ask, best_bid + eps)
-        if bid >= ask:
+        if np.isfinite(bid):
+            bid = min(bid, best_ask - eps)
+        if np.isfinite(ask):
+            ask = max(ask, best_bid + eps)
+        if np.isfinite(bid) and np.isfinite(ask) and bid >= ask:
             bid = best_bid
             ask = best_ask
         return bid, ask
@@ -2303,27 +2351,29 @@ class MarketMakingEnv:
         self.last_maker_sell_clipped = 0.0
         # Hard inventory cap is defined in quote notional and converted to base qty using midpoint for symmetric long/short treatment.
         mid_for_cap = self._mid_price(idx)
+        bid_enabled = np.isfinite(bid)
+        ask_enabled = np.isfinite(ask)
         # Evaluate fills against the next snapshot's opposite side.
-        if best_ask_next <= bid + self.fill_tolerance:
+        if bid_enabled and best_ask_next <= bid + self.fill_tolerance:
             requested_buy = self.fill_size
             clipped_buy = self._clip_fill_qty(1, requested_buy, mid_for_cap)
             self.last_maker_buy_clipped = requested_buy - clipped_buy
             buy_fill = self._apply_signed_fill(1, clipped_buy, bid)
         # Keep deterministic buy-then-sell processing; second fill sees updated inventory.
-        if best_bid_next >= ask - self.fill_tolerance:
+        if ask_enabled and best_bid_next >= ask - self.fill_tolerance:
             requested_sell = self.fill_size
             clipped_sell = self._clip_fill_qty(-1, requested_sell, mid_for_cap)
             self.last_maker_sell_clipped = requested_sell - clipped_sell
             sell_fill = self._apply_signed_fill(-1, clipped_sell, ask)
         # Heuristic: if we're at the touch and the next best moves away, we got hit.
         touch_tolerance = max(self.fill_tolerance, touch_epsilon)
-        if buy_fill == 0.0 and abs(bid - best_bid_prev) <= touch_tolerance:
+        if bid_enabled and buy_fill == 0.0 and abs(bid - best_bid_prev) <= touch_tolerance:
             if best_bid_next < best_bid_prev - touch_epsilon:
                 requested_buy = self.fill_size
                 clipped_buy = self._clip_fill_qty(1, requested_buy, mid_for_cap)
                 self.last_maker_buy_clipped = requested_buy - clipped_buy
                 buy_fill = self._apply_signed_fill(1, clipped_buy, bid)
-        if sell_fill == 0.0 and abs(ask - best_ask_prev) <= touch_tolerance:
+        if ask_enabled and sell_fill == 0.0 and abs(ask - best_ask_prev) <= touch_tolerance:
             if best_ask_next > best_ask_prev + touch_epsilon:
                 requested_sell = self.fill_size
                 clipped_sell = self._clip_fill_qty(-1, requested_sell, mid_for_cap)
@@ -4275,7 +4325,7 @@ def _fit_baseline_alpha_calibration(
         target_std_bps[h] = float(np.std(target_winsor))
         winsorized_fraction[h] = float(np.mean(target_valid != target_winsor))
     return BaselineAlphaCalibration(
-        slope_by_horizon=slope_by_horizon,
+        score_to_bps_slope_by_horizon=slope_by_horizon,
         winsor_lower_bps_by_horizon=winsor_lower,
         winsor_upper_bps_by_horizon=winsor_upper,
         fit_count_by_horizon=fit_count,
@@ -4357,7 +4407,7 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
         vol_long=vol_long,
     )
 
-def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, vol_short, vol_long, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, base_half_spread_bps, obs_spread_anchor_frac, alpha_center_scale, inventory_center_scale, vol_width_scale, uncertainty_width_scale, inventory_side_widen_scale, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
+def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, vol_short, vol_long, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, base_half_spread_bps, obs_spread_anchor_frac, alpha_center_scale, inventory_center_scale, vol_width_scale, uncertainty_width_scale, inventory_side_widen_scale, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight, score_to_bps_slope_250, score_to_bps_slope_500, score_to_bps_slope_1000):
     steps = len(mid)
     equity_curve = np.zeros(steps, dtype=np.float64)
     inventory_curve = np.zeros(steps, dtype=np.float64)
@@ -4389,38 +4439,48 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
     inventory_abs_max = 0.0
     for idx in range(steps):
         mid_i = mid[idx]
-        weight_sum = p250_weight + p500_weight + p1000_weight
-        if weight_sum > 0.0:
-            p_weighted = (p250_weight * p250[idx] + p500_weight * p500[idx] + p1000_weight * p1000[idx]) / weight_sum
-        else:
-            p_weighted = 0.5
-        alpha = (p_weighted - 0.5) * 2.0
-        confidence = abs(alpha)
-        anchored_half_spread_bps = base_half_spread_bps
+        score_250 = 2.0 * p250[idx] - 1.0
+        score_500 = 2.0 * p500[idx] - 1.0
+        score_1000 = 2.0 * p1000[idx] - 1.0
+        alpha_center_bps = alpha_center_scale * (
+            p250_weight * score_to_bps_slope_250 * score_250
+            + p500_weight * score_to_bps_slope_500 * score_500
+            + p1000_weight * score_to_bps_slope_1000 * score_1000
+        )
         observed_spread_bps_i = observed_spread_bps[idx]
+        obs_anchor_bps = base_half_spread_bps
         if np.isfinite(observed_spread_bps_i) and observed_spread_bps_i > 0.0:
-            anchored_half_spread_bps = max(anchored_half_spread_bps, obs_spread_anchor_frac * observed_spread_bps_i)
-        realized_vol_proxy_bps = 1e4 * max(0.0, max(vol_short[idx], vol_long[idx]))
+            obs_anchor_bps = max(obs_anchor_bps, obs_spread_anchor_frac * observed_spread_bps_i)
+        sigma_bps = 1e4 * max(0.0, vol_short[idx], vol_long[idx])
+        disagreement = max(abs(p250[idx] - p500[idx]), abs(p250[idx] - p1000[idx]), abs(p500[idx] - p1000[idx]))
+        uncertainty_ref_bps = sigma_bps + 1e4 * disagreement
+        half_spread_bps = obs_anchor_bps + vol_width_scale * sigma_bps + uncertainty_width_scale * uncertainty_ref_bps
+        if half_spread_bps < spread_floor_bps:
+            half_spread_bps = spread_floor_bps
+        if half_spread_bps > spread_cap_bps:
+            half_spread_bps = spread_cap_bps
         inv_notional = inventory * mid_i
-        inv_ratio = inv_notional / inv_ref_notional
-        width_bps = anchored_half_spread_bps + vol_width_scale * realized_vol_proxy_bps + uncertainty_width_scale * (1.0 - confidence)
-        if width_bps < spread_floor_bps:
-            width_bps = spread_floor_bps
-        if width_bps > spread_cap_bps:
-            width_bps = spread_cap_bps
-        bid_half_spread_bps = width_bps + inventory_side_widen_scale * max(inv_ratio, 0.0)
-        ask_half_spread_bps = width_bps + inventory_side_widen_scale * max(-inv_ratio, 0.0)
-        center_bps = alpha_center_scale * alpha - inventory_center_scale * inv_ratio
-        bid = mid_i + mid_i * (center_bps - bid_half_spread_bps) * 1e-4
-        ask = mid_i + mid_i * (center_bps + ask_half_spread_bps) * 1e-4
+        inventory_center_bps = inventory_center_scale * (inv_notional / inv_ref_notional)
+        reservation_bps = alpha_center_bps - inventory_center_bps
+        extra_widen_bps = inventory_side_widen_scale * max(0.0, abs(inv_notional) - inv_soft_notional) / inv_soft_notional
+        bid_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional > 0.0 else 0.0)
+        ask_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional < 0.0 else 0.0)
+        bid_enabled = inv_notional < max_inventory_notional
+        ask_enabled = inv_notional > -max_inventory_notional
+        bid = np.nan
+        ask = np.nan
+        if bid_enabled:
+            bid = mid_i + mid_i * (reservation_bps - bid_half_spread_bps) * 1e-4
+        if ask_enabled:
+            ask = mid_i + mid_i * (reservation_bps + ask_half_spread_bps) * 1e-4
         eps = max(1e-8, mid_i * 1e-6)
         curr_best_bid = best_bid[idx]
         curr_best_ask = best_ask[idx]
-        if bid > curr_best_ask - eps:
+        if bid_enabled and bid > curr_best_ask - eps:
             bid = curr_best_ask - eps
-        if ask < curr_best_bid + eps:
+        if ask_enabled and ask < curr_best_bid + eps:
             ask = curr_best_bid + eps
-        if bid >= ask:
+        if bid_enabled and ask_enabled and bid >= ask:
             bid = curr_best_bid
             ask = curr_best_ask
         mid_cap = mid_next[idx]
@@ -4429,35 +4489,33 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
         sell_fill = 0.0
         buy_clip = 0.0
         sell_clip = 0.0
-        if best_ask_next[idx] <= bid + fill_tolerance:
+        if bid_enabled and best_ask_next[idx] <= bid + fill_tolerance:
             room = max(0.0, cap_qty - inventory)
             buy_fill = min(fill_size, room)
             buy_clip = fill_size - buy_fill
             cash -= bid * buy_fill
             inventory += buy_fill
-        if best_bid_next[idx] >= ask - fill_tolerance:
+        if ask_enabled and best_bid_next[idx] >= ask - fill_tolerance:
             room = max(0.0, cap_qty + inventory)
             sell_fill = min(fill_size, room)
             sell_clip = fill_size - sell_fill
             cash += ask * sell_fill
             inventory -= sell_fill
         touch_tolerance = max(fill_tolerance, 1e-9)
-        if buy_fill == 0.0 and abs(bid - best_bid_prev[idx]) <= touch_tolerance and best_bid_next[idx] < best_bid_prev[idx] - 1e-9:
+        if bid_enabled and buy_fill == 0.0 and abs(bid - best_bid_prev[idx]) <= touch_tolerance and best_bid_next[idx] < best_bid_prev[idx] - 1e-9:
             room = max(0.0, cap_qty - inventory)
             buy_fill = min(fill_size, room)
             buy_clip = fill_size - buy_fill
             cash -= bid * buy_fill
             inventory += buy_fill
-        if sell_fill == 0.0 and abs(ask - best_ask_prev[idx]) <= touch_tolerance and best_ask_next[idx] > best_ask_prev[idx] + 1e-9:
+        if ask_enabled and sell_fill == 0.0 and abs(ask - best_ask_prev[idx]) <= touch_tolerance and best_ask_next[idx] > best_ask_prev[idx] + 1e-9:
             room = max(0.0, cap_qty + inventory)
             sell_fill = min(fill_size, room)
             sell_clip = fill_size - sell_fill
             cash += ask * sell_fill
             inventory -= sell_fill
-        maker_buy_notional = buy_fill * bid
-        maker_sell_notional = sell_fill * ask
-        maker_rebate_notional = maker_buy_notional + maker_sell_notional
-        rebate = maker_rebate_notional * maker_rebate_bps * 1e-4
+        maker_notional = buy_fill * bid + sell_fill * ask
+        rebate = maker_notional * maker_rebate_bps * 1e-4
         cash += rebate
         equity = cash + inventory * mid_next[idx]
         delta_equity = equity - prev_equity
@@ -4467,48 +4525,47 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
             penalty += inventory_penalty * (inv_abs_notional - max_inventory_notional)
         excess_notional = max(0.0, inv_abs_notional - inv_soft_notional)
         inv_penalty = lambda_inv * (excess_notional / inv_soft_notional) ** 2 if inv_soft_notional > 0.0 else 0.0
-        penalty_total = penalty if penalty > inv_penalty else inv_penalty
-        turnover_penalty = lambda_turn * maker_rebate_notional
-        reward = delta_equity - penalty_total - turnover_penalty
+        turnover_penalty = lambda_turn * (buy_fill + sell_fill)
+        reward = delta_equity - max(penalty, inv_penalty) - turnover_penalty
+        equity_curve[idx] = equity
+        inventory_curve[idx] = inventory
         delta_equity_curve[idx] = delta_equity
         reward_curve[idx] = reward
-        total_reward += reward
-        total_delta_equity += delta_equity
-        inventory_penalty_total += penalty_total
-        total_turnover_penalty += turnover_penalty
-        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 else 0.0
-        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 else 0.0
         maker_buy_curve[idx] = buy_fill
         maker_sell_curve[idx] = sell_fill
-        turnover_notional_curve[idx] = maker_rebate_notional
+        step_turnover_notional = buy_fill * bid + sell_fill * ask
+        turnover_notional_curve[idx] = step_turnover_notional
+        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 else 0.0
+        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 else 0.0
         maker_buy_markout_curve[idx] = maker_buy_markout
         maker_sell_markout_curve[idx] = maker_sell_markout
-        total_maker_buy_markout += maker_buy_markout
-        total_maker_sell_markout += maker_sell_markout
         turnover_qty += buy_fill + sell_fill
-        turnover_notional += maker_rebate_notional
+        turnover_notional += step_turnover_notional
         maker_rebate_total += rebate
         maker_fill_count += (1 if buy_fill > 0.0 else 0) + (1 if sell_fill > 0.0 else 0)
         maker_buy_fills += 1 if buy_fill > 0.0 else 0
         maker_sell_fills += 1 if sell_fill > 0.0 else 0
         maker_buy_clipped_steps += 1 if buy_clip > 0.0 else 0
         maker_sell_clipped_steps += 1 if sell_clip > 0.0 else 0
+        total_reward += reward
+        total_delta_equity += delta_equity
+        inventory_penalty_total += max(penalty, inv_penalty)
+        total_turnover_penalty += turnover_penalty
+        total_maker_buy_markout += maker_buy_markout
+        total_maker_sell_markout += maker_sell_markout
         inventory_abs_sum += inv_abs_notional
         if inv_abs_notional > inventory_abs_max:
             inventory_abs_max = inv_abs_notional
-        equity_curve[idx] = equity
-        inventory_curve[idx] = inventory
         prev_equity = equity
-    diff_count = 0
     step_ms = float(RAW_SNAPSHOT_EXPECTED_STEP_MS)
+    diff_count = 0
     if decision_ts is not None and len(decision_ts) >= 2:
-        diffs = np.diff(decision_ts[: steps + 1])
+        diffs = np.diff(decision_ts)
         positive = diffs[diffs > 0]
-        if positive.size > 0:
+        if len(positive) > 0:
             step_ms = float(np.median(positive))
-            diff_count = int(positive.size)
+            diff_count = int(len(positive))
     return (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count)
-
 
 _evaluate_prepared_baseline_fast_kernel_py = _fast_kernel_impl
 if HAS_NUMBA:
@@ -4517,7 +4574,7 @@ else:
     _evaluate_prepared_baseline_fast_kernel_numba = None
 
 
-def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, quote_cfg: BaselineQuoteConfig, *, use_numba: Optional[bool] = None) -> Dict[str, Any]:
+def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, quote_cfg: BaselineQuoteConfig, baseline_alpha_calibration: BaselineAlphaCalibration, *, use_numba: Optional[bool] = None) -> Dict[str, Any]:
     quote_cfg = _validate_baseline_quote_config(quote_cfg)
     kernel = _evaluate_prepared_baseline_fast_kernel_py
     backend = "python"
@@ -4528,7 +4585,7 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
     print(f"[baseline fast] backend={backend} split={prepared_batch.split_name}")
     # Pass the precomputed previous-book arrays directly; shifted current arrays break touch/move-away parity.
     result = kernel(
-        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.base_half_spread_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.alpha_center_scale, quote_cfg.inventory_center_scale, quote_cfg.vol_width_scale, quote_cfg.uncertainty_width_scale, quote_cfg.inventory_side_widen_scale, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
+        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.base_half_spread_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.alpha_center_scale, quote_cfg.inventory_center_scale, quote_cfg.vol_width_scale, quote_cfg.uncertainty_width_scale, quote_cfg.inventory_side_widen_scale, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight, baseline_alpha_calibration.score_to_bps_slope_by_horizon[_resolve_horizon_index(250, baseline_alpha_calibration.horizons_ms, label="p250")], baseline_alpha_calibration.score_to_bps_slope_by_horizon[_resolve_horizon_index(500, baseline_alpha_calibration.horizons_ms, label="p500")], baseline_alpha_calibration.score_to_bps_slope_by_horizon[_resolve_horizon_index(1000, baseline_alpha_calibration.horizons_ms, label="p1000")],
     )
     (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
     initial_equity = prepared_batch.initial_cash
@@ -4596,7 +4653,7 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
             collect_vol_bucket_report=True,
             baseline_cfg=quote_cfg,
         )
-    fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg)
+    fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration)
     for key in ("net_pnl_pct", "maker_fill_rate", "maker_fill_count", "maker_buy_fills", "maker_sell_fills", "turnover_notional", "inventory_mean_abs_notional", "inventory_max_abs_notional"):
         lhs = env_metrics.get(key, env_metrics.get("max_drawdown") if key == "max_dd" else None)
         rhs = fast_metrics.get(key)
@@ -4684,13 +4741,14 @@ def prepare_baseline_context(
     calibration_summary = {
         "fit_split": baseline_alpha_calibration.diagnostics["fit_split"],
         "horizons_ms": baseline_alpha_calibration.horizons_ms.tolist(),
-        "slope_bps_by_unit_score": np.round(baseline_alpha_calibration.slope_by_horizon, 6).tolist(),
+        "slope_bps_by_unit_score": np.round(baseline_alpha_calibration.score_to_bps_slope_by_horizon, 6).tolist(),
         "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
     }
     print(f"[baseline prep] alpha calibration {json.dumps(calibration_summary, sort_keys=True)}")
     meta["baseline_alpha_calibration"] = {
         "horizons_ms": baseline_alpha_calibration.horizons_ms.astype(int).tolist(),
-        "slope_by_horizon": baseline_alpha_calibration.slope_by_horizon.tolist(),
+        "score_to_bps_slope_by_horizon": baseline_alpha_calibration.score_to_bps_slope_by_horizon.tolist(),
+        "slope_by_horizon": baseline_alpha_calibration.score_to_bps_slope_by_horizon.tolist(),
         "winsor_lower_bps_by_horizon": baseline_alpha_calibration.winsor_lower_bps_by_horizon.tolist(),
         "winsor_upper_bps_by_horizon": baseline_alpha_calibration.winsor_upper_bps_by_horizon.tolist(),
         "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
@@ -4735,7 +4793,7 @@ def evaluate_prepared_baseline(
     fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
     print(f"[baseline eval cached] split={eval_split} fast_mode={fast_enabled}")
     if fast_enabled and fast_batch is not None:
-        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, fast_quote_cfg, use_numba=use_numba)
+        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, fast_quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba)
     else:
         # The generic env path still resolves quote settings from env vars, so install the structured config temporarily.
         with temporary_baseline_quote_env_from_config(quote_cfg):
