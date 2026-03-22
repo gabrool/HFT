@@ -500,6 +500,86 @@ def _select_baseline_env(
     raise ValueError(f"Unsupported baseline split '{split_name}'")
 
 
+def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
+    maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
+    inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
+    inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
+    if not inv_soft_notional_str:
+        raise ValueError(
+            "Missing required env var BYBIT_MM_INV_SOFT_NOTIONAL (quote notional, USD)."
+        )
+    inv_soft_notional = float(inv_soft_notional_str)
+    lambda_inv = float(os.environ.get("BYBIT_MM_LAMBDA_INV", "0.0"))
+    lambda_turn = float(os.environ.get("BYBIT_MM_LAMBDA_TURN", "0.0"))
+    max_inventory_notional_str = os.environ.get("BYBIT_MM_MAX_INV_NOTIONAL", "").strip()
+    if not max_inventory_notional_str:
+        raise ValueError(
+            "Missing required env var BYBIT_MM_MAX_INV_NOTIONAL (quote notional, USD)."
+        )
+    max_inventory_notional = float(max_inventory_notional_str)
+    hard_max_inventory_notional_str = os.environ.get("BYBIT_MM_HARD_MAX_INV_NOTIONAL", "").strip()
+    hard_max_inventory_notional = (
+        float(hard_max_inventory_notional_str)
+        if hard_max_inventory_notional_str
+        else float(max_inventory_notional)
+    )
+    fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
+    fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
+    taker_fee_bps = float(os.environ.get("BYBIT_MM_TAKER_FEE_BPS", str(DEFAULT_MM_TAKER_FEE_BPS)))
+    taker_threshold = float(os.environ.get("BYBIT_MM_TAKER_THRESHOLD", str(DEFAULT_MM_TAKER_THRESHOLD)))
+    delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
+    if not delta_bps_limit_str:
+        raise ValueError(
+            "Missing required env var BYBIT_MM_DELTA_BPS_LIMIT (basis points, bps)."
+        )
+    try:
+        delta_bps_limit = float(delta_bps_limit_str)
+    except ValueError as exc:
+        raise ValueError(
+            "BYBIT_MM_DELTA_BPS_LIMIT must be a finite float in basis points (bps)."
+        ) from exc
+    if not np.isfinite(delta_bps_limit) or delta_bps_limit <= 0.0:
+        raise ValueError(
+            "BYBIT_MM_DELTA_BPS_LIMIT must be finite and > 0 in basis points (bps)."
+        )
+    if inv_soft_notional <= 0.0:
+        raise ValueError("BYBIT_MM_INV_SOFT_NOTIONAL must be > 0 (quote notional, USD).")
+    if max_inventory_notional <= 0.0:
+        raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be > 0 (quote notional, USD).")
+    if max_inventory_notional < inv_soft_notional:
+        raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be >= BYBIT_MM_INV_SOFT_NOTIONAL.")
+    if not np.isfinite(hard_max_inventory_notional) or hard_max_inventory_notional <= 0.0:
+        raise ValueError(
+            "BYBIT_MM_HARD_MAX_INV_NOTIONAL must be finite and > 0 (quote notional, USD)."
+        )
+    if hard_max_inventory_notional < max_inventory_notional:
+        raise ValueError(
+            "BYBIT_MM_HARD_MAX_INV_NOTIONAL must be >= BYBIT_MM_MAX_INV_NOTIONAL."
+        )
+    if lambda_inv > 0.0 and inv_soft_notional > 0.0:
+        print(
+            "[mm config warning]",
+            "Inventory penalties now use USD notional units; retune",
+            "BYBIT_MM_INVENTORY_PENALTY/BYBIT_MM_LAMBDA_INV if needed.",
+            f"inv_soft_notional={inv_soft_notional}",
+            f"lambda_inv={lambda_inv}",
+        )
+    return {
+        "maker_rebate_bps": maker_rebate_bps,
+        "taker_fee_bps": taker_fee_bps,
+        "taker_threshold": taker_threshold,
+        "inventory_penalty": inventory_penalty,
+        "inv_soft_notional": inv_soft_notional,
+        "lambda_inv": lambda_inv,
+        "lambda_turn": lambda_turn,
+        "max_inventory_notional": max_inventory_notional,
+        "hard_max_inventory_notional": hard_max_inventory_notional,
+        "fill_size": fill_size,
+        "fill_tolerance": fill_tolerance,
+        "delta_bps_limit": delta_bps_limit,
+    }
+
+
 def _resolve_ppo_epochs(default: int) -> int:
     return _env_int(PPO_EPOCHS_ENV, default)
 
@@ -627,6 +707,23 @@ class BaselineQuoteConfig:
     p250_weight: float
     p500_weight: float
     p1000_weight: float
+
+
+@dataclass(frozen=True)
+class PreparedBaselineContext:
+    out_root: str
+    ckpt_path: str
+    device: str
+    meta: Dict[str, Any]
+    test_split: Dict[str, Any]
+    cmssl_report: Dict[str, Any]
+    splits_rl_bounds: Dict[str, Any]
+    mm_val_batch: "MarketMakingBatch"
+    mm_test_batch: "MarketMakingBatch"
+    env_kwargs_common: Dict[str, Any]
+    run_config: Dict[str, Any]
+    joined_rows: int
+    cmssl_batch_size: int
 
 
 def load_baseline_quote_config() -> BaselineQuoteConfig:
@@ -3857,6 +3954,118 @@ def load_market_policy(
     return ppo_model.policy_net
 
 
+def build_baseline_eval_env(
+    batch: MarketMakingBatch,
+    env_kwargs_common: Dict[str, Any],
+) -> MarketMakingEnv:
+    # The cached baseline path evaluates a fixed zero-action policy, so
+    # observation-normalization prefit/freeze does not affect actions or fills.
+    return MarketMakingEnv(batch, allow_taker=False, **env_kwargs_common)
+
+
+def prepare_baseline_context(
+    out_root: str,
+    ckpt_path: str,
+    device: str = "cuda",
+) -> PreparedBaselineContext:
+    print("[baseline prep] building shared CMSSL/joined context")
+    meta = load_global_meta(Path(out_root))
+    test_split = resolve_test_split(out_root, meta)
+    report_pretrain_diagnostics(out_root, meta)
+    model, _meta = load_cmssl(out_root, ckpt_path, device=device)
+
+    cmssl_batch_size = _resolve_cmssl_batch_size()
+    preallocate_join_features = _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False)
+    rollout_storage = _resolve_rollout_storage("gpu")
+    run_config = {
+        "cmssl_batch_size": cmssl_batch_size,
+        "rollout_storage": rollout_storage,
+        "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False),
+        "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False),
+        "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False),
+        "preallocate_join_features": preallocate_join_features,
+    }
+    _timing_log(
+        "run_config "
+        f"cmssl_batch_size={cmssl_batch_size} "
+        f"rollout_storage={rollout_storage} "
+        f"compile_cmssl={run_config['compile_cmssl']} "
+        f"compile_ppo={run_config['compile_ppo']} "
+        f"tf32={run_config['tf32']} "
+        f"preallocate_join_features={preallocate_join_features}"
+    )
+
+    joined_test = build_joined_split(
+        out_root,
+        test_split,
+        model,
+        meta,
+        device,
+        batch_size=cmssl_batch_size,
+    )
+    num_h = len(meta.get("horizons_ms", []))
+    cmssl_report = report_cmssl_metrics(
+        joined_test["y"],
+        {
+            "ret_pred": joined_test["features"][:, :num_h],
+            "vol_pred": joined_test["features"][:, num_h:2 * num_h],
+            "dir_logits": joined_test["features"][:, 2 * num_h:3 * num_h],
+        },
+    )
+
+    splits_rl = chronological_split(joined_test, ratios=(0.6, 0.2, 0.2))
+    persist_split_bounds(out_root, splits_rl["bounds"], total=len(joined_test["ts"]))
+    mm_val_batch = build_market_batch(splits_rl["val"])
+    mm_test_batch = build_market_batch(splits_rl["test"])
+    env_kwargs_common = resolve_market_env_common_kwargs_from_env()
+    val_rows = int(mm_val_batch.features.shape[0])
+    test_rows = int(mm_test_batch.features.shape[0])
+    joined_rows = int(joined_test["features"].shape[0])
+    print(
+        f"[baseline prep] joined_rows={joined_rows} val_rows={val_rows} test_rows={test_rows}"
+    )
+    return PreparedBaselineContext(
+        out_root=str(out_root),
+        ckpt_path=str(ckpt_path),
+        device=str(device),
+        meta=meta,
+        test_split=test_split,
+        cmssl_report=cmssl_report,
+        splits_rl_bounds=splits_rl["bounds"],
+        mm_val_batch=mm_val_batch,
+        mm_test_batch=mm_test_batch,
+        env_kwargs_common=env_kwargs_common,
+        run_config=run_config,
+        joined_rows=joined_rows,
+        cmssl_batch_size=cmssl_batch_size,
+    )
+
+
+def evaluate_prepared_baseline(
+    context: PreparedBaselineContext,
+    *,
+    eval_split: str,
+) -> Dict[str, Any]:
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"Unsupported baseline split '{eval_split}'")
+    batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
+    print(f"[baseline eval cached] split={eval_split}")
+    env = build_baseline_eval_env(batch, context.env_kwargs_common)
+    baseline_metrics = evaluate_market_making(env, lambda _obs: (0.0, 0.0, 0.0))
+    return {
+        "cmssl_test": context.cmssl_report,
+        "mm_baseline": baseline_metrics,
+        "mm_rl": None,
+        "mm_run_context": {
+            "run_mode": "baseline",
+            "baseline_eval_split": eval_split,
+            "prepared_context_reuse": True,
+            "joined_rows": context.joined_rows,
+            "cmssl_batch_size": context.cmssl_batch_size,
+        },
+    }
+
+
 def run_pipeline(
     out_root: str,
     ckpt_path: str,
@@ -3911,163 +4120,29 @@ def run_pipeline(
     mm_train_batch = build_market_batch(splits_rl["train"])
     mm_val_batch = build_market_batch(splits_rl["val"])
     mm_test_batch = build_market_batch(splits_rl["test"])
-    maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
-    inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
-    # Inventory/turnover penalties applied inside MarketMakingEnv.step().
-    # Required inventory risk knobs (quote notional, USD):
-    #   BYBIT_MM_INV_SOFT_NOTIONAL
-    #   BYBIT_MM_MAX_INV_NOTIONAL
-    #   BYBIT_MM_INVENTORY_NOTIONAL_SCALE
-    # Required delta control knob (basis points, bps):
-    #   BYBIT_MM_DELTA_BPS_LIMIT
-    # Units are quote notional (USD), not base units.
-    inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
-    if not inv_soft_notional_str:
-        raise ValueError(
-            "Missing required env var BYBIT_MM_INV_SOFT_NOTIONAL (quote notional, USD)."
-        )
-    inv_soft_notional = float(inv_soft_notional_str)
-    lambda_inv = float(os.environ.get("BYBIT_MM_LAMBDA_INV", "0.0"))
-    lambda_turn = float(os.environ.get("BYBIT_MM_LAMBDA_TURN", "0.0"))
-    # Soft threshold (reward penalty trigger) and hard pre-fill clipping cap, both in USD notionals.
-    max_inventory_notional_str = os.environ.get("BYBIT_MM_MAX_INV_NOTIONAL", "").strip()
-    if not max_inventory_notional_str:
-        raise ValueError(
-            "Missing required env var BYBIT_MM_MAX_INV_NOTIONAL (quote notional, USD)."
-        )
-    max_inventory_notional = float(max_inventory_notional_str)
-    hard_max_inventory_notional_str = os.environ.get("BYBIT_MM_HARD_MAX_INV_NOTIONAL", "").strip()
-    hard_max_inventory_notional = (
-        float(hard_max_inventory_notional_str)
-        if hard_max_inventory_notional_str
-        else float(max_inventory_notional)
-    )
-    fill_size = float(os.environ.get("BYBIT_MM_FILL_SIZE", "1.0"))
-    fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
+    env_kwargs_common = resolve_market_env_common_kwargs_from_env()
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "10.0"))
     taker_scale = float(os.environ.get("BYBIT_MM_TAKER_SCALE", "1.0"))
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
-    taker_fee_bps = float(os.environ.get("BYBIT_MM_TAKER_FEE_BPS", str(DEFAULT_MM_TAKER_FEE_BPS)))
-    taker_threshold = float(os.environ.get("BYBIT_MM_TAKER_THRESHOLD", str(DEFAULT_MM_TAKER_THRESHOLD)))
-    delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
-    if not delta_bps_limit_str:
-        raise ValueError(
-            "Missing required env var BYBIT_MM_DELTA_BPS_LIMIT (basis points, bps)."
-        )
-    try:
-        delta_bps_limit = float(delta_bps_limit_str)
-    except ValueError as exc:
-        raise ValueError(
-            "BYBIT_MM_DELTA_BPS_LIMIT must be a finite float in basis points (bps)."
-        ) from exc
-    if not np.isfinite(delta_bps_limit) or delta_bps_limit <= 0.0:
-        raise ValueError(
-            "BYBIT_MM_DELTA_BPS_LIMIT must be finite and > 0 in basis points (bps)."
-        )
-    if inv_soft_notional <= 0.0:
-        raise ValueError("BYBIT_MM_INV_SOFT_NOTIONAL must be > 0 (quote notional, USD).")
-    if max_inventory_notional <= 0.0:
-        raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be > 0 (quote notional, USD).")
-    if max_inventory_notional < inv_soft_notional:
-        raise ValueError("BYBIT_MM_MAX_INV_NOTIONAL must be >= BYBIT_MM_INV_SOFT_NOTIONAL.")
-    if not np.isfinite(hard_max_inventory_notional) or hard_max_inventory_notional <= 0.0:
-        raise ValueError(
-            "BYBIT_MM_HARD_MAX_INV_NOTIONAL must be finite and > 0 (quote notional, USD)."
-        )
-    if hard_max_inventory_notional < max_inventory_notional:
-        raise ValueError(
-            "BYBIT_MM_HARD_MAX_INV_NOTIONAL must be >= BYBIT_MM_MAX_INV_NOTIONAL."
-        )
-    if lambda_inv > 0.0 and inv_soft_notional > 0.0:
-        print(
-            "[mm config warning]",
-            "Inventory penalties now use USD notional units; retune",
-            "BYBIT_MM_INVENTORY_PENALTY/BYBIT_MM_LAMBDA_INV if needed.",
-            f"inv_soft_notional={inv_soft_notional}",
-            f"lambda_inv={lambda_inv}",
-        )
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
-        maker_rebate_bps=maker_rebate_bps,
-        taker_fee_bps=taker_fee_bps,
         allow_taker=allow_taker,
-        taker_threshold=taker_threshold,
-        inventory_penalty=inventory_penalty,
-        inv_soft_notional=inv_soft_notional,
-        lambda_inv=lambda_inv,
-        lambda_turn=lambda_turn,
-        max_inventory_notional=max_inventory_notional,
-        hard_max_inventory_notional=hard_max_inventory_notional,
-        fill_size=fill_size,
-        fill_tolerance=fill_tolerance,
-        delta_bps_limit=delta_bps_limit,
+        **env_kwargs_common,
     )
     print("[mm obs scaling]", json.dumps(mm_train_env.get_observation_scaling_config(), sort_keys=True))
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
-        maker_rebate_bps=maker_rebate_bps,
-        taker_fee_bps=taker_fee_bps,
         allow_taker=allow_taker,
-        taker_threshold=taker_threshold,
-        inventory_penalty=inventory_penalty,
-        inv_soft_notional=inv_soft_notional,
-        lambda_inv=lambda_inv,
-        lambda_turn=lambda_turn,
-        max_inventory_notional=max_inventory_notional,
-        hard_max_inventory_notional=hard_max_inventory_notional,
-        fill_size=fill_size,
-        fill_tolerance=fill_tolerance,
-        delta_bps_limit=delta_bps_limit,
+        **env_kwargs_common,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
-        maker_rebate_bps=maker_rebate_bps,
-        taker_fee_bps=taker_fee_bps,
         allow_taker=allow_taker,
-        taker_threshold=taker_threshold,
-        inventory_penalty=inventory_penalty,
-        inv_soft_notional=inv_soft_notional,
-        lambda_inv=lambda_inv,
-        lambda_turn=lambda_turn,
-        max_inventory_notional=max_inventory_notional,
-        hard_max_inventory_notional=hard_max_inventory_notional,
-        fill_size=fill_size,
-        fill_tolerance=fill_tolerance,
-        delta_bps_limit=delta_bps_limit,
+        **env_kwargs_common,
     )
-    baseline_val_env = MarketMakingEnv(
-        mm_val_batch,
-        maker_rebate_bps=maker_rebate_bps,
-        taker_fee_bps=taker_fee_bps,
-        allow_taker=False,
-        taker_threshold=taker_threshold,
-        inventory_penalty=inventory_penalty,
-        inv_soft_notional=inv_soft_notional,
-        lambda_inv=lambda_inv,
-        lambda_turn=lambda_turn,
-        max_inventory_notional=max_inventory_notional,
-        hard_max_inventory_notional=hard_max_inventory_notional,
-        fill_size=fill_size,
-        fill_tolerance=fill_tolerance,
-        delta_bps_limit=delta_bps_limit,
-    )
-    baseline_test_env = MarketMakingEnv(
-        mm_test_batch,
-        maker_rebate_bps=maker_rebate_bps,
-        taker_fee_bps=taker_fee_bps,
-        allow_taker=False,
-        taker_threshold=taker_threshold,
-        inventory_penalty=inventory_penalty,
-        inv_soft_notional=inv_soft_notional,
-        lambda_inv=lambda_inv,
-        lambda_turn=lambda_turn,
-        max_inventory_notional=max_inventory_notional,
-        hard_max_inventory_notional=hard_max_inventory_notional,
-        fill_size=fill_size,
-        fill_tolerance=fill_tolerance,
-        delta_bps_limit=delta_bps_limit,
-    )
+    baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common)
+    baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common)
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
     mm_train_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)

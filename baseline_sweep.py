@@ -235,9 +235,7 @@ def score_baseline_row(
 def evaluate_baseline_config(
     config: Dict[str, Any],
     *,
-    out_root: str,
-    ckpt_path: str,
-    device: str,
+    prepared_context: RL_exec.PreparedBaselineContext,
     eval_split: str,
     trial: int,
     seed: int,
@@ -245,12 +243,9 @@ def evaluate_baseline_config(
 ) -> Dict[str, Any]:
     overrides = config_to_env_overrides(config, eval_split)
     with temporary_env(overrides):
-        report = RL_exec.run_pipeline(
-            out_root,
-            ckpt_path,
-            device=device,
-            ppo_epochs=0,
-            run_mode="baseline",
+        report = RL_exec.evaluate_prepared_baseline(
+            prepared_context,
+            eval_split=eval_split,
         )
     return flatten_report_row(
         config,
@@ -327,13 +322,24 @@ def print_leaderboard(rows: List[Dict[str, Any]], *, top_k: int, label: str) -> 
         )
 
 
-def build_metadata(args: argparse.Namespace, *, out_root: str, ckpt_path: str) -> Dict[str, Any]:
+def build_metadata(
+    args: argparse.Namespace,
+    *,
+    out_root: str,
+    ckpt_path: str,
+    prepared_context: RL_exec.PreparedBaselineContext,
+) -> Dict[str, Any]:
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "args": vars(args),
         "seed": args.seed,
         "out_root": out_root,
         "ckpt_path": ckpt_path,
+        "prepared_context_reuse": True,
+        "prepared_joined_rows": prepared_context.joined_rows,
+        "prepared_val_rows": int(prepared_context.mm_val_batch.features.shape[0]),
+        "prepared_test_rows": int(prepared_context.mm_test_batch.features.shape[0]),
+        "prepared_cmssl_batch_size": prepared_context.cmssl_batch_size,
     }
 
 
@@ -367,22 +373,33 @@ def main() -> None:
     if args.search_mode != "random":
         raise ValueError(f"Unsupported search mode: {args.search_mode}")
 
+    # Imported usage skips RL_exec.__main__, so run the shared setup hooks here.
+    RL_exec._set_seed_from_env()
+    RL_exec._configure_tf32_from_env()
+
     rng = np.random.default_rng(args.seed)
     results_csv = Path(args.results_csv)
     results_jsonl = results_csv.with_suffix(".jsonl")
     metadata_json = results_csv.with_suffix(".metadata.json")
 
     rows: List[Dict[str, Any]] = []
-    write_metadata(metadata_json, build_metadata(args, out_root=out_root, ckpt_path=ckpt_path))
+    prepared_context = RL_exec.prepare_baseline_context(out_root, ckpt_path, device=args.device)
+    write_metadata(
+        metadata_json,
+        build_metadata(
+            args,
+            out_root=out_root,
+            ckpt_path=ckpt_path,
+            prepared_context=prepared_context,
+        ),
+    )
 
     for trial in range(args.n_trials):
         config = sample_baseline_config(rng, DEFAULT_SEARCH_SPACE)
         try:
             row = evaluate_baseline_config(
                 config,
-                out_root=out_root,
-                ckpt_path=ckpt_path,
-                device=args.device,
+                prepared_context=prepared_context,
                 eval_split=args.eval_split,
                 trial=trial,
                 seed=args.seed,
@@ -434,9 +451,7 @@ def main() -> None:
             try:
                 retest_row = evaluate_baseline_config(
                     config,
-                    out_root=out_root,
-                    ckpt_path=ckpt_path,
-                    device=args.device,
+                    prepared_context=prepared_context,
                     eval_split="test",
                     trial=rank,
                     seed=args.seed,
