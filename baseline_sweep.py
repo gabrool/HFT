@@ -229,7 +229,7 @@ def score_baseline_row(
         sharpe_1h = -1e6
     if drawdown is None or not np.isfinite(drawdown):
         drawdown = 1e6
-    return 1000.0 * float(net_pnl_pct) + 10.0 * float(sharpe_1h) - 5.0 * float(drawdown)
+    return 1000.0 * float(net_pnl_pct)
 
 
 def evaluate_baseline_config(
