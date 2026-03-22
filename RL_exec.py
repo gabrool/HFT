@@ -3744,12 +3744,18 @@ def train_market_ppo(
 
 
 def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -> Dict[str, float]:
-    num_h = y_true.shape[1] // 2
-    y_ret = y_true[:, :num_h]
+    y_true = np.asarray(y_true, dtype=np.float64)
     dir_logits = np.asarray(cmssl_out["dir_logits"], dtype=np.float64)
+    require(y_true.ndim == 2, f"y_true must be 2D, got shape={y_true.shape}")
+    require(dir_logits.ndim == 2, f"cmssl_out['dir_logits'] must be 2D, got shape={dir_logits.shape}")
+    require(
+        y_true.shape == dir_logits.shape,
+        f"y_true shape {y_true.shape} must match dir_logits shape {dir_logits.shape}",
+    )
     p_up = _sigmoid(dir_logits)
-    y_up = (y_ret > 0.0).astype(np.float64)
-    bce = float(np.mean(-(y_up * np.log(np.clip(p_up, 1e-6, 1.0)) + (1.0 - y_up) * np.log(np.clip(1.0 - p_up, 1e-6, 1.0)))))
+    y_up = (y_true > 0.0).astype(np.float64)
+    p_up = np.clip(p_up, 1e-6, 1.0 - 1e-6)
+    bce = float(np.mean(-(y_up * np.log(p_up) + (1.0 - y_up) * np.log(1.0 - p_up))))
     accuracy = float(np.mean((p_up >= 0.5) == (y_up >= 0.5)))
     return {
         "direction_bce": bce,
