@@ -63,14 +63,12 @@ from CMSSL17 import (  # type: ignore
     # core hypers
     LOOKBACK, AUX_DIM, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
     BATCH_SIZE, EPOCHS, LR, PATIENCE,
-    # schedules / deltas / lambdas
+    # schedules
     DIR_MASK_TAIL_FRACTION,
-    DELTA_RET, DELTA_LOGVOL,
-    LAMBDA_BCE, LAMBDA_RET, LAMBDA_VOL,
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC_HORIZON_MS,
     # utils
-    huber_loss, ema_update, binary_auc_from_logits,
+    binary_auc_from_logits,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     # optimizer
     SAM,
@@ -470,7 +468,7 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
 def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     # Label-space noise trimming: keep only mid-quantile return magnitudes per direction/horizon;
     # this is unrelated to model token dropout objectives.
-    y_ret = y_train[:, :NUM_HORIZONS].astype(np.float32)
+    y_ret = y_train.astype(np.float32, copy=False)
     def _compute_trim_bounds(arr: np.ndarray) -> Tuple[float, float]:
         if arr.size == 0:
             return float("inf"), float("-inf")
@@ -840,33 +838,7 @@ def train_from_offline():
     horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
     horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
     horizon_weights_np = horizon_weights_cpu.numpy()
-    delta_ret_tensor = torch.as_tensor(DELTA_RET, dtype=torch.float32, device=device)
-    delta_logvol_tensor = torch.as_tensor(DELTA_LOGVOL, dtype=torch.float32, device=device)
     compute_directional_loss = compute_directional_loss_fn(build_directional_noise_filter_mask, horizon_weights)
-
-    def compute_masked_regression_loss(
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        delta: torch.Tensor,
-        noise_filter_mask: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        if not noise_filter_mask.any():
-            return torch.tensor(0.0, device=pred.device)
-        loss_elem = huber_loss(pred, target, delta, reduction='none')
-        losses = []
-        weight_list = []
-        for h_idx in range(NUM_HORIZONS):
-            noise_filter_mask_h = noise_filter_mask[:, h_idx]
-            if noise_filter_mask_h.any():
-                loss_h = loss_elem[noise_filter_mask_h, h_idx].mean()
-                losses.append(loss_h)
-                weight_list.append(weights[h_idx])
-        if not losses:
-            return torch.tensor(0.0, device=pred.device)
-        loss_stack = torch.stack(losses)
-        weight_stack = torch.stack(weight_list)
-        return (loss_stack * weight_stack).sum() / weight_stack.sum()
 
     def format_metric(values: Iterable[float], fmt: str) -> str:
         formatted = []
@@ -927,281 +899,123 @@ def train_from_offline():
     # ---------------- Epoch loop ----------------
     best = -float('inf') if primary_metric_mode == "max" else float('inf')
     no_imp = 0
-    ema_ft  = {
-        'ret': 1.0,
-        'logvol': 1.0,
-        'ret_masked': 1.0,
-        'logvol_masked': 1.0,
-        'bce': 1.0,
-    }
     primary_horizon_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
 
-    def run_validation(*, primary_horizon_idx: int, full_metrics: bool) -> dict:
+    def summarize_directional_metrics(dl: DataLoader, *, primary_only: bool) -> dict:
         model.eval()
+        logits_all = [[] for _ in range(NUM_HORIZONS)]
+        ypos_all = [[] for _ in range(NUM_HORIZONS)]
+        logits_masked = [[] for _ in range(NUM_HORIZONS)]
+        ypos_masked = [[] for _ in range(NUM_HORIZONS)]
+        bce_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+        bce_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+        bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+        bce_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
+        acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+        total = np.zeros(NUM_HORIZONS, dtype=np.float64)
+        acc_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
+        masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
+
         with torch.no_grad():
-            if not full_metrics:
-                primary_ret_masked_sum = 0.0
-                primary_ret_masked_count = 0.0
-                primary_vol_masked_sum = 0.0
-                primary_vol_masked_count = 0.0
-                primary_logits_masked: List[torch.Tensor] = []
-                primary_targets_masked: List[torch.Tensor] = []
-                primary_acc_masked_sum = 0.0
-                primary_masked_total = 0.0
-
-                for x, y_targets in dl_val:
-                    x = x.to(device, non_blocking=True)
-                    y_targets = y_targets.to(device, non_blocking=True)
-                    y_return = y_targets[:, :NUM_HORIZONS]
-                    y_logvol = y_targets
-
-                    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                        ret_pred, vol_pred, dir_pred_logits = model(x)
-                        ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
-                        vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
-                        y_dir = (y_return > 0).to(torch.float32)
-
-                    ret_loss_elem = ret_loss_elem.float()
-                    vol_loss_elem = vol_loss_elem.float()
-                    dir_pred_logits = dir_pred_logits.float()
-
-                    noise_filter_mask = build_directional_noise_filter_mask(y_return)
-                    primary_mask = noise_filter_mask[:, primary_horizon_idx]
-                    if primary_mask.any():
-                        primary_ret = ret_loss_elem[primary_mask, primary_horizon_idx]
-                        primary_vol = vol_loss_elem[primary_mask, primary_horizon_idx]
-                        primary_logits = dir_pred_logits[primary_mask, primary_horizon_idx]
-                        primary_targets = y_dir[primary_mask, primary_horizon_idx]
-
-                        primary_ret_masked_sum += primary_ret.sum().item()
-                        primary_ret_masked_count += primary_mask.sum().item()
-                        primary_vol_masked_sum += primary_vol.sum().item()
-                        primary_vol_masked_count += primary_mask.sum().item()
-                        primary_logits_masked.append(primary_logits.detach().cpu())
-                        primary_targets_masked.append(primary_targets.to(torch.int32).detach().cpu())
-                        primary_acc_masked_sum += (
-                            (primary_logits > 0).to(torch.int32) == primary_targets.to(torch.int32)
-                        ).sum().item()
-                        primary_masked_total += primary_mask.sum().item()
-
-                primary_masked_ret_loss = (
-                    float(primary_ret_masked_sum / primary_ret_masked_count)
-                    if primary_ret_masked_count > 0
-                    else float('nan')
-                )
-                primary_masked_vol_loss = (
-                    float(primary_vol_masked_sum / primary_vol_masked_count)
-                    if primary_vol_masked_count > 0
-                    else float('nan')
-                )
-                primary_masked_auc = float('nan')
-                if primary_logits_masked:
-                    logits_cat = torch.cat(primary_logits_masked, dim=0).view(-1)
-                    targets_cat = torch.cat(primary_targets_masked, dim=0).view(-1)
-                    primary_masked_auc = binary_auc_from_logits(logits_cat, targets_cat)
-                primary_masked_acc = (
-                    float(primary_acc_masked_sum / primary_masked_total)
-                    if primary_masked_total > 0
-                    else float('nan')
-                )
-
-                val_auc_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-                val_ret_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-                val_vol_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-                val_auc_masked[primary_horizon_idx] = primary_masked_auc
-                val_ret_loss_masked_per_h[primary_horizon_idx] = primary_masked_ret_loss
-                val_vol_loss_masked_per_h[primary_horizon_idx] = primary_masked_vol_loss
-
-                primary_metric_value, primary_metric_label = compute_primary_metric(
-                    val_auc_masked,
-                    val_ret_loss_masked_per_h,
-                    val_vol_loss_masked_per_h,
-                )
-                return {
-                    "primary_metric_value": float(primary_metric_value),
-                    "primary_metric_label": primary_metric_label,
-                    "primary_masked_ret_loss": primary_masked_ret_loss,
-                    "primary_masked_vol_loss": primary_masked_vol_loss,
-                    "primary_masked_auc": primary_masked_auc,
-                    "primary_masked_acc": primary_masked_acc,
-                }
-
-            val_ret_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_vol_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_ret_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_ret_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_vol_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_vol_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_sample_total = 0
-            val_acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_total   = 0
-
-            val_bce_unmasked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_bce_unmasked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_bce_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_acc_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-            val_masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
-
-            val_logits_all = [[] for _ in range(NUM_HORIZONS)]
-            val_ypos_all   = [[] for _ in range(NUM_HORIZONS)]
-            val_logits_masked = [[] for _ in range(NUM_HORIZONS)]
-            val_ypos_masked   = [[] for _ in range(NUM_HORIZONS)]
-
-            for x, y_targets in dl_val:
+            for x, y in dl:
                 x = x.to(device, non_blocking=True)
-                y_targets = y_targets.to(device, non_blocking=True)
-                y_return = y_targets[:, :NUM_HORIZONS]
-                y_logvol = y_targets
+                y = y.to(device, non_blocking=True)
+                y_ret = y
+                y_dir = (y_ret > 0).float()
+                noise_filter_mask = build_directional_noise_filter_mask(y_ret)
 
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                    ret_pred, vol_pred, dir_pred_logits = model(x)
-                    ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
-                    vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
-                    y_dir = (y_return > 0).to(torch.float32)
-                    bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
+                    dir_logits = model(x)
+                    bce_elem = F.binary_cross_entropy_with_logits(dir_logits, y_dir, reduction='none')
 
-                ret_loss_elem = ret_loss_elem.float()
-                vol_loss_elem = vol_loss_elem.float()
-                dir_pred_logits = dir_pred_logits.float()
+                dir_logits = dir_logits.float()
                 bce_elem = bce_elem.float()
-
-                batch_n = x.size(0)
-
-                val_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
-                val_vol_loss_sum += vol_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
-                val_sample_total += batch_n
-
-                val_bce_unmasked_sum += bce_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
-                val_bce_unmasked_count += batch_n
-
-                pred_class = (dir_pred_logits > 0).to(torch.int32)
+                pred_class = (dir_logits > 0).to(torch.int32)
                 true_class = y_dir.to(torch.int32)
-                val_acc_sum += (pred_class == true_class).sum(dim=0).detach().cpu().numpy().astype(np.float64)
-                val_total += batch_n
 
-                for h_idx in range(NUM_HORIZONS):
-                    val_logits_all[h_idx].append(dir_pred_logits[:, h_idx].detach().cpu())
-                    val_ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
+                horizon_indices = [primary_horizon_idx] if primary_only else range(NUM_HORIZONS)
+                for h_idx in horizon_indices:
+                    logits_h_all = dir_logits[:, h_idx]
+                    targets_h_all = y_dir[:, h_idx]
+                    bce_sum[h_idx] += bce_elem[:, h_idx].sum().item()
+                    bce_count[h_idx] += targets_h_all.numel()
+                    acc_sum[h_idx] += (pred_class[:, h_idx] == true_class[:, h_idx]).sum().item()
+                    total[h_idx] += targets_h_all.numel()
+                    logits_all[h_idx].append(logits_h_all.detach().cpu())
+                    ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
 
-                noise_filter_mask = build_directional_noise_filter_mask(y_return)
-                for h_idx in range(NUM_HORIZONS):
                     noise_filter_mask_h = noise_filter_mask[:, h_idx]
                     if noise_filter_mask_h.any():
-                        ret_masked_h = ret_loss_elem[noise_filter_mask_h, h_idx]
-                        vol_masked_h = vol_loss_elem[noise_filter_mask_h, h_idx]
-                        val_ret_loss_masked_sum[h_idx] += ret_masked_h.sum().item()
-                        val_ret_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
-                        val_vol_loss_masked_sum[h_idx] += vol_masked_h.sum().item()
-                        val_vol_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
-                        logits_h = dir_pred_logits[noise_filter_mask_h, h_idx]
+                        logits_h = dir_logits[noise_filter_mask_h, h_idx]
                         targets_h = y_dir[noise_filter_mask_h, h_idx]
-                        val_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
+                        bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
                             logits_h, targets_h, reduction='sum'
                         ).item()
-                        val_bce_masked_count[h_idx] += noise_filter_mask_h.sum().item()
-                        val_logits_masked[h_idx].append(logits_h.detach().cpu())
-                        val_ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
-                        val_acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
-                        val_masked_total[h_idx] += noise_filter_mask_h.sum().item()
+                        bce_masked_count[h_idx] += noise_filter_mask_h.sum().item()
+                        acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
+                        masked_total[h_idx] += noise_filter_mask_h.sum().item()
+                        logits_masked[h_idx].append(logits_h.detach().cpu())
+                        ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
 
-        avg_val_ret_loss_per_h = val_ret_loss_sum / max(val_sample_total, 1)
-        avg_val_vol_loss_per_h = val_vol_loss_sum / max(val_sample_total, 1)
-        val_ret_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        val_vol_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        ret_masked_valid = val_ret_loss_masked_count > 0
-        vol_masked_valid = val_vol_loss_masked_count > 0
-        val_ret_loss_masked_per_h[ret_masked_valid] = (
-            val_ret_loss_masked_sum[ret_masked_valid] / val_ret_loss_masked_count[ret_masked_valid]
-        )
-        val_vol_loss_masked_per_h[vol_masked_valid] = (
-            val_vol_loss_masked_sum[vol_masked_valid] / val_vol_loss_masked_count[vol_masked_valid]
-        )
-        avg_val_ret_loss = float(
-            np.dot(avg_val_ret_loss_per_h, horizon_weights_np)
-            / max(horizon_weights_cpu.sum().item(), 1e-12)
-        )
-        avg_val_vol_loss = float(
-            np.dot(avg_val_vol_loss_per_h, horizon_weights_np)
-            / max(horizon_weights_cpu.sum().item(), 1e-12)
-        )
-        ret_masked_weights = horizon_weights_np[ret_masked_valid]
-        vol_masked_weights = horizon_weights_np[vol_masked_valid]
-        avg_val_ret_loss_masked = float(
-            np.dot(val_ret_loss_masked_per_h[ret_masked_valid], ret_masked_weights)
-            / max(ret_masked_weights.sum(), 1e-12)
-        ) if ret_masked_weights.size else float('nan')
-        avg_val_vol_loss_masked = float(
-            np.dot(val_vol_loss_masked_per_h[vol_masked_valid], vol_masked_weights)
-            / max(vol_masked_weights.sum(), 1e-12)
-        ) if vol_masked_weights.size else float('nan')
+        bce = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        bce_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        acc = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        acc_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        auc = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        auc_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        pos_rate_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        logit_mean_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        logit_std_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        pos_rate_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        logit_mean_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        logit_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
 
-        val_bce_unmasked = val_bce_unmasked_sum / np.maximum(val_bce_unmasked_count, 1)
-        val_bce_masked = val_bce_masked_sum / np.maximum(val_bce_masked_count, 1)
-        val_acc = val_acc_sum / np.maximum(val_total, 1)
-        val_acc_masked = val_acc_masked_sum / np.maximum(val_masked_total, 1)
+        for h_idx in ([primary_horizon_idx] if primary_only else range(NUM_HORIZONS)):
+            if bce_count[h_idx] > 0:
+                bce[h_idx] = bce_sum[h_idx] / bce_count[h_idx]
+                acc[h_idx] = acc_sum[h_idx] / max(total[h_idx], 1.0)
+            if bce_masked_count[h_idx] > 0:
+                bce_masked[h_idx] = bce_masked_sum[h_idx] / bce_masked_count[h_idx]
+                acc_masked[h_idx] = acc_masked_sum[h_idx] / max(masked_total[h_idx], 1.0)
+            if logits_all[h_idx]:
+                logits_cat = torch.cat(logits_all[h_idx], dim=0).view(-1)
+                ypos_cat = torch.cat(ypos_all[h_idx], dim=0).view(-1)
+                auc[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
+                pos_rate_all[h_idx] = float(ypos_cat.float().mean().item())
+                logit_mean_all[h_idx] = float(logits_cat.mean().item())
+                logit_std_all[h_idx] = float(logits_cat.std(unbiased=False).item())
+            if logits_masked[h_idx]:
+                logits_cat = torch.cat(logits_masked[h_idx], dim=0).view(-1)
+                ypos_cat = torch.cat(ypos_masked[h_idx], dim=0).view(-1)
+                auc_masked[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
+                pos_rate_masked[h_idx] = float(ypos_cat.float().mean().item())
+                logit_mean_masked[h_idx] = float(logits_cat.mean().item())
+                logit_std_masked[h_idx] = float(logits_cat.std(unbiased=False).item())
 
-        val_auc = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        val_auc_masked = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        val_pos_rate_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        val_logit_mean_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        val_logit_std_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        val_pos_rate_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        val_logit_mean_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        val_logit_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        for h_idx in range(NUM_HORIZONS):
-            if val_logits_all[h_idx]:
-                logits_cat = torch.cat(val_logits_all[h_idx], dim=0).view(-1)
-                ypos_cat = torch.cat(val_ypos_all[h_idx], dim=0).view(-1)
-                val_auc[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
-                val_pos_rate_all[h_idx] = float(ypos_cat.float().mean().item())
-                val_logit_mean_all[h_idx] = float(logits_cat.mean().item())
-                val_logit_std_all[h_idx] = float(logits_cat.std(unbiased=False).item())
-            else:
-                val_auc[h_idx] = float('nan')
-            if val_logits_masked[h_idx]:
-                logits_cat = torch.cat(val_logits_masked[h_idx], dim=0).view(-1)
-                ypos_cat = torch.cat(val_ypos_masked[h_idx], dim=0).view(-1)
-                val_auc_masked[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
-                val_pos_rate_masked[h_idx] = float(ypos_cat.float().mean().item())
-                val_logit_mean_masked[h_idx] = float(logits_cat.mean().item())
-                val_logit_std_masked[h_idx] = float(logits_cat.std(unbiased=False).item())
-            else:
-                val_auc_masked[h_idx] = float('nan')
-
-        primary_metric_value, primary_metric_label = compute_primary_metric(
-            val_auc_masked,
-            val_ret_loss_masked_per_h,
-            val_vol_loss_masked_per_h,
-        )
-
+        primary_metric_value, primary_metric_label = compute_primary_metric(auc_masked)
         return {
-            "avg_val_ret_loss_per_h": avg_val_ret_loss_per_h,
-            "avg_val_vol_loss_per_h": avg_val_vol_loss_per_h,
-            "avg_val_ret_loss": avg_val_ret_loss,
-            "avg_val_vol_loss": avg_val_vol_loss,
-            "val_ret_loss_masked_per_h": val_ret_loss_masked_per_h,
-            "val_vol_loss_masked_per_h": val_vol_loss_masked_per_h,
-            "avg_val_ret_loss_masked": avg_val_ret_loss_masked,
-            "avg_val_vol_loss_masked": avg_val_vol_loss_masked,
-            "val_bce_unmasked": val_bce_unmasked,
-            "val_bce_masked": val_bce_masked,
-            "val_acc": val_acc,
-            "val_acc_masked": val_acc_masked,
-            "val_auc": val_auc,
-            "val_auc_masked": val_auc_masked,
-            "val_pos_rate_all": val_pos_rate_all,
-            "val_logit_mean_all": val_logit_mean_all,
-            "val_logit_std_all": val_logit_std_all,
-            "val_pos_rate_masked": val_pos_rate_masked,
-            "val_logit_mean_masked": val_logit_mean_masked,
-            "val_logit_std_masked": val_logit_std_masked,
+            "val_bce_unmasked": bce,
+            "val_bce_masked": bce_masked,
+            "val_acc": acc,
+            "val_acc_masked": acc_masked,
+            "val_auc": auc,
+            "val_auc_masked": auc_masked,
+            "val_pos_rate_all": pos_rate_all,
+            "val_logit_mean_all": logit_mean_all,
+            "val_logit_std_all": logit_std_all,
+            "val_pos_rate_masked": pos_rate_masked,
+            "val_logit_mean_masked": logit_mean_masked,
+            "val_logit_std_masked": logit_std_masked,
             "primary_metric_value": float(primary_metric_value),
             "primary_metric_label": primary_metric_label,
-            "primary_masked_ret_loss": float(val_ret_loss_masked_per_h[primary_horizon_idx]),
-            "primary_masked_vol_loss": float(val_vol_loss_masked_per_h[primary_horizon_idx]),
-            "primary_masked_auc": float(val_auc_masked[primary_horizon_idx]),
+            "primary_masked_bce": float(bce_masked[primary_horizon_idx]),
+            "primary_masked_auc": float(auc_masked[primary_horizon_idx]),
+            "primary_masked_acc": float(acc_masked[primary_horizon_idx]),
         }
+
+    def run_validation(*, primary_horizon_idx: int, full_metrics: bool) -> dict:
+        del primary_horizon_idx
+        return summarize_directional_metrics(dl_val, primary_only=not full_metrics)
 
     for epoch in range(EPOCHS):
         early_stop_triggered = False
@@ -1209,85 +1023,34 @@ def train_from_offline():
         pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
         num_train_batches = len(dl_train)
         running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
-        running_ret_t = torch.zeros((), device=device, dtype=torch.float32)
-        running_vol_t = torch.zeros((), device=device, dtype=torch.float32)
-        running_ret_masked_t = torch.zeros((), device=device, dtype=torch.float32)
-        running_vol_masked_t = torch.zeros((), device=device, dtype=torch.float32)
         running_bce_t = torch.zeros((), device=device, dtype=torch.float32)
         n_batches = 0
 
         for batch_idx, (x, y) in enumerate(pbar):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            y_ret = y
 
-            y_ret = y[:, :NUM_HORIZONS]
-            y_logvol = y
-
-            # ===== SAM pass #1 =====
             opt.base_optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                ret_pred, vol_pred, dir_pred_logits = model(x)
-                mse_ret = huber_loss(ret_pred, y_ret, delta_ret_tensor, weights=horizon_weights)
-                mse_vol = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-                noise_filter_mask = build_directional_noise_filter_mask(y_ret)
-                mse_ret_masked = compute_masked_regression_loss(
-                    ret_pred, y_ret, delta_ret_tensor, noise_filter_mask, horizon_weights
-                )
-                mse_vol_masked = compute_masked_regression_loss(
-                    vol_pred, y_logvol, delta_logvol_tensor, noise_filter_mask, horizon_weights
-                )
-                bce_loss = compute_directional_loss(dir_pred_logits, y_ret)
-                loss = (
-                    LAMBDA_RET * (mse_ret_masked / (ema_ft['ret_masked'] + 1e-8)) +
-                    LAMBDA_VOL * (mse_vol_masked / (ema_ft['logvol_masked'] + 1e-8)) +
-                    LAMBDA_BCE * (bce_loss / (ema_ft['bce'] + 1e-8))
-                )
+                dir_logits = model(x)
+                bce_loss = compute_directional_loss(dir_logits, y_ret)
+                loss = bce_loss
 
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     f"Non-finite training loss in SAM pass #1: {float(loss.detach().float().cpu())}"
                 )
 
-            ema_ret_masked = ema_update('ret_masked', float(mse_ret_masked.detach().float().cpu()), ema_ft)
-            ema_logvol_masked = ema_update('logvol_masked', float(mse_vol_masked.detach().float().cpu()), ema_ft)
-            ema_bce = ema_update('bce', float(bce_loss.detach().float().cpu()), ema_ft)
-
-            # recompute normalized loss after EMA update, still under autocast-style tensor types
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                loss = (
-                    LAMBDA_RET * (mse_ret_masked / (ema_ret_masked + 1e-8)) +
-                    LAMBDA_VOL * (mse_vol_masked / (ema_logvol_masked + 1e-8)) +
-                    LAMBDA_BCE * (bce_loss / (ema_bce + 1e-8))
-                )
-
-            running_ret_t += mse_ret.detach().float()
-            running_vol_t += mse_vol.detach().float()
-            running_ret_masked_t += mse_ret_masked.detach().float()
-            running_vol_masked_t += mse_vol_masked.detach().float()
             running_bce_t += bce_loss.detach().float()
-
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.first_step(zero_grad=True)
 
-            # ===== SAM pass #2 =====
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                ret_pred2, vol_pred2, dir_pred_logits2 = model(x)
-                mse_ret2 = huber_loss(ret_pred2, y_ret, delta_ret_tensor, weights=horizon_weights)
-                mse_vol2 = huber_loss(vol_pred2, y_logvol, delta_logvol_tensor, weights=horizon_weights)
-                noise_filter_mask2 = build_directional_noise_filter_mask(y_ret)
-                mse_ret2_masked = compute_masked_regression_loss(
-                    ret_pred2, y_ret, delta_ret_tensor, noise_filter_mask2, horizon_weights
-                )
-                mse_vol2_masked = compute_masked_regression_loss(
-                    vol_pred2, y_logvol, delta_logvol_tensor, noise_filter_mask2, horizon_weights
-                )
-                bce_loss2 = compute_directional_loss(dir_pred_logits2, y_ret)
-                loss2 = (
-                    LAMBDA_RET * (mse_ret2_masked / (ema_ft['ret_masked'] + 1e-8)) +
-                    LAMBDA_VOL * (mse_vol2_masked / (ema_ft['logvol_masked'] + 1e-8)) +
-                    LAMBDA_BCE * (bce_loss2 / (ema_ft['bce'] + 1e-8))
-                )
+                dir_logits2 = model(x)
+                bce_loss2 = compute_directional_loss(dir_logits2, y_ret)
+                loss2 = bce_loss2
 
             if not torch.isfinite(loss2):
                 raise RuntimeError(
@@ -1304,31 +1067,12 @@ def train_from_offline():
             if should_log_batch:
                 denom = float(max(1, n_batches))
                 running_loss = float(running_loss_t.detach().cpu())
-                running_ret = float(running_ret_t.detach().cpu())
-                running_vol = float(running_vol_t.detach().cpu())
-                running_ret_masked = float(running_ret_masked_t.detach().cpu())
-                running_vol_masked = float(running_vol_masked_t.detach().cpu())
                 running_bce = float(running_bce_t.detach().cpu())
-
-                pbar.set_postfix(
-                    loss=f"{(running_loss / denom):.4f}",
-                    ret=f"{(running_ret / denom):.4f}",
-                    vol=f"{(running_vol / denom):.4f}",
-                    ret_m=f"{(running_ret_masked / denom):.4f}",
-                    vol_m=f"{(running_vol_masked / denom):.4f}",
-                    bce=f"{(running_bce / denom):.4f}",
-                )
+                pbar.set_postfix(loss=f"{(running_loss / denom):.4f}", bce=f"{(running_bce / denom):.4f}")
 
         epoch_train_loss = float(running_loss_t.detach().cpu()) / float(max(1, n_batches))
-        epoch_train_ret = float(running_ret_t.detach().cpu()) / float(max(1, n_batches))
-        epoch_train_vol = float(running_vol_t.detach().cpu()) / float(max(1, n_batches))
-        epoch_train_ret_masked = float(running_ret_masked_t.detach().cpu()) / float(max(1, n_batches))
-        epoch_train_vol_masked = float(running_vol_masked_t.detach().cpu()) / float(max(1, n_batches))
         epoch_train_bce = float(running_bce_t.detach().cpu()) / float(max(1, n_batches))
-        print(
-            f"[train] loss={epoch_train_loss:.4f} ret={epoch_train_ret:.4f} vol={epoch_train_vol:.4f} "
-            f"ret(mask)={epoch_train_ret_masked:.4f} vol(mask)={epoch_train_vol_masked:.4f} bce={epoch_train_bce:.4f}"
-        )
+        print(f"[train] loss={epoch_train_loss:.4f} bce={epoch_train_bce:.4f}")
 
         # ---------------- Validation ----------------
         fast_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=False)
@@ -1338,8 +1082,7 @@ def train_from_offline():
         if math.isfinite(primary_metric_value):
             print(
                 f"[val-fast] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
-                f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_ret_loss']):.6f}, "
-                f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_vol_loss']):.6f}, "
+                f"[masked_bce_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_bce']):.6f}, "
                 f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_auc']):.6f}, "
                 f"masked_acc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_acc']):.3%}]"
             )
@@ -1348,15 +1091,7 @@ def train_from_offline():
                 no_imp = 0
                 full_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=True)
                 print(
-                    f"[val] ret={format_metric(full_val['avg_val_ret_loss_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_ret_loss']):.4e})  "
-                    f"vol={format_metric(full_val['avg_val_vol_loss_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_vol_loss']):.4e})  "
-                    f"ret(mask)={format_metric(full_val['val_ret_loss_masked_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_ret_loss_masked']):.4e})  "
-                    f"vol(mask)={format_metric(full_val['val_vol_loss_masked_per_h'], '{:.5f}')} "
-                    f"(w_avg={float(full_val['avg_val_vol_loss_masked']):.4e})  "
-                    f"BCE(all)={format_metric(full_val['val_bce_unmasked'], '{:.5f}')}  "
+                    f"[val] BCE(all)={format_metric(full_val['val_bce_unmasked'], '{:.5f}')}  "
                     f"BCE(mask)={format_metric(full_val['val_bce_masked'], '{:.5f}')}  "
                     f"Acc(all)={format_metric(full_val['val_acc'], '{:.3%}')}  "
                     f"Acc(mask)={format_metric(full_val['val_acc_masked'], '{:.3%}')}  "
@@ -1371,8 +1106,7 @@ def train_from_offline():
                     f"logit_std(mask)={format_metric(full_val['val_logit_std_masked'], '{:.3f}')}")
                 print(
                     f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
-                    f"[masked_ret_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_ret_loss']):.6f}, "
-                    f"masked_vol_loss_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_vol_loss']):.6f}, "
+                    f"[masked_bce_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_bce']):.6f}, "
                     f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_auc']):.6f}]"
                 )
                 ckpt = {
@@ -1382,6 +1116,7 @@ def train_from_offline():
                         "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
                         "feat_dim": F_total, "LOOKBACK": LOOKBACK,
                         "HORIZONS_MS": HORIZONS_MS,
+                        "checkpoint_schema": "cmssl17-direction-only-v1",
                     },
                     "best_primary_metric": best,
                 }
@@ -1404,146 +1139,22 @@ def train_from_offline():
         # if no_imp > 50: break
 
     # ---------------- Test Evaluation ----------------
-    model.eval()
-    test_ret_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_vol_loss_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_ret_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_ret_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_vol_loss_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_vol_loss_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_sample_total = 0
-    test_acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_bce_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_bce_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_bce_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_acc_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-    test_masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
-
-    test_logits_all = [[] for _ in range(NUM_HORIZONS)]
-    test_ypos_all = [[] for _ in range(NUM_HORIZONS)]
-    test_logits_masked = [[] for _ in range(NUM_HORIZONS)]
-    test_ypos_masked = [[] for _ in range(NUM_HORIZONS)]
-
-    with torch.no_grad():
-        for x, y in dl_test:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            y_return = y[:, :NUM_HORIZONS]
-            y_logvol = y
-
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                ret_pred, vol_pred, dir_pred_logits = model(x)
-                ret_loss_elem = huber_loss(ret_pred, y_return, delta_ret_tensor, reduction='none')
-                vol_loss_elem = huber_loss(vol_pred, y_logvol, delta_logvol_tensor, reduction='none')
-                y_dir = (y_return > 0).to(torch.float32)
-                bce_elem = F.binary_cross_entropy_with_logits(dir_pred_logits, y_dir, reduction='none')
-
-            ret_loss_elem = ret_loss_elem.float()
-            vol_loss_elem = vol_loss_elem.float()
-            dir_pred_logits = dir_pred_logits.float()
-            bce_elem = bce_elem.float()
-
-            batch_n = x.size(0)
-
-            test_ret_loss_sum += ret_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
-            test_vol_loss_sum += vol_loss_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
-            test_sample_total += batch_n
-
-            test_bce_sum += bce_elem.sum(dim=0).detach().cpu().numpy().astype(np.float64)
-            test_bce_count += batch_n
-
-            pred_class = (dir_pred_logits > 0).to(torch.int32)
-            true_class = y_dir.to(torch.int32)
-            test_acc_sum += (pred_class == true_class).sum(dim=0).detach().cpu().numpy().astype(np.float64)
-            test_total += batch_n
-
-            for h_idx in range(NUM_HORIZONS):
-                test_logits_all[h_idx].append(dir_pred_logits[:, h_idx].detach().cpu())
-                test_ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
-
-            noise_filter_mask = build_directional_noise_filter_mask(y_return)
-            for h_idx in range(NUM_HORIZONS):
-                noise_filter_mask_h = noise_filter_mask[:, h_idx]
-                if noise_filter_mask_h.any():
-                    ret_masked_h = ret_loss_elem[noise_filter_mask_h, h_idx]
-                    vol_masked_h = vol_loss_elem[noise_filter_mask_h, h_idx]
-                    test_ret_loss_masked_sum[h_idx] += ret_masked_h.sum().item()
-                    test_ret_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
-                    test_vol_loss_masked_sum[h_idx] += vol_masked_h.sum().item()
-                    test_vol_loss_masked_count[h_idx] += noise_filter_mask_h.sum().item()
-                    logits_h = dir_pred_logits[noise_filter_mask_h, h_idx]
-                    targets_h = y_dir[noise_filter_mask_h, h_idx]
-                    test_bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
-                        logits_h, targets_h, reduction='sum'
-                    ).item()
-                    test_bce_masked_count[h_idx] += noise_filter_mask_h.sum().item()
-                    test_logits_masked[h_idx].append(logits_h.detach().cpu())
-                    test_ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
-                    test_acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
-                    test_masked_total[h_idx] += noise_filter_mask_h.sum().item()
-
-    avg_test_ret_loss_per_h = test_ret_loss_sum / max(1, test_sample_total)
-    avg_test_vol_loss_per_h = test_vol_loss_sum / max(1, test_sample_total)
-    test_ret_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-    test_vol_loss_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-    test_ret_masked_valid = test_ret_loss_masked_count > 0
-    test_vol_masked_valid = test_vol_loss_masked_count > 0
-    test_ret_loss_masked_per_h[test_ret_masked_valid] = (
-        test_ret_loss_masked_sum[test_ret_masked_valid] / test_ret_loss_masked_count[test_ret_masked_valid]
-    )
-    test_vol_loss_masked_per_h[test_vol_masked_valid] = (
-        test_vol_loss_masked_sum[test_vol_masked_valid] / test_vol_loss_masked_count[test_vol_masked_valid]
-    )
-    test_dir_bce_per_h = np.divide(test_bce_sum, np.maximum(test_bce_count, 1.0))
-    test_accuracy_per_h = np.divide(test_acc_sum, np.maximum(test_total, 1.0))
-
-    test_auc_per_h = []
-    for h_idx in range(NUM_HORIZONS):
-        if test_logits_all[h_idx]:
-            logits_cat = torch.cat(test_logits_all[h_idx])
-            ypos_cat = torch.cat(test_ypos_all[h_idx])
-            test_auc_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
-        else:
-            test_auc_per_h.append(float('nan'))
-
-    test_dir_bce_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-    test_acc_masked_per_h = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-    test_auc_masked_per_h: List[float] = []
-    for h_idx in range(NUM_HORIZONS):
-        if test_bce_masked_count[h_idx] > 0:
-            test_dir_bce_masked_per_h[h_idx] = test_bce_masked_sum[h_idx] / test_bce_masked_count[h_idx]
-            test_acc_masked_per_h[h_idx] = test_acc_masked_sum[h_idx] / max(test_masked_total[h_idx], 1.0)
-            logits_cat = torch.cat(test_logits_masked[h_idx])
-            ypos_cat = torch.cat(test_ypos_masked[h_idx])
-            test_auc_masked_per_h.append(binary_auc_from_logits(logits_cat, ypos_cat))
-        else:
-            test_auc_masked_per_h.append(float('nan'))
-
-    test_ret_masked_weights = horizon_weights_np[test_ret_masked_valid]
-    test_vol_masked_weights = horizon_weights_np[test_vol_masked_valid]
-    avg_test_ret_loss_masked = float(
-        np.dot(test_ret_loss_masked_per_h[test_ret_masked_valid], test_ret_masked_weights)
-        / max(test_ret_masked_weights.sum(), 1e-12)
-    ) if test_ret_masked_weights.size else float('nan')
-    avg_test_vol_loss_masked = float(
-        np.dot(test_vol_loss_masked_per_h[test_vol_masked_valid], test_vol_masked_weights)
-        / max(test_vol_masked_weights.sum(), 1e-12)
-    ) if test_vol_masked_weights.size else float('nan')
-
+    test_metrics = summarize_directional_metrics(dl_test, primary_only=False)
     print(
-        f"[test] ret={format_metric(avg_test_ret_loss_per_h, '{:.4e}')} (w_avg={float(np.dot(avg_test_ret_loss_per_h, horizon_weights_np) / max(horizon_weights_cpu.sum().item(), 1e-12)):.4e})  "
-        f"vol={format_metric(avg_test_vol_loss_per_h, '{:.4e}')} (w_avg={float(np.dot(avg_test_vol_loss_per_h, horizon_weights_np) / max(horizon_weights_cpu.sum().item(), 1e-12)):.4e})  "
-        f"ret(mask)={format_metric(test_ret_loss_masked_per_h, '{:.4e}')} (w_avg={avg_test_ret_loss_masked:.4e})  "
-        f"vol(mask)={format_metric(test_vol_loss_masked_per_h, '{:.4e}')} (w_avg={avg_test_vol_loss_masked:.4e})  "
-        f"BCE(all)={format_metric(test_dir_bce_per_h, '{:.4e}')}  Acc(all)={format_metric(test_accuracy_per_h, '{:.4f}')}  "
-        f"AUC(all)={format_metric(test_auc_per_h, '{:.4f}')}"
-    )
+        f"[test] BCE(all)={format_metric(test_metrics['val_bce_unmasked'], '{:.4e}')}  "
+        f"Acc(all)={format_metric(test_metrics['val_acc'], '{:.4f}')}  "
+        f"AUC(all)={format_metric(test_metrics['val_auc'], '{:.4f}')}")
     print(
-        f"  BCE(mask)={format_metric(test_dir_bce_masked_per_h, '{:.4e}')}  Acc(mask)={format_metric(test_acc_masked_per_h, '{:.4f}')}  "
-        f"AUC(mask)={format_metric(test_auc_masked_per_h, '{:.4f}')}"
-    )
+        f"  BCE(mask)={format_metric(test_metrics['val_bce_masked'], '{:.4e}')}  "
+        f"Acc(mask)={format_metric(test_metrics['val_acc_masked'], '{:.4f}')}  "
+        f"AUC(mask)={format_metric(test_metrics['val_auc_masked'], '{:.4f}')}")
+    print(
+        f"[test_diag] pos_rate(all)={format_metric(test_metrics['val_pos_rate_all'], '{:.3%}')}  "
+        f"logit_mean(all)={format_metric(test_metrics['val_logit_mean_all'], '{:.3f}')}  "
+        f"logit_std(all)={format_metric(test_metrics['val_logit_std_all'], '{:.3f}')}  "
+        f"pos_rate(mask)={format_metric(test_metrics['val_pos_rate_masked'], '{:.3%}')}  "
+        f"logit_mean(mask)={format_metric(test_metrics['val_logit_mean_masked'], '{:.3f}')}  "
+        f"logit_std(mask)={format_metric(test_metrics['val_logit_std_masked'], '{:.3f}')}")
 
     print("[done] Training complete.")
 
