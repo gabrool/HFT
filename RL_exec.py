@@ -136,31 +136,45 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
     state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     require(isinstance(state, dict), "CMSSL checkpoint state_dict must be a mapping")
 
+    raw_keys = {
+        key[7:] if isinstance(key, str) and key.startswith("module.") else key
+        for key in state.keys()
+    }
+    legacy_prefixes = ("return_head.", "volatility_head.")
+    require(
+        not any(any(key.startswith(prefix) for prefix in legacy_prefixes) for key in raw_keys),
+        "Legacy three-head CMSSL checkpoints are incompatible with the direction-only runtime; retrain/export a direction-only checkpoint."
+    )
+    if isinstance(ckpt, dict):
+        ckpt_args = ckpt.get("args")
+        if isinstance(ckpt_args, dict) and ckpt_args.get("checkpoint_schema") not in (None, "cmssl17-direction-only-v1"):
+            require(
+                False,
+                f"Unsupported CMSSL checkpoint schema {ckpt_args.get('checkpoint_schema')!r}; expected 'cmssl17-direction-only-v1'."
+            )
+
     model_state = model.state_dict()
-    filtered_state = {}
-    for key, value in state.items():
-        k = key[7:] if isinstance(key, str) and key.startswith("module.") else key
-        if k in model_state:
-            filtered_state[k] = value
+    missing_model_keys = [k for k in model_state.keys() if k not in raw_keys]
+    unexpected_model_keys = [k for k in raw_keys if k not in model_state]
+    require(
+        not missing_model_keys,
+        "CMSSL checkpoint missing model keys: " + ", ".join(missing_model_keys[:10]) + (" ..." if len(missing_model_keys) > 10 else "")
+    )
+    require(
+        not unexpected_model_keys,
+        "CMSSL checkpoint has unexpected model keys: " + ", ".join(unexpected_model_keys[:10]) + (" ..." if len(unexpected_model_keys) > 10 else "")
+    )
 
-    loaded = model.load_state_dict(filtered_state, strict=False)
-    if loaded.unexpected_keys:
-        warnings.warn(
-            f"Ignoring unexpected CMSSL checkpoint keys: {loaded.unexpected_keys[:10]}"
-            + (" ..." if len(loaded.unexpected_keys) > 10 else "")
-        )
-    if loaded.missing_keys:
-        warnings.warn(
-            f"CMSSL checkpoint missing model keys: {loaded.missing_keys[:10]}"
-            + (" ..." if len(loaded.missing_keys) > 10 else "")
-        )
+    normalized_state = {
+        key[7:] if isinstance(key, str) and key.startswith("module.") else key: value
+        for key, value in state.items()
+    }
+    model.load_state_dict(normalized_state, strict=True)
 
-    loaded_keys = set(filtered_state.keys())
+    loaded_keys = set(normalized_state.keys())
     required_prefixes = (
         "depatch_proj_encoder.",
         "mamba.",
-        "return_head.",
-        "volatility_head.",
         "direction_head.",
     )
     missing_components = [
