@@ -55,7 +55,7 @@ DEFAULT_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
     "k_alpha": [0.5, 1.0, 1.5, 2.0, 3.0],
     "spread_floor_bps": [0.0, 0.25, 0.5],
     "spread_cap_bps": [2.0, 3.0, 4.0, 6.0, 8.0],
-    "vol_horizon_ms": [500, 1000],
+    "vol_horizon_ms": [1000],
     "weights": [(0.0, 0.0, 1.0)],
     "k_inv": [0.0],
     "inv_ref_notional": [1.0],
