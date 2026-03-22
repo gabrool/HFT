@@ -106,8 +106,7 @@ def _obs_norm_state_is_ready(state: Dict[str, Any]) -> bool:
 
 def _require_grid_quantized_decision_meta(meta: Dict[str, Any]) -> None:
     contract_error = (
-        "Dataset not built with grid-quantized decisions; "
-        "rerun offline_ingest/offline_snapshots."
+        "Dataset not built with grid-quantized decisions; rerun offline_ingest.py first so RL sees canonical decision timestamps."
     )
     time_grid = meta.get("time_grid")
     if not isinstance(time_grid, dict):
@@ -118,6 +117,49 @@ def _require_grid_quantized_decision_meta(meta: Dict[str, Any]) -> None:
         raise ValueError(contract_error)
     if meta.get("decision_policy") != "ob_only_grid_quantized":
         raise ValueError(contract_error)
+
+
+def _cmssl_rl_migration_message() -> str:
+    return (
+        "Migration order required: rerun offline_ingest.py, then retrain CMSSL17_offline.py, "
+        "then retrain RL."
+    )
+
+
+OLD_RL_OBS_LAYOUT_DESCRIPTION = "[ret, vol, logits, p_up, ...]"
+
+
+def _raise_rl_layout_mismatch(*, expected_obs_dim: int, actual_obs_dim: int, context: str) -> None:
+    raise ValueError(
+        f"{context} observation dimension mismatch: expected new joined-layout obs_dim={expected_obs_dim}, "
+        f"got checkpoint/input obs_dim={actual_obs_dim}. This RL checkpoint was trained on the old "
+        f"{OLD_RL_OBS_LAYOUT_DESCRIPTION} layout and is incompatible with the new direction-only joined features; "
+        "it must be retrained after regenerating data and CMSSL outputs. "
+        f"{_cmssl_rl_migration_message()}"
+    )
+
+
+def _expected_joined_feature_dim(num_horizons: int) -> int:
+    return _joined_feature_layout(num_horizons, len(RAW_SNAPSHOT_FEATURE_COLUMNS))["snapshots"].stop
+
+
+def _expected_market_obs_dim_for_horizons(num_horizons: int) -> int:
+    return _expected_joined_feature_dim(num_horizons) + ENV_OBS_EXTRA_STATE_DIM
+
+
+def _expected_market_obs_dim_from_meta(meta: Dict[str, Any]) -> int:
+    horizons = [int(h) for h in meta.get("horizons_ms", [])]
+    require(horizons, "meta['horizons_ms'] must be non-empty")
+    return _expected_market_obs_dim_for_horizons(len(horizons))
+
+
+def _validate_rl_obs_dim(*, actual_obs_dim: int, expected_obs_dim: int, context: str) -> None:
+    if int(actual_obs_dim) != int(expected_obs_dim):
+        _raise_rl_layout_mismatch(
+            expected_obs_dim=int(expected_obs_dim),
+            actual_obs_dim=int(actual_obs_dim),
+            context=context,
+        )
 
 
 def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
@@ -134,6 +176,22 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
     state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     require(isinstance(state, dict), "CMSSL checkpoint state_dict must be a mapping")
 
+    normalized_keys = {
+        key[7:] if isinstance(key, str) and key.startswith("module.") else key
+        for key in state.keys()
+    }
+    legacy_head_prefixes = ("return_head.", "volatility_head.")
+    legacy_schema_keys = [
+        prefix for prefix in legacy_head_prefixes
+        if any(k.startswith(prefix) for k in normalized_keys)
+    ]
+    if legacy_schema_keys:
+        raise ValueError(
+            "CMSSL checkpoint uses the deprecated multi-head schema "
+            f"({', '.join(legacy_schema_keys)} present). RL_exec.py now requires backbone + direction_head-only checkpoints. "
+            f"{_cmssl_rl_migration_message()}"
+        )
+
     model_state = model.state_dict()
     filtered_state = {}
     for key, value in state.items():
@@ -147,29 +205,38 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
             f"Ignoring unexpected CMSSL checkpoint keys: {loaded.unexpected_keys[:10]}"
             + (" ..." if len(loaded.unexpected_keys) > 10 else "")
         )
-    if loaded.missing_keys:
-        warnings.warn(
-            f"CMSSL checkpoint missing model keys: {loaded.missing_keys[:10]}"
-            + (" ..." if len(loaded.missing_keys) > 10 else "")
-        )
 
     loaded_keys = set(filtered_state.keys())
     required_prefixes = (
         "depatch_proj_encoder.",
         "mamba.",
-        "return_head.",
-        "volatility_head.",
         "direction_head.",
     )
     missing_components = [
         prefix for prefix in required_prefixes
         if not any(k.startswith(prefix) for k in loaded_keys)
     ]
-    require(
-        not missing_components,
-        "CMSSL checkpoint is incompatible; required components not loaded: "
-        + ", ".join(missing_components),
-    )
+    if missing_components:
+        raise ValueError(
+            "CMSSL checkpoint is incompatible with the direction-only RL pipeline; required components were not populated: "
+            + ", ".join(missing_components)
+            + ". Missing direction_head/backbone weights usually means the checkpoint predates the direction-only schema. "
+            + _cmssl_rl_migration_message()
+        )
+    if loaded.missing_keys:
+        missing_direction_keys = [k for k in loaded.missing_keys if k.startswith("direction_head.")]
+        if missing_direction_keys:
+            raise ValueError(
+                "CMSSL checkpoint failed to populate required direction_head weights: "
+                + ", ".join(missing_direction_keys[:10])
+                + (" ..." if len(missing_direction_keys) > 10 else "")
+                + ". This checkpoint is incompatible with the direction-only schema. "
+                + _cmssl_rl_migration_message()
+            )
+        warnings.warn(
+            f"CMSSL checkpoint missing model keys: {loaded.missing_keys[:10]}"
+            + (" ..." if len(loaded.missing_keys) > 10 else "")
+        )
     model.eval()
     model = _maybe_compile_module(
         model,
@@ -1399,11 +1466,12 @@ def _extract_joined_feature_blocks(features: np.ndarray, *, label: str) -> Dict[
         raise ValueError(f"{label} features must be 2D, got shape={features.shape}")
     num_h = _infer_num_horizons(int(features.shape[1]))
     layout = _joined_feature_layout(num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
-    expected_dim = layout["snapshots"].stop
+    expected_dim = _expected_joined_feature_dim(num_h)
     if features.shape[1] != expected_dim:
         raise ValueError(
             f"{label} features have incompatible joined width: actual={features.shape[1]} expected={expected_dim} "
-            f"for layout=[dir_logits({num_h}), p_up({num_h}), extras({FEATURE_EXTRA_DIM}), snapshots({len(RAW_SNAPSHOT_FEATURE_COLUMNS)})]."
+            f"for layout=[dir_logits({num_h}), p_up({num_h}), extras({FEATURE_EXTRA_DIM}), snapshots({len(RAW_SNAPSHOT_FEATURE_COLUMNS)})]. "
+            f"{_cmssl_rl_migration_message()}"
         )
     return {
         "num_h": num_h,
@@ -1958,7 +2026,8 @@ class MarketMakingEnv:
             raise ValueError(
                 "MarketMakingEnv feature layout drift detected: "
                 f"actual_feature_dim={actual_feature_dim} expected_feature_dim={expected_feature_dim} "
-                f"num_horizons={self._num_h} snapshot_dim={len(RAW_SNAPSHOT_FEATURE_COLUMNS)}"
+                f"num_horizons={self._num_h} snapshot_dim={len(RAW_SNAPSHOT_FEATURE_COLUMNS)}. "
+                f"{_cmssl_rl_migration_message()}"
             )
 
     def get_observation_scaling_config(self) -> Dict[str, float]:
@@ -1975,9 +2044,10 @@ class MarketMakingEnv:
     def _continuous_mask(self, obs_dim: int) -> np.ndarray:
         expected_obs_dim = self._feature_layout["snapshots"].stop + ENV_OBS_EXTRA_STATE_DIM
         if obs_dim != expected_obs_dim:
-            raise ValueError(
-                "Observation dimension mismatch for normalization mask: "
-                f"obs_dim={obs_dim} expected_obs_dim={expected_obs_dim}"
+            _raise_rl_layout_mismatch(
+                expected_obs_dim=expected_obs_dim,
+                actual_obs_dim=obs_dim,
+                context="Normalization mask"
             )
         mask = np.ones(obs_dim, dtype=bool)
         bounded_feature_keys = (
@@ -3257,6 +3327,7 @@ def save_market_ppo_checkpoint(
         "policy_hidden_dims": tuple(int(x) for x in policy_hidden_dims),
         "value_hidden_dims": tuple(int(x) for x in value_hidden_dims),
         "obs_dim": int(obs_dim),
+        "joined_feature_layout": "[dir_logits, p_up, align/conf metrics, snapshots] + env_extra_state",
         "action_dim": int(action_dim),
         "val_report": _strip_large_report_fields(val_report),
         "val_report_mode": str(val_report_mode),
@@ -3306,6 +3377,19 @@ def _canonical_market_ppo_action_dim(ckpt: Dict[str, Any]) -> int:
     return action_dim
 
 
+def _checkpoint_obs_dim(ckpt: Dict[str, Any]) -> Optional[int]:
+    raw_obs_dim = ckpt.get("obs_dim")
+    if raw_obs_dim is None:
+        return None
+    try:
+        obs_dim = int(raw_obs_dim)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Malformed canonical market PPO checkpoint: obs_dim is not an integer.") from exc
+    if obs_dim <= 0:
+        raise ValueError("Malformed canonical market PPO checkpoint: obs_dim must be positive.")
+    return obs_dim
+
+
 def load_market_ppo_model(
     input_dim: int,
     device: str = "cuda",
@@ -3351,6 +3435,13 @@ def load_market_ppo_model(
     policy_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "policy_hidden_dims")
     value_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "value_hidden_dims")
     action_dim = _canonical_market_ppo_action_dim(ckpt)
+    checkpoint_obs_dim = _checkpoint_obs_dim(ckpt)
+    if checkpoint_obs_dim is not None:
+        _validate_rl_obs_dim(
+            actual_obs_dim=checkpoint_obs_dim,
+            expected_obs_dim=input_dim,
+            context="PPO checkpoint"
+        )
 
     model = MarketPolicyValueNet(
         input_dim,
@@ -3731,7 +3822,8 @@ def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -
     if y_true.shape[1] == 2 * num_h:
         raise ValueError(
             "report_cmssl_metrics() no longer accepts legacy [2 * NUM_HORIZONS] regression labels. "
-            "Regenerate offline chunks with direction-only labels and retrain the CMSSL model before rerunning RL_exec.py."
+            "This indicates old CMSSL/offline data artifacts. "
+            + _cmssl_rl_migration_message()
         )
     if y_true.shape[1] != num_h:
         raise ValueError(
@@ -4643,6 +4735,12 @@ def run_pipeline(
     baseline_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_obs = mm_train_env.reset()
     mm_obs_dim = mm_obs.shape[0]
+    expected_market_obs_dim = _expected_market_obs_dim_from_meta(meta)
+    _validate_rl_obs_dim(
+        actual_obs_dim=mm_obs_dim,
+        expected_obs_dim=expected_market_obs_dim,
+        context="Current joined feature pipeline"
+    )
     print(
         "[mm obs norm] "
         f"source=train_prefit count={int(prefitted_obs_norm_state['count'])} "
