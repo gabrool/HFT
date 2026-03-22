@@ -57,9 +57,7 @@ SHORT_VOL_WINDOW = 50
 LONG_VOL_WINDOW = 200
 # CMSSL market-making horizon contract is fixed: exactly [250, 500, 1000] ms.
 DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
-DEFAULT_MM_VOL_HORIZON_MS = 1000
 DEFAULT_MM_S_MIN_BPS = 0.0
-DEFAULT_MM_K_SIGMA = 0.5
 DEFAULT_MM_K_INV = 0.0
 DEFAULT_MM_K_ALPHA = 1.0
 DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
@@ -202,20 +200,16 @@ def cmssl_predict(model, x_core, x_aux, meta, device: str = "cuda"):
     x_core = torch.as_tensor(x_core, device=device)
     x_aux = torch.as_tensor(x_aux, device=device)
     x = torch.cat([x_core, x_aux], dim=-1)
-    ret_pred, vol_pred, dir_logits = model(x)
+    model_out = model(x)
+    require(isinstance(model_out, (tuple, list)) and len(model_out) >= 1, "CMSSL model must return direction logits")
+    dir_logits = model_out[-1]
     horizons = meta.get("horizons_ms", [])
     expected_h = len(horizons)
     require(expected_h > 0, "meta['horizons_ms'] must be non-empty")
-    require(ret_pred.shape[-1] == expected_h, (
-        f"ret_pred shape {ret_pred.shape} does not match horizons {expected_h}"
-    ))
-    require(vol_pred.shape[-1] == expected_h, (
-        f"vol_pred shape {vol_pred.shape} does not match horizons {expected_h}"
-    ))
     require(dir_logits.shape[-1] == expected_h, (
         f"dir_logits shape {dir_logits.shape} does not match horizons {expected_h}"
     ))
-    return ret_pred, vol_pred, dir_logits
+    return dir_logits
 
 
 def iter_chunk_batches(out_root: str):
@@ -271,10 +265,6 @@ def get_cmssl_splits(out_root: str) -> dict:
         },
     }
 
-
-def sigma_from_vol(log_vol: np.ndarray) -> np.ndarray:
-    """Recover volatility from log-vol predictions."""
-    return np.exp(log_vol)
 
 
 def bps_to_px(mid: float, bps: float) -> float:
@@ -718,14 +708,12 @@ def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
 @dataclass(frozen=True)
 class BaselineQuoteConfig:
     s_min_bps: float
-    k_sigma: float
     k_inv: float
     k_alpha: float
     obs_spread_anchor_frac: float
     spread_floor_bps: float
     spread_cap_bps: float
     inv_ref_notional: float
-    vol_horizon_ms: int
     horizons_ms: List[int]
     p250_weight: float
     p500_weight: float
@@ -759,13 +747,14 @@ class PreparedFastBaselineBatch:
     mid_next: np.ndarray
     observed_spread_bps: np.ndarray
     decision_ts: Optional[np.ndarray]
-    ret_by_horizon: np.ndarray
-    sigma_bps_by_horizon: np.ndarray
+    dir_logits_by_horizon: np.ndarray
     p_up_by_horizon: np.ndarray
+    direction_confidence_by_horizon: np.ndarray
     p250: np.ndarray
     p500: np.ndarray
     p1000: np.ndarray
-    alpha_ret_forecast_bps_by_horizon: Dict[int, np.ndarray]
+    vol_short: np.ndarray
+    vol_long: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -790,14 +779,12 @@ class PreparedBaselineContext:
 def load_baseline_quote_config() -> BaselineQuoteConfig:
     return BaselineQuoteConfig(
         s_min_bps=_env_float("BYBIT_MM_S_MIN_BPS", DEFAULT_MM_S_MIN_BPS),
-        k_sigma=_env_float("BYBIT_MM_K_SIGMA", DEFAULT_MM_K_SIGMA),
         k_inv=_env_float("BYBIT_MM_K_INV", DEFAULT_MM_K_INV),
         k_alpha=_env_float("BYBIT_MM_K_ALPHA", DEFAULT_MM_K_ALPHA),
         obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
         spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
         spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
         inv_ref_notional=_env_float("BYBIT_MM_INV_REF_NOTIONAL", DEFAULT_MM_INV_REF_NOTIONAL),
-        vol_horizon_ms=_env_int("BYBIT_MM_VOL_HORIZON_MS", DEFAULT_MM_VOL_HORIZON_MS),
         # CMSSL MM contract is fixed to [250, 500, 1000]; any deviation is a hard error.
         horizons_ms=_env_int_list("BYBIT_MM_HORIZONS_MS", DEFAULT_MM_HORIZONS_MS),
         p250_weight=_env_float("BYBIT_MM_P250_WEIGHT", DEFAULT_MM_P250_WEIGHT),
@@ -820,21 +807,18 @@ def _validate_baseline_quote_config(cfg: BaselineQuoteConfig, *, tol: float = 1e
         )
     if cfg.spread_cap_bps < cfg.spread_floor_bps:
         raise ValueError("spread_cap_bps must be >= spread_floor_bps")
-    _resolve_horizon_index(cfg.vol_horizon_ms, horizons, label="vol")
     return BaselineQuoteConfig(**{**cfg.__dict__, "horizons_ms": horizons})
 
 
 def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> BaselineQuoteConfig:
     cfg = BaselineQuoteConfig(
         s_min_bps=float(mapping.get("s_min_bps", DEFAULT_MM_S_MIN_BPS)),
-        k_sigma=float(mapping.get("k_sigma", DEFAULT_MM_K_SIGMA)),
         k_inv=float(mapping.get("k_inv", DEFAULT_MM_K_INV)),
         k_alpha=float(mapping.get("k_alpha", DEFAULT_MM_K_ALPHA)),
         obs_spread_anchor_frac=float(mapping.get("obs_spread_anchor_frac", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC)),
         spread_floor_bps=float(mapping.get("spread_floor_bps", DEFAULT_MM_SPREAD_FLOOR_BPS)),
         spread_cap_bps=float(mapping.get("spread_cap_bps", DEFAULT_MM_SPREAD_CAP_BPS)),
         inv_ref_notional=float(mapping.get("inv_ref_notional", DEFAULT_MM_INV_REF_NOTIONAL)),
-        vol_horizon_ms=int(mapping.get("vol_horizon_ms", DEFAULT_MM_VOL_HORIZON_MS)),
         horizons_ms=[int(h) for h in mapping.get("horizons_ms", DEFAULT_MM_HORIZONS_MS)],
         p250_weight=float(mapping.get("p250_weight", DEFAULT_MM_P250_WEIGHT)),
         p500_weight=float(mapping.get("p500_weight", DEFAULT_MM_P500_WEIGHT)),
@@ -845,14 +829,12 @@ def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> Basel
 
 BASELINE_QUOTE_ENV_VAR_MAP: Tuple[Tuple[str, str], ...] = (
     ("s_min_bps", "BYBIT_MM_S_MIN_BPS"),
-    ("k_sigma", "BYBIT_MM_K_SIGMA"),
     ("k_inv", "BYBIT_MM_K_INV"),
     ("k_alpha", "BYBIT_MM_K_ALPHA"),
     ("obs_spread_anchor_frac", "BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC"),
     ("spread_floor_bps", "BYBIT_MM_SPREAD_FLOOR_BPS"),
     ("spread_cap_bps", "BYBIT_MM_SPREAD_CAP_BPS"),
     ("inv_ref_notional", "BYBIT_MM_INV_REF_NOTIONAL"),
-    ("vol_horizon_ms", "BYBIT_MM_VOL_HORIZON_MS"),
     ("p250_weight", "BYBIT_MM_P250_WEIGHT"),
     ("p500_weight", "BYBIT_MM_P500_WEIGHT"),
     ("p1000_weight", "BYBIT_MM_P1000_WEIGHT"),
@@ -973,28 +955,24 @@ def temporary_baseline_quote_env_from_config(
 
 def _infer_num_horizons(feature_dim: int) -> int:
     base_dim = feature_dim - len(RAW_SNAPSHOT_FEATURE_COLUMNS) - FEATURE_EXTRA_DIM
-    if base_dim <= 0 or base_dim % 4 != 0:
+    if base_dim <= 0 or base_dim % 2 != 0:
         raise ValueError(
             "Feature dimension does not align with expected horizon layout: "
             f"feature_dim={feature_dim} base_dim={base_dim}"
         )
-    return base_dim // 4
+    return base_dim // 2
 
 
 def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, slice]:
     """Schema for join_features() tensor layout (excluding env extra state).
 
     Layout order:
-      [ret(h), vol(h), logits(h), p_up(h), align/conf-delta/conf metrics(5), snapshots(snapshot_dim)]
+      [logits(h), p_up(h), align/conf-delta/conf metrics(5), snapshots(snapshot_dim)]
     """
     offset = 0
     layout = {
-        "ret": slice(offset, offset + num_horizons),
+        "dir_logits": slice(offset, offset + num_horizons)
     }
-    offset += num_horizons
-    layout["vol"] = slice(offset, offset + num_horizons)
-    offset += num_horizons
-    layout["dir_logits"] = slice(offset, offset + num_horizons)
     offset += num_horizons
     layout["p_up"] = slice(offset, offset + num_horizons)
     offset += num_horizons
@@ -1182,14 +1160,10 @@ def run_cmssl_test_window_inference(
     horizons = meta.get("horizons_ms", [])
     output: Dict[str, Dict[int, np.ndarray]] = {
         "horizons_ms": horizons,
-        "ret_pred": {},
-        "vol_pred": {},
         "dir_logits": {},
     }
     for idx, ts_val in enumerate(ts):
         ts_key = int(ts_val)
-        output["ret_pred"][ts_key] = cmssl_out["ret_pred"][idx]
-        output["vol_pred"][ts_key] = cmssl_out["vol_pred"][idx]
         output["dir_logits"][ts_key] = cmssl_out["dir_logits"][idx]
     return output
 
@@ -1209,20 +1183,14 @@ def run_cmssl_inference(
     if n == 0:
         empty = np.empty((0, num_h), dtype=np.float32)
         return {
-            "ret_pred": empty.copy(),
-            "vol_pred": empty.copy(),
             "dir_logits": empty.copy(),
         }
-    ret_out = np.empty((n, num_h), dtype=np.float32)
-    vol_out = np.empty((n, num_h), dtype=np.float32)
     logits_out = np.empty((n, num_h), dtype=np.float32)
     for i in range(0, n, batch_size):
         j = min(i + batch_size, n)
         xc = x_core[i:j]
         xa = x_aux[i:j]
-        ret_pred, vol_pred, dir_logits = cmssl_predict(model, xc, xa, meta, device=device)
-        ret_out[i:j] = ret_pred.detach().cpu().numpy().astype(np.float32, copy=False)
-        vol_out[i:j] = vol_pred.detach().cpu().numpy().astype(np.float32, copy=False)
+        dir_logits = cmssl_predict(model, xc, xa, meta, device=device)
         logits_out[i:j] = dir_logits.detach().cpu().numpy().astype(np.float32, copy=False)
     elapsed = time.perf_counter() - t0
     if elapsed > 0.0:
@@ -1232,8 +1200,6 @@ def run_cmssl_inference(
     else:
         _timing_log(f"cmssl_inference rows={n} batch_size={batch_size} secs={elapsed:.4f}")
     return {
-        "ret_pred": ret_out,
-        "vol_pred": vol_out,
         "dir_logits": logits_out,
     }
 
@@ -1510,20 +1476,16 @@ def join_features(
     """Join model outputs and snapshot state into a single feature tensor.
 
     Per-row layout (excluding environment-only extra state):
-      1) ret_pred[h]
-      2) vol_pred[h]
-      3) dir_logits[h]
-      4) p_up[h]
-      5) align/conf deltas and confidence metrics:
+      1) dir_logits[h]
+      2) p_up[h]
+      3) align/conf deltas and confidence metrics:
          - align_all
          - diff_short_long
          - diff_mid_long
          - conf_long
          - conf_min
-      6) snapshot features from RAW_SNAPSHOT_FEATURE_COLUMNS
+      4) snapshot features from RAW_SNAPSHOT_FEATURE_COLUMNS
     """
-    ret_pred = cmssl_out["ret_pred"]
-    vol_pred = cmssl_out["vol_pred"]
     dir_logits = cmssl_out["dir_logits"]
     p_up = _sigmoid(dir_logits)
     horizons = [int(h) for h in meta.get("horizons_ms", [])]
@@ -1546,21 +1508,15 @@ def join_features(
     diff_mid_long = p_up[:, idx_mid] - p_up[:, idx_long]
     conf_long = conf[:, idx_long]
     conf_min = np.min(conf, axis=1)
-    layout = _joined_feature_layout(ret_pred.shape[1], snapshots.shape[1])
+    layout = _joined_feature_layout(dir_logits.shape[1], snapshots.shape[1])
     snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
     if _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False):
-        n_rows = int(ret_pred.shape[0])
+        n_rows = int(dir_logits.shape[0])
         expected_feature_dim = layout["snapshots"].stop
         features = np.empty((n_rows, expected_feature_dim), dtype=np.float32)
         cursor = 0
 
-        d = ret_pred.shape[1]
-        features[:, cursor:cursor + d] = ret_pred
-        cursor += d
-        d = vol_pred.shape[1]
-        features[:, cursor:cursor + d] = vol_pred
-        cursor += d
         d = dir_logits.shape[1]
         features[:, cursor:cursor + d] = dir_logits
         cursor += d
@@ -1584,8 +1540,6 @@ def join_features(
     else:
         features = np.concatenate(
             [
-                ret_pred,
-                vol_pred,
                 dir_logits,
                 p_up,
                 align_all[:, None],
@@ -1906,11 +1860,6 @@ class MarketMakingEnv:
             self._baseline_cfg.horizons_ms,
         )
         self._horizons_ms = _validate_fixed_cmssl_horizons(self._horizons_ms)
-        self._vol_horizon_idx = _resolve_horizon_index(
-            self._baseline_cfg.vol_horizon_ms,
-            self._horizons_ms,
-            label="vol",
-        )
         self._p250_idx = _resolve_horizon_index(
             250,
             self._horizons_ms,
@@ -1929,8 +1878,6 @@ class MarketMakingEnv:
         print(
             "[mm horizons]",
             f"resolved_horizons_ms={self._horizons_ms}",
-            f"vol_ms={self._baseline_cfg.vol_horizon_ms}",
-            f"vol_idx={self._vol_horizon_idx}",
             f"p250_idx={self._p250_idx}",
             f"p500_idx={self._p500_idx}",
             f"p1000_idx={self._p1000_idx}",
@@ -2214,11 +2161,7 @@ class MarketMakingEnv:
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         cfg = self._baseline_cfg
         mid = self._mid_price(idx)
-        ret_pred = self._feature_slice(idx, 0, self._num_h)
-        vol_pred = self._feature_slice(idx, self._num_h, 2 * self._num_h)
-        p_up = self._feature_slice(idx, 3 * self._num_h, 4 * self._num_h)
-        sigma_bps = 1e4 * float(sigma_from_vol(vol_pred[self._vol_horizon_idx]))
-        ret_forecast_bps = 1e4 * float(ret_pred[self._vol_horizon_idx])
+        p_up = self._feature_slice(idx, self._num_h, 2 * self._num_h)
         p250 = float(p_up[self._p250_idx])
         p500 = float(p_up[self._p500_idx])
         p1000 = float(p_up[self._p1000_idx])
@@ -2229,23 +2172,23 @@ class MarketMakingEnv:
             ) / weight_sum
         else:
             p_weighted = 0.5
-        # Blend the explicit return forecast with probability-weighted sigma to steer skew.
         alpha = (p_weighted - 0.5) * 2.0
+        confidence = abs(alpha)
         s_min_bps = cfg.s_min_bps
-        snapshot_offset = self._feature_layout["snapshots"].start
-        spread_idx = snapshot_offset + RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
-        if spread_idx < self.features.shape[1]:
-            observed_spread_bps = float(self.features[idx, spread_idx])
-            if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-                s_min_bps = max(s_min_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
-        half_spread_bps = s_min_bps + cfg.k_sigma * sigma_bps
+        snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
+        observed_spread_bps = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")])
+        vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
+        vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
+        realized_vol_proxy_bps = 1e4 * max(0.0, vol_short, vol_long)
+        if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
+            s_min_bps = max(s_min_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
+        half_spread_bps = s_min_bps + confidence * realized_vol_proxy_bps
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         inv_ref = cfg.inv_ref_notional if cfg.inv_ref_notional > 0.0 else 1.0
         inv_notional = self.inventory * mid
         skew_bps = cfg.k_inv * (inv_notional / inv_ref) - cfg.k_alpha * alpha
         half_spread_px = bps_to_px(mid, half_spread_bps)
         skew_px = bps_to_px(mid, skew_bps)
-        # Plan: spread = s_min + k_sigma*sigma (floored/capped), skew = k_inv*inv - k_alpha*alpha.
         bid = mid - half_spread_px - skew_px
         ask = mid + half_spread_px - skew_px
         return bid, ask, mid
@@ -3798,14 +3741,14 @@ def train_market_ppo(
 def report_cmssl_metrics(y_true: np.ndarray, cmssl_out: Dict[str, np.ndarray]) -> Dict[str, float]:
     num_h = y_true.shape[1] // 2
     y_ret = y_true[:, :num_h]
-    y_vol = y_true[:, num_h:]
-    ret_pred = cmssl_out["ret_pred"]
-    vol_pred = cmssl_out["vol_pred"]
-    ret_mae = float(np.mean(np.abs(ret_pred - y_ret)))
-    vol_mae = float(np.mean(np.abs(vol_pred - y_vol)))
+    dir_logits = np.asarray(cmssl_out["dir_logits"], dtype=np.float64)
+    p_up = _sigmoid(dir_logits)
+    y_up = (y_ret > 0.0).astype(np.float64)
+    bce = float(np.mean(-(y_up * np.log(np.clip(p_up, 1e-6, 1.0)) + (1.0 - y_up) * np.log(np.clip(1.0 - p_up, 1e-6, 1.0)))))
+    accuracy = float(np.mean((p_up >= 0.5) == (y_up >= 0.5)))
     return {
-        "ret_mae": ret_mae,
-        "vol_mae": vol_mae,
+        "direction_bce": bce,
+        "direction_accuracy": accuracy,
     }
 
 
@@ -3915,7 +3858,6 @@ def evaluate_market_making(
     maker_sell_markout_steps: List[float] = []
     if collect_vol_bucket_report:
         bucket_cfg = _validate_baseline_quote_config(load_baseline_quote_config() if baseline_cfg is None else baseline_cfg)
-        vol_idx = _resolve_horizon_index(bucket_cfg.vol_horizon_ms, bucket_cfg.horizons_ms, label="baseline_bucket_vol")
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -3981,8 +3923,10 @@ def evaluate_market_making(
         maker_opps += 2
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
         if collect_vol_bucket_report and bucket_cfg is not None:
-            vol_pred = env._feature_slice(idx_before_step, env._num_h, 2 * env._num_h)
-            sigma_bps_selected_steps.append(1e4 * float(sigma_from_vol(vol_pred[vol_idx])))
+            snapshot_row = env.features[idx_before_step, env._feature_layout["snapshots"]]
+            vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
+            vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
+            sigma_bps_selected_steps.append(1e4 * max(0.0, vol_short, vol_long))
             delta_equity_steps.append(float(info.get("delta_equity", 0.0)))
             reward_steps.append(float(reward))
             maker_buy_steps.append(maker_buy)
@@ -4226,15 +4170,14 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
     num_h = _infer_num_horizons(batch.features.shape[-1])
     horizons_ms = _validate_fixed_cmssl_horizons(_normalize_horizons(num_h, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS)))
     layout = _joined_feature_layout(num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
-    ret_by_horizon = np.asarray(batch.features[:, layout["ret_pred"]], dtype=np.float64)
-    vol_pred = np.asarray(batch.features[:, layout["vol_pred"]], dtype=np.float64)
-    sigma_bps_by_horizon = 1e4 * sigma_from_vol(vol_pred)
+    dir_logits_by_horizon = np.asarray(batch.features[:, layout["dir_logits"]], dtype=np.float64)
     p_up_by_horizon = np.asarray(batch.features[:, layout["p_up"]], dtype=np.float64)
+    direction_confidence_by_horizon = np.abs(2.0 * p_up_by_horizon - 1.0)
     snapshot_block = np.asarray(batch.features[:, layout["snapshots"]], dtype=np.float64)
     spread_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     observed_spread_bps = snapshot_block[:, spread_idx]
-    horizon_idx = {h: _resolve_horizon_index(h, horizons_ms, label=f"fast_{h}") for h in horizons_ms}
-    alpha_ret_forecast_bps_by_horizon = {h: 1e4 * ret_by_horizon[:, idx] for h, idx in horizon_idx.items()}
+    vol_short = snapshot_block[:, RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")]
+    vol_long = snapshot_block[:, RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")]
     best_bid = np.asarray(batch.best_bid, dtype=np.float64)
     best_ask = np.asarray(batch.best_ask, dtype=np.float64)
     mid = 0.5 * (best_bid + best_ask)
@@ -4269,17 +4212,17 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
         mid_next=mid_next,
         observed_spread_bps=observed_spread_bps,
         decision_ts=None if batch.decision_ts is None else np.asarray(batch.decision_ts, dtype=np.int64),
-        ret_by_horizon=ret_by_horizon,
-        sigma_bps_by_horizon=sigma_bps_by_horizon,
+        dir_logits_by_horizon=dir_logits_by_horizon,
         p_up_by_horizon=p_up_by_horizon,
+        direction_confidence_by_horizon=direction_confidence_by_horizon,
         p250=p_up_by_horizon[:, _resolve_horizon_index(250, horizons_ms, label="p250")],
         p500=p_up_by_horizon[:, _resolve_horizon_index(500, horizons_ms, label="p500")],
         p1000=p_up_by_horizon[:, _resolve_horizon_index(1000, horizons_ms, label="p1000")],
-        alpha_ret_forecast_bps_by_horizon=alpha_ret_forecast_bps_by_horizon,
+        vol_short=vol_short,
+        vol_long=vol_long,
     )
 
-
-def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, sigma_bps, ret_forecast_bps, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, s_min_bps, obs_spread_anchor_frac, k_sigma, k_inv, k_alpha, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
+def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, vol_short, vol_long, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, s_min_bps, obs_spread_anchor_frac, k_inv, k_alpha, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight):
     steps = len(mid)
     equity_curve = np.zeros(steps, dtype=np.float64)
     inventory_curve = np.zeros(steps, dtype=np.float64)
@@ -4311,18 +4254,19 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
     inventory_abs_max = 0.0
     for idx in range(steps):
         mid_i = mid[idx]
-        sigma_bps_i = sigma_bps[idx]
         weight_sum = p250_weight + p500_weight + p1000_weight
         if weight_sum > 0.0:
             p_weighted = (p250_weight * p250[idx] + p500_weight * p500[idx] + p1000_weight * p1000[idx]) / weight_sum
         else:
             p_weighted = 0.5
         alpha = (p_weighted - 0.5) * 2.0
+        confidence = abs(alpha)
         anchored_s_min_bps = s_min_bps
         observed_spread_bps_i = observed_spread_bps[idx]
         if np.isfinite(observed_spread_bps_i) and observed_spread_bps_i > 0.0:
             anchored_s_min_bps = max(anchored_s_min_bps, obs_spread_anchor_frac * observed_spread_bps_i)
-        half_spread_bps = anchored_s_min_bps + k_sigma * sigma_bps_i
+        realized_vol_proxy_bps = 1e4 * max(0.0, max(vol_short[idx], vol_long[idx]))
+        half_spread_bps = anchored_s_min_bps + confidence * realized_vol_proxy_bps
         if half_spread_bps < spread_floor_bps:
             half_spread_bps = spread_floor_bps
         if half_spread_bps > spread_cap_bps:
@@ -4439,7 +4383,6 @@ else:
 
 def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, quote_cfg: BaselineQuoteConfig, *, use_numba: Optional[bool] = None) -> Dict[str, Any]:
     quote_cfg = _validate_baseline_quote_config(quote_cfg)
-    vol_idx = _resolve_horizon_index(quote_cfg.vol_horizon_ms, quote_cfg.horizons_ms, label="vol")
     kernel = _evaluate_prepared_baseline_fast_kernel_py
     backend = "python"
     allow_numba = _env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA) if use_numba is None else bool(use_numba)
@@ -4449,7 +4392,7 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
     print(f"[baseline fast] backend={backend} split={prepared_batch.split_name}")
     # Pass the precomputed previous-book arrays directly; shifted current arrays break touch/move-away parity.
     result = kernel(
-        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], prepared_batch.alpha_ret_forecast_bps_by_horizon[quote_cfg.vol_horizon_ms][:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.k_sigma, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
+        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
     )
     (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
     initial_equity = prepared_batch.initial_cash
@@ -4490,7 +4433,7 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
     }
     metrics.update(
         build_vol_bucket_report(
-            sigma_bps_selected=np.asarray(prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], dtype=np.float64),
+            sigma_bps_selected=np.asarray(1e4 * np.maximum(0.0, np.maximum(prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1])), dtype=np.float64),
             delta_equity_per_step=np.asarray(delta_equity_curve, dtype=np.float64),
             reward_per_step=np.asarray(reward_curve, dtype=np.float64),
             maker_buy_per_step=np.asarray(maker_buy_curve, dtype=np.float64),
@@ -4584,9 +4527,7 @@ def prepare_baseline_context(
     cmssl_report = report_cmssl_metrics(
         joined_test["y"],
         {
-            "ret_pred": joined_test["features"][:, :num_h],
-            "vol_pred": joined_test["features"][:, num_h:2 * num_h],
-            "dir_logits": joined_test["features"][:, 2 * num_h:3 * num_h],
+            "dir_logits": joined_test["features"][:, :num_h],
         },
     )
 
@@ -4710,9 +4651,7 @@ def run_pipeline(
     cmssl_report = report_cmssl_metrics(
         joined_test["y"],
         {
-            "ret_pred": joined_test["features"][:, :num_h],
-            "vol_pred": joined_test["features"][:, num_h:2 * num_h],
-            "dir_logits": joined_test["features"][:, 2 * num_h:3 * num_h],
+            "dir_logits": joined_test["features"][:, :num_h],
         },
     )
 
