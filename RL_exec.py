@@ -2,6 +2,7 @@ import json
 import os
 import time
 import warnings
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -818,6 +819,52 @@ def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> Basel
         p1000_weight=float(mapping.get("p1000_weight", DEFAULT_MM_P1000_WEIGHT)),
     )
     return _validate_baseline_quote_config(cfg)
+
+
+BASELINE_QUOTE_ENV_VAR_MAP: Tuple[Tuple[str, str], ...] = (
+    ("s_min_bps", "BYBIT_MM_S_MIN_BPS"),
+    ("k_sigma", "BYBIT_MM_K_SIGMA"),
+    ("k_inv", "BYBIT_MM_K_INV"),
+    ("k_alpha", "BYBIT_MM_K_ALPHA"),
+    ("spread_floor_bps", "BYBIT_MM_SPREAD_FLOOR_BPS"),
+    ("spread_cap_bps", "BYBIT_MM_SPREAD_CAP_BPS"),
+    ("inv_ref_notional", "BYBIT_MM_INV_REF_NOTIONAL"),
+    ("vol_horizon_ms", "BYBIT_MM_VOL_HORIZON_MS"),
+    ("p250_weight", "BYBIT_MM_P250_WEIGHT"),
+    ("p500_weight", "BYBIT_MM_P500_WEIGHT"),
+    ("p1000_weight", "BYBIT_MM_P1000_WEIGHT"),
+)
+
+
+def _resolve_baseline_quote_config(
+    baseline_config: Optional[Dict[str, Any] | BaselineQuoteConfig],
+) -> Optional[BaselineQuoteConfig]:
+    if baseline_config is None:
+        return None
+    if isinstance(baseline_config, BaselineQuoteConfig):
+        return _validate_baseline_quote_config(baseline_config)
+    return resolve_baseline_quote_config_from_mapping(baseline_config)
+
+
+@contextmanager
+def temporary_baseline_quote_env_from_config(
+    config: Optional[BaselineQuoteConfig | Dict[str, Any]],
+):
+    quote_cfg = _resolve_baseline_quote_config(config)
+    if quote_cfg is None:
+        yield None
+        return
+    previous = {env_name: os.environ.get(env_name) for _, env_name in BASELINE_QUOTE_ENV_VAR_MAP}
+    try:
+        for field_name, env_name in BASELINE_QUOTE_ENV_VAR_MAP:
+            os.environ[env_name] = str(getattr(quote_cfg, field_name))
+        yield quote_cfg
+    finally:
+        for env_name, prior in previous.items():
+            if prior is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = prior
 
 
 def _infer_num_horizons(feature_dim: int) -> int:
@@ -4244,8 +4291,9 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
         kernel = _evaluate_prepared_baseline_fast_kernel_numba
         backend = "numba"
     print(f"[baseline fast] backend={backend} split={prepared_batch.split_name}")
+    # Pass the precomputed previous-book arrays directly; shifted current arrays break touch/move-away parity.
     result = kernel(
-        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_half_spread_floor_bps[:-1], prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], prepared_batch.alpha_ret_forecast_bps_by_horizon[quote_cfg.vol_horizon_ms][:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.k_sigma, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
+        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_half_spread_floor_bps[:-1], prepared_batch.sigma_bps_by_horizon[:-1, vol_idx], prepared_batch.alpha_ret_forecast_bps_by_horizon[quote_cfg.vol_horizon_ms][:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.s_min_bps, quote_cfg.k_sigma, quote_cfg.k_inv, quote_cfg.k_alpha, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight,
     )
     (equity_curve, inventory_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
     initial_equity = prepared_batch.initial_cash
@@ -4290,7 +4338,10 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
     fast_batch = context.fast_val_batch if eval_split == "val" else context.fast_test_batch
     if fast_batch is None:
         raise ValueError("Fast baseline batch unavailable for parity check")
-    env_metrics = evaluate_market_making(build_baseline_eval_env(context.mm_val_batch if eval_split == "val" else context.mm_test_batch, context.env_kwargs_common), lambda _obs: (0.0, 0.0, 0.0))
+    quote_cfg = _validate_baseline_quote_config(quote_cfg)
+    batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
+    with temporary_baseline_quote_env_from_config(quote_cfg):
+        env_metrics = evaluate_market_making(build_baseline_eval_env(batch, context.env_kwargs_common), lambda _obs: (0.0, 0.0, 0.0))
     fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg)
     for key in ("net_pnl_pct", "maker_fill_rate", "maker_fill_count", "maker_buy_fills", "maker_sell_fills", "turnover_notional", "inventory_mean_abs_notional", "inventory_max_abs_notional"):
         lhs = env_metrics.get(key, env_metrics.get("max_drawdown") if key == "max_dd" else None)
@@ -4406,14 +4457,17 @@ def evaluate_prepared_baseline(
         raise ValueError(f"Unsupported baseline split '{eval_split}'")
     batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
     fast_batch = context.fast_val_batch if eval_split == "val" else context.fast_test_batch
-    quote_cfg = load_baseline_quote_config() if baseline_config is None else (baseline_config if isinstance(baseline_config, BaselineQuoteConfig) else resolve_baseline_quote_config_from_mapping(baseline_config))
+    quote_cfg = _resolve_baseline_quote_config(baseline_config)
+    fast_quote_cfg = load_baseline_quote_config() if quote_cfg is None else quote_cfg
     fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
     print(f"[baseline eval cached] split={eval_split} fast_mode={fast_enabled}")
     if fast_enabled and fast_batch is not None:
-        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, use_numba=use_numba)
+        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, fast_quote_cfg, use_numba=use_numba)
     else:
-        env = build_baseline_eval_env(batch, context.env_kwargs_common)
-        baseline_metrics = evaluate_market_making(env, lambda _obs: (0.0, 0.0, 0.0))
+        # The generic env path still resolves quote settings from env vars, so install the structured config temporarily.
+        with temporary_baseline_quote_env_from_config(quote_cfg):
+            env = build_baseline_eval_env(batch, context.env_kwargs_common)
+            baseline_metrics = evaluate_market_making(env, lambda _obs: (0.0, 0.0, 0.0))
     return {
         "cmssl_test": context.cmssl_report,
         "mm_baseline": baseline_metrics,
