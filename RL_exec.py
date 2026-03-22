@@ -4303,7 +4303,7 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
             p_weighted = (p250_weight * p250[idx] + p500_weight * p500[idx] + p1000_weight * p1000[idx]) / weight_sum
         else:
             p_weighted = 0.5
-        alpha = (p_weighted - 0.5) * 2.0 * sigma_bps_i
+        alpha = (p_weighted - 0.5) * 2.0
         anchored_s_min_bps = s_min_bps
         observed_spread_bps_i = observed_spread_bps[idx]
         if np.isfinite(observed_spread_bps_i) and observed_spread_bps_i > 0.0:
