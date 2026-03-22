@@ -1013,8 +1013,7 @@ def train_from_offline():
             "primary_masked_acc": float(acc_masked[primary_horizon_idx]),
         }
 
-    def run_validation(*, primary_horizon_idx: int, full_metrics: bool) -> dict:
-        del primary_horizon_idx
+    def run_validation(*, full_metrics: bool) -> dict:
         return summarize_directional_metrics(dl_val, primary_only=not full_metrics)
 
     for epoch in range(EPOCHS):
@@ -1075,7 +1074,7 @@ def train_from_offline():
         print(f"[train] loss={epoch_train_loss:.4f} bce={epoch_train_bce:.4f}")
 
         # ---------------- Validation ----------------
-        fast_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=False)
+        fast_val = run_validation(full_metrics=False)
         primary_metric_value = float(fast_val["primary_metric_value"])
         primary_metric_label = str(fast_val["primary_metric_label"])
 
@@ -1089,7 +1088,7 @@ def train_from_offline():
             if is_metric_improved(primary_metric_value, best, primary_metric_mode):
                 best = float(primary_metric_value)
                 no_imp = 0
-                full_val = run_validation(primary_horizon_idx=primary_horizon_idx, full_metrics=True)
+                full_val = run_validation(full_metrics=True)
                 print(
                     f"[val] BCE(all)={format_metric(full_val['val_bce_unmasked'], '{:.5f}')}  "
                     f"BCE(mask)={format_metric(full_val['val_bce_masked'], '{:.5f}')}  "
