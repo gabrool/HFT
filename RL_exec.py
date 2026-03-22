@@ -2126,7 +2126,7 @@ class MarketMakingEnv:
         else:
             p_weighted = 0.5
         # Blend the explicit return forecast with probability-weighted sigma to steer skew.
-        alpha = (p_weighted - 0.5) * 2.0 * sigma_bps + ret_forecast_bps
+        alpha = (p_weighted - 0.5) * 2.0 * sigma_bps
         s_min_bps = cfg.s_min_bps
         snapshot_offset = self._feature_layout["snapshots"].start
         spread_idx = snapshot_offset + RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
