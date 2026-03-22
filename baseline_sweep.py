@@ -122,8 +122,6 @@ RESULT_COLUMNS = [
     "p250_weight",
     "p500_weight",
     "p1000_weight",
-    "vol_bucket_edges_bps_json",
-    "vol_bucket_report_json",
     "net_pnl_pct",
     "sharpe_1h",
     "sortino_1h",
@@ -536,8 +534,6 @@ def flatten_report_row(
         "factor_name": factor_name,
         "factor_value_label": factor_value_label_text,
         "cmssl_test": json.dumps(report.get("cmssl_test"), sort_keys=True),
-        "vol_bucket_edges_bps_json": None,
-        "vol_bucket_report_json": None,
         "error_type": None,
         "error_message": None,
     }
@@ -564,10 +560,6 @@ def flatten_report_row(
                 row[metric_key] = _safe_metric(baseline, "max_drawdown")
         else:
             row[metric_key] = _safe_metric(baseline, metric_key)
-    if "vol_bucket_edges_bps" in baseline:
-        row["vol_bucket_edges_bps_json"] = json.dumps(baseline.get("vol_bucket_edges_bps"), sort_keys=True)
-    if "vol_bucket_report" in baseline:
-        row["vol_bucket_report_json"] = json.dumps(baseline.get("vol_bucket_report"), sort_keys=True)
     return row
 
 
