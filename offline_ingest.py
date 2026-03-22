@@ -844,11 +844,11 @@ class ChunkWriter:
         assert self.F_core > 0, "feature_dim must be > AUX_DIM"
         self.core_dtype = np.float32
 
-        # compute chunk size (keep as you already had it)
+        # compute chunk size using NUM_HORIZONS-wide labels
         bytes_per_seq = (
             (self.L * self.F_core * 4)
             + (self.L * AUX_DIM * 4)
-            + (2 * NUM_HORIZONS * 4)
+            + (NUM_HORIZONS * 4)
         )
         if chunk_size_override > 0:
             self.N = int(chunk_size_override)
@@ -859,7 +859,7 @@ class ChunkWriter:
         # preallocate separate buffers
         self.X_core = np.empty((self.N, self.L, self.F_core), dtype=np.float32)  # cast on flush
         self.X_aux  = np.empty((self.N, self.L, AUX_DIM),     dtype=np.float32)  # keep fp32
-        self.Y      = np.empty((self.N, 2 * NUM_HORIZONS), dtype=np.float32)
+        self.Y      = np.empty((self.N, NUM_HORIZONS), dtype=np.float32)
         self.TS     = np.empty((self.N,), dtype=np.int64)
         self.i = 0
         self.cid = 0
@@ -1017,7 +1017,7 @@ class WeekWriterRouter:
             "lookback": self.lookback,
             "feature_dim_total": self.feature_dim,
             "feature_dim_core": self.feature_dim - AUX_DIM,
-            "label_dim": int(2 * NUM_HORIZONS),
+            "label_dim": int(NUM_HORIZONS),
             "horizons_ms": [int(h) for h in HORIZONS_MS],
             "chunk_size_used": int(writer.N),
             "chunks": chunks_meta,
@@ -1777,7 +1777,7 @@ def process_all(
 
     feature_dim_total = None if F is None else int(F)
     feature_dim_core = None if F is None else int(F - AUX_DIM)
-    label_dim = int(2 * NUM_HORIZONS)
+    label_dim = int(NUM_HORIZONS)
     week_meta_records = {} if router is None else dict(router.week_metas)
     week_quality_records = dict(feeder.quality_by_week)
     weeks_in_order = [wk for wk, _ob, _th in pairs]
