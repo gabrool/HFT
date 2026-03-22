@@ -41,6 +41,12 @@ import numpy as np
 
 import RL_exec
 
+REMOVED_BASELINE_KNOBS = ("k_sigma", "vol_horizon_ms")
+REMOVED_BASELINE_ENV_VARS = {
+    "k_sigma": "BYBIT_MM_K_SIGMA",
+    "vol_horizon_ms": "BYBIT_MM_VOL_HORIZON_MS",
+}
+
 BASELINE_PARAM_ENV_MAP = {
     "s_min_bps": "BYBIT_MM_S_MIN_BPS",
     "k_inv": "BYBIT_MM_K_INV",
@@ -154,6 +160,34 @@ _WORKER_PREPARED_CONTEXT: Optional[RL_exec.PreparedBaselineContext] = None
 _WORKER_EVAL_SPLIT: Optional[str] = None
 _WORKER_FAST_MODE: bool = True
 _WORKER_USE_NUMBA: Optional[bool] = None
+
+
+def _raise_on_stale_deleted_knobs(payload: Any, *, context: str) -> None:
+    stale_tokens = set(REMOVED_BASELINE_KNOBS) | set(REMOVED_BASELINE_ENV_VARS.values())
+
+    def _walk(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_text = str(key)
+                if key_text in stale_tokens:
+                    raise ValueError(f"Stale deleted baseline knob '{key_text}' found in {context} at {path}.")
+                _walk(nested, f"{path}.{key_text}")
+            return
+        if isinstance(value, (list, tuple, set)):
+            for idx, nested in enumerate(value):
+                _walk(nested, f"{path}[{idx}]")
+            return
+        if isinstance(value, str):
+            for token in stale_tokens:
+                if token in value:
+                    raise ValueError(f"Stale deleted baseline knob '{token}' found in {context} at {path}.")
+
+    _walk(payload, context)
+
+
+def _validate_module_examples() -> None:
+    module_doc = __doc__ or ""
+    _raise_on_stale_deleted_knobs(module_doc, context="baseline_sweep module doc")
 
 
 def resolve_required_path(value: Optional[str], env_name: str) -> str:
@@ -554,6 +588,7 @@ def flatten_report_row(
         row["vol_bucket_edges_bps_json"] = json.dumps(baseline.get("vol_bucket_edges_bps"), sort_keys=True)
     if "vol_bucket_report" in baseline:
         row["vol_bucket_report_json"] = json.dumps(baseline.get("vol_bucket_report"), sort_keys=True)
+    _raise_on_stale_deleted_knobs(row, context="results row")
     return row
 
 
@@ -703,6 +738,7 @@ def make_error_row(
     )
     for key in BASELINE_PARAM_ENV_MAP:
         row[key] = config.get(key)
+    _raise_on_stale_deleted_knobs(row, context="error results row")
     return row
 
 
@@ -760,6 +796,7 @@ def build_metadata(
         metadata["grid_size"] = planned_trials
     if args.search_mode == "one-factor":
         metadata["one_factor_include_anchor"] = args.include_anchor
+    _raise_on_stale_deleted_knobs(metadata, context="metadata")
     return metadata
 
 
@@ -769,6 +806,15 @@ def write_metadata(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    for raw_arg in os.sys.argv[1:]:
+        option = raw_arg.split("=", 1)[0]
+        for knob in REMOVED_BASELINE_KNOBS:
+            deleted_opt = f"--{knob.replace('_', '-')}"
+            if option == deleted_opt:
+                raise SystemExit(
+                    f"{deleted_opt} has been removed from baseline_sweep.py; delete stale references to {knob}."
+                )
+
     parser = argparse.ArgumentParser(description="Baseline-only sweep / structured search for RL_exec.")
     parser.add_argument("--out-root", default=None)
     parser.add_argument("--ckpt-path", default=None)
@@ -803,7 +849,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-method", choices=("auto", "fork", "spawn"), default="auto")
     parser.add_argument("--disable-fast-baseline", action="store_true")
     parser.add_argument("--disable-numba", action="store_true")
-    return parser.parse_args()
+
+    help_text = parser.format_help()
+    _raise_on_stale_deleted_knobs(help_text, context="CLI help text")
+
+    args = parser.parse_args()
+    _raise_on_stale_deleted_knobs(vars(args), context="parsed CLI args")
+    return args
 
 
 def build_retest_row_metadata(row: Dict[str, Any], anchor_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -819,6 +871,7 @@ def build_retest_row_metadata(row: Dict[str, Any], anchor_config: Dict[str, Any]
 
 
 def main() -> None:
+    _validate_module_examples()
     args = parse_args()
     out_root = resolve_required_path(args.out_root, "BYBIT_OUT_ROOT")
     ckpt_path = resolve_required_path(args.ckpt_path, "BYBIT_CMSSL_CKPT")
