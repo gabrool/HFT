@@ -16,6 +16,12 @@ Examples:
         --search-mode one-factor --vary k_sigma k_alpha spread_cap_bps weights --anchor-s-min-bps 0.25 \
         --anchor-k-sigma 0.10 --anchor-k-alpha 1.5 --anchor-spread-floor-bps 0.25 --anchor-spread-cap-bps 4.0 \
         --anchor-vol-horizon-ms 500 --anchor-weight-preset blend_235 --eval-split val
+
+    python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
+        --search-mode one-factor --vary obs_spread_anchor_frac --anchor-obs-spread-anchor-frac 0.5 --eval-split val
+
+    python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
+        --search-mode grid --vary k_sigma k_alpha obs_spread_anchor_frac --anchor-vol-horizon-ms 500 --eval-split val
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ BASELINE_PARAM_ENV_MAP = {
     "k_sigma": "BYBIT_MM_K_SIGMA",
     "k_inv": "BYBIT_MM_K_INV",
     "k_alpha": "BYBIT_MM_K_ALPHA",
+    "obs_spread_anchor_frac": "BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC",
     "spread_floor_bps": "BYBIT_MM_SPREAD_FLOOR_BPS",
     "spread_cap_bps": "BYBIT_MM_SPREAD_CAP_BPS",
     "inv_ref_notional": "BYBIT_MM_INV_REF_NOTIONAL",
@@ -53,6 +60,7 @@ DEFAULT_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
     "s_min_bps": [0.0, 0.25, 0.5],
     "k_sigma": [0.05, 0.10, 0.15, 0.25, 0.40],
     "k_alpha": [0.5, 1.0, 1.5, 2.0, 3.0],
+    "obs_spread_anchor_frac": [0.5, 0.25, 0.1, 0.0],
     "spread_floor_bps": [0.0, 0.25, 0.5],
     "spread_cap_bps": [6.0, 8.0, 10.0],
     "vol_horizon_ms": [500, 1000],
@@ -77,6 +85,7 @@ TUNABLE_FACTORS = [
     "s_min_bps",
     "k_sigma",
     "k_alpha",
+    "obs_spread_anchor_frac",
     "spread_floor_bps",
     "spread_cap_bps",
     "vol_horizon_ms",
@@ -105,6 +114,7 @@ RESULT_COLUMNS = [
     "k_sigma",
     "k_inv",
     "k_alpha",
+    "obs_spread_anchor_frac",
     "spread_floor_bps",
     "spread_cap_bps",
     "inv_ref_notional",
@@ -112,6 +122,8 @@ RESULT_COLUMNS = [
     "p250_weight",
     "p500_weight",
     "p1000_weight",
+    "vol_bucket_edges_bps_json",
+    "vol_bucket_report_json",
     "net_pnl_pct",
     "sharpe_1h",
     "sortino_1h",
@@ -135,6 +147,7 @@ SCALAR_ANCHOR_ARGS = {
     "k_sigma": "anchor_k_sigma",
     "k_inv": "anchor_k_inv",
     "k_alpha": "anchor_k_alpha",
+    "obs_spread_anchor_frac": "anchor_obs_spread_anchor_frac",
     "spread_floor_bps": "anchor_spread_floor_bps",
     "spread_cap_bps": "anchor_spread_cap_bps",
     "inv_ref_notional": "anchor_inv_ref_notional",
@@ -167,6 +180,9 @@ def validate_baseline_config(config: Dict[str, Any], *, tol: float = 1e-6) -> No
             "Baseline horizon weights must sum to 1.0 within tolerance; "
             f"got {weight_sum:.12f} for {config}"
         )
+    obs_spread_anchor_frac = float(config["obs_spread_anchor_frac"])
+    if not math.isfinite(obs_spread_anchor_frac) or obs_spread_anchor_frac < 0.0:
+        raise ValueError("obs_spread_anchor_frac must be finite and >= 0.0")
 
 
 def build_default_anchor_config() -> Dict[str, Any]:
@@ -176,6 +192,7 @@ def build_default_anchor_config() -> Dict[str, Any]:
         "k_sigma": float(DEFAULT_SEARCH_SPACE["k_sigma"][0]),
         "k_inv": float(DEFAULT_SEARCH_SPACE["k_inv"][0]),
         "k_alpha": float(DEFAULT_SEARCH_SPACE["k_alpha"][0]),
+        "obs_spread_anchor_frac": float(DEFAULT_SEARCH_SPACE["obs_spread_anchor_frac"][0]),
         "spread_floor_bps": float(DEFAULT_SEARCH_SPACE["spread_floor_bps"][0]),
         "spread_cap_bps": float(DEFAULT_SEARCH_SPACE["spread_cap_bps"][0]),
         "inv_ref_notional": float(DEFAULT_SEARCH_SPACE["inv_ref_notional"][0]),
@@ -519,6 +536,8 @@ def flatten_report_row(
         "factor_name": factor_name,
         "factor_value_label": factor_value_label_text,
         "cmssl_test": json.dumps(report.get("cmssl_test"), sort_keys=True),
+        "vol_bucket_edges_bps_json": None,
+        "vol_bucket_report_json": None,
         "error_type": None,
         "error_message": None,
     }
@@ -545,6 +564,10 @@ def flatten_report_row(
                 row[metric_key] = _safe_metric(baseline, "max_drawdown")
         else:
             row[metric_key] = _safe_metric(baseline, metric_key)
+    if "vol_bucket_edges_bps" in baseline:
+        row["vol_bucket_edges_bps_json"] = json.dumps(baseline.get("vol_bucket_edges_bps"), sort_keys=True)
+    if "vol_bucket_report" in baseline:
+        row["vol_bucket_report_json"] = json.dumps(baseline.get("vol_bucket_report"), sort_keys=True)
     return row
 
 
@@ -708,7 +731,7 @@ def print_leaderboard(rows: List[Dict[str, Any]], *, top_k: int, label: str) -> 
             f"split={row.get('baseline_eval_split')} pnl={row.get('net_pnl_pct')} sharpe={row.get('sharpe_1h')} "
             f"dd={row.get('max_dd')} fill_rate={row.get('maker_fill_rate')} fills={row.get('maker_fill_count')} "
             f"params={{s_min_bps={row.get('s_min_bps')}, k_sigma={row.get('k_sigma')}, "
-            f"k_alpha={row.get('k_alpha')}, spread_floor_bps={row.get('spread_floor_bps')}, "
+            f"k_alpha={row.get('k_alpha')}, obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_floor_bps={row.get('spread_floor_bps')}, "
             f"spread_cap_bps={row.get('spread_cap_bps')}, vol_horizon_ms={row.get('vol_horizon_ms')}, "
             f"weights=({row.get('p250_weight')}, {row.get('p500_weight')}, {row.get('p1000_weight')})}}"
         )
@@ -780,6 +803,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-k-sigma", type=float, default=None)
     parser.add_argument("--anchor-k-inv", type=float, default=None)
     parser.add_argument("--anchor-k-alpha", type=float, default=None)
+    parser.add_argument("--anchor-obs-spread-anchor-frac", type=float, default=None)
     parser.add_argument("--anchor-spread-floor-bps", type=float, default=None)
     parser.add_argument("--anchor-spread-cap-bps", type=float, default=None)
     parser.add_argument("--anchor-inv-ref-notional", type=float, default=None)
@@ -893,7 +917,7 @@ def main() -> None:
             if args.verbose:
                 print(
                     f"[trial {row['trial'] + 1}/{total_trials}] status={row['status']} score={row.get('score')} "
-                    f"split={row.get('baseline_eval_split')} config={{s_min_bps={row.get('s_min_bps')}, k_sigma={row.get('k_sigma')}, k_alpha={row.get('k_alpha')}, spread_cap_bps={row.get('spread_cap_bps')}}}"
+                    f"split={row.get('baseline_eval_split')} config={{s_min_bps={row.get('s_min_bps')}, k_sigma={row.get('k_sigma')}, k_alpha={row.get('k_alpha')}, obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_cap_bps={row.get('spread_cap_bps')}}}"
                 )
     finally:
         if args.workers > 1:
