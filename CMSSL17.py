@@ -881,18 +881,6 @@ class SAMBA(nn.Module):
         # Heads
         fused_dim = args.d_model * 2
         head_hidden_dim = fused_dim * 2
-        self.return_head = nn.Sequential(
-            nn.Linear(fused_dim, head_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(head_hidden_dim, NUM_HORIZONS)
-        )
-        self.volatility_head = nn.Sequential(
-            nn.Linear(fused_dim, head_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(head_hidden_dim, NUM_HORIZONS)  # predicts log-vol per horizon
-        )
         self.direction_head = nn.Sequential(
             nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
@@ -905,11 +893,9 @@ class SAMBA(nn.Module):
         h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
 
         pooled, _, _ = self.mamba(h_tokens, embedded=True)
-        ret = self.return_head(pooled)
-        vol = self.volatility_head(pooled)
         dir_logits = self.direction_head(pooled)
 
-        return ret, vol, dir_logits
+        return dir_logits
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
