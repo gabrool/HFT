@@ -844,7 +844,7 @@ class ChunkWriter:
         assert self.F_core > 0, "feature_dim must be > AUX_DIM"
         self.core_dtype = np.float32
 
-        # compute chunk size using NUM_HORIZONS-wide labels
+        # compute chunk size using direction-only NUM_HORIZONS-wide labels
         bytes_per_seq = (
             (self.L * self.F_core * 4)
             + (self.L * AUX_DIM * 4)
