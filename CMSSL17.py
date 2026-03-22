@@ -2393,19 +2393,12 @@ class LabelBuilder:
         while self.wait_mature and self.wait_mature[0][0] <= t:
             _, t_delta, mid0 = self.wait_mature.popleft()
 
-            e = 1e-12
-            mid0_safe = max(e, mid0)
-
-            returns = []
-            vols = []
+            dir_targets = []
             for horizon in self.horizons:
                 mid_T = self._price_at(t_delta + int(horizon))
-                mid_T_safe = max(e, mid_T)
-                y_ret = math.log(mid_T_safe / mid0_safe)
-                returns.append(y_ret)
-                vols.append(0.5 * (y_ret ** 2))
+                dir_targets.append(1.0 if mid_T > mid0 else 0.0)
 
-            out.append(np.array(returns + vols, dtype=np.float32))
+            out.append(np.array(dir_targets, dtype=np.float32))
 
         self.last_ts = t
         self.last_mid = m
