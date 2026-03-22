@@ -5,23 +5,23 @@ Examples:
         --device cuda --search-mode random --n-trials 40 --eval-split val --results-csv baseline_val_sweep.csv
 
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
-        --search-mode random --vary k_alpha weights --anchor-spread-cap-bps 4.0 \
+        --search-mode random --vary alpha_center_scale weights --anchor-spread-cap-bps 4.0 \
         --n-trials 24 --eval-split val
 
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
-        --search-mode grid --vary k_alpha weights --anchor-s-min-bps 0.25 \
+        --search-mode grid --vary vol_width_scale weights --anchor-base-half-spread-bps 0.25 \
         --anchor-spread-floor-bps 0.25 --anchor-spread-cap-bps 4.0 --eval-split val
 
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
-        --search-mode one-factor --vary k_alpha spread_cap_bps weights --anchor-s-min-bps 0.25 \
-        --anchor-k-alpha 1.5 --anchor-spread-floor-bps 0.25 --anchor-spread-cap-bps 4.0 \
+        --search-mode one-factor --vary alpha_center_scale spread_cap_bps weights --anchor-base-half-spread-bps 0.25 \
+        --anchor-alpha-center-scale 1.5 --anchor-spread-floor-bps 0.25 --anchor-spread-cap-bps 4.0 \
         --anchor-weight-preset blend_235 --eval-split val
 
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
         --search-mode one-factor --vary obs_spread_anchor_frac --anchor-obs-spread-anchor-frac 0.5 --eval-split val
 
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
-        --search-mode grid --vary k_alpha obs_spread_anchor_frac --eval-split val
+        --search-mode grid --vary vol_width_scale obs_spread_anchor_frac --eval-split val
 """
 
 from __future__ import annotations
@@ -41,16 +41,22 @@ import numpy as np
 
 import RL_exec
 
-REMOVED_BASELINE_KNOBS = ("k_sigma", "vol_horizon_ms")
+REMOVED_BASELINE_KNOBS = ("k_sigma", "vol_horizon_ms", "s_min_bps", "k_alpha", "k_inv")
 REMOVED_BASELINE_ENV_VARS = {
     "k_sigma": "BYBIT_MM_K_SIGMA",
     "vol_horizon_ms": "BYBIT_MM_VOL_HORIZON_MS",
+    "s_min_bps": "BYBIT_MM_S_MIN_BPS",
+    "k_alpha": "BYBIT_MM_K_ALPHA",
+    "k_inv": "BYBIT_MM_K_INV",
 }
 
 BASELINE_PARAM_ENV_MAP = {
-    "s_min_bps": "BYBIT_MM_S_MIN_BPS",
-    "k_inv": "BYBIT_MM_K_INV",
-    "k_alpha": "BYBIT_MM_K_ALPHA",
+    "base_half_spread_bps": "BYBIT_MM_BASE_HALF_SPREAD_BPS",
+    "alpha_center_scale": "BYBIT_MM_ALPHA_CENTER_SCALE",
+    "inventory_center_scale": "BYBIT_MM_INVENTORY_CENTER_SCALE",
+    "vol_width_scale": "BYBIT_MM_VOL_WIDTH_SCALE",
+    "uncertainty_width_scale": "BYBIT_MM_UNCERTAINTY_WIDTH_SCALE",
+    "inventory_side_widen_scale": "BYBIT_MM_INVENTORY_SIDE_WIDEN_SCALE",
     "obs_spread_anchor_frac": "BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC",
     "spread_floor_bps": "BYBIT_MM_SPREAD_FLOOR_BPS",
     "spread_cap_bps": "BYBIT_MM_SPREAD_CAP_BPS",
@@ -61,19 +67,22 @@ BASELINE_PARAM_ENV_MAP = {
 }
 
 DEFAULT_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
-    "s_min_bps": [0.0, 0.25, 0.5],
-    "k_alpha": [0.5, 1.0, 1.5, 2.0, 3.0],
+    "base_half_spread_bps": [0.0, 0.25, 0.5, 1.0],
+    "alpha_center_scale": [0.5, 1.0, 1.5, 2.0],
+    "inventory_center_scale": [0.0, 0.5, 1.0, 2.0],
+    "vol_width_scale": [0.25, 0.5, 1.0, 1.5, 2.0],
+    "uncertainty_width_scale": [0.0, 0.25, 0.5, 1.0],
+    "inventory_side_widen_scale": [0.0, 0.5, 1.0, 2.0],
     "obs_spread_anchor_frac": [0.5, 0.25, 0.1, 0.0],
     "spread_floor_bps": [0.0, 0.25, 0.5],
-    "spread_cap_bps": [6.0, 8.0, 10.0],
+    "spread_cap_bps": [4.0, 6.0, 8.0, 10.0],
     "weights": [
         (0.0, 0.0, 1.0),
         (0.2, 0.3, 0.5),
         (0.3, 0.4, 0.3),
         (1.0, 0.0, 0.0),
     ],
-    "k_inv": [0.0],
-    "inv_ref_notional": [1.0],
+    "inv_ref_notional": [1.0, 2.0, 5.0],
 }
 
 WEIGHT_PRESETS = {
@@ -84,13 +93,16 @@ WEIGHT_PRESETS = {
 }
 
 TUNABLE_FACTORS = [
-    "s_min_bps",
-    "k_alpha",
+    "base_half_spread_bps",
+    "alpha_center_scale",
+    "inventory_center_scale",
+    "vol_width_scale",
+    "uncertainty_width_scale",
+    "inventory_side_widen_scale",
     "obs_spread_anchor_frac",
     "spread_floor_bps",
     "spread_cap_bps",
     "weights",
-    "k_inv",
     "inv_ref_notional",
 ]
 
@@ -110,9 +122,12 @@ RESULT_COLUMNS = [
     "grid_index",
     "factor_name",
     "factor_value_label",
-    "s_min_bps",
-    "k_inv",
-    "k_alpha",
+    "base_half_spread_bps",
+    "alpha_center_scale",
+    "inventory_center_scale",
+    "vol_width_scale",
+    "uncertainty_width_scale",
+    "inventory_side_widen_scale",
     "obs_spread_anchor_frac",
     "spread_floor_bps",
     "spread_cap_bps",
@@ -141,14 +156,23 @@ RESULT_COLUMNS = [
 ]
 
 SCALAR_ANCHOR_ARGS = {
-    "s_min_bps": "anchor_s_min_bps",
-    "k_inv": "anchor_k_inv",
-    "k_alpha": "anchor_k_alpha",
+    "base_half_spread_bps": "anchor_base_half_spread_bps",
+    "alpha_center_scale": "anchor_alpha_center_scale",
+    "inventory_center_scale": "anchor_inventory_center_scale",
+    "vol_width_scale": "anchor_vol_width_scale",
+    "uncertainty_width_scale": "anchor_uncertainty_width_scale",
+    "inventory_side_widen_scale": "anchor_inventory_side_widen_scale",
     "obs_spread_anchor_frac": "anchor_obs_spread_anchor_frac",
     "spread_floor_bps": "anchor_spread_floor_bps",
     "spread_cap_bps": "anchor_spread_cap_bps",
     "inv_ref_notional": "anchor_inv_ref_notional",
 }
+REMOVED_BASELINE_CLI_OPTIONS = (
+    "--anchor-s-min-bps",
+    "--anchor-k-alpha",
+    "--anchor-k-inv",
+)
+
 WEIGHT_COMPONENT_KEYS = ("p250_weight", "p500_weight", "p1000_weight")
 WEIGHT_ARG_KEYS = {
     "p250_weight": "anchor_p250_weight",
@@ -163,7 +187,7 @@ _WORKER_USE_NUMBA: Optional[bool] = None
 
 
 def _raise_on_stale_deleted_knobs(payload: Any, *, context: str) -> None:
-    stale_tokens = set(REMOVED_BASELINE_KNOBS) | set(REMOVED_BASELINE_ENV_VARS.values())
+    stale_tokens = set(REMOVED_BASELINE_KNOBS) | set(REMOVED_BASELINE_ENV_VARS.values()) | set(REMOVED_BASELINE_CLI_OPTIONS)
 
     def _walk(value: Any, path: str) -> None:
         if isinstance(value, dict):
@@ -204,17 +228,37 @@ def validate_baseline_config(config: Dict[str, Any], *, tol: float = 1e-6) -> No
             "Baseline horizon weights must sum to 1.0 within tolerance; "
             f"got {weight_sum:.12f} for {config}"
         )
-    obs_spread_anchor_frac = float(config["obs_spread_anchor_frac"])
-    if not math.isfinite(obs_spread_anchor_frac) or obs_spread_anchor_frac < 0.0:
-        raise ValueError("obs_spread_anchor_frac must be finite and >= 0.0")
+    nonnegative_keys = (
+        "base_half_spread_bps",
+        "vol_width_scale",
+        "uncertainty_width_scale",
+        "inventory_side_widen_scale",
+        "obs_spread_anchor_frac",
+        "spread_floor_bps",
+    )
+    for key in nonnegative_keys:
+        value = float(config[key])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{key} must be finite and >= 0.0")
+    for key in ("alpha_center_scale", "inventory_center_scale", "spread_cap_bps"):
+        value = float(config[key])
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite")
+    if float(config["spread_cap_bps"]) < float(config["spread_floor_bps"]):
+        raise ValueError("spread_cap_bps must be >= spread_floor_bps")
+    if float(config["inv_ref_notional"]) <= 0.0 or not math.isfinite(float(config["inv_ref_notional"])):
+        raise ValueError("inv_ref_notional must be finite and > 0.0")
 
 
 def build_default_anchor_config() -> Dict[str, Any]:
     weights = DEFAULT_SEARCH_SPACE["weights"][0]
     config = {
-        "s_min_bps": float(DEFAULT_SEARCH_SPACE["s_min_bps"][0]),
-        "k_inv": float(DEFAULT_SEARCH_SPACE["k_inv"][0]),
-        "k_alpha": float(DEFAULT_SEARCH_SPACE["k_alpha"][0]),
+        "base_half_spread_bps": float(DEFAULT_SEARCH_SPACE["base_half_spread_bps"][0]),
+        "alpha_center_scale": float(DEFAULT_SEARCH_SPACE["alpha_center_scale"][0]),
+        "inventory_center_scale": float(DEFAULT_SEARCH_SPACE["inventory_center_scale"][0]),
+        "vol_width_scale": float(DEFAULT_SEARCH_SPACE["vol_width_scale"][0]),
+        "uncertainty_width_scale": float(DEFAULT_SEARCH_SPACE["uncertainty_width_scale"][0]),
+        "inventory_side_widen_scale": float(DEFAULT_SEARCH_SPACE["inventory_side_widen_scale"][0]),
         "obs_spread_anchor_frac": float(DEFAULT_SEARCH_SPACE["obs_spread_anchor_frac"][0]),
         "spread_floor_bps": float(DEFAULT_SEARCH_SPACE["spread_floor_bps"][0]),
         "spread_cap_bps": float(DEFAULT_SEARCH_SPACE["spread_cap_bps"][0]),
@@ -307,8 +351,8 @@ def factor_value_equals_anchor(anchor_config: Dict[str, Any], factor: str, candi
 
 def factor_value_label(factor: str, value: Any) -> str:
     if factor == "weights":
-        return f"weights={tuple(float(v) for v in value)}"
-    return f"{factor}={value}"
+        return "weights=" + json.dumps([float(v) for v in value])
+    return f"{factor}={float(value):g}"
 
 
 def diff_config_vs_anchor(config: Dict[str, Any], anchor_config: Dict[str, Any]) -> List[str]:
@@ -502,6 +546,7 @@ def append_row_csv(path: Path, row: Dict[str, Any]) -> None:
 
 
 def append_row_jsonl(path: Path, row: Dict[str, Any]) -> None:
+    _raise_on_stale_deleted_knobs(row, context="serialized results row")
     with path.open("a") as handle:
         handle.write(json.dumps(row, sort_keys=True, default=str))
         handle.write("\n")
@@ -752,9 +797,11 @@ def print_leaderboard(rows: List[Dict[str, Any]], *, top_k: int, label: str) -> 
             f"  #{idx} mode={row.get('search_mode')}{factor_text} score={row.get('score'):.6f} "
             f"split={row.get('baseline_eval_split')} pnl={row.get('net_pnl_pct')} sharpe={row.get('sharpe_1h')} "
             f"dd={row.get('max_dd')} fill_rate={row.get('maker_fill_rate')} fills={row.get('maker_fill_count')} "
-            f"params={{s_min_bps={row.get('s_min_bps')}, "
-            f"k_alpha={row.get('k_alpha')}, obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_floor_bps={row.get('spread_floor_bps')}, "
-            f"spread_cap_bps={row.get('spread_cap_bps')}, "
+            f"params={{base_half_spread_bps={row.get('base_half_spread_bps')}, alpha_center_scale={row.get('alpha_center_scale')}, "
+            f"inventory_center_scale={row.get('inventory_center_scale')}, vol_width_scale={row.get('vol_width_scale')}, "
+            f"uncertainty_width_scale={row.get('uncertainty_width_scale')}, inventory_side_widen_scale={row.get('inventory_side_widen_scale')}, "
+            f"obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_floor_bps={row.get('spread_floor_bps')}, "
+            f"spread_cap_bps={row.get('spread_cap_bps')}, inv_ref_notional={row.get('inv_ref_notional')}, "
             f"weights=({row.get('p250_weight')}, {row.get('p500_weight')}, {row.get('p1000_weight')})}}"
         )
 
@@ -801,6 +848,7 @@ def build_metadata(
 
 
 def write_metadata(path: Path, payload: Dict[str, Any]) -> None:
+    _raise_on_stale_deleted_knobs(payload, context="serialized metadata payload")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -813,6 +861,11 @@ def parse_args() -> argparse.Namespace:
             if option == deleted_opt:
                 raise SystemExit(
                     f"{deleted_opt} has been removed from baseline_sweep.py; delete stale references to {knob}."
+                )
+        for deleted_opt in REMOVED_BASELINE_CLI_OPTIONS:
+            if option == deleted_opt:
+                raise SystemExit(
+                    f"{deleted_opt} has been removed from baseline_sweep.py; use the renamed anchor baseline quote controls instead."
                 )
 
     parser = argparse.ArgumentParser(description="Baseline-only sweep / structured search for RL_exec.")
@@ -831,9 +884,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-anchor", dest="include_anchor", action="store_true", default=True)
     parser.add_argument("--exclude-anchor", dest="include_anchor", action="store_false")
     parser.add_argument("--max-grid-trials", type=int, default=None)
-    parser.add_argument("--anchor-s-min-bps", type=float, default=None)
-    parser.add_argument("--anchor-k-inv", type=float, default=None)
-    parser.add_argument("--anchor-k-alpha", type=float, default=None)
+    parser.add_argument("--anchor-base-half-spread-bps", type=float, default=None)
+    parser.add_argument("--anchor-alpha-center-scale", type=float, default=None)
+    parser.add_argument("--anchor-inventory-center-scale", type=float, default=None)
+    parser.add_argument("--anchor-vol-width-scale", type=float, default=None)
+    parser.add_argument("--anchor-uncertainty-width-scale", type=float, default=None)
+    parser.add_argument("--anchor-inventory-side-widen-scale", type=float, default=None)
     parser.add_argument("--anchor-obs-spread-anchor-frac", type=float, default=None)
     parser.add_argument("--anchor-spread-floor-bps", type=float, default=None)
     parser.add_argument("--anchor-spread-cap-bps", type=float, default=None)
@@ -954,7 +1010,7 @@ def main() -> None:
             if args.verbose:
                 print(
                     f"[trial {row['trial'] + 1}/{total_trials}] status={row['status']} score={row.get('score')} "
-                    f"split={row.get('baseline_eval_split')} config={{s_min_bps={row.get('s_min_bps')}, k_alpha={row.get('k_alpha')}, obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_cap_bps={row.get('spread_cap_bps')}}}"
+                    f"split={row.get('baseline_eval_split')} config={{base_half_spread_bps={row.get('base_half_spread_bps')}, alpha_center_scale={row.get('alpha_center_scale')}, vol_width_scale={row.get('vol_width_scale')}, obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_cap_bps={row.get('spread_cap_bps')}}}"
                 )
     finally:
         if args.workers > 1:
@@ -971,6 +1027,7 @@ def main() -> None:
             BASELINE_PARAM_ENV_MAP[key]: str(best[key])
             for key in BASELINE_PARAM_ENV_MAP
         }
+        _raise_on_stale_deleted_knobs(best_env, context="best config env payload")
         print("[best config env]", json.dumps(best_env, sort_keys=True))
 
     if args.retest_topk_on_test:
