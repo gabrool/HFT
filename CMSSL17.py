@@ -481,7 +481,6 @@ PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
 PRIMARY_METRIC = "masked_auc_1000ms"  # options: "masked_auc_<horizon>ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
-PRIMARY_METRIC_AUC_WEIGHT = 1.0
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
 # These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
@@ -2503,8 +2502,6 @@ def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
 
 def compute_primary_metric(
     val_auc_masked_per_h: Iterable[float],
-    val_ret_loss_masked_per_h: Optional[Iterable[float]] = None,
-    val_vol_loss_masked_per_h: Optional[Iterable[float]] = None,
 ) -> Tuple[float, str]:
     if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
         raise ValueError(
