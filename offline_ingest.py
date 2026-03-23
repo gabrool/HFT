@@ -1391,6 +1391,22 @@ def _build_week_index(pairs: List[WeekPair]):
     return index
 
 
+def _print_coarse_timing_totals(prefix: str, totals: Dict[str, float]) -> None:
+    ordered = [
+        ("wall_s", "wall"),
+        ("queue_wait_s", "queue_wait"),
+        ("event_proc_s", "event_proc"),
+        ("router_housekeeping_s", "router_housekeeping"),
+    ]
+    parts = []
+    for key, label in ordered:
+        if key in totals:
+            parts.append(f"{label}={float(totals[key]):.6f}s")
+    if not parts:
+        return
+    print(f"{prefix} {' '.join(parts)}", flush=True)
+
+
 
 
 def _iter_week_merged_events(
@@ -1399,6 +1415,7 @@ def _iter_week_merged_events(
     th_paths: List[str],
     week_quality: Optional[WeekQuality] = None,
 ):
+    """Yield compact ingest tuples for a full week in timestamp order."""
     ob_list = list(ob_paths)
     th_list = list(th_paths)
 
@@ -1598,6 +1615,8 @@ class EventFeeder:
                     )
                 self._last_first_ts = ts_first
 
+                # Forward the compact tuple unchanged so both PCA and main ingest
+                # can use FeatureEngine.on_fast_event(...).
                 self._put(("first", wk, first_event))
                 for event in merged:
                     self._put(("evt", wk, event))
@@ -1620,6 +1639,9 @@ def _stream_core_features(pairs: List[WeekPair]):
     sample_count = 0
     last_log = time.monotonic()
     last_wk = None
+    stream_started = time.monotonic()
+    queue_wait_s = 0.0
+    event_proc_s = 0.0
 
     feeder = EventFeeder(pairs, collect_quality=False)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
@@ -1629,7 +1651,9 @@ def _stream_core_features(pairs: List[WeekPair]):
     last_global_ts: Optional[int] = None
     try:
         while True:
+            t_q = time.monotonic()
             kind, wk, payload = q.get()
+            queue_wait_s += time.monotonic() - t_q
 
             if kind == "first":
                 if wk is None:
@@ -1654,7 +1678,9 @@ def _stream_core_features(pairs: List[WeekPair]):
             if event is None:
                 continue
 
+            t_evt = time.monotonic()
             ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_fast_event(event)
+            event_proc_s += time.monotonic() - t_evt
             if last_global_ts is not None and ts_ms < last_global_ts:
                 raise ValueError(
                     "Non-monotonic timestamps across weeks during PCA stream: "
@@ -1671,6 +1697,15 @@ def _stream_core_features(pairs: List[WeekPair]):
             yield np.asarray(feat_z, dtype=np.float32)
     finally:
         producer_thread.join()
+        _print_coarse_timing_totals(
+            "[pca-time]",
+            {
+                "wall_s": time.monotonic() - stream_started,
+                "queue_wait_s": queue_wait_s,
+                "event_proc_s": event_proc_s,
+            },
+        )
+        fe.print_timer_totals(prefix="[pca-timers]")
 
 
 def _select_pca_components(sample_rows: np.ndarray, target_var: float) -> int:
@@ -1940,6 +1975,10 @@ def process_all(
         f"[start] ingest weeks={len(pairs)} L={LOOKBACK} budget={RAM_BUDGET}MB"
     )
     last_log = time.monotonic()
+    ingest_started = time.monotonic()
+    queue_wait_s = 0.0
+    event_proc_s = 0.0
+    router_housekeeping_s = 0.0
 
     last_global_ts: Optional[int] = None
 
@@ -1952,7 +1991,9 @@ def process_all(
     week_counter = 0
 
     while True:
+        t_q = time.monotonic()
         kind, wk, payload = q.get()
+        queue_wait_s += time.monotonic() - t_q
 
         if kind == "first":
             if wk is None:
@@ -1984,7 +2025,9 @@ def process_all(
         if event is None:
             continue
 
+        t_evt = time.monotonic()
         ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_fast_event(event)
+        event_proc_s += time.monotonic() - t_evt
 
         if not is_trade:
             feat_core = feat_z
@@ -2063,8 +2106,10 @@ def process_all(
 
         last_global_ts = int(ts_ms)
 
+        t_router = time.monotonic()
         if router is not None:
             router.close_old_writers(int(ts_ms))
+        router_housekeeping_s += time.monotonic() - t_router
         
         if time.monotonic() - last_log >= 300:
             print(f"[tok  ] seq={total_sequences} weeks={week_counter}/{week_total} "
@@ -2206,6 +2251,15 @@ def process_all(
         f"[pca  ] summary applied={pca_summary['applied']} "
         f"var_kept={pca_summary['var_kept']:.4f} k={pca_summary['k']} "
         f"model={pca_summary['model_path']}"
+    )
+    _print_coarse_timing_totals(
+        "[ingest-time]",
+        {
+            "wall_s": time.monotonic() - ingest_started,
+            "queue_wait_s": queue_wait_s,
+            "event_proc_s": event_proc_s,
+            "router_housekeeping_s": router_housekeeping_s,
+        },
     )
     fe.print_timer_totals(prefix="[timers]")
 
