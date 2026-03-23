@@ -374,25 +374,55 @@ def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, stri
         yield event
 
 
-def build_sequence_from_tokens(tokens: deque, lookback: int) -> np.ndarray:
-    """Local sequence builder used by ingest; intentionally not imported from CMSSL17."""
-    """
-    Build a fixed-length [L, F] sequence from a deque of tokens (each 1D np.array of size F).
-    - If len(tokens) >= L: trim older (deque already keeps last L if maxlen=L).
-    - If len(tokens) <  L: left-pad by repeating the earliest token.
-      Important: set aux Δt for pads to 0 so padding doesn't distort time/CPC.
-    """
-    assert len(tokens) >= 1
-    if len(tokens) >= lookback:
-        return np.stack(list(tokens), axis=0)
+class TokenRingBuffer:
+    def __init__(self, lookback: int, feature_dim: int):
+        self.lookback = int(lookback)
+        self.feature_dim = int(feature_dim)
+        self.tokens = np.empty((self.lookback, self.feature_dim), dtype=np.float32)
+        self.cursor = 0
+        self.count = 0
 
-    pad_n = lookback - len(tokens)
-    first = tokens[0].copy()
-    # Last channels are [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms].
-    first[-AUX_DIM:] = 0.0
-    pad_block = np.repeat(first[None, :], pad_n, axis=0)
-    arr = np.stack(list(tokens), axis=0)
-    return np.concatenate([pad_block, arr], axis=0)
+    def append(self, token: np.ndarray) -> None:
+        self.tokens[self.cursor] = token
+        self.cursor = (self.cursor + 1) % self.lookback
+        self.count = min(self.count + 1, self.lookback)
+
+    def overwrite_latest(self, token: np.ndarray) -> None:
+        if self.count <= 0:
+            raise RuntimeError("Cannot overwrite latest token in an empty ring buffer")
+        latest_idx = (self.cursor - 1) % self.lookback
+        self.tokens[latest_idx] = token
+
+    def snapshot(self, ts_decision_ms: int) -> "TokenBufferSnapshot":
+        if self.count <= 0:
+            raise RuntimeError("Cannot snapshot an empty token ring buffer")
+        return TokenBufferSnapshot(
+            ts_decision_ms=int(ts_decision_ms),
+            source=self,
+            cursor=int(self.cursor),
+            count=int(self.count),
+        )
+
+
+@dataclass
+class TokenBufferSnapshot:
+    ts_decision_ms: int
+    source: TokenRingBuffer
+    cursor: int
+    count: int
+
+    def refresh(self, ts_decision_ms: int) -> None:
+        self.ts_decision_ms = int(ts_decision_ms)
+        self.cursor = int(self.source.cursor)
+        self.count = int(self.source.count)
+
+    @property
+    def lookback(self) -> int:
+        return self.source.lookback
+
+    @property
+    def feature_dim(self) -> int:
+        return self.source.feature_dim
 
 
 def _parse_requested_weeks(raw: str) -> List[str]:
@@ -977,13 +1007,43 @@ class ChunkWriter:
         self.cid = 0
         self.chunks_meta = []
 
-    def add(self, ts_decision_ms: int, seq: np.ndarray, y: np.ndarray):
-        core = seq[:, :self.F_core]
-        aux  = seq[:, self.F_core:]
-        self.X_core[self.i] = core
-        self.X_aux[self.i]  = aux
-        self.Y[self.i]      = y
-        self.TS[self.i]     = ts_decision_ms
+    def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, y: np.ndarray):
+        if token_buffer.feature_dim != self.F:
+            raise ValueError(
+                f"Token buffer feature_dim={token_buffer.feature_dim} does not match writer feature_dim={self.F}"
+            )
+        if token_buffer.lookback != self.L:
+            raise ValueError(
+                f"Token buffer lookback={token_buffer.lookback} does not match writer lookback={self.L}"
+            )
+        if token_buffer.count <= 0:
+            raise RuntimeError("Cannot add sequence from empty token buffer snapshot")
+
+        row_core = self.X_core[self.i]
+        row_aux = self.X_aux[self.i]
+        pad_n = self.L - token_buffer.count
+        if pad_n > 0:
+            earliest_idx = (token_buffer.cursor - token_buffer.count) % self.L
+            earliest = token_buffer.source.tokens[earliest_idx]
+            row_core[:pad_n] = earliest[:self.F_core]
+            row_aux[:pad_n] = earliest[self.F_core:]
+            row_aux[:pad_n, :] = 0.0
+
+        dest_start = pad_n
+        src_start = (token_buffer.cursor - token_buffer.count) % self.L
+        first_block = min(token_buffer.count, self.L - src_start)
+        second_block = token_buffer.count - first_block
+
+        src = token_buffer.source.tokens
+        row_core[dest_start : dest_start + first_block] = src[src_start : src_start + first_block, : self.F_core]
+        row_aux[dest_start : dest_start + first_block] = src[src_start : src_start + first_block, self.F_core :]
+        if second_block > 0:
+            mid = dest_start + first_block
+            row_core[mid : mid + second_block] = src[:second_block, : self.F_core]
+            row_aux[mid : mid + second_block] = src[:second_block, self.F_core :]
+
+        self.Y[self.i] = y
+        self.TS[self.i] = ts_decision_ms
         self.i += 1
         if self.i >= self.N:
             self.flush()
@@ -1080,10 +1140,10 @@ class WeekWriterRouter:
         raise ValueError(f"No week found for decision timestamp {ts_ms}")
 
 
-    def add(self, ts_decision_ms: int, seq: np.ndarray, label: np.ndarray):
+    def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, label: np.ndarray):
         wk = self._find_week_key(ts_decision_ms)
         writer = self._ensure_writer(wk)
-        writer.add(ts_decision_ms, seq, label)
+        writer.add_from_token_buffer(ts_decision_ms, token_buffer, label)
         self.week_counts[wk] += 1
         if wk not in self.week_decision_span:
             self.week_decision_span[wk] = [ts_decision_ms, ts_decision_ms]
@@ -1732,8 +1792,8 @@ def process_all(
     # Entry references use decision_ts directly (no sub-grid delay).
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
 
-    tokens_buf: deque = deque(maxlen=LOOKBACK)
-    pending_seqs: deque = deque()
+    token_buffer: Optional[TokenRingBuffer] = None
+    pending_decisions: deque[TokenBufferSnapshot] = deque()
     last_grid_ts: Optional[int] = None
     last_tick_dt_ms: Optional[int] = None
 
@@ -1819,6 +1879,7 @@ def process_all(
                 tok = build_token(fe, feat_core, is_trade, dt_tick)
                 if F is None:
                     F = tok.shape[0]
+                    token_buffer = TokenRingBuffer(LOOKBACK, F)
                     router = WeekWriterRouter(
                         out_root,
                         LOOKBACK,
@@ -1828,10 +1889,10 @@ def process_all(
                         week_index,
                         pca_meta=pca_summary,
                     )
-                tokens_buf.append(tok)
-
-                seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
-                pending_seqs.append((grid_ts, seq.astype(np.float32, copy=False)))
+                if token_buffer is None:
+                    raise RuntimeError("Token ring buffer was not initialised")
+                token_buffer.append(tok)
+                pending_decisions.append(token_buffer.snapshot(grid_ts))
                 # Decision frontier must advance only on a new decision-time tick.
                 labeler.on_decision(grid_ts)
                 # register decision at tick first, then advance/update tick price.
@@ -1839,18 +1900,15 @@ def process_all(
                 last_grid_ts = grid_ts
                 last_tick_dt_ms = int(dt_tick)
             elif is_collision:
-                if not pending_seqs:
+                if not pending_decisions:
                     raise RuntimeError("Grid collision observed but no pending sequence to overwrite")
                 if last_tick_dt_ms is None:
                     raise RuntimeError("Grid collision observed without last_tick_dt_ms state")
                 tok = build_token(fe, feat_core, is_trade, int(last_tick_dt_ms))
-                if not tokens_buf:
-                    raise RuntimeError("Grid collision observed but token buffer is empty")
-                tokens_buf[-1] = tok
-
-                seq = build_sequence_from_tokens(tokens_buf, LOOKBACK)
-                # Collision updates the current decision token/sequence in place.
-                pending_seqs[-1] = (grid_ts, seq.astype(np.float32, copy=False))
+                if token_buffer is None:
+                    raise RuntimeError("Grid collision observed but token ring buffer is empty")
+                token_buffer.overwrite_latest(tok)
+                pending_decisions[-1].refresh(grid_ts)
                 matured = labeler.on_event(grid_ts, float(mid))
             else:
                 raise RuntimeError(
@@ -1860,14 +1918,18 @@ def process_all(
             if matured is None:
                 raise RuntimeError("Matured labels were not produced for OB event")
             for yy in matured:
-                if not pending_seqs:
+                if not pending_decisions:
                     raise RuntimeError(
                         "Matured label available but no pending sequences to pair"
                     )
                 if router is None:
                     raise RuntimeError("Router not initialised before label maturity")
-                ts_ready, seq_ready = pending_seqs.popleft()
-                router.add(ts_ready, seq_ready, yy.astype(np.float32, copy=False))
+                snapshot = pending_decisions.popleft()
+                router.add_from_token_buffer(
+                    snapshot.ts_decision_ms,
+                    snapshot,
+                    yy.astype(np.float32, copy=False),
+                )
                 total_sequences += 1
 
         last_global_ts = int(ts_ms)
