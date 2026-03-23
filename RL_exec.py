@@ -972,6 +972,33 @@ def build_vol_bucket_report(
     }
 
 
+def _baseline_alpha_calibration_from_meta(meta: Dict[str, Any]) -> BaselineAlphaCalibration:
+    raw = meta.get("baseline_alpha_calibration")
+    if not isinstance(raw, dict):
+        raise ValueError("meta missing baseline_alpha_calibration; run prepare_baseline_context first")
+    required_keys = (
+        "horizons_ms",
+        "score_to_bps_slope_by_horizon",
+        "winsor_lower_bps_by_horizon",
+        "winsor_upper_bps_by_horizon",
+        "fit_count_by_horizon",
+        "diagnostics",
+    )
+    missing = [key for key in required_keys if key not in raw]
+    if missing:
+        raise ValueError(
+            "meta baseline_alpha_calibration missing keys: " + ", ".join(sorted(missing))
+        )
+    return BaselineAlphaCalibration(
+        score_to_bps_slope_by_horizon=np.asarray(raw["score_to_bps_slope_by_horizon"], dtype=np.float64),
+        winsor_lower_bps_by_horizon=np.asarray(raw["winsor_lower_bps_by_horizon"], dtype=np.float64),
+        winsor_upper_bps_by_horizon=np.asarray(raw["winsor_upper_bps_by_horizon"], dtype=np.float64),
+        fit_count_by_horizon=np.asarray(raw["fit_count_by_horizon"], dtype=np.int64),
+        horizons_ms=np.asarray(raw["horizons_ms"], dtype=np.int64),
+        diagnostics=dict(raw["diagnostics"]),
+    )
+
+
 @contextmanager
 def temporary_baseline_quote_env_from_config(
     config: Optional[BaselineQuoteConfig | Dict[str, Any]],
@@ -1800,6 +1827,7 @@ class MarketMakingEnv:
         initial_cash: Optional[float] = None,
         obs_norm_state: Optional[dict] = None,
         freeze_obs_norm: bool = False,
+        baseline_alpha_calibration: Optional[BaselineAlphaCalibration] = None,
     ):
         self.features = batch.features
         self.spread_bps = batch.spread_bps
@@ -1923,10 +1951,18 @@ class MarketMakingEnv:
             f"p500_idx={self._p500_idx}",
             f"p1000_idx={self._p1000_idx}",
         )
-        self._baseline_alpha_calibration = self._fit_batch_baseline_alpha_calibration(batch)
-        self._score_to_bps_slope_250 = float(self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p250_idx])
-        self._score_to_bps_slope_500 = float(self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p500_idx])
-        self._score_to_bps_slope_1000 = float(self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p1000_idx])
+        self._baseline_alpha_calibration = baseline_alpha_calibration
+        if self._baseline_alpha_calibration is None:
+            raise ValueError("baseline_alpha_calibration must be provided")
+        self._score_to_bps_slope_250 = float(
+            self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p250_idx]
+        )
+        self._score_to_bps_slope_500 = float(
+            self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p500_idx]
+        )
+        self._score_to_bps_slope_1000 = float(
+            self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p1000_idx]
+        )
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
 
@@ -2221,39 +2257,6 @@ class MarketMakingEnv:
         uncertainty_ref_bps = sigma_bps + 1e4 * disagreement
         half_spread_bps = obs_anchor_bps + cfg.vol_width_scale * sigma_bps + cfg.uncertainty_width_scale * uncertainty_ref_bps
         return float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
-
-    def _fit_batch_baseline_alpha_calibration(self, batch: MarketMakingBatch) -> BaselineAlphaCalibration:
-        if batch.future_ret_by_horizon is None:
-            zeros = np.zeros(self._num_h, dtype=np.float64)
-            return BaselineAlphaCalibration(
-                score_to_bps_slope_by_horizon=zeros,
-                winsor_lower_bps_by_horizon=zeros.copy(),
-                winsor_upper_bps_by_horizon=zeros.copy(),
-                fit_count_by_horizon=np.zeros(self._num_h, dtype=np.int64),
-                horizons_ms=np.asarray(self._horizons_ms, dtype=np.int64),
-                diagnostics={"fit_split": "env_missing_targets"},
-            )
-        prepared_batch = prepare_fast_baseline_batch(
-            batch,
-            {"horizons_ms": self._horizons_ms},
-            env_kwargs_common={
-                "initial_cash": self.initial_cash,
-                "fill_size": self.fill_size,
-                "maker_rebate_bps": self.maker_rebate_bps,
-                "taker_fee_bps": self.taker_fee_bps,
-                "fill_tolerance": self.fill_tolerance,
-                "delta_bps_limit": self.delta_bps_limit,
-                "inventory_penalty": self.inventory_penalty,
-                "inv_soft_notional": self.inv_soft_notional,
-                "lambda_inv": self.lambda_inv,
-                "lambda_turn": self.lambda_turn,
-                "max_inventory_notional": self.max_inventory_notional,
-                "hard_max_inventory_notional": self.hard_max_inventory_notional,
-                "fill_ema_alpha": self.fill_ema_alpha,
-            },
-            split_name="env",
-        )
-        return _fit_baseline_alpha_calibration(prepared_batch, self._horizons_ms)
 
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         cfg = self._baseline_cfg
@@ -4648,7 +4651,7 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
     batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
     with temporary_baseline_quote_env_from_config(quote_cfg):
         env_metrics = evaluate_market_making(
-            build_baseline_eval_env(batch, context.env_kwargs_common),
+            build_baseline_eval_env(batch, context.env_kwargs_common, context.baseline_alpha_calibration),
             lambda _obs: (0.0, 0.0, 0.0),
             collect_vol_bucket_report=True,
             baseline_cfg=quote_cfg,
@@ -4670,10 +4673,11 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
 def build_baseline_eval_env(
     batch: MarketMakingBatch,
     env_kwargs_common: Dict[str, Any],
+    baseline_alpha_calibration: BaselineAlphaCalibration,
 ) -> MarketMakingEnv:
     # The cached baseline path evaluates a fixed zero-action policy, so
     # observation-normalization prefit/freeze does not affect actions or fills.
-    return MarketMakingEnv(batch, allow_taker=False, **env_kwargs_common)
+    return MarketMakingEnv(batch, allow_taker=False, baseline_alpha_calibration=baseline_alpha_calibration, **env_kwargs_common)
 
 
 def prepare_baseline_context(
@@ -4797,7 +4801,7 @@ def evaluate_prepared_baseline(
     else:
         # The generic env path still resolves quote settings from env vars, so install the structured config temporarily.
         with temporary_baseline_quote_env_from_config(quote_cfg):
-            env = build_baseline_eval_env(batch, context.env_kwargs_common)
+            env = build_baseline_eval_env(batch, context.env_kwargs_common, context.baseline_alpha_calibration)
             baseline_metrics = evaluate_market_making(
                 env,
                 lambda _obs: (0.0, 0.0, 0.0),
@@ -4873,6 +4877,7 @@ def run_pipeline(
     mm_val_batch = build_market_batch(splits_rl["val"])
     mm_test_batch = build_market_batch(splits_rl["test"])
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
+    baseline_alpha_calibration = _baseline_alpha_calibration_from_meta(meta)
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "10.0"))
     taker_scale = float(os.environ.get("BYBIT_MM_TAKER_SCALE", "1.0"))
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
@@ -4880,21 +4885,24 @@ def run_pipeline(
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
         allow_taker=allow_taker,
+        baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
     print("[mm obs scaling]", json.dumps(mm_train_env.get_observation_scaling_config(), sort_keys=True))
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
         allow_taker=allow_taker,
+        baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
         allow_taker=allow_taker,
+        baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
-    baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common)
-    baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common)
+    baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common, baseline_alpha_calibration)
+    baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common, baseline_alpha_calibration)
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
     mm_train_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
