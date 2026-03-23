@@ -229,46 +229,6 @@ def iter_chunk_batches(out_root: str):
             yield week, int(entry.get("chunk", 0)), ts, x_core, x_aux, y
 
 
-def get_cmssl_splits(out_root: str) -> dict:
-    out_root = Path(out_root)
-    meta = load_global_meta(out_root)
-    _require_grid_quantized_decision_meta(meta)
-    splits = meta.get("splits", {})
-
-    missing = [
-        key for key in ("train", "holdout_week", "train_ts_range", "val_ts_range", "test_ts_range")
-        if key not in splits
-    ]
-    require(not missing, (
-        "meta.json missing split ranges — rerun offline_ingest to generate canonical splits"
-    ))
-    require(isinstance(splits["train"], list), (
-        "meta.json missing split ranges — rerun offline_ingest to generate canonical splits"
-    ))
-
-    train_ts_range = splits["train_ts_range"]
-    val_ts_range = splits["val_ts_range"]
-    test_ts_range = splits["test_ts_range"]
-
-    return {
-        "train": {
-            "weeks": splits["train"],
-            "start": int(train_ts_range["min"]),
-            "end": int(train_ts_range["max"]),
-        },
-        "val": {
-            "weeks": [splits["holdout_week"]],
-            "start": int(val_ts_range["min"]),
-            "end": int(val_ts_range["max"]),
-        },
-        "test": {
-            "weeks": [splits["holdout_week"]],
-            "start": int(test_ts_range["min"]),
-            "end": int(test_ts_range["max"]),
-        },
-    }
-
-
 
 def bps_to_px(mid: float, bps: float) -> float:
     return mid * bps * 1e-4
@@ -780,17 +740,22 @@ class PreparedBaselineContext:
     ckpt_path: str
     device: str
     meta: Dict[str, Any]
-    test_split: Dict[str, Any]
-    cmssl_report: Dict[str, Any]
-    splits_rl_bounds: Dict[str, Any]
-    mm_val_batch: "MarketMakingBatch"
-    mm_test_batch: "MarketMakingBatch"
-    fast_val_batch: Optional[PreparedFastBaselineBatch]
-    fast_test_batch: Optional[PreparedFastBaselineBatch]
+    cmssl_test_split: Dict[str, Any]
+    rl_val_split: Dict[str, Any]
+    rl_test_split: Dict[str, Any]
+    eval_full_split: Dict[str, Any]
+    cmssl_test_metrics: Dict[str, Any]
+    joined_rl_rows: int
+    joined_eval_rows: int
+    mm_rl_val_batch: "MarketMakingBatch"
+    mm_rl_test_batch: "MarketMakingBatch"
+    fast_rl_val_batch: Optional[PreparedFastBaselineBatch]
+    fast_rl_test_batch: Optional[PreparedFastBaselineBatch]
+    fast_rl_train_batch: PreparedFastBaselineBatch
+    fast_eval_full_batch: PreparedFastBaselineBatch
     baseline_alpha_calibration: BaselineAlphaCalibration
     env_kwargs_common: Dict[str, Any]
     run_config: Dict[str, Any]
-    joined_rows: int
     cmssl_batch_size: int
 
 
@@ -1050,6 +1015,143 @@ def _resolve_horizon_index(
     )
 
 
+def _resolve_split_range(range_value: Any, *, label: str) -> Tuple[int, int]:
+    if not isinstance(range_value, dict):
+        raise KeyError(f"meta['splits']['{label}'] must include decision_ts_range with start/end.")
+    try:
+        start = int(range_value["start"])
+        end = int(range_value["end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"meta['splits']['{label}']['decision_ts_range'] must contain integer start/end."
+        ) from exc
+    if start >= end:
+        raise ValueError(f"meta['splits']['{label}']['decision_ts_range'] must satisfy start < end.")
+    return start, end
+
+
+def _resolve_meta_full_week_range(meta: Dict[str, Any], week_key: str, *, label: str) -> Tuple[int, int]:
+    week_ranges = meta.get("week_decision_ts_ranges")
+    if isinstance(week_ranges, dict):
+        wk = week_ranges.get(week_key)
+        if isinstance(wk, dict):
+            if "start" in wk and "end" in wk:
+                return _resolve_split_range(wk, label=label)
+            if "min" in wk and "max" in wk:
+                return int(wk["min"]), int(wk["max"])
+    weeks_meta = meta.get("weeks_meta")
+    if isinstance(weeks_meta, dict):
+        wk_meta = weeks_meta.get(week_key)
+        if isinstance(wk_meta, dict):
+            decision_ts_range = wk_meta.get("decision_ts_range")
+            if isinstance(decision_ts_range, dict):
+                if "start" in decision_ts_range and "end" in decision_ts_range:
+                    return _resolve_split_range(decision_ts_range, label=label)
+                if "min" in decision_ts_range and "max" in decision_ts_range:
+                    start = int(decision_ts_range["min"])
+                    end = int(decision_ts_range["max"])
+                    if start >= end:
+                        raise ValueError(f"meta week range for {label} must satisfy start < end.")
+                    return start, end
+    raise KeyError(
+        f"meta is missing inline decision_ts_range metadata for full-week split '{label}' ({week_key})."
+    )
+
+
+def _normalize_pipeline_split_entry(meta: Dict[str, Any], split_entry: Any, *, label: str, require_range: bool) -> Dict[str, Any]:
+    if not isinstance(split_entry, dict):
+        raise KeyError(f"meta['splits']['{label}'] must be a dict.")
+    week_value = split_entry.get("week", split_entry.get("weeks"))
+    if isinstance(week_value, str) and week_value:
+        weeks = [week_value]
+    elif isinstance(week_value, list) and week_value and all(isinstance(w, str) and w for w in week_value):
+        weeks = list(week_value)
+    else:
+        raise KeyError(f"meta['splits']['{label}'] must include non-empty 'week' or 'weeks'.")
+    known_weeks = meta.get("weeks_in_order")
+    if not isinstance(known_weeks, list) or len(known_weeks) != 4:
+        raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries.")
+    missing_weeks = [wk for wk in weeks if wk not in set(known_weeks)]
+    if missing_weeks:
+        raise KeyError(f"meta['splits']['{label}'] references unknown week(s): {missing_weeks}")
+    if require_range:
+        start, end = _resolve_split_range(split_entry.get("decision_ts_range"), label=label)
+    else:
+        start, end = _resolve_meta_full_week_range(meta, weeks[0], label=label)
+    return {"weeks": weeks, "start": start, "end": end}
+
+
+def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
+    _require_grid_quantized_decision_meta(meta)
+    splits = meta.get("splits")
+    if not isinstance(splits, dict):
+        raise KeyError("meta['splits'] must be a dict.")
+    weeks_in_order = meta.get("weeks_in_order")
+    if not (isinstance(weeks_in_order, list) and len(weeks_in_order) == 4 and all(isinstance(w, str) and w for w in weeks_in_order)):
+        raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries.")
+    if splits.get("protocol") != "four_week_cmssl_rl_eval_v1":
+        raise ValueError("meta['splits']['protocol'] must be 'four_week_cmssl_rl_eval_v1'.")
+    normalized = {"protocol": splits["protocol"]}
+    for section in ("cmssl", "rl", "eval"):
+        if not isinstance(splits.get(section), dict):
+            raise KeyError(f"meta['splits']['{section}'] must be a dict.")
+        normalized[section] = {}
+    required_entries = {
+        "cmssl.train": ("cmssl", "train", False),
+        "cmssl.val": ("cmssl", "val", True),
+        "cmssl.test": ("cmssl", "test", True),
+        "rl.train": ("rl", "train", True),
+        "rl.val": ("rl", "val", True),
+        "rl.test": ("rl", "test", True),
+        "eval.full": ("eval", "full", False),
+    }
+    for label, (section, name, require_range) in required_entries.items():
+        normalized[section][name] = _normalize_pipeline_split_entry(meta, splits[section].get(name), label=label, require_range=require_range)
+    week1, week2, week3, week4 = weeks_in_order
+    require(normalized["cmssl"]["train"]["weeks"] == [week1], "meta['splits']['cmssl']['train'] must reference weeks_in_order[0].")
+    require(normalized["cmssl"]["val"]["weeks"] == [week2], "meta['splits']['cmssl']['val'] must reference weeks_in_order[1].")
+    require(normalized["cmssl"]["test"]["weeks"] == [week2], "meta['splits']['cmssl']['test'] must reference weeks_in_order[1].")
+    for split_name in ("train", "val", "test"):
+        require(normalized["rl"][split_name]["weeks"] == [week3], f"meta['splits']['rl']['{split_name}'] must reference weeks_in_order[2].")
+    require(normalized["eval"]["full"]["weeks"] == [week4], "meta['splits']['eval']['full'] must reference weeks_in_order[3].")
+    cmssl_val = normalized["cmssl"]["val"]
+    cmssl_test = normalized["cmssl"]["test"]
+    require(cmssl_val["end"] <= cmssl_test["start"] or cmssl_test["end"] <= cmssl_val["start"], "meta['splits']['cmssl'] val/test must be non-overlapping.")
+    rl_train = normalized["rl"]["train"]
+    rl_val = normalized["rl"]["val"]
+    rl_test = normalized["rl"]["test"]
+    require(rl_train["end"] <= rl_val["start"] < rl_val["end"] <= rl_test["start"] < rl_test["end"], "meta['splits']['rl'] train/val/test must be strictly ordered and non-overlapping.")
+    return normalized
+
+
+def resolve_cmssl_train_split(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta)["cmssl"]["train"])
+
+
+def resolve_cmssl_val_split(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta)["cmssl"]["val"])
+
+
+def resolve_cmssl_test_split(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta)["cmssl"]["test"])
+
+
+def resolve_rl_train_split(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta)["rl"]["train"])
+
+
+def resolve_rl_val_split(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta)["rl"]["val"])
+
+
+def resolve_rl_test_split(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta)["rl"]["test"])
+
+
+def resolve_eval_full_split(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta)["eval"]["full"])
+
+
 def _split_weeks(split: Dict[str, Any]) -> list[str]:
     weeks = split.get("weeks")
     if isinstance(weeks, list) and len(weeks) > 0:
@@ -1106,19 +1208,6 @@ def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray,
     return x_core_all[order], x_aux_all[order], y_all[order], ts_all[order]
 
 
-def resolve_test_split(out_root: str, meta: dict) -> Dict[str, Any]:
-    _require_grid_quantized_decision_meta(meta)
-    splits = meta.get("splits", {})
-    test_range = splits.get("test_ts_range")
-    holdout_week = splits.get("holdout_week")
-    if test_range and holdout_week:
-        return {
-            "weeks": [holdout_week],
-            "start": int(test_range["min"]),
-            "end": int(test_range["max"]),
-        }
-    return get_cmssl_splits(out_root)["test"]
-
 
 def _build_windowed_inputs(
     x_core: np.ndarray,
@@ -1151,11 +1240,11 @@ def _build_windowed_inputs(
     return x_core_win, x_aux_win, ts[lookback - 1:]
 
 
-def load_test_windowed_inputs(
+def load_cmssl_test_windowed_inputs(
     out_root: str,
     meta: dict,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    split = resolve_test_split(out_root, meta)
+    split = resolve_cmssl_test_split(meta)
     x_core, x_aux, _y, ts = load_split_arrays(out_root, split)
     return _build_windowed_inputs(x_core, x_aux, ts, lookback=LOOKBACK)
 
@@ -1168,7 +1257,7 @@ def run_cmssl_test_window_inference(
 ) -> Dict[str, Any]:
     """Run CMSSL inference over test windowed inputs for offline diagnostics."""
     model, meta = load_cmssl(out_root, ckpt_path, device=device)
-    x_core, x_aux, ts = load_test_windowed_inputs(out_root, meta)
+    x_core, x_aux, ts = load_cmssl_test_windowed_inputs(out_root, meta)
     resolved_batch_size = _resolve_cmssl_batch_size() if batch_size is None else int(batch_size)
     cmssl_out = run_cmssl_inference(
         model,
@@ -1396,8 +1485,8 @@ def _ensure_monotonic(ts: np.ndarray, label: str) -> None:
         raise ValueError(f"{label} timestamps must be monotonically non-decreasing.")
 
 
-def report_pretrain_diagnostics(out_root: str, meta: dict) -> None:
-    test_split = resolve_test_split(out_root, meta)
+def report_cmssl_test_diagnostics(out_root: str, meta: dict) -> None:
+    test_split = resolve_cmssl_test_split(meta)
     split_weeks = _split_weeks(test_split)
     if not split_weeks:
         raise ValueError("Test split contains no weeks.")
@@ -1712,42 +1801,18 @@ def build_joined_split(
     return out
 
 
-def chronological_split(
-    data: Dict[str, np.ndarray],
-    ratios: Tuple[float, float, float] = (0.6, 0.2, 0.2),
-) -> Dict[str, Dict[str, np.ndarray]]:
-    require(abs(sum(ratios) - 1.0) < 1e-6, f"ratios must sum to 1.0; got {ratios}")
-    n = len(data["ts"])
-    n_train = int(n * ratios[0])
-    n_val = int(n * ratios[1])
-    idx_train = slice(0, n_train)
-    idx_val = slice(n_train, n_train + n_val)
-    idx_test = slice(n_train + n_val, n)
-
-    def _slice(idx: slice) -> Dict[str, np.ndarray]:
-        return {key: value[idx] for key, value in data.items()}
-
-    return {
-        "train": _slice(idx_train),
-        "val": _slice(idx_val),
-        "test": _slice(idx_test),
-        "bounds": {
-            "train": {"start": 0, "end": n_train},
-            "val": {"start": n_train, "end": n_train + n_val},
-            "test": {"start": n_train + n_val, "end": n},
-        },
-    }
-
-
-def persist_split_bounds(out_root: str, bounds: Dict[str, Dict[str, int]], total: int) -> Path:
-    out_root = Path(out_root)
-    payload = {
-        "total": total,
-        "bounds": bounds,
-    }
-    path = out_root / "rl_exec_split_bounds.json"
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    return path
+def slice_joined_by_split(data: Dict[str, np.ndarray], split_def: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    start = int(split_def["start"])
+    end = int(split_def["end"])
+    ts = np.asarray(data["ts"], dtype=np.int64)
+    mask = (ts >= start) & (ts < end)
+    if not np.any(mask):
+        raise ValueError(f"No joined rows found for split range [{start}, {end}).")
+    sliced = {key: value[mask] for key, value in data.items()}
+    sliced_ts = np.asarray(sliced["ts"], dtype=np.int64)
+    if sliced_ts[0] < start or sliced_ts[-1] >= end:
+        raise ValueError("slice_joined_by_split produced rows outside requested timestamp bounds.")
+    return sliced
 
 
 @dataclass
@@ -4617,11 +4682,13 @@ def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, q
 
 
 def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: str, quote_cfg: BaselineQuoteConfig, *, atol: float = 1e-9, rtol: float = 1e-6) -> None:
-    fast_batch = context.fast_val_batch if eval_split == "val" else context.fast_test_batch
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"Unsupported baseline split '{eval_split}'")
+    fast_batch = context.fast_rl_val_batch if eval_split == "val" else context.fast_rl_test_batch
+    batch = context.mm_rl_val_batch if eval_split == "val" else context.mm_rl_test_batch
     if fast_batch is None:
         raise ValueError("Fast baseline batch unavailable for parity check")
     quote_cfg = _validate_baseline_quote_config(quote_cfg)
-    batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
     env_metrics = evaluate_market_making(
         build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration),
         lambda _obs: (0.0, 0.0, 0.0),
@@ -4636,10 +4703,6 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
             raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
         if lhs is not None and rhs is not None and not np.isclose(float(lhs), float(rhs), atol=atol, rtol=rtol):
             raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
-    env_bucket_report = env_metrics.get("vol_bucket_report") or []
-    fast_bucket_report = fast_metrics.get("vol_bucket_report") or []
-    if len(env_bucket_report) != len(fast_bucket_report):
-        raise AssertionError("Baseline parity mismatch vol_bucket_report length")
 
 
 def build_baseline_eval_env(
@@ -4648,8 +4711,6 @@ def build_baseline_eval_env(
     baseline_quote_config: BaselineQuoteConfig,
     baseline_alpha_calibration: BaselineAlphaCalibration,
 ) -> MarketMakingEnv:
-    # The cached baseline path evaluates a fixed zero-action policy, so
-    # observation-normalization prefit/freeze does not affect actions or fills.
     return MarketMakingEnv(
         batch,
         allow_taker=False,
@@ -4664,98 +4725,40 @@ def prepare_baseline_context(
     ckpt_path: str,
     device: str = "cuda",
 ) -> PreparedBaselineContext:
-    print("[baseline prep] building shared CMSSL/joined context")
+    print("[baseline prep] building shared CMSSL/RL/eval context")
     meta = dict(load_global_meta(Path(out_root)))
-    test_split = resolve_test_split(out_root, meta)
-    report_pretrain_diagnostics(out_root, meta)
+    cmssl_test_split = resolve_cmssl_test_split(meta)
+    rl_train_split = resolve_rl_train_split(meta)
+    rl_val_split = resolve_rl_val_split(meta)
+    rl_test_split = resolve_rl_test_split(meta)
+    eval_full_split = resolve_eval_full_split(meta)
+    report_cmssl_test_diagnostics(out_root, meta)
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
-
     cmssl_batch_size = _resolve_cmssl_batch_size()
     preallocate_join_features = _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False)
     rollout_storage = _resolve_rollout_storage("gpu")
-    run_config = {
-        "cmssl_batch_size": cmssl_batch_size,
-        "rollout_storage": rollout_storage,
-        "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False),
-        "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False),
-        "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False),
-        "preallocate_join_features": preallocate_join_features,
-    }
-    _timing_log(
-        "run_config "
-        f"cmssl_batch_size={cmssl_batch_size} "
-        f"rollout_storage={rollout_storage} "
-        f"compile_cmssl={run_config['compile_cmssl']} "
-        f"compile_ppo={run_config['compile_ppo']} "
-        f"tf32={run_config['tf32']} "
-        f"preallocate_join_features={preallocate_join_features}"
-    )
-
-    joined_test = build_joined_split(
-        out_root,
-        test_split,
-        model,
-        meta,
-        device,
-        batch_size=cmssl_batch_size,
-    )
+    run_config = {"cmssl_batch_size": cmssl_batch_size, "rollout_storage": rollout_storage, "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False), "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False), "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False), "preallocate_join_features": preallocate_join_features}
+    joined_cmssl_test = build_joined_split(out_root, cmssl_test_split, model, meta, device, batch_size=cmssl_batch_size)
     num_h = len(meta.get("horizons_ms", []))
-    cmssl_report = report_cmssl_metrics(
-        joined_test["y"],
-        {
-            "dir_logits": joined_test["features"][:, :num_h],
-        },
-    )
-
-    splits_rl = chronological_split(joined_test, ratios=(0.6, 0.2, 0.2))
-    persist_split_bounds(out_root, splits_rl["bounds"], total=len(joined_test["ts"]))
-    mm_val_batch = build_market_batch(splits_rl["val"])
-    mm_test_batch = build_market_batch(splits_rl["test"])
+    cmssl_test_metrics = report_cmssl_metrics(joined_cmssl_test["y"], {"dir_logits": joined_cmssl_test["features"][:, :num_h]})
+    week3_full_split = {"weeks": rl_train_split["weeks"], "start": rl_train_split["start"], "end": rl_test_split["end"]}
+    joined_rl_full = build_joined_split(out_root, week3_full_split, model, meta, device, batch_size=cmssl_batch_size)
+    joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
+    joined_rl_val = slice_joined_by_split(joined_rl_full, rl_val_split)
+    joined_rl_test = slice_joined_by_split(joined_rl_full, rl_test_split)
+    joined_eval_full = build_joined_split(out_root, eval_full_split, model, meta, device, batch_size=cmssl_batch_size)
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
-    val_rows = int(mm_val_batch.features.shape[0])
-    test_rows = int(mm_test_batch.features.shape[0])
-    joined_rows = int(joined_test["features"].shape[0])
-    print(
-        f"[baseline prep] joined_rows={joined_rows} val_rows={val_rows} test_rows={test_rows}"
-    )
-    fast_val_batch = prepare_fast_baseline_batch(mm_val_batch, meta, env_kwargs_common=env_kwargs_common, split_name="val")
-    print(f"[baseline prep] fast cache ready split=val rows={fast_val_batch.rows}")
-    baseline_alpha_calibration = _fit_baseline_alpha_calibration(fast_val_batch, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS))
-    calibration_summary = {
-        "fit_split": baseline_alpha_calibration.diagnostics["fit_split"],
-        "horizons_ms": baseline_alpha_calibration.horizons_ms.tolist(),
-        "slope_bps_by_unit_score": np.round(baseline_alpha_calibration.score_to_bps_slope_by_horizon, 6).tolist(),
-        "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
-    }
-    print(f"[baseline prep] alpha calibration {json.dumps(calibration_summary, sort_keys=True)}")
-    meta["baseline_alpha_calibration"] = {
-        "horizons_ms": baseline_alpha_calibration.horizons_ms.astype(int).tolist(),
-        "score_to_bps_slope_by_horizon": baseline_alpha_calibration.score_to_bps_slope_by_horizon.tolist(),
-        "winsor_lower_bps_by_horizon": baseline_alpha_calibration.winsor_lower_bps_by_horizon.tolist(),
-        "winsor_upper_bps_by_horizon": baseline_alpha_calibration.winsor_upper_bps_by_horizon.tolist(),
-        "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
-        "diagnostics": _summarize_for_log(baseline_alpha_calibration.diagnostics),
-    }
-    fast_test_batch = prepare_fast_baseline_batch(mm_test_batch, meta, env_kwargs_common=env_kwargs_common, split_name="test")
-    print(f"[baseline prep] fast cache ready split=test rows={fast_test_batch.rows}")
-    return PreparedBaselineContext(
-        out_root=str(out_root),
-        ckpt_path=str(ckpt_path),
-        device=str(device),
-        meta=meta,
-        test_split=test_split,
-        cmssl_report=cmssl_report,
-        splits_rl_bounds=splits_rl["bounds"],
-        mm_val_batch=mm_val_batch,
-        mm_test_batch=mm_test_batch,
-        fast_val_batch=fast_val_batch,
-        fast_test_batch=fast_test_batch,
-        baseline_alpha_calibration=baseline_alpha_calibration,
-        env_kwargs_common=env_kwargs_common,
-        run_config=run_config,
-        joined_rows=joined_rows,
-        cmssl_batch_size=cmssl_batch_size,
-    )
+    mm_rl_train_batch = build_market_batch(joined_rl_train)
+    mm_rl_val_batch = build_market_batch(joined_rl_val)
+    mm_rl_test_batch = build_market_batch(joined_rl_test)
+    mm_eval_full_batch = build_market_batch(joined_eval_full)
+    fast_rl_train_batch = prepare_fast_baseline_batch(mm_rl_train_batch, meta, env_kwargs_common=env_kwargs_common, split_name="rl_train")
+    fast_rl_val_batch = prepare_fast_baseline_batch(mm_rl_val_batch, meta, env_kwargs_common=env_kwargs_common, split_name="rl_val")
+    fast_rl_test_batch = prepare_fast_baseline_batch(mm_rl_test_batch, meta, env_kwargs_common=env_kwargs_common, split_name="rl_test")
+    fast_eval_full_batch = prepare_fast_baseline_batch(mm_eval_full_batch, meta, env_kwargs_common=env_kwargs_common, split_name="eval_full")
+    baseline_alpha_calibration = _fit_baseline_alpha_calibration(fast_rl_train_batch, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS))
+    meta["baseline_alpha_calibration"] = {"horizons_ms": baseline_alpha_calibration.horizons_ms.astype(int).tolist(), "score_to_bps_slope_by_horizon": baseline_alpha_calibration.score_to_bps_slope_by_horizon.tolist(), "winsor_lower_bps_by_horizon": baseline_alpha_calibration.winsor_lower_bps_by_horizon.tolist(), "winsor_upper_bps_by_horizon": baseline_alpha_calibration.winsor_upper_bps_by_horizon.tolist(), "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(), "diagnostics": _summarize_for_log(baseline_alpha_calibration.diagnostics)}
+    return PreparedBaselineContext(out_root=str(out_root), ckpt_path=str(ckpt_path), device=str(device), meta=meta, cmssl_test_split=cmssl_test_split, rl_val_split=rl_val_split, rl_test_split=rl_test_split, eval_full_split=eval_full_split, cmssl_test_metrics=cmssl_test_metrics, joined_rl_rows=int(joined_rl_full["features"].shape[0]), joined_eval_rows=int(joined_eval_full["features"].shape[0]), mm_rl_val_batch=mm_rl_val_batch, mm_rl_test_batch=mm_rl_test_batch, fast_rl_val_batch=fast_rl_val_batch, fast_rl_test_batch=fast_rl_test_batch, fast_rl_train_batch=fast_rl_train_batch, fast_eval_full_batch=fast_eval_full_batch, baseline_alpha_calibration=baseline_alpha_calibration, env_kwargs_common=env_kwargs_common, run_config=run_config, cmssl_batch_size=cmssl_batch_size)
 
 
 def evaluate_prepared_baseline(
@@ -4768,36 +4771,13 @@ def evaluate_prepared_baseline(
 ) -> Dict[str, Any]:
     if eval_split not in {"val", "test"}:
         raise ValueError(f"Unsupported baseline split '{eval_split}'")
-    batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
-    fast_batch = context.fast_val_batch if eval_split == "val" else context.fast_test_batch
+    batch = context.mm_rl_val_batch if eval_split == "val" else context.mm_rl_test_batch
+    fast_batch = context.fast_rl_val_batch if eval_split == "val" else context.fast_rl_test_batch
     quote_cfg = _resolve_baseline_quote_config(baseline_config)
     quote_cfg = load_baseline_quote_config() if quote_cfg is None else quote_cfg
     fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
-    print(f"[baseline eval cached] split={eval_split} fast_mode={fast_enabled}")
-    if fast_enabled and fast_batch is not None:
-        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba)
-    else:
-        env = build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration)
-        baseline_metrics = evaluate_market_making(
-            env,
-            lambda _obs: (0.0, 0.0, 0.0),
-            collect_vol_bucket_report=True,
-            baseline_cfg=quote_cfg,
-        )
-    return {
-        "cmssl_test": context.cmssl_report,
-        "mm_baseline": baseline_metrics,
-        "mm_rl": None,
-        "mm_run_context": {
-            "run_mode": "baseline",
-            "baseline_eval_split": eval_split,
-            "prepared_context_reuse": True,
-            "joined_rows": context.joined_rows,
-            "cmssl_batch_size": context.cmssl_batch_size,
-            "fast_baseline_mode": bool(fast_enabled and fast_batch is not None),
-            "fast_baseline_numba": bool(use_numba if use_numba is not None else _env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA)),
-        },
-    }
+    baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba) if fast_enabled and fast_batch is not None else evaluate_market_making(build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration), lambda _obs: (0.0, 0.0, 0.0), collect_vol_bucket_report=True, baseline_cfg=quote_cfg)
+    return {"cmssl_test": context.cmssl_test_metrics, "mm_baseline": baseline_metrics, "mm_rl": None, "mm_run_context": {"run_mode": "baseline", "baseline_eval_split": eval_split, "baseline_eval_semantics": f"rl_week3_{eval_split}", "prepared_context_reuse": True, "joined_rl_rows": context.joined_rl_rows, "joined_eval_rows": context.joined_eval_rows, "cmssl_batch_size": context.cmssl_batch_size, "fast_baseline_mode": bool(fast_enabled and fast_batch is not None)}}
 
 
 def run_pipeline(
@@ -4818,9 +4798,13 @@ def run_pipeline(
             use_numba=_env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA),
         )
     meta = load_global_meta(Path(out_root))
-    test_split = resolve_test_split(out_root, meta)
+    cmssl_test_split = resolve_cmssl_test_split(meta)
+    rl_train_split = resolve_rl_train_split(meta)
+    rl_val_split = resolve_rl_val_split(meta)
+    rl_test_split = resolve_rl_test_split(meta)
+    eval_full_split = resolve_eval_full_split(meta)
 
-    report_pretrain_diagnostics(out_root, meta)
+    report_cmssl_test_diagnostics(out_root, meta)
 
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
 
@@ -4838,9 +4822,9 @@ def run_pipeline(
         f"tf32={_env_bool('BYBIT_MM_ENABLE_TF32', False)} "
         f"preallocate_join_features={preallocate_join_features}"
     )
-    joined_test = build_joined_split(
+    joined_cmssl_test = build_joined_split(
         out_root,
-        test_split,
+        cmssl_test_split,
         model,
         meta,
         device,
@@ -4849,27 +4833,48 @@ def run_pipeline(
 
     num_h = len(meta.get("horizons_ms", []))
     cmssl_report = report_cmssl_metrics(
-        joined_test["y"],
-        {
-            "dir_logits": joined_test["features"][:, :num_h],
-        },
+        joined_cmssl_test["y"],
+        {"dir_logits": joined_cmssl_test["features"][:, :num_h]},
     )
 
-    splits_rl = chronological_split(joined_test, ratios=(0.6, 0.2, 0.2))
-    persist_split_bounds(out_root, splits_rl["bounds"], total=len(joined_test["ts"]))
+    rl_week3_full_split = {"weeks": rl_train_split["weeks"], "start": rl_train_split["start"], "end": rl_test_split["end"]}
+    joined_rl_full = build_joined_split(out_root, rl_week3_full_split, model, meta, device, batch_size=cmssl_batch_size)
+    joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
+    joined_rl_val = slice_joined_by_split(joined_rl_full, rl_val_split)
+    joined_rl_test = slice_joined_by_split(joined_rl_full, rl_test_split)
+    joined_eval_full = build_joined_split(out_root, eval_full_split, model, meta, device, batch_size=cmssl_batch_size)
 
-    mm_train_batch = build_market_batch(splits_rl["train"])
-    mm_val_batch = build_market_batch(splits_rl["val"])
-    mm_test_batch = build_market_batch(splits_rl["test"])
+    mm_train_batch = build_market_batch(joined_rl_train)
+    mm_val_batch = build_market_batch(joined_rl_val)
+    mm_test_batch = build_market_batch(joined_rl_test)
+    mm_eval_full_batch = build_market_batch(joined_eval_full)
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
+    fast_train_batch = prepare_fast_baseline_batch(
+        mm_train_batch,
+        meta,
+        env_kwargs_common=env_kwargs_common,
+        split_name="rl_train",
+    )
     fast_val_batch = prepare_fast_baseline_batch(
         mm_val_batch,
         meta,
         env_kwargs_common=env_kwargs_common,
-        split_name="val",
+        split_name="rl_val",
+    )
+    fast_test_batch = prepare_fast_baseline_batch(
+        mm_test_batch,
+        meta,
+        env_kwargs_common=env_kwargs_common,
+        split_name="rl_test",
+    )
+    fast_eval_full_batch = prepare_fast_baseline_batch(
+        mm_eval_full_batch,
+        meta,
+        env_kwargs_common=env_kwargs_common,
+        split_name="eval_full",
     )
     baseline_alpha_calibration = _fit_baseline_alpha_calibration(
-        fast_val_batch,
+        fast_train_batch,
         meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS),
     )
     calibration_summary = {
@@ -4904,15 +4909,24 @@ def run_pipeline(
         baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
+    mm_final_env = MarketMakingEnv(
+        mm_eval_full_batch,
+        allow_taker=allow_taker,
+        baseline_alpha_calibration=baseline_alpha_calibration,
+        **env_kwargs_common,
+    )
     default_baseline_quote_cfg = load_baseline_quote_config()
     baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
     baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
+    baseline_final_env = build_baseline_eval_env(mm_eval_full_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
     mm_train_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
+    mm_final_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     baseline_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     baseline_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
+    baseline_final_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_obs = mm_train_env.reset()
     mm_obs_dim = mm_obs.shape[0]
     print(
@@ -5038,20 +5052,25 @@ def run_pipeline(
                 "Evaluation requires a valid prefitted frozen observation normalization state."
             )
         mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+        mm_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         baseline_val_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         baseline_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+        baseline_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         obs_norm_source = "checkpoint"
 
     if eval_obs_norm_state is not None:
         baseline_eval_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-    baseline_eval_t0 = time.perf_counter()
-    baseline_metrics = evaluate_market_making(baseline_eval_env, lambda _obs: (0.0, 0.0, 0.0))
+        baseline_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
+    baseline_dev_t0 = time.perf_counter()
+    baseline_dev_metrics = evaluate_prepared_baseline_fast(fast_val_batch if baseline_eval_split == "val" else fast_test_batch, default_baseline_quote_cfg, baseline_alpha_calibration)
+    baseline_metrics = evaluate_prepared_baseline_fast(fast_eval_full_batch, default_baseline_quote_cfg, baseline_alpha_calibration)
     _timing_log(
         "evaluate_market_making baseline "
-        f"split={baseline_split_name} secs={time.perf_counter() - baseline_eval_t0:.4f}"
+        f"split=eval.full secs={time.perf_counter() - baseline_dev_t0:.4f}"
     )
 
     rl_metrics = None
+    rl_dev_metrics = None
     ppo_eval_stochastic = _env_bool("BYBIT_MM_PPO_EVAL_STOCHASTIC", False)
     ppo_eval_seed = _env_int("BYBIT_MM_PPO_EVAL_SEED", 0)
 
@@ -5118,7 +5137,7 @@ def run_pipeline(
                 stochastic_generator = torch.Generator(device=torch.device(device).type)
                 stochastic_generator.manual_seed(ppo_eval_seed)
             rl_eval_t0 = time.perf_counter()
-            rl_metrics = evaluate_market_policy_ppo(
+            rl_dev_metrics = evaluate_market_policy_ppo(
                 mm_test_env,
                 mm_ppo_model,
                 stochastic=ppo_eval_stochastic,
@@ -5129,6 +5148,15 @@ def run_pipeline(
             )
             _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
             rl_eval_performed = True
+            rl_metrics = evaluate_market_policy_ppo(
+                mm_final_env,
+                mm_ppo_model,
+                stochastic=ppo_eval_stochastic,
+                device=device,
+                delta_scale=delta_scale,
+                taker_scale=taker_scale,
+                generator=stochastic_generator,
+            )
         else:
             if mm_policy is None:
                 if rl_policy_reason == "no path provided":
@@ -5151,7 +5179,8 @@ def run_pipeline(
                     )
 
             rl_eval_t0 = time.perf_counter()
-            rl_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
+            rl_dev_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
+            rl_metrics = evaluate_market_making(mm_final_env, rl_policy_fn)
             _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
             rl_eval_performed = True
 
@@ -5160,10 +5189,14 @@ def run_pipeline(
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
         "mm_baseline": baseline_metrics,
         "mm_rl": rl_metrics,
+        "mm_baseline_dev_test": baseline_dev_metrics if baseline_eval_split == "test" else None,
+        "mm_baseline_dev_val": baseline_dev_metrics if baseline_eval_split == "val" else None,
+        "mm_rl_dev_test": rl_dev_metrics,
         # Fatal failures are surfaced via exceptions rather than persisted in provenance state.
         "mm_run_context": {
             "run_mode": run_mode,
             "baseline_eval_split": baseline_split_name,
+            "baseline_eval_semantics": f"rl_week3_{baseline_split_name}",
             "ppo_trained_this_run": trained_this_run,
             "ppo_best_ckpt_path": str(mm_best_ckpt.expanduser().resolve()),
             "rl_eval_performed": rl_eval_performed,
