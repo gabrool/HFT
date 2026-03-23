@@ -4768,7 +4768,6 @@ def prepare_baseline_context(
     meta["baseline_alpha_calibration"] = {
         "horizons_ms": baseline_alpha_calibration.horizons_ms.astype(int).tolist(),
         "score_to_bps_slope_by_horizon": baseline_alpha_calibration.score_to_bps_slope_by_horizon.tolist(),
-        "slope_by_horizon": baseline_alpha_calibration.score_to_bps_slope_by_horizon.tolist(),
         "winsor_lower_bps_by_horizon": baseline_alpha_calibration.winsor_lower_bps_by_horizon.tolist(),
         "winsor_upper_bps_by_horizon": baseline_alpha_calibration.winsor_upper_bps_by_horizon.tolist(),
         "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
