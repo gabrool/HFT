@@ -2284,9 +2284,14 @@ class MarketMakingEnv:
         vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
         vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
         half_spread_bps = self._width_from_market_state(cfg, observed_spread_bps, vol_short, vol_long, p250, p500, p1000)
-        extra_widen_bps = cfg.inventory_side_widen_scale * max(0.0, abs(inv_notional) - self.inv_soft_notional) / self.inv_soft_notional
-        bid_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional > 0.0 else 0.0)
-        ask_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional < 0.0 else 0.0)
+        eps = 1e-12
+        soft_ratio = abs(inv_notional) / max(self.inv_soft_notional, eps)
+        overload = max(0.0, soft_ratio - 1.0)
+        inventory_side_extra_bps = (
+            cfg.inventory_side_widen_scale * overload * max(half_spread_bps, 1.0)
+        )
+        bid_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional > 0.0 else 0.0)
+        ask_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional < 0.0 else 0.0)
         bid_enabled = inv_notional < self.max_inventory_notional
         ask_enabled = inv_notional > -self.max_inventory_notional
         bid = mid + bps_to_px(mid, reservation_bps - bid_half_spread_bps) if bid_enabled else np.nan
@@ -4471,9 +4476,14 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
         inv_notional = inventory * mid_i
         inventory_center_bps = inventory_center_scale * (inv_notional / inv_ref_notional)
         reservation_bps = alpha_center_bps - inventory_center_bps
-        extra_widen_bps = inventory_side_widen_scale * max(0.0, abs(inv_notional) - inv_soft_notional) / inv_soft_notional
-        bid_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional > 0.0 else 0.0)
-        ask_half_spread_bps = half_spread_bps + (extra_widen_bps if inv_notional < 0.0 else 0.0)
+        inv_soft_notional_eps = 1e-12
+        soft_ratio = abs(inv_notional) / max(inv_soft_notional, inv_soft_notional_eps)
+        overload = max(0.0, soft_ratio - 1.0)
+        inventory_side_extra_bps = (
+            inventory_side_widen_scale * overload * max(half_spread_bps, 1.0)
+        )
+        bid_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional > 0.0 else 0.0)
+        ask_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional < 0.0 else 0.0)
         bid_enabled = inv_notional < max_inventory_notional
         ask_enabled = inv_notional > -max_inventory_notional
         bid = np.nan
