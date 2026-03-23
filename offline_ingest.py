@@ -40,7 +40,7 @@ import queue
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple, Iterable, Dict, Optional
+from typing import List, Tuple, Iterable, Dict, Optional, Any
 from collections import deque, defaultdict
 import itertools
 import numpy as np
@@ -68,6 +68,80 @@ RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "4096"))
 DECISION_POLICY = "ob_only_grid_quantized"
 
+
+
+
+OB_TP_SNAPSHOT = 1
+OB_TP_DELTA = 2
+TRADE_SIDE_BUY = 1
+TRADE_SIDE_SELL = -1
+TRADE_SIDE_UNKNOWN = 0
+TRADE_TICK_PLUS = 1
+TRADE_TICK_MINUS = -1
+TRADE_TICK_ZERO = 0
+
+
+def _compact_ob_type_code(tp_raw: Any) -> int:
+    tp_norm = str(tp_raw or "delta").strip().lower()
+    return OB_TP_SNAPSHOT if tp_norm == "snapshot" else OB_TP_DELTA
+
+
+def _compact_trade_side_code(side_raw: Any) -> int:
+    side_norm = str(side_raw or "").strip().lower()
+    if side_norm == "buy":
+        return TRADE_SIDE_BUY
+    if side_norm == "sell":
+        return TRADE_SIDE_SELL
+    return TRADE_SIDE_UNKNOWN
+
+
+def _compact_tick_dir_code(tick_raw: Any) -> int:
+    norm = str(tick_raw or "").strip().lower()
+    cleaned = norm.replace("-", "").replace("_", "").replace(" ", "")
+    if "plus" in cleaned or cleaned in {"plustick", "uptick", "up", "buy", "bid", "+", "1"}:
+        return TRADE_TICK_PLUS
+    if "minus" in cleaned or cleaned in {"minustick", "downtick", "down", "sell", "ask", "-", "-1"}:
+        return TRADE_TICK_MINUS
+    if "zero" in cleaned or cleaned in {"zerotick", "flat", "unchanged", "0"}:
+        return TRADE_TICK_ZERO
+    try:
+        val = float(tick_raw)
+    except (TypeError, ValueError):
+        return TRADE_TICK_ZERO
+    if val > 0:
+        return TRADE_TICK_PLUS
+    if val < 0:
+        return TRADE_TICK_MINUS
+    return TRADE_TICK_ZERO
+
+
+def _compact_is_rpi_code(rpi_raw: Any) -> int:
+    if rpi_raw is None:
+        return 0
+    if isinstance(rpi_raw, str):
+        rpi_norm = rpi_raw.strip().lower()
+        if rpi_norm in {"1", "true", "t", "yes", "y", "on"}:
+            return 1
+        if rpi_norm in {"0", "false", "f", "no", "n", "off", ""}:
+            return 0
+    try:
+        return 1 if float(rpi_raw) != 0.0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compact_book_levels(levels: Any) -> Tuple[Tuple[float, float], ...]:
+    if not isinstance(levels, list):
+        return tuple()
+    out = []
+    for lvl in levels:
+        if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
+            continue
+        try:
+            out.append((float(lvl[0]), float(lvl[1])))
+        except (TypeError, ValueError):
+            continue
+    return tuple(out)
 
 def _env_bool_int(name: str, default: int = 0) -> int:
     raw = os.environ.get(name)
@@ -256,20 +330,22 @@ def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 
 def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, strict: bool = True, B: int = 0):
-    """Merge OB/trade events by timestamp/sequence with a monotonicity guard."""
+    """Merge compact OB/trade events by timestamp/sequence with a monotonicity guard."""
     ob_item = next(ob_iter, None)
     tr_item = next(tr_iter, None)
     last_ts = -1
     while ob_item or tr_item:
-        if ob_item and (tr_item is None or ob_item[0] < tr_item[0]):
-            ts, seq, data = ob_item
+        ob_ts = ob_item[1] if ob_item is not None else None
+        tr_ts = tr_item[1] if tr_item is not None else None
+        if ob_item is not None and (tr_item is None or ob_ts < tr_ts):
+            event = ob_item
             ob_item = next(ob_iter, None)
-            etype = "ob"
         else:
             # Prefer the trade when timestamps tie to preserve causal ordering.
-            ts, seq, data = tr_item
+            event = tr_item
             tr_item = next(tr_iter, None)
-            etype = "trade"
+        etype = event[0]
+        ts = int(event[1])
         if ts + B < last_ts:
             backstep_ms = int(last_ts - ts)
             if strict:
@@ -283,6 +359,7 @@ def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, stri
                         {"kind": "clamp", "s": etype[0], "d": backstep_ms, "in": int(ts), "out": int(last_ts)},
                     )
                 ts = last_ts
+                event = (event[0], int(last_ts), *event[2:])
             else:
                 if dq_day is not None:
                     dq_day.increment_counter("merge", "merge_dropped_big_backstep")
@@ -294,7 +371,7 @@ def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, stri
         last_ts = ts
         if dq_day is not None:
             dq_day.update_output_ts(last_ts)
-        yield etype, ts, seq, data
+        yield event
 
 
 def build_sequence_from_tokens(tokens: deque, lookback: int) -> np.ndarray:
@@ -661,30 +738,12 @@ def _sort_pairs_by_end(pairs: List[WeekPair]) -> List[WeekPair]:
 
 
 def _event_ts(event) -> int:
-    """Extract the first integer-like timestamp from an event tuple."""
+    """Extract the timestamp from a compact ingest event tuple."""
     if event is None:
         raise ValueError("Expected an event tuple, got None")
-
-    for idx in (0, 1):
-        if len(event) <= idx:
-            continue
-        candidate = event[idx]
-        try:
-            ts = int(candidate)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(candidate, bool):
-            continue
-        if isinstance(candidate, float) and not candidate.is_integer():
-            continue
-        if isinstance(candidate, np.floating) and not candidate.is_integer():
-            continue
-        return ts
-
-    raise ValueError(
-        "Event does not expose an integer timestamp at positions 0 or 1: "
-        f"{event!r}"
-    )
+    if not isinstance(event, tuple) or len(event) < 2:
+        raise ValueError(f"Expected compact event tuple, got: {event!r}")
+    return int(event[1])
 
 
 def _trade_iter_precise(tr_iter: Iterable[Tuple[int, int, dict]]):
@@ -770,21 +829,23 @@ def safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day):
                     continue
 
             data = obj.get("data")
-            if isinstance(data, dict):
-                seq = _try_int(data.get("seq"), 0)
-            else:
+            if not isinstance(data, dict):
                 dq_day.increment_counter("ob", "missing_data")
-                seq = 0
+                continue
+
+            seq = _try_int(data.get("seq"), 0)
+            tp_code = _compact_ob_type_code(obj.get("type") or data.get("type") or obj.get("DataType"))
+            bids = _compact_book_levels(data.get("b"))
+            asks = _compact_book_levels(data.get("a"))
 
             last_ts_out = int(ts_ms)
             emitted += 1
             dq_day.increment_counter("ob", "emitted")
             dq_day.update_output_ts(last_ts_out)
-            yield last_ts_out, seq, obj
+            yield ("ob", last_ts_out, seq, tp_code, bids, asks)
 
     dq_day.increment_counter("ob", "total_seen", total)
     dq_day.increment_counter("ob", "total_emitted", emitted)
-
 
 def safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day):
     total = 0
@@ -793,20 +854,35 @@ def safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day):
     day_clip_enabled = bool(BYBIT_DAY_CLIP)
 
     with _open_text(th_path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None:
+            dq_day.increment_counter("th", "missing_header")
+            dq_day.increment_counter("th", "total_seen", total)
+            dq_day.increment_counter("th", "total_emitted", emitted)
+            return
+        header_map = {str(name).strip(): idx for idx, name in enumerate(header)}
+
+        def get_col(row, *names):
+            for name in names:
+                idx = header_map.get(name)
+                if idx is not None and idx < len(row):
+                    return row[idx]
+            return None
+
         for seq, row in enumerate(reader, start=1):
             total += 1
             dq_day.increment_counter("th", "total")
-            t_raw = row.get("timestamp")
+            t_raw = get_col(row, "timestamp", "ts", "T")
             if t_raw is None or (isinstance(t_raw, str) and not t_raw.strip()):
                 dq_day.increment_counter("th", "missing_ts")
-                dq_day.append_example("th_missing_ts", {"seq": seq, "row": row})
+                dq_day.append_example("th_missing_ts", {"seq": seq, "row": row[:16]})
                 continue
             try:
                 ts_ms = timestamp_to_ms_half_even(t_raw)
             except Exception:
                 dq_day.increment_counter("th", "bad_ts")
-                dq_day.append_example("th_bad_ts", {"seq": seq, "ts_raw": t_raw, "row": row})
+                dq_day.append_example("th_bad_ts", {"seq": seq, "ts_raw": t_raw, "row": row[:16]})
                 continue
 
             dq_day.update_raw_ts(ts_ms)
@@ -832,12 +908,23 @@ def safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day):
                     )
                     continue
 
-            row["seq"] = seq
+            try:
+                price = float(get_col(row, "price"))
+                size = float(get_col(row, "size"))
+            except (TypeError, ValueError):
+                dq_day.increment_counter("th", "bad_pxsz")
+                dq_day.append_example("th_bad_pxsz", {"seq": seq, "row": row[:16]})
+                continue
+
+            side_code = _compact_trade_side_code(get_col(row, "side", "S"))
+            tick_dir_code = _compact_tick_dir_code(get_col(row, "tickDirection", "tick_direction"))
+            is_rpi = _compact_is_rpi_code(get_col(row, "RPI", "rpi"))
+
             last_ts_out = int(ts_ms)
             emitted += 1
             dq_day.increment_counter("th", "emitted")
             dq_day.update_output_ts(last_ts_out)
-            yield last_ts_out, seq, row
+            yield ("trade", last_ts_out, seq, price, size, side_code, tick_dir_code, is_rpi)
 
     dq_day.increment_counter("th", "total_seen", total)
     dq_day.increment_counter("th", "total_emitted", emitted)
@@ -1190,7 +1277,7 @@ def _iter_week_merged_events(
         ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day)
         th_iter = safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day)
         for event in merge_event_time(ob_iter, th_iter, dq_day=dq_day, strict=strict_mode, B=0):
-            _etype, ts, _seq, _data = event
+            ts = int(event[1])
             if (
                 last_ts_global is not None
                 and ts + WEEK_CHAIN_TS_TOLERANCE_MS < last_ts_global
@@ -1223,7 +1310,7 @@ def _iter_week_merged_events(
                             "curr_ts": int(ts),
                         },
                     )
-                    event = (_etype, int(last_ts_global), _seq, _data)
+                    event = (event[0], int(last_ts_global), *event[2:])
                     ts = int(last_ts_global)
                 else:
                     dq_day.increment_counter("chain", "chain_dropped_big_backstep")

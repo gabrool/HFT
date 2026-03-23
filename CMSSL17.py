@@ -1543,11 +1543,12 @@ class FeatureEngine:
         etype in {'ob','trade'}
         """
         # Tuple form
-        if isinstance(e, tuple) and len(e) == 4 and isinstance(e[0], str):
+        if isinstance(e, tuple) and len(e) >= 4 and isinstance(e[0], str):
             etype = e[0].lower()
-            ts_ms = int(e[1])
-            payload = e[3]  # ignore sequence
-            return etype, ts_ms, payload
+            if etype in {"ob", "trade"}:
+                ts_ms = int(e[1])
+                payload = e[3:]
+                return etype, ts_ms, payload
 
         if isinstance(e, tuple) and len(e) == 3 and isinstance(e[0], str):
             etype = e[0].lower()
@@ -1595,12 +1596,15 @@ class FeatureEngine:
 
         raise ValueError(f"Unrecognized event shape: {type(e)} :: {e}")
 
-    def _update_book_from_ob(self, ob_evt: dict):
-        tp = ob_evt.get('type') or ob_evt.get('data', {}).get('type') or ob_evt.get('DataType') or 'delta'
-        data = ob_evt.get('data', ob_evt)
-
-        bids = data.get('b', [])
-        asks = data.get('a', [])
+    def _update_book_from_ob(self, ob_evt: Any):
+        if isinstance(ob_evt, tuple):
+            tp_raw, bids, asks = ob_evt
+            tp = 'snapshot' if int(tp_raw) == 1 else 'delta'
+        else:
+            tp = ob_evt.get('type') or ob_evt.get('data', {}).get('type') or ob_evt.get('DataType') or 'delta'
+            data = ob_evt.get('data', ob_evt)
+            bids = data.get('b', [])
+            asks = data.get('a', [])
 
         if tp == 'snapshot':
             self.bids = {float(p): float(q) for p, q in bids[: self.depth]}
@@ -1647,40 +1651,49 @@ class FeatureEngine:
 
         return int(tick_sign), int(is_zero_tick)
 
-    def _update_trade_windows(self, ts_ms: int, trade_evt: dict, dt_ms: float):
-        side = str(trade_evt['side']).lower()  # 'buy'|'sell'
-        price = float(trade_evt['price'])
-        size = float(trade_evt['size'])
+    def _update_trade_windows(self, ts_ms: int, trade_evt: Any, dt_ms: float):
+        if isinstance(trade_evt, tuple):
+            price, size, side_code, tick_dir_code, is_rpi = trade_evt
+            side = 'buy' if int(side_code) > 0 else 'sell' if int(side_code) < 0 else 'unknown'
+            price = float(price)
+            size = float(size)
+            tick_sign = int(tick_dir_code)
+            is_zero_tick = 1 if int(tick_dir_code) == 0 else 0
+            is_rpi = int(is_rpi)
+        else:
+            side = str(trade_evt['side']).lower()  # 'buy'|'sell'
+            price = float(trade_evt['price'])
+            size = float(trade_evt['size'])
 
-        tick_dir = trade_evt.get("tickDirection")
-        tick_sign = int(self.last_tick_sign)
-        is_zero_tick = int(self.last_is_zero_tick)
-        is_rpi = int(self.last_is_rpi)
+            tick_dir = trade_evt.get("tickDirection")
+            tick_sign = int(self.last_tick_sign)
+            is_zero_tick = int(self.last_is_zero_tick)
+            is_rpi = int(self.last_is_rpi)
 
-        rpi_raw = trade_evt.get("RPI")
-        if rpi_raw is None:
-            rpi_raw = trade_evt.get("rpi")
+            rpi_raw = trade_evt.get("RPI")
+            if rpi_raw is None:
+                rpi_raw = trade_evt.get("rpi")
 
-        if rpi_raw is not None:
-            if isinstance(rpi_raw, str):
-                rpi_norm = rpi_raw.strip().lower()
-                if rpi_norm in {"1", "true", "t", "yes", "y"}:
-                    is_rpi = 1
-                elif rpi_norm in {"0", "false", "f", "no", "n", ""}:
-                    is_rpi = 0
+            if rpi_raw is not None:
+                if isinstance(rpi_raw, str):
+                    rpi_norm = rpi_raw.strip().lower()
+                    if rpi_norm in {"1", "true", "t", "yes", "y"}:
+                        is_rpi = 1
+                    elif rpi_norm in {"0", "false", "f", "no", "n", ""}:
+                        is_rpi = 0
+                    else:
+                        try:
+                            is_rpi = 1 if float(rpi_norm) != 0.0 else 0
+                        except ValueError:
+                            pass
                 else:
                     try:
-                        is_rpi = 1 if float(rpi_norm) != 0.0 else 0
-                    except ValueError:
+                        is_rpi = 1 if float(rpi_raw) != 0.0 else 0
+                    except (TypeError, ValueError):
                         pass
-            else:
-                try:
-                    is_rpi = 1 if float(rpi_raw) != 0.0 else 0
-                except (TypeError, ValueError):
-                    pass
 
-        if tick_dir is not None:
-            tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
+            if tick_dir is not None:
+                tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
 
         if self.last_trade_price is not None:
             if price > self.last_trade_price:
