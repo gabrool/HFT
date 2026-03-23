@@ -1,8 +1,8 @@
 """Baseline-only sweep / structured search for RL_exec market-making engine.
 
-Examples:
+Examples (RL week-3 sweep only; final evaluation stays in the main pipeline after a config/checkpoint is chosen):
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
-        --device cuda --search-mode random --n-trials 40 --eval-split val --results-csv baseline_val_sweep.csv
+        --device cuda --search-mode random --n-trials 40 --eval-split val --results-csv baseline_week3_val_sweep.csv
 
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
         --search-mode random --vary alpha_center_scale weights --anchor-spread-cap-bps 4.0 \
@@ -760,6 +760,14 @@ def make_error_row(
     return row
 
 
+def describe_eval_split(split: str) -> str:
+    if split == "val":
+        return "val (RL week-3 validation)"
+    if split == "test":
+        return "test (RL week-3 test)"
+    return split
+
+
 def print_leaderboard(rows: List[Dict[str, Any]], *, top_k: int, label: str) -> None:
     ranked = [row for row in rows if row.get("status") == "ok"]
     ranked.sort(key=lambda item: item.get("score", -math.inf), reverse=True)
@@ -768,7 +776,7 @@ def print_leaderboard(rows: List[Dict[str, Any]], *, top_k: int, label: str) -> 
         factor_text = f" factor={row.get('factor_name')}" if row.get("factor_name") else ""
         print(
             f"  #{idx} mode={row.get('search_mode')}{factor_text} score={row.get('score'):.6f} "
-            f"split={row.get('baseline_eval_split')} pnl={row.get('net_pnl_pct')} sharpe={row.get('sharpe_1h')} "
+            f"split={describe_eval_split(row.get('baseline_eval_split'))} pnl={row.get('net_pnl_pct')} sharpe={row.get('sharpe_1h')} "
             f"dd={row.get('max_dd')} fill_rate={row.get('maker_fill_rate')} fills={row.get('maker_fill_count')} "
             f"params={{base_half_spread_bps={row.get('base_half_spread_bps')}, alpha_center_scale={row.get('alpha_center_scale')}, "
             f"inventory_center_scale={row.get('inventory_center_scale')}, vol_width_scale={row.get('vol_width_scale')}, "
@@ -841,16 +849,16 @@ def parse_args() -> argparse.Namespace:
                     f"{deleted_opt} has been removed from baseline_sweep.py; use the renamed anchor baseline quote controls instead."
                 )
 
-    parser = argparse.ArgumentParser(description="Baseline-only sweep / structured search for RL_exec.")
+    parser = argparse.ArgumentParser(description="Baseline-only RL week-3 sweep / structured search for RL_exec. Final evaluation stays in the main pipeline after selecting a config/checkpoint.")
     parser.add_argument("--out-root", default=None)
     parser.add_argument("--ckpt-path", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--n-trials", type=int, default=40)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--eval-split", choices=("val", "test"), default="val")
-    parser.add_argument("--results-csv", default="baseline_sweep_results.csv")
-    parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--retest-topk-on-test", action="store_true")
+    parser.add_argument("--eval-split", choices=("val", "test"), default="val", help="Sweep split: val = RL week-3 validation; test = RL week-3 test.")
+    parser.add_argument("--results-csv", default="baseline_sweep_results.csv", help="Output CSV for RL week-3 sweep results.")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of top RL week-3 sweep candidates to summarize.")
+    parser.add_argument("--retest-topk-on-test", action="store_true", help="After ranking candidates on the chosen RL week-3 sweep split, retest the top-k candidates on RL week-3 test. This does not run any separate final evaluation week.")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--search-mode", choices=("random", "grid", "one-factor"), default="random")
     parser.add_argument("--vary", nargs="+", default=None)
@@ -873,7 +881,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-weight-preset", choices=tuple(WEIGHT_PRESETS), default=None)
     parser.add_argument("--min-fill-rate", type=float, default=0.002)
     parser.add_argument("--max-drawdown", type=float, default=None)
-    parser.add_argument("--workers", type=int, default=1, help="CPU workers for validation trials; start with 4-8 on large hosts.")
+    parser.add_argument("--workers", type=int, default=1, help="CPU workers for RL week-3 sweep trials; start with 4-8 on large hosts.")
     parser.add_argument("--worker-chunk-size", type=int, default=1)
     parser.add_argument("--start-method", choices=("auto", "fork", "spawn"), default="auto")
     parser.add_argument("--disable-fast-baseline", action="store_true")
@@ -923,9 +931,9 @@ def main() -> None:
     trial_plan = generate_trial_plan(args, rng=rng, space=DEFAULT_SEARCH_SPACE, anchor_config=anchor_config)
 
     if args.search_mode == "grid":
-        print(f"[info] mode=grid planned grid size={len(trial_plan)}; --n-trials={args.n_trials} is ignored.")
+        print(f"[info] mode=grid planned RL week-3 grid size={len(trial_plan)} on {describe_eval_split(args.eval_split)}; --n-trials={args.n_trials} is ignored.")
     elif args.search_mode == "one-factor":
-        print(f"[info] mode=one-factor uses {len(trial_plan)} planned trials; --n-trials={args.n_trials} is ignored.")
+        print(f"[info] mode=one-factor uses {len(trial_plan)} planned RL week-3 trials on {describe_eval_split(args.eval_split)}; --n-trials={args.n_trials} is ignored.")
 
     write_metadata(
         metadata_json,
@@ -983,14 +991,14 @@ def main() -> None:
             if args.verbose:
                 print(
                     f"[trial {row['trial'] + 1}/{total_trials}] status={row['status']} score={row.get('score')} "
-                    f"split={row.get('baseline_eval_split')} config={{base_half_spread_bps={row.get('base_half_spread_bps')}, alpha_center_scale={row.get('alpha_center_scale')}, vol_width_scale={row.get('vol_width_scale')}, obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_cap_bps={row.get('spread_cap_bps')}}}"
+                    f"split={describe_eval_split(row.get('baseline_eval_split'))} config={{base_half_spread_bps={row.get('base_half_spread_bps')}, alpha_center_scale={row.get('alpha_center_scale')}, vol_width_scale={row.get('vol_width_scale')}, obs_spread_anchor_frac={row.get('obs_spread_anchor_frac')}, spread_cap_bps={row.get('spread_cap_bps')}}}"
                 )
     finally:
         if args.workers > 1:
             pool.close()
             pool.join()
 
-    print_leaderboard(rows, top_k=args.top_k, label=f"baseline sweep {args.eval_split}")
+    print_leaderboard(rows, top_k=args.top_k, label=f"baseline sweep {describe_eval_split(args.eval_split)}")
 
     best_rows = [row for row in rows if row.get("status") == "ok"]
     best_rows.sort(key=lambda item: item.get("score", -math.inf), reverse=True)
@@ -1001,9 +1009,10 @@ def main() -> None:
             for key in BASELINE_PARAM_ENV_MAP
         }
         _raise_on_stale_deleted_knobs(best_env, context="best config env payload")
-        print("[best config env]", json.dumps(best_env, sort_keys=True))
+        print(f"[best config env from {describe_eval_split(args.eval_split)}]", json.dumps(best_env, sort_keys=True))
 
     if args.retest_topk_on_test:
+        print(f"[retest] retesting top {min(args.top_k, len(best_rows))} RL week-3 candidates from {describe_eval_split(args.eval_split)} on {describe_eval_split('test')}; no separate final evaluation week is run here.")
         top_rows = [row for row in best_rows[: args.top_k]]
         retest_rows: List[Dict[str, Any]] = []
         retest_csv = results_csv.with_name(f"{results_csv.stem}_topk_test.csv")
@@ -1048,11 +1057,11 @@ def main() -> None:
                     factor_value_label_text=row_metadata["factor_value_label"],
                     exc=exc,
                 )
-                print(f"[retest rank {rank}] error {type(exc).__name__}: {exc}")
+                print(f"[retest rank {rank} on {describe_eval_split('test')}] error {type(exc).__name__}: {exc}")
             retest_rows.append(retest_row)
             append_row_csv(retest_csv, retest_row)
             append_row_jsonl(retest_jsonl, retest_row)
-        print_leaderboard(retest_rows, top_k=args.top_k, label="baseline sweep test retest")
+        print_leaderboard(retest_rows, top_k=args.top_k, label=f"baseline sweep retest on {describe_eval_split('test')}")
 
 
 if __name__ == "__main__":
