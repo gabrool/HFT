@@ -40,7 +40,7 @@ import queue
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple, Iterable, Dict, Optional, Any
+from typing import Callable, List, Tuple, Iterable, Dict, Optional, Any
 from collections import deque, defaultdict
 import itertools
 import numpy as np
@@ -976,36 +976,70 @@ def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.n
     ).astype(np.float32, copy=False)
 
 # ---------- chunk writer (preallocated) ----------
+@dataclass
+class FlushJob:
+    week_key: str
+    chunk_id: int
+    row_count: int
+    out_dir: str
+    x_core_file: str
+    x_aux_file: str
+    y_file: str
+    ts_file: str
+    x_core: np.ndarray
+    x_aux: np.ndarray
+    y: np.ndarray
+    ts: np.ndarray
+    core_dtype: Any
+
+
 class ChunkWriter:
-    def __init__(self, out_dir: str, lookback: int, feature_dim: int,
-                 ram_budget_mb: int, chunk_size_override: int = 0):
+    def __init__(
+        self,
+        out_dir: str,
+        lookback: int,
+        feature_dim: int,
+        ram_budget_mb: int,
+        chunk_size_override: int = 0,
+        week_key: str = "",
+        flush_callback: Optional[Callable[[FlushJob], None]] = None,
+    ):
         self.out_dir = out_dir
+        self.week_key = str(week_key)
         self.L = int(lookback)
         self.F = int(feature_dim)
         self.F_core = self.F - AUX_DIM
         assert self.F_core > 0, "feature_dim must be > AUX_DIM"
         self.core_dtype = np.float32
+        self.flush_callback = flush_callback
 
-        # compute chunk size using direction-only NUM_HORIZONS-wide labels
-        bytes_per_seq = (
+        total_bytes_per_seq = (
             (self.L * self.F_core * 4)
             + (self.L * AUX_DIM * 4)
             + (NUM_HORIZONS * 4)
+            + 8
         )
         if chunk_size_override > 0:
             self.N = int(chunk_size_override)
         else:
-            self.N = max(256, int((ram_budget_mb * 1024 * 1024) // bytes_per_seq))
-        self.N = min(self.N, 4096)
+            auto_n = max(256, int((ram_budget_mb * 1024 * 1024) // total_bytes_per_seq))
+            safety_cap = max(256, int((2 * 1024 * 1024 * 1024) // max(1, total_bytes_per_seq)))
+            self.N = min(auto_n, safety_cap)
 
-        # preallocate separate buffers
-        self.X_core = np.empty((self.N, self.L, self.F_core), dtype=np.float32)  # cast on flush
-        self.X_aux  = np.empty((self.N, self.L, AUX_DIM),     dtype=np.float32)  # keep fp32
-        self.Y      = np.empty((self.N, NUM_HORIZONS), dtype=np.float32)
-        self.TS     = np.empty((self.N,), dtype=np.int64)
+        self.X_core: np.ndarray
+        self.X_aux: np.ndarray
+        self.Y: np.ndarray
+        self.TS: np.ndarray
+        self._alloc_buffers()
         self.i = 0
         self.cid = 0
         self.chunks_meta = []
+
+    def _alloc_buffers(self) -> None:
+        self.X_core = np.empty((self.N, self.L, self.F_core), dtype=np.float32)
+        self.X_aux = np.empty((self.N, self.L, AUX_DIM), dtype=np.float32)
+        self.Y = np.empty((self.N, NUM_HORIZONS), dtype=np.float32)
+        self.TS = np.empty((self.N,), dtype=np.int64)
 
     def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, y: np.ndarray):
         if token_buffer.feature_dim != self.F:
@@ -1048,34 +1082,70 @@ class ChunkWriter:
         if self.i >= self.N:
             self.flush()
 
-    def flush(self):
-        if self.i == 0: return
-        x_core_path = os.path.join(self.out_dir, f"Xcore_{self.cid:03d}.npy")
-        x_aux_path  = os.path.join(self.out_dir, f"Xaux_{self.cid:03d}.npy")
-        y_path      = os.path.join(self.out_dir, f"y_{self.cid:03d}.npy")
-        ts_path     = os.path.join(self.out_dir, f"ts_{self.cid:03d}.npy")
-
-        # optional: warn if core would overflow fp16
-        if self.core_dtype == np.float16:
-            maxabs = float(np.max(np.abs(self.X_core[:self.i])))
-            if maxabs > np.finfo(np.float16).max:
-                print(f"[warn] core max {maxabs:.1f} exceeds fp16 range; consider BYBIT_SAVE_DTYPE=bf16", flush=True)
-
-        np.save(x_core_path, self.X_core[:self.i].astype(self.core_dtype, copy=False))
-        np.save(x_aux_path,  self.X_aux[:self.i])                 # fp32
-        np.save(y_path,      self.Y[:self.i])                     # fp32
-        np.save(ts_path,     self.TS[:self.i])                    # int64
-
+    def _build_flush_job(self) -> Optional[FlushJob]:
+        if self.i == 0:
+            return None
+        chunk_id = int(self.cid)
+        row_count = int(self.i)
+        job = FlushJob(
+            week_key=self.week_key,
+            chunk_id=chunk_id,
+            row_count=row_count,
+            out_dir=self.out_dir,
+            x_core_file=f"Xcore_{chunk_id:03d}.npy",
+            x_aux_file=f"Xaux_{chunk_id:03d}.npy",
+            y_file=f"y_{chunk_id:03d}.npy",
+            ts_file=f"ts_{chunk_id:03d}.npy",
+            x_core=self.X_core,
+            x_aux=self.X_aux,
+            y=self.Y,
+            ts=self.TS,
+            core_dtype=self.core_dtype,
+        )
         self.chunks_meta.append({
-            "chunk": int(self.cid),
-            "n": int(self.i),
-            "files": {"core": os.path.basename(x_core_path),
-                      "aux":  os.path.basename(x_aux_path),
-                      "y":    os.path.basename(y_path),
-                      "ts":   os.path.basename(ts_path)}
+            "chunk": chunk_id,
+            "n": row_count,
+            "files": {
+                "core": job.x_core_file,
+                "aux": job.x_aux_file,
+                "y": job.y_file,
+                "ts": job.ts_file,
+            },
         })
         self.cid += 1
         self.i = 0
+        self._alloc_buffers()
+        return job
+
+    def flush(self):
+        job = self._build_flush_job()
+        if job is None:
+            return
+        if self.flush_callback is None:
+            _persist_flush_job(job)
+        else:
+            self.flush_callback(job)
+
+
+_SENTINEL_FLUSH_JOB = object()
+_FLUSH_QUEUE_MAXSIZE = 4
+
+
+def _persist_flush_job(job: FlushJob) -> None:
+    x_core_path = os.path.join(job.out_dir, job.x_core_file)
+    x_aux_path = os.path.join(job.out_dir, job.x_aux_file)
+    y_path = os.path.join(job.out_dir, job.y_file)
+    ts_path = os.path.join(job.out_dir, job.ts_file)
+
+    if job.core_dtype == np.float16:
+        maxabs = float(np.max(np.abs(job.x_core[: job.row_count])))
+        if maxabs > np.finfo(np.float16).max:
+            print(f"[warn] core max {maxabs:.1f} exceeds fp16 range; consider BYBIT_SAVE_DTYPE=bf16", flush=True)
+
+    np.save(x_core_path, job.x_core[: job.row_count].astype(job.core_dtype, copy=False))
+    np.save(x_aux_path, job.x_aux[: job.row_count])
+    np.save(y_path, job.y[: job.row_count])
+    np.save(ts_path, job.ts[: job.row_count])
 
 
 class WeekWriterRouter:
@@ -1099,11 +1169,56 @@ class WeekWriterRouter:
             wk: (start, end) for wk, start, end in self.week_index
         }
         self.writers: Dict[str, ChunkWriter] = {}
+        self.closed_writers: Dict[str, ChunkWriter] = {}
         self.week_counts: Dict[str, int] = defaultdict(int)
         self.week_decision_span: Dict[str, List[int]] = {}
         self.chunk_size_used: int = 0
         self.week_metas: Dict[str, dict] = {}
         self.pca_meta = dict(pca_meta) if pca_meta is not None else {}
+        self.flush_queue: "queue.Queue[object]" = queue.Queue(maxsize=_FLUSH_QUEUE_MAXSIZE)
+        self.writer_exception: Optional[BaseException] = None
+        self.writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="offline-ingest-chunk-writer",
+            daemon=True,
+        )
+        self.writer_thread.start()
+
+    def _check_writer_exception(self) -> None:
+        if self.writer_exception is not None:
+            raise RuntimeError("Asynchronous chunk writer failed") from self.writer_exception
+
+    def _writer_loop(self) -> None:
+        try:
+            while True:
+                job = self.flush_queue.get()
+                try:
+                    if job is _SENTINEL_FLUSH_JOB:
+                        return
+                    _persist_flush_job(job)
+                finally:
+                    self.flush_queue.task_done()
+        except BaseException as exc:
+            self.writer_exception = exc
+            while True:
+                try:
+                    pending = self.flush_queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self.flush_queue.task_done()
+                    if pending is _SENTINEL_FLUSH_JOB:
+                        break
+
+    def _enqueue_flush_job(self, job: FlushJob) -> None:
+        while True:
+            self._check_writer_exception()
+            try:
+                self.flush_queue.put(job, timeout=0.5)
+                self._check_writer_exception()
+                return
+            except queue.Full:
+                continue
 
     def _ensure_writer(self, week_key: str) -> ChunkWriter:
         if week_key in self.writers:
@@ -1116,6 +1231,8 @@ class WeekWriterRouter:
             self.feature_dim,
             self.ram_budget_mb,
             self.chunk_size_override,
+            week_key=week_key,
+            flush_callback=self._enqueue_flush_job,
         )
         self.writers[week_key] = writer
         if not self.chunk_size_used:
@@ -1139,8 +1256,8 @@ class WeekWriterRouter:
         # If we're here, this really is outside any reasonable week boundary.
         raise ValueError(f"No week found for decision timestamp {ts_ms}")
 
-
     def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, label: np.ndarray):
+        self._check_writer_exception()
         wk = self._find_week_key(ts_decision_ms)
         writer = self._ensure_writer(wk)
         writer.add_from_token_buffer(ts_decision_ms, token_buffer, label)
@@ -1152,14 +1269,16 @@ class WeekWriterRouter:
             span[0] = min(span[0], ts_decision_ms)
             span[1] = max(span[1], ts_decision_ms)
 
-    def _finalize_week(self, week_key: str):
+    def _close_writer(self, week_key: str):
         writer = self.writers.pop(week_key, None)
-        span = self.week_decision_span.pop(week_key, None)
-        total_sequences = int(self.week_counts.get(week_key, 0))
         if writer is None:
-            # Week already finalised or produced no data.
             return
         writer.flush()
+        self.closed_writers[week_key] = writer
+
+    def _build_week_meta(self, week_key: str, writer: ChunkWriter) -> dict:
+        span = self.week_decision_span.pop(week_key, None)
+        total_sequences = int(self.week_counts.get(week_key, 0))
         meta_path = os.path.join(self.out_root, week_key, "meta_week.json")
         chunks_meta = [
             {
@@ -1216,6 +1335,12 @@ class WeekWriterRouter:
             json.dump(meta, f, indent=2)
         self.week_metas[week_key] = meta
         print(f"[write] week={week_key} chunks={len(chunks_meta)} rows={rows_total}", flush=True)
+        return meta
+
+    def _finalize_closed_weeks(self):
+        for week_key, writer in list(self.closed_writers.items()):
+            self._build_week_meta(week_key, writer)
+            del self.closed_writers[week_key]
 
     def close_old_writers(self, watermark_ms: int):
         to_close = []
@@ -1224,14 +1349,18 @@ class WeekWriterRouter:
             if end_ms + GRACE_MS < watermark_ms:
                 to_close.append(wk)
         for wk in to_close:
-            self._finalize_week(wk)
+            self._close_writer(wk)
 
     def flush_all(self):
         for wk in list(self.writers.keys()):
-            self._finalize_week(wk)
-        # If any metadata spans remain (e.g. weeks with no chunks), clear them.
+            self._close_writer(wk)
+        self._check_writer_exception()
+        self.flush_queue.put(_SENTINEL_FLUSH_JOB)
+        self.writer_thread.join()
+        self._check_writer_exception()
+        self._finalize_closed_weeks()
         for wk in list(self.week_decision_span.keys()):
-            self._finalize_week(wk)
+            self.week_decision_span.pop(wk, None)
 # --------------- dataset-wide processing ---------------
 def _compute_dataset_span(pairs: List[WeekPair]):
     if not pairs:
