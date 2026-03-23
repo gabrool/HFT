@@ -2,7 +2,6 @@ import json
 import os
 import time
 import warnings
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -864,21 +863,24 @@ def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> Basel
     return _validate_baseline_quote_config(cfg)
 
 
-BASELINE_QUOTE_ENV_VAR_MAP: Tuple[Tuple[str, str], ...] = (
-    ("base_half_spread_bps", "BYBIT_MM_BASE_HALF_SPREAD_BPS"),
-    ("alpha_center_scale", "BYBIT_MM_ALPHA_CENTER_SCALE"),
-    ("inventory_center_scale", "BYBIT_MM_INVENTORY_CENTER_SCALE"),
-    ("vol_width_scale", "BYBIT_MM_VOL_WIDTH_SCALE"),
-    ("uncertainty_width_scale", "BYBIT_MM_UNCERTAINTY_WIDTH_SCALE"),
-    ("inventory_side_widen_scale", "BYBIT_MM_INVENTORY_SIDE_WIDEN_SCALE"),
-    ("obs_spread_anchor_frac", "BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC"),
-    ("spread_floor_bps", "BYBIT_MM_SPREAD_FLOOR_BPS"),
-    ("spread_cap_bps", "BYBIT_MM_SPREAD_CAP_BPS"),
-    ("inv_ref_notional", "BYBIT_MM_INV_REF_NOTIONAL"),
-    ("p250_weight", "BYBIT_MM_P250_WEIGHT"),
-    ("p500_weight", "BYBIT_MM_P500_WEIGHT"),
-    ("p1000_weight", "BYBIT_MM_P1000_WEIGHT"),
-)
+def baseline_quote_config_to_dict(cfg: BaselineQuoteConfig) -> Dict[str, Any]:
+    validated = _validate_baseline_quote_config(cfg)
+    return {
+        "base_half_spread_bps": float(validated.base_half_spread_bps),
+        "alpha_center_scale": float(validated.alpha_center_scale),
+        "inventory_center_scale": float(validated.inventory_center_scale),
+        "vol_width_scale": float(validated.vol_width_scale),
+        "uncertainty_width_scale": float(validated.uncertainty_width_scale),
+        "inventory_side_widen_scale": float(validated.inventory_side_widen_scale),
+        "obs_spread_anchor_frac": float(validated.obs_spread_anchor_frac),
+        "spread_floor_bps": float(validated.spread_floor_bps),
+        "spread_cap_bps": float(validated.spread_cap_bps),
+        "inv_ref_notional": float(validated.inv_ref_notional),
+        "horizons_ms": [int(h) for h in validated.horizons_ms],
+        "p250_weight": float(validated.p250_weight),
+        "p500_weight": float(validated.p500_weight),
+        "p1000_weight": float(validated.p1000_weight),
+    }
 
 
 def _resolve_baseline_quote_config(
@@ -970,27 +972,6 @@ def build_vol_bucket_report(
         "vol_bucket_edges_bps": bucket_edges,
         "vol_bucket_report": report_rows,
     }
-
-
-@contextmanager
-def temporary_baseline_quote_env_from_config(
-    config: Optional[BaselineQuoteConfig | Dict[str, Any]],
-):
-    quote_cfg = _resolve_baseline_quote_config(config)
-    if quote_cfg is None:
-        yield None
-        return
-    previous = {env_name: os.environ.get(env_name) for _, env_name in BASELINE_QUOTE_ENV_VAR_MAP}
-    try:
-        for field_name, env_name in BASELINE_QUOTE_ENV_VAR_MAP:
-            os.environ[env_name] = str(getattr(quote_cfg, field_name))
-        yield quote_cfg
-    finally:
-        for env_name, prior in previous.items():
-            if prior is None:
-                os.environ.pop(env_name, None)
-            else:
-                os.environ[env_name] = prior
 
 
 def _infer_num_horizons(feature_dim: int) -> int:
@@ -1801,6 +1782,7 @@ class MarketMakingEnv:
         obs_norm_state: Optional[dict] = None,
         freeze_obs_norm: bool = False,
         baseline_alpha_calibration: Optional[BaselineAlphaCalibration] = None,
+        baseline_quote_config: Optional[BaselineQuoteConfig] = None,
     ):
         self.features = batch.features
         self.spread_bps = batch.spread_bps
@@ -1895,11 +1877,13 @@ class MarketMakingEnv:
             _env_int("BYBIT_MM_FILL_EMA_WINDOW_STEPS", DEFAULT_MM_FILL_EMA_WINDOW_STEPS),
         )
         self.fill_ema_alpha = 2.0 / (float(self.fill_ema_window_steps) + 1.0)
-        self._baseline_cfg = load_baseline_quote_config()
+        self.baseline_quote_config = _validate_baseline_quote_config(
+            load_baseline_quote_config() if baseline_quote_config is None else baseline_quote_config
+        )
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._horizons_ms = _normalize_horizons(
             self._num_h,
-            self._baseline_cfg.horizons_ms,
+            self.baseline_quote_config.horizons_ms,
         )
         self._horizons_ms = _validate_fixed_cmssl_horizons(self._horizons_ms)
         self._p250_idx = _resolve_horizon_index(
@@ -2235,7 +2219,7 @@ class MarketMakingEnv:
         return float(np.clip(half_spread_bps_raw, cfg.spread_floor_bps, cfg.spread_cap_bps))
 
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
-        cfg = self._baseline_cfg
+        cfg = self.baseline_quote_config
         mid = self._mid_price(idx)
         p_up = self._feature_slice(idx, self._feature_layout["p_up"].start, self._feature_layout["p_up"].stop)
         p250 = float(p_up[self._p250_idx])
@@ -4638,13 +4622,12 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
         raise ValueError("Fast baseline batch unavailable for parity check")
     quote_cfg = _validate_baseline_quote_config(quote_cfg)
     batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
-    with temporary_baseline_quote_env_from_config(quote_cfg):
-        env_metrics = evaluate_market_making(
-            build_baseline_eval_env(batch, context.env_kwargs_common, context.baseline_alpha_calibration),
-            lambda _obs: (0.0, 0.0, 0.0),
-            collect_vol_bucket_report=True,
-            baseline_cfg=quote_cfg,
-        )
+    env_metrics = evaluate_market_making(
+        build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration),
+        lambda _obs: (0.0, 0.0, 0.0),
+        collect_vol_bucket_report=True,
+        baseline_cfg=quote_cfg,
+    )
     fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration)
     for key in ("net_pnl_pct", "maker_fill_rate", "maker_fill_count", "maker_buy_fills", "maker_sell_fills", "turnover_notional", "inventory_mean_abs_notional", "inventory_max_abs_notional"):
         lhs = env_metrics.get(key, env_metrics.get("max_drawdown") if key == "max_dd" else None)
@@ -4662,11 +4645,18 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
 def build_baseline_eval_env(
     batch: MarketMakingBatch,
     env_kwargs_common: Dict[str, Any],
+    baseline_quote_config: BaselineQuoteConfig,
     baseline_alpha_calibration: BaselineAlphaCalibration,
 ) -> MarketMakingEnv:
     # The cached baseline path evaluates a fixed zero-action policy, so
     # observation-normalization prefit/freeze does not affect actions or fills.
-    return MarketMakingEnv(batch, allow_taker=False, baseline_alpha_calibration=baseline_alpha_calibration, **env_kwargs_common)
+    return MarketMakingEnv(
+        batch,
+        allow_taker=False,
+        baseline_alpha_calibration=baseline_alpha_calibration,
+        baseline_quote_config=baseline_quote_config,
+        **env_kwargs_common,
+    )
 
 
 def prepare_baseline_context(
@@ -4781,21 +4771,19 @@ def evaluate_prepared_baseline(
     batch = context.mm_val_batch if eval_split == "val" else context.mm_test_batch
     fast_batch = context.fast_val_batch if eval_split == "val" else context.fast_test_batch
     quote_cfg = _resolve_baseline_quote_config(baseline_config)
-    fast_quote_cfg = load_baseline_quote_config() if quote_cfg is None else quote_cfg
+    quote_cfg = load_baseline_quote_config() if quote_cfg is None else quote_cfg
     fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
     print(f"[baseline eval cached] split={eval_split} fast_mode={fast_enabled}")
     if fast_enabled and fast_batch is not None:
-        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, fast_quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba)
+        baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba)
     else:
-        # The generic env path still resolves quote settings from env vars, so install the structured config temporarily.
-        with temporary_baseline_quote_env_from_config(quote_cfg):
-            env = build_baseline_eval_env(batch, context.env_kwargs_common, context.baseline_alpha_calibration)
-            baseline_metrics = evaluate_market_making(
-                env,
-                lambda _obs: (0.0, 0.0, 0.0),
-                collect_vol_bucket_report=True,
-                baseline_cfg=fast_quote_cfg,
-            )
+        env = build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration)
+        baseline_metrics = evaluate_market_making(
+            env,
+            lambda _obs: (0.0, 0.0, 0.0),
+            collect_vol_bucket_report=True,
+            baseline_cfg=quote_cfg,
+        )
     return {
         "cmssl_test": context.cmssl_report,
         "mm_baseline": baseline_metrics,
@@ -4820,6 +4808,15 @@ def run_pipeline(
     run_mode: str = "train",
 ) -> Dict[str, Any]:
     print(f"[mm run mode] {run_mode}")
+    if run_mode == "baseline":
+        prepared_context = prepare_baseline_context(out_root, ckpt_path, device=device)
+        return evaluate_prepared_baseline(
+            prepared_context,
+            eval_split=_resolve_baseline_eval_split(),
+            baseline_config=None,
+            fast_mode=_env_bool("BYBIT_MM_BASELINE_FAST_MODE", True),
+            use_numba=_env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA),
+        )
     meta = load_global_meta(Path(out_root))
     test_split = resolve_test_split(out_root, meta)
 
@@ -4907,8 +4904,9 @@ def run_pipeline(
         baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
-    baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common, baseline_alpha_calibration)
-    baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common, baseline_alpha_calibration)
+    default_baseline_quote_cfg = load_baseline_quote_config()
+    baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
+    baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
     mm_train_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
@@ -4959,7 +4957,7 @@ def run_pipeline(
     external_ckpt_explicit = bool(external_rl_ckpt.strip())
 
     trained_this_run = False
-    if run_mode in {"train", "baseline"}:
+    if run_mode == "train":
         resolved_eval_ckpt = None
         rl_checkpoint_origin = "none"
         eval_ckpt_payload = None
@@ -5057,7 +5055,7 @@ def run_pipeline(
     ppo_eval_stochastic = _env_bool("BYBIT_MM_PPO_EVAL_STOCHASTIC", False)
     ppo_eval_seed = _env_int("BYBIT_MM_PPO_EVAL_SEED", 0)
 
-    eval_action = "skipped" if run_mode in {"train", "baseline"} else "performed"
+    eval_action = "skipped" if run_mode == "train" else "performed"
     print(
         "[mm eval] "
         f"mode={run_mode} "
@@ -5070,10 +5068,6 @@ def run_pipeline(
         rl_policy_loaded = False
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
         print("[mm eval] baseline only; RL skipped because run_mode=train.")
-    elif run_mode == "baseline":
-        rl_policy_loaded = False
-        rl_policy_reason = "skipped_baseline_mode"
-        print("[mm eval] baseline only; RL skipped because run_mode=baseline.")
     else:
         mm_ppo_model: Optional[MarketPolicyValueNet] = None
         mm_policy: Optional[MarketPolicyNet] = None
