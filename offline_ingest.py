@@ -27,7 +27,7 @@ Environment variables (read via os.environ.get in this module):
   BYBIT_PCA_MODEL=pca_model.npz
   BYBIT_PCA_USE_EXISTING=0
   BYBIT_RAM_BUDGET_MB=512            # memory budget for one chunk
-  BYBIT_CHUNK_SIZE=4096              # 0 = auto from budget; else fixed size
+  BYBIT_CHUNK_SIZE=0                 # default auto-size from RAM budget; set a positive integer to force a fixed chunk size
 
 Shared constants from CMSSL17:
   LOOKBACK (and related model/data constants) are defined in CMSSL17.py.
@@ -65,7 +65,7 @@ PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
-CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "4096"))
+CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "0"))  # 0 = auto-size from RAM budget; >0 = explicit fixed override
 DECISION_POLICY = "ob_only_grid_quantized"
 
 
@@ -1060,7 +1060,6 @@ class ChunkWriter:
             earliest_idx = (token_buffer.cursor - token_buffer.count) % self.L
             earliest = token_buffer.source.tokens[earliest_idx]
             row_core[:pad_n] = earliest[:self.F_core]
-            row_aux[:pad_n] = earliest[self.F_core:]
             row_aux[:pad_n, :] = 0.0
 
         dest_start = pad_n
