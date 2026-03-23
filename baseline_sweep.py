@@ -243,7 +243,7 @@ def build_default_anchor_config() -> Dict[str, Any]:
         "p500_weight": float(weights[1]),
         "p1000_weight": float(weights[2]),
     }
-    return normalize_baseline_config(config)
+    return config
 
 
 def weight_tuple_from_config(config: Dict[str, Any]) -> tuple[float, float, float]:
@@ -362,13 +362,14 @@ def build_trial_descriptor(
 
 
 def sample_baseline_config(rng: np.random.Generator, space: Dict[str, Sequence[Any]]) -> Dict[str, Any]:
-    return generate_random_configs(
+    sampled = generate_random_configs(
         rng,
         space=space,
         anchor_config=build_default_anchor_config(),
         vary_factors=TUNABLE_FACTORS,
         n_trials=1,
     )[0]["config"]
+    return normalize_baseline_config(sampled)
 
 
 def generate_random_configs(
@@ -386,7 +387,6 @@ def generate_random_configs(
             candidates = factor_candidates(space, factor)
             chosen = candidates[int(rng.integers(len(candidates)))]
             apply_factor_value(config, factor, chosen)
-        config = normalize_baseline_config(config)
         plan.append(
             build_trial_descriptor(
                 config,
@@ -417,7 +417,6 @@ def generate_grid_configs(
         config = dict(anchor_config)
         for factor, value in zip(vary_factors, values):
             apply_factor_value(config, factor, value)
-        config = normalize_baseline_config(config)
         plan.append(
             build_trial_descriptor(
                 config,
@@ -454,7 +453,6 @@ def generate_one_factor_configs(
                 continue
             config = dict(anchor_config)
             apply_factor_value(config, factor, candidate)
-            config = normalize_baseline_config(config)
             plan.append(
                 build_trial_descriptor(
                     config,
