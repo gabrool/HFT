@@ -1948,8 +1948,25 @@ def main():
             raise ValueError(
                 f"Requested BYBIT_WEEKS not found in available data: {', '.join(missing)}"
             )
-        requested_unique = list(dict.fromkeys(requested_weeks))
-        requested_set = set(requested_unique)
+
+        seen = set()
+        duplicate_weeks = []
+        duplicate_seen = set()
+        for wk in requested_weeks:
+            if wk in seen:
+                if wk not in duplicate_seen:
+                    duplicate_weeks.append(wk)
+                    duplicate_seen.add(wk)
+            else:
+                seen.add(wk)
+
+        if duplicate_weeks:
+            raise ValueError(
+                "BYBIT_WEEKS contains duplicate week keys; duplicates are not allowed: "
+                + ", ".join(duplicate_weeks)
+            )
+
+        requested_set = set(requested_weeks)
         pairs = [pair for pair in pairs if pair[0] in requested_set]
 
     pairs = _sort_pairs_by_end(pairs)
