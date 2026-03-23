@@ -972,33 +972,6 @@ def build_vol_bucket_report(
     }
 
 
-def _baseline_alpha_calibration_from_meta(meta: Dict[str, Any]) -> BaselineAlphaCalibration:
-    raw = meta.get("baseline_alpha_calibration")
-    if not isinstance(raw, dict):
-        raise ValueError("meta missing baseline_alpha_calibration; run prepare_baseline_context first")
-    required_keys = (
-        "horizons_ms",
-        "score_to_bps_slope_by_horizon",
-        "winsor_lower_bps_by_horizon",
-        "winsor_upper_bps_by_horizon",
-        "fit_count_by_horizon",
-        "diagnostics",
-    )
-    missing = [key for key in required_keys if key not in raw]
-    if missing:
-        raise ValueError(
-            "meta baseline_alpha_calibration missing keys: " + ", ".join(sorted(missing))
-        )
-    return BaselineAlphaCalibration(
-        score_to_bps_slope_by_horizon=np.asarray(raw["score_to_bps_slope_by_horizon"], dtype=np.float64),
-        winsor_lower_bps_by_horizon=np.asarray(raw["winsor_lower_bps_by_horizon"], dtype=np.float64),
-        winsor_upper_bps_by_horizon=np.asarray(raw["winsor_upper_bps_by_horizon"], dtype=np.float64),
-        fit_count_by_horizon=np.asarray(raw["fit_count_by_horizon"], dtype=np.int64),
-        horizons_ms=np.asarray(raw["horizons_ms"], dtype=np.int64),
-        diagnostics=dict(raw["diagnostics"]),
-    )
-
-
 @contextmanager
 def temporary_baseline_quote_env_from_config(
     config: Optional[BaselineQuoteConfig | Dict[str, Any]],
@@ -4892,7 +4865,25 @@ def run_pipeline(
     mm_val_batch = build_market_batch(splits_rl["val"])
     mm_test_batch = build_market_batch(splits_rl["test"])
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
-    baseline_alpha_calibration = _baseline_alpha_calibration_from_meta(meta)
+    fast_val_batch = prepare_fast_baseline_batch(
+        mm_val_batch,
+        meta,
+        env_kwargs_common=env_kwargs_common,
+        split_name="val",
+    )
+    baseline_alpha_calibration = _fit_baseline_alpha_calibration(
+        fast_val_batch,
+        meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS),
+    )
+    calibration_summary = {
+        "fit_split": baseline_alpha_calibration.diagnostics["fit_split"],
+        "horizons_ms": baseline_alpha_calibration.horizons_ms.tolist(),
+        "slope_bps_by_unit_score": np.round(
+            baseline_alpha_calibration.score_to_bps_slope_by_horizon, 6
+        ).tolist(),
+        "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
+    }
+    print(f"[mm runtime] alpha calibration {json.dumps(calibration_summary, sort_keys=True)}")
     delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "10.0"))
     taker_scale = float(os.environ.get("BYBIT_MM_TAKER_SCALE", "1.0"))
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
