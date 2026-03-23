@@ -601,29 +601,54 @@ def _assert_weeks_consecutive(pairs: List[WeekPair]):
 
 
 
-def classify_week_splits(pairs: List[WeekPair]) -> Tuple[List[str], List[str], List[str]]:
-    """
-    Apply the N-week split policy for train/val/test assignment.
-
-    Policy:
-      - n >= 2 weeks are required.
-      - Weeks are assumed already ordered/consecutive (validated in main()).
-      - All earlier weeks are TRAIN.
-      - The final week is the holdout week for both VAL and TEST.
-      - VAL/TEST half/half is enforced downstream using timestamps.
-    """
-    weeks = [wk for wk, _ob, _th in pairs]
-    n = len(weeks)
-
-    if n < 2:
+def build_four_week_pipeline_splits(
+    weeks_in_order: List[str],
+    week_meta_records: Dict[str, Dict[str, object]],
+) -> Dict[str, object]:
+    if len(weeks_in_order) != 4:
         raise ValueError(
-            f"classify_week_splits requires at least two weeks; got {n}."
+            f"build_four_week_pipeline_splits requires exactly 4 weeks; got {len(weeks_in_order)}."
         )
 
-    train_weeks = weeks[:-1]
-    val_weeks = [weeks[-1]]
-    test_weeks = [weeks[-1]]
-    return train_weeks, val_weeks, test_weeks
+    def _decision_range(week_key: str) -> Tuple[int, int]:
+        wk_meta = week_meta_records.get(week_key)
+        if not wk_meta or "decision_ts_range" not in wk_meta:
+            raise ValueError(
+                f"Missing decision_ts_range for week '{week_key}'; cannot derive four-week split boundaries."
+            )
+        decision_range = wk_meta["decision_ts_range"]
+        start = int(decision_range["min"])
+        end = int(decision_range["max"])
+        if end <= start:
+            raise ValueError(
+                f"Week '{week_key}' decision_ts_range invalid: min={start} max={end}"
+            )
+        return start, end
+
+    week1, week2, week3, week4 = weeks_in_order
+    week2_min, week2_max = _decision_range(week2)
+    week3_min, week3_max = _decision_range(week3)
+
+    week2_mid = week2_min + (week2_max - week2_min) // 2
+    week3_40 = week3_min + ((week3_max - week3_min) * 4) // 10
+    week3_70 = week3_min + ((week3_max - week3_min) * 7) // 10
+
+    return {
+        "protocol": "four_week_cmssl_rl_eval_v1",
+        "cmssl": {
+            "train": {"week": week1},
+            "val": {"week": week2, "decision_ts_range": {"start": week2_min, "end": week2_mid}},
+            "test": {"week": week2, "decision_ts_range": {"start": week2_mid, "end": week2_max}},
+        },
+        "rl": {
+            "train": {"week": week3, "decision_ts_range": {"start": week3_min, "end": week3_40}},
+            "val": {"week": week3, "decision_ts_range": {"start": week3_40, "end": week3_70}},
+            "test": {"week": week3, "decision_ts_range": {"start": week3_70, "end": week3_max}},
+        },
+        "eval": {
+            "full": {"week": week4}
+        },
+    }
 
 
 def _sort_pairs_by_end(pairs: List[WeekPair]) -> List[WeekPair]:
@@ -1587,7 +1612,6 @@ def process_all(
     pairs: List[WeekPair],
     out_root: str,
     pca_meta: dict,
-    split_info: Optional[Dict[str, List[str]]] = None,
 ):
     """Run ingest across week pairs composed of ordered daily OB/TH file lists."""
     ensure_dir(out_root)
@@ -1854,49 +1878,6 @@ def process_all(
     with open(os.path.join(out_root, "_data_quality.json"), "w") as f:
         json.dump(data_quality_dataset, f, indent=2)
 
-    split_ranges = None
-    if split_info and len(weeks_in_order) >= 2:
-        holdout_week = weeks_in_order[-1]
-        train_weeks = weeks_in_order[:-1]
-
-        train_week_mins = []
-        train_week_maxs = []
-        for wk in train_weeks:
-            wk_meta = week_meta_records.get(wk)
-            if not wk_meta or "decision_ts_range" not in wk_meta:
-                raise ValueError(
-                    f"Missing decision_ts_range for week '{wk}'; cannot derive train split range."
-                )
-            decision_range = wk_meta["decision_ts_range"]
-            train_week_mins.append(int(decision_range["min"]))
-            train_week_maxs.append(int(decision_range["max"]))
-
-        holdout_meta = week_meta_records.get(holdout_week)
-        if not holdout_meta or "decision_ts_range" not in holdout_meta:
-            raise ValueError(
-                f"Missing decision_ts_range for week '{holdout_week}'; cannot derive val/test split ranges."
-            )
-
-        holdout_range = holdout_meta["decision_ts_range"]
-        holdout_min = int(holdout_range["min"])
-        holdout_max = int(holdout_range["max"])
-        if holdout_max <= holdout_min:
-            raise ValueError(
-                f"Week '{holdout_week}' decision_ts_range invalid: min={holdout_min} max={holdout_max}"
-            )
-
-        midpoint = holdout_min + (holdout_max - holdout_min) // 2
-        split_ranges = {
-            "train_week": train_weeks[-1],
-            "holdout_week": holdout_week,
-            "train_ts_range": {
-                "min": min(train_week_mins),
-                "max": max(train_week_maxs),
-            },
-            "val_ts_range": {"min": holdout_min, "max": midpoint},
-            "test_ts_range": {"min": midpoint, "max": holdout_max},
-        }
-
     # Dataset metadata contract: `weeks_in_order` is the only supported key for
     # week ordering in OUT_ROOT/meta.json.
     meta = {
@@ -1932,10 +1913,7 @@ def process_all(
     meta["pca"] = dict(pca_summary)
     if pca_var_ratio is not None:
         meta["pca"]["explained_variance_ratio"] = [float(x) for x in pca_var_ratio]
-    if split_info:
-        meta["splits"] = {key: list(vals) for key, vals in split_info.items()}
-        if split_ranges:
-            meta["splits"].update(split_ranges)
+    meta["splits"] = build_four_week_pipeline_splits(weeks_in_order, week_meta_records)
     with open(os.path.join(out_root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -1955,10 +1933,6 @@ def process_all(
 # --------------- driver ----------------
 def main():
     ensure_dir(OUT_ROOT)
-    # Week selection contract:
-    #   1) start from all discovered OB/TH week pairs on disk
-    #   2) optionally filter explicitly via BYBIT_WEEKS
-    # No implicit "last K weeks" or anchor-date selection is applied.
     pairs = pair_weeks(OB_DIR, TH_DIR)
 
     if not pairs:
@@ -1975,17 +1949,13 @@ def main():
                 f"Requested BYBIT_WEEKS not found in available data: {', '.join(missing)}"
             )
         requested_unique = list(dict.fromkeys(requested_weeks))
-        if len(requested_unique) < 2:
-            raise ValueError(
-                f"BYBIT_WEEKS must include at least two distinct weeks; got {len(requested_unique)}."
-            )
         requested_set = set(requested_unique)
         pairs = [pair for pair in pairs if pair[0] in requested_set]
 
     pairs = _sort_pairs_by_end(pairs)
-    if len(pairs) < 2:
+    if len(pairs) != 4:
         raise ValueError(
-            f"Need at least two weeks of data after selection; found {len(pairs)}."
+            f"Need exactly 4 distinct consecutive weeks of data after BYBIT_WEEKS filtering; found {len(pairs)}."
         )
 
     _assert_week_order(pairs)
@@ -2002,19 +1972,15 @@ def main():
     print(f"[out  ] OUT_ROOT={OUT_ROOT}")
 
 
-    train_weeks, val_weeks, test_weeks = classify_week_splits(pairs)
-    split_info = {
-        "train": train_weeks,
-        "val": val_weeks,
-        "test": test_weeks,
-    }
+    selected_weeks = [wk for wk, _ob, _th in pairs]
+    week1, week2, week3, week4 = selected_weeks
     print(
-        f"[split] train={len(train_weeks)} val={len(val_weeks)} test={len(test_weeks)}"
+        f"[split] protocol=four_week_cmssl_rl_eval_v1 cmssl.train={week1} cmssl.val/test={week2} rl={week3} eval={week4}"
     )
     pca_fit_meta = maybe_fit_pca_model(
         pairs,
         OUT_ROOT,
-        train_weeks,
+        [week1],
         PCA_VAR_TARGET,
         PCA_MAX_SAMPLE_ROWS,
         PCA_BATCH_SIZE,
@@ -2022,7 +1988,7 @@ def main():
         PCA_USE_EXISTING,
     )
 
-    process_all(pairs, OUT_ROOT, pca_fit_meta, split_info=split_info)
+    process_all(pairs, OUT_ROOT, pca_fit_meta)
 
 if __name__ == "__main__":
     main()
