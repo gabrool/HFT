@@ -1465,7 +1465,7 @@ def _stream_core_features(pairs: List[WeekPair]):
             if event is None:
                 continue
 
-            ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_event(event)
+            ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_fast_event(event)
             if last_global_ts is not None and ts_ms < last_global_ts:
                 raise ValueError(
                     "Non-monotonic timestamps across weeks during PCA stream: "
@@ -1795,7 +1795,7 @@ def process_all(
         if event is None:
             continue
 
-        ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_event(event)
+        ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_fast_event(event)
 
         if not is_trade:
             feat_core = feat_z
@@ -2016,6 +2016,7 @@ def process_all(
         f"var_kept={pca_summary['var_kept']:.4f} k={pca_summary['k']} "
         f"model={pca_summary['model_path']}"
     )
+    fe.print_timer_totals(prefix="[timers]")
 
 # --------------- driver ----------------
 def main():

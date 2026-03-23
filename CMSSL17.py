@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable, Union
+from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable, Union, Sequence
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import math
@@ -1059,6 +1059,7 @@ class FeatureEngine:
         self.asks: Dict[float, float] = {}
         self.bid_lvls: List[Tuple[float, float]] = []  # sorted desc by price
         self.ask_lvls: List[Tuple[float, float]] = []  # sorted asc by price
+        self._book_dirty: bool = False
         self.prev_bsz: float = 0.0
         self.prev_asz: float = 0.0
         self.prev_bsz2: float = 0.0
@@ -1245,6 +1246,12 @@ class FeatureEngine:
         self.z_m2: Optional[np.ndarray] = None  # EWMA of x^2 (for var = m2 - mean^2)
         self._feat_dim: Optional[int] = None
 
+        # ---------- ingest timing ----------
+        self.timer_parse_dispatch_s: float = 0.0
+        self.timer_book_update_s: float = 0.0
+        self.timer_trade_update_s: float = 0.0
+        self.timer_feature_build_s: float = 0.0
+
     def feature_dim(self) -> int:
         """Return feature dimension including Filiary channels."""
         if self._feat_dim is None:
@@ -1409,9 +1416,94 @@ class FeatureEngine:
         return num / den
 
     def _sorted_ladders(self):
-        # cache sorted ladders (top N)
+        # slow-path full rebuild, retained for snapshot resets / invalidated cached ladders
         self.bid_lvls = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[: self.depth]
         self.ask_lvls = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[: self.depth]
+        self._book_dirty = False
+
+    def _insert_level(self, levels: List[Tuple[float, float]], price: float, size: float, is_bid: bool) -> bool:
+        insert_at = 0
+        while insert_at < len(levels):
+            px_i = levels[insert_at][0]
+            if px_i == price:
+                levels[insert_at] = (price, size)
+                return insert_at < self.depth
+            if (price > px_i) if is_bid else (price < px_i):
+                break
+            insert_at += 1
+        levels.insert(insert_at, (price, size))
+        if len(levels) > self.depth:
+            levels.pop()
+        return insert_at < self.depth
+
+    def _remove_level(self, levels: List[Tuple[float, float]], price: float) -> bool:
+        for idx, (px_i, _sz_i) in enumerate(levels):
+            if px_i == price:
+                levels.pop(idx)
+                return idx < self.depth
+        return False
+
+    def _side_requires_full_rebuild(
+        self,
+        book: Dict[float, float],
+        levels: List[Tuple[float, float]],
+        price: float,
+        size: float,
+        is_bid: bool,
+    ) -> bool:
+        prev_size = book.get(price)
+        was_tracked = any(px == price for px, _ in levels)
+        best_price = levels[0][0] if levels else None
+        boundary_price = levels[-1][0] if len(levels) >= self.depth else None
+        deleting = size <= 0.0
+
+        if deleting and prev_size is None:
+            return False
+        if deleting and best_price is not None and price == best_price:
+            return True
+        if deleting:
+            removed = self._remove_level(levels, price)
+            if removed and len(book) >= self.depth:
+                return True
+            return False
+
+        book[price] = size
+        if was_tracked:
+            self._insert_level(levels, price, size, is_bid)
+            return False
+        if len(levels) < self.depth:
+            self._insert_level(levels, price, size, is_bid)
+            return False
+        if boundary_price is None:
+            self._insert_level(levels, price, size, is_bid)
+            return False
+        enters_top = (price > boundary_price) if is_bid else (price < boundary_price)
+        if enters_top:
+            return True
+        return False
+
+    def _apply_side_updates(
+        self,
+        book: Dict[float, float],
+        levels: List[Tuple[float, float]],
+        updates: Sequence[Tuple[float, float]],
+        is_bid: bool,
+    ) -> bool:
+        rebuild = False
+        for price_raw, size_raw in updates:
+            price = float(price_raw)
+            size = float(size_raw)
+            if self._side_requires_full_rebuild(book, levels, price, size, is_bid):
+                rebuild = True
+            if size <= 0.0:
+                book.pop(price, None)
+            else:
+                book[price] = size
+        return rebuild
+
+    def _ensure_book_ladders(self) -> None:
+        if self._book_dirty:
+            self._sorted_ladders()
 
     def _book_best(self) -> Tuple[float, float, float, float]:
         bid = self.bid_lvls[0][0] if self.bid_lvls else 0.0
@@ -1596,234 +1688,12 @@ class FeatureEngine:
 
         raise ValueError(f"Unrecognized event shape: {type(e)} :: {e}")
 
-    def _update_book_from_ob(self, ob_evt: Any):
-        if isinstance(ob_evt, tuple):
-            tp_raw, bids, asks = ob_evt
-            tp = 'snapshot' if int(tp_raw) == 1 else 'delta'
-        else:
-            tp = ob_evt.get('type') or ob_evt.get('data', {}).get('type') or ob_evt.get('DataType') or 'delta'
-            data = ob_evt.get('data', ob_evt)
-            bids = data.get('b', [])
-            asks = data.get('a', [])
-
-        if tp == 'snapshot':
-            self.bids = {float(p): float(q) for p, q in bids[: self.depth]}
-            self.asks = {float(p): float(q) for p, q in asks[: self.depth]}
-        else:  # delta
-            for p, q in bids:
-                p = float(p); q = float(q)
-                if q == 0.0:
-                    self.bids.pop(p, None)
-                else:
-                    self.bids[p] = q
-            for p, q in asks:
-                p = float(p); q = float(q)
-                if q == 0.0:
-                    self.asks.pop(p, None)
-                else:
-                    self.asks[p] = q
-
-        self._sorted_ladders()
-
-    def _interpret_tick_direction(self, tick_dir: Any) -> Tuple[int, int]:
-        tick_sign = 0
-        is_zero_tick = 0
-
-        if isinstance(tick_dir, (int, float)):
-            if tick_dir > 0:
-                tick_sign = 1
-            elif tick_dir < 0:
-                tick_sign = -1
-            else:
-                tick_sign = 0
-                is_zero_tick = 1
-        elif isinstance(tick_dir, str):
-            norm = tick_dir.strip().lower()
-            cleaned = norm.replace("-", "").replace("_", "").replace(" ", "")
-            if 'plus' in cleaned or cleaned in {"plustick", "uptick", "up", "buy", "bid"}:
-                tick_sign = 1
-            elif 'minus' in cleaned or cleaned in {"minustick", "downtick", "down", "sell", "ask"}:
-                tick_sign = -1
-            elif cleaned in {"zerotick", "flat", "unchanged", "0"}:
-                tick_sign = 0
-            if 'zero' in cleaned or cleaned in {"zerotick", "flat", "unchanged", "0"}:
-                is_zero_tick = 1
-
-        return int(tick_sign), int(is_zero_tick)
-
-    def _update_trade_windows(self, ts_ms: int, trade_evt: Any, dt_ms: float):
-        if isinstance(trade_evt, tuple):
-            price, size, side_code, tick_dir_code, is_rpi = trade_evt
-            side = 'buy' if int(side_code) > 0 else 'sell' if int(side_code) < 0 else 'unknown'
-            price = float(price)
-            size = float(size)
-            tick_sign = int(tick_dir_code)
-            is_zero_tick = 1 if int(tick_dir_code) == 0 else 0
-            is_rpi = int(is_rpi)
-        else:
-            side = str(trade_evt['side']).lower()  # 'buy'|'sell'
-            price = float(trade_evt['price'])
-            size = float(trade_evt['size'])
-
-            tick_dir = trade_evt.get("tickDirection")
-            tick_sign = int(self.last_tick_sign)
-            is_zero_tick = int(self.last_is_zero_tick)
-            is_rpi = int(self.last_is_rpi)
-
-            rpi_raw = trade_evt.get("RPI")
-            if rpi_raw is None:
-                rpi_raw = trade_evt.get("rpi")
-
-            if rpi_raw is not None:
-                if isinstance(rpi_raw, str):
-                    rpi_norm = rpi_raw.strip().lower()
-                    if rpi_norm in {"1", "true", "t", "yes", "y"}:
-                        is_rpi = 1
-                    elif rpi_norm in {"0", "false", "f", "no", "n", ""}:
-                        is_rpi = 0
-                    else:
-                        try:
-                            is_rpi = 1 if float(rpi_norm) != 0.0 else 0
-                        except ValueError:
-                            pass
-                else:
-                    try:
-                        is_rpi = 1 if float(rpi_raw) != 0.0 else 0
-                    except (TypeError, ValueError):
-                        pass
-
-            if tick_dir is not None:
-                tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
-
-        if self.last_trade_price is not None:
-            if price > self.last_trade_price:
-                tick_sign, is_zero_tick = 1, 0
-            elif price < self.last_trade_price:
-                tick_sign, is_zero_tick = -1, 0
-            else:
-                if tick_sign == 0 and is_zero_tick == 0:
-                    tick_sign = self.last_tick_sign if self.last_tick_sign != 0 else 0
-                if is_zero_tick == 0:
-                    is_zero_tick = 1
-        else:
-            if tick_sign == 0 and is_zero_tick == 0:
-                tick_sign, is_zero_tick = 0, 0
-
-        self.last_tick_sign = tick_sign
-        self.last_is_zero_tick = is_zero_tick
-        self.last_trade_price = price
-        self.last_is_rpi = is_rpi
-
-        entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
-        for window, deq in self._trade_window_deques.items():
-            deq.append(entry)
-            self._update_trade_window_state_with_insert(window, entry)
-
-        dt_trade_ms = (
-            max(1.0, float(ts_ms - self.last_trade_ts))
-            if self.last_trade_ts is not None
-            else max(1.0, float(dt_ms))
-        )
-
-        # Update volume-regime (vol/sec) EWMAs using trade-arrival timing
-        vol_rate = size / (dt_trade_ms / 1000.0)  # base per second
-        for hl in self.regime_windows_ms:
-            self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
-
-        # VPIN bucket sizing and accumulation
-        v_per_sec = max(self.volume_ewma[1_000], 1e-9)
-        Vb = max(v_per_sec * self.vpin_target_bucket_secs, 1e-9)
-        self.vpin_Vb = Vb if self.vpin_Vb is None else (0.9 * self.vpin_Vb + 0.1 * Vb)
-
-        if side == 'buy':
-            self.vpin_cum_buy += size
-        else:
-            self.vpin_cum_sell += size
-        self.vpin_cum += size
-
-        # Close as many buckets as are filled (proportionally closing the last)
-        while self.vpin_cum >= (self.vpin_Vb or 1e9):
-            if self.vpin_Vb is None:
-                break
-            # proportionally split exactly Vb from current cum pools
-            total = max(self.vpin_cum, 1e-12)
-            scale = (self.vpin_Vb) / total
-            buy_bucket = self.vpin_cum_buy * scale
-            sell_bucket = self.vpin_cum_sell * scale
-            phi = abs(buy_bucket - sell_bucket) / max(self.vpin_Vb, 1e-12)
-            self.vpin_phi.append(phi)
-
-            # subtract the closed bucket
-            self.vpin_cum_buy -= buy_bucket
-            self.vpin_cum_sell -= sell_bucket
-            self.vpin_cum -= self.vpin_Vb
-
-        self.last_trade_ts = ts_ms
-
-    def _add_return(self, ts_ms: int, mid: float, is_ob_event: bool):
-        if mid <= 0.0:
-            return 0.0
-        if self.last_mid_for_ret is None:
-            self.last_mid_for_ret = mid
-            return 0.0
-        r = math.log(mid / self.last_mid_for_ret) if self.last_mid_for_ret > 0 else 0.0
-        self.last_mid_for_ret = mid
-
-        # push to windows
-        self._append_tuple_with_guard(self.ret_hist_100ms, (ts_ms, r), ts_ms, 100, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_250ms, (ts_ms, r), ts_ms, 250, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_500ms, (ts_ms, r), ts_ms, 500, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_1s,   (ts_ms, r), ts_ms, 1_000, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_5s,   (ts_ms, r), ts_ms, 5_000, is_ob_event)
-
-        # update short-horizon EWMA and realized vol caches
-        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
-        r2 = r * r
-        for hl in self.regime_windows_ms:
-            self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
-
-        for ms, deq in self._regime_return_deques.items():
-            self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in deq))
-        return r
-
-    def _stats_from_returns(self, deq: Deque[Tuple[int, float]]) -> Tuple[float, float]:
-        """Return (mean, variance) of returns in a deque window."""
-        n = len(deq)
-        if n <= 1:
-            return 0.0, 0.0
-        vals = [x for _, x in deq]
-        m = float(sum(vals) / n)
-        var = float(sum((v - m) * (v - m) for v in vals) / (n - 1))
-        return m, var
-
-    def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
-        """Per-feature EWMA mean/var rolling z-score."""
-        eps = 1e-9
-        if self._feat_dim is None:
-            self._feat_dim = int(x.shape[0])
-            self.z_mean = x.astype(np.float64).copy()
-            self.z_m2 = (x.astype(np.float64) ** 2).copy()
-            return np.zeros_like(x, dtype=np.float32)
-
-        hl = self._alpha_half_life_ms(self.z_hl_ms)
-        alpha = 1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl))
-
-        # Update EWMA mean and second moment
-        self.z_mean = (1.0 - alpha) * self.z_mean + alpha * x
-        self.z_m2   = (1.0 - alpha) * self.z_m2 + alpha * (x * x)
-        var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
-        z = (x - self.z_mean) / np.sqrt(var)
-        return z.astype(np.float32)
-
-    # -------------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------------
-    def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
-        """
-        Process a single merged event and return:
-            ts_ms, feature_vector (z-scored), mid, is_trade, dt_ms
-        """
-        etype, ts_ms, payload = self._parse_event(e)
+    def _dispatch_parsed_event(
+        self,
+        etype: str,
+        ts_ms: int,
+        payload: Any,
+    ) -> Tuple[int, np.ndarray, float, bool, float]:
         dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
         prev_bid_l1 = self.prev_bsz
         prev_ask_l1 = self.prev_asz
@@ -1834,30 +1704,32 @@ class FeatureEngine:
         for window in self._trade_window_deques:
             self._prune_trade_window(ts_ms, window)
 
-        # Event density
+        is_trade = (etype == 'trade')
         self._append_ts_with_guard(self.ev_100ms, ts_ms, 100, is_ob_event=(etype == 'ob'))
         self._append_ts_with_guard(self.ev_250ms, ts_ms, 250, is_ob_event=(etype == 'ob'))
         self._append_ts_with_guard(self.ev_500ms, ts_ms, 500, is_ob_event=(etype == 'ob'))
         self._append_ts_with_guard(self.ev_1s,    ts_ms, 1000, is_ob_event=(etype == 'ob'))
 
-        # Update book/trades
-        is_trade = (etype == 'trade')
         if etype == 'ob':
-            self._update_book_from_ob(payload)
+            tp_code, bids, asks = payload
+            t0 = time.perf_counter()
+            self._update_book_from_ob(tp_code, bids, asks)
+            self.timer_book_update_s += time.perf_counter() - t0
             for window, deq in self._quote_window_deques.items():
                 self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
         else:
+            t0 = time.perf_counter()
             self._update_trade_windows(ts_ms, payload, dt_ms)
+            self.timer_trade_update_s += time.perf_counter() - t0
 
-        # Compute basic ladders + best quotes
-        self._sorted_ladders()
+        t0 = time.perf_counter()
+        self._ensure_book_ladders()
         bid1, ask1, bsz1, asz1 = self._book_best()
         mid = 0.5 * (bid1 + ask1) if (bid1 > 0 and ask1 > 0) else 0.0
 
         # Microprice and SmartPrice (inverse-size weighting)
         if (bsz1 + asz1) > 0:
             micro = (ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1)
-            # smart weights: w_b = 1/bsz, w_a = 1/asz
             wb = 1.0 / max(bsz1, 1e-12)
             wa = 1.0 / max(asz1, 1e-12)
             smart = (bid1 * wb + ask1 * wa) / (wb + wa)
@@ -1881,7 +1753,6 @@ class FeatureEngine:
             spread_deltas[window] = spread - ref_val
         self.spread_history.append((ts_ms, spread))
 
-        # Gaps (best->second)
         ask2 = self.ask_lvls[1][0] if len(self.ask_lvls) > 1 else ask1
         bid2 = self.bid_lvls[1][0] if len(self.bid_lvls) > 1 else bid1
         gap_a = max(0.0, ask2 - ask1)
@@ -2332,7 +2203,289 @@ class FeatureEngine:
         self.last_ts = ts_ms
         self._last_event_ts = ts_ms
 
+        self.timer_feature_build_s += time.perf_counter() - t0
         return ts_ms, feat_z, mid, is_trade, dt_ms
+
+    def _update_book_from_ob(
+        self,
+        tp_code: int,
+        bids: Sequence[Tuple[float, float]],
+        asks: Sequence[Tuple[float, float]],
+    ) -> None:
+        if int(tp_code) == 1:
+            self.bids = {float(p): float(q) for p, q in bids[: self.depth]}
+            self.asks = {float(p): float(q) for p, q in asks[: self.depth]}
+            self._sorted_ladders()
+            return
+
+        rebuild_bid = self._apply_side_updates(self.bids, self.bid_lvls, bids, is_bid=True)
+        rebuild_ask = self._apply_side_updates(self.asks, self.ask_lvls, asks, is_bid=False)
+        self._book_dirty = bool(rebuild_bid or rebuild_ask)
+
+    def _interpret_tick_direction(self, tick_dir: Any) -> Tuple[int, int]:
+        tick_sign = 0
+        is_zero_tick = 0
+
+        if isinstance(tick_dir, (int, float)):
+            if tick_dir > 0:
+                tick_sign = 1
+            elif tick_dir < 0:
+                tick_sign = -1
+            else:
+                tick_sign = 0
+                is_zero_tick = 1
+        elif isinstance(tick_dir, str):
+            norm = tick_dir.strip().lower()
+            cleaned = norm.replace("-", "").replace("_", "").replace(" ", "")
+            if 'plus' in cleaned or cleaned in {"plustick", "uptick", "up", "buy", "bid"}:
+                tick_sign = 1
+            elif 'minus' in cleaned or cleaned in {"minustick", "downtick", "down", "sell", "ask"}:
+                tick_sign = -1
+            elif cleaned in {"zerotick", "flat", "unchanged", "0"}:
+                tick_sign = 0
+            if 'zero' in cleaned or cleaned in {"zerotick", "flat", "unchanged", "0"}:
+                is_zero_tick = 1
+
+        return int(tick_sign), int(is_zero_tick)
+
+    def _update_trade_windows(self, ts_ms: int, trade_evt: Any, dt_ms: float):
+        if isinstance(trade_evt, tuple):
+            price, size, side_code, tick_dir_code, is_rpi = trade_evt
+            side = 'buy' if int(side_code) > 0 else 'sell' if int(side_code) < 0 else 'unknown'
+            price = float(price)
+            size = float(size)
+            tick_sign = int(tick_dir_code)
+            is_zero_tick = 1 if int(tick_dir_code) == 0 else 0
+            is_rpi = int(is_rpi)
+        else:
+            side = str(trade_evt['side']).lower()  # 'buy'|'sell'
+            price = float(trade_evt['price'])
+            size = float(trade_evt['size'])
+
+            tick_dir = trade_evt.get("tickDirection")
+            tick_sign = int(self.last_tick_sign)
+            is_zero_tick = int(self.last_is_zero_tick)
+            is_rpi = int(self.last_is_rpi)
+
+            rpi_raw = trade_evt.get("RPI")
+            if rpi_raw is None:
+                rpi_raw = trade_evt.get("rpi")
+
+            if rpi_raw is not None:
+                if isinstance(rpi_raw, str):
+                    rpi_norm = rpi_raw.strip().lower()
+                    if rpi_norm in {"1", "true", "t", "yes", "y"}:
+                        is_rpi = 1
+                    elif rpi_norm in {"0", "false", "f", "no", "n", ""}:
+                        is_rpi = 0
+                    else:
+                        try:
+                            is_rpi = 1 if float(rpi_norm) != 0.0 else 0
+                        except ValueError:
+                            pass
+                else:
+                    try:
+                        is_rpi = 1 if float(rpi_raw) != 0.0 else 0
+                    except (TypeError, ValueError):
+                        pass
+
+            if tick_dir is not None:
+                tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
+
+        if self.last_trade_price is not None:
+            if price > self.last_trade_price:
+                tick_sign, is_zero_tick = 1, 0
+            elif price < self.last_trade_price:
+                tick_sign, is_zero_tick = -1, 0
+            else:
+                if tick_sign == 0 and is_zero_tick == 0:
+                    tick_sign = self.last_tick_sign if self.last_tick_sign != 0 else 0
+                if is_zero_tick == 0:
+                    is_zero_tick = 1
+        else:
+            if tick_sign == 0 and is_zero_tick == 0:
+                tick_sign, is_zero_tick = 0, 0
+
+        self.last_tick_sign = tick_sign
+        self.last_is_zero_tick = is_zero_tick
+        self.last_trade_price = price
+        self.last_is_rpi = is_rpi
+
+        entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
+        for window, deq in self._trade_window_deques.items():
+            deq.append(entry)
+            self._update_trade_window_state_with_insert(window, entry)
+
+        dt_trade_ms = (
+            max(1.0, float(ts_ms - self.last_trade_ts))
+            if self.last_trade_ts is not None
+            else max(1.0, float(dt_ms))
+        )
+
+        # Update volume-regime (vol/sec) EWMAs using trade-arrival timing
+        vol_rate = size / (dt_trade_ms / 1000.0)  # base per second
+        for hl in self.regime_windows_ms:
+            self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
+
+        # VPIN bucket sizing and accumulation
+        v_per_sec = max(self.volume_ewma[1_000], 1e-9)
+        Vb = max(v_per_sec * self.vpin_target_bucket_secs, 1e-9)
+        self.vpin_Vb = Vb if self.vpin_Vb is None else (0.9 * self.vpin_Vb + 0.1 * Vb)
+
+        if side == 'buy':
+            self.vpin_cum_buy += size
+        else:
+            self.vpin_cum_sell += size
+        self.vpin_cum += size
+
+        # Close as many buckets as are filled (proportionally closing the last)
+        while self.vpin_cum >= (self.vpin_Vb or 1e9):
+            if self.vpin_Vb is None:
+                break
+            # proportionally split exactly Vb from current cum pools
+            total = max(self.vpin_cum, 1e-12)
+            scale = (self.vpin_Vb) / total
+            buy_bucket = self.vpin_cum_buy * scale
+            sell_bucket = self.vpin_cum_sell * scale
+            phi = abs(buy_bucket - sell_bucket) / max(self.vpin_Vb, 1e-12)
+            self.vpin_phi.append(phi)
+
+            # subtract the closed bucket
+            self.vpin_cum_buy -= buy_bucket
+            self.vpin_cum_sell -= sell_bucket
+            self.vpin_cum -= self.vpin_Vb
+
+        self.last_trade_ts = ts_ms
+
+    def _add_return(self, ts_ms: int, mid: float, is_ob_event: bool):
+        if mid <= 0.0:
+            return 0.0
+        if self.last_mid_for_ret is None:
+            self.last_mid_for_ret = mid
+            return 0.0
+        r = math.log(mid / self.last_mid_for_ret) if self.last_mid_for_ret > 0 else 0.0
+        self.last_mid_for_ret = mid
+
+        # push to windows
+        self._append_tuple_with_guard(self.ret_hist_100ms, (ts_ms, r), ts_ms, 100, is_ob_event)
+        self._append_tuple_with_guard(self.ret_hist_250ms, (ts_ms, r), ts_ms, 250, is_ob_event)
+        self._append_tuple_with_guard(self.ret_hist_500ms, (ts_ms, r), ts_ms, 500, is_ob_event)
+        self._append_tuple_with_guard(self.ret_hist_1s,   (ts_ms, r), ts_ms, 1_000, is_ob_event)
+        self._append_tuple_with_guard(self.ret_hist_5s,   (ts_ms, r), ts_ms, 5_000, is_ob_event)
+
+        # update short-horizon EWMA and realized vol caches
+        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
+        r2 = r * r
+        for hl in self.regime_windows_ms:
+            self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
+
+        for ms, deq in self._regime_return_deques.items():
+            self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in deq))
+        return r
+
+    def _stats_from_returns(self, deq: Deque[Tuple[int, float]]) -> Tuple[float, float]:
+        """Return (mean, variance) of returns in a deque window."""
+        n = len(deq)
+        if n <= 1:
+            return 0.0, 0.0
+        vals = [x for _, x in deq]
+        m = float(sum(vals) / n)
+        var = float(sum((v - m) * (v - m) for v in vals) / (n - 1))
+        return m, var
+
+    def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
+        """Per-feature EWMA mean/var rolling z-score."""
+        eps = 1e-9
+        if self._feat_dim is None:
+            self._feat_dim = int(x.shape[0])
+            self.z_mean = x.astype(np.float64).copy()
+            self.z_m2 = (x.astype(np.float64) ** 2).copy()
+            return np.zeros_like(x, dtype=np.float32)
+
+        hl = self._alpha_half_life_ms(self.z_hl_ms)
+        alpha = 1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl))
+
+        # Update EWMA mean and second moment
+        self.z_mean = (1.0 - alpha) * self.z_mean + alpha * x
+        self.z_m2   = (1.0 - alpha) * self.z_m2 + alpha * (x * x)
+        var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
+        z = (x - self.z_mean) / np.sqrt(var)
+        return z.astype(np.float32)
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+    def on_fast_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
+        """Fast ingest path for compact tuples emitted by offline_ingest.py."""
+        t0 = time.perf_counter()
+        if not isinstance(e, tuple) or len(e) < 4 or not isinstance(e[0], str):
+            raise ValueError(f"Expected compact ingest tuple, got: {e!r}")
+        etype = e[0].lower()
+        ts_ms = int(e[1])
+        if etype == 'ob':
+            payload = (int(e[3]), e[4], e[5])
+        elif etype == 'trade':
+            payload = e[3:8]
+        else:
+            raise ValueError(f"Unsupported compact event type: {etype!r}")
+        self.timer_parse_dispatch_s += time.perf_counter() - t0
+        return self._dispatch_parsed_event(etype, ts_ms, payload)
+
+    def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
+        """Slow compatibility path for callers that still pass generic event shapes."""
+        t0 = time.perf_counter()
+        etype, ts_ms, payload = self._parse_event(e)
+        self.timer_parse_dispatch_s += time.perf_counter() - t0
+
+        if etype == 'ob':
+            if isinstance(payload, tuple):
+                compact_payload = (int(payload[0]), payload[1], payload[2])
+            else:
+                data = payload.get('data', payload)
+                compact_payload = (
+                    1 if str(payload.get('type') or data.get('type') or payload.get('DataType') or 'delta').strip().lower() == 'snapshot' else 2,
+                    tuple((float(p), float(q)) for p, q in data.get('b', [])),
+                    tuple((float(p), float(q)) for p, q in data.get('a', [])),
+                )
+            payload = compact_payload
+        elif etype == 'trade' and not isinstance(payload, tuple):
+            rpi_raw = payload.get('RPI')
+            if rpi_raw is None:
+                rpi_raw = payload.get('rpi')
+            if isinstance(rpi_raw, str):
+                rpi_norm = rpi_raw.strip().lower()
+                is_rpi = 1 if rpi_norm in {"1", "true", "t", "yes", "y", "on"} else 0
+            else:
+                try:
+                    is_rpi = 1 if float(rpi_raw) != 0.0 else 0
+                except (TypeError, ValueError):
+                    is_rpi = 0
+            payload = (
+                float(payload['price']),
+                float(payload['size']),
+                1 if str(payload['side']).lower() == 'buy' else -1 if str(payload['side']).lower() == 'sell' else 0,
+                self._interpret_tick_direction(payload.get('tickDirection'))[0],
+                is_rpi,
+            )
+        return self._dispatch_parsed_event(etype, ts_ms, payload)
+
+    def timer_totals(self) -> Dict[str, float]:
+        return {
+            'parse_dispatch_s': float(self.timer_parse_dispatch_s),
+            'order_book_update_s': float(self.timer_book_update_s),
+            'trade_update_s': float(self.timer_trade_update_s),
+            'feature_build_s': float(self.timer_feature_build_s),
+        }
+
+    def print_timer_totals(self, prefix: str = '[timers]') -> None:
+        totals = self.timer_totals()
+        print(
+            f"{prefix} parse_dispatch={totals['parse_dispatch_s']:.6f}s "
+            f"order_book_update={totals['order_book_update_s']:.6f}s "
+            f"trade_update={totals['trade_update_s']:.6f}s "
+            f"feature_build={totals['feature_build_s']:.6f}s",
+            flush=True,
+        )
 
 
 class LabelBuilder:
