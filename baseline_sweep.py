@@ -221,33 +221,9 @@ def resolve_required_path(value: Optional[str], env_name: str) -> str:
     return resolved
 
 
-def validate_baseline_config(config: Dict[str, Any], *, tol: float = 1e-6) -> None:
-    weight_sum = float(config["p250_weight"]) + float(config["p500_weight"]) + float(config["p1000_weight"])
-    if abs(weight_sum - 1.0) > tol:
-        raise ValueError(
-            "Baseline horizon weights must sum to 1.0 within tolerance; "
-            f"got {weight_sum:.12f} for {config}"
-        )
-    nonnegative_keys = (
-        "base_half_spread_bps",
-        "vol_width_scale",
-        "uncertainty_width_scale",
-        "inventory_side_widen_scale",
-        "obs_spread_anchor_frac",
-        "spread_floor_bps",
-    )
-    for key in nonnegative_keys:
-        value = float(config[key])
-        if not math.isfinite(value) or value < 0.0:
-            raise ValueError(f"{key} must be finite and >= 0.0")
-    for key in ("alpha_center_scale", "inventory_center_scale", "spread_cap_bps"):
-        value = float(config[key])
-        if not math.isfinite(value):
-            raise ValueError(f"{key} must be finite")
-    if float(config["spread_cap_bps"]) < float(config["spread_floor_bps"]):
-        raise ValueError("spread_cap_bps must be >= spread_floor_bps")
-    if float(config["inv_ref_notional"]) <= 0.0 or not math.isfinite(float(config["inv_ref_notional"])):
-        raise ValueError("inv_ref_notional must be finite and > 0.0")
+def normalize_baseline_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    cfg_obj = RL_exec.resolve_baseline_quote_config_from_mapping(config)
+    return RL_exec.baseline_quote_config_to_dict(cfg_obj)
 
 
 def build_default_anchor_config() -> Dict[str, Any]:
@@ -267,8 +243,7 @@ def build_default_anchor_config() -> Dict[str, Any]:
         "p500_weight": float(weights[1]),
         "p1000_weight": float(weights[2]),
     }
-    validate_baseline_config(config)
-    return config
+    return normalize_baseline_config(config)
 
 
 def weight_tuple_from_config(config: Dict[str, Any]) -> tuple[float, float, float]:
@@ -304,8 +279,7 @@ def resolve_anchor_config(args: argparse.Namespace) -> Dict[str, Any]:
             continue
         config[config_key] = float(value)
 
-    validate_baseline_config(config)
-    return config
+    return normalize_baseline_config(config)
 
 
 def validate_vary_factors(factors: Sequence[str]) -> List[str]:
@@ -412,7 +386,7 @@ def generate_random_configs(
             candidates = factor_candidates(space, factor)
             chosen = candidates[int(rng.integers(len(candidates)))]
             apply_factor_value(config, factor, chosen)
-        validate_baseline_config(config)
+        config = normalize_baseline_config(config)
         plan.append(
             build_trial_descriptor(
                 config,
@@ -443,7 +417,7 @@ def generate_grid_configs(
         config = dict(anchor_config)
         for factor, value in zip(vary_factors, values):
             apply_factor_value(config, factor, value)
-        validate_baseline_config(config)
+        config = normalize_baseline_config(config)
         plan.append(
             build_trial_descriptor(
                 config,
@@ -480,7 +454,7 @@ def generate_one_factor_configs(
                 continue
             config = dict(anchor_config)
             apply_factor_value(config, factor, candidate)
-            validate_baseline_config(config)
+            config = normalize_baseline_config(config)
             plan.append(
                 build_trial_descriptor(
                     config,
@@ -678,15 +652,16 @@ def evaluate_baseline_config(
     fast_mode: bool,
     use_numba: Optional[bool],
 ) -> Dict[str, Any]:
+    normalized_config = normalize_baseline_config(config)
     report = RL_exec.evaluate_prepared_baseline(
         prepared_context,
         eval_split=eval_split,
-        baseline_config=config,
+        baseline_config=normalized_config,
         fast_mode=fast_mode,
         use_numba=use_numba,
     )
     return flatten_report_row(
-        config,
+        normalized_config,
         report,
         trial=trial,
         seed=seed,
