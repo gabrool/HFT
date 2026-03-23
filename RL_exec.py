@@ -2249,14 +2249,17 @@ class MarketMakingEnv:
         p500: float,
         p1000: float,
     ) -> float:
-        obs_anchor_bps = cfg.base_half_spread_bps
+        obs_anchor_bps = 0.0
         if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-            obs_anchor_bps = max(obs_anchor_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
+            obs_anchor_bps = max(0.0, cfg.obs_spread_anchor_frac * observed_spread_bps)
         sigma_bps = 1e4 * max(0.0, vol_short, vol_long)
-        disagreement = max(abs(p250 - p500), abs(p250 - p1000), abs(p500 - p1000))
-        uncertainty_ref_bps = sigma_bps + 1e4 * disagreement
-        half_spread_bps = obs_anchor_bps + cfg.vol_width_scale * sigma_bps + cfg.uncertainty_width_scale * uncertainty_ref_bps
-        return float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+        disagreement = max(abs(p250 - p500), abs(p500 - p1000), abs(p250 - p1000))
+        uncertainty_ref_bps = max(cfg.base_half_spread_bps, obs_anchor_bps, sigma_bps, cfg.spread_floor_bps)
+        base_component_bps = max(cfg.base_half_spread_bps, obs_anchor_bps, cfg.spread_floor_bps)
+        vol_width_bps = cfg.vol_width_scale * sigma_bps
+        uncertainty_width_bps = cfg.uncertainty_width_scale * disagreement * uncertainty_ref_bps
+        half_spread_bps_raw = base_component_bps + vol_width_bps + uncertainty_width_bps
+        return float(np.clip(half_spread_bps_raw, cfg.spread_floor_bps, cfg.spread_cap_bps))
 
     def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
         cfg = self._baseline_cfg
@@ -4451,13 +4454,16 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
             + p1000_weight * score_to_bps_slope_1000 * score_1000
         )
         observed_spread_bps_i = observed_spread_bps[idx]
-        obs_anchor_bps = base_half_spread_bps
+        obs_anchor_bps = 0.0
         if np.isfinite(observed_spread_bps_i) and observed_spread_bps_i > 0.0:
-            obs_anchor_bps = max(obs_anchor_bps, obs_spread_anchor_frac * observed_spread_bps_i)
+            obs_anchor_bps = max(0.0, obs_spread_anchor_frac * observed_spread_bps_i)
         sigma_bps = 1e4 * max(0.0, vol_short[idx], vol_long[idx])
-        disagreement = max(abs(p250[idx] - p500[idx]), abs(p250[idx] - p1000[idx]), abs(p500[idx] - p1000[idx]))
-        uncertainty_ref_bps = sigma_bps + 1e4 * disagreement
-        half_spread_bps = obs_anchor_bps + vol_width_scale * sigma_bps + uncertainty_width_scale * uncertainty_ref_bps
+        disagreement = max(abs(p250[idx] - p500[idx]), abs(p500[idx] - p1000[idx]), abs(p250[idx] - p1000[idx]))
+        uncertainty_ref_bps = max(base_half_spread_bps, obs_anchor_bps, sigma_bps, spread_floor_bps)
+        base_component_bps = max(base_half_spread_bps, obs_anchor_bps, spread_floor_bps)
+        vol_width_bps = vol_width_scale * sigma_bps
+        uncertainty_width_bps = uncertainty_width_scale * disagreement * uncertainty_ref_bps
+        half_spread_bps = base_component_bps + vol_width_bps + uncertainty_width_bps
         if half_spread_bps < spread_floor_bps:
             half_spread_bps = spread_floor_bps
         if half_spread_bps > spread_cap_bps:
