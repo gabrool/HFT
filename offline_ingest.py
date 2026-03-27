@@ -938,27 +938,30 @@ def build_four_week_pipeline_splits(
         return start, end
 
     week1, week2, week3, week4 = weeks_in_order
+    week1_min, week1_max = _decision_range(week1)
     week2_min, week2_max = _decision_range(week2)
     week3_min, week3_max = _decision_range(week3)
+    week4_min, week4_max = _decision_range(week4)
 
-    week2_mid = week2_min + (week2_max - week2_min) // 2
     week3_40 = week3_min + ((week3_max - week3_min) * 4) // 10
     week3_70 = week3_min + ((week3_max - week3_min) * 7) // 10
 
     return {
-        "protocol": "four_week_cmssl_rl_eval_v1",
+        "protocol": "four_week_cmssl_val_test_rl_eval_v2",
         "cmssl": {
-            "train": {"week": week1},
-            "val": {"week": week2, "decision_ts_range": {"start": week2_min, "end": week2_mid}},
-            "test": {"week": week2, "decision_ts_range": {"start": week2_mid, "end": week2_max}},
+            "train": {"weeks": [week1], "start": week1_min, "end": week1_max},
+            "val": {"weeks": [week2], "start": week2_min, "end": week2_max},
+            "test": {"weeks": [week3], "start": week3_min, "end": week3_max},
         },
         "rl": {
+            "week": week3,
             "train": {"week": week3, "decision_ts_range": {"start": week3_min, "end": week3_40}},
             "val": {"week": week3, "decision_ts_range": {"start": week3_40, "end": week3_70}},
             "test": {"week": week3, "decision_ts_range": {"start": week3_70, "end": week3_max}},
         },
         "eval": {
-            "full": {"week": week4}
+            "week": week4,
+            "full": {"weeks": [week4], "start": week4_min, "end": week4_max},
         },
     }
 
@@ -2646,7 +2649,7 @@ def main():
     selected_weeks = [wk for wk, _ob, _th in pairs]
     week1, week2, week3, week4 = selected_weeks
     print(
-        f"[split] protocol=four_week_cmssl_rl_eval_v1 cmssl.train={week1} cmssl.val/test={week2} rl={week3} eval={week4}"
+        f"[split] protocol=four_week_cmssl_val_test_rl_eval_v2 cmssl.train={week1} cmssl.val={week2} cmssl.test={week3} rl={week3} eval={week4}"
     )
     pca_fit_meta = maybe_fit_pca_model(
         pairs,
