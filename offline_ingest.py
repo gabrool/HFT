@@ -2170,8 +2170,6 @@ def process_all(
     current_grid_latest_ob_ts_ms: Optional[int] = None
     current_grid_trade_count_running = 0
     current_grid_last_trade_ts_running: Optional[int] = None
-    current_grid_trade_count_at_latest_ob = 0
-    current_grid_last_trade_ts_at_latest_ob: Optional[int] = None
     current_grid_collision_count = 0
     current_grid_max_collision_delta_ms: Optional[int] = None
 
@@ -2253,8 +2251,8 @@ def process_all(
                 grid_ts=int(current_grid_ts),
                 actual_ob_ts_ms=int(current_grid_latest_ob_ts_ms),
                 collision_count_for_decision=int(current_grid_collision_count),
-                trade_count_after_grid=int(current_grid_trade_count_at_latest_ob),
-                last_trade_ts_after_grid=current_grid_last_trade_ts_at_latest_ob,
+                trade_count_after_grid=int(current_grid_trade_count_running),
+                last_trade_ts_after_grid=current_grid_last_trade_ts_running,
                 max_collision_delta_ms=current_grid_max_collision_delta_ms,
             )
             current_grid_ts = None
@@ -2262,8 +2260,6 @@ def process_all(
             current_grid_latest_ob_ts_ms = None
             current_grid_trade_count_running = 0
             current_grid_last_trade_ts_running = None
-            current_grid_trade_count_at_latest_ob = 0
-            current_grid_last_trade_ts_at_latest_ob = None
             current_grid_collision_count = 0
             current_grid_max_collision_delta_ms = None
 
@@ -2301,8 +2297,8 @@ def process_all(
                         grid_ts=int(current_grid_ts),
                         actual_ob_ts_ms=int(current_grid_latest_ob_ts_ms),
                         collision_count_for_decision=int(current_grid_collision_count),
-                        trade_count_after_grid=int(current_grid_trade_count_at_latest_ob),
-                        last_trade_ts_after_grid=current_grid_last_trade_ts_at_latest_ob,
+                        trade_count_after_grid=int(current_grid_trade_count_running),
+                        last_trade_ts_after_grid=current_grid_last_trade_ts_running,
                         max_collision_delta_ms=current_grid_max_collision_delta_ms,
                     )
                 dt_tick = DECISION_NOMINAL_STEP_MS if last_grid_ts is None else int(grid_ts - last_grid_ts)
@@ -2334,8 +2330,6 @@ def process_all(
                 current_grid_latest_ob_ts_ms = int(ts_ms)
                 current_grid_trade_count_running = 0
                 current_grid_last_trade_ts_running = None
-                current_grid_trade_count_at_latest_ob = 0
-                current_grid_last_trade_ts_at_latest_ob = None
                 current_grid_collision_count = 0
                 current_grid_max_collision_delta_ms = None
             elif is_collision:
@@ -2360,8 +2354,6 @@ def process_all(
                 pending_decisions[-1].refresh(grid_ts)
                 matured = labeler.on_event(grid_ts, float(mid))
                 current_grid_latest_ob_ts_ms = int(ts_ms)
-                current_grid_trade_count_at_latest_ob = int(current_grid_trade_count_running)
-                current_grid_last_trade_ts_at_latest_ob = current_grid_last_trade_ts_running
             else:
                 raise RuntimeError(
                     f"Non-monotone grid timestamp: grid_ts={grid_ts} < last_grid_ts={last_grid_ts}"
@@ -2407,8 +2399,8 @@ def process_all(
             grid_ts=int(current_grid_ts),
             actual_ob_ts_ms=int(current_grid_latest_ob_ts_ms),
             collision_count_for_decision=int(current_grid_collision_count),
-            trade_count_after_grid=int(current_grid_trade_count_at_latest_ob),
-            last_trade_ts_after_grid=current_grid_last_trade_ts_at_latest_ob,
+            trade_count_after_grid=int(current_grid_trade_count_running),
+            last_trade_ts_after_grid=current_grid_last_trade_ts_running,
             max_collision_delta_ms=current_grid_max_collision_delta_ms,
         )
 
