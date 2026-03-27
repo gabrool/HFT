@@ -32,7 +32,7 @@ Environment variables (read via os.environ.get in this module):
 Shared constants from CMSSL17:
   LOOKBACK (and related model/data constants) are defined in CMSSL17.py.
   If these values are intentionally changed, update them in CMSSL17.py.
-  The decision-time grid contract is centralized in CMSSL17.py.
+  Decision timestamps are the actual OB event timestamps (event-time).
 """
 
 import os, sys, csv, json, re, time, logging
@@ -67,7 +67,7 @@ PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "0"))  # 0 = auto-size from RAM budget; >0 = explicit fixed override
-DECISION_POLICY = "ob_only_grid_quantized"
+DECISION_POLICY = "ob_event_time"
 
 
 
@@ -384,11 +384,7 @@ def _gap_summary_ms(values: List[float]) -> Dict[str, object]:
 @dataclass
 class _DecisionWeekStats:
     decision_count: int = 0
-    lag_ms: List[float] = field(default_factory=list)
-    collision_count: int = 0
-    collision_delta_ms: List[float] = field(default_factory=list)
-    decisions_with_trade_after_grid: int = 0
-    trade_count_after_grid: List[int] = field(default_factory=list)
+    trade_count_after_decision: List[int] = field(default_factory=list)
     last_trade_gap_ms: List[float] = field(default_factory=list)
 
 
@@ -404,48 +400,32 @@ class DecisionTimeDiagnostics:
             self._by_week[week_key] = _DecisionWeekStats()
         return self._by_week[week_key]
 
-    def record_collision(self, week_key: str, collision_delta_ms: int) -> None:
-        stats = self._stats(week_key)
-        stats.collision_count += 1
-        stats.collision_delta_ms.append(float(collision_delta_ms))
-
     def finalize_decision(
         self,
         week_key: str,
-        grid_ts: int,
-        actual_ob_ts_ms: int,
-        collision_count_for_decision: int,
-        trade_count_after_grid: int,
-        last_trade_ts_after_grid: Optional[int],
-        max_collision_delta_ms: Optional[int],
+        decision_ts_ms: int,
+        trade_count_after_decision: int,
+        last_trade_ts_after_decision: Optional[int],
     ) -> None:
         stats = self._stats(week_key)
-        lag_ms = int(actual_ob_ts_ms - grid_ts)
         stats.decision_count += 1
-        stats.lag_ms.append(float(lag_ms))
-        stats.trade_count_after_grid.append(int(trade_count_after_grid))
-        if trade_count_after_grid > 0:
-            stats.decisions_with_trade_after_grid += 1
-            if last_trade_ts_after_grid is not None:
-                stats.last_trade_gap_ms.append(float(actual_ob_ts_ms - int(last_trade_ts_after_grid)))
+        stats.trade_count_after_decision.append(int(trade_count_after_decision))
+        if trade_count_after_decision > 0 and last_trade_ts_after_decision is not None:
+            stats.last_trade_gap_ms.append(float(decision_ts_ms - int(last_trade_ts_after_decision)))
         row = {
             "week": week_key,
-            "grid_ts": int(grid_ts),
-            "actual_ob_ts_ms": int(actual_ob_ts_ms),
-            "lag_ms": int(lag_ms),
-            "is_collision": bool(collision_count_for_decision > 0),
-            "collision_delta_ms": None if max_collision_delta_ms is None else int(max_collision_delta_ms),
-            "trade_count_after_grid": int(trade_count_after_grid),
-            "last_trade_ts_after_grid": None if last_trade_ts_after_grid is None else int(last_trade_ts_after_grid),
-            "last_trade_gap_ms": None if last_trade_ts_after_grid is None else int(actual_ob_ts_ms - int(last_trade_ts_after_grid)),
+            "decision_ts_ms": int(decision_ts_ms),
+            "trade_count_after_decision": int(trade_count_after_decision),
+            "last_trade_ts_after_decision": None if last_trade_ts_after_decision is None else int(last_trade_ts_after_decision),
+            "last_trade_gap_ms": None if last_trade_ts_after_decision is None else int(decision_ts_ms - int(last_trade_ts_after_decision)),
         }
         self._push_sample(row)
 
     def _push_sample(self, row: Dict[str, object]) -> None:
         score = (
-            int(row.get("trade_count_after_grid") or 0),
-            int(row.get("lag_ms") or 0),
-            int(row.get("collision_delta_ms") or 0),
+            int(row.get("trade_count_after_decision") or 0),
+            int(row.get("last_trade_gap_ms") or 0),
+            int(row.get("decision_ts_ms") or 0),
         )
         self._sample_seq += 1
         item = (score, self._sample_seq, row)
@@ -457,21 +437,13 @@ class DecisionTimeDiagnostics:
 
     def _week_summary(self, stats: _DecisionWeekStats) -> Dict[str, object]:
         decision_count = int(stats.decision_count)
-        collision_count = int(stats.collision_count)
-        decisions_with_trade_after_grid = int(stats.decisions_with_trade_after_grid)
+        decisions_with_trade_after_decision = int(sum(1 for v in stats.trade_count_after_decision if int(v) > 0))
         return {
             "decision_count": decision_count,
-            "lag_ms": _tail_summary_ms(stats.lag_ms, (1, 2, 5, 10)),
-            "collision": {
-                "decision_count": decision_count,
-                "collision_count": collision_count,
-                "collision_rate": float(collision_count / max(1, decision_count)),
-                "collision_delta_ms": _tail_summary_ms(stats.collision_delta_ms, (1, 2, 5, 10)),
-            },
-            "post_grid_trades": {
-                "decisions_with_trade_after_grid": decisions_with_trade_after_grid,
-                "fraction_with_trade_after_grid": float(decisions_with_trade_after_grid / max(1, decision_count)),
-                "trade_count_after_grid": _count_summary(stats.trade_count_after_grid, (1, 2, 5, 10)),
+            "post_decision_trades": {
+                "decisions_with_trade_after_decision": decisions_with_trade_after_decision,
+                "fraction_with_trade_after_decision": float(decisions_with_trade_after_decision / max(1, decision_count)),
+                "trade_count_after_decision": _count_summary(stats.trade_count_after_decision, (1, 2, 5, 10)),
                 "last_trade_gap_ms": _gap_summary_ms(stats.last_trade_gap_ms),
             },
         }
@@ -481,11 +453,7 @@ class DecisionTimeDiagnostics:
         global_stats = _DecisionWeekStats()
         for stats in self._by_week.values():
             global_stats.decision_count += int(stats.decision_count)
-            global_stats.collision_count += int(stats.collision_count)
-            global_stats.decisions_with_trade_after_grid += int(stats.decisions_with_trade_after_grid)
-            global_stats.lag_ms.extend(stats.lag_ms)
-            global_stats.collision_delta_ms.extend(stats.collision_delta_ms)
-            global_stats.trade_count_after_grid.extend(stats.trade_count_after_grid)
+            global_stats.trade_count_after_decision.extend(stats.trade_count_after_decision)
             global_stats.last_trade_gap_ms.extend(stats.last_trade_gap_ms)
         return {"version": 1, "by_week": by_week, "global": self._week_summary(global_stats)}
 
@@ -502,20 +470,14 @@ if HERE not in sys.path:
 from CMSSL17 import (
     FeatureEngine,
     LabelBuilder,
-    quantize_ts_ms,
     HORIZONS_MS,
     NUM_HORIZONS,
     LOOKBACK,
     AUX_DIM,
     _open_text,
-    TIME_GRID_STEP_MS,
-    TIME_GRID_GUARD_MS,
     timestamp_to_ms_half_even,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
-
-DECISION_NOMINAL_STEP_MS = int(TIME_GRID_STEP_MS)
-DECISION_GUARD_MS = int(TIME_GRID_GUARD_MS)
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
@@ -1510,8 +1472,7 @@ class WeekWriterRouter:
         meta = {
             "week": week_key,
             "decision_policy": DECISION_POLICY,
-            "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
-            "decision_guard_ms": int(DECISION_GUARD_MS),
+            "decision_time_basis": "ob_event_time",
             "lookback": self.lookback,
             "feature_dim_total": self.feature_dim,
             "feature_dim_core": self.feature_dim - AUX_DIM,
@@ -2159,22 +2120,18 @@ def process_all(
             })
 
     fe = FeatureEngine()
-    # Label timing is aligned to the same quantized 100ms grid as decisions.
-    # Entry references use decision_ts directly (no sub-grid delay).
+    # Decision timestamps are OB event timestamps (event-time).
+    # Entry references use decision_ts directly (no additional delay).
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
 
     token_buffer: Optional[TokenRingBuffer] = None
     pending_decisions: deque[TokenBufferSnapshot] = deque()
-    last_grid_ts: Optional[int] = None
-    last_tick_dt_ms: Optional[int] = None
+    last_decision_ts_ms: Optional[int] = None
     diagnostics = DecisionTimeDiagnostics(sample_limit=200)
-    current_grid_ts: Optional[int] = None
-    current_grid_week_key: Optional[str] = None
-    current_grid_latest_ob_ts_ms: Optional[int] = None
-    current_grid_trade_count_running = 0
-    current_grid_last_trade_ts_running: Optional[int] = None
-    current_grid_collision_count = 0
-    current_grid_max_collision_delta_ms: Optional[int] = None
+    current_decision_ts_ms: Optional[int] = None
+    current_decision_week_key: Optional[str] = None
+    current_trade_count_running = 0
+    current_last_trade_ts_running: Optional[int] = None
 
     F = None
     router: WeekWriterRouter = None  # type: ignore
@@ -2242,38 +2199,30 @@ def process_all(
 
         event_week = wk
         if (
-            current_grid_ts is not None
-            and current_grid_week_key is not None
+            current_decision_ts_ms is not None
+            and current_decision_week_key is not None
             and event_week is not None
-            and event_week != current_grid_week_key
+            and event_week != current_decision_week_key
         ):
-            if current_grid_latest_ob_ts_ms is None:
-                raise RuntimeError("Active grid exists without latest OB timestamp during week transition")
             diagnostics.finalize_decision(
-                week_key=current_grid_week_key,
-                grid_ts=int(current_grid_ts),
-                actual_ob_ts_ms=int(current_grid_latest_ob_ts_ms),
-                collision_count_for_decision=int(current_grid_collision_count),
-                trade_count_after_grid=int(current_grid_trade_count_running),
-                last_trade_ts_after_grid=current_grid_last_trade_ts_running,
-                max_collision_delta_ms=current_grid_max_collision_delta_ms,
+                week_key=current_decision_week_key,
+                decision_ts_ms=int(current_decision_ts_ms),
+                trade_count_after_decision=int(current_trade_count_running),
+                last_trade_ts_after_decision=current_last_trade_ts_running,
             )
-            current_grid_ts = None
-            current_grid_week_key = None
-            current_grid_latest_ob_ts_ms = None
-            current_grid_trade_count_running = 0
-            current_grid_last_trade_ts_running = None
-            current_grid_collision_count = 0
-            current_grid_max_collision_delta_ms = None
+            current_decision_ts_ms = None
+            current_decision_week_key = None
+            current_trade_count_running = 0
+            current_last_trade_ts_running = None
 
         t_evt = time.monotonic()
         ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_fast_event(event)
         event_proc_s += time.monotonic() - t_evt
 
         if is_trade:
-            if current_grid_ts is not None and int(ts_ms) > int(current_grid_ts):
-                current_grid_trade_count_running += 1
-                current_grid_last_trade_ts_running = int(ts_ms)
+            if current_decision_ts_ms is not None and int(ts_ms) > int(current_decision_ts_ms):
+                current_trade_count_running += 1
+                current_last_trade_ts_running = int(ts_ms)
         else:
             feat_core = feat_z
             if pca_components is not None and pca_mean is not None:
@@ -2285,82 +2234,47 @@ def process_all(
                 centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
                 feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
 
-            grid_ts = quantize_ts_ms(int(ts_ms), DECISION_NOMINAL_STEP_MS, DECISION_GUARD_MS)
-            matured = None
-
-            is_new_tick = last_grid_ts is None or grid_ts > last_grid_ts
-            is_collision = (last_grid_ts is not None and grid_ts == last_grid_ts)
-
-            if is_new_tick:
-                if current_grid_ts is not None:
-                    if current_grid_latest_ob_ts_ms is None or current_grid_week_key is None:
-                        raise RuntimeError("Active grid exists without required diagnostics state on tick advance")
-                    diagnostics.finalize_decision(
-                        week_key=current_grid_week_key,
-                        grid_ts=int(current_grid_ts),
-                        actual_ob_ts_ms=int(current_grid_latest_ob_ts_ms),
-                        collision_count_for_decision=int(current_grid_collision_count),
-                        trade_count_after_grid=int(current_grid_trade_count_running),
-                        last_trade_ts_after_grid=current_grid_last_trade_ts_running,
-                        max_collision_delta_ms=current_grid_max_collision_delta_ms,
-                    )
-                dt_tick = DECISION_NOMINAL_STEP_MS if last_grid_ts is None else int(grid_ts - last_grid_ts)
-                tok = build_token(fe, feat_core, is_trade, dt_tick)
-                if F is None:
-                    F = tok.shape[0]
-                    token_buffer = TokenRingBuffer(LOOKBACK, F)
-                    router = WeekWriterRouter(
-                        out_root,
-                        LOOKBACK,
-                        F,
-                        RAM_BUDGET,
-                        CHUNK_SIZE,
-                        week_index,
-                        pca_meta=pca_summary,
-                    )
-                if token_buffer is None:
-                    raise RuntimeError("Token ring buffer was not initialised")
-                token_buffer.append(tok)
-                pending_decisions.append(token_buffer.snapshot(grid_ts))
-                # Decision frontier must advance only on a new decision-time tick.
-                labeler.on_decision(grid_ts)
-                # register decision at tick first, then advance/update tick price.
-                matured = labeler.on_event(grid_ts, float(mid))
-                last_grid_ts = grid_ts
-                last_tick_dt_ms = int(dt_tick)
-                current_grid_ts = int(grid_ts)
-                current_grid_week_key = str(wk) if wk is not None else "unknown"
-                current_grid_latest_ob_ts_ms = int(ts_ms)
-                current_grid_trade_count_running = 0
-                current_grid_last_trade_ts_running = None
-                current_grid_collision_count = 0
-                current_grid_max_collision_delta_ms = None
-            elif is_collision:
-                if not pending_decisions:
-                    raise RuntimeError("Grid collision observed but no pending sequence to overwrite")
-                if last_tick_dt_ms is None:
-                    raise RuntimeError("Grid collision observed without last_tick_dt_ms state")
-                tok = build_token(fe, feat_core, is_trade, int(last_tick_dt_ms))
-                if token_buffer is None:
-                    raise RuntimeError("Grid collision observed but token ring buffer is empty")
-                if current_grid_latest_ob_ts_ms is None or current_grid_week_key is None:
-                    raise RuntimeError("Grid collision observed without current diagnostics state")
-                collision_delta_ms = int(ts_ms - current_grid_latest_ob_ts_ms)
-                diagnostics.record_collision(current_grid_week_key, collision_delta_ms)
-                current_grid_collision_count += 1
-                if (
-                    current_grid_max_collision_delta_ms is None
-                    or collision_delta_ms > current_grid_max_collision_delta_ms
-                ):
-                    current_grid_max_collision_delta_ms = int(collision_delta_ms)
-                token_buffer.overwrite_latest(tok)
-                pending_decisions[-1].refresh(grid_ts)
-                matured = labeler.on_event(grid_ts, float(mid))
-                current_grid_latest_ob_ts_ms = int(ts_ms)
-            else:
+            decision_ts_ms = int(ts_ms)
+            if last_decision_ts_ms is not None and decision_ts_ms < last_decision_ts_ms:
                 raise RuntimeError(
-                    f"Non-monotone grid timestamp: grid_ts={grid_ts} < last_grid_ts={last_grid_ts}"
+                    f"Non-monotone decision timestamp: decision_ts_ms={decision_ts_ms} "
+                    f"< last_decision_ts_ms={last_decision_ts_ms}"
                 )
+
+            if current_decision_ts_ms is not None:
+                if current_decision_week_key is None:
+                    raise RuntimeError("Active decision exists without required diagnostics week state")
+                diagnostics.finalize_decision(
+                    week_key=current_decision_week_key,
+                    decision_ts_ms=int(current_decision_ts_ms),
+                    trade_count_after_decision=int(current_trade_count_running),
+                    last_trade_ts_after_decision=current_last_trade_ts_running,
+                )
+            dt_tick = 0 if last_decision_ts_ms is None else int(decision_ts_ms - last_decision_ts_ms)
+            tok = build_token(fe, feat_core, is_trade, dt_tick)
+            if F is None:
+                F = tok.shape[0]
+                token_buffer = TokenRingBuffer(LOOKBACK, F)
+                router = WeekWriterRouter(
+                    out_root,
+                    LOOKBACK,
+                    F,
+                    RAM_BUDGET,
+                    CHUNK_SIZE,
+                    week_index,
+                    pca_meta=pca_summary,
+                )
+            if token_buffer is None:
+                raise RuntimeError("Token ring buffer was not initialised")
+            token_buffer.append(tok)
+            pending_decisions.append(token_buffer.snapshot(decision_ts_ms))
+            labeler.on_decision(decision_ts_ms)
+            matured = labeler.on_event(decision_ts_ms, float(mid))
+            last_decision_ts_ms = decision_ts_ms
+            current_decision_ts_ms = int(decision_ts_ms)
+            current_decision_week_key = str(wk) if wk is not None else "unknown"
+            current_trade_count_running = 0
+            current_last_trade_ts_running = None
 
             if matured is None:
                 raise RuntimeError("Matured labels were not produced for OB event")
@@ -2394,17 +2308,14 @@ def process_all(
 
     producer_thread.join()
 
-    if current_grid_ts is not None:
-        if current_grid_latest_ob_ts_ms is None or current_grid_week_key is None:
-            raise RuntimeError("Active grid exists without latest OB timestamp at ingest end")
+    if current_decision_ts_ms is not None:
+        if current_decision_week_key is None:
+            raise RuntimeError("Active decision exists without diagnostics state at ingest end")
         diagnostics.finalize_decision(
-            week_key=current_grid_week_key,
-            grid_ts=int(current_grid_ts),
-            actual_ob_ts_ms=int(current_grid_latest_ob_ts_ms),
-            collision_count_for_decision=int(current_grid_collision_count),
-            trade_count_after_grid=int(current_grid_trade_count_running),
-            last_trade_ts_after_grid=current_grid_last_trade_ts_running,
-            max_collision_delta_ms=current_grid_max_collision_delta_ms,
+            week_key=current_decision_week_key,
+            decision_ts_ms=int(current_decision_ts_ms),
+            trade_count_after_decision=int(current_trade_count_running),
+            last_trade_ts_after_decision=current_last_trade_ts_running,
         )
 
     if router is not None:
@@ -2496,12 +2407,7 @@ def process_all(
         "dataset_end": end_iso,
         "weeks_in_order": weeks_in_order,
         "decision_policy": DECISION_POLICY,
-        "decision_nominal_step_ms": int(DECISION_NOMINAL_STEP_MS),
-        "time_grid": {
-            "step_ms": int(DECISION_NOMINAL_STEP_MS),
-            "guard_ms": int(DECISION_GUARD_MS),
-            "mode": "nearest",
-        },
+        "decision_time_basis": "ob_event_time",
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
@@ -2550,28 +2456,13 @@ def process_all(
         f"model={pca_summary['model_path']}"
     )
     diag_global = decision_diag_summary.get("global", {})
-    lag_ms = diag_global.get("lag_ms", {})
-    collision = diag_global.get("collision", {})
-    collision_delta = collision.get("collision_delta_ms", {})
-    post_grid = diag_global.get("post_grid_trades", {})
-    trade_counts = post_grid.get("trade_count_after_grid", {})
-    last_trade_gap = post_grid.get("last_trade_gap_ms", {})
+    post_decision = diag_global.get("post_decision_trades", {})
+    trade_counts = post_decision.get("trade_count_after_decision", {})
+    last_trade_gap = post_decision.get("last_trade_gap_ms", {})
     print("[decision-time-diagnostics]")
     print(
-        "  lag_ms: "
-        f"mean={lag_ms.get('mean', 0.0):.3f} p95={lag_ms.get('p95', 0.0):.3f} "
-        f"p99={lag_ms.get('p99', 0.0):.3f} max={lag_ms.get('max', 0.0):.3f} "
-        f">2ms={lag_ms.get('count_gt_2ms', 0)} >5ms={lag_ms.get('count_gt_5ms', 0)}"
-    )
-    print(
-        "  collisions: "
-        f"count={collision.get('collision_count', 0)} rate={collision.get('collision_rate', 0.0):.6f} "
-        f"p95_delta={collision_delta.get('p95', 0.0):.3f} "
-        f"p99_delta={collision_delta.get('p99', 0.0):.3f} max_delta={collision_delta.get('max', 0.0):.3f}"
-    )
-    print(
-        "  post-grid-trades: "
-        f"frac_with_any={post_grid.get('fraction_with_trade_after_grid', 0.0):.6f} "
+        "  post-decision-trades: "
+        f"frac_with_any={post_decision.get('fraction_with_trade_after_decision', 0.0):.6f} "
         f"p95_count={trade_counts.get('p95', 0.0):.3f} p99_count={trade_counts.get('p99', 0.0):.3f} "
         f"max_count={trade_counts.get('max', 0)} p95_last_trade_gap={last_trade_gap.get('p95', 0.0):.3f}"
     )
