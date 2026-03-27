@@ -994,13 +994,13 @@ def safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day):
     dq_day.increment_counter("th", "total_emitted", emitted)
 
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
-    # exact tail order: [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
+    # exact tail order: [log_dt_ms, is_trade, log_events_100ms, log_events_200ms, log_events_500ms]
     aux_tail = np.array(
         [
             np.log1p(float(dt_ms)),
             float(is_trade),
             np.log1p(fe.event_density_100ms()),
-            np.log1p(fe.event_density_250ms()),
+            np.log1p(fe.event_density_200ms()),
             np.log1p(fe.event_density_500ms()),
         ],
         dtype=np.float32,
@@ -2235,7 +2235,7 @@ def process_all(
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
-        "aux_tail": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_250ms", "log_events_500ms"],
+        "aux_tail": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_200ms", "log_events_500ms"],
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
