@@ -1,5 +1,6 @@
 import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time
 from collections import deque
+from bisect import bisect_right
 from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
 import numpy as np
 import torch
@@ -1011,6 +1012,19 @@ class RollingZScore:
 
 # -------------------------  Feature engine  -------------------------
 class FeatureEngine:
+
+    @dataclass(frozen=True)
+    class OBSnapshot:
+        ts_ms: int
+        bid1: float
+        ask1: float
+        bsz1: float
+        asz1: float
+        spread: float
+        cum_bid3: float
+        cum_ask3: float
+        cum_bid5: float
+        cum_ask5: float
     
     def __init__(
         self,
@@ -1071,8 +1085,11 @@ class FeatureEngine:
         self.last_spread: Optional[float] = None
         self.last_spread_ts: Optional[int] = None
         self.spread_delta_windows: Tuple[int, ...] = (100, 200, 500)
-        self.spread_history: Deque[Tuple[int, float]] = deque()
-        self.spread_history_window_ms: int = 1_000
+        self.ob_horizon_compare_windows_ms: Tuple[int, ...] = (100, 200, 500)
+        self.ob_snapshot_margin_ms: int = 200
+        self._ob_snapshot_keep_ms: int = max(self.ob_horizon_compare_windows_ms) + self.ob_snapshot_margin_ms
+        self._ob_snapshots: List[FeatureEngine.OBSnapshot] = []
+        self._ob_snapshot_ts_ms: List[int] = []
         self.spread_changes_100ms: Deque[int] = deque()
         self.spread_changes_200ms: Deque[int] = deque()
         self.spread_changes_500ms: Deque[int] = deque()
@@ -1576,6 +1593,49 @@ class FeatureEngine:
                 self._append_tuple_with_guard(dq, (ts_ms, value), ts_ms, window, is_ob_event=True)
                 sums_map[key] += value
 
+    def _append_ob_snapshot(
+        self,
+        ts_ms: int,
+        bid1: float,
+        ask1: float,
+        bsz1: float,
+        asz1: float,
+        spread: float,
+        cum_bid3: float,
+        cum_ask3: float,
+        cum_bid5: float,
+        cum_ask5: float,
+    ) -> None:
+        snap = self.OBSnapshot(
+            ts_ms=int(ts_ms),
+            bid1=float(bid1),
+            ask1=float(ask1),
+            bsz1=float(bsz1),
+            asz1=float(asz1),
+            spread=float(spread),
+            cum_bid3=float(cum_bid3),
+            cum_ask3=float(cum_ask3),
+            cum_bid5=float(cum_bid5),
+            cum_ask5=float(cum_ask5),
+        )
+        self._ob_snapshots.append(snap)
+        self._ob_snapshot_ts_ms.append(snap.ts_ms)
+        self._prune_ob_snapshots(ts_ms)
+
+    def _prune_ob_snapshots(self, now_ts_ms: int) -> None:
+        cutoff = int(now_ts_ms) - int(self._ob_snapshot_keep_ms)
+        while self._ob_snapshot_ts_ms and self._ob_snapshot_ts_ms[0] < cutoff:
+            del self._ob_snapshot_ts_ms[0]
+            del self._ob_snapshots[0]
+
+    def get_ob_snapshot_asof(self, cutoff_ts_ms: int) -> Optional["FeatureEngine.OBSnapshot"]:
+        if not self._ob_snapshot_ts_ms:
+            return None
+        idx = bisect_right(self._ob_snapshot_ts_ms, int(cutoff_ts_ms)) - 1
+        if idx < 0:
+            return None
+        return self._ob_snapshots[idx]
+
     def _replenishment_rates(self) -> Dict[int, Dict[Tuple[str, int, str], float]]:
         rates: Dict[int, Dict[Tuple[str, int, str], float]] = {}
         for window in self.replen_windows_ms:
@@ -1707,19 +1767,12 @@ class FeatureEngine:
         spread = max(0.0, ask1 - bid1)
         spread_norm = spread / max(mid, 1e-9)
 
-        self._prune_deque_ms(self.spread_history, ts_ms, self.spread_history_window_ms)
         spread_deltas: Dict[int, float] = {}
-        for window in self.spread_delta_windows:
+        for window in self.ob_horizon_compare_windows_ms:
             target = ts_ms - window
-            ref_val = None
-            for t_prev, spread_prev in reversed(self.spread_history):
-                ref_val = spread_prev
-                if t_prev <= target:
-                    break
-            if ref_val is None:
-                ref_val = spread
+            ob_snap = self.get_ob_snapshot_asof(target)
+            ref_val = ob_snap.spread if ob_snap is not None else spread
             spread_deltas[window] = spread - ref_val
-        self.spread_history.append((ts_ms, spread))
 
         ask2 = self.ask_lvls[1][0] if len(self.ask_lvls) > 1 else ask1
         bid2 = self.bid_lvls[1][0] if len(self.bid_lvls) > 1 else bid1
@@ -1749,6 +1802,20 @@ class FeatureEngine:
         cum_ask5 = self._cum_depth(self.ask_lvls, 5)
         cum_bid10 = self._cum_depth(self.bid_lvls, 10)
         cum_ask10 = self._cum_depth(self.ask_lvls, 10)
+
+        if etype == 'ob':
+            self._append_ob_snapshot(
+                ts_ms=ts_ms,
+                bid1=bid1,
+                ask1=ask1,
+                bsz1=bsz1,
+                asz1=asz1,
+                spread=spread,
+                cum_bid3=cum_bid3,
+                cum_ask3=cum_ask3,
+                cum_bid5=cum_bid5,
+                cum_ask5=cum_ask5,
+            )
 
         # OFI (L1/L3/L5)
         ofi_l1 = (bsz1 - self.prev_bsz) - (asz1 - self.prev_asz)
