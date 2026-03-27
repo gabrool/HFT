@@ -586,6 +586,39 @@ def load_weeks_in_order(out_root: str) -> List[str]:
     return weeks
 
 
+def validate_metadata_contract(out_root: str) -> None:
+    """Validate offline_ingest metadata contract required by offline snapshots."""
+    meta_path = Path(out_root) / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"Missing {meta_path}. Run offline_ingest first to create OUT_ROOT/meta.json."
+        )
+    with meta_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    decision_time_basis = meta.get("decision_time_basis")
+    if decision_time_basis != "ob_event_time":
+        raise ValueError(
+            "Unsupported metadata contract in OUT_ROOT/meta.json: "
+            f"decision_time_basis={decision_time_basis!r}. "
+            "Required decision_time_basis='ob_event_time'."
+        )
+
+    decision_policy = meta.get("decision_policy")
+    if decision_policy is not None and decision_policy != "ob_event_time":
+        if decision_policy == "ob_only_grid_quantized":
+            raise ValueError(
+                "Rejected deprecated grid decision policy in OUT_ROOT/meta.json: "
+                "decision_policy='ob_only_grid_quantized'. "
+                "This snapshot builder only supports ob_event_time policy metadata."
+            )
+        raise ValueError(
+            "Unsupported metadata contract in OUT_ROOT/meta.json: "
+            f"decision_policy={decision_policy!r}. "
+            "Required decision_policy='ob_event_time' when decision_policy is present."
+        )
+
+
 def filter_weeks(weeks_in_order: List[str], requested: Optional[List[str]]) -> List[str]:
     if not requested:
         return weeks_in_order
@@ -634,6 +667,7 @@ def main() -> int:
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing snapshot files")
     args = parser.parse_args()
 
+    validate_metadata_contract(args.out_root)
     weeks_in_order = load_weeks_in_order(args.out_root)
     requested = _parse_requested_weeks(args.weeks) if args.weeks else None
     weeks = filter_weeks(weeks_in_order, requested)
