@@ -723,38 +723,42 @@ def build_four_week_pipeline_splits(
             )
         decision_range = wk_meta["decision_ts_range"]
         start = int(decision_range["min"])
-        end = int(decision_range["max"])
-        if end <= start:
+        end_inclusive = int(decision_range["max"])
+        end_exclusive = end_inclusive + 1
+        if end_exclusive <= start:
             raise ValueError(
-                f"Week '{week_key}' decision_ts_range invalid: min={start} max={end}"
+                f"Week '{week_key}' decision_ts_range invalid: min={start} max={end_inclusive}"
             )
-        return start, end
+        return start, end_exclusive
 
     week1, week2, week3, week4 = weeks_in_order
-    week1_min, week1_max = _decision_range(week1)
-    week2_min, week2_max = _decision_range(week2)
-    week3_min, week3_max = _decision_range(week3)
-    week4_min, week4_max = _decision_range(week4)
+    week1_start, week1_end_exclusive = _decision_range(week1)
+    week2_start, week2_end_exclusive = _decision_range(week2)
+    week3_start, week3_end_exclusive = _decision_range(week3)
+    week4_start, week4_end_exclusive = _decision_range(week4)
 
-    week3_40 = week3_min + ((week3_max - week3_min) * 4) // 10
-    week3_70 = week3_min + ((week3_max - week3_min) * 7) // 10
+    week3_40 = week3_start + ((week3_end_exclusive - week3_start) * 4) // 10
+    week3_70 = week3_start + ((week3_end_exclusive - week3_start) * 7) // 10
 
     return {
         "protocol": "four_week_cmssl_val_test_rl_eval_v2",
         "cmssl": {
-            "train": {"weeks": [week1], "start": week1_min, "end": week1_max},
-            "val": {"weeks": [week2], "start": week2_min, "end": week2_max},
-            "test": {"weeks": [week3], "start": week3_min, "end": week3_max},
+            # All emitted ranges are half-open: [start, end).
+            "train": {"weeks": [week1], "start": week1_start, "end": week1_end_exclusive},
+            "val": {"weeks": [week2], "start": week2_start, "end": week2_end_exclusive},
+            "test": {"weeks": [week3], "start": week3_start, "end": week3_end_exclusive},
         },
         "rl": {
             "week": week3,
-            "train": {"week": week3, "decision_ts_range": {"start": week3_min, "end": week3_40}},
+            # All emitted ranges are half-open: [start, end).
+            "train": {"week": week3, "decision_ts_range": {"start": week3_start, "end": week3_40}},
             "val": {"week": week3, "decision_ts_range": {"start": week3_40, "end": week3_70}},
-            "test": {"week": week3, "decision_ts_range": {"start": week3_70, "end": week3_max}},
+            "test": {"week": week3, "decision_ts_range": {"start": week3_70, "end": week3_end_exclusive}},
         },
         "eval": {
             "week": week4,
-            "full": {"weeks": [week4], "start": week4_min, "end": week4_max},
+            # All emitted ranges are half-open: [start, end).
+            "full": {"weeks": [week4], "start": week4_start, "end": week4_end_exclusive},
         },
     }
 
