@@ -1035,6 +1035,7 @@ class ChunkWriter:
         feature_dim: int,
         ram_budget_mb: int,
         chunk_size_override: int = 0,
+        start_chunk_id: int = 0,
         week_key: str = "",
         flush_callback: Optional[Callable[[FlushJob], None]] = None,
     ):
@@ -1066,7 +1067,7 @@ class ChunkWriter:
         self.TS: np.ndarray
         self._alloc_buffers()
         self.i = 0
-        self.cid = 0
+        self.cid = int(start_chunk_id)
         self.chunks_meta = []
 
     def _alloc_buffers(self) -> None:
@@ -1202,7 +1203,8 @@ class WeekWriterRouter:
             wk: (start, end) for wk, start, end in self.week_index
         }
         self.writers: Dict[str, ChunkWriter] = {}
-        self.closed_writers: Dict[str, ChunkWriter] = {}
+        self.closed_writers: Dict[str, List[ChunkWriter]] = defaultdict(list)
+        self.next_chunk_id: Dict[str, int] = defaultdict(int)
         self.week_counts: Dict[str, int] = defaultdict(int)
         self.week_decision_span: Dict[str, List[int]] = {}
         self.chunk_size_used: int = 0
@@ -1244,6 +1246,10 @@ class WeekWriterRouter:
                         break
 
     def _enqueue_flush_job(self, job: FlushJob) -> None:
+        self.next_chunk_id[job.week_key] = max(
+            int(self.next_chunk_id.get(job.week_key, 0)),
+            int(job.chunk_id) + 1,
+        )
         while True:
             self._check_writer_exception()
             try:
@@ -1256,14 +1262,20 @@ class WeekWriterRouter:
     def _ensure_writer(self, week_key: str) -> ChunkWriter:
         if week_key in self.writers:
             return self.writers[week_key]
+        if week_key in self.week_metas:
+            raise RuntimeError(
+                f"Week '{week_key}' is already finalized; refusing to reopen writer."
+            )
         week_dir = os.path.join(self.out_root, week_key)
         ensure_dir(week_dir)
+        start_chunk_id = int(self.next_chunk_id.get(week_key, 0))
         writer = ChunkWriter(
             week_dir,
             self.lookback,
             self.feature_dim,
             self.ram_budget_mb,
             self.chunk_size_override,
+            start_chunk_id=start_chunk_id,
             week_key=week_key,
             flush_callback=self._enqueue_flush_job,
         )
@@ -1307,20 +1319,32 @@ class WeekWriterRouter:
         if writer is None:
             return
         writer.flush()
-        self.closed_writers[week_key] = writer
+        self.next_chunk_id[week_key] = int(writer.cid)
+        self.closed_writers[week_key].append(writer)
 
-    def _build_week_meta(self, week_key: str, writer: ChunkWriter) -> dict:
+    def _build_week_meta(self, week_key: str, writers: List[ChunkWriter]) -> dict:
         span = self.week_decision_span.pop(week_key, None)
         total_sequences = int(self.week_counts.get(week_key, 0))
         meta_path = os.path.join(self.out_root, week_key, "meta_week.json")
-        chunks_meta = [
-            {
-                "chunk": int(entry["chunk"]),
-                "n": int(entry["n"]),
-                "files": dict(entry["files"]),
-            }
-            for entry in writer.chunks_meta
-        ]
+        chunks_meta = []
+        for writer in writers:
+            chunks_meta.extend(
+                {
+                    "chunk": int(entry["chunk"]),
+                    "n": int(entry["n"]),
+                    "files": dict(entry["files"]),
+                }
+                for entry in writer.chunks_meta
+            )
+        chunks_meta.sort(key=lambda entry: int(entry["chunk"]))
+        seen_chunk_ids = set()
+        for entry in chunks_meta:
+            chunk_id = int(entry["chunk"])
+            if chunk_id in seen_chunk_ids:
+                raise RuntimeError(
+                    f"Duplicate chunk id {chunk_id} detected while finalizing week '{week_key}'."
+                )
+            seen_chunk_ids.add(chunk_id)
         for entry in chunks_meta:
             ts_file = entry.get("files", {}).get("ts")
             if not ts_file:
@@ -1333,6 +1357,7 @@ class WeekWriterRouter:
                     f"Chunk {entry.get('chunk')} in week '{week_key}' missing ts file '{ts_file}'."
                 )
         rows_total = int(sum(entry["n"] for entry in chunks_meta))
+        chunk_size_used = int(writers[0].N) if writers else 0
         meta = {
             "week": week_key,
             "decision_policy": DECISION_POLICY,
@@ -1342,7 +1367,7 @@ class WeekWriterRouter:
             "feature_dim_core": self.feature_dim - AUX_DIM,
             "label_dim": int(NUM_HORIZONS),
             "horizons_ms": [int(h) for h in HORIZONS_MS],
-            "chunk_size_used": int(writer.N),
+            "chunk_size_used": chunk_size_used,
             "chunks": chunks_meta,
             "chunk_count": int(len(chunks_meta)),
             "rows_total": rows_total,
@@ -1370,8 +1395,11 @@ class WeekWriterRouter:
         return meta
 
     def _finalize_closed_weeks(self):
-        for week_key, writer in list(self.closed_writers.items()):
-            self._build_week_meta(week_key, writer)
+        for week_key, writers in list(self.closed_writers.items()):
+            if not writers:
+                del self.closed_writers[week_key]
+                continue
+            self._build_week_meta(week_key, writers)
             del self.closed_writers[week_key]
 
     def close_old_writers(self, watermark_ms: int):
