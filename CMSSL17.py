@@ -1015,6 +1015,10 @@ class FeatureEngine:
 
     @dataclass(frozen=True)
     class OBSnapshot:
+        # Developer note:
+        # - Snapshot history is only for OB horizon-based state(t) vs state(t-h) comparisons.
+        # - Instantaneous OB features are always computed from the current in-memory book state.
+        # - Trade-history / rolling event-time features (deques, EWMAs, trade windows) do not use snapshots.
         ts_ms: int
         bid1: float
         ask1: float
@@ -1629,6 +1633,8 @@ class FeatureEngine:
             del self._ob_snapshots[0]
 
     def get_ob_snapshot_asof(self, cutoff_ts_ms: int) -> Optional["FeatureEngine.OBSnapshot"]:
+        # Strict as-of lookup: returns latest snapshot with snapshot.ts_ms <= cutoff_ts_ms.
+        # Intentionally no nearest-neighbor-by-distance selection.
         if not self._ob_snapshot_ts_ms:
             return None
         idx = bisect_right(self._ob_snapshot_ts_ms, int(cutoff_ts_ms)) - 1
@@ -1767,12 +1773,14 @@ class FeatureEngine:
         spread = max(0.0, ask1 - bid1)
         spread_norm = spread / max(mid, 1e-9)
 
+        # OB horizon comparison block (as-of horizons: 100/200/500ms).
+        # Uses current state at t plus get_ob_snapshot_asof(t-h), never nearest-by-distance.
         spread_deltas: Dict[int, float] = {}
         for window in self.ob_horizon_compare_windows_ms:
-            target = ts_ms - window
-            ob_snap = self.get_ob_snapshot_asof(target)
-            ref_val = ob_snap.spread if ob_snap is not None else spread
-            spread_deltas[window] = spread - ref_val
+            target_ts_ms = ts_ms - window
+            ob_snap = self.get_ob_snapshot_asof(target_ts_ms)
+            spread_t_minus_h = ob_snap.spread if ob_snap is not None else spread
+            spread_deltas[window] = spread - spread_t_minus_h
 
         ask2 = self.ask_lvls[1][0] if len(self.ask_lvls) > 1 else ask1
         bid2 = self.bid_lvls[1][0] if len(self.bid_lvls) > 1 else bid1
@@ -2055,6 +2063,7 @@ class FeatureEngine:
             for hl, val in spread_ema_vals.items()
         }
 
+        # OB horizon comparison normalization block (as-of horizons: 100/200/500ms).
         spread_delta_norms: Dict[int, float] = {}
         for window, delta in spread_deltas.items():
             if window <= 150:
