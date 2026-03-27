@@ -160,37 +160,6 @@ def _build_ob_daily_map(ob_dir: str) -> dict[date, str]:
     return by_day
 
 
-def iter_ob_events(ob_path: str):
-    total_lines = 0
-    bad_json = 0
-    bad_examples: list[str] = []
-    with _open_text(ob_path) as f:
-        for line_no, line in enumerate(f, start=1):
-            total_lines += 1
-            if not line:
-                continue
-            try:
-                obj = fast_json_loads(line)
-            except Exception:
-                bad_json += 1
-                if len(bad_examples) < BYBIT_BAD_EXAMPLES_N:
-                    bad_examples.append(f"line={line_no} sample={line[:200].rstrip()}")
-                continue
-            yield obj
-    if bad_json:
-        print(
-            f"[warn] iter_ob_events {Path(ob_path).name}: "
-            f"total_lines={total_lines:,} bad_json={bad_json:,}"
-        )
-        for ex in bad_examples:
-            print(f"  [bad_json] {ex}")
-
-
-def iter_ob_events_many(ob_paths: List[str]):
-    for p in ob_paths:
-        yield from iter_ob_events(p)
-
-
 def _utc_day_bounds_ms(day: date) -> tuple[int, int]:
     assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
