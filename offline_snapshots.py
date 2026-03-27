@@ -384,11 +384,6 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
         time_since_last_ob_update_ms=[],
     )
 
-    last_bid: Optional[float] = None
-    last_ask: Optional[float] = None
-    last_bsz: Optional[float] = None
-    last_asz: Optional[float] = None
-    last_ob_update_ts: Optional[int] = None
     last_seen_ts_ms: Optional[int] = None
 
     for ob_path in ob_paths:
@@ -521,20 +516,9 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                     series.best_bid_size[-1] = float(bsz)
                     series.best_ask_size[-1] = float(asz)
                     series.time_since_last_ob_update_ms[-1] = 0.0
-                    last_bid = bid
-                    last_ask = ask
-                    last_bsz = bsz
-                    last_asz = asz
-                    last_ob_update_ts = int(repaired_ts_ms)
                     continue
 
                 series.append(repaired_ts_ms, bid, ask, bsz, asz, 0.0)
-
-                last_bid = bid
-                last_ask = ask
-                last_bsz = bsz
-                last_asz = asz
-                last_ob_update_ts = int(repaired_ts_ms)
 
                 bad_abs, total = _day_bad_abs_and_total(dq_day)
                 bad_frac = float(bad_abs) / float(max(1, total))
