@@ -48,8 +48,6 @@ from CMSSL17 import (  # type: ignore
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     # optimizer
     SAM,
-    TIME_GRID_STEP_MS,
-    TIME_GRID_GUARD_MS,
 )
 
 # ---------------- Config via env ----------------
@@ -63,9 +61,8 @@ COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "default").strip()
 LOG_EVERY     = max(1, int(os.environ.get("BYBIT_LOG_EVERY", "100")))
 CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
-EXPECTED_GRID_STEP_MS = int(TIME_GRID_STEP_MS)
-EXPECTED_GRID_GUARD_MS = int(TIME_GRID_GUARD_MS)
-EXPECTED_DECISION_POLICY = "ob_only_grid_quantized"
+EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
+EXPECTED_DECISION_POLICY = "ob_event_time"
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
@@ -84,39 +81,23 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
     if not isinstance(weeks_in_order, list) or len(weeks_in_order) != 4 or not all(isinstance(w, str) and w for w in weeks_in_order):
         raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries. Rerun offline_ingest.")
 
-    time_grid = meta.get("time_grid")
-    if not isinstance(time_grid, dict):
-        raise KeyError(
-            "meta.json missing required key 'time_grid'. "
-            f"Rerun offline_ingest so timestamps are exported on the canonical {EXPECTED_GRID_STEP_MS}ms grid."
-        )
-    step_ms = time_grid.get("step_ms")
-    guard_ms = time_grid.get("guard_ms")
-    try:
-        step_ms_int = int(step_ms)
-        guard_ms_int = int(guard_ms)
-    except (TypeError, ValueError):
+    decision_time_basis = meta.get("decision_time_basis")
+    if decision_time_basis != EXPECTED_DECISION_TIME_BASIS:
         raise ValueError(
-            "meta.json has invalid time_grid types. "
-            f"Expected integer step_ms/guard_ms, got step_ms={step_ms!r}, guard_ms={guard_ms!r}. "
-            "Rerun offline_ingest to regenerate grid-quantized splits."
+            "meta.json has incompatible decision_time_basis. "
+            f"Expected '{EXPECTED_DECISION_TIME_BASIS}' (event-time decision timestamps); "
+            f"got {decision_time_basis!r}. "
+            "Rerun offline_ingest to regenerate metadata with event-time decisions enabled."
         )
-    if step_ms_int != EXPECTED_GRID_STEP_MS or guard_ms_int != EXPECTED_GRID_GUARD_MS:
-        raise ValueError(
-            "meta.json has incompatible time_grid settings. "
-            f"Expected step_ms={EXPECTED_GRID_STEP_MS}, guard_ms={EXPECTED_GRID_GUARD_MS}; "
-            f"got step_ms={step_ms_int!r}, guard_ms={guard_ms_int!r}. "
-            "Rerun offline_ingest to regenerate grid-quantized splits."
-        )
-
-    decision_policy = meta.get("decision_policy")
-    if decision_policy != EXPECTED_DECISION_POLICY:
-        raise ValueError(
-            "meta.json has incompatible decision_policy. "
-            f"Expected '{EXPECTED_DECISION_POLICY}' (canonical grid-quantized policy); "
-            f"got {decision_policy!r}. "
-            "Rerun offline_ingest to regenerate metadata with grid quantization enabled."
-        )
+    if "decision_policy" in meta:
+        decision_policy = meta.get("decision_policy")
+        if decision_policy != EXPECTED_DECISION_POLICY:
+            raise ValueError(
+                "meta.json has incompatible decision_policy. "
+                f"Expected '{EXPECTED_DECISION_POLICY}' (event-time decision policy); "
+                f"got {decision_policy!r}. "
+                "Rerun offline_ingest to regenerate metadata with event-time decisions enabled."
+            )
 
     if splits.get("protocol") != "four_week_cmssl_val_test_rl_eval_v2":
         raise ValueError(
@@ -303,16 +284,6 @@ def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[C
                 f"Timestamp file is not non-decreasing for chunk {idx}: {week_dir / ts_rel}"
             )
 
-        if ts_arr.size and not np.all(ts_arr % EXPECTED_GRID_STEP_MS == 0):
-            bad_i = int(np.flatnonzero(ts_arr % EXPECTED_GRID_STEP_MS != 0)[0])
-            bad_ts = int(ts_arr[bad_i])
-            raise ValueError(
-                "Off-grid timestamp detected while building chunk refs. "
-                f"week_meta={meta_week_path}, chunk={idx}, ts_file={week_dir / ts_rel}, "
-                f"bad_index={bad_i}, bad_ts={bad_ts}. "
-                "Rerun offline_ingest to regenerate grid-aligned timestamps."
-            )
-
         l = int(np.searchsorted(ts_arr, start, side="left"))
         r = int(np.searchsorted(ts_arr, end, side="left"))
 
@@ -459,17 +430,6 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
             if r <= l:
                 continue
 
-            if not np.all(ts_arr[l:r] % EXPECTED_GRID_STEP_MS == 0):
-                rel_i = int(np.flatnonzero(ts_arr[l:r] % EXPECTED_GRID_STEP_MS != 0)[0])
-                bad_i = l + rel_i
-                bad_ts = int(ts_arr[bad_i])
-                raise ValueError(
-                    "Off-grid timestamp detected in selected split range. "
-                    f"week_meta={wp}, chunk={idx}, ts_file={week_dir / ts_rel}, "
-                    f"slice=({l}:{r}), bad_index={bad_i}, bad_ts={bad_ts}. "
-                    "Rerun offline_ingest to regenerate grid-aligned timestamps."
-                )
-
             Xc = np.load(week_dir / files["core"])
             Xa = np.load(week_dir / files["aux"])
             Y = np.load(week_dir / files["y"])
@@ -593,9 +553,8 @@ def quantile_cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, 
         "train_week_keys",
         "train_ts_start",
         "train_ts_end",
+        "decision_time_basis",
         "decision_policy",
-        "expected_grid_step_ms",
-        "expected_grid_guard_ms",
     )
     return all(cached_meta.get(k) == current_meta.get(k) for k in required_keys)
 
@@ -761,9 +720,8 @@ def train_from_offline():
         "train_week_keys": list(train_week_keys),
         "train_ts_start": int(tr_start),
         "train_ts_end": int(tr_end),
+        "decision_time_basis": EXPECTED_DECISION_TIME_BASIS,
         "decision_policy": EXPECTED_DECISION_POLICY,
-        "expected_grid_step_ms": int(EXPECTED_GRID_STEP_MS),
-        "expected_grid_guard_ms": int(EXPECTED_GRID_GUARD_MS),
     }
     cached_quantiles = load_quantile_cache(quantile_cache_path)
     cached_bounds = None
