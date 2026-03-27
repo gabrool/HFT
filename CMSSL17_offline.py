@@ -554,7 +554,6 @@ def quantile_cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, 
         "train_ts_start",
         "train_ts_end",
         "decision_time_basis",
-        "decision_policy",
     )
     return all(cached_meta.get(k) == current_meta.get(k) for k in required_keys)
 
@@ -721,19 +720,21 @@ def train_from_offline():
         "train_ts_start": int(tr_start),
         "train_ts_end": int(tr_end),
         "decision_time_basis": EXPECTED_DECISION_TIME_BASIS,
-        "decision_policy": EXPECTED_DECISION_POLICY,
     }
     cached_quantiles = load_quantile_cache(quantile_cache_path)
     cached_bounds = None
     if cached_quantiles is None:
-        print(f"[dir-mask-cache] miss path={quantile_cache_path} (prepass required)")
+        print(f"[dir-mask-cache] miss path={quantile_cache_path} (quantile prepass required)")
     else:
         cached_bounds, cached_meta = cached_quantiles
         if quantile_cache_matches(cached_meta, current_meta):
-            print(f"[dir-mask-cache] hit path={quantile_cache_path} (prepass skipped)")
+            print(f"[dir-mask-cache] hit path={quantile_cache_path} (quantile prepass skipped)")
         else:
             cached_bounds = None
-            print(f"[dir-mask-cache] metadata mismatch path={quantile_cache_path} (prepass required)")
+            print(
+                "[dir-mask-cache] event-time identity mismatch "
+                f"path={quantile_cache_path} (quantile prepass required)"
+            )
 
     if USE_IN_MEMORY:
         X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
