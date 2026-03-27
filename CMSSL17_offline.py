@@ -118,9 +118,9 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
             "Rerun offline_ingest to regenerate metadata with grid quantization enabled."
         )
 
-    if splits.get("protocol") != "four_week_cmssl_rl_eval_v1":
+    if splits.get("protocol") != "four_week_cmssl_val_test_rl_eval_v2":
         raise ValueError(
-            "meta['splits']['protocol'] must be 'four_week_cmssl_rl_eval_v1'. Rerun offline_ingest."
+            "meta['splits']['protocol'] must be 'four_week_cmssl_val_test_rl_eval_v2'. Rerun offline_ingest."
         )
 
     known_weeks = set(weeks_in_order)
@@ -191,8 +191,8 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
 
     required_entries = {
         "cmssl.train": ("cmssl", "train", False),
-        "cmssl.val": ("cmssl", "val", True),
-        "cmssl.test": ("cmssl", "test", True),
+        "cmssl.val": ("cmssl", "val", False),
+        "cmssl.test": ("cmssl", "test", False),
         "rl.train": ("rl", "train", True),
         "rl.val": ("rl", "val", True),
         "rl.test": ("rl", "test", True),
@@ -212,17 +212,14 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
     week1, week2, week3, week4 = weeks_in_order
     if normalized["cmssl"]["train"]["weeks"] != [week1]:
         raise ValueError("meta['splits']['cmssl']['train'] must reference weeks_in_order[0].")
-    if normalized["cmssl"]["val"]["weeks"] != [week2] or normalized["cmssl"]["test"]["weeks"] != [week2]:
-        raise ValueError("meta['splits']['cmssl'] val/test must both reference weeks_in_order[1].")
+    if normalized["cmssl"]["val"]["weeks"] != [week2]:
+        raise ValueError("meta['splits']['cmssl']['val'] must reference weeks_in_order[1].")
+    if normalized["cmssl"]["test"]["weeks"] != [week3]:
+        raise ValueError("meta['splits']['cmssl']['test'] must reference weeks_in_order[2].")
     if any(normalized["rl"][name]["weeks"] != [week3] for name in ("train", "val", "test")):
         raise ValueError("meta['splits']['rl'] train/val/test must all reference weeks_in_order[2].")
     if normalized["eval"]["full"]["weeks"] != [week4]:
         raise ValueError("meta['splits']['eval']['full'] must reference weeks_in_order[3].")
-
-    cmssl_val = normalized["cmssl"]["val"]
-    cmssl_test = normalized["cmssl"]["test"]
-    if max(cmssl_val["start"], cmssl_test["start"]) < min(cmssl_val["end"], cmssl_test["end"]):
-        raise ValueError("meta['splits']['cmssl'] val/test decision_ts_range must not overlap.")
 
     rl_train = normalized["rl"]["train"]
     rl_val = normalized["rl"]["val"]
@@ -728,8 +725,11 @@ def train_from_offline():
     if not (tr_weeks and va_weeks and te_weeks):
         raise ValueError("CMSSL split metadata must resolve to at least one week for train/val/test")
 
+    week1, week2, week3, week4 = weeks_order
     print(
-        f"[cmssl weeks] train={train_week_keys} val={cmssl_val['weeks']} test={cmssl_test['weeks']} eval_full={eval_full['weeks']}"
+        "[cmssl weeks] "
+        f"train=week1({week1}) val=week2({week2}) test=week3({week3}) eval_full=week4({week4}) "
+        f"| train_keys={train_week_keys} val_keys={cmssl_val['weeks']} test_keys={cmssl_test['weeks']}"
     )
 
     early_stop_patience = SINGLE_WEEK_PATIENCE if len(tr_weeks) <= 1 else PATIENCE
