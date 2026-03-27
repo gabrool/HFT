@@ -1032,7 +1032,11 @@ def _resolve_meta_full_week_range(meta: Dict[str, Any], week_key: str, *, label:
             if "start" in wk and "end" in wk:
                 return _resolve_split_range(wk, label=label)
             if "min" in wk and "max" in wk:
-                return int(wk["min"]), int(wk["max"])
+                start = int(wk["min"])
+                end = int(wk["max"]) + 1
+                if start >= end:
+                    raise ValueError(f"meta week range for {label} must satisfy start < end.")
+                return start, end
     weeks_meta = meta.get("weeks_meta")
     if isinstance(weeks_meta, dict):
         wk_meta = weeks_meta.get(week_key)
@@ -1043,7 +1047,7 @@ def _resolve_meta_full_week_range(meta: Dict[str, Any], week_key: str, *, label:
                     return _resolve_split_range(decision_ts_range, label=label)
                 if "min" in decision_ts_range and "max" in decision_ts_range:
                     start = int(decision_ts_range["min"])
-                    end = int(decision_ts_range["max"])
+                    end = int(decision_ts_range["max"]) + 1
                     if start >= end:
                         raise ValueError(f"meta week range for {label} must satisfy start < end.")
                     return start, end
@@ -1071,7 +1075,13 @@ def _normalize_pipeline_split_entry(meta: Dict[str, Any], split_entry: Any, *, l
     if require_range:
         start, end = _resolve_split_range(split_entry.get("decision_ts_range"), label=label)
     else:
-        start, end = _resolve_meta_full_week_range(meta, weeks[0], label=label)
+        explicit_range = split_entry.get("decision_ts_range")
+        if isinstance(explicit_range, dict) and "start" in explicit_range and "end" in explicit_range:
+            start, end = _resolve_split_range(explicit_range, label=label)
+        elif "start" in split_entry and "end" in split_entry:
+            start, end = _resolve_split_range(split_entry, label=label)
+        else:
+            start, end = _resolve_meta_full_week_range(meta, weeks[0], label=label)
     return {"weeks": weeks, "start": start, "end": end}
 
 
