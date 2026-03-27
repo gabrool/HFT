@@ -160,6 +160,7 @@ def _env_bool_int(name: str, default: int = 0) -> int:
 BYBIT_DAY_CLIP = int(os.environ.get("BYBIT_DAY_CLIP", "1"))
 BYBIT_TS_BACKSTEP_CLAMP_MS = int(os.environ.get("BYBIT_TS_BACKSTEP_CLAMP_MS", "5000"))
 BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
+ALLOW_DUPLICATE_OB_TS = _env_bool_int("BYBIT_ALLOW_DUPLICATE_OB_TS", 0)
 BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
 BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
@@ -2232,10 +2233,18 @@ def process_all(
                 centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
                 feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
 
+            is_duplicate_decision_ts = (
+                last_decision_ts_ms is not None and int(ts_ms) == last_decision_ts_ms
+            )
             if last_decision_ts_ms is not None and int(ts_ms) < last_decision_ts_ms:
                 raise RuntimeError(
                     f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} "
                     f"< last_decision_ts_ms={last_decision_ts_ms}"
+                )
+            if is_duplicate_decision_ts and not ALLOW_DUPLICATE_OB_TS:
+                raise RuntimeError(
+                    f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} "
+                    f"<= last_decision_ts_ms={last_decision_ts_ms}"
                 )
 
             if current_decision_ts_ms is not None:
@@ -2264,14 +2273,22 @@ def process_all(
             if token_buffer is None:
                 raise RuntimeError("Token ring buffer was not initialised")
             token_buffer.append(tok)
-            pending_decisions.append(token_buffer.snapshot(int(ts_ms)))
-            labeler.on_decision(int(ts_ms))
+            if is_duplicate_decision_ts:
+                if not pending_decisions:
+                    raise RuntimeError(
+                        "Duplicate OB timestamp cannot update state because no pending decision exists"
+                    )
+                pending_decisions[-1] = token_buffer.snapshot(int(ts_ms))
+            else:
+                pending_decisions.append(token_buffer.snapshot(int(ts_ms)))
+                labeler.on_decision(int(ts_ms))
             matured = labeler.on_event(int(ts_ms), float(mid))
             last_decision_ts_ms = int(ts_ms)
-            current_decision_ts_ms = int(ts_ms)
-            current_decision_week_key = str(wk) if wk is not None else "unknown"
-            current_trade_count_running = 0
-            current_last_trade_ts_running = None
+            if not is_duplicate_decision_ts:
+                current_decision_ts_ms = int(ts_ms)
+                current_decision_week_key = str(wk) if wk is not None else "unknown"
+                current_trade_count_running = 0
+                current_last_trade_ts_running = None
 
             if matured is None:
                 raise RuntimeError("Matured labels were not produced for OB event")
