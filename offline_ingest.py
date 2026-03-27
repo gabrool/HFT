@@ -279,6 +279,7 @@ class WeekQuality:
 
 
 def _day_bad_abs_and_total(day_quality: DayQuality) -> Tuple[int, int]:
+    # Retained for event-time ingest quality gating in iter_weekly_event_stream().
     """Compute corruption and input totals for a day quality record."""
     bad_abs = 0
     for namespace in ("ob", "th", "merge", "chain"):
@@ -291,40 +292,6 @@ def _day_bad_abs_and_total(day_quality: DayQuality) -> Tuple[int, int]:
     total_th = int(day_quality.counters.get("th", {}).get("total", 0))
     total = total_ob + total_th
     return int(bad_abs), int(total)
-
-
-def _percentile(values: List[float], q: float) -> float:
-    if not values:
-        return 0.0
-    arr = np.asarray(values, dtype=np.float64)
-    return float(np.percentile(arr, q))
-
-
-def _tail_summary_ms(values: List[float], gt_thresholds: Tuple[int, ...]) -> Dict[str, object]:
-    if not values:
-        out: Dict[str, object] = {
-            "count": 0,
-            "mean": 0.0,
-            "p90": 0.0,
-            "p95": 0.0,
-            "p99": 0.0,
-            "max": 0.0,
-        }
-        for thr in gt_thresholds:
-            out[f"count_gt_{thr}ms"] = 0
-        return out
-    arr = np.asarray(values, dtype=np.float64)
-    out = {
-        "count": int(arr.shape[0]),
-        "mean": float(arr.mean()),
-        "p90": _percentile(values, 90),
-        "p95": _percentile(values, 95),
-        "p99": _percentile(values, 99),
-        "max": float(arr.max()),
-    }
-    for thr in gt_thresholds:
-        out[f"count_gt_{thr}ms"] = int(np.sum(arr > float(thr)))
-    return out
 
 
 # import your training utilities
