@@ -119,7 +119,7 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
         if not isinstance(decision_range, dict) or "min" not in decision_range or "max" not in decision_range:
             raise KeyError(f"Week metadata for {stage} must include decision_ts_range min/max.")
         start = int(decision_range["min"])
-        end = int(decision_range["max"])
+        end = int(decision_range["max"]) + 1
         if start >= end:
             raise ValueError(f"Week metadata for {stage} has invalid decision_ts_range: start={start} end={end}.")
         return start, end
@@ -166,7 +166,26 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
                     f"meta['splits']['{stage}']['decision_ts_range'] must satisfy start < end. Rerun offline_ingest."
                 )
         else:
-            start, end = _full_week_range(weeks[0], stage)
+            explicit_start = entry.get("start")
+            explicit_end = entry.get("end")
+            if explicit_start is None or explicit_end is None:
+                if isinstance(decision_ts_range, dict):
+                    explicit_start = decision_ts_range.get("start")
+                    explicit_end = decision_ts_range.get("end")
+            if explicit_start is not None and explicit_end is not None:
+                try:
+                    start = int(explicit_start)
+                    end = int(explicit_end)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"meta['splits']['{stage}'] explicit start/end must be integers. Rerun offline_ingest."
+                    )
+            else:
+                start, end = _full_week_range(weeks[0], stage)
+            if start >= end:
+                raise ValueError(
+                    f"meta['splits']['{stage}'] must satisfy start < end. Rerun offline_ingest."
+                )
 
         return {"weeks": weeks, "start": start, "end": end}
 
