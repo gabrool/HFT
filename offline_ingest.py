@@ -2152,8 +2152,6 @@ def process_all(
     event_proc_s = 0.0
     router_housekeeping_s = 0.0
 
-    last_global_ts: Optional[int] = None
-
     feeder = EventFeeder(pairs)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
     producer_thread.start()
@@ -2176,10 +2174,10 @@ def process_all(
                 print(f"[skip ] {wk} yielded no events")
                 continue
             ts_first = _event_ts(payload)
-            if last_global_ts is not None and ts_first < last_global_ts:
+            if last_decision_ts_ms is not None and ts_first < last_decision_ts_ms:
                 raise ValueError(
-                    "Non-monotonic timestamps across weeks: "
-                    f"week {wk} starts at {ts_first} < last seen {last_global_ts}"
+                    "Non-monotonic event timestamps across weeks relative to prior decision time: "
+                    f"week {wk} starts at {ts_first} < last_decision_ts_ms {last_decision_ts_ms}"
                 )
             event = payload
         elif kind == "evt":
@@ -2234,10 +2232,9 @@ def process_all(
                 centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
                 feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
 
-            decision_ts_ms = int(ts_ms)
-            if last_decision_ts_ms is not None and decision_ts_ms < last_decision_ts_ms:
+            if last_decision_ts_ms is not None and int(ts_ms) < last_decision_ts_ms:
                 raise RuntimeError(
-                    f"Non-monotone decision timestamp: decision_ts_ms={decision_ts_ms} "
+                    f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} "
                     f"< last_decision_ts_ms={last_decision_ts_ms}"
                 )
 
@@ -2250,7 +2247,7 @@ def process_all(
                     trade_count_after_decision=int(current_trade_count_running),
                     last_trade_ts_after_decision=current_last_trade_ts_running,
                 )
-            dt_tick = 0 if last_decision_ts_ms is None else int(decision_ts_ms - last_decision_ts_ms)
+            dt_tick = 1 if last_decision_ts_ms is None else int(ts_ms - last_decision_ts_ms)
             tok = build_token(fe, feat_core, is_trade, dt_tick)
             if F is None:
                 F = tok.shape[0]
@@ -2267,11 +2264,11 @@ def process_all(
             if token_buffer is None:
                 raise RuntimeError("Token ring buffer was not initialised")
             token_buffer.append(tok)
-            pending_decisions.append(token_buffer.snapshot(decision_ts_ms))
-            labeler.on_decision(decision_ts_ms)
-            matured = labeler.on_event(decision_ts_ms, float(mid))
-            last_decision_ts_ms = decision_ts_ms
-            current_decision_ts_ms = int(decision_ts_ms)
+            pending_decisions.append(token_buffer.snapshot(int(ts_ms)))
+            labeler.on_decision(int(ts_ms))
+            matured = labeler.on_event(int(ts_ms), float(mid))
+            last_decision_ts_ms = int(ts_ms)
+            current_decision_ts_ms = int(ts_ms)
             current_decision_week_key = str(wk) if wk is not None else "unknown"
             current_trade_count_running = 0
             current_last_trade_ts_running = None
@@ -2292,8 +2289,6 @@ def process_all(
                     yy.astype(np.float32, copy=False),
                 )
                 total_sequences += 1
-
-        last_global_ts = int(ts_ms)
 
         t_router = time.monotonic()
         if router is not None:
