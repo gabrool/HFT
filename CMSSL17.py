@@ -483,7 +483,7 @@ PRIMARY_METRIC = "masked_auc_1000ms"  # options: "masked_auc_<horizon>ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
-# These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_250ms, log_events_500ms]
+# These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_200ms, log_events_500ms]
 AUX_DIM        = 5
 
 
@@ -1050,7 +1050,7 @@ class FeatureEngine:
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute σ and VR
         self.ret_hist_100ms: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_250ms: Deque[Tuple[int, float]] = deque()
+        self.ret_hist_200ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_500ms: Deque[Tuple[int, float]] = deque()
         self.ret_hist_1s: Deque[Tuple[int, float]] = deque()
         self.ret_hist_5s: Deque[Tuple[int, float]] = deque()
@@ -1070,34 +1070,34 @@ class FeatureEngine:
         # ---------- Spread ----------
         self.last_spread: Optional[float] = None
         self.last_spread_ts: Optional[int] = None
-        self.spread_delta_windows: Tuple[int, ...] = (100, 250, 500)
+        self.spread_delta_windows: Tuple[int, ...] = (100, 200, 500)
         self.spread_history: Deque[Tuple[int, float]] = deque()
         self.spread_history_window_ms: int = 1_000
         self.spread_changes_100ms: Deque[int] = deque()
-        self.spread_changes_250ms: Deque[int] = deque()
+        self.spread_changes_200ms: Deque[int] = deque()
         self.spread_changes_500ms: Deque[int] = deque()
         self.spread_changes_1s: Deque[int] = deque()
         self.spread_changes_5s: Deque[int] = deque()
         self._spread_change_deques: Dict[int, Deque[int]] = {
             100: self.spread_changes_100ms,
-            250: self.spread_changes_250ms,
+            200: self.spread_changes_200ms,
             500: self.spread_changes_500ms,
             1000: self.spread_changes_1s,
             5_000: self.spread_changes_5s,
         }
 
         # ---------- Best-level churn & depletion ----------
-        self.bestlvl_windows: Tuple[int, ...] = (100, 250, 500, 1_000)
+        self.bestlvl_windows: Tuple[int, ...] = (100, 200, 500, 1_000)
         self._bid1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self._ask1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self.bid1_changes_1s = self._bid1_change_deques[1_000]
         self.ask1_changes_1s = self._ask1_change_deques[1_000]
         self.last_bid1 = None; self.last_ask1 = None
-        self.neg_dbsz_250 = 0.0; self.neg_dasz_250 = 0.0
-        self.sz_deltas_250ms: Deque[Tuple[int,float,float]] = deque()
+        self.neg_dbsz_200 = 0.0; self.neg_dasz_200 = 0.0
+        self.sz_deltas_200ms: Deque[Tuple[int,float,float]] = deque()
 
         # ---------- Liquidity replenishment tracking (L1/L2) ----------
-        self.replen_windows_ms: Tuple[int, ...] = (100, 250, 500)
+        self.replen_windows_ms: Tuple[int, ...] = (100, 200, 500)
         self._replen_keys: Tuple[Tuple[str, int, str], ...] = tuple(
             (side, level, kind)
             for side in ("bid", "ask")
@@ -1134,23 +1134,23 @@ class FeatureEngine:
         self.last_trade_price: Optional[float] = None
         self.last_is_rpi: int = 0
 
-        # ---------- Quote windows (100/250/500/1000 ms) ----------
+        # ---------- Quote windows (100/200/500/1000 ms) ----------
         self.quotes_100ms: Deque[int] = deque()
-        self.quotes_250ms: Deque[int] = deque()
+        self.quotes_200ms: Deque[int] = deque()
         self.quotes_500ms: Deque[int] = deque()
         self.quotes_1s: Deque[int] = deque()
         self.quotes_5s: Deque[int] = deque()
         self._quote_window_deques: Dict[int, Deque[int]] = {
             100: self.quotes_100ms,
-            250: self.quotes_250ms,
+            200: self.quotes_200ms,
             500: self.quotes_500ms,
             1_000: self.quotes_1s,
             5_000: self.quotes_5s,
         }
 
-        # ---------- Event density (100/250/500 ms) ----------
+        # ---------- Event density (100/200/500 ms) ----------
         self.ev_100ms: Deque[int] = deque()
-        self.ev_250ms: Deque[int] = deque()
+        self.ev_200ms: Deque[int] = deque()
         self.ev_500ms: Deque[int] = deque()
         self.ev_1s:    Deque[int] = deque()
 
@@ -1544,8 +1544,8 @@ class FeatureEngine:
         # events per 0.1s
         return self._event_density(self.ev_100ms, 100)
 
-    def event_density_250ms(self) -> float:
-        return self._event_density(self.ev_250ms, 250)
+    def event_density_200ms(self) -> float:
+        return self._event_density(self.ev_200ms, 200)
 
     def event_density_500ms(self) -> float:
         return self._event_density(self.ev_500ms, 500)
@@ -1674,7 +1674,7 @@ class FeatureEngine:
 
         is_trade = (etype == 'trade')
         self._append_ts_with_guard(self.ev_100ms, ts_ms, 100, is_ob_event=(etype == 'ob'))
-        self._append_ts_with_guard(self.ev_250ms, ts_ms, 250, is_ob_event=(etype == 'ob'))
+        self._append_ts_with_guard(self.ev_200ms, ts_ms, 200, is_ob_event=(etype == 'ob'))
         self._append_ts_with_guard(self.ev_500ms, ts_ms, 500, is_ob_event=(etype == 'ob'))
         self._append_ts_with_guard(self.ev_1s,    ts_ms, 1000, is_ob_event=(etype == 'ob'))
 
@@ -1803,7 +1803,7 @@ class FeatureEngine:
 
         # Pressure (EWMA of OFI L1)
         self.press_100ms = self._ewma_update(self.press_100ms, ofi_l1, dt_ms, 100)
-        self.press_250ms = self._ewma_update(getattr(self, 'press_250ms',0.0), ofi_l1, dt_ms, 250)
+        self.press_200ms = self._ewma_update(getattr(self, 'press_200ms',0.0), ofi_l1, dt_ms, 200)
         self.press_1s    = self._ewma_update(self.press_1s,    ofi_l1, dt_ms, 1_000)
         self.press_2s    = self._ewma_update(getattr(self, 'press_2s',   0.0), ofi_l1, dt_ms, 2_000)
 
@@ -1897,13 +1897,13 @@ class FeatureEngine:
 
         self.last_bid1, self.last_ask1 = bid1, ask1
 
-        # size depletion (only negative deltas accumulated over 250ms)
+        # size depletion (only negative deltas accumulated over 200ms)
         db = bsz1 - self.prev_bsz
         da = asz1 - self.prev_asz
-        self.sz_deltas_250ms.append((ts_ms, min(db,0.0), min(da,0.0)))
-        self._prune_deque_ms(self.sz_deltas_250ms, ts_ms, 250)
-        neg_depl_b = sum(x for _, x, _ in self.sz_deltas_250ms)
-        neg_depl_a = sum(x for _, _, x in self.sz_deltas_250ms)
+        self.sz_deltas_200ms.append((ts_ms, min(db,0.0), min(da,0.0)))
+        self._prune_deque_ms(self.sz_deltas_200ms, ts_ms, 200)
+        neg_depl_b = sum(x for _, x, _ in self.sz_deltas_200ms)
+        neg_depl_a = sum(x for _, _, x in self.sz_deltas_200ms)
 
         dt_since_trade = float(ts_ms - self.last_trade_ts) if self.last_trade_ts is not None else 0.0
         dt_since_bid1_update = (
@@ -1928,24 +1928,24 @@ class FeatureEngine:
         bid1_change_counts = {ms: len(self._bid1_change_deques[ms]) for ms in self.bestlvl_windows}
         ask1_change_counts = {ms: len(self._ask1_change_deques[ms]) for ms in self.bestlvl_windows}
         time_since_spread_change = (ts_ms - (self.last_spread_ts or ts_ms))
-        n_spread_chg_250ms = spread_change_counts.get(250, 0)
+        n_spread_chg_200ms = spread_change_counts.get(200, 0)
         n_spread_chg_1s = len(self._spread_change_deques[1000])
 
         # Returns & vol stats (populate histories + compute σ and VR)
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
         _, var_100 = self._stats_from_returns(self.ret_hist_100ms)
-        _, var_250 = self._stats_from_returns(self.ret_hist_250ms)
+        _, var_200 = self._stats_from_returns(self.ret_hist_200ms)
         _, var_500 = self._stats_from_returns(self.ret_hist_500ms)
         _, var_1s = self._stats_from_returns(self.ret_hist_1s)
         _, var_5s = self._stats_from_returns(self.ret_hist_5s)
         std_100 = math.sqrt(max(0.0, var_100))
-        std_250 = math.sqrt(max(0.0, var_250))
+        std_200 = math.sqrt(max(0.0, var_200))
         std_500 = math.sqrt(max(0.0, var_500))
         std_1s = math.sqrt(max(0.0, var_1s))
         std_5s = math.sqrt(max(0.0, var_5s))
         # Variance ratio: 1s variance vs 10 * 100ms variance (1s = 10×100ms)
         vr = (var_1s / max(10.0 * var_100, 1e-12)) if var_100 > 0 else 0.0
-        vr_1s_250 = var_1s / max(4.0 * var_250, 1e-12) if var_250 > 0 else 0.0
+        vr_1s_200 = var_1s / max(5.0 * var_200, 1e-12) if var_200 > 0 else 0.0
         var_ratio_500_100 = var_500 / max(var_100, 1e-12) if var_100 > 0 else 0.0
 
         # Short-horizon regime summaries (vol & flow)
@@ -2013,10 +2013,10 @@ class FeatureEngine:
             return (1 - a) * prev + a * x if prev is not None else x
 
         # MACD for microprice
-        self.macd_fast = ema_ms(getattr(self, 'macd_fast', None), micro, 150.0)
-        self.macd_slow = ema_ms(getattr(self, 'macd_slow', None), micro, 450.0)
+        self.macd_fast = ema_ms(getattr(self, 'macd_fast', None), micro, 100.0)
+        self.macd_slow = ema_ms(getattr(self, 'macd_slow', None), micro, 400.0)
         macd_raw = (self.macd_fast - self.macd_slow) if (self.macd_fast is not None and self.macd_slow is not None) else 0.0
-        self.macd_sig = ema_ms(getattr(self, 'macd_sig', None), macd_raw, 250.0)
+        self.macd_sig = ema_ms(getattr(self, 'macd_sig', None), macd_raw, 200.0)
         macd_hist = macd_raw - (self.macd_sig if self.macd_sig is not None else 0.0)
 
         # CCI (micro) using EWMA mean & mean abs dev proxy
@@ -2048,7 +2048,7 @@ class FeatureEngine:
 
             # --- pressure (decayed OFI) ---
             self.press_100ms,
-            getattr(self, 'press_250ms', 0.0),
+            getattr(self, 'press_200ms', 0.0),
             self.press_1s,
             getattr(self, 'press_2s', 0.0),
 
@@ -2067,26 +2067,26 @@ class FeatureEngine:
 
             # --- best-level churn & depletion & spread-change stats ---
             float(bid1_change_counts.get(100, 0)),
-            float(bid1_change_counts.get(250, 0)),
+            float(bid1_change_counts.get(200, 0)),
             float(bid1_change_counts.get(500, 0)),
             float(bid1_change_counts.get(1_000, 0)),
             float(ask1_change_counts.get(100, 0)),
-            float(ask1_change_counts.get(250, 0)),
+            float(ask1_change_counts.get(200, 0)),
             float(ask1_change_counts.get(500, 0)),
             float(ask1_change_counts.get(1_000, 0)),
             neg_depl_b, neg_depl_a,
             float(time_since_spread_change),
-            float(n_spread_chg_250ms), float(n_spread_chg_1s),
+            float(n_spread_chg_200ms), float(n_spread_chg_1s),
             dt_since_bid1_update,
             dt_since_ask1_update,
-            spread_deltas.get(100, 0.0), spread_deltas.get(250, 0.0),
+            spread_deltas.get(100, 0.0), spread_deltas.get(200, 0.0),
             spread_deltas.get(500, 0.0),
-            spread_delta_norms.get(100, 0.0), spread_delta_norms.get(250, 0.0),
+            spread_delta_norms.get(100, 0.0), spread_delta_norms.get(200, 0.0),
             spread_delta_norms.get(500, 0.0),
 
             # --- returns & vol stats ---
-            std_100, std_250, std_500, std_1s, std_5s,
-            vr, vr_1s_250,
+            std_100, std_200, std_500, std_1s, std_5s,
+            vr, vr_1s_200,
             var_ratio_500_100,
 
             # --- EMAs & technicals ---
@@ -2336,7 +2336,7 @@ class FeatureEngine:
 
         # push to windows
         self._append_tuple_with_guard(self.ret_hist_100ms, (ts_ms, r), ts_ms, 100, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_250ms, (ts_ms, r), ts_ms, 250, is_ob_event)
+        self._append_tuple_with_guard(self.ret_hist_200ms, (ts_ms, r), ts_ms, 200, is_ob_event)
         self._append_tuple_with_guard(self.ret_hist_500ms, (ts_ms, r), ts_ms, 500, is_ob_event)
         self._append_tuple_with_guard(self.ret_hist_1s,   (ts_ms, r), ts_ms, 1_000, is_ob_event)
         self._append_tuple_with_guard(self.ret_hist_5s,   (ts_ms, r), ts_ms, 5_000, is_ob_event)
