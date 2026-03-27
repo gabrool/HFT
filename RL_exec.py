@@ -1089,8 +1089,8 @@ def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
     weeks_in_order = meta.get("weeks_in_order")
     if not (isinstance(weeks_in_order, list) and len(weeks_in_order) == 4 and all(isinstance(w, str) and w for w in weeks_in_order)):
         raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries.")
-    if splits.get("protocol") != "four_week_cmssl_rl_eval_v1":
-        raise ValueError("meta['splits']['protocol'] must be 'four_week_cmssl_rl_eval_v1'.")
+    if splits.get("protocol") != "four_week_cmssl_val_test_rl_eval_v2":
+        raise ValueError("meta['splits']['protocol'] must be 'four_week_cmssl_val_test_rl_eval_v2'.")
     normalized = {"protocol": splits["protocol"]}
     for section in ("cmssl", "rl", "eval"):
         if not isinstance(splits.get(section), dict):
@@ -1098,8 +1098,8 @@ def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
         normalized[section] = {}
     required_entries = {
         "cmssl.train": ("cmssl", "train", False),
-        "cmssl.val": ("cmssl", "val", True),
-        "cmssl.test": ("cmssl", "test", True),
+        "cmssl.val": ("cmssl", "val", False),
+        "cmssl.test": ("cmssl", "test", False),
         "rl.train": ("rl", "train", True),
         "rl.val": ("rl", "val", True),
         "rl.test": ("rl", "test", True),
@@ -1110,17 +1110,30 @@ def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
     week1, week2, week3, week4 = weeks_in_order
     require(normalized["cmssl"]["train"]["weeks"] == [week1], "meta['splits']['cmssl']['train'] must reference weeks_in_order[0].")
     require(normalized["cmssl"]["val"]["weeks"] == [week2], "meta['splits']['cmssl']['val'] must reference weeks_in_order[1].")
-    require(normalized["cmssl"]["test"]["weeks"] == [week2], "meta['splits']['cmssl']['test'] must reference weeks_in_order[1].")
+    require(normalized["cmssl"]["test"]["weeks"] == [week3], "meta['splits']['cmssl']['test'] must reference weeks_in_order[2].")
     for split_name in ("train", "val", "test"):
         require(normalized["rl"][split_name]["weeks"] == [week3], f"meta['splits']['rl']['{split_name}'] must reference weeks_in_order[2].")
     require(normalized["eval"]["full"]["weeks"] == [week4], "meta['splits']['eval']['full'] must reference weeks_in_order[3].")
-    cmssl_val = normalized["cmssl"]["val"]
     cmssl_test = normalized["cmssl"]["test"]
-    require(cmssl_val["end"] <= cmssl_test["start"] or cmssl_test["end"] <= cmssl_val["start"], "meta['splits']['cmssl'] val/test must be non-overlapping.")
+    week3_start, week3_end = _resolve_meta_full_week_range(meta, week3, label="weeks_in_order[2]")
+    require(
+        cmssl_test["start"] == week3_start and cmssl_test["end"] == week3_end,
+        "meta['splits']['cmssl']['test'] must cover the full CMSSL week-3 range from metadata."
+    )
     rl_train = normalized["rl"]["train"]
     rl_val = normalized["rl"]["val"]
     rl_test = normalized["rl"]["test"]
+    require(
+        rl_train["start"] >= week3_start and rl_train["end"] <= week3_end
+        and rl_val["start"] >= week3_start and rl_val["end"] <= week3_end
+        and rl_test["start"] >= week3_start and rl_test["end"] <= week3_end,
+        "meta['splits']['rl'] train/val/test must stay within CMSSL test week-3 boundaries."
+    )
     require(rl_train["end"] <= rl_val["start"] < rl_val["end"] <= rl_test["start"] < rl_test["end"], "meta['splits']['rl'] train/val/test must be strictly ordered and non-overlapping.")
+    require(
+        normalized["rl"]["train"]["weeks"] == normalized["cmssl"]["test"]["weeks"],
+        "meta['splits']['rl'] and meta['splits']['cmssl']['test'] must reference the same week (week-3)."
+    )
     return normalized
 
 
@@ -1486,6 +1499,7 @@ def _ensure_monotonic(ts: np.ndarray, label: str) -> None:
 
 
 def report_cmssl_test_diagnostics(out_root: str, meta: dict) -> None:
+    """Report diagnostics for CMSSL week-3 out-of-sample/downstream-development split."""
     test_split = resolve_cmssl_test_split(meta)
     split_weeks = _split_weeks(test_split)
     if not split_weeks:
@@ -1495,17 +1509,16 @@ def report_cmssl_test_diagnostics(out_root: str, meta: dict) -> None:
     end_ms = int(test_split["end"])
     duration_ms = end_ms - start_ms
     print(
-        "[cmssl split:test]",
+        "[cmssl split:test week3_oos_downstream_dev]",
         f"weeks={split_weeks_label}",
         f"start={_format_ts(start_ms)}",
         f"end={_format_ts(end_ms)}",
         f"duration={_format_duration_ms(duration_ms)}",
     )
     expected_week_ms = 7 * 24 * 60 * 60 * 1000
-    expected_half_ms = int(expected_week_ms / 2.0)
     tolerance_ms = 60 * 60 * 1000
-    require(abs(duration_ms - expected_half_ms) <= tolerance_ms, (
-        f"Test split duration {duration_ms}ms not ~3.5 days."
+    require(abs(duration_ms - expected_week_ms) <= tolerance_ms, (
+        f"CMSSL test split duration {duration_ms}ms not ~7 days (week-3 full range)."
     ))
 
     canonical_snapshot_ts_parts: List[np.ndarray] = []
@@ -4832,6 +4845,8 @@ def run_pipeline(
     )
 
     num_h = len(meta.get("horizons_ms", []))
+    # CMSSL diagnostics are computed on CMSSL week-3 out-of-sample test data.
+    # This split is also used for downstream RL development; it is not final untouched evaluation.
     cmssl_report = report_cmssl_metrics(
         joined_cmssl_test["y"],
         {"dir_logits": joined_cmssl_test["features"][:, :num_h]},
@@ -5063,6 +5078,7 @@ def run_pipeline(
         baseline_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
     baseline_dev_t0 = time.perf_counter()
     baseline_dev_metrics = evaluate_prepared_baseline_fast(fast_val_batch if baseline_eval_split == "val" else fast_test_batch, default_baseline_quote_cfg, baseline_alpha_calibration)
+    # Final untouched evaluation remains week-4 (eval.full) for both mm_baseline and mm_rl.
     baseline_metrics = evaluate_prepared_baseline_fast(fast_eval_full_batch, default_baseline_quote_cfg, baseline_alpha_calibration)
     _timing_log(
         "evaluate_market_making baseline "
@@ -5184,6 +5200,10 @@ def run_pipeline(
             _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
             rl_eval_performed = True
 
+    # Return shape:
+    # - cmssl_test: CMSSL week-3 out-of-sample/downstream-development diagnostics.
+    # - mm_baseline/mm_rl: final untouched week-4 (eval.full) metrics.
+    # - *_dev_* fields: week-3 development splits.
     return {
         "cmssl_test": cmssl_report,
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
