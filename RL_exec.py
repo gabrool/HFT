@@ -29,14 +29,11 @@ from CMSSL17 import (
     DMODEL,
     MAMBA_LAYERS,
     LOOKBACK,
-    TIME_GRID_GUARD_MS,
-    TIME_GRID_STEP_MS,
 )
 from offline_tokens import iter_week_chunks, load_global_meta
 
-RAW_SNAPSHOT_EXPECTED_STEP_MS = int(TIME_GRID_STEP_MS)
-RAW_SNAPSHOT_EXPECTED_GUARD_MS = int(TIME_GRID_GUARD_MS)
-# Time-grid contract is centralized in CMSSL17.py.
+# Reference snapshot cadence in milliseconds (used for runtime scaling only).
+RAW_SNAPSHOT_EXPECTED_STEP_MS = 100
 RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "best_bid",
     "best_ask",
@@ -106,19 +103,16 @@ def _obs_norm_state_is_ready(state: Dict[str, Any]) -> bool:
     return count >= 2 and state.get("mean") is not None and state.get("m2") is not None
 
 
-def _require_grid_quantized_decision_meta(meta: Dict[str, Any]) -> None:
+def _require_event_time_decision_meta(meta: Dict[str, Any]) -> None:
     contract_error = (
-        "Dataset not built with grid-quantized decisions; "
-        "rerun offline_ingest/offline_snapshots."
+        "Dataset is missing event-time decision metadata. "
+        "Regenerate canonical snapshots and tokens so decisions use "
+        "order-book event timestamps (decision_time_basis='ob_event_time')."
     )
-    time_grid = meta.get("time_grid")
-    if not isinstance(time_grid, dict):
+    if meta.get("decision_time_basis") != "ob_event_time":
         raise ValueError(contract_error)
-    if int(time_grid.get("step_ms", -1)) != RAW_SNAPSHOT_EXPECTED_STEP_MS:
-        raise ValueError(contract_error)
-    if int(time_grid.get("guard_ms", -1)) != RAW_SNAPSHOT_EXPECTED_GUARD_MS:
-        raise ValueError(contract_error)
-    if meta.get("decision_policy") != "ob_only_grid_quantized":
+    decision_policy = meta.get("decision_policy")
+    if decision_policy is not None and decision_policy != "ob_event_time":
         raise ValueError(contract_error)
 
 
@@ -126,7 +120,7 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
     t0 = time.perf_counter()
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
-    _require_grid_quantized_decision_meta(meta)
+    _require_event_time_decision_meta(meta)
     feat_dim = int(meta["feature_dim_total"])  # includes AUX_DIM already
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, feat_dim, LOOKBACK)
@@ -1082,7 +1076,7 @@ def _normalize_pipeline_split_entry(meta: Dict[str, Any], split_entry: Any, *, l
 
 
 def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
-    _require_grid_quantized_decision_meta(meta)
+    _require_event_time_decision_meta(meta)
     splits = meta.get("splits")
     if not isinstance(splits, dict):
         raise KeyError("meta['splits'] must be a dict.")
@@ -1213,10 +1207,6 @@ def load_split_arrays(out_root: str, split: Dict[str, Any]) -> Tuple[np.ndarray,
     x_aux_all = np.concatenate(x_aux_list, axis=0)
     y_all = np.concatenate(y_list, axis=0)
     ts_all = np.concatenate(ts_list, axis=0)
-    if not np.all(ts_all % RAW_SNAPSHOT_EXPECTED_STEP_MS == 0):
-        raise ValueError(
-            f"Decision timestamps must be on {RAW_SNAPSHOT_EXPECTED_STEP_MS}ms grid."
-        )
     order = np.argsort(ts_all)
     return x_core_all[order], x_aux_all[order], y_all[order], ts_all[order]
 
@@ -1567,9 +1557,9 @@ def align_snapshots_to_decisions(
             "Snapshot alignment failed; exact timestamp matches missing. "
             f"missing={missing.shape[0]} total={decision_ts.size} "
             f"samples={missing[:sample_count].tolist()}. "
-            "Run offline_snapshots.py and ensure "
-            f"decision_policy=ob_only_grid_quantized with guard_ms={RAW_SNAPSHOT_EXPECTED_GUARD_MS}; "
-            "timestamps must land on snapshot grid"
+            "Regenerate canonical snapshots/tokens so decision timestamps are "
+            "derived from order-book event time "
+            "(decision_time_basis='ob_event_time', decision_policy='ob_event_time')."
         )
     return aligned_idx
 
