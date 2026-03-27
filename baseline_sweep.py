@@ -1,5 +1,9 @@
 """Baseline-only sweep / structured search for RL_exec market-making engine.
 
+Protocol note: in v2, CMSSL test corresponds to week3 full. This sweep intentionally
+evaluates RL week3 development splits only (`--eval-split val|test`), and week4 final
+evaluation remains outside this sweep in the main pipeline.
+
 Examples (RL week-3 sweep only; final evaluation stays in the main pipeline after a config/checkpoint is chosen):
     python baseline_sweep.py --out-root /path/to/out_root --ckpt-path /path/to/cmssl17_offline_best.pt \
         --device cuda --search-mode random --n-trials 40 --eval-split val --results-csv baseline_week3_val_sweep.csv
@@ -762,9 +766,9 @@ def make_error_row(
 
 def describe_eval_split(split: str) -> str:
     if split == "val":
-        return "val (RL week-3 validation)"
+        return "val (RL week-3 validation/dev)"
     if split == "test":
-        return "test (RL week-3 test)"
+        return "test (RL week-3 test/dev)"
     return split
 
 
@@ -849,16 +853,41 @@ def parse_args() -> argparse.Namespace:
                     f"{deleted_opt} has been removed from baseline_sweep.py; use the renamed anchor baseline quote controls instead."
                 )
 
-    parser = argparse.ArgumentParser(description="Baseline-only RL week-3 sweep / structured search for RL_exec. Final evaluation stays in the main pipeline after selecting a config/checkpoint.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Baseline-only RL week-3 sweep / structured search for RL_exec. "
+            "In v2 protocol, CMSSL test corresponds to week3 full; this sweep still uses only RL week-3 "
+            "development splits (val/test), and week4 final evaluation stays in the main pipeline."
+        )
+    )
     parser.add_argument("--out-root", default=None)
     parser.add_argument("--ckpt-path", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--n-trials", type=int, default=40)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--eval-split", choices=("val", "test"), default="val", help="Sweep split: val = RL week-3 validation; test = RL week-3 test.")
-    parser.add_argument("--results-csv", default="baseline_sweep_results.csv", help="Output CSV for RL week-3 sweep results.")
+    parser.add_argument(
+        "--eval-split",
+        choices=("val", "test"),
+        default="val",
+        help=(
+            "Sweep split (unchanged): val = RL week-3 validation/dev; test = RL week-3 test/dev. "
+            "CMSSL test maps to week3 full in v2 protocol, but this sweep remains RL week-3 val/test only."
+        ),
+    )
+    parser.add_argument(
+        "--results-csv",
+        default="baseline_sweep_results.csv",
+        help="Output CSV for RL week-3 val/test sweep results (not week4 final evaluation).",
+    )
     parser.add_argument("--top-k", type=int, default=5, help="Number of top RL week-3 sweep candidates to summarize.")
-    parser.add_argument("--retest-topk-on-test", action="store_true", help="After ranking candidates on the chosen RL week-3 sweep split, retest the top-k candidates on RL week-3 test. This does not run any separate final evaluation week.")
+    parser.add_argument(
+        "--retest-topk-on-test",
+        action="store_true",
+        help=(
+            "After ranking candidates on the chosen RL week-3 sweep split, retest top-k on RL week-3 test/dev. "
+            "This is still within sweep development evaluation; week4 final evaluation remains in the main pipeline."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--search-mode", choices=("random", "grid", "one-factor"), default="random")
     parser.add_argument("--vary", nargs="+", default=None)
