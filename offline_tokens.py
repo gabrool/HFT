@@ -5,10 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from CMSSL17 import TIME_GRID_GUARD_MS, TIME_GRID_STEP_MS
-
-# Time-grid contract is centralized in CMSSL17.py.
-
 
 def read_json(path: Path) -> dict:
     with open(path, "r") as f:
@@ -32,28 +28,16 @@ def load_global_meta(out_root: Path) -> dict:
     if not (isinstance(weeks_meta, dict) and weeks_meta):
         raise _meta_error("missing non-empty 'weeks_meta'")
 
-    time_grid = meta.get("time_grid")
-    if not isinstance(time_grid, dict):
-        raise _meta_error("missing 'time_grid' object")
-
-    step_ms = time_grid.get("step_ms")
-    if step_ms != TIME_GRID_STEP_MS:
+    decision_time_basis = meta.get("decision_time_basis")
+    if decision_time_basis != "ob_event_time":
         raise _meta_error(
-            f"'time_grid.step_ms' must be {TIME_GRID_STEP_MS} (got {step_ms!r})"
-        )
-
-    guard_ms = time_grid.get("guard_ms")
-    if guard_ms != TIME_GRID_GUARD_MS:
-        raise _meta_error(
-            f"'time_grid.guard_ms' must be {TIME_GRID_GUARD_MS} (got {guard_ms!r})"
+            "missing/invalid 'decision_time_basis' (must be 'ob_event_time')"
         )
 
     decision_policy = meta.get("decision_policy")
-    if not isinstance(decision_policy, str) or (
-        decision_policy != "ob_only_grid_quantized" and "grid" not in decision_policy
-    ):
+    if decision_policy is not None and decision_policy != "ob_event_time":
         raise _meta_error(
-            "missing/invalid 'decision_policy' (must be 'ob_only_grid_quantized' or contain 'grid')"
+            "invalid 'decision_policy' when present (must be 'ob_event_time')"
         )
 
     week_counts = meta.get("week_counts")
