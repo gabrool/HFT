@@ -471,7 +471,15 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                 last_seen_ts_ms = repaired_ts_ms
                 dq_day.update_output_ts(repaired_ts_ms)
 
-                fe._update_book_from_ob(payload)
+                if isinstance(payload, tuple):
+                    tp_code, bids, asks = int(payload[0]), payload[1], payload[2]
+                else:
+                    data = payload.get("data", payload)
+                    tp_code = 1 if str(payload.get("type") or data.get("type") or payload.get("DataType") or "delta").strip().lower() == "snapshot" else 2
+                    bids = tuple((float(p), float(q)) for p, q in data.get("b", []))
+                    asks = tuple((float(p), float(q)) for p, q in data.get("a", []))
+
+                fe._update_book_from_ob(tp_code, bids, asks)
                 bid, ask, bsz, asz = fe._book_best()
                 if bid <= 0.0 or ask <= 0.0 or bsz is None or asz is None:
                     continue
