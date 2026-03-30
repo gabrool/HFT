@@ -934,7 +934,9 @@ def train_from_offline():
                 y_dir = (y_ret > 0).float()
                 noise_filter_mask = build_directional_noise_filter_mask(y_ret)
 
-                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                # Keep validation/test directional metrics in fp32 to avoid bf16-induced
+                # logit quantization ties in AUC and logit summary statistics.
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=False):
                     dir_logits = model(x)
                     bce_elem = F.binary_cross_entropy_with_logits(dir_logits, y_dir, reduction='none')
 
