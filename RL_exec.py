@@ -30,7 +30,7 @@ from CMSSL17 import (
     MAMBA_LAYERS,
     LOOKBACK,
 )
-from offline_tokens import iter_week_chunks, load_global_meta
+from offline_tokens import iter_week_chunks, load_global_meta, read_json
 
 # Reference snapshot cadence in milliseconds (used for runtime scaling only).
 RAW_SNAPSHOT_EXPECTED_STEP_MS = 100
@@ -1024,39 +1024,32 @@ def _resolve_split_range(range_value: Any, *, label: str) -> Tuple[int, int]:
     return start, end
 
 
-def _resolve_meta_full_week_range(meta: Dict[str, Any], week_key: str, *, label: str) -> Tuple[int, int]:
-    week_ranges = meta.get("week_decision_ts_ranges")
-    if isinstance(week_ranges, dict):
-        wk = week_ranges.get(week_key)
-        if isinstance(wk, dict):
-            if "start" in wk and "end" in wk:
-                return _resolve_split_range(wk, label=label)
-            if "min" in wk and "max" in wk:
-                start = int(wk["min"])
-                end = int(wk["max"]) + 1
-                if start >= end:
-                    raise ValueError(f"meta week range for {label} must satisfy start < end.")
-                return start, end
-    weeks_meta = meta.get("weeks_meta")
-    if isinstance(weeks_meta, dict):
-        wk_meta = weeks_meta.get(week_key)
-        if isinstance(wk_meta, dict):
-            decision_ts_range = wk_meta.get("decision_ts_range")
-            if isinstance(decision_ts_range, dict):
-                if "start" in decision_ts_range and "end" in decision_ts_range:
-                    return _resolve_split_range(decision_ts_range, label=label)
-                if "min" in decision_ts_range and "max" in decision_ts_range:
-                    start = int(decision_ts_range["min"])
-                    end = int(decision_ts_range["max"]) + 1
-                    if start >= end:
-                        raise ValueError(f"meta week range for {label} must satisfy start < end.")
-                    return start, end
-    raise KeyError(
-        f"meta is missing inline decision_ts_range metadata for full-week split '{label}' ({week_key})."
-    )
+def _resolve_meta_full_week_range(out_root: Path, meta: Dict[str, Any], week_key: str, *, label: str) -> Tuple[int, int]:
+    weeks_meta_map = meta.get("weeks_meta")
+    if not isinstance(weeks_meta_map, dict) or not weeks_meta_map:
+        raise KeyError("meta.json missing required non-empty key 'weeks_meta'. Rerun offline_ingest.")
+    rel_path = weeks_meta_map.get(week_key)
+    if not isinstance(rel_path, str) or not rel_path:
+        raise KeyError(f"meta['weeks_meta'] missing path for week '{week_key}' referenced by {label}.")
+    week_meta = read_json(out_root / rel_path)
+    decision_range = week_meta.get("decision_ts_range")
+    if not isinstance(decision_range, dict) or "min" not in decision_range or "max" not in decision_range:
+        raise KeyError(f"Week metadata for {label} must include decision_ts_range min/max.")
+    start = int(decision_range["min"])
+    end = int(decision_range["max"]) + 1
+    if start >= end:
+        raise ValueError(f"Week metadata for {label} has invalid decision_ts_range: start={start} end={end}.")
+    return start, end
 
 
-def _normalize_pipeline_split_entry(meta: Dict[str, Any], split_entry: Any, *, label: str, require_range: bool) -> Dict[str, Any]:
+def _normalize_pipeline_split_entry(
+    out_root: Path,
+    meta: Dict[str, Any],
+    split_entry: Any,
+    *,
+    label: str,
+    require_range: bool,
+) -> Dict[str, Any]:
     if not isinstance(split_entry, dict):
         raise KeyError(f"meta['splits']['{label}'] must be a dict.")
     week_value = split_entry.get("week", split_entry.get("weeks"))
@@ -1081,11 +1074,11 @@ def _normalize_pipeline_split_entry(meta: Dict[str, Any], split_entry: Any, *, l
         elif "start" in split_entry and "end" in split_entry:
             start, end = _resolve_split_range(split_entry, label=label)
         else:
-            start, end = _resolve_meta_full_week_range(meta, weeks[0], label=label)
+            start, end = _resolve_meta_full_week_range(out_root, meta, weeks[0], label=label)
     return {"weeks": weeks, "start": start, "end": end}
 
 
-def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
+def require_four_week_pipeline_splits(meta: Dict[str, Any], out_root: Path) -> Dict[str, Any]:
     _require_event_time_decision_meta(meta)
     splits = meta.get("splits")
     if not isinstance(splits, dict):
@@ -1093,6 +1086,9 @@ def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
     weeks_in_order = meta.get("weeks_in_order")
     if not (isinstance(weeks_in_order, list) and len(weeks_in_order) == 4 and all(isinstance(w, str) and w for w in weeks_in_order)):
         raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries.")
+    weeks_meta_map = meta.get("weeks_meta")
+    if not isinstance(weeks_meta_map, dict) or not weeks_meta_map:
+        raise KeyError("meta.json missing required non-empty key 'weeks_meta'. Rerun offline_ingest.")
     if splits.get("protocol") != "four_week_cmssl_val_test_rl_eval_v2":
         raise ValueError("meta['splits']['protocol'] must be 'four_week_cmssl_val_test_rl_eval_v2'.")
     normalized = {"protocol": splits["protocol"]}
@@ -1110,7 +1106,13 @@ def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
         "eval.full": ("eval", "full", False),
     }
     for label, (section, name, require_range) in required_entries.items():
-        normalized[section][name] = _normalize_pipeline_split_entry(meta, splits[section].get(name), label=label, require_range=require_range)
+        normalized[section][name] = _normalize_pipeline_split_entry(
+            out_root,
+            meta,
+            splits[section].get(name),
+            label=label,
+            require_range=require_range,
+        )
     week1, week2, week3, week4 = weeks_in_order
     require(normalized["cmssl"]["train"]["weeks"] == [week1], "meta['splits']['cmssl']['train'] must reference weeks_in_order[0].")
     require(normalized["cmssl"]["val"]["weeks"] == [week2], "meta['splits']['cmssl']['val'] must reference weeks_in_order[1].")
@@ -1119,7 +1121,7 @@ def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
         require(normalized["rl"][split_name]["weeks"] == [week3], f"meta['splits']['rl']['{split_name}'] must reference weeks_in_order[2].")
     require(normalized["eval"]["full"]["weeks"] == [week4], "meta['splits']['eval']['full'] must reference weeks_in_order[3].")
     cmssl_test = normalized["cmssl"]["test"]
-    week3_start, week3_end = _resolve_meta_full_week_range(meta, week3, label="weeks_in_order[2]")
+    week3_start, week3_end = _resolve_meta_full_week_range(out_root, meta, week3, label="weeks_in_order[2]")
     require(
         cmssl_test["start"] == week3_start and cmssl_test["end"] == week3_end,
         "meta['splits']['cmssl']['test'] must cover the full CMSSL week-3 range from metadata."
@@ -1141,32 +1143,32 @@ def require_four_week_pipeline_splits(meta: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def resolve_cmssl_train_split(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(require_four_week_pipeline_splits(meta)["cmssl"]["train"])
+def resolve_cmssl_train_split(out_root: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta, Path(out_root))["cmssl"]["train"])
 
 
-def resolve_cmssl_val_split(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(require_four_week_pipeline_splits(meta)["cmssl"]["val"])
+def resolve_cmssl_val_split(out_root: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta, Path(out_root))["cmssl"]["val"])
 
 
-def resolve_cmssl_test_split(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(require_four_week_pipeline_splits(meta)["cmssl"]["test"])
+def resolve_cmssl_test_split(out_root: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta, Path(out_root))["cmssl"]["test"])
 
 
-def resolve_rl_train_split(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(require_four_week_pipeline_splits(meta)["rl"]["train"])
+def resolve_rl_train_split(out_root: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta, Path(out_root))["rl"]["train"])
 
 
-def resolve_rl_val_split(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(require_four_week_pipeline_splits(meta)["rl"]["val"])
+def resolve_rl_val_split(out_root: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta, Path(out_root))["rl"]["val"])
 
 
-def resolve_rl_test_split(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(require_four_week_pipeline_splits(meta)["rl"]["test"])
+def resolve_rl_test_split(out_root: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta, Path(out_root))["rl"]["test"])
 
 
-def resolve_eval_full_split(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(require_four_week_pipeline_splits(meta)["eval"]["full"])
+def resolve_eval_full_split(out_root: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(require_four_week_pipeline_splits(meta, Path(out_root))["eval"]["full"])
 
 
 def _split_weeks(split: Dict[str, Any]) -> list[str]:
@@ -1257,7 +1259,7 @@ def load_cmssl_test_windowed_inputs(
     out_root: str,
     meta: dict,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    split = resolve_cmssl_test_split(meta)
+    split = resolve_cmssl_test_split(out_root, meta)
     x_core, x_aux, _y, ts = load_split_arrays(out_root, split)
     return _build_windowed_inputs(x_core, x_aux, ts, lookback=LOOKBACK)
 
@@ -1500,7 +1502,7 @@ def _ensure_monotonic(ts: np.ndarray, label: str) -> None:
 
 def report_cmssl_test_diagnostics(out_root: str, meta: dict) -> None:
     """Report diagnostics for CMSSL week-3 out-of-sample/downstream-development split."""
-    test_split = resolve_cmssl_test_split(meta)
+    test_split = resolve_cmssl_test_split(out_root, meta)
     split_weeks = _split_weeks(test_split)
     if not split_weeks:
         raise ValueError("Test split contains no weeks.")
@@ -4740,11 +4742,11 @@ def prepare_baseline_context(
 ) -> PreparedBaselineContext:
     print("[baseline prep] building shared CMSSL/RL/eval context")
     meta = dict(load_global_meta(Path(out_root)))
-    cmssl_test_split = resolve_cmssl_test_split(meta)
-    rl_train_split = resolve_rl_train_split(meta)
-    rl_val_split = resolve_rl_val_split(meta)
-    rl_test_split = resolve_rl_test_split(meta)
-    eval_full_split = resolve_eval_full_split(meta)
+    cmssl_test_split = resolve_cmssl_test_split(out_root, meta)
+    rl_train_split = resolve_rl_train_split(out_root, meta)
+    rl_val_split = resolve_rl_val_split(out_root, meta)
+    rl_test_split = resolve_rl_test_split(out_root, meta)
+    eval_full_split = resolve_eval_full_split(out_root, meta)
     report_cmssl_test_diagnostics(out_root, meta)
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
     cmssl_batch_size = _resolve_cmssl_batch_size()
@@ -4811,11 +4813,11 @@ def run_pipeline(
             use_numba=_env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA),
         )
     meta = load_global_meta(Path(out_root))
-    cmssl_test_split = resolve_cmssl_test_split(meta)
-    rl_train_split = resolve_rl_train_split(meta)
-    rl_val_split = resolve_rl_val_split(meta)
-    rl_test_split = resolve_rl_test_split(meta)
-    eval_full_split = resolve_eval_full_split(meta)
+    cmssl_test_split = resolve_cmssl_test_split(out_root, meta)
+    rl_train_split = resolve_rl_train_split(out_root, meta)
+    rl_val_split = resolve_rl_val_split(out_root, meta)
+    rl_test_split = resolve_rl_test_split(out_root, meta)
+    eval_full_split = resolve_eval_full_split(out_root, meta)
 
     report_cmssl_test_diagnostics(out_root, meta)
 
