@@ -335,11 +335,12 @@ def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, stri
     while ob_item or tr_item:
         ob_ts = ob_item[1] if ob_item is not None else None
         tr_ts = tr_item[1] if tr_item is not None else None
-        if ob_item is not None and (tr_item is None or ob_ts < tr_ts):
+        if ob_item is not None and (tr_item is None or ob_ts <= tr_ts):
             event = ob_item
             ob_item = next(ob_iter, None)
         else:
-            # Prefer the trade when timestamps tie to preserve causal ordering.
+            # OB wins exact timestamp ties so decision-time book state updates
+            # before same-ms trade-derived features are consumed.
             event = tr_item
             tr_item = next(tr_iter, None)
         etype = event[0]

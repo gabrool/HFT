@@ -2645,15 +2645,28 @@ def binary_auc_from_logits(logits: torch.Tensor, targets_pos: torch.Tensor) -> f
     """
     s = logits.detach().cpu().numpy().astype(np.float64)
     y = targets_pos.detach().cpu().numpy().astype(np.int32)
-    # rank-based AUC
-    order = np.argsort(s)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(len(s), dtype=np.float64) + 1.0
-    n_pos = y.sum()
-    n_neg = len(y) - n_pos
+    n_pos = int(y.sum())
+    n_neg = int(len(y) - n_pos)
     if n_pos == 0 or n_neg == 0:
         return float('nan')
-    auc = (ranks[y==1].sum() - n_pos*(n_pos+1)/2.0) / (n_pos*n_neg)
+
+    order = np.argsort(s, kind="mergesort")
+    s_sorted = s[order]
+    y_sorted = y[order]
+
+    rank_sum_pos = 0.0
+    i = 0
+    n = len(s_sorted)
+    while i < n:
+        j = i + 1
+        while j < n and s_sorted[j] == s_sorted[i]:
+            j += 1
+        avg_rank = 0.5 * ((i + 1) + j)  # 1-based average rank over [i, j)
+        pos_in_block = int(y_sorted[i:j].sum())
+        rank_sum_pos += avg_rank * pos_in_block
+        i = j
+
+    auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)
 
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:

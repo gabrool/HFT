@@ -938,29 +938,29 @@ def train_from_offline():
                     dir_logits = model(x)
                     bce_elem = F.binary_cross_entropy_with_logits(dir_logits, y_dir, reduction='none')
 
-                dir_logits = dir_logits.float()
-                bce_elem = bce_elem.float()
-                pred_class = (dir_logits > 0).to(torch.int32)
-                true_class = y_dir.to(torch.int32)
+                dir_logits_metrics = dir_logits.detach().float()
+                bce_elem_fp32 = bce_elem.detach().float()
+                y_dir_metrics = y_dir.detach()
+                noise_filter_mask_metrics = noise_filter_mask.detach()
+                pred_class = (dir_logits_metrics > 0).to(torch.int32)
+                true_class = y_dir_metrics.to(torch.int32)
 
                 horizon_indices = [primary_horizon_idx] if primary_only else range(NUM_HORIZONS)
                 for h_idx in horizon_indices:
-                    logits_h_all = dir_logits[:, h_idx]
-                    targets_h_all = y_dir[:, h_idx]
-                    bce_sum[h_idx] += bce_elem[:, h_idx].sum().item()
+                    logits_h_all = dir_logits_metrics[:, h_idx]
+                    targets_h_all = y_dir_metrics[:, h_idx]
+                    bce_sum[h_idx] += bce_elem_fp32[:, h_idx].sum().item()
                     bce_count[h_idx] += targets_h_all.numel()
                     acc_sum[h_idx] += (pred_class[:, h_idx] == true_class[:, h_idx]).sum().item()
                     total[h_idx] += targets_h_all.numel()
                     logits_all[h_idx].append(logits_h_all.detach().cpu())
                     ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
 
-                    noise_filter_mask_h = noise_filter_mask[:, h_idx]
+                    noise_filter_mask_h = noise_filter_mask_metrics[:, h_idx]
                     if noise_filter_mask_h.any():
-                        logits_h = dir_logits[noise_filter_mask_h, h_idx]
-                        targets_h = y_dir[noise_filter_mask_h, h_idx]
-                        bce_masked_sum[h_idx] += F.binary_cross_entropy_with_logits(
-                            logits_h, targets_h, reduction='sum'
-                        ).item()
+                        logits_h = dir_logits_metrics[noise_filter_mask_h, h_idx]
+                        targets_h = y_dir_metrics[noise_filter_mask_h, h_idx]
+                        bce_masked_sum[h_idx] += bce_elem_fp32[noise_filter_mask_h, h_idx].sum().item()
                         bce_masked_count[h_idx] += noise_filter_mask_h.sum().item()
                         acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
                         masked_total[h_idx] += noise_filter_mask_h.sum().item()
