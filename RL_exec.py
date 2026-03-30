@@ -1094,13 +1094,11 @@ def _normalize_pipeline_split_entry(
 ) -> Dict[str, Any]:
     if not isinstance(split_entry, dict):
         raise KeyError(f"meta['splits']['{label}'] must be a dict.")
-    week_value = split_entry.get("week", split_entry.get("weeks"))
-    if isinstance(week_value, str) and week_value:
-        weeks = [week_value]
-    elif isinstance(week_value, list) and week_value and all(isinstance(w, str) and w for w in week_value):
+    week_value = split_entry.get("weeks")
+    if isinstance(week_value, list) and week_value and all(isinstance(w, str) and w for w in week_value):
         weeks = list(week_value)
     else:
-        raise KeyError(f"meta['splits']['{label}'] must include non-empty 'week' or 'weeks'.")
+        raise KeyError(f"meta['splits']['{label}'] must include non-empty list[str] 'weeks'.")
     known_weeks = meta.get("weeks_in_order")
     if not isinstance(known_weeks, list) or len(known_weeks) != 4:
         raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries.")
