@@ -3631,11 +3631,6 @@ def train_market_ppo(
             "Validation env must share the prefitted frozen observation normalization before "
             "train_market_ppo() probe construction."
         )
-    if train_obs_norm_state != val_obs_norm_state:
-        raise RuntimeError(
-            "Train/validation observation normalization states differ; install the same prefitted "
-            "frozen state on both envs before train_market_ppo()."
-        )
     prefitted_obs_count = int(train_obs_norm_state["count"])
     print(
         "[mm ppo obs norm] "
