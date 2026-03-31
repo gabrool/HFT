@@ -2597,22 +2597,22 @@ class MarketMakingEnv:
             self.time_since_last_fill += float(dt_ms) / float(RAW_SNAPSHOT_EXPECTED_STEP_MS)
 
         mid_next = self._mid_price(next_idx)
-        maker_rebate_notional = maker_buy * bid + maker_sell * ask
+        maker_buy_notional = maker_buy * bid if maker_buy > 0.0 and np.isfinite(bid) else 0.0
+        maker_sell_notional = maker_sell * ask if maker_sell > 0.0 and np.isfinite(ask) else 0.0
+        maker_rebate_notional = maker_buy_notional + maker_sell_notional
         rebate = maker_rebate_notional * self.maker_rebate_bps * 1e-4
-        taker_notional = taker_buy * best_ask_next + taker_sell * best_bid_next
+        taker_buy_notional = taker_buy * best_ask_next if taker_buy > 0.0 and np.isfinite(best_ask_next) else 0.0
+        taker_sell_notional = taker_sell * best_bid_next if taker_sell > 0.0 and np.isfinite(best_bid_next) else 0.0
+        taker_notional = taker_buy_notional + taker_sell_notional
         taker_fee = taker_notional * self.taker_fee_bps * 1e-4
         self.cash += rebate - taker_fee
 
-        maker_buy_notional = maker_buy * bid
-        maker_sell_notional = maker_sell * ask
-        taker_buy_notional = taker_buy * best_ask_next
-        taker_sell_notional = taker_sell * best_bid_next
         buy_notional_total = maker_buy_notional + taker_buy_notional
         sell_notional_total = maker_sell_notional + taker_sell_notional
         net_fill_notional = buy_notional_total - sell_notional_total
         gross_fill_notional = buy_notional_total + sell_notional_total
-        maker_buy_markout = (mid_next - bid) * maker_buy if maker_buy > 0.0 else 0.0
-        maker_sell_markout = (ask - mid_next) * maker_sell if maker_sell > 0.0 else 0.0
+        maker_buy_markout = (mid_next - bid) * maker_buy if maker_buy > 0.0 and np.isfinite(bid) else 0.0
+        maker_sell_markout = (ask - mid_next) * maker_sell if maker_sell > 0.0 and np.isfinite(ask) else 0.0
 
         if maker_buy > 0.0:
             self.last_maker_buy_notional = maker_buy_notional
@@ -2656,6 +2656,12 @@ class MarketMakingEnv:
         self.idx = next_idx
         done = self.idx >= self.n - 1
         next_obs = self._build_observation(self.idx)
+        if not np.all(np.isfinite(next_obs)):
+            raise RuntimeError(
+                f"Non-finite observation at idx={self.idx}: "
+                f"bid={bid}, ask={ask}, maker_buy={maker_buy}, maker_sell={maker_sell}, "
+                f"taker_buy={taker_buy}, taker_sell={taker_sell}"
+            )
         post_hard_cap_qty = self._inventory_cap_qty(mid_next)
         post_buy_room_qty = self._remaining_inventory_room(1, mid_next)
         post_sell_room_qty = self._remaining_inventory_room(-1, mid_next)
@@ -4565,7 +4571,9 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
             sell_clip = fill_size - sell_fill
             cash += ask * sell_fill
             inventory -= sell_fill
-        maker_notional = buy_fill * bid + sell_fill * ask
+        maker_buy_notional = buy_fill * bid if buy_fill > 0.0 and np.isfinite(bid) else 0.0
+        maker_sell_notional = sell_fill * ask if sell_fill > 0.0 and np.isfinite(ask) else 0.0
+        maker_notional = maker_buy_notional + maker_sell_notional
         rebate = maker_notional * maker_rebate_bps * 1e-4
         cash += rebate
         equity = cash + inventory * mid_next[idx]
@@ -4584,10 +4592,10 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
         reward_curve[idx] = reward
         maker_buy_curve[idx] = buy_fill
         maker_sell_curve[idx] = sell_fill
-        step_turnover_notional = buy_fill * bid + sell_fill * ask
+        step_turnover_notional = maker_notional
         turnover_notional_curve[idx] = step_turnover_notional
-        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 else 0.0
-        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 else 0.0
+        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 and np.isfinite(bid) else 0.0
+        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 and np.isfinite(ask) else 0.0
         maker_buy_markout_curve[idx] = maker_buy_markout
         maker_sell_markout_curve[idx] = maker_sell_markout
         turnover_qty += buy_fill + sell_fill
