@@ -2603,8 +2603,8 @@ class MarketMakingEnv:
         taker_fee = taker_notional * self.taker_fee_bps * 1e-4
         self.cash += rebate - taker_fee
 
-        maker_buy_notional = maker_buy * bid
-        maker_sell_notional = maker_sell * ask
+        maker_buy_notional = maker_buy * bid if maker_buy > 0.0 and np.isfinite(bid) else 0.0
+        maker_sell_notional = maker_sell * ask if maker_sell > 0.0 and np.isfinite(ask) else 0.0
         taker_buy_notional = taker_buy * best_ask_next
         taker_sell_notional = taker_sell * best_bid_next
         buy_notional_total = maker_buy_notional + taker_buy_notional
