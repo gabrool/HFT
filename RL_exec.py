@@ -4571,7 +4571,9 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
             sell_clip = fill_size - sell_fill
             cash += ask * sell_fill
             inventory -= sell_fill
-        maker_notional = buy_fill * bid + sell_fill * ask
+        maker_buy_notional = buy_fill * bid if buy_fill > 0.0 and np.isfinite(bid) else 0.0
+        maker_sell_notional = sell_fill * ask if sell_fill > 0.0 and np.isfinite(ask) else 0.0
+        maker_notional = maker_buy_notional + maker_sell_notional
         rebate = maker_notional * maker_rebate_bps * 1e-4
         cash += rebate
         equity = cash + inventory * mid_next[idx]
@@ -4590,10 +4592,10 @@ def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid
         reward_curve[idx] = reward
         maker_buy_curve[idx] = buy_fill
         maker_sell_curve[idx] = sell_fill
-        step_turnover_notional = buy_fill * bid + sell_fill * ask
+        step_turnover_notional = maker_notional
         turnover_notional_curve[idx] = step_turnover_notional
-        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 else 0.0
-        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 else 0.0
+        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 and np.isfinite(bid) else 0.0
+        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 and np.isfinite(ask) else 0.0
         maker_buy_markout_curve[idx] = maker_buy_markout
         maker_sell_markout_curve[idx] = maker_sell_markout
         turnover_qty += buy_fill + sell_fill
