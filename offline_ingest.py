@@ -2433,14 +2433,18 @@ def process_all(
 def main():
     ensure_dir(OUT_ROOT)
     mode_fields = canonical_mode_fields()
+    trade_history_enabled = bool(mode_fields["trade_history_enabled"])
     print(
-        f"[ingest mode] trade_history_enabled={str(mode_fields['trade_history_enabled']).lower()} "
+        f"[ingest mode] trade_history_enabled={str(trade_history_enabled).lower()} "
         f"event_stream_mode={mode_fields['event_stream_mode']}"
     )
     pairs = pair_weeks(OB_DIR, TH_DIR)
 
     if not pairs:
-        print(f"No week pairs found under OB_DIR={OB_DIR} and TH_DIR={TH_DIR}")
+        if trade_history_enabled:
+            print(f"No week pairs found under OB_DIR={OB_DIR} and TH_DIR={TH_DIR}")
+        else:
+            print(f"No week pairs found under OB_DIR={OB_DIR}")
         return
 
     requested_weeks = _parse_requested_weeks(RAW_BYBIT_WEEKS)
@@ -2489,7 +2493,8 @@ def main():
     print(f"[weeks] {', '.join(chosen_weeks)}")
 
     print(f"[paths] OB_DIR={OB_DIR}")
-    print(f"[paths] TH_DIR={TH_DIR}")
+    if trade_history_enabled:
+        print(f"[paths] TH_DIR={TH_DIR}")
     print(f"[out  ] OUT_ROOT={OUT_ROOT}")
 
 
