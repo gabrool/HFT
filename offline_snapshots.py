@@ -10,10 +10,13 @@ Each row is emitted at repaired OB event timestamps.
 There is no time-grid interpolation in this pipeline.
 Contract matches decision_time_basis = "ob_event_time".
 
-Outputs snapshots.npz files compatible with RL_exec.load_raw_snapshots.
-The snapshots payload is always a 4-column top-of-book matrix:
+Outputs:
+  - snapshots.npz (raw OB event-time snapshots)
+  - decision_snapshots.npz (decision-aligned 11-column snapshot feature matrix)
+
+The raw snapshots payload is always a 4-column top-of-book matrix:
   (best_bid, best_ask, best_bid_size, best_ask_size).
-RL execution expects this exact schema.
+RL execution consumes decision_snapshots.npz.
 
 Env defaults:
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
@@ -79,6 +82,22 @@ BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
 BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
 ONE_DAY = timedelta(days=1)
+DECISION_SNAPSHOTS_SCHEMA_VERSION = 1
+RAW_SNAPSHOT_FEATURE_COLUMNS = [
+    "best_bid",
+    "best_ask",
+    "best_bid_size",
+    "best_ask_size",
+    "time_since_last_ob_update_ms",
+    "imbalance",
+    "mid",
+    "spread_bps",
+    "mid_ret_1",
+    "vol_short",
+    "vol_long",
+]
+SHORT_VOL_WINDOW = 5
+LONG_VOL_WINDOW = 10
 
 
 def quality_env_config() -> dict[str, object]:
@@ -615,6 +634,238 @@ def write_week_snapshots(out_root: str, week_key: str, series: SnapshotSeries, *
     return out_path
 
 
+def _load_meta_json(out_root: str) -> dict:
+    meta_path = Path(out_root) / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Missing {meta_path}. Run offline_ingest.py first.")
+    with meta_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_week_decision_timestamps(out_root: str, week_key: str) -> np.ndarray:
+    meta = _load_meta_json(out_root)
+    weeks_meta = meta.get("weeks_meta")
+    if not isinstance(weeks_meta, dict):
+        raise ValueError("Malformed meta.json: missing weeks_meta mapping.")
+    rel_week_meta = weeks_meta.get(week_key)
+    if not isinstance(rel_week_meta, str) or not rel_week_meta.strip():
+        raise ValueError(f"Malformed meta.json: missing weeks_meta entry for week={week_key}.")
+    week_meta_path = Path(out_root) / rel_week_meta
+    if not week_meta_path.exists():
+        raise FileNotFoundError(f"Missing week metadata for week={week_key}: {week_meta_path}")
+    with week_meta_path.open("r", encoding="utf-8") as f:
+        week_meta = json.load(f)
+    chunks = week_meta.get("chunks")
+    if not isinstance(chunks, list):
+        raise ValueError(f"Malformed week metadata for week={week_key}: chunks must be a list.")
+    parts: List[np.ndarray] = []
+    for idx, chunk in enumerate(chunks):
+        files = chunk.get("files", {})
+        if not isinstance(files, dict) or "ts" not in files:
+            raise ValueError(f"Week={week_key} chunk[{idx}] missing files['ts'] metadata.")
+        ts_path = week_meta_path.parent / str(files["ts"])
+        if not ts_path.exists():
+            raise FileNotFoundError(f"Week={week_key} chunk[{idx}] missing ts file: {ts_path}")
+        ts_arr = np.load(ts_path)
+        ts_arr = np.asarray(ts_arr)
+        if ts_arr.ndim != 1:
+            raise ValueError(f"Week={week_key} chunk[{idx}] ts must be 1D, got shape={ts_arr.shape}")
+        if ts_arr.size and np.any(np.diff(ts_arr.astype(np.int64, copy=False)) < 0):
+            raise ValueError(f"Week={week_key} chunk[{idx}] ts must be monotonically non-decreasing.")
+        parts.append(ts_arr.astype(np.int64, copy=False))
+    if not parts:
+        return np.empty((0,), dtype=np.int64)
+    week_ts = np.concatenate(parts, axis=0).astype(np.int64, copy=False)
+    if week_ts.size and np.any(np.diff(week_ts) < 0):
+        raise ValueError(f"Week={week_key} concatenated ts must be monotonically non-decreasing.")
+    return week_ts
+
+
+def _ffill_1d(x: np.ndarray) -> np.ndarray:
+    out = np.asarray(x, dtype=np.float64).copy()
+    if out.size == 0:
+        return out
+    finite_mask = np.isfinite(out)
+    if not np.any(finite_mask):
+        out[:] = 0.0
+        return out
+    idx = np.where(finite_mask, np.arange(out.size), 0)
+    np.maximum.accumulate(idx, out=idx)
+    out = out[idx]
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
+def _rolling_std_ignore_nan(x: np.ndarray, window: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    finite = np.isfinite(x)
+    x_finite = np.where(finite, x, 0.0)
+    x_finite_sq = x_finite * x_finite
+    csum = np.cumsum(x_finite)
+    csum2 = np.cumsum(x_finite_sq)
+    count_csum = np.cumsum(finite.astype(np.int64))
+    count = count_csum.copy()
+    sums = csum.copy()
+    sumsq = csum2.copy()
+    if window < n:
+        count[window:] -= count_csum[:-window]
+        sums[window:] -= csum[:-window]
+        sumsq[window:] -= csum2[:-window]
+    out = np.full(n, np.nan, dtype=np.float64)
+    valid = count > 1
+    var_num = sumsq[valid] - (sums[valid] * sums[valid]) / count[valid]
+    out[valid] = np.sqrt(np.maximum(var_num / (count[valid] - 1), 0.0))
+    return out
+
+
+def _sanitize_snapshot_features(arr: np.ndarray) -> np.ndarray:
+    target_cols = [
+        "best_bid_size",
+        "best_ask_size",
+        "time_since_last_ob_update_ms",
+        "imbalance",
+        "mid_ret_1",
+        "vol_short",
+        "vol_long",
+        "spread_bps",
+    ]
+    out = np.asarray(arr).copy()
+    if out.ndim != 2:
+        raise ValueError(f"Expected 2D snapshot feature array, got shape={out.shape}.")
+    col_idx = {
+        name: RAW_SNAPSHOT_FEATURE_COLUMNS.index(name)
+        for name in target_cols
+        if name in RAW_SNAPSHOT_FEATURE_COLUMNS and RAW_SNAPSHOT_FEATURE_COLUMNS.index(name) < out.shape[1]
+    }
+    for idx in col_idx.values():
+        col = out[:, idx].astype(np.float64, copy=False)
+        col[~np.isfinite(col)] = np.nan
+        col = _ffill_1d(col)
+        col[~np.isfinite(col)] = 0.0
+        out[:, idx] = col.astype(out.dtype, copy=False)
+    return out
+
+
+def compute_snapshot_feature_matrix(
+    snapshot_ts: np.ndarray,
+    snapshots: np.ndarray,
+    time_since_last_ob_update_ms: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshots = np.asarray(snapshots)
+    stale_ms = np.asarray(time_since_last_ob_update_ms, dtype=np.float64)
+    if snapshot_ts.ndim != 1:
+        raise ValueError("snapshot_ts must be 1D.")
+    if snapshots.ndim != 2 or snapshots.shape[1] != 4:
+        raise ValueError("Snapshots must be [N,4] with bid/ask and sizes.")
+    if stale_ms.ndim != 1 or stale_ms.shape[0] != snapshot_ts.shape[0]:
+        raise ValueError("time_since_last_ob_update_ms must be shape [N].")
+    order = np.argsort(snapshot_ts)
+    snapshot_ts = snapshot_ts[order]
+    snapshots = snapshots[order]
+    stale_ms = np.maximum(stale_ms[order], 0.0)
+    best_bid = snapshots[:, 0].astype(np.float64)
+    best_ask = snapshots[:, 1].astype(np.float64)
+    best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
+    best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
+    mid = (best_bid + best_ask) / 2.0
+    eps = 1e-9
+    imbalance = (best_bid_size - best_ask_size) / (best_bid_size + best_ask_size + eps)
+    spread_bps = (best_ask - best_bid) / mid * 1e4
+    mid_ret_1 = np.log(mid)
+    mid_ret_1 = np.concatenate([[np.nan], np.diff(mid_ret_1)])
+    vol_short = _rolling_std_ignore_nan(mid_ret_1, SHORT_VOL_WINDOW)
+    vol_long = _rolling_std_ignore_nan(mid_ret_1, LONG_VOL_WINDOW)
+    features = np.column_stack(
+        [
+            best_bid,
+            best_ask,
+            best_bid_size,
+            best_ask_size,
+            stale_ms,
+            imbalance,
+            mid,
+            spread_bps,
+            mid_ret_1,
+            vol_short,
+            vol_long,
+        ]
+    )
+    features = _sanitize_snapshot_features(features).astype(np.float32, copy=False)
+    return snapshot_ts, features
+
+
+def align_snapshot_features_to_decisions(
+    snapshot_ts: np.ndarray,
+    snapshot_features: np.ndarray,
+    decision_ts: np.ndarray,
+) -> np.ndarray:
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshot_features = np.asarray(snapshot_features, dtype=np.float32)
+    decision_ts = np.asarray(decision_ts, dtype=np.int64)
+    if snapshot_ts.ndim != 1:
+        raise ValueError("snapshot_ts must be 1D")
+    if snapshot_features.ndim != 2:
+        raise ValueError("snapshot_features must be 2D")
+    if snapshot_features.shape[0] != snapshot_ts.shape[0]:
+        raise ValueError("snapshot_features rows must match snapshot_ts length")
+    if decision_ts.ndim != 1:
+        raise ValueError("decision_ts must be 1D")
+    if snapshot_ts.size and np.any(np.diff(snapshot_ts) <= 0):
+        raise ValueError("snapshot_ts must be strictly increasing (np.diff(snapshot_ts) > 0)")
+    if decision_ts.size and np.any(np.diff(decision_ts) < 0):
+        raise ValueError("decision_ts must be monotonically non-decreasing (np.diff(decision_ts) >= 0)")
+    aligned_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
+    in_bounds = aligned_idx < snapshot_ts.shape[0]
+    exact_match = np.zeros(decision_ts.shape[0], dtype=bool)
+    exact_match[in_bounds] = snapshot_ts[aligned_idx[in_bounds]] == decision_ts[in_bounds]
+    missing_mask = ~exact_match
+    if np.any(missing_mask):
+        missing = decision_ts[missing_mask]
+        sample_count = min(5, int(missing.shape[0]))
+        raise ValueError(
+            "Snapshot alignment failed; exact timestamp matches missing. "
+            f"missing={missing.shape[0]} total={decision_ts.size} "
+            f"samples={missing[:sample_count].tolist()}. "
+            "Regenerate canonical snapshots/tokens so decision timestamps are "
+            "derived from order-book event time "
+            "(decision_time_basis='ob_event_time', decision_policy='ob_event_time')."
+        )
+    return snapshot_features[aligned_idx]
+
+
+def write_week_decision_snapshots(
+    out_root: str,
+    week_key: str,
+    decision_ts: np.ndarray,
+    aligned_snapshot_features: np.ndarray,
+    *,
+    overwrite: bool,
+    source_snapshot_rows: Optional[int] = None,
+) -> Path:
+    week_dir = Path(out_root) / week_key
+    week_dir.mkdir(parents=True, exist_ok=True)
+    out_path = week_dir / "decision_snapshots.npz"
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(f"Decision snapshot file exists: {out_path} (use --overwrite)")
+    payload = {
+        "ts": np.asarray(decision_ts, dtype=np.int64),
+        "snapshots": np.asarray(aligned_snapshot_features, dtype=np.float32),
+        "schema_version": np.asarray(DECISION_SNAPSHOTS_SCHEMA_VERSION, dtype=np.int64),
+        "feature_columns_json": np.asarray(json.dumps(RAW_SNAPSHOT_FEATURE_COLUMNS), dtype=np.str_),
+        "source_snapshot_rows": np.asarray(
+            int(source_snapshot_rows if source_snapshot_rows is not None else aligned_snapshot_features.shape[0]),
+            dtype=np.int64,
+        ),
+        "decision_row_count": np.asarray(int(decision_ts.shape[0]), dtype=np.int64),
+    }
+    np.savez_compressed(out_path, **payload)
+    return out_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -653,19 +904,51 @@ def main() -> int:
         )
         week_quality = WeekQuality(week_key=wk, days=[], totals={})
         series = build_snapshots_from_ob_files(ob_paths, week_quality)
-        quality_path = Path(args.out_root) / wk / "snapshots_quality.json"
-        quality_payload = {
-            "config": quality_env_config(),
-            **week_quality.to_dict(),
-        }
-        quality_path.parent.mkdir(parents=True, exist_ok=True)
-        quality_path.write_text(json.dumps(quality_payload, indent=2), encoding="utf-8")
         if not series.ts:
+            quality_path = Path(args.out_root) / wk / "snapshots_quality.json"
+            quality_payload = {
+                "config": quality_env_config(),
+                **week_quality.to_dict(),
+            }
+            quality_path.parent.mkdir(parents=True, exist_ok=True)
+            quality_path.write_text(json.dumps(quality_payload, indent=2), encoding="utf-8")
             print(f"  [skip] no snapshots produced for {wk}")
             print(f"  [quality] {quality_path}")
             continue
         out_path = write_week_snapshots(args.out_root, wk, series, overwrite=args.overwrite)
+        raw_ts = np.asarray(series.ts, dtype=np.int64)
+        raw_snapshots = np.column_stack(
+            [series.best_bid, series.best_ask, series.best_bid_size, series.best_ask_size]
+        ).astype(np.float32, copy=False)
+        stale_ms = np.asarray(series.time_since_last_ob_update_ms, dtype=np.float32)
+        snapshot_ts, snapshot_features = compute_snapshot_feature_matrix(raw_ts, raw_snapshots, stale_ms)
+        decision_ts = load_week_decision_timestamps(args.out_root, wk)
+        aligned_snapshots = align_snapshot_features_to_decisions(snapshot_ts, snapshot_features, decision_ts)
+        decision_out_path = write_week_decision_snapshots(
+            args.out_root,
+            wk,
+            decision_ts,
+            aligned_snapshots,
+            overwrite=args.overwrite,
+            source_snapshot_rows=int(snapshot_ts.shape[0]),
+        )
+        quality_path = Path(args.out_root) / wk / "snapshots_quality.json"
+        quality_payload = {
+            "config": quality_env_config(),
+            **week_quality.to_dict(),
+            "decision_alignment": {
+                "decision_rows": int(decision_ts.shape[0]),
+                "raw_snapshot_rows": int(snapshot_ts.shape[0]),
+                "aligned_rows": int(aligned_snapshots.shape[0]),
+                "schema_version": int(DECISION_SNAPSHOTS_SCHEMA_VERSION),
+                "feature_columns": list(RAW_SNAPSHOT_FEATURE_COLUMNS),
+                "alignment_status": "ok",
+            },
+        }
+        quality_path.parent.mkdir(parents=True, exist_ok=True)
+        quality_path.write_text(json.dumps(quality_payload, indent=2), encoding="utf-8")
         print(f"  [write] {out_path} rows={len(series.ts):,}")
+        print(f"  [write] {decision_out_path} rows={aligned_snapshots.shape[0]:,}")
         print(f"  [quality] {quality_path}")
 
     return 0

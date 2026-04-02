@@ -35,6 +35,7 @@ from offline_tokens import iter_week_chunks, load_global_meta, read_json
 
 # Reference snapshot cadence in milliseconds (used for runtime scaling only).
 RAW_SNAPSHOT_EXPECTED_STEP_MS = 100
+DECISION_SNAPSHOTS_SCHEMA_VERSION = 1
 RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "best_bid",
     "best_ask",
@@ -50,8 +51,6 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
 ]
 FEATURE_EXTRA_DIM = 5
 ENV_OBS_EXTRA_STATE_DIM = 14
-SHORT_VOL_WINDOW = 5
-LONG_VOL_WINDOW = 10
 # CMSSL market-making horizon contract is fixed: exactly [250, 500, 1000] ms.
 DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
 DEFAULT_MM_BASE_HALF_SPREAD_BPS = 0.0
@@ -1378,158 +1377,50 @@ def run_cmssl_inference(
     }
 
 
-def _find_week_dir(out_root: Path, week_key: str) -> Path:
-    meta = load_global_meta(out_root)
-    for wk, _wmeta, wk_dir in iter_week_chunks(out_root, meta=meta):
+def load_decision_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray]:
+    week_dir: Optional[Path] = None
+    meta = load_global_meta(Path(out_root))
+    for wk, _wmeta, wk_dir in iter_week_chunks(Path(out_root), meta=meta):
         if wk == week_key:
-            return wk_dir
-    raise ValueError(f"Unable to locate week directory for {week_key}")
-
-
-def _ffill_1d(x: np.ndarray) -> np.ndarray:
-    out = np.asarray(x, dtype=np.float64).copy()
-    if out.size == 0:
-        return out
-    finite_mask = np.isfinite(out)
-    if not np.any(finite_mask):
-        out[:] = 0.0
-        return out
-    idx = np.where(finite_mask, np.arange(out.size), 0)
-    np.maximum.accumulate(idx, out=idx)
-    out = out[idx]
-    out[~np.isfinite(out)] = 0.0
-    return out
-
-
-def _rolling_std_ignore_nan(x: np.ndarray, window: int) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float64)
-    n = x.size
-    if n == 0:
-        return np.empty(0, dtype=np.float64)
-    finite = np.isfinite(x)
-    x_finite = np.where(finite, x, 0.0)
-    x_finite_sq = x_finite * x_finite
-
-    csum = np.cumsum(x_finite)
-    csum2 = np.cumsum(x_finite_sq)
-    count_csum = np.cumsum(finite.astype(np.int64))
-
-    count = count_csum.copy()
-    sums = csum.copy()
-    sumsq = csum2.copy()
-    if window < n:
-        count[window:] -= count_csum[:-window]
-        sums[window:] -= csum[:-window]
-        sumsq[window:] -= csum2[:-window]
-
-    out = np.full(n, np.nan, dtype=np.float64)
-    valid = count > 1
-    var_num = sumsq[valid] - (sums[valid] * sums[valid]) / count[valid]
-    out[valid] = np.sqrt(np.maximum(var_num / (count[valid] - 1), 0.0))
-    return out
-
-
-def _sanitize_snapshot_features(arr: np.ndarray) -> np.ndarray:
-    target_cols = [
-        "best_bid_size",
-        "best_ask_size",
-        "time_since_last_ob_update_ms",
-        "imbalance",
-        "mid_ret_1",
-        "vol_short",
-        "vol_long",
-        "spread_bps",
-    ]
-    arr = np.asarray(arr).copy()
-    if arr.ndim != 2:
-        raise ValueError(f"Expected 2D snapshot feature array, got shape={arr.shape}.")
-    col_idx = {
-        name: RAW_SNAPSHOT_FEATURE_COLUMNS.index(name)
-        for name in target_cols
-        if name in RAW_SNAPSHOT_FEATURE_COLUMNS and RAW_SNAPSHOT_FEATURE_COLUMNS.index(name) < arr.shape[1]
-    }
-    for idx in col_idx.values():
-        col = arr[:, idx].astype(np.float64, copy=False)
-        col[~np.isfinite(col)] = np.nan
-        col = _ffill_1d(col)
-        col[~np.isfinite(col)] = 0.0
-        col = col.astype(arr.dtype, copy=False)
-        arr[:, idx] = col
-    return arr
-
-
-def _compute_snapshot_feature_matrix(
-    snapshot_ts: np.ndarray,
-    snapshots: np.ndarray,
-    time_since_last_ob_update_ms: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-    snapshots = np.asarray(snapshots)
-    if snapshot_ts.ndim != 1:
-        raise ValueError("snapshot_ts must be 1D.")
-    if snapshots.ndim != 2 or snapshots.shape[1] != 4:
-        raise ValueError("Snapshots must be [N,4] with bid/ask and sizes. Rebuild snapshots.")
-    order = np.argsort(snapshot_ts)
-    snapshot_ts = snapshot_ts[order]
-    snapshots = snapshots[order]
-    best_bid = snapshots[:, 0].astype(np.float64)
-    best_ask = snapshots[:, 1].astype(np.float64)
-    best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
-    best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
-    if time_since_last_ob_update_ms is None:
-        time_since_last_ob_update_ms = np.zeros_like(best_bid, dtype=np.float64)
-    else:
-        time_since_last_ob_update_ms = np.asarray(time_since_last_ob_update_ms, dtype=np.float64)
-        if time_since_last_ob_update_ms.ndim != 1 or time_since_last_ob_update_ms.shape[0] != snapshot_ts.shape[0]:
-            raise ValueError("time_since_last_ob_update_ms must be shape [N].")
-        time_since_last_ob_update_ms = np.maximum(time_since_last_ob_update_ms[order], 0.0)
-    mid = (best_bid + best_ask) / 2.0
-    eps = 1e-9
-    imbalance = (best_bid_size - best_ask_size) / (best_bid_size + best_ask_size + eps)
-    spread_bps = (best_ask - best_bid) / mid * 1e4
-    mid_ret_1 = np.log(mid)
-    mid_ret_1 = np.concatenate([[np.nan], np.diff(mid_ret_1)])
-    vol_short = _rolling_std_ignore_nan(mid_ret_1, SHORT_VOL_WINDOW)
-    vol_long = _rolling_std_ignore_nan(mid_ret_1, LONG_VOL_WINDOW)
-    features = np.column_stack(
-        [
-            best_bid,
-            best_ask,
-            best_bid_size,
-            best_ask_size,
-            time_since_last_ob_update_ms,
-            imbalance,
-            mid,
-            spread_bps,
-            mid_ret_1,
-            vol_short,
-            vol_long,
-        ]
+            week_dir = wk_dir
+            break
+    if week_dir is None:
+        raise ValueError(f"Unable to locate week directory for {week_key}")
+    decision_path = week_dir / "decision_snapshots.npz"
+    rebuild_msg = (
+        "Decision snapshot artifact is missing/stale/malformed. "
+        f"Expected {decision_path}. Please rerun offline_snapshots.py."
     )
-    return snapshot_ts, _sanitize_snapshot_features(features)
-
-
-def load_raw_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """Load canonical raw snapshots only (no alternate ingestion fallbacks)."""
-    week_dir = _find_week_dir(Path(out_root), week_key)
-    canonical_path = week_dir / "snapshots.npz"
-    if not canonical_path.exists():
-        raise FileNotFoundError("Run offline_snapshots.py first.")
-
-    data = np.load(canonical_path)
-    if not {"ts", "snapshots"}.issubset(data.files):
-        raise ValueError(
-            f"Expected canonical snapshots at {out_root}/{week_key}/snapshots.npz "
-            "with fields ts and snapshots. Generate them with offline_snapshots.py."
-        )
-    snapshots = data["snapshots"]
-    if snapshots.ndim != 2 or snapshots.shape[1] != 4:
-        raise ValueError(
-            f"{canonical_path} has snapshots shape {snapshots.shape}; expected [N,4] (bid, ask, bid_size, ask_size). "
-            "Re-run offline_snapshots (1).py to regenerate."
-        )
-    stale_ms = data["time_since_last_ob_update_ms"] if "time_since_last_ob_update_ms" in data.files else None
-    return data["ts"], snapshots, stale_ms
+    if not decision_path.exists():
+        raise FileNotFoundError(rebuild_msg)
+    data = np.load(decision_path)
+    if not {"ts", "snapshots", "schema_version", "feature_columns_json"}.issubset(data.files):
+        raise ValueError(rebuild_msg)
+    ts = np.asarray(data["ts"], dtype=np.int64)
+    snapshots = np.asarray(data["snapshots"], dtype=np.float32)
+    if ts.ndim != 1:
+        raise ValueError(rebuild_msg)
+    if snapshots.ndim != 2 or snapshots.shape[1] != len(RAW_SNAPSHOT_FEATURE_COLUMNS):
+        raise ValueError(rebuild_msg)
+    schema_version = int(np.asarray(data["schema_version"]).reshape(-1)[0])
+    if schema_version != DECISION_SNAPSHOTS_SCHEMA_VERSION:
+        raise ValueError(rebuild_msg)
+    feature_columns_raw = np.asarray(data["feature_columns_json"]).reshape(-1)[0]
+    if isinstance(feature_columns_raw, np.bytes_):
+        feature_columns_raw = feature_columns_raw.decode("utf-8")
+    try:
+        feature_columns = json.loads(str(feature_columns_raw))
+    except Exception as exc:
+        raise ValueError(rebuild_msg) from exc
+    if feature_columns != RAW_SNAPSHOT_FEATURE_COLUMNS:
+        raise ValueError(rebuild_msg)
+    if ts.size and np.any(np.diff(ts) <= 0):
+        raise ValueError(rebuild_msg)
+    if not np.all(np.isfinite(snapshots)):
+        raise ValueError(rebuild_msg)
+    if snapshots.shape[0] != ts.shape[0]:
+        raise ValueError(rebuild_msg)
+    return ts, snapshots
 
 
 def _format_ts(ts_ms: int) -> str:
@@ -1572,57 +1463,43 @@ def report_cmssl_test_diagnostics(out_root: str, meta: dict) -> None:
         f"CMSSL test split duration {duration_ms}ms not ~7 days (week-3 full range)."
     ))
 
-    canonical_snapshot_ts_parts: List[np.ndarray] = []
+    split_token_ts_parts: List[np.ndarray] = []
+    decision_snapshot_ts_parts: List[np.ndarray] = []
     for week in split_weeks:
-        week_snapshot_ts, _snapshots, _stale_ms = load_raw_snapshots(out_root, week)
-        canonical_snapshot_ts_parts.append(np.asarray(week_snapshot_ts, dtype=np.int64))
-    canonical_snapshot_ts = np.concatenate(canonical_snapshot_ts_parts, axis=0)
-    canonical_snapshot_ts = np.asarray(canonical_snapshot_ts, dtype=np.int64)
-    canonical_snapshot_ts = np.sort(canonical_snapshot_ts)
-    filtered = canonical_snapshot_ts[(canonical_snapshot_ts >= start_ms) & (canonical_snapshot_ts < end_ms)]
-    if filtered.size == 0:
-        raise ValueError("No canonical raw snapshots found inside the CMSSL test split range.")
-    _ensure_monotonic(filtered, "Raw snapshot (filtered)")
-    print(
-        "[raw snapshots:test]",
-        f"count={filtered.size}",
-        f"start={_format_ts(int(filtered[0]))}",
-        f"end={_format_ts(int(filtered[-1]))}",
-    )
-
-
-def align_snapshots_to_decisions(
-    snapshot_ts: np.ndarray,
-    decision_ts: np.ndarray,
-) -> np.ndarray:
-    """Return exact snapshot indices for each decision timestamp."""
-    if snapshot_ts.ndim != 1:
-        raise ValueError("snapshot_ts must be 1D")
-    if decision_ts.ndim != 1:
-        raise ValueError("decision_ts must be 1D")
-    if snapshot_ts.size and np.any(np.diff(snapshot_ts) <= 0):
-        raise ValueError("snapshot_ts must be strictly increasing (np.diff(snapshot_ts) > 0)")
-    if decision_ts.size and np.any(np.diff(decision_ts) < 0):
-        raise ValueError("decision_ts must be monotonically non-decreasing (np.diff(decision_ts) >= 0)")
-
-    aligned_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
-    in_bounds = aligned_idx < snapshot_ts.shape[0]
-    exact_match = np.zeros(decision_ts.shape[0], dtype=bool)
-    exact_match[in_bounds] = snapshot_ts[aligned_idx[in_bounds]] == decision_ts[in_bounds]
-    missing_mask = ~exact_match
-
-    if np.any(missing_mask):
-        missing = decision_ts[missing_mask]
-        sample_count = min(5, int(missing.shape[0]))
+        wk_split = {"weeks": [week], "start": start_ms, "end": end_ms}
+        try:
+            _x_core, _x_aux, _y, token_ts = load_split_arrays(out_root, wk_split)
+        except ValueError as exc:
+            if str(exc).startswith("No data found for split"):
+                continue
+            raise
+        split_token_ts_parts.append(np.asarray(token_ts, dtype=np.int64))
+        wk_snapshot_ts, _snapshots = load_decision_snapshots(out_root, week)
+        mask = (wk_snapshot_ts >= start_ms) & (wk_snapshot_ts < end_ms)
+        decision_snapshot_ts_parts.append(np.asarray(wk_snapshot_ts[mask], dtype=np.int64))
+    if not split_token_ts_parts:
+        raise ValueError("No token decision timestamps found inside the CMSSL test split range.")
+    split_token_ts = np.concatenate(split_token_ts_parts, axis=0).astype(np.int64, copy=False)
+    decision_snapshot_ts = np.concatenate(decision_snapshot_ts_parts, axis=0).astype(np.int64, copy=False)
+    _ensure_monotonic(split_token_ts, "Token decision (filtered)")
+    _ensure_monotonic(decision_snapshot_ts, "Decision snapshot (filtered)")
+    if split_token_ts.shape != decision_snapshot_ts.shape or not np.array_equal(split_token_ts, decision_snapshot_ts):
         raise ValueError(
-            "Snapshot alignment failed; exact timestamp matches missing. "
-            f"missing={missing.shape[0]} total={decision_ts.size} "
-            f"samples={missing[:sample_count].tolist()}. "
-            "Regenerate canonical snapshots/tokens so decision timestamps are "
-            "derived from order-book event time "
-            "(decision_time_basis='ob_event_time', decision_policy='ob_event_time')."
+            "CMSSL test diagnostics timestamp contract failed: token decision timestamps "
+            "do not exactly match decision_snapshots.npz timestamps. Please rerun offline_snapshots.py."
         )
-    return aligned_idx
+    print(
+        "[tokens:test]",
+        f"count={split_token_ts.size}",
+        f"start={_format_ts(int(split_token_ts[0]))}",
+        f"end={_format_ts(int(split_token_ts[-1]))}",
+    )
+    print(
+        "[decision snapshots:test]",
+        f"count={decision_snapshot_ts.size}",
+        f"start={_format_ts(int(decision_snapshot_ts[0]))}",
+        f"end={_format_ts(int(decision_snapshot_ts[-1]))}",
+    )
 
 
 def _resolve_horizon_indices(meta: dict, targets: Iterable[int]) -> Dict[int, int]:
@@ -1780,31 +1657,21 @@ def _build_joined_split_uncached(
             device=device,
         )
 
-        # Canonical snapshot flow: load_raw_snapshots(...) ->
-        # _compute_snapshot_feature_matrix(...).
-        week_snapshot_ts, week_raw_snapshots, week_stale_ms = load_raw_snapshots(out_root, wk)
-        snapshot_ts, snapshots = _compute_snapshot_feature_matrix(
-            np.asarray(week_snapshot_ts, dtype=np.int64),
-            np.asarray(week_raw_snapshots),
-            None if week_stale_ms is None else np.asarray(week_stale_ms, dtype=np.float64),
-        )
-        snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-        snapshots = np.asarray(snapshots, dtype=np.float32)
+        decision_snapshot_ts, aligned_snapshots = load_decision_snapshots(out_root, wk)
+        decision_snapshot_ts = np.asarray(decision_snapshot_ts, dtype=np.int64)
+        aligned_snapshots = np.asarray(aligned_snapshots, dtype=np.float32)
 
         window_start = int(split["start"])
         window_end = int(split["end"])
-        effective_mask = (snapshot_ts >= window_start) & (snapshot_ts < window_end)
+        effective_mask = (decision_snapshot_ts >= window_start) & (decision_snapshot_ts < window_end)
         if np.any(effective_mask):
-            snapshot_ts = snapshot_ts[effective_mask]
-            snapshots = snapshots[effective_mask]
-
-        # Perform exact-match decision/snapshot alignment week-by-week so split
-        # boundaries follow the authoritative `weeks` ordering without cross-week
-        # ambiguity at week edges.
-        snap_idx = align_snapshots_to_decisions(snapshot_ts, ts)
-        assert snapshot_ts[snap_idx].shape == ts.shape
-        assert np.all(snapshot_ts[snap_idx] == ts)
-        aligned_snapshots = snapshots[snap_idx]
+            decision_snapshot_ts = decision_snapshot_ts[effective_mask]
+            aligned_snapshots = aligned_snapshots[effective_mask]
+        if decision_snapshot_ts.shape != ts.shape or not np.array_equal(decision_snapshot_ts, ts):
+            raise ValueError(
+                f"Decision snapshot timestamps do not exactly match token timestamps for week={wk}. "
+                "Please rerun offline_snapshots.py to rebuild decision_snapshots.npz."
+            )
         week_outputs.append(join_features(ts, y, cmssl_out, aligned_snapshots, meta))
 
     if not week_outputs:
@@ -1926,7 +1793,7 @@ def _build_joined_cache_identity(
         week_dir = week_meta_path.parent
         week_refs[week] = {
             "week_meta": _safe_file_identity(week_meta_path, required=True),
-            "snapshots_npz": _safe_file_identity(week_dir / "snapshots.npz", required=True),
+            "decision_snapshots_npz": _safe_file_identity(week_dir / "decision_snapshots.npz", required=True),
         }
     split_protocol = None
     if isinstance(meta.get("splits"), dict):
