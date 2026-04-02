@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 import time
 import warnings
 from datetime import datetime, timezone
@@ -82,6 +83,8 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 # Inventory risk thresholds are denominated in quote notional (USD).
+JOINED_CACHE_SCHEMA_VERSION = 1
+JOINED_FEATURE_SCHEMA_VERSION = 1
 
 def require(condition: bool, msg: str, exc_type: type[Exception] = ValueError) -> None:
     """Raise a typed exception when a runtime precondition fails."""
@@ -1741,7 +1744,7 @@ def join_features(
     return output
 
 
-def build_joined_split(
+def _build_joined_split_uncached(
     out_root: str,
     split: Dict[str, Any],
     model,
@@ -1855,6 +1858,140 @@ def build_joined_split(
         )
 
     _timing_log(f"build_joined_split rows={out['ts'].shape[0]} secs={time.perf_counter() - t0:.4f}")
+    return out
+
+
+def _joined_cache_identity_payload(
+    out_root: str,
+    split: Dict[str, Any],
+    meta: Dict[str, Any],
+    device: str,
+    batch_size: int,
+) -> Dict[str, Any]:
+    weeks = [str(w) for w in split.get("weeks", [])]
+    payload = {
+        "joined_cache_schema_version": JOINED_CACHE_SCHEMA_VERSION,
+        "joined_feature_schema_version": JOINED_FEATURE_SCHEMA_VERSION,
+        "out_root": str(Path(out_root).resolve()),
+        "split": {
+            "weeks": weeks,
+            "start": int(split["start"]),
+            "end": int(split["end"]),
+        },
+        "cmssl": {
+            "batch_size": int(batch_size),
+            "device": str(device),
+            "feature_dim_total": int(meta.get("feature_dim_total", -1)),
+            "horizons_ms": [int(v) for v in meta.get("horizons_ms", [])],
+            "decision_time_basis": meta.get("decision_time_basis"),
+            "trade_history_enabled": meta.get("trade_history_enabled"),
+            "event_stream_mode": meta.get("event_stream_mode"),
+        },
+    }
+    return payload
+
+
+def _joined_cache_fingerprint(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_joined_cached_output(data: Dict[str, np.ndarray]) -> None:
+    expected_keys = {"ts", "features", "y", "spread_bps", "snapshots"}
+    if set(data.keys()) != expected_keys:
+        raise ValueError(f"Joined cache keys mismatch: got={sorted(data.keys())} expected={sorted(expected_keys)}")
+    expected_rows = int(data["ts"].shape[0])
+    for key in ("features", "y", "spread_bps", "snapshots"):
+        if int(data[key].shape[0]) != expected_rows:
+            raise ValueError(
+                f"Joined cache row-count mismatch: ts_rows={expected_rows} {key}_rows={int(data[key].shape[0])}"
+            )
+    ts_all = np.asarray(data["ts"], dtype=np.int64)
+    ts_diff = np.diff(ts_all)
+    bad_idx = np.where(ts_diff <= 0)[0]
+    if bad_idx.size > 0:
+        first_bad = int(bad_idx[0])
+        raise ValueError(
+            "Joined cache has non-increasing timestamps: "
+            f"first_bad_index={first_bad} ts_prev={int(ts_all[first_bad])} "
+            f"ts_next={int(ts_all[first_bad + 1])} diff={int(ts_diff[first_bad])}"
+        )
+
+
+def _load_joined_cache(npz_path: Path, sidecar_path: Path, expected_payload: Dict[str, Any]) -> Optional[Dict[str, np.ndarray]]:
+    if not (npz_path.exists() and sidecar_path.exists()):
+        return None
+    try:
+        sidecar = read_json(sidecar_path)
+        if not isinstance(sidecar, dict):
+            return None
+        if int(sidecar.get("joined_cache_schema_version", -1)) != JOINED_CACHE_SCHEMA_VERSION:
+            return None
+        if int(sidecar.get("joined_feature_schema_version", -1)) != JOINED_FEATURE_SCHEMA_VERSION:
+            return None
+        if sidecar.get("identity_payload") != expected_payload:
+            return None
+        with np.load(npz_path, allow_pickle=False) as arr:
+            out = {key: np.asarray(arr[key]) for key in ("ts", "features", "y", "spread_bps", "snapshots")}
+        _validate_joined_cached_output(out)
+        return out
+    except Exception:
+        return None
+
+
+def _save_joined_cache_atomic(
+    npz_path: Path,
+    sidecar_path: Path,
+    payload: Dict[str, Any],
+    fingerprint: str,
+    out: Dict[str, np.ndarray],
+) -> None:
+    npz_tmp = npz_path.with_name(npz_path.name + f".tmp-{os.getpid()}.npz")
+    sidecar_tmp = sidecar_path.with_name(sidecar_path.name + f".tmp-{os.getpid()}")
+    with npz_tmp.open("wb") as fh:
+        np.savez_compressed(
+            fh,
+            ts=out["ts"],
+            features=out["features"],
+            y=out["y"],
+            spread_bps=out["spread_bps"],
+            snapshots=out["snapshots"],
+        )
+    sidecar = {
+        "joined_cache_schema_version": JOINED_CACHE_SCHEMA_VERSION,
+        "joined_feature_schema_version": JOINED_FEATURE_SCHEMA_VERSION,
+        "fingerprint": fingerprint,
+        "identity_payload": payload,
+    }
+    sidecar_tmp.write_text(json.dumps(sidecar, sort_keys=True, indent=2), encoding="utf-8")
+    os.replace(npz_tmp, npz_path)
+    os.replace(sidecar_tmp, sidecar_path)
+
+
+def build_joined_split(
+    out_root: str,
+    split: Dict[str, Any],
+    model,
+    meta: dict,
+    device: str,
+    batch_size: int = 2048,
+) -> Dict[str, np.ndarray]:
+    payload = _joined_cache_identity_payload(out_root, split, meta, device, batch_size)
+    fingerprint = _joined_cache_fingerprint(payload)
+    cache_dir = Path(out_root) / "rl_exec_cache" / "joined"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = cache_dir / f"{fingerprint}.npz"
+    sidecar_path = cache_dir / f"{fingerprint}.json"
+
+    cached = _load_joined_cache(npz_path, sidecar_path, payload)
+    if cached is not None:
+        _timing_log(f"build_joined_split cache_hit rows={cached['ts'].shape[0]} path={npz_path}")
+        return cached
+
+    out = _build_joined_split_uncached(out_root, split, model, meta, device, batch_size=batch_size)
+    _validate_joined_cached_output(out)
+    _save_joined_cache_atomic(npz_path, sidecar_path, payload, fingerprint, out)
+    _timing_log(f"build_joined_split cache_miss rows={out['ts'].shape[0]} path={npz_path}")
     return out
 
 
