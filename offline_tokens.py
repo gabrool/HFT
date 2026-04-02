@@ -44,6 +44,43 @@ def load_global_meta(out_root: Path) -> dict:
     if week_counts is not None and not isinstance(week_counts, dict):
         raise _meta_error("'week_counts' must be a dict when present")
 
+    trade_history_enabled_raw = meta.get("trade_history_enabled")
+    if trade_history_enabled_raw is None:
+        raise _meta_error("missing 'trade_history_enabled'")
+
+    trade_history_enabled: Optional[bool] = None
+    if isinstance(trade_history_enabled_raw, bool):
+        trade_history_enabled = trade_history_enabled_raw
+    elif isinstance(trade_history_enabled_raw, (int, float)):
+        if trade_history_enabled_raw in (0, 0.0):
+            trade_history_enabled = False
+        elif trade_history_enabled_raw in (1, 1.0):
+            trade_history_enabled = True
+    elif isinstance(trade_history_enabled_raw, str):
+        normalized = trade_history_enabled_raw.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            trade_history_enabled = True
+        elif normalized in {"0", "false", "f", "no", "n", "off"}:
+            trade_history_enabled = False
+
+    if trade_history_enabled is None:
+        raise _meta_error("invalid 'trade_history_enabled' (must be boolean-like)")
+
+    event_stream_mode = meta.get("event_stream_mode")
+    if event_stream_mode is None:
+        raise _meta_error("missing 'event_stream_mode'")
+    if event_stream_mode not in {"ob_th_merged", "ob_only"}:
+        raise _meta_error(
+            "invalid 'event_stream_mode' (must be 'ob_th_merged' or 'ob_only')"
+        )
+
+    expected_mode = "ob_th_merged" if trade_history_enabled else "ob_only"
+    if event_stream_mode != expected_mode:
+        raise _meta_error(
+            "inconsistent ingest mode: 'trade_history_enabled' must map to "
+            f"'event_stream_mode' ({trade_history_enabled} -> '{expected_mode}')"
+        )
+
     return meta
 
 
