@@ -1861,39 +1861,92 @@ def _build_joined_split_uncached(
     return out
 
 
-def _joined_cache_identity_payload(
+def _stable_json_dumps(payload: Any) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _hash_payload(payload: Any) -> str:
+    digest = hashlib.sha256(_stable_json_dumps(payload).encode("utf-8")).hexdigest()
+    return digest[:20]
+
+
+def _safe_file_identity(path: Path | str, *, required: bool = True) -> Dict[str, Any]:
+    resolved = Path(path).resolve()
+    exists = resolved.exists()
+    if required and not exists:
+        raise FileNotFoundError(f"Required file is missing: {resolved}")
+    out: Dict[str, Any] = {
+        "path": str(resolved),
+        "exists": bool(exists),
+        "size": None,
+        "mtime_ns": None,
+    }
+    if exists:
+        stat = resolved.stat()
+        out["size"] = int(stat.st_size)
+        out["mtime_ns"] = int(stat.st_mtime_ns)
+    return out
+
+
+def _joined_cache_paths(out_root: str, split_label: str, fingerprint: str) -> Tuple[Path, Path]:
+    cache_dir = Path(out_root).resolve() / "rl_exec_cache" / "joined"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    sanitized_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in str(split_label).strip().lower())
+    sanitized_label = sanitized_label or "split"
+    stem = f"{sanitized_label}-{fingerprint}"
+    return cache_dir / f"{stem}.npz", cache_dir / f"{stem}.json"
+
+
+def _build_joined_cache_identity(
     out_root: str,
+    split_label: str,
     split: Dict[str, Any],
     meta: Dict[str, Any],
-    device: str,
-    batch_size: int,
+    ckpt_path: str,
 ) -> Dict[str, Any]:
-    weeks = [str(w) for w in split.get("weeks", [])]
-    payload = {
+    out_root_path = Path(out_root).resolve()
+    weeks = [str(w) for w in _split_weeks(split)]
+    weeks_meta = meta.get("weeks_meta")
+    if not isinstance(weeks_meta, dict):
+        raise KeyError("meta['weeks_meta'] must be a dict for joined cache identity.")
+    week_refs: Dict[str, Any] = {}
+    for week in weeks:
+        rel_meta_path = weeks_meta.get(week)
+        if not isinstance(rel_meta_path, str) or not rel_meta_path.strip():
+            raise KeyError(f"meta['weeks_meta'] missing path for week '{week}'")
+        week_meta_path = (out_root_path / rel_meta_path).resolve()
+        week_dir = week_meta_path.parent
+        week_refs[week] = {
+            "week_meta": _safe_file_identity(week_meta_path, required=True),
+            "snapshots_npz": _safe_file_identity(week_dir / "snapshots.npz", required=True),
+        }
+    split_protocol = None
+    if isinstance(meta.get("splits"), dict):
+        split_protocol = meta["splits"].get("protocol")
+    return {
         "joined_cache_schema_version": JOINED_CACHE_SCHEMA_VERSION,
         "joined_feature_schema_version": JOINED_FEATURE_SCHEMA_VERSION,
-        "out_root": str(Path(out_root).resolve()),
+        "split_label": str(split_label),
         "split": {
             "weeks": weeks,
             "start": int(split["start"]),
             "end": int(split["end"]),
         },
-        "cmssl": {
-            "batch_size": int(batch_size),
-            "device": str(device),
-            "feature_dim_total": int(meta.get("feature_dim_total", -1)),
-            "horizons_ms": [int(v) for v in meta.get("horizons_ms", [])],
+        "checkpoint": _safe_file_identity(ckpt_path, required=True),
+        "dataset_meta_contract": {
             "decision_time_basis": meta.get("decision_time_basis"),
+            "decision_policy": meta.get("decision_policy"),
             "trade_history_enabled": meta.get("trade_history_enabled"),
             "event_stream_mode": meta.get("event_stream_mode"),
+            "feature_dim_total": int(meta.get("feature_dim_total", -1)),
+            "label_dim": int(meta["label_dim"]) if meta.get("label_dim") is not None else None,
+            "horizons_ms": [int(v) for v in meta.get("horizons_ms", [])],
+            "weeks_in_order": [str(v) for v in meta.get("weeks_in_order", [])] if isinstance(meta.get("weeks_in_order"), list) else None,
+            "weeks_meta": {str(k): str(v) for k, v in weeks_meta.items()},
+            "splits.protocol": split_protocol,
         },
+        "referenced_weeks": week_refs,
     }
-    return payload
-
-
-def _joined_cache_fingerprint(payload: Dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_joined_cached_output(data: Dict[str, np.ndarray]) -> None:
@@ -1970,18 +2023,18 @@ def _save_joined_cache_atomic(
 
 def build_joined_split(
     out_root: str,
+    split_label: str,
     split: Dict[str, Any],
     model,
     meta: dict,
+    ckpt_path: str,
     device: str,
     batch_size: int = 2048,
 ) -> Dict[str, np.ndarray]:
-    payload = _joined_cache_identity_payload(out_root, split, meta, device, batch_size)
-    fingerprint = _joined_cache_fingerprint(payload)
-    cache_dir = Path(out_root) / "rl_exec_cache" / "joined"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    npz_path = cache_dir / f"{fingerprint}.npz"
-    sidecar_path = cache_dir / f"{fingerprint}.json"
+    payload = _build_joined_cache_identity(out_root, split_label, split, meta, ckpt_path)
+    payload["cmssl_runtime"] = {"batch_size": int(batch_size), "device": str(device)}
+    fingerprint = _hash_payload(payload)
+    npz_path, sidecar_path = _joined_cache_paths(out_root, split_label, fingerprint)
 
     cached = _load_joined_cache(npz_path, sidecar_path, payload)
     if cached is not None:
@@ -4935,15 +4988,15 @@ def prepare_baseline_context(
     preallocate_join_features = _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False)
     rollout_storage = _resolve_rollout_storage("gpu")
     run_config = {"cmssl_batch_size": cmssl_batch_size, "rollout_storage": rollout_storage, "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False), "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False), "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False), "preallocate_join_features": preallocate_join_features}
-    joined_cmssl_test = build_joined_split(out_root, cmssl_test_split, model, meta, device, batch_size=cmssl_batch_size)
+    joined_cmssl_test = build_joined_split(out_root, "cmssl_test", cmssl_test_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
     num_h = len(meta.get("horizons_ms", []))
     cmssl_test_metrics = report_cmssl_metrics(joined_cmssl_test["y"], {"dir_logits": joined_cmssl_test["features"][:, :num_h]})
     week3_full_split = {"weeks": rl_train_split["weeks"], "start": rl_train_split["start"], "end": rl_test_split["end"]}
-    joined_rl_full = build_joined_split(out_root, week3_full_split, model, meta, device, batch_size=cmssl_batch_size)
+    joined_rl_full = build_joined_split(out_root, "rl_week3_full", week3_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
     joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
     joined_rl_val = slice_joined_by_split(joined_rl_full, rl_val_split)
     joined_rl_test = slice_joined_by_split(joined_rl_full, rl_test_split)
-    joined_eval_full = build_joined_split(out_root, eval_full_split, model, meta, device, batch_size=cmssl_batch_size)
+    joined_eval_full = build_joined_split(out_root, "eval_full", eval_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
     mm_rl_train_batch = build_market_batch(joined_rl_train)
     mm_rl_val_batch = build_market_batch(joined_rl_val)
@@ -5021,9 +5074,11 @@ def run_pipeline(
     )
     joined_cmssl_test = build_joined_split(
         out_root,
+        "cmssl_test",
         cmssl_test_split,
         model,
         meta,
+        ckpt_path,
         device,
         batch_size=cmssl_batch_size,
     )
@@ -5037,11 +5092,11 @@ def run_pipeline(
     )
 
     rl_week3_full_split = {"weeks": rl_train_split["weeks"], "start": rl_train_split["start"], "end": rl_test_split["end"]}
-    joined_rl_full = build_joined_split(out_root, rl_week3_full_split, model, meta, device, batch_size=cmssl_batch_size)
+    joined_rl_full = build_joined_split(out_root, "rl_week3_full", rl_week3_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
     joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
     joined_rl_val = slice_joined_by_split(joined_rl_full, rl_val_split)
     joined_rl_test = slice_joined_by_split(joined_rl_full, rl_test_split)
-    joined_eval_full = build_joined_split(out_root, eval_full_split, model, meta, device, batch_size=cmssl_batch_size)
+    joined_eval_full = build_joined_split(out_root, "eval_full", eval_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
 
     mm_train_batch = build_market_batch(joined_rl_train)
     mm_val_batch = build_market_batch(joined_rl_val)
