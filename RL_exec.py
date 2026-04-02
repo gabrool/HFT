@@ -121,6 +121,9 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
     out_root = Path(out_root)
     meta = load_global_meta(out_root)
     _require_event_time_decision_meta(meta)
+    dataset_trade_history_enabled = meta.get("trade_history_enabled")
+    dataset_has_event_stream_mode = "event_stream_mode" in meta
+    dataset_event_stream_mode = meta.get("event_stream_mode") if dataset_has_event_stream_mode else None
     feat_dim = int(meta["feature_dim_total"])  # includes AUX_DIM already
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, feat_dim, LOOKBACK)
@@ -146,6 +149,45 @@ def load_cmssl(out_root: str, ckpt_path: str, device: str = "cuda"):
                 False,
                 f"Unsupported CMSSL checkpoint schema {ckpt_args.get('checkpoint_schema')!r}; expected 'cmssl17-direction-only-v1'."
             )
+        require(
+            isinstance(ckpt_args, dict),
+            "CMSSL checkpoint is missing args metadata; retrain/re-export with updated CMSSL17_offline.py so compatibility fields are embedded.",
+            exc_type=RuntimeError,
+        )
+        require(
+            "trade_history_enabled" in ckpt_args,
+            "CMSSL checkpoint args missing 'trade_history_enabled'; retrain/re-export with updated CMSSL17_offline.py.",
+            exc_type=RuntimeError,
+        )
+        ckpt_trade_history_enabled = ckpt_args.get("trade_history_enabled")
+        require(
+            ckpt_trade_history_enabled == dataset_trade_history_enabled,
+            "CMSSL dataset/checkpoint compatibility mismatch for trade_history_enabled: "
+            f"dataset={dataset_trade_history_enabled!r}, checkpoint={ckpt_trade_history_enabled!r}. "
+            "Use a checkpoint trained on this dataset mode or retrain/re-export with updated CMSSL17_offline.py.",
+        )
+        if dataset_has_event_stream_mode:
+            require(
+                "event_stream_mode" in ckpt_args,
+                "CMSSL checkpoint args missing 'event_stream_mode' for an event-stream-mode dataset; "
+                "retrain/re-export with updated CMSSL17_offline.py.",
+                exc_type=RuntimeError,
+            )
+            ckpt_event_stream_mode = ckpt_args.get("event_stream_mode")
+            require(
+                ckpt_event_stream_mode == dataset_event_stream_mode,
+                "CMSSL dataset/checkpoint compatibility mismatch for event_stream_mode: "
+                f"dataset={dataset_event_stream_mode!r}, checkpoint={ckpt_event_stream_mode!r}. "
+                "Use a checkpoint trained on this dataset mode or retrain/re-export with updated CMSSL17_offline.py.",
+            )
+        elif isinstance(ckpt_args, dict) and "event_stream_mode" in ckpt_args:
+            ckpt_event_stream_mode = ckpt_args.get("event_stream_mode")
+            if ckpt_event_stream_mode is not None:
+                require(
+                    False,
+                    "CMSSL checkpoint carries event_stream_mode metadata but dataset metadata does not; "
+                    "regenerate/re-export artifacts with updated CMSSL17_offline.py so modes are aligned.",
+                )
 
     model_state = model.state_dict()
     missing_model_keys = [k for k in model_state.keys() if k not in raw_keys]
