@@ -160,6 +160,7 @@ BYBIT_DAY_CLIP = int(os.environ.get("BYBIT_DAY_CLIP", "1"))
 BYBIT_TS_BACKSTEP_CLAMP_MS = int(os.environ.get("BYBIT_TS_BACKSTEP_CLAMP_MS", "5000"))
 BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
 ALLOW_DUPLICATE_OB_TS = _env_bool_int("BYBIT_ALLOW_DUPLICATE_OB_TS", 0)
+USE_TRADES = _env_bool_int("BYBIT_USE_TRADES", 1)
 BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
 BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
@@ -610,46 +611,53 @@ def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
         matching daily coverage before grouping.
     """
     ob_by_day = _build_ob_daily_map(ob_dir)
-    th_by_day = _build_th_daily_map(th_dir)
 
     if not ob_by_day:
         raise ValueError(
             "No OB daily files found. Expected filenames like "
             "'2024-01-15_BTCUSDT_orderbook.ob.zip' (YYYY-MM-DD_BTCUSDT_*ob*.zip)."
         )
-    if not th_by_day:
-        raise ValueError(
-            "No TH daily files found. Expected filenames like "
-            "'BTCUSDT2024-01-15.csv.gz' (BTCUSDTYYYY-MM-DD.csv[.gz|.gzip])."
-        )
 
-    missing_th_days = sorted(set(ob_by_day) - set(th_by_day))
-    missing_ob_days = sorted(set(th_by_day) - set(ob_by_day))
+    if USE_TRADES:
+        th_by_day = _build_th_daily_map(th_dir)
+        if not th_by_day:
+            raise ValueError(
+                "No TH daily files found. Expected filenames like "
+                "'BTCUSDT2024-01-15.csv.gz' (BTCUSDTYYYY-MM-DD.csv[.gz|.gzip])."
+            )
 
-    def _format_missing_days(days: List[date]) -> str:
-        days_fmt = [d.strftime("%Y-%m-%d") for d in days]
-        if len(days_fmt) <= 10:
-            return f"count={len(days_fmt)}, full={days_fmt}"
-        sample = days_fmt[:5] + ["..."] + days_fmt[-5:]
-        return f"count={len(days_fmt)}, sample={sample}"
+        missing_th_days = sorted(set(ob_by_day) - set(th_by_day))
+        missing_ob_days = sorted(set(th_by_day) - set(ob_by_day))
 
-    if missing_th_days or missing_ob_days:
-        raise ValueError(
-            "Daily ingest requires exact OB/TH date parity before week grouping. "
-            f"Missing TH days (present in OB): {_format_missing_days(missing_th_days)}. "
-            f"Missing OB days (present in TH): {_format_missing_days(missing_ob_days)}."
-        )
+        def _format_missing_days(days: List[date]) -> str:
+            days_fmt = [d.strftime("%Y-%m-%d") for d in days]
+            if len(days_fmt) <= 10:
+                return f"count={len(days_fmt)}, full={days_fmt}"
+            sample = days_fmt[:5] + ["..."] + days_fmt[-5:]
+            return f"count={len(days_fmt)}, sample={sample}"
 
-    common_days = sorted(set(ob_by_day) & set(th_by_day))
-    if not common_days:
-        return []
+        if missing_th_days or missing_ob_days:
+            raise ValueError(
+                "Daily ingest requires exact OB/TH date parity before week grouping. "
+                f"Missing TH days (present in OB): {_format_missing_days(missing_th_days)}. "
+                f"Missing OB days (present in TH): {_format_missing_days(missing_ob_days)}."
+            )
+
+        common_days = sorted(set(ob_by_day) & set(th_by_day))
+        if not common_days:
+            return []
+    else:
+        th_by_day = {}
+        common_days = sorted(ob_by_day)
+        if not common_days:
+            return []
 
     week_blocks = _group_common_days_into_weeks(common_days, strict=bool(BYBIT_STRICT_DATA))
     rows = []
     for block in week_blocks:
         week_key = _week_key_from_dates(block[0], block[-1])
         ob_paths = [ob_by_day[d] for d in block]
-        th_paths = [th_by_day[d] for d in block]
+        th_paths = [th_by_day[d] for d in block] if USE_TRADES else []
         rows.append((block[-1], block[0], week_key, ob_paths, th_paths))
 
     rows.sort()
@@ -1475,30 +1483,135 @@ def _iter_week_merged_events(
             prev_name = os.path.basename(path)
 
     _assert_daily_side_sorted(ob_list, "OB")
-    _assert_daily_side_sorted(th_list, "TH")
+    if th_list:
+        _assert_daily_side_sorted(th_list, "TH")
 
-    for ob_p, th_p in zip(ob_list, th_list):
-        ob_day = _daily_path_day(ob_p, "OB")
-        th_day = _daily_path_day(th_p, "TH")
-        if ob_day != th_day:
+        for ob_p, th_p in zip(ob_list, th_list):
+            ob_day = _daily_path_day(ob_p, "OB")
+            th_day = _daily_path_day(th_p, "TH")
+            if ob_day != th_day:
+                raise ValueError(
+                    "Daily OB/TH day mismatch: "
+                    f"week_key={week_key} "
+                    f"ob={os.path.basename(ob_p)}({ob_day.isoformat()}) "
+                    f"th={os.path.basename(th_p)}({th_day.isoformat()})"
+                )
+
+        if len(ob_list) != len(th_list):
             raise ValueError(
-                "Daily OB/TH day mismatch: "
-                f"week_key={week_key} "
-                f"ob={os.path.basename(ob_p)}({ob_day.isoformat()}) "
-                f"th={os.path.basename(th_p)}({th_day.isoformat()})"
+                "Mismatched OB/TH file counts within week block: "
+                f"ob={len(ob_list)} th={len(th_list)}"
             )
-
-    if len(ob_list) != len(th_list):
-        raise ValueError(
-            "Mismatched OB/TH file counts within week block: "
-            f"ob={len(ob_list)} th={len(th_list)}"
-        )
 
     strict_mode = bool(BYBIT_STRICT_DATA)
     assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     last_ts_global: Optional[int] = None
     prev_ob_name: Optional[str] = None
     prev_th_name: Optional[str] = None
+
+    if not th_list:
+        for ob_path in ob_list:
+            ob_name = os.path.basename(ob_path)
+            day = _daily_path_day(ob_path, "OB")
+            day_start_ms = _dt_to_epoch_ms(datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc))
+            day_end_ms = _dt_to_epoch_ms(datetime.combine(day + ONE_DAY, datetime.min.time(), tzinfo=timezone.utc))
+            dq_day = DayQuality(
+                day=day.isoformat(),
+                ob_path=ob_path,
+                th_path="",
+            )
+            aborted_for_corruption = False
+            ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day)
+            for event in ob_iter:
+                ts = int(event[1])
+                if (
+                    last_ts_global is not None
+                    and ts + WEEK_CHAIN_TS_TOLERANCE_MS < last_ts_global
+                ):
+                    prev_pair = (
+                        f"{prev_ob_name} | {prev_th_name}"
+                        if prev_ob_name is not None and prev_th_name is not None
+                        else (f"{prev_ob_name} | <ob-only>" if prev_ob_name is not None else "<week-start>")
+                    )
+                    backstep_ms = int(last_ts_global - ts)
+                    if strict_mode:
+                        raise ValueError(
+                            "Non-monotonic timestamps while chaining daily files within week: "
+                            f"week={week_key} "
+                            f"prev_day_files={prev_pair} "
+                            f"curr_day_files={ob_name} | <ob-only> "
+                            f"prev_ts={last_ts_global} curr_ts={ts} "
+                            f"tolerance_ms={WEEK_CHAIN_TS_TOLERANCE_MS}"
+                        )
+
+                    if backstep_ms <= WEEK_CHAIN_TS_TOLERANCE_MS:
+                        dq_day.increment_counter("chain", "chain_clamped_backstep")
+                        dq_day.append_example(
+                            "chain_backstep",
+                            {
+                                "a": "clamp",
+                                "p": prev_pair,
+                                "c": f"{ob_name} | <ob-only>",
+                                "prev_ts": int(last_ts_global),
+                                "curr_ts": int(ts),
+                            },
+                        )
+                        event = (event[0], int(last_ts_global), *event[2:])
+                        ts = int(last_ts_global)
+                    else:
+                        dq_day.increment_counter("chain", "chain_dropped_big_backstep")
+                        dq_day.append_example(
+                            "chain_backstep",
+                            {
+                                "a": "drop",
+                                "p": prev_pair,
+                                "c": f"{ob_name} | <ob-only>",
+                                "prev_ts": int(last_ts_global),
+                                "curr_ts": int(ts),
+                            },
+                        )
+                        continue
+
+                last_ts_global = ts
+                prev_ob_name = ob_name
+                prev_th_name = None
+                yield event
+
+                bad_abs, total = _day_bad_abs_and_total(dq_day)
+                bad_frac = float(bad_abs) / float(max(1, total))
+                if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                    aborted_for_corruption = True
+                    dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                    if week_quality is not None:
+                        week_quality.tainted = True
+                        week_quality.append_note(
+                            "[warn] corruption abort day="
+                            f"{dq_day.day} week={week_key} bad_abs={bad_abs} total={total} "
+                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                        )
+                    break
+
+            bad_abs, total = _day_bad_abs_and_total(dq_day)
+            bad_frac = float(bad_abs) / float(max(1, total))
+            if (not aborted_for_corruption) and (
+                bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT
+            ):
+                aborted_for_corruption = True
+                dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                if week_quality is not None:
+                    week_quality.tainted = True
+                    week_quality.append_note(
+                        "[warn] corruption abort day="
+                        f"{dq_day.day} week={week_key} bad_abs={bad_abs} total={total} "
+                        f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                    )
+            dq_day.increment_counter("merge", "bad_abs", bad_abs)
+            dq_day.increment_counter("merge", "total", total)
+            if week_quality is not None:
+                week_quality.add_day(dq_day)
+            if aborted_for_corruption:
+                continue
+        return
 
     for ob_path, th_path in zip(ob_list, th_list):
         ob_name = os.path.basename(ob_path)
