@@ -573,6 +573,8 @@ def quantile_cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, 
         "train_ts_start",
         "train_ts_end",
         "decision_time_basis",
+        "trade_history_enabled",
+        "event_stream_mode",
     )
     return all(cached_meta.get(k) == current_meta.get(k) for k in required_keys)
 
@@ -644,6 +646,11 @@ def train_from_offline():
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
     validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
+    trade_history_enabled = meta.get("trade_history_enabled")
+    event_stream_mode = meta.get("event_stream_mode")
+    print(f"[meta] trade_history_enabled={trade_history_enabled!r}")
+    if "event_stream_mode" in meta:
+        print(f"[meta] event_stream_mode={event_stream_mode!r}")
     splits = require_four_week_pipeline_splits(meta, out_root)
 
     pca_info = meta.get("pca", {}) or {}
@@ -692,12 +699,18 @@ def train_from_offline():
     cmssl_val = splits["splits"]["cmssl"]["val"]
     cmssl_test = splits["splits"]["cmssl"]["test"]
     eval_full = splits["splits"]["eval"]["full"]
+    rl_train = splits["splits"]["rl"]["train"]
+    rl_val = splits["splits"]["rl"]["val"]
+    rl_test = splits["splits"]["rl"]["test"]
 
     train_week_keys = cmssl_train["weeks"]
     tr_weeks = keys_to_paths(train_week_keys, "cmssl.train")
     va_weeks = keys_to_paths(cmssl_val["weeks"], "cmssl.val")
     te_weeks = keys_to_paths(cmssl_test["weeks"], "cmssl.test")
-    keys_to_paths(eval_full["weeks"], "eval.full")
+    eval_weeks = keys_to_paths(eval_full["weeks"], "eval.full")
+    rl_train_weeks = keys_to_paths(rl_train["weeks"], "rl.train")
+    rl_val_weeks = keys_to_paths(rl_val["weeks"], "rl.val")
+    rl_test_weeks = keys_to_paths(rl_test["weeks"], "rl.test")
 
     if not (tr_weeks and va_weeks and te_weeks):
         raise ValueError("CMSSL split metadata must resolve to at least one week for train/val/test")
@@ -716,9 +729,36 @@ def train_from_offline():
 
     # feature/label dim sanity
     feat_dim_total = None
-    for wp in tr_weeks + va_weeks + te_weeks:
+    resolved_split_week_paths = []
+    seen_week_meta_paths: set[str] = set()
+    for week_group in (
+        tr_weeks, va_weeks, te_weeks, eval_weeks, rl_train_weeks, rl_val_weeks, rl_test_weeks
+    ):
+        for wp in week_group:
+            wp_key = str(wp)
+            if wp_key not in seen_week_meta_paths:
+                seen_week_meta_paths.add(wp_key)
+                resolved_split_week_paths.append(wp)
+
+    for wp in resolved_split_week_paths:
         week_meta = read_json(wp)
         validate_dataset_label_dim(week_meta, f"week metadata {wp}")
+        if week_meta.get("trade_history_enabled") != trade_history_enabled:
+            raise ValueError(
+                "trade_history_enabled mismatch between global metadata and week metadata: "
+                f"global={trade_history_enabled!r}, week={week_meta.get('trade_history_enabled')!r}, week_meta={wp}"
+            )
+        if "event_stream_mode" in meta:
+            if week_meta.get("event_stream_mode") != event_stream_mode:
+                raise ValueError(
+                    "event_stream_mode mismatch between global metadata and week metadata: "
+                    f"global={event_stream_mode!r}, week={week_meta.get('event_stream_mode')!r}, week_meta={wp}"
+                )
+        elif "event_stream_mode" in week_meta:
+            raise ValueError(
+                "event_stream_mode present in week metadata but missing from global metadata: "
+                f"week={week_meta.get('event_stream_mode')!r}, week_meta={wp}"
+            )
         fm = int(week_meta["feature_dim_total"])
         if feat_dim_total is None:
             feat_dim_total = fm
@@ -739,6 +779,8 @@ def train_from_offline():
         "train_ts_start": int(tr_start),
         "train_ts_end": int(tr_end),
         "decision_time_basis": EXPECTED_DECISION_TIME_BASIS,
+        "trade_history_enabled": trade_history_enabled,
+        "event_stream_mode": event_stream_mode,
     }
     cached_quantiles = load_quantile_cache(quantile_cache_path)
     cached_bounds = None
@@ -1128,6 +1170,9 @@ def train_from_offline():
                         "feat_dim": F_total, "LOOKBACK": LOOKBACK,
                         "HORIZONS_MS": HORIZONS_MS,
                         "checkpoint_schema": "cmssl17-direction-only-v1",
+                        "trade_history_enabled": trade_history_enabled,
+                        "event_stream_mode": event_stream_mode,
+                        "decision_time_basis": meta.get("decision_time_basis"),
                     },
                     "best_primary_metric": best,
                 }
