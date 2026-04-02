@@ -167,6 +167,14 @@ BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
 ONE_DAY = timedelta(days=1)
 
 
+def canonical_mode_fields() -> Dict[str, object]:
+    trade_history_enabled = bool(USE_TRADES)
+    return {
+        "trade_history_enabled": trade_history_enabled,
+        "event_stream_mode": "ob_th_merged" if trade_history_enabled else "ob_only",
+    }
+
+
 def quality_env_config() -> Dict[str, object]:
     """Serializable quality/repair env knobs for reports/metadata."""
     return {
@@ -1342,6 +1350,7 @@ class WeekWriterRouter:
             "week": week_key,
             "decision_policy": DECISION_POLICY,
             "decision_time_basis": "ob_event_time",
+            **canonical_mode_fields(),
             "lookback": self.lookback,
             "feature_dim_total": self.feature_dim,
             "feature_dim_core": self.feature_dim - AUX_DIM,
@@ -2345,6 +2354,7 @@ def process_all(
         "weeks_in_order": weeks_in_order,
         "decision_policy": DECISION_POLICY,
         "decision_time_basis": "ob_event_time",
+        **canonical_mode_fields(),
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
@@ -2368,6 +2378,19 @@ def process_all(
     if pca_var_ratio is not None:
         meta["pca"]["explained_variance_ratio"] = [float(x) for x in pca_var_ratio]
     meta["splits"] = build_four_week_pipeline_splits(weeks_in_order, week_meta_records)
+    if week_meta_records:
+        expected_mode = canonical_mode_fields()
+        for wk in weeks_in_order:
+            week_meta = week_meta_records.get(wk)
+            if not week_meta:
+                continue
+            for field, expected in expected_mode.items():
+                observed = week_meta.get(field)
+                if observed != expected:
+                    raise ValueError(
+                        f"Inconsistent ingest mode in week '{wk}': {field}={observed!r} "
+                        f"(expected {expected!r})"
+                    )
 
     with open(os.path.join(out_root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -2398,6 +2421,11 @@ def process_all(
 # --------------- driver ----------------
 def main():
     ensure_dir(OUT_ROOT)
+    mode_fields = canonical_mode_fields()
+    print(
+        f"[ingest mode] trade_history_enabled={str(mode_fields['trade_history_enabled']).lower()} "
+        f"event_stream_mode={mode_fields['event_stream_mode']}"
+    )
     pairs = pair_weeks(OB_DIR, TH_DIR)
 
     if not pairs:
