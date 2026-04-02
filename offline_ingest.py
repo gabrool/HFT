@@ -9,8 +9,12 @@ Input layout support:
 - TH: BTCUSDTYYYY-MM-DD.csv.gz, with tolerant handling for .csv / .csv.gzip.
 
 Downstream ingest contract:
-- pair_weeks() groups aligned daily OB/TH files into consecutive 7-day blocks
-  and emits canonical week keys: DD-MM-YYYY-to-DD-MM-YYYY.
+- pair_weeks() supports two grouping branches controlled by BYBIT_USE_TRADES:
+  - BYBIT_USE_TRADES=1: aligned OB/TH daily files are grouped into consecutive
+    7-day blocks.
+  - BYBIT_USE_TRADES=0: OB-only daily files are grouped into consecutive 7-day
+    blocks and each week emits th_paths=[].
+- pair_weeks() emits canonical week keys: DD-MM-YYYY-to-DD-MM-YYYY.
 - pair_weeks() and all ingest entry points operate on WeekPair tuples:
   (week_key, ob_paths: List[str], th_paths: List[str]).
 - Event streaming is chained per week; daily files are processed in day order
@@ -545,7 +549,7 @@ def _group_common_days_into_weeks(common_days: List[date], *, strict: bool = Tru
     Partition sorted common days into non-overlapping 7-day blocks.
 
     Args:
-        common_days: Sorted list of dates known to exist in both OB/TH maps.
+        common_days: Sorted candidate dates for week grouping.
         strict: If True, raise on any day-to-day gap inside a 7-day block.
             If False, skip invalid blocks and continue.
 
@@ -610,13 +614,18 @@ WeekPair = Tuple[str, WeekPaths, WeekPaths]
 
 def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
     """
-    Discover aligned OB/TH daily inputs and emit 7-day week groups.
+    Discover daily inputs and emit 7-day week groups.
+
+    In trade-enabled mode (BYBIT_USE_TRADES=1), this enforces exact OB/TH daily
+    parity before grouping and emits aligned `ob_paths`/`th_paths` lists.
+    In OB-only mode (BYBIT_USE_TRADES=0), this groups only OB daily files and
+    emits `th_paths=[]` for each returned week.
 
     Returns:
         List of (week_key, ob_paths, th_paths), ordered by block end date ascending.
-        `ob_paths`/`th_paths` are ordered 7-element file-path lists (one per
-        day in each week block). Day parity is strict: OB/TH must have exact
-        matching daily coverage before grouping.
+        `ob_paths` is an ordered 7-element file-path list (one per day in each
+        week block). `th_paths` is an ordered 7-element list in trade-enabled
+        mode, or an empty list in OB-only mode.
     """
     ob_by_day = _build_ob_daily_map(ob_dir)
 
@@ -1901,8 +1910,10 @@ def maybe_fit_pca_model(
 ):
     """Fit (or reuse) a PCA model using the training subset of week-keyed daily paths.
 
-    Each pair is ``(week_key, ob_paths, th_paths)`` where ``ob_paths`` and
-    ``th_paths`` are ordered lists of per-day file paths for that week.
+    Each pair is ``(week_key, ob_paths, th_paths)`` where ``ob_paths`` is an
+    ordered per-day file-path list for the week and ``th_paths`` is either the
+    aligned per-day trade-history list (trade-enabled mode) or ``[]`` in
+    OB-only mode.
     """
     meta = {
         "applied": False,
@@ -2078,7 +2089,7 @@ def process_all(
     out_root: str,
     pca_meta: dict,
 ):
-    """Run ingest across week pairs composed of ordered daily OB/TH file lists."""
+    """Run ingest across week pairs with ordered daily OB paths and mode-dependent TH paths (which may be empty in OB-only mode)."""
     ensure_dir(out_root)
 
     pca_summary = _summarise_pca_meta(pca_meta)
