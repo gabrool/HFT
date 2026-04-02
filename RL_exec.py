@@ -1754,6 +1754,7 @@ def _build_joined_split_uncached(
     model,
     meta: dict,
     device: str,
+    split_label: str,
     batch_size: int = 2048,
 ) -> Dict[str, np.ndarray]:
     t0 = time.perf_counter()
@@ -1861,7 +1862,10 @@ def _build_joined_split_uncached(
             f"ts_next={int(ts_all[first_bad + 1])} diff={int(ts_diff[first_bad])}"
         )
 
-    _timing_log(f"build_joined_split rows={out['ts'].shape[0]} secs={time.perf_counter() - t0:.4f}")
+    _timing_log(
+        f"build_joined_split_uncached label={split_label} rows={out['ts'].shape[0]} "
+        f"secs={time.perf_counter() - t0:.4f}"
+    )
     return out
 
 
@@ -2093,6 +2097,7 @@ def build_joined_split(
     split_label: str,
     batch_size: int = 2048,
 ) -> Dict[str, np.ndarray]:
+    cache_t0 = time.perf_counter()
     payload = _build_joined_cache_identity(out_root, split_label, split, meta, ckpt_path)
     payload["cmssl_runtime"] = {"batch_size": int(batch_size), "device": str(device)}
     fingerprint = _hash_payload(payload)
@@ -2101,12 +2106,33 @@ def build_joined_split(
     cache_meta = {"identity_payload": payload, "runtime_meta": meta}
     try:
         cached = _load_joined_cache(npz_path, sidecar_path, meta=cache_meta)
-        _timing_log(f"build_joined_split cache_hit rows={cached['ts'].shape[0]} path={npz_path}")
+        _timing_log(
+            f"[joined-cache] hit label={split_label} fingerprint={fingerprint} "
+            f"path={npz_path} rows={cached['ts'].shape[0]} secs={time.perf_counter() - cache_t0:.4f}"
+        )
         return cached
     except JoinedCacheError as exc:
-        _timing_log(f"build_joined_split cache_stale_or_corrupt path={npz_path} reason={exc}")
+        reason = str(exc).replace("\n", " ").strip()
+        if "artifact missing" in reason:
+            _timing_log(
+                f"[joined-cache] miss label={split_label} fingerprint={fingerprint} "
+                f"path={npz_path} sidecar={sidecar_path}"
+            )
+        else:
+            _timing_log(
+                f"[joined-cache] stale label={split_label} fingerprint={fingerprint} "
+                f"path={npz_path} sidecar={sidecar_path} reason={reason} rebuilding"
+            )
 
-    out = _build_joined_split_uncached(out_root, split, model, meta, device, batch_size=batch_size)
+    out = _build_joined_split_uncached(
+        out_root,
+        split,
+        model,
+        meta,
+        device,
+        split_label=split_label,
+        batch_size=batch_size,
+    )
     _validate_joined_payload(out, meta=meta)
     sidecar = {
         "joined_cache_schema_version": JOINED_CACHE_SCHEMA_VERSION,
@@ -2114,8 +2140,13 @@ def build_joined_split(
         "fingerprint": fingerprint,
         "identity_payload": payload,
     }
+    save_t0 = time.perf_counter()
     _save_joined_cache(npz_path, sidecar_path, out, sidecar)
-    _timing_log(f"build_joined_split cache_miss rows={out['ts'].shape[0]} path={npz_path}")
+    _timing_log(
+        f"[joined-cache] saved label={split_label} fingerprint={fingerprint} "
+        f"path={npz_path} sidecar={sidecar_path} rows={out['ts'].shape[0]} "
+        f"feature_dim={out['features'].shape[1]} secs={time.perf_counter() - save_t0:.4f}"
+    )
     return out
 
 
