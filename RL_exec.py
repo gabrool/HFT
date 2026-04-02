@@ -2040,21 +2040,29 @@ def _load_joined_cache(npz_path: Path, json_path: Path, *, meta: Dict[str, Any])
         raise JoinedCacheError(
             f"Joined cache artifact missing: npz_exists={npz_path.exists()} json_exists={json_path.exists()}"
         )
-    sidecar = read_json(json_path)
-    if not isinstance(sidecar, dict):
-        raise JoinedCacheError("Joined cache sidecar must be a JSON object.")
-    if int(sidecar.get("joined_cache_schema_version", -1)) != JOINED_CACHE_SCHEMA_VERSION:
-        raise JoinedCacheError(
-            "Joined cache schema mismatch: "
-            f"got={sidecar.get('joined_cache_schema_version')} expected={JOINED_CACHE_SCHEMA_VERSION}"
-        )
-    if int(sidecar.get("joined_feature_schema_version", -1)) != JOINED_FEATURE_SCHEMA_VERSION:
-        raise JoinedCacheError(
-            "Joined feature schema mismatch: "
-            f"got={sidecar.get('joined_feature_schema_version')} expected={JOINED_FEATURE_SCHEMA_VERSION}"
-        )
-    if sidecar.get("identity_payload") != expected_payload:
-        raise JoinedCacheError("Joined cache identity payload mismatch (stale cache).")
+    try:
+        sidecar = read_json(json_path)
+    except Exception as exc:
+        raise JoinedCacheError(f"Failed reading joined cache sidecar: {exc}") from exc
+    try:
+        if not isinstance(sidecar, dict):
+            raise JoinedCacheError("Joined cache sidecar must be a JSON object.")
+        if int(sidecar.get("joined_cache_schema_version", -1)) != JOINED_CACHE_SCHEMA_VERSION:
+            raise JoinedCacheError(
+                "Joined cache schema mismatch: "
+                f"got={sidecar.get('joined_cache_schema_version')} expected={JOINED_CACHE_SCHEMA_VERSION}"
+            )
+        if int(sidecar.get("joined_feature_schema_version", -1)) != JOINED_FEATURE_SCHEMA_VERSION:
+            raise JoinedCacheError(
+                "Joined feature schema mismatch: "
+                f"got={sidecar.get('joined_feature_schema_version')} expected={JOINED_FEATURE_SCHEMA_VERSION}"
+            )
+        if sidecar.get("identity_payload") != expected_payload:
+            raise JoinedCacheError("Joined cache identity payload mismatch (stale cache).")
+    except JoinedCacheError:
+        raise
+    except Exception as exc:
+        raise JoinedCacheError(f"Invalid joined cache sidecar contents: {exc}") from exc
     try:
         with np.load(npz_path, allow_pickle=False) as arr:
             out = {key: np.asarray(arr[key]) for key in ("ts", "features", "y", "spread_bps", "snapshots")}
@@ -2099,7 +2107,6 @@ def build_joined_split(
 ) -> Dict[str, np.ndarray]:
     cache_t0 = time.perf_counter()
     payload = _build_joined_cache_identity(out_root, split_label, split, meta, ckpt_path)
-    payload["cmssl_runtime"] = {"batch_size": int(batch_size), "device": str(device)}
     fingerprint = _hash_payload(payload)
     npz_path, sidecar_path = _joined_cache_paths(out_root, split_label, fingerprint)
 
@@ -2139,6 +2146,13 @@ def build_joined_split(
         "joined_feature_schema_version": JOINED_FEATURE_SCHEMA_VERSION,
         "fingerprint": fingerprint,
         "identity_payload": payload,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "split_label": str(split_label),
+        "row_count": int(out["ts"].shape[0]),
+        "feature_shape": [int(v) for v in out["features"].shape],
+        "y_shape": [int(v) for v in out["y"].shape],
+        "spread_bps_shape": [int(v) for v in out["spread_bps"].shape],
+        "snapshots_shape": [int(v) for v in out["snapshots"].shape],
     }
     save_t0 = time.perf_counter()
     _save_joined_cache(npz_path, sidecar_path, out, sidecar)
