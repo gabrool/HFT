@@ -2084,12 +2084,13 @@ def _save_joined_cache(
 
 def build_joined_split(
     out_root: str,
-    split_label: str,
     split: Dict[str, Any],
     model,
     meta: dict,
-    ckpt_path: str,
     device: str,
+    *,
+    ckpt_path: str,
+    split_label: str,
     batch_size: int = 2048,
 ) -> Dict[str, np.ndarray]:
     payload = _build_joined_cache_identity(out_root, split_label, split, meta, ckpt_path)
@@ -5058,15 +5059,42 @@ def prepare_baseline_context(
     preallocate_join_features = _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False)
     rollout_storage = _resolve_rollout_storage("gpu")
     run_config = {"cmssl_batch_size": cmssl_batch_size, "rollout_storage": rollout_storage, "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False), "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False), "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False), "preallocate_join_features": preallocate_join_features}
-    joined_cmssl_test = build_joined_split(out_root, "cmssl_test", cmssl_test_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
+    joined_cmssl_test = build_joined_split(
+        out_root,
+        cmssl_test_split,
+        model,
+        meta,
+        device,
+        ckpt_path=ckpt_path,
+        split_label="cmssl_test",
+        batch_size=cmssl_batch_size,
+    )
     num_h = len(meta.get("horizons_ms", []))
     cmssl_test_metrics = report_cmssl_metrics(joined_cmssl_test["y"], {"dir_logits": joined_cmssl_test["features"][:, :num_h]})
     week3_full_split = {"weeks": rl_train_split["weeks"], "start": rl_train_split["start"], "end": rl_test_split["end"]}
-    joined_rl_full = build_joined_split(out_root, "rl_week3_full", week3_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
+    joined_rl_full = build_joined_split(
+        out_root,
+        week3_full_split,
+        model,
+        meta,
+        device,
+        ckpt_path=ckpt_path,
+        split_label="rl_week3_full",
+        batch_size=cmssl_batch_size,
+    )
     joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
     joined_rl_val = slice_joined_by_split(joined_rl_full, rl_val_split)
     joined_rl_test = slice_joined_by_split(joined_rl_full, rl_test_split)
-    joined_eval_full = build_joined_split(out_root, "eval_full", eval_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
+    joined_eval_full = build_joined_split(
+        out_root,
+        eval_full_split,
+        model,
+        meta,
+        device,
+        ckpt_path=ckpt_path,
+        split_label="eval_full",
+        batch_size=cmssl_batch_size,
+    )
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
     mm_rl_train_batch = build_market_batch(joined_rl_train)
     mm_rl_val_batch = build_market_batch(joined_rl_val)
@@ -5144,12 +5172,12 @@ def run_pipeline(
     )
     joined_cmssl_test = build_joined_split(
         out_root,
-        "cmssl_test",
         cmssl_test_split,
         model,
         meta,
-        ckpt_path,
         device,
+        ckpt_path=ckpt_path,
+        split_label="cmssl_test",
         batch_size=cmssl_batch_size,
     )
 
@@ -5162,11 +5190,29 @@ def run_pipeline(
     )
 
     rl_week3_full_split = {"weeks": rl_train_split["weeks"], "start": rl_train_split["start"], "end": rl_test_split["end"]}
-    joined_rl_full = build_joined_split(out_root, "rl_week3_full", rl_week3_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
+    joined_rl_full = build_joined_split(
+        out_root,
+        rl_week3_full_split,
+        model,
+        meta,
+        device,
+        ckpt_path=ckpt_path,
+        split_label="rl_week3_full",
+        batch_size=cmssl_batch_size,
+    )
     joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
     joined_rl_val = slice_joined_by_split(joined_rl_full, rl_val_split)
     joined_rl_test = slice_joined_by_split(joined_rl_full, rl_test_split)
-    joined_eval_full = build_joined_split(out_root, "eval_full", eval_full_split, model, meta, ckpt_path, device, batch_size=cmssl_batch_size)
+    joined_eval_full = build_joined_split(
+        out_root,
+        eval_full_split,
+        model,
+        meta,
+        device,
+        ckpt_path=ckpt_path,
+        split_label="eval_full",
+        batch_size=cmssl_batch_size,
+    )
 
     mm_train_batch = build_market_batch(joined_rl_train)
     mm_val_batch = build_market_batch(joined_rl_val)
