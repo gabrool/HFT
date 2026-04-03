@@ -1565,46 +1565,31 @@ def join_features(
     layout = _joined_feature_layout(dir_logits.shape[1], snapshots.shape[1])
     snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
-    if _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False):
-        n_rows = int(dir_logits.shape[0])
-        expected_feature_dim = layout["snapshots"].stop
-        features = np.empty((n_rows, expected_feature_dim), dtype=np.float32)
-        cursor = 0
+    n_rows = int(dir_logits.shape[0])
+    expected_feature_dim = layout["snapshots"].stop
+    features = np.empty((n_rows, expected_feature_dim), dtype=np.float32)
+    cursor = 0
 
-        d = dir_logits.shape[1]
-        features[:, cursor:cursor + d] = dir_logits
-        cursor += d
-        d = p_up.shape[1]
-        features[:, cursor:cursor + d] = p_up
-        cursor += d
+    d = dir_logits.shape[1]
+    features[:, cursor:cursor + d] = dir_logits
+    cursor += d
+    d = p_up.shape[1]
+    features[:, cursor:cursor + d] = p_up
+    cursor += d
 
-        features[:, cursor] = align_all
-        cursor += 1
-        features[:, cursor] = diff_short_long
-        cursor += 1
-        features[:, cursor] = diff_mid_long
-        cursor += 1
-        features[:, cursor] = conf_long
-        cursor += 1
-        features[:, cursor] = conf_min
-        cursor += 1
+    features[:, cursor] = align_all
+    cursor += 1
+    features[:, cursor] = diff_short_long
+    cursor += 1
+    features[:, cursor] = diff_mid_long
+    cursor += 1
+    features[:, cursor] = conf_long
+    cursor += 1
+    features[:, cursor] = conf_min
+    cursor += 1
 
-        d = snapshots.shape[1]
-        features[:, cursor:cursor + d] = snapshots
-    else:
-        features = np.concatenate(
-            [
-                dir_logits,
-                p_up,
-                align_all[:, None],
-                diff_short_long[:, None],
-                diff_mid_long[:, None],
-                conf_long[:, None],
-                conf_min[:, None],
-                snapshots,
-            ],
-            axis=-1,
-        )
+    d = snapshots.shape[1]
+    features[:, cursor:cursor + d] = snapshots
     expected_feature_dim = layout["snapshots"].stop
     if features.shape[1] != expected_feature_dim:
         raise ValueError(
@@ -1620,10 +1605,10 @@ def join_features(
         )
     output = {
         "ts": decision_ts,
-        "features": features.astype(np.float32),
-        "y": y.astype(np.float32),
-        "spread_bps": spread_bps.astype(np.float32),
-        "snapshots": snapshots.astype(np.float32),
+        "features": features,
+        "y": y,
+        "spread_bps": spread_bps,
+        "snapshots": snapshots,
     }
     return output
 
@@ -1680,37 +1665,28 @@ def _build_joined_split_uncached(
     if not week_outputs:
         raise ValueError(f"No data found for split {split}")
 
-    if _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False):
-        total_rows = int(sum(wk["ts"].shape[0] for wk in week_outputs))
-        feature_dim = int(week_outputs[0]["features"].shape[1])
-        y_dim = int(week_outputs[0]["y"].shape[1])
-        snapshot_dim = int(week_outputs[0]["snapshots"].shape[1])
+    total_rows = int(sum(wk["ts"].shape[0] for wk in week_outputs))
+    feature_dim = int(week_outputs[0]["features"].shape[1])
+    y_dim = int(week_outputs[0]["y"].shape[1])
+    snapshot_dim = int(week_outputs[0]["snapshots"].shape[1])
 
-        out = {
-            "ts": np.empty((total_rows,), dtype=week_outputs[0]["ts"].dtype),
-            "features": np.empty((total_rows, feature_dim), dtype=week_outputs[0]["features"].dtype),
-            "y": np.empty((total_rows, y_dim), dtype=week_outputs[0]["y"].dtype),
-            "spread_bps": np.empty((total_rows,), dtype=week_outputs[0]["spread_bps"].dtype),
-            "snapshots": np.empty((total_rows, snapshot_dim), dtype=week_outputs[0]["snapshots"].dtype),
-        }
-        cursor = 0
-        for wk in week_outputs:
-            rows = int(wk["ts"].shape[0])
-            end = cursor + rows
-            out["ts"][cursor:end] = wk["ts"]
-            out["features"][cursor:end] = wk["features"]
-            out["y"][cursor:end] = wk["y"]
-            out["spread_bps"][cursor:end] = wk["spread_bps"]
-            out["snapshots"][cursor:end] = wk["snapshots"]
-            cursor = end
-    else:
-        out = {
-            "ts": np.concatenate([wk["ts"] for wk in week_outputs], axis=0),
-            "features": np.concatenate([wk["features"] for wk in week_outputs], axis=0),
-            "y": np.concatenate([wk["y"] for wk in week_outputs], axis=0),
-            "spread_bps": np.concatenate([wk["spread_bps"] for wk in week_outputs], axis=0),
-            "snapshots": np.vstack([wk["snapshots"] for wk in week_outputs]),
-        }
+    out = {
+        "ts": np.empty((total_rows,), dtype=week_outputs[0]["ts"].dtype),
+        "features": np.empty((total_rows, feature_dim), dtype=week_outputs[0]["features"].dtype),
+        "y": np.empty((total_rows, y_dim), dtype=week_outputs[0]["y"].dtype),
+        "spread_bps": np.empty((total_rows,), dtype=week_outputs[0]["spread_bps"].dtype),
+        "snapshots": np.empty((total_rows, snapshot_dim), dtype=week_outputs[0]["snapshots"].dtype),
+    }
+    cursor = 0
+    for wk in week_outputs:
+        rows = int(wk["ts"].shape[0])
+        end = cursor + rows
+        out["ts"][cursor:end] = wk["ts"]
+        out["features"][cursor:end] = wk["features"]
+        out["y"][cursor:end] = wk["y"]
+        out["spread_bps"][cursor:end] = wk["spread_bps"]
+        out["snapshots"][cursor:end] = wk["snapshots"]
+        cursor = end
 
     expected_rows = out["ts"].shape[0]
     for key, value in out.items():
@@ -3529,7 +3505,7 @@ def _policy_action_from_obs_numpy(
     *,
     env: Optional[MarketMakingEnv] = None,
 ) -> np.ndarray:
-    obs_t = torch.from_numpy(obs).float().to(device)
+    obs_t = torch.from_numpy(obs).to(device)
     with torch.no_grad():
         raw_action = policy(obs_t.unsqueeze(0)).squeeze(0)
         action_env = _deterministic_env_action_from_model_output(
@@ -3552,7 +3528,7 @@ def _ppo_action_from_obs_numpy(
     taker_scale: float = 1.0,
     env: Optional[MarketMakingEnv] = None,
 ) -> np.ndarray:
-    obs_t = torch.from_numpy(obs_np).float().to(device)
+    obs_t = torch.from_numpy(obs_np).to(device)
     action_low, action_high = _ppo_action_bounds(
         env,
         int(model.log_std.shape[0]),
@@ -5029,9 +5005,8 @@ def prepare_baseline_context(
     report_cmssl_test_diagnostics(out_root, meta)
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
     cmssl_batch_size = _resolve_cmssl_batch_size()
-    preallocate_join_features = _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False)
     rollout_storage = _resolve_rollout_storage("gpu")
-    run_config = {"cmssl_batch_size": cmssl_batch_size, "rollout_storage": rollout_storage, "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False), "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False), "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False), "preallocate_join_features": preallocate_join_features}
+    run_config = {"cmssl_batch_size": cmssl_batch_size, "rollout_storage": rollout_storage, "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False), "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False), "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False)}
     joined_cmssl_test = build_joined_split(
         out_root,
         cmssl_test_split,
@@ -5133,15 +5108,13 @@ def run_pipeline(
     rollout_storage = _resolve_rollout_storage("gpu")
     pin_rollout_memory = _env_bool("BYBIT_MM_PIN_ROLLOUT_MEMORY", True)
     non_blocking_transfers = _env_bool("BYBIT_MM_NONBLOCKING_TRANSFERS", True)
-    preallocate_join_features = _env_bool("BYBIT_MM_PREALLOCATE_JOIN_FEATURES", False)
     _timing_log(
         "run_config "
         f"cmssl_batch_size={cmssl_batch_size} "
         f"rollout_storage={rollout_storage} "
         f"compile_cmssl={_env_bool('BYBIT_MM_COMPILE_CMSSL', False)} "
         f"compile_ppo={_env_bool('BYBIT_MM_COMPILE_PPO', False)} "
-        f"tf32={_env_bool('BYBIT_MM_ENABLE_TF32', False)} "
-        f"preallocate_join_features={preallocate_join_features}"
+        f"tf32={_env_bool('BYBIT_MM_ENABLE_TF32', False)}"
     )
     joined_cmssl_test = build_joined_split(
         out_root,
