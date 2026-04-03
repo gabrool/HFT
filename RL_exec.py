@@ -2466,22 +2466,20 @@ class MarketMakingEnv:
         self._obs_continuous_mask = mask
         self.freeze_obs_norm = bool(freeze)
 
-    def _normalize_observation_into(self, obs: np.ndarray, out: np.ndarray) -> None:
+    def _normalize_observation_into(self, obs_raw: np.ndarray, out: np.ndarray) -> np.ndarray:
         if self._obs_continuous_mask is None:
-            self._obs_continuous_mask = self._continuous_mask(obs.shape[0])
-        np.copyto(out, obs)
+            self._obs_continuous_mask = self._continuous_mask(obs_raw.shape[0])
         if self._obs_count >= 2 and self._obs_mean is not None and self._obs_m2 is not None:
             var = self._obs_m2 / max(self._obs_count - 1, 1)
             std = np.sqrt(np.maximum(var, 1e-6))
             mask = self._obs_continuous_mask
-            out[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
+            np.copyto(out, obs_raw)
+            out[mask] = (obs_raw[mask] - self._obs_mean[mask]) / std[mask]
+        else:
+            np.copyto(out, obs_raw)
         if not self.freeze_obs_norm:
-            self._update_obs_stats(obs)
-
-    def _normalize_observation(self, obs: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
-        normalized = out if out is not None else np.empty_like(obs, dtype=np.float32)
-        self._normalize_observation_into(obs, normalized)
-        return normalized
+            self._update_obs_stats(obs_raw)
+        return out
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
         """Parse an action into (bid_delta_bps, ask_delta_bps, taker_signal).
