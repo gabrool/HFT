@@ -2083,11 +2083,20 @@ class MarketMakingEnv:
         baseline_alpha_calibration: Optional[BaselineAlphaCalibration] = None,
         baseline_quote_config: Optional[BaselineQuoteConfig] = None,
     ):
-        self.features = batch.features
-        self.spread_bps = batch.spread_bps
-        self.best_bid = batch.best_bid
-        self.best_ask = batch.best_ask
-        self.decision_ts = batch.decision_ts
+        self.features = np.ascontiguousarray(np.asarray(batch.features, dtype=np.float32))
+        self.spread_bps = np.ascontiguousarray(np.asarray(batch.spread_bps, dtype=np.float32))
+        self.best_bid = np.ascontiguousarray(np.asarray(batch.best_bid, dtype=np.float32))
+        self.best_ask = np.ascontiguousarray(np.asarray(batch.best_ask, dtype=np.float32))
+        self.future_ret_by_horizon = (
+            None
+            if batch.future_ret_by_horizon is None
+            else np.ascontiguousarray(np.asarray(batch.future_ret_by_horizon, dtype=np.float32))
+        )
+        self.decision_ts = (
+            None
+            if batch.decision_ts is None
+            else np.ascontiguousarray(np.asarray(batch.decision_ts, dtype=np.int64))
+        )
         self.maker_rebate_bps = maker_rebate_bps
         self.taker_fee_bps = taker_fee_bps
         self.allow_taker = allow_taker
@@ -2176,6 +2185,22 @@ class MarketMakingEnv:
             _env_int("BYBIT_MM_FILL_EMA_WINDOW_STEPS", DEFAULT_MM_FILL_EMA_WINDOW_STEPS),
         )
         self.fill_ema_alpha = 2.0 / (float(self.fill_ema_window_steps) + 1.0)
+        self._inv_inventory_notional_scale = (
+            1.0 / self.inventory_notional_scale if self.inventory_notional_scale != 0.0 else 0.0
+        )
+        self._inv_cash_scale = 1.0 / self.cash_scale if self.cash_scale != 0.0 else 0.0
+        self._inv_time_since_fill_scale = (
+            1.0 / self.time_since_fill_scale if self.time_since_fill_scale != 0.0 else 0.0
+        )
+        self._inv_fill_notional_scale = (
+            1.0 / self.fill_notional_scale if self.fill_notional_scale != 0.0 else 0.0
+        )
+        self._inv_pnl_notional_scale = (
+            1.0 / self.pnl_notional_scale if self.pnl_notional_scale != 0.0 else 0.0
+        )
+        self._inv_markout_notional_scale = (
+            1.0 / self.markout_notional_scale if self.markout_notional_scale != 0.0 else 0.0
+        )
         self.baseline_quote_config = _validate_baseline_quote_config(
             load_baseline_quote_config() if baseline_quote_config is None else baseline_quote_config
         )
@@ -2221,6 +2246,15 @@ class MarketMakingEnv:
         )
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
+        self._feature_dim = int(self.features.shape[-1])
+        self._obs_dim = self._feature_dim + ENV_OBS_EXTRA_STATE_DIM
+        self._obs_feature_slice = slice(0, self._feature_dim)
+        self._obs_extra_slice = slice(self._feature_dim, self._obs_dim)
+        self._obs_raw_buf_a = np.empty(self._obs_dim, dtype=np.float32)
+        self._obs_raw_buf_b = np.empty(self._obs_dim, dtype=np.float32)
+        self._obs_out_buf_a = np.empty(self._obs_dim, dtype=np.float32)
+        self._obs_out_buf_b = np.empty(self._obs_dim, dtype=np.float32)
+        self._obs_ping_pong_idx = 0
 
         self.n = len(self.spread_bps)
         self.idx = 0
@@ -2280,6 +2314,7 @@ class MarketMakingEnv:
         self.last_maker_sell_clipped = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
+        self._obs_ping_pong_idx = 0
         mid = self._mid_price(self.idx)
         self.prev_equity = self.cash + self.inventory * mid
         return self._build_observation(self.idx)
@@ -2296,19 +2331,15 @@ class MarketMakingEnv:
 
     def _build_observation(self, idx: int) -> np.ndarray:
         mid = self._mid_price(idx)
-        inventory_notional_scaled = (
-            (self.inventory * mid) / self.inventory_notional_scale if self.inventory_notional_scale else 0.0
-        )
-        cash_scaled = self.cash / self.cash_scale if self.cash_scale else 0.0
-        time_since_last_fill_scaled = (
-            self.time_since_last_fill / self.time_since_fill_scale if self.time_since_fill_scale else 0.0
-        )
+        raw = self._obs_raw_buf_a if self._obs_ping_pong_idx == 0 else self._obs_raw_buf_b
+        out = self._obs_out_buf_a if self._obs_ping_pong_idx == 0 else self._obs_out_buf_b
+        inventory_notional_scaled = (self.inventory * mid) * self._inv_inventory_notional_scale
+        cash_scaled = self.cash * self._inv_cash_scale
+        time_since_last_fill_scaled = self.time_since_last_fill * self._inv_time_since_fill_scale
         unrealized_pnl_notional = (
             self.inventory * (mid - self.avg_entry_price) if self.inventory != 0.0 else 0.0
         )
-        unrealized_pnl_scaled = (
-            unrealized_pnl_notional / self.pnl_notional_scale if self.pnl_notional_scale else 0.0
-        )
+        unrealized_pnl_scaled = unrealized_pnl_notional * self._inv_pnl_notional_scale
         # Fill-notional `last_*` fields capture the last non-zero fill aggregates.
         # At reset, `time_since_last_fill` starts at a sentinel for "no prior fill"
         # (scaled value ~1.0). A real fill sets it to 0.0. On no-fill steps, it is
@@ -2317,27 +2348,26 @@ class MarketMakingEnv:
         # than fixed "1 snapshot == 1 step" units. Under jitter this keeps intent
         # explicit: ~100ms gaps contribute ~1.0, ~300ms gaps contribute ~3.0.
         # `last_*` values persist on no-fill steps.
-        extra = np.array(
-            [
-                inventory_notional_scaled,
-                cash_scaled,
-                time_since_last_fill_scaled,
-                self.last_maker_buy_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                self.last_maker_sell_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                self.last_taker_buy_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                self.last_taker_sell_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                self.last_net_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                self.last_gross_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                self.ema_net_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                self.ema_gross_fill_notional / self.fill_notional_scale if self.fill_notional_scale else 0.0,
-                unrealized_pnl_scaled,
-                self.ema_maker_buy_markout / self.markout_notional_scale if self.markout_notional_scale else 0.0,
-                self.ema_maker_sell_markout / self.markout_notional_scale if self.markout_notional_scale else 0.0,
-            ],
-            dtype=np.float32,
+        raw[self._obs_feature_slice] = self.features[idx]
+        raw[self._obs_extra_slice] = (
+            inventory_notional_scaled,
+            cash_scaled,
+            time_since_last_fill_scaled,
+            self.last_maker_buy_notional * self._inv_fill_notional_scale,
+            self.last_maker_sell_notional * self._inv_fill_notional_scale,
+            self.last_taker_buy_notional * self._inv_fill_notional_scale,
+            self.last_taker_sell_notional * self._inv_fill_notional_scale,
+            self.last_net_fill_notional * self._inv_fill_notional_scale,
+            self.last_gross_fill_notional * self._inv_fill_notional_scale,
+            self.ema_net_fill_notional * self._inv_fill_notional_scale,
+            self.ema_gross_fill_notional * self._inv_fill_notional_scale,
+            unrealized_pnl_scaled,
+            self.ema_maker_buy_markout * self._inv_markout_notional_scale,
+            self.ema_maker_sell_markout * self._inv_markout_notional_scale,
         )
-        obs = np.concatenate([self.features[idx].astype(np.float32), extra], axis=0)
-        return self._normalize_observation(obs)
+        normalized = self._normalize_observation(raw, out=out)
+        self._obs_ping_pong_idx ^= 1
+        return normalized
 
     def _validate_feature_layout(self) -> None:
         expected_feature_dim = self._feature_layout["snapshots"].stop
@@ -2361,7 +2391,7 @@ class MarketMakingEnv:
         }
 
     def _continuous_mask(self, obs_dim: int) -> np.ndarray:
-        expected_obs_dim = self._feature_layout["snapshots"].stop + ENV_OBS_EXTRA_STATE_DIM
+        expected_obs_dim = self._obs_dim
         if obs_dim != expected_obs_dim:
             raise ValueError(
                 "Observation dimension mismatch for normalization mask: "
@@ -2436,10 +2466,11 @@ class MarketMakingEnv:
         self._obs_continuous_mask = mask
         self.freeze_obs_norm = bool(freeze)
 
-    def _normalize_observation(self, obs: np.ndarray) -> np.ndarray:
+    def _normalize_observation(self, obs: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
         if self._obs_continuous_mask is None:
             self._obs_continuous_mask = self._continuous_mask(obs.shape[0])
-        normalized = obs.copy()
+        normalized = out if out is not None else np.empty_like(obs, dtype=np.float32)
+        np.copyto(normalized, obs)
         if self._obs_count >= 2 and self._obs_mean is not None and self._obs_m2 is not None:
             var = self._obs_m2 / max(self._obs_count - 1, 1)
             std = np.sqrt(np.maximum(var, 1e-6))
