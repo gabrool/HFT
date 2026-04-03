@@ -3081,7 +3081,7 @@ def collect_market_rollout(
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
     horizon: int = 32768,
-    rollouts_per_epoch: int = 16,
+    rollouts_per_epoch: int = 4,
     randomize_start: bool = True,
     rollout_storage: str = "gpu",
     pin_memory: bool = True,
