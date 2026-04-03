@@ -2749,19 +2749,18 @@ class MarketMakingEnv:
             return linear_penalty + quadratic_penalty
         return max(linear_penalty, quadratic_penalty)
 
-    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
+    def step(self, action: Any, emit_info: bool = False) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         # Execution convention: both maker and taker fills are priced using the next snapshot
         # (next_idx). We quote on self.idx, then advance state after applying fills at next_idx.
         next_idx = self.idx + 1
         if next_idx >= self.n:
             mid = self._mid_price(self.idx)
+            if not emit_info:
+                return self._build_observation(self.idx), 0.0, True, None
+
             hard_cap_qty = self._inventory_cap_qty(mid)
-            pre_hard_cap_qty = hard_cap_qty
             pre_buy_room_qty = self._remaining_inventory_room(1, mid)
             pre_sell_room_qty = self._remaining_inventory_room(-1, mid)
-            post_hard_cap_qty = hard_cap_qty
-            post_buy_room_qty = pre_buy_room_qty
-            post_sell_room_qty = pre_sell_room_qty
             equity = self.cash + self.inventory * mid
             info = {
                 "reward": 0.0,
@@ -2778,12 +2777,12 @@ class MarketMakingEnv:
                 "turnover_penalty": 0.0,
                 "mid": float(mid),
                 "hard_max_inventory_notional": float(self.hard_max_inventory_notional),
-                "pre_hard_cap_qty": float(pre_hard_cap_qty),
+                "pre_hard_cap_qty": float(hard_cap_qty),
                 "pre_buy_room_qty": float(pre_buy_room_qty),
                 "pre_sell_room_qty": float(pre_sell_room_qty),
-                "post_hard_cap_qty": float(post_hard_cap_qty),
-                "post_buy_room_qty": float(post_buy_room_qty),
-                "post_sell_room_qty": float(post_sell_room_qty),
+                "post_hard_cap_qty": float(hard_cap_qty),
+                "post_buy_room_qty": float(pre_buy_room_qty),
+                "post_sell_room_qty": float(pre_sell_room_qty),
                 "bid": 0.0,
                 "ask": 0.0,
                 "maker_buy": 0.0,
@@ -2819,9 +2818,9 @@ class MarketMakingEnv:
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
         mid_for_cap = self._mid_price(next_idx)
-        pre_hard_cap_qty = self._inventory_cap_qty(mid_for_cap)
-        pre_buy_room_qty = self._remaining_inventory_room(1, mid_for_cap)
-        pre_sell_room_qty = self._remaining_inventory_room(-1, mid_for_cap)
+        pre_hard_cap_qty = self._inventory_cap_qty(mid_for_cap) if emit_info else 0.0
+        pre_buy_room_qty = self._remaining_inventory_room(1, mid_for_cap) if emit_info else 0.0
+        pre_sell_room_qty = self._remaining_inventory_room(-1, mid_for_cap) if emit_info else 0.0
         # Clipping is evaluated per fill attempt, so maker/taker clipped amounts reflect
         # evolving inventory after each in-step fill is applied.
         maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
@@ -2913,6 +2912,9 @@ class MarketMakingEnv:
                 f"bid={bid}, ask={ask}, maker_buy={maker_buy}, maker_sell={maker_sell}, "
                 f"taker_buy={taker_buy}, taker_sell={taker_sell}"
             )
+        if not emit_info:
+            return next_obs, float(reward), done, None
+
         post_hard_cap_qty = self._inventory_cap_qty(mid_next)
         post_buy_room_qty = self._remaining_inventory_room(1, mid_next)
         post_sell_room_qty = self._remaining_inventory_room(-1, mid_next)
@@ -3164,7 +3166,7 @@ def collect_market_rollout(
                 )
 
             env_action = _market_env_action_tuple(action_env.squeeze(0).detach().cpu().numpy())
-            next_obs, reward, env_done, _info = env.step(env_action)
+            next_obs, reward, env_done, _info = env.step(env_action, emit_info=False)
             steps += 1
             terminated = bool(env_done)
             # Truncation means the rollout horizon ended; it is not a true
@@ -4304,7 +4306,8 @@ def evaluate_market_making(
     while not done:
         idx_before_step = env.idx
         action = policy_fn(obs)
-        obs, reward, done, info = env.step(action)
+        obs, reward, done, info = env.step(action, emit_info=True)
+        require(info is not None, "MarketMakingEnv.step(..., emit_info=True) must return diagnostics info")
         equity_curve.append(info["equity"])
         inventory_curve.append(info["inventory"])
         steps += 1
