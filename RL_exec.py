@@ -2365,9 +2365,9 @@ class MarketMakingEnv:
             self.ema_maker_buy_markout * self._inv_markout_notional_scale,
             self.ema_maker_sell_markout * self._inv_markout_notional_scale,
         )
-        normalized = self._normalize_observation(raw, out=out)
+        self._normalize_observation_into(raw, out)
         self._obs_ping_pong_idx ^= 1
-        return normalized
+        return out
 
     def _validate_feature_layout(self) -> None:
         expected_feature_dim = self._feature_layout["snapshots"].stop
@@ -2466,18 +2466,21 @@ class MarketMakingEnv:
         self._obs_continuous_mask = mask
         self.freeze_obs_norm = bool(freeze)
 
-    def _normalize_observation(self, obs: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
+    def _normalize_observation_into(self, obs: np.ndarray, out: np.ndarray) -> None:
         if self._obs_continuous_mask is None:
             self._obs_continuous_mask = self._continuous_mask(obs.shape[0])
-        normalized = out if out is not None else np.empty_like(obs, dtype=np.float32)
-        np.copyto(normalized, obs)
+        np.copyto(out, obs)
         if self._obs_count >= 2 and self._obs_mean is not None and self._obs_m2 is not None:
             var = self._obs_m2 / max(self._obs_count - 1, 1)
             std = np.sqrt(np.maximum(var, 1e-6))
             mask = self._obs_continuous_mask
-            normalized[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
+            out[mask] = (obs[mask] - self._obs_mean[mask]) / std[mask]
         if not self.freeze_obs_norm:
             self._update_obs_stats(obs)
+
+    def _normalize_observation(self, obs: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
+        normalized = out if out is not None else np.empty_like(obs, dtype=np.float32)
+        self._normalize_observation_into(obs, normalized)
         return normalized
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
