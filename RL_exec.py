@@ -3694,7 +3694,7 @@ def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
     done = False
     action_array = _canonical_zero_market_action(allow_taker=train_env.allow_taker)
     while not done:
-        _, _, done, _ = train_env.step(action_array, emit_info=False)
+        _, _, done, _ = train_env.step_canonical_action_array(action_array, emit_info=False)
     state = train_env.get_obs_norm_state()
     if not _obs_norm_state_is_ready(state):
         raise RuntimeError(
