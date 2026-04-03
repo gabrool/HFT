@@ -2467,16 +2467,17 @@ class MarketMakingEnv:
         self.freeze_obs_norm = bool(freeze)
 
     def _normalize_observation_into(self, obs_raw: np.ndarray, out: np.ndarray) -> np.ndarray:
-        if self._obs_continuous_mask is None:
-            self._obs_continuous_mask = self._continuous_mask(obs_raw.shape[0])
-        if self._obs_count >= 2 and self._obs_mean is not None and self._obs_m2 is not None:
+        norm_active = self._obs_count >= 2 and self._obs_mean is not None and self._obs_m2 is not None
+        if not norm_active:
+            out[:] = obs_raw
+        else:
+            if self._obs_continuous_mask is None:
+                self._obs_continuous_mask = self._continuous_mask(obs_raw.shape[0])
             var = self._obs_m2 / max(self._obs_count - 1, 1)
             std = np.sqrt(np.maximum(var, 1e-6))
             mask = self._obs_continuous_mask
-            np.copyto(out, obs_raw)
+            out[:] = obs_raw
             out[mask] = (obs_raw[mask] - self._obs_mean[mask]) / std[mask]
-        else:
-            np.copyto(out, obs_raw)
         if not self.freeze_obs_norm:
             self._update_obs_stats(obs_raw)
         return out
