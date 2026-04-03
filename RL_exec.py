@@ -3143,19 +3143,37 @@ def collect_market_rollout(
     )
 
     max_start = max(0, env.n - 2)
+    obs_device_buf: Optional[torch.Tensor] = None
     for _ in range(rollouts_per_epoch):
         start_idx = int(np.random.randint(0, max_start + 1)) if randomize_start else 0
         obs = env.reset(start_idx=start_idx)
         done = False
         steps = 0
         while not done and steps < horizon:
-            obs_cpu = torch.from_numpy(obs).float()
+            obs_cpu = torch.from_numpy(obs)
             if obs_buf is None:
                 obs_dim = int(obs_cpu.shape[0])
                 obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32, **alloc_kwargs)
                 next_obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32, **alloc_kwargs)
                 actions_buf = torch.empty((max_steps, action_dim), dtype=torch.float32, **alloc_kwargs)
-            obs_t = obs_cpu.to(target_device, non_blocking=non_blocking)
+                if target_device.type == "cuda":
+                    obs_device_buf = torch.empty((1, obs_dim), dtype=torch.float32, device=target_device)
+            require(
+                obs_buf is not None and next_obs_buf is not None and actions_buf is not None,
+                "rollout buffers not initialized",
+            )
+            idx = cursor
+            cursor += 1
+            if target_device.type == "cuda":
+                require(obs_device_buf is not None, "obs_device_buf not initialized")
+                obs_device_buf[0].copy_(obs_cpu, non_blocking=non_blocking)
+                obs_t = obs_device_buf[0]
+            else:
+                obs_t = obs_cpu.to(target_device, non_blocking=non_blocking)
+            if use_gpu_storage:
+                obs_buf[idx].copy_(obs_t, non_blocking=non_blocking)
+            else:
+                obs_buf[idx].copy_(obs_cpu)
             with torch.no_grad():
                 mean, log_std, value = model(obs_t.unsqueeze(0))
                 action_env, logp_env, _latent_action = _sample_bounded_ppo_action(
@@ -3174,21 +3192,13 @@ def collect_market_rollout(
             truncated = (not terminated) and (steps >= horizon)
             done = terminated or truncated
 
-            idx = cursor
-            cursor += 1
-            require(
-                obs_buf is not None and next_obs_buf is not None and actions_buf is not None,
-                "rollout buffers not initialized",
-            )
-            next_obs_cpu = torch.from_numpy(next_obs).float()
+            next_obs_cpu = torch.from_numpy(next_obs)
             if use_gpu_storage:
-                obs_buf[idx].copy_(obs_t)
                 next_obs_buf[idx].copy_(next_obs_cpu.to(target_device, non_blocking=non_blocking))
                 actions_buf[idx].copy_(action_env.squeeze(0).detach())
                 logp_buf[idx] = logp_env.squeeze(0).detach()
                 values_buf[idx] = value.squeeze(0).detach()
             else:
-                obs_buf[idx].copy_(obs_cpu)
                 next_obs_buf[idx].copy_(next_obs_cpu)
                 actions_buf[idx].copy_(action_env.squeeze(0).detach().cpu())
                 logp_buf[idx] = logp_env.squeeze(0).detach().cpu()
