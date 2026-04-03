@@ -1389,6 +1389,9 @@ def load_decision_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, n
     decision_path = week_dir / "decision_snapshots.npz"
     rebuild_msg = (
         "Decision snapshot artifact is missing/stale/malformed. "
+        "Expected keys={ts,snapshots,schema_version,feature_columns_json}, "
+        "ts to be 1D monotonically non-decreasing, snapshots to be finite with "
+        "the expected feature columns/schema, and row counts to match. "
         f"Expected {decision_path}. Please rerun offline_snapshots.py."
     )
     if not decision_path.exists():
@@ -1414,7 +1417,7 @@ def load_decision_snapshots(out_root: str, week_key: str) -> Tuple[np.ndarray, n
         raise ValueError(rebuild_msg) from exc
     if feature_columns != RAW_SNAPSHOT_FEATURE_COLUMNS:
         raise ValueError(rebuild_msg)
-    if ts.size and np.any(np.diff(ts) <= 0):
+    if ts.size and np.any(np.diff(ts) < 0):
         raise ValueError(rebuild_msg)
     if not np.all(np.isfinite(snapshots)):
         raise ValueError(rebuild_msg)
@@ -1719,13 +1722,13 @@ def _build_joined_split_uncached(
 
     ts_all = out["ts"]
     ts_diff = np.diff(ts_all)
-    bad_idx = np.where(ts_diff <= 0)[0]
+    bad_idx = np.where(ts_diff < 0)[0]
     if bad_idx.size > 0:
         first_bad = int(bad_idx[0])
         raise ValueError(
-            "build_joined_split requires strictly increasing concatenated timestamps "
+            "build_joined_split requires monotonically non-decreasing concatenated timestamps "
             "(weeks order is preserved; outputs are not resorted). "
-            f"first_bad_index={first_bad} ts_prev={int(ts_all[first_bad])} "
+            f"first_decreasing_index={first_bad} ts_prev={int(ts_all[first_bad])} "
             f"ts_next={int(ts_all[first_bad + 1])} diff={int(ts_diff[first_bad])}"
         )
 
@@ -1819,6 +1822,7 @@ def _build_joined_cache_identity(
             "weeks_in_order": [str(v) for v in meta.get("weeks_in_order", [])] if isinstance(meta.get("weeks_in_order"), list) else None,
             "weeks_meta": {str(k): str(v) for k, v in weeks_meta.items()},
             "splits.protocol": split_protocol,
+            "joined_ts_ordering": "nondecreasing",
         },
         "referenced_weeks": week_refs,
     }
@@ -1826,11 +1830,11 @@ def _build_joined_cache_identity(
 
 def _joined_ts_ordering_mode(meta: Optional[Dict[str, Any]]) -> str:
     if not isinstance(meta, dict):
-        return "strictly_increasing"
+        return "nondecreasing"
     mode = meta.get("joined_ts_ordering")
     if mode in {"strictly_increasing", "nondecreasing"}:
         return str(mode)
-    return "strictly_increasing"
+    return "nondecreasing"
 
 
 def _validate_joined_payload(payload: Dict[str, np.ndarray], *, meta: Optional[Dict[str, Any]]) -> None:
@@ -1885,7 +1889,7 @@ def _validate_joined_payload(payload: Dict[str, np.ndarray], *, meta: Optional[D
         ordering_desc = "non-increasing" if ordering_mode == "strictly_increasing" else "decreasing"
         raise JoinedCacheError(
             f"Joined cache has {ordering_desc} timestamps: "
-            f"first_bad_index={first_bad} ts_prev={int(ts_all[first_bad])} "
+            f"first_decreasing_index={first_bad} ts_prev={int(ts_all[first_bad])} "
             f"ts_next={int(ts_all[first_bad + 1])} diff={int(ts_diff[first_bad])}"
         )
 
