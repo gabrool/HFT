@@ -2702,7 +2702,14 @@ class MarketMakingEnv:
             return linear_penalty + quadratic_penalty
         return max(linear_penalty, quadratic_penalty)
 
-    def step(self, action: Any, emit_info: bool = False) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
+    def _step_from_components(
+        self,
+        bid_delta_bps: float,
+        ask_delta_bps: float,
+        taker_signal: float,
+        *,
+        emit_info: bool = False,
+    ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         # Execution convention: both maker and taker fills are priced using the next snapshot
         # (next_idx). We quote on self.idx, then advance state after applying fills at next_idx.
         next_idx = self.idx + 1
@@ -2763,7 +2770,6 @@ class MarketMakingEnv:
                 "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
             return self._build_observation(self.idx), 0.0, True, info
-        bid_delta_bps, ask_delta_bps, taker_signal = self._parse_action(action)
         bid, ask, mid = self._baseline_quotes(self.idx)
         bid, ask, bid_delta_bps, ask_delta_bps = self._apply_deltas(
             bid, ask, mid, bid_delta_bps, ask_delta_bps
@@ -2923,6 +2929,39 @@ class MarketMakingEnv:
             "taker_sell_clipped": float(self.last_taker_sell_clipped),
         }
         return next_obs, float(reward), done, info
+
+    def step_canonical_action_array(
+        self, action_arr: np.ndarray, *, emit_info: bool = False
+    ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
+        expected_dim = 3 if self.allow_taker else 2
+        if not isinstance(action_arr, np.ndarray):
+            raise TypeError(f"Expected np.ndarray action_arr, got {type(action_arr)!r}")
+        if action_arr.dtype != np.float32:
+            action_arr = action_arr.astype(np.float32, copy=False)
+        require(
+            action_arr.shape == (expected_dim,),
+            f"Expected action shape {(expected_dim,)}, got shape={action_arr.shape}",
+        )
+        if not np.all(np.isfinite(action_arr)):
+            raise ValueError(f"Action components must be finite, got {action_arr}")
+        bid_delta_bps = float(action_arr[0])
+        ask_delta_bps = float(action_arr[1])
+        taker_signal = float(action_arr[2]) if expected_dim == 3 else 0.0
+        return self._step_from_components(
+            bid_delta_bps,
+            ask_delta_bps,
+            taker_signal,
+            emit_info=emit_info,
+        )
+
+    def step(self, action: Any, emit_info: bool = False) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
+        bid_delta_bps, ask_delta_bps, taker_signal = self._parse_action(action)
+        return self._step_from_components(
+            bid_delta_bps,
+            ask_delta_bps,
+            taker_signal,
+            emit_info=emit_info,
+        )
 
 
 class MLP(nn.Module):
