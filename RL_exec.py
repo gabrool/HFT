@@ -3125,7 +3125,14 @@ def collect_market_rollout(
     dones_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
-    action_dim = int(model.log_std.shape[0])
+    action_dim = _resolve_market_action_dim(env.allow_taker)
+    action_cpu_buf = np.empty((action_dim,), dtype=np.float32)
+    action_cpu_stage_t: Optional[torch.Tensor] = None
+    if target_device.type == "cuda":
+        stage_kwargs: Dict[str, Any] = {}
+        if use_pinned:
+            stage_kwargs["pin_memory"] = True
+        action_cpu_stage_t = torch.empty((action_dim,), dtype=torch.float32, device="cpu", **stage_kwargs)
     action_low, action_high = _ppo_action_bounds(
         env,
         action_dim,
@@ -3181,9 +3188,15 @@ def collect_market_rollout(
                     action_high,
                 )
 
-            env_action = action_env.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+            sampled_action_env = action_env.squeeze(0).detach()
+            if sampled_action_env.device.type == "cpu":
+                np.copyto(action_cpu_buf, sampled_action_env.numpy(), casting="no")
+            else:
+                require(action_cpu_stage_t is not None, "action_cpu_stage_t not initialized")
+                action_cpu_stage_t.copy_(sampled_action_env, non_blocking=non_blocking)
+                np.copyto(action_cpu_buf, action_cpu_stage_t.numpy(), casting="no")
             # 4) Step env only after obs has been ingested into model/storage buffers.
-            next_obs, reward, env_done, _ = env.step(env_action, emit_info=False)
+            next_obs, reward, env_done, _ = env.step_canonical_action_array(action_cpu_buf, emit_info=False)
             steps += 1
             terminated = bool(env_done)
             # Truncation means the rollout horizon ended; it is not a true
