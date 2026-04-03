@@ -3047,7 +3047,7 @@ class PPOConfig:
     val_every: int = 1
     max_drawdown_guard: Optional[float] = None
     rollout_horizon: int = 32768
-    rollouts_per_epoch: int = 16
+    rollouts_per_epoch: int = 4
     randomize_rollout_start: bool = True
     zero_residual_init: bool = True
     init_log_std: float = -3.0
