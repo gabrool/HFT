@@ -4309,10 +4309,7 @@ def evaluate_market_making(
         steps += 1
         total_reward += float(reward)
         total_delta_equity += float(info.get("delta_equity", 0.0))
-        step_inventory_penalty_total = info.get("inventory_penalty_total")
-        if step_inventory_penalty_total is None:
-            step_inventory_penalty_total = info.get("inventory_penalty", 0.0)
-        inventory_penalty_total += float(step_inventory_penalty_total)
+        inventory_penalty_total += float(info.get("inventory_penalty_total", 0.0))
         total_turnover_penalty += float(info.get("turnover_penalty", 0.0))
         total_maker_buy_markout += float(info.get("maker_buy_markout", 0.0))
         total_maker_sell_markout += float(info.get("maker_sell_markout", 0.0))
