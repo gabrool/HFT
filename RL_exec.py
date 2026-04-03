@@ -2333,6 +2333,7 @@ class MarketMakingEnv:
         mid = self._mid_price(idx)
         raw = self._obs_raw_buf_a if self._obs_ping_pong_idx == 0 else self._obs_raw_buf_b
         out = self._obs_out_buf_a if self._obs_ping_pong_idx == 0 else self._obs_out_buf_b
+        feature_row = self.features[idx]
         inventory_notional_scaled = (self.inventory * mid) * self._inv_inventory_notional_scale
         cash_scaled = self.cash * self._inv_cash_scale
         time_since_last_fill_scaled = self.time_since_last_fill * self._inv_time_since_fill_scale
@@ -2348,23 +2349,22 @@ class MarketMakingEnv:
         # than fixed "1 snapshot == 1 step" units. Under jitter this keeps intent
         # explicit: ~100ms gaps contribute ~1.0, ~300ms gaps contribute ~3.0.
         # `last_*` values persist on no-fill steps.
-        raw[self._obs_feature_slice] = self.features[idx]
-        raw[self._obs_extra_slice] = (
-            inventory_notional_scaled,
-            cash_scaled,
-            time_since_last_fill_scaled,
-            self.last_maker_buy_notional * self._inv_fill_notional_scale,
-            self.last_maker_sell_notional * self._inv_fill_notional_scale,
-            self.last_taker_buy_notional * self._inv_fill_notional_scale,
-            self.last_taker_sell_notional * self._inv_fill_notional_scale,
-            self.last_net_fill_notional * self._inv_fill_notional_scale,
-            self.last_gross_fill_notional * self._inv_fill_notional_scale,
-            self.ema_net_fill_notional * self._inv_fill_notional_scale,
-            self.ema_gross_fill_notional * self._inv_fill_notional_scale,
-            unrealized_pnl_scaled,
-            self.ema_maker_buy_markout * self._inv_markout_notional_scale,
-            self.ema_maker_sell_markout * self._inv_markout_notional_scale,
-        )
+        raw[self._obs_feature_slice] = feature_row
+        extra = raw[self._obs_extra_slice]
+        extra[0] = inventory_notional_scaled
+        extra[1] = cash_scaled
+        extra[2] = time_since_last_fill_scaled
+        extra[3] = self.last_maker_buy_notional * self._inv_fill_notional_scale
+        extra[4] = self.last_maker_sell_notional * self._inv_fill_notional_scale
+        extra[5] = self.last_taker_buy_notional * self._inv_fill_notional_scale
+        extra[6] = self.last_taker_sell_notional * self._inv_fill_notional_scale
+        extra[7] = self.last_net_fill_notional * self._inv_fill_notional_scale
+        extra[8] = self.last_gross_fill_notional * self._inv_fill_notional_scale
+        extra[9] = self.ema_net_fill_notional * self._inv_fill_notional_scale
+        extra[10] = self.ema_gross_fill_notional * self._inv_fill_notional_scale
+        extra[11] = unrealized_pnl_scaled
+        extra[12] = self.ema_maker_buy_markout * self._inv_markout_notional_scale
+        extra[13] = self.ema_maker_sell_markout * self._inv_markout_notional_scale
         self._normalize_observation_into(raw, out)
         self._obs_ping_pong_idx ^= 1
         return out
