@@ -2483,8 +2483,20 @@ class MarketMakingEnv:
         return out
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
-        """Parse canonical action arrays into (bid_delta_bps, ask_delta_bps, taker_signal)."""
-        action_arr = _canonical_market_action_array(action, allow_taker=self.allow_taker)
+        """Hot-path parser for canonical float32 action arrays."""
+        expected_dim = 3 if self.allow_taker else 2
+        if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.shape == (expected_dim,):
+            if action.shape[0] == 2:
+                return float(action[0]), float(action[1]), 0.0
+            return float(action[0]), float(action[1]), float(action[2])
+        # Minimal debug conversion/fallback for non-canonical callers outside rollout hot paths.
+        action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        require(
+            action_arr.shape == (expected_dim,),
+            f"Expected action shape {(expected_dim,)}, got shape={action_arr.shape}",
+        )
+        if not np.all(np.isfinite(action_arr)):
+            raise ValueError(f"Action components must be finite, got {action_arr}")
         if action_arr.shape[0] == 2:
             return float(action_arr[0]), float(action_arr[1]), 0.0
         return float(action_arr[0]), float(action_arr[1]), float(action_arr[2])
@@ -3448,10 +3460,20 @@ def _canonical_market_action_array(
     return action_arr
 
 
+def _canonical_zero_market_action(*, allow_taker: bool) -> np.ndarray:
+    """Allocate the canonical no-op action used in training/eval stepping loops."""
+    if bool(allow_taker):
+        return np.zeros((3,), dtype=np.float32)
+    return np.zeros((2,), dtype=np.float32)
+
+
 def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float]:
     action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
-    require(action_arr.shape[0] >= 2, f"Expected at least 2 action dimensions, got shape={action_arr.shape}")
-    taker_delta = float(action_arr[2]) if action_arr.shape[0] >= 3 else 0.0
+    require(
+        action_arr.shape in ((2,), (3,)),
+        f"Expected canonical action shape (2,) or (3,), got shape={action_arr.shape}",
+    )
+    taker_delta = float(action_arr[2]) if action_arr.shape[0] == 3 else 0.0
     return float(action_arr[0]), float(action_arr[1]), taker_delta
 
 
@@ -3642,8 +3664,7 @@ def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
     train_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
     _ = train_env.reset(start_idx=0)
     done = False
-    action_dim = _resolve_market_action_dim(train_env.allow_taker)
-    action_array = np.zeros((action_dim,), dtype=np.float32)
+    action_array = _canonical_zero_market_action(allow_taker=train_env.allow_taker)
     while not done:
         _, _, done, _ = train_env.step(action_array, emit_info=False)
     state = train_env.get_obs_norm_state()
@@ -3685,11 +3706,12 @@ def _build_market_probe_obs_batch(
     max_start = max(0, env.n - 2)
     probe_count = max(1, min(int(batch_size), max_start + 1))
     probe_indices = np.linspace(0, max_start, num=probe_count, dtype=int)
-    probe_obs = [
-        env.reset(start_idx=int(idx))
-        for idx in probe_indices
-    ]
-    return torch.as_tensor(np.stack(probe_obs, axis=0), device=device)
+    first_obs = env.reset(start_idx=int(probe_indices[0]))
+    probe_obs_batch = np.empty((probe_count, first_obs.shape[0]), dtype=first_obs.dtype)
+    probe_obs_batch[0] = first_obs
+    for row_idx, idx in enumerate(probe_indices[1:], start=1):
+        probe_obs_batch[row_idx] = env.reset(start_idx=int(idx))
+    return torch.as_tensor(probe_obs_batch, device=device)
 
 
 def save_market_ppo_checkpoint(
