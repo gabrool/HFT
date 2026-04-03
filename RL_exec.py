@@ -2482,47 +2482,11 @@ class MarketMakingEnv:
         return out
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
-        """Parse an action into (bid_delta_bps, ask_delta_bps, taker_signal).
-
-        Accepted action formats:
-        - Scalar: applies the same delta to bid and ask, with no taker signal.
-        - Length-2 sequence: interpreted as (bid_delta_bps, ask_delta_bps), taker=0.
-        - Length-3 sequence: interpreted as (bid_delta_bps, ask_delta_bps, taker_signal).
-        """
-        bid_delta_bps: float
-        ask_delta_bps: float
-        taker_signal: float
-
-        if isinstance(action, (list, tuple, np.ndarray)):
-            if len(action) == 3:
-                bid_delta_bps = float(action[0])
-                ask_delta_bps = float(action[1])
-                taker_signal = float(action[2])
-            elif len(action) == 2:
-                bid_delta_bps = float(action[0])
-                ask_delta_bps = float(action[1])
-                taker_signal = 0.0
-            else:
-                raise ValueError(
-                    "Action sequence must be length 2 or 3: "
-                    "(bid_delta_bps, ask_delta_bps[, taker_signal])."
-                )
-        elif np.isscalar(action):
-            bid_delta_bps = float(action)
-            ask_delta_bps = float(action)
-            taker_signal = 0.0
-        else:
-            raise ValueError(
-                "Action must be a scalar or (bid_delta_bps, ask_delta_bps[, taker_signal])."
-            )
-
-        if not np.all(np.isfinite([bid_delta_bps, ask_delta_bps, taker_signal])):
-            raise ValueError(
-                "Action components must be finite: "
-                f"bid_delta_bps={bid_delta_bps}, ask_delta_bps={ask_delta_bps}, "
-                f"taker_signal={taker_signal}"
-            )
-        return bid_delta_bps, ask_delta_bps, taker_signal
+        """Parse canonical action arrays into (bid_delta_bps, ask_delta_bps, taker_signal)."""
+        action_arr = _canonical_market_action_array(action, allow_taker=self.allow_taker)
+        if action_arr.shape[0] == 2:
+            return float(action_arr[0]), float(action_arr[1]), 0.0
+        return float(action_arr[0]), float(action_arr[1]), float(action_arr[2])
 
     def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
         return self.features[idx, start:end]
@@ -3183,8 +3147,8 @@ def collect_market_rollout(
                     action_high,
                 )
 
-            env_action = _market_env_action_tuple(action_env.squeeze(0).detach().cpu().numpy())
-            next_obs, reward, env_done, _info = env.step(env_action, emit_info=False)
+            env_action = action_env.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+            next_obs, reward, env_done, _ = env.step(env_action, emit_info=False)
             steps += 1
             terminated = bool(env_done)
             # Truncation means the rollout horizon ended; it is not a true
@@ -3444,7 +3408,7 @@ def evaluate_market_policy(
     delta_scale: float = 1.0,
     taker_scale: float = 1.0,
 ) -> Dict[str, Any]:
-    def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
+    def _policy_fn(obs: np.ndarray) -> np.ndarray:
         return _policy_action_from_obs_numpy(
             obs,
             policy,
@@ -3455,6 +3419,25 @@ def evaluate_market_policy(
         )
 
     return evaluate_market_making(env, _policy_fn)
+
+
+def _canonical_market_action_array(
+    action: np.ndarray | torch.Tensor | Sequence[float],
+    *,
+    allow_taker: bool,
+) -> np.ndarray:
+    expected_dim = 3 if bool(allow_taker) else 2
+    if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.ndim == 1:
+        action_arr = action
+    else:
+        action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
+    require(
+        action_arr.shape == (expected_dim,),
+        f"Expected action shape {(expected_dim,)}, got shape={action_arr.shape}",
+    )
+    if not np.all(np.isfinite(action_arr)):
+        raise ValueError(f"Action components must be finite, got {action_arr}")
+    return action_arr
 
 
 def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float]:
@@ -3474,7 +3457,7 @@ def evaluate_market_policy_ppo(
     taker_scale: float = 1.0,
     generator: Optional[torch.Generator] = None,
 ) -> Dict[str, Any]:
-    def _policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
+    def _policy_fn(obs: np.ndarray) -> np.ndarray:
         action = _ppo_action_from_obs_numpy(
             model,
             obs,
@@ -3485,7 +3468,7 @@ def evaluate_market_policy_ppo(
             taker_scale=taker_scale,
             env=env,
         )
-        return _market_env_action_tuple(action)
+        return _canonical_market_action_array(action, allow_taker=env.allow_taker)
 
     return evaluate_market_making(env, _policy_fn)
 
@@ -3515,7 +3498,7 @@ def _policy_action_from_obs_numpy(
     taker_scale: float,
     *,
     env: Optional[MarketMakingEnv] = None,
-) -> Tuple[float, float, float]:
+) -> np.ndarray:
     obs_t = torch.from_numpy(obs).float().to(device)
     with torch.no_grad():
         raw_action = policy(obs_t.unsqueeze(0)).squeeze(0)
@@ -3525,7 +3508,7 @@ def _policy_action_from_obs_numpy(
             delta_scale=delta_scale,
             taker_scale=taker_scale,
         )
-    return _market_env_action_tuple(action_env.cpu().numpy())
+    return _canonical_market_action_array(action_env.cpu().numpy(), allow_taker=env.allow_taker if env is not None else True)
 
 
 def _ppo_action_from_obs_numpy(
@@ -3651,8 +3634,10 @@ def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
     train_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
     _ = train_env.reset(start_idx=0)
     done = False
+    action_dim = _resolve_market_action_dim(train_env.allow_taker)
+    action_array = np.zeros((action_dim,), dtype=np.float32)
     while not done:
-        _, _, done, _ = train_env.step((0.0, 0.0, 0.0))
+        _, _, done, _ = train_env.step(action_array, emit_info=False)
     state = train_env.get_obs_norm_state()
     if not _obs_norm_state_is_ready(state):
         raise RuntimeError(
@@ -3693,7 +3678,7 @@ def _build_market_probe_obs_batch(
     probe_count = max(1, min(int(batch_size), max_start + 1))
     probe_indices = np.linspace(0, max_start, num=probe_count, dtype=int)
     probe_obs = [
-        env.reset(start_idx=int(idx)).astype(np.float32, copy=True)
+        env.reset(start_idx=int(idx))
         for idx in probe_indices
     ]
     return torch.as_tensor(np.stack(probe_obs, axis=0), device=device)
