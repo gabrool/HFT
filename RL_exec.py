@@ -3115,6 +3115,8 @@ def collect_market_rollout(
         done = False
         steps = 0
         while not done and steps < horizon:
+            # 1) Read obs
+            # 2) Create zero-copy CPU tensor view
             obs_cpu = torch.from_numpy(obs)
             if obs_buf is None:
                 obs_dim = int(obs_cpu.shape[0])
@@ -3122,6 +3124,8 @@ def collect_market_rollout(
                 next_obs_buf = torch.empty((max_steps, obs_dim), dtype=torch.float32, **alloc_kwargs)
                 actions_buf = torch.empty((max_steps, action_dim), dtype=torch.float32, **alloc_kwargs)
                 if target_device.type == "cuda":
+                    # Reusable single-row GPU inference buffer to avoid
+                    # per-step tensor allocation/churn for model inputs.
                     obs_device_buf = torch.empty((1, obs_dim), dtype=torch.float32, device=target_device)
             require(
                 obs_buf is not None and next_obs_buf is not None and actions_buf is not None,
@@ -3131,10 +3135,12 @@ def collect_market_rollout(
             cursor += 1
             if target_device.type == "cuda":
                 require(obs_device_buf is not None, "obs_device_buf not initialized")
+                # 3) Copy CPU view into model input buffer
                 obs_device_buf[0].copy_(obs_cpu, non_blocking=non_blocking)
                 obs_t = obs_device_buf[0]
             else:
                 obs_t = obs_cpu.to(target_device, non_blocking=non_blocking)
+            # 3) Copy CPU view into rollout storage buffer
             if use_gpu_storage:
                 obs_buf[idx].copy_(obs_t, non_blocking=non_blocking)
             else:
@@ -3149,6 +3155,7 @@ def collect_market_rollout(
                 )
 
             env_action = action_env.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+            # 4) Step env only after obs has been ingested into model/storage buffers.
             next_obs, reward, env_done, _ = env.step(env_action, emit_info=False)
             steps += 1
             terminated = bool(env_done)
@@ -3159,7 +3166,7 @@ def collect_market_rollout(
 
             next_obs_cpu = torch.from_numpy(next_obs)
             if use_gpu_storage:
-                next_obs_buf[idx].copy_(next_obs_cpu.to(target_device, non_blocking=non_blocking))
+                next_obs_buf[idx].copy_(next_obs_cpu, non_blocking=non_blocking)
                 actions_buf[idx].copy_(action_env.squeeze(0).detach())
                 logp_buf[idx] = logp_env.squeeze(0).detach()
                 values_buf[idx] = value.squeeze(0).detach()
