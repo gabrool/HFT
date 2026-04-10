@@ -4796,19 +4796,21 @@ if __name__ == "__main__":
     )
     print("[cmssl test]", report["cmssl_test"])
     print("[mm obs scaling]", report["mm_obs_scaling"])
+    zero_action_report = report["mm_zero_action"]
+    rl_report = report["mm_rl"]
     # Ownership: __main__ prints MM summaries once; run_pipeline() only returns metrics.
     # Keep default logs compact so routine runs stay readable; full reports are opt-in.
-    print("[mm eval]", _format_mm_summary("zero_action", report["mm_zero_action"]))
-    if report["mm_rl"] is None:
+    print("[mm eval]", _format_mm_summary("zero_action", zero_action_report))
+    if rl_report is None:
         print("[mm rl] skipped (mm_rl is None)")
     else:
-        print("[mm eval]", _format_mm_summary("zero_action+rl", report["mm_rl"]))
+        print("[mm eval]", _format_mm_summary("zero_action+rl", rl_report))
     if verbose_reports:
-        print("[mm zero-action verbose]", _summarize_for_log(report["mm_zero_action"]))
-        if report["mm_rl"] is None:
+        print("[mm zero-action verbose]", _summarize_for_log(zero_action_report))
+        if rl_report is None:
             print("[mm rl verbose] skipped (mm_rl is None)")
         else:
-            print("[mm rl verbose]", _summarize_for_log(report["mm_rl"]))
+            print("[mm rl verbose]", _summarize_for_log(rl_report))
     if run_cmssl_test_window:
         print("[cmssl test window] running windowed inference for diagnostics.")
         test_window_report = run_cmssl_test_window_inference(out_root, ckpt_path, device=device)
