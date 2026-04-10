@@ -1081,6 +1081,10 @@ def _build_rollout_start_sampler(
                 "abs_logit": float(raw_score[i]),
             }
         )
+    if config.start_exclusion_window is None:
+        effective_start_exclusion_window = int(safe_rollout_horizon)
+    else:
+        effective_start_exclusion_window = int(max(0, int(config.start_exclusion_window)))
     return {
         "candidate_starts": candidate_starts,
         "focus_idx": focus_idx,
@@ -1089,7 +1093,7 @@ def _build_rollout_start_sampler(
         "abs_focus_logit": raw_score.astype(np.float64, copy=False),
         "effective_max_start": int(effective_max_start),
         "min_remaining_steps": int(min_remaining_steps),
-        "start_exclusion_window": int(max(0, int(config.start_exclusion_window))),
+        "start_exclusion_window": int(effective_start_exclusion_window),
         "top_focus": top_focus,
         "config": config,
     }
