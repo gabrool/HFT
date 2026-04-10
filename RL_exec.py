@@ -372,16 +372,11 @@ def _ppo_action_bounds(
     device: torch.device | str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     action_dim = _resolve_market_action_dim()
+    direct_cfg = env.direct_quote_config if env is not None else load_direct_quote_config()
     center_limit_bps = (
-        float(env.delta_bps_limit)
-        if env is not None
-        else abs(float(_env_float("BYBIT_MM_DELTA_BPS_LIMIT", 1.0)))
+        float(direct_cfg.center_limit_bps)
     )
-    taker_signal_limit = (
-        float(env.taker_signal_limit)
-        if env is not None
-        else abs(float(_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT)))
-    )
+    taker_signal_limit = float(direct_cfg.taker_signal_limit)
     low = torch.tensor(
         [-center_limit_bps, -1.0, -1.0, -taker_signal_limit],
         device=device,
@@ -524,6 +519,7 @@ def _select_baseline_env(
 
 
 def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
+    direct_quote_config = load_direct_quote_config()
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
@@ -550,28 +546,6 @@ def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
     taker_fee_bps = float(os.environ.get("BYBIT_MM_TAKER_FEE_BPS", str(DEFAULT_MM_TAKER_FEE_BPS)))
     taker_threshold = float(os.environ.get("BYBIT_MM_TAKER_THRESHOLD", str(DEFAULT_MM_TAKER_THRESHOLD)))
-    taker_signal_limit = float(
-        os.environ.get("BYBIT_MM_TAKER_SIGNAL_LIMIT", str(DEFAULT_MM_TAKER_SIGNAL_LIMIT))
-    )
-    delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
-    if not delta_bps_limit_str:
-        raise ValueError(
-            "Missing required env var BYBIT_MM_DELTA_BPS_LIMIT (basis points, bps)."
-        )
-    try:
-        delta_bps_limit = float(delta_bps_limit_str)
-    except ValueError as exc:
-        raise ValueError(
-            "BYBIT_MM_DELTA_BPS_LIMIT must be a finite float in basis points (bps)."
-        ) from exc
-    if not np.isfinite(delta_bps_limit) or delta_bps_limit <= 0.0:
-        raise ValueError(
-            "BYBIT_MM_DELTA_BPS_LIMIT must be finite and > 0 in basis points (bps)."
-        )
-    if not np.isfinite(taker_signal_limit) or taker_signal_limit <= 0.0:
-        raise ValueError(
-            "BYBIT_MM_TAKER_SIGNAL_LIMIT must be finite and > 0."
-        )
     if inv_soft_notional <= 0.0:
         raise ValueError("BYBIT_MM_INV_SOFT_NOTIONAL must be > 0 (quote notional, USD).")
     if max_inventory_notional <= 0.0:
@@ -598,7 +572,6 @@ def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
         "maker_rebate_bps": maker_rebate_bps,
         "taker_fee_bps": taker_fee_bps,
         "taker_threshold": taker_threshold,
-        "taker_signal_limit": taker_signal_limit,
         "inventory_penalty": inventory_penalty,
         "inv_soft_notional": inv_soft_notional,
         "lambda_inv": lambda_inv,
@@ -607,7 +580,7 @@ def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
         "hard_max_inventory_notional": hard_max_inventory_notional,
         "fill_size": fill_size,
         "fill_tolerance": fill_tolerance,
-        "delta_bps_limit": delta_bps_limit,
+        "direct_quote_config": direct_quote_config,
     }
 
 
@@ -744,11 +717,13 @@ class BaselineQuoteConfig:
 
 @dataclass(frozen=True)
 class DirectQuoteConfig:
-    obs_spread_anchor_frac: float
+    center_limit_bps: float
     spread_floor_bps: float
     spread_cap_bps: float
+    obs_spread_anchor_frac: float
     skew_limit_bps: float
     skew_fraction_limit: float
+    taker_signal_limit: float
 
 
 @dataclass(frozen=True)
@@ -770,7 +745,6 @@ class PreparedFastBaselineBatch:
     maker_rebate_bps: float
     taker_fee_bps: float
     fill_tolerance: float
-    delta_bps_limit: float
     inventory_penalty: float
     inv_soft_notional: float
     lambda_inv: float
@@ -827,126 +801,60 @@ class PreparedBaselineContext:
 def load_direct_quote_config() -> DirectQuoteConfig:
     return _validate_direct_quote_config(
         DirectQuoteConfig(
-            obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
+            center_limit_bps=_env_float("BYBIT_MM_CENTER_LIMIT_BPS", 1.0),
             spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
-            skew_limit_bps=_env_float("BYBIT_MM_DIRECT_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
-            skew_fraction_limit=_env_float("BYBIT_MM_DIRECT_SKEW_FRACTION_LIMIT", DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT),
+            obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
+            skew_limit_bps=_env_float("BYBIT_MM_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
+            skew_fraction_limit=_env_float("BYBIT_MM_SKEW_FRACTION_LIMIT", DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT),
+            taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
         )
     )
 
 
 def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
-    if not np.isfinite(cfg.obs_spread_anchor_frac) or cfg.obs_spread_anchor_frac < 0.0:
-        raise ValueError("obs_spread_anchor_frac must be finite and >= 0.0")
+    if not np.isfinite(cfg.center_limit_bps) or cfg.center_limit_bps <= 0.0:
+        raise ValueError("center_limit_bps must be finite and > 0.0")
     if not np.isfinite(cfg.spread_floor_bps) or cfg.spread_floor_bps < 0.0:
         raise ValueError("spread_floor_bps must be finite and >= 0.0")
     if not np.isfinite(cfg.spread_cap_bps) or cfg.spread_cap_bps < cfg.spread_floor_bps:
         raise ValueError("spread_cap_bps must be finite and >= spread_floor_bps")
+    if (
+        not np.isfinite(cfg.obs_spread_anchor_frac)
+        or cfg.obs_spread_anchor_frac < 0.0
+        or cfg.obs_spread_anchor_frac > 1.0
+    ):
+        raise ValueError("obs_spread_anchor_frac must be finite and in [0.0, 1.0]")
     if not np.isfinite(cfg.skew_limit_bps) or cfg.skew_limit_bps < 0.0:
         raise ValueError("skew_limit_bps must be finite and >= 0.0")
-    if not np.isfinite(cfg.skew_fraction_limit) or cfg.skew_fraction_limit < 0.0:
-        raise ValueError("skew_fraction_limit must be finite and >= 0.0")
+    if (
+        not np.isfinite(cfg.skew_fraction_limit)
+        or cfg.skew_fraction_limit < 0.0
+        or cfg.skew_fraction_limit > 1.0
+    ):
+        raise ValueError("skew_fraction_limit must be finite and in [0.0, 1.0]")
+    if not np.isfinite(cfg.taker_signal_limit) or cfg.taker_signal_limit <= 0.0:
+        raise ValueError("taker_signal_limit must be finite and > 0.0")
     return cfg
 
 
-def load_baseline_quote_config() -> BaselineQuoteConfig:
+def _default_baseline_quote_config() -> BaselineQuoteConfig:
     return BaselineQuoteConfig(
-        base_half_spread_bps=_env_float("BYBIT_MM_BASE_HALF_SPREAD_BPS", DEFAULT_MM_BASE_HALF_SPREAD_BPS),
-        alpha_center_scale=_env_float("BYBIT_MM_ALPHA_CENTER_SCALE", DEFAULT_MM_ALPHA_CENTER_SCALE),
-        inventory_center_scale=_env_float("BYBIT_MM_INVENTORY_CENTER_SCALE", DEFAULT_MM_INVENTORY_CENTER_SCALE),
-        vol_width_scale=_env_float("BYBIT_MM_VOL_WIDTH_SCALE", DEFAULT_MM_VOL_WIDTH_SCALE),
-        uncertainty_width_scale=_env_float("BYBIT_MM_UNCERTAINTY_WIDTH_SCALE", DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE),
-        inventory_side_widen_scale=_env_float("BYBIT_MM_INVENTORY_SIDE_WIDEN_SCALE", DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE),
-        obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
-        spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
-        spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
-        inv_ref_notional=_env_float("BYBIT_MM_INV_REF_NOTIONAL", DEFAULT_MM_INV_REF_NOTIONAL),
-        # CMSSL MM contract is fixed to [250, 500, 1000]; any deviation is a hard error.
-        horizons_ms=_env_int_list("BYBIT_MM_HORIZONS_MS", DEFAULT_MM_HORIZONS_MS),
-        p250_weight=_env_float("BYBIT_MM_P250_WEIGHT", DEFAULT_MM_P250_WEIGHT),
-        p500_weight=_env_float("BYBIT_MM_P500_WEIGHT", DEFAULT_MM_P500_WEIGHT),
-        p1000_weight=_env_float("BYBIT_MM_P1000_WEIGHT", DEFAULT_MM_P1000_WEIGHT),
+        base_half_spread_bps=DEFAULT_MM_BASE_HALF_SPREAD_BPS,
+        alpha_center_scale=DEFAULT_MM_ALPHA_CENTER_SCALE,
+        inventory_center_scale=DEFAULT_MM_INVENTORY_CENTER_SCALE,
+        vol_width_scale=DEFAULT_MM_VOL_WIDTH_SCALE,
+        uncertainty_width_scale=DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE,
+        inventory_side_widen_scale=DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE,
+        obs_spread_anchor_frac=DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC,
+        spread_floor_bps=DEFAULT_MM_SPREAD_FLOOR_BPS,
+        spread_cap_bps=DEFAULT_MM_SPREAD_CAP_BPS,
+        inv_ref_notional=DEFAULT_MM_INV_REF_NOTIONAL,
+        horizons_ms=list(DEFAULT_MM_HORIZONS_MS),
+        p250_weight=DEFAULT_MM_P250_WEIGHT,
+        p500_weight=DEFAULT_MM_P500_WEIGHT,
+        p1000_weight=DEFAULT_MM_P1000_WEIGHT,
     )
-
-
-def _validate_baseline_quote_config(cfg: BaselineQuoteConfig, *, tol: float = 1e-6) -> BaselineQuoteConfig:
-    horizons = _validate_fixed_cmssl_horizons(_normalize_horizons(len(cfg.horizons_ms), cfg.horizons_ms))
-    weight_sum = float(cfg.p250_weight + cfg.p500_weight + cfg.p1000_weight)
-    if abs(weight_sum - 1.0) > tol:
-        raise ValueError(f"Baseline horizon weights must sum to 1.0; got {weight_sum:.12f}")
-    if not np.isfinite(cfg.base_half_spread_bps) or cfg.base_half_spread_bps < 0.0:
-        raise ValueError("base_half_spread_bps must be finite and >= 0.0")
-    if not np.isfinite(cfg.alpha_center_scale):
-        raise ValueError("alpha_center_scale must be finite")
-    if not np.isfinite(cfg.inventory_center_scale):
-        raise ValueError("inventory_center_scale must be finite")
-    if not np.isfinite(cfg.vol_width_scale) or cfg.vol_width_scale < 0.0:
-        raise ValueError("vol_width_scale must be finite and >= 0.0")
-    if not np.isfinite(cfg.uncertainty_width_scale) or cfg.uncertainty_width_scale < 0.0:
-        raise ValueError("uncertainty_width_scale must be finite and >= 0.0")
-    if not np.isfinite(cfg.inventory_side_widen_scale) or cfg.inventory_side_widen_scale < 0.0:
-        raise ValueError("inventory_side_widen_scale must be finite and >= 0.0")
-    if cfg.inv_ref_notional <= 0.0:
-        raise ValueError("inv_ref_notional must be > 0")
-    if not np.isfinite(cfg.obs_spread_anchor_frac) or cfg.obs_spread_anchor_frac < 0.0:
-        raise ValueError(
-            "obs_spread_anchor_frac must be finite and >= 0.0 "
-            "(applies a floor using the observed spread before width scaling)"
-        )
-    if cfg.spread_cap_bps < cfg.spread_floor_bps:
-        raise ValueError("spread_cap_bps must be >= spread_floor_bps")
-    return BaselineQuoteConfig(**{**cfg.__dict__, "horizons_ms": horizons})
-
-
-def resolve_baseline_quote_config_from_mapping(mapping: Dict[str, Any]) -> BaselineQuoteConfig:
-    cfg = BaselineQuoteConfig(
-        base_half_spread_bps=float(mapping.get("base_half_spread_bps", DEFAULT_MM_BASE_HALF_SPREAD_BPS)),
-        alpha_center_scale=float(mapping.get("alpha_center_scale", DEFAULT_MM_ALPHA_CENTER_SCALE)),
-        inventory_center_scale=float(mapping.get("inventory_center_scale", DEFAULT_MM_INVENTORY_CENTER_SCALE)),
-        vol_width_scale=float(mapping.get("vol_width_scale", DEFAULT_MM_VOL_WIDTH_SCALE)),
-        uncertainty_width_scale=float(mapping.get("uncertainty_width_scale", DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE)),
-        inventory_side_widen_scale=float(mapping.get("inventory_side_widen_scale", DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE)),
-        obs_spread_anchor_frac=float(mapping.get("obs_spread_anchor_frac", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC)),
-        spread_floor_bps=float(mapping.get("spread_floor_bps", DEFAULT_MM_SPREAD_FLOOR_BPS)),
-        spread_cap_bps=float(mapping.get("spread_cap_bps", DEFAULT_MM_SPREAD_CAP_BPS)),
-        inv_ref_notional=float(mapping.get("inv_ref_notional", DEFAULT_MM_INV_REF_NOTIONAL)),
-        horizons_ms=[int(h) for h in mapping.get("horizons_ms", DEFAULT_MM_HORIZONS_MS)],
-        p250_weight=float(mapping.get("p250_weight", DEFAULT_MM_P250_WEIGHT)),
-        p500_weight=float(mapping.get("p500_weight", DEFAULT_MM_P500_WEIGHT)),
-        p1000_weight=float(mapping.get("p1000_weight", DEFAULT_MM_P1000_WEIGHT)),
-    )
-    return _validate_baseline_quote_config(cfg)
-
-
-def baseline_quote_config_to_dict(cfg: BaselineQuoteConfig) -> Dict[str, Any]:
-    validated = _validate_baseline_quote_config(cfg)
-    return {
-        "base_half_spread_bps": float(validated.base_half_spread_bps),
-        "alpha_center_scale": float(validated.alpha_center_scale),
-        "inventory_center_scale": float(validated.inventory_center_scale),
-        "vol_width_scale": float(validated.vol_width_scale),
-        "uncertainty_width_scale": float(validated.uncertainty_width_scale),
-        "inventory_side_widen_scale": float(validated.inventory_side_widen_scale),
-        "obs_spread_anchor_frac": float(validated.obs_spread_anchor_frac),
-        "spread_floor_bps": float(validated.spread_floor_bps),
-        "spread_cap_bps": float(validated.spread_cap_bps),
-        "inv_ref_notional": float(validated.inv_ref_notional),
-        "horizons_ms": [int(h) for h in validated.horizons_ms],
-        "p250_weight": float(validated.p250_weight),
-        "p500_weight": float(validated.p500_weight),
-        "p1000_weight": float(validated.p1000_weight),
-    }
-
-
-def _resolve_baseline_quote_config(
-    baseline_config: Optional[Dict[str, Any] | BaselineQuoteConfig],
-) -> Optional[BaselineQuoteConfig]:
-    if baseline_config is None:
-        return None
-    if isinstance(baseline_config, BaselineQuoteConfig):
-        return _validate_baseline_quote_config(baseline_config)
-    return resolve_baseline_quote_config_from_mapping(baseline_config)
 
 
 def resolve_baseline_vol_bucket_edges_bps() -> List[float]:
@@ -2093,7 +2001,6 @@ class MarketMakingEnv:
         taker_fee_bps: float = DEFAULT_MM_TAKER_FEE_BPS,
         allow_taker: bool = True,
         taker_threshold: float = DEFAULT_MM_TAKER_THRESHOLD,
-        taker_signal_limit: float = DEFAULT_MM_TAKER_SIGNAL_LIMIT,
         inventory_penalty: float = 0.0,
         inv_soft_notional: float,
         lambda_inv: float = 0.0,
@@ -2102,7 +2009,6 @@ class MarketMakingEnv:
         hard_max_inventory_notional: Optional[float] = None,
         fill_size: float = 1.0,
         fill_tolerance: float = 1e-6,
-        delta_bps_limit: float = 0.0,
         initial_cash: Optional[float] = None,
         obs_norm_state: Optional[dict] = None,
         freeze_obs_norm: bool = False,
@@ -2126,9 +2032,6 @@ class MarketMakingEnv:
         self.taker_fee_bps = taker_fee_bps
         self.allow_taker = allow_taker
         self.taker_threshold = taker_threshold
-        self.taker_signal_limit = float(taker_signal_limit)
-        if not np.isfinite(self.taker_signal_limit) or self.taker_signal_limit <= 0.0:
-            raise ValueError("taker_signal_limit must be finite and > 0.")
         self.inventory_penalty = inventory_penalty
         if inv_soft_notional <= 0.0:
             raise ValueError("inv_soft_notional must be > 0 in quote notional (USD).")
@@ -2160,11 +2063,6 @@ class MarketMakingEnv:
             )
         self.fill_size = fill_size
         self.fill_tolerance = fill_tolerance
-        self.delta_bps_limit = float(delta_bps_limit)
-        if not np.isfinite(self.delta_bps_limit) or self.delta_bps_limit <= 0.0:
-            raise ValueError(
-                "delta_bps_limit must be finite and > 0 in basis points (bps)."
-            )
         self.initial_cash = (
             float(initial_cash)
             if initial_cash is not None
@@ -2232,6 +2130,7 @@ class MarketMakingEnv:
         self.direct_quote_config = _validate_direct_quote_config(
             load_direct_quote_config() if direct_quote_config is None else direct_quote_config
         )
+        self.taker_signal_limit = float(self.direct_quote_config.taker_signal_limit)
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
@@ -2511,7 +2410,7 @@ class MarketMakingEnv:
         skew_bps = float(np.clip(skew_control, -1.0, 1.0)) * skew_limit_bps
         bid_half_spread_bps = max(floor_bps, half_spread_bps + skew_bps)
         ask_half_spread_bps = max(floor_bps, half_spread_bps - skew_bps)
-        center_bps = float(np.clip(center_bps, -self.delta_bps_limit, self.delta_bps_limit))
+        center_bps = float(np.clip(center_bps, -cfg.center_limit_bps, cfg.center_limit_bps))
         bid = mid + bps_to_px(mid, center_bps - bid_half_spread_bps)
         ask = mid + bps_to_px(mid, center_bps + ask_half_spread_bps)
         return bid, ask
@@ -2867,7 +2766,13 @@ class MarketMakingEnv:
             "post_sell_room_qty": float(post_sell_room_qty),
             "bid": float(bid),
             "ask": float(ask),
-            "center_bps": float(np.clip(center_bps, -self.delta_bps_limit, self.delta_bps_limit)),
+            "center_bps": float(
+                np.clip(
+                    center_bps,
+                    -self.direct_quote_config.center_limit_bps,
+                    self.direct_quote_config.center_limit_bps,
+                )
+            ),
             "width_control": float(np.clip(width_control, -1.0, 1.0)),
             "skew_control": float(np.clip(skew_control, -1.0, 1.0)),
             "inv_change": float(inv_change),
@@ -3902,7 +3807,7 @@ def train_market_ppo(
         f"action_dim={action_dim} "
         f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
         f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
-        f"env_delta_bps_limit={train_env.delta_bps_limit:.4f} "
+            f"env_center_limit_bps={train_env.direct_quote_config.center_limit_bps:.4f} "
         f"taker_signal_limit={train_env.taker_signal_limit:.4f} "
         f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
         f"env_action={_market_env_action_tuple(bounded_probe_action)} "
@@ -4247,7 +4152,7 @@ def evaluate_market_making(
     maker_buy_markout_steps: List[float] = []
     maker_sell_markout_steps: List[float] = []
     if collect_vol_bucket_report:
-        bucket_cfg = _validate_baseline_quote_config(load_baseline_quote_config() if baseline_cfg is None else baseline_cfg)
+        bucket_cfg = (baseline_cfg if baseline_cfg is not None else _default_baseline_quote_config())
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -4649,7 +4554,6 @@ def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], 
         maker_rebate_bps=float(env_kwargs_common["maker_rebate_bps"]),
         taker_fee_bps=float(env_kwargs_common["taker_fee_bps"]),
         fill_tolerance=float(env_kwargs_common["fill_tolerance"]),
-        delta_bps_limit=float(env_kwargs_common["delta_bps_limit"]),
         inventory_penalty=float(env_kwargs_common["inventory_penalty"]),
         inv_soft_notional=float(env_kwargs_common["inv_soft_notional"]),
         lambda_inv=float(env_kwargs_common["lambda_inv"]),
@@ -4856,7 +4760,6 @@ else:
 
 
 def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, quote_cfg: BaselineQuoteConfig, baseline_alpha_calibration: BaselineAlphaCalibration, *, use_numba: Optional[bool] = None) -> Dict[str, Any]:
-    quote_cfg = _validate_baseline_quote_config(quote_cfg)
     kernel = _evaluate_prepared_baseline_fast_kernel_py
     backend = "python"
     allow_numba = _env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA) if use_numba is None else bool(use_numba)
@@ -4928,7 +4831,6 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
     batch = context.mm_rl_val_batch if eval_split == "val" else context.mm_rl_test_batch
     if fast_batch is None:
         raise ValueError("Fast baseline batch unavailable for parity check")
-    quote_cfg = _validate_baseline_quote_config(quote_cfg)
     env_metrics = evaluate_market_making(
         build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration),
         lambda _obs: (0.0, 0.0, 0.0, 0.0),
@@ -4952,20 +4854,25 @@ def build_baseline_eval_env(
     baseline_alpha_calibration: BaselineAlphaCalibration,
 ) -> MarketMakingEnv:
     _ = baseline_alpha_calibration
+    env_direct_cfg = _validate_direct_quote_config(
+        env_kwargs_common.get("direct_quote_config", load_direct_quote_config())
+    )
     direct_cfg = _validate_direct_quote_config(
         DirectQuoteConfig(
-            obs_spread_anchor_frac=float(baseline_quote_config.obs_spread_anchor_frac),
+            center_limit_bps=float(env_direct_cfg.center_limit_bps),
             spread_floor_bps=float(baseline_quote_config.spread_floor_bps),
             spread_cap_bps=float(baseline_quote_config.spread_cap_bps),
+            obs_spread_anchor_frac=float(baseline_quote_config.obs_spread_anchor_frac),
             skew_limit_bps=DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS,
             skew_fraction_limit=DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT,
+            taker_signal_limit=float(env_direct_cfg.taker_signal_limit),
         )
     )
     return MarketMakingEnv(
         batch,
         allow_taker=False,
         direct_quote_config=direct_cfg,
-        **env_kwargs_common,
+        **{k: v for k, v in env_kwargs_common.items() if k != "direct_quote_config"},
     )
 
 
@@ -5040,7 +4947,7 @@ def evaluate_prepared_baseline(
     context: PreparedBaselineContext,
     *,
     eval_split: str,
-    baseline_config: Optional[Dict[str, Any] | BaselineQuoteConfig] = None,
+    baseline_config: Optional[BaselineQuoteConfig] = None,
     fast_mode: Optional[bool] = None,
     use_numba: Optional[bool] = None,
 ) -> Dict[str, Any]:
@@ -5048,8 +4955,7 @@ def evaluate_prepared_baseline(
         raise ValueError(f"Unsupported baseline split '{eval_split}'")
     batch = context.mm_rl_val_batch if eval_split == "val" else context.mm_rl_test_batch
     fast_batch = context.fast_rl_val_batch if eval_split == "val" else context.fast_rl_test_batch
-    quote_cfg = _resolve_baseline_quote_config(baseline_config)
-    quote_cfg = load_baseline_quote_config() if quote_cfg is None else quote_cfg
+    quote_cfg = _default_baseline_quote_config() if baseline_config is None else baseline_config
     fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
     baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba) if fast_enabled and fast_batch is not None else evaluate_market_making(build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration), lambda _obs: (0.0, 0.0, 0.0, 0.0), collect_vol_bucket_report=True, baseline_cfg=quote_cfg)
     return {"cmssl_test": context.cmssl_test_metrics, "mm_baseline": baseline_metrics, "mm_rl": None, "mm_run_context": {"run_mode": "baseline", "baseline_eval_split": eval_split, "baseline_eval_semantics": f"rl_week3_{eval_split}", "prepared_context_reuse": True, "joined_rl_rows": context.joined_rl_rows, "joined_eval_rows": context.joined_eval_rows, "cmssl_batch_size": context.cmssl_batch_size, "fast_baseline_mode": bool(fast_enabled and fast_batch is not None)}}
@@ -5208,7 +5114,7 @@ def run_pipeline(
         baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
-    default_baseline_quote_cfg = load_baseline_quote_config()
+    default_baseline_quote_cfg = _default_baseline_quote_config()
     baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
     baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
     baseline_final_env = build_baseline_eval_env(mm_eval_full_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
