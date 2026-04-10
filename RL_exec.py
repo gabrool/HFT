@@ -486,8 +486,8 @@ def _maybe_compile_module(module: torch.nn.Module, *, enabled: bool, label: str)
 
 
 def _resolve_run_mode(default: str = "train") -> str:
-    """Resolve run mode: train, eval, train_eval, or baseline-only evaluation."""
-    accepted_modes = {"baseline", "train", "eval", "train_eval"}
+    """Resolve run mode: train, eval, or train_eval."""
+    accepted_modes = {"train", "eval", "train_eval"}
     mode = os.environ.get("BYBIT_MM_RUN_MODE", default).strip().lower()
     if mode not in accepted_modes:
         accepted = ", ".join(sorted(accepted_modes))
@@ -495,27 +495,8 @@ def _resolve_run_mode(default: str = "train") -> str:
     return mode
 
 
-def _resolve_baseline_eval_split(default: str = "val") -> str:
-    accepted_splits = {"val", "test"}
-    split_name = os.environ.get("BYBIT_MM_BASELINE_EVAL_SPLIT", default).strip().lower()
-    if split_name not in accepted_splits:
-        accepted = ", ".join(sorted(accepted_splits))
-        raise ValueError(
-            f"Invalid BYBIT_MM_BASELINE_EVAL_SPLIT='{split_name}'. Accepted values: {accepted}"
-        )
-    return split_name
 
 
-def _select_baseline_env(
-    split_name: str,
-    mm_val_env: "MarketMakingEnv",
-    mm_test_env: "MarketMakingEnv",
-) -> Tuple[str, "MarketMakingEnv"]:
-    if split_name == "val":
-        return "val", mm_val_env
-    if split_name == "test":
-        return "test", mm_test_env
-    raise ValueError(f"Unsupported baseline split '{split_name}'")
 
 
 def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
@@ -734,68 +715,6 @@ class BaselineAlphaCalibration:
     fit_count_by_horizon: np.ndarray
     horizons_ms: np.ndarray
     diagnostics: Dict[str, Any]
-
-
-@dataclass(frozen=True)
-class PreparedFastBaselineBatch:
-    split_name: str
-    rows: int
-    initial_cash: float
-    fill_size: float
-    maker_rebate_bps: float
-    taker_fee_bps: float
-    fill_tolerance: float
-    inventory_penalty: float
-    inv_soft_notional: float
-    lambda_inv: float
-    lambda_turn: float
-    max_inventory_notional: float
-    hard_max_inventory_notional: float
-    fill_ema_alpha: float
-    best_bid: np.ndarray
-    best_ask: np.ndarray
-    best_bid_next: np.ndarray
-    best_ask_next: np.ndarray
-    best_bid_prev: np.ndarray
-    best_ask_prev: np.ndarray
-    mid: np.ndarray
-    mid_next: np.ndarray
-    observed_spread_bps: np.ndarray
-    decision_ts: Optional[np.ndarray]
-    dir_logits_by_horizon: np.ndarray
-    p_up_by_horizon: np.ndarray
-    direction_confidence_by_horizon: np.ndarray
-    future_ret_by_horizon: np.ndarray
-    p250: np.ndarray
-    p500: np.ndarray
-    p1000: np.ndarray
-    vol_short: np.ndarray
-    vol_long: np.ndarray
-
-
-@dataclass(frozen=True)
-class PreparedBaselineContext:
-    out_root: str
-    ckpt_path: str
-    device: str
-    meta: Dict[str, Any]
-    cmssl_test_split: Dict[str, Any]
-    rl_val_split: Dict[str, Any]
-    rl_test_split: Dict[str, Any]
-    eval_full_split: Dict[str, Any]
-    cmssl_test_metrics: Dict[str, Any]
-    joined_rl_rows: int
-    joined_eval_rows: int
-    mm_rl_val_batch: "MarketMakingBatch"
-    mm_rl_test_batch: "MarketMakingBatch"
-    fast_rl_val_batch: Optional[PreparedFastBaselineBatch]
-    fast_rl_test_batch: Optional[PreparedFastBaselineBatch]
-    fast_rl_train_batch: PreparedFastBaselineBatch
-    fast_eval_full_batch: PreparedFastBaselineBatch
-    baseline_alpha_calibration: BaselineAlphaCalibration
-    env_kwargs_common: Dict[str, Any]
-    run_config: Dict[str, Any]
-    cmssl_batch_size: int
 
 
 def load_direct_quote_config() -> DirectQuoteConfig:
@@ -4140,7 +4059,6 @@ def evaluate_market_making(
     policy_fn,
     *,
     collect_vol_bucket_report: bool = False,
-    baseline_cfg: Optional[BaselineQuoteConfig] = None,
 ) -> Dict[str, Any]:
     bucket_cfg = None
     sigma_bps_selected_steps: List[float] = []
@@ -4152,7 +4070,7 @@ def evaluate_market_making(
     maker_buy_markout_steps: List[float] = []
     maker_sell_markout_steps: List[float] = []
     if collect_vol_bucket_report:
-        bucket_cfg = (baseline_cfg if baseline_cfg is not None else _default_baseline_quote_config())
+        bucket_cfg = _default_baseline_quote_config()
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -4458,507 +4376,9 @@ def load_market_policy(
     return ppo_model.policy_net
 
 
-def _fit_baseline_alpha_calibration(
-    prepared_batch: PreparedFastBaselineBatch,
-    horizons_ms: Sequence[int],
-    *,
-    eps: float = 1e-12,
-) -> BaselineAlphaCalibration:
-    score_by_horizon = np.asarray(2.0 * prepared_batch.p_up_by_horizon - 1.0, dtype=np.float64)
-    target_bps_by_horizon = np.asarray(prepared_batch.future_ret_by_horizon, dtype=np.float64) * 1e4
-    if score_by_horizon.shape != target_bps_by_horizon.shape:
-        raise ValueError(
-            "Calibration inputs must have matching score/target shapes: "
-            f"score_shape={score_by_horizon.shape} target_shape={target_bps_by_horizon.shape}"
-        )
-    num_h = score_by_horizon.shape[1]
-    slope_by_horizon = np.zeros(num_h, dtype=np.float64)
-    winsor_lower = np.zeros(num_h, dtype=np.float64)
-    winsor_upper = np.zeros(num_h, dtype=np.float64)
-    fit_count = np.zeros(num_h, dtype=np.int64)
-    score_mean = np.zeros(num_h, dtype=np.float64)
-    target_mean_bps = np.zeros(num_h, dtype=np.float64)
-    target_std_bps = np.zeros(num_h, dtype=np.float64)
-    winsorized_fraction = np.zeros(num_h, dtype=np.float64)
-    for h in range(num_h):
-        score_h = score_by_horizon[:, h]
-        target_h = target_bps_by_horizon[:, h]
-        valid = np.isfinite(score_h) & np.isfinite(target_h)
-        fit_count[h] = int(np.sum(valid))
-        if fit_count[h] == 0:
-            continue
-        score_valid = score_h[valid]
-        target_valid = target_h[valid]
-        lower = float(np.quantile(target_valid, 0.01))
-        upper = float(np.quantile(target_valid, 0.99))
-        winsor_lower[h] = lower
-        winsor_upper[h] = upper
-        target_winsor = np.clip(target_valid, lower, upper)
-        denom = float(np.sum(score_valid * score_valid))
-        slope_by_horizon[h] = float(np.sum(score_valid * target_winsor) / max(denom, eps))
-        score_mean[h] = float(np.mean(score_valid))
-        target_mean_bps[h] = float(np.mean(target_winsor))
-        target_std_bps[h] = float(np.std(target_winsor))
-        winsorized_fraction[h] = float(np.mean(target_valid != target_winsor))
-    return BaselineAlphaCalibration(
-        score_to_bps_slope_by_horizon=slope_by_horizon,
-        winsor_lower_bps_by_horizon=winsor_lower,
-        winsor_upper_bps_by_horizon=winsor_upper,
-        fit_count_by_horizon=fit_count,
-        horizons_ms=np.asarray(horizons_ms, dtype=np.int64),
-        diagnostics={
-            "score_mean_by_horizon": score_mean,
-            "target_mean_bps_by_horizon": target_mean_bps,
-            "target_std_bps_by_horizon": target_std_bps,
-            "winsorized_fraction_by_horizon": winsorized_fraction,
-            "eps": float(eps),
-            "fit_split": prepared_batch.split_name,
-        },
-    )
 
 
-def prepare_fast_baseline_batch(batch: MarketMakingBatch, meta: Dict[str, Any], *, env_kwargs_common: Dict[str, Any], split_name: str) -> PreparedFastBaselineBatch:
-    """Precompute baseline-only arrays once so each trial only runs quote math + fills."""
-    num_h = _infer_num_horizons(batch.features.shape[-1])
-    horizons_ms = _validate_fixed_cmssl_horizons(_normalize_horizons(num_h, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS)))
-    layout = _joined_feature_layout(num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
-    dir_logits_by_horizon = np.asarray(batch.features[:, layout["dir_logits"]], dtype=np.float64)
-    p_up_by_horizon = np.asarray(batch.features[:, layout["p_up"]], dtype=np.float64)
-    direction_confidence_by_horizon = np.abs(2.0 * p_up_by_horizon - 1.0)
-    if batch.future_ret_by_horizon is None:
-        raise ValueError("MarketMakingBatch.future_ret_by_horizon is required for baseline calibration.")
-    future_ret_by_horizon = np.asarray(batch.future_ret_by_horizon, dtype=np.float64)
-    if future_ret_by_horizon.shape != p_up_by_horizon.shape:
-        raise ValueError(
-            "Future-return horizon target matrix must align with model horizon outputs: "
-            f"targets_shape={future_ret_by_horizon.shape} p_up_shape={p_up_by_horizon.shape}"
-        )
-    snapshot_block = np.asarray(batch.features[:, layout["snapshots"]], dtype=np.float64)
-    spread_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
-    observed_spread_bps = snapshot_block[:, spread_idx]
-    vol_short = snapshot_block[:, RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")]
-    vol_long = snapshot_block[:, RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")]
-    best_bid = np.asarray(batch.best_bid, dtype=np.float64)
-    best_ask = np.asarray(batch.best_ask, dtype=np.float64)
-    mid = 0.5 * (best_bid + best_ask)
-    best_bid_next = np.concatenate([best_bid[1:], best_bid[-1:]])
-    best_ask_next = np.concatenate([best_ask[1:], best_ask[-1:]])
-    best_bid_prev = np.concatenate([best_bid[:1], best_bid[:-1]])
-    best_ask_prev = np.concatenate([best_ask[:1], best_ask[:-1]])
-    mid_next = np.concatenate([mid[1:], mid[-1:]])
-    return PreparedFastBaselineBatch(
-        split_name=split_name,
-        rows=int(batch.features.shape[0]),
-        initial_cash=float(_env_float("BYBIT_MM_INITIAL_CASH", DEFAULT_MM_INITIAL_CASH)),
-        fill_size=float(env_kwargs_common["fill_size"]),
-        maker_rebate_bps=float(env_kwargs_common["maker_rebate_bps"]),
-        taker_fee_bps=float(env_kwargs_common["taker_fee_bps"]),
-        fill_tolerance=float(env_kwargs_common["fill_tolerance"]),
-        inventory_penalty=float(env_kwargs_common["inventory_penalty"]),
-        inv_soft_notional=float(env_kwargs_common["inv_soft_notional"]),
-        lambda_inv=float(env_kwargs_common["lambda_inv"]),
-        lambda_turn=float(env_kwargs_common["lambda_turn"]),
-        max_inventory_notional=float(env_kwargs_common["max_inventory_notional"]),
-        hard_max_inventory_notional=float(env_kwargs_common["hard_max_inventory_notional"]),
-        fill_ema_alpha=2.0 / float(max(1, _env_int("BYBIT_MM_FILL_EMA_WINDOW_STEPS", DEFAULT_MM_FILL_EMA_WINDOW_STEPS)) + 1.0),
-        best_bid=best_bid,
-        best_ask=best_ask,
-        best_bid_next=best_bid_next,
-        best_ask_next=best_ask_next,
-        best_bid_prev=best_bid_prev,
-        best_ask_prev=best_ask_prev,
-        mid=mid,
-        mid_next=mid_next,
-        observed_spread_bps=observed_spread_bps,
-        decision_ts=None if batch.decision_ts is None else np.asarray(batch.decision_ts, dtype=np.int64),
-        dir_logits_by_horizon=dir_logits_by_horizon,
-        p_up_by_horizon=p_up_by_horizon,
-        direction_confidence_by_horizon=direction_confidence_by_horizon,
-        future_ret_by_horizon=future_ret_by_horizon,
-        p250=p_up_by_horizon[:, _resolve_horizon_index(250, horizons_ms, label="p250")],
-        p500=p_up_by_horizon[:, _resolve_horizon_index(500, horizons_ms, label="p500")],
-        p1000=p_up_by_horizon[:, _resolve_horizon_index(1000, horizons_ms, label="p1000")],
-        vol_short=vol_short,
-        vol_long=vol_long,
-    )
 
-def _fast_kernel_impl(best_bid, best_ask, best_bid_next, best_ask_next, best_bid_prev, best_ask_prev, mid, mid_next, observed_spread_bps, vol_short, vol_long, p250, p500, p1000, decision_ts, initial_cash, fill_size, maker_rebate_bps, fill_tolerance, inventory_penalty, inv_soft_notional, lambda_inv, lambda_turn, max_inventory_notional, hard_max_inventory_notional, base_half_spread_bps, obs_spread_anchor_frac, alpha_center_scale, inventory_center_scale, vol_width_scale, uncertainty_width_scale, inventory_side_widen_scale, spread_floor_bps, spread_cap_bps, inv_ref_notional, p250_weight, p500_weight, p1000_weight, score_to_bps_slope_250, score_to_bps_slope_500, score_to_bps_slope_1000):
-    steps = len(mid)
-    equity_curve = np.zeros(steps, dtype=np.float64)
-    inventory_curve = np.zeros(steps, dtype=np.float64)
-    delta_equity_curve = np.zeros(steps, dtype=np.float64)
-    reward_curve = np.zeros(steps, dtype=np.float64)
-    maker_buy_curve = np.zeros(steps, dtype=np.float64)
-    maker_sell_curve = np.zeros(steps, dtype=np.float64)
-    turnover_notional_curve = np.zeros(steps, dtype=np.float64)
-    maker_buy_markout_curve = np.zeros(steps, dtype=np.float64)
-    maker_sell_markout_curve = np.zeros(steps, dtype=np.float64)
-    cash = initial_cash
-    inventory = 0.0
-    prev_equity = initial_cash
-    total_reward = 0.0
-    total_delta_equity = 0.0
-    inventory_penalty_total = 0.0
-    total_turnover_penalty = 0.0
-    total_maker_buy_markout = 0.0
-    total_maker_sell_markout = 0.0
-    turnover_qty = 0.0
-    turnover_notional = 0.0
-    maker_rebate_total = 0.0
-    maker_fill_count = 0
-    maker_buy_fills = 0
-    maker_sell_fills = 0
-    maker_buy_clipped_steps = 0
-    maker_sell_clipped_steps = 0
-    inventory_abs_sum = 0.0
-    inventory_abs_max = 0.0
-    for idx in range(steps):
-        mid_i = mid[idx]
-        score_250 = 2.0 * p250[idx] - 1.0
-        score_500 = 2.0 * p500[idx] - 1.0
-        score_1000 = 2.0 * p1000[idx] - 1.0
-        alpha_center_bps = alpha_center_scale * (
-            p250_weight * score_to_bps_slope_250 * score_250
-            + p500_weight * score_to_bps_slope_500 * score_500
-            + p1000_weight * score_to_bps_slope_1000 * score_1000
-        )
-        observed_spread_bps_i = observed_spread_bps[idx]
-        obs_anchor_bps = 0.0
-        if np.isfinite(observed_spread_bps_i) and observed_spread_bps_i > 0.0:
-            obs_anchor_bps = max(0.0, obs_spread_anchor_frac * observed_spread_bps_i)
-        sigma_bps = 1e4 * max(0.0, vol_short[idx], vol_long[idx])
-        disagreement = max(abs(p250[idx] - p500[idx]), abs(p500[idx] - p1000[idx]), abs(p250[idx] - p1000[idx]))
-        uncertainty_ref_bps = max(base_half_spread_bps, obs_anchor_bps, sigma_bps, spread_floor_bps)
-        base_component_bps = max(base_half_spread_bps, obs_anchor_bps, spread_floor_bps)
-        vol_width_bps = vol_width_scale * sigma_bps
-        uncertainty_width_bps = uncertainty_width_scale * disagreement * uncertainty_ref_bps
-        half_spread_bps = base_component_bps + vol_width_bps + uncertainty_width_bps
-        if half_spread_bps < spread_floor_bps:
-            half_spread_bps = spread_floor_bps
-        if half_spread_bps > spread_cap_bps:
-            half_spread_bps = spread_cap_bps
-        inv_notional = inventory * mid_i
-        inventory_center_bps = inventory_center_scale * (inv_notional / inv_ref_notional)
-        reservation_bps = alpha_center_bps - inventory_center_bps
-        inv_soft_notional_eps = 1e-12
-        soft_ratio = abs(inv_notional) / max(inv_soft_notional, inv_soft_notional_eps)
-        overload = max(0.0, soft_ratio - 1.0)
-        inventory_side_extra_bps = (
-            inventory_side_widen_scale * overload * max(half_spread_bps, 1.0)
-        )
-        bid_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional > 0.0 else 0.0)
-        ask_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional < 0.0 else 0.0)
-        bid_enabled = inv_notional < max_inventory_notional
-        ask_enabled = inv_notional > -max_inventory_notional
-        bid = np.nan
-        ask = np.nan
-        if bid_enabled:
-            bid = mid_i + mid_i * (reservation_bps - bid_half_spread_bps) * 1e-4
-        if ask_enabled:
-            ask = mid_i + mid_i * (reservation_bps + ask_half_spread_bps) * 1e-4
-        eps = max(1e-8, mid_i * 1e-6)
-        curr_best_bid = best_bid[idx]
-        curr_best_ask = best_ask[idx]
-        if bid_enabled and bid > curr_best_ask - eps:
-            bid = curr_best_ask - eps
-        if ask_enabled and ask < curr_best_bid + eps:
-            ask = curr_best_bid + eps
-        if bid_enabled and ask_enabled and bid >= ask:
-            bid = curr_best_bid
-            ask = curr_best_ask
-        mid_cap = mid_next[idx]
-        cap_qty = hard_max_inventory_notional / max(mid_cap, 1e-12)
-        buy_fill = 0.0
-        sell_fill = 0.0
-        buy_clip = 0.0
-        sell_clip = 0.0
-        if bid_enabled and best_ask_next[idx] <= bid + fill_tolerance:
-            room = max(0.0, cap_qty - inventory)
-            buy_fill = min(fill_size, room)
-            buy_clip = fill_size - buy_fill
-            cash -= bid * buy_fill
-            inventory += buy_fill
-        if ask_enabled and best_bid_next[idx] >= ask - fill_tolerance:
-            room = max(0.0, cap_qty + inventory)
-            sell_fill = min(fill_size, room)
-            sell_clip = fill_size - sell_fill
-            cash += ask * sell_fill
-            inventory -= sell_fill
-        touch_tolerance = max(fill_tolerance, 1e-9)
-        if bid_enabled and buy_fill == 0.0 and abs(bid - best_bid_prev[idx]) <= touch_tolerance and best_bid_next[idx] < best_bid_prev[idx] - 1e-9:
-            room = max(0.0, cap_qty - inventory)
-            buy_fill = min(fill_size, room)
-            buy_clip = fill_size - buy_fill
-            cash -= bid * buy_fill
-            inventory += buy_fill
-        if ask_enabled and sell_fill == 0.0 and abs(ask - best_ask_prev[idx]) <= touch_tolerance and best_ask_next[idx] > best_ask_prev[idx] + 1e-9:
-            room = max(0.0, cap_qty + inventory)
-            sell_fill = min(fill_size, room)
-            sell_clip = fill_size - sell_fill
-            cash += ask * sell_fill
-            inventory -= sell_fill
-        maker_buy_notional = buy_fill * bid if buy_fill > 0.0 and np.isfinite(bid) else 0.0
-        maker_sell_notional = sell_fill * ask if sell_fill > 0.0 and np.isfinite(ask) else 0.0
-        maker_notional = maker_buy_notional + maker_sell_notional
-        rebate = maker_notional * maker_rebate_bps * 1e-4
-        cash += rebate
-        equity = cash + inventory * mid_next[idx]
-        delta_equity = equity - prev_equity
-        inv_abs_notional = abs(inventory * mid_next[idx])
-        penalty = 0.0
-        if inv_abs_notional > max_inventory_notional:
-            penalty += inventory_penalty * (inv_abs_notional - max_inventory_notional)
-        excess_notional = max(0.0, inv_abs_notional - inv_soft_notional)
-        inv_penalty = lambda_inv * (excess_notional / inv_soft_notional) ** 2 if inv_soft_notional > 0.0 else 0.0
-        turnover_penalty = lambda_turn * (buy_fill + sell_fill)
-        reward = delta_equity - max(penalty, inv_penalty) - turnover_penalty
-        equity_curve[idx] = equity
-        inventory_curve[idx] = inventory
-        delta_equity_curve[idx] = delta_equity
-        reward_curve[idx] = reward
-        maker_buy_curve[idx] = buy_fill
-        maker_sell_curve[idx] = sell_fill
-        step_turnover_notional = maker_notional
-        turnover_notional_curve[idx] = step_turnover_notional
-        maker_buy_markout = (mid_next[idx] - bid) * buy_fill if buy_fill > 0.0 and np.isfinite(bid) else 0.0
-        maker_sell_markout = (ask - mid_next[idx]) * sell_fill if sell_fill > 0.0 and np.isfinite(ask) else 0.0
-        maker_buy_markout_curve[idx] = maker_buy_markout
-        maker_sell_markout_curve[idx] = maker_sell_markout
-        turnover_qty += buy_fill + sell_fill
-        turnover_notional += step_turnover_notional
-        maker_rebate_total += rebate
-        maker_fill_count += (1 if buy_fill > 0.0 else 0) + (1 if sell_fill > 0.0 else 0)
-        maker_buy_fills += 1 if buy_fill > 0.0 else 0
-        maker_sell_fills += 1 if sell_fill > 0.0 else 0
-        maker_buy_clipped_steps += 1 if buy_clip > 0.0 else 0
-        maker_sell_clipped_steps += 1 if sell_clip > 0.0 else 0
-        total_reward += reward
-        total_delta_equity += delta_equity
-        inventory_penalty_total += max(penalty, inv_penalty)
-        total_turnover_penalty += turnover_penalty
-        total_maker_buy_markout += maker_buy_markout
-        total_maker_sell_markout += maker_sell_markout
-        inventory_abs_sum += inv_abs_notional
-        if inv_abs_notional > inventory_abs_max:
-            inventory_abs_max = inv_abs_notional
-        prev_equity = equity
-    step_ms = float(RAW_SNAPSHOT_EXPECTED_STEP_MS)
-    diff_count = 0
-    if decision_ts is not None and len(decision_ts) >= 2:
-        diffs = np.diff(decision_ts)
-        positive = diffs[diffs > 0]
-        if len(positive) > 0:
-            step_ms = float(np.median(positive))
-            diff_count = int(len(positive))
-    return (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count)
-
-_evaluate_prepared_baseline_fast_kernel_py = _fast_kernel_impl
-if HAS_NUMBA:
-    _evaluate_prepared_baseline_fast_kernel_numba = numba.njit(cache=True)(_fast_kernel_impl)
-else:
-    _evaluate_prepared_baseline_fast_kernel_numba = None
-
-
-def evaluate_prepared_baseline_fast(prepared_batch: PreparedFastBaselineBatch, quote_cfg: BaselineQuoteConfig, baseline_alpha_calibration: BaselineAlphaCalibration, *, use_numba: Optional[bool] = None) -> Dict[str, Any]:
-    kernel = _evaluate_prepared_baseline_fast_kernel_py
-    backend = "python"
-    allow_numba = _env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA) if use_numba is None else bool(use_numba)
-    if allow_numba and _evaluate_prepared_baseline_fast_kernel_numba is not None:
-        kernel = _evaluate_prepared_baseline_fast_kernel_numba
-        backend = "numba"
-    print(f"[baseline fast] backend={backend} split={prepared_batch.split_name}")
-    # Pass the precomputed previous-book arrays directly; shifted current arrays break touch/move-away parity.
-    result = kernel(
-        prepared_batch.best_bid[:-1], prepared_batch.best_ask[:-1], prepared_batch.best_bid_next[:-1], prepared_batch.best_ask_next[:-1], prepared_batch.best_bid_prev[:-1], prepared_batch.best_ask_prev[:-1], prepared_batch.mid[:-1], prepared_batch.mid_next[:-1], prepared_batch.observed_spread_bps[:-1], prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1], prepared_batch.p250[:-1], prepared_batch.p500[:-1], prepared_batch.p1000[:-1], prepared_batch.decision_ts, prepared_batch.initial_cash, prepared_batch.fill_size, prepared_batch.maker_rebate_bps, prepared_batch.fill_tolerance, prepared_batch.inventory_penalty, prepared_batch.inv_soft_notional, prepared_batch.lambda_inv, prepared_batch.lambda_turn, prepared_batch.max_inventory_notional, prepared_batch.hard_max_inventory_notional, quote_cfg.base_half_spread_bps, quote_cfg.obs_spread_anchor_frac, quote_cfg.alpha_center_scale, quote_cfg.inventory_center_scale, quote_cfg.vol_width_scale, quote_cfg.uncertainty_width_scale, quote_cfg.inventory_side_widen_scale, quote_cfg.spread_floor_bps, quote_cfg.spread_cap_bps, quote_cfg.inv_ref_notional, quote_cfg.p250_weight, quote_cfg.p500_weight, quote_cfg.p1000_weight, baseline_alpha_calibration.score_to_bps_slope_by_horizon[_resolve_horizon_index(250, baseline_alpha_calibration.horizons_ms, label="p250")], baseline_alpha_calibration.score_to_bps_slope_by_horizon[_resolve_horizon_index(500, baseline_alpha_calibration.horizons_ms, label="p500")], baseline_alpha_calibration.score_to_bps_slope_by_horizon[_resolve_horizon_index(1000, baseline_alpha_calibration.horizons_ms, label="p1000")],
-    )
-    (equity_curve, inventory_curve, delta_equity_curve, reward_curve, maker_buy_curve, maker_sell_curve, turnover_notional_curve, maker_buy_markout_curve, maker_sell_markout_curve, turnover_qty, turnover_notional, maker_rebate_total, maker_fill_count, maker_buy_fills, maker_sell_fills, total_reward, total_delta_equity, inventory_penalty_total, total_turnover_penalty, total_maker_buy_markout, total_maker_sell_markout, maker_buy_clipped_steps, maker_sell_clipped_steps, inventory_abs_sum, inventory_abs_max, step_ms, diff_count) = result
-    initial_equity = prepared_batch.initial_cash
-    prev_equity = np.concatenate([[initial_equity], equity_curve[:-1]]) if equity_curve.size else np.empty(0, dtype=np.float64)
-    returns = np.divide(equity_curve, prev_equity, out=np.zeros_like(equity_curve), where=prev_equity != 0) - 1.0 if equity_curve.size else np.empty(0, dtype=np.float64)
-    steps = int(equity_curve.size)
-    steps_per_year = _steps_per_year_from_snapshot_ms(step_ms)
-    sharpe = compute_sharpe(returns, steps_per_year)
-    ts_ms = prepared_batch.decision_ts[1: steps + 1] if prepared_batch.decision_ts is not None and prepared_batch.decision_ts.size >= steps + 1 else np.arange(steps, dtype=np.int64) * int(max(step_ms, 1.0))
-    capital_returns_5m = aggregate_returns_by_time(ts_ms, returns, 5 * 60 * 1000)
-    capital_returns_1h = aggregate_returns_by_time(ts_ms, returns, 60 * 60 * 1000)
-    sharpe_5m = compute_sharpe(capital_returns_5m, 365.0 * 24.0 * 12.0)
-    sharpe_1h = compute_sharpe(capital_returns_1h, 365.0 * 24.0)
-    sortino_5m = compute_sortino(capital_returns_5m, 365.0 * 24.0 * 12.0)
-    sortino_1h = compute_sortino(capital_returns_1h, 365.0 * 24.0)
-    max_drawdown = compute_max_drawdown(equity_curve)
-    final_equity = float(equity_curve[-1]) if equity_curve.size else float(initial_equity)
-    net_pnl = final_equity - initial_equity
-    net_pnl_pct = net_pnl / max(initial_equity, 1e-12)
-    gross_pnl = net_pnl - maker_rebate_total
-    inventory_dist = _inventory_distribution(inventory_curve.astype(np.float32))
-    maker_opportunities = 2 * steps
-    maker_fill_rate = float(maker_fill_count / maker_opportunities) if maker_opportunities > 0 else 0.0
-    ending_inventory_qty = float(inventory_curve[-1]) if inventory_curve.size else 0.0
-    ending_inventory_notional = float(abs(ending_inventory_qty * (prepared_batch.mid_next[-2] if steps > 0 else 0.0)))
-    metrics = {
-        "initial_equity": float(initial_equity), "final_equity": float(final_equity), "net_pnl": float(net_pnl), "net_pnl_pct": float(net_pnl_pct),
-        "gross_pnl": float(gross_pnl), "gross_pnl_pct": float(gross_pnl / max(initial_equity, 1e-12)), "equity_curve": equity_curve.astype(np.float32), "pnl_curve": (equity_curve - initial_equity).astype(np.float32),
-        "sharpe": float(sharpe), "sharpe_5m": float(sharpe_5m), "sharpe_1h": float(sharpe_1h), "sortino_5m": float(sortino_5m), "sortino_1h": float(sortino_1h),
-        "max_drawdown": float(max_drawdown), "max_dd": float(max_drawdown), "turnover_qty": float(turnover_qty), "turnover_notional": float(turnover_notional), "maker_turnover_notional": float(turnover_notional), "maker_turnover_share": 1.0 if turnover_notional > 0 else 0.0,
-        "maker_fill_rate": maker_fill_rate, "maker_fill_count": int(maker_fill_count), "maker_opportunities": int(maker_opportunities), "maker_buy_fills": int(maker_buy_fills), "maker_sell_fills": int(maker_sell_fills),
-        "taker_usage_frequency": 0.0, "taker_volume_share": 0.0, "taker_steps": 0, "steps": steps,
-        "gross_taker_fees_paid": 0.0, "gross_maker_rebates_earned": float(maker_rebate_total), "net_fee_cost": float(-maker_rebate_total), "net_fee_bps_on_turnover": float(-1e4 * maker_rebate_total / turnover_notional) if turnover_notional > 0 else 0.0, "net_fee_pct_initial_equity": float(-maker_rebate_total / max(initial_equity, 1e-12)), "fee_drag": float(-maker_rebate_total / turnover_notional) if turnover_notional > 0 else 0.0,
-        "ending_inventory_qty": ending_inventory_qty, "ending_inventory_notional": ending_inventory_notional, "total_reward": float(total_reward), "total_delta_equity": float(total_delta_equity), "inventory_penalty_total": float(inventory_penalty_total), "total_turnover_penalty": float(total_turnover_penalty),
-        "total_maker_buy_markout": float(total_maker_buy_markout), "total_maker_sell_markout": float(total_maker_sell_markout), "maker_buy_clipped_steps": int(maker_buy_clipped_steps), "maker_sell_clipped_steps": int(maker_sell_clipped_steps), "taker_buy_clipped_steps": 0, "taker_sell_clipped_steps": 0,
-        "inventory_mean_abs_notional": float(inventory_abs_sum / steps) if steps > 0 else 0.0, "inventory_max_abs_notional": float(inventory_abs_max), "inventory_distribution": inventory_dist,
-        "cadence": {"step_ms": float(step_ms), "steps_per_year": float(steps_per_year), "source": "decision_ts_median_diff" if diff_count > 0 else "env_var_fallback", "diff_count": int(diff_count), "timestamp_source": "decision_ts" if prepared_batch.decision_ts is not None else "synthetic_from_cadence"},
-    }
-    metrics.update(
-        build_vol_bucket_report(
-            sigma_bps_selected=np.asarray(1e4 * np.maximum(0.0, np.maximum(prepared_batch.vol_short[:-1], prepared_batch.vol_long[:-1])), dtype=np.float64),
-            delta_equity_per_step=np.asarray(delta_equity_curve, dtype=np.float64),
-            reward_per_step=np.asarray(reward_curve, dtype=np.float64),
-            maker_buy_per_step=np.asarray(maker_buy_curve, dtype=np.float64),
-            maker_sell_per_step=np.asarray(maker_sell_curve, dtype=np.float64),
-            turnover_notional_per_step=np.asarray(turnover_notional_curve, dtype=np.float64),
-            maker_buy_markout_per_step=np.asarray(maker_buy_markout_curve, dtype=np.float64),
-            maker_sell_markout_per_step=np.asarray(maker_sell_markout_curve, dtype=np.float64),
-            initial_equity=float(initial_equity),
-        )
-    )
-    return metrics
-
-
-def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: str, quote_cfg: BaselineQuoteConfig, *, atol: float = 1e-9, rtol: float = 1e-6) -> None:
-    if eval_split not in {"val", "test"}:
-        raise ValueError(f"Unsupported baseline split '{eval_split}'")
-    fast_batch = context.fast_rl_val_batch if eval_split == "val" else context.fast_rl_test_batch
-    batch = context.mm_rl_val_batch if eval_split == "val" else context.mm_rl_test_batch
-    if fast_batch is None:
-        raise ValueError("Fast baseline batch unavailable for parity check")
-    env_metrics = evaluate_market_making(
-        build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration),
-        lambda _obs: (0.0, 0.0, 0.0, 0.0),
-        collect_vol_bucket_report=True,
-        baseline_cfg=quote_cfg,
-    )
-    fast_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration)
-    for key in ("net_pnl_pct", "maker_fill_rate", "maker_fill_count", "maker_buy_fills", "maker_sell_fills", "turnover_notional", "inventory_mean_abs_notional", "inventory_max_abs_notional"):
-        lhs = env_metrics.get(key, env_metrics.get("max_drawdown") if key == "max_dd" else None)
-        rhs = fast_metrics.get(key)
-        if isinstance(lhs, (int, np.integer)) and lhs != rhs:
-            raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
-        if lhs is not None and rhs is not None and not np.isclose(float(lhs), float(rhs), atol=atol, rtol=rtol):
-            raise AssertionError(f"Baseline parity mismatch {key}: env={lhs} fast={rhs}")
-
-
-def build_baseline_eval_env(
-    batch: MarketMakingBatch,
-    env_kwargs_common: Dict[str, Any],
-    baseline_quote_config: BaselineQuoteConfig,
-    baseline_alpha_calibration: BaselineAlphaCalibration,
-) -> MarketMakingEnv:
-    _ = baseline_alpha_calibration
-    env_direct_cfg = _validate_direct_quote_config(
-        env_kwargs_common.get("direct_quote_config", load_direct_quote_config())
-    )
-    direct_cfg = _validate_direct_quote_config(
-        DirectQuoteConfig(
-            center_limit_bps=float(env_direct_cfg.center_limit_bps),
-            spread_floor_bps=float(baseline_quote_config.spread_floor_bps),
-            spread_cap_bps=float(baseline_quote_config.spread_cap_bps),
-            obs_spread_anchor_frac=float(baseline_quote_config.obs_spread_anchor_frac),
-            skew_limit_bps=DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS,
-            skew_fraction_limit=DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT,
-            taker_signal_limit=float(env_direct_cfg.taker_signal_limit),
-        )
-    )
-    return MarketMakingEnv(
-        batch,
-        allow_taker=False,
-        direct_quote_config=direct_cfg,
-        **{k: v for k, v in env_kwargs_common.items() if k != "direct_quote_config"},
-    )
-
-
-def prepare_baseline_context(
-    out_root: str,
-    ckpt_path: str,
-    device: str = "cuda",
-) -> PreparedBaselineContext:
-    print("[baseline prep] building shared CMSSL/RL/eval context")
-    meta = dict(load_global_meta(Path(out_root)))
-    cmssl_test_split = resolve_cmssl_test_split(out_root, meta)
-    rl_train_split = resolve_rl_train_split(out_root, meta)
-    rl_val_split = resolve_rl_val_split(out_root, meta)
-    rl_test_split = resolve_rl_test_split(out_root, meta)
-    eval_full_split = resolve_eval_full_split(out_root, meta)
-    report_cmssl_test_diagnostics(out_root, meta)
-    model, _meta = load_cmssl(out_root, ckpt_path, device=device)
-    cmssl_batch_size = _resolve_cmssl_batch_size()
-    rollout_storage = _resolve_rollout_storage("gpu")
-    run_config = {"cmssl_batch_size": cmssl_batch_size, "rollout_storage": rollout_storage, "compile_cmssl": _env_bool("BYBIT_MM_COMPILE_CMSSL", False), "compile_ppo": _env_bool("BYBIT_MM_COMPILE_PPO", False), "tf32": _env_bool("BYBIT_MM_ENABLE_TF32", False)}
-    joined_cmssl_test = build_joined_split(
-        out_root,
-        cmssl_test_split,
-        model,
-        meta,
-        device,
-        ckpt_path=ckpt_path,
-        split_label="cmssl_test",
-        batch_size=cmssl_batch_size,
-    )
-    num_h = len(meta.get("horizons_ms", []))
-    cmssl_test_metrics = report_cmssl_metrics(joined_cmssl_test["y"], {"dir_logits": joined_cmssl_test["features"][:, :num_h]})
-    week3_full_split = {"weeks": rl_train_split["weeks"], "start": rl_train_split["start"], "end": rl_test_split["end"]}
-    joined_rl_full = build_joined_split(
-        out_root,
-        week3_full_split,
-        model,
-        meta,
-        device,
-        ckpt_path=ckpt_path,
-        split_label="rl_week3_full",
-        batch_size=cmssl_batch_size,
-    )
-    joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
-    joined_rl_val = slice_joined_by_split(joined_rl_full, rl_val_split)
-    joined_rl_test = slice_joined_by_split(joined_rl_full, rl_test_split)
-    joined_eval_full = build_joined_split(
-        out_root,
-        eval_full_split,
-        model,
-        meta,
-        device,
-        ckpt_path=ckpt_path,
-        split_label="eval_full",
-        batch_size=cmssl_batch_size,
-    )
-    env_kwargs_common = resolve_market_env_common_kwargs_from_env()
-    mm_rl_train_batch = build_market_batch(joined_rl_train)
-    mm_rl_val_batch = build_market_batch(joined_rl_val)
-    mm_rl_test_batch = build_market_batch(joined_rl_test)
-    mm_eval_full_batch = build_market_batch(joined_eval_full)
-    fast_rl_train_batch = prepare_fast_baseline_batch(mm_rl_train_batch, meta, env_kwargs_common=env_kwargs_common, split_name="rl_train")
-    fast_rl_val_batch = prepare_fast_baseline_batch(mm_rl_val_batch, meta, env_kwargs_common=env_kwargs_common, split_name="rl_val")
-    fast_rl_test_batch = prepare_fast_baseline_batch(mm_rl_test_batch, meta, env_kwargs_common=env_kwargs_common, split_name="rl_test")
-    fast_eval_full_batch = prepare_fast_baseline_batch(mm_eval_full_batch, meta, env_kwargs_common=env_kwargs_common, split_name="eval_full")
-    baseline_alpha_calibration = _fit_baseline_alpha_calibration(fast_rl_train_batch, meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS))
-    meta["baseline_alpha_calibration"] = {"horizons_ms": baseline_alpha_calibration.horizons_ms.astype(int).tolist(), "score_to_bps_slope_by_horizon": baseline_alpha_calibration.score_to_bps_slope_by_horizon.tolist(), "winsor_lower_bps_by_horizon": baseline_alpha_calibration.winsor_lower_bps_by_horizon.tolist(), "winsor_upper_bps_by_horizon": baseline_alpha_calibration.winsor_upper_bps_by_horizon.tolist(), "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(), "diagnostics": _summarize_for_log(baseline_alpha_calibration.diagnostics)}
-    return PreparedBaselineContext(out_root=str(out_root), ckpt_path=str(ckpt_path), device=str(device), meta=meta, cmssl_test_split=cmssl_test_split, rl_val_split=rl_val_split, rl_test_split=rl_test_split, eval_full_split=eval_full_split, cmssl_test_metrics=cmssl_test_metrics, joined_rl_rows=int(joined_rl_full["features"].shape[0]), joined_eval_rows=int(joined_eval_full["features"].shape[0]), mm_rl_val_batch=mm_rl_val_batch, mm_rl_test_batch=mm_rl_test_batch, fast_rl_val_batch=fast_rl_val_batch, fast_rl_test_batch=fast_rl_test_batch, fast_rl_train_batch=fast_rl_train_batch, fast_eval_full_batch=fast_eval_full_batch, baseline_alpha_calibration=baseline_alpha_calibration, env_kwargs_common=env_kwargs_common, run_config=run_config, cmssl_batch_size=cmssl_batch_size)
-
-
-def evaluate_prepared_baseline(
-    context: PreparedBaselineContext,
-    *,
-    eval_split: str,
-    baseline_config: Optional[BaselineQuoteConfig] = None,
-    fast_mode: Optional[bool] = None,
-    use_numba: Optional[bool] = None,
-) -> Dict[str, Any]:
-    if eval_split not in {"val", "test"}:
-        raise ValueError(f"Unsupported baseline split '{eval_split}'")
-    batch = context.mm_rl_val_batch if eval_split == "val" else context.mm_rl_test_batch
-    fast_batch = context.fast_rl_val_batch if eval_split == "val" else context.fast_rl_test_batch
-    quote_cfg = _default_baseline_quote_config() if baseline_config is None else baseline_config
-    fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
-    baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba) if fast_enabled and fast_batch is not None else evaluate_market_making(build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration), lambda _obs: (0.0, 0.0, 0.0, 0.0), collect_vol_bucket_report=True, baseline_cfg=quote_cfg)
-    return {"cmssl_test": context.cmssl_test_metrics, "mm_baseline": baseline_metrics, "mm_rl": None, "mm_run_context": {"run_mode": "baseline", "baseline_eval_split": eval_split, "baseline_eval_semantics": f"rl_week3_{eval_split}", "prepared_context_reuse": True, "joined_rl_rows": context.joined_rl_rows, "joined_eval_rows": context.joined_eval_rows, "cmssl_batch_size": context.cmssl_batch_size, "fast_baseline_mode": bool(fast_enabled and fast_batch is not None)}}
 
 
 def run_pipeline(
@@ -4969,15 +4389,6 @@ def run_pipeline(
     run_mode: str = "train",
 ) -> Dict[str, Any]:
     print(f"[mm run mode] {run_mode}")
-    if run_mode == "baseline":
-        prepared_context = prepare_baseline_context(out_root, ckpt_path, device=device)
-        return evaluate_prepared_baseline(
-            prepared_context,
-            eval_split=_resolve_baseline_eval_split(),
-            baseline_config=None,
-            fast_mode=_env_bool("BYBIT_MM_BASELINE_FAST_MODE", True),
-            use_numba=_env_bool("BYBIT_MM_BASELINE_FAST_NUMBA", HAS_NUMBA),
-        )
     meta = load_global_meta(Path(out_root))
     cmssl_test_split = resolve_cmssl_test_split(out_root, meta)
     rl_train_split = resolve_rl_train_split(out_root, meta)
@@ -5050,95 +4461,40 @@ def run_pipeline(
     mm_test_batch = build_market_batch(joined_rl_test)
     mm_eval_full_batch = build_market_batch(joined_eval_full)
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
-    fast_train_batch = prepare_fast_baseline_batch(
-        mm_train_batch,
-        meta,
-        env_kwargs_common=env_kwargs_common,
-        split_name="rl_train",
-    )
-    fast_val_batch = prepare_fast_baseline_batch(
-        mm_val_batch,
-        meta,
-        env_kwargs_common=env_kwargs_common,
-        split_name="rl_val",
-    )
-    fast_test_batch = prepare_fast_baseline_batch(
-        mm_test_batch,
-        meta,
-        env_kwargs_common=env_kwargs_common,
-        split_name="rl_test",
-    )
-    fast_eval_full_batch = prepare_fast_baseline_batch(
-        mm_eval_full_batch,
-        meta,
-        env_kwargs_common=env_kwargs_common,
-        split_name="eval_full",
-    )
-    baseline_alpha_calibration = _fit_baseline_alpha_calibration(
-        fast_train_batch,
-        meta.get("horizons_ms", DEFAULT_MM_HORIZONS_MS),
-    )
-    calibration_summary = {
-        "fit_split": baseline_alpha_calibration.diagnostics["fit_split"],
-        "horizons_ms": baseline_alpha_calibration.horizons_ms.tolist(),
-        "slope_bps_by_unit_score": np.round(
-            baseline_alpha_calibration.score_to_bps_slope_by_horizon, 6
-        ).tolist(),
-        "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
-    }
-    print(f"[mm runtime] alpha calibration {json.dumps(calibration_summary, sort_keys=True)}")
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
         allow_taker=allow_taker,
-        baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
     print("[mm obs scaling]", json.dumps(mm_train_env.get_observation_scaling_config(), sort_keys=True))
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
         allow_taker=allow_taker,
-        baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
         allow_taker=allow_taker,
-        baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
     mm_final_env = MarketMakingEnv(
         mm_eval_full_batch,
         allow_taker=allow_taker,
-        baseline_alpha_calibration=baseline_alpha_calibration,
         **env_kwargs_common,
     )
-    default_baseline_quote_cfg = _default_baseline_quote_config()
-    baseline_val_env = build_baseline_eval_env(mm_val_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
-    baseline_test_env = build_baseline_eval_env(mm_test_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
-    baseline_final_env = build_baseline_eval_env(mm_eval_full_batch, env_kwargs_common, default_baseline_quote_cfg, baseline_alpha_calibration)
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
     mm_train_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_final_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
-    baseline_val_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
-    baseline_test_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
-    baseline_final_env.set_obs_norm_state(prefitted_obs_norm_state, freeze=True)
     mm_obs = mm_train_env.reset()
     mm_obs_dim = mm_obs.shape[0]
     print(
         "[mm obs norm] "
         f"source=train_prefit count={int(prefitted_obs_norm_state['count'])} "
         f"obs_dim={mm_obs_dim} frozen={mm_train_env.freeze_obs_norm}"
-    )
-
-    baseline_eval_split = _resolve_baseline_eval_split()
-    baseline_split_name, baseline_eval_env = _select_baseline_env(
-        baseline_eval_split,
-        baseline_val_env,
-        baseline_test_env,
     )
 
     mm_ppo_config = PPOConfig(
@@ -5250,22 +4606,12 @@ def run_pipeline(
             )
         mm_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         mm_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-        baseline_val_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-        baseline_test_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-        baseline_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         obs_norm_source = "checkpoint"
 
-    if eval_obs_norm_state is not None:
-        baseline_eval_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-        baseline_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
-    baseline_dev_t0 = time.perf_counter()
-    baseline_dev_metrics = evaluate_prepared_baseline_fast(fast_val_batch if baseline_eval_split == "val" else fast_test_batch, default_baseline_quote_cfg, baseline_alpha_calibration)
-    # Final untouched evaluation remains week-4 (eval.full) for both mm_baseline and mm_rl.
-    baseline_metrics = evaluate_prepared_baseline_fast(fast_eval_full_batch, default_baseline_quote_cfg, baseline_alpha_calibration)
-    _timing_log(
-        "evaluate_market_making baseline "
-        f"split=eval.full secs={time.perf_counter() - baseline_dev_t0:.4f}"
-    )
+    baseline_eval_t0 = time.perf_counter()
+    baseline_policy_fn = lambda _obs: _canonical_zero_market_action()
+    baseline_metrics = evaluate_market_making(mm_final_env, baseline_policy_fn)
+    _timing_log(f"evaluate_market_making baseline split=eval.full secs={time.perf_counter() - baseline_eval_t0:.4f}")
 
     rl_metrics = None
     rl_dev_metrics = None
@@ -5385,14 +4731,12 @@ def run_pipeline(
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
         "mm_baseline": baseline_metrics,
         "mm_rl": rl_metrics,
-        "mm_baseline_dev_test": baseline_dev_metrics if baseline_eval_split == "test" else None,
-        "mm_baseline_dev_val": baseline_dev_metrics if baseline_eval_split == "val" else None,
+        "mm_baseline_dev_test": None,
+        "mm_baseline_dev_val": None,
         "mm_rl_dev_test": rl_dev_metrics,
         # Fatal failures are surfaced via exceptions rather than persisted in provenance state.
         "mm_run_context": {
             "run_mode": run_mode,
-            "baseline_eval_split": baseline_split_name,
-            "baseline_eval_semantics": f"rl_week3_{baseline_split_name}",
             "ppo_trained_this_run": trained_this_run,
             "ppo_best_ckpt_path": str(mm_best_ckpt.expanduser().resolve()),
             "rl_eval_performed": rl_eval_performed,
