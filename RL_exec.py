@@ -4406,7 +4406,7 @@ def run_pipeline(
 
     mm_ppo_config = PPOConfig(
         lr=float(os.environ.get("BYBIT_MM_PPO_LR", "3e-4")),
-        update_epochs=int(os.environ.get("BYBIT_MM_PPO_UPDATE_EPOCHS", "4")),
+        update_epochs=int(os.environ.get("BYBIT_MM_PPO_UPDATE_EPOCHS", "6")),
         batch_size=int(os.environ.get("BYBIT_MM_PPO_BATCH_SIZE", "32768")),
         clip_ratio=float(os.environ.get("BYBIT_MM_PPO_CLIP_RATIO", "0.2")),
         gamma=float(os.environ.get("BYBIT_MM_PPO_GAMMA", "0.99")),
