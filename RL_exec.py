@@ -2821,7 +2821,7 @@ def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
     return final_policy_linear
 
 
-def _init_zero_residual_policy(model: MarketPolicyValueNet, init_log_std: float) -> None:
+def _init_neutral_direct_quote_policy(model: MarketPolicyValueNet, init_log_std: float) -> None:
     final_policy_linear = _find_final_policy_linear_layer(model)
     with torch.no_grad():
         final_policy_linear.weight.zero_()
@@ -2849,7 +2849,7 @@ class PPOConfig:
     rollout_horizon: int = 32768
     rollouts_per_epoch: int = 4
     randomize_rollout_start: bool = True
-    zero_residual_init: bool = True
+    neutral_direct_quote_init: bool = True
     init_log_std: float = -3.0
 
 
@@ -3701,8 +3701,8 @@ def train_market_ppo(
         action_dim=action_dim,
         init_log_std=config.init_log_std,
     ).to(device)
-    if config.zero_residual_init:
-        _init_zero_residual_policy(model, config.init_log_std)
+    if config.neutral_direct_quote_init:
+        _init_neutral_direct_quote_policy(model, config.init_log_std)
     print(
         "[mm ppo compile] "
         f"enabled={compile_enabled} "
@@ -3718,7 +3718,9 @@ def train_market_ppo(
         f"rollout_horizon={config.rollout_horizon} "
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
-        f"zero_residual_init={config.zero_residual_init} "
+        f"neutral_direct_quote_init={config.neutral_direct_quote_init} "
+        "direct_quote_neutral_means="
+        "{center=0,width_control=0,skew_control=0,taker_signal=0} "
         f"init_log_std={config.init_log_std:.4f} "
         f"action_mag_coef={config.action_mag_coef:.6f} "
         f"action_mag_power={config.action_mag_power:.2f}"
@@ -3761,14 +3763,21 @@ def train_market_ppo(
         np.all(bounded_probe_action >= bounds_low_np - 1e-6)
         and np.all(bounded_probe_action <= bounds_high_np + 1e-6)
     )
+    probe_action_labels = {
+        "center_bps": float(bounded_probe_action[0]),
+        "width_control": float(bounded_probe_action[1]),
+        "skew_control": float(bounded_probe_action[2]),
+        "taker_signal": float(bounded_probe_action[3]),
+    }
     print(
         "[mm ppo bounds] "
         f"action_dim={action_dim} "
         f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
         f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
-            f"env_center_limit_bps={train_env.direct_quote_config.center_limit_bps:.4f} "
+        f"env_center_limit_bps={train_env.direct_quote_config.center_limit_bps:.4f} "
         f"taker_signal_limit={train_env.taker_signal_limit:.4f} "
         f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
+        f"mean_probe_action_labeled={probe_action_labels} "
         f"env_action={_market_env_action_tuple(bounded_probe_action)} "
         f"bounded_before_step={within_bounds}"
     )
@@ -4555,7 +4564,7 @@ def run_pipeline(
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 32768),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 4),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
-        zero_residual_init=_env_bool("BYBIT_MM_PPO_ZERO_RESIDUAL_INIT", True),
+        neutral_direct_quote_init=_env_bool("BYBIT_MM_PPO_NEUTRAL_DIRECT_QUOTE_INIT", True),
         init_log_std=_env_float("BYBIT_MM_PPO_INIT_LOG_STD", -1.5),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
