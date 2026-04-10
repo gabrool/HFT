@@ -3068,8 +3068,8 @@ class PPOConfig:
     value_hidden: Tuple[int, ...] = (128, 128)
     val_every: int = 1
     max_drawdown_guard: Optional[float] = None
-    rollout_horizon: int = 32768
-    rollouts_per_epoch: int = 4
+    rollout_horizon: int = 8192
+    rollouts_per_epoch: int = 16
     randomize_rollout_start: bool = True
     init_log_std_center: float = -0.5
     init_log_std_width: float = -0.25
@@ -3102,8 +3102,8 @@ def collect_market_rollout(
     env: MarketMakingEnv,
     model: MarketPolicyValueNet,
     device: str,
-    horizon: int = 32768,
-    rollouts_per_epoch: int = 4,
+    horizon: int = 8192,
+    rollouts_per_epoch: int = 16,
     randomize_start: bool = True,
     rollout_storage: str = "gpu",
     pin_memory: bool = True,
@@ -4842,8 +4842,8 @@ def run_pipeline(
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
         val_every=_env_int("BYBIT_MM_PPO_VAL_EVERY", 1),
         max_drawdown_guard=_env_float("BYBIT_MM_PPO_MAX_DRAWDOWN", float("nan")),
-        rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 32768),
-        rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 4),
+        rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
+        rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
         init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.25),
         init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", 0.0),
