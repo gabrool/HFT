@@ -55,7 +55,7 @@ DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
 DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS = 50.0
-DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT = 0.75
+DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT = 0.9
 # PPO training epochs environment variable (used across entrypoint/config helpers).
 PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
 # Scaling factors for market-making observation extra-state features.
