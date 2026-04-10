@@ -675,6 +675,111 @@ class DirectQuoteConfig:
     taker_signal_limit: float
 
 
+@dataclass(frozen=True)
+class RolloutStartSamplingConfig:
+    enabled: bool = False
+    weighted_mix: float = 0.8
+    score_power: float = 1.0
+    score_epsilon: float = 1e-6
+    lead_steps: int = 5
+    min_remaining_steps: int = 256
+    horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
+
+
+@dataclass(frozen=True)
+class RewardShapingConfig:
+    enabled: bool = False
+    horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
+    logit_tanh_scale: float = 1.0
+    skew_coef: float = 0.02
+    skew_target_scale: float = 1.0
+    width_coef: float = 0.005
+    width_alpha_coef: float = 0.35
+    width_vol_coef: float = 0.45
+    width_target_min: float = -0.8
+    width_target_max: float = 0.8
+
+
+@dataclass(frozen=True)
+class WidthVolatilityScaler:
+    p50: float
+    p90: float
+    eps: float = 1e-6
+    sigma_min: float = 0.0
+    sigma_max: float = 0.0
+    sigma_mean: float = 0.0
+
+
+def _env_float_tuple(name: str, default: Tuple[float, ...]) -> Tuple[float, ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return tuple(float(v) for v in default)
+    values = tuple(float(item.strip()) for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError(f"{name} must contain at least one float value.")
+    return values
+
+
+def _resolve_fixed_horizon_logit_weights(name: str, default: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    values = _env_float_tuple(name, default)
+    if len(values) != 3:
+        raise ValueError(f"{name} must provide exactly 3 comma-separated floats for horizons [250,500,1000].")
+    return (float(values[0]), float(values[1]), float(values[2]))
+
+
+def load_rollout_start_sampling_config() -> RolloutStartSamplingConfig:
+    cfg = RolloutStartSamplingConfig(
+        enabled=_env_bool("BYBIT_MM_START_SAMPLING_ENABLE", False),
+        weighted_mix=_env_float("BYBIT_MM_START_SAMPLING_WEIGHTED_MIX", 0.8),
+        score_power=_env_float("BYBIT_MM_START_SAMPLING_SCORE_POWER", 1.0),
+        score_epsilon=_env_float("BYBIT_MM_START_SAMPLING_SCORE_EPS", 1e-6),
+        lead_steps=_env_int("BYBIT_MM_START_SAMPLING_LEAD_STEPS", 5),
+        min_remaining_steps=_env_int("BYBIT_MM_START_SAMPLING_MIN_REMAINING_STEPS", 256),
+        horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
+            "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
+            (0.0, 0.0, 1.0),
+        ),
+    )
+    if not np.isfinite(cfg.weighted_mix) or cfg.weighted_mix < 0.0 or cfg.weighted_mix > 1.0:
+        raise ValueError("BYBIT_MM_START_SAMPLING_WEIGHTED_MIX must be in [0, 1].")
+    if not np.isfinite(cfg.score_power) or cfg.score_power <= 0.0:
+        raise ValueError("BYBIT_MM_START_SAMPLING_SCORE_POWER must be finite and > 0.")
+    if not np.isfinite(cfg.score_epsilon) or cfg.score_epsilon <= 0.0:
+        raise ValueError("BYBIT_MM_START_SAMPLING_SCORE_EPS must be finite and > 0.")
+    if cfg.lead_steps < 0:
+        raise ValueError("BYBIT_MM_START_SAMPLING_LEAD_STEPS must be >= 0.")
+    if cfg.min_remaining_steps < 1:
+        raise ValueError("BYBIT_MM_START_SAMPLING_MIN_REMAINING_STEPS must be >= 1.")
+    return cfg
+
+
+def load_reward_shaping_config() -> RewardShapingConfig:
+    cfg = RewardShapingConfig(
+        enabled=_env_bool("BYBIT_MM_REWARD_SHAPING_ENABLE", False),
+        horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
+            "BYBIT_MM_REWARD_SHAPING_HORIZON_LOGIT_WEIGHTS",
+            (0.0, 0.0, 1.0),
+        ),
+        logit_tanh_scale=_env_float("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE", 1.0),
+        skew_coef=_env_float("BYBIT_MM_REWARD_SHAPING_SKEW_COEF", 0.02),
+        skew_target_scale=_env_float("BYBIT_MM_REWARD_SHAPING_SKEW_TARGET_SCALE", 1.0),
+        width_coef=_env_float("BYBIT_MM_REWARD_SHAPING_WIDTH_COEF", 0.005),
+        width_alpha_coef=_env_float("BYBIT_MM_REWARD_SHAPING_WIDTH_ALPHA_COEF", 0.35),
+        width_vol_coef=_env_float("BYBIT_MM_REWARD_SHAPING_WIDTH_VOL_COEF", 0.45),
+        width_target_min=_env_float("BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MIN", -0.8),
+        width_target_max=_env_float("BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MAX", 0.8),
+    )
+    if not np.isfinite(cfg.logit_tanh_scale) or cfg.logit_tanh_scale <= 0.0:
+        raise ValueError("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE must be finite and > 0.")
+    if cfg.skew_coef < 0.0 or cfg.width_coef < 0.0:
+        raise ValueError("Reward shaping coefficients must be >= 0.")
+    if cfg.width_coef > cfg.skew_coef:
+        raise ValueError("Width shaping coefficient must be <= skew shaping coefficient.")
+    if cfg.width_target_min > cfg.width_target_max:
+        raise ValueError("BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MIN must be <= WIDTH_TARGET_MAX.")
+    return cfg
+
+
 def load_direct_quote_config() -> DirectQuoteConfig:
     return _validate_direct_quote_config(
         DirectQuoteConfig(
@@ -884,6 +989,89 @@ def _resolve_horizon_index(
         "Required horizon is not available in configured horizon mapping: "
         f"label={label} target_ms={target_ms} configured_horizons={horizons}."
     )
+
+
+def _huber_loss(x: float, delta: float = 1.0) -> float:
+    ax = abs(float(x))
+    if ax <= delta:
+        return 0.5 * ax * ax
+    return delta * (ax - 0.5 * delta)
+
+
+def _compute_width_volatility_scaler(env: "MarketMakingEnv") -> WidthVolatilityScaler:
+    snap = env.features[:, env._feature_layout["snapshots"]]
+    vol_short = np.asarray(snap[:, RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")], dtype=np.float64)
+    vol_long = np.asarray(snap[:, RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")], dtype=np.float64)
+    sigma_recent = np.maximum(vol_short, vol_long)
+    finite = sigma_recent[np.isfinite(sigma_recent)]
+    if finite.size == 0:
+        return WidthVolatilityScaler(p50=0.0, p90=1.0)
+    p50 = float(np.quantile(finite, 0.50))
+    p90 = float(np.quantile(finite, 0.90))
+    return WidthVolatilityScaler(
+        p50=p50,
+        p90=p90,
+        eps=1e-6,
+        sigma_min=float(np.min(finite)),
+        sigma_max=float(np.max(finite)),
+        sigma_mean=float(np.mean(finite)),
+    )
+
+
+def _build_rollout_start_sampler(
+    env: "MarketMakingEnv",
+    config: RolloutStartSamplingConfig,
+    *,
+    rollout_horizon: int,
+) -> Optional[Dict[str, Any]]:
+    max_start = max(0, env.n - 2)
+    if not config.enabled or max_start <= 0:
+        return None
+    min_remaining_steps = int(min(max(1, rollout_horizon), max(1, config.min_remaining_steps)))
+    effective_max_start = int(np.clip(env.n - min_remaining_steps - 1, 0, max_start))
+    if effective_max_start < 0:
+        return None
+    candidate_starts = np.arange(0, effective_max_start + 1, dtype=np.int64)
+    if candidate_starts.size == 0:
+        return None
+    dir_logits = env.features[:, env._feature_layout["dir_logits"]]
+    weights = np.asarray(config.horizon_logit_weights, dtype=np.float64).reshape(3,)
+    focus_idx = np.minimum(candidate_starts + int(config.lead_steps), env.n - 2).astype(np.int64, copy=False)
+    z = np.sum(dir_logits[focus_idx].astype(np.float64) * weights[None, :], axis=1)
+    raw_score = np.abs(z)
+    weighted_score = float(config.score_epsilon) + np.power(raw_score, float(config.score_power))
+    weighted_mass = weighted_score / max(float(np.sum(weighted_score)), 1e-12)
+    uniform_mass = np.full(candidate_starts.shape[0], 1.0 / float(candidate_starts.shape[0]), dtype=np.float64)
+    mixed_mass = (1.0 - float(config.weighted_mix)) * uniform_mass + float(config.weighted_mix) * weighted_mass
+    mixed_mass = mixed_mass / max(float(np.sum(mixed_mass)), 1e-12)
+    top_k = min(5, candidate_starts.shape[0])
+    top_idx = np.argsort(weighted_score)[-top_k:][::-1]
+    top_focus = []
+    for i in top_idx:
+        fidx = int(focus_idx[i])
+        ts_val = None
+        if env.decision_ts is not None and 0 <= fidx < env.decision_ts.shape[0]:
+            ts_val = int(env.decision_ts[fidx])
+        top_focus.append(
+            {
+                "start_idx": int(candidate_starts[i]),
+                "focus_idx": fidx,
+                "focus_ts": ts_val,
+                "score": float(weighted_score[i]),
+                "abs_logit": float(raw_score[i]),
+            }
+        )
+    return {
+        "candidate_starts": candidate_starts,
+        "focus_idx": focus_idx,
+        "weighted_score": weighted_score.astype(np.float64, copy=False),
+        "mixed_mass": mixed_mass.astype(np.float64, copy=False),
+        "abs_focus_logit": raw_score.astype(np.float64, copy=False),
+        "effective_max_start": int(effective_max_start),
+        "min_remaining_steps": int(min_remaining_steps),
+        "top_focus": top_focus,
+        "config": config,
+    }
 
 
 def _resolve_split_range(range_value: Any, *, label: str) -> Tuple[int, int]:
@@ -1885,6 +2073,8 @@ class MarketMakingEnv:
         obs_norm_state: Optional[dict] = None,
         freeze_obs_norm: bool = False,
         direct_quote_config: Optional[DirectQuoteConfig] = None,
+        reward_shaping_config: Optional[RewardShapingConfig] = None,
+        width_vol_scaler: Optional[WidthVolatilityScaler] = None,
     ):
         self.features = np.ascontiguousarray(np.asarray(batch.features, dtype=np.float32))
         self.spread_bps = np.ascontiguousarray(np.asarray(batch.spread_bps, dtype=np.float32))
@@ -2002,6 +2192,10 @@ class MarketMakingEnv:
         self.direct_quote_config = _validate_direct_quote_config(
             load_direct_quote_config() if direct_quote_config is None else direct_quote_config
         )
+        self.reward_shaping_config = (
+            load_reward_shaping_config() if reward_shaping_config is None else reward_shaping_config
+        )
+        self.width_vol_scaler = width_vol_scaler
         self.taker_signal_limit = float(self.direct_quote_config.taker_signal_limit)
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
@@ -2466,6 +2660,11 @@ class MarketMakingEnv:
             equity = self.cash + self.inventory * mid
             info = {
                 "reward": 0.0,
+                "reward_true": 0.0,
+                "reward_train": 0.0,
+                "reward_shape_skew": 0.0,
+                "reward_shape_width": 0.0,
+                "reward_shape_total": 0.0,
                 "total_reward": float(self.total_reward),
                 "cash": float(self.cash),
                 "inventory": float(self.inventory),
@@ -2597,10 +2796,41 @@ class MarketMakingEnv:
         inventory_penalty_total = self._combine_inventory_penalties(penalty, inv_penalty)
         turnover_notional = maker_rebate_notional + taker_notional
         turnover_penalty = self.lambda_turn * turnover_notional
-        reward = delta_equity - inventory_penalty_total - turnover_penalty
+        reward_true = delta_equity - inventory_penalty_total - turnover_penalty
+        reward_shape_skew = 0.0
+        reward_shape_width = 0.0
+        if self.reward_shaping_config.enabled:
+            cfg = self.reward_shaping_config
+            dir_logits = self.features[self.idx, self._feature_layout["dir_logits"]]
+            z = float(np.dot(np.asarray(cfg.horizon_logit_weights, dtype=np.float64), dir_logits.astype(np.float64)))
+            alpha_signal = float(np.tanh(cfg.logit_tanh_scale * z))
+            alpha_strength = abs(alpha_signal)
+            skew_target = float(np.clip(-cfg.skew_target_scale * alpha_signal, -1.0, 1.0))
+            skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
+            reward_shape_skew = -cfg.skew_coef * _huber_loss(skew_control_clipped - skew_target)
+
+            snapshot_row = self.features[self.idx, self._feature_layout["snapshots"]]
+            vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
+            vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
+            sigma_recent = max(0.0, vol_short, vol_long)
+            vol_score = 0.0
+            if self.width_vol_scaler is not None:
+                denom = max(self.width_vol_scaler.p90 - self.width_vol_scaler.p50, self.width_vol_scaler.eps)
+                vol_score = float(np.clip((sigma_recent - self.width_vol_scaler.p50) / denom, 0.0, 1.0))
+            width_target = float(
+                np.clip(
+                    cfg.width_vol_coef * vol_score - cfg.width_alpha_coef * alpha_strength,
+                    cfg.width_target_min,
+                    cfg.width_target_max,
+                )
+            )
+            width_control_clipped = float(np.clip(width_control, -1.0, 1.0))
+            reward_shape_width = -cfg.width_coef * _huber_loss(width_control_clipped - width_target)
+        reward_shape_total = reward_shape_skew + reward_shape_width
+        reward_train = reward_true + reward_shape_total
 
         self.prev_equity = equity
-        self.total_reward += reward
+        self.total_reward += reward_train
         self.idx = next_idx
         done = self.idx >= self.n - 1
         next_obs = self._build_observation(self.idx)
@@ -2611,13 +2841,18 @@ class MarketMakingEnv:
                 f"taker_buy={taker_buy}, taker_sell={taker_sell}"
             )
         if not emit_info:
-            return next_obs, float(reward), done, None
+            return next_obs, float(reward_train), done, None
 
         post_hard_cap_qty = self._inventory_cap_qty(mid_next)
         post_buy_room_qty = self._remaining_inventory_room(1, mid_next)
         post_sell_room_qty = self._remaining_inventory_room(-1, mid_next)
         info = {
-            "reward": float(reward),
+            "reward": float(reward_train),
+            "reward_true": float(reward_true),
+            "reward_train": float(reward_train),
+            "reward_shape_skew": float(reward_shape_skew),
+            "reward_shape_width": float(reward_shape_width),
+            "reward_shape_total": float(reward_shape_total),
             "total_reward": float(self.total_reward),
             "cash": float(self.cash),
             "inventory": float(self.inventory),
@@ -2848,6 +3083,7 @@ def collect_market_rollout(
     rollout_storage: str = "gpu",
     pin_memory: bool = True,
     non_blocking: bool = True,
+    start_sampler: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, torch.Tensor]:
     # Canonical PPO action space is the bounded env-facing action tensor.
     # We sample in latent Gaussian space, squash with tanh, then affinely map
@@ -2885,6 +3121,12 @@ def collect_market_rollout(
     terminated_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     truncated_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     dones_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    start_idx_buf = torch.empty((max_steps,), dtype=torch.int64, **alloc_kwargs)
+    focus_logit_abs_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_true_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_shape_skew_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_shape_width_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_shape_total_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
     action_dim = _resolve_market_action_dim()
@@ -2901,9 +3143,24 @@ def collect_market_rollout(
     )
 
     max_start = max(0, env.n - 2)
+    sampler_starts = None if start_sampler is None else start_sampler.get("candidate_starts")
+    sampler_mass = None if start_sampler is None else start_sampler.get("mixed_mass")
+    sampler_abs_focus = None if start_sampler is None else start_sampler.get("abs_focus_logit")
+    rollout_start_indices: List[int] = []
     obs_device_buf: Optional[torch.Tensor] = None
     for _ in range(rollouts_per_epoch):
-        start_idx = int(np.random.randint(0, max_start + 1)) if randomize_start else 0
+        if randomize_start:
+            if sampler_starts is not None and sampler_mass is not None:
+                sampled_slot = int(np.random.choice(sampler_starts.shape[0], p=sampler_mass))
+                start_idx = int(sampler_starts[sampled_slot])
+                sampled_focus_abs = float(sampler_abs_focus[sampled_slot]) if sampler_abs_focus is not None else 0.0
+            else:
+                start_idx = int(np.random.randint(0, max_start + 1))
+                sampled_focus_abs = 0.0
+        else:
+            start_idx = 0
+            sampled_focus_abs = 0.0
+        rollout_start_indices.append(start_idx)
         obs = env.reset(start_idx=start_idx)
         done = False
         steps = 0
@@ -2955,7 +3212,7 @@ def collect_market_rollout(
                 action_cpu_stage_t.copy_(sampled_action_env, non_blocking=non_blocking)
                 np.copyto(action_cpu_buf, action_cpu_stage_t.numpy(), casting="no")
             # 4) Step env only after obs has been ingested into model/storage buffers.
-            next_obs, reward, env_done, _ = env.step_canonical_action_array(action_cpu_buf, emit_info=False)
+            next_obs, reward, env_done, info = env.step_canonical_action_array(action_cpu_buf, emit_info=True)
             steps += 1
             terminated = bool(env_done)
             # Truncation means the rollout horizon ended; it is not a true
@@ -2975,9 +3232,16 @@ def collect_market_rollout(
                 logp_buf[idx] = logp_env.squeeze(0).detach().cpu()
                 values_buf[idx] = value.squeeze(0).detach().cpu()
             rewards_buf[idx] = float(reward)
+            info = info or {}
+            reward_true_buf[idx] = float(info.get("reward_true", reward))
+            reward_shape_skew_buf[idx] = float(info.get("reward_shape_skew", 0.0))
+            reward_shape_width_buf[idx] = float(info.get("reward_shape_width", 0.0))
+            reward_shape_total_buf[idx] = float(info.get("reward_shape_total", 0.0))
             terminated_buf[idx] = float(terminated)
             truncated_buf[idx] = float(truncated)
             dones_buf[idx] = float(done)
+            start_idx_buf[idx] = int(start_idx)
+            focus_logit_abs_buf[idx] = float(sampled_focus_abs)
             obs = next_obs
 
     if obs_buf is None or next_obs_buf is None or actions_buf is None:
@@ -3014,6 +3278,13 @@ def collect_market_rollout(
         "terminated": terminated_buf[:cursor],
         "truncated": truncated_buf[:cursor],
         "dones": dones_buf[:cursor],
+        "start_idx": start_idx_buf[:cursor],
+        "focus_logit_abs": focus_logit_abs_buf[:cursor],
+        "reward_true": reward_true_buf[:cursor],
+        "reward_shape_skew": reward_shape_skew_buf[:cursor],
+        "reward_shape_width": reward_shape_width_buf[:cursor],
+        "reward_shape_total": reward_shape_total_buf[:cursor],
+        "rollout_start_indices": np.asarray(rollout_start_indices, dtype=np.int64),
     }
 
 
@@ -3702,6 +3973,37 @@ def train_market_ppo(
     best_selection_epoch: Optional[int] = None
     best_selection_key: Optional[Tuple[float, float, float]] = None
     saved_new_ckpt_this_run = False
+    start_sampling_cfg = load_rollout_start_sampling_config()
+    start_sampler = _build_rollout_start_sampler(
+        train_env,
+        start_sampling_cfg,
+        rollout_horizon=config.rollout_horizon,
+    )
+    if start_sampler is None:
+        print(
+            "[mm rollout sampler] "
+            f"enabled={start_sampling_cfg.enabled} "
+            "active=false reason=disabled_or_insufficient_candidates"
+        )
+    else:
+        score_arr = np.asarray(start_sampler["weighted_score"], dtype=np.float64)
+        print(
+            "[mm rollout sampler] "
+            f"enabled={start_sampling_cfg.enabled} "
+            f"active=true "
+            f"horizon_logit_weights={start_sampling_cfg.horizon_logit_weights} "
+            f"weighted_mix={start_sampling_cfg.weighted_mix:.4f} "
+            f"score_power={start_sampling_cfg.score_power:.4f} "
+            f"score_epsilon={start_sampling_cfg.score_epsilon:.6g} "
+            f"lead_steps={start_sampling_cfg.lead_steps} "
+            f"candidate_count={int(start_sampler['candidate_starts'].shape[0])} "
+            f"effective_max_start={int(start_sampler['effective_max_start'])} "
+            f"min_remaining_steps={int(start_sampler['min_remaining_steps'])} "
+            f"score_min={float(np.min(score_arr)):.6g} "
+            f"score_max={float(np.max(score_arr)):.6g} "
+            f"score_mean={float(np.mean(score_arr)):.6g} "
+            f"top_focus={start_sampler['top_focus']}"
+        )
 
     for epoch in range(epochs):
         epoch_t0 = time.perf_counter()
@@ -3716,6 +4018,7 @@ def train_market_ppo(
             rollout_storage=rollout_storage,
             pin_memory=pin_rollout_memory,
             non_blocking=non_blocking_transfers,
+            start_sampler=start_sampler if config.randomize_rollout_start else None,
         )
         ppo_update_market(
             model,
@@ -3758,6 +4061,32 @@ def train_market_ppo(
             f"bounded_probe_mean_action_abs={np.array2string(bounded_probe_mean_action_abs, precision=6, floatmode='fixed')} "
             f"saturation_fraction={np.array2string(saturation_fraction, precision=6, floatmode='fixed')}"
         )
+        start_idx_np = rollout["start_idx"].detach().cpu().numpy().astype(np.float64)
+        focus_abs_np = rollout["focus_logit_abs"].detach().cpu().numpy().astype(np.float64)
+        reward_true_np = rollout["reward_true"].detach().cpu().numpy().astype(np.float64)
+        shape_skew_np = rollout["reward_shape_skew"].detach().cpu().numpy().astype(np.float64)
+        shape_width_np = rollout["reward_shape_width"].detach().cpu().numpy().astype(np.float64)
+        shape_total_np = rollout["reward_shape_total"].detach().cpu().numpy().astype(np.float64)
+        true_abs_mean = float(np.mean(np.abs(reward_true_np))) if reward_true_np.size else 0.0
+        shape_abs_mean = float(np.mean(np.abs(shape_total_np))) if shape_total_np.size else 0.0
+        shaping_ratio = shape_abs_mean / max(true_abs_mean, 1e-8)
+        print(
+            "[mm ppo sampler/shaping] "
+            f"epoch={epoch + 1} "
+            f"start_idx_mean={float(np.mean(start_idx_np)):.2f} "
+            f"focus_abs_logit_mean={float(np.mean(focus_abs_np)):.6f} "
+            f"reward_true_mean={float(np.mean(reward_true_np)):.6f} "
+            f"reward_shape_skew_mean={float(np.mean(shape_skew_np)):.6f} "
+            f"reward_shape_width_mean={float(np.mean(shape_width_np)):.6f} "
+            f"reward_shape_total_mean={float(np.mean(shape_total_np)):.6f} "
+            f"shape_abs_ratio={shaping_ratio:.6f}"
+        )
+        if shaping_ratio > 0.10:
+            print(
+                "[mm ppo shaping warning] "
+                f"epoch={epoch + 1} shape_abs_ratio={shaping_ratio:.6f} "
+                "threshold=0.10 shaping may be dominating economic reward."
+            )
         if (epoch + 1) % config.val_every == 0:
             assert train_env.freeze_obs_norm is True, "train env obs normalization must stay frozen during PPO"
             assert val_env.freeze_obs_norm is True, "val env obs normalization must stay frozen during PPO"
@@ -4306,6 +4635,7 @@ def run_pipeline(
     report_cmssl_test_diagnostics(out_root, meta)
 
     model, _meta = load_cmssl(out_root, ckpt_path, device=device)
+    _validate_fixed_cmssl_horizons([int(h) for h in meta.get("horizons_ms", [])])
 
     cmssl_batch_size = _resolve_cmssl_batch_size()
     rollout_storage = _resolve_rollout_storage("gpu")
@@ -4369,26 +4699,42 @@ def run_pipeline(
     mm_eval_full_batch = build_market_batch(joined_eval_full)
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
+    reward_shaping_cfg = load_reward_shaping_config()
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
         allow_taker=allow_taker,
+        reward_shaping_config=reward_shaping_cfg,
         **env_kwargs_common,
+    )
+    width_vol_scaler = _compute_width_volatility_scaler(mm_train_env)
+    mm_train_env.width_vol_scaler = width_vol_scaler
+    print(
+        "[mm shaping vol scaler] "
+        f"enabled={reward_shaping_cfg.enabled} "
+        f"p50={width_vol_scaler.p50:.6g} "
+        f"p90={width_vol_scaler.p90:.6g} "
+        f"sigma_min={width_vol_scaler.sigma_min:.6g} "
+        f"sigma_max={width_vol_scaler.sigma_max:.6g} "
+        f"sigma_mean={width_vol_scaler.sigma_mean:.6g}"
     )
     print("[mm obs scaling]", json.dumps(mm_train_env.get_observation_scaling_config(), sort_keys=True))
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
         allow_taker=allow_taker,
+        reward_shaping_config=RewardShapingConfig(enabled=False),
         **env_kwargs_common,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
         allow_taker=allow_taker,
+        reward_shaping_config=RewardShapingConfig(enabled=False),
         **env_kwargs_common,
     )
     mm_final_env = MarketMakingEnv(
         mm_eval_full_batch,
         allow_taker=allow_taker,
+        reward_shaping_config=RewardShapingConfig(enabled=False),
         **env_kwargs_common,
     )
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
