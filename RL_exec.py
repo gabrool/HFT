@@ -3203,11 +3203,6 @@ def _canonical_market_action_array(
     return action_arr
 
 
-def _canonical_noop_market_action() -> np.ndarray:
-    """Allocate the canonical no-op action used in internal stepping loops."""
-    return np.zeros((_resolve_market_action_dim(),), dtype=np.float32)
-
-
 def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float, float]:
     action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
     require(
@@ -3353,13 +3348,14 @@ def _resolve_checkpoint_metric_mode() -> str:
 
 
 def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
-    """Fit observation normalization on the train split before PPO consumes observations."""
+    """Fit train-split obs normalization at the active-neutral direct-quote operating point used for PPO init."""
     train_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
     _ = train_env.reset(start_idx=0)
     done = False
-    action_array = _canonical_noop_market_action()
+    # Active-neutral direct-quote action at PPO initialization: center/width/skew/taker = 0.
+    active_neutral_action = np.asarray((0.0, 0.0, 0.0, 0.0), dtype=np.float32).reshape(4,)
     while not done:
-        _, _, done, _ = train_env.step_canonical_action_array(action_array, emit_info=False)
+        _, _, done, _ = train_env.step_canonical_action_array(active_neutral_action, emit_info=False)
     state = train_env.get_obs_norm_state()
     if not _obs_norm_state_is_ready(state):
         raise RuntimeError(
