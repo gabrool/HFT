@@ -4422,8 +4422,8 @@ def run_pipeline(
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
         init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.25),
         init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", 0.0),
-        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -0.75),
-        init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -0.25),
+        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -0.25),
+        init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -0.10),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
