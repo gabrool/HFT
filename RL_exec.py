@@ -62,6 +62,8 @@ DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE = 0.0
 DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
+DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS = 50.0
+DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT = 0.75
 DEFAULT_MM_INV_REF_NOTIONAL = 1.0
 DEFAULT_MM_P250_WEIGHT = 0.0
 DEFAULT_MM_P500_WEIGHT = 0.0
@@ -741,6 +743,15 @@ class BaselineQuoteConfig:
 
 
 @dataclass(frozen=True)
+class DirectQuoteConfig:
+    obs_spread_anchor_frac: float
+    spread_floor_bps: float
+    spread_cap_bps: float
+    skew_limit_bps: float
+    skew_fraction_limit: float
+
+
+@dataclass(frozen=True)
 class BaselineAlphaCalibration:
     score_to_bps_slope_by_horizon: np.ndarray
     winsor_lower_bps_by_horizon: np.ndarray
@@ -811,6 +822,32 @@ class PreparedBaselineContext:
     env_kwargs_common: Dict[str, Any]
     run_config: Dict[str, Any]
     cmssl_batch_size: int
+
+
+def load_direct_quote_config() -> DirectQuoteConfig:
+    return _validate_direct_quote_config(
+        DirectQuoteConfig(
+            obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
+            spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
+            spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
+            skew_limit_bps=_env_float("BYBIT_MM_DIRECT_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
+            skew_fraction_limit=_env_float("BYBIT_MM_DIRECT_SKEW_FRACTION_LIMIT", DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT),
+        )
+    )
+
+
+def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
+    if not np.isfinite(cfg.obs_spread_anchor_frac) or cfg.obs_spread_anchor_frac < 0.0:
+        raise ValueError("obs_spread_anchor_frac must be finite and >= 0.0")
+    if not np.isfinite(cfg.spread_floor_bps) or cfg.spread_floor_bps < 0.0:
+        raise ValueError("spread_floor_bps must be finite and >= 0.0")
+    if not np.isfinite(cfg.spread_cap_bps) or cfg.spread_cap_bps < cfg.spread_floor_bps:
+        raise ValueError("spread_cap_bps must be finite and >= spread_floor_bps")
+    if not np.isfinite(cfg.skew_limit_bps) or cfg.skew_limit_bps < 0.0:
+        raise ValueError("skew_limit_bps must be finite and >= 0.0")
+    if not np.isfinite(cfg.skew_fraction_limit) or cfg.skew_fraction_limit < 0.0:
+        raise ValueError("skew_fraction_limit must be finite and >= 0.0")
+    return cfg
 
 
 def load_baseline_quote_config() -> BaselineQuoteConfig:
@@ -2069,8 +2106,7 @@ class MarketMakingEnv:
         initial_cash: Optional[float] = None,
         obs_norm_state: Optional[dict] = None,
         freeze_obs_norm: bool = False,
-        baseline_alpha_calibration: Optional[BaselineAlphaCalibration] = None,
-        baseline_quote_config: Optional[BaselineQuoteConfig] = None,
+        direct_quote_config: Optional[DirectQuoteConfig] = None,
     ):
         self.features = np.ascontiguousarray(np.asarray(batch.features, dtype=np.float32))
         self.spread_bps = np.ascontiguousarray(np.asarray(batch.spread_bps, dtype=np.float32))
@@ -2193,49 +2229,10 @@ class MarketMakingEnv:
         self._inv_markout_notional_scale = (
             1.0 / self.markout_notional_scale if self.markout_notional_scale != 0.0 else 0.0
         )
-        self.baseline_quote_config = _validate_baseline_quote_config(
-            load_baseline_quote_config() if baseline_quote_config is None else baseline_quote_config
+        self.direct_quote_config = _validate_direct_quote_config(
+            load_direct_quote_config() if direct_quote_config is None else direct_quote_config
         )
         self._num_h = _infer_num_horizons(self.features.shape[-1])
-        self._horizons_ms = _normalize_horizons(
-            self._num_h,
-            self.baseline_quote_config.horizons_ms,
-        )
-        self._horizons_ms = _validate_fixed_cmssl_horizons(self._horizons_ms)
-        self._p250_idx = _resolve_horizon_index(
-            250,
-            self._horizons_ms,
-            label="p250",
-        )
-        self._p500_idx = _resolve_horizon_index(
-            500,
-            self._horizons_ms,
-            label="p500",
-        )
-        self._p1000_idx = _resolve_horizon_index(
-            1000,
-            self._horizons_ms,
-            label="p1000",
-        )
-        print(
-            "[mm horizons]",
-            f"resolved_horizons_ms={self._horizons_ms}",
-            f"p250_idx={self._p250_idx}",
-            f"p500_idx={self._p500_idx}",
-            f"p1000_idx={self._p1000_idx}",
-        )
-        self._baseline_alpha_calibration = baseline_alpha_calibration
-        if self._baseline_alpha_calibration is None:
-            raise ValueError("baseline_alpha_calibration must be provided")
-        self._score_to_bps_slope_250 = float(
-            self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p250_idx]
-        )
-        self._score_to_bps_slope_500 = float(
-            self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p500_idx]
-        )
-        self._score_to_bps_slope_1000 = float(
-            self._baseline_alpha_calibration.score_to_bps_slope_by_horizon[self._p1000_idx]
-        )
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
         self._feature_dim = int(self.features.shape[-1])
@@ -2474,105 +2471,50 @@ class MarketMakingEnv:
             self._update_obs_stats(obs_raw)
         return out
 
-    def _parse_action(self, action: Any) -> Tuple[float, float, float]:
+    def _parse_action(self, action: Any) -> Tuple[float, float, float, float]:
         """Hot-path parser for canonical float32 action arrays."""
-        expected_dim = _resolve_market_action_dim()
-        if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.shape == (expected_dim,):
-            center_control = float(action[0])
-            width_control = float(action[1])
-            skew_control = float(action[2])
-            taker_signal = float(action[3])
-            bid_delta_bps = center_control - width_control + skew_control
-            ask_delta_bps = center_control + width_control - skew_control
-            return bid_delta_bps, ask_delta_bps, taker_signal
+        if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.shape == (4,):
+            return float(action[0]), float(action[1]), float(action[2]), float(action[3])
         # Minimal debug conversion/fallback for non-canonical callers outside rollout hot paths.
         action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
         require(
-            action_arr.shape == (expected_dim,),
-            f"Expected action shape {(expected_dim,)}, got shape={action_arr.shape}",
+            action_arr.shape == (4,),
+            f"Expected action shape {(4,)}, got shape={action_arr.shape}",
         )
         if not np.all(np.isfinite(action_arr)):
             raise ValueError(f"Action components must be finite, got {action_arr}")
-        center_control = float(action_arr[0])
-        width_control = float(action_arr[1])
-        skew_control = float(action_arr[2])
-        taker_signal = float(action_arr[3])
-        bid_delta_bps = center_control - width_control + skew_control
-        ask_delta_bps = center_control + width_control - skew_control
-        return bid_delta_bps, ask_delta_bps, taker_signal
+        return float(action_arr[0]), float(action_arr[1]), float(action_arr[2]), float(action_arr[3])
 
     def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
         return self.features[idx, start:end]
 
-    @staticmethod
-    def _width_from_market_state(
-        cfg: BaselineQuoteConfig,
-        observed_spread_bps: float,
-        vol_short: float,
-        vol_long: float,
-        p250: float,
-        p500: float,
-        p1000: float,
-    ) -> float:
-        obs_anchor_bps = 0.0
-        if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-            obs_anchor_bps = max(0.0, cfg.obs_spread_anchor_frac * observed_spread_bps)
-        sigma_bps = 1e4 * max(0.0, vol_short, vol_long)
-        disagreement = max(abs(p250 - p500), abs(p500 - p1000), abs(p250 - p1000))
-        uncertainty_ref_bps = max(cfg.base_half_spread_bps, obs_anchor_bps, sigma_bps, cfg.spread_floor_bps)
-        base_component_bps = max(cfg.base_half_spread_bps, obs_anchor_bps, cfg.spread_floor_bps)
-        vol_width_bps = cfg.vol_width_scale * sigma_bps
-        uncertainty_width_bps = cfg.uncertainty_width_scale * disagreement * uncertainty_ref_bps
-        half_spread_bps_raw = base_component_bps + vol_width_bps + uncertainty_width_bps
-        return float(np.clip(half_spread_bps_raw, cfg.spread_floor_bps, cfg.spread_cap_bps))
-
-    def _baseline_quotes(self, idx: int) -> Tuple[float, float, float]:
-        cfg = self.baseline_quote_config
+    def _policy_quotes(
+        self,
+        idx: int,
+        center_bps: float,
+        width_control: float,
+        skew_control: float,
+    ) -> Tuple[float, float]:
+        cfg = self.direct_quote_config
         mid = self._mid_price(idx)
-        p_up = self._feature_slice(idx, self._feature_layout["p_up"].start, self._feature_layout["p_up"].stop)
-        p250 = float(p_up[self._p250_idx])
-        p500 = float(p_up[self._p500_idx])
-        p1000 = float(p_up[self._p1000_idx])
-        score_250 = 2.0 * p250 - 1.0
-        score_500 = 2.0 * p500 - 1.0
-        score_1000 = 2.0 * p1000 - 1.0
-        alpha_center_bps = cfg.alpha_center_scale * (
-            cfg.p250_weight * self._score_to_bps_slope_250 * score_250
-            + cfg.p500_weight * self._score_to_bps_slope_500 * score_500
-            + cfg.p1000_weight * self._score_to_bps_slope_1000 * score_1000
-        )
-        inv_notional = self.inventory * mid
-        inventory_center_bps = cfg.inventory_center_scale * (inv_notional / cfg.inv_ref_notional)
-        reservation_bps = alpha_center_bps - inventory_center_bps
         snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
         observed_spread_bps = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")])
-        vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
-        vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
-        half_spread_bps = self._width_from_market_state(cfg, observed_spread_bps, vol_short, vol_long, p250, p500, p1000)
-        eps = 1e-12
-        soft_ratio = abs(inv_notional) / max(self.inv_soft_notional, eps)
-        overload = max(0.0, soft_ratio - 1.0)
-        inventory_side_extra_bps = (
-            cfg.inventory_side_widen_scale * overload * max(half_spread_bps, 1.0)
-        )
-        bid_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional > 0.0 else 0.0)
-        ask_half_spread_bps = half_spread_bps + (inventory_side_extra_bps if inv_notional < 0.0 else 0.0)
-        bid_enabled = inv_notional < self.max_inventory_notional
-        ask_enabled = inv_notional > -self.max_inventory_notional
-        bid = mid + bps_to_px(mid, reservation_bps - bid_half_spread_bps) if bid_enabled else np.nan
-        ask = mid + bps_to_px(mid, reservation_bps + ask_half_spread_bps) if ask_enabled else np.nan
-        return bid, ask, mid
-
-    def _apply_deltas(
-        self, bid: float, ask: float, mid: float, bid_delta_bps: float, ask_delta_bps: float
-    ) -> Tuple[float, float, float, float]:
-        bid_delta_bps = float(np.clip(bid_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
-        ask_delta_bps = float(np.clip(ask_delta_bps, -self.delta_bps_limit, self.delta_bps_limit))
-        if np.isfinite(bid):
-            bid += mid * bid_delta_bps * 1e-4
-        if np.isfinite(ask):
-            ask += mid * ask_delta_bps * 1e-4
-        return bid, ask, bid_delta_bps, ask_delta_bps
+        floor_bps = cfg.spread_floor_bps
+        if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
+            floor_bps = max(floor_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
+        floor_bps = float(np.clip(floor_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+        width_alpha = 0.5 * (float(np.clip(width_control, -1.0, 1.0)) + 1.0)
+        half_spread_bps = floor_bps + width_alpha * max(0.0, cfg.spread_cap_bps - floor_bps)
+        half_spread_bps = float(np.clip(half_spread_bps, floor_bps, cfg.spread_cap_bps))
+        half_spread_floor = max(half_spread_bps, 1e-12)
+        skew_limit_bps = min(cfg.skew_limit_bps, cfg.skew_fraction_limit * half_spread_floor)
+        skew_bps = float(np.clip(skew_control, -1.0, 1.0)) * skew_limit_bps
+        bid_half_spread_bps = max(floor_bps, half_spread_bps + skew_bps)
+        ask_half_spread_bps = max(floor_bps, half_spread_bps - skew_bps)
+        center_bps = float(np.clip(center_bps, -self.delta_bps_limit, self.delta_bps_limit))
+        bid = mid + bps_to_px(mid, center_bps - bid_half_spread_bps)
+        ask = mid + bps_to_px(mid, center_bps + ask_half_spread_bps)
+        return bid, ask
 
     def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         best_bid = float(self.best_bid[idx])
@@ -2727,10 +2669,11 @@ class MarketMakingEnv:
             return linear_penalty + quadratic_penalty
         return max(linear_penalty, quadratic_penalty)
 
-    def _step_from_components(
+    def _step_from_action_components(
         self,
-        bid_delta_bps: float,
-        ask_delta_bps: float,
+        center_bps: float,
+        width_control: float,
+        skew_control: float,
         taker_signal: float,
         *,
         emit_info: bool = False,
@@ -2795,10 +2738,7 @@ class MarketMakingEnv:
                 "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
             return self._build_observation(self.idx), 0.0, True, info
-        bid, ask, mid = self._baseline_quotes(self.idx)
-        bid, ask, bid_delta_bps, ask_delta_bps = self._apply_deltas(
-            bid, ask, mid, bid_delta_bps, ask_delta_bps
-        )
+        bid, ask = self._policy_quotes(self.idx, center_bps, width_control, skew_control)
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
         mid_for_cap = self._mid_price(next_idx)
@@ -2927,8 +2867,9 @@ class MarketMakingEnv:
             "post_sell_room_qty": float(post_sell_room_qty),
             "bid": float(bid),
             "ask": float(ask),
-            "bid_delta_bps": float(bid_delta_bps),
-            "ask_delta_bps": float(ask_delta_bps),
+            "center_bps": float(np.clip(center_bps, -self.delta_bps_limit, self.delta_bps_limit)),
+            "width_control": float(np.clip(width_control, -1.0, 1.0)),
+            "skew_control": float(np.clip(skew_control, -1.0, 1.0)),
             "inv_change": float(inv_change),
             "maker_buy": float(maker_buy),
             "maker_sell": float(maker_sell),
@@ -2958,35 +2899,34 @@ class MarketMakingEnv:
     def step_canonical_action_array(
         self, action_arr: np.ndarray, *, emit_info: bool = False
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
-        expected_dim = _resolve_market_action_dim()
         if not isinstance(action_arr, np.ndarray):
             raise TypeError(f"Expected np.ndarray action_arr, got {type(action_arr)!r}")
         if action_arr.dtype != np.float32:
             action_arr = action_arr.astype(np.float32, copy=False)
         require(
-            action_arr.shape == (expected_dim,),
-            f"Expected action shape {(expected_dim,)}, got shape={action_arr.shape}",
+            action_arr.shape == (4,),
+            f"Expected action shape {(4,)}, got shape={action_arr.shape}",
         )
         if not np.all(np.isfinite(action_arr)):
             raise ValueError(f"Action components must be finite, got {action_arr}")
         center_control = float(action_arr[0])
         width_control = float(action_arr[1])
         skew_control = float(action_arr[2])
-        bid_delta_bps = center_control - width_control + skew_control
-        ask_delta_bps = center_control + width_control - skew_control
         taker_signal = float(action_arr[3])
-        return self._step_from_components(
-            bid_delta_bps,
-            ask_delta_bps,
+        return self._step_from_action_components(
+            center_control,
+            width_control,
+            skew_control,
             taker_signal,
             emit_info=emit_info,
         )
 
     def step(self, action: Any, emit_info: bool = False) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
-        bid_delta_bps, ask_delta_bps, taker_signal = self._parse_action(action)
-        return self._step_from_components(
-            bid_delta_bps,
-            ask_delta_bps,
+        center_bps, width_control, skew_control, taker_signal = self._parse_action(action)
+        return self._step_from_action_components(
+            center_bps,
+            width_control,
+            skew_control,
             taker_signal,
             emit_info=emit_info,
         )
@@ -4991,7 +4931,7 @@ def compare_fast_vs_env_baseline(context: PreparedBaselineContext, eval_split: s
     quote_cfg = _validate_baseline_quote_config(quote_cfg)
     env_metrics = evaluate_market_making(
         build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration),
-        lambda _obs: (0.0, 0.0, 0.0),
+        lambda _obs: (0.0, 0.0, 0.0, 0.0),
         collect_vol_bucket_report=True,
         baseline_cfg=quote_cfg,
     )
@@ -5011,11 +4951,20 @@ def build_baseline_eval_env(
     baseline_quote_config: BaselineQuoteConfig,
     baseline_alpha_calibration: BaselineAlphaCalibration,
 ) -> MarketMakingEnv:
+    _ = baseline_alpha_calibration
+    direct_cfg = _validate_direct_quote_config(
+        DirectQuoteConfig(
+            obs_spread_anchor_frac=float(baseline_quote_config.obs_spread_anchor_frac),
+            spread_floor_bps=float(baseline_quote_config.spread_floor_bps),
+            spread_cap_bps=float(baseline_quote_config.spread_cap_bps),
+            skew_limit_bps=DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS,
+            skew_fraction_limit=DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT,
+        )
+    )
     return MarketMakingEnv(
         batch,
         allow_taker=False,
-        baseline_alpha_calibration=baseline_alpha_calibration,
-        baseline_quote_config=baseline_quote_config,
+        direct_quote_config=direct_cfg,
         **env_kwargs_common,
     )
 
@@ -5102,7 +5051,7 @@ def evaluate_prepared_baseline(
     quote_cfg = _resolve_baseline_quote_config(baseline_config)
     quote_cfg = load_baseline_quote_config() if quote_cfg is None else quote_cfg
     fast_enabled = _env_bool("BYBIT_MM_BASELINE_FAST_MODE", True) if fast_mode is None else bool(fast_mode)
-    baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba) if fast_enabled and fast_batch is not None else evaluate_market_making(build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration), lambda _obs: (0.0, 0.0, 0.0), collect_vol_bucket_report=True, baseline_cfg=quote_cfg)
+    baseline_metrics = evaluate_prepared_baseline_fast(fast_batch, quote_cfg, context.baseline_alpha_calibration, use_numba=use_numba) if fast_enabled and fast_batch is not None else evaluate_market_making(build_baseline_eval_env(batch, context.env_kwargs_common, quote_cfg, context.baseline_alpha_calibration), lambda _obs: (0.0, 0.0, 0.0, 0.0), collect_vol_bucket_report=True, baseline_cfg=quote_cfg)
     return {"cmssl_test": context.cmssl_test_metrics, "mm_baseline": baseline_metrics, "mm_rl": None, "mm_run_context": {"run_mode": "baseline", "baseline_eval_split": eval_split, "baseline_eval_semantics": f"rl_week3_{eval_split}", "prepared_context_reuse": True, "joined_rl_rows": context.joined_rl_rows, "joined_eval_rows": context.joined_eval_rows, "cmssl_batch_size": context.cmssl_batch_size, "fast_baseline_mode": bool(fast_enabled and fast_batch is not None)}}
 
 
