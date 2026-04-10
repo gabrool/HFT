@@ -682,7 +682,7 @@ class RolloutStartSamplingConfig:
     score_power: float = 1.0
     score_epsilon: float = 1e-6
     lead_steps: int = 512
-    min_remaining_steps: int = 256
+    min_remaining_steps: int = 2048
     horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
 
@@ -734,7 +734,7 @@ def load_rollout_start_sampling_config() -> RolloutStartSamplingConfig:
         score_power=_env_float("BYBIT_MM_START_SAMPLING_SCORE_POWER", 1.0),
         score_epsilon=_env_float("BYBIT_MM_START_SAMPLING_SCORE_EPS", 1e-6),
         lead_steps=_env_int("BYBIT_MM_START_SAMPLING_LEAD_STEPS", 512),
-        min_remaining_steps=_env_int("BYBIT_MM_START_SAMPLING_MIN_REMAINING_STEPS", 256),
+        min_remaining_steps=_env_int("BYBIT_MM_START_SAMPLING_MIN_REMAINING_STEPS", 2048),
         horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
             "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
             (0.0, 0.0, 1.0),
@@ -1027,7 +1027,9 @@ def _build_rollout_start_sampler(
     max_start = max(0, env.n - 2)
     if not config.enabled or max_start <= 0:
         return None
-    min_remaining_steps = int(min(max(1, rollout_horizon), max(1, config.min_remaining_steps)))
+    safe_rollout_horizon = max(1, int(rollout_horizon))
+    safe_config_min_remaining_steps = max(1, int(config.min_remaining_steps))
+    min_remaining_steps = int(min(safe_rollout_horizon, max(safe_config_min_remaining_steps, safe_rollout_horizon // 2)))
     effective_max_start = int(np.clip(env.n - min_remaining_steps - 1, 0, max_start))
     if effective_max_start < 0:
         return None
