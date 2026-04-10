@@ -682,7 +682,7 @@ class RolloutStartSamplingConfig:
     score_power: float = 1.0
     score_epsilon: float = 1e-6
     lead_steps: int = 512
-    start_exclusion_window: int = 32768
+    start_exclusion_window: Optional[int] = None
     horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
 
