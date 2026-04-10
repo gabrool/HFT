@@ -681,7 +681,7 @@ class RolloutStartSamplingConfig:
     weighted_mix: float = 0.8
     score_power: float = 1.0
     score_epsilon: float = 1e-6
-    lead_steps: int = 5
+    lead_steps: int = 512
     min_remaining_steps: int = 256
     horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
@@ -733,7 +733,7 @@ def load_rollout_start_sampling_config() -> RolloutStartSamplingConfig:
         weighted_mix=_env_float("BYBIT_MM_START_SAMPLING_WEIGHTED_MIX", 0.8),
         score_power=_env_float("BYBIT_MM_START_SAMPLING_SCORE_POWER", 1.0),
         score_epsilon=_env_float("BYBIT_MM_START_SAMPLING_SCORE_EPS", 1e-6),
-        lead_steps=_env_int("BYBIT_MM_START_SAMPLING_LEAD_STEPS", 5),
+        lead_steps=_env_int("BYBIT_MM_START_SAMPLING_LEAD_STEPS", 512),
         min_remaining_steps=_env_int("BYBIT_MM_START_SAMPLING_MIN_REMAINING_STEPS", 256),
         horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
             "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
