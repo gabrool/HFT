@@ -3532,8 +3532,8 @@ def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
         raise ValueError(
             "Unsupported market PPO checkpoint schema. "
             f"Expected checkpoint_schema={MM_PPO_CHECKPOINT_SCHEMA!r}, got {schema!r}. "
-            "Old residual-era checkpoints are intentionally unsupported; retrain or re-export "
-            "a direct-quote PPO checkpoint."
+            "Legacy residual checkpoints are intentionally unsupported; retrain or re-export "
+            "a direct quote policy PPO checkpoint."
         )
     return str(schema)
 
@@ -3542,7 +3542,7 @@ def _canonical_market_ppo_action_semantics(ckpt: Dict[str, Any]) -> Tuple[str, .
     semantics = ckpt.get("action_semantics")
     canonical_error = (
         "Unsupported market PPO checkpoint action semantics. "
-        f"Expected {list(MM_PPO_ACTION_SEMANTICS)!r}; retrain or re-export a direct-quote PPO checkpoint."
+        f"Expected {list(MM_PPO_ACTION_SEMANTICS)!r}; retrain or re-export a direct quote policy PPO checkpoint with center/width/skew/taker controls."
     )
     if isinstance(semantics, tuple):
         semantics = list(semantics)
@@ -3666,6 +3666,7 @@ def train_market_ppo(
         f"neutral_direct_quote_init={config.neutral_direct_quote_init} "
         "direct_quote_neutral_means="
         "{center=0,width_control=0,skew_control=0,taker_signal=0} "
+        "action_controls=center/width/skew/taker controls "
         f"init_log_std={config.init_log_std:.4f} "
         f"action_mag_coef={config.action_mag_coef:.6f} "
         f"action_mag_power={config.action_mag_power:.2f}"
@@ -4638,7 +4639,7 @@ def run_pipeline(
         elif resolved_eval_ckpt is None:
             rl_policy_reason = "no path provided"
         elif not Path(resolved_eval_ckpt).exists():
-            missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using zero-action deltas for RL run."
+            missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using zero-action benchmark for RL run."
             if require_rl_ckpt:
                 raise FileNotFoundError(missing_msg)
             warnings.warn(missing_msg, RuntimeWarning)
@@ -4691,7 +4692,7 @@ def run_pipeline(
         else:
             if mm_policy is None:
                 if rl_policy_reason == "no path provided":
-                    print("[mm eval] no policy path provided; using zero-action deltas for RL run.")
+                    print("[mm eval] no policy path provided; using zero-action benchmark for RL run.")
                 rl_policy_fn = lambda _obs: _canonical_zero_market_action()
                 rl_policy_loaded = False
             else:
