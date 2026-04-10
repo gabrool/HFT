@@ -81,6 +81,7 @@ DEFAULT_MM_FILL_EMA_WINDOW_STEPS = 3
 DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
+DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
 # Inventory risk thresholds are denominated in quote notional (USD).
 JOINED_CACHE_SCHEMA_VERSION = 1
 JOINED_FEATURE_SCHEMA_VERSION = 1
@@ -360,32 +361,35 @@ def _diag_gaussian_entropy(log_std: torch.Tensor) -> torch.Tensor:
     return (log_std + 0.5 * (1.0 + LOG_2PI)).sum(dim=-1)
 
 
-def _resolve_market_action_dim(allow_taker: bool) -> int:
-    return 3 if bool(allow_taker) else 2
+def _resolve_market_action_dim(_allow_taker: Optional[bool] = None) -> int:
+    return 4
 
 
 def _ppo_action_bounds(
     env: Optional["MarketMakingEnv"],
-    action_dim: int,
     device: torch.device | str,
-    delta_scale: float,
-    taker_scale: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    low = torch.full((action_dim,), -1.0, device=device, dtype=torch.float32)
-    high = torch.full((action_dim,), 1.0, device=device, dtype=torch.float32)
-    if action_dim >= 1:
-        delta_limit = abs(float(delta_scale))
-        if env is not None:
-            delta_limit = min(delta_limit, float(env.delta_bps_limit))
-        low[0] = -delta_limit
-        high[0] = delta_limit
-    if action_dim >= 2:
-        low[1] = low[0]
-        high[1] = high[0]
-    if action_dim >= 3:
-        taker_limit = abs(float(taker_scale)) if env is None or env.allow_taker else 0.0
-        low[2] = -taker_limit
-        high[2] = taker_limit
+    action_dim = _resolve_market_action_dim()
+    center_limit_bps = (
+        float(env.delta_bps_limit)
+        if env is not None
+        else abs(float(_env_float("BYBIT_MM_DELTA_BPS_LIMIT", 1.0)))
+    )
+    taker_signal_limit = (
+        float(env.taker_signal_limit)
+        if env is not None
+        else abs(float(_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT)))
+    )
+    low = torch.tensor(
+        [-center_limit_bps, -1.0, -1.0, -taker_signal_limit],
+        device=device,
+        dtype=torch.float32,
+    )
+    high = torch.tensor(
+        [center_limit_bps, 1.0, 1.0, taker_signal_limit],
+        device=device,
+        dtype=torch.float32,
+    )
     return low, high
 
 
@@ -544,6 +548,9 @@ def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
     fill_tolerance = float(os.environ.get("BYBIT_MM_FILL_TOLERANCE", "1e-6"))
     taker_fee_bps = float(os.environ.get("BYBIT_MM_TAKER_FEE_BPS", str(DEFAULT_MM_TAKER_FEE_BPS)))
     taker_threshold = float(os.environ.get("BYBIT_MM_TAKER_THRESHOLD", str(DEFAULT_MM_TAKER_THRESHOLD)))
+    taker_signal_limit = float(
+        os.environ.get("BYBIT_MM_TAKER_SIGNAL_LIMIT", str(DEFAULT_MM_TAKER_SIGNAL_LIMIT))
+    )
     delta_bps_limit_str = os.environ.get("BYBIT_MM_DELTA_BPS_LIMIT", "").strip()
     if not delta_bps_limit_str:
         raise ValueError(
@@ -558,6 +565,10 @@ def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
     if not np.isfinite(delta_bps_limit) or delta_bps_limit <= 0.0:
         raise ValueError(
             "BYBIT_MM_DELTA_BPS_LIMIT must be finite and > 0 in basis points (bps)."
+        )
+    if not np.isfinite(taker_signal_limit) or taker_signal_limit <= 0.0:
+        raise ValueError(
+            "BYBIT_MM_TAKER_SIGNAL_LIMIT must be finite and > 0."
         )
     if inv_soft_notional <= 0.0:
         raise ValueError("BYBIT_MM_INV_SOFT_NOTIONAL must be > 0 (quote notional, USD).")
@@ -585,6 +596,7 @@ def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
         "maker_rebate_bps": maker_rebate_bps,
         "taker_fee_bps": taker_fee_bps,
         "taker_threshold": taker_threshold,
+        "taker_signal_limit": taker_signal_limit,
         "inventory_penalty": inventory_penalty,
         "inv_soft_notional": inv_soft_notional,
         "lambda_inv": lambda_inv,
@@ -2044,6 +2056,7 @@ class MarketMakingEnv:
         taker_fee_bps: float = DEFAULT_MM_TAKER_FEE_BPS,
         allow_taker: bool = True,
         taker_threshold: float = DEFAULT_MM_TAKER_THRESHOLD,
+        taker_signal_limit: float = DEFAULT_MM_TAKER_SIGNAL_LIMIT,
         inventory_penalty: float = 0.0,
         inv_soft_notional: float,
         lambda_inv: float = 0.0,
@@ -2077,6 +2090,9 @@ class MarketMakingEnv:
         self.taker_fee_bps = taker_fee_bps
         self.allow_taker = allow_taker
         self.taker_threshold = taker_threshold
+        self.taker_signal_limit = float(taker_signal_limit)
+        if not np.isfinite(self.taker_signal_limit) or self.taker_signal_limit <= 0.0:
+            raise ValueError("taker_signal_limit must be finite and > 0.")
         self.inventory_penalty = inventory_penalty
         if inv_soft_notional <= 0.0:
             raise ValueError("inv_soft_notional must be > 0 in quote notional (USD).")
@@ -2460,11 +2476,15 @@ class MarketMakingEnv:
 
     def _parse_action(self, action: Any) -> Tuple[float, float, float]:
         """Hot-path parser for canonical float32 action arrays."""
-        expected_dim = 3 if self.allow_taker else 2
+        expected_dim = _resolve_market_action_dim()
         if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.shape == (expected_dim,):
-            if action.shape[0] == 2:
-                return float(action[0]), float(action[1]), 0.0
-            return float(action[0]), float(action[1]), float(action[2])
+            center_control = float(action[0])
+            width_control = float(action[1])
+            skew_control = float(action[2])
+            taker_signal = float(action[3])
+            bid_delta_bps = center_control - width_control + skew_control
+            ask_delta_bps = center_control + width_control - skew_control
+            return bid_delta_bps, ask_delta_bps, taker_signal
         # Minimal debug conversion/fallback for non-canonical callers outside rollout hot paths.
         action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
         require(
@@ -2473,9 +2493,13 @@ class MarketMakingEnv:
         )
         if not np.all(np.isfinite(action_arr)):
             raise ValueError(f"Action components must be finite, got {action_arr}")
-        if action_arr.shape[0] == 2:
-            return float(action_arr[0]), float(action_arr[1]), 0.0
-        return float(action_arr[0]), float(action_arr[1]), float(action_arr[2])
+        center_control = float(action_arr[0])
+        width_control = float(action_arr[1])
+        skew_control = float(action_arr[2])
+        taker_signal = float(action_arr[3])
+        bid_delta_bps = center_control - width_control + skew_control
+        ask_delta_bps = center_control + width_control - skew_control
+        return bid_delta_bps, ask_delta_bps, taker_signal
 
     def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
         return self.features[idx, start:end]
@@ -2638,6 +2662,7 @@ class MarketMakingEnv:
         self.last_taker_sell_clipped = 0.0
         if not self.allow_taker:
             return 0.0, 0.0
+        taker_signal = float(np.clip(taker_signal, -self.taker_signal_limit, self.taker_signal_limit))
         if abs(taker_signal) < self.taker_threshold:
             return 0.0, 0.0
         best_bid = float(self.best_bid[idx])
@@ -2933,7 +2958,7 @@ class MarketMakingEnv:
     def step_canonical_action_array(
         self, action_arr: np.ndarray, *, emit_info: bool = False
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
-        expected_dim = 3 if self.allow_taker else 2
+        expected_dim = _resolve_market_action_dim()
         if not isinstance(action_arr, np.ndarray):
             raise TypeError(f"Expected np.ndarray action_arr, got {type(action_arr)!r}")
         if action_arr.dtype != np.float32:
@@ -2944,9 +2969,12 @@ class MarketMakingEnv:
         )
         if not np.all(np.isfinite(action_arr)):
             raise ValueError(f"Action components must be finite, got {action_arr}")
-        bid_delta_bps = float(action_arr[0])
-        ask_delta_bps = float(action_arr[1])
-        taker_signal = float(action_arr[2]) if expected_dim == 3 else 0.0
+        center_control = float(action_arr[0])
+        width_control = float(action_arr[1])
+        skew_control = float(action_arr[2])
+        bid_delta_bps = center_control - width_control + skew_control
+        ask_delta_bps = center_control + width_control - skew_control
+        taker_signal = float(action_arr[3])
         return self._step_from_components(
             bid_delta_bps,
             ask_delta_bps,
@@ -2981,7 +3009,7 @@ class MLP(nn.Module):
 
 
 class MarketPolicyNet(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: Iterable[int] = (128, 128), action_dim: int = 3):
+    def __init__(self, input_dim: int, hidden_dims: Iterable[int] = (128, 128), action_dim: int = 4):
         super().__init__()
         # MarketPolicyNet wraps its MLP under .net for compatibility with checkpoints.
         self.net = MLP(input_dim, hidden_dims, action_dim)
@@ -2996,7 +3024,7 @@ class MarketPolicyValueNet(nn.Module):
         input_dim: int,
         policy_hidden: Iterable[int] = (128, 128),
         value_hidden: Iterable[int] = (128, 128),
-        action_dim: int = 3,
+        action_dim: int = 4,
         init_log_std: float = -3.0,
     ):
         super().__init__()
@@ -3078,8 +3106,6 @@ def collect_market_rollout(
     env: MarketMakingEnv,
     model: MarketPolicyValueNet,
     device: str,
-    delta_scale: float = 1.0,
-    taker_scale: float = 1.0,
     horizon: int = 32768,
     rollouts_per_epoch: int = 4,
     randomize_start: bool = True,
@@ -3125,7 +3151,7 @@ def collect_market_rollout(
     dones_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
-    action_dim = _resolve_market_action_dim(env.allow_taker)
+    action_dim = _resolve_market_action_dim()
     action_cpu_buf = np.empty((action_dim,), dtype=np.float32)
     action_cpu_stage_t: Optional[torch.Tensor] = None
     if target_device.type == "cuda":
@@ -3135,10 +3161,7 @@ def collect_market_rollout(
         action_cpu_stage_t = torch.empty((action_dim,), dtype=torch.float32, device="cpu", **stage_kwargs)
     action_low, action_high = _ppo_action_bounds(
         env,
-        action_dim,
         target_device,
-        delta_scale,
-        taker_scale,
     )
 
     max_start = max(0, env.n - 2)
@@ -3264,8 +3287,6 @@ def ppo_update_market(
     rollout: Dict[str, torch.Tensor],
     config: PPOConfig,
     device: str,
-    delta_scale: float = 1.0,
-    taker_scale: float = 1.0,
     non_blocking: bool = True,
     env: Optional[MarketMakingEnv] = None,
 ) -> Dict[str, float]:
@@ -3297,10 +3318,7 @@ def ppo_update_market(
         same_device = (target_device.index is None) or (obs.device.index == target_device.index)
     action_low, action_high = _ppo_action_bounds(
         env,
-        action_dim,
         target_device,
-        delta_scale,
-        taker_scale,
     )
     indices = torch.arange(n, device=obs.device)
     action_mag_loss_total = 0.0
@@ -3453,16 +3471,12 @@ def evaluate_market_policy(
     env: MarketMakingEnv,
     policy: MarketPolicyNet,
     device: str = "cuda",
-    delta_scale: float = 1.0,
-    taker_scale: float = 1.0,
 ) -> Dict[str, Any]:
     def _policy_fn(obs: np.ndarray) -> np.ndarray:
         return _policy_action_from_obs_numpy(
             obs,
             policy,
             device,
-            delta_scale,
-            taker_scale,
             env=env,
         )
 
@@ -3471,10 +3485,8 @@ def evaluate_market_policy(
 
 def _canonical_market_action_array(
     action: np.ndarray | torch.Tensor | Sequence[float],
-    *,
-    allow_taker: bool,
 ) -> np.ndarray:
-    expected_dim = 3 if bool(allow_taker) else 2
+    expected_dim = _resolve_market_action_dim()
     if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.ndim == 1:
         action_arr = action
     else:
@@ -3488,21 +3500,18 @@ def _canonical_market_action_array(
     return action_arr
 
 
-def _canonical_zero_market_action(*, allow_taker: bool) -> np.ndarray:
+def _canonical_zero_market_action() -> np.ndarray:
     """Allocate the canonical no-op action used in training/eval stepping loops."""
-    if bool(allow_taker):
-        return np.zeros((3,), dtype=np.float32)
-    return np.zeros((2,), dtype=np.float32)
+    return np.zeros((_resolve_market_action_dim(),), dtype=np.float32)
 
 
-def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float]:
+def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float, float]:
     action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
     require(
-        action_arr.shape in ((2,), (3,)),
-        f"Expected canonical action shape (2,) or (3,), got shape={action_arr.shape}",
+        action_arr.shape == (_resolve_market_action_dim(),),
+        f"Expected canonical action shape {(4,)}, got shape={action_arr.shape}",
     )
-    taker_delta = float(action_arr[2]) if action_arr.shape[0] == 3 else 0.0
-    return float(action_arr[0]), float(action_arr[1]), taker_delta
+    return float(action_arr[0]), float(action_arr[1]), float(action_arr[2]), float(action_arr[3])
 
 
 def evaluate_market_policy_ppo(
@@ -3511,8 +3520,6 @@ def evaluate_market_policy_ppo(
     *,
     stochastic: bool,
     device: str = "cuda",
-    delta_scale: float = 1.0,
-    taker_scale: float = 1.0,
     generator: Optional[torch.Generator] = None,
 ) -> Dict[str, Any]:
     def _policy_fn(obs: np.ndarray) -> np.ndarray:
@@ -3522,11 +3529,9 @@ def evaluate_market_policy_ppo(
             stochastic=stochastic,
             generator=generator,
             device=device,
-            delta_scale=delta_scale,
-            taker_scale=taker_scale,
             env=env,
         )
-        return _canonical_market_action_array(action, allow_taker=env.allow_taker)
+        return _canonical_market_action_array(action)
 
     return evaluate_market_making(env, _policy_fn)
 
@@ -3535,15 +3540,10 @@ def _deterministic_env_action_from_model_output(
     raw_action: torch.Tensor,
     *,
     env: Optional[MarketMakingEnv],
-    delta_scale: float,
-    taker_scale: float,
 ) -> torch.Tensor:
     action_low, action_high = _ppo_action_bounds(
         env,
-        int(raw_action.shape[-1]),
         raw_action.device,
-        delta_scale,
-        taker_scale,
     )
     return _postprocess_bounded_env_action(raw_action, action_low, action_high)
 
@@ -3552,8 +3552,6 @@ def _policy_action_from_obs_numpy(
     obs: np.ndarray,
     policy: torch.nn.Module,
     device: str,
-    delta_scale: float,
-    taker_scale: float,
     *,
     env: Optional[MarketMakingEnv] = None,
 ) -> np.ndarray:
@@ -3563,10 +3561,8 @@ def _policy_action_from_obs_numpy(
         action_env = _deterministic_env_action_from_model_output(
             raw_action,
             env=env,
-            delta_scale=delta_scale,
-            taker_scale=taker_scale,
         )
-    return _canonical_market_action_array(action_env.cpu().numpy(), allow_taker=env.allow_taker if env is not None else True)
+    return _canonical_market_action_array(action_env.cpu().numpy())
 
 
 def _ppo_action_from_obs_numpy(
@@ -3576,17 +3572,12 @@ def _ppo_action_from_obs_numpy(
     generator: Optional[torch.Generator] = None,
     *,
     device: str = "cuda",
-    delta_scale: float = 1.0,
-    taker_scale: float = 1.0,
     env: Optional[MarketMakingEnv] = None,
 ) -> np.ndarray:
     obs_t = torch.from_numpy(obs_np).to(device)
     action_low, action_high = _ppo_action_bounds(
         env,
-        int(model.log_std.shape[0]),
         obs_t.device,
-        delta_scale,
-        taker_scale,
     )
     with torch.no_grad():
         mean, log_std, _value = model(obs_t.unsqueeze(0))
@@ -3692,7 +3683,7 @@ def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
     train_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
     _ = train_env.reset(start_idx=0)
     done = False
-    action_array = _canonical_zero_market_action(allow_taker=train_env.allow_taker)
+    action_array = _canonical_zero_market_action()
     while not done:
         _, _, done, _ = train_env.step_canonical_action_array(action_array, emit_info=False)
     state = train_env.get_obs_norm_state()
@@ -3811,7 +3802,7 @@ def _canonical_market_ppo_action_dim(ckpt: Dict[str, Any]) -> int:
         action_dim = int(ckpt["action_dim"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(canonical_error) from exc
-    if action_dim <= 0:
+    if action_dim != _resolve_market_action_dim():
         raise ValueError(canonical_error)
     return action_dim
 
@@ -3888,8 +3879,6 @@ def train_market_ppo(
     epochs: int = 10,
     config: Optional[PPOConfig] = None,
     ckpt_path: Optional[Path] = None,
-    delta_scale: float = 1.0,
-    taker_scale: float = 1.0,
     rollout_storage: str = "gpu",
     pin_rollout_memory: bool = True,
     non_blocking_transfers: bool = True,
@@ -3900,7 +3889,7 @@ def train_market_ppo(
     stochastic_val_seed = _env_int("BYBIT_MM_PPO_VAL_SEED", 0)
     compile_enabled = _env_bool("BYBIT_MM_COMPILE_PPO", False)
     compile_mode = os.environ.get("BYBIT_MM_COMPILE_MODE", "reduce-overhead")
-    action_dim = _resolve_market_action_dim(train_env.allow_taker)
+    action_dim = _resolve_market_action_dim()
     model = MarketPolicyValueNet(
         input_dim,
         policy_hidden=config.policy_hidden,
@@ -3954,10 +3943,7 @@ def train_market_ppo(
     probe_obs = _build_market_probe_obs_batch(val_env, batch_size=8, device=device)
     action_low, action_high = _ppo_action_bounds(
         train_env,
-        int(model.log_std.shape[0]),
         device,
-        delta_scale,
-        taker_scale,
     )
     with torch.no_grad():
         bounded_probe_action = _bounded_ppo_mean_action(
@@ -3977,7 +3963,7 @@ def train_market_ppo(
         f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
         f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
         f"env_delta_bps_limit={train_env.delta_bps_limit:.4f} "
-        f"allow_taker={train_env.allow_taker} "
+        f"taker_signal_limit={train_env.taker_signal_limit:.4f} "
         f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
         f"env_action={_market_env_action_tuple(bounded_probe_action)} "
         f"bounded_before_step={within_bounds}"
@@ -4004,8 +3990,6 @@ def train_market_ppo(
             train_env,
             model,
             device,
-            delta_scale=delta_scale,
-            taker_scale=taker_scale,
             horizon=config.rollout_horizon,
             rollouts_per_epoch=config.rollouts_per_epoch,
             randomize_start=config.randomize_rollout_start,
@@ -4019,8 +4003,6 @@ def train_market_ppo(
             rollout,
             config,
             device,
-            delta_scale=delta_scale,
-            taker_scale=taker_scale,
             non_blocking=non_blocking_transfers,
             env=train_env,
         )
@@ -4065,8 +4047,6 @@ def train_market_ppo(
                 model,
                 stochastic=False,
                 device=device,
-                delta_scale=delta_scale,
-                taker_scale=taker_scale,
             )
             stochastic_generator = torch.Generator(device=torch.device(device).type)
             stochastic_generator.manual_seed(stochastic_val_seed)
@@ -4075,8 +4055,6 @@ def train_market_ppo(
                 model,
                 stochastic=True,
                 device=device,
-                delta_scale=delta_scale,
-                taker_scale=taker_scale,
                 generator=stochastic_generator,
             )
             deterministic_sel = _checkpoint_selection_metrics(deterministic_report)
@@ -5254,8 +5232,6 @@ def run_pipeline(
         "fit_count_by_horizon": baseline_alpha_calibration.fit_count_by_horizon.astype(int).tolist(),
     }
     print(f"[mm runtime] alpha calibration {json.dumps(calibration_summary, sort_keys=True)}")
-    delta_scale = float(os.environ.get("BYBIT_MM_DELTA_SCALE", "10.0"))
-    taker_scale = float(os.environ.get("BYBIT_MM_TAKER_SCALE", "1.0"))
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
 
     mm_train_env = MarketMakingEnv(
@@ -5374,8 +5350,6 @@ def run_pipeline(
             epochs=_resolve_ppo_epochs(ppo_epochs),
             config=mm_ppo_config,
             ckpt_path=mm_best_ckpt,
-            delta_scale=delta_scale,
-            taker_scale=taker_scale,
             rollout_storage=rollout_storage,
             pin_rollout_memory=pin_rollout_memory,
             non_blocking_transfers=non_blocking_transfers,
@@ -5511,8 +5485,6 @@ def run_pipeline(
                 mm_ppo_model,
                 stochastic=ppo_eval_stochastic,
                 device=device,
-                delta_scale=delta_scale,
-                taker_scale=taker_scale,
                 generator=stochastic_generator,
             )
             _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
@@ -5522,28 +5494,24 @@ def run_pipeline(
                 mm_ppo_model,
                 stochastic=ppo_eval_stochastic,
                 device=device,
-                delta_scale=delta_scale,
-                taker_scale=taker_scale,
                 generator=stochastic_generator,
             )
         else:
             if mm_policy is None:
                 if rl_policy_reason == "no path provided":
                     print("[mm eval] no policy path provided; using baseline deltas for RL run.")
-                rl_policy_fn = lambda _obs: (0.0, 0.0, 0.0)
+                rl_policy_fn = lambda _obs: _canonical_zero_market_action()
                 rl_policy_loaded = False
             else:
                 rl_policy_loaded = True
                 rl_policy_eval_mode = "deterministic_mean"
                 print("[mm eval] deterministic policy action semantics=bounded_harmonized source=code")
 
-                def rl_policy_fn(obs: np.ndarray) -> Tuple[float, float, float]:
+                def rl_policy_fn(obs: np.ndarray) -> np.ndarray:
                     return _policy_action_from_obs_numpy(
                         obs,
                         mm_policy,
                         device,
-                        delta_scale,
-                        taker_scale,
                         env=mm_test_env,
                     )
 
