@@ -727,7 +727,7 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
 
 def resolve_vol_bucket_edges_bps(
     *,
-    env_var_name: str = "BYBIT_MM_BASELINE_VOL_BUCKET_BPS",
+    env_var_name: str = "BYBIT_MM_VOL_BUCKET_BPS",
     default_value: str = "0.5,1.0,2.0,4.0,8.0",
 ) -> List[float]:
     raw_value = os.environ.get(env_var_name, default_value)
