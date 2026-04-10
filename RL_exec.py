@@ -72,7 +72,7 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
-MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v1"
+MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v2"
 MM_PPO_ACTION_DIM = 4
 MM_PPO_ACTION_SEMANTICS = (
     "center_bps",
@@ -436,18 +436,6 @@ def _bounded_ppo_mean_action(
     return _postprocess_bounded_env_action(mean, action_low, action_high)
 
 
-def _bounded_mean_action_penalty(
-    mean: torch.Tensor,
-    action_low: torch.Tensor,
-    action_high: torch.Tensor,
-    power: float = 2.0,
-) -> torch.Tensor:
-    bounded_mean = _bounded_ppo_mean_action(mean, action_low, action_high)
-    bound_mag = torch.maximum(action_low.abs(), action_high.abs())
-    normalized_mag = bounded_mean / torch.clamp(bound_mag, min=1e-12)
-    return (normalized_mag.abs() ** power).mean()
-
-
 def _bounded_ppo_latent_action(
     action_env: torch.Tensor,
     action_low: torch.Tensor,
@@ -626,7 +614,7 @@ def _resolve_eval_checkpoint(
                 "BYBIT_MM_REQUIRE_RL_CKPT=true requires explicit BYBIT_MM_RL_CKPT when run_mode=train_eval."
             )
         # In train_eval, explicit BYBIT_MM_RL_CKPT is treated as user intent;
-        # missing path is fatal, no zero-action fallback.
+        # missing path is fatal.
         if external_ckpt_explicit:
             resolved_eval_ckpt = resolved_external_rl_ckpt
             if resolved_eval_ckpt is None or not Path(resolved_eval_ckpt).exists():
@@ -680,6 +668,8 @@ class DirectQuoteConfig:
     spread_floor_bps: float
     spread_cap_bps: float
     obs_spread_anchor_frac: float
+    width_expand_mult: float
+    width_tighten_frac: float
     skew_limit_bps: float
     skew_fraction_limit: float
     taker_signal_limit: float
@@ -692,6 +682,8 @@ def load_direct_quote_config() -> DirectQuoteConfig:
             spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
+            width_expand_mult=_env_float("BYBIT_MM_WIDTH_EXPAND_MULT", 3.0),
+            width_tighten_frac=_env_float("BYBIT_MM_WIDTH_TIGHTEN_FRAC", 0.5),
             skew_limit_bps=_env_float("BYBIT_MM_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
             skew_fraction_limit=_env_float("BYBIT_MM_SKEW_FRACTION_LIMIT", DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
@@ -712,6 +704,14 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         or cfg.obs_spread_anchor_frac > 1.0
     ):
         raise ValueError("obs_spread_anchor_frac must be finite and in [0.0, 1.0]")
+    if not np.isfinite(cfg.width_expand_mult) or cfg.width_expand_mult < 1.0:
+        raise ValueError("width_expand_mult must be finite and >= 1.0")
+    if (
+        not np.isfinite(cfg.width_tighten_frac)
+        or cfg.width_tighten_frac < 0.0
+        or cfg.width_tighten_frac >= 1.0
+    ):
+        raise ValueError("width_tighten_frac must be finite and in [0.0, 1.0)")
     if not np.isfinite(cfg.skew_limit_bps) or cfg.skew_limit_bps < 0.0:
         raise ValueError("skew_limit_bps must be finite and >= 0.0")
     if (
@@ -2273,15 +2273,18 @@ class MarketMakingEnv:
         floor_bps = cfg.spread_floor_bps
         if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
             floor_bps = max(floor_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
-        floor_bps = float(np.clip(floor_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
-        width_alpha = 0.5 * (float(np.clip(width_control, -1.0, 1.0)) + 1.0)
-        half_spread_bps = floor_bps + width_alpha * max(0.0, cfg.spread_cap_bps - floor_bps)
-        half_spread_bps = float(np.clip(half_spread_bps, floor_bps, cfg.spread_cap_bps))
+        anchor_half_spread_bps = float(np.clip(floor_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+        wc = float(np.clip(width_control, -1.0, 1.0))
+        if wc >= 0.0:
+            half_spread_bps = anchor_half_spread_bps * (1.0 + wc * (cfg.width_expand_mult - 1.0))
+        else:
+            half_spread_bps = anchor_half_spread_bps * (1.0 + wc * cfg.width_tighten_frac)
+        half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         half_spread_floor = max(half_spread_bps, 1e-12)
         skew_limit_bps = min(cfg.skew_limit_bps, cfg.skew_fraction_limit * half_spread_floor)
         skew_bps = float(np.clip(skew_control, -1.0, 1.0)) * skew_limit_bps
-        bid_half_spread_bps = max(floor_bps, half_spread_bps + skew_bps)
-        ask_half_spread_bps = max(floor_bps, half_spread_bps - skew_bps)
+        bid_half_spread_bps = max(cfg.spread_floor_bps, half_spread_bps + skew_bps)
+        ask_half_spread_bps = max(cfg.spread_floor_bps, half_spread_bps - skew_bps)
         center_bps = float(np.clip(center_bps, -cfg.center_limit_bps, cfg.center_limit_bps))
         bid = mid + bps_to_px(mid, center_bps - bid_half_spread_bps)
         ask = mid + bps_to_px(mid, center_bps + ask_half_spread_bps)
@@ -2742,12 +2745,20 @@ class MarketPolicyValueNet(nn.Module):
         policy_hidden: Iterable[int] = (128, 128),
         value_hidden: Iterable[int] = (128, 128),
         action_dim: int = 4,
-        init_log_std: float = -3.0,
+        init_log_std: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.policy_net = MarketPolicyNet(input_dim, hidden_dims=policy_hidden, action_dim=action_dim)
         self.value_net = MLP(input_dim, value_hidden, 1)
-        self.log_std = nn.Parameter(torch.full((action_dim,), init_log_std))
+        if init_log_std is None:
+            init_log_std_vec = torch.full((action_dim,), -3.0, dtype=torch.float32)
+        else:
+            init_log_std_vec = torch.as_tensor(init_log_std, dtype=torch.float32).reshape(-1)
+            if init_log_std_vec.numel() != action_dim:
+                raise ValueError(
+                    f"init_log_std must have length {action_dim}, got {init_log_std_vec.numel()}"
+                )
+        self.log_std = nn.Parameter(init_log_std_vec.clone())
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mean = self.policy_net(x)
@@ -2766,13 +2777,21 @@ def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
     return final_policy_linear
 
 
-def _init_neutral_direct_quote_policy(model: MarketPolicyValueNet, init_log_std: float) -> None:
+def _init_active_neutral_direct_quote_policy(
+    model: MarketPolicyValueNet,
+    init_log_std: Sequence[float],
+) -> None:
     final_policy_linear = _find_final_policy_linear_layer(model)
+    init_log_std_vec = torch.as_tensor(init_log_std, dtype=model.log_std.dtype, device=model.log_std.device).reshape(-1)
+    if init_log_std_vec.numel() != model.log_std.numel():
+        raise ValueError(
+            f"Active-neutral direct quote init log_std vector must have length {model.log_std.numel()}, got {init_log_std_vec.numel()}"
+        )
     with torch.no_grad():
         final_policy_linear.weight.zero_()
         if final_policy_linear.bias is not None:
             final_policy_linear.bias.zero_()
-        model.log_std.fill_(init_log_std)
+        model.log_std.copy_(init_log_std_vec)
 
 
 @dataclass
@@ -2783,9 +2802,7 @@ class PPOConfig:
     lr: float = 3e-4
     update_epochs: int = 4
     batch_size: int = 32768
-    entropy_coef: float = 0.01
-    action_mag_coef: float = 0.0
-    action_mag_power: float = 2.0
+    entropy_coef: float = 0.02
     value_coef: float = 0.5
     policy_hidden: Tuple[int, ...] = (128, 128)
     value_hidden: Tuple[int, ...] = (128, 128)
@@ -2794,8 +2811,10 @@ class PPOConfig:
     rollout_horizon: int = 32768
     rollouts_per_epoch: int = 4
     randomize_rollout_start: bool = True
-    neutral_direct_quote_init: bool = True
-    init_log_std: float = -3.0
+    init_log_std_center: float = -0.5
+    init_log_std_width: float = -0.25
+    init_log_std_skew: float = -0.75
+    init_log_std_taker: float = -0.25
 
 
 def compute_gae(
@@ -3038,8 +3057,6 @@ def ppo_update_market(
         target_device,
     )
     indices = torch.arange(n, device=obs.device)
-    action_mag_loss_total = 0.0
-    action_mag_loss_batches = 0
     for _ in range(config.update_epochs):
         perm = indices[torch.randperm(n, device=obs.device)]
         for start in range(0, n, config.batch_size):
@@ -3059,12 +3076,6 @@ def ppo_update_market(
                 mb_returns = returns[mb_idx_cpu].to(target_device, non_blocking=non_blocking)
 
             mean, log_std, value = model(mb_obs)
-            action_mag_loss = _bounded_mean_action_penalty(
-                mean,
-                action_low,
-                action_high,
-                power=config.action_mag_power,
-            )
             latent_actions = _bounded_ppo_latent_action(mb_actions, action_low, action_high)
             logp = _squashed_gaussian_log_prob(
                 latent_actions,
@@ -3082,26 +3093,17 @@ def ppo_update_market(
                 policy_loss
                 + config.value_coef * value_loss
                 - config.entropy_coef * entropy_loss
-                + config.action_mag_coef * action_mag_loss
             )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-            action_mag_loss_total += action_mag_loss.detach().item()
-            action_mag_loss_batches += 1
-
     storage = "gpu" if obs.device.type == target_device.type else "cpu"
     _timing_log(
         f"ppo_update storage={storage} on_device={same_device} manual_gaussian=true secs={time.perf_counter() - t0:.4f}"
     )
-    avg_action_mag_loss = (
-        action_mag_loss_total / action_mag_loss_batches
-        if action_mag_loss_batches > 0
-        else 0.0
-    )
-    return {"action_mag_loss": avg_action_mag_loss}
+    return {}
 
 def _steps_per_year_from_snapshot_ms(step_ms: float) -> float:
     if step_ms <= 0:
@@ -3184,22 +3186,6 @@ def compute_sortino(returns: np.ndarray, periods_per_year: float) -> float:
     return float(mean / downside_std * np.sqrt(periods_per_year))
 
 
-def evaluate_market_policy(
-    env: MarketMakingEnv,
-    policy: MarketPolicyNet,
-    device: str = "cuda",
-) -> Dict[str, Any]:
-    def _policy_fn(obs: np.ndarray) -> np.ndarray:
-        return _policy_action_from_obs_numpy(
-            obs,
-            policy,
-            device,
-            env=env,
-        )
-
-    return evaluate_market_making(env, _policy_fn)
-
-
 def _canonical_market_action_array(
     action: np.ndarray | torch.Tensor | Sequence[float],
 ) -> np.ndarray:
@@ -3217,8 +3203,8 @@ def _canonical_market_action_array(
     return action_arr
 
 
-def _canonical_zero_market_action() -> np.ndarray:
-    """Allocate the canonical no-op action used in training/eval stepping loops."""
+def _canonical_noop_market_action() -> np.ndarray:
+    """Allocate the canonical no-op action used in internal stepping loops."""
     return np.zeros((_resolve_market_action_dim(),), dtype=np.float32)
 
 
@@ -3251,35 +3237,6 @@ def evaluate_market_policy_ppo(
         return _canonical_market_action_array(action)
 
     return evaluate_market_making(env, _policy_fn)
-
-
-def _deterministic_env_action_from_model_output(
-    raw_action: torch.Tensor,
-    *,
-    env: Optional[MarketMakingEnv],
-) -> torch.Tensor:
-    action_low, action_high = _ppo_action_bounds(
-        env,
-        raw_action.device,
-    )
-    return _postprocess_bounded_env_action(raw_action, action_low, action_high)
-
-
-def _policy_action_from_obs_numpy(
-    obs: np.ndarray,
-    policy: torch.nn.Module,
-    device: str,
-    *,
-    env: Optional[MarketMakingEnv] = None,
-) -> np.ndarray:
-    obs_t = torch.from_numpy(obs).to(device)
-    with torch.no_grad():
-        raw_action = policy(obs_t.unsqueeze(0)).squeeze(0)
-        action_env = _deterministic_env_action_from_model_output(
-            raw_action,
-            env=env,
-        )
-    return _canonical_market_action_array(action_env.cpu().numpy())
 
 
 def _ppo_action_from_obs_numpy(
@@ -3400,7 +3357,7 @@ def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
     train_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
     _ = train_env.reset(start_idx=0)
     done = False
-    action_array = _canonical_zero_market_action()
+    action_array = _canonical_noop_market_action()
     while not done:
         _, _, done, _ = train_env.step_canonical_action_array(action_array, emit_info=False)
     state = train_env.get_obs_norm_state()
@@ -3532,8 +3489,8 @@ def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
         raise ValueError(
             "Unsupported market PPO checkpoint schema. "
             f"Expected checkpoint_schema={MM_PPO_CHECKPOINT_SCHEMA!r}, got {schema!r}. "
-            "Legacy residual checkpoints are intentionally unsupported; retrain or re-export "
-            "a direct quote policy PPO checkpoint."
+            "Direct-quote width semantics changed in v2; retrain under the new "
+            "anchor-centered width mapping and produce a v2 checkpoint."
         )
     return str(schema)
 
@@ -3558,20 +3515,13 @@ def load_market_ppo_model(
     input_dim: int,
     device: str = "cuda",
     ckpt_path: Optional[str] = None,
-    require_checkpoint: bool = False,
     checkpoint_data: Optional[Any] = None,
 ) -> Optional[MarketPolicyValueNet]:
     if not ckpt_path:
         return None
     path = Path(ckpt_path)
     if not path.exists():
-        if require_checkpoint:
-            raise FileNotFoundError(f"Market PPO checkpoint not found: {ckpt_path}")
-        warnings.warn(
-            f"Market PPO checkpoint not found: {ckpt_path}. Falling back to zero-action policy.",
-            RuntimeWarning,
-        )
-        return None
+        raise FileNotFoundError(f"Market PPO checkpoint not found: {ckpt_path}")
     ckpt = (
         checkpoint_data
         if checkpoint_data is not None
@@ -3644,10 +3594,22 @@ def train_market_ppo(
         policy_hidden=config.policy_hidden,
         value_hidden=config.value_hidden,
         action_dim=action_dim,
-        init_log_std=config.init_log_std,
+        init_log_std=(
+            config.init_log_std_center,
+            config.init_log_std_width,
+            config.init_log_std_skew,
+            config.init_log_std_taker,
+        ),
     ).to(device)
-    if config.neutral_direct_quote_init:
-        _init_neutral_direct_quote_policy(model, config.init_log_std)
+    _init_active_neutral_direct_quote_policy(
+        model,
+        (
+            config.init_log_std_center,
+            config.init_log_std_width,
+            config.init_log_std_skew,
+            config.init_log_std_taker,
+        ),
+    )
     print(
         "[mm ppo compile] "
         f"enabled={compile_enabled} "
@@ -3663,13 +3625,16 @@ def train_market_ppo(
         f"rollout_horizon={config.rollout_horizon} "
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
-        f"neutral_direct_quote_init={config.neutral_direct_quote_init} "
-        "direct_quote_neutral_means="
+        "active_neutral_direct_quote_init=true "
+        "initial_mean_action="
         "{center=0,width_control=0,skew_control=0,taker_signal=0} "
         "action_controls=center/width/skew/taker controls "
-        f"init_log_std={config.init_log_std:.4f} "
-        f"action_mag_coef={config.action_mag_coef:.6f} "
-        f"action_mag_power={config.action_mag_power:.2f}"
+        "init_log_std={"
+        f"center={config.init_log_std_center:.4f},"
+        f"width={config.init_log_std_width:.4f},"
+        f"skew={config.init_log_std_skew:.4f},"
+        f"taker={config.init_log_std_taker:.4f}"
+        "}"
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     train_obs_norm_state = train_env.get_obs_norm_state()
@@ -3756,7 +3721,7 @@ def train_market_ppo(
             pin_memory=pin_rollout_memory,
             non_blocking=non_blocking_transfers,
         )
-        ppo_update_summary = ppo_update_market(
+        ppo_update_market(
             model,
             optimizer,
             rollout,
@@ -3775,7 +3740,7 @@ def train_market_ppo(
             probe_mean = model.policy_net(probe_obs)
             bounded_probe_actions = _bounded_ppo_mean_action(probe_mean, action_low, action_high)
             probe_mean_abs = probe_mean.abs().mean(dim=0).detach().cpu().numpy()
-            bounded_probe_mean_action_mag = bounded_probe_actions.abs().mean(dim=0).detach().cpu().numpy()
+            bounded_probe_mean_action_abs = bounded_probe_actions.abs().mean(dim=0).detach().cpu().numpy()
             action_bound_magnitude = torch.maximum(action_low.abs(), action_high.abs())
             saturation_fraction = (
                 bounded_probe_actions.abs() >= (0.95 * action_bound_magnitude)
@@ -3790,12 +3755,11 @@ def train_market_ppo(
         print(
             "[mm ppo stats] "
             f"epoch={epoch + 1} "
-            f"action_mag_loss={ppo_update_summary['action_mag_loss']:.6f} "
             f"log_std={np.array2string(log_std_values, precision=4, floatmode='fixed')} "
             f"policy_head_weight_l2={policy_weight_l2:.6f} "
             f"policy_head_bias_l2={policy_bias_l2:.6f} "
             f"probe_mean_abs={np.array2string(probe_mean_abs, precision=6, floatmode='fixed')} "
-            f"bounded_probe_mean_action_mag={np.array2string(bounded_probe_mean_action_mag, precision=6, floatmode='fixed')} "
+            f"bounded_probe_mean_action_abs={np.array2string(bounded_probe_mean_action_abs, precision=6, floatmode='fixed')} "
             f"saturation_fraction={np.array2string(saturation_fraction, precision=6, floatmode='fixed')}"
         )
         if (epoch + 1) % config.val_every == 0:
@@ -4326,51 +4290,6 @@ def _summarize_for_log(value: Any) -> Any:
     return value
 
 
-def load_market_policy(
-    input_dim: int,
-    device: str = "cuda",
-    ckpt_path: Optional[str] = None,
-    require_checkpoint: bool = False,
-    checkpoint_data: Optional[Any] = None,
-) -> Optional[MarketPolicyNet]:
-    """Load a deterministic market policy (mean-action inference only)."""
-    if not ckpt_path:
-        return None
-    path = Path(ckpt_path)
-    if not path.exists():
-        if require_checkpoint:
-            raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
-        warnings.warn(
-            f"Market policy checkpoint not found: {ckpt_path}. Falling back to zero-action policy.",
-            RuntimeWarning,
-        )
-        return None
-    ckpt = (
-        checkpoint_data
-        if checkpoint_data is not None
-        else _torch_load_trusted_checkpoint(path, map_location=device)
-    )
-    ppo_model = load_market_ppo_model(
-        input_dim,
-        device=device,
-        ckpt_path=ckpt_path,
-        require_checkpoint=require_checkpoint,
-        checkpoint_data=ckpt,
-    )
-    if ppo_model is None:
-        return None
-    setattr(ppo_model.policy_net, "checkpoint_path", str(path.expanduser().resolve()))
-    print(
-        "[mm deterministic policy] "
-        f"path={path.expanduser().resolve()} "
-        "action_semantics=direct_quote source=checkpoint"
-    )
-    return ppo_model.policy_net
-
-
-
-
-
 
 
 def run_pipeline(
@@ -4496,9 +4415,7 @@ def run_pipeline(
         clip_ratio=float(os.environ.get("BYBIT_MM_PPO_CLIP_RATIO", "0.2")),
         gamma=float(os.environ.get("BYBIT_MM_PPO_GAMMA", "0.99")),
         gae_lambda=float(os.environ.get("BYBIT_MM_PPO_GAE_LAMBDA", "0.95")),
-        entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.0")),
-        action_mag_coef=_env_float("BYBIT_MM_PPO_ACTION_MAG_COEF", 0.0),
-        action_mag_power=_env_float("BYBIT_MM_PPO_ACTION_MAG_POWER", 2.0),
+        entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.02")),
         value_coef=float(os.environ.get("BYBIT_MM_PPO_VALUE_COEF", "0.5")),
         policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")),
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
@@ -4507,8 +4424,10 @@ def run_pipeline(
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 32768),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 4),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
-        neutral_direct_quote_init=_env_bool("BYBIT_MM_PPO_NEUTRAL_DIRECT_QUOTE_INIT", True),
-        init_log_std=_env_float("BYBIT_MM_PPO_INIT_LOG_STD", -1.5),
+        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.5),
+        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -0.25),
+        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -0.75),
+        init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -0.25),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
@@ -4600,11 +4519,6 @@ def run_pipeline(
         mm_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         obs_norm_source = "checkpoint"
 
-    zero_action_eval_t0 = time.perf_counter()
-    zero_action_policy_fn = lambda _obs: _canonical_zero_market_action()
-    zero_action_metrics = evaluate_market_making(mm_final_env, zero_action_policy_fn)
-    _timing_log(f"evaluate_market_making zero_action split=eval.full secs={time.perf_counter() - zero_action_eval_t0:.4f}")
-
     rl_metrics = None
     rl_dev_metrics = None
     ppo_eval_stochastic = _env_bool("BYBIT_MM_PPO_EVAL_STOCHASTIC", False)
@@ -4619,112 +4533,50 @@ def run_pipeline(
         f"eval_action={eval_action}"
     )
 
-    if run_mode == "train":
+    if run_mode != "train":
+        if resolved_eval_ckpt is None:
+            raise RuntimeError(
+                "run_mode in {'eval','train_eval'} requires a PPO checkpoint; none was resolved."
+            )
+        mm_ppo_model = load_market_ppo_model(
+            mm_obs_dim,
+            device=device,
+            ckpt_path=resolved_eval_ckpt,
+            checkpoint_data=eval_ckpt_payload,
+        )
+        require(mm_ppo_model is not None, "Failed to load eval PPO checkpoint")
+        rl_policy_loaded = True
+        rl_policy_reason = "loaded"
+        rl_policy_eval_mode = "stochastic_sample" if ppo_eval_stochastic else "deterministic_mean"
+        stochastic_generator = None
+        if ppo_eval_stochastic:
+            stochastic_generator = torch.Generator(device=torch.device(device).type)
+            stochastic_generator.manual_seed(ppo_eval_seed)
+        rl_eval_t0 = time.perf_counter()
+        rl_dev_metrics = evaluate_market_policy_ppo(
+            mm_test_env,
+            mm_ppo_model,
+            stochastic=ppo_eval_stochastic,
+            device=device,
+            generator=stochastic_generator,
+        )
+        _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
+        rl_eval_performed = True
+        rl_metrics = evaluate_market_policy_ppo(
+            mm_final_env,
+            mm_ppo_model,
+            stochastic=ppo_eval_stochastic,
+            device=device,
+            generator=stochastic_generator,
+        )
+    else:
         rl_policy_loaded = False
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
-        print("[mm eval] zero-action only; RL skipped because run_mode=train.")
-    else:
-        mm_ppo_model: Optional[MarketPolicyValueNet] = None
-        mm_policy: Optional[MarketPolicyNet] = None
-        if run_mode == "eval":
-            mm_ppo_model = load_market_ppo_model(
-                mm_obs_dim,
-                device=device,
-                ckpt_path=resolved_eval_ckpt,
-                require_checkpoint=True,
-                checkpoint_data=eval_ckpt_payload,
-            )
-            require(mm_ppo_model is not None, "Failed to load eval PPO checkpoint")
-            rl_policy_reason = "loaded"
-        elif resolved_eval_ckpt is None:
-            rl_policy_reason = "no path provided"
-        elif not Path(resolved_eval_ckpt).exists():
-            missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using zero-action benchmark for RL run."
-            if require_rl_ckpt:
-                raise FileNotFoundError(missing_msg)
-            warnings.warn(missing_msg, RuntimeWarning)
-            rl_policy_reason = "missing checkpoint"
-        else:
-            policy_require_checkpoint = require_rl_ckpt or (
-                run_mode == "train_eval" and external_ckpt_explicit
-            )
-            mm_ppo_model = load_market_ppo_model(
-                mm_obs_dim,
-                device=device,
-                ckpt_path=resolved_eval_ckpt,
-                require_checkpoint=policy_require_checkpoint,
-                checkpoint_data=eval_ckpt_payload,
-            )
-            if mm_ppo_model is None:
-                mm_policy = load_market_policy(
-                    mm_obs_dim,
-                    device=device,
-                    ckpt_path=resolved_eval_ckpt,
-                    require_checkpoint=policy_require_checkpoint,
-                    checkpoint_data=eval_ckpt_payload,
-                )
-            rl_policy_reason = "loaded" if (mm_ppo_model is not None or mm_policy is not None) else "missing checkpoint"
 
-        if mm_ppo_model is not None:
-            rl_policy_loaded = True
-            rl_policy_eval_mode = "stochastic_sample" if ppo_eval_stochastic else "deterministic_mean"
-            stochastic_generator = None
-            if ppo_eval_stochastic:
-                stochastic_generator = torch.Generator(device=torch.device(device).type)
-                stochastic_generator.manual_seed(ppo_eval_seed)
-            rl_eval_t0 = time.perf_counter()
-            rl_dev_metrics = evaluate_market_policy_ppo(
-                mm_test_env,
-                mm_ppo_model,
-                stochastic=ppo_eval_stochastic,
-                device=device,
-                generator=stochastic_generator,
-            )
-            _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
-            rl_eval_performed = True
-            rl_metrics = evaluate_market_policy_ppo(
-                mm_final_env,
-                mm_ppo_model,
-                stochastic=ppo_eval_stochastic,
-                device=device,
-                generator=stochastic_generator,
-            )
-        else:
-            if mm_policy is None:
-                if rl_policy_reason == "no path provided":
-                    print("[mm eval] no policy path provided; using zero-action benchmark for RL run.")
-                rl_policy_fn = lambda _obs: _canonical_zero_market_action()
-                rl_policy_loaded = False
-            else:
-                rl_policy_loaded = True
-                rl_policy_eval_mode = "deterministic_mean"
-                print("[mm eval] deterministic policy action_semantics=direct_quote source=checkpoint")
-
-                def rl_policy_fn(obs: np.ndarray) -> np.ndarray:
-                    return _policy_action_from_obs_numpy(
-                        obs,
-                        mm_policy,
-                        device,
-                        env=mm_test_env,
-                    )
-
-            rl_eval_t0 = time.perf_counter()
-            rl_dev_metrics = evaluate_market_making(mm_test_env, rl_policy_fn)
-            rl_metrics = evaluate_market_making(mm_final_env, rl_policy_fn)
-            _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
-            rl_eval_performed = True
-
-    # Return shape:
-    # - cmssl_test: CMSSL week-3 out-of-sample/downstream-development diagnostics.
-    # - mm_zero_action/mm_rl: final untouched week-4 (eval.full) metrics.
-    # - *_dev_* fields: week-3 development splits.
     return {
         "cmssl_test": cmssl_report,
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
-        "mm_zero_action": zero_action_metrics,
         "mm_rl": rl_metrics,
-        "mm_zero_action_dev_test": None,
-        "mm_zero_action_dev_val": None,
         "mm_rl_dev_test": rl_dev_metrics,
         # Fatal failures are surfaced via exceptions rather than persisted in provenance state.
         "mm_run_context": {
@@ -4797,17 +4649,12 @@ if __name__ == "__main__":
     )
     print("[cmssl test]", report["cmssl_test"])
     print("[mm obs scaling]", report["mm_obs_scaling"])
-    zero_action_report = report["mm_zero_action"]
     rl_report = report["mm_rl"]
-    # Ownership: __main__ prints MM summaries once; run_pipeline() only returns metrics.
-    # Keep default logs compact so routine runs stay readable; full reports are opt-in.
-    print("[mm eval]", _format_mm_summary("zero_action", zero_action_report))
     if rl_report is None:
         print("[mm rl] skipped (mm_rl is None)")
     else:
-        print("[mm eval]", _format_mm_summary("zero_action+rl", rl_report))
+        print("[mm eval]", _format_mm_summary("rl", rl_report))
     if verbose_reports:
-        print("[mm zero-action verbose]", _summarize_for_log(zero_action_report))
         if rl_report is None:
             print("[mm rl verbose] skipped (mm_rl is None)")
         else:
