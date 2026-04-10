@@ -51,23 +51,11 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
 ]
 FEATURE_EXTRA_DIM = 5
 ENV_OBS_EXTRA_STATE_DIM = 14
-# CMSSL market-making horizon contract is fixed: exactly [250, 500, 1000] ms.
-DEFAULT_MM_HORIZONS_MS = [250, 500, 1000]
-DEFAULT_MM_BASE_HALF_SPREAD_BPS = 0.0
-DEFAULT_MM_ALPHA_CENTER_SCALE = 1.0
-DEFAULT_MM_INVENTORY_CENTER_SCALE = 0.0
-DEFAULT_MM_VOL_WIDTH_SCALE = 1.0
-DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE = 0.0
-DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE = 0.0
 DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
 DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS = 50.0
 DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT = 0.75
-DEFAULT_MM_INV_REF_NOTIONAL = 1.0
-DEFAULT_MM_P250_WEIGHT = 0.0
-DEFAULT_MM_P500_WEIGHT = 0.0
-DEFAULT_MM_P1000_WEIGHT = 1.0
 # PPO training epochs environment variable (used across entrypoint/config helpers).
 PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
 # Scaling factors for market-making observation extra-state features.
@@ -687,24 +675,6 @@ def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
 
 
 @dataclass(frozen=True)
-class BaselineQuoteConfig:
-    base_half_spread_bps: float
-    alpha_center_scale: float
-    inventory_center_scale: float
-    vol_width_scale: float
-    uncertainty_width_scale: float
-    inventory_side_widen_scale: float
-    obs_spread_anchor_frac: float
-    spread_floor_bps: float
-    spread_cap_bps: float
-    inv_ref_notional: float
-    horizons_ms: List[int]
-    p250_weight: float
-    p500_weight: float
-    p1000_weight: float
-
-
-@dataclass(frozen=True)
 class DirectQuoteConfig:
     center_limit_bps: float
     spread_floor_bps: float
@@ -713,16 +683,6 @@ class DirectQuoteConfig:
     skew_limit_bps: float
     skew_fraction_limit: float
     taker_signal_limit: float
-
-
-@dataclass(frozen=True)
-class BaselineAlphaCalibration:
-    score_to_bps_slope_by_horizon: np.ndarray
-    winsor_lower_bps_by_horizon: np.ndarray
-    winsor_upper_bps_by_horizon: np.ndarray
-    fit_count_by_horizon: np.ndarray
-    horizons_ms: np.ndarray
-    diagnostics: Dict[str, Any]
 
 
 def load_direct_quote_config() -> DirectQuoteConfig:
@@ -765,36 +725,21 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
     return cfg
 
 
-def _default_baseline_quote_config() -> BaselineQuoteConfig:
-    return BaselineQuoteConfig(
-        base_half_spread_bps=DEFAULT_MM_BASE_HALF_SPREAD_BPS,
-        alpha_center_scale=DEFAULT_MM_ALPHA_CENTER_SCALE,
-        inventory_center_scale=DEFAULT_MM_INVENTORY_CENTER_SCALE,
-        vol_width_scale=DEFAULT_MM_VOL_WIDTH_SCALE,
-        uncertainty_width_scale=DEFAULT_MM_UNCERTAINTY_WIDTH_SCALE,
-        inventory_side_widen_scale=DEFAULT_MM_INVENTORY_SIDE_WIDEN_SCALE,
-        obs_spread_anchor_frac=DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC,
-        spread_floor_bps=DEFAULT_MM_SPREAD_FLOOR_BPS,
-        spread_cap_bps=DEFAULT_MM_SPREAD_CAP_BPS,
-        inv_ref_notional=DEFAULT_MM_INV_REF_NOTIONAL,
-        horizons_ms=list(DEFAULT_MM_HORIZONS_MS),
-        p250_weight=DEFAULT_MM_P250_WEIGHT,
-        p500_weight=DEFAULT_MM_P500_WEIGHT,
-        p1000_weight=DEFAULT_MM_P1000_WEIGHT,
-    )
-
-
-def resolve_baseline_vol_bucket_edges_bps() -> List[float]:
-    raw_value = os.environ.get("BYBIT_MM_BASELINE_VOL_BUCKET_BPS", "0.5,1.0,2.0,4.0,8.0")
+def resolve_vol_bucket_edges_bps(
+    *,
+    env_var_name: str = "BYBIT_MM_BASELINE_VOL_BUCKET_BPS",
+    default_value: str = "0.5,1.0,2.0,4.0,8.0",
+) -> List[float]:
+    raw_value = os.environ.get(env_var_name, default_value)
     edges = [float(part.strip()) for part in raw_value.split(",") if part.strip()]
     if not edges:
-        raise ValueError("BYBIT_MM_BASELINE_VOL_BUCKET_BPS must contain at least one positive edge")
+        raise ValueError(f"{env_var_name} must contain at least one positive edge")
     prev = 0.0
     for edge in edges:
         if not np.isfinite(edge) or edge <= 0.0:
-            raise ValueError("Baseline vol bucket edges must be finite and > 0")
+            raise ValueError(f"{env_var_name} edges must be finite and > 0")
         if edge <= prev:
-            raise ValueError("Baseline vol bucket edges must be strictly increasing")
+            raise ValueError(f"{env_var_name} edges must be strictly increasing")
         prev = edge
     return edges
 
@@ -819,7 +764,7 @@ def build_vol_bucket_report(
     maker_sell_arr = np.asarray(maker_sell_per_step, dtype=np.float64)
     turnover_arr = np.asarray(turnover_notional_per_step, dtype=np.float64)
     if bucket_edges_bps is None:
-        bucket_edges = resolve_baseline_vol_bucket_edges_bps()
+        bucket_edges = resolve_vol_bucket_edges_bps()
     else:
         bucket_edges = [float(edge) for edge in bucket_edges_bps]
     total_steps = int(sigma_arr.size)
@@ -4109,7 +4054,6 @@ def evaluate_market_making(
     *,
     collect_vol_bucket_report: bool = False,
 ) -> Dict[str, Any]:
-    bucket_cfg = None
     sigma_bps_selected_steps: List[float] = []
     delta_equity_steps: List[float] = []
     reward_steps: List[float] = []
@@ -4118,8 +4062,6 @@ def evaluate_market_making(
     turnover_notional_steps: List[float] = []
     maker_buy_markout_steps: List[float] = []
     maker_sell_markout_steps: List[float] = []
-    if collect_vol_bucket_report:
-        bucket_cfg = _default_baseline_quote_config()
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -4182,7 +4124,7 @@ def evaluate_market_making(
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
         maker_opps += 2
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
-        if collect_vol_bucket_report and bucket_cfg is not None:
+        if collect_vol_bucket_report:
             snapshot_row = env.features[idx_before_step, env._feature_layout["snapshots"]]
             vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
             vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
@@ -4308,7 +4250,7 @@ def evaluate_market_making(
             "timestamp_source": ts_source,
         },
     }
-    if collect_vol_bucket_report and bucket_cfg is not None:
+    if collect_vol_bucket_report:
         metrics.update(
             build_vol_bucket_report(
                 sigma_bps_selected=np.asarray(sigma_bps_selected_steps, dtype=np.float64),
