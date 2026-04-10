@@ -678,12 +678,12 @@ class DirectQuoteConfig:
 def load_direct_quote_config() -> DirectQuoteConfig:
     return _validate_direct_quote_config(
         DirectQuoteConfig(
-            center_limit_bps=_env_float("BYBIT_MM_CENTER_LIMIT_BPS", 1.0),
+            center_limit_bps=_env_float("BYBIT_MM_CENTER_LIMIT_BPS", 1.5),
             spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
-            width_expand_mult=_env_float("BYBIT_MM_WIDTH_EXPAND_MULT", 3.0),
-            width_tighten_frac=_env_float("BYBIT_MM_WIDTH_TIGHTEN_FRAC", 0.5),
+            width_expand_mult=_env_float("BYBIT_MM_WIDTH_EXPAND_MULT", 2.0),
+            width_tighten_frac=_env_float("BYBIT_MM_WIDTH_TIGHTEN_FRAC", 0.7),
             skew_limit_bps=_env_float("BYBIT_MM_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
             skew_fraction_limit=_env_float("BYBIT_MM_SKEW_FRACTION_LIMIT", DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
