@@ -84,6 +84,14 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.25
 DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
+MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v1"
+MM_PPO_ACTION_DIM = 4
+MM_PPO_ACTION_SEMANTICS = (
+    "center_bps",
+    "width_control",
+    "skew_control",
+    "taker_signal",
+)
 # Inventory risk thresholds are denominated in quote notional (USD).
 JOINED_CACHE_SCHEMA_VERSION = 1
 JOINED_FEATURE_SCHEMA_VERSION = 1
@@ -364,7 +372,7 @@ def _diag_gaussian_entropy(log_std: torch.Tensor) -> torch.Tensor:
 
 
 def _resolve_market_action_dim(_allow_taker: Optional[bool] = None) -> int:
-    return 4
+    return MM_PPO_ACTION_DIM
 
 
 def _ppo_action_bounds(
@@ -3518,11 +3526,13 @@ def save_market_ppo_checkpoint(
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     payload: Dict[str, Any] = {
         "format_version": 2,
+        "checkpoint_schema": MM_PPO_CHECKPOINT_SCHEMA,
         "model_state_dict": model.state_dict(),
         "policy_hidden_dims": tuple(int(x) for x in policy_hidden_dims),
         "value_hidden_dims": tuple(int(x) for x in value_hidden_dims),
         "obs_dim": int(obs_dim),
-        "action_dim": int(action_dim),
+        "action_dim": MM_PPO_ACTION_DIM,
+        "action_semantics": list(MM_PPO_ACTION_SEMANTICS),
         "val_report": _strip_large_report_fields(val_report),
         "val_report_mode": str(val_report_mode),
         "best_report_mode": str(val_report_mode),
@@ -3571,6 +3581,34 @@ def _canonical_market_ppo_action_dim(ckpt: Dict[str, Any]) -> int:
     return action_dim
 
 
+def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
+    schema = ckpt.get("checkpoint_schema")
+    if schema != MM_PPO_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "Unsupported market PPO checkpoint schema. "
+            f"Expected checkpoint_schema={MM_PPO_CHECKPOINT_SCHEMA!r}, got {schema!r}. "
+            "Old residual-era checkpoints are intentionally unsupported; retrain or re-export "
+            "a direct-quote PPO checkpoint."
+        )
+    return str(schema)
+
+
+def _canonical_market_ppo_action_semantics(ckpt: Dict[str, Any]) -> Tuple[str, ...]:
+    semantics = ckpt.get("action_semantics")
+    canonical_error = (
+        "Unsupported market PPO checkpoint action semantics. "
+        f"Expected {list(MM_PPO_ACTION_SEMANTICS)!r}; retrain or re-export a direct-quote PPO checkpoint."
+    )
+    if isinstance(semantics, tuple):
+        semantics = list(semantics)
+    if not isinstance(semantics, list):
+        raise ValueError(canonical_error)
+    parsed = tuple(str(x) for x in semantics)
+    if parsed != MM_PPO_ACTION_SEMANTICS:
+        raise ValueError(canonical_error)
+    return parsed
+
+
 def load_market_ppo_model(
     input_dim: int,
     device: str = "cuda",
@@ -3598,16 +3636,17 @@ def load_market_ppo_model(
         raise ValueError(
             "Unsupported PPO checkpoint payload type; expected a mapping for market PPO loading."
         )
+    _canonical_market_ppo_schema(ckpt)
 
     state = ckpt.get("model_state_dict")
-    canonical_metadata_fields = ("policy_hidden_dims", "value_hidden_dims", "action_dim")
+    canonical_metadata_fields = ("policy_hidden_dims", "value_hidden_dims", "action_dim", "action_semantics")
     has_any_canonical_metadata = any(field in ckpt for field in canonical_metadata_fields)
     if not isinstance(state, dict):
         if not has_any_canonical_metadata:
             raise ValueError(
                 "Unsupported RL checkpoint format. Only canonical full PPO checkpoints are supported. "
                 "Re-export or retrain under the PPO checkpoint format with model_state_dict, "
-                "policy_hidden_dims, value_hidden_dims, and action_dim."
+                "policy_hidden_dims, value_hidden_dims, action_dim, action_semantics, and checkpoint_schema."
             )
         raise ValueError(
             "Malformed canonical market PPO checkpoint: model_state_dict is missing or not a mapping."
@@ -3616,6 +3655,7 @@ def load_market_ppo_model(
     policy_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "policy_hidden_dims")
     value_hidden_dims = _canonical_market_ppo_arch_field(ckpt, "value_hidden_dims")
     action_dim = _canonical_market_ppo_action_dim(ckpt)
+    _canonical_market_ppo_action_semantics(ckpt)
 
     model = MarketPolicyValueNet(
         input_dim,
@@ -4371,7 +4411,7 @@ def load_market_policy(
     print(
         "[mm deterministic policy] "
         f"path={path.expanduser().resolve()} "
-        "action_semantics=bounded_harmonized source=code"
+        "action_semantics=direct_quote source=checkpoint"
     )
     return ppo_model.policy_net
 
@@ -4706,7 +4746,7 @@ def run_pipeline(
             else:
                 rl_policy_loaded = True
                 rl_policy_eval_mode = "deterministic_mean"
-                print("[mm eval] deterministic policy action semantics=bounded_harmonized source=code")
+                print("[mm eval] deterministic policy action_semantics=direct_quote source=checkpoint")
 
                 def rl_policy_fn(obs: np.ndarray) -> np.ndarray:
                     return _policy_action_from_obs_numpy(
