@@ -626,7 +626,7 @@ def _resolve_eval_checkpoint(
                 "BYBIT_MM_REQUIRE_RL_CKPT=true requires explicit BYBIT_MM_RL_CKPT when run_mode=train_eval."
             )
         # In train_eval, explicit BYBIT_MM_RL_CKPT is treated as user intent;
-        # missing path is fatal, no baseline fallback.
+        # missing path is fatal, no zero-action fallback.
         if external_ckpt_explicit:
             resolved_eval_ckpt = resolved_external_rl_ckpt
             if resolved_eval_ckpt is None or not Path(resolved_eval_ckpt).exists():
@@ -3568,7 +3568,7 @@ def load_market_ppo_model(
         if require_checkpoint:
             raise FileNotFoundError(f"Market PPO checkpoint not found: {ckpt_path}")
         warnings.warn(
-            f"Market PPO checkpoint not found: {ckpt_path}. Falling back to baseline policy.",
+            f"Market PPO checkpoint not found: {ckpt_path}. Falling back to zero-action policy.",
             RuntimeWarning,
         )
         return None
@@ -4340,7 +4340,7 @@ def load_market_policy(
         if require_checkpoint:
             raise FileNotFoundError(f"Market policy checkpoint not found: {ckpt_path}")
         warnings.warn(
-            f"Market policy checkpoint not found: {ckpt_path}. Falling back to baseline policy.",
+            f"Market policy checkpoint not found: {ckpt_path}. Falling back to zero-action policy.",
             RuntimeWarning,
         )
         return None
@@ -4599,10 +4599,10 @@ def run_pipeline(
         mm_final_env.set_obs_norm_state(eval_obs_norm_state, freeze=True)
         obs_norm_source = "checkpoint"
 
-    baseline_eval_t0 = time.perf_counter()
-    baseline_policy_fn = lambda _obs: _canonical_zero_market_action()
-    baseline_metrics = evaluate_market_making(mm_final_env, baseline_policy_fn)
-    _timing_log(f"evaluate_market_making baseline split=eval.full secs={time.perf_counter() - baseline_eval_t0:.4f}")
+    zero_action_eval_t0 = time.perf_counter()
+    zero_action_policy_fn = lambda _obs: _canonical_zero_market_action()
+    zero_action_metrics = evaluate_market_making(mm_final_env, zero_action_policy_fn)
+    _timing_log(f"evaluate_market_making zero_action split=eval.full secs={time.perf_counter() - zero_action_eval_t0:.4f}")
 
     rl_metrics = None
     rl_dev_metrics = None
@@ -4621,7 +4621,7 @@ def run_pipeline(
     if run_mode == "train":
         rl_policy_loaded = False
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
-        print("[mm eval] baseline only; RL skipped because run_mode=train.")
+        print("[mm eval] zero-action only; RL skipped because run_mode=train.")
     else:
         mm_ppo_model: Optional[MarketPolicyValueNet] = None
         mm_policy: Optional[MarketPolicyNet] = None
@@ -4638,7 +4638,7 @@ def run_pipeline(
         elif resolved_eval_ckpt is None:
             rl_policy_reason = "no path provided"
         elif not Path(resolved_eval_ckpt).exists():
-            missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using baseline deltas for RL run."
+            missing_msg = f"[mm eval] no checkpoint saved/found at {resolved_eval_ckpt}; using zero-action deltas for RL run."
             if require_rl_ckpt:
                 raise FileNotFoundError(missing_msg)
             warnings.warn(missing_msg, RuntimeWarning)
@@ -4691,7 +4691,7 @@ def run_pipeline(
         else:
             if mm_policy is None:
                 if rl_policy_reason == "no path provided":
-                    print("[mm eval] no policy path provided; using baseline deltas for RL run.")
+                    print("[mm eval] no policy path provided; using zero-action deltas for RL run.")
                 rl_policy_fn = lambda _obs: _canonical_zero_market_action()
                 rl_policy_loaded = False
             else:
@@ -4715,15 +4715,15 @@ def run_pipeline(
 
     # Return shape:
     # - cmssl_test: CMSSL week-3 out-of-sample/downstream-development diagnostics.
-    # - mm_baseline/mm_rl: final untouched week-4 (eval.full) metrics.
+    # - mm_zero_action/mm_rl: final untouched week-4 (eval.full) metrics.
     # - *_dev_* fields: week-3 development splits.
     return {
         "cmssl_test": cmssl_report,
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
-        "mm_baseline": baseline_metrics,
+        "mm_zero_action": zero_action_metrics,
         "mm_rl": rl_metrics,
-        "mm_baseline_dev_test": None,
-        "mm_baseline_dev_val": None,
+        "mm_zero_action_dev_test": None,
+        "mm_zero_action_dev_val": None,
         "mm_rl_dev_test": rl_dev_metrics,
         # Fatal failures are surfaced via exceptions rather than persisted in provenance state.
         "mm_run_context": {
@@ -4798,13 +4798,13 @@ if __name__ == "__main__":
     print("[mm obs scaling]", report["mm_obs_scaling"])
     # Ownership: __main__ prints MM summaries once; run_pipeline() only returns metrics.
     # Keep default logs compact so routine runs stay readable; full reports are opt-in.
-    print("[mm eval]", _format_mm_summary("baseline", report["mm_baseline"]))
+    print("[mm eval]", _format_mm_summary("zero_action", report["mm_zero_action"]))
     if report["mm_rl"] is None:
         print("[mm rl] skipped (mm_rl is None)")
     else:
-        print("[mm eval]", _format_mm_summary("baseline+rl", report["mm_rl"]))
+        print("[mm eval]", _format_mm_summary("zero_action+rl", report["mm_rl"]))
     if verbose_reports:
-        print("[mm baseline verbose]", _summarize_for_log(report["mm_baseline"]))
+        print("[mm zero-action verbose]", _summarize_for_log(report["mm_zero_action"]))
         if report["mm_rl"] is None:
             print("[mm rl verbose] skipped (mm_rl is None)")
         else:
