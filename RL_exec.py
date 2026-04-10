@@ -682,7 +682,7 @@ class RolloutStartSamplingConfig:
     score_power: float = 1.0
     score_epsilon: float = 1e-6
     lead_steps: int = 512
-    start_exclusion_window: int = 32768
+    start_exclusion_window: Optional[int] = None
     horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
 
@@ -729,13 +729,21 @@ def _resolve_fixed_horizon_logit_weights(name: str, default: Tuple[float, float,
 
 def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartSamplingConfig:
     safe_rollout_horizon = max(1, int(rollout_horizon))
+    raw_start_exclusion_window = os.environ.get("BYBIT_MM_START_SAMPLING_EXCLUSION_WINDOW", "").strip()
+    if raw_start_exclusion_window:
+        resolved_start_exclusion_window = _env_int(
+            "BYBIT_MM_START_SAMPLING_EXCLUSION_WINDOW",
+            safe_rollout_horizon,
+        )
+    else:
+        resolved_start_exclusion_window = safe_rollout_horizon
     cfg = RolloutStartSamplingConfig(
         enabled=_env_bool("BYBIT_MM_START_SAMPLING_ENABLE", False),
         weighted_mix=_env_float("BYBIT_MM_START_SAMPLING_WEIGHTED_MIX", 0.8),
         score_power=_env_float("BYBIT_MM_START_SAMPLING_SCORE_POWER", 1.0),
         score_epsilon=_env_float("BYBIT_MM_START_SAMPLING_SCORE_EPS", 1e-6),
         lead_steps=_env_int("BYBIT_MM_START_SAMPLING_LEAD_STEPS", 512),
-        start_exclusion_window=_env_int("BYBIT_MM_START_SAMPLING_EXCLUSION_WINDOW", safe_rollout_horizon),
+        start_exclusion_window=resolved_start_exclusion_window,
         horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
             "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
             (0.0, 0.0, 1.0),
@@ -749,8 +757,18 @@ def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartS
         raise ValueError("BYBIT_MM_START_SAMPLING_SCORE_EPS must be finite and > 0.")
     if cfg.lead_steps < 0:
         raise ValueError("BYBIT_MM_START_SAMPLING_LEAD_STEPS must be >= 0.")
-    if cfg.start_exclusion_window < 0:
+    resolved_start_exclusion_window_int = int(cfg.start_exclusion_window)
+    if resolved_start_exclusion_window_int < 0:
         raise ValueError("BYBIT_MM_START_SAMPLING_EXCLUSION_WINDOW must be >= 0.")
+    cfg = RolloutStartSamplingConfig(
+        enabled=cfg.enabled,
+        weighted_mix=cfg.weighted_mix,
+        score_power=cfg.score_power,
+        score_epsilon=cfg.score_epsilon,
+        lead_steps=cfg.lead_steps,
+        start_exclusion_window=resolved_start_exclusion_window_int,
+        horizon_logit_weights=cfg.horizon_logit_weights,
+    )
     return cfg
 
 
