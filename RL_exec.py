@@ -682,7 +682,7 @@ class RolloutStartSamplingConfig:
     score_power: float = 1.0
     score_epsilon: float = 1e-6
     lead_steps: int = 512
-    min_remaining_steps: int = 2048
+    start_exclusion_window: int = 32768
     horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
 
@@ -727,14 +727,15 @@ def _resolve_fixed_horizon_logit_weights(name: str, default: Tuple[float, float,
     return (float(values[0]), float(values[1]), float(values[2]))
 
 
-def load_rollout_start_sampling_config() -> RolloutStartSamplingConfig:
+def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartSamplingConfig:
+    safe_rollout_horizon = max(1, int(rollout_horizon))
     cfg = RolloutStartSamplingConfig(
         enabled=_env_bool("BYBIT_MM_START_SAMPLING_ENABLE", False),
         weighted_mix=_env_float("BYBIT_MM_START_SAMPLING_WEIGHTED_MIX", 0.8),
         score_power=_env_float("BYBIT_MM_START_SAMPLING_SCORE_POWER", 1.0),
         score_epsilon=_env_float("BYBIT_MM_START_SAMPLING_SCORE_EPS", 1e-6),
         lead_steps=_env_int("BYBIT_MM_START_SAMPLING_LEAD_STEPS", 512),
-        min_remaining_steps=_env_int("BYBIT_MM_START_SAMPLING_MIN_REMAINING_STEPS", 2048),
+        start_exclusion_window=_env_int("BYBIT_MM_START_SAMPLING_EXCLUSION_WINDOW", safe_rollout_horizon),
         horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
             "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
             (0.0, 0.0, 1.0),
@@ -748,8 +749,8 @@ def load_rollout_start_sampling_config() -> RolloutStartSamplingConfig:
         raise ValueError("BYBIT_MM_START_SAMPLING_SCORE_EPS must be finite and > 0.")
     if cfg.lead_steps < 0:
         raise ValueError("BYBIT_MM_START_SAMPLING_LEAD_STEPS must be >= 0.")
-    if cfg.min_remaining_steps < 1:
-        raise ValueError("BYBIT_MM_START_SAMPLING_MIN_REMAINING_STEPS must be >= 1.")
+    if cfg.start_exclusion_window < 0:
+        raise ValueError("BYBIT_MM_START_SAMPLING_EXCLUSION_WINDOW must be >= 0.")
     return cfg
 
 
@@ -1028,8 +1029,7 @@ def _build_rollout_start_sampler(
     if not config.enabled or max_start <= 0:
         return None
     safe_rollout_horizon = max(1, int(rollout_horizon))
-    safe_config_min_remaining_steps = max(1, int(config.min_remaining_steps))
-    min_remaining_steps = int(min(safe_rollout_horizon, max(safe_config_min_remaining_steps, safe_rollout_horizon // 2)))
+    min_remaining_steps = int(safe_rollout_horizon)
     effective_max_start = int(np.clip(env.n - min_remaining_steps - 1, 0, max_start))
     if effective_max_start < 0:
         return None
@@ -1071,6 +1071,7 @@ def _build_rollout_start_sampler(
         "abs_focus_logit": raw_score.astype(np.float64, copy=False),
         "effective_max_start": int(effective_max_start),
         "min_remaining_steps": int(min_remaining_steps),
+        "start_exclusion_window": int(max(0, int(config.start_exclusion_window))),
         "top_focus": top_focus,
         "config": config,
     }
@@ -3148,14 +3149,55 @@ def collect_market_rollout(
     sampler_starts = None if start_sampler is None else start_sampler.get("candidate_starts")
     sampler_mass = None if start_sampler is None else start_sampler.get("mixed_mass")
     sampler_abs_focus = None if start_sampler is None else start_sampler.get("abs_focus_logit")
+    sampler_start_exclusion_window = 0
+    available_mask: Optional[np.ndarray] = None
+    sampler_reset_count = 0
+    sampler_reset_warned = False
+    if sampler_starts is not None and sampler_mass is not None:
+        sampler_start_exclusion_window = int(
+            max(
+                0,
+                int(
+                    start_sampler.get(
+                        "start_exclusion_window",
+                        getattr(start_sampler.get("config"), "start_exclusion_window", horizon),
+                    )
+                ),
+            )
+        )
+        available_mask = np.ones(sampler_starts.shape[0], dtype=bool)
     rollout_start_indices: List[int] = []
     obs_device_buf: Optional[torch.Tensor] = None
     for _ in range(rollouts_per_epoch):
         if randomize_start:
             if sampler_starts is not None and sampler_mass is not None:
-                sampled_slot = int(np.random.choice(sampler_starts.shape[0], p=sampler_mass))
+                require(available_mask is not None, "start-sampler availability mask not initialized")
+                if not bool(np.any(available_mask)):
+                    available_mask[:] = True
+                    sampler_reset_count += 1
+                    if not sampler_reset_warned:
+                        print(
+                            "[mm rollout sampler] "
+                            "availability_exhausted=true action=reset_available_mask"
+                        )
+                        sampler_reset_warned = True
+                available_slots = np.flatnonzero(available_mask)
+                current_mass = np.asarray(sampler_mass[available_slots], dtype=np.float64)
+                mass_total = float(np.sum(current_mass))
+                if mass_total <= 0.0:
+                    current_mass = np.full(
+                        available_slots.shape[0],
+                        1.0 / float(max(1, available_slots.shape[0])),
+                        dtype=np.float64,
+                    )
+                else:
+                    current_mass = current_mass / mass_total
+                sampled_slot = int(np.random.choice(available_slots, p=current_mass))
                 start_idx = int(sampler_starts[sampled_slot])
                 sampled_focus_abs = float(sampler_abs_focus[sampled_slot]) if sampler_abs_focus is not None else 0.0
+                lower = start_idx - sampler_start_exclusion_window
+                upper = start_idx + sampler_start_exclusion_window
+                available_mask[(sampler_starts >= lower) & (sampler_starts <= upper)] = False
             else:
                 start_idx = int(np.random.randint(0, max_start + 1))
                 sampled_focus_abs = 0.0
@@ -3287,6 +3329,7 @@ def collect_market_rollout(
         "reward_shape_width": reward_shape_width_buf[:cursor],
         "reward_shape_total": reward_shape_total_buf[:cursor],
         "rollout_start_indices": np.asarray(rollout_start_indices, dtype=np.int64),
+        "sampler_availability_resets": int(sampler_reset_count),
     }
 
 
@@ -3975,7 +4018,7 @@ def train_market_ppo(
     best_selection_epoch: Optional[int] = None
     best_selection_key: Optional[Tuple[float, float, float]] = None
     saved_new_ckpt_this_run = False
-    start_sampling_cfg = load_rollout_start_sampling_config()
+    start_sampling_cfg = load_rollout_start_sampling_config(rollout_horizon=config.rollout_horizon)
     start_sampler = _build_rollout_start_sampler(
         train_env,
         start_sampling_cfg,
@@ -3998,6 +4041,7 @@ def train_market_ppo(
             f"score_power={start_sampling_cfg.score_power:.4f} "
             f"score_epsilon={start_sampling_cfg.score_epsilon:.6g} "
             f"lead_steps={start_sampling_cfg.lead_steps} "
+            f"start_exclusion_window={int(start_sampler['start_exclusion_window'])} "
             f"candidate_count={int(start_sampler['candidate_starts'].shape[0])} "
             f"effective_max_start={int(start_sampler['effective_max_start'])} "
             f"min_remaining_steps={int(start_sampler['min_remaining_steps'])} "
@@ -4065,6 +4109,14 @@ def train_market_ppo(
         )
         start_idx_np = rollout["start_idx"].detach().cpu().numpy().astype(np.float64)
         focus_abs_np = rollout["focus_logit_abs"].detach().cpu().numpy().astype(np.float64)
+        rollout_start_indices_np = np.asarray(rollout.get("rollout_start_indices", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        unique_starts = int(np.unique(rollout_start_indices_np).shape[0]) if rollout_start_indices_np.size else 0
+        min_start_distance = (
+            int(np.min(np.diff(np.sort(np.unique(rollout_start_indices_np)))))
+            if unique_starts > 1
+            else None
+        )
+        sampler_resets = int(rollout.get("sampler_availability_resets", 0))
         reward_true_np = rollout["reward_true"].detach().cpu().numpy().astype(np.float64)
         shape_skew_np = rollout["reward_shape_skew"].detach().cpu().numpy().astype(np.float64)
         shape_width_np = rollout["reward_shape_width"].detach().cpu().numpy().astype(np.float64)
@@ -4081,7 +4133,10 @@ def train_market_ppo(
             f"reward_shape_skew_mean={float(np.mean(shape_skew_np)):.6f} "
             f"reward_shape_width_mean={float(np.mean(shape_width_np)):.6f} "
             f"reward_shape_total_mean={float(np.mean(shape_total_np)):.6f} "
-            f"shape_abs_ratio={shaping_ratio:.6f}"
+            f"shape_abs_ratio={shaping_ratio:.6f} "
+            f"sampled_unique_starts={unique_starts} "
+            f"sampled_min_start_distance={min_start_distance} "
+            f"sampler_availability_reset={sampler_resets > 0}"
         )
         if shaping_ratio > 0.10:
             print(
