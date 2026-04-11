@@ -485,6 +485,7 @@ def _resolve_run_mode(default: str = "train") -> str:
 
 def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
     direct_quote_config = load_direct_quote_config()
+    continuous_maker_fill_config = load_continuous_maker_fill_config()
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
     inventory_penalty = float(os.environ.get("BYBIT_MM_INVENTORY_PENALTY", "0.0"))
     inv_soft_notional_str = os.environ.get("BYBIT_MM_INV_SOFT_NOTIONAL", "").strip()
@@ -546,6 +547,7 @@ def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
         "fill_size": fill_size,
         "fill_tolerance": fill_tolerance,
         "direct_quote_config": direct_quote_config,
+        "continuous_maker_fill_config": continuous_maker_fill_config,
     }
 
 
@@ -708,6 +710,36 @@ class WidthVolatilityScaler:
     sigma_min: float = 0.0
     sigma_max: float = 0.0
     sigma_mean: float = 0.0
+
+
+@dataclass(frozen=True)
+class ContinuousMakerFillConfig:
+    activity_min: float = 0.02
+    activity_max: float = 0.30
+    tau_touch: float = 0.75
+    tau_cross: float = 0.25
+    eps_px: float = 1e-9
+
+
+def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
+    cfg = ContinuousMakerFillConfig(
+        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.02),
+        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.30),
+        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.75),
+        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.25),
+        eps_px=_env_float("BYBIT_MM_FILL_EPS_PX", 1e-9),
+    )
+    if not np.isfinite(cfg.activity_min) or not np.isfinite(cfg.activity_max):
+        raise ValueError("Continuous maker-fill activity bounds must be finite.")
+    if cfg.activity_min < 0.0 or cfg.activity_max < cfg.activity_min:
+        raise ValueError("Continuous maker-fill activity bounds must satisfy 0 <= min <= max.")
+    if not np.isfinite(cfg.tau_touch) or cfg.tau_touch <= 0.0:
+        raise ValueError("BYBIT_MM_FILL_TAU_TOUCH must be finite and > 0.")
+    if not np.isfinite(cfg.tau_cross) or cfg.tau_cross <= 0.0:
+        raise ValueError("BYBIT_MM_FILL_TAU_CROSS must be finite and > 0.")
+    if not np.isfinite(cfg.eps_px) or cfg.eps_px <= 0.0:
+        raise ValueError("BYBIT_MM_FILL_EPS_PX must be finite and > 0.")
+    return cfg
 
 
 def _env_float_tuple(name: str, default: Tuple[float, ...]) -> Tuple[float, ...]:
@@ -878,6 +910,8 @@ def build_vol_bucket_report(
     turnover_notional_per_step: np.ndarray,
     maker_buy_markout_per_step: Optional[np.ndarray] = None,
     maker_sell_markout_per_step: Optional[np.ndarray] = None,
+    maker_buy_fill_frac_per_step: Optional[np.ndarray] = None,
+    maker_sell_fill_frac_per_step: Optional[np.ndarray] = None,
     initial_equity: float,
     bucket_edges_bps: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
@@ -897,6 +931,8 @@ def build_vol_bucket_report(
     report_rows: List[Dict[str, Any]] = []
     maker_buy_markout_arr = None if maker_buy_markout_per_step is None else np.asarray(maker_buy_markout_per_step, dtype=np.float64)
     maker_sell_markout_arr = None if maker_sell_markout_per_step is None else np.asarray(maker_sell_markout_per_step, dtype=np.float64)
+    maker_buy_fill_frac_arr = None if maker_buy_fill_frac_per_step is None else np.asarray(maker_buy_fill_frac_per_step, dtype=np.float64)
+    maker_sell_fill_frac_arr = None if maker_sell_fill_frac_per_step is None else np.asarray(maker_sell_fill_frac_per_step, dtype=np.float64)
     for bucket_index in range(len(bucket_edges) + 1):
         mask = bucket_indices == bucket_index
         step_count = int(np.count_nonzero(mask))
@@ -927,6 +963,10 @@ def build_vol_bucket_report(
             bucket_row["maker_buy_markout"] = float(np.sum(maker_buy_markout_arr[mask])) if step_count > 0 else 0.0
         if maker_sell_markout_arr is not None:
             bucket_row["maker_sell_markout"] = float(np.sum(maker_sell_markout_arr[mask])) if step_count > 0 else 0.0
+        if maker_buy_fill_frac_arr is not None:
+            bucket_row["maker_buy_fill_frac_mean"] = float(np.mean(maker_buy_fill_frac_arr[mask])) if step_count > 0 else 0.0
+        if maker_sell_fill_frac_arr is not None:
+            bucket_row["maker_sell_fill_frac_mean"] = float(np.mean(maker_sell_fill_frac_arr[mask])) if step_count > 0 else 0.0
         report_rows.append(bucket_row)
     return {
         "vol_bucket_edges_bps": bucket_edges,
@@ -2100,6 +2140,7 @@ class MarketMakingEnv:
         direct_quote_config: Optional[DirectQuoteConfig] = None,
         reward_shaping_config: Optional[RewardShapingConfig] = None,
         width_vol_scaler: Optional[WidthVolatilityScaler] = None,
+        continuous_maker_fill_config: Optional[ContinuousMakerFillConfig] = None,
     ):
         self.features = np.ascontiguousarray(np.asarray(batch.features, dtype=np.float32))
         self.spread_bps = np.ascontiguousarray(np.asarray(batch.spread_bps, dtype=np.float32))
@@ -2221,6 +2262,11 @@ class MarketMakingEnv:
             load_reward_shaping_config() if reward_shaping_config is None else reward_shaping_config
         )
         self.width_vol_scaler = width_vol_scaler
+        self.continuous_maker_fill_config = (
+            load_continuous_maker_fill_config()
+            if continuous_maker_fill_config is None
+            else continuous_maker_fill_config
+        )
         self.taker_signal_limit = float(self.direct_quote_config.taker_signal_limit)
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
@@ -2255,6 +2301,11 @@ class MarketMakingEnv:
         self.ema_maker_sell_markout = 0.0
         self.last_maker_buy_clipped = 0.0
         self.last_maker_sell_clipped = 0.0
+        self.last_maker_buy_fill_frac = 0.0
+        self.last_maker_sell_fill_frac = 0.0
+        self.last_activity_score = 0.0
+        self.last_touch_dist_buy = 0.0
+        self.last_touch_dist_sell = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self._obs_count = 0
@@ -2291,6 +2342,11 @@ class MarketMakingEnv:
         self.ema_maker_sell_markout = 0.0
         self.last_maker_buy_clipped = 0.0
         self.last_maker_sell_clipped = 0.0
+        self.last_maker_buy_fill_frac = 0.0
+        self.last_maker_sell_fill_frac = 0.0
+        self.last_activity_score = 0.0
+        self.last_touch_dist_buy = 0.0
+        self.last_touch_dist_sell = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self._obs_ping_pong_idx = 0
@@ -2550,8 +2606,24 @@ class MarketMakingEnv:
         self.inventory += signed_qty
         return float(qty)
 
-    def _apply_fills(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
-        touch_epsilon = 1e-9
+    def _volatility_activity_score(self, decision_idx: int) -> float:
+        snapshot_row = self.features[decision_idx, self._feature_layout["snapshots"]]
+        vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
+        vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
+        sigma_recent = max(0.0, vol_short, vol_long)
+        vol_score = 0.0
+        if self.width_vol_scaler is not None:
+            denom = max(self.width_vol_scaler.p90 - self.width_vol_scaler.p50, self.width_vol_scaler.eps)
+            vol_score = float(np.clip((sigma_recent - self.width_vol_scaler.p50) / denom, 0.0, 1.0))
+        cfg = self.continuous_maker_fill_config
+        return float(cfg.activity_min + (cfg.activity_max - cfg.activity_min) * vol_score)
+
+    def _sigmoid(self, x: float) -> float:
+        x_clip = float(np.clip(x, -50.0, 50.0))
+        return float(1.0 / (1.0 + np.exp(-x_clip)))
+
+    def _compute_maker_fill_hard(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
+        touch_epsilon = self.continuous_maker_fill_config.eps_px
         best_bid_next = float(self.best_bid[idx])
         best_ask_next = float(self.best_ask[idx])
         best_bid_prev = float(self.best_bid[idx - 1]) if idx > 0 else best_bid_next
@@ -2591,6 +2663,53 @@ class MarketMakingEnv:
                 self.last_maker_sell_clipped = requested_sell - clipped_sell
                 sell_fill = self._apply_signed_fill(-1, clipped_sell, ask)
         return buy_fill, sell_fill
+
+    def _compute_maker_fill_continuous(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
+        decision_idx = max(0, idx - 1)
+        best_bid_t = float(self.best_bid[decision_idx])
+        best_ask_t = float(self.best_ask[decision_idx])
+        best_bid_next = float(self.best_bid[idx])
+        best_ask_next = float(self.best_ask[idx])
+        cfg = self.continuous_maker_fill_config
+        spread_px = max(best_ask_t - best_bid_t, cfg.eps_px)
+        activity = self._volatility_activity_score(decision_idx)
+        self.last_activity_score = activity
+        bid_enabled = np.isfinite(bid)
+        ask_enabled = np.isfinite(ask)
+
+        buy_fill_frac = 0.0
+        sell_fill_frac = 0.0
+        touch_dist_buy = 0.0
+        touch_dist_sell = 0.0
+
+        if bid_enabled:
+            touch_dist_buy = float(max(0.0, best_bid_t - bid) / spread_px)
+            cross_gap_buy = float((best_ask_next - bid) / spread_px)
+            p_touch_buy = float(activity * np.exp(-touch_dist_buy / cfg.tau_touch))
+            p_cross_buy = self._sigmoid(-cross_gap_buy / cfg.tau_cross)
+            buy_fill_frac = float(np.clip(1.0 - (1.0 - p_touch_buy) * (1.0 - p_cross_buy), 0.0, 1.0))
+        if ask_enabled:
+            touch_dist_sell = float(max(0.0, ask - best_ask_t) / spread_px)
+            cross_gap_sell = float((ask - best_bid_next) / spread_px)
+            p_touch_sell = float(activity * np.exp(-touch_dist_sell / cfg.tau_touch))
+            p_cross_sell = self._sigmoid(-cross_gap_sell / cfg.tau_cross)
+            sell_fill_frac = float(np.clip(1.0 - (1.0 - p_touch_sell) * (1.0 - p_cross_sell), 0.0, 1.0))
+
+        self.last_touch_dist_buy = float(touch_dist_buy)
+        self.last_touch_dist_sell = float(touch_dist_sell)
+        self.last_maker_buy_fill_frac = float(buy_fill_frac)
+        self.last_maker_sell_fill_frac = float(sell_fill_frac)
+
+        mid_for_cap = self._mid_price(idx)
+        requested_buy = self.fill_size * buy_fill_frac
+        requested_sell = self.fill_size * sell_fill_frac
+        clipped_buy = self._clip_fill_qty(1, requested_buy, mid_for_cap)
+        self.last_maker_buy_clipped = max(0.0, requested_buy - clipped_buy)
+        buy_fill = self._apply_signed_fill(1, clipped_buy, bid) if bid_enabled else 0.0
+        clipped_sell = self._clip_fill_qty(-1, requested_sell, mid_for_cap)
+        self.last_maker_sell_clipped = max(0.0, requested_sell - clipped_sell)
+        sell_fill = self._apply_signed_fill(-1, clipped_sell, ask) if ask_enabled else 0.0
+        return float(buy_fill), float(sell_fill)
 
     def _apply_taker(self, idx: int, taker_signal: float) -> Tuple[float, float]:
         self.last_taker_buy_clipped = 0.0
@@ -2670,6 +2789,7 @@ class MarketMakingEnv:
         taker_signal: float,
         *,
         emit_info: bool = False,
+        use_hard_maker_fill: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         # Execution convention: both maker and taker fills are priced using the next snapshot
         # (next_idx). We quote on self.idx, then advance state after applying fills at next_idx.
@@ -2732,6 +2852,13 @@ class MarketMakingEnv:
                 "ema_maker_sell_markout": float(self.ema_maker_sell_markout),
                 "maker_buy_clipped": float(self.last_maker_buy_clipped),
                 "maker_sell_clipped": float(self.last_maker_sell_clipped),
+                "maker_buy_fill_frac": float(self.last_maker_buy_fill_frac),
+                "maker_sell_fill_frac": float(self.last_maker_sell_fill_frac),
+                "maker_buy_exec_qty": 0.0,
+                "maker_sell_exec_qty": 0.0,
+                "activity_score": float(self.last_activity_score),
+                "touch_dist_buy": float(self.last_touch_dist_buy),
+                "touch_dist_sell": float(self.last_touch_dist_sell),
                 "taker_buy_clipped": float(self.last_taker_buy_clipped),
                 "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
@@ -2745,7 +2872,15 @@ class MarketMakingEnv:
         pre_sell_room_qty = self._remaining_inventory_room(-1, mid_for_cap) if emit_info else 0.0
         # Clipping is evaluated per fill attempt, so maker/taker clipped amounts reflect
         # evolving inventory after each in-step fill is applied.
-        maker_buy, maker_sell = self._apply_fills(bid, ask, next_idx)
+        if use_hard_maker_fill:
+            maker_buy, maker_sell = self._compute_maker_fill_hard(bid, ask, next_idx)
+            self.last_maker_buy_fill_frac = 1.0 if maker_buy > 0.0 else 0.0
+            self.last_maker_sell_fill_frac = 1.0 if maker_sell > 0.0 else 0.0
+            self.last_activity_score = 0.0
+            self.last_touch_dist_buy = 0.0
+            self.last_touch_dist_sell = 0.0
+        else:
+            maker_buy, maker_sell = self._compute_maker_fill_continuous(bid, ask, next_idx)
         taker_buy, taker_sell = self._apply_taker(next_idx, taker_signal)
         best_ask_next = float(self.best_ask[next_idx])
         best_bid_next = float(self.best_bid[next_idx])
@@ -2931,6 +3066,13 @@ class MarketMakingEnv:
             "ema_maker_sell_markout": float(self.ema_maker_sell_markout),
             "maker_buy_clipped": float(self.last_maker_buy_clipped),
             "maker_sell_clipped": float(self.last_maker_sell_clipped),
+            "maker_buy_fill_frac": float(self.last_maker_buy_fill_frac),
+            "maker_sell_fill_frac": float(self.last_maker_sell_fill_frac),
+            "maker_buy_exec_qty": float(maker_buy),
+            "maker_sell_exec_qty": float(maker_sell),
+            "activity_score": float(self.last_activity_score),
+            "touch_dist_buy": float(self.last_touch_dist_buy),
+            "touch_dist_sell": float(self.last_touch_dist_sell),
             "taker_buy_clipped": float(self.last_taker_buy_clipped),
             "taker_sell_clipped": float(self.last_taker_sell_clipped),
         }
@@ -2969,6 +3111,21 @@ class MarketMakingEnv:
             skew_control,
             taker_signal,
             emit_info=emit_info,
+        )
+
+    def step_hard_diagnostic(
+        self,
+        action: Any,
+        emit_info: bool = False,
+    ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
+        center_bps, width_control, skew_control, taker_signal = self._parse_action(action)
+        return self._step_from_action_components(
+            center_bps,
+            width_control,
+            skew_control,
+            taker_signal,
+            emit_info=emit_info,
+            use_hard_maker_fill=True,
         )
 
 
@@ -3557,6 +3714,7 @@ def evaluate_market_policy_ppo(
     stochastic: bool,
     device: str = "cuda",
     generator: Optional[torch.Generator] = None,
+    use_hard_maker_fill: bool = False,
 ) -> Dict[str, Any]:
     def _policy_fn(obs: np.ndarray) -> np.ndarray:
         action = _ppo_action_from_obs_numpy(
@@ -3569,7 +3727,7 @@ def evaluate_market_policy_ppo(
         )
         return _canonical_market_action_array(action)
 
-    return evaluate_market_making(env, _policy_fn)
+    return evaluate_market_making(env, _policy_fn, use_hard_maker_fill=use_hard_maker_fill)
 
 
 def _ppo_action_from_obs_numpy(
@@ -4422,6 +4580,7 @@ def evaluate_market_making(
     policy_fn,
     *,
     collect_vol_bucket_report: bool = False,
+    use_hard_maker_fill: bool = False,
 ) -> Dict[str, Any]:
     sigma_bps_selected_steps: List[float] = []
     delta_equity_steps: List[float] = []
@@ -4431,6 +4590,9 @@ def evaluate_market_making(
     turnover_notional_steps: List[float] = []
     maker_buy_markout_steps: List[float] = []
     maker_sell_markout_steps: List[float] = []
+    maker_buy_fill_frac_steps: List[float] = []
+    maker_sell_fill_frac_steps: List[float] = []
+    maker_exec_qty_total_steps: List[float] = []
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -4460,7 +4622,10 @@ def evaluate_market_making(
     while not done:
         idx_before_step = env.idx
         action = policy_fn(obs)
-        obs, reward, done, info = env.step(action, emit_info=True)
+        if use_hard_maker_fill:
+            obs, reward, done, info = env.step_hard_diagnostic(action, emit_info=True)
+        else:
+            obs, reward, done, info = env.step(action, emit_info=True)
         require(info is not None, "MarketMakingEnv.step(..., emit_info=True) must return diagnostics info")
         equity_curve.append(info["equity"])
         inventory_curve.append(info["inventory"])
@@ -4492,6 +4657,9 @@ def evaluate_market_making(
         maker_rebate_total += float(info.get("rebate", 0.0))
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
         maker_opps += 2
+        maker_buy_fill_frac_steps.append(float(info.get("maker_buy_fill_frac", 0.0)))
+        maker_sell_fill_frac_steps.append(float(info.get("maker_sell_fill_frac", 0.0)))
+        maker_exec_qty_total_steps.append(float(info.get("maker_buy_exec_qty", maker_buy)) + float(info.get("maker_sell_exec_qty", maker_sell)))
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
         if collect_vol_bucket_report:
             snapshot_row = env.features[idx_before_step, env._feature_layout["snapshots"]]
@@ -4565,6 +4733,9 @@ def evaluate_market_making(
     ending_inventory_notional = float(abs(ending_inventory_qty * last_mid))
     maker_turnover_notional = float(turnover_notional - taker_notional)
     maker_turnover_share = float(maker_turnover_notional / turnover_notional) if turnover_notional > 0 else 0.0
+    maker_buy_fill_frac_arr = np.asarray(maker_buy_fill_frac_steps, dtype=np.float64)
+    maker_sell_fill_frac_arr = np.asarray(maker_sell_fill_frac_steps, dtype=np.float64)
+    maker_exec_qty_total_arr = np.asarray(maker_exec_qty_total_steps, dtype=np.float64)
 
     metrics = {
         "initial_equity": float(initial_equity),
@@ -4586,6 +4757,9 @@ def evaluate_market_making(
         "maker_turnover_notional": maker_turnover_notional,
         "maker_turnover_share": maker_turnover_share,
         "maker_fill_rate": maker_fill_rate,
+        "maker_buy_fill_frac_mean": float(np.mean(maker_buy_fill_frac_arr)) if maker_buy_fill_frac_arr.size > 0 else 0.0,
+        "maker_sell_fill_frac_mean": float(np.mean(maker_sell_fill_frac_arr)) if maker_sell_fill_frac_arr.size > 0 else 0.0,
+        "maker_exec_qty_total_per_step_mean": float(np.mean(maker_exec_qty_total_arr)) if maker_exec_qty_total_arr.size > 0 else 0.0,
         "maker_fill_count": int(maker_fill_count),
         "maker_opportunities": int(maker_opps),
         "taker_usage_frequency": taker_usage_frequency,
@@ -4630,6 +4804,8 @@ def evaluate_market_making(
                 turnover_notional_per_step=np.asarray(turnover_notional_steps, dtype=np.float64),
                 maker_buy_markout_per_step=np.asarray(maker_buy_markout_steps, dtype=np.float64),
                 maker_sell_markout_per_step=np.asarray(maker_sell_markout_steps, dtype=np.float64),
+                maker_buy_fill_frac_per_step=np.asarray(maker_buy_fill_frac_steps, dtype=np.float64),
+                maker_sell_fill_frac_per_step=np.asarray(maker_sell_fill_frac_steps, dtype=np.float64),
                 initial_equity=float(initial_equity),
             )
         )
@@ -4802,18 +4978,21 @@ def run_pipeline(
         mm_val_batch,
         allow_taker=allow_taker,
         reward_shaping_config=RewardShapingConfig(enabled=False),
+        width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
         allow_taker=allow_taker,
         reward_shaping_config=RewardShapingConfig(enabled=False),
+        width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
     mm_final_env = MarketMakingEnv(
         mm_eval_full_batch,
         allow_taker=allow_taker,
         reward_shaping_config=RewardShapingConfig(enabled=False),
+        width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
@@ -4942,8 +5121,11 @@ def run_pipeline(
 
     rl_metrics = None
     rl_dev_metrics = None
+    rl_dev_hard_diag_metrics = None
+    rl_final_hard_diag_metrics = None
     ppo_eval_stochastic = _env_bool("BYBIT_MM_PPO_EVAL_STOCHASTIC", False)
     ppo_eval_seed = _env_int("BYBIT_MM_PPO_EVAL_SEED", 0)
+    run_hard_fill_diagnostics = _env_bool("BYBIT_MM_RUN_HARD_FILL_DIAGNOSTICS", True)
 
     eval_action = "skipped" if run_mode == "train" else "performed"
     print(
@@ -4981,6 +5163,15 @@ def run_pipeline(
             device=device,
             generator=stochastic_generator,
         )
+        if run_hard_fill_diagnostics:
+            rl_dev_hard_diag_metrics = evaluate_market_policy_ppo(
+                mm_test_env,
+                mm_ppo_model,
+                stochastic=ppo_eval_stochastic,
+                device=device,
+                generator=stochastic_generator,
+                use_hard_maker_fill=True,
+            )
         _timing_log(f"evaluate_market_making rl secs={time.perf_counter() - rl_eval_t0:.4f}")
         rl_eval_performed = True
         rl_metrics = evaluate_market_policy_ppo(
@@ -4990,6 +5181,15 @@ def run_pipeline(
             device=device,
             generator=stochastic_generator,
         )
+        if run_hard_fill_diagnostics:
+            rl_final_hard_diag_metrics = evaluate_market_policy_ppo(
+                mm_final_env,
+                mm_ppo_model,
+                stochastic=ppo_eval_stochastic,
+                device=device,
+                generator=stochastic_generator,
+                use_hard_maker_fill=True,
+            )
     else:
         rl_policy_loaded = False
         rl_policy_reason = "skipped because BYBIT_MM_RUN_MODE=train"
@@ -4999,6 +5199,8 @@ def run_pipeline(
         "mm_obs_scaling": mm_train_env.get_observation_scaling_config(),
         "mm_rl": rl_metrics,
         "mm_rl_dev_test": rl_dev_metrics,
+        "mm_rl_test_hard_diag": rl_dev_hard_diag_metrics,
+        "mm_rl_final_hard_diag": rl_final_hard_diag_metrics,
         # Fatal failures are surfaced via exceptions rather than persisted in provenance state.
         "mm_run_context": {
             "run_mode": run_mode,
