@@ -1598,8 +1598,9 @@ def _resolve_horizon_indices(meta: dict, targets: Iterable[int]) -> Dict[int, in
     return {h: index_map[h] for h in targets}
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
+def _sigmoid(x):
+    x_clip = np.clip(x, -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-x_clip))
 
 
 def join_features(
@@ -2618,10 +2619,6 @@ class MarketMakingEnv:
         cfg = self.continuous_maker_fill_config
         return float(cfg.activity_min + (cfg.activity_max - cfg.activity_min) * vol_score)
 
-    def _sigmoid(self, x: float) -> float:
-        x_clip = float(np.clip(x, -50.0, 50.0))
-        return float(1.0 / (1.0 + np.exp(-x_clip)))
-
     def _compute_maker_fill_hard(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         touch_epsilon = self.continuous_maker_fill_config.eps_px
         best_bid_next = float(self.best_bid[idx])
@@ -2686,13 +2683,13 @@ class MarketMakingEnv:
             touch_dist_buy = float(max(0.0, best_bid_t - bid) / spread_px)
             cross_gap_buy = float((best_ask_next - bid) / spread_px)
             p_touch_buy = float(activity * np.exp(-touch_dist_buy / cfg.tau_touch))
-            p_cross_buy = self._sigmoid(-cross_gap_buy / cfg.tau_cross)
+            p_cross_buy = float(_sigmoid(-cross_gap_buy / cfg.tau_cross))
             buy_fill_frac = float(np.clip(1.0 - (1.0 - p_touch_buy) * (1.0 - p_cross_buy), 0.0, 1.0))
         if ask_enabled:
             touch_dist_sell = float(max(0.0, ask - best_ask_t) / spread_px)
             cross_gap_sell = float((ask - best_bid_next) / spread_px)
             p_touch_sell = float(activity * np.exp(-touch_dist_sell / cfg.tau_touch))
-            p_cross_sell = self._sigmoid(-cross_gap_sell / cfg.tau_cross)
+            p_cross_sell = float(_sigmoid(-cross_gap_sell / cfg.tau_cross))
             sell_fill_frac = float(np.clip(1.0 - (1.0 - p_touch_sell) * (1.0 - p_cross_sell), 0.0, 1.0))
 
         self.last_touch_dist_buy = float(touch_dist_buy)
@@ -2789,7 +2786,53 @@ class MarketMakingEnv:
         taker_signal: float,
         *,
         emit_info: bool = False,
-        use_hard_maker_fill: bool = False,
+    ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
+        return self._step_from_action_components_with_fill(
+            center_bps,
+            width_control,
+            skew_control,
+            taker_signal,
+            emit_info=emit_info,
+            maker_fill_fn=self._compute_maker_fill_continuous,
+            maker_fill_postprocess_fn=None,
+        )
+
+    def _step_from_action_components_hard_diagnostic(
+        self,
+        center_bps: float,
+        width_control: float,
+        skew_control: float,
+        taker_signal: float,
+        *,
+        emit_info: bool = False,
+    ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
+        return self._step_from_action_components_with_fill(
+            center_bps,
+            width_control,
+            skew_control,
+            taker_signal,
+            emit_info=emit_info,
+            maker_fill_fn=self._compute_maker_fill_hard,
+            maker_fill_postprocess_fn=self._postprocess_hard_maker_fill,
+        )
+
+    def _postprocess_hard_maker_fill(self, maker_buy: float, maker_sell: float) -> None:
+        self.last_maker_buy_fill_frac = 1.0 if maker_buy > 0.0 else 0.0
+        self.last_maker_sell_fill_frac = 1.0 if maker_sell > 0.0 else 0.0
+        self.last_activity_score = 0.0
+        self.last_touch_dist_buy = 0.0
+        self.last_touch_dist_sell = 0.0
+
+    def _step_from_action_components_with_fill(
+        self,
+        center_bps: float,
+        width_control: float,
+        skew_control: float,
+        taker_signal: float,
+        *,
+        emit_info: bool,
+        maker_fill_fn,
+        maker_fill_postprocess_fn=None,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         # Execution convention: both maker and taker fills are priced using the next snapshot
         # (next_idx). We quote on self.idx, then advance state after applying fills at next_idx.
@@ -2872,15 +2915,9 @@ class MarketMakingEnv:
         pre_sell_room_qty = self._remaining_inventory_room(-1, mid_for_cap) if emit_info else 0.0
         # Clipping is evaluated per fill attempt, so maker/taker clipped amounts reflect
         # evolving inventory after each in-step fill is applied.
-        if use_hard_maker_fill:
-            maker_buy, maker_sell = self._compute_maker_fill_hard(bid, ask, next_idx)
-            self.last_maker_buy_fill_frac = 1.0 if maker_buy > 0.0 else 0.0
-            self.last_maker_sell_fill_frac = 1.0 if maker_sell > 0.0 else 0.0
-            self.last_activity_score = 0.0
-            self.last_touch_dist_buy = 0.0
-            self.last_touch_dist_sell = 0.0
-        else:
-            maker_buy, maker_sell = self._compute_maker_fill_continuous(bid, ask, next_idx)
+        maker_buy, maker_sell = maker_fill_fn(bid, ask, next_idx)
+        if maker_fill_postprocess_fn is not None:
+            maker_fill_postprocess_fn(maker_buy, maker_sell)
         taker_buy, taker_sell = self._apply_taker(next_idx, taker_signal)
         best_ask_next = float(self.best_ask[next_idx])
         best_bid_next = float(self.best_bid[next_idx])
@@ -3119,13 +3156,12 @@ class MarketMakingEnv:
         emit_info: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         center_bps, width_control, skew_control, taker_signal = self._parse_action(action)
-        return self._step_from_action_components(
+        return self._step_from_action_components_hard_diagnostic(
             center_bps,
             width_control,
             skew_control,
             taker_signal,
             emit_info=emit_info,
-            use_hard_maker_fill=True,
         )
 
 
