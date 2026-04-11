@@ -2934,7 +2934,7 @@ class MarketMakingEnv:
             "taker_buy_clipped": float(self.last_taker_buy_clipped),
             "taker_sell_clipped": float(self.last_taker_sell_clipped),
         }
-        return next_obs, float(reward), done, info
+        return next_obs, float(reward_train), done, info
 
     def step_canonical_action_array(
         self, action_arr: np.ndarray, *, emit_info: bool = False
