@@ -55,7 +55,8 @@ DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
 DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS = 50.0
-DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT = 0.9
+DEFAULT_MM_DIRECT_CENTER_ANCHOR_FRAC = 0.5
+DEFAULT_MM_DIRECT_SKEW_ANCHOR_FRAC = 0.9
 # PPO training epochs environment variable (used across entrypoint/config helpers).
 PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
 # Scaling factors for market-making observation extra-state features.
@@ -72,10 +73,10 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.1
 DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
-MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v2"
+MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v3"
 MM_PPO_ACTION_DIM = 4
 MM_PPO_ACTION_SEMANTICS = (
-    "center_bps",
+    "center_control",
     "width_control",
     "skew_control",
     "taker_signal",
@@ -369,17 +370,14 @@ def _ppo_action_bounds(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     action_dim = _resolve_market_action_dim()
     direct_cfg = env.direct_quote_config if env is not None else load_direct_quote_config()
-    center_limit_bps = (
-        float(direct_cfg.center_limit_bps)
-    )
     taker_signal_limit = float(direct_cfg.taker_signal_limit)
     low = torch.tensor(
-        [-center_limit_bps, -1.0, -1.0, -taker_signal_limit],
+        [-1.0, -1.0, -1.0, -taker_signal_limit],
         device=device,
         dtype=torch.float32,
     )
     high = torch.tensor(
-        [center_limit_bps, 1.0, 1.0, taker_signal_limit],
+        [1.0, 1.0, 1.0, taker_signal_limit],
         device=device,
         dtype=torch.float32,
     )
@@ -666,14 +664,14 @@ def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
 
 @dataclass(frozen=True)
 class DirectQuoteConfig:
-    center_limit_bps: float
+    center_anchor_frac: float
     spread_floor_bps: float
     spread_cap_bps: float
     obs_spread_anchor_frac: float
     width_expand_mult: float
     width_tighten_frac: float
     skew_limit_bps: float
-    skew_fraction_limit: float
+    skew_anchor_frac: float
     taker_signal_limit: float
 
 
@@ -834,22 +832,22 @@ def load_reward_shaping_config() -> RewardShapingConfig:
 def load_direct_quote_config() -> DirectQuoteConfig:
     return _validate_direct_quote_config(
         DirectQuoteConfig(
-            center_limit_bps=_env_float("BYBIT_MM_CENTER_LIMIT_BPS", 1.5),
+            center_anchor_frac=_env_float("BYBIT_MM_CENTER_ANCHOR_FRAC", DEFAULT_MM_DIRECT_CENTER_ANCHOR_FRAC),
             spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
             width_expand_mult=_env_float("BYBIT_MM_WIDTH_EXPAND_MULT", 2.0),
             width_tighten_frac=_env_float("BYBIT_MM_WIDTH_TIGHTEN_FRAC", 0.7),
             skew_limit_bps=_env_float("BYBIT_MM_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
-            skew_fraction_limit=_env_float("BYBIT_MM_SKEW_FRACTION_LIMIT", DEFAULT_MM_DIRECT_SKEW_FRACTION_LIMIT),
+            skew_anchor_frac=_env_float("BYBIT_MM_SKEW_ANCHOR_FRAC", DEFAULT_MM_DIRECT_SKEW_ANCHOR_FRAC),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
         )
     )
 
 
 def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
-    if not np.isfinite(cfg.center_limit_bps) or cfg.center_limit_bps <= 0.0:
-        raise ValueError("center_limit_bps must be finite and > 0.0")
+    if not np.isfinite(cfg.center_anchor_frac) or cfg.center_anchor_frac < 0.0:
+        raise ValueError("center_anchor_frac must be finite and >= 0.0")
     if not np.isfinite(cfg.spread_floor_bps) or cfg.spread_floor_bps < 0.0:
         raise ValueError("spread_floor_bps must be finite and >= 0.0")
     if not np.isfinite(cfg.spread_cap_bps) or cfg.spread_cap_bps < cfg.spread_floor_bps:
@@ -870,12 +868,8 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         raise ValueError("width_tighten_frac must be finite and in [0.0, 1.0)")
     if not np.isfinite(cfg.skew_limit_bps) or cfg.skew_limit_bps < 0.0:
         raise ValueError("skew_limit_bps must be finite and >= 0.0")
-    if (
-        not np.isfinite(cfg.skew_fraction_limit)
-        or cfg.skew_fraction_limit < 0.0
-        or cfg.skew_fraction_limit > 1.0
-    ):
-        raise ValueError("skew_fraction_limit must be finite and in [0.0, 1.0]")
+    if not np.isfinite(cfg.skew_anchor_frac) or cfg.skew_anchor_frac < 0.0:
+        raise ValueError("skew_anchor_frac must be finite and >= 0.0")
     if not np.isfinite(cfg.taker_signal_limit) or cfg.taker_signal_limit <= 0.0:
         raise ValueError("taker_signal_limit must be finite and > 0.0")
     return cfg
@@ -2538,10 +2532,10 @@ class MarketMakingEnv:
     def _policy_quotes(
         self,
         idx: int,
-        center_bps: float,
+        center_control: float,
         width_control: float,
         skew_control: float,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, float, Dict[str, float]]:
         cfg = self.direct_quote_config
         mid = self._mid_price(idx)
         snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
@@ -2556,15 +2550,27 @@ class MarketMakingEnv:
         else:
             half_spread_bps = anchor_half_spread_bps * (1.0 + wc * cfg.width_tighten_frac)
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
-        half_spread_floor = max(half_spread_bps, 1e-12)
-        skew_limit_bps = min(cfg.skew_limit_bps, cfg.skew_fraction_limit * half_spread_floor)
-        skew_bps = float(np.clip(skew_control, -1.0, 1.0)) * skew_limit_bps
+        center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
+        center_shift_bps = center_control_clipped * cfg.center_anchor_frac * anchor_half_spread_bps
+        skew_local_limit_bps = cfg.skew_anchor_frac * anchor_half_spread_bps
+        skew_limit_bps = min(cfg.skew_limit_bps, skew_local_limit_bps)
+        skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
+        skew_bps = skew_control_clipped * skew_limit_bps
         bid_half_spread_bps = max(cfg.spread_floor_bps, half_spread_bps + skew_bps)
         ask_half_spread_bps = max(cfg.spread_floor_bps, half_spread_bps - skew_bps)
-        center_bps = float(np.clip(center_bps, -cfg.center_limit_bps, cfg.center_limit_bps))
-        bid = mid + bps_to_px(mid, center_bps - bid_half_spread_bps)
-        ask = mid + bps_to_px(mid, center_bps + ask_half_spread_bps)
-        return bid, ask
+        bid = mid + bps_to_px(mid, center_shift_bps - bid_half_spread_bps)
+        ask = mid + bps_to_px(mid, center_shift_bps + ask_half_spread_bps)
+        quote_metrics = {
+            "anchor_half_spread_bps": float(anchor_half_spread_bps),
+            "half_spread_bps": float(half_spread_bps),
+            "center_control": float(center_control_clipped),
+            "center_shift_bps": float(center_shift_bps),
+            "skew_control": float(skew_control_clipped),
+            "skew_local_limit_bps": float(skew_local_limit_bps),
+            "skew_limit_bps": float(skew_limit_bps),
+            "skew_bps": float(skew_bps),
+        }
+        return bid, ask, quote_metrics
 
     def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         best_bid = float(self.best_bid[idx])
@@ -2780,7 +2786,7 @@ class MarketMakingEnv:
 
     def _step_from_action_components(
         self,
-        center_bps: float,
+        center_control: float,
         width_control: float,
         skew_control: float,
         taker_signal: float,
@@ -2788,7 +2794,7 @@ class MarketMakingEnv:
         emit_info: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         return self._step_from_action_components_with_fill(
-            center_bps,
+            center_control,
             width_control,
             skew_control,
             taker_signal,
@@ -2799,7 +2805,7 @@ class MarketMakingEnv:
 
     def _step_from_action_components_hard_diagnostic(
         self,
-        center_bps: float,
+        center_control: float,
         width_control: float,
         skew_control: float,
         taker_signal: float,
@@ -2807,7 +2813,7 @@ class MarketMakingEnv:
         emit_info: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         return self._step_from_action_components_with_fill(
-            center_bps,
+            center_control,
             width_control,
             skew_control,
             taker_signal,
@@ -2825,7 +2831,7 @@ class MarketMakingEnv:
 
     def _step_from_action_components_with_fill(
         self,
-        center_bps: float,
+        center_control: float,
         width_control: float,
         skew_control: float,
         taker_signal: float,
@@ -2906,7 +2912,7 @@ class MarketMakingEnv:
                 "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
             return self._build_observation(self.idx), 0.0, True, info
-        bid, ask = self._policy_quotes(self.idx, center_bps, width_control, skew_control)
+        bid, ask, quote_metrics = self._policy_quotes(self.idx, center_control, width_control, skew_control)
         bid, ask = self._enforce_passive(bid, ask, self.idx)
         inv_prev = self.inventory
         mid_for_cap = self._mid_price(next_idx)
@@ -3046,15 +3052,15 @@ class MarketMakingEnv:
             "post_sell_room_qty": float(post_sell_room_qty),
             "bid": float(bid),
             "ask": float(ask),
-            "center_bps": float(
-                np.clip(
-                    center_bps,
-                    -self.direct_quote_config.center_limit_bps,
-                    self.direct_quote_config.center_limit_bps,
-                )
-            ),
+            "center_control": float(quote_metrics["center_control"]),
+            "center_shift_bps": float(quote_metrics["center_shift_bps"]),
             "width_control": float(np.clip(width_control, -1.0, 1.0)),
-            "skew_control": float(np.clip(skew_control, -1.0, 1.0)),
+            "skew_control": float(quote_metrics["skew_control"]),
+            "anchor_half_spread_bps": float(quote_metrics["anchor_half_spread_bps"]),
+            "half_spread_bps": float(quote_metrics["half_spread_bps"]),
+            "skew_local_limit_bps": float(quote_metrics["skew_local_limit_bps"]),
+            "skew_limit_bps": float(quote_metrics["skew_limit_bps"]),
+            "skew_bps": float(quote_metrics["skew_bps"]),
             "inv_change": float(inv_change),
             "maker_buy": float(maker_buy),
             "maker_sell": float(maker_sell),
@@ -3114,9 +3120,9 @@ class MarketMakingEnv:
         )
 
     def step(self, action: Any, emit_info: bool = False) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
-        center_bps, width_control, skew_control, taker_signal = self._parse_action(action)
+        center_control, width_control, skew_control, taker_signal = self._parse_action(action)
         return self._step_from_action_components(
-            center_bps,
+            center_control,
             width_control,
             skew_control,
             taker_signal,
@@ -3128,9 +3134,9 @@ class MarketMakingEnv:
         action: Any,
         emit_info: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
-        center_bps, width_control, skew_control, taker_signal = self._parse_action(action)
+        center_control, width_control, skew_control, taker_signal = self._parse_action(action)
         return self._step_from_action_components_hard_diagnostic(
-            center_bps,
+            center_control,
             width_control,
             skew_control,
             taker_signal,
@@ -3987,11 +3993,16 @@ def _canonical_market_ppo_action_dim(ckpt: Dict[str, Any]) -> int:
 def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
     schema = ckpt.get("checkpoint_schema")
     if schema != MM_PPO_CHECKPOINT_SCHEMA:
+        legacy_note = ""
+        if schema == "mm-ppo-direct-quote-v2":
+            legacy_note = (
+                " Direct-quote v2 checkpoints are incompatible with v3 because center is now "
+                "spread-relative and skew capacity is anchor-based (independent of width); retraining is required."
+            )
         raise ValueError(
             "Unsupported market PPO checkpoint schema. "
             f"Expected checkpoint_schema={MM_PPO_CHECKPOINT_SCHEMA!r}, got {schema!r}. "
-            "Direct-quote width semantics changed in v2; retrain under the new "
-            "anchor-centered width mapping and produce a v2 checkpoint."
+            f"{legacy_note}".strip()
         )
     return str(schema)
 
@@ -4128,7 +4139,7 @@ def train_market_ppo(
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
         "active_neutral_direct_quote_init=true "
         "initial_mean_action="
-        "{center=0,width_control=0,skew_control=0,taker_signal=0} "
+        "{center_control=0,width_control=0,skew_control=0,taker_signal=0} "
         "action_controls=center/width/skew/taker controls "
         "init_log_std={"
         f"center={config.init_log_std_center:.4f},"
@@ -4176,7 +4187,7 @@ def train_market_ppo(
         and np.all(bounded_probe_action <= bounds_high_np + 1e-6)
     )
     probe_action_labels = {
-        "center_bps": float(bounded_probe_action[0]),
+        "center_control": float(bounded_probe_action[0]),
         "width_control": float(bounded_probe_action[1]),
         "skew_control": float(bounded_probe_action[2]),
         "taker_signal": float(bounded_probe_action[3]),
@@ -4186,7 +4197,7 @@ def train_market_ppo(
         f"action_dim={action_dim} "
         f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
         f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
-        f"env_center_limit_bps={train_env.direct_quote_config.center_limit_bps:.4f} "
+        f"env_center_anchor_frac={train_env.direct_quote_config.center_anchor_frac:.4f} "
         f"taker_signal_limit={train_env.taker_signal_limit:.4f} "
         f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
         f"mean_probe_action_labeled={probe_action_labels} "
