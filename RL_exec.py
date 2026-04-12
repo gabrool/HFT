@@ -714,19 +714,19 @@ class WidthVolatilityScaler:
 
 @dataclass(frozen=True)
 class ContinuousMakerFillConfig:
-    activity_min: float = 0.02
-    activity_max: float = 0.30
-    tau_touch: float = 0.75
-    tau_cross: float = 0.25
+    activity_min: float = 0.08
+    activity_max: float = 0.70
+    tau_touch: float = 1.50
+    tau_cross: float = 0.75
     eps_px: float = 1e-9
 
 
 def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
     cfg = ContinuousMakerFillConfig(
-        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.02),
-        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.30),
-        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.75),
-        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.25),
+        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.08),
+        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.70),
+        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 1.50),
+        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.75),
         eps_px=_env_float("BYBIT_MM_FILL_EPS_PX", 1e-9),
     )
     if not np.isfinite(cfg.activity_min) or not np.isfinite(cfg.activity_max):
@@ -806,7 +806,7 @@ def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartS
 
 def load_reward_shaping_config() -> RewardShapingConfig:
     cfg = RewardShapingConfig(
-        enabled=_env_bool("BYBIT_MM_REWARD_SHAPING_ENABLE", False),
+        enabled=False,
         horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
             "BYBIT_MM_REWARD_SHAPING_HORIZON_LOGIT_WEIGHTS",
             (0.0, 0.0, 1.0),
@@ -2996,35 +2996,8 @@ class MarketMakingEnv:
         reward_true = delta_equity - inventory_penalty_total - turnover_penalty
         reward_shape_skew = 0.0
         reward_shape_width = 0.0
-        if self.reward_shaping_config.enabled:
-            cfg = self.reward_shaping_config
-            dir_logits = self.features[self.idx, self._feature_layout["dir_logits"]]
-            z = float(np.dot(np.asarray(cfg.horizon_logit_weights, dtype=np.float64), dir_logits.astype(np.float64)))
-            alpha_signal = float(np.tanh(cfg.logit_tanh_scale * z))
-            alpha_strength = abs(alpha_signal)
-            skew_target = float(np.clip(-cfg.skew_target_scale * alpha_signal, -1.0, 1.0))
-            skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
-            reward_shape_skew = -cfg.skew_coef * _huber_loss(skew_control_clipped - skew_target)
-
-            snapshot_row = self.features[self.idx, self._feature_layout["snapshots"]]
-            vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
-            vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
-            sigma_recent = max(0.0, vol_short, vol_long)
-            vol_score = 0.0
-            if self.width_vol_scaler is not None:
-                denom = max(self.width_vol_scaler.p90 - self.width_vol_scaler.p50, self.width_vol_scaler.eps)
-                vol_score = float(np.clip((sigma_recent - self.width_vol_scaler.p50) / denom, 0.0, 1.0))
-            width_target = float(
-                np.clip(
-                    cfg.width_vol_coef * vol_score - cfg.width_alpha_coef * alpha_strength,
-                    cfg.width_target_min,
-                    cfg.width_target_max,
-                )
-            )
-            width_control_clipped = float(np.clip(width_control, -1.0, 1.0))
-            reward_shape_width = -cfg.width_coef * _huber_loss(width_control_clipped - width_target)
         reward_shape_total = reward_shape_skew + reward_shape_width
-        reward_train = reward_true + reward_shape_total
+        reward_train = reward_true
 
         self.prev_equity = equity
         self.total_reward += reward_train
@@ -4354,7 +4327,7 @@ def train_market_ppo(
             f"sampled_min_start_distance={min_start_distance} "
             f"sampler_availability_reset={sampler_resets > 0}"
         )
-        if shaping_ratio > 0.10:
+        if shape_abs_mean > 0.0 and shaping_ratio > 0.10:
             print(
                 "[mm ppo shaping warning] "
                 f"epoch={epoch + 1} shape_abs_ratio={shaping_ratio:.6f} "
@@ -4990,7 +4963,7 @@ def run_pipeline(
     mm_eval_full_batch = build_market_batch(joined_eval_full)
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
-    reward_shaping_cfg = load_reward_shaping_config()
+    reward_shaping_cfg = RewardShapingConfig(enabled=False)
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
