@@ -3287,7 +3287,7 @@ class PPOConfig:
     value_coef: float = 0.5
     policy_hidden: Tuple[int, ...] = (128, 128)
     value_hidden: Tuple[int, ...] = (128, 128)
-    val_every: int = 1
+    val_every: int = 10
     max_drawdown_guard: Optional[float] = None
     rollout_horizon: int = 8192
     rollouts_per_epoch: int = 16
