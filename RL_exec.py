@@ -5015,7 +5015,7 @@ def run_pipeline(
     out_root: str,
     ckpt_path: str,
     device: str = "cuda",
-    ppo_epochs: int = 10,
+    ppo_epochs: int = 50,
     run_mode: str = "train",
 ) -> Dict[str, Any]:
     print(f"[mm run mode] {run_mode}")
