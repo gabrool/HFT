@@ -4162,7 +4162,7 @@ def train_market_ppo(
     val_env: MarketMakingEnv,
     input_dim: int,
     device: str = "cuda",
-    epochs: int = 10,
+    epochs: int = 50,
     config: Optional[PPOConfig] = None,
     ckpt_path: Optional[Path] = None,
     rollout_storage: str = "gpu",
