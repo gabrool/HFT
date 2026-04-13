@@ -5166,7 +5166,7 @@ def run_pipeline(
         value_coef=float(os.environ.get("BYBIT_MM_PPO_VALUE_COEF", "0.5")),
         policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")),
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
-        val_every=_env_int("BYBIT_MM_PPO_VAL_EVERY", 1),
+        val_every=_env_int("BYBIT_MM_PPO_VAL_EVERY", 10),
         max_drawdown_guard=_env_float("BYBIT_MM_PPO_MAX_DRAWDOWN", float("nan")),
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
