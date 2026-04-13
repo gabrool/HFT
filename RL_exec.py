@@ -668,8 +668,9 @@ class DirectQuoteConfig:
     spread_floor_bps: float
     spread_cap_bps: float
     obs_spread_anchor_frac: float
-    width_expand_mult: float
-    width_tighten_frac: float
+    touch_halfspread_mult: float
+    neutral_halfspread_mult: float
+    wide_halfspread_mult: float
     skew_limit_bps: float
     skew_anchor_frac: float
     taker_signal_limit: float
@@ -712,19 +713,23 @@ class WidthVolatilityScaler:
 
 @dataclass(frozen=True)
 class ContinuousMakerFillConfig:
-    activity_min: float = 0.08
-    activity_max: float = 0.70
-    tau_touch: float = 1.50
-    tau_cross: float = 0.75
+    activity_min: float = 0.0
+    activity_max: float = 0.45
+    tau_touch: float = 0.20
+    tau_cross: float = 0.20
+    touch_event_bonus: float = 0.45
+    touch_event_distance_frac: float = 0.10
     eps_px: float = 1e-9
 
 
 def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
     cfg = ContinuousMakerFillConfig(
-        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.08),
-        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.70),
-        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 1.50),
-        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.75),
+        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.0),
+        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.45),
+        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.20),
+        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.20),
+        touch_event_bonus=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_BONUS", 0.45),
+        touch_event_distance_frac=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC", 0.10),
         eps_px=_env_float("BYBIT_MM_FILL_EPS_PX", 1e-9),
     )
     if not np.isfinite(cfg.activity_min) or not np.isfinite(cfg.activity_max):
@@ -735,6 +740,14 @@ def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
         raise ValueError("BYBIT_MM_FILL_TAU_TOUCH must be finite and > 0.")
     if not np.isfinite(cfg.tau_cross) or cfg.tau_cross <= 0.0:
         raise ValueError("BYBIT_MM_FILL_TAU_CROSS must be finite and > 0.")
+    if not np.isfinite(cfg.touch_event_bonus) or cfg.touch_event_bonus < 0.0:
+        raise ValueError("BYBIT_MM_FILL_TOUCH_EVENT_BONUS must be finite and >= 0.")
+    if (
+        not np.isfinite(cfg.touch_event_distance_frac)
+        or cfg.touch_event_distance_frac < 0.0
+        or cfg.touch_event_distance_frac > 1.0
+    ):
+        raise ValueError("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC must be finite and in [0, 1].")
     if not np.isfinite(cfg.eps_px) or cfg.eps_px <= 0.0:
         raise ValueError("BYBIT_MM_FILL_EPS_PX must be finite and > 0.")
     return cfg
@@ -836,8 +849,9 @@ def load_direct_quote_config() -> DirectQuoteConfig:
             spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
-            width_expand_mult=_env_float("BYBIT_MM_WIDTH_EXPAND_MULT", 2.0),
-            width_tighten_frac=_env_float("BYBIT_MM_WIDTH_TIGHTEN_FRAC", 0.7),
+            touch_halfspread_mult=_env_float("BYBIT_MM_TOUCH_HALFSPREAD_MULT", 1.0),
+            neutral_halfspread_mult=_env_float("BYBIT_MM_NEUTRAL_HALFSPREAD_MULT", 3.0),
+            wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 6.0),
             skew_limit_bps=_env_float("BYBIT_MM_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
             skew_anchor_frac=_env_float("BYBIT_MM_SKEW_ANCHOR_FRAC", DEFAULT_MM_DIRECT_SKEW_ANCHOR_FRAC),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
@@ -858,14 +872,12 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         or cfg.obs_spread_anchor_frac > 1.0
     ):
         raise ValueError("obs_spread_anchor_frac must be finite and in [0.0, 1.0]")
-    if not np.isfinite(cfg.width_expand_mult) or cfg.width_expand_mult < 1.0:
-        raise ValueError("width_expand_mult must be finite and >= 1.0")
-    if (
-        not np.isfinite(cfg.width_tighten_frac)
-        or cfg.width_tighten_frac < 0.0
-        or cfg.width_tighten_frac >= 1.0
-    ):
-        raise ValueError("width_tighten_frac must be finite and in [0.0, 1.0)")
+    if not np.isfinite(cfg.touch_halfspread_mult) or cfg.touch_halfspread_mult <= 0.0:
+        raise ValueError("touch_halfspread_mult must be finite and > 0.")
+    if not np.isfinite(cfg.neutral_halfspread_mult) or cfg.neutral_halfspread_mult < cfg.touch_halfspread_mult:
+        raise ValueError("neutral_halfspread_mult must be finite and >= touch_halfspread_mult.")
+    if not np.isfinite(cfg.wide_halfspread_mult) or cfg.wide_halfspread_mult < cfg.neutral_halfspread_mult:
+        raise ValueError("wide_halfspread_mult must be finite and >= neutral_halfspread_mult.")
     if not np.isfinite(cfg.skew_limit_bps) or cfg.skew_limit_bps < 0.0:
         raise ValueError("skew_limit_bps must be finite and >= 0.0")
     if not np.isfinite(cfg.skew_anchor_frac) or cfg.skew_anchor_frac < 0.0:
@@ -2301,6 +2313,10 @@ class MarketMakingEnv:
         self.last_activity_score = 0.0
         self.last_touch_dist_buy = 0.0
         self.last_touch_dist_sell = 0.0
+        self.last_touch_bonus_buy = 0.0
+        self.last_touch_bonus_sell = 0.0
+        self.last_fill_baseline_buy = 0.0
+        self.last_fill_baseline_sell = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self._obs_count = 0
@@ -2342,6 +2358,10 @@ class MarketMakingEnv:
         self.last_activity_score = 0.0
         self.last_touch_dist_buy = 0.0
         self.last_touch_dist_sell = 0.0
+        self.last_touch_bonus_buy = 0.0
+        self.last_touch_bonus_sell = 0.0
+        self.last_fill_baseline_buy = 0.0
+        self.last_fill_baseline_sell = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self._obs_ping_pong_idx = 0
@@ -2437,6 +2457,7 @@ class MarketMakingEnv:
         for key in bounded_feature_keys:
             feature_slice = self._feature_layout[key]
             mask[feature_slice] = False
+        mask[self._obs_extra_slice] = False
         return mask
 
     def _update_obs_stats(self, obs: np.ndarray) -> None:
@@ -2545,10 +2566,11 @@ class MarketMakingEnv:
             floor_bps = max(floor_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
         anchor_half_spread_bps = float(np.clip(floor_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         wc = float(np.clip(width_control, -1.0, 1.0))
-        if wc >= 0.0:
-            half_spread_bps = anchor_half_spread_bps * (1.0 + wc * (cfg.width_expand_mult - 1.0))
+        if wc <= 0.0:
+            width_mult = cfg.neutral_halfspread_mult + (-wc) * (cfg.touch_halfspread_mult - cfg.neutral_halfspread_mult)
         else:
-            half_spread_bps = anchor_half_spread_bps * (1.0 + wc * cfg.width_tighten_frac)
+            width_mult = cfg.neutral_halfspread_mult + wc * (cfg.wide_halfspread_mult - cfg.neutral_halfspread_mult)
+        half_spread_bps = anchor_half_spread_bps * width_mult
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
         center_shift_bps = center_control_clipped * cfg.center_anchor_frac * anchor_half_spread_bps
@@ -2685,21 +2707,47 @@ class MarketMakingEnv:
         touch_dist_buy = 0.0
         touch_dist_sell = 0.0
 
+        touch_bonus_buy = 0.0
+        touch_bonus_sell = 0.0
+        baseline_buy = 0.0
+        baseline_sell = 0.0
+        touch_dist_threshold = max(0.0, cfg.touch_event_distance_frac)
+        touch_epsilon = cfg.eps_px
+        best_bid_prev = float(self.best_bid[idx - 1]) if idx > 0 else best_bid_t
+        best_ask_prev = float(self.best_ask[idx - 1]) if idx > 0 else best_ask_t
         if bid_enabled:
             touch_dist_buy = float(max(0.0, best_bid_t - bid) / spread_px)
             cross_gap_buy = float((best_ask_next - bid) / spread_px)
-            p_touch_buy = float(activity * np.exp(-touch_dist_buy / cfg.tau_touch))
+            p_touch_buy = float(activity * np.exp(-((touch_dist_buy / cfg.tau_touch) ** 2)))
             p_cross_buy = float(_sigmoid(-cross_gap_buy / cfg.tau_cross))
-            buy_fill_frac = float(np.clip(1.0 - (1.0 - p_touch_buy) * (1.0 - p_cross_buy), 0.0, 1.0))
+            baseline_buy = float(np.clip(p_touch_buy + p_cross_buy, 0.0, 1.0))
+            at_touch_buy = (
+                touch_dist_buy <= touch_dist_threshold
+                and abs(bid - best_bid_prev) <= max(self.fill_tolerance, touch_epsilon)
+                and best_bid_next < best_bid_prev - touch_epsilon
+            )
+            touch_bonus_buy = cfg.touch_event_bonus if at_touch_buy else 0.0
+            buy_fill_frac = float(np.clip(baseline_buy + touch_bonus_buy, 0.0, 1.0))
         if ask_enabled:
             touch_dist_sell = float(max(0.0, ask - best_ask_t) / spread_px)
             cross_gap_sell = float((ask - best_bid_next) / spread_px)
-            p_touch_sell = float(activity * np.exp(-touch_dist_sell / cfg.tau_touch))
+            p_touch_sell = float(activity * np.exp(-((touch_dist_sell / cfg.tau_touch) ** 2)))
             p_cross_sell = float(_sigmoid(-cross_gap_sell / cfg.tau_cross))
-            sell_fill_frac = float(np.clip(1.0 - (1.0 - p_touch_sell) * (1.0 - p_cross_sell), 0.0, 1.0))
+            baseline_sell = float(np.clip(p_touch_sell + p_cross_sell, 0.0, 1.0))
+            at_touch_sell = (
+                touch_dist_sell <= touch_dist_threshold
+                and abs(ask - best_ask_prev) <= max(self.fill_tolerance, touch_epsilon)
+                and best_ask_next > best_ask_prev + touch_epsilon
+            )
+            touch_bonus_sell = cfg.touch_event_bonus if at_touch_sell else 0.0
+            sell_fill_frac = float(np.clip(baseline_sell + touch_bonus_sell, 0.0, 1.0))
 
         self.last_touch_dist_buy = float(touch_dist_buy)
         self.last_touch_dist_sell = float(touch_dist_sell)
+        self.last_touch_bonus_buy = float(touch_bonus_buy)
+        self.last_touch_bonus_sell = float(touch_bonus_sell)
+        self.last_fill_baseline_buy = float(baseline_buy)
+        self.last_fill_baseline_sell = float(baseline_sell)
         self.last_maker_buy_fill_frac = float(buy_fill_frac)
         self.last_maker_sell_fill_frac = float(sell_fill_frac)
 
@@ -2908,6 +2956,10 @@ class MarketMakingEnv:
                 "activity_score": float(self.last_activity_score),
                 "touch_dist_buy": float(self.last_touch_dist_buy),
                 "touch_dist_sell": float(self.last_touch_dist_sell),
+                "touch_bonus_buy": float(self.last_touch_bonus_buy),
+                "touch_bonus_sell": float(self.last_touch_bonus_sell),
+                "fill_baseline_buy": float(self.last_fill_baseline_buy),
+                "fill_baseline_sell": float(self.last_fill_baseline_sell),
                 "taker_buy_clipped": float(self.last_taker_buy_clipped),
                 "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
@@ -3089,6 +3141,10 @@ class MarketMakingEnv:
             "activity_score": float(self.last_activity_score),
             "touch_dist_buy": float(self.last_touch_dist_buy),
             "touch_dist_sell": float(self.last_touch_dist_sell),
+            "touch_bonus_buy": float(self.last_touch_bonus_buy),
+            "touch_bonus_sell": float(self.last_touch_bonus_sell),
+            "fill_baseline_buy": float(self.last_fill_baseline_buy),
+            "fill_baseline_sell": float(self.last_fill_baseline_sell),
             "taker_buy_clipped": float(self.last_taker_buy_clipped),
             "taker_sell_clipped": float(self.last_taker_sell_clipped),
         }
@@ -3183,7 +3239,7 @@ class MarketPolicyValueNet(nn.Module):
         self.policy_net = MarketPolicyNet(input_dim, hidden_dims=policy_hidden, action_dim=action_dim)
         self.value_net = MLP(input_dim, value_hidden, 1)
         if init_log_std is None:
-            init_log_std_vec = torch.full((action_dim,), -3.0, dtype=torch.float32)
+            init_log_std_vec = torch.full((action_dim,), 0.0, dtype=torch.float32)
         else:
             init_log_std_vec = torch.as_tensor(init_log_std, dtype=torch.float32).reshape(-1)
             if init_log_std_vec.numel() != action_dim:
@@ -3209,21 +3265,12 @@ def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
     return final_policy_linear
 
 
-def _init_active_neutral_direct_quote_policy(
-    model: MarketPolicyValueNet,
-    init_log_std: Sequence[float],
-) -> None:
+def _init_market_policy_mean_head(model: MarketPolicyValueNet) -> None:
     final_policy_linear = _find_final_policy_linear_layer(model)
-    init_log_std_vec = torch.as_tensor(init_log_std, dtype=model.log_std.dtype, device=model.log_std.device).reshape(-1)
-    if init_log_std_vec.numel() != model.log_std.numel():
-        raise ValueError(
-            f"Active-neutral direct quote init log_std vector must have length {model.log_std.numel()}, got {init_log_std_vec.numel()}"
-        )
     with torch.no_grad():
-        final_policy_linear.weight.zero_()
+        nn.init.orthogonal_(final_policy_linear.weight, gain=1.0)
         if final_policy_linear.bias is not None:
             final_policy_linear.bias.zero_()
-        model.log_std.copy_(init_log_std_vec)
 
 
 @dataclass
@@ -3243,10 +3290,10 @@ class PPOConfig:
     rollout_horizon: int = 8192
     rollouts_per_epoch: int = 16
     randomize_rollout_start: bool = True
-    init_log_std_center: float = -0.5
-    init_log_std_width: float = -0.25
-    init_log_std_skew: float = -0.75
-    init_log_std_taker: float = -0.25
+    init_log_std_center: float = 0.0
+    init_log_std_width: float = 0.0
+    init_log_std_skew: float = 0.0
+    init_log_std_taker: float = 0.0
 
 
 def compute_gae(
@@ -3324,6 +3371,15 @@ def collect_market_rollout(
     reward_shape_skew_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_shape_width_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_shape_total_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    touch_dist_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    touch_dist_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    maker_buy_fill_frac_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    maker_sell_fill_frac_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    activity_score_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    touch_bonus_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    touch_bonus_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    fill_baseline_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    fill_baseline_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
     action_dim = _resolve_market_action_dim()
@@ -3475,6 +3531,15 @@ def collect_market_rollout(
             reward_shape_skew_buf[idx] = float(info.get("reward_shape_skew", 0.0))
             reward_shape_width_buf[idx] = float(info.get("reward_shape_width", 0.0))
             reward_shape_total_buf[idx] = float(info.get("reward_shape_total", 0.0))
+            touch_dist_buy_buf[idx] = float(info.get("touch_dist_buy", 0.0))
+            touch_dist_sell_buf[idx] = float(info.get("touch_dist_sell", 0.0))
+            maker_buy_fill_frac_buf[idx] = float(info.get("maker_buy_fill_frac", 0.0))
+            maker_sell_fill_frac_buf[idx] = float(info.get("maker_sell_fill_frac", 0.0))
+            activity_score_buf[idx] = float(info.get("activity_score", 0.0))
+            touch_bonus_buy_buf[idx] = float(info.get("touch_bonus_buy", 0.0))
+            touch_bonus_sell_buf[idx] = float(info.get("touch_bonus_sell", 0.0))
+            fill_baseline_buy_buf[idx] = float(info.get("fill_baseline_buy", 0.0))
+            fill_baseline_sell_buf[idx] = float(info.get("fill_baseline_sell", 0.0))
             terminated_buf[idx] = float(terminated)
             truncated_buf[idx] = float(truncated)
             dones_buf[idx] = float(done)
@@ -3522,6 +3587,15 @@ def collect_market_rollout(
         "reward_shape_skew": reward_shape_skew_buf[:cursor],
         "reward_shape_width": reward_shape_width_buf[:cursor],
         "reward_shape_total": reward_shape_total_buf[:cursor],
+        "touch_dist_buy": touch_dist_buy_buf[:cursor],
+        "touch_dist_sell": touch_dist_sell_buf[:cursor],
+        "maker_buy_fill_frac": maker_buy_fill_frac_buf[:cursor],
+        "maker_sell_fill_frac": maker_sell_fill_frac_buf[:cursor],
+        "activity_score": activity_score_buf[:cursor],
+        "touch_bonus_buy": touch_bonus_buy_buf[:cursor],
+        "touch_bonus_sell": touch_bonus_sell_buf[:cursor],
+        "fill_baseline_buy": fill_baseline_buy_buf[:cursor],
+        "fill_baseline_sell": fill_baseline_sell_buf[:cursor],
         "rollout_start_indices": np.asarray(rollout_start_indices, dtype=np.int64),
         "sampler_availability_resets": int(sampler_reset_count),
     }
@@ -3859,38 +3933,37 @@ def _resolve_checkpoint_metric_mode() -> str:
 
 
 def prefit_market_obs_norm(train_env: MarketMakingEnv) -> Dict[str, Any]:
-    """Fit train-split obs normalization at the active-neutral direct-quote operating point used for PPO init."""
-    train_env.set_obs_norm_state(_empty_obs_norm_state(), freeze=False)
-    _ = train_env.reset(start_idx=0)
-    done = False
-    # Active-neutral direct-quote action at PPO initialization: center/width/skew/taker = 0.
-    active_neutral_action = np.asarray((0.0, 0.0, 0.0, 0.0), dtype=np.float32).reshape(4,)
-    while not done:
-        _, _, done, _ = train_env.step_canonical_action_array(active_neutral_action, emit_info=False)
-    state = train_env.get_obs_norm_state()
-    if not _obs_norm_state_is_ready(state):
+    """Fit train-split obs normalization from exogenous feature rows only."""
+    feature_rows = np.asarray(train_env.features, dtype=np.float64)
+    if feature_rows.ndim != 2 or feature_rows.shape[0] < 2:
         raise RuntimeError(
-            "Train-only observation-normalization prefit did not produce a ready state; "
-            "ensure the train env has at least two observations."
+            "Train-only observation-normalization prefit requires at least two training feature rows."
         )
-    mean = np.asarray(state["mean"], dtype=np.float64)
-    m2 = np.asarray(state["m2"], dtype=np.float64)
-    mask_raw = state.get("continuous_mask")
-    mask = None if mask_raw is None else np.asarray(mask_raw, dtype=bool)
-    if mean.shape != m2.shape:
+    obs_dim = train_env._obs_dim
+    feature_dim = train_env._feature_dim
+    count = int(feature_rows.shape[0])
+    mean = np.zeros((obs_dim,), dtype=np.float64)
+    m2 = np.zeros((obs_dim,), dtype=np.float64)
+    mean[:feature_dim] = np.mean(feature_rows, axis=0)
+    centered = feature_rows - mean[:feature_dim]
+    m2[:feature_dim] = np.sum(centered * centered, axis=0)
+    mask = train_env._continuous_mask(obs_dim).astype(bool, copy=False)
+    if mean.shape != (obs_dim,) or m2.shape != (obs_dim,):
         raise RuntimeError(
-            f"Prefitted obs normalization mean/m2 shape mismatch: mean={mean.shape} m2={m2.shape}"
+            f"Prefitted obs normalization shape mismatch: mean={mean.shape} m2={m2.shape} obs_dim={obs_dim}"
         )
-    if mask is not None and mask.shape != mean.shape:
+    if mask.shape != mean.shape:
         raise RuntimeError(
             "Prefitted obs normalization continuous_mask shape mismatch: "
             f"mask={mask.shape} mean={mean.shape}"
         )
+    if bool(np.any(mask[feature_dim:])):
+        raise RuntimeError("Execution-state extras must be excluded from observation z-scoring.")
     return {
-        "count": int(state["count"]),
+        "count": count,
         "mean": mean.tolist(),
         "m2": m2.tolist(),
-        "continuous_mask": None if mask is None else mask.tolist(),
+        "continuous_mask": mask.tolist(),
     }
 
 
@@ -4113,15 +4186,7 @@ def train_market_ppo(
             config.init_log_std_taker,
         ),
     ).to(device)
-    _init_active_neutral_direct_quote_policy(
-        model,
-        (
-            config.init_log_std_center,
-            config.init_log_std_width,
-            config.init_log_std_skew,
-            config.init_log_std_taker,
-        ),
-    )
+    _init_market_policy_mean_head(model)
     print(
         "[mm ppo compile] "
         f"enabled={compile_enabled} "
@@ -4137,9 +4202,7 @@ def train_market_ppo(
         f"rollout_horizon={config.rollout_horizon} "
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
-        "active_neutral_direct_quote_init=true "
-        "initial_mean_action="
-        "{center_control=0,width_control=0,skew_control=0,taker_signal=0} "
+        "policy_mean_head_init=orthogonal_gain1 "
         "action_controls=center/width/skew/taker controls "
         "init_log_std={"
         f"center={config.init_log_std_center:.4f},"
@@ -4162,11 +4225,22 @@ def train_market_ppo(
             "train_market_ppo() probe construction."
         )
     prefitted_obs_count = int(train_obs_norm_state["count"])
+    train_mask = np.asarray(train_obs_norm_state.get("continuous_mask"), dtype=bool)
+    require(
+        train_mask.shape == (input_dim,),
+        f"Train obs normalization mask shape mismatch: {train_mask.shape} vs {(input_dim,)}",
+    )
+    require(
+        not bool(np.any(train_mask[-ENV_OBS_EXTRA_STATE_DIM:])),
+        "Execution-state extras must be excluded from z-scoring (continuous_mask tail must be all False).",
+    )
     print(
         "[mm ppo obs norm] "
         f"count={prefitted_obs_count} "
         f"train_frozen={train_env.freeze_obs_norm} "
-        f"val_frozen={val_env.freeze_obs_norm}"
+        f"val_frozen={val_env.freeze_obs_norm} "
+        f"feature_mask_true={int(np.sum(train_mask[:-ENV_OBS_EXTRA_STATE_DIM]))} "
+        f"extras_normalized={bool(np.any(train_mask[-ENV_OBS_EXTRA_STATE_DIM:]))}"
     )
     assert prefitted_obs_count >= 2, "prefitted observation normalization must have count >= 2"
     probe_obs = _build_market_probe_obs_batch(val_env, batch_size=8, device=device)
@@ -4321,9 +4395,25 @@ def train_market_ppo(
         shape_skew_np = rollout["reward_shape_skew"].detach().cpu().numpy().astype(np.float64)
         shape_width_np = rollout["reward_shape_width"].detach().cpu().numpy().astype(np.float64)
         shape_total_np = rollout["reward_shape_total"].detach().cpu().numpy().astype(np.float64)
+        touch_dist_buy_np = rollout["touch_dist_buy"].detach().cpu().numpy().astype(np.float64)
+        touch_dist_sell_np = rollout["touch_dist_sell"].detach().cpu().numpy().astype(np.float64)
+        maker_buy_fill_frac_np = rollout["maker_buy_fill_frac"].detach().cpu().numpy().astype(np.float64)
+        maker_sell_fill_frac_np = rollout["maker_sell_fill_frac"].detach().cpu().numpy().astype(np.float64)
+        activity_score_np = rollout["activity_score"].detach().cpu().numpy().astype(np.float64)
+        touch_bonus_buy_np = rollout["touch_bonus_buy"].detach().cpu().numpy().astype(np.float64)
+        touch_bonus_sell_np = rollout["touch_bonus_sell"].detach().cpu().numpy().astype(np.float64)
+        fill_baseline_buy_np = rollout["fill_baseline_buy"].detach().cpu().numpy().astype(np.float64)
+        fill_baseline_sell_np = rollout["fill_baseline_sell"].detach().cpu().numpy().astype(np.float64)
         true_abs_mean = float(np.mean(np.abs(reward_true_np))) if reward_true_np.size else 0.0
         shape_abs_mean = float(np.mean(np.abs(shape_total_np))) if shape_total_np.size else 0.0
         shaping_ratio = shape_abs_mean / max(true_abs_mean, 1e-8)
+        avg_touch_dist = float(np.mean(0.5 * (touch_dist_buy_np + touch_dist_sell_np))) if touch_dist_buy_np.size else 0.0
+        at_touch_frac = float(np.mean((touch_dist_buy_np <= 0.10) & (touch_dist_sell_np <= 0.10))) if touch_dist_buy_np.size else 0.0
+        off_touch_frac = float(np.mean((touch_dist_buy_np >= 0.50) & (touch_dist_sell_np >= 0.50))) if touch_dist_buy_np.size else 0.0
+        bonus_mass = touch_bonus_buy_np + touch_bonus_sell_np
+        smooth_mass = fill_baseline_buy_np + fill_baseline_sell_np
+        bonus_frac = float(np.mean(bonus_mass / np.maximum(bonus_mass + smooth_mass, 1e-8))) if bonus_mass.size else 0.0
+        fill_mean = float(np.mean(0.5 * (maker_buy_fill_frac_np + maker_sell_fill_frac_np))) if maker_buy_fill_frac_np.size else 0.0
         print(
             "[mm ppo sampler/shaping] "
             f"epoch={epoch + 1} "
@@ -4337,6 +4427,18 @@ def train_market_ppo(
             f"sampled_unique_starts={unique_starts} "
             f"sampled_min_start_distance={min_start_distance} "
             f"sampler_availability_reset={sampler_resets > 0}"
+        )
+        print(
+            "[mm ppo regime] "
+            f"epoch={epoch + 1} "
+            f"quote_touch_dist_avg={avg_touch_dist:.6f} "
+            f"quote_at_touch_frac={at_touch_frac:.6f} "
+            f"quote_off_touch_frac={off_touch_frac:.6f} "
+            f"maker_fill_frac_mean={fill_mean:.6f} "
+            f"activity_score_mean={float(np.mean(activity_score_np)):.6f} "
+            f"touch_bonus_mass_frac={bonus_frac:.6f} "
+            f"reward_true_std={float(np.std(reward_true_np)):.6f} "
+            f"reward_train_std={float(np.std((reward_true_np + shape_total_np))):.6f}"
         )
         if shape_abs_mean > 0.0 and shaping_ratio > 0.10:
             print(
@@ -4362,6 +4464,9 @@ def train_market_ppo(
                 device=device,
                 generator=stochastic_generator,
             )
+            val_touch_mean = float(stochastic_report.get("mean_touch_dist", 0.0))
+            val_touch_at = float(stochastic_report.get("touch_quote_frac", 0.0))
+            val_touch_off = float(stochastic_report.get("off_touch_quote_frac", 0.0))
             deterministic_sel = _checkpoint_selection_metrics(deterministic_report)
             stochastic_sel = _checkpoint_selection_metrics(stochastic_report)
             guard = config.max_drawdown_guard
@@ -4394,7 +4499,10 @@ def train_market_ppo(
                 f"seed={stochastic_val_seed} "
                 f"candidate_mode={selected_mode} "
                 f"candidate={stoch_candidate_ok} "
-                f"reason={stoch_candidate_reason}"
+                f"reason={stoch_candidate_reason} "
+                f"touch_dist_avg={val_touch_mean:.6f} "
+                f"touch_at_frac={val_touch_at:.6f} "
+                f"touch_off_frac={val_touch_off:.6f}"
             )
             selected_report = (
                 deterministic_report if selected_mode == "deterministic" else stochastic_report
@@ -4613,6 +4721,8 @@ def evaluate_market_making(
     maker_buy_fill_frac_steps: List[float] = []
     maker_sell_fill_frac_steps: List[float] = []
     maker_exec_qty_total_steps: List[float] = []
+    touch_dist_buy_steps: List[float] = []
+    touch_dist_sell_steps: List[float] = []
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -4680,6 +4790,8 @@ def evaluate_market_making(
         maker_buy_fill_frac_steps.append(float(info.get("maker_buy_fill_frac", 0.0)))
         maker_sell_fill_frac_steps.append(float(info.get("maker_sell_fill_frac", 0.0)))
         maker_exec_qty_total_steps.append(float(info.get("maker_buy_exec_qty", maker_buy)) + float(info.get("maker_sell_exec_qty", maker_sell)))
+        touch_dist_buy_steps.append(float(info.get("touch_dist_buy", 0.0)))
+        touch_dist_sell_steps.append(float(info.get("touch_dist_sell", 0.0)))
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
         if collect_vol_bucket_report:
             snapshot_row = env.features[idx_before_step, env._feature_layout["snapshots"]]
@@ -4756,6 +4868,8 @@ def evaluate_market_making(
     maker_buy_fill_frac_arr = np.asarray(maker_buy_fill_frac_steps, dtype=np.float64)
     maker_sell_fill_frac_arr = np.asarray(maker_sell_fill_frac_steps, dtype=np.float64)
     maker_exec_qty_total_arr = np.asarray(maker_exec_qty_total_steps, dtype=np.float64)
+    touch_dist_buy_arr = np.asarray(touch_dist_buy_steps, dtype=np.float64)
+    touch_dist_sell_arr = np.asarray(touch_dist_sell_steps, dtype=np.float64)
 
     metrics = {
         "initial_equity": float(initial_equity),
@@ -4780,6 +4894,9 @@ def evaluate_market_making(
         "maker_buy_fill_frac_mean": float(np.mean(maker_buy_fill_frac_arr)) if maker_buy_fill_frac_arr.size > 0 else 0.0,
         "maker_sell_fill_frac_mean": float(np.mean(maker_sell_fill_frac_arr)) if maker_sell_fill_frac_arr.size > 0 else 0.0,
         "maker_exec_qty_total_per_step_mean": float(np.mean(maker_exec_qty_total_arr)) if maker_exec_qty_total_arr.size > 0 else 0.0,
+        "mean_touch_dist": float(np.mean(0.5 * (touch_dist_buy_arr + touch_dist_sell_arr))) if touch_dist_buy_arr.size > 0 else 0.0,
+        "touch_quote_frac": float(np.mean((touch_dist_buy_arr <= 0.10) & (touch_dist_sell_arr <= 0.10))) if touch_dist_buy_arr.size > 0 else 0.0,
+        "off_touch_quote_frac": float(np.mean((touch_dist_buy_arr >= 0.50) & (touch_dist_sell_arr >= 0.50))) if touch_dist_buy_arr.size > 0 else 0.0,
         "maker_fill_count": int(maker_fill_count),
         "maker_opportunities": int(maker_opps),
         "taker_usage_frequency": taker_usage_frequency,
@@ -5027,6 +5144,14 @@ def run_pipeline(
         f"source=train_prefit count={int(prefitted_obs_norm_state['count'])} "
         f"obs_dim={mm_obs_dim} frozen={mm_train_env.freeze_obs_norm}"
     )
+    prefitted_mask = np.asarray(prefitted_obs_norm_state["continuous_mask"], dtype=bool)
+    extras_mask = prefitted_mask[-ENV_OBS_EXTRA_STATE_DIM:]
+    print(
+        "[mm obs norm extras] "
+        f"extra_dim={ENV_OBS_EXTRA_STATE_DIM} "
+        f"extras_normalized={bool(np.any(extras_mask))} "
+        f"feature_mask_true={int(np.sum(prefitted_mask[:-ENV_OBS_EXTRA_STATE_DIM]))}"
+    )
 
     mm_ppo_config = PPOConfig(
         lr=float(os.environ.get("BYBIT_MM_PPO_LR", "3e-4")),
@@ -5044,10 +5169,10 @@ def run_pipeline(
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
-        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.25),
+        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", 0.0),
         init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", 0.0),
-        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -0.25),
-        init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -0.10),
+        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", 0.0),
+        init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", 0.0),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
