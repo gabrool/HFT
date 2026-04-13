@@ -2573,7 +2573,8 @@ class MarketMakingEnv:
         half_spread_bps = anchor_half_spread_bps * width_mult
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
-        center_shift_bps = center_control_clipped * cfg.center_anchor_frac * anchor_half_spread_bps
+        # Scale center shift by the realized policy half-spread, not the raw anchor, so center remains meaningful under wide neutral quotes.
+        center_shift_bps = center_control_clipped * cfg.center_anchor_frac * half_spread_bps
         skew_local_limit_bps = cfg.skew_anchor_frac * anchor_half_spread_bps
         skew_limit_bps = min(cfg.skew_limit_bps, skew_local_limit_bps)
         skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
@@ -2585,6 +2586,7 @@ class MarketMakingEnv:
         quote_metrics = {
             "anchor_half_spread_bps": float(anchor_half_spread_bps),
             "half_spread_bps": float(half_spread_bps),
+            "center_shift_scale_bps": float(half_spread_bps),
             "center_control": float(center_control_clipped),
             "center_shift_bps": float(center_shift_bps),
             "skew_control": float(skew_control_clipped),
