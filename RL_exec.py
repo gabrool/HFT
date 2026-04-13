@@ -3282,7 +3282,7 @@ class PPOConfig:
     clip_ratio: float = 0.2
     lr: float = 3e-4
     update_epochs: int = 4
-    batch_size: int = 32768
+    batch_size: int = 131072
     entropy_coef: float = 0.02
     value_coef: float = 0.5
     policy_hidden: Tuple[int, ...] = (128, 128)
