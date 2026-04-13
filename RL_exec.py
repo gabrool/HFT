@@ -5379,7 +5379,7 @@ if __name__ == "__main__":
     out_root = os.environ.get("BYBIT_OUT_ROOT", "").strip()
     ckpt_path = os.environ.get("BYBIT_CMSSL_CKPT", "").strip()
     device = os.environ.get("BYBIT_DEVICE", "cuda")
-    ppo_epochs = _resolve_ppo_epochs(10)
+    ppo_epochs = _resolve_ppo_epochs(50)
     run_mode = _resolve_run_mode("train")
     run_cmssl_test_window = os.environ.get("BYBIT_RUN_CMSSL_TEST_WINDOW", "").strip().lower() in {
         "1",
