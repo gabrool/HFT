@@ -3430,6 +3430,8 @@ def collect_market_rollout(
     width_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     width_mult_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    center_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    center_shift_scale_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
@@ -3597,6 +3599,8 @@ def collect_market_rollout(
             width_control_buf[idx] = float(info.get("width_control", 0.0))
             width_mult_buf[idx] = float(info.get("width_mult", 0.0))
             half_spread_bps_buf[idx] = float(info.get("half_spread_bps", 0.0))
+            center_control_buf[idx] = float(info.get("center_control", 0.0))
+            center_shift_scale_bps_buf[idx] = float(info.get("center_shift_scale_bps", 0.0))
             center_shift_bps_buf[idx] = float(info.get("center_shift_bps", 0.0))
             terminated_buf[idx] = float(terminated)
             truncated_buf[idx] = float(truncated)
@@ -3660,6 +3664,8 @@ def collect_market_rollout(
         "width_control": width_control_buf[:cursor],
         "width_mult": width_mult_buf[:cursor],
         "half_spread_bps": half_spread_bps_buf[:cursor],
+        "center_control": center_control_buf[:cursor],
+        "center_shift_scale_bps": center_shift_scale_bps_buf[:cursor],
         "center_shift_bps": center_shift_bps_buf[:cursor],
         "rollout_start_indices": np.asarray(rollout_start_indices, dtype=np.int64),
         "sampler_availability_resets": int(sampler_reset_count),
@@ -4476,6 +4482,8 @@ def train_market_ppo(
         width_control_np = rollout["width_control"].detach().cpu().numpy().astype(np.float64)
         width_mult_np = rollout["width_mult"].detach().cpu().numpy().astype(np.float64)
         half_spread_bps_np = rollout["half_spread_bps"].detach().cpu().numpy().astype(np.float64)
+        center_control_np = rollout["center_control"].detach().cpu().numpy().astype(np.float64)
+        center_shift_scale_bps_np = rollout["center_shift_scale_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_bps_np = rollout["center_shift_bps"].detach().cpu().numpy().astype(np.float64)
         true_abs_mean = float(np.mean(np.abs(reward_true_np))) if reward_true_np.size else 0.0
         shape_abs_mean = float(np.mean(np.abs(shape_total_np))) if shape_total_np.size else 0.0
@@ -4515,6 +4523,12 @@ def train_market_ppo(
             f"half_spread_bps_mean={float(np.mean(half_spread_bps_np)):.6f} "
             f"half_spread_bps_p50={float(np.percentile(half_spread_bps_np, 50.0)):.6f} "
             f"half_spread_bps_p90={float(np.percentile(half_spread_bps_np, 90.0)):.6f} "
+            f"center_control_mean={float(np.mean(center_control_np)):.6f} "
+            f"center_control_p50={float(np.percentile(center_control_np, 50.0)):.6f} "
+            f"center_control_p90={float(np.percentile(center_control_np, 90.0)):.6f} "
+            f"center_shift_scale_bps_mean={float(np.mean(center_shift_scale_bps_np)):.6f} "
+            f"center_shift_scale_bps_p50={float(np.percentile(center_shift_scale_bps_np, 50.0)):.6f} "
+            f"center_shift_scale_bps_p90={float(np.percentile(center_shift_scale_bps_np, 90.0)):.6f} "
             f"center_shift_bps_mean={float(np.mean(center_shift_bps_np)):.6f} "
             f"center_shift_bps_p50={float(np.percentile(center_shift_bps_np, 50.0)):.6f} "
             f"center_shift_bps_p90={float(np.percentile(center_shift_bps_np, 90.0)):.6f} "
