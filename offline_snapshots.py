@@ -470,6 +470,7 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                     asks = tuple((float(p), float(q)) for p, q in data.get("a", []))
 
                 fe._update_book_from_ob(tp_code, bids, asks)
+                fe._ensure_book_ladders()
                 bid, ask, bsz, asz = fe._book_best()
                 if bid <= 0.0 or ask <= 0.0 or bsz is None or asz is None:
                     continue
