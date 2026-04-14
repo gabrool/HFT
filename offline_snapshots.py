@@ -194,6 +194,7 @@ class SnapshotSeries:
     best_bid_size: List[float]
     best_ask_size: List[float]
     time_since_last_ob_update_ms: List[float]
+    day_by_row: List[str]
 
     def append(
         self,
@@ -203,6 +204,7 @@ class SnapshotSeries:
         bid_size: float,
         ask_size: float,
         stale_ms: float,
+        day_key: str,
     ) -> None:
         # Invariant: every per-row series must be appended in lockstep.
         self.ts.append(int(ts_ms))
@@ -211,6 +213,7 @@ class SnapshotSeries:
         self.best_bid_size.append(float(bid_size))
         self.best_ask_size.append(float(ask_size))
         self.time_since_last_ob_update_ms.append(max(float(stale_ms), 0.0))
+        self.day_by_row.append(str(day_key))
 
     def to_npz(self, path: Path) -> None:
         """Save snapshot arrays.
@@ -233,6 +236,7 @@ class SnapshotSeries:
             == len(self.best_bid_size)
             == len(self.best_ask_size)
             == len(self.time_since_last_ob_update_ms)
+            == len(self.day_by_row)
         ):
             raise ValueError("SnapshotSeries arrays have mismatched lengths")
         snapshots = np.column_stack(
@@ -329,6 +333,7 @@ class WeekQuality:
             "event": {},
             "backstep": {},
             "day_clip": {},
+            "crossed_book": {},
         }
         for day in self.days:
             for namespace, values in day.counters.items():
@@ -369,6 +374,7 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
         best_bid_size=[],
         best_ask_size=[],
         time_since_last_ob_update_ms=[],
+        day_by_row=[],
     )
 
     last_seen_ts_ms: Optional[int] = None
@@ -511,9 +517,10 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                     series.best_bid_size[-1] = float(bsz)
                     series.best_ask_size[-1] = float(asz)
                     series.time_since_last_ob_update_ms[-1] = 0.0
+                    series.day_by_row[-1] = str(dq_day.day)
                     continue
 
-                series.append(repaired_ts_ms, bid, ask, bsz, asz, 0.0)
+                series.append(repaired_ts_ms, bid, ask, bsz, asz, 0.0, dq_day.day)
 
                 bad_abs, total = _day_bad_abs_and_total(dq_day)
                 bad_frac = float(bad_abs) / float(max(1, total))
@@ -624,13 +631,141 @@ def daily_ob_paths_for_week(week_key: str, ob_by_day: dict[date, str]) -> List[s
     return paths
 
 
-def write_week_snapshots(out_root: str, week_key: str, series: SnapshotSeries, *, overwrite: bool) -> Path:
+def _repair_crossed_top_of_book_row(bid: float, ask: float) -> tuple[float, float, bool]:
+    if ask >= bid:
+        return float(bid), float(ask), False
+    repaired_px = 0.5 * (float(bid) + float(ask))
+    return repaired_px, repaired_px, True
+
+
+def _sample_rows_for_error(
+    indices: np.ndarray,
+    snapshot_ts: np.ndarray,
+    best_bid: np.ndarray,
+    best_ask: np.ndarray,
+    *,
+    limit: int = 5,
+) -> list[dict[str, object]]:
+    samples = []
+    for idx in indices[: min(limit, int(indices.shape[0]))]:
+        row_idx = int(idx)
+        samples.append(
+            {
+                "row": row_idx,
+                "ts": int(snapshot_ts[row_idx]),
+                "best_bid": float(best_bid[row_idx]),
+                "best_ask": float(best_ask[row_idx]),
+            }
+        )
+    return samples
+
+
+def repair_snapshot_book_rows(
+    snapshot_ts: np.ndarray,
+    snapshots: np.ndarray,
+    *,
+    week_quality: Optional[WeekQuality] = None,
+    day_by_row: Optional[list[str]] = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    repaired = np.asarray(snapshots, dtype=np.float64).copy()
+    if repaired.ndim != 2 or repaired.shape[1] != 4:
+        raise ValueError(f"snapshots must be [N,4], got shape={repaired.shape}")
+    if snapshot_ts.shape[0] != repaired.shape[0]:
+        raise ValueError("snapshot_ts length must match snapshots rows")
+
+    best_bid = repaired[:, 0]
+    best_ask = repaired[:, 1]
+    crossed_idx = np.flatnonzero(best_ask < best_bid)
+    examples: list[dict[str, object]] = []
+    for idx in crossed_idx:
+        row = int(idx)
+        orig_bid = float(best_bid[row])
+        orig_ask = float(best_ask[row])
+        fixed_bid, fixed_ask, was_repaired = _repair_crossed_top_of_book_row(orig_bid, orig_ask)
+        if was_repaired:
+            best_bid[row] = fixed_bid
+            best_ask[row] = fixed_ask
+        if len(examples) < BYBIT_BAD_EXAMPLES_N:
+            examples.append(
+                {
+                    "row": row,
+                    "ts": int(snapshot_ts[row]),
+                    "original_bid": orig_bid,
+                    "original_ask": orig_ask,
+                    "repaired_bid": float(best_bid[row]),
+                    "repaired_ask": float(best_ask[row]),
+                }
+            )
+
+    repaired_count = int(crossed_idx.shape[0])
+    if week_quality is not None:
+        day_counter: dict[str, int] = {}
+        if day_by_row is not None:
+            if len(day_by_row) != repaired.shape[0]:
+                raise ValueError("day_by_row length must match snapshots rows")
+            for idx in crossed_idx:
+                day_counter[str(day_by_row[int(idx)])] = day_counter.get(str(day_by_row[int(idx)]), 0) + 1
+        for day in week_quality.days:
+            detected = int(day_counter.get(day.day, 0))
+            if detected > 0:
+                day.increment_counter("crossed_book", "crossed_detected", detected)
+                day.increment_counter("crossed_book", "crossed_repaired", detected)
+                for ex in examples:
+                    if str(day.day) == str(day_by_row[int(ex["row"])]):
+                        day.append_example("crossed_book_repair", ex)
+        week_quality.recompute_totals()
+
+    summary = {
+        "crossed_detected": repaired_count,
+        "crossed_repaired": repaired_count,
+        "examples": examples,
+    }
+    return snapshot_ts, repaired.astype(np.float32, copy=False), summary
+
+
+def validate_repaired_snapshot_book(
+    snapshot_ts: np.ndarray,
+    snapshots: np.ndarray,
+    *,
+    week_key: str,
+    stage: str,
+) -> None:
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshots = np.asarray(snapshots, dtype=np.float64)
+    bid = snapshots[:, 0]
+    ask = snapshots[:, 1]
+    bad_bid = np.flatnonzero(~np.isfinite(bid) | (bid <= 0.0))
+    bad_ask = np.flatnonzero(~np.isfinite(ask) | (ask <= 0.0))
+    crossed = np.flatnonzero(ask < bid)
+    if bad_bid.size or bad_ask.size or crossed.size:
+        raise ValueError(
+            f"{stage}: invalid snapshot top-of-book after repair for week={week_key}; "
+            f"bad_bid={int(bad_bid.size)} bad_ask={int(bad_ask.size)} crossed={int(crossed.size)} "
+            f"crossed_samples={_sample_rows_for_error(crossed, snapshot_ts, bid, ask)}"
+        )
+
+
+def write_week_snapshots(
+    out_root: str,
+    week_key: str,
+    snapshot_ts: np.ndarray,
+    snapshots: np.ndarray,
+    stale_ms: np.ndarray,
+    *,
+    overwrite: bool,
+) -> Path:
     week_dir = Path(out_root) / week_key
     week_dir.mkdir(parents=True, exist_ok=True)
     out_path = week_dir / "snapshots.npz"
     if out_path.exists() and not overwrite:
         raise FileExistsError(f"Snapshot file exists: {out_path} (use --overwrite)")
-    series.to_npz(out_path)
+    np.savez_compressed(
+        out_path,
+        ts=np.asarray(snapshot_ts, dtype=np.int64),
+        snapshots=np.asarray(snapshots, dtype=np.float32),
+        time_since_last_ob_update_ms=np.asarray(stale_ms, dtype=np.float32),
+    )
     return out_path
 
 
@@ -769,9 +904,24 @@ def compute_snapshot_feature_matrix(
     stale_ms = np.maximum(stale_ms[order], 0.0)
     best_bid = snapshots[:, 0].astype(np.float64)
     best_ask = snapshots[:, 1].astype(np.float64)
+    crossed = np.flatnonzero(best_ask < best_bid)
+    if crossed.size:
+        raise ValueError(
+            "compute_snapshot_feature_matrix received crossed book rows; "
+            f"count={int(crossed.size)} samples={_sample_rows_for_error(crossed, snapshot_ts, best_bid, best_ask)}"
+        )
+    invalid_bid = np.flatnonzero(~np.isfinite(best_bid) | (best_bid <= 0.0))
+    invalid_ask = np.flatnonzero(~np.isfinite(best_ask) | (best_ask <= 0.0))
+    if invalid_bid.size or invalid_ask.size:
+        raise ValueError(
+            "compute_snapshot_feature_matrix received non-positive/invalid top-of-book rows; "
+            f"invalid_bid={int(invalid_bid.size)} invalid_ask={int(invalid_ask.size)}"
+        )
     best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
     best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
     mid = (best_bid + best_ask) / 2.0
+    if np.any(~np.isfinite(mid) | (mid <= 0.0)):
+        raise ValueError("compute_snapshot_feature_matrix computed non-finite or non-positive mid values.")
     eps = 1e-9
     imbalance = (best_bid_size - best_ask_size) / (best_bid_size + best_ask_size + eps)
     spread_bps = (best_ask - best_bid) / mid * 1e4
@@ -915,13 +1065,27 @@ def main() -> int:
             print(f"  [skip] no snapshots produced for {wk}")
             print(f"  [quality] {quality_path}")
             continue
-        out_path = write_week_snapshots(args.out_root, wk, series, overwrite=args.overwrite)
         raw_ts = np.asarray(series.ts, dtype=np.int64)
         raw_snapshots = np.column_stack(
             [series.best_bid, series.best_ask, series.best_bid_size, series.best_ask_size]
         ).astype(np.float32, copy=False)
         stale_ms = np.asarray(series.time_since_last_ob_update_ms, dtype=np.float32)
-        snapshot_ts, snapshot_features = compute_snapshot_feature_matrix(raw_ts, raw_snapshots, stale_ms)
+        snapshot_ts, repaired_snapshots, repair_summary = repair_snapshot_book_rows(
+            raw_ts,
+            raw_snapshots,
+            week_quality=week_quality,
+            day_by_row=series.day_by_row,
+        )
+        validate_repaired_snapshot_book(snapshot_ts, repaired_snapshots, week_key=wk, stage="post_repair")
+        out_path = write_week_snapshots(
+            args.out_root,
+            wk,
+            snapshot_ts,
+            repaired_snapshots,
+            stale_ms,
+            overwrite=args.overwrite,
+        )
+        snapshot_ts, snapshot_features = compute_snapshot_feature_matrix(snapshot_ts, repaired_snapshots, stale_ms)
         decision_ts = load_week_decision_timestamps(args.out_root, wk)
         aligned_snapshots = align_snapshot_features_to_decisions(snapshot_ts, snapshot_features, decision_ts)
         decision_out_path = write_week_decision_snapshots(
@@ -944,11 +1108,23 @@ def main() -> int:
                 "feature_columns": list(RAW_SNAPSHOT_FEATURE_COLUMNS),
                 "alignment_status": "ok",
             },
+            "snapshot_repairs": {
+                "crossed_book": {
+                    "crossed_detected": int(repair_summary["crossed_detected"]),
+                    "crossed_repaired": int(repair_summary["crossed_repaired"]),
+                    "examples": list(repair_summary["examples"]),
+                }
+            },
         }
         quality_path.parent.mkdir(parents=True, exist_ok=True)
         quality_path.write_text(json.dumps(quality_payload, indent=2), encoding="utf-8")
         print(f"  [write] {out_path} rows={len(series.ts):,}")
         print(f"  [write] {decision_out_path} rows={aligned_snapshots.shape[0]:,}")
+        print(
+            "  [quality] crossed_book "
+            f"crossed_detected={int(repair_summary['crossed_detected']):,} "
+            f"crossed_repaired={int(repair_summary['crossed_repaired']):,}"
+        )
         print(f"  [quality] {quality_path}")
 
     return 0
