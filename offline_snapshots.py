@@ -215,41 +215,6 @@ class SnapshotSeries:
         self.time_since_last_ob_update_ms.append(max(float(stale_ms), 0.0))
         self.day_by_row.append(str(day_key))
 
-    def to_npz(self, path: Path) -> None:
-        """Save snapshot arrays.
-
-        Schema:
-          - ts: int64 ms timestamps
-          - snapshots: float32 [N,4] = (best_bid, best_ask, best_bid_size, best_ask_size)
-
-        Example row:
-          snapshots[i] = [63125.5, 63126.0, 4.2, 3.8]
-
-        RL execution requires this 4-field format.
-        """
-        # Invariant: all per-row arrays must remain equal length.
-        n_rows = len(self.ts)
-        if not (
-            n_rows
-            == len(self.best_bid)
-            == len(self.best_ask)
-            == len(self.best_bid_size)
-            == len(self.best_ask_size)
-            == len(self.time_since_last_ob_update_ms)
-            == len(self.day_by_row)
-        ):
-            raise ValueError("SnapshotSeries arrays have mismatched lengths")
-        snapshots = np.column_stack(
-            [self.best_bid, self.best_ask, self.best_bid_size, self.best_ask_size]
-        ).astype(np.float32)
-        np.savez_compressed(
-            path,
-            ts=np.asarray(self.ts, dtype=np.int64),
-            snapshots=snapshots,
-            time_since_last_ob_update_ms=np.asarray(self.time_since_last_ob_update_ms, dtype=np.float32),
-        )
-
-
 @dataclass
 class DayQuality:
     day: str
