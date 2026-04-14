@@ -55,7 +55,7 @@ DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
 DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS = 50.0
-DEFAULT_MM_DIRECT_CENTER_ANCHOR_FRAC = 0.5
+DEFAULT_MM_DIRECT_CENTER_ANCHOR_FRAC = 0.15
 DEFAULT_MM_DIRECT_SKEW_ANCHOR_FRAC = 1.0
 # PPO training epochs environment variable (used across entrypoint/config helpers).
 PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
@@ -73,7 +73,7 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.1
 DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
-MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v3"
+MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v4"
 MM_PPO_ACTION_DIM = 4
 MM_PPO_ACTION_SEMANTICS = (
     "center_control",
@@ -372,7 +372,7 @@ def _ppo_action_bounds(
     direct_cfg = env.direct_quote_config if env is not None else load_direct_quote_config()
     taker_signal_limit = float(direct_cfg.taker_signal_limit)
     low = torch.tensor(
-        [-1.0, -1.0, -1.0, -taker_signal_limit],
+        [-1.0, 0.0, -1.0, -taker_signal_limit],
         device=device,
         dtype=torch.float32,
     )
@@ -669,7 +669,6 @@ class DirectQuoteConfig:
     spread_cap_bps: float
     obs_spread_anchor_frac: float
     touch_halfspread_mult: float
-    neutral_halfspread_mult: float
     wide_halfspread_mult: float
     skew_limit_bps: float
     skew_anchor_frac: float
@@ -719,7 +718,7 @@ class ContinuousMakerFillConfig:
     tau_cross: float = 0.20
     touch_event_bonus: float = 0.45
     touch_event_distance_frac: float = 0.10
-    eps_px: float = 1e-9
+    price_epsilon_px: float = 1e-9
 
 
 def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
@@ -730,7 +729,7 @@ def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
         tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.20),
         touch_event_bonus=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_BONUS", 0.45),
         touch_event_distance_frac=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC", 0.10),
-        eps_px=_env_float("BYBIT_MM_FILL_EPS_PX", 1e-9),
+        price_epsilon_px=_env_float("BYBIT_MM_FILL_PRICE_EPSILON_PX", 1e-9),
     )
     if not np.isfinite(cfg.activity_min) or not np.isfinite(cfg.activity_max):
         raise ValueError("Continuous maker-fill activity bounds must be finite.")
@@ -748,8 +747,8 @@ def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
         or cfg.touch_event_distance_frac > 1.0
     ):
         raise ValueError("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC must be finite and in [0, 1].")
-    if not np.isfinite(cfg.eps_px) or cfg.eps_px <= 0.0:
-        raise ValueError("BYBIT_MM_FILL_EPS_PX must be finite and > 0.")
+    if not np.isfinite(cfg.price_epsilon_px) or cfg.price_epsilon_px <= 0.0:
+        raise ValueError("BYBIT_MM_FILL_PRICE_EPSILON_PX must be finite and > 0.")
     return cfg
 
 
@@ -850,8 +849,7 @@ def load_direct_quote_config() -> DirectQuoteConfig:
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
             touch_halfspread_mult=_env_float("BYBIT_MM_TOUCH_HALFSPREAD_MULT", 1.0),
-            neutral_halfspread_mult=_env_float("BYBIT_MM_NEUTRAL_HALFSPREAD_MULT", 3.0),
-            wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 6.0),
+            wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 2.0),
             skew_limit_bps=_env_float("BYBIT_MM_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
             skew_anchor_frac=_env_float("BYBIT_MM_SKEW_ANCHOR_FRAC", DEFAULT_MM_DIRECT_SKEW_ANCHOR_FRAC),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
@@ -874,10 +872,8 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         raise ValueError("obs_spread_anchor_frac must be finite and in [0.0, 1.0]")
     if not np.isfinite(cfg.touch_halfspread_mult) or cfg.touch_halfspread_mult <= 0.0:
         raise ValueError("touch_halfspread_mult must be finite and > 0.")
-    if not np.isfinite(cfg.neutral_halfspread_mult) or cfg.neutral_halfspread_mult < cfg.touch_halfspread_mult:
-        raise ValueError("neutral_halfspread_mult must be finite and >= touch_halfspread_mult.")
-    if not np.isfinite(cfg.wide_halfspread_mult) or cfg.wide_halfspread_mult < cfg.neutral_halfspread_mult:
-        raise ValueError("wide_halfspread_mult must be finite and >= neutral_halfspread_mult.")
+    if not np.isfinite(cfg.wide_halfspread_mult) or cfg.wide_halfspread_mult < cfg.touch_halfspread_mult:
+        raise ValueError("wide_halfspread_mult must be finite and >= touch_halfspread_mult.")
     if not np.isfinite(cfg.skew_limit_bps) or cfg.skew_limit_bps < 0.0:
         raise ValueError("skew_limit_bps must be finite and >= 0.0")
     if not np.isfinite(cfg.skew_anchor_frac) or cfg.skew_anchor_frac < 0.0:
@@ -2274,6 +2270,15 @@ class MarketMakingEnv:
             if continuous_maker_fill_config is None
             else continuous_maker_fill_config
         )
+        raw_spreads_px = np.asarray(self.best_ask - self.best_bid, dtype=np.float64)
+        positive_raw_spreads_px = raw_spreads_px[
+            np.isfinite(raw_spreads_px) & (raw_spreads_px > 0.0)
+        ]
+        if positive_raw_spreads_px.size:
+            spread_q05 = float(np.quantile(positive_raw_spreads_px, 0.05))
+            self.fill_norm_spread_px_floor = float(max(spread_q05, 1e-6))
+        else:
+            self.fill_norm_spread_px_floor = 1e-6
         self.taker_signal_limit = float(self.direct_quote_config.taker_signal_limit)
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
@@ -2317,6 +2322,9 @@ class MarketMakingEnv:
         self.last_touch_bonus_sell = 0.0
         self.last_fill_baseline_buy = 0.0
         self.last_fill_baseline_sell = 0.0
+        self.last_raw_spread_px = 0.0
+        self.last_norm_spread_px = float(self.fill_norm_spread_px_floor)
+        self.last_used_norm_spread_floor = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self._obs_count = 0
@@ -2362,6 +2370,9 @@ class MarketMakingEnv:
         self.last_touch_bonus_sell = 0.0
         self.last_fill_baseline_buy = 0.0
         self.last_fill_baseline_sell = 0.0
+        self.last_raw_spread_px = 0.0
+        self.last_norm_spread_px = float(self.fill_norm_spread_px_floor)
+        self.last_used_norm_spread_floor = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self._obs_ping_pong_idx = 0
@@ -2565,15 +2576,12 @@ class MarketMakingEnv:
         if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
             floor_bps = max(floor_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
         anchor_half_spread_bps = float(np.clip(floor_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
-        wc = float(np.clip(width_control, -1.0, 1.0))
-        if wc <= 0.0:
-            width_mult = cfg.neutral_halfspread_mult + (-wc) * (cfg.touch_halfspread_mult - cfg.neutral_halfspread_mult)
-        else:
-            width_mult = cfg.neutral_halfspread_mult + wc * (cfg.wide_halfspread_mult - cfg.neutral_halfspread_mult)
+        wc = float(np.clip(width_control, 0.0, 1.0))
+        width_mult = cfg.touch_halfspread_mult + wc * (cfg.wide_halfspread_mult - cfg.touch_halfspread_mult)
         half_spread_bps = anchor_half_spread_bps * width_mult
         half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
         center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
-        # Scale center shift by the realized policy half-spread, not the raw anchor, so center remains meaningful under wide neutral quotes.
+        # Scale center shift by the realized policy half-spread.
         center_shift_bps = center_control_clipped * cfg.center_anchor_frac * half_spread_bps
         skew_local_limit_bps = cfg.skew_anchor_frac * anchor_half_spread_bps
         skew_limit_bps = min(cfg.skew_limit_bps, skew_local_limit_bps)
@@ -2585,6 +2593,8 @@ class MarketMakingEnv:
         ask = mid + bps_to_px(mid, center_shift_bps + ask_half_spread_bps)
         quote_metrics = {
             "anchor_half_spread_bps": float(anchor_half_spread_bps),
+            "width_control": float(wc),
+            "width_mult": float(width_mult),
             "half_spread_bps": float(half_spread_bps),
             "center_shift_scale_bps": float(half_spread_bps),
             "center_control": float(center_control_clipped),
@@ -2650,7 +2660,7 @@ class MarketMakingEnv:
         return float(cfg.activity_min + (cfg.activity_max - cfg.activity_min) * vol_score)
 
     def _compute_maker_fill_hard(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
-        touch_epsilon = self.continuous_maker_fill_config.eps_px
+        touch_epsilon = self.continuous_maker_fill_config.price_epsilon_px
         best_bid_next = float(self.best_bid[idx])
         best_ask_next = float(self.best_ask[idx])
         best_bid_prev = float(self.best_bid[idx - 1]) if idx > 0 else best_bid_next
@@ -2698,7 +2708,8 @@ class MarketMakingEnv:
         best_bid_next = float(self.best_bid[idx])
         best_ask_next = float(self.best_ask[idx])
         cfg = self.continuous_maker_fill_config
-        spread_px = max(best_ask_t - best_bid_t, cfg.eps_px)
+        raw_spread_px = max(best_ask_t - best_bid_t, 0.0)
+        norm_spread_px = max(raw_spread_px, self.fill_norm_spread_px_floor)
         activity = self._volatility_activity_score(decision_idx)
         self.last_activity_score = activity
         bid_enabled = np.isfinite(bid)
@@ -2714,31 +2725,31 @@ class MarketMakingEnv:
         baseline_buy = 0.0
         baseline_sell = 0.0
         touch_dist_threshold = max(0.0, cfg.touch_event_distance_frac)
-        touch_epsilon = cfg.eps_px
+        touch_epsilon = max(self.fill_tolerance, cfg.price_epsilon_px)
         best_bid_prev = float(self.best_bid[idx - 1]) if idx > 0 else best_bid_t
         best_ask_prev = float(self.best_ask[idx - 1]) if idx > 0 else best_ask_t
         if bid_enabled:
-            touch_dist_buy = float(max(0.0, best_bid_t - bid) / spread_px)
-            cross_gap_buy = float((best_ask_next - bid) / spread_px)
+            touch_dist_buy = float(max(0.0, best_bid_t - bid) / norm_spread_px)
+            cross_gap_buy = float((best_ask_next - bid) / norm_spread_px)
             p_touch_buy = float(activity * np.exp(-((touch_dist_buy / cfg.tau_touch) ** 2)))
             p_cross_buy = float(_sigmoid(-cross_gap_buy / cfg.tau_cross))
             baseline_buy = float(np.clip(p_touch_buy + p_cross_buy, 0.0, 1.0))
             at_touch_buy = (
                 touch_dist_buy <= touch_dist_threshold
-                and abs(bid - best_bid_prev) <= max(self.fill_tolerance, touch_epsilon)
+                and abs(bid - best_bid_prev) <= touch_epsilon
                 and best_bid_next < best_bid_prev - touch_epsilon
             )
             touch_bonus_buy = cfg.touch_event_bonus if at_touch_buy else 0.0
             buy_fill_frac = float(np.clip(baseline_buy + touch_bonus_buy, 0.0, 1.0))
         if ask_enabled:
-            touch_dist_sell = float(max(0.0, ask - best_ask_t) / spread_px)
-            cross_gap_sell = float((ask - best_bid_next) / spread_px)
+            touch_dist_sell = float(max(0.0, ask - best_ask_t) / norm_spread_px)
+            cross_gap_sell = float((ask - best_bid_next) / norm_spread_px)
             p_touch_sell = float(activity * np.exp(-((touch_dist_sell / cfg.tau_touch) ** 2)))
             p_cross_sell = float(_sigmoid(-cross_gap_sell / cfg.tau_cross))
             baseline_sell = float(np.clip(p_touch_sell + p_cross_sell, 0.0, 1.0))
             at_touch_sell = (
                 touch_dist_sell <= touch_dist_threshold
-                and abs(ask - best_ask_prev) <= max(self.fill_tolerance, touch_epsilon)
+                and abs(ask - best_ask_prev) <= touch_epsilon
                 and best_ask_next > best_ask_prev + touch_epsilon
             )
             touch_bonus_sell = cfg.touch_event_bonus if at_touch_sell else 0.0
@@ -2750,6 +2761,9 @@ class MarketMakingEnv:
         self.last_touch_bonus_sell = float(touch_bonus_sell)
         self.last_fill_baseline_buy = float(baseline_buy)
         self.last_fill_baseline_sell = float(baseline_sell)
+        self.last_raw_spread_px = float(raw_spread_px)
+        self.last_norm_spread_px = float(norm_spread_px)
+        self.last_used_norm_spread_floor = float(raw_spread_px < self.fill_norm_spread_px_floor)
         self.last_maker_buy_fill_frac = float(buy_fill_frac)
         self.last_maker_sell_fill_frac = float(sell_fill_frac)
 
@@ -2878,6 +2892,9 @@ class MarketMakingEnv:
         self.last_activity_score = 0.0
         self.last_touch_dist_buy = 0.0
         self.last_touch_dist_sell = 0.0
+        self.last_raw_spread_px = 0.0
+        self.last_norm_spread_px = float(self.fill_norm_spread_px_floor)
+        self.last_used_norm_spread_floor = 1.0
 
     def _step_from_action_components_with_fill(
         self,
@@ -2930,6 +2947,17 @@ class MarketMakingEnv:
                 "post_sell_room_qty": float(pre_sell_room_qty),
                 "bid": 0.0,
                 "ask": 0.0,
+                "center_control": 0.0,
+                "center_shift_bps": 0.0,
+                "center_shift_scale_bps": 0.0,
+                "width_control": 0.0,
+                "width_mult": 0.0,
+                "skew_control": 0.0,
+                "anchor_half_spread_bps": 0.0,
+                "half_spread_bps": 0.0,
+                "skew_local_limit_bps": 0.0,
+                "skew_limit_bps": 0.0,
+                "skew_bps": 0.0,
                 "maker_buy": 0.0,
                 "maker_sell": 0.0,
                 "taker_buy": 0.0,
@@ -2962,6 +2990,9 @@ class MarketMakingEnv:
                 "touch_bonus_sell": float(self.last_touch_bonus_sell),
                 "fill_baseline_buy": float(self.last_fill_baseline_buy),
                 "fill_baseline_sell": float(self.last_fill_baseline_sell),
+                "raw_spread_px": float(self.last_raw_spread_px),
+                "norm_spread_px": float(self.last_norm_spread_px),
+                "used_norm_spread_floor": float(self.last_used_norm_spread_floor),
                 "taker_buy_clipped": float(self.last_taker_buy_clipped),
                 "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
@@ -3108,7 +3139,9 @@ class MarketMakingEnv:
             "ask": float(ask),
             "center_control": float(quote_metrics["center_control"]),
             "center_shift_bps": float(quote_metrics["center_shift_bps"]),
-            "width_control": float(np.clip(width_control, -1.0, 1.0)),
+            "center_shift_scale_bps": float(quote_metrics["center_shift_scale_bps"]),
+            "width_control": float(quote_metrics["width_control"]),
+            "width_mult": float(quote_metrics["width_mult"]),
             "skew_control": float(quote_metrics["skew_control"]),
             "anchor_half_spread_bps": float(quote_metrics["anchor_half_spread_bps"]),
             "half_spread_bps": float(quote_metrics["half_spread_bps"]),
@@ -3147,6 +3180,9 @@ class MarketMakingEnv:
             "touch_bonus_sell": float(self.last_touch_bonus_sell),
             "fill_baseline_buy": float(self.last_fill_baseline_buy),
             "fill_baseline_sell": float(self.last_fill_baseline_sell),
+            "raw_spread_px": float(self.last_raw_spread_px),
+            "norm_spread_px": float(self.last_norm_spread_px),
+            "used_norm_spread_floor": float(self.last_used_norm_spread_floor),
             "taker_buy_clipped": float(self.last_taker_buy_clipped),
             "taker_sell_clipped": float(self.last_taker_sell_clipped),
         }
@@ -3270,9 +3306,15 @@ def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
 def _init_market_policy_mean_head(model: MarketPolicyValueNet) -> None:
     final_policy_linear = _find_final_policy_linear_layer(model)
     with torch.no_grad():
-        nn.init.orthogonal_(final_policy_linear.weight, gain=1.0)
+        nn.init.orthogonal_(final_policy_linear.weight, gain=0.1)
         if final_policy_linear.bias is not None:
             final_policy_linear.bias.zero_()
+            width_action_init = 0.05
+            width_latent_bias = np.arctanh(2.0 * width_action_init - 1.0)
+            final_policy_linear.bias[0] = 0.0
+            final_policy_linear.bias[1] = float(width_latent_bias)
+            final_policy_linear.bias[2] = 0.0
+            final_policy_linear.bias[3] = 0.0
 
 
 @dataclass
@@ -3292,10 +3334,10 @@ class PPOConfig:
     rollout_horizon: int = 8192
     rollouts_per_epoch: int = 16
     randomize_rollout_start: bool = True
-    init_log_std_center: float = 0.0
-    init_log_std_width: float = 0.0
-    init_log_std_skew: float = 0.0
-    init_log_std_taker: float = 0.0
+    init_log_std_center: float = -1.0
+    init_log_std_width: float = -1.5
+    init_log_std_skew: float = -1.0
+    init_log_std_taker: float = -1.0
 
 
 def compute_gae(
@@ -3382,6 +3424,13 @@ def collect_market_rollout(
     touch_bonus_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     fill_baseline_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     fill_baseline_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    raw_spread_px_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    norm_spread_px_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    used_norm_spread_floor_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    width_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    width_mult_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
     action_dim = _resolve_market_action_dim()
@@ -3542,6 +3591,13 @@ def collect_market_rollout(
             touch_bonus_sell_buf[idx] = float(info.get("touch_bonus_sell", 0.0))
             fill_baseline_buy_buf[idx] = float(info.get("fill_baseline_buy", 0.0))
             fill_baseline_sell_buf[idx] = float(info.get("fill_baseline_sell", 0.0))
+            raw_spread_px_buf[idx] = float(info.get("raw_spread_px", 0.0))
+            norm_spread_px_buf[idx] = float(info.get("norm_spread_px", 0.0))
+            used_norm_spread_floor_buf[idx] = float(info.get("used_norm_spread_floor", 0.0))
+            width_control_buf[idx] = float(info.get("width_control", 0.0))
+            width_mult_buf[idx] = float(info.get("width_mult", 0.0))
+            half_spread_bps_buf[idx] = float(info.get("half_spread_bps", 0.0))
+            center_shift_bps_buf[idx] = float(info.get("center_shift_bps", 0.0))
             terminated_buf[idx] = float(terminated)
             truncated_buf[idx] = float(truncated)
             dones_buf[idx] = float(done)
@@ -3598,6 +3654,13 @@ def collect_market_rollout(
         "touch_bonus_sell": touch_bonus_sell_buf[:cursor],
         "fill_baseline_buy": fill_baseline_buy_buf[:cursor],
         "fill_baseline_sell": fill_baseline_sell_buf[:cursor],
+        "raw_spread_px": raw_spread_px_buf[:cursor],
+        "norm_spread_px": norm_spread_px_buf[:cursor],
+        "used_norm_spread_floor": used_norm_spread_floor_buf[:cursor],
+        "width_control": width_control_buf[:cursor],
+        "width_mult": width_mult_buf[:cursor],
+        "half_spread_bps": half_spread_bps_buf[:cursor],
+        "center_shift_bps": center_shift_bps_buf[:cursor],
         "rollout_start_indices": np.asarray(rollout_start_indices, dtype=np.int64),
         "sampler_availability_resets": int(sampler_reset_count),
     }
@@ -4069,10 +4132,11 @@ def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
     schema = ckpt.get("checkpoint_schema")
     if schema != MM_PPO_CHECKPOINT_SCHEMA:
         legacy_note = ""
-        if schema == "mm-ppo-direct-quote-v2":
+        if schema == "mm-ppo-direct-quote-v3":
             legacy_note = (
-                " Direct-quote v2 checkpoints are incompatible with v3 because center is now "
-                "spread-relative and skew capacity is anchor-based (independent of width); retraining is required."
+                " Direct-quote v3 checkpoints are incompatible with v4 because width control "
+                "contract changed to one-sided [0,1], fill normalization changed, and policy "
+                "initialization defaults changed; retraining is required."
             )
         raise ValueError(
             "Unsupported market PPO checkpoint schema. "
@@ -4406,10 +4470,19 @@ def train_market_ppo(
         touch_bonus_sell_np = rollout["touch_bonus_sell"].detach().cpu().numpy().astype(np.float64)
         fill_baseline_buy_np = rollout["fill_baseline_buy"].detach().cpu().numpy().astype(np.float64)
         fill_baseline_sell_np = rollout["fill_baseline_sell"].detach().cpu().numpy().astype(np.float64)
+        raw_spread_px_np = rollout["raw_spread_px"].detach().cpu().numpy().astype(np.float64)
+        norm_spread_px_np = rollout["norm_spread_px"].detach().cpu().numpy().astype(np.float64)
+        used_norm_spread_floor_np = rollout["used_norm_spread_floor"].detach().cpu().numpy().astype(np.float64)
+        width_control_np = rollout["width_control"].detach().cpu().numpy().astype(np.float64)
+        width_mult_np = rollout["width_mult"].detach().cpu().numpy().astype(np.float64)
+        half_spread_bps_np = rollout["half_spread_bps"].detach().cpu().numpy().astype(np.float64)
+        center_shift_bps_np = rollout["center_shift_bps"].detach().cpu().numpy().astype(np.float64)
         true_abs_mean = float(np.mean(np.abs(reward_true_np))) if reward_true_np.size else 0.0
         shape_abs_mean = float(np.mean(np.abs(shape_total_np))) if shape_total_np.size else 0.0
         shaping_ratio = shape_abs_mean / max(true_abs_mean, 1e-8)
         avg_touch_dist = float(np.mean(0.5 * (touch_dist_buy_np + touch_dist_sell_np))) if touch_dist_buy_np.size else 0.0
+        p50_touch_dist = float(np.percentile(0.5 * (touch_dist_buy_np + touch_dist_sell_np), 50.0)) if touch_dist_buy_np.size else 0.0
+        p90_touch_dist = float(np.percentile(0.5 * (touch_dist_buy_np + touch_dist_sell_np), 90.0)) if touch_dist_buy_np.size else 0.0
         at_touch_frac = float(np.mean((touch_dist_buy_np <= 0.10) & (touch_dist_sell_np <= 0.10))) if touch_dist_buy_np.size else 0.0
         off_touch_frac = float(np.mean((touch_dist_buy_np >= 0.50) & (touch_dist_sell_np >= 0.50))) if touch_dist_buy_np.size else 0.0
         bonus_mass = touch_bonus_buy_np + touch_bonus_sell_np
@@ -4431,9 +4504,32 @@ def train_market_ppo(
             f"sampler_availability_reset={sampler_resets > 0}"
         )
         print(
+            "[mm ppo quote geometry] "
+            f"epoch={epoch + 1} "
+            f"width_control_mean={float(np.mean(width_control_np)):.6f} "
+            f"width_control_p50={float(np.percentile(width_control_np, 50.0)):.6f} "
+            f"width_control_p90={float(np.percentile(width_control_np, 90.0)):.6f} "
+            f"width_mult_mean={float(np.mean(width_mult_np)):.6f} "
+            f"width_mult_p50={float(np.percentile(width_mult_np, 50.0)):.6f} "
+            f"width_mult_p90={float(np.percentile(width_mult_np, 90.0)):.6f} "
+            f"half_spread_bps_mean={float(np.mean(half_spread_bps_np)):.6f} "
+            f"half_spread_bps_p50={float(np.percentile(half_spread_bps_np, 50.0)):.6f} "
+            f"half_spread_bps_p90={float(np.percentile(half_spread_bps_np, 90.0)):.6f} "
+            f"center_shift_bps_mean={float(np.mean(center_shift_bps_np)):.6f} "
+            f"center_shift_bps_p50={float(np.percentile(center_shift_bps_np, 50.0)):.6f} "
+            f"center_shift_bps_p90={float(np.percentile(center_shift_bps_np, 90.0)):.6f} "
+            f"raw_spread_px_p50={float(np.percentile(raw_spread_px_np, 50.0)):.8f} "
+            f"raw_spread_px_p90={float(np.percentile(raw_spread_px_np, 90.0)):.8f} "
+            f"norm_spread_px_p50={float(np.percentile(norm_spread_px_np, 50.0)):.8f} "
+            f"norm_spread_px_p90={float(np.percentile(norm_spread_px_np, 90.0)):.8f} "
+            f"spread_floor_usage_frac={float(np.mean(used_norm_spread_floor_np)):.6f}"
+        )
+        print(
             "[mm ppo regime] "
             f"epoch={epoch + 1} "
             f"quote_touch_dist_avg={avg_touch_dist:.6f} "
+            f"quote_touch_dist_p50={p50_touch_dist:.6f} "
+            f"quote_touch_dist_p90={p90_touch_dist:.6f} "
             f"quote_at_touch_frac={at_touch_frac:.6f} "
             f"quote_off_touch_frac={off_touch_frac:.6f} "
             f"maker_fill_frac_mean={fill_mean:.6f} "
@@ -5171,10 +5267,10 @@ def run_pipeline(
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
-        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", 0.0),
-        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", 0.0),
-        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", 0.0),
-        init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", 0.0),
+        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -1.0),
+        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -1.5),
+        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -1.0),
+        init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -1.0),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
         mm_ppo_config.max_drawdown_guard = None
