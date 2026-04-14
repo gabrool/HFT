@@ -2279,6 +2279,51 @@ class MarketMakingEnv:
             self.fill_norm_spread_px_floor = float(max(spread_q05, 1e-6))
         else:
             self.fill_norm_spread_px_floor = 1e-6
+        mids_px = 0.5 * (self.best_bid.astype(np.float64) + self.best_ask.astype(np.float64))
+        finite_positive_mids = mids_px[np.isfinite(mids_px) & (mids_px > 0.0)]
+        self.quote_mid_ref_px = (
+            float(np.median(finite_positive_mids)) if finite_positive_mids.size else 1.0
+        )
+        self.quote_anchor_floor_full_spread_bps = float(
+            (self.fill_norm_spread_px_floor / max(self.quote_mid_ref_px, 1e-12)) * 1e4
+        )
+        self.quote_anchor_half_spread_floor_bps = float(
+            max(
+                self.direct_quote_config.spread_floor_bps,
+                self.direct_quote_config.obs_spread_anchor_frac * self.quote_anchor_floor_full_spread_bps,
+            )
+        )
+        if (
+            not np.isfinite(self.quote_anchor_half_spread_floor_bps)
+            or self.quote_anchor_half_spread_floor_bps <= 0.0
+        ):
+            raise ValueError(
+                "quote_anchor_half_spread_floor_bps must be finite and > 0.0; "
+                f"got {self.quote_anchor_half_spread_floor_bps}"
+            )
+        self.positive_raw_spread_frac = float(
+            np.mean(np.isfinite(raw_spreads_px) & (raw_spreads_px > 0.0))
+        )
+        spread_bps_arr = self.spread_bps.astype(np.float64)
+        self.positive_snapshot_spread_frac = float(
+            np.mean(np.isfinite(spread_bps_arr) & (spread_bps_arr > 0.0))
+        )
+        print(
+            "[mm quote floor] "
+            f"positive_raw_spread_frac={self.positive_raw_spread_frac:.6f} "
+            f"positive_snapshot_spread_frac={self.positive_snapshot_spread_frac:.6f} "
+            f"fill_norm_spread_px_floor={self.fill_norm_spread_px_floor:.10f} "
+            f"quote_mid_ref_px={self.quote_mid_ref_px:.10f} "
+            f"quote_anchor_floor_full_spread_bps={self.quote_anchor_floor_full_spread_bps:.10f} "
+            f"quote_anchor_half_spread_floor_bps={self.quote_anchor_half_spread_floor_bps:.10f}"
+        )
+        if self.positive_raw_spread_frac < 0.01 or self.positive_snapshot_spread_frac < 0.01:
+            print(
+                "[mm quote floor warning] "
+                "low-positive-spread-fraction detected; quote floor remains active "
+                f"positive_raw_spread_frac={self.positive_raw_spread_frac:.6f} "
+                f"positive_snapshot_spread_frac={self.positive_snapshot_spread_frac:.6f}"
+            )
         self.taker_signal_limit = float(self.direct_quote_config.taker_signal_limit)
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
@@ -2572,31 +2617,55 @@ class MarketMakingEnv:
         mid = self._mid_price(idx)
         snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
         observed_spread_bps = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")])
-        floor_bps = cfg.spread_floor_bps
+        observed_anchor_half_spread_bps = 0.0
         if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
-            floor_bps = max(floor_bps, cfg.obs_spread_anchor_frac * observed_spread_bps)
-        anchor_half_spread_bps = float(np.clip(floor_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+            observed_anchor_half_spread_bps = cfg.obs_spread_anchor_frac * observed_spread_bps
+        anchor_half_spread_bps = float(
+            max(
+                self.quote_anchor_half_spread_floor_bps,
+                observed_anchor_half_spread_bps,
+            )
+        )
+        anchor_half_spread_bps = float(
+            np.clip(
+                anchor_half_spread_bps,
+                self.quote_anchor_half_spread_floor_bps,
+                cfg.spread_cap_bps,
+            )
+        )
         wc = float(np.clip(width_control, 0.0, 1.0))
         width_mult = cfg.touch_halfspread_mult + wc * (cfg.wide_halfspread_mult - cfg.touch_halfspread_mult)
         half_spread_bps = anchor_half_spread_bps * width_mult
-        half_spread_bps = float(np.clip(half_spread_bps, cfg.spread_floor_bps, cfg.spread_cap_bps))
+        half_spread_bps = float(
+            np.clip(
+                half_spread_bps,
+                self.quote_anchor_half_spread_floor_bps,
+                cfg.spread_cap_bps,
+            )
+        )
         center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
-        # Scale center shift by the realized policy half-spread.
-        center_shift_bps = center_control_clipped * cfg.center_anchor_frac * half_spread_bps
+        center_shift_scale_bps = float(half_spread_bps)
+        center_shift_bps = center_control_clipped * cfg.center_anchor_frac * center_shift_scale_bps
         skew_local_limit_bps = cfg.skew_anchor_frac * anchor_half_spread_bps
         skew_limit_bps = min(cfg.skew_limit_bps, skew_local_limit_bps)
         skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
         skew_bps = skew_control_clipped * skew_limit_bps
-        bid_half_spread_bps = max(cfg.spread_floor_bps, half_spread_bps + skew_bps)
-        ask_half_spread_bps = max(cfg.spread_floor_bps, half_spread_bps - skew_bps)
+        bid_half_spread_bps = max(self.quote_anchor_half_spread_floor_bps, half_spread_bps + skew_bps)
+        ask_half_spread_bps = max(self.quote_anchor_half_spread_floor_bps, half_spread_bps - skew_bps)
         bid = mid + bps_to_px(mid, center_shift_bps - bid_half_spread_bps)
         ask = mid + bps_to_px(mid, center_shift_bps + ask_half_spread_bps)
         quote_metrics = {
+            "observed_spread_bps": float(observed_spread_bps),
+            "observed_anchor_half_spread_bps": float(observed_anchor_half_spread_bps),
+            "quote_anchor_floor_full_spread_bps": float(self.quote_anchor_floor_full_spread_bps),
+            "quote_anchor_half_spread_floor_bps": float(self.quote_anchor_half_spread_floor_bps),
             "anchor_half_spread_bps": float(anchor_half_spread_bps),
             "width_control": float(wc),
             "width_mult": float(width_mult),
             "half_spread_bps": float(half_spread_bps),
-            "center_shift_scale_bps": float(half_spread_bps),
+            "bid_half_spread_bps": float(bid_half_spread_bps),
+            "ask_half_spread_bps": float(ask_half_spread_bps),
+            "center_shift_scale_bps": float(center_shift_scale_bps),
             "center_control": float(center_control_clipped),
             "center_shift_bps": float(center_shift_bps),
             "skew_control": float(skew_control_clipped),
@@ -2950,11 +3019,17 @@ class MarketMakingEnv:
                 "center_control": 0.0,
                 "center_shift_bps": 0.0,
                 "center_shift_scale_bps": 0.0,
+                "observed_spread_bps": 0.0,
+                "observed_anchor_half_spread_bps": 0.0,
+                "quote_anchor_floor_full_spread_bps": float(self.quote_anchor_floor_full_spread_bps),
+                "quote_anchor_half_spread_floor_bps": float(self.quote_anchor_half_spread_floor_bps),
                 "width_control": 0.0,
                 "width_mult": 0.0,
                 "skew_control": 0.0,
                 "anchor_half_spread_bps": 0.0,
                 "half_spread_bps": 0.0,
+                "bid_half_spread_bps": float(self.quote_anchor_half_spread_floor_bps),
+                "ask_half_spread_bps": float(self.quote_anchor_half_spread_floor_bps),
                 "skew_local_limit_bps": 0.0,
                 "skew_limit_bps": 0.0,
                 "skew_bps": 0.0,
@@ -3140,11 +3215,17 @@ class MarketMakingEnv:
             "center_control": float(quote_metrics["center_control"]),
             "center_shift_bps": float(quote_metrics["center_shift_bps"]),
             "center_shift_scale_bps": float(quote_metrics["center_shift_scale_bps"]),
+            "observed_spread_bps": float(quote_metrics["observed_spread_bps"]),
+            "observed_anchor_half_spread_bps": float(quote_metrics["observed_anchor_half_spread_bps"]),
+            "quote_anchor_floor_full_spread_bps": float(quote_metrics["quote_anchor_floor_full_spread_bps"]),
+            "quote_anchor_half_spread_floor_bps": float(quote_metrics["quote_anchor_half_spread_floor_bps"]),
             "width_control": float(quote_metrics["width_control"]),
             "width_mult": float(quote_metrics["width_mult"]),
             "skew_control": float(quote_metrics["skew_control"]),
             "anchor_half_spread_bps": float(quote_metrics["anchor_half_spread_bps"]),
             "half_spread_bps": float(quote_metrics["half_spread_bps"]),
+            "bid_half_spread_bps": float(quote_metrics["bid_half_spread_bps"]),
+            "ask_half_spread_bps": float(quote_metrics["ask_half_spread_bps"]),
             "skew_local_limit_bps": float(quote_metrics["skew_local_limit_bps"]),
             "skew_limit_bps": float(quote_metrics["skew_limit_bps"]),
             "skew_bps": float(quote_metrics["skew_bps"]),
@@ -3433,6 +3514,12 @@ def collect_market_rollout(
     center_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_scale_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    observed_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    observed_anchor_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    quote_anchor_floor_full_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    quote_anchor_half_spread_floor_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    bid_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    ask_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
 
     action_dim = _resolve_market_action_dim()
@@ -3602,6 +3689,12 @@ def collect_market_rollout(
             center_control_buf[idx] = float(info.get("center_control", 0.0))
             center_shift_scale_bps_buf[idx] = float(info.get("center_shift_scale_bps", 0.0))
             center_shift_bps_buf[idx] = float(info.get("center_shift_bps", 0.0))
+            observed_spread_bps_buf[idx] = float(info.get("observed_spread_bps", 0.0))
+            observed_anchor_half_spread_bps_buf[idx] = float(info.get("observed_anchor_half_spread_bps", 0.0))
+            quote_anchor_floor_full_spread_bps_buf[idx] = float(info.get("quote_anchor_floor_full_spread_bps", 0.0))
+            quote_anchor_half_spread_floor_bps_buf[idx] = float(info.get("quote_anchor_half_spread_floor_bps", 0.0))
+            bid_half_spread_bps_buf[idx] = float(info.get("bid_half_spread_bps", 0.0))
+            ask_half_spread_bps_buf[idx] = float(info.get("ask_half_spread_bps", 0.0))
             terminated_buf[idx] = float(terminated)
             truncated_buf[idx] = float(truncated)
             dones_buf[idx] = float(done)
@@ -3667,6 +3760,12 @@ def collect_market_rollout(
         "center_control": center_control_buf[:cursor],
         "center_shift_scale_bps": center_shift_scale_bps_buf[:cursor],
         "center_shift_bps": center_shift_bps_buf[:cursor],
+        "observed_spread_bps": observed_spread_bps_buf[:cursor],
+        "observed_anchor_half_spread_bps": observed_anchor_half_spread_bps_buf[:cursor],
+        "quote_anchor_floor_full_spread_bps": quote_anchor_floor_full_spread_bps_buf[:cursor],
+        "quote_anchor_half_spread_floor_bps": quote_anchor_half_spread_floor_bps_buf[:cursor],
+        "bid_half_spread_bps": bid_half_spread_bps_buf[:cursor],
+        "ask_half_spread_bps": ask_half_spread_bps_buf[:cursor],
         "rollout_start_indices": np.asarray(rollout_start_indices, dtype=np.int64),
         "sampler_availability_resets": int(sampler_reset_count),
     }
@@ -4274,7 +4373,7 @@ def train_market_ppo(
         f"rollout_horizon={config.rollout_horizon} "
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
-        "policy_mean_head_init=orthogonal_gain1 "
+        "policy_mean_head_init=orthogonal_gain0.1_width_bias_init0.05 "
         "action_controls=center/width/skew/taker controls "
         "init_log_std={"
         f"center={config.init_log_std_center:.4f},"
@@ -4485,6 +4584,12 @@ def train_market_ppo(
         center_control_np = rollout["center_control"].detach().cpu().numpy().astype(np.float64)
         center_shift_scale_bps_np = rollout["center_shift_scale_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_bps_np = rollout["center_shift_bps"].detach().cpu().numpy().astype(np.float64)
+        observed_spread_bps_np = rollout["observed_spread_bps"].detach().cpu().numpy().astype(np.float64)
+        observed_anchor_half_spread_bps_np = rollout["observed_anchor_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
+        quote_anchor_floor_full_spread_bps_np = rollout["quote_anchor_floor_full_spread_bps"].detach().cpu().numpy().astype(np.float64)
+        quote_anchor_half_spread_floor_bps_np = rollout["quote_anchor_half_spread_floor_bps"].detach().cpu().numpy().astype(np.float64)
+        bid_half_spread_bps_np = rollout["bid_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
+        ask_half_spread_bps_np = rollout["ask_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
         true_abs_mean = float(np.mean(np.abs(reward_true_np))) if reward_true_np.size else 0.0
         shape_abs_mean = float(np.mean(np.abs(shape_total_np))) if shape_total_np.size else 0.0
         shaping_ratio = shape_abs_mean / max(true_abs_mean, 1e-8)
@@ -4532,6 +4637,24 @@ def train_market_ppo(
             f"center_shift_bps_mean={float(np.mean(center_shift_bps_np)):.6f} "
             f"center_shift_bps_p50={float(np.percentile(center_shift_bps_np, 50.0)):.6f} "
             f"center_shift_bps_p90={float(np.percentile(center_shift_bps_np, 90.0)):.6f} "
+            f"observed_spread_bps_mean={float(np.mean(observed_spread_bps_np)):.6f} "
+            f"observed_spread_bps_p50={float(np.percentile(observed_spread_bps_np, 50.0)):.6f} "
+            f"observed_spread_bps_p90={float(np.percentile(observed_spread_bps_np, 90.0)):.6f} "
+            f"observed_anchor_half_spread_bps_mean={float(np.mean(observed_anchor_half_spread_bps_np)):.6f} "
+            f"observed_anchor_half_spread_bps_p50={float(np.percentile(observed_anchor_half_spread_bps_np, 50.0)):.6f} "
+            f"observed_anchor_half_spread_bps_p90={float(np.percentile(observed_anchor_half_spread_bps_np, 90.0)):.6f} "
+            f"quote_anchor_floor_full_spread_bps_mean={float(np.mean(quote_anchor_floor_full_spread_bps_np)):.6f} "
+            f"quote_anchor_floor_full_spread_bps_p50={float(np.percentile(quote_anchor_floor_full_spread_bps_np, 50.0)):.6f} "
+            f"quote_anchor_floor_full_spread_bps_p90={float(np.percentile(quote_anchor_floor_full_spread_bps_np, 90.0)):.6f} "
+            f"quote_anchor_half_spread_floor_bps_mean={float(np.mean(quote_anchor_half_spread_floor_bps_np)):.6f} "
+            f"quote_anchor_half_spread_floor_bps_p50={float(np.percentile(quote_anchor_half_spread_floor_bps_np, 50.0)):.6f} "
+            f"quote_anchor_half_spread_floor_bps_p90={float(np.percentile(quote_anchor_half_spread_floor_bps_np, 90.0)):.6f} "
+            f"bid_half_spread_bps_mean={float(np.mean(bid_half_spread_bps_np)):.6f} "
+            f"bid_half_spread_bps_p50={float(np.percentile(bid_half_spread_bps_np, 50.0)):.6f} "
+            f"bid_half_spread_bps_p90={float(np.percentile(bid_half_spread_bps_np, 90.0)):.6f} "
+            f"ask_half_spread_bps_mean={float(np.mean(ask_half_spread_bps_np)):.6f} "
+            f"ask_half_spread_bps_p50={float(np.percentile(ask_half_spread_bps_np, 50.0)):.6f} "
+            f"ask_half_spread_bps_p90={float(np.percentile(ask_half_spread_bps_np, 90.0)):.6f} "
             f"raw_spread_px_p50={float(np.percentile(raw_spread_px_np, 50.0)):.8f} "
             f"raw_spread_px_p90={float(np.percentile(raw_spread_px_np, 90.0)):.8f} "
             f"norm_spread_px_p50={float(np.percentile(norm_spread_px_np, 50.0)):.8f} "
