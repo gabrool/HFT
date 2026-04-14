@@ -4358,6 +4358,8 @@ def train_market_ppo(
         ),
     ).to(device)
     _init_market_policy_mean_head(model)
+    mean_head_width_action_init = 0.05
+    mean_head_width_bias_latent = float(np.arctanh(2.0 * mean_head_width_action_init - 1.0))
     print(
         "[mm ppo compile] "
         f"enabled={compile_enabled} "
@@ -4373,14 +4375,14 @@ def train_market_ppo(
         f"rollout_horizon={config.rollout_horizon} "
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
-        "policy_mean_head_init=orthogonal_gain0.1_width_bias_init0.05 "
+        "mean_head_init=orthogonal_gain0.1 "
+        f"width_action_init={mean_head_width_action_init:.2f} "
+        f"width_bias_latent={mean_head_width_bias_latent:.6f} "
         "action_controls=center/width/skew/taker controls "
-        "init_log_std={"
-        f"center={config.init_log_std_center:.4f},"
-        f"width={config.init_log_std_width:.4f},"
-        f"skew={config.init_log_std_skew:.4f},"
-        f"taker={config.init_log_std_taker:.4f}"
-        "}"
+        f"init_log_std_center={config.init_log_std_center:.4f} "
+        f"init_log_std_width={config.init_log_std_width:.4f} "
+        f"init_log_std_skew={config.init_log_std_skew:.4f} "
+        f"init_log_std_taker={config.init_log_std_taker:.4f}"
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     train_obs_norm_state = train_env.get_obs_norm_state()
