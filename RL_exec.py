@@ -4179,7 +4179,7 @@ def save_market_ppo_checkpoint(
     payload: Dict[str, Any] = {
         "format_version": 2,
         "checkpoint_schema": MM_PPO_CHECKPOINT_SCHEMA,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _market_ppo_model_state_dict_for_ckpt(model),
         "policy_hidden_dims": tuple(int(x) for x in policy_hidden_dims),
         "value_hidden_dims": tuple(int(x) for x in value_hidden_dims),
         "obs_dim": int(obs_dim),
@@ -4198,6 +4198,19 @@ def save_market_ppo_checkpoint(
     if extra_metadata:
         payload.update(extra_metadata)
     torch.save(payload, ckpt_path)
+
+
+def _market_ppo_model_state_dict_for_ckpt(model: MarketPolicyValueNet) -> Dict[str, torch.Tensor]:
+    source_module = model._orig_mod if hasattr(model, "_orig_mod") else model
+    return dict(source_module.state_dict())
+
+
+def _normalize_market_ppo_checkpoint_state_dict(state: Dict[str, Any]) -> Dict[str, Any]:
+    keys = list(state.keys())
+    prefix = "_orig_mod."
+    if keys and all(isinstance(key, str) and key.startswith(prefix) for key in keys):
+        return {key[len(prefix):]: value for key, value in state.items()}
+    return dict(state)
 
 
 def _canonical_market_ppo_arch_field(ckpt: Dict[str, Any], field_name: str) -> Tuple[int, ...]:
@@ -4315,7 +4328,8 @@ def load_market_ppo_model(
         action_dim=action_dim,
     ).to(device)
 
-    model.load_state_dict(state, strict=True)
+    normalized_state = _normalize_market_ppo_checkpoint_state_dict(state)
+    model.load_state_dict(normalized_state, strict=True)
 
     model.eval()
     model = _maybe_compile_module(
