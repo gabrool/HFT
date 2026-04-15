@@ -4707,7 +4707,7 @@ def train_market_ppo(
             f"center_shift_scale_bps_p90={float(np.percentile(center_shift_scale_bps_np, 90.0)):.6f} "
             f"center_shift_bps_mean={float(np.mean(center_shift_bps_np)):.6f} "
             f"center_shift_bps_p50={float(np.percentile(center_shift_bps_np, 50.0)):.6f} "
-            f"center_shift_bps_p90={float(np.percentile(center_shift_bps_np, 90.0)):.6f} "
+            f"center_shift_bps_abs_p90={float(np.percentile(np.abs(center_shift_bps_np), 90.0)):.6f} "
             f"observed_spread_bps_mean={float(np.mean(observed_spread_bps_np)):.6f} "
             f"observed_spread_bps_p50={float(np.percentile(observed_spread_bps_np, 50.0)):.6f} "
             f"observed_spread_bps_p90={float(np.percentile(observed_spread_bps_np, 90.0)):.6f} "
@@ -4751,11 +4751,11 @@ def train_market_ppo(
             f"epoch={epoch + 1} "
             f"skew_bps_mean={float(np.mean(skew_bps_np)):.6f} "
             f"skew_bps_p50={float(np.percentile(skew_bps_np, 50.0)):.6f} "
-            f"skew_bps_p90={float(np.percentile(skew_bps_np, 90.0)):.6f} "
+            f"skew_bps_abs_p90={float(np.percentile(np.abs(skew_bps_np), 90.0)):.6f} "
             f"skew_limit_bps_mean={float(np.mean(skew_limit_bps_np)):.6f} "
             f"center_shift_bps_mean={float(np.mean(center_shift_bps_np)):.6f} "
             f"center_shift_bps_p50={float(np.percentile(center_shift_bps_np, 50.0)):.6f} "
-            f"center_shift_bps_p90={float(np.percentile(center_shift_bps_np, 90.0)):.6f} "
+            f"center_shift_bps_abs_p90={float(np.percentile(np.abs(center_shift_bps_np), 90.0)):.6f} "
             f"cmssl_skew_control_corr={_safe_corr(weighted_cmssl_logit_np, skew_control_np):.6f} "
             f"cmssl_skew_bps_corr={_safe_corr(weighted_cmssl_logit_np, skew_bps_np):.6f} "
             f"cmssl_sign_agreement={sign_agreement:.6f} "
@@ -5302,11 +5302,11 @@ def evaluate_market_making(
         "maker_sell_inventory_clip_fraction": float(maker_sell_clipped_steps / steps) if steps > 0 else 0.0,
         "skew_bps_mean": float(np.mean(skew_bps_arr)) if skew_bps_arr.size else 0.0,
         "skew_bps_p50": float(np.percentile(skew_bps_arr, 50.0)) if skew_bps_arr.size else 0.0,
-        "skew_bps_p90": float(np.percentile(np.abs(skew_bps_arr), 90.0)) if skew_bps_arr.size else 0.0,
+        "skew_bps_abs_p90": float(np.percentile(np.abs(skew_bps_arr), 90.0)) if skew_bps_arr.size else 0.0,
         "skew_limit_bps_mean": float(np.mean(skew_limit_bps_arr)) if skew_limit_bps_arr.size else 0.0,
         "center_shift_bps_mean": float(np.mean(center_shift_bps_arr)) if center_shift_bps_arr.size else 0.0,
         "center_shift_bps_p50": float(np.percentile(center_shift_bps_arr, 50.0)) if center_shift_bps_arr.size else 0.0,
-        "center_shift_bps_p90": float(np.percentile(np.abs(center_shift_bps_arr), 90.0)) if center_shift_bps_arr.size else 0.0,
+        "center_shift_bps_abs_p90": float(np.percentile(np.abs(center_shift_bps_arr), 90.0)) if center_shift_bps_arr.size else 0.0,
         "cmssl_skew_control_corr": _safe_corr(weighted_cmssl_logit_arr, skew_control_arr),
         "cmssl_skew_bps_corr": _safe_corr(weighted_cmssl_logit_arr, skew_bps_arr),
         "cmssl_skew_sign_agreement_rate": float(np.mean(np.sign(skew_bps_arr) == np.sign(weighted_cmssl_logit_arr))) if skew_bps_arr.size else 0.0,
@@ -5421,6 +5421,9 @@ def run_pipeline(
             "BYBIT_MM_CENTER_ANCHOR_FRAC",
             "BYBIT_MM_SKEW_ANCHOR_FRAC",
             "BYBIT_MM_FILL_TOUCH_EVENT_BONUS",
+            "BYBIT_MM_WIDTH_EXPAND_MULT",
+            "BYBIT_MM_WIDTH_TIGHTEN_FRAC",
+            "BYBIT_MM_FILL_EPS_PX",
         )
     )
     meta = load_global_meta(Path(out_root))
