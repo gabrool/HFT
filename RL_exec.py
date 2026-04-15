@@ -55,8 +55,7 @@ DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
 DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS = 50.0
-DEFAULT_MM_DIRECT_CENTER_ANCHOR_FRAC = 0.15
-DEFAULT_MM_DIRECT_SKEW_ANCHOR_FRAC = 1.0
+DEFAULT_MM_DIRECT_CENTER_LIMIT_BPS = 12.0
 # PPO training epochs environment variable (used across entrypoint/config helpers).
 PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
 # Scaling factors for market-making observation extra-state features.
@@ -298,6 +297,15 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
     if not raw:
         return list(default)
     return [int(item) for item in raw.split(",") if item.strip()]
+
+
+def _fail_on_removed_env_vars(removed: Sequence[str]) -> None:
+    present = [name for name in removed if os.environ.get(name, "").strip()]
+    if present:
+        raise ValueError(
+            "Removed env vars are set and no longer supported: "
+            f"{', '.join(sorted(present))}"
+        )
 
 
 def _resolve_cmssl_batch_size(default: int = 2048) -> int:
@@ -664,14 +672,13 @@ def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
 
 @dataclass(frozen=True)
 class DirectQuoteConfig:
-    center_anchor_frac: float
+    center_limit_bps: float
     spread_floor_bps: float
     spread_cap_bps: float
     obs_spread_anchor_frac: float
     touch_halfspread_mult: float
     wide_halfspread_mult: float
     skew_limit_bps: float
-    skew_anchor_frac: float
     taker_signal_limit: float
 
 
@@ -713,22 +720,22 @@ class WidthVolatilityScaler:
 @dataclass(frozen=True)
 class ContinuousMakerFillConfig:
     activity_min: float = 0.0
-    activity_max: float = 0.45
-    tau_touch: float = 0.20
-    tau_cross: float = 0.20
-    touch_event_bonus: float = 0.45
-    touch_event_distance_frac: float = 0.10
+    activity_max: float = 0.18
+    tau_touch: float = 0.10
+    tau_cross: float = 0.08
+    touch_event_boost: float = 0.20
+    touch_event_distance_frac: float = 0.05
     price_epsilon_px: float = 1e-9
 
 
 def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
     cfg = ContinuousMakerFillConfig(
         activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.0),
-        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.45),
-        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.20),
-        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.20),
-        touch_event_bonus=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_BONUS", 0.45),
-        touch_event_distance_frac=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC", 0.10),
+        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.18),
+        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.10),
+        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.08),
+        touch_event_boost=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_BOOST", 0.20),
+        touch_event_distance_frac=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC", 0.05),
         price_epsilon_px=_env_float("BYBIT_MM_FILL_PRICE_EPSILON_PX", 1e-9),
     )
     if not np.isfinite(cfg.activity_min) or not np.isfinite(cfg.activity_max):
@@ -739,8 +746,8 @@ def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
         raise ValueError("BYBIT_MM_FILL_TAU_TOUCH must be finite and > 0.")
     if not np.isfinite(cfg.tau_cross) or cfg.tau_cross <= 0.0:
         raise ValueError("BYBIT_MM_FILL_TAU_CROSS must be finite and > 0.")
-    if not np.isfinite(cfg.touch_event_bonus) or cfg.touch_event_bonus < 0.0:
-        raise ValueError("BYBIT_MM_FILL_TOUCH_EVENT_BONUS must be finite and >= 0.")
+    if not np.isfinite(cfg.touch_event_boost) or cfg.touch_event_boost < 0.0 or cfg.touch_event_boost > 1.0:
+        raise ValueError("BYBIT_MM_FILL_TOUCH_EVENT_BOOST must be finite and in [0, 1].")
     if (
         not np.isfinite(cfg.touch_event_distance_frac)
         or cfg.touch_event_distance_frac < 0.0
@@ -844,22 +851,21 @@ def load_reward_shaping_config() -> RewardShapingConfig:
 def load_direct_quote_config() -> DirectQuoteConfig:
     return _validate_direct_quote_config(
         DirectQuoteConfig(
-            center_anchor_frac=_env_float("BYBIT_MM_CENTER_ANCHOR_FRAC", DEFAULT_MM_DIRECT_CENTER_ANCHOR_FRAC),
+            center_limit_bps=_env_float("BYBIT_MM_CENTER_LIMIT_BPS", DEFAULT_MM_DIRECT_CENTER_LIMIT_BPS),
             spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
             touch_halfspread_mult=_env_float("BYBIT_MM_TOUCH_HALFSPREAD_MULT", 1.0),
             wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 2.0),
             skew_limit_bps=_env_float("BYBIT_MM_SKEW_LIMIT_BPS", DEFAULT_MM_DIRECT_SKEW_LIMIT_BPS),
-            skew_anchor_frac=_env_float("BYBIT_MM_SKEW_ANCHOR_FRAC", DEFAULT_MM_DIRECT_SKEW_ANCHOR_FRAC),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
         )
     )
 
 
 def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
-    if not np.isfinite(cfg.center_anchor_frac) or cfg.center_anchor_frac < 0.0:
-        raise ValueError("center_anchor_frac must be finite and >= 0.0")
+    if not np.isfinite(cfg.center_limit_bps) or cfg.center_limit_bps < 0.0:
+        raise ValueError("center_limit_bps must be finite and >= 0.0")
     if not np.isfinite(cfg.spread_floor_bps) or cfg.spread_floor_bps < 0.0:
         raise ValueError("spread_floor_bps must be finite and >= 0.0")
     if not np.isfinite(cfg.spread_cap_bps) or cfg.spread_cap_bps < cfg.spread_floor_bps:
@@ -876,8 +882,6 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         raise ValueError("wide_halfspread_mult must be finite and >= touch_halfspread_mult.")
     if not np.isfinite(cfg.skew_limit_bps) or cfg.skew_limit_bps < 0.0:
         raise ValueError("skew_limit_bps must be finite and >= 0.0")
-    if not np.isfinite(cfg.skew_anchor_frac) or cfg.skew_anchor_frac < 0.0:
-        raise ValueError("skew_anchor_frac must be finite and >= 0.0")
     if not np.isfinite(cfg.taker_signal_limit) or cfg.taker_signal_limit <= 0.0:
         raise ValueError("taker_signal_limit must be finite and > 0.0")
     return cfg
@@ -955,7 +959,7 @@ def build_vol_bucket_report(
             "maker_buy_fills": maker_buy_fills,
             "maker_sell_fills": maker_sell_fills,
             "maker_opportunities": maker_opportunities,
-            "maker_fill_rate": float(maker_fill_count / maker_opportunities) if maker_opportunities > 0 else 0.0,
+            "maker_side_hit_rate": float(maker_fill_count / maker_opportunities) if maker_opportunities > 0 else 0.0,
             "turnover_notional": float(np.sum(turnover_arr[mask])) if step_count > 0 else 0.0,
             "delta_equity": float(np.sum(delta_arr[mask])) if step_count > 0 else 0.0,
             "reward": float(np.sum(reward_arr[mask])) if step_count > 0 else 0.0,
@@ -2363,15 +2367,17 @@ class MarketMakingEnv:
         self.last_activity_score = 0.0
         self.last_touch_dist_buy = 0.0
         self.last_touch_dist_sell = 0.0
-        self.last_touch_bonus_buy = 0.0
-        self.last_touch_bonus_sell = 0.0
-        self.last_fill_baseline_buy = 0.0
-        self.last_fill_baseline_sell = 0.0
+        self.last_touch_event_boost_buy = 0.0
+        self.last_touch_event_boost_sell = 0.0
+        self.last_fill_interaction_buy = 0.0
+        self.last_fill_interaction_sell = 0.0
         self.last_raw_spread_px = 0.0
         self.last_norm_spread_px = float(self.fill_norm_spread_px_floor)
         self.last_used_norm_spread_floor = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
+        self.last_passive_clamped = 0.0
+        self.last_weighted_cmssl_logit = 0.0
         self._obs_count = 0
         self._obs_mean: Optional[np.ndarray] = None
         self._obs_m2: Optional[np.ndarray] = None
@@ -2411,15 +2417,17 @@ class MarketMakingEnv:
         self.last_activity_score = 0.0
         self.last_touch_dist_buy = 0.0
         self.last_touch_dist_sell = 0.0
-        self.last_touch_bonus_buy = 0.0
-        self.last_touch_bonus_sell = 0.0
-        self.last_fill_baseline_buy = 0.0
-        self.last_fill_baseline_sell = 0.0
+        self.last_touch_event_boost_buy = 0.0
+        self.last_touch_event_boost_sell = 0.0
+        self.last_fill_interaction_buy = 0.0
+        self.last_fill_interaction_sell = 0.0
         self.last_raw_spread_px = 0.0
         self.last_norm_spread_px = float(self.fill_norm_spread_px_floor)
         self.last_used_norm_spread_floor = 0.0
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
+        self.last_passive_clamped = 0.0
+        self.last_weighted_cmssl_logit = 0.0
         self._obs_ping_pong_idx = 0
         mid = self._mid_price(self.idx)
         self.prev_equity = self.cash + self.inventory * mid
@@ -2644,10 +2652,9 @@ class MarketMakingEnv:
             )
         )
         center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
-        center_shift_scale_bps = float(half_spread_bps)
-        center_shift_bps = center_control_clipped * cfg.center_anchor_frac * center_shift_scale_bps
-        skew_local_limit_bps = cfg.skew_anchor_frac * anchor_half_spread_bps
-        skew_limit_bps = min(cfg.skew_limit_bps, skew_local_limit_bps)
+        center_shift_scale_bps = float(cfg.center_limit_bps)
+        center_shift_bps = center_control_clipped * center_shift_scale_bps
+        skew_limit_bps = float(cfg.skew_limit_bps)
         skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
         skew_bps = skew_control_clipped * skew_limit_bps
         bid_half_spread_bps = max(self.quote_anchor_half_spread_floor_bps, half_spread_bps + skew_bps)
@@ -2669,13 +2676,14 @@ class MarketMakingEnv:
             "center_control": float(center_control_clipped),
             "center_shift_bps": float(center_shift_bps),
             "skew_control": float(skew_control_clipped),
-            "skew_local_limit_bps": float(skew_local_limit_bps),
             "skew_limit_bps": float(skew_limit_bps),
             "skew_bps": float(skew_bps),
         }
         return bid, ask, quote_metrics
 
-    def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
+    def _enforce_passive(self, bid: float, ask: float, idx: int) -> Tuple[float, float, bool]:
+        orig_bid = float(bid)
+        orig_ask = float(ask)
         best_bid = float(self.best_bid[idx])
         best_ask = float(self.best_ask[idx])
         mid = 0.5 * (best_bid + best_ask)
@@ -2687,7 +2695,8 @@ class MarketMakingEnv:
         if np.isfinite(bid) and np.isfinite(ask) and bid >= ask:
             bid = best_bid
             ask = best_ask
-        return bid, ask
+        clamped = bool((abs(bid - orig_bid) > 1e-12) or (abs(ask - orig_ask) > 1e-12))
+        return bid, ask, clamped
 
     def _inventory_cap_qty(self, mid: float) -> float:
         # Threshold contract: hard_max_inventory_notional is only for execution-time
@@ -2727,6 +2736,16 @@ class MarketMakingEnv:
             vol_score = float(np.clip((sigma_recent - self.width_vol_scaler.p50) / denom, 0.0, 1.0))
         cfg = self.continuous_maker_fill_config
         return float(cfg.activity_min + (cfg.activity_max - cfg.activity_min) * vol_score)
+
+    def _weighted_cmssl_logit(self, decision_idx: int) -> float:
+        dir_slice = self._feature_layout["dir_logits"]
+        dir_logits = np.asarray(self.features[decision_idx, dir_slice], dtype=np.float64)
+        weights = np.asarray(self.reward_shaping_config.horizon_logit_weights, dtype=np.float64)
+        if dir_logits.shape[0] != weights.shape[0]:
+            raise RuntimeError(
+                f"horizon_logit_weights shape mismatch: logits={dir_logits.shape[0]} weights={weights.shape[0]}"
+            )
+        return float(np.dot(dir_logits, weights))
 
     def _compute_maker_fill_hard(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         touch_epsilon = self.continuous_maker_fill_config.price_epsilon_px
@@ -2789,10 +2808,12 @@ class MarketMakingEnv:
         touch_dist_buy = 0.0
         touch_dist_sell = 0.0
 
-        touch_bonus_buy = 0.0
-        touch_bonus_sell = 0.0
-        baseline_buy = 0.0
-        baseline_sell = 0.0
+        touch_boost_buy = 0.0
+        touch_boost_sell = 0.0
+        resting_quality_buy = 0.0
+        resting_quality_sell = 0.0
+        cross_confirmation_buy = 0.0
+        cross_confirmation_sell = 0.0
         touch_dist_threshold = max(0.0, cfg.touch_event_distance_frac)
         touch_epsilon = max(self.fill_tolerance, cfg.price_epsilon_px)
         best_bid_prev = float(self.best_bid[idx - 1]) if idx > 0 else best_bid_t
@@ -2800,36 +2821,36 @@ class MarketMakingEnv:
         if bid_enabled:
             touch_dist_buy = float(max(0.0, best_bid_t - bid) / norm_spread_px)
             cross_gap_buy = float((best_ask_next - bid) / norm_spread_px)
-            p_touch_buy = float(activity * np.exp(-((touch_dist_buy / cfg.tau_touch) ** 2)))
-            p_cross_buy = float(_sigmoid(-cross_gap_buy / cfg.tau_cross))
-            baseline_buy = float(np.clip(p_touch_buy + p_cross_buy, 0.0, 1.0))
+            resting_quality_buy = float(np.exp(-((touch_dist_buy / cfg.tau_touch) ** 2)))
+            cross_confirmation_buy = float(_sigmoid(-cross_gap_buy / cfg.tau_cross))
             at_touch_buy = (
                 touch_dist_buy <= touch_dist_threshold
                 and abs(bid - best_bid_prev) <= touch_epsilon
                 and best_bid_next < best_bid_prev - touch_epsilon
             )
-            touch_bonus_buy = cfg.touch_event_bonus if at_touch_buy else 0.0
-            buy_fill_frac = float(np.clip(baseline_buy + touch_bonus_buy, 0.0, 1.0))
+            touch_boost_buy = cfg.touch_event_boost if at_touch_buy else 0.0
+            buy_fill_base = activity * resting_quality_buy * cross_confirmation_buy
+            buy_fill_frac = float(np.clip(buy_fill_base * (1.0 + touch_boost_buy), 0.0, 1.0))
         if ask_enabled:
             touch_dist_sell = float(max(0.0, ask - best_ask_t) / norm_spread_px)
             cross_gap_sell = float((ask - best_bid_next) / norm_spread_px)
-            p_touch_sell = float(activity * np.exp(-((touch_dist_sell / cfg.tau_touch) ** 2)))
-            p_cross_sell = float(_sigmoid(-cross_gap_sell / cfg.tau_cross))
-            baseline_sell = float(np.clip(p_touch_sell + p_cross_sell, 0.0, 1.0))
+            resting_quality_sell = float(np.exp(-((touch_dist_sell / cfg.tau_touch) ** 2)))
+            cross_confirmation_sell = float(_sigmoid(-cross_gap_sell / cfg.tau_cross))
             at_touch_sell = (
                 touch_dist_sell <= touch_dist_threshold
                 and abs(ask - best_ask_prev) <= touch_epsilon
                 and best_ask_next > best_ask_prev + touch_epsilon
             )
-            touch_bonus_sell = cfg.touch_event_bonus if at_touch_sell else 0.0
-            sell_fill_frac = float(np.clip(baseline_sell + touch_bonus_sell, 0.0, 1.0))
+            touch_boost_sell = cfg.touch_event_boost if at_touch_sell else 0.0
+            sell_fill_base = activity * resting_quality_sell * cross_confirmation_sell
+            sell_fill_frac = float(np.clip(sell_fill_base * (1.0 + touch_boost_sell), 0.0, 1.0))
 
         self.last_touch_dist_buy = float(touch_dist_buy)
         self.last_touch_dist_sell = float(touch_dist_sell)
-        self.last_touch_bonus_buy = float(touch_bonus_buy)
-        self.last_touch_bonus_sell = float(touch_bonus_sell)
-        self.last_fill_baseline_buy = float(baseline_buy)
-        self.last_fill_baseline_sell = float(baseline_sell)
+        self.last_touch_event_boost_buy = float(touch_boost_buy)
+        self.last_touch_event_boost_sell = float(touch_boost_sell)
+        self.last_fill_interaction_buy = float(resting_quality_buy * cross_confirmation_buy)
+        self.last_fill_interaction_sell = float(resting_quality_sell * cross_confirmation_sell)
         self.last_raw_spread_px = float(raw_spread_px)
         self.last_norm_spread_px = float(norm_spread_px)
         self.last_used_norm_spread_floor = float(raw_spread_px < self.fill_norm_spread_px_floor)
@@ -3030,9 +3051,10 @@ class MarketMakingEnv:
                 "half_spread_bps": 0.0,
                 "bid_half_spread_bps": float(self.quote_anchor_half_spread_floor_bps),
                 "ask_half_spread_bps": float(self.quote_anchor_half_spread_floor_bps),
-                "skew_local_limit_bps": 0.0,
                 "skew_limit_bps": 0.0,
                 "skew_bps": 0.0,
+                "passive_clamped": float(self.last_passive_clamped),
+                "weighted_cmssl_logit": float(self.last_weighted_cmssl_logit),
                 "maker_buy": 0.0,
                 "maker_sell": 0.0,
                 "taker_buy": 0.0,
@@ -3061,10 +3083,10 @@ class MarketMakingEnv:
                 "activity_score": float(self.last_activity_score),
                 "touch_dist_buy": float(self.last_touch_dist_buy),
                 "touch_dist_sell": float(self.last_touch_dist_sell),
-                "touch_bonus_buy": float(self.last_touch_bonus_buy),
-                "touch_bonus_sell": float(self.last_touch_bonus_sell),
-                "fill_baseline_buy": float(self.last_fill_baseline_buy),
-                "fill_baseline_sell": float(self.last_fill_baseline_sell),
+                "touch_event_boost_buy": float(self.last_touch_event_boost_buy),
+                "touch_event_boost_sell": float(self.last_touch_event_boost_sell),
+                "fill_interaction_buy": float(self.last_fill_interaction_buy),
+                "fill_interaction_sell": float(self.last_fill_interaction_sell),
                 "raw_spread_px": float(self.last_raw_spread_px),
                 "norm_spread_px": float(self.last_norm_spread_px),
                 "used_norm_spread_floor": float(self.last_used_norm_spread_floor),
@@ -3073,7 +3095,9 @@ class MarketMakingEnv:
             }
             return self._build_observation(self.idx), 0.0, True, info
         bid, ask, quote_metrics = self._policy_quotes(self.idx, center_control, width_control, skew_control)
-        bid, ask = self._enforce_passive(bid, ask, self.idx)
+        bid, ask, passive_clamped = self._enforce_passive(bid, ask, self.idx)
+        self.last_passive_clamped = float(passive_clamped)
+        self.last_weighted_cmssl_logit = self._weighted_cmssl_logit(self.idx)
         inv_prev = self.inventory
         mid_for_cap = self._mid_price(next_idx)
         pre_hard_cap_qty = self._inventory_cap_qty(mid_for_cap) if emit_info else 0.0
@@ -3226,9 +3250,10 @@ class MarketMakingEnv:
             "half_spread_bps": float(quote_metrics["half_spread_bps"]),
             "bid_half_spread_bps": float(quote_metrics["bid_half_spread_bps"]),
             "ask_half_spread_bps": float(quote_metrics["ask_half_spread_bps"]),
-            "skew_local_limit_bps": float(quote_metrics["skew_local_limit_bps"]),
             "skew_limit_bps": float(quote_metrics["skew_limit_bps"]),
             "skew_bps": float(quote_metrics["skew_bps"]),
+            "passive_clamped": float(self.last_passive_clamped),
+            "weighted_cmssl_logit": float(self.last_weighted_cmssl_logit),
             "inv_change": float(inv_change),
             "maker_buy": float(maker_buy),
             "maker_sell": float(maker_sell),
@@ -3257,10 +3282,10 @@ class MarketMakingEnv:
             "activity_score": float(self.last_activity_score),
             "touch_dist_buy": float(self.last_touch_dist_buy),
             "touch_dist_sell": float(self.last_touch_dist_sell),
-            "touch_bonus_buy": float(self.last_touch_bonus_buy),
-            "touch_bonus_sell": float(self.last_touch_bonus_sell),
-            "fill_baseline_buy": float(self.last_fill_baseline_buy),
-            "fill_baseline_sell": float(self.last_fill_baseline_sell),
+            "touch_event_boost_buy": float(self.last_touch_event_boost_buy),
+            "touch_event_boost_sell": float(self.last_touch_event_boost_sell),
+            "fill_interaction_buy": float(self.last_fill_interaction_buy),
+            "fill_interaction_sell": float(self.last_fill_interaction_sell),
             "raw_spread_px": float(self.last_raw_spread_px),
             "norm_spread_px": float(self.last_norm_spread_px),
             "used_norm_spread_floor": float(self.last_used_norm_spread_floor),
@@ -3390,7 +3415,7 @@ def _init_market_policy_mean_head(model: MarketPolicyValueNet) -> None:
         nn.init.orthogonal_(final_policy_linear.weight, gain=0.1)
         if final_policy_linear.bias is not None:
             final_policy_linear.bias.zero_()
-            width_action_init = 0.05
+            width_action_init = 0.18
             width_latent_bias = np.arctanh(2.0 * width_action_init - 1.0)
             final_policy_linear.bias[0] = 0.0
             final_policy_linear.bias[1] = float(width_latent_bias)
@@ -3415,9 +3440,9 @@ class PPOConfig:
     rollout_horizon: int = 8192
     rollouts_per_epoch: int = 16
     randomize_rollout_start: bool = True
-    init_log_std_center: float = -1.0
-    init_log_std_width: float = -1.5
-    init_log_std_skew: float = -1.0
+    init_log_std_center: float = -0.7
+    init_log_std_width: float = -0.9
+    init_log_std_skew: float = -0.7
     init_log_std_taker: float = -1.0
 
 
@@ -3501,10 +3526,10 @@ def collect_market_rollout(
     maker_buy_fill_frac_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     maker_sell_fill_frac_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     activity_score_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    touch_bonus_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    touch_bonus_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    fill_baseline_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    fill_baseline_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    touch_event_boost_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    touch_event_boost_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    fill_interaction_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    fill_interaction_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     raw_spread_px_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     norm_spread_px_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     used_norm_spread_floor_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
@@ -3514,6 +3539,11 @@ def collect_market_rollout(
     center_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_scale_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    skew_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    skew_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    skew_limit_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    passive_clamped_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    weighted_cmssl_logit_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     observed_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     observed_anchor_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     quote_anchor_floor_full_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
@@ -3676,10 +3706,10 @@ def collect_market_rollout(
             maker_buy_fill_frac_buf[idx] = float(info.get("maker_buy_fill_frac", 0.0))
             maker_sell_fill_frac_buf[idx] = float(info.get("maker_sell_fill_frac", 0.0))
             activity_score_buf[idx] = float(info.get("activity_score", 0.0))
-            touch_bonus_buy_buf[idx] = float(info.get("touch_bonus_buy", 0.0))
-            touch_bonus_sell_buf[idx] = float(info.get("touch_bonus_sell", 0.0))
-            fill_baseline_buy_buf[idx] = float(info.get("fill_baseline_buy", 0.0))
-            fill_baseline_sell_buf[idx] = float(info.get("fill_baseline_sell", 0.0))
+            touch_event_boost_buy_buf[idx] = float(info.get("touch_event_boost_buy", 0.0))
+            touch_event_boost_sell_buf[idx] = float(info.get("touch_event_boost_sell", 0.0))
+            fill_interaction_buy_buf[idx] = float(info.get("fill_interaction_buy", 0.0))
+            fill_interaction_sell_buf[idx] = float(info.get("fill_interaction_sell", 0.0))
             raw_spread_px_buf[idx] = float(info.get("raw_spread_px", 0.0))
             norm_spread_px_buf[idx] = float(info.get("norm_spread_px", 0.0))
             used_norm_spread_floor_buf[idx] = float(info.get("used_norm_spread_floor", 0.0))
@@ -3689,6 +3719,11 @@ def collect_market_rollout(
             center_control_buf[idx] = float(info.get("center_control", 0.0))
             center_shift_scale_bps_buf[idx] = float(info.get("center_shift_scale_bps", 0.0))
             center_shift_bps_buf[idx] = float(info.get("center_shift_bps", 0.0))
+            skew_control_buf[idx] = float(info.get("skew_control", 0.0))
+            skew_bps_buf[idx] = float(info.get("skew_bps", 0.0))
+            skew_limit_bps_buf[idx] = float(info.get("skew_limit_bps", 0.0))
+            passive_clamped_buf[idx] = float(info.get("passive_clamped", 0.0))
+            weighted_cmssl_logit_buf[idx] = float(info.get("weighted_cmssl_logit", 0.0))
             observed_spread_bps_buf[idx] = float(info.get("observed_spread_bps", 0.0))
             observed_anchor_half_spread_bps_buf[idx] = float(info.get("observed_anchor_half_spread_bps", 0.0))
             quote_anchor_floor_full_spread_bps_buf[idx] = float(info.get("quote_anchor_floor_full_spread_bps", 0.0))
@@ -3747,10 +3782,10 @@ def collect_market_rollout(
         "maker_buy_fill_frac": maker_buy_fill_frac_buf[:cursor],
         "maker_sell_fill_frac": maker_sell_fill_frac_buf[:cursor],
         "activity_score": activity_score_buf[:cursor],
-        "touch_bonus_buy": touch_bonus_buy_buf[:cursor],
-        "touch_bonus_sell": touch_bonus_sell_buf[:cursor],
-        "fill_baseline_buy": fill_baseline_buy_buf[:cursor],
-        "fill_baseline_sell": fill_baseline_sell_buf[:cursor],
+        "touch_event_boost_buy": touch_event_boost_buy_buf[:cursor],
+        "touch_event_boost_sell": touch_event_boost_sell_buf[:cursor],
+        "fill_interaction_buy": fill_interaction_buy_buf[:cursor],
+        "fill_interaction_sell": fill_interaction_sell_buf[:cursor],
         "raw_spread_px": raw_spread_px_buf[:cursor],
         "norm_spread_px": norm_spread_px_buf[:cursor],
         "used_norm_spread_floor": used_norm_spread_floor_buf[:cursor],
@@ -3760,6 +3795,11 @@ def collect_market_rollout(
         "center_control": center_control_buf[:cursor],
         "center_shift_scale_bps": center_shift_scale_bps_buf[:cursor],
         "center_shift_bps": center_shift_bps_buf[:cursor],
+        "skew_control": skew_control_buf[:cursor],
+        "skew_bps": skew_bps_buf[:cursor],
+        "skew_limit_bps": skew_limit_bps_buf[:cursor],
+        "passive_clamped": passive_clamped_buf[:cursor],
+        "weighted_cmssl_logit": weighted_cmssl_logit_buf[:cursor],
         "observed_spread_bps": observed_spread_bps_buf[:cursor],
         "observed_anchor_half_spread_bps": observed_anchor_half_spread_bps_buf[:cursor],
         "quote_anchor_floor_full_spread_bps": quote_anchor_floor_full_spread_bps_buf[:cursor],
@@ -4031,14 +4071,14 @@ def _checkpoint_selection_metrics(report: Dict[str, Any]) -> Dict[str, float]:
     denom = max(initial_equity, 1e-12)
     net_pnl = final_equity - initial_equity
     net_pnl_pct = net_pnl / denom
-    gross_pnl = net_pnl + net_fee_cost
-    gross_pnl_pct = gross_pnl / denom
+    pre_fee_pnl = net_pnl - net_fee_cost
+    pre_fee_pnl_pct = pre_fee_pnl / denom
 
     return {
         "net_pnl": net_pnl,
         "net_pnl_pct": net_pnl_pct,
-        "gross_pnl": gross_pnl,
-        "gross_pnl_pct": gross_pnl_pct,
+        "pre_fee_pnl": pre_fee_pnl,
+        "pre_fee_pnl_pct": pre_fee_pnl_pct,
         "max_drawdown": float(report.get("max_drawdown", float("inf"))),
         "sharpe_1h": _safe_metric_for_tiebreak(report.get("sharpe_1h", float("-inf"))),
         "sortino_1h": _safe_metric_for_tiebreak(report.get("sortino_1h", float("-inf"))),
@@ -4372,7 +4412,7 @@ def train_market_ppo(
         ),
     ).to(device)
     _init_market_policy_mean_head(model)
-    mean_head_width_action_init = 0.05
+    mean_head_width_action_init = 0.18
     mean_head_width_bias_latent = float(np.arctanh(2.0 * mean_head_width_action_init - 1.0))
     print(
         "[mm ppo compile] "
@@ -4458,7 +4498,7 @@ def train_market_ppo(
         f"action_dim={action_dim} "
         f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
         f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
-        f"env_center_anchor_frac={train_env.direct_quote_config.center_anchor_frac:.4f} "
+        f"env_center_limit_bps={train_env.direct_quote_config.center_limit_bps:.4f} "
         f"taker_signal_limit={train_env.taker_signal_limit:.4f} "
         f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
         f"mean_probe_action_labeled={probe_action_labels} "
@@ -4587,10 +4627,10 @@ def train_market_ppo(
         maker_buy_fill_frac_np = rollout["maker_buy_fill_frac"].detach().cpu().numpy().astype(np.float64)
         maker_sell_fill_frac_np = rollout["maker_sell_fill_frac"].detach().cpu().numpy().astype(np.float64)
         activity_score_np = rollout["activity_score"].detach().cpu().numpy().astype(np.float64)
-        touch_bonus_buy_np = rollout["touch_bonus_buy"].detach().cpu().numpy().astype(np.float64)
-        touch_bonus_sell_np = rollout["touch_bonus_sell"].detach().cpu().numpy().astype(np.float64)
-        fill_baseline_buy_np = rollout["fill_baseline_buy"].detach().cpu().numpy().astype(np.float64)
-        fill_baseline_sell_np = rollout["fill_baseline_sell"].detach().cpu().numpy().astype(np.float64)
+        touch_event_boost_buy_np = rollout["touch_event_boost_buy"].detach().cpu().numpy().astype(np.float64)
+        touch_event_boost_sell_np = rollout["touch_event_boost_sell"].detach().cpu().numpy().astype(np.float64)
+        fill_interaction_buy_np = rollout["fill_interaction_buy"].detach().cpu().numpy().astype(np.float64)
+        fill_interaction_sell_np = rollout["fill_interaction_sell"].detach().cpu().numpy().astype(np.float64)
         raw_spread_px_np = rollout["raw_spread_px"].detach().cpu().numpy().astype(np.float64)
         norm_spread_px_np = rollout["norm_spread_px"].detach().cpu().numpy().astype(np.float64)
         used_norm_spread_floor_np = rollout["used_norm_spread_floor"].detach().cpu().numpy().astype(np.float64)
@@ -4600,6 +4640,11 @@ def train_market_ppo(
         center_control_np = rollout["center_control"].detach().cpu().numpy().astype(np.float64)
         center_shift_scale_bps_np = rollout["center_shift_scale_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_bps_np = rollout["center_shift_bps"].detach().cpu().numpy().astype(np.float64)
+        skew_control_np = rollout["skew_control"].detach().cpu().numpy().astype(np.float64)
+        skew_bps_np = rollout["skew_bps"].detach().cpu().numpy().astype(np.float64)
+        skew_limit_bps_np = rollout["skew_limit_bps"].detach().cpu().numpy().astype(np.float64)
+        passive_clamped_np = rollout["passive_clamped"].detach().cpu().numpy().astype(np.float64)
+        weighted_cmssl_logit_np = rollout["weighted_cmssl_logit"].detach().cpu().numpy().astype(np.float64)
         observed_spread_bps_np = rollout["observed_spread_bps"].detach().cpu().numpy().astype(np.float64)
         observed_anchor_half_spread_bps_np = rollout["observed_anchor_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
         quote_anchor_floor_full_spread_bps_np = rollout["quote_anchor_floor_full_spread_bps"].detach().cpu().numpy().astype(np.float64)
@@ -4614,10 +4659,20 @@ def train_market_ppo(
         p90_touch_dist = float(np.percentile(0.5 * (touch_dist_buy_np + touch_dist_sell_np), 90.0)) if touch_dist_buy_np.size else 0.0
         at_touch_frac = float(np.mean((touch_dist_buy_np <= 0.10) & (touch_dist_sell_np <= 0.10))) if touch_dist_buy_np.size else 0.0
         off_touch_frac = float(np.mean((touch_dist_buy_np >= 0.50) & (touch_dist_sell_np >= 0.50))) if touch_dist_buy_np.size else 0.0
-        bonus_mass = touch_bonus_buy_np + touch_bonus_sell_np
-        smooth_mass = fill_baseline_buy_np + fill_baseline_sell_np
+        bonus_mass = touch_event_boost_buy_np + touch_event_boost_sell_np
+        smooth_mass = fill_interaction_buy_np + fill_interaction_sell_np
         bonus_frac = float(np.mean(bonus_mass / np.maximum(bonus_mass + smooth_mass, 1e-8))) if bonus_mass.size else 0.0
         fill_mean = float(np.mean(0.5 * (maker_buy_fill_frac_np + maker_sell_fill_frac_np))) if maker_buy_fill_frac_np.size else 0.0
+        def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+            if a.size == 0 or b.size == 0 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
+                return 0.0
+            return float(np.corrcoef(a, b)[0, 1])
+
+        logit_abs = np.abs(weighted_cmssl_logit_np)
+        logit_cut = float(np.median(logit_abs)) if logit_abs.size else 0.0
+        high_logit_mask = logit_abs >= logit_cut
+        low_logit_mask = ~high_logit_mask
+        sign_agreement = float(np.mean(np.sign(skew_bps_np) == np.sign(weighted_cmssl_logit_np))) if skew_bps_np.size else 0.0
         print(
             "[mm ppo sampler/shaping] "
             f"epoch={epoch + 1} "
@@ -4687,9 +4742,26 @@ def train_market_ppo(
             f"quote_off_touch_frac={off_touch_frac:.6f} "
             f"maker_fill_frac_mean={fill_mean:.6f} "
             f"activity_score_mean={float(np.mean(activity_score_np)):.6f} "
-            f"touch_bonus_mass_frac={bonus_frac:.6f} "
+            f"touch_event_boost_mass_frac={bonus_frac:.6f} "
             f"reward_true_std={float(np.std(reward_true_np)):.6f} "
             f"reward_train_std={float(np.std((reward_true_np + shape_total_np))):.6f}"
+        )
+        print(
+            "[mm ppo signal usage] "
+            f"epoch={epoch + 1} "
+            f"skew_bps_mean={float(np.mean(skew_bps_np)):.6f} "
+            f"skew_bps_p50={float(np.percentile(skew_bps_np, 50.0)):.6f} "
+            f"skew_bps_p90={float(np.percentile(skew_bps_np, 90.0)):.6f} "
+            f"skew_limit_bps_mean={float(np.mean(skew_limit_bps_np)):.6f} "
+            f"center_shift_bps_mean={float(np.mean(center_shift_bps_np)):.6f} "
+            f"center_shift_bps_p50={float(np.percentile(center_shift_bps_np, 50.0)):.6f} "
+            f"center_shift_bps_p90={float(np.percentile(center_shift_bps_np, 90.0)):.6f} "
+            f"cmssl_skew_control_corr={_safe_corr(weighted_cmssl_logit_np, skew_control_np):.6f} "
+            f"cmssl_skew_bps_corr={_safe_corr(weighted_cmssl_logit_np, skew_bps_np):.6f} "
+            f"cmssl_sign_agreement={sign_agreement:.6f} "
+            f"abs_skew_high_abs_logit_mean={float(np.mean(np.abs(skew_bps_np[high_logit_mask])) if np.any(high_logit_mask) else 0.0):.6f} "
+            f"abs_skew_low_abs_logit_mean={float(np.mean(np.abs(skew_bps_np[low_logit_mask])) if np.any(low_logit_mask) else 0.0):.6f} "
+            f"passive_clamp_fraction={float(np.mean(passive_clamped_np)):.6f}"
         )
         if shape_abs_mean > 0.0 and shaping_ratio > 0.10:
             print(
@@ -4972,8 +5044,16 @@ def evaluate_market_making(
     maker_buy_fill_frac_steps: List[float] = []
     maker_sell_fill_frac_steps: List[float] = []
     maker_exec_qty_total_steps: List[float] = []
+    maker_buy_steps_signed: List[float] = []
+    maker_sell_steps_signed: List[float] = []
     touch_dist_buy_steps: List[float] = []
     touch_dist_sell_steps: List[float] = []
+    passive_clamped_steps: List[float] = []
+    skew_control_steps: List[float] = []
+    skew_bps_steps: List[float] = []
+    skew_limit_bps_steps: List[float] = []
+    center_shift_bps_steps: List[float] = []
+    weighted_cmssl_logit_steps: List[float] = []
     obs = env.reset()
     equity_curve: List[float] = []
     inventory_curve: List[float] = []
@@ -4983,6 +5063,8 @@ def evaluate_market_making(
     taker_fee_total = 0.0
     maker_rebate_total = 0.0
     maker_fill_count = 0
+    maker_step_any_fill_count = 0
+    maker_step_both_fill_count = 0
     maker_opps = 0
     taker_steps = 0
     steps = 0
@@ -5037,12 +5119,22 @@ def evaluate_market_making(
         taker_fee_total += float(info.get("taker_fee", 0.0))
         maker_rebate_total += float(info.get("rebate", 0.0))
         maker_fill_count += int(info["maker_buy"] > 0.0) + int(info["maker_sell"] > 0.0)
+        maker_step_any_fill_count += int(info["maker_buy"] > 0.0 or info["maker_sell"] > 0.0)
+        maker_step_both_fill_count += int(info["maker_buy"] > 0.0 and info["maker_sell"] > 0.0)
         maker_opps += 2
         maker_buy_fill_frac_steps.append(float(info.get("maker_buy_fill_frac", 0.0)))
         maker_sell_fill_frac_steps.append(float(info.get("maker_sell_fill_frac", 0.0)))
         maker_exec_qty_total_steps.append(float(info.get("maker_buy_exec_qty", maker_buy)) + float(info.get("maker_sell_exec_qty", maker_sell)))
         touch_dist_buy_steps.append(float(info.get("touch_dist_buy", 0.0)))
         touch_dist_sell_steps.append(float(info.get("touch_dist_sell", 0.0)))
+        maker_buy_steps_signed.append(float(info.get("maker_buy", 0.0)))
+        maker_sell_steps_signed.append(float(info.get("maker_sell", 0.0)))
+        passive_clamped_steps.append(float(info.get("passive_clamped", 0.0)))
+        skew_control_steps.append(float(info.get("skew_control", 0.0)))
+        skew_bps_steps.append(float(info.get("skew_bps", 0.0)))
+        skew_limit_bps_steps.append(float(info.get("skew_limit_bps", 0.0)))
+        center_shift_bps_steps.append(float(info.get("center_shift_bps", 0.0)))
+        weighted_cmssl_logit_steps.append(float(info.get("weighted_cmssl_logit", 0.0)))
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
         if collect_vol_bucket_report:
             snapshot_row = env.features[idx_before_step, env._feature_layout["snapshots"]]
@@ -5096,7 +5188,9 @@ def evaluate_market_making(
     max_drawdown = compute_max_drawdown(equity_arr)
     final_equity = float(equity_arr[-1]) if equity_arr.size > 0 else float(initial_equity)
     pnl_curve = equity_arr - float(initial_equity)
-    maker_fill_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
+    maker_side_hit_rate = float(maker_fill_count / maker_opps) if maker_opps > 0 else 0.0
+    maker_step_any_fill_rate = float(maker_step_any_fill_count / steps) if steps > 0 else 0.0
+    maker_step_both_fill_rate = float(maker_step_both_fill_count / steps) if steps > 0 else 0.0
     taker_usage_frequency = float(taker_steps / steps) if steps > 0 else 0.0
     taker_volume_share = float(taker_notional / turnover_notional) if turnover_notional > 0 else 0.0
     gross_taker_fees_paid = float(taker_fee_total)
@@ -5110,8 +5204,14 @@ def evaluate_market_making(
     denom = max(float(initial_equity), 1e-12)
     net_pnl = float(final_equity - float(initial_equity))
     net_pnl_pct = float(net_pnl / denom)
-    gross_pnl = float(net_pnl + net_fee_cost)
-    gross_pnl_pct = float(gross_pnl / denom)
+    pre_fee_pnl = float(net_pnl - net_fee_cost)
+    pre_fee_pnl_pct = float(pre_fee_pnl / denom)
+    pnl_identity_residual = float(abs(net_pnl - (pre_fee_pnl + (-net_fee_cost))))
+    if pnl_identity_residual > 1e-8:
+        raise RuntimeError(
+            f"PnL identity violated: net_pnl={net_pnl:.10f} pre_fee_pnl={pre_fee_pnl:.10f} "
+            f"net_fee_cost={net_fee_cost:.10f} residual={pnl_identity_residual:.10e}"
+        )
     ending_inventory_qty = float(inventory_arr[-1]) if inventory_arr.size > 0 else 0.0
     ending_inventory_notional = float(abs(ending_inventory_qty * last_mid))
     maker_turnover_notional = float(turnover_notional - taker_notional)
@@ -5121,14 +5221,33 @@ def evaluate_market_making(
     maker_exec_qty_total_arr = np.asarray(maker_exec_qty_total_steps, dtype=np.float64)
     touch_dist_buy_arr = np.asarray(touch_dist_buy_steps, dtype=np.float64)
     touch_dist_sell_arr = np.asarray(touch_dist_sell_steps, dtype=np.float64)
+    passive_clamped_arr = np.asarray(passive_clamped_steps, dtype=np.float64)
+    skew_control_arr = np.asarray(skew_control_steps, dtype=np.float64)
+    skew_bps_arr = np.asarray(skew_bps_steps, dtype=np.float64)
+    skew_limit_bps_arr = np.asarray(skew_limit_bps_steps, dtype=np.float64)
+    center_shift_bps_arr = np.asarray(center_shift_bps_steps, dtype=np.float64)
+    weighted_cmssl_logit_arr = np.asarray(weighted_cmssl_logit_steps, dtype=np.float64)
+    maker_buy_signed_arr = np.asarray(maker_buy_steps_signed, dtype=np.float64)
+    maker_sell_signed_arr = np.asarray(maker_sell_steps_signed, dtype=np.float64)
+    abs_logit_arr = np.abs(weighted_cmssl_logit_arr)
+    logit_med = float(np.median(abs_logit_arr)) if abs_logit_arr.size else 0.0
+    high_mask = abs_logit_arr >= logit_med
+    low_mask = ~high_mask
+
+    def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+        if a.size == 0 or b.size == 0:
+            return 0.0
+        if np.std(a) < 1e-12 or np.std(b) < 1e-12:
+            return 0.0
+        return float(np.corrcoef(a, b)[0, 1])
 
     metrics = {
         "initial_equity": float(initial_equity),
         "final_equity": final_equity,
         "net_pnl": net_pnl,
         "net_pnl_pct": net_pnl_pct,
-        "gross_pnl": gross_pnl,
-        "gross_pnl_pct": gross_pnl_pct,
+        "pre_fee_pnl": pre_fee_pnl,
+        "pre_fee_pnl_pct": pre_fee_pnl_pct,
         "equity_curve": equity_arr,
         "pnl_curve": pnl_curve,
         "sharpe": sharpe,
@@ -5141,7 +5260,9 @@ def evaluate_market_making(
         "turnover_notional": float(turnover_notional),
         "maker_turnover_notional": maker_turnover_notional,
         "maker_turnover_share": maker_turnover_share,
-        "maker_fill_rate": maker_fill_rate,
+        "maker_side_hit_rate": maker_side_hit_rate,
+        "maker_step_any_fill_rate": maker_step_any_fill_rate,
+        "maker_step_both_fill_rate": maker_step_both_fill_rate,
         "maker_buy_fill_frac_mean": float(np.mean(maker_buy_fill_frac_arr)) if maker_buy_fill_frac_arr.size > 0 else 0.0,
         "maker_sell_fill_frac_mean": float(np.mean(maker_sell_fill_frac_arr)) if maker_sell_fill_frac_arr.size > 0 else 0.0,
         "maker_exec_qty_total_per_step_mean": float(np.mean(maker_exec_qty_total_arr)) if maker_exec_qty_total_arr.size > 0 else 0.0,
@@ -5150,6 +5271,8 @@ def evaluate_market_making(
         "off_touch_quote_frac": float(np.mean((touch_dist_buy_arr >= 0.50) & (touch_dist_sell_arr >= 0.50))) if touch_dist_buy_arr.size > 0 else 0.0,
         "maker_fill_count": int(maker_fill_count),
         "maker_opportunities": int(maker_opps),
+        "maker_step_any_fill_count": int(maker_step_any_fill_count),
+        "maker_step_both_fill_count": int(maker_step_both_fill_count),
         "taker_usage_frequency": taker_usage_frequency,
         "taker_volume_share": taker_volume_share,
         "taker_steps": int(taker_steps),
@@ -5173,6 +5296,26 @@ def evaluate_market_making(
         "taker_buy_clipped_steps": int(taker_buy_clipped_steps),
         "taker_sell_clipped_steps": int(taker_sell_clipped_steps),
         "inventory_distribution": _inventory_distribution(inventory_arr),
+        "pnl_identity_residual": pnl_identity_residual,
+        "passive_clamp_fraction": float(np.mean(passive_clamped_arr)) if passive_clamped_arr.size else 0.0,
+        "maker_buy_inventory_clip_fraction": float(maker_buy_clipped_steps / steps) if steps > 0 else 0.0,
+        "maker_sell_inventory_clip_fraction": float(maker_sell_clipped_steps / steps) if steps > 0 else 0.0,
+        "skew_bps_mean": float(np.mean(skew_bps_arr)) if skew_bps_arr.size else 0.0,
+        "skew_bps_p50": float(np.percentile(skew_bps_arr, 50.0)) if skew_bps_arr.size else 0.0,
+        "skew_bps_p90": float(np.percentile(np.abs(skew_bps_arr), 90.0)) if skew_bps_arr.size else 0.0,
+        "skew_limit_bps_mean": float(np.mean(skew_limit_bps_arr)) if skew_limit_bps_arr.size else 0.0,
+        "center_shift_bps_mean": float(np.mean(center_shift_bps_arr)) if center_shift_bps_arr.size else 0.0,
+        "center_shift_bps_p50": float(np.percentile(center_shift_bps_arr, 50.0)) if center_shift_bps_arr.size else 0.0,
+        "center_shift_bps_p90": float(np.percentile(np.abs(center_shift_bps_arr), 90.0)) if center_shift_bps_arr.size else 0.0,
+        "cmssl_skew_control_corr": _safe_corr(weighted_cmssl_logit_arr, skew_control_arr),
+        "cmssl_skew_bps_corr": _safe_corr(weighted_cmssl_logit_arr, skew_bps_arr),
+        "cmssl_skew_sign_agreement_rate": float(np.mean(np.sign(skew_bps_arr) == np.sign(weighted_cmssl_logit_arr))) if skew_bps_arr.size else 0.0,
+        "abs_skew_bps_high_abs_logit_mean": float(np.mean(np.abs(skew_bps_arr[high_mask]))) if skew_bps_arr.size and np.any(high_mask) else 0.0,
+        "abs_skew_bps_low_abs_logit_mean": float(np.mean(np.abs(skew_bps_arr[low_mask]))) if skew_bps_arr.size and np.any(low_mask) else 0.0,
+        "maker_buy_volume_when_signal_pos": float(np.sum(maker_buy_signed_arr[weighted_cmssl_logit_arr > 0.0])) if maker_buy_signed_arr.size else 0.0,
+        "maker_sell_volume_when_signal_pos": float(np.sum(maker_sell_signed_arr[weighted_cmssl_logit_arr > 0.0])) if maker_sell_signed_arr.size else 0.0,
+        "maker_buy_volume_when_signal_neg": float(np.sum(maker_buy_signed_arr[weighted_cmssl_logit_arr < 0.0])) if maker_buy_signed_arr.size else 0.0,
+        "maker_sell_volume_when_signal_neg": float(np.sum(maker_sell_signed_arr[weighted_cmssl_logit_arr < 0.0])) if maker_sell_signed_arr.size else 0.0,
         "cadence": {
             "step_ms": step_ms,
             "steps_per_year": float(steps_per_year),
@@ -5206,8 +5349,9 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
         f"{label}: final_equity={float(metrics.get('final_equity', 0.0)):.4f} "
         f"net_pnl={float(metrics.get('net_pnl', 0.0)):.4f} "
         f"net_pnl_pct={float(metrics.get('net_pnl_pct', 0.0)):.6f} "
-        f"gross_pnl={float(metrics.get('gross_pnl', 0.0)):.4f} "
-        f"gross_pnl_pct={float(metrics.get('gross_pnl_pct', 0.0)):.6f} "
+        f"pre_fee_pnl={float(metrics.get('pre_fee_pnl', 0.0)):.4f} "
+        f"pre_fee_pnl_pct={float(metrics.get('pre_fee_pnl_pct', 0.0)):.6f} "
+        f"net_fee_pct_initial_equity={float(metrics.get('net_fee_pct_initial_equity', 0.0)):.6f} "
         f"sharpe={float(metrics.get('sharpe', 0.0)):.4f} "
         f"sharpe_5m={float(metrics.get('sharpe_5m', 0.0)):.4f} "
         f"sharpe_1h={float(metrics.get('sharpe_1h', 0.0)):.4f} "
@@ -5216,7 +5360,11 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
         f"max_dd={float(metrics.get('max_drawdown', 0.0)):.4f} "
         f"turnover_notional={float(metrics.get('turnover_notional', 0.0)):.4f} "
         f"turnover_qty={float(metrics.get('turnover_qty', 0.0)):.4f} "
-        f"maker_fill_rate={float(metrics.get('maker_fill_rate', 0.0)):.4f} "
+        f"maker_side_hit_rate={float(metrics.get('maker_side_hit_rate', 0.0)):.4f} "
+        f"maker_step_any_fill_rate={float(metrics.get('maker_step_any_fill_rate', 0.0)):.4f} "
+        f"maker_step_both_fill_rate={float(metrics.get('maker_step_both_fill_rate', 0.0)):.4f} "
+        f"passive_clamp_fraction={float(metrics.get('passive_clamp_fraction', 0.0)):.4f} "
+        f"cmssl_skew_bps_corr={float(metrics.get('cmssl_skew_bps_corr', 0.0)):.4f} "
         f"taker_usage_freq={float(metrics.get('taker_usage_frequency', 0.0)):.4f} "
         f"taker_volume_share={float(metrics.get('taker_volume_share', 0.0)):.4f} "
         f"gross_taker_fees_paid={float(metrics.get('gross_taker_fees_paid', 0.0)):.4f} "
@@ -5268,6 +5416,13 @@ def run_pipeline(
     run_mode: str = "train",
 ) -> Dict[str, Any]:
     print(f"[mm run mode] {run_mode}")
+    _fail_on_removed_env_vars(
+        (
+            "BYBIT_MM_CENTER_ANCHOR_FRAC",
+            "BYBIT_MM_SKEW_ANCHOR_FRAC",
+            "BYBIT_MM_FILL_TOUCH_EVENT_BONUS",
+        )
+    )
     meta = load_global_meta(Path(out_root))
     cmssl_test_split = resolve_cmssl_test_split(out_root, meta)
     rl_train_split = resolve_rl_train_split(out_root, meta)
@@ -5343,11 +5498,17 @@ def run_pipeline(
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
     reward_shaping_cfg = RewardShapingConfig(enabled=False)
+    quote_cfg = load_direct_quote_config()
+    fill_cfg = load_continuous_maker_fill_config()
+    print("[mm quote config]", json.dumps(dict(quote_cfg.__dict__), sort_keys=True))
+    print("[mm fill config]", json.dumps(dict(fill_cfg.__dict__), sort_keys=True))
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        direct_quote_config=quote_cfg,
+        continuous_maker_fill_config=fill_cfg,
         **env_kwargs_common,
     )
     width_vol_scaler = _compute_width_volatility_scaler(mm_train_env)
@@ -5365,21 +5526,27 @@ def run_pipeline(
     mm_val_env = MarketMakingEnv(
         mm_val_batch,
         allow_taker=allow_taker,
-        reward_shaping_config=RewardShapingConfig(enabled=False),
+        reward_shaping_config=reward_shaping_cfg,
+        direct_quote_config=quote_cfg,
+        continuous_maker_fill_config=fill_cfg,
         width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
         allow_taker=allow_taker,
-        reward_shaping_config=RewardShapingConfig(enabled=False),
+        reward_shaping_config=reward_shaping_cfg,
+        direct_quote_config=quote_cfg,
+        continuous_maker_fill_config=fill_cfg,
         width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
     mm_final_env = MarketMakingEnv(
         mm_eval_full_batch,
         allow_taker=allow_taker,
-        reward_shaping_config=RewardShapingConfig(enabled=False),
+        reward_shaping_config=reward_shaping_cfg,
+        direct_quote_config=quote_cfg,
+        continuous_maker_fill_config=fill_cfg,
         width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
@@ -5420,9 +5587,9 @@ def run_pipeline(
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
-        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -1.0),
-        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -1.5),
-        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -1.0),
+        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.7),
+        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -0.9),
+        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -0.7),
         init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -1.0),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
