@@ -4205,14 +4205,6 @@ def _market_ppo_model_state_dict_for_ckpt(model: MarketPolicyValueNet) -> Dict[s
     return dict(source_module.state_dict())
 
 
-def _normalize_market_ppo_checkpoint_state_dict(state: Dict[str, Any]) -> Dict[str, Any]:
-    keys = list(state.keys())
-    prefix = "_orig_mod."
-    if keys and all(isinstance(key, str) and key.startswith(prefix) for key in keys):
-        return {key[len(prefix):]: value for key, value in state.items()}
-    return dict(state)
-
-
 def _canonical_market_ppo_arch_field(ckpt: Dict[str, Any], field_name: str) -> Tuple[int, ...]:
     value = ckpt.get(field_name)
     canonical_error = (
@@ -4328,8 +4320,16 @@ def load_market_ppo_model(
         action_dim=action_dim,
     ).to(device)
 
-    normalized_state = _normalize_market_ppo_checkpoint_state_dict(state)
-    model.load_state_dict(normalized_state, strict=True)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Malformed canonical market PPO checkpoint: model_state_dict does not match "
+            "the current canonical MarketPolicyValueNet parameter layout. "
+            "Only canonical PPO checkpoints saved from the current codepath are supported; "
+            "checkpoints with _orig_mod.-prefixed keys or other non-canonical naming are unsupported. "
+            "Re-save from the current codepath or retrain."
+        ) from exc
 
     model.eval()
     model = _maybe_compile_module(
