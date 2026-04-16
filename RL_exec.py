@@ -5206,7 +5206,7 @@ def evaluate_market_making(
     net_pnl_pct = float(net_pnl / denom)
     pre_fee_pnl = float(net_pnl - net_fee_cost)
     pre_fee_pnl_pct = float(pre_fee_pnl / denom)
-    pnl_identity_residual = float(abs(net_pnl - (pre_fee_pnl + (-net_fee_cost))))
+    pnl_identity_residual = float(abs(net_pnl - (pre_fee_pnl + net_fee_cost)))
     if pnl_identity_residual > 1e-8:
         raise RuntimeError(
             f"PnL identity violated: net_pnl={net_pnl:.10f} pre_fee_pnl={pre_fee_pnl:.10f} "
