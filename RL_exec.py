@@ -2586,7 +2586,7 @@ class MarketMakingEnv:
         center_control: float,
         width_control: float,
         skew_control: float,
-    ) -> Tuple[float, float, Dict[str, float]]:
+    ) -> Tuple[float, float, Dict[str, Any]]:
         cfg = self.direct_quote_config
         mid = self._mid_price(idx)
         snapshot_row = self.features[idx, self._feature_layout["snapshots"]]
