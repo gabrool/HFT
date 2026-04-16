@@ -5501,8 +5501,8 @@ def run_pipeline(
     env_kwargs_common = resolve_market_env_common_kwargs_from_env()
     allow_taker = os.environ.get("BYBIT_MM_ALLOW_TAKER", "true").strip().lower() in {"1", "true", "yes", "y"}
     reward_shaping_cfg = RewardShapingConfig(enabled=False)
-    quote_cfg = load_direct_quote_config()
-    fill_cfg = load_continuous_maker_fill_config()
+    quote_cfg = env_kwargs_common["direct_quote_config"]
+    fill_cfg = env_kwargs_common["continuous_maker_fill_config"]
     print("[mm quote config]", json.dumps(dict(quote_cfg.__dict__), sort_keys=True))
     print("[mm fill config]", json.dumps(dict(fill_cfg.__dict__), sort_keys=True))
 
@@ -5510,8 +5510,6 @@ def run_pipeline(
         mm_train_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
-        direct_quote_config=quote_cfg,
-        continuous_maker_fill_config=fill_cfg,
         **env_kwargs_common,
     )
     width_vol_scaler = _compute_width_volatility_scaler(mm_train_env)
@@ -5530,8 +5528,6 @@ def run_pipeline(
         mm_val_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
-        direct_quote_config=quote_cfg,
-        continuous_maker_fill_config=fill_cfg,
         width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
@@ -5539,8 +5535,6 @@ def run_pipeline(
         mm_test_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
-        direct_quote_config=quote_cfg,
-        continuous_maker_fill_config=fill_cfg,
         width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
@@ -5548,8 +5542,6 @@ def run_pipeline(
         mm_eval_full_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
-        direct_quote_config=quote_cfg,
-        continuous_maker_fill_config=fill_cfg,
         width_vol_scaler=width_vol_scaler,
         **env_kwargs_common,
     )
