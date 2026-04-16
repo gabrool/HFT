@@ -2675,7 +2675,7 @@ class MarketMakingEnv:
         }
         return bid, ask, quote_metrics
 
-    def _assert_passive_quotes(self, bid: float, ask: float, idx: int, quote_metrics: Dict[str, float]) -> None:
+    def _assert_passive_quotes(self, bid: float, ask: float, idx: int, quote_metrics: Mapping[str, Any]) -> None:
         best_bid = float(self.best_bid[idx])
         best_ask = float(self.best_ask[idx])
         mid = 0.5 * (best_bid + best_ask)
