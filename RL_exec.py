@@ -827,7 +827,7 @@ def load_direct_quote_config() -> DirectQuoteConfig:
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
             touch_halfspread_mult=_env_float("BYBIT_MM_TOUCH_HALFSPREAD_MULT", 1.0),
-            wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 2.0),
+            wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 3.0),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
         )
     )
