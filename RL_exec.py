@@ -70,7 +70,7 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.1
 DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
-MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v4"
+MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v5"
 MM_PPO_ACTION_DIM = 4
 MM_PPO_ACTION_SEMANTICS = (
     "center_control",
@@ -700,7 +700,7 @@ class RewardShapingConfig:
 
 @dataclass(frozen=True)
 class ContinuousMakerFillConfig:
-    activity_min: float = 0.0
+    activity_min: float = 0.02
     activity_max: float = 0.18
     tau_touch: float = 0.10
     tau_cross: float = 0.08
@@ -709,9 +709,65 @@ class ContinuousMakerFillConfig:
     price_epsilon_px: float = 1e-9
 
 
+@dataclass(frozen=True)
+class ContinuousMakerFillCalibration:
+    vol_p50_bps: float
+    vol_p90_bps: float
+    vol_mean_bps: float
+    vol_p99_bps: float
+    sample_count: int
+
+
+def _fit_continuous_maker_fill_calibration_from_snapshots(
+    train_snapshots: np.ndarray,
+) -> ContinuousMakerFillCalibration:
+    vol_short_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")
+    vol_long_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")
+    snapshots = np.asarray(train_snapshots, dtype=np.float64)
+    if snapshots.ndim != 2:
+        raise ValueError(f"train_snapshots must be rank-2, got shape={snapshots.shape}")
+    if snapshots.shape[1] <= max(vol_short_idx, vol_long_idx):
+        raise ValueError(
+            "train_snapshots does not include required volatility columns: "
+            f"shape={snapshots.shape} vol_short_idx={vol_short_idx} vol_long_idx={vol_long_idx}"
+        )
+    vol_short = snapshots[:, vol_short_idx]
+    vol_long = snapshots[:, vol_long_idx]
+    sigma_recent = np.maximum(vol_short, vol_long).astype(np.float64, copy=False)
+    sigma_bps = 1e4 * sigma_recent
+    valid_mask = np.isfinite(sigma_bps) & (sigma_bps >= 0.0)
+    sigma_bps_valid = sigma_bps[valid_mask]
+    if sigma_bps_valid.size < 1024:
+        raise ValueError(
+            "Insufficient valid train-split volatility rows for maker fill calibration: "
+            f"sample_count={sigma_bps_valid.size} required_min=1024"
+        )
+    p50 = float(np.percentile(sigma_bps_valid, 50.0))
+    p90 = float(np.percentile(sigma_bps_valid, 90.0))
+    p99 = float(np.percentile(sigma_bps_valid, 99.0))
+    mean = float(np.mean(sigma_bps_valid))
+    if not np.isfinite(p50) or not np.isfinite(p90):
+        raise ValueError(
+            "Invalid maker fill calibration quantiles: "
+            f"vol_p50_bps={p50} vol_p90_bps={p90}"
+        )
+    if p90 <= p50:
+        raise ValueError(
+            "Maker fill calibration requires vol_p90_bps > vol_p50_bps: "
+            f"vol_p50_bps={p50} vol_p90_bps={p90}"
+        )
+    return ContinuousMakerFillCalibration(
+        vol_p50_bps=p50,
+        vol_p90_bps=p90,
+        vol_mean_bps=mean,
+        vol_p99_bps=p99,
+        sample_count=int(sigma_bps_valid.size),
+    )
+
+
 def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
     cfg = ContinuousMakerFillConfig(
-        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.0),
+        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.02),
         activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.18),
         tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.10),
         tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.08),
@@ -2083,6 +2139,8 @@ class MarketMakingEnv:
         self,
         batch: MarketMakingBatch,
         *,
+        continuous_maker_fill_config: ContinuousMakerFillConfig,
+        continuous_maker_fill_calibration: ContinuousMakerFillCalibration,
         maker_rebate_bps: float = 0.0,
         taker_fee_bps: float = DEFAULT_MM_TAKER_FEE_BPS,
         allow_taker: bool = True,
@@ -2100,7 +2158,6 @@ class MarketMakingEnv:
         freeze_obs_norm: bool = False,
         direct_quote_config: Optional[DirectQuoteConfig] = None,
         reward_shaping_config: Optional[RewardShapingConfig] = None,
-        continuous_maker_fill_config: Optional[ContinuousMakerFillConfig] = None,
     ):
         self.features = np.ascontiguousarray(np.asarray(batch.features, dtype=np.float32))
         self.spread_bps = np.ascontiguousarray(np.asarray(batch.spread_bps, dtype=np.float32))
@@ -2221,10 +2278,25 @@ class MarketMakingEnv:
         self.reward_shaping_config = (
             load_reward_shaping_config() if reward_shaping_config is None else reward_shaping_config
         )
-        self.continuous_maker_fill_config = (
-            load_continuous_maker_fill_config()
-            if continuous_maker_fill_config is None
-            else continuous_maker_fill_config
+        self.continuous_maker_fill_config = continuous_maker_fill_config
+        self.continuous_maker_fill_calibration = continuous_maker_fill_calibration
+        if self.continuous_maker_fill_calibration.sample_count < 1024:
+            raise ValueError(
+                "Continuous maker-fill calibration sample_count must be >= 1024, got "
+                f"{self.continuous_maker_fill_calibration.sample_count}"
+            )
+        if self.continuous_maker_fill_calibration.vol_p90_bps <= self.continuous_maker_fill_calibration.vol_p50_bps:
+            raise ValueError(
+                "Continuous maker-fill calibration requires vol_p90_bps > vol_p50_bps, got "
+                f"vol_p50_bps={self.continuous_maker_fill_calibration.vol_p50_bps} "
+                f"vol_p90_bps={self.continuous_maker_fill_calibration.vol_p90_bps}"
+            )
+        print("[mm fill config]", json.dumps(dict(self.continuous_maker_fill_config.__dict__), sort_keys=True))
+        print(
+            "[mm fill config] "
+            f"calibrated=True "
+            f"vol_p50_bps={self.continuous_maker_fill_calibration.vol_p50_bps:.6f} "
+            f"vol_p90_bps={self.continuous_maker_fill_calibration.vol_p90_bps:.6f}"
         )
         raw_spreads_px = np.asarray(self.best_ask - self.best_bid, dtype=np.float64)
         positive_raw_spreads_px = raw_spreads_px[
@@ -2284,6 +2356,18 @@ class MarketMakingEnv:
         self._num_h = _infer_num_horizons(self.features.shape[-1])
         self._feature_layout = _joined_feature_layout(self._num_h, len(RAW_SNAPSHOT_FEATURE_COLUMNS))
         self._validate_feature_layout()
+        vol_short_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")
+        vol_long_idx = RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")
+        snapshot_features = self.features[:, self._feature_layout["snapshots"]].astype(np.float64, copy=False)
+        sigma_recent = np.maximum(snapshot_features[:, vol_short_idx], snapshot_features[:, vol_long_idx])
+        if not np.all(np.isfinite(sigma_recent)):
+            bad_count = int(np.size(sigma_recent) - np.count_nonzero(np.isfinite(sigma_recent)))
+            raise ValueError(
+                "Non-finite snapshot volatility encountered in MarketMakingEnv; "
+                f"bad_rows={bad_count}"
+            )
+        self.snapshot_sigma_bps = np.ascontiguousarray((1e4 * sigma_recent).astype(np.float64, copy=False))
+        self.last_activity_sigma_bps = 0.0
         self._feature_dim = int(self.features.shape[-1])
         self._obs_dim = self._feature_dim + ENV_OBS_EXTRA_STATE_DIM
         self._obs_feature_slice = slice(0, self._feature_dim)
@@ -2323,6 +2407,10 @@ class MarketMakingEnv:
         self.last_touch_event_boost_sell = 0.0
         self.last_fill_interaction_buy = 0.0
         self.last_fill_interaction_sell = 0.0
+        self.last_resting_quality_buy = 0.0
+        self.last_resting_quality_sell = 0.0
+        self.last_cross_confirmation_buy = 0.0
+        self.last_cross_confirmation_sell = 0.0
         self.last_raw_spread_px = 0.0
         self.last_norm_spread_px = float(self.fill_norm_spread_px_floor)
         self.last_used_norm_spread_floor = 0.0
@@ -2373,6 +2461,11 @@ class MarketMakingEnv:
         self.last_touch_event_boost_sell = 0.0
         self.last_fill_interaction_buy = 0.0
         self.last_fill_interaction_sell = 0.0
+        self.last_resting_quality_buy = 0.0
+        self.last_resting_quality_sell = 0.0
+        self.last_cross_confirmation_buy = 0.0
+        self.last_cross_confirmation_sell = 0.0
+        self.last_activity_sigma_bps = 0.0
         self.last_raw_spread_px = 0.0
         self.last_norm_spread_px = float(self.fill_norm_spread_px_floor)
         self.last_used_norm_spread_floor = 0.0
@@ -2726,13 +2819,17 @@ class MarketMakingEnv:
         return float(qty)
 
     def _volatility_activity_score(self, decision_idx: int) -> float:
-        snapshot_row = self.features[decision_idx, self._feature_layout["snapshots"]]
-        vol_short = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_short")])
-        vol_long = float(snapshot_row[RAW_SNAPSHOT_FEATURE_COLUMNS.index("vol_long")])
-        sigma_recent = max(0.0, vol_short, vol_long)
-        vol_score = float(np.tanh(max(sigma_recent, 0.0)))
+        sigma_bps = float(self.snapshot_sigma_bps[decision_idx])
+        if not np.isfinite(sigma_bps):
+            raise ValueError(
+                f"Non-finite snapshot sigma_bps at decision_idx={decision_idx}: sigma_bps={sigma_bps}"
+            )
         cfg = self.continuous_maker_fill_config
-        return float(cfg.activity_min + (cfg.activity_max - cfg.activity_min) * vol_score)
+        cal = self.continuous_maker_fill_calibration
+        u = (sigma_bps - cal.vol_p50_bps) / (cal.vol_p90_bps - cal.vol_p50_bps)
+        u = float(np.clip(u, 0.0, 1.0))
+        self.last_activity_sigma_bps = sigma_bps
+        return float(cfg.activity_min + (cfg.activity_max - cfg.activity_min) * u)
 
     def _weighted_cmssl_logit(self, decision_idx: int) -> float:
         dir_slice = self._feature_layout["dir_logits"]
@@ -2846,6 +2943,10 @@ class MarketMakingEnv:
         self.last_touch_dist_sell = float(touch_dist_sell)
         self.last_touch_event_boost_buy = float(touch_boost_buy)
         self.last_touch_event_boost_sell = float(touch_boost_sell)
+        self.last_resting_quality_buy = float(resting_quality_buy)
+        self.last_resting_quality_sell = float(resting_quality_sell)
+        self.last_cross_confirmation_buy = float(cross_confirmation_buy)
+        self.last_cross_confirmation_sell = float(cross_confirmation_sell)
         self.last_fill_interaction_buy = float(resting_quality_buy * cross_confirmation_buy)
         self.last_fill_interaction_sell = float(resting_quality_sell * cross_confirmation_sell)
         self.last_raw_spread_px = float(raw_spread_px)
@@ -3082,10 +3183,15 @@ class MarketMakingEnv:
                 "maker_buy_exec_qty": 0.0,
                 "maker_sell_exec_qty": 0.0,
                 "activity_score": float(self.last_activity_score),
+                "activity_sigma_bps": float(self.last_activity_sigma_bps),
                 "touch_dist_buy": float(self.last_touch_dist_buy),
                 "touch_dist_sell": float(self.last_touch_dist_sell),
                 "touch_event_boost_buy": float(self.last_touch_event_boost_buy),
                 "touch_event_boost_sell": float(self.last_touch_event_boost_sell),
+                "resting_quality_buy": float(self.last_resting_quality_buy),
+                "resting_quality_sell": float(self.last_resting_quality_sell),
+                "cross_confirmation_buy": float(self.last_cross_confirmation_buy),
+                "cross_confirmation_sell": float(self.last_cross_confirmation_sell),
                 "fill_interaction_buy": float(self.last_fill_interaction_buy),
                 "fill_interaction_sell": float(self.last_fill_interaction_sell),
                 "raw_spread_px": float(self.last_raw_spread_px),
@@ -3289,10 +3395,15 @@ class MarketMakingEnv:
             "maker_buy_exec_qty": float(maker_buy),
             "maker_sell_exec_qty": float(maker_sell),
             "activity_score": float(self.last_activity_score),
+            "activity_sigma_bps": float(self.last_activity_sigma_bps),
             "touch_dist_buy": float(self.last_touch_dist_buy),
             "touch_dist_sell": float(self.last_touch_dist_sell),
             "touch_event_boost_buy": float(self.last_touch_event_boost_buy),
             "touch_event_boost_sell": float(self.last_touch_event_boost_sell),
+            "resting_quality_buy": float(self.last_resting_quality_buy),
+            "resting_quality_sell": float(self.last_resting_quality_sell),
+            "cross_confirmation_buy": float(self.last_cross_confirmation_buy),
+            "cross_confirmation_sell": float(self.last_cross_confirmation_sell),
             "fill_interaction_buy": float(self.last_fill_interaction_buy),
             "fill_interaction_sell": float(self.last_fill_interaction_sell),
             "raw_spread_px": float(self.last_raw_spread_px),
@@ -3419,13 +3530,18 @@ def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
 
 
 def _init_market_policy_mean_head(model: MarketPolicyValueNet) -> None:
+    width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.14)
+    if not np.isfinite(width_action_init) or not (0.0 < width_action_init < 1.0):
+        raise ValueError(
+            "BYBIT_MM_PPO_WIDTH_ACTION_INIT must be finite and satisfy 0.0 < value < 1.0, "
+            f"got {width_action_init}"
+        )
+    width_latent_bias = float(np.arctanh(2.0 * width_action_init - 1.0))
     final_policy_linear = _find_final_policy_linear_layer(model)
     with torch.no_grad():
         final_policy_linear.weight.zero_()
         if final_policy_linear.bias is not None:
             final_policy_linear.bias.zero_()
-            width_action_init = 0.08
-            width_latent_bias = np.arctanh(2.0 * width_action_init - 1.0)
             final_policy_linear.bias[0] = 0.0
             final_policy_linear.bias[1] = float(width_latent_bias)
             final_policy_linear.bias[2] = 0.0
@@ -3535,8 +3651,13 @@ def collect_market_rollout(
     maker_buy_fill_frac_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     maker_sell_fill_frac_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     activity_score_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    activity_sigma_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     touch_event_boost_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     touch_event_boost_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    resting_quality_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    resting_quality_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    cross_confirmation_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    cross_confirmation_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     fill_interaction_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     fill_interaction_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     raw_spread_px_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
@@ -3719,8 +3840,13 @@ def collect_market_rollout(
             maker_buy_fill_frac_buf[idx] = float(info.get("maker_buy_fill_frac", 0.0))
             maker_sell_fill_frac_buf[idx] = float(info.get("maker_sell_fill_frac", 0.0))
             activity_score_buf[idx] = float(info.get("activity_score", 0.0))
+            activity_sigma_bps_buf[idx] = float(info.get("activity_sigma_bps", 0.0))
             touch_event_boost_buy_buf[idx] = float(info.get("touch_event_boost_buy", 0.0))
             touch_event_boost_sell_buf[idx] = float(info.get("touch_event_boost_sell", 0.0))
+            resting_quality_buy_buf[idx] = float(info.get("resting_quality_buy", 0.0))
+            resting_quality_sell_buf[idx] = float(info.get("resting_quality_sell", 0.0))
+            cross_confirmation_buy_buf[idx] = float(info.get("cross_confirmation_buy", 0.0))
+            cross_confirmation_sell_buf[idx] = float(info.get("cross_confirmation_sell", 0.0))
             fill_interaction_buy_buf[idx] = float(info.get("fill_interaction_buy", 0.0))
             fill_interaction_sell_buf[idx] = float(info.get("fill_interaction_sell", 0.0))
             raw_spread_px_buf[idx] = float(info.get("raw_spread_px", 0.0))
@@ -3799,8 +3925,13 @@ def collect_market_rollout(
         "maker_buy_fill_frac": maker_buy_fill_frac_buf[:cursor],
         "maker_sell_fill_frac": maker_sell_fill_frac_buf[:cursor],
         "activity_score": activity_score_buf[:cursor],
+        "activity_sigma_bps": activity_sigma_bps_buf[:cursor],
         "touch_event_boost_buy": touch_event_boost_buy_buf[:cursor],
         "touch_event_boost_sell": touch_event_boost_sell_buf[:cursor],
+        "resting_quality_buy": resting_quality_buy_buf[:cursor],
+        "resting_quality_sell": resting_quality_sell_buf[:cursor],
+        "cross_confirmation_buy": cross_confirmation_buy_buf[:cursor],
+        "cross_confirmation_sell": cross_confirmation_sell_buf[:cursor],
         "fill_interaction_buy": fill_interaction_buy_buf[:cursor],
         "fill_interaction_sell": fill_interaction_sell_buf[:cursor],
         "raw_spread_px": raw_spread_px_buf[:cursor],
@@ -4303,7 +4434,13 @@ def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
     schema = ckpt.get("checkpoint_schema")
     if schema != MM_PPO_CHECKPOINT_SCHEMA:
         legacy_note = ""
-        if schema == "mm-ppo-direct-quote-v3":
+        if schema == "mm-ppo-direct-quote-v4":
+            legacy_note = (
+                " Direct-quote v4 checkpoints are incompatible with v5 because maker-fill activity "
+                "is now train-split volatility-calibrated and runtime metadata includes calibration fields; "
+                "retraining is required."
+            )
+        elif schema == "mm-ppo-direct-quote-v3":
             legacy_note = (
                 " Direct-quote v3 checkpoints are incompatible with v4 because width control "
                 "contract changed to one-sided [0,1], fill normalization changed, and policy "
@@ -4433,7 +4570,12 @@ def train_market_ppo(
         ),
     ).to(device)
     _init_market_policy_mean_head(model)
-    mean_head_width_action_init = 0.08
+    mean_head_width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.14)
+    if not np.isfinite(mean_head_width_action_init) or not (0.0 < mean_head_width_action_init < 1.0):
+        raise ValueError(
+            "BYBIT_MM_PPO_WIDTH_ACTION_INIT must be finite and satisfy 0.0 < value < 1.0, "
+            f"got {mean_head_width_action_init}"
+        )
     mean_head_width_bias_latent = float(np.arctanh(2.0 * mean_head_width_action_init - 1.0))
     print(
         "[mm ppo compile] "
@@ -4452,6 +4594,7 @@ def train_market_ppo(
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
         "mean_head_init=zeros_width_bias_only "
         f"width_action_init={mean_head_width_action_init:.2f} "
+        "width_action_init_source=BYBIT_MM_PPO_WIDTH_ACTION_INIT(default=0.14) "
         f"width_bias_latent={mean_head_width_bias_latent:.6f} "
         "action_controls=center/width/skew/taker controls "
         f"init_log_std_center={config.init_log_std_center:.4f} "
@@ -4647,8 +4790,13 @@ def train_market_ppo(
         maker_buy_fill_frac_np = rollout["maker_buy_fill_frac"].detach().cpu().numpy().astype(np.float64)
         maker_sell_fill_frac_np = rollout["maker_sell_fill_frac"].detach().cpu().numpy().astype(np.float64)
         activity_score_np = rollout["activity_score"].detach().cpu().numpy().astype(np.float64)
+        activity_sigma_bps_np = rollout["activity_sigma_bps"].detach().cpu().numpy().astype(np.float64)
         touch_event_boost_buy_np = rollout["touch_event_boost_buy"].detach().cpu().numpy().astype(np.float64)
         touch_event_boost_sell_np = rollout["touch_event_boost_sell"].detach().cpu().numpy().astype(np.float64)
+        resting_quality_buy_np = rollout["resting_quality_buy"].detach().cpu().numpy().astype(np.float64)
+        resting_quality_sell_np = rollout["resting_quality_sell"].detach().cpu().numpy().astype(np.float64)
+        cross_confirmation_buy_np = rollout["cross_confirmation_buy"].detach().cpu().numpy().astype(np.float64)
+        cross_confirmation_sell_np = rollout["cross_confirmation_sell"].detach().cpu().numpy().astype(np.float64)
         fill_interaction_buy_np = rollout["fill_interaction_buy"].detach().cpu().numpy().astype(np.float64)
         fill_interaction_sell_np = rollout["fill_interaction_sell"].detach().cpu().numpy().astype(np.float64)
         raw_spread_px_np = rollout["raw_spread_px"].detach().cpu().numpy().astype(np.float64)
@@ -4784,6 +4932,22 @@ def train_market_ppo(
             f"reward_train_std={float(np.std((reward_true_np + shape_total_np))):.6f}"
         )
         print(
+            "[mm ppo fill path] "
+            f"epoch={epoch + 1} "
+            f"activity_sigma_bps_mean={float(np.mean(activity_sigma_bps_np)):.6f} "
+            f"activity_sigma_bps_p50={float(np.percentile(activity_sigma_bps_np, 50.0)):.6f} "
+            f"activity_sigma_bps_p90={float(np.percentile(activity_sigma_bps_np, 90.0)):.6f} "
+            f"activity_score_mean={float(np.mean(activity_score_np)):.6f} "
+            f"activity_score_p50={float(np.percentile(activity_score_np, 50.0)):.6f} "
+            f"activity_score_p90={float(np.percentile(activity_score_np, 90.0)):.6f} "
+            f"resting_quality_buy_mean={float(np.mean(resting_quality_buy_np)):.6f} "
+            f"resting_quality_sell_mean={float(np.mean(resting_quality_sell_np)):.6f} "
+            f"cross_confirmation_buy_mean={float(np.mean(cross_confirmation_buy_np)):.6f} "
+            f"cross_confirmation_sell_mean={float(np.mean(cross_confirmation_sell_np)):.6f} "
+            f"fill_interaction_buy_mean={float(np.mean(fill_interaction_buy_np)):.6f} "
+            f"fill_interaction_sell_mean={float(np.mean(fill_interaction_sell_np)):.6f}"
+        )
+        print(
             "[mm ppo signal usage] "
             f"epoch={epoch + 1} "
             f"skew_bps_mean={float(np.mean(skew_bps_np)):.6f} "
@@ -4916,6 +5080,17 @@ def train_market_ppo(
                             },
                             extra_metadata={
                                 "config": config.__dict__,
+                                "runtime_fill_config": {
+                                    "width_action_init": float(mean_head_width_action_init),
+                                    "fill_activity_min": float(train_env.continuous_maker_fill_config.activity_min),
+                                    "fill_activity_max": float(train_env.continuous_maker_fill_config.activity_max),
+                                    "fill_tau_touch": float(train_env.continuous_maker_fill_config.tau_touch),
+                                    "fill_tau_cross": float(train_env.continuous_maker_fill_config.tau_cross),
+                                    "fill_touch_event_boost": float(train_env.continuous_maker_fill_config.touch_event_boost),
+                                    "fill_touch_event_distance_frac": float(train_env.continuous_maker_fill_config.touch_event_distance_frac),
+                                    "fill_vol_p50_bps": float(train_env.continuous_maker_fill_calibration.vol_p50_bps),
+                                    "fill_vol_p90_bps": float(train_env.continuous_maker_fill_calibration.vol_p90_bps),
+                                },
                                 "validation_metadata": {
                                     "deterministic_report": _strip_large_report_fields(deterministic_report),
                                     "stochastic_report": _strip_large_report_fields(stochastic_report),
@@ -5555,13 +5730,30 @@ def run_pipeline(
     reward_shaping_cfg = load_reward_shaping_config()
     quote_cfg = env_kwargs_common["direct_quote_config"]
     fill_cfg = env_kwargs_common["continuous_maker_fill_config"]
+    fill_calibration = _fit_continuous_maker_fill_calibration_from_snapshots(joined_rl_train["snapshots"])
+    print(
+        "[mm fill calibration] "
+        f"source=rl_train_split "
+        f"sample_count={fill_calibration.sample_count} "
+        f"vol_p50_bps={fill_calibration.vol_p50_bps:.6f} "
+        f"vol_p90_bps={fill_calibration.vol_p90_bps:.6f} "
+        f"vol_mean_bps={fill_calibration.vol_mean_bps:.6f} "
+        f"vol_p99_bps={fill_calibration.vol_p99_bps:.6f}"
+    )
     print("[mm quote config]", json.dumps(dict(quote_cfg.__dict__), sort_keys=True))
     print("[mm fill config]", json.dumps(dict(fill_cfg.__dict__), sort_keys=True))
+    print(
+        "[mm fill config] "
+        f"calibrated=True "
+        f"vol_p50_bps={fill_calibration.vol_p50_bps:.6f} "
+        f"vol_p90_bps={fill_calibration.vol_p90_bps:.6f}"
+    )
 
     mm_train_env = MarketMakingEnv(
         mm_train_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
     print("[mm obs scaling]", json.dumps(mm_train_env.get_observation_scaling_config(), sort_keys=True))
@@ -5569,18 +5761,21 @@ def run_pipeline(
         mm_val_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
     mm_test_env = MarketMakingEnv(
         mm_test_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
     mm_final_env = MarketMakingEnv(
         mm_eval_full_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
     prefitted_obs_norm_state = prefit_market_obs_norm(mm_train_env)
