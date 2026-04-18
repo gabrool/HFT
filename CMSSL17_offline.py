@@ -870,7 +870,7 @@ def build_logit_diagnostics_for_horizon(
     }
 
     y01 = (r > 0.0).astype(np.float64)
-    pred01 = (logit > 0.0).astype(np.float64)
+    pred01 = (logit >= 0.0).astype(np.float64)
     summary["auc_all"] = _binary_auc_from_score(logit, y01)
     summary["auc_masked"] = _binary_auc_from_score(logit[is_masked], y01[is_masked])
     summary["acc_all"] = _safe_mean((pred01 == y01).astype(np.float64))
@@ -1484,18 +1484,18 @@ def train_from_offline():
 
         primary_metric_value, primary_metric_label = compute_primary_metric(auc_masked)
         return {
-            "val_bce_unmasked": bce,
-            "val_bce_masked": bce_masked,
-            "val_acc": acc,
-            "val_acc_masked": acc_masked,
-            "val_auc": auc,
-            "val_auc_masked": auc_masked,
-            "val_pos_rate_all": pos_rate_all,
-            "val_logit_mean_all": logit_mean_all,
-            "val_logit_std_all": logit_std_all,
-            "val_pos_rate_masked": pos_rate_masked,
-            "val_logit_mean_masked": logit_mean_masked,
-            "val_logit_std_masked": logit_std_masked,
+            "bce_unmasked": bce,
+            "bce_masked": bce_masked,
+            "acc_unmasked": acc,
+            "acc_masked": acc_masked,
+            "auc_unmasked": auc,
+            "auc_masked": auc_masked,
+            "pos_rate_unmasked": pos_rate_all,
+            "logit_mean_unmasked": logit_mean_all,
+            "logit_std_unmasked": logit_std_all,
+            "pos_rate_masked": pos_rate_masked,
+            "logit_mean_masked": logit_mean_masked,
+            "logit_std_masked": logit_std_masked,
             "primary_metric_value": float(primary_metric_value),
             "primary_metric_label": primary_metric_label,
             "primary_masked_bce": float(bce_masked[primary_horizon_idx]),
@@ -1648,19 +1648,19 @@ def train_from_offline():
                 no_imp = 0
                 full_val = run_validation(full_metrics=True)
                 print(
-                    f"[val] BCE(all)={format_metric(full_val['val_bce_unmasked'], '{:.5f}')}  "
-                    f"BCE(mask)={format_metric(full_val['val_bce_masked'], '{:.5f}')}  "
-                    f"Acc(all)={format_metric(full_val['val_acc'], '{:.3%}')}  "
-                    f"Acc(mask)={format_metric(full_val['val_acc_masked'], '{:.3%}')}  "
-                    f"AUC(all)={format_metric(full_val['val_auc'], '{:.3f}')}  "
-                    f"AUC(mask)={format_metric(full_val['val_auc_masked'], '{:.3f}')}")
+                    f"[val] BCE(all)={format_metric(full_val['bce_unmasked'], '{:.5f}')}  "
+                    f"BCE(mask)={format_metric(full_val['bce_masked'], '{:.5f}')}  "
+                    f"Acc(all)={format_metric(full_val['acc_unmasked'], '{:.3%}')}  "
+                    f"Acc(mask)={format_metric(full_val['acc_masked'], '{:.3%}')}  "
+                    f"AUC(all)={format_metric(full_val['auc_unmasked'], '{:.3f}')}  "
+                    f"AUC(mask)={format_metric(full_val['auc_masked'], '{:.3f}')}")
                 print(
-                    f"[val_diag] pos_rate(all)={format_metric(full_val['val_pos_rate_all'], '{:.3%}')}  "
-                    f"logit_mean(all)={format_metric(full_val['val_logit_mean_all'], '{:.3f}')}  "
-                    f"logit_std(all)={format_metric(full_val['val_logit_std_all'], '{:.3f}')}  "
-                    f"pos_rate(mask)={format_metric(full_val['val_pos_rate_masked'], '{:.3%}')}  "
-                    f"logit_mean(mask)={format_metric(full_val['val_logit_mean_masked'], '{:.3f}')}  "
-                    f"logit_std(mask)={format_metric(full_val['val_logit_std_masked'], '{:.3f}')}")
+                    f"[val_diag] pos_rate(all)={format_metric(full_val['pos_rate_unmasked'], '{:.3%}')}  "
+                    f"logit_mean(all)={format_metric(full_val['logit_mean_unmasked'], '{:.3f}')}  "
+                    f"logit_std(all)={format_metric(full_val['logit_std_unmasked'], '{:.3f}')}  "
+                    f"pos_rate(mask)={format_metric(full_val['pos_rate_masked'], '{:.3%}')}  "
+                    f"logit_mean(mask)={format_metric(full_val['logit_mean_masked'], '{:.3f}')}  "
+                    f"logit_std(mask)={format_metric(full_val['logit_std_masked'], '{:.3f}')}")
                 print(
                     f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
                     f"[masked_bce_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_bce']):.6f}, "
@@ -1704,52 +1704,52 @@ def train_from_offline():
     eval_metrics = summarize_directional_metrics(dl_eval, primary_only=False, split_name="eval_full")
 
     print(
-        f"[val] BCE(all)={format_metric(val_metrics['val_bce_unmasked'], '{:.4e}')}  "
-        f"Acc(all)={format_metric(val_metrics['val_acc'], '{:.4f}')}  "
-        f"AUC(all)={format_metric(val_metrics['val_auc'], '{:.4f}')}")
+        f"[val] BCE(all)={format_metric(val_metrics['bce_unmasked'], '{:.4e}')}  "
+        f"Acc(all)={format_metric(val_metrics['acc_unmasked'], '{:.4f}')}  "
+        f"AUC(all)={format_metric(val_metrics['auc_unmasked'], '{:.4f}')}")
     print(
-        f"  BCE(mask)={format_metric(val_metrics['val_bce_masked'], '{:.4e}')}  "
-        f"Acc(mask)={format_metric(val_metrics['val_acc_masked'], '{:.4f}')}  "
-        f"AUC(mask)={format_metric(val_metrics['val_auc_masked'], '{:.4f}')}")
+        f"  BCE(mask)={format_metric(val_metrics['bce_masked'], '{:.4e}')}  "
+        f"Acc(mask)={format_metric(val_metrics['acc_masked'], '{:.4f}')}  "
+        f"AUC(mask)={format_metric(val_metrics['auc_masked'], '{:.4f}')}")
     print(
-        f"[val_diag] pos_rate(all)={format_metric(val_metrics['val_pos_rate_all'], '{:.3%}')}  "
-        f"logit_mean(all)={format_metric(val_metrics['val_logit_mean_all'], '{:.3f}')}  "
-        f"logit_std(all)={format_metric(val_metrics['val_logit_std_all'], '{:.3f}')}  "
-        f"pos_rate(mask)={format_metric(val_metrics['val_pos_rate_masked'], '{:.3%}')}  "
-        f"logit_mean(mask)={format_metric(val_metrics['val_logit_mean_masked'], '{:.3f}')}  "
-        f"logit_std(mask)={format_metric(val_metrics['val_logit_std_masked'], '{:.3f}')}")
+        f"[val_diag] pos_rate(all)={format_metric(val_metrics['pos_rate_unmasked'], '{:.3%}')}  "
+        f"logit_mean(all)={format_metric(val_metrics['logit_mean_unmasked'], '{:.3f}')}  "
+        f"logit_std(all)={format_metric(val_metrics['logit_std_unmasked'], '{:.3f}')}  "
+        f"pos_rate(mask)={format_metric(val_metrics['pos_rate_masked'], '{:.3%}')}  "
+        f"logit_mean(mask)={format_metric(val_metrics['logit_mean_masked'], '{:.3f}')}  "
+        f"logit_std(mask)={format_metric(val_metrics['logit_std_masked'], '{:.3f}')}")
 
     print(
-        f"[test] BCE(all)={format_metric(test_metrics['val_bce_unmasked'], '{:.4e}')}  "
-        f"Acc(all)={format_metric(test_metrics['val_acc'], '{:.4f}')}  "
-        f"AUC(all)={format_metric(test_metrics['val_auc'], '{:.4f}')}")
+        f"[test] BCE(all)={format_metric(test_metrics['bce_unmasked'], '{:.4e}')}  "
+        f"Acc(all)={format_metric(test_metrics['acc_unmasked'], '{:.4f}')}  "
+        f"AUC(all)={format_metric(test_metrics['auc_unmasked'], '{:.4f}')}")
     print(
-        f"  BCE(mask)={format_metric(test_metrics['val_bce_masked'], '{:.4e}')}  "
-        f"Acc(mask)={format_metric(test_metrics['val_acc_masked'], '{:.4f}')}  "
-        f"AUC(mask)={format_metric(test_metrics['val_auc_masked'], '{:.4f}')}")
+        f"  BCE(mask)={format_metric(test_metrics['bce_masked'], '{:.4e}')}  "
+        f"Acc(mask)={format_metric(test_metrics['acc_masked'], '{:.4f}')}  "
+        f"AUC(mask)={format_metric(test_metrics['auc_masked'], '{:.4f}')}")
     print(
-        f"[test_diag] pos_rate(all)={format_metric(test_metrics['val_pos_rate_all'], '{:.3%}')}  "
-        f"logit_mean(all)={format_metric(test_metrics['val_logit_mean_all'], '{:.3f}')}  "
-        f"logit_std(all)={format_metric(test_metrics['val_logit_std_all'], '{:.3f}')}  "
-        f"pos_rate(mask)={format_metric(test_metrics['val_pos_rate_masked'], '{:.3%}')}  "
-        f"logit_mean(mask)={format_metric(test_metrics['val_logit_mean_masked'], '{:.3f}')}  "
-        f"logit_std(mask)={format_metric(test_metrics['val_logit_std_masked'], '{:.3f}')}")
+        f"[test_diag] pos_rate(all)={format_metric(test_metrics['pos_rate_unmasked'], '{:.3%}')}  "
+        f"logit_mean(all)={format_metric(test_metrics['logit_mean_unmasked'], '{:.3f}')}  "
+        f"logit_std(all)={format_metric(test_metrics['logit_std_unmasked'], '{:.3f}')}  "
+        f"pos_rate(mask)={format_metric(test_metrics['pos_rate_masked'], '{:.3%}')}  "
+        f"logit_mean(mask)={format_metric(test_metrics['logit_mean_masked'], '{:.3f}')}  "
+        f"logit_std(mask)={format_metric(test_metrics['logit_std_masked'], '{:.3f}')}")
 
     print(
-        f"[eval_full] BCE(all)={format_metric(eval_metrics['val_bce_unmasked'], '{:.4e}')}  "
-        f"Acc(all)={format_metric(eval_metrics['val_acc'], '{:.4f}')}  "
-        f"AUC(all)={format_metric(eval_metrics['val_auc'], '{:.4f}')}")
+        f"[eval_full] BCE(all)={format_metric(eval_metrics['bce_unmasked'], '{:.4e}')}  "
+        f"Acc(all)={format_metric(eval_metrics['acc_unmasked'], '{:.4f}')}  "
+        f"AUC(all)={format_metric(eval_metrics['auc_unmasked'], '{:.4f}')}")
     print(
-        f"  BCE(mask)={format_metric(eval_metrics['val_bce_masked'], '{:.4e}')}  "
-        f"Acc(mask)={format_metric(eval_metrics['val_acc_masked'], '{:.4f}')}  "
-        f"AUC(mask)={format_metric(eval_metrics['val_auc_masked'], '{:.4f}')}")
+        f"  BCE(mask)={format_metric(eval_metrics['bce_masked'], '{:.4e}')}  "
+        f"Acc(mask)={format_metric(eval_metrics['acc_masked'], '{:.4f}')}  "
+        f"AUC(mask)={format_metric(eval_metrics['auc_masked'], '{:.4f}')}")
     print(
-        f"[eval_full_diag] pos_rate(all)={format_metric(eval_metrics['val_pos_rate_all'], '{:.3%}')}  "
-        f"logit_mean(all)={format_metric(eval_metrics['val_logit_mean_all'], '{:.3f}')}  "
-        f"logit_std(all)={format_metric(eval_metrics['val_logit_std_all'], '{:.3f}')}  "
-        f"pos_rate(mask)={format_metric(eval_metrics['val_pos_rate_masked'], '{:.3%}')}  "
-        f"logit_mean(mask)={format_metric(eval_metrics['val_logit_mean_masked'], '{:.3f}')}  "
-        f"logit_std(mask)={format_metric(eval_metrics['val_logit_std_masked'], '{:.3f}')}")
+        f"[eval_full_diag] pos_rate(all)={format_metric(eval_metrics['pos_rate_unmasked'], '{:.3%}')}  "
+        f"logit_mean(all)={format_metric(eval_metrics['logit_mean_unmasked'], '{:.3f}')}  "
+        f"logit_std(all)={format_metric(eval_metrics['logit_std_unmasked'], '{:.3f}')}  "
+        f"pos_rate(mask)={format_metric(eval_metrics['pos_rate_masked'], '{:.3%}')}  "
+        f"logit_mean(mask)={format_metric(eval_metrics['logit_mean_masked'], '{:.3f}')}  "
+        f"logit_std(mask)={format_metric(eval_metrics['logit_std_masked'], '{:.3f}')}")
 
     _print_logit_diag_compact("val", val_metrics)
     _print_logit_diag_compact("test", test_metrics)
