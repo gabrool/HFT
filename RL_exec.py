@@ -3790,9 +3790,18 @@ def _init_market_policy_mean_head(model: MarketPolicyValueNet, env: MarketMaking
         feature_layout = env._feature_layout
         skip_weight = model.policy_net.linear_skip.weight
         skip_bias = model.policy_net.linear_skip.bias
-        skip_weight[2, feature_layout["weighted_cmssl_logit"].start] = 0.30
-        skip_weight[2, feature_layout["abs_weighted_cmssl_logit"].start] = 0.00
-        skip_bias[2] = 0.0
+        dir_slice = feature_layout["dir_logits"]
+        p_up_slice = feature_layout["p_up"]
+        short_idx = 0
+        mid_idx = env._num_h // 2
+        long_idx = env._num_h - 1
+        skip_weight[2, dir_slice.start + short_idx] = 0.04
+        skip_weight[2, dir_slice.start + mid_idx] = 0.08
+        skip_weight[2, dir_slice.start + long_idx] = 0.22
+        skip_weight[2, p_up_slice.start + short_idx] = 0.02
+        skip_weight[2, p_up_slice.start + mid_idx] = 0.04
+        skip_weight[2, p_up_slice.start + long_idx] = 0.08
+        skip_bias[2] = -0.07
         skip_weight[0, env._obs_extra_slice.start + 0] = -0.25
         skip_bias[0] = 0.0
 
