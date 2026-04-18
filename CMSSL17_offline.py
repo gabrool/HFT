@@ -63,8 +63,28 @@ CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
+WEIGHTED_SIGNAL_HORIZON_WEIGHTS_ENV = "BYBIT_MM_SIGNAL_HORIZON_LOGIT_WEIGHTS"
+WEIGHTED_SIGNAL_HORIZON_WEIGHTS_DEFAULT = (0.0, 0.0, 1.0)
+TOPK_FRACTIONS: Tuple[float, ...] = (0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00)
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
+
+
+def _env_float_tuple(name: str, default: Tuple[float, ...]) -> Tuple[float, ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return tuple(float(v) for v in default)
+    values = tuple(float(item.strip()) for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError(f"{name} must contain at least one float value.")
+    return values
+
+
+def _resolve_fixed_horizon_logit_weights(name: str, default: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    values = _env_float_tuple(name, default)
+    if len(values) != 3:
+        raise ValueError(f"{name} must provide exactly 3 comma-separated floats for horizons [250,500,1000].")
+    return (float(values[0]), float(values[1]), float(values[2]))
 
 def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
     if "splits" not in meta:
@@ -777,31 +797,33 @@ def _json_default(obj):
     return obj
 
 
-def build_logit_diagnostics_for_horizon(
-    logits_h: np.ndarray,
-    y_ret_h: np.ndarray,
-    mask_h: np.ndarray,
+def _normalized_state_dict_keys(state: dict) -> dict:
+    return {
+        key[7:] if isinstance(key, str) and key.startswith("module.") else key: value
+        for key, value in state.items()
+    }
+
+
+def _resolve_state_dict_target(model: torch.nn.Module) -> torch.nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def _compute_partitions(
+    y_ret: np.ndarray,
+    provided_mask: np.ndarray,
+    *,
     pos_lo: float,
     pos_hi: float,
     neg_lo: float,
     neg_hi: float,
-    horizon_ms: int,
     split_name: str,
-) -> Tuple[dict, List[dict], List[dict], List[dict]]:
-    logit = np.asarray(logits_h, dtype=np.float64).reshape(-1)
-    r = np.asarray(y_ret_h, dtype=np.float64).reshape(-1)
-    provided_mask = np.asarray(mask_h, dtype=bool).reshape(-1)
-    if not (logit.size == r.size == provided_mask.size):
-        raise ValueError(f"Shape mismatch in diagnostics for split={split_name} horizon={horizon_ms}")
-
+    label: str,
+) -> dict:
+    r = np.asarray(y_ret, dtype=np.float64).reshape(-1)
+    pm = np.asarray(provided_mask, dtype=bool).reshape(-1)
+    if r.size != pm.size:
+        raise ValueError(f"Shape mismatch in diagnostics for split={split_name} {label}")
     a = np.abs(r)
-    abs_logit = np.abs(logit)
-    p_up = 1.0 / (1.0 + np.exp(-np.clip(logit, -50.0, 50.0)))
-    conf = np.abs(p_up - 0.5) * 2.0
-    pred_sign = np.where(logit >= 0.0, 1.0, -1.0)
-    realized_sign = np.where(r > 0.0, 1.0, np.where(r < 0.0, -1.0, 0.0))
-    sign_aligned_return = pred_sign * r
-
     is_zero = (r == 0.0)
     is_pos = (r > 0.0)
     is_neg = (r < 0.0)
@@ -816,15 +838,150 @@ def build_logit_diagnostics_for_horizon(
     is_high_tail = is_pos_high | is_neg_high
     is_nonzero_unmasked = (~is_masked) & (~is_zero)
     is_dead = is_zero | is_low_tail
-
-    if not np.array_equal(is_masked, provided_mask):
-        raise ValueError(f"Mask mismatch in diagnostics for split={split_name} horizon={horizon_ms}")
-
+    if not np.array_equal(is_masked, pm):
+        raise ValueError(f"Mask mismatch in diagnostics for split={split_name} {label}")
     partition_stack = np.stack(
         [is_zero, is_pos_low, is_pos_kept, is_pos_high, is_neg_low, is_neg_kept, is_neg_high], axis=0
     )
     if not np.all(np.sum(partition_stack.astype(np.int32), axis=0) == 1):
-        raise ValueError(f"Partition coverage mismatch in diagnostics for split={split_name} horizon={horizon_ms}")
+        raise ValueError(f"Partition coverage mismatch in diagnostics for split={split_name} {label}")
+    return {
+        "r": r,
+        "a": a,
+        "is_zero": is_zero,
+        "is_pos": is_pos,
+        "is_neg": is_neg,
+        "is_masked": is_masked,
+        "is_low_tail": is_low_tail,
+        "is_high_tail": is_high_tail,
+        "is_nonzero_unmasked": is_nonzero_unmasked,
+        "is_dead": is_dead,
+    }
+
+
+def _build_topk_abs_by_side_rows(
+    *,
+    split_name: str,
+    horizon_label: str,
+    logit: np.ndarray,
+    abs_logit: np.ndarray,
+    r: np.ndarray,
+    a: np.ndarray,
+    conf: np.ndarray,
+    is_masked: np.ndarray,
+    is_zero: np.ndarray,
+    is_low_tail: np.ndarray,
+    is_high_tail: np.ndarray,
+    is_dead: np.ndarray,
+) -> List[dict]:
+    pred_sign = np.where(logit >= 0.0, 1.0, -1.0)
+    realized_sign = np.where(r > 0.0, 1.0, np.where(r < 0.0, -1.0, 0.0))
+    sign_aligned_return = pred_sign * r
+    side_rows: List[dict] = []
+    side_defs = [("pred_up", logit >= 0.0), ("pred_down", logit < 0.0)]
+    for side_name, side_mask in side_defs:
+        n_side = int(np.count_nonzero(side_mask))
+        if n_side == 0:
+            raise ValueError(
+                f"Side-restricted diagnostics empty for split={split_name} horizon={horizon_label} side={side_name}"
+            )
+        side_score = abs_logit[side_mask]
+        for frac in TOPK_FRACTIONS:
+            side_topk = _topk_mask_from_score(side_score, frac=frac)
+            selected = np.zeros_like(side_mask, dtype=bool)
+            selected[np.flatnonzero(side_mask)[side_topk]] = True
+            n_selected = int(np.count_nonzero(selected))
+            if n_selected == 0:
+                raise ValueError(
+                    f"Side top-k selection empty for split={split_name} horizon={horizon_label} side={side_name} frac={frac}"
+                )
+            nz = selected & (r != 0.0)
+            side_rows.append({
+                "split_name": split_name,
+                "horizon": horizon_label,
+                "side": side_name,
+                "frac_selected": float(frac),
+                "n": n_selected,
+                "threshold_abs_logit_min": _safe_quantile(abs_logit[selected], 0.0),
+                "mean_abs_logit": _safe_mean(abs_logit[selected]),
+                "mean_signed_return": _safe_mean(r[selected]),
+                "mean_abs_return": _safe_mean(a[selected]),
+                "masked_frac": _safe_frac(is_masked[selected]),
+                "zero_frac": _safe_frac(is_zero[selected]),
+                "low_tail_frac": _safe_frac(is_low_tail[selected]),
+                "high_tail_frac": _safe_frac(is_high_tail[selected]),
+                "dead_frac": _safe_frac(is_dead[selected]),
+                "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+                "mean_sign_aligned_return": _safe_mean(sign_aligned_return[selected]),
+                "mean_conf": _safe_mean(conf[selected]),
+            })
+    return side_rows
+
+
+def _compute_weighted_signal(logits: np.ndarray, weights: np.ndarray, *, split_name: str) -> dict:
+    logits_2d = np.asarray(logits, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if logits_2d.ndim != 2:
+        raise ValueError(f"Expected 2D logits for weighted diagnostics, got shape={logits_2d.shape} split={split_name}")
+    if logits_2d.shape[1] != w.size:
+        raise ValueError(
+            f"Weighted diagnostics shape mismatch for split={split_name}: logits shape={logits_2d.shape} weights_len={w.size}"
+        )
+    weighted = np.sum(logits_2d * w.reshape(1, -1), axis=1)
+    p_up_weighted = 1.0 / (1.0 + np.exp(-np.clip(weighted, -50.0, 50.0)))
+    abs_weighted = np.abs(weighted)
+    conf_weighted = np.abs(p_up_weighted - 0.5) * 2.0
+    return {
+        "weighted_cmssl_logit": weighted,
+        "abs_weighted_cmssl_logit": abs_weighted,
+        "p_up_weighted": p_up_weighted,
+        "conf_weighted": conf_weighted,
+    }
+
+
+def build_logit_diagnostics_for_horizon(
+    logits_h: np.ndarray,
+    y_ret_h: np.ndarray,
+    mask_h: np.ndarray,
+    pos_lo: float,
+    pos_hi: float,
+    neg_lo: float,
+    neg_hi: float,
+    horizon_ms: int,
+    split_name: str,
+) -> Tuple[dict, List[dict], List[dict], List[dict], List[dict]]:
+    logit = np.asarray(logits_h, dtype=np.float64).reshape(-1)
+    r = np.asarray(y_ret_h, dtype=np.float64).reshape(-1)
+    provided_mask = np.asarray(mask_h, dtype=bool).reshape(-1)
+    if not (logit.size == r.size == provided_mask.size):
+        raise ValueError(f"Shape mismatch in diagnostics for split={split_name} horizon={horizon_ms}")
+
+    abs_logit = np.abs(logit)
+    p_up = 1.0 / (1.0 + np.exp(-np.clip(logit, -50.0, 50.0)))
+    conf = np.abs(p_up - 0.5) * 2.0
+    parts = _compute_partitions(
+        y_ret=r,
+        provided_mask=provided_mask,
+        pos_lo=pos_lo,
+        pos_hi=pos_hi,
+        neg_lo=neg_lo,
+        neg_hi=neg_hi,
+        split_name=split_name,
+        label=f"horizon={horizon_ms}",
+    )
+    r = parts["r"]
+    a = parts["a"]
+    is_zero = parts["is_zero"]
+    is_pos = parts["is_pos"]
+    is_neg = parts["is_neg"]
+    is_masked = parts["is_masked"]
+    is_low_tail = parts["is_low_tail"]
+    is_high_tail = parts["is_high_tail"]
+    is_nonzero_unmasked = parts["is_nonzero_unmasked"]
+    is_dead = parts["is_dead"]
+    pred_sign = np.where(logit >= 0.0, 1.0, -1.0)
+    realized_sign = np.where(r > 0.0, 1.0, np.where(r < 0.0, -1.0, 0.0))
+    sign_aligned_return = pred_sign * r
 
     def _part_stats(part_mask: np.ndarray) -> dict:
         return {
@@ -989,7 +1146,7 @@ def build_logit_diagnostics_for_horizon(
         })
 
     topk_rows: List[dict] = []
-    for frac in [0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00]:
+    for frac in TOPK_FRACTIONS:
         km = _topk_mask_from_score(abs_logit, frac=frac)
         nz = km & (r != 0.0)
         threshold = _safe_quantile(abs_logit[km], 0.0)
@@ -1012,13 +1169,251 @@ def build_logit_diagnostics_for_horizon(
             "mean_conf": _safe_mean(conf[km]),
         })
 
-    return summary, signed_rows, abs_rows, topk_rows
+    side_topk_rows = _build_topk_abs_by_side_rows(
+        split_name=split_name,
+        horizon_label=f"{int(horizon_ms)}",
+        logit=logit,
+        abs_logit=abs_logit,
+        r=r,
+        a=a,
+        conf=conf,
+        is_masked=is_masked,
+        is_zero=is_zero,
+        is_low_tail=is_low_tail,
+        is_high_tail=is_high_tail,
+        is_dead=is_dead,
+    )
+
+    return summary, signed_rows, abs_rows, topk_rows, side_topk_rows
+
+
+def build_weighted_logit_diagnostics(
+    *,
+    logits_all_h: np.ndarray,
+    y_ret_primary: np.ndarray,
+    mask_primary: np.ndarray,
+    pos_lo: float,
+    pos_hi: float,
+    neg_lo: float,
+    neg_hi: float,
+    split_name: str,
+    horizon_weights: np.ndarray,
+) -> Tuple[dict, List[dict], List[dict], List[dict], List[dict]]:
+    weighted_signal = _compute_weighted_signal(logits_all_h, horizon_weights, split_name=split_name)
+    weighted_logit = weighted_signal["weighted_cmssl_logit"]
+    abs_weighted_logit = weighted_signal["abs_weighted_cmssl_logit"]
+    conf_weighted = weighted_signal["conf_weighted"]
+    parts = _compute_partitions(
+        y_ret=y_ret_primary,
+        provided_mask=mask_primary,
+        pos_lo=pos_lo,
+        pos_hi=pos_hi,
+        neg_lo=neg_lo,
+        neg_hi=neg_hi,
+        split_name=split_name,
+        label="weighted_primary",
+    )
+    r = parts["r"]
+    a = parts["a"]
+    is_zero = parts["is_zero"]
+    is_masked = parts["is_masked"]
+    is_low_tail = parts["is_low_tail"]
+    is_high_tail = parts["is_high_tail"]
+    is_nonzero_unmasked = parts["is_nonzero_unmasked"]
+    is_dead = parts["is_dead"]
+
+    pred_sign = np.where(weighted_logit >= 0.0, 1.0, -1.0)
+    realized_sign = np.where(r > 0.0, 1.0, np.where(r < 0.0, -1.0, 0.0))
+    sign_aligned_return = pred_sign * r
+
+    def _part_stats(part_mask: np.ndarray) -> dict:
+        return {
+            "mean_abs_weighted_cmssl_logit": _safe_mean(abs_weighted_logit[part_mask]),
+            "median_abs_weighted_cmssl_logit": _safe_median(abs_weighted_logit[part_mask]),
+            "p75_abs_weighted_cmssl_logit": _safe_quantile(abs_weighted_logit[part_mask], 0.75),
+            "p90_abs_weighted_cmssl_logit": _safe_quantile(abs_weighted_logit[part_mask], 0.90),
+            "mean_conf_weighted": _safe_mean(conf_weighted[part_mask]),
+        }
+
+    summary: dict = {
+        "split_name": split_name,
+        "signal_name": "weighted_primary",
+        "horizon_weights": [float(v) for v in horizon_weights],
+        "n_all": int(weighted_logit.size),
+        "frac_zero": _safe_frac(is_zero),
+        "frac_masked": _safe_frac(is_masked),
+        "frac_low_tail": _safe_frac(is_low_tail),
+        "frac_high_tail": _safe_frac(is_high_tail),
+        "frac_nonzero_unmasked": _safe_frac(is_nonzero_unmasked),
+        "frac_dead": _safe_frac(is_dead),
+        "mean_sign_aligned_return_all": _safe_mean(sign_aligned_return),
+        "mean_sign_aligned_return_nonzero": _safe_mean(sign_aligned_return[r != 0.0]),
+        "sign_accuracy_nonzero": _safe_mean((pred_sign[r != 0.0] == realized_sign[r != 0.0]).astype(np.float64)),
+        "pearson_abs_weighted_cmssl_logit_abs_return_all": _safe_pearson(abs_weighted_logit, a),
+        "spearman_abs_weighted_cmssl_logit_abs_return_all": _safe_spearman(abs_weighted_logit, a),
+        "pearson_conf_weighted_abs_return_all": _safe_pearson(conf_weighted, a),
+        "spearman_conf_weighted_abs_return_all": _safe_spearman(conf_weighted, a),
+    }
+    partitions = {
+        "all": np.ones_like(is_zero, dtype=bool),
+        "masked": is_masked,
+        "zero": is_zero,
+        "low_tail": is_low_tail,
+        "high_tail": is_high_tail,
+        "dead": is_dead,
+        "nonzero_unmasked": is_nonzero_unmasked,
+    }
+    for name, pm in partitions.items():
+        for k, v in _part_stats(pm).items():
+            summary[f"{k}_{name}"] = v
+    summary["masked_vs_zero_mean_abs_weighted_cmssl_logit_ratio"] = _safe_ratio(
+        summary["mean_abs_weighted_cmssl_logit_masked"],
+        summary["mean_abs_weighted_cmssl_logit_zero"],
+    )
+    summary["masked_vs_dead_mean_abs_weighted_cmssl_logit_ratio"] = _safe_ratio(
+        summary["mean_abs_weighted_cmssl_logit_masked"],
+        summary["mean_abs_weighted_cmssl_logit_dead"],
+    )
+    summary["masked_vs_low_tail_mean_abs_weighted_cmssl_logit_ratio"] = _safe_ratio(
+        summary["mean_abs_weighted_cmssl_logit_masked"],
+        summary["mean_abs_weighted_cmssl_logit_low_tail"],
+    )
+
+    def _auc_between(score: np.ndarray, a_mask: np.ndarray, b_mask: np.ndarray) -> float:
+        use = a_mask | b_mask
+        if np.count_nonzero(a_mask) == 0 or np.count_nonzero(b_mask) == 0:
+            return float("nan")
+        t = np.where(a_mask[use], 1.0, 0.0)
+        return _binary_auc_from_score(score[use], t)
+
+    summary["auc_abs_weighted_cmssl_logit_masked_vs_dead"] = _auc_between(abs_weighted_logit, is_masked, is_dead)
+    summary["auc_abs_weighted_cmssl_logit_masked_vs_zero"] = _auc_between(abs_weighted_logit, is_masked, is_zero)
+    summary["auc_abs_weighted_cmssl_logit_masked_vs_low_tail"] = _auc_between(abs_weighted_logit, is_masked, is_low_tail)
+
+    signed_rows: List[dict] = []
+    signed_edges = _quantile_bin_edges(weighted_logit, n_bins=10)
+    signed_bins = _assign_bins(weighted_logit, signed_edges)
+    for bi in range(signed_edges.size - 1):
+        bm = (signed_bins == bi)
+        nz = bm & (r != 0.0)
+        signed_rows.append({
+            "split_name": split_name,
+            "horizon": "weighted_primary",
+            "bin_kind": "weighted_signed_logit_decile",
+            "bin_index": int(bi),
+            "bin_left": float(signed_edges[bi]),
+            "bin_right": float(signed_edges[bi + 1]),
+            "n": int(np.count_nonzero(bm)),
+            "frac_of_split": _safe_frac(bm),
+            "mean_weighted_cmssl_logit": _safe_mean(weighted_logit[bm]),
+            "mean_abs_weighted_cmssl_logit": _safe_mean(abs_weighted_logit[bm]),
+            "mean_signed_return": _safe_mean(r[bm]),
+            "mean_abs_return": _safe_mean(a[bm]),
+            "masked_frac": _safe_frac(is_masked[bm]),
+            "zero_frac": _safe_frac(is_zero[bm]),
+            "low_tail_frac": _safe_frac(is_low_tail[bm]),
+            "high_tail_frac": _safe_frac(is_high_tail[bm]),
+            "dead_frac": _safe_frac(is_dead[bm]),
+            "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+            "mean_sign_aligned_return": _safe_mean(sign_aligned_return[bm]),
+            "mean_conf": _safe_mean(conf_weighted[bm]),
+        })
+
+    abs_rows: List[dict] = []
+    abs_edges = _quantile_bin_edges(abs_weighted_logit, n_bins=10)
+    abs_bins = _assign_bins(abs_weighted_logit, abs_edges)
+    for bi in range(abs_edges.size - 1):
+        bm = (abs_bins == bi)
+        nz = bm & (r != 0.0)
+        abs_rows.append({
+            "split_name": split_name,
+            "horizon": "weighted_primary",
+            "bin_kind": "weighted_abs_logit_decile",
+            "bin_index": int(bi),
+            "bin_left": float(abs_edges[bi]),
+            "bin_right": float(abs_edges[bi + 1]),
+            "n": int(np.count_nonzero(bm)),
+            "frac_of_split": _safe_frac(bm),
+            "mean_abs_weighted_cmssl_logit": _safe_mean(abs_weighted_logit[bm]),
+            "mean_signed_return": _safe_mean(r[bm]),
+            "mean_abs_return": _safe_mean(a[bm]),
+            "masked_frac": _safe_frac(is_masked[bm]),
+            "zero_frac": _safe_frac(is_zero[bm]),
+            "low_tail_frac": _safe_frac(is_low_tail[bm]),
+            "high_tail_frac": _safe_frac(is_high_tail[bm]),
+            "dead_frac": _safe_frac(is_dead[bm]),
+            "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+            "mean_sign_aligned_return": _safe_mean(sign_aligned_return[bm]),
+            "mean_conf": _safe_mean(conf_weighted[bm]),
+        })
+
+    topk_rows: List[dict] = []
+    for frac in TOPK_FRACTIONS:
+        km = _topk_mask_from_score(abs_weighted_logit, frac=frac)
+        nz = km & (r != 0.0)
+        topk_rows.append({
+            "split_name": split_name,
+            "horizon": "weighted_primary",
+            "frac_selected": float(frac),
+            "n": int(np.count_nonzero(km)),
+            "threshold_abs_logit_min": _safe_quantile(abs_weighted_logit[km], 0.0),
+            "mean_abs_weighted_cmssl_logit": _safe_mean(abs_weighted_logit[km]),
+            "mean_signed_return": _safe_mean(r[km]),
+            "mean_abs_return": _safe_mean(a[km]),
+            "masked_frac": _safe_frac(is_masked[km]),
+            "zero_frac": _safe_frac(is_zero[km]),
+            "low_tail_frac": _safe_frac(is_low_tail[km]),
+            "high_tail_frac": _safe_frac(is_high_tail[km]),
+            "dead_frac": _safe_frac(is_dead[km]),
+            "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+            "mean_sign_aligned_return": _safe_mean(sign_aligned_return[km]),
+            "mean_conf": _safe_mean(conf_weighted[km]),
+        })
+
+    side_topk_rows = _build_topk_abs_by_side_rows(
+        split_name=split_name,
+        horizon_label="weighted_primary",
+        logit=weighted_logit,
+        abs_logit=abs_weighted_logit,
+        r=r,
+        a=a,
+        conf=conf_weighted,
+        is_masked=is_masked,
+        is_zero=is_zero,
+        is_low_tail=is_low_tail,
+        is_high_tail=is_high_tail,
+        is_dead=is_dead,
+    )
+    return summary, signed_rows, abs_rows, topk_rows, side_topk_rows
 
 
 def get_model_state_dict_for_ckpt(model: torch.nn.Module) -> dict:
     if hasattr(model, "_orig_mod"):
         return model._orig_mod.state_dict()
     return model.state_dict()
+
+
+def load_model_state_dict_strict(model: torch.nn.Module, state: dict) -> None:
+    if not isinstance(state, dict):
+        raise TypeError("Checkpoint state_dict must be a mapping.")
+    target_module = _resolve_state_dict_target(model)
+    model_state = target_module.state_dict()
+    normalized_state = _normalized_state_dict_keys(state)
+    missing_model_keys = [k for k in model_state.keys() if k not in normalized_state]
+    unexpected_model_keys = [k for k in normalized_state.keys() if k not in model_state]
+    if missing_model_keys:
+        raise RuntimeError(
+            "Checkpoint missing model keys: "
+            + ", ".join(missing_model_keys[:10])
+            + (" ..." if len(missing_model_keys) > 10 else "")
+        )
+    if unexpected_model_keys:
+        raise RuntimeError(
+            "Checkpoint has unexpected model keys: "
+            + ", ".join(unexpected_model_keys[:10])
+            + (" ..." if len(unexpected_model_keys) > 10 else "")
+        )
+    target_module.load_state_dict(normalized_state, strict=True)
 
 # ---------------- Train/Eval ----------------
 def train_from_offline():
@@ -1288,8 +1683,13 @@ def train_from_offline():
         print(f"[dir-mask-cache] saved path={quantile_cache_path}")
     build_directional_noise_filter_mask = make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi)
     horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
-    horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
-    horizon_weights_np = horizon_weights_cpu.numpy()
+    weighted_horizon_logit_weights = np.asarray(
+        _resolve_fixed_horizon_logit_weights(
+            WEIGHTED_SIGNAL_HORIZON_WEIGHTS_ENV,
+            WEIGHTED_SIGNAL_HORIZON_WEIGHTS_DEFAULT,
+        ),
+        dtype=np.float64,
+    )
     compute_directional_loss = compute_directional_loss_fn(build_directional_noise_filter_mask, horizon_weights)
 
     def format_metric(values: Iterable[float], fmt: str) -> str:
@@ -1369,6 +1769,7 @@ def train_from_offline():
         ypos_masked = [[] for _ in range(NUM_HORIZONS)]
         yret_all = [[] for _ in range(NUM_HORIZONS)]
         mask_all = [[] for _ in range(NUM_HORIZONS)]
+        logits_matrix_all: List[torch.Tensor] = []
         bce_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
         bce_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
         bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
@@ -1393,6 +1794,7 @@ def train_from_offline():
                     bce_elem = F.binary_cross_entropy_with_logits(dir_logits, y_dir, reduction='none')
 
                 dir_logits_metrics = dir_logits.detach().float()
+                logits_matrix_all.append(dir_logits_metrics.detach().cpu())
                 bce_elem_fp32 = bce_elem.detach().float()
                 y_dir_metrics = y_dir.detach()
                 noise_filter_mask_metrics = noise_filter_mask.detach()
@@ -1440,6 +1842,12 @@ def train_from_offline():
         logit_diag_signed_bins_rows: List[dict] = []
         logit_diag_abs_bins_rows: List[dict] = []
         logit_diag_topk_rows: List[dict] = []
+        logit_diag_topk_by_side_rows: List[dict] = []
+        weighted_diag_summary: Optional[dict] = None
+        weighted_diag_signed_bins_rows: List[dict] = []
+        weighted_diag_abs_bins_rows: List[dict] = []
+        weighted_diag_topk_rows: List[dict] = []
+        weighted_diag_topk_by_side_rows: List[dict] = []
 
         for h_idx in ([primary_horizon_idx] if primary_only else range(NUM_HORIZONS)):
             if bce_count[h_idx] > 0:
@@ -1466,7 +1874,7 @@ def train_from_offline():
                 logits_h_np = torch.cat(logits_all[h_idx], dim=0).view(-1).numpy()
                 y_ret_h_np = torch.cat(yret_all[h_idx], dim=0).view(-1).numpy()
                 mask_h_np = torch.cat(mask_all[h_idx], dim=0).view(-1).numpy().astype(bool)
-                summary_h, signed_rows_h, abs_rows_h, topk_rows_h = build_logit_diagnostics_for_horizon(
+                summary_h, signed_rows_h, abs_rows_h, topk_rows_h, topk_side_rows_h = build_logit_diagnostics_for_horizon(
                     logits_h=logits_h_np,
                     y_ret_h=y_ret_h_np,
                     mask_h=mask_h_np,
@@ -1481,6 +1889,34 @@ def train_from_offline():
                 logit_diag_signed_bins_rows.extend(signed_rows_h)
                 logit_diag_abs_bins_rows.extend(abs_rows_h)
                 logit_diag_topk_rows.extend(topk_rows_h)
+                logit_diag_topk_by_side_rows.extend(topk_side_rows_h)
+
+        if (not primary_only) and logits_matrix_all:
+            logits_all_np = torch.cat(logits_matrix_all, dim=0).numpy()
+            y_ret_primary_np = torch.cat(yret_all[primary_horizon_idx], dim=0).view(-1).numpy()
+            mask_primary_np = torch.cat(mask_all[primary_horizon_idx], dim=0).view(-1).numpy().astype(bool)
+            if logits_all_np.shape[0] != y_ret_primary_np.shape[0]:
+                raise ValueError(
+                    f"Weighted diagnostics shape mismatch for split={split_name}: "
+                    f"logits_rows={logits_all_np.shape[0]} primary_targets={y_ret_primary_np.shape[0]}"
+                )
+            (
+                weighted_diag_summary,
+                weighted_diag_signed_bins_rows,
+                weighted_diag_abs_bins_rows,
+                weighted_diag_topk_rows,
+                weighted_diag_topk_by_side_rows,
+            ) = build_weighted_logit_diagnostics(
+                logits_all_h=logits_all_np,
+                y_ret_primary=y_ret_primary_np,
+                mask_primary=mask_primary_np,
+                pos_lo=float(pos_lo[primary_horizon_idx]),
+                pos_hi=float(pos_hi[primary_horizon_idx]),
+                neg_lo=float(neg_lo[primary_horizon_idx]),
+                neg_hi=float(neg_hi[primary_horizon_idx]),
+                split_name=split_name,
+                horizon_weights=weighted_horizon_logit_weights,
+            )
 
         primary_metric_value, primary_metric_label = compute_primary_metric(auc_masked)
         return {
@@ -1505,6 +1941,13 @@ def train_from_offline():
             "logit_diag_signed_bins_rows": logit_diag_signed_bins_rows,
             "logit_diag_abs_bins_rows": logit_diag_abs_bins_rows,
             "logit_diag_topk_rows": logit_diag_topk_rows,
+            "logit_diag_topk_by_side_rows": logit_diag_topk_by_side_rows,
+            "weighted_logit_diag_summary": weighted_diag_summary,
+            "weighted_logit_diag_signed_bins_rows": weighted_diag_signed_bins_rows,
+            "weighted_logit_diag_abs_bins_rows": weighted_diag_abs_bins_rows,
+            "weighted_logit_diag_topk_rows": weighted_diag_topk_rows,
+            "weighted_logit_diag_topk_by_side_rows": weighted_diag_topk_by_side_rows,
+            "weighted_logit_diag_horizon_weights": weighted_horizon_logit_weights,
         }
 
     def run_validation(*, full_metrics: bool) -> dict:
@@ -1526,23 +1969,47 @@ def train_from_offline():
 
     def _save_logit_diag_bundle(split: str, metrics: dict) -> None:
         summary_path = out_root / f"cmssl_logit_diagnostics_{split}.json"
-        signed_path = out_root / f"cmssl_logit_signed_logit_bins_{split}.csv"
-        abs_path = out_root / f"cmssl_logit_abs_logit_bins_{split}.csv"
-        topk_path = out_root / f"cmssl_logit_topk_abs_logit_{split}.csv"
+        signed_path = out_root / f"cmssl_logit_signed_bins_{split}.csv"
+        abs_path = out_root / f"cmssl_logit_abs_bins_{split}.csv"
+        topk_path = out_root / f"cmssl_logit_topk_abs_{split}.csv"
+        topk_side_path = out_root / f"cmssl_logit_topk_abs_by_side_{split}.csv"
+        weighted_summary_path = out_root / f"cmssl_logit_diagnostics_weighted_{split}.json"
+        weighted_signed_path = out_root / f"cmssl_logit_weighted_signed_bins_{split}.csv"
+        weighted_abs_path = out_root / f"cmssl_logit_weighted_abs_bins_{split}.csv"
+        weighted_topk_path = out_root / f"cmssl_logit_weighted_topk_abs_{split}.csv"
+        weighted_topk_side_path = out_root / f"cmssl_logit_weighted_topk_abs_by_side_{split}.csv"
         payload = {
             "split": split,
             "horizons_ms": [int(h) for h in HORIZONS_MS],
             "tail_fraction": float(DIR_MASK_TAIL_FRACTION),
             "summary_per_horizon": metrics["logit_diag_summary_per_h"],
         }
+        weighted_payload = {
+            "split": split,
+            "signal_name": "weighted_primary",
+            "primary_metric_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS),
+            "horizon_weights": [float(v) for v in metrics["weighted_logit_diag_horizon_weights"]],
+            "summary": metrics["weighted_logit_diag_summary"],
+        }
         with summary_path.open("w") as f:
             json.dump(payload, f, indent=2, default=_json_default)
+        with weighted_summary_path.open("w") as f:
+            json.dump(weighted_payload, f, indent=2, default=_json_default)
         _write_csv_rows(signed_path, metrics["logit_diag_signed_bins_rows"])
         _write_csv_rows(abs_path, metrics["logit_diag_abs_bins_rows"])
         _write_csv_rows(topk_path, metrics["logit_diag_topk_rows"])
+        _write_csv_rows(topk_side_path, metrics["logit_diag_topk_by_side_rows"])
+        _write_csv_rows(weighted_signed_path, metrics["weighted_logit_diag_signed_bins_rows"])
+        _write_csv_rows(weighted_abs_path, metrics["weighted_logit_diag_abs_bins_rows"])
+        _write_csv_rows(weighted_topk_path, metrics["weighted_logit_diag_topk_rows"])
+        _write_csv_rows(weighted_topk_side_path, metrics["weighted_logit_diag_topk_by_side_rows"])
         print(
             f"[logit_diag_saved][{split}] json={summary_path} signed_bins={signed_path} "
-            f"abs_bins={abs_path} topk={topk_path}"
+            f"abs_bins={abs_path} topk={topk_path} topk_by_side={topk_side_path}"
+        )
+        print(
+            f"[logit_diag_saved_weighted][{split}] json={weighted_summary_path} signed_bins={weighted_signed_path} "
+            f"abs_bins={weighted_abs_path} topk={weighted_topk_path} topk_by_side={weighted_topk_side_path}"
         )
 
     def _print_logit_diag_compact(split: str, metrics: dict) -> None:
@@ -1572,6 +2039,27 @@ def train_from_offline():
                 f"mean_sign_aligned_return_top10pct={float(top10.get('mean_sign_aligned_return', float('nan'))):.6f} "
                 f"masked_frac_top10pct={float(top10.get('masked_frac', float('nan'))):.4f} "
                 f"zero_frac_top10pct={float(top10.get('zero_frac', float('nan'))):.4f}"
+            )
+        w_summary = metrics.get("weighted_logit_diag_summary")
+        if isinstance(w_summary, dict):
+            w_top10 = next(
+                (
+                    row for row in metrics.get("weighted_logit_diag_topk_rows", [])
+                    if abs(float(row.get("frac_selected", -1.0)) - 0.10) < 1e-12
+                ),
+                {},
+            )
+            print(
+                f"[logit_diag_weighted][{split}] "
+                f"weights={w_summary.get('horizon_weights')} "
+                f"frac_masked={w_summary.get('frac_masked', float('nan')):.4f} "
+                f"frac_dead={w_summary.get('frac_dead', float('nan')):.4f} "
+                f"mean_abs_weighted_masked={w_summary.get('mean_abs_weighted_cmssl_logit_masked', float('nan')):.6f} "
+                f"mean_abs_weighted_dead={w_summary.get('mean_abs_weighted_cmssl_logit_dead', float('nan')):.6f} "
+                f"auc_abs_weighted_masked_vs_dead={w_summary.get('auc_abs_weighted_cmssl_logit_masked_vs_dead', float('nan')):.6f} "
+                f"pearson_abs_weighted_abs_return={w_summary.get('pearson_abs_weighted_cmssl_logit_abs_return_all', float('nan')):.6f} "
+                f"sign_acc_nonzero={w_summary.get('sign_accuracy_nonzero', float('nan')):.6f} "
+                f"mean_sign_aligned_return_top10pct={float(w_top10.get('mean_sign_aligned_return', float('nan'))):.6f}"
             )
 
     for epoch in range(EPOCHS):
@@ -1699,6 +2187,17 @@ def train_from_offline():
         # if no_imp > 50: break
 
     # ---------------- Final Split Evaluations ----------------
+    best_ckpt_path = out_root / "cmssl17_offline_best.pt"
+    if not best_ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Best checkpoint missing after training: {best_ckpt_path}. Cannot run final diagnostics."
+        )
+    best_ckpt = torch.load(best_ckpt_path, map_location=device)
+    best_state = best_ckpt["state_dict"] if isinstance(best_ckpt, dict) and "state_dict" in best_ckpt else best_ckpt
+    load_model_state_dict_strict(model, best_state)
+    model.eval()
+    print(f"[ckpt] reloaded best checkpoint for final diagnostics/export: {best_ckpt_path}")
+
     val_metrics = summarize_directional_metrics(dl_val, primary_only=False, split_name="val")
     test_metrics = summarize_directional_metrics(dl_test, primary_only=False, split_name="test")
     eval_metrics = summarize_directional_metrics(dl_eval, primary_only=False, split_name="eval_full")
@@ -1759,7 +2258,7 @@ def train_from_offline():
     _save_logit_diag_bundle("test", test_metrics)
     _save_logit_diag_bundle("eval_full", eval_metrics)
 
-    print("[done] Training complete.")
+    print("[done] Training complete. Final diagnostics exported from reloaded cmssl17_offline_best.pt.")
 
 # ---------------- Lightweight HFTDataset (when loading into RAM) ----------------
 class HFTDataset(Dataset):
