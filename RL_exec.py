@@ -49,7 +49,7 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "vol_short",
     "vol_long",
 ]
-FEATURE_EXTRA_DIM = 5
+FEATURE_EXTRA_DIM = 7
 ENV_OBS_EXTRA_STATE_DIM = 14
 DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
 DEFAULT_MM_QUOTE_HALF_SPREAD_FLOOR_BPS = 0.0050
@@ -80,7 +80,7 @@ MM_PPO_ACTION_SEMANTICS = (
 )
 # Inventory risk thresholds are denominated in quote notional (USD).
 JOINED_CACHE_SCHEMA_VERSION = 1
-JOINED_FEATURE_SCHEMA_VERSION = 1
+JOINED_FEATURE_SCHEMA_VERSION = 2
 
 class JoinedCacheError(RuntimeError):
     """Raised when joined cache artifacts are stale, corrupt, or invalid."""
@@ -685,6 +685,12 @@ class DirectQuoteConfig:
 
 
 @dataclass(frozen=True)
+class DirectionalSignalConfig:
+    horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
+    training_reward_horizon_ms: int = 1000
+
+
+@dataclass(frozen=True)
 class RolloutStartSamplingConfig:
     enabled: bool = False
     weighted_mix: float = 0.8
@@ -692,25 +698,23 @@ class RolloutStartSamplingConfig:
     score_epsilon: float = 1e-6
     lead_steps: int = 512
     start_exclusion_window: Optional[int] = None
-    horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
 
 @dataclass(frozen=True)
 class RewardShapingConfig:
     enabled: bool = True
-    horizon_logit_weights: Tuple[float, float, float] = (0.0, 0.0, 1.0)
     logit_tanh_scale: float = 12.0
-    skew_coef: float = 0.0025
+    skew_coef: float = 0.01
 
 
 @dataclass(frozen=True)
 class ContinuousMakerFillConfig:
-    activity_min: float = 0.02
-    activity_max: float = 0.18
-    tau_touch: float = 0.10
-    tau_cross: float = 0.08
-    touch_event_boost: float = 0.20
-    touch_event_distance_frac: float = 0.05
+    activity_min: float = 0.03
+    activity_max: float = 0.20
+    tau_touch: float = 0.12
+    tau_cross: float = 0.09
+    touch_event_boost: float = 0.15
+    touch_event_distance_frac: float = 0.10
     price_epsilon_px: float = 1e-9
 
 
@@ -772,12 +776,12 @@ def _fit_continuous_maker_fill_calibration_from_snapshots(
 
 def load_continuous_maker_fill_config() -> ContinuousMakerFillConfig:
     cfg = ContinuousMakerFillConfig(
-        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.02),
-        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.18),
-        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.10),
-        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.08),
-        touch_event_boost=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_BOOST", 0.20),
-        touch_event_distance_frac=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC", 0.05),
+        activity_min=_env_float("BYBIT_MM_FILL_ACTIVITY_MIN", 0.03),
+        activity_max=_env_float("BYBIT_MM_FILL_ACTIVITY_MAX", 0.20),
+        tau_touch=_env_float("BYBIT_MM_FILL_TAU_TOUCH", 0.12),
+        tau_cross=_env_float("BYBIT_MM_FILL_TAU_CROSS", 0.09),
+        touch_event_boost=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_BOOST", 0.15),
+        touch_event_distance_frac=_env_float("BYBIT_MM_FILL_TOUCH_EVENT_DISTANCE_FRAC", 0.10),
         price_epsilon_px=_env_float("BYBIT_MM_FILL_PRICE_EPSILON_PX", 1e-9),
     )
     if not np.isfinite(cfg.activity_min) or not np.isfinite(cfg.activity_max):
@@ -818,6 +822,25 @@ def _resolve_fixed_horizon_logit_weights(name: str, default: Tuple[float, float,
     return (float(values[0]), float(values[1]), float(values[2]))
 
 
+def load_directional_signal_config(meta: Dict[str, Any]) -> DirectionalSignalConfig:
+    horizons = [int(h) for h in meta.get("horizons_ms", [])]
+    _validate_fixed_cmssl_horizons(horizons)
+    weights = _resolve_fixed_horizon_logit_weights(
+        "BYBIT_MM_SIGNAL_HORIZON_LOGIT_WEIGHTS",
+        (0.0, 0.0, 1.0),
+    )
+    training_reward_horizon_ms = _env_int("BYBIT_MM_TRAIN_REWARD_HORIZON_MS", 1000)
+    if training_reward_horizon_ms not in horizons:
+        raise ValueError(
+            "BYBIT_MM_TRAIN_REWARD_HORIZON_MS must be one of meta['horizons_ms']: "
+            f"got={training_reward_horizon_ms} horizons={horizons}"
+        )
+    return DirectionalSignalConfig(
+        horizon_logit_weights=weights,
+        training_reward_horizon_ms=int(training_reward_horizon_ms),
+    )
+
+
 def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartSamplingConfig:
     safe_rollout_horizon = max(1, int(rollout_horizon))
     raw_start_exclusion_window = os.environ.get("BYBIT_MM_START_SAMPLING_EXCLUSION_WINDOW", "").strip()
@@ -835,10 +858,6 @@ def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartS
         score_epsilon=_env_float("BYBIT_MM_START_SAMPLING_SCORE_EPS", 1e-6),
         lead_steps=_env_int("BYBIT_MM_START_SAMPLING_LEAD_STEPS", 512),
         start_exclusion_window=resolved_start_exclusion_window,
-        horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
-            "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
-            (0.0, 0.0, 1.0),
-        ),
     )
     if not np.isfinite(cfg.weighted_mix) or cfg.weighted_mix < 0.0 or cfg.weighted_mix > 1.0:
         raise ValueError("BYBIT_MM_START_SAMPLING_WEIGHTED_MIX must be in [0, 1].")
@@ -858,7 +877,6 @@ def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartS
         score_epsilon=cfg.score_epsilon,
         lead_steps=cfg.lead_steps,
         start_exclusion_window=resolved_start_exclusion_window_int,
-        horizon_logit_weights=cfg.horizon_logit_weights,
     )
     return cfg
 
@@ -879,12 +897,8 @@ def load_reward_shaping_config() -> RewardShapingConfig:
         )
     cfg = RewardShapingConfig(
         enabled=_env_bool("BYBIT_MM_REWARD_SHAPING_ENABLE", True),
-        horizon_logit_weights=_resolve_fixed_horizon_logit_weights(
-            "BYBIT_MM_REWARD_SHAPING_HORIZON_LOGIT_WEIGHTS",
-            (0.0, 0.0, 1.0),
-        ),
         logit_tanh_scale=_env_float("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE", 12.0),
-        skew_coef=_env_float("BYBIT_MM_REWARD_SHAPING_SKEW_COEF", 0.0025),
+        skew_coef=_env_float("BYBIT_MM_REWARD_SHAPING_SKEW_COEF", 0.01),
     )
     if not np.isfinite(cfg.logit_tanh_scale) or cfg.logit_tanh_scale <= 0.0:
         raise ValueError("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE must be finite and > 0.")
@@ -903,7 +917,7 @@ def load_direct_quote_config() -> DirectQuoteConfig:
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
             touch_halfspread_mult=_env_float("BYBIT_MM_TOUCH_HALFSPREAD_MULT", 1.0),
-            wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 3.0),
+            wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 1.75),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
             inventory_center_weight=_env_float("BYBIT_MM_INVENTORY_CENTER_WEIGHT", 0.25),
             alpha_center_weight=_env_float("BYBIT_MM_ALPHA_CENTER_WEIGHT", 1.00),
@@ -1060,7 +1074,8 @@ def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, sl
     """Schema for join_features() tensor layout (excluding env extra state).
 
     Layout order:
-      [dir_logits(h), p_up(h), confidence/alignment scalars(5), snapshots(snapshot_dim)]
+      [dir_logits(h), p_up(h), confidence/alignment scalars(5),
+       weighted_cmssl_logit(1), abs_weighted_cmssl_logit(1), snapshots(snapshot_dim)]
     """
     offset = 0
     layout = {
@@ -1078,6 +1093,10 @@ def _joined_feature_layout(num_horizons: int, snapshot_dim: int) -> Dict[str, sl
     layout["conf_long"] = slice(offset, offset + 1)
     offset += 1
     layout["conf_min"] = slice(offset, offset + 1)
+    offset += 1
+    layout["weighted_cmssl_logit"] = slice(offset, offset + 1)
+    offset += 1
+    layout["abs_weighted_cmssl_logit"] = slice(offset, offset + 1)
     offset += 1
     layout["snapshots"] = slice(offset, offset + snapshot_dim)
     return layout
@@ -1139,10 +1158,9 @@ def _build_rollout_start_sampler(
     candidate_starts = np.arange(0, effective_max_start + 1, dtype=np.int64)
     if candidate_starts.size == 0:
         return None
-    dir_logits = env.features[:, env._feature_layout["dir_logits"]]
-    weights = np.asarray(config.horizon_logit_weights, dtype=np.float64).reshape(3,)
     focus_idx = np.minimum(candidate_starts + int(config.lead_steps), env.n - 2).astype(np.int64, copy=False)
-    z = np.sum(dir_logits[focus_idx].astype(np.float64) * weights[None, :], axis=1)
+    weighted_slice = env._feature_layout["weighted_cmssl_logit"]
+    z = env.features[focus_idx, weighted_slice.start].astype(np.float64, copy=False)
     raw_score = np.abs(z)
     weighted_score = float(config.score_epsilon) + np.power(raw_score, float(config.score_power))
     weighted_mass = weighted_score / max(float(np.sum(weighted_score)), 1e-12)
@@ -1654,6 +1672,7 @@ def join_features(
     cmssl_out: Dict[str, np.ndarray],
     snapshots: np.ndarray,
     meta: dict,
+    directional_signal_config: DirectionalSignalConfig,
 ) -> Dict[str, np.ndarray]:
     """Join model outputs and snapshot state into a single feature tensor.
 
@@ -1666,7 +1685,8 @@ def join_features(
          - diff_mid_long
          - conf_long
          - conf_min
-      4) snapshot features from RAW_SNAPSHOT_FEATURE_COLUMNS
+      4) weighted_cmssl_logit, abs_weighted_cmssl_logit
+      5) snapshot features from RAW_SNAPSHOT_FEATURE_COLUMNS
     """
     dir_logits = cmssl_out["dir_logits"]
     p_up = _sigmoid(dir_logits)
@@ -1690,6 +1710,12 @@ def join_features(
     diff_mid_long = p_up[:, idx_mid] - p_up[:, idx_long]
     conf_long = conf[:, idx_long]
     conf_min = np.min(conf, axis=1)
+    weighted_cmssl_logit = np.sum(
+        dir_logits.astype(np.float64, copy=False)
+        * np.asarray(directional_signal_config.horizon_logit_weights, dtype=np.float64).reshape(1, 3),
+        axis=1,
+    ).astype(np.float32, copy=False)
+    abs_weighted_cmssl_logit = np.abs(weighted_cmssl_logit).astype(np.float32, copy=False)
     layout = _joined_feature_layout(dir_logits.shape[1], snapshots.shape[1])
     snapshot_spread_col = RAW_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
     spread_bps = snapshots[:, snapshot_spread_col]  # use aligned snapshot spread
@@ -1714,6 +1740,10 @@ def join_features(
     features[:, cursor] = conf_long
     cursor += 1
     features[:, cursor] = conf_min
+    cursor += 1
+    features[:, cursor] = weighted_cmssl_logit
+    cursor += 1
+    features[:, cursor] = abs_weighted_cmssl_logit
     cursor += 1
 
     d = snapshots.shape[1]
@@ -1748,6 +1778,7 @@ def _build_joined_split_uncached(
     meta: dict,
     device: str,
     split_label: str,
+    directional_signal_config: DirectionalSignalConfig,
     batch_size: int = 2048,
 ) -> Dict[str, np.ndarray]:
     t0 = time.perf_counter()
@@ -1788,7 +1819,7 @@ def _build_joined_split_uncached(
                 f"Decision snapshot timestamps do not exactly match token timestamps for week={wk}. "
                 "Please rerun offline_snapshots.py to rebuild decision_snapshots.npz."
             )
-        week_outputs.append(join_features(ts, y, cmssl_out, aligned_snapshots, meta))
+        week_outputs.append(join_features(ts, y, cmssl_out, aligned_snapshots, meta, directional_signal_config))
 
     if not week_outputs:
         raise ValueError(f"No data found for split {split}")
@@ -2078,6 +2109,7 @@ def build_joined_split(
     *,
     ckpt_path: str,
     split_label: str,
+    directional_signal_config: DirectionalSignalConfig,
     batch_size: int = 2048,
 ) -> Dict[str, np.ndarray]:
     cache_t0 = time.perf_counter()
@@ -2113,6 +2145,7 @@ def build_joined_split(
         meta,
         device,
         split_label=split_label,
+        directional_signal_config=directional_signal_config,
         batch_size=batch_size,
     )
     _validate_joined_payload(out, meta=meta)
@@ -2187,6 +2220,7 @@ class MarketMakingEnv:
         freeze_obs_norm: bool = False,
         direct_quote_config: Optional[DirectQuoteConfig] = None,
         reward_shaping_config: Optional[RewardShapingConfig] = None,
+        directional_signal_config: DirectionalSignalConfig = DirectionalSignalConfig(),
     ):
         self.features = np.ascontiguousarray(np.asarray(batch.features, dtype=np.float32))
         self.spread_bps = np.ascontiguousarray(np.asarray(batch.spread_bps, dtype=np.float32))
@@ -2307,6 +2341,7 @@ class MarketMakingEnv:
         self.reward_shaping_config = (
             load_reward_shaping_config() if reward_shaping_config is None else reward_shaping_config
         )
+        self.directional_signal_config = directional_signal_config
         self.continuous_maker_fill_config = continuous_maker_fill_config
         self.continuous_maker_fill_calibration = continuous_maker_fill_calibration
         if self.continuous_maker_fill_calibration.sample_count < 1024:
@@ -2336,7 +2371,8 @@ class MarketMakingEnv:
             self.fill_norm_spread_px_floor = float(max(spread_q05, 1e-6))
         else:
             self.fill_norm_spread_px_floor = 1e-6
-        mids_px = 0.5 * (self.best_bid.astype(np.float64) + self.best_ask.astype(np.float64))
+        self.mid_px = 0.5 * (self.best_bid.astype(np.float64) + self.best_ask.astype(np.float64))
+        mids_px = self.mid_px
         finite_positive_mids = mids_px[np.isfinite(mids_px) & (mids_px > 0.0)]
         self.quote_mid_ref_px = (
             float(np.median(finite_positive_mids)) if finite_positive_mids.size else 1.0
@@ -2403,6 +2439,23 @@ class MarketMakingEnv:
         self._obs_ping_pong_idx = 0
 
         self.n = len(self.spread_bps)
+        self.training_reward_horizon_ms = int(self.directional_signal_config.training_reward_horizon_ms)
+        if self.decision_ts is None:
+            raise ValueError(
+                "decision_ts is required for training reward horizon alignment; missing in MarketMakingBatch."
+            )
+        if self.decision_ts.shape[0] != self.n:
+            raise ValueError(
+                "decision_ts length mismatch with environment rows: "
+                f"decision_ts={self.decision_ts.shape[0]} rows={self.n}"
+            )
+        future_idx = np.empty((self.n,), dtype=np.int64)
+        for i in range(self.n):
+            target_ts = int(self.decision_ts[i]) + int(self.training_reward_horizon_ms)
+            j = int(np.searchsorted(self.decision_ts, target_ts, side="left"))
+            j = int(np.clip(j, i + 1, self.n - 1))
+            future_idx[i] = j
+        self.training_reward_future_idx = future_idx
         self.idx = 0
         self.cash = self.initial_cash
         self.inventory = 0.0
@@ -2441,6 +2494,7 @@ class MarketMakingEnv:
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self.last_weighted_cmssl_logit = 0.0
+        self.last_abs_weighted_cmssl_logit = 0.0
         self.last_cmssl_alpha = 0.0
         self._obs_count = 0
         self._obs_mean: Optional[np.ndarray] = None
@@ -2496,6 +2550,7 @@ class MarketMakingEnv:
         self.last_taker_buy_clipped = 0.0
         self.last_taker_sell_clipped = 0.0
         self.last_weighted_cmssl_logit = 0.0
+        self.last_abs_weighted_cmssl_logit = 0.0
         self.last_cmssl_alpha = 0.0
         self._obs_ping_pong_idx = 0
         mid = self._mid_price(self.idx)
@@ -2503,7 +2558,7 @@ class MarketMakingEnv:
         return self._build_observation(self.idx)
 
     def _mid_price(self, idx: int) -> float:
-        return float((self.best_bid[idx] + self.best_ask[idx]) / 2.0)
+        return float(self.mid_px[idx])
 
     def _initial_time_since_last_fill(self) -> float:
         # Prefer a startup value near 1.0 after scaling. This signals "no fill yet"
@@ -2937,14 +2992,12 @@ class MarketMakingEnv:
         return float(cfg.activity_min + (cfg.activity_max - cfg.activity_min) * u)
 
     def _weighted_cmssl_logit(self, decision_idx: int) -> float:
-        dir_slice = self._feature_layout["dir_logits"]
-        dir_logits = np.asarray(self.features[decision_idx, dir_slice], dtype=np.float64)
-        weights = np.asarray(self.reward_shaping_config.horizon_logit_weights, dtype=np.float64)
-        if dir_logits.shape[0] != weights.shape[0]:
-            raise RuntimeError(
-                f"horizon_logit_weights shape mismatch: logits={dir_logits.shape[0]} weights={weights.shape[0]}"
-            )
-        return float(np.dot(dir_logits, weights))
+        weighted_slice = self._feature_layout["weighted_cmssl_logit"]
+        return float(self.features[decision_idx, weighted_slice.start])
+
+    def _abs_weighted_cmssl_logit(self, decision_idx: int) -> float:
+        abs_weighted_slice = self._feature_layout["abs_weighted_cmssl_logit"]
+        return float(self.features[decision_idx, abs_weighted_slice.start])
 
     def _compute_maker_fill_hard(self, bid: float, ask: float, idx: int) -> Tuple[float, float]:
         touch_epsilon = self.continuous_maker_fill_config.price_epsilon_px
@@ -3274,6 +3327,7 @@ class MarketMakingEnv:
                 "bid_at_floor": 1.0,
                 "ask_at_floor": 1.0,
                 "weighted_cmssl_logit": float(self.last_weighted_cmssl_logit),
+                "abs_weighted_cmssl_logit": float(self.last_abs_weighted_cmssl_logit),
                 "cmssl_alpha": float(self.last_cmssl_alpha),
                 "maker_buy": 0.0,
                 "maker_sell": 0.0,
@@ -3322,6 +3376,7 @@ class MarketMakingEnv:
         bid, ask, quote_metrics = self._policy_quotes(self.idx, center_control, width_control, skew_control)
         self._assert_passive_quotes(bid, ask, self.idx, quote_metrics)
         self.last_weighted_cmssl_logit = self._weighted_cmssl_logit(self.idx)
+        self.last_abs_weighted_cmssl_logit = self._abs_weighted_cmssl_logit(self.idx)
         cmssl_alpha = float(np.tanh(self.last_weighted_cmssl_logit / self.reward_shaping_config.logit_tanh_scale))
         self.last_cmssl_alpha = cmssl_alpha
         inv_prev = self.inventory
@@ -3410,13 +3465,29 @@ class MarketMakingEnv:
         turnover_notional = maker_rebate_notional + taker_notional
         turnover_penalty = self.lambda_turn * turnover_notional
         reward_true = delta_equity - inventory_penalty_total - turnover_penalty
+        future_idx = int(self.training_reward_future_idx[self.idx])
+        mid_future = float(self.mid_px[future_idx])
+        equity_future = self.cash + self.inventory * mid_future
+        delta_equity_future = equity_future - self.prev_equity
+        penalty_future = self._compute_penalty(mid_future)
+        inv_notional_future = abs(inv_new * mid_future)
+        excess_notional_future = max(0.0, inv_notional_future - self.inv_soft_notional)
+        inv_penalty_future = (
+            self.lambda_inv * (excess_notional_future / self.inv_soft_notional) ** 2
+            if self.inv_soft_notional > 0.0
+            else 0.0
+        )
+        inventory_penalty_total_future = self._combine_inventory_penalties(penalty_future, inv_penalty_future)
+        reward_true_future = delta_equity_future - inventory_penalty_total_future - turnover_penalty
+        reward_future_bonus = reward_true_future - reward_true
+        reward_train_econ = reward_true + reward_future_bonus
         reward_shape_skew = (
             self.reward_shaping_config.skew_coef
             * cmssl_alpha
             * float(quote_metrics["directional_response"])
         )
         reward_shape_total = reward_shape_skew
-        reward_train = reward_true + reward_shape_total
+        reward_train = reward_train_econ + reward_shape_total
 
         self.prev_equity = equity
         self.total_reward += reward_train
@@ -3438,6 +3509,9 @@ class MarketMakingEnv:
         info = {
             "reward": float(reward_train),
             "reward_true": float(reward_true),
+            "reward_true_future": float(reward_true_future),
+            "reward_future_bonus": float(reward_future_bonus),
+            "reward_train_econ": float(reward_train_econ),
             "reward_train": float(reward_train),
             "reward_shape_skew": float(reward_shape_skew),
             "reward_shape_total": float(reward_shape_total),
@@ -3447,6 +3521,7 @@ class MarketMakingEnv:
             "inventory_notional": float(inv_notional),
             "equity": float(equity),
             "delta_equity": float(delta_equity),
+            "delta_equity_future": float(delta_equity_future),
             "rebate": float(rebate),
             "taker_fee": float(taker_fee),
             "penalty": float(penalty),
@@ -3455,6 +3530,9 @@ class MarketMakingEnv:
             "inventory_penalty_total": float(inventory_penalty_total),
             "turnover_penalty": float(turnover_penalty),
             "mid": float(mid_next),
+            "mid_future": float(mid_future),
+            "training_reward_future_idx": int(future_idx),
+            "training_reward_actual_horizon_ms": int(self.decision_ts[future_idx] - self.decision_ts[self.idx]),
             "hard_max_inventory_notional": float(self.hard_max_inventory_notional),
             "pre_hard_cap_qty": float(pre_hard_cap_qty),
             "pre_buy_room_qty": float(pre_buy_room_qty),
@@ -3499,6 +3577,7 @@ class MarketMakingEnv:
             "bid_at_floor": float(quote_metrics["bid_at_floor"]),
             "ask_at_floor": float(quote_metrics["ask_at_floor"]),
             "weighted_cmssl_logit": float(self.last_weighted_cmssl_logit),
+            "abs_weighted_cmssl_logit": float(self.last_abs_weighted_cmssl_logit),
             "cmssl_alpha": float(cmssl_alpha),
             "inv_change": float(inv_change),
             "maker_buy": float(maker_buy),
@@ -3661,7 +3740,7 @@ def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
 
 
 def _init_market_policy_mean_head(model: MarketPolicyValueNet, env: MarketMakingEnv) -> None:
-    width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.14)
+    width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.08)
     if not np.isfinite(width_action_init) or not (0.0 < width_action_init < 1.0):
         raise ValueError(
             "BYBIT_MM_PPO_WIDTH_ACTION_INIT must be finite and satisfy 0.0 < value < 1.0, "
@@ -3687,38 +3766,29 @@ def _init_market_policy_mean_head(model: MarketPolicyValueNet, env: MarketMaking
         feature_layout = env._feature_layout
         skip_weight = model.policy_net.linear_skip.weight
         skip_bias = model.policy_net.linear_skip.bias
-        dir_slice = feature_layout["dir_logits"]
-        p_up_slice = feature_layout["p_up"]
-        short_idx = 0
-        mid_idx = env._num_h // 2
-        long_idx = env._num_h - 1
-        skip_weight[2, dir_slice.start + short_idx] = 0.04
-        skip_weight[2, dir_slice.start + mid_idx] = 0.08
-        skip_weight[2, dir_slice.start + long_idx] = 0.22
-        skip_weight[2, p_up_slice.start + short_idx] = 0.02
-        skip_weight[2, p_up_slice.start + mid_idx] = 0.04
-        skip_weight[2, p_up_slice.start + long_idx] = 0.08
-        skip_bias[2] = -0.07
+        skip_weight[2, feature_layout["weighted_cmssl_logit"].start] = 0.30
+        skip_weight[2, feature_layout["abs_weighted_cmssl_logit"].start] = 0.00
+        skip_bias[2] = 0.0
         skip_weight[0, env._obs_extra_slice.start + 0] = -0.25
         skip_bias[0] = 0.0
 
 
 @dataclass
 class PPOConfig:
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
+    gamma: float = 0.999
+    gae_lambda: float = 0.99
     clip_ratio: float = 0.2
     lr: float = 3e-4
-    update_epochs: int = 4
+    update_epochs: int = 8
     batch_size: int = 65536
-    entropy_coef: float = 0.02
+    entropy_coef: float = 0.0075
     value_coef: float = 0.5
     policy_hidden: Tuple[int, ...] = (128, 128)
     value_hidden: Tuple[int, ...] = (128, 128)
     val_every: int = 10
     max_drawdown_guard: Optional[float] = None
     rollout_horizon: int = 8192
-    rollouts_per_epoch: int = 16
+    rollouts_per_epoch: int = 32
     randomize_rollout_start: bool = True
     init_log_std_center: float = -0.20
     init_log_std_width: float = -1.00
@@ -3798,8 +3868,13 @@ def collect_market_rollout(
     start_idx_buf = torch.empty((max_steps,), dtype=torch.int64, **alloc_kwargs)
     focus_logit_abs_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_true_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_true_future_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_future_bonus_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_train_econ_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_shape_skew_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_shape_total_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    training_reward_actual_horizon_ms_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    mid_future_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cmssl_alpha_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     touch_dist_buy_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     touch_dist_sell_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
@@ -3992,8 +4067,13 @@ def collect_market_rollout(
             rewards_buf[idx] = float(reward)
             info = info or {}
             reward_true_buf[idx] = float(info.get("reward_true", reward))
+            reward_true_future_buf[idx] = float(info.get("reward_true_future", info.get("reward_true", reward)))
+            reward_future_bonus_buf[idx] = float(info.get("reward_future_bonus", 0.0))
+            reward_train_econ_buf[idx] = float(info.get("reward_train_econ", info.get("reward_true", reward)))
             reward_shape_skew_buf[idx] = float(info.get("reward_shape_skew", 0.0))
             reward_shape_total_buf[idx] = float(info.get("reward_shape_total", 0.0))
+            training_reward_actual_horizon_ms_buf[idx] = float(info.get("training_reward_actual_horizon_ms", 0.0))
+            mid_future_buf[idx] = float(info.get("mid_future", 0.0))
             cmssl_alpha_buf[idx] = float(info.get("cmssl_alpha", 0.0))
             touch_dist_buy_buf[idx] = float(info.get("touch_dist_buy", 0.0))
             touch_dist_sell_buf[idx] = float(info.get("touch_dist_sell", 0.0))
@@ -4082,8 +4162,13 @@ def collect_market_rollout(
         "start_idx": start_idx_buf[:cursor],
         "focus_logit_abs": focus_logit_abs_buf[:cursor],
         "reward_true": reward_true_buf[:cursor],
+        "reward_true_future": reward_true_future_buf[:cursor],
+        "reward_future_bonus": reward_future_bonus_buf[:cursor],
+        "reward_train_econ": reward_train_econ_buf[:cursor],
         "reward_shape_skew": reward_shape_skew_buf[:cursor],
         "reward_shape_total": reward_shape_total_buf[:cursor],
+        "training_reward_actual_horizon_ms": training_reward_actual_horizon_ms_buf[:cursor],
+        "mid_future": mid_future_buf[:cursor],
         "cmssl_alpha": cmssl_alpha_buf[:cursor],
         "touch_dist_buy": touch_dist_buy_buf[:cursor],
         "touch_dist_sell": touch_dist_sell_buf[:cursor],
@@ -4733,7 +4818,7 @@ def train_market_ppo(
         ),
     ).to(device)
     _init_market_policy_mean_head(model, train_env)
-    mean_head_width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.14)
+    mean_head_width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.08)
     if not np.isfinite(mean_head_width_action_init) or not (0.0 < mean_head_width_action_init < 1.0):
         raise ValueError(
             "BYBIT_MM_PPO_WIDTH_ACTION_INIT must be finite and satisfy 0.0 < value < 1.0, "
@@ -4754,10 +4839,15 @@ def train_market_ppo(
         "[mm ppo init] "
         f"rollout_horizon={config.rollout_horizon} "
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
+        f"gamma={config.gamma:.6f} "
+        f"gae_lambda={config.gae_lambda:.6f} "
+        f"entropy_coef={config.entropy_coef:.6f} "
+        f"update_epochs={config.update_epochs} "
+        f"batch_size={config.batch_size} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
         "mean_head_init=small_normal_mlp_plus_cmssl_skip_warm_start "
         f"width_action_init={mean_head_width_action_init:.2f} "
-        "width_action_init_source=BYBIT_MM_PPO_WIDTH_ACTION_INIT(default=0.14) "
+        "width_action_init_source=BYBIT_MM_PPO_WIDTH_ACTION_INIT(default=0.08) "
         f"width_bias_latent={mean_head_width_bias_latent:.6f} "
         f"inventory_center_weight={train_env.direct_quote_config.inventory_center_weight:.2f} "
         f"alpha_center_weight={train_env.direct_quote_config.alpha_center_weight:.2f} "
@@ -4870,7 +4960,7 @@ def train_market_ppo(
             "[mm rollout sampler] "
             f"enabled={start_sampling_cfg.enabled} "
             f"active=true "
-            f"horizon_logit_weights={start_sampling_cfg.horizon_logit_weights} "
+            f"horizon_logit_weights={train_env.directional_signal_config.horizon_logit_weights} "
             f"weighted_mix={start_sampling_cfg.weighted_mix:.4f} "
             f"score_power={start_sampling_cfg.score_power:.4f} "
             f"score_epsilon={start_sampling_cfg.score_epsilon:.6g} "
@@ -4960,8 +5050,12 @@ def train_market_ppo(
         )
         sampler_resets = int(rollout.get("sampler_availability_resets", 0))
         reward_true_np = rollout["reward_true"].detach().cpu().numpy().astype(np.float64)
+        reward_true_future_np = rollout["reward_true_future"].detach().cpu().numpy().astype(np.float64)
+        reward_future_bonus_np = rollout["reward_future_bonus"].detach().cpu().numpy().astype(np.float64)
+        reward_train_econ_np = rollout["reward_train_econ"].detach().cpu().numpy().astype(np.float64)
         shape_skew_np = rollout["reward_shape_skew"].detach().cpu().numpy().astype(np.float64)
         shape_total_np = rollout["reward_shape_total"].detach().cpu().numpy().astype(np.float64)
+        training_reward_actual_horizon_ms_np = rollout["training_reward_actual_horizon_ms"].detach().cpu().numpy().astype(np.float64)
         touch_dist_buy_np = rollout["touch_dist_buy"].detach().cpu().numpy().astype(np.float64)
         touch_dist_sell_np = rollout["touch_dist_sell"].detach().cpu().numpy().astype(np.float64)
         maker_buy_fill_frac_np = rollout["maker_buy_fill_frac"].detach().cpu().numpy().astype(np.float64)
@@ -5006,7 +5100,7 @@ def train_market_ppo(
         quote_half_spread_floor_bps_np = rollout["quote_half_spread_floor_bps"].detach().cpu().numpy().astype(np.float64)
         bid_half_spread_bps_np = rollout["bid_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
         ask_half_spread_bps_np = rollout["ask_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
-        true_abs_mean = float(np.mean(np.abs(reward_true_np))) if reward_true_np.size else 0.0
+        true_abs_mean = float(np.mean(np.abs(reward_train_econ_np))) if reward_train_econ_np.size else 0.0
         shape_abs_mean = float(np.mean(np.abs(shape_total_np))) if shape_total_np.size else 0.0
         shaping_ratio = shape_abs_mean / max(true_abs_mean, 1e-8)
         avg_touch_dist = float(np.mean(0.5 * (touch_dist_buy_np + touch_dist_sell_np))) if touch_dist_buy_np.size else 0.0
@@ -5036,10 +5130,16 @@ def train_market_ppo(
             f"start_idx_mean={float(np.mean(start_idx_np)):.2f} "
             f"focus_abs_logit_mean={float(np.mean(focus_abs_np)):.6f} "
             f"reward_true_mean={float(np.mean(reward_true_np)):.6f} "
+            f"reward_true_future_mean={float(np.mean(reward_true_future_np)):.6f} "
+            f"reward_future_bonus_mean={float(np.mean(reward_future_bonus_np)):.6f} "
+            f"reward_train_econ_mean={float(np.mean(reward_train_econ_np)):.6f} "
             f"reward_shape_skew_mean={float(np.mean(shape_skew_np)):.6f} "
             f"reward_shape_total_mean={float(np.mean(shape_total_np)):.6f} "
             f"cmssl_alpha_mean={float(np.mean(cmssl_alpha_np)):.6f} "
             f"shape_abs_ratio={shaping_ratio:.6f} "
+            f"training_reward_actual_horizon_ms_mean={float(np.mean(training_reward_actual_horizon_ms_np)):.2f} "
+            f"training_reward_actual_horizon_ms_p50={float(np.percentile(training_reward_actual_horizon_ms_np, 50.0)):.2f} "
+            f"training_reward_actual_horizon_ms_p90={float(np.percentile(training_reward_actual_horizon_ms_np, 90.0)):.2f} "
             f"sampled_unique_starts={unique_starts} "
             f"sampled_min_start_distance={min_start_distance} "
             f"sampler_availability_reset={sampler_resets > 0}"
@@ -5122,7 +5222,7 @@ def train_market_ppo(
             f"activity_score_mean={float(np.mean(activity_score_np)):.6f} "
             f"touch_event_boost_mass_frac={bonus_frac:.6f} "
             f"reward_true_std={float(np.std(reward_true_np)):.6f} "
-            f"reward_train_std={float(np.std((reward_true_np + shape_total_np))):.6f}"
+            f"reward_train_std={float(np.std((reward_train_econ_np + shape_total_np))):.6f}"
         )
         print(
             "[mm ppo fill path] "
@@ -5878,9 +5978,12 @@ def run_pipeline(
             "BYBIT_MM_REWARD_SHAPING_WIDTH_VOL_COEF",
             "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MIN",
             "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MAX",
+            "BYBIT_MM_REWARD_SHAPING_HORIZON_LOGIT_WEIGHTS",
+            "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
         )
     )
     meta = load_global_meta(Path(out_root))
+    directional_signal_cfg = load_directional_signal_config(meta)
     cmssl_test_split = resolve_cmssl_test_split(out_root, meta)
     rl_train_split = resolve_rl_train_split(out_root, meta)
     rl_val_split = resolve_rl_val_split(out_root, meta)
@@ -5912,6 +6015,7 @@ def run_pipeline(
         device,
         ckpt_path=ckpt_path,
         split_label="cmssl_test",
+        directional_signal_config=directional_signal_cfg,
         batch_size=cmssl_batch_size,
     )
 
@@ -5932,6 +6036,7 @@ def run_pipeline(
         device,
         ckpt_path=ckpt_path,
         split_label="rl_week3_full",
+        directional_signal_config=directional_signal_cfg,
         batch_size=cmssl_batch_size,
     )
     joined_rl_train = slice_joined_by_split(joined_rl_full, rl_train_split)
@@ -5945,6 +6050,7 @@ def run_pipeline(
         device,
         ckpt_path=ckpt_path,
         split_label="eval_full",
+        directional_signal_config=directional_signal_cfg,
         batch_size=cmssl_batch_size,
     )
 
@@ -5980,6 +6086,7 @@ def run_pipeline(
         mm_train_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        directional_signal_config=directional_signal_cfg,
         continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
@@ -5988,6 +6095,7 @@ def run_pipeline(
         mm_val_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        directional_signal_config=directional_signal_cfg,
         continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
@@ -5995,6 +6103,7 @@ def run_pipeline(
         mm_test_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        directional_signal_config=directional_signal_cfg,
         continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
@@ -6002,6 +6111,7 @@ def run_pipeline(
         mm_eval_full_batch,
         allow_taker=allow_taker,
         reward_shaping_config=reward_shaping_cfg,
+        directional_signal_config=directional_signal_cfg,
         continuous_maker_fill_calibration=fill_calibration,
         **env_kwargs_common,
     )
@@ -6028,19 +6138,19 @@ def run_pipeline(
 
     mm_ppo_config = PPOConfig(
         lr=float(os.environ.get("BYBIT_MM_PPO_LR", "3e-4")),
-        update_epochs=int(os.environ.get("BYBIT_MM_PPO_UPDATE_EPOCHS", "6")),
+        update_epochs=int(os.environ.get("BYBIT_MM_PPO_UPDATE_EPOCHS", "8")),
         batch_size=int(os.environ.get("BYBIT_MM_PPO_BATCH_SIZE", "65536")),
         clip_ratio=float(os.environ.get("BYBIT_MM_PPO_CLIP_RATIO", "0.2")),
-        gamma=float(os.environ.get("BYBIT_MM_PPO_GAMMA", "0.99")),
-        gae_lambda=float(os.environ.get("BYBIT_MM_PPO_GAE_LAMBDA", "0.95")),
-        entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.03")),
+        gamma=float(os.environ.get("BYBIT_MM_PPO_GAMMA", "0.999")),
+        gae_lambda=float(os.environ.get("BYBIT_MM_PPO_GAE_LAMBDA", "0.99")),
+        entropy_coef=float(os.environ.get("BYBIT_MM_PPO_ENTROPY_COEF", "0.0075")),
         value_coef=float(os.environ.get("BYBIT_MM_PPO_VALUE_COEF", "0.5")),
         policy_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_POLICY_HIDDEN", "128,128").split(",")),
         value_hidden=tuple(int(x) for x in os.environ.get("BYBIT_MM_PPO_VALUE_HIDDEN", "128,128").split(",")),
         val_every=_env_int("BYBIT_MM_PPO_VAL_EVERY", 10),
         max_drawdown_guard=_env_float("BYBIT_MM_PPO_MAX_DRAWDOWN", float("nan")),
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
-        rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
+        rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 32),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
         init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.20),
         init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -1.00),
