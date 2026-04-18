@@ -52,7 +52,7 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
 FEATURE_EXTRA_DIM = 5
 ENV_OBS_EXTRA_STATE_DIM = 14
 DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC = 0.5
-DEFAULT_MM_SPREAD_FLOOR_BPS = 0.0
+DEFAULT_MM_QUOTE_HALF_SPREAD_FLOOR_BPS = 0.0050
 DEFAULT_MM_SPREAD_CAP_BPS = 10_000.0
 # PPO training epochs environment variable (used across entrypoint/config helpers).
 PPO_EPOCHS_ENV = "BYBIT_MM_PPO_EPOCHS"
@@ -70,7 +70,11 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.1
 DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
-MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v5"
+MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v6"
+INVENTORY_CENTER_WEIGHT = 0.35
+ALPHA_CENTER_WEIGHT = 0.80
+DIRECTIONAL_RESPONSE_CENTER_WEIGHT = 0.75
+DIRECTIONAL_RESPONSE_ASYM_WEIGHT = 0.25
 MM_PPO_ACTION_DIM = 4
 MM_PPO_ACTION_SEMANTICS = (
     "center_control",
@@ -488,6 +492,7 @@ def _resolve_run_mode(default: str = "train") -> str:
 
 
 def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
+    _fail_on_removed_env_vars(("BYBIT_MM_SPREAD_FLOOR_BPS",))
     direct_quote_config = load_direct_quote_config()
     continuous_maker_fill_config = load_continuous_maker_fill_config()
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
@@ -670,7 +675,7 @@ def _set_seed_from_env(env_name: str = "BYBIT_SEED") -> Optional[int]:
 
 @dataclass(frozen=True)
 class DirectQuoteConfig:
-    spread_floor_bps: float
+    quote_half_spread_floor_bps: float
     spread_cap_bps: float
     obs_spread_anchor_frac: float
     touch_halfspread_mult: float
@@ -891,22 +896,25 @@ def load_reward_shaping_config() -> RewardShapingConfig:
 def load_direct_quote_config() -> DirectQuoteConfig:
     return _validate_direct_quote_config(
         DirectQuoteConfig(
-            spread_floor_bps=_env_float("BYBIT_MM_SPREAD_FLOOR_BPS", DEFAULT_MM_SPREAD_FLOOR_BPS),
+            quote_half_spread_floor_bps=_env_float(
+                "BYBIT_MM_QUOTE_HALF_SPREAD_FLOOR_BPS",
+                DEFAULT_MM_QUOTE_HALF_SPREAD_FLOOR_BPS,
+            ),
             spread_cap_bps=_env_float("BYBIT_MM_SPREAD_CAP_BPS", DEFAULT_MM_SPREAD_CAP_BPS),
             obs_spread_anchor_frac=_env_float("BYBIT_MM_OBS_SPREAD_ANCHOR_FRAC", DEFAULT_MM_OBS_SPREAD_ANCHOR_FRAC),
             touch_halfspread_mult=_env_float("BYBIT_MM_TOUCH_HALFSPREAD_MULT", 1.0),
             wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 3.0),
-            skew_max_frac=_env_float("BYBIT_MM_SKEW_MAX_FRAC", 0.75),
+            skew_max_frac=_env_float("BYBIT_MM_SKEW_MAX_FRAC", 1.0),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
         )
     )
 
 
 def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
-    if not np.isfinite(cfg.spread_floor_bps) or cfg.spread_floor_bps < 0.0:
-        raise ValueError("spread_floor_bps must be finite and >= 0.0")
-    if not np.isfinite(cfg.spread_cap_bps) or cfg.spread_cap_bps < cfg.spread_floor_bps:
-        raise ValueError("spread_cap_bps must be finite and >= spread_floor_bps")
+    if not np.isfinite(cfg.quote_half_spread_floor_bps) or cfg.quote_half_spread_floor_bps <= 0.0:
+        raise ValueError("quote_half_spread_floor_bps must be finite and > 0.0")
+    if not np.isfinite(cfg.spread_cap_bps) or cfg.spread_cap_bps < cfg.quote_half_spread_floor_bps:
+        raise ValueError("spread_cap_bps must be finite and >= quote_half_spread_floor_bps")
     if (
         not np.isfinite(cfg.obs_spread_anchor_frac)
         or cfg.obs_spread_anchor_frac < 0.0
@@ -2312,22 +2320,17 @@ class MarketMakingEnv:
         self.quote_mid_ref_px = (
             float(np.median(finite_positive_mids)) if finite_positive_mids.size else 1.0
         )
-        self.quote_anchor_floor_full_spread_bps = float(
+        self.fill_norm_spread_floor_full_bps = float(
             (self.fill_norm_spread_px_floor / max(self.quote_mid_ref_px, 1e-12)) * 1e4
         )
-        self.quote_anchor_half_spread_floor_bps = float(
-            max(
-                self.direct_quote_config.spread_floor_bps,
-                self.direct_quote_config.obs_spread_anchor_frac * self.quote_anchor_floor_full_spread_bps,
-            )
-        )
+        self.quote_half_spread_floor_bps = float(self.direct_quote_config.quote_half_spread_floor_bps)
         if (
-            not np.isfinite(self.quote_anchor_half_spread_floor_bps)
-            or self.quote_anchor_half_spread_floor_bps <= 0.0
+            not np.isfinite(self.quote_half_spread_floor_bps)
+            or self.quote_half_spread_floor_bps <= 0.0
         ):
             raise ValueError(
-                "quote_anchor_half_spread_floor_bps must be finite and > 0.0; "
-                f"got {self.quote_anchor_half_spread_floor_bps}"
+                "quote_half_spread_floor_bps must be finite and > 0.0; "
+                f"got {self.quote_half_spread_floor_bps}"
             )
         self.positive_raw_spread_frac = float(
             np.mean(np.isfinite(raw_spreads_px) & (raw_spreads_px > 0.0))
@@ -2342,8 +2345,8 @@ class MarketMakingEnv:
             f"positive_snapshot_spread_frac={self.positive_snapshot_spread_frac:.6f} "
             f"fill_norm_spread_px_floor={self.fill_norm_spread_px_floor:.10f} "
             f"quote_mid_ref_px={self.quote_mid_ref_px:.10f} "
-            f"quote_anchor_floor_full_spread_bps={self.quote_anchor_floor_full_spread_bps:.10f} "
-            f"quote_anchor_half_spread_floor_bps={self.quote_anchor_half_spread_floor_bps:.10f}"
+            f"fill_norm_spread_floor_full_bps={self.fill_norm_spread_floor_full_bps:.10f} "
+            f"quote_half_spread_floor_bps={self.quote_half_spread_floor_bps:.10f}"
         )
         if self.positive_raw_spread_frac < 0.01 or self.positive_snapshot_spread_frac < 0.01:
             print(
@@ -2675,14 +2678,14 @@ class MarketMakingEnv:
             observed_anchor_half_spread_bps = cfg.obs_spread_anchor_frac * observed_spread_bps
         anchor_half_spread_bps = float(
             max(
-                self.quote_anchor_half_spread_floor_bps,
+                self.quote_half_spread_floor_bps,
                 observed_anchor_half_spread_bps,
             )
         )
         anchor_half_spread_bps = float(
             np.clip(
                 anchor_half_spread_bps,
-                self.quote_anchor_half_spread_floor_bps,
+                self.quote_half_spread_floor_bps,
                 cfg.spread_cap_bps,
             )
         )
@@ -2692,27 +2695,37 @@ class MarketMakingEnv:
         base_half_spread_bps = float(
             np.clip(
                 base_half_spread_bps,
-                self.quote_anchor_half_spread_floor_bps,
+                self.quote_half_spread_floor_bps,
                 cfg.spread_cap_bps,
             )
         )
         skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
-        half_spread_floor_bps = self.quote_anchor_half_spread_floor_bps
-        skew_frac = cfg.skew_max_frac * skew_control_clipped
-        bid_half_spread_bps = float(
-            np.clip(
-                base_half_spread_bps * (1.0 - skew_frac),
-                half_spread_floor_bps,
-                cfg.spread_cap_bps,
+        half_spread_floor_bps = self.quote_half_spread_floor_bps
+        asymmetry_cap_bps = max(base_half_spread_bps - half_spread_floor_bps, 0.0)
+        asymmetry_target_bps = skew_control_clipped * cfg.skew_max_frac * asymmetry_cap_bps
+        total_half_spread_bps = 2.0 * base_half_spread_bps
+        desired_bid_half_spread_bps = base_half_spread_bps - asymmetry_target_bps
+        bid_half_lower_bps = max(half_spread_floor_bps, total_half_spread_bps - cfg.spread_cap_bps)
+        bid_half_upper_bps = min(cfg.spread_cap_bps, total_half_spread_bps - half_spread_floor_bps)
+        bid_half_spread_bps = float(np.clip(desired_bid_half_spread_bps, bid_half_lower_bps, bid_half_upper_bps))
+        ask_half_spread_bps = float(total_half_spread_bps - bid_half_spread_bps)
+        if not (np.isfinite(bid_half_spread_bps) and np.isfinite(ask_half_spread_bps)):
+            raise RuntimeError(
+                "Non-finite projected half spreads: "
+                f"idx={idx} bid_half_spread_bps={bid_half_spread_bps} ask_half_spread_bps={ask_half_spread_bps}"
             )
-        )
-        ask_half_spread_bps = float(
-            np.clip(
-                base_half_spread_bps * (1.0 + skew_frac),
-                half_spread_floor_bps,
-                cfg.spread_cap_bps,
+        if not (half_spread_floor_bps <= bid_half_spread_bps <= cfg.spread_cap_bps):
+            raise RuntimeError(
+                "Bid half spread outside feasible bounds after projection: "
+                f"idx={idx} bid_half_spread_bps={bid_half_spread_bps} "
+                f"floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
             )
-        )
+        if not (half_spread_floor_bps <= ask_half_spread_bps <= cfg.spread_cap_bps):
+            raise RuntimeError(
+                "Ask half spread outside feasible bounds after projection: "
+                f"idx={idx} ask_half_spread_bps={ask_half_spread_bps} "
+                f"floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
+            )
         effective_half_spread_bps = 0.5 * (bid_half_spread_bps + ask_half_spread_bps)
         bid_half_spread_px = bps_to_px(mid, bid_half_spread_bps)
         ask_half_spread_px = bps_to_px(mid, ask_half_spread_bps)
@@ -2732,8 +2745,27 @@ class MarketMakingEnv:
         center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
         center_shift_mid_px = 0.5 * (center_shift_min_px + center_shift_max_px)
         center_shift_half_range_px = 0.5 * (center_shift_max_px - center_shift_min_px)
-        center_shift_px = center_shift_mid_px + center_control_clipped * center_shift_half_range_px
+        inventory_center_shift_px_raw = INVENTORY_CENTER_WEIGHT * center_control_clipped * center_shift_half_range_px
+        inventory_only_center_shift_px = float(
+            np.clip(
+                center_shift_mid_px + inventory_center_shift_px_raw,
+                center_shift_min_px,
+                center_shift_max_px,
+            )
+        )
+        alpha_center_shift_px_raw = ALPHA_CENTER_WEIGHT * skew_control_clipped * center_shift_half_range_px
+        center_shift_px = float(
+            np.clip(
+                inventory_only_center_shift_px + alpha_center_shift_px_raw,
+                center_shift_min_px,
+                center_shift_max_px,
+            )
+        )
+        actual_inventory_center_shift_px = inventory_only_center_shift_px - center_shift_mid_px
+        actual_alpha_center_shift_px = center_shift_px - inventory_only_center_shift_px
         center_shift_bps = center_shift_px / max(mid, 1e-12) * 1e4
+        inventory_center_shift_bps = actual_inventory_center_shift_px / max(mid, 1e-12) * 1e4
+        alpha_center_shift_bps = actual_alpha_center_shift_px / max(mid, 1e-12) * 1e4
         center_shift_scale_bps = center_shift_half_range_px / max(mid, 1e-12) * 1e4
         center_shift_min_bps = center_shift_min_px / max(mid, 1e-12) * 1e4
         center_shift_max_bps = center_shift_max_px / max(mid, 1e-12) * 1e4
@@ -2741,17 +2773,24 @@ class MarketMakingEnv:
         bid = mid + center_shift_px - bid_half_spread_px
         ask = mid + center_shift_px + ask_half_spread_px
         skew_bps = 0.5 * (ask_half_spread_bps - bid_half_spread_bps)
-        directional_response = (ask_half_spread_bps - bid_half_spread_bps) / max(
+        directional_center_response = float(
+            np.clip(actual_alpha_center_shift_px / max(center_shift_half_range_px, 1e-12), -1.0, 1.0)
+        )
+        directional_asym_response = (ask_half_spread_bps - bid_half_spread_bps) / max(
             ask_half_spread_bps + bid_half_spread_bps,
             1e-12,
+        )
+        directional_response = (
+            DIRECTIONAL_RESPONSE_CENTER_WEIGHT * directional_center_response
+            + DIRECTIONAL_RESPONSE_ASYM_WEIGHT * directional_asym_response
         )
         bid_at_floor = bid_half_spread_bps <= (half_spread_floor_bps + 1e-12)
         ask_at_floor = ask_half_spread_bps <= (half_spread_floor_bps + 1e-12)
         quote_metrics = {
             "observed_spread_bps": float(observed_spread_bps),
             "observed_anchor_half_spread_bps": float(observed_anchor_half_spread_bps),
-            "quote_anchor_floor_full_spread_bps": float(self.quote_anchor_floor_full_spread_bps),
-            "quote_anchor_half_spread_floor_bps": float(self.quote_anchor_half_spread_floor_bps),
+            "fill_norm_spread_floor_full_bps": float(self.fill_norm_spread_floor_full_bps),
+            "quote_half_spread_floor_bps": float(self.quote_half_spread_floor_bps),
             "anchor_half_spread_bps": float(anchor_half_spread_bps),
             "width_control": float(wc),
             "width_mult": float(width_mult),
@@ -2764,8 +2803,12 @@ class MarketMakingEnv:
             "center_shift_max_bps": float(center_shift_max_bps),
             "center_control": float(center_control_clipped),
             "center_shift_bps": float(center_shift_bps),
+            "inventory_center_shift_bps": float(inventory_center_shift_bps),
+            "alpha_center_shift_bps": float(alpha_center_shift_bps),
             "skew_control": float(skew_control_clipped),
             "skew_bps": float(skew_bps),
+            "directional_center_response": float(directional_center_response),
+            "directional_asym_response": float(directional_asym_response),
             "directional_response": float(directional_response),
             "bid_at_floor": bool(bid_at_floor),
             "ask_at_floor": bool(ask_at_floor),
@@ -3141,17 +3184,21 @@ class MarketMakingEnv:
                 "center_shift_max_bps": 0.0,
                 "observed_spread_bps": 0.0,
                 "observed_anchor_half_spread_bps": 0.0,
-                "quote_anchor_floor_full_spread_bps": float(self.quote_anchor_floor_full_spread_bps),
-                "quote_anchor_half_spread_floor_bps": float(self.quote_anchor_half_spread_floor_bps),
+                "fill_norm_spread_floor_full_bps": float(self.fill_norm_spread_floor_full_bps),
+                "quote_half_spread_floor_bps": float(self.quote_half_spread_floor_bps),
                 "width_control": 0.0,
                 "width_mult": 0.0,
                 "skew_control": 0.0,
                 "anchor_half_spread_bps": 0.0,
                 "base_half_spread_bps": 0.0,
                 "half_spread_bps": 0.0,
-                "bid_half_spread_bps": float(self.quote_anchor_half_spread_floor_bps),
-                "ask_half_spread_bps": float(self.quote_anchor_half_spread_floor_bps),
+                "bid_half_spread_bps": float(self.quote_half_spread_floor_bps),
+                "ask_half_spread_bps": float(self.quote_half_spread_floor_bps),
                 "skew_bps": 0.0,
+                "inventory_center_shift_bps": 0.0,
+                "alpha_center_shift_bps": 0.0,
+                "directional_center_response": 0.0,
+                "directional_asym_response": 0.0,
                 "directional_response": 0.0,
                 "bid_at_floor": 1.0,
                 "ask_at_floor": 1.0,
@@ -3353,8 +3400,8 @@ class MarketMakingEnv:
             "center_shift_max_bps": float(quote_metrics["center_shift_max_bps"]),
             "observed_spread_bps": float(quote_metrics["observed_spread_bps"]),
             "observed_anchor_half_spread_bps": float(quote_metrics["observed_anchor_half_spread_bps"]),
-            "quote_anchor_floor_full_spread_bps": float(quote_metrics["quote_anchor_floor_full_spread_bps"]),
-            "quote_anchor_half_spread_floor_bps": float(quote_metrics["quote_anchor_half_spread_floor_bps"]),
+            "fill_norm_spread_floor_full_bps": float(quote_metrics["fill_norm_spread_floor_full_bps"]),
+            "quote_half_spread_floor_bps": float(quote_metrics["quote_half_spread_floor_bps"]),
             "width_control": float(quote_metrics["width_control"]),
             "width_mult": float(quote_metrics["width_mult"]),
             "skew_control": float(quote_metrics["skew_control"]),
@@ -3364,6 +3411,10 @@ class MarketMakingEnv:
             "bid_half_spread_bps": float(quote_metrics["bid_half_spread_bps"]),
             "ask_half_spread_bps": float(quote_metrics["ask_half_spread_bps"]),
             "skew_bps": float(quote_metrics["skew_bps"]),
+            "inventory_center_shift_bps": float(quote_metrics["inventory_center_shift_bps"]),
+            "alpha_center_shift_bps": float(quote_metrics["alpha_center_shift_bps"]),
+            "directional_center_response": float(quote_metrics["directional_center_response"]),
+            "directional_asym_response": float(quote_metrics["directional_asym_response"]),
             "directional_response": float(quote_metrics["directional_response"]),
             "bid_at_floor": float(quote_metrics["bid_at_floor"]),
             "ask_at_floor": float(quote_metrics["ask_at_floor"]),
@@ -3483,11 +3534,11 @@ class MLP(nn.Module):
 class MarketPolicyNet(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: Iterable[int] = (128, 128), action_dim: int = 4):
         super().__init__()
-        # MarketPolicyNet wraps its MLP under .net for compatibility with checkpoints.
-        self.net = MLP(input_dim, hidden_dims, action_dim)
+        self.mlp_mean = MLP(input_dim, hidden_dims, action_dim)
+        self.linear_skip = nn.Linear(input_dim, action_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.mlp_mean(x) + self.linear_skip(x)
 
 
 class MarketPolicyValueNet(nn.Module):
@@ -3521,7 +3572,7 @@ class MarketPolicyValueNet(nn.Module):
 
 def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
     final_policy_linear: Optional[nn.Linear] = None
-    for module in model.policy_net.net.net:
+    for module in model.policy_net.mlp_mean.net:
         if isinstance(module, nn.Linear):
             final_policy_linear = module
     if final_policy_linear is None:
@@ -3529,7 +3580,7 @@ def _find_final_policy_linear_layer(model: MarketPolicyValueNet) -> nn.Linear:
     return final_policy_linear
 
 
-def _init_market_policy_mean_head(model: MarketPolicyValueNet) -> None:
+def _init_market_policy_mean_head(model: MarketPolicyValueNet, env: MarketMakingEnv) -> None:
     width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.14)
     if not np.isfinite(width_action_init) or not (0.0 < width_action_init < 1.0):
         raise ValueError(
@@ -3537,15 +3588,39 @@ def _init_market_policy_mean_head(model: MarketPolicyValueNet) -> None:
             f"got {width_action_init}"
         )
     width_latent_bias = float(np.arctanh(2.0 * width_action_init - 1.0))
+    with torch.no_grad():
+        for module in model.policy_net.mlp_mean.net:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    module.bias.zero_()
+        model.policy_net.linear_skip.weight.zero_()
+        if model.policy_net.linear_skip.bias is not None:
+            model.policy_net.linear_skip.bias.zero_()
     final_policy_linear = _find_final_policy_linear_layer(model)
     with torch.no_grad():
-        final_policy_linear.weight.zero_()
         if final_policy_linear.bias is not None:
-            final_policy_linear.bias.zero_()
             final_policy_linear.bias[0] = 0.0
             final_policy_linear.bias[1] = float(width_latent_bias)
             final_policy_linear.bias[2] = 0.0
             final_policy_linear.bias[3] = 0.0
+        feature_layout = env._feature_layout
+        skip_weight = model.policy_net.linear_skip.weight
+        skip_bias = model.policy_net.linear_skip.bias
+        dir_slice = feature_layout["dir_logits"]
+        p_up_slice = feature_layout["p_up"]
+        short_idx = 0
+        mid_idx = env._num_h // 2
+        long_idx = env._num_h - 1
+        skip_weight[2, dir_slice.start + short_idx] = 0.04
+        skip_weight[2, dir_slice.start + mid_idx] = 0.08
+        skip_weight[2, dir_slice.start + long_idx] = 0.22
+        skip_weight[2, p_up_slice.start + short_idx] = 0.02
+        skip_weight[2, p_up_slice.start + mid_idx] = 0.04
+        skip_weight[2, p_up_slice.start + long_idx] = 0.08
+        skip_bias[2] = -0.07
+        skip_weight[0, env._obs_extra_slice.start + 0] = -0.25
+        skip_bias[0] = 0.0
 
 
 @dataclass
@@ -3565,9 +3640,9 @@ class PPOConfig:
     rollout_horizon: int = 8192
     rollouts_per_epoch: int = 16
     randomize_rollout_start: bool = True
-    init_log_std_center: float = -0.7
-    init_log_std_width: float = -0.9
-    init_log_std_skew: float = -0.7
+    init_log_std_center: float = -0.20
+    init_log_std_width: float = -1.00
+    init_log_std_skew: float = 0.00
     init_log_std_taker: float = -1.0
 
 
@@ -3672,16 +3747,20 @@ def collect_market_rollout(
     center_shift_min_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_max_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    inventory_center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    alpha_center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     skew_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     skew_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    directional_center_response_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    directional_asym_response_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     directional_response_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     bid_at_floor_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     ask_at_floor_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     weighted_cmssl_logit_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     observed_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     observed_anchor_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    quote_anchor_floor_full_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    quote_anchor_half_spread_floor_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    fill_norm_spread_floor_full_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    quote_half_spread_floor_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     bid_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     ask_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     cursor = 0
@@ -3861,16 +3940,20 @@ def collect_market_rollout(
             center_shift_min_bps_buf[idx] = float(info.get("center_shift_min_bps", 0.0))
             center_shift_max_bps_buf[idx] = float(info.get("center_shift_max_bps", 0.0))
             center_shift_bps_buf[idx] = float(info.get("center_shift_bps", 0.0))
+            inventory_center_shift_bps_buf[idx] = float(info.get("inventory_center_shift_bps", 0.0))
+            alpha_center_shift_bps_buf[idx] = float(info.get("alpha_center_shift_bps", 0.0))
             skew_control_buf[idx] = float(info.get("skew_control", 0.0))
             skew_bps_buf[idx] = float(info.get("skew_bps", 0.0))
+            directional_center_response_buf[idx] = float(info.get("directional_center_response", 0.0))
+            directional_asym_response_buf[idx] = float(info.get("directional_asym_response", 0.0))
             directional_response_buf[idx] = float(info.get("directional_response", 0.0))
             bid_at_floor_buf[idx] = float(info.get("bid_at_floor", 0.0))
             ask_at_floor_buf[idx] = float(info.get("ask_at_floor", 0.0))
             weighted_cmssl_logit_buf[idx] = float(info.get("weighted_cmssl_logit", 0.0))
             observed_spread_bps_buf[idx] = float(info.get("observed_spread_bps", 0.0))
             observed_anchor_half_spread_bps_buf[idx] = float(info.get("observed_anchor_half_spread_bps", 0.0))
-            quote_anchor_floor_full_spread_bps_buf[idx] = float(info.get("quote_anchor_floor_full_spread_bps", 0.0))
-            quote_anchor_half_spread_floor_bps_buf[idx] = float(info.get("quote_anchor_half_spread_floor_bps", 0.0))
+            fill_norm_spread_floor_full_bps_buf[idx] = float(info.get("fill_norm_spread_floor_full_bps", 0.0))
+            quote_half_spread_floor_bps_buf[idx] = float(info.get("quote_half_spread_floor_bps", 0.0))
             bid_half_spread_bps_buf[idx] = float(info.get("bid_half_spread_bps", 0.0))
             ask_half_spread_bps_buf[idx] = float(info.get("ask_half_spread_bps", 0.0))
             terminated_buf[idx] = float(terminated)
@@ -3946,16 +4029,20 @@ def collect_market_rollout(
         "center_shift_min_bps": center_shift_min_bps_buf[:cursor],
         "center_shift_max_bps": center_shift_max_bps_buf[:cursor],
         "center_shift_bps": center_shift_bps_buf[:cursor],
+        "inventory_center_shift_bps": inventory_center_shift_bps_buf[:cursor],
+        "alpha_center_shift_bps": alpha_center_shift_bps_buf[:cursor],
         "skew_control": skew_control_buf[:cursor],
         "skew_bps": skew_bps_buf[:cursor],
+        "directional_center_response": directional_center_response_buf[:cursor],
+        "directional_asym_response": directional_asym_response_buf[:cursor],
         "directional_response": directional_response_buf[:cursor],
         "bid_at_floor": bid_at_floor_buf[:cursor],
         "ask_at_floor": ask_at_floor_buf[:cursor],
         "weighted_cmssl_logit": weighted_cmssl_logit_buf[:cursor],
         "observed_spread_bps": observed_spread_bps_buf[:cursor],
         "observed_anchor_half_spread_bps": observed_anchor_half_spread_bps_buf[:cursor],
-        "quote_anchor_floor_full_spread_bps": quote_anchor_floor_full_spread_bps_buf[:cursor],
-        "quote_anchor_half_spread_floor_bps": quote_anchor_half_spread_floor_bps_buf[:cursor],
+        "fill_norm_spread_floor_full_bps": fill_norm_spread_floor_full_bps_buf[:cursor],
+        "quote_half_spread_floor_bps": quote_half_spread_floor_bps_buf[:cursor],
         "bid_half_spread_bps": bid_half_spread_bps_buf[:cursor],
         "ask_half_spread_bps": ask_half_spread_bps_buf[:cursor],
         "rollout_start_indices": np.asarray(rollout_start_indices, dtype=np.int64),
@@ -4433,19 +4520,12 @@ def _canonical_market_ppo_action_dim(ckpt: Dict[str, Any]) -> int:
 def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
     schema = ckpt.get("checkpoint_schema")
     if schema != MM_PPO_CHECKPOINT_SCHEMA:
-        legacy_note = ""
-        if schema == "mm-ppo-direct-quote-v4":
-            legacy_note = (
-                " Direct-quote v4 checkpoints are incompatible with v5 because maker-fill activity "
-                "is now train-split volatility-calibrated and runtime metadata includes calibration fields; "
-                "retraining is required."
-            )
-        elif schema == "mm-ppo-direct-quote-v3":
-            legacy_note = (
-                " Direct-quote v3 checkpoints are incompatible with v4 because width control "
-                "contract changed to one-sided [0,1], fill normalization changed, and policy "
-                "initialization defaults changed; retraining is required."
-            )
+        legacy_note = (
+            " Direct-quote v5 checkpoints are incompatible with v6 because policy architecture "
+            "changed to MLP + linear skip and mean-head warm-start semantics changed; retraining is required."
+            if schema == "mm-ppo-direct-quote-v5"
+            else ""
+        )
         raise ValueError(
             "Unsupported market PPO checkpoint schema. "
             f"Expected checkpoint_schema={MM_PPO_CHECKPOINT_SCHEMA!r}, got {schema!r}. "
@@ -4569,7 +4649,7 @@ def train_market_ppo(
             config.init_log_std_taker,
         ),
     ).to(device)
-    _init_market_policy_mean_head(model)
+    _init_market_policy_mean_head(model, train_env)
     mean_head_width_action_init = _env_float("BYBIT_MM_PPO_WIDTH_ACTION_INIT", 0.14)
     if not np.isfinite(mean_head_width_action_init) or not (0.0 < mean_head_width_action_init < 1.0):
         raise ValueError(
@@ -4592,10 +4672,13 @@ def train_market_ppo(
         f"rollout_horizon={config.rollout_horizon} "
         f"rollouts_per_epoch={config.rollouts_per_epoch} "
         f"steps_per_epoch={config.rollout_horizon * config.rollouts_per_epoch} "
-        "mean_head_init=zeros_width_bias_only "
+        "mean_head_init=small_normal_mlp_plus_cmssl_skip_warm_start "
         f"width_action_init={mean_head_width_action_init:.2f} "
         "width_action_init_source=BYBIT_MM_PPO_WIDTH_ACTION_INIT(default=0.14) "
         f"width_bias_latent={mean_head_width_bias_latent:.6f} "
+        f"alpha_center_weight={ALPHA_CENTER_WEIGHT:.2f} "
+        f"inventory_center_weight={INVENTORY_CENTER_WEIGHT:.2f} "
+        f"quote_half_spread_floor_bps={train_env.quote_half_spread_floor_bps:.4f} "
         "action_controls=center/width/skew/taker controls "
         f"init_log_std_center={config.init_log_std_center:.4f} "
         f"init_log_std_width={config.init_log_std_width:.4f} "
@@ -4662,7 +4745,7 @@ def train_market_ppo(
         f"action_dim={action_dim} "
         f"low={np.array2string(bounds_low_np, precision=4, floatmode='fixed')} "
         f"high={np.array2string(bounds_high_np, precision=4, floatmode='fixed')} "
-        f"env_quote_anchor_half_spread_floor_bps={train_env.quote_anchor_half_spread_floor_bps:.6f} "
+        f"env_quote_half_spread_floor_bps={train_env.quote_half_spread_floor_bps:.6f} "
         f"taker_signal_limit={train_env.taker_signal_limit:.4f} "
         f"mean_probe_action={np.array2string(bounded_probe_action, precision=4, floatmode='fixed')} "
         f"mean_probe_action_labeled={probe_action_labels} "
@@ -4746,6 +4829,7 @@ def train_market_ppo(
             "train env obs normalization count drifted during PPO despite frozen normalization"
         )
         final_policy_linear = _find_final_policy_linear_layer(model)
+        policy_skip_linear = model.policy_net.linear_skip
         with torch.no_grad():
             probe_mean = model.policy_net(probe_obs)
             bounded_probe_actions = _bounded_ppo_mean_action(probe_mean, action_low, action_high)
@@ -4756,18 +4840,25 @@ def train_market_ppo(
                 bounded_probe_actions.abs() >= (0.95 * action_bound_magnitude)
             ).float().mean(dim=0).detach().cpu().numpy()
             log_std_values = model.log_std.detach().cpu().numpy()
-            policy_weight_l2 = float(final_policy_linear.weight.detach().norm(2).item())
-            policy_bias_l2 = (
-                float(final_policy_linear.bias.detach().norm(2).item())
-                if final_policy_linear.bias is not None
-                else 0.0
+            policy_mlp_final_weight_l2 = float(final_policy_linear.weight.detach().norm(2).item())
+            policy_skip_weight_l2 = float(policy_skip_linear.weight.detach().norm(2).item())
+            policy_total_head_weight_l2 = float(
+                np.sqrt(policy_mlp_final_weight_l2 ** 2 + policy_skip_weight_l2 ** 2)
             )
+            policy_head_bias_l2 = 0.0
+            if final_policy_linear.bias is not None:
+                policy_head_bias_l2 += float(final_policy_linear.bias.detach().norm(2).item()) ** 2
+            if policy_skip_linear.bias is not None:
+                policy_head_bias_l2 += float(policy_skip_linear.bias.detach().norm(2).item()) ** 2
+            policy_head_bias_l2 = float(np.sqrt(policy_head_bias_l2))
         print(
             "[mm ppo stats] "
             f"epoch={epoch + 1} "
             f"log_std={np.array2string(log_std_values, precision=4, floatmode='fixed')} "
-            f"policy_head_weight_l2={policy_weight_l2:.6f} "
-            f"policy_head_bias_l2={policy_bias_l2:.6f} "
+            f"policy_mlp_final_weight_l2={policy_mlp_final_weight_l2:.6f} "
+            f"policy_skip_weight_l2={policy_skip_weight_l2:.6f} "
+            f"policy_total_head_weight_l2={policy_total_head_weight_l2:.6f} "
+            f"policy_head_bias_l2={policy_head_bias_l2:.6f} "
             f"probe_mean_abs={np.array2string(probe_mean_abs, precision=6, floatmode='fixed')} "
             f"bounded_probe_mean_action_abs={np.array2string(bounded_probe_mean_action_abs, precision=6, floatmode='fixed')} "
             f"saturation_fraction={np.array2string(saturation_fraction, precision=6, floatmode='fixed')}"
@@ -4811,8 +4902,12 @@ def train_market_ppo(
         center_shift_min_bps_np = rollout["center_shift_min_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_max_bps_np = rollout["center_shift_max_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_bps_np = rollout["center_shift_bps"].detach().cpu().numpy().astype(np.float64)
+        inventory_center_shift_bps_np = rollout["inventory_center_shift_bps"].detach().cpu().numpy().astype(np.float64)
+        alpha_center_shift_bps_np = rollout["alpha_center_shift_bps"].detach().cpu().numpy().astype(np.float64)
         skew_control_np = rollout["skew_control"].detach().cpu().numpy().astype(np.float64)
         skew_bps_np = rollout["skew_bps"].detach().cpu().numpy().astype(np.float64)
+        directional_center_response_np = rollout["directional_center_response"].detach().cpu().numpy().astype(np.float64)
+        directional_asym_response_np = rollout["directional_asym_response"].detach().cpu().numpy().astype(np.float64)
         directional_response_np = rollout["directional_response"].detach().cpu().numpy().astype(np.float64)
         bid_at_floor_np = rollout["bid_at_floor"].detach().cpu().numpy().astype(np.float64)
         ask_at_floor_np = rollout["ask_at_floor"].detach().cpu().numpy().astype(np.float64)
@@ -4820,8 +4915,8 @@ def train_market_ppo(
         cmssl_alpha_np = rollout["cmssl_alpha"].detach().cpu().numpy().astype(np.float64)
         observed_spread_bps_np = rollout["observed_spread_bps"].detach().cpu().numpy().astype(np.float64)
         observed_anchor_half_spread_bps_np = rollout["observed_anchor_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
-        quote_anchor_floor_full_spread_bps_np = rollout["quote_anchor_floor_full_spread_bps"].detach().cpu().numpy().astype(np.float64)
-        quote_anchor_half_spread_floor_bps_np = rollout["quote_anchor_half_spread_floor_bps"].detach().cpu().numpy().astype(np.float64)
+        fill_norm_spread_floor_full_bps_np = rollout["fill_norm_spread_floor_full_bps"].detach().cpu().numpy().astype(np.float64)
+        quote_half_spread_floor_bps_np = rollout["quote_half_spread_floor_bps"].detach().cpu().numpy().astype(np.float64)
         bid_half_spread_bps_np = rollout["bid_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
         ask_half_spread_bps_np = rollout["ask_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
         true_abs_mean = float(np.mean(np.abs(reward_true_np))) if reward_true_np.size else 0.0
@@ -4894,17 +4989,25 @@ def train_market_ppo(
             f"observed_anchor_half_spread_bps_mean={float(np.mean(observed_anchor_half_spread_bps_np)):.6f} "
             f"observed_anchor_half_spread_bps_p50={float(np.percentile(observed_anchor_half_spread_bps_np, 50.0)):.6f} "
             f"observed_anchor_half_spread_bps_p90={float(np.percentile(observed_anchor_half_spread_bps_np, 90.0)):.6f} "
-            f"quote_anchor_floor_full_spread_bps_mean={float(np.mean(quote_anchor_floor_full_spread_bps_np)):.6f} "
-            f"quote_anchor_floor_full_spread_bps_p50={float(np.percentile(quote_anchor_floor_full_spread_bps_np, 50.0)):.6f} "
-            f"quote_anchor_floor_full_spread_bps_p90={float(np.percentile(quote_anchor_floor_full_spread_bps_np, 90.0)):.6f} "
-            f"quote_anchor_half_spread_floor_bps_mean={float(np.mean(quote_anchor_half_spread_floor_bps_np)):.6f} "
-            f"quote_anchor_half_spread_floor_bps_p50={float(np.percentile(quote_anchor_half_spread_floor_bps_np, 50.0)):.6f} "
-            f"quote_anchor_half_spread_floor_bps_p90={float(np.percentile(quote_anchor_half_spread_floor_bps_np, 90.0)):.6f} "
+            f"fill_norm_spread_floor_full_bps_mean={float(np.mean(fill_norm_spread_floor_full_bps_np)):.6f} "
+            f"fill_norm_spread_floor_full_bps_p50={float(np.percentile(fill_norm_spread_floor_full_bps_np, 50.0)):.6f} "
+            f"fill_norm_spread_floor_full_bps_p90={float(np.percentile(fill_norm_spread_floor_full_bps_np, 90.0)):.6f} "
+            f"quote_half_spread_floor_bps_mean={float(np.mean(quote_half_spread_floor_bps_np)):.6f} "
+            f"quote_half_spread_floor_bps_p50={float(np.percentile(quote_half_spread_floor_bps_np, 50.0)):.6f} "
+            f"quote_half_spread_floor_bps_p90={float(np.percentile(quote_half_spread_floor_bps_np, 90.0)):.6f} "
             f"skew_bps_mean={float(np.mean(skew_bps_np)):.6f} "
             f"skew_bps_p50={float(np.percentile(skew_bps_np, 50.0)):.6f} "
             f"skew_bps_abs_p90={float(np.percentile(np.abs(skew_bps_np), 90.0)):.6f} "
             f"directional_response_mean={float(np.mean(directional_response_np)):.6f} "
             f"directional_response_abs_p90={float(np.percentile(np.abs(directional_response_np), 90.0)):.6f} "
+            f"inventory_center_shift_bps_mean={float(np.mean(inventory_center_shift_bps_np)):.6f} "
+            f"inventory_center_shift_bps_abs_p90={float(np.percentile(np.abs(inventory_center_shift_bps_np), 90.0)):.6f} "
+            f"alpha_center_shift_bps_mean={float(np.mean(alpha_center_shift_bps_np)):.6f} "
+            f"alpha_center_shift_bps_abs_p90={float(np.percentile(np.abs(alpha_center_shift_bps_np), 90.0)):.6f} "
+            f"directional_center_response_mean={float(np.mean(directional_center_response_np)):.6f} "
+            f"directional_center_response_abs_p90={float(np.percentile(np.abs(directional_center_response_np), 90.0)):.6f} "
+            f"directional_asym_response_mean={float(np.mean(directional_asym_response_np)):.6f} "
+            f"directional_asym_response_abs_p90={float(np.percentile(np.abs(directional_asym_response_np), 90.0)):.6f} "
             f"bid_half_spread_bps_mean={float(np.mean(bid_half_spread_bps_np)):.6f} "
             f"bid_half_spread_bps_p50={float(np.percentile(bid_half_spread_bps_np, 50.0)):.6f} "
             f"bid_half_spread_bps_p90={float(np.percentile(bid_half_spread_bps_np, 90.0)):.6f} "
@@ -4960,9 +5063,13 @@ def train_market_ppo(
             f"center_shift_bps_abs_p90={float(np.percentile(np.abs(center_shift_bps_np), 90.0)):.6f} "
             f"cmssl_skew_control_corr={_safe_corr(weighted_cmssl_logit_np, skew_control_np):.6f} "
             f"cmssl_skew_bps_corr={_safe_corr(weighted_cmssl_logit_np, skew_bps_np):.6f} "
+            f"cmssl_alpha_center_shift_corr={_safe_corr(weighted_cmssl_logit_np, alpha_center_shift_bps_np):.6f} "
+            f"cmssl_directional_center_response_corr={_safe_corr(weighted_cmssl_logit_np, directional_center_response_np):.6f} "
             f"cmssl_sign_agreement={sign_agreement:.6f} "
             f"abs_directional_response_high_abs_logit_mean={float(np.mean(np.abs(directional_response_np[high_logit_mask])) if np.any(high_logit_mask) else 0.0):.6f} "
             f"abs_directional_response_low_abs_logit_mean={float(np.mean(np.abs(directional_response_np[low_logit_mask])) if np.any(low_logit_mask) else 0.0):.6f} "
+            f"abs_alpha_center_shift_high_abs_logit_mean={float(np.mean(np.abs(alpha_center_shift_bps_np[high_logit_mask])) if np.any(high_logit_mask) else 0.0):.6f} "
+            f"abs_alpha_center_shift_low_abs_logit_mean={float(np.mean(np.abs(alpha_center_shift_bps_np[low_logit_mask])) if np.any(low_logit_mask) else 0.0):.6f} "
             f"bid_floor_fraction={float(np.mean(bid_at_floor_np)):.6f} "
             f"ask_floor_fraction={float(np.mean(ask_at_floor_np)):.6f}"
         )
@@ -5265,9 +5372,13 @@ def evaluate_market_making(
     skew_control_steps: List[float] = []
     skew_bps_steps: List[float] = []
     directional_response_steps: List[float] = []
+    directional_center_response_steps: List[float] = []
+    directional_asym_response_steps: List[float] = []
     bid_at_floor_steps: List[float] = []
     ask_at_floor_steps: List[float] = []
     center_shift_bps_steps: List[float] = []
+    inventory_center_shift_bps_steps: List[float] = []
+    alpha_center_shift_bps_steps: List[float] = []
     weighted_cmssl_logit_steps: List[float] = []
     obs = env.reset()
     equity_curve: List[float] = []
@@ -5346,10 +5457,14 @@ def evaluate_market_making(
         maker_sell_steps_signed.append(float(info.get("maker_sell", 0.0)))
         skew_control_steps.append(float(info.get("skew_control", 0.0)))
         skew_bps_steps.append(float(info.get("skew_bps", 0.0)))
+        directional_center_response_steps.append(float(info.get("directional_center_response", 0.0)))
+        directional_asym_response_steps.append(float(info.get("directional_asym_response", 0.0)))
         directional_response_steps.append(float(info.get("directional_response", 0.0)))
         bid_at_floor_steps.append(float(info.get("bid_at_floor", 0.0)))
         ask_at_floor_steps.append(float(info.get("ask_at_floor", 0.0)))
         center_shift_bps_steps.append(float(info.get("center_shift_bps", 0.0)))
+        inventory_center_shift_bps_steps.append(float(info.get("inventory_center_shift_bps", 0.0)))
+        alpha_center_shift_bps_steps.append(float(info.get("alpha_center_shift_bps", 0.0)))
         weighted_cmssl_logit_steps.append(float(info.get("weighted_cmssl_logit", 0.0)))
         taker_steps += int(info["taker_buy"] > 0.0 or info["taker_sell"] > 0.0)
         if collect_vol_bucket_report:
@@ -5439,10 +5554,14 @@ def evaluate_market_making(
     touch_dist_sell_arr = np.asarray(touch_dist_sell_steps, dtype=np.float64)
     skew_control_arr = np.asarray(skew_control_steps, dtype=np.float64)
     skew_bps_arr = np.asarray(skew_bps_steps, dtype=np.float64)
+    directional_center_response_arr = np.asarray(directional_center_response_steps, dtype=np.float64)
+    directional_asym_response_arr = np.asarray(directional_asym_response_steps, dtype=np.float64)
     directional_response_arr = np.asarray(directional_response_steps, dtype=np.float64)
     bid_at_floor_arr = np.asarray(bid_at_floor_steps, dtype=np.float64)
     ask_at_floor_arr = np.asarray(ask_at_floor_steps, dtype=np.float64)
     center_shift_bps_arr = np.asarray(center_shift_bps_steps, dtype=np.float64)
+    inventory_center_shift_bps_arr = np.asarray(inventory_center_shift_bps_steps, dtype=np.float64)
+    alpha_center_shift_bps_arr = np.asarray(alpha_center_shift_bps_steps, dtype=np.float64)
     weighted_cmssl_logit_arr = np.asarray(weighted_cmssl_logit_steps, dtype=np.float64)
     maker_buy_signed_arr = np.asarray(maker_buy_steps_signed, dtype=np.float64)
     maker_sell_signed_arr = np.asarray(maker_sell_steps_signed, dtype=np.float64)
@@ -5523,14 +5642,26 @@ def evaluate_market_making(
         "skew_bps_abs_p90": float(np.percentile(np.abs(skew_bps_arr), 90.0)) if skew_bps_arr.size else 0.0,
         "directional_response_mean": float(np.mean(directional_response_arr)) if directional_response_arr.size else 0.0,
         "directional_response_abs_p90": float(np.percentile(np.abs(directional_response_arr), 90.0)) if directional_response_arr.size else 0.0,
+        "directional_center_response_mean": float(np.mean(directional_center_response_arr)) if directional_center_response_arr.size else 0.0,
+        "directional_center_response_abs_p90": float(np.percentile(np.abs(directional_center_response_arr), 90.0)) if directional_center_response_arr.size else 0.0,
+        "directional_asym_response_mean": float(np.mean(directional_asym_response_arr)) if directional_asym_response_arr.size else 0.0,
+        "directional_asym_response_abs_p90": float(np.percentile(np.abs(directional_asym_response_arr), 90.0)) if directional_asym_response_arr.size else 0.0,
         "center_shift_bps_mean": float(np.mean(center_shift_bps_arr)) if center_shift_bps_arr.size else 0.0,
         "center_shift_bps_p50": float(np.percentile(center_shift_bps_arr, 50.0)) if center_shift_bps_arr.size else 0.0,
         "center_shift_bps_abs_p90": float(np.percentile(np.abs(center_shift_bps_arr), 90.0)) if center_shift_bps_arr.size else 0.0,
+        "inventory_center_shift_bps_mean": float(np.mean(inventory_center_shift_bps_arr)) if inventory_center_shift_bps_arr.size else 0.0,
+        "inventory_center_shift_bps_abs_p90": float(np.percentile(np.abs(inventory_center_shift_bps_arr), 90.0)) if inventory_center_shift_bps_arr.size else 0.0,
+        "alpha_center_shift_bps_mean": float(np.mean(alpha_center_shift_bps_arr)) if alpha_center_shift_bps_arr.size else 0.0,
+        "alpha_center_shift_bps_abs_p90": float(np.percentile(np.abs(alpha_center_shift_bps_arr), 90.0)) if alpha_center_shift_bps_arr.size else 0.0,
         "cmssl_skew_control_corr": _safe_corr(weighted_cmssl_logit_arr, skew_control_arr),
         "cmssl_skew_bps_corr": _safe_corr(weighted_cmssl_logit_arr, skew_bps_arr),
+        "cmssl_alpha_center_shift_corr": _safe_corr(weighted_cmssl_logit_arr, alpha_center_shift_bps_arr),
+        "cmssl_directional_center_response_corr": _safe_corr(weighted_cmssl_logit_arr, directional_center_response_arr),
         "cmssl_sign_agreement_rate": float(np.mean(np.sign(directional_response_arr) == np.sign(weighted_cmssl_logit_arr))) if directional_response_arr.size else 0.0,
         "abs_directional_response_high_abs_logit_mean": float(np.mean(np.abs(directional_response_arr[high_mask]))) if directional_response_arr.size and np.any(high_mask) else 0.0,
         "abs_directional_response_low_abs_logit_mean": float(np.mean(np.abs(directional_response_arr[low_mask]))) if directional_response_arr.size and np.any(low_mask) else 0.0,
+        "abs_alpha_center_shift_high_abs_logit_mean": float(np.mean(np.abs(alpha_center_shift_bps_arr[high_mask]))) if alpha_center_shift_bps_arr.size and np.any(high_mask) else 0.0,
+        "abs_alpha_center_shift_low_abs_logit_mean": float(np.mean(np.abs(alpha_center_shift_bps_arr[low_mask]))) if alpha_center_shift_bps_arr.size and np.any(low_mask) else 0.0,
         "maker_buy_volume_when_signal_pos": float(np.sum(maker_buy_signed_arr[weighted_cmssl_logit_arr > 0.0])) if maker_buy_signed_arr.size else 0.0,
         "maker_sell_volume_when_signal_pos": float(np.sum(maker_sell_signed_arr[weighted_cmssl_logit_arr > 0.0])) if maker_sell_signed_arr.size else 0.0,
         "maker_buy_volume_when_signal_neg": float(np.sum(maker_buy_signed_arr[weighted_cmssl_logit_arr < 0.0])) if maker_buy_signed_arr.size else 0.0,
@@ -5815,9 +5946,9 @@ def run_pipeline(
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 16),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
-        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.7),
-        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -0.9),
-        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", -0.7),
+        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.20),
+        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -1.00),
+        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", 0.00),
         init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -1.0),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
