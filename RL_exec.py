@@ -1916,6 +1916,7 @@ def _build_joined_cache_identity(
     split: Dict[str, Any],
     meta: Dict[str, Any],
     ckpt_path: str,
+    directional_signal_config: DirectionalSignalConfig,
 ) -> Dict[str, Any]:
     out_root_path = Path(out_root).resolve()
     weeks = [str(w) for w in _split_weeks(split)]
@@ -1936,6 +1937,10 @@ def _build_joined_cache_identity(
     split_protocol = None
     if isinstance(meta.get("splits"), dict):
         split_protocol = meta["splits"].get("protocol")
+    directional_signal_payload = {
+        "horizon_logit_weights": [float(v) for v in directional_signal_config.horizon_logit_weights],
+        "training_reward_horizon_ms": int(directional_signal_config.training_reward_horizon_ms),
+    }
     return {
         "joined_cache_schema_version": JOINED_CACHE_SCHEMA_VERSION,
         "joined_feature_schema_version": JOINED_FEATURE_SCHEMA_VERSION,
@@ -1959,6 +1964,7 @@ def _build_joined_cache_identity(
             "splits.protocol": split_protocol,
             "joined_ts_ordering": "nondecreasing",
         },
+        "directional_signal_config": directional_signal_payload,
         "referenced_weeks": week_refs,
     }
 
@@ -2113,7 +2119,20 @@ def build_joined_split(
     batch_size: int = 2048,
 ) -> Dict[str, np.ndarray]:
     cache_t0 = time.perf_counter()
-    payload = _build_joined_cache_identity(out_root, split_label, split, meta, ckpt_path)
+    directional_signal_payload = {
+        "horizon_logit_weights": [float(v) for v in directional_signal_config.horizon_logit_weights],
+        "training_reward_horizon_ms": int(directional_signal_config.training_reward_horizon_ms),
+    }
+    signal_weights_summary = "[" + ",".join(f"{v:.6g}" for v in directional_signal_payload["horizon_logit_weights"]) + "]"
+    train_reward_horizon_ms = directional_signal_payload["training_reward_horizon_ms"]
+    payload = _build_joined_cache_identity(
+        out_root,
+        split_label,
+        split,
+        meta,
+        ckpt_path,
+        directional_signal_config,
+    )
     fingerprint = _hash_payload(payload)
     npz_path, sidecar_path = _joined_cache_paths(out_root, split_label, fingerprint)
 
@@ -2122,7 +2141,8 @@ def build_joined_split(
         cached = _load_joined_cache(npz_path, sidecar_path, meta=cache_meta)
         _timing_log(
             f"[joined-cache] hit label={split_label} fingerprint={fingerprint} "
-            f"path={npz_path} rows={cached['ts'].shape[0]} secs={time.perf_counter() - cache_t0:.4f}"
+            f"path={npz_path} rows={cached['ts'].shape[0]} signal_weights={signal_weights_summary} "
+            f"train_reward_horizon_ms={train_reward_horizon_ms} secs={time.perf_counter() - cache_t0:.4f}"
         )
         return cached
     except JoinedCacheError as exc:
@@ -2130,12 +2150,14 @@ def build_joined_split(
         if "artifact missing" in reason:
             _timing_log(
                 f"[joined-cache] miss label={split_label} fingerprint={fingerprint} "
-                f"path={npz_path} sidecar={sidecar_path}"
+                f"path={npz_path} sidecar={sidecar_path} signal_weights={signal_weights_summary} "
+                f"train_reward_horizon_ms={train_reward_horizon_ms}"
             )
         else:
             _timing_log(
                 f"[joined-cache] stale label={split_label} fingerprint={fingerprint} "
-                f"path={npz_path} sidecar={sidecar_path} reason={reason} rebuilding"
+                f"path={npz_path} sidecar={sidecar_path} signal_weights={signal_weights_summary} "
+                f"train_reward_horizon_ms={train_reward_horizon_ms} reason={reason} rebuilding"
             )
 
     out = _build_joined_split_uncached(
@@ -2154,6 +2176,7 @@ def build_joined_split(
         "joined_feature_schema_version": JOINED_FEATURE_SCHEMA_VERSION,
         "fingerprint": fingerprint,
         "identity_payload": payload,
+        "directional_signal_config": directional_signal_payload,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "split_label": str(split_label),
         "row_count": int(out["ts"].shape[0]),
@@ -2167,7 +2190,8 @@ def build_joined_split(
     _timing_log(
         f"[joined-cache] saved label={split_label} fingerprint={fingerprint} "
         f"path={npz_path} sidecar={sidecar_path} rows={out['ts'].shape[0]} "
-        f"feature_dim={out['features'].shape[1]} secs={time.perf_counter() - save_t0:.4f}"
+        f"feature_dim={out['features'].shape[1]} signal_weights={signal_weights_summary} "
+        f"train_reward_horizon_ms={train_reward_horizon_ms} secs={time.perf_counter() - save_t0:.4f}"
     )
     return out
 
