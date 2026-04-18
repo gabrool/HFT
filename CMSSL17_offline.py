@@ -8,7 +8,7 @@ This mirrors the training/eval flow in CMSSL17.py but reads dataset splits
 from OUT_ROOT/meta.json and week meta files, avoiding any online feature building.
 """
 
-import os, sys, math, json
+import os, sys, math, json, csv
 from typing import List, Dict, Tuple, Iterable, Optional, Any
 from pathlib import Path
 import numpy as np
@@ -621,6 +621,399 @@ def compute_directional_loss_fn(build_directional_noise_filter_mask_fn, horizon_
         return (loss_stack * weight_stack).sum() / weight_stack.sum()
     return compute_directional_loss
 
+def _safe_mean(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return float("nan")
+    return float(np.mean(x[finite]))
+
+
+def _safe_std(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return float("nan")
+    return float(np.std(x[finite]))
+
+
+def _safe_median(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return float("nan")
+    return float(np.median(x[finite]))
+
+
+def _safe_quantile(x: np.ndarray, q: float) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return float("nan")
+    return float(np.quantile(x[finite], q))
+
+
+def _safe_frac(mask: np.ndarray) -> float:
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0:
+        return float("nan")
+    return float(np.mean(mask.astype(np.float64)))
+
+
+def _safe_ratio(num: float, den: float) -> float:
+    if not np.isfinite(num) or not np.isfinite(den) or den <= 0.0:
+        return float("nan")
+    return float(num / den)
+
+
+def _rankdata_average_ties(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    n = x.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    finite_idx = np.where(np.isfinite(x))[0]
+    if finite_idx.size == 0:
+        return out
+    xf = x[finite_idx]
+    order = np.argsort(xf, kind="mergesort")
+    ranks = np.empty_like(xf, dtype=np.float64)
+    sorted_vals = xf[order]
+    i = 0
+    while i < sorted_vals.size:
+        j = i + 1
+        while j < sorted_vals.size and sorted_vals[j] == sorted_vals[i]:
+            j += 1
+        avg_rank = 0.5 * (i + j - 1) + 1.0
+        ranks[order[i:j]] = avg_rank
+        i = j
+    out[finite_idx] = ranks
+    return out
+
+
+def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if np.count_nonzero(finite) < 2:
+        return float("nan")
+    xf = x[finite]
+    yf = y[finite]
+    xstd = float(np.std(xf))
+    ystd = float(np.std(yf))
+    if xstd <= 0.0 or ystd <= 0.0:
+        return float("nan")
+    return float(np.mean((xf - float(np.mean(xf))) * (yf - float(np.mean(yf)))) / (xstd * ystd))
+
+
+def _safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
+    xr = _rankdata_average_ties(x)
+    yr = _rankdata_average_ties(y)
+    return _safe_pearson(xr, yr)
+
+
+def _topk_mask_from_score(score: np.ndarray, frac: float) -> np.ndarray:
+    score = np.asarray(score, dtype=np.float64).reshape(-1)
+    n = score.size
+    out = np.zeros(n, dtype=bool)
+    if n == 0:
+        return out
+    if frac >= 1.0:
+        out[:] = True
+        return out
+    if frac <= 0.0:
+        return out
+    k = max(1, int(math.floor(frac * n)))
+    order = np.argsort(-score, kind="mergesort")
+    out[order[:k]] = True
+    return out
+
+
+def _quantile_bin_edges(x: np.ndarray, n_bins: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    xf = x[np.isfinite(x)]
+    if xf.size == 0:
+        return np.array([0.0, 1e-12], dtype=np.float64)
+    qs = np.linspace(0.0, 1.0, int(n_bins) + 1)
+    edges = np.quantile(xf, qs)
+    edges = np.unique(edges.astype(np.float64))
+    if edges.size >= 2:
+        return edges
+    v = float(xf[0])
+    eps = max(1e-12, abs(v) * 1e-12)
+    return np.array([v - eps, v + eps], dtype=np.float64)
+
+
+def _assign_bins(x: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    edges = np.asarray(edges, dtype=np.float64).reshape(-1)
+    if edges.size < 2:
+        raise ValueError("edges must contain at least 2 values")
+    right = np.searchsorted(edges, x, side="right") - 1
+    return np.clip(right, 0, edges.size - 2).astype(np.int64)
+
+
+def _binary_auc_from_score(score: np.ndarray, target01: np.ndarray) -> float:
+    score = np.asarray(score, dtype=np.float64).reshape(-1)
+    target01 = np.asarray(target01).reshape(-1)
+    finite = np.isfinite(score) & np.isfinite(target01)
+    if np.count_nonzero(finite) < 2:
+        return float("nan")
+    s = score[finite]
+    t = target01[finite].astype(np.int32)
+    n_pos = int(np.sum(t == 1))
+    n_neg = int(np.sum(t == 0))
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    ranks = _rankdata_average_ties(s)
+    sum_ranks_pos = float(np.sum(ranks[t == 1]))
+    auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
+
+
+def _json_default(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    return obj
+
+
+def build_logit_diagnostics_for_horizon(
+    logits_h: np.ndarray,
+    y_ret_h: np.ndarray,
+    mask_h: np.ndarray,
+    pos_lo: float,
+    pos_hi: float,
+    neg_lo: float,
+    neg_hi: float,
+    horizon_ms: int,
+    split_name: str,
+) -> Tuple[dict, List[dict], List[dict], List[dict]]:
+    logit = np.asarray(logits_h, dtype=np.float64).reshape(-1)
+    r = np.asarray(y_ret_h, dtype=np.float64).reshape(-1)
+    provided_mask = np.asarray(mask_h, dtype=bool).reshape(-1)
+    if not (logit.size == r.size == provided_mask.size):
+        raise ValueError(f"Shape mismatch in diagnostics for split={split_name} horizon={horizon_ms}")
+
+    a = np.abs(r)
+    abs_logit = np.abs(logit)
+    p_up = 1.0 / (1.0 + np.exp(-np.clip(logit, -50.0, 50.0)))
+    conf = np.abs(p_up - 0.5) * 2.0
+    pred_sign = np.where(logit >= 0.0, 1.0, -1.0)
+    realized_sign = np.where(r > 0.0, 1.0, np.where(r < 0.0, -1.0, 0.0))
+    sign_aligned_return = pred_sign * r
+
+    is_zero = (r == 0.0)
+    is_pos = (r > 0.0)
+    is_neg = (r < 0.0)
+    is_pos_low = is_pos & (r < float(pos_lo))
+    is_pos_kept = is_pos & (r >= float(pos_lo)) & (r <= float(pos_hi))
+    is_pos_high = is_pos & (r > float(pos_hi))
+    is_neg_low = is_neg & (a < float(neg_lo))
+    is_neg_kept = is_neg & (a >= float(neg_lo)) & (a <= float(neg_hi))
+    is_neg_high = is_neg & (a > float(neg_hi))
+    is_masked = is_pos_kept | is_neg_kept
+    is_low_tail = is_pos_low | is_neg_low
+    is_high_tail = is_pos_high | is_neg_high
+    is_nonzero_unmasked = (~is_masked) & (~is_zero)
+    is_dead = is_zero | is_low_tail
+
+    if not np.array_equal(is_masked, provided_mask):
+        raise ValueError(f"Mask mismatch in diagnostics for split={split_name} horizon={horizon_ms}")
+
+    partition_stack = np.stack(
+        [is_zero, is_pos_low, is_pos_kept, is_pos_high, is_neg_low, is_neg_kept, is_neg_high], axis=0
+    )
+    if not np.all(np.sum(partition_stack.astype(np.int32), axis=0) == 1):
+        raise ValueError(f"Partition coverage mismatch in diagnostics for split={split_name} horizon={horizon_ms}")
+
+    def _part_stats(part_mask: np.ndarray) -> dict:
+        return {
+            "mean_logit": _safe_mean(logit[part_mask]),
+            "std_logit": _safe_std(logit[part_mask]),
+            "mean_abs_logit": _safe_mean(abs_logit[part_mask]),
+            "median_abs_logit": _safe_median(abs_logit[part_mask]),
+            "p75_abs_logit": _safe_quantile(abs_logit[part_mask], 0.75),
+            "p90_abs_logit": _safe_quantile(abs_logit[part_mask], 0.90),
+            "mean_conf": _safe_mean(conf[part_mask]),
+        }
+
+    def _sign_stats(part_mask: np.ndarray) -> dict:
+        nz = part_mask & (r != 0.0)
+        return {
+            "pearson_logit_signed_return": _safe_pearson(logit[part_mask], r[part_mask]),
+            "spearman_logit_signed_return": _safe_spearman(logit[part_mask], r[part_mask]),
+            "mean_sign_aligned_return": _safe_mean(sign_aligned_return[part_mask]),
+            "mean_sign_aligned_return_nonzero": _safe_mean(sign_aligned_return[nz]),
+            "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+        }
+
+    def _mag_stats(part_mask: np.ndarray) -> dict:
+        return {
+            "pearson_abs_logit_abs_return": _safe_pearson(abs_logit[part_mask], a[part_mask]),
+            "spearman_abs_logit_abs_return": _safe_spearman(abs_logit[part_mask], a[part_mask]),
+            "pearson_conf_abs_return": _safe_pearson(conf[part_mask], a[part_mask]),
+            "spearman_conf_abs_return": _safe_spearman(conf[part_mask], a[part_mask]),
+        }
+
+    summary: dict = {
+        "split_name": split_name,
+        "horizon_ms": int(horizon_ms),
+        "n_all": int(logit.size),
+        "frac_zero": _safe_frac(is_zero),
+        "frac_masked": _safe_frac(is_masked),
+        "frac_low_tail": _safe_frac(is_low_tail),
+        "frac_high_tail": _safe_frac(is_high_tail),
+        "frac_nonzero_unmasked": _safe_frac(is_nonzero_unmasked),
+        "frac_dead": _safe_frac(is_dead),
+        "frac_pos": _safe_frac(is_pos),
+        "frac_neg": _safe_frac(is_neg),
+    }
+
+    y01 = (r > 0.0).astype(np.float64)
+    pred01 = (logit > 0.0).astype(np.float64)
+    summary["auc_all"] = _binary_auc_from_score(logit, y01)
+    summary["auc_masked"] = _binary_auc_from_score(logit[is_masked], y01[is_masked])
+    summary["acc_all"] = _safe_mean((pred01 == y01).astype(np.float64))
+    summary["acc_masked"] = _safe_mean((pred01[is_masked] == y01[is_masked]).astype(np.float64))
+    bce_elem_all = np.maximum(logit, 0.0) - logit * y01 + np.log1p(np.exp(-np.abs(logit)))
+    summary["bce_all"] = _safe_mean(bce_elem_all)
+    summary["bce_masked"] = _safe_mean(bce_elem_all[is_masked])
+    summary["pos_rate_all"] = _safe_mean(y01)
+    summary["pos_rate_masked"] = _safe_mean(y01[is_masked])
+
+    partitions = {
+        "all": np.ones_like(is_zero, dtype=bool),
+        "masked": is_masked,
+        "zero": is_zero,
+        "low_tail": is_low_tail,
+        "high_tail": is_high_tail,
+        "dead": is_dead,
+        "nonzero_unmasked": is_nonzero_unmasked,
+    }
+    for name, pmask in partitions.items():
+        for k, v in _part_stats(pmask).items():
+            summary[f"{k}_{name}"] = v
+
+    summary["masked_vs_zero_mean_abs_logit_ratio"] = _safe_ratio(summary["mean_abs_logit_masked"], summary["mean_abs_logit_zero"])
+    summary["masked_vs_low_tail_mean_abs_logit_ratio"] = _safe_ratio(summary["mean_abs_logit_masked"], summary["mean_abs_logit_low_tail"])
+    summary["masked_vs_dead_mean_abs_logit_ratio"] = _safe_ratio(summary["mean_abs_logit_masked"], summary["mean_abs_logit_dead"])
+    summary["high_tail_vs_low_tail_mean_abs_logit_ratio"] = _safe_ratio(summary["mean_abs_logit_high_tail"], summary["mean_abs_logit_low_tail"])
+
+    for name, pmask in {
+        "all": partitions["all"],
+        "masked": partitions["masked"],
+        "nonzero_unmasked": partitions["nonzero_unmasked"],
+        "low_tail": partitions["low_tail"],
+        "high_tail": partitions["high_tail"],
+    }.items():
+        for k, v in _sign_stats(pmask).items():
+            summary[f"{k}_{name}"] = v
+
+    for name, pmask in {
+        "all": partitions["all"],
+        "masked": partitions["masked"],
+        "nonzero_unmasked": partitions["nonzero_unmasked"],
+        "dead": partitions["dead"],
+        "low_tail": partitions["low_tail"],
+        "high_tail": partitions["high_tail"],
+    }.items():
+        for k, v in _mag_stats(pmask).items():
+            summary[f"{k}_{name}"] = v
+
+    def _auc_between(score: np.ndarray, a_mask: np.ndarray, b_mask: np.ndarray) -> float:
+        use = a_mask | b_mask
+        if np.count_nonzero(a_mask) == 0 or np.count_nonzero(b_mask) == 0:
+            return float("nan")
+        t = np.where(a_mask[use], 1.0, 0.0)
+        return _binary_auc_from_score(score[use], t)
+
+    summary["auc_abs_logit_masked_vs_zero"] = _auc_between(abs_logit, is_masked, is_zero)
+    summary["auc_abs_logit_masked_vs_low_tail"] = _auc_between(abs_logit, is_masked, is_low_tail)
+    summary["auc_abs_logit_masked_vs_dead"] = _auc_between(abs_logit, is_masked, is_dead)
+    summary["auc_abs_logit_high_tail_vs_dead"] = _auc_between(abs_logit, is_high_tail, is_dead)
+
+    signed_rows: List[dict] = []
+    signed_edges = _quantile_bin_edges(logit, n_bins=10)
+    signed_bins = _assign_bins(logit, signed_edges)
+    for bi in range(signed_edges.size - 1):
+        bm = (signed_bins == bi)
+        nz = bm & (r != 0.0)
+        signed_rows.append({
+            "split_name": split_name,
+            "horizon_ms": int(horizon_ms),
+            "bin_kind": "signed_logit_decile",
+            "bin_index": int(bi),
+            "bin_left": float(signed_edges[bi]),
+            "bin_right": float(signed_edges[bi + 1]),
+            "n": int(np.count_nonzero(bm)),
+            "frac_of_split": _safe_frac(bm),
+            "mean_logit": _safe_mean(logit[bm]),
+            "mean_abs_logit": _safe_mean(abs_logit[bm]),
+            "mean_signed_return": _safe_mean(r[bm]),
+            "mean_abs_return": _safe_mean(a[bm]),
+            "pos_rate": _safe_mean((r[bm] > 0.0).astype(np.float64)),
+            "masked_frac": _safe_frac(is_masked[bm]),
+            "zero_frac": _safe_frac(is_zero[bm]),
+            "low_tail_frac": _safe_frac(is_low_tail[bm]),
+            "high_tail_frac": _safe_frac(is_high_tail[bm]),
+            "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+            "mean_sign_aligned_return": _safe_mean(sign_aligned_return[bm]),
+        })
+
+    abs_rows: List[dict] = []
+    abs_edges = _quantile_bin_edges(abs_logit, n_bins=10)
+    abs_bins = _assign_bins(abs_logit, abs_edges)
+    for bi in range(abs_edges.size - 1):
+        bm = (abs_bins == bi)
+        nz = bm & (r != 0.0)
+        abs_rows.append({
+            "split_name": split_name,
+            "horizon_ms": int(horizon_ms),
+            "bin_kind": "abs_logit_decile",
+            "bin_index": int(bi),
+            "bin_left": float(abs_edges[bi]),
+            "bin_right": float(abs_edges[bi + 1]),
+            "n": int(np.count_nonzero(bm)),
+            "frac_of_split": _safe_frac(bm),
+            "mean_abs_logit": _safe_mean(abs_logit[bm]),
+            "mean_signed_return": _safe_mean(r[bm]),
+            "mean_abs_return": _safe_mean(a[bm]),
+            "masked_frac": _safe_frac(is_masked[bm]),
+            "zero_frac": _safe_frac(is_zero[bm]),
+            "low_tail_frac": _safe_frac(is_low_tail[bm]),
+            "high_tail_frac": _safe_frac(is_high_tail[bm]),
+            "dead_frac": _safe_frac(is_dead[bm]),
+            "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+            "mean_sign_aligned_return": _safe_mean(sign_aligned_return[bm]),
+            "mean_conf": _safe_mean(conf[bm]),
+        })
+
+    topk_rows: List[dict] = []
+    for frac in [0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00]:
+        km = _topk_mask_from_score(abs_logit, frac=frac)
+        nz = km & (r != 0.0)
+        threshold = _safe_quantile(abs_logit[km], 0.0)
+        topk_rows.append({
+            "split_name": split_name,
+            "horizon_ms": int(horizon_ms),
+            "frac_selected": float(frac),
+            "n": int(np.count_nonzero(km)),
+            "threshold_abs_logit_min": threshold,
+            "mean_abs_logit": _safe_mean(abs_logit[km]),
+            "mean_signed_return": _safe_mean(r[km]),
+            "mean_abs_return": _safe_mean(a[km]),
+            "masked_frac": _safe_frac(is_masked[km]),
+            "zero_frac": _safe_frac(is_zero[km]),
+            "low_tail_frac": _safe_frac(is_low_tail[km]),
+            "high_tail_frac": _safe_frac(is_high_tail[km]),
+            "dead_frac": _safe_frac(is_dead[km]),
+            "sign_accuracy_nonzero": _safe_mean((pred_sign[nz] == realized_sign[nz]).astype(np.float64)),
+            "mean_sign_aligned_return": _safe_mean(sign_aligned_return[km]),
+            "mean_conf": _safe_mean(conf[km]),
+        })
+
+    return summary, signed_rows, abs_rows, topk_rows
+
 
 def get_model_state_dict_for_ckpt(model: torch.nn.Module) -> dict:
     if hasattr(model, "_orig_mod"):
@@ -770,6 +1163,7 @@ def train_from_offline():
     tr_start, tr_end = int(cmssl_train["start"]), int(cmssl_train["end"])
     va_start, va_end = int(cmssl_val["start"]), int(cmssl_val["end"])
     te_start, te_end = int(cmssl_test["start"]), int(cmssl_test["end"])
+    eval_start, eval_end = int(eval_full["start"]), int(eval_full["end"])
 
     quantile_cache_path = out_root / "dir_mask_quantiles_cache.npz"
     current_meta = {
@@ -801,19 +1195,22 @@ def train_from_offline():
         X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
         X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
         X_te, y_te, feat_dim3 = load_split_in_memory_ts(te_weeks, te_start, te_end)
-        assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
+        X_ev, y_ev, feat_dim4 = load_split_in_memory_ts(eval_weeks, eval_start, eval_end)
+        assert feat_dim1 == feat_dim2 == feat_dim3 == feat_dim4 == F_total, "feat dim mismatch"
         print(
             f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={len(y_tr)} "
-            f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
+            f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)} "
+            f"eval_full=[{eval_start},{eval_end}) N={len(y_ev)}"
         )
 
         # Build in-RAM datasets
         ds_train = HFTDataset(X_tr, y_tr)
         ds_val   = HFTDataset(X_va, y_va)
         ds_test  = HFTDataset(X_te, y_te)
+        ds_eval  = HFTDataset(X_ev, y_ev)
         print(
             f"[offline-data] train N={len(ds_train)}, "
-            f"val N={len(ds_val)}, test N={len(ds_test)}"
+            f"val N={len(ds_val)}, test N={len(ds_test)}, eval_full N={len(ds_eval)}"
         )
         # we still need y_tr to build directional mask quantiles unless cache hit
         y_train_for_quant = None if cached_bounds is not None else y_tr
@@ -828,18 +1225,21 @@ def train_from_offline():
         tr_refs = refs_for_weeks_timerange(tr_weeks, tr_start, tr_end)
         va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
         te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
+        ev_refs = refs_for_weeks_timerange(eval_weeks, eval_start, eval_end)
         print(
             f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
             f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
-            f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
+            f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)} "
+            f"eval_full=[{eval_start},{eval_end}) N={sum(r.n for r in ev_refs)}"
         )
 
         ds_train = NpyChunksDataset(tr_refs, F_total)
         ds_val   = NpyChunksDataset(va_refs, F_total)
         ds_test  = NpyChunksDataset(te_refs, F_total)
+        ds_eval  = NpyChunksDataset(ev_refs, F_total)
         print(
             f"[offline-data] train N={len(ds_train)}, "
-            f"val N={len(ds_val)}, test N={len(ds_test)}"
+            f"val N={len(ds_val)}, test N={len(ds_test)}, eval_full N={len(ds_eval)}"
         )
 
         # Build y_train_for_quant without loading features into RAM unless cache hit.
@@ -929,6 +1329,14 @@ def train_from_offline():
         pin_memory=True,
         persistent_workers=(max(1, WORKERS_VAL) > 0),
     )
+    dl_eval = DataLoader(
+        ds_eval,
+        BATCH_SIZE,
+        shuffle=False,
+        num_workers=max(1, WORKERS_VAL),
+        pin_memory=True,
+        persistent_workers=(max(1, WORKERS_VAL) > 0),
+    )
 
     # ---------------- Model ----------------
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
@@ -953,12 +1361,14 @@ def train_from_offline():
     no_imp = 0
     primary_horizon_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
 
-    def summarize_directional_metrics(dl: DataLoader, *, primary_only: bool) -> dict:
+    def summarize_directional_metrics(dl: DataLoader, *, primary_only: bool, split_name: str) -> dict:
         model.eval()
         logits_all = [[] for _ in range(NUM_HORIZONS)]
         ypos_all = [[] for _ in range(NUM_HORIZONS)]
         logits_masked = [[] for _ in range(NUM_HORIZONS)]
         ypos_masked = [[] for _ in range(NUM_HORIZONS)]
+        yret_all = [[] for _ in range(NUM_HORIZONS)]
+        mask_all = [[] for _ in range(NUM_HORIZONS)]
         bce_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
         bce_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
         bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
@@ -993,14 +1403,17 @@ def train_from_offline():
                 for h_idx in horizon_indices:
                     logits_h_all = dir_logits_metrics[:, h_idx]
                     targets_h_all = y_dir_metrics[:, h_idx]
+                    y_ret_h_all = y_ret[:, h_idx]
+                    noise_filter_mask_h = noise_filter_mask_metrics[:, h_idx]
                     bce_sum[h_idx] += bce_elem_fp32[:, h_idx].sum().item()
                     bce_count[h_idx] += targets_h_all.numel()
                     acc_sum[h_idx] += (pred_class[:, h_idx] == true_class[:, h_idx]).sum().item()
                     total[h_idx] += targets_h_all.numel()
                     logits_all[h_idx].append(logits_h_all.detach().cpu())
                     ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
+                    yret_all[h_idx].append(y_ret_h_all.detach().cpu())
+                    mask_all[h_idx].append(noise_filter_mask_h.detach().cpu())
 
-                    noise_filter_mask_h = noise_filter_mask_metrics[:, h_idx]
                     if noise_filter_mask_h.any():
                         logits_h = dir_logits_metrics[noise_filter_mask_h, h_idx]
                         targets_h = y_dir_metrics[noise_filter_mask_h, h_idx]
@@ -1023,6 +1436,10 @@ def train_from_offline():
         pos_rate_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
         logit_mean_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
         logit_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        logit_diag_summary_per_h: List[dict] = []
+        logit_diag_signed_bins_rows: List[dict] = []
+        logit_diag_abs_bins_rows: List[dict] = []
+        logit_diag_topk_rows: List[dict] = []
 
         for h_idx in ([primary_horizon_idx] if primary_only else range(NUM_HORIZONS)):
             if bce_count[h_idx] > 0:
@@ -1045,6 +1462,25 @@ def train_from_offline():
                 pos_rate_masked[h_idx] = float(ypos_cat.float().mean().item())
                 logit_mean_masked[h_idx] = float(logits_cat.mean().item())
                 logit_std_masked[h_idx] = float(logits_cat.std(unbiased=False).item())
+            if logits_all[h_idx]:
+                logits_h_np = torch.cat(logits_all[h_idx], dim=0).view(-1).numpy()
+                y_ret_h_np = torch.cat(yret_all[h_idx], dim=0).view(-1).numpy()
+                mask_h_np = torch.cat(mask_all[h_idx], dim=0).view(-1).numpy().astype(bool)
+                summary_h, signed_rows_h, abs_rows_h, topk_rows_h = build_logit_diagnostics_for_horizon(
+                    logits_h=logits_h_np,
+                    y_ret_h=y_ret_h_np,
+                    mask_h=mask_h_np,
+                    pos_lo=float(pos_lo[h_idx]),
+                    pos_hi=float(pos_hi[h_idx]),
+                    neg_lo=float(neg_lo[h_idx]),
+                    neg_hi=float(neg_hi[h_idx]),
+                    horizon_ms=int(HORIZONS_MS[h_idx]),
+                    split_name=split_name,
+                )
+                logit_diag_summary_per_h.append(summary_h)
+                logit_diag_signed_bins_rows.extend(signed_rows_h)
+                logit_diag_abs_bins_rows.extend(abs_rows_h)
+                logit_diag_topk_rows.extend(topk_rows_h)
 
         primary_metric_value, primary_metric_label = compute_primary_metric(auc_masked)
         return {
@@ -1065,10 +1501,78 @@ def train_from_offline():
             "primary_masked_bce": float(bce_masked[primary_horizon_idx]),
             "primary_masked_auc": float(auc_masked[primary_horizon_idx]),
             "primary_masked_acc": float(acc_masked[primary_horizon_idx]),
+            "logit_diag_summary_per_h": logit_diag_summary_per_h,
+            "logit_diag_signed_bins_rows": logit_diag_signed_bins_rows,
+            "logit_diag_abs_bins_rows": logit_diag_abs_bins_rows,
+            "logit_diag_topk_rows": logit_diag_topk_rows,
         }
 
     def run_validation(*, full_metrics: bool) -> dict:
-        return summarize_directional_metrics(dl_val, primary_only=not full_metrics)
+        return summarize_directional_metrics(dl_val, primary_only=not full_metrics, split_name="val")
+
+    def _write_csv_rows(path: Path, rows: List[dict]) -> None:
+        fieldnames: List[str] = []
+        seen = set()
+        for row in rows:
+            for key in row.keys():
+                if key not in seen:
+                    seen.add(key)
+                    fieldnames.append(key)
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    def _save_logit_diag_bundle(split: str, metrics: dict) -> None:
+        summary_path = out_root / f"cmssl_logit_diagnostics_{split}.json"
+        signed_path = out_root / f"cmssl_logit_signed_logit_bins_{split}.csv"
+        abs_path = out_root / f"cmssl_logit_abs_logit_bins_{split}.csv"
+        topk_path = out_root / f"cmssl_logit_topk_abs_logit_{split}.csv"
+        payload = {
+            "split": split,
+            "horizons_ms": [int(h) for h in HORIZONS_MS],
+            "tail_fraction": float(DIR_MASK_TAIL_FRACTION),
+            "summary_per_horizon": metrics["logit_diag_summary_per_h"],
+        }
+        with summary_path.open("w") as f:
+            json.dump(payload, f, indent=2, default=_json_default)
+        _write_csv_rows(signed_path, metrics["logit_diag_signed_bins_rows"])
+        _write_csv_rows(abs_path, metrics["logit_diag_abs_bins_rows"])
+        _write_csv_rows(topk_path, metrics["logit_diag_topk_rows"])
+        print(
+            f"[logit_diag_saved][{split}] json={summary_path} signed_bins={signed_path} "
+            f"abs_bins={abs_path} topk={topk_path}"
+        )
+
+    def _print_logit_diag_compact(split: str, metrics: dict) -> None:
+        top10_by_h = {
+            int(row["horizon_ms"]): row
+            for row in metrics["logit_diag_topk_rows"]
+            if abs(float(row.get("frac_selected", -1.0)) - 0.10) < 1e-12
+        }
+        for row in metrics["logit_diag_summary_per_h"]:
+            h = int(row["horizon_ms"])
+            top10 = top10_by_h.get(h, {})
+            print(
+                f"[logit_diag][{split}][{h}ms] "
+                f"horizon_ms={h} "
+                f"frac_masked={row.get('frac_masked', float('nan')):.4f} "
+                f"frac_zero={row.get('frac_zero', float('nan')):.4f} "
+                f"frac_low_tail={row.get('frac_low_tail', float('nan')):.4f} "
+                f"frac_high_tail={row.get('frac_high_tail', float('nan')):.4f} "
+                f"mean_abs_logit_masked={row.get('mean_abs_logit_masked', float('nan')):.6f} "
+                f"mean_abs_logit_zero={row.get('mean_abs_logit_zero', float('nan')):.6f} "
+                f"mean_abs_logit_low_tail={row.get('mean_abs_logit_low_tail', float('nan')):.6f} "
+                f"mean_abs_logit_high_tail={row.get('mean_abs_logit_high_tail', float('nan')):.6f} "
+                f"auc_abs_logit_masked_vs_dead={row.get('auc_abs_logit_masked_vs_dead', float('nan')):.6f} "
+                f"pearson_logit_signed_return_all={row.get('pearson_logit_signed_return_all', float('nan')):.6f} "
+                f"spearman_logit_signed_return_all={row.get('spearman_logit_signed_return_all', float('nan')):.6f} "
+                f"pearson_abs_logit_abs_return_all={row.get('pearson_abs_logit_abs_return_all', float('nan')):.6f} "
+                f"mean_sign_aligned_return_top10pct={float(top10.get('mean_sign_aligned_return', float('nan'))):.6f} "
+                f"masked_frac_top10pct={float(top10.get('masked_frac', float('nan'))):.4f} "
+                f"zero_frac_top10pct={float(top10.get('zero_frac', float('nan'))):.4f}"
+            )
 
     for epoch in range(EPOCHS):
         early_stop_triggered = False
@@ -1194,8 +1698,27 @@ def train_from_offline():
         # (Optional) early stop on long stagnation
         # if no_imp > 50: break
 
-    # ---------------- Test Evaluation ----------------
-    test_metrics = summarize_directional_metrics(dl_test, primary_only=False)
+    # ---------------- Final Split Evaluations ----------------
+    val_metrics = summarize_directional_metrics(dl_val, primary_only=False, split_name="val")
+    test_metrics = summarize_directional_metrics(dl_test, primary_only=False, split_name="test")
+    eval_metrics = summarize_directional_metrics(dl_eval, primary_only=False, split_name="eval_full")
+
+    print(
+        f"[val] BCE(all)={format_metric(val_metrics['val_bce_unmasked'], '{:.4e}')}  "
+        f"Acc(all)={format_metric(val_metrics['val_acc'], '{:.4f}')}  "
+        f"AUC(all)={format_metric(val_metrics['val_auc'], '{:.4f}')}")
+    print(
+        f"  BCE(mask)={format_metric(val_metrics['val_bce_masked'], '{:.4e}')}  "
+        f"Acc(mask)={format_metric(val_metrics['val_acc_masked'], '{:.4f}')}  "
+        f"AUC(mask)={format_metric(val_metrics['val_auc_masked'], '{:.4f}')}")
+    print(
+        f"[val_diag] pos_rate(all)={format_metric(val_metrics['val_pos_rate_all'], '{:.3%}')}  "
+        f"logit_mean(all)={format_metric(val_metrics['val_logit_mean_all'], '{:.3f}')}  "
+        f"logit_std(all)={format_metric(val_metrics['val_logit_std_all'], '{:.3f}')}  "
+        f"pos_rate(mask)={format_metric(val_metrics['val_pos_rate_masked'], '{:.3%}')}  "
+        f"logit_mean(mask)={format_metric(val_metrics['val_logit_mean_masked'], '{:.3f}')}  "
+        f"logit_std(mask)={format_metric(val_metrics['val_logit_std_masked'], '{:.3f}')}")
+
     print(
         f"[test] BCE(all)={format_metric(test_metrics['val_bce_unmasked'], '{:.4e}')}  "
         f"Acc(all)={format_metric(test_metrics['val_acc'], '{:.4f}')}  "
@@ -1211,6 +1734,30 @@ def train_from_offline():
         f"pos_rate(mask)={format_metric(test_metrics['val_pos_rate_masked'], '{:.3%}')}  "
         f"logit_mean(mask)={format_metric(test_metrics['val_logit_mean_masked'], '{:.3f}')}  "
         f"logit_std(mask)={format_metric(test_metrics['val_logit_std_masked'], '{:.3f}')}")
+
+    print(
+        f"[eval_full] BCE(all)={format_metric(eval_metrics['val_bce_unmasked'], '{:.4e}')}  "
+        f"Acc(all)={format_metric(eval_metrics['val_acc'], '{:.4f}')}  "
+        f"AUC(all)={format_metric(eval_metrics['val_auc'], '{:.4f}')}")
+    print(
+        f"  BCE(mask)={format_metric(eval_metrics['val_bce_masked'], '{:.4e}')}  "
+        f"Acc(mask)={format_metric(eval_metrics['val_acc_masked'], '{:.4f}')}  "
+        f"AUC(mask)={format_metric(eval_metrics['val_auc_masked'], '{:.4f}')}")
+    print(
+        f"[eval_full_diag] pos_rate(all)={format_metric(eval_metrics['val_pos_rate_all'], '{:.3%}')}  "
+        f"logit_mean(all)={format_metric(eval_metrics['val_logit_mean_all'], '{:.3f}')}  "
+        f"logit_std(all)={format_metric(eval_metrics['val_logit_std_all'], '{:.3f}')}  "
+        f"pos_rate(mask)={format_metric(eval_metrics['val_pos_rate_masked'], '{:.3%}')}  "
+        f"logit_mean(mask)={format_metric(eval_metrics['val_logit_mean_masked'], '{:.3f}')}  "
+        f"logit_std(mask)={format_metric(eval_metrics['val_logit_std_masked'], '{:.3f}')}")
+
+    _print_logit_diag_compact("val", val_metrics)
+    _print_logit_diag_compact("test", test_metrics)
+    _print_logit_diag_compact("eval_full", eval_metrics)
+
+    _save_logit_diag_bundle("val", val_metrics)
+    _save_logit_diag_bundle("test", test_metrics)
+    _save_logit_diag_bundle("eval_full", eval_metrics)
 
     print("[done] Training complete.")
 
