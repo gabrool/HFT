@@ -70,12 +70,13 @@ DEFAULT_MM_INITIAL_CASH = 1_000_000.0
 DEFAULT_MM_TAKER_FEE_BPS = 1.7
 DEFAULT_MM_TAKER_THRESHOLD = 0.1
 DEFAULT_MM_TAKER_SIGNAL_LIMIT = 1.0
-MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v7"
-MM_PPO_ACTION_DIM = 4
+MM_PPO_CHECKPOINT_SCHEMA = "mm-ppo-direct-quote-v8"
+MM_PPO_ACTION_DIM = 5
 MM_PPO_ACTION_SEMANTICS = (
-    "center_control",
+    "inventory_center_control",
     "width_control",
-    "skew_control",
+    "alpha_center_control",
+    "alpha_asym_control",
     "taker_signal",
 )
 # Inventory risk thresholds are denominated in quote notional (USD).
@@ -378,12 +379,12 @@ def _ppo_action_bounds(
     direct_cfg = env.direct_quote_config if env is not None else load_direct_quote_config()
     taker_signal_limit = float(direct_cfg.taker_signal_limit)
     low = torch.tensor(
-        [-1.0, 0.0, -1.0, -taker_signal_limit],
+        [-1.0, 0.0, -1.0, -1.0, -taker_signal_limit],
         device=device,
         dtype=torch.float32,
     )
     high = torch.tensor(
-        [1.0, 1.0, 1.0, taker_signal_limit],
+        [1.0, 1.0, 1.0, 1.0, taker_signal_limit],
         device=device,
         dtype=torch.float32,
     )
@@ -679,7 +680,8 @@ class DirectQuoteConfig:
     taker_signal_limit: float
     inventory_center_weight: float
     alpha_center_weight: float
-    asymmetry_residual_frac: float
+    alpha_asymmetry_cap_frac: float
+    alpha_confidence_logit_scale: float
     directional_response_center_weight: float
     directional_response_asym_weight: float
 
@@ -704,7 +706,8 @@ class RolloutStartSamplingConfig:
 class RewardShapingConfig:
     enabled: bool = True
     logit_tanh_scale: float = 12.0
-    skew_coef: float = 0.01
+    center_coef: float = 0.01
+    asym_coef: float = 0.03
 
 
 @dataclass(frozen=True)
@@ -895,19 +898,32 @@ def load_reward_shaping_config() -> RewardShapingConfig:
             "Width shaping was removed from reward shaping; the following env vars are no longer supported: "
             + ", ".join(set_removed)
         )
+    if os.environ.get("BYBIT_MM_REWARD_SHAPING_SKEW_COEF", "").strip():
+        raise ValueError(
+            "BYBIT_MM_REWARD_SHAPING_SKEW_COEF was removed. "
+            "Use BYBIT_MM_REWARD_SHAPING_CENTER_COEF and BYBIT_MM_REWARD_SHAPING_ASYM_COEF."
+        )
     cfg = RewardShapingConfig(
         enabled=_env_bool("BYBIT_MM_REWARD_SHAPING_ENABLE", True),
         logit_tanh_scale=_env_float("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE", 12.0),
-        skew_coef=_env_float("BYBIT_MM_REWARD_SHAPING_SKEW_COEF", 0.01),
+        center_coef=_env_float("BYBIT_MM_REWARD_SHAPING_CENTER_COEF", 0.01),
+        asym_coef=_env_float("BYBIT_MM_REWARD_SHAPING_ASYM_COEF", 0.03),
     )
     if not np.isfinite(cfg.logit_tanh_scale) or cfg.logit_tanh_scale <= 0.0:
         raise ValueError("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE must be finite and > 0.")
-    if not np.isfinite(cfg.skew_coef) or cfg.skew_coef < 0.0:
-        raise ValueError("BYBIT_MM_REWARD_SHAPING_SKEW_COEF must be finite and >= 0.")
+    if not np.isfinite(cfg.center_coef) or cfg.center_coef < 0.0:
+        raise ValueError("BYBIT_MM_REWARD_SHAPING_CENTER_COEF must be finite and >= 0.")
+    if not np.isfinite(cfg.asym_coef) or cfg.asym_coef < 0.0:
+        raise ValueError("BYBIT_MM_REWARD_SHAPING_ASYM_COEF must be finite and >= 0.")
     return cfg
 
 
 def load_direct_quote_config() -> DirectQuoteConfig:
+    if os.environ.get("BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC", "").strip():
+        raise ValueError(
+            "BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC was removed because the old asymmetry geometry was removed. "
+            "Use BYBIT_MM_ALPHA_ASYMMETRY_CAP_FRAC and BYBIT_MM_ALPHA_CONFIDENCE_LOGIT_SCALE."
+        )
     return _validate_direct_quote_config(
         DirectQuoteConfig(
             quote_half_spread_floor_bps=_env_float(
@@ -920,10 +936,11 @@ def load_direct_quote_config() -> DirectQuoteConfig:
             wide_halfspread_mult=_env_float("BYBIT_MM_WIDE_HALFSPREAD_MULT", 1.75),
             taker_signal_limit=_env_float("BYBIT_MM_TAKER_SIGNAL_LIMIT", DEFAULT_MM_TAKER_SIGNAL_LIMIT),
             inventory_center_weight=_env_float("BYBIT_MM_INVENTORY_CENTER_WEIGHT", 0.25),
-            alpha_center_weight=_env_float("BYBIT_MM_ALPHA_CENTER_WEIGHT", 1.00),
-            asymmetry_residual_frac=_env_float("BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC", 0.15),
-            directional_response_center_weight=_env_float("BYBIT_MM_DIRECTIONAL_RESPONSE_CENTER_WEIGHT", 0.90),
-            directional_response_asym_weight=_env_float("BYBIT_MM_DIRECTIONAL_RESPONSE_ASYM_WEIGHT", 0.10),
+            alpha_center_weight=_env_float("BYBIT_MM_ALPHA_CENTER_WEIGHT", 0.55),
+            alpha_asymmetry_cap_frac=_env_float("BYBIT_MM_ALPHA_ASYMMETRY_CAP_FRAC", 0.75),
+            alpha_confidence_logit_scale=_env_float("BYBIT_MM_ALPHA_CONFIDENCE_LOGIT_SCALE", 6.0),
+            directional_response_center_weight=_env_float("BYBIT_MM_DIRECTIONAL_RESPONSE_CENTER_WEIGHT", 0.55),
+            directional_response_asym_weight=_env_float("BYBIT_MM_DIRECTIONAL_RESPONSE_ASYM_WEIGHT", 0.45),
         )
     )
 
@@ -949,12 +966,16 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         raise ValueError("inventory_center_weight must be finite and in [0.0, 1.0].")
     if not np.isfinite(cfg.alpha_center_weight) or cfg.alpha_center_weight <= 0.0 or cfg.alpha_center_weight > 1.0:
         raise ValueError("alpha_center_weight must be finite and in (0.0, 1.0].")
+    if not np.isfinite(cfg.alpha_center_weight) or cfg.alpha_center_weight <= 0.0 or cfg.alpha_center_weight > 1.0:
+        raise ValueError("alpha_center_weight must be finite and in (0.0, 1.0].")
     if (
-        not np.isfinite(cfg.asymmetry_residual_frac)
-        or cfg.asymmetry_residual_frac < 0.0
-        or cfg.asymmetry_residual_frac > 0.50
+        not np.isfinite(cfg.alpha_asymmetry_cap_frac)
+        or cfg.alpha_asymmetry_cap_frac <= 0.0
+        or cfg.alpha_asymmetry_cap_frac > 1.0
     ):
-        raise ValueError("asymmetry_residual_frac must be finite and in [0.0, 0.50].")
+        raise ValueError("alpha_asymmetry_cap_frac must be finite and in (0.0, 1.0].")
+    if not np.isfinite(cfg.alpha_confidence_logit_scale) or cfg.alpha_confidence_logit_scale <= 0.0:
+        raise ValueError("alpha_confidence_logit_scale must be finite and > 0.")
     if not np.isfinite(cfg.directional_response_center_weight) or cfg.directional_response_center_weight < 0.0:
         raise ValueError("directional_response_center_weight must be finite and >= 0.")
     if not np.isfinite(cfg.directional_response_asym_weight) or cfg.directional_response_asym_weight < 0.0:
@@ -962,8 +983,6 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
     directional_weight_sum = cfg.directional_response_center_weight + cfg.directional_response_asym_weight
     if abs(directional_weight_sum - 1.0) > 1e-8:
         raise ValueError("directional response weights must sum to 1.0 within tolerance 1e-8.")
-    if cfg.directional_response_center_weight <= cfg.directional_response_asym_weight:
-        raise ValueError("directional_response_center_weight must be strictly greater than directional_response_asym_weight.")
     return cfg
 
 
@@ -2745,19 +2764,19 @@ class MarketMakingEnv:
             self._update_obs_stats(obs_raw)
         return out
 
-    def _parse_action(self, action: Any) -> Tuple[float, float, float, float]:
+    def _parse_action(self, action: Any) -> Tuple[float, float, float, float, float]:
         """Hot-path parser for canonical float32 action arrays."""
-        if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.shape == (4,):
-            return float(action[0]), float(action[1]), float(action[2]), float(action[3])
+        if isinstance(action, np.ndarray) and action.dtype == np.float32 and action.shape == (5,):
+            return float(action[0]), float(action[1]), float(action[2]), float(action[3]), float(action[4])
         # Minimal debug conversion/fallback for non-canonical callers outside rollout hot paths.
         action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
         require(
-            action_arr.shape == (4,),
-            f"Expected action shape {(4,)}, got shape={action_arr.shape}",
+            action_arr.shape == (5,),
+            f"Expected action shape {(5,)}, got shape={action_arr.shape}",
         )
         if not np.all(np.isfinite(action_arr)):
             raise ValueError(f"Action components must be finite, got {action_arr}")
-        return float(action_arr[0]), float(action_arr[1]), float(action_arr[2]), float(action_arr[3])
+        return float(action_arr[0]), float(action_arr[1]), float(action_arr[2]), float(action_arr[3]), float(action_arr[4])
 
     def _feature_slice(self, idx: int, start: int, end: int) -> np.ndarray:
         return self.features[idx, start:end]
@@ -2765,9 +2784,10 @@ class MarketMakingEnv:
     def _policy_quotes(
         self,
         idx: int,
-        center_control: float,
+        inventory_center_control: float,
         width_control: float,
-        skew_control: float,
+        alpha_center_control: float,
+        alpha_asym_control: float,
     ) -> Tuple[float, float, Dict[str, Any]]:
         cfg = self.direct_quote_config
         mid = self._mid_price(idx)
@@ -2776,36 +2796,22 @@ class MarketMakingEnv:
         observed_anchor_half_spread_bps = 0.0
         if np.isfinite(observed_spread_bps) and observed_spread_bps > 0.0:
             observed_anchor_half_spread_bps = cfg.obs_spread_anchor_frac * observed_spread_bps
-        anchor_half_spread_bps = float(
-            max(
-                self.quote_half_spread_floor_bps,
-                observed_anchor_half_spread_bps,
-            )
-        )
-        anchor_half_spread_bps = float(
-            np.clip(
-                anchor_half_spread_bps,
-                self.quote_half_spread_floor_bps,
-                cfg.spread_cap_bps,
-            )
-        )
+        anchor_half_spread_bps = float(max(self.quote_half_spread_floor_bps, observed_anchor_half_spread_bps))
+        anchor_half_spread_bps = float(np.clip(anchor_half_spread_bps, self.quote_half_spread_floor_bps, cfg.spread_cap_bps))
+
         wc = float(np.clip(width_control, 0.0, 1.0))
         width_mult = cfg.touch_halfspread_mult + wc * (cfg.wide_halfspread_mult - cfg.touch_halfspread_mult)
-        base_half_spread_bps = anchor_half_spread_bps * width_mult
-        base_half_spread_bps = float(
-            np.clip(
-                base_half_spread_bps,
-                self.quote_half_spread_floor_bps,
-                cfg.spread_cap_bps,
-            )
-        )
+        base_half_spread_bps = float(np.clip(anchor_half_spread_bps * width_mult, self.quote_half_spread_floor_bps, cfg.spread_cap_bps))
 
-        skew_control_clipped = float(np.clip(skew_control, -1.0, 1.0))
-        half_spread_floor_bps = self.quote_half_spread_floor_bps
+        weighted_cmssl_logit = self._weighted_cmssl_logit(idx)
+        abs_weighted_cmssl_logit = self._abs_weighted_cmssl_logit(idx)
+        alpha_strength = float(np.tanh(abs_weighted_cmssl_logit / cfg.alpha_confidence_logit_scale))
         total_half_spread_bps = 2.0 * base_half_spread_bps
-        asymmetry_cap_bps = max(total_half_spread_bps - 2.0 * half_spread_floor_bps, 0.0)
-        asymmetry_target_bps = cfg.asymmetry_residual_frac * skew_control_clipped * asymmetry_cap_bps
+        raw_asymmetry_cap_bps = cfg.alpha_asymmetry_cap_frac * total_half_spread_bps
+        alpha_asym_control_clipped = float(np.clip(alpha_asym_control, -1.0, 1.0))
+        asymmetry_target_bps = alpha_strength * alpha_asym_control_clipped * raw_asymmetry_cap_bps
 
+        half_spread_floor_bps = self.quote_half_spread_floor_bps
         desired_bid_half_spread_bps = 0.5 * (total_half_spread_bps - asymmetry_target_bps)
         bid_half_lower_bps = max(half_spread_floor_bps, total_half_spread_bps - cfg.spread_cap_bps)
         bid_half_upper_bps = min(cfg.spread_cap_bps, total_half_spread_bps - half_spread_floor_bps)
@@ -2819,18 +2825,17 @@ class MarketMakingEnv:
         if not (half_spread_floor_bps <= bid_half_spread_bps <= cfg.spread_cap_bps):
             raise RuntimeError(
                 "Bid half spread outside feasible bounds after projection: "
-                f"idx={idx} bid_half_spread_bps={bid_half_spread_bps} "
-                f"floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
+                f"idx={idx} bid_half_spread_bps={bid_half_spread_bps} floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
             )
         if not (half_spread_floor_bps <= ask_half_spread_bps <= cfg.spread_cap_bps):
             raise RuntimeError(
                 "Ask half spread outside feasible bounds after projection: "
-                f"idx={idx} ask_half_spread_bps={ask_half_spread_bps} "
-                f"floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
+                f"idx={idx} ask_half_spread_bps={ask_half_spread_bps} floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
             )
-        effective_half_spread_bps = 0.5 * (bid_half_spread_bps + ask_half_spread_bps)
+
         bid_half_spread_px = bps_to_px(mid, bid_half_spread_bps)
         ask_half_spread_px = bps_to_px(mid, ask_half_spread_bps)
+        effective_half_spread_bps = 0.5 * (bid_half_spread_bps + ask_half_spread_bps)
 
         best_bid = float(self.best_bid[idx])
         best_ask = float(self.best_ask[idx])
@@ -2838,58 +2843,25 @@ class MarketMakingEnv:
         center_shift_min_px = (best_bid + eps_px) - mid - ask_half_spread_px
         center_shift_max_px = (best_ask - eps_px) - mid + bid_half_spread_px
         if center_shift_min_px > center_shift_max_px + 1e-12:
-            raise RuntimeError(
-                "Passive-feasible center interval invalid: "
-                f"idx={idx} best_bid={best_bid:.12f} best_ask={best_ask:.12f} mid={mid:.12f} "
-                f"bid_half_spread_px={bid_half_spread_px:.12f} ask_half_spread_px={ask_half_spread_px:.12f} "
-                f"center_shift_min_px={center_shift_min_px:.12f} center_shift_max_px={center_shift_max_px:.12f}"
-            )
+            raise RuntimeError("Passive-feasible center interval invalid")
 
-        center_control_clipped = float(np.clip(center_control, -1.0, 1.0))
+        inventory_center_control_clipped = float(np.clip(inventory_center_control, -1.0, 1.0))
         center_shift_mid_px = 0.5 * (center_shift_min_px + center_shift_max_px)
         center_shift_half_range_px = 0.5 * (center_shift_max_px - center_shift_min_px)
-
-        inventory_center_shift_px_raw = (
-            cfg.inventory_center_weight * center_control_clipped * center_shift_half_range_px
-        )
-        inventory_only_center_shift_px = float(
-            np.clip(
-                center_shift_mid_px + inventory_center_shift_px_raw,
-                center_shift_min_px,
-                center_shift_max_px,
-            )
-        )
+        inventory_center_shift_px_raw = cfg.inventory_center_weight * inventory_center_control_clipped * center_shift_half_range_px
+        inventory_only_center_shift_px = float(np.clip(center_shift_mid_px + inventory_center_shift_px_raw, center_shift_min_px, center_shift_max_px))
 
         nominal_alpha_center_capacity_px = cfg.alpha_center_weight * center_shift_half_range_px
-        positive_alpha_capacity_px = min(
-            nominal_alpha_center_capacity_px,
-            max(0.0, center_shift_max_px - inventory_only_center_shift_px),
-        )
-        negative_alpha_capacity_px = min(
-            nominal_alpha_center_capacity_px,
-            max(0.0, inventory_only_center_shift_px - center_shift_min_px),
-        )
-        if skew_control_clipped >= 0.0:
-            alpha_center_shift_px_raw = skew_control_clipped * positive_alpha_capacity_px
-        else:
-            alpha_center_shift_px_raw = skew_control_clipped * negative_alpha_capacity_px
+        alpha_center_control_clipped = float(np.clip(alpha_center_control, -1.0, 1.0))
+        alpha_center_shift_px_raw = alpha_strength * alpha_center_control_clipped * nominal_alpha_center_capacity_px
+        center_shift_px = float(np.clip(inventory_only_center_shift_px + alpha_center_shift_px_raw, center_shift_min_px, center_shift_max_px))
 
-        center_shift_px = float(
-            np.clip(
-                inventory_only_center_shift_px + alpha_center_shift_px_raw,
-                center_shift_min_px,
-                center_shift_max_px,
-            )
-        )
         actual_inventory_center_shift_px = inventory_only_center_shift_px - center_shift_mid_px
         actual_alpha_center_shift_px = center_shift_px - inventory_only_center_shift_px
-
-        if actual_alpha_center_shift_px > 0.0:
-            effective_alpha_center_capacity_px = positive_alpha_capacity_px
-        elif actual_alpha_center_shift_px < 0.0:
-            effective_alpha_center_capacity_px = negative_alpha_capacity_px
-        else:
-            effective_alpha_center_capacity_px = max(positive_alpha_capacity_px, negative_alpha_capacity_px)
+        effective_alpha_center_capacity_px = min(
+            nominal_alpha_center_capacity_px,
+            max(center_shift_max_px - inventory_only_center_shift_px, inventory_only_center_shift_px - center_shift_min_px),
+        )
 
         center_shift_bps = center_shift_px / max(mid, 1e-12) * 1e4
         inventory_center_shift_bps = actual_inventory_center_shift_px / max(mid, 1e-12) * 1e4
@@ -2898,26 +2870,20 @@ class MarketMakingEnv:
         center_shift_min_bps = center_shift_min_px / max(mid, 1e-12) * 1e4
         center_shift_max_bps = center_shift_max_px / max(mid, 1e-12) * 1e4
         nominal_alpha_center_capacity_bps = nominal_alpha_center_capacity_px / max(mid, 1e-12) * 1e4
-        positive_alpha_capacity_bps = positive_alpha_capacity_px / max(mid, 1e-12) * 1e4
-        negative_alpha_capacity_bps = negative_alpha_capacity_px / max(mid, 1e-12) * 1e4
         effective_alpha_center_capacity_bps = effective_alpha_center_capacity_px / max(mid, 1e-12) * 1e4
 
         bid = mid + center_shift_px - bid_half_spread_px
         ask = mid + center_shift_px + ask_half_spread_px
-        skew_bps = 0.5 * (ask_half_spread_bps - bid_half_spread_bps)
-        directional_center_response = float(
-            np.clip(actual_alpha_center_shift_px / max(effective_alpha_center_capacity_px, 1e-12), -1.0, 1.0)
-        )
-        directional_asym_response = (ask_half_spread_bps - bid_half_spread_bps) / max(
-            ask_half_spread_bps + bid_half_spread_bps,
-            1e-12,
-        )
+        actual_alpha_asymmetry_bps = ask_half_spread_bps - bid_half_spread_bps
+        directional_center_response = float(np.clip(actual_alpha_center_shift_px / max(effective_alpha_center_capacity_px, 1e-12), -1.0, 1.0))
+        directional_asym_response = float(np.clip(actual_alpha_asymmetry_bps / max(raw_asymmetry_cap_bps, 1e-12), -1.0, 1.0))
         directional_response = (
             cfg.directional_response_center_weight * directional_center_response
             + cfg.directional_response_asym_weight * directional_asym_response
         )
         bid_at_floor = bid_half_spread_bps <= (half_spread_floor_bps + 1e-12)
         ask_at_floor = ask_half_spread_bps <= (half_spread_floor_bps + 1e-12)
+
         quote_metrics = {
             "observed_spread_bps": float(observed_spread_bps),
             "observed_anchor_half_spread_bps": float(observed_anchor_half_spread_bps),
@@ -2925,9 +2891,14 @@ class MarketMakingEnv:
             "quote_half_spread_floor_bps": float(self.quote_half_spread_floor_bps),
             "inventory_center_weight": float(cfg.inventory_center_weight),
             "alpha_center_weight": float(cfg.alpha_center_weight),
-            "asymmetry_residual_frac": float(cfg.asymmetry_residual_frac),
+            "alpha_asymmetry_cap_frac": float(cfg.alpha_asymmetry_cap_frac),
+            "alpha_confidence_logit_scale": float(cfg.alpha_confidence_logit_scale),
             "directional_response_center_weight": float(cfg.directional_response_center_weight),
             "directional_response_asym_weight": float(cfg.directional_response_asym_weight),
+            "weighted_cmssl_logit": float(weighted_cmssl_logit),
+            "abs_weighted_cmssl_logit": float(abs_weighted_cmssl_logit),
+            "alpha_strength": float(alpha_strength),
+            "raw_asymmetry_cap_bps": float(raw_asymmetry_cap_bps),
             "anchor_half_spread_bps": float(anchor_half_spread_bps),
             "width_control": float(wc),
             "width_mult": float(width_mult),
@@ -2939,15 +2910,14 @@ class MarketMakingEnv:
             "center_shift_min_bps": float(center_shift_min_bps),
             "center_shift_max_bps": float(center_shift_max_bps),
             "nominal_alpha_center_capacity_bps": float(nominal_alpha_center_capacity_bps),
-            "positive_alpha_capacity_bps": float(positive_alpha_capacity_bps),
-            "negative_alpha_capacity_bps": float(negative_alpha_capacity_bps),
             "effective_alpha_center_capacity_bps": float(effective_alpha_center_capacity_bps),
-            "center_control": float(center_control_clipped),
+            "inventory_center_control": float(inventory_center_control_clipped),
+            "alpha_center_control": float(alpha_center_control_clipped),
+            "alpha_asym_control": float(alpha_asym_control_clipped),
             "center_shift_bps": float(center_shift_bps),
             "inventory_center_shift_bps": float(inventory_center_shift_bps),
             "alpha_center_shift_bps": float(alpha_center_shift_bps),
-            "skew_control": float(skew_control_clipped),
-            "skew_bps": float(skew_bps),
+            "alpha_asymmetry_bps": float(actual_alpha_asymmetry_bps),
             "directional_center_response": float(directional_center_response),
             "directional_asym_response": float(directional_asym_response),
             "directional_response": float(directional_response),
@@ -3220,17 +3190,19 @@ class MarketMakingEnv:
 
     def _step_from_action_components(
         self,
-        center_control: float,
+        inventory_center_control: float,
         width_control: float,
-        skew_control: float,
+        alpha_center_control: float,
+        alpha_asym_control: float,
         taker_signal: float,
         *,
         emit_info: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         return self._step_from_action_components_with_fill(
-            center_control,
+            inventory_center_control,
             width_control,
-            skew_control,
+            alpha_center_control,
+            alpha_asym_control,
             taker_signal,
             emit_info=emit_info,
             maker_fill_fn=self._compute_maker_fill_continuous,
@@ -3239,17 +3211,19 @@ class MarketMakingEnv:
 
     def _step_from_action_components_hard_diagnostic(
         self,
-        center_control: float,
+        inventory_center_control: float,
         width_control: float,
-        skew_control: float,
+        alpha_center_control: float,
+        alpha_asym_control: float,
         taker_signal: float,
         *,
         emit_info: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
         return self._step_from_action_components_with_fill(
-            center_control,
+            inventory_center_control,
             width_control,
-            skew_control,
+            alpha_center_control,
+            alpha_asym_control,
             taker_signal,
             emit_info=emit_info,
             maker_fill_fn=self._compute_maker_fill_hard,
@@ -3268,9 +3242,10 @@ class MarketMakingEnv:
 
     def _step_from_action_components_with_fill(
         self,
-        center_control: float,
+        inventory_center_control: float,
         width_control: float,
-        skew_control: float,
+        alpha_center_control: float,
+        alpha_asym_control: float,
         taker_signal: float,
         *,
         emit_info: bool,
@@ -3293,7 +3268,8 @@ class MarketMakingEnv:
                 "reward": 0.0,
                 "reward_true": 0.0,
                 "reward_train": 0.0,
-                "reward_shape_skew": 0.0,
+                "reward_shape_center": 0.0,
+                "reward_shape_asym": 0.0,
                 "reward_shape_total": 0.0,
                 "total_reward": float(self.total_reward),
                 "cash": float(self.cash),
@@ -3316,7 +3292,7 @@ class MarketMakingEnv:
                 "post_sell_room_qty": float(pre_sell_room_qty),
                 "bid": 0.0,
                 "ask": 0.0,
-                "center_control": 0.0,
+                "inventory_center_control": 0.0,
                 "center_shift_bps": 0.0,
                 "center_shift_scale_bps": 0.0,
                 "center_shift_min_bps": 0.0,
@@ -3331,18 +3307,22 @@ class MarketMakingEnv:
                 "quote_half_spread_floor_bps": float(self.quote_half_spread_floor_bps),
                 "inventory_center_weight": float(self.direct_quote_config.inventory_center_weight),
                 "alpha_center_weight": float(self.direct_quote_config.alpha_center_weight),
-                "asymmetry_residual_frac": float(self.direct_quote_config.asymmetry_residual_frac),
+                "alpha_asymmetry_cap_frac": float(self.direct_quote_config.alpha_asymmetry_cap_frac),
+                "alpha_confidence_logit_scale": float(self.direct_quote_config.alpha_confidence_logit_scale),
                 "directional_response_center_weight": float(self.direct_quote_config.directional_response_center_weight),
                 "directional_response_asym_weight": float(self.direct_quote_config.directional_response_asym_weight),
                 "width_control": 0.0,
                 "width_mult": 0.0,
-                "skew_control": 0.0,
+                "alpha_center_control": 0.0,
+                "alpha_asym_control": 0.0,
+                "alpha_strength": 0.0,
+                "raw_asymmetry_cap_bps": 0.0,
                 "anchor_half_spread_bps": 0.0,
                 "base_half_spread_bps": 0.0,
                 "half_spread_bps": 0.0,
                 "bid_half_spread_bps": float(self.quote_half_spread_floor_bps),
                 "ask_half_spread_bps": float(self.quote_half_spread_floor_bps),
-                "skew_bps": 0.0,
+                "alpha_asymmetry_bps": 0.0,
                 "inventory_center_shift_bps": 0.0,
                 "alpha_center_shift_bps": 0.0,
                 "directional_center_response": 0.0,
@@ -3397,7 +3377,7 @@ class MarketMakingEnv:
                 "taker_sell_clipped": float(self.last_taker_sell_clipped),
             }
             return self._build_observation(self.idx), 0.0, True, info
-        bid, ask, quote_metrics = self._policy_quotes(self.idx, center_control, width_control, skew_control)
+        bid, ask, quote_metrics = self._policy_quotes(self.idx, inventory_center_control, width_control, alpha_center_control, alpha_asym_control)
         self._assert_passive_quotes(bid, ask, self.idx, quote_metrics)
         self.last_weighted_cmssl_logit = self._weighted_cmssl_logit(self.idx)
         self.last_abs_weighted_cmssl_logit = self._abs_weighted_cmssl_logit(self.idx)
@@ -3505,12 +3485,17 @@ class MarketMakingEnv:
         reward_true_future = delta_equity_future - inventory_penalty_total_future - turnover_penalty
         reward_future_bonus = reward_true_future - reward_true
         reward_train_econ = reward_true + reward_future_bonus
-        reward_shape_skew = (
-            self.reward_shaping_config.skew_coef
+        reward_shape_asym = (
+            self.reward_shaping_config.asym_coef
             * cmssl_alpha
-            * float(quote_metrics["directional_response"])
+            * float(quote_metrics["directional_asym_response"])
         )
-        reward_shape_total = reward_shape_skew
+        reward_shape_center = (
+            self.reward_shaping_config.center_coef
+            * cmssl_alpha
+            * float(quote_metrics["directional_center_response"])
+        )
+        reward_shape_total = reward_shape_center + reward_shape_asym
         reward_train = reward_train_econ + reward_shape_total
 
         self.prev_equity = equity
@@ -3537,7 +3522,8 @@ class MarketMakingEnv:
             "reward_future_bonus": float(reward_future_bonus),
             "reward_train_econ": float(reward_train_econ),
             "reward_train": float(reward_train),
-            "reward_shape_skew": float(reward_shape_skew),
+            "reward_shape_center": float(reward_shape_center),
+            "reward_shape_asym": float(reward_shape_asym),
             "reward_shape_total": float(reward_shape_total),
             "total_reward": float(self.total_reward),
             "cash": float(self.cash),
@@ -3566,33 +3552,35 @@ class MarketMakingEnv:
             "post_sell_room_qty": float(post_sell_room_qty),
             "bid": float(bid),
             "ask": float(ask),
-            "center_control": float(quote_metrics["center_control"]),
+            "inventory_center_control": float(quote_metrics["inventory_center_control"]),
             "center_shift_bps": float(quote_metrics["center_shift_bps"]),
             "center_shift_scale_bps": float(quote_metrics["center_shift_scale_bps"]),
             "center_shift_min_bps": float(quote_metrics["center_shift_min_bps"]),
             "center_shift_max_bps": float(quote_metrics["center_shift_max_bps"]),
             "nominal_alpha_center_capacity_bps": float(quote_metrics["nominal_alpha_center_capacity_bps"]),
-            "positive_alpha_capacity_bps": float(quote_metrics["positive_alpha_capacity_bps"]),
-            "negative_alpha_capacity_bps": float(quote_metrics["negative_alpha_capacity_bps"]),
-            "effective_alpha_center_capacity_bps": float(quote_metrics["effective_alpha_center_capacity_bps"]),
+                        "effective_alpha_center_capacity_bps": float(quote_metrics["effective_alpha_center_capacity_bps"]),
             "observed_spread_bps": float(quote_metrics["observed_spread_bps"]),
             "observed_anchor_half_spread_bps": float(quote_metrics["observed_anchor_half_spread_bps"]),
             "fill_norm_spread_floor_full_bps": float(quote_metrics["fill_norm_spread_floor_full_bps"]),
             "quote_half_spread_floor_bps": float(quote_metrics["quote_half_spread_floor_bps"]),
             "inventory_center_weight": float(quote_metrics["inventory_center_weight"]),
             "alpha_center_weight": float(quote_metrics["alpha_center_weight"]),
-            "asymmetry_residual_frac": float(quote_metrics["asymmetry_residual_frac"]),
+            "alpha_asymmetry_cap_frac": float(quote_metrics["alpha_asymmetry_cap_frac"]),
+            "alpha_confidence_logit_scale": float(quote_metrics["alpha_confidence_logit_scale"]),
             "directional_response_center_weight": float(quote_metrics["directional_response_center_weight"]),
             "directional_response_asym_weight": float(quote_metrics["directional_response_asym_weight"]),
             "width_control": float(quote_metrics["width_control"]),
             "width_mult": float(quote_metrics["width_mult"]),
-            "skew_control": float(quote_metrics["skew_control"]),
+            "alpha_center_control": float(quote_metrics["alpha_center_control"]),
+            "alpha_asym_control": float(quote_metrics["alpha_asym_control"]),
+            "alpha_strength": float(quote_metrics["alpha_strength"]),
+            "raw_asymmetry_cap_bps": float(quote_metrics["raw_asymmetry_cap_bps"]),
             "anchor_half_spread_bps": float(quote_metrics["anchor_half_spread_bps"]),
             "base_half_spread_bps": float(quote_metrics["base_half_spread_bps"]),
             "half_spread_bps": float(quote_metrics["half_spread_bps"]),
             "bid_half_spread_bps": float(quote_metrics["bid_half_spread_bps"]),
             "ask_half_spread_bps": float(quote_metrics["ask_half_spread_bps"]),
-            "skew_bps": float(quote_metrics["skew_bps"]),
+            "alpha_asymmetry_bps": float(quote_metrics["alpha_asymmetry_bps"]),
             "inventory_center_shift_bps": float(quote_metrics["inventory_center_shift_bps"]),
             "alpha_center_shift_bps": float(quote_metrics["alpha_center_shift_bps"]),
             "directional_center_response": float(quote_metrics["directional_center_response"]),
@@ -3656,29 +3644,32 @@ class MarketMakingEnv:
         if action_arr.dtype != np.float32:
             action_arr = action_arr.astype(np.float32, copy=False)
         require(
-            action_arr.shape == (4,),
-            f"Expected action shape {(4,)}, got shape={action_arr.shape}",
+            action_arr.shape == (5,),
+            f"Expected action shape {(5,)}, got shape={action_arr.shape}",
         )
         if not np.all(np.isfinite(action_arr)):
             raise ValueError(f"Action components must be finite, got {action_arr}")
-        center_control = float(action_arr[0])
+        inventory_center_control = float(action_arr[0])
         width_control = float(action_arr[1])
-        skew_control = float(action_arr[2])
-        taker_signal = float(action_arr[3])
+        alpha_center_control = float(action_arr[2])
+        alpha_asym_control = float(action_arr[3])
+        taker_signal = float(action_arr[4])
         return self._step_from_action_components(
-            center_control,
+            inventory_center_control,
             width_control,
-            skew_control,
+            alpha_center_control,
+            alpha_asym_control,
             taker_signal,
             emit_info=emit_info,
         )
 
     def step(self, action: Any, emit_info: bool = False) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
-        center_control, width_control, skew_control, taker_signal = self._parse_action(action)
+        inventory_center_control, width_control, alpha_center_control, alpha_asym_control, taker_signal = self._parse_action(action)
         return self._step_from_action_components(
-            center_control,
+            inventory_center_control,
             width_control,
-            skew_control,
+            alpha_center_control,
+            alpha_asym_control,
             taker_signal,
             emit_info=emit_info,
         )
@@ -3688,11 +3679,12 @@ class MarketMakingEnv:
         action: Any,
         emit_info: bool = False,
     ) -> Tuple[np.ndarray, float, bool, Optional[Dict[str, float]]]:
-        center_control, width_control, skew_control, taker_signal = self._parse_action(action)
+        inventory_center_control, width_control, alpha_center_control, alpha_asym_control, taker_signal = self._parse_action(action)
         return self._step_from_action_components_hard_diagnostic(
-            center_control,
+            inventory_center_control,
             width_control,
-            skew_control,
+            alpha_center_control,
+            alpha_asym_control,
             taker_signal,
             emit_info=emit_info,
         )
@@ -3787,21 +3779,41 @@ def _init_market_policy_mean_head(model: MarketPolicyValueNet, env: MarketMaking
             final_policy_linear.bias[1] = float(width_latent_bias)
             final_policy_linear.bias[2] = 0.0
             final_policy_linear.bias[3] = 0.0
+            final_policy_linear.bias[4] = 0.0
         feature_layout = env._feature_layout
         skip_weight = model.policy_net.linear_skip.weight
         skip_bias = model.policy_net.linear_skip.bias
         dir_slice = feature_layout["dir_logits"]
         p_up_slice = feature_layout["p_up"]
+        abs_logit_slice = feature_layout["abs_weighted_cmssl_logit"]
+        conf_long_slice = feature_layout["conf_long"]
+        conf_min_slice = feature_layout["conf_min"]
         short_idx = 0
         mid_idx = env._num_h // 2
         long_idx = env._num_h - 1
+        # alpha_center_control
         skip_weight[2, dir_slice.start + short_idx] = 0.04
         skip_weight[2, dir_slice.start + mid_idx] = 0.08
         skip_weight[2, dir_slice.start + long_idx] = 0.22
         skip_weight[2, p_up_slice.start + short_idx] = 0.02
         skip_weight[2, p_up_slice.start + mid_idx] = 0.04
         skip_weight[2, p_up_slice.start + long_idx] = 0.08
-        skip_bias[2] = -0.07
+        skip_weight[2, abs_logit_slice.start] = 0.14
+        skip_weight[2, conf_long_slice.start] = 0.08
+        skip_weight[2, conf_min_slice.start] = 0.05
+        skip_bias[2] = -0.04
+        # alpha_asym_control
+        skip_weight[3, dir_slice.start + short_idx] = 0.05
+        skip_weight[3, dir_slice.start + mid_idx] = 0.10
+        skip_weight[3, dir_slice.start + long_idx] = 0.28
+        skip_weight[3, p_up_slice.start + short_idx] = 0.02
+        skip_weight[3, p_up_slice.start + mid_idx] = 0.05
+        skip_weight[3, p_up_slice.start + long_idx] = 0.10
+        skip_weight[3, abs_logit_slice.start] = 0.22
+        skip_weight[3, conf_long_slice.start] = 0.12
+        skip_weight[3, conf_min_slice.start] = 0.08
+        skip_bias[3] = 0.00
+        # inventory_center_control
         skip_weight[0, env._obs_extra_slice.start + 0] = -0.25
         skip_bias[0] = 0.0
 
@@ -3823,9 +3835,10 @@ class PPOConfig:
     rollout_horizon: int = 8192
     rollouts_per_epoch: int = 32
     randomize_rollout_start: bool = True
-    init_log_std_center: float = -0.20
+    init_log_std_inventory_center: float = -0.20
     init_log_std_width: float = -1.00
-    init_log_std_skew: float = 0.00
+    init_log_std_alpha_center: float = 0.00
+    init_log_std_alpha_asym: float = 0.15
     init_log_std_taker: float = -1.0
 
 
@@ -3904,7 +3917,8 @@ def collect_market_rollout(
     reward_true_future_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_future_bonus_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_train_econ_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    reward_shape_skew_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_shape_center_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    reward_shape_asym_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     reward_shape_total_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     training_reward_actual_horizon_ms_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     mid_future_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
@@ -3930,15 +3944,18 @@ def collect_market_rollout(
     width_mult_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     base_half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     half_spread_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    center_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    inventory_center_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    alpha_center_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_scale_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_min_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_max_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     inventory_center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     alpha_center_shift_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    skew_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
-    skew_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    alpha_asym_control_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    alpha_asymmetry_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    alpha_strength_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
+    raw_asymmetry_cap_bps_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     directional_center_response_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     directional_asym_response_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
     directional_response_buf = torch.empty((max_steps,), dtype=torch.float32, **alloc_kwargs)
@@ -4103,7 +4120,8 @@ def collect_market_rollout(
             reward_true_future_buf[idx] = float(info.get("reward_true_future", info.get("reward_true", reward)))
             reward_future_bonus_buf[idx] = float(info.get("reward_future_bonus", 0.0))
             reward_train_econ_buf[idx] = float(info.get("reward_train_econ", info.get("reward_true", reward)))
-            reward_shape_skew_buf[idx] = float(info.get("reward_shape_skew", 0.0))
+            reward_shape_center_buf[idx] = float(info.get("reward_shape_center", 0.0))
+            reward_shape_asym_buf[idx] = float(info.get("reward_shape_asym", 0.0))
             reward_shape_total_buf[idx] = float(info.get("reward_shape_total", 0.0))
             training_reward_actual_horizon_ms_buf[idx] = float(info.get("training_reward_actual_horizon_ms", 0.0))
             mid_future_buf[idx] = float(info.get("mid_future", 0.0))
@@ -4129,15 +4147,18 @@ def collect_market_rollout(
             width_mult_buf[idx] = float(info.get("width_mult", 0.0))
             base_half_spread_bps_buf[idx] = float(info.get("base_half_spread_bps", 0.0))
             half_spread_bps_buf[idx] = float(info.get("half_spread_bps", 0.0))
-            center_control_buf[idx] = float(info.get("center_control", 0.0))
+            inventory_center_control_buf[idx] = float(info.get("inventory_center_control", 0.0))
+            alpha_center_control_buf[idx] = float(info.get("alpha_center_control", 0.0))
             center_shift_scale_bps_buf[idx] = float(info.get("center_shift_scale_bps", 0.0))
             center_shift_min_bps_buf[idx] = float(info.get("center_shift_min_bps", 0.0))
             center_shift_max_bps_buf[idx] = float(info.get("center_shift_max_bps", 0.0))
             center_shift_bps_buf[idx] = float(info.get("center_shift_bps", 0.0))
             inventory_center_shift_bps_buf[idx] = float(info.get("inventory_center_shift_bps", 0.0))
             alpha_center_shift_bps_buf[idx] = float(info.get("alpha_center_shift_bps", 0.0))
-            skew_control_buf[idx] = float(info.get("skew_control", 0.0))
-            skew_bps_buf[idx] = float(info.get("skew_bps", 0.0))
+            alpha_asym_control_buf[idx] = float(info.get("alpha_asym_control", 0.0))
+            alpha_asymmetry_bps_buf[idx] = float(info.get("alpha_asymmetry_bps", 0.0))
+            alpha_strength_buf[idx] = float(info.get("alpha_strength", 0.0))
+            raw_asymmetry_cap_bps_buf[idx] = float(info.get("raw_asymmetry_cap_bps", 0.0))
             directional_center_response_buf[idx] = float(info.get("directional_center_response", 0.0))
             directional_asym_response_buf[idx] = float(info.get("directional_asym_response", 0.0))
             directional_response_buf[idx] = float(info.get("directional_response", 0.0))
@@ -4198,7 +4219,8 @@ def collect_market_rollout(
         "reward_true_future": reward_true_future_buf[:cursor],
         "reward_future_bonus": reward_future_bonus_buf[:cursor],
         "reward_train_econ": reward_train_econ_buf[:cursor],
-        "reward_shape_skew": reward_shape_skew_buf[:cursor],
+        "reward_shape_center": reward_shape_center_buf[:cursor],
+        "reward_shape_asym": reward_shape_asym_buf[:cursor],
         "reward_shape_total": reward_shape_total_buf[:cursor],
         "training_reward_actual_horizon_ms": training_reward_actual_horizon_ms_buf[:cursor],
         "mid_future": mid_future_buf[:cursor],
@@ -4224,15 +4246,18 @@ def collect_market_rollout(
         "width_mult": width_mult_buf[:cursor],
         "base_half_spread_bps": base_half_spread_bps_buf[:cursor],
         "half_spread_bps": half_spread_bps_buf[:cursor],
-        "center_control": center_control_buf[:cursor],
+        "inventory_center_control": inventory_center_control_buf[:cursor],
+        "alpha_center_control": alpha_center_control_buf[:cursor],
         "center_shift_scale_bps": center_shift_scale_bps_buf[:cursor],
         "center_shift_min_bps": center_shift_min_bps_buf[:cursor],
         "center_shift_max_bps": center_shift_max_bps_buf[:cursor],
         "center_shift_bps": center_shift_bps_buf[:cursor],
         "inventory_center_shift_bps": inventory_center_shift_bps_buf[:cursor],
         "alpha_center_shift_bps": alpha_center_shift_bps_buf[:cursor],
-        "skew_control": skew_control_buf[:cursor],
-        "skew_bps": skew_bps_buf[:cursor],
+        "alpha_asym_control": alpha_asym_control_buf[:cursor],
+        "alpha_asymmetry_bps": alpha_asymmetry_bps_buf[:cursor],
+        "alpha_strength": alpha_strength_buf[:cursor],
+        "raw_asymmetry_cap_bps": raw_asymmetry_cap_bps_buf[:cursor],
         "directional_center_response": directional_center_response_buf[:cursor],
         "directional_asym_response": directional_asym_response_buf[:cursor],
         "directional_response": directional_response_buf[:cursor],
@@ -4437,13 +4462,13 @@ def _canonical_market_action_array(
     return action_arr
 
 
-def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float, float]:
+def _market_env_action_tuple(action: np.ndarray | torch.Tensor | Sequence[float]) -> Tuple[float, float, float, float, float]:
     action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
     require(
         action_arr.shape == (_resolve_market_action_dim(),),
-        f"Expected canonical action shape {(4,)}, got shape={action_arr.shape}",
+        f"Expected canonical action shape {(5,)}, got shape={action_arr.shape}",
     )
-    return float(action_arr[0]), float(action_arr[1]), float(action_arr[2]), float(action_arr[3])
+    return float(action_arr[0]), float(action_arr[1]), float(action_arr[2]), float(action_arr[3]), float(action_arr[4])
 
 
 def evaluate_market_policy_ppo(
@@ -4721,16 +4746,11 @@ def _canonical_market_ppo_action_dim(ckpt: Dict[str, Any]) -> int:
 def _canonical_market_ppo_schema(ckpt: Dict[str, Any]) -> str:
     schema = ckpt.get("checkpoint_schema")
     if schema != MM_PPO_CHECKPOINT_SCHEMA:
-        legacy_note = (
-            " Direct-quote v5/v6 checkpoints are incompatible with v7 because policy architecture and quote-geometry semantics "
-            "changed to MLP + linear skip and mean-head warm-start semantics changed; retraining is required."
-            if schema in {"mm-ppo-direct-quote-v5", "mm-ppo-direct-quote-v6"}
-            else ""
-        )
         raise ValueError(
             "Unsupported market PPO checkpoint schema. "
             f"Expected checkpoint_schema={MM_PPO_CHECKPOINT_SCHEMA!r}, got {schema!r}. "
-            f"{legacy_note}".strip()
+            "v7 and earlier checkpoints are incompatible because action space, alpha-routing semantics, "
+            "and quote geometry changed materially; retraining is required."
         )
     return str(schema)
 
@@ -4739,7 +4759,7 @@ def _canonical_market_ppo_action_semantics(ckpt: Dict[str, Any]) -> Tuple[str, .
     semantics = ckpt.get("action_semantics")
     canonical_error = (
         "Unsupported market PPO checkpoint action semantics. "
-        f"Expected {list(MM_PPO_ACTION_SEMANTICS)!r}; retrain or re-export a direct quote policy PPO checkpoint with center/width/skew/taker controls."
+        f"Expected {list(MM_PPO_ACTION_SEMANTICS)!r}; retrain or re-export a direct quote policy PPO checkpoint with inventory_center/width/alpha_center/alpha_asym/taker controls."
     )
     if isinstance(semantics, tuple):
         semantics = list(semantics)
@@ -4844,9 +4864,10 @@ def train_market_ppo(
         value_hidden=config.value_hidden,
         action_dim=action_dim,
         init_log_std=(
-            config.init_log_std_center,
+            config.init_log_std_inventory_center,
             config.init_log_std_width,
-            config.init_log_std_skew,
+            config.init_log_std_alpha_center,
+            config.init_log_std_alpha_asym,
             config.init_log_std_taker,
         ),
     ).to(device)
@@ -4884,14 +4905,16 @@ def train_market_ppo(
         f"width_bias_latent={mean_head_width_bias_latent:.6f} "
         f"inventory_center_weight={train_env.direct_quote_config.inventory_center_weight:.2f} "
         f"alpha_center_weight={train_env.direct_quote_config.alpha_center_weight:.2f} "
-        f"asymmetry_residual_frac={train_env.direct_quote_config.asymmetry_residual_frac:.2f} "
+        f"alpha_asymmetry_cap_frac={train_env.direct_quote_config.alpha_asymmetry_cap_frac:.2f} "
+        f"alpha_confidence_logit_scale={train_env.direct_quote_config.alpha_confidence_logit_scale:.2f} "
         f"directional_response_center_weight={train_env.direct_quote_config.directional_response_center_weight:.2f} "
         f"directional_response_asym_weight={train_env.direct_quote_config.directional_response_asym_weight:.2f} "
         f"quote_half_spread_floor_bps={train_env.direct_quote_config.quote_half_spread_floor_bps:.4f} "
-        "action_controls=center/width/skew/taker controls "
-        f"init_log_std_center={config.init_log_std_center:.4f} "
+        "action_controls=inventory_center/width/alpha_center/alpha_asym/taker "
+        f"init_log_std_inventory_center={config.init_log_std_inventory_center:.4f} "
         f"init_log_std_width={config.init_log_std_width:.4f} "
-        f"init_log_std_skew={config.init_log_std_skew:.4f} "
+        f"init_log_std_alpha_center={config.init_log_std_alpha_center:.4f} "
+        f"init_log_std_alpha_asym={config.init_log_std_alpha_asym:.4f} "
         f"init_log_std_taker={config.init_log_std_taker:.4f}"
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
@@ -4944,10 +4967,11 @@ def train_market_ppo(
         and np.all(bounded_probe_action <= bounds_high_np + 1e-6)
     )
     probe_action_labels = {
-        "center_control": float(bounded_probe_action[0]),
+        "inventory_center_control": float(bounded_probe_action[0]),
         "width_control": float(bounded_probe_action[1]),
-        "skew_control": float(bounded_probe_action[2]),
-        "taker_signal": float(bounded_probe_action[3]),
+        "alpha_center_control": float(bounded_probe_action[2]),
+        "alpha_asym_control": float(bounded_probe_action[3]),
+        "taker_signal": float(bounded_probe_action[4]),
     }
     print(
         "[mm ppo bounds] "
@@ -5086,7 +5110,8 @@ def train_market_ppo(
         reward_true_future_np = rollout["reward_true_future"].detach().cpu().numpy().astype(np.float64)
         reward_future_bonus_np = rollout["reward_future_bonus"].detach().cpu().numpy().astype(np.float64)
         reward_train_econ_np = rollout["reward_train_econ"].detach().cpu().numpy().astype(np.float64)
-        shape_skew_np = rollout["reward_shape_skew"].detach().cpu().numpy().astype(np.float64)
+        shape_center_np = rollout["reward_shape_center"].detach().cpu().numpy().astype(np.float64)
+        shape_asym_np = rollout["reward_shape_asym"].detach().cpu().numpy().astype(np.float64)
         shape_total_np = rollout["reward_shape_total"].detach().cpu().numpy().astype(np.float64)
         training_reward_actual_horizon_ms_np = rollout["training_reward_actual_horizon_ms"].detach().cpu().numpy().astype(np.float64)
         touch_dist_buy_np = rollout["touch_dist_buy"].detach().cpu().numpy().astype(np.float64)
@@ -5110,15 +5135,18 @@ def train_market_ppo(
         width_mult_np = rollout["width_mult"].detach().cpu().numpy().astype(np.float64)
         base_half_spread_bps_np = rollout["base_half_spread_bps"].detach().cpu().numpy().astype(np.float64)
         half_spread_bps_np = rollout["half_spread_bps"].detach().cpu().numpy().astype(np.float64)
-        center_control_np = rollout["center_control"].detach().cpu().numpy().astype(np.float64)
+        inventory_center_control_np = rollout["inventory_center_control"].detach().cpu().numpy().astype(np.float64)
+        alpha_center_control_np = rollout["alpha_center_control"].detach().cpu().numpy().astype(np.float64)
         center_shift_scale_bps_np = rollout["center_shift_scale_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_min_bps_np = rollout["center_shift_min_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_max_bps_np = rollout["center_shift_max_bps"].detach().cpu().numpy().astype(np.float64)
         center_shift_bps_np = rollout["center_shift_bps"].detach().cpu().numpy().astype(np.float64)
         inventory_center_shift_bps_np = rollout["inventory_center_shift_bps"].detach().cpu().numpy().astype(np.float64)
         alpha_center_shift_bps_np = rollout["alpha_center_shift_bps"].detach().cpu().numpy().astype(np.float64)
-        skew_control_np = rollout["skew_control"].detach().cpu().numpy().astype(np.float64)
-        skew_bps_np = rollout["skew_bps"].detach().cpu().numpy().astype(np.float64)
+        alpha_asym_control_np = rollout["alpha_asym_control"].detach().cpu().numpy().astype(np.float64)
+        alpha_asymmetry_bps_np = rollout["alpha_asymmetry_bps"].detach().cpu().numpy().astype(np.float64)
+        alpha_strength_np = rollout["alpha_strength"].detach().cpu().numpy().astype(np.float64)
+        raw_asymmetry_cap_bps_np = rollout["raw_asymmetry_cap_bps"].detach().cpu().numpy().astype(np.float64)
         directional_center_response_np = rollout["directional_center_response"].detach().cpu().numpy().astype(np.float64)
         directional_asym_response_np = rollout["directional_asym_response"].detach().cpu().numpy().astype(np.float64)
         directional_response_np = rollout["directional_response"].detach().cpu().numpy().astype(np.float64)
@@ -5166,7 +5194,8 @@ def train_market_ppo(
             f"reward_true_future_mean={float(np.mean(reward_true_future_np)):.6f} "
             f"reward_future_bonus_mean={float(np.mean(reward_future_bonus_np)):.6f} "
             f"reward_train_econ_mean={float(np.mean(reward_train_econ_np)):.6f} "
-            f"reward_shape_skew_mean={float(np.mean(shape_skew_np)):.6f} "
+            f"reward_shape_center_mean={float(np.mean(shape_center_np)):.6f} "
+            f"reward_shape_asym_mean={float(np.mean(shape_asym_np)):.6f} "
             f"reward_shape_total_mean={float(np.mean(shape_total_np)):.6f} "
             f"cmssl_alpha_mean={float(np.mean(cmssl_alpha_np)):.6f} "
             f"shape_abs_ratio={shaping_ratio:.6f} "
@@ -5192,9 +5221,12 @@ def train_market_ppo(
             f"half_spread_bps_mean={float(np.mean(half_spread_bps_np)):.6f} "
             f"half_spread_bps_p50={float(np.percentile(half_spread_bps_np, 50.0)):.6f} "
             f"half_spread_bps_p90={float(np.percentile(half_spread_bps_np, 90.0)):.6f} "
-            f"center_control_mean={float(np.mean(center_control_np)):.6f} "
-            f"center_control_p50={float(np.percentile(center_control_np, 50.0)):.6f} "
-            f"center_control_p90={float(np.percentile(center_control_np, 90.0)):.6f} "
+            f"inventory_center_control_mean={float(np.mean(inventory_center_control_np)):.6f} "
+            f"inventory_center_control_p50={float(np.percentile(inventory_center_control_np, 50.0)):.6f} "
+            f"inventory_center_control_p90={float(np.percentile(inventory_center_control_np, 90.0)):.6f} "
+            f"alpha_center_control_mean={float(np.mean(alpha_center_control_np)):.6f} "
+            f"alpha_center_control_p50={float(np.percentile(alpha_center_control_np, 50.0)):.6f} "
+            f"alpha_center_control_p90={float(np.percentile(alpha_center_control_np, 90.0)):.6f} "
             f"center_shift_scale_bps_mean={float(np.mean(center_shift_scale_bps_np)):.6f} "
             f"center_shift_scale_bps_p50={float(np.percentile(center_shift_scale_bps_np, 50.0)):.6f} "
             f"center_shift_scale_bps_p90={float(np.percentile(center_shift_scale_bps_np, 90.0)):.6f} "
@@ -5215,9 +5247,11 @@ def train_market_ppo(
             f"quote_half_spread_floor_bps_mean={float(np.mean(quote_half_spread_floor_bps_np)):.6f} "
             f"quote_half_spread_floor_bps_p50={float(np.percentile(quote_half_spread_floor_bps_np, 50.0)):.6f} "
             f"quote_half_spread_floor_bps_p90={float(np.percentile(quote_half_spread_floor_bps_np, 90.0)):.6f} "
-            f"skew_bps_mean={float(np.mean(skew_bps_np)):.6f} "
-            f"skew_bps_p50={float(np.percentile(skew_bps_np, 50.0)):.6f} "
-            f"skew_bps_abs_p90={float(np.percentile(np.abs(skew_bps_np), 90.0)):.6f} "
+            f"alpha_asymmetry_bps_mean={float(np.mean(alpha_asymmetry_bps_np)):.6f} "
+            f"alpha_asymmetry_bps_p50={float(np.percentile(alpha_asymmetry_bps_np, 50.0)):.6f} "
+            f"alpha_asymmetry_bps_abs_p90={float(np.percentile(np.abs(alpha_asymmetry_bps_np), 90.0)):.6f} "
+            f"alpha_strength_mean={float(np.mean(alpha_strength_np)):.6f} "
+            f"raw_asymmetry_cap_bps_mean={float(np.mean(raw_asymmetry_cap_bps_np)):.6f} "
             f"directional_response_mean={float(np.mean(directional_response_np)):.6f} "
             f"directional_response_abs_p90={float(np.percentile(np.abs(directional_response_np), 90.0)):.6f} "
             f"inventory_center_shift_bps_mean={float(np.mean(inventory_center_shift_bps_np)):.6f} "
@@ -5276,16 +5310,19 @@ def train_market_ppo(
         print(
             "[mm ppo signal usage] "
             f"epoch={epoch + 1} "
-            f"skew_bps_mean={float(np.mean(skew_bps_np)):.6f} "
-            f"skew_bps_p50={float(np.percentile(skew_bps_np, 50.0)):.6f} "
-            f"skew_bps_abs_p90={float(np.percentile(np.abs(skew_bps_np), 90.0)):.6f} "
+            f"alpha_asymmetry_bps_mean={float(np.mean(alpha_asymmetry_bps_np)):.6f} "
+            f"alpha_asymmetry_bps_p50={float(np.percentile(alpha_asymmetry_bps_np, 50.0)):.6f} "
+            f"alpha_asymmetry_bps_abs_p90={float(np.percentile(np.abs(alpha_asymmetry_bps_np), 90.0)):.6f} "
+            f"alpha_strength_mean={float(np.mean(alpha_strength_np)):.6f} "
+            f"raw_asymmetry_cap_bps_mean={float(np.mean(raw_asymmetry_cap_bps_np)):.6f} "
             f"directional_response_mean={float(np.mean(directional_response_np)):.6f} "
             f"directional_response_abs_p90={float(np.percentile(np.abs(directional_response_np), 90.0)):.6f} "
             f"center_shift_bps_mean={float(np.mean(center_shift_bps_np)):.6f} "
             f"center_shift_bps_p50={float(np.percentile(center_shift_bps_np, 50.0)):.6f} "
             f"center_shift_bps_abs_p90={float(np.percentile(np.abs(center_shift_bps_np), 90.0)):.6f} "
-            f"cmssl_skew_control_corr={_safe_corr(weighted_cmssl_logit_np, skew_control_np):.6f} "
-            f"cmssl_skew_bps_corr={_safe_corr(weighted_cmssl_logit_np, skew_bps_np):.6f} "
+            f"cmssl_alpha_asym_control_corr={_safe_corr(weighted_cmssl_logit_np, alpha_asym_control_np):.6f} "
+            f"cmssl_alpha_asym_corr={_safe_corr(weighted_cmssl_logit_np, alpha_asymmetry_bps_np):.6f} "
+            f"cmssl_alpha_center_corr={_safe_corr(weighted_cmssl_logit_np, alpha_center_shift_bps_np):.6f} "
             f"cmssl_alpha_center_shift_corr={_safe_corr(weighted_cmssl_logit_np, alpha_center_shift_bps_np):.6f} "
             f"cmssl_directional_center_response_corr={_safe_corr(weighted_cmssl_logit_np, directional_center_response_np):.6f} "
             f"cmssl_sign_agreement={sign_agreement:.6f} "
@@ -5293,6 +5330,8 @@ def train_market_ppo(
             f"abs_directional_response_low_abs_logit_mean={float(np.mean(np.abs(directional_response_np[low_logit_mask])) if np.any(low_logit_mask) else 0.0):.6f} "
             f"abs_alpha_center_shift_high_abs_logit_mean={float(np.mean(np.abs(alpha_center_shift_bps_np[high_logit_mask])) if np.any(high_logit_mask) else 0.0):.6f} "
             f"abs_alpha_center_shift_low_abs_logit_mean={float(np.mean(np.abs(alpha_center_shift_bps_np[low_logit_mask])) if np.any(low_logit_mask) else 0.0):.6f} "
+            f"abs_alpha_asymmetry_high_abs_logit_mean={float(np.mean(np.abs(alpha_asymmetry_bps_np[high_logit_mask])) if np.any(high_logit_mask) else 0.0):.6f} "
+            f"abs_alpha_asymmetry_low_abs_logit_mean={float(np.mean(np.abs(alpha_asymmetry_bps_np[low_logit_mask])) if np.any(low_logit_mask) else 0.0):.6f} "
             f"bid_floor_fraction={float(np.mean(bid_at_floor_np)):.6f} "
             f"ask_floor_fraction={float(np.mean(ask_at_floor_np)):.6f}"
         )
@@ -5593,8 +5632,8 @@ def evaluate_market_making(
     maker_sell_steps_signed: List[float] = []
     touch_dist_buy_steps: List[float] = []
     touch_dist_sell_steps: List[float] = []
-    skew_control_steps: List[float] = []
-    skew_bps_steps: List[float] = []
+    alpha_asym_control_steps: List[float] = []
+    alpha_asymmetry_bps_steps: List[float] = []
     directional_response_steps: List[float] = []
     effective_alpha_center_capacity_bps_steps: List[float] = []
     directional_center_response_steps: List[float] = []
@@ -5680,8 +5719,8 @@ def evaluate_market_making(
         touch_dist_sell_steps.append(float(info.get("touch_dist_sell", 0.0)))
         maker_buy_steps_signed.append(float(info.get("maker_buy", 0.0)))
         maker_sell_steps_signed.append(float(info.get("maker_sell", 0.0)))
-        skew_control_steps.append(float(info.get("skew_control", 0.0)))
-        skew_bps_steps.append(float(info.get("skew_bps", 0.0)))
+        alpha_asym_control_steps.append(float(info.get("alpha_asym_control", 0.0)))
+        alpha_asymmetry_bps_steps.append(float(info.get("alpha_asymmetry_bps", 0.0)))
         directional_center_response_steps.append(float(info.get("directional_center_response", 0.0)))
         directional_asym_response_steps.append(float(info.get("directional_asym_response", 0.0)))
         directional_response_steps.append(float(info.get("directional_response", 0.0)))
@@ -5778,8 +5817,8 @@ def evaluate_market_making(
     maker_exec_qty_total_arr = np.asarray(maker_exec_qty_total_steps, dtype=np.float64)
     touch_dist_buy_arr = np.asarray(touch_dist_buy_steps, dtype=np.float64)
     touch_dist_sell_arr = np.asarray(touch_dist_sell_steps, dtype=np.float64)
-    skew_control_arr = np.asarray(skew_control_steps, dtype=np.float64)
-    skew_bps_arr = np.asarray(skew_bps_steps, dtype=np.float64)
+    alpha_asym_control_arr = np.asarray(alpha_asym_control_steps, dtype=np.float64)
+    alpha_asymmetry_bps_arr = np.asarray(alpha_asymmetry_bps_steps, dtype=np.float64)
     directional_center_response_arr = np.asarray(directional_center_response_steps, dtype=np.float64)
     directional_asym_response_arr = np.asarray(directional_asym_response_steps, dtype=np.float64)
     directional_response_arr = np.asarray(directional_response_steps, dtype=np.float64)
@@ -5864,9 +5903,9 @@ def evaluate_market_making(
         "ask_floor_fraction": float(np.mean(ask_at_floor_arr)) if ask_at_floor_arr.size else 0.0,
         "maker_buy_inventory_clip_fraction": float(maker_buy_clipped_steps / steps) if steps > 0 else 0.0,
         "maker_sell_inventory_clip_fraction": float(maker_sell_clipped_steps / steps) if steps > 0 else 0.0,
-        "skew_bps_mean": float(np.mean(skew_bps_arr)) if skew_bps_arr.size else 0.0,
-        "skew_bps_p50": float(np.percentile(skew_bps_arr, 50.0)) if skew_bps_arr.size else 0.0,
-        "skew_bps_abs_p90": float(np.percentile(np.abs(skew_bps_arr), 90.0)) if skew_bps_arr.size else 0.0,
+        "alpha_asymmetry_bps_mean": float(np.mean(alpha_asymmetry_bps_arr)) if alpha_asymmetry_bps_arr.size else 0.0,
+        "alpha_asymmetry_bps_p50": float(np.percentile(alpha_asymmetry_bps_arr, 50.0)) if alpha_asymmetry_bps_arr.size else 0.0,
+        "alpha_asymmetry_bps_abs_p90": float(np.percentile(np.abs(alpha_asymmetry_bps_arr), 90.0)) if alpha_asymmetry_bps_arr.size else 0.0,
         "directional_response_mean": float(np.mean(directional_response_arr)) if directional_response_arr.size else 0.0,
         "directional_response_abs_p90": float(np.percentile(np.abs(directional_response_arr), 90.0)) if directional_response_arr.size else 0.0,
         "effective_alpha_center_capacity_bps_mean": float(np.mean(effective_alpha_center_capacity_bps_arr)) if effective_alpha_center_capacity_bps_arr.size else 0.0,
@@ -5882,8 +5921,9 @@ def evaluate_market_making(
         "inventory_center_shift_bps_abs_p90": float(np.percentile(np.abs(inventory_center_shift_bps_arr), 90.0)) if inventory_center_shift_bps_arr.size else 0.0,
         "alpha_center_shift_bps_mean": float(np.mean(alpha_center_shift_bps_arr)) if alpha_center_shift_bps_arr.size else 0.0,
         "alpha_center_shift_bps_abs_p90": float(np.percentile(np.abs(alpha_center_shift_bps_arr), 90.0)) if alpha_center_shift_bps_arr.size else 0.0,
-        "cmssl_skew_control_corr": _safe_corr(weighted_cmssl_logit_arr, skew_control_arr),
-        "cmssl_skew_bps_corr": _safe_corr(weighted_cmssl_logit_arr, skew_bps_arr),
+        "cmssl_alpha_asym_control_corr": _safe_corr(weighted_cmssl_logit_arr, alpha_asym_control_arr),
+        "cmssl_alpha_asym_corr": _safe_corr(weighted_cmssl_logit_arr, alpha_asymmetry_bps_arr),
+        "cmssl_alpha_center_corr": _safe_corr(weighted_cmssl_logit_arr, alpha_center_shift_bps_arr),
         "cmssl_alpha_center_shift_corr": _safe_corr(weighted_cmssl_logit_arr, alpha_center_shift_bps_arr),
         "cmssl_directional_center_response_corr": _safe_corr(weighted_cmssl_logit_arr, directional_center_response_arr),
         "cmssl_sign_agreement_rate": float(np.mean(np.sign(directional_response_arr) == np.sign(weighted_cmssl_logit_arr))) if directional_response_arr.size else 0.0,
@@ -5891,6 +5931,8 @@ def evaluate_market_making(
         "abs_directional_response_low_abs_logit_mean": float(np.mean(np.abs(directional_response_arr[low_mask]))) if directional_response_arr.size and np.any(low_mask) else 0.0,
         "abs_alpha_center_shift_high_abs_logit_mean": float(np.mean(np.abs(alpha_center_shift_bps_arr[high_mask]))) if alpha_center_shift_bps_arr.size and np.any(high_mask) else 0.0,
         "abs_alpha_center_shift_low_abs_logit_mean": float(np.mean(np.abs(alpha_center_shift_bps_arr[low_mask]))) if alpha_center_shift_bps_arr.size and np.any(low_mask) else 0.0,
+        "abs_alpha_asymmetry_high_abs_logit_mean": float(np.mean(np.abs(alpha_asymmetry_bps_arr[high_mask]))) if alpha_asymmetry_bps_arr.size and np.any(high_mask) else 0.0,
+        "abs_alpha_asymmetry_low_abs_logit_mean": float(np.mean(np.abs(alpha_asymmetry_bps_arr[low_mask]))) if alpha_asymmetry_bps_arr.size and np.any(low_mask) else 0.0,
         "maker_buy_volume_when_signal_pos": float(np.sum(maker_buy_signed_arr[weighted_cmssl_logit_arr > 0.0])) if maker_buy_signed_arr.size else 0.0,
         "maker_sell_volume_when_signal_pos": float(np.sum(maker_sell_signed_arr[weighted_cmssl_logit_arr > 0.0])) if maker_sell_signed_arr.size else 0.0,
         "maker_buy_volume_when_signal_neg": float(np.sum(maker_buy_signed_arr[weighted_cmssl_logit_arr < 0.0])) if maker_buy_signed_arr.size else 0.0,
@@ -5944,7 +5986,7 @@ def _format_mm_summary(label: str, metrics: Dict[str, Any]) -> str:
         f"maker_step_both_fill_rate={float(metrics.get('maker_step_both_fill_rate', 0.0)):.4f} "
         f"bid_floor_fraction={float(metrics.get('bid_floor_fraction', 0.0)):.4f} "
         f"ask_floor_fraction={float(metrics.get('ask_floor_fraction', 0.0)):.4f} "
-        f"cmssl_skew_bps_corr={float(metrics.get('cmssl_skew_bps_corr', 0.0)):.4f} "
+        f"cmssl_alpha_asym_corr={float(metrics.get('cmssl_alpha_asym_corr', 0.0)):.4f} "
         f"taker_usage_freq={float(metrics.get('taker_usage_frequency', 0.0)):.4f} "
         f"taker_volume_share={float(metrics.get('taker_volume_share', 0.0)):.4f} "
         f"gross_taker_fees_paid={float(metrics.get('gross_taker_fees_paid', 0.0)):.4f} "
@@ -6185,9 +6227,10 @@ def run_pipeline(
         rollout_horizon=_env_int("BYBIT_MM_PPO_ROLLOUT_HORIZON", 8192),
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 32),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
-        init_log_std_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_CENTER", -0.20),
+        init_log_std_inventory_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_INVENTORY_CENTER", -0.20),
         init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -1.00),
-        init_log_std_skew=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_SKEW", 0.00),
+        init_log_std_alpha_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_ALPHA_CENTER", 0.00),
+        init_log_std_alpha_asym=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_ALPHA_ASYM", 0.15),
         init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -1.0),
     )
     if np.isnan(mm_ppo_config.max_drawdown_guard):
