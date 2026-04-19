@@ -298,15 +298,6 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
     return [int(item) for item in raw.split(",") if item.strip()]
 
 
-def _fail_on_removed_env_vars(removed: Sequence[str]) -> None:
-    present = [name for name in removed if os.environ.get(name, "").strip()]
-    if present:
-        raise ValueError(
-            "Removed env vars are set and no longer supported: "
-            f"{', '.join(sorted(present))}"
-        )
-
-
 def _resolve_cmssl_batch_size(default: int = 2048) -> int:
     return _env_int("BYBIT_MM_CMSSL_BATCH_SIZE", default)
 
@@ -489,14 +480,6 @@ def _resolve_run_mode(default: str = "train") -> str:
 
 
 def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
-    _fail_on_removed_env_vars(
-        (
-            "BYBIT_MM_SPREAD_FLOOR_BPS",
-            "BYBIT_MM_SKEW_MAX_FRAC",
-            "BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC",
-            "BYBIT_MM_REWARD_SHAPING_SKEW_COEF",
-        )
-    )
     direct_quote_config = load_direct_quote_config()
     continuous_maker_fill_config = load_continuous_maker_fill_config()
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
@@ -892,19 +875,6 @@ def load_rollout_start_sampling_config(*, rollout_horizon: int) -> RolloutStartS
 
 
 def load_reward_shaping_config() -> RewardShapingConfig:
-    removed_width_envs = (
-        "BYBIT_MM_REWARD_SHAPING_WIDTH_COEF",
-        "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_BASE",
-        "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_ALPHA_WEIGHT",
-        "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_VOL_WEIGHT",
-        "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MAX",
-    )
-    set_removed = [name for name in removed_width_envs if os.environ.get(name, "").strip()]
-    if set_removed:
-        raise ValueError(
-            "Width shaping was removed from reward shaping; the following env vars are no longer supported: "
-            + ", ".join(set_removed)
-        )
     cfg = RewardShapingConfig(
         enabled=_env_bool("BYBIT_MM_REWARD_SHAPING_ENABLE", True),
         logit_tanh_scale=_env_float("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE", 12.0),
@@ -6033,25 +6003,6 @@ def run_pipeline(
     run_mode: str = "train",
 ) -> Dict[str, Any]:
     print(f"[mm run mode] {run_mode}")
-    _fail_on_removed_env_vars(
-        (
-            "BYBIT_MM_CENTER_ANCHOR_FRAC",
-            "BYBIT_MM_SKEW_ANCHOR_FRAC",
-            "BYBIT_MM_FILL_TOUCH_EVENT_BONUS",
-            "BYBIT_MM_WIDTH_EXPAND_MULT",
-            "BYBIT_MM_WIDTH_TIGHTEN_FRAC",
-            "BYBIT_MM_FILL_EPS_PX",
-            "BYBIT_MM_CENTER_LIMIT_BPS",
-            "BYBIT_MM_SKEW_LIMIT_BPS",
-            "BYBIT_MM_REWARD_SHAPING_SKEW_TARGET_SCALE",
-            "BYBIT_MM_REWARD_SHAPING_WIDTH_ALPHA_COEF",
-            "BYBIT_MM_REWARD_SHAPING_WIDTH_VOL_COEF",
-            "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MIN",
-            "BYBIT_MM_REWARD_SHAPING_WIDTH_TARGET_MAX",
-            "BYBIT_MM_REWARD_SHAPING_HORIZON_LOGIT_WEIGHTS",
-            "BYBIT_MM_START_SAMPLING_HORIZON_LOGIT_WEIGHTS",
-        )
-    )
     meta = load_global_meta(Path(out_root))
     directional_signal_cfg = load_directional_signal_config(meta)
     cmssl_test_split = resolve_cmssl_test_split(out_root, meta)
