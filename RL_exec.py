@@ -671,6 +671,7 @@ class DirectQuoteConfig:
     inventory_center_weight: float
     alpha_center_weight: float
     alpha_asymmetry_cap_frac: float
+    asymmetry_residual_frac: float
     alpha_confidence_logit_scale: float
     directional_response_center_weight: float
     directional_response_asym_weight: float
@@ -905,6 +906,7 @@ def load_direct_quote_config() -> DirectQuoteConfig:
             inventory_center_weight=_env_float("BYBIT_MM_INVENTORY_CENTER_WEIGHT", 0.25),
             alpha_center_weight=_env_float("BYBIT_MM_ALPHA_CENTER_WEIGHT", 0.55),
             alpha_asymmetry_cap_frac=_env_float("BYBIT_MM_ALPHA_ASYMMETRY_CAP_FRAC", 0.75),
+            asymmetry_residual_frac=_env_float("BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC", 1.0),
             alpha_confidence_logit_scale=_env_float("BYBIT_MM_ALPHA_CONFIDENCE_LOGIT_SCALE", 6.0),
             directional_response_center_weight=_env_float("BYBIT_MM_DIRECTIONAL_RESPONSE_CENTER_WEIGHT", 0.55),
             directional_response_asym_weight=_env_float("BYBIT_MM_DIRECTIONAL_RESPONSE_ASYM_WEIGHT", 0.45),
@@ -939,6 +941,12 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         or cfg.alpha_asymmetry_cap_frac > 1.0
     ):
         raise ValueError("alpha_asymmetry_cap_frac must be finite and in (0.0, 1.0].")
+    if (
+        not np.isfinite(cfg.asymmetry_residual_frac)
+        or cfg.asymmetry_residual_frac <= 0.0
+        or cfg.asymmetry_residual_frac > 1.0
+    ):
+        raise ValueError("asymmetry_residual_frac must be finite and in (0.0, 1.0].")
     if not np.isfinite(cfg.alpha_confidence_logit_scale) or cfg.alpha_confidence_logit_scale <= 0.0:
         raise ValueError("alpha_confidence_logit_scale must be finite and > 0.")
     if not np.isfinite(cfg.directional_response_center_weight) or cfg.directional_response_center_weight < 0.0:
@@ -2774,7 +2782,12 @@ class MarketMakingEnv:
         total_half_spread_bps = 2.0 * base_half_spread_bps
         raw_asymmetry_cap_bps = cfg.alpha_asymmetry_cap_frac * total_half_spread_bps
         alpha_asym_control_clipped = float(np.clip(alpha_asym_control, -1.0, 1.0))
-        asymmetry_target_bps = alpha_strength * alpha_asym_control_clipped * raw_asymmetry_cap_bps
+        asymmetry_target_bps = (
+            cfg.asymmetry_residual_frac
+            * alpha_strength
+            * alpha_asym_control_clipped
+            * raw_asymmetry_cap_bps
+        )
 
         half_spread_floor_bps = self.quote_half_spread_floor_bps
         desired_bid_half_spread_bps = 0.5 * (total_half_spread_bps - asymmetry_target_bps)
@@ -2816,17 +2829,21 @@ class MarketMakingEnv:
         inventory_center_shift_px_raw = cfg.inventory_center_weight * inventory_center_control_clipped * center_shift_half_range_px
         inventory_only_center_shift_px = float(np.clip(center_shift_mid_px + inventory_center_shift_px_raw, center_shift_min_px, center_shift_max_px))
 
-        nominal_alpha_center_capacity_px = cfg.alpha_center_weight * center_shift_half_range_px
         alpha_center_control_clipped = float(np.clip(alpha_center_control, -1.0, 1.0))
+        positive_alpha_capacity_px = max(0.0, center_shift_max_px - inventory_only_center_shift_px)
+        negative_alpha_capacity_px = max(0.0, inventory_only_center_shift_px - center_shift_min_px)
+        directional_alpha_capacity_px = (
+            positive_alpha_capacity_px
+            if alpha_center_control_clipped >= 0.0
+            else negative_alpha_capacity_px
+        )
+        nominal_alpha_center_capacity_px = cfg.alpha_center_weight * directional_alpha_capacity_px
         alpha_center_shift_px_raw = alpha_strength * alpha_center_control_clipped * nominal_alpha_center_capacity_px
         center_shift_px = float(np.clip(inventory_only_center_shift_px + alpha_center_shift_px_raw, center_shift_min_px, center_shift_max_px))
 
         actual_inventory_center_shift_px = inventory_only_center_shift_px - center_shift_mid_px
         actual_alpha_center_shift_px = center_shift_px - inventory_only_center_shift_px
-        effective_alpha_center_capacity_px = min(
-            nominal_alpha_center_capacity_px,
-            max(center_shift_max_px - inventory_only_center_shift_px, inventory_only_center_shift_px - center_shift_min_px),
-        )
+        effective_alpha_center_capacity_px = nominal_alpha_center_capacity_px
 
         center_shift_bps = center_shift_px / max(mid, 1e-12) * 1e4
         inventory_center_shift_bps = actual_inventory_center_shift_px / max(mid, 1e-12) * 1e4
@@ -2857,6 +2874,7 @@ class MarketMakingEnv:
             "inventory_center_weight": float(cfg.inventory_center_weight),
             "alpha_center_weight": float(cfg.alpha_center_weight),
             "alpha_asymmetry_cap_frac": float(cfg.alpha_asymmetry_cap_frac),
+            "asymmetry_residual_frac": float(cfg.asymmetry_residual_frac),
             "alpha_confidence_logit_scale": float(cfg.alpha_confidence_logit_scale),
             "directional_response_center_weight": float(cfg.directional_response_center_weight),
             "directional_response_asym_weight": float(cfg.directional_response_asym_weight),
@@ -3438,6 +3456,8 @@ class MarketMakingEnv:
         mid_future = float(self.mid_px[future_idx])
         equity_future = self.cash + self.inventory * mid_future
         delta_equity_future = equity_future - self.prev_equity
+        baseline_pnl = inv_prev * (mid_future - mid_next)
+        hedged_delta_equity_future = delta_equity_future - baseline_pnl
         penalty_future = self._compute_penalty(mid_future)
         inv_notional_future = abs(inv_new * mid_future)
         excess_notional_future = max(0.0, inv_notional_future - self.inv_soft_notional)
@@ -3447,7 +3467,7 @@ class MarketMakingEnv:
             else 0.0
         )
         inventory_penalty_total_future = self._combine_inventory_penalties(penalty_future, inv_penalty_future)
-        reward_true_future = delta_equity_future - inventory_penalty_total_future - turnover_penalty
+        reward_true_future = hedged_delta_equity_future - inventory_penalty_total_future - turnover_penalty
         reward_future_bonus = reward_true_future - reward_true
         reward_train_econ = reward_true + reward_future_bonus
         reward_shape_asym = (
@@ -3497,6 +3517,8 @@ class MarketMakingEnv:
             "equity": float(equity),
             "delta_equity": float(delta_equity),
             "delta_equity_future": float(delta_equity_future),
+            "hedged_delta_equity_future": float(hedged_delta_equity_future),
+            "baseline_pnl_future": float(baseline_pnl),
             "rebate": float(rebate),
             "taker_fee": float(taker_fee),
             "penalty": float(penalty),
