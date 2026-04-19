@@ -489,7 +489,14 @@ def _resolve_run_mode(default: str = "train") -> str:
 
 
 def resolve_market_env_common_kwargs_from_env() -> Dict[str, Any]:
-    _fail_on_removed_env_vars(("BYBIT_MM_SPREAD_FLOOR_BPS", "BYBIT_MM_SKEW_MAX_FRAC"))
+    _fail_on_removed_env_vars(
+        (
+            "BYBIT_MM_SPREAD_FLOOR_BPS",
+            "BYBIT_MM_SKEW_MAX_FRAC",
+            "BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC",
+            "BYBIT_MM_REWARD_SHAPING_SKEW_COEF",
+        )
+    )
     direct_quote_config = load_direct_quote_config()
     continuous_maker_fill_config = load_continuous_maker_fill_config()
     maker_rebate_bps = float(os.environ.get("BYBIT_MM_MAKER_REBATE_BPS", "0.0"))
@@ -898,11 +905,6 @@ def load_reward_shaping_config() -> RewardShapingConfig:
             "Width shaping was removed from reward shaping; the following env vars are no longer supported: "
             + ", ".join(set_removed)
         )
-    if os.environ.get("BYBIT_MM_REWARD_SHAPING_SKEW_COEF", "").strip():
-        raise ValueError(
-            "BYBIT_MM_REWARD_SHAPING_SKEW_COEF was removed. "
-            "Use BYBIT_MM_REWARD_SHAPING_CENTER_COEF and BYBIT_MM_REWARD_SHAPING_ASYM_COEF."
-        )
     cfg = RewardShapingConfig(
         enabled=_env_bool("BYBIT_MM_REWARD_SHAPING_ENABLE", True),
         logit_tanh_scale=_env_float("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE", 12.0),
@@ -919,11 +921,6 @@ def load_reward_shaping_config() -> RewardShapingConfig:
 
 
 def load_direct_quote_config() -> DirectQuoteConfig:
-    if os.environ.get("BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC", "").strip():
-        raise ValueError(
-            "BYBIT_MM_ASYMMETRY_RESIDUAL_FRAC was removed because the old asymmetry geometry was removed. "
-            "Use BYBIT_MM_ALPHA_ASYMMETRY_CAP_FRAC and BYBIT_MM_ALPHA_CONFIDENCE_LOGIT_SCALE."
-        )
     return _validate_direct_quote_config(
         DirectQuoteConfig(
             quote_half_spread_floor_bps=_env_float(
@@ -964,8 +961,6 @@ def _validate_direct_quote_config(cfg: DirectQuoteConfig) -> DirectQuoteConfig:
         raise ValueError("taker_signal_limit must be finite and > 0.0")
     if not np.isfinite(cfg.inventory_center_weight) or cfg.inventory_center_weight < 0.0 or cfg.inventory_center_weight > 1.0:
         raise ValueError("inventory_center_weight must be finite and in [0.0, 1.0].")
-    if not np.isfinite(cfg.alpha_center_weight) or cfg.alpha_center_weight <= 0.0 or cfg.alpha_center_weight > 1.0:
-        raise ValueError("alpha_center_weight must be finite and in (0.0, 1.0].")
     if not np.isfinite(cfg.alpha_center_weight) or cfg.alpha_center_weight <= 0.0 or cfg.alpha_center_weight > 1.0:
         raise ValueError("alpha_center_weight must be finite and in (0.0, 1.0].")
     if (
