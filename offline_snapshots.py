@@ -96,8 +96,8 @@ RAW_SNAPSHOT_FEATURE_COLUMNS = [
     "vol_short",
     "vol_long",
 ]
-SHORT_VOL_WINDOW = 5
-LONG_VOL_WINDOW = 10
+SHORT_VOL_WINDOW = 20
+LONG_VOL_WINDOW = 50
 
 
 def quality_env_config() -> dict[str, object]:
