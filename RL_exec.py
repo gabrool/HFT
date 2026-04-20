@@ -879,8 +879,8 @@ def load_reward_shaping_config() -> RewardShapingConfig:
     cfg = RewardShapingConfig(
         enabled=_env_bool("BYBIT_MM_REWARD_SHAPING_ENABLE", True),
         logit_tanh_scale=_env_float("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE", 12.0),
-        center_coef=_env_float("BYBIT_MM_REWARD_SHAPING_CENTER_COEF", 0.01),
-        asym_coef=_env_float("BYBIT_MM_REWARD_SHAPING_ASYM_COEF", 0.03),
+        center_coef=_env_float("BYBIT_MM_REWARD_SHAPING_CENTER_COEF", 1.0),
+        asym_coef=_env_float("BYBIT_MM_REWARD_SHAPING_ASYM_COEF", 1.0),
     )
     if not np.isfinite(cfg.logit_tanh_scale) or cfg.logit_tanh_scale <= 0.0:
         raise ValueError("BYBIT_MM_REWARD_SHAPING_LOGIT_TANH_SCALE must be finite and > 0.")
