@@ -1191,12 +1191,11 @@ class FeatureEngine:
             "bid1",
             "ask1",
             "mid",
-            "spread",
-            "spread_norm",
+            "spread_bps",
             "micro",
             "smart",
-            "gap_a",
-            "gap_b",
+            "gap_a_bps",
+            "gap_b_bps",
             "cum_bid1",
             "cum_ask1",
             "cum_bid3",
@@ -1766,19 +1765,21 @@ class FeatureEngine:
             micro = smart = mid
 
         spread = max(0.0, ask1 - bid1)
-        spread_norm = spread / max(mid, 1e-9)
+        spread_bps = 1e4 * spread / max(mid, 1e-12)
 
-        spread_deltas: Dict[int, float] = {}
+        spread_delta_bps: Dict[int, float] = {}
         for window in self.ob_horizon_compare_windows_ms:
             target_ts_ms = ts_ms - window
             ob_snap = self.get_ob_snapshot_asof(target_ts_ms)
             spread_t_minus_h = ob_snap.spread if ob_snap is not None else spread
-            spread_deltas[window] = spread - spread_t_minus_h
+            spread_delta_bps[window] = 1e4 * (spread - spread_t_minus_h) / max(mid, 1e-12)
 
         ask2 = self.ask_lvls[1][0] if len(self.ask_lvls) > 1 else ask1
         bid2 = self.bid_lvls[1][0] if len(self.bid_lvls) > 1 else bid1
         gap_a = max(0.0, ask2 - ask1)
         gap_b = max(0.0, bid1 - bid2)
+        gap_a_bps = 1e4 * gap_a / max(mid, 1e-12)
+        gap_b_bps = 1e4 * gap_b / max(mid, 1e-12)
 
         bsz2 = self.bid_lvls[1][1] if len(self.bid_lvls) > 1 else 0.0
         asz2 = self.ask_lvls[1][1] if len(self.ask_lvls) > 1 else 0.0
@@ -1827,8 +1828,8 @@ class FeatureEngine:
         slope_a = self._lin_slope(xa, ya)
 
         indicator_values = {
-            "bid1": bid1, "ask1": ask1, "mid": mid, "spread": spread, "spread_norm": spread_norm,
-            "micro": micro, "smart": smart, "gap_a": gap_a, "gap_b": gap_b,
+            "bid1": bid1, "ask1": ask1, "mid": mid, "spread_bps": spread_bps,
+            "micro": micro, "smart": smart, "gap_a_bps": gap_a_bps, "gap_b_bps": gap_b_bps,
             "cum_bid1": cum_bid1, "cum_ask1": cum_ask1, "cum_bid3": cum_bid3, "cum_ask3": cum_ask3,
             "slope_a": slope_a, "slope_b": slope_b, "obi_l1": obi_l1, "obi_l3": obi_l3, "obi_l5": obi_l5,
             "ofi_l1": ofi_l1, "ofi_l3": ofi_l3, "ofi_l5": ofi_l5, "micro_premia": micro_premia, "smart_premia": smart_premia,
@@ -1844,8 +1845,8 @@ class FeatureEngine:
             ms: (self.trade_window_state[ms]["pxv_sum"] / self.trade_window_state[ms]["vol_sum"] if self.trade_window_state[ms]["vol_sum"] > 1e-12 else mid)
             for ms in self.trade_windows
         }
-        vwap_vs_mid = {ms: ((vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0) if mid > 0 else 0.0 for ms in self.trade_windows}
-        vwap_vs_micro = {ms: ((vwap_per_ms[ms] / max(micro, 1e-12)) - 1.0) if micro > 0 else 0.0 for ms in self.trade_windows}
+        vwap_vs_mid_bps = {ms: (1e4 * ((vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0)) if mid > 0 else 0.0 for ms in self.trade_windows}
+        vwap_vs_micro_bps = {ms: (1e4 * ((vwap_per_ms[ms] / max(micro, 1e-12)) - 1.0)) if micro > 0 else 0.0 for ms in self.trade_windows}
 
         for ms in self._spread_change_deques:
             if self.last_spread is None or spread != self.last_spread:
@@ -1896,8 +1897,6 @@ class FeatureEngine:
             self.flow_regime[ms] = trade_stats[nearest]["imbalance"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
 
-        spread_delta_norms = {ms: spread_deltas[ms] / max(spread, 1e-9) for ms in self.ob_horizon_compare_windows_ms}
-
         rsi_vals = []
         for hl in EMA_HALF_LIVES_MS:
             ema_micro = self.ema_states[hl]["micro"] if self.ema_states[hl]["micro"] is not None else micro
@@ -1942,7 +1941,7 @@ class FeatureEngine:
         # 4) flow-window return std/VR; 5) regime-window summaries; 6) pressure; 7) EMA bank; 8) EMA residuals;
         # 9) RSI; 10) MACD; 11) CCI; 12) VPIN.
         feat_list = [
-            bid1, ask1, mid, micro, smart, spread, spread_norm, gap_a, gap_b,
+            bid1, ask1, mid, micro, smart, spread_bps, gap_a_bps, gap_b_bps,
             bsz1, asz1, cum_bid5, cum_ask5, cum_bid10, cum_ask10, slope_a, slope_b,
             obi_l1, obi_l3, obi_l5, ofi_l1, ofi_l3, ofi_l5, micro_premia, smart_premia,
             dt_since_trade, dt_since_bid1_update, dt_since_ask1_update,
@@ -1951,8 +1950,7 @@ class FeatureEngine:
 
         for ms in FAST_WINDOWS_MS:
             feat_list.extend([
-                spread_deltas.get(ms, 0.0),
-                spread_delta_norms.get(ms, 0.0),
+                spread_delta_bps.get(ms, 0.0),
                 float(len(self._spread_change_deques[ms])),
                 float(len(self._bid1_change_deques[ms])),
                 float(len(self._ask1_change_deques[ms])),
@@ -1968,7 +1966,7 @@ class FeatureEngine:
                 stats["buy_vol"], stats["sell_vol"], stats["buy_cnt"], stats["sell_cnt"],
                 stats["buy_mean"], stats["sell_mean"], stats["buy_max"], stats["sell_max"],
                 stats["net_flow"], stats["imbalance"], stats["toxicity"], stats["trade_through"],
-                float(quote_counts[ms]), vwap_vs_mid[ms], vwap_vs_micro[ms],
+                float(quote_counts[ms]), vwap_vs_mid_bps[ms], vwap_vs_micro_bps[ms],
             ])
 
         for ms in FLOW_WINDOWS_MS:
@@ -2158,7 +2156,7 @@ class FeatureEngine:
         if self.last_mid_for_ret is None:
             self.last_mid_for_ret = mid
             return 0.0
-        r = math.log(mid / self.last_mid_for_ret) if self.last_mid_for_ret > 0 else 0.0
+        r = (1e4 * math.log(mid / self.last_mid_for_ret)) if self.last_mid_for_ret > 0 else 0.0
         self.last_mid_for_ret = mid
 
         for ms, deq in self.return_histories.items():
