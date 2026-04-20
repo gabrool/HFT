@@ -991,14 +991,17 @@ def safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day):
     dq_day.increment_counter("th", "total_emitted", emitted)
 
 def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
-    # exact tail order: [log_dt_ms, is_trade, log_events_100ms, log_events_200ms, log_events_500ms]
+    # exact tail order:
+    # [log_dt_ms, is_trade, log_events_100ms, log_events_500ms, log_events_1000ms, log_events_3000ms, log_events_7500ms]
     aux_tail = np.array(
         [
             np.log1p(float(dt_ms)),
             float(is_trade),
             np.log1p(fe.event_density_100ms()),
-            np.log1p(fe.event_density_200ms()),
             np.log1p(fe.event_density_500ms()),
+            np.log1p(fe.event_density_1000ms()),
+            np.log1p(fe.event_density_3000ms()),
+            np.log1p(fe.event_density_7500ms()),
         ],
         dtype=np.float32,
     )
@@ -1359,6 +1362,15 @@ class WeekWriterRouter:
             "week": week_key,
             "decision_policy": DECISION_POLICY,
             "decision_time_basis": "ob_event_time",
+            "window_ms": 60_000,
+            "decision_stride_policy": "every_ob_event",
+            "label_delta_ms": 0,
+            "label_units": "signed_log_return_bps",
+            "target_task": "signed_excess_return_training_from_raw_bps_labels",
+            "fee_hurdle_bps": 3.7,
+            "target_transform": "signed_sqrt_excess_bps",
+            "abs_trim_tail_fraction": 0.02,
+            "checkpoint_schema_expected": "cmssl17-signed-excess-v1",
             **canonical_mode_fields(),
             "lookback": self.lookback,
             "feature_dim_total": self.feature_dim,
@@ -2365,11 +2377,20 @@ def process_all(
         "weeks_in_order": weeks_in_order,
         "decision_policy": DECISION_POLICY,
         "decision_time_basis": "ob_event_time",
+        "window_ms": 60_000,
+        "decision_stride_policy": "every_ob_event",
+        "label_delta_ms": 0,
+        "label_units": "signed_log_return_bps",
+        "target_task": "signed_excess_return_training_from_raw_bps_labels",
+        "fee_hurdle_bps": 3.7,
+        "target_transform": "signed_sqrt_excess_bps",
+        "abs_trim_tail_fraction": 0.02,
+        "checkpoint_schema_expected": "cmssl17-signed-excess-v1",
         **canonical_mode_fields(),
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
-        "aux_tail": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_200ms", "log_events_500ms"],
+        "aux_tail": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_500ms", "log_events_1000ms", "log_events_3000ms", "log_events_7500ms"],
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
