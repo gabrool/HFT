@@ -2800,16 +2800,27 @@ class MarketMakingEnv:
                 "Non-finite projected half spreads: "
                 f"idx={idx} bid_half_spread_bps={bid_half_spread_bps} ask_half_spread_bps={ask_half_spread_bps}"
             )
-        if not (half_spread_floor_bps <= bid_half_spread_bps <= cfg.spread_cap_bps):
+        spread_bound_eps = 1e-9
+        if not (
+            half_spread_floor_bps - spread_bound_eps
+            <= bid_half_spread_bps
+            <= cfg.spread_cap_bps + spread_bound_eps
+        ):
             raise RuntimeError(
                 "Bid half spread outside feasible bounds after projection: "
                 f"idx={idx} bid_half_spread_bps={bid_half_spread_bps} floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
             )
-        if not (half_spread_floor_bps <= ask_half_spread_bps <= cfg.spread_cap_bps):
+        if not (
+            half_spread_floor_bps - spread_bound_eps
+            <= ask_half_spread_bps
+            <= cfg.spread_cap_bps + spread_bound_eps
+        ):
             raise RuntimeError(
                 "Ask half spread outside feasible bounds after projection: "
                 f"idx={idx} ask_half_spread_bps={ask_half_spread_bps} floor={half_spread_floor_bps} cap={cfg.spread_cap_bps}"
             )
+        bid_half_spread_bps = float(np.clip(bid_half_spread_bps, half_spread_floor_bps, cfg.spread_cap_bps))
+        ask_half_spread_bps = float(np.clip(ask_half_spread_bps, half_spread_floor_bps, cfg.spread_cap_bps))
 
         bid_half_spread_px = bps_to_px(mid, bid_half_spread_bps)
         ask_half_spread_px = bps_to_px(mid, ask_half_spread_bps)
