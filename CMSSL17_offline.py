@@ -34,19 +34,13 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from CMSSL17 import (  # type: ignore
-    # model + args
     SAMBA, ModelArgs,
-    # core hypers
-    LOOKBACK, AUX_DIM, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
+    LOOKBACK, WINDOW_MS, AUX_DIM, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
     BATCH_SIZE, EPOCHS, LR, PATIENCE,
-    # schedules
-    DIR_MASK_TAIL_FRACTION,
     DMODEL, MAMBA_LAYERS,
-    PRIMARY_METRIC_HORIZON_MS,
-    # utils
-    binary_auc_from_logits,
+    PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS,
+    FEE_HURDLE_BPS, ABS_TRIM_TAIL_FRACTION, TARGET_TRANSFORM, CHECKPOINT_SCHEMA,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
-    # optimizer
     SAM,
 )
 
@@ -466,753 +460,307 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
     y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
     return X, y, int(feat_dim)
 
-# ---------------- Directional-noise filter quantiles from TRAIN set ----------------
-def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    # Label-space noise trimming: keep only mid-quantile return magnitudes per direction/horizon;
-    # this is unrelated to model token dropout objectives.
-    y_ret = y_train.astype(np.float32, copy=False)
-    def _compute_trim_bounds(arr: np.ndarray) -> Tuple[float, float]:
-        if arr.size == 0:
-            return float("inf"), float("-inf")
-        try:
-            lo = float(np.quantile(arr, DIR_MASK_TAIL_FRACTION, method="linear"))
-            hi = float(np.quantile(arr, 1.0 - DIR_MASK_TAIL_FRACTION, method="linear"))
-        except TypeError:
-            lo = float(np.quantile(arr, DIR_MASK_TAIL_FRACTION, interpolation="linear"))
-            hi = float(np.quantile(arr, 1.0 - DIR_MASK_TAIL_FRACTION, interpolation="linear"))
-        return lo, hi
-
-    pos_lo_list = []
-    pos_hi_list = []
-    neg_lo_list = []
-    neg_hi_list = []
-    print("[directional-noise-filter quantiles]")
-    for idx, horizon in enumerate(HORIZONS_MS):
-        horizon_returns = y_ret[:, idx]
-        pos_returns = horizon_returns[horizon_returns > 0]
-        neg_returns = horizon_returns[horizon_returns < 0]
-        pos_lo, pos_hi = _compute_trim_bounds(pos_returns)
-        neg_lo, neg_hi = _compute_trim_bounds((-neg_returns))
-        pos_lo_list.append(pos_lo); pos_hi_list.append(pos_hi)
-        neg_lo_list.append(neg_lo); neg_hi_list.append(neg_hi)
-        print(f"  {horizon}ms → pos:[{pos_lo:.3e}, {pos_hi:.3e}]  neg|mag:[{neg_lo:.3e}, {neg_hi:.3e}] (tail {DIR_MASK_TAIL_FRACTION:.2%})")
-
-    pos_lo_arr = np.array(pos_lo_list, dtype=np.float32)
-    pos_hi_arr = np.array(pos_hi_list, dtype=np.float32)
-    neg_lo_arr = np.array(neg_lo_list, dtype=np.float32)
-    neg_hi_arr = np.array(neg_hi_list, dtype=np.float32)
-
-    pos_mask = y_ret > 0
-    neg_mask = y_ret < 0
-    neg_mag = -y_ret
-    keep_mask = (
-        (pos_mask & (y_ret >= pos_lo_arr) & (y_ret <= pos_hi_arr))
-        | (neg_mask & (neg_mag >= neg_lo_arr) & (neg_mag <= neg_hi_arr))
-    )
-    kept_per_h = keep_mask.mean(axis=0)
-    per_horizon_line = " | ".join(
-        f"{horizon}ms={float(kept):.2%}" for horizon, kept in zip(HORIZONS_MS, kept_per_h)
-    )
-    print(f"[dir-mask] kept per horizon: {per_horizon_line}")
-
-    main_idx = NUM_HORIZONS - 1
-    main_kept = float(keep_mask[:, main_idx].mean())
-    main_removed = 1.0 - main_kept
-    print(
-        f"[dir-mask] main horizon {HORIZONS_MS[main_idx]}ms kept={main_kept:.2%}, removed={main_removed:.2%}"
-    )
-
-    none_kept = float((~keep_mask.any(axis=1)).mean())
-    all_kept = float((keep_mask.all(axis=1)).mean())
-    print(f"[dir-mask] row sanity: none_kept={none_kept:.2%}, all_kept={all_kept:.2%}")
-
-    return (
-        pos_lo_arr,
-        pos_hi_arr,
-        neg_lo_arr,
-        neg_hi_arr,
-    )
+# ---------------- Signed-excess preprocessing, cache, and metrics ----------------
+def raw_returns_to_excess_bps(y_raw_bps: np.ndarray, fee_hurdle_bps: float) -> np.ndarray:
+    mag = np.maximum(np.abs(y_raw_bps) - float(fee_hurdle_bps), 0.0)
+    return np.sign(y_raw_bps) * mag
 
 
-def load_quantile_cache(path: Path) -> Optional[Tuple[Dict[str, np.ndarray], Dict[str, Any]]]:
+def signed_sqrt_transform(x: np.ndarray) -> np.ndarray:
+    return np.sign(x) * np.sqrt(np.abs(x))
+
+
+def build_abs_trim_mask(y_raw_bps: np.ndarray, abs_lo_raw_bps: np.ndarray, abs_hi_raw_bps: np.ndarray) -> np.ndarray:
+    abs_y = np.abs(y_raw_bps)
+    lo = abs_lo_raw_bps.reshape(1, -1)
+    hi = abs_hi_raw_bps.reshape(1, -1)
+    return (abs_y >= lo) & (abs_y <= hi)
+
+
+def build_loss_weights(y_excess_bps: np.ndarray, active_q50_excess: np.ndarray, active_q85_excess: np.ndarray) -> np.ndarray:
+    w = np.full_like(y_excess_bps, 0.25, dtype=np.float32)
+    abs_ex = np.abs(y_excess_bps)
+    active = abs_ex > 0
+    q50 = active_q50_excess.reshape(1, -1)
+    q85 = active_q85_excess.reshape(1, -1)
+    w[active & (abs_ex <= q50)] = 1.00
+    w[active & (abs_ex > q50) & (abs_ex <= q85)] = 1.25
+    w[active & (abs_ex > q85)] = 1.00
+    return w
+
+
+def compute_signed_excess_stats(y_train: np.ndarray) -> Dict[str, np.ndarray]:
+    abs_y = np.abs(y_train)
+    abs_lo = np.quantile(abs_y, ABS_TRIM_TAIL_FRACTION, axis=0).astype(np.float32)
+    abs_hi = np.quantile(abs_y, 1.0 - ABS_TRIM_TAIL_FRACTION, axis=0).astype(np.float32)
+    keep = build_abs_trim_mask(y_train, abs_lo, abs_hi)
+    y_ex = raw_returns_to_excess_bps(y_train, FEE_HURDLE_BPS)
+    q50 = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    q85 = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    for h in range(NUM_HORIZONS):
+        a = np.abs(y_ex[:, h])
+        act = a[(a > 0) & keep[:, h]]
+        if act.size:
+            q50[h] = float(np.quantile(act, 0.50))
+            q85[h] = float(np.quantile(act, 0.85))
+    return {
+        'abs_lo_raw_bps': abs_lo,
+        'abs_hi_raw_bps': abs_hi,
+        'active_q50_excess': q50,
+        'active_q85_excess': q85,
+    }
+
+
+def load_stats_cache(path: Path):
     if not path.exists():
         return None
-    try:
-        with np.load(path, allow_pickle=False) as cached:
-            bounds = {
-                "pos_lo": np.asarray(cached["pos_lo"], dtype=np.float32),
-                "pos_hi": np.asarray(cached["pos_hi"], dtype=np.float32),
-                "neg_lo": np.asarray(cached["neg_lo"], dtype=np.float32),
-                "neg_hi": np.asarray(cached["neg_hi"], dtype=np.float32),
-            }
-            meta_json = str(cached["metadata_json"].item())
-        metadata = json.loads(meta_json)
-    except Exception as exc:
-        print(f"[dir-mask-cache] invalid cache at {path}: {exc}")
-        return None
-    return bounds, metadata
+    with np.load(path, allow_pickle=False) as c:
+        stats = {k: np.asarray(c[k], dtype=np.float32) for k in ('abs_lo_raw_bps','abs_hi_raw_bps','active_q50_excess','active_q85_excess')}
+        meta = json.loads(str(c['metadata_json'].item()))
+    return stats, meta
 
 
-def save_quantile_cache(path: Path, bounds: Dict[str, np.ndarray], metadata: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        pos_lo=np.asarray(bounds["pos_lo"], dtype=np.float32),
-        pos_hi=np.asarray(bounds["pos_hi"], dtype=np.float32),
-        neg_lo=np.asarray(bounds["neg_lo"], dtype=np.float32),
-        neg_hi=np.asarray(bounds["neg_hi"], dtype=np.float32),
-        metadata_json=np.array(json.dumps(metadata, sort_keys=True), dtype=np.str_),
-    )
+def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[str, Any]) -> None:
+    np.savez_compressed(path, **stats, metadata_json=np.array(json.dumps(metadata, sort_keys=True), dtype=np.str_))
 
 
-def quantile_cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
-    required_keys = (
-        "tail_fraction",
-        "horizons_ms",
-        "train_week_keys",
-        "train_ts_start",
-        "train_ts_end",
-        "decision_time_basis",
-        "trade_history_enabled",
-        "event_stream_mode",
-    )
-    return all(cached_meta.get(k) == current_meta.get(k) for k in required_keys)
+def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
+    keys = ('abs_trim_tail_fraction','fee_hurdle_bps','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units')
+    return all(cached_meta.get(k)==current_meta.get(k) for k in keys)
 
-def make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi):
-    # Build a label-space noise filter mask (mid-quantile magnitude keeper), not an SSL token mask.
-    pos_lo_t = torch.from_numpy(pos_lo)
-    pos_hi_t = torch.from_numpy(pos_hi)
-    neg_lo_t = torch.from_numpy(neg_lo)
-    neg_hi_t = torch.from_numpy(neg_hi)
 
-    def build_directional_noise_filter_mask(y_ret: torch.Tensor) -> torch.Tensor:
-        pos = y_ret > 0
-        neg = y_ret < 0
-        lo_pos = pos_lo_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
-        hi_pos = pos_hi_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
-        lo_neg = neg_lo_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
-        hi_neg = neg_hi_t.to(device=y_ret.device, dtype=y_ret.dtype).view(1, -1)
-        mag_neg = (-y_ret).clamp_min(0.0)
-        keep_pos = pos & (y_ret >= lo_pos) & (y_ret <= hi_pos)
-        keep_neg = neg & (mag_neg >= lo_neg) & (mag_neg <= hi_neg)
-        return keep_pos | keep_neg
-    return build_directional_noise_filter_mask
+def _pearson(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 2:
+        return float('nan')
+    x0 = x - x.mean(); y0 = y - y.mean()
+    den = np.sqrt((x0*x0).sum() * (y0*y0).sum())
+    if den <= 0:
+        return float('nan')
+    return float((x0*y0).sum()/den)
 
-def compute_directional_loss_fn(build_directional_noise_filter_mask_fn, horizon_weights: torch.Tensor):
-    def compute_directional_loss(logits: torch.Tensor, y_ret: torch.Tensor) -> torch.Tensor:
-        noise_filter_mask = build_directional_noise_filter_mask_fn(y_ret)
-        if not noise_filter_mask.any():
-            return torch.tensor(0.0, device=logits.device)
-        y_dir = (y_ret > 0).float()
-        losses = []
-        weights = []
-        for h_idx in range(NUM_HORIZONS):
-            noise_filter_mask_h = noise_filter_mask[:, h_idx]
-            if noise_filter_mask_h.any():
-                loss_h = F.binary_cross_entropy_with_logits(
-                    logits[noise_filter_mask_h, h_idx], y_dir[noise_filter_mask_h, h_idx], reduction='mean'
-                )
-                losses.append(loss_h)
-                weights.append(horizon_weights[h_idx])
-        if not losses:
-            return torch.tensor(0.0, device=logits.device)
-        loss_stack = torch.stack(losses)
-        weight_stack = torch.stack(weights)
-        return (loss_stack * weight_stack).sum() / weight_stack.sum()
-    return compute_directional_loss
+
+def _spearman(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 2:
+        return float('nan')
+    rx = np.argsort(np.argsort(x))
+    ry = np.argsort(np.argsort(y))
+    return _pearson(rx.astype(np.float64), ry.astype(np.float64))
+
+
+def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_only=False):
+    model.eval()
+    pred_parts=[]; y_parts=[]
+    with torch.no_grad():
+        for x,y in dl:
+            x=x.to(device, non_blocking=True)
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                pred=model(x)
+            pred_parts.append(pred.detach().float().cpu().numpy())
+            y_parts.append(y.numpy())
+    if not y_parts:
+        out={"top_10pct_signed_excess_bps":[float('nan')]*NUM_HORIZONS}
+        return out
+    pred=np.concatenate(pred_parts,0); y_raw=np.concatenate(y_parts,0)
+    keep=build_abs_trim_mask(y_raw, stats['abs_lo_raw_bps'], stats['abs_hi_raw_bps'])
+    y_ex=raw_returns_to_excess_bps(y_raw, FEE_HURDLE_BPS)
+    y_t=signed_sqrt_transform(y_ex)
+    out={
+        'kept_fraction':[], 'active_fraction_true':[], 'huber_kept':[], 'mae_kept_transformed':[],
+        'pearson_all':[], 'pearson_active':[], 'spearman_all':[], 'spearman_active':[],
+        'sign_acc_active_true':[], 'sign_acc_active_pred':[],
+        'top_1pct_signed_excess_bps':[], 'top_5pct_signed_excess_bps':[], 'top_10pct_signed_excess_bps':[], 'top_20pct_signed_excess_bps':[],
+        'pred_abs_p50':[], 'pred_abs_p90':[], 'pred_abs_p99':[], 'true_excess_abs_p50_top10':[], 'true_excess_abs_p90_top10':[],
+    }
+    kset=[1,5,10,20]
+    for h in range(NUM_HORIZONS):
+        kh=keep[:,h]; ph=pred[:,h]; yh=y_t[:,h]; ex=y_ex[:,h]
+        out['kept_fraction'].append(float(kh.mean()))
+        active=np.abs(ex)>0
+        out['active_fraction_true'].append(float(active.mean()))
+        if kh.any():
+            d=np.abs(ph[kh]-yh[kh]); hub=np.where(d<=1.0,0.5*d*d,d-0.5)
+            out['huber_kept'].append(float(hub.mean())); out['mae_kept_transformed'].append(float(d.mean()))
+        else:
+            out['huber_kept'].append(float('nan')); out['mae_kept_transformed'].append(float('nan'))
+        out['pearson_all'].append(_pearson(ph,yh)); out['spearman_all'].append(_spearman(ph,yh))
+        out['pearson_active'].append(_pearson(ph[active], yh[active]) if active.sum()>1 else float('nan'))
+        out['spearman_active'].append(_spearman(ph[active], yh[active]) if active.sum()>1 else float('nan'))
+        out['sign_acc_active_true'].append(float((np.sign(ph[active])==np.sign(ex[active])).mean()) if active.any() else float('nan'))
+        ap=np.abs(ph)>0
+        out['sign_acc_active_pred'].append(float((np.sign(ph[ap])==np.sign(ex[ap])).mean()) if ap.any() else float('nan'))
+        score=np.abs(ph); order=np.argsort(-score)
+        sre=np.sign(ph)*ex
+        n=len(order)
+        for pct,key in zip(kset,['top_1pct_signed_excess_bps','top_5pct_signed_excess_bps','top_10pct_signed_excess_bps','top_20pct_signed_excess_bps']):
+            k=max(1,int(np.ceil(n*pct/100.0))); idx=order[:k]
+            out[key].append(float(np.mean(sre[idx])))
+        pa=np.abs(ph)
+        out['pred_abs_p50'].append(float(np.quantile(pa,0.50))); out['pred_abs_p90'].append(float(np.quantile(pa,0.90))); out['pred_abs_p99'].append(float(np.quantile(pa,0.99)))
+        k10=max(1,int(np.ceil(n*0.10))); idx10=order[:k10]; ta=np.abs(ex[idx10])
+        out['true_excess_abs_p50_top10'].append(float(np.quantile(ta,0.50))); out['true_excess_abs_p90_top10'].append(float(np.quantile(ta,0.90)))
+    if primary_only:
+        return {'top_10pct_signed_excess_bps': out['top_10pct_signed_excess_bps']}
+    return out
 
 
 def get_model_state_dict_for_ckpt(model: torch.nn.Module) -> dict:
-    if hasattr(model, "_orig_mod"):
-        return model._orig_mod.state_dict()
-    return model.state_dict()
+    return model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict()
+
 
 # ---------------- Train/Eval ----------------
 def train_from_offline():
     if CUDNN_BENCHMARK:
         torch.backends.cudnn.benchmark = True
-    if hasattr(torch, "set_float32_matmul_precision"):
-        try:
-            torch.set_float32_matmul_precision(MATMUL_PRECISION)
-        except Exception as exc:
-            print(f"[warn] failed to set float32 matmul precision to '{MATMUL_PRECISION}': {exc}")
-    print(f"[startup] cudnn_benchmark={CUDNN_BENCHMARK} matmul_precision={MATMUL_PRECISION}")
-    print(f"[startup] log_every={LOG_EVERY}")
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    amp_enabled = AMP_ENABLED and device.type == "cuda"
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        try: torch.set_float32_matmul_precision(MATMUL_PRECISION)
+        except Exception: pass
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    amp_enabled = AMP_ENABLED and device.type=='cuda'
     amp_dtype = torch.bfloat16
-    print(f"[amp] enabled={amp_enabled} dtype=bf16")
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
     validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
-    trade_history_enabled = meta.get("trade_history_enabled")
-    event_stream_mode = meta.get("event_stream_mode")
-    print(f"[meta] trade_history_enabled={trade_history_enabled!r}")
-    if "event_stream_mode" in meta:
-        print(f"[meta] event_stream_mode={event_stream_mode!r}")
+    trade_history_enabled = meta.get('trade_history_enabled')
+    event_stream_mode = meta.get('event_stream_mode')
     splits = require_four_week_pipeline_splits(meta, out_root)
 
-    pca_info = meta.get("pca", {}) or {}
-    if pca_info:
-        applied = bool(pca_info.get("applied", False))
-        summary_parts = [f"applied={applied}"]
-        var_kept = pca_info.get("var_kept")
-        if isinstance(var_kept, (int, float)):
-            summary_parts.append(f"var_kept={float(var_kept):.4f}")
-        elif var_kept is not None:
-            summary_parts.append(f"var_kept={var_kept}")
-        k = pca_info.get("k")
-        if k is not None:
-            try:
-                summary_parts.append(f"k={int(k)}")
-            except (TypeError, ValueError):
-                summary_parts.append(f"k={k}")
-        model_path = pca_info.get("model_path")
-        if model_path:
-            summary_parts.append(f"model={model_path}")
-        print(f"[pca-meta] {' '.join(summary_parts)}")
-        if not applied:
-            print("[warn] PCA metadata indicates the dataset was not reduced; training will use original feature dimensionality.")
+    weeks_order = splits['weeks_in_order']
+    key_to_meta = {wk: out_root / meta['weeks_meta'][wk] for wk in weeks_order if wk in meta.get('weeks_meta',{})}
+    cmssl_train = splits['splits']['cmssl']['train']; cmssl_val = splits['splits']['cmssl']['val']; cmssl_test = splits['splits']['cmssl']['test']
+    tr_weeks=[key_to_meta[k] for k in cmssl_train['weeks']]; va_weeks=[key_to_meta[k] for k in cmssl_val['weeks']]; te_weeks=[key_to_meta[k] for k in cmssl_test['weeks']]
 
-    weeks_order = splits["weeks_in_order"]
-    weeks_meta_map = meta.get("weeks_meta", {})
+    feat_dim_total=None
+    for wp in tr_weeks+va_weeks+te_weeks:
+        wm=read_json(wp); validate_dataset_label_dim(wm, f"week metadata {wp}")
+        fm=int(wm['feature_dim_total']); feat_dim_total=fm if feat_dim_total is None else feat_dim_total
+    F_total=int(feat_dim_total or 0)
 
-    key_to_meta: Dict[str, Path] = {}
-    if weeks_meta_map and weeks_order:
-        key_to_meta = {
-            wk: out_root / weeks_meta_map[wk]
-            for wk in weeks_order
-            if wk in weeks_meta_map
-        }
+    tr_start,tr_end=int(cmssl_train['start']),int(cmssl_train['end'])
+    va_start,va_end=int(cmssl_val['start']),int(cmssl_val['end'])
+    te_start,te_end=int(cmssl_test['start']),int(cmssl_test['end'])
 
-    if not key_to_meta:
-        raise KeyError("meta must include non-empty 'weeks_in_order' and 'weeks_meta' for split week-key mapping")
+    def refs(weeks,start,end):
+        out=[]
+        for wp in weeks: out.extend(build_chunk_refs_by_ts(wp,start,end))
+        return out
+    tr_refs,va_refs,te_refs = refs(tr_weeks,tr_start,tr_end),refs(va_weeks,va_start,va_end),refs(te_weeks,te_start,te_end)
+    ds_train,ds_val,ds_test = NpyChunksDataset(tr_refs,F_total),NpyChunksDataset(va_refs,F_total),NpyChunksDataset(te_refs,F_total)
 
-    def keys_to_paths(keys: List[str], split_name: str) -> List[Path]:
-        missing = [k for k in keys if k not in key_to_meta]
-        if missing:
-            raise KeyError(f"Split '{split_name}' references unknown week key(s): {missing}")
-        return [key_to_meta[k] for k in keys]
-
-    cmssl_train = splits["splits"]["cmssl"]["train"]
-    cmssl_val = splits["splits"]["cmssl"]["val"]
-    cmssl_test = splits["splits"]["cmssl"]["test"]
-    eval_full = splits["splits"]["eval"]["full"]
-    rl_train = splits["splits"]["rl"]["train"]
-    rl_val = splits["splits"]["rl"]["val"]
-    rl_test = splits["splits"]["rl"]["test"]
-
-    train_week_keys = cmssl_train["weeks"]
-    tr_weeks = keys_to_paths(train_week_keys, "cmssl.train")
-    va_weeks = keys_to_paths(cmssl_val["weeks"], "cmssl.val")
-    te_weeks = keys_to_paths(cmssl_test["weeks"], "cmssl.test")
-    eval_weeks = keys_to_paths(eval_full["weeks"], "eval.full")
-    rl_train_weeks = keys_to_paths(rl_train["weeks"], "rl.train")
-    rl_val_weeks = keys_to_paths(rl_val["weeks"], "rl.val")
-    rl_test_weeks = keys_to_paths(rl_test["weeks"], "rl.test")
-
-    if not (tr_weeks and va_weeks and te_weeks):
-        raise ValueError("CMSSL split metadata must resolve to at least one week for train/val/test")
-
-    week1, week2, week3, week4 = weeks_order
-    print(
-        "[cmssl weeks] "
-        f"train=week1({week1}) val=week2({week2}) test=week3({week3}) eval_full=week4({week4}) "
-        f"| train_keys={train_week_keys} val_keys={cmssl_val['weeks']} test_keys={cmssl_test['weeks']}"
-    )
-
-    early_stop_patience = SINGLE_WEEK_PATIENCE if len(tr_weeks) <= 1 else PATIENCE
-    if early_stop_patience != PATIENCE:
-        print(f"[early-stop] using short patience={early_stop_patience} for single-week training")
-
-
-    # feature/label dim sanity
-    feat_dim_total = None
-    resolved_split_week_paths = []
-    seen_week_meta_paths: set[str] = set()
-    for week_group in (
-        tr_weeks, va_weeks, te_weeks, eval_weeks, rl_train_weeks, rl_val_weeks, rl_test_weeks
-    ):
-        for wp in week_group:
-            wp_key = str(wp)
-            if wp_key not in seen_week_meta_paths:
-                seen_week_meta_paths.add(wp_key)
-                resolved_split_week_paths.append(wp)
-
-    for wp in resolved_split_week_paths:
-        week_meta = read_json(wp)
-        validate_dataset_label_dim(week_meta, f"week metadata {wp}")
-        if week_meta.get("trade_history_enabled") != trade_history_enabled:
-            raise ValueError(
-                "trade_history_enabled mismatch between global metadata and week metadata: "
-                f"global={trade_history_enabled!r}, week={week_meta.get('trade_history_enabled')!r}, week_meta={wp}"
-            )
-        if "event_stream_mode" in meta:
-            if week_meta.get("event_stream_mode") != event_stream_mode:
-                raise ValueError(
-                    "event_stream_mode mismatch between global metadata and week metadata: "
-                    f"global={event_stream_mode!r}, week={week_meta.get('event_stream_mode')!r}, week_meta={wp}"
-                )
-        elif "event_stream_mode" in week_meta:
-            raise ValueError(
-                "event_stream_mode present in week metadata but missing from global metadata: "
-                f"week={week_meta.get('event_stream_mode')!r}, week_meta={wp}"
-            )
-        fm = int(week_meta["feature_dim_total"])
-        if feat_dim_total is None:
-            feat_dim_total = fm
-        elif feat_dim_total != fm:
-            raise ValueError(f"Feature dim mismatch: saw {feat_dim_total} then {fm}")
-    F_total = int(feat_dim_total or 0)
-
-    # ---- build datasets or fully load ----
-    tr_start, tr_end = int(cmssl_train["start"]), int(cmssl_train["end"])
-    va_start, va_end = int(cmssl_val["start"]), int(cmssl_val["end"])
-    te_start, te_end = int(cmssl_test["start"]), int(cmssl_test["end"])
-
-    quantile_cache_path = out_root / "dir_mask_quantiles_cache.npz"
-    current_meta = {
-        "tail_fraction": float(DIR_MASK_TAIL_FRACTION),
-        "horizons_ms": [int(h) for h in HORIZONS_MS],
-        "train_week_keys": list(train_week_keys),
-        "train_ts_start": int(tr_start),
-        "train_ts_end": int(tr_end),
-        "decision_time_basis": EXPECTED_DECISION_TIME_BASIS,
-        "trade_history_enabled": trade_history_enabled,
-        "event_stream_mode": event_stream_mode,
+    cache_path=out_root/'signed_excess_stats_cache.npz'
+    cache_meta={
+        'abs_trim_tail_fraction': float(ABS_TRIM_TAIL_FRACTION), 'fee_hurdle_bps': float(FEE_HURDLE_BPS),
+        'horizons_ms':[int(h) for h in HORIZONS_MS], 'train_week_keys': list(cmssl_train['weeks']),
+        'train_ts_start': int(tr_start), 'train_ts_end': int(tr_end), 'decision_time_basis': EXPECTED_DECISION_TIME_BASIS,
+        'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
+        'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps'
     }
-    cached_quantiles = load_quantile_cache(quantile_cache_path)
-    cached_bounds = None
-    if cached_quantiles is None:
-        print(f"[dir-mask-cache] miss path={quantile_cache_path} (quantile prepass required)")
-    else:
-        cached_bounds, cached_meta = cached_quantiles
-        if quantile_cache_matches(cached_meta, current_meta):
-            print(f"[dir-mask-cache] hit path={quantile_cache_path} (quantile prepass skipped)")
-        else:
-            cached_bounds = None
-            print(
-                "[dir-mask-cache] event-time identity mismatch "
-                f"path={quantile_cache_path} (quantile prepass required)"
-            )
+    cached=load_stats_cache(cache_path); stats=None
+    if cached and cache_matches(cached[1], cache_meta): stats=cached[0]
+    if stats is None:
+        dl_pre=DataLoader(ds_train,batch_size=BATCH_SIZE,shuffle=False,drop_last=False,num_workers=WORKERS_TRAIN,pin_memory=True)
+        y_parts=[yb.numpy() for _,yb in dl_pre]
+        y_train=np.concatenate(y_parts,0) if y_parts else np.empty((0,NUM_HORIZONS),np.float32)
+        stats=compute_signed_excess_stats(y_train)
+        save_stats_cache(cache_path,stats,cache_meta)
 
-    if USE_IN_MEMORY:
-        X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
-        X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
-        X_te, y_te, feat_dim3 = load_split_in_memory_ts(te_weeks, te_start, te_end)
-        assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
-        print(
-            f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={len(y_tr)} "
-            f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
-        )
+    dl_train=DataLoader(ds_train,BATCH_SIZE,shuffle=True,drop_last=True,num_workers=WORKERS_TRAIN,pin_memory=True,prefetch_factor=8 if WORKERS_TRAIN>0 else None,persistent_workers=(WORKERS_TRAIN>0))
+    dl_val=DataLoader(ds_val,BATCH_SIZE,shuffle=False,num_workers=max(1,WORKERS_VAL),pin_memory=True,persistent_workers=(max(1,WORKERS_VAL)>0))
+    dl_test=DataLoader(ds_test,BATCH_SIZE,shuffle=False,num_workers=max(1,WORKERS_VAL),pin_memory=True,persistent_workers=(max(1,WORKERS_VAL)>0))
 
-        # Build in-RAM datasets
-        ds_train = HFTDataset(X_tr, y_tr)
-        ds_val   = HFTDataset(X_va, y_va)
-        ds_test  = HFTDataset(X_te, y_te)
-        print(
-            f"[offline-data] train N={len(ds_train)}, "
-            f"val N={len(ds_val)}, test N={len(ds_test)}"
-        )
-        # we still need y_tr to build directional mask quantiles unless cache hit
-        y_train_for_quant = None if cached_bounds is not None else y_tr
+    args=ModelArgs(DMODEL,MAMBA_LAYERS,F_total,LOOKBACK)
+    model=SAMBA(args).to(device)
+    if COMPILE_ENABLED and hasattr(torch,'compile'):
+        try: model=torch.compile(model, mode=COMPILE_MODE)
+        except Exception: pass
+    opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
+    primary_metric_mode=get_primary_metric_mode()
+    best=-float('inf') if primary_metric_mode=='max' else float('inf')
+    no_imp=0; early_stop_patience=SINGLE_WEEK_PATIENCE if len(tr_weeks)<=1 else PATIENCE
 
-    else:
-        def refs_for_weeks_timerange(weeks: List[Path], start: int, end: int) -> List[ChunkRef]:
-            refs: List[ChunkRef] = []
-            for wp in weeks:
-                refs.extend(build_chunk_refs_by_ts(wp, start, end))
-            return refs
-
-        tr_refs = refs_for_weeks_timerange(tr_weeks, tr_start, tr_end)
-        va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
-        te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
-        print(
-            f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
-            f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
-            f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
-        )
-
-        ds_train = NpyChunksDataset(tr_refs, F_total)
-        ds_val   = NpyChunksDataset(va_refs, F_total)
-        ds_test  = NpyChunksDataset(te_refs, F_total)
-        print(
-            f"[offline-data] train N={len(ds_train)}, "
-            f"val N={len(ds_val)}, test N={len(ds_test)}"
-        )
-
-        # Build y_train_for_quant without loading features into RAM unless cache hit.
-        if cached_bounds is not None:
-            y_train_for_quant = None
-        elif len(ds_train) == 0:
-            y_train_for_quant = np.empty((0, NUM_HORIZONS), dtype=np.float32)
-        else:
-            dl_prepass = DataLoader(
-                ds_train,
-                batch_size=BATCH_SIZE,
-                shuffle=False,
-                drop_last=False,
-                num_workers=WORKERS_TRAIN,
-                pin_memory=True,
-            )
-            y_parts: List[np.ndarray] = []
-            with torch.no_grad():
-                for _, y_batch in tqdm(dl_prepass, desc="[prepass y_train quantiles]"):
-                    y_parts.append(y_batch.numpy())
-            y_train_for_quant = (
-                np.concatenate(y_parts, axis=0)
-                if y_parts
-                else np.empty((0, NUM_HORIZONS), dtype=np.float32)
-            )
-
-
-    # ---------------- directional-noise filter quantiles & loss closure ----------------
-    if cached_bounds is not None:
-        pos_lo = cached_bounds["pos_lo"]
-        pos_hi = cached_bounds["pos_hi"]
-        neg_lo = cached_bounds["neg_lo"]
-        neg_hi = cached_bounds["neg_hi"]
-    else:
-        pos_lo, pos_hi, neg_lo, neg_hi = compute_dir_mask_quantiles_from_ytrain(y_train_for_quant)
-        save_quantile_cache(
-            quantile_cache_path,
-            {
-                "pos_lo": pos_lo,
-                "pos_hi": pos_hi,
-                "neg_lo": neg_lo,
-                "neg_hi": neg_hi,
-            },
-            current_meta,
-        )
-        print(f"[dir-mask-cache] saved path={quantile_cache_path}")
-    build_directional_noise_filter_mask = make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi)
-    horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
-    horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
-    horizon_weights_np = horizon_weights_cpu.numpy()
-    compute_directional_loss = compute_directional_loss_fn(build_directional_noise_filter_mask, horizon_weights)
-
-    def format_metric(values: Iterable[float], fmt: str) -> str:
-        formatted = []
-        for horizon, value in zip(HORIZONS_MS, values):
-            val = float(value)
-            if math.isnan(val) or math.isinf(val):
-                formatted.append(f"{horizon}ms:nan")
-            else:
-                formatted.append(f"{horizon}ms:{fmt.format(val)}")
-        return '[' + ', '.join(formatted) + ']'
-
-    # ---------------- DataLoaders ----------------
-    dl_train = DataLoader(
-        ds_train,
-        BATCH_SIZE,
-        shuffle=True,
-        drop_last=True,
-        num_workers=WORKERS_TRAIN,
-        pin_memory=True,
-        prefetch_factor=8 if WORKERS_TRAIN > 0 else None,
-        persistent_workers=(WORKERS_TRAIN > 0),
-    )
-    dl_val = DataLoader(
-        ds_val,
-        BATCH_SIZE,
-        shuffle=False,
-        num_workers=max(1, WORKERS_VAL),
-        pin_memory=True,
-        persistent_workers=(max(1, WORKERS_VAL) > 0),
-    )
-    dl_test = DataLoader(
-        ds_test,
-        BATCH_SIZE,
-        shuffle=False,
-        num_workers=max(1, WORKERS_VAL),
-        pin_memory=True,
-        persistent_workers=(max(1, WORKERS_VAL) > 0),
-    )
-
-    # ---------------- Model ----------------
-    args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
-    model = SAMBA(args).to(device)
-    if COMPILE_ENABLED:
-        if hasattr(torch, "compile"):
-            try:
-                model = torch.compile(model, mode=COMPILE_MODE)
-                print(f"[compile] enabled mode={COMPILE_MODE}")
-            except Exception as exc:
-                print(f"[warn] torch.compile failed ({exc}); continuing in eager mode")
-        else:
-            print("[warn] BYBIT_TORCH_COMPILE=1 but torch.compile is unavailable; continuing in eager mode")
-    else:
-        print("[compile] enabled=False")
-    primary_metric_mode = get_primary_metric_mode()
-    opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
-    torch.cuda.empty_cache()
-
-    # ---------------- Epoch loop ----------------
-    best = -float('inf') if primary_metric_mode == "max" else float('inf')
-    no_imp = 0
-    primary_horizon_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-
-    def summarize_directional_metrics(dl: DataLoader, *, primary_only: bool) -> dict:
-        model.eval()
-        logits_all = [[] for _ in range(NUM_HORIZONS)]
-        ypos_all = [[] for _ in range(NUM_HORIZONS)]
-        logits_masked = [[] for _ in range(NUM_HORIZONS)]
-        ypos_masked = [[] for _ in range(NUM_HORIZONS)]
-        bce_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        bce_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        bce_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        bce_masked_count = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        acc_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        total = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        acc_masked_sum = np.zeros(NUM_HORIZONS, dtype=np.float64)
-        masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
-
-        with torch.no_grad():
-            for x, y in dl:
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                y_ret = y
-                y_dir = (y_ret > 0).float()
-                noise_filter_mask = build_directional_noise_filter_mask(y_ret)
-
-                # Keep validation/test directional metrics in fp32 to avoid bf16-induced
-                # logit quantization ties in AUC and logit summary statistics.
-                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=False):
-                    dir_logits = model(x)
-                    bce_elem = F.binary_cross_entropy_with_logits(dir_logits, y_dir, reduction='none')
-
-                dir_logits_metrics = dir_logits.detach().float()
-                bce_elem_fp32 = bce_elem.detach().float()
-                y_dir_metrics = y_dir.detach()
-                noise_filter_mask_metrics = noise_filter_mask.detach()
-                pred_class = (dir_logits_metrics > 0).to(torch.int32)
-                true_class = y_dir_metrics.to(torch.int32)
-
-                horizon_indices = [primary_horizon_idx] if primary_only else range(NUM_HORIZONS)
-                for h_idx in horizon_indices:
-                    logits_h_all = dir_logits_metrics[:, h_idx]
-                    targets_h_all = y_dir_metrics[:, h_idx]
-                    bce_sum[h_idx] += bce_elem_fp32[:, h_idx].sum().item()
-                    bce_count[h_idx] += targets_h_all.numel()
-                    acc_sum[h_idx] += (pred_class[:, h_idx] == true_class[:, h_idx]).sum().item()
-                    total[h_idx] += targets_h_all.numel()
-                    logits_all[h_idx].append(logits_h_all.detach().cpu())
-                    ypos_all[h_idx].append(true_class[:, h_idx].detach().cpu())
-
-                    noise_filter_mask_h = noise_filter_mask_metrics[:, h_idx]
-                    if noise_filter_mask_h.any():
-                        logits_h = dir_logits_metrics[noise_filter_mask_h, h_idx]
-                        targets_h = y_dir_metrics[noise_filter_mask_h, h_idx]
-                        bce_masked_sum[h_idx] += bce_elem_fp32[noise_filter_mask_h, h_idx].sum().item()
-                        bce_masked_count[h_idx] += noise_filter_mask_h.sum().item()
-                        acc_masked_sum[h_idx] += ((logits_h > 0).to(torch.int32) == targets_h.to(torch.int32)).sum().item()
-                        masked_total[h_idx] += noise_filter_mask_h.sum().item()
-                        logits_masked[h_idx].append(logits_h.detach().cpu())
-                        ypos_masked[h_idx].append(targets_h.to(torch.int32).detach().cpu())
-
-        bce = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        bce_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        acc = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        acc_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        auc = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        auc_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        pos_rate_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        logit_mean_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        logit_std_all = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        pos_rate_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        logit_mean_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-        logit_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
-
-        for h_idx in ([primary_horizon_idx] if primary_only else range(NUM_HORIZONS)):
-            if bce_count[h_idx] > 0:
-                bce[h_idx] = bce_sum[h_idx] / bce_count[h_idx]
-                acc[h_idx] = acc_sum[h_idx] / max(total[h_idx], 1.0)
-            if bce_masked_count[h_idx] > 0:
-                bce_masked[h_idx] = bce_masked_sum[h_idx] / bce_masked_count[h_idx]
-                acc_masked[h_idx] = acc_masked_sum[h_idx] / max(masked_total[h_idx], 1.0)
-            if logits_all[h_idx]:
-                logits_cat = torch.cat(logits_all[h_idx], dim=0).view(-1)
-                ypos_cat = torch.cat(ypos_all[h_idx], dim=0).view(-1)
-                auc[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
-                pos_rate_all[h_idx] = float(ypos_cat.float().mean().item())
-                logit_mean_all[h_idx] = float(logits_cat.mean().item())
-                logit_std_all[h_idx] = float(logits_cat.std(unbiased=False).item())
-            if logits_masked[h_idx]:
-                logits_cat = torch.cat(logits_masked[h_idx], dim=0).view(-1)
-                ypos_cat = torch.cat(ypos_masked[h_idx], dim=0).view(-1)
-                auc_masked[h_idx] = binary_auc_from_logits(logits_cat, ypos_cat)
-                pos_rate_masked[h_idx] = float(ypos_cat.float().mean().item())
-                logit_mean_masked[h_idx] = float(logits_cat.mean().item())
-                logit_std_masked[h_idx] = float(logits_cat.std(unbiased=False).item())
-
-        primary_metric_value, primary_metric_label = compute_primary_metric(auc_masked)
-        return {
-            "val_bce_unmasked": bce,
-            "val_bce_masked": bce_masked,
-            "val_acc": acc,
-            "val_acc_masked": acc_masked,
-            "val_auc": auc,
-            "val_auc_masked": auc_masked,
-            "val_pos_rate_all": pos_rate_all,
-            "val_logit_mean_all": logit_mean_all,
-            "val_logit_std_all": logit_std_all,
-            "val_pos_rate_masked": pos_rate_masked,
-            "val_logit_mean_masked": logit_mean_masked,
-            "val_logit_std_masked": logit_std_masked,
-            "primary_metric_value": float(primary_metric_value),
-            "primary_metric_label": primary_metric_label,
-            "primary_masked_bce": float(bce_masked[primary_horizon_idx]),
-            "primary_masked_auc": float(auc_masked[primary_horizon_idx]),
-            "primary_masked_acc": float(acc_masked[primary_horizon_idx]),
-        }
-
-    def run_validation(*, full_metrics: bool) -> dict:
-        return summarize_directional_metrics(dl_val, primary_only=not full_metrics)
+    abs_lo_t=torch.tensor(stats['abs_lo_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
+    abs_hi_t=torch.tensor(stats['abs_hi_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
+    q50_t=torch.tensor(stats['active_q50_excess'],device=device,dtype=torch.float32).view(1,-1)
+    q85_t=torch.tensor(stats['active_q85_excess'],device=device,dtype=torch.float32).view(1,-1)
+    hwt=torch.tensor(HORIZON_WEIGHTS,device=device,dtype=torch.float32).view(1,-1)
 
     for epoch in range(EPOCHS):
-        early_stop_triggered = False
-        model.train()
-        pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
-        num_train_batches = len(dl_train)
-        running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
-        running_bce_t = torch.zeros((), device=device, dtype=torch.float32)
-        n_batches = 0
-
-        for batch_idx, (x, y) in enumerate(pbar):
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            y_ret = y
+        model.train(); running={'loss':0.0,'huber':0.0,'corr':0.0}; n_batches=0
+        for x,y in tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}"):
+            x=x.to(device, non_blocking=True); y_raw=y.to(device, non_blocking=True)
+            def compute_loss(pred, y_raw):
+                keep=(torch.abs(y_raw)>=abs_lo_t)&(torch.abs(y_raw)<=abs_hi_t)
+                y_ex=torch.sign(y_raw)*torch.clamp(torch.abs(y_raw)-FEE_HURDLE_BPS, min=0.0)
+                y_t=torch.sign(y_ex)*torch.sqrt(torch.abs(y_ex))
+                if not keep.any():
+                    z=pred.sum()*0.0
+                    return z,z,z
+                w=torch.full_like(y_ex,0.25)
+                abs_ex=torch.abs(y_ex); active=abs_ex>0
+                w = torch.where(active & (abs_ex<=q50_t), torch.ones_like(w), w)
+                w = torch.where(active & (abs_ex>q50_t) & (abs_ex<=q85_t), torch.full_like(w,1.25), w)
+                w = torch.where(active & (abs_ex>q85_t), torch.ones_like(w), w)
+                d=F.huber_loss(pred, y_t, delta=1.0, reduction='none')
+                wm=(w*keep.float()*hwt)
+                hub=(d*wm).sum()/wm.sum().clamp_min(1e-9)
+                corrs=[]
+                for h in range(NUM_HORIZONS):
+                    mask=keep[:,h] & (torch.abs(y_ex[:,h])>0)
+                    if mask.sum()>=2:
+                        px=pred[:,h][mask]; ty=y_t[:,h][mask]
+                        px=px-px.mean(); ty=ty-ty.mean()
+                        den=torch.sqrt((px*px).sum()*(ty*ty).sum()).clamp_min(1e-9)
+                        corr=(px*ty).sum()/den
+                        corrs.append(1.0-corr)
+                corr_pen=torch.stack(corrs).mean() if corrs else pred.sum()*0.0
+                return hub+0.10*corr_pen, hub, corr_pen
 
             opt.base_optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                dir_logits = model(x)
-                bce_loss = compute_directional_loss(dir_logits, y_ret)
-                loss = bce_loss
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                pred=model(x); loss,hub,corr=compute_loss(pred,y_raw)
+            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000); opt.first_step(zero_grad=True)
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                pred2=model(x); loss2,_,_=compute_loss(pred2,y_raw)
+            loss2.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000); opt.second_step(zero_grad=True)
+            running['loss']+=float(loss.detach().cpu()); running['huber']+=float(hub.detach().cpu()); running['corr']+=float(corr.detach().cpu()); n_batches+=1
+        print(f"[train] loss={running['loss']/max(1,n_batches):.6f} huber={running['huber']/max(1,n_batches):.6f} corr_penalty={running['corr']/max(1,n_batches):.6f}")
 
-            if not torch.isfinite(loss):
-                raise RuntimeError(
-                    f"Non-finite training loss in SAM pass #1: {float(loss.detach().float().cpu())}"
-                )
-
-            running_bce_t += bce_loss.detach().float()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
-            opt.first_step(zero_grad=True)
-
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                dir_logits2 = model(x)
-                bce_loss2 = compute_directional_loss(dir_logits2, y_ret)
-                loss2 = bce_loss2
-
-            if not torch.isfinite(loss2):
-                raise RuntimeError(
-                    f"Non-finite training loss in SAM pass #2: {float(loss2.detach().float().cpu())}"
-                )
-
-            loss2.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
-            opt.second_step(zero_grad=True)
-
-            running_loss_t += loss.detach().float()
-            n_batches += 1
-            should_log_batch = ((batch_idx + 1) % LOG_EVERY == 0) or ((batch_idx + 1) == num_train_batches)
-            if should_log_batch:
-                denom = float(max(1, n_batches))
-                running_loss = float(running_loss_t.detach().cpu())
-                running_bce = float(running_bce_t.detach().cpu())
-                pbar.set_postfix(loss=f"{(running_loss / denom):.4f}", bce=f"{(running_bce / denom):.4f}")
-
-        epoch_train_loss = float(running_loss_t.detach().cpu()) / float(max(1, n_batches))
-        epoch_train_bce = float(running_bce_t.detach().cpu()) / float(max(1, n_batches))
-        print(f"[train] loss={epoch_train_loss:.4f} bce={epoch_train_bce:.4f}")
-
-        # ---------------- Validation ----------------
-        fast_val = run_validation(full_metrics=False)
-        primary_metric_value = float(fast_val["primary_metric_value"])
-        primary_metric_label = str(fast_val["primary_metric_label"])
-
-        if math.isfinite(primary_metric_value):
-            print(
-                f"[val-fast] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
-                f"[masked_bce_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_bce']):.6f}, "
-                f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_auc']):.6f}, "
-                f"masked_acc_{PRIMARY_METRIC_HORIZON_MS}ms={float(fast_val['primary_masked_acc']):.3%}]"
-            )
-            if is_metric_improved(primary_metric_value, best, primary_metric_mode):
-                best = float(primary_metric_value)
-                no_imp = 0
-                full_val = run_validation(full_metrics=True)
-                print(
-                    f"[val] BCE(all)={format_metric(full_val['val_bce_unmasked'], '{:.5f}')}  "
-                    f"BCE(mask)={format_metric(full_val['val_bce_masked'], '{:.5f}')}  "
-                    f"Acc(all)={format_metric(full_val['val_acc'], '{:.3%}')}  "
-                    f"Acc(mask)={format_metric(full_val['val_acc_masked'], '{:.3%}')}  "
-                    f"AUC(all)={format_metric(full_val['val_auc'], '{:.3f}')}  "
-                    f"AUC(mask)={format_metric(full_val['val_auc_masked'], '{:.3f}')}")
-                print(
-                    f"[val_diag] pos_rate(all)={format_metric(full_val['val_pos_rate_all'], '{:.3%}')}  "
-                    f"logit_mean(all)={format_metric(full_val['val_logit_mean_all'], '{:.3f}')}  "
-                    f"logit_std(all)={format_metric(full_val['val_logit_std_all'], '{:.3f}')}  "
-                    f"pos_rate(mask)={format_metric(full_val['val_pos_rate_masked'], '{:.3%}')}  "
-                    f"logit_mean(mask)={format_metric(full_val['val_logit_mean_masked'], '{:.3f}')}  "
-                    f"logit_std(mask)={format_metric(full_val['val_logit_std_masked'], '{:.3f}')}")
-                print(
-                    f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
-                    f"[masked_bce_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_bce']):.6f}, "
-                    f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_auc']):.6f}]"
-                )
-                ckpt = {
-                    "epoch": epoch,
-                    "state_dict": get_model_state_dict_for_ckpt(model),
-                    "args": {
-                        "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
-                        "feat_dim": F_total, "LOOKBACK": LOOKBACK,
-                        "HORIZONS_MS": HORIZONS_MS,
-                        "checkpoint_schema": "cmssl17-direction-only-v1",
-                        "trade_history_enabled": trade_history_enabled,
-                        "event_stream_mode": event_stream_mode,
-                        "decision_time_basis": meta.get("decision_time_basis"),
-                    },
-                    "best_primary_metric": best,
-                }
-                out_ckpt = out_root / "cmssl17_offline_best.pt"
-                torch.save(ckpt, out_ckpt)
-                print(f"[ckpt] saved best to {out_ckpt}")
-            else:
-                no_imp += 1
-                print(f"no improve {no_imp}/{early_stop_patience}")
-                if no_imp >= early_stop_patience:
-                    print("Early stopping triggered.")
-                    early_stop_triggered = True
+        val_fast=summarize_metrics(model, dl_val, device, stats, amp_enabled, amp_dtype, primary_only=True)
+        primary_metric_value, primary_metric_label = compute_primary_metric(val_fast)
+        print(f"[val-fast] primary_metric({primary_metric_label})={primary_metric_value:.6f}")
+        if math.isfinite(primary_metric_value) and is_metric_improved(primary_metric_value,best,primary_metric_mode):
+            best=float(primary_metric_value); no_imp=0
+            full=summarize_metrics(model, dl_val, device, stats, amp_enabled, amp_dtype, primary_only=False)
+            print(f"[val] kept_fraction={full['kept_fraction']} active_fraction={full['active_fraction_true']}")
+            print(f"[val_reg] huber_kept={full['huber_kept']} pearson_all={full['pearson_all']} spearman_all={full['spearman_all']}")
+            print(f"[val_trade] top10={full['top_10pct_signed_excess_bps']} top20={full['top_20pct_signed_excess_bps']}")
+            ckpt={
+                'epoch': epoch,
+                'state_dict': get_model_state_dict_for_ckpt(model),
+                'args': {
+                    'DMODEL':DMODEL, 'MAMBA_LAYERS':MAMBA_LAYERS, 'feat_dim':F_total, 'LOOKBACK':LOOKBACK,
+                    'WINDOW_MS': WINDOW_MS, 'HORIZONS_MS': HORIZONS_MS, 'checkpoint_schema': CHECKPOINT_SCHEMA,
+                    'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
+                    'decision_time_basis': meta.get('decision_time_basis'), 'decision_stride_policy':'every_ob_event',
+                    'label_delta_ms':0, 'label_units':'signed_log_return_bps',
+                    'target_task':'signed_excess_return_training_from_raw_bps_labels',
+                    'fee_hurdle_bps': float(FEE_HURDLE_BPS), 'target_transform': TARGET_TRANSFORM,
+                    'abs_trim_tail_fraction': float(ABS_TRIM_TAIL_FRACTION),
+                },
+                'best_primary_metric': best,
+            }
+            out_ckpt=out_root/'cmssl17_offline_best.pt'; torch.save(ckpt,out_ckpt); print(f"[ckpt] saved best to {out_ckpt}")
         else:
-            print(f"[val-fast] primary_metric({primary_metric_label})=nan (skipping early stop)")
+            no_imp += 1
+            if no_imp >= early_stop_patience:
+                print('Early stopping triggered.')
+                break
 
-        if early_stop_triggered:
-            break
+    test=summarize_metrics(model, dl_test, device, stats, amp_enabled, amp_dtype, primary_only=False)
+    print(f"[test] kept_fraction={test['kept_fraction']} active_fraction={test['active_fraction_true']}")
+    print(f"[test_reg] huber_kept={test['huber_kept']} mae={test['mae_kept_transformed']}")
+    print(f"[test_trade] top1={test['top_1pct_signed_excess_bps']} top5={test['top_5pct_signed_excess_bps']} top10={test['top_10pct_signed_excess_bps']} top20={test['top_20pct_signed_excess_bps']}")
+    print('[done] Training complete.')
 
-        # (Optional) early stop on long stagnation
-        # if no_imp > 50: break
-
-    # ---------------- Test Evaluation ----------------
-    test_metrics = summarize_directional_metrics(dl_test, primary_only=False)
-    print(
-        f"[test] BCE(all)={format_metric(test_metrics['val_bce_unmasked'], '{:.4e}')}  "
-        f"Acc(all)={format_metric(test_metrics['val_acc'], '{:.4f}')}  "
-        f"AUC(all)={format_metric(test_metrics['val_auc'], '{:.4f}')}")
-    print(
-        f"  BCE(mask)={format_metric(test_metrics['val_bce_masked'], '{:.4e}')}  "
-        f"Acc(mask)={format_metric(test_metrics['val_acc_masked'], '{:.4f}')}  "
-        f"AUC(mask)={format_metric(test_metrics['val_auc_masked'], '{:.4f}')}")
-    print(
-        f"[test_diag] pos_rate(all)={format_metric(test_metrics['val_pos_rate_all'], '{:.3%}')}  "
-        f"logit_mean(all)={format_metric(test_metrics['val_logit_mean_all'], '{:.3f}')}  "
-        f"logit_std(all)={format_metric(test_metrics['val_logit_std_all'], '{:.3f}')}  "
-        f"pos_rate(mask)={format_metric(test_metrics['val_pos_rate_masked'], '{:.3%}')}  "
-        f"logit_mean(mask)={format_metric(test_metrics['val_logit_mean_masked'], '{:.3f}')}  "
-        f"logit_std(mask)={format_metric(test_metrics['val_logit_std_masked'], '{:.3f}')}")
-
-    print("[done] Training complete.")
 
 # ---------------- Lightweight HFTDataset (when loading into RAM) ----------------
 class HFTDataset(Dataset):

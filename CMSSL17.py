@@ -460,8 +460,8 @@ def coerce_ts_ms(value: Union[int, float, str]) -> int:
 
 
 # ---------------------------  Core hyper-params  ---------------------------
-LOOKBACK        = 100        # number of tokens spanning ~10s
-WINDOW_MS       = 10_000     # time-based window span (10s)
+LOOKBACK        = 600        # canonical event-time token lookback
+WINDOW_MS       = 60_000     # canonical rolling window span (60s)
 PAD_DT_FOR_LEFT = 0.0
 BATCH_SIZE      = 1024
 DMODEL          = 256
@@ -470,28 +470,45 @@ CONV_KERNELS    = [3,3,5,5,7,7]
 DFF_CONV        = 2 * DMODEL
 
 # Prediction horizons (in milliseconds)
-HORIZONS_MS     = [250, 500, 1000]
+HORIZONS_MS     = [7_500, 15_000, 30_000]
 NUM_HORIZONS    = len(HORIZONS_MS)
 HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
-DIR_MASK_TAIL_FRACTION = 0.02
+FEE_HURDLE_BPS = 3.7
+ABS_TRIM_TAIL_FRACTION = 0.02
+TARGET_TRANSFORM = "signed_sqrt_excess_bps"
+CHECKPOINT_SCHEMA = "cmssl17-signed-excess-v1"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "masked_auc_1000ms"  # options: "masked_auc_<horizon>ms"
-PRIMARY_METRIC_HORIZON_MS = 1000
+PRIMARY_METRIC = "top_decile_signed_excess_30000ms"
+PRIMARY_METRIC_HORIZON_MS = 30_000
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
-# These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_200ms, log_events_500ms]
-AUX_DIM        = 5
+# These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_500ms,
+#  log_events_1000ms, log_events_3000ms, log_events_7500ms]
+AUX_DIM        = 7
 
+
+FAST_WINDOWS_MS = (500, 1_000, 3_000, 7_500, 15_000)
+FLOW_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000)
+EVENT_DENSITY_WINDOWS_MS = (100, 500, 1_000, 3_000, 7_500)
+EMA_HALF_LIVES_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+MACD_TRIPLETS_MS = (
+    (1_000, 3_000, 1_500),
+    (3_000, 7_500, 5_000),
+    (7_500, 15_000, 10_000),
+    (15_000, 30_000, 20_000),
+    (30_000, 60_000, 40_000),
+)
+VPIN_BUCKET_SECS = (1.0, 3.0, 7.5, 15.0, 30.0)
 
 NUM_HEADS       = 8
 # Loss mixing (fixed lambdas), with EMA normalization per loss
 EMA_DECAY       = 0.99
-LAMBDA_BCE      = 1.00
 
 
 # ---------------------------  Building blocks  ----------------------------
@@ -838,7 +855,7 @@ class SAMBA(nn.Module):
         # Heads
         fused_dim = args.d_model * 2
         head_hidden_dim = fused_dim * 2
-        self.direction_head = nn.Sequential(
+        self.excess_head = nn.Sequential(
             nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
@@ -850,9 +867,9 @@ class SAMBA(nn.Module):
         h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
 
         pooled, _, _ = self.mamba(h_tokens, embedded=True)
-        dir_logits = self.direction_head(pooled)
+        pred_excess = self.excess_head(pooled)
 
-        return dir_logits
+        return pred_excess
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
@@ -985,7 +1002,7 @@ class BybitRawIter:
 # ---------------------  Rolling normalization  ---------------------
 
 class RollingZScore:
-    def __init__(self, window_ms: int = 10000):
+    def __init__(self, window_ms: int = 60_000):
         self.window = window_ms
         self.buf = deque()
         self.sum = None
@@ -1039,6 +1056,7 @@ class FeatureEngine:
         self.depth = int(depth)
         self.z_hl_ms = int(z_hl_ms)
         self.vpin_target_bucket_secs = float(vpin_target_bucket_secs)
+        self.vpin_bucket_secs: Tuple[float, ...] = VPIN_BUCKET_SECS
 
         # ---------- Book state ----------
         self.bids: Dict[float, float] = {}
@@ -1073,23 +1091,19 @@ class FeatureEngine:
         self.ret_hist_1s: Deque[Tuple[int, float]] = deque()
         self.ret_hist_5s: Deque[Tuple[int, float]] = deque()
 
-        self.regime_windows_ms: Tuple[int, ...] = (500, 1_000, 5_000)
+        self.regime_windows_ms: Tuple[int, ...] = REGIME_WINDOWS_MS
         self.rv_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.realized_vol: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.volume_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.flow_regime: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
-        self._regime_return_deques: Dict[int, Deque[Tuple[int, float]]] = {
-            500: self.ret_hist_500ms,
-            1_000: self.ret_hist_1s,
-            5_000: self.ret_hist_5s,
-        }
+        self._regime_return_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self.regime_windows_ms}
         self.last_mid_for_ret: Optional[float] = None
 
         # ---------- Spread ----------
         self.last_spread: Optional[float] = None
         self.last_spread_ts: Optional[int] = None
-        self.spread_delta_windows: Tuple[int, ...] = (100, 200, 500)
-        self.ob_horizon_compare_windows_ms: Tuple[int, ...] = (100, 200, 500)
+        self.spread_delta_windows: Tuple[int, ...] = FAST_WINDOWS_MS
+        self.ob_horizon_compare_windows_ms: Tuple[int, ...] = FAST_WINDOWS_MS
         self.ob_snapshot_margin_ms: int = 200
         self._ob_snapshot_keep_ms: int = max(self.ob_horizon_compare_windows_ms) + self.ob_snapshot_margin_ms
         self._ob_snapshots: List[FeatureEngine.OBSnapshot] = []
@@ -1108,7 +1122,7 @@ class FeatureEngine:
         }
 
         # ---------- Best-level churn & depletion ----------
-        self.bestlvl_windows: Tuple[int, ...] = (100, 200, 500, 1_000)
+        self.bestlvl_windows: Tuple[int, ...] = FAST_WINDOWS_MS
         self._bid1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self._ask1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self.bid1_changes_1s = self._bid1_change_deques[1_000]
@@ -1118,7 +1132,7 @@ class FeatureEngine:
         self.sz_deltas_200ms: Deque[Tuple[int,float,float]] = deque()
 
         # ---------- Liquidity replenishment tracking (L1/L2) ----------
-        self.replen_windows_ms: Tuple[int, ...] = (100, 200, 500)
+        self.replen_windows_ms: Tuple[int, ...] = FAST_WINDOWS_MS
         self._replen_keys: Tuple[Tuple[str, int, str], ...] = tuple(
             (side, level, kind)
             for side in ("bid", "ask")
@@ -1139,7 +1153,7 @@ class FeatureEngine:
         self.trades_1s: Deque[Tuple[int, float, float, str, int, int]] = deque()
         self.trades_5s: Deque[Tuple[int, float, float, str, int, int]] = deque()
 
-        self.trade_windows: Tuple[int, ...] = (1_000, 5_000)
+        self.trade_windows: Tuple[int, ...] = FLOW_WINDOWS_MS
         self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str, int, int]]] = {
             1_000: self.trades_1s,
             5_000: self.trades_5s,
@@ -1155,25 +1169,15 @@ class FeatureEngine:
         self.last_trade_price: Optional[float] = None
         self.last_is_rpi: int = 0
 
-        # ---------- Quote windows (100/200/500/1000 ms) ----------
-        self.quotes_100ms: Deque[int] = deque()
-        self.quotes_200ms: Deque[int] = deque()
-        self.quotes_500ms: Deque[int] = deque()
-        self.quotes_1s: Deque[int] = deque()
-        self.quotes_5s: Deque[int] = deque()
+        # ---------- Quote windows ----------
         self._quote_window_deques: Dict[int, Deque[int]] = {
-            100: self.quotes_100ms,
-            200: self.quotes_200ms,
-            500: self.quotes_500ms,
-            1_000: self.quotes_1s,
-            5_000: self.quotes_5s,
+            ms: deque() for ms in FLOW_WINDOWS_MS
         }
 
-        # ---------- Event density (100/200/500 ms) ----------
-        self.ev_100ms: Deque[int] = deque()
-        self.ev_200ms: Deque[int] = deque()
-        self.ev_500ms: Deque[int] = deque()
-        self.ev_1s:    Deque[int] = deque()
+        # ---------- Event density windows ----------
+        self._event_density_deques: Dict[int, Deque[int]] = {
+            ms: deque() for ms in EVENT_DENSITY_WINDOWS_MS
+        }
 
         # ---------- VPIN state ----------
         self.vpin_Vb: Optional[float] = None          # dynamic bucket size (in base-volume)
@@ -1199,7 +1203,7 @@ class FeatureEngine:
         self.press_5s: float = 0.0
 
         # ---------- Fast EMA state for microstructure signals ----------
-        self.ema_half_lives_ms = (100, 500)
+        self.ema_half_lives_ms = EMA_HALF_LIVES_MS
         self.ema_indicator_names = (
             "bid1",
             "ask1",
@@ -1561,15 +1565,26 @@ class FeatureEngine:
         window_secs = window_ms / 1000.0
         return len(deq) / window_secs if window_secs > 0 else 0.0
 
-    def event_density_100ms(self) -> float:
-        # events per 0.1s
-        return self._event_density(self.ev_100ms, 100)
+    def event_density(self, window_ms: int) -> float:
+        deq = self._event_density_deques.get(int(window_ms))
+        if deq is None:
+            return 0.0
+        return self._event_density(deq, int(window_ms))
 
-    def event_density_200ms(self) -> float:
-        return self._event_density(self.ev_200ms, 200)
+    def event_density_100ms(self) -> float:
+        return self.event_density(100)
 
     def event_density_500ms(self) -> float:
-        return self._event_density(self.ev_500ms, 500)
+        return self.event_density(500)
+
+    def event_density_1000ms(self) -> float:
+        return self.event_density(1_000)
+
+    def event_density_3000ms(self) -> float:
+        return self.event_density(3_000)
+
+    def event_density_7500ms(self) -> float:
+        return self.event_density(7_500)
 
     def _prune_ts_deque(self, deq: Deque[int], now_ms: int, window_ms: int):
         while deq and (now_ms - deq[0] > window_ms):
@@ -1739,10 +1754,8 @@ class FeatureEngine:
             self._prune_trade_window(ts_ms, window)
 
         is_trade = (etype == 'trade')
-        self._append_ts_with_guard(self.ev_100ms, ts_ms, 100, is_ob_event=(etype == 'ob'))
-        self._append_ts_with_guard(self.ev_200ms, ts_ms, 200, is_ob_event=(etype == 'ob'))
-        self._append_ts_with_guard(self.ev_500ms, ts_ms, 500, is_ob_event=(etype == 'ob'))
-        self._append_ts_with_guard(self.ev_1s,    ts_ms, 1000, is_ob_event=(etype == 'ob'))
+        for w, deq in self._event_density_deques.items():
+            self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == 'ob'))
 
         if etype == 'ob':
             tp_code, bids, asks = payload
@@ -2533,7 +2546,7 @@ class FeatureEngine:
 
 
 class LabelBuilder:
-    def __init__(self, delta_ms: int = 5, horizons_ms: Optional[List[int]] = None):
+    def __init__(self, delta_ms: int = 0, horizons_ms: Optional[List[int]] = None):
         self.delta = int(delta_ms)
         self.horizons = sorted(horizons_ms if horizons_ms is not None else HORIZONS_MS)
         assert len(self.horizons) > 0, "At least one horizon required"
@@ -2584,7 +2597,7 @@ class LabelBuilder:
             for horizon in self.horizons:
                 mid_T = self._price_at(t_delta + int(horizon))
                 mid_T_safe = max(e, mid_T)
-                y_ret = math.log(mid_T_safe / mid0_safe)
+                y_ret = 1e4 * math.log(mid_T_safe / mid0_safe)
                 returns.append(y_ret)
 
             out.append(np.array(returns, dtype=np.float32))
@@ -2637,59 +2650,22 @@ class HFTDataset(Dataset):
     
 
 # --------------------  Utils ---------------------
-def binary_auc_from_logits(logits: torch.Tensor, targets_pos: torch.Tensor) -> float:
-    """
-    Compute ROC AUC from logits without sklearn.
-    logits: shape [N], raw logits
-    targets_pos: shape [N], 0/1
-    """
-    s = logits.detach().cpu().numpy().astype(np.float64)
-    y = targets_pos.detach().cpu().numpy().astype(np.int32)
-    n_pos = int(y.sum())
-    n_neg = int(len(y) - n_pos)
-    if n_pos == 0 or n_neg == 0:
-        return float('nan')
-
-    order = np.argsort(s, kind="mergesort")
-    s_sorted = s[order]
-    y_sorted = y[order]
-
-    rank_sum_pos = 0.0
-    i = 0
-    n = len(s_sorted)
-    while i < n:
-        j = i + 1
-        while j < n and s_sorted[j] == s_sorted[i]:
-            j += 1
-        avg_rank = 0.5 * ((i + 1) + j)  # 1-based average rank over [i, j)
-        pos_in_block = int(y_sorted[i:j].sum())
-        rank_sum_pos += avg_rank * pos_in_block
-        i = j
-
-    auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
-    return float(auc)
-
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
     metric = metric_name or PRIMARY_METRIC
-    if metric.startswith("masked_auc_") and metric.endswith("ms"):
+    if metric == PRIMARY_METRIC:
         return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
-def compute_primary_metric(val_auc_masked_per_h: Iterable[float]) -> Tuple[float, str]:
+def compute_primary_metric(metric_payload: Dict[str, Any]) -> Tuple[float, str]:
     if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
         raise ValueError(
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
         )
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    val_auc_masked_list = list(val_auc_masked_per_h)
-    auc_val = float(val_auc_masked_list[idx]) if idx < len(val_auc_masked_list) else float("nan")
-
-    expected_metric = f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms"
-    if PRIMARY_METRIC == expected_metric:
-        if not math.isfinite(auc_val):
-            return float("nan"), expected_metric
-        return auc_val, expected_metric
-    raise ValueError(f"Unsupported primary metric '{PRIMARY_METRIC}'")
+    vals = metric_payload.get("top_10pct_signed_excess_bps", [])
+    if idx >= len(vals):
+        return float("nan"), PRIMARY_METRIC
+    return float(vals[idx]), PRIMARY_METRIC
 
 def is_metric_improved(value: float, best: float, mode: str) -> bool:
     if mode == "min":
