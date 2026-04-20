@@ -573,9 +573,9 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
         'pearson_all':[], 'pearson_active':[], 'spearman_all':[], 'spearman_active':[],
         'sign_acc_active_true':[], 'sign_acc_pred_active_1p0bps':[],
         'top_1pct_signed_excess_bps':[], 'top_5pct_signed_excess_bps':[], 'top_10pct_signed_excess_bps':[], 'top_20pct_signed_excess_bps':[],
-        'pred_abs_p50':[], 'pred_abs_p90':[], 'pred_abs_p99':[], 'true_excess_abs_p50_top10':[], 'true_excess_abs_p90_top10':[],
+        'true_excess_abs_p50_top10':[], 'true_excess_abs_p90_top10':[],
         'pred_excess_abs_p50_bps':[], 'pred_excess_abs_p90_bps':[], 'pred_near_zero_frac_0p5bps':[], 'pred_near_zero_frac_1p0bps':[],
-        'true_zero_frac':[], 'true_pos_active_frac':[], 'true_neg_active_frac':[],
+        'true_zero_frac':[], 'true_pos_kept_frac':[], 'true_neg_kept_frac':[],
         'pred_zero_frac_1p0bps':[], 'pred_pos_frac_1p0bps':[], 'pred_neg_frac_1p0bps':[],
         'balanced_sign_acc_active_true':[],
         'bin_frac':[], 'bin_edge_bps':[], 'bin_sign_acc':[], 'bin_pred_abs_p90_bps':[],
@@ -609,8 +609,8 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
             out['pred_near_zero_frac_1p0bps'].append(float((abs_ph_ex_k < 1.0).mean()))
 
             out['true_zero_frac'].append(float((np.abs(ex_k) == 0).mean()))
-            out['true_pos_active_frac'].append(float((ex_k > 0).mean()))
-            out['true_neg_active_frac'].append(float((ex_k < 0).mean()))
+            out['true_pos_kept_frac'].append(float((ex_k > 0).mean()))
+            out['true_neg_kept_frac'].append(float((ex_k < 0).mean()))
             out['pred_zero_frac_1p0bps'].append(float((np.abs(ph_ex_bps_k) < 1.0).mean()))
             out['pred_pos_frac_1p0bps'].append(float((ph_ex_bps_k >= 1.0).mean()))
             out['pred_neg_frac_1p0bps'].append(float((ph_ex_bps_k <= -1.0).mean()))
@@ -624,7 +624,7 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
             else:
                 out['balanced_sign_acc_active_true'].append(float('nan'))
 
-            q50=float(stats['active_q50_excess_bps'][h]); q85=float(stats['active_q85_excess_bps'][h])
+            q50=float(stats['active_q50_excess'][h]); q85=float(stats['active_q85_excess'][h])
             abs_ex_k = np.abs(ex_k)
             bin_masks = [
                 (abs_ex_k == 0),
@@ -663,8 +663,8 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
             out['pred_near_zero_frac_0p5bps'].append(float('nan'))
             out['pred_near_zero_frac_1p0bps'].append(float('nan'))
             out['true_zero_frac'].append(float('nan'))
-            out['true_pos_active_frac'].append(float('nan'))
-            out['true_neg_active_frac'].append(float('nan'))
+            out['true_pos_kept_frac'].append(float('nan'))
+            out['true_neg_kept_frac'].append(float('nan'))
             out['pred_zero_frac_1p0bps'].append(float('nan'))
             out['pred_pos_frac_1p0bps'].append(float('nan'))
             out['pred_neg_frac_1p0bps'].append(float('nan'))
@@ -680,8 +680,6 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
         for pct,key in zip(kset,['top_1pct_signed_excess_bps','top_5pct_signed_excess_bps','top_10pct_signed_excess_bps','top_20pct_signed_excess_bps']):
             k=max(1,int(np.ceil(n*pct/100.0))); idx=order[:k]
             out[key].append(float(np.mean(sre[idx])))
-        pa=np.abs(ph)
-        out['pred_abs_p50'].append(float(np.quantile(pa,0.50))); out['pred_abs_p90'].append(float(np.quantile(pa,0.90))); out['pred_abs_p99'].append(float(np.quantile(pa,0.99)))
         k10=max(1,int(np.ceil(n*0.10))); idx10=order[:k10]; ta=np.abs(ex[idx10])
         out['true_excess_abs_p50_top10'].append(float(np.quantile(ta,0.50))); out['true_excess_abs_p90_top10'].append(float(np.quantile(ta,0.90)))
     if primary_only:
@@ -820,7 +818,7 @@ def train_from_offline():
             print(f"[val_reg] huber_kept={full['huber_kept']} pearson_all={full['pearson_all']} spearman_all={full['spearman_all']}")
             print(f"[val_trade] top10={full['top_10pct_signed_excess_bps']} top20={full['top_20pct_signed_excess_bps']}")
             print(f"[val_zero] pred_abs_p50_bps={full['pred_excess_abs_p50_bps']} pred_abs_p90_bps={full['pred_excess_abs_p90_bps']} near_zero_0p5={full['pred_near_zero_frac_0p5bps']} near_zero_1p0={full['pred_near_zero_frac_1p0bps']}")
-            print(f"[val_cls] true_zero={full['true_zero_frac']} true_pos={full['true_pos_active_frac']} true_neg={full['true_neg_active_frac']} pred_zero={full['pred_zero_frac_1p0bps']} pred_pos={full['pred_pos_frac_1p0bps']} pred_neg={full['pred_neg_frac_1p0bps']} bal_sign_acc={full['balanced_sign_acc_active_true']} pred_active_sign_acc={full['sign_acc_pred_active_1p0bps']}")
+            print(f"[val_cls] true_zero={full['true_zero_frac']} true_pos={full['true_pos_kept_frac']} true_neg={full['true_neg_kept_frac']} pred_zero={full['pred_zero_frac_1p0bps']} pred_pos={full['pred_pos_frac_1p0bps']} pred_neg={full['pred_neg_frac_1p0bps']} bal_sign_acc={full['balanced_sign_acc_active_true']} pred_active_sign_acc={full['sign_acc_pred_active_1p0bps']}")
             print(f"[val_bins] frac={full['bin_frac']} edge_bps={full['bin_edge_bps']} sign_acc={full['bin_sign_acc']} pred_abs_p90_bps={full['bin_pred_abs_p90_bps']}")
             ckpt={
                 'epoch': epoch,
@@ -849,7 +847,7 @@ def train_from_offline():
     print(f"[test_reg] huber_kept={test['huber_kept']} mae={test['mae_kept_transformed']}")
     print(f"[test_trade] top1={test['top_1pct_signed_excess_bps']} top5={test['top_5pct_signed_excess_bps']} top10={test['top_10pct_signed_excess_bps']} top20={test['top_20pct_signed_excess_bps']}")
     print(f"[test_zero] pred_abs_p50_bps={test['pred_excess_abs_p50_bps']} pred_abs_p90_bps={test['pred_excess_abs_p90_bps']} near_zero_0p5={test['pred_near_zero_frac_0p5bps']} near_zero_1p0={test['pred_near_zero_frac_1p0bps']}")
-    print(f"[test_cls] true_zero={test['true_zero_frac']} true_pos={test['true_pos_active_frac']} true_neg={test['true_neg_active_frac']} pred_zero={test['pred_zero_frac_1p0bps']} pred_pos={test['pred_pos_frac_1p0bps']} pred_neg={test['pred_neg_frac_1p0bps']} bal_sign_acc={test['balanced_sign_acc_active_true']} pred_active_sign_acc={test['sign_acc_pred_active_1p0bps']}")
+    print(f"[test_cls] true_zero={test['true_zero_frac']} true_pos={test['true_pos_kept_frac']} true_neg={test['true_neg_kept_frac']} pred_zero={test['pred_zero_frac_1p0bps']} pred_pos={test['pred_pos_frac_1p0bps']} pred_neg={test['pred_neg_frac_1p0bps']} bal_sign_acc={test['balanced_sign_acc_active_true']} pred_active_sign_acc={test['sign_acc_pred_active_1p0bps']}")
     print(f"[test_bins] frac={test['bin_frac']} edge_bps={test['bin_edge_bps']} sign_acc={test['bin_sign_acc']} pred_abs_p90_bps={test['bin_pred_abs_p90_bps']}")
     print('[done] Training complete.')
 
