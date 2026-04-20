@@ -6196,7 +6196,7 @@ def run_pipeline(
         rollouts_per_epoch=_env_int("BYBIT_MM_PPO_ROLLOUTS_PER_EPOCH", 32),
         randomize_rollout_start=_env_bool("BYBIT_MM_PPO_RANDOMIZE_START", True),
         init_log_std_inventory_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_INVENTORY_CENTER", -0.20),
-        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -1.00),
+        init_log_std_width=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_WIDTH", -2.0),
         init_log_std_alpha_center=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_ALPHA_CENTER", 0.00),
         init_log_std_alpha_asym=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_ALPHA_ASYM", 0.15),
         init_log_std_taker=_env_float("BYBIT_MM_PPO_INIT_LOG_STD_TAKER", -1.0),
