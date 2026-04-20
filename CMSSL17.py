@@ -1084,12 +1084,11 @@ class FeatureEngine:
         self.last_ask1_update_ts: Optional[int] = None
 
         # ---------- Rolling return histories ----------
-        # Deques of (ts_ms, logret) to compute σ and VR
-        self.ret_hist_100ms: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_200ms: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_500ms: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_1s: Deque[Tuple[int, float]] = deque()
-        self.ret_hist_5s: Deque[Tuple[int, float]] = deque()
+        # Deques of (ts_ms, logret) to compute dispersion and variance-ratio ladders.
+        self.return_windows_ms: Tuple[int, ...] = FLOW_WINDOWS_MS
+        self.return_histories: Dict[int, Deque[Tuple[int, float]]] = {
+            ms: deque() for ms in self.return_windows_ms
+        }
 
         self.regime_windows_ms: Tuple[int, ...] = REGIME_WINDOWS_MS
         self.rv_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
@@ -1108,28 +1107,18 @@ class FeatureEngine:
         self._ob_snapshot_keep_ms: int = max(self.ob_horizon_compare_windows_ms) + self.ob_snapshot_margin_ms
         self._ob_snapshots: List[FeatureEngine.OBSnapshot] = []
         self._ob_snapshot_ts_ms: List[int] = []
-        self.spread_changes_100ms: Deque[int] = deque()
-        self.spread_changes_200ms: Deque[int] = deque()
-        self.spread_changes_500ms: Deque[int] = deque()
-        self.spread_changes_1s: Deque[int] = deque()
-        self.spread_changes_5s: Deque[int] = deque()
         self._spread_change_deques: Dict[int, Deque[int]] = {
-            100: self.spread_changes_100ms,
-            200: self.spread_changes_200ms,
-            500: self.spread_changes_500ms,
-            1000: self.spread_changes_1s,
-            5_000: self.spread_changes_5s,
+            ms: deque() for ms in self.spread_delta_windows
         }
 
         # ---------- Best-level churn & depletion ----------
         self.bestlvl_windows: Tuple[int, ...] = FAST_WINDOWS_MS
         self._bid1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self._ask1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
-        self.bid1_changes_1s = self._bid1_change_deques[1_000]
-        self.ask1_changes_1s = self._ask1_change_deques[1_000]
         self.last_bid1 = None; self.last_ask1 = None
-        self.neg_dbsz_200 = 0.0; self.neg_dasz_200 = 0.0
-        self.sz_deltas_200ms: Deque[Tuple[int,float,float]] = deque()
+        self.sz_delta_deques: Dict[int, Deque[Tuple[int, float, float]]] = {
+            ms: deque() for ms in self.bestlvl_windows
+        }
 
         # ---------- Liquidity replenishment tracking (L1/L2) ----------
         self.replen_windows_ms: Tuple[int, ...] = FAST_WINDOWS_MS
@@ -1148,15 +1137,11 @@ class FeatureEngine:
             for window in self.replen_windows_ms
         }
 
-        # ---------- Trades windows (>= 1s) ----------
+        # ---------- Trades windows ----------
         # (ts, price, size, side, tick_sign, is_zero_tick)
-        self.trades_1s: Deque[Tuple[int, float, float, str, int, int]] = deque()
-        self.trades_5s: Deque[Tuple[int, float, float, str, int, int]] = deque()
-
         self.trade_windows: Tuple[int, ...] = FLOW_WINDOWS_MS
         self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str, int, int]]] = {
-            1_000: self.trades_1s,
-            5_000: self.trades_5s,
+            ms: deque() for ms in self.trade_windows
         }
         self.trade_window_state: Dict[int, Dict[str, Any]] = {
             window: self._new_trade_window_state()
@@ -1180,27 +1165,25 @@ class FeatureEngine:
         }
 
         # ---------- VPIN state ----------
-        self.vpin_Vb: Optional[float] = None          # dynamic bucket size (in base-volume)
-        self.vpin_cum_buy: float = 0.0
-        self.vpin_cum_sell: float = 0.0
-        self.vpin_cum: float = 0.0
-        self.vpin_phi: Deque[float] = deque(maxlen=50)
-
-        # ---------- EWMAs for microprice and spread (short/med/long) ----------
-        self.ema_mp_100: Optional[float] = None
-        self.ema_mp_500: Optional[float] = None
-        self.ema_sp_100: Optional[float] = None
-        self.ema_sp_500: Optional[float] = None
-        self.ema_sp_1000: Optional[float] = None
-
-        # ---------- RSI on microprice (EWMA gains/losses) ----------
-        self.rsi_gain: Optional[float] = None
-        self.rsi_loss: Optional[float] = None
+        self.vpin_state: Dict[float, Dict[str, Any]] = {
+            secs: {"Vb": None, "cum_buy": 0.0, "cum_sell": 0.0, "cum": 0.0, "phi": deque(maxlen=50)}
+            for secs in self.vpin_bucket_secs
+        }
 
         # ---------- Decayed pressure (EWMA of OFI L1) ----------
-        self.press_100ms: float = 0.0
-        self.press_1s: float = 0.0
-        self.press_5s: float = 0.0
+        self.pressure_by_window: Dict[int, float] = {ms: 0.0 for ms in FAST_WINDOWS_MS}
+
+        # ---------- RSI/MACD/CCI state ----------
+        self.rsi_state: Dict[int, Dict[str, float]] = {
+            hl: {"gain": 0.0, "loss": 0.0} for hl in EMA_HALF_LIVES_MS
+        }
+        self.macd_state: Dict[int, Dict[str, Optional[float]]] = {
+            idx: {"fast": None, "slow": None, "signal": None}
+            for idx in range(len(MACD_TRIPLETS_MS))
+        }
+        self.cci_state: Dict[int, Dict[str, Optional[float]]] = {
+            hl: {"mean": None, "mad": None} for hl in EMA_HALF_LIVES_MS
+        }
 
         # ---------- Fast EMA state for microstructure signals ----------
         self.ema_half_lives_ms = EMA_HALF_LIVES_MS
@@ -1774,7 +1757,6 @@ class FeatureEngine:
         bid1, ask1, bsz1, asz1 = self._book_best()
         mid = 0.5 * (bid1 + ask1) if (bid1 > 0 and ask1 > 0) else 0.0
 
-        # Microprice and SmartPrice (inverse-size weighting)
         if (bsz1 + asz1) > 0:
             micro = (ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1)
             wb = 1.0 / max(bsz1, 1e-12)
@@ -1786,8 +1768,6 @@ class FeatureEngine:
         spread = max(0.0, ask1 - bid1)
         spread_norm = spread / max(mid, 1e-9)
 
-        # OB horizon comparison block (as-of horizons: 100/200/500ms).
-        # Uses current state at t plus get_ob_snapshot_asof(t-h), never nearest-by-distance.
         spread_deltas: Dict[int, float] = {}
         for window in self.ob_horizon_compare_windows_ms:
             target_ts_ms = ts_ms - window
@@ -1814,7 +1794,6 @@ class FeatureEngine:
         }
         self._record_replenishment(ts_ms, replen_deltas)
 
-        # Cum depths
         cum_bid1 = self._cum_depth(self.bid_lvls, 1)
         cum_ask1 = self._cum_depth(self.ask_lvls, 1)
         cum_bid3 = self._cum_depth(self.bid_lvls, 3)
@@ -1825,21 +1804,9 @@ class FeatureEngine:
         cum_ask10 = self._cum_depth(self.ask_lvls, 10)
 
         if etype == 'ob':
-            self._append_ob_snapshot(
-                ts_ms=ts_ms,
-                bid1=bid1,
-                ask1=ask1,
-                bsz1=bsz1,
-                asz1=asz1,
-                spread=spread,
-                cum_bid3=cum_bid3,
-                cum_ask3=cum_ask3,
-                cum_bid5=cum_bid5,
-                cum_ask5=cum_ask5,
-            )
+            self._append_ob_snapshot(ts_ms, bid1, ask1, bsz1, asz1, spread, cum_bid3, cum_ask3, cum_bid5, cum_ask5)
 
-        # OFI (L1/L3/L5)
-        ofi_l1 = (bsz1 - self.prev_bsz) - (asz1 - self.prev_asz)
+        ofi_l1 = (bsz1 - prev_bid_l1) - (asz1 - prev_ask_l1)
         ofi_l3 = (cum_bid3 - self.prev_cum_bid3) - (cum_ask3 - self.prev_cum_ask3)
         ofi_l5 = (cum_bid5 - self.prev_cum_bid5) - (cum_ask5 - self.prev_cum_ask5)
         self.prev_bsz, self.prev_asz = bsz1, asz1
@@ -1847,416 +1814,191 @@ class FeatureEngine:
         self.prev_cum_bid3, self.prev_cum_ask3 = cum_bid3, cum_ask3
         self.prev_cum_bid5, self.prev_cum_ask5 = cum_bid5, cum_ask5
 
-        # OBI (L1, L3 and L5)
         obi_l1 = (bsz1 - asz1) / max(bsz1 + asz1, 1e-12)
         obi_l3 = (cum_bid3 - cum_ask3) / max(cum_bid3 + cum_ask3, 1e-12)
         obi_l5 = (cum_bid5 - cum_ask5) / max(cum_bid5 + cum_ask5, 1e-12)
 
-        # Micro-premia vs spread
         micro_premia = (micro - mid) / max(spread, 1e-9)
         smart_premia = (smart - mid) / max(spread, 1e-9)
 
-        # Slopes/shape (top-K vs distance from mid)
         xb, yb = self._levels_to_xy(self.bid_lvls, mid, True, 5)
         xa, ya = self._levels_to_xy(self.ask_lvls, mid, False, 5)
         slope_b = self._lin_slope(xb, yb)
         slope_a = self._lin_slope(xa, ya)
 
         indicator_values = {
-            "bid1": bid1,
-            "ask1": ask1,
-            "mid": mid,
-            "spread": spread,
-            "spread_norm": spread_norm,
-            "micro": micro,
-            "smart": smart,
-            "gap_a": gap_a,
-            "gap_b": gap_b,
-            "cum_bid1": cum_bid1,
-            "cum_ask1": cum_ask1,
-            "cum_bid3": cum_bid3,
-            "cum_ask3": cum_ask3,
-            "slope_a": slope_a,
-            "slope_b": slope_b,
-            "obi_l1": obi_l1,
-            "obi_l3": obi_l3,
-            "obi_l5": obi_l5,
-            "ofi_l1": ofi_l1,
-            "ofi_l3": ofi_l3,
-            "ofi_l5": ofi_l5,
-            "micro_premia": micro_premia,
-            "smart_premia": smart_premia,
+            "bid1": bid1, "ask1": ask1, "mid": mid, "spread": spread, "spread_norm": spread_norm,
+            "micro": micro, "smart": smart, "gap_a": gap_a, "gap_b": gap_b,
+            "cum_bid1": cum_bid1, "cum_ask1": cum_ask1, "cum_bid3": cum_bid3, "cum_ask3": cum_ask3,
+            "slope_a": slope_a, "slope_b": slope_b, "obi_l1": obi_l1, "obi_l3": obi_l3, "obi_l5": obi_l5,
+            "ofi_l1": ofi_l1, "ofi_l3": ofi_l3, "ofi_l5": ofi_l5, "micro_premia": micro_premia, "smart_premia": smart_premia,
         }
         self._update_indicator_emas(indicator_values, dt_ms)
 
-        # Pressure (EWMA of OFI L1)
-        self.press_100ms = self._ewma_update(self.press_100ms, ofi_l1, dt_ms, 100)
-        self.press_200ms = self._ewma_update(getattr(self, 'press_200ms',0.0), ofi_l1, dt_ms, 200)
-        self.press_1s    = self._ewma_update(self.press_1s,    ofi_l1, dt_ms, 1_000)
-        self.press_2s    = self._ewma_update(getattr(self, 'press_2s',   0.0), ofi_l1, dt_ms, 2_000)
+        for ms in FAST_WINDOWS_MS:
+            self.pressure_by_window[ms] = self._ewma_update(self.pressure_by_window[ms], ofi_l1, dt_ms, ms)
 
-        # VWAPs (>=1s) and rel to mid/micro
-        vwap_per_ms: Dict[int, float] = {
-            window: (
-                self.trade_window_state[window]["pxv_sum"] / self.trade_window_state[window]["vol_sum"]
-                if self.trade_window_state[window]["vol_sum"] > 1e-12
-                else mid
-            )
-            for window in self.trade_windows
+        trade_stats = {ms: self._compute_trade_window_stats(ms, mid) for ms in self.trade_windows}
+        quote_counts = {ms: len(self._quote_window_deques[ms]) for ms in self.trade_windows}
+        vwap_per_ms = {
+            ms: (self.trade_window_state[ms]["pxv_sum"] / self.trade_window_state[ms]["vol_sum"] if self.trade_window_state[ms]["vol_sum"] > 1e-12 else mid)
+            for ms in self.trade_windows
         }
-        vwap_vs_mid = {
-            ms: (vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0 if mid > 0 else 0.0
-            for ms in vwap_per_ms
-        }
-        vwap_vs_micro = {
-            ms: (vwap_per_ms[ms] / max(micro, 1e-12)) - 1.0 if micro > 0 else 0.0
-            for ms in vwap_per_ms
-        }
+        vwap_vs_mid = {ms: ((vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0) if mid > 0 else 0.0 for ms in self.trade_windows}
+        vwap_vs_micro = {ms: ((vwap_per_ms[ms] / max(micro, 1e-12)) - 1.0) if micro > 0 else 0.0 for ms in self.trade_windows}
 
-        # Trade stats per horizon and tempo
-        stats_1s = self._compute_trade_window_stats(1_000, mid)
-        stats_5s = self._compute_trade_window_stats(5_000, mid)
-        trade_stats = {
-            1_000: stats_1s,
-            5_000: stats_5s,
-        }
-
-        # Quote/trade tempo (1s windows)
-        quotes_1s = float(len(self.quotes_1s))
-        trade_cnt_1s = float(stats_1s["buy_cnt"] + stats_1s["sell_cnt"])
-        buy_vol_1s = stats_1s["buy_vol"]
-        sell_vol_1s = stats_1s["sell_vol"]
-        buy_cnt_1s = stats_1s["buy_cnt"]
-        sell_cnt_1s = stats_1s["sell_cnt"]
-        buy_mean_1s = stats_1s["buy_mean"]
-        sell_mean_1s = stats_1s["sell_mean"]
-        buy_max_1s = stats_1s["buy_max"]
-        sell_max_1s = stats_1s["sell_max"]
-        tot_1s = buy_vol_1s + sell_vol_1s
-        trade_imb_1s = stats_1s["imbalance"]
-        net_vol_1s = stats_1s["net_flow"]
-        trade_through_1s = stats_1s["trade_through"]
-
-        regime_flow = {
-            1_000: stats_1s["imbalance"],
-            5_000: stats_5s["imbalance"],
-        }
-        for ms, val in regime_flow.items():
-            self.flow_regime[ms] = val
-
-        # Spread
+        for ms in self._spread_change_deques:
+            if self.last_spread is None or spread != self.last_spread:
+                self._append_ts_with_guard(self._spread_change_deques[ms], ts_ms, ms, is_ob_event=True)
+            else:
+                self._prune_ts_deque(self._spread_change_deques[ms], ts_ms, ms)
         if self.last_spread is None or spread != self.last_spread:
-            for window, deq in self._spread_change_deques.items():
-                self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
             self.last_spread = spread
             self.last_spread_ts = ts_ms
-        else:
-            for window, deq in self._spread_change_deques.items():
-                self._prune_ts_deque(deq, ts_ms, window)
 
-        # Best-level churn & depletion
-        bid_level_changed = (
-            self.last_bid1 is None
-            or bid1 != self.last_bid1
-            or bsz1 != prev_bid_l1
-        )
-        ask_level_changed = (
-            self.last_ask1 is None
-            or ask1 != self.last_ask1
-            or asz1 != prev_ask_l1
-        )
-
-        for window, dq in self._bid1_change_deques.items():
-            if bid_level_changed:
-                self._append_ts_with_guard(dq, ts_ms, window, is_ob_event=True)
-            else:
-                self._prune_ts_deque(dq, ts_ms, window)
-
-        for window, dq in self._ask1_change_deques.items():
-            if ask_level_changed:
-                self._append_ts_with_guard(dq, ts_ms, window, is_ob_event=True)
-            else:
-                self._prune_ts_deque(dq, ts_ms, window)
-
+        bid_level_changed = (self.last_bid1 is None or bid1 != self.last_bid1 or bsz1 != prev_bid_l1)
+        ask_level_changed = (self.last_ask1 is None or ask1 != self.last_ask1 or asz1 != prev_ask_l1)
+        for ms, dq in self._bid1_change_deques.items():
+            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if bid_level_changed else self._prune_ts_deque(dq, ts_ms, ms)
+        for ms, dq in self._ask1_change_deques.items():
+            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if ask_level_changed else self._prune_ts_deque(dq, ts_ms, ms)
         if bid_level_changed:
             self.last_bid1_update_ts = ts_ms
         if ask_level_changed:
             self.last_ask1_update_ts = ts_ms
-
         self.last_bid1, self.last_ask1 = bid1, ask1
 
-        # size depletion (only negative deltas accumulated over 200ms)
-        db = bsz1 - self.prev_bsz
-        da = asz1 - self.prev_asz
-        self.sz_deltas_200ms.append((ts_ms, min(db,0.0), min(da,0.0)))
-        self._prune_deque_ms(self.sz_deltas_200ms, ts_ms, 200)
-        neg_depl_b = sum(x for _, x, _ in self.sz_deltas_200ms)
-        neg_depl_a = sum(x for _, _, x in self.sz_deltas_200ms)
+        for ms, deq in self.sz_delta_deques.items():
+            deq.append((ts_ms, min(bsz1 - prev_bid_l1, 0.0), min(asz1 - prev_ask_l1, 0.0)))
+            self._prune_deque_ms(deq, ts_ms, ms)
+        neg_depletion = {ms: (sum(x for _, x, _ in deq), sum(x for _, _, x in deq)) for ms, deq in self.sz_delta_deques.items()}
 
         dt_since_trade = float(ts_ms - self.last_trade_ts) if self.last_trade_ts is not None else 0.0
-        dt_since_bid1_update = (
-            float(ts_ms - self.last_bid1_update_ts)
-            if self.last_bid1_update_ts is not None
-            else 0.0
-        )
-        dt_since_ask1_update = (
-            float(ts_ms - self.last_ask1_update_ts)
-            if self.last_ask1_update_ts is not None
-            else 0.0
-        )
+        dt_since_bid1_update = float(ts_ms - self.last_bid1_update_ts) if self.last_bid1_update_ts is not None else 0.0
+        dt_since_ask1_update = float(ts_ms - self.last_ask1_update_ts) if self.last_ask1_update_ts is not None else 0.0
 
-        quote_counts = {
-            1_000: len(self.quotes_1s),
-            5_000: len(self.quotes_5s),
-        }
-        spread_change_counts = {
-            1_000: len(self._spread_change_deques[1_000]),
-            5_000: len(self._spread_change_deques[5_000]),
-        }
-        bid1_change_counts = {ms: len(self._bid1_change_deques[ms]) for ms in self.bestlvl_windows}
-        ask1_change_counts = {ms: len(self._ask1_change_deques[ms]) for ms in self.bestlvl_windows}
-        time_since_spread_change = (ts_ms - (self.last_spread_ts or ts_ms))
-        n_spread_chg_200ms = spread_change_counts.get(200, 0)
-        n_spread_chg_1s = len(self._spread_change_deques[1000])
-
-        # Returns & vol stats (populate histories + compute σ and VR)
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
-        _, var_100 = self._stats_from_returns(self.ret_hist_100ms)
-        _, var_200 = self._stats_from_returns(self.ret_hist_200ms)
-        _, var_500 = self._stats_from_returns(self.ret_hist_500ms)
-        _, var_1s = self._stats_from_returns(self.ret_hist_1s)
-        _, var_5s = self._stats_from_returns(self.ret_hist_5s)
-        std_100 = math.sqrt(max(0.0, var_100))
-        std_200 = math.sqrt(max(0.0, var_200))
-        std_500 = math.sqrt(max(0.0, var_500))
-        std_1s = math.sqrt(max(0.0, var_1s))
-        std_5s = math.sqrt(max(0.0, var_5s))
-        # Variance ratio: 1s variance vs 10 * 100ms variance (1s = 10×100ms)
-        vr = (var_1s / max(10.0 * var_100, 1e-12)) if var_100 > 0 else 0.0
-        vr_1s_200 = var_1s / max(5.0 * var_200, 1e-12) if var_200 > 0 else 0.0
-        var_ratio_500_100 = var_500 / max(var_100, 1e-12) if var_100 > 0 else 0.0
+        return_std = {}
+        for ms, deq in self.return_histories.items():
+            _, var = self._stats_from_returns(deq)
+            return_std[ms] = math.sqrt(max(0.0, var))
+        vr_adjacent = {}
+        for prev_ms, cur_ms in zip(self.return_windows_ms[:-1], self.return_windows_ms[1:]):
+            _, var_prev = self._stats_from_returns(self.return_histories[prev_ms])
+            _, var_cur = self._stats_from_returns(self.return_histories[cur_ms])
+            vr_adjacent[(cur_ms, prev_ms)] = (var_cur / max((cur_ms / prev_ms) * var_prev, 1e-12)) if var_prev > 0 else 0.0
 
-        # Short-horizon regime summaries (vol & flow)
         regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
         regime_realized = {ms: self.realized_vol[ms] for ms in self.regime_windows_ms}
         regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
+        for ms in self.regime_windows_ms:
+            nearest = min(self.trade_windows, key=lambda w: abs(w - ms))
+            self.flow_regime[ms] = trade_stats[nearest]["imbalance"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
-        vol_ratio_short_long = regime_volume[500] / max(regime_volume[5_000], 1e-9)
-        realized_ratio_short_long = regime_realized[500] / max(regime_realized[5_000], 1e-12)
-        flow_diff_short_long = regime_flow_snapshot[1_000] - regime_flow_snapshot[5_000]
 
-        # EMA (microprice & spread) and RSI(micro)
-        for attr, val, hl, use_half_life in [
-            ("ema_mp_100", micro, 200, False),
-            ("ema_mp_500", micro, 800, False),
-            ("ema_sp_100", spread, 100, True),
-            ("ema_sp_500", spread, 500, True),
-            ("ema_sp_1000", spread, 1000, True),
-        ]:
-            cur = getattr(self, attr)
-            if use_half_life:
-                prev = cur if cur is not None else val
-                updated = self._ewma_update(prev, val, dt_ms, hl)
-            else:
-                alpha = 1.0 - math.exp(-dt_ms / float(max(1, hl)))
-                updated = (1.0 - alpha) * (cur if cur is not None else val) + alpha * val
-            setattr(self, attr, updated)
+        spread_delta_norms = {ms: spread_deltas[ms] / max(spread, 1e-9) for ms in self.ob_horizon_compare_windows_ms}
 
-        spread_ema_vals = {
-            100: self.ema_sp_100 if self.ema_sp_100 is not None else spread,
-            500: self.ema_sp_500 if self.ema_sp_500 is not None else spread,
-            1000: self.ema_sp_1000 if self.ema_sp_1000 is not None else spread,
-        }
-        spread_ratios = {
-            hl: spread / max(val, 1e-9)
-            for hl, val in spread_ema_vals.items()
-        }
-        spread_log_ratios = {
-            hl: math.log(max(spread, 1e-9)) - math.log(max(val, 1e-9))
-            for hl, val in spread_ema_vals.items()
-        }
+        rsi_vals = []
+        for hl in EMA_HALF_LIVES_MS:
+            ema_micro = self.ema_states[hl]["micro"] if self.ema_states[hl]["micro"] is not None else micro
+            delta = micro - ema_micro
+            state = self.rsi_state[hl]
+            state["gain"] = self._ewma_update(state["gain"], max(delta, 0.0), dt_ms, hl)
+            state["loss"] = self._ewma_update(state["loss"], max(-delta, 0.0), dt_ms, hl)
+            rs = state["gain"] / max(state["loss"], 1e-12)
+            rsi_vals.append(100.0 - 100.0 / (1.0 + rs))
 
-        # OB horizon comparison normalization block (as-of horizons: 100/200/500ms).
-        spread_delta_norms: Dict[int, float] = {}
-        for window, delta in spread_deltas.items():
-            if window <= 150:
-                baseline = self.ema_sp_100 if self.ema_sp_100 is not None else spread
-            else:
-                baseline = self.ema_sp_500 if self.ema_sp_500 is not None else spread
-            spread_delta_norms[window] = delta / max(baseline, 1e-9)
-
-        # RSI on microprice (use EWMA gains/losses with ~100ms smoothing)
-        delta_mp = micro - (self.ema_mp_100 if self.ema_mp_100 is not None else micro)
-        micro_minus_ema100 = delta_mp
-        gain = max(delta_mp, 0.0)
-        loss = max(-delta_mp, 0.0)
-        alpha_rsi = 1.0 - math.exp(-dt_ms / 200.0)
-        self.rsi_gain = (1.0 - alpha_rsi) * (self.rsi_gain or 0.0) + alpha_rsi * gain
-        self.rsi_loss = (1.0 - alpha_rsi) * (self.rsi_loss or 0.0) + alpha_rsi * loss
-        rs = self.rsi_gain / max(self.rsi_loss, 1e-12)
-        rsi = 100.0 - 100.0 / (1.0 + rs)
-
-        # MACD/CCI on μ & SmartPrice (use ms-based EMAs)
-        def ema_ms(prev: float, x: float, hl_ms: float) -> float:
+        def ema_ms(prev: Optional[float], x: float, hl_ms: float) -> float:
             a = 1.0 - math.exp(-dt_ms / max(1.0, hl_ms))
-            return (1 - a) * prev + a * x if prev is not None else x
+            return x if prev is None else ((1.0 - a) * prev + a * x)
 
-        # MACD for microprice
-        self.macd_fast = ema_ms(getattr(self, 'macd_fast', None), micro, 100.0)
-        self.macd_slow = ema_ms(getattr(self, 'macd_slow', None), micro, 400.0)
-        macd_raw = (self.macd_fast - self.macd_slow) if (self.macd_fast is not None and self.macd_slow is not None) else 0.0
-        self.macd_sig = ema_ms(getattr(self, 'macd_sig', None), macd_raw, 200.0)
-        macd_hist = macd_raw - (self.macd_sig if self.macd_sig is not None else 0.0)
+        macd_features = []
+        for idx, (fast_ms, slow_ms, sig_ms) in enumerate(MACD_TRIPLETS_MS):
+            st = self.macd_state[idx]
+            st["fast"] = ema_ms(st["fast"], micro, float(fast_ms))
+            st["slow"] = ema_ms(st["slow"], micro, float(slow_ms))
+            raw = float(st["fast"] - st["slow"])
+            st["signal"] = ema_ms(st["signal"], raw, float(sig_ms))
+            sig = float(st["signal"])
+            macd_features.extend([raw, sig, raw - sig])
 
-        # CCI (micro) using EWMA mean & mean abs dev proxy
-        self.cci_mean = ema_ms(getattr(self, 'cci_mean', None), micro, 200.0)
-        mad = abs(micro - (self.cci_mean if self.cci_mean is not None else micro))
-        self.cci_mad = ema_ms(getattr(self, 'cci_mad', None), mad, 200.0)
-        cci = 0.015 * ((micro - (self.cci_mean or micro)) / max(self.cci_mad or 1e-12, 1e-12))
+        cci_features = []
+        for hl in EMA_HALF_LIVES_MS:
+            st = self.cci_state[hl]
+            st["mean"] = ema_ms(st["mean"], micro, float(hl))
+            mad = abs(micro - float(st["mean"]))
+            st["mad"] = ema_ms(st["mad"], mad, float(hl))
+            cci_features.append(0.015 * ((micro - float(st["mean"])) / max(float(st["mad"]), 1e-12)))
 
-        # VPIN value (avg of last M φ)
-        vpin = (sum(self.vpin_phi) / len(self.vpin_phi)) if self.vpin_phi else 0.0
+        vpin_features = []
+        for secs in self.vpin_bucket_secs:
+            phi = self.vpin_state[secs]["phi"]
+            vpin_features.append((sum(phi) / len(phi)) if phi else 0.0)
 
-        trade_horizons = list(self.trade_windows)
         replen_rates = self._replenishment_rates()
 
-        # Build raw feature vector
+        # Canonical order:
+        # 1) instantaneous; 2) fast-window OB/spread/churn/depletion/replen; 3) flow-window trade/quote/VWAP;
+        # 4) flow-window return std/VR; 5) regime-window summaries; 6) pressure; 7) EMA bank; 8) EMA residuals;
+        # 9) RSI; 10) MACD; 11) CCI; 12) VPIN.
         feat_list = [
-            # --- price/state ---
             bid1, ask1, mid, micro, smart, spread, spread_norm, gap_a, gap_b,
-            bsz1, asz1,
-
-            # --- depth/shape ---
-            cum_bid5, cum_ask5, cum_bid10, cum_ask10,
-            slope_b, slope_a,
-
-            # --- imbalance & premia ---
-            ofi_l1, ofi_l3, ofi_l5,
-            obi_l1, obi_l3, obi_l5,
-            micro_premia, smart_premia,
-
-            # --- pressure (decayed OFI) ---
-            self.press_100ms,
-            getattr(self, 'press_200ms', 0.0),
-            self.press_1s,
-            getattr(self, 'press_2s', 0.0),
-
-            # --- trade flow (true ~1s) ---
-            buy_vol_1s, sell_vol_1s, buy_cnt_1s, sell_cnt_1s,
-            buy_mean_1s, sell_mean_1s, buy_max_1s, sell_max_1s,
-            trade_imb_1s, net_vol_1s, trade_through_1s,
-
-            # --- tempo ---
-            quotes_1s,
-            trade_cnt_1s,
-            dt_since_trade,
-            float(self.last_tick_sign),
-            float(self.last_is_zero_tick),
-            float(self.last_is_rpi),
-
-            # --- best-level churn & depletion & spread-change stats ---
-            float(bid1_change_counts.get(100, 0)),
-            float(bid1_change_counts.get(200, 0)),
-            float(bid1_change_counts.get(500, 0)),
-            float(bid1_change_counts.get(1_000, 0)),
-            float(ask1_change_counts.get(100, 0)),
-            float(ask1_change_counts.get(200, 0)),
-            float(ask1_change_counts.get(500, 0)),
-            float(ask1_change_counts.get(1_000, 0)),
-            neg_depl_b, neg_depl_a,
-            float(time_since_spread_change),
-            float(n_spread_chg_200ms), float(n_spread_chg_1s),
-            dt_since_bid1_update,
-            dt_since_ask1_update,
-            spread_deltas.get(100, 0.0), spread_deltas.get(200, 0.0),
-            spread_deltas.get(500, 0.0),
-            spread_delta_norms.get(100, 0.0), spread_delta_norms.get(200, 0.0),
-            spread_delta_norms.get(500, 0.0),
-
-            # --- returns & vol stats ---
-            std_100, std_200, std_500, std_1s, std_5s,
-            vr, vr_1s_200,
-            var_ratio_500_100,
-
-            # --- EMAs & technicals ---
-            (self.ema_mp_100 if self.ema_mp_100 is not None else micro),
-            (self.ema_mp_500 if self.ema_mp_500 is not None else micro),
-            (self.ema_sp_100 if self.ema_sp_100 is not None else spread),
-            (self.ema_sp_500 if self.ema_sp_500 is not None else spread),
-            (self.ema_sp_1000 if self.ema_sp_1000 is not None else spread),
-            spread_ratios[100], spread_ratios[500], spread_ratios[1000],
-            spread_log_ratios[100], spread_log_ratios[500], spread_log_ratios[1000],
-            micro_minus_ema100,
-            rsi,
-            macd_raw,
-            (self.macd_sig if getattr(self, 'macd_sig', None) is not None else 0.0),
-            macd_hist,
-            cci,
-
-            # --- regime & risks ---
-            self.volume_ewma[500], self.volume_ewma[1_000], self.volume_ewma[5_000],
-            regime_realized[500], regime_realized[1_000], regime_realized[5_000],
-            regime_vol_ewma[500], regime_vol_ewma[1_000], regime_vol_ewma[5_000],
-            self.flow_regime[1_000], self.flow_regime[5_000],
-            vol_ratio_short_long, realized_ratio_short_long, flow_diff_short_long,
-            vpin,
+            bsz1, asz1, cum_bid5, cum_ask5, cum_bid10, cum_ask10, slope_a, slope_b,
+            obi_l1, obi_l3, obi_l5, ofi_l1, ofi_l3, ofi_l5, micro_premia, smart_premia,
+            dt_since_trade, dt_since_bid1_update, dt_since_ask1_update,
+            float(self.last_tick_sign), float(self.last_is_zero_tick), float(self.last_is_rpi),
         ]
 
-        # --- per-horizon trade stats & liquidity metrics (>=1s) ---
-        for ms in trade_horizons:
-            stats = trade_stats[ms]
+        for ms in FAST_WINDOWS_MS:
             feat_list.extend([
-                stats["buy_vol"], stats["sell_vol"],
-                stats["buy_cnt"], stats["sell_cnt"],
-                stats["buy_mean"], stats["sell_mean"],
-                stats["buy_max"], stats["sell_max"],
-                stats["net_flow"], stats["imbalance"],
-                stats["toxicity"], stats["trade_through"],
-                float(quote_counts.get(ms, 0)),
-                float(spread_change_counts.get(ms, 0)),
+                spread_deltas.get(ms, 0.0),
+                spread_delta_norms.get(ms, 0.0),
+                float(len(self._spread_change_deques[ms])),
+                float(len(self._bid1_change_deques[ms])),
+                float(len(self._ask1_change_deques[ms])),
+                neg_depletion[ms][0], neg_depletion[ms][1],
             ])
-
-        # --- L1/L2 liquidity replenishment/cancellation rates (size/ms) ---
-        for ms in self.replen_windows_ms:
             rates = replen_rates[ms]
             for level in (1, 2):
-                feat_list.extend([
-                    rates[("bid", level, "add")],
-                    rates[("bid", level, "rem")],
-                    rates[("ask", level, "add")],
-                    rates[("ask", level, "rem")],
-                ])
+                feat_list.extend([rates[("bid", level, "add")], rates[("bid", level, "rem")], rates[("ask", level, "add")], rates[("ask", level, "rem")]])
 
-        # --- VWAPs vs mid/micro across horizons ---
-        for ms in trade_horizons:
-            feat_list.append(vwap_vs_mid[ms])
-        for ms in trade_horizons:
-            feat_list.append(vwap_vs_micro[ms])
+        for ms in FLOW_WINDOWS_MS:
+            stats = trade_stats[ms]
+            feat_list.extend([
+                stats["buy_vol"], stats["sell_vol"], stats["buy_cnt"], stats["sell_cnt"],
+                stats["buy_mean"], stats["sell_mean"], stats["buy_max"], stats["sell_max"],
+                stats["net_flow"], stats["imbalance"], stats["toxicity"], stats["trade_through"],
+                float(quote_counts[ms]), vwap_vs_mid[ms], vwap_vs_micro[ms],
+            ])
 
-        # --- indicator EMAs (100/500 ms) ---
+        for ms in FLOW_WINDOWS_MS:
+            feat_list.append(return_std[ms])
+        for prev_ms, cur_ms in zip(FLOW_WINDOWS_MS[:-1], FLOW_WINDOWS_MS[1:]):
+            feat_list.append(vr_adjacent[(cur_ms, prev_ms)])
+
+        for ms in REGIME_WINDOWS_MS:
+            feat_list.extend([regime_volume[ms], regime_realized[ms], regime_vol_ewma[ms], regime_flow_snapshot[ms]])
+
+        for ms in FAST_WINDOWS_MS:
+            feat_list.append(self.pressure_by_window[ms])
+
         for hl in self.ema_half_lives_ms:
             state = self.ema_states[hl]
             for name in self.ema_indicator_names:
-                ema_val = state[name]
-                if ema_val is None:
-                    ema_val = indicator_values[name]
-                feat_list.append(ema_val)
-
-        # --- indicator EMA residuals (raw - EMA) ---
+                feat_list.append(state[name] if state[name] is not None else indicator_values[name])
         for hl in self.ema_half_lives_ms:
             state = self.ema_states[hl]
             for name in self.ema_indicator_names:
-                ema_val = state[name]
-                if ema_val is None:
-                    ema_val = indicator_values[name]
+                ema_val = state[name] if state[name] is not None else indicator_values[name]
                 feat_list.append(indicator_values[name] - ema_val)
 
+        feat_list.extend(rsi_vals)
+        feat_list.extend(macd_features)
+        feat_list.extend(cci_features)
+        feat_list.extend(vpin_features)
+
         feat = np.array(feat_list, dtype=np.float64)
-
-        # Rolling z-score normalization
         feat_z = self._zscore(feat, dt_ms)
-
-        # Update end-of-event time markers
         self.last_ts = ts_ms
         self._last_event_ts = ts_ms
 
@@ -2384,33 +2126,29 @@ class FeatureEngine:
         for hl in self.regime_windows_ms:
             self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
 
-        # VPIN bucket sizing and accumulation
+        # VPIN bucket sizing and accumulation per configured bucket scale
         v_per_sec = max(self.volume_ewma[1_000], 1e-9)
-        Vb = max(v_per_sec * self.vpin_target_bucket_secs, 1e-9)
-        self.vpin_Vb = Vb if self.vpin_Vb is None else (0.9 * self.vpin_Vb + 0.1 * Vb)
+        for secs, st in self.vpin_state.items():
+            Vb = max(v_per_sec * float(secs), 1e-9)
+            st["Vb"] = Vb if st["Vb"] is None else (0.9 * st["Vb"] + 0.1 * Vb)
+            if side == 'buy':
+                st["cum_buy"] += size
+            else:
+                st["cum_sell"] += size
+            st["cum"] += size
 
-        if side == 'buy':
-            self.vpin_cum_buy += size
-        else:
-            self.vpin_cum_sell += size
-        self.vpin_cum += size
-
-        # Close as many buckets as are filled (proportionally closing the last)
-        while self.vpin_cum >= (self.vpin_Vb or 1e9):
-            if self.vpin_Vb is None:
-                break
-            # proportionally split exactly Vb from current cum pools
-            total = max(self.vpin_cum, 1e-12)
-            scale = (self.vpin_Vb) / total
-            buy_bucket = self.vpin_cum_buy * scale
-            sell_bucket = self.vpin_cum_sell * scale
-            phi = abs(buy_bucket - sell_bucket) / max(self.vpin_Vb, 1e-12)
-            self.vpin_phi.append(phi)
-
-            # subtract the closed bucket
-            self.vpin_cum_buy -= buy_bucket
-            self.vpin_cum_sell -= sell_bucket
-            self.vpin_cum -= self.vpin_Vb
+            while st["cum"] >= (st["Vb"] or 1e9):
+                if st["Vb"] is None:
+                    break
+                total = max(st["cum"], 1e-12)
+                scale = st["Vb"] / total
+                buy_bucket = st["cum_buy"] * scale
+                sell_bucket = st["cum_sell"] * scale
+                phi = abs(buy_bucket - sell_bucket) / max(st["Vb"], 1e-12)
+                st["phi"].append(phi)
+                st["cum_buy"] -= buy_bucket
+                st["cum_sell"] -= sell_bucket
+                st["cum"] -= st["Vb"]
 
         self.last_trade_ts = ts_ms
 
@@ -2423,14 +2161,9 @@ class FeatureEngine:
         r = math.log(mid / self.last_mid_for_ret) if self.last_mid_for_ret > 0 else 0.0
         self.last_mid_for_ret = mid
 
-        # push to windows
-        self._append_tuple_with_guard(self.ret_hist_100ms, (ts_ms, r), ts_ms, 100, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_200ms, (ts_ms, r), ts_ms, 200, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_500ms, (ts_ms, r), ts_ms, 500, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_1s,   (ts_ms, r), ts_ms, 1_000, is_ob_event)
-        self._append_tuple_with_guard(self.ret_hist_5s,   (ts_ms, r), ts_ms, 5_000, is_ob_event)
+        for ms, deq in self.return_histories.items():
+            self._append_tuple_with_guard(deq, (ts_ms, r), ts_ms, ms, is_ob_event)
 
-        # update short-horizon EWMA and realized vol caches
         dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
         r2 = r * r
         for hl in self.regime_windows_ms:
