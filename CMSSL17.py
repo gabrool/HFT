@@ -474,9 +474,11 @@ HORIZONS_MS     = [7_500, 15_000, 30_000]
 NUM_HORIZONS    = len(HORIZONS_MS)
 HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
-FEE_HURDLE_BPS = 3.7
+FEE_HURDLE_BPS = 3.7  # main 30s trading fee hurdle / reference trading fee
+HORIZON_TARGET_HURDLES_BPS = [0.0, 0.0, 3.7]  # supervised target hurdles per horizon
 ABS_TRIM_TAIL_FRACTION = 0.02
 TARGET_TRANSFORM = "signed_sqrt_excess_bps"
+TARGET_TASK = "horizon_specific_signed_excess_targets_from_raw_bps_labels"
 CHECKPOINT_SCHEMA = "cmssl17-signed-excess-v1"
 EPOCHS          = 200
 LR              = 4e-4
