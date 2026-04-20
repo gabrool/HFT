@@ -483,7 +483,7 @@ LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "top_decile_signed_excess_30000ms"
+PRIMARY_METRIC = "spearman_active_30000ms"
 PRIMARY_METRIC_HORIZON_MS = 30_000
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
@@ -2393,7 +2393,7 @@ def compute_primary_metric(metric_payload: Dict[str, Any]) -> Tuple[float, str]:
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
         )
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    vals = metric_payload.get("top_10pct_signed_excess_bps", [])
+    vals = metric_payload.get("spearman_active", [])
     if idx >= len(vals):
         return float("nan"), PRIMARY_METRIC
     return float(vals[idx]), PRIMARY_METRIC
