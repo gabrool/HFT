@@ -39,7 +39,7 @@ from CMSSL17 import (  # type: ignore
     BATCH_SIZE, EPOCHS, LR, PATIENCE,
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS,
-    FEE_HURDLE_BPS, ABS_TRIM_TAIL_FRACTION, TARGET_TRANSFORM, CHECKPOINT_SCHEMA,
+    FEE_HURDLE_BPS, HORIZON_TARGET_HURDLES_BPS, ABS_TRIM_TAIL_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     SAM,
 )
@@ -461,8 +461,9 @@ def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) 
     return X, y, int(feat_dim)
 
 # ---------------- Signed-excess preprocessing, cache, and metrics ----------------
-def raw_returns_to_excess_bps(y_raw_bps: np.ndarray, fee_hurdle_bps: float) -> np.ndarray:
-    mag = np.maximum(np.abs(y_raw_bps) - float(fee_hurdle_bps), 0.0)
+def raw_returns_to_excess_bps(y_raw_bps: np.ndarray, horizon_target_hurdles_bps: np.ndarray) -> np.ndarray:
+    hurdles = np.asarray(horizon_target_hurdles_bps, dtype=np.float32).reshape(1, -1)
+    mag = np.maximum(np.abs(y_raw_bps) - hurdles, 0.0)
     return np.sign(y_raw_bps) * mag
 
 
@@ -494,7 +495,7 @@ def compute_signed_excess_stats(y_train: np.ndarray) -> Dict[str, np.ndarray]:
     abs_lo = np.quantile(abs_y, ABS_TRIM_TAIL_FRACTION, axis=0).astype(np.float32)
     abs_hi = np.quantile(abs_y, 1.0 - ABS_TRIM_TAIL_FRACTION, axis=0).astype(np.float32)
     keep = build_abs_trim_mask(y_train, abs_lo, abs_hi)
-    y_ex = raw_returns_to_excess_bps(y_train, FEE_HURDLE_BPS)
+    y_ex = raw_returns_to_excess_bps(y_train, HORIZON_TARGET_HURDLES_BPS)
     q50 = np.zeros(NUM_HORIZONS, dtype=np.float32)
     q85 = np.zeros(NUM_HORIZONS, dtype=np.float32)
     for h in range(NUM_HORIZONS):
@@ -525,7 +526,7 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
-    keys = ('abs_trim_tail_fraction','fee_hurdle_bps','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units')
+    keys = ('abs_trim_tail_fraction','horizon_target_hurdles_bps','main_fee_hurdle_bps','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task')
     return all(cached_meta.get(k)==current_meta.get(k) for k in keys)
 
 
@@ -566,7 +567,7 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
         return out
     pred=np.concatenate(pred_parts,0); y_raw=np.concatenate(y_parts,0)
     keep=build_abs_trim_mask(y_raw, stats['abs_lo_raw_bps'], stats['abs_hi_raw_bps'])
-    y_ex=raw_returns_to_excess_bps(y_raw, FEE_HURDLE_BPS)
+    y_ex=raw_returns_to_excess_bps(y_raw, HORIZON_TARGET_HURDLES_BPS)
     y_t=signed_sqrt_transform(y_ex)
     out={
         'kept_fraction':[], 'active_fraction_true':[], 'huber_kept':[], 'mae_kept_transformed':[],
@@ -727,11 +728,12 @@ def train_from_offline():
 
     cache_path=out_root/'signed_excess_stats_cache.npz'
     cache_meta={
-        'abs_trim_tail_fraction': float(ABS_TRIM_TAIL_FRACTION), 'fee_hurdle_bps': float(FEE_HURDLE_BPS),
+        'abs_trim_tail_fraction': float(ABS_TRIM_TAIL_FRACTION),
+        'horizon_target_hurdles_bps': [float(h) for h in HORIZON_TARGET_HURDLES_BPS], 'main_fee_hurdle_bps': float(FEE_HURDLE_BPS),
         'horizons_ms':[int(h) for h in HORIZONS_MS], 'train_week_keys': list(cmssl_train['weeks']),
         'train_ts_start': int(tr_start), 'train_ts_end': int(tr_end), 'decision_time_basis': EXPECTED_DECISION_TIME_BASIS,
         'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
-        'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps'
+        'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK
     }
     cached=load_stats_cache(cache_path); stats=None
     if cached and cache_matches(cached[1], cache_meta): stats=cached[0]
@@ -761,6 +763,7 @@ def train_from_offline():
     q50_t=torch.tensor(stats['active_q50_excess'],device=device,dtype=torch.float32).view(1,-1)
     q85_t=torch.tensor(stats['active_q85_excess'],device=device,dtype=torch.float32).view(1,-1)
     hwt=torch.tensor(HORIZON_WEIGHTS,device=device,dtype=torch.float32).view(1,-1)
+    hurdles_t=torch.tensor(HORIZON_TARGET_HURDLES_BPS, device=device, dtype=torch.float32).view(1,-1)
 
     for epoch in range(EPOCHS):
         model.train(); running={'loss':0.0,'huber':0.0,'corr':0.0}; n_batches=0
@@ -768,7 +771,7 @@ def train_from_offline():
             x=x.to(device, non_blocking=True); y_raw=y.to(device, non_blocking=True)
             def compute_loss(pred, y_raw):
                 keep=(torch.abs(y_raw)>=abs_lo_t)&(torch.abs(y_raw)<=abs_hi_t)
-                y_ex=torch.sign(y_raw)*torch.clamp(torch.abs(y_raw)-FEE_HURDLE_BPS, min=0.0)
+                y_ex=torch.sign(y_raw)*torch.clamp(torch.abs(y_raw)-hurdles_t, min=0.0)
                 y_t=torch.sign(y_ex)*torch.sqrt(torch.abs(y_ex))
                 if not keep.any():
                     z=pred.sum()*0.0
@@ -823,8 +826,9 @@ def train_from_offline():
                     'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
                     'decision_time_basis': meta.get('decision_time_basis'), 'decision_stride_policy':'every_ob_event',
                     'label_delta_ms':0, 'label_units':'signed_log_return_bps',
-                    'target_task':'signed_excess_return_training_from_raw_bps_labels',
-                    'fee_hurdle_bps': float(FEE_HURDLE_BPS), 'target_transform': TARGET_TRANSFORM,
+                    'target_task': TARGET_TASK,
+                    'horizon_target_hurdles_bps': [float(h) for h in HORIZON_TARGET_HURDLES_BPS],
+                    'main_fee_hurdle_bps': float(FEE_HURDLE_BPS), 'target_transform': TARGET_TRANSFORM,
                     'abs_trim_tail_fraction': float(ABS_TRIM_TAIL_FRACTION),
                 },
                 'best_primary_metric': best,
