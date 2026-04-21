@@ -1762,7 +1762,13 @@ class EventFeeder:
         self.quality_by_week: Dict[str, Dict[str, object]] = {}
 
     def _put(self, item: Tuple[str, Optional[str], Optional[object]]):
-        self.queue.put(item)
+        while True:
+            try:
+                self.queue.put(item, timeout=1.0)
+                return
+            except queue.Full:
+                kind, wk, _payload = item
+                print(f"[feeder] queue full while sending kind={kind!r} week={wk!r}", flush=True)
 
     def run(self):
         try:
@@ -1854,7 +1860,17 @@ def _stream_core_features(pairs: List[WeekPair]):
                 continue
 
             t_evt = time.monotonic()
-            ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_fast_event(event)
+            try:
+                ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_fast_event(event)
+            except Exception as exc:
+                event_repr = repr(event)
+                if len(event_repr) > 500:
+                    event_repr = event_repr[:500] + "..."
+                print(
+                    f"[pca-error] week={wk} kind={kind} event={event_repr} exc={exc!r}",
+                    flush=True,
+                )
+                raise
             event_proc_s += time.monotonic() - t_evt
             if last_global_ts is not None and ts_ms < last_global_ts:
                 raise ValueError(
@@ -1871,7 +1887,9 @@ def _stream_core_features(pairs: List[WeekPair]):
                 last_log = now
             yield np.asarray(feat_z, dtype=np.float32)
     finally:
-        producer_thread.join()
+        producer_thread.join(timeout=2.0)
+        if producer_thread.is_alive():
+            print("[pca ] producer thread still alive during shutdown; skipping blocking join", flush=True)
         _print_coarse_timing_totals(
             "[pca-time]",
             {
