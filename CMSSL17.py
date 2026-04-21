@@ -2157,7 +2157,7 @@ class FeatureEngine:
             self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
 
         # VPIN bucket sizing and accumulation per configured bucket scale
-        v_per_sec = max(self.volume_ewma[1_000], 1e-9)
+        v_per_sec = max(self.volume_ewma[3_000], 1e-9)
         for secs, st in self.vpin_state.items():
             Vb = max(v_per_sec * float(secs), 1e-9)
             st["Vb"] = Vb if st["Vb"] is None else (0.9 * st["Vb"] + 0.1 * Vb)
