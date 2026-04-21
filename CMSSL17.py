@@ -506,6 +506,8 @@ MACD_TRIPLETS_MS = (
     (30_000, 60_000, 40_000),
 )
 VPIN_BUCKET_SECS = (1.0, 3.0, 7.5, 15.0, 30.0)
+BOOK_DEPTH_FEATURE_LEVELS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 100)
+MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
 
 NUM_HEADS       = 8
 # Loss mixing (fixed lambdas), with EMA normalization per loss
@@ -1050,11 +1052,16 @@ class FeatureEngine:
     
     def __init__(
         self,
-        depth: int = 10,
+        depth: int = MAX_BOOK_FEATURE_LEVEL,
         z_hl_ms: int = 500,
         vpin_target_bucket_secs: float = 2.0,
     ):
         self.depth = int(depth)
+        if self.depth < MAX_BOOK_FEATURE_LEVEL:
+            raise ValueError(
+                f"FeatureEngine depth={self.depth} is too small for BOOK_DEPTH_FEATURE_LEVELS={BOOK_DEPTH_FEATURE_LEVELS}. "
+                f"Need depth >= {MAX_BOOK_FEATURE_LEVEL}."
+            )
         self.z_hl_ms = int(z_hl_ms)
         self.vpin_target_bucket_secs = float(vpin_target_bucket_secs)
         self.vpin_bucket_secs: Tuple[float, ...] = VPIN_BUCKET_SECS
@@ -1069,10 +1076,8 @@ class FeatureEngine:
         self.prev_asz: float = 0.0
         self.prev_bsz2: float = 0.0
         self.prev_asz2: float = 0.0
-        self.prev_cum_bid3: float = 0.0
-        self.prev_cum_ask3: float = 0.0
-        self.prev_cum_bid5: float = 0.0
-        self.prev_cum_ask5: float = 0.0
+        self.prev_cum_bid_by_level: Dict[int, float] = {lvl: 0.0 for lvl in BOOK_DEPTH_FEATURE_LEVELS}
+        self.prev_cum_ask_by_level: Dict[int, float] = {lvl: 0.0 for lvl in BOOK_DEPTH_FEATURE_LEVELS}
 
         # Guard against sub-interval jitter when targeting ~100ms OB cadence
         self.ob_jitter_guard_ms: int = 100
@@ -1796,29 +1801,46 @@ class FeatureEngine:
         }
         self._record_replenishment(ts_ms, replen_deltas)
 
-        cum_bid1 = self._cum_depth(self.bid_lvls, 1)
-        cum_ask1 = self._cum_depth(self.ask_lvls, 1)
-        cum_bid3 = self._cum_depth(self.bid_lvls, 3)
-        cum_ask3 = self._cum_depth(self.ask_lvls, 3)
-        cum_bid5 = self._cum_depth(self.bid_lvls, 5)
-        cum_ask5 = self._cum_depth(self.ask_lvls, 5)
-        cum_bid10 = self._cum_depth(self.bid_lvls, 10)
-        cum_ask10 = self._cum_depth(self.ask_lvls, 10)
+        cum_bid_by_level = {lvl: self._cum_depth(self.bid_lvls, lvl) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
+        cum_ask_by_level = {lvl: self._cum_depth(self.ask_lvls, lvl) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
+        cum_bid1 = cum_bid_by_level[1]
+        cum_ask1 = cum_ask_by_level[1]
+        cum_bid3 = cum_bid_by_level[3]
+        cum_ask3 = cum_ask_by_level[3]
+        cum_bid5 = cum_bid_by_level[5]
+        cum_ask5 = cum_ask_by_level[5]
+        cum_bid10 = cum_bid_by_level[10]
+        cum_ask10 = cum_ask_by_level[10]
 
         if etype == 'ob':
             self._append_ob_snapshot(ts_ms, bid1, ask1, bsz1, asz1, spread, cum_bid3, cum_ask3, cum_bid5, cum_ask5)
 
-        ofi_l1 = (bsz1 - prev_bid_l1) - (asz1 - prev_ask_l1)
-        ofi_l3 = (cum_bid3 - self.prev_cum_bid3) - (cum_ask3 - self.prev_cum_ask3)
-        ofi_l5 = (cum_bid5 - self.prev_cum_bid5) - (cum_ask5 - self.prev_cum_ask5)
+        obi_by_level = {
+            lvl: (cum_bid_by_level[lvl] - cum_ask_by_level[lvl]) / max(cum_bid_by_level[lvl] + cum_ask_by_level[lvl], 1e-12)
+            for lvl in BOOK_DEPTH_FEATURE_LEVELS
+        }
+
+        ofi_by_level: Dict[int, float] = {}
+        ofi_by_level[1] = (bsz1 - prev_bid_l1) - (asz1 - prev_ask_l1)
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            if lvl == 1:
+                continue
+            ofi_by_level[lvl] = (
+                (cum_bid_by_level[lvl] - self.prev_cum_bid_by_level[lvl])
+                - (cum_ask_by_level[lvl] - self.prev_cum_ask_by_level[lvl])
+            )
+        ofi_l1 = ofi_by_level[1]
+        ofi_l3 = ofi_by_level[3]
+        ofi_l5 = ofi_by_level[5]
         self.prev_bsz, self.prev_asz = bsz1, asz1
         self.prev_bsz2, self.prev_asz2 = bsz2, asz2
-        self.prev_cum_bid3, self.prev_cum_ask3 = cum_bid3, cum_ask3
-        self.prev_cum_bid5, self.prev_cum_ask5 = cum_bid5, cum_ask5
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            self.prev_cum_bid_by_level[lvl] = cum_bid_by_level[lvl]
+            self.prev_cum_ask_by_level[lvl] = cum_ask_by_level[lvl]
 
-        obi_l1 = (bsz1 - asz1) / max(bsz1 + asz1, 1e-12)
-        obi_l3 = (cum_bid3 - cum_ask3) / max(cum_bid3 + cum_ask3, 1e-12)
-        obi_l5 = (cum_bid5 - cum_ask5) / max(cum_bid5 + cum_ask5, 1e-12)
+        obi_l1 = obi_by_level[1]
+        obi_l3 = obi_by_level[3]
+        obi_l5 = obi_by_level[5]
 
         micro_premia = (micro - mid) / max(spread, 1e-9)
         smart_premia = (smart - mid) / max(spread, 1e-9)
@@ -1943,11 +1965,20 @@ class FeatureEngine:
         # 9) RSI; 10) MACD; 11) CCI; 12) VPIN.
         feat_list = [
             bid1, ask1, mid, micro, smart, spread_bps, gap_a_bps, gap_b_bps,
-            bsz1, asz1, cum_bid5, cum_ask5, cum_bid10, cum_ask10, slope_a, slope_b,
-            obi_l1, obi_l3, obi_l5, ofi_l1, ofi_l3, ofi_l5, micro_premia, smart_premia,
+            bsz1, asz1,
+        ]
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            feat_list.extend([cum_bid_by_level[lvl], cum_ask_by_level[lvl]])
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            feat_list.append(obi_by_level[lvl])
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            feat_list.append(ofi_by_level[lvl])
+        feat_list.extend([
+            slope_a, slope_b,
+            micro_premia, smart_premia,
             dt_since_trade, dt_since_bid1_update, dt_since_ask1_update,
             float(self.last_tick_sign), float(self.last_is_zero_tick), float(self.last_is_rpi),
-        ]
+        ])
 
         for ms in FAST_WINDOWS_MS:
             feat_list.extend([
