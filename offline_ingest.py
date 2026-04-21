@@ -1928,6 +1928,38 @@ def _select_pca_components(sample_rows: np.ndarray, target_var: float) -> int:
     return k
 
 
+def _weekday_only_week_pair(week_pair: WeekPair) -> WeekPair:
+    wk, ob_paths, th_paths = week_pair
+    ob_weekday: List[str] = []
+    th_weekday: List[str] = []
+
+    for idx, ob_path in enumerate(ob_paths):
+        ob_name = Path(ob_path).name
+        m_ob = OB_DAILY_RE.match(ob_name)
+        if not m_ob:
+            raise ValueError(f"Unable to parse OB day from path for PCA weekday filter: {ob_path}")
+        day = _parse_ymd_date(m_ob.group("d"))
+        if day.weekday() >= 5:
+            continue
+        ob_weekday.append(ob_path)
+        if th_paths:
+            if idx >= len(th_paths):
+                raise ValueError(
+                    "OB/TH day alignment mismatch while building weekday-only PCA subset "
+                    f"for week '{wk}': ob_days={len(ob_paths)} th_days={len(th_paths)}"
+                )
+            th_weekday.append(th_paths[idx])
+
+    return wk, ob_weekday, th_weekday
+
+
+def _count_stream_core_feature_rows(pairs: List[WeekPair]) -> int:
+    rows = 0
+    for _feat in _stream_core_features(pairs):
+        rows += 1
+    return rows
+
+
 def maybe_fit_pca_model(
     pairs: List[WeekPair],
     out_root: str,
@@ -1992,78 +2024,52 @@ def maybe_fit_pca_model(
     sample_limit = max(1, int(sample_limit))
     batch_size = int(batch_size)
 
+    wk, _ob_paths, _th_paths = train_pairs[0]
+    train_weekday_pair = _weekday_only_week_pair(train_pairs[0])
+    weekday_pairs = [train_weekday_pair]
+
+    total_rows = _count_stream_core_feature_rows(weekday_pairs)
+    if total_rows <= 0:
+        print(f"[pca  ] No weekday PCA rows available in week '{wk}'; skipping PCA fit")
+        return meta
+
+    block_size = min(sample_limit, total_rows)
+    start_idx = max(0, (total_rows - block_size) // 2)
+
     sample_rows: List[np.ndarray] = []
-    sample_array: Optional[np.ndarray] = None
-    pad_rows: Optional[np.ndarray] = None
-    ipca = None
-    fitted_rows = 0
-    total_rows = 0
-    pending: List[np.ndarray] = []
-    n_components = 0
-
-    def flush_pending(force: bool = False):
-        nonlocal pending, fitted_rows, batches, last_log
-        if ipca is None or not pending:
-            return
-        need = max(1, ipca.n_components)
-        thresh = max(need, batch_size) if batch_size > 0 else need
-        if not force and len(pending) < thresh:
-            return
-        arr = np.asarray(pending, dtype=np.float32)
-        actual_rows = arr.shape[0]
-        if actual_rows < need:
-            source = pad_rows if pad_rows is not None and pad_rows.size else sample_array
-            if source is not None and source.shape[0] >= need:
-                pad_needed = need - actual_rows
-                arr = np.vstack([arr, source[:pad_needed]])
-        ipca.partial_fit(arr)
-        fitted_rows += actual_rows
-        batches += 1
-        if time.monotonic() - last_log >= 300:
-            print(f"[pca-fit] fitted={fitted_rows} batches={batches}", flush=True)
-            last_log = time.monotonic()
-        pending = []
-
-    def ensure_ipca(force: bool = False):
-        nonlocal ipca, sample_array, pad_rows, n_components, fitted_rows, last_log
-        if ipca is not None:
-            return
-        if not sample_rows:
-            return
-        if not force and len(sample_rows) < sample_limit:
-            return
-        sample_array = np.asarray(sample_rows, dtype=np.float32)
-        n_components = _select_pca_components(sample_array, target_var)
-        if n_components <= 0:
-            return
-        ipca = IncrementalPCA(
-            n_components=n_components,
-            batch_size=None if batch_size <= 0 else max(batch_size, n_components),
-        )
-        ipca.partial_fit(sample_array)
-        print(f"[pca-init] n_components={n_components} sample_rows={sample_array.shape[0]}", flush=True)
-        last_log = time.monotonic()
-        fitted_rows += sample_array.shape[0]
-        pad_rows = sample_array[:n_components].copy()
-        sample_rows.clear()
-
-    for feat in _stream_core_features(train_pairs):
-        total_rows += 1
-        vec = np.asarray(feat, dtype=np.float32)
-        if ipca is None:
-            sample_rows.append(vec)
-            ensure_ipca()
+    end_idx = start_idx + block_size
+    for idx, feat in enumerate(_stream_core_features(weekday_pairs)):
+        if idx < start_idx:
             continue
-        pending.append(vec)
-        flush_pending()
+        if idx >= end_idx:
+            break
+        sample_rows.append(np.asarray(feat, dtype=np.float32))
 
-    ensure_ipca(force=True)
+    if not sample_rows:
+        print("[pca  ] Unable to collect PCA sample rows; skipping")
+        return meta
 
-    if ipca is None:
+    sample_array = np.asarray(sample_rows, dtype=np.float32)
+    n_components = _select_pca_components(sample_array, target_var)
+    if n_components <= 0:
         print("[pca  ] Unable to initialise PCA (insufficient data); skipping")
         return meta
 
-    flush_pending(force=True)
+    ipca = IncrementalPCA(
+        n_components=n_components,
+        batch_size=None if batch_size <= 0 else max(batch_size, n_components),
+    )
+    ipca.partial_fit(sample_array)
+    batches += 1
+    fitted_rows = int(sample_array.shape[0])
+    if time.monotonic() - last_log >= 300:
+        print(f"[pca-fit] fitted={fitted_rows} batches={batches}", flush=True)
+        last_log = time.monotonic()
+    print(
+        f"[pca-init] n_components={n_components} sample_rows={sample_array.shape[0]} "
+        f"start_idx={start_idx} total_weekday_rows={total_rows}",
+        flush=True,
+    )
 
     model_path = os.path.join(out_root, model_filename)
     ensure_dir(os.path.dirname(model_path))
@@ -2080,7 +2086,7 @@ def maybe_fit_pca_model(
             "k": int(ipca.n_components),
             "model_path": model_filename,
             "rows_fitted": int(fitted_rows),
-            "rows_total": int(total_rows),
+            "rows_total": int(block_size),
             "sample_rows": int(sample_array.shape[0] if sample_array is not None else 0),
         }
     )
