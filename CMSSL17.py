@@ -474,18 +474,17 @@ HORIZONS_MS     = [7_500, 15_000, 30_000]
 NUM_HORIZONS    = len(HORIZONS_MS)
 HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
-FEE_HURDLE_BPS = 3.7  # main 30s trading fee hurdle / reference trading fee
-HORIZON_TARGET_HURDLES_BPS = [0.0, 0.0, 3.7]  # supervised target hurdles per horizon
-ABS_TRIM_TAIL_FRACTION = 0.02
-TARGET_TRANSFORM = "signed_sqrt_excess_bps"
-TARGET_TASK = "horizon_specific_signed_excess_targets_from_raw_bps_labels"
-CHECKPOINT_SCHEMA = "cmssl17-signed-excess-v1"
+LOW_ABS_TRIM_FRACTION = 0.02
+HIGH_ABS_TRIM_FRACTION = 0.02
+TARGET_TRANSFORM = "signed_sqrt_raw_bps"
+TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
+CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v1"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "spearman_active_30000ms"
+PRIMARY_METRIC = "spearman_kept_q50plus_30000ms"
 PRIMARY_METRIC_HORIZON_MS = 30_000
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
@@ -857,7 +856,7 @@ class SAMBA(nn.Module):
         # Heads
         fused_dim = args.d_model * 2
         head_hidden_dim = fused_dim * 2
-        self.excess_head = nn.Sequential(
+        self.return_head = nn.Sequential(
             nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
@@ -869,9 +868,9 @@ class SAMBA(nn.Module):
         h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
 
         pooled, _, _ = self.mamba(h_tokens, embedded=True)
-        pred_excess = self.excess_head(pooled)
+        pred_return = self.return_head(pooled)
 
-        return pred_excess
+        return pred_return
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
@@ -2395,7 +2394,7 @@ def compute_primary_metric(metric_payload: Dict[str, Any]) -> Tuple[float, str]:
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
         )
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    vals = metric_payload.get("spearman_active", [])
+    vals = metric_payload.get("spearman_kept_q50plus", [])
     if idx >= len(vals):
         return float("nan"), PRIMARY_METRIC
     return float(vals[idx]), PRIMARY_METRIC
