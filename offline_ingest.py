@@ -1951,9 +1951,6 @@ def maybe_fit_pca_model(
         "k": 0,
         "model_path": None,
     }
-    last_log = time.monotonic()
-    batches = 0
-
     if target_var <= 0.0:
         return meta
 
@@ -1988,82 +1985,64 @@ def maybe_fit_pca_model(
     if not train_pairs:
         print("[pca  ] No training weeks available; skipping PCA fit")
         return meta
+    if len(train_pairs) != 1:
+        print(f"[pca  ] Expected exactly one training week for PCA sampling; got {len(train_pairs)}. Skipping PCA fit")
+        return meta
 
     sample_limit = max(1, int(sample_limit))
-    batch_size = int(batch_size)
-
-    sample_rows: List[np.ndarray] = []
-    sample_array: Optional[np.ndarray] = None
-    pad_rows: Optional[np.ndarray] = None
-    ipca = None
-    fitted_rows = 0
-    total_rows = 0
-    pending: List[np.ndarray] = []
-    n_components = 0
-
-    def flush_pending(force: bool = False):
-        nonlocal pending, fitted_rows, batches, last_log
-        if ipca is None or not pending:
-            return
-        need = max(1, ipca.n_components)
-        thresh = max(need, batch_size) if batch_size > 0 else need
-        if not force and len(pending) < thresh:
-            return
-        arr = np.asarray(pending, dtype=np.float32)
-        actual_rows = arr.shape[0]
-        if actual_rows < need:
-            source = pad_rows if pad_rows is not None and pad_rows.size else sample_array
-            if source is not None and source.shape[0] >= need:
-                pad_needed = need - actual_rows
-                arr = np.vstack([arr, source[:pad_needed]])
-        ipca.partial_fit(arr)
-        fitted_rows += actual_rows
-        batches += 1
-        if time.monotonic() - last_log >= 300:
-            print(f"[pca-fit] fitted={fitted_rows} batches={batches}", flush=True)
-            last_log = time.monotonic()
-        pending = []
-
-    def ensure_ipca(force: bool = False):
-        nonlocal ipca, sample_array, pad_rows, n_components, fitted_rows, last_log
-        if ipca is not None:
-            return
-        if not sample_rows:
-            return
-        if not force and len(sample_rows) < sample_limit:
-            return
-        sample_array = np.asarray(sample_rows, dtype=np.float32)
-        n_components = _select_pca_components(sample_array, target_var)
-        if n_components <= 0:
-            return
-        ipca = IncrementalPCA(
-            n_components=n_components,
-            batch_size=None if batch_size <= 0 else max(batch_size, n_components),
-        )
-        ipca.partial_fit(sample_array)
-        print(f"[pca-init] n_components={n_components} sample_rows={sample_array.shape[0]}", flush=True)
-        last_log = time.monotonic()
-        fitted_rows += sample_array.shape[0]
-        pad_rows = sample_array[:n_components].copy()
-        sample_rows.clear()
-
-    for feat in _stream_core_features(train_pairs):
-        total_rows += 1
-        vec = np.asarray(feat, dtype=np.float32)
-        if ipca is None:
-            sample_rows.append(vec)
-            ensure_ipca()
+    week_key, week_ob_paths, week_th_paths = train_pairs[0]
+    weekday_days: List[Tuple[date, str, str]] = []
+    for idx, ob_path in enumerate(week_ob_paths):
+        ob_name = os.path.basename(ob_path)
+        ob_match = OB_DAILY_RE.match(ob_name)
+        if not ob_match:
             continue
-        pending.append(vec)
-        flush_pending()
+        day = _parse_ymd_date(ob_match.group("d"))
+        if day.weekday() >= 5:
+            continue
+        th_path = week_th_paths[idx] if idx < len(week_th_paths) else ""
+        weekday_days.append((day, ob_path, th_path))
 
-    ensure_ipca(force=True)
+    weekday_count = len(weekday_days)
+    if weekday_count <= 0:
+        print(f"[pca  ] No weekday files found in training week '{week_key}'; skipping PCA fit")
+        return meta
 
-    if ipca is None:
+    per_day_limit = max(1, (sample_limit + weekday_count - 1) // weekday_count)
+    sample_rows: List[np.ndarray] = []
+    for day, ob_path, th_path in weekday_days:
+        day_pair: WeekPair = (week_key, [ob_path], [th_path] if week_th_paths else [])
+        day_rows = 0
+        for feat in _stream_core_features([day_pair]):
+            sample_rows.append(np.asarray(feat, dtype=np.float32))
+            day_rows += 1
+            if day_rows >= per_day_limit:
+                break
+
+    if len(sample_rows) > sample_limit:
+        sample_rows = sample_rows[:sample_limit]
+
+    if not sample_rows:
         print("[pca  ] Unable to initialise PCA (insufficient data); skipping")
         return meta
 
-    flush_pending(force=True)
+    sample_array = np.asarray(sample_rows, dtype=np.float32)
+    n_components = _select_pca_components(sample_array, target_var)
+    if n_components <= 0:
+        print("[pca  ] Unable to initialise PCA (insufficient data); skipping")
+        return meta
+    ipca = IncrementalPCA(
+        n_components=n_components,
+        batch_size=None if batch_size <= 0 else max(int(batch_size), n_components),
+    )
+    ipca.partial_fit(sample_array)
+
+    weekday_labels = [d.isoformat() for (d, _ob, _th) in weekday_days]
+    print(
+        f"[pca-sample] week={week_key} weekdays={weekday_labels} "
+        f"per_day_limit={per_day_limit} sample_rows={sample_array.shape[0]}",
+        flush=True,
+    )
 
     model_path = os.path.join(out_root, model_filename)
     ensure_dir(os.path.dirname(model_path))
@@ -2079,15 +2058,15 @@ def maybe_fit_pca_model(
             "applied": True,
             "k": int(ipca.n_components),
             "model_path": model_filename,
-            "rows_fitted": int(fitted_rows),
-            "rows_total": int(total_rows),
-            "sample_rows": int(sample_array.shape[0] if sample_array is not None else 0),
+            "rows_fitted": int(sample_array.shape[0]),
+            "rows_total": int(sample_array.shape[0]),
+            "sample_rows": int(sample_array.shape[0]),
         }
     )
 
     print(
         f"[pca  ] applied target={target_var:.4f} k={meta['k']} "
-        f"sample={meta.get('sample_rows', 0)} fitted={meta.get('rows_fitted', 0)}"
+        f"sample={meta.get('sample_rows', 0)}"
     )
 
     return meta
