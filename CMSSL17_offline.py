@@ -473,14 +473,12 @@ def build_abs_trim_mask(y_raw_bps: np.ndarray, abs_lo_raw_bps: np.ndarray, abs_h
 
 
 def build_raw_loss_weights(y_raw_bps: np.ndarray, kept_q50_abs_raw_bps: np.ndarray, kept_q85_abs_raw_bps: np.ndarray) -> np.ndarray:
-    w = np.ones_like(y_raw_bps, dtype=np.float32)
     abs_raw = np.abs(y_raw_bps)
     q50 = kept_q50_abs_raw_bps.reshape(1, -1)
     q85 = kept_q85_abs_raw_bps.reshape(1, -1)
-    w[abs_raw < q50] = 0.50
-    w[(abs_raw >= q50) & (abs_raw <= q85)] = 1.00
-    w[abs_raw > q85] = 1.25
-    return w
+    tau = np.maximum(0.10 * (q85 - q50), 0.05)
+    w = 0.50 + 0.50 * (1.0 / (1.0 + np.exp(-(abs_raw - q50) / tau))) + 0.25 * (1.0 / (1.0 + np.exp(-(abs_raw - q85) / tau)))
+    return np.clip(w, 0.50, 1.25).astype(np.float32, copy=False)
 
 
 def compute_signed_raw_stats(y_train: np.ndarray) -> Dict[str, np.ndarray]:
@@ -517,7 +515,7 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
-    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task')
+    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','spearman_ranking_schema')
     return all(cached_meta.get(k)==current_meta.get(k) for k in keys)
 
 
@@ -531,12 +529,27 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float:
     return float((x0*y0).sum()/den)
 
 
+def _average_ranks(x: np.ndarray) -> np.ndarray:
+    order = np.argsort(x, kind='mergesort')
+    xs = x[order]
+    ranks = np.empty(x.shape[0], dtype=np.float64)
+    i = 0
+    while i < xs.size:
+        j = i + 1
+        while j < xs.size and xs[j] == xs[i]:
+            j += 1
+        avg_rank = 0.5 * (i + j - 1)
+        ranks[order[i:j]] = avg_rank
+        i = j
+    return ranks
+
+
 def _spearman(x: np.ndarray, y: np.ndarray) -> float:
-    if x.size < 2:
+    if x.size < 2 or y.size < 2:
         return float('nan')
-    rx = np.argsort(np.argsort(x))
-    ry = np.argsort(np.argsort(y))
-    return _pearson(rx.astype(np.float64), ry.astype(np.float64))
+    rx = _average_ranks(x.astype(np.float64, copy=False))
+    ry = _average_ranks(y.astype(np.float64, copy=False))
+    return _pearson(rx, ry)
 
 
 def inverse_signed_sqrt_transform_to_bps(z: np.ndarray) -> np.ndarray:
@@ -571,6 +584,8 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
         'true_pos_kept_frac':[], 'true_neg_kept_frac':[],
         'pred_zero_frac_1p0bps':[], 'pred_pos_frac_1p0bps':[], 'pred_neg_frac_1p0bps':[],
         'balanced_sign_acc_kept_q50plus':[],
+        'true_mean_bps_all':[], 'pred_mean_bps_all':[], 'true_std_bps_all':[], 'pred_std_bps_all':[],
+        'true_mean_bps_kept':[], 'pred_mean_bps_kept':[], 'true_std_bps_kept':[], 'pred_std_bps_kept':[],
         'bin_frac':[], 'bin_sign_acc':[], 'bin_pred_abs_p90_bps':[], 'bin_spearman':[],
     }
     for h in range(NUM_HORIZONS):
@@ -580,6 +595,10 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
 
         out['kept_fraction'].append(float(kh.mean()))
         out['raw_q50plus_fraction_true'].append(float(q50plus.mean()))
+        out['true_mean_bps_all'].append(float(np.mean(raw)))
+        out['pred_mean_bps_all'].append(float(np.mean(ph_raw)))
+        out['true_std_bps_all'].append(float(np.std(raw, ddof=0)))
+        out['pred_std_bps_all'].append(float(np.std(ph_raw, ddof=0)))
         if kh.any():
             d=np.abs(ph[kh]-yh[kh]); hub=np.where(d<=1.0,0.5*d*d,d-0.5)
             out['huber_kept'].append(float(hub.mean())); out['mae_kept_transformed'].append(float(d.mean()))
@@ -598,6 +617,10 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
             out['pred_zero_frac_1p0bps'].append(float((np.abs(pred_k) < 1.0).mean()))
             out['pred_pos_frac_1p0bps'].append(float((pred_k >= 1.0).mean()))
             out['pred_neg_frac_1p0bps'].append(float((pred_k <= -1.0).mean()))
+            out['true_mean_bps_kept'].append(float(np.mean(raw_k)))
+            out['pred_mean_bps_kept'].append(float(np.mean(pred_k)))
+            out['true_std_bps_kept'].append(float(np.std(raw_k, ddof=0)))
+            out['pred_std_bps_kept'].append(float(np.std(pred_k, ddof=0)))
             kept_abs = np.abs(raw_k)
             bin_masks=[kept_abs < q50, (kept_abs >= q50) & (kept_abs <= q85), kept_abs > q85]
             n_k=float(raw_k.size)
@@ -623,6 +646,8 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
             out['pred_near_zero_frac_0p5bps'].append(float('nan')); out['pred_near_zero_frac_1p0bps'].append(float('nan'))
             out['true_pos_kept_frac'].append(float('nan')); out['true_neg_kept_frac'].append(float('nan'))
             out['pred_zero_frac_1p0bps'].append(float('nan')); out['pred_pos_frac_1p0bps'].append(float('nan')); out['pred_neg_frac_1p0bps'].append(float('nan'))
+            out['true_mean_bps_kept'].append(float('nan')); out['pred_mean_bps_kept'].append(float('nan'))
+            out['true_std_bps_kept'].append(float('nan')); out['pred_std_bps_kept'].append(float('nan'))
             out['bin_frac'].append([float('nan')]*3); out['bin_sign_acc'].append([float('nan')]*3); out['bin_pred_abs_p90_bps'].append([float('nan')]*3); out['bin_spearman'].append([float('nan')]*3)
 
         out['pearson_all'].append(_pearson(ph,yh)); out['spearman_all'].append(_spearman(ph,yh))
@@ -695,7 +720,9 @@ def train_from_offline():
         'horizons_ms':[int(h) for h in HORIZONS_MS], 'train_week_keys': list(cmssl_train['weeks']),
         'train_ts_start': int(tr_start), 'train_ts_end': int(tr_end), 'decision_time_basis': EXPECTED_DECISION_TIME_BASIS,
         'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
-        'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK
+        'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK,
+        'loss_weighting_schema': 'smooth_two_sigmoid_q50_q85_v1',
+        'spearman_ranking_schema': 'tie_aware_average_ranks_v1'
     }
     cached=load_stats_cache(cache_path); stats=None
     if cached and cache_matches(cached[1], cache_meta): stats=cached[0]
@@ -737,10 +764,9 @@ def train_from_offline():
                     z=pred.sum()*0.0
                     return z,z,z
                 abs_raw=torch.abs(y_raw)
-                w=torch.ones_like(y_raw)
-                w = torch.where(abs_raw < q50_t, torch.full_like(w, 0.50), w)
-                w = torch.where((abs_raw >= q50_t) & (abs_raw <= q85_t), torch.ones_like(w), w)
-                w = torch.where(abs_raw > q85_t, torch.full_like(w, 1.25), w)
+                tau_t=torch.clamp(0.10 * (q85_t - q50_t), min=0.05)
+                w=0.50 + 0.50 * torch.sigmoid((abs_raw - q50_t) / tau_t) + 0.25 * torch.sigmoid((abs_raw - q85_t) / tau_t)
+                w=torch.clamp(w, 0.50, 1.25)
                 d=F.huber_loss(pred, y_t, delta=1.0, reduction='none')
                 wm=(w*keep.float()*hwt)
                 hub=(d*wm).sum()/wm.sum().clamp_min(1e-9)
@@ -777,6 +803,8 @@ def train_from_offline():
             print(f"[val_zero] pred_abs_p50_bps={full['pred_raw_abs_p50_bps']} pred_abs_p90_bps={full['pred_raw_abs_p90_bps']} near_zero_0p5={full['pred_near_zero_frac_0p5bps']} near_zero_1p0={full['pred_near_zero_frac_1p0bps']}")
             print(f"[val_cls] true_pos={full['true_pos_kept_frac']} true_neg={full['true_neg_kept_frac']} pred_zero={full['pred_zero_frac_1p0bps']} pred_pos={full['pred_pos_frac_1p0bps']} pred_neg={full['pred_neg_frac_1p0bps']} bal_sign_acc={full['balanced_sign_acc_kept_q50plus']} pred_mag_sign_acc={full['sign_acc_pred_mag_ge_1p0bps']}")
             print(f"[val_bins] frac={full['bin_frac']} sign_acc={full['bin_sign_acc']} pred_abs_p90_bps={full['bin_pred_abs_p90_bps']} spearman={full['bin_spearman']}")
+            print(f"[val_mean] true_mean_bps_all={full['true_mean_bps_all']} pred_mean_bps_all={full['pred_mean_bps_all']} true_mean_bps_kept={full['true_mean_bps_kept']} pred_mean_bps_kept={full['pred_mean_bps_kept']}")
+            print(f"[val_std] true_std_bps_all={full['true_std_bps_all']} pred_std_bps_all={full['pred_std_bps_all']} true_std_bps_kept={full['true_std_bps_kept']} pred_std_bps_kept={full['pred_std_bps_kept']}")
             ckpt={
                 'epoch': epoch,
                 'state_dict': get_model_state_dict_for_ckpt(model),
@@ -806,6 +834,8 @@ def train_from_offline():
     print(f"[test_zero] pred_abs_p50_bps={test['pred_raw_abs_p50_bps']} pred_abs_p90_bps={test['pred_raw_abs_p90_bps']} near_zero_0p5={test['pred_near_zero_frac_0p5bps']} near_zero_1p0={test['pred_near_zero_frac_1p0bps']}")
     print(f"[test_cls] true_pos={test['true_pos_kept_frac']} true_neg={test['true_neg_kept_frac']} pred_zero={test['pred_zero_frac_1p0bps']} pred_pos={test['pred_pos_frac_1p0bps']} pred_neg={test['pred_neg_frac_1p0bps']} bal_sign_acc={test['balanced_sign_acc_kept_q50plus']} pred_mag_sign_acc={test['sign_acc_pred_mag_ge_1p0bps']}")
     print(f"[test_bins] frac={test['bin_frac']} sign_acc={test['bin_sign_acc']} pred_abs_p90_bps={test['bin_pred_abs_p90_bps']} spearman={test['bin_spearman']}")
+    print(f"[test_mean] true_mean_bps_all={test['true_mean_bps_all']} pred_mean_bps_all={test['pred_mean_bps_all']} true_mean_bps_kept={test['true_mean_bps_kept']} pred_mean_bps_kept={test['pred_mean_bps_kept']}")
+    print(f"[test_std] true_std_bps_all={test['true_std_bps_all']} pred_std_bps_all={test['pred_std_bps_all']} true_std_bps_kept={test['true_std_bps_kept']} pred_std_bps_kept={test['pred_std_bps_kept']}")
     print('[done] Training complete.')
 
 
