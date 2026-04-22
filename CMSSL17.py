@@ -1,6 +1,6 @@
 import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time
 from collections import deque
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
 import numpy as np
 import torch
@@ -2330,9 +2330,10 @@ class LabelBuilder:
         # entries are (t_ready, t_delta, mid_entry)
         self.wait_mature: Deque[Tuple[int, int, float]] = deque()
 
-        # Maintain recent midprice history as parallel deques (timestamp, mid)
-        self.price_ts: Deque[int] = deque()
-        self.price_mid: Deque[float] = deque()
+        # Maintain recent midprice history as parallel arrays (timestamp, mid)
+        self.price_ts: List[int] = []
+        self.price_mid: List[float] = []
+        self.price_start_idx = 0
         self.history_span = self.max_h + self.delta + 1000
 
         self.last_ts = -10**15
@@ -2393,20 +2394,28 @@ class LabelBuilder:
     def _record_price(self, t: int, m: float):
         self._push_price(t, m)
         cutoff = t - self.history_span
-        while len(self.price_ts) > 1 and self.price_ts[0] < cutoff:
-            self.price_ts.popleft()
-            self.price_mid.popleft()
+        new_start = bisect_left(self.price_ts, cutoff, lo=self.price_start_idx)
+        if new_start >= len(self.price_ts):
+            new_start = max(0, len(self.price_ts) - 1)
+        self.price_start_idx = new_start
+
+        if self.price_start_idx >= 4096 or self.price_start_idx >= len(self.price_ts) // 2:
+            self.price_ts = self.price_ts[self.price_start_idx:]
+            self.price_mid = self.price_mid[self.price_start_idx:]
+            self.price_start_idx = 0
 
     def _price_at(self, t_query: int) -> float:
         if not self.price_ts:
             return self.last_mid if self.last_mid is not None else 0.0
 
-        for ts, mid in zip(reversed(self.price_ts), reversed(self.price_mid)):
-            if ts <= t_query:
-                return mid
+        start = self.price_start_idx
+        if t_query < self.price_ts[start]:
+            return self.price_mid[start]
 
-        # If query precedes the oldest stored timestamp, fall back to the earliest mid
-        return self.price_mid[0]
+        idx = bisect_right(self.price_ts, t_query, lo=start) - 1
+        if idx < start:
+            return self.price_mid[start]
+        return self.price_mid[idx]
 
 
 class HFTDataset(Dataset):
