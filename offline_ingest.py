@@ -1230,28 +1230,29 @@ class WeekWriterRouter:
             raise RuntimeError("Asynchronous chunk writer failed") from self.writer_exception
 
     def _writer_loop(self) -> None:
-        try:
-            while True:
-                job = self.flush_queue.get()
-                try:
-                    if job is _SENTINEL_FLUSH_JOB:
-                        return
-                    _persist_flush_job(job)
-                finally:
-                    self.flush_queue.task_done()
-        except BaseException as exc:
-            with self._writer_exception_lock:
-                if self.writer_exception is None:
-                    self.writer_exception = exc
-            while True:
-                try:
-                    pending = self.flush_queue.get_nowait()
-                except queue.Empty:
-                    break
-                else:
-                    self.flush_queue.task_done()
-                    if pending is _SENTINEL_FLUSH_JOB:
-                        break
+        while True:
+            # If another worker already failed, exit promptly.
+            if self.writer_exception is not None:
+                return
+
+            try:
+                job = self.flush_queue.get(timeout=0.5)
+            except queue.Empty:
+                # Periodically wake up so we can observe writer_exception
+                # instead of blocking forever on get().
+                continue
+
+            try:
+                if job is _SENTINEL_FLUSH_JOB:
+                    return
+                _persist_flush_job(job)
+            except BaseException as exc:
+                with self._writer_exception_lock:
+                    if self.writer_exception is None:
+                        self.writer_exception = exc
+                return
+            finally:
+                self.flush_queue.task_done()
 
     def _enqueue_flush_job(self, job: FlushJob) -> None:
         self.next_chunk_id[job.week_key] = max(
