@@ -3,9 +3,9 @@
 """
 CMSSL17_offline.py
 
-Run CMSSL17's model *using prebuilt tokens* produced by offline_ingest.py.
+Run CMSSL17's model using flat decision rows produced by offline_ingest.py.
 This mirrors the training/eval flow in CMSSL17.py but reads dataset splits
-from OUT_ROOT/meta.json and week meta files, avoiding any online feature building.
+from OUT_ROOT/meta.json and week meta files, with dynamic sequence slicing at load time.
 """
 
 import os, sys, math, json
