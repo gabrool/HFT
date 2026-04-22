@@ -1030,6 +1030,32 @@ class RollingZScore:
         return (x - mean) / std
 
 
+class RollingWindowStats:
+    def __init__(self, window_ms: int):
+        self.window_ms = int(window_ms)
+        self.deq: Deque[Tuple[int, float]] = deque()
+        self.sum: float = 0.0
+        self.sumsq: float = 0.0
+
+    def add(self, ts_ms: int, val: float) -> None:
+        v = float(val)
+        self.deq.append((int(ts_ms), v))
+        self.sum += v
+        self.sumsq += v * v
+        while self.deq and (ts_ms - self.deq[0][0] > self.window_ms):
+            _, old = self.deq.popleft()
+            self.sum -= old
+            self.sumsq -= old * old
+
+    def mean_var(self) -> Tuple[float, float]:
+        n = len(self.deq)
+        if n <= 1:
+            return 0.0, 0.0
+        mean = self.sum / n
+        var = (self.sumsq - (self.sum * self.sum) / n) / (n - 1)
+        return mean, max(0.0, var)
+
+
 # -------------------------  Feature engine  -------------------------
 class FeatureEngine:
 
@@ -1092,8 +1118,8 @@ class FeatureEngine:
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute dispersion and variance-ratio ladders.
         self.return_windows_ms: Tuple[int, ...] = FLOW_WINDOWS_MS
-        self.return_histories: Dict[int, Deque[Tuple[int, float]]] = {
-            ms: deque() for ms in self.return_windows_ms
+        self.return_histories: Dict[int, RollingWindowStats] = {
+            ms: RollingWindowStats(ms) for ms in self.return_windows_ms
         }
 
         self.regime_windows_ms: Tuple[int, ...] = REGIME_WINDOWS_MS
@@ -1101,7 +1127,9 @@ class FeatureEngine:
         self.realized_vol: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.volume_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.flow_regime: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
-        self._regime_return_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self.regime_windows_ms}
+        self._regime_return_deques: Dict[int, RollingWindowStats] = {
+            ms: RollingWindowStats(ms) for ms in self.regime_windows_ms
+        }
         self.last_mid_for_ret: Optional[float] = None
 
         # ---------- Spread ----------
@@ -1124,6 +1152,9 @@ class FeatureEngine:
         self.last_bid1 = None; self.last_ask1 = None
         self.sz_delta_deques: Dict[int, Deque[Tuple[int, float, float]]] = {
             ms: deque() for ms in self.bestlvl_windows
+        }
+        self.sz_delta_sums: Dict[int, Dict[str, float]] = {
+            ms: {"bid": 0.0, "ask": 0.0} for ms in self.bestlvl_windows
         }
 
         # ---------- Liquidity replenishment tracking (L1/L2) ----------
@@ -1893,23 +1924,32 @@ class FeatureEngine:
         self.last_bid1, self.last_ask1 = bid1, ask1
 
         for ms, deq in self.sz_delta_deques.items():
-            deq.append((ts_ms, min(bsz1 - prev_bid_l1, 0.0), min(asz1 - prev_ask_l1, 0.0)))
-            self._prune_deque_ms(deq, ts_ms, ms)
-        neg_depletion = {ms: (sum(x for _, x, _ in deq), sum(x for _, _, x in deq)) for ms, deq in self.sz_delta_deques.items()}
+            bid_dep = min(bsz1 - prev_bid_l1, 0.0)
+            ask_dep = min(asz1 - prev_ask_l1, 0.0)
+            deq.append((ts_ms, bid_dep, ask_dep))
+            sums = self.sz_delta_sums[ms]
+            sums["bid"] += bid_dep
+            sums["ask"] += ask_dep
+            while deq and (ts_ms - deq[0][0] > ms):
+                _, old_bid, old_ask = deq.popleft()
+                sums["bid"] -= old_bid
+                sums["ask"] -= old_ask
+        neg_depletion = {
+            ms: (self.sz_delta_sums[ms]["bid"], self.sz_delta_sums[ms]["ask"])
+            for ms in self.sz_delta_deques
+        }
 
         dt_since_trade = float(ts_ms - self.last_trade_ts) if self.last_trade_ts is not None else 0.0
         dt_since_bid1_update = float(ts_ms - self.last_bid1_update_ts) if self.last_bid1_update_ts is not None else 0.0
         dt_since_ask1_update = float(ts_ms - self.last_ask1_update_ts) if self.last_ask1_update_ts is not None else 0.0
 
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
-        return_std = {}
-        for ms, deq in self.return_histories.items():
-            _, var = self._stats_from_returns(deq)
-            return_std[ms] = math.sqrt(max(0.0, var))
+        return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
+        return_std = {ms: math.sqrt(var) for ms, var in return_var.items()}
         vr_adjacent = {}
         for prev_ms, cur_ms in zip(self.return_windows_ms[:-1], self.return_windows_ms[1:]):
-            _, var_prev = self._stats_from_returns(self.return_histories[prev_ms])
-            _, var_cur = self._stats_from_returns(self.return_histories[cur_ms])
+            var_prev = return_var[prev_ms]
+            var_cur = return_var[cur_ms]
             vr_adjacent[(cur_ms, prev_ms)] = (var_cur / max((cur_ms / prev_ms) * var_prev, 1e-12)) if var_prev > 0 else 0.0
 
         regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
@@ -2191,27 +2231,18 @@ class FeatureEngine:
         r = (1e4 * math.log(mid / self.last_mid_for_ret)) if self.last_mid_for_ret > 0 else 0.0
         self.last_mid_for_ret = mid
 
-        for ms, deq in self.return_histories.items():
-            self._append_tuple_with_guard(deq, (ts_ms, r), ts_ms, ms, is_ob_event)
+        for stats in self.return_histories.values():
+            stats.add(ts_ms, r)
 
         dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
         r2 = r * r
         for hl in self.regime_windows_ms:
             self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
 
-        for ms, deq in self._regime_return_deques.items():
-            self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in deq))
+        for ms, stats in self._regime_return_deques.items():
+            stats.add(ts_ms, r)
+            self.realized_vol[ms] = math.sqrt(max(0.0, stats.sumsq))
         return r
-
-    def _stats_from_returns(self, deq: Deque[Tuple[int, float]]) -> Tuple[float, float]:
-        """Return (mean, variance) of returns in a deque window."""
-        n = len(deq)
-        if n <= 1:
-            return 0.0, 0.0
-        vals = [x for _, x in deq]
-        m = float(sum(vals) / n)
-        var = float(sum((v - m) * (v - m) for v in vals) / (n - 1))
-        return m, var
 
     def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
         """Per-feature EWMA mean/var rolling z-score.
