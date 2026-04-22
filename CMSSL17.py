@@ -1,4 +1,5 @@
 import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time
+from pathlib import Path
 from collections import deque
 from bisect import bisect_left, bisect_right
 from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
@@ -2452,17 +2453,138 @@ class LabelBuilder:
         return self.price_mid[idx]
 
 
-class HFTDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = X.astype(np.float32)
-        self.y = y.astype(np.float32)
+class WeekFeatureStore:
+    def __init__(self, week_dir: Path, week_meta: Dict[str, Any], lookback: int):
+        self.week_dir = week_dir
+        self.week_meta = week_meta
+        self.lookback = int(lookback)
+        self.feature_dim_total = int(week_meta["feature_dim_total"])
+        self.feature_dim_core = int(week_meta["feature_dim_core"])
+        self.aux_dim = int(week_meta["aux_dim"])
+        self.feature_chunks = sorted(list(week_meta.get("feature_chunks", [])), key=lambda x: int(x["chunk"]))
+        self.row_starts = np.array([int(ch["row_start"]) for ch in self.feature_chunks], dtype=np.int64)
+        self.row_ends = np.array([int(ch["row_end"]) for ch in self.feature_chunks], dtype=np.int64)
+        self.features_mm = [np.load(self.week_dir / ch["files"]["features"], mmap_mode="r") for ch in self.feature_chunks]
+
+    def _locate_chunk(self, row_idx: int) -> int:
+        i = int(np.searchsorted(self.row_ends, int(row_idx), side="right"))
+        if i >= len(self.row_ends) or row_idx < int(self.row_starts[i]) or row_idx >= int(self.row_ends[i]):
+            raise IndexError(f"row_idx={row_idx} out of range for week store {self.week_dir}")
+        return i
+
+    def _read_row(self, row_idx: int) -> np.ndarray:
+        ci = self._locate_chunk(int(row_idx))
+        off = int(row_idx - int(self.row_starts[ci]))
+        return np.asarray(self.features_mm[ci][off], dtype=np.float32)
+
+    def read_window(self, row_idx: int, lookback: int) -> np.ndarray:
+        L = int(lookback)
+        end = int(row_idx)
+        start = max(0, end - L + 1)
+        n_real = end - start + 1
+        out = np.empty((L, self.feature_dim_total), dtype=np.float32)
+
+        pos = L - n_real
+        cur = start
+        while cur <= end:
+            ci = self._locate_chunk(cur)
+            chunk_start = int(self.row_starts[ci])
+            chunk_end = int(self.row_ends[ci])
+            take_end = min(end + 1, chunk_end)
+            local_l = cur - chunk_start
+            local_r = take_end - chunk_start
+            n = local_r - local_l
+            out[pos:pos+n] = np.asarray(self.features_mm[ci][local_l:local_r], dtype=np.float32)
+            pos += n
+            cur = take_end
+
+        if n_real < L:
+            earliest = out[L - n_real]
+            out[: L - n_real, : self.feature_dim_core] = earliest[: self.feature_dim_core]
+            out[: L - n_real, self.feature_dim_core :] = 0.0
+        return out
+
+
+class HFTFlatDataset(Dataset):
+    def __init__(self, dataset_root: str, weeks: List[str], decision_ts_start: Optional[int] = None, decision_ts_end: Optional[int] = None):
+        self.dataset_root = Path(dataset_root)
+        self.meta = json.loads((self.dataset_root / "meta.json").read_text())
+        self.lookback = int(self.meta["lookback"])
+        self.feature_dim_total = int(self.meta["feature_dim_total"])
+        self.weeks = list(weeks)
+
+        self.week_keys = list(self.weeks)
+        self.week_to_id = {wk: i for i, wk in enumerate(self.week_keys)}
+        self.stores: List[WeekFeatureStore] = []
+
+        week_meta_paths = self.meta.get("weeks_meta", {})
+        self.week_ids: List[int] = []
+        self.row_idx: List[int] = []
+        y_parts: List[np.ndarray] = []
+
+        for wk in self.week_keys:
+            rel = week_meta_paths.get(wk)
+            if not rel:
+                raise KeyError(f"Week {wk!r} missing from meta['weeks_meta']")
+            week_meta_path = self.dataset_root / rel
+            week_meta = json.loads(week_meta_path.read_text())
+            store = WeekFeatureStore(week_meta_path.parent, week_meta, self.lookback)
+            self.stores.append(store)
+
+            for chunk in week_meta.get("label_chunks", []):
+                files = chunk.get("files", {})
+                row_idx_arr = np.load(week_meta_path.parent / files["row_idx"], mmap_mode="r")
+                label_ts_arr = np.load(week_meta_path.parent / files["label_ts"], mmap_mode="r")
+                y_arr = np.load(week_meta_path.parent / files["y"], mmap_mode="r")
+
+                mask = np.ones(label_ts_arr.shape[0], dtype=bool)
+                if decision_ts_start is not None:
+                    mask &= (label_ts_arr >= int(decision_ts_start))
+                if decision_ts_end is not None:
+                    mask &= (label_ts_arr < int(decision_ts_end))
+                if not np.any(mask):
+                    continue
+                idx = np.nonzero(mask)[0]
+                self.week_ids.extend([self.week_to_id[wk]] * int(idx.shape[0]))
+                self.row_idx.extend(np.asarray(row_idx_arr[idx], dtype=np.int64).tolist())
+                y_parts.append(np.asarray(y_arr[idx], dtype=np.float32))
+
+        self.week_ids = np.asarray(self.week_ids, dtype=np.int16)
+        self.row_idx = np.asarray(self.row_idx, dtype=np.int64)
+        self.y = np.concatenate(y_parts, axis=0).astype(np.float32, copy=False) if y_parts else np.empty((0, NUM_HORIZONS), dtype=np.float32)
 
     def __len__(self) -> int:
-        return len(self.X)
+        return int(self.y.shape[0])
 
     def __getitem__(self, idx: int):
-        return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
-    
+        wk_id = int(self.week_ids[idx])
+        row_idx = int(self.row_idx[idx])
+        x_seq = self.stores[wk_id].read_window(row_idx, self.lookback)
+        y_i = self.y[idx]
+        return torch.from_numpy(x_seq), torch.from_numpy(y_i)
+
+
+def build_dataset_from_split(dataset_root: str, split_cfg: Dict[str, Any]) -> HFTFlatDataset:
+    weeks = split_cfg.get("weeks")
+    if weeks is None:
+        wk = split_cfg.get("week")
+        weeks = [wk] if wk else []
+    if not weeks:
+        raise ValueError("Split config must include 'week' or 'weeks'.")
+
+    start = split_cfg.get("start")
+    end = split_cfg.get("end")
+    if start is None or end is None:
+        dr = split_cfg.get("decision_ts_range") or {}
+        start = dr.get("start")
+        end = dr.get("end")
+    return HFTFlatDataset(
+        dataset_root=dataset_root,
+        weeks=list(weeks),
+        decision_ts_start=None if start is None else int(start),
+        decision_ts_end=None if end is None else int(end),
+    )
+
 
 # --------------------  Utils ---------------------
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
@@ -2490,3 +2612,19 @@ def is_metric_improved(value: float, best: float, mode: str) -> bool:
     raise ValueError(f"Unsupported mode '{mode}'")
 
 # --------------------  Training loop  ---------------------
+
+
+def build_datasets_from_meta_splits(dataset_root: str) -> Dict[str, HFTFlatDataset]:
+    root = Path(dataset_root)
+    meta = json.loads((root / "meta.json").read_text())
+    splits = meta.get("splits", {})
+    out: Dict[str, HFTFlatDataset] = {}
+    for section in ("cmssl", "rl", "eval"):
+        sec = splits.get(section, {})
+        if not isinstance(sec, dict):
+            continue
+        for name, cfg in sec.items():
+            if not isinstance(cfg, dict):
+                continue
+            out[f"{section}.{name}"] = build_dataset_from_split(dataset_root, cfg)
+    return out
