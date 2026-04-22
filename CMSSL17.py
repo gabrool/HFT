@@ -2453,6 +2453,33 @@ class LabelBuilder:
         return self.price_mid[idx]
 
 
+def _validate_flat_dataset_meta(meta: Dict[str, Any], source: str, *, require_storage_format: bool = True) -> None:
+    if require_storage_format:
+        storage_format = meta.get("storage_format")
+        if storage_format != "flat_decision_rows_v1":
+            raise ValueError(
+                f"{source} has unsupported storage_format={storage_format!r}; expected 'flat_decision_rows_v1'."
+            )
+
+    label_dim = meta.get("label_dim")
+    try:
+        label_dim_int = int(label_dim)
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} has invalid label_dim={label_dim!r}; expected {NUM_HORIZONS}.")
+    if label_dim_int != int(NUM_HORIZONS):
+        raise ValueError(f"{source} has label_dim={label_dim_int}; expected {NUM_HORIZONS}.")
+
+    for field in ("feature_dim_total", "aux_dim", "lookback"):
+        if field not in meta:
+            raise ValueError(f"{source} missing required field '{field}'.")
+        try:
+            value = int(meta[field])
+        except (TypeError, ValueError):
+            raise ValueError(f"{source} has non-integer {field}={meta[field]!r}.")
+        if value <= 0:
+            raise ValueError(f"{source} has non-positive {field}={value}.")
+
+
 class WeekFeatureStore:
     def __init__(self, week_dir: Path, week_meta: Dict[str, Any], lookback: int):
         self.week_dir = week_dir
@@ -2509,6 +2536,7 @@ class HFTFlatDataset(Dataset):
     def __init__(self, dataset_root: str, weeks: List[str], decision_ts_start: Optional[int] = None, decision_ts_end: Optional[int] = None):
         self.dataset_root = Path(dataset_root)
         self.meta = json.loads((self.dataset_root / "meta.json").read_text())
+        _validate_flat_dataset_meta(self.meta, f"dataset metadata {self.dataset_root / 'meta.json'}")
         self.lookback = int(self.meta["lookback"])
         self.feature_dim_total = int(self.meta["feature_dim_total"])
         self.weeks = list(weeks)
@@ -2528,6 +2556,22 @@ class HFTFlatDataset(Dataset):
                 raise KeyError(f"Week {wk!r} missing from meta['weeks_meta']")
             week_meta_path = self.dataset_root / rel
             week_meta = json.loads(week_meta_path.read_text())
+            _validate_flat_dataset_meta(week_meta, f"week metadata {week_meta_path}", require_storage_format=False)
+            if int(week_meta["lookback"]) != int(self.lookback):
+                raise ValueError(
+                    f"week metadata {week_meta_path} has lookback={int(week_meta['lookback'])}, "
+                    f"but dataset metadata requires lookback={self.lookback}."
+                )
+            if int(week_meta["feature_dim_total"]) != int(self.feature_dim_total):
+                raise ValueError(
+                    f"week metadata {week_meta_path} has feature_dim_total={int(week_meta['feature_dim_total'])}, "
+                    f"but dataset metadata requires feature_dim_total={self.feature_dim_total}."
+                )
+            if int(week_meta["aux_dim"]) != int(self.meta["aux_dim"]):
+                raise ValueError(
+                    f"week metadata {week_meta_path} has aux_dim={int(week_meta['aux_dim'])}, "
+                    f"but dataset metadata requires aux_dim={int(self.meta['aux_dim'])}."
+                )
             store = WeekFeatureStore(week_meta_path.parent, week_meta, self.lookback)
             self.stores.append(store)
 
@@ -2565,6 +2609,8 @@ class HFTFlatDataset(Dataset):
 
 
 def build_dataset_from_split(dataset_root: str, split_cfg: Dict[str, Any]) -> HFTFlatDataset:
+    meta = json.loads((Path(dataset_root) / "meta.json").read_text())
+    _validate_flat_dataset_meta(meta, f"dataset metadata {Path(dataset_root) / 'meta.json'}")
     weeks = split_cfg.get("weeks")
     if weeks is None:
         wk = split_cfg.get("week")

@@ -322,6 +322,7 @@ from CMSSL17 import (
     AUX_DIM,
     _open_text,
     timestamp_to_ms_half_even,
+    CHECKPOINT_SCHEMA,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
 
@@ -795,7 +796,7 @@ class FlatWeekRouter:
             "target_transform": "signed_sqrt_raw_bps",
             "low_abs_trim_fraction": 0.02,
             "high_abs_trim_fraction": 0.02,
-            "checkpoint_schema_expected": "cmssl17-signed-raw-v1",
+            "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
             **canonical_mode_fields(),
             "lookback": int(LOOKBACK),
             "feature_dim_total": int(self.feature_dim),
@@ -1727,6 +1728,16 @@ def process_all(
     week_label_counts = {wk: int(0 if router is None else router.week_labels_total.get(wk, 0)) for wk in weeks_in_order}
     total_feature_rows_from_weeks = sum(int(week_meta.get("rows_total", 0)) for week_meta in week_meta_records.values())
     total_labels_from_weeks = sum(int(week_meta.get("labels_total", 0)) for week_meta in week_meta_records.values())
+    if int(total_feature_rows) != int(total_feature_rows_from_weeks):
+        raise ValueError(
+            "Inconsistent dataset totals: total_feature_rows "
+            f"{int(total_feature_rows)} != sum(weeks_meta.rows_total) {int(total_feature_rows_from_weeks)}"
+        )
+    if int(total_labels) != int(total_labels_from_weeks):
+        raise ValueError(
+            "Inconsistent dataset totals: total_labels "
+            f"{int(total_labels)} != sum(weeks_meta.labels_total) {int(total_labels_from_weeks)}"
+        )
     weeks_meta_paths = {wk: week_meta_records[wk].get("meta_path", os.path.join(wk, "meta_week.json")) for wk in week_meta_records.keys()}
 
     quality_week_totals: Dict[str, Dict[str, int]] = {"ob": {}, "th": {}, "merge": {}, "chain": {}}
@@ -1784,7 +1795,7 @@ def process_all(
         "target_transform": "signed_sqrt_raw_bps",
         "low_abs_trim_fraction": 0.02,
         "high_abs_trim_fraction": 0.02,
-        "checkpoint_schema_expected": "cmssl17-signed-raw-v1",
+        "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
         **canonical_mode_fields(),
         "storage_format": "flat_decision_rows_v1",
         "lookback": int(LOOKBACK),
@@ -1801,8 +1812,6 @@ def process_all(
         "total_labels": int(total_labels),
         "week_row_counts": week_row_counts,
         "week_label_counts": week_label_counts,
-        "total_feature_rows_from_weeks": int(total_feature_rows_from_weeks),
-        "total_labels_from_weeks": int(total_labels_from_weeks),
         "weeks_meta": weeks_meta_paths,
         "data_quality_path": "_data_quality.json",
     }
