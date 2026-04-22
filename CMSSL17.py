@@ -2399,7 +2399,10 @@ class LabelBuilder:
             new_start = max(0, len(self.price_ts) - 1)
         self.price_start_idx = new_start
 
-        if self.price_start_idx >= 4096 or self.price_start_idx >= len(self.price_ts) // 2:
+        if self.price_start_idx > 0 and (
+            self.price_start_idx >= 4096
+            or self.price_start_idx >= len(self.price_ts) // 2
+        ):
             self.price_ts = self.price_ts[self.price_start_idx:]
             self.price_mid = self.price_mid[self.price_start_idx:]
             self.price_start_idx = 0
