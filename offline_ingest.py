@@ -1211,7 +1211,7 @@ class FlatWeekRouter:
             "label_units": "signed_log_return_bps",
             "target_task": "horizon_specific_signed_raw_bps_targets",
             "target_transform": "signed_sqrt_raw_bps",
-            "low_abs_trim_fraction": 0.02,
+            "low_abs_trim_fraction": 0.05,
             "high_abs_trim_fraction": 0.02,
             "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
             **canonical_mode_fields(),
