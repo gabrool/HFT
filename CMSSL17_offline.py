@@ -17,11 +17,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from offline_tokens import (
-    read_json,
-    load_global_meta,
-    ChunkRef,
-)
 
 # ---------------- Import from CMSSL17 ----------------
 # Configure CUDA allocator only for this entrypoint execution to avoid
@@ -42,6 +37,7 @@ from CMSSL17 import (  # type: ignore
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     SAM,
+    build_dataset_from_split,
 )
 
 # ---------------- Config via env ----------------
@@ -108,7 +104,7 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
         rel_path = weeks_meta_map.get(week_key)
         if not isinstance(rel_path, str) or not rel_path:
             raise KeyError(f"meta['weeks_meta'] missing path for week '{week_key}' referenced by {stage}.")
-        week_meta = read_json(out_root / rel_path)
+        week_meta = json.loads((out_root / rel_path).read_text())
         decision_range = week_meta.get("decision_ts_range")
         if not isinstance(decision_range, dict) or "min" not in decision_range or "max" not in decision_range:
             raise KeyError(f"Week metadata for {stage} must include decision_ts_range min/max.")
@@ -261,204 +257,6 @@ def validate_loaded_label_array(y: np.ndarray, source: str) -> None:
     if y.shape[1] != NUM_HORIZONS:
         raise _label_dim_error(source, y.shape[1])
 
-
-def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[ChunkRef]:
-    """
-    Build ChunkRefs for rows whose timestamps satisfy start <= ts < end.
-
-    The function performs contiguous slicing per chunk via searchsorted on each
-    chunk's ts file and avoids materializing full boolean masks / index lists.
-    """
-    if end < start:
-        raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
-
-    wmeta = read_json(meta_week_path)
-    validate_dataset_label_dim(wmeta, f"week metadata {meta_week_path}")
-    week_dir = meta_week_path.parent
-    refs: List[ChunkRef] = []
-
-    for idx, ch in enumerate(wmeta.get("chunks", [])):
-        files = ch.get("files", {})
-        ts_rel = files.get("ts")
-        if not ts_rel:
-            raise KeyError(
-                f"Chunk {idx} in {meta_week_path} is missing files['ts']; cannot slice by timestamp"
-            )
-
-        ts_arr = np.load(week_dir / ts_rel, mmap_mode="r")
-        if ts_arr.ndim != 1:
-            raise ValueError(
-                f"Expected 1D ts array in chunk {idx} ({week_dir / ts_rel}), got shape={ts_arr.shape}"
-            )
-
-        # Safety check: searchsorted semantics require non-decreasing input.
-        if ts_arr.size > 1 and not np.all(ts_arr[1:] >= ts_arr[:-1]):
-            raise ValueError(
-                f"Timestamp file is not non-decreasing for chunk {idx}: {week_dir / ts_rel}"
-            )
-
-        l = int(np.searchsorted(ts_arr, start, side="left"))
-        r = int(np.searchsorted(ts_arr, end, side="left"))
-
-        if r > l:
-            refs.append(ChunkRef(
-                week_dir=week_dir,
-                core_file=week_dir / files["core"],
-                aux_file=week_dir / files["aux"],
-                y_file=week_dir / files["y"],
-                n=r - l,
-                offset=l,
-            ))
-
-    return refs
-
-# ---------------- Dataset (streaming from .npy chunks) ----------------
-class NpyChunksDataset(Dataset):
-    def __init__(self, chunk_refs: List[ChunkRef], feature_dim_total: int):
-        """
-        chunk_refs: list of chunks in chronological order (kept as given)
-        feature_dim_total: F (including AUX_DIM)
-        """
-        self.refs = list(chunk_refs)
-        self.F = int(feature_dim_total)
-        self.F_core = self.F - AUX_DIM
-        if self.F_core <= 0:
-            raise ValueError(f"feature_dim_total ({self.F}) must exceed AUX_DIM ({AUX_DIM})")
-
-        # prefix sums for O(log N) lookup
-        self.starts = []
-        total = 0
-        for r in self.refs:
-            self.starts.append(total)
-            total += r.n
-        self.total = total
-
-        # small cache of currently loaded memory-mapped arrays per process
-        self._cache: Dict[Tuple[str, int], Tuple[np.memmap, np.memmap, np.memmap]] = {}
-        self._lru: List[Tuple[str, int]] = []
-        self._cap = 8  # keep up to 8 chunks mapped
-
-    def __len__(self):
-        return self.total
-
-    def _locate(self, idx: int) -> Tuple[int, int]:
-        # binary search on starts
-        lo, hi = 0, len(self.starts) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            start = self.starts[mid]
-            next_start = self.starts[mid + 1] if mid + 1 < len(self.starts) else self.total
-            if start <= idx < next_start:
-                return mid, idx - start
-            elif idx < start:
-                hi = mid - 1
-            else:
-                lo = mid + 1
-        raise IndexError(idx)
-
-    def _load_chunk(self, i: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        ref = self.refs[i]
-        key = (str(ref.week_dir), i)
-        if key in self._cache:
-            # move to end of LRU
-            try:
-                self._lru.remove(key)
-            except ValueError:
-                pass
-            self._lru.append(key)
-            return self._cache[key]
-        # mmap lazy
-        Xc = np.load(ref.core_file, mmap_mode='r')
-        Xa = np.load(ref.aux_file,  mmap_mode='r')
-        Y  = np.load(ref.y_file,    mmap_mode='r')
-        validate_loaded_label_array(Y, f"label file {ref.y_file}")
-        self._cache[key] = (Xc, Xa, Y)
-        self._lru.append(key)
-        if len(self._lru) > self._cap:
-            evict_key = self._lru.pop(0)
-            try:
-                del self._cache[evict_key]
-            except KeyError:
-                pass
-        return Xc, Xa, Y
-
-    def __getitem__(self, idx: int):
-        ci, offset_in_dataset = self._locate(idx)
-        ref = self.refs[ci]
-        Xc, Xa, Y = self._load_chunk(ci)
-
-        idx_in_file = ref.offset + offset_in_dataset
-
-        core = np.asarray(Xc[idx_in_file], dtype=np.float32)
-        aux  = np.asarray(Xa[idx_in_file], dtype=np.float32)
-        x = np.concatenate([core, aux], axis=-1)
-        if not x.flags.writeable:
-            x = x.copy()
-        y = np.asarray(Y[idx_in_file], dtype=np.float32)
-        if not y.flags.writeable:
-            y = y.copy()
-        return torch.from_numpy(x), torch.from_numpy(y)
-
-
-def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Load rows in start <= ts < end across weeks into RAM. Returns X [N, L, F], y [N, H], F."""
-    if end < start:
-        raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
-
-    Xs, Ys = [], []
-    feat_dim = None
-    for wp in split_week_paths:
-        wmeta = read_json(wp)
-        validate_dataset_label_dim(wmeta, f"week metadata {wp}")
-        F_total = int(wmeta["feature_dim_total"])
-        if feat_dim is None:
-            feat_dim = F_total
-        elif feat_dim != F_total:
-            raise ValueError(f"Feature dim mismatch between weeks: {feat_dim} vs {F_total}")
-
-        week_dir = wp.parent
-        for idx, ch in enumerate(wmeta.get("chunks", [])):
-            files = ch.get("files", {})
-            ts_rel = files.get("ts")
-            if not ts_rel:
-                raise KeyError(
-                    f"Chunk {idx} in {wp} is missing files['ts']; cannot slice by timestamp"
-                )
-
-            ts_arr = np.load(week_dir / ts_rel, mmap_mode="r")
-            if ts_arr.ndim != 1:
-                raise ValueError(
-                    f"Expected 1D ts array in chunk {idx} ({week_dir / ts_rel}), got shape={ts_arr.shape}"
-                )
-
-            # Safety check: searchsorted semantics require non-decreasing input.
-            if ts_arr.size > 1 and not np.all(ts_arr[1:] >= ts_arr[:-1]):
-                raise ValueError(
-                    f"Timestamp file is not non-decreasing for chunk {idx} in {wp}: "
-                    f"{week_dir / ts_rel}; ts must be non-decreasing for range slicing"
-                )
-
-            l = int(np.searchsorted(ts_arr, start, side="left"))
-            r = int(np.searchsorted(ts_arr, end, side="left"))
-            if r <= l:
-                continue
-
-            Xc = np.load(week_dir / files["core"])
-            Xa = np.load(week_dir / files["aux"])
-            Y = np.load(week_dir / files["y"])
-            validate_loaded_label_array(Y, f"label file {week_dir / files['y']}")
-            Xs.append(np.concatenate([Xc[l:r], Xa[l:r]], axis=-1))
-            Ys.append(Y[l:r])
-
-    if not Xs:
-        return (
-            np.empty((0, LOOKBACK, feat_dim or 0), np.float32),
-            np.empty((0, NUM_HORIZONS), np.float32),
-            (feat_dim or 0),
-        )
-    X = np.concatenate(Xs, axis=0).astype(np.float32, copy=False)
-    y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
-    return X, y, int(feat_dim)
 
 # ---------------- Signed-raw preprocessing, cache, and metrics ----------------
 def signed_sqrt_transform(x: np.ndarray) -> np.ndarray:
@@ -685,33 +483,25 @@ def train_from_offline():
     amp_enabled = AMP_ENABLED and device.type=='cuda'
     amp_dtype = torch.bfloat16
     out_root = Path(OUT_ROOT)
-    meta = load_global_meta(out_root)
+    meta = json.loads((out_root / "meta.json").read_text())
     validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
     trade_history_enabled = meta.get('trade_history_enabled')
     event_stream_mode = meta.get('event_stream_mode')
     splits = require_four_week_pipeline_splits(meta, out_root)
 
     weeks_order = splits['weeks_in_order']
-    key_to_meta = {wk: out_root / meta['weeks_meta'][wk] for wk in weeks_order if wk in meta.get('weeks_meta',{})}
-    cmssl_train = splits['splits']['cmssl']['train']; cmssl_val = splits['splits']['cmssl']['val']; cmssl_test = splits['splits']['cmssl']['test']
-    tr_weeks=[key_to_meta[k] for k in cmssl_train['weeks']]; va_weeks=[key_to_meta[k] for k in cmssl_val['weeks']]; te_weeks=[key_to_meta[k] for k in cmssl_test['weeks']]
+    cmssl_train = splits['splits']['cmssl']['train']
+    cmssl_val = splits['splits']['cmssl']['val']
+    cmssl_test = splits['splits']['cmssl']['test']
 
-    feat_dim_total=None
-    for wp in tr_weeks+va_weeks+te_weeks:
-        wm=read_json(wp); validate_dataset_label_dim(wm, f"week metadata {wp}")
-        fm=int(wm['feature_dim_total']); feat_dim_total=fm if feat_dim_total is None else feat_dim_total
-    F_total=int(feat_dim_total or 0)
+    ds_train = build_dataset_from_split(str(out_root), cmssl_train)
+    ds_val = build_dataset_from_split(str(out_root), cmssl_val)
+    ds_test = build_dataset_from_split(str(out_root), cmssl_test)
+    F_total = int(meta.get("feature_dim_total", 0))
 
     tr_start,tr_end=int(cmssl_train['start']),int(cmssl_train['end'])
     va_start,va_end=int(cmssl_val['start']),int(cmssl_val['end'])
     te_start,te_end=int(cmssl_test['start']),int(cmssl_test['end'])
-
-    def refs(weeks,start,end):
-        out=[]
-        for wp in weeks: out.extend(build_chunk_refs_by_ts(wp,start,end))
-        return out
-    tr_refs,va_refs,te_refs = refs(tr_weeks,tr_start,tr_end),refs(va_weeks,va_start,va_end),refs(te_weeks,te_start,te_end)
-    ds_train,ds_val,ds_test = NpyChunksDataset(tr_refs,F_total),NpyChunksDataset(va_refs,F_total),NpyChunksDataset(te_refs,F_total)
 
     cache_path=out_root/'signed_raw_stats_cache.npz'
     cache_meta={
@@ -838,15 +628,6 @@ def train_from_offline():
     print(f"[test_std] true_std_bps_all={test['true_std_bps_all']} pred_std_bps_all={test['pred_std_bps_all']} true_std_bps_kept={test['true_std_bps_kept']} pred_std_bps_kept={test['pred_std_bps_kept']}")
     print('[done] Training complete.')
 
-
-# ---------------- Lightweight HFTDataset (when loading into RAM) ----------------
-class HFTDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = X.astype(np.float32, copy=False)
-        self.y = y.astype(np.float32, copy=False)
-    def __len__(self): return int(self.y.shape[0])
-    def __getitem__(self, idx): 
-        return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
 
 # ---------------- Entry ----------------
 if __name__ == "__main__":
