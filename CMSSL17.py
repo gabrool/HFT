@@ -2215,22 +2215,25 @@ class FeatureEngine:
 
     def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
         """Per-feature EWMA mean/var rolling z-score."""
-        eps = 1e-9
+        eps = np.float32(1e-9)
         if self._feat_dim is None:
             self._feat_dim = int(x.shape[0])
-            self.z_mean = x.astype(np.float64).copy()
-            self.z_m2 = (x.astype(np.float64) ** 2).copy()
+            x32 = x.astype(np.float32, copy=False)
+            self.z_mean = x32.copy()
+            self.z_m2 = np.square(x32, dtype=np.float32)
             return np.zeros_like(x, dtype=np.float32)
 
         hl = self._alpha_half_life_ms(self.z_hl_ms)
-        alpha = 1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl))
+        alpha = np.float32(1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl)))
+        one_minus_alpha = np.float32(1.0) - alpha
+        x32 = x.astype(np.float32, copy=False)
 
         # Update EWMA mean and second moment
-        self.z_mean = (1.0 - alpha) * self.z_mean + alpha * x
-        self.z_m2   = (1.0 - alpha) * self.z_m2 + alpha * (x * x)
+        self.z_mean = one_minus_alpha * self.z_mean + alpha * x32
+        self.z_m2 = one_minus_alpha * self.z_m2 + alpha * np.square(x32, dtype=np.float32)
         var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
-        z = (x - self.z_mean) / np.sqrt(var)
-        return z.astype(np.float32)
+        z = (x32 - self.z_mean) / np.sqrt(var).astype(np.float32, copy=False)
+        return z.astype(np.float32, copy=False)
 
     # -------------------------------------------------------------------------
     # Public API

@@ -70,6 +70,7 @@ PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "0"))  # 0 = auto-size from RAM budget; >0 = explicit fixed override
+FLUSH_WORKERS = int(os.environ.get("BYBIT_FLUSH_WORKERS", "4"))
 DECISION_POLICY = "ob_event_time"
 
 
@@ -1162,7 +1163,7 @@ class ChunkWriter:
 
 
 _SENTINEL_FLUSH_JOB = object()
-_FLUSH_QUEUE_MAXSIZE = 4
+_FLUSH_QUEUE_MAXSIZE = max(8, 2 * FLUSH_WORKERS)
 
 
 def _persist_flush_job(job: FlushJob) -> None:
@@ -1212,12 +1213,17 @@ class WeekWriterRouter:
         self.pca_meta = dict(pca_meta) if pca_meta is not None else {}
         self.flush_queue: "queue.Queue[object]" = queue.Queue(maxsize=_FLUSH_QUEUE_MAXSIZE)
         self.writer_exception: Optional[BaseException] = None
-        self.writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name="offline-ingest-chunk-writer",
-            daemon=True,
-        )
-        self.writer_thread.start()
+        self._writer_exception_lock = threading.Lock()
+        self.writer_threads: List[threading.Thread] = []
+        worker_count = max(1, int(FLUSH_WORKERS))
+        for idx in range(worker_count):
+            t = threading.Thread(
+                target=self._writer_loop,
+                name=f"offline-ingest-chunk-writer-{idx}",
+                daemon=True,
+            )
+            t.start()
+            self.writer_threads.append(t)
 
     def _check_writer_exception(self) -> None:
         if self.writer_exception is not None:
@@ -1234,7 +1240,9 @@ class WeekWriterRouter:
                 finally:
                     self.flush_queue.task_done()
         except BaseException as exc:
-            self.writer_exception = exc
+            with self._writer_exception_lock:
+                if self.writer_exception is None:
+                    self.writer_exception = exc
             while True:
                 try:
                     pending = self.flush_queue.get_nowait()
@@ -1425,8 +1433,10 @@ class WeekWriterRouter:
         for wk in list(self.writers.keys()):
             self._close_writer(wk)
         self._check_writer_exception()
-        self.flush_queue.put(_SENTINEL_FLUSH_JOB)
-        self.writer_thread.join()
+        for _ in self.writer_threads:
+            self.flush_queue.put(_SENTINEL_FLUSH_JOB)
+        for t in self.writer_threads:
+            t.join()
         self._check_writer_exception()
         self._finalize_closed_weeks()
         for wk in list(self.week_decision_span.keys()):
