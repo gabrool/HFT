@@ -389,6 +389,423 @@ def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, stri
         yield event
 
 
+WeekPair = Tuple[str, List[str], List[str]]
+
+OB_DAILY_RE = re.compile(r"^(?P<d>\d{4}-\d{2}-\d{2})_BTCUSDT_.*ob.*\.zip$", re.IGNORECASE)
+TH_DAILY_RE = re.compile(r"^BTCUSDT(?P<d>\d{4}-\d{2}-\d{2})\.csv(?:\.gz|\.gzip)?$", re.IGNORECASE)
+WEEK_KEY_RE = re.compile(r"^(\d{2}-\d{2}-\d{4})-to-(\d{2}-\d{2}-\d{4})$")
+
+
+def _ob_ext_rank(path: str) -> int:
+    lower = str(path).lower()
+    if lower.endswith(".data.zip"):
+        return 0
+    if lower.endswith(".zip"):
+        return 1
+    return 2
+
+
+def _choose_preferred_daily_ob_path(candidates: List[str]) -> str:
+    def _key(path: str) -> Tuple[int, str, str]:
+        p = Path(path)
+        return (_ob_ext_rank(path), p.name, str(p))
+
+    return min(candidates, key=_key)
+
+
+def _parse_ymd_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def _parse_week_key_any(week_key: str) -> Tuple[datetime, datetime, str]:
+    m = WEEK_KEY_RE.fullmatch(str(week_key).strip())
+    if not m:
+        raise ValueError(f"Unrecognized week key: {week_key}")
+    start_dt = datetime.strptime(m.group(1), "%d-%m-%Y").replace(tzinfo=timezone.utc)
+    end_dt = datetime.strptime(m.group(2), "%d-%m-%Y").replace(tzinfo=timezone.utc)
+    if end_dt < start_dt:
+        raise ValueError(f"Week key end before start: {week_key}")
+    return start_dt, end_dt, week_key
+
+
+def _format_week_key(start_day: date, end_day: date) -> str:
+    return f"{start_day.strftime('%d-%m-%Y')}-to-{end_day.strftime('%d-%m-%Y')}"
+
+
+def _parse_requested_weeks(raw: str) -> List[str]:
+    return [wk.strip() for wk in re.split(r"[\s,]+", str(raw or "")) if wk.strip()]
+
+
+def _sort_pairs_by_end(pairs: List[WeekPair]) -> List[WeekPair]:
+    return sorted(pairs, key=lambda p: _parse_week_key_any(p[0])[1])
+
+
+def _assert_week_order(pairs: List[WeekPair]) -> None:
+    if not pairs:
+        return
+    prev_end: Optional[datetime] = None
+    prev_wk: Optional[str] = None
+    for wk, _ob_paths, _th_paths in pairs:
+        _start, end, _ = _parse_week_key_any(wk)
+        if prev_end is not None and end <= prev_end:
+            raise ValueError(f"Weeks not strictly ordered by end date: prev={prev_wk} curr={wk}")
+        prev_end = end
+        prev_wk = wk
+
+
+def _assert_weeks_consecutive(pairs: List[WeekPair]) -> None:
+    if not pairs:
+        return
+    ordered = _sort_pairs_by_end(list(pairs))
+    for idx in range(1, len(ordered)):
+        prev_wk = ordered[idx - 1][0]
+        curr_wk = ordered[idx][0]
+        _prev_start, prev_end, _ = _parse_week_key_any(prev_wk)
+        curr_start, _curr_end, _ = _parse_week_key_any(curr_wk)
+        expected = (prev_end + ONE_DAY).date()
+        if curr_start.date() != expected:
+            raise ValueError(
+                "Weeks are not consecutive: "
+                f"prev={prev_wk} (ends {prev_end.date().isoformat()}) "
+                f"curr={curr_wk} (starts {curr_start.date().isoformat()})"
+            )
+
+
+def _build_ob_daily_map(ob_dir: str) -> Dict[date, str]:
+    by_day: Dict[date, str] = {}
+    for path in sorted(Path(ob_dir).iterdir()):
+        if not path.is_file():
+            continue
+        m = OB_DAILY_RE.match(path.name)
+        if not m:
+            continue
+        day = _parse_ymd_date(m.group("d"))
+        cand = str(path)
+        cur = by_day.get(day)
+        if cur is None:
+            by_day[day] = cand
+            continue
+        chosen = _choose_preferred_daily_ob_path([cur, cand])
+        by_day[day] = chosen
+        print(
+            f"[warn] duplicate daily OB for {day.isoformat()}: "
+            f"{Path(cur).name} vs {path.name}; using {Path(chosen).name}",
+            flush=True,
+        )
+    return by_day
+
+
+def _build_th_daily_map(th_dir: str) -> Dict[date, str]:
+    by_day: Dict[date, str] = {}
+    for path in sorted(Path(th_dir).iterdir()):
+        if not path.is_file():
+            continue
+        m = TH_DAILY_RE.match(path.name)
+        if not m:
+            continue
+        day = _parse_ymd_date(m.group("d"))
+        cur = by_day.get(day)
+        cand = str(path)
+        if cur is None:
+            by_day[day] = cand
+            continue
+        keep = min([cur, cand], key=lambda p: (0 if str(p).lower().endswith(".csv.gz") else 1, Path(p).name, str(p)))
+        by_day[day] = keep
+        print(
+            f"[warn] duplicate daily TH for {day.isoformat()}: "
+            f"{Path(cur).name} vs {path.name}; using {Path(keep).name}",
+            flush=True,
+        )
+    return by_day
+
+
+def pair_weeks(ob_dir: str, th_dir: str) -> List[WeekPair]:
+    ob_by_day = _build_ob_daily_map(ob_dir)
+    if not ob_by_day:
+        return []
+
+    if not USE_TRADES:
+        days = sorted(ob_by_day.keys())
+        pairs: List[WeekPair] = []
+        for i in range(0, len(days), 7):
+            block = days[i : i + 7]
+            if len(block) < 7:
+                continue
+            if any((block[j] - block[j - 1]).days != 1 for j in range(1, len(block))):
+                continue
+            week_key = _format_week_key(block[0], block[-1])
+            ob_paths = [ob_by_day[d] for d in block]
+            pairs.append((week_key, ob_paths, []))
+        return _sort_pairs_by_end(pairs)
+
+    th_by_day = _build_th_daily_map(th_dir)
+    common_days = sorted(set(ob_by_day.keys()) & set(th_by_day.keys()))
+    pairs = []
+    for i in range(0, len(common_days), 7):
+        block = common_days[i : i + 7]
+        if len(block) < 7:
+            continue
+        if any((block[j] - block[j - 1]).days != 1 for j in range(1, len(block))):
+            continue
+        ob_paths = [ob_by_day[d] for d in block]
+        th_paths = [th_by_day[d] for d in block]
+        if len(ob_paths) != len(th_paths):
+            continue
+        week_key = _format_week_key(block[0], block[-1])
+        pairs.append((week_key, ob_paths, th_paths))
+    return _sort_pairs_by_end(pairs)
+
+
+def _try_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _trade_iter_precise(rows: Iterable[Tuple[int, int, dict]]) -> Iterable[Tuple[int, int, dict]]:
+    for ts_raw, line_no, row in rows:
+        t_raw = row.get("timestamp")
+        if t_raw is None:
+            t_raw = row.get("ts")
+        if t_raw is None:
+            t_raw = row.get("T")
+        if t_raw is None:
+            yield int(ts_raw), int(line_no), row
+            continue
+        try:
+            ts_ms = timestamp_to_ms_half_even(t_raw)
+        except Exception:
+            yield int(ts_raw), int(line_no), row
+            continue
+        yield int(ts_ms), int(line_no), row
+
+
+def safe_ob_iter(ob_path: str, day_start_ms: int, day_end_ms: int, dq_day: Optional[DayQuality] = None):
+    last_ts: Optional[int] = None
+    with _open_text(ob_path) as f:
+        for line_no, line in enumerate(f, start=1):
+            if dq_day is not None:
+                dq_day.increment_counter("ob", "total")
+            if not line:
+                continue
+            try:
+                raw = fast_json_loads(line)
+            except Exception:
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "bad_json")
+                    dq_day.append_example("ob_bad_json", {"line": int(line_no), "sample": line[:200].rstrip()})
+                continue
+            if not isinstance(raw, dict):
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "bad_shape")
+                    dq_day.append_example("ob_bad_shape", {"line": int(line_no)})
+                continue
+            data = raw.get("data", raw)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                data = data[0]
+            if not isinstance(data, dict):
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "bad_payload")
+                continue
+
+            ts_raw = raw.get("ts")
+            if ts_raw is None:
+                ts_raw = raw.get("cts")
+            if ts_raw is None:
+                ts_raw = data.get("ts")
+            if ts_raw is None:
+                ts_raw = data.get("cts")
+            ts_ms = _try_int(ts_raw)
+            if ts_ms is None:
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "bad_ts")
+                    dq_day.append_example("ob_bad_ts", {"line": int(line_no), "ts": ts_raw})
+                continue
+
+            if dq_day is not None:
+                dq_day.update_raw_ts(ts_ms)
+            if BYBIT_DAY_CLIP and not (int(day_start_ms) <= ts_ms < int(day_end_ms)):
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "day_clipped")
+                continue
+
+            out_ts = int(ts_ms)
+            if last_ts is not None and out_ts < last_ts:
+                backstep = int(last_ts - out_ts)
+                if BYBIT_STRICT_DATA:
+                    raise ValueError(
+                        f"Non-decreasing OB timestamps violated in {ob_path}: prev={last_ts} curr={out_ts}"
+                    )
+                if backstep <= BYBIT_TS_BACKSTEP_CLAMP_MS:
+                    out_ts = int(last_ts)
+                    if dq_day is not None:
+                        dq_day.increment_counter("ob", "clamped_backstep")
+                else:
+                    if dq_day is not None:
+                        dq_day.increment_counter("ob", "dropped_big_backstep")
+                    continue
+            last_ts = out_ts
+            if dq_day is not None:
+                dq_day.update_output_ts(out_ts)
+
+            tp_raw = raw.get("type")
+            if tp_raw is None:
+                tp_raw = data.get("type")
+            if tp_raw is None:
+                tp_raw = raw.get("DataType")
+            tp_code = _compact_ob_type_code(tp_raw)
+            bids = _compact_book_levels(data.get("b", []))
+            asks = _compact_book_levels(data.get("a", []))
+            seq = _try_int(raw.get("seq"), 0)
+            yield ("ob", int(out_ts), int(seq or 0), int(tp_code), bids, asks)
+
+
+def safe_th_iter(th_path: str, day_start_ms: int, day_end_ms: int, dq_day: Optional[DayQuality] = None):
+    last_ts: Optional[int] = None
+    with _open_text(th_path) as f:
+        reader = csv.DictReader(f)
+        base_rows = (
+            ((_try_int((row or {}).get("ts"), 0) or 0), line_no, row or {})
+            for line_no, row in enumerate(reader, start=2)
+        )
+        for ts_ms_raw, line_no, row in _trade_iter_precise(base_rows):
+            if dq_day is not None:
+                dq_day.increment_counter("th", "total")
+            ts_ms = int(ts_ms_raw)
+            if dq_day is not None:
+                dq_day.update_raw_ts(ts_ms)
+            if BYBIT_DAY_CLIP and not (int(day_start_ms) <= ts_ms < int(day_end_ms)):
+                if dq_day is not None:
+                    dq_day.increment_counter("th", "day_clipped")
+                continue
+
+            out_ts = int(ts_ms)
+            if last_ts is not None and out_ts < last_ts:
+                backstep = int(last_ts - out_ts)
+                if BYBIT_STRICT_DATA:
+                    raise ValueError(
+                        f"Non-decreasing TH timestamps violated in {th_path}: prev={last_ts} curr={out_ts}"
+                    )
+                if backstep <= BYBIT_TS_BACKSTEP_CLAMP_MS:
+                    out_ts = int(last_ts)
+                    if dq_day is not None:
+                        dq_day.increment_counter("th", "clamped_backstep")
+                else:
+                    if dq_day is not None:
+                        dq_day.increment_counter("th", "dropped_big_backstep")
+                    continue
+
+            price_raw = row.get("price")
+            size_raw = row.get("size")
+            side_raw = row.get("side")
+            try:
+                price = float(price_raw)
+                size = float(size_raw)
+            except (TypeError, ValueError):
+                if dq_day is not None:
+                    dq_day.increment_counter("th", "bad_price_or_size")
+                    dq_day.append_example(
+                        "th_bad_price_or_size",
+                        {"line": int(line_no), "price": price_raw, "size": size_raw},
+                    )
+                continue
+            seq = _try_int(row.get("seq"), 0) or 0
+            side_code = _compact_trade_side_code(side_raw)
+            tick_dir_code = _compact_tick_dir_code(row.get("tickDirection"))
+            is_rpi = _compact_is_rpi_code(row.get("RPI", row.get("rpi")))
+
+            last_ts = out_ts
+            if dq_day is not None:
+                dq_day.update_output_ts(out_ts)
+            yield ("trade", int(out_ts), int(seq), float(price), float(size), int(side_code), int(tick_dir_code), int(is_rpi))
+
+
+def _event_ts(event: Any) -> int:
+    return int(event[1])
+
+
+def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
+    aux = np.asarray(
+        [
+            np.log1p(float(dt_ms)),
+            float(is_trade),
+            np.log1p(fe.event_density_100ms()),
+            np.log1p(fe.event_density_500ms()),
+            np.log1p(fe.event_density_1000ms()),
+            np.log1p(fe.event_density_3000ms()),
+            np.log1p(fe.event_density_7500ms()),
+        ],
+        dtype=np.float32,
+    )
+    core = np.asarray(feat_z, dtype=np.float32)
+    return np.concatenate([core, aux], axis=0).astype(np.float32, copy=False)
+
+
+def build_four_week_pipeline_splits(weeks_in_order, week_meta_records):
+    if len(weeks_in_order) != 4:
+        raise ValueError(f"Expected exactly 4 weeks; got {len(weeks_in_order)}")
+    week1, week2, week3, week4 = weeks_in_order
+
+    def _range_for(week_key: str) -> Tuple[int, int]:
+        week_meta = week_meta_records.get(week_key)
+        if not isinstance(week_meta, dict):
+            raise KeyError(f"Missing week metadata for split week '{week_key}'")
+        decision_range = week_meta.get("decision_ts_range")
+        if not isinstance(decision_range, dict):
+            raise KeyError(f"Week '{week_key}' missing decision_ts_range in metadata")
+        if "min" not in decision_range or "max" not in decision_range:
+            raise KeyError(f"Week '{week_key}' decision_ts_range must contain min/max")
+        start = int(decision_range["min"])
+        end_exclusive = int(decision_range["max"]) + 1
+        if start >= end_exclusive:
+            raise ValueError(f"Invalid decision_ts_range for week '{week_key}': {start}..{end_exclusive}")
+        return start, end_exclusive
+
+    w1s, w1e = _range_for(week1)
+    w2s, w2e = _range_for(week2)
+    w3s, w3e = _range_for(week3)
+    w4s, w4e = _range_for(week4)
+
+    span3 = max(1, w3e - w3s)
+    w3_40 = w3s + int(np.floor(0.4 * span3))
+    w3_70 = w3s + int(np.floor(0.7 * span3))
+    w3_40 = min(max(w3_40, w3s + 1), w3e - 2)
+    w3_70 = min(max(w3_70, w3_40 + 1), w3e - 1)
+
+    return {
+        "protocol": "four_week_cmssl_val_test_rl_eval_v2",
+        "cmssl": {
+            "train": {"week": week1, "start": int(w1s), "end": int(w1e)},
+            "val": {"week": week2, "start": int(w2s), "end": int(w2e)},
+            "test": {"week": week3, "start": int(w3s), "end": int(w3e)},
+        },
+        "rl": {
+            "train": {"week": week3, "decision_ts_range": {"start": int(w3s), "end": int(w3_40)}},
+            "val": {"week": week3, "decision_ts_range": {"start": int(w3_40), "end": int(w3_70)}},
+            "test": {"week": week3, "decision_ts_range": {"start": int(w3_70), "end": int(w3e)}},
+        },
+        "eval": {
+            "full": {"week": week4, "start": int(w4s), "end": int(w4e)},
+        },
+    }
+
+
+def iter_weekly_event_stream(pairs: List[WeekPair], collect_quality: bool = True):
+    feeder = EventFeeder(pairs, collect_quality=collect_quality)
+    producer_thread = threading.Thread(target=feeder.run, daemon=True)
+    producer_thread.start()
+    try:
+        while True:
+            kind, wk, payload = feeder.queue.get()
+            if kind == "eof" and wk is None:
+                if isinstance(payload, Exception):
+                    raise payload
+                break
+            yield kind, wk, payload
+    finally:
+        producer_thread.join(timeout=2.0)
+
 
 FEATURE_AUX_TAIL = [
     "log_dt_ms",
