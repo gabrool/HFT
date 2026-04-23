@@ -678,10 +678,12 @@ class _ConvEncoderLayer(nn.Module):
         self.dw_act = get_activation_fn(activation)
         self.sublayerconnect1 = SublayerConnection(enable_res_param, dropout)
         self.dw_norm = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)  # switchable
-        self.ff = nn.Sequential(nn.Conv1d(d_model, d_ff, 1, 1), 
-                                get_activation_fn(activation), 
-                                nn.Dropout(dropout), 
-                                nn.Conv1d(d_ff, d_model, 1, 1))
+        self.ff = nn.Sequential(
+                    nn.Linear(d_model, d_ff), 
+                    get_activation_fn(activation), 
+                    nn.Dropout(dropout), 
+                    nn.Linear(d_ff, d_model)
+                )
         self.sublayerconnect2 = SublayerConnection(enable_res_param, dropout)
         self.norm_ffn = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)
 
