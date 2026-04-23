@@ -539,8 +539,8 @@ def train_from_offline():
         # Disable pointwise autotuning to prevent benchmarking crashes
         torch._inductor.config.max_autotune_pointwise = False
         
-        model = torch.compile(model, mode=COMPILE_MODE, dynamic=True)
-        print("[compile] enabled full-model compile with dynamic=True, epilogue_fusion=False", flush=True)
+        model = torch.compile(model, mode=COMPILE_MODE, dynamic=False)
+        print("[compile] enabled full-model compile with dynamic=False, epilogue_fusion=False", flush=True)
         
     opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     primary_metric_mode=get_primary_metric_mode()
