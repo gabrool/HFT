@@ -487,7 +487,7 @@ PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
 PRIMARY_METRIC = "spearman_kept_q50plus_30000ms"
 PRIMARY_METRIC_HORIZON_MS = 30_000
-SINGLE_WEEK_PATIENCE = 1
+SINGLE_WEEK_PATIENCE = 3
 # Number of auxiliary channels appended after the base feature vector
 # These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_500ms,
 #  log_events_1000ms, log_events_3000ms, log_events_7500ms]
