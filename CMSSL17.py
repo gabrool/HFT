@@ -677,13 +677,14 @@ class _ConvEncoderLayer(nn.Module):
             self.DW_infer = nn.Conv1d(d_model, d_model, kernel_size, stride=1, padding='same', groups=d_model)
         self.dw_act = get_activation_fn(activation)
         self.sublayerconnect1 = SublayerConnection(enable_res_param, dropout)
-        self.dw_norm = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)  # switchable
+        self.dw_norm = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)
+        
         self.ff = nn.Sequential(
-                    nn.Linear(d_model, d_ff), 
-                    get_activation_fn(activation), 
-                    nn.Dropout(dropout), 
-                    nn.Linear(d_ff, d_model)
-                )
+            nn.Linear(d_model, d_ff), 
+            get_activation_fn(activation), 
+            nn.Dropout(dropout), 
+            nn.Linear(d_ff, d_model)
+        )
         self.sublayerconnect2 = SublayerConnection(enable_res_param, dropout)
         self.norm_ffn = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)
 
@@ -708,17 +709,30 @@ class _ConvEncoderLayer(nn.Module):
             out_x = self.DW_conv(src)
 
         residual_src = self.sublayerconnect1(src, self.dw_act(out_x))
-        normed_src = residual_src.permute(0, 2, 1).contiguous() if self.norm_tp != 'batch' else residual_src
-        normed_src = self.dw_norm(normed_src)
-        normed_src = normed_src.permute(0, 2, 1).contiguous() if self.norm_tp != 'batch' else normed_src
-        ff_out = normed_src
-        for layer in self.ff:
-            ff_out = layer(ff_out).contiguous()
-        residual_src2 = self.sublayerconnect2(normed_src, ff_out)
-        normed_src2 = residual_src2.permute(0, 2, 1).contiguous() if self.norm_tp != 'batch' else residual_src2
-        normed_src2 = self.norm_ffn(normed_src2)
-        normed_src2 = normed_src2.permute(0, 2, 1).contiguous() if self.norm_tp != 'batch' else normed_src2
-        return normed_src2
+        
+        if self.norm_tp != 'batch':
+            # LayerNorm natively operates on C, so permute to (B, L, C)
+            normed_src = residual_src.permute(0, 2, 1).contiguous()
+            normed_src = self.dw_norm(normed_src)
+            
+            # Apply Linear FFN directly on (B, L, C)
+            ff_out = self.ff(normed_src)
+            
+            residual_src2 = self.sublayerconnect2(normed_src, ff_out)
+            normed_src2 = self.norm_ffn(residual_src2)
+            
+            # Return cleanly as (B, C, L)
+            return normed_src2.permute(0, 2, 1).contiguous()
+        else:
+            normed_src = self.dw_norm(residual_src)
+            
+            # Must temporarily permute to (B, L, C) for Linear FFN
+            normed_src_t = normed_src.permute(0, 2, 1).contiguous()
+            ff_out_t = self.ff(normed_src_t)
+            ff_out = ff_out_t.permute(0, 2, 1).contiguous()
+            
+            residual_src2 = self.sublayerconnect2(normed_src, ff_out)
+            return self.norm_ffn(residual_src2)
 
 class ConvEncoder(nn.Module):
     def __init__(self, d_model, d_ff, kernel_size=[3,3,5,5,7,7], dropout=0.1, activation='gelu', 
