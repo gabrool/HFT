@@ -739,7 +739,7 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         self.d_model_internal = max(1, d_model // in_feats)
         self.d_ff_internal = max(2, d_ff // in_feats)
         self.output_linear = nn.Linear(patch_size, self.d_model_internal)
-        self.encoder = ConvEncoder(d_model=self.d_model_internal, d_ff=d_ff, kernel_size=dw_ks, dropout=dropout, activation=act,
+        self.encoder = ConvEncoder(d_model=self.d_model_internal, d_ff=self.d_ff_internal, kernel_size=dw_ks, dropout=dropout, activation=act,
                                    n_layers=n_layers, enable_res_param=enable_res_param, norm=norm, re_param=re_param, small_ks=re_param_kernel)
         self.final_proj = nn.Linear(self.d_model_internal * in_feats, d_model)
     def forward(self, x):
