@@ -527,11 +527,14 @@ def train_from_offline():
     dl_val=DataLoader(ds_val,BATCH_SIZE,shuffle=False,num_workers=max(1,WORKERS_VAL),pin_memory=True,persistent_workers=(max(1,WORKERS_VAL)>0))
     dl_test=DataLoader(ds_test,BATCH_SIZE,shuffle=False,num_workers=max(1,WORKERS_VAL),pin_memory=True,persistent_workers=(max(1,WORKERS_VAL)>0))
 
-    args=ModelArgs(DMODEL,MAMBA_LAYERS,F_total,LOOKBACK)
-    model=SAMBA(args).to(device)
-    if COMPILE_ENABLED and hasattr(torch,'compile'):
-        try: model=torch.compile(model, mode=COMPILE_MODE)
-        except Exception: pass
+    args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
+    model = SAMBA(args).to(device)
+
+    if COMPILE_ENABLED and hasattr(torch, "compile"):
+        import torch._inductor.config
+        torch._inductor.config.max_autotune_pointwise = False
+        model = torch.compile(model, mode=COMPILE_MODE, dynamic=True)
+        print("[compile] enabled full-model compile with dynamic=True and max_autotune_pointwise=False", flush=True)
     opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     primary_metric_mode=get_primary_metric_mode()
     best=-float('inf') if primary_metric_mode=='max' else float('inf')
