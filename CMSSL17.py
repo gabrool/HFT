@@ -527,6 +527,10 @@ class ModelArgs:
     d_conv: int = 3
     headdim: int = DMODEL // NUM_HEADS
 
+    def __post_init__(self):
+        assert self.d_model % NUM_HEADS == 0, "d_model must be divisible by NUM_HEADS"
+        assert self.headdim == (self.d_model // NUM_HEADS), "headdim must equal d_model // NUM_HEADS"
+
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-8):
         super().__init__()
@@ -617,7 +621,7 @@ class OffsetPredictor(nn.Module):
         self.stride = stride
         self.channel = in_feats
         self.patch_size = patch_size
-        hid_dim = max(2, 64 // in_feats)
+        hid_dim = 8
         self.offset_predictor = nn.Sequential(
             nn.Conv1d(1, hid_dim, patch_size, stride=stride, padding=0),
             nn.GELU(),
@@ -756,7 +760,9 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         self.patch_count = (seq_len - patch_size) // stride + 1
         self.patch_size = patch_size
         self.d_model_internal = max(1, d_model // in_feats)
-        self.d_ff_internal = max(2, d_ff // in_feats)
+        self.d_ff_internal = max(2 * self.d_model_internal, 4)
+        assert self.d_model_internal >= 1, "d_model_internal must be >= 1"
+        assert self.d_ff_internal >= 2 * self.d_model_internal, "d_ff_internal must be >= 2 * d_model_internal"
         self.output_linear = nn.Linear(patch_size, self.d_model_internal)
         self.encoder = ConvEncoder(d_model=self.d_model_internal, d_ff=self.d_ff_internal, kernel_size=dw_ks, dropout=dropout, activation=act,
                                    n_layers=n_layers, enable_res_param=enable_res_param, norm=norm, re_param=re_param, small_ks=re_param_kernel)
@@ -871,11 +877,14 @@ class SAMBA(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        assert args.d_model == DMODEL, f"Expected args.d_model ({args.d_model}) == DMODEL ({DMODEL})"
+        assert args.d_model % NUM_HEADS == 0, "args.d_model must be divisible by NUM_HEADS"
+        assert args.headdim == (args.d_model // NUM_HEADS), "args.headdim must match d_model // NUM_HEADS"
         # (3) Switch BatchNorm -> LayerNorm in ConvTimeNet
         self.depatch_proj_encoder = ConvTimeNetFeatureExtractor(
             in_feats=args.vocab_size, seq_len=args.seq_in, d_model=args.d_model, 
-            dw_ks=[3,3,5,5,7,7], n_layers=6, d_ff=256, dropout=0.1, act='gelu', 
-            enable_res_param=True, norm='layer', re_param=True, re_param_kernel=3, 
+            dw_ks=[3,3,5,5,7,7], n_layers=6, d_ff=DFF_CONV, dropout=0.1, act='gelu',
+            enable_res_param=False, norm='layer', re_param=True, re_param_kernel=3, 
             patch_size=2, stride=1
         )
         # Mamba backbone (forward/backward fusion) + pooling
