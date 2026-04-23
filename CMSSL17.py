@@ -888,7 +888,7 @@ class SAMBA(nn.Module):
             patch_size=2, stride=1
         )
         # Mamba backbone (forward/backward fusion) + pooling
-        self.mamba = Mamba(args, ff_hid=DMODEL)
+        self.mamba = Mamba(args, ff_hid=4*DMODEL)
 
         # Heads
         fused_dim = args.d_model * 2
