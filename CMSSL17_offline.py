@@ -531,7 +531,6 @@ def train_from_offline():
     model = SAMBA(args).to(device)
 
     if COMPILE_ENABLED and hasattr(torch, "compile"):
-        import torch._inductor.config
         torch._inductor.config.max_autotune_pointwise = False
         model = torch.compile(model, mode=COMPILE_MODE, dynamic=True)
         print("[compile] enabled full-model compile with dynamic=True and max_autotune_pointwise=False", flush=True)
