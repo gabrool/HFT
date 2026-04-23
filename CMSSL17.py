@@ -464,7 +464,7 @@ def coerce_ts_ms(value: Union[int, float, str]) -> int:
 LOOKBACK        = 600        # canonical event-time token lookback
 WINDOW_MS       = 60_000     # canonical rolling window span (60s)
 PAD_DT_FOR_LEFT = 0.0
-BATCH_SIZE      = 2048
+BATCH_SIZE      = 256
 DMODEL          = 256
 MAMBA_LAYERS    = 2
 CONV_KERNELS    = [3,3,5,5,7,7]
