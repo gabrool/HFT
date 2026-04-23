@@ -532,11 +532,16 @@ def train_from_offline():
     model = SAMBA(args).to(device)
 
     if COMPILE_ENABLED and hasattr(torch, "compile"):
-        # Use the 'cudagraphs' backend instead of 'inductor'.
-        # This captures the optimized kernel launches for a massive speedup
-        # but prevents the compiler from rewriting Mamba's tensors and crashing.
-        model = torch.compile(model, backend="cudagraphs")
-        print("[compile] enabled full-model compile with backend='cudagraphs'", flush=True)
+        # Disable epilogue fusion to prevent the Triton XBLOCK crash
+        inductor_config.epilogue_fusion = False
+        # Break the graph up slightly to preserve VRAM
+        inductor_config.realize_opcount_threshold = 40
+        # Disable pointwise autotuning to prevent benchmarking crashes
+        inductor_config.max_autotune_pointwise = False
+        
+        model = torch.compile(model, mode=COMPILE_MODE, dynamic=True)
+        print("[compile] enabled full-model compile with dynamic=True, epilogue_fusion=False", flush=True)
+        
     opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     primary_metric_mode=get_primary_metric_mode()
     best=-float('inf') if primary_metric_mode=='max' else float('inf')
