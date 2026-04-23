@@ -617,10 +617,11 @@ class OffsetPredictor(nn.Module):
         self.stride = stride
         self.channel = in_feats
         self.patch_size = patch_size
+        hid_dim = max(2, 64 // in_feats)
         self.offset_predictor = nn.Sequential(
-            nn.Conv1d(1, 64, patch_size, stride=stride, padding=0),
+            nn.Conv1d(1, hid_dim, patch_size, stride=stride, padding=0),
             nn.GELU(),
-            nn.Conv1d(64, 2, 1, 1, padding=0)
+            nn.Conv1d(hid_dim, 2, 1, 1, padding=0)
         )
         if use_zero_init:
             self.offset_predictor.apply(zero_init)
