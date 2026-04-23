@@ -532,9 +532,16 @@ def train_from_offline():
     model = SAMBA(args).to(device)
 
     if COMPILE_ENABLED and hasattr(torch, "compile"):
+        # 1. Disable epilogue fusion to stop XBLOCK from exceeding 4096 on massive tensors
+        torch._inductor.config.epilogue_fusion = False
+
+        # 2. Force the compiler to materialize tensors earlier to break the graph up
+        torch._inductor.config.realize_opcount_threshold = 40
+
+        # 3. Keep pointwise autotuning off to prevent benchmarking crashes
         torch._inductor.config.max_autotune_pointwise = False
         model = torch.compile(model, mode=COMPILE_MODE, dynamic=True)
-        print("[compile] enabled full-model compile with dynamic=True and max_autotune_pointwise=False", flush=True)
+        print("[compile] enabled full-model compile with dynamic=True, epilogue_fusion=False, realize_opcount_threshold=40", flush=True)
     opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     primary_metric_mode=get_primary_metric_mode()
     best=-float('inf') if primary_metric_mode=='max' else float('inf')
