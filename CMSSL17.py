@@ -867,8 +867,8 @@ class SAMBA(nn.Module):
         )
 
     def forward(self, x):
-        x_permuted = x.permute(0, 2, 1)
-        h_tokens = self.depatch_proj_encoder(x_permuted)                   # [B, L, D] (ConvTimeNet projection applied)
+        x_permuted = x.permute(0, 2, 1).contiguous()
+        h_tokens = self.depatch_proj_encoder(x_permuted).contiguous()        # [B, L, D] (ConvTimeNet projection applied)
 
         pooled, _, _ = self.mamba(h_tokens, embedded=True)
         pred_return = self.return_head(pooled)
