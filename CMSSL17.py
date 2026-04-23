@@ -742,17 +742,22 @@ class ConvTimeNetFeatureExtractor(nn.Module):
                                    n_layers=n_layers, enable_res_param=enable_res_param, norm=norm, re_param=re_param, small_ks=re_param_kernel)
         self.final_proj = nn.Linear(self.d_model_internal * in_feats, d_model)
     def forward(self, x):
-        out_patch = self.depatch(x)  # [B, feats, patch_count, patch_size]
-        out = self.output_linear(out_patch)  # [B, feats, patch_count, d_model_internal]
+        out_patch = self.depatch(x).contiguous()  # [B, feats, patch_count, patch_size]
+        out = self.output_linear(out_patch).contiguous()  # [B, feats, patch_count, d_model_internal]
+    
         B = out.shape[0]
-        u = out.reshape(B * out.shape[1], out.shape[2], self.d_model_internal)  # [B * feats, patch_count, d_model_internal]
-        u = u.permute(0, 2, 1)  # [B * feats, d_model_internal, patch_count]
-        out = self.encoder(u)  # [B * feats, d_model_internal, patch_count]
-        out = out.permute(0, 2, 1)  # [B * feats, patch_count, d_model_internal]
-        out = out.reshape(B, out.shape[0] // B, out.shape[1], self.d_model_internal)  # [B, feats, patch_count, d_model_internal]
-        out = out.permute(0, 2, 3, 1)  # [B, patch_count, d_model_internal, feats]
-        out = out.reshape(B, self.depatch.patch_count, self.d_model_internal * out.shape[3])  # [B, patch_count, d_model_internal * feats]
-        out = self.final_proj(out)  # [B, patch_count, d_model]
+    
+        u = out.reshape(B * out.shape[1], out.shape[2], self.d_model_internal)
+        u = u.permute(0, 2, 1).contiguous()  # [B * feats, d_model_internal, patch_count]
+    
+        out = self.encoder(u)
+        out = out.permute(0, 2, 1).contiguous()  # [B * feats, patch_count, d_model_internal]
+    
+        out = out.reshape(B, out.shape[0] // B, out.shape[1], self.d_model_internal)
+        out = out.permute(0, 2, 3, 1).contiguous()  # [B, patch_count, d_model_internal, feats]
+    
+        out = out.reshape(B, self.depatch.patch_count, self.d_model_internal * out.shape[3]).contiguous()
+        out = self.final_proj(out).contiguous()  # [B, patch_count, d_model]
         return out
 
 # ------------  Mamba wrapper + pooling ------------
