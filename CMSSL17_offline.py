@@ -535,7 +535,8 @@ def train_from_offline():
     opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     primary_metric_mode=get_primary_metric_mode()
     best=-float('inf') if primary_metric_mode=='max' else float('inf')
-    no_imp=0; early_stop_patience=SINGLE_WEEK_PATIENCE if len(tr_weeks)<=1 else PATIENCE
+    no_imp = 0
+    early_stop_patience = SINGLE_WEEK_PATIENCE if len(cmssl_train['weeks']) <= 1 else PATIENCE
 
     abs_lo_t=torch.tensor(stats['abs_lo_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
     abs_hi_t=torch.tensor(stats['abs_hi_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
