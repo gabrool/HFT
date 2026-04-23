@@ -533,11 +533,11 @@ def train_from_offline():
 
     if COMPILE_ENABLED and hasattr(torch, "compile"):
         # Disable epilogue fusion to prevent the Triton XBLOCK crash
-        inductor_config.epilogue_fusion = False
+        torch._inductor.config.epilogue_fusion = False
         # Break the graph up slightly to preserve VRAM
-        inductor_config.realize_opcount_threshold = 40
+        torch._inductor.config.realize_opcount_threshold = 40
         # Disable pointwise autotuning to prevent benchmarking crashes
-        inductor_config.max_autotune_pointwise = False
+        torch._inductor.config.max_autotune_pointwise = False
         
         model = torch.compile(model, mode=COMPILE_MODE, dynamic=True)
         print("[compile] enabled full-model compile with dynamic=True, epilogue_fusion=False", flush=True)
