@@ -708,7 +708,9 @@ class _ConvEncoderLayer(nn.Module):
         normed_src = residual_src.permute(0, 2, 1).contiguous() if self.norm_tp != 'batch' else residual_src
         normed_src = self.dw_norm(normed_src)
         normed_src = normed_src.permute(0, 2, 1).contiguous() if self.norm_tp != 'batch' else normed_src
-        ff_out = self.ff(normed_src)
+        ff_out = normed_src
+        for layer in self.ff:
+            ff_out = layer(ff_out).contiguous()
         residual_src2 = self.sublayerconnect2(normed_src, ff_out)
         normed_src2 = residual_src2.permute(0, 2, 1).contiguous() if self.norm_tp != 'batch' else residual_src2
         normed_src2 = self.norm_ffn(normed_src2)
