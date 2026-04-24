@@ -2525,7 +2525,9 @@ class WeekFeatureStore:
         self.feature_chunks = sorted(list(week_meta.get("feature_chunks", [])), key=lambda x: int(x["chunk"]))
         self.row_starts = np.array([int(ch["row_start"]) for ch in self.feature_chunks], dtype=np.int64)
         self.row_ends = np.array([int(ch["row_end"]) for ch in self.feature_chunks], dtype=np.int64)
-        self.features_mm = [np.load(self.week_dir / ch["files"]["features"], mmap_mode="r") for ch in self.feature_chunks]
+        # Fully load the chunk into RAM by omitting mmap_mode (or calling .copy())
+        # This eliminates the massive disk I/O bottleneck during shuffled Dataloader reads
+        self.features_mm = [np.load(self.week_dir / ch["files"]["features"])[:] for ch in self.feature_chunks]
 
     def _locate_chunk(self, row_idx: int) -> int:
         i = int(np.searchsorted(self.row_ends, int(row_idx), side="right"))
