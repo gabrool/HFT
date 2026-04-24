@@ -936,7 +936,7 @@ class SAM(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None: continue
-                p.data = self.state[p]["old_p"]
+                p.copy_(self.state[p]["old_p"])
         self.base_optimizer.step()
         if zero_grad: self.zero_grad()
 
