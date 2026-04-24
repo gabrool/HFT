@@ -11,12 +11,8 @@ There is no time-grid interpolation in this pipeline.
 Contract matches decision_time_basis = "ob_event_time".
 
 Outputs:
-  - snapshots.npz (raw OB event-time snapshots)
-  - decision_snapshots.npz (decision-aligned 11-column snapshot feature matrix)
-
-The raw snapshots payload is always a 4-column top-of-book matrix:
-  (best_bid, best_ask, best_bid_size, best_ask_size).
-RL execution consumes decision_snapshots.npz.
+  - snapshots.npz contains full event-time execution feature rows.
+  - decision_snapshots.npz contains the same execution feature schema aligned exactly to token decision timestamps.
 
 Env defaults:
   BYBIT_OB_DIR=/home/gabrool/Documents/OB
@@ -31,6 +27,7 @@ import importlib.util
 import json
 import os
 import re
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -38,13 +35,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from CMSSL17 import (
-    FeatureEngine,
-    _open_text,
-)
+from CMSSL17 import FeatureEngine, _open_text
 
-
-# fast json if available
 _orjson_spec = importlib.util.find_spec("orjson")
 if _orjson_spec is not None:
     import orjson as _fastjson
@@ -74,7 +66,6 @@ def _env_bool_int(name: str, default: int = 0) -> int:
     return int(v)
 
 
-# Quality/repair env config (parsed once at import time)
 BYBIT_DAY_CLIP = int(os.environ.get("BYBIT_DAY_CLIP", "1"))
 BYBIT_TS_BACKSTEP_CLAMP_MS = int(os.environ.get("BYBIT_TS_BACKSTEP_CLAMP_MS", "5000"))
 BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
@@ -82,26 +73,37 @@ BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
 BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
 ONE_DAY = timedelta(days=1)
-DECISION_SNAPSHOTS_SCHEMA_VERSION = 1
-RAW_SNAPSHOT_FEATURE_COLUMNS = [
-    "best_bid",
-    "best_ask",
-    "best_bid_size",
-    "best_ask_size",
-    "time_since_last_ob_update_ms",
-    "imbalance",
-    "mid",
-    "spread_bps",
-    "mid_ret_1",
-    "vol_short",
-    "vol_long",
+
+DECISION_SNAPSHOTS_SCHEMA_VERSION = 2
+EXEC_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
+DEPTH_LEVELS = (1, 5, 10, 20, 50)
+IMPACT_NOTIONALS_USD = (10_000.0, 25_000.0, 50_000.0, 100_000.0)
+IMPACT_BPS_BANDS = (1.0, 2.0, 5.0)
+EPS = 1e-12
+
+EXEC_SNAPSHOT_FEATURE_COLUMNS = [
+    "best_bid", "best_ask", "mid", "spread_bps", "half_spread_bps", "best_bid_size", "best_ask_size",
+    "time_since_last_ob_update_ms", "dt_ms", "l1_qty_imbalance", "l5_qty_imbalance", "l10_qty_imbalance",
+    "l20_qty_imbalance", "l50_qty_imbalance", "l5_notional_imbalance", "l10_notional_imbalance",
+    "l20_notional_imbalance", "l50_notional_imbalance", "microprice_bps_from_mid", "cum_bid_qty_l1",
+    "cum_ask_qty_l1", "cum_bid_qty_l5", "cum_ask_qty_l5", "cum_bid_qty_l10", "cum_ask_qty_l10",
+    "cum_bid_qty_l20", "cum_ask_qty_l20", "cum_bid_qty_l50", "cum_ask_qty_l50", "cum_bid_notional_l1",
+    "cum_ask_notional_l1", "cum_bid_notional_l5", "cum_ask_notional_l5", "cum_bid_notional_l10",
+    "cum_ask_notional_l10", "cum_bid_notional_l20", "cum_ask_notional_l20", "cum_bid_notional_l50",
+    "cum_ask_notional_l50", "buy_impact_bps_10k", "sell_impact_bps_10k", "buy_impact_bps_25k",
+    "sell_impact_bps_25k", "buy_impact_bps_50k", "sell_impact_bps_50k", "buy_impact_bps_100k",
+    "sell_impact_bps_100k", "buy_notional_within_1bps", "sell_notional_within_1bps", "buy_notional_within_2bps",
+    "sell_notional_within_2bps", "buy_notional_within_5bps", "sell_notional_within_5bps", "event_rate_1s",
+    "event_rate_3s", "event_rate_7p5s", "event_rate_15s", "event_rate_30s", "event_rate_60s", "mid_vol_bps_1s",
+    "mid_vol_bps_3s", "mid_vol_bps_7p5s", "mid_vol_bps_15s", "mid_vol_bps_30s", "mid_vol_bps_60s",
+    "spread_mean_bps_1s", "spread_mean_bps_3s", "spread_mean_bps_7p5s", "spread_mean_bps_15s",
+    "spread_mean_bps_30s", "spread_mean_bps_60s", "spread_p90_bps_30s", "spread_p90_bps_60s", "depth_l10_mean_1s",
+    "depth_l10_mean_3s", "depth_l10_mean_7p5s", "depth_l10_mean_15s", "depth_l10_mean_30s", "depth_l10_mean_60s",
+    "depth_l10_min_30s", "depth_l10_min_60s",
 ]
-SHORT_VOL_WINDOW = 20
-LONG_VOL_WINDOW = 50
 
 
 def quality_env_config() -> dict[str, object]:
-    """Serializable quality/repair env knobs for reports/metadata."""
     return {
         "day_clip": int(BYBIT_DAY_CLIP),
         "ts_backstep_clamp_ms": int(BYBIT_TS_BACKSTEP_CLAMP_MS),
@@ -123,16 +125,11 @@ def _ob_ext_rank(path: str) -> int:
 
 
 def _choose_preferred_daily_ob_path(candidates: List[str]) -> str:
-    def _sort_key(path: str) -> tuple[int, str, str]:
-        p = Path(path)
-        return (_ob_ext_rank(path), p.name, str(p))
-
-    return min(candidates, key=_sort_key)
+    return min(candidates, key=lambda path: (_ob_ext_rank(path), Path(path).name, str(path)))
 
 
 def _parse_requested_weeks(raw: str) -> List[str]:
-    items = [wk.strip() for wk in re.split(r"[\s,]+", raw) if wk.strip()]
-    return items
+    return [wk.strip() for wk in re.split(r"[\s,]+", raw) if wk.strip()]
 
 
 def _parse_ymd_date(s: str) -> date:
@@ -172,15 +169,11 @@ def _build_ob_daily_map(ob_dir: str) -> dict[date, str]:
         chosen = _choose_preferred_daily_ob_path([current, candidate])
         if chosen != current:
             by_day[day] = candidate
-        print(
-            f"[warn] duplicate daily OB for {day.isoformat()}: "
-            f"{Path(current).name} vs {path.name}; using {Path(chosen).name}"
-        )
+        print(f"[warn] duplicate daily OB for {day.isoformat()}: {Path(current).name} vs {path.name}; using {Path(chosen).name}")
     return by_day
 
 
 def _utc_day_bounds_ms(day: date) -> tuple[int, int]:
-    assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
@@ -188,32 +181,11 @@ def _utc_day_bounds_ms(day: date) -> tuple[int, int]:
 
 @dataclass
 class SnapshotSeries:
-    ts: List[int]
-    best_bid: List[float]
-    best_ask: List[float]
-    best_bid_size: List[float]
-    best_ask_size: List[float]
-    time_since_last_ob_update_ms: List[float]
-    day_by_row: List[str]
+    ts: list[int]
+    features: list[np.ndarray]
+    stale_ms: list[float]
+    day_by_row: list[str]
 
-    def append(
-        self,
-        ts_ms: int,
-        bid: float,
-        ask: float,
-        bid_size: float,
-        ask_size: float,
-        stale_ms: float,
-        day_key: str,
-    ) -> None:
-        # Invariant: every per-row series must be appended in lockstep.
-        self.ts.append(int(ts_ms))
-        self.best_bid.append(float(bid))
-        self.best_ask.append(float(ask))
-        self.best_bid_size.append(float(bid_size))
-        self.best_ask_size.append(float(ask_size))
-        self.time_since_last_ob_update_ms.append(max(float(stale_ms), 0.0))
-        self.day_by_row.append(str(day_key))
 
 @dataclass
 class DayQuality:
@@ -248,13 +220,11 @@ class DayQuality:
         self.out_ts_max = ts if self.out_ts_max is None else max(self.out_ts_max, ts)
 
     def append_example(self, category: str, payload: dict[str, object]) -> None:
-        assert self.examples is not None
         bucket = self.examples.setdefault(category, [])
         if len(bucket) < BYBIT_BAD_EXAMPLES_N:
             bucket.append(dict(payload))
 
     def set_abort_flag(self, flag: str, value: bool = True) -> None:
-        assert self.abort_flags is not None
         self.abort_flags[flag] = bool(value)
 
     def to_dict(self) -> dict[str, object]:
@@ -284,22 +254,11 @@ class WeekQuality:
     def add_day(self, day_quality: DayQuality) -> None:
         self.days.append(day_quality)
 
-    def increment_total(self, namespace: str, key: str, amount: int = 1) -> None:
-        ns = self.totals.setdefault(namespace, {})
-        ns[key] = int(ns.get(key, 0) + amount)
-
     def append_note(self, note: str) -> None:
-        assert self.notes is not None
         self.notes.append(str(note))
 
     def recompute_totals(self) -> None:
-        self.totals = {
-            "parse": {},
-            "event": {},
-            "backstep": {},
-            "day_clip": {},
-            "crossed_book": {},
-        }
+        self.totals = {"parse": {}, "event": {}, "backstep": {}, "day_clip": {}, "crossed_book": {}}
         for day in self.days:
             for namespace, values in day.counters.items():
                 ns = self.totals.setdefault(namespace, {})
@@ -319,7 +278,6 @@ class WeekQuality:
 
 
 def _day_bad_abs_and_total(day_quality: DayQuality) -> tuple[int, int]:
-    """Compute corruption and total counts for snapshot day quality."""
     bad_abs = 0
     for namespace in ("parse", "event", "backstep", "day_clip"):
         for key, value in day_quality.counters.get(namespace, {}).items():
@@ -330,19 +288,186 @@ def _day_bad_abs_and_total(day_quality: DayQuality) -> tuple[int, int]:
     return int(bad_abs), int(total)
 
 
+@dataclass
+class ExecutionRollingState:
+    event_ts_by_window: dict[int, deque[int]]
+    mid_by_window: dict[int, deque[tuple[int, float]]]
+    spread_by_window: dict[int, deque[tuple[int, float]]]
+    depth_l10_by_window: dict[int, deque[tuple[int, float]]]
+
+    @classmethod
+    def create(cls) -> "ExecutionRollingState":
+        return cls(
+            event_ts_by_window={w: deque() for w in EXEC_WINDOWS_MS},
+            mid_by_window={w: deque() for w in EXEC_WINDOWS_MS},
+            spread_by_window={w: deque() for w in EXEC_WINDOWS_MS},
+            depth_l10_by_window={w: deque() for w in EXEC_WINDOWS_MS},
+        )
+
+    def update(self, ts_ms: int, mid: float, spread_bps: float, depth_l10_notional: float) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for w in EXEC_WINDOWS_MS:
+            cutoff = int(ts_ms - w)
+            e = self.event_ts_by_window[w]
+            m = self.mid_by_window[w]
+            s = self.spread_by_window[w]
+            d = self.depth_l10_by_window[w]
+            e.append(int(ts_ms))
+            m.append((int(ts_ms), float(mid)))
+            s.append((int(ts_ms), float(spread_bps)))
+            d.append((int(ts_ms), float(depth_l10_notional)))
+            while e and e[0] < cutoff:
+                e.popleft()
+            while m and m[0][0] < cutoff:
+                m.popleft()
+            while s and s[0][0] < cutoff:
+                s.popleft()
+            while d and d[0][0] < cutoff:
+                d.popleft()
+
+            spread_arr = np.asarray([v for _, v in s], dtype=np.float64)
+            depth_arr = np.asarray([v for _, v in d], dtype=np.float64)
+            mids = np.asarray([v for _, v in m], dtype=np.float64)
+            log_mids = np.log(np.maximum(mids, EPS))
+            rets = np.diff(log_mids)
+            vol_bps = float(np.std(rets, ddof=0) * 1e4) if len(rets) >= 2 else 0.0
+
+            out[f"event_rate_{w}"] = float(len(e)) / (float(w) / 1000.0)
+            out[f"mid_vol_{w}"] = vol_bps
+            out[f"spread_mean_{w}"] = float(np.mean(spread_arr)) if spread_arr.size else 0.0
+            out[f"depth_mean_{w}"] = float(np.mean(depth_arr)) if depth_arr.size else 0.0
+            if w in (30_000, 60_000):
+                out[f"spread_p90_{w}"] = float(np.percentile(spread_arr, 90)) if spread_arr.size else 0.0
+                out[f"depth_min_{w}"] = float(np.min(depth_arr)) if depth_arr.size else 0.0
+        return out
+
+
+def _compute_cum_qty(levels: list[tuple[float, float]], depth: int) -> float:
+    return float(sum(size for _, size in levels[:depth]))
+
+
+def _compute_cum_notional(levels: list[tuple[float, float]], depth: int) -> float:
+    return float(sum(price * size for price, size in levels[:depth]))
+
+
+def _compute_qty_imbalance(bid_lvls: list[tuple[float, float]], ask_lvls: list[tuple[float, float]], depth: int) -> float:
+    bid_qty_N = _compute_cum_qty(bid_lvls, depth)
+    ask_qty_N = _compute_cum_qty(ask_lvls, depth)
+    return float((bid_qty_N - ask_qty_N) / max(bid_qty_N + ask_qty_N, EPS))
+
+
+def _compute_notional_imbalance(bid_lvls: list[tuple[float, float]], ask_lvls: list[tuple[float, float]], depth: int) -> float:
+    bid_notional_N = _compute_cum_notional(bid_lvls, depth)
+    ask_notional_N = _compute_cum_notional(ask_lvls, depth)
+    return float((bid_notional_N - ask_notional_N) / max(bid_notional_N + ask_notional_N, EPS))
+
+
+def estimate_market_order_impact_bps(side: str, notional_usd: float, mid: float, bid_lvls: list[tuple[float, float]], ask_lvls: list[tuple[float, float]]) -> float:
+    if notional_usd <= 0.0:
+        return 0.0
+    lvls = ask_lvls if side == "buy" else bid_lvls if side == "sell" else None
+    if lvls is None:
+        raise ValueError(f"unsupported side={side!r}")
+    remaining_notional = float(notional_usd)
+    filled_notional = 0.0
+    filled_qty = 0.0
+    for px, sz in lvls:
+        level_notional = float(px) * float(sz)
+        if level_notional <= 0.0:
+            continue
+        take = min(remaining_notional, level_notional)
+        qty = take / max(float(px), EPS)
+        filled_notional += take
+        filled_qty += qty
+        remaining_notional -= take
+        if remaining_notional <= EPS:
+            break
+    if filled_qty <= EPS:
+        impact_bps = 1000.0
+    else:
+        vwap = filled_notional / max(filled_qty, EPS)
+        if side == "buy":
+            impact_bps = 1e4 * (vwap - mid) / max(mid, EPS)
+        else:
+            impact_bps = 1e4 * (mid - vwap) / max(mid, EPS)
+    if remaining_notional > EPS:
+        unfilled_frac = remaining_notional / max(notional_usd, EPS)
+        impact_bps += 1000.0 * unfilled_frac
+    impact_bps = float(max(impact_bps, 0.0))
+    if not np.isfinite(impact_bps):
+        return 0.0
+    return impact_bps
+
+
+def notional_within_bps(side: str, band_bps: float, mid: float, bid_lvls: list[tuple[float, float]], ask_lvls: list[tuple[float, float]]) -> float:
+    total = 0.0
+    if side == "buy":
+        for ask_price, ask_size in ask_lvls:
+            dist_bps = 1e4 * (ask_price - mid) / max(mid, EPS)
+            if dist_bps <= band_bps:
+                total += ask_price * ask_size
+    elif side == "sell":
+        for bid_price, bid_size in bid_lvls:
+            dist_bps = 1e4 * (mid - bid_price) / max(mid, EPS)
+            if dist_bps <= band_bps:
+                total += bid_price * bid_size
+    else:
+        raise ValueError(f"unsupported side={side!r}")
+    return float(max(total, 0.0))
+
+
+def compute_execution_snapshot_features(*, ts_ms: int, stale_ms: float, dt_ms: float, bid_lvls: list[tuple[float, float]], ask_lvls: list[tuple[float, float]], rolling: ExecutionRollingState) -> np.ndarray:
+    best_bid, best_bid_size = bid_lvls[0]
+    best_ask, best_ask_size = ask_lvls[0]
+    mid = 0.5 * (best_bid + best_ask)
+    spread_bps = 1e4 * (best_ask - best_bid) / max(mid, EPS)
+    half_spread_bps = 0.5 * spread_bps
+
+    qty_imb = {d: _compute_qty_imbalance(bid_lvls, ask_lvls, d) for d in DEPTH_LEVELS}
+    notional_imb = {d: _compute_notional_imbalance(bid_lvls, ask_lvls, d) for d in DEPTH_LEVELS if d != 1}
+    cum_bid_qty = {d: _compute_cum_qty(bid_lvls, d) for d in DEPTH_LEVELS}
+    cum_ask_qty = {d: _compute_cum_qty(ask_lvls, d) for d in DEPTH_LEVELS}
+    cum_bid_notional = {d: _compute_cum_notional(bid_lvls, d) for d in DEPTH_LEVELS}
+    cum_ask_notional = {d: _compute_cum_notional(ask_lvls, d) for d in DEPTH_LEVELS}
+
+    micro = (best_ask * best_bid_size + best_bid * best_ask_size) / max(best_bid_size + best_ask_size, EPS)
+    microprice_bps_from_mid = 1e4 * (micro - mid) / max(mid, EPS)
+
+    buy_impact = {n: estimate_market_order_impact_bps("buy", n, mid, bid_lvls, ask_lvls) for n in IMPACT_NOTIONALS_USD}
+    sell_impact = {n: estimate_market_order_impact_bps("sell", n, mid, bid_lvls, ask_lvls) for n in IMPACT_NOTIONALS_USD}
+    buy_within = {b: notional_within_bps("buy", b, mid, bid_lvls, ask_lvls) for b in IMPACT_BPS_BANDS}
+    sell_within = {b: notional_within_bps("sell", b, mid, bid_lvls, ask_lvls) for b in IMPACT_BPS_BANDS}
+
+    depth_l10_notional = cum_bid_notional[10] + cum_ask_notional[10]
+    roll = rolling.update(int(ts_ms), float(mid), float(spread_bps), float(depth_l10_notional))
+
+    feats = [
+        best_bid, best_ask, mid, spread_bps, half_spread_bps, best_bid_size, best_ask_size, max(stale_ms, 0.0), max(dt_ms, 0.0),
+        qty_imb[1], qty_imb[5], qty_imb[10], qty_imb[20], qty_imb[50], notional_imb[5], notional_imb[10], notional_imb[20], notional_imb[50], microprice_bps_from_mid,
+        cum_bid_qty[1], cum_ask_qty[1], cum_bid_qty[5], cum_ask_qty[5], cum_bid_qty[10], cum_ask_qty[10], cum_bid_qty[20], cum_ask_qty[20], cum_bid_qty[50], cum_ask_qty[50],
+        cum_bid_notional[1], cum_ask_notional[1], cum_bid_notional[5], cum_ask_notional[5], cum_bid_notional[10], cum_ask_notional[10], cum_bid_notional[20], cum_ask_notional[20], cum_bid_notional[50], cum_ask_notional[50],
+        buy_impact[10_000.0], sell_impact[10_000.0], buy_impact[25_000.0], sell_impact[25_000.0], buy_impact[50_000.0], sell_impact[50_000.0], buy_impact[100_000.0], sell_impact[100_000.0],
+        buy_within[1.0], sell_within[1.0], buy_within[2.0], sell_within[2.0], buy_within[5.0], sell_within[5.0],
+        roll["event_rate_1000"], roll["event_rate_3000"], roll["event_rate_7500"], roll["event_rate_15000"], roll["event_rate_30000"], roll["event_rate_60000"],
+        roll["mid_vol_1000"], roll["mid_vol_3000"], roll["mid_vol_7500"], roll["mid_vol_15000"], roll["mid_vol_30000"], roll["mid_vol_60000"],
+        roll["spread_mean_1000"], roll["spread_mean_3000"], roll["spread_mean_7500"], roll["spread_mean_15000"], roll["spread_mean_30000"], roll["spread_mean_60000"],
+        roll["spread_p90_30000"], roll["spread_p90_60000"],
+        roll["depth_mean_1000"], roll["depth_mean_3000"], roll["depth_mean_7500"], roll["depth_mean_15000"], roll["depth_mean_30000"], roll["depth_mean_60000"],
+        roll["depth_min_30000"], roll["depth_min_60000"],
+    ]
+    arr = np.asarray(feats, dtype=np.float32)
+    if arr.shape[0] != len(EXEC_SNAPSHOT_FEATURE_COLUMNS) or not np.all(np.isfinite(arr)):
+        raise ValueError(f"invalid execution feature row ts={ts_ms} shape={arr.shape} finite={bool(np.all(np.isfinite(arr)))}")
+    return arr
+
+
 def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality) -> SnapshotSeries:
     fe = FeatureEngine()
-    series = SnapshotSeries(
-        ts=[],
-        best_bid=[],
-        best_ask=[],
-        best_bid_size=[],
-        best_ask_size=[],
-        time_since_last_ob_update_ms=[],
-        day_by_row=[],
-    )
+    series = SnapshotSeries(ts=[], features=[], stale_ms=[], day_by_row=[])
+    rolling = ExecutionRollingState.create()
 
     last_seen_ts_ms: Optional[int] = None
+    last_ob_update_ts_ms: Optional[int] = None
 
     for ob_path in ob_paths:
         day_match = OB_DAILY_RE.match(Path(ob_path).name)
@@ -354,6 +479,22 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
         dq_day = DayQuality(day=day.isoformat(), ob_path=ob_path, counters={})
         aborted_for_corruption = False
 
+        def _should_abort_corruption() -> bool:
+            nonlocal aborted_for_corruption
+            bad_abs, total = _day_bad_abs_and_total(dq_day)
+            bad_frac = float(bad_abs) / float(max(1, total))
+            if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
+                aborted_for_corruption = True
+                dq_day.set_abort_flag("aborted_due_to_corruption", True)
+                week_quality.tainted = True
+                week_quality.append_note(
+                    f"[warn] corruption abort day={dq_day.day} file={Path(ob_path).name} "
+                    f"bad_abs={bad_abs} total={total} bad_frac={bad_frac:.6f} "
+                    f"thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
+                )
+                return True
+            return False
+
         with _open_text(ob_path) as f:
             for line_no, line in enumerate(f, start=1):
                 dq_day.increment_counter("event", "total")
@@ -363,10 +504,7 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                     raw = fast_json_loads(line)
                 except Exception:
                     dq_day.increment_counter("parse", "bad_json")
-                    dq_day.append_example(
-                        "bad_json",
-                        {"line": int(line_no), "sample": line[:200].rstrip()},
-                    )
+                    dq_day.append_example("bad_json", {"line": int(line_no), "sample": line[:200].rstrip()})
                     raw = None
 
                 if raw is not None:
@@ -378,33 +516,13 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                         raw = None
 
                 if raw is None:
-                    bad_abs, total = _day_bad_abs_and_total(dq_day)
-                    bad_frac = float(bad_abs) / float(max(1, total))
-                    if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
-                        aborted_for_corruption = True
-                        dq_day.set_abort_flag("aborted_due_to_corruption", True)
-                        week_quality.tainted = True
-                        week_quality.append_note(
-                            "[warn] corruption abort day="
-                            f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
-                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
-                        )
+                    if _should_abort_corruption():
                         break
                     continue
 
                 if etype != "ob":
                     dq_day.increment_counter("event", "non_ob")
-                    bad_abs, total = _day_bad_abs_and_total(dq_day)
-                    bad_frac = float(bad_abs) / float(max(1, total))
-                    if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
-                        aborted_for_corruption = True
-                        dq_day.set_abort_flag("aborted_due_to_corruption", True)
-                        week_quality.tainted = True
-                        week_quality.append_note(
-                            "[warn] corruption abort day="
-                            f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
-                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
-                        )
+                    if _should_abort_corruption():
                         break
                     continue
 
@@ -413,17 +531,7 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                 if BYBIT_DAY_CLIP and (ts_ms_raw < day_start_ms or ts_ms_raw >= day_end_ms):
                     dq_day.increment_counter("day_clip", "clipped")
                     dq_day.append_example("day_clip", {"line": int(line_no), "ts_raw": int(ts_ms_raw)})
-                    bad_abs, total = _day_bad_abs_and_total(dq_day)
-                    bad_frac = float(bad_abs) / float(max(1, total))
-                    if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
-                        aborted_for_corruption = True
-                        dq_day.set_abort_flag("aborted_due_to_corruption", True)
-                        week_quality.tainted = True
-                        week_quality.append_note(
-                            "[warn] corruption abort day="
-                            f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
-                            f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
-                        )
+                    if _should_abort_corruption():
                         break
                     continue
 
@@ -431,33 +539,17 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
                 if last_seen_ts_ms is not None and repaired_ts_ms < last_seen_ts_ms:
                     backstep_ms = last_seen_ts_ms - repaired_ts_ms
                     if BYBIT_STRICT_DATA:
-                        raise ValueError(
-                            "Non-decreasing repaired OB event timestamps violated: "
-                            f"previous_ts_ms={last_seen_ts_ms} current_ts_ms={repaired_ts_ms} "
-                            f"raw_ts_ms={ts_ms_raw}. strict_data=1"
-                        )
+                        raise ValueError(f"Non-decreasing repaired OB event timestamps violated: previous_ts_ms={last_seen_ts_ms} current_ts_ms={repaired_ts_ms} raw_ts_ms={ts_ms_raw}. strict_data=1")
                     if backstep_ms <= BYBIT_TS_BACKSTEP_CLAMP_MS:
                         repaired_ts_ms = last_seen_ts_ms
                         dq_day.increment_counter("backstep", "clamp")
                     else:
                         dq_day.increment_counter("backstep", "drop")
-                        dq_day.append_example(
-                            "backstep_drop",
-                            {"line": int(line_no), "prev_ts": int(last_seen_ts_ms), "curr_ts": int(ts_ms_raw)},
-                        )
-                        bad_abs, total = _day_bad_abs_and_total(dq_day)
-                        bad_frac = float(bad_abs) / float(max(1, total))
-                        if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
-                            aborted_for_corruption = True
-                            dq_day.set_abort_flag("aborted_due_to_corruption", True)
-                            week_quality.tainted = True
-                            week_quality.append_note(
-                                "[warn] corruption abort day="
-                                f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
-                                f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
-                            )
+                        dq_day.append_example("backstep_drop", {"line": int(line_no), "prev_ts": int(last_seen_ts_ms), "curr_ts": int(ts_ms_raw)})
+                        if _should_abort_corruption():
                             break
                         continue
+
                 last_seen_ts_ms = repaired_ts_ms
                 dq_day.update_output_ts(repaired_ts_ms)
 
@@ -471,41 +563,49 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
 
                 fe._update_book_from_ob(tp_code, bids, asks)
                 fe._ensure_book_ladders()
-                bid, ask, bsz, asz = fe._book_best()
-                if bid <= 0.0 or ask <= 0.0 or bsz is None or asz is None:
+                bid_lvls = fe.bid_lvls
+                ask_lvls = fe.ask_lvls
+                if not bid_lvls or not ask_lvls:
+                    dq_day.increment_counter("event", "invalid_book_drop")
+                    if _should_abort_corruption():
+                        break
                     continue
-                bsz = max(float(bsz), 0.0)
-                asz = max(float(asz), 0.0)
+                best_bid, best_ask, best_bid_size, best_ask_size = fe._book_best()
+                if best_bid <= 0.0 or best_ask <= 0.0 or best_bid_size <= 0.0 or best_ask_size <= 0.0:
+                    dq_day.increment_counter("event", "invalid_book_drop")
+                    if _should_abort_corruption():
+                        break
+                    continue
+
+                stale_ms = 0.0 if last_ob_update_ts_ms is None else max(float(repaired_ts_ms - last_ob_update_ts_ms), 0.0)
+                dt_ms = 1.0 if not series.ts else max(float(repaired_ts_ms - series.ts[-1]), 0.0)
+                last_ob_update_ts_ms = repaired_ts_ms
+                feature_vec = compute_execution_snapshot_features(
+                    ts_ms=repaired_ts_ms,
+                    stale_ms=stale_ms,
+                    dt_ms=dt_ms,
+                    bid_lvls=bid_lvls,
+                    ask_lvls=ask_lvls,
+                    rolling=rolling,
+                )
 
                 if series.ts and series.ts[-1] == repaired_ts_ms:
-                    series.best_bid[-1] = float(bid)
-                    series.best_ask[-1] = float(ask)
-                    series.best_bid_size[-1] = float(bsz)
-                    series.best_ask_size[-1] = float(asz)
-                    series.time_since_last_ob_update_ms[-1] = 0.0
+                    series.features[-1] = feature_vec
+                    series.stale_ms[-1] = 0.0
                     series.day_by_row[-1] = str(dq_day.day)
-                    continue
+                else:
+                    series.ts.append(int(repaired_ts_ms))
+                    series.features.append(feature_vec)
+                    series.stale_ms.append(float(stale_ms))
+                    series.day_by_row.append(str(dq_day.day))
 
-                series.append(repaired_ts_ms, bid, ask, bsz, asz, 0.0, dq_day.day)
-
-                bad_abs, total = _day_bad_abs_and_total(dq_day)
-                bad_frac = float(bad_abs) / float(max(1, total))
-                if bad_abs >= BYBIT_BAD_ABS_ABORT or bad_frac >= BYBIT_BAD_FRAC_ABORT:
-                    aborted_for_corruption = True
-                    dq_day.set_abort_flag("aborted_due_to_corruption", True)
-                    week_quality.tainted = True
-                    week_quality.append_note(
-                        "[warn] corruption abort day="
-                        f"{dq_day.day} file={Path(ob_path).name} bad_abs={bad_abs} total={total} "
-                        f"bad_frac={bad_frac:.6f} thresholds(abs={BYBIT_BAD_ABS_ABORT}, frac={BYBIT_BAD_FRAC_ABORT})"
-                    )
+                if _should_abort_corruption():
                     break
 
         bad_abs, total = _day_bad_abs_and_total(dq_day)
         dq_day.increment_counter("event", "bad_abs", bad_abs)
         dq_day.increment_counter("event", "bad_total", total)
         week_quality.add_day(dq_day)
-
         parse_bad_json = dq_day.counters.get("parse", {}).get("bad_json", 0)
         parse_fail = dq_day.counters.get("parse", {}).get("parse_fail", 0)
         non_ob = dq_day.counters.get("event", {}).get("non_ob", 0)
@@ -513,12 +613,7 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
         backstep_drop = dq_day.counters.get("backstep", {}).get("drop", 0)
         backstep_clamp = dq_day.counters.get("backstep", {}).get("clamp", 0)
         if parse_bad_json or parse_fail or non_ob or day_clipped or backstep_drop or backstep_clamp or aborted_for_corruption:
-            print(
-                f"[quality] {Path(ob_path).name}: "
-                f"bad_json={parse_bad_json:,} parse_fail={parse_fail:,} non_ob={non_ob:,} day_clipped={day_clipped:,} "
-                f"backstep_clamp={backstep_clamp:,} backstep_drop={backstep_drop:,} "
-                f"aborted={int(aborted_for_corruption)}"
-            )
+            print(f"[quality] {Path(ob_path).name}: bad_json={parse_bad_json:,} parse_fail={parse_fail:,} non_ob={non_ob:,} day_clipped={day_clipped:,} backstep_clamp={backstep_clamp:,} backstep_drop={backstep_drop:,} aborted={int(aborted_for_corruption)}")
 
     week_quality.recompute_totals()
     return series
@@ -527,9 +622,7 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
 def load_weeks_in_order(out_root: str) -> List[str]:
     meta_path = Path(out_root) / "meta.json"
     if not meta_path.exists():
-        raise FileNotFoundError(
-            f"Missing {meta_path}. Run offline_ingest first to create OUT_ROOT/meta.json."
-        )
+        raise FileNotFoundError(f"Missing {meta_path}. Run offline_ingest first to create OUT_ROOT/meta.json.")
     with meta_path.open("r", encoding="utf-8") as f:
         meta = json.load(f)
     weeks = meta.get("weeks_in_order")
@@ -539,36 +632,21 @@ def load_weeks_in_order(out_root: str) -> List[str]:
 
 
 def validate_metadata_contract(out_root: str) -> None:
-    """Validate offline_ingest metadata contract required by offline snapshots."""
     meta_path = Path(out_root) / "meta.json"
     if not meta_path.exists():
-        raise FileNotFoundError(
-            f"Missing {meta_path}. Run offline_ingest first to create OUT_ROOT/meta.json."
-        )
+        raise FileNotFoundError(f"Missing {meta_path}. Run offline_ingest first to create OUT_ROOT/meta.json.")
     with meta_path.open("r", encoding="utf-8") as f:
         meta = json.load(f)
 
     decision_time_basis = meta.get("decision_time_basis")
     if decision_time_basis != "ob_event_time":
-        raise ValueError(
-            "Unsupported metadata contract in OUT_ROOT/meta.json: "
-            f"decision_time_basis={decision_time_basis!r}. "
-            "Required decision_time_basis='ob_event_time'."
-        )
+        raise ValueError(f"Unsupported metadata contract in OUT_ROOT/meta.json: decision_time_basis={decision_time_basis!r}. Required decision_time_basis='ob_event_time'.")
 
     decision_policy = meta.get("decision_policy")
     if decision_policy is not None and decision_policy != "ob_event_time":
         if decision_policy == "ob_only_grid_quantized":
-            raise ValueError(
-                "Rejected deprecated grid decision policy in OUT_ROOT/meta.json: "
-                "decision_policy='ob_only_grid_quantized'. "
-                "This snapshot builder only supports ob_event_time policy metadata."
-            )
-        raise ValueError(
-            "Unsupported metadata contract in OUT_ROOT/meta.json: "
-            f"decision_policy={decision_policy!r}. "
-            "Required decision_policy='ob_event_time' when decision_policy is present."
-        )
+            raise ValueError("Rejected deprecated grid decision policy in OUT_ROOT/meta.json: decision_policy='ob_only_grid_quantized'. This snapshot builder only supports ob_event_time policy metadata.")
+        raise ValueError(f"Unsupported metadata contract in OUT_ROOT/meta.json: decision_policy={decision_policy!r}. Required decision_policy='ob_event_time' when decision_policy is present.")
 
 
 def filter_weeks(weeks_in_order: List[str], requested: Optional[List[str]]) -> List[str]:
@@ -579,11 +657,9 @@ def filter_weeks(weeks_in_order: List[str], requested: Optional[List[str]]) -> L
 
 
 def daily_ob_paths_for_week(week_key: str, ob_by_day: dict[date, str]) -> List[str]:
-    assert ONE_DAY.total_seconds() > 0, "ONE_DAY must be positive and non-zero"
     start_dt, end_dt, _ = _parse_week_key(week_key)
     d0, d1 = start_dt.date(), end_dt.date()
-    paths = []
-    missing = []
+    paths, missing = [], []
     d = d0
     while d <= d1:
         p = ob_by_day.get(d)
@@ -597,6 +673,65 @@ def daily_ob_paths_for_week(week_key: str, ob_by_day: dict[date, str]) -> List[s
     return paths
 
 
+def _sample_bad_rows(indices: np.ndarray, snapshot_ts: np.ndarray, snapshot_features: np.ndarray, cols: list[str], limit: int = 5) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for idx in indices[: min(limit, int(indices.shape[0]))]:
+        i = int(idx)
+        row = {"row": i, "ts": int(snapshot_ts[i])}
+        for c in cols:
+            ci = EXEC_SNAPSHOT_FEATURE_COLUMNS.index(c)
+            row[c] = float(snapshot_features[i, ci])
+        out.append(row)
+    return out
+
+
+def validate_execution_snapshot_features(snapshot_ts: np.ndarray, snapshot_features: np.ndarray, *, week_key: str, stage: str) -> None:
+    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
+    snapshot_features = np.asarray(snapshot_features, dtype=np.float64)
+    if snapshot_ts.ndim != 1:
+        raise ValueError(f"{stage} week={week_key}: snapshot_ts must be 1D")
+    if snapshot_features.ndim != 2:
+        raise ValueError(f"{stage} week={week_key}: snapshot_features must be 2D")
+    if snapshot_features.shape[1] != len(EXEC_SNAPSHOT_FEATURE_COLUMNS):
+        raise ValueError(f"{stage} week={week_key}: feature count mismatch got={snapshot_features.shape[1]} expected={len(EXEC_SNAPSHOT_FEATURE_COLUMNS)}")
+    if snapshot_features.shape[0] != snapshot_ts.shape[0]:
+        raise ValueError(f"{stage} week={week_key}: row count mismatch ts={snapshot_ts.shape[0]} feats={snapshot_features.shape[0]}")
+    if snapshot_ts.size and np.any(np.diff(snapshot_ts) < 0):
+        raise ValueError(f"{stage} week={week_key}: snapshot_ts must be monotonically non-decreasing")
+    if not np.all(np.isfinite(snapshot_features)):
+        bad = np.argwhere(~np.isfinite(snapshot_features))[:5]
+        raise ValueError(f"{stage} week={week_key}: non-finite snapshot_features found sample_idx={bad.tolist()}")
+
+    idx = {k: EXEC_SNAPSHOT_FEATURE_COLUMNS.index(k) for k in ["best_bid", "best_ask", "mid", "spread_bps"]}
+    bid, ask, mid, spread = (snapshot_features[:, idx["best_bid"]], snapshot_features[:, idx["best_ask"]], snapshot_features[:, idx["mid"]], snapshot_features[:, idx["spread_bps"]])
+    bad_bid = np.flatnonzero(bid <= 0)
+    bad_ask = np.flatnonzero(ask <= 0)
+    crossed = np.flatnonzero(ask < bid)
+    bad_mid = np.flatnonzero(mid <= 0)
+    bad_spread = np.flatnonzero(spread < 0)
+    if bad_bid.size or bad_ask.size or crossed.size or bad_mid.size or bad_spread.size:
+        raise ValueError(f"{stage} week={week_key}: top-of-book constraints failed bad_bid={bad_bid.size} bad_ask={bad_ask.size} crossed={crossed.size} bad_mid={bad_mid.size} bad_spread={bad_spread.size} samples={_sample_bad_rows(crossed if crossed.size else bad_bid if bad_bid.size else bad_ask if bad_ask.size else bad_mid if bad_mid.size else bad_spread, snapshot_ts, snapshot_features, ['best_bid','best_ask','mid','spread_bps'])}")
+
+    impact_cols = [c for c in EXEC_SNAPSHOT_FEATURE_COLUMNS if c.startswith("buy_impact_bps_") or c.startswith("sell_impact_bps_")]
+    depth_notional_cols = [
+        c for c in EXEC_SNAPSHOT_FEATURE_COLUMNS
+        if c.startswith("cum_") or c.startswith("buy_notional_within_") or c.startswith("sell_notional_within_") or c.startswith("depth_l10_") or c in {"best_bid_size", "best_ask_size"}
+    ]
+    imbalance_cols = [c for c in EXEC_SNAPSHOT_FEATURE_COLUMNS if "imbalance" in c]
+
+    for c in impact_cols + depth_notional_cols:
+        col = snapshot_features[:, EXEC_SNAPSHOT_FEATURE_COLUMNS.index(c)]
+        bad = np.flatnonzero(col < 0)
+        if bad.size:
+            raise ValueError(f"{stage} week={week_key}: negative values in {c} count={bad.size} samples={_sample_bad_rows(bad, snapshot_ts, snapshot_features, [c])}")
+
+    for c in imbalance_cols:
+        col = snapshot_features[:, EXEC_SNAPSHOT_FEATURE_COLUMNS.index(c)]
+        bad = np.flatnonzero((col < -1.000001) | (col > 1.000001))
+        if bad.size:
+            raise ValueError(f"{stage} week={week_key}: imbalance bounds violated in {c} count={bad.size} samples={_sample_bad_rows(bad, snapshot_ts, snapshot_features, [c])}")
+
+
 def _repair_crossed_top_of_book_row(bid: float, ask: float) -> tuple[float, float, bool]:
     if ask >= bid:
         return float(bid), float(ask), False
@@ -604,123 +739,61 @@ def _repair_crossed_top_of_book_row(bid: float, ask: float) -> tuple[float, floa
     return repaired_px, repaired_px, True
 
 
-def _sample_rows_for_error(
-    indices: np.ndarray,
-    snapshot_ts: np.ndarray,
-    best_bid: np.ndarray,
-    best_ask: np.ndarray,
-    *,
-    limit: int = 5,
-) -> list[dict[str, object]]:
-    samples = []
-    for idx in indices[: min(limit, int(indices.shape[0]))]:
-        row_idx = int(idx)
-        samples.append(
-            {
-                "row": row_idx,
-                "ts": int(snapshot_ts[row_idx]),
-                "best_bid": float(best_bid[row_idx]),
-                "best_ask": float(best_ask[row_idx]),
-            }
-        )
-    return samples
-
-
-def repair_snapshot_book_rows(
-    snapshot_ts: np.ndarray,
-    snapshots: np.ndarray,
-    *,
-    week_quality: Optional[WeekQuality] = None,
-    day_by_row: Optional[list[str]] = None,
-) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+def repair_execution_snapshot_book_rows(snapshot_ts: np.ndarray, snapshot_features: np.ndarray, *, week_quality: Optional[WeekQuality] = None, day_by_row: Optional[list[str]] = None) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-    repaired = np.asarray(snapshots, dtype=np.float64).copy()
-    if repaired.ndim != 2 or repaired.shape[1] != 4:
-        raise ValueError(f"snapshots must be [N,4], got shape={repaired.shape}")
-    if snapshot_ts.shape[0] != repaired.shape[0]:
-        raise ValueError("snapshot_ts length must match snapshots rows")
+    repaired = np.asarray(snapshot_features, dtype=np.float64).copy()
+    if repaired.ndim != 2 or repaired.shape[1] != len(EXEC_SNAPSHOT_FEATURE_COLUMNS):
+        raise ValueError(f"snapshot_features must be [N,{len(EXEC_SNAPSHOT_FEATURE_COLUMNS)}], got shape={repaired.shape}")
 
-    best_bid = repaired[:, 0]
-    best_ask = repaired[:, 1]
+    bid_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("best_bid")
+    ask_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("best_ask")
+    bid_size_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("best_bid_size")
+    ask_size_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("best_ask_size")
+    mid_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("mid")
+    spread_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("spread_bps")
+    half_spread_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("half_spread_bps")
+    l1_imb_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("l1_qty_imbalance")
+    micro_idx = EXEC_SNAPSHOT_FEATURE_COLUMNS.index("microprice_bps_from_mid")
+
+    best_bid = repaired[:, bid_idx]
+    best_ask = repaired[:, ask_idx]
     crossed_idx = np.flatnonzero(best_ask < best_bid)
     examples: list[dict[str, object]] = []
-    for idx in crossed_idx:
-        row = int(idx)
+    for row in crossed_idx:
+        row = int(row)
         orig_bid = float(best_bid[row])
         orig_ask = float(best_ask[row])
         fixed_bid, fixed_ask, was_repaired = _repair_crossed_top_of_book_row(orig_bid, orig_ask)
         if was_repaired:
-            best_bid[row] = fixed_bid
-            best_ask[row] = fixed_ask
+            repaired[row, bid_idx] = fixed_bid
+            repaired[row, ask_idx] = fixed_ask
+            repaired[row, mid_idx] = 0.5 * (fixed_bid + fixed_ask)
+            repaired[row, spread_idx] = 1e4 * (fixed_ask - fixed_bid) / max(repaired[row, mid_idx], EPS)
+            repaired[row, half_spread_idx] = 0.5 * repaired[row, spread_idx]
+            bsz = max(float(repaired[row, bid_size_idx]), 0.0)
+            asz = max(float(repaired[row, ask_size_idx]), 0.0)
+            repaired[row, l1_imb_idx] = (bsz - asz) / max(bsz + asz, EPS)
+            micro = (fixed_ask * bsz + fixed_bid * asz) / max(bsz + asz, EPS)
+            repaired[row, micro_idx] = 1e4 * (micro - repaired[row, mid_idx]) / max(repaired[row, mid_idx], EPS)
         if len(examples) < BYBIT_BAD_EXAMPLES_N:
-            examples.append(
-                {
-                    "row": row,
-                    "ts": int(snapshot_ts[row]),
-                    "original_bid": orig_bid,
-                    "original_ask": orig_ask,
-                    "repaired_bid": float(best_bid[row]),
-                    "repaired_ask": float(best_ask[row]),
-                }
-            )
+            examples.append({"row": row, "ts": int(snapshot_ts[row]), "original_bid": orig_bid, "original_ask": orig_ask, "repaired_bid": float(repaired[row, bid_idx]), "repaired_ask": float(repaired[row, ask_idx])})
 
-    repaired_count = int(crossed_idx.shape[0])
-    if week_quality is not None:
+    if week_quality is not None and day_by_row is not None:
         day_counter: dict[str, int] = {}
-        if day_by_row is not None:
-            if len(day_by_row) != repaired.shape[0]:
-                raise ValueError("day_by_row length must match snapshots rows")
-            for idx in crossed_idx:
-                day_counter[str(day_by_row[int(idx)])] = day_counter.get(str(day_by_row[int(idx)]), 0) + 1
+        for idx in crossed_idx:
+            day_counter[str(day_by_row[int(idx)])] = day_counter.get(str(day_by_row[int(idx)]), 0) + 1
         for day in week_quality.days:
             detected = int(day_counter.get(day.day, 0))
             if detected > 0:
                 day.increment_counter("crossed_book", "crossed_detected", detected)
                 day.increment_counter("crossed_book", "crossed_repaired", detected)
-                for ex in examples:
-                    if str(day.day) == str(day_by_row[int(ex["row"])]):
-                        day.append_example("crossed_book_repair", ex)
         week_quality.recompute_totals()
 
-    summary = {
-        "crossed_detected": repaired_count,
-        "crossed_repaired": repaired_count,
-        "examples": examples,
-    }
+    summary = {"crossed_detected": int(crossed_idx.shape[0]), "crossed_repaired": int(crossed_idx.shape[0]), "examples": examples}
     return snapshot_ts, repaired.astype(np.float32, copy=False), summary
 
 
-def validate_repaired_snapshot_book(
-    snapshot_ts: np.ndarray,
-    snapshots: np.ndarray,
-    *,
-    week_key: str,
-    stage: str,
-) -> None:
-    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-    snapshots = np.asarray(snapshots, dtype=np.float64)
-    bid = snapshots[:, 0]
-    ask = snapshots[:, 1]
-    bad_bid = np.flatnonzero(~np.isfinite(bid) | (bid <= 0.0))
-    bad_ask = np.flatnonzero(~np.isfinite(ask) | (ask <= 0.0))
-    crossed = np.flatnonzero(ask < bid)
-    if bad_bid.size or bad_ask.size or crossed.size:
-        raise ValueError(
-            f"{stage}: invalid snapshot top-of-book after repair for week={week_key}; "
-            f"bad_bid={int(bad_bid.size)} bad_ask={int(bad_ask.size)} crossed={int(crossed.size)} "
-            f"crossed_samples={_sample_rows_for_error(crossed, snapshot_ts, bid, ask)}"
-        )
-
-
-def write_week_snapshots(
-    out_root: str,
-    week_key: str,
-    snapshot_ts: np.ndarray,
-    snapshots: np.ndarray,
-    stale_ms: np.ndarray,
-    *,
-    overwrite: bool,
-) -> Path:
+def write_week_snapshots(out_root: str, week_key: str, snapshot_ts: np.ndarray, snapshot_features: np.ndarray, stale_ms: np.ndarray, *, overwrite: bool) -> Path:
     week_dir = Path(out_root) / week_key
     week_dir.mkdir(parents=True, exist_ok=True)
     out_path = week_dir / "snapshots.npz"
@@ -729,8 +802,10 @@ def write_week_snapshots(
     np.savez_compressed(
         out_path,
         ts=np.asarray(snapshot_ts, dtype=np.int64),
-        snapshots=np.asarray(snapshots, dtype=np.float32),
+        snapshots=np.asarray(snapshot_features, dtype=np.float32),
         time_since_last_ob_update_ms=np.asarray(stale_ms, dtype=np.float32),
+        schema_version=np.asarray(DECISION_SNAPSHOTS_SCHEMA_VERSION, dtype=np.int64),
+        feature_columns_json=np.asarray(json.dumps(EXEC_SNAPSHOT_FEATURE_COLUMNS), dtype=np.str_),
     )
     return out_path
 
@@ -767,8 +842,7 @@ def load_week_decision_timestamps(out_root: str, week_key: str) -> np.ndarray:
         ts_path = week_meta_path.parent / str(files["ts"])
         if not ts_path.exists():
             raise FileNotFoundError(f"Week={week_key} chunk[{idx}] missing ts file: {ts_path}")
-        ts_arr = np.load(ts_path)
-        ts_arr = np.asarray(ts_arr)
+        ts_arr = np.asarray(np.load(ts_path))
         if ts_arr.ndim != 1:
             raise ValueError(f"Week={week_key} chunk[{idx}] ts must be 1D, got shape={ts_arr.shape}")
         if ts_arr.size and np.any(np.diff(ts_arr.astype(np.int64, copy=False)) < 0):
@@ -782,159 +856,11 @@ def load_week_decision_timestamps(out_root: str, week_key: str) -> np.ndarray:
     return week_ts
 
 
-def _ffill_1d(x: np.ndarray) -> np.ndarray:
-    out = np.asarray(x, dtype=np.float64).copy()
-    if out.size == 0:
-        return out
-    finite_mask = np.isfinite(out)
-    if not np.any(finite_mask):
-        out[:] = 0.0
-        return out
-    idx = np.where(finite_mask, np.arange(out.size), 0)
-    np.maximum.accumulate(idx, out=idx)
-    out = out[idx]
-    out[~np.isfinite(out)] = 0.0
-    return out
-
-
-def _rolling_std_ignore_nan(x: np.ndarray, window: int) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float64)
-    n = x.size
-    if n == 0:
-        return np.empty(0, dtype=np.float64)
-    finite = np.isfinite(x)
-    x_finite = np.where(finite, x, 0.0)
-    x_finite_sq = x_finite * x_finite
-    csum = np.cumsum(x_finite)
-    csum2 = np.cumsum(x_finite_sq)
-    count_csum = np.cumsum(finite.astype(np.int64))
-    count = count_csum.copy()
-    sums = csum.copy()
-    sumsq = csum2.copy()
-    if window < n:
-        count[window:] -= count_csum[:-window]
-        sums[window:] -= csum[:-window]
-        sumsq[window:] -= csum2[:-window]
-    out = np.full(n, np.nan, dtype=np.float64)
-    valid = count > 1
-    var_num = sumsq[valid] - (sums[valid] * sums[valid]) / count[valid]
-    out[valid] = np.sqrt(np.maximum(var_num / (count[valid] - 1), 0.0))
-    return out
-
-
-def _sanitize_snapshot_features(arr: np.ndarray) -> np.ndarray:
-    target_cols = [
-        "best_bid_size",
-        "best_ask_size",
-        "time_since_last_ob_update_ms",
-        "imbalance",
-        "mid_ret_1",
-        "vol_short",
-        "vol_long",
-        "spread_bps",
-    ]
-    out = np.asarray(arr).copy()
-    if out.ndim != 2:
-        raise ValueError(f"Expected 2D snapshot feature array, got shape={out.shape}.")
-    col_idx = {
-        name: RAW_SNAPSHOT_FEATURE_COLUMNS.index(name)
-        for name in target_cols
-        if name in RAW_SNAPSHOT_FEATURE_COLUMNS and RAW_SNAPSHOT_FEATURE_COLUMNS.index(name) < out.shape[1]
-    }
-    for idx in col_idx.values():
-        col = out[:, idx].astype(np.float64, copy=False)
-        col[~np.isfinite(col)] = np.nan
-        col = _ffill_1d(col)
-        col[~np.isfinite(col)] = 0.0
-        out[:, idx] = col.astype(out.dtype, copy=False)
-    return out
-
-
-def compute_snapshot_feature_matrix(
-    snapshot_ts: np.ndarray,
-    snapshots: np.ndarray,
-    time_since_last_ob_update_ms: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
-    snapshots = np.asarray(snapshots)
-    stale_ms = np.asarray(time_since_last_ob_update_ms, dtype=np.float64)
-    if snapshot_ts.ndim != 1:
-        raise ValueError("snapshot_ts must be 1D.")
-    if snapshots.ndim != 2 or snapshots.shape[1] != 4:
-        raise ValueError("Snapshots must be [N,4] with bid/ask and sizes.")
-    if stale_ms.ndim != 1 or stale_ms.shape[0] != snapshot_ts.shape[0]:
-        raise ValueError("time_since_last_ob_update_ms must be shape [N].")
-    order = np.argsort(snapshot_ts)
-    snapshot_ts = snapshot_ts[order]
-    snapshots = snapshots[order]
-    stale_ms = np.maximum(stale_ms[order], 0.0)
-    best_bid = snapshots[:, 0].astype(np.float64)
-    best_ask = snapshots[:, 1].astype(np.float64)
-    crossed = np.flatnonzero(best_ask < best_bid)
-    if crossed.size:
-        raise ValueError(
-            "compute_snapshot_feature_matrix received crossed book rows; "
-            f"count={int(crossed.size)} samples={_sample_rows_for_error(crossed, snapshot_ts, best_bid, best_ask)}"
-        )
-    invalid_bid = np.flatnonzero(~np.isfinite(best_bid) | (best_bid <= 0.0))
-    invalid_ask = np.flatnonzero(~np.isfinite(best_ask) | (best_ask <= 0.0))
-    if invalid_bid.size or invalid_ask.size:
-        raise ValueError(
-            "compute_snapshot_feature_matrix received non-positive/invalid top-of-book rows; "
-            f"invalid_bid={int(invalid_bid.size)} invalid_ask={int(invalid_ask.size)}"
-        )
-    best_bid_size = np.maximum(snapshots[:, 2].astype(np.float64), 0.0)
-    best_ask_size = np.maximum(snapshots[:, 3].astype(np.float64), 0.0)
-    mid = (best_bid + best_ask) / 2.0
-    if np.any(~np.isfinite(mid) | (mid <= 0.0)):
-        raise ValueError("compute_snapshot_feature_matrix computed non-finite or non-positive mid values.")
-    eps = 1e-9
-    imbalance = (best_bid_size - best_ask_size) / (best_bid_size + best_ask_size + eps)
-    spread_bps = (best_ask - best_bid) / mid * 1e4
-    mid_ret_1 = np.log(mid)
-    mid_ret_1 = np.concatenate([[np.nan], np.diff(mid_ret_1)])
-    vol_short = _rolling_std_ignore_nan(mid_ret_1, SHORT_VOL_WINDOW)
-    vol_long = _rolling_std_ignore_nan(mid_ret_1, LONG_VOL_WINDOW)
-    features = np.column_stack(
-        [
-            best_bid,
-            best_ask,
-            best_bid_size,
-            best_ask_size,
-            stale_ms,
-            imbalance,
-            mid,
-            spread_bps,
-            mid_ret_1,
-            vol_short,
-            vol_long,
-        ]
-    )
-    features = _sanitize_snapshot_features(features).astype(np.float32, copy=False)
-    return snapshot_ts, features
-
-
-def align_snapshot_features_to_decisions(
-    snapshot_ts: np.ndarray,
-    snapshot_features: np.ndarray,
-    decision_ts: np.ndarray,
-) -> np.ndarray:
+def align_snapshot_features_to_decisions(snapshot_ts: np.ndarray, snapshot_features: np.ndarray, decision_ts: np.ndarray) -> np.ndarray:
     snapshot_ts = np.asarray(snapshot_ts, dtype=np.int64)
     snapshot_features = np.asarray(snapshot_features, dtype=np.float32)
     decision_ts = np.asarray(decision_ts, dtype=np.int64)
-    if snapshot_ts.ndim != 1:
-        raise ValueError("snapshot_ts must be 1D")
-    if snapshot_features.ndim != 2:
-        raise ValueError("snapshot_features must be 2D")
-    if snapshot_features.shape[0] != snapshot_ts.shape[0]:
-        raise ValueError("snapshot_features rows must match snapshot_ts length")
-    if decision_ts.ndim != 1:
-        raise ValueError("decision_ts must be 1D")
-    if snapshot_ts.size and np.any(np.diff(snapshot_ts) <= 0):
-        raise ValueError("snapshot_ts must be strictly increasing (np.diff(snapshot_ts) > 0)")
-    if decision_ts.size and np.any(np.diff(decision_ts) < 0):
-        raise ValueError("decision_ts must be monotonically non-decreasing (np.diff(decision_ts) >= 0)")
-    aligned_idx = np.searchsorted(snapshot_ts, decision_ts, side="left")
+    aligned_idx = np.searchsorted(snapshot_ts, decision_ts)
     in_bounds = aligned_idx < snapshot_ts.shape[0]
     exact_match = np.zeros(decision_ts.shape[0], dtype=bool)
     exact_match[in_bounds] = snapshot_ts[aligned_idx[in_bounds]] == decision_ts[in_bounds]
@@ -944,24 +870,14 @@ def align_snapshot_features_to_decisions(
         sample_count = min(5, int(missing.shape[0]))
         raise ValueError(
             "Snapshot alignment failed; exact timestamp matches missing. "
-            f"missing={missing.shape[0]} total={decision_ts.size} "
-            f"samples={missing[:sample_count].tolist()}. "
-            "Regenerate canonical snapshots/tokens so decision timestamps are "
-            "derived from order-book event time "
+            f"missing={missing.shape[0]} total={decision_ts.size} samples={missing[:sample_count].tolist()}. "
+            "Regenerate canonical snapshots/tokens so decision timestamps are derived from order-book event time "
             "(decision_time_basis='ob_event_time', decision_policy='ob_event_time')."
         )
     return snapshot_features[aligned_idx]
 
 
-def write_week_decision_snapshots(
-    out_root: str,
-    week_key: str,
-    decision_ts: np.ndarray,
-    aligned_snapshot_features: np.ndarray,
-    *,
-    overwrite: bool,
-    source_snapshot_rows: Optional[int] = None,
-) -> Path:
+def write_week_decision_snapshots(out_root: str, week_key: str, decision_ts: np.ndarray, aligned_snapshot_features: np.ndarray, *, overwrite: bool, source_snapshot_rows: Optional[int] = None) -> Path:
     week_dir = Path(out_root) / week_key
     week_dir.mkdir(parents=True, exist_ok=True)
     out_path = week_dir / "decision_snapshots.npz"
@@ -971,24 +887,33 @@ def write_week_decision_snapshots(
         "ts": np.asarray(decision_ts, dtype=np.int64),
         "snapshots": np.asarray(aligned_snapshot_features, dtype=np.float32),
         "schema_version": np.asarray(DECISION_SNAPSHOTS_SCHEMA_VERSION, dtype=np.int64),
-        "feature_columns_json": np.asarray(json.dumps(RAW_SNAPSHOT_FEATURE_COLUMNS), dtype=np.str_),
-        "source_snapshot_rows": np.asarray(
-            int(source_snapshot_rows if source_snapshot_rows is not None else aligned_snapshot_features.shape[0]),
-            dtype=np.int64,
-        ),
+        "feature_columns_json": np.asarray(json.dumps(EXEC_SNAPSHOT_FEATURE_COLUMNS), dtype=np.str_),
+        "source_snapshot_rows": np.asarray(int(source_snapshot_rows if source_snapshot_rows is not None else aligned_snapshot_features.shape[0]), dtype=np.int64),
         "decision_row_count": np.asarray(int(decision_ts.shape[0]), dtype=np.int64),
     }
     np.savez_compressed(out_path, **payload)
     return out_path
 
 
+def _summarize_execution_features(snapshot_features: np.ndarray) -> dict[str, object]:
+    f = np.asarray(snapshot_features, dtype=np.float64)
+    idx = {c: EXEC_SNAPSHOT_FEATURE_COLUMNS.index(c) for c in ["spread_bps", "buy_impact_bps_50k", "sell_impact_bps_50k", "mid_vol_bps_30s", "depth_l10_mean_30s"]}
+    spread = f[:, idx["spread_bps"]]
+    return {
+        "rows": int(f.shape[0]),
+        "feature_count": int(f.shape[1]),
+        "spread_bps_mean": float(np.mean(spread)),
+        "spread_bps_p90": float(np.percentile(spread, 90)),
+        "buy_impact_bps_50k_mean": float(np.mean(f[:, idx["buy_impact_bps_50k"]])),
+        "sell_impact_bps_50k_mean": float(np.mean(f[:, idx["sell_impact_bps_50k"]])),
+        "mid_vol_bps_30s_mean": float(np.mean(f[:, idx["mid_vol_bps_30s"]])),
+        "depth_l10_mean_30s_mean": float(np.mean(f[:, idx["depth_l10_mean_30s"]])),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--ob-dir",
-        default=OB_DIR,
-        help="Directory containing daily OB zips like YYYY-MM-DD_BTCUSDT_ob200.data.zip",
-    )
+    parser.add_argument("--ob-dir", default=OB_DIR, help="Directory containing daily OB zips like YYYY-MM-DD_BTCUSDT_ob200.data.zip")
     parser.add_argument("--out-root", default=OUT_ROOT, help="Output root matching offline_ingest")
     parser.add_argument("--weeks", default=RAW_BYBIT_WEEKS, help="Comma-separated week keys")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing snapshot files")
@@ -999,61 +924,46 @@ def main() -> int:
     requested = _parse_requested_weeks(args.weeks) if args.weeks else None
     weeks = filter_weeks(weeks_in_order, requested)
     if not weeks:
-        raise ValueError(
-            f"No matching weeks found for requested filter. "
-            f"requested={requested or []} available={weeks_in_order}"
-        )
+        raise ValueError(f"No matching weeks found for requested filter. requested={requested or []} available={weeks_in_order}")
 
     ob_by_day = _build_ob_daily_map(args.ob_dir)
     if not ob_by_day:
-        raise FileNotFoundError(
-            f"No daily OB files found in {args.ob_dir}. "
-            "Expected files like YYYY-MM-DD_BTCUSDT_ob200.data.zip"
-        )
+        raise FileNotFoundError(f"No daily OB files found in {args.ob_dir}. Expected files like YYYY-MM-DD_BTCUSDT_ob200.data.zip")
 
     for wk in weeks:
         ob_paths = daily_ob_paths_for_week(wk, ob_by_day)
-        print(
-            f"[snapshots] week={wk} "
-            f"ob={os.path.basename(ob_paths[0])}...{os.path.basename(ob_paths[-1])} "
-            f"({len(ob_paths)} files)"
-        )
+        print(f"[snapshots] week={wk} ob={os.path.basename(ob_paths[0])}...{os.path.basename(ob_paths[-1])} ({len(ob_paths)} files)")
         week_quality = WeekQuality(week_key=wk, days=[], totals={})
         series = build_snapshots_from_ob_files(ob_paths, week_quality)
         if not series.ts:
             quality_path = Path(args.out_root) / wk / "snapshots_quality.json"
-            quality_payload = {
-                "config": quality_env_config(),
-                **week_quality.to_dict(),
-            }
+            quality_payload = {"config": quality_env_config(), **week_quality.to_dict()}
             quality_path.parent.mkdir(parents=True, exist_ok=True)
             quality_path.write_text(json.dumps(quality_payload, indent=2), encoding="utf-8")
             print(f"  [skip] no snapshots produced for {wk}")
             print(f"  [quality] {quality_path}")
             continue
-        raw_ts = np.asarray(series.ts, dtype=np.int64)
-        raw_snapshots = np.column_stack(
-            [series.best_bid, series.best_ask, series.best_bid_size, series.best_ask_size]
-        ).astype(np.float32, copy=False)
-        stale_ms = np.asarray(series.time_since_last_ob_update_ms, dtype=np.float32)
-        snapshot_ts, repaired_snapshots, repair_summary = repair_snapshot_book_rows(
-            raw_ts,
-            raw_snapshots,
+
+        snapshot_ts = np.asarray(series.ts, dtype=np.int64)
+        snapshot_features = np.vstack(series.features).astype(np.float32, copy=False)
+        stale_ms = np.asarray(series.stale_ms, dtype=np.float32)
+
+        validate_execution_snapshot_features(snapshot_ts, snapshot_features, week_key=wk, stage="pre_repair")
+        snapshot_ts, snapshot_features, repair_summary = repair_execution_snapshot_book_rows(
+            snapshot_ts,
+            snapshot_features,
             week_quality=week_quality,
             day_by_row=series.day_by_row,
         )
-        validate_repaired_snapshot_book(snapshot_ts, repaired_snapshots, week_key=wk, stage="post_repair")
-        out_path = write_week_snapshots(
-            args.out_root,
-            wk,
-            snapshot_ts,
-            repaired_snapshots,
-            stale_ms,
-            overwrite=args.overwrite,
-        )
-        snapshot_ts, snapshot_features = compute_snapshot_feature_matrix(snapshot_ts, repaired_snapshots, stale_ms)
+        validate_execution_snapshot_features(snapshot_ts, snapshot_features, week_key=wk, stage="post_repair")
+        validate_execution_snapshot_features(snapshot_ts, snapshot_features, week_key=wk, stage="pre_write_snapshots")
+        out_path = write_week_snapshots(args.out_root, wk, snapshot_ts, snapshot_features, stale_ms, overwrite=args.overwrite)
+
         decision_ts = load_week_decision_timestamps(args.out_root, wk)
         aligned_snapshots = align_snapshot_features_to_decisions(snapshot_ts, snapshot_features, decision_ts)
+        validate_execution_snapshot_features(decision_ts, aligned_snapshots, week_key=wk, stage="decision_aligned")
+        validate_execution_snapshot_features(decision_ts, aligned_snapshots, week_key=wk, stage="pre_write_decision_snapshots")
+
         decision_out_path = write_week_decision_snapshots(
             args.out_root,
             wk,
@@ -1070,9 +980,14 @@ def main() -> int:
                 "decision_rows": int(decision_ts.shape[0]),
                 "raw_snapshot_rows": int(snapshot_ts.shape[0]),
                 "aligned_rows": int(aligned_snapshots.shape[0]),
-                "schema_version": int(DECISION_SNAPSHOTS_SCHEMA_VERSION),
-                "feature_columns": list(RAW_SNAPSHOT_FEATURE_COLUMNS),
+                "schema_version": 2,
+                "feature_columns": list(EXEC_SNAPSHOT_FEATURE_COLUMNS),
+                "feature_count": len(EXEC_SNAPSHOT_FEATURE_COLUMNS),
                 "alignment_status": "ok",
+                "execution_windows_ms": list(EXEC_WINDOWS_MS),
+                "depth_levels": list(DEPTH_LEVELS),
+                "impact_notionals_usd": list(IMPACT_NOTIONALS_USD),
+                "impact_bps_bands": list(IMPACT_BPS_BANDS),
             },
             "snapshot_repairs": {
                 "crossed_book": {
@@ -1081,18 +996,14 @@ def main() -> int:
                     "examples": list(repair_summary["examples"]),
                 }
             },
+            "execution_feature_summary": _summarize_execution_features(snapshot_features),
         }
         quality_path.parent.mkdir(parents=True, exist_ok=True)
         quality_path.write_text(json.dumps(quality_payload, indent=2), encoding="utf-8")
-        print(f"  [write] {out_path} rows={len(series.ts):,}")
+        print(f"  [write] {out_path} rows={snapshot_ts.shape[0]:,}")
         print(f"  [write] {decision_out_path} rows={aligned_snapshots.shape[0]:,}")
-        print(
-            "  [quality] crossed_book "
-            f"crossed_detected={int(repair_summary['crossed_detected']):,} "
-            f"crossed_repaired={int(repair_summary['crossed_repaired']):,}"
-        )
+        print(f"  [quality] crossed_book crossed_detected={int(repair_summary['crossed_detected']):,} crossed_repaired={int(repair_summary['crossed_repaired']):,}")
         print(f"  [quality] {quality_path}")
-
     return 0
 
 
