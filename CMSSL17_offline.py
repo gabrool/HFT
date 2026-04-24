@@ -577,13 +577,33 @@ def train_from_offline():
                 return hub+0.10*corr_pen, hub, corr_pen
 
             opt.base_optimizer.zero_grad(set_to_none=True)
+            
+            # First forward/backward: compute the raw gradient used to choose SAM's adversarial perturbation.
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
-                pred=model(x); loss,hub,corr=compute_loss(pred,y_raw)
-            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000); opt.first_step(zero_grad=True)
+                pred = model(x)
+                loss, hub, corr = compute_loss(pred, y_raw)
+            
+            loss.backward()
+            
+            # Do NOT clip here. SAM first_step must see the raw gradient direction.
+            opt.first_step(zero_grad=True)
+            
+            # Second forward/backward at perturbed weights.
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
-                pred2=model(x); loss2,_,_=compute_loss(pred2,y_raw)
-            loss2.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000); opt.second_step(zero_grad=True)
-            running['loss']+=float(loss.detach().cpu()); running['huber']+=float(hub.detach().cpu()); running['corr']+=float(corr.detach().cpu()); n_batches+=1
+                pred2 = model(x)
+                loss2, _, _ = compute_loss(pred2, y_raw)
+            
+            loss2.backward()
+            
+            # Clip only before the actual optimizer update.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
+            opt.second_step(zero_grad=True)
+            
+            running['loss'] += float(loss.detach().cpu())
+            running['huber'] += float(hub.detach().cpu())
+            running['corr'] += float(corr.detach().cpu())
+            n_batches += 1
+            
         print(f"[train] loss={running['loss']/max(1,n_batches):.6f} huber={running['huber']/max(1,n_batches):.6f} corr_penalty={running['corr']/max(1,n_batches):.6f}")
 
         val_fast=summarize_metrics(model, dl_val, device, stats, amp_enabled, amp_dtype, primary_only=True)
