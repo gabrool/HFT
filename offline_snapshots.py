@@ -286,7 +286,7 @@ class WeekQuality:
 
 def _day_bad_abs_and_total(day_quality: DayQuality) -> tuple[int, int]:
     bad_abs = 0
-    for namespace in ("parse", "event", "backstep", "day_clip"):
+    for namespace in ("parse", "event", "backstep", "day_clip", "crossed_book"):
         for key, value in day_quality.counters.get(namespace, {}).items():
             key_l = str(key).lower()
             if "drop" in key_l or "error" in key_l or "bad" in key_l:
@@ -636,8 +636,18 @@ def build_snapshots_from_ob_files(ob_paths: List[str], week_quality: WeekQuality
         day_clipped = dq_day.counters.get("day_clip", {}).get("clipped", 0)
         backstep_drop = dq_day.counters.get("backstep", {}).get("drop", 0)
         backstep_clamp = dq_day.counters.get("backstep", {}).get("clamp", 0)
-        if parse_bad_json or parse_fail or non_ob or day_clipped or backstep_drop or backstep_clamp or aborted_for_corruption:
-            print(f"[quality] {Path(ob_path).name}: bad_json={parse_bad_json:,} parse_fail={parse_fail:,} non_ob={non_ob:,} day_clipped={day_clipped:,} backstep_clamp={backstep_clamp:,} backstep_drop={backstep_drop:,} aborted={int(aborted_for_corruption)}")
+        crossed_drop = dq_day.counters.get("crossed_book", {}).get("crossed_dropped_pre_feature", 0)
+        if (
+            parse_bad_json
+            or parse_fail
+            or non_ob
+            or day_clipped
+            or backstep_drop
+            or backstep_clamp
+            or crossed_drop
+            or aborted_for_corruption
+        ):
+            print(f"[quality] {Path(ob_path).name}: bad_json={parse_bad_json:,} parse_fail={parse_fail:,} non_ob={non_ob:,} day_clipped={day_clipped:,} backstep_clamp={backstep_clamp:,} backstep_drop={backstep_drop:,} crossed_drop={crossed_drop:,} aborted={int(aborted_for_corruption)}")
 
     week_quality.recompute_totals()
     return series
@@ -1062,6 +1072,18 @@ def main() -> int:
             print(f"  [quality] {quality_path}")
             continue
 
+        if not (
+            len(series.ts)
+            == len(series.features)
+            == len(series.stale_ms)
+            == len(series.day_by_row)
+        ):
+            raise ValueError(
+                f"week={wk}: SnapshotSeries length mismatch "
+                f"ts={len(series.ts)} features={len(series.features)} "
+                f"stale_ms={len(series.stale_ms)} day_by_row={len(series.day_by_row)}"
+            )
+
         snapshot_ts = np.asarray(series.ts, dtype=np.int64)
         snapshot_features = np.vstack(series.features).astype(np.float32, copy=False)
         stale_ms = np.asarray(series.stale_ms, dtype=np.float32)
@@ -1075,13 +1097,13 @@ def main() -> int:
         )
         validate_execution_snapshot_features(snapshot_ts, snapshot_features, week_key=wk, stage="post_repair", allow_crossed_book=False)
         validate_execution_snapshot_features(snapshot_ts, snapshot_features, week_key=wk, stage="pre_write_snapshots", allow_crossed_book=False)
-        out_path = write_week_snapshots(args.out_root, wk, snapshot_ts, snapshot_features, stale_ms, overwrite=args.overwrite)
 
         decision_ts = load_week_decision_timestamps(args.out_root, wk)
         aligned_snapshots = align_snapshot_features_to_decisions(snapshot_ts, snapshot_features, decision_ts)
         validate_execution_snapshot_features(decision_ts, aligned_snapshots, week_key=wk, stage="decision_aligned", allow_crossed_book=False)
         validate_execution_snapshot_features(decision_ts, aligned_snapshots, week_key=wk, stage="pre_write_decision_snapshots", allow_crossed_book=False)
 
+        out_path = write_week_snapshots(args.out_root, wk, snapshot_ts, snapshot_features, stale_ms, overwrite=args.overwrite)
         decision_out_path = write_week_decision_snapshots(
             args.out_root,
             wk,
