@@ -535,6 +535,7 @@ def train_from_offline():
         # Enable extreme kernel benchmarking
         torch._inductor.config.max_autotune = True
         torch._inductor.config.coordinate_descent_tuning = True
+        torch._inductor.config.cudagraphs = False
         model = torch.compile(model, mode="max-autotune", dynamic=False)
         print("[compile] enabled full-model compile with max-autotune (dynamic=False)", flush=True)
         
