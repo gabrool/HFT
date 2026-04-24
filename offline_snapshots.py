@@ -74,7 +74,7 @@ BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
 ONE_DAY = timedelta(days=1)
 
-DECISION_SNAPSHOTS_SCHEMA_VERSION = 2
+DECISION_SNAPSHOTS_SCHEMA_VERSION = 3
 EXEC_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
 DEPTH_LEVELS = (1, 5, 10, 20, 50)
 IMPACT_NOTIONALS_USD = (10_000.0, 25_000.0, 50_000.0, 100_000.0)
@@ -82,24 +82,110 @@ IMPACT_BPS_BANDS = (1.0, 2.0, 5.0)
 EPS = 1e-12
 
 EXEC_SNAPSHOT_FEATURE_COLUMNS = [
-    "best_bid", "best_ask", "mid", "spread_bps", "half_spread_bps", "best_bid_size", "best_ask_size",
-    "time_since_last_ob_update_ms", "dt_ms", "l1_qty_imbalance", "l5_qty_imbalance", "l10_qty_imbalance",
-    "l20_qty_imbalance", "l50_qty_imbalance", "l5_notional_imbalance", "l10_notional_imbalance",
-    "l20_notional_imbalance", "l50_notional_imbalance", "microprice_bps_from_mid", "cum_bid_qty_l1",
-    "cum_ask_qty_l1", "cum_bid_qty_l5", "cum_ask_qty_l5", "cum_bid_qty_l10", "cum_ask_qty_l10",
-    "cum_bid_qty_l20", "cum_ask_qty_l20", "cum_bid_qty_l50", "cum_ask_qty_l50", "cum_bid_notional_l1",
-    "cum_ask_notional_l1", "cum_bid_notional_l5", "cum_ask_notional_l5", "cum_bid_notional_l10",
-    "cum_ask_notional_l10", "cum_bid_notional_l20", "cum_ask_notional_l20", "cum_bid_notional_l50",
-    "cum_ask_notional_l50", "buy_impact_bps_10k", "sell_impact_bps_10k", "buy_impact_bps_25k",
-    "sell_impact_bps_25k", "buy_impact_bps_50k", "sell_impact_bps_50k", "buy_impact_bps_100k",
-    "sell_impact_bps_100k", "buy_notional_within_1bps", "sell_notional_within_1bps", "buy_notional_within_2bps",
-    "sell_notional_within_2bps", "buy_notional_within_5bps", "sell_notional_within_5bps", "event_rate_1s",
-    "event_rate_3s", "event_rate_7p5s", "event_rate_15s", "event_rate_30s", "event_rate_60s", "mid_vol_bps_1s",
-    "mid_vol_bps_3s", "mid_vol_bps_7p5s", "mid_vol_bps_15s", "mid_vol_bps_30s", "mid_vol_bps_60s",
-    "spread_mean_bps_1s", "spread_mean_bps_3s", "spread_mean_bps_7p5s", "spread_mean_bps_15s",
-    "spread_mean_bps_30s", "spread_mean_bps_60s", "spread_p90_bps_30s", "spread_p90_bps_60s", "depth_l10_mean_1s",
-    "depth_l10_mean_3s", "depth_l10_mean_7p5s", "depth_l10_mean_15s", "depth_l10_mean_30s", "depth_l10_mean_60s",
-    "depth_l10_min_30s", "depth_l10_min_60s",
+    # Top-of-book / immediate execution cost
+    "best_bid",
+    "best_ask",
+    "mid",
+    "spread_bps",
+    "half_spread_bps",
+    "best_bid_size",
+    "best_ask_size",
+    "time_since_last_ob_update_ms",
+    "dt_ms",
+
+    # Order-book imbalance / microstructure state
+    "l1_qty_imbalance",
+    "l5_qty_imbalance",
+    "l10_qty_imbalance",
+    "l20_qty_imbalance",
+    "l50_qty_imbalance",
+    "l5_notional_imbalance",
+    "l10_notional_imbalance",
+    "l20_notional_imbalance",
+    "l50_notional_imbalance",
+    "microprice_bps_from_mid",
+
+    # Log-scaled liquidity magnitude
+    "log_total_qty_l1",
+    "log_total_qty_l5",
+    "log_total_qty_l10",
+    "log_total_qty_l20",
+    "log_total_qty_l50",
+    "log_total_depth_l1",
+    "log_total_depth_l5",
+    "log_total_depth_l10",
+    "log_total_depth_l20",
+    "log_total_depth_l50",
+
+    # Estimated taker market-order impact
+    "buy_impact_bps_10k",
+    "sell_impact_bps_10k",
+    "buy_impact_bps_25k",
+    "sell_impact_bps_25k",
+    "buy_impact_bps_50k",
+    "sell_impact_bps_50k",
+    "buy_impact_bps_100k",
+    "sell_impact_bps_100k",
+
+    # Within-band capacity as side-specific fractions of L50 depth
+    "buy_notional_within_1bps_frac_l50",
+    "sell_notional_within_1bps_frac_l50",
+    "buy_notional_within_2bps_frac_l50",
+    "sell_notional_within_2bps_frac_l50",
+    "buy_notional_within_5bps_frac_l50",
+    "sell_notional_within_5bps_frac_l50",
+
+    # Event-rate / staleness
+    "event_rate_1s",
+    "event_rate_3s",
+    "event_rate_7p5s",
+    "event_rate_15s",
+    "event_rate_30s",
+    "event_rate_60s",
+
+    # Mid volatility regime
+    "mid_vol_bps_1s",
+    "mid_vol_bps_3s",
+    "mid_vol_bps_7p5s",
+    "mid_vol_bps_15s",
+    "mid_vol_bps_30s",
+    "mid_vol_bps_60s",
+
+    # Spread regime
+    "spread_mean_bps_1s",
+    "spread_mean_bps_3s",
+    "spread_mean_bps_7p5s",
+    "spread_mean_bps_15s",
+    "spread_mean_bps_30s",
+    "spread_mean_bps_60s",
+    "spread_p90_bps_30s",
+    "spread_p90_bps_60s",
+
+    # Liquidity regime
+    "depth_l10_mean_1s",
+    "depth_l10_mean_3s",
+    "depth_l10_mean_7p5s",
+    "depth_l10_mean_15s",
+    "depth_l10_mean_30s",
+    "depth_l10_mean_60s",
+    "depth_l10_min_30s",
+    "depth_l10_min_60s",
+
+    # Explicit relative-context features
+    "spread_vs_mean_30s",
+    "spread_vs_mean_60s",
+    "spread_vs_p90_30s",
+    "buy_impact_50k_vs_spread",
+    "sell_impact_50k_vs_spread",
+    "buy_impact_100k_vs_spread",
+    "sell_impact_100k_vs_spread",
+    "depth_l10_vs_mean_30s",
+    "depth_l10_vs_mean_60s",
+    "event_rate_1s_vs_30s",
+    "event_rate_3s_vs_60s",
+    "vol_7p5s_vs_30s",
+    "vol_15s_vs_60s",
+    "vol_30s_vs_60s",
 ]
 
 if len(EXEC_SNAPSHOT_FEATURE_COLUMNS) != len(set(EXEC_SNAPSHOT_FEATURE_COLUMNS)):
@@ -423,6 +509,14 @@ def notional_within_bps(side: str, band_bps: float, mid: float, bid_lvls: list[t
     return float(max(total, 0.0))
 
 
+def _safe_ratio(num: float, den: float, *, cap: float = 100.0) -> float:
+    if not np.isfinite(num) or not np.isfinite(den):
+        return 0.0
+    if den <= EPS:
+        return 0.0
+    return float(np.clip(num / den, 0.0, cap))
+
+
 def compute_execution_snapshot_features(*, ts_ms: int, stale_ms: float, dt_ms: float, bid_lvls: list[tuple[float, float]], ask_lvls: list[tuple[float, float]], rolling: ExecutionRollingState) -> np.ndarray:
     best_bid, best_bid_size = bid_lvls[0]
     best_ask, best_ask_size = ask_lvls[0]
@@ -436,6 +530,10 @@ def compute_execution_snapshot_features(*, ts_ms: int, stale_ms: float, dt_ms: f
     cum_ask_qty = {d: _compute_cum_qty(ask_lvls, d) for d in DEPTH_LEVELS}
     cum_bid_notional = {d: _compute_cum_notional(bid_lvls, d) for d in DEPTH_LEVELS}
     cum_ask_notional = {d: _compute_cum_notional(ask_lvls, d) for d in DEPTH_LEVELS}
+    total_qty = {d: cum_bid_qty[d] + cum_ask_qty[d] for d in DEPTH_LEVELS}
+    total_depth = {d: cum_bid_notional[d] + cum_ask_notional[d] for d in DEPTH_LEVELS}
+    log_total_qty = {d: float(np.log1p(max(total_qty[d], 0.0))) for d in DEPTH_LEVELS}
+    log_total_depth = {d: float(np.log1p(max(total_depth[d], 0.0))) for d in DEPTH_LEVELS}
 
     micro = (best_ask * best_bid_size + best_bid * best_ask_size) / max(best_bid_size + best_ask_size, EPS)
     microprice_bps_from_mid = 1e4 * (micro - mid) / max(mid, EPS)
@@ -444,23 +542,43 @@ def compute_execution_snapshot_features(*, ts_ms: int, stale_ms: float, dt_ms: f
     sell_impact = {n: estimate_market_order_impact_bps("sell", n, mid, bid_lvls, ask_lvls) for n in IMPACT_NOTIONALS_USD}
     buy_within = {b: notional_within_bps("buy", b, mid, bid_lvls, ask_lvls) for b in IMPACT_BPS_BANDS}
     sell_within = {b: notional_within_bps("sell", b, mid, bid_lvls, ask_lvls) for b in IMPACT_BPS_BANDS}
+    buy_within_frac_l50 = {b: buy_within[b] / max(cum_ask_notional[50], EPS) for b in IMPACT_BPS_BANDS}
+    sell_within_frac_l50 = {b: sell_within[b] / max(cum_bid_notional[50], EPS) for b in IMPACT_BPS_BANDS}
+    buy_within_frac_l50 = {b: float(np.clip(v, 0.0, 1.0)) for b, v in buy_within_frac_l50.items()}
+    sell_within_frac_l50 = {b: float(np.clip(v, 0.0, 1.0)) for b, v in sell_within_frac_l50.items()}
 
-    depth_l10_notional = cum_bid_notional[10] + cum_ask_notional[10]
+    depth_l10_notional = total_depth[10]
     roll = rolling.update(int(ts_ms), float(mid), float(spread_bps), float(depth_l10_notional))
+    spread_vs_mean_30s = _safe_ratio(spread_bps, roll["spread_mean_30000"])
+    spread_vs_mean_60s = _safe_ratio(spread_bps, roll["spread_mean_60000"])
+    spread_vs_p90_30s = _safe_ratio(spread_bps, roll["spread_p90_30000"])
+    buy_impact_50k_vs_spread = _safe_ratio(buy_impact[50_000.0], spread_bps)
+    sell_impact_50k_vs_spread = _safe_ratio(sell_impact[50_000.0], spread_bps)
+    buy_impact_100k_vs_spread = _safe_ratio(buy_impact[100_000.0], spread_bps)
+    sell_impact_100k_vs_spread = _safe_ratio(sell_impact[100_000.0], spread_bps)
+    depth_l10_vs_mean_30s = _safe_ratio(depth_l10_notional, roll["depth_mean_30000"])
+    depth_l10_vs_mean_60s = _safe_ratio(depth_l10_notional, roll["depth_mean_60000"])
+    event_rate_1s_vs_30s = _safe_ratio(roll["event_rate_1000"], roll["event_rate_30000"])
+    event_rate_3s_vs_60s = _safe_ratio(roll["event_rate_3000"], roll["event_rate_60000"])
+    vol_7p5s_vs_30s = _safe_ratio(roll["mid_vol_7500"], roll["mid_vol_30000"])
+    vol_15s_vs_60s = _safe_ratio(roll["mid_vol_15000"], roll["mid_vol_60000"])
+    vol_30s_vs_60s = _safe_ratio(roll["mid_vol_30000"], roll["mid_vol_60000"])
 
     feats = [
         best_bid, best_ask, mid, spread_bps, half_spread_bps, best_bid_size, best_ask_size, max(stale_ms, 0.0), max(dt_ms, 0.0),
         qty_imb[1], qty_imb[5], qty_imb[10], qty_imb[20], qty_imb[50], notional_imb[5], notional_imb[10], notional_imb[20], notional_imb[50], microprice_bps_from_mid,
-        cum_bid_qty[1], cum_ask_qty[1], cum_bid_qty[5], cum_ask_qty[5], cum_bid_qty[10], cum_ask_qty[10], cum_bid_qty[20], cum_ask_qty[20], cum_bid_qty[50], cum_ask_qty[50],
-        cum_bid_notional[1], cum_ask_notional[1], cum_bid_notional[5], cum_ask_notional[5], cum_bid_notional[10], cum_ask_notional[10], cum_bid_notional[20], cum_ask_notional[20], cum_bid_notional[50], cum_ask_notional[50],
+        log_total_qty[1], log_total_qty[5], log_total_qty[10], log_total_qty[20], log_total_qty[50],
+        log_total_depth[1], log_total_depth[5], log_total_depth[10], log_total_depth[20], log_total_depth[50],
         buy_impact[10_000.0], sell_impact[10_000.0], buy_impact[25_000.0], sell_impact[25_000.0], buy_impact[50_000.0], sell_impact[50_000.0], buy_impact[100_000.0], sell_impact[100_000.0],
-        buy_within[1.0], sell_within[1.0], buy_within[2.0], sell_within[2.0], buy_within[5.0], sell_within[5.0],
+        buy_within_frac_l50[1.0], sell_within_frac_l50[1.0], buy_within_frac_l50[2.0], sell_within_frac_l50[2.0], buy_within_frac_l50[5.0], sell_within_frac_l50[5.0],
         roll["event_rate_1000"], roll["event_rate_3000"], roll["event_rate_7500"], roll["event_rate_15000"], roll["event_rate_30000"], roll["event_rate_60000"],
         roll["mid_vol_1000"], roll["mid_vol_3000"], roll["mid_vol_7500"], roll["mid_vol_15000"], roll["mid_vol_30000"], roll["mid_vol_60000"],
         roll["spread_mean_1000"], roll["spread_mean_3000"], roll["spread_mean_7500"], roll["spread_mean_15000"], roll["spread_mean_30000"], roll["spread_mean_60000"],
         roll["spread_p90_30000"], roll["spread_p90_60000"],
         roll["depth_mean_1000"], roll["depth_mean_3000"], roll["depth_mean_7500"], roll["depth_mean_15000"], roll["depth_mean_30000"], roll["depth_mean_60000"],
         roll["depth_min_30000"], roll["depth_min_60000"],
+        spread_vs_mean_30s, spread_vs_mean_60s, spread_vs_p90_30s, buy_impact_50k_vs_spread, sell_impact_50k_vs_spread, buy_impact_100k_vs_spread, sell_impact_100k_vs_spread,
+        depth_l10_vs_mean_30s, depth_l10_vs_mean_60s, event_rate_1s_vs_30s, event_rate_3s_vs_60s, vol_7p5s_vs_30s, vol_15s_vs_60s, vol_30s_vs_60s,
     ]
     arr = np.asarray(feats, dtype=np.float32)
     if arr.shape[0] != len(EXEC_SNAPSHOT_FEATURE_COLUMNS) or not np.all(np.isfinite(arr)):
@@ -765,19 +883,24 @@ def validate_execution_snapshot_features(
         else:
             raise ValueError(f"{stage} week={week_key}: negative spread rows count={bad_spread.size} samples={_sample_bad_rows(bad_spread, snapshot_ts, snapshot_features, ['best_bid','best_ask','mid','spread_bps'])}")
 
-    nonnegative_cols = [
-        c for c in EXEC_SNAPSHOT_FEATURE_COLUMNS
-        if (
+    nonnegative_cols = []
+    for c in EXEC_SNAPSHOT_FEATURE_COLUMNS:
+        is_nonnegative = (
             c.startswith("buy_impact_bps_")
             or c.startswith("sell_impact_bps_")
-            or c.startswith("cum_")
-            or c.startswith("buy_notional_within_")
-            or c.startswith("sell_notional_within_")
+            or c.startswith("log_total_qty_")
+            or c.startswith("log_total_depth_")
+            or c.endswith("_frac_l50")
             or c.startswith("depth_l10_")
             or c.startswith("event_rate_")
             or c.startswith("mid_vol_bps_")
             or c.startswith("spread_mean_bps_")
             or c.startswith("spread_p90_bps_")
+            or c.startswith("spread_vs_")
+            or c.endswith("_vs_spread")
+            or c.startswith("depth_l10_vs_")
+            or (c.startswith("event_rate_") and "_vs_" in c)
+            or (c.startswith("vol_") and "_vs_" in c)
             or c in {
                 "best_bid_size",
                 "best_ask_size",
@@ -786,7 +909,8 @@ def validate_execution_snapshot_features(
                 "half_spread_bps",
             }
         )
-    ]
+        if is_nonnegative:
+            nonnegative_cols.append(c)
     imbalance_cols = [c for c in EXEC_SNAPSHOT_FEATURE_COLUMNS if "imbalance" in c]
 
     for c in nonnegative_cols:
@@ -805,6 +929,16 @@ def validate_execution_snapshot_features(
         bad = np.flatnonzero((col < -1.000001) | (col > 1.000001))
         if bad.size:
             raise ValueError(f"{stage} week={week_key}: imbalance bounds violated in {c} count={bad.size} samples={_sample_bad_rows(bad, snapshot_ts, snapshot_features, [c])}")
+
+    fraction_cols = [c for c in EXEC_SNAPSHOT_FEATURE_COLUMNS if c.endswith("_frac_l50")]
+    for c in fraction_cols:
+        col = snapshot_features[:, EXEC_SNAPSHOT_FEATURE_COLUMNS.index(c)]
+        bad = np.flatnonzero((col < -1e-6) | (col > 1.000001))
+        if bad.size:
+            raise ValueError(
+                f"{stage} week={week_key}: fraction bounds violated in {c} "
+                f"count={bad.size} samples={_sample_bad_rows(bad, snapshot_ts, snapshot_features, [c])}"
+            )
 
 
 def _repair_crossed_top_of_book_row(bid: float, ask: float) -> tuple[float, float, bool]:
@@ -996,6 +1130,14 @@ def _summarize_execution_features(snapshot_features: np.ndarray) -> dict[str, ob
             "event_rate_60s",
             "l10_qty_imbalance",
             "l10_notional_imbalance",
+            "log_total_depth_l10",
+            "log_total_depth_l50",
+            "buy_notional_within_5bps_frac_l50",
+            "sell_notional_within_5bps_frac_l50",
+            "spread_vs_mean_30s",
+            "spread_vs_p90_30s",
+            "depth_l10_vs_mean_30s",
+            "vol_30s_vs_60s",
         ]
     }
     spread = f[:, idx["spread_bps"]]
@@ -1014,6 +1156,14 @@ def _summarize_execution_features(snapshot_features: np.ndarray) -> dict[str, ob
         "event_rate_60s_mean": float(np.mean(f[:, idx["event_rate_60s"]])),
         "l10_qty_imbalance_mean": float(np.mean(f[:, idx["l10_qty_imbalance"]])),
         "l10_notional_imbalance_mean": float(np.mean(f[:, idx["l10_notional_imbalance"]])),
+        "log_total_depth_l10_mean": float(np.mean(f[:, idx["log_total_depth_l10"]])),
+        "log_total_depth_l50_mean": float(np.mean(f[:, idx["log_total_depth_l50"]])),
+        "buy_notional_within_5bps_frac_l50_mean": float(np.mean(f[:, idx["buy_notional_within_5bps_frac_l50"]])),
+        "sell_notional_within_5bps_frac_l50_mean": float(np.mean(f[:, idx["sell_notional_within_5bps_frac_l50"]])),
+        "spread_vs_mean_30s_mean": float(np.mean(f[:, idx["spread_vs_mean_30s"]])),
+        "spread_vs_p90_30s_mean": float(np.mean(f[:, idx["spread_vs_p90_30s"]])),
+        "depth_l10_vs_mean_30s_mean": float(np.mean(f[:, idx["depth_l10_vs_mean_30s"]])),
+        "vol_30s_vs_60s_mean": float(np.mean(f[:, idx["vol_30s_vs_60s"]])),
     }
 
 
