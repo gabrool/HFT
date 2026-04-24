@@ -702,13 +702,7 @@ class _ConvEncoderLayer(nn.Module):
 
     def forward(self, src:torch.Tensor) -> torch.Tensor: # [B, C, L]
         if self.re_param:
-            if self.training:
-                large_out = self.DW_conv_large(src)
-                small_out = self.DW_conv_small(src)
-                out_x = large_out + small_out
-            else:
-                self._get_merged_param()
-                out_x = self.DW_infer(src)
+            out_x = self.DW_conv_large(src) + self.DW_conv_small(src)
         else:
             out_x = self.DW_conv(src)
 
