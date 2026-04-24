@@ -1109,7 +1109,7 @@ class FeatureEngine:
     def __init__(
         self,
         depth: int = MAX_BOOK_FEATURE_LEVEL,
-        z_hl_ms: int = 500,
+        z_hl_ms: int = 30_000,
         vpin_target_bucket_secs: float = 2.0,
     ):
         self.depth = int(depth)
