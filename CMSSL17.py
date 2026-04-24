@@ -571,49 +571,59 @@ def zero_init(m):
             m.bias.data.fill_(0)
 
 class BoxCoder(nn.Module):
-    def __init__(self, patch_count, patch_stride, patch_size, seq_len, channels, device='cuda:0'):
+    def __init__(self, patch_count, patch_stride, patch_size, seq_len, channels):
         super().__init__()
-        self.device = device
         self.seq_len = seq_len
         self.channels = channels
         self.patch_size = patch_size
         self.patch_count = patch_count
         self.patch_stride = patch_stride
-        self._generate_anchor(device=device)
-    def _generate_anchor(self, device="cuda:0"):
+        self._generate_anchor()
+
+    def _generate_anchor(self):
         anchors = []
         self.S_bias = (self.patch_size - 1) / 2
         for i in range(self.patch_count):
             x = i * self.patch_stride + 0.5 * (self.patch_size - 1)
             anchors.append(x)
-        anchors = torch.as_tensor(anchors, device=device)
+        anchors = torch.as_tensor(anchors, dtype=torch.float32)
         self.register_buffer("anchor", anchors)
+
     def forward(self, boxes):
-        self.bound = self.decode(boxes)
-        points = self.meshgrid(self.bound)
-        return points, self.bound
+        bound = self.decode(boxes)
+        points = self.meshgrid(bound)
+        return points, bound
+
     def decode(self, rel_codes):
-        boxes = self.anchor
+        boxes = self.anchor.to(device=rel_codes.device, dtype=rel_codes.dtype)
         dx = rel_codes[:, :, :, 0]
         ds = torch.relu(rel_codes[:, :, :, 1] + self.S_bias)
+
         pred_boxes = torch.zeros_like(rel_codes)
         ref_x = boxes.view(1, boxes.shape[0], 1)
-        pred_boxes[:, :, :, 0] = (dx + ref_x - ds) 
-        pred_boxes[:, :, :, 1] = (dx + ref_x + ds) 
-        pred_boxes /= (self.seq_len - 1)
-        pred_boxes = pred_boxes.clamp_(min=0., max=1.)
-        return pred_boxes	
+        pred_boxes[:, :, :, 0] = dx + ref_x - ds
+        pred_boxes[:, :, :, 1] = dx + ref_x + ds
+        pred_boxes = pred_boxes / (self.seq_len - 1)
+        return pred_boxes.clamp(min=0.0, max=1.0)
+
     def meshgrid(self, boxes):
         B, patch_count, C = boxes.shape[0], boxes.shape[1], boxes.shape[2]
-        channel_boxes = torch.zeros((boxes.shape[0], boxes.shape[1], 2)).to(self.device)
+        channel_boxes = torch.zeros(
+            (B, patch_count, 2),
+            device=boxes.device,
+            dtype=boxes.dtype,
+        )
         channel_boxes[:, :, 1] = 1.0
-        xs = boxes.view(B*patch_count, C, 2)
-        xs = torch.nn.functional.interpolate(xs, size=self.patch_size, mode='linear', align_corners=True)
-        ys = torch.nn.functional.interpolate(channel_boxes, size=self.channels, mode='linear', align_corners=True)
+
+        xs = boxes.view(B * patch_count, C, 2)
+        xs = F.interpolate(xs, size=self.patch_size, mode="linear", align_corners=True)
+
+        ys = F.interpolate(channel_boxes, size=self.channels, mode="linear", align_corners=True)
+
         xs = xs.view(B, patch_count, C, self.patch_size, 1)
         ys = ys.unsqueeze(3).expand(B, patch_count, C, self.patch_size).unsqueeze(-1)
-        grid = torch.stack([xs, ys], dim = -1)
-        return grid
+
+        return torch.stack([xs, ys], dim=-1)
 
 class OffsetPredictor(nn.Module):
     def __init__(self, in_feats, patch_size, stride, use_zero_init=True):
