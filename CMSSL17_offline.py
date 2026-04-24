@@ -384,6 +384,7 @@ class GPUWindowBatchSource:
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
         self.subset_max_rows = subset_max_rows
+        self.is_shared_feature_view = False
         self.lookback = int(ds.lookback)
         self.num_horizons = int(ds.y.shape[1]) if ds.y.ndim == 2 else NUM_HORIZONS
 
@@ -416,6 +417,41 @@ class GPUWindowBatchSource:
         if self.drop_last:
             return n // self.batch_size
         return (n + self.batch_size - 1) // self.batch_size
+
+    def make_evenly_spaced_subset(self, max_rows: int) -> "GPUWindowBatchSource":
+        if int(max_rows) <= 0:
+            raise ValueError(f"max_rows must be > 0, got {max_rows}")
+        if int(self.n_rows) <= 0:
+            raise ValueError("Cannot subset an empty source")
+        n = min(int(max_rows), int(self.n_rows))
+        idx = torch.linspace(0, self.n_rows - 1, steps=n, device=self.device).round().long()
+        child = object.__new__(GPUWindowBatchSource)
+        child.features = self.features
+        child.offsets = self.offsets
+        child.device = self.device
+        child.lookback = self.lookback
+        child.batch_size = self.batch_size
+        child.shuffle = False
+        child.drop_last = False
+        child.seed = self.seed
+        child.num_horizons = self.num_horizons
+        child.row_idx = self.row_idx[idx]
+        child.y = self.y[idx]
+        if child.row_idx.numel() > 0 and int(child.row_idx.min().item()) < int(child.lookback - 1):
+            raise ValueError(
+                f"Subset violates full-history invariant: min row_idx={int(child.row_idx.min().item())}, lookback={int(child.lookback)}"
+            )
+        child.n_rows = int(child.y.shape[0])
+        child.feature_shape = tuple(child.features.shape)
+        child.feature_gb = 0.0
+        child.label_index_gb = float(
+            child.y.numel() * child.y.element_size() + child.row_idx.numel() * child.row_idx.element_size()
+        ) / (1024 ** 3)
+        child.subset_max_rows = int(max_rows)
+        child.is_shared_feature_view = True
+        if child.features is not self.features:
+            raise RuntimeError("Subset source must share exact feature tensor object")
+        return child
 
     def iter_epoch(self, epoch: int):
         n = int(self.n_rows)
@@ -454,8 +490,8 @@ def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, prim
             for x, y_raw in source.iter_epoch(epoch):
                 with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
                     pred = model(x)
-                pred_primary_parts.append(pred[:, primary_h].detach().float().cpu().numpy())
-                y_primary_parts.append(y_raw[:, primary_h].detach().float().cpu().numpy())
+                pred_primary_parts.append(pred[:, primary_h].detach().float())
+                y_primary_parts.append(y_raw[:, primary_h].detach().float())
                 n_eval_rows += int(y_raw.shape[0])
             out = {
                 "spearman_kept_q50plus": [float("nan")] * NUM_HORIZONS,
@@ -465,8 +501,8 @@ def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, prim
             }
             if not y_primary_parts:
                 return out
-            pred_h = np.concatenate(pred_primary_parts, axis=0)
-            y_raw_h = np.concatenate(y_primary_parts, axis=0)
+            pred_h = torch.cat(pred_primary_parts, dim=0).cpu().numpy()
+            y_raw_h = torch.cat(y_primary_parts, dim=0).cpu().numpy()
             y_t_h = signed_sqrt_transform(y_raw_h)
             abs_y = np.abs(y_raw_h)
             keep = (abs_y >= float(stats['abs_lo_raw_bps'][primary_h])) & (abs_y <= float(stats['abs_hi_raw_bps'][primary_h]))
@@ -583,8 +619,12 @@ def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, prim
     return out
 
 
-def get_model_state_dict_for_ckpt(model: torch.nn.Module) -> dict:
-    return model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict()
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model._orig_mod if hasattr(model, '_orig_mod') else model
+
+
+def get_model_state_dict(model: torch.nn.Module) -> dict:
+    return unwrap_model(model).state_dict()
 
 
 # ---------------- Train/Eval ----------------
@@ -649,21 +689,19 @@ def train_from_offline():
         save_stats_cache(cache_path,stats,cache_meta)
 
     train_src = GPUWindowBatchSource(ds_train, device, BATCH_SIZE, shuffle=True, drop_last=True)
-    val_fast_src = GPUWindowBatchSource(ds_val, device, BATCH_SIZE, shuffle=False, drop_last=False, subset_max_rows=FAST_VAL_MAX_ROWS)
     val_full_src = GPUWindowBatchSource(ds_val, device, BATCH_SIZE, shuffle=False, drop_last=False)
-    test_full_src = GPUWindowBatchSource(ds_test, device, BATCH_SIZE, shuffle=False, drop_last=False)
+    val_fast_src = val_full_src.make_evenly_spaced_subset(FAST_VAL_MAX_ROWS)
     print(
         f"[gpu_data] train rows={train_src.n_rows} feature_shape={train_src.feature_shape} "
         f"feature_gb={train_src.feature_gb:.3f} label_index_gb={train_src.label_index_gb:.3f}"
     )
-    print(f"[gpu_data] val_fast rows={val_fast_src.n_rows} subset={FAST_VAL_MAX_ROWS}")
     print(
         f"[gpu_data] val_full rows={val_full_src.n_rows} feature_shape={val_full_src.feature_shape} "
         f"feature_gb={val_full_src.feature_gb:.3f} label_index_gb={val_full_src.label_index_gb:.3f}"
     )
     print(
-        f"[gpu_data] test_full rows={test_full_src.n_rows} feature_shape={test_full_src.feature_shape} "
-        f"feature_gb={test_full_src.feature_gb:.3f} label_index_gb={test_full_src.label_index_gb:.3f}"
+        f"[gpu_data] val_fast rows={val_fast_src.n_rows} subset={FAST_VAL_MAX_ROWS} "
+        f"shared_features={val_fast_src.is_shared_feature_view} label_index_gb={val_fast_src.label_index_gb:.3f}"
     )
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
@@ -764,7 +802,7 @@ def train_from_offline():
         )
         full_val_sec = 0.0
         improved = math.isfinite(primary_metric_value) and is_metric_improved(primary_metric_value,best,primary_metric_mode)
-        if math.isfinite(primary_metric_value) and is_metric_improved(primary_metric_value,best,primary_metric_mode):
+        if improved:
             best=float(primary_metric_value); no_imp=0
             full_t0 = time.perf_counter()
             full=summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch)
@@ -778,7 +816,7 @@ def train_from_offline():
             print(f"[val_std] true_std_bps_all={full['true_std_bps_all']} pred_std_bps_all={full['pred_std_bps_all']} true_std_bps_kept={full['true_std_bps_kept']} pred_std_bps_kept={full['pred_std_bps_kept']}")
             ckpt={
                 'epoch': epoch,
-                'state_dict': get_model_state_dict_for_ckpt(model),
+                'state_dict': get_model_state_dict(model),
                 'args': {
                     'DMODEL':DMODEL, 'MAMBA_LAYERS':MAMBA_LAYERS, 'feat_dim':F_total, 'LOOKBACK':LOOKBACK,
                     'WINDOW_MS': WINDOW_MS, 'HORIZONS_MS': HORIZONS_MS, 'checkpoint_schema': CHECKPOINT_SCHEMA,
@@ -794,22 +832,46 @@ def train_from_offline():
                 'selection_metric_source': f'fast_val_{FAST_VAL_MAX_ROWS}_primary',
                 'full_val_ran_on_improvement': True,
                 'fast_val_primary_metric': float(primary_metric_value),
+                'fast_val_metrics': val_fast,
                 'full_val_metrics': full,
             }
             out_ckpt=out_root/'cmssl17_offline_best.pt'; torch.save(ckpt,out_ckpt); print(f"[ckpt] saved best to {out_ckpt}")
         else:
             no_imp += 1
-            if no_imp >= early_stop_patience:
-                print('Early stopping triggered.')
-                break
-        if (epoch + 1) % FULL_VAL_EVERY == 0 and not improved:
-            full_t0 = time.perf_counter()
-            full_periodic = summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch)
-            full_val_sec += time.perf_counter() - full_t0
-            print(f"[val_full_periodic] kept_fraction={full_periodic['kept_fraction']} raw_q50plus_fraction_true={full_periodic['raw_q50plus_fraction_true']}")
-            print(f"[val_full_periodic_reg] huber_kept={full_periodic['huber_kept']} pearson_all={full_periodic['pearson_all']} spearman_all={full_periodic['spearman_all']} pearson_kept_q50plus={full_periodic['pearson_kept_q50plus']} spearman_kept_q50plus={full_periodic['spearman_kept_q50plus']}")
+            if (epoch + 1) % FULL_VAL_EVERY == 0:
+                full_t0 = time.perf_counter()
+                full_periodic = summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch)
+                full_val_sec += time.perf_counter() - full_t0
+                print(f"[val_full_periodic] kept_fraction={full_periodic['kept_fraction']} raw_q50plus_fraction_true={full_periodic['raw_q50plus_fraction_true']}")
+                print(f"[val_full_periodic_reg] huber_kept={full_periodic['huber_kept']} pearson_all={full_periodic['pearson_all']} spearman_all={full_periodic['spearman_all']} pearson_kept_q50plus={full_periodic['pearson_kept_q50plus']} spearman_kept_q50plus={full_periodic['spearman_kept_q50plus']}")
         total_sec = time.perf_counter() - epoch_t0
         print(f"[epoch_time] train_sec={train_sec:.3f} val_fast_sec={val_fast_sec:.3f} full_val_sec={full_val_sec:.3f} total_sec={total_sec:.3f}")
+
+        if not improved and no_imp >= early_stop_patience:
+            print('Early stopping triggered.')
+            break
+
+    best_path = out_root / 'cmssl17_offline_best.pt'
+    if not best_path.exists():
+        raise FileNotFoundError(f"Best checkpoint not found: {best_path}")
+    ckpt = torch.load(best_path, map_location=device)
+    state = ckpt.get('state_dict')
+    if state is None:
+        raise KeyError(f"Checkpoint {best_path} missing 'state_dict'")
+    unwrap_model(model).load_state_dict(state, strict=True)
+    model.eval()
+
+    del train_src
+    del val_fast_src
+    del val_full_src
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    test_full_src = GPUWindowBatchSource(ds_test, device, BATCH_SIZE, shuffle=False, drop_last=False)
+    print(
+        f"[gpu_data] test_full rows={test_full_src.n_rows} feature_shape={test_full_src.feature_shape} "
+        f"feature_gb={test_full_src.feature_gb:.3f} label_index_gb={test_full_src.label_index_gb:.3f}"
+    )
 
     test=summarize_metrics(model, test_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=0)
     print(f"[test] kept_fraction={test['kept_fraction']} raw_q50plus_fraction_true={test['raw_q50plus_fraction_true']}")

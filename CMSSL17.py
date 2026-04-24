@@ -688,7 +688,6 @@ class _ConvEncoderLayer(nn.Module):
             self.small_ks = small_ks
             self.DW_conv_large = nn.Conv1d(d_model, d_model, kernel_size, stride=1, padding='same', groups=d_model)
             self.DW_conv_small = nn.Conv1d(d_model, d_model, small_ks, stride=1, padding='same', groups=d_model)
-            self.DW_infer = nn.Conv1d(d_model, d_model, kernel_size, stride=1, padding='same', groups=d_model)
         self.dw_act = get_activation_fn(activation)
         self.sublayerconnect1 = SublayerConnection(enable_res_param, dropout)
         self.dw_norm = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)
@@ -701,14 +700,6 @@ class _ConvEncoderLayer(nn.Module):
         )
         self.sublayerconnect2 = SublayerConnection(enable_res_param, dropout)
         self.norm_ffn = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)
-
-    def _get_merged_param(self):
-        left_pad = (self.large_ks - self.small_ks) // 2
-        right_pad = (self.large_ks - self.small_ks) - left_pad
-        module_output = copy.deepcopy(self.DW_conv_large)
-        module_output.weight = torch.nn.Parameter(module_output.weight + F.pad(self.DW_conv_small.weight, (left_pad, right_pad), value=0))
-        module_output.bias = torch.nn.Parameter(module_output.bias + self.DW_conv_small.bias)
-        self.DW_infer = module_output
 
     def forward(self, src:torch.Tensor) -> torch.Tensor: # [B, C, L]
         if self.re_param:
