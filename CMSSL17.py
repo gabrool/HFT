@@ -2264,9 +2264,15 @@ class FeatureEngine:
     def _add_return(self, ts_ms: int, mid: float, is_ob_event: bool):
         if mid <= 0.0:
             return 0.0
+    
         if self.last_mid_for_ret is None:
             self.last_mid_for_ret = mid
             return 0.0
+    
+        # Do not let trade-only rows inject zero mid returns into OB-return statistics.
+        if not is_ob_event:
+            return 0.0
+            
         r = (1e4 * math.log(mid / self.last_mid_for_ret)) if self.last_mid_for_ret > 0 else 0.0
         self.last_mid_for_ret = mid
 
