@@ -8,14 +8,13 @@ This mirrors the training/eval flow in CMSSL17.py but reads dataset splits
 from OUT_ROOT/meta.json and week meta files, with dynamic sequence slicing at load time.
 """
 
-import os, sys, math, json
+import os, sys, math, json, time
 from typing import List, Dict, Tuple, Iterable, Optional, Any
 from pathlib import Path
 import numpy as np
 import torch
 import torch._inductor.config
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 
@@ -54,6 +53,8 @@ CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
+FAST_VAL_MAX_ROWS = 200_000
+FULL_VAL_EVERY = 5
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
@@ -355,16 +356,131 @@ def inverse_signed_sqrt_transform_to_bps(z: np.ndarray) -> np.ndarray:
     return np.sign(z) * (np.abs(z) ** 2)
 
 
-def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_only=False):
+class GPUWindowBatchSource:
+    def __init__(
+        self,
+        ds,
+        device: torch.device,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int = 12345,
+        subset_max_rows: Optional[int] = None,
+        subset_stride: Optional[int] = None,
+    ):
+        del subset_stride
+        if len(ds.stores) != 1:
+            raise ValueError(f"GPUWindowBatchSource requires exactly one week/store, got {len(ds.stores)}")
+        if ds.week_ids.size and not np.all(ds.week_ids == 0):
+            raise ValueError("GPUWindowBatchSource requires ds.week_ids to contain only zeros for single-week datasets")
+        if len(ds) > 0 and int(ds.row_idx.min()) < int(ds.lookback - 1):
+            raise ValueError(
+                f"GPUWindowBatchSource requires full-history rows only, min row_idx={int(ds.row_idx.min())}, lookback={int(ds.lookback)}"
+            )
+
+        self.device = device
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.subset_max_rows = subset_max_rows
+        self.lookback = int(ds.lookback)
+        self.num_horizons = int(ds.y.shape[1]) if ds.y.ndim == 2 else NUM_HORIZONS
+
+        features_np = ds.stores[0].contiguous_features()
+        self.features = torch.from_numpy(features_np).to(device=device, dtype=torch.float32, non_blocking=False)
+        if self.features.dtype != torch.float32:
+            raise ValueError(f"Expected float32 features, got {self.features.dtype}")
+        self.row_idx = torch.from_numpy(ds.row_idx.astype(np.int64, copy=False)).to(device=device)
+        self.y = torch.from_numpy(ds.y.astype(np.float32, copy=False)).to(device=device)
+        self.offsets = torch.arange(self.lookback - 1, -1, -1, device=device, dtype=torch.long)
+        if self.y.ndim != 2 or self.y.shape[1] != NUM_HORIZONS:
+            raise ValueError(f"Expected y to have shape [N, {NUM_HORIZONS}], got {tuple(self.y.shape)}")
+
+        if subset_max_rows is not None:
+            n = min(int(subset_max_rows), int(self.y.shape[0]))
+            if n > 0:
+                idx = torch.linspace(0, int(self.y.shape[0]) - 1, steps=n, device=device).round().long()
+                self.row_idx = self.row_idx[idx]
+                self.y = self.y[idx]
+
+        self.n_rows = int(self.y.shape[0])
+        self.feature_shape = tuple(self.features.shape)
+        self.feature_gb = float(self.features.numel() * self.features.element_size()) / (1024 ** 3)
+        self.label_index_gb = float(
+            self.y.numel() * self.y.element_size() + self.row_idx.numel() * self.row_idx.element_size()
+        ) / (1024 ** 3)
+
+    def __len__(self) -> int:
+        n = int(self.n_rows)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+    def iter_epoch(self, epoch: int):
+        n = int(self.n_rows)
+        if self.shuffle:
+            g = torch.Generator(device=self.device)
+            g.manual_seed(self.seed + int(epoch))
+            perm = torch.randperm(n, device=self.device, generator=g)
+        else:
+            perm = torch.arange(n, device=self.device)
+
+        stop = (n // self.batch_size) * self.batch_size if self.drop_last else n
+        for start in range(0, stop, self.batch_size):
+            end = min(start + self.batch_size, stop)
+            ids = perm[start:end]
+            rows = self.row_idx[ids]
+            win_idx = rows[:, None] - self.offsets[None, :]
+            x = self.features[win_idx]
+            y_raw = self.y[ids]
+            expected_b = int(end - start)
+            if x.shape != (expected_b, self.lookback, self.features.shape[1]):
+                raise ValueError(f"Window tensor shape mismatch: got {tuple(x.shape)}")
+            if y_raw.ndim != 2 or y_raw.shape[1] != NUM_HORIZONS:
+                raise ValueError(f"Label tensor shape mismatch: got {tuple(y_raw.shape)}")
+            yield x, y_raw
+
+
+def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch: int = 0):
     model.eval()
     pred_parts=[]; y_parts=[]
-    with torch.no_grad():
-        for x,y in dl:
-            x=x.to(device, non_blocking=True)
+    with torch.inference_mode():
+        if primary_only:
+            primary_h = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+            pred_primary_parts = []
+            y_primary_parts = []
+            n_eval_rows = 0
+            for x, y_raw in source.iter_epoch(epoch):
+                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                    pred = model(x)
+                pred_primary_parts.append(pred[:, primary_h].detach().float().cpu().numpy())
+                y_primary_parts.append(y_raw[:, primary_h].detach().float().cpu().numpy())
+                n_eval_rows += int(y_raw.shape[0])
+            out = {
+                "spearman_kept_q50plus": [float("nan")] * NUM_HORIZONS,
+                "n_eval_rows": int(n_eval_rows),
+                "primary_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS),
+                "primary_subset": bool(getattr(source, "subset_max_rows", None) is not None),
+            }
+            if not y_primary_parts:
+                return out
+            pred_h = np.concatenate(pred_primary_parts, axis=0)
+            y_raw_h = np.concatenate(y_primary_parts, axis=0)
+            y_t_h = signed_sqrt_transform(y_raw_h)
+            abs_y = np.abs(y_raw_h)
+            keep = (abs_y >= float(stats['abs_lo_raw_bps'][primary_h])) & (abs_y <= float(stats['abs_hi_raw_bps'][primary_h]))
+            q50 = float(stats['kept_q50_abs_raw_bps'][primary_h])
+            q50plus = keep & (abs_y >= q50)
+            if q50plus.sum() > 1:
+                out["spearman_kept_q50plus"][primary_h] = _spearman(pred_h[q50plus], y_t_h[q50plus])
+            return out
+
+        for x, y_raw in source.iter_epoch(epoch):
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
-                pred=model(x)
+                pred = model(x)
             pred_parts.append(pred.detach().float().cpu().numpy())
-            y_parts.append(y.numpy())
+            y_parts.append(y_raw.detach().float().cpu().numpy())
     if not y_parts:
         out={"spearman_kept_q50plus":[float('nan')]*NUM_HORIZONS}
         return out
@@ -464,8 +580,6 @@ def summarize_metrics(model, dl, device, stats, amp_enabled, amp_dtype, primary_
         else:
             out['balanced_sign_acc_kept_q50plus'].append(float('nan'))
 
-    if primary_only:
-        return {'spearman_kept_q50plus': out['spearman_kept_q50plus']}
     return out
 
 
@@ -490,7 +604,6 @@ def train_from_offline():
     event_stream_mode = meta.get('event_stream_mode')
     splits = require_four_week_pipeline_splits(meta, out_root)
 
-    weeks_order = splits['weeks_in_order']
     cmssl_train = splits['splits']['cmssl']['train']
     cmssl_val = splits['splits']['cmssl']['val']
     cmssl_test = splits['splits']['cmssl']['test']
@@ -499,6 +612,19 @@ def train_from_offline():
     ds_val = build_dataset_from_split(str(out_root), cmssl_val)
     ds_test = build_dataset_from_split(str(out_root), cmssl_test)
     F_total = int(meta.get("feature_dim_total", 0))
+    if F_total != int(ds_train.feature_dim_total):
+        raise ValueError(f"Feature dimension mismatch: meta={F_total}, train_dataset={int(ds_train.feature_dim_total)}")
+    if int(ds_train.lookback) != int(LOOKBACK):
+        raise ValueError(f"LOOKBACK mismatch: config={LOOKBACK}, train_dataset={int(ds_train.lookback)}")
+    for split_name, ds in (("train", ds_train), ("val", ds_val), ("test", ds_test)):
+        if len(ds.stores) != 1:
+            raise ValueError(f"{split_name} split must have exactly one store/week, got {len(ds.stores)}")
+        if ds.week_ids.size and not np.all(ds.week_ids == 0):
+            raise ValueError(f"{split_name} split week_ids must all be 0 for single-week protocol")
+        if len(ds) > 0 and int(ds.row_idx.min()) < int(LOOKBACK - 1):
+            raise ValueError(
+                f"{split_name} split has rows without full history: min_row_idx={int(ds.row_idx.min())}, lookback={LOOKBACK}"
+            )
 
     tr_start,tr_end=int(cmssl_train['start']),int(cmssl_train['end'])
     va_start,va_end=int(cmssl_val['start']),int(cmssl_val['end'])
@@ -518,15 +644,27 @@ def train_from_offline():
     cached=load_stats_cache(cache_path); stats=None
     if cached and cache_matches(cached[1], cache_meta): stats=cached[0]
     if stats is None:
-        dl_pre=DataLoader(ds_train,batch_size=BATCH_SIZE,shuffle=False,drop_last=False,num_workers=WORKERS_TRAIN,pin_memory=True)
-        y_parts=[yb.numpy() for _,yb in dl_pre]
-        y_train=np.concatenate(y_parts,0) if y_parts else np.empty((0,NUM_HORIZONS),np.float32)
+        y_train=np.asarray(ds_train.y, dtype=np.float32)
         stats=compute_signed_raw_stats(y_train)
         save_stats_cache(cache_path,stats,cache_meta)
 
-    dl_train=DataLoader(ds_train,BATCH_SIZE,shuffle=True,drop_last=True,num_workers=WORKERS_TRAIN,pin_memory=True,prefetch_factor=8 if WORKERS_TRAIN>0 else None,persistent_workers=(WORKERS_TRAIN>0))
-    dl_val=DataLoader(ds_val,BATCH_SIZE,shuffle=False,num_workers=max(1,WORKERS_VAL),pin_memory=True,persistent_workers=(max(1,WORKERS_VAL)>0))
-    dl_test=DataLoader(ds_test,BATCH_SIZE,shuffle=False,num_workers=max(1,WORKERS_VAL),pin_memory=True,persistent_workers=(max(1,WORKERS_VAL)>0))
+    train_src = GPUWindowBatchSource(ds_train, device, BATCH_SIZE, shuffle=True, drop_last=True)
+    val_fast_src = GPUWindowBatchSource(ds_val, device, BATCH_SIZE, shuffle=False, drop_last=False, subset_max_rows=FAST_VAL_MAX_ROWS)
+    val_full_src = GPUWindowBatchSource(ds_val, device, BATCH_SIZE, shuffle=False, drop_last=False)
+    test_full_src = GPUWindowBatchSource(ds_test, device, BATCH_SIZE, shuffle=False, drop_last=False)
+    print(
+        f"[gpu_data] train rows={train_src.n_rows} feature_shape={train_src.feature_shape} "
+        f"feature_gb={train_src.feature_gb:.3f} label_index_gb={train_src.label_index_gb:.3f}"
+    )
+    print(f"[gpu_data] val_fast rows={val_fast_src.n_rows} subset={FAST_VAL_MAX_ROWS}")
+    print(
+        f"[gpu_data] val_full rows={val_full_src.n_rows} feature_shape={val_full_src.feature_shape} "
+        f"feature_gb={val_full_src.feature_gb:.3f} label_index_gb={val_full_src.label_index_gb:.3f}"
+    )
+    print(
+        f"[gpu_data] test_full rows={test_full_src.n_rows} feature_shape={test_full_src.feature_shape} "
+        f"feature_gb={test_full_src.feature_gb:.3f} label_index_gb={test_full_src.label_index_gb:.3f}"
+    )
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
     model = SAMBA(args).to(device)
@@ -548,9 +686,14 @@ def train_from_offline():
     hwt=torch.tensor(HORIZON_WEIGHTS,device=device,dtype=torch.float32).view(1,-1)
 
     for epoch in range(EPOCHS):
-        model.train(); running={'loss':0.0,'huber':0.0,'corr':0.0}; n_batches=0
-        for x,y in tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}"):
-            x=x.to(device, non_blocking=True); y_raw=y.to(device, non_blocking=True)
+        epoch_t0 = time.perf_counter()
+        train_t0 = time.perf_counter()
+        model.train()
+        loss_sum = torch.zeros((), device=device)
+        hub_sum = torch.zeros((), device=device)
+        corr_sum = torch.zeros((), device=device)
+        n_batches = 0
+        for x, y_raw in tqdm(train_src.iter_epoch(epoch), total=len(train_src), desc=f"Ep{epoch+1}/{EPOCHS}"):
             def compute_loss(pred, y_raw):
                 keep=(torch.abs(y_raw)>=abs_lo_t)&(torch.abs(y_raw)<=abs_hi_t)
                 y_t=torch.sign(y_raw)*torch.sqrt(torch.abs(y_raw))
@@ -598,20 +741,34 @@ def train_from_offline():
             # Clip only before the actual optimizer update.
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
             opt.second_step(zero_grad=True)
-            
-            running['loss'] += float(loss.detach().cpu())
-            running['huber'] += float(hub.detach().cpu())
-            running['corr'] += float(corr.detach().cpu())
-            n_batches += 1
-            
-        print(f"[train] loss={running['loss']/max(1,n_batches):.6f} huber={running['huber']/max(1,n_batches):.6f} corr_penalty={running['corr']/max(1,n_batches):.6f}")
 
-        val_fast=summarize_metrics(model, dl_val, device, stats, amp_enabled, amp_dtype, primary_only=True)
+            loss_sum += loss.detach()
+            hub_sum += hub.detach()
+            corr_sum += corr.detach()
+            n_batches += 1
+
+        train_sec = time.perf_counter() - train_t0
+        train_loss = (loss_sum / max(1, n_batches)).item()
+        train_hub = (hub_sum / max(1, n_batches)).item()
+        train_corr = (corr_sum / max(1, n_batches)).item()
+        print(f"[train] loss={train_loss:.6f} huber={train_hub:.6f} corr_penalty={train_corr:.6f}")
+
+        val_fast_t0 = time.perf_counter()
+        val_fast=summarize_metrics(model, val_fast_src, device, stats, amp_enabled, amp_dtype, primary_only=True, epoch=epoch)
+        val_fast_sec = time.perf_counter() - val_fast_t0
         primary_metric_value, primary_metric_label = compute_primary_metric(val_fast)
-        print(f"[val-fast] primary_metric({primary_metric_label})={primary_metric_value:.6f}")
+        print(
+            f"[val_fast] primary_metric_name={primary_metric_label} "
+            f"primary_horizon_ms={val_fast.get('primary_horizon_ms', PRIMARY_METRIC_HORIZON_MS)} "
+            f"value={primary_metric_value:.6f} rows={val_fast.get('n_eval_rows', 0)}"
+        )
+        full_val_sec = 0.0
+        improved = math.isfinite(primary_metric_value) and is_metric_improved(primary_metric_value,best,primary_metric_mode)
         if math.isfinite(primary_metric_value) and is_metric_improved(primary_metric_value,best,primary_metric_mode):
             best=float(primary_metric_value); no_imp=0
-            full=summarize_metrics(model, dl_val, device, stats, amp_enabled, amp_dtype, primary_only=False)
+            full_t0 = time.perf_counter()
+            full=summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch)
+            full_val_sec += time.perf_counter() - full_t0
             print(f"[val] kept_fraction={full['kept_fraction']} raw_q50plus_fraction_true={full['raw_q50plus_fraction_true']}")
             print(f"[val_reg] huber_kept={full['huber_kept']} pearson_all={full['pearson_all']} spearman_all={full['spearman_all']} pearson_kept_q50plus={full['pearson_kept_q50plus']} spearman_kept_q50plus={full['spearman_kept_q50plus']}")
             print(f"[val_zero] pred_abs_p50_bps={full['pred_raw_abs_p50_bps']} pred_abs_p90_bps={full['pred_raw_abs_p90_bps']} near_zero_0p5={full['pred_near_zero_frac_0p5bps']} near_zero_1p0={full['pred_near_zero_frac_1p0bps']}")
@@ -634,6 +791,10 @@ def train_from_offline():
                     'high_abs_trim_fraction': float(HIGH_ABS_TRIM_FRACTION),
                 },
                 'best_primary_metric': best,
+                'selection_metric_source': f'fast_val_{FAST_VAL_MAX_ROWS}_primary',
+                'full_val_ran_on_improvement': True,
+                'fast_val_primary_metric': float(primary_metric_value),
+                'full_val_metrics': full,
             }
             out_ckpt=out_root/'cmssl17_offline_best.pt'; torch.save(ckpt,out_ckpt); print(f"[ckpt] saved best to {out_ckpt}")
         else:
@@ -641,8 +802,16 @@ def train_from_offline():
             if no_imp >= early_stop_patience:
                 print('Early stopping triggered.')
                 break
+        if (epoch + 1) % FULL_VAL_EVERY == 0 and not improved:
+            full_t0 = time.perf_counter()
+            full_periodic = summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch)
+            full_val_sec += time.perf_counter() - full_t0
+            print(f"[val_full_periodic] kept_fraction={full_periodic['kept_fraction']} raw_q50plus_fraction_true={full_periodic['raw_q50plus_fraction_true']}")
+            print(f"[val_full_periodic_reg] huber_kept={full_periodic['huber_kept']} pearson_all={full_periodic['pearson_all']} spearman_all={full_periodic['spearman_all']} pearson_kept_q50plus={full_periodic['pearson_kept_q50plus']} spearman_kept_q50plus={full_periodic['spearman_kept_q50plus']}")
+        total_sec = time.perf_counter() - epoch_t0
+        print(f"[epoch_time] train_sec={train_sec:.3f} val_fast_sec={val_fast_sec:.3f} full_val_sec={full_val_sec:.3f} total_sec={total_sec:.3f}")
 
-    test=summarize_metrics(model, dl_test, device, stats, amp_enabled, amp_dtype, primary_only=False)
+    test=summarize_metrics(model, test_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=0)
     print(f"[test] kept_fraction={test['kept_fraction']} raw_q50plus_fraction_true={test['raw_q50plus_fraction_true']}")
     print(f"[test_reg] huber_kept={test['huber_kept']} pearson_all={test['pearson_all']} spearman_all={test['spearman_all']} pearson_kept_q50plus={test['pearson_kept_q50plus']} spearman_kept_q50plus={test['spearman_kept_q50plus']}")
     print(f"[test_zero] pred_abs_p50_bps={test['pred_raw_abs_p50_bps']} pred_abs_p90_bps={test['pred_raw_abs_p90_bps']} near_zero_0p5={test['pred_near_zero_frac_0p5bps']} near_zero_1p0={test['pred_near_zero_frac_1p0bps']}")

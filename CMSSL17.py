@@ -2539,6 +2539,27 @@ class WeekFeatureStore:
         # This eliminates the massive disk I/O bottleneck during shuffled Dataloader reads
         self.features_mm = [np.load(self.week_dir / ch["files"]["features"])[:] for ch in self.feature_chunks]
 
+    def contiguous_features(self) -> np.ndarray:
+        if self.row_starts.size == 0 or self.row_ends.size == 0:
+            raise ValueError(f"No feature chunks found for week store {self.week_dir}")
+        if int(self.row_starts[0]) != 0:
+            raise ValueError(
+                f"Feature chunks are not contiguous for {self.week_dir}: row_starts[0]={int(self.row_starts[0])}, expected 0"
+            )
+        for i in range(1, int(self.row_starts.size)):
+            if int(self.row_starts[i]) != int(self.row_ends[i - 1]):
+                raise ValueError(
+                    f"Feature chunks are not contiguous for {self.week_dir}: "
+                    f"row_starts[{i}]={int(self.row_starts[i])} != row_ends[{i-1}]={int(self.row_ends[i - 1])}"
+                )
+        out = np.concatenate(self.features_mm, axis=0).astype(np.float32, copy=False)
+        expected_shape = (int(self.row_ends[-1]), int(self.feature_dim_total))
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"Contiguous feature matrix shape mismatch for {self.week_dir}: got {out.shape}, expected {expected_shape}"
+            )
+        return np.ascontiguousarray(out, dtype=np.float32)
+
     def _locate_chunk(self, row_idx: int) -> int:
         i = int(np.searchsorted(self.row_ends, int(row_idx), side="right"))
         if i >= len(self.row_ends) or row_idx < int(self.row_starts[i]) or row_idx >= int(self.row_ends[i]):
@@ -2592,8 +2613,8 @@ class HFTFlatDataset(Dataset):
         self.stores: List[WeekFeatureStore] = []
 
         week_meta_paths = self.meta.get("weeks_meta", {})
-        self.week_ids: List[int] = []
-        self.row_idx: List[int] = []
+        week_ids_parts: List[np.ndarray] = []
+        row_idx_parts: List[np.ndarray] = []
         y_parts: List[np.ndarray] = []
 
         for wk in self.week_keys:
@@ -2632,16 +2653,23 @@ class HFTFlatDataset(Dataset):
                     mask &= (label_ts_arr >= int(decision_ts_start))
                 if decision_ts_end is not None:
                     mask &= (label_ts_arr < int(decision_ts_end))
+                row_idx_i64 = np.asarray(row_idx_arr, dtype=np.int64)
+                full_history_mask = row_idx_i64 >= (self.lookback - 1)
+                mask &= full_history_mask
                 if not np.any(mask):
                     continue
                 idx = np.nonzero(mask)[0]
-                self.week_ids.extend([self.week_to_id[wk]] * int(idx.shape[0]))
-                self.row_idx.extend(np.asarray(row_idx_arr[idx], dtype=np.int64).tolist())
+                week_ids_parts.append(np.full((int(idx.shape[0]),), self.week_to_id[wk], dtype=np.int64))
+                row_idx_parts.append(row_idx_i64[idx])
                 y_parts.append(np.asarray(y_arr[idx], dtype=np.float32))
-
-        self.week_ids = np.asarray(self.week_ids, dtype=np.int16)
-        self.row_idx = np.asarray(self.row_idx, dtype=np.int64)
+        self.week_ids = np.concatenate(week_ids_parts, axis=0).astype(np.int64, copy=False) if week_ids_parts else np.empty((0,), dtype=np.int64)
+        self.row_idx = np.concatenate(row_idx_parts, axis=0).astype(np.int64, copy=False) if row_idx_parts else np.empty((0,), dtype=np.int64)
         self.y = np.concatenate(y_parts, axis=0).astype(np.float32, copy=False) if y_parts else np.empty((0, NUM_HORIZONS), dtype=np.float32)
+        if self.y.shape[0] == 0:
+            raise ValueError(
+                "No rows remain in HFTFlatDataset after decision_ts/full-history filtering. "
+                f"weeks={self.weeks}, decision_ts_start={decision_ts_start}, decision_ts_end={decision_ts_end}, lookback={self.lookback}"
+            )
 
     def __len__(self) -> int:
         return int(self.y.shape[0])
