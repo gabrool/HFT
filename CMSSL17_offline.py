@@ -532,15 +532,11 @@ def train_from_offline():
     model = SAMBA(args).to(device)
 
     if COMPILE_ENABLED and hasattr(torch, "compile"):
-        # Disable epilogue fusion to prevent the Triton XBLOCK crash
-        torch._inductor.config.epilogue_fusion = False
-        # Break the graph up slightly to preserve VRAM
-        torch._inductor.config.realize_opcount_threshold = 40
-        # Disable pointwise autotuning to prevent benchmarking crashes
-        torch._inductor.config.max_autotune_pointwise = False
-        
-        model = torch.compile(model, mode=COMPILE_MODE, dynamic=False)
-        print("[compile] enabled full-model compile with dynamic=False, epilogue_fusion=False", flush=True)
+        # Enable extreme kernel benchmarking
+        torch._inductor.config.max_autotune = True
+        torch._inductor.config.coordinate_descent_tuning = True
+        model = torch.compile(model, mode="max-autotune", dynamic=False)
+        print("[compile] enabled full-model compile with max-autotune (dynamic=False)", flush=True)
         
     opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
     primary_metric_mode=get_primary_metric_mode()
