@@ -234,9 +234,9 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
 
 def _label_dim_error(source: str, observed: Any) -> ValueError:
     return ValueError(
-        f"{source} has label_dim={observed!r}, but CMSSL17_offline.py now requires "
-        f"label_dim={NUM_HORIZONS}. Old offline datasets with 2 * NUM_HORIZONS labels are no longer supported; "
-        "rebuild the offline data with offline_ingest.py."
+        f"{source} has label_dim={observed!r}, expected {NUM_HORIZONS}. "
+        "Old or incompatible offline dataset. Rerun offline_ingest.py with "
+        f"FEATURE_SCHEMA={FEATURE_SCHEMA}."
     )
 
 
@@ -282,6 +282,70 @@ def validate_contract_meta(meta: dict, source: str) -> None:
         raise ValueError(
             "Old or incompatible offline dataset. Rerun offline_ingest.py with "
             f"FEATURE_SCHEMA={FEATURE_SCHEMA}."
+        )
+
+
+def validate_week_matches_global(global_meta: dict, week_meta: dict, source: str) -> None:
+    checks = {
+        "feature_schema": (week_meta.get("feature_schema"), global_meta.get("feature_schema")),
+        "aux_schema": (week_meta.get("aux_schema"), global_meta.get("aux_schema")),
+        "checkpoint_schema_expected": (
+            week_meta.get("checkpoint_schema_expected"),
+            global_meta.get("checkpoint_schema_expected"),
+        ),
+        "target_transform": (week_meta.get("target_transform"), global_meta.get("target_transform")),
+        "target_task": (week_meta.get("target_task"), global_meta.get("target_task")),
+        "aux_dim": (int(week_meta.get("aux_dim", -1)), int(global_meta.get("aux_dim", -2))),
+        "feature_dim_core": (
+            int(week_meta.get("feature_dim_core", -1)),
+            int(global_meta.get("feature_dim_core", -2)),
+        ),
+        "feature_dim_total": (
+            int(week_meta.get("feature_dim_total", -1)),
+            int(global_meta.get("feature_dim_total", -2)),
+        ),
+        "feature_dim_core_pre_pca": (
+            int(week_meta.get("feature_dim_core_pre_pca", -1)),
+            int(global_meta.get("feature_dim_core_pre_pca", -2)),
+        ),
+        "feature_names_hash": (
+            week_meta.get("feature_names_hash"),
+            global_meta.get("feature_names_hash"),
+        ),
+    }
+
+    for field, (week_value, global_value) in checks.items():
+        if week_value != global_value:
+            raise ValueError(
+                "Week metadata does not match global metadata. "
+                f"source={source}, field={field}, week_value={week_value!r}, "
+                f"global_value={global_value!r}. Rerun offline_ingest.py with "
+                f"FEATURE_SCHEMA={FEATURE_SCHEMA}."
+            )
+
+    if list(week_meta.get("aux_names", [])) != list(global_meta.get("aux_names", [])):
+        raise ValueError(
+            "Week metadata aux_names do not match global metadata. "
+            f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
+        )
+
+    if list(week_meta.get("feature_names_pre_pca", [])) != list(global_meta.get("feature_names_pre_pca", [])):
+        raise ValueError(
+            "Week metadata feature_names_pre_pca do not match global metadata. "
+            f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
+        )
+
+    week_pca = week_meta.get("pca", {}) or {}
+    global_pca = global_meta.get("pca", {}) or {}
+    if bool(week_pca.get("applied", False)) != bool(global_pca.get("applied", False)):
+        raise ValueError(
+            "Week metadata PCA applied flag does not match global metadata. "
+            f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
+        )
+    if int(week_pca.get("k", -1)) != int(global_pca.get("k", -2)):
+        raise ValueError(
+            "Week metadata PCA k does not match global metadata. "
+            f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
         )
 
 
@@ -667,10 +731,19 @@ def train_from_offline():
     validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
     validate_contract_meta(meta, f"global metadata {out_root / 'meta.json'}")
     for rel_path in meta.get("weeks_meta", {}).values():
-        week_meta_path = out_root / rel_path
-        week_meta = json.loads(week_meta_path.read_text())
-        validate_dataset_label_dim(week_meta, f"week metadata {week_meta_path}")
-        validate_contract_meta(week_meta, f"week metadata {week_meta_path}")
+        wk_path = out_root / rel_path
+        wk_meta = json.loads(wk_path.read_text())
+        source = f"week metadata {rel_path}"
+        validate_dataset_label_dim(wk_meta, source)
+        validate_contract_meta(wk_meta, source)
+        validate_week_matches_global(meta, wk_meta, source)
+    print(
+        f"[metadata-contract] schema={FEATURE_SCHEMA} "
+        f"feature_dim_core={meta.get('feature_dim_core')} "
+        f"feature_dim_total={meta.get('feature_dim_total')} "
+        f"feature_names_hash={meta.get('feature_names_hash')}",
+        flush=True,
+    )
     trade_history_enabled = meta.get('trade_history_enabled')
     event_stream_mode = meta.get('event_stream_mode')
     splits = require_four_week_pipeline_splits(meta, out_root)
