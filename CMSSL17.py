@@ -480,9 +480,9 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "signed_sqrt_raw_bps"
 TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
-FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v1"
+FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v2"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
-CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage4"
+CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage4-v2"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
@@ -552,7 +552,14 @@ SLIPPAGE_NOTIONAL_USD = (
     250_000.0,
 )
 FAST_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
-FLOW_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+FLOW_WINDOWS_MS = (
+    1_000,
+    3_000,
+    7_500,
+    15_000,
+    30_000,
+    60_000,
+)
 LARGE_TRADE_NOTIONAL_USD = (
     50_000.0,
     100_000.0,
@@ -1269,15 +1276,13 @@ class FeatureEngine:
 
         # ---------- Best-level churn & depletion ----------
         self.bestlvl_windows: Tuple[int, ...] = FAST_WINDOWS_MS
-        self._bid1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
-        self._ask1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
+        self._bid_price_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
+        self._ask_price_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self.last_bid1 = None; self.last_ask1 = None
-        self.sz_delta_deques: Dict[int, Deque[Tuple[int, float, float]]] = {
-            ms: deque() for ms in self.bestlvl_windows
-        }
-        self.sz_delta_sums: Dict[int, Dict[str, float]] = {
-            ms: {"bid": 0.0, "ask": 0.0} for ms in self.bestlvl_windows
-        }
+        self._bid_l1_depletion_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self.bestlvl_windows}
+        self._ask_l1_depletion_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self.bestlvl_windows}
+        self._bid_l1_depletion_sums: Dict[int, float] = {ms: 0.0 for ms in self.bestlvl_windows}
+        self._ask_l1_depletion_sums: Dict[int, float] = {ms: 0.0 for ms in self.bestlvl_windows}
 
         # ---------- Liquidity replenishment tracking (L1/L2) ----------
         self.replen_windows_ms: Tuple[int, ...] = FAST_WINDOWS_MS
@@ -1507,19 +1512,27 @@ class FeatureEngine:
             names.extend([
                 f"spread_delta_bps_{ms}ms",
                 f"spread_change_count_{ms}ms",
-                f"bid1_change_count_{ms}ms",
-                f"ask1_change_count_{ms}ms",
+                f"bid_price_change_count_{ms}ms",
+                f"ask_price_change_count_{ms}ms",
+                f"bid_price_change_rate_{ms}ms",
+                f"ask_price_change_rate_{ms}ms",
                 f"bid_l1_depletion_{ms}ms",
                 f"ask_l1_depletion_{ms}ms",
-                f"bid_l1_add_rate_{ms}ms",
-                f"bid_l1_rem_rate_{ms}ms",
-                f"ask_l1_add_rate_{ms}ms",
-                f"ask_l1_rem_rate_{ms}ms",
-                f"bid_l2_add_rate_{ms}ms",
-                f"bid_l2_rem_rate_{ms}ms",
-                f"ask_l2_add_rate_{ms}ms",
-                f"ask_l2_rem_rate_{ms}ms",
+                f"bid_l1_depletion_over_depth_{ms}ms",
+                f"ask_l1_depletion_over_depth_{ms}ms",
             ])
+        for ms in FAST_WINDOWS_MS:
+            for level in (1, 2):
+                names.extend([
+                    f"bid_l{level}_add_rate_{ms}ms",
+                    f"bid_l{level}_rem_rate_{ms}ms",
+                    f"ask_l{level}_add_rate_{ms}ms",
+                    f"ask_l{level}_rem_rate_{ms}ms",
+                    f"bid_l{level}_add_rate_over_depth_{ms}ms",
+                    f"bid_l{level}_rem_rate_over_depth_{ms}ms",
+                    f"ask_l{level}_add_rate_over_depth_{ms}ms",
+                    f"ask_l{level}_rem_rate_over_depth_{ms}ms",
+                ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
                 f"buy_vol_base_{ms}ms",
@@ -1597,15 +1610,18 @@ class FeatureEngine:
                 f"price_response_to_sell_flow_{ms}ms",
             ])
         for ms in FLOW_WINDOWS_MS:
-            names.append(f"return_std_{ms}ms")
+            names.append(f"return_std_bps_{ms}ms")
         for prev_ms, cur_ms in zip(FLOW_WINDOWS_MS[:-1], FLOW_WINDOWS_MS[1:]):
-            names.append(f"vr_{cur_ms}ms_over_{prev_ms}ms")
+            names.append(f"variance_ratio_{cur_ms}ms_over_{prev_ms}ms")
         for ms in REGIME_WINDOWS_MS:
             names.extend([
                 f"regime_volume_ewma_{ms}ms",
                 f"regime_realized_vol_bps_{ms}ms",
                 f"regime_vol_ewma_bps_{ms}ms",
-                f"regime_flow_imbalance_{ms}ms",
+            ])
+            if ms <= 60_000:
+                names.append(f"regime_flow_imbalance_{ms}ms")
+            names.extend([
                 f"realized_up_vol_bps_{ms}ms",
                 f"realized_down_vol_bps_{ms}ms",
                 f"down_up_vol_ratio_{ms}ms",
@@ -2820,41 +2836,48 @@ class FeatureEngine:
             if spread < self.prev_spread_for_age:
                 self.last_spread_tighten_ts = ts_ms
 
+        spread_changed = (self.last_spread is not None and spread != self.last_spread)
         for ms in self._spread_change_deques:
-            if self.last_spread is None or spread != self.last_spread:
+            if spread_changed:
                 self._append_ts_with_guard(self._spread_change_deques[ms], ts_ms, ms, is_ob_event=True)
             else:
                 self._prune_ts_deque(self._spread_change_deques[ms], ts_ms, ms)
-        if self.last_spread is None or spread != self.last_spread:
+        if self.last_spread is None or spread_changed:
             self.last_spread = spread
             self.last_spread_ts = ts_ms
 
         bid_level_changed = (self.last_bid1 is None or bid1 != self.last_bid1 or bsz1 != prev_bid_l1)
         ask_level_changed = (self.last_ask1 is None or ask1 != self.last_ask1 or asz1 != prev_ask_l1)
-        for ms, dq in self._bid1_change_deques.items():
-            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if bid_level_changed else self._prune_ts_deque(dq, ts_ms, ms)
-        for ms, dq in self._ask1_change_deques.items():
-            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if ask_level_changed else self._prune_ts_deque(dq, ts_ms, ms)
+        bid_price_changed = (self.prev_bid1_price is not None and bid1 != self.prev_bid1_price)
+        ask_price_changed = (self.prev_ask1_price is not None and ask1 != self.prev_ask1_price)
+        for ms, dq in self._bid_price_change_deques.items():
+            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if bid_price_changed else self._prune_ts_deque(dq, ts_ms, ms)
+        for ms, dq in self._ask_price_change_deques.items():
+            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if ask_price_changed else self._prune_ts_deque(dq, ts_ms, ms)
         if bid_level_changed:
             self.last_bid1_update_ts = ts_ms
         if ask_level_changed:
             self.last_ask1_update_ts = ts_ms
         self.last_bid1, self.last_ask1 = bid1, ask1
 
-        for ms, deq in self.sz_delta_deques.items():
-            bid_dep = min(bsz1 - prev_bid_l1, 0.0)
-            ask_dep = min(asz1 - prev_ask_l1, 0.0)
-            deq.append((ts_ms, bid_dep, ask_dep))
-            sums = self.sz_delta_sums[ms]
-            sums["bid"] += bid_dep
-            sums["ask"] += ask_dep
-            while deq and (ts_ms - deq[0][0] > ms):
-                _, old_bid, old_ask = deq.popleft()
-                sums["bid"] -= old_bid
-                sums["ask"] -= old_ask
-        neg_depletion = {
-            ms: (self.sz_delta_sums[ms]["bid"], self.sz_delta_sums[ms]["ask"])
-            for ms in self.sz_delta_deques
+        bid_l1_depletion_event = max(prev_bid_l1 - bsz1, 0.0) if prev_bid_l1 > 0.0 else 0.0
+        ask_l1_depletion_event = max(prev_ask_l1 - asz1, 0.0) if prev_ask_l1 > 0.0 else 0.0
+        for ms in self.bestlvl_windows:
+            bid_deq = self._bid_l1_depletion_deques[ms]
+            ask_deq = self._ask_l1_depletion_deques[ms]
+            bid_deq.append((ts_ms, bid_l1_depletion_event))
+            ask_deq.append((ts_ms, ask_l1_depletion_event))
+            self._bid_l1_depletion_sums[ms] += bid_l1_depletion_event
+            self._ask_l1_depletion_sums[ms] += ask_l1_depletion_event
+            while bid_deq and (ts_ms - bid_deq[0][0] > ms):
+                _, old_bid = bid_deq.popleft()
+                self._bid_l1_depletion_sums[ms] -= old_bid
+            while ask_deq and (ts_ms - ask_deq[0][0] > ms):
+                _, old_ask = ask_deq.popleft()
+                self._ask_l1_depletion_sums[ms] -= old_ask
+        l1_depletion = {
+            ms: (self._bid_l1_depletion_sums[ms], self._ask_l1_depletion_sums[ms])
+            for ms in self.bestlvl_windows
         }
 
         dt_since_trade = float(ts_ms - self.last_trade_ts) if self.last_trade_ts is not None else 0.0
@@ -2869,19 +2892,19 @@ class FeatureEngine:
 
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
         return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
-        return_std = {ms: math.sqrt(var) for ms, var in return_var.items()}
-        vr_adjacent = {}
+        return_std_bps = {ms: math.sqrt(var) for ms, var in return_var.items()}
+        variance_ratio_adjacent = {}
         for prev_ms, cur_ms in zip(self.return_windows_ms[:-1], self.return_windows_ms[1:]):
             var_prev = return_var[prev_ms]
             var_cur = return_var[cur_ms]
-            vr_adjacent[(cur_ms, prev_ms)] = (var_cur / max((cur_ms / prev_ms) * var_prev, 1e-12)) if var_prev > 0 else 0.0
+            variance_ratio_adjacent[(cur_ms, prev_ms)] = (var_cur / max((cur_ms / prev_ms) * var_prev, 1e-12)) if var_prev > 0 else 0.0
 
         regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
         regime_realized = {ms: self.realized_vol[ms] for ms in self.regime_windows_ms}
         regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
         for ms in self.regime_windows_ms:
-            nearest = min(self.trade_windows, key=lambda w: abs(w - ms))
-            self.flow_regime[ms] = trade_stats_by_ms[nearest]["trade_imbalance_notional"]
+            if ms <= 60_000:
+                self.flow_regime[ms] = trade_stats_by_ms[ms]["trade_imbalance_notional"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
 
         vpin_features = []
@@ -3099,16 +3122,42 @@ class FeatureEngine:
             ])
 
         for ms in FAST_WINDOWS_MS:
+            window_seconds = max(ms / 1000.0, 1e-9)
+            bid_price_change_count = float(len(self._bid_price_change_deques[ms]))
+            ask_price_change_count = float(len(self._ask_price_change_deques[ms]))
+            bid_l1_depletion = l1_depletion[ms][0]
+            ask_l1_depletion = l1_depletion[ms][1]
             feat_list.extend([
                 spread_delta_bps[ms],
                 float(len(self._spread_change_deques[ms])),
-                float(len(self._bid1_change_deques[ms])),
-                float(len(self._ask1_change_deques[ms])),
-                neg_depletion[ms][0], neg_depletion[ms][1],
+                bid_price_change_count,
+                ask_price_change_count,
+                bid_price_change_count / window_seconds,
+                ask_price_change_count / window_seconds,
+                bid_l1_depletion,
+                ask_l1_depletion,
+                self._safe_div(bid_l1_depletion, max(bsz1, 1e-9), 0.0),
+                self._safe_div(ask_l1_depletion, max(asz1, 1e-9), 0.0),
             ])
+        for ms in FAST_WINDOWS_MS:
             rates = replen_rates[ms]
             for level in (1, 2):
-                feat_list.extend([rates[("bid", level, "add")], rates[("bid", level, "rem")], rates[("ask", level, "add")], rates[("ask", level, "rem")]])
+                bid_level_size = bsz1 if level == 1 else bsz2
+                ask_level_size = asz1 if level == 1 else asz2
+                bid_add_rate = rates[("bid", level, "add")] * 1000.0
+                bid_rem_rate = rates[("bid", level, "rem")] * 1000.0
+                ask_add_rate = rates[("ask", level, "add")] * 1000.0
+                ask_rem_rate = rates[("ask", level, "rem")] * 1000.0
+                feat_list.extend([
+                    bid_add_rate,
+                    bid_rem_rate,
+                    ask_add_rate,
+                    ask_rem_rate,
+                    self._safe_div(bid_add_rate, max(bid_level_size, 1e-9), 0.0),
+                    self._safe_div(bid_rem_rate, max(bid_level_size, 1e-9), 0.0),
+                    self._safe_div(ask_add_rate, max(ask_level_size, 1e-9), 0.0),
+                    self._safe_div(ask_rem_rate, max(ask_level_size, 1e-9), 0.0),
+                ])
 
         for ms in FLOW_WINDOWS_MS:
             s = trade_stats_by_ms[ms]
@@ -3209,9 +3258,9 @@ class FeatureEngine:
             feat_list.extend(absorption_values)
 
         for ms in FLOW_WINDOWS_MS:
-            feat_list.append(return_std[ms])
+            feat_list.append(return_std_bps[ms])
         for prev_ms, cur_ms in zip(FLOW_WINDOWS_MS[:-1], FLOW_WINDOWS_MS[1:]):
-            feat_list.append(vr_adjacent[(cur_ms, prev_ms)])
+            feat_list.append(variance_ratio_adjacent[(cur_ms, prev_ms)])
 
         for ms in REGIME_WINDOWS_MS:
             regime_returns = [v for _, v in self._regime_return_deques[ms].deq if math.isfinite(v)]
@@ -3220,7 +3269,10 @@ class FeatureEngine:
                 regime_volume[ms],
                 regime_realized[ms],
                 regime_vol_ewma[ms],
-                regime_flow_snapshot[ms],
+            ])
+            if ms <= 60_000:
+                feat_list.append(regime_flow_snapshot[ms])
+            feat_list.extend([
                 dist["realized_up_vol_bps"],
                 dist["realized_down_vol_bps"],
                 dist["down_up_vol_ratio"],
