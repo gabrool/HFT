@@ -40,7 +40,7 @@ Shared constants from CMSSL17:
   Decision timestamps are the actual OB event timestamps (event-time).
 """
 
-import os, sys, csv, json, re, time, logging
+import os, sys, csv, json, re, time, logging, hashlib
 import queue
 import threading
 from dataclasses import dataclass, field
@@ -320,9 +320,16 @@ from CMSSL17 import (
     NUM_HORIZONS,
     LOOKBACK,
     AUX_DIM,
+    FEATURE_SCHEMA,
+    AUX_SCHEMA,
+    FEATURE_AUX_TAIL,
     _open_text,
     timestamp_to_ms_half_even,
     CHECKPOINT_SCHEMA,
+    TARGET_TRANSFORM,
+    TARGET_TASK,
+    LOW_ABS_TRIM_FRACTION,
+    HIGH_ABS_TRIM_FRACTION,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
 
@@ -725,16 +732,16 @@ def _event_ts(event: Any) -> int:
     return int(event[1])
 
 
-def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
+def build_token(fe: FeatureEngine, feat_z, dt_ms: float) -> np.ndarray:
     aux = np.asarray(
         [
             np.log1p(float(dt_ms)),
-            float(is_trade),
-            np.log1p(fe.event_density_100ms()),
-            np.log1p(fe.event_density_500ms()),
             np.log1p(fe.event_density_1000ms()),
             np.log1p(fe.event_density_3000ms()),
             np.log1p(fe.event_density_7500ms()),
+            np.log1p(fe.event_density_15000ms()),
+            np.log1p(fe.event_density_30000ms()),
+            np.log1p(fe.event_density_60000ms()),
         ],
         dtype=np.float32,
     )
@@ -805,17 +812,6 @@ def iter_weekly_event_stream(pairs: List[WeekPair], collect_quality: bool = True
             yield kind, wk, payload
     finally:
         producer_thread.join(timeout=2.0)
-
-
-FEATURE_AUX_TAIL = [
-    "log_dt_ms",
-    "is_trade",
-    "log_events_100ms",
-    "log_events_500ms",
-    "log_events_1000ms",
-    "log_events_3000ms",
-    "log_events_7500ms",
-]
 
 
 @dataclass
@@ -1209,17 +1205,22 @@ class FlatWeekRouter:
             "decision_stride_policy": "every_ob_event",
             "label_delta_ms": 0,
             "label_units": "signed_log_return_bps",
-            "target_task": "horizon_specific_signed_raw_bps_targets",
-            "target_transform": "signed_sqrt_raw_bps",
-            "low_abs_trim_fraction": 0.05,
-            "high_abs_trim_fraction": 0.02,
+            "feature_schema": FEATURE_SCHEMA,
+            "aux_schema": AUX_SCHEMA,
+            "target_task": TARGET_TASK,
+            "target_transform": TARGET_TRANSFORM,
+            "low_abs_trim_fraction": float(LOW_ABS_TRIM_FRACTION),
+            "high_abs_trim_fraction": float(HIGH_ABS_TRIM_FRACTION),
             "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
             **canonical_mode_fields(),
             "lookback": int(LOOKBACK),
             "feature_dim_total": int(self.feature_dim),
             "feature_dim_core": int(self.feature_dim - AUX_DIM),
+            "feature_dim_core_pre_pca": int(self.pca_meta.get("feature_dim_core_pre_pca", 0)),
+            "feature_names_pre_pca": list(self.pca_meta.get("feature_names_pre_pca", [])),
+            "feature_names_hash": str(self.pca_meta.get("feature_names_hash", "")),
             "aux_dim": int(AUX_DIM),
-            "aux_tail": list(FEATURE_AUX_TAIL),
+            "aux_names": list(FEATURE_AUX_TAIL),
             "label_dim": int(NUM_HORIZONS),
             "horizons_ms": [int(h) for h in HORIZONS_MS],
             "rows_total": rows_total,
@@ -1233,7 +1234,7 @@ class FlatWeekRouter:
         if self.pca_meta:
             meta["pca"] = dict(self.pca_meta)
         else:
-            meta["pca"] = {"applied": False, "var_kept": float(PCA_VAR_TARGET), "k": 0, "model_path": None}
+            raise ValueError("Missing required PCA metadata")
 
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
@@ -1784,17 +1785,26 @@ def maybe_fit_pca_model(
     aligned per-day trade-history list (trade-enabled mode) or ``[]`` in
     OB-only mode.
     """
+    feature_names_pre_pca = list(FeatureEngine().feature_names())
+    names_hash = hashlib.sha256(json.dumps(feature_names_pre_pca).encode()).hexdigest()[:12]
+    print(
+        f"[pca-feature-schema] schema={FEATURE_SCHEMA} raw_dim={len(feature_names_pre_pca)} names_hash={names_hash}",
+        flush=True,
+    )
     meta = {
         "applied": False,
         "var_kept": float(target_var),
         "k": 0,
         "model_path": None,
+        "feature_names_pre_pca": feature_names_pre_pca,
+        "feature_dim_core_pre_pca": int(len(feature_names_pre_pca)),
+        "feature_names_hash": names_hash,
     }
     last_log = time.monotonic()
     batches = 0
 
     if target_var <= 0.0:
-        return meta
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage1_v1")
 
     if int(use_existing) == 1:
         model_path = os.path.join(out_root, model_filename)
@@ -1804,9 +1814,21 @@ def maybe_fit_pca_model(
                 k = int(components.shape[0]) if components.size else 0
                 if k <= 0:
                     raise ValueError("PCA model has no components")
+                if "metadata_json" not in data:
+                    raise ValueError("PCA model missing metadata_json")
+                model_meta = json.loads(str(data["metadata_json"].item()))
+                if model_meta.get("feature_schema") != FEATURE_SCHEMA:
+                    raise ValueError("PCA feature schema mismatch")
+                if model_meta.get("aux_schema") != AUX_SCHEMA:
+                    raise ValueError("PCA aux schema mismatch")
+                if int(model_meta.get("feature_dim_core_pre_pca", -1)) != len(feature_names_pre_pca):
+                    raise ValueError("PCA pre-PCA feature dim mismatch")
+                if list(model_meta.get("feature_names_pre_pca", [])) != feature_names_pre_pca:
+                    raise ValueError("PCA feature names mismatch")
+                if str(model_meta.get("feature_names_hash", "")) != names_hash:
+                    raise ValueError("PCA feature names hash mismatch")
         except Exception as exc:
-            print(f"[pca  ] Failed to reuse PCA model '{model_path}': {exc}; disabling PCA")
-            return meta
+            raise ValueError(f"Failed to load required PCA model '{model_path}': {exc}") from exc
 
         meta.update({
             "applied": True,
@@ -1819,14 +1841,12 @@ def maybe_fit_pca_model(
     try:
         from sklearn.decomposition import IncrementalPCA  # type: ignore
     except Exception as exc:
-        print(f"[pca  ] sklearn unavailable ({exc}); skipping PCA fit")
-        return meta
+        raise ValueError(f"Failed to load required PCA model tooling: {exc}") from exc
 
     train_set = set(train_weeks)
     train_pairs = [p for p in pairs if p[0] in train_set]
     if not train_pairs:
-        print("[pca  ] No training weeks available; skipping PCA fit")
-        return meta
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage1_v1")
 
     sample_limit = max(1, int(sample_limit))
     batch_size = int(batch_size)
@@ -1899,8 +1919,7 @@ def maybe_fit_pca_model(
     ensure_ipca(force=True)
 
     if ipca is None:
-        print("[pca  ] Unable to initialise PCA (insufficient data); skipping")
-        return meta
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage1_v1")
 
     flush_pending(force=True)
 
@@ -1911,6 +1930,21 @@ def maybe_fit_pca_model(
         mean=ipca.mean_.astype(np.float32, copy=False),
         components=ipca.components_.astype(np.float32, copy=False),
         explained_variance_ratio=ipca.explained_variance_ratio_.astype(np.float32, copy=False),
+        metadata_json=np.array(
+            json.dumps(
+                {
+                    "feature_schema": FEATURE_SCHEMA,
+                    "aux_schema": AUX_SCHEMA,
+                    "feature_dim_core_pre_pca": len(feature_names_pre_pca),
+                    "feature_names_pre_pca": feature_names_pre_pca,
+                    "feature_names_hash": names_hash,
+                    "created_by": "offline_ingest.py",
+                    "stage": "stage1",
+                },
+                sort_keys=True,
+            ),
+            dtype=np.str_,
+        ),
     )
 
     meta.update(
@@ -1938,6 +1972,9 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
         "var_kept": float(PCA_VAR_TARGET),
         "k": 0,
         "model_path": None,
+        "feature_names_pre_pca": [],
+        "feature_dim_core_pre_pca": 0,
+        "feature_names_hash": "",
     }
     if not meta:
         return base
@@ -1948,6 +1985,9 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
             "var_kept": float(meta.get("var_kept", base["var_kept"])),
             "k": int(meta.get("k", 0) if applied else 0),
             "model_path": meta.get("model_path") if applied else None,
+            "feature_names_pre_pca": list(meta.get("feature_names_pre_pca", [])),
+            "feature_dim_core_pre_pca": int(meta.get("feature_dim_core_pre_pca", 0)),
+            "feature_names_hash": str(meta.get("feature_names_hash", "")),
         }
     )
     return base
@@ -1962,25 +2002,44 @@ def process_all(
     ensure_dir(out_root)
 
     pca_summary = _summarise_pca_meta(pca_meta)
+    if not pca_summary["applied"]:
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage1_v1")
+    feature_names_pre_pca = list(FeatureEngine().feature_names())
+    names_hash = hashlib.sha256(json.dumps(feature_names_pre_pca).encode()).hexdigest()[:12]
     pca_mean: Optional[np.ndarray] = None
     pca_components: Optional[np.ndarray] = None
     pca_var_ratio: Optional[np.ndarray] = None
 
-    if pca_summary["applied"]:
-        model_path = pca_summary.get("model_path")
-        full_model_path = os.path.join(out_root, model_path) if model_path else ""
-        try:
-            with np.load(full_model_path) as data:
-                pca_mean = data["mean"].astype(np.float32)
-                pca_components = data["components"].astype(np.float32)
-                if "explained_variance_ratio" in data:
-                    pca_var_ratio = data["explained_variance_ratio"].astype(np.float32)
-        except Exception as exc:
-            print(f"[pca  ] Failed to load PCA model '{full_model_path}': {exc}; disabling PCA")
-            pca_mean = None
-            pca_components = None
-            pca_var_ratio = None
-            pca_summary = _summarise_pca_meta({"applied": False, "var_kept": pca_summary.get("var_kept", PCA_VAR_TARGET)})
+    model_path = pca_summary.get("model_path")
+    full_model_path = os.path.join(out_root, model_path) if model_path else ""
+    try:
+        with np.load(full_model_path) as data:
+            pca_mean = data["mean"].astype(np.float32)
+            pca_components = data["components"].astype(np.float32)
+            if "explained_variance_ratio" in data:
+                pca_var_ratio = data["explained_variance_ratio"].astype(np.float32)
+            if "metadata_json" not in data:
+                raise ValueError("missing metadata_json")
+            model_meta = json.loads(str(data["metadata_json"].item()))
+    except Exception as exc:
+        raise ValueError(f"Failed to load required PCA model '{full_model_path}': {exc}") from exc
+
+    if model_meta.get("feature_schema") != FEATURE_SCHEMA:
+        raise ValueError("PCA feature_schema mismatch")
+    if model_meta.get("aux_schema") != AUX_SCHEMA:
+        raise ValueError("PCA aux_schema mismatch")
+    if int(model_meta.get("feature_dim_core_pre_pca", -1)) != len(feature_names_pre_pca):
+        raise ValueError("PCA feature_dim_core_pre_pca mismatch")
+    if list(model_meta.get("feature_names_pre_pca", [])) != feature_names_pre_pca:
+        raise ValueError("PCA feature_names_pre_pca mismatch")
+    if str(model_meta.get("feature_names_hash", "")) != names_hash:
+        raise ValueError("PCA feature_names_hash mismatch")
+    pca_summary["feature_names_pre_pca"] = feature_names_pre_pca
+    pca_summary["feature_dim_core_pre_pca"] = len(feature_names_pre_pca)
+    pca_summary["feature_names_hash"] = names_hash
+    for req in ("feature_names_pre_pca", "feature_dim_core_pre_pca", "feature_names_hash"):
+        if req not in pca_summary or not pca_summary[req]:
+            raise ValueError(f"Missing required PCA metadata field: {req}")
 
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
@@ -2075,10 +2134,21 @@ def process_all(
                 )
 
             dt_tick = 1 if last_decision_ts_ms is None else int(ts_ms - last_decision_ts_ms)
-            tok = build_token(fe, feat_core, is_trade, dt_tick)
+            tok = build_token(fe, feat_core, dt_tick)
+            expected_total = int(feat_core.shape[0]) + AUX_DIM
+            if tok.shape[0] != expected_total:
+                raise ValueError(
+                    f"Token dim mismatch: tok={tok.shape[0]} expected={expected_total} "
+                    f"(core={feat_core.shape[0]} aux={AUX_DIM})"
+                )
 
             if F is None:
                 F = tok.shape[0]
+                print(
+                    f"[first-token] feature_dim_core={int(feat_core.shape[0])} "
+                    f"aux_dim={AUX_DIM} feature_dim_total={int(F)}",
+                    flush=True,
+                )
                 router = FlatWeekRouter(
                     out_root,
                     F,
@@ -2208,18 +2278,23 @@ def process_all(
         "decision_stride_policy": "every_ob_event",
         "label_delta_ms": 0,
         "label_units": "signed_log_return_bps",
-        "target_task": "horizon_specific_signed_raw_bps_targets",
-        "target_transform": "signed_sqrt_raw_bps",
-        "low_abs_trim_fraction": 0.05,
-        "high_abs_trim_fraction": 0.02,
+        "feature_schema": FEATURE_SCHEMA,
+        "aux_schema": AUX_SCHEMA,
+        "target_task": TARGET_TASK,
+        "target_transform": TARGET_TRANSFORM,
+        "low_abs_trim_fraction": float(LOW_ABS_TRIM_FRACTION),
+        "high_abs_trim_fraction": float(HIGH_ABS_TRIM_FRACTION),
         "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
         **canonical_mode_fields(),
         "storage_format": "flat_decision_rows_v1",
         "lookback": int(LOOKBACK),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
+        "feature_dim_core_pre_pca": int(pca_summary["feature_dim_core_pre_pca"]),
+        "feature_names_pre_pca": list(pca_summary["feature_names_pre_pca"]),
+        "feature_names_hash": str(pca_summary["feature_names_hash"]),
         "aux_dim": int(AUX_DIM),
-        "aux_tail": list(FEATURE_AUX_TAIL),
+        "aux_names": list(FEATURE_AUX_TAIL),
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
@@ -2242,6 +2317,18 @@ def process_all(
             week_meta = week_meta_records.get(wk)
             if not week_meta:
                 continue
+            for field, expected in (
+                ("feature_schema", FEATURE_SCHEMA),
+                ("aux_schema", AUX_SCHEMA),
+                ("feature_dim_core", feature_dim_core),
+                ("feature_dim_total", feature_dim_total),
+                ("aux_names", list(FEATURE_AUX_TAIL)),
+                ("feature_names_hash", str(pca_summary["feature_names_hash"])),
+            ):
+                if week_meta.get(field) != expected:
+                    raise ValueError(
+                        f"Week/global metadata mismatch in week '{wk}': {field}={week_meta.get(field)!r} expected={expected!r}"
+                    )
             for field, expected in expected_mode.items():
                 observed = week_meta.get(field)
                 if observed != expected:

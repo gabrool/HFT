@@ -479,7 +479,9 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "signed_sqrt_raw_bps"
 TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
-CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v2"
+FEATURE_SCHEMA = "cmssl17_30s_taker_stage1_v1"
+AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
+CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage1"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
@@ -488,16 +490,27 @@ PATIENCE        = 15
 PRIMARY_METRIC = "spearman_kept_q50plus_30000ms"
 PRIMARY_METRIC_HORIZON_MS = 30_000
 SINGLE_WEEK_PATIENCE = 3
-# Number of auxiliary channels appended after the base feature vector
-# These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_500ms,
-#  log_events_1000ms, log_events_3000ms, log_events_7500ms]
+# Number of auxiliary channels appended after the PCA/core feature vector.
+# These correspond to:
+# [log_dt_decision_ms, log_events_1000ms, log_events_3000ms,
+#  log_events_7500ms, log_events_15000ms, log_events_30000ms,
+#  log_events_60000ms]
 AUX_DIM        = 7
+FEATURE_AUX_TAIL = (
+    "log_dt_decision_ms",
+    "log_events_1000ms",
+    "log_events_3000ms",
+    "log_events_7500ms",
+    "log_events_15000ms",
+    "log_events_30000ms",
+    "log_events_60000ms",
+)
 
 
-FAST_WINDOWS_MS = (500, 1_000, 3_000, 7_500, 15_000)
+FAST_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000)
 FLOW_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
 REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000)
-EVENT_DENSITY_WINDOWS_MS = (100, 500, 1_000, 3_000, 7_500)
+EVENT_DENSITY_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
 EMA_HALF_LIVES_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
 MACD_TRIPLETS_MS = (
     (1_000, 3_000, 1_500),
@@ -506,7 +519,7 @@ MACD_TRIPLETS_MS = (
     (15_000, 30_000, 20_000),
     (30_000, 60_000, 40_000),
 )
-VPIN_BUCKET_SECS = (1.0, 3.0, 7.5, 15.0, 30.0)
+VPIN_BUCKET_SECS = (7.5, 15.0, 30.0)
 BOOK_DEPTH_FEATURE_LEVELS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 100)
 MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
 
@@ -1240,16 +1253,10 @@ class FeatureEngine:
         # ---------- Decayed pressure (EWMA of OFI L1) ----------
         self.pressure_by_window: Dict[int, float] = {ms: 0.0 for ms in FAST_WINDOWS_MS}
 
-        # ---------- RSI/MACD/CCI state ----------
-        self.rsi_state: Dict[int, Dict[str, float]] = {
-            hl: {"gain": 0.0, "loss": 0.0} for hl in EMA_HALF_LIVES_MS
-        }
+        # ---------- MACD state ----------
         self.macd_state: Dict[int, Dict[str, Optional[float]]] = {
             idx: {"fast": None, "slow": None, "signal": None}
             for idx in range(len(MACD_TRIPLETS_MS))
-        }
-        self.cci_state: Dict[int, Dict[str, Optional[float]]] = {
-            hl: {"mean": None, "mad": None} for hl in EMA_HALF_LIVES_MS
         }
 
         # ---------- Fast EMA state for microstructure signals ----------
@@ -1260,7 +1267,6 @@ class FeatureEngine:
             "mid",
             "spread_bps",
             "micro",
-            "smart",
             "gap_a_bps",
             "gap_b_bps",
             "cum_bid1",
@@ -1276,7 +1282,6 @@ class FeatureEngine:
             "ofi_l3",
             "ofi_l5",
             "micro_premia",
-            "smart_premia",
         )
         self.ema_states: Dict[int, Dict[str, Optional[float]]] = {
             hl: {name: None for name in self.ema_indicator_names}
@@ -1294,11 +1299,85 @@ class FeatureEngine:
         self.timer_trade_update_s: float = 0.0
         self.timer_feature_build_s: float = 0.0
 
+    def feature_names(self) -> List[str]:
+        names: List[str] = [
+            "bid1", "ask1", "mid", "micro", "spread_bps", "gap_a_bps", "gap_b_bps", "bsz1", "asz1",
+        ]
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            names.append(f"cum_bid_l{lvl}")
+            names.append(f"cum_ask_l{lvl}")
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            names.append(f"obi_l{lvl}")
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            names.append(f"ofi_l{lvl}")
+        names.extend([
+            "slope_a", "slope_b", "micro_premia",
+            "dt_since_trade_ms", "dt_since_bid1_update_ms", "dt_since_ask1_update_ms",
+        ])
+        for ms in FAST_WINDOWS_MS:
+            names.extend([
+                f"spread_delta_bps_{ms}ms",
+                f"spread_change_count_{ms}ms",
+                f"bid1_change_count_{ms}ms",
+                f"ask1_change_count_{ms}ms",
+                f"bid_l1_depletion_{ms}ms",
+                f"ask_l1_depletion_{ms}ms",
+                f"bid_l1_add_rate_{ms}ms",
+                f"bid_l1_rem_rate_{ms}ms",
+                f"ask_l1_add_rate_{ms}ms",
+                f"ask_l1_rem_rate_{ms}ms",
+                f"bid_l2_add_rate_{ms}ms",
+                f"bid_l2_rem_rate_{ms}ms",
+                f"ask_l2_add_rate_{ms}ms",
+                f"ask_l2_rem_rate_{ms}ms",
+            ])
+        for ms in FLOW_WINDOWS_MS:
+            names.extend([
+                f"buy_vol_{ms}ms", f"sell_vol_{ms}ms", f"buy_cnt_{ms}ms", f"sell_cnt_{ms}ms",
+                f"buy_mean_{ms}ms", f"sell_mean_{ms}ms", f"buy_max_{ms}ms", f"sell_max_{ms}ms",
+                f"net_flow_{ms}ms", f"imbalance_{ms}ms", f"toxicity_{ms}ms", f"trade_through_{ms}ms",
+                f"quote_count_{ms}ms", f"vwap_vs_mid_bps_{ms}ms", f"vwap_vs_micro_bps_{ms}ms",
+            ])
+        for ms in FLOW_WINDOWS_MS:
+            names.append(f"return_std_{ms}ms")
+        for prev_ms, cur_ms in zip(FLOW_WINDOWS_MS[:-1], FLOW_WINDOWS_MS[1:]):
+            names.append(f"vr_{cur_ms}ms_over_{prev_ms}ms")
+        for ms in REGIME_WINDOWS_MS:
+            names.extend([
+                f"regime_volume_{ms}ms",
+                f"regime_realized_vol_{ms}ms",
+                f"regime_vol_ewma_{ms}ms",
+                f"regime_flow_{ms}ms",
+            ])
+        for ms in FAST_WINDOWS_MS:
+            names.append(f"pressure_ofi_l1_{ms}ms")
+        for hl in self.ema_half_lives_ms:
+            for name in self.ema_indicator_names:
+                names.append(f"ema_{name}_{hl}ms")
+        for hl in self.ema_half_lives_ms:
+            for name in self.ema_indicator_names:
+                names.append(f"resid_{name}_{hl}ms")
+        for fast_ms, slow_ms, sig_ms in MACD_TRIPLETS_MS:
+            names.extend([
+                f"macd_raw_{fast_ms}_{slow_ms}_{sig_ms}ms",
+                f"macd_signal_{fast_ms}_{slow_ms}_{sig_ms}ms",
+                f"macd_hist_{fast_ms}_{slow_ms}_{sig_ms}ms",
+            ])
+        for secs in VPIN_BUCKET_SECS:
+            names.append(f"vpin_{str(secs).replace('.', 'p')}s")
+        return names
+
+    def core_feature_dim(self) -> int:
+        return len(self.feature_names())
+
+    def feature_schema(self) -> str:
+        return FEATURE_SCHEMA
+
+    def aux_schema(self) -> str:
+        return AUX_SCHEMA
+
     def feature_dim(self) -> int:
-        """Return feature dimension including Filiary channels."""
-        if self._feat_dim is None:
-            raise ValueError("Feature dimension unknown before first event")
-        return self._feat_dim + AUX_DIM
+        return self.core_feature_dim() + AUX_DIM
 
     def _new_trade_window_state(self) -> Dict[str, Any]:
         return {
@@ -1620,12 +1699,6 @@ class FeatureEngine:
             return 0.0
         return self._event_density(deq, int(window_ms))
 
-    def event_density_100ms(self) -> float:
-        return self.event_density(100)
-
-    def event_density_500ms(self) -> float:
-        return self.event_density(500)
-
     def event_density_1000ms(self) -> float:
         return self.event_density(1_000)
 
@@ -1634,6 +1707,15 @@ class FeatureEngine:
 
     def event_density_7500ms(self) -> float:
         return self.event_density(7_500)
+
+    def event_density_15000ms(self) -> float:
+        return self.event_density(15_000)
+
+    def event_density_30000ms(self) -> float:
+        return self.event_density(30_000)
+
+    def event_density_60000ms(self) -> float:
+        return self.event_density(60_000)
 
     def _prune_ts_deque(self, deq: Deque[int], now_ms: int, window_ms: int):
         while deq and (now_ms - deq[0] > window_ms):
@@ -1825,11 +1907,8 @@ class FeatureEngine:
 
         if (bsz1 + asz1) > 0:
             micro = (ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1)
-            wb = 1.0 / max(bsz1, 1e-12)
-            wa = 1.0 / max(asz1, 1e-12)
-            smart = (bid1 * wb + ask1 * wa) / (wb + wa)
         else:
-            micro = smart = mid
+            micro = mid
 
         spread = max(0.0, ask1 - bid1)
         spread_bps = 1e4 * spread / max(mid, 1e-12)
@@ -1904,7 +1983,6 @@ class FeatureEngine:
         obi_l5 = obi_by_level[5]
 
         micro_premia = (micro - mid) / max(spread, 1e-9)
-        smart_premia = (smart - mid) / max(spread, 1e-9)
 
         xb, yb = self._levels_to_xy(self.bid_lvls, mid, True, 5)
         xa, ya = self._levels_to_xy(self.ask_lvls, mid, False, 5)
@@ -1913,10 +1991,10 @@ class FeatureEngine:
 
         indicator_values = {
             "bid1": bid1, "ask1": ask1, "mid": mid, "spread_bps": spread_bps,
-            "micro": micro, "smart": smart, "gap_a_bps": gap_a_bps, "gap_b_bps": gap_b_bps,
+            "micro": micro, "gap_a_bps": gap_a_bps, "gap_b_bps": gap_b_bps,
             "cum_bid1": cum_bid1, "cum_ask1": cum_ask1, "cum_bid3": cum_bid3, "cum_ask3": cum_ask3,
             "slope_a": slope_a, "slope_b": slope_b, "obi_l1": obi_l1, "obi_l3": obi_l3, "obi_l5": obi_l5,
-            "ofi_l1": ofi_l1, "ofi_l3": ofi_l3, "ofi_l5": ofi_l5, "micro_premia": micro_premia, "smart_premia": smart_premia,
+            "ofi_l1": ofi_l1, "ofi_l3": ofi_l3, "ofi_l5": ofi_l5, "micro_premia": micro_premia,
         }
         self._update_indicator_emas(indicator_values, dt_ms)
 
@@ -1990,16 +2068,6 @@ class FeatureEngine:
             self.flow_regime[ms] = trade_stats[nearest]["imbalance"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
 
-        rsi_vals = []
-        for hl in EMA_HALF_LIVES_MS:
-            ema_micro = self.ema_states[hl]["micro"] if self.ema_states[hl]["micro"] is not None else micro
-            delta = micro - ema_micro
-            state = self.rsi_state[hl]
-            state["gain"] = self._ewma_update(state["gain"], max(delta, 0.0), dt_ms, hl)
-            state["loss"] = self._ewma_update(state["loss"], max(-delta, 0.0), dt_ms, hl)
-            rs = state["gain"] / max(state["loss"], 1e-12)
-            rsi_vals.append(100.0 - 100.0 / (1.0 + rs))
-
         def ema_ms(prev: Optional[float], x: float, hl_ms: float) -> float:
             a = 1.0 - math.exp(-dt_ms / max(1.0, hl_ms))
             return x if prev is None else ((1.0 - a) * prev + a * x)
@@ -2014,14 +2082,6 @@ class FeatureEngine:
             sig = float(st["signal"])
             macd_features.extend([raw, sig, raw - sig])
 
-        cci_features = []
-        for hl in EMA_HALF_LIVES_MS:
-            st = self.cci_state[hl]
-            st["mean"] = ema_ms(st["mean"], micro, float(hl))
-            mad = abs(micro - float(st["mean"]))
-            st["mad"] = ema_ms(st["mad"], mad, float(hl))
-            cci_features.append(0.015 * ((micro - float(st["mean"])) / max(float(st["mad"]), 1e-12)))
-
         vpin_features = []
         for secs in self.vpin_bucket_secs:
             phi = self.vpin_state[secs]["phi"]
@@ -2032,9 +2092,9 @@ class FeatureEngine:
         # Canonical order:
         # 1) instantaneous; 2) fast-window OB/spread/churn/depletion/replen; 3) flow-window trade/quote/VWAP;
         # 4) flow-window return std/VR; 5) regime-window summaries; 6) pressure; 7) EMA bank; 8) EMA residuals;
-        # 9) RSI; 10) MACD; 11) CCI; 12) VPIN.
+        # 9) MACD; 10) VPIN.
         feat_list = [
-            bid1, ask1, mid, micro, smart, spread_bps, gap_a_bps, gap_b_bps,
+            bid1, ask1, mid, micro, spread_bps, gap_a_bps, gap_b_bps,
             bsz1, asz1,
         ]
         for lvl in BOOK_DEPTH_FEATURE_LEVELS:
@@ -2045,9 +2105,8 @@ class FeatureEngine:
             feat_list.append(ofi_by_level[lvl])
         feat_list.extend([
             slope_a, slope_b,
-            micro_premia, smart_premia,
+            micro_premia,
             dt_since_trade, dt_since_bid1_update, dt_since_ask1_update,
-            float(self.last_tick_sign), float(self.last_is_zero_tick), float(self.last_is_rpi),
         ])
 
         for ms in FAST_WINDOWS_MS:
@@ -2092,10 +2151,17 @@ class FeatureEngine:
                 ema_val = state[name] if state[name] is not None else indicator_values[name]
                 feat_list.append(indicator_values[name] - ema_val)
 
-        feat_list.extend(rsi_vals)
         feat_list.extend(macd_features)
-        feat_list.extend(cci_features)
         feat_list.extend(vpin_features)
+        names = self.feature_names()
+        if len(feat_list) != len(names):
+            raise ValueError(
+                f"Feature vector/name length mismatch: len(feat_list)={len(feat_list)} "
+                f"len(feature_names)={len(names)}"
+            )
+        for name, value in zip(names, feat_list):
+            if not np.isfinite(float(value)):
+                raise ValueError(f"Non-finite feature {name}={value!r} at ts_ms={ts_ms}")
 
         feat = np.array(feat_list, dtype=np.float64)
         feat_z = self._zscore(feat, dt_ms)
@@ -2267,7 +2333,7 @@ class FeatureEngine:
         r = (1e4 * math.log(mid / self.last_mid_for_ret)) if self.last_mid_for_ret > 0 else 0.0
         self.last_mid_for_ret = mid
 
-        for stats in self.return_histories.values():
+        for ms, stats in self.return_histories.items():
             stats.add(ts_ms, r)
 
         dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
@@ -2276,8 +2342,10 @@ class FeatureEngine:
             self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
 
         for ms, stats in self._regime_return_deques.items():
-            stats.add(ts_ms, r)
-            self.realized_vol[ms] = math.sqrt(max(0.0, stats.sumsq))
+            self._append_tuple_with_guard(stats.deq, (ts_ms, r), ts_ms, ms, is_ob_event)
+            while stats.deq and (ts_ms - stats.deq[0][0] > ms):
+                stats.deq.popleft()
+            self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in stats.deq))
         return r
 
     def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
@@ -2286,11 +2354,18 @@ class FeatureEngine:
         Keep running mean / second moment in float64 for numerical stability.
         Emit float32 z-scores to preserve the dataset/model contract.
         """
+        if x.ndim != 1:
+            raise ValueError(f"_zscore expects 1D feature vector, got shape={x.shape}")
+        if not np.all(np.isfinite(x)):
+            raise ValueError("Non-finite values passed to _zscore")
         eps = 1e-9
         x64 = x.astype(np.float64, copy=False)
 
         if self._feat_dim is None:
             self._feat_dim = int(x.shape[0])
+            expected = self.core_feature_dim()
+            if self._feat_dim != expected:
+                raise ValueError(f"Initial feature dim mismatch: got {self._feat_dim} expected {expected}")
             self.z_mean = x64.copy()
             self.z_m2 = np.square(x64, dtype=np.float64)
             return np.zeros_like(x, dtype=np.float32)
@@ -2305,7 +2380,8 @@ class FeatureEngine:
 
         var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
         z = (x64 - self.z_mean) / np.sqrt(var)
-
+        if not np.all(np.isfinite(z)):
+            raise ValueError("Non-finite values produced by _zscore")
         return z.astype(np.float32, copy=False)
 
     # -------------------------------------------------------------------------
