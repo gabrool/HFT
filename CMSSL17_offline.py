@@ -35,6 +35,7 @@ from CMSSL17 import (  # type: ignore
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS,
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA,
+    FEATURE_SCHEMA, AUX_SCHEMA, FEATURE_AUX_TAIL,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     SAM,
     build_dataset_from_split,
@@ -258,6 +259,30 @@ def validate_loaded_label_array(y: np.ndarray, source: str) -> None:
         raise ValueError(f"{source} must be 2D, got shape={y.shape}")
     if y.shape[1] != NUM_HORIZONS:
         raise _label_dim_error(source, y.shape[1])
+
+
+def validate_contract_meta(meta: dict, source: str) -> None:
+    ok = (
+        meta.get("feature_schema") == FEATURE_SCHEMA
+        and meta.get("aux_schema") == AUX_SCHEMA
+        and meta.get("checkpoint_schema_expected") == CHECKPOINT_SCHEMA
+        and meta.get("target_transform") == TARGET_TRANSFORM
+        and meta.get("target_task") == TARGET_TASK
+        and int(meta.get("label_dim", -1)) == NUM_HORIZONS
+        and int(meta.get("aux_dim", -1)) == AUX_DIM
+        and list(meta.get("aux_names", [])) == list(FEATURE_AUX_TAIL)
+        and int(meta.get("feature_dim_total", -1)) == int(meta.get("feature_dim_core", -1)) + AUX_DIM
+        and bool(meta.get("feature_names_pre_pca"))
+        and int(meta.get("feature_dim_core_pre_pca", -1)) == len(meta.get("feature_names_pre_pca", []))
+        and bool(meta.get("feature_names_hash"))
+        and bool(meta.get("pca", {}).get("applied", False))
+        and int(meta.get("pca", {}).get("k", -1)) == int(meta.get("feature_dim_core", -1))
+    )
+    if not ok:
+        raise ValueError(
+            "Old or incompatible offline dataset. Rerun offline_ingest.py with "
+            f"FEATURE_SCHEMA={FEATURE_SCHEMA}."
+        )
 
 
 # ---------------- Signed-raw preprocessing, cache, and metrics ----------------
@@ -640,6 +665,12 @@ def train_from_offline():
     out_root = Path(OUT_ROOT)
     meta = json.loads((out_root / "meta.json").read_text())
     validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
+    validate_contract_meta(meta, f"global metadata {out_root / 'meta.json'}")
+    for rel_path in meta.get("weeks_meta", {}).values():
+        week_meta_path = out_root / rel_path
+        week_meta = json.loads(week_meta_path.read_text())
+        validate_dataset_label_dim(week_meta, f"week metadata {week_meta_path}")
+        validate_contract_meta(week_meta, f"week metadata {week_meta_path}")
     trade_history_enabled = meta.get('trade_history_enabled')
     event_stream_mode = meta.get('event_stream_mode')
     splits = require_four_week_pipeline_splits(meta, out_root)
