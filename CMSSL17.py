@@ -478,18 +478,24 @@ HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
 LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
-TARGET_TRANSFORM = "signed_sqrt_raw_bps"
-TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
+TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
+TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v4"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
-CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage4-v4"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-stage4-v4"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "spearman_kept_q50plus_30000ms"
+PRIMARY_METRIC = "edge_spearman_q50plus_30000ms"
 PRIMARY_METRIC_HORIZON_MS = 30_000
+PRIMARY_DIR_BAL_ACC_GUARD = 0.505
+MODEL_OUTPUT_SCHEMA = "dir_logits_mag_up_down_sqrt_v1"
+MAG_SQRT_EPS = 1e-6
+DIR_LOSS_WEIGHT = 1.00
+MAG_LOSS_WEIGHT = 0.75
+MAG_CORR_LOSS_WEIGHT = 0.05
 SINGLE_WEEK_PATIENCE = 3
 # Number of auxiliary channels appended after the PCA/core feature vector.
 # These correspond to:
@@ -917,8 +923,40 @@ class GatedPooling(nn.Module):
         z = torch.einsum('bl,bld->bd', alpha, h)
         return z
 
+class TaskTokenDecoder(nn.Module):
+    """Lightweight task-specific temporal refinement block over shared Mamba token states."""
+
+    def __init__(self, dim: int, kernel_size: int = 5, ff_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert kernel_size % 2 == 1, "TaskTokenDecoder requires odd kernel_size for same-length padding"
+        self.norm1 = nn.LayerNorm(dim)
+        self.temporal = nn.Conv1d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=dim,
+            bias=True,
+        )
+        self.drop1 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, ff_mult * dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_mult * dim, dim),
+        )
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        z = self.norm1(h)
+        z = self.temporal(z.transpose(1, 2)).transpose(1, 2)
+        h = h + self.drop1(z)
+        h = h + self.drop2(self.ff(self.norm2(h)))
+        return h
+
 class Mamba(nn.Module):
-    """Bidirectional (forward/backward) Mamba stacks with gated pooling."""
+    """Bidirectional Mamba stacks returning fused token states."""
 
     def __init__(self, args: ModelArgs, ff_hid: int):
         super().__init__()
@@ -934,7 +972,6 @@ class Mamba(nn.Module):
 
         self.norm_fwd = nn.LayerNorm(args.d_model)
         self.norm_bwd = nn.LayerNorm(args.d_model)
-        self.pool = GatedPooling(2 * args.d_model)
 
     def _run_stack(self, x, blocks, ffns):
         for blk, ffn in zip(blocks, ffns):
@@ -955,9 +992,7 @@ class Mamba(nn.Module):
         h_fwd = self.norm_fwd(x_fwd)
         h_bwd = self.norm_bwd(x_bwd)
         h = torch.cat([h_fwd, h_bwd], dim=-1)
-
-        pooled = self.pool(h)
-        return pooled, h, h_fwd
+        return h, h_fwd
 
 # -------------  SAMBA -------------
 class SAMBA(nn.Module):
@@ -974,27 +1009,67 @@ class SAMBA(nn.Module):
             enable_res_param=False, norm='layer', re_param=True, re_param_kernel=3, 
             patch_size=2, stride=1
         )
-        # Mamba backbone (forward/backward fusion) + pooling
+        # Mamba backbone (forward/backward fusion)
         self.mamba = Mamba(args, ff_hid=4*DMODEL)
 
-        # Heads
         fused_dim = args.d_model * 2
         head_hidden_dim = fused_dim * 2
-        self.return_head = nn.Sequential(
+        self.dir_token_decoder = TaskTokenDecoder(
+            dim=fused_dim,
+            kernel_size=5,
+            ff_mult=4,
+            dropout=0.1,
+        )
+        self.mag_token_decoder = TaskTokenDecoder(
+            dim=fused_dim,
+            kernel_size=5,
+            ff_mult=4,
+            dropout=0.1,
+        )
+        self.dir_pool = GatedPooling(fused_dim)
+        self.mag_pool = GatedPooling(fused_dim)
+        self.dir_head = nn.Sequential(
             nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(head_hidden_dim, NUM_HORIZONS)
         )
+        self.mag_up_head = nn.Sequential(
+            nn.Linear(fused_dim, head_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(head_hidden_dim, NUM_HORIZONS),
+        )
+        self.mag_down_head = nn.Sequential(
+            nn.Linear(fused_dim, head_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(head_hidden_dim, NUM_HORIZONS),
+        )
+        for head in (self.dir_head, self.mag_up_head, self.mag_down_head):
+            for mod in head:
+                if isinstance(mod, nn.Linear):
+                    _init_small(mod)
 
     def forward(self, x):
         x_permuted = x.permute(0, 2, 1).contiguous()
         h_tokens = self.depatch_proj_encoder(x_permuted).contiguous()        # [B, L, D] (ConvTimeNet projection applied)
-
-        pooled, _, _ = self.mamba(h_tokens, embedded=True)
-        pred_return = self.return_head(pooled)
-
-        return pred_return
+        h, _ = self.mamba(h_tokens, embedded=True)
+        h_dir = self.dir_token_decoder(h)
+        h_mag = self.mag_token_decoder(h)
+        pooled_dir = self.dir_pool(h_dir)
+        pooled_mag = self.mag_pool(h_mag)
+        dir_logits = self.dir_head(pooled_dir)
+        mag_up_sqrt = F.softplus(self.mag_up_head(pooled_mag)) + MAG_SQRT_EPS
+        mag_down_sqrt = F.softplus(self.mag_down_head(pooled_mag)) + MAG_SQRT_EPS
+        assert dir_logits.shape[-1] == NUM_HORIZONS
+        assert mag_up_sqrt.shape == dir_logits.shape
+        assert mag_down_sqrt.shape == dir_logits.shape
+        return {
+            "dir_logits": dir_logits,
+            "mag_up_sqrt": mag_up_sqrt,
+            "mag_down_sqrt": mag_down_sqrt,
+        }
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
@@ -4532,16 +4607,55 @@ def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
         return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
+def derive_dir_mag_predictions(pred: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    required = ("dir_logits", "mag_up_sqrt", "mag_down_sqrt")
+    for key in required:
+        if key not in pred:
+            raise KeyError(f"Model output missing required key: {key}")
+    dir_logits = pred["dir_logits"]
+    mag_up_sqrt = pred["mag_up_sqrt"]
+    mag_down_sqrt = pred["mag_down_sqrt"]
+    if dir_logits.shape != mag_up_sqrt.shape or dir_logits.shape != mag_down_sqrt.shape:
+        raise ValueError(
+            "Invalid model output shapes: "
+            f"dir_logits={tuple(dir_logits.shape)} "
+            f"mag_up_sqrt={tuple(mag_up_sqrt.shape)} "
+            f"mag_down_sqrt={tuple(mag_down_sqrt.shape)}"
+        )
+    p_up = torch.sigmoid(dir_logits)
+    mag_up_bps = mag_up_sqrt.square()
+    mag_down_bps = mag_down_sqrt.square()
+    edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
+    mag_pred_sqrt = p_up * mag_up_sqrt + (1.0 - p_up) * mag_down_sqrt
+    return {
+        "p_up": p_up,
+        "mag_up_bps": mag_up_bps,
+        "mag_down_bps": mag_down_bps,
+        "edge_bps": edge_bps,
+        "mag_pred_sqrt": mag_pred_sqrt,
+    }
+
+def derive_mag_pred_sqrt_for_mag_loss(pred: Dict[str, torch.Tensor]) -> torch.Tensor:
+    p_up_detached = torch.sigmoid(pred["dir_logits"]).detach()
+    return p_up_detached * pred["mag_up_sqrt"] + (1.0 - p_up_detached) * pred["mag_down_sqrt"]
+
 def compute_primary_metric(metric_payload: Dict[str, Any]) -> Tuple[float, str]:
     if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
         raise ValueError(
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
         )
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    vals = metric_payload.get("spearman_kept_q50plus", [])
-    if idx >= len(vals):
+    vals = metric_payload.get("edge_spearman_q50plus", [])
+    dir_vals = metric_payload.get("dir_bal_acc_q50plus", [])
+    if idx >= len(vals) or idx >= len(dir_vals):
         return float("nan"), PRIMARY_METRIC
-    return float(vals[idx]), PRIMARY_METRIC
+    edge_value = float(vals[idx])
+    dir_guard_value = float(dir_vals[idx])
+    if not math.isfinite(edge_value):
+        return float("nan"), PRIMARY_METRIC
+    if not math.isfinite(dir_guard_value) or dir_guard_value < PRIMARY_DIR_BAL_ACC_GUARD:
+        return float("nan"), PRIMARY_METRIC
+    return edge_value, PRIMARY_METRIC
 
 def is_metric_improved(value: float, best: float, mode: str) -> bool:
     if mode == "min":
