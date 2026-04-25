@@ -479,9 +479,9 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "signed_sqrt_raw_bps"
 TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
-FEATURE_SCHEMA = "cmssl17_30s_taker_stage2_v1"
+FEATURE_SCHEMA = "cmssl17_30s_taker_stage3_v1"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
-CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage2"
+CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage3"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
@@ -550,8 +550,17 @@ SLIPPAGE_NOTIONAL_USD = (
     100_000.0,
     250_000.0,
 )
-FAST_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000)
+FAST_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
 FLOW_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+LARGE_TRADE_NOTIONAL_USD = (
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+)
+LARGE_TRADE_CLUSTER_THRESHOLD_USD = 100_000.0
+LARGE_TRADE_CLUSTER_GAP_MS = 1_000
+LARGE_TRADE_CLOCK_THRESHOLD_USD = 100_000.0
 REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000)
 EVENT_DENSITY_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
 EMA_HALF_LIVES_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
@@ -1274,15 +1283,23 @@ class FeatureEngine:
         }
 
         # ---------- Trades windows ----------
-        # (ts, price, size, side, tick_sign, is_zero_tick)
+        # (ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick)
         self.trade_windows: Tuple[int, ...] = FLOW_WINDOWS_MS
-        self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str, int, int]]] = {
+        self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, float, str, float, float, float]]] = {
             ms: deque() for ms in self.trade_windows
         }
         self.trade_window_state: Dict[int, Dict[str, Any]] = {
             window: self._new_trade_window_state()
             for window in self.trade_windows
         }
+        self.cvd_notional = 0.0
+        self._cvd_history: Deque[Tuple[int, float]] = deque()
+        self._cvd_ema = {ms: 0.0 for ms in FLOW_WINDOWS_MS}
+        self._cvd_ema_initialized = {ms: False for ms in FLOW_WINDOWS_MS}
+        self.last_cvd_update_ts: Optional[int] = None
+        self.cvd_history_keep_ms = max(FLOW_WINDOWS_MS) + 5_000
+        self.last_large_buy_ts: Optional[int] = None
+        self.last_large_sell_ts: Optional[int] = None
 
         # Tick-direction & RPI tracking
         self.last_tick_sign: int = 0
@@ -1467,10 +1484,79 @@ class FeatureEngine:
             ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
-                f"buy_vol_{ms}ms", f"sell_vol_{ms}ms", f"buy_cnt_{ms}ms", f"sell_cnt_{ms}ms",
-                f"buy_mean_{ms}ms", f"sell_mean_{ms}ms", f"buy_max_{ms}ms", f"sell_max_{ms}ms",
-                f"net_flow_{ms}ms", f"imbalance_{ms}ms", f"toxicity_{ms}ms", f"trade_through_{ms}ms",
-                f"quote_count_{ms}ms", f"vwap_vs_mid_bps_{ms}ms", f"vwap_vs_micro_bps_{ms}ms",
+                f"buy_vol_base_{ms}ms",
+                f"sell_vol_base_{ms}ms",
+                f"buy_notional_usd_{ms}ms",
+                f"sell_notional_usd_{ms}ms",
+                f"buy_count_{ms}ms",
+                f"sell_count_{ms}ms",
+                f"buy_mean_notional_usd_{ms}ms",
+                f"sell_mean_notional_usd_{ms}ms",
+                f"buy_max_notional_usd_{ms}ms",
+                f"sell_max_notional_usd_{ms}ms",
+                f"signed_notional_flow_usd_{ms}ms",
+                f"signed_trade_count_imbalance_{ms}ms",
+                f"trade_imbalance_notional_{ms}ms",
+                f"trade_toxicity_notional_{ms}ms",
+                f"plus_tick_fraction_{ms}ms",
+                f"minus_tick_fraction_{ms}ms",
+                f"zero_tick_fraction_{ms}ms",
+                f"tick_sign_imbalance_{ms}ms",
+                f"quote_count_{ms}ms",
+                f"trade_count_{ms}ms",
+                f"quote_to_trade_ratio_{ms}ms",
+                f"trade_count_per_second_{ms}ms",
+                f"quote_count_per_second_{ms}ms",
+                f"vwap_vs_mid_bps_{ms}ms",
+                f"vwap_vs_micro_bps_{ms}ms",
+                f"signed_trade_premium_bps_count_weighted_{ms}ms",
+                f"signed_trade_premium_bps_volume_weighted_{ms}ms",
+                f"buy_trade_premium_bps_{ms}ms",
+                f"sell_trade_premium_bps_{ms}ms",
+                f"aggressor_price_impact_bps_{ms}ms",
+            ])
+        for ms in FLOW_WINDOWS_MS:
+            names.extend([
+                f"cvd_change_usd_{ms}ms",
+                f"cvd_slope_usd_per_sec_{ms}ms",
+                f"cvd_minus_ema_usd_{ms}ms",
+            ])
+        names.extend([
+            "imbalance_1000ms_minus_7500ms",
+            "imbalance_3000ms_minus_15000ms",
+            "imbalance_7500ms_minus_30000ms",
+            "net_flow_3000ms_minus_30000ms",
+            "ofi_imbalance_3000ms_minus_15000ms",
+            "ofi_imbalance_7500ms_minus_30000ms",
+        ])
+        for ms in FLOW_WINDOWS_MS:
+            for threshold in LARGE_TRADE_NOTIONAL_USD:
+                thr = self._fmt_usd_notional(threshold)
+                names.extend([
+                    f"large_buy_count_ge_{thr}_{ms}ms",
+                    f"large_sell_count_ge_{thr}_{ms}ms",
+                    f"large_buy_notional_ge_{thr}_{ms}ms",
+                    f"large_sell_notional_ge_{thr}_{ms}ms",
+                    f"large_trade_imbalance_ge_{thr}_{ms}ms",
+                ])
+            names.extend([
+                f"max_signed_trade_notional_usd_{ms}ms",
+                f"top5_trade_notional_sum_usd_{ms}ms",
+                f"large_trade_cluster_count_{ms}ms",
+            ])
+        names.extend([
+            "time_since_large_buy_ms",
+            "time_since_large_sell_ms",
+        ])
+        for ms in FLOW_WINDOWS_MS:
+            names.extend([
+                f"buy_flow_without_price_up_{ms}ms",
+                f"sell_flow_without_price_down_{ms}ms",
+                f"absorption_bid_{ms}ms",
+                f"absorption_ask_{ms}ms",
+                f"signed_flow_per_bp_move_{ms}ms",
+                f"price_response_to_buy_flow_{ms}ms",
+                f"price_response_to_sell_flow_{ms}ms",
             ])
         for ms in FLOW_WINDOWS_MS:
             names.append(f"return_std_{ms}ms")
@@ -1502,7 +1588,7 @@ class FeatureEngine:
         if len(names) != len(set(names)):
             seen = set()
             duplicates = sorted({n for n in names if n in seen or seen.add(n)})
-            raise ValueError(f"Duplicate feature names in Stage 2 schema: {duplicates[:20]}")
+            raise ValueError(f"Duplicate feature names in Stage 3 schema: {duplicates[:20]}")
         self._feature_names_cache = list(names)
         return list(self._feature_names_cache)
 
@@ -1567,59 +1653,59 @@ class FeatureEngine:
     def _update_trade_window_state_with_insert(
         self,
         window_ms: int,
-        entry: Tuple[int, float, float, str, int, int],
+        entry: Tuple[int, float, float, float, str, float, float, float],
     ) -> None:
-        ts_ms, price, size, side, *_ = entry
+        ts_ms, price, size, notional_usd, side, side_sign, *_ = entry
         state = self.trade_window_state[window_ms]
 
         state["pxv_sum"] += price * size
         state["vol_sum"] += size
 
-        if side == "buy":
+        if side_sign > 0:
             state["buy_cnt"] += 1
             state["buy_vol"] += size
-            state["signed_px_sum"] += price
+            state["signed_px_sum"] += notional_usd
             state["signed_cnt"] += 1.0
             q = state["buy_max_q"]
-            while q and q[-1][1] <= size:
+            while q and q[-1][1] <= notional_usd:
                 q.pop()
-            q.append((ts_ms, size))
-        else:
+            q.append((ts_ms, notional_usd))
+        elif side_sign < 0:
             state["sell_cnt"] += 1
             state["sell_vol"] += size
-            state["signed_px_sum"] -= price
+            state["signed_px_sum"] -= notional_usd
             state["signed_cnt"] -= 1.0
             q = state["sell_max_q"]
-            while q and q[-1][1] <= size:
+            while q and q[-1][1] <= notional_usd:
                 q.pop()
-            q.append((ts_ms, size))
+            q.append((ts_ms, notional_usd))
 
     def _update_trade_window_state_with_expire(
         self,
         window_ms: int,
-        entry: Tuple[int, float, float, str, int, int],
+        entry: Tuple[int, float, float, float, str, float, float, float],
     ) -> None:
-        ts_ms, price, size, side, *_ = entry
+        ts_ms, price, size, notional_usd, side, side_sign, *_ = entry
         state = self.trade_window_state[window_ms]
 
         state["pxv_sum"] -= price * size
         state["vol_sum"] -= size
 
-        if side == "buy":
+        if side_sign > 0:
             state["buy_cnt"] -= 1
             state["buy_vol"] -= size
-            state["signed_px_sum"] -= price
+            state["signed_px_sum"] -= notional_usd
             state["signed_cnt"] -= 1.0
             q = state["buy_max_q"]
-            if q and q[0][0] == ts_ms and abs(q[0][1] - size) <= 1e-12:
+            if q and q[0][0] == ts_ms and abs(q[0][1] - notional_usd) <= 1e-12:
                 q.popleft()
-        else:
+        elif side_sign < 0:
             state["sell_cnt"] -= 1
             state["sell_vol"] -= size
-            state["signed_px_sum"] += price
+            state["signed_px_sum"] += notional_usd
             state["signed_cnt"] += 1.0
             q = state["sell_max_q"]
-            if q and q[0][0] == ts_ms and abs(q[0][1] - size) <= 1e-12:
+            if q and q[0][0] == ts_ms and abs(q[0][1] - notional_usd) <= 1e-12:
                 q.popleft()
 
         state["buy_cnt"] = max(0, state["buy_cnt"])
@@ -1637,41 +1723,102 @@ class FeatureEngine:
             expired = deq.popleft()
             self._update_trade_window_state_with_expire(window_ms, expired)
 
-    def _compute_trade_window_stats(self, window_ms: int, mid: float) -> Dict[str, float]:
-        state = self.trade_window_state[window_ms]
-        buy_vol = float(state["buy_vol"])
-        sell_vol = float(state["sell_vol"])
-        buy_cnt = float(state["buy_cnt"])
-        sell_cnt = float(state["sell_cnt"])
-        buy_max = float(state["buy_max_q"][0][1]) if state["buy_max_q"] else 0.0
-        sell_max = float(state["sell_max_q"][0][1]) if state["sell_max_q"] else 0.0
+    def _compute_trade_window_stats(self, ms: int, ts_ms: int, mid: float, micro: float) -> Dict[str, float]:
+        deq = self._trade_window_deques[ms]
+        eps = 1e-12
+        trades = [t for t in deq if (ts_ms - t[0]) <= ms]
+        trade_count = float(len(trades))
+        quote_count = float(len(self._quote_window_deques[ms]))
+        buy_vol = sell_vol = 0.0
+        buy_notional = sell_notional = 0.0
+        buy_count = sell_count = 0.0
+        plus_tick = minus_tick = zero_tick = 0.0
+        pxv_sum = vol_sum = 0.0
+        signed_premium_sum = signed_premium_weighted = signed_notional = 0.0
+        signed_notional_sum_for_premium = 0.0
+        buy_premium_sum = sell_premium_sum = 0.0
+        buy_premium_count = sell_premium_count = 0.0
+        buy_max_notional = sell_max_notional = 0.0
 
-        buy_mean = buy_vol / buy_cnt if buy_cnt > 0 else 0.0
-        sell_mean = sell_vol / sell_cnt if sell_cnt > 0 else 0.0
-        net_flow = buy_vol - sell_vol
-        total_vol = buy_vol + sell_vol
-        denom = max(total_vol, 1e-12)
-        imbalance = net_flow / denom
-        toxicity = abs(net_flow) / denom
+        for _, price, size, notional_usd, _, side_sign, tick_sign, is_zero_tick in trades:
+            pxv_sum += price * size
+            vol_sum += size
+            if tick_sign > 0:
+                plus_tick += 1.0
+            elif tick_sign < 0:
+                minus_tick += 1.0
+            if is_zero_tick > 0:
+                zero_tick += 1.0
+            if side_sign > 0:
+                buy_vol += size
+                buy_notional += notional_usd
+                buy_count += 1.0
+                buy_max_notional = max(buy_max_notional, notional_usd)
+            elif side_sign < 0:
+                sell_vol += size
+                sell_notional += notional_usd
+                sell_count += 1.0
+                sell_max_notional = max(sell_max_notional, notional_usd)
 
-        trade_through = 0.0
-        if mid > 0.0:
-            trade_through = (float(state["signed_px_sum"]) / mid) - float(state["signed_cnt"])
+            if side_sign != 0.0 and mid > 0.0:
+                premium_bps = 1e4 * (price / mid - 1.0)
+                signed_premium = side_sign * premium_bps
+                signed_premium_sum += signed_premium
+                signed_premium_weighted += signed_premium * notional_usd
+                signed_notional_sum_for_premium += notional_usd
+                if side_sign > 0:
+                    buy_premium_sum += premium_bps
+                    buy_premium_count += 1.0
+                elif side_sign < 0 and price > 0.0:
+                    sell_premium_sum += 1e4 * (mid / price - 1.0)
+                    sell_premium_count += 1.0
 
-        return {
-            "buy_vol": buy_vol,
-            "sell_vol": sell_vol,
-            "buy_cnt": buy_cnt,
-            "sell_cnt": sell_cnt,
-            "buy_mean": buy_mean,
-            "sell_mean": sell_mean,
-            "buy_max": buy_max,
-            "sell_max": sell_max,
-            "net_flow": net_flow,
-            "imbalance": imbalance,
-            "toxicity": toxicity,
-            "trade_through": trade_through,
+            if side_sign != 0.0:
+                signed_notional += side_sign * notional_usd
+
+        tot_notional = buy_notional + sell_notional
+        tot_count_signed = buy_count + sell_count
+        window_sec = max(ms / 1000.0, eps)
+        stats = {
+            "buy_vol_base": buy_vol,
+            "sell_vol_base": sell_vol,
+            "buy_notional_usd": buy_notional,
+            "sell_notional_usd": sell_notional,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "buy_mean_notional_usd": self._safe_div(buy_notional, buy_count, 0.0),
+            "sell_mean_notional_usd": self._safe_div(sell_notional, sell_count, 0.0),
+            "buy_max_notional_usd": buy_max_notional,
+            "sell_max_notional_usd": sell_max_notional,
+            "signed_notional_flow_usd": signed_notional,
+            "signed_trade_count_imbalance": self._safe_div(buy_count - sell_count, tot_count_signed, 0.0),
+            "trade_imbalance_notional": self._safe_div(buy_notional - sell_notional, tot_notional, 0.0),
+            "trade_toxicity_notional": self._safe_div(abs(buy_notional - sell_notional), tot_notional, 0.0),
+            "plus_tick_fraction": self._safe_div(plus_tick, trade_count, 0.0),
+            "minus_tick_fraction": self._safe_div(minus_tick, trade_count, 0.0),
+            "zero_tick_fraction": self._safe_div(zero_tick, trade_count, 0.0),
+            "tick_sign_imbalance": self._safe_div(plus_tick - minus_tick, plus_tick + minus_tick + zero_tick, 0.0),
+            "quote_count": quote_count,
+            "trade_count": trade_count,
+            "quote_to_trade_ratio": self._safe_div(quote_count, max(trade_count, 1.0), 0.0),
+            "trade_count_per_second": self._safe_div(trade_count, window_sec, 0.0),
+            "quote_count_per_second": self._safe_div(quote_count, window_sec, 0.0),
+            "vwap_vs_mid_bps": 0.0,
+            "vwap_vs_micro_bps": 0.0,
+            "signed_trade_premium_bps_count_weighted": self._safe_div(signed_premium_sum, tot_count_signed, 0.0),
+            "signed_trade_premium_bps_volume_weighted": self._safe_div(signed_premium_weighted, signed_notional_sum_for_premium, 0.0),
+            "buy_trade_premium_bps": self._safe_div(buy_premium_sum, buy_premium_count, 0.0),
+            "sell_trade_premium_bps": self._safe_div(sell_premium_sum, sell_premium_count, 0.0),
+            "aggressor_price_impact_bps": self._safe_div(signed_premium_weighted, signed_notional_sum_for_premium, 0.0),
         }
+        if vol_sum > eps:
+            vwap = pxv_sum / vol_sum
+            stats["vwap_vs_mid_bps"] = (1e4 * (vwap / mid - 1.0)) if mid > 0 else 0.0
+            stats["vwap_vs_micro_bps"] = (1e4 * (vwap / micro - 1.0)) if micro > 0 else 0.0
+        for k, v in stats.items():
+            if not math.isfinite(float(v)):
+                raise ValueError(f"Non-finite trade stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
+        return stats
 
     def _lin_slope(self, xs: List[float], ys: List[float], eps: float = 1e-12) -> float:
         n = len(xs)
@@ -1729,6 +1876,77 @@ class FeatureEngine:
                 continue
             if v > 0.0 and math.isfinite(v):
                 out.append((int(ts), v))
+        return out
+
+    def _cvd_asof(self, ts_query: int) -> float:
+        if not self._cvd_history:
+            return float(self.cvd_notional)
+        tq = int(ts_query)
+        for ts, value in reversed(self._cvd_history):
+            if ts <= tq:
+                return float(value)
+        return float(self._cvd_history[0][1])
+
+    def _cvd_window_points(self, now_ms: int, window_ms: int) -> List[Tuple[int, float]]:
+        lo = int(now_ms) - int(window_ms)
+        return [(int(ts), float(v)) for ts, v in self._cvd_history if lo <= ts <= int(now_ms)]
+
+    def _rolling_slope_simple(self, points: List[Tuple[int, float]]) -> float:
+        if len(points) < 3:
+            return 0.0
+        t0 = points[0][0]
+        x = np.asarray([(ts - t0) / 1000.0 for ts, _ in points], dtype=np.float64)
+        y = np.asarray([float(v) for _, v in points], dtype=np.float64)
+        x_mean = float(np.mean(x))
+        y_mean = float(np.mean(y))
+        den = float(np.sum((x - x_mean) ** 2))
+        if den <= 1e-12:
+            return 0.0
+        num = float(np.sum((x - x_mean) * (y - y_mean)))
+        return num / den
+
+    def _compute_large_trade_stats(self, trades: List[Tuple[int, float, float, float, str, float, float, float]], ms: int) -> Dict[str, float]:
+        eps = 1e-12
+        out: Dict[str, float] = {}
+        for threshold in LARGE_TRADE_NOTIONAL_USD:
+            thr_key = self._fmt_usd_notional(threshold)
+            lb_count = ls_count = 0.0
+            lb_notional = ls_notional = 0.0
+            for _, _, _, notional_usd, _, side_sign, _, _ in trades:
+                if notional_usd < threshold:
+                    continue
+                if side_sign > 0:
+                    lb_count += 1.0
+                    lb_notional += notional_usd
+                elif side_sign < 0:
+                    ls_count += 1.0
+                    ls_notional += notional_usd
+            out[f"large_buy_count_ge_{thr_key}_{ms}ms"] = lb_count
+            out[f"large_sell_count_ge_{thr_key}_{ms}ms"] = ls_count
+            out[f"large_buy_notional_ge_{thr_key}_{ms}ms"] = lb_notional
+            out[f"large_sell_notional_ge_{thr_key}_{ms}ms"] = ls_notional
+            out[f"large_trade_imbalance_ge_{thr_key}_{ms}ms"] = self._safe_div(lb_notional - ls_notional, lb_notional + ls_notional, 0.0)
+
+        if trades:
+            largest = max(trades, key=lambda x: x[3])
+            out[f"max_signed_trade_notional_usd_{ms}ms"] = float(largest[5]) * float(largest[3]) if float(largest[5]) != 0.0 else 0.0
+            out[f"top5_trade_notional_sum_usd_{ms}ms"] = float(sum(sorted((t[3] for t in trades), reverse=True)[:5]))
+            large_trades = sorted((t for t in trades if t[3] >= LARGE_TRADE_CLUSTER_THRESHOLD_USD), key=lambda x: x[0])
+            clusters = 0
+            prev_ts: Optional[int] = None
+            for t in large_trades:
+                if prev_ts is None or (t[0] - prev_ts) > LARGE_TRADE_CLUSTER_GAP_MS:
+                    clusters += 1
+                prev_ts = t[0]
+            out[f"large_trade_cluster_count_{ms}ms"] = float(clusters)
+        else:
+            out[f"max_signed_trade_notional_usd_{ms}ms"] = 0.0
+            out[f"top5_trade_notional_sum_usd_{ms}ms"] = 0.0
+            out[f"large_trade_cluster_count_{ms}ms"] = 0.0
+
+        for k, v in out.items():
+            if not math.isfinite(float(v)):
+                raise ValueError(f"Non-finite large trade stat {k}={v!r} window={ms}")
         return out
 
     def _rolling_slope_r2(self, points: List[Tuple[int, float]]) -> Tuple[float, float]:
@@ -2401,14 +2619,27 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             self.pressure_by_window[ms] = self._ewma_update(self.pressure_by_window[ms], ofi_l1, dt_ms, ms)
 
-        trade_stats = {ms: self._compute_trade_window_stats(ms, mid) for ms in self.trade_windows}
-        quote_counts = {ms: len(self._quote_window_deques[ms]) for ms in self.trade_windows}
-        vwap_per_ms = {
-            ms: (self.trade_window_state[ms]["pxv_sum"] / self.trade_window_state[ms]["vol_sum"] if self.trade_window_state[ms]["vol_sum"] > 1e-12 else mid)
-            for ms in self.trade_windows
-        }
-        vwap_vs_mid_bps = {ms: (1e4 * ((vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0)) if mid > 0 else 0.0 for ms in self.trade_windows}
-        vwap_vs_micro_bps = {ms: (1e4 * ((vwap_per_ms[ms] / max(micro, 1e-12)) - 1.0)) if micro > 0 else 0.0 for ms in self.trade_windows}
+        trade_stats_by_ms = {ms: self._compute_trade_window_stats(ms, ts_ms, mid, micro) for ms in self.trade_windows}
+        trades_by_ms = {ms: [t for t in self._trade_window_deques[ms] if (ts_ms - t[0]) <= ms] for ms in self.trade_windows}
+        cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
+        for ms in self.trade_windows:
+            if self._cvd_history:
+                cvd_change = self.cvd_notional - self._cvd_asof(ts_ms - ms)
+                cvd_slope = self._rolling_slope_simple(self._cvd_window_points(ts_ms, ms))
+                cvd_minus_ema = self.cvd_notional - self._cvd_ema[ms]
+            else:
+                cvd_change = 0.0
+                cvd_slope = 0.0
+                cvd_minus_ema = 0.0
+            cvd_stats_by_ms[ms] = {
+                "cvd_change_usd": float(cvd_change),
+                "cvd_slope_usd_per_sec": float(cvd_slope),
+                "cvd_minus_ema_usd": float(cvd_minus_ema),
+            }
+            for k, v in cvd_stats_by_ms[ms].items():
+                if not math.isfinite(float(v)):
+                    raise ValueError(f"Non-finite CVD stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
+        large_stats_by_ms = {ms: self._compute_large_trade_stats(trades_by_ms[ms], ms) for ms in self.trade_windows}
 
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
             self.last_bid_price_change_ts = ts_ms
@@ -2486,7 +2717,7 @@ class FeatureEngine:
         regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
         for ms in self.regime_windows_ms:
             nearest = min(self.trade_windows, key=lambda w: abs(w - ms))
-            self.flow_regime[ms] = trade_stats[nearest]["imbalance"]
+            self.flow_regime[ms] = trade_stats_by_ms[nearest]["trade_imbalance_notional"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
 
         def ema_ms(prev: Optional[float], x: float, hl_ms: float) -> float:
@@ -2644,13 +2875,102 @@ class FeatureEngine:
                 feat_list.extend([rates[("bid", level, "add")], rates[("bid", level, "rem")], rates[("ask", level, "add")], rates[("ask", level, "rem")]])
 
         for ms in FLOW_WINDOWS_MS:
-            stats = trade_stats[ms]
+            s = trade_stats_by_ms[ms]
             feat_list.extend([
-                stats["buy_vol"], stats["sell_vol"], stats["buy_cnt"], stats["sell_cnt"],
-                stats["buy_mean"], stats["sell_mean"], stats["buy_max"], stats["sell_max"],
-                stats["net_flow"], stats["imbalance"], stats["toxicity"], stats["trade_through"],
-                float(quote_counts[ms]), vwap_vs_mid_bps[ms], vwap_vs_micro_bps[ms],
+                s["buy_vol_base"],
+                s["sell_vol_base"],
+                s["buy_notional_usd"],
+                s["sell_notional_usd"],
+                s["buy_count"],
+                s["sell_count"],
+                s["buy_mean_notional_usd"],
+                s["sell_mean_notional_usd"],
+                s["buy_max_notional_usd"],
+                s["sell_max_notional_usd"],
+                s["signed_notional_flow_usd"],
+                s["signed_trade_count_imbalance"],
+                s["trade_imbalance_notional"],
+                s["trade_toxicity_notional"],
+                s["plus_tick_fraction"],
+                s["minus_tick_fraction"],
+                s["zero_tick_fraction"],
+                s["tick_sign_imbalance"],
+                s["quote_count"],
+                s["trade_count"],
+                s["quote_to_trade_ratio"],
+                s["trade_count_per_second"],
+                s["quote_count_per_second"],
+                s["vwap_vs_mid_bps"],
+                s["vwap_vs_micro_bps"],
+                s["signed_trade_premium_bps_count_weighted"],
+                s["signed_trade_premium_bps_volume_weighted"],
+                s["buy_trade_premium_bps"],
+                s["sell_trade_premium_bps"],
+                s["aggressor_price_impact_bps"],
             ])
+        for ms in FLOW_WINDOWS_MS:
+            c = cvd_stats_by_ms[ms]
+            feat_list.extend([
+                c["cvd_change_usd"],
+                c["cvd_slope_usd_per_sec"],
+                c["cvd_minus_ema_usd"],
+            ])
+        feat_list.extend([
+            trade_stats_by_ms[1_000]["trade_imbalance_notional"] - trade_stats_by_ms[7_500]["trade_imbalance_notional"],
+            trade_stats_by_ms[3_000]["trade_imbalance_notional"] - trade_stats_by_ms[15_000]["trade_imbalance_notional"],
+            trade_stats_by_ms[7_500]["trade_imbalance_notional"] - trade_stats_by_ms[30_000]["trade_imbalance_notional"],
+            (trade_stats_by_ms[3_000]["signed_notional_flow_usd"] / 100_000.0) - (trade_stats_by_ms[30_000]["signed_notional_flow_usd"] / 100_000.0),
+            self.pressure_by_window[3_000] - self.pressure_by_window[15_000],
+            self.pressure_by_window[7_500] - self.pressure_by_window[30_000],
+        ])
+        for ms in FLOW_WINDOWS_MS:
+            large_stats = large_stats_by_ms[ms]
+            for threshold in LARGE_TRADE_NOTIONAL_USD:
+                thr = self._fmt_usd_notional(threshold)
+                feat_list.extend([
+                    large_stats[f"large_buy_count_ge_{thr}_{ms}ms"],
+                    large_stats[f"large_sell_count_ge_{thr}_{ms}ms"],
+                    large_stats[f"large_buy_notional_ge_{thr}_{ms}ms"],
+                    large_stats[f"large_sell_notional_ge_{thr}_{ms}ms"],
+                    large_stats[f"large_trade_imbalance_ge_{thr}_{ms}ms"],
+                ])
+            feat_list.extend([
+                large_stats[f"max_signed_trade_notional_usd_{ms}ms"],
+                large_stats[f"top5_trade_notional_sum_usd_{ms}ms"],
+                large_stats[f"large_trade_cluster_count_{ms}ms"],
+            ])
+        feat_list.extend([
+            float(ts_ms - self.last_large_buy_ts) if self.last_large_buy_ts is not None else 0.0,
+            float(ts_ms - self.last_large_sell_ts) if self.last_large_sell_ts is not None else 0.0,
+        ])
+        for ms in FLOW_WINDOWS_MS:
+            s = trade_stats_by_ms[ms]
+            mid_ret_bps = price_features_by_window[ms][0] if ms in price_features_by_window else (
+                self._bps_return(mid, self._series_asof(ts_ms - ms, "mid")) if self._series_asof(ts_ms - ms, "mid") is not None else 0.0
+            )
+            buy_notional_scaled = s["buy_notional_usd"] / 100_000.0
+            sell_notional_scaled = s["sell_notional_usd"] / 100_000.0
+            signed_notional_scaled = s["signed_notional_flow_usd"] / 100_000.0
+            buy_flow_without_price_up = buy_notional_scaled * math.exp(max(-max(mid_ret_bps, 0.0), -50.0))
+            sell_flow_without_price_down = sell_notional_scaled * math.exp(max(-max(-mid_ret_bps, 0.0), -50.0))
+            absorption_ask = buy_notional_scaled / max(0.25, max(mid_ret_bps, 0.0))
+            absorption_bid = sell_notional_scaled / max(0.25, max(-mid_ret_bps, 0.0))
+            signed_flow_per_bp_move = signed_notional_scaled / max(0.25, abs(mid_ret_bps))
+            price_response_to_buy_flow = max(mid_ret_bps, 0.0) / max(buy_notional_scaled, 1e-9)
+            price_response_to_sell_flow = max(-mid_ret_bps, 0.0) / max(sell_notional_scaled, 1e-9)
+            absorption_values = [
+                buy_flow_without_price_up,
+                sell_flow_without_price_down,
+                absorption_bid,
+                absorption_ask,
+                signed_flow_per_bp_move,
+                price_response_to_buy_flow,
+                price_response_to_sell_flow,
+            ]
+            for i, value in enumerate(absorption_values):
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"Non-finite absorption stat idx={i} value={value!r} at ts_ms={ts_ms} window={ms}")
+            feat_list.extend(absorption_values)
 
         for ms in FLOW_WINDOWS_MS:
             feat_list.append(return_std[ms])
@@ -2744,19 +3064,21 @@ class FeatureEngine:
         if isinstance(trade_evt, tuple):
             price, size, side_code, tick_dir_code, is_rpi = trade_evt
             side = 'buy' if int(side_code) > 0 else 'sell' if int(side_code) < 0 else 'unknown'
+            side_sign = 1.0 if int(side_code) > 0 else -1.0 if int(side_code) < 0 else 0.0
             price = float(price)
             size = float(size)
-            tick_sign = int(tick_dir_code)
-            is_zero_tick = 1 if int(tick_dir_code) == 0 else 0
+            tick_sign = float(int(tick_dir_code))
+            is_zero_tick = 1.0 if int(tick_dir_code) == 0 else 0.0
             is_rpi = int(is_rpi)
         else:
             side = str(trade_evt['side']).lower()  # 'buy'|'sell'
+            side_sign = 1.0 if side == "buy" else -1.0 if side == "sell" else 0.0
             price = float(trade_evt['price'])
             size = float(trade_evt['size'])
 
             tick_dir = trade_evt.get("tickDirection")
-            tick_sign = int(self.last_tick_sign)
-            is_zero_tick = int(self.last_is_zero_tick)
+            tick_sign = float(int(self.last_tick_sign))
+            is_zero_tick = float(int(self.last_is_zero_tick))
             is_rpi = int(self.last_is_rpi)
 
             rpi_raw = trade_evt.get("RPI")
@@ -2782,31 +3104,60 @@ class FeatureEngine:
                         pass
 
             if tick_dir is not None:
-                tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
+                td_sign, td_zero = self._interpret_tick_direction(tick_dir)
+                tick_sign, is_zero_tick = float(td_sign), float(td_zero)
 
         if self.last_trade_price is not None:
             if price > self.last_trade_price:
-                tick_sign, is_zero_tick = 1, 0
+                tick_sign, is_zero_tick = 1.0, 0.0
             elif price < self.last_trade_price:
-                tick_sign, is_zero_tick = -1, 0
+                tick_sign, is_zero_tick = -1.0, 0.0
             else:
                 if tick_sign == 0 and is_zero_tick == 0:
-                    tick_sign = self.last_tick_sign if self.last_tick_sign != 0 else 0
+                    tick_sign = float(self.last_tick_sign if self.last_tick_sign != 0 else 0)
                 if is_zero_tick == 0:
-                    is_zero_tick = 1
+                    is_zero_tick = 1.0
         else:
             if tick_sign == 0 and is_zero_tick == 0:
-                tick_sign, is_zero_tick = 0, 0
+                tick_sign, is_zero_tick = 0.0, 0.0
 
-        self.last_tick_sign = tick_sign
-        self.last_is_zero_tick = is_zero_tick
+        self.last_tick_sign = int(tick_sign)
+        self.last_is_zero_tick = int(is_zero_tick)
         self.last_trade_price = price
         self.last_is_rpi = is_rpi
 
-        entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
+        notional_usd = price * size
+        entry = (ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick)
         for window, deq in self._trade_window_deques.items():
             deq.append(entry)
             self._update_trade_window_state_with_insert(window, entry)
+
+        if side_sign != 0.0:
+            self.cvd_notional += side_sign * notional_usd
+        self._cvd_history.append((int(ts_ms), float(self.cvd_notional)))
+        cutoff = int(ts_ms) - int(self.cvd_history_keep_ms)
+        while self._cvd_history and self._cvd_history[0][0] < cutoff:
+            self._cvd_history.popleft()
+        if self.last_cvd_update_ts is None:
+            for ms in FLOW_WINDOWS_MS:
+                self._cvd_ema[ms] = float(self.cvd_notional)
+                self._cvd_ema_initialized[ms] = True
+        else:
+            cvd_dt_ms = max(1, int(ts_ms - self.last_cvd_update_ts))
+            for ms in FLOW_WINDOWS_MS:
+                if not self._cvd_ema_initialized[ms]:
+                    self._cvd_ema[ms] = float(self.cvd_notional)
+                    self._cvd_ema_initialized[ms] = True
+                    continue
+                alpha = 1.0 - math.exp(-math.log(2.0) * max(cvd_dt_ms, 1) / float(ms))
+                self._cvd_ema[ms] = (1.0 - alpha) * self._cvd_ema[ms] + alpha * float(self.cvd_notional)
+        self.last_cvd_update_ts = int(ts_ms)
+
+        if notional_usd >= LARGE_TRADE_CLOCK_THRESHOLD_USD:
+            if side_sign > 0:
+                self.last_large_buy_ts = int(ts_ms)
+            elif side_sign < 0:
+                self.last_large_sell_ts = int(ts_ms)
 
         dt_trade_ms = (
             max(1.0, float(ts_ms - self.last_trade_ts))
@@ -2824,9 +3175,9 @@ class FeatureEngine:
         for secs, st in self.vpin_state.items():
             Vb = max(v_per_sec * float(secs), 1e-9)
             st["Vb"] = Vb if st["Vb"] is None else (0.9 * st["Vb"] + 0.1 * Vb)
-            if side == 'buy':
+            if side_sign > 0:
                 st["cum_buy"] += size
-            else:
+            elif side_sign < 0:
                 st["cum_sell"] += size
             st["cum"] += size
 
