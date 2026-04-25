@@ -1204,6 +1204,7 @@ class FlatWeekRouter:
             "window_ms": 60_000,
             "decision_stride_policy": "every_ob_event",
             "label_delta_ms": 0,
+            # Labels remain signed raw log-return bps; direction/conditional magnitude targets are derived downstream at train time.
             "label_units": "signed_log_return_bps",
             "feature_schema": FEATURE_SCHEMA,
             "aux_schema": AUX_SCHEMA,
@@ -1221,7 +1222,7 @@ class FlatWeekRouter:
             "feature_names_hash": str(self.pca_meta.get("feature_names_hash", "")),
             "aux_dim": int(AUX_DIM),
             "aux_names": list(FEATURE_AUX_TAIL),
-            "label_dim": int(NUM_HORIZONS),
+            "label_dim": int(NUM_HORIZONS),  # one signed-return label per configured horizon
             "horizons_ms": [int(h) for h in HORIZONS_MS],
             "rows_total": rows_total,
             "labels_total": labels_total,
@@ -2277,6 +2278,7 @@ def process_all(
         "window_ms": 60_000,
         "decision_stride_policy": "every_ob_event",
         "label_delta_ms": 0,
+        # Labels remain signed raw log-return bps; direction/conditional magnitude targets are derived downstream at train time.
         "label_units": "signed_log_return_bps",
         "feature_schema": FEATURE_SCHEMA,
         "aux_schema": AUX_SCHEMA,
@@ -2298,7 +2300,7 @@ def process_all(
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
-        "label_dim": label_dim,
+        "label_dim": label_dim,  # remains NUM_HORIZONS
         "horizons_ms": [int(h) for h in HORIZONS_MS],
         "total_feature_rows": int(total_feature_rows),
         "total_labels": int(total_labels),
