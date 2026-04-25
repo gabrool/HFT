@@ -1950,7 +1950,21 @@ class FeatureEngine:
 
     def _metric_values(self, deq: Deque[Tuple[int, float]], now_ms: int, window_ms: int) -> List[Tuple[int, float]]:
         cutoff = int(now_ms) - int(window_ms)
-        return [(ts, val) for ts, val in deq if cutoff <= ts <= now_ms and math.isfinite(val)]
+        now = int(now_ms)
+        out: List[Tuple[int, float]] = []
+
+        for ts, val in reversed(deq):
+            ts_i = int(ts)
+            if ts_i > now:
+                continue
+            if ts_i < cutoff:
+                break
+            v = float(val)
+            if math.isfinite(v):
+                out.append((ts_i, v))
+
+        out.reverse()
+        return out
 
     def _rolling_stats_values(self, vals: List[float]) -> Dict[str, float]:
         if not vals:
@@ -1964,19 +1978,69 @@ class FeatureEngine:
             "p90": float(np.quantile(arr, 0.90)),
         }
 
+    def _rolling_mean_values(self, vals: List[float]) -> float:
+        n = 0
+        total = 0.0
+        for value in vals:
+            v = float(value)
+            if math.isfinite(v):
+                total += v
+                n += 1
+        return total / float(n) if n > 0 else 0.0
+
+    def _rolling_mean_std_values(self, vals: List[float]) -> Tuple[float, float]:
+        n = 0
+        total = 0.0
+        total_sq = 0.0
+        for value in vals:
+            v = float(value)
+            if math.isfinite(v):
+                total += v
+                total_sq += v * v
+                n += 1
+
+        if n <= 0:
+            return 0.0, 0.0
+
+        mean = total / float(n)
+        var = max(0.0, total_sq / float(n) - mean * mean)
+        return mean, math.sqrt(var)
+
+    def _slope_from_points_no_numpy(self, points: List[Tuple[int, float]]) -> float:
+        n = 0
+        t0: Optional[int] = None
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_x2 = 0.0
+        sum_xy = 0.0
+
+        for ts, value in points:
+            v = float(value)
+            if not math.isfinite(v):
+                continue
+            ts_i = int(ts)
+            if t0 is None:
+                t0 = ts_i
+            x = (float(ts_i) - float(t0)) / 1000.0
+            n += 1
+            sum_x += x
+            sum_y += v
+            sum_x2 += x * x
+            sum_xy += x * v
+
+        if n < 3:
+            return 0.0
+
+        den = sum_x2 - (sum_x * sum_x) / float(n)
+        if den <= 1e-12 or not math.isfinite(den):
+            return 0.0
+
+        num = sum_xy - (sum_x * sum_y) / float(n)
+        out = num / den
+        return float(out) if math.isfinite(out) else 0.0
+
     def _rolling_value_slope(self, points: List[Tuple[int, float]]) -> float:
-        if len(points) < 3:
-            return 0.0
-        t0 = float(points[0][0])
-        xs = np.asarray([(float(ts) - t0) / 1000.0 for ts, _ in points], dtype=np.float64)
-        ys = np.asarray([float(v) for _, v in points], dtype=np.float64)
-        x_mean = float(np.mean(xs))
-        y_mean = float(np.mean(ys))
-        x_var = float(np.sum((xs - x_mean) ** 2))
-        if x_var <= 1e-12:
-            return 0.0
-        cov = float(np.sum((xs - x_mean) * (ys - y_mean)))
-        return cov / x_var
+        return self._slope_from_points_no_numpy(points)
 
     def _return_distribution_stats(self, vals: List[float]) -> Dict[str, float]:
         if not vals:
@@ -2290,14 +2354,19 @@ class FeatureEngine:
 
     def _window_price_points(self, now_ms: int, window_ms: int, series: str = "mid") -> List[Tuple[int, float]]:
         history = self._mid_history if series == "mid" else self._micro_history
-        lower = int(now_ms) - int(window_ms)
+        cutoff = int(now_ms) - int(window_ms)
+        now = int(now_ms)
         out: List[Tuple[int, float]] = []
-        for ts, value in zip(self._price_ts, history):
-            v = float(value)
-            if ts < lower or ts > now_ms:
+        for ts, value in zip(reversed(self._price_ts), reversed(history)):
+            ts_i = int(ts)
+            if ts_i > now:
                 continue
+            if ts_i < cutoff:
+                break
+            v = float(value)
             if v > 0.0 and math.isfinite(v):
-                out.append((int(ts), v))
+                out.append((ts_i, v))
+        out.reverse()
         return out
 
     def _cvd_asof(self, ts_query: int) -> float:
@@ -2310,22 +2379,64 @@ class FeatureEngine:
         return float(self._cvd_history[0][1])
 
     def _cvd_window_points(self, now_ms: int, window_ms: int) -> List[Tuple[int, float]]:
-        lo = int(now_ms) - int(window_ms)
-        return [(int(ts), float(v)) for ts, v in self._cvd_history if lo <= ts <= int(now_ms)]
+        cutoff = int(now_ms) - int(window_ms)
+        now = int(now_ms)
+        out: List[Tuple[int, float]] = []
+
+        for ts, value in reversed(self._cvd_history):
+            ts_i = int(ts)
+            if ts_i > now:
+                continue
+            if ts_i < cutoff:
+                break
+            v = float(value)
+            if math.isfinite(v):
+                out.append((ts_i, v))
+
+        out.reverse()
+        return out
+
+    def _recent_trades_for_window(
+        self,
+        ms: int,
+        now_ms: int,
+    ) -> List[Tuple[int, float, float, float, str, float, float, float]]:
+        cutoff = int(now_ms) - int(ms)
+        now = int(now_ms)
+        out: List[Tuple[int, float, float, float, str, float, float, float]] = []
+
+        deq = self._trade_window_deques[int(ms)]
+        for trade in reversed(deq):
+            ts_i = int(trade[0])
+            if ts_i > now:
+                continue
+            if ts_i < cutoff:
+                break
+            out.append(trade)
+
+        out.reverse()
+        return out
+
+    def _recent_trade_signs(self, now_ms: int, window_ms: int) -> List[int]:
+        cutoff = int(now_ms) - int(window_ms)
+        now = int(now_ms)
+        signs: List[int] = []
+
+        for t, s, _ in reversed(self.trade_sign_history):
+            t_i = int(t)
+            if t_i > now:
+                continue
+            if t_i < cutoff:
+                break
+            s_i = int(s)
+            if s_i != 0:
+                signs.append(s_i)
+
+        signs.reverse()
+        return signs
 
     def _rolling_slope_simple(self, points: List[Tuple[int, float]]) -> float:
-        if len(points) < 3:
-            return 0.0
-        t0 = points[0][0]
-        x = np.asarray([(ts - t0) / 1000.0 for ts, _ in points], dtype=np.float64)
-        y = np.asarray([float(v) for _, v in points], dtype=np.float64)
-        x_mean = float(np.mean(x))
-        y_mean = float(np.mean(y))
-        den = float(np.sum((x - x_mean) ** 2))
-        if den <= 1e-12:
-            return 0.0
-        num = float(np.sum((x - x_mean) * (y - y_mean)))
-        return num / den
+        return self._slope_from_points_no_numpy(points)
 
     def _compute_large_trade_stats(self, trades: List[Tuple[int, float, float, float, str, float, float, float]], ms: int) -> Dict[str, float]:
         eps = 1e-12
@@ -2378,7 +2489,8 @@ class FeatureEngine:
         v0 = float(points[0][1])
         if v0 <= 0.0 or not math.isfinite(v0):
             return 0.0, 0.0
-        x = np.asarray([(ts - t0) / 1000.0 for ts, _ in points], dtype=np.float64)
+        x_vals = [(ts - t0) / 1000.0 for ts, _ in points]
+        x = np.asarray(x_vals, dtype=np.float64)
         y_vals: List[float] = []
         for _, value in points:
             v = float(value)
@@ -3038,7 +3150,10 @@ class FeatureEngine:
         if etype == "ob":
             self.last_ob_ofi_l5 = float(ofi_l5)
             self.last_ob_trade_imbalance_30000ms = float(trade_stats_by_ms[30_000]["trade_imbalance_notional"])
-        trades_by_ms = {ms: [t for t in self._trade_window_deques[ms] if (ts_ms - t[0]) <= ms] for ms in self.trade_windows}
+        trades_by_ms = {
+            ms: self._recent_trades_for_window(ms, ts_ms)
+            for ms in self.trade_windows
+        }
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in self.trade_windows:
             if self._cvd_history:
@@ -3064,9 +3179,7 @@ class FeatureEngine:
             "consecutive_sell_trade_count": float(self.consecutive_sell_trade_count),
         }
         for window in TRADE_BURST_WINDOWS_MS:
-            lo = ts_ms - window
-            signed = [(t, s, n) for t, s, n in self.trade_sign_history if lo <= t <= ts_ms and s != 0]
-            signs = [s for _, s, _ in signed]
+            signs = self._recent_trade_signs(ts_ms, window)
             max_buy_run = 0
             max_sell_run = 0
             run_buy = 0
@@ -3753,18 +3866,17 @@ class FeatureEngine:
 
             depth_points = self._metric_values(self._depth_5bps_total_history, ts_ms, ms)
             depth_vals = [v for _, v in depth_points]
-            depth_stats = self._rolling_stats_values(depth_vals)
-            depth_std = depth_stats["std"]
-            depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_stats["mean"]) / max(depth_std, 1e-9)
+            depth_mean, depth_std = self._rolling_mean_std_values(depth_vals)
+            depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_mean) / max(depth_std, 1e-9)
             imb_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, ms)
             imb_vals = [v for _, v in imb_points]
-            imb_stats = self._rolling_stats_values(imb_vals)
+            imb_mean = self._rolling_mean_values(imb_vals)
             imb_slope = self._rolling_value_slope(imb_points)
 
             bid_points = self._metric_values(self._bid_depth_5bps_history, ts_ms, ms)
             ask_points = self._metric_values(self._ask_depth_5bps_history, ts_ms, ms)
-            bid_mean = self._rolling_stats_values([v for _, v in bid_points])["mean"]
-            ask_mean = self._rolling_stats_values([v for _, v in ask_points])["mean"]
+            bid_mean = self._rolling_mean_values([v for _, v in bid_points])
+            ask_mean = self._rolling_mean_values([v for _, v in ask_points])
 
             feat_list.extend([
                 spread_stats["mean"],
@@ -3775,10 +3887,10 @@ class FeatureEngine:
                 spread_z,
                 spread_slope,
                 spread_above,
-                depth_stats["mean"],
-                depth_stats["std"],
+                depth_mean,
+                depth_std,
                 depth_z,
-                imb_stats["mean"],
+                imb_mean,
                 imb_slope,
                 (bid_depth_5bps["size"] / max(bid_mean, 1e-9)) - 1.0,
                 (ask_depth_5bps["size"] / max(ask_mean, 1e-9)) - 1.0,
