@@ -1877,14 +1877,50 @@ class FeatureEngine:
 
     def _new_trade_window_state(self) -> Dict[str, Any]:
         return {
+            # Counts
+            "trade_count": 0,
             "buy_cnt": 0,
             "sell_cnt": 0,
+
+            # Base volume
             "buy_vol": 0.0,
             "sell_vol": 0.0,
-            "signed_px_sum": 0.0,
-            "signed_cnt": 0.0,
-            "pxv_sum": 0.0,
             "vol_sum": 0.0,
+
+            # Notional
+            "buy_notional": 0.0,
+            "sell_notional": 0.0,
+            "signed_notional": 0.0,
+
+            # VWAP
+            "pxv_sum": 0.0,
+
+            # Tick direction
+            "plus_tick": 0,
+            "minus_tick": 0,
+            "zero_tick": 0,
+
+            # Premium terms needed to reproduce the old scan exactly.
+            # signed_premium_sum = 1e4 * (signed_price_sum / mid - signed_count)
+            "signed_price_sum": 0.0,
+            "signed_count": 0.0,
+
+            # signed_premium_weighted =
+            #   1e4 * (signed_price_notional_sum / mid - signed_notional)
+            "signed_price_notional_sum": 0.0,
+            "signed_notional_sum_for_premium": 0.0,
+
+            # buy_trade_premium_bps =
+            #   1e4 * (buy_price_sum / mid - buy_premium_count) / buy_premium_count
+            "buy_price_sum": 0.0,
+            "buy_premium_count": 0.0,
+
+            # sell_trade_premium_bps =
+            #   1e4 * (mid * sell_inv_price_sum - sell_premium_count) / sell_premium_count
+            "sell_inv_price_sum": 0.0,
+            "sell_premium_count": 0.0,
+
+            # Monotonic max queues: entries are (ts_ms, notional_usd).
             "buy_max_q": deque(),
             "sell_max_q": deque(),
         }
@@ -2094,67 +2130,188 @@ class FeatureEngine:
         window_ms: int,
         entry: Tuple[int, float, float, float, str, float, float, float],
     ) -> None:
-        ts_ms, price, size, notional_usd, side, side_sign, *_ = entry
+        ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick = entry
         state = self.trade_window_state[window_ms]
 
-        state["pxv_sum"] += price * size
-        state["vol_sum"] += size
+        ts_i = int(ts_ms)
+        px = float(price)
+        sz = float(size)
+        notion = float(notional_usd)
+        ss = float(side_sign)
+        tick = float(tick_sign)
+        zero = float(is_zero_tick)
 
-        if side_sign > 0:
+        state["trade_count"] += 1
+        state["pxv_sum"] += px * sz
+        state["vol_sum"] += sz
+
+        if tick > 0:
+            state["plus_tick"] += 1
+        elif tick < 0:
+            state["minus_tick"] += 1
+
+        if zero > 0:
+            state["zero_tick"] += 1
+
+        if ss > 0:
             state["buy_cnt"] += 1
-            state["buy_vol"] += size
-            state["signed_px_sum"] += notional_usd
-            state["signed_cnt"] += 1.0
+            state["buy_vol"] += sz
+            state["buy_notional"] += notion
+            state["signed_notional"] += notion
+
+            state["signed_price_sum"] += px
+            state["signed_count"] += 1.0
+            state["signed_price_notional_sum"] += px * notion
+            state["signed_notional_sum_for_premium"] += notion
+
+            state["buy_price_sum"] += px
+            state["buy_premium_count"] += 1.0
+
             q = state["buy_max_q"]
-            while q and q[-1][1] <= notional_usd:
+            while q and q[-1][1] <= notion:
                 q.pop()
-            q.append((ts_ms, notional_usd))
-        elif side_sign < 0:
+            q.append((ts_i, notion))
+
+        elif ss < 0:
             state["sell_cnt"] += 1
-            state["sell_vol"] += size
-            state["signed_px_sum"] -= notional_usd
-            state["signed_cnt"] -= 1.0
+            state["sell_vol"] += sz
+            state["sell_notional"] += notion
+            state["signed_notional"] -= notion
+
+            state["signed_price_sum"] -= px
+            state["signed_count"] -= 1.0
+            state["signed_price_notional_sum"] -= px * notion
+            state["signed_notional_sum_for_premium"] += notion
+
+            if px > 0.0:
+                state["sell_inv_price_sum"] += 1.0 / px
+                state["sell_premium_count"] += 1.0
+
             q = state["sell_max_q"]
-            while q and q[-1][1] <= notional_usd:
+            while q and q[-1][1] <= notion:
                 q.pop()
-            q.append((ts_ms, notional_usd))
+            q.append((ts_i, notion))
 
     def _update_trade_window_state_with_expire(
         self,
         window_ms: int,
         entry: Tuple[int, float, float, float, str, float, float, float],
     ) -> None:
-        ts_ms, price, size, notional_usd, side, side_sign, *_ = entry
+        ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick = entry
         state = self.trade_window_state[window_ms]
 
-        state["pxv_sum"] -= price * size
-        state["vol_sum"] -= size
+        ts_i = int(ts_ms)
+        px = float(price)
+        sz = float(size)
+        notion = float(notional_usd)
+        ss = float(side_sign)
+        tick = float(tick_sign)
+        zero = float(is_zero_tick)
 
-        if side_sign > 0:
+        state["trade_count"] -= 1
+        state["pxv_sum"] -= px * sz
+        state["vol_sum"] -= sz
+
+        if tick > 0:
+            state["plus_tick"] -= 1
+        elif tick < 0:
+            state["minus_tick"] -= 1
+
+        if zero > 0:
+            state["zero_tick"] -= 1
+
+        if ss > 0:
             state["buy_cnt"] -= 1
-            state["buy_vol"] -= size
-            state["signed_px_sum"] -= notional_usd
-            state["signed_cnt"] -= 1.0
+            state["buy_vol"] -= sz
+            state["buy_notional"] -= notion
+            state["signed_notional"] -= notion
+
+            state["signed_price_sum"] -= px
+            state["signed_count"] -= 1.0
+            state["signed_price_notional_sum"] -= px * notion
+            state["signed_notional_sum_for_premium"] -= notion
+
+            state["buy_price_sum"] -= px
+            state["buy_premium_count"] -= 1.0
+
             q = state["buy_max_q"]
-            if q and q[0][0] == ts_ms and abs(q[0][1] - notional_usd) <= 1e-12:
-                q.popleft()
-        elif side_sign < 0:
-            state["sell_cnt"] -= 1
-            state["sell_vol"] -= size
-            state["signed_px_sum"] += notional_usd
-            state["signed_cnt"] += 1.0
-            q = state["sell_max_q"]
-            if q and q[0][0] == ts_ms and abs(q[0][1] - notional_usd) <= 1e-12:
+            if q and q[0][0] == ts_i and abs(q[0][1] - notion) <= 1e-12:
                 q.popleft()
 
-        state["buy_cnt"] = max(0, state["buy_cnt"])
-        state["sell_cnt"] = max(0, state["sell_cnt"])
-        state["buy_vol"] = max(0.0, state["buy_vol"])
-        state["sell_vol"] = max(0.0, state["sell_vol"])
-        state["vol_sum"] = max(0.0, state["vol_sum"])
-        if state["buy_cnt"] == 0 and state["sell_cnt"] == 0:
-            state["signed_px_sum"] = 0.0
-            state["signed_cnt"] = 0.0
+        elif ss < 0:
+            state["sell_cnt"] -= 1
+            state["sell_vol"] -= sz
+            state["sell_notional"] -= notion
+            state["signed_notional"] += notion
+
+            state["signed_price_sum"] += px
+            state["signed_count"] += 1.0
+            state["signed_price_notional_sum"] += px * notion
+            state["signed_notional_sum_for_premium"] -= notion
+
+            if px > 0.0:
+                state["sell_inv_price_sum"] -= 1.0 / px
+                state["sell_premium_count"] -= 1.0
+
+            q = state["sell_max_q"]
+            if q and q[0][0] == ts_i and abs(q[0][1] - notion) <= 1e-12:
+                q.popleft()
+
+        # Clamp tiny floating point residue / impossible negative counters after expiration.
+        int_keys = (
+            "trade_count",
+            "buy_cnt",
+            "sell_cnt",
+            "plus_tick",
+            "minus_tick",
+            "zero_tick",
+        )
+        for key in int_keys:
+            if state[key] < 0:
+                state[key] = 0
+
+        float_nonnegative_keys = (
+            "buy_vol",
+            "sell_vol",
+            "vol_sum",
+            "buy_notional",
+            "sell_notional",
+            "signed_notional_sum_for_premium",
+            "buy_premium_count",
+            "sell_premium_count",
+        )
+        for key in float_nonnegative_keys:
+            if state[key] < 0.0 and abs(state[key]) <= 1e-9:
+                state[key] = 0.0
+            elif state[key] < 0.0:
+                state[key] = 0.0
+
+        if state["trade_count"] == 0:
+            for key in (
+                "buy_vol",
+                "sell_vol",
+                "vol_sum",
+                "buy_notional",
+                "sell_notional",
+                "signed_notional",
+                "pxv_sum",
+                "signed_price_sum",
+                "signed_count",
+                "signed_price_notional_sum",
+                "signed_notional_sum_for_premium",
+                "buy_price_sum",
+                "buy_premium_count",
+                "sell_inv_price_sum",
+                "sell_premium_count",
+            ):
+                state[key] = 0.0
+            state["buy_cnt"] = 0
+            state["sell_cnt"] = 0
+            state["plus_tick"] = 0
+            state["minus_tick"] = 0
+            state["zero_tick"] = 0
+            state["buy_max_q"].clear()
+            state["sell_max_q"].clear()
 
     def _prune_trade_window(self, now_ms: int, window_ms: int) -> None:
         deq = self._trade_window_deques[window_ms]
@@ -2163,56 +2320,58 @@ class FeatureEngine:
             self._update_trade_window_state_with_expire(window_ms, expired)
 
     def _compute_trade_window_stats(self, ms: int, ts_ms: int, mid: float, micro: float) -> Dict[str, float]:
-        deq = self._trade_window_deques[ms]
+        del ts_ms
         eps = 1e-12
-        trades = [t for t in deq if (ts_ms - t[0]) <= ms]
-        trade_count = float(len(trades))
-        buy_vol = sell_vol = 0.0
-        buy_notional = sell_notional = 0.0
-        buy_count = sell_count = 0.0
-        plus_tick = minus_tick = zero_tick = 0.0
-        pxv_sum = vol_sum = 0.0
-        signed_premium_sum = signed_premium_weighted = signed_notional = 0.0
+        state = self.trade_window_state[ms]
+
+        trade_count = float(state["trade_count"])
+        buy_vol = float(state["buy_vol"])
+        sell_vol = float(state["sell_vol"])
+        buy_notional = float(state["buy_notional"])
+        sell_notional = float(state["sell_notional"])
+        buy_count = float(state["buy_cnt"])
+        sell_count = float(state["sell_cnt"])
+        plus_tick = float(state["plus_tick"])
+        minus_tick = float(state["minus_tick"])
+        zero_tick = float(state["zero_tick"])
+        pxv_sum = float(state["pxv_sum"])
+        vol_sum = float(state["vol_sum"])
+        signed_notional = float(state["signed_notional"])
+
+        buy_max_q = state["buy_max_q"]
+        sell_max_q = state["sell_max_q"]
+        buy_max_notional = float(buy_max_q[0][1]) if buy_max_q else 0.0
+        sell_max_notional = float(sell_max_q[0][1]) if sell_max_q else 0.0
+
+        signed_premium_sum = 0.0
+        signed_premium_weighted = 0.0
+        buy_premium_sum = 0.0
+        sell_premium_sum = 0.0
         signed_notional_sum_for_premium = 0.0
-        buy_premium_sum = sell_premium_sum = 0.0
         buy_premium_count = sell_premium_count = 0.0
-        buy_max_notional = sell_max_notional = 0.0
 
-        for _, price, size, notional_usd, _, side_sign, tick_sign, is_zero_tick in trades:
-            pxv_sum += price * size
-            vol_sum += size
-            if tick_sign > 0:
-                plus_tick += 1.0
-            elif tick_sign < 0:
-                minus_tick += 1.0
-            if is_zero_tick > 0:
-                zero_tick += 1.0
-            if side_sign > 0:
-                buy_vol += size
-                buy_notional += notional_usd
-                buy_count += 1.0
-                buy_max_notional = max(buy_max_notional, notional_usd)
-            elif side_sign < 0:
-                sell_vol += size
-                sell_notional += notional_usd
-                sell_count += 1.0
-                sell_max_notional = max(sell_max_notional, notional_usd)
+        if mid > 0.0:
+            signed_premium_sum = 1e4 * (
+                float(state["signed_price_sum"]) / mid
+                - float(state["signed_count"])
+            )
+            signed_premium_weighted = 1e4 * (
+                float(state["signed_price_notional_sum"]) / mid
+                - float(state["signed_notional"])
+            )
+            signed_notional_sum_for_premium = float(state["signed_notional_sum_for_premium"])
 
-            if side_sign != 0.0 and mid > 0.0:
-                premium_bps = 1e4 * (price / mid - 1.0)
-                signed_premium = side_sign * premium_bps
-                signed_premium_sum += signed_premium
-                signed_premium_weighted += signed_premium * notional_usd
-                signed_notional_sum_for_premium += notional_usd
-                if side_sign > 0:
-                    buy_premium_sum += premium_bps
-                    buy_premium_count += 1.0
-                elif side_sign < 0 and price > 0.0:
-                    sell_premium_sum += 1e4 * (mid / price - 1.0)
-                    sell_premium_count += 1.0
+            buy_premium_count = float(state["buy_premium_count"])
+            buy_premium_sum = 1e4 * (
+                float(state["buy_price_sum"]) / mid
+                - buy_premium_count
+            )
 
-            if side_sign != 0.0:
-                signed_notional += side_sign * notional_usd
+            sell_premium_count = float(state["sell_premium_count"])
+            sell_premium_sum = 1e4 * (
+                mid * float(state["sell_inv_price_sum"])
+                - sell_premium_count
+            )
 
         tot_notional = buy_notional + sell_notional
         tot_count_signed = buy_count + sell_count
@@ -2252,7 +2411,7 @@ class FeatureEngine:
             stats["vwap_vs_micro_bps"] = (1e4 * (vwap / micro - 1.0)) if micro > 0 else 0.0
         for k, v in stats.items():
             if not math.isfinite(float(v)):
-                raise ValueError(f"Non-finite trade stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
+                raise ValueError(f"Non-finite trade stat {k}={v!r} window={ms}")
         return stats
 
     def _lin_slope(self, xs: List[float], ys: List[float], eps: float = 1e-12) -> float:
