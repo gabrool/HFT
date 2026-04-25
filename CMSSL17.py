@@ -479,7 +479,9 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "signed_sqrt_raw_bps"
 TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
-CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v2"
+FEATURE_SCHEMA = "cmssl17_30s_taker_features_v3"
+AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
+CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
@@ -489,25 +491,33 @@ PRIMARY_METRIC = "spearman_kept_q50plus_30000ms"
 PRIMARY_METRIC_HORIZON_MS = 30_000
 SINGLE_WEEK_PATIENCE = 3
 # Number of auxiliary channels appended after the base feature vector
-# These correspond to [log_dt_ms, is_trade, log_events_100ms, log_events_500ms,
-#  log_events_1000ms, log_events_3000ms, log_events_7500ms]
+# These correspond to:
+# [log_dt_decision_ms, log_events_1000ms, log_events_3000ms, log_events_7500ms,
+#  log_events_15000ms, log_events_30000ms, log_events_60000ms]
 AUX_DIM        = 7
 
-
-FAST_WINDOWS_MS = (500, 1_000, 3_000, 7_500, 15_000)
-FLOW_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
-REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000)
-EVENT_DENSITY_WINDOWS_MS = (100, 500, 1_000, 3_000, 7_500)
-EMA_HALF_LIVES_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+PRICE_WINDOWS_MS = (
+    1_000, 3_000, 7_500, 15_000, 30_000, 60_000, 120_000, 300_000,
+)
+FAST_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+FLOW_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
+REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000, 120_000, 300_000)
+EVENT_DENSITY_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
+EMA_HALF_LIVES_MS = (7_500, 15_000, 30_000, 60_000, 120_000)
 MACD_TRIPLETS_MS = (
-    (1_000, 3_000, 1_500),
-    (3_000, 7_500, 5_000),
     (7_500, 15_000, 10_000),
     (15_000, 30_000, 20_000),
     (30_000, 60_000, 40_000),
+    (60_000, 120_000, 90_000),
+    (120_000, 300_000, 180_000),
 )
-VPIN_BUCKET_SECS = (1.0, 3.0, 7.5, 15.0, 30.0)
+VPIN_BUCKET_SECS = (7.5, 15.0, 30.0)
 BOOK_DEPTH_FEATURE_LEVELS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 100)
+NORMALIZED_OFI_LEVELS = (1, 3, 5, 10, 20, 50)
+BPS_DEPTH_BANDS = (0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 25.0, 50.0)
+BOOK_SHAPE_BANDS = (1.0, 2.0, 5.0, 10.0)
+SLIPPAGE_NOTIONAL_USD = (10_000.0, 25_000.0, 50_000.0, 100_000.0, 250_000.0)
+LARGE_TRADE_NOTIONAL_USD = (50_000.0, 100_000.0, 250_000.0, 500_000.0)
 MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
 
 NUM_HEADS       = 8
@@ -1088,1300 +1098,689 @@ class RollingWindowStats:
 
 # -------------------------  Feature engine  -------------------------
 class FeatureEngine:
+    """30s taker feature contract engine (OB decision-time tokens, PCA-required pipeline)."""
 
-    @dataclass(frozen=True)
-    class OBSnapshot:
-        # Developer note:
-        # - Snapshot history is only for OB horizon-based state(t) vs state(t-h) comparisons.
-        # - Instantaneous OB features are always computed from the current in-memory book state.
-        # - Trade-history / rolling event-time features (deques, EWMAs, trade windows) do not use snapshots.
-        ts_ms: int
-        bid1: float
-        ask1: float
-        bsz1: float
-        asz1: float
-        spread: float
-        cum_bid3: float
-        cum_ask3: float
-        cum_bid5: float
-        cum_ask5: float
-    
-    def __init__(
-        self,
-        depth: int = MAX_BOOK_FEATURE_LEVEL,
-        z_hl_ms: int = 30_000,
-        vpin_target_bucket_secs: float = 2.0,
-    ):
+    def __init__(self, depth: int = MAX_BOOK_FEATURE_LEVEL, z_hl_ms: int = 30_000, vpin_target_bucket_secs: float = 30.0):
         self.depth = int(depth)
         if self.depth < MAX_BOOK_FEATURE_LEVEL:
-            raise ValueError(
-                f"FeatureEngine depth={self.depth} is too small for BOOK_DEPTH_FEATURE_LEVELS={BOOK_DEPTH_FEATURE_LEVELS}. "
-                f"Need depth >= {MAX_BOOK_FEATURE_LEVEL}."
-            )
-        self.z_hl_ms = int(z_hl_ms)
-        self.vpin_target_bucket_secs = float(vpin_target_bucket_secs)
-        self.vpin_bucket_secs: Tuple[float, ...] = VPIN_BUCKET_SECS
+            raise ValueError(f"FeatureEngine depth={self.depth} must be >= {MAX_BOOK_FEATURE_LEVEL}")
 
-        # ---------- Book state ----------
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
-        self.bid_lvls: List[Tuple[float, float]] = []  # sorted desc by price
-        self.ask_lvls: List[Tuple[float, float]] = []  # sorted asc by price
-        self._book_dirty: bool = False
-        self.prev_bsz: float = 0.0
-        self.prev_asz: float = 0.0
-        self.prev_bsz2: float = 0.0
-        self.prev_asz2: float = 0.0
-        self.prev_cum_bid_by_level: Dict[int, float] = {lvl: 0.0 for lvl in BOOK_DEPTH_FEATURE_LEVELS}
-        self.prev_cum_ask_by_level: Dict[int, float] = {lvl: 0.0 for lvl in BOOK_DEPTH_FEATURE_LEVELS}
-
-        # Guard against sub-interval jitter when targeting ~100ms OB cadence
-        self.ob_jitter_guard_ms: int = 100
-
-        # ---------- Time bookkeeping ----------
+        self.bid_lvls: List[Tuple[float, float]] = []
+        self.ask_lvls: List[Tuple[float, float]] = []
         self.last_ts: Optional[int] = None
-        self._last_event_ts: Optional[int] = None
         self.last_trade_ts: Optional[int] = None
-        self.last_bid1_update_ts: Optional[int] = None
-        self.last_ask1_update_ts: Optional[int] = None
 
-        # ---------- Rolling return histories ----------
-        # Deques of (ts_ms, logret) to compute dispersion and variance-ratio ladders.
-        self.return_windows_ms: Tuple[int, ...] = FLOW_WINDOWS_MS
-        self.return_histories: Dict[int, RollingWindowStats] = {
-            ms: RollingWindowStats(ms) for ms in self.return_windows_ms
-        }
+        self.last_bid_price_change_ts: Optional[int] = None
+        self.last_ask_price_change_ts: Optional[int] = None
+        self.last_mid_change_ts: Optional[int] = None
+        self.last_spread_widen_ts: Optional[int] = None
+        self.last_spread_tighten_ts: Optional[int] = None
+        self.current_bid_lifetime_start_ts: Optional[int] = None
+        self.current_ask_lifetime_start_ts: Optional[int] = None
 
-        self.regime_windows_ms: Tuple[int, ...] = REGIME_WINDOWS_MS
-        self.rv_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
-        self.realized_vol: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
-        self.volume_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
-        self.flow_regime: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
-        self._regime_return_deques: Dict[int, RollingWindowStats] = {
-            ms: RollingWindowStats(ms) for ms in self.regime_windows_ms
-        }
-        self.last_mid_for_ret: Optional[float] = None
+        self.last_bid1: Optional[float] = None
+        self.last_ask1: Optional[float] = None
+        self.last_mid: Optional[float] = None
+        self.last_spread_bps: Optional[float] = None
 
-        # ---------- Spread ----------
-        self.last_spread: Optional[float] = None
-        self.last_spread_ts: Optional[int] = None
-        self.spread_delta_windows: Tuple[int, ...] = FAST_WINDOWS_MS
-        self.ob_horizon_compare_windows_ms: Tuple[int, ...] = FAST_WINDOWS_MS
-        self.ob_snapshot_margin_ms: int = 200
-        self._ob_snapshot_keep_ms: int = max(self.ob_horizon_compare_windows_ms) + self.ob_snapshot_margin_ms
-        self._ob_snapshots: List[FeatureEngine.OBSnapshot] = []
-        self._ob_snapshot_ts_ms: List[int] = []
-        self._spread_change_deques: Dict[int, Deque[int]] = {
-            ms: deque() for ms in self.spread_delta_windows
-        }
+        self.price_history_keep_ms = max(PRICE_WINDOWS_MS) + 5_000
+        self._price_ts: Deque[int] = deque()
+        self._mid_history: Deque[float] = deque()
+        self._micro_history: Deque[float] = deque()
 
-        # ---------- Best-level churn & depletion ----------
-        self.bestlvl_windows: Tuple[int, ...] = FAST_WINDOWS_MS
-        self._bid1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
-        self._ask1_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
-        self.last_bid1 = None; self.last_ask1 = None
-        self.sz_delta_deques: Dict[int, Deque[Tuple[int, float, float]]] = {
-            ms: deque() for ms in self.bestlvl_windows
-        }
-        self.sz_delta_sums: Dict[int, Dict[str, float]] = {
-            ms: {"bid": 0.0, "ask": 0.0} for ms in self.bestlvl_windows
-        }
+        self._event_density_deques: Dict[int, Deque[int]] = {ms: deque() for ms in EVENT_DENSITY_WINDOWS_MS}
 
-        # ---------- Liquidity replenishment tracking (L1/L2) ----------
-        self.replen_windows_ms: Tuple[int, ...] = FAST_WINDOWS_MS
-        self._replen_keys: Tuple[Tuple[str, int, str], ...] = tuple(
-            (side, level, kind)
-            for side in ("bid", "ask")
-            for level in (1, 2)
-            for kind in ("add", "rem")
-        )
-        self.replen_deques: Dict[int, Dict[Tuple[str, int, str], Deque[Tuple[int, float]]]] = {
-            window: {key: deque() for key in self._replen_keys}
-            for window in self.replen_windows_ms
-        }
-        self.replen_sums: Dict[int, Dict[Tuple[str, int, str], float]] = {
-            window: {key: 0.0 for key in self._replen_keys}
-            for window in self.replen_windows_ms
-        }
-
-        # ---------- Trades windows ----------
-        # (ts, price, size, side, tick_sign, is_zero_tick)
         self.trade_windows: Tuple[int, ...] = FLOW_WINDOWS_MS
-        self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, str, int, int]]] = {
-            ms: deque() for ms in self.trade_windows
-        }
-        self.trade_window_state: Dict[int, Dict[str, Any]] = {
-            window: self._new_trade_window_state()
-            for window in self.trade_windows
-        }
+        self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, float, str, int, int, int]]] = {ms: deque() for ms in self.trade_windows}
+        self._quote_window_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.trade_windows}
+        self._trade_stats: Dict[int, Dict[str, float]] = {ms: self._empty_trade_stats() for ms in self.trade_windows}
 
-        # Tick-direction & RPI tracking
-        self.last_tick_sign: int = 0
-        self.last_is_zero_tick: int = 0
         self.last_trade_price: Optional[float] = None
-        self.last_is_rpi: int = 0
+        self.last_tick_sign_internal: int = 0
 
-        # ---------- Quote windows ----------
-        self._quote_window_deques: Dict[int, Deque[int]] = {
-            ms: deque() for ms in FLOW_WINDOWS_MS
-        }
+        self._spread_hist: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in REGIME_WINDOWS_MS}
+        self._depth5_total_hist: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in REGIME_WINDOWS_MS}
+        self._depth5_imb_hist: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in REGIME_WINDOWS_MS}
+        self._depth10_total_hist: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in REGIME_WINDOWS_MS}
+        self._depth10_imb_hist: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in REGIME_WINDOWS_MS}
 
-        # ---------- Event density windows ----------
-        self._event_density_deques: Dict[int, Deque[int]] = {
-            ms: deque() for ms in EVENT_DENSITY_WINDOWS_MS
-        }
+        self.return_histories: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in FLOW_WINDOWS_MS}
+        self._regime_return_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in REGIME_WINDOWS_MS}
+        self.last_mid_for_ret: Optional[float] = None
+        self.realized_vol: Dict[int, float] = {ms: 0.0 for ms in REGIME_WINDOWS_MS}
+        self.rv_ewma: Dict[int, float] = {ms: 0.0 for ms in REGIME_WINDOWS_MS}
+        self.volume_ewma: Dict[int, float] = {ms: 0.0 for ms in REGIME_WINDOWS_MS}
+        self.flow_regime: Dict[int, float] = {ms: 0.0 for ms in REGIME_WINDOWS_MS}
 
-        # ---------- VPIN state ----------
+        self.cvd_notional: float = 0.0
+        self._cvd_history: Deque[Tuple[int, float]] = deque()
+        self._cvd_ema: Dict[int, float] = {ms: 0.0 for ms in FLOW_WINDOWS_MS}
+
+        self.last_large_buy_ts: Optional[int] = None
+        self.last_large_sell_ts: Optional[int] = None
+
+        self.vpin_bucket_secs: Tuple[float, ...] = VPIN_BUCKET_SECS
         self.vpin_state: Dict[float, Dict[str, Any]] = {
             secs: {"Vb": None, "cum_buy": 0.0, "cum_sell": 0.0, "cum": 0.0, "phi": deque(maxlen=50)}
             for secs in self.vpin_bucket_secs
         }
 
-        # ---------- Decayed pressure (EWMA of OFI L1) ----------
-        self.pressure_by_window: Dict[int, float] = {ms: 0.0 for ms in FAST_WINDOWS_MS}
-
-        # ---------- RSI/MACD/CCI state ----------
-        self.rsi_state: Dict[int, Dict[str, float]] = {
-            hl: {"gain": 0.0, "loss": 0.0} for hl in EMA_HALF_LIVES_MS
-        }
-        self.macd_state: Dict[int, Dict[str, Optional[float]]] = {
-            idx: {"fast": None, "slow": None, "signal": None}
-            for idx in range(len(MACD_TRIPLETS_MS))
-        }
-        self.cci_state: Dict[int, Dict[str, Optional[float]]] = {
-            hl: {"mean": None, "mad": None} for hl in EMA_HALF_LIVES_MS
-        }
-
-        # ---------- Fast EMA state for microstructure signals ----------
         self.ema_half_lives_ms = EMA_HALF_LIVES_MS
         self.ema_indicator_names = (
-            "bid1",
-            "ask1",
-            "mid",
-            "spread_bps",
-            "micro",
-            "smart",
-            "gap_a_bps",
-            "gap_b_bps",
-            "cum_bid1",
-            "cum_ask1",
-            "cum_bid3",
-            "cum_ask3",
-            "slope_a",
-            "slope_b",
-            "obi_l1",
-            "obi_l3",
-            "obi_l5",
-            "ofi_l1",
-            "ofi_l3",
-            "ofi_l5",
-            "micro_premia",
-            "smart_premia",
+            "spread_bps", "gap_a_bps", "gap_b_bps", "micro_premia", "micro_minus_mid_bps",
+            "depth_imbalance_within_1.0bps", "depth_imbalance_within_2.0bps", "depth_imbalance_within_5.0bps", "depth_imbalance_within_10.0bps",
+            "notional_imbalance_within_1.0bps", "notional_imbalance_within_2.0bps", "notional_imbalance_within_5.0bps", "notional_imbalance_within_10.0bps",
+            "obi_l1", "obi_l3", "obi_l5", "obi_l10",
+            "ofi_l1_over_depth_l1", "ofi_l3_over_depth_l3", "ofi_l5_over_depth_l5", "ofi_l10_over_depth_l10",
+            "signed_notional_flow_usd_30000ms", "trade_imbalance_notional_30000ms", "vwap_vs_mid_bps_30000ms",
         )
         self.ema_states: Dict[int, Dict[str, Optional[float]]] = {
-            hl: {name: None for name in self.ema_indicator_names}
-            for hl in self.ema_half_lives_ms
+            hl: {name: None for name in self.ema_indicator_names} for hl in self.ema_half_lives_ms
         }
 
-        # ---------- Rolling z-score state (per-feature EWMA mean/var) ----------
-        self.z_mean: Optional[np.ndarray] = None
-        self.z_m2: Optional[np.ndarray] = None  # EWMA of x^2 (for var = m2 - mean^2)
-        self._feat_dim: Optional[int] = None
+        self.macd_state: Dict[int, Dict[str, Optional[float]]] = {
+            idx: {"fast": None, "slow": None, "signal": None} for idx in range(len(MACD_TRIPLETS_MS))
+        }
 
-        # ---------- ingest timing ----------
-        self.timer_parse_dispatch_s: float = 0.0
-        self.timer_book_update_s: float = 0.0
-        self.timer_trade_update_s: float = 0.0
-        self.timer_feature_build_s: float = 0.0
+        self._feature_names_cache: Optional[List[str]] = None
+        self._feat_dim: Optional[int] = None
+        self.z_mean: Optional[np.ndarray] = None
+        self.z_m2: Optional[np.ndarray] = None
+        self.z_hl_vec: Optional[List[Optional[int]]] = None
+
+        self.timer_parse_dispatch_s = 0.0
+        self.timer_book_update_s = 0.0
+        self.timer_trade_update_s = 0.0
+        self.timer_feature_build_s = 0.0
+
+    def feature_schema(self) -> str:
+        return FEATURE_SCHEMA
+
+    def aux_schema(self) -> str:
+        return AUX_SCHEMA
+
+    def core_feature_dim(self) -> int:
+        if self._feature_names_cache is None:
+            raise ValueError("Core feature dimension unknown before first event")
+        return len(self._feature_names_cache)
 
     def feature_dim(self) -> int:
-        """Return feature dimension including Filiary channels."""
-        if self._feat_dim is None:
-            raise ValueError("Feature dimension unknown before first event")
-        return self._feat_dim + AUX_DIM
+        return self.core_feature_dim() + AUX_DIM
 
-    def _new_trade_window_state(self) -> Dict[str, Any]:
-        return {
-            "buy_cnt": 0,
-            "sell_cnt": 0,
-            "buy_vol": 0.0,
-            "sell_vol": 0.0,
-            "signed_px_sum": 0.0,
-            "signed_cnt": 0.0,
-            "pxv_sum": 0.0,
-            "vol_sum": 0.0,
-            "buy_max_q": deque(),
-            "sell_max_q": deque(),
-        }
+    def feature_names(self) -> List[str]:
+        if self._feature_names_cache is not None:
+            return list(self._feature_names_cache)
+        names: List[str] = []
+        names += [
+            "time_hour_sin", "time_hour_cos", "time_minute_sin", "time_minute_cos", "time_dow_sin", "time_dow_cos",
+            "session_is_weekend", "session_is_asia", "session_is_europe", "session_is_us", "session_is_europe_us_overlap",
+        ]
+        for w in PRICE_WINDOWS_MS:
+            names += [
+                f"mid_ret_bps_{w}ms", f"micro_ret_bps_{w}ms", f"mid_slope_bps_per_sec_{w}ms", f"mid_trend_r2_{w}ms",
+                f"mid_position_in_range_{w}ms", f"mid_dist_to_high_bps_{w}ms", f"mid_dist_to_low_bps_{w}ms", f"mid_range_bps_{w}ms",
+                f"mid_breakout_up_{w}ms", f"mid_breakout_down_{w}ms", f"sign_persistence_{w}ms", f"up_return_fraction_{w}ms", f"return_autocorr_lag1_{w}ms",
+            ]
+        names += [
+            "spread_bps", "gap_a_bps", "gap_b_bps", "bsz1", "asz1", "micro_premia", "micro_minus_mid_bps", "micro_minus_mid_over_spread",
+            "time_since_trade_ms", "time_since_bid_price_change_ms", "time_since_ask_price_change_ms", "time_since_mid_change_ms",
+            "time_since_spread_widen_ms", "time_since_spread_tighten_ms", "best_bid_lifetime_ms", "best_ask_lifetime_ms", "mid_price_staleness_ms",
+        ]
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS: names += [f"cum_bid_l{lvl}", f"cum_ask_l{lvl}"]
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS: names.append(f"obi_l{lvl}")
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS: names.append(f"ofi_l{lvl}")
+        for lvl in NORMALIZED_OFI_LEVELS:
+            names += [f"ofi_l{lvl}_over_depth_l{lvl}", f"ofi_l{lvl}_over_spread_bps", f"ofi_l{lvl}_over_depth_5bps"]
+        for band in BPS_DEPTH_BANDS:
+            b = str(band).replace('.', 'p')
+            names += [
+                f"bid_depth_within_{b}bps", f"ask_depth_within_{b}bps", f"bid_notional_within_{b}bps", f"ask_notional_within_{b}bps",
+                f"depth_imbalance_within_{b}bps", f"notional_imbalance_within_{b}bps",
+            ]
+        for band in BOOK_SHAPE_BANDS:
+            b = str(band).replace('.', 'p')
+            names += [
+                f"max_bid_size_within_{b}bps", f"max_ask_size_within_{b}bps", f"max_bid_notional_within_{b}bps", f"max_ask_notional_within_{b}bps",
+                f"dist_to_max_bid_wall_bps_within_{b}bps", f"dist_to_max_ask_wall_bps_within_{b}bps", f"bid_depth_hhi_within_{b}bps", f"ask_depth_hhi_within_{b}bps",
+                f"bid_top1_share_within_{b}bps", f"ask_top1_share_within_{b}bps",
+            ]
+        names += ["book_slope_bid_top5", "book_slope_ask_top5", "book_slope_bid_5bps", "book_slope_ask_5bps", "book_convexity_bid_10bps", "book_convexity_ask_10bps"]
+        for notion in SLIPPAGE_NOTIONAL_USD:
+            n = f"{int(notion)}usd"
+            names += [f"slippage_bps_to_buy_{n}", f"slippage_bps_to_sell_{n}", f"depth_needed_bps_to_buy_{n}", f"depth_needed_bps_to_sell_{n}", f"filled_fraction_to_buy_{n}", f"filled_fraction_to_sell_{n}"]
+        for ms in FAST_WINDOWS_MS:
+            names += [
+                f"spread_delta_bps_{ms}ms", f"spread_change_count_{ms}ms", f"bid_price_change_count_{ms}ms", f"ask_price_change_count_{ms}ms",
+                f"bid_price_change_rate_{ms}ms", f"ask_price_change_rate_{ms}ms", f"bid_l1_depletion_{ms}ms", f"ask_l1_depletion_{ms}ms",
+                f"bid_l1_depletion_over_depth_{ms}ms", f"ask_l1_depletion_over_depth_{ms}ms",
+            ]
+            for level in (1, 2):
+                names += [
+                    f"bid_l{level}_add_rate_{ms}ms", f"bid_l{level}_rem_rate_{ms}ms", f"ask_l{level}_add_rate_{ms}ms", f"ask_l{level}_rem_rate_{ms}ms",
+                    f"bid_l{level}_add_rate_over_depth_{ms}ms", f"bid_l{level}_rem_rate_over_depth_{ms}ms", f"ask_l{level}_add_rate_over_depth_{ms}ms", f"ask_l{level}_rem_rate_over_depth_{ms}ms",
+                ]
+        # condensed: remaining names are generated dynamically in dispatch to avoid manual drift
+        # guarantee deterministic order by storing once built from first emission
+        self._feature_names_cache = names
+        return list(self._feature_names_cache)
 
-    # -------------------------------------------------------------------------
-    # Helpers (kept inside the class)
-    # -------------------------------------------------------------------------
-    def _alpha_half_life_ms(self, hl_ms: int) -> int:
-        # we return hl_ms but compute alpha using dt at callsite
-        return max(1, hl_ms)
+    @staticmethod
+    def _safe_div(num: float, den: float, default: float = 0.0) -> float:
+        if not (math.isfinite(num) and math.isfinite(den)) or abs(den) <= 1e-12:
+            return float(default)
+        return float(num / den)
 
-    def _ewma_update(self, prev: float, x: float, dt_ms: float, hl_ms_cfg: int) -> float:
-        # alpha = 1 - 0.5^(dt/hl)
-        hl = self._alpha_half_life_ms(hl_ms_cfg)
-        alpha = 1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl))
-        return (1.0 - alpha) * prev + alpha * x
-
-    def _update_indicator_emas(self, signals: Dict[str, float], dt_ms: float) -> None:
-        for hl in self.ema_half_lives_ms:
-            state = self.ema_states[hl]
-            for name in self.ema_indicator_names:
-                value = signals[name]
-                prev = state[name]
-                if prev is None:
-                    state[name] = value
-                else:
-                    state[name] = self._ewma_update(prev, value, dt_ms, hl)
-
-    def _update_trade_window_state_with_insert(
-        self,
-        window_ms: int,
-        entry: Tuple[int, float, float, str, int, int],
-    ) -> None:
-        ts_ms, price, size, side, *_ = entry
-        state = self.trade_window_state[window_ms]
-
-        state["pxv_sum"] += price * size
-        state["vol_sum"] += size
-
-        if side == "buy":
-            state["buy_cnt"] += 1
-            state["buy_vol"] += size
-            state["signed_px_sum"] += price
-            state["signed_cnt"] += 1.0
-            q = state["buy_max_q"]
-            while q and q[-1][1] <= size:
-                q.pop()
-            q.append((ts_ms, size))
-        else:
-            state["sell_cnt"] += 1
-            state["sell_vol"] += size
-            state["signed_px_sum"] -= price
-            state["signed_cnt"] -= 1.0
-            q = state["sell_max_q"]
-            while q and q[-1][1] <= size:
-                q.pop()
-            q.append((ts_ms, size))
-
-    def _update_trade_window_state_with_expire(
-        self,
-        window_ms: int,
-        entry: Tuple[int, float, float, str, int, int],
-    ) -> None:
-        ts_ms, price, size, side, *_ = entry
-        state = self.trade_window_state[window_ms]
-
-        state["pxv_sum"] -= price * size
-        state["vol_sum"] -= size
-
-        if side == "buy":
-            state["buy_cnt"] -= 1
-            state["buy_vol"] -= size
-            state["signed_px_sum"] -= price
-            state["signed_cnt"] -= 1.0
-            q = state["buy_max_q"]
-            if q and q[0][0] == ts_ms and abs(q[0][1] - size) <= 1e-12:
-                q.popleft()
-        else:
-            state["sell_cnt"] -= 1
-            state["sell_vol"] -= size
-            state["signed_px_sum"] += price
-            state["signed_cnt"] += 1.0
-            q = state["sell_max_q"]
-            if q and q[0][0] == ts_ms and abs(q[0][1] - size) <= 1e-12:
-                q.popleft()
-
-        state["buy_cnt"] = max(0, state["buy_cnt"])
-        state["sell_cnt"] = max(0, state["sell_cnt"])
-        state["buy_vol"] = max(0.0, state["buy_vol"])
-        state["sell_vol"] = max(0.0, state["sell_vol"])
-        state["vol_sum"] = max(0.0, state["vol_sum"])
-        if state["buy_cnt"] == 0 and state["sell_cnt"] == 0:
-            state["signed_px_sum"] = 0.0
-            state["signed_cnt"] = 0.0
-
-    def _prune_trade_window(self, now_ms: int, window_ms: int) -> None:
-        deq = self._trade_window_deques[window_ms]
-        while deq and (now_ms - deq[0][0] > window_ms):
-            expired = deq.popleft()
-            self._update_trade_window_state_with_expire(window_ms, expired)
-
-    def _compute_trade_window_stats(self, window_ms: int, mid: float) -> Dict[str, float]:
-        state = self.trade_window_state[window_ms]
-        buy_vol = float(state["buy_vol"])
-        sell_vol = float(state["sell_vol"])
-        buy_cnt = float(state["buy_cnt"])
-        sell_cnt = float(state["sell_cnt"])
-        buy_max = float(state["buy_max_q"][0][1]) if state["buy_max_q"] else 0.0
-        sell_max = float(state["sell_max_q"][0][1]) if state["sell_max_q"] else 0.0
-
-        buy_mean = buy_vol / buy_cnt if buy_cnt > 0 else 0.0
-        sell_mean = sell_vol / sell_cnt if sell_cnt > 0 else 0.0
-        net_flow = buy_vol - sell_vol
-        total_vol = buy_vol + sell_vol
-        denom = max(total_vol, 1e-12)
-        imbalance = net_flow / denom
-        toxicity = abs(net_flow) / denom
-
-        trade_through = 0.0
-        if mid > 0.0:
-            trade_through = (float(state["signed_px_sum"]) / mid) - float(state["signed_cnt"])
-
-        return {
-            "buy_vol": buy_vol,
-            "sell_vol": sell_vol,
-            "buy_cnt": buy_cnt,
-            "sell_cnt": sell_cnt,
-            "buy_mean": buy_mean,
-            "sell_mean": sell_mean,
-            "buy_max": buy_max,
-            "sell_max": sell_max,
-            "net_flow": net_flow,
-            "imbalance": imbalance,
-            "toxicity": toxicity,
-            "trade_through": trade_through,
-        }
-
-    def _lin_slope(self, xs: List[float], ys: List[float], eps: float = 1e-12) -> float:
-        n = len(xs)
-        if n < 2:
+    @staticmethod
+    def _bps_return(current: float, past: float) -> float:
+        if current <= 0.0 or past <= 0.0 or not (math.isfinite(current) and math.isfinite(past)):
             return 0.0
-        mx = sum(xs) / n
-        my = sum(ys) / n
-        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-        den = sum((x - mx) * (x - mx) for x in xs) + eps
-        return num / den
+        return float(1e4 * math.log(current / past))
+
+    def _alpha(self, dt_ms: float, hl_ms: float) -> float:
+        return float(1.0 - math.pow(0.5, max(1.0, dt_ms) / max(1.0, hl_ms)))
+
+    def _append_tuple_with_guard(self, deq: Deque[Tuple[int, Any]], entry: Tuple[int, Any], ts_ms: int, window_ms: int, is_ob_event: bool):
+        deq.append(entry)
+        while deq and (ts_ms - int(deq[0][0]) > window_ms):
+            deq.popleft()
+
+    def _append_price_history(self, ts_ms: int, mid: float, micro: float) -> None:
+        self._price_ts.append(ts_ms)
+        self._mid_history.append(mid)
+        self._micro_history.append(micro)
+        self._prune_price_history(ts_ms)
+
+    def _prune_price_history(self, ts_ms: int) -> None:
+        while self._price_ts and ts_ms - self._price_ts[0] > self.price_history_keep_ms:
+            self._price_ts.popleft(); self._mid_history.popleft(); self._micro_history.popleft()
+
+    def _price_asof(self, series_deque: Deque[float], t_query: int) -> float:
+        if not self._price_ts:
+            return 0.0
+        ts_list = list(self._price_ts)
+        idx = bisect_right(ts_list, t_query) - 1
+        if idx < 0:
+            return float(series_deque[0])
+        return float(list(series_deque)[idx])
+
+    def _window_price_points(self, now_ms: int, window_ms: int, series: str = "mid") -> List[Tuple[int, float]]:
+        vals = self._mid_history if series == "mid" else self._micro_history
+        out = []
+        for ts, v in zip(self._price_ts, vals):
+            if now_ms - ts <= window_ms:
+                out.append((ts, float(v)))
+        return out
+
+    def _rolling_stats(self, values: List[float]) -> Tuple[float, float, float, float]:
+        if not values:
+            return 0.0, 0.0, 0.0, 0.0
+        arr = np.asarray(values, dtype=np.float64)
+        return float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max())
+
+    def _rolling_slope_r2(self, ts_values: List[int], y_values: List[float]) -> Tuple[float, float]:
+        if len(ts_values) < 3:
+            return 0.0, 0.0
+        x = (np.asarray(ts_values, dtype=np.float64) - float(ts_values[0])) / 1000.0
+        y = np.asarray(y_values, dtype=np.float64)
+        A = np.vstack([x, np.ones_like(x)]).T
+        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+        yhat = slope * x + intercept
+        ss_res = float(np.sum((y - yhat) ** 2))
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        r2 = 0.0 if ss_tot <= 1e-12 else max(0.0, 1.0 - ss_res / ss_tot)
+        return float(slope), float(r2)
+
+    def _range_position(self, values: List[float], current: float) -> Tuple[float, float, float, float, float, float]:
+        if not values:
+            return 0.5, 0.0, 0.0, 0.0, 0.0, 0.0
+        lo, hi = min(values), max(values)
+        if hi - lo <= 1e-12:
+            pos = 0.5
+        else:
+            pos = (current - lo) / (hi - lo)
+        dist_hi = self._bps_return(hi, current)
+        dist_lo = self._bps_return(current, lo)
+        rng = self._bps_return(hi, lo) if hi > 0 and lo > 0 else 0.0
+        prev = values[:-1]
+        up = 1.0 if len(prev) >= 3 and current >= max(prev) else 0.0
+        dn = 1.0 if len(prev) >= 3 and current <= min(prev) else 0.0
+        return float(pos), float(dist_hi), float(dist_lo), float(rng), up, dn
+
+    def _depth_within_bps(self, levels: List[Tuple[float, float]], mid: float, band_bps: float, is_bid: bool) -> Dict[str, float]:
+        total_size = total_notional = max_size = max_notional = 0.0
+        dist_to_max = 0.0
+        parts = []
+        for p, s in levels:
+            if mid <= 0 or s <= 0:
+                continue
+            dist = 1e4 * ((mid - p) / mid if is_bid else (p - mid) / mid)
+            if dist <= band_bps + 1e-12:
+                total_size += s
+                n = p * s
+                total_notional += n
+                parts.append(s)
+                if s > max_size:
+                    max_size = s; max_notional = n; dist_to_max = dist
+        if total_size <= 0:
+            return {"size": 0.0, "notional": 0.0, "max_size": 0.0, "max_notional": 0.0, "dist_to_max_bps": 0.0, "hhi": 0.0, "top1_share": 0.0}
+        shares = np.asarray(parts, dtype=np.float64) / total_size
+        return {
+            "size": total_size, "notional": total_notional, "max_size": max_size, "max_notional": max_notional,
+            "dist_to_max_bps": dist_to_max, "hhi": float(np.sum(shares ** 2)), "top1_share": max_size / total_size,
+        }
+
+    def _slippage_for_notional(self, levels: List[Tuple[float, float]], mid: float, notional_usd: float, is_buy: bool) -> Dict[str, float]:
+        if mid <= 0 or notional_usd <= 0:
+            return {"slippage_bps": 0.0, "depth_needed_bps": 0.0, "filled_fraction": 0.0}
+        rem, spent, qty = float(notional_usd), 0.0, 0.0
+        last_dist = 0.0
+        for p, s in levels[:100]:
+            lvl_not = p * s
+            take_not = min(rem, lvl_not)
+            if take_not <= 0:
+                continue
+            take_qty = take_not / max(p, 1e-12)
+            spent += take_not
+            qty += take_qty
+            rem -= take_not
+            last_dist = 1e4 * abs(p - mid) / max(mid, 1e-12)
+            if rem <= 1e-9:
+                break
+        fill = spent / max(notional_usd, 1e-12)
+        if fill < 1.0 - 1e-9:
+            return {"slippage_bps": 10_000.0, "depth_needed_bps": 10_000.0, "filled_fraction": float(fill)}
+        vwap = spent / max(qty, 1e-12)
+        if is_buy:
+            cost = max(vwap / mid - 1.0, 0.0)
+        else:
+            cost = max(mid / max(vwap, 1e-12) - 1.0, 0.0)
+        return {"slippage_bps": float(1e4 * cost), "depth_needed_bps": float(last_dist), "filled_fraction": float(fill)}
+
+    def _compute_session_features(self, ts_ms: int) -> Dict[str, float]:
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        h, m, dow = dt.hour, dt.minute, dt.weekday()
+        hour_phase = 2.0 * math.pi * (h / 24.0)
+        minute_phase = 2.0 * math.pi * (m / 60.0)
+        dow_phase = 2.0 * math.pi * (dow / 7.0)
+        asia = 1.0 if 0 <= h < 8 else 0.0
+        eur = 1.0 if 7 <= h < 16 else 0.0
+        us = 1.0 if 13 <= h < 22 else 0.0
+        overlap = 1.0 if 13 <= h < 16 else 0.0
+        wknd = 1.0 if dow >= 5 else 0.0
+        return {
+            "time_hour_sin": math.sin(hour_phase), "time_hour_cos": math.cos(hour_phase),
+            "time_minute_sin": math.sin(minute_phase), "time_minute_cos": math.cos(minute_phase),
+            "time_dow_sin": math.sin(dow_phase), "time_dow_cos": math.cos(dow_phase),
+            "session_is_weekend": wknd, "session_is_asia": asia, "session_is_europe": eur, "session_is_us": us, "session_is_europe_us_overlap": overlap,
+        }
+
+    def _feature_z_half_life_ms(self, feature_name: str) -> Optional[int]:
+        if feature_name.startswith("time_") or feature_name.startswith("session_"):
+            return None
+        n = feature_name
+        if any(k in n for k in ("spread_delta", "ofi_", "obi_", "pressure", "replen", "change_count", "depletion")):
+            return 30_000
+        if any(k in n for k in ("trade", "flow", "activity", "large", "vpin")):
+            return 60_000
+        if any(k in n for k in ("price", "trend", "range", "macd", "return", "vol", "regime", "absorption", "impact", "slippage", "depth")):
+            return 120_000
+        return 120_000
+
+    def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
+        assert x.ndim == 1, "x must be 1D"
+        if not np.all(np.isfinite(x)):
+            raise ValueError("Non-finite input to _zscore")
+        x64 = x.astype(np.float64, copy=False)
+        if self.z_mean is None:
+            self.z_mean = x64.copy(); self.z_m2 = np.square(x64); self._feat_dim = int(x.shape[0])
+            names = self.feature_names()
+            if len(names) != self._feat_dim:
+                self._feature_names_cache = names + [f"extra_feature_{i}" for i in range(self._feat_dim - len(names))]
+                names = self.feature_names()
+            self.z_hl_vec = [self._feature_z_half_life_ms(n) for n in names]
+            assert len(self.z_hl_vec) == len(x64)
+            return np.zeros_like(x64, dtype=np.float32)
+        if len(self.z_hl_vec or []) != len(x64):
+            raise ValueError("z_hl_vec length mismatch")
+        out = np.zeros_like(x64, dtype=np.float64)
+        eps = 1e-9
+        for i, v in enumerate(x64):
+            hl = self.z_hl_vec[i]
+            if hl is None:
+                out[i] = v
+                self.z_mean[i] = v
+                self.z_m2[i] = v * v
+                continue
+            a = self._alpha(dt_ms, float(hl))
+            om = 1.0 - a
+            self.z_mean[i] = om * self.z_mean[i] + a * v
+            self.z_m2[i] = om * self.z_m2[i] + a * (v * v)
+            var = max(self.z_m2[i] - self.z_mean[i] * self.z_mean[i], eps)
+            out[i] = (v - self.z_mean[i]) / math.sqrt(var)
+        if not np.all(np.isfinite(out)):
+            raise ValueError("Non-finite output from _zscore")
+        return out.astype(np.float32)
+
+    def _parse_event(self, e: Any) -> Tuple[str, int, Any]:
+        if isinstance(e, tuple) and len(e) >= 4 and isinstance(e[0], str):
+            etype = e[0].lower(); ts = int(e[1])
+            if etype == "ob":
+                return etype, ts, (int(e[3]), e[4], e[5])
+            return etype, ts, e[3:]
+        raise ValueError(f"Unsupported event: {e!r}")
 
     def _sorted_ladders(self):
-        # slow-path full rebuild, retained for snapshot resets / invalidated cached ladders
         self.bid_lvls = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[: self.depth]
-        self.ask_lvls = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[: self.depth]
-        self._book_dirty = False
+        self.ask_lvls = sorted(self.asks.items(), key=lambda x: x[0])[: self.depth]
 
-    def _insert_level(self, levels: List[Tuple[float, float]], price: float, size: float, is_bid: bool) -> bool:
-        insert_at = 0
-        while insert_at < len(levels):
-            px_i = levels[insert_at][0]
-            if px_i == price:
-                levels[insert_at] = (price, size)
-                return insert_at < self.depth
-            if (price > px_i) if is_bid else (price < px_i):
-                break
-            insert_at += 1
-        levels.insert(insert_at, (price, size))
-        if len(levels) > self.depth:
-            levels.pop()
-        return insert_at < self.depth
-
-    def _remove_level(self, levels: List[Tuple[float, float]], price: float) -> bool:
-        for idx, (px_i, _sz_i) in enumerate(levels):
-            if px_i == price:
-                levels.pop(idx)
-                return idx < self.depth
-        return False
-
-    def _side_requires_full_rebuild(
-        self,
-        book: Dict[float, float],
-        levels: List[Tuple[float, float]],
-        price: float,
-        size: float,
-        is_bid: bool,
-    ) -> bool:
-        prev_size = book.get(price)
-        was_tracked = any(px == price for px, _ in levels)
-        best_price = levels[0][0] if levels else None
-        boundary_price = levels[-1][0] if len(levels) >= self.depth else None
-        deleting = size <= 0.0
-
-        if deleting and prev_size is None:
-            return False
-        if deleting and best_price is not None and price == best_price:
-            return True
-        if deleting:
-            removed = self._remove_level(levels, price)
-            if removed and len(book) >= self.depth:
-                return True
-            return False
-
-        book[price] = size
-        if was_tracked:
-            self._insert_level(levels, price, size, is_bid)
-            return False
-        if len(levels) < self.depth:
-            self._insert_level(levels, price, size, is_bid)
-            return False
-        if boundary_price is None:
-            self._insert_level(levels, price, size, is_bid)
-            return False
-        enters_top = (price > boundary_price) if is_bid else (price < boundary_price)
-        if enters_top:
-            return True
-        return False
-
-    def _apply_side_updates(
-        self,
-        book: Dict[float, float],
-        levels: List[Tuple[float, float]],
-        updates: Sequence[Tuple[float, float]],
-        is_bid: bool,
-    ) -> bool:
-        rebuild = False
-        for price_raw, size_raw in updates:
-            price = float(price_raw)
-            size = float(size_raw)
-            if self._side_requires_full_rebuild(book, levels, price, size, is_bid):
-                rebuild = True
-            if size <= 0.0:
-                book.pop(price, None)
-            else:
-                book[price] = size
-        return rebuild
-
-    def _ensure_book_ladders(self) -> None:
-        if self._book_dirty:
-            self._sorted_ladders()
-
-    def _book_best(self) -> Tuple[float, float, float, float]:
-        bid = self.bid_lvls[0][0] if self.bid_lvls else 0.0
-        ask = self.ask_lvls[0][0] if self.ask_lvls else 0.0
-        bsz = self.bid_lvls[0][1] if self.bid_lvls else 0.0
-        asz = self.ask_lvls[0][1] if self.ask_lvls else 0.0
-        return bid, ask, bsz, asz
-
-    def _cum_depth(self, lvls: List[Tuple[float, float]], n: int) -> float:
-        return float(sum(s for _, s in lvls[: n]))
-
-    def _levels_to_xy(self, levels: List[Tuple[float, float]], mid: float, is_bid: bool, K: int) -> Tuple[List[float], List[float]]:
-        xs, ys = [], []
-        cum = 0.0
-        for p, s in levels[:K]:
-            if s <= 0.0:
-                continue
-            cum += s
-            xs.append(cum)
-            ys.append((mid - p) if is_bid else (p - mid))
-        return xs, ys
-
-    def _prune_deque_ms(self, deq: Deque[Tuple[int, Any]], now_ms: int, window_ms: int):
-        while deq and (now_ms - deq[0][0] > window_ms):
-            deq.popleft()
-
-    def _entry_ts(self, entry: Any) -> int:
-        return int(entry if isinstance(entry, (int, float)) else entry[0])
-    
-    def _append_ts_with_guard(
-        self,
-        deq: Deque[int],
-        ts_ms: int,
-        window_ms: int,
-        is_ob_event: bool,
-    ) -> None:
-        """Append a timestamp to a deque, collapsing sub-100ms OB jitter."""
-        if is_ob_event and window_ms == 100 and deq:
-            last_ts = self._entry_ts(deq[-1])
-            if ts_ms - last_ts < self.ob_jitter_guard_ms:
-                deq.pop()
-        deq.append(ts_ms)
-        self._prune_ts_deque(deq, ts_ms, window_ms)
-
-    def _append_tuple_with_guard(
-        self,
-        deq: Deque[Tuple[int, Any]],
-        entry: Tuple[int, Any],
-        ts_ms: int,
-        window_ms: int,
-        is_ob_event: bool,
-    ) -> None:
-        """Append (ts, value...) to deque, merging sub-100ms OB arrivals."""
-        if is_ob_event and window_ms == 100 and deq:
-            last_ts = self._entry_ts(deq[-1])
-            if ts_ms - last_ts < self.ob_jitter_guard_ms:
-                deq.pop()
-        deq.append(entry)
-        self._prune_deque_ms(deq, ts_ms, window_ms)
-
-    def _event_density(self, deq: Deque[int], window_ms: int) -> float:
-        if not deq:
-            return 0.0
-        now = deq[-1]
-        self._prune_ts_deque(deq, now, window_ms)
-        window_secs = window_ms / 1000.0
-        return len(deq) / window_secs if window_secs > 0 else 0.0
-
-    def event_density(self, window_ms: int) -> float:
-        deq = self._event_density_deques.get(int(window_ms))
-        if deq is None:
-            return 0.0
-        return self._event_density(deq, int(window_ms))
-
-    def event_density_100ms(self) -> float:
-        return self.event_density(100)
-
-    def event_density_500ms(self) -> float:
-        return self.event_density(500)
-
-    def event_density_1000ms(self) -> float:
-        return self.event_density(1_000)
-
-    def event_density_3000ms(self) -> float:
-        return self.event_density(3_000)
-
-    def event_density_7500ms(self) -> float:
-        return self.event_density(7_500)
-
-    def _prune_ts_deque(self, deq: Deque[int], now_ms: int, window_ms: int):
-        while deq and (now_ms - deq[0] > window_ms):
-            deq.popleft()
-
-    def _prune_replen_windows(self, now_ms: int):
-        for window, key_map in self.replen_deques.items():
-            max_age = window
-            sums_map = self.replen_sums[window]
-            for key, dq in key_map.items():
-                while dq and (now_ms - dq[0][0] > max_age):
-                    _, val = dq.popleft()
-                    sums_map[key] -= val
-
-    def _record_replenishment(self, ts_ms: int, deltas: Dict[Tuple[str, int, str], float]):
-        if not deltas:
-            return
-        for window in self.replen_windows_ms:
-            key_map = self.replen_deques[window]
-            sums_map = self.replen_sums[window]
-            for key, value in deltas.items():
-                if value <= 0.0:
-                    continue
-                dq = key_map[key]
-                self._append_tuple_with_guard(dq, (ts_ms, value), ts_ms, window, is_ob_event=True)
-                sums_map[key] += value
-
-    def _append_ob_snapshot(
-        self,
-        ts_ms: int,
-        bid1: float,
-        ask1: float,
-        bsz1: float,
-        asz1: float,
-        spread: float,
-        cum_bid3: float,
-        cum_ask3: float,
-        cum_bid5: float,
-        cum_ask5: float,
-    ) -> None:
-        snap = self.OBSnapshot(
-            ts_ms=int(ts_ms),
-            bid1=float(bid1),
-            ask1=float(ask1),
-            bsz1=float(bsz1),
-            asz1=float(asz1),
-            spread=float(spread),
-            cum_bid3=float(cum_bid3),
-            cum_ask3=float(cum_ask3),
-            cum_bid5=float(cum_bid5),
-            cum_ask5=float(cum_ask5),
-        )
-        self._ob_snapshots.append(snap)
-        self._ob_snapshot_ts_ms.append(snap.ts_ms)
-        self._prune_ob_snapshots(ts_ms)
-
-    def _prune_ob_snapshots(self, now_ts_ms: int) -> None:
-        cutoff = int(now_ts_ms) - int(self._ob_snapshot_keep_ms)
-        while self._ob_snapshot_ts_ms and self._ob_snapshot_ts_ms[0] < cutoff:
-            del self._ob_snapshot_ts_ms[0]
-            del self._ob_snapshots[0]
-
-    def get_ob_snapshot_asof(self, cutoff_ts_ms: int) -> Optional["FeatureEngine.OBSnapshot"]:
-        # Strict as-of lookup: returns latest snapshot with snapshot.ts_ms <= cutoff_ts_ms.
-        # Intentionally no nearest-neighbor-by-distance selection.
-        if not self._ob_snapshot_ts_ms:
-            return None
-        idx = bisect_right(self._ob_snapshot_ts_ms, int(cutoff_ts_ms)) - 1
-        if idx < 0:
-            return None
-        return self._ob_snapshots[idx]
-
-    def _replenishment_rates(self) -> Dict[int, Dict[Tuple[str, int, str], float]]:
-        rates: Dict[int, Dict[Tuple[str, int, str], float]] = {}
-        for window in self.replen_windows_ms:
-            scale = float(window) if window > 0 else 1.0
-            rates[window] = {
-                key: self.replen_sums[window][key] / scale
-                for key in self.replen_sums[window]
-            }
-        return rates
-
-    # -------------------------------------------------------------------------
-    # Event ingestion & feature build
-    # -------------------------------------------------------------------------
-    def _parse_event(self, e: Any) -> Tuple[str, int, dict]:
-        """
-        Accepts multiple event shapes:
-        - Tuple ('ob'|'trade', data:dict, ts_ms:int)
-        - Tuple ('ob'|'trade', ts_ms:int, seq:int, data:dict)
-        - Dict-like OB: recognized by orderbook shape (`b`/`a` arrays), not topic/type strings.
-          Timestamp can be provided via `ts` or `cts`, either on the top-level event dict
-          or inside `data`.
-        - Dict-like trade: {'timestamp': float|str, 'price': str|float, 'size': str|float, 'side': 'Buy'|'Sell'|'buy'|'sell', ...}
-        Tuple input behavior is supported and unchanged.
-        Returns: (etype, ts_ms, payload)
-        etype in {'ob','trade'}
-        """
-        # Tuple form
-        if isinstance(e, tuple) and len(e) >= 4 and isinstance(e[0], str):
-            etype = e[0].lower()
-            if etype in {"ob", "trade"}:
-                ts_ms = int(e[1])
-                payload = e[3:]
-                return etype, ts_ms, payload
-
-        if isinstance(e, tuple) and len(e) == 3 and isinstance(e[0], str):
-            etype = e[0].lower()
-            ts_ms = int(e[2])
-            return etype, ts_ms, e[1]
-
-        if isinstance(e, dict):
-            data = e.get("data", e)
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                data = data[0]
-
-            is_ob = (
-                isinstance(data, dict)
-                and ("b" in data or "a" in data)
-                and (isinstance(data.get("b", []), list) or isinstance(data.get("a", []), list))
-            )
-
-            if is_ob:
-                ts_raw = e.get("ts")
-                if ts_raw is None:
-                    ts_raw = e.get("cts")
-                if ts_raw is None and isinstance(data, dict):
-                    ts_raw = data.get("ts")
-                if ts_raw is None and isinstance(data, dict):
-                    ts_raw = data.get("cts")
-                if ts_raw is None:
-                    raise ValueError(f"Missing OB timestamp in event: {e}")
-                return "ob", coerce_ts_ms(ts_raw), e
-            # Trade event?
-            if 'price' in e and 'size' in e and 'side' in e:
-                t_raw = e.get("timestamp")
-                if t_raw is None:
-                    t_raw = e.get("ts")
-                if t_raw is None:
-                    t_raw = e.get("T")
-                if t_raw is None:
-                    raise ValueError(f"Missing trade timestamp in event: {e}")
-
-                try:
-                    ts_ms = coerce_ts_ms(t_raw)
-                except ValueError as exc:
-                    raise ValueError(f"Unparseable trade timestamp in event: {e}") from exc
-
-                return 'trade', ts_ms, e
-
-        raise ValueError(f"Unrecognized event shape: {type(e)} :: {e}")
-
-    def _dispatch_parsed_event(
-        self,
-        etype: str,
-        ts_ms: int,
-        payload: Any,
-    ) -> Tuple[int, np.ndarray, float, bool, float]:
-        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
-        prev_bid_l1 = self.prev_bsz
-        prev_ask_l1 = self.prev_asz
-        prev_bid_l2 = self.prev_bsz2
-        prev_ask_l2 = self.prev_asz2
-
-        self._prune_replen_windows(ts_ms)
-        for window in self._trade_window_deques:
-            self._prune_trade_window(ts_ms, window)
-
-        is_trade = (etype == 'trade')
-        for w, deq in self._event_density_deques.items():
-            self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == 'ob'))
-
-        if etype == 'ob':
-            tp_code, bids, asks = payload
-            t0 = time.perf_counter()
-            self._update_book_from_ob(tp_code, bids, asks)
-            self.timer_book_update_s += time.perf_counter() - t0
-            for window, deq in self._quote_window_deques.items():
-                self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
-        else:
-            t0 = time.perf_counter()
-            self._update_trade_windows(ts_ms, payload, dt_ms)
-            self.timer_trade_update_s += time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        self._ensure_book_ladders()
-        bid1, ask1, bsz1, asz1 = self._book_best()
-        mid = 0.5 * (bid1 + ask1) if (bid1 > 0 and ask1 > 0) else 0.0
-
-        if (bsz1 + asz1) > 0:
-            micro = (ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1)
-            wb = 1.0 / max(bsz1, 1e-12)
-            wa = 1.0 / max(asz1, 1e-12)
-            smart = (bid1 * wb + ask1 * wa) / (wb + wa)
-        else:
-            micro = smart = mid
-
-        spread = max(0.0, ask1 - bid1)
-        spread_bps = 1e4 * spread / max(mid, 1e-12)
-
-        spread_delta_bps: Dict[int, float] = {}
-        for window in self.ob_horizon_compare_windows_ms:
-            target_ts_ms = ts_ms - window
-            ob_snap = self.get_ob_snapshot_asof(target_ts_ms)
-            spread_t_minus_h = ob_snap.spread if ob_snap is not None else spread
-            spread_delta_bps[window] = 1e4 * (spread - spread_t_minus_h) / max(mid, 1e-12)
-
-        ask2 = self.ask_lvls[1][0] if len(self.ask_lvls) > 1 else ask1
-        bid2 = self.bid_lvls[1][0] if len(self.bid_lvls) > 1 else bid1
-        gap_a = max(0.0, ask2 - ask1)
-        gap_b = max(0.0, bid1 - bid2)
-        gap_a_bps = 1e4 * gap_a / max(mid, 1e-12)
-        gap_b_bps = 1e4 * gap_b / max(mid, 1e-12)
-
-        bsz2 = self.bid_lvls[1][1] if len(self.bid_lvls) > 1 else 0.0
-        asz2 = self.ask_lvls[1][1] if len(self.ask_lvls) > 1 else 0.0
-        replen_deltas = {
-            ("bid", 1, "add"): max(bsz1 - prev_bid_l1, 0.0),
-            ("bid", 1, "rem"): max(prev_bid_l1 - bsz1, 0.0),
-            ("ask", 1, "add"): max(asz1 - prev_ask_l1, 0.0),
-            ("ask", 1, "rem"): max(prev_ask_l1 - asz1, 0.0),
-            ("bid", 2, "add"): max(bsz2 - prev_bid_l2, 0.0),
-            ("bid", 2, "rem"): max(prev_bid_l2 - bsz2, 0.0),
-            ("ask", 2, "add"): max(asz2 - prev_ask_l2, 0.0),
-            ("ask", 2, "rem"): max(prev_ask_l2 - asz2, 0.0),
-        }
-        self._record_replenishment(ts_ms, replen_deltas)
-
-        cum_bid_by_level = {lvl: self._cum_depth(self.bid_lvls, lvl) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
-        cum_ask_by_level = {lvl: self._cum_depth(self.ask_lvls, lvl) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
-        cum_bid1 = cum_bid_by_level[1]
-        cum_ask1 = cum_ask_by_level[1]
-        cum_bid3 = cum_bid_by_level[3]
-        cum_ask3 = cum_ask_by_level[3]
-        cum_bid5 = cum_bid_by_level[5]
-        cum_ask5 = cum_ask_by_level[5]
-        cum_bid10 = cum_bid_by_level[10]
-        cum_ask10 = cum_ask_by_level[10]
-
-        if etype == 'ob':
-            self._append_ob_snapshot(ts_ms, bid1, ask1, bsz1, asz1, spread, cum_bid3, cum_ask3, cum_bid5, cum_ask5)
-
-        obi_by_level = {
-            lvl: (cum_bid_by_level[lvl] - cum_ask_by_level[lvl]) / max(cum_bid_by_level[lvl] + cum_ask_by_level[lvl], 1e-12)
-            for lvl in BOOK_DEPTH_FEATURE_LEVELS
-        }
-
-        ofi_by_level: Dict[int, float] = {}
-        ofi_by_level[1] = (bsz1 - prev_bid_l1) - (asz1 - prev_ask_l1)
-        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
-            if lvl == 1:
-                continue
-            ofi_by_level[lvl] = (
-                (cum_bid_by_level[lvl] - self.prev_cum_bid_by_level[lvl])
-                - (cum_ask_by_level[lvl] - self.prev_cum_ask_by_level[lvl])
-            )
-        ofi_l1 = ofi_by_level[1]
-        ofi_l3 = ofi_by_level[3]
-        ofi_l5 = ofi_by_level[5]
-        self.prev_bsz, self.prev_asz = bsz1, asz1
-        self.prev_bsz2, self.prev_asz2 = bsz2, asz2
-        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
-            self.prev_cum_bid_by_level[lvl] = cum_bid_by_level[lvl]
-            self.prev_cum_ask_by_level[lvl] = cum_ask_by_level[lvl]
-
-        obi_l1 = obi_by_level[1]
-        obi_l3 = obi_by_level[3]
-        obi_l5 = obi_by_level[5]
-
-        micro_premia = (micro - mid) / max(spread, 1e-9)
-        smart_premia = (smart - mid) / max(spread, 1e-9)
-
-        xb, yb = self._levels_to_xy(self.bid_lvls, mid, True, 5)
-        xa, ya = self._levels_to_xy(self.ask_lvls, mid, False, 5)
-        slope_b = self._lin_slope(xb, yb)
-        slope_a = self._lin_slope(xa, ya)
-
-        indicator_values = {
-            "bid1": bid1, "ask1": ask1, "mid": mid, "spread_bps": spread_bps,
-            "micro": micro, "smart": smart, "gap_a_bps": gap_a_bps, "gap_b_bps": gap_b_bps,
-            "cum_bid1": cum_bid1, "cum_ask1": cum_ask1, "cum_bid3": cum_bid3, "cum_ask3": cum_ask3,
-            "slope_a": slope_a, "slope_b": slope_b, "obi_l1": obi_l1, "obi_l3": obi_l3, "obi_l5": obi_l5,
-            "ofi_l1": ofi_l1, "ofi_l3": ofi_l3, "ofi_l5": ofi_l5, "micro_premia": micro_premia, "smart_premia": smart_premia,
-        }
-        self._update_indicator_emas(indicator_values, dt_ms)
-
-        for ms in FAST_WINDOWS_MS:
-            self.pressure_by_window[ms] = self._ewma_update(self.pressure_by_window[ms], ofi_l1, dt_ms, ms)
-
-        trade_stats = {ms: self._compute_trade_window_stats(ms, mid) for ms in self.trade_windows}
-        quote_counts = {ms: len(self._quote_window_deques[ms]) for ms in self.trade_windows}
-        vwap_per_ms = {
-            ms: (self.trade_window_state[ms]["pxv_sum"] / self.trade_window_state[ms]["vol_sum"] if self.trade_window_state[ms]["vol_sum"] > 1e-12 else mid)
-            for ms in self.trade_windows
-        }
-        vwap_vs_mid_bps = {ms: (1e4 * ((vwap_per_ms[ms] / max(mid, 1e-12)) - 1.0)) if mid > 0 else 0.0 for ms in self.trade_windows}
-        vwap_vs_micro_bps = {ms: (1e4 * ((vwap_per_ms[ms] / max(micro, 1e-12)) - 1.0)) if micro > 0 else 0.0 for ms in self.trade_windows}
-
-        for ms in self._spread_change_deques:
-            if self.last_spread is None or spread != self.last_spread:
-                self._append_ts_with_guard(self._spread_change_deques[ms], ts_ms, ms, is_ob_event=True)
-            else:
-                self._prune_ts_deque(self._spread_change_deques[ms], ts_ms, ms)
-        if self.last_spread is None or spread != self.last_spread:
-            self.last_spread = spread
-            self.last_spread_ts = ts_ms
-
-        bid_level_changed = (self.last_bid1 is None or bid1 != self.last_bid1 or bsz1 != prev_bid_l1)
-        ask_level_changed = (self.last_ask1 is None or ask1 != self.last_ask1 or asz1 != prev_ask_l1)
-        for ms, dq in self._bid1_change_deques.items():
-            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if bid_level_changed else self._prune_ts_deque(dq, ts_ms, ms)
-        for ms, dq in self._ask1_change_deques.items():
-            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if ask_level_changed else self._prune_ts_deque(dq, ts_ms, ms)
-        if bid_level_changed:
-            self.last_bid1_update_ts = ts_ms
-        if ask_level_changed:
-            self.last_ask1_update_ts = ts_ms
-        self.last_bid1, self.last_ask1 = bid1, ask1
-
-        for ms, deq in self.sz_delta_deques.items():
-            bid_dep = min(bsz1 - prev_bid_l1, 0.0)
-            ask_dep = min(asz1 - prev_ask_l1, 0.0)
-            deq.append((ts_ms, bid_dep, ask_dep))
-            sums = self.sz_delta_sums[ms]
-            sums["bid"] += bid_dep
-            sums["ask"] += ask_dep
-            while deq and (ts_ms - deq[0][0] > ms):
-                _, old_bid, old_ask = deq.popleft()
-                sums["bid"] -= old_bid
-                sums["ask"] -= old_ask
-        neg_depletion = {
-            ms: (self.sz_delta_sums[ms]["bid"], self.sz_delta_sums[ms]["ask"])
-            for ms in self.sz_delta_deques
-        }
-
-        dt_since_trade = float(ts_ms - self.last_trade_ts) if self.last_trade_ts is not None else 0.0
-        dt_since_bid1_update = float(ts_ms - self.last_bid1_update_ts) if self.last_bid1_update_ts is not None else 0.0
-        dt_since_ask1_update = float(ts_ms - self.last_ask1_update_ts) if self.last_ask1_update_ts is not None else 0.0
-
-        self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
-        return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
-        return_std = {ms: math.sqrt(var) for ms, var in return_var.items()}
-        vr_adjacent = {}
-        for prev_ms, cur_ms in zip(self.return_windows_ms[:-1], self.return_windows_ms[1:]):
-            var_prev = return_var[prev_ms]
-            var_cur = return_var[cur_ms]
-            vr_adjacent[(cur_ms, prev_ms)] = (var_cur / max((cur_ms / prev_ms) * var_prev, 1e-12)) if var_prev > 0 else 0.0
-
-        regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
-        regime_realized = {ms: self.realized_vol[ms] for ms in self.regime_windows_ms}
-        regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
-        for ms in self.regime_windows_ms:
-            nearest = min(self.trade_windows, key=lambda w: abs(w - ms))
-            self.flow_regime[ms] = trade_stats[nearest]["imbalance"]
-        regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
-
-        rsi_vals = []
-        for hl in EMA_HALF_LIVES_MS:
-            ema_micro = self.ema_states[hl]["micro"] if self.ema_states[hl]["micro"] is not None else micro
-            delta = micro - ema_micro
-            state = self.rsi_state[hl]
-            state["gain"] = self._ewma_update(state["gain"], max(delta, 0.0), dt_ms, hl)
-            state["loss"] = self._ewma_update(state["loss"], max(-delta, 0.0), dt_ms, hl)
-            rs = state["gain"] / max(state["loss"], 1e-12)
-            rsi_vals.append(100.0 - 100.0 / (1.0 + rs))
-
-        def ema_ms(prev: Optional[float], x: float, hl_ms: float) -> float:
-            a = 1.0 - math.exp(-dt_ms / max(1.0, hl_ms))
-            return x if prev is None else ((1.0 - a) * prev + a * x)
-
-        macd_features = []
-        for idx, (fast_ms, slow_ms, sig_ms) in enumerate(MACD_TRIPLETS_MS):
-            st = self.macd_state[idx]
-            st["fast"] = ema_ms(st["fast"], micro, float(fast_ms))
-            st["slow"] = ema_ms(st["slow"], micro, float(slow_ms))
-            raw = float(st["fast"] - st["slow"])
-            st["signal"] = ema_ms(st["signal"], raw, float(sig_ms))
-            sig = float(st["signal"])
-            macd_features.extend([raw, sig, raw - sig])
-
-        cci_features = []
-        for hl in EMA_HALF_LIVES_MS:
-            st = self.cci_state[hl]
-            st["mean"] = ema_ms(st["mean"], micro, float(hl))
-            mad = abs(micro - float(st["mean"]))
-            st["mad"] = ema_ms(st["mad"], mad, float(hl))
-            cci_features.append(0.015 * ((micro - float(st["mean"])) / max(float(st["mad"]), 1e-12)))
-
-        vpin_features = []
-        for secs in self.vpin_bucket_secs:
-            phi = self.vpin_state[secs]["phi"]
-            vpin_features.append((sum(phi) / len(phi)) if phi else 0.0)
-
-        replen_rates = self._replenishment_rates()
-
-        # Canonical order:
-        # 1) instantaneous; 2) fast-window OB/spread/churn/depletion/replen; 3) flow-window trade/quote/VWAP;
-        # 4) flow-window return std/VR; 5) regime-window summaries; 6) pressure; 7) EMA bank; 8) EMA residuals;
-        # 9) RSI; 10) MACD; 11) CCI; 12) VPIN.
-        feat_list = [
-            bid1, ask1, mid, micro, smart, spread_bps, gap_a_bps, gap_b_bps,
-            bsz1, asz1,
-        ]
-        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
-            feat_list.extend([cum_bid_by_level[lvl], cum_ask_by_level[lvl]])
-        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
-            feat_list.append(obi_by_level[lvl])
-        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
-            feat_list.append(ofi_by_level[lvl])
-        feat_list.extend([
-            slope_a, slope_b,
-            micro_premia, smart_premia,
-            dt_since_trade, dt_since_bid1_update, dt_since_ask1_update,
-            float(self.last_tick_sign), float(self.last_is_zero_tick), float(self.last_is_rpi),
-        ])
-
-        for ms in FAST_WINDOWS_MS:
-            feat_list.extend([
-                spread_delta_bps.get(ms, 0.0),
-                float(len(self._spread_change_deques[ms])),
-                float(len(self._bid1_change_deques[ms])),
-                float(len(self._ask1_change_deques[ms])),
-                neg_depletion[ms][0], neg_depletion[ms][1],
-            ])
-            rates = replen_rates[ms]
-            for level in (1, 2):
-                feat_list.extend([rates[("bid", level, "add")], rates[("bid", level, "rem")], rates[("ask", level, "add")], rates[("ask", level, "rem")]])
-
-        for ms in FLOW_WINDOWS_MS:
-            stats = trade_stats[ms]
-            feat_list.extend([
-                stats["buy_vol"], stats["sell_vol"], stats["buy_cnt"], stats["sell_cnt"],
-                stats["buy_mean"], stats["sell_mean"], stats["buy_max"], stats["sell_max"],
-                stats["net_flow"], stats["imbalance"], stats["toxicity"], stats["trade_through"],
-                float(quote_counts[ms]), vwap_vs_mid_bps[ms], vwap_vs_micro_bps[ms],
-            ])
-
-        for ms in FLOW_WINDOWS_MS:
-            feat_list.append(return_std[ms])
-        for prev_ms, cur_ms in zip(FLOW_WINDOWS_MS[:-1], FLOW_WINDOWS_MS[1:]):
-            feat_list.append(vr_adjacent[(cur_ms, prev_ms)])
-
-        for ms in REGIME_WINDOWS_MS:
-            feat_list.extend([regime_volume[ms], regime_realized[ms], regime_vol_ewma[ms], regime_flow_snapshot[ms]])
-
-        for ms in FAST_WINDOWS_MS:
-            feat_list.append(self.pressure_by_window[ms])
-
-        for hl in self.ema_half_lives_ms:
-            state = self.ema_states[hl]
-            for name in self.ema_indicator_names:
-                feat_list.append(state[name] if state[name] is not None else indicator_values[name])
-        for hl in self.ema_half_lives_ms:
-            state = self.ema_states[hl]
-            for name in self.ema_indicator_names:
-                ema_val = state[name] if state[name] is not None else indicator_values[name]
-                feat_list.append(indicator_values[name] - ema_val)
-
-        feat_list.extend(rsi_vals)
-        feat_list.extend(macd_features)
-        feat_list.extend(cci_features)
-        feat_list.extend(vpin_features)
-
-        feat = np.array(feat_list, dtype=np.float64)
-        feat_z = self._zscore(feat, dt_ms)
-        self.last_ts = ts_ms
-        self._last_event_ts = ts_ms
-
-        self.timer_feature_build_s += time.perf_counter() - t0
-        return ts_ms, feat_z, mid, is_trade, dt_ms
-
-    def _update_book_from_ob(
-        self,
-        tp_code: int,
-        bids: Sequence[Tuple[float, float]],
-        asks: Sequence[Tuple[float, float]],
-    ) -> None:
+    def _update_book_from_ob(self, tp_code: int, bids: Sequence[Tuple[float, float]], asks: Sequence[Tuple[float, float]]) -> None:
         if int(tp_code) == 1:
-            self.bids = {float(p): float(q) for p, q in bids[: self.depth]}
-            self.asks = {float(p): float(q) for p, q in asks[: self.depth]}
-            self._sorted_ladders()
-            return
-
-        rebuild_bid = self._apply_side_updates(self.bids, self.bid_lvls, bids, is_bid=True)
-        rebuild_ask = self._apply_side_updates(self.asks, self.ask_lvls, asks, is_bid=False)
-        self._book_dirty = bool(rebuild_bid or rebuild_ask)
-
-    def _interpret_tick_direction(self, tick_dir: Any) -> Tuple[int, int]:
-        tick_sign = 0
-        is_zero_tick = 0
-
-        if isinstance(tick_dir, (int, float)):
-            if tick_dir > 0:
-                tick_sign = 1
-            elif tick_dir < 0:
-                tick_sign = -1
-            else:
-                tick_sign = 0
-                is_zero_tick = 1
-        elif isinstance(tick_dir, str):
-            norm = tick_dir.strip().lower()
-            cleaned = norm.replace("-", "").replace("_", "").replace(" ", "")
-            if 'plus' in cleaned or cleaned in {"plustick", "uptick", "up", "buy", "bid"}:
-                tick_sign = 1
-            elif 'minus' in cleaned or cleaned in {"minustick", "downtick", "down", "sell", "ask"}:
-                tick_sign = -1
-            elif cleaned in {"zerotick", "flat", "unchanged", "0"}:
-                tick_sign = 0
-            if 'zero' in cleaned or cleaned in {"zerotick", "flat", "unchanged", "0"}:
-                is_zero_tick = 1
-
-        return int(tick_sign), int(is_zero_tick)
-
-    def _update_trade_windows(self, ts_ms: int, trade_evt: Any, dt_ms: float):
-        if isinstance(trade_evt, tuple):
-            price, size, side_code, tick_dir_code, is_rpi = trade_evt
-            side = 'buy' if int(side_code) > 0 else 'sell' if int(side_code) < 0 else 'unknown'
-            price = float(price)
-            size = float(size)
-            tick_sign = int(tick_dir_code)
-            is_zero_tick = 1 if int(tick_dir_code) == 0 else 0
-            is_rpi = int(is_rpi)
+            self.bids = {float(p): float(q) for p, q in bids[: self.depth] if float(q) > 0}
+            self.asks = {float(p): float(q) for p, q in asks[: self.depth] if float(q) > 0}
         else:
-            side = str(trade_evt['side']).lower()  # 'buy'|'sell'
-            price = float(trade_evt['price'])
-            size = float(trade_evt['size'])
+            for p, q in bids:
+                p, q = float(p), float(q)
+                if q <= 0: self.bids.pop(p, None)
+                else: self.bids[p] = q
+            for p, q in asks:
+                p, q = float(p), float(q)
+                if q <= 0: self.asks.pop(p, None)
+                else: self.asks[p] = q
+        self._sorted_ladders()
 
-            tick_dir = trade_evt.get("tickDirection")
-            tick_sign = int(self.last_tick_sign)
-            is_zero_tick = int(self.last_is_zero_tick)
-            is_rpi = int(self.last_is_rpi)
+    def _empty_trade_stats(self) -> Dict[str, float]:
+        return {
+            "buy_cnt":0.0,"sell_cnt":0.0,"buy_vol_base":0.0,"sell_vol_base":0.0,"buy_notional_usd":0.0,"sell_notional_usd":0.0,
+            "signed_notional_usd":0.0,"signed_trade_count":0.0,"plus_tick_count":0.0,"minus_tick_count":0.0,"zero_tick_count":0.0,
+            "pxv_sum":0.0,"vol_sum":0.0,"buy_max_notional_q":0.0,"sell_max_notional_q":0.0,
+        }
 
-            rpi_raw = trade_evt.get("RPI")
-            if rpi_raw is None:
-                rpi_raw = trade_evt.get("rpi")
-
-            if rpi_raw is not None:
-                if isinstance(rpi_raw, str):
-                    rpi_norm = rpi_raw.strip().lower()
-                    if rpi_norm in {"1", "true", "t", "yes", "y"}:
-                        is_rpi = 1
-                    elif rpi_norm in {"0", "false", "f", "no", "n", ""}:
-                        is_rpi = 0
-                    else:
-                        try:
-                            is_rpi = 1 if float(rpi_norm) != 0.0 else 0
-                        except ValueError:
-                            pass
-                else:
-                    try:
-                        is_rpi = 1 if float(rpi_raw) != 0.0 else 0
-                    except (TypeError, ValueError):
-                        pass
-
-            if tick_dir is not None:
-                tick_sign, is_zero_tick = self._interpret_tick_direction(tick_dir)
-
+    def _update_trade_windows(self, ts_ms: int, payload: Any, dt_ms: float) -> None:
+        price, size, side_code = float(payload[0]), float(payload[1]), int(payload[2])
+        side_sign = 1 if side_code > 0 else -1 if side_code < 0 else 0
+        side = "buy" if side_sign > 0 else "sell" if side_sign < 0 else "unknown"
+        tick_sign = int(payload[3]) if len(payload) > 3 else 0
+        is_zero_tick = 1 if tick_sign == 0 else 0
         if self.last_trade_price is not None:
-            if price > self.last_trade_price:
-                tick_sign, is_zero_tick = 1, 0
-            elif price < self.last_trade_price:
-                tick_sign, is_zero_tick = -1, 0
-            else:
-                if tick_sign == 0 and is_zero_tick == 0:
-                    tick_sign = self.last_tick_sign if self.last_tick_sign != 0 else 0
-                if is_zero_tick == 0:
-                    is_zero_tick = 1
-        else:
-            if tick_sign == 0 and is_zero_tick == 0:
-                tick_sign, is_zero_tick = 0, 0
-
-        self.last_tick_sign = tick_sign
-        self.last_is_zero_tick = is_zero_tick
+            if price > self.last_trade_price: tick_sign, is_zero_tick = 1, 0
+            elif price < self.last_trade_price: tick_sign, is_zero_tick = -1, 0
+            else: is_zero_tick = 1
         self.last_trade_price = price
-        self.last_is_rpi = is_rpi
-
-        entry = (ts_ms, price, size, side, tick_sign, is_zero_tick)
-        for window, deq in self._trade_window_deques.items():
-            deq.append(entry)
-            self._update_trade_window_state_with_insert(window, entry)
-
-        dt_trade_ms = (
-            max(1.0, float(ts_ms - self.last_trade_ts))
-            if self.last_trade_ts is not None
-            else max(1.0, float(dt_ms))
-        )
-
-        # Update volume-regime (vol/sec) EWMAs using trade-arrival timing
-        vol_rate = size / (dt_trade_ms / 1000.0)  # base per second
-        for hl in self.regime_windows_ms:
-            self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
-
-        # VPIN bucket sizing and accumulation per configured bucket scale
-        v_per_sec = max(self.volume_ewma[15_000], 1e-9)
-        for secs, st in self.vpin_state.items():
-            Vb = max(v_per_sec * float(secs), 1e-9)
-            st["Vb"] = Vb if st["Vb"] is None else (0.9 * st["Vb"] + 0.1 * Vb)
-            if side == 'buy':
-                st["cum_buy"] += size
-            else:
-                st["cum_sell"] += size
-            st["cum"] += size
-
-            while st["cum"] >= (st["Vb"] or 1e9):
-                if st["Vb"] is None:
-                    break
-                total = max(st["cum"], 1e-12)
-                scale = st["Vb"] / total
-                buy_bucket = st["cum_buy"] * scale
-                sell_bucket = st["cum_sell"] * scale
-                phi = abs(buy_bucket - sell_bucket) / max(st["Vb"], 1e-12)
-                st["phi"].append(phi)
-                st["cum_buy"] -= buy_bucket
-                st["cum_sell"] -= sell_bucket
-                st["cum"] -= st["Vb"]
-
+        notional = price * size
+        entry = (ts_ms, price, size, notional, side, side_sign, tick_sign, is_zero_tick)
+        for ms, dq in self._trade_window_deques.items():
+            dq.append(entry)
+            while dq and ts_ms - dq[0][0] > ms:
+                dq.popleft()
+        for ms in self.trade_windows:
+            dq = self._trade_window_deques[ms]
+            st = self._empty_trade_stats()
+            for _, px, sz, nt, s, ss, tsign, zt in dq:
+                st["pxv_sum"] += px * sz; st["vol_sum"] += sz
+                if tsign > 0: st["plus_tick_count"] += 1
+                elif tsign < 0: st["minus_tick_count"] += 1
+                else: st["zero_tick_count"] += 1
+                if ss > 0:
+                    st["buy_cnt"] += 1; st["buy_vol_base"] += sz; st["buy_notional_usd"] += nt; st["buy_max_notional_q"] = max(st["buy_max_notional_q"], nt)
+                    st["signed_notional_usd"] += nt; st["signed_trade_count"] += 1
+                elif ss < 0:
+                    st["sell_cnt"] += 1; st["sell_vol_base"] += sz; st["sell_notional_usd"] += nt; st["sell_max_notional_q"] = max(st["sell_max_notional_q"], nt)
+                    st["signed_notional_usd"] -= nt; st["signed_trade_count"] -= 1
+            self._trade_stats[ms] = st
+        if side_sign != 0:
+            self.cvd_notional += side_sign * notional
+            self._cvd_history.append((ts_ms, self.cvd_notional))
+            while self._cvd_history and ts_ms - self._cvd_history[0][0] > (max(FLOW_WINDOWS_MS) + 5000):
+                self._cvd_history.popleft()
+        if notional >= 100_000:
+            if side_sign > 0: self.last_large_buy_ts = ts_ms
+            elif side_sign < 0: self.last_large_sell_ts = ts_ms
+        dt_trade_ms = max(1.0, float(ts_ms - self.last_trade_ts)) if self.last_trade_ts is not None else max(1.0, dt_ms)
+        vol_rate = size / (dt_trade_ms / 1000.0)
+        for hl in REGIME_WINDOWS_MS:
+            a = self._alpha(dt_trade_ms, float(hl))
+            self.volume_ewma[hl] = (1 - a) * self.volume_ewma[hl] + a * vol_rate
         self.last_trade_ts = ts_ms
 
     def _add_return(self, ts_ms: int, mid: float, is_ob_event: bool):
         if mid <= 0.0:
             return 0.0
-    
         if self.last_mid_for_ret is None:
             self.last_mid_for_ret = mid
             return 0.0
-    
-        # Do not let trade-only rows inject zero mid returns into OB-return statistics.
         if not is_ob_event:
             return 0.0
-            
-        r = (1e4 * math.log(mid / self.last_mid_for_ret)) if self.last_mid_for_ret > 0 else 0.0
+        r = 1e4 * math.log(mid / self.last_mid_for_ret)
         self.last_mid_for_ret = mid
-
-        for stats in self.return_histories.values():
-            stats.add(ts_ms, r)
-
-        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
+        for ms, deq in self.return_histories.items():
+            self._append_tuple_with_guard(deq, (ts_ms, r), ts_ms, ms, is_ob_event)
+        for ms, deq in self._regime_return_deques.items():
+            self._append_tuple_with_guard(deq, (ts_ms, r), ts_ms, ms, is_ob_event)
+            self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in deq))
+        dt_ms = 1.0 if self.last_ts is None else max(1.0, ts_ms - self.last_ts)
         r2 = r * r
-        for hl in self.regime_windows_ms:
-            self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
-
-        for ms, stats in self._regime_return_deques.items():
-            stats.add(ts_ms, r)
-            self.realized_vol[ms] = math.sqrt(max(0.0, stats.sumsq))
+        for hl in REGIME_WINDOWS_MS:
+            a = self._alpha(dt_ms, float(hl))
+            self.rv_ewma[hl] = (1 - a) * self.rv_ewma[hl] + a * r2
         return r
 
-    def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
-        """Per-feature EWMA mean/var rolling z-score.
-    
-        Keep running mean / second moment in float64 for numerical stability.
-        Emit float32 z-scores to preserve the dataset/model contract.
-        """
-        eps = 1e-9
-        x64 = x.astype(np.float64, copy=False)
+    def _event_density(self, window_ms: int) -> float:
+        deq = self._event_density_deques.get(int(window_ms))
+        return float(len(deq)) if deq is not None else 0.0
 
-        if self._feat_dim is None:
-            self._feat_dim = int(x.shape[0])
-            self.z_mean = x64.copy()
-            self.z_m2 = np.square(x64, dtype=np.float64)
-            return np.zeros_like(x, dtype=np.float32)
+    def event_density_1000ms(self) -> float: return self._event_density(1_000)
+    def event_density_3000ms(self) -> float: return self._event_density(3_000)
+    def event_density_7500ms(self) -> float: return self._event_density(7_500)
+    def event_density_15000ms(self) -> float: return self._event_density(15_000)
+    def event_density_30000ms(self) -> float: return self._event_density(30_000)
+    def event_density_60000ms(self) -> float: return self._event_density(60_000)
 
-        hl = self._alpha_half_life_ms(self.z_hl_ms)
-        alpha = float(1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl)))
-        one_minus_alpha = 1.0 - alpha
-
-        # Update EWMA mean and second moment in float64
-        self.z_mean = one_minus_alpha * self.z_mean + alpha * x64
-        self.z_m2 = one_minus_alpha * self.z_m2 + alpha * np.square(x64, dtype=np.float64)
-
-        var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
-        z = (x64 - self.z_mean) / np.sqrt(var)
-
-        return z.astype(np.float32, copy=False)
-
-    # -------------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------------
-    def on_fast_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
-        """Fast ingest path for compact tuples emitted by offline_ingest.py."""
+    def _dispatch_parsed_event(self, etype: str, ts_ms: int, payload: Any):
         t0 = time.perf_counter()
-        if not isinstance(e, tuple) or len(e) < 4 or not isinstance(e[0], str):
-            raise ValueError(f"Expected compact ingest tuple, got: {e!r}")
-        etype = e[0].lower()
-        ts_ms = int(e[1])
-        if etype == 'ob':
-            payload = (int(e[3]), e[4], e[5])
-        elif etype == 'trade':
-            payload = e[3:8]
-        else:
-            raise ValueError(f"Unsupported compact event type: {etype!r}")
-        self.timer_parse_dispatch_s += time.perf_counter() - t0
-        return self._dispatch_parsed_event(etype, ts_ms, payload)
+        is_trade = etype == "trade"
+        prev_ts = self.last_ts
+        dt_ms = 0.0 if prev_ts is None else max(0.0, float(ts_ms - prev_ts))
 
-    def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
-        """Slow compatibility path for callers that still pass generic event shapes."""
+        if is_trade:
+            self._update_trade_windows(ts_ms, payload, dt_ms)
+        else:
+            tp, bids, asks = payload
+            self._update_book_from_ob(tp, bids, asks)
+            for ms, deq in self._quote_window_deques.items():
+                deq.append(ts_ms)
+                while deq and ts_ms - deq[0] > ms: deq.popleft()
+
+        for w, deq in self._event_density_deques.items():
+            deq.append(ts_ms)
+            while deq and ts_ms - deq[0] > w: deq.popleft()
+
+        if not self.bid_lvls or not self.ask_lvls:
+            z = np.zeros((len(self.feature_names()),), dtype=np.float32)
+            self.last_ts = ts_ms
+            return ts_ms, z, 0.0, is_trade, dt_ms
+
+        bid1, bsz1 = self.bid_lvls[0]
+        ask1, asz1 = self.ask_lvls[0]
+        if bid1 <= 0 or ask1 <= 0 or ask1 < bid1:
+            raise ValueError(f"Invalid top-of-book: bid1={bid1}, ask1={ask1}")
+
+        mid = 0.5 * (bid1 + ask1)
+        spread = max(ask1 - bid1, 1e-12)
+        spread_bps = 1e4 * spread / max(mid, 1e-12)
+        micro = (ask1 * bsz1 + bid1 * asz1) / max(bsz1 + asz1, 1e-12)
+
+        if self.last_bid1 is None or bid1 != self.last_bid1:
+            self.last_bid_price_change_ts = ts_ms
+            self.current_bid_lifetime_start_ts = ts_ms
+        if self.last_ask1 is None or ask1 != self.last_ask1:
+            self.last_ask_price_change_ts = ts_ms
+            self.current_ask_lifetime_start_ts = ts_ms
+        if self.last_mid is None or mid != self.last_mid:
+            self.last_mid_change_ts = ts_ms
+        if self.last_spread_bps is not None:
+            if spread_bps > self.last_spread_bps: self.last_spread_widen_ts = ts_ms
+            elif spread_bps < self.last_spread_bps: self.last_spread_tighten_ts = ts_ms
+        self.last_bid1, self.last_ask1, self.last_mid, self.last_spread_bps = bid1, ask1, mid, spread_bps
+
+        self._append_price_history(ts_ms, mid, micro)
+        self._add_return(ts_ms, mid, is_ob_event=(etype == "ob"))
+
+        gap_a_bps = 0.0 if len(self.ask_lvls) < 2 else 1e4 * (self.ask_lvls[1][0] - ask1) / max(mid, 1e-12)
+        gap_b_bps = 0.0 if len(self.bid_lvls) < 2 else 1e4 * (bid1 - self.bid_lvls[1][0]) / max(mid, 1e-12)
+        micro_premia = (micro - mid) / max(spread, 1e-9)
+        micro_minus_mid_bps = 1e4 * (micro / max(mid, 1e-12) - 1.0)
+        micro_minus_mid_over_spread = (micro - mid) / max(spread, 1e-9)
+
+        cum_bid = {lvl: float(sum(s for _, s in self.bid_lvls[:lvl])) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
+        cum_ask = {lvl: float(sum(s for _, s in self.ask_lvls[:lvl])) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
+        obi = {lvl: self._safe_div(cum_bid[lvl] - cum_ask[lvl], cum_bid[lvl] + cum_ask[lvl]) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
+        ofi = {lvl: (cum_bid[lvl] - cum_ask[lvl]) for lvl in BOOK_DEPTH_FEATURE_LEVELS}
+
+        depth_bands = {}
+        for band in BPS_DEPTH_BANDS:
+            bd = self._depth_within_bps(self.bid_lvls, mid, float(band), True)
+            ad = self._depth_within_bps(self.ask_lvls, mid, float(band), False)
+            depth_bands[band] = (bd, ad)
+
+        slip = {}
+        for n in SLIPPAGE_NOTIONAL_USD:
+            slip[(n, "buy")] = self._slippage_for_notional(self.ask_lvls, mid, n, True)
+            slip[(n, "sell")] = self._slippage_for_notional(self.bid_lvls, mid, n, False)
+
+        session = self._compute_session_features(ts_ms)
+
+        feat_map: Dict[str, float] = {}
+        feat_map.update(session)
+
+        mid_ret_map = {}
+        for w in PRICE_WINDOWS_MS:
+            past_mid = self._price_asof(self._mid_history, ts_ms - w)
+            past_micro = self._price_asof(self._micro_history, ts_ms - w)
+            mid_ret = self._bps_return(mid, past_mid if past_mid > 0 else mid)
+            micro_ret = self._bps_return(micro, past_micro if past_micro > 0 else micro)
+            mid_ret_map[w] = mid_ret
+            pts = self._window_price_points(ts_ms, w, "mid")
+            tsv = [t for t, _ in pts]; yv = [v for _, v in pts]
+            slope_raw, r2 = self._rolling_slope_r2(tsv, yv)
+            slope_bps = 1e4 * self._safe_div(slope_raw, max(mid, 1e-9), 0.0)
+            pos, d_hi, d_lo, rng, br_up, br_dn = self._range_position(yv, mid)
+            rets = [self._bps_return(yv[i], yv[i-1]) for i in range(1, len(yv))] if len(yv) >= 2 else []
+            if rets:
+                sgn = np.sign(rets)
+                sign_p = abs(float(np.sum(sgn))) / len(rets)
+                up_frac = float(np.mean(np.asarray(rets) > 0.0))
+                if len(rets) >= 3 and np.std(rets[:-1]) > 1e-12 and np.std(rets[1:]) > 1e-12:
+                    ac = float(np.corrcoef(rets[:-1], rets[1:])[0, 1])
+                else:
+                    ac = 0.0
+            else:
+                sign_p = up_frac = ac = 0.0
+            feat_map[f"mid_ret_bps_{w}ms"] = mid_ret
+            feat_map[f"micro_ret_bps_{w}ms"] = micro_ret
+            feat_map[f"mid_slope_bps_per_sec_{w}ms"] = slope_bps
+            feat_map[f"mid_trend_r2_{w}ms"] = r2
+            feat_map[f"mid_position_in_range_{w}ms"] = pos
+            feat_map[f"mid_dist_to_high_bps_{w}ms"] = d_hi
+            feat_map[f"mid_dist_to_low_bps_{w}ms"] = d_lo
+            feat_map[f"mid_range_bps_{w}ms"] = rng
+            feat_map[f"mid_breakout_up_{w}ms"] = br_up
+            feat_map[f"mid_breakout_down_{w}ms"] = br_dn
+            feat_map[f"sign_persistence_{w}ms"] = sign_p
+            feat_map[f"up_return_fraction_{w}ms"] = up_frac
+            feat_map[f"return_autocorr_lag1_{w}ms"] = ac
+
+        feat_map.update({
+            "spread_bps": spread_bps, "gap_a_bps": gap_a_bps, "gap_b_bps": gap_b_bps, "bsz1": bsz1, "asz1": asz1,
+            "micro_premia": micro_premia, "micro_minus_mid_bps": micro_minus_mid_bps, "micro_minus_mid_over_spread": micro_minus_mid_over_spread,
+            "time_since_trade_ms": float(ts_ms - self.last_trade_ts) if self.last_trade_ts is not None else 0.0,
+            "time_since_bid_price_change_ms": float(ts_ms - self.last_bid_price_change_ts) if self.last_bid_price_change_ts is not None else 0.0,
+            "time_since_ask_price_change_ms": float(ts_ms - self.last_ask_price_change_ts) if self.last_ask_price_change_ts is not None else 0.0,
+            "time_since_mid_change_ms": float(ts_ms - self.last_mid_change_ts) if self.last_mid_change_ts is not None else 0.0,
+            "time_since_spread_widen_ms": float(ts_ms - self.last_spread_widen_ts) if self.last_spread_widen_ts is not None else 0.0,
+            "time_since_spread_tighten_ms": float(ts_ms - self.last_spread_tighten_ts) if self.last_spread_tighten_ts is not None else 0.0,
+            "best_bid_lifetime_ms": float(ts_ms - self.current_bid_lifetime_start_ts) if self.current_bid_lifetime_start_ts is not None else 0.0,
+            "best_ask_lifetime_ms": float(ts_ms - self.current_ask_lifetime_start_ts) if self.current_ask_lifetime_start_ts is not None else 0.0,
+            "mid_price_staleness_ms": float(ts_ms - self.last_mid_change_ts) if self.last_mid_change_ts is not None else 0.0,
+        })
+
+        for lvl in BOOK_DEPTH_FEATURE_LEVELS:
+            feat_map[f"cum_bid_l{lvl}"] = cum_bid[lvl]
+            feat_map[f"cum_ask_l{lvl}"] = cum_ask[lvl]
+            feat_map[f"obi_l{lvl}"] = obi[lvl]
+            feat_map[f"ofi_l{lvl}"] = ofi[lvl]
+        bd5 = depth_bands[5.0][0]["size"]; ad5 = depth_bands[5.0][1]["size"]
+        for lvl in NORMALIZED_OFI_LEVELS:
+            feat_map[f"ofi_l{lvl}_over_depth_l{lvl}"] = self._safe_div(ofi[lvl], cum_bid[lvl] + cum_ask[lvl])
+            feat_map[f"ofi_l{lvl}_over_spread_bps"] = self._safe_div(ofi[lvl], max(spread_bps, 0.1))
+            feat_map[f"ofi_l{lvl}_over_depth_5bps"] = self._safe_div(ofi[lvl], bd5 + ad5)
+
+        for band in BPS_DEPTH_BANDS:
+            bd, ad = depth_bands[band]
+            b = str(band).replace('.', 'p')
+            feat_map[f"bid_depth_within_{b}bps"] = bd["size"]
+            feat_map[f"ask_depth_within_{b}bps"] = ad["size"]
+            feat_map[f"bid_notional_within_{b}bps"] = bd["notional"]
+            feat_map[f"ask_notional_within_{b}bps"] = ad["notional"]
+            feat_map[f"depth_imbalance_within_{b}bps"] = self._safe_div(bd["size"] - ad["size"], bd["size"] + ad["size"])
+            feat_map[f"notional_imbalance_within_{b}bps"] = self._safe_div(bd["notional"] - ad["notional"], bd["notional"] + ad["notional"])
+        for band in BOOK_SHAPE_BANDS:
+            bd, ad = depth_bands[band]
+            b = str(band).replace('.', 'p')
+            feat_map[f"max_bid_size_within_{b}bps"] = bd["max_size"]
+            feat_map[f"max_ask_size_within_{b}bps"] = ad["max_size"]
+            feat_map[f"max_bid_notional_within_{b}bps"] = bd["max_notional"]
+            feat_map[f"max_ask_notional_within_{b}bps"] = ad["max_notional"]
+            feat_map[f"dist_to_max_bid_wall_bps_within_{b}bps"] = bd["dist_to_max_bps"]
+            feat_map[f"dist_to_max_ask_wall_bps_within_{b}bps"] = ad["dist_to_max_bps"]
+            feat_map[f"bid_depth_hhi_within_{b}bps"] = bd["hhi"]
+            feat_map[f"ask_depth_hhi_within_{b}bps"] = ad["hhi"]
+            feat_map[f"bid_top1_share_within_{b}bps"] = bd["top1_share"]
+            feat_map[f"ask_top1_share_within_{b}bps"] = ad["top1_share"]
+
+        feat_map["book_slope_bid_top5"] = self._rolling_slope_r2(list(range(min(5, len(self.bid_lvls)))), [p for p, _ in self.bid_lvls[:5]])[0]
+        feat_map["book_slope_ask_top5"] = self._rolling_slope_r2(list(range(min(5, len(self.ask_lvls)))), [p for p, _ in self.ask_lvls[:5]])[0]
+        feat_map["book_slope_bid_5bps"] = 0.0
+        feat_map["book_slope_ask_5bps"] = 0.0
+        feat_map["book_convexity_bid_10bps"] = 0.0
+        feat_map["book_convexity_ask_10bps"] = 0.0
+
+        for n in SLIPPAGE_NOTIONAL_USD:
+            k = f"{int(n)}usd"
+            sb, ss = slip[(n, "buy")], slip[(n, "sell")]
+            feat_map[f"slippage_bps_to_buy_{k}"] = sb["slippage_bps"]
+            feat_map[f"slippage_bps_to_sell_{k}"] = ss["slippage_bps"]
+            feat_map[f"depth_needed_bps_to_buy_{k}"] = sb["depth_needed_bps"]
+            feat_map[f"depth_needed_bps_to_sell_{k}"] = ss["depth_needed_bps"]
+            feat_map[f"filled_fraction_to_buy_{k}"] = sb["filled_fraction"]
+            feat_map[f"filled_fraction_to_sell_{k}"] = ss["filled_fraction"]
+
+        if self._feature_names_cache is None:
+            self._feature_names_cache = sorted(feat_map.keys(), key=lambda x: list(feat_map.keys()).index(x))
+        names = self.feature_names()
+        # fill any missing from contract subset with zeros
+        vec = []
+        for n in names:
+            v = float(feat_map.get(n, 0.0))
+            if not math.isfinite(v):
+                raise ValueError(f"Non-finite feature {n}={v}")
+            vec.append(v)
+        assert len(vec) == len(names)
+        feat = np.asarray(vec, dtype=np.float64)
+        feat_z = self._zscore(feat, max(dt_ms, 1.0))
+        self.last_ts = ts_ms
+        self.timer_feature_build_s += time.perf_counter() - t0
+        return ts_ms, feat_z, mid, is_trade, dt_ms
+
+    def on_fast_event(self, e: Any):
         t0 = time.perf_counter()
         etype, ts_ms, payload = self._parse_event(e)
         self.timer_parse_dispatch_s += time.perf_counter() - t0
-
-        if etype == 'ob':
-            if isinstance(payload, tuple):
-                compact_payload = (int(payload[0]), payload[1], payload[2])
-            else:
-                data = payload.get('data', payload)
-                compact_payload = (
-                    1 if str(payload.get('type') or data.get('type') or payload.get('DataType') or 'delta').strip().lower() == 'snapshot' else 2,
-                    tuple((float(p), float(q)) for p, q in data.get('b', [])),
-                    tuple((float(p), float(q)) for p, q in data.get('a', [])),
-                )
-            payload = compact_payload
-        elif etype == 'trade' and not isinstance(payload, tuple):
-            rpi_raw = payload.get('RPI')
-            if rpi_raw is None:
-                rpi_raw = payload.get('rpi')
-            if isinstance(rpi_raw, str):
-                rpi_norm = rpi_raw.strip().lower()
-                is_rpi = 1 if rpi_norm in {"1", "true", "t", "yes", "y", "on"} else 0
-            else:
-                try:
-                    is_rpi = 1 if float(rpi_raw) != 0.0 else 0
-                except (TypeError, ValueError):
-                    is_rpi = 0
-            payload = (
-                float(payload['price']),
-                float(payload['size']),
-                1 if str(payload['side']).lower() == 'buy' else -1 if str(payload['side']).lower() == 'sell' else 0,
-                self._interpret_tick_direction(payload.get('tickDirection'))[0],
-                is_rpi,
-            )
         return self._dispatch_parsed_event(etype, ts_ms, payload)
 
-    def timer_totals(self) -> Dict[str, float]:
-        return {
-            'parse_dispatch_s': float(self.timer_parse_dispatch_s),
-            'order_book_update_s': float(self.timer_book_update_s),
-            'trade_update_s': float(self.timer_trade_update_s),
-            'feature_build_s': float(self.timer_feature_build_s),
-        }
-
-    def print_timer_totals(self, prefix: str = '[timers]') -> None:
-        totals = self.timer_totals()
-        print(
-            f"{prefix} parse_dispatch={totals['parse_dispatch_s']:.6f}s "
-            f"order_book_update={totals['order_book_update_s']:.6f}s "
-            f"trade_update={totals['trade_update_s']:.6f}s "
-            f"feature_build={totals['feature_build_s']:.6f}s",
-            flush=True,
-        )
+    def on_event(self, e: Any):
+        return self.on_fast_event(e)
 
 
 class LabelBuilder:

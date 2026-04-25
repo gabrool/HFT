@@ -34,7 +34,8 @@ from CMSSL17 import (  # type: ignore
     BATCH_SIZE, EPOCHS, LR, PATIENCE,
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS,
-    LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA,
+    LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK,
+    FEATURE_SCHEMA, AUX_SCHEMA, CHECKPOINT_SCHEMA,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     SAM,
     build_dataset_from_split,
@@ -234,8 +235,8 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
 def _label_dim_error(source: str, observed: Any) -> ValueError:
     return ValueError(
         f"{source} has label_dim={observed!r}, but CMSSL17_offline.py now requires "
-        f"label_dim={NUM_HORIZONS}. Old offline datasets with 2 * NUM_HORIZONS labels are no longer supported; "
-        "rebuild the offline data with offline_ingest.py."
+        f"label_dim={NUM_HORIZONS}. Old offline datasets are not supported. "
+        "Rerun offline_ingest.py with FEATURE_SCHEMA=cmssl17_30s_taker_features_v3."
     )
 
 
@@ -258,6 +259,42 @@ def validate_loaded_label_array(y: np.ndarray, source: str) -> None:
         raise ValueError(f"{source} must be 2D, got shape={y.shape}")
     if y.shape[1] != NUM_HORIZONS:
         raise _label_dim_error(source, y.shape[1])
+
+
+def validate_contract_meta(meta: dict, source: str) -> None:
+    required_aux = [
+        "log_dt_decision_ms",
+        "log_events_1000ms",
+        "log_events_3000ms",
+        "log_events_7500ms",
+        "log_events_15000ms",
+        "log_events_30000ms",
+        "log_events_60000ms",
+    ]
+    if meta.get("feature_schema") != FEATURE_SCHEMA:
+        raise ValueError("Old offline datasets are not supported. Rerun offline_ingest.py with FEATURE_SCHEMA=cmssl17_30s_taker_features_v3.")
+    if meta.get("aux_schema") != AUX_SCHEMA:
+        raise ValueError(f"{source} aux_schema mismatch")
+    if meta.get("checkpoint_schema_expected") != CHECKPOINT_SCHEMA:
+        raise ValueError(f"{source} checkpoint schema mismatch")
+    if meta.get("target_transform") != TARGET_TRANSFORM or meta.get("target_task") != TARGET_TASK:
+        raise ValueError(f"{source} target metadata mismatch")
+    if int(meta.get("aux_dim", -1)) != AUX_DIM:
+        raise ValueError(f"{source} aux_dim mismatch")
+    if list(meta.get("aux_names", [])) != required_aux:
+        raise ValueError(f"{source} aux_names mismatch")
+    pca = meta.get("pca") or {}
+    if not bool(pca.get("applied", False)):
+        raise ValueError("Old offline datasets are not supported. Rerun offline_ingest.py with FEATURE_SCHEMA=cmssl17_30s_taker_features_v3.")
+    if int(pca.get("k", -1)) != int(meta.get("feature_dim_core", -2)):
+        raise ValueError(f"{source} PCA k mismatch")
+    if int(meta.get("feature_dim_total", -1)) != int(meta.get("feature_dim_core", -1)) + AUX_DIM:
+        raise ValueError(f"{source} feature_dim_total mismatch")
+    fn = list(meta.get("feature_names_pre_pca", []))
+    if not fn:
+        raise ValueError(f"{source} missing feature_names_pre_pca")
+    if int(meta.get("feature_dim_core_pre_pca", -1)) != len(fn):
+        raise ValueError(f"{source} feature_dim_core_pre_pca mismatch")
 
 
 # ---------------- Signed-raw preprocessing, cache, and metrics ----------------
@@ -640,6 +677,12 @@ def train_from_offline():
     out_root = Path(OUT_ROOT)
     meta = json.loads((out_root / "meta.json").read_text())
     validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
+    validate_contract_meta(meta, f"global metadata {out_root / 'meta.json'}")
+    for rel_path in meta.get("weeks_meta", []):
+        wk_path = out_root / rel_path
+        wk_meta = json.loads(wk_path.read_text())
+        validate_dataset_label_dim(wk_meta, f"week metadata {wk_path}")
+        validate_contract_meta(wk_meta, f"week metadata {wk_path}")
     trade_history_enabled = meta.get('trade_history_enabled')
     event_stream_mode = meta.get('event_stream_mode')
     splits = require_four_week_pipeline_splits(meta, out_root)
