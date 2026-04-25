@@ -480,9 +480,9 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "signed_sqrt_raw_bps"
 TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
-FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v2"
+FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v3"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
-CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage4-v2"
+CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage4-v3"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
@@ -552,6 +552,11 @@ SLIPPAGE_NOTIONAL_USD = (
     250_000.0,
 )
 FAST_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+INTERACTION_WINDOWS_MS = (
+    7_500,
+    15_000,
+    30_000,
+)
 FLOW_WINDOWS_MS = (
     1_000,
     3_000,
@@ -1343,7 +1348,7 @@ class FeatureEngine:
         }
 
         # ---------- Decayed pressure (EWMA of OFI L1) ----------
-        self.pressure_by_window: Dict[int, float] = {ms: 0.0 for ms in FAST_WINDOWS_MS}
+        self.ofi_pressure_by_window: Dict[int, float] = {ms: 0.0 for ms in FAST_WINDOWS_MS}
 
         # ---------- MACD state ----------
         self.macd_state = {
@@ -1650,7 +1655,24 @@ class FeatureEngine:
                 f"liquidity_shock_ask_5bps_{ms}ms",
             ])
         for ms in FAST_WINDOWS_MS:
-            names.append(f"pressure_ofi_l1_{ms}ms")
+            names.extend([
+                f"ofi_l1_pressure_ewma_{ms}ms",
+                f"ofi_l1_pressure_over_depth_5bps_{ms}ms",
+                f"ofi_l1_pressure_over_realized_vol_{ms}ms",
+            ])
+        for ms in INTERACTION_WINDOWS_MS:
+            names.extend([
+                f"flow_agrees_with_book_{ms}ms",
+                f"flow_disagrees_with_book_{ms}ms",
+                f"trade_imbalance_x_obi_5bps_{ms}ms",
+                f"trade_imbalance_x_ofi_pressure_{ms}ms",
+                f"ofi_pressure_x_spread_bps_{ms}ms",
+                f"micro_premia_x_trade_imbalance_{ms}ms",
+                f"micro_premia_x_depth_imbalance_5bps_{ms}ms",
+                f"signed_flow_over_depth_5bps_{ms}ms",
+                f"signed_flow_over_spread_bps_{ms}ms",
+                f"abs_signed_flow_over_realized_vol_{ms}ms",
+            ])
         for hl in self.ema_half_lives_ms:
             for name in self.ema_indicator_names:
                 names.append(f"ema_{name}_{hl}ms")
@@ -2797,7 +2819,8 @@ class FeatureEngine:
         slope_a = self._lin_slope(xa, ya)
 
         for ms in FAST_WINDOWS_MS:
-            self.pressure_by_window[ms] = self._ewma_update(self.pressure_by_window[ms], ofi_l1, dt_ms, ms)
+            self.ofi_pressure_by_window[ms] = self._ewma_update(self.ofi_pressure_by_window[ms], ofi_l1, dt_ms, ms)
+        ofi_pressure_by_ms = {ms: self.ofi_pressure_by_window[ms] for ms in FAST_WINDOWS_MS}
 
         trade_stats_by_ms = {ms: self._compute_trade_window_stats(ms, ts_ms, mid, micro) for ms in self.trade_windows}
         trades_by_ms = {ms: [t for t in self._trade_window_deques[ms] if (ts_ms - t[0]) <= ms] for ms in self.trade_windows}
@@ -3205,8 +3228,8 @@ class FeatureEngine:
             trade_stats_by_ms[3_000]["trade_imbalance_notional"] - trade_stats_by_ms[15_000]["trade_imbalance_notional"],
             trade_stats_by_ms[7_500]["trade_imbalance_notional"] - trade_stats_by_ms[30_000]["trade_imbalance_notional"],
             (trade_stats_by_ms[3_000]["signed_notional_flow_usd"] / 100_000.0) - (trade_stats_by_ms[30_000]["signed_notional_flow_usd"] / 100_000.0),
-            self.pressure_by_window[3_000] - self.pressure_by_window[15_000],
-            self.pressure_by_window[7_500] - self.pressure_by_window[30_000],
+            self.ofi_pressure_by_window[3_000] - self.ofi_pressure_by_window[15_000],
+            self.ofi_pressure_by_window[7_500] - self.ofi_pressure_by_window[30_000],
         ])
         for ms in FLOW_WINDOWS_MS:
             large_stats = large_stats_by_ms[ms]
@@ -3325,8 +3348,48 @@ class FeatureEngine:
                 (ask_depth_5bps["size"] / max(ask_mean, 1e-9)) - 1.0,
             ])
 
+        bid_depth_5bps_base = float(band_depth_stats[5.0]["bid"]["size"])
+        ask_depth_5bps_base = float(band_depth_stats[5.0]["ask"]["size"])
+        bid_notional_5bps_base = float(band_depth_stats[5.0]["bid"]["notional"])
+        ask_notional_5bps_base = float(band_depth_stats[5.0]["ask"]["notional"])
+        depth_imbalance_5bps = self._safe_div(
+            bid_depth_5bps_base - ask_depth_5bps_base,
+            bid_depth_5bps_base + ask_depth_5bps_base,
+            0.0,
+        )
+        depth_5bps_total_base = bid_depth_5bps_base + ask_depth_5bps_base
+        depth_5bps_total_notional = bid_notional_5bps_base + ask_notional_5bps_base
+
         for ms in FAST_WINDOWS_MS:
-            feat_list.append(self.pressure_by_window[ms])
+            ofi_pressure = ofi_pressure_by_ms[ms]
+            feat_list.extend([
+                ofi_pressure,
+                self._safe_div(ofi_pressure, max(depth_5bps_total_base, 1e-9), 0.0),
+                self._safe_div(ofi_pressure, max(self._realized_vol_for_pressure(ms), 1e-9), 0.0),
+            ])
+
+        for ms in INTERACTION_WINDOWS_MS:
+            trade_imbalance = float(trade_stats_by_ms[ms]["trade_imbalance_notional"])
+            signed_flow_usd = float(trade_stats_by_ms[ms]["signed_notional_flow_usd"])
+            signed_flow_scaled = signed_flow_usd / 100_000.0
+            ofi_pressure = float(ofi_pressure_by_ms[ms])
+            realized_vol = float(self.realized_vol[ms])
+            flow_sign = 1 if trade_imbalance > 0.0 else (-1 if trade_imbalance < 0.0 else 0)
+            book_sign = 1 if depth_imbalance_5bps > 0.0 else (-1 if depth_imbalance_5bps < 0.0 else 0)
+            flow_agrees_with_book = 1.0 if (flow_sign != 0 and book_sign != 0 and flow_sign == book_sign) else 0.0
+            flow_disagrees_with_book = 1.0 if (flow_sign != 0 and book_sign != 0 and flow_sign != book_sign) else 0.0
+            feat_list.extend([
+                flow_agrees_with_book,
+                flow_disagrees_with_book,
+                trade_imbalance * depth_imbalance_5bps,
+                trade_imbalance * ofi_pressure,
+                ofi_pressure * spread_bps,
+                micro_premia * trade_imbalance,
+                micro_premia * depth_imbalance_5bps,
+                self._safe_div(signed_flow_usd, max(depth_5bps_total_notional, 1e-9), 0.0),
+                self._safe_div(signed_flow_scaled, max(spread_bps, 0.1), 0.0),
+                self._safe_div(abs(signed_flow_scaled), max(realized_vol, 1e-9), 0.0),
+            ])
 
         for hl in self.ema_half_lives_ms:
             state = self.ema_states[hl]
@@ -3597,6 +3660,11 @@ class FeatureEngine:
             self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in stats.deq))
         return r
 
+    def _realized_vol_for_pressure(self, ms: int) -> float:
+        if ms in self.realized_vol:
+            return float(self.realized_vol.get(ms, 0.0))
+        return float(self.realized_vol.get(3_000, 0.0))
+
     def _feature_z_half_life_ms(self, feature_name: str) -> Optional[int]:
         if (
             feature_name.startswith("time_hour_")
@@ -3605,6 +3673,19 @@ class FeatureEngine:
             or feature_name.startswith("session_")
         ):
             return None
+        if any(
+            tok in feature_name
+            for tok in (
+                "flow_agrees_with_book",
+                "flow_disagrees_with_book",
+                "trade_imbalance_x",
+                "ofi_pressure_x",
+                "micro_premia_x",
+                "signed_flow_over",
+                "abs_signed_flow_over",
+            )
+        ):
+            return 60_000
         if any(tok in feature_name for tok in ("spread_delta", "ofi_", "obi_", "pressure", "replen", "change_count", "depletion")):
             return 30_000
         if any(tok in feature_name for tok in ("trade", "flow", "large", "vpin", "cvd", "quote_count", "quote_to_trade", "aggressor", "absorption")):

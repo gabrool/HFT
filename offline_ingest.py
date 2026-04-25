@@ -1804,7 +1804,7 @@ def maybe_fit_pca_model(
     batches = 0
 
     if target_var <= 0.0:
-        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v2")
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v3")
 
     if int(use_existing) == 1:
         model_path = os.path.join(out_root, model_filename)
@@ -1846,7 +1846,7 @@ def maybe_fit_pca_model(
     train_set = set(train_weeks)
     train_pairs = [p for p in pairs if p[0] in train_set]
     if not train_pairs:
-        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v2")
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v3")
 
     sample_limit = max(1, int(sample_limit))
     batch_size = int(batch_size)
@@ -1919,7 +1919,7 @@ def maybe_fit_pca_model(
     ensure_ipca(force=True)
 
     if ipca is None:
-        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v2")
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v3")
 
     flush_pending(force=True)
 
@@ -1939,7 +1939,7 @@ def maybe_fit_pca_model(
                     "feature_names_pre_pca": feature_names_pre_pca,
                     "feature_names_hash": names_hash,
                     "created_by": "offline_ingest.py",
-                    "stage": "stage4_v2",
+                    "stage": "stage4_v3",
                 },
                 sort_keys=True,
             ),
@@ -2003,7 +2003,7 @@ def process_all(
 
     pca_summary = _summarise_pca_meta(pca_meta)
     if not pca_summary["applied"]:
-        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v2")
+        raise ValueError("PCA is required for FEATURE_SCHEMA=cmssl17_30s_taker_stage4_v3")
     feature_names_pre_pca = list(FeatureEngine().feature_names())
     names_hash = hashlib.sha256(json.dumps(feature_names_pre_pca).encode()).hexdigest()[:12]
     pca_mean: Optional[np.ndarray] = None
