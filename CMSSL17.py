@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable, Union, Sequence
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -479,9 +480,9 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "signed_sqrt_raw_bps"
 TARGET_TASK = "horizon_specific_signed_raw_bps_targets"
-FEATURE_SCHEMA = "cmssl17_30s_taker_stage3_v1"
+FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v1"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
-CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage3"
+CHECKPOINT_SCHEMA = "cmssl17-signed-raw-v3-stage4"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
@@ -561,17 +562,24 @@ LARGE_TRADE_NOTIONAL_USD = (
 LARGE_TRADE_CLUSTER_THRESHOLD_USD = 100_000.0
 LARGE_TRADE_CLUSTER_GAP_MS = 1_000
 LARGE_TRADE_CLOCK_THRESHOLD_USD = 100_000.0
-REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000)
+REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000, 120_000, 300_000)
 EVENT_DENSITY_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
-EMA_HALF_LIVES_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
+EMA_HALF_LIVES_MS = (7_500, 15_000, 30_000, 60_000, 120_000)
 MACD_TRIPLETS_MS = (
-    (1_000, 3_000, 1_500),
-    (3_000, 7_500, 5_000),
     (7_500, 15_000, 10_000),
     (15_000, 30_000, 20_000),
     (30_000, 60_000, 40_000),
+    (60_000, 120_000, 90_000),
+    (120_000, 300_000, 180_000),
 )
 VPIN_BUCKET_SECS = (7.5, 15.0, 30.0)
+SPREAD_DEPTH_REGIME_WINDOWS_MS = (
+    7_500,
+    15_000,
+    30_000,
+    60_000,
+    120_000,
+)
 BOOK_DEPTH_FEATURE_LEVELS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 100)
 MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
 
@@ -1239,6 +1247,12 @@ class FeatureEngine:
             ms: RollingWindowStats(ms) for ms in self.regime_windows_ms
         }
         self.last_mid_for_ret: Optional[float] = None
+        self._spread_bps_history: Deque[Tuple[int, float]] = deque()
+        self._bid_depth_5bps_history: Deque[Tuple[int, float]] = deque()
+        self._ask_depth_5bps_history: Deque[Tuple[int, float]] = deque()
+        self._depth_5bps_total_history: Deque[Tuple[int, float]] = deque()
+        self._depth_5bps_imbalance_history: Deque[Tuple[int, float]] = deque()
+        self._regime_metric_keep_ms = max(SPREAD_DEPTH_REGIME_WINDOWS_MS) + 5_000
 
         # ---------- Spread ----------
         self.last_spread: Optional[float] = None
@@ -1327,34 +1341,43 @@ class FeatureEngine:
         self.pressure_by_window: Dict[int, float] = {ms: 0.0 for ms in FAST_WINDOWS_MS}
 
         # ---------- MACD state ----------
-        self.macd_state: Dict[int, Dict[str, Optional[float]]] = {
-            idx: {"fast": None, "slow": None, "signal": None}
-            for idx in range(len(MACD_TRIPLETS_MS))
+        self.macd_state = {
+            (fast, slow, sig): {
+                "fast": None,
+                "slow": None,
+                "signal": 0.0,
+                "signal_initialized": False,
+            }
+            for (fast, slow, sig) in MACD_TRIPLETS_MS
         }
 
         # ---------- Fast EMA state for microstructure signals ----------
         self.ema_half_lives_ms = EMA_HALF_LIVES_MS
         self.ema_indicator_names = (
-            "bid1",
-            "ask1",
-            "mid",
             "spread_bps",
-            "micro",
             "gap_a_bps",
             "gap_b_bps",
-            "cum_bid1",
-            "cum_ask1",
-            "cum_bid3",
-            "cum_ask3",
-            "slope_a",
-            "slope_b",
+            "micro_premia",
+            "micro_minus_mid_bps",
+            "depth_imbalance_within_1bps",
+            "depth_imbalance_within_2bps",
+            "depth_imbalance_within_5bps",
+            "depth_imbalance_within_10bps",
+            "notional_imbalance_within_1bps",
+            "notional_imbalance_within_2bps",
+            "notional_imbalance_within_5bps",
+            "notional_imbalance_within_10bps",
             "obi_l1",
             "obi_l3",
             "obi_l5",
-            "ofi_l1",
-            "ofi_l3",
-            "ofi_l5",
-            "micro_premia",
+            "obi_l10",
+            "ofi_l1_over_depth_l1",
+            "ofi_l3_over_depth_l3",
+            "ofi_l5_over_depth_l5",
+            "ofi_l10_over_depth_l10",
+            "signed_notional_flow_usd_30000ms",
+            "trade_imbalance_notional_30000ms",
+            "vwap_vs_mid_bps_30000ms",
         )
         self.ema_states: Dict[int, Dict[str, Optional[float]]] = {
             hl: {name: None for name in self.ema_indicator_names}
@@ -1363,9 +1386,11 @@ class FeatureEngine:
 
         # ---------- Rolling z-score state (per-feature EWMA mean/var) ----------
         self.z_mean: Optional[np.ndarray] = None
-        self.z_m2: Optional[np.ndarray] = None  # EWMA of x^2 (for var = m2 - mean^2)
+        self.z_var: Optional[np.ndarray] = None
         self._feat_dim: Optional[int] = None
         self._feature_names_cache: Optional[List[str]] = None
+        self._z_half_lives_ms: Optional[List[Optional[int]]] = None
+        self._last_z_ts_ms: Optional[int] = None
 
         # ---------- ingest timing ----------
         self.timer_parse_dispatch_s: float = 0.0
@@ -1377,6 +1402,19 @@ class FeatureEngine:
         if self._feature_names_cache is not None:
             return list(self._feature_names_cache)
         names: List[str] = []
+        names.extend([
+            "time_hour_sin",
+            "time_hour_cos",
+            "time_minute_sin",
+            "time_minute_cos",
+            "time_dow_sin",
+            "time_dow_cos",
+            "session_is_weekend",
+            "session_is_asia",
+            "session_is_europe",
+            "session_is_us",
+            "session_is_europe_us_overlap",
+        ])
         for w in PRICE_WINDOWS_MS:
             names.extend([
                 f"mid_ret_bps_{w}ms",
@@ -1564,10 +1602,36 @@ class FeatureEngine:
             names.append(f"vr_{cur_ms}ms_over_{prev_ms}ms")
         for ms in REGIME_WINDOWS_MS:
             names.extend([
-                f"regime_volume_{ms}ms",
-                f"regime_realized_vol_{ms}ms",
-                f"regime_vol_ewma_{ms}ms",
-                f"regime_flow_{ms}ms",
+                f"regime_volume_ewma_{ms}ms",
+                f"regime_realized_vol_bps_{ms}ms",
+                f"regime_vol_ewma_bps_{ms}ms",
+                f"regime_flow_imbalance_{ms}ms",
+                f"realized_up_vol_bps_{ms}ms",
+                f"realized_down_vol_bps_{ms}ms",
+                f"down_up_vol_ratio_{ms}ms",
+                f"bipower_variation_{ms}ms",
+                f"jump_variation_{ms}ms",
+                f"max_abs_return_bps_{ms}ms",
+                f"return_skew_{ms}ms",
+                f"return_kurtosis_{ms}ms",
+            ])
+        for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
+            names.extend([
+                f"spread_mean_bps_{ms}ms",
+                f"spread_std_bps_{ms}ms",
+                f"spread_p90_bps_{ms}ms",
+                f"spread_max_bps_{ms}ms",
+                f"spread_min_bps_{ms}ms",
+                f"spread_z_{ms}ms",
+                f"spread_widening_slope_bps_per_sec_{ms}ms",
+                f"spread_time_above_1bp_frac_{ms}ms",
+                f"depth_5bps_mean_{ms}ms",
+                f"depth_5bps_std_{ms}ms",
+                f"depth_5bps_z_{ms}ms",
+                f"depth_imbalance_5bps_mean_{ms}ms",
+                f"depth_imbalance_5bps_slope_{ms}ms",
+                f"liquidity_shock_bid_5bps_{ms}ms",
+                f"liquidity_shock_ask_5bps_{ms}ms",
             ])
         for ms in FAST_WINDOWS_MS:
             names.append(f"pressure_ofi_l1_{ms}ms")
@@ -1579,16 +1643,16 @@ class FeatureEngine:
                 names.append(f"resid_{name}_{hl}ms")
         for fast_ms, slow_ms, sig_ms in MACD_TRIPLETS_MS:
             names.extend([
-                f"macd_raw_{fast_ms}_{slow_ms}_{sig_ms}ms",
-                f"macd_signal_{fast_ms}_{slow_ms}_{sig_ms}ms",
-                f"macd_hist_{fast_ms}_{slow_ms}_{sig_ms}ms",
+                f"macd_micro_bps_{fast_ms}_{slow_ms}_{sig_ms}",
+                f"macd_signal_bps_{fast_ms}_{slow_ms}_{sig_ms}",
+                f"macd_hist_bps_{fast_ms}_{slow_ms}_{sig_ms}",
             ])
         for secs in VPIN_BUCKET_SECS:
             names.append(f"vpin_{str(secs).replace('.', 'p')}s")
         if len(names) != len(set(names)):
             seen = set()
             duplicates = sorted({n for n in names if n in seen or seen.add(n)})
-            raise ValueError(f"Duplicate feature names in Stage 3 schema: {duplicates[:20]}")
+            raise ValueError(f"Duplicate feature names in Stage 4 schema: {duplicates[:20]}")
         self._feature_names_cache = list(names)
         return list(self._feature_names_cache)
 
@@ -1649,6 +1713,114 @@ class FeatureEngine:
                     state[name] = value
                 else:
                     state[name] = self._ewma_update(prev, value, dt_ms, hl)
+
+    def _compute_session_features(self, ts_ms: int) -> Dict[str, float]:
+        dt_utc = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
+        hour_float = dt_utc.hour + (dt_utc.minute / 60.0) + (dt_utc.second / 3600.0)
+        minute_float = dt_utc.minute + (dt_utc.second / 60.0)
+        dow = dt_utc.weekday()
+        hour_phase = (2.0 * math.pi * hour_float) / 24.0
+        minute_phase = (2.0 * math.pi * minute_float) / 60.0
+        dow_phase = (2.0 * math.pi * float(dow)) / 7.0
+        is_weekend = 1.0 if dow >= 5 else 0.0
+        h = dt_utc.hour
+        return {
+            "time_hour_sin": float(math.sin(hour_phase)),
+            "time_hour_cos": float(math.cos(hour_phase)),
+            "time_minute_sin": float(math.sin(minute_phase)),
+            "time_minute_cos": float(math.cos(minute_phase)),
+            "time_dow_sin": float(math.sin(dow_phase)),
+            "time_dow_cos": float(math.cos(dow_phase)),
+            "session_is_weekend": is_weekend,
+            "session_is_asia": 1.0 if 0 <= h < 8 else 0.0,
+            "session_is_europe": 1.0 if 7 <= h < 16 else 0.0,
+            "session_is_us": 1.0 if 13 <= h < 22 else 0.0,
+            "session_is_europe_us_overlap": 1.0 if 13 <= h < 16 else 0.0,
+        }
+
+    def _append_metric_history(self, deq: Deque[Tuple[int, float]], ts_ms: int, value: float, keep_ms: int) -> None:
+        if math.isfinite(float(value)):
+            deq.append((int(ts_ms), float(value)))
+        cutoff = int(ts_ms) - int(keep_ms)
+        while deq and deq[0][0] < cutoff:
+            deq.popleft()
+
+    def _metric_values(self, deq: Deque[Tuple[int, float]], now_ms: int, window_ms: int) -> List[Tuple[int, float]]:
+        cutoff = int(now_ms) - int(window_ms)
+        return [(ts, val) for ts, val in deq if cutoff <= ts <= now_ms and math.isfinite(val)]
+
+    def _rolling_stats_values(self, vals: List[float]) -> Dict[str, float]:
+        if not vals:
+            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "p90": 0.0}
+        arr = np.asarray(vals, dtype=np.float64)
+        return {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr, ddof=0)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+            "p90": float(np.quantile(arr, 0.90)),
+        }
+
+    def _rolling_value_slope(self, points: List[Tuple[int, float]]) -> float:
+        if len(points) < 3:
+            return 0.0
+        t0 = float(points[0][0])
+        xs = np.asarray([(float(ts) - t0) / 1000.0 for ts, _ in points], dtype=np.float64)
+        ys = np.asarray([float(v) for _, v in points], dtype=np.float64)
+        x_mean = float(np.mean(xs))
+        y_mean = float(np.mean(ys))
+        x_var = float(np.sum((xs - x_mean) ** 2))
+        if x_var <= 1e-12:
+            return 0.0
+        cov = float(np.sum((xs - x_mean) * (ys - y_mean)))
+        return cov / x_var
+
+    def _return_distribution_stats(self, vals: List[float]) -> Dict[str, float]:
+        if not vals:
+            return {
+                "realized_up_vol_bps": 0.0,
+                "realized_down_vol_bps": 0.0,
+                "down_up_vol_ratio": 0.0,
+                "bipower_variation": 0.0,
+                "jump_variation": 0.0,
+                "max_abs_return_bps": 0.0,
+                "return_skew": 0.0,
+                "return_kurtosis": 0.0,
+            }
+        eps = 1e-9
+        arr = np.asarray(vals, dtype=np.float64)
+        up = float(math.sqrt(np.sum(np.square(arr[arr > 0.0])))) if np.any(arr > 0.0) else 0.0
+        down = float(math.sqrt(np.sum(np.square(arr[arr < 0.0])))) if np.any(arr < 0.0) else 0.0
+        realized_var = float(np.sum(arr * arr))
+        bipower = 0.0
+        if arr.shape[0] >= 2:
+            bipower = float(np.sum(np.abs(arr[1:]) * np.abs(arr[:-1])))
+        jump_var = max(realized_var - bipower, 0.0)
+        max_abs = float(np.max(np.abs(arr)))
+        mean = float(np.mean(arr))
+        std = float(np.std(arr, ddof=0))
+        skew = 0.0
+        kurt = 0.0
+        if arr.shape[0] >= 3 and std > eps:
+            z = (arr - mean) / std
+            skew = float(np.mean(z ** 3))
+        if arr.shape[0] >= 4 and std > eps:
+            z = (arr - mean) / std
+            kurt = float(np.mean(z ** 4))
+        out = {
+            "realized_up_vol_bps": up,
+            "realized_down_vol_bps": down,
+            "down_up_vol_ratio": float(down / max(up, eps)),
+            "bipower_variation": bipower,
+            "jump_variation": jump_var,
+            "max_abs_return_bps": max_abs,
+            "return_skew": skew,
+            "return_kurtosis": kurt,
+        }
+        for k, v in out.items():
+            if not math.isfinite(float(v)):
+                out[k] = 0.0
+        return out
 
     def _update_trade_window_state_with_insert(
         self,
@@ -2518,6 +2690,7 @@ class FeatureEngine:
 
         t0 = time.perf_counter()
         self._ensure_book_ladders()
+        session_features = self._compute_session_features(ts_ms)
         bid1, ask1, bsz1, asz1 = self._book_best()
         mid = 0.5 * (bid1 + ask1) if (bid1 > 0 and ask1 > 0) else 0.0
 
@@ -2606,15 +2779,6 @@ class FeatureEngine:
         xa, ya = self._levels_to_xy(self.ask_lvls, mid, False, 5)
         slope_b = self._lin_slope(xb, yb)
         slope_a = self._lin_slope(xa, ya)
-
-        indicator_values = {
-            "bid1": bid1, "ask1": ask1, "mid": mid, "spread_bps": spread_bps,
-            "micro": micro, "gap_a_bps": gap_a_bps, "gap_b_bps": gap_b_bps,
-            "cum_bid1": cum_bid1, "cum_ask1": cum_ask1, "cum_bid3": cum_bid3, "cum_ask3": cum_ask3,
-            "slope_a": slope_a, "slope_b": slope_b, "obi_l1": obi_l1, "obi_l3": obi_l3, "obi_l5": obi_l5,
-            "ofi_l1": ofi_l1, "ofi_l3": ofi_l3, "ofi_l5": ofi_l5, "micro_premia": micro_premia,
-        }
-        self._update_indicator_emas(indicator_values, dt_ms)
 
         for ms in FAST_WINDOWS_MS:
             self.pressure_by_window[ms] = self._ewma_update(self.pressure_by_window[ms], ofi_l1, dt_ms, ms)
@@ -2720,20 +2884,6 @@ class FeatureEngine:
             self.flow_regime[ms] = trade_stats_by_ms[nearest]["trade_imbalance_notional"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
 
-        def ema_ms(prev: Optional[float], x: float, hl_ms: float) -> float:
-            a = 1.0 - math.exp(-dt_ms / max(1.0, hl_ms))
-            return x if prev is None else ((1.0 - a) * prev + a * x)
-
-        macd_features = []
-        for idx, (fast_ms, slow_ms, sig_ms) in enumerate(MACD_TRIPLETS_MS):
-            st = self.macd_state[idx]
-            st["fast"] = ema_ms(st["fast"], micro, float(fast_ms))
-            st["slow"] = ema_ms(st["slow"], micro, float(slow_ms))
-            raw = float(st["fast"] - st["slow"])
-            st["signal"] = ema_ms(st["signal"], raw, float(sig_ms))
-            sig = float(st["signal"])
-            macd_features.extend([raw, sig, raw - sig])
-
         vpin_features = []
         for secs in self.vpin_bucket_secs:
             phi = self.vpin_state[secs]["phi"]
@@ -2760,6 +2910,16 @@ class FeatureEngine:
         bid_depth_5bps = self._depth_within_bps(self.bid_lvls, mid, 5.0, is_bid=True)
         ask_depth_5bps = self._depth_within_bps(self.ask_lvls, mid, 5.0, is_bid=False)
         depth_5bps_total = bid_depth_5bps["size"] + ask_depth_5bps["size"]
+        depth_5bps_imbalance = self._safe_div(
+            bid_depth_5bps["size"] - ask_depth_5bps["size"],
+            bid_depth_5bps["size"] + ask_depth_5bps["size"],
+            0.0,
+        )
+        self._append_metric_history(self._spread_bps_history, ts_ms, spread_bps, self._regime_metric_keep_ms)
+        self._append_metric_history(self._bid_depth_5bps_history, ts_ms, bid_depth_5bps["size"], self._regime_metric_keep_ms)
+        self._append_metric_history(self._ask_depth_5bps_history, ts_ms, ask_depth_5bps["size"], self._regime_metric_keep_ms)
+        self._append_metric_history(self._depth_5bps_total_history, ts_ms, depth_5bps_total, self._regime_metric_keep_ms)
+        self._append_metric_history(self._depth_5bps_imbalance_history, ts_ms, depth_5bps_imbalance, self._regime_metric_keep_ms)
 
         band_depth_stats: Dict[float, Dict[str, dict]] = {}
         for band in BPS_DEPTH_BANDS:
@@ -2781,10 +2941,86 @@ class FeatureEngine:
                 "sell": self._slippage_for_notional(self.bid_lvls, mid, notional, is_buy=False),
             }
 
+        indicator_values = {
+            "spread_bps": spread_bps,
+            "gap_a_bps": gap_a_bps,
+            "gap_b_bps": gap_b_bps,
+            "micro_premia": micro_premia,
+            "micro_minus_mid_bps": micro_minus_mid_bps,
+            "depth_imbalance_within_1bps": self._safe_div(
+                band_depth_stats[1.0]["bid"]["size"] - band_depth_stats[1.0]["ask"]["size"],
+                band_depth_stats[1.0]["bid"]["size"] + band_depth_stats[1.0]["ask"]["size"],
+                0.0,
+            ),
+            "depth_imbalance_within_2bps": self._safe_div(
+                band_depth_stats[2.0]["bid"]["size"] - band_depth_stats[2.0]["ask"]["size"],
+                band_depth_stats[2.0]["bid"]["size"] + band_depth_stats[2.0]["ask"]["size"],
+                0.0,
+            ),
+            "depth_imbalance_within_5bps": self._safe_div(
+                band_depth_stats[5.0]["bid"]["size"] - band_depth_stats[5.0]["ask"]["size"],
+                band_depth_stats[5.0]["bid"]["size"] + band_depth_stats[5.0]["ask"]["size"],
+                0.0,
+            ),
+            "depth_imbalance_within_10bps": self._safe_div(
+                band_depth_stats[10.0]["bid"]["size"] - band_depth_stats[10.0]["ask"]["size"],
+                band_depth_stats[10.0]["bid"]["size"] + band_depth_stats[10.0]["ask"]["size"],
+                0.0,
+            ),
+            "notional_imbalance_within_1bps": self._safe_div(
+                band_depth_stats[1.0]["bid"]["notional"] - band_depth_stats[1.0]["ask"]["notional"],
+                band_depth_stats[1.0]["bid"]["notional"] + band_depth_stats[1.0]["ask"]["notional"],
+                0.0,
+            ),
+            "notional_imbalance_within_2bps": self._safe_div(
+                band_depth_stats[2.0]["bid"]["notional"] - band_depth_stats[2.0]["ask"]["notional"],
+                band_depth_stats[2.0]["bid"]["notional"] + band_depth_stats[2.0]["ask"]["notional"],
+                0.0,
+            ),
+            "notional_imbalance_within_5bps": self._safe_div(
+                band_depth_stats[5.0]["bid"]["notional"] - band_depth_stats[5.0]["ask"]["notional"],
+                band_depth_stats[5.0]["bid"]["notional"] + band_depth_stats[5.0]["ask"]["notional"],
+                0.0,
+            ),
+            "notional_imbalance_within_10bps": self._safe_div(
+                band_depth_stats[10.0]["bid"]["notional"] - band_depth_stats[10.0]["ask"]["notional"],
+                band_depth_stats[10.0]["bid"]["notional"] + band_depth_stats[10.0]["ask"]["notional"],
+                0.0,
+            ),
+            "obi_l1": obi_by_level[1],
+            "obi_l3": obi_by_level[3],
+            "obi_l5": obi_by_level[5],
+            "obi_l10": obi_by_level[10],
+            "ofi_l1_over_depth_l1": self._safe_div(ofi_by_level[1], cum_bid_by_level[1] + cum_ask_by_level[1], 0.0),
+            "ofi_l3_over_depth_l3": self._safe_div(ofi_by_level[3], cum_bid_by_level[3] + cum_ask_by_level[3], 0.0),
+            "ofi_l5_over_depth_l5": self._safe_div(ofi_by_level[5], cum_bid_by_level[5] + cum_ask_by_level[5], 0.0),
+            "ofi_l10_over_depth_l10": self._safe_div(ofi_by_level[10], cum_bid_by_level[10] + cum_ask_by_level[10], 0.0),
+            "signed_notional_flow_usd_30000ms": trade_stats_by_ms[30_000]["signed_notional_flow_usd"],
+            "trade_imbalance_notional_30000ms": trade_stats_by_ms[30_000]["trade_imbalance_notional"],
+            "vwap_vs_mid_bps_30000ms": trade_stats_by_ms[30_000]["vwap_vs_mid_bps"],
+        }
+        for required_name in self.ema_indicator_names:
+            if required_name not in indicator_values:
+                raise ValueError(f"Missing EMA indicator value for {required_name}")
+        self._update_indicator_emas(indicator_values, dt_ms)
+
         bid_5bps_levels = [(p, s) for p, s in self.bid_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p <= mid and (1e4 * (mid - p) / mid) <= 5.0]
         ask_5bps_levels = [(p, s) for p, s in self.ask_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p >= mid and (1e4 * (p - mid) / mid) <= 5.0]
 
         feat_list: List[float] = []
+        feat_list.extend([
+            session_features["time_hour_sin"],
+            session_features["time_hour_cos"],
+            session_features["time_minute_sin"],
+            session_features["time_minute_cos"],
+            session_features["time_dow_sin"],
+            session_features["time_dow_cos"],
+            session_features["session_is_weekend"],
+            session_features["session_is_asia"],
+            session_features["session_is_europe"],
+            session_features["session_is_us"],
+            session_features["session_is_europe_us_overlap"],
+        ])
         for w in PRICE_WINDOWS_MS:
             feat_list.extend(price_features_by_window[w])
         feat_list.extend([
@@ -2978,7 +3214,64 @@ class FeatureEngine:
             feat_list.append(vr_adjacent[(cur_ms, prev_ms)])
 
         for ms in REGIME_WINDOWS_MS:
-            feat_list.extend([regime_volume[ms], regime_realized[ms], regime_vol_ewma[ms], regime_flow_snapshot[ms]])
+            regime_returns = [v for _, v in self._regime_return_deques[ms].deq if math.isfinite(v)]
+            dist = self._return_distribution_stats(regime_returns)
+            feat_list.extend([
+                regime_volume[ms],
+                regime_realized[ms],
+                regime_vol_ewma[ms],
+                regime_flow_snapshot[ms],
+                dist["realized_up_vol_bps"],
+                dist["realized_down_vol_bps"],
+                dist["down_up_vol_ratio"],
+                dist["bipower_variation"],
+                dist["jump_variation"],
+                dist["max_abs_return_bps"],
+                dist["return_skew"],
+                dist["return_kurtosis"],
+            ])
+
+        for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
+            spread_points = self._metric_values(self._spread_bps_history, ts_ms, ms)
+            spread_vals = [v for _, v in spread_points]
+            spread_stats = self._rolling_stats_values(spread_vals)
+            spread_std = spread_stats["std"]
+            spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_stats["mean"]) / max(spread_std, 1e-9)
+            spread_slope = self._rolling_value_slope(spread_points)
+            spread_above = self._safe_div(sum(1.0 for v in spread_vals if v > 1.0), float(len(spread_vals)), 0.0)
+
+            depth_points = self._metric_values(self._depth_5bps_total_history, ts_ms, ms)
+            depth_vals = [v for _, v in depth_points]
+            depth_stats = self._rolling_stats_values(depth_vals)
+            depth_std = depth_stats["std"]
+            depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_stats["mean"]) / max(depth_std, 1e-9)
+            imb_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, ms)
+            imb_vals = [v for _, v in imb_points]
+            imb_stats = self._rolling_stats_values(imb_vals)
+            imb_slope = self._rolling_value_slope(imb_points)
+
+            bid_points = self._metric_values(self._bid_depth_5bps_history, ts_ms, ms)
+            ask_points = self._metric_values(self._ask_depth_5bps_history, ts_ms, ms)
+            bid_mean = self._rolling_stats_values([v for _, v in bid_points])["mean"]
+            ask_mean = self._rolling_stats_values([v for _, v in ask_points])["mean"]
+
+            feat_list.extend([
+                spread_stats["mean"],
+                spread_stats["std"],
+                spread_stats["p90"],
+                spread_stats["max"],
+                spread_stats["min"],
+                spread_z,
+                spread_slope,
+                spread_above,
+                depth_stats["mean"],
+                depth_stats["std"],
+                depth_z,
+                imb_stats["mean"],
+                imb_slope,
+                (bid_depth_5bps["size"] / max(bid_mean, 1e-9)) - 1.0,
+                (ask_depth_5bps["size"] / max(ask_mean, 1e-9)) - 1.0,
+            ])
 
         for ms in FAST_WINDOWS_MS:
             feat_list.append(self.pressure_by_window[ms])
@@ -2986,13 +3279,39 @@ class FeatureEngine:
         for hl in self.ema_half_lives_ms:
             state = self.ema_states[hl]
             for name in self.ema_indicator_names:
-                feat_list.append(state[name] if state[name] is not None else indicator_values[name])
+                if state[name] is None:
+                    raise ValueError(f"Uninitialized EMA state for {name} hl={hl}")
+                feat_list.append(state[name])
         for hl in self.ema_half_lives_ms:
             state = self.ema_states[hl]
             for name in self.ema_indicator_names:
-                ema_val = state[name] if state[name] is not None else indicator_values[name]
+                if state[name] is None:
+                    raise ValueError(f"Uninitialized EMA state for {name} hl={hl}")
+                ema_val = state[name]
                 feat_list.append(indicator_values[name] - ema_val)
 
+        macd_features = []
+        for fast_ms, slow_ms, sig_ms in MACD_TRIPLETS_MS:
+            st = self.macd_state[(fast_ms, slow_ms, sig_ms)]
+            if st["fast"] is None:
+                st["fast"] = float(micro)
+            else:
+                st["fast"] = self._ewma_update(float(st["fast"]), float(micro), dt_ms, int(fast_ms))
+            if st["slow"] is None:
+                st["slow"] = float(micro)
+            else:
+                st["slow"] = self._ewma_update(float(st["slow"]), float(micro), dt_ms, int(slow_ms))
+            fast_ema = float(st["fast"])
+            slow_ema = float(st["slow"])
+            raw_bps = 1e4 * math.log(fast_ema / slow_ema) if (fast_ema > 0.0 and slow_ema > 0.0) else 0.0
+            if not bool(st["signal_initialized"]):
+                st["signal"] = float(raw_bps)
+                st["signal_initialized"] = True
+            else:
+                st["signal"] = self._ewma_update(float(st["signal"]), float(raw_bps), dt_ms, int(sig_ms))
+            sig_bps = float(st["signal"])
+            hist_bps = float(raw_bps - sig_bps)
+            macd_features.extend([raw_bps, sig_bps, hist_bps])
         feat_list.extend(macd_features)
         feat_list.extend(vpin_features)
         names = self.feature_names()
@@ -3006,7 +3325,7 @@ class FeatureEngine:
                 raise ValueError(f"Non-finite feature {name}={value!r} at ts_ms={ts_ms}")
 
         feat = np.array(feat_list, dtype=np.float64)
-        feat_z = self._zscore(feat, dt_ms)
+        feat_z = self._zscore(feat, ts_ms)
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
@@ -3226,41 +3545,66 @@ class FeatureEngine:
             self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in stats.deq))
         return r
 
-    def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
-        """Per-feature EWMA mean/var rolling z-score.
-    
-        Keep running mean / second moment in float64 for numerical stability.
-        Emit float32 z-scores to preserve the dataset/model contract.
-        """
+    def _feature_z_half_life_ms(self, feature_name: str) -> Optional[int]:
+        if (
+            feature_name.startswith("time_hour_")
+            or feature_name.startswith("time_minute_")
+            or feature_name.startswith("time_dow_")
+            or feature_name.startswith("session_")
+        ):
+            return None
+        if any(tok in feature_name for tok in ("spread_delta", "ofi_", "obi_", "pressure", "replen", "change_count", "depletion")):
+            return 30_000
+        if any(tok in feature_name for tok in ("trade", "flow", "large", "vpin", "cvd", "quote_count", "quote_to_trade", "aggressor", "absorption")):
+            return 60_000
+        if any(tok in feature_name for tok in ("price", "trend", "range", "macd", "return", "vol", "regime", "slippage", "depth", "liquidity", "spread_mean", "spread_std", "spread_p90", "spread_z")):
+            return 120_000
+        return 120_000
+
+    def _zscore(self, x: np.ndarray, ts_ms: int) -> np.ndarray:
         if x.ndim != 1:
             raise ValueError(f"_zscore expects 1D feature vector, got shape={x.shape}")
+        names = self.feature_names()
+        if len(x) != len(names):
+            raise ValueError(f"_zscore feature length mismatch: got={len(x)} expected={len(names)}")
         if not np.all(np.isfinite(x)):
             raise ValueError("Non-finite values passed to _zscore")
-        eps = 1e-9
         x64 = x.astype(np.float64, copy=False)
+        dt_ms = 1.0 if self._last_z_ts_ms is None else float(max(1, int(ts_ms) - int(self._last_z_ts_ms)))
+        self._last_z_ts_ms = int(ts_ms)
+
+        if self._z_half_lives_ms is None:
+            self._z_half_lives_ms = [self._feature_z_half_life_ms(name) for name in names]
 
         if self._feat_dim is None:
             self._feat_dim = int(x.shape[0])
-            expected = self.core_feature_dim()
-            if self._feat_dim != expected:
-                raise ValueError(f"Initial feature dim mismatch: got {self._feat_dim} expected {expected}")
             self.z_mean = x64.copy()
-            self.z_m2 = np.square(x64, dtype=np.float64)
-            return np.zeros_like(x, dtype=np.float32)
+            self.z_var = np.ones_like(x64, dtype=np.float64)
+            out = np.array(x64, copy=True)
+            for i, hl in enumerate(self._z_half_lives_ms):
+                if hl is not None:
+                    out[i] = 0.0
+            out = out.astype(np.float32, copy=False)
+            if not np.all(np.isfinite(out)):
+                raise ValueError("Non-finite values produced by _zscore")
+            return out
 
-        hl = self._alpha_half_life_ms(self.z_hl_ms)
-        alpha = float(1.0 - math.pow(0.5, max(1.0, dt_ms) / float(hl)))
-        one_minus_alpha = 1.0 - alpha
+        out = np.array(x64, copy=True)
+        for i, hl in enumerate(self._z_half_lives_ms):
+            if hl is None:
+                out[i] = x64[i]
+                continue
+            alpha = 1.0 - math.exp(-math.log(2.0) * dt_ms / float(max(1, int(hl))))
+            diff = x64[i] - self.z_mean[i]
+            self.z_mean[i] += alpha * diff
+            self.z_var[i] = (1.0 - alpha) * (self.z_var[i] + alpha * diff * diff)
+            z_i = (x64[i] - self.z_mean[i]) / math.sqrt(max(self.z_var[i], 1e-6))
+            out[i] = float(np.clip(z_i, -10.0, 10.0))
 
-        # Update EWMA mean and second moment in float64
-        self.z_mean = one_minus_alpha * self.z_mean + alpha * x64
-        self.z_m2 = one_minus_alpha * self.z_m2 + alpha * np.square(x64, dtype=np.float64)
-
-        var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
-        z = (x64 - self.z_mean) / np.sqrt(var)
-        if not np.all(np.isfinite(z)):
+        out32 = out.astype(np.float32, copy=False)
+        if not np.all(np.isfinite(out32)):
             raise ValueError("Non-finite values produced by _zscore")
-        return z.astype(np.float32, copy=False)
+        return out32
 
     # -------------------------------------------------------------------------
     # Public API
