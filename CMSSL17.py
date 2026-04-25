@@ -480,7 +480,7 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
-FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v4"
+FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v5"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
 CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-stage4-v4"
 EPOCHS          = 200
@@ -521,8 +521,6 @@ PRICE_WINDOWS_MS = (
     15_000,
     30_000,
     60_000,
-    120_000,
-    300_000,
 )
 NORMALIZED_OFI_LEVELS = (
     1,
@@ -587,15 +585,20 @@ ROLLING_OBI_WINDOWS_MS = (15_000, 30_000, 60_000)
 DEEP_MICRO_LEVELS = (3, 5, 10, 20)
 TRADE_BURST_WINDOWS_MS = (7_500, 15_000, 30_000)
 LARGE_TRADE_CONTINUATION_WINDOWS_MS = (7_500, 15_000)
-REGIME_WINDOWS_MS = (3_000, 7_500, 15_000, 30_000, 60_000, 120_000, 300_000)
+REGIME_WINDOWS_MS = (
+    3_000,
+    7_500,
+    15_000,
+    30_000,
+    60_000,
+    120_000,
+)
 EVENT_DENSITY_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
 EMA_HALF_LIVES_MS = (7_500, 15_000, 30_000, 60_000, 120_000)
 MACD_TRIPLETS_MS = (
     (7_500, 15_000, 10_000),
     (15_000, 30_000, 20_000),
     (30_000, 60_000, 40_000),
-    (60_000, 120_000, 90_000),
-    (120_000, 300_000, 180_000),
 )
 VPIN_BUCKET_SECS = (7.5, 15.0, 30.0)
 SPREAD_DEPTH_REGIME_WINDOWS_MS = (
