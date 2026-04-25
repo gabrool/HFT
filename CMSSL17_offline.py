@@ -37,7 +37,7 @@ from CMSSL17 import (  # type: ignore
     PRIMARY_DIR_BAL_ACC_GUARD,
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
-    DIR_LOSS_WEIGHT, MAG_LOSS_WEIGHT, MAG_CORR_LOSS_WEIGHT, MAG_SQRT_EPS, EMA_DECAY,
+    DIR_LOSS_WEIGHT, MAG_LOSS_WEIGHT, MAG_CORR_LOSS_WEIGHT, EMA_DECAY,
     FEATURE_SCHEMA, AUX_SCHEMA, FEATURE_AUX_TAIL,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     derive_dir_mag_predictions, derive_mag_pred_sqrt_for_mag_loss,
@@ -398,7 +398,7 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
-    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','spearman_ranking_schema')
+    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','ranking_schema')
     return all(cached_meta.get(k)==current_meta.get(k) for k in keys)
 
 
@@ -865,10 +865,15 @@ def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, prim
             dn_h = kh & (y_raw[:, h] < 0)
             errs = []
             if np.any(up_h):
-                errs.append(np.abs(mag_up_sqrt[:, h][up_h] - np.sqrt(abs_raw[:, h][up_h])))
+                errs.append(mag_up_sqrt[:, h][up_h] - np.sqrt(abs_raw[:, h][up_h]))
             if np.any(dn_h):
-                errs.append(np.abs(mag_down_sqrt[:, h][dn_h] - np.sqrt(abs_raw[:, h][dn_h])))
-            out["val_mag_huber_kept"].append(float(np.mean(np.concatenate(errs))) if errs else float("nan"))
+                errs.append(mag_down_sqrt[:, h][dn_h] - np.sqrt(abs_raw[:, h][dn_h]))
+            if errs:
+                d = np.abs(np.concatenate(errs))
+                hub = np.where(d <= 1.0, 0.5 * d * d, d - 0.5)
+                out["val_mag_huber_kept"].append(float(np.mean(hub)))
+            else:
+                out["val_mag_huber_kept"].append(float("nan"))
         else:
             out["val_dir_bce_kept"].append(float("nan"))
             out["val_mag_huber_kept"].append(float("nan"))
@@ -952,8 +957,8 @@ def train_from_offline():
         'train_ts_start': int(tr_start), 'train_ts_end': int(tr_end), 'decision_time_basis': EXPECTED_DECISION_TIME_BASIS,
         'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
         'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK,
-        'loss_weighting_schema': 'smooth_two_sigmoid_q50_q85_v1',
-        'spearman_ranking_schema': 'tie_aware_average_ranks_v1'
+        'loss_weighting_schema': 'dir_mag_smooth_q50_q85_class_bal_v1',
+        'ranking_schema': 'tie_aware_average_ranks_v1'
     }
     cached=load_stats_cache(cache_path); stats=None
     if cached and cache_matches(cached[1], cache_meta): stats=cached[0]
