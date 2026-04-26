@@ -1403,6 +1403,45 @@ def _print_coarse_timing_totals(prefix: str, totals: Dict[str, float]) -> None:
     print(f"{prefix} {' '.join(parts)}", flush=True)
 
 
+def _numeric_delta(cur: dict, prev: dict, key: str) -> float:
+    cur_v = cur.get(key, 0.0)
+    prev_v = prev.get(key, 0.0)
+    try:
+        return float(cur_v) - float(prev_v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _feature_timer_sections_delta(cur: dict, prev: dict) -> Dict[str, float]:
+    cur_sections = cur.get("feature_sections_s", {}) or {}
+    prev_sections = prev.get("feature_sections_s", {}) or {}
+    keys = set(cur_sections.keys()) | set(prev_sections.keys())
+    out: Dict[str, float] = {}
+    for key in keys:
+        try:
+            out[key] = float(cur_sections.get(key, 0.0)) - float(prev_sections.get(key, 0.0))
+        except (TypeError, ValueError):
+            out[key] = 0.0
+    return out
+
+
+def _format_top_feature_sections(sections_delta: Dict[str, float], ob_delta: int, top_n: int = 10) -> str:
+    if not sections_delta:
+        return ""
+    den = max(1, int(ob_delta))
+    parts: List[str] = []
+    for name, seconds in sorted(sections_delta.items(), key=lambda kv: kv[1], reverse=True):
+        sec = float(seconds)
+        if sec == 0.0:
+            continue
+        label = name[:-2] if name.endswith("_s") else name
+        ms_per_ob = 1000.0 * sec / den
+        parts.append(f"{label}={sec:.3f}s/{ms_per_ob:.3f}ms/ob")
+        if len(parts) >= int(top_n):
+            break
+    return " ".join(parts)
+
+
 
 
 def _iter_week_merged_events(
@@ -1760,6 +1799,11 @@ def _stream_core_features(pairs: List[WeekPair]):
     stream_started = time.monotonic()
     queue_wait_s = 0.0
     event_proc_s = 0.0
+    events_seen = 0
+    last_log_rows = 0
+    last_log_events = 0
+    last_log_time = stream_started
+    last_fe_timer_snapshot = fe.timer_totals()
 
     feeder = EventFeeder(pairs, collect_quality=False)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
@@ -1809,6 +1853,7 @@ def _stream_core_features(pairs: List[WeekPair]):
                 )
                 raise
             event_proc_s += time.monotonic() - t_evt
+            events_seen += 1
             if last_global_ts is not None and ts_ms < last_global_ts:
                 raise ValueError(
                     "Non-monotonic timestamps across weeks during PCA stream: "
@@ -1822,8 +1867,38 @@ def _stream_core_features(pairs: List[WeekPair]):
             sample_count += 1
             now = time.monotonic()
             if now - last_log >= 300:
-                print(f"[pca-stream] rows_seen={sample_count} last_wk={last_wk}", flush=True)
+                interval_s = max(1e-9, now - last_log_time)
+                rows_delta = int(sample_count - last_log_rows)
+                events_delta = int(events_seen - last_log_events)
+                rows_per_sec = rows_delta / interval_s
+                events_per_sec = events_delta / interval_s
+                print(
+                    f"[pca-stream] rows_seen={sample_count} last_wk={last_wk} "
+                    f"rows_per_sec_interval={rows_per_sec:.2f} events_per_sec_interval={events_per_sec:.2f}",
+                    flush=True,
+                )
+                cur_totals = fe.timer_totals()
+                ob_delta = int(_numeric_delta(cur_totals, last_fe_timer_snapshot, "ob_feature_build_count"))
+                feature_build_delta = _numeric_delta(cur_totals, last_fe_timer_snapshot, "feature_build_s")
+                feature_build_ms_per_ob = 1000.0 * feature_build_delta / max(1, ob_delta)
+                print(
+                    f"[pca-fe-delta] parse_dispatch={_numeric_delta(cur_totals, last_fe_timer_snapshot, 'parse_dispatch_s'):.3f}s "
+                    f"book_update={_numeric_delta(cur_totals, last_fe_timer_snapshot, 'order_book_update_s'):.3f}s "
+                    f"trade_update={_numeric_delta(cur_totals, last_fe_timer_snapshot, 'trade_update_s'):.3f}s "
+                    f"feature_build={feature_build_delta:.3f}s "
+                    f"feature_build_ms_per_ob={feature_build_ms_per_ob:.3f}",
+                    flush=True,
+                )
+                sections_delta = _feature_timer_sections_delta(cur_totals, last_fe_timer_snapshot)
+                print(
+                    f"[pca-fe-sections] {_format_top_feature_sections(sections_delta, ob_delta, top_n=10)}",
+                    flush=True,
+                )
                 last_log = now
+                last_log_rows = int(sample_count)
+                last_log_events = int(events_seen)
+                last_log_time = now
+                last_fe_timer_snapshot = cur_totals
             yield np.asarray(feat_z, dtype=np.float32)
     finally:
         producer_thread.join(timeout=2.0)
@@ -2143,6 +2218,14 @@ def process_all(
     queue_wait_s = 0.0
     event_proc_s = 0.0
     router_housekeeping_s = 0.0
+    events_seen = 0
+    last_log_rows = 0
+    last_log_labels = 0
+    last_log_events = 0
+    last_log_queue_full = 0
+    last_log_event_proc_s = 0.0
+    last_log_time = ingest_started
+    last_fe_timer_snapshot = fe.timer_totals()
 
     feeder = EventFeeder(pairs)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
@@ -2190,6 +2273,7 @@ def process_all(
         t_evt = time.monotonic()
         ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_fast_event(event)
         event_proc_s += time.monotonic() - t_evt
+        events_seen += 1
         if is_trade and np.asarray(feat_z).shape[0] != 0:
             raise RuntimeError("Trade fast path returned a non-empty feature vector")
 
@@ -2264,13 +2348,53 @@ def process_all(
 
         if time.monotonic() - last_log >= 300:
             elapsed = max(1e-9, time.monotonic() - ingest_started)
+            now = time.monotonic()
+            interval_s = max(1e-9, now - last_log_time)
+            rows_delta = int(total_feature_rows - last_log_rows)
+            labels_delta = int(total_labels - last_log_labels)
+            events_delta = int(events_seen - last_log_events)
+            queue_full_delta = int(feeder._queue_full_count - last_log_queue_full)
+            event_proc_s_delta = event_proc_s - last_log_event_proc_s
+            cur_totals = fe.timer_totals()
+            ob_delta = int(_numeric_delta(cur_totals, last_fe_timer_snapshot, "ob_feature_build_count"))
+            feature_build_delta = _numeric_delta(cur_totals, last_fe_timer_snapshot, "feature_build_s")
+            feature_build_ms_per_ob = 1000.0 * feature_build_delta / max(1, ob_delta)
             print(
                 f"[tok  ] rows={total_feature_rows} labels={total_labels} weeks={week_counter}/{week_total} "
                 f"chunkN={router.chunk_size_used if router else 0} rows_per_sec={total_feature_rows/elapsed:.2f} "
                 f"queue_full={feeder._queue_full_count}",
                 flush=True,
             )
-            last_log = time.monotonic()
+            print(
+                f"[tok-time] interval_s={interval_s:.2f} events_delta={events_delta} rows_delta={rows_delta} "
+                f"labels_delta={labels_delta} rows_per_sec_interval={rows_delta/interval_s:.2f} "
+                f"events_per_sec_interval={events_delta/interval_s:.2f} event_proc_s_delta={event_proc_s_delta:.2f} "
+                f"queue_wait_s_total={queue_wait_s:.2f} router_housekeeping_s_total={router_housekeeping_s:.2f} "
+                f"queue_full_delta={queue_full_delta}",
+                flush=True,
+            )
+            print(
+                f"[tok-fe-delta] parse_dispatch={_numeric_delta(cur_totals, last_fe_timer_snapshot, 'parse_dispatch_s'):.3f}s "
+                f"book_update={_numeric_delta(cur_totals, last_fe_timer_snapshot, 'order_book_update_s'):.3f}s "
+                f"trade_update={_numeric_delta(cur_totals, last_fe_timer_snapshot, 'trade_update_s'):.3f}s "
+                f"feature_build={feature_build_delta:.3f}s feature_build_ms_per_ob={feature_build_ms_per_ob:.3f} "
+                f"trade_fast_path_delta={int(_numeric_delta(cur_totals, last_fe_timer_snapshot, 'trade_fast_path_count'))} "
+                f"ob_feature_delta={ob_delta}",
+                flush=True,
+            )
+            sections_delta = _feature_timer_sections_delta(cur_totals, last_fe_timer_snapshot)
+            print(
+                f"[tok-fe-sections] {_format_top_feature_sections(sections_delta, ob_delta, top_n=10)}",
+                flush=True,
+            )
+            last_log = now
+            last_log_rows = int(total_feature_rows)
+            last_log_labels = int(total_labels)
+            last_log_events = int(events_seen)
+            last_log_queue_full = int(feeder._queue_full_count)
+            last_log_event_proc_s = float(event_proc_s)
+            last_log_time = now
+            last_fe_timer_snapshot = cur_totals
 
     producer_thread.join()
 

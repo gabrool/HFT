@@ -1707,6 +1707,32 @@ class FeatureEngine:
         self.timer_feature_build_s: float = 0.0
         self.trade_fast_path_count: int = 0
         self.ob_feature_build_count: int = 0
+        self.timer_feature_sections_s: Dict[str, float] = {
+            "ob_core_state_s": 0.0,
+            "trade_window_stats_s": 0.0,
+            "cvd_large_burst_s": 0.0,
+            "event_age_depletion_s": 0.0,
+            "return_regime_state_s": 0.0,
+            "price_window_features_s": 0.0,
+            "depth_5bps_history_s": 0.0,
+            "band_depth_features_s": 0.0,
+            "slippage_features_s": 0.0,
+            "rolling_ofi_obi_s": 0.0,
+            "deep_micro_features_s": 0.0,
+            "slippage_derived_features_s": 0.0,
+            "indicator_ema_s": 0.0,
+            "feature_assembly_main_s": 0.0,
+            "spread_depth_regime_s": 0.0,
+            "feature_assembly_tail_s": 0.0,
+            "feature_validation_s": 0.0,
+            "zscore_s": 0.0,
+            "post_feature_state_s": 0.0,
+        }
+
+    def _add_feature_timer(self, name: str, t0: float) -> None:
+        if name not in self.timer_feature_sections_s:
+            self.timer_feature_sections_s[name] = 0.0
+        self.timer_feature_sections_s[name] += time.perf_counter() - t0
 
     def feature_names(self) -> List[str]:
         if self._feature_names_cache is not None:
@@ -3528,7 +3554,8 @@ class FeatureEngine:
         else:
             raise ValueError(f"Unsupported event type in _dispatch_parsed_event: {etype!r}")
 
-        t0 = time.perf_counter()
+        feature_total_t0 = time.perf_counter()
+        section_t0 = time.perf_counter()
         self._ensure_book_ladders()
         session_features = self._compute_session_features(ts_ms)
         bid1, ask1, bsz1, asz1 = self._book_best()
@@ -3624,10 +3651,17 @@ class FeatureEngine:
             self.ofi_pressure_by_window[ms] = self._ewma_update(self.ofi_pressure_by_window[ms], ofi_l1, dt_ms, ms)
         ofi_pressure_by_ms = {ms: self.ofi_pressure_by_window[ms] for ms in FAST_WINDOWS_MS}
 
+        self._add_feature_timer("ob_core_state_s", section_t0)
+
+        section_t0 = time.perf_counter()
         trade_stats_by_ms = {ms: self._compute_trade_window_stats(ms, ts_ms, mid, micro) for ms in self.trade_windows}
         if etype == "ob":
             self.last_ob_ofi_l5 = float(ofi_l5)
             self.last_ob_trade_imbalance_30000ms = float(trade_stats_by_ms[30_000]["trade_imbalance_notional"])
+        self._add_feature_timer("trade_window_stats_s", section_t0)
+
+        section_t0 = time.perf_counter()
+        cvd_section_t0 = section_t0
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in self.trade_windows:
             cvd_state = self.cvd_window_states[ms]
@@ -3646,6 +3680,7 @@ class FeatureEngine:
         large_stats_by_ms = {ms: self._large_trade_stats_from_state(ms, ts_ms) for ms in self.trade_windows}
         trade_burst_features = self._trade_burst_features_from_state(ts_ms)
 
+        section_t0 = time.perf_counter()
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
             self.last_bid_price_change_ts = ts_ms
         if self.prev_ask1_price is None or ask1 != self.prev_ask1_price:
@@ -3715,6 +3750,8 @@ class FeatureEngine:
         best_ask_lifetime_ms = time_since_ask_price_change_ms
         mid_price_staleness_ms = time_since_mid_change_ms
 
+        self._add_feature_timer("event_age_depletion_s", section_t0)
+
         def _ofi_since(ts0: Optional[int]) -> float:
             if ts0 is None:
                 return 0.0
@@ -3749,6 +3786,9 @@ class FeatureEngine:
             if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= 15_000) else 0.0,
         }
 
+        self._add_feature_timer("cvd_large_burst_s", cvd_section_t0)
+
+        section_t0 = time.perf_counter()
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
         return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
         return_std_bps = {ms: math.sqrt(var) for ms, var in return_var.items()}
@@ -3773,6 +3813,9 @@ class FeatureEngine:
 
         replen_rates = self._replenishment_rates()
 
+        self._add_feature_timer("return_regime_state_s", section_t0)
+
+        section_t0 = time.perf_counter()
         price_features_by_window: Dict[int, Tuple[float, ...]] = {}
         for w in PRICE_WINDOWS_MS:
             past_mid = self._series_asof(ts_ms - w, "mid")
@@ -3789,6 +3832,9 @@ class FeatureEngine:
                 sign_persistence, up_frac, autocorr,
             )
 
+        self._add_feature_timer("price_window_features_s", section_t0)
+
+        section_t0 = time.perf_counter()
         bid_depth_5bps = self._depth_within_bps(self.bid_lvls, mid, 5.0, is_bid=True)
         ask_depth_5bps = self._depth_within_bps(self.ask_lvls, mid, 5.0, is_bid=False)
         depth_5bps_total = bid_depth_5bps["size"] + ask_depth_5bps["size"]
@@ -3803,6 +3849,9 @@ class FeatureEngine:
         self._append_metric_history(self._depth_5bps_total_history, ts_ms, depth_5bps_total, self._regime_metric_keep_ms)
         self._append_metric_history(self._depth_5bps_imbalance_history, ts_ms, depth_5bps_imbalance, self._regime_metric_keep_ms)
 
+        self._add_feature_timer("depth_5bps_history_s", section_t0)
+
+        section_t0 = time.perf_counter()
         band_depth_stats: Dict[float, Dict[str, dict]] = {}
         for band in BPS_DEPTH_BANDS:
             band_depth_stats[band] = {
@@ -3816,6 +3865,9 @@ class FeatureEngine:
                 "ask": self._depth_within_bps(self.ask_lvls, mid, band, is_bid=False),
             }
 
+        self._add_feature_timer("band_depth_features_s", section_t0)
+
+        section_t0 = time.perf_counter()
         slippage_by_notional: Dict[float, Dict[str, dict]] = {}
         for notional in SLIPPAGE_NOTIONAL_USD:
             slippage_by_notional[notional] = {
@@ -3823,6 +3875,9 @@ class FeatureEngine:
                 "sell": self._slippage_for_notional(self.bid_lvls, mid, notional, is_buy=False),
             }
 
+        self._add_feature_timer("slippage_features_s", section_t0)
+
+        section_t0 = time.perf_counter()
         rolling_ofi_sums: Dict[Tuple[int, int], float] = {}
         rolling_obi_stats: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
         if etype == "ob":
@@ -3908,6 +3963,9 @@ class FeatureEngine:
             "slippage_curve_convexity_sell": sell_slope_50_250 - sell_slope_10_50,
         })
 
+        self._add_feature_timer("slippage_derived_features_s", section_t0)
+
+        section_t0 = time.perf_counter()
         indicator_values = {
             "spread_bps": spread_bps,
             "gap_a_bps": gap_a_bps,
@@ -3974,6 +4032,9 @@ class FeatureEngine:
         bid_5bps_levels = [(p, s) for p, s in self.bid_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p <= mid and (1e4 * (mid - p) / mid) <= 5.0]
         ask_5bps_levels = [(p, s) for p, s in self.ask_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p >= mid and (1e4 * (p - mid) / mid) <= 5.0]
 
+        self._add_feature_timer("indicator_ema_s", section_t0)
+
+        section_t0 = time.perf_counter()
         feat_list: List[float] = []
         feat_list.extend([
             session_features["time_hour_sin"],
@@ -4287,6 +4348,9 @@ class FeatureEngine:
                 dist["return_kurtosis"],
             ])
 
+        self._add_feature_timer("feature_assembly_main_s", section_t0)
+
+        section_t0 = time.perf_counter()
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
             spread_points = self._metric_values(self._spread_bps_history, ts_ms, ms)
             spread_vals = [v for _, v in spread_points]
@@ -4328,6 +4392,9 @@ class FeatureEngine:
                 (ask_depth_5bps["size"] / max(ask_mean, 1e-9)) - 1.0,
             ])
 
+        self._add_feature_timer("spread_depth_regime_s", section_t0)
+
+        section_t0 = time.perf_counter()
         bid_depth_5bps_base = float(band_depth_stats[5.0]["bid"]["size"])
         ask_depth_5bps_base = float(band_depth_stats[5.0]["ask"]["size"])
         bid_notional_5bps_base = float(band_depth_stats[5.0]["bid"]["notional"])
@@ -4409,6 +4476,9 @@ class FeatureEngine:
             macd_features.extend([raw_bps, sig_bps, hist_bps])
         feat_list.extend(macd_features)
         feat_list.extend(vpin_features)
+        self._add_feature_timer("feature_assembly_tail_s", section_t0)
+
+        section_t0 = time.perf_counter()
         names = self.feature_names()
         if len(feat_list) != len(names):
             raise ValueError(
@@ -4422,8 +4492,14 @@ class FeatureEngine:
             if not np.isfinite(float(value)):
                 raise ValueError(f"Non-finite feature {name}={value!r} at ts_ms={ts_ms}")
 
+        self._add_feature_timer("feature_validation_s", section_t0)
+
+        section_t0 = time.perf_counter()
         feat = np.array(feat_list, dtype=np.float64)
         feat_z = self._zscore(feat, ts_ms)
+        self._add_feature_timer("zscore_s", section_t0)
+
+        section_t0 = time.perf_counter()
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
@@ -4431,8 +4507,9 @@ class FeatureEngine:
         self.prev_spread_for_age = spread
         self.last_ts = ts_ms
         self._last_event_ts = ts_ms
+        self._add_feature_timer("post_feature_state_s", section_t0)
 
-        self.timer_feature_build_s += time.perf_counter() - t0
+        self.timer_feature_build_s += time.perf_counter() - feature_total_t0
         self.ob_feature_build_count += 1
         return ts_ms, feat_z, mid, is_trade, dt_ms
 
@@ -4920,6 +4997,8 @@ class FeatureEngine:
         return self._dispatch_parsed_event(etype, ts_ms, payload)
 
     def timer_totals(self) -> Dict[str, float]:
+        feature_sections = {k: float(v) for k, v in self.timer_feature_sections_s.items()}
+        feature_sections_sum = float(sum(feature_sections.values()))
         return {
             'parse_dispatch_s': float(self.timer_parse_dispatch_s),
             'order_book_update_s': float(self.timer_book_update_s),
@@ -4927,6 +5006,9 @@ class FeatureEngine:
             'feature_build_s': float(self.timer_feature_build_s),
             'trade_fast_path_count': int(self.trade_fast_path_count),
             'ob_feature_build_count': int(self.ob_feature_build_count),
+            'feature_sections_s': feature_sections,
+            'feature_sections_sum_s': feature_sections_sum,
+            'feature_unattributed_s': float(self.timer_feature_build_s - feature_sections_sum),
         }
 
     def print_timer_totals(self, prefix: str = '[timers]') -> None:
@@ -4936,10 +5018,22 @@ class FeatureEngine:
             f"order_book_update={totals['order_book_update_s']:.6f}s "
             f"trade_update={totals['trade_update_s']:.6f}s "
             f"feature_build={totals['feature_build_s']:.6f}s "
+            f"feature_sections_sum={totals['feature_sections_sum_s']:.6f}s "
+            f"feature_unattributed={totals['feature_unattributed_s']:.6f}s "
             f"trade_fast_path_count={totals['trade_fast_path_count']} "
             f"ob_feature_build_count={totals['ob_feature_build_count']}",
             flush=True,
         )
+        sections = totals.get('feature_sections_s', {})
+        ob_count = max(1, int(self.ob_feature_build_count))
+        parts = []
+        for key, seconds in sorted(sections.items(), key=lambda kv: kv[1], reverse=True):
+            if float(seconds) == 0.0:
+                continue
+            label = key[:-2] if key.endswith('_s') else key
+            ms_per_ob = 1000.0 * float(seconds) / ob_count
+            parts.append(f"{label}={float(seconds):.6f}s/{ms_per_ob:.3f}ms/ob")
+        print(f"[timers-detail] {' '.join(parts)}", flush=True)
 
 
 class LabelBuilder:
