@@ -40,7 +40,7 @@ Shared constants from CMSSL17:
   Decision timestamps are the actual OB event timestamps (event-time).
 """
 
-import os, sys, csv, json, re, time, logging, hashlib
+import os, sys, csv, json, re, time, logging, hashlib, math
 import queue
 import threading
 from dataclasses import dataclass, field
@@ -1724,7 +1724,7 @@ def _stream_core_features(pairs: List[WeekPair]):
             sample_count += 1
             now = time.monotonic()
             if now - last_log >= 300:
-                print(f"[pca-sample] rows={sample_count} last_wk={last_wk}", flush=True)
+                print(f"[pca-stream] rows_seen={sample_count} last_wk={last_wk}", flush=True)
                 last_log = now
             yield np.asarray(feat_z, dtype=np.float32)
     finally:
@@ -1742,31 +1742,43 @@ def _stream_core_features(pairs: List[WeekPair]):
         fe.print_timer_totals(prefix="[pca-timers]")
 
 
-def _select_pca_components(sample_rows: np.ndarray, target_var: float) -> int:
+def _fit_pca_svd_from_sample(sample_rows: np.ndarray, target_var: float) -> Dict[str, np.ndarray]:
     if sample_rows.ndim != 2 or sample_rows.size == 0:
-        return 0
+        raise ValueError("PCA sample_rows must be a non-empty 2D array")
+
     n_samples, n_features = sample_rows.shape
-    if n_samples == 0 or n_features == 0:
-        return 0
+    if n_samples < 2:
+        raise ValueError(f"PCA requires at least 2 sample rows, got {n_samples}")
+    if n_features <= 0:
+        raise ValueError("PCA sample has zero features")
+
     target = float(max(0.0, min(1.0, target_var)))
     if target <= 0.0:
-        return 0
+        raise ValueError(f"PCA target_var must be positive, got {target_var}")
 
-    mean_vec = np.mean(sample_rows, axis=0, keepdims=True)
-    centered = sample_rows - mean_vec
-    try:
-        _u, s, _vh = np.linalg.svd(centered, full_matrices=False)
-    except np.linalg.LinAlgError:
-        return min(n_samples, n_features)
-    denom = max(1, n_samples - 1)
-    explained = (s ** 2) / denom
-    total = float(np.sum(explained))
-    if not np.isfinite(total) or total <= 0.0:
-        return min(n_samples, n_features)
-    ratios = np.cumsum(explained / total)
-    k_idx = int(np.searchsorted(ratios, target, side="left"))
-    k = max(1, min(n_features, n_samples, k_idx + 1))
-    return k
+    x = np.asarray(sample_rows, dtype=np.float64)
+    mean = np.mean(x, axis=0)
+    centered = x - mean.reshape(1, -1)
+    _u, s, vt = np.linalg.svd(centered, full_matrices=False)
+
+    explained_variance = (s * s) / max(1, n_samples - 1)
+    total_variance = float(np.sum(explained_variance))
+    if not math.isfinite(total_variance) or total_variance <= 0.0:
+        raise ValueError("PCA sample has non-positive total variance")
+
+    explained_ratio_all = explained_variance / total_variance
+    cum = np.cumsum(explained_ratio_all)
+
+    k = int(np.searchsorted(cum, target, side="left") + 1)
+    k = max(1, min(k, vt.shape[0]))
+
+    return {
+        "mean": mean.astype(np.float32, copy=False),
+        "components": vt[:k].astype(np.float32, copy=False),
+        "explained_variance_ratio": explained_ratio_all[:k].astype(np.float32, copy=False),
+        "k": np.array(k, dtype=np.int64),
+        "total_explained_variance_ratio": np.array(float(cum[k - 1]), dtype=np.float32),
+    }
 
 
 def maybe_fit_pca_model(
@@ -1801,9 +1813,6 @@ def maybe_fit_pca_model(
         "feature_dim_core_pre_pca": int(len(feature_names_pre_pca)),
         "feature_names_hash": names_hash,
     }
-    last_log = time.monotonic()
-    batches = 0
-
     if target_var <= 0.0:
         raise ValueError(f"PCA is required for FEATURE_SCHEMA={FEATURE_SCHEMA}")
 
@@ -1839,98 +1848,57 @@ def maybe_fit_pca_model(
         print(f"[pca  ] Reusing existing PCA model '{model_path}' (k={k})")
         return meta
 
-    try:
-        from sklearn.decomposition import IncrementalPCA  # type: ignore
-    except Exception as exc:
-        raise ValueError(f"Failed to load required PCA model tooling: {exc}") from exc
-
     train_set = set(train_weeks)
     train_pairs = [p for p in pairs if p[0] in train_set]
     if not train_pairs:
         raise ValueError(f"PCA is required for FEATURE_SCHEMA={FEATURE_SCHEMA}")
 
     sample_limit = max(1, int(sample_limit))
-    batch_size = int(batch_size)
+    _ = int(batch_size)
+
+    print(
+        f"[pca-collect] target_rows={sample_limit} target_var={target_var:.4f} method=sample_capped_full_svd",
+        flush=True,
+    )
 
     sample_rows: List[np.ndarray] = []
-    sample_array: Optional[np.ndarray] = None
-    pad_rows: Optional[np.ndarray] = None
-    ipca = None
-    fitted_rows = 0
     total_rows = 0
-    pending: List[np.ndarray] = []
-    n_components = 0
-
-    def flush_pending(force: bool = False):
-        nonlocal pending, fitted_rows, batches, last_log
-        if ipca is None or not pending:
-            return
-        need = max(1, ipca.n_components)
-        thresh = max(need, batch_size) if batch_size > 0 else need
-        if not force and len(pending) < thresh:
-            return
-        arr = np.asarray(pending, dtype=np.float32)
-        actual_rows = arr.shape[0]
-        if actual_rows < need:
-            source = pad_rows if pad_rows is not None and pad_rows.size else sample_array
-            if source is not None and source.shape[0] >= need:
-                pad_needed = need - actual_rows
-                arr = np.vstack([arr, source[:pad_needed]])
-        ipca.partial_fit(arr)
-        fitted_rows += actual_rows
-        batches += 1
-        if time.monotonic() - last_log >= 300:
-            print(f"[pca-fit] fitted={fitted_rows} batches={batches}", flush=True)
-            last_log = time.monotonic()
-        pending = []
-
-    def ensure_ipca(force: bool = False):
-        nonlocal ipca, sample_array, pad_rows, n_components, fitted_rows, last_log
-        if ipca is not None:
-            return
-        if not sample_rows:
-            return
-        if not force and len(sample_rows) < sample_limit:
-            return
-        sample_array = np.asarray(sample_rows, dtype=np.float32)
-        n_components = _select_pca_components(sample_array, target_var)
-        if n_components <= 0:
-            return
-        ipca = IncrementalPCA(
-            n_components=n_components,
-            batch_size=None if batch_size <= 0 else max(batch_size, n_components),
-        )
-        ipca.partial_fit(sample_array)
-        print(f"[pca-init] n_components={n_components} sample_rows={sample_array.shape[0]}", flush=True)
-        last_log = time.monotonic()
-        fitted_rows += sample_array.shape[0]
-        pad_rows = sample_array[:n_components].copy()
-        sample_rows.clear()
+    collect_last_log = time.monotonic()
+    collect_log_step = 25_000
 
     for feat in _stream_core_features(train_pairs):
         total_rows += 1
-        vec = np.asarray(feat, dtype=np.float32)
-        if ipca is None:
-            sample_rows.append(vec)
-            ensure_ipca()
-            continue
-        pending.append(vec)
-        flush_pending()
+        sample_rows.append(np.asarray(feat, dtype=np.float32))
+        now = time.monotonic()
+        if len(sample_rows) % collect_log_step == 0 or (now - collect_last_log >= 300):
+            print(f"[pca-collect] rows={len(sample_rows)}/{sample_limit}", flush=True)
+            collect_last_log = now
+        if len(sample_rows) >= sample_limit:
+            break
 
-    ensure_ipca(force=True)
-
-    if ipca is None:
+    if not sample_rows:
         raise ValueError(f"PCA is required for FEATURE_SCHEMA={FEATURE_SCHEMA}")
 
-    flush_pending(force=True)
+    sample_array = np.asarray(sample_rows, dtype=np.float32)
+    print(
+        f"[pca-fit] method=sample_capped_full_svd rows={sample_array.shape[0]} raw_dim={sample_array.shape[1]}",
+        flush=True,
+    )
+    pca_fit = _fit_pca_svd_from_sample(sample_array, target_var)
+    mean = pca_fit["mean"]
+    components = pca_fit["components"]
+    explained_variance_ratio = pca_fit["explained_variance_ratio"]
+    k = int(pca_fit["k"])
+    total_kept = float(pca_fit["total_explained_variance_ratio"])
+    print(f"[pca-init] n_components={k} sample_rows={sample_array.shape[0]} kept_var={total_kept:.6f}", flush=True)
 
     model_path = os.path.join(out_root, model_filename)
     ensure_dir(os.path.dirname(model_path))
     np.savez(
         model_path,
-        mean=ipca.mean_.astype(np.float32, copy=False),
-        components=ipca.components_.astype(np.float32, copy=False),
-        explained_variance_ratio=ipca.explained_variance_ratio_.astype(np.float32, copy=False),
+        mean=mean,
+        components=components,
+        explained_variance_ratio=explained_variance_ratio,
         metadata_json=np.array(
             json.dumps(
                 {
@@ -1940,7 +1908,11 @@ def maybe_fit_pca_model(
                     "feature_names_pre_pca": feature_names_pre_pca,
                     "feature_names_hash": names_hash,
                     "created_by": "offline_ingest.py",
-                    "stage": "stage4_v4",
+                    "stage": "stage4_v5",
+                    "pca_fit_method": "sample_capped_full_svd",
+                    "pca_sample_rows": int(sample_array.shape[0]),
+                    "pca_target_var": float(target_var),
+                    "pca_total_explained_variance_ratio": float(total_kept),
                 },
                 sort_keys=True,
             ),
@@ -1951,17 +1923,20 @@ def maybe_fit_pca_model(
     meta.update(
         {
             "applied": True,
-            "k": int(ipca.n_components),
+            "k": int(k),
             "model_path": model_filename,
-            "rows_fitted": int(fitted_rows),
-            "rows_total": int(total_rows),
-            "sample_rows": int(sample_array.shape[0] if sample_array is not None else 0),
+            "rows_fitted": int(sample_array.shape[0]),
+            "rows_total_seen_for_pca": int(total_rows),
+            "sample_rows": int(sample_array.shape[0]),
+            "fit_method": "sample_capped_full_svd",
+            "total_explained_variance_ratio": float(total_kept),
         }
     )
 
     print(
         f"[pca  ] applied target={target_var:.4f} k={meta['k']} "
-        f"sample={meta.get('sample_rows', 0)} fitted={meta.get('rows_fitted', 0)}"
+        f"sample={meta.get('sample_rows', 0)} fitted={meta.get('rows_fitted', 0)} "
+        f"method={meta.get('fit_method')}"
     )
 
     return meta
