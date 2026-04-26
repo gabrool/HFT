@@ -1320,17 +1320,86 @@ class TradeBurstWindowState:
 @dataclass
 class CVDWindowState:
     window_ms: int
-    points: Deque[Tuple[int, float]]
-    asof_cutoff_value: float
+    points: Deque[Tuple[int, float, float]]
+    asof_before_window_value: float
     n: int
     sum_t: float
     sum_y: float
     sum_t2: float
     sum_ty: float
+    anchor_ms: Optional[int]
 
     @classmethod
     def create(cls, window_ms: int, initial_cvd: float = 0.0) -> "CVDWindowState":
-        return cls(int(window_ms), deque(), float(initial_cvd), 0, 0.0, 0.0, 0.0, 0.0)
+        return cls(int(window_ms), deque(), float(initial_cvd), 0, 0.0, 0.0, 0.0, 0.0, None)
+
+    def add(self, ts_ms: int, cvd_value: float) -> None:
+        ts = int(ts_ms)
+        y = float(cvd_value)
+        if not math.isfinite(y):
+            raise ValueError(f"Non-finite CVD value for window={self.window_ms}: {cvd_value!r}")
+        if self.anchor_ms is None:
+            self.anchor_ms = ts
+        t_rel_sec = (float(ts) - float(self.anchor_ms)) / 1000.0
+        self.points.append((ts, y, t_rel_sec))
+        self.n += 1
+        self.sum_t += t_rel_sec
+        self.sum_y += y
+        self.sum_t2 += t_rel_sec * t_rel_sec
+        self.sum_ty += t_rel_sec * y
+
+    def _remove_left_point(self) -> Tuple[int, float, float]:
+        ts, y, t_rel_sec = self.points.popleft()
+        self.n -= 1
+        self.sum_t -= t_rel_sec
+        self.sum_y -= y
+        self.sum_t2 -= t_rel_sec * t_rel_sec
+        self.sum_ty -= t_rel_sec * y
+        if self.n <= 0:
+            self.n = 0
+            if abs(self.sum_t) < 1e-9:
+                self.sum_t = 0.0
+            if abs(self.sum_y) < 1e-9:
+                self.sum_y = 0.0
+            if abs(self.sum_t2) < 1e-9:
+                self.sum_t2 = 0.0
+            if abs(self.sum_ty) < 1e-9:
+                self.sum_ty = 0.0
+        return ts, y, t_rel_sec
+
+    def prune(self, now_ms: int) -> None:
+        cutoff = int(now_ms) - int(self.window_ms)
+        while self.points and self.points[0][0] < cutoff:
+            _ts, y, _t_rel_sec = self._remove_left_point()
+            self.asof_before_window_value = y
+
+    def asof_cutoff_value(self, now_ms: int) -> float:
+        cutoff = int(now_ms) - int(self.window_ms)
+        baseline = float(self.asof_before_window_value)
+        for ts, y, _t_rel_sec in self.points:
+            if ts == cutoff:
+                baseline = y
+                continue
+            if ts > cutoff:
+                break
+        return float(baseline)
+
+    def slope_usd_per_sec(self) -> float:
+        if self.n < 3:
+            return 0.0
+        n = float(self.n)
+        den = self.sum_t2 - (self.sum_t * self.sum_t) / n
+        if den <= 1e-12 or not math.isfinite(den):
+            return 0.0
+        num = self.sum_ty - (self.sum_t * self.sum_y) / n
+        slope = num / den
+        return float(slope) if math.isfinite(float(slope)) else 0.0
+
+    def change_usd(self, now_ms: int, current_cvd: float) -> float:
+        return float(current_cvd) - self.asof_cutoff_value(now_ms)
+
+    def current_points_debug(self) -> List[Tuple[int, float, float]]:
+        return list(self.points)
 
 
 @dataclass
@@ -2757,6 +2826,28 @@ class FeatureEngine:
                 else:
                     st.run_lengths.pop(rid, None)
 
+    def _corr_lag1_from_sign_state(self, st: TradeBurstWindowState) -> float:
+        if st.buy_count < 0 or st.sell_count < 0 or st.pair_n < 0:
+            raise ValueError(
+                f"Invalid trade burst counts: buy={st.buy_count} sell={st.sell_count} pair_n={st.pair_n}"
+            )
+        total = int(st.buy_count + st.sell_count)
+        if total < 2 or st.pair_n <= 0:
+            return 0.0
+
+        n = float(st.pair_n)
+        var_x = st.sum_x2 - (st.sum_x * st.sum_x) / n
+        var_y = st.sum_y2 - (st.sum_y * st.sum_y) / n
+
+        if var_x <= 1e-12 or var_y <= 1e-12:
+            if total >= 2 and (st.buy_count == total or st.sell_count == total):
+                return 1.0
+            return 0.0
+
+        cov = st.sum_xy - (st.sum_x * st.sum_y) / n
+        corr = cov / math.sqrt(max(var_x, 1e-12) * max(var_y, 1e-12))
+        return float(corr) if math.isfinite(float(corr)) else 0.0
+
     def _trade_burst_features_from_state(self, ts_ms: int) -> Dict[str, float]:
         out: Dict[str, float] = {
             "consecutive_buy_trade_count": float(self.consecutive_buy_trade_count),
@@ -2786,14 +2877,7 @@ class FeatureEngine:
                 return 0
             max_buy_run = _max_run(st.buy_heap, 1)
             max_sell_run = _max_run(st.sell_heap, -1)
-            autocorr = 0.0
-            if st.pair_n > 0:
-                n = float(st.pair_n)
-                var_x = st.sum_x2 - (st.sum_x * st.sum_x) / n
-                var_y = st.sum_y2 - (st.sum_y * st.sum_y) / n
-                if var_x > 1e-12 and var_y > 1e-12:
-                    cov_xy = st.sum_xy - (st.sum_x * st.sum_y) / n
-                    autocorr = cov_xy / math.sqrt(var_x * var_y)
+            autocorr = self._corr_lag1_from_sign_state(st)
             out.update({
                 f"max_buy_run_length_{window}ms": float(max_buy_run),
                 f"max_sell_run_length_{window}ms": float(max_sell_run),
@@ -2803,6 +2887,15 @@ class FeatureEngine:
                 f"buy_trade_burst_score_{window}ms": self._safe_div(max_buy_run, max(total_signed, 1), 0.0),
                 f"sell_trade_burst_score_{window}ms": self._safe_div(max_sell_run, max(total_signed, 1), 0.0),
             })
+            for key in (
+                f"trade_sign_autocorr_lag1_{window}ms",
+                f"trade_sign_entropy_{window}ms",
+                f"trade_burst_score_{window}ms",
+                f"buy_trade_burst_score_{window}ms",
+                f"sell_trade_burst_score_{window}ms",
+            ):
+                if not math.isfinite(float(out[key])):
+                    raise ValueError(f"Non-finite trade burst feature {key}={out[key]!r}")
         return out
 
     def _bps_return(self, current: float, past: float) -> float:
@@ -2847,118 +2940,8 @@ class FeatureEngine:
         out.reverse()
         return out
 
-    def _cvd_asof(self, ts_query: int) -> float:
-        if not self._cvd_history:
-            return float(self.cvd_notional)
-        tq = int(ts_query)
-        for ts, value in reversed(self._cvd_history):
-            if ts <= tq:
-                return float(value)
-        return float(self._cvd_history[0][1])
-
-    def _cvd_window_points(self, now_ms: int, window_ms: int) -> List[Tuple[int, float]]:
-        cutoff = int(now_ms) - int(window_ms)
-        now = int(now_ms)
-        out: List[Tuple[int, float]] = []
-
-        for ts, value in reversed(self._cvd_history):
-            ts_i = int(ts)
-            if ts_i > now:
-                continue
-            if ts_i < cutoff:
-                break
-            v = float(value)
-            if math.isfinite(v):
-                out.append((ts_i, v))
-
-        out.reverse()
-        return out
-
-    def _recent_trades_for_window(
-        self,
-        ms: int,
-        now_ms: int,
-    ) -> List[Tuple[int, float, float, float, str, float, float, float]]:
-        cutoff = int(now_ms) - int(ms)
-        now = int(now_ms)
-        out: List[Tuple[int, float, float, float, str, float, float, float]] = []
-
-        deq = self._trade_window_deques[int(ms)]
-        for trade in reversed(deq):
-            ts_i = int(trade[0])
-            if ts_i > now:
-                continue
-            if ts_i < cutoff:
-                break
-            out.append(trade)
-
-        out.reverse()
-        return out
-
-    def _recent_trade_signs(self, now_ms: int, window_ms: int) -> List[int]:
-        cutoff = int(now_ms) - int(window_ms)
-        now = int(now_ms)
-        signs: List[int] = []
-
-        for t, s, _ in reversed(self.trade_sign_history):
-            t_i = int(t)
-            if t_i > now:
-                continue
-            if t_i < cutoff:
-                break
-            s_i = int(s)
-            if s_i != 0:
-                signs.append(s_i)
-
-        signs.reverse()
-        return signs
-
     def _rolling_slope_simple(self, points: List[Tuple[int, float]]) -> float:
         return self._slope_from_points_no_numpy(points)
-
-    def _compute_large_trade_stats(self, trades: List[Tuple[int, float, float, float, str, float, float, float]], ms: int) -> Dict[str, float]:
-        eps = 1e-12
-        out: Dict[str, float] = {}
-        for threshold in LARGE_TRADE_NOTIONAL_USD:
-            thr_key = self._fmt_usd_notional(threshold)
-            lb_count = ls_count = 0.0
-            lb_notional = ls_notional = 0.0
-            for _, _, _, notional_usd, _, side_sign, _, _ in trades:
-                if notional_usd < threshold:
-                    continue
-                if side_sign > 0:
-                    lb_count += 1.0
-                    lb_notional += notional_usd
-                elif side_sign < 0:
-                    ls_count += 1.0
-                    ls_notional += notional_usd
-            out[f"large_buy_count_ge_{thr_key}_{ms}ms"] = lb_count
-            out[f"large_sell_count_ge_{thr_key}_{ms}ms"] = ls_count
-            out[f"large_buy_notional_ge_{thr_key}_{ms}ms"] = lb_notional
-            out[f"large_sell_notional_ge_{thr_key}_{ms}ms"] = ls_notional
-            out[f"large_trade_imbalance_ge_{thr_key}_{ms}ms"] = self._safe_div(lb_notional - ls_notional, lb_notional + ls_notional, 0.0)
-
-        if trades:
-            largest = max(trades, key=lambda x: x[3])
-            out[f"max_signed_trade_notional_usd_{ms}ms"] = float(largest[5]) * float(largest[3]) if float(largest[5]) != 0.0 else 0.0
-            out[f"top5_trade_notional_sum_usd_{ms}ms"] = float(sum(sorted((t[3] for t in trades), reverse=True)[:5]))
-            large_trades = sorted((t for t in trades if t[3] >= LARGE_TRADE_CLUSTER_THRESHOLD_USD), key=lambda x: x[0])
-            clusters = 0
-            prev_ts: Optional[int] = None
-            for t in large_trades:
-                if prev_ts is None or (t[0] - prev_ts) > LARGE_TRADE_CLUSTER_GAP_MS:
-                    clusters += 1
-                prev_ts = t[0]
-            out[f"large_trade_cluster_count_{ms}ms"] = float(clusters)
-        else:
-            out[f"max_signed_trade_notional_usd_{ms}ms"] = 0.0
-            out[f"top5_trade_notional_sum_usd_{ms}ms"] = 0.0
-            out[f"large_trade_cluster_count_{ms}ms"] = 0.0
-
-        for k, v in out.items():
-            if not math.isfinite(float(v)):
-                raise ValueError(f"Non-finite large trade stat {k}={v!r} window={ms}")
-        return out
 
     def _rolling_slope_r2(self, points: List[Tuple[int, float]]) -> Tuple[float, float]:
         if len(points) < 3:
@@ -3648,26 +3631,9 @@ class FeatureEngine:
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in self.trade_windows:
             cvd_state = self.cvd_window_states[ms]
-            cutoff = int(ts_ms) - int(ms)
-            while cvd_state.points and cvd_state.points[0][0] < cutoff:
-                old_ts, old_y = cvd_state.points.popleft()
-                t = float(old_ts) / 1000.0
-                cvd_state.n -= 1
-                cvd_state.sum_t -= t
-                cvd_state.sum_y -= float(old_y)
-                cvd_state.sum_t2 -= t * t
-                cvd_state.sum_ty -= t * float(old_y)
-                cvd_state.asof_cutoff_value = float(old_y)
-            cvd_change = float(self.cvd_notional - cvd_state.asof_cutoff_value)
-            if cvd_state.n >= 3:
-                den = cvd_state.sum_t2 - (cvd_state.sum_t * cvd_state.sum_t) / float(cvd_state.n)
-                if den > 1e-12 and math.isfinite(den):
-                    num = cvd_state.sum_ty - (cvd_state.sum_t * cvd_state.sum_y) / float(cvd_state.n)
-                    cvd_slope = num / den
-                else:
-                    cvd_slope = 0.0
-            else:
-                cvd_slope = 0.0
+            cvd_state.prune(ts_ms)
+            cvd_change = cvd_state.change_usd(ts_ms, self.cvd_notional)
+            cvd_slope = cvd_state.slope_usd_per_sec()
             cvd_minus_ema = float(self.cvd_notional - self._cvd_ema[ms])
             cvd_stats_by_ms[ms] = {
                 "cvd_change_usd": float(cvd_change),
@@ -4605,15 +4571,8 @@ class FeatureEngine:
 
         if side_sign != 0.0:
             self.cvd_notional += side_sign * notional_usd
-        t_sec = float(ts_ms) / 1000.0
-        for ms, cvd_state in self.cvd_window_states.items():
-            y = float(self.cvd_notional)
-            cvd_state.points.append((int(ts_ms), y))
-            cvd_state.n += 1
-            cvd_state.sum_t += t_sec
-            cvd_state.sum_y += y
-            cvd_state.sum_t2 += t_sec * t_sec
-            cvd_state.sum_ty += t_sec * y
+        for cvd_state in self.cvd_window_states.values():
+            cvd_state.add(int(ts_ms), float(self.cvd_notional))
         if self.last_cvd_update_ts is None:
             for ms in FLOW_WINDOWS_MS:
                 self._cvd_ema[ms] = float(self.cvd_notional)
