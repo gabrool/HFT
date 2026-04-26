@@ -611,7 +611,7 @@ SPREAD_DEPTH_REGIME_WINDOWS_MS = (
 BOOK_DEPTH_FEATURE_LEVELS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 100)
 MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
 
-NUM_HEADS       = 8
+NUM_HEADS       = 32
 # Loss mixing (fixed lambdas), with EMA normalization per loss
 EMA_DECAY       = 0.99
 
