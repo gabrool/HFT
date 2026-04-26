@@ -2316,9 +2316,10 @@ def process_all(
                 flush_curr = dict(_FLUSH_PERF)
             ob_cnt = _timer_delta(fe_curr, last_fe_timers, "ob_feature_build_count")
             trade_cnt = _timer_delta(fe_curr, last_fe_timers, "trade_fast_path_count")
-            ob_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "feature_build_s") / max(ob_cnt, 1.0))
+            fe_build_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "feature_build_s") / max(ob_cnt, 1.0))
             z_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "zscore_s") / max(ob_cnt, 1.0))
             fill_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "feature_fill_s") / max(ob_cnt, 1.0))
+            validate_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "feature_validate_s") / max(ob_cnt, 1.0))
             book_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "book_update_s") / max(ob_cnt, 1.0))
             cache_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "book_cache_s") / max(ob_cnt, 1.0))
             metric_ms = (1000.0 * (_timer_delta(fe_curr, last_fe_timers, "metric_state_s") + _timer_delta(fe_curr, last_fe_timers, "metric_query_s")) / max(ob_cnt, 1.0))
@@ -2329,12 +2330,12 @@ def process_all(
             print(
                 f"[tok  ] rows={total_feature_rows} labels={total_labels} weeks={week_counter}/{week_total} "
                 f"chunkN={router.chunk_size_used if router else 0} rows_per_sec={total_feature_rows/elapsed:.2f} "
-                f"ob_ms={ob_ms:.2f} fe_build_ms={ob_ms:.2f} z_ms={z_ms:.2f} fill_ms={fill_ms:.2f} "
+                f"fe_build_ms={fe_build_ms:.2f} z_ms={z_ms:.2f} fill_ms={fill_ms:.2f} validate_ms={validate_ms:.2f} "
                 f"book_ms={book_ms:.2f} book_cache_ms={cache_ms:.2f} metric_ms={metric_ms:.2f} "
                 f"trade_us={trade_us:.2f} trade_per_ob={trade_per_ob:.2f} "
                 f"queue_wait_s={queue_wait_s:.2f} label_s={label_update_s:.2f} aux_s={aux_build_s:.2f} router_s={router_append_s:.2f} "
-                f"flush_proj_s={_timer_delta(flush_curr, last_flush_perf, 'pca_project_s'):.2f} "
-                f"flush_save_s={_timer_delta(flush_curr, last_flush_perf, 'feature_save_s'):.2f} "
+                f"flush_project_s={_timer_delta(flush_curr, last_flush_perf, 'pca_project_s'):.2f} "
+                f"flush_feature_save_s={_timer_delta(flush_curr, last_flush_perf, 'feature_save_s'):.2f} "
                 f"flush_label_s={_timer_delta(flush_curr, last_flush_perf, 'label_save_s'):.2f} "
                 f"int_rows={delta_rows} int_labels={delta_labels} int_sec={interval_wall:.1f} "
                 f"queue_full={feeder._queue_full_count}",
