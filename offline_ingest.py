@@ -1719,6 +1719,8 @@ def _stream_core_features(pairs: List[WeekPair]):
                     f"week {wk} event {ts_ms} < last {last_global_ts}"
                 )
             last_global_ts = int(ts_ms)
+            if _is_trade and np.asarray(feat_z).shape[0] != 0:
+                raise RuntimeError("Trade fast path returned a non-empty feature vector")
             if _is_trade:
                 continue
             sample_count += 1
@@ -1908,7 +1910,7 @@ def maybe_fit_pca_model(
                     "feature_names_pre_pca": feature_names_pre_pca,
                     "feature_names_hash": names_hash,
                     "created_by": "offline_ingest.py",
-                    "stage": "stage4_v5",
+                    "stage": "stage4_v6_fast_trade_obnorm",
                     "pca_fit_method": "sample_capped_full_svd",
                     "pca_sample_rows": int(sample_array.shape[0]),
                     "pca_target_var": float(target_var),
@@ -2087,6 +2089,8 @@ def process_all(
         t_evt = time.monotonic()
         ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_fast_event(event)
         event_proc_s += time.monotonic() - t_evt
+        if is_trade and np.asarray(feat_z).shape[0] != 0:
+            raise RuntimeError("Trade fast path returned a non-empty feature vector")
 
         if not is_trade:
             feat_core = feat_z
