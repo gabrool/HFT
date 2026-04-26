@@ -3752,6 +3752,8 @@ class FeatureEngine:
 
         self._add_feature_timer("event_age_depletion_s", section_t0)
 
+        section_t0 = time.perf_counter()
+
         def _ofi_since(ts0: Optional[int]) -> float:
             if ts0 is None:
                 return 0.0
@@ -3785,6 +3787,8 @@ class FeatureEngine:
             "large_sell_continuation_bps_15000ms": self._bps(self.last_large_sell_mid or 0.0, mid, 0.0)
             if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= 15_000) else 0.0,
         }
+
+        self._add_feature_timer("cvd_large_burst_s", section_t0)
 
         section_t0 = time.perf_counter()
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
