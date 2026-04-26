@@ -334,7 +334,8 @@ from CMSSL17 import (
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
-EVENT_QUEUE_MAXSIZE = 4096
+EVENT_QUEUE_MAXSIZE = int(os.environ.get("BYBIT_EVENT_QUEUE_MAXSIZE", "4096"))
+EVENT_QUEUE_FULL_LOG_SEC = float(os.environ.get("BYBIT_EVENT_QUEUE_FULL_LOG_SEC", "60"))
 # Weekly chaining guard for multi-file weeks.
 WEEK_CHAIN_TS_TOLERANCE_MS = int(BYBIT_TS_BACKSTEP_CLAMP_MS)
 
@@ -749,6 +750,21 @@ def build_token(fe: FeatureEngine, feat_z, dt_ms: float) -> np.ndarray:
     return np.concatenate([core, aux], axis=0).astype(np.float32, copy=False)
 
 
+def build_aux_tail(fe: FeatureEngine, dt_ms: float) -> np.ndarray:
+    return np.asarray(
+        [
+            np.log1p(float(dt_ms)),
+            np.log1p(fe.event_density_1000ms()),
+            np.log1p(fe.event_density_3000ms()),
+            np.log1p(fe.event_density_7500ms()),
+            np.log1p(fe.event_density_15000ms()),
+            np.log1p(fe.event_density_30000ms()),
+            np.log1p(fe.event_density_60000ms()),
+        ],
+        dtype=np.float32,
+    )
+
+
 def build_four_week_pipeline_splits(weeks_in_order, week_meta_records):
     if len(weeks_in_order) != 4:
         raise ValueError(f"Expected exactly 4 weeks; got {len(weeks_in_order)}")
@@ -824,8 +840,13 @@ class FeatureFlushJob:
     out_dir: str
     features_file: str
     ts_file: str
-    features: np.ndarray
+    pre_pca_core: np.ndarray
+    aux: np.ndarray
     ts: np.ndarray
+    pca_mean: np.ndarray
+    pca_components: np.ndarray
+    final_feature_dim: int
+    aux_dim: int
 
 
 @dataclass
@@ -845,12 +866,27 @@ class LabelFlushJob:
 
 
 class FlatFeatureWriter:
-    def __init__(self, out_dir: str, feature_dim: int, ram_budget_mb: int, chunk_size_override: int = 0, start_chunk_id: int = 0, week_key: str = "", flush_callback: Optional[Callable[[object], None]] = None):
+    def __init__(self, out_dir: str, final_feature_dim: int, pre_pca_dim: int, pca_mean: np.ndarray, pca_components: np.ndarray, aux_dim: int, ram_budget_mb: int, chunk_size_override: int = 0, start_chunk_id: int = 0, week_key: str = "", flush_callback: Optional[Callable[[object], None]] = None):
         self.out_dir = out_dir
         self.week_key = str(week_key)
-        self.feature_dim = int(feature_dim)
+        self.final_feature_dim = int(final_feature_dim)
+        self.pre_pca_dim = int(pre_pca_dim)
+        self.aux_dim = int(aux_dim)
+        self.pca_mean = np.asarray(pca_mean, dtype=np.float32, copy=False)
+        self.pca_components = np.asarray(pca_components, dtype=np.float32, copy=False)
+        if self.pca_mean.ndim != 1:
+            raise ValueError("pca_mean must be 1D")
+        if self.pca_components.ndim != 2:
+            raise ValueError("pca_components must be 2D")
+        if self.pca_components.shape[1] != self.pca_mean.shape[0] or self.pca_mean.shape[0] != self.pre_pca_dim:
+            raise ValueError("PCA dimension mismatch")
+        if self.final_feature_dim != self.pca_components.shape[0] + self.aux_dim:
+            raise ValueError("final_feature_dim mismatch")
+        if self.aux_dim != AUX_DIM:
+            raise ValueError("aux_dim must equal AUX_DIM")
         self.flush_callback = flush_callback
-        bytes_per_row = (self.feature_dim * 4) + 8
+        pca_k = int(self.pca_components.shape[0])
+        bytes_per_row = (4 * self.pre_pca_dim) + (4 * self.aux_dim) + 8 + (4 * self.final_feature_dim) + (4 * pca_k)
         if chunk_size_override > 0:
             self.N = int(chunk_size_override)
         else:
@@ -858,31 +894,46 @@ class FlatFeatureWriter:
             safety_cap = max(256, int((2 * 1024 * 1024 * 1024) // max(1, bytes_per_row)))
             self.N = min(auto_n, safety_cap)
 
-        self.features = np.empty((self.N, self.feature_dim), dtype=np.float32)
+        self.pre_pca_core = np.empty((self.N, self.pre_pca_dim), dtype=np.float32)
+        self.aux = np.empty((self.N, self.aux_dim), dtype=np.float32)
         self.ts = np.empty((self.N,), dtype=np.int64)
         self.i = 0
         self.cid = int(start_chunk_id)
         self.rows_total = 0
         self.chunks_meta: List[Dict[str, Any]] = []
 
-    def append_row(self, ts_decision_ms: int, row: np.ndarray) -> int:
+    def append_row_pre_pca(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> int:
         if self.i >= self.N:
             self.flush()
-        if row.shape[0] != self.feature_dim:
-            raise ValueError(f"Feature row dim mismatch: {row.shape[0]} != {self.feature_dim}")
-        self.features[self.i] = row
+        core = np.asarray(core_pre_pca, dtype=np.float32, copy=False)
+        aux = np.asarray(aux_tail, dtype=np.float32, copy=False)
+        if core.shape != (self.pre_pca_dim,):
+            raise ValueError(f"Core pre-PCA dim mismatch: {core.shape} != {(self.pre_pca_dim,)}")
+        if aux.shape != (self.aux_dim,):
+            raise ValueError(f"Aux dim mismatch: {aux.shape} != {(self.aux_dim,)}")
+        if not np.all(np.isfinite(core)) or not np.all(np.isfinite(aux)):
+            raise ValueError("Non-finite input features")
+        self.pre_pca_core[self.i] = core
+        self.aux[self.i] = aux
         self.ts[self.i] = int(ts_decision_ms)
         row_idx = self.rows_total + self.i
         self.i += 1
         return int(row_idx)
 
-    def overwrite_latest_row(self, ts_decision_ms: int, row: np.ndarray) -> int:
+    def overwrite_latest_row(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> int:
         if self.i <= 0:
             raise RuntimeError("Cannot overwrite latest feature row in an empty open chunk")
-        if row.shape[0] != self.feature_dim:
-            raise ValueError(f"Feature row dim mismatch: {row.shape[0]} != {self.feature_dim}")
+        core = np.asarray(core_pre_pca, dtype=np.float32, copy=False)
+        aux = np.asarray(aux_tail, dtype=np.float32, copy=False)
+        if core.shape != (self.pre_pca_dim,):
+            raise ValueError(f"Core pre-PCA dim mismatch: {core.shape} != {(self.pre_pca_dim,)}")
+        if aux.shape != (self.aux_dim,):
+            raise ValueError(f"Aux dim mismatch: {aux.shape} != {(self.aux_dim,)}")
+        if not np.all(np.isfinite(core)) or not np.all(np.isfinite(aux)):
+            raise ValueError("Non-finite input features")
         idx = self.i - 1
-        self.features[idx] = row
+        self.pre_pca_core[idx] = core
+        self.aux[idx] = aux
         self.ts[idx] = int(ts_decision_ms)
         return int(self.rows_total + idx)
 
@@ -902,8 +953,13 @@ class FlatFeatureWriter:
             out_dir=self.out_dir,
             features_file=f"features_{chunk_id:03d}.npy",
             ts_file=f"ts_{chunk_id:03d}.npy",
-            features=self.features,
+            pre_pca_core=self.pre_pca_core,
+            aux=self.aux,
             ts=self.ts,
+            pca_mean=self.pca_mean,
+            pca_components=self.pca_components,
+            final_feature_dim=self.final_feature_dim,
+            aux_dim=self.aux_dim,
         )
         self.chunks_meta.append({
             "chunk": chunk_id,
@@ -915,7 +971,8 @@ class FlatFeatureWriter:
         self.rows_total = row_end
         self.cid += 1
         self.i = 0
-        self.features = np.empty((self.N, self.feature_dim), dtype=np.float32)
+        self.pre_pca_core = np.empty((self.N, self.pre_pca_dim), dtype=np.float32)
+        self.aux = np.empty((self.N, self.aux_dim), dtype=np.float32)
         self.ts = np.empty((self.N,), dtype=np.int64)
         return job
 
@@ -1006,12 +1063,30 @@ class FlatLabelWriter:
 
 _SENTINEL_FLUSH_JOB = object()
 _FLUSH_QUEUE_MAXSIZE = max(8, 2 * FLUSH_WORKERS)
+_FLUSH_PERF = {"pca_project_s": 0.0, "feature_flush_s": 0.0}
 
 
 def _persist_flush_job(job: object) -> None:
     if isinstance(job, FeatureFlushJob):
-        np.save(os.path.join(job.out_dir, job.features_file), job.features[: job.row_count])
+        t0 = time.perf_counter()
+        n = int(job.row_count)
+        X = job.pre_pca_core[:n].astype(np.float32, copy=False)
+        aux = job.aux[:n].astype(np.float32, copy=False)
+        t1 = time.perf_counter()
+        centered = X - job.pca_mean[None, :]
+        projected = centered @ job.pca_components.T
+        _FLUSH_PERF["pca_project_s"] += float(time.perf_counter() - t1)
+        out = np.empty((n, int(job.final_feature_dim)), dtype=np.float32)
+        pca_k = int(job.pca_components.shape[0])
+        out[:, :pca_k] = projected.astype(np.float32, copy=False)
+        out[:, pca_k:] = aux
+        if out.shape != (n, int(job.final_feature_dim)):
+            raise ValueError(f"Projected shape mismatch: {out.shape} != {(n, int(job.final_feature_dim))}")
+        if not np.all(np.isfinite(out)):
+            raise ValueError("Non-finite projected feature output")
+        np.save(os.path.join(job.out_dir, job.features_file), out)
         np.save(os.path.join(job.out_dir, job.ts_file), job.ts[: job.row_count])
+        _FLUSH_PERF["feature_flush_s"] += float(time.perf_counter() - t0)
         return
     if isinstance(job, LabelFlushJob):
         np.save(os.path.join(job.out_dir, job.row_idx_file), job.row_idx[: job.label_count])
@@ -1022,9 +1097,13 @@ def _persist_flush_job(job: object) -> None:
 
 
 class FlatWeekRouter:
-    def __init__(self, out_root: str, feature_dim: int, ram_budget_mb: int, chunk_size_override: int, week_index: List[Tuple[str, int, int]], pca_meta: Optional[dict] = None):
+    def __init__(self, out_root: str, final_feature_dim: int, pre_pca_dim: int, pca_mean: np.ndarray, pca_components: np.ndarray, aux_dim: int, ram_budget_mb: int, chunk_size_override: int, week_index: List[Tuple[str, int, int]], pca_meta: Optional[dict] = None):
         self.out_root = out_root
-        self.feature_dim = int(feature_dim)
+        self.feature_dim = int(final_feature_dim)
+        self.pre_pca_dim = int(pre_pca_dim)
+        self.pca_mean = np.asarray(pca_mean, dtype=np.float32, copy=False)
+        self.pca_components = np.asarray(pca_components, dtype=np.float32, copy=False)
+        self.aux_dim = int(aux_dim)
         self.ram_budget_mb = int(ram_budget_mb)
         self.chunk_size_override = int(chunk_size_override)
         self.week_index = list(week_index)
@@ -1096,6 +1175,10 @@ class FlatWeekRouter:
         writer = FlatFeatureWriter(
             week_dir,
             self.feature_dim,
+            self.pre_pca_dim,
+            self.pca_mean,
+            self.pca_components,
+            self.aux_dim,
             self.ram_budget_mb,
             self.chunk_size_override,
             start_chunk_id=int(self.next_feature_chunk_id.get(week_key, 0)),
@@ -1136,11 +1219,11 @@ class FlatWeekRouter:
                 return last_wk
         raise ValueError(f"No week found for decision timestamp {ts_ms}")
 
-    def append_feature_row(self, ts_decision_ms: int, row: np.ndarray) -> Tuple[str, int]:
+    def append_feature_row(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> Tuple[str, int]:
         self._check_writer_exception()
         wk = self._find_week_key(ts_decision_ms)
         writer = self._ensure_feature_writer(wk)
-        row_idx = writer.append_row(int(ts_decision_ms), row)
+        row_idx = writer.append_row_pre_pca(int(ts_decision_ms), core_pre_pca, aux_tail)
         self.week_rows_total[wk] = max(self.week_rows_total[wk], int(row_idx) + 1)
         if wk not in self.week_decision_span:
             self.week_decision_span[wk] = [int(ts_decision_ms), int(ts_decision_ms)]
@@ -1150,11 +1233,11 @@ class FlatWeekRouter:
             span[1] = max(span[1], int(ts_decision_ms))
         return wk, int(row_idx)
 
-    def overwrite_latest_feature_row(self, ts_decision_ms: int, row: np.ndarray) -> Tuple[str, int]:
+    def overwrite_latest_feature_row(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> Tuple[str, int]:
         self._check_writer_exception()
         wk = self._find_week_key(ts_decision_ms)
         writer = self._ensure_feature_writer(wk)
-        row_idx = writer.overwrite_latest_row(int(ts_decision_ms), row)
+        row_idx = writer.overwrite_latest_row(int(ts_decision_ms), core_pre_pca, aux_tail)
         if wk not in self.week_decision_span:
             self.week_decision_span[wk] = [int(ts_decision_ms), int(ts_decision_ms)]
         else:
@@ -1308,6 +1391,8 @@ def _print_coarse_timing_totals(prefix: str, totals: Dict[str, float]) -> None:
         ("queue_wait_s", "queue_wait"),
         ("event_proc_s", "event_proc"),
         ("router_housekeeping_s", "router_housekeeping"),
+        ("pca_project_s", "pca_project"),
+        ("feature_flush_s", "feature_flush"),
     ]
     parts = []
     for key, label in ordered:
@@ -1601,6 +1686,8 @@ class EventFeeder:
         self.collect_quality = bool(collect_quality)
         self.week_qualities: Dict[str, WeekQuality] = {}
         self.quality_by_week: Dict[str, Dict[str, object]] = {}
+        self._queue_full_count = 0
+        self._queue_full_last_log = 0.0
 
     def _put(self, item: Tuple[str, Optional[str], Optional[object]]):
         while True:
@@ -1608,8 +1695,17 @@ class EventFeeder:
                 self.queue.put(item, timeout=1.0)
                 return
             except queue.Full:
-                kind, wk, _payload = item
-                print(f"[feeder] queue full while sending kind={kind!r} week={wk!r}", flush=True)
+                self._queue_full_count += 1
+                if EVENT_QUEUE_FULL_LOG_SEC > 0:
+                    now = time.monotonic()
+                    if now - self._queue_full_last_log >= EVENT_QUEUE_FULL_LOG_SEC:
+                        kind, wk, _payload = item
+                        print(
+                            f"[feeder] queue full blocked_count={self._queue_full_count} "
+                            f"kind={kind!r} week={wk!r} qsize={self.queue.qsize()}",
+                            flush=True,
+                        )
+                        self._queue_full_last_log = now
 
     def run(self):
         try:
@@ -2018,6 +2114,11 @@ def process_all(
     for req in ("feature_names_pre_pca", "feature_dim_core_pre_pca", "feature_names_hash"):
         if req not in pca_summary or not pca_summary[req]:
             raise ValueError(f"Missing required PCA metadata field: {req}")
+    if pca_mean is None or pca_components is None:
+        raise ValueError("Missing PCA tensors")
+    pre_pca_dim = int(pca_mean.shape[0])
+    pca_k = int(pca_components.shape[0])
+    final_feature_dim = int(pca_k + AUX_DIM)
 
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
@@ -2025,7 +2126,7 @@ def process_all(
     pending_decisions: deque[Tuple[str, int, int]] = deque()
     last_decision_ts_ms: Optional[int] = None
 
-    F = None
+    F = final_feature_dim
     router: FlatWeekRouter = None  # type: ignore
     total_feature_rows = 0
     total_labels = 0
@@ -2093,15 +2194,11 @@ def process_all(
             raise RuntimeError("Trade fast path returned a non-empty feature vector")
 
         if not is_trade:
-            feat_core = feat_z
-            if pca_components is not None and pca_mean is not None:
-                if np.asarray(feat_z).shape[-1] != pca_mean.shape[0]:
-                    raise ValueError(
-                        f"PCA mean/components dimension {pca_mean.shape[0]} does not match "
-                        f"feature dimension {np.asarray(feat_z).shape[-1]}"
-                    )
-                centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
-                feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
+            core_pre_pca = np.asarray(feat_z, dtype=np.float32, copy=False)
+            if core_pre_pca.shape[-1] != pre_pca_dim:
+                raise ValueError(
+                    f"PCA pre-core dimension {pre_pca_dim} does not match feature dimension {core_pre_pca.shape[-1]}"
+                )
 
             is_duplicate_decision_ts = (last_decision_ts_ms is not None and int(ts_ms) == last_decision_ts_ms)
             if last_decision_ts_ms is not None and int(ts_ms) < last_decision_ts_ms:
@@ -2114,24 +2211,17 @@ def process_all(
                 )
 
             dt_tick = 1 if last_decision_ts_ms is None else int(ts_ms - last_decision_ts_ms)
-            tok = build_token(fe, feat_core, dt_tick)
-            expected_total = int(feat_core.shape[0]) + AUX_DIM
-            if tok.shape[0] != expected_total:
-                raise ValueError(
-                    f"Token dim mismatch: tok={tok.shape[0]} expected={expected_total} "
-                    f"(core={feat_core.shape[0]} aux={AUX_DIM})"
-                )
+            aux_tail = build_aux_tail(fe, dt_tick)
 
-            if F is None:
-                F = tok.shape[0]
-                print(
-                    f"[first-token] feature_dim_core={int(feat_core.shape[0])} "
-                    f"aux_dim={AUX_DIM} feature_dim_total={int(F)}",
-                    flush=True,
-                )
+            if router is None:
+                print(f"[first-token] feature_dim_core={int(pca_k)} aux_dim={AUX_DIM} feature_dim_total={int(F)}", flush=True)
                 router = FlatWeekRouter(
                     out_root,
                     F,
+                    pre_pca_dim,
+                    pca_mean,
+                    pca_components,
+                    AUX_DIM,
                     RAM_BUDGET,
                     CHUNK_SIZE,
                     week_index,
@@ -2145,12 +2235,12 @@ def process_all(
                 if not pending_decisions:
                     raise RuntimeError("Duplicate OB timestamp cannot update state because no pending decision exists")
                 prev_week_key, _prev_row_idx, _prev_ts = pending_decisions[-1]
-                week_key, row_idx = router.overwrite_latest_feature_row(int(ts_ms), tok)
+                week_key, row_idx = router.overwrite_latest_feature_row(int(ts_ms), core_pre_pca, aux_tail)
                 if week_key != prev_week_key:
                     raise RuntimeError("Duplicate timestamp mapped to a different week during overwrite")
                 pending_decisions[-1] = (week_key, row_idx, int(ts_ms))
             else:
-                week_key, row_idx = router.append_feature_row(int(ts_ms), tok)
+                week_key, row_idx = router.append_feature_row(int(ts_ms), core_pre_pca, aux_tail)
                 pending_decisions.append((week_key, row_idx, int(ts_ms)))
                 labeler.on_decision(int(ts_ms))
                 total_feature_rows += 1
@@ -2173,9 +2263,11 @@ def process_all(
         router_housekeeping_s += time.monotonic() - t_router
 
         if time.monotonic() - last_log >= 300:
+            elapsed = max(1e-9, time.monotonic() - ingest_started)
             print(
                 f"[tok  ] rows={total_feature_rows} labels={total_labels} weeks={week_counter}/{week_total} "
-                f"chunkN={router.chunk_size_used if router else 0}",
+                f"chunkN={router.chunk_size_used if router else 0} rows_per_sec={total_feature_rows/elapsed:.2f} "
+                f"queue_full={feeder._queue_full_count}",
                 flush=True,
             )
             last_log = time.monotonic()
@@ -2185,8 +2277,8 @@ def process_all(
     if router is not None:
         router.flush_all()
 
-    feature_dim_total = None if F is None else int(F)
-    feature_dim_core = None if F is None else int(F - AUX_DIM)
+    feature_dim_total = int(F)
+    feature_dim_core = int(F - AUX_DIM)
     label_dim = int(NUM_HORIZONS)
     week_meta_records = {} if router is None else dict(router.week_metas)
     week_quality_records = dict(feeder.quality_by_week)
@@ -2335,8 +2427,12 @@ def process_all(
             "queue_wait_s": queue_wait_s,
             "event_proc_s": event_proc_s,
             "router_housekeeping_s": router_housekeeping_s,
+            "pca_project_s": float(_FLUSH_PERF.get("pca_project_s", 0.0)),
+            "feature_flush_s": float(_FLUSH_PERF.get("feature_flush_s", 0.0)),
         },
     )
+    elapsed_total = max(1e-9, time.monotonic() - ingest_started)
+    print(f"[ingest] rows_per_sec={total_feature_rows/elapsed_total:.2f} queue_full_count={feeder._queue_full_count}", flush=True)
     fe.print_timer_totals(prefix="[timers]")
 
 # --------------- driver ----------------

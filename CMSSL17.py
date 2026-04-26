@@ -1,4 +1,4 @@
-import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time
+import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time, heapq
 from pathlib import Path
 from collections import deque
 from bisect import bisect_left, bisect_right
@@ -1256,6 +1256,99 @@ class RollingWindowStats:
         return mean, max(0.0, var)
 
 
+@dataclass
+class LargeTradeWindowState:
+    window_ms: int
+    threshold_counts: Dict[float, Dict[str, float]]
+    max_heap: List[Tuple[float, int, float]]
+    cluster_ts: Deque[int]
+    cluster_count: int
+
+    @classmethod
+    def create(cls, window_ms: int) -> "LargeTradeWindowState":
+        return cls(
+            window_ms=int(window_ms),
+            threshold_counts={
+                float(t): {"buy_count": 0.0, "sell_count": 0.0, "buy_notional": 0.0, "sell_notional": 0.0}
+                for t in LARGE_TRADE_NOTIONAL_USD
+            },
+            max_heap=[],
+            cluster_ts=deque(),
+            cluster_count=0,
+        )
+
+
+@dataclass
+class TradeBurstWindowState:
+    window_ms: int
+    signs: Deque[Tuple[int, int, int]]
+    runs: Deque[Tuple[int, int, int]]
+    run_lengths: Dict[int, Tuple[int, int]]
+    buy_heap: List[Tuple[int, int]]
+    sell_heap: List[Tuple[int, int]]
+    buy_count: int
+    sell_count: int
+    pair_n: int
+    sum_x: float
+    sum_y: float
+    sum_x2: float
+    sum_y2: float
+    sum_xy: float
+    next_run_id: int
+
+    @classmethod
+    def create(cls, window_ms: int) -> "TradeBurstWindowState":
+        return cls(
+            window_ms=int(window_ms),
+            signs=deque(),
+            runs=deque(),
+            run_lengths={},
+            buy_heap=[],
+            sell_heap=[],
+            buy_count=0,
+            sell_count=0,
+            pair_n=0,
+            sum_x=0.0,
+            sum_y=0.0,
+            sum_x2=0.0,
+            sum_y2=0.0,
+            sum_xy=0.0,
+            next_run_id=1,
+        )
+
+
+@dataclass
+class CVDWindowState:
+    window_ms: int
+    points: Deque[Tuple[int, float]]
+    asof_cutoff_value: float
+    n: int
+    sum_t: float
+    sum_y: float
+    sum_t2: float
+    sum_ty: float
+
+    @classmethod
+    def create(cls, window_ms: int, initial_cvd: float = 0.0) -> "CVDWindowState":
+        return cls(int(window_ms), deque(), float(initial_cvd), 0, 0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass
+class RollingReturnDistributionState:
+    window_ms: int
+    deq: Deque[Tuple[int, float, float, int]]
+    n: int
+    sum1: float
+    sum2: float
+    sum3: float
+    sum4: float
+    up_sumsq: float
+    down_sumsq: float
+    bipower: float
+    max_abs_q: Deque[Tuple[int, int, float]]
+    seq: int
+
+
 # -------------------------  Feature engine  -------------------------
 class FeatureEngine:
 
@@ -1340,8 +1433,22 @@ class FeatureEngine:
         self.realized_vol: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.volume_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.flow_regime: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
-        self._regime_return_deques: Dict[int, RollingWindowStats] = {
-            ms: RollingWindowStats(ms) for ms in self.regime_windows_ms
+        self.regime_return_states: Dict[int, RollingReturnDistributionState] = {
+            ms: RollingReturnDistributionState(
+                window_ms=ms,
+                deq=deque(),
+                n=0,
+                sum1=0.0,
+                sum2=0.0,
+                sum3=0.0,
+                sum4=0.0,
+                up_sumsq=0.0,
+                down_sumsq=0.0,
+                bipower=0.0,
+                max_abs_q=deque(),
+                seq=0,
+            )
+            for ms in self.regime_windows_ms
         }
         self.last_mid_for_ret: Optional[float] = None
         self._spread_bps_history: Deque[Tuple[int, float]] = deque()
@@ -1397,16 +1504,21 @@ class FeatureEngine:
         self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, float, str, float, float, float]]] = {
             ms: deque() for ms in self.trade_windows
         }
+        self._trade_seq: int = 0
         self.trade_window_state: Dict[int, Dict[str, Any]] = {
             window: self._new_trade_window_state()
             for window in self.trade_windows
         }
+        self.large_trade_states: Dict[int, LargeTradeWindowState] = {
+            ms: LargeTradeWindowState.create(ms) for ms in self.trade_windows
+        }
         self.cvd_notional = 0.0
-        self._cvd_history: Deque[Tuple[int, float]] = deque()
         self._cvd_ema = {ms: 0.0 for ms in FLOW_WINDOWS_MS}
         self._cvd_ema_initialized = {ms: False for ms in FLOW_WINDOWS_MS}
+        self.cvd_window_states: Dict[int, CVDWindowState] = {
+            ms: CVDWindowState.create(ms, initial_cvd=0.0) for ms in self.trade_windows
+        }
         self.last_cvd_update_ts: Optional[int] = None
-        self.cvd_history_keep_ms = max(FLOW_WINDOWS_MS) + 5_000
         self.last_large_buy_ts: Optional[int] = None
         self.last_large_sell_ts: Optional[int] = None
         self.last_large_buy_mid: Optional[float] = None
@@ -1419,8 +1531,10 @@ class FeatureEngine:
         self.last_large_sell_trade_imbalance_at_event: float = 0.0
         self.consecutive_buy_trade_count: int = 0
         self.consecutive_sell_trade_count: int = 0
+        self.trade_burst_states: Dict[int, TradeBurstWindowState] = {
+            ms: TradeBurstWindowState.create(ms) for ms in TRADE_BURST_WINDOWS_MS
+        }
         self.trade_sign_history: Deque[Tuple[int, int, float]] = deque()
-        self._trade_sign_keep_ms = max(TRADE_BURST_WINDOWS_MS) + 5_000
         self.last_ob_ofi_l5: float = 0.0
         self.last_ob_trade_imbalance_30000ms: float = 0.0
 
@@ -2199,6 +2313,7 @@ class FeatureEngine:
             while q and q[-1][1] <= notion:
                 q.pop()
             q.append((ts_i, notion))
+        self._large_trade_state_insert(window_ms, entry)
 
     def _update_trade_window_state_with_expire(
         self,
@@ -2320,6 +2435,7 @@ class FeatureEngine:
             state["zero_tick"] = 0
             state["buy_max_q"].clear()
             state["sell_max_q"].clear()
+        self._large_trade_state_expire(window_ms, entry)
 
     def _prune_trade_window(self, now_ms: int, window_ms: int) -> None:
         deq = self._trade_window_deques[window_ms]
@@ -2493,6 +2609,201 @@ class FeatureEngine:
             return 1.0 if len(vals) >= 2 and all(v == vals[0] for v in vals) else 0.0
         c = float(np.corrcoef(x, y)[0, 1])
         return c if math.isfinite(c) else 0.0
+
+    def _large_trade_state_insert(self, window_ms: int, entry: Tuple[int, float, float, float, str, float, float, float]) -> None:
+        ts_ms, _price, _size, notional_usd, _side, side_sign, _tick_sign, _is_zero_tick = entry
+        state = self.large_trade_states[window_ms]
+        notion = float(notional_usd)
+        ss = float(side_sign)
+        ts_i = int(ts_ms)
+        for threshold, agg in state.threshold_counts.items():
+            if notion < threshold:
+                continue
+            if ss > 0:
+                agg["buy_count"] += 1.0
+                agg["buy_notional"] += notion
+            elif ss < 0:
+                agg["sell_count"] += 1.0
+                agg["sell_notional"] += notion
+        if notion > 0.0:
+            heapq.heappush(state.max_heap, (-notion, ts_i, ss))
+        if notion >= LARGE_TRADE_CLUSTER_THRESHOLD_USD:
+            if not state.cluster_ts or (ts_i - state.cluster_ts[-1]) > LARGE_TRADE_CLUSTER_GAP_MS:
+                state.cluster_count += 1
+            state.cluster_ts.append(ts_i)
+
+    def _large_trade_state_expire(self, window_ms: int, entry: Tuple[int, float, float, float, str, float, float, float]) -> None:
+        ts_ms, _price, _size, notional_usd, _side, side_sign, _tick_sign, _is_zero_tick = entry
+        state = self.large_trade_states[window_ms]
+        notion = float(notional_usd)
+        ss = float(side_sign)
+        ts_i = int(ts_ms)
+        for threshold, agg in state.threshold_counts.items():
+            if notion < threshold:
+                continue
+            if ss > 0:
+                agg["buy_count"] = max(0.0, agg["buy_count"] - 1.0)
+                agg["buy_notional"] = max(0.0, agg["buy_notional"] - notion)
+            elif ss < 0:
+                agg["sell_count"] = max(0.0, agg["sell_count"] - 1.0)
+                agg["sell_notional"] = max(0.0, agg["sell_notional"] - notion)
+        if notion >= LARGE_TRADE_CLUSTER_THRESHOLD_USD and state.cluster_ts and state.cluster_ts[0] == ts_i:
+            expired_ts = state.cluster_ts.popleft()
+            state.cluster_count = max(0, state.cluster_count - 1)
+            if state.cluster_ts and (state.cluster_ts[0] - expired_ts) <= LARGE_TRADE_CLUSTER_GAP_MS:
+                state.cluster_count += 1
+
+    def _large_trade_stats_from_state(self, ms: int, now_ms: int) -> Dict[str, float]:
+        cutoff = int(now_ms) - int(ms)
+        state = self.large_trade_states[ms]
+        out: Dict[str, float] = {}
+        for threshold in LARGE_TRADE_NOTIONAL_USD:
+            thr_key = self._fmt_usd_notional(threshold)
+            agg = state.threshold_counts[float(threshold)]
+            lb_notional = float(agg["buy_notional"])
+            ls_notional = float(agg["sell_notional"])
+            out[f"large_buy_count_ge_{thr_key}_{ms}ms"] = float(agg["buy_count"])
+            out[f"large_sell_count_ge_{thr_key}_{ms}ms"] = float(agg["sell_count"])
+            out[f"large_buy_notional_ge_{thr_key}_{ms}ms"] = lb_notional
+            out[f"large_sell_notional_ge_{thr_key}_{ms}ms"] = ls_notional
+            out[f"large_trade_imbalance_ge_{thr_key}_{ms}ms"] = self._safe_div(lb_notional - ls_notional, lb_notional + ls_notional, 0.0)
+        while state.max_heap and state.max_heap[0][1] < cutoff:
+            heapq.heappop(state.max_heap)
+        if state.max_heap:
+            notion = float(-state.max_heap[0][0])
+            ss = float(state.max_heap[0][2])
+            out[f"max_signed_trade_notional_usd_{ms}ms"] = ss * notion if ss != 0.0 else 0.0
+        else:
+            out[f"max_signed_trade_notional_usd_{ms}ms"] = 0.0
+        popped: List[Tuple[float, int, float]] = []
+        top_sum = 0.0
+        for _ in range(5):
+            while state.max_heap and state.max_heap[0][1] < cutoff:
+                heapq.heappop(state.max_heap)
+            if not state.max_heap:
+                break
+            item = heapq.heappop(state.max_heap)
+            popped.append(item)
+            top_sum += float(-item[0])
+        for item in popped:
+            heapq.heappush(state.max_heap, item)
+        out[f"top5_trade_notional_sum_usd_{ms}ms"] = top_sum
+        out[f"large_trade_cluster_count_{ms}ms"] = float(state.cluster_count)
+        return out
+
+    def _trade_burst_insert(self, window_ms: int, ts_ms: int, sign: int) -> None:
+        if sign == 0:
+            return
+        st = self.trade_burst_states[window_ms]
+        ts_i = int(ts_ms)
+        run_id = -1
+        if st.signs:
+            prev_sign = st.signs[-1][1]
+            st.pair_n += 1
+            st.sum_x += prev_sign
+            st.sum_y += sign
+            st.sum_x2 += prev_sign * prev_sign
+            st.sum_y2 += sign * sign
+            st.sum_xy += prev_sign * sign
+        if sign > 0:
+            st.buy_count += 1
+        else:
+            st.sell_count += 1
+        if st.runs and st.runs[-1][1] == sign:
+            rid, _, length = st.runs.pop()
+            length += 1
+            st.runs.append((rid, sign, length))
+            st.run_lengths[rid] = (sign, length)
+            run_id = rid
+        else:
+            run_id = st.next_run_id
+            st.next_run_id += 1
+            st.runs.append((run_id, sign, 1))
+            st.run_lengths[run_id] = (sign, 1)
+        if sign > 0:
+            heapq.heappush(st.buy_heap, (-st.run_lengths[run_id][1], run_id))
+        else:
+            heapq.heappush(st.sell_heap, (-st.run_lengths[run_id][1], run_id))
+        st.signs.append((ts_i, sign, run_id))
+
+    def _trade_burst_prune(self, window_ms: int, now_ms: int) -> None:
+        cutoff = int(now_ms) - int(window_ms)
+        st = self.trade_burst_states[window_ms]
+        while st.signs and st.signs[0][0] < cutoff:
+            _ts, sign, _rid = st.signs.popleft()
+            if sign > 0:
+                st.buy_count = max(0, st.buy_count - 1)
+            else:
+                st.sell_count = max(0, st.sell_count - 1)
+            if st.signs:
+                nxt = st.signs[0][1]
+                st.pair_n = max(0, st.pair_n - 1)
+                st.sum_x -= sign
+                st.sum_y -= nxt
+                st.sum_x2 -= sign * sign
+                st.sum_y2 -= nxt * nxt
+                st.sum_xy -= sign * nxt
+            if st.runs:
+                rid, rsign, rlen = st.runs[0]
+                rlen -= 1
+                st.runs.popleft()
+                if rlen > 0:
+                    st.runs.appendleft((rid, rsign, rlen))
+                    st.run_lengths[rid] = (rsign, rlen)
+                    if rsign > 0:
+                        heapq.heappush(st.buy_heap, (-rlen, rid))
+                    else:
+                        heapq.heappush(st.sell_heap, (-rlen, rid))
+                else:
+                    st.run_lengths.pop(rid, None)
+
+    def _trade_burst_features_from_state(self, ts_ms: int) -> Dict[str, float]:
+        out: Dict[str, float] = {
+            "consecutive_buy_trade_count": float(self.consecutive_buy_trade_count),
+            "consecutive_sell_trade_count": float(self.consecutive_sell_trade_count),
+        }
+        for window in TRADE_BURST_WINDOWS_MS:
+            self._trade_burst_prune(window, ts_ms)
+            st = self.trade_burst_states[window]
+            total_signed = st.buy_count + st.sell_count
+            p_buy = self._safe_div(st.buy_count, max(total_signed, 1), 0.0)
+            p_sell = self._safe_div(st.sell_count, max(total_signed, 1), 0.0)
+            entropy = 0.0
+            if total_signed > 0:
+                if p_buy > 0.0:
+                    entropy -= p_buy * math.log(p_buy)
+                if p_sell > 0.0:
+                    entropy -= p_sell * math.log(p_sell)
+                entropy = self._safe_div(entropy, math.log(2.0), 0.0)
+            def _max_run(heap: List[Tuple[int, int]], sign_expected: int) -> int:
+                while heap:
+                    neg_len, rid = heap[0]
+                    cur = st.run_lengths.get(rid)
+                    if cur is None or cur[0] != sign_expected or cur[1] != -neg_len:
+                        heapq.heappop(heap)
+                        continue
+                    return int(-neg_len)
+                return 0
+            max_buy_run = _max_run(st.buy_heap, 1)
+            max_sell_run = _max_run(st.sell_heap, -1)
+            autocorr = 0.0
+            if st.pair_n > 0:
+                n = float(st.pair_n)
+                var_x = st.sum_x2 - (st.sum_x * st.sum_x) / n
+                var_y = st.sum_y2 - (st.sum_y * st.sum_y) / n
+                if var_x > 1e-12 and var_y > 1e-12:
+                    cov_xy = st.sum_xy - (st.sum_x * st.sum_y) / n
+                    autocorr = cov_xy / math.sqrt(var_x * var_y)
+            out.update({
+                f"max_buy_run_length_{window}ms": float(max_buy_run),
+                f"max_sell_run_length_{window}ms": float(max_sell_run),
+                f"trade_sign_autocorr_lag1_{window}ms": float(autocorr) if math.isfinite(autocorr) else 0.0,
+                f"trade_sign_entropy_{window}ms": float(entropy),
+                f"trade_burst_score_{window}ms": self._safe_div(max(max_buy_run, max_sell_run), max(total_signed, 1), 0.0),
+                f"buy_trade_burst_score_{window}ms": self._safe_div(max_buy_run, max(total_signed, 1), 0.0),
+                f"sell_trade_burst_score_{window}ms": self._safe_div(max_sell_run, max(total_signed, 1), 0.0),
+            })
+        return out
 
     def _bps_return(self, current: float, past: float) -> float:
         c = float(current)
@@ -3197,10 +3508,6 @@ class FeatureEngine:
         prev_bid_l2 = self.prev_bsz2
         prev_ask_l2 = self.prev_asz2
 
-        self._prune_replen_windows(ts_ms)
-        for window in self._trade_window_deques:
-            self._prune_trade_window(ts_ms, window)
-
         is_trade = (etype == 'trade')
         for w, deq in self._event_density_deques.items():
             self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == 'ob'))
@@ -3224,6 +3531,11 @@ class FeatureEngine:
             return ts_ms, self._trade_fast_path_empty_feature, mid, True, dt_ms
 
         if etype == 'ob':
+            self._prune_replen_windows(ts_ms)
+            for window in self._trade_window_deques:
+                self._prune_trade_window(ts_ms, window)
+            for window in self.trade_burst_states:
+                self._trade_burst_prune(window, ts_ms)
             tp_code, bids, asks = payload
             t0 = time.perf_counter()
             self._update_book_from_ob(tp_code, bids, asks)
@@ -3333,20 +3645,30 @@ class FeatureEngine:
         if etype == "ob":
             self.last_ob_ofi_l5 = float(ofi_l5)
             self.last_ob_trade_imbalance_30000ms = float(trade_stats_by_ms[30_000]["trade_imbalance_notional"])
-        trades_by_ms = {
-            ms: self._recent_trades_for_window(ms, ts_ms)
-            for ms in self.trade_windows
-        }
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in self.trade_windows:
-            if self._cvd_history:
-                cvd_change = self.cvd_notional - self._cvd_asof(ts_ms - ms)
-                cvd_slope = self._rolling_slope_simple(self._cvd_window_points(ts_ms, ms))
-                cvd_minus_ema = self.cvd_notional - self._cvd_ema[ms]
+            cvd_state = self.cvd_window_states[ms]
+            cutoff = int(ts_ms) - int(ms)
+            while cvd_state.points and cvd_state.points[0][0] < cutoff:
+                old_ts, old_y = cvd_state.points.popleft()
+                t = float(old_ts) / 1000.0
+                cvd_state.n -= 1
+                cvd_state.sum_t -= t
+                cvd_state.sum_y -= float(old_y)
+                cvd_state.sum_t2 -= t * t
+                cvd_state.sum_ty -= t * float(old_y)
+                cvd_state.asof_cutoff_value = float(old_y)
+            cvd_change = float(self.cvd_notional - cvd_state.asof_cutoff_value)
+            if cvd_state.n >= 3:
+                den = cvd_state.sum_t2 - (cvd_state.sum_t * cvd_state.sum_t) / float(cvd_state.n)
+                if den > 1e-12 and math.isfinite(den):
+                    num = cvd_state.sum_ty - (cvd_state.sum_t * cvd_state.sum_y) / float(cvd_state.n)
+                    cvd_slope = num / den
+                else:
+                    cvd_slope = 0.0
             else:
-                cvd_change = 0.0
                 cvd_slope = 0.0
-                cvd_minus_ema = 0.0
+            cvd_minus_ema = float(self.cvd_notional - self._cvd_ema[ms])
             cvd_stats_by_ms[ms] = {
                 "cvd_change_usd": float(cvd_change),
                 "cvd_slope_usd_per_sec": float(cvd_slope),
@@ -3355,46 +3677,8 @@ class FeatureEngine:
             for k, v in cvd_stats_by_ms[ms].items():
                 if not math.isfinite(float(v)):
                     raise ValueError(f"Non-finite CVD stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
-        large_stats_by_ms = {ms: self._compute_large_trade_stats(trades_by_ms[ms], ms) for ms in self.trade_windows}
-
-        trade_burst_features: Dict[str, float] = {
-            "consecutive_buy_trade_count": float(self.consecutive_buy_trade_count),
-            "consecutive_sell_trade_count": float(self.consecutive_sell_trade_count),
-        }
-        for window in TRADE_BURST_WINDOWS_MS:
-            signs = self._recent_trade_signs(ts_ms, window)
-            max_buy_run = 0
-            max_sell_run = 0
-            run_buy = 0
-            run_sell = 0
-            for s in signs:
-                if s > 0:
-                    run_buy += 1
-                    run_sell = 0
-                elif s < 0:
-                    run_sell += 1
-                    run_buy = 0
-                max_buy_run = max(max_buy_run, run_buy)
-                max_sell_run = max(max_sell_run, run_sell)
-            total_signed = len(signs)
-            p_buy = self._safe_div(sum(1 for s in signs if s > 0), max(total_signed, 1), 0.0)
-            p_sell = self._safe_div(sum(1 for s in signs if s < 0), max(total_signed, 1), 0.0)
-            entropy = 0.0
-            if total_signed > 0:
-                if p_buy > 0.0:
-                    entropy -= p_buy * math.log(p_buy)
-                if p_sell > 0.0:
-                    entropy -= p_sell * math.log(p_sell)
-                entropy = self._safe_div(entropy, math.log(2.0), 0.0)
-            trade_burst_features.update({
-                f"max_buy_run_length_{window}ms": float(max_buy_run),
-                f"max_sell_run_length_{window}ms": float(max_sell_run),
-                f"trade_sign_autocorr_lag1_{window}ms": self._safe_corr_lag1([float(s) for s in signs]),
-                f"trade_sign_entropy_{window}ms": float(entropy),
-                f"trade_burst_score_{window}ms": self._safe_div(max(max_buy_run, max_sell_run), max(total_signed, 1), 0.0),
-                f"buy_trade_burst_score_{window}ms": self._safe_div(max_buy_run, max(total_signed, 1), 0.0),
-                f"sell_trade_burst_score_{window}ms": self._safe_div(max_sell_run, max(total_signed, 1), 0.0),
-            })
+        large_stats_by_ms = {ms: self._large_trade_stats_from_state(ms, ts_ms) for ms in self.trade_windows}
+        trade_burst_features = self._trade_burst_features_from_state(ts_ms)
 
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
             self.last_bid_price_change_ts = ts_ms
@@ -4018,8 +4302,7 @@ class FeatureEngine:
             feat_list.append(variance_ratio_adjacent[(cur_ms, prev_ms)])
 
         for ms in REGIME_WINDOWS_MS:
-            regime_returns = [v for _, v in self._regime_return_deques[ms].deq if math.isfinite(v)]
-            dist = self._return_distribution_stats(regime_returns)
+            dist = self._regime_distribution(ms)
             feat_list.extend([
                 regime_volume[ms],
                 regime_realized[ms],
@@ -4309,9 +4592,11 @@ class FeatureEngine:
             self.consecutive_sell_trade_count = 0
             trade_sign = 0
         self.trade_sign_history.append((int(ts_ms), int(trade_sign), float(notional_usd)))
-        trade_cutoff = int(ts_ms) - int(self._trade_sign_keep_ms)
+        trade_cutoff = int(ts_ms) - int(max(TRADE_BURST_WINDOWS_MS) + 5_000)
         while self.trade_sign_history and self.trade_sign_history[0][0] < trade_cutoff:
             self.trade_sign_history.popleft()
+        for window in TRADE_BURST_WINDOWS_MS:
+            self._trade_burst_insert(window, int(ts_ms), int(trade_sign))
 
         entry = (ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick)
         for window, deq in self._trade_window_deques.items():
@@ -4320,10 +4605,15 @@ class FeatureEngine:
 
         if side_sign != 0.0:
             self.cvd_notional += side_sign * notional_usd
-        self._cvd_history.append((int(ts_ms), float(self.cvd_notional)))
-        cutoff = int(ts_ms) - int(self.cvd_history_keep_ms)
-        while self._cvd_history and self._cvd_history[0][0] < cutoff:
-            self._cvd_history.popleft()
+        t_sec = float(ts_ms) / 1000.0
+        for ms, cvd_state in self.cvd_window_states.items():
+            y = float(self.cvd_notional)
+            cvd_state.points.append((int(ts_ms), y))
+            cvd_state.n += 1
+            cvd_state.sum_t += t_sec
+            cvd_state.sum_y += y
+            cvd_state.sum_t2 += t_sec * t_sec
+            cvd_state.sum_ty += t_sec * y
         if self.last_cvd_update_ts is None:
             for ms in FLOW_WINDOWS_MS:
                 self._cvd_ema[ms] = float(self.cvd_notional)
@@ -4415,12 +4705,91 @@ class FeatureEngine:
         for hl in self.regime_windows_ms:
             self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
 
-        for ms, stats in self._regime_return_deques.items():
-            self._append_tuple_with_guard(stats.deq, (ts_ms, r), ts_ms, ms, is_ob_event)
-            while stats.deq and (ts_ms - stats.deq[0][0] > ms):
-                stats.deq.popleft()
-            self.realized_vol[ms] = math.sqrt(sum(val * val for _, val in stats.deq))
+        for ms, state in self.regime_return_states.items():
+            self._regime_return_add(state, int(ts_ms), float(r))
+            self._regime_return_prune(state, int(ts_ms))
+            self.realized_vol[ms] = self._regime_realized_vol(state)
         return r
+
+    def _regime_return_add(self, state: RollingReturnDistributionState, ts_ms: int, r: float) -> None:
+        v = float(r)
+        av = abs(v)
+        state.seq += 1
+        seq = state.seq
+        if state.deq:
+            state.bipower += abs(state.deq[-1][1]) * av
+        state.deq.append((int(ts_ms), v, av, seq))
+        state.n += 1
+        state.sum1 += v
+        state.sum2 += v * v
+        state.sum3 += v * v * v
+        state.sum4 += v * v * v * v
+        if v > 0.0:
+            state.up_sumsq += v * v
+        elif v < 0.0:
+            state.down_sumsq += v * v
+        while state.max_abs_q and state.max_abs_q[-1][2] <= av:
+            state.max_abs_q.pop()
+        state.max_abs_q.append((seq, int(ts_ms), av))
+
+    def _regime_return_prune(self, state: RollingReturnDistributionState, now_ms: int) -> None:
+        cutoff = int(now_ms) - int(state.window_ms)
+        while state.deq and (int(now_ms) - state.deq[0][0] > state.window_ms):
+            old_ts, old_r, old_abs, old_seq = state.deq.popleft()
+            state.n -= 1
+            state.sum1 -= old_r
+            state.sum2 -= old_r * old_r
+            state.sum3 -= old_r * old_r * old_r
+            state.sum4 -= old_r * old_r * old_r * old_r
+            if old_r > 0.0:
+                state.up_sumsq -= old_r * old_r
+            elif old_r < 0.0:
+                state.down_sumsq -= old_r * old_r
+            if state.deq:
+                state.bipower -= old_abs * abs(state.deq[0][1])
+            if state.max_abs_q and state.max_abs_q[0][0] == old_seq:
+                state.max_abs_q.popleft()
+        while state.max_abs_q and state.max_abs_q[0][1] < cutoff:
+            state.max_abs_q.popleft()
+        for attr in ("sum1", "sum2", "sum3", "sum4", "up_sumsq", "down_sumsq", "bipower"):
+            val = getattr(state, attr)
+            if abs(val) < 1e-12:
+                setattr(state, attr, 0.0)
+
+    def _regime_realized_vol(self, state: RollingReturnDistributionState) -> float:
+        return math.sqrt(max(state.sum2, 0.0))
+
+    def _regime_distribution(self, ms: int) -> Dict[str, float]:
+        state = self.regime_return_states[ms]
+        if state.n <= 0:
+            return self._return_distribution_stats([])
+        eps = 1e-9
+        n = float(state.n)
+        mean = state.sum1 / n
+        m2 = max(0.0, state.sum2 / n - mean * mean)
+        std = math.sqrt(max(m2, 0.0))
+        m3 = state.sum3 / n - 3.0 * mean * (state.sum2 / n) + 2.0 * mean * mean * mean
+        m4 = state.sum4 / n - 4.0 * mean * (state.sum3 / n) + 6.0 * (mean * mean) * (state.sum2 / n) - 3.0 * mean ** 4
+        skew = 0.0
+        kurt = 0.0
+        if state.n >= 3 and std > eps:
+            skew = m3 / (std ** 3)
+        if state.n >= 4 and std > eps:
+            kurt = m4 / (std ** 4)
+        up = math.sqrt(max(state.up_sumsq, 0.0))
+        down = math.sqrt(max(state.down_sumsq, 0.0))
+        realized_var = max(state.sum2, 0.0)
+        bipower = max(state.bipower, 0.0)
+        return {
+            "realized_up_vol_bps": float(up),
+            "realized_down_vol_bps": float(down),
+            "down_up_vol_ratio": self._safe_div(down, max(up, eps), 0.0),
+            "bipower_variation": float(bipower),
+            "jump_variation": float(max(realized_var - bipower, 0.0)),
+            "max_abs_return_bps": float(state.max_abs_q[0][2]) if state.max_abs_q else 0.0,
+            "return_skew": float(skew) if math.isfinite(skew) else 0.0,
+            "return_kurtosis": float(kurt) if math.isfinite(kurt) else 0.0,
+        }
 
     def _realized_vol_for_pressure(self, ms: int) -> float:
         if ms in self.realized_vol:
