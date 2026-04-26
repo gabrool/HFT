@@ -1063,7 +1063,8 @@ class FlatLabelWriter:
 
 _SENTINEL_FLUSH_JOB = object()
 _FLUSH_QUEUE_MAXSIZE = max(8, 2 * FLUSH_WORKERS)
-_FLUSH_PERF = {"pca_project_s": 0.0, "feature_flush_s": 0.0}
+_FLUSH_PERF_LOCK = threading.Lock()
+_FLUSH_PERF = defaultdict(float)
 
 
 def _persist_flush_job(job: object) -> None:
@@ -1074,24 +1075,47 @@ def _persist_flush_job(job: object) -> None:
         aux = job.aux[:n].astype(np.float32, copy=False)
         t1 = time.perf_counter()
         centered = X - job.pca_mean[None, :]
+        t_center = time.perf_counter()
         projected = centered @ job.pca_components.T
-        _FLUSH_PERF["pca_project_s"] += float(time.perf_counter() - t1)
+        t_project = time.perf_counter()
         out = np.empty((n, int(job.final_feature_dim)), dtype=np.float32)
         pca_k = int(job.pca_components.shape[0])
         out[:, :pca_k] = projected.astype(np.float32, copy=False)
         out[:, pca_k:] = aux
+        t_assemble = time.perf_counter()
         if out.shape != (n, int(job.final_feature_dim)):
             raise ValueError(f"Projected shape mismatch: {out.shape} != {(n, int(job.final_feature_dim))}")
         if not np.all(np.isfinite(out)):
             raise ValueError("Non-finite projected feature output")
         np.save(os.path.join(job.out_dir, job.features_file), out)
+        t_save_feat = time.perf_counter()
         np.save(os.path.join(job.out_dir, job.ts_file), job.ts[: job.row_count])
-        _FLUSH_PERF["feature_flush_s"] += float(time.perf_counter() - t0)
+        t_save_ts = time.perf_counter()
+        with _FLUSH_PERF_LOCK:
+            _FLUSH_PERF["center_subtract_s"] += float(t_center - t1)
+            _FLUSH_PERF["pca_project_s"] += float(t_project - t_center)
+            _FLUSH_PERF["output_assemble_s"] += float(t_assemble - t_project)
+            _FLUSH_PERF["feature_save_s"] += float(t_save_feat - t_assemble)
+            _FLUSH_PERF["ts_save_s"] += float(t_save_ts - t_save_feat)
+            _FLUSH_PERF["feature_flush_s"] += float(t_save_ts - t0)
+            _FLUSH_PERF["flush_wall_s"] += float(t_save_ts - t0)
+            _FLUSH_PERF["flush_jobs"] += 1.0
+            _FLUSH_PERF["flush_rows"] += float(n)
         return
     if isinstance(job, LabelFlushJob):
+        t0 = time.perf_counter()
         np.save(os.path.join(job.out_dir, job.row_idx_file), job.row_idx[: job.label_count])
+        t1 = time.perf_counter()
         np.save(os.path.join(job.out_dir, job.label_ts_file), job.label_ts[: job.label_count])
+        t2 = time.perf_counter()
         np.save(os.path.join(job.out_dir, job.y_file), job.y[: job.label_count])
+        t3 = time.perf_counter()
+        with _FLUSH_PERF_LOCK:
+            _FLUSH_PERF["row_idx_save_s"] += float(t1 - t0)
+            _FLUSH_PERF["label_ts_save_s"] += float(t2 - t1)
+            _FLUSH_PERF["label_save_s"] += float(t3 - t2)
+            _FLUSH_PERF["flush_wall_s"] += float(t3 - t0)
+            _FLUSH_PERF["flush_jobs"] += 1.0
         return
     raise TypeError(f"Unsupported flush job type: {type(job)!r}")
 
@@ -2075,6 +2099,9 @@ def process_all(
     """Run ingest across week pairs with ordered daily OB paths and mode-dependent TH paths (which may be empty in OB-only mode)."""
     ensure_dir(out_root)
 
+    def _timer_delta(curr: dict, prev: dict, key: str) -> float:
+        return float(curr.get(key, 0.0)) - float(prev.get(key, 0.0))
+
     pca_summary = _summarise_pca_meta(pca_meta)
     if not pca_summary["applied"]:
         raise ValueError(f"PCA is required for FEATURE_SCHEMA={FEATURE_SCHEMA}")
@@ -2143,6 +2170,14 @@ def process_all(
     queue_wait_s = 0.0
     event_proc_s = 0.0
     router_housekeeping_s = 0.0
+    last_tok_log_wall = time.perf_counter()
+    last_tok_rows = 0
+    last_tok_labels = 0
+    last_fe_timers: Dict[str, float] = {}
+    last_flush_perf: Dict[str, float] = {}
+    label_update_s = 0.0
+    aux_build_s = 0.0
+    router_append_s = 0.0
 
     feeder = EventFeeder(pairs)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
@@ -2211,7 +2246,9 @@ def process_all(
                 )
 
             dt_tick = 1 if last_decision_ts_ms is None else int(ts_ms - last_decision_ts_ms)
+            t_aux = time.perf_counter()
             aux_tail = build_aux_tail(fe, dt_tick)
+            aux_build_s += time.perf_counter() - t_aux
 
             if router is None:
                 print(f"[first-token] feature_dim_core={int(pca_k)} aux_dim={AUX_DIM} feature_dim_total={int(F)}", flush=True)
@@ -2235,17 +2272,25 @@ def process_all(
                 if not pending_decisions:
                     raise RuntimeError("Duplicate OB timestamp cannot update state because no pending decision exists")
                 prev_week_key, _prev_row_idx, _prev_ts = pending_decisions[-1]
+                t_router_append = time.perf_counter()
                 week_key, row_idx = router.overwrite_latest_feature_row(int(ts_ms), core_pre_pca, aux_tail)
+                router_append_s += time.perf_counter() - t_router_append
                 if week_key != prev_week_key:
                     raise RuntimeError("Duplicate timestamp mapped to a different week during overwrite")
                 pending_decisions[-1] = (week_key, row_idx, int(ts_ms))
             else:
+                t_router_append = time.perf_counter()
                 week_key, row_idx = router.append_feature_row(int(ts_ms), core_pre_pca, aux_tail)
+                router_append_s += time.perf_counter() - t_router_append
                 pending_decisions.append((week_key, row_idx, int(ts_ms)))
+                t_label = time.perf_counter()
                 labeler.on_decision(int(ts_ms))
+                label_update_s += time.perf_counter() - t_label
                 total_feature_rows += 1
 
+            t_label = time.perf_counter()
             matured = labeler.on_event(int(ts_ms), float(mid))
+            label_update_s += time.perf_counter() - t_label
             last_decision_ts_ms = int(ts_ms)
 
             if matured is None:
@@ -2264,12 +2309,42 @@ def process_all(
 
         if time.monotonic() - last_log >= 300:
             elapsed = max(1e-9, time.monotonic() - ingest_started)
+            now_perf = time.perf_counter()
+            interval_wall = max(1e-9, now_perf - last_tok_log_wall)
+            fe_curr = fe.timer_totals()
+            with _FLUSH_PERF_LOCK:
+                flush_curr = dict(_FLUSH_PERF)
+            ob_cnt = _timer_delta(fe_curr, last_fe_timers, "ob_feature_build_count")
+            trade_cnt = _timer_delta(fe_curr, last_fe_timers, "trade_fast_path_count")
+            ob_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "feature_build_s") / max(ob_cnt, 1.0))
+            z_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "zscore_s") / max(ob_cnt, 1.0))
+            fill_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "feature_fill_s") / max(ob_cnt, 1.0))
+            book_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "book_update_s") / max(ob_cnt, 1.0))
+            cache_ms = (1000.0 * _timer_delta(fe_curr, last_fe_timers, "book_cache_s") / max(ob_cnt, 1.0))
+            metric_ms = (1000.0 * (_timer_delta(fe_curr, last_fe_timers, "metric_state_s") + _timer_delta(fe_curr, last_fe_timers, "metric_query_s")) / max(ob_cnt, 1.0))
+            trade_us = (1e6 * _timer_delta(fe_curr, last_fe_timers, "trade_update_s") / max(trade_cnt, 1.0))
+            trade_per_ob = trade_cnt / max(ob_cnt, 1.0)
+            delta_rows = total_feature_rows - last_tok_rows
+            delta_labels = total_labels - last_tok_labels
             print(
                 f"[tok  ] rows={total_feature_rows} labels={total_labels} weeks={week_counter}/{week_total} "
                 f"chunkN={router.chunk_size_used if router else 0} rows_per_sec={total_feature_rows/elapsed:.2f} "
+                f"ob_ms={ob_ms:.2f} fe_build_ms={ob_ms:.2f} z_ms={z_ms:.2f} fill_ms={fill_ms:.2f} "
+                f"book_ms={book_ms:.2f} book_cache_ms={cache_ms:.2f} metric_ms={metric_ms:.2f} "
+                f"trade_us={trade_us:.2f} trade_per_ob={trade_per_ob:.2f} "
+                f"queue_wait_s={queue_wait_s:.2f} label_s={label_update_s:.2f} aux_s={aux_build_s:.2f} router_s={router_append_s:.2f} "
+                f"flush_proj_s={_timer_delta(flush_curr, last_flush_perf, 'pca_project_s'):.2f} "
+                f"flush_save_s={_timer_delta(flush_curr, last_flush_perf, 'feature_save_s'):.2f} "
+                f"flush_label_s={_timer_delta(flush_curr, last_flush_perf, 'label_save_s'):.2f} "
+                f"int_rows={delta_rows} int_labels={delta_labels} int_sec={interval_wall:.1f} "
                 f"queue_full={feeder._queue_full_count}",
                 flush=True,
             )
+            last_tok_log_wall = now_perf
+            last_tok_rows = total_feature_rows
+            last_tok_labels = total_labels
+            last_fe_timers = fe_curr
+            last_flush_perf = flush_curr
             last_log = time.monotonic()
 
     producer_thread.join()

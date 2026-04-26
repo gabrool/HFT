@@ -1,7 +1,7 @@
 import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time, heapq
 from pathlib import Path
 from collections import deque
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
 import numpy as np
 import torch
@@ -45,6 +45,8 @@ from huggingface_hub import PyTorchModelHubMixin
 # NOTE FOR CONTRIBUTORS:
 # This file is a library module. Offline dataset creation is implemented in
 # offline_ingest.py. Do not add ingestion scripts here.
+BYBIT_FE_TIMING_DETAIL = int(os.environ.get("BYBIT_FE_TIMING_DETAIL", "1")) == 1
+BYBIT_FEATURE_FILL_VALIDATE_ROWS = int(os.environ.get("BYBIT_FEATURE_FILL_VALIDATE_ROWS", "1000"))
 
 ft_config.donated_buffer = False
 torch.cuda.empty_cache()
@@ -1418,6 +1420,119 @@ class RollingReturnDistributionState:
     seq: int
 
 
+class ExactRollingMetricWindow:
+    def __init__(self, window_ms: int):
+        self.window_ms = int(window_ms)
+        self.deq: Deque[Tuple[int, float, float]] = deque()
+        self.sorted_vals: List[float] = []
+        self.anchor_ms: Optional[int] = None
+        self.n = 0
+        self.sum = 0.0
+        self.sumsq = 0.0
+        self.sum_t = 0.0
+        self.sum_y = 0.0
+        self.sum_t2 = 0.0
+        self.sum_ty = 0.0
+
+    def add(self, ts_ms: int, value: float) -> None:
+        ts = int(ts_ms)
+        val = float(value)
+        if self.anchor_ms is None:
+            self.anchor_ms = ts
+        t_rel_sec = (ts - int(self.anchor_ms)) / 1000.0
+        self.deq.append((ts, val, t_rel_sec))
+        insort(self.sorted_vals, val)
+        self.n += 1
+        self.sum += val
+        self.sumsq += val * val
+        self.sum_t += t_rel_sec
+        self.sum_y += val
+        self.sum_t2 += t_rel_sec * t_rel_sec
+        self.sum_ty += t_rel_sec * val
+
+    def prune(self, now_ms: int) -> None:
+        cutoff = int(now_ms) - int(self.window_ms)
+        while self.deq and self.deq[0][0] < cutoff:
+            _ts, val, t_rel_sec = self.deq.popleft()
+            idx = bisect_left(self.sorted_vals, val)
+            if idx >= len(self.sorted_vals):
+                raise RuntimeError("ExactRollingMetricWindow prune removal mismatch")
+            self.sorted_vals.pop(idx)
+            self.n -= 1
+            self.sum -= val
+            self.sumsq -= val * val
+            self.sum_t -= t_rel_sec
+            self.sum_y -= val
+            self.sum_t2 -= t_rel_sec * t_rel_sec
+            self.sum_ty -= t_rel_sec * val
+
+    def mean(self) -> float:
+        return self.sum / self.n if self.n > 0 else 0.0
+
+    def std_population(self) -> float:
+        if self.n <= 0:
+            return 0.0
+        mu = self.sum / self.n
+        return math.sqrt(max((self.sumsq / self.n) - mu * mu, 0.0))
+
+    def min(self) -> float:
+        return float(self.sorted_vals[0]) if self.sorted_vals else 0.0
+
+    def max(self) -> float:
+        return float(self.sorted_vals[-1]) if self.sorted_vals else 0.0
+
+    def p90(self) -> float:
+        if not self.sorted_vals:
+            return 0.0
+        n = len(self.sorted_vals)
+        pos = (n - 1) * 0.9
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return float(self.sorted_vals[lo])
+        return float(self.sorted_vals[lo] * (hi - pos) + self.sorted_vals[hi] * (pos - lo))
+
+    def z_current(self, current: float) -> float:
+        std = self.std_population()
+        if std <= 1e-9:
+            return 0.0
+        return (float(current) - self.mean()) / max(std, 1e-9)
+
+    def slope_per_sec(self) -> float:
+        if self.n < 3:
+            return 0.0
+        den = (self.n * self.sum_t2) - (self.sum_t * self.sum_t)
+        if abs(den) <= 1e-12:
+            return 0.0
+        return float(((self.n * self.sum_ty) - (self.sum_t * self.sum_y)) / den)
+
+
+@dataclass
+class BookArrayCache:
+    ts_ms: int
+    bid_px: np.ndarray
+    bid_sz: np.ndarray
+    ask_px: np.ndarray
+    ask_sz: np.ndarray
+    bid_notional: np.ndarray
+    ask_notional: np.ndarray
+    bid_size_prefix: np.ndarray
+    ask_size_prefix: np.ndarray
+    bid_notional_prefix: np.ndarray
+    ask_notional_prefix: np.ndarray
+    bid_dist_bps: np.ndarray
+    ask_dist_bps: np.ndarray
+    mid: float
+    micro: float
+    bid1: float
+    ask1: float
+    bsz1: float
+    asz1: float
+    spread: float
+    spread_bps: float
+    valid: bool
+
+
 # -------------------------  Feature engine  -------------------------
 class FeatureEngine:
 
@@ -1520,12 +1635,17 @@ class FeatureEngine:
             for ms in self.regime_windows_ms
         }
         self.last_mid_for_ret: Optional[float] = None
-        self._spread_bps_history: Deque[Tuple[int, float]] = deque()
-        self._bid_depth_5bps_history: Deque[Tuple[int, float]] = deque()
-        self._ask_depth_5bps_history: Deque[Tuple[int, float]] = deque()
-        self._depth_5bps_total_history: Deque[Tuple[int, float]] = deque()
-        self._depth_5bps_imbalance_history: Deque[Tuple[int, float]] = deque()
-        self._regime_metric_keep_ms = max(SPREAD_DEPTH_REGIME_WINDOWS_MS) + 5_000
+        self.spread_depth_metric_names = (
+            "spread_bps",
+            "bid_depth_5bps",
+            "ask_depth_5bps",
+            "depth_5bps_total",
+            "depth_5bps_imbalance",
+        )
+        self.spread_depth_regime_states: Dict[str, Dict[int, ExactRollingMetricWindow]] = {
+            name: {ms: ExactRollingMetricWindow(ms) for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS}
+            for name in self.spread_depth_metric_names
+        }
 
         # ---------- Spread ----------
         self.last_spread: Optional[float] = None
@@ -1699,12 +1819,25 @@ class FeatureEngine:
         self._z_half_lives_arr: Optional[np.ndarray] = None
         self._z_mask: Optional[np.ndarray] = None
         self._last_z_ts_ms: Optional[int] = None
+        self._feature_index: Optional[Dict[str, int]] = None
+        self._feature_dim: Optional[int] = None
+        self._feature_fill_template: Optional[np.ndarray] = None
+        self._feature_fill_validate_remaining: int = max(0, int(BYBIT_FEATURE_FILL_VALIDATE_ROWS))
+        self._book_array_cache: Optional[BookArrayCache] = None
+        self._book_array_cache_dirty: bool = True
+        self._book_array_cache_ts: Optional[int] = None
 
         # ---------- ingest timing ----------
         self.timer_parse_dispatch_s: float = 0.0
         self.timer_book_update_s: float = 0.0
         self.timer_trade_update_s: float = 0.0
         self.timer_feature_build_s: float = 0.0
+        self.timer_book_cache_s: float = 0.0
+        self.timer_metric_state_s: float = 0.0
+        self.timer_metric_query_s: float = 0.0
+        self.timer_feature_fill_s: float = 0.0
+        self.timer_zscore_s: float = 0.0
+        self.timer_feature_validate_s: float = 0.0
         self.trade_fast_path_count: int = 0
         self.ob_feature_build_count: int = 0
 
@@ -2191,6 +2324,57 @@ class FeatureEngine:
                 out.append((ts_i, v))
 
         out.reverse()
+        return out
+
+    def _update_spread_depth_regime_states(
+        self,
+        ts_ms: int,
+        spread_bps: float,
+        bid_depth_5bps: float,
+        ask_depth_5bps: float,
+        depth_5bps_total: float,
+        depth_5bps_imbalance: float,
+    ) -> None:
+        values = {
+            "spread_bps": float(spread_bps),
+            "bid_depth_5bps": float(bid_depth_5bps),
+            "ask_depth_5bps": float(ask_depth_5bps),
+            "depth_5bps_total": float(depth_5bps_total),
+            "depth_5bps_imbalance": float(depth_5bps_imbalance),
+        }
+        for name, value in values.items():
+            for state in self.spread_depth_regime_states[name].values():
+                state.add(ts_ms, value)
+                state.prune(ts_ms)
+
+    def _spread_depth_regime_features_from_state(self, current_values: Dict[str, float]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        cur_spread = float(current_values["spread_bps"])
+        cur_depth = float(current_values["depth_5bps_total"])
+        cur_bid = float(current_values["bid_depth_5bps"])
+        cur_ask = float(current_values["ask_depth_5bps"])
+        for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
+            spread_state = self.spread_depth_regime_states["spread_bps"][ms]
+            depth_state = self.spread_depth_regime_states["depth_5bps_total"][ms]
+            imb_state = self.spread_depth_regime_states["depth_5bps_imbalance"][ms]
+            bid_state = self.spread_depth_regime_states["bid_depth_5bps"][ms]
+            ask_state = self.spread_depth_regime_states["ask_depth_5bps"][ms]
+            above = float(sum(1.0 for _t, v, _r in spread_state.deq if v > 1.0) / spread_state.n) if spread_state.n > 0 else 0.0
+            out[f"spread_mean_bps_{ms}ms"] = spread_state.mean()
+            out[f"spread_std_bps_{ms}ms"] = spread_state.std_population()
+            out[f"spread_p90_bps_{ms}ms"] = spread_state.p90()
+            out[f"spread_max_bps_{ms}ms"] = spread_state.max()
+            out[f"spread_min_bps_{ms}ms"] = spread_state.min()
+            out[f"spread_z_{ms}ms"] = spread_state.z_current(cur_spread)
+            out[f"spread_widening_slope_bps_per_sec_{ms}ms"] = spread_state.slope_per_sec()
+            out[f"spread_time_above_1bp_frac_{ms}ms"] = above
+            out[f"depth_5bps_mean_{ms}ms"] = depth_state.mean()
+            out[f"depth_5bps_std_{ms}ms"] = depth_state.std_population()
+            out[f"depth_5bps_z_{ms}ms"] = depth_state.z_current(cur_depth)
+            out[f"depth_imbalance_5bps_mean_{ms}ms"] = imb_state.mean()
+            out[f"depth_imbalance_5bps_slope_{ms}ms"] = imb_state.slope_per_sec()
+            out[f"liquidity_shock_bid_5bps_{ms}ms"] = (cur_bid / max(bid_state.mean(), 1e-9)) - 1.0
+            out[f"liquidity_shock_ask_5bps_{ms}ms"] = (cur_ask / max(ask_state.mean(), 1e-9)) - 1.0
         return out
 
     def _rolling_stats_values(self, vals: List[float]) -> Dict[str, float]:
@@ -3152,6 +3336,7 @@ class FeatureEngine:
         self.bid_lvls = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[: self.depth]
         self.ask_lvls = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[: self.depth]
         self._book_dirty = False
+        self._book_array_cache_dirty = True
 
     def _insert_level(self, levels: List[Tuple[float, float]], price: float, size: float, is_bid: bool) -> bool:
         insert_at = 0
@@ -3243,6 +3428,71 @@ class FeatureEngine:
         bsz = self.bid_lvls[0][1] if self.bid_lvls else 0.0
         asz = self.ask_lvls[0][1] if self.ask_lvls else 0.0
         return bid, ask, bsz, asz
+
+    def _ensure_feature_index(self) -> None:
+        if self._feature_index is not None:
+            return
+        names = self.feature_names()
+        if len(names) != len(set(names)):
+            raise ValueError("Duplicate feature names detected")
+        self._feature_index = {name: i for i, name in enumerate(names)}
+        self._feature_dim = len(names)
+        self._feature_fill_template = np.zeros((self._feature_dim,), dtype=np.float64)
+
+    class _FeatureAppendBuffer:
+        def __init__(self, dim: int):
+            self.arr = np.zeros((int(dim),), dtype=np.float64)
+            self.i = 0
+
+        def append(self, value: float) -> None:
+            if self.i >= self.arr.shape[0]:
+                raise RuntimeError("Feature append overflow")
+            self.arr[self.i] = float(value)
+            self.i += 1
+
+        def extend(self, values: Iterable[float]) -> None:
+            for v in values:
+                self.append(float(v))
+
+        def __len__(self) -> int:
+            return int(self.i)
+
+        def __iter__(self):
+            for j in range(self.i):
+                yield float(self.arr[j])
+
+    def _refresh_book_array_cache(self, ts_ms: int) -> BookArrayCache:
+        if (not self._book_array_cache_dirty) and self._book_array_cache is not None:
+            return self._book_array_cache
+        t0 = time.perf_counter()
+        self._ensure_book_ladders()
+        n_bid = min(self.depth, len(self.bid_lvls))
+        n_ask = min(self.depth, len(self.ask_lvls))
+        bid_px = np.asarray([p for p, _ in self.bid_lvls[:n_bid]], dtype=np.float64)
+        bid_sz = np.asarray([s for _, s in self.bid_lvls[:n_bid]], dtype=np.float64)
+        ask_px = np.asarray([p for p, _ in self.ask_lvls[:n_ask]], dtype=np.float64)
+        ask_sz = np.asarray([s for _, s in self.ask_lvls[:n_ask]], dtype=np.float64)
+        if bid_px.size == 0 or ask_px.size == 0:
+            self._book_array_cache = BookArrayCache(int(ts_ms), bid_px, bid_sz, ask_px, ask_sz, np.empty((0,)), np.empty((0,)), np.empty((0,)), np.empty((0,)), np.empty((0,)), np.empty((0,)), np.empty((0,)), np.empty((0,)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False)
+        else:
+            bid1 = float(bid_px[0]); ask1 = float(ask_px[0]); bsz1 = float(bid_sz[0]); asz1 = float(ask_sz[0])
+            mid = 0.5 * (bid1 + ask1) if bid1 > 0.0 and ask1 > 0.0 else 0.0
+            spread = max(0.0, ask1 - bid1)
+            spread_bps = 1e4 * spread / max(mid, 1e-12) if mid > 0.0 else 0.0
+            micro = ((ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1)) if (bsz1 + asz1) > 0.0 else mid
+            bid_notional = bid_px * bid_sz
+            ask_notional = ask_px * ask_sz
+            bid_size_prefix = np.cumsum(bid_sz)
+            ask_size_prefix = np.cumsum(ask_sz)
+            bid_notional_prefix = np.cumsum(bid_notional)
+            ask_notional_prefix = np.cumsum(ask_notional)
+            bid_dist_bps = ((mid - bid_px) / max(mid, 1e-12)) * 1e4 if mid > 0.0 else np.full_like(bid_px, np.inf)
+            ask_dist_bps = ((ask_px - mid) / max(mid, 1e-12)) * 1e4 if mid > 0.0 else np.full_like(ask_px, np.inf)
+            self._book_array_cache = BookArrayCache(int(ts_ms), bid_px, bid_sz, ask_px, ask_sz, bid_notional, ask_notional, bid_size_prefix, ask_size_prefix, bid_notional_prefix, ask_notional_prefix, bid_dist_bps, ask_dist_bps, float(mid), float(micro), bid1, ask1, bsz1, asz1, float(spread), float(spread_bps), True)
+        self._book_array_cache_dirty = False
+        self._book_array_cache_ts = int(ts_ms)
+        self.timer_book_cache_s += time.perf_counter() - t0
+        return self._book_array_cache
 
     def _cum_depth(self, lvls: List[Tuple[float, float]], n: int) -> float:
         return float(sum(s for _, s in lvls[: n]))
@@ -3789,6 +4039,8 @@ class FeatureEngine:
                 sign_persistence, up_frac, autocorr,
             )
 
+        if BYBIT_FE_TIMING_DETAIL:
+            self._refresh_book_array_cache(ts_ms)
         bid_depth_5bps = self._depth_within_bps(self.bid_lvls, mid, 5.0, is_bid=True)
         ask_depth_5bps = self._depth_within_bps(self.ask_lvls, mid, 5.0, is_bid=False)
         depth_5bps_total = bid_depth_5bps["size"] + ask_depth_5bps["size"]
@@ -3797,11 +4049,16 @@ class FeatureEngine:
             bid_depth_5bps["size"] + ask_depth_5bps["size"],
             0.0,
         )
-        self._append_metric_history(self._spread_bps_history, ts_ms, spread_bps, self._regime_metric_keep_ms)
-        self._append_metric_history(self._bid_depth_5bps_history, ts_ms, bid_depth_5bps["size"], self._regime_metric_keep_ms)
-        self._append_metric_history(self._ask_depth_5bps_history, ts_ms, ask_depth_5bps["size"], self._regime_metric_keep_ms)
-        self._append_metric_history(self._depth_5bps_total_history, ts_ms, depth_5bps_total, self._regime_metric_keep_ms)
-        self._append_metric_history(self._depth_5bps_imbalance_history, ts_ms, depth_5bps_imbalance, self._regime_metric_keep_ms)
+        t_metric_state = time.perf_counter()
+        self._update_spread_depth_regime_states(
+            ts_ms=ts_ms,
+            spread_bps=spread_bps,
+            bid_depth_5bps=bid_depth_5bps["size"],
+            ask_depth_5bps=ask_depth_5bps["size"],
+            depth_5bps_total=depth_5bps_total,
+            depth_5bps_imbalance=depth_5bps_imbalance,
+        )
+        self.timer_metric_state_s += time.perf_counter() - t_metric_state
 
         band_depth_stats: Dict[float, Dict[str, dict]] = {}
         for band in BPS_DEPTH_BANDS:
@@ -3974,7 +4231,8 @@ class FeatureEngine:
         bid_5bps_levels = [(p, s) for p, s in self.bid_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p <= mid and (1e4 * (mid - p) / mid) <= 5.0]
         ask_5bps_levels = [(p, s) for p, s in self.ask_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p >= mid and (1e4 * (p - mid) / mid) <= 5.0]
 
-        feat_list: List[float] = []
+        self._ensure_feature_index()
+        feat_list = self._FeatureAppendBuffer(int(self._feature_dim or 0))
         feat_list.extend([
             session_features["time_hour_sin"],
             session_features["time_hour_cos"],
@@ -4287,45 +4545,32 @@ class FeatureEngine:
                 dist["return_kurtosis"],
             ])
 
+        t_metric_query = time.perf_counter()
+        spread_depth_regime_features = self._spread_depth_regime_features_from_state({
+            "spread_bps": spread_bps,
+            "bid_depth_5bps": bid_depth_5bps["size"],
+            "ask_depth_5bps": ask_depth_5bps["size"],
+            "depth_5bps_total": depth_5bps_total,
+            "depth_5bps_imbalance": depth_5bps_imbalance,
+        })
+        self.timer_metric_query_s += time.perf_counter() - t_metric_query
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
-            spread_points = self._metric_values(self._spread_bps_history, ts_ms, ms)
-            spread_vals = [v for _, v in spread_points]
-            spread_stats = self._rolling_stats_values(spread_vals)
-            spread_std = spread_stats["std"]
-            spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_stats["mean"]) / max(spread_std, 1e-9)
-            spread_slope = self._rolling_value_slope(spread_points)
-            spread_above = self._safe_div(sum(1.0 for v in spread_vals if v > 1.0), float(len(spread_vals)), 0.0)
-
-            depth_points = self._metric_values(self._depth_5bps_total_history, ts_ms, ms)
-            depth_vals = [v for _, v in depth_points]
-            depth_mean, depth_std = self._rolling_mean_std_values(depth_vals)
-            depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_mean) / max(depth_std, 1e-9)
-            imb_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, ms)
-            imb_vals = [v for _, v in imb_points]
-            imb_mean = self._rolling_mean_values(imb_vals)
-            imb_slope = self._rolling_value_slope(imb_points)
-
-            bid_points = self._metric_values(self._bid_depth_5bps_history, ts_ms, ms)
-            ask_points = self._metric_values(self._ask_depth_5bps_history, ts_ms, ms)
-            bid_mean = self._rolling_mean_values([v for _, v in bid_points])
-            ask_mean = self._rolling_mean_values([v for _, v in ask_points])
-
             feat_list.extend([
-                spread_stats["mean"],
-                spread_stats["std"],
-                spread_stats["p90"],
-                spread_stats["max"],
-                spread_stats["min"],
-                spread_z,
-                spread_slope,
-                spread_above,
-                depth_mean,
-                depth_std,
-                depth_z,
-                imb_mean,
-                imb_slope,
-                (bid_depth_5bps["size"] / max(bid_mean, 1e-9)) - 1.0,
-                (ask_depth_5bps["size"] / max(ask_mean, 1e-9)) - 1.0,
+                spread_depth_regime_features[f"spread_mean_bps_{ms}ms"],
+                spread_depth_regime_features[f"spread_std_bps_{ms}ms"],
+                spread_depth_regime_features[f"spread_p90_bps_{ms}ms"],
+                spread_depth_regime_features[f"spread_max_bps_{ms}ms"],
+                spread_depth_regime_features[f"spread_min_bps_{ms}ms"],
+                spread_depth_regime_features[f"spread_z_{ms}ms"],
+                spread_depth_regime_features[f"spread_widening_slope_bps_per_sec_{ms}ms"],
+                spread_depth_regime_features[f"spread_time_above_1bp_frac_{ms}ms"],
+                spread_depth_regime_features[f"depth_5bps_mean_{ms}ms"],
+                spread_depth_regime_features[f"depth_5bps_std_{ms}ms"],
+                spread_depth_regime_features[f"depth_5bps_z_{ms}ms"],
+                spread_depth_regime_features[f"depth_imbalance_5bps_mean_{ms}ms"],
+                spread_depth_regime_features[f"depth_imbalance_5bps_slope_{ms}ms"],
+                spread_depth_regime_features[f"liquidity_shock_bid_5bps_{ms}ms"],
+                spread_depth_regime_features[f"liquidity_shock_ask_5bps_{ms}ms"],
             ])
 
         bid_depth_5bps_base = float(band_depth_stats[5.0]["bid"]["size"])
@@ -4415,15 +4660,21 @@ class FeatureEngine:
                 f"Feature vector/name length mismatch: len(feat_list)={len(feat_list)} "
                 f"len(feature_names)={len(names)}"
             )
-        values_np = np.asarray(feat_list, dtype=np.float64)
+        t_fill_done = time.perf_counter()
+        self.timer_feature_fill_s += t_fill_done - t0
+        t_validate = time.perf_counter()
+        values_np = np.asarray(feat_list.arr[:len(feat_list)], dtype=np.float64)
         if not np.all(np.isfinite(values_np)):
             raise ValueError("Non-finite feature vector")
         for name, value in zip(names, feat_list):
             if not np.isfinite(float(value)):
                 raise ValueError(f"Non-finite feature {name}={value!r} at ts_ms={ts_ms}")
+        self.timer_feature_validate_s += time.perf_counter() - t_validate
 
-        feat = np.array(feat_list, dtype=np.float64)
+        feat = values_np
+        t_z = time.perf_counter()
         feat_z = self._zscore(feat, ts_ms)
+        self.timer_zscore_s += time.perf_counter() - t_z
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
@@ -4446,11 +4697,13 @@ class FeatureEngine:
             self.bids = {float(p): float(q) for p, q in bids[: self.depth]}
             self.asks = {float(p): float(q) for p, q in asks[: self.depth]}
             self._sorted_ladders()
+            self._book_array_cache_dirty = True
             return
 
         rebuild_bid = self._apply_side_updates(self.bids, self.bid_lvls, bids, is_bid=True)
         rebuild_ask = self._apply_side_updates(self.asks, self.ask_lvls, asks, is_bid=False)
         self._book_dirty = bool(rebuild_bid or rebuild_ask)
+        self._book_array_cache_dirty = True
 
     def _interpret_tick_direction(self, tick_dir: Any) -> Tuple[int, int]:
         tick_sign = 0
@@ -4921,21 +5174,32 @@ class FeatureEngine:
 
     def timer_totals(self) -> Dict[str, float]:
         return {
-            'parse_dispatch_s': float(self.timer_parse_dispatch_s),
-            'order_book_update_s': float(self.timer_book_update_s),
-            'trade_update_s': float(self.timer_trade_update_s),
-            'feature_build_s': float(self.timer_feature_build_s),
-            'trade_fast_path_count': int(self.trade_fast_path_count),
-            'ob_feature_build_count': int(self.ob_feature_build_count),
+            "parse_dispatch_s": self.timer_parse_dispatch_s,
+            "book_update_s": self.timer_book_update_s,
+            "trade_update_s": self.timer_trade_update_s,
+            "feature_build_s": self.timer_feature_build_s,
+            "book_cache_s": self.timer_book_cache_s,
+            "metric_state_s": self.timer_metric_state_s,
+            "metric_query_s": self.timer_metric_query_s,
+            "feature_fill_s": self.timer_feature_fill_s,
+            "zscore_s": self.timer_zscore_s,
+            "feature_validate_s": self.timer_feature_validate_s,
+            "trade_fast_path_count": float(self.trade_fast_path_count),
+            "ob_feature_build_count": float(self.ob_feature_build_count),
         }
 
     def print_timer_totals(self, prefix: str = '[timers]') -> None:
         totals = self.timer_totals()
         print(
             f"{prefix} parse_dispatch={totals['parse_dispatch_s']:.6f}s "
-            f"order_book_update={totals['order_book_update_s']:.6f}s "
+            f"book_update={totals['book_update_s']:.6f}s "
             f"trade_update={totals['trade_update_s']:.6f}s "
             f"feature_build={totals['feature_build_s']:.6f}s "
+            f"book_cache={totals['book_cache_s']:.6f}s "
+            f"metric_state={totals['metric_state_s']:.6f}s "
+            f"metric_query={totals['metric_query_s']:.6f}s "
+            f"feature_fill={totals['feature_fill_s']:.6f}s "
+            f"zscore={totals['zscore_s']:.6f}s "
             f"trade_fast_path_count={totals['trade_fast_path_count']} "
             f"ob_feature_build_count={totals['ob_feature_build_count']}",
             flush=True,
@@ -5336,3 +5600,23 @@ def build_datasets_from_meta_splits(dataset_root: str) -> Dict[str, HFTFlatDatas
                 continue
             out[f"{section}.{name}"] = build_dataset_from_split(dataset_root, cfg)
     return out
+
+
+def run_feature_speed_refactor_tests() -> None:
+    w = ExactRollingMetricWindow(1_000)
+    assert w.mean() == 0.0 and w.std_population() == 0.0
+    w.add(1_000, 1.0); w.prune(1_000)
+    assert abs(w.mean() - 1.0) < 1e-12
+    w.add(1_500, 3.0); w.prune(1_500)
+    assert abs(w.p90() - np.percentile(np.array([1.0, 3.0]), 90)) < 1e-9
+    w.add(2_500, 5.0); w.prune(2_500)
+    assert w.n >= 2
+    fe = FeatureEngine()
+    names = fe.feature_names()
+    fe._ensure_feature_index()
+    assert len(names) == int(fe._feature_dim or 0)
+    print("[tests] run_feature_speed_refactor_tests passed", flush=True)
+
+
+if __name__ == "__main__" and os.environ.get("BYBIT_RUN_FEATURE_SPEED_TESTS") == "1":
+    run_feature_speed_refactor_tests()
