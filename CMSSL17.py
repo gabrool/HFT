@@ -3661,7 +3661,6 @@ class FeatureEngine:
         self._add_feature_timer("trade_window_stats_s", section_t0)
 
         section_t0 = time.perf_counter()
-        cvd_section_t0 = section_t0
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in self.trade_windows:
             cvd_state = self.cvd_window_states[ms]
@@ -3679,6 +3678,7 @@ class FeatureEngine:
                     raise ValueError(f"Non-finite CVD stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
         large_stats_by_ms = {ms: self._large_trade_stats_from_state(ms, ts_ms) for ms in self.trade_windows}
         trade_burst_features = self._trade_burst_features_from_state(ts_ms)
+        self._add_feature_timer("cvd_large_burst_s", section_t0)
 
         section_t0 = time.perf_counter()
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
@@ -3785,8 +3785,6 @@ class FeatureEngine:
             "large_sell_continuation_bps_15000ms": self._bps(self.last_large_sell_mid or 0.0, mid, 0.0)
             if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= 15_000) else 0.0,
         }
-
-        self._add_feature_timer("cvd_large_burst_s", cvd_section_t0)
 
         section_t0 = time.perf_counter()
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
@@ -3903,7 +3901,9 @@ class FeatureEngine:
                     match = sum(1.0 for v in ys if self._sign(v) == current_sign and self._sign(v) != 0)
                     persistence = self._safe_div(match, float(len(ys)), 0.0)
                 rolling_obi_stats[(level, window)] = (mean_val, slope, persistence)
+        self._add_feature_timer("rolling_ofi_obi_s", section_t0)
 
+        section_t0 = time.perf_counter()
         deep_micro_features: Dict[str, float] = {}
         deep_micro_minus_mid_bps: Dict[int, float] = {}
         micro_price_by_level: Dict[int, float] = {}
@@ -3934,7 +3934,9 @@ class FeatureEngine:
                 deep_micro_features[f"micro_l{level}_slope_{window}ms"] = self._lin_slope(xs, ys) if len(ys) >= 2 else 0.0
         deep_micro_features["micro_l1_minus_micro_l10_bps"] = self._bps(micro, micro_price_by_level.get(10, 0.0), 0.0)
         deep_micro_features["micro_l5_minus_micro_l20_bps"] = self._bps(micro_price_by_level.get(5, 0.0), micro_price_by_level.get(20, 0.0), 0.0)
+        self._add_feature_timer("deep_micro_features_s", section_t0)
 
+        section_t0 = time.perf_counter()
         slippage_asymmetry_features: Dict[str, float] = {}
         notional_map = {int(n): n for n in SLIPPAGE_NOTIONAL_USD}
         for notional in SLIPPAGE_NOTIONAL_USD:
@@ -5033,7 +5035,11 @@ class FeatureEngine:
             label = key[:-2] if key.endswith('_s') else key
             ms_per_ob = 1000.0 * float(seconds) / ob_count
             parts.append(f"{label}={float(seconds):.6f}s/{ms_per_ob:.3f}ms/ob")
-        print(f"[timers-detail] {' '.join(parts)}", flush=True)
+        if prefix.endswith("]"):
+            detail_prefix = prefix[:-1] + "-detail]"
+        else:
+            detail_prefix = prefix + "-detail"
+        print(f"{detail_prefix} {' '.join(parts)}", flush=True)
 
 
 class LabelBuilder:
