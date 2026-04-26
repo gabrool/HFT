@@ -480,7 +480,7 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
-FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v5"
+FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v6_fast_trade_obnorm"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
 CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-stage4-v4"
 EPOCHS          = 200
@@ -1509,6 +1509,12 @@ class FeatureEngine:
         self._feat_dim: Optional[int] = None
         self._feature_names_cache: Optional[List[str]] = None
         self._z_half_lives_ms: Optional[List[Optional[int]]] = None
+        # Empty immutable-ish placeholder returned for trade events.
+        # Trade rows are never consumed by offline_ingest, so this avoids per-trade allocation.
+        self._trade_fast_path_empty_feature = np.empty((0,), dtype=np.float32)
+        # Vectorized z-score metadata.
+        self._z_half_lives_arr: Optional[np.ndarray] = None
+        self._z_mask: Optional[np.ndarray] = None
         self._last_z_ts_ms: Optional[int] = None
 
         # ---------- ingest timing ----------
@@ -1516,6 +1522,8 @@ class FeatureEngine:
         self.timer_book_update_s: float = 0.0
         self.timer_trade_update_s: float = 0.0
         self.timer_feature_build_s: float = 0.0
+        self.trade_fast_path_count: int = 0
+        self.ob_feature_build_count: int = 0
 
     def feature_names(self) -> List[str]:
         if self._feature_names_cache is not None:
@@ -3197,6 +3205,24 @@ class FeatureEngine:
         for w, deq in self._event_density_deques.items():
             self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == 'ob'))
 
+        if etype == 'trade':
+            t0 = time.perf_counter()
+            self._update_trade_windows(ts_ms, payload, dt_ms)
+            self.timer_trade_update_s += time.perf_counter() - t0
+            self.trade_fast_path_count += 1
+
+            # Trade rows update trade/event-density state only.
+            # They must not build feature vectors, update feature z-score state,
+            # append price-history rows, update book EMAs, or call _zscore().
+            self.last_ts = ts_ms
+            self._last_event_ts = ts_ms
+
+            # Mid is ignored by offline_ingest for trades, but return a best-effort value
+            # for API consistency.
+            bid1, ask1, _, _ = self._book_best()
+            mid = 0.5 * (bid1 + ask1) if bid1 > 0.0 and ask1 > 0.0 else 0.0
+            return ts_ms, self._trade_fast_path_empty_feature, mid, True, dt_ms
+
         if etype == 'ob':
             tp_code, bids, asks = payload
             t0 = time.perf_counter()
@@ -3205,9 +3231,7 @@ class FeatureEngine:
             for window, deq in self._quote_window_deques.items():
                 self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
         else:
-            t0 = time.perf_counter()
-            self._update_trade_windows(ts_ms, payload, dt_ms)
-            self.timer_trade_update_s += time.perf_counter() - t0
+            raise ValueError(f"Unsupported event type in _dispatch_parsed_event: {etype!r}")
 
         t0 = time.perf_counter()
         self._ensure_book_ladders()
@@ -4160,6 +4184,7 @@ class FeatureEngine:
         self._last_event_ts = ts_ms
 
         self.timer_feature_build_s += time.perf_counter() - t0
+        self.ob_feature_build_count += 1
         return ts_ms, feat_z, mid, is_trade, dt_ms
 
     def _update_book_from_ob(
@@ -4449,41 +4474,65 @@ class FeatureEngine:
         if not np.all(np.isfinite(x)):
             raise ValueError("Non-finite values passed to _zscore")
         x64 = x.astype(np.float64, copy=False)
+        dim = int(x64.shape[0])
+        self._ensure_zscore_metadata(names, dim)
+
+        if self._z_mask is None or self._z_half_lives_arr is None:
+            raise RuntimeError("z-score metadata was not initialized")
+
         dt_ms = 1.0 if self._last_z_ts_ms is None else float(max(1, int(ts_ms) - int(self._last_z_ts_ms)))
         self._last_z_ts_ms = int(ts_ms)
 
-        if self._z_half_lives_ms is None:
-            self._z_half_lives_ms = [self._feature_z_half_life_ms(name) for name in names]
-
         if self._feat_dim is None:
-            self._feat_dim = int(x.shape[0])
+            self._feat_dim = dim
             self.z_mean = x64.copy()
             self.z_var = np.ones_like(x64, dtype=np.float64)
-            out = np.array(x64, copy=True)
-            for i, hl in enumerate(self._z_half_lives_ms):
-                if hl is not None:
-                    out[i] = 0.0
-            out = out.astype(np.float32, copy=False)
-            if not np.all(np.isfinite(out)):
+            out = x64.copy()
+            out[self._z_mask] = 0.0
+            out32 = out.astype(np.float32, copy=False)
+            if not np.all(np.isfinite(out32)):
                 raise ValueError("Non-finite values produced by _zscore")
-            return out
+            return out32
 
-        out = np.array(x64, copy=True)
-        for i, hl in enumerate(self._z_half_lives_ms):
-            if hl is None:
-                out[i] = x64[i]
-                continue
-            alpha = 1.0 - math.exp(-math.log(2.0) * dt_ms / float(max(1, int(hl))))
-            diff = x64[i] - self.z_mean[i]
-            self.z_mean[i] += alpha * diff
-            self.z_var[i] = (1.0 - alpha) * (self.z_var[i] + alpha * diff * diff)
-            z_i = (x64[i] - self.z_mean[i]) / math.sqrt(max(self.z_var[i], 1e-6))
-            out[i] = float(np.clip(z_i, -10.0, 10.0))
+        if dim != int(self._feat_dim):
+            raise ValueError(f"_zscore feature dimension changed: got={dim} expected={self._feat_dim}")
+        if self.z_mean is None or self.z_var is None:
+            raise RuntimeError("z-score state is uninitialized despite _feat_dim being set")
+
+        out = x64.copy()
+        mask = self._z_mask
+        if np.any(mask):
+            hl = self._z_half_lives_arr[mask]
+            alpha = 1.0 - np.exp(-math.log(2.0) * dt_ms / hl)
+            old_mean = self.z_mean[mask]
+            old_var = self.z_var[mask]
+            x_m = x64[mask]
+            diff = x_m - old_mean
+            new_mean = old_mean + alpha * diff
+            new_var = (1.0 - alpha) * (old_var + alpha * diff * diff)
+            self.z_mean[mask] = new_mean
+            self.z_var[mask] = new_var
+            z = (x_m - new_mean) / np.sqrt(np.maximum(new_var, 1e-6))
+            out[mask] = np.clip(z, -10.0, 10.0)
 
         out32 = out.astype(np.float32, copy=False)
         if not np.all(np.isfinite(out32)):
             raise ValueError("Non-finite values produced by _zscore")
         return out32
+
+    def _ensure_zscore_metadata(self, names: List[str], dim: int) -> None:
+        if self._z_half_lives_ms is not None:
+            return
+
+        half_lives = [self._feature_z_half_life_ms(name) for name in names]
+        self._z_half_lives_ms = half_lives
+        mask = np.asarray([hl is not None for hl in half_lives], dtype=bool)
+        hl_arr = np.ones((dim,), dtype=np.float64)
+        for i, hl in enumerate(half_lives):
+            if hl is not None:
+                hl_arr[i] = float(max(1, int(hl)))
+        self._z_mask = mask
+        self._z_half_lives_arr = hl_arr
 
     # -------------------------------------------------------------------------
     # Public API
@@ -4548,6 +4597,8 @@ class FeatureEngine:
             'order_book_update_s': float(self.timer_book_update_s),
             'trade_update_s': float(self.timer_trade_update_s),
             'feature_build_s': float(self.timer_feature_build_s),
+            'trade_fast_path_count': int(self.trade_fast_path_count),
+            'ob_feature_build_count': int(self.ob_feature_build_count),
         }
 
     def print_timer_totals(self, prefix: str = '[timers]') -> None:
@@ -4556,7 +4607,9 @@ class FeatureEngine:
             f"{prefix} parse_dispatch={totals['parse_dispatch_s']:.6f}s "
             f"order_book_update={totals['order_book_update_s']:.6f}s "
             f"trade_update={totals['trade_update_s']:.6f}s "
-            f"feature_build={totals['feature_build_s']:.6f}s",
+            f"feature_build={totals['feature_build_s']:.6f}s "
+            f"trade_fast_path_count={totals['trade_fast_path_count']} "
+            f"ob_feature_build_count={totals['ob_feature_build_count']}",
             flush=True,
         )
 
