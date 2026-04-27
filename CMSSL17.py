@@ -2215,42 +2215,9 @@ class FeatureEngine:
         self._z_mask: Optional[np.ndarray] = None
         self._last_z_ts_ms: Optional[int] = None
 
-        # ---------- ingest timing ----------
-        self.timer_parse_dispatch_s: float = 0.0
-        self.timer_book_update_s: float = 0.0
-        self.timer_trade_update_s: float = 0.0
-        self.timer_feature_build_s: float = 0.0
         self.trade_fast_path_count: int = 0
         self.ob_feature_build_count: int = 0
-        self.timer_feature_sections_s: Dict[str, float] = {
-            "ob_core_state_s": 0.0,
-            "trade_window_stats_s": 0.0,
-            "cvd_large_burst_s": 0.0,
-            "event_age_depletion_s": 0.0,
-            "return_regime_state_s": 0.0,
-            "price_window_features_s": 0.0,
-            "depth_5bps_history_s": 0.0,
-            "band_depth_features_s": 0.0,
-            "slippage_features_s": 0.0,
-            "rolling_ofi_obi_s": 0.0,
-            "deep_micro_features_s": 0.0,
-            "slippage_derived_features_s": 0.0,
-            "indicator_ema_s": 0.0,
-            "feature_assembly_main_s": 0.0,
-            "spread_depth_regime_s": 0.0,
-            "feature_assembly_tail_s": 0.0,
-            "feature_validation_s": 0.0,
-            "zscore_s": 0.0,
-            "post_feature_state_s": 0.0,
-        }
-        self.debug_verify_price_windows = int(os.environ.get("BYBIT_DEBUG_VERIFY_PRICE_WINDOWS", "0")) == 1
-        self.debug_verify_price_windows_max = int(os.environ.get("BYBIT_DEBUG_VERIFY_PRICE_WINDOWS_MAX", "1000"))
-        self.debug_verify_price_windows_count = 0
-
-    def _add_feature_timer(self, name: str, t0: float) -> None:
-        if name not in self.timer_feature_sections_s:
-            self.timer_feature_sections_s[name] = 0.0
-        self.timer_feature_sections_s[name] += time.perf_counter() - t0
+        self.strict_feature_validation = os.environ.get("BYBIT_STRICT_FEATURE_VALIDATION", "0") == "1"
 
     def feature_names(self) -> List[str]:
         if self._feature_names_cache is not None:
@@ -2812,135 +2779,6 @@ class FeatureEngine:
 
     def _rolling_value_slope(self, points: List[Tuple[int, float]]) -> float:
         return self._slope_from_points_no_numpy(points)
-
-    def _debug_compare_spread_depth_regime_states(
-        self,
-        ts_ms: int,
-        spread_bps: float,
-        depth_5bps_total: float,
-        depth_5bps_imbalance: float,
-        bid_depth_5bps_size: float,
-        ask_depth_5bps_size: float,
-        *,
-        atol: float = 1e-8,
-        rtol: float = 1e-7,
-    ) -> None:
-        for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
-            spread_points = self._metric_values(self._spread_bps_history, ts_ms, ms)
-            spread_vals = [v for _, v in spread_points]
-            spread_stats = self._rolling_stats_values(spread_vals)
-            spread_std = spread_stats["std"]
-            spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_stats["mean"]) / max(spread_std, 1e-9)
-            spread_slope = self._rolling_value_slope(spread_points)
-            spread_above = self._safe_div(sum(1.0 for v in spread_vals if v > 1.0), float(len(spread_vals)), 0.0)
-            depth_points = self._metric_values(self._depth_5bps_total_history, ts_ms, ms)
-            depth_vals = [v for _, v in depth_points]
-            depth_mean, depth_std = self._rolling_mean_std_values(depth_vals)
-            depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_mean) / max(depth_std, 1e-9)
-            imb_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, ms)
-            imb_vals = [v for _, v in imb_points]
-            imb_mean = self._rolling_mean_values(imb_vals)
-            imb_slope = self._rolling_value_slope(imb_points)
-            bid_points = self._metric_values(self._bid_depth_5bps_history, ts_ms, ms)
-            ask_points = self._metric_values(self._ask_depth_5bps_history, ts_ms, ms)
-            bid_mean = self._rolling_mean_values([v for _, v in bid_points])
-            ask_mean = self._rolling_mean_values([v for _, v in ask_points])
-            old_values = [
-                spread_stats["mean"],
-                spread_stats["std"],
-                spread_stats["p90"],
-                spread_stats["max"],
-                spread_stats["min"],
-                spread_z,
-                spread_slope,
-                spread_above,
-                depth_mean,
-                depth_std,
-                depth_z,
-                imb_mean,
-                imb_slope,
-                (bid_depth_5bps_size / max(bid_mean, 1e-9)) - 1.0,
-                (ask_depth_5bps_size / max(ask_mean, 1e-9)) - 1.0,
-            ]
-
-            spread_state = self._spread_bps_regime_states[ms]
-            depth_state = self._depth_5bps_total_regime_states[ms]
-            imb_state = self._depth_5bps_imbalance_regime_states[ms]
-            bid_state = self._bid_depth_5bps_regime_states[ms]
-            ask_state = self._ask_depth_5bps_regime_states[ms]
-            spread_mean_new, spread_std_new = spread_state.mean_std()
-            spread_z_new = 0.0 if spread_std_new <= 1e-9 else (spread_bps - spread_mean_new) / max(spread_std_new, 1e-9)
-            depth_mean_new, depth_std_new = depth_state.mean_std()
-            depth_z_new = 0.0 if depth_std_new <= 1e-9 else (depth_5bps_total - depth_mean_new) / max(depth_std_new, 1e-9)
-            bid_mean_new = bid_state.mean()
-            ask_mean_new = ask_state.mean()
-            new_values = [
-                spread_mean_new,
-                spread_std_new,
-                spread_state.p90(),
-                spread_state.max(),
-                spread_state.min(),
-                spread_z_new,
-                spread_state.slope(),
-                spread_state.frac_above(1.0),
-                depth_mean_new,
-                depth_std_new,
-                depth_z_new,
-                imb_state.mean(),
-                imb_state.slope(),
-                (bid_depth_5bps_size / max(bid_mean_new, 1e-9)) - 1.0,
-                (ask_depth_5bps_size / max(ask_mean_new, 1e-9)) - 1.0,
-            ]
-            for idx, (old_v, new_v) in enumerate(zip(old_values, new_values)):
-                if not math.isclose(float(old_v), float(new_v), rel_tol=rtol, abs_tol=atol):
-                    raise AssertionError(
-                        f"spread_depth_regime mismatch window={ms} idx={idx} old={old_v!r} new={new_v!r}"
-                    )
-
-    def _debug_compare_rolling_ofi_obi_states(
-        self,
-        ts_ms: int,
-        obi_by_level: Dict[int, float],
-        *,
-        atol: float = 1e-8,
-        rtol: float = 1e-7,
-    ) -> None:
-        for level in ROLLING_OFI_LEVELS:
-            for window in ROLLING_OFI_WINDOWS_MS:
-                old_sum = float(sum(v for _, v in self._metric_values(self.ofi_level_histories[level], ts_ms, window)))
-                new_sum = self._rolling_ofi_states[(level, window)].sum_value()
-                if not math.isclose(old_sum, new_sum, rel_tol=rtol, abs_tol=atol):
-                    raise AssertionError(
-                        f"rolling_ofi mismatch level={level} window={window} old={old_sum!r} new={new_sum!r}"
-                    )
-        for level in ROLLING_OBI_LEVELS:
-            current_sign = self._sign(obi_by_level[level])
-            for window in ROLLING_OBI_WINDOWS_MS:
-                vals = self._metric_values(self.obi_level_histories[level], ts_ms, window)
-                ys = [v for _, v in vals]
-                old_mean = float(sum(ys) / len(ys)) if ys else 0.0
-                old_slope = self._lin_slope([(ts - ts_ms) / 1000.0 for ts, _ in vals], ys) if len(ys) >= 2 else 0.0
-                if not ys or current_sign == 0:
-                    old_persistence = 0.0
-                else:
-                    match = sum(1.0 for v in ys if self._sign(v) == current_sign and self._sign(v) != 0)
-                    old_persistence = self._safe_div(match, float(len(ys)), 0.0)
-                state = self._rolling_obi_states[(level, window)]
-                new_mean = state.mean()
-                new_slope = state.slope()
-                new_persistence = state.persistence(current_sign)
-                if not math.isclose(old_mean, new_mean, rel_tol=rtol, abs_tol=atol):
-                    raise AssertionError(
-                        f"rolling_obi mean mismatch level={level} window={window} old={old_mean!r} new={new_mean!r}"
-                    )
-                if not math.isclose(old_slope, new_slope, rel_tol=rtol, abs_tol=atol):
-                    raise AssertionError(
-                        f"rolling_obi slope mismatch level={level} window={window} old={old_slope!r} new={new_slope!r}"
-                    )
-                if not math.isclose(old_persistence, new_persistence, rel_tol=rtol, abs_tol=atol):
-                    raise AssertionError(
-                        f"rolling_obi persistence mismatch level={level} window={window} old={old_persistence!r} new={new_persistence!r}"
-                    )
 
     def _return_distribution_stats(self, vals: List[float]) -> Dict[str, float]:
         if not vals:
@@ -3711,45 +3549,6 @@ class FeatureEngine:
             autocorr = 0.0
         return float(sign_persistence), float(up_return_fraction), float(autocorr)
 
-    def _debug_compare_price_window_states(
-        self,
-        ts_ms: int,
-        mid: float,
-        micro: float,
-        *,
-        atol: float = 1e-8,
-        rtol: float = 1e-7,
-    ) -> None:
-        for w in PRICE_WINDOWS_MS:
-            past_mid_old = self._series_asof(ts_ms - w, "mid")
-            past_micro_old = self._series_asof(ts_ms - w, "micro")
-            old_mid_ret = self._bps_return(mid, past_mid_old) if past_mid_old is not None else 0.0
-            old_micro_ret = self._bps_return(micro, past_micro_old) if past_micro_old is not None else 0.0
-            points = self._window_price_points(ts_ms, w, "mid")
-            old_slope, old_r2 = self._rolling_slope_r2(points)
-            old_range = self._range_features(points, mid)
-            old_shape = self._return_shape_features(points)
-            old_tuple = (old_mid_ret, old_micro_ret, old_slope, old_r2, *old_range, *old_shape)
-
-            past_mid_new = self._mid_asof_history.asof(ts_ms - w)
-            past_micro_new = self._micro_asof_history.asof(ts_ms - w)
-            new_mid_ret = self._bps_return(mid, past_mid_new) if past_mid_new is not None else 0.0
-            new_micro_ret = self._bps_return(micro, past_micro_new) if past_micro_new is not None else 0.0
-            state = self._price_window_mid_states[w]
-            new_slope, new_r2 = state.slope_r2()
-            new_range = state.range_features(mid)
-            new_shape = state.return_shape_features()
-            new_tuple = (new_mid_ret, new_micro_ret, new_slope, new_r2, *new_range, *new_shape)
-
-            for idx, (old_val, new_val) in enumerate(zip(old_tuple, new_tuple)):
-                tol = 1e-6 if idx in (3, 12) else atol
-                if not math.isclose(float(old_val), float(new_val), rel_tol=rtol, abs_tol=tol):
-                    raise AssertionError(
-                        "Price-window state mismatch "
-                        f"window={w} idx={idx} old={old_val!r} new={new_val!r} "
-                        f"rtol={rtol} atol={tol} ts_ms={ts_ms}"
-                    )
-
     def _depth_within_bps(self, levels: List[Tuple[float, float]], mid: float, band_bps: float, is_bid: bool) -> dict:
         eps = 1e-12
         out = {
@@ -4213,9 +4012,7 @@ class FeatureEngine:
             self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == 'ob'))
 
         if etype == 'trade':
-            t0 = time.perf_counter()
             self._update_trade_windows(ts_ms, payload, dt_ms)
-            self.timer_trade_update_s += time.perf_counter() - t0
             self.trade_fast_path_count += 1
 
             # Trade rows update trade/event-density state only.
@@ -4237,16 +4034,11 @@ class FeatureEngine:
             for window in self.trade_burst_states:
                 self._trade_burst_prune(window, ts_ms)
             tp_code, bids, asks = payload
-            t0 = time.perf_counter()
             self._update_book_from_ob(tp_code, bids, asks)
-            self.timer_book_update_s += time.perf_counter() - t0
             for window, deq in self._quote_window_deques.items():
                 self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
         else:
             raise ValueError(f"Unsupported event type in _dispatch_parsed_event: {etype!r}")
-
-        feature_total_t0 = time.perf_counter()
-        section_t0 = time.perf_counter()
         self._ensure_book_ladders()
         session_features = self._compute_session_features(ts_ms)
         bid1, ask1, bsz1, asz1 = self._book_best()
@@ -4341,17 +4133,10 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             self.ofi_pressure_by_window[ms] = self._ewma_update(self.ofi_pressure_by_window[ms], ofi_l1, dt_ms, ms)
         ofi_pressure_by_ms = {ms: self.ofi_pressure_by_window[ms] for ms in FAST_WINDOWS_MS}
-
-        self._add_feature_timer("ob_core_state_s", section_t0)
-
-        section_t0 = time.perf_counter()
         trade_stats_by_ms = {ms: self._compute_trade_window_stats(ms, ts_ms, mid, micro) for ms in self.trade_windows}
         if etype == "ob":
             self.last_ob_ofi_l5 = float(ofi_l5)
             self.last_ob_trade_imbalance_30000ms = float(trade_stats_by_ms[30_000]["trade_imbalance_notional"])
-        self._add_feature_timer("trade_window_stats_s", section_t0)
-
-        section_t0 = time.perf_counter()
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in self.trade_windows:
             cvd_state = self.cvd_window_states[ms]
@@ -4369,9 +4154,6 @@ class FeatureEngine:
                     raise ValueError(f"Non-finite CVD stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
         large_stats_by_ms = {ms: self._large_trade_stats_from_state(ms, ts_ms) for ms in self.trade_windows}
         trade_burst_features = self._trade_burst_features_from_state(ts_ms)
-        self._add_feature_timer("cvd_large_burst_s", section_t0)
-
-        section_t0 = time.perf_counter()
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
             self.last_bid_price_change_ts = ts_ms
         if self.prev_ask1_price is None or ask1 != self.prev_ask1_price:
@@ -4441,10 +4223,6 @@ class FeatureEngine:
         best_ask_lifetime_ms = time_since_ask_price_change_ms
         mid_price_staleness_ms = time_since_mid_change_ms
 
-        self._add_feature_timer("event_age_depletion_s", section_t0)
-
-        section_t0 = time.perf_counter()
-
         def _ofi_since(ts0: Optional[int]) -> float:
             if ts0 is None:
                 return 0.0
@@ -4478,10 +4256,6 @@ class FeatureEngine:
             "large_sell_continuation_bps_15000ms": self._bps(self.last_large_sell_mid or 0.0, mid, 0.0)
             if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= 15_000) else 0.0,
         }
-
-        self._add_feature_timer("cvd_large_burst_s", section_t0)
-
-        section_t0 = time.perf_counter()
         self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
         return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
         return_std_bps = {ms: math.sqrt(var) for ms, var in return_var.items()}
@@ -4505,10 +4279,6 @@ class FeatureEngine:
             vpin_features.append((sum(phi) / len(phi)) if phi else 0.0)
 
         replen_rates = self._replenishment_rates()
-
-        self._add_feature_timer("return_regime_state_s", section_t0)
-
-        section_t0 = time.perf_counter()
         price_features_by_window: Dict[int, Tuple[float, ...]] = {}
         for w in PRICE_WINDOWS_MS:
             past_mid = self._mid_asof_history.asof(ts_ms - w)
@@ -4525,10 +4295,6 @@ class FeatureEngine:
                 pos, d_high, d_low, rng, br_up, br_down,
                 sign_persistence, up_frac, autocorr,
             )
-
-        self._add_feature_timer("price_window_features_s", section_t0)
-
-        section_t0 = time.perf_counter()
         bid_depth_5bps = self._depth_within_bps(self.bid_lvls, mid, 5.0, is_bid=True)
         ask_depth_5bps = self._depth_within_bps(self.ask_lvls, mid, 5.0, is_bid=False)
         depth_5bps_total = bid_depth_5bps["size"] + ask_depth_5bps["size"]
@@ -4548,10 +4314,6 @@ class FeatureEngine:
             self._ask_depth_5bps_regime_states[ms].update(ts_ms, ask_depth_5bps["size"])
             self._depth_5bps_total_regime_states[ms].update(ts_ms, depth_5bps_total)
             self._depth_5bps_imbalance_regime_states[ms].update(ts_ms, depth_5bps_imbalance)
-
-        self._add_feature_timer("depth_5bps_history_s", section_t0)
-
-        section_t0 = time.perf_counter()
         band_depth_stats: Dict[float, Dict[str, dict]] = {}
         for band in BPS_DEPTH_BANDS:
             band_depth_stats[band] = {
@@ -4564,20 +4326,12 @@ class FeatureEngine:
                 "bid": self._depth_within_bps(self.bid_lvls, mid, band, is_bid=True),
                 "ask": self._depth_within_bps(self.ask_lvls, mid, band, is_bid=False),
             }
-
-        self._add_feature_timer("band_depth_features_s", section_t0)
-
-        section_t0 = time.perf_counter()
         slippage_by_notional: Dict[float, Dict[str, dict]] = {}
         for notional in SLIPPAGE_NOTIONAL_USD:
             slippage_by_notional[notional] = {
                 "buy": self._slippage_for_notional(self.ask_lvls, mid, notional, is_buy=True),
                 "sell": self._slippage_for_notional(self.bid_lvls, mid, notional, is_buy=False),
             }
-
-        self._add_feature_timer("slippage_features_s", section_t0)
-
-        section_t0 = time.perf_counter()
         rolling_ofi_sums: Dict[Tuple[int, int], float] = {}
         rolling_obi_stats: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
         if etype == "ob":
@@ -4602,9 +4356,6 @@ class FeatureEngine:
                 slope = state.slope()
                 persistence = state.persistence(current_sign)
                 rolling_obi_stats[(level, window)] = (mean_val, slope, persistence)
-        self._add_feature_timer("rolling_ofi_obi_s", section_t0)
-
-        section_t0 = time.perf_counter()
         deep_micro_features: Dict[str, float] = {}
         deep_micro_minus_mid_bps: Dict[int, float] = {}
         micro_price_by_level: Dict[int, float] = {}
@@ -4635,9 +4386,6 @@ class FeatureEngine:
                 deep_micro_features[f"micro_l{level}_slope_{window}ms"] = self._lin_slope(xs, ys) if len(ys) >= 2 else 0.0
         deep_micro_features["micro_l1_minus_micro_l10_bps"] = self._bps(micro, micro_price_by_level.get(10, 0.0), 0.0)
         deep_micro_features["micro_l5_minus_micro_l20_bps"] = self._bps(micro_price_by_level.get(5, 0.0), micro_price_by_level.get(20, 0.0), 0.0)
-        self._add_feature_timer("deep_micro_features_s", section_t0)
-
-        section_t0 = time.perf_counter()
         slippage_asymmetry_features: Dict[str, float] = {}
         notional_map = {int(n): n for n in SLIPPAGE_NOTIONAL_USD}
         for notional in SLIPPAGE_NOTIONAL_USD:
@@ -4665,10 +4413,6 @@ class FeatureEngine:
             "slippage_curve_convexity_buy": buy_slope_50_250 - buy_slope_10_50,
             "slippage_curve_convexity_sell": sell_slope_50_250 - sell_slope_10_50,
         })
-
-        self._add_feature_timer("slippage_derived_features_s", section_t0)
-
-        section_t0 = time.perf_counter()
         indicator_values = {
             "spread_bps": spread_bps,
             "gap_a_bps": gap_a_bps,
@@ -4734,10 +4478,6 @@ class FeatureEngine:
 
         bid_5bps_levels = [(p, s) for p, s in self.bid_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p <= mid and (1e4 * (mid - p) / mid) <= 5.0]
         ask_5bps_levels = [(p, s) for p, s in self.ask_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p >= mid and (1e4 * (p - mid) / mid) <= 5.0]
-
-        self._add_feature_timer("indicator_ema_s", section_t0)
-
-        section_t0 = time.perf_counter()
         feat_list: List[float] = []
         feat_list.extend([
             session_features["time_hour_sin"],
@@ -5050,10 +4790,6 @@ class FeatureEngine:
                 dist["return_skew"],
                 dist["return_kurtosis"],
             ])
-
-        self._add_feature_timer("feature_assembly_main_s", section_t0)
-
-        section_t0 = time.perf_counter()
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
             spread_state = self._spread_bps_regime_states[ms]
             depth_state = self._depth_5bps_total_regime_states[ms]
@@ -5098,10 +4834,6 @@ class FeatureEngine:
                 (bid_depth_5bps["size"] / max(bid_mean, 1e-9)) - 1.0,
                 (ask_depth_5bps["size"] / max(ask_mean, 1e-9)) - 1.0,
             ])
-
-        self._add_feature_timer("spread_depth_regime_s", section_t0)
-
-        section_t0 = time.perf_counter()
         bid_depth_5bps_base = float(band_depth_stats[5.0]["bid"]["size"])
         ask_depth_5bps_base = float(band_depth_stats[5.0]["ask"]["size"])
         bid_notional_5bps_base = float(band_depth_stats[5.0]["bid"]["notional"])
@@ -5183,34 +4915,22 @@ class FeatureEngine:
             macd_features.extend([raw_bps, sig_bps, hist_bps])
         feat_list.extend(macd_features)
         feat_list.extend(vpin_features)
-        self._add_feature_timer("feature_assembly_tail_s", section_t0)
-
-        section_t0 = time.perf_counter()
         names = self.feature_names()
         if len(feat_list) != len(names):
             raise ValueError(
                 f"Feature vector/name length mismatch: len(feat_list)={len(feat_list)} "
                 f"len(feature_names)={len(names)}"
             )
-        values_np = np.asarray(feat_list, dtype=np.float64)
-        if not np.all(np.isfinite(values_np)):
-            raise ValueError("Non-finite feature vector")
-        for name, value in zip(names, feat_list):
-            if not np.isfinite(float(value)):
-                raise ValueError(f"Non-finite feature {name}={value!r} at ts_ms={ts_ms}")
-
-        self._add_feature_timer("feature_validation_s", section_t0)
-
-        section_t0 = time.perf_counter()
-        feat = np.array(feat_list, dtype=np.float64)
+        feat = np.asarray(feat_list, dtype=np.float64)
+        if self.strict_feature_validation:
+            if not np.all(np.isfinite(feat)):
+                bad_idx = np.flatnonzero(~np.isfinite(feat))
+                details = [
+                    f"{int(i)}:{names[int(i)]}={feat[int(i)]!r}"
+                    for i in bad_idx[:20]
+                ]
+                raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
         feat_z = self._zscore(feat, ts_ms)
-        self._add_feature_timer("zscore_s", section_t0)
-
-        if self.debug_verify_price_windows and self.debug_verify_price_windows_count < self.debug_verify_price_windows_max:
-            self._debug_compare_price_window_states(ts_ms, mid, micro)
-            self.debug_verify_price_windows_count += 1
-
-        section_t0 = time.perf_counter()
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
@@ -5218,9 +4938,7 @@ class FeatureEngine:
         self.prev_spread_for_age = spread
         self.last_ts = ts_ms
         self._last_event_ts = ts_ms
-        self._add_feature_timer("post_feature_state_s", section_t0)
 
-        self.timer_feature_build_s += time.perf_counter() - feature_total_t0
         self.ob_feature_build_count += 1
         return ts_ms, feat_z, mid, is_trade, dt_ms
 
@@ -5655,7 +5373,6 @@ class FeatureEngine:
     # -------------------------------------------------------------------------
     def on_fast_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
         """Fast ingest path for compact tuples emitted by offline_ingest.py."""
-        t0 = time.perf_counter()
         if not isinstance(e, tuple) or len(e) < 4 or not isinstance(e[0], str):
             raise ValueError(f"Expected compact ingest tuple, got: {e!r}")
         etype = e[0].lower()
@@ -5666,14 +5383,11 @@ class FeatureEngine:
             payload = e[3:8]
         else:
             raise ValueError(f"Unsupported compact event type: {etype!r}")
-        self.timer_parse_dispatch_s += time.perf_counter() - t0
         return self._dispatch_parsed_event(etype, ts_ms, payload)
 
     def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
         """Slow compatibility path for callers that still pass generic event shapes."""
-        t0 = time.perf_counter()
         etype, ts_ms, payload = self._parse_event(e)
-        self.timer_parse_dispatch_s += time.perf_counter() - t0
 
         if etype == 'ob':
             if isinstance(payload, tuple):
@@ -5706,49 +5420,6 @@ class FeatureEngine:
                 is_rpi,
             )
         return self._dispatch_parsed_event(etype, ts_ms, payload)
-
-    def timer_totals(self) -> Dict[str, float]:
-        feature_sections = {k: float(v) for k, v in self.timer_feature_sections_s.items()}
-        feature_sections_sum = float(sum(feature_sections.values()))
-        return {
-            'parse_dispatch_s': float(self.timer_parse_dispatch_s),
-            'order_book_update_s': float(self.timer_book_update_s),
-            'trade_update_s': float(self.timer_trade_update_s),
-            'feature_build_s': float(self.timer_feature_build_s),
-            'trade_fast_path_count': int(self.trade_fast_path_count),
-            'ob_feature_build_count': int(self.ob_feature_build_count),
-            'feature_sections_s': feature_sections,
-            'feature_sections_sum_s': feature_sections_sum,
-            'feature_unattributed_s': float(self.timer_feature_build_s - feature_sections_sum),
-        }
-
-    def print_timer_totals(self, prefix: str = '[timers]') -> None:
-        totals = self.timer_totals()
-        print(
-            f"{prefix} parse_dispatch={totals['parse_dispatch_s']:.6f}s "
-            f"order_book_update={totals['order_book_update_s']:.6f}s "
-            f"trade_update={totals['trade_update_s']:.6f}s "
-            f"feature_build={totals['feature_build_s']:.6f}s "
-            f"feature_sections_sum={totals['feature_sections_sum_s']:.6f}s "
-            f"feature_unattributed={totals['feature_unattributed_s']:.6f}s "
-            f"trade_fast_path_count={totals['trade_fast_path_count']} "
-            f"ob_feature_build_count={totals['ob_feature_build_count']}",
-            flush=True,
-        )
-        sections = totals.get('feature_sections_s', {})
-        ob_count = max(1, int(self.ob_feature_build_count))
-        parts = []
-        for key, seconds in sorted(sections.items(), key=lambda kv: kv[1], reverse=True):
-            if float(seconds) == 0.0:
-                continue
-            label = key[:-2] if key.endswith('_s') else key
-            ms_per_ob = 1000.0 * float(seconds) / ob_count
-            parts.append(f"{label}={float(seconds):.6f}s/{ms_per_ob:.3f}ms/ob")
-        if prefix.endswith("]"):
-            detail_prefix = prefix[:-1] + "-detail]"
-        else:
-            detail_prefix = prefix + "-detail"
-        print(f"{detail_prefix} {' '.join(parts)}", flush=True)
 
 
 class LabelBuilder:
