@@ -1449,6 +1449,286 @@ class RollingScalarWindowState:
         return 0.0
 
 
+class RollingPriceWindowState:
+    def __init__(self, window_ms: int):
+        self.window_ms = int(window_ms)
+        self.deq: Deque[Tuple[int, float, float, float]] = deque()
+        self.anchor_ms: Optional[int] = None
+        self.n: int = 0
+
+        self.sum_t: float = 0.0
+        self.sum_t2: float = 0.0
+        self.sum_logp: float = 0.0
+        self.sum_logp2: float = 0.0
+        self.sum_t_logp: float = 0.0
+
+        self.sorted_prices: List[float] = []
+
+        self.return_deq: Deque[Tuple[int, int, float]] = deque()
+        self.return_n: int = 0
+        self.return_sum: float = 0.0
+        self.return_sumsq: float = 0.0
+        self.return_pos_count: int = 0
+        self.return_neg_count: int = 0
+        self.return_sign_sum: float = 0.0
+
+        self.pair_deq: Deque[Tuple[int, int, float, float]] = deque()
+        self.pair_n: int = 0
+        self.pair_sum_x: float = 0.0
+        self.pair_sum_y: float = 0.0
+        self.pair_sum_x2: float = 0.0
+        self.pair_sum_y2: float = 0.0
+        self.pair_sum_xy: float = 0.0
+
+    def _remove_sorted_price(self, value: float) -> None:
+        idx = bisect_left(self.sorted_prices, value)
+        if idx < len(self.sorted_prices) and self.sorted_prices[idx] == value:
+            self.sorted_prices.pop(idx)
+            return
+        for j in range(max(0, idx - 3), min(len(self.sorted_prices), idx + 4)):
+            if self.sorted_prices[j] == value:
+                self.sorted_prices.pop(j)
+                return
+        for j, v in enumerate(self.sorted_prices):
+            if v == value:
+                self.sorted_prices.pop(j)
+                return
+        raise RuntimeError("RollingPriceWindowState sorted price removal failed")
+
+    def _append_return(self, left_ts: int, right_ts: int, ret_bps: float) -> None:
+        r = float(ret_bps)
+        self.return_deq.append((int(left_ts), int(right_ts), r))
+        self.return_n += 1
+        self.return_sum += r
+        self.return_sumsq += r * r
+        sign = 1.0 if r > 0.0 else (-1.0 if r < 0.0 else 0.0)
+        self.return_sign_sum += sign
+        if r > 0.0:
+            self.return_pos_count += 1
+        elif r < 0.0:
+            self.return_neg_count += 1
+
+    def _remove_return(self, left_ts: int, right_ts: int, ret_bps: float) -> None:
+        _ = (left_ts, right_ts)
+        r = float(ret_bps)
+        self.return_n -= 1
+        self.return_sum -= r
+        self.return_sumsq -= r * r
+        sign = 1.0 if r > 0.0 else (-1.0 if r < 0.0 else 0.0)
+        self.return_sign_sum -= sign
+        if r > 0.0:
+            self.return_pos_count -= 1
+        elif r < 0.0:
+            self.return_neg_count -= 1
+        if self.return_n <= 0:
+            self.return_n = 0
+            self.return_sum = 0.0
+            self.return_sumsq = 0.0
+            self.return_pos_count = 0
+            self.return_neg_count = 0
+            self.return_sign_sum = 0.0
+
+    def _append_pair(self, first_return_left_ts: int, second_return_right_ts: int, r0: float, r1: float) -> None:
+        x = float(r0)
+        y = float(r1)
+        self.pair_deq.append((int(first_return_left_ts), int(second_return_right_ts), x, y))
+        self.pair_n += 1
+        self.pair_sum_x += x
+        self.pair_sum_y += y
+        self.pair_sum_x2 += x * x
+        self.pair_sum_y2 += y * y
+        self.pair_sum_xy += x * y
+
+    def _remove_pair(self, first_return_left_ts: int, second_return_right_ts: int, r0: float, r1: float) -> None:
+        _ = (first_return_left_ts, second_return_right_ts)
+        x = float(r0)
+        y = float(r1)
+        self.pair_n -= 1
+        self.pair_sum_x -= x
+        self.pair_sum_y -= y
+        self.pair_sum_x2 -= x * x
+        self.pair_sum_y2 -= y * y
+        self.pair_sum_xy -= x * y
+        if self.pair_n <= 0:
+            self.pair_n = 0
+            self.pair_sum_x = 0.0
+            self.pair_sum_y = 0.0
+            self.pair_sum_x2 = 0.0
+            self.pair_sum_y2 = 0.0
+            self.pair_sum_xy = 0.0
+
+    def _rebuild_returns_and_pairs_from_prices(self) -> None:
+        while self.return_deq:
+            left_ts, right_ts, ret_bps = self.return_deq.popleft()
+            self._remove_return(left_ts, right_ts, ret_bps)
+        while self.pair_deq:
+            left_ts, right_ts, r0, r1 = self.pair_deq.popleft()
+            self._remove_pair(left_ts, right_ts, r0, r1)
+        if len(self.deq) < 2:
+            return
+        for i in range(1, len(self.deq)):
+            prev_ts, prev_p, _prev_logp, _prev_t = self.deq[i - 1]
+            cur_ts, cur_p, _cur_logp, _cur_t = self.deq[i]
+            ret_bps = 1e4 * math.log(cur_p / prev_p)
+            self._append_return(prev_ts, cur_ts, ret_bps)
+            if len(self.return_deq) >= 2:
+                prev_return = self.return_deq[-2][2]
+                cur_return = self.return_deq[-1][2]
+                self._append_pair(self.return_deq[-2][0], self.return_deq[-1][1], prev_return, cur_return)
+
+    def add(self, ts_ms: int, price: float) -> None:
+        p = float(price)
+        if p <= 0.0 or not math.isfinite(p):
+            return
+        ts = int(ts_ms)
+        if self.anchor_ms is None:
+            self.anchor_ms = ts
+        t_rel_sec = (ts - self.anchor_ms) / 1000.0
+        logp = math.log(p)
+
+        self.deq.append((ts, p, logp, t_rel_sec))
+        self.n += 1
+        self.sum_t += t_rel_sec
+        self.sum_t2 += t_rel_sec * t_rel_sec
+        self.sum_logp += logp
+        self.sum_logp2 += logp * logp
+        self.sum_t_logp += t_rel_sec * logp
+        insort(self.sorted_prices, p)
+
+        if len(self.deq) >= 2:
+            prev_ts, prev_p, _prev_logp, _prev_t = self.deq[-2]
+            ret_bps = 1e4 * math.log(p / prev_p)
+            self._append_return(prev_ts, ts, ret_bps)
+        if len(self.return_deq) >= 2:
+            prev_return = self.return_deq[-2][2]
+            cur_return = self.return_deq[-1][2]
+            self._append_pair(self.return_deq[-2][0], self.return_deq[-1][1], prev_return, cur_return)
+
+    def prune(self, now_ms: int) -> None:
+        cutoff = int(now_ms) - self.window_ms
+        changed = False
+        while self.deq and self.deq[0][0] < cutoff:
+            _ts, p, logp, t_rel_sec = self.deq.popleft()
+            self.n -= 1
+            self.sum_t -= t_rel_sec
+            self.sum_t2 -= t_rel_sec * t_rel_sec
+            self.sum_logp -= logp
+            self.sum_logp2 -= logp * logp
+            self.sum_t_logp -= t_rel_sec * logp
+            self._remove_sorted_price(p)
+            changed = True
+        if self.n <= 0:
+            self.n = 0
+            self.sum_t = 0.0
+            self.sum_t2 = 0.0
+            self.sum_logp = 0.0
+            self.sum_logp2 = 0.0
+            self.sum_t_logp = 0.0
+        if changed:
+            self._rebuild_returns_and_pairs_from_prices()
+
+    def slope_r2(self) -> Tuple[float, float]:
+        if self.n < 3:
+            return 0.0, 0.0
+        n = float(self.n)
+        x_mean = self.sum_t / n
+        y_mean = self.sum_logp / n
+        x_var = self.sum_t2 / n - x_mean * x_mean
+        y_var = self.sum_logp2 / n - y_mean * y_mean
+        if x_var <= 1e-12:
+            return 0.0, 0.0
+        cov = self.sum_t_logp / n - x_mean * y_mean
+        slope = 1e4 * cov / x_var
+        if y_var <= 1e-12:
+            return float(slope), 0.0
+        r2 = (cov * cov) / max(x_var * y_var, 1e-30)
+        r2 = max(0.0, min(1.0, r2))
+        return float(slope), float(r2)
+
+    def range_features(self, current: float) -> Tuple[float, float, float, float, float, float]:
+        if self.n < 3:
+            return 0.5, 0.0, 0.0, 0.0, 0.0, 0.0
+        low = self.sorted_prices[0]
+        high = self.sorted_prices[-1]
+        cur = float(current)
+        if high <= low:
+            position = 0.5
+        else:
+            position = max(0.0, min(1.0, (cur - low) / (high - low)))
+        dist_to_high_bps = 1e4 * math.log(high / cur) if high > 0.0 and cur > 0.0 else 0.0
+        dist_to_low_bps = 1e4 * math.log(cur / low) if cur > 0.0 and low > 0.0 else 0.0
+        rolling_range_bps = 1e4 * math.log(high / low) if high > 0.0 and low > 0.0 else 0.0
+        breakout_up = 1.0 if cur >= high else 0.0
+        breakout_down = 1.0 if cur <= low else 0.0
+        return (
+            float(position),
+            float(dist_to_high_bps),
+            float(dist_to_low_bps),
+            float(rolling_range_bps),
+            float(breakout_up),
+            float(breakout_down),
+        )
+
+    def return_shape_features(self) -> Tuple[float, float, float]:
+        if self.n < 3 or self.return_n < 2:
+            return 0.0, 0.0, 0.0
+        denom = float(self.return_n)
+        sign_persistence = abs(self.return_sign_sum) / denom
+        up_return_fraction = float(self.return_pos_count) / denom
+        if self.return_n < 3 or self.pair_n < 2:
+            autocorr = 0.0
+        else:
+            n = float(self.pair_n)
+            mean_x = self.pair_sum_x / n
+            mean_y = self.pair_sum_y / n
+            var_x = self.pair_sum_x2 / n - mean_x * mean_x
+            var_y = self.pair_sum_y2 / n - mean_y * mean_y
+            if var_x <= 1e-24 or var_y <= 1e-24:
+                autocorr = 0.0
+            else:
+                cov = self.pair_sum_xy / n - mean_x * mean_y
+                autocorr = cov / math.sqrt(var_x * var_y)
+        if not math.isfinite(autocorr):
+            autocorr = 0.0
+        return float(sign_persistence), float(up_return_fraction), float(autocorr)
+
+    def features(self, current: float) -> Tuple[float, float, float, float, float, float, float, float, float, float, float]:
+        slope, r2 = self.slope_r2()
+        pos, d_high, d_low, rng, br_up, br_down = self.range_features(current)
+        sign_persistence, up_frac, autocorr = self.return_shape_features()
+        return slope, r2, pos, d_high, d_low, rng, br_up, br_down, sign_persistence, up_frac, autocorr
+
+
+class PriceAsofHistory:
+    def __init__(self, keep_ms: int):
+        self.keep_ms = int(keep_ms)
+        self.ts: List[int] = []
+        self.values: List[float] = []
+        self.start_idx: int = 0
+
+    def append(self, ts_ms: int, value: float) -> None:
+        ts = int(ts_ms)
+        v = float(value)
+        if not math.isfinite(v):
+            return
+        self.ts.append(ts)
+        self.values.append(v)
+        cutoff = ts - self.keep_ms
+        self.start_idx = bisect_left(self.ts, cutoff, lo=self.start_idx)
+        if self.start_idx > 0 and (self.start_idx >= 4096 or self.start_idx >= len(self.ts) // 2):
+            self.ts = self.ts[self.start_idx:]
+            self.values = self.values[self.start_idx:]
+            self.start_idx = 0
+
+    def asof(self, ts_query: int) -> Optional[float]:
+        if not self.ts:
+            return None
+        idx = bisect_right(self.ts, int(ts_query), lo=self.start_idx) - 1
+        if idx < self.start_idx:
+            return None
+        return float(self.values[idx])
+
+
 @dataclass
 class LargeTradeWindowState:
     window_ms: int
@@ -1682,6 +1962,11 @@ class FeatureEngine:
         self._price_ts: Deque[int] = deque()
         self._mid_history: Deque[float] = deque()
         self._micro_history: Deque[float] = deque()
+        self._mid_asof_history = PriceAsofHistory(self.price_history_keep_ms)
+        self._micro_asof_history = PriceAsofHistory(self.price_history_keep_ms)
+        self._price_window_mid_states: Dict[int, RollingPriceWindowState] = {
+            w: RollingPriceWindowState(w) for w in PRICE_WINDOWS_MS
+        }
 
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute dispersion and variance-ratio ladders.
@@ -1958,6 +2243,9 @@ class FeatureEngine:
             "zscore_s": 0.0,
             "post_feature_state_s": 0.0,
         }
+        self.debug_verify_price_windows = int(os.environ.get("BYBIT_DEBUG_VERIFY_PRICE_WINDOWS", "0")) == 1
+        self.debug_verify_price_windows_max = int(os.environ.get("BYBIT_DEBUG_VERIFY_PRICE_WINDOWS_MAX", "1000"))
+        self.debug_verify_price_windows_count = 0
 
     def _add_feature_timer(self, name: str, t0: float) -> None:
         if name not in self.timer_feature_sections_s:
@@ -3300,6 +3588,11 @@ class FeatureEngine:
             self._price_ts.popleft()
             self._mid_history.popleft()
             self._micro_history.popleft()
+        self._mid_asof_history.append(ts, mid)
+        self._micro_asof_history.append(ts, micro)
+        for state in self._price_window_mid_states.values():
+            state.add(ts, mid)
+            state.prune(ts)
 
     def _series_asof(self, ts_query: int, series: str) -> Optional[float]:
         history = self._mid_history if series == "mid" else self._micro_history
@@ -3417,6 +3710,45 @@ class FeatureEngine:
         if not math.isfinite(autocorr):
             autocorr = 0.0
         return float(sign_persistence), float(up_return_fraction), float(autocorr)
+
+    def _debug_compare_price_window_states(
+        self,
+        ts_ms: int,
+        mid: float,
+        micro: float,
+        *,
+        atol: float = 1e-8,
+        rtol: float = 1e-7,
+    ) -> None:
+        for w in PRICE_WINDOWS_MS:
+            past_mid_old = self._series_asof(ts_ms - w, "mid")
+            past_micro_old = self._series_asof(ts_ms - w, "micro")
+            old_mid_ret = self._bps_return(mid, past_mid_old) if past_mid_old is not None else 0.0
+            old_micro_ret = self._bps_return(micro, past_micro_old) if past_micro_old is not None else 0.0
+            points = self._window_price_points(ts_ms, w, "mid")
+            old_slope, old_r2 = self._rolling_slope_r2(points)
+            old_range = self._range_features(points, mid)
+            old_shape = self._return_shape_features(points)
+            old_tuple = (old_mid_ret, old_micro_ret, old_slope, old_r2, *old_range, *old_shape)
+
+            past_mid_new = self._mid_asof_history.asof(ts_ms - w)
+            past_micro_new = self._micro_asof_history.asof(ts_ms - w)
+            new_mid_ret = self._bps_return(mid, past_mid_new) if past_mid_new is not None else 0.0
+            new_micro_ret = self._bps_return(micro, past_micro_new) if past_micro_new is not None else 0.0
+            state = self._price_window_mid_states[w]
+            new_slope, new_r2 = state.slope_r2()
+            new_range = state.range_features(mid)
+            new_shape = state.return_shape_features()
+            new_tuple = (new_mid_ret, new_micro_ret, new_slope, new_r2, *new_range, *new_shape)
+
+            for idx, (old_val, new_val) in enumerate(zip(old_tuple, new_tuple)):
+                tol = 1e-6 if idx in (3, 12) else atol
+                if not math.isclose(float(old_val), float(new_val), rel_tol=rtol, abs_tol=tol):
+                    raise AssertionError(
+                        "Price-window state mismatch "
+                        f"window={w} idx={idx} old={old_val!r} new={new_val!r} "
+                        f"rtol={rtol} atol={tol} ts_ms={ts_ms}"
+                    )
 
     def _depth_within_bps(self, levels: List[Tuple[float, float]], mid: float, band_bps: float, is_bid: bool) -> dict:
         eps = 1e-12
@@ -4179,14 +4511,14 @@ class FeatureEngine:
         section_t0 = time.perf_counter()
         price_features_by_window: Dict[int, Tuple[float, ...]] = {}
         for w in PRICE_WINDOWS_MS:
-            past_mid = self._series_asof(ts_ms - w, "mid")
-            past_micro = self._series_asof(ts_ms - w, "micro")
+            past_mid = self._mid_asof_history.asof(ts_ms - w)
+            past_micro = self._micro_asof_history.asof(ts_ms - w)
             mid_ret_bps = self._bps_return(mid, past_mid) if past_mid is not None else 0.0
             micro_ret_bps = self._bps_return(micro, past_micro) if past_micro is not None else 0.0
-            points = self._window_price_points(ts_ms, w, "mid")
-            slope, r2 = self._rolling_slope_r2(points)
-            pos, d_high, d_low, rng, br_up, br_down = self._range_features(points, mid)
-            sign_persistence, up_frac, autocorr = self._return_shape_features(points)
+            state = self._price_window_mid_states[w]
+            slope, r2 = state.slope_r2()
+            pos, d_high, d_low, rng, br_up, br_down = state.range_features(mid)
+            sign_persistence, up_frac, autocorr = state.return_shape_features()
             price_features_by_window[w] = (
                 mid_ret_bps, micro_ret_bps, slope, r2,
                 pos, d_high, d_low, rng, br_up, br_down,
@@ -4872,6 +5204,10 @@ class FeatureEngine:
         feat = np.array(feat_list, dtype=np.float64)
         feat_z = self._zscore(feat, ts_ms)
         self._add_feature_timer("zscore_s", section_t0)
+
+        if self.debug_verify_price_windows and self.debug_verify_price_windows_count < self.debug_verify_price_windows_max:
+            self._debug_compare_price_window_states(ts_ms, mid, micro)
+            self.debug_verify_price_windows_count += 1
 
         section_t0 = time.perf_counter()
         self._append_price_history(ts_ms, mid, micro)
