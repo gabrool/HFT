@@ -4516,6 +4516,7 @@ class FeatureEngine:
             mid_ret_bps = self._bps_return(mid, past_mid) if past_mid is not None else 0.0
             micro_ret_bps = self._bps_return(micro, past_micro) if past_micro is not None else 0.0
             state = self._price_window_mid_states[w]
+            state.prune(ts_ms)  # critical: prune to current row timestamp before reading
             slope, r2 = state.slope_r2()
             pos, d_high, d_low, rng, br_up, br_down = state.range_features(mid)
             sign_persistence, up_frac, autocorr = state.return_shape_features()
