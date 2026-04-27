@@ -1945,7 +1945,8 @@ class FeatureEngine:
 
         # ---------- Time bookkeeping ----------
         self.last_ts: Optional[int] = None
-        self._last_event_ts: Optional[int] = None
+        self._last_any_event_ts: Optional[int] = None
+        self._last_ob_feature_ts: Optional[int] = None
         self.last_trade_ts: Optional[int] = None
         self.last_bid1_update_ts: Optional[int] = None
         self.last_ask1_update_ts: Optional[int] = None
@@ -3023,10 +3024,15 @@ class FeatureEngine:
             expired = deq.popleft()
             self._update_trade_window_state_with_expire(window_ms, expired)
 
+    def _prune_trade_max_queue_heads(self, q: Deque[Tuple[int, float]], cutoff_ts_ms: int) -> None:
+        cutoff = int(cutoff_ts_ms)
+        while q and int(q[0][0]) < cutoff:
+            q.popleft()
+
     def _compute_trade_window_stats(self, ms: int, ts_ms: int, mid: float, micro: float) -> Dict[str, float]:
-        del ts_ms
         eps = 1e-12
         state = self.trade_window_state[ms]
+        cutoff_ts_ms = int(ts_ms) - int(ms)
 
         trade_count = float(state["trade_count"])
         buy_vol = float(state["buy_vol"])
@@ -3044,6 +3050,8 @@ class FeatureEngine:
 
         buy_max_q = state["buy_max_q"]
         sell_max_q = state["sell_max_q"]
+        self._prune_trade_max_queue_heads(buy_max_q, cutoff_ts_ms)
+        self._prune_trade_max_queue_heads(sell_max_q, cutoff_ts_ms)
         buy_max_notional = float(buy_max_q[0][1]) if buy_max_q else 0.0
         sell_max_notional = float(sell_max_q[0][1]) if sell_max_q else 0.0
 
@@ -4001,7 +4009,11 @@ class FeatureEngine:
         ts_ms: int,
         payload: Any,
     ) -> Tuple[int, np.ndarray, float, bool, float]:
-        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
+        any_event_dt_ms = (
+            1.0
+            if self._last_any_event_ts is None
+            else max(1.0, float(ts_ms - int(self._last_any_event_ts)))
+        )
         prev_bid_l1 = self.prev_bsz
         prev_ask_l1 = self.prev_asz
         prev_bid_l2 = self.prev_bsz2
@@ -4012,20 +4024,20 @@ class FeatureEngine:
             self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == 'ob'))
 
         if etype == 'trade':
-            self._update_trade_windows(ts_ms, payload, dt_ms)
+            self._update_trade_windows(ts_ms, payload, any_event_dt_ms)
             self.trade_fast_path_count += 1
 
             # Trade rows update trade/event-density state only.
             # They must not build feature vectors, update feature z-score state,
             # append price-history rows, update book EMAs, or call _zscore().
             self.last_ts = ts_ms
-            self._last_event_ts = ts_ms
+            self._last_any_event_ts = int(ts_ms)
 
             # Mid is ignored by offline_ingest for trades, but return a best-effort value
             # for API consistency.
             bid1, ask1, _, _ = self._book_best()
             mid = 0.5 * (bid1 + ask1) if bid1 > 0.0 and ask1 > 0.0 else 0.0
-            return ts_ms, self._trade_fast_path_empty_feature, mid, True, dt_ms
+            return ts_ms, self._trade_fast_path_empty_feature, mid, True, any_event_dt_ms
 
         if etype == 'ob':
             self._prune_replen_windows(ts_ms)
@@ -4124,6 +4136,10 @@ class FeatureEngine:
         micro_premia = (micro - mid) / max(spread, 1e-12)
         micro_minus_mid_bps = 1e4 * (micro / mid - 1.0) if mid > 0.0 and micro > 0.0 else 0.0
         micro_minus_mid_over_spread = (micro - mid) / max(spread, 1e-12)
+        if self._last_ob_feature_ts is None:
+            ob_dt_ms = 1.0
+        else:
+            ob_dt_ms = max(1.0, float(ts_ms - int(self._last_ob_feature_ts)))
 
         xb, yb = self._levels_to_xy(self.bid_lvls, mid, True, 5)
         xa, ya = self._levels_to_xy(self.ask_lvls, mid, False, 5)
@@ -4131,7 +4147,7 @@ class FeatureEngine:
         slope_a = self._lin_slope(xa, ya)
 
         for ms in FAST_WINDOWS_MS:
-            self.ofi_pressure_by_window[ms] = self._ewma_update(self.ofi_pressure_by_window[ms], ofi_l1, dt_ms, ms)
+            self.ofi_pressure_by_window[ms] = self._ewma_update(self.ofi_pressure_by_window[ms], ofi_l1, ob_dt_ms, ms)
         ofi_pressure_by_ms = {ms: self.ofi_pressure_by_window[ms] for ms in FAST_WINDOWS_MS}
         trade_stats_by_ms = {ms: self._compute_trade_window_stats(ms, ts_ms, mid, micro) for ms in self.trade_windows}
         if etype == "ob":
@@ -4256,7 +4272,7 @@ class FeatureEngine:
             "large_sell_continuation_bps_15000ms": self._bps(self.last_large_sell_mid or 0.0, mid, 0.0)
             if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= 15_000) else 0.0,
         }
-        self._add_return(ts_ms, mid, is_ob_event=(etype == 'ob'))
+        self._add_return(ts_ms, mid, ob_dt_ms)
         return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
         return_std_bps = {ms: math.sqrt(var) for ms, var in return_var.items()}
         variance_ratio_adjacent = {}
@@ -4474,7 +4490,7 @@ class FeatureEngine:
         for required_name in self.ema_indicator_names:
             if required_name not in indicator_values:
                 raise ValueError(f"Missing EMA indicator value for {required_name}")
-        self._update_indicator_emas(indicator_values, dt_ms)
+        self._update_indicator_emas(indicator_values, ob_dt_ms)
 
         bid_5bps_levels = [(p, s) for p, s in self.bid_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p <= mid and (1e4 * (mid - p) / mid) <= 5.0]
         ask_5bps_levels = [(p, s) for p, s in self.ask_lvls if p > 0.0 and s > 0.0 and mid > 0.0 and p >= mid and (1e4 * (p - mid) / mid) <= 5.0]
@@ -4897,11 +4913,11 @@ class FeatureEngine:
             if st["fast"] is None:
                 st["fast"] = float(micro)
             else:
-                st["fast"] = self._ewma_update(float(st["fast"]), float(micro), dt_ms, int(fast_ms))
+                st["fast"] = self._ewma_update(float(st["fast"]), float(micro), ob_dt_ms, int(fast_ms))
             if st["slow"] is None:
                 st["slow"] = float(micro)
             else:
-                st["slow"] = self._ewma_update(float(st["slow"]), float(micro), dt_ms, int(slow_ms))
+                st["slow"] = self._ewma_update(float(st["slow"]), float(micro), ob_dt_ms, int(slow_ms))
             fast_ema = float(st["fast"])
             slow_ema = float(st["slow"])
             raw_bps = 1e4 * math.log(fast_ema / slow_ema) if (fast_ema > 0.0 and slow_ema > 0.0) else 0.0
@@ -4909,7 +4925,7 @@ class FeatureEngine:
                 st["signal"] = float(raw_bps)
                 st["signal_initialized"] = True
             else:
-                st["signal"] = self._ewma_update(float(st["signal"]), float(raw_bps), dt_ms, int(sig_ms))
+                st["signal"] = self._ewma_update(float(st["signal"]), float(raw_bps), ob_dt_ms, int(sig_ms))
             sig_bps = float(st["signal"])
             hist_bps = float(raw_bps - sig_bps)
             macd_features.extend([raw_bps, sig_bps, hist_bps])
@@ -4937,10 +4953,11 @@ class FeatureEngine:
         self.prev_mid_price_for_age = mid
         self.prev_spread_for_age = spread
         self.last_ts = ts_ms
-        self._last_event_ts = ts_ms
+        self._last_ob_feature_ts = int(ts_ms)
+        self._last_any_event_ts = int(ts_ms)
 
         self.ob_feature_build_count += 1
-        return ts_ms, feat_z, mid, is_trade, dt_ms
+        return ts_ms, feat_z, mid, is_trade, ob_dt_ms
 
     def _update_book_from_ob(
         self,
@@ -5147,7 +5164,7 @@ class FeatureEngine:
 
         self.last_trade_ts = ts_ms
 
-    def _add_return(self, ts_ms: int, mid: float, is_ob_event: bool):
+    def _add_return(self, ts_ms: int, mid: float, ob_dt_ms: float):
         if mid <= 0.0:
             return 0.0
     
@@ -5155,20 +5172,15 @@ class FeatureEngine:
             self.last_mid_for_ret = mid
             return 0.0
     
-        # Do not let trade-only rows inject zero mid returns into OB-return statistics.
-        if not is_ob_event:
-            return 0.0
-            
         r = (1e4 * math.log(mid / self.last_mid_for_ret)) if self.last_mid_for_ret > 0 else 0.0
         self.last_mid_for_ret = mid
 
         for ms, stats in self.return_histories.items():
             stats.add(ts_ms, r)
 
-        dt_ms = 1.0 if self._last_event_ts is None else max(1.0, ts_ms - self._last_event_ts)
         r2 = r * r
         for hl in self.regime_windows_ms:
-            self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, dt_ms, hl)
+            self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, ob_dt_ms, hl)
 
         for ms, state in self.regime_return_states.items():
             self._regime_return_add(state, int(ts_ms), float(r))
