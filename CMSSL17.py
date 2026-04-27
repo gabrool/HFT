@@ -1,7 +1,7 @@
 import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time, heapq
 from pathlib import Path
 from collections import deque
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
 import numpy as np
 import torch
@@ -1256,6 +1256,199 @@ class RollingWindowStats:
         return mean, max(0.0, var)
 
 
+class RollingScalarWindowState:
+    def __init__(
+        self,
+        window_ms: int,
+        *,
+        track_sorted: bool = False,
+        track_sign: bool = False,
+        above_thresholds: Tuple[float, ...] = (),
+    ):
+        self.window_ms: int = int(window_ms)
+        self.deq: Deque[Tuple[int, float, float]] = deque()
+        self.n: int = 0
+        self.sum: float = 0.0
+        self.sumsq: float = 0.0
+        self.sum_t: float = 0.0
+        self.sum_t2: float = 0.0
+        self.sum_ty: float = 0.0
+        self.anchor_ms: Optional[int] = None
+
+        self.track_sorted: bool = bool(track_sorted)
+        self.sorted_vals: List[float] = []
+
+        self.track_sign: bool = bool(track_sign)
+        self.pos_count: int = 0
+        self.neg_count: int = 0
+
+        self.above_thresholds: Tuple[float, ...] = tuple(float(t) for t in above_thresholds)
+        self.above_counts: Dict[float, int] = {float(t): 0 for t in self.above_thresholds}
+
+    def _remove_sorted_value(self, value: float) -> None:
+        idx = bisect_left(self.sorted_vals, value)
+        if idx < len(self.sorted_vals) and self.sorted_vals[idx] == value:
+            self.sorted_vals.pop(idx)
+            return
+        for j in range(max(0, idx - 3), min(len(self.sorted_vals), idx + 4)):
+            if self.sorted_vals[j] == value:
+                self.sorted_vals.pop(j)
+                return
+        for j, v in enumerate(self.sorted_vals):
+            if v == value:
+                self.sorted_vals.pop(j)
+                return
+        raise RuntimeError("RollingScalarWindowState sorted value removal failed")
+
+    def add(self, ts_ms: int, value: float) -> None:
+        v = float(value)
+        if not math.isfinite(v):
+            return
+        ts = int(ts_ms)
+        if self.anchor_ms is None:
+            self.anchor_ms = ts
+        t_rel_sec = (float(ts) - float(self.anchor_ms)) / 1000.0
+        self.deq.append((ts, v, t_rel_sec))
+        self.n += 1
+        self.sum += v
+        self.sumsq += v * v
+        self.sum_t += t_rel_sec
+        self.sum_t2 += t_rel_sec * t_rel_sec
+        self.sum_ty += t_rel_sec * v
+        if self.track_sorted:
+            insort(self.sorted_vals, v)
+        if self.track_sign:
+            s = 1 if v > 0.0 else (-1 if v < 0.0 else 0)
+            if s > 0:
+                self.pos_count += 1
+            elif s < 0:
+                self.neg_count += 1
+        if self.above_thresholds:
+            for thr in self.above_thresholds:
+                if v > thr:
+                    self.above_counts[thr] += 1
+
+    def prune(self, now_ms: int) -> None:
+        cutoff = int(now_ms) - self.window_ms
+        while self.deq and self.deq[0][0] < cutoff:
+            _ts, v, t_rel_sec = self.deq.popleft()
+            self.n -= 1
+            self.sum -= v
+            self.sumsq -= v * v
+            self.sum_t -= t_rel_sec
+            self.sum_t2 -= t_rel_sec * t_rel_sec
+            self.sum_ty -= t_rel_sec * v
+            if self.track_sorted:
+                self._remove_sorted_value(v)
+            if self.track_sign:
+                s = 1 if v > 0.0 else (-1 if v < 0.0 else 0)
+                if s > 0:
+                    self.pos_count -= 1
+                elif s < 0:
+                    self.neg_count -= 1
+            if self.above_thresholds:
+                for thr in self.above_thresholds:
+                    if v > thr:
+                        self.above_counts[thr] -= 1
+        if self.n <= 0:
+            self.n = 0
+            self.sum = 0.0
+            self.sumsq = 0.0
+            self.sum_t = 0.0
+            self.sum_t2 = 0.0
+            self.sum_ty = 0.0
+            self.pos_count = 0
+            self.neg_count = 0
+            for thr in self.above_thresholds:
+                self.above_counts[thr] = 0
+
+    def update(self, ts_ms: int, value: float) -> None:
+        self.add(ts_ms, value)
+        self.prune(ts_ms)
+
+    def mean(self) -> float:
+        return self.sum / float(self.n) if self.n > 0 else 0.0
+
+    def std(self) -> float:
+        if self.n <= 0:
+            return 0.0
+        mean = self.sum / float(self.n)
+        var = max(0.0, self.sumsq / float(self.n) - mean * mean)
+        return math.sqrt(var)
+
+    def mean_std(self) -> Tuple[float, float]:
+        if self.n <= 0:
+            return 0.0, 0.0
+        mean = self.sum / float(self.n)
+        var = max(0.0, self.sumsq / float(self.n) - mean * mean)
+        return mean, math.sqrt(var)
+
+    def min(self) -> float:
+        if self.n <= 0:
+            return 0.0
+        if self.track_sorted:
+            return float(self.sorted_vals[0])
+        return float(min(v for _, v, _ in self.deq))
+
+    def max(self) -> float:
+        if self.n <= 0:
+            return 0.0
+        if self.track_sorted:
+            return float(self.sorted_vals[-1])
+        return float(max(v for _, v, _ in self.deq))
+
+    def quantile(self, q: float) -> float:
+        if self.n <= 0:
+            return 0.0
+        if not self.track_sorted:
+            vals = sorted(v for _, v, _ in self.deq)
+        else:
+            vals = self.sorted_vals
+        if self.n == 1:
+            return float(vals[0])
+        h = (self.n - 1) * float(q)
+        lo = int(math.floor(h))
+        hi = int(math.ceil(h))
+        if lo == hi:
+            return float(vals[lo])
+        return float(vals[lo] * (hi - h) + vals[hi] * (h - lo))
+
+    def p90(self) -> float:
+        return self.quantile(0.90)
+
+    def slope(self) -> float:
+        n = self.n
+        if n < 2:
+            return 0.0
+        den = self.sum_t2 - (self.sum_t * self.sum_t) / float(n)
+        if den <= 1e-12 or not math.isfinite(den):
+            return 0.0
+        num = self.sum_ty - (self.sum_t * self.sum) / float(n)
+        out = num / den
+        return float(out) if math.isfinite(out) else 0.0
+
+    def frac_above(self, threshold: float) -> float:
+        if self.n <= 0:
+            return 0.0
+        thr = float(threshold)
+        if thr in self.above_counts:
+            return float(self.above_counts[thr]) / float(self.n)
+        count = sum(1 for _, v, _ in self.deq if v > thr)
+        return float(count) / float(self.n)
+
+    def sum_value(self) -> float:
+        return float(self.sum)
+
+    def persistence(self, current_sign: int) -> float:
+        if current_sign == 0 or self.n <= 0:
+            return 0.0
+        if current_sign > 0:
+            return float(self.pos_count) / float(self.n)
+        if current_sign < 0:
+            return float(self.neg_count) / float(self.n)
+        return 0.0
+
+
 @dataclass
 class LargeTradeWindowState:
     window_ms: int
@@ -1526,6 +1719,30 @@ class FeatureEngine:
         self._depth_5bps_total_history: Deque[Tuple[int, float]] = deque()
         self._depth_5bps_imbalance_history: Deque[Tuple[int, float]] = deque()
         self._regime_metric_keep_ms = max(SPREAD_DEPTH_REGIME_WINDOWS_MS) + 5_000
+        self._spread_bps_regime_states = {
+            ms: RollingScalarWindowState(
+                ms,
+                track_sorted=True,
+                above_thresholds=(1.0,),
+            )
+            for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS
+        }
+        self._depth_5bps_total_regime_states = {
+            ms: RollingScalarWindowState(ms)
+            for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS
+        }
+        self._depth_5bps_imbalance_regime_states = {
+            ms: RollingScalarWindowState(ms)
+            for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS
+        }
+        self._bid_depth_5bps_regime_states = {
+            ms: RollingScalarWindowState(ms)
+            for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS
+        }
+        self._ask_depth_5bps_regime_states = {
+            ms: RollingScalarWindowState(ms)
+            for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS
+        }
 
         # ---------- Spread ----------
         self.last_spread: Optional[float] = None
@@ -1636,6 +1853,19 @@ class FeatureEngine:
         }
         self.obi_level_histories: Dict[int, Deque[Tuple[int, float]]] = {
             level: deque() for level in ROLLING_OBI_LEVELS
+        }
+        self._rolling_ofi_states = {
+            (level, window): RollingScalarWindowState(window)
+            for level in ROLLING_OFI_LEVELS
+            for window in ROLLING_OFI_WINDOWS_MS
+        }
+        self._rolling_obi_states = {
+            (level, window): RollingScalarWindowState(
+                window,
+                track_sign=True,
+            )
+            for level in ROLLING_OBI_LEVELS
+            for window in ROLLING_OBI_WINDOWS_MS
         }
         self.deep_micro_histories: Dict[int, Deque[Tuple[int, float]]] = {
             5: deque(),
@@ -2294,6 +2524,135 @@ class FeatureEngine:
 
     def _rolling_value_slope(self, points: List[Tuple[int, float]]) -> float:
         return self._slope_from_points_no_numpy(points)
+
+    def _debug_compare_spread_depth_regime_states(
+        self,
+        ts_ms: int,
+        spread_bps: float,
+        depth_5bps_total: float,
+        depth_5bps_imbalance: float,
+        bid_depth_5bps_size: float,
+        ask_depth_5bps_size: float,
+        *,
+        atol: float = 1e-8,
+        rtol: float = 1e-7,
+    ) -> None:
+        for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
+            spread_points = self._metric_values(self._spread_bps_history, ts_ms, ms)
+            spread_vals = [v for _, v in spread_points]
+            spread_stats = self._rolling_stats_values(spread_vals)
+            spread_std = spread_stats["std"]
+            spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_stats["mean"]) / max(spread_std, 1e-9)
+            spread_slope = self._rolling_value_slope(spread_points)
+            spread_above = self._safe_div(sum(1.0 for v in spread_vals if v > 1.0), float(len(spread_vals)), 0.0)
+            depth_points = self._metric_values(self._depth_5bps_total_history, ts_ms, ms)
+            depth_vals = [v for _, v in depth_points]
+            depth_mean, depth_std = self._rolling_mean_std_values(depth_vals)
+            depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_mean) / max(depth_std, 1e-9)
+            imb_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, ms)
+            imb_vals = [v for _, v in imb_points]
+            imb_mean = self._rolling_mean_values(imb_vals)
+            imb_slope = self._rolling_value_slope(imb_points)
+            bid_points = self._metric_values(self._bid_depth_5bps_history, ts_ms, ms)
+            ask_points = self._metric_values(self._ask_depth_5bps_history, ts_ms, ms)
+            bid_mean = self._rolling_mean_values([v for _, v in bid_points])
+            ask_mean = self._rolling_mean_values([v for _, v in ask_points])
+            old_values = [
+                spread_stats["mean"],
+                spread_stats["std"],
+                spread_stats["p90"],
+                spread_stats["max"],
+                spread_stats["min"],
+                spread_z,
+                spread_slope,
+                spread_above,
+                depth_mean,
+                depth_std,
+                depth_z,
+                imb_mean,
+                imb_slope,
+                (bid_depth_5bps_size / max(bid_mean, 1e-9)) - 1.0,
+                (ask_depth_5bps_size / max(ask_mean, 1e-9)) - 1.0,
+            ]
+
+            spread_state = self._spread_bps_regime_states[ms]
+            depth_state = self._depth_5bps_total_regime_states[ms]
+            imb_state = self._depth_5bps_imbalance_regime_states[ms]
+            bid_state = self._bid_depth_5bps_regime_states[ms]
+            ask_state = self._ask_depth_5bps_regime_states[ms]
+            spread_mean_new, spread_std_new = spread_state.mean_std()
+            spread_z_new = 0.0 if spread_std_new <= 1e-9 else (spread_bps - spread_mean_new) / max(spread_std_new, 1e-9)
+            depth_mean_new, depth_std_new = depth_state.mean_std()
+            depth_z_new = 0.0 if depth_std_new <= 1e-9 else (depth_5bps_total - depth_mean_new) / max(depth_std_new, 1e-9)
+            bid_mean_new = bid_state.mean()
+            ask_mean_new = ask_state.mean()
+            new_values = [
+                spread_mean_new,
+                spread_std_new,
+                spread_state.p90(),
+                spread_state.max(),
+                spread_state.min(),
+                spread_z_new,
+                spread_state.slope(),
+                spread_state.frac_above(1.0),
+                depth_mean_new,
+                depth_std_new,
+                depth_z_new,
+                imb_state.mean(),
+                imb_state.slope(),
+                (bid_depth_5bps_size / max(bid_mean_new, 1e-9)) - 1.0,
+                (ask_depth_5bps_size / max(ask_mean_new, 1e-9)) - 1.0,
+            ]
+            for idx, (old_v, new_v) in enumerate(zip(old_values, new_values)):
+                if not math.isclose(float(old_v), float(new_v), rel_tol=rtol, abs_tol=atol):
+                    raise AssertionError(
+                        f"spread_depth_regime mismatch window={ms} idx={idx} old={old_v!r} new={new_v!r}"
+                    )
+
+    def _debug_compare_rolling_ofi_obi_states(
+        self,
+        ts_ms: int,
+        obi_by_level: Dict[int, float],
+        *,
+        atol: float = 1e-8,
+        rtol: float = 1e-7,
+    ) -> None:
+        for level in ROLLING_OFI_LEVELS:
+            for window in ROLLING_OFI_WINDOWS_MS:
+                old_sum = float(sum(v for _, v in self._metric_values(self.ofi_level_histories[level], ts_ms, window)))
+                new_sum = self._rolling_ofi_states[(level, window)].sum_value()
+                if not math.isclose(old_sum, new_sum, rel_tol=rtol, abs_tol=atol):
+                    raise AssertionError(
+                        f"rolling_ofi mismatch level={level} window={window} old={old_sum!r} new={new_sum!r}"
+                    )
+        for level in ROLLING_OBI_LEVELS:
+            current_sign = self._sign(obi_by_level[level])
+            for window in ROLLING_OBI_WINDOWS_MS:
+                vals = self._metric_values(self.obi_level_histories[level], ts_ms, window)
+                ys = [v for _, v in vals]
+                old_mean = float(sum(ys) / len(ys)) if ys else 0.0
+                old_slope = self._lin_slope([(ts - ts_ms) / 1000.0 for ts, _ in vals], ys) if len(ys) >= 2 else 0.0
+                if not ys or current_sign == 0:
+                    old_persistence = 0.0
+                else:
+                    match = sum(1.0 for v in ys if self._sign(v) == current_sign and self._sign(v) != 0)
+                    old_persistence = self._safe_div(match, float(len(ys)), 0.0)
+                state = self._rolling_obi_states[(level, window)]
+                new_mean = state.mean()
+                new_slope = state.slope()
+                new_persistence = state.persistence(current_sign)
+                if not math.isclose(old_mean, new_mean, rel_tol=rtol, abs_tol=atol):
+                    raise AssertionError(
+                        f"rolling_obi mean mismatch level={level} window={window} old={old_mean!r} new={new_mean!r}"
+                    )
+                if not math.isclose(old_slope, new_slope, rel_tol=rtol, abs_tol=atol):
+                    raise AssertionError(
+                        f"rolling_obi slope mismatch level={level} window={window} old={old_slope!r} new={new_slope!r}"
+                    )
+                if not math.isclose(old_persistence, new_persistence, rel_tol=rtol, abs_tol=atol):
+                    raise AssertionError(
+                        f"rolling_obi persistence mismatch level={level} window={window} old={old_persistence!r} new={new_persistence!r}"
+                    )
 
     def _return_distribution_stats(self, vals: List[float]) -> Dict[str, float]:
         if not vals:
@@ -3850,6 +4209,12 @@ class FeatureEngine:
         self._append_metric_history(self._ask_depth_5bps_history, ts_ms, ask_depth_5bps["size"], self._regime_metric_keep_ms)
         self._append_metric_history(self._depth_5bps_total_history, ts_ms, depth_5bps_total, self._regime_metric_keep_ms)
         self._append_metric_history(self._depth_5bps_imbalance_history, ts_ms, depth_5bps_imbalance, self._regime_metric_keep_ms)
+        for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
+            self._spread_bps_regime_states[ms].update(ts_ms, spread_bps)
+            self._bid_depth_5bps_regime_states[ms].update(ts_ms, bid_depth_5bps["size"])
+            self._ask_depth_5bps_regime_states[ms].update(ts_ms, ask_depth_5bps["size"])
+            self._depth_5bps_total_regime_states[ms].update(ts_ms, depth_5bps_total)
+            self._depth_5bps_imbalance_regime_states[ms].update(ts_ms, depth_5bps_imbalance)
 
         self._add_feature_timer("depth_5bps_history_s", section_t0)
 
@@ -3884,26 +4249,25 @@ class FeatureEngine:
         rolling_obi_stats: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
         if etype == "ob":
             for level in ROLLING_OFI_LEVELS:
-                self._append_metric_history(self.ofi_level_histories[level], ts_ms, ofi_by_level[level], keep_ms=120_000)
+                value = ofi_by_level[level]
+                self._append_metric_history(self.ofi_level_histories[level], ts_ms, value, keep_ms=120_000)
+                for window in ROLLING_OFI_WINDOWS_MS:
+                    self._rolling_ofi_states[(level, window)].update(ts_ms, value)
             for level in ROLLING_OBI_LEVELS:
-                self._append_metric_history(self.obi_level_histories[level], ts_ms, obi_by_level[level], keep_ms=120_000)
+                value = obi_by_level[level]
+                self._append_metric_history(self.obi_level_histories[level], ts_ms, value, keep_ms=120_000)
+                for window in ROLLING_OBI_WINDOWS_MS:
+                    self._rolling_obi_states[(level, window)].update(ts_ms, value)
         for level in ROLLING_OFI_LEVELS:
             for window in ROLLING_OFI_WINDOWS_MS:
-                vals = self._metric_values(self.ofi_level_histories[level], ts_ms, window)
-                rolling_ofi_sums[(level, window)] = float(sum(v for _, v in vals))
+                rolling_ofi_sums[(level, window)] = self._rolling_ofi_states[(level, window)].sum_value()
         for level in ROLLING_OBI_LEVELS:
             current_sign = self._sign(obi_by_level[level])
             for window in ROLLING_OBI_WINDOWS_MS:
-                vals = self._metric_values(self.obi_level_histories[level], ts_ms, window)
-                ys = [v for _, v in vals]
-                mean_val = float(sum(ys) / len(ys)) if ys else 0.0
-                xs = [(ts - ts_ms) / 1000.0 for ts, _ in vals]
-                slope = self._lin_slope(xs, ys) if len(ys) >= 2 else 0.0
-                if not ys or current_sign == 0:
-                    persistence = 0.0
-                else:
-                    match = sum(1.0 for v in ys if self._sign(v) == current_sign and self._sign(v) != 0)
-                    persistence = self._safe_div(match, float(len(ys)), 0.0)
+                state = self._rolling_obi_states[(level, window)]
+                mean_val = state.mean()
+                slope = state.slope()
+                persistence = state.persistence(current_sign)
                 rolling_obi_stats[(level, window)] = (mean_val, slope, persistence)
         self._add_feature_timer("rolling_ofi_obi_s", section_t0)
 
@@ -4358,27 +4722,31 @@ class FeatureEngine:
 
         section_t0 = time.perf_counter()
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
-            spread_points = self._metric_values(self._spread_bps_history, ts_ms, ms)
-            spread_vals = [v for _, v in spread_points]
-            spread_stats = self._rolling_stats_values(spread_vals)
-            spread_std = spread_stats["std"]
-            spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_stats["mean"]) / max(spread_std, 1e-9)
-            spread_slope = self._rolling_value_slope(spread_points)
-            spread_above = self._safe_div(sum(1.0 for v in spread_vals if v > 1.0), float(len(spread_vals)), 0.0)
+            spread_state = self._spread_bps_regime_states[ms]
+            depth_state = self._depth_5bps_total_regime_states[ms]
+            imb_state = self._depth_5bps_imbalance_regime_states[ms]
+            bid_state = self._bid_depth_5bps_regime_states[ms]
+            ask_state = self._ask_depth_5bps_regime_states[ms]
 
-            depth_points = self._metric_values(self._depth_5bps_total_history, ts_ms, ms)
-            depth_vals = [v for _, v in depth_points]
-            depth_mean, depth_std = self._rolling_mean_std_values(depth_vals)
+            spread_mean, spread_std = spread_state.mean_std()
+            spread_stats = {
+                "mean": spread_mean,
+                "std": spread_std,
+                "p90": spread_state.p90(),
+                "max": spread_state.max(),
+                "min": spread_state.min(),
+            }
+            spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_mean) / max(spread_std, 1e-9)
+            spread_slope = spread_state.slope()
+            spread_above = spread_state.frac_above(1.0)
+
+            depth_mean, depth_std = depth_state.mean_std()
             depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_mean) / max(depth_std, 1e-9)
-            imb_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, ms)
-            imb_vals = [v for _, v in imb_points]
-            imb_mean = self._rolling_mean_values(imb_vals)
-            imb_slope = self._rolling_value_slope(imb_points)
+            imb_mean = imb_state.mean()
+            imb_slope = imb_state.slope()
 
-            bid_points = self._metric_values(self._bid_depth_5bps_history, ts_ms, ms)
-            ask_points = self._metric_values(self._ask_depth_5bps_history, ts_ms, ms)
-            bid_mean = self._rolling_mean_values([v for _, v in bid_points])
-            ask_mean = self._rolling_mean_values([v for _, v in ask_points])
+            bid_mean = bid_state.mean()
+            ask_mean = ask_state.mean()
 
             feat_list.extend([
                 spread_stats["mean"],
