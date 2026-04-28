@@ -60,6 +60,9 @@ EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
 FAST_VAL_MAX_ROWS = 200_000
 FULL_VAL_EVERY = 5
+TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "10"))
+if TRAIN_ROW_STRIDE < 1:
+    raise ValueError(f"BYBIT_TRAIN_ROW_STRIDE must be >= 1, got {TRAIN_ROW_STRIDE}")
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
@@ -481,9 +484,8 @@ class GPUWindowBatchSource:
         drop_last: bool,
         seed: int = 12345,
         subset_max_rows: Optional[int] = None,
-        subset_stride: Optional[int] = None,
+        row_stride: int = 1,
     ):
-        del subset_stride
         if len(ds.stores) != 1:
             raise ValueError(f"GPUWindowBatchSource requires exactly one week/store, got {len(ds.stores)}")
         if ds.week_ids.size and not np.all(ds.week_ids == 0):
@@ -498,6 +500,9 @@ class GPUWindowBatchSource:
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
+        self.row_stride = int(row_stride)
+        if self.row_stride < 1:
+            raise ValueError(f"row_stride must be >= 1, got {self.row_stride}")
         self.subset_max_rows = subset_max_rows
         self.is_shared_feature_view = False
         self.lookback = int(ds.lookback)
@@ -521,6 +526,11 @@ class GPUWindowBatchSource:
                 self.y = self.y[idx]
 
         self.n_rows = int(self.y.shape[0])
+        self.effective_rows_nominal = (
+            int((self.n_rows + self.row_stride - 1) // self.row_stride)
+            if self.row_stride > 1
+            else int(self.n_rows)
+        )
         self.feature_shape = tuple(self.features.shape)
         self.feature_gb = float(self.features.numel() * self.features.element_size()) / (1024 ** 3)
         self.label_index_gb = float(
@@ -528,7 +538,7 @@ class GPUWindowBatchSource:
         ) / (1024 ** 3)
 
     def __len__(self) -> int:
-        n = int(self.n_rows)
+        n = int(self.effective_rows_nominal)
         if self.drop_last:
             return n // self.batch_size
         return (n + self.batch_size - 1) // self.batch_size
@@ -549,6 +559,7 @@ class GPUWindowBatchSource:
         child.shuffle = False
         child.drop_last = False
         child.seed = self.seed
+        child.row_stride = 1
         child.num_horizons = self.num_horizons
         child.row_idx = self.row_idx[idx]
         child.y = self.y[idx]
@@ -557,6 +568,7 @@ class GPUWindowBatchSource:
                 f"Subset violates full-history invariant: min row_idx={int(child.row_idx.min().item())}, lookback={int(child.lookback)}"
             )
         child.n_rows = int(child.y.shape[0])
+        child.effective_rows_nominal = int(child.n_rows)
         child.feature_shape = tuple(child.features.shape)
         child.feature_gb = 0.0
         child.label_index_gb = float(
@@ -569,13 +581,31 @@ class GPUWindowBatchSource:
         return child
 
     def iter_epoch(self, epoch: int):
-        n = int(self.n_rows)
+        n_total = int(self.n_rows)
+        stride = int(self.row_stride)
+
+        if stride == 1:
+            selected = torch.arange(n_total, device=self.device)
+        else:
+            g_offset = torch.Generator(device=self.device)
+            g_offset.manual_seed(self.seed + 1_000_003 + int(epoch))
+            offset = int(torch.randint(
+                low=0,
+                high=stride,
+                size=(1,),
+                device=self.device,
+                generator=g_offset,
+            ).item())
+            selected = torch.arange(offset, n_total, stride, device=self.device)
+
+        n = int(selected.numel())
         if self.shuffle:
             g = torch.Generator(device=self.device)
             g.manual_seed(self.seed + int(epoch))
-            perm = torch.randperm(n, device=self.device, generator=g)
+            order = torch.randperm(n, device=self.device, generator=g)
+            perm = selected[order]
         else:
-            perm = torch.arange(n, device=self.device)
+            perm = selected
 
         stop = (n // self.batch_size) * self.batch_size if self.drop_last else n
         for start in range(0, stop, self.batch_size):
@@ -901,6 +931,7 @@ def train_from_offline():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amp_enabled = AMP_ENABLED and device.type=='cuda'
     amp_dtype = torch.bfloat16
+    print(f"[config] BYBIT_TRAIN_ROW_STRIDE={TRAIN_ROW_STRIDE}", flush=True)
     out_root = Path(OUT_ROOT)
     meta = json.loads((out_root / "meta.json").read_text())
     validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
@@ -976,11 +1007,27 @@ def train_from_offline():
     )
     print(f"[train_stats] dir_pos_w={dir_pos_w.tolist()} dir_neg_w={dir_neg_w.tolist()}")
 
-    train_src = GPUWindowBatchSource(ds_train, device, BATCH_SIZE, shuffle=True, drop_last=True)
-    val_full_src = GPUWindowBatchSource(ds_val, device, BATCH_SIZE, shuffle=False, drop_last=False)
+    train_src = GPUWindowBatchSource(
+        ds_train,
+        device,
+        BATCH_SIZE,
+        shuffle=True,
+        drop_last=True,
+        row_stride=TRAIN_ROW_STRIDE,
+    )
+    val_full_src = GPUWindowBatchSource(
+        ds_val,
+        device,
+        BATCH_SIZE,
+        shuffle=False,
+        drop_last=False,
+        row_stride=1,
+    )
     val_fast_src = val_full_src.make_evenly_spaced_subset(FAST_VAL_MAX_ROWS)
     print(
-        f"[gpu_data] train rows={train_src.n_rows} feature_shape={train_src.feature_shape} "
+        f"[gpu_data] train rows={train_src.n_rows} train_row_stride={train_src.row_stride} "
+        f"effective_rows_nominal={train_src.effective_rows_nominal} "
+        f"feature_shape={train_src.feature_shape} "
         f"feature_gb={train_src.feature_gb:.3f} label_index_gb={train_src.label_index_gb:.3f}"
     )
     print(
@@ -1189,7 +1236,14 @@ def train_from_offline():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    test_full_src = GPUWindowBatchSource(ds_test, device, BATCH_SIZE, shuffle=False, drop_last=False)
+    test_full_src = GPUWindowBatchSource(
+        ds_test,
+        device,
+        BATCH_SIZE,
+        shuffle=False,
+        drop_last=False,
+        row_stride=1,
+    )
     print(
         f"[gpu_data] test_full rows={test_full_src.n_rows} feature_shape={test_full_src.feature_shape} "
         f"feature_gb={test_full_src.feature_gb:.3f} label_index_gb={test_full_src.label_index_gb:.3f}"
