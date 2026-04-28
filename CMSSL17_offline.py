@@ -623,6 +623,183 @@ class GPUWindowBatchSource:
             yield x, y_raw
 
 
+class CPUWindowBatchSource:
+    def __init__(
+        self,
+        ds,
+        device: torch.device,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int = 12345,
+        subset_max_rows: Optional[int] = None,
+        row_stride: int = 1,
+    ):
+        if len(ds.stores) != 1:
+            raise ValueError(f"CPUWindowBatchSource requires exactly one week/store, got {len(ds.stores)}")
+        if ds.week_ids.size and not np.all(ds.week_ids == 0):
+            raise ValueError("CPUWindowBatchSource requires ds.week_ids to contain only zeros for single-week datasets")
+        if len(ds) > 0 and int(ds.row_idx.min()) < int(ds.lookback - 1):
+            raise ValueError(
+                f"CPUWindowBatchSource requires full-history rows only, min row_idx={int(ds.row_idx.min())}, lookback={int(ds.lookback)}"
+            )
+
+        self.target_device = device
+        self.device = torch.device("cpu")
+        self.pin_memory = bool(device.type == "cuda")
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.row_stride = int(row_stride)
+        if self.row_stride < 1:
+            raise ValueError(f"row_stride must be >= 1, got {self.row_stride}")
+        self.subset_max_rows = subset_max_rows
+        self.is_shared_feature_view = False
+        self.lookback = int(ds.lookback)
+        self.num_horizons = int(ds.y.shape[1]) if ds.y.ndim == 2 else NUM_HORIZONS
+
+        features_np = ds.stores[0].contiguous_features()
+        features_np = np.ascontiguousarray(features_np, dtype=np.float32)
+        features_cpu = torch.from_numpy(features_np)
+        if self.pin_memory:
+            features_cpu = features_cpu.pin_memory()
+        self.features = features_cpu
+        if self.features.dtype != torch.float32:
+            raise ValueError(f"Expected float32 features, got {self.features.dtype}")
+
+        row_idx_cpu = torch.from_numpy(ds.row_idx.astype(np.int64, copy=False))
+        y_cpu = torch.from_numpy(ds.y.astype(np.float32, copy=False))
+        if self.pin_memory:
+            row_idx_cpu = row_idx_cpu.pin_memory()
+            y_cpu = y_cpu.pin_memory()
+        self.row_idx = row_idx_cpu
+        self.y = y_cpu
+        self.offsets = torch.arange(self.lookback - 1, -1, -1, dtype=torch.long)
+        if self.y.ndim != 2 or self.y.shape[1] != NUM_HORIZONS:
+            raise ValueError(f"Expected y to have shape [N, {NUM_HORIZONS}], got {tuple(self.y.shape)}")
+
+        if subset_max_rows is not None:
+            n = min(int(subset_max_rows), int(self.y.shape[0]))
+            if n > 0:
+                idx = torch.linspace(0, int(self.y.shape[0]) - 1, steps=n).round().long()
+                self.row_idx = self.row_idx[idx]
+                self.y = self.y[idx]
+                if self.pin_memory:
+                    self.row_idx = self.row_idx.pin_memory()
+                    self.y = self.y.pin_memory()
+
+        self.n_rows = int(self.y.shape[0])
+        self.effective_rows_nominal = (
+            int((self.n_rows + self.row_stride - 1) // self.row_stride)
+            if self.row_stride > 1
+            else int(self.n_rows)
+        )
+        self.feature_shape = tuple(self.features.shape)
+        self.feature_gb = float(self.features.numel() * self.features.element_size()) / (1024 ** 3)
+        self.label_index_gb = float(
+            self.y.numel() * self.y.element_size() + self.row_idx.numel() * self.row_idx.element_size()
+        ) / (1024 ** 3)
+
+    def __len__(self) -> int:
+        n = int(self.effective_rows_nominal)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+    def make_evenly_spaced_subset(self, max_rows: int) -> "CPUWindowBatchSource":
+        if int(max_rows) <= 0:
+            raise ValueError(f"max_rows must be > 0, got {max_rows}")
+        if int(self.n_rows) <= 0:
+            raise ValueError("Cannot subset an empty source")
+
+        n = min(int(max_rows), int(self.n_rows))
+        idx = torch.linspace(0, self.n_rows - 1, steps=n).round().long()
+
+        child = object.__new__(CPUWindowBatchSource)
+        child.features = self.features
+        child.offsets = self.offsets
+        child.target_device = self.target_device
+        child.device = self.device
+        child.pin_memory = self.pin_memory
+        child.lookback = self.lookback
+        child.batch_size = self.batch_size
+        child.shuffle = False
+        child.drop_last = False
+        child.seed = self.seed
+        child.row_stride = 1
+        child.num_horizons = self.num_horizons
+        child.row_idx = self.row_idx[idx]
+        child.y = self.y[idx]
+        if child.pin_memory:
+            child.row_idx = child.row_idx.pin_memory()
+            child.y = child.y.pin_memory()
+        if child.row_idx.numel() > 0 and int(child.row_idx.min().item()) < int(child.lookback - 1):
+            raise ValueError(
+                f"Subset violates full-history invariant: min row_idx={int(child.row_idx.min().item())}, lookback={int(child.lookback)}"
+            )
+        child.n_rows = int(child.y.shape[0])
+        child.effective_rows_nominal = int(child.n_rows)
+        child.feature_shape = tuple(child.features.shape)
+        child.feature_gb = float(child.features.numel() * child.features.element_size()) / (1024 ** 3)
+        child.label_index_gb = float(
+            child.y.numel() * child.y.element_size() + child.row_idx.numel() * child.row_idx.element_size()
+        ) / (1024 ** 3)
+        child.subset_max_rows = int(max_rows)
+        child.is_shared_feature_view = True
+
+        if child.features is not self.features:
+            raise RuntimeError("Subset source must share exact feature tensor object")
+
+        return child
+
+    def iter_epoch(self, epoch: int):
+        n_total = int(self.n_rows)
+        stride = int(self.row_stride)
+
+        if stride == 1:
+            selected = torch.arange(n_total)
+        else:
+            g_offset = torch.Generator(device="cpu")
+            g_offset.manual_seed(self.seed + 1_000_003 + int(epoch))
+            offset = int(torch.randint(
+                low=0,
+                high=stride,
+                size=(1,),
+                generator=g_offset,
+            ).item())
+            selected = torch.arange(offset, n_total, stride)
+
+        n = int(selected.numel())
+        if self.shuffle:
+            g = torch.Generator(device="cpu")
+            g.manual_seed(self.seed + int(epoch))
+            order = torch.randperm(n, generator=g)
+            perm = selected[order]
+        else:
+            perm = selected
+
+        stop = (n // self.batch_size) * self.batch_size if self.drop_last else n
+        for start in range(0, stop, self.batch_size):
+            end = min(start + self.batch_size, stop)
+            ids = perm[start:end]
+            rows = self.row_idx[ids]
+            win_idx = rows[:, None] - self.offsets[None, :]
+            x_cpu = self.features[win_idx]
+            y_cpu = self.y[ids]
+            if self.pin_memory:
+                x_cpu = x_cpu.pin_memory()
+                y_cpu = y_cpu.pin_memory()
+            x = x_cpu.to(self.target_device, non_blocking=self.pin_memory)
+            y_raw = y_cpu.to(self.target_device, non_blocking=self.pin_memory)
+            expected_b = int(end - start)
+            if x.shape != (expected_b, self.lookback, self.features.shape[1]):
+                raise ValueError(f"Window tensor shape mismatch: got {tuple(x.shape)}")
+            if y_raw.ndim != 2 or y_raw.shape[1] != NUM_HORIZONS:
+                raise ValueError(f"Label tensor shape mismatch: got {tuple(y_raw.shape)}")
+            yield x, y_raw
+
+
 class LossEmaState:
     def __init__(self, decay: float):
         self.decay = float(decay)
@@ -1015,7 +1192,7 @@ def train_from_offline():
         drop_last=True,
         row_stride=TRAIN_ROW_STRIDE,
     )
-    val_full_src = GPUWindowBatchSource(
+    val_full_src = CPUWindowBatchSource(
         ds_val,
         device,
         BATCH_SIZE,
@@ -1031,12 +1208,15 @@ def train_from_offline():
         f"feature_gb={train_src.feature_gb:.3f} label_index_gb={train_src.label_index_gb:.3f}"
     )
     print(
-        f"[gpu_data] val_full rows={val_full_src.n_rows} feature_shape={val_full_src.feature_shape} "
-        f"feature_gb={val_full_src.feature_gb:.3f} label_index_gb={val_full_src.label_index_gb:.3f}"
+        f"[cpu_val_data] val_full rows={val_full_src.n_rows} row_stride={val_full_src.row_stride} "
+        f"feature_shape={val_full_src.feature_shape} "
+        f"feature_gb_cpu={val_full_src.feature_gb:.3f} label_index_gb_cpu={val_full_src.label_index_gb:.3f} "
+        f"pin_memory={val_full_src.pin_memory}"
     )
     print(
-        f"[gpu_data] val_fast rows={val_fast_src.n_rows} subset={FAST_VAL_MAX_ROWS} "
-        f"shared_features={val_fast_src.is_shared_feature_view} label_index_gb={val_fast_src.label_index_gb:.3f}"
+        f"[cpu_val_data] val_fast rows={val_fast_src.n_rows} subset={FAST_VAL_MAX_ROWS} "
+        f"shared_features={val_fast_src.is_shared_feature_view} "
+        f"label_index_gb_cpu={val_fast_src.label_index_gb:.3f} pin_memory={val_fast_src.pin_memory}"
     )
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
@@ -1236,7 +1416,7 @@ def train_from_offline():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    test_full_src = GPUWindowBatchSource(
+    test_full_src = CPUWindowBatchSource(
         ds_test,
         device,
         BATCH_SIZE,
@@ -1245,8 +1425,10 @@ def train_from_offline():
         row_stride=1,
     )
     print(
-        f"[gpu_data] test_full rows={test_full_src.n_rows} feature_shape={test_full_src.feature_shape} "
-        f"feature_gb={test_full_src.feature_gb:.3f} label_index_gb={test_full_src.label_index_gb:.3f}"
+        f"[cpu_test_data] test_full rows={test_full_src.n_rows} row_stride={test_full_src.row_stride} "
+        f"feature_shape={test_full_src.feature_shape} "
+        f"feature_gb_cpu={test_full_src.feature_gb:.3f} label_index_gb_cpu={test_full_src.label_index_gb:.3f} "
+        f"pin_memory={test_full_src.pin_memory}"
     )
 
     test=summarize_metrics(model, test_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=0)
