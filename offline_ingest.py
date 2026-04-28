@@ -73,6 +73,8 @@ RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "0"))  # 0 = auto-size from RAM budget; >0 = explicit fixed override
 FLUSH_WORKERS = int(os.environ.get("BYBIT_FLUSH_WORKERS", "4"))
 DECISION_POLICY = "ob_event_time"
+FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
+FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
 
 
 
@@ -167,6 +169,7 @@ BYBIT_TS_BACKSTEP_CLAMP_MS = int(os.environ.get("BYBIT_TS_BACKSTEP_CLAMP_MS", "5
 BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
 ALLOW_DUPLICATE_OB_TS = _env_bool_int("BYBIT_ALLOW_DUPLICATE_OB_TS", 0)
 USE_TRADES = _env_bool_int("BYBIT_USE_TRADES", 1)
+APPEND_MISSING_WEEKS = _env_bool_int("BYBIT_APPEND_MISSING_WEEKS", 0)
 BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
 BYBIT_BAD_FRAC_ABORT = float(os.environ.get("BYBIT_BAD_FRAC_ABORT", "0.005"))
 BYBIT_BAD_ABS_ABORT = int(os.environ.get("BYBIT_BAD_ABS_ABORT", "50000"))
@@ -765,13 +768,34 @@ def build_aux_tail(fe: FeatureEngine, dt_ms: float) -> np.ndarray:
     )
 
 
-def build_four_week_pipeline_splits(weeks_in_order, week_meta_records):
-    if len(weeks_in_order) != 4:
-        raise ValueError(f"Expected exactly 4 weeks; got {len(weeks_in_order)}")
-    week1, week2, week3, week4 = weeks_in_order
+def build_pipeline_splits(
+    weeks_in_order: List[str],
+    week_metas: Dict[str, dict],
+    protocol: str,
+) -> dict:
+    if protocol == FOUR_WEEK_PROTOCOL:
+        if len(weeks_in_order) != 4:
+            raise ValueError(f"Expected exactly 4 weeks for {FOUR_WEEK_PROTOCOL}; got {len(weeks_in_order)}")
+        week1, week2, week3, week4 = weeks_in_order
+        cmssl_train_weeks = [week1]
+        cmssl_val_week = week2
+        cmssl_test_week = week3
+        rl_week = week3
+        eval_week = week4
+    elif protocol == FIVE_WEEK_PROTOCOL:
+        if len(weeks_in_order) != 5:
+            raise ValueError(f"Expected exactly 5 weeks for {FIVE_WEEK_PROTOCOL}; got {len(weeks_in_order)}")
+        week1, week2, week3, week4, week5 = weeks_in_order
+        cmssl_train_weeks = [week1, week2]
+        cmssl_val_week = week3
+        cmssl_test_week = week4
+        rl_week = week4
+        eval_week = week5
+    else:
+        raise ValueError(f"Unsupported split protocol: {protocol}")
 
     def _range_for(week_key: str) -> Tuple[int, int]:
-        week_meta = week_meta_records.get(week_key)
+        week_meta = week_metas.get(week_key)
         if not isinstance(week_meta, dict):
             raise KeyError(f"Missing week metadata for split week '{week_key}'")
         decision_range = week_meta.get("decision_ts_range")
@@ -785,31 +809,52 @@ def build_four_week_pipeline_splits(weeks_in_order, week_meta_records):
             raise ValueError(f"Invalid decision_ts_range for week '{week_key}': {start}..{end_exclusive}")
         return start, end_exclusive
 
-    w1s, w1e = _range_for(week1)
-    w2s, w2e = _range_for(week2)
-    w3s, w3e = _range_for(week3)
-    w4s, w4e = _range_for(week4)
+    train_start = _range_for(cmssl_train_weeks[0])[0]
+    train_end = _range_for(cmssl_train_weeks[-1])[1]
+    vals, vale = _range_for(cmssl_val_week)
+    tests, teste = _range_for(cmssl_test_week)
+    evals, evale = _range_for(eval_week)
 
-    span3 = max(1, w3e - w3s)
-    w3_40 = w3s + int(np.floor(0.4 * span3))
-    w3_70 = w3s + int(np.floor(0.7 * span3))
-    w3_40 = min(max(w3_40, w3s + 1), w3e - 2)
-    w3_70 = min(max(w3_70, w3_40 + 1), w3e - 1)
+    span_rl = max(1, teste - tests)
+    rl_40 = tests + int(np.floor(0.4 * span_rl))
+    rl_70 = tests + int(np.floor(0.7 * span_rl))
+    rl_40 = min(max(rl_40, tests + 1), teste - 2)
+    rl_70 = min(max(rl_70, rl_40 + 1), teste - 1)
 
     return {
-        "protocol": "four_week_cmssl_val_test_rl_eval_v2",
+        "protocol": protocol,
         "cmssl": {
-            "train": {"week": week1, "start": int(w1s), "end": int(w1e)},
-            "val": {"week": week2, "start": int(w2s), "end": int(w2e)},
-            "test": {"week": week3, "start": int(w3s), "end": int(w3e)},
+            "train": {
+                "weeks": list(cmssl_train_weeks),
+                "decision_ts_range": {"start": int(train_start), "end": int(train_end)},
+                "start": int(train_start),
+                "end": int(train_end),
+            },
+            "val": {
+                "week": cmssl_val_week,
+                "decision_ts_range": {"start": int(vals), "end": int(vale)},
+                "start": int(vals),
+                "end": int(vale),
+            },
+            "test": {
+                "week": cmssl_test_week,
+                "decision_ts_range": {"start": int(tests), "end": int(teste)},
+                "start": int(tests),
+                "end": int(teste),
+            },
         },
         "rl": {
-            "train": {"week": week3, "decision_ts_range": {"start": int(w3s), "end": int(w3_40)}},
-            "val": {"week": week3, "decision_ts_range": {"start": int(w3_40), "end": int(w3_70)}},
-            "test": {"week": week3, "decision_ts_range": {"start": int(w3_70), "end": int(w3e)}},
+            "train": {"week": rl_week, "decision_ts_range": {"start": int(tests), "end": int(rl_40)}},
+            "val": {"week": rl_week, "decision_ts_range": {"start": int(rl_40), "end": int(rl_70)}},
+            "test": {"week": rl_week, "decision_ts_range": {"start": int(rl_70), "end": int(teste)}},
         },
         "eval": {
-            "full": {"week": week4, "start": int(w4s), "end": int(w4e)},
+            "full": {
+                "week": eval_week,
+                "decision_ts_range": {"start": int(evals), "end": int(evale)},
+                "start": int(evals),
+                "end": int(evale),
+            },
         },
     }
 
@@ -2075,10 +2120,193 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
     return base
 
 
+def _resolve_chunk_path(out_root: Path, week_key: str, rel_or_abs: str) -> Path:
+    p = Path(rel_or_abs)
+    if p.is_absolute():
+        return p
+    cand1 = out_root / p
+    if cand1.exists():
+        return cand1
+    return out_root / week_key / p
+
+
+def load_reusable_week_meta(
+    out_root: str,
+    week_key: str,
+    *,
+    expected: dict,
+) -> Optional[dict]:
+    root = Path(out_root)
+    week_meta_path = root / week_key / "meta_week.json"
+    if not week_meta_path.exists():
+        return None
+
+    try:
+        meta = json.loads(week_meta_path.read_text())
+    except Exception as exc:
+        raise ValueError(f"[reuse] week={week_key} invalid meta_week.json: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise ValueError(f"[reuse] week={week_key} meta_week.json must decode to dict")
+
+    expected_meta_path = os.path.join(week_key, "meta_week.json")
+    observed_meta_path = meta.get("meta_path")
+    if observed_meta_path is not None and observed_meta_path != expected_meta_path:
+        raise ValueError(
+            f"[reuse] week={week_key} incompatible meta_path={observed_meta_path!r} expected={expected_meta_path!r}"
+        )
+
+    feature_chunks = meta.get("feature_chunks")
+    label_chunks = meta.get("label_chunks")
+    if not isinstance(feature_chunks, list) or not feature_chunks:
+        raise ValueError(f"[reuse] week={week_key} missing non-empty feature_chunks")
+    if not isinstance(label_chunks, list) or not label_chunks:
+        raise ValueError(f"[reuse] week={week_key} missing non-empty label_chunks")
+
+    for rel_path in feature_chunks:
+        if not isinstance(rel_path, str) or not rel_path:
+            raise ValueError(f"[reuse] week={week_key} invalid feature chunk path={rel_path!r}")
+        if not _resolve_chunk_path(root, week_key, rel_path).exists():
+            raise ValueError(f"[reuse] week={week_key} missing feature chunk file: {rel_path}")
+    for rel_path in label_chunks:
+        if not isinstance(rel_path, str) or not rel_path:
+            raise ValueError(f"[reuse] week={week_key} invalid label chunk path={rel_path!r}")
+        if not _resolve_chunk_path(root, week_key, rel_path).exists():
+            raise ValueError(f"[reuse] week={week_key} missing label chunk file: {rel_path}")
+
+    if int(meta.get("rows_total", 0)) <= 0:
+        raise ValueError(f"[reuse] week={week_key} rows_total must be > 0")
+    if int(meta.get("labels_total", 0)) <= 0:
+        raise ValueError(f"[reuse] week={week_key} labels_total must be > 0")
+
+    decision_range = meta.get("decision_ts_range")
+    if not isinstance(decision_range, dict):
+        raise ValueError(f"[reuse] week={week_key} missing decision_ts_range")
+    if "min" not in decision_range or "max" not in decision_range:
+        raise ValueError(f"[reuse] week={week_key} decision_ts_range must include min/max")
+    min_ts = int(decision_range["min"])
+    max_ts = int(decision_range["max"])
+    if min_ts > max_ts:
+        raise ValueError(f"[reuse] week={week_key} invalid decision_ts_range min={min_ts} max={max_ts}")
+
+    for key in (
+        "feature_schema",
+        "aux_schema",
+        "target_task",
+        "target_transform",
+        "checkpoint_schema_expected",
+        "lookback",
+        "label_dim",
+        "aux_dim",
+        "feature_names_hash",
+        "trade_history_enabled",
+        "event_stream_mode",
+    ):
+        if meta.get(key) != expected.get(key):
+            raise ValueError(
+                f"[reuse] week={week_key} incompatible field {key}: {meta.get(key)!r} != {expected.get(key)!r}"
+            )
+    if int(meta.get("feature_dim_total", -1)) != int(meta.get("feature_dim_core", -1)) + AUX_DIM:
+        raise ValueError(f"[reuse] week={week_key} feature_dim_total must equal feature_dim_core + AUX_DIM")
+
+    pca = meta.get("pca")
+    if not isinstance(pca, dict) or not bool(pca.get("applied", False)):
+        raise ValueError(f"[reuse] week={week_key} requires pca.applied=true")
+    if int(pca.get("k", -1)) != int(expected["pca_k"]):
+        raise ValueError(
+            f"[reuse] week={week_key} PCA k mismatch: {int(pca.get('k', -1))} != {int(expected['pca_k'])}"
+        )
+    print(f"[reuse] week={week_key} rows={int(meta.get('rows_total', 0))} labels={int(meta.get('labels_total', 0))}", flush=True)
+    return meta
+
+
+def build_global_meta_from_week_metas(
+    *,
+    pairs: List[WeekPair],
+    week_metas: Dict[str, dict],
+    pca_summary: dict,
+    pca_var_ratio: Optional[np.ndarray],
+    protocol: str,
+    router: Optional[FlatWeekRouter],
+    week_quality_records: Dict[str, dict],
+) -> dict:
+    ds_start, ds_end = _compute_dataset_span(pairs)
+    start_iso = ds_start.date().isoformat() if ds_start else None
+    end_iso = ds_end.date().isoformat() if ds_end else None
+    weeks_in_order = [wk for wk, _ob, _th in pairs]
+    week_row_counts = {wk: int(week_metas[wk].get("rows_total", 0)) for wk in weeks_in_order}
+    week_label_counts = {wk: int(week_metas[wk].get("labels_total", 0)) for wk in weeks_in_order}
+    total_feature_rows = int(sum(week_row_counts.values()))
+    total_labels = int(sum(week_label_counts.values()))
+    feature_dim_core = int(pca_summary["k"])
+    feature_dim_total = int(feature_dim_core + AUX_DIM)
+    label_dim = int(NUM_HORIZONS)
+    weeks_meta_paths = {wk: week_metas[wk].get("meta_path", os.path.join(wk, "meta_week.json")) for wk in weeks_in_order}
+
+    meta = {
+        "dataset_start": start_iso,
+        "dataset_end": end_iso,
+        "weeks_in_order": weeks_in_order,
+        "decision_policy": DECISION_POLICY,
+        "decision_time_basis": "ob_event_time",
+        "window_ms": 60_000,
+        "decision_stride_policy": "every_ob_event",
+        "label_delta_ms": 0,
+        "label_units": "signed_log_return_bps",
+        "feature_schema": FEATURE_SCHEMA,
+        "aux_schema": AUX_SCHEMA,
+        "target_task": TARGET_TASK,
+        "target_transform": TARGET_TRANSFORM,
+        "low_abs_trim_fraction": float(LOW_ABS_TRIM_FRACTION),
+        "high_abs_trim_fraction": float(HIGH_ABS_TRIM_FRACTION),
+        "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
+        **canonical_mode_fields(),
+        "storage_format": "flat_decision_rows_v1",
+        "lookback": int(LOOKBACK),
+        "feature_dim_total": feature_dim_total,
+        "feature_dim_core": feature_dim_core,
+        "feature_dim_core_pre_pca": int(pca_summary["feature_dim_core_pre_pca"]),
+        "feature_names_pre_pca": list(pca_summary["feature_names_pre_pca"]),
+        "feature_names_hash": str(pca_summary["feature_names_hash"]),
+        "aux_dim": int(AUX_DIM),
+        "aux_names": list(FEATURE_AUX_TAIL),
+        "dtype": "float32",
+        "ram_budget_mb": int(RAM_BUDGET),
+        "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
+        "label_dim": label_dim,
+        "horizons_ms": [int(h) for h in HORIZONS_MS],
+        "total_feature_rows": total_feature_rows,
+        "total_labels": total_labels,
+        "week_row_counts": week_row_counts,
+        "week_label_counts": week_label_counts,
+        "weeks_meta": weeks_meta_paths,
+        "data_quality_path": "_data_quality.json",
+    }
+    meta["pca"] = dict(pca_summary)
+    if pca_var_ratio is not None:
+        meta["pca"]["explained_variance_ratio"] = [float(x) for x in pca_var_ratio]
+    meta["splits"] = build_pipeline_splits(weeks_in_order, week_metas, protocol)
+    return meta
+
+
+def write_json_atomic_with_backup(path: Path, obj: dict) -> None:
+    ensure_dir(str(path.parent))
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if path.exists():
+        backup = path.with_name(f"{path.name}.bak.{ts}")
+        os.replace(path, backup)
+    tmp = path.with_name(f"{path.name}.tmp")
+    with tmp.open("w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+
 def process_all(
     pairs: List[WeekPair],
     out_root: str,
     pca_meta: dict,
+    *,
+    protocol: str,
+    append_missing_weeks: bool = False,
 ):
     """Run ingest across week pairs with ordered daily OB paths and mode-dependent TH paths (which may be empty in OB-only mode)."""
     ensure_dir(out_root)
@@ -2127,6 +2355,33 @@ def process_all(
     pre_pca_dim = int(pca_mean.shape[0])
     pca_k = int(pca_components.shape[0])
     final_feature_dim = int(pca_k + AUX_DIM)
+    weeks_in_order = [wk for wk, _ob, _th in pairs]
+    if append_missing_weeks and protocol != FIVE_WEEK_PROTOCOL:
+        raise ValueError("append_missing_weeks=True requires five-week protocol")
+    expected_reuse_fields = {
+        "feature_schema": FEATURE_SCHEMA,
+        "aux_schema": AUX_SCHEMA,
+        "target_task": TARGET_TASK,
+        "target_transform": TARGET_TRANSFORM,
+        "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
+        "lookback": int(LOOKBACK),
+        "label_dim": int(NUM_HORIZONS),
+        "aux_dim": int(AUX_DIM),
+        "feature_names_hash": str(names_hash),
+        "trade_history_enabled": canonical_mode_fields()["trade_history_enabled"],
+        "event_stream_mode": canonical_mode_fields()["event_stream_mode"],
+        "pca_k": int(pca_summary["k"]),
+    }
+    week_meta_records: Dict[str, dict] = {}
+    pairs_to_build: List[WeekPair] = []
+    for pair in pairs:
+        wk = pair[0]
+        if append_missing_weeks:
+            reusable = load_reusable_week_meta(out_root, wk, expected=expected_reuse_fields)
+            if reusable is not None:
+                week_meta_records[wk] = reusable
+                continue
+        pairs_to_build.append(pair)
 
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
@@ -2135,28 +2390,26 @@ def process_all(
     last_decision_ts_ms: Optional[int] = None
 
     F = final_feature_dim
-    router: FlatWeekRouter = None  # type: ignore
+    router: Optional[FlatWeekRouter] = None
     total_feature_rows = 0
     total_labels = 0
+    week_index = _build_week_index(pairs_to_build)
 
-    ds_start, ds_end = _compute_dataset_span(pairs)
-    start_iso = ds_start.date().isoformat() if ds_start else None
-    end_iso = ds_end.date().isoformat() if ds_end else None
-
-    week_index = _build_week_index(pairs)
-
-    print(f"[start] ingest weeks={len(pairs)} L={LOOKBACK} budget={RAM_BUDGET}MB")
+    print(
+        f"[start] ingest weeks={len(pairs)} build={len(pairs_to_build)} reuse={len(week_meta_records)} "
+        f"L={LOOKBACK} budget={RAM_BUDGET}MB"
+    )
     last_log = time.monotonic()
     next_log = last_log + 300.0
     ingest_started = time.monotonic()
     events_seen = 0
 
-    feeder = EventFeeder(pairs)
+    feeder = EventFeeder(pairs_to_build)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
     producer_thread.start()
     q = feeder.queue
 
-    week_total = len(pairs)
+    week_total = len(pairs_to_build)
     week_counter = 0
 
     while True:
@@ -2261,8 +2514,8 @@ def process_all(
                 router.add_label(lbl_week, lbl_row_idx, lbl_ts, yy.astype(np.float32, copy=False))
                 total_labels += 1
 
-        if router is not None:
-            router.close_old_writers(int(ts_ms))
+            if router is not None:
+                router.close_old_writers(int(ts_ms))
 
         now = time.monotonic()
         if now >= next_log:
@@ -2284,24 +2537,29 @@ def process_all(
     feature_dim_total = int(F)
     feature_dim_core = int(F - AUX_DIM)
     label_dim = int(NUM_HORIZONS)
-    week_meta_records = {} if router is None else dict(router.week_metas)
+    if router is not None:
+        week_meta_records.update(dict(router.week_metas))
     week_quality_records = dict(feeder.quality_by_week)
-    weeks_in_order = [wk for wk, _ob, _th in pairs]
-    week_row_counts = {wk: int(0 if router is None else router.week_rows_total.get(wk, 0)) for wk in weeks_in_order}
-    week_label_counts = {wk: int(0 if router is None else router.week_labels_total.get(wk, 0)) for wk in weeks_in_order}
-    total_feature_rows_from_weeks = sum(int(week_meta.get("rows_total", 0)) for week_meta in week_meta_records.values())
-    total_labels_from_weeks = sum(int(week_meta.get("labels_total", 0)) for week_meta in week_meta_records.values())
-    if int(total_feature_rows) != int(total_feature_rows_from_weeks):
+    if set(week_meta_records.keys()) != set(weeks_in_order):
+        missing = [wk for wk in weeks_in_order if wk not in week_meta_records]
+        raise ValueError(f"Missing week metadata for requested weeks: {missing}")
+    built_feature_rows_from_weeks = sum(
+        int(week_meta_records[wk].get("rows_total", 0)) for wk, _ob, _th in pairs_to_build if wk in week_meta_records
+    )
+    built_labels_from_weeks = sum(
+        int(week_meta_records[wk].get("labels_total", 0)) for wk, _ob, _th in pairs_to_build if wk in week_meta_records
+    )
+    if int(total_feature_rows) != int(built_feature_rows_from_weeks):
         raise ValueError(
-            "Inconsistent dataset totals: total_feature_rows "
-            f"{int(total_feature_rows)} != sum(weeks_meta.rows_total) {int(total_feature_rows_from_weeks)}"
+            "Inconsistent built totals: total_feature_rows "
+            f"{int(total_feature_rows)} != built weeks_meta.rows_total {int(built_feature_rows_from_weeks)}"
         )
-    if int(total_labels) != int(total_labels_from_weeks):
+    if int(total_labels) != int(built_labels_from_weeks):
         raise ValueError(
-            "Inconsistent dataset totals: total_labels "
-            f"{int(total_labels)} != sum(weeks_meta.labels_total) {int(total_labels_from_weeks)}"
+            "Inconsistent built totals: total_labels "
+            f"{int(total_labels)} != built weeks_meta.labels_total {int(built_labels_from_weeks)}"
         )
-    weeks_meta_paths = {wk: week_meta_records[wk].get("meta_path", os.path.join(wk, "meta_week.json")) for wk in week_meta_records.keys()}
+    weeks_meta_paths = {wk: week_meta_records[wk].get("meta_path", os.path.join(wk, "meta_week.json")) for wk in weeks_in_order}
 
     quality_week_totals: Dict[str, Dict[str, int]] = {"ob": {}, "th": {}, "merge": {}, "chain": {}}
     quality_week_tainted = 0
@@ -2335,59 +2593,28 @@ def process_all(
     }
 
     for wk in weeks_in_order:
-        if wk not in week_quality_records:
-            continue
         week_quality_path = os.path.join(out_root, wk, "data_quality.json")
-        with open(week_quality_path, "w") as f:
-            json.dump(week_quality_records[wk], f, indent=2)
+        if wk in week_quality_records:
+            with open(week_quality_path, "w") as f:
+                json.dump(week_quality_records[wk], f, indent=2)
+            continue
+        if append_missing_weeks and os.path.exists(week_quality_path):
+            try:
+                data_quality_dataset["weeks"][wk] = json.loads(Path(week_quality_path).read_text())
+            except Exception:
+                pass
 
     with open(os.path.join(out_root, "_data_quality.json"), "w") as f:
         json.dump(data_quality_dataset, f, indent=2)
-
-    meta = {
-        "dataset_start": start_iso,
-        "dataset_end": end_iso,
-        "weeks_in_order": weeks_in_order,
-        "decision_policy": DECISION_POLICY,
-        "decision_time_basis": "ob_event_time",
-        "window_ms": 60_000,
-        "decision_stride_policy": "every_ob_event",
-        "label_delta_ms": 0,
-        # Labels remain signed raw log-return bps; direction/conditional magnitude targets are derived downstream at train time.
-        "label_units": "signed_log_return_bps",
-        "feature_schema": FEATURE_SCHEMA,
-        "aux_schema": AUX_SCHEMA,
-        "target_task": TARGET_TASK,
-        "target_transform": TARGET_TRANSFORM,
-        "low_abs_trim_fraction": float(LOW_ABS_TRIM_FRACTION),
-        "high_abs_trim_fraction": float(HIGH_ABS_TRIM_FRACTION),
-        "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
-        **canonical_mode_fields(),
-        "storage_format": "flat_decision_rows_v1",
-        "lookback": int(LOOKBACK),
-        "feature_dim_total": feature_dim_total,
-        "feature_dim_core": feature_dim_core,
-        "feature_dim_core_pre_pca": int(pca_summary["feature_dim_core_pre_pca"]),
-        "feature_names_pre_pca": list(pca_summary["feature_names_pre_pca"]),
-        "feature_names_hash": str(pca_summary["feature_names_hash"]),
-        "aux_dim": int(AUX_DIM),
-        "aux_names": list(FEATURE_AUX_TAIL),
-        "dtype": "float32",
-        "ram_budget_mb": int(RAM_BUDGET),
-        "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
-        "label_dim": label_dim,  # remains NUM_HORIZONS
-        "horizons_ms": [int(h) for h in HORIZONS_MS],
-        "total_feature_rows": int(total_feature_rows),
-        "total_labels": int(total_labels),
-        "week_row_counts": week_row_counts,
-        "week_label_counts": week_label_counts,
-        "weeks_meta": weeks_meta_paths,
-        "data_quality_path": "_data_quality.json",
-    }
-    meta["pca"] = dict(pca_summary)
-    if pca_var_ratio is not None:
-        meta["pca"]["explained_variance_ratio"] = [float(x) for x in pca_var_ratio]
-    meta["splits"] = build_four_week_pipeline_splits(weeks_in_order, week_meta_records)
+    meta = build_global_meta_from_week_metas(
+        pairs=pairs,
+        week_metas=week_meta_records,
+        pca_summary=pca_summary,
+        pca_var_ratio=pca_var_ratio,
+        protocol=protocol,
+        router=router,
+        week_quality_records=week_quality_records,
+    )
     if week_meta_records:
         expected_mode = canonical_mode_fields()
         for wk in weeks_in_order:
@@ -2413,8 +2640,7 @@ def process_all(
                         f"Inconsistent ingest mode in week '{wk}': {field}={observed!r} (expected {expected!r})"
                     )
 
-    with open(os.path.join(out_root, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    write_json_atomic_with_backup(Path(out_root) / "meta.json", meta)
 
     print(
         f"[done ] dataset weeks={len(pairs)} total_rows={total_feature_rows} total_labels={total_labels} "
@@ -2484,9 +2710,9 @@ def main():
         pairs = [pair for pair in pairs if pair[0] in requested_set]
 
     pairs = _sort_pairs_by_end(pairs)
-    if len(pairs) != 4:
+    if len(pairs) not in (4, 5):
         raise ValueError(
-            f"Need exactly 4 distinct consecutive weeks of data after BYBIT_WEEKS filtering; found {len(pairs)}."
+            f"Need exactly 4 or 5 distinct consecutive weeks of data after BYBIT_WEEKS filtering; found {len(pairs)}."
         )
 
     _assert_week_order(pairs)
@@ -2505,14 +2731,31 @@ def main():
 
 
     selected_weeks = [wk for wk, _ob, _th in pairs]
-    week1, week2, week3, week4 = selected_weeks
-    print(
-        f"[split] protocol=four_week_cmssl_val_test_rl_eval_v2 cmssl.train={week1} cmssl.val={week2} cmssl.test={week3} rl={week3} eval={week4}"
-    )
+    protocol = FIVE_WEEK_PROTOCOL if len(selected_weeks) == 5 else FOUR_WEEK_PROTOCOL
+    if APPEND_MISSING_WEEKS:
+        if protocol != FIVE_WEEK_PROTOCOL:
+            raise ValueError("BYBIT_APPEND_MISSING_WEEKS=1 requires exactly 5 weeks")
+        if not PCA_USE_EXISTING:
+            raise ValueError("BYBIT_APPEND_MISSING_WEEKS=1 requires BYBIT_PCA_USE_EXISTING=1")
+
+    if protocol == FOUR_WEEK_PROTOCOL:
+        week1, week2, week3, week4 = selected_weeks
+        print(
+            f"[split] protocol={FOUR_WEEK_PROTOCOL} cmssl.train={week1} cmssl.val={week2} cmssl.test={week3} rl={week3} eval={week4}"
+        )
+        train_week_keys = [week1]
+    else:
+        week1, week2, week3, week4, week5 = selected_weeks
+        print(
+            f"[split] protocol={FIVE_WEEK_PROTOCOL} cmssl.train={week1},{week2} cmssl.val={week3} cmssl.test={week4} rl={week4} eval={week5}"
+        )
+        print(f"[append] enabled={str(bool(APPEND_MISSING_WEEKS)).lower()}")
+        train_week_keys = [week1, week2]
+
     pca_fit_meta = maybe_fit_pca_model(
         pairs,
         OUT_ROOT,
-        [week1],
+        train_week_keys,
         PCA_VAR_TARGET,
         PCA_MAX_SAMPLE_ROWS,
         PCA_BATCH_SIZE,
@@ -2520,7 +2763,13 @@ def main():
         PCA_USE_EXISTING,
     )
 
-    process_all(pairs, OUT_ROOT, pca_fit_meta)
+    process_all(
+        pairs,
+        OUT_ROOT,
+        pca_fit_meta,
+        protocol=protocol,
+        append_missing_weeks=bool(APPEND_MISSING_WEEKS),
+    )
 
 if __name__ == "__main__":
     main()
