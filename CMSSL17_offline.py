@@ -1530,8 +1530,14 @@ def train_from_offline():
     model.eval()
 
     del train_src
-    del val_fast_src
-    del val_full_src
+    if "train_sources" in locals():
+        del train_sources
+    if "ds_train_list" in locals():
+        del ds_train_list
+    if "val_fast_src" in locals():
+        del val_fast_src
+    if "val_full_src" in locals():
+        del val_full_src
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
