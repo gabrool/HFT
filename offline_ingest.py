@@ -2130,6 +2130,55 @@ def _resolve_chunk_path(out_root: Path, week_key: str, rel_or_abs: str) -> Path:
     return out_root / week_key / p
 
 
+def _iter_chunk_file_refs(chunks: list, *, kind: str) -> List[str]:
+    out: List[str] = []
+    if kind == "feature":
+        required = ("features", "ts")
+    elif kind == "label":
+        required = ("row_idx", "label_ts", "y")
+    else:
+        raise ValueError(f"Unsupported chunk kind: {kind}")
+
+    for idx, entry in enumerate(chunks):
+        if isinstance(entry, str):
+            if not entry:
+                raise ValueError(f"Empty {kind} chunk path at index {idx}")
+            out.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"Invalid {kind} chunk entry at index {idx}: expected dict, got {type(entry).__name__}"
+            )
+        files = entry.get("files")
+        if not isinstance(files, dict):
+            raise ValueError(f"Invalid {kind} chunk entry at index {idx}: missing files dict")
+        for key in required:
+            path = files.get(key)
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"Invalid {kind} chunk entry at index {idx}: missing files.{key}")
+            out.append(path)
+    return out
+
+
+def _assert_append_build_dir_safe(out_root: Path, week_key: str) -> None:
+    week_dir = out_root / week_key
+    meta_path = week_dir / "meta_week.json"
+    if not week_dir.exists():
+        return
+    if meta_path.exists():
+        raise ValueError(
+            f"Refusing to build week {week_key}: week directory already has meta_week.json. "
+            "This should have been reused or rejected, not rebuilt."
+        )
+    entries = [p for p in week_dir.iterdir() if p.name not in {".DS_Store"}]
+    if entries:
+        sample = ", ".join(p.name for p in entries[:10])
+        raise ValueError(
+            f"Refusing to build week {week_key}: directory exists but has no meta_week.json and is not empty. "
+            f"This may be a partial previous run. Move/delete it manually before append. Entries: {sample}"
+        )
+
+
 def load_reusable_week_meta(
     out_root: str,
     week_key: str,
@@ -2162,14 +2211,10 @@ def load_reusable_week_meta(
     if not isinstance(label_chunks, list) or not label_chunks:
         raise ValueError(f"[reuse] week={week_key} missing non-empty label_chunks")
 
-    for rel_path in feature_chunks:
-        if not isinstance(rel_path, str) or not rel_path:
-            raise ValueError(f"[reuse] week={week_key} invalid feature chunk path={rel_path!r}")
+    for rel_path in _iter_chunk_file_refs(feature_chunks, kind="feature"):
         if not _resolve_chunk_path(root, week_key, rel_path).exists():
             raise ValueError(f"[reuse] week={week_key} missing feature chunk file: {rel_path}")
-    for rel_path in label_chunks:
-        if not isinstance(rel_path, str) or not rel_path:
-            raise ValueError(f"[reuse] week={week_key} invalid label chunk path={rel_path!r}")
+    for rel_path in _iter_chunk_file_refs(label_chunks, kind="label"):
         if not _resolve_chunk_path(root, week_key, rel_path).exists():
             raise ValueError(f"[reuse] week={week_key} missing label chunk file: {rel_path}")
 
@@ -2289,15 +2334,65 @@ def build_global_meta_from_week_metas(
 
 
 def write_json_atomic_with_backup(path: Path, obj: dict) -> None:
+    path = Path(path)
     ensure_dir(str(path.parent))
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    if path.exists():
-        backup = path.with_name(f"{path.name}.bak.{ts}")
-        os.replace(path, backup)
-    tmp = path.with_name(f"{path.name}.tmp")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    backup = path.with_name(f"{path.name}.bak.{ts}")
     with tmp.open("w") as f:
-        json.dump(obj, f, indent=2)
+        json.dump(obj, f, indent=2, sort_keys=False)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    if path.exists():
+        backup.write_bytes(path.read_bytes())
     os.replace(tmp, path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        pass
+
+
+def _mature_with_next_week_context(
+    *,
+    pair: WeekPair,
+    week_key_to_mature: str,
+    week_decision_ts_max: int,
+    fe: FeatureEngine,
+    labeler: LabelBuilder,
+    pending_decisions: deque[Tuple[str, int, int]],
+    router: FlatWeekRouter,
+) -> Tuple[int, Optional[int], int]:
+    cutoff_ts = int(week_decision_ts_max + GRACE_MS + 1)
+    context_events = 0
+    context_last_ts: Optional[int] = None
+    matured_labels = 0
+    for event in _iter_week_merged_events(pair[0], pair[1], pair[2], week_quality=None):
+        ts_ms, feat_z, mid, is_trade, _dt_ms = fe.on_fast_event(event)
+        if is_trade:
+            continue
+        if int(ts_ms) > cutoff_ts:
+            break
+        context_events += 1
+        context_last_ts = int(ts_ms)
+        matured = labeler.on_event(int(ts_ms), float(mid))
+        if matured is None:
+            raise RuntimeError("Matured labels were not produced for OB context event")
+        for yy in matured:
+            if not pending_decisions:
+                raise RuntimeError("Context maturation produced labels but pending queue was empty")
+            lbl_week, lbl_row_idx, lbl_ts = pending_decisions.popleft()
+            router.add_label(lbl_week, lbl_row_idx, lbl_ts, yy.astype(np.float32, copy=False))
+            matured_labels += 1
+        if not pending_decisions:
+            break
+        if pending_decisions[0][0] != week_key_to_mature:
+            break
+    return context_events, context_last_ts, matured_labels
 
 
 def process_all(
@@ -2374,20 +2469,25 @@ def process_all(
     }
     week_meta_records: Dict[str, dict] = {}
     pairs_to_build: List[WeekPair] = []
+    reused_week_metas: Dict[str, dict] = {}
     for pair in pairs:
         wk = pair[0]
         if append_missing_weeks:
             reusable = load_reusable_week_meta(out_root, wk, expected=expected_reuse_fields)
             if reusable is not None:
                 week_meta_records[wk] = reusable
+                reused_week_metas[wk] = reusable
                 continue
+            _assert_append_build_dir_safe(Path(out_root), wk)
         pairs_to_build.append(pair)
+    build_week_keys = {wk for wk, _ob, _th in pairs_to_build}
 
     fe = FeatureEngine()
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
 
     pending_decisions: deque[Tuple[str, int, int]] = deque()
     last_decision_ts_ms: Optional[int] = None
+    built_week_last_decision_ts: Dict[str, int] = {}
 
     F = final_feature_dim
     router: Optional[FlatWeekRouter] = None
@@ -2395,6 +2495,11 @@ def process_all(
     total_labels = 0
     week_index = _build_week_index(pairs_to_build)
 
+    print(f"[append] requested_weeks={len(pairs)} reused={len(reused_week_metas)} build={len(pairs_to_build)}", flush=True)
+    for wk in reused_week_metas:
+        print(f"[reuse] week={wk}", flush=True)
+    for wk, _ob, _th in pairs_to_build:
+        print(f"[build] week={wk}", flush=True)
     print(
         f"[start] ingest weeks={len(pairs)} build={len(pairs_to_build)} reuse={len(week_meta_records)} "
         f"L={LOOKBACK} budget={RAM_BUDGET}MB"
@@ -2501,6 +2606,7 @@ def process_all(
                 pending_decisions.append((week_key, row_idx, int(ts_ms)))
                 labeler.on_decision(int(ts_ms))
                 total_feature_rows += 1
+            built_week_last_decision_ts[week_key] = int(ts_ms)
 
             matured = labeler.on_event(int(ts_ms), float(mid))
             last_decision_ts_ms = int(ts_ms)
@@ -2530,6 +2636,39 @@ def process_all(
             next_log = now + 300.0
 
     producer_thread.join()
+
+    if append_missing_weeks and router is not None:
+        for idx, pair in enumerate(pairs):
+            wk = pair[0]
+            if wk not in build_week_keys:
+                continue
+            next_pair = pairs[idx + 1] if (idx + 1) < len(pairs) else None
+            if next_pair is None or next_pair[0] not in reused_week_metas:
+                continue
+            if wk not in built_week_last_decision_ts:
+                continue
+            if not pending_decisions:
+                continue
+            if pending_decisions[0][0] != wk:
+                continue
+            print(
+                f"[append-context] week={wk} next={next_pair[0]} mode=label_maturation_only max_ms={GRACE_MS}",
+                flush=True,
+            )
+            context_events, context_last_ts, matured_labels = _mature_with_next_week_context(
+                pair=next_pair,
+                week_key_to_mature=wk,
+                week_decision_ts_max=int(built_week_last_decision_ts[wk]),
+                fe=fe,
+                labeler=labeler,
+                pending_decisions=pending_decisions,
+                router=router,
+            )
+            print(
+                f"[append-context] done week={wk} context_events={context_events} "
+                f"context_last_ts={context_last_ts} matured_labels={matured_labels}",
+                flush=True,
+            )
 
     if router is not None:
         router.flush_all()
