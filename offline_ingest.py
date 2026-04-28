@@ -2664,6 +2664,7 @@ def process_all(
                 pending_decisions=pending_decisions,
                 router=router,
             )
+            total_labels += int(matured_labels)
             print(
                 f"[append-context] done week={wk} context_events={context_events} "
                 f"context_last_ts={context_last_ts} matured_labels={matured_labels}",
