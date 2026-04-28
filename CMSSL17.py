@@ -496,7 +496,7 @@ MAG_SQRT_EPS = 1e-6
 DIR_LOSS_WEIGHT = 1.00
 MAG_LOSS_WEIGHT = 0.75
 MAG_CORR_LOSS_WEIGHT = 0.05
-SINGLE_WEEK_PATIENCE = 3
+SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the PCA/core feature vector.
 # These correspond to:
 # [log_dt_decision_ms, log_events_1000ms, log_events_3000ms,
