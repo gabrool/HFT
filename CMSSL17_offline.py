@@ -61,6 +61,8 @@ EXPECTED_DECISION_POLICY = "ob_event_time"
 FAST_VAL_MAX_ROWS = 200_000
 FULL_VAL_EVERY = 5
 TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "10"))
+FEATURE_STORAGE_DTYPE = torch.bfloat16
+FEATURE_STORAGE_DTYPE_NAME = "bf16"
 if TRAIN_ROW_STRIDE < 1:
     raise ValueError(f"BYBIT_TRAIN_ROW_STRIDE must be >= 1, got {TRAIN_ROW_STRIDE}")
 
@@ -509,9 +511,14 @@ class GPUWindowBatchSource:
         self.num_horizons = int(ds.y.shape[1]) if ds.y.ndim == 2 else NUM_HORIZONS
 
         features_np = ds.stores[0].contiguous_features()
-        self.features = torch.from_numpy(features_np).to(device=device, dtype=torch.float32, non_blocking=False)
-        if self.features.dtype != torch.float32:
-            raise ValueError(f"Expected float32 features, got {self.features.dtype}")
+        features_np = np.ascontiguousarray(features_np, dtype=np.float32)
+        self.features = torch.from_numpy(features_np).to(
+            device=device,
+            dtype=FEATURE_STORAGE_DTYPE,
+            non_blocking=False,
+        )
+        if self.features.dtype != FEATURE_STORAGE_DTYPE:
+            raise ValueError(f"Expected {FEATURE_STORAGE_DTYPE_NAME} features, got {self.features.dtype}")
         self.row_idx = torch.from_numpy(ds.row_idx.astype(np.int64, copy=False)).to(device=device)
         self.y = torch.from_numpy(ds.y.astype(np.float32, copy=False)).to(device=device)
         self.offsets = torch.arange(self.lookback - 1, -1, -1, device=device, dtype=torch.long)
@@ -661,12 +668,14 @@ class CPUWindowBatchSource:
 
         features_np = ds.stores[0].contiguous_features()
         features_np = np.ascontiguousarray(features_np, dtype=np.float32)
-        features_cpu = torch.from_numpy(features_np)
+
+        features_cpu = torch.from_numpy(features_np).to(dtype=FEATURE_STORAGE_DTYPE)
         if self.pin_memory:
             features_cpu = features_cpu.pin_memory()
+
         self.features = features_cpu
-        if self.features.dtype != torch.float32:
-            raise ValueError(f"Expected float32 features, got {self.features.dtype}")
+        if self.features.dtype != FEATURE_STORAGE_DTYPE:
+            raise ValueError(f"Expected {FEATURE_STORAGE_DTYPE_NAME} features, got {self.features.dtype}")
 
         row_idx_cpu = torch.from_numpy(ds.row_idx.astype(np.int64, copy=False))
         y_cpu = torch.from_numpy(ds.y.astype(np.float32, copy=False))
@@ -1204,12 +1213,12 @@ def train_from_offline():
     print(
         f"[gpu_data] train rows={train_src.n_rows} train_row_stride={train_src.row_stride} "
         f"effective_rows_nominal={train_src.effective_rows_nominal} "
-        f"feature_shape={train_src.feature_shape} "
+        f"feature_shape={train_src.feature_shape} feature_dtype={train_src.features.dtype} "
         f"feature_gb={train_src.feature_gb:.3f} label_index_gb={train_src.label_index_gb:.3f}"
     )
     print(
         f"[cpu_val_data] val_full rows={val_full_src.n_rows} row_stride={val_full_src.row_stride} "
-        f"feature_shape={val_full_src.feature_shape} "
+        f"feature_shape={val_full_src.feature_shape} feature_dtype={val_full_src.features.dtype} "
         f"feature_gb_cpu={val_full_src.feature_gb:.3f} label_index_gb_cpu={val_full_src.label_index_gb:.3f} "
         f"pin_memory={val_full_src.pin_memory}"
     )
@@ -1366,6 +1375,7 @@ def train_from_offline():
                     'primary_metric': PRIMARY_METRIC,
                     'primary_metric_horizon_ms': PRIMARY_METRIC_HORIZON_MS,
                     'primary_dir_bal_acc_guard': PRIMARY_DIR_BAL_ACC_GUARD,
+                    'feature_storage_dtype': FEATURE_STORAGE_DTYPE_NAME,
                 },
                 'model_output_schema': MODEL_OUTPUT_SCHEMA,
                 'best_primary_metric': best,
@@ -1426,7 +1436,7 @@ def train_from_offline():
     )
     print(
         f"[cpu_test_data] test_full rows={test_full_src.n_rows} row_stride={test_full_src.row_stride} "
-        f"feature_shape={test_full_src.feature_shape} "
+        f"feature_shape={test_full_src.feature_shape} feature_dtype={test_full_src.features.dtype} "
         f"feature_gb_cpu={test_full_src.feature_gb:.3f} label_index_gb_cpu={test_full_src.label_index_gb:.3f} "
         f"pin_memory={test_full_src.pin_memory}"
     )
