@@ -481,8 +481,8 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v6_fast_trade_obnorm"
-AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v2"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-stage4-v4"
+AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v3_no_1s"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-stage4-v5-aux6-pca506"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
@@ -499,13 +499,11 @@ MAG_CORR_LOSS_WEIGHT = 0.05
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the PCA/core feature vector.
 # These correspond to:
-# [log_dt_decision_ms, log_events_1000ms, log_events_3000ms,
-#  log_events_7500ms, log_events_15000ms, log_events_30000ms,
-#  log_events_60000ms]
-AUX_DIM        = 7
+# [log_dt_decision_ms, log_events_3000ms, log_events_7500ms,
+#  log_events_15000ms, log_events_30000ms, log_events_60000ms]
+AUX_DIM        = 6
 FEATURE_AUX_TAIL = (
     "log_dt_decision_ms",
-    "log_events_1000ms",
     "log_events_3000ms",
     "log_events_7500ms",
     "log_events_15000ms",
