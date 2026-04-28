@@ -58,6 +58,9 @@ CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
+FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
+FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
+SUPPORTED_PROTOCOLS = {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}
 FAST_VAL_MAX_ROWS = 200_000
 FULL_VAL_EVERY = 5
 TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "10"))
@@ -68,7 +71,7 @@ if TRAIN_ROW_STRIDE < 1:
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
-def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
+def require_supported_pipeline_splits(meta: dict, out_root: Path) -> dict:
     if "splits" not in meta:
         raise KeyError(
             "meta.json missing required key 'splits'. Run offline_ingest to generate offline dataset metadata."
@@ -80,8 +83,8 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
     if "weeks_in_order" not in meta:
         raise KeyError("meta.json missing required key 'weeks_in_order'. Rerun offline_ingest.")
     weeks_in_order = meta["weeks_in_order"]
-    if not isinstance(weeks_in_order, list) or len(weeks_in_order) != 4 or not all(isinstance(w, str) and w for w in weeks_in_order):
-        raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries. Rerun offline_ingest.")
+    if not isinstance(weeks_in_order, list) or len(weeks_in_order) not in (4, 5) or not all(isinstance(w, str) and w for w in weeks_in_order):
+        raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 or 5 entries. Rerun offline_ingest.")
 
     decision_time_basis = meta.get("decision_time_basis")
     if decision_time_basis != EXPECTED_DECISION_TIME_BASIS:
@@ -101,9 +104,10 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
                 "Rerun offline_ingest to regenerate metadata with event-time decisions enabled."
             )
 
-    if splits.get("protocol") != "four_week_cmssl_val_test_rl_eval_v2":
+    protocol = splits.get("protocol")
+    if protocol not in SUPPORTED_PROTOCOLS:
         raise ValueError(
-            "meta['splits']['protocol'] must be 'four_week_cmssl_val_test_rl_eval_v2'. Rerun offline_ingest."
+            f"meta['splits']['protocol'] must be one of {sorted(SUPPORTED_PROTOCOLS)}. Rerun offline_ingest."
         )
 
     known_weeks = set(weeks_in_order)
@@ -201,7 +205,7 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
         "eval.full": ("eval", "full", False),
     }
 
-    normalized = {"protocol": splits["protocol"]}
+    normalized = {"protocol": protocol}
     for section in ("cmssl", "rl", "eval"):
         sec = splits.get(section)
         if not isinstance(sec, dict):
@@ -211,17 +215,30 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
     for label, (section, name, require_range) in required_entries.items():
         normalized[section][name] = _normalize_split_entry(label, splits[section].get(name), require_range=require_range)
 
-    week1, week2, week3, week4 = weeks_in_order
-    if normalized["cmssl"]["train"]["weeks"] != [week1]:
-        raise ValueError("meta['splits']['cmssl']['train'] must reference weeks_in_order[0].")
-    if normalized["cmssl"]["val"]["weeks"] != [week2]:
-        raise ValueError("meta['splits']['cmssl']['val'] must reference weeks_in_order[1].")
-    if normalized["cmssl"]["test"]["weeks"] != [week3]:
-        raise ValueError("meta['splits']['cmssl']['test'] must reference weeks_in_order[2].")
-    if any(normalized["rl"][name]["weeks"] != [week3] for name in ("train", "val", "test")):
-        raise ValueError("meta['splits']['rl'] train/val/test must all reference weeks_in_order[2].")
-    if normalized["eval"]["full"]["weeks"] != [week4]:
-        raise ValueError("meta['splits']['eval']['full'] must reference weeks_in_order[3].")
+    if protocol == FOUR_WEEK_PROTOCOL:
+        week1, week2, week3, week4 = weeks_in_order
+        if normalized["cmssl"]["train"]["weeks"] != [week1]:
+            raise ValueError("meta['splits']['cmssl']['train'] must reference weeks_in_order[0].")
+        if normalized["cmssl"]["val"]["weeks"] != [week2]:
+            raise ValueError("meta['splits']['cmssl']['val'] must reference weeks_in_order[1].")
+        if normalized["cmssl"]["test"]["weeks"] != [week3]:
+            raise ValueError("meta['splits']['cmssl']['test'] must reference weeks_in_order[2].")
+        if any(normalized["rl"][name]["weeks"] != [week3] for name in ("train", "val", "test")):
+            raise ValueError("meta['splits']['rl'] train/val/test must all reference weeks_in_order[2].")
+        if normalized["eval"]["full"]["weeks"] != [week4]:
+            raise ValueError("meta['splits']['eval']['full'] must reference weeks_in_order[3].")
+    elif protocol == FIVE_WEEK_PROTOCOL:
+        week1, week2, week3, week4, week5 = weeks_in_order
+        if normalized["cmssl"]["train"]["weeks"] != [week1, week2]:
+            raise ValueError("meta['splits']['cmssl']['train'] must reference weeks_in_order[0:2].")
+        if normalized["cmssl"]["val"]["weeks"] != [week3]:
+            raise ValueError("meta['splits']['cmssl']['val'] must reference weeks_in_order[2].")
+        if normalized["cmssl"]["test"]["weeks"] != [week4]:
+            raise ValueError("meta['splits']['cmssl']['test'] must reference weeks_in_order[3].")
+        if any(normalized["rl"][name]["weeks"] != [week4] for name in ("train", "val", "test")):
+            raise ValueError("meta['splits']['rl'] train/val/test must all reference weeks_in_order[3].")
+        if normalized["eval"]["full"]["weeks"] != [week5]:
+            raise ValueError("meta['splits']['eval']['full'] must reference weeks_in_order[4].")
 
     rl_train = normalized["rl"]["train"]
     rl_val = normalized["rl"]["val"]
@@ -236,9 +253,31 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
         raise ValueError("meta['splits']['eval']['full'] must reference at least one week.")
 
     return {
+        "protocol": protocol,
         "splits": normalized,
         "weeks_in_order": weeks_in_order,
     }
+
+
+def make_single_week_split_from_meta(
+    *,
+    out_root: Path,
+    global_meta: dict,
+    week_key: str,
+) -> dict:
+    weeks_meta = global_meta.get("weeks_meta", {})
+    rel_path = weeks_meta.get(week_key)
+    if not isinstance(rel_path, str) or not rel_path:
+        raise KeyError(f"weeks_meta is missing path for week '{week_key}'")
+    week_meta = json.loads((out_root / rel_path).read_text())
+    decision_range = week_meta.get("decision_ts_range")
+    if not isinstance(decision_range, dict) or "min" not in decision_range or "max" not in decision_range:
+        raise KeyError(f"Week '{week_key}' metadata missing decision_ts_range min/max")
+    start = int(decision_range["min"])
+    end = int(decision_range["max"]) + 1
+    if start >= end:
+        raise ValueError(f"Week '{week_key}' has invalid decision_ts_range: start={start}, end={end}")
+    return {"weeks": [week_key], "start": start, "end": end}
 
 
 def _label_dim_error(source: str, observed: Any) -> ValueError:
@@ -403,7 +442,7 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
-    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','ranking_schema')
+    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','split_protocol','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','ranking_schema')
     return all(cached_meta.get(k)==current_meta.get(k) for k in keys)
 
 
@@ -809,6 +848,41 @@ class CPUWindowBatchSource:
             yield x, y_raw
 
 
+class MultiWeekTrainBatchSource:
+    def __init__(self, sources: List[GPUWindowBatchSource], seed: int = 12345):
+        if not sources:
+            raise ValueError("MultiWeekTrainBatchSource requires at least one source")
+        self.sources = list(sources)
+        self.seed = int(seed)
+        self.n_rows = sum(src.n_rows for src in self.sources)
+        self.effective_rows_nominal = sum(src.effective_rows_nominal for src in self.sources)
+        self.batch_size = self.sources[0].batch_size
+        for src in self.sources:
+            if src.batch_size != self.batch_size:
+                raise ValueError("All train sources must use the same batch size")
+
+    def __len__(self) -> int:
+        return sum(len(src) for src in self.sources)
+
+    def iter_epoch(self, epoch: int):
+        rng = np.random.default_rng(self.seed + int(epoch))
+        source_order = []
+        for i, src in enumerate(self.sources):
+            source_order.extend([i] * len(src))
+        source_order = np.asarray(source_order, dtype=np.int64)
+        rng.shuffle(source_order)
+
+        iters = [src.iter_epoch(epoch) for src in self.sources]
+        exhausted = [False] * len(self.sources)
+        for i in source_order.tolist():
+            if exhausted[i]:
+                continue
+            try:
+                yield next(iters[i])
+            except StopIteration:
+                exhausted[i] = True
+
+
 class LossEmaState:
     def __init__(self, decay: float):
         self.decay = float(decay)
@@ -1138,21 +1212,37 @@ def train_from_offline():
     )
     trade_history_enabled = meta.get('trade_history_enabled')
     event_stream_mode = meta.get('event_stream_mode')
-    splits = require_four_week_pipeline_splits(meta, out_root)
+    split_info = require_supported_pipeline_splits(meta, out_root)
+    protocol = split_info["protocol"]
+    splits = split_info['splits']
 
-    cmssl_train = splits['splits']['cmssl']['train']
-    cmssl_val = splits['splits']['cmssl']['val']
-    cmssl_test = splits['splits']['cmssl']['test']
-
-    ds_train = build_dataset_from_split(str(out_root), cmssl_train)
+    cmssl_train = splits['cmssl']['train']
+    cmssl_val = splits['cmssl']['val']
+    cmssl_test = splits['cmssl']['test']
+    train_week_keys = list(cmssl_train["weeks"])
+    print(
+        f"[split] protocol={protocol} cmssl.train={','.join(train_week_keys)} "
+        f"cmssl.val={cmssl_val['weeks']} cmssl.test={cmssl_test['weeks']}",
+        flush=True,
+    )
+    train_split_entries = [
+        make_single_week_split_from_meta(out_root=out_root, global_meta=meta, week_key=wk)
+        for wk in train_week_keys
+    ]
+    ds_train_list = [build_dataset_from_split(str(out_root), entry) for entry in train_split_entries]
     ds_val = build_dataset_from_split(str(out_root), cmssl_val)
     ds_test = build_dataset_from_split(str(out_root), cmssl_test)
     F_total = int(meta.get("feature_dim_total", 0))
-    if F_total != int(ds_train.feature_dim_total):
-        raise ValueError(f"Feature dimension mismatch: meta={F_total}, train_dataset={int(ds_train.feature_dim_total)}")
-    if int(ds_train.lookback) != int(LOOKBACK):
-        raise ValueError(f"LOOKBACK mismatch: config={LOOKBACK}, train_dataset={int(ds_train.lookback)}")
-    for split_name, ds in (("train", ds_train), ("val", ds_val), ("test", ds_test)):
+    for i, ds_train in enumerate(ds_train_list):
+        if F_total != int(ds_train.feature_dim_total):
+            raise ValueError(f"Feature dimension mismatch: meta={F_total}, train_dataset={int(ds_train.feature_dim_total)}")
+        if int(ds_train.lookback) != int(LOOKBACK):
+            raise ValueError(f"LOOKBACK mismatch: config={LOOKBACK}, train_dataset={int(ds_train.lookback)}")
+    for split_name, ds in (
+        *[(f"train[{i}]/{train_week_keys[i]}", ds_train_i) for i, ds_train_i in enumerate(ds_train_list)],
+        ("val", ds_val),
+        ("test", ds_test),
+    ):
         if len(ds.stores) != 1:
             raise ValueError(f"{split_name} split must have exactly one store/week, got {len(ds.stores)}")
         if ds.week_ids.size and not np.all(ds.week_ids == 0):
@@ -1162,7 +1252,8 @@ def train_from_offline():
                 f"{split_name} split has rows without full history: min_row_idx={int(ds.row_idx.min())}, lookback={LOOKBACK}"
             )
 
-    tr_start,tr_end=int(cmssl_train['start']),int(cmssl_train['end'])
+    tr_start = int(min(entry["start"] for entry in train_split_entries))
+    tr_end = int(max(entry["end"] for entry in train_split_entries))
     va_start,va_end=int(cmssl_val['start']),int(cmssl_val['end'])
     te_start,te_end=int(cmssl_test['start']),int(cmssl_test['end'])
 
@@ -1170,7 +1261,7 @@ def train_from_offline():
     cache_meta={
         'low_abs_trim_fraction': float(LOW_ABS_TRIM_FRACTION),
         'high_abs_trim_fraction': float(HIGH_ABS_TRIM_FRACTION),
-        'horizons_ms':[int(h) for h in HORIZONS_MS], 'train_week_keys': list(cmssl_train['weeks']),
+        'horizons_ms':[int(h) for h in HORIZONS_MS], 'split_protocol': protocol, 'train_week_keys': list(train_week_keys),
         'train_ts_start': int(tr_start), 'train_ts_end': int(tr_end), 'decision_time_basis': EXPECTED_DECISION_TIME_BASIS,
         'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
         'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK,
@@ -1180,11 +1271,11 @@ def train_from_offline():
     cached=load_stats_cache(cache_path); stats=None
     if cached and cache_matches(cached[1], cache_meta): stats=cached[0]
     if stats is None:
-        y_train=np.asarray(ds_train.y, dtype=np.float32)
+        y_train=np.concatenate([np.asarray(ds.y, dtype=np.float32) for ds in ds_train_list], axis=0)
         stats=compute_signed_raw_stats(y_train)
         save_stats_cache(cache_path,stats,cache_meta)
     else:
-        y_train = np.asarray(ds_train.y, dtype=np.float32)
+        y_train = np.concatenate([np.asarray(ds.y, dtype=np.float32) for ds in ds_train_list], axis=0)
     dir_pos_w, dir_neg_w = compute_dir_class_weights_from_train_labels(
         y_train,
         abs_lo=stats["abs_lo_raw_bps"],
@@ -1193,14 +1284,21 @@ def train_from_offline():
     )
     print(f"[train_stats] dir_pos_w={dir_pos_w.tolist()} dir_neg_w={dir_neg_w.tolist()}")
 
-    train_src = GPUWindowBatchSource(
-        ds_train,
-        device,
-        BATCH_SIZE,
-        shuffle=True,
-        drop_last=True,
-        row_stride=TRAIN_ROW_STRIDE,
-    )
+    train_sources = [
+        GPUWindowBatchSource(
+            ds,
+            device,
+            BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,
+            row_stride=TRAIN_ROW_STRIDE,
+        )
+        for ds in ds_train_list
+    ]
+    if len(train_sources) == 1:
+        train_src = train_sources[0]
+    else:
+        train_src = MultiWeekTrainBatchSource(train_sources)
     val_full_src = CPUWindowBatchSource(
         ds_val,
         device,
@@ -1210,12 +1308,20 @@ def train_from_offline():
         row_stride=1,
     )
     val_fast_src = val_full_src.make_evenly_spaced_subset(FAST_VAL_MAX_ROWS)
-    print(
-        f"[gpu_data] train rows={train_src.n_rows} train_row_stride={train_src.row_stride} "
-        f"effective_rows_nominal={train_src.effective_rows_nominal} "
-        f"feature_shape={train_src.feature_shape} feature_dtype={train_src.features.dtype} "
-        f"feature_gb={train_src.feature_gb:.3f} label_index_gb={train_src.label_index_gb:.3f}"
-    )
+    for i, src in enumerate(train_sources):
+        print(
+            f"[gpu_data] train_week[{i}]={train_week_keys[i]} rows={src.n_rows} "
+            f"train_row_stride={src.row_stride} effective_rows_nominal={src.effective_rows_nominal} "
+            f"feature_shape={src.feature_shape} feature_dtype={src.features.dtype} "
+            f"feature_gb={src.feature_gb:.3f} label_index_gb={src.label_index_gb:.3f}",
+            flush=True,
+        )
+    if len(train_sources) > 1:
+        print(
+            f"[multi_train] weeks={len(train_sources)} rows={train_src.n_rows} "
+            f"effective_rows_nominal={train_src.effective_rows_nominal} batches={len(train_src)}",
+            flush=True,
+        )
     print(
         f"[cpu_val_data] val_full rows={val_full_src.n_rows} row_stride={val_full_src.row_stride} "
         f"feature_shape={val_full_src.feature_shape} feature_dtype={val_full_src.features.dtype} "
@@ -1239,7 +1345,7 @@ def train_from_offline():
     primary_metric_mode=get_primary_metric_mode()
     best=-float('inf') if primary_metric_mode=='max' else float('inf')
     no_imp = 0
-    early_stop_patience = SINGLE_WEEK_PATIENCE if len(cmssl_train['weeks']) <= 1 else PATIENCE
+    early_stop_patience = SINGLE_WEEK_PATIENCE if len(train_week_keys) <= 1 else PATIENCE
 
     abs_lo_t=torch.tensor(stats['abs_lo_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
     abs_hi_t=torch.tensor(stats['abs_hi_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
@@ -1376,6 +1482,9 @@ def train_from_offline():
                     'primary_metric_horizon_ms': PRIMARY_METRIC_HORIZON_MS,
                     'primary_dir_bal_acc_guard': PRIMARY_DIR_BAL_ACC_GUARD,
                     'feature_storage_dtype': FEATURE_STORAGE_DTYPE_NAME,
+                    'split_protocol': protocol,
+                    'train_week_keys': list(train_week_keys),
+                    'train_row_stride': int(TRAIN_ROW_STRIDE),
                 },
                 'model_output_schema': MODEL_OUTPUT_SCHEMA,
                 'best_primary_metric': best,
