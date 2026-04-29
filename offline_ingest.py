@@ -1399,8 +1399,24 @@ class FlatWeekRouter:
             _start_ms, end_ms = self.week_bounds[wk]
             if end_ms + GRACE_MS < watermark_ms:
                 to_close.append(wk)
+
+        if not to_close:
+            return
+
         for wk in to_close:
             self._close_week_writers(wk)
+
+        # _close_week_writers() flushes writers, which enqueues chunk write jobs.
+        # meta_week.json must only be built after those queued writes have completed,
+        # otherwise metadata could reference files still being written.
+        self._check_writer_exception()
+        self.flush_queue.join()
+        self._check_writer_exception()
+
+        # Build the exact same meta_week.json files that flush_all() would build,
+        # but as soon as completed weeks are safely closed. This makes completed
+        # weeks reusable after a later crash.
+        self._finalize_closed_weeks()
 
     def flush_all(self) -> None:
         for wk in sorted(set(self.feature_writers.keys()) | set(self.label_writers.keys())):
