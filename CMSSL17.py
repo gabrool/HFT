@@ -465,8 +465,8 @@ def coerce_ts_ms(value: Union[int, float, str]) -> int:
 LOOKBACK        = 600        # canonical event-time token lookback
 WINDOW_MS       = 60_000     # canonical rolling window span (60s)
 PAD_DT_FOR_LEFT = 0.0
-BATCH_SIZE      = 128
-DMODEL          = 2048
+BATCH_SIZE      = 256
+DMODEL          = 1024
 MAMBA_LAYERS    = 2
 CONV_KERNELS    = [3,3,5,5,7,7]
 DFF_CONV        = 2 * DMODEL
@@ -609,7 +609,7 @@ SPREAD_DEPTH_REGIME_WINDOWS_MS = (
 BOOK_DEPTH_FEATURE_LEVELS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 100)
 MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
 
-NUM_HEADS       = 32
+NUM_HEADS       = 16
 # Loss mixing (fixed lambdas), with EMA normalization per loss
 EMA_DECAY       = 0.99
 
