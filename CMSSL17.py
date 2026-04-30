@@ -854,7 +854,7 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         self.patch_count = (seq_len - patch_size) // stride + 1
         self.patch_size = patch_size
         self.d_model_internal = max(4, d_model // in_feats)
-        self.d_ff_internal = max(2 * self.d_model_internal, 4)
+        self.d_ff_internal = max(8 * self.d_model_internal, 16)
         assert self.d_model_internal >= 1, "d_model_internal must be >= 1"
         assert self.d_ff_internal >= 2 * self.d_model_internal, "d_ff_internal must be >= 2 * d_model_internal"
         self.output_linear = nn.Linear(patch_size, self.d_model_internal)
