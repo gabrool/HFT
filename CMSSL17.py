@@ -846,6 +846,66 @@ class ConvEncoder(nn.Module):
             output = mod(output)
         return output
 
+class FeatureReliabilityGate(nn.Module):
+    """
+    Dynamic per-feature reliability gate with a static learned per-feature prior.
+
+    Input:
+        z: [B, L, F, C]
+           B = batch
+           L = patch_count
+           F = in_feats
+           C = d_model_internal
+
+    Output:
+        gated_z: same shape as z
+    """
+
+    def __init__(self, in_feats: int, d_internal: int, dropout: float = 0.05, init_keep_prob: float = 0.90):
+        super().__init__()
+        self.in_feats = int(in_feats)
+        self.d_internal = int(d_internal)
+        self.init_keep_prob = float(init_keep_prob)
+
+        hidden = max(8, 2 * d_internal)
+        self.norm = nn.LayerNorm(d_internal)
+        self.dynamic = nn.Sequential(
+            nn.Linear(d_internal, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self.feature_prior_logit = nn.Parameter(torch.empty(in_feats))
+
+        prior_init = math.log(init_keep_prob / (1.0 - init_keep_prob))
+        nn.init.zeros_(self.dynamic[-1].weight)
+        nn.init.zeros_(self.dynamic[-1].bias)
+        nn.init.constant_(self.feature_prior_logit, prior_init)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        assert z.ndim == 4
+        _, _, F, C = z.shape
+        assert F == self.in_feats
+        assert C == self.d_internal
+
+        dyn = self.dynamic(self.norm(z))  # [B, L, F, 1]
+        prior = self.feature_prior_logit.view(1, 1, F, 1).to(dtype=dyn.dtype, device=dyn.device)
+        gate = torch.sigmoid(dyn + prior)  # [B, L, F, 1]
+        multiplier = gate / self.init_keep_prob
+        return z * multiplier
+
+    @torch.no_grad()
+    def gate_stats(self, z: torch.Tensor) -> dict:
+        dyn = self.dynamic(self.norm(z))
+        prior = self.feature_prior_logit.view(1, 1, self.in_feats, 1).to(dtype=dyn.dtype, device=dyn.device)
+        gate = torch.sigmoid(dyn + prior)
+        return {
+            "mean": float(gate.mean().detach().cpu()),
+            "std": float(gate.std(unbiased=False).detach().cpu()),
+            "min": float(gate.min().detach().cpu()),
+            "max": float(gate.max().detach().cpu()),
+        }
+
 class ConvTimeNetFeatureExtractor(nn.Module):
     def __init__(self, in_feats, seq_len, d_model, dw_ks, n_layers, d_ff=256, dropout=0.1, act='gelu', 
                  enable_res_param=True, norm='batch', re_param=True, re_param_kernel=3, patch_size=2, stride=1):
@@ -860,6 +920,12 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         self.output_linear = nn.Linear(patch_size, self.d_model_internal)
         self.encoder = ConvEncoder(d_model=self.d_model_internal, d_ff=self.d_ff_internal, kernel_size=dw_ks, dropout=dropout, activation=act,
                                    n_layers=n_layers, enable_res_param=enable_res_param, norm=norm, re_param=re_param, small_ks=re_param_kernel)
+        self.feature_gate = FeatureReliabilityGate(
+            in_feats=in_feats,
+            d_internal=self.d_model_internal,
+            dropout=0.05,
+            init_keep_prob=0.90,
+        )
         self.final_proj = nn.Linear(self.d_model_internal * in_feats, d_model)
     def forward(self, x):
         out_patch = self.depatch(x).contiguous()  # [B, feats, patch_count, patch_size]
@@ -872,11 +938,17 @@ class ConvTimeNetFeatureExtractor(nn.Module):
     
         out = self.encoder(u)
         out = out.permute(0, 2, 1).contiguous()  # [B * feats, patch_count, d_model_internal]
-    
-        out = out.reshape(B, out.shape[0] // B, out.shape[1], self.d_model_internal)
-        out = out.permute(0, 2, 3, 1).contiguous()  # [B, patch_count, d_model_internal, feats]
-    
-        out = out.reshape(B, self.depatch.patch_count, self.d_model_internal * out.shape[3]).contiguous()
+        assert out.shape[0] % B == 0
+        feats = out.shape[0] // B
+        assert feats == self.depatch.in_feats
+        assert out.shape[1] == self.depatch.patch_count
+        assert out.shape[2] == self.d_model_internal
+
+        out = out.reshape(B, feats, self.depatch.patch_count, self.d_model_internal)
+        out = out.permute(0, 2, 1, 3).contiguous()  # [B, patch_count, feats, d_model_internal]
+        out = self.feature_gate(out)  # [B, patch_count, feats, d_model_internal]
+
+        out = out.reshape(B, self.depatch.patch_count, feats * self.d_model_internal).contiguous()
         out = self.final_proj(out).contiguous()  # [B, patch_count, d_model]
         return out
 
