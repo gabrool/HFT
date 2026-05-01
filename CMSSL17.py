@@ -926,7 +926,17 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             dropout=0.05,
             init_keep_prob=0.90,
         )
-        self.final_proj = nn.Linear(self.d_model_internal * in_feats, d_model)
+        final_in_dim = self.d_model_internal * in_feats
+        # Post-gate nonlinear cross-feature mixer.
+        # Feature streams have already been temporally encoded and reliability-gated;
+        # this MLP mixes gated feature channels before projecting to d_model tokens.
+        self.final_proj = nn.Sequential(
+            nn.LayerNorm(final_in_dim),
+            nn.Linear(final_in_dim, final_in_dim),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(final_in_dim, d_model),
+        )
     def forward(self, x):
         out_patch = self.depatch(x).contiguous()  # [B, feats, patch_count, patch_size]
         out = self.output_linear(out_patch).contiguous()  # [B, feats, patch_count, d_model_internal]
