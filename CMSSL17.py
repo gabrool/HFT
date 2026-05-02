@@ -1009,7 +1009,7 @@ class GatedPooling(nn.Module):
 class TaskTokenDecoder(nn.Module):
     """Lightweight task-specific temporal refinement block over shared Mamba token states."""
 
-    def __init__(self, dim: int, kernel_size: int = 5, ff_mult: int = 4, dropout: float = 0.1):
+    def __init__(self, dim: int, kernel_size: int = 5, ff_mult: int = 2, dropout: float = 0.1):
         super().__init__()
         assert kernel_size % 2 == 1, "TaskTokenDecoder requires odd kernel_size for same-length padding"
         self.norm1 = nn.LayerNorm(dim)
