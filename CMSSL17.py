@@ -1100,13 +1100,13 @@ class SAMBA(nn.Module):
         self.dir_token_decoder = TaskTokenDecoder(
             dim=fused_dim,
             kernel_size=5,
-            ff_mult=4,
+            ff_mult=2,
             dropout=0.1,
         )
         self.mag_token_decoder = TaskTokenDecoder(
             dim=fused_dim,
             kernel_size=5,
-            ff_mult=4,
+            ff_mult=2,
             dropout=0.1,
         )
         self.dir_pool = GatedPooling(fused_dim)
