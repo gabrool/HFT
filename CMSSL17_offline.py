@@ -64,8 +64,19 @@ SUPPORTED_PROTOCOLS = {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}
 FAST_VAL_MAX_ROWS = 200_000
 FULL_VAL_EVERY = 5
 TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "10"))
-FEATURE_STORAGE_DTYPE = torch.bfloat16
-FEATURE_STORAGE_DTYPE_NAME = "bf16"
+_feature_storage_dtype_raw = os.environ.get("BYBIT_FEATURE_STORAGE_DTYPE", "fp32").strip().lower()
+
+if _feature_storage_dtype_raw in {"fp32", "float32"}:
+    FEATURE_STORAGE_DTYPE = torch.float32
+    FEATURE_STORAGE_DTYPE_NAME = "fp32"
+elif _feature_storage_dtype_raw in {"bf16", "bfloat16"}:
+    FEATURE_STORAGE_DTYPE = torch.bfloat16
+    FEATURE_STORAGE_DTYPE_NAME = "bf16"
+else:
+    raise ValueError(
+        "BYBIT_FEATURE_STORAGE_DTYPE must be one of: fp32, float32, bf16, bfloat16; "
+        f"got {_feature_storage_dtype_raw!r}"
+    )
 if TRAIN_ROW_STRIDE < 1:
     raise ValueError(f"BYBIT_TRAIN_ROW_STRIDE must be >= 1, got {TRAIN_ROW_STRIDE}")
 
@@ -1312,7 +1323,7 @@ def train_from_offline():
         print(
             f"[gpu_data] train_week[{i}]={train_week_keys[i]} rows={src.n_rows} "
             f"train_row_stride={src.row_stride} effective_rows_nominal={src.effective_rows_nominal} "
-            f"feature_shape={src.feature_shape} feature_dtype={src.features.dtype} "
+            f"feature_shape={src.feature_shape} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
             f"feature_gb={src.feature_gb:.3f} label_index_gb={src.label_index_gb:.3f}",
             flush=True,
         )
@@ -1324,7 +1335,7 @@ def train_from_offline():
         )
     print(
         f"[cpu_val_data] val_full rows={val_full_src.n_rows} row_stride={val_full_src.row_stride} "
-        f"feature_shape={val_full_src.feature_shape} feature_dtype={val_full_src.features.dtype} "
+        f"feature_shape={val_full_src.feature_shape} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
         f"feature_gb_cpu={val_full_src.feature_gb:.3f} label_index_gb_cpu={val_full_src.label_index_gb:.3f} "
         f"pin_memory={val_full_src.pin_memory}"
     )
@@ -1551,7 +1562,7 @@ def train_from_offline():
     )
     print(
         f"[cpu_test_data] test_full rows={test_full_src.n_rows} row_stride={test_full_src.row_stride} "
-        f"feature_shape={test_full_src.feature_shape} feature_dtype={test_full_src.features.dtype} "
+        f"feature_shape={test_full_src.feature_shape} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
         f"feature_gb_cpu={test_full_src.feature_gb:.3f} label_index_gb_cpu={test_full_src.label_index_gb:.3f} "
         f"pin_memory={test_full_src.pin_memory}"
     )
