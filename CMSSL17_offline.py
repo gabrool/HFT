@@ -56,6 +56,9 @@ COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "max-autotune").strip(
 LOG_EVERY     = max(1, int(os.environ.get("BYBIT_LOG_EVERY", "100")))
 CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
+LR = float(os.environ.get("BYBIT_LR", "2e-4"))
+CLIP_GRAD = float(os.environ.get("BYBIT_CLIP_GRAD", "5.0"))
+FINITE_DEBUG = int(os.environ.get("BYBIT_FINITE_DEBUG", "1")) == 1
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -1192,6 +1195,80 @@ def get_model_state_dict(model: torch.nn.Module) -> dict:
     return unwrap_model(model).state_dict()
 
 
+def _finite_stats(t: torch.Tensor) -> str:
+    td = t.detach()
+    finite = torch.isfinite(td)
+    bad = int((~finite).sum().item())
+    total = int(td.numel())
+    if finite.any():
+        vals = td[finite].float()
+        return (
+            f"shape={tuple(td.shape)} dtype={td.dtype} device={td.device} "
+            f"bad={bad}/{total} "
+            f"min={float(vals.min().item()):.6g} "
+            f"max={float(vals.max().item()):.6g} "
+            f"mean={float(vals.mean().item()):.6g} "
+            f"absmax={float(vals.abs().max().item()):.6g}"
+        )
+    return (
+        f"shape={tuple(td.shape)} dtype={td.dtype} device={td.device} "
+        f"bad={bad}/{total} min=nan max=nan mean=nan absmax=nan"
+    )
+
+
+def _check_tensor_finite(name: str, t: torch.Tensor, *, epoch: int, batch: int, stage: str) -> None:
+    if not FINITE_DEBUG:
+        return
+    if not torch.isfinite(t).all():
+        raise FloatingPointError(
+            f"[nonfinite-tensor] epoch={epoch+1} batch={batch} stage={stage} "
+            f"name={name} {_finite_stats(t)}"
+        )
+
+
+def _check_pred_finite(pred: Dict[str, torch.Tensor], *, epoch: int, batch: int, stage: str) -> None:
+    if not FINITE_DEBUG:
+        return
+    expected = {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
+    if not isinstance(pred, dict) or set(pred.keys()) != expected:
+        raise ValueError(
+            f"[bad-pred] epoch={epoch+1} batch={batch} stage={stage} "
+            f"type={type(pred)} keys={list(pred.keys()) if isinstance(pred, dict) else None}"
+        )
+    for k, v in pred.items():
+        _check_tensor_finite(f"pred.{k}", v, epoch=epoch, batch=batch, stage=stage)
+
+
+def _check_grads_finite(model: torch.nn.Module, *, epoch: int, batch: int, stage: str) -> float:
+    if not FINITE_DEBUG:
+        return float("nan")
+    sq_sum = 0.0
+    for name, p in unwrap_model(model).named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        if not torch.isfinite(g).all():
+            raise FloatingPointError(
+                f"[nonfinite-grad] epoch={epoch+1} batch={batch} stage={stage} "
+                f"name={name} {_finite_stats(g)}"
+            )
+        gf = g.float()
+        sq_sum += float((gf * gf).sum().item())
+    return math.sqrt(sq_sum)
+
+
+def _check_params_finite(model: torch.nn.Module, *, epoch: int, batch: int, stage: str) -> None:
+    if not FINITE_DEBUG:
+        return
+    for name, p in unwrap_model(model).named_parameters():
+        pd = p.detach()
+        if not torch.isfinite(pd).all():
+            raise FloatingPointError(
+                f"[nonfinite-param] epoch={epoch+1} batch={batch} stage={stage} "
+                f"name={name} {_finite_stats(pd)}"
+            )
+
+
 # ---------------- Train/Eval ----------------
 def train_from_offline():
     if CUDNN_BENCHMARK:
@@ -1351,8 +1428,9 @@ def train_from_offline():
     if COMPILE_ENABLED and hasattr(torch, "compile"):
         model = torch.compile(model, mode=COMPILE_MODE, dynamic=False)
         print(f"[compile] enabled full-model compile with {COMPILE_MODE} (dynamic=False)", flush=True)
-        
+
     opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
+    print(f"[optim-config] lr={LR} clip_grad={CLIP_GRAD} sam_rho=0.01 weight_decay=1e-3", flush=True)
     primary_metric_mode=get_primary_metric_mode()
     best=-float('inf') if primary_metric_mode=='max' else float('inf')
     no_imp = 0
@@ -1380,12 +1458,16 @@ def train_from_offline():
         corr_norm_sum = torch.zeros((), device=device)
         n_batches = 0
         first_batch_checked = False
-        for x, y_raw in tqdm(train_src.iter_epoch(epoch), total=len(train_src), desc=f"Ep{epoch+1}/{EPOCHS}"):
+        for batch_i, (x, y_raw) in enumerate(tqdm(train_src.iter_epoch(epoch), total=len(train_src), desc=f"Ep{epoch+1}/{EPOCHS}")):
             opt.base_optimizer.zero_grad(set_to_none=True)
+            _check_tensor_finite("x", x, epoch=epoch, batch=batch_i, stage="input")
+            _check_tensor_finite("y_raw", y_raw, epoch=epoch, batch=batch_i, stage="input")
+            _check_params_finite(model, epoch=epoch, batch=batch_i, stage="batch_start")
             
             # First forward/backward: compute the raw gradient used to choose SAM's adversarial perturbation.
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
                 pred = model(x)
+                _check_pred_finite(pred, epoch=epoch, batch=batch_i, stage="forward1")
                 if not first_batch_checked:
                     assert isinstance(pred, dict)
                     assert set(pred.keys()) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
@@ -1405,15 +1487,21 @@ def train_from_offline():
                     ema_state=ema_state,
                     update_ema=True,
                 )
-            
+                _check_tensor_finite("loss", loss, epoch=epoch, batch=batch_i, stage="loss1")
+                for k, v in comps.items():
+                    _check_tensor_finite(f"comps.{k}", v, epoch=epoch, batch=batch_i, stage="loss1")
+
             loss.backward()
-            
+            grad_norm1 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward1")
+
             # Do NOT clip here. SAM first_step must see the raw gradient direction.
             opt.first_step(zero_grad=True)
+            _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_sam_first_step")
             
             # Second forward/backward at perturbed weights.
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
                 pred2 = model(x)
+                _check_pred_finite(pred2, epoch=epoch, batch=batch_i, stage="forward2_sam_perturbed")
                 loss2, comps2 = compute_dir_mag_loss(
                     pred2,
                     y_raw,
@@ -1427,12 +1515,32 @@ def train_from_offline():
                     ema_state=ema_state,
                     update_ema=False,
                 )
-            
+                _check_tensor_finite("loss2", loss2, epoch=epoch, batch=batch_i, stage="loss2")
+                for k, v in comps2.items():
+                    _check_tensor_finite(f"comps2.{k}", v, epoch=epoch, batch=batch_i, stage="loss2")
+
             loss2.backward()
-            
+            grad_norm2 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward2")
+
             # Clip only before the actual optimizer update.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
+            grad_norm_clip_return = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                CLIP_GRAD,
+                error_if_nonfinite=True,
+            )
+            _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_clip")
+            if FINITE_DEBUG and ((batch_i + 1) % LOG_EVERY == 0 or batch_i == 0):
+                print(
+                    f"[debug-train] epoch={epoch+1} batch={batch_i} "
+                    f"loss1={float(loss.detach().float().item()):.6g} "
+                    f"loss2={float(loss2.detach().float().item()):.6g} "
+                    f"grad_norm1={grad_norm1:.6g} "
+                    f"grad_norm2={grad_norm2:.6g} "
+                    f"clip_return={float(grad_norm_clip_return.detach().float().item()):.6g}",
+                    flush=True,
+                )
             opt.second_step(zero_grad=True)
+            _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_optimizer_step")
 
             loss_sum += loss.detach()
             dir_bce_sum += comps["dir_bce"]
