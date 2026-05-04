@@ -470,6 +470,9 @@ DMODEL          = 1024
 MAMBA_LAYERS    = 2
 CONV_KERNELS    = [3,3,5,5,7,7]
 DFF_CONV        = 2 * DMODEL
+DEPATCH_OFFSET_SCALE = float(os.environ.get("BYBIT_DEPATCH_OFFSET_SCALE", "0.10"))
+if not math.isfinite(DEPATCH_OFFSET_SCALE) or DEPATCH_OFFSET_SCALE <= 0.0:
+    raise ValueError(f"BYBIT_DEPATCH_OFFSET_SCALE must be finite and > 0, got {DEPATCH_OFFSET_SCALE}")
 
 # Prediction horizons (in milliseconds)
 HORIZONS_MS     = [7_500, 15_000, 30_000]
@@ -745,8 +748,9 @@ class OffsetPredictor(nn.Module):
         patch_X = patch_X.contiguous().view(B, patch_count, self.patch_size, self.channel)
         patch_X = patch_X.permute(0, 1, 3, 2)
         patch_X = patch_X.contiguous().view(B*patch_count*self.channel, 1, self.patch_size)
-        pred_offset = self.offset_predictor(patch_X)
-        pred_offset = pred_offset.view(B, patch_count, self.channel, 2).contiguous()
+        raw_offset = self.offset_predictor(patch_X)
+        raw_offset = raw_offset.view(B, patch_count, self.channel, 2).contiguous()
+        pred_offset = DEPATCH_OFFSET_SCALE * torch.tanh(raw_offset)
         return pred_offset
 
 class DepatchSampling(nn.Module):
@@ -764,15 +768,24 @@ class DepatchSampling(nn.Module):
         sampling_locations, bound = self.box_coder(pred_offset)
         return sampling_locations, bound
     def forward(self, X, return_bound=False):
-        img = X.unsqueeze(1)
-        B = img.shape[0]
-        sampling_locations, bound = self.get_sampling_location(X)
-        sampling_locations = sampling_locations.view(B, self.patch_count*self.in_feats, self.patch_size, 2)
-        sampling_locations = (sampling_locations - 0.5) * 2
-        output = F.grid_sample(img, sampling_locations, align_corners=True)
-        output = output.view(B, self.patch_count, self.in_feats, self.patch_size)
-        output = output.permute(0, 2, 1, 3).contiguous()
-        return output # (B, C, patch_count, patch_size)
+        orig_dtype = X.dtype
+        ctx = (
+            torch.amp.autocast(device_type="cuda", enabled=False)
+            if X.is_cuda
+            else contextlib.nullcontext()
+        )
+
+        with ctx:
+            X32 = X.float()
+            img = X32.unsqueeze(1)
+            B = img.shape[0]
+            sampling_locations, bound = self.get_sampling_location(X32)
+            sampling_locations = sampling_locations.view(B, self.patch_count*self.in_feats, self.patch_size, 2)
+            sampling_locations = (sampling_locations - 0.5) * 2
+            output = F.grid_sample(img, sampling_locations, align_corners=True)
+            output = output.view(B, self.patch_count, self.in_feats, self.patch_size)
+            output = output.permute(0, 2, 1, 3).contiguous()
+        return output.to(dtype=orig_dtype) # (B, C, patch_count, patch_size)
 
 class _ConvEncoderLayer(nn.Module):
     def __init__(self, kernel_size, d_model, d_ff=256, dropout=0.1, activation="gelu", 
