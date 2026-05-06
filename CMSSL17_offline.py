@@ -59,6 +59,7 @@ MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lowe
 LR = float(os.environ.get("BYBIT_LR", "2e-4"))
 CLIP_GRAD = float(os.environ.get("BYBIT_CLIP_GRAD", "5.0"))
 FINITE_DEBUG = int(os.environ.get("BYBIT_FINITE_DEBUG", "1")) == 1
+USE_SAM = int(os.environ.get("BYBIT_USE_SAM", "0")) == 1
 DEPATCH_OFFSET_LR_MULT = float(os.environ.get("BYBIT_DEPATCH_OFFSET_LR_MULT", "0.05"))
 DEPATCH_OFFSET_CLIP_GRAD = float(os.environ.get("BYBIT_DEPATCH_OFFSET_CLIP_GRAD", "0.10"))
 SAM_RHO = float(os.environ.get("BYBIT_SAM_RHO", "0.005"))
@@ -1506,9 +1507,15 @@ def train_from_offline():
         },
     ]
 
-    opt = SAM(param_groups, torch.optim.AdamW, rho=SAM_RHO)
+    if USE_SAM:
+        opt = SAM(param_groups, torch.optim.AdamW, rho=SAM_RHO)
+        optimizer_name = "SAM(AdamW)"
+    else:
+        opt = torch.optim.AdamW(param_groups)
+        optimizer_name = "AdamW"
     print(
-        f"[optim-config] lr={LR} clip_grad={CLIP_GRAD} sam_rho={SAM_RHO} weight_decay=1e-3 "
+        f"[optim-config] optimizer={optimizer_name} use_sam={int(USE_SAM)} "
+        f"lr={LR} clip_grad={CLIP_GRAD} sam_rho={SAM_RHO} weight_decay=1e-3 "
         f"offset_lr={LR * DEPATCH_OFFSET_LR_MULT} "
         f"offset_lr_mult={DEPATCH_OFFSET_LR_MULT} "
         f"offset_clip_grad={DEPATCH_OFFSET_CLIP_GRAD} "
@@ -1544,11 +1551,11 @@ def train_from_offline():
         n_batches = 0
         first_batch_checked = False
         for batch_i, (x, y_raw) in enumerate(tqdm(train_src.iter_epoch(epoch), total=len(train_src), desc=f"Ep{epoch+1}/{EPOCHS}")):
-            opt.base_optimizer.zero_grad(set_to_none=True)
+            opt.zero_grad(set_to_none=True)
             _check_tensor_finite("x", x, epoch=epoch, batch=batch_i, stage="input")
             _check_tensor_finite("y_raw", y_raw, epoch=epoch, batch=batch_i, stage="input")
             _check_params_finite(model, epoch=epoch, batch=batch_i, stage="batch_start")
-            
+
             # First forward/backward: compute the raw gradient used to choose SAM's adversarial perturbation.
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
                 pred = model(x)
@@ -1579,70 +1586,104 @@ def train_from_offline():
             loss.backward()
             grad_norm1 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward1")
 
-            offset_clip_return1 = torch.nn.utils.clip_grad_norm_(
-                _offset_predictor_params(model),
-                DEPATCH_OFFSET_CLIP_GRAD,
-                error_if_nonfinite=True,
-            )
-
-            _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_offset_clip1")
-
-            opt.first_step(zero_grad=True)
-            _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_sam_first_step")
-            
-            # Second forward/backward at perturbed weights.
-            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
-                pred2 = model(x)
-                _check_pred_finite(pred2, epoch=epoch, batch=batch_i, stage="forward2_sam_perturbed")
-                loss2, comps2 = compute_dir_mag_loss(
-                    pred2,
-                    y_raw,
-                    abs_lo_t=abs_lo_t,
-                    abs_hi_t=abs_hi_t,
-                    q50_t=q50_t,
-                    q85_t=q85_t,
-                    hwt=hwt,
-                    dir_pos_w_t=dir_pos_w_t,
-                    dir_neg_w_t=dir_neg_w_t,
-                    ema_state=ema_state,
-                    update_ema=False,
+            if USE_SAM:
+                offset_clip_return1 = torch.nn.utils.clip_grad_norm_(
+                    _offset_predictor_params(model),
+                    DEPATCH_OFFSET_CLIP_GRAD,
+                    error_if_nonfinite=True,
                 )
-                _check_tensor_finite("loss2", loss2, epoch=epoch, batch=batch_i, stage="loss2")
-                for k, v in comps2.items():
-                    _check_tensor_finite(f"comps2.{k}", v, epoch=epoch, batch=batch_i, stage="loss2")
 
-            loss2.backward()
-            grad_norm2 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward2")
+                _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_offset_clip1")
 
-            offset_clip_return2 = torch.nn.utils.clip_grad_norm_(
-                _offset_predictor_params(model),
-                DEPATCH_OFFSET_CLIP_GRAD,
-                error_if_nonfinite=True,
-            )
+                opt.first_step(zero_grad=True)
+                _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_sam_first_step")
 
-            _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_offset_clip2")
+                # Second forward/backward at perturbed weights.
+                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                    pred2 = model(x)
+                    _check_pred_finite(pred2, epoch=epoch, batch=batch_i, stage="forward2_sam_perturbed")
+                    loss2, comps2 = compute_dir_mag_loss(
+                        pred2,
+                        y_raw,
+                        abs_lo_t=abs_lo_t,
+                        abs_hi_t=abs_hi_t,
+                        q50_t=q50_t,
+                        q85_t=q85_t,
+                        hwt=hwt,
+                        dir_pos_w_t=dir_pos_w_t,
+                        dir_neg_w_t=dir_neg_w_t,
+                        ema_state=ema_state,
+                        update_ema=False,
+                    )
+                    _check_tensor_finite("loss2", loss2, epoch=epoch, batch=batch_i, stage="loss2")
+                    for k, v in comps2.items():
+                        _check_tensor_finite(f"comps2.{k}", v, epoch=epoch, batch=batch_i, stage="loss2")
 
-            # Clip only before the actual optimizer update.
-            grad_norm_clip_return = torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                CLIP_GRAD,
-                error_if_nonfinite=True,
-            )
-            _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_clip")
-            if FINITE_DEBUG and ((batch_i + 1) % LOG_EVERY == 0 or batch_i == 0):
-                print(
-                    f"[debug-train] epoch={epoch+1} batch={batch_i} "
-                    f"loss1={float(loss.detach().float().item()):.6g} "
-                    f"loss2={float(loss2.detach().float().item()):.6g} "
-                    f"grad_norm1={grad_norm1:.6g} "
-                    f"grad_norm2={grad_norm2:.6g} "
-                    f"offset_clip1={float(offset_clip_return1.detach().float().item()):.6g} "
-                    f"offset_clip2={float(offset_clip_return2.detach().float().item()):.6g} "
-                    f"clip_return={float(grad_norm_clip_return.detach().float().item()):.6g}",
-                    flush=True,
+                loss2.backward()
+                grad_norm2 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward2")
+
+                offset_clip_return2 = torch.nn.utils.clip_grad_norm_(
+                    _offset_predictor_params(model),
+                    DEPATCH_OFFSET_CLIP_GRAD,
+                    error_if_nonfinite=True,
                 )
-            opt.second_step(zero_grad=True)
-            _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_optimizer_step")
+
+                _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_offset_clip2")
+
+                # Clip only before the actual optimizer update.
+                grad_norm_clip_return = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    CLIP_GRAD,
+                    error_if_nonfinite=True,
+                )
+                _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_clip")
+
+                opt.second_step(zero_grad=True)
+                _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_optimizer_step")
+
+                if FINITE_DEBUG and ((batch_i + 1) % LOG_EVERY == 0 or batch_i == 0):
+                    print(
+                        f"[debug-train] epoch={epoch+1} batch={batch_i} optimizer=SAM "
+                        f"loss1={float(loss.detach().float().item()):.6g} "
+                        f"loss2={float(loss2.detach().float().item()):.6g} "
+                        f"grad_norm1={grad_norm1:.6g} "
+                        f"grad_norm2={grad_norm2:.6g} "
+                        f"offset_clip1={float(offset_clip_return1.detach().float().item()):.6g} "
+                        f"offset_clip2={float(offset_clip_return2.detach().float().item()):.6g} "
+                        f"clip_return={float(grad_norm_clip_return.detach().float().item()):.6g}",
+                        flush=True,
+                    )
+            else:
+                offset_clip_return1 = torch.nn.utils.clip_grad_norm_(
+                    _offset_predictor_params(model),
+                    DEPATCH_OFFSET_CLIP_GRAD,
+                    error_if_nonfinite=True,
+                )
+
+                _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_offset_clip1")
+
+                grad_norm_clip_return = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    CLIP_GRAD,
+                    error_if_nonfinite=True,
+                )
+
+                _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_clip")
+
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+                _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_optimizer_step")
+
+                if FINITE_DEBUG and ((batch_i + 1) % LOG_EVERY == 0 or batch_i == 0):
+                    print(
+                        f"[debug-train] epoch={epoch+1} batch={batch_i} optimizer=AdamW "
+                        f"loss1={float(loss.detach().float().item()):.6g} "
+                        f"grad_norm1={grad_norm1:.6g} "
+                        f"offset_clip1={float(offset_clip_return1.detach().float().item()):.6g} "
+                        f"clip_return={float(grad_norm_clip_return.detach().float().item()):.6g}",
+                        flush=True,
+                    )
 
             loss_sum += loss.detach()
             dir_bce_sum += comps["dir_bce"]
