@@ -951,7 +951,11 @@ class FeatureReliabilityGate(nn.Module):
         self.in_feats = int(in_feats)
         self.d_internal = int(d_internal)
         self.init_keep_prob = float(init_keep_prob)
-        self.gate_alpha = 1.0
+        self.register_buffer(
+            "gate_alpha",
+            torch.tensor(1.0, dtype=torch.float32),
+            persistent=False,
+        )
 
         hidden = max(8, 2 * d_internal)
         self.norm = nn.LayerNorm(d_internal)
@@ -982,12 +986,13 @@ class FeatureReliabilityGate(nn.Module):
         alpha = float(alpha)
         if not math.isfinite(alpha):
             raise ValueError(f"gate alpha must be finite, got {alpha}")
-        self.gate_alpha = max(0.0, min(1.0, alpha))
+        alpha = max(0.0, min(1.0, alpha))
+        self.gate_alpha.fill_(alpha)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         gate, _, _ = self._compute_gate(z)
         multiplier = gate / self.init_keep_prob
-        alpha = float(self.gate_alpha)
+        alpha = self.gate_alpha.to(device=z.device, dtype=z.dtype)
         effective_multiplier = (1.0 - alpha) + alpha * multiplier
         return z * effective_multiplier
 
@@ -1028,7 +1033,7 @@ class FeatureReliabilityGate(nn.Module):
             "prior_std": float(prior.detach().float().std(unbiased=False).cpu()),
             "top_gate_feature_idx_8": top,
             "bottom_gate_feature_idx_8": bottom,
-            "alpha": float(self.gate_alpha),
+            "alpha": float(self.gate_alpha.detach().cpu().item()),
         }
 
     @torch.no_grad()
@@ -1039,7 +1044,7 @@ class FeatureReliabilityGate(nn.Module):
             "std": diag["gate_std"],
             "min": diag["gate_min"],
             "max": diag["gate_max"],
-            "alpha": float(self.gate_alpha),
+            "alpha": float(self.gate_alpha.detach().cpu().item()),
         }
 
 
