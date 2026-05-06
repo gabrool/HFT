@@ -70,6 +70,16 @@ GRAD_DIAG_P95_MAX_ELEMS = max(
     1024,
     int(os.environ.get("BYBIT_GRAD_DIAG_P95_MAX_ELEMS", "1000000")),
 )
+BAND_DIAG = int(os.environ.get("BYBIT_BAND_DIAG", "1")) == 1
+BAND_DIAG_TRAIN = int(os.environ.get("BYBIT_BAND_DIAG_TRAIN", "1")) == 1
+BAND_DIAG_TRAIN_MAX_ROWS = max(1, int(os.environ.get("BYBIT_BAND_DIAG_TRAIN_MAX_ROWS", "200000")))
+BAND_DIAG_QUANTILES = np.array([0.00, 0.25, 0.50, 0.65, 0.75, 0.85, 0.925, 0.975, 1.00], dtype=np.float32)
+BAND_DIAG_NAMES = ["q00-q25", "q25-q50", "q50-q65", "q65-q75", "q75-q85", "q85-q925", "q925-q975", "q975-q100"]
+print(
+    f"[band-diag-config] enabled={int(BAND_DIAG)} train_enabled={int(BAND_DIAG_TRAIN)} "
+    f"train_max_rows={BAND_DIAG_TRAIN_MAX_ROWS} bands={','.join(BAND_DIAG_NAMES)}",
+    flush=True,
+)
 print(
     f"[model-diag-config] enabled={int(MODEL_DIAG)} "
     f"every={MODEL_DIAG_EVERY} max_batch={MODEL_DIAG_MAX_BATCH} "
@@ -467,16 +477,23 @@ def compute_signed_raw_stats(y_train: np.ndarray) -> Dict[str, np.ndarray]:
     keep = build_abs_trim_mask(y_train, abs_lo, abs_hi)
     q50 = np.zeros(NUM_HORIZONS, dtype=np.float32)
     q85 = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    band_edges = np.full((NUM_HORIZONS, len(BAND_DIAG_QUANTILES)), np.nan, dtype=np.float32)
     for h in range(NUM_HORIZONS):
         kept_abs = abs_y[keep[:, h], h]
         if kept_abs.size:
             q50[h] = float(np.quantile(kept_abs, 0.50))
             q85[h] = float(np.quantile(kept_abs, 0.85))
+            edges = np.quantile(kept_abs, BAND_DIAG_QUANTILES).astype(np.float32)
+            edges[0] = float(np.min(kept_abs))
+            edges[-1] = float(np.max(kept_abs))
+            band_edges[h] = edges
     return {
         'abs_lo_raw_bps': abs_lo,
         'abs_hi_raw_bps': abs_hi,
         'kept_q50_abs_raw_bps': q50,
         'kept_q85_abs_raw_bps': q85,
+        'band_quantiles': BAND_DIAG_QUANTILES.copy(),
+        'kept_abs_band_edges_raw_bps': band_edges,
     }
 
 
@@ -484,7 +501,13 @@ def load_stats_cache(path: Path):
     if not path.exists():
         return None
     with np.load(path, allow_pickle=False) as c:
-        stats = {k: np.asarray(c[k], dtype=np.float32) for k in ('abs_lo_raw_bps','abs_hi_raw_bps','kept_q50_abs_raw_bps','kept_q85_abs_raw_bps')}
+        required = (
+            'abs_lo_raw_bps', 'abs_hi_raw_bps', 'kept_q50_abs_raw_bps', 'kept_q85_abs_raw_bps',
+            'band_quantiles', 'kept_abs_band_edges_raw_bps',
+        )
+        if any(k not in c.files for k in required) or 'metadata_json' not in c.files:
+            return None
+        stats = {k: np.asarray(c[k], dtype=np.float32) for k in required}
         meta = json.loads(str(c['metadata_json'].item()))
     return stats, meta
 
@@ -494,7 +517,7 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
-    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','split_protocol','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','ranking_schema')
+    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','split_protocol','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','ranking_schema','band_diag_quantiles')
     return all(cached_meta.get(k)==current_meta.get(k) for k in keys)
 
 
@@ -935,6 +958,64 @@ class MultiWeekTrainBatchSource:
                 exhausted[i] = True
 
 
+
+
+class MultiSourceEvalBatchSource:
+    def __init__(self, sources: List[Any]):
+        if not sources:
+            raise ValueError("MultiSourceEvalBatchSource requires at least one source")
+        self.sources = list(sources)
+        self.n_rows = sum(int(src.n_rows) for src in self.sources)
+        self.effective_rows_nominal = sum(int(getattr(src, "effective_rows_nominal", src.n_rows)) for src in self.sources)
+
+    def __len__(self) -> int:
+        return sum(len(src) for src in self.sources)
+
+    def iter_epoch(self, epoch: int):
+        for src in self.sources:
+            yield from src.iter_epoch(epoch)
+
+
+def make_train_band_eval_source(train_sources: List[Any], max_rows: int) -> Any:
+    if not train_sources:
+        raise ValueError("No train sources available for band diagnostics")
+    max_rows = max(1, int(max_rows))
+    if len(train_sources) == 1:
+        return train_sources[0].make_evenly_spaced_subset(max_rows)
+    total_rows = sum(max(0, int(src.n_rows)) for src in train_sources)
+    if total_rows <= 0:
+        raise ValueError("Cannot create train band diagnostic source from empty train sources")
+    target = min(max_rows, total_rows)
+    raw = np.asarray([int(src.n_rows) for src in train_sources], dtype=np.float64) * (float(target) / float(total_rows))
+    alloc = np.floor(raw).astype(np.int64)
+    for i, src in enumerate(train_sources):
+        if int(src.n_rows) > 0 and alloc[i] == 0 and int(alloc.sum()) < target:
+            alloc[i] = 1
+    remainder = int(target - int(alloc.sum()))
+    if remainder > 0:
+        order = np.argsort(-(raw - np.floor(raw)))
+        for i in order.tolist():
+            if remainder <= 0:
+                break
+            room = int(train_sources[i].n_rows) - int(alloc[i])
+            if room > 0:
+                add = min(room, remainder)
+                alloc[i] += add
+                remainder -= add
+    elif remainder < 0:
+        order = np.argsort(raw - np.floor(raw))
+        to_remove = -remainder
+        for i in order.tolist():
+            if to_remove <= 0:
+                break
+            min_keep = 1 if int(train_sources[i].n_rows) > 0 else 0
+            removable = max(0, int(alloc[i]) - min_keep)
+            rem = min(removable, to_remove)
+            alloc[i] -= rem
+            to_remove -= rem
+    children = [src.make_evenly_spaced_subset(int(n)) for src, n in zip(train_sources, alloc.tolist()) if int(n) > 0]
+    return MultiSourceEvalBatchSource(children)
+
 class LossEmaState:
     def __init__(self, decay: float):
         self.decay = float(decay)
@@ -1133,7 +1214,206 @@ def compute_dir_mag_loss(
     return loss, components
 
 
-def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch: int = 0):
+
+def _nan_band_metrics(n: int, frac: float, edge_lo: float, edge_hi: float) -> Dict[str, Any]:
+    fields = [
+        "true_abs_p50", "true_abs_mean", "true_abs_p90", "true_pos_frac", "true_ret_mean_bps", "true_ret_std_bps",
+        "dir_auc", "dir_bal_acc", "dir_acc", "dir_bce", "dir_logit_mean", "dir_logit_std", "dir_prob_mean",
+        "dir_prob_std", "dir_pos_frac_pred", "dir_pos_frac_true", "pred_abs_p50", "pred_abs_p90",
+        "true_abs_std", "pred_abs_std", "pred_abs_std_over_true_abs_std", "mag_spearman_abs",
+        "edge_mean", "edge_std", "edge_abs_p50", "edge_abs_p90", "edge_pearson", "edge_spearman",
+        "edge_sign_acc", "edge_sign_bal_acc", "edge_pos_frac", "realized_mean_when_edge_pos",
+        "realized_mean_when_edge_neg", "realized_spread_edge_pos_minus_neg", "top_edge_abs_q90_threshold",
+        "n_top_edge_abs_q90", "top_edge_abs_q90_realized_abs_mean", "top_edge_abs_q90_edge_spearman",
+        "top_edge_abs_q90_edge_sign_bal_acc",
+    ]
+    d: Dict[str, Any] = {"n": int(n), "frac": float(frac), "edge_lo_bps": float(edge_lo), "edge_hi_bps": float(edge_hi)}
+    for f in fields:
+        d[f] = 0 if f == "n_top_edge_abs_q90" else float("nan")
+    d["learnability_tag"] = "too_few" if n < 1000 else "ignore_candidate"
+    return d
+
+
+def summarize_label_band_audit(y_raw: np.ndarray, stats: Dict[str, np.ndarray], *, split_name: str) -> Dict[str, Any]:
+    y_raw = np.asarray(y_raw, dtype=np.float32)
+    abs_raw = np.abs(y_raw)
+    keep = build_abs_trim_mask(y_raw, stats["abs_lo_raw_bps"], stats["abs_hi_raw_bps"])
+    edges = np.asarray(stats["kept_abs_band_edges_raw_bps"], dtype=np.float32)
+    out: Dict[str, Any] = {"split": split_name, "band_quantiles": [float(x) for x in BAND_DIAG_QUANTILES], "bands": {}}
+    for h, horizon_ms in enumerate(HORIZONS_MS):
+        h_bands: Dict[str, Any] = {}
+        denom = max(1, int(np.sum(keep[:, h])))
+        for b, name in enumerate(BAND_DIAG_NAMES):
+            lo, hi = float(edges[h, b]), float(edges[h, b + 1])
+            if not (math.isfinite(lo) and math.isfinite(hi)):
+                mask = np.zeros(y_raw.shape[0], dtype=bool)
+            elif b == len(BAND_DIAG_NAMES) - 1:
+                mask = keep[:, h] & (abs_raw[:, h] >= lo) & (abs_raw[:, h] <= hi)
+            else:
+                mask = keep[:, h] & (abs_raw[:, h] >= lo) & (abs_raw[:, h] < hi)
+            n = int(np.sum(mask))
+            vals = y_raw[:, h][mask]
+            absv = abs_raw[:, h][mask]
+            item = {
+                "n": n, "frac": float(n / denom), "edge_lo_bps": lo, "edge_hi_bps": hi,
+                "true_abs_p50": _safe_quantile_np(absv, 0.50),
+                "true_abs_mean": float(np.mean(absv)) if n else float("nan"),
+                "true_abs_p90": _safe_quantile_np(absv, 0.90),
+                "true_pos_frac": float(np.mean(vals > 0)) if n else float("nan"),
+                "true_ret_mean_bps": float(np.mean(vals)) if n else float("nan"),
+                "true_ret_std_bps": float(np.std(vals, ddof=0)) if n else float("nan"),
+            }
+            h_bands[name] = item
+            print(
+                f"[band-label split={split_name} h={int(horizon_ms)} band={name}] "
+                f"n={n} frac={item['frac']:.6f} abs_p50={item['true_abs_p50']:.6g} "
+                f"abs_mean={item['true_abs_mean']:.6g} abs_p90={item['true_abs_p90']:.6g} "
+                f"pos_frac={item['true_pos_frac']:.6f} ret_mean={item['true_ret_mean_bps']:.6g} "
+                f"ret_std={item['true_ret_std_bps']:.6g}",
+                flush=True,
+            )
+        out["bands"][str(int(horizon_ms))] = h_bands
+    return out
+
+
+def summarize_band_metrics_from_arrays(
+    *,
+    dir_logits: np.ndarray,
+    mag_up_sqrt: np.ndarray,
+    mag_down_sqrt: np.ndarray,
+    y_raw: np.ndarray,
+    stats: Dict[str, np.ndarray],
+    split_name: str,
+) -> Dict[str, Any]:
+    p_up = 1.0 / (1.0 + np.exp(-dir_logits))
+    true_up = y_raw > 0
+    pred_up = p_up >= 0.5
+    mag_up_bps = mag_up_sqrt ** 2
+    mag_down_bps = mag_down_sqrt ** 2
+    mag_pred_sqrt = p_up * mag_up_sqrt + (1.0 - p_up) * mag_down_sqrt
+    pred_abs_bps = mag_pred_sqrt ** 2
+    edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
+    edge_sign = edge_bps >= 0
+    abs_raw = np.abs(y_raw)
+    keep = build_abs_trim_mask(y_raw, stats["abs_lo_raw_bps"], stats["abs_hi_raw_bps"])
+    edges = np.asarray(stats["kept_abs_band_edges_raw_bps"], dtype=np.float32)
+    out: Dict[str, Any] = {"split": split_name, "band_quantiles": [float(x) for x in BAND_DIAG_QUANTILES], "bands": {}}
+    for h, horizon_ms in enumerate(HORIZONS_MS):
+        h_bands: Dict[str, Any] = {}
+        denom = max(1, int(np.sum(keep[:, h])))
+        for b, name in enumerate(BAND_DIAG_NAMES):
+            lo, hi = float(edges[h, b]), float(edges[h, b + 1])
+            if not (math.isfinite(lo) and math.isfinite(hi)):
+                mask = np.zeros(y_raw.shape[0], dtype=bool)
+            elif b == len(BAND_DIAG_NAMES) - 1:
+                mask = keep[:, h] & (abs_raw[:, h] >= lo) & (abs_raw[:, h] <= hi)
+            else:
+                mask = keep[:, h] & (abs_raw[:, h] >= lo) & (abs_raw[:, h] < hi)
+            n = int(np.sum(mask))
+            frac = float(n / denom)
+            if n < 100:
+                h_bands[name] = _nan_band_metrics(n, frac, lo, hi)
+                continue
+            yv = y_raw[:, h][mask]
+            absv = abs_raw[:, h][mask]
+            prob = p_up[:, h][mask]
+            pred = pred_up[:, h][mask]
+            truth = true_up[:, h][mask]
+            logits = dir_logits[:, h][mask]
+            pred_abs = pred_abs_bps[:, h][mask]
+            edge = edge_bps[:, h][mask]
+            esign = edge_sign[:, h][mask]
+            edge_pos = edge >= 0
+            edge_neg = ~edge_pos
+            yt = truth.astype(np.float32)
+            bce = -(yt * np.log(np.clip(prob, 1e-9, 1.0 - 1e-9)) + (1.0 - yt) * np.log(np.clip(1.0 - prob, 1e-9, 1.0 - 1e-9)))
+            true_std = float(np.std(absv, ddof=0))
+            pred_std = float(np.std(pred_abs, ddof=0))
+            edge_abs = np.abs(edge)
+            top_thr = _safe_quantile_np(edge_abs, 0.90)
+            top_mask = edge_abs >= top_thr if math.isfinite(top_thr) else np.zeros(n, dtype=bool)
+            n_top = int(np.sum(top_mask))
+            edge_spearman = _safe_spearman_np(edge, yv)
+            edge_sign_bal = _balanced_acc_np(esign, truth)
+            dir_auc = _binary_auc_np(prob, truth)
+            dir_prob_std = float(np.std(prob, ddof=0))
+            if n < 1000:
+                tag = "too_few"
+            elif math.isfinite(edge_spearman) and edge_spearman >= 0.02 and edge_sign_bal >= 0.505:
+                tag = "focus_candidate"
+            elif math.isfinite(dir_auc) and dir_auc >= 0.505 and dir_prob_std >= 0.01:
+                tag = "accept_candidate"
+            else:
+                tag = "ignore_candidate"
+            h_bands[name] = {
+                "n": n, "frac": frac, "edge_lo_bps": lo, "edge_hi_bps": hi,
+                "true_abs_p50": _safe_quantile_np(absv, 0.50), "true_abs_mean": float(np.mean(absv)), "true_abs_p90": _safe_quantile_np(absv, 0.90),
+                "true_pos_frac": float(np.mean(truth)), "true_ret_mean_bps": float(np.mean(yv)), "true_ret_std_bps": float(np.std(yv, ddof=0)),
+                "dir_auc": dir_auc, "dir_bal_acc": _balanced_acc_np(pred, truth), "dir_acc": float(np.mean(pred == truth)), "dir_bce": float(np.mean(bce)),
+                "dir_logit_mean": float(np.mean(logits)), "dir_logit_std": float(np.std(logits, ddof=0)), "dir_prob_mean": float(np.mean(prob)), "dir_prob_std": dir_prob_std,
+                "dir_pos_frac_pred": float(np.mean(pred)), "dir_pos_frac_true": float(np.mean(truth)),
+                "pred_abs_p50": _safe_quantile_np(pred_abs, 0.50), "pred_abs_p90": _safe_quantile_np(pred_abs, 0.90),
+                "pred_abs_std": pred_std, "true_abs_std": true_std, "pred_abs_std_over_true_abs_std": pred_std / true_std if true_std > 0 else float("nan"),
+                "mag_spearman_abs": _safe_spearman_np(pred_abs, absv),
+                "edge_mean": float(np.mean(edge)), "edge_std": float(np.std(edge, ddof=0)), "edge_abs_p50": _safe_quantile_np(edge_abs, 0.50), "edge_abs_p90": _safe_quantile_np(edge_abs, 0.90),
+                "edge_pearson": _safe_pearson_np(edge, yv), "edge_spearman": edge_spearman, "edge_sign_acc": float(np.mean(esign == truth)), "edge_sign_bal_acc": edge_sign_bal,
+                "edge_pos_frac": float(np.mean(edge_pos)),
+                "realized_mean_when_edge_pos": float(np.mean(yv[edge_pos])) if np.any(edge_pos) else float("nan"),
+                "realized_mean_when_edge_neg": float(np.mean(yv[edge_neg])) if np.any(edge_neg) else float("nan"),
+                "realized_spread_edge_pos_minus_neg": (float(np.mean(yv[edge_pos]) - np.mean(yv[edge_neg])) if np.any(edge_pos) and np.any(edge_neg) else float("nan")),
+                "top_edge_abs_q90_threshold": top_thr, "n_top_edge_abs_q90": n_top,
+                "top_edge_abs_q90_realized_abs_mean": float(np.mean(absv[top_mask])) if n_top else float("nan"),
+                "top_edge_abs_q90_edge_spearman": _safe_spearman_np(edge[top_mask], yv[top_mask]) if n_top >= 2 else float("nan"),
+                "top_edge_abs_q90_edge_sign_bal_acc": _balanced_acc_np(esign[top_mask], truth[top_mask]) if n_top >= 2 else float("nan"),
+                "learnability_tag": tag,
+            }
+        out["bands"][str(int(horizon_ms))] = h_bands
+    return out
+
+
+def _fmt_band_float(x: Any) -> str:
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return "nan"
+    return f"{xf:.6g}" if math.isfinite(xf) else "nan"
+
+
+def print_band_metrics_summary(metrics: Dict[str, Any], *, split_name: str, epoch: int) -> None:
+    tag = f"band-{split_name}"
+    for horizon_ms, bands in metrics.get("bands", {}).items():
+        for band_name, m in bands.items():
+            print(
+                f"[{tag} epoch={epoch + 1} h={horizon_ms} band={band_name}] "
+                f"n={int(m.get('n', 0))} frac={_fmt_band_float(m.get('frac'))} "
+                f"abs_p50={_fmt_band_float(m.get('true_abs_p50'))} pos_frac={_fmt_band_float(m.get('true_pos_frac'))} "
+                f"dir_auc={_fmt_band_float(m.get('dir_auc'))} dir_bal={_fmt_band_float(m.get('dir_bal_acc'))} "
+                f"prob_std={_fmt_band_float(m.get('dir_prob_std'))} edge_sp={_fmt_band_float(m.get('edge_spearman'))} "
+                f"edge_bal={_fmt_band_float(m.get('edge_sign_bal_acc'))} edge_abs_p90={_fmt_band_float(m.get('edge_abs_p90'))} "
+                f"pred_abs_std_ratio={_fmt_band_float(m.get('pred_abs_std_over_true_abs_std'))} "
+                f"spread_pos_neg={_fmt_band_float(m.get('realized_spread_edge_pos_minus_neg'))} "
+                f"tag={m.get('learnability_tag', 'unknown')}",
+                flush=True,
+            )
+
+
+def save_band_metrics_jsonl(out_root: Path, metrics: Dict[str, Any], *, epoch: int, split_name: str) -> None:
+    path = out_root / "cmssl17_band_metrics.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"epoch": int(epoch + 1), "split": split_name, "metrics": metrics}, sort_keys=True, allow_nan=True) + "\n")
+
+def summarize_metrics(
+    model,
+    source,
+    device,
+    stats,
+    amp_enabled,
+    amp_dtype,
+    primary_only=False,
+    epoch: int = 0,
+    band_diag: bool = False,
+    split_name: str = "eval",
+):
     model.eval()
     dir_parts, up_parts, down_parts, y_parts = [], [], [], []
     with torch.inference_mode():
@@ -1179,6 +1459,15 @@ def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, prim
         out["dir_bal_acc_q50plus"][h] = _balanced_acc_np(pred_up[:, h][q50plus], true_up[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
         out["primary_dir_bal_acc"] = out["dir_bal_acc_q50plus"][h]
         out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
+        if band_diag:
+            out["band_metrics"] = summarize_band_metrics_from_arrays(
+                dir_logits=dir_logits,
+                mag_up_sqrt=mag_up_sqrt,
+                mag_down_sqrt=mag_down_sqrt,
+                y_raw=y_raw,
+                stats=stats,
+                split_name=split_name,
+            )
         return out
 
     keys = [
@@ -1280,6 +1569,15 @@ def summarize_metrics(model, source, device, stats, amp_enabled, amp_dtype, prim
     primary_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
     out["primary_dir_bal_acc"] = float(out["dir_bal_acc_q50plus"][primary_idx])
     out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
+    if band_diag:
+        out["band_metrics"] = summarize_band_metrics_from_arrays(
+            dir_logits=dir_logits,
+            mag_up_sqrt=mag_up_sqrt,
+            mag_down_sqrt=mag_down_sqrt,
+            y_raw=y_raw,
+            stats=stats,
+            split_name=split_name,
+        )
     return out
 
 
@@ -1788,7 +2086,8 @@ def train_from_offline():
         'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
         'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK,
         'loss_weighting_schema': 'dir_mag_smooth_q50_q85_class_bal_v1',
-        'ranking_schema': 'tie_aware_average_ranks_v1'
+        'ranking_schema': 'tie_aware_average_ranks_v1',
+        'band_diag_quantiles': [float(x) for x in BAND_DIAG_QUANTILES],
     }
     cached=load_stats_cache(cache_path); stats=None
     if cached and cache_matches(cached[1], cache_meta): stats=cached[0]
@@ -1811,6 +2110,7 @@ def train_from_offline():
         q50=stats["kept_q50_abs_raw_bps"],
     )
     print(f"[train_stats] dir_pos_w={dir_pos_w.tolist()} dir_neg_w={dir_neg_w.tolist()}")
+    train_label_band_audit = summarize_label_band_audit(y_train, stats, split_name="train") if BAND_DIAG else None
 
     TrainSourceCls = CPUWindowBatchSource if TRAIN_DATA_DEVICE == "cpu_pinned" else GPUWindowBatchSource
     train_sources = [
@@ -1837,6 +2137,13 @@ def train_from_offline():
         row_stride=1,
     )
     val_fast_src = val_full_src.make_evenly_spaced_subset(FAST_VAL_MAX_ROWS)
+    train_band_src = None
+    if BAND_DIAG and BAND_DIAG_TRAIN:
+        train_band_src = make_train_band_eval_source(train_sources, BAND_DIAG_TRAIN_MAX_ROWS)
+        print(
+            f"[band-train-data] rows={train_band_src.n_rows} max_rows={BAND_DIAG_TRAIN_MAX_ROWS} weeks={len(train_sources)}",
+            flush=True,
+        )
     train_feature_gb_name = "feature_gb_cpu" if TRAIN_DATA_DEVICE == "cpu_pinned" else "feature_gb_gpu"
     for i, src in enumerate(train_sources):
         print(
@@ -2129,9 +2436,16 @@ def train_from_offline():
         train_mag_norm = (mag_norm_sum / max(1, n_batches)).item()
         train_corr_norm = (corr_norm_sum / max(1, n_batches)).item()
         print(f"[train] loss={train_loss:.6f} dir_bce={train_dir_bce:.6f} mag_huber={train_mag_huber:.6f} mag_up_huber={train_mag_up_huber:.6f} mag_down_huber={train_mag_down_huber:.6f} mag_corr={train_mag_corr:.6f} dir_norm={train_dir_norm:.6f} mag_norm={train_mag_norm:.6f} corr_norm={train_corr_norm:.6f}")
+        if BAND_DIAG and BAND_DIAG_TRAIN and train_band_src is not None:
+            train_band = summarize_metrics(
+                model, train_band_src, device, stats, amp_enabled, amp_dtype,
+                primary_only=False, epoch=epoch, band_diag=True, split_name="train",
+            )
+            print_band_metrics_summary(train_band["band_metrics"], split_name="train", epoch=epoch)
+            save_band_metrics_jsonl(out_root, train_band["band_metrics"], epoch=epoch, split_name="train")
 
         val_fast_t0 = time.perf_counter()
-        val_fast=summarize_metrics(model, val_fast_src, device, stats, amp_enabled, amp_dtype, primary_only=True, epoch=epoch)
+        val_fast=summarize_metrics(model, val_fast_src, device, stats, amp_enabled, amp_dtype, primary_only=True, epoch=epoch, band_diag=BAND_DIAG, split_name="val_fast")
         val_fast_sec = time.perf_counter() - val_fast_t0
         primary_metric_value, primary_metric_label = compute_primary_metric(val_fast)
         print(
@@ -2142,16 +2456,26 @@ def train_from_offline():
             f"guard_passed={val_fast.get('primary_metric_guard_passed', False)} "
             f"rows={val_fast.get('n_eval_rows', 0)}"
         )
+        if BAND_DIAG:
+            print_band_metrics_summary(val_fast["band_metrics"], split_name="val", epoch=epoch)
+            save_band_metrics_jsonl(out_root, val_fast["band_metrics"], epoch=epoch, split_name="val_fast")
         full_val_sec = 0.0
         improved = math.isfinite(primary_metric_value) and is_metric_improved(primary_metric_value,best,primary_metric_mode)
         if improved:
             best=float(primary_metric_value); no_imp=0
             full_t0 = time.perf_counter()
-            full=summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch)
+            full=summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch, band_diag=BAND_DIAG, split_name="val_full")
             full_val_sec += time.perf_counter() - full_t0
-            print(f"[val_dir] dir_auc_q50plus={full['dir_auc_q50plus']} dir_bal_acc_q50plus={full['dir_bal_acc_q50plus']} dir_pos_frac_pred_q50plus={full['dir_pos_frac_pred_q50plus']} dir_pos_frac_true_q50plus={full['dir_pos_frac_true_q50plus']}")
-            print(f"[val_mag] mag_spearman_abs_q50plus={full['mag_spearman_abs_q50plus']} pred_abs_bps_p50_kept={full['pred_abs_bps_p50_kept']} true_abs_bps_p50_kept={full['true_abs_bps_p50_kept']} pred_abs_bps_p90_kept={full['pred_abs_bps_p90_kept']} true_abs_bps_p90_kept={full['true_abs_bps_p90_kept']} pred_abs_std_over_true_abs_std_kept={full['pred_abs_std_over_true_abs_std_kept']}")
-            print(f"[val_edge] edge_spearman_q50plus={full['edge_spearman_q50plus']} edge_bal_sign_acc_q50plus={full['edge_bal_sign_acc_q50plus']} edge_mean_kept={full['edge_mean_kept']} edge_std_kept={full['edge_std_kept']} edge_abs_p90_kept={full['edge_abs_p90_kept']}")
+            full_value, full_label = compute_primary_metric(full)
+            print(
+                f"[val_full] epoch={epoch + 1} rows={full.get('n_eval_rows', 0)} "
+                f"primary_metric_name={full_label} value={full_value:.6f} "
+                f"guard_dir_bal_acc={full.get('primary_dir_bal_acc', float('nan')):.6f} "
+                f"guard_passed={full.get('primary_metric_guard_passed', False)}"
+            )
+            if BAND_DIAG:
+                print_band_metrics_summary(full["band_metrics"], split_name="val_full", epoch=epoch)
+                save_band_metrics_jsonl(out_root, full["band_metrics"], epoch=epoch, split_name="val_full")
             ckpt={
                 'epoch': epoch,
                 'state_dict': get_model_state_dict(model),
@@ -2188,11 +2512,18 @@ def train_from_offline():
             no_imp += 1
             if (epoch + 1) % FULL_VAL_EVERY == 0:
                 full_t0 = time.perf_counter()
-                full_periodic = summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch)
+                full_periodic = summarize_metrics(model, val_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=epoch, band_diag=BAND_DIAG, split_name="val_full")
                 full_val_sec += time.perf_counter() - full_t0
-                print(f"[val_dir] dir_auc_q50plus={full_periodic['dir_auc_q50plus']} dir_bal_acc_q50plus={full_periodic['dir_bal_acc_q50plus']} dir_pos_frac_pred_q50plus={full_periodic['dir_pos_frac_pred_q50plus']} dir_pos_frac_true_q50plus={full_periodic['dir_pos_frac_true_q50plus']}")
-                print(f"[val_mag] mag_spearman_abs_q50plus={full_periodic['mag_spearman_abs_q50plus']} pred_abs_bps_p50_kept={full_periodic['pred_abs_bps_p50_kept']} true_abs_bps_p50_kept={full_periodic['true_abs_bps_p50_kept']} pred_abs_bps_p90_kept={full_periodic['pred_abs_bps_p90_kept']} true_abs_bps_p90_kept={full_periodic['true_abs_bps_p90_kept']} pred_abs_std_over_true_abs_std_kept={full_periodic['pred_abs_std_over_true_abs_std_kept']}")
-                print(f"[val_edge] edge_spearman_q50plus={full_periodic['edge_spearman_q50plus']} edge_bal_sign_acc_q50plus={full_periodic['edge_bal_sign_acc_q50plus']} edge_mean_kept={full_periodic['edge_mean_kept']} edge_std_kept={full_periodic['edge_std_kept']} edge_abs_p90_kept={full_periodic['edge_abs_p90_kept']}")
+                full_value, full_label = compute_primary_metric(full_periodic)
+                print(
+                    f"[val_full] epoch={epoch + 1} rows={full_periodic.get('n_eval_rows', 0)} "
+                    f"primary_metric_name={full_label} value={full_value:.6f} "
+                    f"guard_dir_bal_acc={full_periodic.get('primary_dir_bal_acc', float('nan')):.6f} "
+                    f"guard_passed={full_periodic.get('primary_metric_guard_passed', False)}"
+                )
+                if BAND_DIAG:
+                    print_band_metrics_summary(full_periodic["band_metrics"], split_name="val_full", epoch=epoch)
+                    save_band_metrics_jsonl(out_root, full_periodic["band_metrics"], epoch=epoch, split_name="val_full")
         total_sec = time.perf_counter() - epoch_t0
         print(f"[epoch_time] train_sec={train_sec:.3f} val_fast_sec={val_fast_sec:.3f} full_val_sec={full_val_sec:.3f} total_sec={total_sec:.3f}")
 
@@ -2247,10 +2578,17 @@ def train_from_offline():
         f"pin_memory={test_full_src.pin_memory}"
     )
 
-    test=summarize_metrics(model, test_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=0)
-    print(f"[test_dir] dir_auc_q50plus={test['dir_auc_q50plus']} dir_bal_acc_q50plus={test['dir_bal_acc_q50plus']} dir_pos_frac_pred_q50plus={test['dir_pos_frac_pred_q50plus']} dir_pos_frac_true_q50plus={test['dir_pos_frac_true_q50plus']}")
-    print(f"[test_mag] mag_spearman_abs_q50plus={test['mag_spearman_abs_q50plus']} pred_abs_std_over_true_abs_std_kept={test['pred_abs_std_over_true_abs_std_kept']} pred_abs_bps_p50_kept={test['pred_abs_bps_p50_kept']} true_abs_bps_p50_kept={test['true_abs_bps_p50_kept']}")
-    print(f"[test_edge] edge_spearman_q50plus={test['edge_spearman_q50plus']} edge_bal_sign_acc_q50plus={test['edge_bal_sign_acc_q50plus']} edge_mean_kept={test['edge_mean_kept']} edge_std_kept={test['edge_std_kept']}")
+    test=summarize_metrics(model, test_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name="test")
+    test_value, test_label = compute_primary_metric(test)
+    print(
+        f"[test] rows={test.get('n_eval_rows', 0)} primary_metric_name={test_label} value={test_value:.6f} "
+        f"guard_dir_bal_acc={test.get('primary_dir_bal_acc', float('nan')):.6f} "
+        f"guard_passed={test.get('primary_metric_guard_passed', False)}"
+    )
+    if BAND_DIAG:
+        best_epoch_or_0 = int(ckpt.get('epoch', 0)) if isinstance(ckpt, dict) else 0
+        print_band_metrics_summary(test["band_metrics"], split_name="test", epoch=best_epoch_or_0)
+        save_band_metrics_jsonl(out_root, test["band_metrics"], epoch=best_epoch_or_0, split_name="test")
     print('[done] Training complete.')
 
 
