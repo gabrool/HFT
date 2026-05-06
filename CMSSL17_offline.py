@@ -517,8 +517,36 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
-    keys = ('low_abs_trim_fraction','high_abs_trim_fraction','horizons_ms','split_protocol','train_week_keys','train_ts_start','train_ts_end','decision_time_basis','trade_history_enabled','event_stream_mode','target_transform','label_units','target_task','loss_weighting_schema','ranking_schema','band_diag_quantiles')
-    return all(cached_meta.get(k)==current_meta.get(k) for k in keys)
+    keys = (
+        'low_abs_trim_fraction',
+        'high_abs_trim_fraction',
+        'horizons_ms',
+        'split_protocol',
+        'train_week_keys',
+        'train_ts_start',
+        'train_ts_end',
+        'decision_time_basis',
+        'trade_history_enabled',
+        'event_stream_mode',
+        'target_transform',
+        'label_units',
+        'target_task',
+        'loss_weighting_schema',
+        'ranking_schema',
+    )
+    if not all(cached_meta.get(k) == current_meta.get(k) for k in keys):
+        return False
+
+    expected_band_q = [float(x) for x in BAND_DIAG_QUANTILES]
+    cached_band_q = cached_meta.get("band_diag_quantiles")
+    current_band_q = current_meta.get("band_diag_quantiles")
+
+    if current_band_q != expected_band_q:
+        return False
+    if cached_band_q != expected_band_q:
+        return False
+
+    return True
 
 
 def _safe_pearson_np(x: np.ndarray, y: np.ndarray) -> float:
@@ -1414,171 +1442,174 @@ def summarize_metrics(
     band_diag: bool = False,
     split_name: str = "eval",
 ):
+    was_training = model.training
     model.eval()
-    dir_parts, up_parts, down_parts, y_parts = [], [], [], []
-    with torch.inference_mode():
-        for x, y_raw in source.iter_epoch(epoch):
-            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
-                pred = model(x)
-            if not isinstance(pred, dict) or set(pred.keys()) != {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}:
-                raise ValueError(f"Model output must be dict with fixed schema, got keys={list(pred.keys()) if isinstance(pred, dict) else type(pred)}")
-            for key in pred:
-                if pred[key].shape != y_raw.shape:
-                    raise ValueError(f"Shape mismatch for {key}: pred={tuple(pred[key].shape)} y_raw={tuple(y_raw.shape)}")
-            d = derive_dir_mag_predictions(pred)
-            dir_parts.append(pred["dir_logits"].detach().float().cpu().numpy())
-            up_parts.append(pred["mag_up_sqrt"].detach().float().cpu().numpy())
-            down_parts.append(pred["mag_down_sqrt"].detach().float().cpu().numpy())
-            y_parts.append(y_raw.detach().float().cpu().numpy())
-    n_eval_rows = int(sum(a.shape[0] for a in y_parts))
-    out = {"primary_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS), "n_eval_rows": n_eval_rows}
-    if not y_parts:
-        out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
-        out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
-        out["primary_metric_guard_passed"] = False
-        return out
-    dir_logits = np.concatenate(dir_parts, axis=0)
-    p_up = 1.0 / (1.0 + np.exp(-dir_logits))
-    mag_up_sqrt = np.concatenate(up_parts, axis=0)
-    mag_down_sqrt = np.concatenate(down_parts, axis=0)
-    y_raw = np.concatenate(y_parts, axis=0)
-    mag_up_bps = mag_up_sqrt ** 2
-    mag_down_bps = mag_down_sqrt ** 2
-    mag_pred_sqrt = p_up * mag_up_sqrt + (1.0 - p_up) * mag_down_sqrt
-    edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
-    abs_raw = np.abs(y_raw)
-    keep = build_abs_trim_mask(y_raw, stats['abs_lo_raw_bps'], stats['abs_hi_raw_bps'])
-    true_up = y_raw > 0
-    pred_up = p_up >= 0.5
-    if primary_only:
-        out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
-        out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
-        h = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-        q50plus = keep[:, h] & (abs_raw[:, h] >= float(stats['kept_q50_abs_raw_bps'][h]))
-        out["edge_spearman_q50plus"][h] = _safe_spearman_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
-        out["dir_bal_acc_q50plus"][h] = _balanced_acc_np(pred_up[:, h][q50plus], true_up[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
-        out["primary_dir_bal_acc"] = out["dir_bal_acc_q50plus"][h]
-        out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
-        if band_diag:
-            out["band_metrics"] = summarize_band_metrics_from_arrays(
-                dir_logits=dir_logits,
-                mag_up_sqrt=mag_up_sqrt,
-                mag_down_sqrt=mag_down_sqrt,
-                y_raw=y_raw,
-                stats=stats,
-                split_name=split_name,
-            )
-        return out
-
-    keys = [
-        "dir_auc_q50plus", "dir_auc_q85plus", "dir_acc_q50plus", "dir_acc_q85plus", "dir_bal_acc_q50plus",
-        "dir_bal_acc_q85plus", "dir_pos_frac_pred_q50plus", "dir_pos_frac_true_q50plus", "dir_pos_frac_pred_q85plus",
-        "dir_pos_frac_true_q85plus", "dir_auc_kept", "dir_bal_acc_kept", "mag_spearman_abs_q50plus",
-        "mag_pearson_abs_q50plus", "mag_spearman_abs_q85plus", "mag_pearson_abs_q85plus", "true_abs_bps_p50_kept",
-        "true_abs_bps_p90_kept", "pred_abs_bps_p50_kept", "pred_abs_bps_p90_kept", "true_abs_bps_std_kept",
-        "pred_abs_bps_std_kept", "pred_abs_std_over_true_abs_std_kept", "pred_abs_p90_over_true_abs_p90_kept",
-        "mag_up_huber_pos_kept", "mag_down_huber_neg_kept", "mag_up_pred_bps_p50_pos_kept", "mag_down_pred_bps_p50_neg_kept",
-        "edge_pearson_all", "edge_spearman_all", "edge_pearson_kept", "edge_spearman_kept", "edge_pearson_q50plus",
-        "edge_spearman_q50plus", "edge_pearson_q85plus", "edge_spearman_q85plus", "edge_sign_acc_q50plus",
-        "edge_bal_sign_acc_q50plus", "edge_sign_acc_q85plus", "edge_bal_sign_acc_q85plus", "edge_pos_frac_q50plus",
-        "edge_pos_frac_q85plus", "edge_mean_kept", "edge_std_kept", "edge_abs_p50_kept", "edge_abs_p90_kept",
-        "val_dir_bce_kept", "val_mag_huber_kept",
-    ]
-    for k in keys:
-        out[k] = []
-    true_abs_bps = abs_raw
-    pred_abs_bps = mag_pred_sqrt ** 2
-    for h in range(NUM_HORIZONS):
-        kh = keep[:, h]
-        q50plus = kh & (abs_raw[:, h] >= float(stats['kept_q50_abs_raw_bps'][h]))
-        q85plus = kh & (abs_raw[:, h] >= float(stats['kept_q85_abs_raw_bps'][h]))
-        out["dir_auc_q50plus"].append(_binary_auc_np(p_up[:, h][q50plus], true_up[:, h][q50plus]))
-        out["dir_auc_q85plus"].append(_binary_auc_np(p_up[:, h][q85plus], true_up[:, h][q85plus]))
-        out["dir_acc_q50plus"].append(float(np.mean(pred_up[:, h][q50plus] == true_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
-        out["dir_acc_q85plus"].append(float(np.mean(pred_up[:, h][q85plus] == true_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
-        out["dir_bal_acc_q50plus"].append(_balanced_acc_np(pred_up[:, h][q50plus], true_up[:, h][q50plus]))
-        out["dir_bal_acc_q85plus"].append(_balanced_acc_np(pred_up[:, h][q85plus], true_up[:, h][q85plus]))
-        out["dir_pos_frac_pred_q50plus"].append(float(np.mean(pred_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
-        out["dir_pos_frac_true_q50plus"].append(float(np.mean(true_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
-        out["dir_pos_frac_pred_q85plus"].append(float(np.mean(pred_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
-        out["dir_pos_frac_true_q85plus"].append(float(np.mean(true_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
-        out["dir_auc_kept"].append(_binary_auc_np(p_up[:, h][kh], true_up[:, h][kh]))
-        out["dir_bal_acc_kept"].append(_balanced_acc_np(pred_up[:, h][kh], true_up[:, h][kh]))
-        out["mag_spearman_abs_q50plus"].append(_safe_spearman_np(pred_abs_bps[:, h][q50plus], true_abs_bps[:, h][q50plus]))
-        out["mag_pearson_abs_q50plus"].append(_safe_pearson_np(pred_abs_bps[:, h][q50plus], true_abs_bps[:, h][q50plus]))
-        out["mag_spearman_abs_q85plus"].append(_safe_spearman_np(pred_abs_bps[:, h][q85plus], true_abs_bps[:, h][q85plus]))
-        out["mag_pearson_abs_q85plus"].append(_safe_pearson_np(pred_abs_bps[:, h][q85plus], true_abs_bps[:, h][q85plus]))
-        out["true_abs_bps_p50_kept"].append(_safe_quantile_np(true_abs_bps[:, h][kh], 0.50))
-        out["true_abs_bps_p90_kept"].append(_safe_quantile_np(true_abs_bps[:, h][kh], 0.90))
-        out["pred_abs_bps_p50_kept"].append(_safe_quantile_np(pred_abs_bps[:, h][kh], 0.50))
-        out["pred_abs_bps_p90_kept"].append(_safe_quantile_np(pred_abs_bps[:, h][kh], 0.90))
-        true_std = float(np.std(true_abs_bps[:, h][kh], ddof=0)) if np.any(kh) else float("nan")
-        pred_std = float(np.std(pred_abs_bps[:, h][kh], ddof=0)) if np.any(kh) else float("nan")
-        out["true_abs_bps_std_kept"].append(true_std)
-        out["pred_abs_bps_std_kept"].append(pred_std)
-        out["pred_abs_std_over_true_abs_std_kept"].append(pred_std / true_std if math.isfinite(true_std) and true_std > 0 else float("nan"))
-        true_p90 = out["true_abs_bps_p90_kept"][-1]
-        pred_p90 = out["pred_abs_bps_p90_kept"][-1]
-        out["pred_abs_p90_over_true_abs_p90_kept"].append(pred_p90 / true_p90 if math.isfinite(true_p90) and true_p90 > 0 else float("nan"))
-        pos_kept = kh & (y_raw[:, h] > 0)
-        neg_kept = kh & (y_raw[:, h] < 0)
-        out["mag_up_huber_pos_kept"].append(float(np.mean(np.where((mag_up_sqrt[:, h][pos_kept] - np.sqrt(abs_raw[:, h][pos_kept])) ** 2 <= 1.0, 0.5 * (mag_up_sqrt[:, h][pos_kept] - np.sqrt(abs_raw[:, h][pos_kept])) ** 2, np.abs(mag_up_sqrt[:, h][pos_kept] - np.sqrt(abs_raw[:, h][pos_kept])) - 0.5))) if np.any(pos_kept) else float("nan"))
-        out["mag_down_huber_neg_kept"].append(float(np.mean(np.where((mag_down_sqrt[:, h][neg_kept] - np.sqrt(abs_raw[:, h][neg_kept])) ** 2 <= 1.0, 0.5 * (mag_down_sqrt[:, h][neg_kept] - np.sqrt(abs_raw[:, h][neg_kept])) ** 2, np.abs(mag_down_sqrt[:, h][neg_kept] - np.sqrt(abs_raw[:, h][neg_kept])) - 0.5))) if np.any(neg_kept) else float("nan"))
-        out["mag_up_pred_bps_p50_pos_kept"].append(_safe_quantile_np(mag_up_bps[:, h][pos_kept], 0.50))
-        out["mag_down_pred_bps_p50_neg_kept"].append(_safe_quantile_np(mag_down_bps[:, h][neg_kept], 0.50))
-        out["edge_pearson_all"].append(_safe_pearson_np(edge_bps[:, h], y_raw[:, h]))
-        out["edge_spearman_all"].append(_safe_spearman_np(edge_bps[:, h], y_raw[:, h]))
-        out["edge_pearson_kept"].append(_safe_pearson_np(edge_bps[:, h][kh], y_raw[:, h][kh]))
-        out["edge_spearman_kept"].append(_safe_spearman_np(edge_bps[:, h][kh], y_raw[:, h][kh]))
-        out["edge_pearson_q50plus"].append(_safe_pearson_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]))
-        out["edge_spearman_q50plus"].append(_safe_spearman_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]))
-        out["edge_pearson_q85plus"].append(_safe_pearson_np(edge_bps[:, h][q85plus], y_raw[:, h][q85plus]))
-        out["edge_spearman_q85plus"].append(_safe_spearman_np(edge_bps[:, h][q85plus], y_raw[:, h][q85plus]))
-        edge_sign = edge_bps[:, h] >= 0
-        out["edge_sign_acc_q50plus"].append(float(np.mean(edge_sign[q50plus] == true_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
-        out["edge_bal_sign_acc_q50plus"].append(_balanced_acc_np(edge_sign[q50plus], true_up[:, h][q50plus]))
-        out["edge_sign_acc_q85plus"].append(float(np.mean(edge_sign[q85plus] == true_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
-        out["edge_bal_sign_acc_q85plus"].append(_balanced_acc_np(edge_sign[q85plus], true_up[:, h][q85plus]))
-        out["edge_pos_frac_q50plus"].append(float(np.mean(edge_sign[q50plus])) if np.any(q50plus) else float("nan"))
-        out["edge_pos_frac_q85plus"].append(float(np.mean(edge_sign[q85plus])) if np.any(q85plus) else float("nan"))
-        out["edge_mean_kept"].append(float(np.mean(edge_bps[:, h][kh])) if np.any(kh) else float("nan"))
-        out["edge_std_kept"].append(float(np.std(edge_bps[:, h][kh], ddof=0)) if np.any(kh) else float("nan"))
-        out["edge_abs_p50_kept"].append(_safe_quantile_np(np.abs(edge_bps[:, h][kh]), 0.50))
-        out["edge_abs_p90_kept"].append(_safe_quantile_np(np.abs(edge_bps[:, h][kh]), 0.90))
-        if np.any(kh):
-            yt = true_up[:, h][kh].astype(np.float32)
-            prob = p_up[:, h][kh]
-            bce = -(yt * np.log(np.clip(prob, 1e-9, 1.0)) + (1.0 - yt) * np.log(np.clip(1.0 - prob, 1e-9, 1.0)))
-            out["val_dir_bce_kept"].append(float(np.mean(bce)))
-            up_h = kh & (y_raw[:, h] > 0)
-            dn_h = kh & (y_raw[:, h] < 0)
-            errs = []
-            if np.any(up_h):
-                errs.append(mag_up_sqrt[:, h][up_h] - np.sqrt(abs_raw[:, h][up_h]))
-            if np.any(dn_h):
-                errs.append(mag_down_sqrt[:, h][dn_h] - np.sqrt(abs_raw[:, h][dn_h]))
-            if errs:
-                d = np.abs(np.concatenate(errs))
-                hub = np.where(d <= 1.0, 0.5 * d * d, d - 0.5)
-                out["val_mag_huber_kept"].append(float(np.mean(hub)))
-            else:
-                out["val_mag_huber_kept"].append(float("nan"))
+    try:
+        dir_parts, up_parts, down_parts, y_parts = [], [], [], []
+        with torch.inference_mode():
+            for x, y_raw in source.iter_epoch(epoch):
+                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                    pred = model(x)
+                if not isinstance(pred, dict) or set(pred.keys()) != {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}:
+                    raise ValueError(f"Model output must be dict with fixed schema, got keys={list(pred.keys()) if isinstance(pred, dict) else type(pred)}")
+                for key in pred:
+                    if pred[key].shape != y_raw.shape:
+                        raise ValueError(f"Shape mismatch for {key}: pred={tuple(pred[key].shape)} y_raw={tuple(y_raw.shape)}")
+                d = derive_dir_mag_predictions(pred)
+                dir_parts.append(pred["dir_logits"].detach().float().cpu().numpy())
+                up_parts.append(pred["mag_up_sqrt"].detach().float().cpu().numpy())
+                down_parts.append(pred["mag_down_sqrt"].detach().float().cpu().numpy())
+                y_parts.append(y_raw.detach().float().cpu().numpy())
+        n_eval_rows = int(sum(a.shape[0] for a in y_parts))
+        out = {"primary_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS), "n_eval_rows": n_eval_rows}
+        if not y_parts:
+            out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
+            out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
+            out["primary_metric_guard_passed"] = False
         else:
-            out["val_dir_bce_kept"].append(float("nan"))
-            out["val_mag_huber_kept"].append(float("nan"))
-    primary_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    out["primary_dir_bal_acc"] = float(out["dir_bal_acc_q50plus"][primary_idx])
-    out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
-    if band_diag:
-        out["band_metrics"] = summarize_band_metrics_from_arrays(
-            dir_logits=dir_logits,
-            mag_up_sqrt=mag_up_sqrt,
-            mag_down_sqrt=mag_down_sqrt,
-            y_raw=y_raw,
-            stats=stats,
-            split_name=split_name,
-        )
-    return out
+            dir_logits = np.concatenate(dir_parts, axis=0)
+            p_up = 1.0 / (1.0 + np.exp(-dir_logits))
+            mag_up_sqrt = np.concatenate(up_parts, axis=0)
+            mag_down_sqrt = np.concatenate(down_parts, axis=0)
+            y_raw = np.concatenate(y_parts, axis=0)
+            mag_up_bps = mag_up_sqrt ** 2
+            mag_down_bps = mag_down_sqrt ** 2
+            mag_pred_sqrt = p_up * mag_up_sqrt + (1.0 - p_up) * mag_down_sqrt
+            edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
+            abs_raw = np.abs(y_raw)
+            keep = build_abs_trim_mask(y_raw, stats['abs_lo_raw_bps'], stats['abs_hi_raw_bps'])
+            true_up = y_raw > 0
+            pred_up = p_up >= 0.5
+            if primary_only:
+                out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
+                out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
+                h = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+                q50plus = keep[:, h] & (abs_raw[:, h] >= float(stats['kept_q50_abs_raw_bps'][h]))
+                out["edge_spearman_q50plus"][h] = _safe_spearman_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
+                out["dir_bal_acc_q50plus"][h] = _balanced_acc_np(pred_up[:, h][q50plus], true_up[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
+                out["primary_dir_bal_acc"] = out["dir_bal_acc_q50plus"][h]
+                out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
+                if band_diag:
+                    out["band_metrics"] = summarize_band_metrics_from_arrays(
+                        dir_logits=dir_logits,
+                        mag_up_sqrt=mag_up_sqrt,
+                        mag_down_sqrt=mag_down_sqrt,
+                        y_raw=y_raw,
+                        stats=stats,
+                        split_name=split_name,
+                    )
+            else:
+                keys = [
+                    "dir_auc_q50plus", "dir_auc_q85plus", "dir_acc_q50plus", "dir_acc_q85plus", "dir_bal_acc_q50plus",
+                    "dir_bal_acc_q85plus", "dir_pos_frac_pred_q50plus", "dir_pos_frac_true_q50plus", "dir_pos_frac_pred_q85plus",
+                    "dir_pos_frac_true_q85plus", "dir_auc_kept", "dir_bal_acc_kept", "mag_spearman_abs_q50plus",
+                    "mag_pearson_abs_q50plus", "mag_spearman_abs_q85plus", "mag_pearson_abs_q85plus", "true_abs_bps_p50_kept",
+                    "true_abs_bps_p90_kept", "pred_abs_bps_p50_kept", "pred_abs_bps_p90_kept", "true_abs_bps_std_kept",
+                    "pred_abs_bps_std_kept", "pred_abs_std_over_true_abs_std_kept", "pred_abs_p90_over_true_abs_p90_kept",
+                    "mag_up_huber_pos_kept", "mag_down_huber_neg_kept", "mag_up_pred_bps_p50_pos_kept", "mag_down_pred_bps_p50_neg_kept",
+                    "edge_pearson_all", "edge_spearman_all", "edge_pearson_kept", "edge_spearman_kept", "edge_pearson_q50plus",
+                    "edge_spearman_q50plus", "edge_pearson_q85plus", "edge_spearman_q85plus", "edge_sign_acc_q50plus",
+                    "edge_bal_sign_acc_q50plus", "edge_sign_acc_q85plus", "edge_bal_sign_acc_q85plus", "edge_pos_frac_q50plus",
+                    "edge_pos_frac_q85plus", "edge_mean_kept", "edge_std_kept", "edge_abs_p50_kept", "edge_abs_p90_kept",
+                    "val_dir_bce_kept", "val_mag_huber_kept",
+                ]
+                for k in keys:
+                    out[k] = []
+                true_abs_bps = abs_raw
+                pred_abs_bps = mag_pred_sqrt ** 2
+                for h in range(NUM_HORIZONS):
+                    kh = keep[:, h]
+                    q50plus = kh & (abs_raw[:, h] >= float(stats['kept_q50_abs_raw_bps'][h]))
+                    q85plus = kh & (abs_raw[:, h] >= float(stats['kept_q85_abs_raw_bps'][h]))
+                    out["dir_auc_q50plus"].append(_binary_auc_np(p_up[:, h][q50plus], true_up[:, h][q50plus]))
+                    out["dir_auc_q85plus"].append(_binary_auc_np(p_up[:, h][q85plus], true_up[:, h][q85plus]))
+                    out["dir_acc_q50plus"].append(float(np.mean(pred_up[:, h][q50plus] == true_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
+                    out["dir_acc_q85plus"].append(float(np.mean(pred_up[:, h][q85plus] == true_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
+                    out["dir_bal_acc_q50plus"].append(_balanced_acc_np(pred_up[:, h][q50plus], true_up[:, h][q50plus]))
+                    out["dir_bal_acc_q85plus"].append(_balanced_acc_np(pred_up[:, h][q85plus], true_up[:, h][q85plus]))
+                    out["dir_pos_frac_pred_q50plus"].append(float(np.mean(pred_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
+                    out["dir_pos_frac_true_q50plus"].append(float(np.mean(true_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
+                    out["dir_pos_frac_pred_q85plus"].append(float(np.mean(pred_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
+                    out["dir_pos_frac_true_q85plus"].append(float(np.mean(true_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
+                    out["dir_auc_kept"].append(_binary_auc_np(p_up[:, h][kh], true_up[:, h][kh]))
+                    out["dir_bal_acc_kept"].append(_balanced_acc_np(pred_up[:, h][kh], true_up[:, h][kh]))
+                    out["mag_spearman_abs_q50plus"].append(_safe_spearman_np(pred_abs_bps[:, h][q50plus], true_abs_bps[:, h][q50plus]))
+                    out["mag_pearson_abs_q50plus"].append(_safe_pearson_np(pred_abs_bps[:, h][q50plus], true_abs_bps[:, h][q50plus]))
+                    out["mag_spearman_abs_q85plus"].append(_safe_spearman_np(pred_abs_bps[:, h][q85plus], true_abs_bps[:, h][q85plus]))
+                    out["mag_pearson_abs_q85plus"].append(_safe_pearson_np(pred_abs_bps[:, h][q85plus], true_abs_bps[:, h][q85plus]))
+                    out["true_abs_bps_p50_kept"].append(_safe_quantile_np(true_abs_bps[:, h][kh], 0.50))
+                    out["true_abs_bps_p90_kept"].append(_safe_quantile_np(true_abs_bps[:, h][kh], 0.90))
+                    out["pred_abs_bps_p50_kept"].append(_safe_quantile_np(pred_abs_bps[:, h][kh], 0.50))
+                    out["pred_abs_bps_p90_kept"].append(_safe_quantile_np(pred_abs_bps[:, h][kh], 0.90))
+                    true_std = float(np.std(true_abs_bps[:, h][kh], ddof=0)) if np.any(kh) else float("nan")
+                    pred_std = float(np.std(pred_abs_bps[:, h][kh], ddof=0)) if np.any(kh) else float("nan")
+                    out["true_abs_bps_std_kept"].append(true_std)
+                    out["pred_abs_bps_std_kept"].append(pred_std)
+                    out["pred_abs_std_over_true_abs_std_kept"].append(pred_std / true_std if math.isfinite(true_std) and true_std > 0 else float("nan"))
+                    true_p90 = out["true_abs_bps_p90_kept"][-1]
+                    pred_p90 = out["pred_abs_bps_p90_kept"][-1]
+                    out["pred_abs_p90_over_true_abs_p90_kept"].append(pred_p90 / true_p90 if math.isfinite(true_p90) and true_p90 > 0 else float("nan"))
+                    pos_kept = kh & (y_raw[:, h] > 0)
+                    neg_kept = kh & (y_raw[:, h] < 0)
+                    out["mag_up_huber_pos_kept"].append(float(np.mean(np.where((mag_up_sqrt[:, h][pos_kept] - np.sqrt(abs_raw[:, h][pos_kept])) ** 2 <= 1.0, 0.5 * (mag_up_sqrt[:, h][pos_kept] - np.sqrt(abs_raw[:, h][pos_kept])) ** 2, np.abs(mag_up_sqrt[:, h][pos_kept] - np.sqrt(abs_raw[:, h][pos_kept])) - 0.5))) if np.any(pos_kept) else float("nan"))
+                    out["mag_down_huber_neg_kept"].append(float(np.mean(np.where((mag_down_sqrt[:, h][neg_kept] - np.sqrt(abs_raw[:, h][neg_kept])) ** 2 <= 1.0, 0.5 * (mag_down_sqrt[:, h][neg_kept] - np.sqrt(abs_raw[:, h][neg_kept])) ** 2, np.abs(mag_down_sqrt[:, h][neg_kept] - np.sqrt(abs_raw[:, h][neg_kept])) - 0.5))) if np.any(neg_kept) else float("nan"))
+                    out["mag_up_pred_bps_p50_pos_kept"].append(_safe_quantile_np(mag_up_bps[:, h][pos_kept], 0.50))
+                    out["mag_down_pred_bps_p50_neg_kept"].append(_safe_quantile_np(mag_down_bps[:, h][neg_kept], 0.50))
+                    out["edge_pearson_all"].append(_safe_pearson_np(edge_bps[:, h], y_raw[:, h]))
+                    out["edge_spearman_all"].append(_safe_spearman_np(edge_bps[:, h], y_raw[:, h]))
+                    out["edge_pearson_kept"].append(_safe_pearson_np(edge_bps[:, h][kh], y_raw[:, h][kh]))
+                    out["edge_spearman_kept"].append(_safe_spearman_np(edge_bps[:, h][kh], y_raw[:, h][kh]))
+                    out["edge_pearson_q50plus"].append(_safe_pearson_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]))
+                    out["edge_spearman_q50plus"].append(_safe_spearman_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]))
+                    out["edge_pearson_q85plus"].append(_safe_pearson_np(edge_bps[:, h][q85plus], y_raw[:, h][q85plus]))
+                    out["edge_spearman_q85plus"].append(_safe_spearman_np(edge_bps[:, h][q85plus], y_raw[:, h][q85plus]))
+                    edge_sign = edge_bps[:, h] >= 0
+                    out["edge_sign_acc_q50plus"].append(float(np.mean(edge_sign[q50plus] == true_up[:, h][q50plus])) if np.any(q50plus) else float("nan"))
+                    out["edge_bal_sign_acc_q50plus"].append(_balanced_acc_np(edge_sign[q50plus], true_up[:, h][q50plus]))
+                    out["edge_sign_acc_q85plus"].append(float(np.mean(edge_sign[q85plus] == true_up[:, h][q85plus])) if np.any(q85plus) else float("nan"))
+                    out["edge_bal_sign_acc_q85plus"].append(_balanced_acc_np(edge_sign[q85plus], true_up[:, h][q85plus]))
+                    out["edge_pos_frac_q50plus"].append(float(np.mean(edge_sign[q50plus])) if np.any(q50plus) else float("nan"))
+                    out["edge_pos_frac_q85plus"].append(float(np.mean(edge_sign[q85plus])) if np.any(q85plus) else float("nan"))
+                    out["edge_mean_kept"].append(float(np.mean(edge_bps[:, h][kh])) if np.any(kh) else float("nan"))
+                    out["edge_std_kept"].append(float(np.std(edge_bps[:, h][kh], ddof=0)) if np.any(kh) else float("nan"))
+                    out["edge_abs_p50_kept"].append(_safe_quantile_np(np.abs(edge_bps[:, h][kh]), 0.50))
+                    out["edge_abs_p90_kept"].append(_safe_quantile_np(np.abs(edge_bps[:, h][kh]), 0.90))
+                    if np.any(kh):
+                        yt = true_up[:, h][kh].astype(np.float32)
+                        prob = p_up[:, h][kh]
+                        bce = -(yt * np.log(np.clip(prob, 1e-9, 1.0)) + (1.0 - yt) * np.log(np.clip(1.0 - prob, 1e-9, 1.0)))
+                        out["val_dir_bce_kept"].append(float(np.mean(bce)))
+                        up_h = kh & (y_raw[:, h] > 0)
+                        dn_h = kh & (y_raw[:, h] < 0)
+                        errs = []
+                        if np.any(up_h):
+                            errs.append(mag_up_sqrt[:, h][up_h] - np.sqrt(abs_raw[:, h][up_h]))
+                        if np.any(dn_h):
+                            errs.append(mag_down_sqrt[:, h][dn_h] - np.sqrt(abs_raw[:, h][dn_h]))
+                        if errs:
+                            d = np.abs(np.concatenate(errs))
+                            hub = np.where(d <= 1.0, 0.5 * d * d, d - 0.5)
+                            out["val_mag_huber_kept"].append(float(np.mean(hub)))
+                        else:
+                            out["val_mag_huber_kept"].append(float("nan"))
+                    else:
+                        out["val_dir_bce_kept"].append(float("nan"))
+                        out["val_mag_huber_kept"].append(float("nan"))
+                primary_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+                out["primary_dir_bal_acc"] = float(out["dir_bal_acc_q50plus"][primary_idx])
+                out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
+                if band_diag:
+                    out["band_metrics"] = summarize_band_metrics_from_arrays(
+                        dir_logits=dir_logits,
+                        mag_up_sqrt=mag_up_sqrt,
+                        mag_down_sqrt=mag_down_sqrt,
+                        y_raw=y_raw,
+                        stats=stats,
+                        split_name=split_name,
+                    )
+        return out
+    finally:
+        model.train(was_training)
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
