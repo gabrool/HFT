@@ -79,7 +79,13 @@ SUPPORTED_PROTOCOLS = {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}
 FAST_VAL_MAX_ROWS = 200_000
 FULL_VAL_EVERY = 5
 TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "10"))
-_feature_storage_dtype_raw = os.environ.get("BYBIT_FEATURE_STORAGE_DTYPE", "fp32").strip().lower()
+TRAIN_DATA_DEVICE = os.environ.get("BYBIT_TRAIN_DATA_DEVICE", "cpu_pinned").strip().lower()
+if TRAIN_DATA_DEVICE not in {"cpu_pinned", "gpu_all"}:
+    raise ValueError(
+        "BYBIT_TRAIN_DATA_DEVICE must be one of: cpu_pinned, gpu_all; "
+        f"got {TRAIN_DATA_DEVICE!r}"
+    )
+_feature_storage_dtype_raw = os.environ.get("BYBIT_FEATURE_STORAGE_DTYPE", "bf16").strip().lower()
 
 if _feature_storage_dtype_raw in {"fp32", "float32"}:
     FEATURE_STORAGE_DTYPE = torch.float32
@@ -94,6 +100,12 @@ else:
     )
 if TRAIN_ROW_STRIDE < 1:
     raise ValueError(f"BYBIT_TRAIN_ROW_STRIDE must be >= 1, got {TRAIN_ROW_STRIDE}")
+
+print(
+    f"[data-config] train_data_device={TRAIN_DATA_DEVICE} "
+    f"feature_storage_dtype={FEATURE_STORAGE_DTYPE_NAME}",
+    flush=True,
+)
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
@@ -875,7 +887,7 @@ class CPUWindowBatchSource:
 
 
 class MultiWeekTrainBatchSource:
-    def __init__(self, sources: List[GPUWindowBatchSource], seed: int = 12345):
+    def __init__(self, sources: List[Any], seed: int = 12345):
         if not sources:
             raise ValueError("MultiWeekTrainBatchSource requires at least one source")
         self.sources = list(sources)
@@ -1415,8 +1427,9 @@ def train_from_offline():
     )
     print(f"[train_stats] dir_pos_w={dir_pos_w.tolist()} dir_neg_w={dir_neg_w.tolist()}")
 
+    TrainSourceCls = CPUWindowBatchSource if TRAIN_DATA_DEVICE == "cpu_pinned" else GPUWindowBatchSource
     train_sources = [
-        GPUWindowBatchSource(
+        TrainSourceCls(
             ds,
             device,
             BATCH_SIZE,
@@ -1439,12 +1452,14 @@ def train_from_offline():
         row_stride=1,
     )
     val_fast_src = val_full_src.make_evenly_spaced_subset(FAST_VAL_MAX_ROWS)
+    train_feature_gb_name = "feature_gb_cpu" if TRAIN_DATA_DEVICE == "cpu_pinned" else "feature_gb_gpu"
     for i, src in enumerate(train_sources):
         print(
-            f"[gpu_data] train_week[{i}]={train_week_keys[i]} rows={src.n_rows} "
+            f"[train_data] mode={TRAIN_DATA_DEVICE} train_week[{i}]={train_week_keys[i]} rows={src.n_rows} "
             f"train_row_stride={src.row_stride} effective_rows_nominal={src.effective_rows_nominal} "
             f"feature_shape={src.feature_shape} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
-            f"feature_gb={src.feature_gb:.3f} label_index_gb={src.label_index_gb:.3f}",
+            f"{train_feature_gb_name}={src.feature_gb:.3f} label_index_gb={src.label_index_gb:.3f} "
+            f"pin_memory={getattr(src, 'pin_memory', False)}",
             flush=True,
         )
     if len(train_sources) > 1:
