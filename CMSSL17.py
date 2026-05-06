@@ -509,6 +509,21 @@ PRIMARY_METRIC_HORIZON_MS = 30_000
 PRIMARY_DIR_BAL_ACC_GUARD = 0.505
 MODEL_OUTPUT_SCHEMA = "dir_logits_mag_up_down_sqrt_v1"
 MAG_SQRT_EPS = 1e-6
+
+
+def inverse_softplus_np(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    x = np.maximum(x, eps)
+    # Stable inverse softplus: for large x, log(expm1(x)) ~= x.
+    out = x.copy()
+    small = x <= 20.0
+    out[small] = np.log(np.expm1(x[small]))
+    return out.astype(np.float32)
+
+
+def inverse_softplus_torch(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x = torch.clamp(x, min=eps)
+    return torch.where(x > 20.0, x, torch.log(torch.expm1(x)))
 DIR_LOSS_WEIGHT = 1.00
 MAG_LOSS_WEIGHT = 0.75
 MAG_CORR_LOSS_WEIGHT = 0.05
@@ -936,6 +951,7 @@ class FeatureReliabilityGate(nn.Module):
         self.in_feats = int(in_feats)
         self.d_internal = int(d_internal)
         self.init_keep_prob = float(init_keep_prob)
+        self.gate_alpha = 1.0
 
         hidden = max(8, 2 * d_internal)
         self.norm = nn.LayerNorm(d_internal)
@@ -962,10 +978,18 @@ class FeatureReliabilityGate(nn.Module):
         gate = torch.sigmoid(dyn + prior)  # [B, L, F, 1]
         return gate, dyn, prior
 
+    def set_gate_alpha(self, alpha: float) -> None:
+        alpha = float(alpha)
+        if not math.isfinite(alpha):
+            raise ValueError(f"gate alpha must be finite, got {alpha}")
+        self.gate_alpha = max(0.0, min(1.0, alpha))
+
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         gate, _, _ = self._compute_gate(z)
         multiplier = gate / self.init_keep_prob
-        return z * multiplier
+        alpha = float(self.gate_alpha)
+        effective_multiplier = (1.0 - alpha) + alpha * multiplier
+        return z * effective_multiplier
 
     @torch.no_grad()
     def gate_diagnostics(self, z: torch.Tensor) -> dict:
@@ -1004,12 +1028,19 @@ class FeatureReliabilityGate(nn.Module):
             "prior_std": float(prior.detach().float().std(unbiased=False).cpu()),
             "top_gate_feature_idx_8": top,
             "bottom_gate_feature_idx_8": bottom,
+            "alpha": float(self.gate_alpha),
         }
 
     @torch.no_grad()
     def gate_stats(self, z: torch.Tensor) -> dict:
         diag = self.gate_diagnostics(z)
-        return {"mean": diag["gate_mean"], "std": diag["gate_std"], "min": diag["gate_min"], "max": diag["gate_max"]}
+        return {
+            "mean": diag["gate_mean"],
+            "std": diag["gate_std"],
+            "min": diag["gate_min"],
+            "max": diag["gate_max"],
+            "alpha": float(self.gate_alpha),
+        }
 
 
 @torch.no_grad()
@@ -1173,6 +1204,9 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             f"mixed_dim={CTN_MIXED_DIM} mixed_dff={CTN_MIXED_DFF} mixed_res_param=1",
             flush=True,
         )
+
+    def set_gate_alpha(self, alpha: float) -> None:
+        self.feature_gate.set_gate_alpha(alpha)
 
     def forward(self, x):
         out_patch = self.depatch(x).contiguous()  # [B, F, L, patch_size]
@@ -1450,6 +1484,42 @@ class SAMBA(nn.Module):
                 if isinstance(mod, nn.Linear):
                     _init_small(mod)
 
+    def set_gate_alpha(self, alpha: float) -> None:
+        self.depatch_proj_encoder.set_gate_alpha(alpha)
+
+    @torch.no_grad()
+    def initialize_magnitude_head_bias(self, pos_target_sqrt, neg_target_sqrt) -> dict:
+        mag_up_final = self.mag_up_head[-1]
+        mag_down_final = self.mag_down_head[-1]
+        assert isinstance(mag_up_final, nn.Linear)
+        assert isinstance(mag_down_final, nn.Linear)
+        assert mag_up_final.out_features == NUM_HORIZONS
+        assert mag_down_final.out_features == NUM_HORIZONS
+
+        device = mag_up_final.bias.device
+        pos = torch.as_tensor(pos_target_sqrt, dtype=torch.float32, device=device).reshape(-1)
+        neg = torch.as_tensor(neg_target_sqrt, dtype=torch.float32, device=device).reshape(-1)
+        if pos.numel() != NUM_HORIZONS or neg.numel() != NUM_HORIZONS:
+            raise ValueError(
+                f"magnitude init targets must have {NUM_HORIZONS} elements, "
+                f"got pos={pos.numel()} neg={neg.numel()}"
+            )
+        pos = torch.clamp(pos, min=1e-4)
+        neg = torch.clamp(neg, min=1e-4)
+        pos_bias = inverse_softplus_torch(pos)
+        neg_bias = inverse_softplus_torch(neg)
+
+        mag_up_final.weight.zero_()
+        mag_down_final.weight.zero_()
+        mag_up_final.bias.copy_(pos_bias)
+        mag_down_final.bias.copy_(neg_bias)
+        return {
+            "pos_target_sqrt": [float(v) for v in pos.detach().cpu().tolist()],
+            "neg_target_sqrt": [float(v) for v in neg.detach().cpu().tolist()],
+            "pos_bias": [float(v) for v in pos_bias.detach().cpu().tolist()],
+            "neg_bias": [float(v) for v in neg_bias.detach().cpu().tolist()],
+        }
+
     def forward(self, x):
         x_permuted = x.permute(0, 2, 1).contiguous()
         h_tokens = self.depatch_proj_encoder(x_permuted).contiguous()        # [B, L, D] (ConvTimeNet projection applied)
@@ -1459,8 +1529,10 @@ class SAMBA(nn.Module):
         pooled_dir = self.dir_pool(h_dir)
         pooled_mag = self.mag_pool(h_mag)
         dir_logits = self.dir_head(pooled_dir)
-        mag_up_sqrt = F.softplus(self.mag_up_head(pooled_mag)) + MAG_SQRT_EPS
-        mag_down_sqrt = F.softplus(self.mag_down_head(pooled_mag)) + MAG_SQRT_EPS
+        mag_up_raw = self.mag_up_head(pooled_mag).float()
+        mag_down_raw = self.mag_down_head(pooled_mag).float()
+        mag_up_sqrt = F.softplus(mag_up_raw) + MAG_SQRT_EPS
+        mag_down_sqrt = F.softplus(mag_down_raw) + MAG_SQRT_EPS
         assert dir_logits.shape[-1] == NUM_HORIZONS
         assert mag_up_sqrt.shape == dir_logits.shape
         assert mag_down_sqrt.shape == dir_logits.shape
@@ -1488,9 +1560,13 @@ class SAMBA(nn.Module):
         diag["activations"]["pooled_dir"] = _activation_summary(pooled_dir)
         diag["activations"]["pooled_mag"] = _activation_summary(pooled_mag)
         dir_logits = self.dir_head(pooled_dir)
-        mag_up_sqrt = F.softplus(self.mag_up_head(pooled_mag)) + MAG_SQRT_EPS
-        mag_down_sqrt = F.softplus(self.mag_down_head(pooled_mag)) + MAG_SQRT_EPS
+        mag_up_raw = self.mag_up_head(pooled_mag).float()
+        mag_down_raw = self.mag_down_head(pooled_mag).float()
+        mag_up_sqrt = F.softplus(mag_up_raw) + MAG_SQRT_EPS
+        mag_down_sqrt = F.softplus(mag_down_raw) + MAG_SQRT_EPS
         diag["activations"]["dir_logits"] = _activation_summary(dir_logits)
+        diag["activations"]["mag_up_raw"] = _activation_summary(mag_up_raw)
+        diag["activations"]["mag_down_raw"] = _activation_summary(mag_down_raw)
         diag["activations"]["mag_up_sqrt"] = _activation_summary(mag_up_sqrt)
         diag["activations"]["mag_down_sqrt"] = _activation_summary(mag_down_sqrt)
         probs = torch.sigmoid(dir_logits.float())
@@ -1498,7 +1574,21 @@ class SAMBA(nn.Module):
             dir_logits.float().abs(),
             max_elems=ACT_DIAG_P95_MAX_ELEMS,
         )
-        diag["prediction"] = {
+        def _raw_stats(prefix: str, t: torch.Tensor) -> dict:
+            tf = t.detach().float()
+            tq = _bounded_flat_sample_for_quantile(tf, max_elems=ACT_DIAG_P95_MAX_ELEMS)
+            qs = torch.quantile(tq, torch.tensor([0.05, 0.50, 0.95], device=tq.device))
+            return {
+                f"{prefix}_mean": float(tf.mean().cpu()),
+                f"{prefix}_std": float(tf.std(unbiased=False).cpu()),
+                f"{prefix}_p05": float(qs[0].cpu()),
+                f"{prefix}_p50": float(qs[1].cpu()),
+                f"{prefix}_p95": float(qs[2].cpu()),
+                f"{prefix}_min": float(tf.min().cpu()),
+                f"{prefix}_max": float(tf.max().cpu()),
+            }
+
+        pred_stats = {
             "dir_logit_mean": float(dir_logits.float().mean().cpu()),
             "dir_logit_std": float(dir_logits.float().std(unbiased=False).cpu()),
             "dir_logit_abs_p95": float(torch.quantile(dir_logit_abs_q, 0.95).cpu()),
@@ -1508,7 +1598,12 @@ class SAMBA(nn.Module):
             "mag_up_std": float(mag_up_sqrt.float().std(unbiased=False).cpu()),
             "mag_down_mean": float(mag_down_sqrt.float().mean().cpu()),
             "mag_down_std": float(mag_down_sqrt.float().std(unbiased=False).cpu()),
+            "mag_up_floor_frac": float((mag_up_sqrt.float() <= MAG_SQRT_EPS * 1.01).float().mean().cpu()),
+            "mag_down_floor_frac": float((mag_down_sqrt.float() <= MAG_SQRT_EPS * 1.01).float().mean().cpu()),
         }
+        pred_stats.update(_raw_stats("mag_up_raw", mag_up_raw))
+        pred_stats.update(_raw_stats("mag_down_raw", mag_down_raw))
+        diag["prediction"] = pred_stats
         eps = 1e-12
         diag["ratios"] = {
             "fused_over_tokens_rms": diag["activations"]["mamba_fused"]["rms"] / (diag["activations"]["mamba_tokens"]["rms"] + eps),
