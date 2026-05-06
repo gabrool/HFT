@@ -64,8 +64,14 @@ SAM_RHO = float(os.environ.get("BYBIT_SAM_RHO", "0.005"))
 MODEL_DIAG = int(os.environ.get("BYBIT_MODEL_DIAG", "1")) == 1
 MODEL_DIAG_EVERY = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_EVERY", str(LOG_EVERY))))
 MODEL_DIAG_MAX_BATCH = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_MAX_BATCH", "16")))
+GRAD_DIAG_P95_MAX_ELEMS = max(
+    1024,
+    int(os.environ.get("BYBIT_GRAD_DIAG_P95_MAX_ELEMS", "1000000")),
+)
 print(
-    f"[model-diag-config] enabled={int(MODEL_DIAG)} every={MODEL_DIAG_EVERY} max_batch={MODEL_DIAG_MAX_BATCH}",
+    f"[model-diag-config] enabled={int(MODEL_DIAG)} "
+    f"every={MODEL_DIAG_EVERY} max_batch={MODEL_DIAG_MAX_BATCH} "
+    f"grad_p95_max_elems={GRAD_DIAG_P95_MAX_ELEMS}",
     flush=True,
 )
 
@@ -1279,6 +1285,58 @@ def summarize_param_groups(model: torch.nn.Module) -> Dict[str, dict]:
     return out
 
 
+def _bounded_abs_sample_for_quantile(
+    chunks: List[torch.Tensor],
+    *,
+    max_elems: int,
+) -> Optional[torch.Tensor]:
+    """Return a bounded deterministic sample of flattened abs-value chunks for quantile diagnostics.
+
+    This is only for diagnostics. It avoids concatenating all gradients in large parameter groups.
+    Sampling is deterministic stride sampling, not random, so logs are reproducible.
+    """
+    if not chunks:
+        return None
+
+    flat_chunks = [c.detach().reshape(-1) for c in chunks if c is not None and c.numel() > 0]
+    if not flat_chunks:
+        return None
+
+    total = sum(int(c.numel()) for c in flat_chunks)
+    if total <= max_elems:
+        return torch.cat(flat_chunks)
+
+    max_elems = int(max(1, max_elems))
+    samples = []
+
+    remaining_budget = max_elems
+    remaining_total = total
+
+    for c in flat_chunks:
+        n = int(c.numel())
+        if n <= 0 or remaining_budget <= 0:
+            remaining_total -= n
+            continue
+
+        # Allocate a proportional deterministic sample budget to this chunk.
+        take = int(round(remaining_budget * (n / max(1, remaining_total))))
+        take = max(1, min(take, n, remaining_budget))
+
+        if take >= n:
+            samples.append(c)
+        else:
+            stride = max(1, n // take)
+            samples.append(c[::stride][:take])
+
+        remaining_budget -= take
+        remaining_total -= n
+
+    if not samples:
+        return None
+
+    return torch.cat(samples)
+
+
 def summarize_grad_groups(model: torch.nn.Module, lr: float) -> Dict[str, dict]:
     out = {}
     for group, params in model_param_groups(model).items():
@@ -1305,8 +1363,12 @@ def summarize_grad_groups(model: torch.nn.Module, lr: float) -> Dict[str, dict]:
             grad_abs_chunks.append(ga)
         grad_norm = math.sqrt(grad_sq)
         param_norm = math.sqrt(param_sq)
-        if grad_abs_chunks:
-            grad_abs_p95 = float(torch.quantile(torch.cat(grad_abs_chunks), 0.95).cpu())
+        q_in = _bounded_abs_sample_for_quantile(
+            grad_abs_chunks,
+            max_elems=GRAD_DIAG_P95_MAX_ELEMS,
+        )
+        if q_in is not None and q_in.numel() > 0:
+            grad_abs_p95 = float(torch.quantile(q_in, 0.95).cpu())
         else:
             grad_abs_p95 = 0.0
         out[group] = {
@@ -1318,6 +1380,10 @@ def summarize_grad_groups(model: torch.nn.Module, lr: float) -> Dict[str, dict]:
             "lr_grad_over_param": float(lr) * grad_norm / (param_norm + 1e-12),
             "grad_abs_mean": grad_abs_sum / max(1, grad_numel),
             "grad_abs_p95": grad_abs_p95,
+            "grad_abs_p95_sampled": bool(
+                sum(int(c.numel()) for c in grad_abs_chunks) > GRAD_DIAG_P95_MAX_ELEMS
+            ),
+            "grad_abs_p95_elems": int(0 if q_in is None else q_in.numel()),
         }
     return out
 
