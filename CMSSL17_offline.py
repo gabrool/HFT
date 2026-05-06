@@ -65,7 +65,7 @@ GATE_WARMUP_STEPS = int(os.environ.get("BYBIT_GATE_WARMUP_STEPS", "18892"))
 GATE_LR = float(os.environ.get("BYBIT_GATE_LR", "2e-5"))
 MODEL_DIAG = int(os.environ.get("BYBIT_MODEL_DIAG", "1")) == 1
 MODEL_DIAG_EVERY = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_EVERY", str(LOG_EVERY))))
-MODEL_DIAG_MAX_BATCH = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_MAX_BATCH", "16")))
+MODEL_DIAG_MAX_BATCH = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_MAX_BATCH", "64")))
 GRAD_DIAG_P95_MAX_ELEMS = max(
     1024,
     int(os.environ.get("BYBIT_GRAD_DIAG_P95_MAX_ELEMS", "1000000")),
