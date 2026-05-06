@@ -1684,8 +1684,17 @@ def train_from_offline():
     model = SAMBA(args).to(device)
     param_summary = summarize_param_groups(model)
     param_keys = [
-        "extractor_depatch", "extractor_patch_embed", "extractor_ci", "extractor_gate",
-        "extractor_post_gate", "extractor_mixed", "mamba", "task_decoders", "heads_pools",
+        "extractor_depatch",
+        "extractor_patch_embed",
+        "extractor_ci",
+        "extractor_gate",
+        "extractor_post_gate",
+        "extractor_mixed",
+        "extractor_output_norm",
+        "mamba",
+        "task_decoders",
+        "heads_pools",
+        "other",
     ]
     total_params = sum(v["param_count"] for v in param_summary.values())
     print(
