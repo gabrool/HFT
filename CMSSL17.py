@@ -470,21 +470,7 @@ DMODEL          = 1024
 MAMBA_LAYERS    = 2
 CONV_KERNELS    = [3,3,5,5,7,7]
 DFF_CONV        = 2 * DMODEL
-DEPATCH_OFFSET_SCALE = float(os.environ.get("BYBIT_DEPATCH_OFFSET_SCALE", "0.10"))
-if not math.isfinite(DEPATCH_OFFSET_SCALE) or DEPATCH_OFFSET_SCALE <= 0.0:
-    raise ValueError(f"BYBIT_DEPATCH_OFFSET_SCALE must be finite and > 0, got {DEPATCH_OFFSET_SCALE}")
-DEPATCH_OFFSET_MODE = os.environ.get("BYBIT_DEPATCH_OFFSET_MODE", "fixed").strip().lower()
-
-if DEPATCH_OFFSET_MODE in {"fixed", "static", "off", "zero", "none"}:
-    DEPATCH_OFFSET_MODE = "fixed"
-elif DEPATCH_OFFSET_MODE in {"learnable", "dynamic", "on"}:
-    DEPATCH_OFFSET_MODE = "learnable"
-else:
-    raise ValueError(
-        "BYBIT_DEPATCH_OFFSET_MODE must be one of: "
-        "fixed, static, off, zero, none, learnable, dynamic, on; "
-        f"got {DEPATCH_OFFSET_MODE!r}"
-    )
+DEPATCH_OFFSET_MODE = "learnable"
 
 # Prediction horizons (in milliseconds)
 HORIZONS_MS     = [7_500, 15_000, 30_000]
@@ -745,7 +731,7 @@ class OffsetPredictor(nn.Module):
         self.stride = stride
         self.channel = in_feats
         self.patch_size = patch_size
-        hid_dim = 8
+        hid_dim = 64
         self.offset_predictor = nn.Sequential(
             nn.Conv1d(1, hid_dim, patch_size, stride=stride, padding=0),
             nn.GELU(),
@@ -760,9 +746,8 @@ class OffsetPredictor(nn.Module):
         patch_X = patch_X.contiguous().view(B, patch_count, self.patch_size, self.channel)
         patch_X = patch_X.permute(0, 1, 3, 2)
         patch_X = patch_X.contiguous().view(B*patch_count*self.channel, 1, self.patch_size)
-        raw_offset = self.offset_predictor(patch_X)
-        raw_offset = raw_offset.view(B, patch_count, self.channel, 2).contiguous()
-        pred_offset = DEPATCH_OFFSET_SCALE * torch.tanh(raw_offset)
+        pred_offset = self.offset_predictor(patch_X)
+        pred_offset = pred_offset.view(B, patch_count, self.channel, 2).contiguous()
         return pred_offset
 
 class DepatchSampling(nn.Module):
@@ -778,26 +763,12 @@ class DepatchSampling(nn.Module):
         self.box_coder = BoxCoder(self.patch_count, stride, patch_size, self.seq_len, in_feats)
         if not hasattr(DepatchSampling, "_printed_offset_mode"):
             print(
-                f"[depatch-config] offset_mode={self.offset_mode} offset_scale={DEPATCH_OFFSET_SCALE}",
+                f"[depatch-config] offset_mode=learnable offset_predictor_hid_dim=64",
                 flush=True,
             )
             DepatchSampling._printed_offset_mode = True
     def get_sampling_location(self, X):
-        if self.offset_mode == "fixed":
-            B = X.shape[0]
-            pred_offset = torch.zeros(
-                B,
-                self.patch_count,
-                self.in_feats,
-                2,
-                device=X.device,
-                dtype=X.dtype,
-            )
-        elif self.offset_mode == "learnable":
-            pred_offset = self.offset_predictor(X)
-        else:
-            raise RuntimeError(f"Unknown depatch offset mode: {self.offset_mode!r}")
-
+        pred_offset = self.offset_predictor(X)
         sampling_locations, bound = self.box_coder(pred_offset)
         return sampling_locations, bound
     def forward(self, X, return_bound=False):
