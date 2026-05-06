@@ -473,6 +473,18 @@ DFF_CONV        = 2 * DMODEL
 DEPATCH_OFFSET_SCALE = float(os.environ.get("BYBIT_DEPATCH_OFFSET_SCALE", "0.10"))
 if not math.isfinite(DEPATCH_OFFSET_SCALE) or DEPATCH_OFFSET_SCALE <= 0.0:
     raise ValueError(f"BYBIT_DEPATCH_OFFSET_SCALE must be finite and > 0, got {DEPATCH_OFFSET_SCALE}")
+DEPATCH_OFFSET_MODE = os.environ.get("BYBIT_DEPATCH_OFFSET_MODE", "fixed").strip().lower()
+
+if DEPATCH_OFFSET_MODE in {"fixed", "static", "off", "zero", "none"}:
+    DEPATCH_OFFSET_MODE = "fixed"
+elif DEPATCH_OFFSET_MODE in {"learnable", "dynamic", "on"}:
+    DEPATCH_OFFSET_MODE = "learnable"
+else:
+    raise ValueError(
+        "BYBIT_DEPATCH_OFFSET_MODE must be one of: "
+        "fixed, static, off, zero, none, learnable, dynamic, on; "
+        f"got {DEPATCH_OFFSET_MODE!r}"
+    )
 
 # Prediction horizons (in milliseconds)
 HORIZONS_MS     = [7_500, 15_000, 30_000]
@@ -761,10 +773,31 @@ class DepatchSampling(nn.Module):
         self.patch_size = patch_size
         self.patch_count = (seq_len - patch_size) // stride + 1
         self.dropout = nn.Dropout(0.1)
+        self.offset_mode = DEPATCH_OFFSET_MODE
         self.offset_predictor = OffsetPredictor(in_feats, patch_size, stride)
         self.box_coder = BoxCoder(self.patch_count, stride, patch_size, self.seq_len, in_feats)
+        if not hasattr(DepatchSampling, "_printed_offset_mode"):
+            print(
+                f"[depatch-config] offset_mode={self.offset_mode} offset_scale={DEPATCH_OFFSET_SCALE}",
+                flush=True,
+            )
+            DepatchSampling._printed_offset_mode = True
     def get_sampling_location(self, X):
-        pred_offset = self.offset_predictor(X)
+        if self.offset_mode == "fixed":
+            B = X.shape[0]
+            pred_offset = torch.zeros(
+                B,
+                self.patch_count,
+                self.in_feats,
+                2,
+                device=X.device,
+                dtype=X.dtype,
+            )
+        elif self.offset_mode == "learnable":
+            pred_offset = self.offset_predictor(X)
+        else:
+            raise RuntimeError(f"Unknown depatch offset mode: {self.offset_mode!r}")
+
         sampling_locations, bound = self.box_coder(pred_offset)
         return sampling_locations, bound
     def forward(self, X, return_bound=False):
