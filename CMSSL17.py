@@ -469,6 +469,11 @@ BATCH_SIZE      = 64
 DMODEL          = 1024
 MAMBA_LAYERS    = 2
 DEPATCH_OFFSET_MODE = "learnable"
+ACT_DIAG_P95_MAX_ELEMS = max(
+    1024,
+    int(os.environ.get("BYBIT_ACT_DIAG_P95_MAX_ELEMS", "1000000")),
+)
+print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
 MODEL_ARCH_SCHEMA = "ctn_hybrid_ci4_gate_proj_mixed2_ci8_v1"
 CTN_CI_KERNELS = [3, 3, 7, 7]
@@ -793,20 +798,30 @@ class DepatchSampling(nn.Module):
         dx_abs = dx.abs().reshape(-1)
         ds_abs = ds_raw.abs().reshape(-1)
         span_flat = span_samples.reshape(-1)
+        dx_q = _bounded_flat_sample_for_quantile(dx_abs, max_elems=ACT_DIAG_P95_MAX_ELEMS)
+        ds_q = _bounded_flat_sample_for_quantile(ds_abs, max_elems=ACT_DIAG_P95_MAX_ELEMS)
+        span_q = _bounded_flat_sample_for_quantile(
+            span_flat,
+            max_elems=ACT_DIAG_P95_MAX_ELEMS,
+        )
         return {
             "offset_dx_mean": float(dx.mean().cpu()),
             "offset_dx_std": float(dx.std(unbiased=False).cpu()),
-            "offset_dx_abs_p95": float(torch.quantile(dx_abs, 0.95).cpu()),
+            "offset_dx_abs_p95": float(torch.quantile(dx_q, 0.95).cpu()),
             "offset_dx_abs_max": float(dx_abs.max().cpu()),
             "offset_ds_raw_mean": float(ds_raw.mean().cpu()),
             "offset_ds_raw_std": float(ds_raw.std(unbiased=False).cpu()),
-            "offset_ds_raw_abs_p95": float(torch.quantile(ds_abs, 0.95).cpu()),
+            "offset_ds_raw_abs_p95": float(torch.quantile(ds_q, 0.95).cpu()),
             "span_samples_mean": float(span_flat.mean().cpu()),
-            "span_samples_p05": float(torch.quantile(span_flat, 0.05).cpu()),
-            "span_samples_p50": float(torch.quantile(span_flat, 0.50).cpu()),
-            "span_samples_p95": float(torch.quantile(span_flat, 0.95).cpu()),
+            "span_samples_p05": float(torch.quantile(span_q, 0.05).cpu()),
+            "span_samples_p50": float(torch.quantile(span_q, 0.50).cpu()),
+            "span_samples_p95": float(torch.quantile(span_q, 0.95).cpu()),
             "bound_left_clip_frac": float((bf[..., 0] <= 1e-6).float().mean().cpu()),
             "bound_right_clip_frac": float((bf[..., 1] >= 1.0 - 1e-6).float().mean().cpu()),
+            "depatch_quantile_sampled": bool(
+                max(dx_abs.numel(), ds_abs.numel(), span_flat.numel()) > ACT_DIAG_P95_MAX_ELEMS
+            ),
+            "depatch_quantile_elems": int(span_q.numel()),
         }
 
     def forward(self, X, return_bound=False):
@@ -956,7 +971,14 @@ class FeatureReliabilityGate(nn.Module):
     def gate_diagnostics(self, z: torch.Tensor) -> dict:
         gate, dyn, prior = self._compute_gate(z)
         gf = gate.detach().float()
-        q = torch.quantile(gf.reshape(-1), torch.tensor([0.01, 0.05, 0.50, 0.95, 0.99], device=gf.device))
+        gf_q = _bounded_flat_sample_for_quantile(
+            gf,
+            max_elems=ACT_DIAG_P95_MAX_ELEMS,
+        )
+        q = torch.quantile(
+            gf_q,
+            torch.tensor([0.01, 0.05, 0.50, 0.95, 0.99], device=gf_q.device),
+        )
         feature_gate = gf.mean(dim=(0, 1, 3))
         k = min(8, feature_gate.numel())
         top = torch.topk(feature_gate, k=k, largest=True).indices.detach().cpu().tolist()
@@ -971,6 +993,8 @@ class FeatureReliabilityGate(nn.Module):
             "gate_p50": float(q[2].cpu()),
             "gate_p95": float(q[3].cpu()),
             "gate_p99": float(q[4].cpu()),
+            "gate_quantile_sampled": bool(gf.numel() > ACT_DIAG_P95_MAX_ELEMS),
+            "gate_quantile_elems": int(gf_q.numel()),
             "gate_frac_lt_0p2": float((gf < 0.2).float().mean().cpu()),
             "gate_frac_lt_0p5": float((gf < 0.5).float().mean().cpu()),
             "gate_frac_gt_0p95": float((gf > 0.95).float().mean().cpu()),
@@ -989,6 +1013,27 @@ class FeatureReliabilityGate(nn.Module):
 
 
 @torch.no_grad()
+def _bounded_flat_sample_for_quantile(
+    x: torch.Tensor,
+    *,
+    max_elems: int,
+) -> torch.Tensor:
+    """Return a bounded deterministic flattened sample for diagnostic quantiles.
+
+    This is only for diagnostics. It avoids calling torch.quantile on huge tensors.
+    Sampling is deterministic stride sampling, not random.
+    """
+    xf = x.detach().reshape(-1)
+    n = int(xf.numel())
+    if n <= max_elems:
+        return xf
+
+    max_elems = int(max(1, max_elems))
+    stride = max(1, n // max_elems)
+    return xf[::stride][:max_elems]
+
+
+@torch.no_grad()
 def _activation_summary(t: torch.Tensor) -> dict:
     td = t.detach()
     tf = td.float()
@@ -1003,19 +1048,27 @@ def _activation_summary(t: torch.Tensor) -> dict:
             "std": float("nan"),
             "rms": float("nan"),
             "abs_p95": float("nan"),
+            "abs_p95_sampled": False,
+            "abs_p95_elems": 0,
             "abs_max": float("nan"),
             "zero_frac_abs_lt_1e_minus_6": float("nan"),
             "finite_bad_frac": 1.0,
         }
     else:
         abs_vals = vals.abs()
+        abs_q = _bounded_flat_sample_for_quantile(
+            abs_vals,
+            max_elems=ACT_DIAG_P95_MAX_ELEMS,
+        )
         out = {
             "shape": list(td.shape),
             "dtype": str(td.dtype),
             "mean": float(vals.mean().cpu()),
             "std": float(vals.std(unbiased=False).cpu()),
             "rms": float(torch.sqrt((vals * vals).mean()).cpu()),
-            "abs_p95": float(torch.quantile(abs_vals.reshape(-1), 0.95).cpu()),
+            "abs_p95": float(torch.quantile(abs_q, 0.95).cpu()),
+            "abs_p95_sampled": bool(abs_vals.numel() > ACT_DIAG_P95_MAX_ELEMS),
+            "abs_p95_elems": int(abs_q.numel()),
             "abs_max": float(abs_vals.max().cpu()),
             "zero_frac_abs_lt_1e_minus_6": float((tf.abs() < 1e-6).float().mean().cpu()),
             "finite_bad_frac": float((~finite).float().mean().cpu()),
@@ -1441,10 +1494,14 @@ class SAMBA(nn.Module):
         diag["activations"]["mag_up_sqrt"] = _activation_summary(mag_up_sqrt)
         diag["activations"]["mag_down_sqrt"] = _activation_summary(mag_down_sqrt)
         probs = torch.sigmoid(dir_logits.float())
+        dir_logit_abs_q = _bounded_flat_sample_for_quantile(
+            dir_logits.float().abs(),
+            max_elems=ACT_DIAG_P95_MAX_ELEMS,
+        )
         diag["prediction"] = {
             "dir_logit_mean": float(dir_logits.float().mean().cpu()),
             "dir_logit_std": float(dir_logits.float().std(unbiased=False).cpu()),
-            "dir_logit_abs_p95": float(torch.quantile(dir_logits.float().abs().reshape(-1), 0.95).cpu()),
+            "dir_logit_abs_p95": float(torch.quantile(dir_logit_abs_q, 0.95).cpu()),
             "dir_prob_mean": float(probs.mean().cpu()),
             "dir_prob_std": float(probs.std(unbiased=False).cpu()),
             "mag_up_mean": float(mag_up_sqrt.float().mean().cpu()),
