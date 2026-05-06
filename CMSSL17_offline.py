@@ -61,6 +61,8 @@ CLIP_GRAD = float(os.environ.get("BYBIT_CLIP_GRAD", "5.0"))
 FINITE_DEBUG = int(os.environ.get("BYBIT_FINITE_DEBUG", "1")) == 1
 USE_SAM = int(os.environ.get("BYBIT_USE_SAM", "0")) == 1
 SAM_RHO = float(os.environ.get("BYBIT_SAM_RHO", "0.005"))
+GATE_WARMUP_STEPS = int(os.environ.get("BYBIT_GATE_WARMUP_STEPS", "18892"))
+GATE_LR = float(os.environ.get("BYBIT_GATE_LR", "2e-5"))
 MODEL_DIAG = int(os.environ.get("BYBIT_MODEL_DIAG", "1")) == 1
 MODEL_DIAG_EVERY = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_EVERY", str(LOG_EVERY))))
 MODEL_DIAG_MAX_BATCH = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_MAX_BATCH", "16")))
@@ -77,6 +79,11 @@ print(
 
 if not math.isfinite(SAM_RHO) or SAM_RHO < 0.0:
     raise ValueError(f"BYBIT_SAM_RHO must be finite and >= 0, got {SAM_RHO}")
+if GATE_WARMUP_STEPS < 0:
+    raise ValueError(f"BYBIT_GATE_WARMUP_STEPS must be >= 0, got {GATE_WARMUP_STEPS}")
+if not math.isfinite(GATE_LR) or GATE_LR <= 0.0:
+    raise ValueError(f"BYBIT_GATE_LR must be finite and > 0, got {GATE_LR}")
+print(f"[gate-config] warmup_steps={GATE_WARMUP_STEPS} gate_lr={GATE_LR}", flush=True)
 
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
@@ -979,6 +986,42 @@ def compute_dir_class_weights_from_train_labels(
     return pos_w, neg_w
 
 
+
+
+def compute_mag_init_targets_from_train_labels(
+    y: np.ndarray,
+    *,
+    abs_lo: np.ndarray,
+    abs_hi: np.ndarray,
+    q50: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(y, dtype=np.float32)
+    abs_lo = np.asarray(abs_lo, dtype=np.float32).reshape(1, -1)
+    abs_hi = np.asarray(abs_hi, dtype=np.float32).reshape(1, -1)
+    q50 = np.asarray(q50, dtype=np.float32).reshape(-1)
+    if y.ndim != 2 or y.shape[1] != NUM_HORIZONS:
+        raise ValueError(f"y must have shape [N, {NUM_HORIZONS}], got {y.shape}")
+    abs_y = np.abs(y).astype(np.float32)
+    keep = (abs_y >= abs_lo) & (abs_y <= abs_hi)
+    pos_target_sqrt = np.empty((NUM_HORIZONS,), dtype=np.float32)
+    neg_target_sqrt = np.empty((NUM_HORIZONS,), dtype=np.float32)
+    for h in range(NUM_HORIZONS):
+        fallback = float(np.sqrt(max(float(q50[h]), 1e-8)))
+        pos_mask = keep[:, h] & (y[:, h] > 0)
+        neg_mask = keep[:, h] & (y[:, h] < 0)
+        if int(pos_mask.sum()) >= 100:
+            pos_val = float(np.median(np.sqrt(abs_y[pos_mask, h])))
+        else:
+            pos_val = fallback
+        if int(neg_mask.sum()) >= 100:
+            neg_val = float(np.median(np.sqrt(abs_y[neg_mask, h])))
+        else:
+            neg_val = fallback
+        pos_target_sqrt[h] = np.float32(np.clip(pos_val, 1e-4, 10.0))
+        neg_target_sqrt[h] = np.float32(np.clip(neg_val, 1e-4, 10.0))
+    return pos_target_sqrt.astype(np.float32), neg_target_sqrt.astype(np.float32)
+
+
 def compute_dir_mag_loss(
     pred: Dict[str, torch.Tensor],
     y_raw: torch.Tensor,
@@ -1019,9 +1062,27 @@ def compute_dir_mag_loss(
     down_d = F.huber_loss(pred["mag_down_sqrt"], mag_target, delta=1.0, reduction="none")
     up_w = mag_w_base * up_mask.to(dtype=dir_logits.dtype)
     down_w = mag_w_base * down_mask.to(dtype=dir_logits.dtype)
-    mag_num = (up_d * up_w).sum() + (down_d * down_w).sum()
-    mag_den = up_w.sum() + down_w.sum()
-    mag_huber = mag_num / mag_den.clamp_min(1e-9) if float(mag_den.detach().item()) > 0.0 else dir_logits.sum() * 0.0
+    up_den = up_w.sum()
+    down_den = down_w.sum()
+    up_valid = up_den.detach() > 0
+    down_valid = down_den.detach() > 0
+    mag_side_terms = []
+    if bool(up_valid.item()):
+        mag_up_huber = (up_d * up_w).sum() / up_den.clamp_min(1e-9)
+        mag_side_terms.append(mag_up_huber)
+    else:
+        mag_up_huber = dir_logits.sum() * 0.0
+    if bool(down_valid.item()):
+        mag_down_huber = (down_d * down_w).sum() / down_den.clamp_min(1e-9)
+        mag_side_terms.append(mag_down_huber)
+    else:
+        mag_down_huber = dir_logits.sum() * 0.0
+    if mag_side_terms:
+        mag_huber = torch.stack(mag_side_terms).mean()
+    else:
+        mag_huber = dir_logits.sum() * 0.0
+    mag_den = up_den + down_den
+    mag_huber_valid = bool(up_valid.item()) or bool(down_valid.item())
 
     mag_pred_sqrt = derive_mag_pred_sqrt_for_mag_loss(pred)
     corr_terms = []
@@ -1044,7 +1105,7 @@ def compute_dir_mag_loss(
 
     if update_ema:
         ema_state.update("dir_bce", dir_bce, valid=True)
-        ema_state.update("mag_huber", mag_huber, valid=float(mag_den.detach().item()) > 0.0)
+        ema_state.update("mag_huber", mag_huber, valid=mag_huber_valid)
         ema_state.update("mag_corr", mag_corr, valid=mag_corr_valid)
     dir_norm = dir_bce / ema_state.denom("dir_bce", dir_bce)
     mag_norm = mag_huber / ema_state.denom("mag_huber", mag_huber)
@@ -1063,6 +1124,10 @@ def compute_dir_mag_loss(
         "mag_norm": mag_norm.detach(),
         "corr_norm": corr_norm.detach(),
         "dir_weight_sum": dir_weight_sum.detach(),
+        "mag_up_huber": mag_up_huber.detach(),
+        "mag_down_huber": mag_down_huber.detach(),
+        "mag_up_weight_sum": up_den.detach(),
+        "mag_down_weight_sum": down_den.detach(),
         "mag_weight_sum": mag_den.detach(),
     }
     return loss, components
@@ -1337,6 +1402,50 @@ def _bounded_abs_sample_for_quantile(
     return torch.cat(samples)
 
 
+
+
+def build_optimizer_param_groups(model: torch.nn.Module, *, base_lr: float, gate_lr: float) -> List[dict]:
+    base = unwrap_model(model)
+    gate_params = []
+    main_params = []
+    trainable_params = []
+    gate_name_part = "depatch_proj_encoder.feature_gate."
+    for name, p in base.named_parameters():
+        if not p.requires_grad:
+            continue
+        trainable_params.append(p)
+        if gate_name_part in name:
+            gate_params.append(p)
+        else:
+            main_params.append(p)
+    if len(gate_params) <= 0:
+        raise ValueError("No trainable gate parameters found for separate optimizer group.")
+    if len(main_params) <= 0:
+        raise ValueError("No trainable main parameters found for optimizer group.")
+    gate_ids = {id(p) for p in gate_params}
+    main_ids = {id(p) for p in main_params}
+    if gate_ids & main_ids:
+        raise ValueError("Optimizer parameter groups overlap.")
+    all_group_ids = list(main_ids) + list(gate_ids)
+    trainable_ids = [id(p) for p in trainable_params]
+    if len(all_group_ids) != len(set(all_group_ids)) or set(all_group_ids) != set(trainable_ids):
+        raise ValueError("Optimizer parameter groups must include every trainable parameter exactly once.")
+    return [
+        {
+            "params": main_params,
+            "lr": base_lr,
+            "weight_decay": 1e-3,
+            "name": "main",
+        },
+        {
+            "params": gate_params,
+            "lr": gate_lr,
+            "weight_decay": 0.0,
+            "name": "gate",
+        },
+    ]
+
+
 def summarize_grad_groups(model: torch.nn.Module, lr: float) -> Dict[str, dict]:
     out = {}
     for group, params in model_param_groups(model).items():
@@ -1481,7 +1590,7 @@ def print_model_diagnostics(epoch: int, batch_i: int, diag: dict, grad_diag: Opt
         f"[model-gate] epoch={epoch+1} batch={batch_i} mean={gate['gate_mean']:.6g} std={gate['gate_std']:.6g} "
         f"p05={gate['gate_p05']:.6g} p50={gate['gate_p50']:.6g} p95={gate['gate_p95']:.6g} "
         f"frac_lt_0p5={gate['gate_frac_lt_0p5']:.6g} frac_gt_0p95={gate['gate_frac_gt_0p95']:.6g} "
-        f"prior_std={gate['prior_std']:.6g} dyn_std={gate['dyn_std']:.6g}",
+        f"alpha={gate.get('alpha', float('nan')):.6g} prior_std={gate['prior_std']:.6g} dyn_std={gate['dyn_std']:.6g}",
         flush=True,
     )
     print(
@@ -1502,6 +1611,10 @@ def print_model_diagnostics(epoch: int, batch_i: int, diag: dict, grad_diag: Opt
         f"[model-pred] epoch={epoch+1} batch={batch_i} dir_logit_std={pred['dir_logit_std']:.6g} "
         f"dir_prob_mean={pred['dir_prob_mean']:.6g} dir_prob_std={pred['dir_prob_std']:.6g} "
         f"mag_up_mean={pred['mag_up_mean']:.6g} mag_down_mean={pred['mag_down_mean']:.6g} "
+        f"mag_up_raw_p50={pred.get('mag_up_raw_p50', float('nan')):.6g} "
+        f"mag_down_raw_p50={pred.get('mag_down_raw_p50', float('nan')):.6g} "
+        f"mag_up_floor_frac={pred.get('mag_up_floor_frac', float('nan')):.6g} "
+        f"mag_down_floor_frac={pred.get('mag_down_floor_frac', float('nan')):.6g} "
         f"corr_dir_y={corr}",
         flush=True,
     )
@@ -1691,6 +1804,12 @@ def train_from_offline():
         abs_hi=stats["abs_hi_raw_bps"],
         q50=stats["kept_q50_abs_raw_bps"],
     )
+    mag_pos_init_sqrt, mag_neg_init_sqrt = compute_mag_init_targets_from_train_labels(
+        y_train,
+        abs_lo=stats["abs_lo_raw_bps"],
+        abs_hi=stats["abs_hi_raw_bps"],
+        q50=stats["kept_q50_abs_raw_bps"],
+    )
     print(f"[train_stats] dir_pos_w={dir_pos_w.tolist()} dir_neg_w={dir_neg_w.tolist()}")
 
     TrainSourceCls = CPUWindowBatchSource if TRAIN_DATA_DEVICE == "cpu_pinned" else GPUWindowBatchSource
@@ -1748,6 +1867,18 @@ def train_from_offline():
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
     model = SAMBA(args).to(device)
+    mag_init_info = model.initialize_magnitude_head_bias(
+        mag_pos_init_sqrt,
+        mag_neg_init_sqrt,
+    )
+    print(
+        f"[mag-init] pos_target_sqrt={mag_init_info['pos_target_sqrt']} "
+        f"neg_target_sqrt={mag_init_info['neg_target_sqrt']} "
+        f"pos_bias={mag_init_info['pos_bias']} neg_bias={mag_init_info['neg_bias']}",
+        flush=True,
+    )
+    param_groups = build_optimizer_param_groups(model, base_lr=LR, gate_lr=GATE_LR)
+    gate_param_count = sum(p.numel() for p in param_groups[1]["params"])
     param_summary = summarize_param_groups(model)
     param_keys = [
         "extractor_depatch",
@@ -1775,14 +1906,6 @@ def train_from_offline():
         model = torch.compile(model, mode=COMPILE_MODE, dynamic=False)
         print(f"[compile] enabled full-model compile with {COMPILE_MODE} (dynamic=False)", flush=True)
 
-    param_groups = [
-        {
-            "params": model.parameters(),
-            "lr": LR,
-            "weight_decay": 1e-3,
-        },
-    ]
-
     if USE_SAM:
         opt = SAM(param_groups, torch.optim.AdamW, rho=SAM_RHO)
         optimizer_name = "SAM(AdamW)"
@@ -1791,8 +1914,9 @@ def train_from_offline():
         optimizer_name = "AdamW"
     print(
         f"[optim-config] optimizer={optimizer_name} use_sam={int(USE_SAM)} "
-        f"lr={LR} clip_grad={CLIP_GRAD} sam_rho={SAM_RHO} weight_decay=1e-3 "
-        f"params={sum(p.numel() for p in model.parameters())}",
+        f"lr={LR} gate_lr={GATE_LR} clip_grad={CLIP_GRAD} sam_rho={SAM_RHO} "
+        f"weight_decay_main=1e-3 weight_decay_gate=0 "
+        f"params={sum(p.numel() for p in unwrap_model(model).parameters())} gate_params={gate_param_count}",
         flush=True,
     )
     primary_metric_mode=get_primary_metric_mode()
@@ -1816,6 +1940,8 @@ def train_from_offline():
         loss_sum = torch.zeros((), device=device)
         dir_bce_sum = torch.zeros((), device=device)
         mag_huber_sum = torch.zeros((), device=device)
+        mag_up_huber_sum = torch.zeros((), device=device)
+        mag_down_huber_sum = torch.zeros((), device=device)
         mag_corr_sum = torch.zeros((), device=device)
         dir_norm_sum = torch.zeros((), device=device)
         mag_norm_sum = torch.zeros((), device=device)
@@ -1828,6 +1954,12 @@ def train_from_offline():
             _check_tensor_finite("x", x, epoch=epoch, batch=batch_i, stage="input")
             _check_tensor_finite("y_raw", y_raw, epoch=epoch, batch=batch_i, stage="input")
             _check_params_finite(model, epoch=epoch, batch=batch_i, stage="batch_start")
+            global_step = epoch * len(train_src) + batch_i
+            if GATE_WARMUP_STEPS <= 0:
+                gate_alpha = 1.0
+            else:
+                gate_alpha = min(1.0, float(global_step) / float(GATE_WARMUP_STEPS))
+            unwrap_model(model).set_gate_alpha(gate_alpha)
 
             # First forward/backward: compute the raw gradient used to choose SAM's adversarial perturbation.
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
@@ -1978,6 +2110,8 @@ def train_from_offline():
             loss_sum += loss.detach()
             dir_bce_sum += comps["dir_bce"]
             mag_huber_sum += comps["mag_huber"]
+            mag_up_huber_sum += comps["mag_up_huber"]
+            mag_down_huber_sum += comps["mag_down_huber"]
             mag_corr_sum += comps["mag_corr"]
             dir_norm_sum += comps["dir_norm"]
             mag_norm_sum += comps["mag_norm"]
@@ -1988,11 +2122,13 @@ def train_from_offline():
         train_loss = (loss_sum / max(1, n_batches)).item()
         train_dir_bce = (dir_bce_sum / max(1, n_batches)).item()
         train_mag_huber = (mag_huber_sum / max(1, n_batches)).item()
+        train_mag_up_huber = (mag_up_huber_sum / max(1, n_batches)).item()
+        train_mag_down_huber = (mag_down_huber_sum / max(1, n_batches)).item()
         train_mag_corr = (mag_corr_sum / max(1, n_batches)).item()
         train_dir_norm = (dir_norm_sum / max(1, n_batches)).item()
         train_mag_norm = (mag_norm_sum / max(1, n_batches)).item()
         train_corr_norm = (corr_norm_sum / max(1, n_batches)).item()
-        print(f"[train] loss={train_loss:.6f} dir_bce={train_dir_bce:.6f} mag_huber={train_mag_huber:.6f} mag_corr={train_mag_corr:.6f} dir_norm={train_dir_norm:.6f} mag_norm={train_mag_norm:.6f} corr_norm={train_corr_norm:.6f}")
+        print(f"[train] loss={train_loss:.6f} dir_bce={train_dir_bce:.6f} mag_huber={train_mag_huber:.6f} mag_up_huber={train_mag_up_huber:.6f} mag_down_huber={train_mag_down_huber:.6f} mag_corr={train_mag_corr:.6f} dir_norm={train_dir_norm:.6f} mag_norm={train_mag_norm:.6f} corr_norm={train_corr_norm:.6f}")
 
         val_fast_t0 = time.perf_counter()
         val_fast=summarize_metrics(model, val_fast_src, device, stats, amp_enabled, amp_dtype, primary_only=True, epoch=epoch)
