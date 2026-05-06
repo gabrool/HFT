@@ -59,6 +59,18 @@ MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lowe
 LR = float(os.environ.get("BYBIT_LR", "2e-4"))
 CLIP_GRAD = float(os.environ.get("BYBIT_CLIP_GRAD", "5.0"))
 FINITE_DEBUG = int(os.environ.get("BYBIT_FINITE_DEBUG", "1")) == 1
+DEPATCH_OFFSET_LR_MULT = float(os.environ.get("BYBIT_DEPATCH_OFFSET_LR_MULT", "0.05"))
+DEPATCH_OFFSET_CLIP_GRAD = float(os.environ.get("BYBIT_DEPATCH_OFFSET_CLIP_GRAD", "0.10"))
+
+if not math.isfinite(DEPATCH_OFFSET_LR_MULT) or DEPATCH_OFFSET_LR_MULT <= 0.0:
+    raise ValueError(
+        f"BYBIT_DEPATCH_OFFSET_LR_MULT must be finite and > 0, got {DEPATCH_OFFSET_LR_MULT}"
+    )
+
+if not math.isfinite(DEPATCH_OFFSET_CLIP_GRAD) or DEPATCH_OFFSET_CLIP_GRAD <= 0.0:
+    raise ValueError(
+        f"BYBIT_DEPATCH_OFFSET_CLIP_GRAD must be finite and > 0, got {DEPATCH_OFFSET_CLIP_GRAD}"
+    )
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -1191,6 +1203,37 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model._orig_mod if hasattr(model, '_orig_mod') else model
 
 
+OFFSET_PARAM_PREFIX = "depatch_proj_encoder.depatch.offset_predictor."
+
+
+def _split_offset_and_main_params(model: torch.nn.Module):
+    base_model = unwrap_model(model)
+    offset_params = []
+    main_params = []
+
+    for name, p in base_model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith(OFFSET_PARAM_PREFIX):
+            offset_params.append(p)
+        else:
+            main_params.append(p)
+
+    if not offset_params:
+        raise RuntimeError(
+            f"No parameters found with prefix {OFFSET_PARAM_PREFIX!r}; cannot build offset optimizer group."
+        )
+    if not main_params:
+        raise RuntimeError("No main trainable parameters found.")
+
+    return main_params, offset_params
+
+
+def _offset_predictor_params(model: torch.nn.Module):
+    _main_params, offset_params = _split_offset_and_main_params(model)
+    return offset_params
+
+
 def get_model_state_dict(model: torch.nn.Module) -> dict:
     return unwrap_model(model).state_dict()
 
@@ -1429,8 +1472,31 @@ def train_from_offline():
         model = torch.compile(model, mode=COMPILE_MODE, dynamic=False)
         print(f"[compile] enabled full-model compile with {COMPILE_MODE} (dynamic=False)", flush=True)
 
-    opt=SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
-    print(f"[optim-config] lr={LR} clip_grad={CLIP_GRAD} sam_rho=0.01 weight_decay=1e-3", flush=True)
+    main_params, offset_params = _split_offset_and_main_params(model)
+
+    param_groups = [
+        {
+            "params": main_params,
+            "lr": LR,
+            "weight_decay": 1e-3,
+        },
+        {
+            "params": offset_params,
+            "lr": LR * DEPATCH_OFFSET_LR_MULT,
+            "weight_decay": 1e-3,
+        },
+    ]
+
+    opt = SAM(param_groups, torch.optim.AdamW, rho=0.01)
+    print(
+        f"[optim-config] lr={LR} clip_grad={CLIP_GRAD} sam_rho=0.01 weight_decay=1e-3 "
+        f"offset_lr={LR * DEPATCH_OFFSET_LR_MULT} "
+        f"offset_lr_mult={DEPATCH_OFFSET_LR_MULT} "
+        f"offset_clip_grad={DEPATCH_OFFSET_CLIP_GRAD} "
+        f"offset_params={sum(p.numel() for p in offset_params)} "
+        f"main_params={sum(p.numel() for p in main_params)}",
+        flush=True,
+    )
     primary_metric_mode=get_primary_metric_mode()
     best=-float('inf') if primary_metric_mode=='max' else float('inf')
     no_imp = 0
@@ -1494,7 +1560,14 @@ def train_from_offline():
             loss.backward()
             grad_norm1 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward1")
 
-            # Do NOT clip here. SAM first_step must see the raw gradient direction.
+            offset_clip_return1 = torch.nn.utils.clip_grad_norm_(
+                _offset_predictor_params(model),
+                DEPATCH_OFFSET_CLIP_GRAD,
+                error_if_nonfinite=True,
+            )
+
+            _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_offset_clip1")
+
             opt.first_step(zero_grad=True)
             _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_sam_first_step")
             
@@ -1522,6 +1595,14 @@ def train_from_offline():
             loss2.backward()
             grad_norm2 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward2")
 
+            offset_clip_return2 = torch.nn.utils.clip_grad_norm_(
+                _offset_predictor_params(model),
+                DEPATCH_OFFSET_CLIP_GRAD,
+                error_if_nonfinite=True,
+            )
+
+            _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="after_offset_clip2")
+
             # Clip only before the actual optimizer update.
             grad_norm_clip_return = torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
@@ -1536,6 +1617,8 @@ def train_from_offline():
                     f"loss2={float(loss2.detach().float().item()):.6g} "
                     f"grad_norm1={grad_norm1:.6g} "
                     f"grad_norm2={grad_norm2:.6g} "
+                    f"offset_clip1={float(offset_clip_return1.detach().float().item()):.6g} "
+                    f"offset_clip2={float(offset_clip_return2.detach().float().item()):.6g} "
                     f"clip_return={float(grad_norm_clip_return.detach().float().item()):.6g}",
                     flush=True,
                 )
