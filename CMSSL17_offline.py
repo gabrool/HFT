@@ -61,6 +61,10 @@ CLIP_GRAD = float(os.environ.get("BYBIT_CLIP_GRAD", "5.0"))
 FINITE_DEBUG = int(os.environ.get("BYBIT_FINITE_DEBUG", "1")) == 1
 DEPATCH_OFFSET_LR_MULT = float(os.environ.get("BYBIT_DEPATCH_OFFSET_LR_MULT", "0.05"))
 DEPATCH_OFFSET_CLIP_GRAD = float(os.environ.get("BYBIT_DEPATCH_OFFSET_CLIP_GRAD", "0.10"))
+SAM_RHO = float(os.environ.get("BYBIT_SAM_RHO", "0.005"))
+
+if not math.isfinite(SAM_RHO) or SAM_RHO < 0.0:
+    raise ValueError(f"BYBIT_SAM_RHO must be finite and >= 0, got {SAM_RHO}")
 
 if not math.isfinite(DEPATCH_OFFSET_LR_MULT) or DEPATCH_OFFSET_LR_MULT <= 0.0:
     raise ValueError(
@@ -1502,9 +1506,9 @@ def train_from_offline():
         },
     ]
 
-    opt = SAM(param_groups, torch.optim.AdamW, rho=0.01)
+    opt = SAM(param_groups, torch.optim.AdamW, rho=SAM_RHO)
     print(
-        f"[optim-config] lr={LR} clip_grad={CLIP_GRAD} sam_rho=0.01 weight_decay=1e-3 "
+        f"[optim-config] lr={LR} clip_grad={CLIP_GRAD} sam_rho={SAM_RHO} weight_decay=1e-3 "
         f"offset_lr={LR * DEPATCH_OFFSET_LR_MULT} "
         f"offset_lr_mult={DEPATCH_OFFSET_LR_MULT} "
         f"offset_clip_grad={DEPATCH_OFFSET_CLIP_GRAD} "
