@@ -35,7 +35,7 @@ from CMSSL17 import (  # type: ignore
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS,
     PRIMARY_DIR_BAL_ACC_GUARD,
-    LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA,
+    LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA, MODEL_ARCH_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
     DIR_LOSS_WEIGHT, MAG_LOSS_WEIGHT, MAG_CORR_LOSS_WEIGHT, EMA_DECAY,
     FEATURE_SCHEMA, AUX_SCHEMA, FEATURE_AUX_TAIL,
@@ -61,6 +61,13 @@ CLIP_GRAD = float(os.environ.get("BYBIT_CLIP_GRAD", "5.0"))
 FINITE_DEBUG = int(os.environ.get("BYBIT_FINITE_DEBUG", "1")) == 1
 USE_SAM = int(os.environ.get("BYBIT_USE_SAM", "0")) == 1
 SAM_RHO = float(os.environ.get("BYBIT_SAM_RHO", "0.005"))
+MODEL_DIAG = int(os.environ.get("BYBIT_MODEL_DIAG", "1")) == 1
+MODEL_DIAG_EVERY = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_EVERY", str(LOG_EVERY))))
+MODEL_DIAG_MAX_BATCH = max(1, int(os.environ.get("BYBIT_MODEL_DIAG_MAX_BATCH", "16")))
+print(
+    f"[model-diag-config] enabled={int(MODEL_DIAG)} every={MODEL_DIAG_EVERY} max_batch={MODEL_DIAG_MAX_BATCH}",
+    flush=True,
+)
 
 if not math.isfinite(SAM_RHO) or SAM_RHO < 0.0:
     raise ValueError(f"BYBIT_SAM_RHO must be finite and >= 0, got {SAM_RHO}")
@@ -1213,6 +1220,236 @@ def get_model_state_dict(model: torch.nn.Module) -> dict:
     return unwrap_model(model).state_dict()
 
 
+def _tensor_float_list(t: torch.Tensor) -> List[float]:
+    return [float(v) for v in t.detach().float().cpu().tolist()]
+
+
+def model_param_groups(model: torch.nn.Module) -> Dict[str, List[Tuple[str, torch.nn.Parameter]]]:
+    prefixes = [
+        ("extractor_depatch", "depatch_proj_encoder.depatch."),
+        ("extractor_patch_embed", "depatch_proj_encoder.output_linear."),
+        ("extractor_ci", "depatch_proj_encoder.ci_encoder."),
+        ("extractor_gate", "depatch_proj_encoder.feature_gate."),
+        ("extractor_post_gate", "depatch_proj_encoder.post_gate_proj."),
+        ("extractor_mixed", "depatch_proj_encoder.mixed_encoder."),
+        ("extractor_output_norm", "depatch_proj_encoder.output_norm."),
+        ("mamba", "mamba."),
+        ("task_decoders", "dir_token_decoder."),
+        ("task_decoders", "mag_token_decoder."),
+        ("heads_pools", "dir_pool."),
+        ("heads_pools", "mag_pool."),
+        ("heads_pools", "dir_head."),
+        ("heads_pools", "mag_up_head."),
+        ("heads_pools", "mag_down_head."),
+    ]
+    groups = {k: [] for k in [
+        "extractor_depatch", "extractor_patch_embed", "extractor_ci", "extractor_gate",
+        "extractor_post_gate", "extractor_mixed", "extractor_output_norm", "mamba",
+        "task_decoders", "heads_pools", "other",
+    ]}
+    for name, p in unwrap_model(model).named_parameters():
+        matched = False
+        for group, prefix in prefixes:
+            if name.startswith(prefix):
+                groups[group].append((name, p))
+                matched = True
+                break
+        if not matched:
+            groups["other"].append((name, p))
+    return groups
+
+
+def summarize_param_groups(model: torch.nn.Module) -> Dict[str, dict]:
+    out = {}
+    for group, params in model_param_groups(model).items():
+        count = sum(p.numel() for _, p in params)
+        req_count = sum(p.numel() for _, p in params if p.requires_grad)
+        sq = 0.0
+        abs_sum = 0.0
+        for _, p in params:
+            pf = p.detach().float()
+            sq += float((pf * pf).sum().item())
+            abs_sum += float(pf.abs().sum().item())
+        out[group] = {
+            "param_count": int(count),
+            "param_norm": math.sqrt(sq),
+            "param_abs_mean": abs_sum / max(1, count),
+            "requires_grad_count": int(req_count),
+        }
+    return out
+
+
+def summarize_grad_groups(model: torch.nn.Module, lr: float) -> Dict[str, dict]:
+    out = {}
+    for group, params in model_param_groups(model).items():
+        param_count = sum(p.numel() for _, p in params)
+        grad_param_count = 0
+        grad_none_param_count = 0
+        grad_sq = 0.0
+        param_sq = 0.0
+        grad_abs_sum = 0.0
+        grad_numel = 0
+        grad_abs_chunks = []
+        for _, p in params:
+            pf = p.detach().float()
+            param_sq += float((pf * pf).sum().item())
+            if p.grad is None:
+                grad_none_param_count += p.numel()
+                continue
+            gf = p.grad.detach().float()
+            grad_param_count += p.numel()
+            grad_sq += float((gf * gf).sum().item())
+            ga = gf.abs().reshape(-1)
+            grad_abs_sum += float(ga.sum().item())
+            grad_numel += ga.numel()
+            grad_abs_chunks.append(ga)
+        grad_norm = math.sqrt(grad_sq)
+        param_norm = math.sqrt(param_sq)
+        if grad_abs_chunks:
+            grad_abs_p95 = float(torch.quantile(torch.cat(grad_abs_chunks), 0.95).cpu())
+        else:
+            grad_abs_p95 = 0.0
+        out[group] = {
+            "param_count": int(param_count),
+            "grad_param_count": int(grad_param_count),
+            "grad_none_param_count": int(grad_none_param_count),
+            "grad_norm": grad_norm,
+            "param_norm": param_norm,
+            "lr_grad_over_param": float(lr) * grad_norm / (param_norm + 1e-12),
+            "grad_abs_mean": grad_abs_sum / max(1, grad_numel),
+            "grad_abs_p95": grad_abs_p95,
+        }
+    return out
+
+
+def append_jsonl(path: Path, payload: dict) -> None:
+    with path.open("a") as f:
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _pearson_small(a: torch.Tensor, b: torch.Tensor) -> float:
+    af = a.detach().float().reshape(-1)
+    bf = b.detach().float().reshape(-1)
+    am = af - af.mean()
+    bm = bf - bf.mean()
+    denom = torch.sqrt((am * am).mean() * (bm * bm).mean())
+    if float(denom.cpu()) <= 1e-12:
+        return float("nan")
+    return float(((am * bm).mean() / denom).cpu())
+
+
+@torch.no_grad()
+def run_model_diagnostics(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y_raw: torch.Tensor,
+    *,
+    epoch: int,
+    batch_i: int,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+) -> dict:
+    base = unwrap_model(model)
+    was_training = base.training
+    base.eval()
+    x_diag = x[:MODEL_DIAG_MAX_BATCH].detach()
+    y_diag = y_raw[:MODEL_DIAG_MAX_BATCH].detach()
+    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+        pred_diag, diag = base.forward_with_diagnostics(x_diag)
+    if was_training:
+        base.train()
+
+    y_sign = (y_diag.float() > 0).float()
+    y_abs = y_diag.float().abs()
+    probs = torch.sigmoid(pred_diag["dir_logits"].float())
+    dir_corr = []
+    prob_std = []
+    for h in range(NUM_HORIZONS):
+        dir_corr.append(_pearson_small(pred_diag["dir_logits"][:, h], y_sign[:, h]))
+        prob_std.append(float(probs[:, h].std(unbiased=False).cpu()))
+    diag["target_prediction"] = {
+        "y_sign_pos_frac_by_horizon": _tensor_float_list(y_sign.mean(dim=0)),
+        "y_abs_mean_by_horizon": _tensor_float_list(y_abs.mean(dim=0)),
+        "dir_logit_pearson_by_horizon": dir_corr,
+        "dir_prob_std_by_horizon": prob_std,
+    }
+    diag["epoch"] = int(epoch + 1)
+    diag["batch"] = int(batch_i)
+    return diag
+
+
+def _fmt_ratio(grad_diag: Optional[Dict[str, dict]], key: str) -> str:
+    if not grad_diag or key not in grad_diag:
+        return "nan"
+    return f"{grad_diag[key]['lr_grad_over_param']:.3e}"
+
+
+def print_model_diagnostics(epoch: int, batch_i: int, diag: dict, grad_diag: Optional[Dict[str, dict]]) -> None:
+    ext = diag["extractor"]
+    ea = ext["activations"]
+    ma = diag["activations"]
+    ratios = ext.get("ratios", {})
+    mratios = diag.get("ratios", {})
+    gate = ext["gate"]
+    dep = ext["depatch"]
+    res = ext["residual_scalars"]
+    pred = diag["prediction"]
+    tp = diag["target_prediction"]
+    print(
+        f"[model-act] epoch={epoch+1} batch={batch_i} input_rms={ea['x_input']['rms']:.6g} "
+        f"depatch_rms={ea['depatch_out']['rms']:.6g} ci_rms={ea['ci_out']['rms']:.6g} "
+        f"gate_rms={ea['post_gate']['rms']:.6g} proj_rms={ea['post_proj']['rms']:.6g} "
+        f"mixed_rms={ea['post_mixed']['rms']:.6g} mamba_rms={ma['mamba_tokens']['rms']:.6g} "
+        f"fused_rms={ma['mamba_fused']['rms']:.6g}",
+        flush=True,
+    )
+    print(
+        f"[model-ratio] epoch={epoch+1} batch={batch_i} gate_over_ci={ratios.get('gate_over_ci_rms', float('nan')):.6g} "
+        f"proj_over_flat={ratios.get('proj_over_flat_rms', float('nan')):.6g} "
+        f"mixed_over_proj={ratios.get('mixed_over_proj_rms', float('nan')):.6g} "
+        f"fused_over_tokens={mratios.get('fused_over_tokens_rms', float('nan')):.6g}",
+        flush=True,
+    )
+    print(
+        f"[model-gate] epoch={epoch+1} batch={batch_i} mean={gate['gate_mean']:.6g} std={gate['gate_std']:.6g} "
+        f"p05={gate['gate_p05']:.6g} p50={gate['gate_p50']:.6g} p95={gate['gate_p95']:.6g} "
+        f"frac_lt_0p5={gate['gate_frac_lt_0p5']:.6g} frac_gt_0p95={gate['gate_frac_gt_0p95']:.6g} "
+        f"prior_std={gate['prior_std']:.6g} dyn_std={gate['dyn_std']:.6g}",
+        flush=True,
+    )
+    print(
+        f"[model-offset] epoch={epoch+1} batch={batch_i} dx_std={dep['offset_dx_std']:.6g} "
+        f"dx_abs_p95={dep['offset_dx_abs_p95']:.6g} span_mean={dep['span_samples_mean']:.6g} "
+        f"span_p05={dep['span_samples_p05']:.6g} span_p95={dep['span_samples_p95']:.6g} "
+        f"left_clip_frac={dep['bound_left_clip_frac']:.6g} right_clip_frac={dep['bound_right_clip_frac']:.6g}",
+        flush=True,
+    )
+    print(
+        f"[model-res] epoch={epoch+1} batch={batch_i} ci_a_mean={res['ci_res_a_mean']:.6g} "
+        f"ci_a_absmax={res['ci_res_a_absmax']:.6g} mixed_a_mean={res['mixed_res_a_mean']:.6g} "
+        f"mixed_a_absmax={res['mixed_res_a_absmax']:.6g}",
+        flush=True,
+    )
+    corr = [float(v) for v in tp["dir_logit_pearson_by_horizon"]]
+    print(
+        f"[model-pred] epoch={epoch+1} batch={batch_i} dir_logit_std={pred['dir_logit_std']:.6g} "
+        f"dir_prob_mean={pred['dir_prob_mean']:.6g} dir_prob_std={pred['dir_prob_std']:.6g} "
+        f"mag_up_mean={pred['mag_up_mean']:.6g} mag_down_mean={pred['mag_down_mean']:.6g} "
+        f"corr_dir_y={corr}",
+        flush=True,
+    )
+    print(
+        f"[model-grad] epoch={epoch+1} batch={batch_i} depatch={_fmt_ratio(grad_diag, 'extractor_depatch')} "
+        f"patch={_fmt_ratio(grad_diag, 'extractor_patch_embed')} ci={_fmt_ratio(grad_diag, 'extractor_ci')} "
+        f"gate={_fmt_ratio(grad_diag, 'extractor_gate')} post_gate={_fmt_ratio(grad_diag, 'extractor_post_gate')} "
+        f"mixed={_fmt_ratio(grad_diag, 'extractor_mixed')} mamba={_fmt_ratio(grad_diag, 'mamba')} "
+        f"decoders={_fmt_ratio(grad_diag, 'task_decoders')} heads={_fmt_ratio(grad_diag, 'heads_pools')}",
+        flush=True,
+    )
+
+
+
 def _finite_stats(t: torch.Tensor) -> str:
     td = t.detach()
     finite = torch.isfinite(td)
@@ -1445,6 +1682,19 @@ def train_from_offline():
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
     model = SAMBA(args).to(device)
+    param_summary = summarize_param_groups(model)
+    param_keys = [
+        "extractor_depatch", "extractor_patch_embed", "extractor_ci", "extractor_gate",
+        "extractor_post_gate", "extractor_mixed", "mamba", "task_decoders", "heads_pools",
+    ]
+    total_params = sum(v["param_count"] for v in param_summary.values())
+    print(
+        "[param-groups] "
+        + " ".join(f"{k}={param_summary[k]['param_count']}" for k in param_keys)
+        + f" total={total_params}",
+        flush=True,
+    )
+    diag_path = out_root / "model_diagnostics.jsonl"
 
     if COMPILE_ENABLED and hasattr(torch, "compile"):
         model = torch.compile(model, mode=COMPILE_MODE, dynamic=False)
@@ -1498,6 +1748,7 @@ def train_from_offline():
         n_batches = 0
         first_batch_checked = False
         for batch_i, (x, y_raw) in enumerate(tqdm(train_src.iter_epoch(epoch), total=len(train_src), desc=f"Ep{epoch+1}/{EPOCHS}")):
+            diag_due = MODEL_DIAG and (batch_i == 0 or ((batch_i + 1) % MODEL_DIAG_EVERY == 0))
             opt.zero_grad(set_to_none=True)
             _check_tensor_finite("x", x, epoch=epoch, batch=batch_i, stage="input")
             _check_tensor_finite("y_raw", y_raw, epoch=epoch, batch=batch_i, stage="input")
@@ -1562,6 +1813,7 @@ def train_from_offline():
                 grad_norm2 = _check_grads_finite(model, epoch=epoch, batch=batch_i, stage="backward2")
 
                 # Clip only before the actual optimizer update.
+                grad_diag = summarize_grad_groups(model, LR) if diag_due else None
                 grad_norm_clip_return = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
                     CLIP_GRAD,
@@ -1571,6 +1823,27 @@ def train_from_offline():
 
                 opt.second_step(zero_grad=True)
                 _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_optimizer_step")
+
+                if diag_due:
+                    activation_diag = run_model_diagnostics(
+                        model, x, y_raw, epoch=epoch, batch_i=batch_i, device=device,
+                        amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                    )
+                    print_model_diagnostics(epoch, batch_i, activation_diag, grad_diag)
+                    append_jsonl(diag_path, {
+                        "epoch": epoch + 1,
+                        "batch": batch_i,
+                        "optimizer": optimizer_name,
+                        "loss1": float(loss.detach().float().item()),
+                        "loss2": float(loss2.detach().float().item()),
+                        "grad_global_norm1": float(grad_norm1),
+                        "grad_global_norm2": float(grad_norm2),
+                        "clip_return": float(grad_norm_clip_return.detach().float().item()),
+                        "activation_diag": activation_diag,
+                        "gradient_diag": grad_diag,
+                        "residual_scalar_diag": activation_diag["extractor"]["residual_scalars"],
+                        "prediction_diag": activation_diag["prediction"],
+                    })
 
                 if FINITE_DEBUG and ((batch_i + 1) % LOG_EVERY == 0 or batch_i == 0):
                     print(
@@ -1583,6 +1856,7 @@ def train_from_offline():
                         flush=True,
                     )
             else:
+                grad_diag = summarize_grad_groups(model, LR) if diag_due else None
                 grad_norm_clip_return = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
                     CLIP_GRAD,
@@ -1595,6 +1869,27 @@ def train_from_offline():
                 opt.zero_grad(set_to_none=True)
 
                 _check_params_finite(model, epoch=epoch, batch=batch_i, stage="after_optimizer_step")
+
+                if diag_due:
+                    activation_diag = run_model_diagnostics(
+                        model, x, y_raw, epoch=epoch, batch_i=batch_i, device=device,
+                        amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                    )
+                    print_model_diagnostics(epoch, batch_i, activation_diag, grad_diag)
+                    append_jsonl(diag_path, {
+                        "epoch": epoch + 1,
+                        "batch": batch_i,
+                        "optimizer": optimizer_name,
+                        "loss1": float(loss.detach().float().item()),
+                        "loss2": None,
+                        "grad_global_norm1": float(grad_norm1),
+                        "grad_global_norm2": None,
+                        "clip_return": float(grad_norm_clip_return.detach().float().item()),
+                        "activation_diag": activation_diag,
+                        "gradient_diag": grad_diag,
+                        "residual_scalar_diag": activation_diag["extractor"]["residual_scalars"],
+                        "prediction_diag": activation_diag["prediction"],
+                    })
 
                 if FINITE_DEBUG and ((batch_i + 1) % LOG_EVERY == 0 or batch_i == 0):
                     print(
@@ -1652,6 +1947,7 @@ def train_from_offline():
                 'args': {
                     'DMODEL':DMODEL, 'MAMBA_LAYERS':MAMBA_LAYERS, 'feat_dim':F_total, 'LOOKBACK':LOOKBACK,
                     'WINDOW_MS': WINDOW_MS, 'HORIZONS_MS': HORIZONS_MS, 'checkpoint_schema': CHECKPOINT_SCHEMA,
+                    'model_arch_schema': MODEL_ARCH_SCHEMA,
                     'model_output_schema': MODEL_OUTPUT_SCHEMA,
                     'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
                     'decision_time_basis': meta.get('decision_time_basis'), 'decision_stride_policy':'every_ob_event',
@@ -1706,6 +2002,8 @@ def train_from_offline():
     ckpt_args = ckpt.get("args", {})
     if ckpt_args.get("checkpoint_schema") != CHECKPOINT_SCHEMA:
         raise ValueError(f"Checkpoint schema mismatch: got {ckpt_args.get('checkpoint_schema')}, expected {CHECKPOINT_SCHEMA}")
+    if ckpt_args.get("model_arch_schema") != MODEL_ARCH_SCHEMA:
+        raise ValueError(f"Model architecture schema mismatch: got {ckpt_args.get('model_arch_schema')}, expected {MODEL_ARCH_SCHEMA}")
     if ckpt_args.get("model_output_schema") != MODEL_OUTPUT_SCHEMA:
         raise ValueError(f"Model output schema mismatch: got {ckpt_args.get('model_output_schema')}, expected {MODEL_OUTPUT_SCHEMA}")
     unwrap_model(model).load_state_dict(state, strict=True)

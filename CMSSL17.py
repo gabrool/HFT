@@ -472,6 +472,18 @@ CONV_KERNELS    = [3,3,5,5,7,7]
 DFF_CONV        = 2 * DMODEL
 DEPATCH_OFFSET_MODE = "learnable"
 
+MODEL_ARCH_SCHEMA = "ctn_hybrid_ci4_gate_proj_mixed2_ci8_v1"
+CTN_CI_KERNELS = [3, 3, 7, 7]
+CTN_MIXED_KERNELS = [15, 15]
+CTN_CI_INTERNAL_DIM = 8
+CTN_CI_FF_MULT = 8
+CTN_CI_DFF = CTN_CI_INTERNAL_DIM * CTN_CI_FF_MULT
+CTN_POST_GATE_HIDDEN = 2 * DMODEL
+CTN_MIXED_DIM = DMODEL
+CTN_MIXED_DFF = 2 * DMODEL
+CTN_PATCH_SIZE = 2
+CTN_PATCH_STRIDE = 1
+
 # Prediction horizons (in milliseconds)
 HORIZONS_MS     = [7_500, 15_000, 30_000]
 NUM_HORIZONS    = len(HORIZONS_MS)
@@ -771,6 +783,34 @@ class DepatchSampling(nn.Module):
         pred_offset = self.offset_predictor(X)
         sampling_locations, bound = self.box_coder(pred_offset)
         return sampling_locations, bound
+
+    @torch.no_grad()
+    def diagnostics(self, X: torch.Tensor) -> dict:
+        pred_offset = self.offset_predictor(X.float())
+        dx = pred_offset[..., 0].detach().float()
+        ds_raw = pred_offset[..., 1].detach().float()
+        _, bound = self.box_coder(pred_offset)
+        bf = bound.detach().float()
+        span_samples = (bf[..., 1] - bf[..., 0]) * float(self.seq_len - 1)
+        dx_abs = dx.abs().reshape(-1)
+        ds_abs = ds_raw.abs().reshape(-1)
+        span_flat = span_samples.reshape(-1)
+        return {
+            "offset_dx_mean": float(dx.mean().cpu()),
+            "offset_dx_std": float(dx.std(unbiased=False).cpu()),
+            "offset_dx_abs_p95": float(torch.quantile(dx_abs, 0.95).cpu()),
+            "offset_dx_abs_max": float(dx_abs.max().cpu()),
+            "offset_ds_raw_mean": float(ds_raw.mean().cpu()),
+            "offset_ds_raw_std": float(ds_raw.std(unbiased=False).cpu()),
+            "offset_ds_raw_abs_p95": float(torch.quantile(ds_abs, 0.95).cpu()),
+            "span_samples_mean": float(span_flat.mean().cpu()),
+            "span_samples_p05": float(torch.quantile(span_flat, 0.05).cpu()),
+            "span_samples_p50": float(torch.quantile(span_flat, 0.50).cpu()),
+            "span_samples_p95": float(torch.quantile(span_flat, 0.95).cpu()),
+            "bound_left_clip_frac": float((bf[..., 0] <= 1e-6).float().mean().cpu()),
+            "bound_right_clip_frac": float((bf[..., 1] >= 1.0 - 1e-6).float().mean().cpu()),
+        }
+
     def forward(self, X, return_bound=False):
         orig_dtype = X.dtype
         ctx = (
@@ -899,85 +939,290 @@ class FeatureReliabilityGate(nn.Module):
         nn.init.zeros_(self.dynamic[-1].bias)
         nn.init.constant_(self.feature_prior_logit, prior_init)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def _compute_gate(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert z.ndim == 4
         _, _, F, C = z.shape
         assert F == self.in_feats
         assert C == self.d_internal
-
         dyn = self.dynamic(self.norm(z))  # [B, L, F, 1]
         prior = self.feature_prior_logit.view(1, 1, F, 1).to(dtype=dyn.dtype, device=dyn.device)
         gate = torch.sigmoid(dyn + prior)  # [B, L, F, 1]
+        return gate, dyn, prior
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        gate, _, _ = self._compute_gate(z)
         multiplier = gate / self.init_keep_prob
         return z * multiplier
 
     @torch.no_grad()
-    def gate_stats(self, z: torch.Tensor) -> dict:
-        dyn = self.dynamic(self.norm(z))
-        prior = self.feature_prior_logit.view(1, 1, self.in_feats, 1).to(dtype=dyn.dtype, device=dyn.device)
-        gate = torch.sigmoid(dyn + prior)
+    def gate_diagnostics(self, z: torch.Tensor) -> dict:
+        gate, dyn, prior = self._compute_gate(z)
+        gf = gate.detach().float()
+        q = torch.quantile(gf.reshape(-1), torch.tensor([0.01, 0.05, 0.50, 0.95, 0.99], device=gf.device))
+        feature_gate = gf.mean(dim=(0, 1, 3))
+        k = min(8, feature_gate.numel())
+        top = torch.topk(feature_gate, k=k, largest=True).indices.detach().cpu().tolist()
+        bottom = torch.topk(feature_gate, k=k, largest=False).indices.detach().cpu().tolist()
         return {
-            "mean": float(gate.mean().detach().cpu()),
-            "std": float(gate.std(unbiased=False).detach().cpu()),
-            "min": float(gate.min().detach().cpu()),
-            "max": float(gate.max().detach().cpu()),
+            "gate_mean": float(gf.mean().cpu()),
+            "gate_std": float(gf.std(unbiased=False).cpu()),
+            "gate_min": float(gf.min().cpu()),
+            "gate_max": float(gf.max().cpu()),
+            "gate_p01": float(q[0].cpu()),
+            "gate_p05": float(q[1].cpu()),
+            "gate_p50": float(q[2].cpu()),
+            "gate_p95": float(q[3].cpu()),
+            "gate_p99": float(q[4].cpu()),
+            "gate_frac_lt_0p2": float((gf < 0.2).float().mean().cpu()),
+            "gate_frac_lt_0p5": float((gf < 0.5).float().mean().cpu()),
+            "gate_frac_gt_0p95": float((gf > 0.95).float().mean().cpu()),
+            "dyn_mean": float(dyn.detach().float().mean().cpu()),
+            "dyn_std": float(dyn.detach().float().std(unbiased=False).cpu()),
+            "prior_mean": float(prior.detach().float().mean().cpu()),
+            "prior_std": float(prior.detach().float().std(unbiased=False).cpu()),
+            "top_gate_feature_idx_8": top,
+            "bottom_gate_feature_idx_8": bottom,
         }
 
+    @torch.no_grad()
+    def gate_stats(self, z: torch.Tensor) -> dict:
+        diag = self.gate_diagnostics(z)
+        return {"mean": diag["gate_mean"], "std": diag["gate_std"], "min": diag["gate_min"], "max": diag["gate_max"]}
+
+
+@torch.no_grad()
+def _activation_summary(t: torch.Tensor) -> dict:
+    td = t.detach()
+    tf = td.float()
+    finite = torch.isfinite(tf)
+    total = max(1, tf.numel())
+    vals = tf[finite]
+    if vals.numel() == 0:
+        out = {
+            "shape": list(td.shape),
+            "dtype": str(td.dtype),
+            "mean": float("nan"),
+            "std": float("nan"),
+            "rms": float("nan"),
+            "abs_p95": float("nan"),
+            "abs_max": float("nan"),
+            "zero_frac_abs_lt_1e_minus_6": float("nan"),
+            "finite_bad_frac": 1.0,
+        }
+    else:
+        abs_vals = vals.abs()
+        out = {
+            "shape": list(td.shape),
+            "dtype": str(td.dtype),
+            "mean": float(vals.mean().cpu()),
+            "std": float(vals.std(unbiased=False).cpu()),
+            "rms": float(torch.sqrt((vals * vals).mean()).cpu()),
+            "abs_p95": float(torch.quantile(abs_vals.reshape(-1), 0.95).cpu()),
+            "abs_max": float(abs_vals.max().cpu()),
+            "zero_frac_abs_lt_1e_minus_6": float((tf.abs() < 1e-6).float().mean().cpu()),
+            "finite_bad_frac": float((~finite).float().mean().cpu()),
+        }
+    if td.ndim == 3:
+        out["time_std_mean"] = float(tf.std(dim=1, unbiased=False).mean().cpu())
+        out["token_std_mean"] = float(tf.std(dim=-1, unbiased=False).mean().cpu())
+    return out
+
+
 class ConvTimeNetFeatureExtractor(nn.Module):
-    def __init__(self, in_feats, seq_len, d_model, dw_ks, n_layers, d_ff=256, dropout=0.1, act='gelu', 
-                 enable_res_param=True, norm='batch', re_param=True, re_param_kernel=3, patch_size=2, stride=1):
+    def __init__(
+        self,
+        in_feats: int,
+        seq_len: int,
+        d_model: int,
+        dropout: float = 0.1,
+        act: str = "gelu",
+        norm: str = "layer",
+        re_param: bool = True,
+        re_param_kernel: int = 3,
+    ):
         super(ConvTimeNetFeatureExtractor, self).__init__()
-        self.depatch = DepatchSampling(in_feats=in_feats, seq_len=seq_len, patch_size=patch_size, stride=stride)
-        self.patch_count = (seq_len - patch_size) // stride + 1
-        self.patch_size = patch_size
-        self.d_model_internal = max(4, d_model // in_feats)
-        self.d_ff_internal = max(8 * self.d_model_internal, 16)
-        assert self.d_model_internal >= 1, "d_model_internal must be >= 1"
-        assert self.d_ff_internal >= 2 * self.d_model_internal, "d_ff_internal must be >= 2 * d_model_internal"
-        self.output_linear = nn.Linear(patch_size, self.d_model_internal)
-        self.encoder = ConvEncoder(d_model=self.d_model_internal, d_ff=self.d_ff_internal, kernel_size=dw_ks, dropout=dropout, activation=act,
-                                   n_layers=n_layers, enable_res_param=enable_res_param, norm=norm, re_param=re_param, small_ks=re_param_kernel)
+        assert d_model == DMODEL
+        assert CTN_MIXED_DIM == d_model
+        assert len(CTN_CI_KERNELS) == 4
+        assert len(CTN_MIXED_KERNELS) == 2
+
+        self.depatch = DepatchSampling(
+            in_feats=in_feats,
+            seq_len=seq_len,
+            patch_size=CTN_PATCH_SIZE,
+            stride=CTN_PATCH_STRIDE,
+        )
+        self.patch_count = (seq_len - CTN_PATCH_SIZE) // CTN_PATCH_STRIDE + 1
+        self.patch_size = CTN_PATCH_SIZE
+        self.d_model_internal = CTN_CI_INTERNAL_DIM
+        self.d_ff_internal = CTN_CI_DFF
+        self.final_in_dim = in_feats * self.d_model_internal
+
+        self.output_linear = nn.Linear(CTN_PATCH_SIZE, CTN_CI_INTERNAL_DIM)
+        self.ci_encoder = ConvEncoder(
+            d_model=CTN_CI_INTERNAL_DIM,
+            d_ff=CTN_CI_DFF,
+            kernel_size=CTN_CI_KERNELS,
+            dropout=dropout,
+            activation=act,
+            n_layers=len(CTN_CI_KERNELS),
+            enable_res_param=True,
+            norm=norm,
+            re_param=re_param,
+            small_ks=re_param_kernel,
+        )
         self.feature_gate = FeatureReliabilityGate(
             in_feats=in_feats,
-            d_internal=self.d_model_internal,
+            d_internal=CTN_CI_INTERNAL_DIM,
             dropout=0.05,
             init_keep_prob=0.90,
         )
-        final_in_dim = self.d_model_internal * in_feats
-        # Post-gate nonlinear cross-feature mixer.
-        # Feature streams have already been temporally encoded and reliability-gated;
-        # this MLP mixes gated feature channels before projecting to d_model tokens.
-        self.final_proj = nn.Sequential(
-            nn.LayerNorm(final_in_dim),
-            nn.Linear(final_in_dim, final_in_dim),
+        self.post_gate_proj = nn.Sequential(
+            nn.LayerNorm(self.final_in_dim),
+            nn.Linear(self.final_in_dim, CTN_POST_GATE_HIDDEN),
             nn.GELU(),
             nn.Dropout(0.05),
-            nn.Linear(final_in_dim, d_model),
+            nn.Linear(CTN_POST_GATE_HIDDEN, d_model),
+            nn.LayerNorm(d_model),
         )
+        self.mixed_encoder = ConvEncoder(
+            d_model=d_model,
+            d_ff=CTN_MIXED_DFF,
+            kernel_size=CTN_MIXED_KERNELS,
+            dropout=dropout,
+            activation=act,
+            n_layers=len(CTN_MIXED_KERNELS),
+            enable_res_param=True,
+            norm=norm,
+            re_param=re_param,
+            small_ks=re_param_kernel,
+        )
+        self.output_norm = nn.LayerNorm(d_model)
+
+        sample_ms = float(WINDOW_MS) / float(LOOKBACK)
+        effective_rf_ms = int(round(46 * sample_ms))
+        print(
+            f"[ctn-config] arch={MODEL_ARCH_SCHEMA} patch_size={CTN_PATCH_SIZE} stride={CTN_PATCH_STRIDE} "
+            f"patch_count={self.patch_count} effective_rf_samples=46 effective_rf_ms={effective_rf_ms}",
+            flush=True,
+        )
+        ci_kernel_str = ",".join(str(k) for k in CTN_CI_KERNELS)
+        mixed_kernel_str = ",".join(str(k) for k in CTN_MIXED_KERNELS)
+        print(
+            f"[ctn-config] ci_layers={len(CTN_CI_KERNELS)} ci_kernels=[{ci_kernel_str}] "
+            f"ci_dim={CTN_CI_INTERNAL_DIM} ci_dff={CTN_CI_DFF} ci_res_param=1",
+            flush=True,
+        )
+        print(
+            f"[ctn-config] post_gate_in_dim={self.final_in_dim} post_gate_hidden={CTN_POST_GATE_HIDDEN} post_gate_out={d_model}",
+            flush=True,
+        )
+        print(
+            f"[ctn-config] mixed_layers={len(CTN_MIXED_KERNELS)} mixed_kernels=[{mixed_kernel_str}] "
+            f"mixed_dim={CTN_MIXED_DIM} mixed_dff={CTN_MIXED_DFF} mixed_res_param=1",
+            flush=True,
+        )
+
     def forward(self, x):
-        out_patch = self.depatch(x).contiguous()  # [B, feats, patch_count, patch_size]
-        out = self.output_linear(out_patch).contiguous()  # [B, feats, patch_count, d_model_internal]
-    
-        B = out.shape[0]
-    
-        u = out.reshape(B * out.shape[1], out.shape[2], self.d_model_internal)
-        u = u.permute(0, 2, 1).contiguous()  # [B * feats, d_model_internal, patch_count]
-    
-        out = self.encoder(u)
-        out = out.permute(0, 2, 1).contiguous()  # [B * feats, patch_count, d_model_internal]
-        assert out.shape[0] % B == 0
-        feats = out.shape[0] // B
-        assert feats == self.depatch.in_feats
-        assert out.shape[1] == self.depatch.patch_count
-        assert out.shape[2] == self.d_model_internal
+        out_patch = self.depatch(x).contiguous()  # [B, F, L, patch_size]
+        out = self.output_linear(out_patch).contiguous()  # [B, F, L, 8]
 
-        out = out.reshape(B, feats, self.depatch.patch_count, self.d_model_internal)
-        out = out.permute(0, 2, 1, 3).contiguous()  # [B, patch_count, feats, d_model_internal]
-        out = self.feature_gate(out)  # [B, patch_count, feats, d_model_internal]
+        B, F, L, C = out.shape
+        assert C == CTN_CI_INTERNAL_DIM
+        assert L == self.patch_count
 
-        out = out.reshape(B, self.depatch.patch_count, feats * self.d_model_internal).contiguous()
-        out = self.final_proj(out).contiguous()  # [B, patch_count, d_model]
+        u = out.reshape(B * F, L, C).permute(0, 2, 1).contiguous()
+        assert u.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
+
+        out = self.ci_encoder(u)
+        assert out.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
+
+        out = out.permute(0, 2, 1).contiguous()
+        out = out.reshape(B, F, self.patch_count, CTN_CI_INTERNAL_DIM)
+        out = out.permute(0, 2, 1, 3).contiguous()  # [B, L, F, 8]
+
+        out = self.feature_gate(out)
+
+        out = out.reshape(B, self.patch_count, F * CTN_CI_INTERNAL_DIM).contiguous()
+        out = self.post_gate_proj(out).contiguous()  # [B, L, 1024]
+
+        out_t = out.transpose(1, 2).contiguous()     # [B, 1024, L]
+        out_t = self.mixed_encoder(out_t)
+        out = out_t.transpose(1, 2).contiguous()     # [B, L, 1024]
+
+        out = self.output_norm(out)
         return out
+
+    @torch.no_grad()
+    def residual_scalar_diagnostics(self) -> dict:
+        def collect(enc: nn.Module) -> torch.Tensor:
+            vals = []
+            for mod in enc.modules():
+                if isinstance(mod, SublayerConnection) and getattr(mod, "enable", False) and hasattr(mod, "a"):
+                    vals.append(mod.a.detach().float().reshape(1))
+            if not vals:
+                return torch.empty(0)
+            return torch.cat(vals)
+
+        ci = collect(self.ci_encoder)
+        mixed = collect(self.mixed_encoder)
+        def stats(prefix: str, vals: torch.Tensor) -> dict:
+            if vals.numel() == 0:
+                return {f"{prefix}_res_a_mean": float("nan"), f"{prefix}_res_a_min": float("nan"), f"{prefix}_res_a_max": float("nan"), f"{prefix}_res_a_absmax": float("nan")}
+            return {
+                f"{prefix}_res_a_mean": float(vals.mean().cpu()),
+                f"{prefix}_res_a_min": float(vals.min().cpu()),
+                f"{prefix}_res_a_max": float(vals.max().cpu()),
+                f"{prefix}_res_a_absmax": float(vals.abs().max().cpu()),
+            }
+        out = {}
+        out.update(stats("ci", ci))
+        out.update(stats("mixed", mixed))
+        return out
+
+    @torch.no_grad()
+    def forward_with_diagnostics(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        diag = {"activations": {}}
+        diag["activations"]["x_input"] = _activation_summary(x)
+        out_patch = self.depatch(x).contiguous()
+        diag["activations"]["depatch_out"] = _activation_summary(out_patch)
+        out = self.output_linear(out_patch).contiguous()
+        diag["activations"]["patch_embed"] = _activation_summary(out)
+
+        B, F, L, C = out.shape
+        assert C == CTN_CI_INTERNAL_DIM
+        assert L == self.patch_count
+        u = out.reshape(B * F, L, C).permute(0, 2, 1).contiguous()
+        assert u.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
+        ci_t = self.ci_encoder(u)
+        assert ci_t.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
+        diag["activations"]["ci_out"] = _activation_summary(ci_t)
+
+        pre_gate = ci_t.permute(0, 2, 1).contiguous().reshape(B, F, self.patch_count, CTN_CI_INTERNAL_DIM)
+        pre_gate = pre_gate.permute(0, 2, 1, 3).contiguous()
+        diag["activations"]["pre_gate"] = _activation_summary(pre_gate)
+        post_gate = self.feature_gate(pre_gate)
+        diag["activations"]["post_gate"] = _activation_summary(post_gate)
+        post_gate_flat = post_gate.reshape(B, self.patch_count, F * CTN_CI_INTERNAL_DIM).contiguous()
+        diag["activations"]["post_gate_flat"] = _activation_summary(post_gate_flat)
+        post_proj = self.post_gate_proj(post_gate_flat).contiguous()
+        diag["activations"]["post_proj"] = _activation_summary(post_proj)
+        post_mixed_t = self.mixed_encoder(post_proj.transpose(1, 2).contiguous())
+        post_mixed = post_mixed_t.transpose(1, 2).contiguous()
+        diag["activations"]["post_mixed"] = _activation_summary(post_mixed)
+        out = self.output_norm(post_mixed)
+        diag["activations"]["extractor_out"] = _activation_summary(out)
+
+        eps = 1e-12
+        diag["ratios"] = {
+            "gate_over_ci_rms": diag["activations"]["post_gate"]["rms"] / (diag["activations"]["ci_out"]["rms"] + eps),
+            "proj_over_flat_rms": diag["activations"]["post_proj"]["rms"] / (diag["activations"]["post_gate_flat"]["rms"] + eps),
+            "mixed_over_proj_rms": diag["activations"]["post_mixed"]["rms"] / (diag["activations"]["post_proj"]["rms"] + eps),
+        }
+        diag["gate"] = self.feature_gate.gate_diagnostics(pre_gate)
+        diag["depatch"] = self.depatch.diagnostics(x)
+        diag["residual_scalars"] = self.residual_scalar_diagnostics()
+        return out, diag
 
 # ------------  Mamba wrapper + pooling ------------
 class ResidualBlock(nn.Module):
@@ -1102,12 +1347,15 @@ class SAMBA(nn.Module):
         assert args.d_model == DMODEL, f"Expected args.d_model ({args.d_model}) == DMODEL ({DMODEL})"
         assert args.d_model % NUM_HEADS == 0, "args.d_model must be divisible by NUM_HEADS"
         assert args.headdim == (args.d_model // NUM_HEADS), "args.headdim must match d_model // NUM_HEADS"
-        # (3) Switch BatchNorm -> LayerNorm in ConvTimeNet
         self.depatch_proj_encoder = ConvTimeNetFeatureExtractor(
-            in_feats=args.vocab_size, seq_len=args.seq_in, d_model=args.d_model, 
-            dw_ks=[3,3,5,5,7,7], n_layers=6, d_ff=DFF_CONV, dropout=0.1, act='gelu',
-            enable_res_param=False, norm='layer', re_param=True, re_param_kernel=3, 
-            patch_size=2, stride=1
+            in_feats=args.vocab_size,
+            seq_len=args.seq_in,
+            d_model=args.d_model,
+            dropout=0.1,
+            act="gelu",
+            norm="layer",
+            re_param=True,
+            re_param_kernel=3,
         )
         # Mamba backbone (forward/backward fusion)
         self.mamba = Mamba(args, ff_hid=4*DMODEL)
@@ -1170,6 +1418,52 @@ class SAMBA(nn.Module):
             "mag_up_sqrt": mag_up_sqrt,
             "mag_down_sqrt": mag_down_sqrt,
         }
+
+    @torch.no_grad()
+    def forward_with_diagnostics(self, x: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], dict]:
+        diag = {"activations": {}, "prediction": {}}
+        x_permuted = x.permute(0, 2, 1).contiguous()
+        h_tokens, ext_diag = self.depatch_proj_encoder.forward_with_diagnostics(x_permuted)
+        diag["extractor"] = ext_diag
+        diag["activations"]["mamba_tokens"] = _activation_summary(h_tokens)
+        h, _ = self.mamba(h_tokens, embedded=True)
+        diag["activations"]["mamba_fused"] = _activation_summary(h)
+        h_dir = self.dir_token_decoder(h)
+        h_mag = self.mag_token_decoder(h)
+        diag["activations"]["dir_decoder_out"] = _activation_summary(h_dir)
+        diag["activations"]["mag_decoder_out"] = _activation_summary(h_mag)
+        pooled_dir = self.dir_pool(h_dir)
+        pooled_mag = self.mag_pool(h_mag)
+        diag["activations"]["pooled_dir"] = _activation_summary(pooled_dir)
+        diag["activations"]["pooled_mag"] = _activation_summary(pooled_mag)
+        dir_logits = self.dir_head(pooled_dir)
+        mag_up_sqrt = F.softplus(self.mag_up_head(pooled_mag)) + MAG_SQRT_EPS
+        mag_down_sqrt = F.softplus(self.mag_down_head(pooled_mag)) + MAG_SQRT_EPS
+        diag["activations"]["dir_logits"] = _activation_summary(dir_logits)
+        diag["activations"]["mag_up_sqrt"] = _activation_summary(mag_up_sqrt)
+        diag["activations"]["mag_down_sqrt"] = _activation_summary(mag_down_sqrt)
+        probs = torch.sigmoid(dir_logits.float())
+        diag["prediction"] = {
+            "dir_logit_mean": float(dir_logits.float().mean().cpu()),
+            "dir_logit_std": float(dir_logits.float().std(unbiased=False).cpu()),
+            "dir_logit_abs_p95": float(torch.quantile(dir_logits.float().abs().reshape(-1), 0.95).cpu()),
+            "dir_prob_mean": float(probs.mean().cpu()),
+            "dir_prob_std": float(probs.std(unbiased=False).cpu()),
+            "mag_up_mean": float(mag_up_sqrt.float().mean().cpu()),
+            "mag_up_std": float(mag_up_sqrt.float().std(unbiased=False).cpu()),
+            "mag_down_mean": float(mag_down_sqrt.float().mean().cpu()),
+            "mag_down_std": float(mag_down_sqrt.float().std(unbiased=False).cpu()),
+        }
+        eps = 1e-12
+        diag["ratios"] = {
+            "fused_over_tokens_rms": diag["activations"]["mamba_fused"]["rms"] / (diag["activations"]["mamba_tokens"]["rms"] + eps),
+        }
+        pred = {
+            "dir_logits": dir_logits,
+            "mag_up_sqrt": mag_up_sqrt,
+            "mag_down_sqrt": mag_down_sqrt,
+        }
+        return pred, diag
 
 # --------------------  SAM Optimiser  ---------------------
 class SAM(torch.optim.Optimizer):
