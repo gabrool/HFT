@@ -468,8 +468,6 @@ PAD_DT_FOR_LEFT = 0.0
 BATCH_SIZE      = 128
 DMODEL          = 1024
 MAMBA_LAYERS    = 2
-CONV_KERNELS    = [3,3,5,5,7,7]
-DFF_CONV        = 2 * DMODEL
 DEPATCH_OFFSET_MODE = "learnable"
 
 MODEL_ARCH_SCHEMA = "ctn_hybrid_ci4_gate_proj_mixed2_ci8_v1"
