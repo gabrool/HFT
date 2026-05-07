@@ -102,7 +102,7 @@ FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
 SUPPORTED_PROTOCOLS = {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}
 FAST_VAL_MAX_ROWS = 200_000
 FULL_VAL_EVERY = 5
-TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "10"))
+TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "5"))
 TRAIN_DATA_DEVICE = os.environ.get("BYBIT_TRAIN_DATA_DEVICE", "cpu_pinned").strip().lower()
 if TRAIN_DATA_DEVICE not in {"cpu_pinned", "gpu_all"}:
     raise ValueError(
@@ -110,6 +110,12 @@ if TRAIN_DATA_DEVICE not in {"cpu_pinned", "gpu_all"}:
         f"got {TRAIN_DATA_DEVICE!r}"
     )
 _feature_storage_dtype_raw = os.environ.get("BYBIT_FEATURE_STORAGE_DTYPE", "bf16").strip().lower()
+BF16_FEATURE_DEBUG = int(os.environ.get("BYBIT_BF16_FEATURE_DEBUG", "0")) == 1
+BF16_FEATURE_DEBUG_MAX_BATCHES = max(1, int(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_MAX_BATCHES", "3")))
+BF16_FEATURE_DEBUG_WARN_MAX_ABS_ERR = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_MAX_ABS_ERR", "0.05"))
+BF16_FEATURE_DEBUG_WARN_MEAN_ABS_ERR = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_MEAN_ABS_ERR", "0.002"))
+BF16_FEATURE_DEBUG_WARN_SIGN_FLIP_FRAC = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_SIGN_FLIP_FRAC", "0.001"))
+BF16_FEATURE_DEBUG_WARN_ZERO_FLIP_FRAC = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_ZERO_FLIP_FRAC", "0.001"))
 
 if _feature_storage_dtype_raw in {"fp32", "float32"}:
     FEATURE_STORAGE_DTYPE = torch.float32
@@ -130,6 +136,93 @@ print(
     f"feature_storage_dtype={FEATURE_STORAGE_DTYPE_NAME}",
     flush=True,
 )
+print(
+    f"[bf16-feature-debug-config] enabled={int(BF16_FEATURE_DEBUG)} "
+    f"max_batches={BF16_FEATURE_DEBUG_MAX_BATCHES}",
+    flush=True,
+)
+
+_BF16_FEATURE_DEBUG_BATCHES_PRINTED = 0
+DIR_CLASS_WEIGHT_TEMPER = 0.5
+DIR_CLASS_WEIGHT_MIN = 0.75
+DIR_CLASS_WEIGHT_MAX = 1.50
+
+
+def summarize_bf16_feature_error(x_fp32: torch.Tensor, x_stored: torch.Tensor) -> Dict[str, float]:
+    """
+    Compare original FP32 feature batch to stored dtype roundtrip.
+    x_fp32 must be float32.
+    x_stored may be bf16/fp32 and is compared after conversion back to fp32.
+    """
+    a = x_fp32.detach().float()
+    b = x_stored.detach().float()
+
+    if a.shape != b.shape:
+        raise ValueError(f"BF16 debug shape mismatch: fp32={tuple(a.shape)} stored={tuple(b.shape)}")
+
+    diff = b - a
+    abs_diff = diff.abs()
+    abs_a = a.abs()
+    denom = torch.clamp(abs_a, min=1e-6)
+    rel_abs = abs_diff / denom
+
+    finite_a = torch.isfinite(a)
+    finite_b = torch.isfinite(b)
+    finite_both = finite_a & finite_b
+
+    nonzero_a = abs_a > 0.0
+    sign_flip = ((torch.sign(a) != torch.sign(b)) & nonzero_a & finite_both)
+    zero_flip = (((a == 0.0) != (b == 0.0)) & finite_both)
+
+    # Per-feature max mean error is useful because a global mean can hide ruined sparse features.
+    flat_abs = abs_diff.reshape(-1, abs_diff.shape[-1]) if abs_diff.ndim >= 2 else abs_diff.reshape(-1, 1)
+    per_feature_mean_abs = flat_abs.mean(dim=0)
+
+    return {
+        "max_abs_err": float(abs_diff.max().cpu()),
+        "mean_abs_err": float(abs_diff.mean().cpu()),
+        "p99_abs_err": float(torch.quantile(abs_diff.reshape(-1), 0.99).cpu()),
+        "max_rel_abs_err": float(rel_abs.max().cpu()),
+        "p99_rel_abs_err": float(torch.quantile(rel_abs.reshape(-1), 0.99).cpu()),
+        "sign_flip_frac": float(sign_flip.float().mean().cpu()),
+        "zero_flip_frac": float(zero_flip.float().mean().cpu()),
+        "nonfinite_after_frac": float((~finite_b).float().mean().cpu()),
+        "per_feature_mean_abs_err_max": float(per_feature_mean_abs.max().cpu()),
+    }
+
+
+def maybe_print_bf16_feature_debug(x_fp32: torch.Tensor, x_stored: torch.Tensor, *, enabled: bool) -> None:
+    global _BF16_FEATURE_DEBUG_BATCHES_PRINTED
+    if not enabled or FEATURE_STORAGE_DTYPE_NAME != "bf16":
+        return
+    if _BF16_FEATURE_DEBUG_BATCHES_PRINTED >= BF16_FEATURE_DEBUG_MAX_BATCHES:
+        return
+
+    debug_batch_i = int(_BF16_FEATURE_DEBUG_BATCHES_PRINTED)
+    _BF16_FEATURE_DEBUG_BATCHES_PRINTED += 1
+    diag = summarize_bf16_feature_error(x_fp32, x_stored)
+    print(
+        "[bf16-feature-debug] "
+        f"batch={debug_batch_i} "
+        f"max_abs_err={diag['max_abs_err']:.6g} "
+        f"mean_abs_err={diag['mean_abs_err']:.6g} "
+        f"p99_abs_err={diag['p99_abs_err']:.6g} "
+        f"max_rel_abs_err={diag['max_rel_abs_err']:.6g} "
+        f"p99_rel_abs_err={diag['p99_rel_abs_err']:.6g} "
+        f"sign_flip_frac={diag['sign_flip_frac']:.6g} "
+        f"zero_flip_frac={diag['zero_flip_frac']:.6g} "
+        f"nonfinite_after_frac={diag['nonfinite_after_frac']:.6g} "
+        f"per_feature_mean_abs_err_max={diag['per_feature_mean_abs_err_max']:.6g}",
+        flush=True,
+    )
+    if (
+        diag["max_abs_err"] > BF16_FEATURE_DEBUG_WARN_MAX_ABS_ERR
+        or diag["mean_abs_err"] > BF16_FEATURE_DEBUG_WARN_MEAN_ABS_ERR
+        or diag["sign_flip_frac"] > BF16_FEATURE_DEBUG_WARN_SIGN_FLIP_FRAC
+        or diag["zero_flip_frac"] > BF16_FEATURE_DEBUG_WARN_ZERO_FLIP_FRAC
+        or diag["nonfinite_after_frac"] > 0.0
+    ):
+        print("[bf16-feature-debug-warn] BF16 feature storage may be materially changing features; consider BYBIT_FEATURE_STORAGE_DTYPE=fp32", flush=True)
 
 if __name__ == "__main__":
     assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
@@ -793,11 +886,14 @@ class GPUWindowBatchSource:
 
         features_np = ds.stores[0].contiguous_features()
         features_np = np.ascontiguousarray(features_np, dtype=np.float32)
-        self.features = torch.from_numpy(features_np).to(
+        features_fp32 = torch.from_numpy(features_np).to(
             device=device,
-            dtype=FEATURE_STORAGE_DTYPE,
+            dtype=torch.float32,
             non_blocking=False,
         )
+        self.bf16_debug_enabled = bool(BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16" and self.shuffle)
+        self.features_debug_fp32 = features_fp32 if self.bf16_debug_enabled else None
+        self.features = features_fp32.to(dtype=FEATURE_STORAGE_DTYPE)
         if self.features.dtype != FEATURE_STORAGE_DTYPE:
             raise ValueError(f"Expected {FEATURE_STORAGE_DTYPE_NAME} features, got {self.features.dtype}")
         self.row_idx = torch.from_numpy(ds.row_idx.astype(np.int64, copy=False)).to(device=device)
@@ -840,6 +936,8 @@ class GPUWindowBatchSource:
         idx = torch.linspace(0, self.n_rows - 1, steps=n, device=self.device).round().long()
         child = object.__new__(GPUWindowBatchSource)
         child.features = self.features
+        child.features_debug_fp32 = None
+        child.bf16_debug_enabled = False
         child.offsets = self.offsets
         child.device = self.device
         child.lookback = self.lookback
@@ -872,19 +970,11 @@ class GPUWindowBatchSource:
         n_total = int(self.n_rows)
         stride = int(self.row_stride)
 
-        if stride == 1:
-            selected = torch.arange(n_total, device=self.device)
+        if stride <= 1:
+            offset = 0
         else:
-            g_offset = torch.Generator(device=self.device)
-            g_offset.manual_seed(self.seed + 1_000_003 + int(epoch))
-            offset = int(torch.randint(
-                low=0,
-                high=stride,
-                size=(1,),
-                device=self.device,
-                generator=g_offset,
-            ).item())
-            selected = torch.arange(offset, n_total, stride, device=self.device)
+            offset = int(epoch) % int(stride)
+        selected = torch.arange(offset, n_total, stride, device=self.device)
 
         n = int(selected.numel())
         if self.shuffle:
@@ -902,6 +992,9 @@ class GPUWindowBatchSource:
             rows = self.row_idx[ids]
             win_idx = rows[:, None] - self.offsets[None, :]
             x = self.features[win_idx]
+            if self.features_debug_fp32 is not None:
+                x_fp32 = self.features_debug_fp32[win_idx]
+                maybe_print_bf16_feature_debug(x_fp32, x, enabled=self.bf16_debug_enabled)
             y_raw = self.y[ids]
             expected_b = int(end - start)
             if x.shape != (expected_b, self.lookback, self.features.shape[1]):
@@ -950,7 +1043,10 @@ class CPUWindowBatchSource:
         features_np = ds.stores[0].contiguous_features()
         features_np = np.ascontiguousarray(features_np, dtype=np.float32)
 
-        features_cpu = torch.from_numpy(features_np).to(dtype=FEATURE_STORAGE_DTYPE)
+        features_fp32_cpu = torch.from_numpy(features_np).to(dtype=torch.float32)
+        self.bf16_debug_enabled = bool(BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16" and self.shuffle)
+        self.features_debug_fp32 = features_fp32_cpu if self.bf16_debug_enabled else None
+        features_cpu = features_fp32_cpu.to(dtype=FEATURE_STORAGE_DTYPE)
         if self.pin_memory:
             features_cpu = features_cpu.pin_memory()
 
@@ -1008,6 +1104,8 @@ class CPUWindowBatchSource:
 
         child = object.__new__(CPUWindowBatchSource)
         child.features = self.features
+        child.features_debug_fp32 = None
+        child.bf16_debug_enabled = False
         child.offsets = self.offsets
         child.target_device = self.target_device
         child.device = self.device
@@ -1047,18 +1145,11 @@ class CPUWindowBatchSource:
         n_total = int(self.n_rows)
         stride = int(self.row_stride)
 
-        if stride == 1:
-            selected = torch.arange(n_total)
+        if stride <= 1:
+            offset = 0
         else:
-            g_offset = torch.Generator(device="cpu")
-            g_offset.manual_seed(self.seed + 1_000_003 + int(epoch))
-            offset = int(torch.randint(
-                low=0,
-                high=stride,
-                size=(1,),
-                generator=g_offset,
-            ).item())
-            selected = torch.arange(offset, n_total, stride)
+            offset = int(epoch) % int(stride)
+        selected = torch.arange(offset, n_total, stride)
 
         n = int(selected.numel())
         if self.shuffle:
@@ -1076,6 +1167,9 @@ class CPUWindowBatchSource:
             rows = self.row_idx[ids]
             win_idx = rows[:, None] - self.offsets[None, :]
             x_cpu = self.features[win_idx]
+            if self.features_debug_fp32 is not None:
+                x_fp32_cpu = self.features_debug_fp32[win_idx]
+                maybe_print_bf16_feature_debug(x_fp32_cpu, x_cpu, enabled=self.bf16_debug_enabled)
             y_cpu = self.y[ids]
             if self.pin_memory:
                 x_cpu = x_cpu.pin_memory()
@@ -1231,8 +1325,11 @@ def compute_dir_class_weights_from_train_labels(
             f"got pos_count={pos_count.tolist()} neg_count={neg_count.tolist()}"
         )
 
-    pos_w = total / (2.0 * np.maximum(pos_count, 1.0))
-    neg_w = total / (2.0 * np.maximum(neg_count, 1.0))
+    pos_w = (total / (2.0 * np.maximum(pos_count, 1.0))) ** DIR_CLASS_WEIGHT_TEMPER
+    neg_w = (total / (2.0 * np.maximum(neg_count, 1.0))) ** DIR_CLASS_WEIGHT_TEMPER
+
+    pos_w = np.clip(pos_w, DIR_CLASS_WEIGHT_MIN, DIR_CLASS_WEIGHT_MAX)
+    neg_w = np.clip(neg_w, DIR_CLASS_WEIGHT_MIN, DIR_CLASS_WEIGHT_MAX)
 
     return pos_w.astype(np.float32), neg_w.astype(np.float32)
 
@@ -1308,22 +1405,23 @@ def compute_dir_mag_loss(
 
     dir_logits = pred["dir_logits"]
     dir_target = (y_raw > 0.0).to(dtype=dir_logits.dtype)
-    dir_weight = torch.where(dir_target > 0.5, dir_pos_w_t, dir_neg_w_t)
-    dir_w = keep_signed.to(dtype=dir_logits.dtype) * hwt * dir_weight
-    dir_w = dir_w * torch.clamp(0.25 + 0.75 * active_w + 0.25 * strong_w, 0.25, 1.25)
-    dir_weight_sum = dir_w.sum()
-    if float(dir_weight_sum.detach().item()) <= 0.0:
+    dir_class_w = torch.where(dir_target > 0.5, dir_pos_w_t, dir_neg_w_t)
+    dir_w = keep_signed.to(dtype=dir_logits.dtype) * hwt * dir_class_w
+    dir_weight_sum = dir_w.sum(dim=0)
+    if bool((dir_weight_sum.detach() <= 0.0).any().item()):
         raise ValueError("Direction loss has zero effective weight; check signed nonzero keep masks and training data.")
-    dir_raw = F.binary_cross_entropy_with_logits(dir_logits, dir_target, reduction="none")
-    dir_bce = (dir_raw * dir_w).sum() / dir_weight_sum.clamp_min(1e-9)
+    dir_bce_raw = F.binary_cross_entropy_with_logits(dir_logits, dir_target, reduction="none")
+    dir_loss_per_h = (dir_bce_raw * dir_w).sum(dim=0) / dir_weight_sum.clamp_min(1.0)
+    dir_bce = dir_loss_per_h.mean()
 
     mag_up_target_sqrt = torch.sqrt(torch.clamp(y_raw, min=0.0))
     mag_down_target_sqrt = torch.sqrt(torch.clamp(-y_raw, min=0.0))
-    mag_w_base = hwt * torch.clamp(0.50 + 0.50 * active_w + 0.25 * strong_w, 0.50, 1.25)
+    mag_shape_w = torch.clamp(0.50 + 0.50 * active_w + 0.25 * strong_w, min=0.50, max=1.25)
+    mag_w = hwt * mag_shape_w
     up_d = F.huber_loss(pred["mag_up_sqrt"], mag_up_target_sqrt, delta=1.0, reduction="none")
     down_d = F.huber_loss(pred["mag_down_sqrt"], mag_down_target_sqrt, delta=1.0, reduction="none")
-    up_w = mag_w_base * keep_pos.to(dtype=dir_logits.dtype)
-    down_w = mag_w_base * keep_neg.to(dtype=dir_logits.dtype)
+    up_w = keep_pos.to(dtype=dir_logits.dtype) * mag_w
+    down_w = keep_neg.to(dtype=dir_logits.dtype) * mag_w
     up_den = up_w.sum()
     down_den = down_w.sum()
     up_valid = up_den.detach() > 0
@@ -1369,7 +1467,7 @@ def compute_dir_mag_loss(
         "dir_norm": dir_norm.detach(),
         "mag_norm": mag_norm.detach(),
         "corr_norm": corr_norm.detach(),
-        "dir_weight_sum": dir_weight_sum.detach(),
+        "dir_weight_sum": dir_weight_sum.sum().detach(),
         "mag_up_huber": mag_up_huber.detach(),
         "mag_down_huber": mag_down_huber.detach(),
         "mag_up_weight_sum": up_den.detach(),
@@ -1621,8 +1719,11 @@ def summarize_metrics(
         out = {"primary_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS), "n_eval_rows": n_eval_rows}
         if not y_parts:
             out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
+            out["dir_auc_kept"] = [float("nan")] * NUM_HORIZONS
+            out["dir_bal_acc_kept"] = [float("nan")] * NUM_HORIZONS
             out["dir_auc_q50plus"] = [float("nan")] * NUM_HORIZONS
             out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
+            out["primary_dir_bal_acc"] = float("nan")
             out["primary_metric_guard_passed"] = False
         else:
             dir_logits = np.concatenate(dir_parts, axis=0)
@@ -1640,14 +1741,27 @@ def summarize_metrics(
             pred_up = p_up >= 0.5
             if primary_only:
                 out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
+                out["dir_auc_kept"] = [float("nan")] * NUM_HORIZONS
+                out["dir_bal_acc_kept"] = [float("nan")] * NUM_HORIZONS
                 out["dir_auc_q50plus"] = [float("nan")] * NUM_HORIZONS
                 out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
                 h = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
+                kh = keep[:, h]
                 q50plus = keep[:, h] & (abs_raw[:, h] >= float(stats['kept_q50_abs_raw_bps'][h]))
+                out["dir_auc_kept"][h] = _binary_auc_np(p_up[:, h][kh], true_up[:, h][kh])
+                out["dir_bal_acc_kept"][h] = _balanced_acc_np(pred_up[:, h][kh], true_up[:, h][kh])
                 out["edge_spearman_q50plus"][h] = _safe_spearman_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
                 out["dir_auc_q50plus"][h] = _binary_auc_np(p_up[:, h][q50plus], true_up[:, h][q50plus])
                 out["dir_bal_acc_q50plus"][h] = _balanced_acc_np(pred_up[:, h][q50plus], true_up[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
-                out["primary_dir_bal_acc"] = out["dir_bal_acc_q50plus"][h]
+                if PRIMARY_METRIC.startswith("dir_auc_kept"):
+                    primary_guard_series = out["dir_bal_acc_kept"]
+                elif PRIMARY_METRIC.startswith("dir_auc_q50plus"):
+                    primary_guard_series = out["dir_bal_acc_q50plus"]
+                elif PRIMARY_METRIC.startswith("edge_spearman_q50plus"):
+                    primary_guard_series = out["dir_bal_acc_q50plus"]
+                else:
+                    raise ValueError(f"Unsupported PRIMARY_METRIC={PRIMARY_METRIC!r}")
+                out["primary_dir_bal_acc"] = float(primary_guard_series[h])
                 out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
                 if band_diag:
                     out["band_metrics"] = summarize_band_metrics_from_arrays(
@@ -1756,7 +1870,15 @@ def summarize_metrics(
                         out["val_dir_bce_kept"].append(float("nan"))
                         out["val_mag_huber_kept"].append(float("nan"))
                 primary_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-                out["primary_dir_bal_acc"] = float(out["dir_bal_acc_q50plus"][primary_idx])
+                if PRIMARY_METRIC.startswith("dir_auc_kept"):
+                    primary_guard_series = out["dir_bal_acc_kept"]
+                elif PRIMARY_METRIC.startswith("dir_auc_q50plus"):
+                    primary_guard_series = out["dir_bal_acc_q50plus"]
+                elif PRIMARY_METRIC.startswith("edge_spearman_q50plus"):
+                    primary_guard_series = out["dir_bal_acc_q50plus"]
+                else:
+                    raise ValueError(f"Unsupported PRIMARY_METRIC={PRIMARY_METRIC!r}")
+                out["primary_dir_bal_acc"] = float(primary_guard_series[primary_idx])
                 out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
                 if band_diag:
                     out["band_metrics"] = summarize_band_metrics_from_arrays(
@@ -2277,7 +2399,7 @@ def train_from_offline():
         'train_ts_start': int(tr_start), 'train_ts_end': int(tr_end), 'decision_time_basis': EXPECTED_DECISION_TIME_BASIS,
         'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
         'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK,
-        'loss_weighting_schema': 'dir_mag_signed_nonzero_side_trim_q50_q85_class_bal_v1',
+        'loss_weighting_schema': 'dir_mag_signed_nonzero_side_trim_tempered_class_dir_plain_mag_q50_q85_ema_v1',
         'ranking_schema': 'tie_aware_average_ranks_v1',
         'band_diag_quantiles': [float(x) for x in BAND_DIAG_QUANTILES],
     }
@@ -2704,7 +2826,7 @@ def train_from_offline():
                     'target_task': TARGET_TASK,
                     'target_transform': TARGET_TRANSFORM,
                     'label_trim_schema': LABEL_TRIM_SCHEMA,
-                    'loss_weighting_schema': 'dir_mag_signed_nonzero_side_trim_q50_q85_class_bal_v1',
+                    'loss_weighting_schema': 'dir_mag_signed_nonzero_side_trim_tempered_class_dir_plain_mag_q50_q85_ema_v1',
                     'low_abs_trim_fraction': float(LOW_ABS_TRIM_FRACTION),
                     'high_abs_trim_fraction': float(HIGH_ABS_TRIM_FRACTION),
                     'primary_metric': PRIMARY_METRIC,

@@ -505,7 +505,7 @@ LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "dir_auc_q50plus_1000ms"
+PRIMARY_METRIC = "dir_auc_kept_1000ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
 PRIMARY_DIR_BAL_ACC_GUARD = 0.505
 MODEL_OUTPUT_SCHEMA = "dir_logits_mag_up_down_sqrt_v1"
@@ -6466,26 +6466,28 @@ def compute_primary_metric(metric_payload: Dict[str, Any]) -> Tuple[float, str]:
         )
 
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    dir_vals = metric_payload.get("dir_bal_acc_q50plus", [])
-    if idx >= len(dir_vals):
-        return float("nan"), PRIMARY_METRIC
 
-    dir_guard_value = float(dir_vals[idx])
-    if not math.isfinite(dir_guard_value) or dir_guard_value < PRIMARY_DIR_BAL_ACC_GUARD:
-        return float("nan"), PRIMARY_METRIC
-
-    if PRIMARY_METRIC.startswith("dir_auc_q50plus"):
+    if PRIMARY_METRIC.startswith("dir_auc_kept"):
+        vals = metric_payload.get("dir_auc_kept", [])
+        guard_vals = metric_payload.get("dir_bal_acc_kept", [])
+    elif PRIMARY_METRIC.startswith("dir_auc_q50plus"):
         vals = metric_payload.get("dir_auc_q50plus", [])
+        guard_vals = metric_payload.get("dir_bal_acc_q50plus", [])
     elif PRIMARY_METRIC.startswith("edge_spearman_q50plus"):
         vals = metric_payload.get("edge_spearman_q50plus", [])
+        guard_vals = metric_payload.get("dir_bal_acc_q50plus", [])
     else:
         raise ValueError(f"Unsupported PRIMARY_METRIC={PRIMARY_METRIC!r}")
 
-    if idx >= len(vals):
+    if idx >= len(vals) or idx >= len(guard_vals):
         return float("nan"), PRIMARY_METRIC
 
     value = float(vals[idx])
+    guard_value = float(guard_vals[idx])
+
     if not math.isfinite(value):
+        return float("nan"), PRIMARY_METRIC
+    if not math.isfinite(guard_value) or guard_value < PRIMARY_DIR_BAL_ACC_GUARD:
         return float("nan"), PRIMARY_METRIC
 
     return value, PRIMARY_METRIC
