@@ -72,8 +72,8 @@ PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
 PCA_WEEKDAY_ROWS_PER_DAY = 20_000
 PCA_SAMPLE_START_UTC_HOUR = 14
 PCA_SAMPLE_START_UTC_MINUTE = 30
-if PCA_SELECT_MODE not in {"variance", "max_components"}:
-    raise ValueError("BYBIT_PCA_SELECT_MODE must be 'variance' or 'max_components'")
+if PCA_SELECT_MODE != "max_components":
+    raise ValueError("BYBIT_PCA_SELECT_MODE must be 'max_components' for the 1s maker contract")
 
 # Memory & chunking
 RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
@@ -329,6 +329,7 @@ from CMSSL17 import (
     HORIZONS_MS,
     NUM_HORIZONS,
     LOOKBACK,
+    WINDOW_MS,
     AUX_DIM,
     FEATURE_SCHEMA,
     AUX_SCHEMA,
@@ -342,6 +343,11 @@ from CMSSL17 import (
     HIGH_ABS_TRIM_FRACTION,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
+FINAL_FEATURE_DIM = 512
+PCA_CORE_COMPONENTS = FINAL_FEATURE_DIM - AUX_DIM
+PCA_MAX_COMPONENTS = int(os.environ.get("BYBIT_PCA_MAX_COMPONENTS", str(PCA_CORE_COMPONENTS)))
+if PCA_MAX_COMPONENTS != PCA_CORE_COMPONENTS:
+    raise ValueError(f"BYBIT_PCA_MAX_COMPONENTS must equal PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS} for final feature_dim_total=512")
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = int(os.environ.get("BYBIT_EVENT_QUEUE_MAXSIZE", "4096"))
@@ -753,34 +759,24 @@ def _event_ts(event: Any) -> int:
     return int(event[1])
 
 
-def build_token(fe: FeatureEngine, feat_z, dt_ms: float) -> np.ndarray:
-    aux = np.asarray(
-        [
-            np.log1p(float(dt_ms)),
-            np.log1p(fe.event_density_3000ms()),
-            np.log1p(fe.event_density_7500ms()),
-            np.log1p(fe.event_density_15000ms()),
-            np.log1p(fe.event_density_30000ms()),
-            np.log1p(fe.event_density_60000ms()),
-        ],
-        dtype=np.float32,
-    )
-    core = np.asarray(feat_z, dtype=np.float32)
-    return np.concatenate([core, aux], axis=0).astype(np.float32, copy=False)
-
-
 def build_aux_tail(fe: FeatureEngine, dt_ms: float) -> np.ndarray:
     return np.asarray(
         [
             np.log1p(float(dt_ms)),
-            np.log1p(fe.event_density_3000ms()),
-            np.log1p(fe.event_density_7500ms()),
-            np.log1p(fe.event_density_15000ms()),
-            np.log1p(fe.event_density_30000ms()),
-            np.log1p(fe.event_density_60000ms()),
+            np.log1p(fe.event_density(100)),
+            np.log1p(fe.event_density(200)),
+            np.log1p(fe.event_density(500)),
+            np.log1p(fe.event_density(1_000)),
+            np.log1p(fe.event_density(3_000)),
         ],
         dtype=np.float32,
     )
+
+
+def build_token(fe: FeatureEngine, feat_z, dt_ms: float) -> np.ndarray:
+    core = np.asarray(feat_z, dtype=np.float32)
+    aux = build_aux_tail(fe, dt_ms)
+    return np.concatenate([core, aux], axis=0).astype(np.float32, copy=False)
 
 
 def build_pipeline_splits(
@@ -1344,7 +1340,7 @@ class FlatWeekRouter:
             "week": week_key,
             "decision_policy": DECISION_POLICY,
             "decision_time_basis": "ob_event_time",
-            "window_ms": 60_000,
+            "window_ms": int(WINDOW_MS),
             "decision_stride_policy": "every_ob_event",
             "label_delta_ms": 0,
             # Labels remain signed raw log-return bps; direction/conditional magnitude targets are derived downstream at train time.
@@ -1940,32 +1936,30 @@ def _fit_pca_svd_from_sample(
 
     max_possible_components = min(n_samples, n_features)
     mode = str(select_mode).strip().lower()
-    if mode == "variance":
-        target = float(max(0.0, min(1.0, target_var)))
-        if target <= 0.0:
-            raise ValueError(f"PCA target_var must be positive, got {target_var}")
-        k = int(np.searchsorted(cum, target, side="left") + 1)
-        k = max(1, min(k, vt.shape[0]))
-        retained_var = float(cum[k - 1])
-        print(
-            f"[pca-select] mode=variance target_var={target:.4f} k={k} retained_var={retained_var:.6f}",
-            flush=True,
+    if mode != "max_components":
+        raise ValueError("BYBIT_PCA_SELECT_MODE must be 'max_components' for the 1s maker contract")
+    if int(n_features) < int(PCA_CORE_COMPONENTS):
+        raise ValueError(
+            f"Raw core feature dimension {int(n_features)} is smaller than required PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS}; "
+            "cannot produce final feature_dim_total=512."
         )
-    elif mode == "max_components":
-        if max_components < 1:
-            raise ValueError(f"BYBIT_PCA_MAX_COMPONENTS must be >= 1, got {max_components}")
-        if max_components > max_possible_components:
-            raise ValueError(
-                f"BYBIT_PCA_MAX_COMPONENTS={max_components} exceeds max_possible_components={max_possible_components}"
-            )
-        k = int(max_components)
-        retained_var = float(cum[k - 1])
-        print(
-            f"[pca-select] mode=max_components max_components={max_components} k={k} retained_var={retained_var:.6f}",
-            flush=True,
+    if int(max_components) != int(PCA_CORE_COMPONENTS):
+        raise ValueError(f"PCA max_components must equal PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS}")
+    if int(PCA_CORE_COMPONENTS) > int(max_possible_components):
+        raise ValueError(
+            f"PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS} exceeds max_possible_components={max_possible_components}"
         )
-    else:
-        raise ValueError("BYBIT_PCA_SELECT_MODE must be 'variance' or 'max_components'")
+    k = int(PCA_CORE_COMPONENTS)
+    retained_var = float(cum[k - 1])
+    print(
+        f"[pca-select] mode=max_components required_components={PCA_CORE_COMPONENTS} k={k} retained_var={retained_var:.6f}",
+        flush=True,
+    )
+
+    if int(vt[:k].shape[0]) != int(PCA_CORE_COMPONENTS):
+        raise ValueError("PCA component row count mismatch after SVD")
+    if int(mean.shape[0]) != int(n_features):
+        raise ValueError("PCA mean dimension mismatch after SVD")
 
     return {
         "mean": mean.astype(np.float32, copy=False),
@@ -2042,7 +2036,13 @@ def maybe_fit_pca_model(
                     raise ValueError("PCA sample mode mismatch")
                 if int(model_meta.get("aux_dim", -1)) != int(AUX_DIM):
                     raise ValueError("PCA aux_dim mismatch")
-                if str(select_mode).strip().lower() == "max_components" and int(k) != int(max_components):
+                if int(model_meta.get("pca_k", -1)) != int(PCA_CORE_COMPONENTS):
+                    raise ValueError("PCA pca_k mismatch")
+                if int(model_meta.get("final_feature_dim", -1)) != int(FINAL_FEATURE_DIM):
+                    raise ValueError("PCA final_feature_dim mismatch")
+                if int(model_meta.get("pca_core_components_required", -1)) != int(PCA_CORE_COMPONENTS):
+                    raise ValueError("PCA required core component mismatch")
+                if int(k) != int(PCA_CORE_COMPONENTS):
                     raise ValueError("PCA component count mismatch")
         except Exception as exc:
             raise ValueError(f"Failed to load required PCA model '{model_path}': {exc}") from exc
@@ -2051,6 +2051,8 @@ def maybe_fit_pca_model(
             "applied": True,
             "k": k,
             "pca_k": k,
+            "final_feature_dim": int(FINAL_FEATURE_DIM),
+            "pca_core_components_required": int(PCA_CORE_COMPONENTS),
             "model_path": model_filename,
             "pca_sample_mode": "weekday_fixed_utc_block",
         })
@@ -2104,6 +2106,8 @@ def maybe_fit_pca_model(
                     "pca_max_components": int(max_components),
                     "k": int(k),
                     "pca_k": int(k),
+                    "final_feature_dim": int(FINAL_FEATURE_DIM),
+                    "pca_core_components_required": int(PCA_CORE_COMPONENTS),
                     "pca_sample_mode": "weekday_fixed_utc_block",
                     "pca_sample_start_utc": f"{PCA_SAMPLE_START_UTC_HOUR:02d}:{PCA_SAMPLE_START_UTC_MINUTE:02d}:00",
                     "pca_weekday_rows_per_day": int(PCA_WEEKDAY_ROWS_PER_DAY),
@@ -2123,6 +2127,8 @@ def maybe_fit_pca_model(
             "applied": True,
             "k": int(k),
             "pca_k": int(k),
+            "final_feature_dim": int(FINAL_FEATURE_DIM),
+            "pca_core_components_required": int(PCA_CORE_COMPONENTS),
             "model_path": model_filename,
             "rows_fitted": int(sample_array.shape[0]),
             "sample_rows": int(sample_array.shape[0]),
@@ -2156,6 +2162,8 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
         "pca_max_components": int(PCA_MAX_COMPONENTS),
         "k": 0,
         "pca_k": 0,
+        "final_feature_dim": int(FINAL_FEATURE_DIM),
+        "pca_core_components_required": int(PCA_CORE_COMPONENTS),
         "model_path": None,
         "feature_names_pre_pca": [],
         "feature_dim_core_pre_pca": 0,
@@ -2175,6 +2183,8 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
             "pca_max_components": int(meta.get("pca_max_components", base["pca_max_components"])),
             "k": int(meta.get("k", 0) if applied else 0),
             "pca_k": int(meta.get("k", 0) if applied else 0),
+            "final_feature_dim": int(meta.get("final_feature_dim", FINAL_FEATURE_DIM)),
+            "pca_core_components_required": int(meta.get("pca_core_components_required", PCA_CORE_COMPONENTS)),
             "model_path": meta.get("model_path") if applied else None,
             "feature_names_pre_pca": list(meta.get("feature_names_pre_pca", [])),
             "feature_dim_core_pre_pca": int(meta.get("feature_dim_core_pre_pca", 0)),
@@ -2311,8 +2321,11 @@ def load_reusable_week_meta(
         "target_transform",
         "checkpoint_schema_expected",
         "lookback",
+        "window_ms",
         "label_dim",
         "aux_dim",
+        "feature_dim_core",
+        "feature_dim_total",
         "feature_names_hash",
         "trade_history_enabled",
         "event_stream_mode",
@@ -2321,12 +2334,20 @@ def load_reusable_week_meta(
             raise ValueError(
                 f"[reuse] week={week_key} incompatible field {key}: {meta.get(key)!r} != {expected.get(key)!r}"
             )
+    if int(meta.get("feature_dim_core", -1)) != int(PCA_CORE_COMPONENTS):
+        raise ValueError(f"[reuse] week={week_key} feature_dim_core mismatch")
+    if int(meta.get("feature_dim_total", -1)) != int(FINAL_FEATURE_DIM):
+        raise ValueError(f"[reuse] week={week_key} feature_dim_total mismatch")
     if int(meta.get("feature_dim_total", -1)) != int(meta.get("feature_dim_core", -1)) + AUX_DIM:
         raise ValueError(f"[reuse] week={week_key} feature_dim_total must equal feature_dim_core + AUX_DIM")
 
     pca = meta.get("pca")
     if not isinstance(pca, dict) or not bool(pca.get("applied", False)):
         raise ValueError(f"[reuse] week={week_key} requires pca.applied=true")
+    if int(pca.get("final_feature_dim", -1)) != int(FINAL_FEATURE_DIM):
+        raise ValueError(f"[reuse] week={week_key} PCA final_feature_dim mismatch")
+    if int(pca.get("pca_core_components_required", -1)) != int(PCA_CORE_COMPONENTS):
+        raise ValueError(f"[reuse] week={week_key} PCA required component mismatch")
     if int(pca.get("k", -1)) != int(expected["pca_k"]):
         raise ValueError(
             f"[reuse] week={week_key} PCA k mismatch: {int(pca.get('k', -1))} != {int(expected['pca_k'])}"
@@ -2361,8 +2382,8 @@ def build_global_meta_from_week_metas(
     week_label_counts = {wk: int(week_metas[wk].get("labels_total", 0)) for wk in weeks_in_order}
     total_feature_rows = int(sum(week_row_counts.values()))
     total_labels = int(sum(week_label_counts.values()))
-    feature_dim_core = int(pca_summary["k"])
-    feature_dim_total = int(feature_dim_core + AUX_DIM)
+    feature_dim_core = int(PCA_CORE_COMPONENTS)
+    feature_dim_total = int(FINAL_FEATURE_DIM)
     label_dim = int(NUM_HORIZONS)
     weeks_meta_paths = {wk: week_metas[wk].get("meta_path", os.path.join(wk, "meta_week.json")) for wk in weeks_in_order}
 
@@ -2372,7 +2393,7 @@ def build_global_meta_from_week_metas(
         "weeks_in_order": weeks_in_order,
         "decision_policy": DECISION_POLICY,
         "decision_time_basis": "ob_event_time",
-        "window_ms": 60_000,
+        "window_ms": int(WINDOW_MS),
         "decision_stride_policy": "every_ob_event",
         "label_delta_ms": 0,
         "label_units": "signed_log_return_bps",
@@ -2524,9 +2545,15 @@ def process_all(
         raise ValueError("PCA pca_sample_mode mismatch")
     if int(model_meta.get("aux_dim", -1)) != int(AUX_DIM):
         raise ValueError("PCA aux_dim mismatch")
-    if PCA_SELECT_MODE == "max_components" and int(pca_components.shape[0]) != int(PCA_MAX_COMPONENTS):
+    if int(model_meta.get("pca_k", -1)) != int(PCA_CORE_COMPONENTS):
+        raise ValueError("PCA pca_k mismatch")
+    if int(model_meta.get("final_feature_dim", -1)) != int(FINAL_FEATURE_DIM):
+        raise ValueError("PCA final_feature_dim mismatch")
+    if int(model_meta.get("pca_core_components_required", -1)) != int(PCA_CORE_COMPONENTS):
+        raise ValueError("PCA required core component mismatch")
+    if int(pca_components.shape[0]) != int(PCA_CORE_COMPONENTS):
         raise ValueError(
-            f"PCA components mismatch for max_components mode: got {int(pca_components.shape[0])} expected {int(PCA_MAX_COMPONENTS)}"
+            f"PCA components mismatch: got {int(pca_components.shape[0])} expected {int(PCA_CORE_COMPONENTS)}"
         )
     pca_summary["feature_names_pre_pca"] = feature_names_pre_pca
     pca_summary["feature_dim_core_pre_pca"] = len(feature_names_pre_pca)
@@ -2538,13 +2565,15 @@ def process_all(
         raise ValueError("Missing PCA tensors")
     pre_pca_dim = int(pca_mean.shape[0])
     pca_k = int(pca_components.shape[0])
+    if int(pca_mean.shape[0]) != int(len(feature_names_pre_pca)):
+        raise ValueError("PCA mean raw core dimension mismatch")
+    if int(pca_components.shape[1]) != int(pca_mean.shape[0]):
+        raise ValueError("PCA components raw core dimension mismatch")
     final_feature_dim = int(pca_k + AUX_DIM)
-    if PCA_SELECT_MODE == "max_components" and PCA_MAX_COMPONENTS == 506:
-        expected_total = 512
-        if final_feature_dim != expected_total:
-            raise ValueError(
-                f"Expected final_feature_dim=512 for pca506_aux6, got {final_feature_dim}"
-            )
+    if int(pca_k) != int(PCA_CORE_COMPONENTS):
+        raise ValueError(f"PCA core dimension mismatch: got {pca_k}, expected {PCA_CORE_COMPONENTS}")
+    if int(final_feature_dim) != int(FINAL_FEATURE_DIM):
+        raise ValueError(f"Expected final_feature_dim={FINAL_FEATURE_DIM}, got {final_feature_dim}")
     weeks_in_order = [wk for wk, _ob, _th in pairs]
     if append_missing_weeks and protocol != FIVE_WEEK_PROTOCOL:
         raise ValueError("append_missing_weeks=True requires five-week protocol")
@@ -2555,8 +2584,11 @@ def process_all(
         "target_transform": TARGET_TRANSFORM,
         "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
         "lookback": int(LOOKBACK),
+        "window_ms": int(WINDOW_MS),
         "label_dim": int(NUM_HORIZONS),
         "aux_dim": int(AUX_DIM),
+        "feature_dim_core": int(PCA_CORE_COMPONENTS),
+        "feature_dim_total": int(FINAL_FEATURE_DIM),
         "feature_names_hash": str(names_hash),
         "trade_history_enabled": canonical_mode_fields()["trade_history_enabled"],
         "event_stream_mode": canonical_mode_fields()["event_stream_mode"],
@@ -2653,6 +2685,7 @@ def process_all(
 
         if not is_trade:
             core_pre_pca = np.asarray(feat_z, dtype=np.float32, copy=False)
+            assert len(feature_names_pre_pca) == core_pre_pca.shape[0]
             if core_pre_pca.shape[-1] != pre_pca_dim:
                 raise ValueError(
                     f"PCA pre-core dimension {pre_pca_dim} does not match feature dimension {core_pre_pca.shape[-1]}"
@@ -2771,7 +2804,7 @@ def process_all(
         router.flush_all()
 
     feature_dim_total = int(F)
-    feature_dim_core = int(F - AUX_DIM)
+    feature_dim_core = int(PCA_CORE_COMPONENTS)
     label_dim = int(NUM_HORIZONS)
     if router is not None:
         week_meta_records.update(dict(router.week_metas))
