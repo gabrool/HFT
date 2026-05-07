@@ -1871,8 +1871,8 @@ def collect_weekday_fixed_utc_pca_sample(
         first_ts: Optional[int] = None
         last_ts: Optional[int] = None
         for event in merged:
-            ts_ms, feat_z, _mid, is_trade, _dt_ms = fe.on_fast_event(event)
-            if is_trade:
+            ts_ms, feat_z, _dt_ms, is_decision, _mid = fe.on_fast_event(event)
+            if not is_decision:
                 continue
             ts_i = int(ts_ms)
             if ts_i < start_ts_ms:
@@ -2100,7 +2100,7 @@ def maybe_fit_pca_model(
                     "feature_names_pre_pca": feature_names_pre_pca,
                     "feature_names_hash": names_hash,
                     "created_by": "offline_ingest.py",
-                    "stage": "stage4_v6_fast_trade_obnorm",
+                    "stage": FEATURE_SCHEMA,
                     "pca_fit_method": "deterministic_weekday_fixed_utc_svd",
                     "pca_select_mode": str(select_mode),
                     "pca_max_components": int(max_components),
@@ -2472,8 +2472,8 @@ def _mature_with_next_week_context(
     context_last_ts: Optional[int] = None
     matured_labels = 0
     for event in _iter_week_merged_events(pair[0], pair[1], pair[2], week_quality=None):
-        ts_ms, feat_z, mid, is_trade, _dt_ms = fe.on_fast_event(event)
-        if is_trade:
+        ts_ms, feat_z, _dt_ms, is_decision, mid = fe.on_fast_event(event)
+        if not is_decision:
             continue
         if int(ts_ms) > cutoff_ts:
             break
@@ -2678,12 +2678,12 @@ def process_all(
         if event is None:
             continue
 
-        ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_fast_event(event)
+        ts_ms, feat_z, dt_ms, is_decision, mid = fe.on_fast_event(event)
         events_seen += 1
-        if is_trade and np.asarray(feat_z).shape[0] != 0:
-            raise RuntimeError("Trade fast path returned a non-empty feature vector")
+        if not is_decision and np.asarray(feat_z).shape[0] != 0:
+            raise RuntimeError("Non-decision fast path returned a non-empty feature vector")
 
-        if not is_trade:
+        if is_decision:
             core_pre_pca = np.asarray(feat_z, dtype=np.float32, copy=False)
             assert len(feature_names_pre_pca) == core_pre_pca.shape[0]
             if core_pre_pca.shape[-1] != pre_pca_dim:
