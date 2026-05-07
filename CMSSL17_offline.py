@@ -35,7 +35,7 @@ from CMSSL17 import (  # type: ignore
     DMODEL, MAMBA_LAYERS,
     PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS,
     PRIMARY_DIR_BAL_ACC_GUARD,
-    LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, CHECKPOINT_SCHEMA, MODEL_ARCH_SCHEMA,
+    LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, LABEL_TRIM_SCHEMA, CHECKPOINT_SCHEMA, MODEL_ARCH_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
     DIR_LOSS_WEIGHT, MAG_LOSS_WEIGHT, MAG_CORR_LOSS_WEIGHT, EMA_DECAY,
     FEATURE_SCHEMA, AUX_SCHEMA, FEATURE_AUX_TAIL,
@@ -131,7 +131,8 @@ print(
     flush=True,
 )
 
-assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
+if __name__ == "__main__":
+    assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
 
 def require_supported_pipeline_splits(meta: dict, out_root: Path) -> dict:
     if "splits" not in meta:
@@ -463,37 +464,158 @@ def validate_week_matches_global(global_meta: dict, week_meta: dict, source: str
 # ---------------- Signed-raw preprocessing, cache, and metrics ----------------
 
 
-def build_abs_trim_mask(y_raw_bps: np.ndarray, abs_lo_raw_bps: np.ndarray, abs_hi_raw_bps: np.ndarray) -> np.ndarray:
-    abs_y = np.abs(y_raw_bps)
-    lo = abs_lo_raw_bps.reshape(1, -1)
-    hi = abs_hi_raw_bps.reshape(1, -1)
-    return (abs_y >= lo) & (abs_y <= hi)
+def build_signed_side_trim_masks_np(
+    y_raw_bps: np.ndarray,
+    *,
+    pos_lo_raw_bps: np.ndarray,
+    pos_hi_raw_bps: np.ndarray,
+    neg_lo_abs_bps: np.ndarray,
+    neg_hi_abs_bps: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build signed nonzero trim masks.
+
+    Positive rows use y > 0 and y itself.
+    Negative rows use y < 0 and -y as magnitude.
+    Zero rows are excluded from all masks.
+    """
+    y = np.asarray(y_raw_bps, dtype=np.float32)
+    if y.ndim != 2 or y.shape[1] != NUM_HORIZONS:
+        raise ValueError(f"y must have shape [N, {NUM_HORIZONS}], got {y.shape}")
+
+    pos_lo = np.asarray(pos_lo_raw_bps, dtype=np.float32).reshape(1, -1)
+    pos_hi = np.asarray(pos_hi_raw_bps, dtype=np.float32).reshape(1, -1)
+    neg_lo = np.asarray(neg_lo_abs_bps, dtype=np.float32).reshape(1, -1)
+    neg_hi = np.asarray(neg_hi_abs_bps, dtype=np.float32).reshape(1, -1)
+
+    pos = y > 0.0
+    neg = y < 0.0
+    neg_mag = (-y).clip(min=0.0)
+
+    keep_pos = pos & (y >= pos_lo) & (y <= pos_hi)
+    keep_neg = neg & (neg_mag >= neg_lo) & (neg_mag <= neg_hi)
+    keep_signed = keep_pos | keep_neg
+    return keep_pos, keep_neg, keep_signed
+
+
+def build_signed_side_trim_masks_torch(
+    y_raw: torch.Tensor,
+    *,
+    pos_lo_t: torch.Tensor,
+    pos_hi_t: torch.Tensor,
+    neg_lo_t: torch.Tensor,
+    neg_hi_t: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pos = y_raw > 0.0
+    neg = y_raw < 0.0
+    neg_mag = (-y_raw).clamp_min(0.0)
+
+    keep_pos = pos & (y_raw >= pos_lo_t) & (y_raw <= pos_hi_t)
+    keep_neg = neg & (neg_mag >= neg_lo_t) & (neg_mag <= neg_hi_t)
+    keep_signed = keep_pos | keep_neg
+    return keep_pos, keep_neg, keep_signed
+
+
+def build_signed_side_trim_masks_from_stats_np(
+    y_raw_bps: np.ndarray,
+    stats: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return build_signed_side_trim_masks_np(
+        y_raw_bps,
+        pos_lo_raw_bps=stats["pos_lo_raw_bps"],
+        pos_hi_raw_bps=stats["pos_hi_raw_bps"],
+        neg_lo_abs_bps=stats["neg_lo_abs_bps"],
+        neg_hi_abs_bps=stats["neg_hi_abs_bps"],
+    )
 
 
 def compute_signed_raw_stats(y_train: np.ndarray) -> Dict[str, np.ndarray]:
-    abs_y = np.abs(y_train)
-    abs_lo = np.quantile(abs_y, LOW_ABS_TRIM_FRACTION, axis=0).astype(np.float32)
-    abs_hi = np.quantile(abs_y, 1.0 - HIGH_ABS_TRIM_FRACTION, axis=0).astype(np.float32)
-    keep = build_abs_trim_mask(y_train, abs_lo, abs_hi)
+    y = np.asarray(y_train, dtype=np.float32)
+    if y.ndim != 2 or y.shape[1] != NUM_HORIZONS:
+        raise ValueError(f"y must have shape [N, {NUM_HORIZONS}], got {y.shape}")
+
+    pos_lo = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    pos_hi = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    neg_lo = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    neg_hi = np.zeros(NUM_HORIZONS, dtype=np.float32)
+
     q50 = np.zeros(NUM_HORIZONS, dtype=np.float32)
     q85 = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    pos_q50 = np.zeros(NUM_HORIZONS, dtype=np.float32)
+    neg_q50 = np.zeros(NUM_HORIZONS, dtype=np.float32)
+
     band_edges = np.full((NUM_HORIZONS, len(BAND_DIAG_QUANTILES)), np.nan, dtype=np.float32)
+    min_side_rows = 100
+
     for h in range(NUM_HORIZONS):
-        kept_abs = abs_y[keep[:, h], h]
-        if kept_abs.size:
-            q50[h] = float(np.quantile(kept_abs, 0.50))
-            q85[h] = float(np.quantile(kept_abs, 0.85))
-            edges = np.quantile(kept_abs, BAND_DIAG_QUANTILES).astype(np.float32)
-            edges[0] = float(np.min(kept_abs))
-            edges[-1] = float(np.max(kept_abs))
-            band_edges[h] = edges
+        yh = y[:, h].astype(np.float64, copy=False)
+        pos_vals = yh[yh > 0.0]
+        neg_vals = -yh[yh < 0.0]
+
+        if pos_vals.size < min_side_rows:
+            raise ValueError(
+                f"Too few positive nonzero train labels for horizon={HORIZONS_MS[h]}ms: "
+                f"n={pos_vals.size}, required>={min_side_rows}"
+            )
+        if neg_vals.size < min_side_rows:
+            raise ValueError(
+                f"Too few negative nonzero train labels for horizon={HORIZONS_MS[h]}ms: "
+                f"n={neg_vals.size}, required>={min_side_rows}"
+            )
+
+        pos_lo[h] = np.float32(np.quantile(pos_vals, LOW_ABS_TRIM_FRACTION))
+        pos_hi[h] = np.float32(np.quantile(pos_vals, 1.0 - HIGH_ABS_TRIM_FRACTION))
+        neg_lo[h] = np.float32(np.quantile(neg_vals, LOW_ABS_TRIM_FRACTION))
+        neg_hi[h] = np.float32(np.quantile(neg_vals, 1.0 - HIGH_ABS_TRIM_FRACTION))
+
+    keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_np(
+        y,
+        pos_lo_raw_bps=pos_lo,
+        pos_hi_raw_bps=pos_hi,
+        neg_lo_abs_bps=neg_lo,
+        neg_hi_abs_bps=neg_hi,
+    )
+
+    abs_y = np.abs(y).astype(np.float32)
+
+    for h in range(NUM_HORIZONS):
+        kept_abs = abs_y[keep_signed[:, h], h]
+        kept_pos_abs = y[keep_pos[:, h], h]
+        kept_neg_abs = -y[keep_neg[:, h], h]
+
+        if kept_abs.size < min_side_rows:
+            raise ValueError(f"Too few signed kept labels for horizon={HORIZONS_MS[h]}ms after trim")
+
+        q50[h] = np.float32(np.quantile(kept_abs.astype(np.float64), 0.50))
+        q85[h] = np.float32(np.quantile(kept_abs.astype(np.float64), 0.85))
+        pos_q50[h] = np.float32(np.quantile(kept_pos_abs.astype(np.float64), 0.50))
+        neg_q50[h] = np.float32(np.quantile(kept_neg_abs.astype(np.float64), 0.50))
+
+        edges = np.quantile(kept_abs.astype(np.float64), BAND_DIAG_QUANTILES).astype(np.float32)
+        edges[0] = float(np.min(kept_abs))
+        edges[-1] = float(np.max(kept_abs))
+        band_edges[h] = edges
+
+    zero_frac = np.mean(y == 0.0, axis=0).astype(np.float32)
+    pos_kept_count = keep_pos.sum(axis=0).astype(np.int64)
+    neg_kept_count = keep_neg.sum(axis=0).astype(np.int64)
+    signed_kept_count = keep_signed.sum(axis=0).astype(np.int64)
+
     return {
-        'abs_lo_raw_bps': abs_lo,
-        'abs_hi_raw_bps': abs_hi,
-        'kept_q50_abs_raw_bps': q50,
-        'kept_q85_abs_raw_bps': q85,
-        'band_quantiles': BAND_DIAG_QUANTILES.copy(),
-        'kept_abs_band_edges_raw_bps': band_edges,
+        "pos_lo_raw_bps": pos_lo,
+        "pos_hi_raw_bps": pos_hi,
+        "neg_lo_abs_bps": neg_lo,
+        "neg_hi_abs_bps": neg_hi,
+        "kept_q50_abs_raw_bps": q50,
+        "kept_q85_abs_raw_bps": q85,
+        "kept_pos_q50_abs_raw_bps": pos_q50,
+        "kept_neg_q50_abs_raw_bps": neg_q50,
+        "band_quantiles": BAND_DIAG_QUANTILES.copy(),
+        "kept_abs_band_edges_raw_bps": band_edges,
+        "zero_frac": zero_frac,
+        "pos_kept_count": pos_kept_count,
+        "neg_kept_count": neg_kept_count,
+        "signed_kept_count": signed_kept_count,
     }
 
 
@@ -502,13 +624,29 @@ def load_stats_cache(path: Path):
         return None
     with np.load(path, allow_pickle=False) as c:
         required = (
-            'abs_lo_raw_bps', 'abs_hi_raw_bps', 'kept_q50_abs_raw_bps', 'kept_q85_abs_raw_bps',
-            'band_quantiles', 'kept_abs_band_edges_raw_bps',
+            "pos_lo_raw_bps",
+            "pos_hi_raw_bps",
+            "neg_lo_abs_bps",
+            "neg_hi_abs_bps",
+            "kept_q50_abs_raw_bps",
+            "kept_q85_abs_raw_bps",
+            "kept_pos_q50_abs_raw_bps",
+            "kept_neg_q50_abs_raw_bps",
+            "band_quantiles",
+            "kept_abs_band_edges_raw_bps",
+            "zero_frac",
+            "pos_kept_count",
+            "neg_kept_count",
+            "signed_kept_count",
         )
-        if any(k not in c.files for k in required) or 'metadata_json' not in c.files:
+        if any(k not in c.files for k in required) or "metadata_json" not in c.files:
             return None
-        stats = {k: np.asarray(c[k], dtype=np.float32) for k in required}
-        meta = json.loads(str(c['metadata_json'].item()))
+        count_keys = {"pos_kept_count", "neg_kept_count", "signed_kept_count"}
+        stats = {
+            k: np.asarray(c[k], dtype=np.int64 if k in count_keys else np.float32)
+            for k in required
+        }
+        meta = json.loads(str(c["metadata_json"].item()))
     return stats, meta
 
 
@@ -518,21 +656,22 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
     keys = (
-        'low_abs_trim_fraction',
-        'high_abs_trim_fraction',
-        'horizons_ms',
-        'split_protocol',
-        'train_week_keys',
-        'train_ts_start',
-        'train_ts_end',
-        'decision_time_basis',
-        'trade_history_enabled',
-        'event_stream_mode',
-        'target_transform',
-        'label_units',
-        'target_task',
-        'loss_weighting_schema',
-        'ranking_schema',
+        "label_trim_schema",
+        "low_abs_trim_fraction",
+        "high_abs_trim_fraction",
+        "horizons_ms",
+        "split_protocol",
+        "train_week_keys",
+        "train_ts_start",
+        "train_ts_end",
+        "decision_time_basis",
+        "trade_history_enabled",
+        "event_stream_mode",
+        "target_transform",
+        "label_units",
+        "target_task",
+        "loss_weighting_schema",
+        "ranking_schema",
     )
     if not all(cached_meta.get(k) == current_meta.get(k) for k in keys):
         return False
@@ -1069,63 +1208,71 @@ class LossEmaState:
 def compute_dir_class_weights_from_train_labels(
     y: np.ndarray,
     *,
-    abs_lo: np.ndarray,
-    abs_hi: np.ndarray,
-    q50: np.ndarray,
+    pos_lo: np.ndarray,
+    pos_hi: np.ndarray,
+    neg_lo: np.ndarray,
+    neg_hi: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    y = np.asarray(y, dtype=np.float32)
-    abs_y = np.abs(y)
-    keep = (abs_y >= abs_lo.reshape(1, -1)) & (abs_y <= abs_hi.reshape(1, -1))
-    active = keep & (abs_y >= q50.reshape(1, -1))
-    pos_w = np.ones((NUM_HORIZONS,), dtype=np.float32)
-    neg_w = np.ones((NUM_HORIZONS,), dtype=np.float32)
-    for h in range(NUM_HORIZONS):
-        m = active[:, h]
-        if int(m.sum()) < 100:
-            continue
-        pos = float(np.sum(y[m, h] > 0))
-        neg = float(np.sum(y[m, h] < 0))
-        total = pos + neg
-        if total <= 0:
-            continue
-        pos_frac = max(pos / total, 1e-6)
-        neg_frac = max(neg / total, 1e-6)
-        pos_w[h] = float(np.clip(0.5 / pos_frac, 0.75, 1.25))
-        neg_w[h] = float(np.clip(0.5 / neg_frac, 0.75, 1.25))
-    return pos_w, neg_w
+    keep_pos, keep_neg, _keep_signed = build_signed_side_trim_masks_np(
+        y,
+        pos_lo_raw_bps=pos_lo,
+        pos_hi_raw_bps=pos_hi,
+        neg_lo_abs_bps=neg_lo,
+        neg_hi_abs_bps=neg_hi,
+    )
 
+    pos_count = keep_pos.sum(axis=0).astype(np.float64)
+    neg_count = keep_neg.sum(axis=0).astype(np.float64)
+    total = pos_count + neg_count
+
+    if np.any(pos_count <= 0.0) or np.any(neg_count <= 0.0):
+        raise ValueError(
+            f"Direction class weights require positive and negative signed kept rows, "
+            f"got pos_count={pos_count.tolist()} neg_count={neg_count.tolist()}"
+        )
+
+    pos_w = total / (2.0 * np.maximum(pos_count, 1.0))
+    neg_w = total / (2.0 * np.maximum(neg_count, 1.0))
+
+    return pos_w.astype(np.float32), neg_w.astype(np.float32)
 
 
 
 def compute_mag_init_targets_from_train_labels(
     y: np.ndarray,
     *,
-    abs_lo: np.ndarray,
-    abs_hi: np.ndarray,
-    q50: np.ndarray,
+    pos_lo: np.ndarray,
+    pos_hi: np.ndarray,
+    neg_lo: np.ndarray,
+    neg_hi: np.ndarray,
+    pos_q50: np.ndarray,
+    neg_q50: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     y = np.asarray(y, dtype=np.float32)
-    abs_lo = np.asarray(abs_lo, dtype=np.float32).reshape(1, -1)
-    abs_hi = np.asarray(abs_hi, dtype=np.float32).reshape(1, -1)
-    q50 = np.asarray(q50, dtype=np.float32).reshape(-1)
+    pos_q50 = np.asarray(pos_q50, dtype=np.float32).reshape(-1)
+    neg_q50 = np.asarray(neg_q50, dtype=np.float32).reshape(-1)
     if y.ndim != 2 or y.shape[1] != NUM_HORIZONS:
         raise ValueError(f"y must have shape [N, {NUM_HORIZONS}], got {y.shape}")
-    abs_y = np.abs(y).astype(np.float32)
-    keep = (abs_y >= abs_lo) & (abs_y <= abs_hi)
+    keep_pos, keep_neg, _ = build_signed_side_trim_masks_np(
+        y,
+        pos_lo_raw_bps=pos_lo,
+        pos_hi_raw_bps=pos_hi,
+        neg_lo_abs_bps=neg_lo,
+        neg_hi_abs_bps=neg_hi,
+    )
     pos_target_sqrt = np.empty((NUM_HORIZONS,), dtype=np.float32)
     neg_target_sqrt = np.empty((NUM_HORIZONS,), dtype=np.float32)
     for h in range(NUM_HORIZONS):
-        fallback = float(np.sqrt(max(float(q50[h]), 1e-8)))
-        pos_mask = keep[:, h] & (y[:, h] > 0)
-        neg_mask = keep[:, h] & (y[:, h] < 0)
-        if int(pos_mask.sum()) >= 100:
-            pos_val = float(np.median(np.sqrt(abs_y[pos_mask, h])))
+        pos_vals = np.sqrt(y[keep_pos[:, h], h].astype(np.float64, copy=False))
+        neg_vals = np.sqrt((-y[keep_neg[:, h], h]).astype(np.float64, copy=False))
+        if int(pos_vals.size) >= 100:
+            pos_val = float(np.median(pos_vals))
         else:
-            pos_val = fallback
-        if int(neg_mask.sum()) >= 100:
-            neg_val = float(np.median(np.sqrt(abs_y[neg_mask, h])))
+            pos_val = float(np.sqrt(max(float(pos_q50[h]), 1e-8)))
+        if int(neg_vals.size) >= 100:
+            neg_val = float(np.median(neg_vals))
         else:
-            neg_val = fallback
+            neg_val = float(np.sqrt(max(float(neg_q50[h]), 1e-8)))
         pos_target_sqrt[h] = np.float32(np.clip(pos_val, 1e-4, 10.0))
         neg_target_sqrt[h] = np.float32(np.clip(neg_val, 1e-4, 10.0))
     return pos_target_sqrt.astype(np.float32), neg_target_sqrt.astype(np.float32)
@@ -1135,8 +1282,10 @@ def compute_dir_mag_loss(
     pred: Dict[str, torch.Tensor],
     y_raw: torch.Tensor,
     *,
-    abs_lo_t: torch.Tensor,
-    abs_hi_t: torch.Tensor,
+    pos_lo_t: torch.Tensor,
+    pos_hi_t: torch.Tensor,
+    neg_lo_t: torch.Tensor,
+    neg_hi_t: torch.Tensor,
     q50_t: torch.Tensor,
     q85_t: torch.Tensor,
     hwt: torch.Tensor,
@@ -1146,31 +1295,35 @@ def compute_dir_mag_loss(
     update_ema: bool,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     abs_raw = torch.abs(y_raw)
-    keep = (abs_raw >= abs_lo_t) & (abs_raw <= abs_hi_t)
+    keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_torch(
+        y_raw,
+        pos_lo_t=pos_lo_t,
+        pos_hi_t=pos_hi_t,
+        neg_lo_t=neg_lo_t,
+        neg_hi_t=neg_hi_t,
+    )
     tau_t = torch.clamp(0.10 * (q85_t - q50_t), min=0.05)
     active_w = torch.sigmoid((abs_raw - q50_t) / tau_t)
     strong_w = torch.sigmoid((abs_raw - q85_t) / tau_t)
 
     dir_logits = pred["dir_logits"]
-    dir_target = (y_raw > 0).to(dtype=dir_logits.dtype)
-    dir_class_w = torch.where(dir_target > 0.5, dir_pos_w_t, dir_neg_w_t)
-    dir_w = keep.to(dtype=dir_logits.dtype) * hwt * dir_class_w
+    dir_target = (y_raw > 0.0).to(dtype=dir_logits.dtype)
+    dir_weight = torch.where(dir_target > 0.5, dir_pos_w_t, dir_neg_w_t)
+    dir_w = keep_signed.to(dtype=dir_logits.dtype) * hwt * dir_weight
     dir_w = dir_w * torch.clamp(0.25 + 0.75 * active_w + 0.25 * strong_w, 0.25, 1.25)
     dir_weight_sum = dir_w.sum()
     if float(dir_weight_sum.detach().item()) <= 0.0:
-        raise ValueError("Direction loss has zero effective weight; check keep masks and training data.")
+        raise ValueError("Direction loss has zero effective weight; check signed nonzero keep masks and training data.")
     dir_raw = F.binary_cross_entropy_with_logits(dir_logits, dir_target, reduction="none")
     dir_bce = (dir_raw * dir_w).sum() / dir_weight_sum.clamp_min(1e-9)
 
-    mag_target = torch.sqrt(abs_raw.clamp_min(0.0))
-    up_mask = keep & (y_raw > 0)
-    down_mask = keep & (y_raw < 0)
-    mag_w_base = keep.to(dtype=dir_logits.dtype) * hwt
-    mag_w_base = mag_w_base * torch.clamp(0.50 + 0.50 * active_w + 0.25 * strong_w, 0.50, 1.25)
-    up_d = F.huber_loss(pred["mag_up_sqrt"], mag_target, delta=1.0, reduction="none")
-    down_d = F.huber_loss(pred["mag_down_sqrt"], mag_target, delta=1.0, reduction="none")
-    up_w = mag_w_base * up_mask.to(dtype=dir_logits.dtype)
-    down_w = mag_w_base * down_mask.to(dtype=dir_logits.dtype)
+    mag_up_target_sqrt = torch.sqrt(torch.clamp(y_raw, min=0.0))
+    mag_down_target_sqrt = torch.sqrt(torch.clamp(-y_raw, min=0.0))
+    mag_w_base = hwt * torch.clamp(0.50 + 0.50 * active_w + 0.25 * strong_w, 0.50, 1.25)
+    up_d = F.huber_loss(pred["mag_up_sqrt"], mag_up_target_sqrt, delta=1.0, reduction="none")
+    down_d = F.huber_loss(pred["mag_down_sqrt"], mag_down_target_sqrt, delta=1.0, reduction="none")
+    up_w = mag_w_base * keep_pos.to(dtype=dir_logits.dtype)
+    down_w = mag_w_base * keep_neg.to(dtype=dir_logits.dtype)
     up_den = up_w.sum()
     down_den = down_w.sum()
     up_valid = up_den.detach() > 0
@@ -1193,24 +1346,8 @@ def compute_dir_mag_loss(
     mag_den = up_den + down_den
     mag_huber_valid = bool(up_valid.item()) or bool(down_valid.item())
 
-    mag_pred_sqrt = derive_mag_pred_sqrt_for_mag_loss(pred)
-    corr_terms = []
-    for h in range(NUM_HORIZONS):
-        mask = keep[:, h] & (abs_raw[:, h] >= q50_t[0, h])
-        if int(mask.sum().item()) >= 2:
-            px = mag_pred_sqrt[:, h][mask]
-            ty = mag_target[:, h][mask]
-            px = px - px.mean()
-            ty = ty - ty.mean()
-            den = torch.sqrt((px * px).sum() * (ty * ty).sum()).clamp_min(1e-9)
-            corr = (px * ty).sum() / den
-            corr_terms.append(1.0 - corr)
-    if corr_terms:
-        mag_corr = torch.stack(corr_terms).mean()
-        mag_corr_valid = True
-    else:
-        mag_corr = dir_logits.sum() * 0.0
-        mag_corr_valid = False
+    mag_corr = torch.zeros((), device=y_raw.device, dtype=y_raw.dtype)
+    mag_corr_valid = False
 
     if update_ema:
         ema_state.update("dir_bce", dir_bce, valid=True)
@@ -1238,6 +1375,10 @@ def compute_dir_mag_loss(
         "mag_up_weight_sum": up_den.detach(),
         "mag_down_weight_sum": down_den.detach(),
         "mag_weight_sum": mag_den.detach(),
+        "dir_mask_frac": keep_signed.float().mean().detach(),
+        "pos_mask_frac": keep_pos.float().mean().detach(),
+        "neg_mask_frac": keep_neg.float().mean().detach(),
+        "zero_frac_batch": (y_raw == 0.0).float().mean().detach(),
     }
     return loss, components
 
@@ -1265,12 +1406,19 @@ def _nan_band_metrics(n: int, frac: float, edge_lo: float, edge_hi: float) -> Di
 def summarize_label_band_audit(y_raw: np.ndarray, stats: Dict[str, np.ndarray], *, split_name: str) -> Dict[str, Any]:
     y_raw = np.asarray(y_raw, dtype=np.float32)
     abs_raw = np.abs(y_raw)
-    keep = build_abs_trim_mask(y_raw, stats["abs_lo_raw_bps"], stats["abs_hi_raw_bps"])
+    _keep_pos, _keep_neg, keep = build_signed_side_trim_masks_from_stats_np(y_raw, stats)
     edges = np.asarray(stats["kept_abs_band_edges_raw_bps"], dtype=np.float32)
     out: Dict[str, Any] = {"split": split_name, "band_quantiles": [float(x) for x in BAND_DIAG_QUANTILES], "bands": {}}
     for h, horizon_ms in enumerate(HORIZONS_MS):
         h_bands: Dict[str, Any] = {}
         denom = max(1, int(np.sum(keep[:, h])))
+        h_diag = {
+            "zero_frac": float(np.mean(y_raw[:, h] == 0.0)),
+            "nonzero_frac": float(np.mean(y_raw[:, h] != 0.0)),
+            "signed_kept_frac": float(np.mean(keep[:, h])),
+            "pos_kept_frac": float(np.mean(_keep_pos[:, h])),
+            "neg_kept_frac": float(np.mean(_keep_neg[:, h])),
+        }
         for b, name in enumerate(BAND_DIAG_NAMES):
             lo, hi = float(edges[h, b]), float(edges[h, b + 1])
             if not (math.isfinite(lo) and math.isfinite(hi)):
@@ -1301,6 +1449,7 @@ def summarize_label_band_audit(y_raw: np.ndarray, stats: Dict[str, np.ndarray], 
                 flush=True,
             )
         out["bands"][str(int(horizon_ms))] = h_bands
+        out.setdefault("zero_diagnostics", {})[str(int(horizon_ms))] = h_diag
     return out
 
 
@@ -1323,12 +1472,19 @@ def summarize_band_metrics_from_arrays(
     edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
     edge_sign = edge_bps >= 0
     abs_raw = np.abs(y_raw)
-    keep = build_abs_trim_mask(y_raw, stats["abs_lo_raw_bps"], stats["abs_hi_raw_bps"])
+    _keep_pos, _keep_neg, keep = build_signed_side_trim_masks_from_stats_np(y_raw, stats)
     edges = np.asarray(stats["kept_abs_band_edges_raw_bps"], dtype=np.float32)
     out: Dict[str, Any] = {"split": split_name, "band_quantiles": [float(x) for x in BAND_DIAG_QUANTILES], "bands": {}}
     for h, horizon_ms in enumerate(HORIZONS_MS):
         h_bands: Dict[str, Any] = {}
         denom = max(1, int(np.sum(keep[:, h])))
+        h_diag = {
+            "zero_frac": float(np.mean(y_raw[:, h] == 0.0)),
+            "nonzero_frac": float(np.mean(y_raw[:, h] != 0.0)),
+            "signed_kept_frac": float(np.mean(keep[:, h])),
+            "pos_kept_frac": float(np.mean(_keep_pos[:, h])),
+            "neg_kept_frac": float(np.mean(_keep_neg[:, h])),
+        }
         for b, name in enumerate(BAND_DIAG_NAMES):
             lo, hi = float(edges[h, b]), float(edges[h, b + 1])
             if not (math.isfinite(lo) and math.isfinite(hi)):
@@ -1396,6 +1552,7 @@ def summarize_band_metrics_from_arrays(
                 "learnability_tag": tag,
             }
         out["bands"][str(int(horizon_ms))] = h_bands
+        out.setdefault("zero_diagnostics", {})[str(int(horizon_ms))] = h_diag
     return out
 
 
@@ -1464,6 +1621,7 @@ def summarize_metrics(
         out = {"primary_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS), "n_eval_rows": n_eval_rows}
         if not y_parts:
             out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
+            out["dir_auc_q50plus"] = [float("nan")] * NUM_HORIZONS
             out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
             out["primary_metric_guard_passed"] = False
         else:
@@ -1477,15 +1635,17 @@ def summarize_metrics(
             mag_pred_sqrt = p_up * mag_up_sqrt + (1.0 - p_up) * mag_down_sqrt
             edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
             abs_raw = np.abs(y_raw)
-            keep = build_abs_trim_mask(y_raw, stats['abs_lo_raw_bps'], stats['abs_hi_raw_bps'])
+            keep_pos, keep_neg, keep = build_signed_side_trim_masks_from_stats_np(y_raw, stats)
             true_up = y_raw > 0
             pred_up = p_up >= 0.5
             if primary_only:
                 out["edge_spearman_q50plus"] = [float("nan")] * NUM_HORIZONS
+                out["dir_auc_q50plus"] = [float("nan")] * NUM_HORIZONS
                 out["dir_bal_acc_q50plus"] = [float("nan")] * NUM_HORIZONS
                 h = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
                 q50plus = keep[:, h] & (abs_raw[:, h] >= float(stats['kept_q50_abs_raw_bps'][h]))
                 out["edge_spearman_q50plus"][h] = _safe_spearman_np(edge_bps[:, h][q50plus], y_raw[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
+                out["dir_auc_q50plus"][h] = _binary_auc_np(p_up[:, h][q50plus], true_up[:, h][q50plus])
                 out["dir_bal_acc_q50plus"][h] = _balanced_acc_np(pred_up[:, h][q50plus], true_up[:, h][q50plus]) if int(np.sum(q50plus)) >= 2 else float("nan")
                 out["primary_dir_bal_acc"] = out["dir_bal_acc_q50plus"][h]
                 out["primary_metric_guard_passed"] = bool(math.isfinite(out["primary_dir_bal_acc"]) and out["primary_dir_bal_acc"] >= PRIMARY_DIR_BAL_ACC_GUARD)
@@ -2108,15 +2268,16 @@ def train_from_offline():
     va_start,va_end=int(cmssl_val['start']),int(cmssl_val['end'])
     te_start,te_end=int(cmssl_test['start']),int(cmssl_test['end'])
 
-    cache_path=out_root/'signed_raw_stats_cache.npz'
+    cache_path=out_root/'signed_side_trim_stats_cache.npz'
     cache_meta={
+        'label_trim_schema': LABEL_TRIM_SCHEMA,
         'low_abs_trim_fraction': float(LOW_ABS_TRIM_FRACTION),
         'high_abs_trim_fraction': float(HIGH_ABS_TRIM_FRACTION),
         'horizons_ms':[int(h) for h in HORIZONS_MS], 'split_protocol': protocol, 'train_week_keys': list(train_week_keys),
         'train_ts_start': int(tr_start), 'train_ts_end': int(tr_end), 'decision_time_basis': EXPECTED_DECISION_TIME_BASIS,
         'trade_history_enabled': trade_history_enabled, 'event_stream_mode': event_stream_mode,
         'target_transform': TARGET_TRANSFORM, 'label_units': 'signed_log_return_bps', 'target_task': TARGET_TASK,
-        'loss_weighting_schema': 'dir_mag_smooth_q50_q85_class_bal_v1',
+        'loss_weighting_schema': 'dir_mag_signed_nonzero_side_trim_q50_q85_class_bal_v1',
         'ranking_schema': 'tie_aware_average_ranks_v1',
         'band_diag_quantiles': [float(x) for x in BAND_DIAG_QUANTILES],
     }
@@ -2130,15 +2291,19 @@ def train_from_offline():
         y_train = np.concatenate([np.asarray(ds.y, dtype=np.float32) for ds in ds_train_list], axis=0)
     dir_pos_w, dir_neg_w = compute_dir_class_weights_from_train_labels(
         y_train,
-        abs_lo=stats["abs_lo_raw_bps"],
-        abs_hi=stats["abs_hi_raw_bps"],
-        q50=stats["kept_q50_abs_raw_bps"],
+        pos_lo=stats["pos_lo_raw_bps"],
+        pos_hi=stats["pos_hi_raw_bps"],
+        neg_lo=stats["neg_lo_abs_bps"],
+        neg_hi=stats["neg_hi_abs_bps"],
     )
     mag_pos_init_sqrt, mag_neg_init_sqrt = compute_mag_init_targets_from_train_labels(
         y_train,
-        abs_lo=stats["abs_lo_raw_bps"],
-        abs_hi=stats["abs_hi_raw_bps"],
-        q50=stats["kept_q50_abs_raw_bps"],
+        pos_lo=stats["pos_lo_raw_bps"],
+        pos_hi=stats["pos_hi_raw_bps"],
+        neg_lo=stats["neg_lo_abs_bps"],
+        neg_hi=stats["neg_hi_abs_bps"],
+        pos_q50=stats["kept_pos_q50_abs_raw_bps"],
+        neg_q50=stats["kept_neg_q50_abs_raw_bps"],
     )
     print(f"[train_stats] dir_pos_w={dir_pos_w.tolist()} dir_neg_w={dir_neg_w.tolist()}")
     train_label_band_audit = summarize_label_band_audit(y_train, stats, split_name="train") if BAND_DIAG else None
@@ -2262,8 +2427,10 @@ def train_from_offline():
     no_imp = 0
     early_stop_patience = SINGLE_WEEK_PATIENCE if len(train_week_keys) <= 1 else PATIENCE
 
-    abs_lo_t=torch.tensor(stats['abs_lo_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
-    abs_hi_t=torch.tensor(stats['abs_hi_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
+    pos_lo_t=torch.tensor(stats['pos_lo_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
+    pos_hi_t=torch.tensor(stats['pos_hi_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
+    neg_lo_t=torch.tensor(stats['neg_lo_abs_bps'],device=device,dtype=torch.float32).view(1,-1)
+    neg_hi_t=torch.tensor(stats['neg_hi_abs_bps'],device=device,dtype=torch.float32).view(1,-1)
     q50_t=torch.tensor(stats['kept_q50_abs_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
     q85_t=torch.tensor(stats['kept_q85_abs_raw_bps'],device=device,dtype=torch.float32).view(1,-1)
     hwt=torch.tensor(HORIZON_WEIGHTS,device=device,dtype=torch.float32).view(1,-1)
@@ -2284,6 +2451,10 @@ def train_from_offline():
         dir_norm_sum = torch.zeros((), device=device)
         mag_norm_sum = torch.zeros((), device=device)
         corr_norm_sum = torch.zeros((), device=device)
+        dir_mask_frac_sum = torch.zeros((), device=device)
+        pos_mask_frac_sum = torch.zeros((), device=device)
+        neg_mask_frac_sum = torch.zeros((), device=device)
+        zero_frac_batch_sum = torch.zeros((), device=device)
         n_batches = 0
         first_batch_checked = False
         for batch_i, (x, y_raw) in enumerate(tqdm(train_src.iter_epoch(epoch), total=len(train_src), desc=f"Ep{epoch+1}/{EPOCHS}")):
@@ -2312,8 +2483,10 @@ def train_from_offline():
                 loss, comps = compute_dir_mag_loss(
                     pred,
                     y_raw,
-                    abs_lo_t=abs_lo_t,
-                    abs_hi_t=abs_hi_t,
+                    pos_lo_t=pos_lo_t,
+                    pos_hi_t=pos_hi_t,
+                    neg_lo_t=neg_lo_t,
+                    neg_hi_t=neg_hi_t,
                     q50_t=q50_t,
                     q85_t=q85_t,
                     hwt=hwt,
@@ -2340,8 +2513,10 @@ def train_from_offline():
                     loss2, comps2 = compute_dir_mag_loss(
                         pred2,
                         y_raw,
-                        abs_lo_t=abs_lo_t,
-                        abs_hi_t=abs_hi_t,
+                        pos_lo_t=pos_lo_t,
+                        pos_hi_t=pos_hi_t,
+                        neg_lo_t=neg_lo_t,
+                        neg_hi_t=neg_hi_t,
                         q50_t=q50_t,
                         q85_t=q85_t,
                         hwt=hwt,
@@ -2454,6 +2629,10 @@ def train_from_offline():
             dir_norm_sum += comps["dir_norm"]
             mag_norm_sum += comps["mag_norm"]
             corr_norm_sum += comps["corr_norm"]
+            dir_mask_frac_sum += comps["dir_mask_frac"]
+            pos_mask_frac_sum += comps["pos_mask_frac"]
+            neg_mask_frac_sum += comps["neg_mask_frac"]
+            zero_frac_batch_sum += comps["zero_frac_batch"]
             n_batches += 1
 
         train_sec = time.perf_counter() - train_t0
@@ -2466,7 +2645,11 @@ def train_from_offline():
         train_dir_norm = (dir_norm_sum / max(1, n_batches)).item()
         train_mag_norm = (mag_norm_sum / max(1, n_batches)).item()
         train_corr_norm = (corr_norm_sum / max(1, n_batches)).item()
-        print(f"[train] loss={train_loss:.6f} dir_bce={train_dir_bce:.6f} mag_huber={train_mag_huber:.6f} mag_up_huber={train_mag_up_huber:.6f} mag_down_huber={train_mag_down_huber:.6f} mag_corr={train_mag_corr:.6f} dir_norm={train_dir_norm:.6f} mag_norm={train_mag_norm:.6f} corr_norm={train_corr_norm:.6f}")
+        train_dir_mask_frac = (dir_mask_frac_sum / max(1, n_batches)).item()
+        train_pos_mask_frac = (pos_mask_frac_sum / max(1, n_batches)).item()
+        train_neg_mask_frac = (neg_mask_frac_sum / max(1, n_batches)).item()
+        train_zero_frac_batch = (zero_frac_batch_sum / max(1, n_batches)).item()
+        print(f"[train] loss={train_loss:.6f} dir_bce={train_dir_bce:.6f} mag_huber={train_mag_huber:.6f} mag_up_huber={train_mag_up_huber:.6f} mag_down_huber={train_mag_down_huber:.6f} mag_corr={train_mag_corr:.6f} dir_norm={train_dir_norm:.6f} mag_norm={train_mag_norm:.6f} corr_norm={train_corr_norm:.6f} dir_mask_frac={train_dir_mask_frac:.6f} pos_mask_frac={train_pos_mask_frac:.6f} neg_mask_frac={train_neg_mask_frac:.6f} zero_frac_batch={train_zero_frac_batch:.6f}")
         if BAND_DIAG and BAND_DIAG_TRAIN and train_band_src is not None:
             train_band = summarize_metrics(
                 model, train_band_src, device, stats, amp_enabled, amp_dtype,
@@ -2520,6 +2703,8 @@ def train_from_offline():
                     'label_delta_ms':0, 'label_units':'signed_log_return_bps',
                     'target_task': TARGET_TASK,
                     'target_transform': TARGET_TRANSFORM,
+                    'label_trim_schema': LABEL_TRIM_SCHEMA,
+                    'loss_weighting_schema': 'dir_mag_signed_nonzero_side_trim_q50_q85_class_bal_v1',
                     'low_abs_trim_fraction': float(LOW_ABS_TRIM_FRACTION),
                     'high_abs_trim_fraction': float(HIGH_ABS_TRIM_FRACTION),
                     'primary_metric': PRIMARY_METRIC,

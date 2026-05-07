@@ -475,9 +475,9 @@ ACT_DIAG_P95_MAX_ELEMS = max(
 )
 print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
-MODEL_ARCH_SCHEMA = "ctn_hybrid_ci4_gate_proj_mixed2_ci8_v1"
-CTN_CI_KERNELS = [3, 3, 7, 7]
-CTN_MIXED_KERNELS = [15, 15]
+MODEL_ARCH_SCHEMA = "ctn_hybrid_ci4_3355_gate_proj_mixed2_77_ci8_v1"
+CTN_CI_KERNELS = [3, 3, 5, 5]
+CTN_MIXED_KERNELS = [7, 7]
 CTN_CI_INTERNAL_DIM = 8
 CTN_CI_FF_MULT = 8
 CTN_CI_DFF = CTN_CI_INTERNAL_DIM * CTN_CI_FF_MULT
@@ -492,10 +492,11 @@ HORIZONS_MS     = [200, 500, 1000]
 NUM_HORIZONS    = len(HORIZONS_MS)
 HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
-LOW_ABS_TRIM_FRACTION = 0.05
+LOW_ABS_TRIM_FRACTION = 0.02
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
+LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
 FEATURE_SCHEMA = "cmssl17_1s_maker_stage1_v1_fast_local_obnorm"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
 CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-stage1"
@@ -504,7 +505,7 @@ LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "edge_spearman_q50plus_1000ms"
+PRIMARY_METRIC = "dir_auc_q50plus_1000ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
 PRIMARY_DIR_BAL_ACC_GUARD = 0.505
 MODEL_OUTPUT_SCHEMA = "dir_logits_mag_up_down_sqrt_v1"
@@ -525,8 +526,8 @@ def inverse_softplus_torch(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     x = torch.clamp(x, min=eps)
     return torch.where(x > 20.0, x, torch.log(torch.expm1(x)))
 DIR_LOSS_WEIGHT = 1.00
-MAG_LOSS_WEIGHT = 0.75
-MAG_CORR_LOSS_WEIGHT = 0.05
+MAG_LOSS_WEIGHT = 0.25
+MAG_CORR_LOSS_WEIGHT = 0.00
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the PCA/core feature vector.
 AUX_DIM        = 6
@@ -1246,11 +1247,14 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         )
         self.output_norm = nn.LayerNorm(d_model)
 
+        effective_rf_samples = CTN_PATCH_SIZE + sum(
+            int(k) - 1 for k in (list(CTN_CI_KERNELS) + list(CTN_MIXED_KERNELS))
+        )
         sample_ms = float(WINDOW_MS) / float(LOOKBACK)
-        effective_rf_ms = int(round(46 * sample_ms))
+        effective_rf_ms = int(round(effective_rf_samples * sample_ms))
         print(
             f"[ctn-config] arch={MODEL_ARCH_SCHEMA} patch_size={CTN_PATCH_SIZE} stride={CTN_PATCH_STRIDE} "
-            f"patch_count={self.patch_count} effective_rf_samples=46 effective_rf_ms={effective_rf_ms}",
+            f"patch_count={self.patch_count} effective_rf_samples={effective_rf_samples} effective_rf_ms={effective_rf_ms}",
             flush=True,
         )
         ci_kernel_str = ",".join(str(k) for k in CTN_CI_KERNELS)
@@ -6419,7 +6423,7 @@ def build_dataset_from_split(dataset_root: str, split_cfg: Dict[str, Any]) -> HF
 # --------------------  Utils ---------------------
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
     metric = metric_name or PRIMARY_METRIC
-    if metric == PRIMARY_METRIC:
+    if metric.startswith("dir_auc_q50plus") or metric.startswith("edge_spearman_q50plus"):
         return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
@@ -6460,18 +6464,31 @@ def compute_primary_metric(metric_payload: Dict[str, Any]) -> Tuple[float, str]:
         raise ValueError(
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
         )
+
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    vals = metric_payload.get("edge_spearman_q50plus", [])
     dir_vals = metric_payload.get("dir_bal_acc_q50plus", [])
-    if idx >= len(vals) or idx >= len(dir_vals):
+    if idx >= len(dir_vals):
         return float("nan"), PRIMARY_METRIC
-    edge_value = float(vals[idx])
+
     dir_guard_value = float(dir_vals[idx])
-    if not math.isfinite(edge_value):
-        return float("nan"), PRIMARY_METRIC
     if not math.isfinite(dir_guard_value) or dir_guard_value < PRIMARY_DIR_BAL_ACC_GUARD:
         return float("nan"), PRIMARY_METRIC
-    return edge_value, PRIMARY_METRIC
+
+    if PRIMARY_METRIC.startswith("dir_auc_q50plus"):
+        vals = metric_payload.get("dir_auc_q50plus", [])
+    elif PRIMARY_METRIC.startswith("edge_spearman_q50plus"):
+        vals = metric_payload.get("edge_spearman_q50plus", [])
+    else:
+        raise ValueError(f"Unsupported PRIMARY_METRIC={PRIMARY_METRIC!r}")
+
+    if idx >= len(vals):
+        return float("nan"), PRIMARY_METRIC
+
+    value = float(vals[idx])
+    if not math.isfinite(value):
+        return float("nan"), PRIMARY_METRIC
+
+    return value, PRIMARY_METRIC
 
 def is_metric_improved(value: float, best: float, mode: str) -> bool:
     if mode == "min":
