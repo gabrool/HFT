@@ -339,6 +339,7 @@ from CMSSL17 import (
     CHECKPOINT_SCHEMA,
     TARGET_TRANSFORM,
     TARGET_TASK,
+    LABEL_TRIM_SCHEMA,
     LOW_ABS_TRIM_FRACTION,
     HIGH_ABS_TRIM_FRACTION,
 )  # keep shared model/data constants only; ingest helpers are local below
@@ -1349,6 +1350,7 @@ class FlatWeekRouter:
             "aux_schema": AUX_SCHEMA,
             "target_task": TARGET_TASK,
             "target_transform": TARGET_TRANSFORM,
+            "label_trim_schema": LABEL_TRIM_SCHEMA,
             "low_abs_trim_fraction": float(LOW_ABS_TRIM_FRACTION),
             "high_abs_trim_fraction": float(HIGH_ABS_TRIM_FRACTION),
             "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
@@ -2401,6 +2403,7 @@ def build_global_meta_from_week_metas(
         "aux_schema": AUX_SCHEMA,
         "target_task": TARGET_TASK,
         "target_transform": TARGET_TRANSFORM,
+        "label_trim_schema": LABEL_TRIM_SCHEMA,
         "low_abs_trim_fraction": float(LOW_ABS_TRIM_FRACTION),
         "high_abs_trim_fraction": float(HIGH_ABS_TRIM_FRACTION),
         "checkpoint_schema_expected": CHECKPOINT_SCHEMA,
