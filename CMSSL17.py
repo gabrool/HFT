@@ -462,8 +462,8 @@ def coerce_ts_ms(value: Union[int, float, str]) -> int:
 
 
 # ---------------------------  Core hyper-params  ---------------------------
-LOOKBACK        = 600        # canonical event-time token lookback
-WINDOW_MS       = 60_000     # canonical rolling window span (60s)
+LOOKBACK        = 100        # canonical event-time token lookback
+WINDOW_MS       = 10_000     # canonical rolling window span (10s)
 PAD_DT_FOR_LEFT = 0.0
 BATCH_SIZE      = 64
 DMODEL          = 1024
@@ -488,7 +488,7 @@ CTN_PATCH_SIZE = 2
 CTN_PATCH_STRIDE = 1
 
 # Prediction horizons (in milliseconds)
-HORIZONS_MS     = [7_500, 15_000, 30_000]
+HORIZONS_MS     = [200, 500, 1000]
 NUM_HORIZONS    = len(HORIZONS_MS)
 HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
@@ -496,16 +496,16 @@ LOW_ABS_TRIM_FRACTION = 0.05
 HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
-FEATURE_SCHEMA = "cmssl17_30s_taker_stage4_v6_fast_trade_obnorm"
-AUX_SCHEMA = "cmssl17_aux_ob_decision_density_v3_no_1s"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-stage4-v5-aux6-pca506"
+FEATURE_SCHEMA = "cmssl17_1s_maker_stage1_v1_fast_local_obnorm"
+AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-stage1"
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "edge_spearman_q50plus_30000ms"
-PRIMARY_METRIC_HORIZON_MS = 30_000
+PRIMARY_METRIC = "edge_spearman_q50plus_1000ms"
+PRIMARY_METRIC_HORIZON_MS = 1000
 PRIMARY_DIR_BAL_ACC_GUARD = 0.505
 MODEL_OUTPUT_SCHEMA = "dir_logits_mag_up_down_sqrt_v1"
 MAG_SQRT_EPS = 1e-6
@@ -529,36 +529,119 @@ MAG_LOSS_WEIGHT = 0.75
 MAG_CORR_LOSS_WEIGHT = 0.05
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the PCA/core feature vector.
-# These correspond to:
-# [log_dt_decision_ms, log_events_3000ms, log_events_7500ms,
-#  log_events_15000ms, log_events_30000ms, log_events_60000ms]
 AUX_DIM        = 6
 FEATURE_AUX_TAIL = (
     "log_dt_decision_ms",
+    "log_events_100ms",
+    "log_events_200ms",
+    "log_events_500ms",
+    "log_events_1000ms",
     "log_events_3000ms",
-    "log_events_7500ms",
-    "log_events_15000ms",
-    "log_events_30000ms",
-    "log_events_60000ms",
 )
 
 
 PRICE_WINDOWS_MS = (
+    100,
+    200,
+    500,
     1_000,
     3_000,
-    7_500,
-    15_000,
-    30_000,
-    60_000,
+    10_000,
 )
-NORMALIZED_OFI_LEVELS = (
-    1,
-    3,
-    5,
-    10,
-    20,
-    50,
+
+FAST_WINDOWS_MS = (
+    100,
+    200,
+    500,
+    1_000,
+    3_000,
 )
+
+FLOW_WINDOWS_MS = (
+    100,
+    200,
+    500,
+    1_000,
+    3_000,
+    10_000,
+)
+
+INTERACTION_WINDOWS_MS = (
+    200,
+    500,
+    1_000,
+)
+
+ROLLING_OFI_WINDOWS_MS = (
+    100,
+    200,
+    500,
+    1_000,
+    3_000,
+)
+
+ROLLING_OBI_WINDOWS_MS = (
+    200,
+    500,
+    1_000,
+    3_000,
+)
+
+TRADE_BURST_WINDOWS_MS = (
+    200,
+    500,
+    1_000,
+)
+
+LARGE_TRADE_CONTINUATION_WINDOWS_MS = (
+    200,
+    500,
+    1_000,
+)
+
+REGIME_WINDOWS_MS = (
+    500,
+    1_000,
+    3_000,
+    10_000,
+)
+
+EVENT_DENSITY_WINDOWS_MS = (
+    100,
+    200,
+    500,
+    1_000,
+    3_000,
+)
+
+EMA_HALF_LIVES_MS = (
+    100,
+    200,
+    500,
+    1_000,
+    3_000,
+)
+
+MACD_TRIPLETS_MS = (
+    (100, 500, 200),
+    (200, 1_000, 500),
+    (500, 3_000, 1_000),
+)
+
+VPIN_BUCKET_SECS = (
+    0.5,
+    1.0,
+    3.0,
+)
+
+SPREAD_DEPTH_REGIME_WINDOWS_MS = (
+    500,
+    1_000,
+    3_000,
+    10_000,
+)
+
+NORMALIZED_OFI_LEVELS = (1, 3, 5, 10, 20)
 BPS_DEPTH_BANDS = (
     0.5,
     1.0,
@@ -584,20 +667,6 @@ SLIPPAGE_NOTIONAL_USD = (
     100_000.0,
     250_000.0,
 )
-FAST_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000)
-INTERACTION_WINDOWS_MS = (
-    7_500,
-    15_000,
-    30_000,
-)
-FLOW_WINDOWS_MS = (
-    1_000,
-    3_000,
-    7_500,
-    15_000,
-    30_000,
-    60_000,
-)
 LARGE_TRADE_NOTIONAL_USD = (
     50_000.0,
     100_000.0,
@@ -608,34 +677,25 @@ LARGE_TRADE_CLUSTER_THRESHOLD_USD = 100_000.0
 LARGE_TRADE_CLUSTER_GAP_MS = 1_000
 LARGE_TRADE_CLOCK_THRESHOLD_USD = 100_000.0
 ROLLING_OFI_LEVELS = (1, 3, 5, 10, 20)
-ROLLING_OFI_WINDOWS_MS = (7_500, 15_000, 30_000, 60_000)
 ROLLING_OBI_LEVELS = (3, 5, 10, 20)
-ROLLING_OBI_WINDOWS_MS = (15_000, 30_000, 60_000)
 DEEP_MICRO_LEVELS = (3, 5, 10, 20)
-TRADE_BURST_WINDOWS_MS = (7_500, 15_000, 30_000)
-LARGE_TRADE_CONTINUATION_WINDOWS_MS = (7_500, 15_000)
-REGIME_WINDOWS_MS = (
-    3_000,
-    7_500,
-    15_000,
-    30_000,
-    60_000,
-    120_000,
+OFI_ACCEL_PAIRS_MS = (
+    (100, 500),
+    (200, 1_000),
+    (500, 3_000),
 )
-EVENT_DENSITY_WINDOWS_MS = (1_000, 3_000, 7_500, 15_000, 30_000, 60_000)
-EMA_HALF_LIVES_MS = (7_500, 15_000, 30_000, 60_000, 120_000)
-MACD_TRIPLETS_MS = (
-    (7_500, 15_000, 10_000),
-    (15_000, 30_000, 20_000),
-    (30_000, 60_000, 40_000),
+TRADE_IMBALANCE_DIFF_PAIRS_MS = (
+    (100, 500),
+    (200, 1_000),
+    (500, 3_000),
 )
-VPIN_BUCKET_SECS = (7.5, 15.0, 30.0)
-SPREAD_DEPTH_REGIME_WINDOWS_MS = (
-    7_500,
-    15_000,
-    30_000,
-    60_000,
-    120_000,
+NET_FLOW_DIFF_PAIRS_MS = (
+    (200, 1_000),
+    (1_000, 10_000),
+)
+OFI_IMBALANCE_DIFF_PAIRS_MS = (
+    (200, 1_000),
+    (500, 3_000),
 )
 BOOK_DEPTH_FEATURE_LEVELS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 100)
 MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
@@ -1751,7 +1811,7 @@ class BybitRawIter:
 # ---------------------  Rolling normalization  ---------------------
 
 class RollingZScore:
-    def __init__(self, window_ms: int = 60_000):
+    def __init__(self, window_ms: int = 10_000):
         self.window = window_ms
         self.buf = deque()
         self.sum = None
@@ -2654,17 +2714,24 @@ class FeatureEngine:
         }
         self.trade_sign_history: Deque[Tuple[int, int, float]] = deque()
         self.last_ob_ofi_l5: float = 0.0
-        self.last_ob_trade_imbalance_30000ms: float = 0.0
+        self.last_ob_trade_imbalance_1000ms: float = 0.0
 
         # Tick-direction & RPI tracking
         self.last_tick_sign: int = 0
         self.last_is_zero_tick: int = 0
         self.last_trade_price: Optional[float] = None
         self.last_is_rpi: int = 0
+        self.last_trade_side_sign: float = 0.0
+        self.last_trade_notional_usd: float = 0.0
+        self.last_buy_trade_ts: Optional[int] = None
+        self.last_sell_trade_ts: Optional[int] = None
 
-        # ---------- Quote windows ----------
+        # ---------- Quote / OB update windows ----------
         self._quote_window_deques: Dict[int, Deque[int]] = {
             ms: deque() for ms in FLOW_WINDOWS_MS
+        }
+        self._ob_update_deques: Dict[int, Deque[int]] = {
+            ms: deque() for ms in FAST_WINDOWS_MS
         }
 
         # ---------- Event density windows ----------
@@ -2739,9 +2806,9 @@ class FeatureEngine:
             "ofi_l3_over_depth_l3",
             "ofi_l5_over_depth_l5",
             "ofi_l10_over_depth_l10",
-            "signed_notional_flow_usd_30000ms",
-            "trade_imbalance_notional_30000ms",
-            "vwap_vs_mid_bps_30000ms",
+            "signed_notional_flow_usd_1000ms",
+            "trade_imbalance_notional_1000ms",
+            "vwap_vs_mid_bps_1000ms",
         )
         self.ema_states: Dict[int, Dict[str, Optional[float]]] = {
             hl: {name: None for name in self.ema_indicator_names}
@@ -2750,7 +2817,7 @@ class FeatureEngine:
 
         # ---------- Rolling z-score state (per-feature EWMA mean/var) ----------
         self.z_mean: Optional[np.ndarray] = None
-        self.z_var: Optional[np.ndarray] = None
+        self.z_m2: Optional[np.ndarray] = None
         self._feat_dim: Optional[int] = None
         self._feature_names_cache: Optional[List[str]] = None
         self._z_half_lives_ms: Optional[List[Optional[int]]] = None
@@ -2832,8 +2899,8 @@ class FeatureEngine:
                 names.append(f"ofi_l{level}_sum_{window}ms")
                 names.append(f"ofi_l{level}_sum_over_depth_{window}ms")
         for level in ROLLING_OFI_LEVELS:
-            names.append(f"ofi_l{level}_accel_7500_minus_30000ms")
-            names.append(f"ofi_l{level}_accel_15000_minus_60000ms")
+            for fast_ms, slow_ms in OFI_ACCEL_PAIRS_MS:
+                names.append(f"ofi_l{level}_accel_{fast_ms}_minus_{slow_ms}ms")
         for level in ROLLING_OBI_LEVELS:
             for window in ROLLING_OBI_WINDOWS_MS:
                 names.append(f"obi_l{level}_mean_{window}ms")
@@ -2846,10 +2913,10 @@ class FeatureEngine:
                 f"vamp_l{level}_minus_mid_bps",
             ])
         names.extend([
-            "micro_l5_slope_7500ms",
-            "micro_l5_slope_30000ms",
-            "micro_l10_slope_7500ms",
-            "micro_l10_slope_30000ms",
+            "micro_l5_slope_200ms",
+            "micro_l5_slope_1000ms",
+            "micro_l10_slope_200ms",
+            "micro_l10_slope_1000ms",
             "micro_l1_minus_micro_l10_bps",
             "micro_l5_minus_micro_l20_bps",
         ])
@@ -2913,6 +2980,7 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             names.extend([
                 f"spread_delta_bps_{ms}ms",
+                f"spread_delta_over_spread_{ms}ms",
                 f"spread_change_count_{ms}ms",
                 f"bid_price_change_count_{ms}ms",
                 f"ask_price_change_count_{ms}ms",
@@ -2922,6 +2990,11 @@ class FeatureEngine:
                 f"ask_l1_depletion_{ms}ms",
                 f"bid_l1_depletion_over_depth_{ms}ms",
                 f"ask_l1_depletion_over_depth_{ms}ms",
+            ])
+        for ms in FAST_WINDOWS_MS:
+            names.extend([
+                f"ob_update_count_{ms}ms",
+                f"ob_update_rate_{ms}ms",
             ])
         for ms in FAST_WINDOWS_MS:
             for level in (1, 2):
@@ -2965,6 +3038,15 @@ class FeatureEngine:
                 f"sell_trade_premium_bps_{ms}ms",
                 f"aggressor_price_impact_bps_{ms}ms",
             ])
+        names.extend([
+            "last_trade_side_sign",
+            "last_tick_sign",
+            "last_is_zero_tick",
+            "last_is_rpi",
+            "last_trade_notional_usd",
+            "time_since_last_buy_trade_ms",
+            "time_since_last_sell_trade_ms",
+        ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
                 f"cvd_change_usd_{ms}ms",
@@ -2972,12 +3054,9 @@ class FeatureEngine:
                 f"cvd_minus_ema_usd_{ms}ms",
             ])
         names.extend([
-            "imbalance_1000ms_minus_7500ms",
-            "imbalance_3000ms_minus_15000ms",
-            "imbalance_7500ms_minus_30000ms",
-            "net_flow_3000ms_minus_30000ms",
-            "ofi_imbalance_3000ms_minus_15000ms",
-            "ofi_imbalance_7500ms_minus_30000ms",
+            *[f"imbalance_{fast_ms}ms_minus_{slow_ms}ms" for fast_ms, slow_ms in TRADE_IMBALANCE_DIFF_PAIRS_MS],
+            *[f"net_flow_{fast_ms}ms_minus_{slow_ms}ms" for fast_ms, slow_ms in NET_FLOW_DIFF_PAIRS_MS],
+            *[f"ofi_imbalance_{fast_ms}ms_minus_{slow_ms}ms" for fast_ms, slow_ms in OFI_IMBALANCE_DIFF_PAIRS_MS],
             "consecutive_buy_trade_count",
             "consecutive_sell_trade_count",
         ])
@@ -3017,10 +3096,8 @@ class FeatureEngine:
             "ofi_l5_since_last_large_sell",
             "trade_imbalance_since_last_large_buy",
             "trade_imbalance_since_last_large_sell",
-            "large_buy_continuation_bps_7500ms",
-            "large_buy_continuation_bps_15000ms",
-            "large_sell_continuation_bps_7500ms",
-            "large_sell_continuation_bps_15000ms",
+            *[f"large_buy_continuation_bps_{ms}ms" for ms in LARGE_TRADE_CONTINUATION_WINDOWS_MS],
+            *[f"large_sell_continuation_bps_{ms}ms" for ms in LARGE_TRADE_CONTINUATION_WINDOWS_MS],
         ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
@@ -3042,8 +3119,7 @@ class FeatureEngine:
                 f"regime_realized_vol_bps_{ms}ms",
                 f"regime_vol_ewma_bps_{ms}ms",
             ])
-            if ms <= 60_000:
-                names.append(f"regime_flow_imbalance_{ms}ms")
+            names.append(f"regime_flow_imbalance_{ms}ms")
             names.extend([
                 f"realized_up_vol_bps_{ms}ms",
                 f"realized_down_vol_bps_{ms}ms",
@@ -4380,23 +4456,20 @@ class FeatureEngine:
             return 0.0
         return self._event_density(deq, int(window_ms))
 
+    def event_density_100ms(self) -> float:
+        return self.event_density(100)
+
+    def event_density_200ms(self) -> float:
+        return self.event_density(200)
+
+    def event_density_500ms(self) -> float:
+        return self.event_density(500)
+
     def event_density_1000ms(self) -> float:
         return self.event_density(1_000)
 
     def event_density_3000ms(self) -> float:
         return self.event_density(3_000)
-
-    def event_density_7500ms(self) -> float:
-        return self.event_density(7_500)
-
-    def event_density_15000ms(self) -> float:
-        return self.event_density(15_000)
-
-    def event_density_30000ms(self) -> float:
-        return self.event_density(30_000)
-
-    def event_density_60000ms(self) -> float:
-        return self.event_density(60_000)
 
     def _prune_ts_deque(self, deq: Deque[int], now_ms: int, window_ms: int):
         while deq and (now_ms - deq[0] > window_ms):
@@ -4595,6 +4668,8 @@ class FeatureEngine:
             self._update_book_from_ob(tp_code, bids, asks)
             for window, deq in self._quote_window_deques.items():
                 self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
+            for window, deq in self._ob_update_deques.items():
+                self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
         else:
             raise ValueError(f"Unsupported event type in _dispatch_parsed_event: {etype!r}")
         self._ensure_book_ladders()
@@ -4698,7 +4773,7 @@ class FeatureEngine:
         trade_stats_by_ms = {ms: self._compute_trade_window_stats(ms, ts_ms, mid, micro) for ms in self.trade_windows}
         if etype == "ob":
             self.last_ob_ofi_l5 = float(ofi_l5)
-            self.last_ob_trade_imbalance_30000ms = float(trade_stats_by_ms[30_000]["trade_imbalance_notional"])
+            self.last_ob_trade_imbalance_1000ms = float(trade_stats_by_ms[1_000]["trade_imbalance_notional"])
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in self.trade_windows:
             cvd_state = self.cvd_window_states[ms]
@@ -4809,14 +4884,20 @@ class FeatureEngine:
             "ofi_l5_since_last_large_sell": -_ofi_since(self.last_large_sell_ts),
             "trade_imbalance_since_last_large_buy": _trade_imb_since(self.last_large_buy_ts),
             "trade_imbalance_since_last_large_sell": -_trade_imb_since(self.last_large_sell_ts),
-            "large_buy_continuation_bps_7500ms": self._bps(mid, self.last_large_buy_mid or 0.0, 0.0)
-            if (self.last_large_buy_ts is not None and (ts_ms - self.last_large_buy_ts) <= 7_500) else 0.0,
-            "large_buy_continuation_bps_15000ms": self._bps(mid, self.last_large_buy_mid or 0.0, 0.0)
-            if (self.last_large_buy_ts is not None and (ts_ms - self.last_large_buy_ts) <= 15_000) else 0.0,
-            "large_sell_continuation_bps_7500ms": self._bps(self.last_large_sell_mid or 0.0, mid, 0.0)
-            if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= 7_500) else 0.0,
-            "large_sell_continuation_bps_15000ms": self._bps(self.last_large_sell_mid or 0.0, mid, 0.0)
-            if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= 15_000) else 0.0,
+            **{
+                f"large_buy_continuation_bps_{ms}ms": (
+                    self._bps(mid, self.last_large_buy_mid or 0.0, 0.0)
+                    if (self.last_large_buy_ts is not None and (ts_ms - self.last_large_buy_ts) <= ms) else 0.0
+                )
+                for ms in LARGE_TRADE_CONTINUATION_WINDOWS_MS
+            },
+            **{
+                f"large_sell_continuation_bps_{ms}ms": (
+                    self._bps(self.last_large_sell_mid or 0.0, mid, 0.0)
+                    if (self.last_large_sell_ts is not None and (ts_ms - self.last_large_sell_ts) <= ms) else 0.0
+                )
+                for ms in LARGE_TRADE_CONTINUATION_WINDOWS_MS
+            },
         }
         self._add_return(ts_ms, mid, ob_dt_ms)
         return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
@@ -4831,8 +4912,7 @@ class FeatureEngine:
         regime_realized = {ms: self.realized_vol[ms] for ms in self.regime_windows_ms}
         regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
         for ms in self.regime_windows_ms:
-            if ms <= 60_000:
-                self.flow_regime[ms] = trade_stats_by_ms[ms]["trade_imbalance_notional"]
+            self.flow_regime[ms] = trade_stats_by_ms[ms]["trade_imbalance_notional"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
 
         vpin_features = []
@@ -4899,12 +4979,12 @@ class FeatureEngine:
         if etype == "ob":
             for level in ROLLING_OFI_LEVELS:
                 value = ofi_by_level[level]
-                self._append_metric_history(self.ofi_level_histories[level], ts_ms, value, keep_ms=120_000)
+                self._append_metric_history(self.ofi_level_histories[level], ts_ms, value, keep_ms=10_000)
                 for window in ROLLING_OFI_WINDOWS_MS:
                     self._rolling_ofi_states[(level, window)].update(ts_ms, value)
             for level in ROLLING_OBI_LEVELS:
                 value = obi_by_level[level]
-                self._append_metric_history(self.obi_level_histories[level], ts_ms, value, keep_ms=120_000)
+                self._append_metric_history(self.obi_level_histories[level], ts_ms, value, keep_ms=10_000)
                 for window in ROLLING_OBI_WINDOWS_MS:
                     self._rolling_obi_states[(level, window)].update(ts_ms, value)
         for level in ROLLING_OFI_LEVELS:
@@ -4938,10 +5018,10 @@ class FeatureEngine:
             deep_micro_features[f"micro_l{level}_minus_mid_over_spread"] = self._safe_div(micro_l - mid, max(spread, 1e-12), 0.0)
             deep_micro_features[f"vamp_l{level}_minus_mid_bps"] = self._bps(vamp_l, mid, 0.0)
         if etype == "ob":
-            self._append_metric_history(self.deep_micro_histories[5], ts_ms, deep_micro_minus_mid_bps.get(5, 0.0), keep_ms=120_000)
-            self._append_metric_history(self.deep_micro_histories[10], ts_ms, deep_micro_minus_mid_bps.get(10, 0.0), keep_ms=120_000)
+            self._append_metric_history(self.deep_micro_histories[5], ts_ms, deep_micro_minus_mid_bps.get(5, 0.0), keep_ms=10_000)
+            self._append_metric_history(self.deep_micro_histories[10], ts_ms, deep_micro_minus_mid_bps.get(10, 0.0), keep_ms=10_000)
         for level in (5, 10):
-            for window in (7_500, 30_000):
+            for window in (200, 1_000):
                 points = self._metric_values(self.deep_micro_histories[level], ts_ms, window)
                 xs = [(t - ts_ms) / 1000.0 for t, _ in points]
                 ys = [v for _, v in points]
@@ -5029,9 +5109,9 @@ class FeatureEngine:
             "ofi_l3_over_depth_l3": self._safe_div(ofi_by_level[3], cum_bid_by_level[3] + cum_ask_by_level[3], 0.0),
             "ofi_l5_over_depth_l5": self._safe_div(ofi_by_level[5], cum_bid_by_level[5] + cum_ask_by_level[5], 0.0),
             "ofi_l10_over_depth_l10": self._safe_div(ofi_by_level[10], cum_bid_by_level[10] + cum_ask_by_level[10], 0.0),
-            "signed_notional_flow_usd_30000ms": trade_stats_by_ms[30_000]["signed_notional_flow_usd"],
-            "trade_imbalance_notional_30000ms": trade_stats_by_ms[30_000]["trade_imbalance_notional"],
-            "vwap_vs_mid_bps_30000ms": trade_stats_by_ms[30_000]["vwap_vs_mid_bps"],
+            "signed_notional_flow_usd_1000ms": trade_stats_by_ms[1_000]["signed_notional_flow_usd"],
+            "trade_imbalance_notional_1000ms": trade_stats_by_ms[1_000]["trade_imbalance_notional"],
+            "vwap_vs_mid_bps_1000ms": trade_stats_by_ms[1_000]["vwap_vs_mid_bps"],
         }
         for required_name in self.ema_indicator_names:
             if required_name not in indicator_values:
@@ -5086,8 +5166,8 @@ class FeatureEngine:
                 feat_list.append(ofi_sum)
                 feat_list.append(self._safe_div(ofi_sum, depth_l, 0.0))
         for level in ROLLING_OFI_LEVELS:
-            feat_list.append(rolling_ofi_sums[(level, 7_500)] - rolling_ofi_sums[(level, 30_000)])
-            feat_list.append(rolling_ofi_sums[(level, 15_000)] - rolling_ofi_sums[(level, 60_000)])
+            for fast_ms, slow_ms in OFI_ACCEL_PAIRS_MS:
+                feat_list.append(rolling_ofi_sums[(level, fast_ms)] - rolling_ofi_sums[(level, slow_ms)])
         for level in ROLLING_OBI_LEVELS:
             for window in ROLLING_OBI_WINDOWS_MS:
                 mean_val, slope, persistence = rolling_obi_stats[(level, window)]
@@ -5099,10 +5179,10 @@ class FeatureEngine:
                 deep_micro_features[f"vamp_l{level}_minus_mid_bps"],
             ])
         feat_list.extend([
-            deep_micro_features["micro_l5_slope_7500ms"],
-            deep_micro_features["micro_l5_slope_30000ms"],
-            deep_micro_features["micro_l10_slope_7500ms"],
-            deep_micro_features["micro_l10_slope_30000ms"],
+            deep_micro_features["micro_l5_slope_200ms"],
+            deep_micro_features["micro_l5_slope_1000ms"],
+            deep_micro_features["micro_l10_slope_200ms"],
+            deep_micro_features["micro_l10_slope_1000ms"],
             deep_micro_features["micro_l1_minus_micro_l10_bps"],
             deep_micro_features["micro_l5_minus_micro_l20_bps"],
         ])
@@ -5179,6 +5259,7 @@ class FeatureEngine:
             ask_l1_depletion = l1_depletion[ms][1]
             feat_list.extend([
                 spread_delta_bps[ms],
+                self._safe_div(spread_delta_bps[ms], max(abs(spread_bps), 1e-12), 0.0),
                 float(len(self._spread_change_deques[ms])),
                 bid_price_change_count,
                 ask_price_change_count,
@@ -5188,6 +5269,13 @@ class FeatureEngine:
                 ask_l1_depletion,
                 self._safe_div(bid_l1_depletion, max(bsz1, 1e-9), 0.0),
                 self._safe_div(ask_l1_depletion, max(asz1, 1e-9), 0.0),
+            ])
+        for ms in FAST_WINDOWS_MS:
+            window_seconds = max(ms / 1000.0, 1e-12)
+            ob_count = float(len(self._ob_update_deques[ms]))
+            feat_list.extend([
+                ob_count,
+                ob_count / window_seconds,
             ])
         for ms in FAST_WINDOWS_MS:
             rates = replen_rates[ms]
@@ -5240,6 +5328,15 @@ class FeatureEngine:
                 s["sell_trade_premium_bps"],
                 s["aggressor_price_impact_bps"],
             ])
+        feat_list.extend([
+            float(self.last_trade_side_sign),
+            float(self.last_tick_sign),
+            float(self.last_is_zero_tick),
+            float(self.last_is_rpi),
+            float(self.last_trade_notional_usd),
+            float(ts_ms - self.last_buy_trade_ts) if self.last_buy_trade_ts is not None else 0.0,
+            float(ts_ms - self.last_sell_trade_ts) if self.last_sell_trade_ts is not None else 0.0,
+        ])
         for ms in FLOW_WINDOWS_MS:
             c = cvd_stats_by_ms[ms]
             feat_list.extend([
@@ -5247,13 +5344,13 @@ class FeatureEngine:
                 c["cvd_slope_usd_per_sec"],
                 c["cvd_minus_ema_usd"],
             ])
+        for fast_ms, slow_ms in TRADE_IMBALANCE_DIFF_PAIRS_MS:
+            feat_list.append(trade_stats_by_ms[fast_ms]["trade_imbalance_notional"] - trade_stats_by_ms[slow_ms]["trade_imbalance_notional"])
+        for fast_ms, slow_ms in NET_FLOW_DIFF_PAIRS_MS:
+            feat_list.append((trade_stats_by_ms[fast_ms]["signed_notional_flow_usd"] / 100_000.0) - (trade_stats_by_ms[slow_ms]["signed_notional_flow_usd"] / 100_000.0))
+        for fast_ms, slow_ms in OFI_IMBALANCE_DIFF_PAIRS_MS:
+            feat_list.append(self.ofi_pressure_by_window[fast_ms] - self.ofi_pressure_by_window[slow_ms])
         feat_list.extend([
-            trade_stats_by_ms[1_000]["trade_imbalance_notional"] - trade_stats_by_ms[7_500]["trade_imbalance_notional"],
-            trade_stats_by_ms[3_000]["trade_imbalance_notional"] - trade_stats_by_ms[15_000]["trade_imbalance_notional"],
-            trade_stats_by_ms[7_500]["trade_imbalance_notional"] - trade_stats_by_ms[30_000]["trade_imbalance_notional"],
-            (trade_stats_by_ms[3_000]["signed_notional_flow_usd"] / 100_000.0) - (trade_stats_by_ms[30_000]["signed_notional_flow_usd"] / 100_000.0),
-            self.ofi_pressure_by_window[3_000] - self.ofi_pressure_by_window[15_000],
-            self.ofi_pressure_by_window[7_500] - self.ofi_pressure_by_window[30_000],
             trade_burst_features["consecutive_buy_trade_count"],
             trade_burst_features["consecutive_sell_trade_count"],
         ])
@@ -5294,10 +5391,8 @@ class FeatureEngine:
             large_trade_cont_features["ofi_l5_since_last_large_sell"],
             large_trade_cont_features["trade_imbalance_since_last_large_buy"],
             large_trade_cont_features["trade_imbalance_since_last_large_sell"],
-            large_trade_cont_features["large_buy_continuation_bps_7500ms"],
-            large_trade_cont_features["large_buy_continuation_bps_15000ms"],
-            large_trade_cont_features["large_sell_continuation_bps_7500ms"],
-            large_trade_cont_features["large_sell_continuation_bps_15000ms"],
+            *[large_trade_cont_features[f"large_buy_continuation_bps_{ms}ms"] for ms in LARGE_TRADE_CONTINUATION_WINDOWS_MS],
+            *[large_trade_cont_features[f"large_sell_continuation_bps_{ms}ms"] for ms in LARGE_TRADE_CONTINUATION_WINDOWS_MS],
         ])
         for ms in FLOW_WINDOWS_MS:
             s = trade_stats_by_ms[ms]
@@ -5340,8 +5435,7 @@ class FeatureEngine:
                 regime_realized[ms],
                 regime_vol_ewma[ms],
             ])
-            if ms <= 60_000:
-                feat_list.append(regime_flow_snapshot[ms])
+            feat_list.append(regime_flow_snapshot[ms])
             feat_list.extend([
                 dist["realized_up_vol_bps"],
                 dist["realized_down_vol_bps"],
@@ -5610,15 +5704,19 @@ class FeatureEngine:
 
         self.last_tick_sign = int(tick_sign)
         self.last_is_zero_tick = int(is_zero_tick)
-        self.last_trade_price = price
-        self.last_is_rpi = is_rpi
+        self.last_trade_price = float(price)
+        self.last_is_rpi = int(is_rpi)
 
-        notional_usd = price * size
+        notional_usd = float(price) * float(size)
+        self.last_trade_side_sign = float(side_sign)
+        self.last_trade_notional_usd = float(notional_usd)
         if side_sign > 0:
+            self.last_buy_trade_ts = int(ts_ms)
             self.consecutive_buy_trade_count += 1
             self.consecutive_sell_trade_count = 0
             trade_sign = 1
         elif side_sign < 0:
+            self.last_sell_trade_ts = int(ts_ms)
             self.consecutive_sell_trade_count += 1
             self.consecutive_buy_trade_count = 0
             trade_sign = -1
@@ -5665,13 +5763,13 @@ class FeatureEngine:
                 self.last_large_buy_mid = float(mid_now)
                 self.last_large_buy_notional_usd = float(notional_usd)
                 self.last_large_buy_ofi_l5_at_event = float(self.last_ob_ofi_l5)
-                self.last_large_buy_trade_imbalance_at_event = float(self.last_ob_trade_imbalance_30000ms)
+                self.last_large_buy_trade_imbalance_at_event = float(self.last_ob_trade_imbalance_1000ms)
             elif side_sign < 0:
                 self.last_large_sell_ts = int(ts_ms)
                 self.last_large_sell_mid = float(mid_now)
                 self.last_large_sell_notional_usd = float(notional_usd)
                 self.last_large_sell_ofi_l5_at_event = float(self.last_ob_ofi_l5)
-                self.last_large_sell_trade_imbalance_at_event = float(self.last_ob_trade_imbalance_30000ms)
+                self.last_large_sell_trade_imbalance_at_event = float(self.last_ob_trade_imbalance_1000ms)
 
         dt_trade_ms = (
             max(1.0, float(ts_ms - self.last_trade_ts))
@@ -5685,7 +5783,7 @@ class FeatureEngine:
             self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
 
         # VPIN bucket sizing and accumulation per configured bucket scale
-        v_per_sec = max(self.volume_ewma[15_000], 1e-9)
+        v_per_sec = max(self.volume_ewma[1_000], 1e-9)
         for secs, st in self.vpin_state.items():
             Vb = max(v_per_sec * float(secs), 1e-9)
             st["Vb"] = Vb if st["Vb"] is None else (0.9 * st["Vb"] + 0.1 * Vb)
@@ -5826,36 +5924,27 @@ class FeatureEngine:
             or feature_name.startswith("session_")
         ):
             return None
-        if any(tok in feature_name for tok in (
-            "ofi_l", "obi_l", "pressure", "persistence",
-            "micro_l", "vamp_l", "slippage_imbalance",
-            "depth_needed_imbalance", "filled_fraction_imbalance",
-            "trade_burst", "run_length", "trade_sign_entropy",
-            "large_buy_continuation", "large_sell_continuation",
-            "return_since_last_large", "ofi_l5_since_last_large",
-            "trade_imbalance_since_last_large",
-        )):
-            return 60_000
-        if any(
-            tok in feature_name
-            for tok in (
-                "flow_agrees_with_book",
-                "flow_disagrees_with_book",
-                "trade_imbalance_x",
-                "ofi_pressure_x",
-                "micro_premia_x",
-                "signed_flow_over",
-                "abs_signed_flow_over",
-            )
-        ):
-            return 60_000
-        if any(tok in feature_name for tok in ("spread_delta", "ofi_", "obi_", "pressure", "replen", "change_count", "depletion")):
+        fast_tokens = (
+            "spread_delta", "spread_change_count", "bid_price_change", "ask_price_change",
+            "ofi_", "obi_", "pressure", "replen", "add_rate", "rem_rate",
+            "depletion", "ob_update_count", "ob_update_rate",
+        )
+        if any(tok in feature_name for tok in fast_tokens):
+            return 5_000
+        trade_tokens = (
+            "trade", "flow", "cvd", "large_", "vpin", "absorption", "aggressor",
+            "signed_flow", "buy_flow", "sell_flow", "premium", "burst", "tick",
+        )
+        if any(tok in feature_name for tok in trade_tokens):
+            return 10_000
+        price_tokens = (
+            "price", "trend", "return", "vol", "regime", "depth", "liquidity",
+            "slippage", "book_", "spread_mean", "spread_std", "spread_p90",
+            "spread_max", "spread_min", "spread_z", "range", "macd", "micro_l", "vamp_l",
+        )
+        if any(tok in feature_name for tok in price_tokens):
             return 30_000
-        if any(tok in feature_name for tok in ("trade", "flow", "large", "vpin", "cvd", "aggressor", "absorption")):
-            return 60_000
-        if any(tok in feature_name for tok in ("price", "trend", "range", "macd", "return", "vol", "regime", "slippage", "depth", "liquidity", "spread_mean", "spread_std", "spread_p90", "spread_z")):
-            return 120_000
-        return 120_000
+        return 30_000
 
     def _zscore(self, x: np.ndarray, ts_ms: int) -> np.ndarray:
         if x.ndim != 1:
@@ -5865,7 +5954,7 @@ class FeatureEngine:
             raise ValueError(f"_zscore feature length mismatch: got={len(x)} expected={len(names)}")
         if not np.all(np.isfinite(x)):
             raise ValueError("Non-finite values passed to _zscore")
-        x64 = x.astype(np.float64, copy=False)
+        x64 = np.asarray(x, dtype=np.float64)
         dim = int(x64.shape[0])
         self._ensure_zscore_metadata(names, dim)
 
@@ -5878,7 +5967,7 @@ class FeatureEngine:
         if self._feat_dim is None:
             self._feat_dim = dim
             self.z_mean = x64.copy()
-            self.z_var = np.ones_like(x64, dtype=np.float64)
+            self.z_m2 = np.ones_like(x64, dtype=np.float64)
             out = x64.copy()
             out[self._z_mask] = 0.0
             out32 = out.astype(np.float32, copy=False)
@@ -5888,7 +5977,7 @@ class FeatureEngine:
 
         if dim != int(self._feat_dim):
             raise ValueError(f"_zscore feature dimension changed: got={dim} expected={self._feat_dim}")
-        if self.z_mean is None or self.z_var is None:
+        if self.z_mean is None or self.z_m2 is None:
             raise RuntimeError("z-score state is uninitialized despite _feat_dim being set")
 
         out = x64.copy()
@@ -5897,13 +5986,13 @@ class FeatureEngine:
             hl = self._z_half_lives_arr[mask]
             alpha = 1.0 - np.exp(-math.log(2.0) * dt_ms / hl)
             old_mean = self.z_mean[mask]
-            old_var = self.z_var[mask]
+            old_var = self.z_m2[mask]
             x_m = x64[mask]
             diff = x_m - old_mean
             new_mean = old_mean + alpha * diff
             new_var = (1.0 - alpha) * (old_var + alpha * diff * diff)
             self.z_mean[mask] = new_mean
-            self.z_var[mask] = new_var
+            self.z_m2[mask] = new_var
             z = (x_m - new_mean) / np.sqrt(np.maximum(new_var, 1e-6))
             out[mask] = np.clip(z, -10.0, 10.0)
 
