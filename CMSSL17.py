@@ -6423,7 +6423,11 @@ def build_dataset_from_split(dataset_root: str, split_cfg: Dict[str, Any]) -> HF
 # --------------------  Utils ---------------------
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
     metric = metric_name or PRIMARY_METRIC
-    if metric.startswith("dir_auc_q50plus") or metric.startswith("edge_spearman_q50plus"):
+    if (
+        metric.startswith("dir_auc_kept")
+        or metric.startswith("dir_auc_q50plus")
+        or metric.startswith("edge_spearman_q50plus")
+    ):
         return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
