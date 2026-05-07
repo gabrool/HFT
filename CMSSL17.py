@@ -3184,7 +3184,7 @@ class FeatureEngine:
         if len(names) != len(set(names)):
             seen = set()
             duplicates = sorted({n for n in names if n in seen or seen.add(n)})
-            raise ValueError(f"Duplicate feature names in Stage 4 schema: {duplicates[:20]}")
+            raise ValueError(f"Duplicate feature names in 1s maker feature schema: {duplicates[:20]}")
         self._feature_names_cache = list(names)
         return list(self._feature_names_cache)
 
@@ -5007,7 +5007,7 @@ class FeatureEngine:
             den = bid_qty_n + ask_qty_n
             if den > 1e-12:
                 micro_l = (ask_px_n * bid_qty_n + bid_px_n * ask_qty_n) / den
-                # VAMP convention for stage4_v4: same-side weighted average
+                # VAMP convention: same-side weighted average
                 vamp_l = (bid_px_n * bid_qty_n + ask_px_n * ask_qty_n) / den
             else:
                 micro_l = 0.0
@@ -5515,7 +5515,7 @@ class FeatureEngine:
             signed_flow_usd = float(trade_stats_by_ms[ms]["signed_notional_flow_usd"])
             signed_flow_scaled = signed_flow_usd / 100_000.0
             ofi_pressure = float(ofi_pressure_by_ms[ms])
-            realized_vol = float(self.realized_vol[ms])
+            realized_vol = self._realized_vol_for_pressure(ms)
             flow_sign = 1 if trade_imbalance > 0.0 else (-1 if trade_imbalance < 0.0 else 0)
             book_sign = 1 if depth_imbalance_5bps > 0.0 else (-1 if depth_imbalance_5bps < 0.0 else 0)
             flow_agrees_with_book = 1.0 if (flow_sign != 0 and book_sign != 0 and flow_sign == book_sign) else 0.0
@@ -5913,9 +5913,36 @@ class FeatureEngine:
         }
 
     def _realized_vol_for_pressure(self, ms: int) -> float:
-        if ms in self.realized_vol:
-            return float(self.realized_vol.get(ms, 0.0))
-        return float(self.realized_vol.get(3_000, 0.0))
+        """Return a finite realized-vol proxy for pressure/interaction features.
+
+        INTERACTION_WINDOWS_MS and FAST_WINDOWS_MS are intentionally shorter than
+        REGIME_WINDOWS_MS in the 1s maker contract. Therefore self.realized_vol may
+        not contain every requested short window, especially 200ms.
+
+        Priority:
+          1. Use self.realized_vol[ms] when available.
+          2. Use return_histories[ms].mean_var() when available.
+          3. Fall back to the shortest available realized_vol value.
+          4. Return 0.0 only if no volatility state exists yet.
+        """
+        ms_i = int(ms)
+
+        if ms_i in self.realized_vol:
+            val = float(self.realized_vol[ms_i])
+            return val if math.isfinite(val) and val >= 0.0 else 0.0
+
+        stats = self.return_histories.get(ms_i)
+        if stats is not None:
+            _mean, var = stats.mean_var()
+            val = math.sqrt(max(float(var), 0.0))
+            return val if math.isfinite(val) and val >= 0.0 else 0.0
+
+        if self.realized_vol:
+            fallback_ms = min(int(k) for k in self.realized_vol.keys())
+            val = float(self.realized_vol.get(fallback_ms, 0.0))
+            return val if math.isfinite(val) and val >= 0.0 else 0.0
+
+        return 0.0
 
     def _feature_z_half_life_ms(self, feature_name: str) -> Optional[int]:
         if (
@@ -5993,7 +6020,8 @@ class FeatureEngine:
             new_var = (1.0 - alpha) * (old_var + alpha * diff * diff)
             self.z_mean[mask] = new_mean
             self.z_m2[mask] = new_var
-            z = (x_m - new_mean) / np.sqrt(np.maximum(new_var, 1e-6))
+            var_floor = 1e-12
+            z = (x_m - new_mean) / np.sqrt(np.maximum(new_var, var_floor))
             out[mask] = np.clip(z, -10.0, 10.0)
 
         out32 = out.astype(np.float32, copy=False)
@@ -6019,7 +6047,12 @@ class FeatureEngine:
     # Public API
     # -------------------------------------------------------------------------
     def on_fast_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
-        """Fast ingest path for compact tuples emitted by offline_ingest.py."""
+        """Fast ingest path returning decision-row semantics for compact tuples.
+
+        Returns (ts_ms, feature_vector, dt_ms, is_decision, raw_mid). Trade rows
+        update state but are not decision rows, so they return an empty feature
+        vector with is_decision=False.
+        """
         if not isinstance(e, tuple) or len(e) < 4 or not isinstance(e[0], str):
             raise ValueError(f"Expected compact ingest tuple, got: {e!r}")
         etype = e[0].lower()
@@ -6030,7 +6063,8 @@ class FeatureEngine:
             payload = e[3:8]
         else:
             raise ValueError(f"Unsupported compact event type: {etype!r}")
-        return self._dispatch_parsed_event(etype, ts_ms, payload)
+        parsed_ts_ms, feat_z, raw_mid, is_trade, dt_ms = self._dispatch_parsed_event(etype, ts_ms, payload)
+        return parsed_ts_ms, feat_z, dt_ms, (not is_trade), raw_mid
 
     def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
         """Slow compatibility path for callers that still pass generic event shapes."""
