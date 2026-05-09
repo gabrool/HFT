@@ -1,10 +1,10 @@
 
 #!/usr/bin/env python3
 """
-CMSSL17_offline.py
+CM_offline.py
 
 Run CMSSL17's model *using prebuilt tokens* produced by offline_ingest.py.
-This mirrors the training/eval flow in CMSSL17.py but reads dataset splits
+This mirrors the training/eval flow in CM.py but reads dataset splits
 from OUT_ROOT/meta.json and week meta files, avoiding any online feature building.
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
 from offline_tokens import (
@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from CMSSL17 import (  # type: ignore
+from CM import (  # type: ignore
     # model + args
     SAMBA, ModelArgs,
     # core hypers
@@ -57,58 +57,127 @@ WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "1")) == 1
 COMPILE_ENABLED = int(os.environ.get("BYBIT_TORCH_COMPILE", "1")) == 1
-COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "default").strip()
+COMPILE_MODE = os.environ.get("BYBIT_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs").strip()
 LOG_EVERY     = max(1, int(os.environ.get("BYBIT_LOG_EVERY", "100")))
 CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
 
-assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
+TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "5"))
+if TRAIN_ROW_STRIDE < 1:
+    raise ValueError(f"BYBIT_TRAIN_ROW_STRIDE must be >= 1, got {TRAIN_ROW_STRIDE}")
+TRAIN_DATA_DEVICE = os.environ.get("BYBIT_TRAIN_DATA_DEVICE", "cpu_pinned").strip().lower()
+if TRAIN_DATA_DEVICE not in {"cpu", "cpu_pinned", "cuda"}:
+    raise ValueError(f"BYBIT_TRAIN_DATA_DEVICE must be one of cpu, cpu_pinned, cuda; got {TRAIN_DATA_DEVICE!r}")
+_feature_storage_dtype_raw = os.environ.get("BYBIT_FEATURE_STORAGE_DTYPE", "bf16").strip().lower()
+if _feature_storage_dtype_raw in {"fp32", "float32"}:
+    FEATURE_STORAGE_DTYPE = torch.float32
+    FEATURE_STORAGE_DTYPE_NAME = "fp32"
+elif _feature_storage_dtype_raw in {"bf16", "bfloat16"}:
+    FEATURE_STORAGE_DTYPE = torch.bfloat16
+    FEATURE_STORAGE_DTYPE_NAME = "bf16"
+else:
+    raise ValueError("BYBIT_FEATURE_STORAGE_DTYPE must be one of: fp32, float32, bf16, bfloat16")
+BF16_FEATURE_DEBUG = int(os.environ.get("BYBIT_BF16_FEATURE_DEBUG", "0")) == 1
+BF16_FEATURE_DEBUG_MAX_BATCHES = max(1, int(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_MAX_BATCHES", "3")))
+BF16_FEATURE_DEBUG_WARN_MAX_ABS_ERR = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_MAX_ABS_ERR", "0.05"))
+BF16_FEATURE_DEBUG_WARN_MEAN_ABS_ERR = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_MEAN_ABS_ERR", "0.002"))
+BF16_FEATURE_DEBUG_WARN_SIGN_FLIP_FRAC = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_SIGN_FLIP_FRAC", "0.001"))
+BF16_FEATURE_DEBUG_WARN_ZERO_FLIP_FRAC = float(os.environ.get("BYBIT_BF16_FEATURE_DEBUG_WARN_ZERO_FLIP_FRAC", "0.001"))
+USE_SAM = int(os.environ.get("BYBIT_USE_SAM", "1")) == 1
+SAM_RHO = float(os.environ.get("BYBIT_SAM_RHO", "0.01"))
 
-def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
-    if "splits" not in meta:
-        raise KeyError(
-            "meta.json missing required key 'splits'. Run offline_ingest to generate offline dataset metadata."
-        )
-    splits = meta["splits"]
+_BF16_FEATURE_DEBUG_BATCHES_PRINTED = 0
+
+def summarize_bf16_feature_error(x_fp32: torch.Tensor, x_stored: torch.Tensor) -> Dict[str, float]:
+    a = x_fp32.detach().float()
+    b = x_stored.detach().float()
+    if a.shape != b.shape:
+        raise ValueError(f"BF16 debug shape mismatch: fp32={tuple(a.shape)} stored={tuple(b.shape)}")
+    diff = b - a
+    abs_diff = diff.abs()
+    abs_a = a.abs()
+    rel_abs = abs_diff / torch.clamp(abs_a, min=1e-6)
+    finite_b = torch.isfinite(b)
+    finite_both = torch.isfinite(a) & finite_b
+    nonzero_a = abs_a > 0.0
+    sign_flip = ((torch.sign(a) != torch.sign(b)) & nonzero_a & finite_both)
+    zero_flip = (((a == 0.0) != (b == 0.0)) & finite_both)
+    flat_abs = abs_diff.reshape(-1, abs_diff.shape[-1]) if abs_diff.ndim >= 2 else abs_diff.reshape(-1, 1)
+    per_feature_mean_abs = flat_abs.mean(dim=0)
+    return {
+        "max_abs_err": float(abs_diff.max().cpu()),
+        "mean_abs_err": float(abs_diff.mean().cpu()),
+        "p99_abs_err": float(torch.quantile(abs_diff.reshape(-1), 0.99).cpu()),
+        "max_rel_abs_err": float(rel_abs.max().cpu()),
+        "p99_rel_abs_err": float(torch.quantile(rel_abs.reshape(-1), 0.99).cpu()),
+        "sign_flip_frac": float(sign_flip.float().mean().cpu()),
+        "zero_flip_frac": float(zero_flip.float().mean().cpu()),
+        "nonfinite_after_frac": float((~finite_b).float().mean().cpu()),
+        "per_feature_mean_abs_err_max": float(per_feature_mean_abs.max().cpu()),
+    }
+
+def maybe_print_bf16_feature_debug(x_fp32: torch.Tensor, x_stored: torch.Tensor, *, enabled: bool) -> None:
+    global _BF16_FEATURE_DEBUG_BATCHES_PRINTED
+    if not enabled or FEATURE_STORAGE_DTYPE_NAME != "bf16" or _BF16_FEATURE_DEBUG_BATCHES_PRINTED >= BF16_FEATURE_DEBUG_MAX_BATCHES:
+        return
+    batch_i = int(_BF16_FEATURE_DEBUG_BATCHES_PRINTED)
+    _BF16_FEATURE_DEBUG_BATCHES_PRINTED += 1
+    diag = summarize_bf16_feature_error(x_fp32, x_stored)
+    print(
+        "[bf16-feature-debug] "
+        f"batch={batch_i} max_abs_err={diag['max_abs_err']:.6g} mean_abs_err={diag['mean_abs_err']:.6g} "
+        f"p99_abs_err={diag['p99_abs_err']:.6g} max_rel_abs_err={diag['max_rel_abs_err']:.6g} "
+        f"p99_rel_abs_err={diag['p99_rel_abs_err']:.6g} sign_flip_frac={diag['sign_flip_frac']:.6g} "
+        f"zero_flip_frac={diag['zero_flip_frac']:.6g} nonfinite_after_frac={diag['nonfinite_after_frac']:.6g} "
+        f"per_feature_mean_abs_err_max={diag['per_feature_mean_abs_err_max']:.6g}",
+        flush=True,
+    )
+    if (diag["max_abs_err"] > BF16_FEATURE_DEBUG_WARN_MAX_ABS_ERR or diag["mean_abs_err"] > BF16_FEATURE_DEBUG_WARN_MEAN_ABS_ERR or diag["sign_flip_frac"] > BF16_FEATURE_DEBUG_WARN_SIGN_FLIP_FRAC or diag["zero_flip_frac"] > BF16_FEATURE_DEBUG_WARN_ZERO_FLIP_FRAC or diag["nonfinite_after_frac"] > 0.0):
+        print("[bf16-feature-debug-warn] BF16 feature storage may be materially changing features; consider BYBIT_FEATURE_STORAGE_DTYPE=fp32", flush=True)
+
+
+def require_phase1_five_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
+    if "pipeline_splits" not in meta:
+        raise KeyError("meta.json missing required key 'pipeline_splits'. Rerun data_ingest.py.")
+    splits = meta["pipeline_splits"]
     if not isinstance(splits, dict):
-        raise KeyError("meta['splits'] must be a dict. Rerun offline_ingest.")
+        raise KeyError("meta['pipeline_splits'] must be a dict. Rerun data_ingest.py.")
+    if splits.get("protocol") != "five_week_cmssl2w_val_test_rl_eval_v1":
+        raise ValueError("meta['pipeline_splits']['protocol'] must be 'five_week_cmssl2w_val_test_rl_eval_v1'.")
 
-    if "weeks_in_order" not in meta:
-        raise KeyError("meta.json missing required key 'weeks_in_order'. Rerun offline_ingest.")
-    weeks_in_order = meta["weeks_in_order"]
-    if not isinstance(weeks_in_order, list) or len(weeks_in_order) != 4 or not all(isinstance(w, str) and w for w in weeks_in_order):
-        raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 entries. Rerun offline_ingest.")
+    weeks_in_order = meta.get("weeks_in_order")
+    if not isinstance(weeks_in_order, list) or len(weeks_in_order) != 5 or not all(isinstance(w, str) and w for w in weeks_in_order):
+        raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 5 entries.")
 
     decision_time_basis = meta.get("decision_time_basis")
     if decision_time_basis != EXPECTED_DECISION_TIME_BASIS:
-        raise ValueError(
-            "meta.json has incompatible decision_time_basis. "
-            f"Expected '{EXPECTED_DECISION_TIME_BASIS}' (event-time decision timestamps); "
-            f"got {decision_time_basis!r}. "
-            "Rerun offline_ingest to regenerate metadata with event-time decisions enabled."
-        )
-    if "decision_policy" in meta:
-        decision_policy = meta.get("decision_policy")
-        if decision_policy != EXPECTED_DECISION_POLICY:
-            raise ValueError(
-                "meta.json has incompatible decision_policy. "
-                f"Expected '{EXPECTED_DECISION_POLICY}' (event-time decision policy); "
-                f"got {decision_policy!r}. "
-                "Rerun offline_ingest to regenerate metadata with event-time decisions enabled."
-            )
-
-    if splits.get("protocol") != "four_week_cmssl_val_test_rl_eval_v2":
-        raise ValueError(
-            "meta['splits']['protocol'] must be 'four_week_cmssl_val_test_rl_eval_v2'. Rerun offline_ingest."
-        )
-
-    known_weeks = set(weeks_in_order)
+        raise ValueError(f"Expected decision_time_basis={EXPECTED_DECISION_TIME_BASIS!r}, got {decision_time_basis!r}.")
+    if meta.get("decision_policy", EXPECTED_DECISION_POLICY) != EXPECTED_DECISION_POLICY:
+        raise ValueError(f"Expected decision_policy={EXPECTED_DECISION_POLICY!r}, got {meta.get('decision_policy')!r}.")
 
     weeks_meta_map = meta.get("weeks_meta")
     if not isinstance(weeks_meta_map, dict) or not weeks_meta_map:
-        raise KeyError("meta.json missing required non-empty key 'weeks_meta'. Rerun offline_ingest.")
+        raise KeyError("meta.json missing required non-empty key 'weeks_meta'.")
+
+    known_weeks = set(weeks_in_order)
+
+    def _weeks(section: str, name: str | None = None) -> List[str]:
+        obj = splits.get(section)
+        if name is not None:
+            if not isinstance(obj, dict):
+                raise KeyError(f"meta['pipeline_splits']['{section}'] must be a dict")
+            obj = obj.get(name)
+        elif isinstance(obj, dict) and "weeks" in obj:
+            obj = obj.get("weeks")
+        if not isinstance(obj, list) or not obj or not all(isinstance(w, str) and w for w in obj):
+            label = f"{section}.{name}" if name else section
+            raise KeyError(f"meta['pipeline_splits']['{label}'] must be a non-empty list of week keys")
+        missing = sorted(w for w in obj if w not in known_weeks)
+        if missing:
+            raise KeyError(f"pipeline_splits references unknown week key(s): {missing}")
+        return list(obj)
 
     def _full_week_range(week_key: str, stage: str) -> Tuple[int, int]:
         rel_path = weeks_meta_map.get(week_key)
@@ -124,124 +193,34 @@ def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
             raise ValueError(f"Week metadata for {stage} has invalid decision_ts_range: start={start} end={end}.")
         return start, end
 
-    def _normalize_split_entry(stage: str, entry: Any, *, require_range: bool) -> dict:
-        if not isinstance(entry, dict):
-            raise KeyError(f"meta['splits']['{stage}'] must be a dict. Rerun offline_ingest.")
+    def _entry(stage: str, weeks: List[str]) -> dict:
+        starts_ends = [_full_week_range(w, stage) for w in weeks]
+        return {"weeks": weeks, "start": min(se[0] for se in starts_ends), "end": max(se[1] for se in starts_ends)}
 
-        week_value = entry.get("week", entry.get("weeks"))
-        if isinstance(week_value, str) and week_value:
-            weeks = [week_value]
-        elif isinstance(week_value, list) and week_value and all(isinstance(w, str) and w for w in week_value):
-            weeks = list(week_value)
-        else:
-            raise KeyError(
-                f"meta['splits']['{stage}'] must include non-empty 'week' or 'weeks'. Rerun offline_ingest."
-            )
+    week1, week2, week3, week4, week5 = weeks_in_order
+    train_weeks = _weeks("cmssl", "train")
+    val_weeks = _weeks("cmssl", "val")
+    test_weeks = _weeks("cmssl", "test")
+    rl_weeks = _weeks("rl", "train")
+    eval_weeks = _weeks("eval")
+    if train_weeks != [week1, week2] or val_weeks != [week3] or test_weeks != [week4] or rl_weeks != [week4] or eval_weeks != [week5]:
+        raise ValueError("Phase 1 splits must be week1+week2=train, week3=val, week4=test/RL, week5=eval.")
 
-        missing_weeks = sorted(w for w in weeks if w not in known_weeks)
-        if missing_weeks:
-            raise KeyError(
-                f"meta['splits']['{stage}'] references week(s) not present in meta['weeks_in_order']: {missing_weeks}"
-            )
-
-        decision_ts_range = entry.get("decision_ts_range")
-        if require_range:
-            if not isinstance(decision_ts_range, dict):
-                raise KeyError(
-                    f"meta['splits']['{stage}'] must include decision_ts_range with start/end. Rerun offline_ingest."
-                )
-            if "start" not in decision_ts_range or "end" not in decision_ts_range:
-                raise KeyError(
-                    f"meta['splits']['{stage}']['decision_ts_range'] must include start/end. Rerun offline_ingest."
-                )
-            try:
-                start = int(decision_ts_range["start"])
-                end = int(decision_ts_range["end"])
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"meta['splits']['{stage}']['decision_ts_range'] start/end must be integers. Rerun offline_ingest."
-                )
-            if start >= end:
-                raise ValueError(
-                    f"meta['splits']['{stage}']['decision_ts_range'] must satisfy start < end. Rerun offline_ingest."
-                )
-        else:
-            explicit_start = entry.get("start")
-            explicit_end = entry.get("end")
-            if explicit_start is None or explicit_end is None:
-                if isinstance(decision_ts_range, dict):
-                    explicit_start = decision_ts_range.get("start")
-                    explicit_end = decision_ts_range.get("end")
-            if explicit_start is not None and explicit_end is not None:
-                try:
-                    start = int(explicit_start)
-                    end = int(explicit_end)
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        f"meta['splits']['{stage}'] explicit start/end must be integers. Rerun offline_ingest."
-                    )
-            else:
-                start, end = _full_week_range(weeks[0], stage)
-            if start >= end:
-                raise ValueError(
-                    f"meta['splits']['{stage}'] must satisfy start < end. Rerun offline_ingest."
-                )
-
-        return {"weeks": weeks, "start": start, "end": end}
-
-    required_entries = {
-        "cmssl.train": ("cmssl", "train", False),
-        "cmssl.val": ("cmssl", "val", False),
-        "cmssl.test": ("cmssl", "test", False),
-        "rl.train": ("rl", "train", True),
-        "rl.val": ("rl", "val", True),
-        "rl.test": ("rl", "test", True),
-        "eval.full": ("eval", "full", False),
+    normalized = {
+        "protocol": splits["protocol"],
+        "cmssl": {
+            "train": _entry("cmssl.train", train_weeks),
+            "val": _entry("cmssl.val", val_weeks),
+            "test": _entry("cmssl.test", test_weeks),
+        },
+        "rl": {"train": _entry("rl.train", rl_weeks)},
+        "eval": {"full": _entry("eval", eval_weeks)},
     }
-
-    normalized = {"protocol": splits["protocol"]}
-    for section in ("cmssl", "rl", "eval"):
-        sec = splits.get(section)
-        if not isinstance(sec, dict):
-            raise KeyError(f"meta['splits']['{section}'] must be a dict. Rerun offline_ingest.")
-        normalized[section] = {}
-
-    for label, (section, name, require_range) in required_entries.items():
-        normalized[section][name] = _normalize_split_entry(label, splits[section].get(name), require_range=require_range)
-
-    week1, week2, week3, week4 = weeks_in_order
-    if normalized["cmssl"]["train"]["weeks"] != [week1]:
-        raise ValueError("meta['splits']['cmssl']['train'] must reference weeks_in_order[0].")
-    if normalized["cmssl"]["val"]["weeks"] != [week2]:
-        raise ValueError("meta['splits']['cmssl']['val'] must reference weeks_in_order[1].")
-    if normalized["cmssl"]["test"]["weeks"] != [week3]:
-        raise ValueError("meta['splits']['cmssl']['test'] must reference weeks_in_order[2].")
-    if any(normalized["rl"][name]["weeks"] != [week3] for name in ("train", "val", "test")):
-        raise ValueError("meta['splits']['rl'] train/val/test must all reference weeks_in_order[2].")
-    if normalized["eval"]["full"]["weeks"] != [week4]:
-        raise ValueError("meta['splits']['eval']['full'] must reference weeks_in_order[3].")
-
-    rl_train = normalized["rl"]["train"]
-    rl_val = normalized["rl"]["val"]
-    rl_test = normalized["rl"]["test"]
-    if not (rl_train["end"] <= rl_val["start"] < rl_val["end"] <= rl_test["start"] < rl_test["end"]):
-        raise ValueError(
-            "meta['splits']['rl'] train/val/test decision_ts_range must be strictly ordered and non-overlapping."
-        )
-
-    eval_full = normalized["eval"]["full"]
-    if not eval_full["weeks"]:
-        raise ValueError("meta['splits']['eval']['full'] must reference at least one week.")
-
-    return {
-        "splits": normalized,
-        "weeks_in_order": weeks_in_order,
-    }
-
+    return {"splits": normalized, "weeks_in_order": weeks_in_order}
 
 def _label_dim_error(source: str, observed: Any) -> ValueError:
     return ValueError(
-        f"{source} has label_dim={observed!r}, but CMSSL17_offline.py now requires "
+        f"{source} has label_dim={observed!r}, but CM_offline.py now requires "
         f"label_dim={NUM_HORIZONS}. Old offline datasets with 2 * NUM_HORIZONS labels are no longer supported; "
         "rebuild the offline data with offline_ingest.py."
     )
@@ -397,13 +376,16 @@ class NpyChunksDataset(Dataset):
 
         core = np.asarray(Xc[idx_in_file], dtype=np.float32)
         aux  = np.asarray(Xa[idx_in_file], dtype=np.float32)
-        x = np.concatenate([core, aux], axis=-1)
+        x = np.concatenate([core, aux], axis=-1).astype(np.float32, copy=False)
         if not x.flags.writeable:
             x = x.copy()
         y = np.asarray(Y[idx_in_file], dtype=np.float32)
         if not y.flags.writeable:
             y = y.copy()
-        return torch.from_numpy(x), torch.from_numpy(y)
+        x_fp32 = torch.from_numpy(x)
+        x_stored = x_fp32.to(dtype=FEATURE_STORAGE_DTYPE)
+        maybe_print_bf16_feature_debug(x_fp32, x_stored, enabled=BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16")
+        return x_stored, torch.from_numpy(y)
 
 
 def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) -> Tuple[np.ndarray, np.ndarray, int]:
@@ -578,6 +560,74 @@ def quantile_cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, 
     )
     return all(cached_meta.get(k) == current_meta.get(k) for k in required_keys)
 
+def build_directional_noise_filter_mask_np(y_ret: np.ndarray, stats: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | Dict[str, np.ndarray]) -> np.ndarray:
+    if isinstance(stats, dict):
+        pos_lo = np.asarray(stats["pos_lo"], dtype=np.float32)
+        pos_hi = np.asarray(stats["pos_hi"], dtype=np.float32)
+        neg_lo = np.asarray(stats["neg_lo"], dtype=np.float32)
+        neg_hi = np.asarray(stats["neg_hi"], dtype=np.float32)
+    else:
+        pos_lo, pos_hi, neg_lo, neg_hi = [np.asarray(x, dtype=np.float32) for x in stats]
+    y = np.asarray(y_ret, dtype=np.float32)
+    pos = y > 0
+    neg = y < 0
+    mag_neg = -y
+    keep_pos = pos & (y >= pos_lo.reshape(1, -1)) & (y <= pos_hi.reshape(1, -1))
+    keep_neg = neg & (mag_neg >= neg_lo.reshape(1, -1)) & (mag_neg <= neg_hi.reshape(1, -1))
+    return keep_pos | keep_neg
+
+def log_band_label_audit_np(split_name: str, y_ret: np.ndarray, keep: np.ndarray) -> None:
+    y = np.asarray(y_ret, dtype=np.float32)
+    keep = np.asarray(keep, dtype=bool)
+    abs_y = np.abs(y)
+    for h, horizon_ms in enumerate(HORIZONS_MS):
+        signed = y[:, h] != 0.0
+        kept = keep[:, h] & signed
+        zero_frac = float(np.mean(~signed)) if y.shape[0] else float("nan")
+        signed_kept_frac = float(np.mean(kept)) if y.shape[0] else float("nan")
+        pos_kept_frac = float(np.mean(y[kept, h] > 0)) if np.any(kept) else float("nan")
+        neg_kept_frac = float(np.mean(y[kept, h] < 0)) if np.any(kept) else float("nan")
+        pos_frac = float(np.mean(y[signed, h] > 0)) if np.any(signed) else float("nan")
+        print(
+            f"[label-audit split={split_name} h={int(horizon_ms)}] zero_frac={zero_frac:.6f} "
+            f"signed_kept_frac={signed_kept_frac:.6f} pos_kept_frac={pos_kept_frac:.6f} "
+            f"neg_kept_frac={neg_kept_frac:.6f} pos_frac={pos_frac:.6f}",
+            flush=True,
+        )
+        vals_abs = abs_y[kept, h]
+        vals = y[kept, h]
+        if vals_abs.size == 0:
+            continue
+        try:
+            qs = np.quantile(vals_abs, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], method="linear")
+        except TypeError:
+            qs = np.quantile(vals_abs, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], interpolation="linear")
+        bands = ("low", "mid", "high")
+        denom = max(1, int(vals_abs.size))
+        for bi, name in enumerate(bands):
+            lo = float(qs[bi])
+            hi = float(qs[bi + 1])
+            if bi == len(bands) - 1:
+                mask = kept & (abs_y[:, h] >= lo) & (abs_y[:, h] <= hi)
+            else:
+                mask = kept & (abs_y[:, h] >= lo) & (abs_y[:, h] < hi)
+            n = int(np.sum(mask))
+            vv = y[:, h][mask]
+            aa = abs_y[:, h][mask]
+            frac = float(n / denom)
+            abs_p50 = float(np.quantile(aa, 0.50)) if n else float("nan")
+            abs_mean = float(np.mean(aa)) if n else float("nan")
+            abs_p90 = float(np.quantile(aa, 0.90)) if n else float("nan")
+            band_pos_frac = float(np.mean(vv > 0)) if n else float("nan")
+            ret_mean = float(np.mean(vv)) if n else float("nan")
+            ret_std = float(np.std(vv, ddof=0)) if n else float("nan")
+            print(
+                f"[band-label split={split_name} h={int(horizon_ms)} band={name}] "
+                f"n={n} frac={frac:.6f} abs_p50={abs_p50:.6g} abs_mean={abs_mean:.6g} "
+                f"abs_p90={abs_p90:.6g} pos_frac={band_pos_frac:.6f} ret_mean={ret_mean:.6g} ret_std={ret_std:.6g}",
+                flush=True,
+            )
+
 def make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi):
     # Build a label-space noise filter mask (mid-quantile magnitude keeper), not an SSL token mask.
     pos_lo_t = torch.from_numpy(pos_lo)
@@ -651,7 +701,7 @@ def train_from_offline():
     print(f"[meta] trade_history_enabled={trade_history_enabled!r}")
     if "event_stream_mode" in meta:
         print(f"[meta] event_stream_mode={event_stream_mode!r}")
-    splits = require_four_week_pipeline_splits(meta, out_root)
+    splits = require_phase1_five_week_pipeline_splits(meta, out_root)
 
     pca_info = meta.get("pca", {}) or {}
     if pca_info:
@@ -700,8 +750,6 @@ def train_from_offline():
     cmssl_test = splits["splits"]["cmssl"]["test"]
     eval_full = splits["splits"]["eval"]["full"]
     rl_train = splits["splits"]["rl"]["train"]
-    rl_val = splits["splits"]["rl"]["val"]
-    rl_test = splits["splits"]["rl"]["test"]
 
     train_week_keys = cmssl_train["weeks"]
     tr_weeks = keys_to_paths(train_week_keys, "cmssl.train")
@@ -709,16 +757,14 @@ def train_from_offline():
     te_weeks = keys_to_paths(cmssl_test["weeks"], "cmssl.test")
     eval_weeks = keys_to_paths(eval_full["weeks"], "eval.full")
     rl_train_weeks = keys_to_paths(rl_train["weeks"], "rl.train")
-    rl_val_weeks = keys_to_paths(rl_val["weeks"], "rl.val")
-    rl_test_weeks = keys_to_paths(rl_test["weeks"], "rl.test")
 
     if not (tr_weeks and va_weeks and te_weeks):
         raise ValueError("CMSSL split metadata must resolve to at least one week for train/val/test")
 
-    week1, week2, week3, week4 = weeks_order
+    week1, week2, week3, week4, week5 = weeks_order
     print(
         "[cmssl weeks] "
-        f"train=week1({week1}) val=week2({week2}) test=week3({week3}) eval_full=week4({week4}) "
+        f"train=week1+week2({week1},{week2}) val=week3({week3}) test=week4({week4}) eval=week5({week5}) "
         f"| train_keys={train_week_keys} val_keys={cmssl_val['weeks']} test_keys={cmssl_test['weeks']}"
     )
 
@@ -732,7 +778,7 @@ def train_from_offline():
     resolved_split_week_paths = []
     seen_week_meta_paths: set[str] = set()
     for week_group in (
-        tr_weeks, va_weeks, te_weeks, eval_weeks, rl_train_weeks, rl_val_weeks, rl_test_weeks
+        tr_weeks, va_weeks, te_weeks, eval_weeks, rl_train_weeks
     ):
         for wp in week_group:
             wp_key = str(wp)
@@ -887,6 +933,9 @@ def train_from_offline():
         )
         print(f"[dir-mask-cache] saved path={quantile_cache_path}")
     build_directional_noise_filter_mask = make_build_directional_noise_filter_mask_torch(pos_lo, pos_hi, neg_lo, neg_hi)
+    if y_train_for_quant is not None:
+        train_keep_np = build_directional_noise_filter_mask_np(y_train_for_quant, (pos_lo, pos_hi, neg_lo, neg_hi))
+        log_band_label_audit_np("train", y_train_for_quant, train_keep_np)
     horizon_weights = torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32, device=device)
     horizon_weights_cpu = horizon_weights.detach().cpu().to(torch.float64)
     horizon_weights_np = horizon_weights_cpu.numpy()
@@ -945,7 +994,14 @@ def train_from_offline():
     else:
         print("[compile] enabled=False")
     primary_metric_mode = get_primary_metric_mode()
-    opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=0.01)
+    if USE_SAM:
+        opt = SAM(model.parameters(), torch.optim.AdamW, lr=LR, weight_decay=1e-3, rho=SAM_RHO)
+        optimizer_name = "SAM(AdamW)"
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
+        optimizer_name = "AdamW"
+    print(f"[optim-config] optimizer={optimizer_name} use_sam={int(USE_SAM)} lr={LR} weight_decay=1e-3 sam_rho={SAM_RHO}")
+    print(f"[data-config] train_row_stride={TRAIN_ROW_STRIDE} train_data_device={TRAIN_DATA_DEVICE} feature_storage_dtype={FEATURE_STORAGE_DTYPE_NAME}")
     torch.cuda.empty_cache()
 
     # ---------------- Epoch loop ----------------
@@ -1023,6 +1079,8 @@ def train_from_offline():
         pos_rate_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
         logit_mean_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
         logit_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        prob_std_masked = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
+        dir_bal_acc_kept = np.full(NUM_HORIZONS, np.nan, dtype=np.float64)
 
         for h_idx in ([primary_horizon_idx] if primary_only else range(NUM_HORIZONS)):
             if bce_count[h_idx] > 0:
@@ -1045,8 +1103,18 @@ def train_from_offline():
                 pos_rate_masked[h_idx] = float(ypos_cat.float().mean().item())
                 logit_mean_masked[h_idx] = float(logits_cat.mean().item())
                 logit_std_masked[h_idx] = float(logits_cat.std(unbiased=False).item())
+                prob_cat = torch.sigmoid(logits_cat)
+                prob_std_masked[h_idx] = float(prob_cat.std(unbiased=False).item())
+                pred_up = prob_cat >= 0.5
+                truth = ypos_cat.bool()
+                pos_m = truth
+                neg_m = ~truth
+                tpr = float((pred_up[pos_m] == truth[pos_m]).float().mean().item()) if pos_m.any() else float("nan")
+                tnr = float((pred_up[neg_m] == truth[neg_m]).float().mean().item()) if neg_m.any() else float("nan")
+                if math.isfinite(tpr) and math.isfinite(tnr):
+                    dir_bal_acc_kept[h_idx] = 0.5 * (tpr + tnr)
 
-        primary_metric_value, primary_metric_label = compute_primary_metric(auc_masked)
+        primary_metric_value, primary_metric_label = compute_primary_metric({"dir_auc_kept": auc_masked, "dir_bal_acc_kept": dir_bal_acc_kept})
         return {
             "val_bce_unmasked": bce,
             "val_bce_masked": bce_masked,
@@ -1060,6 +1128,9 @@ def train_from_offline():
             "val_pos_rate_masked": pos_rate_masked,
             "val_logit_mean_masked": logit_mean_masked,
             "val_logit_std_masked": logit_std_masked,
+            "dir_auc_kept": auc_masked,
+            "dir_bal_acc_kept": dir_bal_acc_kept,
+            "prob_std_kept": prob_std_masked,
             "primary_metric_value": float(primary_metric_value),
             "primary_metric_label": primary_metric_label,
             "primary_masked_bce": float(bce_masked[primary_horizon_idx]),
@@ -1070,11 +1141,28 @@ def train_from_offline():
     def run_validation(*, full_metrics: bool) -> dict:
         return summarize_directional_metrics(dl_val, primary_only=not full_metrics)
 
+    def make_train_loader_for_epoch(epoch: int) -> DataLoader:
+        n_train = len(ds_train)
+        offset = int(epoch) % int(TRAIN_ROW_STRIDE)
+        indices = np.arange(offset, n_train, TRAIN_ROW_STRIDE, dtype=np.int64)
+        print(f"[train-stride] epoch={epoch} stride={TRAIN_ROW_STRIDE} offset={offset} selected={len(indices)}/{n_train}")
+        return DataLoader(
+            Subset(ds_train, indices.tolist()),
+            BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,
+            num_workers=WORKERS_TRAIN,
+            pin_memory=(TRAIN_DATA_DEVICE == "cpu_pinned"),
+            prefetch_factor=8 if WORKERS_TRAIN > 0 else None,
+            persistent_workers=(WORKERS_TRAIN > 0),
+        )
+
     for epoch in range(EPOCHS):
         early_stop_triggered = False
         model.train()
-        pbar = tqdm(dl_train, desc=f"Ep{epoch+1}/{EPOCHS}")
-        num_train_batches = len(dl_train)
+        dl_train_epoch = make_train_loader_for_epoch(epoch)
+        pbar = tqdm(dl_train_epoch, desc=f"Ep{epoch+1}/{EPOCHS}")
+        num_train_batches = len(dl_train_epoch)
         running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
         running_bce_t = torch.zeros((), device=device, dtype=torch.float32)
         n_batches = 0
@@ -1084,35 +1172,34 @@ def train_from_offline():
             y = y.to(device, non_blocking=True)
             y_ret = y
 
-            opt.base_optimizer.zero_grad(set_to_none=True)
+            if USE_SAM:
+                opt.base_optimizer.zero_grad(set_to_none=True)
+            else:
+                opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                 dir_logits = model(x)
                 bce_loss = compute_directional_loss(dir_logits, y_ret)
                 loss = bce_loss
 
             if not torch.isfinite(loss):
-                raise RuntimeError(
-                    f"Non-finite training loss in SAM pass #1: {float(loss.detach().float().cpu())}"
-                )
+                raise RuntimeError(f"Non-finite training loss: {float(loss.detach().float().cpu())}")
 
             running_bce_t += bce_loss.detach().float()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
-            opt.first_step(zero_grad=True)
-
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
-                dir_logits2 = model(x)
-                bce_loss2 = compute_directional_loss(dir_logits2, y_ret)
-                loss2 = bce_loss2
-
-            if not torch.isfinite(loss2):
-                raise RuntimeError(
-                    f"Non-finite training loss in SAM pass #2: {float(loss2.detach().float().cpu())}"
-                )
-
-            loss2.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
-            opt.second_step(zero_grad=True)
+            if USE_SAM:
+                opt.first_step(zero_grad=True)
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+                    dir_logits2 = model(x)
+                    bce_loss2 = compute_directional_loss(dir_logits2, y_ret)
+                    loss2 = bce_loss2
+                if not torch.isfinite(loss2):
+                    raise RuntimeError(f"Non-finite training loss in SAM pass #2: {float(loss2.detach().float().cpu())}")
+                loss2.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10_000)
+                opt.second_step(zero_grad=True)
+            else:
+                opt.step()
 
             running_loss_t += loss.detach().float()
             n_batches += 1
@@ -1156,7 +1243,8 @@ def train_from_offline():
                     f"logit_std(all)={format_metric(full_val['val_logit_std_all'], '{:.3f}')}  "
                     f"pos_rate(mask)={format_metric(full_val['val_pos_rate_masked'], '{:.3%}')}  "
                     f"logit_mean(mask)={format_metric(full_val['val_logit_mean_masked'], '{:.3f}')}  "
-                    f"logit_std(mask)={format_metric(full_val['val_logit_std_masked'], '{:.3f}')}")
+                    f"logit_std(mask)={format_metric(full_val['val_logit_std_masked'], '{:.3f}')}  "
+                    f"prob_std(kept)={format_metric(full_val['prob_std_kept'], '{:.6f}')}")
                 print(
                     f"[val] primary_metric({primary_metric_label})={primary_metric_value:.6f} "
                     f"[masked_bce_{PRIMARY_METRIC_HORIZON_MS}ms={float(full_val['primary_masked_bce']):.6f}, "
@@ -1169,14 +1257,14 @@ def train_from_offline():
                         "DMODEL": DMODEL, "MAMBA_LAYERS": MAMBA_LAYERS,
                         "feat_dim": F_total, "LOOKBACK": LOOKBACK,
                         "HORIZONS_MS": HORIZONS_MS,
-                        "checkpoint_schema": "cmssl17-direction-only-v1",
+                        "checkpoint_schema": "phase1-direction-only-v1",
                         "trade_history_enabled": trade_history_enabled,
                         "event_stream_mode": event_stream_mode,
                         "decision_time_basis": meta.get("decision_time_basis"),
                     },
                     "best_primary_metric": best,
                 }
-                out_ckpt = out_root / "cmssl17_offline_best.pt"
+                out_ckpt = out_root / "cm_offline_phase1_best.pt"
                 torch.save(ckpt, out_ckpt)
                 print(f"[ckpt] saved best to {out_ckpt}")
             else:
@@ -1210,18 +1298,30 @@ def train_from_offline():
         f"logit_std(all)={format_metric(test_metrics['val_logit_std_all'], '{:.3f}')}  "
         f"pos_rate(mask)={format_metric(test_metrics['val_pos_rate_masked'], '{:.3%}')}  "
         f"logit_mean(mask)={format_metric(test_metrics['val_logit_mean_masked'], '{:.3f}')}  "
-        f"logit_std(mask)={format_metric(test_metrics['val_logit_std_masked'], '{:.3f}')}")
+        f"logit_std(mask)={format_metric(test_metrics['val_logit_std_masked'], '{:.3f}')}  "
+        f"prob_std(kept)={format_metric(test_metrics['prob_std_kept'], '{:.6f}')}")
 
     print("[done] Training complete.")
 
 # ---------------- Lightweight HFTDataset (when loading into RAM) ----------------
 class HFTDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = X.astype(np.float32, copy=False)
-        self.y = y.astype(np.float32, copy=False)
+        x_fp32 = torch.from_numpy(X.astype(np.float32, copy=False))
+        x_stored = x_fp32.to(dtype=FEATURE_STORAGE_DTYPE)
+        maybe_print_bf16_feature_debug(x_fp32[:1], x_stored[:1], enabled=BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16" and len(x_fp32) > 0)
+        if TRAIN_DATA_DEVICE == "cpu_pinned" and torch.cuda.is_available():
+            x_stored = x_stored.pin_memory()
+        elif TRAIN_DATA_DEVICE == "cuda" and torch.cuda.is_available():
+            x_stored = x_stored.cuda(non_blocking=True)
+        self.X = x_stored
+        self.y = torch.from_numpy(y.astype(np.float32, copy=False))
+        if TRAIN_DATA_DEVICE == "cpu_pinned" and torch.cuda.is_available():
+            self.y = self.y.pin_memory()
+        elif TRAIN_DATA_DEVICE == "cuda" and torch.cuda.is_available():
+            self.y = self.y.cuda(non_blocking=True)
     def __len__(self): return int(self.y.shape[0])
-    def __getitem__(self, idx): 
-        return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
 # ---------------- Entry ----------------
 if __name__ == "__main__":

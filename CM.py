@@ -30,13 +30,32 @@ try:
 except ImportError:
     selective_state_update = None
 
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-
-from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
-from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
-
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+try:
+    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+    from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+    from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+except ImportError:
+    class RMSNormGated(nn.Module):
+        def __init__(self, dim, eps=1e-5, norm_before_gate=False, group_size=None, device=None, dtype=None):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+            self.eps = eps
+            self.norm_before_gate = norm_before_gate
+        def forward(self, x, z=None):
+            y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+            return y if z is None else y * torch.sigmoid(z)
+    class ColumnParallelLinear(nn.Linear):
+        def __init__(self, in_features, out_features, bias=True, process_group=None, sequence_parallel=True, **kwargs):
+            super().__init__(in_features, out_features, bias=bias, **kwargs)
+    class RowParallelLinear(nn.Linear):
+        def __init__(self, in_features, out_features, bias=True, process_group=None, sequence_parallel=True, **kwargs):
+            super().__init__(in_features, out_features, bias=bias, **kwargs)
+    def all_reduce(x, process_group=None): return x
+    def reduce_scatter(x, process_group=None): return x
+    mamba_chunk_scan_combined = None
+    mamba_split_conv1d_scan_combined = None
 
 from huggingface_hub import PyTorchModelHubMixin
 
@@ -102,7 +121,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.dt_limit = dt_limit
         self.activation = "silu"
         self.chunk_size = chunk_size
-        self.use_mem_eff_path = True
+        self.use_mem_eff_path = bool(mamba_split_conv1d_scan_combined is not None)
         self.layer_idx = layer_idx
 
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
@@ -470,7 +489,7 @@ CONV_KERNELS    = [3,3,5,5,7,7]
 DFF_CONV        = 2 * DMODEL
 
 # Prediction horizons (in milliseconds)
-HORIZONS_MS     = [250, 500, 1000]
+HORIZONS_MS     = [200, 500, 1000]
 NUM_HORIZONS    = len(HORIZONS_MS)
 HORIZON_WEIGHTS = [0.25, 0.5, 1.0]
 
@@ -480,7 +499,7 @@ LR              = 4e-4
 CLIP_GRAD       = 10000
 PATIENCE        = 15
 # Primary metric config (used for checkpointing + early stopping)
-PRIMARY_METRIC = "masked_auc_1000ms"  # options: "masked_auc_<horizon>ms"
+PRIMARY_METRIC = "dir_auc_kept_1000ms"  # options: "dir_auc_kept_<horizon>ms" or "masked_auc_<horizon>ms"
 PRIMARY_METRIC_HORIZON_MS = 1000
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the base feature vector
@@ -2533,7 +2552,7 @@ class FeatureEngine:
 
 
 class LabelBuilder:
-    def __init__(self, delta_ms: int = 5, horizons_ms: Optional[List[int]] = None):
+    def __init__(self, delta_ms: int = 0, horizons_ms: Optional[List[int]] = None):
         self.delta = int(delta_ms)
         self.horizons = sorted(horizons_ms if horizons_ms is not None else HORIZONS_MS)
         assert len(self.horizons) > 0, "At least one horizon required"
@@ -2584,7 +2603,7 @@ class LabelBuilder:
             for horizon in self.horizons:
                 mid_T = self._price_at(t_delta + int(horizon))
                 mid_T_safe = max(e, mid_T)
-                y_ret = math.log(mid_T_safe / mid0_safe)
+                y_ret = 1.0e4 * math.log(mid_T_safe / mid0_safe)
                 returns.append(y_ret)
 
             out.append(np.array(returns, dtype=np.float32))
@@ -2671,24 +2690,27 @@ def binary_auc_from_logits(logits: torch.Tensor, targets_pos: torch.Tensor) -> f
 
 def get_primary_metric_mode(metric_name: Optional[str] = None) -> str:
     metric = metric_name or PRIMARY_METRIC
-    if metric.startswith("masked_auc_") and metric.endswith("ms"):
+    if metric.startswith("dir_auc_kept") or metric.startswith("masked_auc"):
         return "max"
     raise ValueError(f"Unsupported primary metric '{metric}'")
 
-def compute_primary_metric(val_auc_masked_per_h: Iterable[float]) -> Tuple[float, str]:
+def compute_primary_metric(metric_payload: Iterable[float] | Dict[str, Any]) -> Tuple[float, str]:
     if PRIMARY_METRIC_HORIZON_MS not in HORIZONS_MS:
         raise ValueError(
             f"PRIMARY_METRIC_HORIZON_MS={PRIMARY_METRIC_HORIZON_MS} not in HORIZONS_MS={HORIZONS_MS}"
         )
     idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
-    val_auc_masked_list = list(val_auc_masked_per_h)
-    auc_val = float(val_auc_masked_list[idx]) if idx < len(val_auc_masked_list) else float("nan")
-
-    expected_metric = f"masked_auc_{PRIMARY_METRIC_HORIZON_MS}ms"
-    if PRIMARY_METRIC == expected_metric:
-        if not math.isfinite(auc_val):
-            return float("nan"), expected_metric
-        return auc_val, expected_metric
+    if isinstance(metric_payload, dict):
+        if PRIMARY_METRIC.startswith("dir_auc_kept"):
+            values = metric_payload.get("dir_auc_kept", metric_payload.get("auc_masked", []))
+        else:
+            values = metric_payload.get("masked_auc", metric_payload.get("auc_masked", []))
+    else:
+        values = metric_payload
+    vals = list(values)
+    metric_val = float(vals[idx]) if idx < len(vals) else float("nan")
+    if PRIMARY_METRIC.startswith("dir_auc_kept") or PRIMARY_METRIC.startswith("masked_auc"):
+        return (metric_val if math.isfinite(metric_val) else float("nan")), PRIMARY_METRIC
     raise ValueError(f"Unsupported primary metric '{PRIMARY_METRIC}'")
 
 def is_metric_improved(value: float, best: float, mode: str) -> bool:
