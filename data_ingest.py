@@ -34,8 +34,8 @@ Environment variables (read via os.environ.get in this module):
   BYBIT_CHUNK_SIZE=0                 # default auto-size from RAM budget; set a positive integer to force a fixed chunk size
 
 Shared constants from CMSSL17:
-  LOOKBACK (and related model/data constants) are defined in CMSSL17.py.
-  If these values are intentionally changed, update them in CMSSL17.py.
+  LOOKBACK (and related model/data constants) are defined in CM.py.
+  If these values are intentionally changed, update them in CM.py.
   Decision timestamps are the actual OB event timestamps (event-time).
 """
 
@@ -62,7 +62,9 @@ RAW_BYBIT_WEEKS = os.environ.get("BYBIT_WEEKS", "")
 
 # Optional PCA dimensionality reduction on the core features
 PCA_VAR_TARGET      = float(os.environ.get("BYBIT_PCA_VAR", "0.99"))
-PCA_MAX_SAMPLE_ROWS = int(os.environ.get("BYBIT_PCA_MAX_ROWS", "200000"))
+PCA_MAX_ROWS        = int(os.environ.get("BYBIT_PCA_MAX_ROWS", "200000"))
+if PCA_MAX_ROWS <= 0:
+    raise ValueError(f"BYBIT_PCA_MAX_ROWS must be > 0, got {PCA_MAX_ROWS}")
 PCA_BATCH_SIZE      = int(os.environ.get("BYBIT_PCA_BATCH", "4096"))
 PCA_MODEL_FILENAME  = os.environ.get("BYBIT_PCA_MODEL", "pca_model.npz")
 PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
@@ -311,17 +313,18 @@ def _day_bad_abs_and_total(day_quality: DayQuality) -> Tuple[int, int]:
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-from CMSSL17 import (
+from CM import (
     FeatureEngine,
     LabelBuilder,
     HORIZONS_MS,
     NUM_HORIZONS,
     LOOKBACK,
+    WINDOW_MS,
     AUX_DIM,
     _open_text,
     timestamp_to_ms_half_even,
 )  # keep shared model/data constants only; ingest helpers are local below
-# LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
+# LOOKBACK is a shared model constant from CM (single source of truth).
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = 4096
@@ -732,59 +735,24 @@ def _assert_weeks_consecutive(pairs: List[WeekPair]):
 
 
 
-def build_four_week_pipeline_splits(
-    weeks_in_order: List[str],
-    week_meta_records: Dict[str, Dict[str, object]],
-) -> Dict[str, object]:
-    if len(weeks_in_order) != 4:
+def build_pipeline_splits(week_keys: List[str]) -> Dict[str, Any]:
+    if len(week_keys) != 5:
         raise ValueError(
-            f"build_four_week_pipeline_splits requires exactly 4 weeks; got {len(weeks_in_order)}."
+            f"Phase 1 requires exactly 5 weeks, got {len(week_keys)}: {week_keys}"
         )
 
-    def _decision_range(week_key: str) -> Tuple[int, int]:
-        wk_meta = week_meta_records.get(week_key)
-        if not wk_meta or "decision_ts_range" not in wk_meta:
-            raise ValueError(
-                f"Missing decision_ts_range for week '{week_key}'; cannot derive four-week split boundaries."
-            )
-        decision_range = wk_meta["decision_ts_range"]
-        start = int(decision_range["min"])
-        end_inclusive = int(decision_range["max"])
-        end_exclusive = end_inclusive + 1
-        if end_exclusive <= start:
-            raise ValueError(
-                f"Week '{week_key}' decision_ts_range invalid: min={start} max={end_inclusive}"
-            )
-        return start, end_exclusive
-
-    week1, week2, week3, week4 = weeks_in_order
-    week1_start, week1_end_exclusive = _decision_range(week1)
-    week2_start, week2_end_exclusive = _decision_range(week2)
-    week3_start, week3_end_exclusive = _decision_range(week3)
-    week4_start, week4_end_exclusive = _decision_range(week4)
-
-    week3_40 = week3_start + ((week3_end_exclusive - week3_start) * 4) // 10
-    week3_70 = week3_start + ((week3_end_exclusive - week3_start) * 7) // 10
-
     return {
-        "protocol": "four_week_cmssl_val_test_rl_eval_v2",
+        "protocol": "five_week_cmssl2w_val_test_rl_eval_v1",
         "cmssl": {
-            # All emitted ranges are half-open: [start, end).
-            "train": {"weeks": [week1], "start": week1_start, "end": week1_end_exclusive},
-            "val": {"weeks": [week2], "start": week2_start, "end": week2_end_exclusive},
-            "test": {"weeks": [week3], "start": week3_start, "end": week3_end_exclusive},
+            "train": [week_keys[0], week_keys[1]],
+            "val": [week_keys[2]],
+            "test": [week_keys[3]],
         },
         "rl": {
-            "week": week3,
-            # All emitted ranges are half-open: [start, end).
-            "train": {"week": week3, "decision_ts_range": {"start": week3_start, "end": week3_40}},
-            "val": {"week": week3, "decision_ts_range": {"start": week3_40, "end": week3_70}},
-            "test": {"week": week3, "decision_ts_range": {"start": week3_70, "end": week3_end_exclusive}},
+            "train": [week_keys[3]],
         },
         "eval": {
-            "week": week4,
-            # All emitted ranges are half-open: [start, end).
-            "full": {"weeks": [week4], "start": week4_start, "end": week4_end_exclusive},
+            "weeks": [week_keys[4]],
         },
     }
 
@@ -1948,7 +1916,7 @@ def maybe_fit_pca_model(
         return meta
 
     try:
-        from sklearn.decomposition import IncrementalPCA  # type: ignore
+        from sklearn.decomposition import PCA  # type: ignore
     except Exception as exc:
         print(f"[pca  ] sklearn unavailable ({exc}); skipping PCA fit")
         return meta
@@ -1959,99 +1927,58 @@ def maybe_fit_pca_model(
         print("[pca  ] No training weeks available; skipping PCA fit")
         return meta
 
-    sample_limit = max(1, int(sample_limit))
-    batch_size = int(batch_size)
+    sample_limit = int(sample_limit)
+    if sample_limit <= 0:
+        raise ValueError(f"BYBIT_PCA_MAX_ROWS must be > 0, got {sample_limit}")
 
-    sample_rows: List[np.ndarray] = []
-    sample_array: Optional[np.ndarray] = None
-    pad_rows: Optional[np.ndarray] = None
-    ipca = None
-    fitted_rows = 0
+    sample_parts: List[np.ndarray] = []
+    sample_rows_collected = 0
     total_rows = 0
-    pending: List[np.ndarray] = []
-    n_components = 0
-
-    def flush_pending(force: bool = False):
-        nonlocal pending, fitted_rows, batches, last_log
-        if ipca is None or not pending:
-            return
-        need = max(1, ipca.n_components)
-        thresh = max(need, batch_size) if batch_size > 0 else need
-        if not force and len(pending) < thresh:
-            return
-        arr = np.asarray(pending, dtype=np.float32)
-        actual_rows = arr.shape[0]
-        if actual_rows < need:
-            source = pad_rows if pad_rows is not None and pad_rows.size else sample_array
-            if source is not None and source.shape[0] >= need:
-                pad_needed = need - actual_rows
-                arr = np.vstack([arr, source[:pad_needed]])
-        ipca.partial_fit(arr)
-        fitted_rows += actual_rows
-        batches += 1
-        if time.monotonic() - last_log >= 300:
-            print(f"[pca-fit] fitted={fitted_rows} batches={batches}", flush=True)
-            last_log = time.monotonic()
-        pending = []
-
-    def ensure_ipca(force: bool = False):
-        nonlocal ipca, sample_array, pad_rows, n_components, fitted_rows, last_log
-        if ipca is not None:
-            return
-        if not sample_rows:
-            return
-        if not force and len(sample_rows) < sample_limit:
-            return
-        sample_array = np.asarray(sample_rows, dtype=np.float32)
-        n_components = _select_pca_components(sample_array, target_var)
-        if n_components <= 0:
-            return
-        ipca = IncrementalPCA(
-            n_components=n_components,
-            batch_size=None if batch_size <= 0 else max(batch_size, n_components),
-        )
-        ipca.partial_fit(sample_array)
-        print(f"[pca-init] n_components={n_components} sample_rows={sample_array.shape[0]}", flush=True)
-        last_log = time.monotonic()
-        fitted_rows += sample_array.shape[0]
-        pad_rows = sample_array[:n_components].copy()
-        sample_rows.clear()
-
     for feat in _stream_core_features(train_pairs):
-        total_rows += 1
-        vec = np.asarray(feat, dtype=np.float32)
-        if ipca is None:
-            sample_rows.append(vec)
-            ensure_ipca()
-            continue
-        pending.append(vec)
-        flush_pending()
+        vec = np.asarray(feat, dtype=np.float32).reshape(1, -1)
+        total_rows += int(vec.shape[0])
+        remaining = sample_limit - sample_rows_collected
+        if remaining <= 0:
+            break
+        take = min(remaining, int(vec.shape[0]))
+        sample_parts.append(vec[:take])
+        sample_rows_collected += take
+        if sample_rows_collected >= sample_limit:
+            break
 
-    ensure_ipca(force=True)
-
-    if ipca is None:
+    print(f"[pca] sample_rows={sample_rows_collected} max_rows={sample_limit}", flush=True)
+    if sample_rows_collected <= 0:
         print("[pca  ] Unable to initialise PCA (insufficient data); skipping")
         return meta
 
-    flush_pending(force=True)
+    sample_array = np.concatenate(sample_parts, axis=0).astype(np.float32, copy=False)
+    n_components = _select_pca_components(sample_array, target_var)
+    if n_components <= 0:
+        print("[pca  ] Unable to select PCA components; skipping")
+        return meta
+
+    pca = PCA(n_components=n_components, svd_solver="full")
+    pca.fit(sample_array)
+    fitted_rows = int(sample_array.shape[0])
 
     model_path = os.path.join(out_root, model_filename)
     ensure_dir(os.path.dirname(model_path))
     np.savez(
         model_path,
-        mean=ipca.mean_.astype(np.float32, copy=False),
-        components=ipca.components_.astype(np.float32, copy=False),
-        explained_variance_ratio=ipca.explained_variance_ratio_.astype(np.float32, copy=False),
+        mean=pca.mean_.astype(np.float32, copy=False),
+        components=pca.components_.astype(np.float32, copy=False),
+        explained_variance_ratio=pca.explained_variance_ratio_.astype(np.float32, copy=False),
     )
 
     meta.update(
         {
             "applied": True,
-            "k": int(ipca.n_components),
+            "k": int(n_components),
             "model_path": model_filename,
             "rows_fitted": int(fitted_rows),
             "rows_total": int(total_rows),
-            "sample_rows": int(sample_array.shape[0] if sample_array is not None else 0),
+            "sample_rows": int(sample_array.shape[0]),
+            "max_rows": int(sample_limit),
         }
     )
 
@@ -2388,7 +2315,11 @@ def process_all(
     meta["pca"] = dict(pca_summary)
     if pca_var_ratio is not None:
         meta["pca"]["explained_variance_ratio"] = [float(x) for x in pca_var_ratio]
-    meta["splits"] = build_four_week_pipeline_splits(weeks_in_order, week_meta_records)
+    meta["split_protocol"] = "five_week_cmssl2w_val_test_rl_eval_v1"
+    meta["pipeline_splits"] = build_pipeline_splits(weeks_in_order)
+    meta["label_units"] = "signed_log_return_bps"
+    meta["target_transform"] = "signed_log_return_bps"
+    meta["window_ms"] = int(WINDOW_MS)
     if week_meta_records:
         expected_mode = canonical_mode_fields()
         for wk in weeks_in_order:
@@ -2478,9 +2409,9 @@ def main():
         pairs = [pair for pair in pairs if pair[0] in requested_set]
 
     pairs = _sort_pairs_by_end(pairs)
-    if len(pairs) != 4:
+    if len(pairs) != 5:
         raise ValueError(
-            f"Need exactly 4 distinct consecutive weeks of data after BYBIT_WEEKS filtering; found {len(pairs)}."
+            f"Phase 1 requires exactly 5 distinct consecutive weeks of data after BYBIT_WEEKS filtering; found {len(pairs)}."
         )
 
     _assert_week_order(pairs)
@@ -2499,16 +2430,16 @@ def main():
 
 
     selected_weeks = [wk for wk, _ob, _th in pairs]
-    week1, week2, week3, week4 = selected_weeks
+    week1, week2, week3, week4, week5 = selected_weeks
     print(
-        f"[split] protocol=four_week_cmssl_val_test_rl_eval_v2 cmssl.train={week1} cmssl.val={week2} cmssl.test={week3} rl={week3} eval={week4}"
+        f"[split] protocol=five_week_cmssl2w_val_test_rl_eval_v1 cmssl.train={week1},{week2} cmssl.val={week3} cmssl.test={week4} rl={week4} eval={week5}"
     )
     pca_fit_meta = maybe_fit_pca_model(
         pairs,
         OUT_ROOT,
-        [week1],
+        [week1, week2],
         PCA_VAR_TARGET,
-        PCA_MAX_SAMPLE_ROWS,
+        PCA_MAX_ROWS,
         PCA_BATCH_SIZE,
         PCA_MODEL_FILENAME,
         PCA_USE_EXISTING,
