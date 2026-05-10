@@ -1660,26 +1660,42 @@ class EventFeeder:
         self.collect_quality = bool(collect_quality)
         self.week_qualities: Dict[str, WeekQuality] = {}
         self.quality_by_week: Dict[str, Dict[str, object]] = {}
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
 
     def _put(self, item: Tuple[str, Optional[str], Optional[object]]):
-        self.queue.put(item)
+        while not self.stop_event.is_set():
+            try:
+                self.queue.put(item, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def run(self):
         try:
             for wk, ob_paths, th_paths in self.pairs:
+                if self.stop_event.is_set():
+                    break
                 week_quality: Optional[WeekQuality] = None
                 if self.collect_quality:
                     week_quality = WeekQuality(week_key=wk)
                     self.week_qualities[wk] = week_quality
                 merged = _iter_week_merged_events(wk, ob_paths, th_paths, week_quality=week_quality)
 
+                if self.stop_event.is_set():
+                    break
                 first_event = next(merged, None)
                 if first_event is None:
                     if week_quality is not None:
                         week_quality.recompute_totals()
                         self.quality_by_week[wk] = week_quality.to_dict()
-                    self._put(("first", wk, None))
-                    self._put(("eof", wk, None))
+                    if not self._put(("first", wk, None)):
+                        return
+                    if not self._put(("eof", wk, None)):
+                        return
                     continue
 
                 ts_first = _event_ts(first_event)
@@ -1692,17 +1708,27 @@ class EventFeeder:
 
                 # Forward the compact tuple unchanged so both PCA and main ingest
                 # can use FeatureEngine.on_fast_event(...).
-                self._put(("first", wk, first_event))
+                if not self._put(("first", wk, first_event)):
+                    return
                 for event in merged:
-                    self._put(("evt", wk, event))
+                    if self.stop_event.is_set():
+                        return
+                    if not self._put(("evt", wk, event)):
+                        return
                 if week_quality is not None:
                     week_quality.recompute_totals()
                     self.quality_by_week[wk] = week_quality.to_dict()
-                self._put(("eof", wk, None))
+                if not self._put(("eof", wk, None)):
+                    return
 
-            self._put(("eof", None, None))
+            if not self.stop_event.is_set():
+                self._put(("eof", None, None))
         except Exception as exc:
-            self._put(("eof", None, exc))
+            if not self.stop_event.is_set():
+                try:
+                    self.queue.put(("eof", None, exc), timeout=1.0)
+                except queue.Full:
+                    pass
 
 
 def _stream_core_features(pairs: List[WeekPair]):
@@ -1717,6 +1743,12 @@ def _stream_core_features(pairs: List[WeekPair]):
     stream_started = time.monotonic()
     queue_wait_s = 0.0
     event_proc_s = 0.0
+    event_count = 0
+    decision_count = 0
+    non_decision_count = 0
+    last_heartbeat = time.monotonic()
+    last_event_ts = None
+    last_kind = None
 
     feeder = EventFeeder(pairs, collect_quality=False)
     producer_thread = threading.Thread(target=feeder.run, daemon=True)
@@ -1727,7 +1759,18 @@ def _stream_core_features(pairs: List[WeekPair]):
     try:
         while True:
             t_q = time.monotonic()
-            kind, wk, payload = q.get()
+            try:
+                kind, wk, payload = q.get(timeout=60.0)
+            except queue.Empty:
+                now = time.monotonic()
+                queue_wait_s += now - t_q
+                print(
+                    f"[pca-heartbeat] waiting_for_events elapsed={now - stream_started:.1f}s "
+                    f"events={event_count} decisions={decision_count} non_decisions={non_decision_count} "
+                    f"sample_rows={sample_count} producer_alive={producer_thread.is_alive()} qsize={q.qsize()}",
+                    flush=True,
+                )
+                continue
             queue_wait_s += time.monotonic() - t_q
 
             if kind == "first":
@@ -1736,6 +1779,7 @@ def _stream_core_features(pairs: List[WeekPair]):
                 if payload is None:
                     continue
                 event = payload
+                last_wk = wk
                 print(f"[pca-week] {wk}", flush=True)
             elif kind == "evt":
                 event = payload
@@ -1753,9 +1797,12 @@ def _stream_core_features(pairs: List[WeekPair]):
             if event is None:
                 continue
 
+            event_count += 1
+            last_kind = kind
             t_evt = time.monotonic()
             ts_ms, feat_z, _dt_ms, _is_decision, _mid = fe.on_fast_event(event)
             event_proc_s += time.monotonic() - t_evt
+            last_event_ts = int(ts_ms)
             if last_global_ts is not None and ts_ms < last_global_ts:
                 raise ValueError(
                     "Non-monotonic timestamps across weeks during PCA stream: "
@@ -1763,17 +1810,42 @@ def _stream_core_features(pairs: List[WeekPair]):
                 )
             last_global_ts = int(ts_ms)
             if not _is_decision:
+                non_decision_count += 1
                 if np.asarray(feat_z).shape[0] != 0:
                     raise RuntimeError("Non-decision fast path returned non-empty feature vector during PCA sampling")
+                now = time.monotonic()
+                if now - last_heartbeat >= 60.0:
+                    print(
+                        f"[pca-heartbeat] elapsed={now - stream_started:.1f}s "
+                        f"events={event_count} decisions={decision_count} non_decisions={non_decision_count} "
+                        f"sample_rows={sample_count} wk={wk} ts={last_event_ts} kind={last_kind} qsize={q.qsize()}",
+                        flush=True,
+                    )
+                    last_heartbeat = now
                 continue
+            decision_count += 1
             sample_count += 1
             now = time.monotonic()
-            if now - last_log >= 300:
+            if now - last_log >= 60:
                 print(f"[pca-sample] rows={sample_count} last_wk={last_wk}", flush=True)
                 last_log = now
+            if now - last_heartbeat >= 60.0:
+                print(
+                    f"[pca-heartbeat] elapsed={now - stream_started:.1f}s "
+                    f"events={event_count} decisions={decision_count} non_decisions={non_decision_count} "
+                    f"sample_rows={sample_count} wk={wk} ts={last_event_ts} kind={last_kind} qsize={q.qsize()}",
+                    flush=True,
+                )
+                last_heartbeat = now
             yield np.asarray(feat_z, dtype=np.float32)
     finally:
-        producer_thread.join()
+        feeder.stop()
+        producer_thread.join(timeout=5.0)
+        if producer_thread.is_alive():
+            print(
+                "[pca] feeder thread did not exit after cancellation; continuing after early PCA stop",
+                flush=True,
+            )
         _print_coarse_timing_totals(
             "[pca-time]",
             {
@@ -1890,6 +1962,11 @@ def maybe_fit_pca_model(
         sample_parts.append(vec[:take])
         sample_rows_collected += take
         if sample_rows_collected >= sample_limit:
+            print(
+                f"[pca] reached sample cap rows={sample_rows_collected} "
+                f"max_rows={sample_limit}; stopping feeder",
+                flush=True,
+            )
             break
 
     print(f"[pca] sample_rows={sample_rows_collected} max_rows={sample_limit}", flush=True)
