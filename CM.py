@@ -1774,9 +1774,12 @@ class FeatureEngine:
             t0 = time.perf_counter()
             self._update_trade_windows(ts_ms, payload, dt_ms)
             self.timer_trade_update_s += time.perf_counter() - t0
-            current_mid = float("nan")
-            if self.bb is not None and self.aa is not None and self.bb > 0.0 and self.aa > 0.0:
-                current_mid = 0.5 * (float(self.bb) + float(self.aa))
+
+            # Trade events update trade/state features only.
+            # They must not build feature vectors or create decision rows.
+            bid1, ask1, _, _ = self._book_best()
+            current_mid = 0.5 * (bid1 + ask1) if bid1 > 0.0 and ask1 > 0.0 else 0.0
+
             self.last_ts = ts_ms
             self._last_event_ts = ts_ms
             return ts_ms, np.empty((0,), dtype=np.float32), dt_ms, False, current_mid
