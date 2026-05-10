@@ -8,18 +8,17 @@ Windows are materialized dynamically from flat core/aux/y/ts chunks.
 """
 
 import os, sys, math, json
+from dataclasses import dataclass
 from typing import List, Dict, Tuple, Iterable, Optional, Any
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
 from offline_tokens import (
     read_json,
     load_global_meta,
-    ChunkRef,
 )
 
 # ---------------- Import from CMSSL17 ----------------
@@ -52,6 +51,11 @@ from CM import (  # type: ignore
 # ---------------- Config via env ----------------
 OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
 USE_IN_MEMORY = int(os.environ.get("BYBIT_USE_IN_MEMORY", "0")) == 1
+if USE_IN_MEMORY:
+    raise ValueError(
+        "Phase 1B flat-row dynamic windowing requires BYBIT_USE_IN_MEMORY=0. "
+        "Prebuilt in-memory [N, LOOKBACK, F] datasets are disabled."
+    )
 WORKERS_TRAIN = int(os.environ.get("BYBIT_WORKERS", "8"))
 WORKERS_VAL   = max(1, min(4, WORKERS_TRAIN // 2))
 AMP_ENABLED   = int(os.environ.get("BYBIT_AMP", "1")) == 1
@@ -246,70 +250,134 @@ def validate_loaded_label_array(y: np.ndarray, source: str) -> None:
         raise _label_dim_error(source, y.shape[1])
 
 
-def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[ChunkRef]:
+@dataclass(frozen=True)
+class FlatChunkRef:
+    week_dir: Path
+    core_file: Path
+    aux_file: Path
+    y_file: Path
+    ts_file: Path
+    n: int
+    offset: int
+
+
+PHASE1B_FLAT_FORMAT_ERROR = "This Phase 1B CM_offline.py requires flat_decision_rows_v1. Rerun data_ingest.py."
+
+
+def _require_flat_storage_format(meta: dict, source: str) -> None:
+    if meta.get("storage_format") != "flat_decision_rows_v1":
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} has storage_format={meta.get('storage_format')!r}.")
+
+
+def _validate_flat_dims(meta: dict, source: str) -> None:
+    validate_dataset_label_dim(meta, source)
+    try:
+        aux_dim = int(meta.get("aux_dim", -1))
+        f_total = int(meta.get("feature_dim_total", -1))
+        f_core = int(meta.get("feature_dim_core", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} Invalid feature dimension metadata in {source}: {exc}") from exc
+    if aux_dim != AUX_DIM:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} aux_dim={aux_dim}, expected {AUX_DIM}.")
+    if f_total != f_core + AUX_DIM:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} feature_dim_total={f_total}, feature_dim_core={f_core}, aux_dim={aux_dim}.")
+
+
+def _validate_chunk_arrays(core: np.ndarray, aux: np.ndarray, y: np.ndarray, ts: np.ndarray, *, source: str, expected_core_dim: int) -> None:
+    if core.ndim != 2:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} core must be 2D, got shape={core.shape}.")
+    if aux.ndim != 2:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} aux must be 2D, got shape={aux.shape}.")
+    if y.ndim != 2:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} y must be 2D, got shape={y.shape}.")
+    if ts.ndim != 1:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} ts must be 1D, got shape={ts.shape}.")
+    n = int(core.shape[0])
+    if aux.shape[0] != n or y.shape[0] != n or ts.shape[0] != n:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} core/aux/y/ts row mismatch: core={core.shape} aux={aux.shape} y={y.shape} ts={ts.shape}.")
+    if core.shape[1] != int(expected_core_dim):
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} core dim={core.shape[1]}, expected {expected_core_dim}.")
+    if aux.shape[1] != AUX_DIM:
+        raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} {source} aux dim={aux.shape[1]}, expected {AUX_DIM}.")
+    if y.shape[1] != NUM_HORIZONS:
+        raise _label_dim_error(source, y.shape[1])
+
+
+def build_chunk_refs_by_ts(meta_week_path: Path, start: int, end: int) -> List[FlatChunkRef]:
     """
-    Build ChunkRefs for rows whose timestamps satisfy start <= ts < end.
+    Build FlatChunkRefs for rows whose timestamps satisfy start <= ts < end.
 
     The function performs contiguous slicing per chunk via searchsorted on each
-    chunk's ts file and avoids materializing full boolean masks / index lists.
+    chunk's explicit ts file and avoids filename inference.
     """
     if end < start:
         raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
 
     wmeta = read_json(meta_week_path)
-    validate_dataset_label_dim(wmeta, f"week metadata {meta_week_path}")
+    _require_flat_storage_format(wmeta, f"week metadata {meta_week_path}")
+    _validate_flat_dims(wmeta, f"week metadata {meta_week_path}")
+    expected_core_dim = int(wmeta["feature_dim_core"])
     week_dir = meta_week_path.parent
-    refs: List[ChunkRef] = []
+    refs: List[FlatChunkRef] = []
 
     for idx, ch in enumerate(wmeta.get("chunks", [])):
         files = ch.get("files", {})
-        ts_rel = files.get("ts")
-        if not ts_rel:
-            raise KeyError(
-                f"Chunk {idx} in {meta_week_path} is missing files['ts']; cannot slice by timestamp"
-            )
+        missing = [name for name in ("core", "aux", "y", "ts") if not files.get(name)]
+        if missing:
+            raise ValueError(f"{PHASE1B_FLAT_FORMAT_ERROR} Chunk {idx} in {meta_week_path} is missing files {missing}.")
 
-        ts_arr = np.load(week_dir / ts_rel, mmap_mode="r")
-        if ts_arr.ndim != 1:
-            raise ValueError(
-                f"Expected 1D ts array in chunk {idx} ({week_dir / ts_rel}), got shape={ts_arr.shape}"
-            )
+        core_path = week_dir / files["core"]
+        aux_path = week_dir / files["aux"]
+        y_path = week_dir / files["y"]
+        ts_path = week_dir / files["ts"]
+        core = np.load(core_path, mmap_mode="r")
+        aux = np.load(aux_path, mmap_mode="r")
+        y = np.load(y_path, mmap_mode="r")
+        ts_arr = np.load(ts_path, mmap_mode="r")
+        _validate_chunk_arrays(core, aux, y, ts_arr, source=f"chunk {idx} in {meta_week_path}", expected_core_dim=expected_core_dim)
 
-        # Safety check: searchsorted semantics require non-decreasing input.
         if ts_arr.size > 1 and not np.all(ts_arr[1:] >= ts_arr[:-1]):
-            raise ValueError(
-                f"Timestamp file is not non-decreasing for chunk {idx}: {week_dir / ts_rel}"
-            )
+            raise ValueError(f"Timestamp file is not non-decreasing for chunk {idx}: {ts_path}")
 
         l = int(np.searchsorted(ts_arr, start, side="left"))
         r = int(np.searchsorted(ts_arr, end, side="left"))
-
         if r > l:
-            refs.append(ChunkRef(
+            refs.append(FlatChunkRef(
                 week_dir=week_dir,
-                core_file=week_dir / files["core"],
-                aux_file=week_dir / files["aux"],
-                y_file=week_dir / files["y"],
+                core_file=core_path,
+                aux_file=aux_path,
+                y_file=y_path,
+                ts_file=ts_path,
                 n=r - l,
                 offset=l,
             ))
 
     return refs
 
-# ---------------- Dynamic flat-row datasets ----------------
+# ---------------- Dynamic flat-row batch sources ----------------
 VALIDATE_DYNAMIC_WINDOWS = int(os.environ.get("BYBIT_VALIDATE_DYNAMIC_WINDOWS", "1")) == 1
 
 
-class FlatWindowDataset(Dataset):
-    """Materialize [LOOKBACK, F] windows dynamically from flat decision rows."""
+class _FlatWindowBatchSourceBase:
+    """Vectorized dynamic-window source over flat decision rows."""
 
-    def __init__(self, chunk_refs: List[ChunkRef], feature_dim_total: int, *, split: str):
+    def __init__(self, chunk_refs: List[FlatChunkRef], feature_dim_total: int, *, split: str, batch_size: int,
+                 shuffle: bool, drop_last: bool, row_stride: int, seed: int = 12345):
         self.refs = list(chunk_refs)
         self.F = int(feature_dim_total)
         self.F_core = self.F - AUX_DIM
         self.split = str(split)
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.row_stride = int(row_stride)
+        self.seed = int(seed)
+        self.lookback = int(LOOKBACK)
         if self.F_core <= 0:
             raise ValueError(f"feature_dim_total ({self.F}) must exceed AUX_DIM ({AUX_DIM})")
+        if self.row_stride < 1:
+            raise ValueError(f"row_stride must be >= 1, got {self.row_stride}")
+
         xs: List[np.ndarray] = []
         ys: List[np.ndarray] = []
         ts_parts: List[np.ndarray] = []
@@ -321,12 +389,16 @@ class FlatWindowDataset(Dataset):
             Xc = np.load(ref.core_file, mmap_mode="r")
             Xa = np.load(ref.aux_file, mmap_mode="r")
             Y = np.load(ref.y_file, mmap_mode="r")
-            validate_loaded_label_array(Y, f"label file {ref.y_file}")
-            l = int(ref.offset); r = l + int(ref.n)
+            TS = np.load(ref.ts_file, mmap_mode="r")
+            _validate_chunk_arrays(Xc, Xa, Y, TS, source=f"chunk files under {ref.week_dir}", expected_core_dim=self.F_core)
+            l = int(ref.offset)
+            r = l + int(ref.n)
+            if l < 0 or r > int(Y.shape[0]):
+                raise ValueError(f"Invalid chunk slice offset={l} n={ref.n} for {ref.y_file} rows={Y.shape[0]}")
             core = np.asarray(Xc[l:r], dtype=np.float32)
             aux = np.asarray(Xa[l:r], dtype=np.float32)
-            if core.ndim != 2 or aux.ndim != 2:
-                raise ValueError(f"Flat core/aux chunks must be 2D: {ref.core_file}, {ref.aux_file}")
+            y = np.asarray(Y[l:r], dtype=np.float32)
+            ts = np.asarray(TS[l:r], dtype=np.int64)
             source = str(ref.week_dir)
             if current_source is None:
                 current_source = source
@@ -336,116 +408,269 @@ class FlatWindowDataset(Dataset):
                 current_source = source
                 current_start = cursor
             xs.append(np.concatenate([core, aux], axis=-1).astype(np.float32, copy=False))
-            ys.append(np.asarray(Y[l:r], dtype=np.float32))
-            ts_path = ref.week_dir / Path(str(ref.y_file.name).replace('y_', 'ts_'))
-            if ts_path.exists():
-                ts_parts.append(np.asarray(np.load(ts_path, mmap_mode="r")[l:r], dtype=np.int64))
+            ys.append(y)
+            ts_parts.append(ts)
             cursor += int(r - l)
         if current_source is not None:
             self.segments.append((current_source, current_start, cursor))
         if xs:
-            self.features_fp32 = np.concatenate(xs, axis=0).astype(np.float32, copy=False)
-            self.y = np.concatenate(ys, axis=0).astype(np.float32, copy=False)
-            self.ts = np.concatenate(ts_parts, axis=0).astype(np.int64, copy=False) if ts_parts else np.arange(self.y.shape[0], dtype=np.int64)
+            features_np = np.concatenate(xs, axis=0).astype(np.float32, copy=False)
+            labels_np = np.concatenate(ys, axis=0).astype(np.float32, copy=False)
+            ts_np = np.concatenate(ts_parts, axis=0).astype(np.int64, copy=False)
         else:
-            self.features_fp32 = np.empty((0, self.F), dtype=np.float32)
-            self.y = np.empty((0, NUM_HORIZONS), dtype=np.float32)
-            self.ts = np.empty((0,), dtype=np.int64)
-        if self.features_fp32.shape[1] != self.F:
-            raise ValueError(f"Feature dim mismatch: loaded {self.features_fp32.shape[1]} expected {self.F}")
+            features_np = np.empty((0, self.F), dtype=np.float32)
+            labels_np = np.empty((0, NUM_HORIZONS), dtype=np.float32)
+            ts_np = np.empty((0,), dtype=np.int64)
+        if features_np.ndim != 2 or features_np.shape[1] != self.F:
+            raise ValueError(f"Feature dim mismatch: loaded {features_np.shape} expected [N,{self.F}]")
+        if labels_np.ndim != 2 or labels_np.shape[1] != NUM_HORIZONS:
+            raise _label_dim_error(f"loaded labels for split={self.split}", labels_np.shape[1] if labels_np.ndim == 2 else labels_np.shape)
         valid_parts = []
-        for source, start, end in self.segments:
+        for _source, start, end in self.segments:
             first = int(start + LOOKBACK - 1)
             if end > first:
                 valid_parts.append(np.arange(first, end, dtype=np.int64))
-        self.valid_rows = np.concatenate(valid_parts, axis=0) if valid_parts else np.empty((0,), dtype=np.int64)
-        self.total = int(self.valid_rows.shape[0])
-        self.features = torch.from_numpy(self.features_fp32).to(dtype=FEATURE_STORAGE_DTYPE)
-        self.labels = torch.from_numpy(self.y)
-        if TRAIN_DATA_DEVICE == "cpu_pinned" and torch.cuda.is_available():
-            self.features = self.features.pin_memory()
-            self.labels = self.labels.pin_memory()
-        elif TRAIN_DATA_DEVICE == "cuda" and torch.cuda.is_available():
-            self.features = self.features.cuda(non_blocking=True)
-            self.labels = self.labels.cuda(non_blocking=True)
-        feature_gb = (self.features.numel() * self.features.element_size()) / 1e9
-        label_gb = (self.labels.numel() * self.labels.element_size()) / 1e9
+        self.valid_rows_np = np.concatenate(valid_parts, axis=0) if valid_parts else np.empty((0,), dtype=np.int64)
+        self.n_rows = int(self.valid_rows_np.shape[0])
+        self.raw_rows = int(features_np.shape[0])
+        self.ts_np = ts_np
+        self._finish_tensor_init(features_np, labels_np)
+        self.effective_rows_nominal = int((self.n_rows + self.row_stride - 1) // self.row_stride) if self.row_stride > 1 else int(self.n_rows)
+        self.feature_shape = tuple(self.features.shape)
+        self.feature_gb = float(self.features.numel() * self.features.element_size()) / (1024 ** 3)
+        self.label_index_gb = float(
+            self.labels.numel() * self.labels.element_size() + self.valid_rows.numel() * self.valid_rows.element_size()
+        ) / (1024 ** 3)
+        self._print_startup()
+
+    def _finish_tensor_init(self, features_np: np.ndarray, labels_np: np.ndarray) -> None:
+        raise NotImplementedError
+
+    def _print_startup(self) -> None:
         print(
-            f"[flat-data] split={self.split} rows={self.features_fp32.shape[0]} sources={len(self.segments)} "
-            f"valid_window_rows={self.total} row_stride={(TRAIN_ROW_STRIDE if split=='train' else 1)} "
-            f"effective_rows_nominal={(max(0, (self.total + (TRAIN_ROW_STRIDE if split=='train' else 1) - 1) // (TRAIN_ROW_STRIDE if split=='train' else 1)))} "
-            f"feature_shape={tuple(self.features.shape)} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
-            f"feature_gb={feature_gb:.3f} label_gb={label_gb:.3f} pin_memory={TRAIN_DATA_DEVICE == 'cpu_pinned'}",
+            f"[flat-data] split={self.split} rows={self.raw_rows} sources={len(self.segments)} "
+            f"valid_window_rows={self.n_rows} row_stride={self.row_stride} "
+            f"effective_rows_nominal={self.effective_rows_nominal}",
+            flush=True,
+        )
+        print(
+            f"[flat-data] feature_shape={self.feature_shape} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
+            f"train_data_device={TRAIN_DATA_DEVICE} pin_memory={getattr(self, 'pin_memory', False)} "
+            f"feature_gb={self.feature_gb:.3f} label_index_gb={self.label_index_gb:.3f}",
             flush=True,
         )
 
     def __len__(self) -> int:
-        return self.total
+        n = int(self.effective_rows_nominal)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
 
-    def flat_row_for_dataset_index(self, idx: int) -> int:
-        if idx < 0 or idx >= self.total:
+    def flat_row_for_valid_index(self, idx: int) -> int:
+        if idx < 0 or idx >= self.n_rows:
             raise IndexError(idx)
-        return int(self.valid_rows[int(idx)])
+        return int(self.valid_rows_np[int(idx)])
 
-    def __getitem__(self, idx: int):
-        r = self.flat_row_for_dataset_index(int(idx))
-        lo = r - LOOKBACK + 1
-        hi = r + 1
-        if lo < 0:
-            raise IndexError("Dynamic window would use negative flat row index")
-        x_fp32 = torch.from_numpy(self.features_fp32[lo:hi])
-        x_stored = self.features[lo:hi]
-        maybe_print_bf16_feature_debug(x_fp32, x_stored, enabled=BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16")
-        return x_stored, self.labels[r]
+    def _selected_valid_indices(self, epoch: int) -> Any:
+        raise NotImplementedError
 
-    def iter_epoch(self, epoch: int = 0):
-        stride = TRAIN_ROW_STRIDE if self.split == "train" else 1
-        offset = int(epoch) % int(stride)
-        indices = np.arange(offset, len(self), stride, dtype=np.int64)
-        if self.split == "train":
-            rng = np.random.default_rng(1234 + int(epoch))
-            rng.shuffle(indices)
-        for start in range(0, len(indices), BATCH_SIZE):
-            batch_indices = indices[start:start + BATCH_SIZE]
-            if batch_indices.size == 0:
+    def _batch_from_valid_indices(self, ids: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+    def iter_epoch(self, epoch: int):
+        stride = int(self.row_stride)
+        offset = 0 if stride <= 1 else int(epoch) % stride
+        selected = self._selected_valid_indices(epoch)
+        n = int(selected.numel() if isinstance(selected, torch.Tensor) else selected.size)
+        print(f"[train-stride] split={self.split} epoch={epoch} stride={stride} offset={offset} selected={n}/{self.n_rows}", flush=True) if self.split == "train" else None
+        stop = (n // self.batch_size) * self.batch_size if self.drop_last else n
+        for start in range(0, stop, self.batch_size):
+            end = min(start + self.batch_size, stop)
+            if end <= start:
                 continue
-            xs, ys = zip(*(self[int(i)] for i in batch_indices))
-            yield torch.stack(list(xs), dim=0), torch.stack(list(ys), dim=0)
+            yield self._batch_from_valid_indices(selected[start:end])
 
 
-def validate_dynamic_window_alignment(source: FlatWindowDataset, n_checks: int = 16) -> None:
-    if len(source) <= 0:
-        print(f"[window-check] split={source.split} checks=0 passed=1 (empty)", flush=True)
+class CPUWindowBatchSource(_FlatWindowBatchSourceBase):
+    def __init__(self, chunk_refs: List[FlatChunkRef], feature_dim_total: int, *, split: str, device: torch.device,
+                 batch_size: int, shuffle: bool, drop_last: bool, seed: int = 12345, row_stride: int = 1,
+                 pin_memory: bool = False):
+        self.target_device = device
+        self.device = torch.device("cpu")
+        self.pin_memory = bool(pin_memory and device.type == "cuda" and torch.cuda.is_available())
+        super().__init__(chunk_refs, feature_dim_total, split=split, batch_size=batch_size, shuffle=shuffle,
+                         drop_last=drop_last, row_stride=row_stride, seed=seed)
+
+    def _finish_tensor_init(self, features_np: np.ndarray, labels_np: np.ndarray) -> None:
+        features_fp32 = torch.from_numpy(np.ascontiguousarray(features_np, dtype=np.float32)).float()
+        self.bf16_debug_enabled = bool(BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16")
+        self.features_debug_fp32 = features_fp32 if self.bf16_debug_enabled else None
+        self.features = features_fp32.to(dtype=FEATURE_STORAGE_DTYPE)
+        if self.features_debug_fp32 is None:
+            del features_fp32
+        self.labels = torch.from_numpy(np.ascontiguousarray(labels_np, dtype=np.float32))
+        self.valid_rows = torch.from_numpy(self.valid_rows_np.astype(np.int64, copy=False))
+        self.offsets = torch.arange(LOOKBACK - 1, -1, -1, dtype=torch.long)
+        if self.pin_memory:
+            self.features = self.features.pin_memory()
+            self.labels = self.labels.pin_memory()
+            self.valid_rows = self.valid_rows.pin_memory()
+
+    def _selected_valid_indices(self, epoch: int) -> torch.Tensor:
+        stride = int(self.row_stride)
+        offset = 0 if stride <= 1 else int(epoch) % stride
+        selected = torch.arange(offset, self.n_rows, stride, dtype=torch.long)
+        if self.shuffle and selected.numel() > 0:
+            g = torch.Generator(device="cpu")
+            g.manual_seed(self.seed + int(epoch))
+            selected = selected[torch.randperm(int(selected.numel()), generator=g)]
+        return selected
+
+    def _batch_from_valid_indices(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        rows = self.valid_rows[ids]
+        win_idx = rows[:, None] - self.offsets[None, :]
+        x_cpu = self.features[win_idx]
+        if self.features_debug_fp32 is not None:
+            maybe_print_bf16_feature_debug(self.features_debug_fp32[win_idx], x_cpu, enabled=self.bf16_debug_enabled)
+        y_cpu = self.labels[rows]
+        if self.pin_memory:
+            x_cpu = x_cpu.pin_memory()
+            y_cpu = y_cpu.pin_memory()
+        x = x_cpu.to(self.target_device, non_blocking=self.pin_memory)
+        y = y_cpu.to(self.target_device, non_blocking=self.pin_memory)
+        expected_b = int(ids.numel())
+        if x.shape != (expected_b, LOOKBACK, self.F):
+            raise ValueError(f"Window tensor shape mismatch: got {tuple(x.shape)}, expected {(expected_b, LOOKBACK, self.F)}")
+        if y.ndim != 2 or y.shape[1] != NUM_HORIZONS:
+            raise ValueError(f"Label tensor shape mismatch: got {tuple(y.shape)}")
+        return x, y
+
+
+class GPUWindowBatchSource(_FlatWindowBatchSourceBase):
+    def __init__(self, chunk_refs: List[FlatChunkRef], feature_dim_total: int, *, split: str, device: torch.device,
+                 batch_size: int, shuffle: bool, drop_last: bool, seed: int = 12345, row_stride: int = 1):
+        if device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("BYBIT_TRAIN_DATA_DEVICE=cuda requires a CUDA device")
+        self.device = device
+        self.target_device = device
+        self.pin_memory = False
+        super().__init__(chunk_refs, feature_dim_total, split=split, batch_size=batch_size, shuffle=shuffle,
+                         drop_last=drop_last, row_stride=row_stride, seed=seed)
+
+    def _finish_tensor_init(self, features_np: np.ndarray, labels_np: np.ndarray) -> None:
+        features_fp32 = torch.from_numpy(np.ascontiguousarray(features_np, dtype=np.float32)).to(device=self.device, dtype=torch.float32)
+        self.bf16_debug_enabled = bool(BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16")
+        self.features_debug_fp32 = features_fp32 if self.bf16_debug_enabled else None
+        self.features = features_fp32.to(dtype=FEATURE_STORAGE_DTYPE)
+        if self.features_debug_fp32 is None:
+            del features_fp32
+        self.labels = torch.from_numpy(np.ascontiguousarray(labels_np, dtype=np.float32)).to(device=self.device)
+        self.valid_rows = torch.from_numpy(self.valid_rows_np.astype(np.int64, copy=False)).to(device=self.device)
+        self.offsets = torch.arange(LOOKBACK - 1, -1, -1, device=self.device, dtype=torch.long)
+
+    def _selected_valid_indices(self, epoch: int) -> torch.Tensor:
+        stride = int(self.row_stride)
+        offset = 0 if stride <= 1 else int(epoch) % stride
+        selected = torch.arange(offset, self.n_rows, stride, device=self.device, dtype=torch.long)
+        if self.shuffle and selected.numel() > 0:
+            g = torch.Generator(device=self.device)
+            g.manual_seed(self.seed + int(epoch))
+            selected = selected[torch.randperm(int(selected.numel()), device=self.device, generator=g)]
+        return selected
+
+    def _batch_from_valid_indices(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        rows = self.valid_rows[ids]
+        win_idx = rows[:, None] - self.offsets[None, :]
+        x = self.features[win_idx]
+        if self.features_debug_fp32 is not None:
+            maybe_print_bf16_feature_debug(self.features_debug_fp32[win_idx], x, enabled=self.bf16_debug_enabled)
+        y = self.labels[rows]
+        expected_b = int(ids.numel())
+        if x.shape != (expected_b, LOOKBACK, self.F):
+            raise ValueError(f"Window tensor shape mismatch: got {tuple(x.shape)}, expected {(expected_b, LOOKBACK, self.F)}")
+        if y.ndim != 2 or y.shape[1] != NUM_HORIZONS:
+            raise ValueError(f"Label tensor shape mismatch: got {tuple(y.shape)}")
+        return x, y
+
+
+class MultiWeekTrainBatchSource:
+    def __init__(self, sources: List[Any], seed: int = 12345):
+        if not sources:
+            raise ValueError("MultiWeekTrainBatchSource requires at least one source")
+        self.sources = list(sources)
+        self.seed = int(seed)
+        self.n_rows = sum(int(src.n_rows) for src in self.sources)
+        self.effective_rows_nominal = sum(int(src.effective_rows_nominal) for src in self.sources)
+        self.batch_size = self.sources[0].batch_size
+        for src in self.sources:
+            if src.batch_size != self.batch_size:
+                raise ValueError("All train sources must use the same batch size")
+
+    def __len__(self) -> int:
+        return sum(len(src) for src in self.sources)
+
+    def iter_epoch(self, epoch: int):
+        rng = np.random.default_rng(self.seed + int(epoch))
+        source_order: List[int] = []
+        for i, src in enumerate(self.sources):
+            source_order.extend([i] * len(src))
+        rng.shuffle(source_order)
+        iters = [src.iter_epoch(epoch) for src in self.sources]
+        exhausted = [False] * len(self.sources)
+        for i in source_order:
+            if exhausted[i]:
+                continue
+            try:
+                yield next(iters[i])
+            except StopIteration:
+                exhausted[i] = True
+
+
+def iter_source_batches(source: Any, epoch: int = 0):
+    yield from source.iter_epoch(epoch)
+
+
+def validate_dynamic_window_alignment(source: Any, n_checks: int = 16) -> None:
+    sources = getattr(source, "sources", None)
+    if sources is not None:
+        for child in sources:
+            validate_dynamic_window_alignment(child, n_checks=n_checks)
+        return
+    if int(source.n_rows) <= 0:
+        print(f"[window-check] split={source.split} source={getattr(source, 'source_name', 'flat')} checks=0 passed=1 (empty)", flush=True)
         return
     rng = np.random.default_rng(12345)
-    checks = min(int(n_checks), len(source))
-    picks = rng.choice(len(source), size=checks, replace=False) if len(source) > checks else np.arange(len(source))
-    for idx in picks:
-        r = source.flat_row_for_dataset_index(int(idx))
+    checks = min(int(n_checks), int(source.n_rows))
+    picks = rng.choice(int(source.n_rows), size=checks, replace=False) if int(source.n_rows) > checks else np.arange(int(source.n_rows))
+    for valid_idx in picks:
+        r = source.flat_row_for_valid_index(int(valid_idx))
         lo = r - LOOKBACK + 1
-        x, y = source[int(idx)]
-        if lo < 0 or x.shape != (LOOKBACK, source.F):
-            raise RuntimeError(f"Bad dynamic window shape/alignment idx={idx} r={r} lo={lo} shape={tuple(x.shape)}")
-        if not torch.allclose(x[-1].float(), torch.from_numpy(source.features_fp32[r]).float(), atol=0.0, rtol=0.0):
-            raise RuntimeError(f"Window last row != flat row r for split={source.split} idx={idx} r={r}")
-        if not torch.allclose(y.float(), source.labels[r].float(), atol=0.0, rtol=0.0):
-            raise RuntimeError(f"Window label != y[r] for split={source.split} idx={idx} r={r}")
+        rows_np = np.arange(lo, r + 1, dtype=np.int64)
+        rows = torch.from_numpy(rows_np).to(source.valid_rows.device if isinstance(source.valid_rows, torch.Tensor) else torch.device("cpu"))
+        x = source.features[rows]
+        y = source.labels[r]
+        if lo < 0 or tuple(x.shape) != (LOOKBACK, source.F):
+            raise RuntimeError(f"Bad dynamic window shape/alignment idx={valid_idx} r={r} lo={lo} shape={tuple(x.shape)}")
+        if not torch.allclose(x[-1].float().cpu(), source.features[r].float().cpu(), atol=0.0, rtol=0.0):
+            raise RuntimeError(f"Window last row != flat row r for split={source.split} idx={valid_idx} r={r}")
+        if not torch.allclose(y.float().cpu(), source.labels[r].float().cpu(), atol=0.0, rtol=0.0):
+            raise RuntimeError(f"Window label != y[r] for split={source.split} idx={valid_idx} r={r}")
+        if not rows_np[0] == lo or rows_np[-1] != r:
+            raise RuntimeError(f"Bad row index construction for split={source.split} idx={valid_idx} lo={lo} r={r}")
         if not any(seg_start <= lo and r < seg_end for _name, seg_start, seg_end in source.segments):
-            raise RuntimeError(f"Dynamic window crosses source/week boundary for split={source.split} idx={idx} lo={lo} r={r}")
-    print(f"[window-check] split={source.split} checks={checks} passed=1", flush=True)
+            raise RuntimeError(f"Dynamic window crosses source/week boundary for split={source.split} idx={valid_idx} lo={lo} r={r}")
+    source_name = ",".join(name for name, _s, _e in source.segments) if getattr(source, "segments", None) else "flat"
+    print(f"[window-check] split={source.split} source={source_name} checks={checks} passed=1", flush=True)
 
 
-def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) -> Tuple[np.ndarray, np.ndarray, int]:
-    refs: List[ChunkRef] = []
-    feat_dim = 0
-    for wp in split_week_paths:
-        wm = read_json(wp)
-        feat_dim = int(wm.get("feature_dim_total", feat_dim))
-        refs.extend(build_chunk_refs_by_ts(wp, start, end))
-    ds = FlatWindowDataset(refs, feat_dim, split="in_memory")
-    X = np.stack([ds[i][0].float().numpy() for i in range(len(ds))], axis=0) if len(ds) else np.empty((0, LOOKBACK, feat_dim), np.float32)
-    y = np.stack([ds[i][1].numpy() for i in range(len(ds))], axis=0) if len(ds) else np.empty((0, NUM_HORIZONS), np.float32)
-    return X.astype(np.float32, copy=False), y.astype(np.float32, copy=False), int(feat_dim)
+def source_valid_labels_np(source: Any) -> np.ndarray:
+    sources = getattr(source, "sources", None)
+    if sources is not None:
+        parts = [source_valid_labels_np(child) for child in sources]
+        return np.concatenate(parts, axis=0) if parts else np.empty((0, NUM_HORIZONS), dtype=np.float32)
+    if int(source.n_rows) <= 0:
+        return np.empty((0, NUM_HORIZONS), dtype=np.float32)
+    return source.labels[source.valid_rows].detach().cpu().numpy().astype(np.float32, copy=False)
 
 # ---------------- Directional-noise filter quantiles from TRAIN set ----------------
 def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -694,14 +919,8 @@ def train_from_offline():
     print(f"[amp] enabled={amp_enabled} dtype=bf16")
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
-    if meta.get("storage_format") != "flat_decision_rows_v1":
-        raise ValueError("This Phase 1B CM_offline.py requires flat_decision_rows_v1. Rerun data_ingest.py.")
-    validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
-    meta_aux_dim = int(meta.get("aux_dim", -1))
-    meta_f_total = int(meta.get("feature_dim_total", -1))
-    meta_f_core = int(meta.get("feature_dim_core", -1))
-    if meta_aux_dim != AUX_DIM or meta_f_total != meta_f_core + AUX_DIM:
-        raise ValueError(f"Invalid flat feature dimensions in meta.json: F={meta_f_total} core={meta_f_core} aux={meta_aux_dim}, expected aux={AUX_DIM}")
+    _require_flat_storage_format(meta, f"global metadata {out_root / 'meta.json'}")
+    _validate_flat_dims(meta, f"global metadata {out_root / 'meta.json'}")
     trade_history_enabled = meta.get("trade_history_enabled")
     event_stream_mode = meta.get("event_stream_mode")
     print(f"[meta] trade_history_enabled={trade_history_enabled!r}")
@@ -794,11 +1013,8 @@ def train_from_offline():
 
     for wp in resolved_split_week_paths:
         week_meta = read_json(wp)
-        if week_meta.get("storage_format") != "flat_decision_rows_v1":
-            raise ValueError("This Phase 1B CM_offline.py requires flat_decision_rows_v1. Rerun data_ingest.py.")
-        validate_dataset_label_dim(week_meta, f"week metadata {wp}")
-        if int(week_meta.get("aux_dim", -1)) != AUX_DIM:
-            raise ValueError(f"Week metadata aux_dim mismatch in {wp}: {week_meta.get('aux_dim')} != {AUX_DIM}")
+        _require_flat_storage_format(week_meta, f"week metadata {wp}")
+        _validate_flat_dims(week_meta, f"week metadata {wp}")
         if week_meta.get("trade_history_enabled") != trade_history_enabled:
             raise ValueError(
                 "trade_history_enabled mismatch between global metadata and week metadata: "
@@ -853,66 +1069,52 @@ def train_from_offline():
                 f"path={quantile_cache_path} (quantile prepass required)"
             )
 
-    if USE_IN_MEMORY:
-        X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
-        X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
-        X_te, y_te, feat_dim3 = load_split_in_memory_ts(te_weeks, te_start, te_end)
-        assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
-        print(
-            f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={len(y_tr)} "
-            f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
+    def refs_for_weeks_timerange(weeks: List[Path], start: int, end: int) -> List[FlatChunkRef]:
+        refs: List[FlatChunkRef] = []
+        for wp in weeks:
+            refs.extend(build_chunk_refs_by_ts(wp, start, end))
+        return refs
+
+    def make_source(refs: List[FlatChunkRef], *, split: str, shuffle: bool, drop_last: bool, row_stride: int) -> Any:
+        if TRAIN_DATA_DEVICE == "cuda":
+            return GPUWindowBatchSource(
+                refs, F_total, split=split, device=device, batch_size=BATCH_SIZE,
+                shuffle=shuffle, drop_last=drop_last, row_stride=row_stride,
+            )
+        return CPUWindowBatchSource(
+            refs, F_total, split=split, device=device, batch_size=BATCH_SIZE,
+            shuffle=shuffle, drop_last=drop_last, row_stride=row_stride,
+            pin_memory=(TRAIN_DATA_DEVICE == "cpu_pinned"),
         )
 
-        # Build in-RAM datasets
-        ds_train = HFTDataset(X_tr, y_tr)
-        ds_val   = HFTDataset(X_va, y_va)
-        ds_test  = HFTDataset(X_te, y_te)
-        print(
-            f"[offline-data] train windows={len(ds_train)}, "
-            f"val windows={len(ds_val)}, test windows={len(ds_test)}"
-        )
-        if VALIDATE_DYNAMIC_WINDOWS:
-            validate_dynamic_window_alignment(ds_train)
-            validate_dynamic_window_alignment(ds_val)
-            validate_dynamic_window_alignment(ds_test)
-        # we still need y_tr to build directional mask quantiles unless cache hit
-        y_train_for_quant = None if cached_bounds is not None else y_tr
+    train_sources = [
+        make_source(build_chunk_refs_by_ts(wp, tr_start, tr_end), split="train", shuffle=True, drop_last=True, row_stride=TRAIN_ROW_STRIDE)
+        for wp in tr_weeks
+    ]
+    train_source = MultiWeekTrainBatchSource(train_sources) if len(train_sources) > 1 else train_sources[0]
+    va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
+    te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
+    val_source = make_source(va_refs, split="val", shuffle=False, drop_last=False, row_stride=1)
+    test_source = make_source(te_refs, split="test", shuffle=False, drop_last=False, row_stride=1)
+    print(
+        f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={sum(src.raw_rows for src in train_sources)} "
+        f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
+        f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
+    )
+    print(
+        f"[offline-data] train windows={train_source.n_rows}, "
+        f"val windows={val_source.n_rows}, test windows={test_source.n_rows}"
+    )
+    if VALIDATE_DYNAMIC_WINDOWS:
+        validate_dynamic_window_alignment(train_source)
+        validate_dynamic_window_alignment(val_source)
+        validate_dynamic_window_alignment(test_source)
 
+    # Build y_train_for_quant without loading features into RAM unless cache hit.
+    if cached_bounds is not None:
+        y_train_for_quant = None
     else:
-        def refs_for_weeks_timerange(weeks: List[Path], start: int, end: int) -> List[ChunkRef]:
-            refs: List[ChunkRef] = []
-            for wp in weeks:
-                refs.extend(build_chunk_refs_by_ts(wp, start, end))
-            return refs
-
-        tr_refs = refs_for_weeks_timerange(tr_weeks, tr_start, tr_end)
-        va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
-        te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
-        print(
-            f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
-            f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
-            f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
-        )
-
-        ds_train = FlatWindowDataset(tr_refs, F_total, split="train")
-        ds_val   = FlatWindowDataset(va_refs, F_total, split="val")
-        ds_test  = FlatWindowDataset(te_refs, F_total, split="test")
-        print(
-            f"[offline-data] train windows={len(ds_train)}, "
-            f"val windows={len(ds_val)}, test windows={len(ds_test)}"
-        )
-        if VALIDATE_DYNAMIC_WINDOWS:
-            validate_dynamic_window_alignment(ds_train)
-            validate_dynamic_window_alignment(ds_val)
-            validate_dynamic_window_alignment(ds_test)
-
-        # Build y_train_for_quant without loading features into RAM unless cache hit.
-        if cached_bounds is not None:
-            y_train_for_quant = None
-        elif len(ds_train) == 0:
-            y_train_for_quant = np.empty((0, NUM_HORIZONS), dtype=np.float32)
-        else:
-            y_train_for_quant = ds_train.y[ds_train.valid_rows].astype(np.float32, copy=False)
+        y_train_for_quant = source_valid_labels_np(train_source)
 
 
     # ---------------- directional-noise filter quantiles & loss closure ----------------
@@ -953,34 +1155,7 @@ def train_from_offline():
                 formatted.append(f"{horizon}ms:{fmt.format(val)}")
         return '[' + ', '.join(formatted) + ']'
 
-    # ---------------- DataLoaders ----------------
-    dl_train = DataLoader(
-        ds_train,
-        BATCH_SIZE,
-        shuffle=True,
-        drop_last=True,
-        num_workers=WORKERS_TRAIN,
-        pin_memory=True,
-        prefetch_factor=8 if WORKERS_TRAIN > 0 else None,
-        persistent_workers=(WORKERS_TRAIN > 0),
-    )
-    dl_val = DataLoader(
-        ds_val,
-        BATCH_SIZE,
-        shuffle=False,
-        num_workers=max(1, WORKERS_VAL),
-        pin_memory=True,
-        persistent_workers=(max(1, WORKERS_VAL) > 0),
-    )
-    dl_test = DataLoader(
-        ds_test,
-        BATCH_SIZE,
-        shuffle=False,
-        num_workers=max(1, WORKERS_VAL),
-        pin_memory=True,
-        persistent_workers=(max(1, WORKERS_VAL) > 0),
-    )
-
+    # ---------------- Vectorized batch sources are built above ----------------
     # ---------------- Model ----------------
     args = ModelArgs(DMODEL, MAMBA_LAYERS, F_total, LOOKBACK)
     model = SAMBA(args).to(device)
@@ -1011,7 +1186,7 @@ def train_from_offline():
     no_imp = 0
     primary_horizon_idx = HORIZONS_MS.index(PRIMARY_METRIC_HORIZON_MS)
 
-    def summarize_directional_metrics(dl: DataLoader, *, primary_only: bool) -> dict:
+    def summarize_directional_metrics(batch_source: Any, *, primary_only: bool) -> dict:
         model.eval()
         logits_all = [[] for _ in range(NUM_HORIZONS)]
         ypos_all = [[] for _ in range(NUM_HORIZONS)]
@@ -1027,7 +1202,7 @@ def train_from_offline():
         masked_total = np.zeros(NUM_HORIZONS, dtype=np.float64)
 
         with torch.no_grad():
-            for x, y in dl:
+            for x, y in batch_source.iter_epoch(0):
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 y_ret = y
@@ -1141,30 +1316,14 @@ def train_from_offline():
         }
 
     def run_validation(*, full_metrics: bool) -> dict:
-        return summarize_directional_metrics(dl_val, primary_only=not full_metrics)
-
-    def make_train_loader_for_epoch(epoch: int) -> DataLoader:
-        n_train = len(ds_train)
-        offset = int(epoch) % int(TRAIN_ROW_STRIDE)
-        indices = np.arange(offset, n_train, TRAIN_ROW_STRIDE, dtype=np.int64)
-        print(f"[train-stride] epoch={epoch} stride={TRAIN_ROW_STRIDE} offset={offset} selected={len(indices)}/{n_train}")
-        return DataLoader(
-            Subset(ds_train, indices.tolist()),
-            BATCH_SIZE,
-            shuffle=True,
-            drop_last=True,
-            num_workers=WORKERS_TRAIN,
-            pin_memory=(TRAIN_DATA_DEVICE == "cpu_pinned"),
-            prefetch_factor=8 if WORKERS_TRAIN > 0 else None,
-            persistent_workers=(WORKERS_TRAIN > 0),
-        )
+        return summarize_directional_metrics(val_source, primary_only=not full_metrics)
 
     for epoch in range(EPOCHS):
         early_stop_triggered = False
         model.train()
-        dl_train_epoch = make_train_loader_for_epoch(epoch)
-        pbar = tqdm(dl_train_epoch, desc=f"Ep{epoch+1}/{EPOCHS}")
-        num_train_batches = len(dl_train_epoch)
+        train_batches = train_source.iter_epoch(epoch)
+        pbar = tqdm(train_batches, desc=f"Ep{epoch+1}/{EPOCHS}", total=len(train_source))
+        num_train_batches = len(train_source)
         running_loss_t = torch.zeros((), device=device, dtype=torch.float32)
         running_bce_t = torch.zeros((), device=device, dtype=torch.float32)
         n_batches = 0
@@ -1285,7 +1444,7 @@ def train_from_offline():
         # if no_imp > 50: break
 
     # ---------------- Test Evaluation ----------------
-    test_metrics = summarize_directional_metrics(dl_test, primary_only=False)
+    test_metrics = summarize_directional_metrics(test_source, primary_only=False)
     print(
         f"[test] BCE(all)={format_metric(test_metrics['val_bce_unmasked'], '{:.4e}')}  "
         f"Acc(all)={format_metric(test_metrics['val_acc'], '{:.4f}')}  "
@@ -1305,36 +1464,9 @@ def train_from_offline():
 
     print("[done] Training complete.")
 
-# ---------------- Lightweight HFTDataset (when loading into RAM) ----------------
-class HFTDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        x_fp32 = torch.from_numpy(X.astype(np.float32, copy=False))
-        x_stored = x_fp32.to(dtype=FEATURE_STORAGE_DTYPE)
-        maybe_print_bf16_feature_debug(x_fp32[:1], x_stored[:1], enabled=BF16_FEATURE_DEBUG and FEATURE_STORAGE_DTYPE_NAME == "bf16" and len(x_fp32) > 0)
-        if TRAIN_DATA_DEVICE == "cpu_pinned" and torch.cuda.is_available():
-            x_stored = x_stored.pin_memory()
-        elif TRAIN_DATA_DEVICE == "cuda" and torch.cuda.is_available():
-            x_stored = x_stored.cuda(non_blocking=True)
-        self.X = x_stored
-        self.y = torch.from_numpy(y.astype(np.float32, copy=False))
-        if TRAIN_DATA_DEVICE == "cpu_pinned" and torch.cuda.is_available():
-            self.y = self.y.pin_memory()
-        elif TRAIN_DATA_DEVICE == "cuda" and torch.cuda.is_available():
-            self.y = self.y.cuda(non_blocking=True)
-    def __len__(self): return int(self.y.shape[0])
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-
 def _validate_flat_global_meta(meta: dict, out_root: Path) -> None:
-    if meta.get("storage_format") != "flat_decision_rows_v1":
-        raise ValueError("This Phase 1B CM_offline.py requires flat_decision_rows_v1. Rerun data_ingest.py.")
-    validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
-    aux_dim = int(meta.get("aux_dim", -1))
-    f_total = int(meta.get("feature_dim_total", -1))
-    f_core = int(meta.get("feature_dim_core", -1))
-    if aux_dim != AUX_DIM or f_total != f_core + AUX_DIM:
-        raise ValueError(f"Invalid flat feature dimensions: F={f_total} core={f_core} aux={aux_dim}")
+    _require_flat_storage_format(meta, f"global metadata {out_root / 'meta.json'}")
+    _validate_flat_dims(meta, f"global metadata {out_root / 'meta.json'}")
 
 
 def build_sources_for_debug(out_root_str: str) -> Dict[str, Any]:
@@ -1345,29 +1477,58 @@ def build_sources_for_debug(out_root_str: str) -> Dict[str, Any]:
     weeks_order = splits["weeks_in_order"]
     weeks_meta_map = meta.get("weeks_meta", {})
     key_to_meta = {wk: out_root / weeks_meta_map[wk] for wk in weeks_order if wk in weeks_meta_map}
+
     def paths(keys: List[str]) -> List[Path]:
+        missing = [k for k in keys if k not in key_to_meta]
+        if missing:
+            raise KeyError(f"Split references unknown week key(s): {missing}")
         return [key_to_meta[k] for k in keys]
-    def refs_for(weeks: List[Path], start: int, end: int) -> List[ChunkRef]:
-        refs: List[ChunkRef] = []
+
+    def refs_for(weeks: List[Path], start: int, end: int) -> List[FlatChunkRef]:
+        refs: List[FlatChunkRef] = []
         for wp in weeks:
             wm = read_json(wp)
-            if wm.get("storage_format") != "flat_decision_rows_v1":
-                raise ValueError("This Phase 1B CM_offline.py requires flat_decision_rows_v1. Rerun data_ingest.py.")
+            _require_flat_storage_format(wm, f"week metadata {wp}")
+            _validate_flat_dims(wm, f"week metadata {wp}")
             refs.extend(build_chunk_refs_by_ts(wp, start, end))
         return refs
+
     f_total = int(meta["feature_dim_total"])
     cmssl = splits["splits"]["cmssl"]
-    train = cmssl["train"]; val = cmssl["val"]; test = cmssl["test"]
+    train = cmssl["train"]
+    val = cmssl["val"]
+    test = cmssl["test"]
+    eval_full = splits["splits"]["eval"]["full"]
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    def make_debug_source(refs: List[FlatChunkRef], *, split: str, shuffle: bool, drop_last: bool, row_stride: int) -> Any:
+        if TRAIN_DATA_DEVICE == "cuda":
+            return GPUWindowBatchSource(
+                refs, f_total, split=split, device=device, batch_size=BATCH_SIZE,
+                shuffle=shuffle, drop_last=drop_last, row_stride=row_stride,
+            )
+        return CPUWindowBatchSource(
+            refs, f_total, split=split, device=device, batch_size=BATCH_SIZE,
+            shuffle=shuffle, drop_last=drop_last, row_stride=row_stride,
+            pin_memory=(TRAIN_DATA_DEVICE == "cpu_pinned"),
+        )
+
+    train_sources = [
+        make_debug_source(refs_for([wp], int(train["start"]), int(train["end"])), split="train", shuffle=True, drop_last=True, row_stride=TRAIN_ROW_STRIDE)
+        for wp in paths(train["weeks"])
+    ]
     sources = {
-        "train": FlatWindowDataset(refs_for(paths(train["weeks"]), int(train["start"]), int(train["end"])), f_total, split="train"),
-        "val": FlatWindowDataset(refs_for(paths(val["weeks"]), int(val["start"]), int(val["end"])), f_total, split="val"),
-        "test": FlatWindowDataset(refs_for(paths(test["weeks"]), int(test["start"]), int(test["end"])), f_total, split="test"),
+        "train": MultiWeekTrainBatchSource(train_sources) if len(train_sources) > 1 else train_sources[0],
+        "val": make_debug_source(refs_for(paths(val["weeks"]), int(val["start"]), int(val["end"])), split="val", shuffle=False, drop_last=False, row_stride=1),
+        "test": make_debug_source(refs_for(paths(test["weeks"]), int(test["start"]), int(test["end"])), split="test", shuffle=False, drop_last=False, row_stride=1),
+        "eval": make_debug_source(refs_for(paths(eval_full["weeks"]), int(eval_full["start"]), int(eval_full["end"])), split="eval", shuffle=False, drop_last=False, row_stride=1),
         "feature_dim_total": f_total,
     }
     if VALIDATE_DYNAMIC_WINDOWS:
         validate_dynamic_window_alignment(sources["train"])
         validate_dynamic_window_alignment(sources["val"])
         validate_dynamic_window_alignment(sources["test"])
+        validate_dynamic_window_alignment(sources["eval"])
     return sources
 
 # ---------------- Entry ----------------
