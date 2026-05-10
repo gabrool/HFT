@@ -1025,6 +1025,14 @@ class FlushJob:
 
 
 class ChunkWriter:
+    """Flat chronological decision-row writer.
+
+    Rows are appended immediately at decision time and labels are filled later by
+    row index.  A chunk is persisted only when every row in that chunk has a
+    finite label; finalization drops the unlabeled tail whose horizons never
+    matured.
+    """
+
     def __init__(
         self,
         out_dir: str,
@@ -1045,97 +1053,114 @@ class ChunkWriter:
         self.core_dtype = np.float32
         self.flush_callback = flush_callback
 
-        total_bytes_per_seq = (
-            (self.L * self.F_core * 4)
-            + (self.L * AUX_DIM * 4)
+        total_bytes_per_row = (
+            (self.F_core * 4)
+            + (AUX_DIM * 4)
             + (NUM_HORIZONS * 4)
             + 8
         )
         if chunk_size_override > 0:
             self.N = int(chunk_size_override)
         else:
-            auto_n = max(256, int((ram_budget_mb * 1024 * 1024) // total_bytes_per_seq))
-            safety_cap = max(256, int((2 * 1024 * 1024 * 1024) // max(1, total_bytes_per_seq)))
+            auto_n = max(256, int((ram_budget_mb * 1024 * 1024) // total_bytes_per_row))
+            safety_cap = max(256, int((2 * 1024 * 1024 * 1024) // max(1, total_bytes_per_row)))
             self.N = min(auto_n, safety_cap)
 
-        self.X_core: np.ndarray
-        self.X_aux: np.ndarray
-        self.Y: np.ndarray
-        self.TS: np.ndarray
-        self._alloc_buffers()
-        self.i = 0
+        self.chunks: Dict[int, Dict[str, Any]] = {}
         self.cid = int(start_chunk_id)
+        self.next_flush_cid = int(start_chunk_id)
+        self.row_count_total = 0
         self.chunks_meta = []
+        self._ensure_chunk(self.cid)
 
-    def _alloc_buffers(self) -> None:
-        self.X_core = np.empty((self.N, self.L, self.F_core), dtype=np.float32)
-        self.X_aux = np.empty((self.N, self.L, AUX_DIM), dtype=np.float32)
-        self.Y = np.empty((self.N, NUM_HORIZONS), dtype=np.float32)
-        self.TS = np.empty((self.N,), dtype=np.int64)
+    def _new_chunk(self) -> Dict[str, Any]:
+        return {
+            "core": np.empty((self.N, self.F_core), dtype=np.float32),
+            "aux": np.empty((self.N, AUX_DIM), dtype=np.float32),
+            "y": np.full((self.N, NUM_HORIZONS), np.nan, dtype=np.float32),
+            "ts": np.empty((self.N,), dtype=np.int64),
+            "n": 0,
+            "labels_set": 0,
+        }
 
-    def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, y: np.ndarray):
-        if token_buffer.feature_dim != self.F:
-            raise ValueError(
-                f"Token buffer feature_dim={token_buffer.feature_dim} does not match writer feature_dim={self.F}"
-            )
-        if token_buffer.lookback != self.L:
-            raise ValueError(
-                f"Token buffer lookback={token_buffer.lookback} does not match writer lookback={self.L}"
-            )
-        if token_buffer.count <= 0:
-            raise RuntimeError("Cannot add sequence from empty token buffer snapshot")
+    def _ensure_chunk(self, chunk_id: int) -> Dict[str, Any]:
+        if chunk_id not in self.chunks:
+            self.chunks[chunk_id] = self._new_chunk()
+        return self.chunks[chunk_id]
 
-        row_core = self.X_core[self.i]
-        row_aux = self.X_aux[self.i]
-        pad_n = self.L - token_buffer.count
-        if pad_n > 0:
-            earliest_idx = (token_buffer.cursor - token_buffer.count) % self.L
-            earliest = token_buffer.source.tokens[earliest_idx]
-            row_core[:pad_n] = earliest[:self.F_core]
-            row_aux[:pad_n, :] = 0.0
+    def append_flat_row(self, ts_decision_ms: int, token: np.ndarray) -> int:
+        token = np.asarray(token, dtype=np.float32)
+        if token.shape[-1] != self.F:
+            raise ValueError(f"token feature_dim={token.shape[-1]} does not match writer feature_dim={self.F}")
+        if self.cid < self.next_flush_cid:
+            self.cid = int(self.next_flush_cid)
+        chunk_id = self.cid
+        chunk = self._ensure_chunk(chunk_id)
+        if int(chunk["n"]) >= self.N:
+            self._flush_ready_prefix()
+            self.cid = max(self.cid + 1, self.next_flush_cid)
+            chunk_id = self.cid
+            chunk = self._ensure_chunk(chunk_id)
+        off = int(chunk["n"])
+        chunk["core"][off] = token[: self.F_core]
+        chunk["aux"][off] = token[self.F_core :]
+        chunk["y"][off, :] = np.nan
+        chunk["ts"][off] = int(ts_decision_ms)
+        chunk["n"] = off + 1
+        row_idx = chunk_id * self.N + off
+        self.row_count_total = max(self.row_count_total, row_idx + 1)
+        return int(row_idx)
 
-        dest_start = pad_n
-        src_start = (token_buffer.cursor - token_buffer.count) % self.L
-        first_block = min(token_buffer.count, self.L - src_start)
-        second_block = token_buffer.count - first_block
+    def overwrite_flat_row(self, row_idx: int, ts_decision_ms: int, token: np.ndarray) -> None:
+        token = np.asarray(token, dtype=np.float32)
+        if token.shape[-1] != self.F:
+            raise ValueError(f"token feature_dim={token.shape[-1]} does not match writer feature_dim={self.F}")
+        chunk_id, off = divmod(int(row_idx), self.N)
+        chunk = self.chunks.get(chunk_id)
+        if chunk is None or off >= int(chunk["n"]):
+            raise IndexError(f"Cannot overwrite missing flat row {row_idx}")
+        chunk["core"][off] = token[: self.F_core]
+        chunk["aux"][off] = token[self.F_core :]
+        chunk["ts"][off] = int(ts_decision_ms)
 
-        src = token_buffer.source.tokens
-        row_core[dest_start : dest_start + first_block] = src[src_start : src_start + first_block, : self.F_core]
-        row_aux[dest_start : dest_start + first_block] = src[src_start : src_start + first_block, self.F_core :]
-        if second_block > 0:
-            mid = dest_start + first_block
-            row_core[mid : mid + second_block] = src[:second_block, : self.F_core]
-            row_aux[mid : mid + second_block] = src[:second_block, self.F_core :]
+    def set_label(self, row_idx: int, y: np.ndarray) -> None:
+        chunk_id, off = divmod(int(row_idx), self.N)
+        chunk = self.chunks.get(chunk_id)
+        if chunk is None or off >= int(chunk["n"]):
+            raise IndexError(f"Cannot label missing flat row {row_idx}")
+        label = np.asarray(y, dtype=np.float32)
+        if label.shape != (NUM_HORIZONS,):
+            raise ValueError(f"label shape must be ({NUM_HORIZONS},), got {label.shape}")
+        was_finite = bool(np.all(np.isfinite(chunk["y"][off])))
+        chunk["y"][off] = label
+        if not was_finite:
+            chunk["labels_set"] = int(chunk["labels_set"]) + 1
+        self._flush_ready_prefix()
 
-        self.Y[self.i] = y
-        self.TS[self.i] = ts_decision_ms
-        self.i += 1
-        if self.i >= self.N:
-            self.flush()
+    def _chunk_fully_labeled(self, chunk: Dict[str, Any]) -> bool:
+        n = int(chunk["n"])
+        return n > 0 and int(chunk["labels_set"]) == n and bool(np.all(np.isfinite(chunk["y"][:n])))
 
-    def _build_flush_job(self) -> Optional[FlushJob]:
-        if self.i == 0:
-            return None
-        chunk_id = int(self.cid)
-        row_count = int(self.i)
+    def _build_flush_job_for_chunk(self, chunk_id: int, row_count: int) -> FlushJob:
+        chunk = self.chunks.pop(chunk_id)
         job = FlushJob(
             week_key=self.week_key,
-            chunk_id=chunk_id,
-            row_count=row_count,
+            chunk_id=int(chunk_id),
+            row_count=int(row_count),
             out_dir=self.out_dir,
-            x_core_file=f"Xcore_{chunk_id:03d}.npy",
-            x_aux_file=f"Xaux_{chunk_id:03d}.npy",
-            y_file=f"y_{chunk_id:03d}.npy",
-            ts_file=f"ts_{chunk_id:03d}.npy",
-            x_core=self.X_core,
-            x_aux=self.X_aux,
-            y=self.Y,
-            ts=self.TS,
+            x_core_file=f"core_{chunk_id:06d}.npy",
+            x_aux_file=f"aux_{chunk_id:06d}.npy",
+            y_file=f"y_{chunk_id:06d}.npy",
+            ts_file=f"ts_{chunk_id:06d}.npy",
+            x_core=chunk["core"],
+            x_aux=chunk["aux"],
+            y=chunk["y"],
+            ts=chunk["ts"],
             core_dtype=self.core_dtype,
         )
         self.chunks_meta.append({
-            "chunk": chunk_id,
-            "n": row_count,
+            "chunk": int(chunk_id),
+            "n": int(row_count),
             "files": {
                 "core": job.x_core_file,
                 "aux": job.x_aux_file,
@@ -1143,19 +1168,47 @@ class ChunkWriter:
                 "ts": job.ts_file,
             },
         })
-        self.cid += 1
-        self.i = 0
-        self._alloc_buffers()
         return job
 
-    def flush(self):
-        job = self._build_flush_job()
-        if job is None:
-            return
+    def _emit_job(self, job: FlushJob) -> None:
         if self.flush_callback is None:
             _persist_flush_job(job)
         else:
             self.flush_callback(job)
+
+    def _flush_ready_prefix(self) -> None:
+        while self.next_flush_cid in self.chunks:
+            chunk = self.chunks[self.next_flush_cid]
+            if not self._chunk_fully_labeled(chunk):
+                break
+            job = self._build_flush_job_for_chunk(self.next_flush_cid, int(chunk["n"]))
+            self.next_flush_cid += 1
+            self._emit_job(job)
+
+    def flush(self):
+        self._flush_ready_prefix()
+
+    def flush_labeled_tail(self):
+        self._flush_ready_prefix()
+        # At finalization labels mature in chronological order.  Persist any
+        # remaining finite prefix in the next chunk and drop the unlabeled tail.
+        if self.next_flush_cid in self.chunks:
+            chunk = self.chunks[self.next_flush_cid]
+            n = int(chunk["n"])
+            finite = np.all(np.isfinite(chunk["y"][:n]), axis=1) if n else np.empty((0,), dtype=bool)
+            prefix = 0
+            while prefix < n and bool(finite[prefix]):
+                prefix += 1
+            if prefix > 0:
+                job = self._build_flush_job_for_chunk(self.next_flush_cid, prefix)
+                self.next_flush_cid += 1
+                self._emit_job(job)
+        # Drop all chunks after the labeled prefix; these correspond to decisions
+        # inside the final horizon grace that never produced mature labels.
+        for chunk_id in list(self.chunks.keys()):
+            if chunk_id >= self.next_flush_cid:
+                self.chunks.pop(chunk_id, None)
+        self.cid = max(self.cid, self.next_flush_cid)
 
 
 _SENTINEL_FLUSH_JOB = object()
@@ -1206,6 +1259,8 @@ class WeekWriterRouter:
         self.week_decision_span: Dict[str, List[int]] = {}
         self.chunk_size_used: int = 0
         self.week_metas: Dict[str, dict] = {}
+        self.next_global_row_idx = 0
+        self.row_locations: Dict[int, Tuple[str, int]] = {}
         self.pca_meta = dict(pca_meta) if pca_meta is not None else {}
         self.flush_queue: "queue.Queue[object]" = queue.Queue(maxsize=_FLUSH_QUEUE_MAXSIZE)
         self.writer_exception: Optional[BaseException] = None
@@ -1298,11 +1353,14 @@ class WeekWriterRouter:
         # If we're here, this really is outside any reasonable week boundary.
         raise ValueError(f"No week found for decision timestamp {ts_ms}")
 
-    def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, label: np.ndarray):
+    def append_flat_row(self, ts_decision_ms: int, token: np.ndarray) -> int:
         self._check_writer_exception()
         wk = self._find_week_key(ts_decision_ms)
         writer = self._ensure_writer(wk)
-        writer.add_from_token_buffer(ts_decision_ms, token_buffer, label)
+        local_row_idx = writer.append_flat_row(ts_decision_ms, token)
+        row_idx = int(self.next_global_row_idx)
+        self.next_global_row_idx += 1
+        self.row_locations[row_idx] = (wk, int(local_row_idx))
         self.week_counts[wk] += 1
         if wk not in self.week_decision_span:
             self.week_decision_span[wk] = [ts_decision_ms, ts_decision_ms]
@@ -1310,12 +1368,39 @@ class WeekWriterRouter:
             span = self.week_decision_span[wk]
             span[0] = min(span[0], ts_decision_ms)
             span[1] = max(span[1], ts_decision_ms)
+        return int(row_idx)
+
+    def overwrite_flat_row(self, row_idx: int, ts_decision_ms: int, token: np.ndarray) -> None:
+        self._check_writer_exception()
+        loc = self.row_locations.get(int(row_idx))
+        if loc is None:
+            raise IndexError(f"No flat row location recorded for row {row_idx}")
+        wk, local_row_idx = loc
+        writer = self._ensure_writer(wk)
+        writer.overwrite_flat_row(local_row_idx, ts_decision_ms, token)
+        if wk not in self.week_decision_span:
+            self.week_decision_span[wk] = [ts_decision_ms, ts_decision_ms]
+        else:
+            span = self.week_decision_span[wk]
+            span[0] = min(span[0], ts_decision_ms)
+            span[1] = max(span[1], ts_decision_ms)
+
+    def set_label(self, row_idx: int, label: np.ndarray) -> None:
+        self._check_writer_exception()
+        loc = self.row_locations.pop(int(row_idx), None)
+        if loc is None:
+            raise IndexError(f"No flat row location recorded for row {row_idx}")
+        wk, local_row_idx = loc
+        writer = self.writers.get(wk)
+        if writer is None:
+            raise IndexError(f"No open writer for week {wk!r} while labeling row {row_idx}")
+        writer.set_label(local_row_idx, label)
 
     def _close_writer(self, week_key: str):
         writer = self.writers.pop(week_key, None)
         if writer is None:
             return
-        writer.flush()
+        writer.flush_labeled_tail()
         self.next_chunk_id[week_key] = int(writer.cid)
         self.closed_writers[week_key].append(writer)
 
@@ -1355,8 +1440,11 @@ class WeekWriterRouter:
                 )
         rows_total = int(sum(entry["n"] for entry in chunks_meta))
         chunk_size_used = int(writers[0].N) if writers else 0
+        total_sequences = rows_total
         meta = {
             "week": week_key,
+            "storage_format": "flat_decision_rows_v1",
+            "row_semantics": "one_flat_row_per_non_trade_ob_decision",
             "decision_policy": DECISION_POLICY,
             "decision_time_basis": "ob_event_time",
             **canonical_mode_fields(),
@@ -2121,8 +2209,7 @@ def process_all(
     # Entry references use decision_ts directly (no additional delay).
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
 
-    token_buffer: Optional[TokenRingBuffer] = None
-    pending_decisions: deque[TokenBufferSnapshot] = deque()
+    pending_decisions: deque[int] = deque()
     last_decision_ts_ms: Optional[int] = None
 
     F = None
@@ -2220,7 +2307,6 @@ def process_all(
             tok = build_token(fe, feat_core, is_trade, dt_tick)
             if F is None:
                 F = tok.shape[0]
-                token_buffer = TokenRingBuffer(LOOKBACK, F)
                 router = WeekWriterRouter(
                     out_root,
                     LOOKBACK,
@@ -2230,17 +2316,18 @@ def process_all(
                     week_index,
                     pca_meta=pca_summary,
                 )
-            if token_buffer is None:
-                raise RuntimeError("Token ring buffer was not initialised")
-            token_buffer.append(tok)
+            if router is None:
+                raise RuntimeError("Router was not initialised")
             if is_duplicate_decision_ts:
                 if not pending_decisions:
                     raise RuntimeError(
                         "Duplicate OB timestamp cannot update state because no pending decision exists"
                     )
-                pending_decisions[-1] = token_buffer.snapshot(int(ts_ms))
+                row_idx = int(pending_decisions[-1])
+                router.overwrite_flat_row(row_idx, int(ts_ms), tok)
             else:
-                pending_decisions.append(token_buffer.snapshot(int(ts_ms)))
+                row_idx = router.append_flat_row(int(ts_ms), tok)
+                pending_decisions.append(row_idx)
                 labeler.on_decision(int(ts_ms))
             matured = labeler.on_event(int(ts_ms), float(mid))
             last_decision_ts_ms = int(ts_ms)
@@ -2254,10 +2341,9 @@ def process_all(
                     )
                 if router is None:
                     raise RuntimeError("Router not initialised before label maturity")
-                snapshot = pending_decisions.popleft()
-                router.add_from_token_buffer(
-                    snapshot.ts_decision_ms,
-                    snapshot,
+                row_idx = int(pending_decisions.popleft())
+                router.set_label(
+                    row_idx,
                     yy.astype(np.float32, copy=False),
                 )
                 total_sequences += 1
@@ -2268,7 +2354,7 @@ def process_all(
         router_housekeeping_s += time.monotonic() - t_router
         
         if time.monotonic() - last_log >= 300:
-            print(f"[tok  ] seq={total_sequences} weeks={week_counter}/{week_total} "
+            print(f"[tok  ] flat_rows_labeled={total_sequences} weeks={week_counter}/{week_total} "
                   f"chunkN={router.chunk_size_used if router else 0}", flush=True)
             last_log = time.monotonic()
 
@@ -2360,6 +2446,8 @@ def process_all(
     # Dataset metadata contract: `weeks_in_order` is the only supported key for
     # week ordering in OUT_ROOT/meta.json.
     meta = {
+        "storage_format": "flat_decision_rows_v1",
+        "row_semantics": "one_flat_row_per_non_trade_ob_decision",
         "dataset_start": start_iso,
         "dataset_end": end_iso,
         "weeks_in_order": weeks_in_order,
@@ -2409,7 +2497,7 @@ def process_all(
     chunk_summary = 0 if router is None else sum(router.week_counts.values())
 
     print(
-        f"[done ] dataset weeks={len(pairs)} total_seqs={total_sequences} "
+        f"[done ] dataset weeks={len(pairs)} flat_rows_labeled={total_sequences} "
         f"L={LOOKBACK} F={feature_dim_total or 0} chunkN={meta['chunk_size_used']} "
         f"routed={chunk_summary}"
     )
