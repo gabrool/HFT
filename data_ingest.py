@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Decision-time ingest (memory-safe):
-- Snapshot ONE [LOOKBACK, F] sequence at each decision time.
+- Store one flat feature row per OB decision timestamp.
+- Training materializes [LOOKBACK, F] windows dynamically from flat rows.
 - Use a RAM budget to auto-size chunked writes (avoid huge in-RAM lists).
 
 Input layout support:
@@ -33,7 +34,10 @@ Environment variables (read via os.environ.get in this module):
   BYBIT_RAM_BUDGET_MB=512            # memory budget for one chunk
   BYBIT_CHUNK_SIZE=0                 # default auto-size from RAM budget; set a positive integer to force a fixed chunk size
 
-Shared constants from CMSSL17:
+Output storage format:
+  flat_decision_rows_v1 chunks: core_*.npy / aux_*.npy / y_*.npy / ts_*.npy
+
+Shared constants from CM:
   LOOKBACK (and related model/data constants) are defined in CM.py.
   If these values are intentionally changed, update them in CM.py.
   Decision timestamps are the actual OB event timestamps (event-time).
@@ -387,57 +391,6 @@ def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, stri
         if dq_day is not None:
             dq_day.update_output_ts(last_ts)
         yield event
-
-
-class TokenRingBuffer:
-    def __init__(self, lookback: int, feature_dim: int):
-        self.lookback = int(lookback)
-        self.feature_dim = int(feature_dim)
-        self.tokens = np.empty((self.lookback, self.feature_dim), dtype=np.float32)
-        self.cursor = 0
-        self.count = 0
-
-    def append(self, token: np.ndarray) -> None:
-        self.tokens[self.cursor] = token
-        self.cursor = (self.cursor + 1) % self.lookback
-        self.count = min(self.count + 1, self.lookback)
-
-    def overwrite_latest(self, token: np.ndarray) -> None:
-        if self.count <= 0:
-            raise RuntimeError("Cannot overwrite latest token in an empty ring buffer")
-        latest_idx = (self.cursor - 1) % self.lookback
-        self.tokens[latest_idx] = token
-
-    def snapshot(self, ts_decision_ms: int) -> "TokenBufferSnapshot":
-        if self.count <= 0:
-            raise RuntimeError("Cannot snapshot an empty token ring buffer")
-        return TokenBufferSnapshot(
-            ts_decision_ms=int(ts_decision_ms),
-            source=self,
-            cursor=int(self.cursor),
-            count=int(self.count),
-        )
-
-
-@dataclass
-class TokenBufferSnapshot:
-    ts_decision_ms: int
-    source: TokenRingBuffer
-    cursor: int
-    count: int
-
-    def refresh(self, ts_decision_ms: int) -> None:
-        self.ts_decision_ms = int(ts_decision_ms)
-        self.cursor = int(self.source.cursor)
-        self.count = int(self.source.count)
-
-    @property
-    def lookback(self) -> int:
-        return self.source.lookback
-
-    @property
-    def feature_dim(self) -> int:
-        return self.source.feature_dim
 
 
 def _parse_requested_weeks(raw: str) -> List[str]:
@@ -958,235 +911,261 @@ def safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day):
     dq_day.increment_counter("th", "total_seen", total)
     dq_day.increment_counter("th", "total_emitted", emitted)
 
-def build_token(fe: FeatureEngine, feat_z, is_trade: bool, dt_ms: float) -> np.ndarray:
-    # exact tail order: [log_dt_ms, is_trade, log_events_100ms, log_events_200ms, log_events_500ms]
-    aux_tail = np.array(
-        [
-            np.log1p(float(dt_ms)),
-            float(is_trade),
-            np.log1p(fe.event_density_100ms()),
-            np.log1p(fe.event_density_200ms()),
-            np.log1p(fe.event_density_500ms()),
-        ],
-        dtype=np.float32,
-    )
-    return np.concatenate(
-        [np.asarray(feat_z, dtype=np.float32), aux_tail], axis=0
-    ).astype(np.float32, copy=False)
+def build_aux_tail(fe: FeatureEngine, *, is_trade: bool, dt_ms: float) -> np.ndarray:
+    # exact Phase 1 tail order: [log_dt_ms, is_trade, log_events_100ms, log_events_200ms, log_events_500ms]
+    return np.asarray([
+        np.log1p(float(dt_ms)),
+        float(is_trade),
+        np.log1p(fe.event_density_100ms()),
+        np.log1p(fe.event_density_200ms()),
+        np.log1p(fe.event_density_500ms()),
+    ], dtype=np.float32)
 
-# ---------- chunk writer (preallocated) ----------
+# ---------- flat-row chunk writer ----------
 @dataclass
-class FlushJob:
+class FlatFlushJob:
     week_key: str
     chunk_id: int
+    row_start: int
     row_count: int
     out_dir: str
-    x_core_file: str
-    x_aux_file: str
+    core_file: str
+    aux_file: str
     y_file: str
     ts_file: str
-    x_core: np.ndarray
-    x_aux: np.ndarray
+    core: np.ndarray
+    aux: np.ndarray
     y: np.ndarray
     ts: np.ndarray
-    core_dtype: Any
 
 
-class ChunkWriter:
+class FlatWeekWriter:
+    """Chunked flat decision-row writer.
+
+    Rows are appended at OB decision time and labels are filled later by the
+    matured-label FIFO.  Chunks are persisted only once every row in the chunk
+    has a label, so written core/aux/y/ts rows remain exactly aligned.
+    """
+
     def __init__(
         self,
         out_dir: str,
-        lookback: int,
-        feature_dim: int,
+        feature_dim_core: int,
+        pre_pca_dim: int,
+        pca_mean: np.ndarray,
+        pca_components: np.ndarray,
+        aux_dim: int,
         ram_budget_mb: int,
         chunk_size_override: int = 0,
         start_chunk_id: int = 0,
         week_key: str = "",
-        flush_callback: Optional[Callable[[FlushJob], None]] = None,
+        flush_callback: Optional[Callable[[FlatFlushJob], None]] = None,
     ):
         self.out_dir = out_dir
         self.week_key = str(week_key)
-        self.L = int(lookback)
-        self.F = int(feature_dim)
-        self.F_core = self.F - AUX_DIM
-        assert self.F_core > 0, "feature_dim must be > AUX_DIM"
-        self.core_dtype = np.float32
+        self.feature_dim_core = int(feature_dim_core)
+        self.pre_pca_dim = int(pre_pca_dim)
+        self.aux_dim = int(aux_dim)
+        self.pca_mean = np.asarray(pca_mean, dtype=np.float32)
+        self.pca_components = np.asarray(pca_components, dtype=np.float32)
+        if self.aux_dim != AUX_DIM:
+            raise ValueError(f"aux_dim={self.aux_dim} must equal AUX_DIM={AUX_DIM}")
+        if self.pca_mean.shape != (self.pre_pca_dim,):
+            raise ValueError("PCA mean/pre-PCA dimension mismatch")
+        if self.pca_components.shape != (self.feature_dim_core, self.pre_pca_dim):
+            raise ValueError("PCA components dimension mismatch")
         self.flush_callback = flush_callback
-
-        total_bytes_per_seq = (
-            (self.L * self.F_core * 4)
-            + (self.L * AUX_DIM * 4)
-            + (NUM_HORIZONS * 4)
-            + 8
-        )
+        bytes_per_row = (4 * self.pre_pca_dim) + (4 * self.feature_dim_core) + (4 * self.aux_dim) + (4 * NUM_HORIZONS) + 8
         if chunk_size_override > 0:
             self.N = int(chunk_size_override)
         else:
-            auto_n = max(256, int((ram_budget_mb * 1024 * 1024) // total_bytes_per_seq))
-            safety_cap = max(256, int((2 * 1024 * 1024 * 1024) // max(1, total_bytes_per_seq)))
+            auto_n = max(256, int((ram_budget_mb * 1024 * 1024) // max(1, bytes_per_row)))
+            safety_cap = max(256, int((2 * 1024 * 1024 * 1024) // max(1, bytes_per_row)))
             self.N = min(auto_n, safety_cap)
-
-        self.X_core: np.ndarray
-        self.X_aux: np.ndarray
-        self.Y: np.ndarray
-        self.TS: np.ndarray
-        self._alloc_buffers()
-        self.i = 0
         self.cid = int(start_chunk_id)
-        self.chunks_meta = []
+        self.rows_total = 0
+        self.open = self._new_chunk(self.cid, self.rows_total)
+        self.pending_chunks: List[dict] = []
+        self.chunks_meta: List[Dict[str, Any]] = []
 
-    def _alloc_buffers(self) -> None:
-        self.X_core = np.empty((self.N, self.L, self.F_core), dtype=np.float32)
-        self.X_aux = np.empty((self.N, self.L, AUX_DIM), dtype=np.float32)
-        self.Y = np.empty((self.N, NUM_HORIZONS), dtype=np.float32)
-        self.TS = np.empty((self.N,), dtype=np.int64)
+    def _new_chunk(self, chunk_id: int, row_start: int) -> dict:
+        return {
+            "chunk_id": int(chunk_id),
+            "row_start": int(row_start),
+            "row_count": 0,
+            "labels_set": 0,
+            "core": np.empty((self.N, self.feature_dim_core), dtype=np.float32),
+            "aux": np.empty((self.N, self.aux_dim), dtype=np.float32),
+            "y": np.full((self.N, NUM_HORIZONS), np.nan, dtype=np.float32),
+            "ts": np.empty((self.N,), dtype=np.int64),
+        }
 
-    def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, y: np.ndarray):
-        if token_buffer.feature_dim != self.F:
-            raise ValueError(
-                f"Token buffer feature_dim={token_buffer.feature_dim} does not match writer feature_dim={self.F}"
-            )
-        if token_buffer.lookback != self.L:
-            raise ValueError(
-                f"Token buffer lookback={token_buffer.lookback} does not match writer lookback={self.L}"
-            )
-        if token_buffer.count <= 0:
-            raise RuntimeError("Cannot add sequence from empty token buffer snapshot")
+    def append_row_pre_pca(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> int:
+        if self.open["row_count"] >= self.N:
+            self.pending_chunks.append(self.open)
+            self.cid += 1
+            self.open = self._new_chunk(self.cid, self.rows_total)
+            self._flush_ready_prefix()
+        core_pre = np.asarray(core_pre_pca, dtype=np.float32)
+        aux = np.asarray(aux_tail, dtype=np.float32)
+        if core_pre.shape != (self.pre_pca_dim,):
+            raise ValueError(f"Core pre-PCA dim mismatch: {core_pre.shape} != {(self.pre_pca_dim,)}")
+        if aux.shape != (self.aux_dim,):
+            raise ValueError(f"Aux dim mismatch: {aux.shape} != {(self.aux_dim,)}")
+        if not np.all(np.isfinite(core_pre)) or not np.all(np.isfinite(aux)):
+            raise ValueError("Non-finite flat-row features")
+        centered = core_pre - self.pca_mean
+        core = np.dot(centered, self.pca_components.T).astype(np.float32, copy=False)
+        i = int(self.open["row_count"])
+        self.open["core"][i] = core
+        self.open["aux"][i] = aux
+        self.open["ts"][i] = int(ts_decision_ms)
+        row_idx = int(self.rows_total)
+        self.open["row_count"] += 1
+        self.rows_total += 1
+        return row_idx
 
-        row_core = self.X_core[self.i]
-        row_aux = self.X_aux[self.i]
-        pad_n = self.L - token_buffer.count
-        if pad_n > 0:
-            earliest_idx = (token_buffer.cursor - token_buffer.count) % self.L
-            earliest = token_buffer.source.tokens[earliest_idx]
-            row_core[:pad_n] = earliest[:self.F_core]
-            row_aux[:pad_n, :] = 0.0
+    def overwrite_latest_row(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> int:
+        if self.open["row_count"] <= 0:
+            raise RuntimeError("Cannot overwrite latest row after chunk rollover")
+        row_idx = int(self.rows_total - 1)
+        local = int(self.open["row_count"] - 1)
+        core_pre = np.asarray(core_pre_pca, dtype=np.float32)
+        aux = np.asarray(aux_tail, dtype=np.float32)
+        centered = core_pre - self.pca_mean
+        self.open["core"][local] = np.dot(centered, self.pca_components.T).astype(np.float32, copy=False)
+        self.open["aux"][local] = aux
+        self.open["ts"][local] = int(ts_decision_ms)
+        return row_idx
 
-        dest_start = pad_n
-        src_start = (token_buffer.cursor - token_buffer.count) % self.L
-        first_block = min(token_buffer.count, self.L - src_start)
-        second_block = token_buffer.count - first_block
+    def set_label(self, row_idx: int, y: np.ndarray) -> None:
+        yy = np.asarray(y, dtype=np.float32)
+        if yy.shape != (NUM_HORIZONS,):
+            raise ValueError(f"Label dim mismatch: {yy.shape} != {(NUM_HORIZONS,)}")
+        for ch in self.pending_chunks + [self.open]:
+            start = int(ch["row_start"]); end = start + int(ch["row_count"])
+            if start <= int(row_idx) < end:
+                local = int(row_idx) - start
+                if not np.isnan(ch["y"][local]).all():
+                    raise RuntimeError(f"Duplicate label for row_idx={row_idx}")
+                ch["y"][local] = yy
+                ch["labels_set"] += 1
+                self._flush_ready_prefix()
+                return
+        raise KeyError(f"row_idx={row_idx} not found in writer for week={self.week_key}")
 
-        src = token_buffer.source.tokens
-        row_core[dest_start : dest_start + first_block] = src[src_start : src_start + first_block, : self.F_core]
-        row_aux[dest_start : dest_start + first_block] = src[src_start : src_start + first_block, self.F_core :]
-        if second_block > 0:
-            mid = dest_start + first_block
-            row_core[mid : mid + second_block] = src[:second_block, : self.F_core]
-            row_aux[mid : mid + second_block] = src[:second_block, self.F_core :]
-
-        self.Y[self.i] = y
-        self.TS[self.i] = ts_decision_ms
-        self.i += 1
-        if self.i >= self.N:
-            self.flush()
-
-    def _build_flush_job(self) -> Optional[FlushJob]:
-        if self.i == 0:
+    def _build_job(self, ch: dict, row_count: Optional[int] = None) -> Optional[FlatFlushJob]:
+        n = int(ch["row_count"] if row_count is None else row_count)
+        if n <= 0:
             return None
-        chunk_id = int(self.cid)
-        row_count = int(self.i)
-        job = FlushJob(
-            week_key=self.week_key,
-            chunk_id=chunk_id,
-            row_count=row_count,
-            out_dir=self.out_dir,
-            x_core_file=f"Xcore_{chunk_id:03d}.npy",
-            x_aux_file=f"Xaux_{chunk_id:03d}.npy",
-            y_file=f"y_{chunk_id:03d}.npy",
-            ts_file=f"ts_{chunk_id:03d}.npy",
-            x_core=self.X_core,
-            x_aux=self.X_aux,
-            y=self.Y,
-            ts=self.TS,
-            core_dtype=self.core_dtype,
-        )
+        if np.isnan(ch["y"][:n]).any():
+            raise RuntimeError("Attempted to flush unlabeled flat rows")
+        chunk_id = int(ch["chunk_id"])
+        core_file = f"core_{chunk_id:06d}.npy"
+        aux_file = f"aux_{chunk_id:06d}.npy"
+        y_file = f"y_{chunk_id:06d}.npy"
+        ts_file = f"ts_{chunk_id:06d}.npy"
         self.chunks_meta.append({
+            "chunk_id": chunk_id,
             "chunk": chunk_id,
-            "n": row_count,
-            "files": {
-                "core": job.x_core_file,
-                "aux": job.x_aux_file,
-                "y": job.y_file,
-                "ts": job.ts_file,
-            },
+            "rows": n,
+            "n": n,
+            "row_start": int(ch["row_start"]),
+            "row_end": int(ch["row_start"] + n),
+            "files": {"core": core_file, "aux": aux_file, "y": y_file, "ts": ts_file},
         })
-        self.cid += 1
-        self.i = 0
-        self._alloc_buffers()
-        return job
+        return FlatFlushJob(
+            week_key=self.week_key, chunk_id=chunk_id, row_start=int(ch["row_start"]), row_count=n,
+            out_dir=self.out_dir, core_file=core_file, aux_file=aux_file, y_file=y_file, ts_file=ts_file,
+            core=ch["core"][:n].copy(), aux=ch["aux"][:n].copy(), y=ch["y"][:n].copy(), ts=ch["ts"][:n].copy(),
+        )
 
-    def flush(self):
-        job = self._build_flush_job()
-        if job is None:
-            return
+    def _emit(self, job: FlatFlushJob) -> None:
         if self.flush_callback is None:
-            _persist_flush_job(job)
+            _persist_flat_flush_job(job)
         else:
             self.flush_callback(job)
+
+    def _flush_ready_prefix(self) -> None:
+        while self.pending_chunks and int(self.pending_chunks[0]["labels_set"]) == int(self.pending_chunks[0]["row_count"]):
+            ch = self.pending_chunks.pop(0)
+            job = self._build_job(ch)
+            if job is not None:
+                self._emit(job)
+
+    def flush_labeled_tail(self) -> None:
+        self._flush_ready_prefix()
+        # At dataset end, labels mature FIFO.  Persist any labeled prefix and
+        # drop the final unlabeled suffix (possibly spanning multiple chunks).
+        for ch in list(self.pending_chunks) + [self.open]:
+            n_labeled = int(ch["labels_set"])
+            if n_labeled > 0:
+                if np.isnan(ch["y"][:n_labeled]).any():
+                    raise RuntimeError("Non-prefix label maturation detected")
+                job = self._build_job(ch, n_labeled)
+                if job is not None:
+                    self._emit(job)
+            dropped = int(ch["row_count"] - n_labeled)
+            if dropped > 0:
+                print(f"[warn] dropping {dropped} unlabeled tail rows week={self.week_key}", flush=True)
+        self.pending_chunks.clear()
+        self.open = self._new_chunk(self.cid + 1, self.rows_total)
+
+
+def _persist_flat_flush_job(job: FlatFlushJob) -> None:
+    ensure_dir(job.out_dir)
+    np.save(os.path.join(job.out_dir, job.core_file), job.core[: job.row_count].astype(np.float32, copy=False))
+    np.save(os.path.join(job.out_dir, job.aux_file), job.aux[: job.row_count].astype(np.float32, copy=False))
+    np.save(os.path.join(job.out_dir, job.y_file), job.y[: job.row_count].astype(np.float32, copy=False))
+    np.save(os.path.join(job.out_dir, job.ts_file), job.ts[: job.row_count].astype(np.int64, copy=False))
 
 
 _SENTINEL_FLUSH_JOB = object()
 _FLUSH_QUEUE_MAXSIZE = 4
 
 
-def _persist_flush_job(job: FlushJob) -> None:
-    x_core_path = os.path.join(job.out_dir, job.x_core_file)
-    x_aux_path = os.path.join(job.out_dir, job.x_aux_file)
-    y_path = os.path.join(job.out_dir, job.y_file)
-    ts_path = os.path.join(job.out_dir, job.ts_file)
-
-    if job.core_dtype == np.float16:
-        maxabs = float(np.max(np.abs(job.x_core[: job.row_count])))
-        if maxabs > np.finfo(np.float16).max:
-            print(f"[warn] core max {maxabs:.1f} exceeds fp16 range; consider BYBIT_SAVE_DTYPE=bf16", flush=True)
-
-    np.save(x_core_path, job.x_core[: job.row_count].astype(job.core_dtype, copy=False))
-    np.save(x_aux_path, job.x_aux[: job.row_count])
-    np.save(y_path, job.y[: job.row_count])
-    np.save(ts_path, job.ts[: job.row_count])
-
-
-class WeekWriterRouter:
+class FlatWeekRouter:
     def __init__(
         self,
         out_root: str,
-        lookback: int,
-        feature_dim: int,
+        feature_dim_core: int,
+        pre_pca_dim: int,
+        pca_mean: np.ndarray,
+        pca_components: np.ndarray,
+        aux_dim: int,
         ram_budget_mb: int,
         chunk_size_override: int,
         week_index: List[Tuple[str, int, int]],
         pca_meta: Optional[dict] = None,
     ):
         self.out_root = out_root
-        self.lookback = int(lookback)
-        self.feature_dim = int(feature_dim)
+        self.feature_dim_core = int(feature_dim_core)
+        self.pre_pca_dim = int(pre_pca_dim)
+        self.feature_dim_total = int(feature_dim_core + aux_dim)
+        self.aux_dim = int(aux_dim)
+        self.pca_mean = np.asarray(pca_mean, dtype=np.float32)
+        self.pca_components = np.asarray(pca_components, dtype=np.float32)
         self.ram_budget_mb = int(ram_budget_mb)
         self.chunk_size_override = int(chunk_size_override)
         self.week_index = list(week_index)
-        self.week_bounds: Dict[str, Tuple[int, int]] = {
-            wk: (start, end) for wk, start, end in self.week_index
-        }
-        self.writers: Dict[str, ChunkWriter] = {}
-        self.closed_writers: Dict[str, List[ChunkWriter]] = defaultdict(list)
+        self.week_bounds = {wk: (start, end) for wk, start, end in self.week_index}
+        self.writers: Dict[str, FlatWeekWriter] = {}
+        self.closed_writers: Dict[str, List[FlatWeekWriter]] = defaultdict(list)
         self.next_chunk_id: Dict[str, int] = defaultdict(int)
         self.week_counts: Dict[str, int] = defaultdict(int)
+        self.week_label_counts: Dict[str, int] = defaultdict(int)
         self.week_decision_span: Dict[str, List[int]] = {}
-        self.chunk_size_used: int = 0
+        self.chunk_size_used = 0
         self.week_metas: Dict[str, dict] = {}
         self.pca_meta = dict(pca_meta) if pca_meta is not None else {}
         self.flush_queue: "queue.Queue[object]" = queue.Queue(maxsize=_FLUSH_QUEUE_MAXSIZE)
         self.writer_exception: Optional[BaseException] = None
-        self.writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name="offline-ingest-chunk-writer",
-            daemon=True,
-        )
+        self.writer_thread = threading.Thread(target=self._writer_loop, name="flat-row-writer", daemon=True)
         self.writer_thread.start()
 
     def _check_writer_exception(self) -> None:
         if self.writer_exception is not None:
-            raise RuntimeError("Asynchronous chunk writer failed") from self.writer_exception
+            raise RuntimeError("Asynchronous flat-row writer failed") from self.writer_exception
 
     def _writer_loop(self) -> None:
         try:
@@ -1195,53 +1174,42 @@ class WeekWriterRouter:
                 try:
                     if job is _SENTINEL_FLUSH_JOB:
                         return
-                    _persist_flush_job(job)
+                    _persist_flat_flush_job(job)  # type: ignore[arg-type]
                 finally:
                     self.flush_queue.task_done()
         except BaseException as exc:
             self.writer_exception = exc
-            while True:
-                try:
-                    pending = self.flush_queue.get_nowait()
-                except queue.Empty:
-                    break
-                else:
-                    self.flush_queue.task_done()
-                    if pending is _SENTINEL_FLUSH_JOB:
-                        break
 
-    def _enqueue_flush_job(self, job: FlushJob) -> None:
-        self.next_chunk_id[job.week_key] = max(
-            int(self.next_chunk_id.get(job.week_key, 0)),
-            int(job.chunk_id) + 1,
-        )
+    def _enqueue_flush_job(self, job: FlatFlushJob) -> None:
         while True:
             self._check_writer_exception()
             try:
                 self.flush_queue.put(job, timeout=0.5)
-                self._check_writer_exception()
                 return
             except queue.Full:
                 continue
 
-    def _ensure_writer(self, week_key: str) -> ChunkWriter:
+    def _find_week_key(self, ts_ms: int) -> str:
+        for wk, start_ms, end_ms in self.week_index:
+            if start_ms <= ts_ms < end_ms:
+                return wk
+        if self.week_index:
+            last_wk, _last_start, last_end = self.week_index[-1]
+            if ts_ms >= last_end and ts_ms < last_end + GRACE_MS:
+                return last_wk
+        raise ValueError(f"No week found for decision timestamp {ts_ms}")
+
+    def _ensure_writer(self, week_key: str) -> FlatWeekWriter:
         if week_key in self.writers:
             return self.writers[week_key]
         if week_key in self.week_metas:
-            raise RuntimeError(
-                f"Week '{week_key}' is already finalized; refusing to reopen writer."
-            )
+            raise RuntimeError(f"Week '{week_key}' is finalized; refusing to reopen writer")
         week_dir = os.path.join(self.out_root, week_key)
         ensure_dir(week_dir)
-        start_chunk_id = int(self.next_chunk_id.get(week_key, 0))
-        writer = ChunkWriter(
-            week_dir,
-            self.lookback,
-            self.feature_dim,
-            self.ram_budget_mb,
-            self.chunk_size_override,
-            start_chunk_id=start_chunk_id,
-            week_key=week_key,
+        writer = FlatWeekWriter(
+            week_dir, self.feature_dim_core, self.pre_pca_dim, self.pca_mean, self.pca_components,
+            self.aux_dim, self.ram_budget_mb, self.chunk_size_override,
+            start_chunk_id=int(self.next_chunk_id.get(week_key, 0)), week_key=week_key,
             flush_callback=self._enqueue_flush_job,
         )
         self.writers[week_key] = writer
@@ -1249,118 +1217,60 @@ class WeekWriterRouter:
             self.chunk_size_used = int(writer.N)
         return writer
 
-    def _find_week_key(self, ts_ms: int) -> str:
-        # First, normal exact matching: ts in [start_ms, end_ms)
-        for wk, start_ms, end_ms in self.week_index:
-            if start_ms <= ts_ms < end_ms:
-                return wk
-
-        # If nothing matched, allow a small grace window on the *last* week.
-        # This covers tiny spillovers like a few ms after midnight of the "to" date,
-        # or horizon-related edges, without creating overlaps.
-        if self.week_index:
-            last_wk, last_start, last_end = self.week_index[-1]
-            if ts_ms >= last_end and ts_ms < last_end + GRACE_MS:
-                return last_wk
-
-        # If we're here, this really is outside any reasonable week boundary.
-        raise ValueError(f"No week found for decision timestamp {ts_ms}")
-
-    def add_from_token_buffer(self, ts_decision_ms: int, token_buffer: TokenBufferSnapshot, label: np.ndarray):
+    def append_feature_row(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> Tuple[str, int]:
         self._check_writer_exception()
         wk = self._find_week_key(ts_decision_ms)
         writer = self._ensure_writer(wk)
-        writer.add_from_token_buffer(ts_decision_ms, token_buffer, label)
+        row_idx = writer.append_row_pre_pca(ts_decision_ms, core_pre_pca, aux_tail)
         self.week_counts[wk] += 1
-        if wk not in self.week_decision_span:
-            self.week_decision_span[wk] = [ts_decision_ms, ts_decision_ms]
-        else:
-            span = self.week_decision_span[wk]
-            span[0] = min(span[0], ts_decision_ms)
-            span[1] = max(span[1], ts_decision_ms)
+        span = self.week_decision_span.setdefault(wk, [int(ts_decision_ms), int(ts_decision_ms)])
+        span[0] = min(span[0], int(ts_decision_ms)); span[1] = max(span[1], int(ts_decision_ms))
+        return wk, int(row_idx)
 
-    def _close_writer(self, week_key: str):
+    def overwrite_latest_feature_row(self, ts_decision_ms: int, core_pre_pca: np.ndarray, aux_tail: np.ndarray) -> Tuple[str, int]:
+        self._check_writer_exception()
+        wk = self._find_week_key(ts_decision_ms)
+        writer = self._ensure_writer(wk)
+        row_idx = writer.overwrite_latest_row(ts_decision_ms, core_pre_pca, aux_tail)
+        return wk, int(row_idx)
+
+    def set_label(self, week_key: str, row_idx: int, y: np.ndarray) -> None:
+        self._check_writer_exception()
+        writer = self.writers.get(week_key)
+        if writer is None:
+            for w in self.closed_writers.get(week_key, []):
+                writer = w
+                break
+        if writer is None:
+            raise KeyError(f"No writer for label week={week_key} row_idx={row_idx}")
+        writer.set_label(row_idx, y)
+        self.week_label_counts[week_key] += 1
+
+    def _close_writer(self, week_key: str) -> None:
         writer = self.writers.pop(week_key, None)
         if writer is None:
             return
-        writer.flush()
-        self.next_chunk_id[week_key] = int(writer.cid)
+        writer.flush_labeled_tail()
+        self.next_chunk_id[week_key] = int(writer.cid + 1)
         self.closed_writers[week_key].append(writer)
 
-    def _build_week_meta(self, week_key: str, writers: List[ChunkWriter]) -> dict:
-        span = self.week_decision_span.pop(week_key, None)
-        total_sequences = int(self.week_counts.get(week_key, 0))
-        meta_path = os.path.join(self.out_root, week_key, "meta_week.json")
-        chunks_meta = []
-        for writer in writers:
-            chunks_meta.extend(
-                {
-                    "chunk": int(entry["chunk"]),
-                    "n": int(entry["n"]),
-                    "files": dict(entry["files"]),
-                }
-                for entry in writer.chunks_meta
-            )
-        chunks_meta.sort(key=lambda entry: int(entry["chunk"]))
-        seen_chunk_ids = set()
-        for entry in chunks_meta:
-            chunk_id = int(entry["chunk"])
-            if chunk_id in seen_chunk_ids:
-                raise RuntimeError(
-                    f"Duplicate chunk id {chunk_id} detected while finalizing week '{week_key}'."
-                )
-            seen_chunk_ids.add(chunk_id)
-        for entry in chunks_meta:
-            ts_file = entry.get("files", {}).get("ts")
-            if not ts_file:
-                raise ValueError(
-                    f"Chunk {entry.get('chunk')} in week '{week_key}' missing ts file metadata."
-                )
-            ts_path = os.path.join(self.out_root, week_key, ts_file)
-            if not os.path.exists(ts_path):
-                raise FileNotFoundError(
-                    f"Chunk {entry.get('chunk')} in week '{week_key}' missing ts file '{ts_file}'."
-                )
-        rows_total = int(sum(entry["n"] for entry in chunks_meta))
-        chunk_size_used = int(writers[0].N) if writers else 0
-        meta = {
-            "week": week_key,
-            "decision_policy": DECISION_POLICY,
-            "decision_time_basis": "ob_event_time",
-            **canonical_mode_fields(),
-            "lookback": self.lookback,
-            "feature_dim_total": self.feature_dim,
-            "feature_dim_core": self.feature_dim - AUX_DIM,
-            "label_dim": int(NUM_HORIZONS),
-            "horizons_ms": [int(h) for h in HORIZONS_MS],
-            "chunk_size_used": chunk_size_used,
-            "chunks": chunks_meta,
-            "chunk_count": int(len(chunks_meta)),
-            "rows_total": rows_total,
-            "total_sequences": total_sequences,
-            "meta_path": os.path.join(week_key, "meta_week.json"),
-        }
-        if span:
-            meta["decision_ts_range"] = {
-                "min": int(span[0]),
-                "max": int(span[1]),
-            }
-        if self.pca_meta:
-            meta["pca"] = dict(self.pca_meta)
-        else:
-            meta["pca"] = {
-                "applied": False,
-                "var_kept": float(PCA_VAR_TARGET),
-                "k": 0,
-                "model_path": None,
-            }
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
-        self.week_metas[week_key] = meta
-        print(f"[write] week={week_key} chunks={len(chunks_meta)} rows={rows_total}", flush=True)
-        return meta
+    def close_old_writers(self, watermark_ms: int) -> None:
+        for wk in list(self.writers.keys()):
+            _start_ms, end_ms = self.week_bounds[wk]
+            if end_ms + GRACE_MS < watermark_ms:
+                self._close_writer(wk)
+        self._finalize_closed_weeks()
 
-    def _finalize_closed_weeks(self):
+    def flush_all(self) -> None:
+        for wk in list(self.writers.keys()):
+            self._close_writer(wk)
+        self.flush_queue.join()
+        self.flush_queue.put(_SENTINEL_FLUSH_JOB)
+        self.writer_thread.join()
+        self._check_writer_exception()
+        self._finalize_closed_weeks()
+
+    def _finalize_closed_weeks(self) -> None:
         for week_key, writers in list(self.closed_writers.items()):
             if not writers:
                 del self.closed_writers[week_key]
@@ -1368,25 +1278,59 @@ class WeekWriterRouter:
             self._build_week_meta(week_key, writers)
             del self.closed_writers[week_key]
 
-    def close_old_writers(self, watermark_ms: int):
-        to_close = []
-        for wk, writer in list(self.writers.items()):
-            _start_ms, end_ms = self.week_bounds[wk]
-            if end_ms + GRACE_MS < watermark_ms:
-                to_close.append(wk)
-        for wk in to_close:
-            self._close_writer(wk)
+    def _build_week_meta(self, week_key: str, writers: List[FlatWeekWriter]) -> dict:
+        span = self.week_decision_span.pop(week_key, None)
+        meta_path = os.path.join(self.out_root, week_key, "meta_week.json")
+        chunks_meta: List[dict] = []
+        for writer in writers:
+            chunks_meta.extend(dict(entry) for entry in writer.chunks_meta)
+        chunks_meta.sort(key=lambda entry: int(entry["chunk_id"]))
+        rows_total = int(sum(int(entry["rows"]) for entry in chunks_meta))
+        labels_total = rows_total
+        meta = {
+            "week": week_key,
+            "storage_format": "flat_decision_rows_v1",
+            "decision_policy": DECISION_POLICY,
+            "decision_time_basis": "ob_event_time",
+            "decision_stride_policy": "every_ob_event",
+            **canonical_mode_fields(),
+            "lookback": int(LOOKBACK),
+            "window_ms": int(WINDOW_MS),
+            "feature_dim_total": int(self.feature_dim_total),
+            "feature_dim_core": int(self.feature_dim_core),
+            "feature_dim_core_pre_pca": int(self.pre_pca_dim),
+            "aux_dim": int(self.aux_dim),
+            "aux_names": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_200ms", "log_events_500ms"],
+            "label_dim": int(NUM_HORIZONS),
+            "horizons_ms": [int(h) for h in HORIZONS_MS],
+            "chunk_size_used": int(writers[0].N) if writers else 0,
+            "chunks": chunks_meta,
+            "chunk_count": int(len(chunks_meta)),
+            "rows_total": rows_total,
+            "labels_total": labels_total,
+            "meta_path": os.path.join(week_key, "meta_week.json"),
+            "pca": dict(self.pca_meta),
+        }
+        if span:
+            meta["decision_ts_range"] = {"min": int(span[0]), "max": int(span[1])}
+        write_json_atomic_with_backup(Path(meta_path), meta)
+        self.week_metas[week_key] = meta
+        print(f"[write] week={week_key} chunks={len(chunks_meta)} rows={rows_total}", flush=True)
 
-    def flush_all(self):
-        for wk in list(self.writers.keys()):
-            self._close_writer(wk)
-        self._check_writer_exception()
-        self.flush_queue.put(_SENTINEL_FLUSH_JOB)
-        self.writer_thread.join()
-        self._check_writer_exception()
-        self._finalize_closed_weeks()
-        for wk in list(self.week_decision_span.keys()):
-            self.week_decision_span.pop(wk, None)
+
+def write_json_atomic_with_backup(path: Path, obj: dict) -> None:
+    path = Path(path)
+    ensure_dir(str(path.parent))
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    backup = path.with_name(f"{path.name}.bak.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+    with tmp.open("w") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+        f.flush(); os.fsync(f.fileno())
+    if path.exists():
+        backup.write_bytes(path.read_bytes())
+    os.replace(tmp, path)
+
 # --------------- dataset-wide processing ---------------
 def _compute_dataset_span(pairs: List[WeekPair]):
     if not pairs:
@@ -1810,7 +1754,7 @@ def _stream_core_features(pairs: List[WeekPair]):
                 continue
 
             t_evt = time.monotonic()
-            ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_fast_event(event)
+            ts_ms, feat_z, _dt_ms, _is_decision, _mid = fe.on_fast_event(event)
             event_proc_s += time.monotonic() - t_evt
             if last_global_ts is not None and ts_ms < last_global_ts:
                 raise ValueError(
@@ -1818,7 +1762,9 @@ def _stream_core_features(pairs: List[WeekPair]):
                     f"week {wk} event {ts_ms} < last {last_global_ts}"
                 )
             last_global_ts = int(ts_ms)
-            if _is_trade:
+            if not _is_decision:
+                if np.asarray(feat_z).shape[0] != 0:
+                    raise RuntimeError("Non-decision fast path returned non-empty feature vector during PCA sampling")
                 continue
             sample_count += 1
             now = time.monotonic()
@@ -2048,13 +1994,15 @@ def process_all(
     # Entry references use decision_ts directly (no additional delay).
     labeler = LabelBuilder(delta_ms=0, horizons_ms=HORIZONS_MS)
 
-    token_buffer: Optional[TokenRingBuffer] = None
-    pending_decisions: deque[TokenBufferSnapshot] = deque()
+    pending_decisions: deque[Tuple[str, int, int]] = deque()
     last_decision_ts_ms: Optional[int] = None
 
-    F = None
-    router: WeekWriterRouter = None  # type: ignore
-    total_sequences = 0
+    pre_pca_dim = int(pca_mean.shape[0]) if pca_mean is not None else 0
+    pca_k = int(pca_components.shape[0]) if pca_components is not None else 0
+    F = None if pca_k <= 0 else int(pca_k + AUX_DIM)
+    router: Optional[FlatWeekRouter] = None
+    total_feature_rows = 0
+    total_labels = 0
 
     ds_start, ds_end = _compute_dataset_span(pairs)
     start_iso = ds_start.date().isoformat() if ds_start else None
@@ -2063,7 +2011,7 @@ def process_all(
     week_index = _build_week_index(pairs)
 
     print(
-        f"[start] ingest weeks={len(pairs)} L={LOOKBACK} budget={RAM_BUDGET}MB"
+        f"[start] ingest weeks={len(pairs)} storage=flat_decision_rows_v1 L={LOOKBACK} budget={RAM_BUDGET}MB"
     )
     last_log = time.monotonic()
     ingest_started = time.monotonic()
@@ -2115,79 +2063,69 @@ def process_all(
             continue
 
         t_evt = time.monotonic()
-        ts_ms, feat_z, mid, is_trade, dt_ms = fe.on_fast_event(event)
+        ts_ms, feat_z, dt_ms, is_decision, mid = fe.on_fast_event(event)
         event_proc_s += time.monotonic() - t_evt
 
-        if not is_trade:
-            feat_core = feat_z
-            if pca_components is not None and pca_mean is not None:
-                if np.asarray(feat_z).shape[-1] != pca_mean.shape[0]:
-                    raise ValueError(
-                        f"PCA mean/components dimension {pca_mean.shape[0]} does not match "
-                        f"feature dimension {np.asarray(feat_z).shape[-1]}"
-                    )
-                centered = np.asarray(feat_z, dtype=np.float32, copy=False) - pca_mean
-                feat_core = np.dot(centered, pca_components.T).astype(np.float32, copy=False)
+        if not is_decision:
+            if np.asarray(feat_z).shape[0] != 0:
+                raise RuntimeError("Non-decision fast path returned non-empty feature vector")
+            continue
 
-            is_duplicate_decision_ts = (
-                last_decision_ts_ms is not None and int(ts_ms) == last_decision_ts_ms
+        core_pre_pca = np.asarray(feat_z, dtype=np.float32, copy=False)
+        if pca_components is None or pca_mean is None:
+            raise RuntimeError("Phase 1B flat ingest requires PCA model arrays")
+        if core_pre_pca.shape[-1] != pca_mean.shape[0]:
+            raise ValueError(
+                f"PCA mean/components dimension {pca_mean.shape[0]} does not match feature dimension {core_pre_pca.shape[-1]}"
             )
-            if last_decision_ts_ms is not None and int(ts_ms) < last_decision_ts_ms:
-                raise RuntimeError(
-                    f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} "
-                    f"< last_decision_ts_ms={last_decision_ts_ms}"
-                )
-            if is_duplicate_decision_ts and not ALLOW_DUPLICATE_OB_TS:
-                raise RuntimeError(
-                    f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} "
-                    f"<= last_decision_ts_ms={last_decision_ts_ms}"
-                )
 
-            dt_tick = 1 if last_decision_ts_ms is None else int(ts_ms - last_decision_ts_ms)
-            tok = build_token(fe, feat_core, is_trade, dt_tick)
-            if F is None:
-                F = tok.shape[0]
-                token_buffer = TokenRingBuffer(LOOKBACK, F)
-                router = WeekWriterRouter(
-                    out_root,
-                    LOOKBACK,
-                    F,
-                    RAM_BUDGET,
-                    CHUNK_SIZE,
-                    week_index,
-                    pca_meta=pca_summary,
-                )
-            if token_buffer is None:
-                raise RuntimeError("Token ring buffer was not initialised")
-            token_buffer.append(tok)
-            if is_duplicate_decision_ts:
-                if not pending_decisions:
-                    raise RuntimeError(
-                        "Duplicate OB timestamp cannot update state because no pending decision exists"
-                    )
-                pending_decisions[-1] = token_buffer.snapshot(int(ts_ms))
-            else:
-                pending_decisions.append(token_buffer.snapshot(int(ts_ms)))
-                labeler.on_decision(int(ts_ms))
-            matured = labeler.on_event(int(ts_ms), float(mid))
-            last_decision_ts_ms = int(ts_ms)
+        is_duplicate_decision_ts = (last_decision_ts_ms is not None and int(ts_ms) == last_decision_ts_ms)
+        if last_decision_ts_ms is not None and int(ts_ms) < last_decision_ts_ms:
+            raise RuntimeError(
+                f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} < last_decision_ts_ms={last_decision_ts_ms}"
+            )
+        if is_duplicate_decision_ts and not ALLOW_DUPLICATE_OB_TS:
+            raise RuntimeError(
+                f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} <= last_decision_ts_ms={last_decision_ts_ms}"
+            )
 
-            if matured is None:
-                raise RuntimeError("Matured labels were not produced for OB event")
-            for yy in matured:
-                if not pending_decisions:
-                    raise RuntimeError(
-                        "Matured label available but no pending sequences to pair"
-                    )
-                if router is None:
-                    raise RuntimeError("Router not initialised before label maturity")
-                snapshot = pending_decisions.popleft()
-                router.add_from_token_buffer(
-                    snapshot.ts_decision_ms,
-                    snapshot,
-                    yy.astype(np.float32, copy=False),
-                )
-                total_sequences += 1
+        dt_tick = 1 if last_decision_ts_ms is None else int(ts_ms - last_decision_ts_ms)
+        aux_tail = build_aux_tail(fe, is_trade=False, dt_ms=dt_tick)
+        if F is None:
+            pre_pca_dim = int(pca_mean.shape[0])
+            pca_k = int(pca_components.shape[0])
+            F = int(pca_k + AUX_DIM)
+        if router is None:
+            print(f"[first-row] feature_dim_core={int(pca_k)} aux_dim={AUX_DIM} feature_dim_total={int(F)}", flush=True)
+            router = FlatWeekRouter(
+                out_root, int(pca_k), int(pre_pca_dim), pca_mean, pca_components, AUX_DIM,
+                RAM_BUDGET, CHUNK_SIZE, week_index, pca_meta=pca_summary,
+            )
+
+        if is_duplicate_decision_ts:
+            if not pending_decisions:
+                raise RuntimeError("Duplicate OB timestamp cannot update state because no pending decision exists")
+            prev_week_key, _prev_row_idx, _prev_ts = pending_decisions[-1]
+            week_key, row_idx = router.overwrite_latest_feature_row(int(ts_ms), core_pre_pca, aux_tail)
+            if week_key != prev_week_key:
+                raise RuntimeError("Duplicate timestamp mapped to a different week during overwrite")
+            pending_decisions[-1] = (week_key, row_idx, int(ts_ms))
+        else:
+            week_key, row_idx = router.append_feature_row(int(ts_ms), core_pre_pca, aux_tail)
+            pending_decisions.append((week_key, row_idx, int(ts_ms)))
+            labeler.on_decision(int(ts_ms))
+            total_feature_rows += 1
+
+        matured = labeler.on_event(int(ts_ms), float(mid))
+        last_decision_ts_ms = int(ts_ms)
+        if matured is None:
+            raise RuntimeError("Matured labels were not produced for OB event")
+        for yy in matured:
+            if not pending_decisions:
+                raise RuntimeError("Matured label available but no pending flat rows to pair")
+            label_week, label_row_idx, _label_ts = pending_decisions.popleft()
+            router.set_label(label_week, label_row_idx, yy.astype(np.float32, copy=False))
+            total_labels += 1
 
         t_router = time.monotonic()
         if router is not None:
@@ -2195,7 +2133,7 @@ def process_all(
         router_housekeeping_s += time.monotonic() - t_router
         
         if time.monotonic() - last_log >= 300:
-            print(f"[tok  ] seq={total_sequences} weeks={week_counter}/{week_total} "
+            print(f"[tok  ] rows={total_feature_rows} labels={total_labels} weeks={week_counter}/{week_total} "
                   f"chunkN={router.chunk_size_used if router else 0}", flush=True)
             last_log = time.monotonic()
 
@@ -2290,13 +2228,18 @@ def process_all(
         "dataset_start": start_iso,
         "dataset_end": end_iso,
         "weeks_in_order": weeks_in_order,
+        "storage_format": "flat_decision_rows_v1",
         "decision_policy": DECISION_POLICY,
         "decision_time_basis": "ob_event_time",
+        "decision_stride_policy": "every_ob_event",
+        "label_delta_ms": 0,
         **canonical_mode_fields(),
         "lookback": int(LOOKBACK),
+        "window_ms": int(WINDOW_MS),
         "feature_dim_total": feature_dim_total,
         "feature_dim_core": feature_dim_core,
-        "aux_tail": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_200ms", "log_events_500ms"],
+        "feature_dim_core_pre_pca": int(pre_pca_dim),
+        "aux_names": ["log_dt_ms", "is_trade", "log_events_100ms", "log_events_200ms", "log_events_500ms"],
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
@@ -2304,7 +2247,8 @@ def process_all(
         "label_dim": label_dim,
         "horizons_ms": [int(h) for h in HORIZONS_MS],
         "core_dtype": "float32",
-        "total_sequences": int(total_sequences),
+        "total_feature_rows": int(rows_via_week_metas),
+        "total_labels": int(rows_via_week_metas),
         "week_counts": week_counts,
         "total_chunks": int(total_chunks),
         "rows_total_from_weeks": int(rows_via_week_metas),
@@ -2319,7 +2263,6 @@ def process_all(
     meta["pipeline_splits"] = build_pipeline_splits(weeks_in_order)
     meta["label_units"] = "signed_log_return_bps"
     meta["target_transform"] = "signed_log_return_bps"
-    meta["window_ms"] = int(WINDOW_MS)
     if week_meta_records:
         expected_mode = canonical_mode_fields()
         for wk in weeks_in_order:
@@ -2334,13 +2277,12 @@ def process_all(
                         f"(expected {expected!r})"
                     )
 
-    with open(os.path.join(out_root, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    write_json_atomic_with_backup(Path(out_root) / "meta.json", meta)
 
     chunk_summary = 0 if router is None else sum(router.week_counts.values())
 
     print(
-        f"[done ] dataset weeks={len(pairs)} total_seqs={total_sequences} "
+        f"[done ] dataset weeks={len(pairs)} total_rows={total_feature_rows} total_labels={total_labels} "
         f"L={LOOKBACK} F={feature_dim_total or 0} chunkN={meta['chunk_size_used']} "
         f"routed={chunk_summary}"
     )

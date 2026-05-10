@@ -1774,6 +1774,12 @@ class FeatureEngine:
             t0 = time.perf_counter()
             self._update_trade_windows(ts_ms, payload, dt_ms)
             self.timer_trade_update_s += time.perf_counter() - t0
+            current_mid = float("nan")
+            if self.bb is not None and self.aa is not None and self.bb > 0.0 and self.aa > 0.0:
+                current_mid = 0.5 * (float(self.bb) + float(self.aa))
+            self.last_ts = ts_ms
+            self._last_event_ts = ts_ms
+            return ts_ms, np.empty((0,), dtype=np.float32), dt_ms, False, current_mid
 
         t0 = time.perf_counter()
         self._ensure_book_ladders()
@@ -2267,7 +2273,7 @@ class FeatureEngine:
         self._last_event_ts = ts_ms
 
         self.timer_feature_build_s += time.perf_counter() - t0
-        return ts_ms, feat_z, mid, is_trade, dt_ms
+        return ts_ms, feat_z, dt_ms, True, mid
 
     def _update_book_from_ob(
         self,
