@@ -476,6 +476,9 @@ ACT_DIAG_P95_MAX_ELEMS = max(
 print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
 MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_old_ctn6ci_linearproj_no_gate_no_mixed_v1"
+# ConvTimeNet topology intentionally matches original 1s path:
+# Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final_proj -> [B, patch_count, DMODEL].
+# No gate, no MLP projection, no mixed ConvTimeNet stack.
 CTN_CI_KERNELS = [3, 3, 5, 5, 7, 7]
 CTN_MIXED_KERNELS = []
 CTN_CI_INTERNAL_DIM = 8
@@ -1219,7 +1222,8 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             small_ks=re_param_kernel,
         )
         self.final_proj = nn.Linear(self.final_in_dim, d_model)
-        self.output_norm = nn.LayerNorm(d_model)
+        # Match the original _1_sec ConvTimeNet path: no post-final_proj LayerNorm.
+        self.output_norm = None
 
         effective_rf_samples = CTN_PATCH_SIZE + sum(int(k) - 1 for k in CTN_CI_KERNELS)
         sample_ms = float(WINDOW_MS) / float(LOOKBACK)
@@ -1246,28 +1250,46 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         return None
 
     def _ci_encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        out_patch = self.depatch(x).contiguous()  # [B, F, patch_count, patch_size]
+        # x: [B, LOOKBACK, F]. DepatchSampling operates on [B, F, LOOKBACK].
+        B = x.size(0)
+        F_in = x.size(-1)
+        x_permuted = x.permute(0, 2, 1).contiguous()
+        out_patch = self.depatch(x_permuted).contiguous()  # [B, F, patch_count, patch_size]
         out = self.output_linear(out_patch).contiguous()  # [B, F, patch_count, internal_dim]
 
-        B, F, L, C = out.shape
+        B_out, F_out, L, C = out.shape
+        assert B_out == B
+        assert F_out == F_in
         assert C == self.d_model_internal
         assert L == self.patch_count
 
-        u = out.reshape(B * F, L, C).permute(0, 2, 1).contiguous()
-        assert u.shape == (B * F, self.d_model_internal, self.patch_count)
+        u = out.reshape(B * F_in, self.patch_count, self.d_model_internal)
+        u = u.permute(0, 2, 1).contiguous()  # [B*F, C_internal, patch_count]
 
         ci_t = self.ci_encoder(u)
-        assert ci_t.shape == (B * F, self.d_model_internal, self.patch_count)
+        assert ci_t.ndim == 3
+        assert ci_t.shape[0] == B * x.size(-1)
+        assert ci_t.shape[1] == self.d_model_internal
+        assert ci_t.shape[2] == self.patch_count
         return out_patch, out, ci_t
 
     def forward(self, x):
+        # x: [B, LOOKBACK, F]
         B = x.size(0)
+        F_in = x.size(-1)
         _, _, ci_t = self._ci_encode(x)
-        pooled = ci_t.mean(dim=-1)          # [B*F, internal_dim]
-        pooled = pooled.reshape(B, -1)      # [B, F*internal_dim]
-        h = self.final_proj(pooled)         # [B, d_model]
-        h = self.output_norm(h)
-        return h.unsqueeze(1).repeat(1, self.patch_count, 1)
+
+        # Preserve patch/time tokens; final_proj is applied per patch.
+        out = ci_t.permute(0, 2, 1).contiguous()  # [B*F, patch_count, C_internal]
+        out = out.reshape(B, F_in, self.patch_count, self.d_model_internal)
+        out = out.permute(0, 2, 3, 1).contiguous()  # [B, patch_count, C_internal, F]
+        out = out.reshape(B, self.patch_count, self.final_in_dim)  # [B, patch_count, F*C_internal]
+        out = self.final_proj(out)  # [B, patch_count, DMODEL]
+
+        if hasattr(self, "output_norm") and self.output_norm is not None:
+            out = self.output_norm(out)
+
+        return out
 
     @torch.no_grad()
     def residual_scalar_diagnostics(self) -> dict:
@@ -1302,31 +1324,45 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         diag["activations"]["x_input"] = _activation_summary(x)
         out_patch, patch_embed, ci_t = self._ci_encode(x)
         B = x.size(0)
+        F_in = x.size(-1)
         diag["activations"]["depatch_out"] = _activation_summary(out_patch)
         diag["activations"]["patch_embed"] = _activation_summary(patch_embed)
         diag["activations"]["ci_out"] = _activation_summary(ci_t)
 
-        pooled = ci_t.mean(dim=-1).reshape(B, -1)
-        diag["activations"]["ci_pooled_flat"] = _activation_summary(pooled)
-        h = self.final_proj(pooled)
-        diag["activations"]["final_proj"] = _activation_summary(h)
-        h = self.output_norm(h)
-        out = h.unsqueeze(1).repeat(1, self.patch_count, 1)
-        diag["activations"]["extractor_out"] = _activation_summary(out)
+        out = ci_t.permute(0, 2, 1).contiguous()
+        out = out.reshape(B, F_in, self.patch_count, self.d_model_internal)
+        out = out.permute(0, 2, 3, 1).contiguous()
+        ci_patch_flat = out.reshape(B, self.patch_count, self.final_in_dim)
+        final = self.final_proj(ci_patch_flat)
+        if hasattr(self, "output_norm") and self.output_norm is not None:
+            final = self.output_norm(final)
+
+        diag["activations"]["ci_patch_flat"] = _activation_summary(ci_patch_flat)
+        diag["activations"]["ci_pooled_flat"] = diag["activations"]["ci_patch_flat"]
+        diag["activations"]["final_proj"] = _activation_summary(final)
+        diag["activations"]["extractor_out"] = diag["activations"]["final_proj"]
 
         # Compatibility aliases for older diagnostic print code. These summarize
         # the inactive stages without performing gate or mixed-conv computation.
         diag["activations"]["pre_gate"] = diag["activations"]["ci_out"]
-        diag["activations"]["post_gate"] = diag["activations"]["ci_out"]
-        diag["activations"]["post_gate_flat"] = diag["activations"]["ci_pooled_flat"]
+        diag["activations"]["post_gate"] = diag["activations"]["ci_patch_flat"]
+        diag["activations"]["post_gate_flat"] = diag["activations"]["ci_patch_flat"]
         diag["activations"]["post_proj"] = diag["activations"]["final_proj"]
-        diag["activations"]["post_mixed"] = diag["activations"]["extractor_out"]
+        diag["activations"]["post_mixed"] = diag["activations"]["final_proj"]
+
+        diag["ci"] = diag["activations"]["ci_out"]
+        diag["ci_patch_flat"] = diag["activations"]["ci_patch_flat"]
+        diag["final_proj"] = diag["activations"]["final_proj"]
+        diag["out"] = diag["activations"]["final_proj"]
+        diag["post_gate"] = diag["activations"]["ci_patch_flat"]
+        diag["post_proj"] = diag["activations"]["final_proj"]
+        diag["post_mixed"] = diag["activations"]["final_proj"]
 
         eps = 1e-12
         diag["ratios"] = {
             "gate_over_ci_rms": 1.0,
-            "proj_over_flat_rms": diag["activations"]["final_proj"]["rms"] / (diag["activations"]["ci_pooled_flat"]["rms"] + eps),
-            "mixed_over_proj_rms": diag["activations"]["extractor_out"]["rms"] / (diag["activations"]["final_proj"]["rms"] + eps),
+            "proj_over_flat_rms": diag["activations"]["final_proj"]["rms"] / (diag["activations"]["ci_patch_flat"]["rms"] + eps),
+            "mixed_over_proj_rms": 1.0,
         }
         diag["gate"] = {
             "enabled": 0.0,
@@ -1346,9 +1382,30 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             "alpha": float("nan"),
         }
         diag["mixed"] = {"enabled": 0.0}
-        diag["depatch"] = self.depatch.diagnostics(x)
+        diag["depatch"] = self.depatch.diagnostics(x.permute(0, 2, 1).contiguous())
         diag["residual_scalars"] = self.residual_scalar_diagnostics()
-        return out, diag
+        return final, diag
+
+def _debug_check_ctn_token_diversity(model, feature_dim: int, device: str = "cuda"):
+    """Smoke check that ConvTimeNet preserves non-identical patch tokens."""
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    model.eval()
+    x = torch.randn(2, LOOKBACK, feature_dim, device=device)
+    with torch.no_grad():
+        extractor = getattr(model, "feature_extractor", None)
+        if extractor is None:
+            extractor = model.depatch_proj_encoder
+        h = extractor(x)
+    assert h.ndim == 3
+    assert h.shape[0] == 2
+    assert h.shape[-1] == DMODEL
+    if h.shape[1] > 1:
+        diff = (h[:, 1:, :] - h[:, :-1, :]).abs().mean().item()
+        print(f"[ctn-token-check] shape={tuple(h.shape)} adjacent_token_absdiff_mean={diff:.6g}", flush=True)
+        assert diff > 0.0, "ConvTimeNet output tokens are identical; patch dimension was collapsed."
+
+
 
 # ------------  Mamba wrapper + pooling ------------
 class ResidualBlock(nn.Module):
@@ -1467,14 +1524,15 @@ class Mamba(nn.Module):
 
 # -------------  SAMBA -------------
 class SAMBA(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, feature_dim: Optional[int] = None):
         super().__init__()
         self.args = args
         assert args.d_model == DMODEL, f"Expected args.d_model ({args.d_model}) == DMODEL ({DMODEL})"
         assert args.d_model % NUM_HEADS == 0, "args.d_model must be divisible by NUM_HEADS"
         assert args.headdim == (args.d_model // NUM_HEADS), "args.headdim must match d_model // NUM_HEADS"
+        extractor_in_feats = int(feature_dim) if feature_dim is not None else args.vocab_size
         self.depatch_proj_encoder = ConvTimeNetFeatureExtractor(
-            in_feats=args.vocab_size,
+            in_feats=extractor_in_feats,
             seq_len=args.seq_in,
             d_model=args.d_model,
             dropout=0.1,
@@ -1483,6 +1541,7 @@ class SAMBA(nn.Module):
             re_param=True,
             re_param_kernel=3,
         )
+        self.feature_extractor = self.depatch_proj_encoder
         # Mamba backbone (forward/backward fusion)
         self.mamba = Mamba(args, ff_hid=4*DMODEL)
 
@@ -1562,8 +1621,7 @@ class SAMBA(nn.Module):
         }
 
     def forward(self, x):
-        x_permuted = x.permute(0, 2, 1).contiguous()
-        h_tokens = self.depatch_proj_encoder(x_permuted).contiguous()        # [B, L, D] (ConvTimeNet projection applied)
+        h_tokens = self.depatch_proj_encoder(x).contiguous()        # [B, L, D] (ConvTimeNet projection applied)
         h, _ = self.mamba(h_tokens, embedded=True)
         h_dir = self.dir_token_decoder(h)
         h_mag = self.mag_token_decoder(h)
@@ -1586,8 +1644,7 @@ class SAMBA(nn.Module):
     @torch.no_grad()
     def forward_with_diagnostics(self, x: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], dict]:
         diag = {"activations": {}, "prediction": {}}
-        x_permuted = x.permute(0, 2, 1).contiguous()
-        h_tokens, ext_diag = self.depatch_proj_encoder.forward_with_diagnostics(x_permuted)
+        h_tokens, ext_diag = self.depatch_proj_encoder.forward_with_diagnostics(x)
         diag["extractor"] = ext_diag
         diag["activations"]["mamba_tokens"] = _activation_summary(h_tokens)
         h, _ = self.mamba(h_tokens, embedded=True)
