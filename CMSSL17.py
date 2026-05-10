@@ -475,9 +475,9 @@ ACT_DIAG_P95_MAX_ELEMS = max(
 )
 print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
-MODEL_ARCH_SCHEMA = "ctn_hybrid_ci4_3355_gate_proj_mixed2_77_ci8_v1"
-CTN_CI_KERNELS = [3, 3, 5, 5]
-CTN_MIXED_KERNELS = [7, 7]
+MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_old_ctn6ci_linearproj_no_gate_no_mixed_v1"
+CTN_CI_KERNELS = [3, 3, 5, 5, 7, 7]
+CTN_MIXED_KERNELS = []
 CTN_CI_INTERNAL_DIM = 8
 CTN_CI_FF_MULT = 8
 CTN_CI_DFF = CTN_CI_INTERNAL_DIM * CTN_CI_FF_MULT
@@ -1190,9 +1190,8 @@ class ConvTimeNetFeatureExtractor(nn.Module):
     ):
         super(ConvTimeNetFeatureExtractor, self).__init__()
         assert d_model == DMODEL
-        assert CTN_MIXED_DIM == d_model
-        assert len(CTN_CI_KERNELS) == 4
-        assert len(CTN_MIXED_KERNELS) == 2
+        assert len(CTN_CI_KERNELS) == 6
+        assert len(CTN_MIXED_KERNELS) == 0
 
         self.depatch = DepatchSampling(
             in_feats=in_feats,
@@ -1219,37 +1218,10 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             re_param=re_param,
             small_ks=re_param_kernel,
         )
-        self.feature_gate = FeatureReliabilityGate(
-            in_feats=in_feats,
-            d_internal=CTN_CI_INTERNAL_DIM,
-            dropout=0.05,
-            init_keep_prob=0.90,
-        )
-        self.post_gate_proj = nn.Sequential(
-            nn.LayerNorm(self.final_in_dim),
-            nn.Linear(self.final_in_dim, CTN_POST_GATE_HIDDEN),
-            nn.GELU(),
-            nn.Dropout(0.05),
-            nn.Linear(CTN_POST_GATE_HIDDEN, d_model),
-            nn.LayerNorm(d_model),
-        )
-        self.mixed_encoder = ConvEncoder(
-            d_model=d_model,
-            d_ff=CTN_MIXED_DFF,
-            kernel_size=CTN_MIXED_KERNELS,
-            dropout=dropout,
-            activation=act,
-            n_layers=len(CTN_MIXED_KERNELS),
-            enable_res_param=True,
-            norm=norm,
-            re_param=re_param,
-            small_ks=re_param_kernel,
-        )
+        self.final_proj = nn.Linear(self.final_in_dim, d_model)
         self.output_norm = nn.LayerNorm(d_model)
 
-        effective_rf_samples = CTN_PATCH_SIZE + sum(
-            int(k) - 1 for k in (list(CTN_CI_KERNELS) + list(CTN_MIXED_KERNELS))
-        )
+        effective_rf_samples = CTN_PATCH_SIZE + sum(int(k) - 1 for k in CTN_CI_KERNELS)
         sample_ms = float(WINDOW_MS) / float(LOOKBACK)
         effective_rf_ms = int(round(effective_rf_samples * sample_ms))
         print(
@@ -1258,68 +1230,53 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             flush=True,
         )
         ci_kernel_str = ",".join(str(k) for k in CTN_CI_KERNELS)
-        mixed_kernel_str = ",".join(str(k) for k in CTN_MIXED_KERNELS)
         print(
             f"[ctn-config] ci_layers={len(CTN_CI_KERNELS)} ci_kernels=[{ci_kernel_str}] "
             f"ci_dim={CTN_CI_INTERNAL_DIM} ci_dff={CTN_CI_DFF} ci_res_param=1",
             flush=True,
         )
         print(
-            f"[ctn-config] post_gate_in_dim={self.final_in_dim} post_gate_hidden={CTN_POST_GATE_HIDDEN} post_gate_out={d_model}",
-            flush=True,
-        )
-        print(
-            f"[ctn-config] mixed_layers={len(CTN_MIXED_KERNELS)} mixed_kernels=[{mixed_kernel_str}] "
-            f"mixed_dim={CTN_MIXED_DIM} mixed_dff={CTN_MIXED_DFF} mixed_res_param=1",
+            f"[ctn-config] final_in_dim={self.final_in_dim} final_proj_out={d_model} gate=disabled mixed=disabled",
             flush=True,
         )
 
     def set_gate_alpha(self, alpha: float) -> None:
-        self.feature_gate.set_gate_alpha(alpha)
+        # Kept as a no-op compatibility hook for training code that may still
+        # call it during gate-warmup setup.
+        return None
 
-    def forward(self, x):
-        out_patch = self.depatch(x).contiguous()  # [B, F, L, patch_size]
-        out = self.output_linear(out_patch).contiguous()  # [B, F, L, 8]
+    def _ci_encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        out_patch = self.depatch(x).contiguous()  # [B, F, patch_count, patch_size]
+        out = self.output_linear(out_patch).contiguous()  # [B, F, patch_count, internal_dim]
 
         B, F, L, C = out.shape
-        assert C == CTN_CI_INTERNAL_DIM
+        assert C == self.d_model_internal
         assert L == self.patch_count
 
         u = out.reshape(B * F, L, C).permute(0, 2, 1).contiguous()
-        assert u.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
+        assert u.shape == (B * F, self.d_model_internal, self.patch_count)
 
-        out = self.ci_encoder(u)
-        assert out.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
+        ci_t = self.ci_encoder(u)
+        assert ci_t.shape == (B * F, self.d_model_internal, self.patch_count)
+        return out_patch, out, ci_t
 
-        out = out.permute(0, 2, 1).contiguous()
-        out = out.reshape(B, F, self.patch_count, CTN_CI_INTERNAL_DIM)
-        out = out.permute(0, 2, 1, 3).contiguous()  # [B, L, F, 8]
-
-        out = self.feature_gate(out)
-
-        out = out.reshape(B, self.patch_count, F * CTN_CI_INTERNAL_DIM).contiguous()
-        out = self.post_gate_proj(out).contiguous()  # [B, L, 1024]
-
-        out_t = out.transpose(1, 2).contiguous()     # [B, 1024, L]
-        out_t = self.mixed_encoder(out_t)
-        out = out_t.transpose(1, 2).contiguous()     # [B, L, 1024]
-
-        out = self.output_norm(out)
-        return out
+    def forward(self, x):
+        B = x.size(0)
+        _, _, ci_t = self._ci_encode(x)
+        pooled = ci_t.mean(dim=-1)          # [B*F, internal_dim]
+        pooled = pooled.reshape(B, -1)      # [B, F*internal_dim]
+        h = self.final_proj(pooled)         # [B, d_model]
+        h = self.output_norm(h)
+        return h.unsqueeze(1).repeat(1, self.patch_count, 1)
 
     @torch.no_grad()
     def residual_scalar_diagnostics(self) -> dict:
-        def collect(enc: nn.Module) -> torch.Tensor:
-            vals = []
-            for mod in enc.modules():
-                if isinstance(mod, SublayerConnection) and getattr(mod, "enable", False) and hasattr(mod, "a"):
-                    vals.append(mod.a.detach().float().reshape(1))
-            if not vals:
-                return torch.empty(0)
-            return torch.cat(vals)
+        vals = []
+        for mod in self.ci_encoder.modules():
+            if isinstance(mod, SublayerConnection) and getattr(mod, "enable", False) and hasattr(mod, "a"):
+                vals.append(mod.a.detach().float().reshape(1))
+        ci = torch.cat(vals) if vals else torch.empty(0)
 
-        ci = collect(self.ci_encoder)
-        mixed = collect(self.mixed_encoder)
         def stats(prefix: str, vals: torch.Tensor) -> dict:
             if vals.numel() == 0:
                 return {f"{prefix}_res_a_mean": float("nan"), f"{prefix}_res_a_min": float("nan"), f"{prefix}_res_a_max": float("nan"), f"{prefix}_res_a_absmax": float("nan")}
@@ -1331,49 +1288,64 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             }
         out = {}
         out.update(stats("ci", ci))
-        out.update(stats("mixed", mixed))
+        out.update({
+            "mixed_res_a_mean": float("nan"),
+            "mixed_res_a_min": float("nan"),
+            "mixed_res_a_max": float("nan"),
+            "mixed_res_a_absmax": float("nan"),
+        })
         return out
 
     @torch.no_grad()
     def forward_with_diagnostics(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
         diag = {"activations": {}}
         diag["activations"]["x_input"] = _activation_summary(x)
-        out_patch = self.depatch(x).contiguous()
+        out_patch, patch_embed, ci_t = self._ci_encode(x)
+        B = x.size(0)
         diag["activations"]["depatch_out"] = _activation_summary(out_patch)
-        out = self.output_linear(out_patch).contiguous()
-        diag["activations"]["patch_embed"] = _activation_summary(out)
-
-        B, F, L, C = out.shape
-        assert C == CTN_CI_INTERNAL_DIM
-        assert L == self.patch_count
-        u = out.reshape(B * F, L, C).permute(0, 2, 1).contiguous()
-        assert u.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
-        ci_t = self.ci_encoder(u)
-        assert ci_t.shape == (B * F, CTN_CI_INTERNAL_DIM, self.patch_count)
+        diag["activations"]["patch_embed"] = _activation_summary(patch_embed)
         diag["activations"]["ci_out"] = _activation_summary(ci_t)
 
-        pre_gate = ci_t.permute(0, 2, 1).contiguous().reshape(B, F, self.patch_count, CTN_CI_INTERNAL_DIM)
-        pre_gate = pre_gate.permute(0, 2, 1, 3).contiguous()
-        diag["activations"]["pre_gate"] = _activation_summary(pre_gate)
-        post_gate = self.feature_gate(pre_gate)
-        diag["activations"]["post_gate"] = _activation_summary(post_gate)
-        post_gate_flat = post_gate.reshape(B, self.patch_count, F * CTN_CI_INTERNAL_DIM).contiguous()
-        diag["activations"]["post_gate_flat"] = _activation_summary(post_gate_flat)
-        post_proj = self.post_gate_proj(post_gate_flat).contiguous()
-        diag["activations"]["post_proj"] = _activation_summary(post_proj)
-        post_mixed_t = self.mixed_encoder(post_proj.transpose(1, 2).contiguous())
-        post_mixed = post_mixed_t.transpose(1, 2).contiguous()
-        diag["activations"]["post_mixed"] = _activation_summary(post_mixed)
-        out = self.output_norm(post_mixed)
+        pooled = ci_t.mean(dim=-1).reshape(B, -1)
+        diag["activations"]["ci_pooled_flat"] = _activation_summary(pooled)
+        h = self.final_proj(pooled)
+        diag["activations"]["final_proj"] = _activation_summary(h)
+        h = self.output_norm(h)
+        out = h.unsqueeze(1).repeat(1, self.patch_count, 1)
         diag["activations"]["extractor_out"] = _activation_summary(out)
+
+        # Compatibility aliases for older diagnostic print code. These summarize
+        # the inactive stages without performing gate or mixed-conv computation.
+        diag["activations"]["pre_gate"] = diag["activations"]["ci_out"]
+        diag["activations"]["post_gate"] = diag["activations"]["ci_out"]
+        diag["activations"]["post_gate_flat"] = diag["activations"]["ci_pooled_flat"]
+        diag["activations"]["post_proj"] = diag["activations"]["final_proj"]
+        diag["activations"]["post_mixed"] = diag["activations"]["extractor_out"]
 
         eps = 1e-12
         diag["ratios"] = {
-            "gate_over_ci_rms": diag["activations"]["post_gate"]["rms"] / (diag["activations"]["ci_out"]["rms"] + eps),
-            "proj_over_flat_rms": diag["activations"]["post_proj"]["rms"] / (diag["activations"]["post_gate_flat"]["rms"] + eps),
-            "mixed_over_proj_rms": diag["activations"]["post_mixed"]["rms"] / (diag["activations"]["post_proj"]["rms"] + eps),
+            "gate_over_ci_rms": 1.0,
+            "proj_over_flat_rms": diag["activations"]["final_proj"]["rms"] / (diag["activations"]["ci_pooled_flat"]["rms"] + eps),
+            "mixed_over_proj_rms": diag["activations"]["extractor_out"]["rms"] / (diag["activations"]["final_proj"]["rms"] + eps),
         }
-        diag["gate"] = self.feature_gate.gate_diagnostics(pre_gate)
+        diag["gate"] = {
+            "enabled": 0.0,
+            "gate_mean": float("nan"),
+            "gate_std": float("nan"),
+            "gate_min": float("nan"),
+            "gate_max": float("nan"),
+            "gate_p05": float("nan"),
+            "gate_p50": float("nan"),
+            "gate_p95": float("nan"),
+            "gate_frac_lt_0p5": float("nan"),
+            "gate_frac_gt_0p95": float("nan"),
+            "dyn_mean": float("nan"),
+            "dyn_std": float("nan"),
+            "prior_mean": float("nan"),
+            "prior_std": float("nan"),
+            "alpha": float("nan"),
+        }
+        diag["mixed"] = {"enabled": 0.0}
         diag["depatch"] = self.depatch.diagnostics(x)
         diag["residual_scalars"] = self.residual_scalar_diagnostics()
         return out, diag
@@ -2834,6 +2806,7 @@ class FeatureEngine:
         self._last_z_ts_ms: Optional[int] = None
 
         self.trade_fast_path_count: int = 0
+        self.trade_full_feature_state_update_count: int = 0
         self.ob_feature_build_count: int = 0
         self.strict_feature_validation = os.environ.get("BYBIT_STRICT_FEATURE_VALIDATION", "0") == "1"
 
@@ -4649,20 +4622,7 @@ class FeatureEngine:
         if etype == 'trade':
             self._update_trade_windows(ts_ms, payload, any_event_dt_ms)
             self.trade_fast_path_count += 1
-
-            # Trade rows update trade/event-density state only.
-            # They must not build feature vectors, update feature z-score state,
-            # append price-history rows, update book EMAs, or call _zscore().
-            self.last_ts = ts_ms
-            self._last_any_event_ts = int(ts_ms)
-
-            # Mid is ignored by offline_ingest for trades, but return a best-effort value
-            # for API consistency.
-            bid1, ask1, _, _ = self._book_best()
-            mid = 0.5 * (bid1 + ask1) if bid1 > 0.0 and ask1 > 0.0 else 0.0
-            return ts_ms, self._trade_fast_path_empty_feature, mid, True, any_event_dt_ms
-
-        if etype == 'ob':
+        elif etype == 'ob':
             self._prune_replen_windows(ts_ms)
             for window in self._trade_window_deques:
                 self._prune_trade_window(ts_ms, window)
@@ -5590,7 +5550,7 @@ class FeatureEngine:
                     for i in bad_idx[:20]
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
-        feat_z = self._zscore(feat, ts_ms)
+        feat_z = self._zscore(feat, any_event_dt_ms)
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
@@ -5601,7 +5561,10 @@ class FeatureEngine:
         self._last_any_event_ts = int(ts_ms)
 
         self.ob_feature_build_count += 1
-        return ts_ms, feat_z, mid, is_trade, ob_dt_ms
+        if is_trade:
+            self.trade_full_feature_state_update_count += 1
+            return ts_ms, self._trade_fast_path_empty_feature, mid, True, any_event_dt_ms
+        return ts_ms, feat_z, mid, False, any_event_dt_ms
 
     def _update_book_from_ob(
         self,
@@ -5977,61 +5940,39 @@ class FeatureEngine:
             return 30_000
         return 30_000
 
-    def _zscore(self, x: np.ndarray, ts_ms: int) -> np.ndarray:
+    def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
         if x.ndim != 1:
             raise ValueError(f"_zscore expects 1D feature vector, got shape={x.shape}")
-        names = self.feature_names()
-        if len(x) != len(names):
-            raise ValueError(f"_zscore feature length mismatch: got={len(x)} expected={len(names)}")
         if not np.all(np.isfinite(x)):
             raise ValueError("Non-finite values passed to _zscore")
+
+        eps = 1e-9
         x64 = np.asarray(x, dtype=np.float64)
         dim = int(x64.shape[0])
-        self._ensure_zscore_metadata(names, dim)
 
-        if self._z_mask is None or self._z_half_lives_arr is None:
-            raise RuntimeError("z-score metadata was not initialized")
-
-        dt_ms = 1.0 if self._last_z_ts_ms is None else float(max(1, int(ts_ms) - int(self._last_z_ts_ms)))
-        self._last_z_ts_ms = int(ts_ms)
+        if self._feat_dim is not None and dim != int(self._feat_dim):
+            raise ValueError(f"Feature dimension changed: got {x.shape[0]}, expected {self._feat_dim}")
 
         if self._feat_dim is None:
             self._feat_dim = dim
             self.z_mean = x64.copy()
-            self.z_m2 = np.ones_like(x64, dtype=np.float64)
-            out = x64.copy()
-            out[self._z_mask] = 0.0
-            out32 = out.astype(np.float32, copy=False)
-            if not np.all(np.isfinite(out32)):
-                raise ValueError("Non-finite values produced by _zscore")
-            return out32
+            self.z_m2 = (x64 * x64).copy()
+            return np.zeros_like(x, dtype=np.float32)
 
-        if dim != int(self._feat_dim):
-            raise ValueError(f"_zscore feature dimension changed: got={dim} expected={self._feat_dim}")
         if self.z_mean is None or self.z_m2 is None:
             raise RuntimeError("z-score state is uninitialized despite _feat_dim being set")
 
-        out = x64.copy()
-        mask = self._z_mask
-        if np.any(mask):
-            hl = self._z_half_lives_arr[mask]
-            alpha = 1.0 - np.exp(-math.log(2.0) * dt_ms / hl)
-            old_mean = self.z_mean[mask]
-            old_var = self.z_m2[mask]
-            x_m = x64[mask]
-            diff = x_m - old_mean
-            new_mean = old_mean + alpha * diff
-            new_var = (1.0 - alpha) * (old_var + alpha * diff * diff)
-            self.z_mean[mask] = new_mean
-            self.z_m2[mask] = new_var
-            var_floor = 1e-12
-            z = (x_m - new_mean) / np.sqrt(np.maximum(new_var, var_floor))
-            out[mask] = np.clip(z, -10.0, 10.0)
+        hl = self._alpha_half_life_ms(self.z_hl_ms)
+        alpha = 1.0 - math.pow(0.5, max(1.0, float(dt_ms)) / float(hl))
 
-        out32 = out.astype(np.float32, copy=False)
-        if not np.all(np.isfinite(out32)):
+        self.z_mean = (1.0 - alpha) * self.z_mean + alpha * x64
+        self.z_m2 = (1.0 - alpha) * self.z_m2 + alpha * (x64 * x64)
+        var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
+        z = (x64 - self.z_mean) / np.sqrt(var)
+        out = z.astype(np.float32)
+        if not np.all(np.isfinite(out)):
             raise ValueError("Non-finite values produced by _zscore")
-        return out32
+        return out
 
     def _ensure_zscore_metadata(self, names: List[str], dim: int) -> None:
         if self._z_half_lives_ms is not None:
