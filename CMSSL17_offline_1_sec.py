@@ -63,8 +63,30 @@ CUDNN_BENCHMARK = int(os.environ.get("BYBIT_CUDNN_BENCHMARK", "1")) == 1
 MATMUL_PRECISION = os.environ.get("BYBIT_MATMUL_PRECISION", "high").strip().lower()
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
+EXPECTED_STORAGE_FORMAT = "flat_decision_rows_v1"
+VALIDATE_DYNAMIC_WINDOWS = int(os.environ.get("BYBIT_VALIDATE_DYNAMIC_WINDOWS", "1")) == 1
+DRY_RUN_DATA_CHECK = int(os.environ.get("BYBIT_DRY_RUN_DATA_CHECK", "0")) == 1 or "--dry-run-data-check" in sys.argv
 
 assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
+
+
+def validate_flat_storage_meta(meta: dict, source: str) -> None:
+    if meta.get("storage_format") != EXPECTED_STORAGE_FORMAT:
+        raise ValueError(
+            f"Expected {EXPECTED_STORAGE_FORMAT}. Rerun offline_ingest_1_sec.py after raw-row patch. "
+            f"source={source} got={meta.get('storage_format')!r}"
+        )
+    validate_dataset_label_dim(meta, source)
+    if int(meta.get("lookback", -1)) != int(LOOKBACK):
+        raise ValueError(f"{source} lookback mismatch: meta={meta.get('lookback')} expected={LOOKBACK}")
+    if [int(h) for h in meta.get("horizons_ms", [])] != [int(h) for h in HORIZONS_MS]:
+        raise ValueError(f"{source} horizons_ms mismatch: meta={meta.get('horizons_ms')} expected={HORIZONS_MS}")
+    if int(meta.get("label_dim", -1)) != int(NUM_HORIZONS):
+        raise ValueError(f"{source} label_dim mismatch: meta={meta.get('label_dim')} expected={NUM_HORIZONS}")
+    f_total = int(meta.get("feature_dim_total", 0))
+    f_core = int(meta.get("feature_dim_core", 0))
+    if f_total != f_core + int(AUX_DIM):
+        raise ValueError(f"{source} feature_dim_total must equal feature_dim_core + AUX_DIM; got {f_total} vs {f_core}+{AUX_DIM}")
 
 def require_four_week_pipeline_splits(meta: dict, out_root: Path) -> dict:
     if "splits" not in meta:
@@ -406,65 +428,160 @@ class NpyChunksDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-def load_split_in_memory_ts(split_week_paths: List[Path], start: int, end: int) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Load rows in start <= ts < end across weeks into RAM. Returns X [N, L, F], y [N, H], F."""
+class DynamicWindowDataset(Dataset):
+    def __init__(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        ts: np.ndarray,
+        segments: List[Tuple[str, int, int]],
+        split_name: str = "",
+    ):
+        self.features = np.asarray(features, dtype=np.float32)
+        self.labels = np.asarray(labels, dtype=np.float32)
+        self.ts = np.asarray(ts, dtype=np.int64)
+        self.segments = list(segments)
+        self.split_name = str(split_name)
+        if self.features.ndim != 2:
+            raise ValueError(f"features must be [N,F], got {self.features.shape}")
+        validate_loaded_label_array(self.labels, f"labels for split {self.split_name}")
+        if self.ts.ndim != 1 or self.ts.shape[0] != self.features.shape[0] or self.labels.shape[0] != self.features.shape[0]:
+            raise ValueError(
+                f"flat arrays for split {self.split_name} have inconsistent shapes: "
+                f"features={self.features.shape} labels={self.labels.shape} ts={self.ts.shape}"
+            )
+        valid_rows: List[int] = []
+        for _name, seg_start, seg_end in self.segments:
+            if seg_end < seg_start:
+                raise ValueError(f"Invalid segment bounds {seg_start}:{seg_end} in split {self.split_name}")
+            if seg_end - seg_start >= LOOKBACK:
+                valid_rows.extend(range(seg_start + LOOKBACK - 1, seg_end))
+        self.valid_rows = np.asarray(valid_rows, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(self.valid_rows.shape[0])
+
+    def __getitem__(self, idx: int):
+        r = int(self.valid_rows[int(idx)])
+        x = self.features[r - LOOKBACK + 1 : r + 1]
+        y = self.labels[r]
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+    @property
+    def feature_dim(self) -> int:
+        return int(self.features.shape[1])
+
+    @property
+    def flat_rows(self) -> int:
+        return int(self.features.shape[0])
+
+
+def _validate_flat_chunk_arrays(core: np.ndarray, aux: np.ndarray, y: np.ndarray, ts: np.ndarray, source: str, f_core: int) -> None:
+    if core.ndim != 2 or core.shape[1] != f_core:
+        raise ValueError(f"{source} core must be [N,{f_core}], got {core.shape}")
+    if aux.ndim != 2 or aux.shape != (core.shape[0], AUX_DIM):
+        raise ValueError(f"{source} aux must be [N,{AUX_DIM}], got {aux.shape}, core N={core.shape[0]}")
+    if y.ndim != 2 or y.shape != (core.shape[0], NUM_HORIZONS):
+        raise ValueError(f"{source} y must be [N,{NUM_HORIZONS}], got {y.shape}, core N={core.shape[0]}")
+    if ts.ndim != 1 or ts.shape[0] != core.shape[0]:
+        raise ValueError(f"{source} ts must be [N], got {ts.shape}, core N={core.shape[0]}")
+    if ts.size > 1 and not np.all(ts[1:] >= ts[:-1]):
+        raise ValueError(f"{source} ts must be non-decreasing")
+    if y.size and not np.all(np.isfinite(y)):
+        raise ValueError(f"{source} contains non-finite labels; flat-row chunks must contain labeled rows only")
+
+
+def load_split_flat_rows_ts(split_week_paths: List[Path], start: int, end: int, split_name: str = "") -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[str, int, int]], int]:
+    """Load flat rows in start <= ts < end, preserving per-week window boundaries."""
     if end < start:
         raise ValueError(f"Invalid ts range: start={start} must be <= end={end}")
 
-    Xs, Ys = [], []
-    feat_dim = None
+    Xs: List[np.ndarray] = []
+    Ys: List[np.ndarray] = []
+    TSs: List[np.ndarray] = []
+    segments: List[Tuple[str, int, int]] = []
+    feat_dim: Optional[int] = None
+    cursor = 0
     for wp in split_week_paths:
         wmeta = read_json(wp)
-        validate_dataset_label_dim(wmeta, f"week metadata {wp}")
+        validate_flat_storage_meta(wmeta, f"week metadata {wp}")
         F_total = int(wmeta["feature_dim_total"])
+        F_core = int(wmeta["feature_dim_core"])
         if feat_dim is None:
             feat_dim = F_total
         elif feat_dim != F_total:
             raise ValueError(f"Feature dim mismatch between weeks: {feat_dim} vs {F_total}")
 
         week_dir = wp.parent
+        week_xs: List[np.ndarray] = []
+        week_ys: List[np.ndarray] = []
+        week_tss: List[np.ndarray] = []
         for idx, ch in enumerate(wmeta.get("chunks", [])):
             files = ch.get("files", {})
-            ts_rel = files.get("ts")
-            if not ts_rel:
-                raise KeyError(
-                    f"Chunk {idx} in {wp} is missing files['ts']; cannot slice by timestamp"
-                )
-
-            ts_arr = np.load(week_dir / ts_rel, mmap_mode="r")
-            if ts_arr.ndim != 1:
-                raise ValueError(
-                    f"Expected 1D ts array in chunk {idx} ({week_dir / ts_rel}), got shape={ts_arr.shape}"
-                )
-
-            # Safety check: searchsorted semantics require non-decreasing input.
-            if ts_arr.size > 1 and not np.all(ts_arr[1:] >= ts_arr[:-1]):
-                raise ValueError(
-                    f"Timestamp file is not non-decreasing for chunk {idx} in {wp}: "
-                    f"{week_dir / ts_rel}; ts must be non-decreasing for range slicing"
-                )
-
-            l = int(np.searchsorted(ts_arr, start, side="left"))
-            r = int(np.searchsorted(ts_arr, end, side="left"))
+            for key in ("core", "aux", "y", "ts"):
+                if key not in files:
+                    raise KeyError(f"Chunk {idx} in {wp} is missing files[{key!r}]")
+            core = np.load(week_dir / files["core"])
+            aux = np.load(week_dir / files["aux"])
+            y = np.load(week_dir / files["y"])
+            ts = np.load(week_dir / files["ts"])
+            _validate_flat_chunk_arrays(core, aux, y, ts, f"chunk {idx} {wp}", F_core)
+            l = int(np.searchsorted(ts, start, side="left"))
+            r = int(np.searchsorted(ts, end, side="left"))
             if r <= l:
                 continue
-
-            Xc = np.load(week_dir / files["core"])
-            Xa = np.load(week_dir / files["aux"])
-            Y = np.load(week_dir / files["y"])
-            validate_loaded_label_array(Y, f"label file {week_dir / files['y']}")
-            Xs.append(np.concatenate([Xc[l:r], Xa[l:r]], axis=-1))
-            Ys.append(Y[l:r])
+            week_xs.append(np.concatenate([core[l:r], aux[l:r]], axis=-1).astype(np.float32, copy=False))
+            week_ys.append(y[l:r].astype(np.float32, copy=False))
+            week_tss.append(ts[l:r].astype(np.int64, copy=False))
+        if week_xs:
+            Xw = np.concatenate(week_xs, axis=0)
+            Yw = np.concatenate(week_ys, axis=0)
+            TSw = np.concatenate(week_tss, axis=0)
+            if TSw.size > 1 and not np.all(TSw[1:] >= TSw[:-1]):
+                raise ValueError(f"Loaded rows for week {wp} are not non-decreasing by ts")
+            seg_start = cursor
+            seg_end = cursor + int(Xw.shape[0])
+            segments.append((str(wmeta.get("week", wp.parent.name)), seg_start, seg_end))
+            cursor = seg_end
+            Xs.append(Xw)
+            Ys.append(Yw)
+            TSs.append(TSw)
 
     if not Xs:
         return (
-            np.empty((0, LOOKBACK, feat_dim or 0), np.float32),
+            np.empty((0, int(feat_dim or 0)), np.float32),
             np.empty((0, NUM_HORIZONS), np.float32),
-            (feat_dim or 0),
+            np.empty((0,), np.int64),
+            [],
+            int(feat_dim or 0),
         )
     X = np.concatenate(Xs, axis=0).astype(np.float32, copy=False)
     y = np.concatenate(Ys, axis=0).astype(np.float32, copy=False)
-    return X, y, int(feat_dim)
+    ts = np.concatenate(TSs, axis=0).astype(np.int64, copy=False)
+    return X, y, ts, segments, int(feat_dim or 0)
+
+
+def validate_dynamic_window_alignment(ds: DynamicWindowDataset, n_checks: int = 16) -> None:
+    n = len(ds)
+    if n == 0:
+        print(f"[window-check] split={ds.split_name} checks=0 passed=1")
+        return
+    rng = np.random.default_rng(12345)
+    check_count = min(int(n_checks), n)
+    choices = rng.choice(n, size=check_count, replace=False) if n > check_count else np.arange(n)
+    for idx in choices:
+        r = int(ds.valid_rows[int(idx)])
+        x, y = ds[int(idx)]
+        if tuple(x.shape) != (LOOKBACK, ds.feature_dim):
+            raise AssertionError(f"window shape mismatch for split={ds.split_name}: {tuple(x.shape)}")
+        if not np.array_equal(x[-1].numpy(), ds.features[r]):
+            raise AssertionError(f"window last row mismatch for split={ds.split_name} row={r}")
+        if not np.array_equal(y.numpy(), ds.labels[r]):
+            raise AssertionError(f"label mismatch for split={ds.split_name} row={r}")
+        lo = r - LOOKBACK + 1
+        if not any(lo >= seg_start and r < seg_end for _name, seg_start, seg_end in ds.segments):
+            raise AssertionError(f"window crosses segment boundary for split={ds.split_name} row={r}")
+    print(f"[window-check] split={ds.split_name} checks={check_count} passed=1")
 
 # ---------------- Directional-noise filter quantiles from TRAIN set ----------------
 def compute_dir_mask_quantiles_from_ytrain(y_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -645,7 +762,7 @@ def train_from_offline():
     print(f"[amp] enabled={amp_enabled} dtype=bf16")
     out_root = Path(OUT_ROOT)
     meta = load_global_meta(out_root)
-    validate_dataset_label_dim(meta, f"global metadata {out_root / 'meta.json'}")
+    validate_flat_storage_meta(meta, f"global metadata {out_root / 'meta.json'}")
     trade_history_enabled = meta.get("trade_history_enabled")
     event_stream_mode = meta.get("event_stream_mode")
     print(f"[meta] trade_history_enabled={trade_history_enabled!r}")
@@ -742,7 +859,7 @@ def train_from_offline():
 
     for wp in resolved_split_week_paths:
         week_meta = read_json(wp)
-        validate_dataset_label_dim(week_meta, f"week metadata {wp}")
+        validate_flat_storage_meta(week_meta, f"week metadata {wp}")
         if week_meta.get("trade_history_enabled") != trade_history_enabled:
             raise ValueError(
                 "trade_history_enabled mismatch between global metadata and week metadata: "
@@ -781,6 +898,9 @@ def train_from_offline():
         "decision_time_basis": EXPECTED_DECISION_TIME_BASIS,
         "trade_history_enabled": trade_history_enabled,
         "event_stream_mode": event_stream_mode,
+        "storage_format": EXPECTED_STORAGE_FORMAT,
+        "dynamic_windows": True,
+        "lookback": int(LOOKBACK),
     }
     cached_quantiles = load_quantile_cache(quantile_cache_path)
     cached_bounds = None
@@ -797,74 +917,37 @@ def train_from_offline():
                 f"path={quantile_cache_path} (quantile prepass required)"
             )
 
-    if USE_IN_MEMORY:
-        X_tr, y_tr, feat_dim1 = load_split_in_memory_ts(tr_weeks, tr_start, tr_end)
-        X_va, y_va, feat_dim2 = load_split_in_memory_ts(va_weeks, va_start, va_end)
-        X_te, y_te, feat_dim3 = load_split_in_memory_ts(te_weeks, te_start, te_end)
-        assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
-        print(
-            f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={len(y_tr)} "
-            f"val=[{va_start},{va_end}) N={len(y_va)} test=[{te_start},{te_end}) N={len(y_te)}"
-        )
+    if not USE_IN_MEMORY:
+        print("[raw-row] BYBIT_USE_IN_MEMORY=0 uses the same RAM flat-row loader; dynamic windows are not materialized")
 
-        # Build in-RAM datasets
-        ds_train = HFTDataset(X_tr, y_tr)
-        ds_val   = HFTDataset(X_va, y_va)
-        ds_test  = HFTDataset(X_te, y_te)
-        print(
-            f"[offline-data] train N={len(ds_train)}, "
-            f"val N={len(ds_val)}, test N={len(ds_test)}"
-        )
-        # we still need y_tr to build directional mask quantiles unless cache hit
-        y_train_for_quant = None if cached_bounds is not None else y_tr
+    X_tr, y_tr, ts_tr, seg_tr, feat_dim1 = load_split_flat_rows_ts(tr_weeks, tr_start, tr_end, "train")
+    X_va, y_va, ts_va, seg_va, feat_dim2 = load_split_flat_rows_ts(va_weeks, va_start, va_end, "val")
+    X_te, y_te, ts_te, seg_te, feat_dim3 = load_split_flat_rows_ts(te_weeks, te_start, te_end, "test")
+    assert feat_dim1 == feat_dim2 == feat_dim3 == F_total, "feat dim mismatch"
 
-    else:
-        def refs_for_weeks_timerange(weeks: List[Path], start: int, end: int) -> List[ChunkRef]:
-            refs: List[ChunkRef] = []
-            for wp in weeks:
-                refs.extend(build_chunk_refs_by_ts(wp, start, end))
-            return refs
+    ds_train = DynamicWindowDataset(X_tr, y_tr, ts_tr, seg_tr, "train")
+    ds_val   = DynamicWindowDataset(X_va, y_va, ts_va, seg_va, "val")
+    ds_test  = DynamicWindowDataset(X_te, y_te, ts_te, seg_te, "test")
 
-        tr_refs = refs_for_weeks_timerange(tr_weeks, tr_start, tr_end)
-        va_refs = refs_for_weeks_timerange(va_weeks, va_start, va_end)
-        te_refs = refs_for_weeks_timerange(te_weeks, te_start, te_end)
-        print(
-            f"[cmssl split-ts] train=[{tr_start},{tr_end}) N={sum(r.n for r in tr_refs)} "
-            f"val=[{va_start},{va_end}) N={sum(r.n for r in va_refs)} "
-            f"test=[{te_start},{te_end}) N={sum(r.n for r in te_refs)}"
-        )
+    print(
+        f"[cmssl split-ts] train=[{tr_start},{tr_end}) flat_rows={ds_train.flat_rows} valid_windows={len(ds_train)} "
+        f"val=[{va_start},{va_end}) flat_rows={ds_val.flat_rows} valid_windows={len(ds_val)} "
+        f"test=[{te_start},{te_end}) flat_rows={ds_test.flat_rows} valid_windows={len(ds_test)}"
+    )
+    print(f"[flat-data] split=train flat_rows={ds_train.flat_rows} valid_windows={len(ds_train)}")
+    print(f"[flat-data] split=val flat_rows={ds_val.flat_rows} valid_windows={len(ds_val)}")
+    print(f"[flat-data] split=test flat_rows={ds_test.flat_rows} valid_windows={len(ds_test)}")
 
-        ds_train = NpyChunksDataset(tr_refs, F_total)
-        ds_val   = NpyChunksDataset(va_refs, F_total)
-        ds_test  = NpyChunksDataset(te_refs, F_total)
-        print(
-            f"[offline-data] train N={len(ds_train)}, "
-            f"val N={len(ds_val)}, test N={len(ds_test)}"
-        )
+    if VALIDATE_DYNAMIC_WINDOWS:
+        validate_dynamic_window_alignment(ds_train, n_checks=16)
+        validate_dynamic_window_alignment(ds_val, n_checks=16)
+        validate_dynamic_window_alignment(ds_test, n_checks=16)
 
-        # Build y_train_for_quant without loading features into RAM unless cache hit.
-        if cached_bounds is not None:
-            y_train_for_quant = None
-        elif len(ds_train) == 0:
-            y_train_for_quant = np.empty((0, NUM_HORIZONS), dtype=np.float32)
-        else:
-            dl_prepass = DataLoader(
-                ds_train,
-                batch_size=BATCH_SIZE,
-                shuffle=False,
-                drop_last=False,
-                num_workers=WORKERS_TRAIN,
-                pin_memory=True,
-            )
-            y_parts: List[np.ndarray] = []
-            with torch.no_grad():
-                for _, y_batch in tqdm(dl_prepass, desc="[prepass y_train quantiles]"):
-                    y_parts.append(y_batch.numpy())
-            y_train_for_quant = (
-                np.concatenate(y_parts, axis=0)
-                if y_parts
-                else np.empty((0, NUM_HORIZONS), dtype=np.float32)
-            )
+    if DRY_RUN_DATA_CHECK:
+        print("[dry-run-data-check] loaded flat rows and validated dynamic windows; exiting before model construction/training")
+        return
+
+    y_train_for_quant = None if cached_bounds is not None else ds_train.labels[ds_train.valid_rows]
 
 
     # ---------------- directional-noise filter quantiles & loss closure ----------------
