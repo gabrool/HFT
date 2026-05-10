@@ -1914,6 +1914,7 @@ def model_param_groups(model: torch.nn.Module) -> Dict[str, List[Tuple[str, torc
         ("extractor_gate", "depatch_proj_encoder.feature_gate."),
         ("extractor_post_gate", "depatch_proj_encoder.post_gate_proj."),
         ("extractor_mixed", "depatch_proj_encoder.mixed_encoder."),
+        ("extractor_final_proj", "depatch_proj_encoder.final_proj."),
         ("extractor_output_norm", "depatch_proj_encoder.output_norm."),
         ("mamba", "mamba."),
         ("task_decoders", "dir_token_decoder."),
@@ -1926,7 +1927,7 @@ def model_param_groups(model: torch.nn.Module) -> Dict[str, List[Tuple[str, torc
     ]
     groups = {k: [] for k in [
         "extractor_depatch", "extractor_patch_embed", "extractor_ci", "extractor_gate",
-        "extractor_post_gate", "extractor_mixed", "extractor_output_norm", "mamba",
+        "extractor_post_gate", "extractor_mixed", "extractor_final_proj", "extractor_output_norm", "mamba",
         "task_decoders", "heads_pools", "other",
     ]}
     for name, p in unwrap_model(model).named_parameters():
@@ -2030,7 +2031,7 @@ def build_optimizer_param_groups(model: torch.nn.Module, *, base_lr: float, gate
         else:
             main_params.append(p)
     if len(gate_params) <= 0:
-        raise ValueError("No trainable gate parameters found for separate optimizer group.")
+        print("[gate-config] no feature_gate parameters found; gate_lr disabled", flush=True)
     if len(main_params) <= 0:
         raise ValueError("No trainable main parameters found for optimizer group.")
     gate_ids = {id(p) for p in gate_params}
@@ -2041,20 +2042,24 @@ def build_optimizer_param_groups(model: torch.nn.Module, *, base_lr: float, gate
     trainable_ids = [id(p) for p in trainable_params]
     if len(all_group_ids) != len(set(all_group_ids)) or set(all_group_ids) != set(trainable_ids):
         raise ValueError("Optimizer parameter groups must include every trainable parameter exactly once.")
-    return [
+    groups = [
         {
             "params": main_params,
             "lr": base_lr,
             "weight_decay": 1e-3,
             "name": "main",
         },
-        {
-            "params": gate_params,
-            "lr": gate_lr,
-            "weight_decay": 0.0,
-            "name": "gate",
-        },
     ]
+    if gate_params:
+        groups.append(
+            {
+                "params": gate_params,
+                "lr": gate_lr,
+                "weight_decay": 0.0,
+                "name": "gate",
+            }
+        )
+    return groups
 
 
 def summarize_grad_groups(model: torch.nn.Module, lr: float) -> Dict[str, dict]:
@@ -2503,7 +2508,7 @@ def train_from_offline():
         flush=True,
     )
     param_groups = build_optimizer_param_groups(model, base_lr=LR, gate_lr=GATE_LR)
-    gate_param_count = sum(p.numel() for p in param_groups[1]["params"])
+    gate_param_count = sum(p.numel() for group in param_groups if group.get("name") == "gate" for p in group["params"])
     param_summary = summarize_param_groups(model)
     param_keys = [
         "extractor_depatch",
@@ -2512,6 +2517,7 @@ def train_from_offline():
         "extractor_gate",
         "extractor_post_gate",
         "extractor_mixed",
+        "extractor_final_proj",
         "extractor_output_norm",
         "mamba",
         "task_decoders",
