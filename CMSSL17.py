@@ -503,6 +503,14 @@ LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
 FEATURE_SCHEMA = "cmssl17_1s_maker_stage1_v2_pruned_horizon_windows_monday_pca"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
 CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-stage1"
+
+FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
+FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
+CMSSL_TRAIN_VAL_PROTOCOL = "cmssl_train_val_only_v1"
+CMSSL_TRAIN_VAL_TEST_PROTOCOL = "cmssl_train_val_test_only_v1"
+FULL_SPLIT_PROTOCOLS = {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}
+CMSSL_ONLY_SPLIT_PROTOCOLS = {CMSSL_TRAIN_VAL_PROTOCOL, CMSSL_TRAIN_VAL_TEST_PROTOCOL}
+SUPPORTED_SPLIT_PROTOCOLS = FULL_SPLIT_PROTOCOLS | CMSSL_ONLY_SPLIT_PROTOCOLS
 EPOCHS          = 200
 LR              = 4e-4
 CLIP_GRAD       = 10000
