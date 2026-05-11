@@ -4757,7 +4757,7 @@ class FeatureEngine:
             self.last_ob_ofi_l5 = float(ofi_l5)
             self.last_ob_trade_imbalance_1000ms = float(trade_stats_by_ms[1_000]["trade_imbalance_notional"])
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
-        for ms in self.trade_windows:
+        for ms in FLOW_WINDOWS_MS:
             cvd_state = self.cvd_window_states[ms]
             cvd_state.prune(ts_ms)
             cvd_change = cvd_state.change_usd(ts_ms, self.cvd_notional)
