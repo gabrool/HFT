@@ -81,10 +81,12 @@ RAM_BUDGET  = int(os.environ.get("BYBIT_RAM_BUDGET_MB", "512"))
 CHUNK_SIZE  = int(os.environ.get("BYBIT_CHUNK_SIZE", "0"))  # 0 = auto-size from RAM budget; >0 = explicit fixed override
 FLUSH_WORKERS = int(os.environ.get("BYBIT_FLUSH_WORKERS", "4"))
 DECISION_POLICY = "ob_event_time"
-FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
-FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
-
-
+INGEST_STAGE = os.environ.get("BYBIT_INGEST_STAGE", "full").strip().lower()
+VALID_INGEST_STAGES = {"full", "cmssl_train_val", "cmssl_train_val_test"}
+if INGEST_STAGE not in VALID_INGEST_STAGES:
+    raise ValueError(
+        f"BYBIT_INGEST_STAGE must be one of {sorted(VALID_INGEST_STAGES)}, got {INGEST_STAGE!r}"
+    )
 
 
 OB_TP_SNAPSHOT = 1
@@ -343,6 +345,11 @@ from CMSSL17 import (
     LABEL_TRIM_SCHEMA,
     LOW_ABS_TRIM_FRACTION,
     HIGH_ABS_TRIM_FRACTION,
+    FOUR_WEEK_PROTOCOL,
+    FIVE_WEEK_PROTOCOL,
+    CMSSL_TRAIN_VAL_PROTOCOL,
+    CMSSL_TRAIN_VAL_TEST_PROTOCOL,
+    SUPPORTED_SPLIT_PROTOCOLS,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
 FINAL_FEATURE_DIM = 512
@@ -781,11 +788,108 @@ def build_token(fe: FeatureEngine, feat_z, dt_ms: float) -> np.ndarray:
     return np.concatenate([core, aux], axis=0).astype(np.float32, copy=False)
 
 
+def resolve_requested_protocol_and_pairs(pairs: List[WeekPair], ingest_stage: str) -> Tuple[str, List[WeekPair]]:
+    """
+    Return (protocol, selected_pairs) for the requested ingest stage.
+
+    CMSSL-only stages select only the weeks needed for CMSSL training/validation
+    (and optionally test), while full preserves the existing 4/5-week protocols.
+    """
+    if ingest_stage == "full":
+        if len(pairs) == 5:
+            return FIVE_WEEK_PROTOCOL, list(pairs[:5])
+        if len(pairs) == 4:
+            return FOUR_WEEK_PROTOCOL, list(pairs[:4])
+        raise ValueError(f"BYBIT_INGEST_STAGE=full requires exactly 4 or 5 weeks; found {len(pairs)}.")
+
+    if ingest_stage == "cmssl_train_val":
+        if len(pairs) >= 5:
+            return CMSSL_TRAIN_VAL_PROTOCOL, list(pairs[:3])
+        if len(pairs) >= 4:
+            return CMSSL_TRAIN_VAL_PROTOCOL, list(pairs[:2])
+        if len(pairs) in (2, 3):
+            return CMSSL_TRAIN_VAL_PROTOCOL, list(pairs)
+        raise ValueError(f"BYBIT_INGEST_STAGE=cmssl_train_val requires at least 2 weeks; found {len(pairs)}.")
+
+    if ingest_stage == "cmssl_train_val_test":
+        if len(pairs) >= 5:
+            return CMSSL_TRAIN_VAL_TEST_PROTOCOL, list(pairs[:4])
+        if len(pairs) >= 4:
+            return CMSSL_TRAIN_VAL_TEST_PROTOCOL, list(pairs[:3])
+        if len(pairs) == 3:
+            return CMSSL_TRAIN_VAL_TEST_PROTOCOL, list(pairs)
+        raise ValueError(f"BYBIT_INGEST_STAGE=cmssl_train_val_test requires at least 3 weeks; found {len(pairs)}.")
+
+    raise ValueError(f"Unsupported ingest_stage={ingest_stage!r}")
+
+
+def get_cmssl_train_week_keys_for_protocol(weeks_in_order: List[str], protocol: str) -> List[str]:
+    if protocol == FIVE_WEEK_PROTOCOL:
+        if len(weeks_in_order) != 5:
+            raise ValueError(f"Expected exactly 5 weeks for {FIVE_WEEK_PROTOCOL}; got {len(weeks_in_order)}")
+        return list(weeks_in_order[:2])
+    if protocol == FOUR_WEEK_PROTOCOL:
+        if len(weeks_in_order) != 4:
+            raise ValueError(f"Expected exactly 4 weeks for {FOUR_WEEK_PROTOCOL}; got {len(weeks_in_order)}")
+        return [weeks_in_order[0]]
+    if protocol == CMSSL_TRAIN_VAL_PROTOCOL:
+        if len(weeks_in_order) == 3:
+            return list(weeks_in_order[:2])
+        if len(weeks_in_order) == 2:
+            return [weeks_in_order[0]]
+        raise ValueError(f"Expected 2 or 3 weeks for {CMSSL_TRAIN_VAL_PROTOCOL}; got {len(weeks_in_order)}")
+    if protocol == CMSSL_TRAIN_VAL_TEST_PROTOCOL:
+        if len(weeks_in_order) == 4:
+            return list(weeks_in_order[:2])
+        if len(weeks_in_order) == 3:
+            return [weeks_in_order[0]]
+        raise ValueError(f"Expected 3 or 4 weeks for {CMSSL_TRAIN_VAL_TEST_PROTOCOL}; got {len(weeks_in_order)}")
+    raise ValueError(f"Unsupported split protocol: {protocol}")
+
+
 def build_pipeline_splits(
     weeks_in_order: List[str],
     week_metas: Dict[str, dict],
     protocol: str,
 ) -> dict:
+    if protocol not in SUPPORTED_SPLIT_PROTOCOLS:
+        raise ValueError(f"Unsupported split protocol: {protocol}")
+
+    def _range_for(week_key: str) -> Tuple[int, int]:
+        week_meta = week_metas.get(week_key)
+        if not isinstance(week_meta, dict):
+            raise KeyError(f"Missing week metadata for split week '{week_key}'")
+        decision_range = week_meta.get("decision_ts_range")
+        if not isinstance(decision_range, dict):
+            raise KeyError(f"Week '{week_key}' missing decision_ts_range in metadata")
+        if "min" not in decision_range or "max" not in decision_range:
+            raise KeyError(f"Week '{week_key}' decision_ts_range must contain min/max")
+        start = int(decision_range["min"])
+        end_exclusive = int(decision_range["max"]) + 1
+        if start >= end_exclusive:
+            raise ValueError(f"Invalid decision_ts_range for week '{week_key}': {start}..{end_exclusive}")
+        return start, end_exclusive
+
+    def _week_entry(week_key: str) -> dict:
+        start, end = _range_for(week_key)
+        return {
+            "week": week_key,
+            "weeks": [week_key],
+            "decision_ts_range": {"start": int(start), "end": int(end)},
+            "start": int(start),
+            "end": int(end),
+        }
+
+    def _train_entry(train_weeks: List[str]) -> dict:
+        start = _range_for(train_weeks[0])[0]
+        end = _range_for(train_weeks[-1])[1]
+        return {
+            "weeks": list(train_weeks),
+            "decision_ts_range": {"start": int(start), "end": int(end)},
+            "start": int(start),
+            "end": int(end),
+        }
+
     if protocol == FOUR_WEEK_PROTOCOL:
         if len(weeks_in_order) != 4:
             raise ValueError(f"Expected exactly 4 weeks for {FOUR_WEEK_PROTOCOL}; got {len(weeks_in_order)}")
@@ -804,30 +908,55 @@ def build_pipeline_splits(
         cmssl_test_week = week4
         rl_week = week4
         eval_week = week5
-    else:
-        raise ValueError(f"Unsupported split protocol: {protocol}")
+    elif protocol == CMSSL_TRAIN_VAL_PROTOCOL:
+        if len(weeks_in_order) == 3:
+            week1, week2, week3 = weeks_in_order
+            cmssl_train_weeks = [week1, week2]
+            cmssl_val_week = week3
+        elif len(weeks_in_order) == 2:
+            week1, week2 = weeks_in_order
+            cmssl_train_weeks = [week1]
+            cmssl_val_week = week2
+        else:
+            raise ValueError(f"Expected 2 or 3 weeks for {CMSSL_TRAIN_VAL_PROTOCOL}; got {len(weeks_in_order)}")
+        return {
+            "protocol": protocol,
+            "cmssl": {
+                "train": _train_entry(cmssl_train_weeks),
+                "val": _week_entry(cmssl_val_week),
+            },
+            "rl": {},
+            "eval": {},
+            "available_stages": ["cmssl.train", "cmssl.val"],
+            "missing_stages": ["cmssl.test", "rl.train", "rl.val", "rl.test", "eval.full"],
+        }
+    elif protocol == CMSSL_TRAIN_VAL_TEST_PROTOCOL:
+        if len(weeks_in_order) == 4:
+            week1, week2, week3, week4 = weeks_in_order
+            cmssl_train_weeks = [week1, week2]
+            cmssl_val_week = week3
+            cmssl_test_week = week4
+        elif len(weeks_in_order) == 3:
+            week1, week2, week3 = weeks_in_order
+            cmssl_train_weeks = [week1]
+            cmssl_val_week = week2
+            cmssl_test_week = week3
+        else:
+            raise ValueError(f"Expected 3 or 4 weeks for {CMSSL_TRAIN_VAL_TEST_PROTOCOL}; got {len(weeks_in_order)}")
+        return {
+            "protocol": protocol,
+            "cmssl": {
+                "train": _train_entry(cmssl_train_weeks),
+                "val": _week_entry(cmssl_val_week),
+                "test": _week_entry(cmssl_test_week),
+            },
+            "rl": {},
+            "eval": {},
+            "available_stages": ["cmssl.train", "cmssl.val", "cmssl.test"],
+            "missing_stages": ["rl.train", "rl.val", "rl.test", "eval.full"],
+        }
 
-    def _range_for(week_key: str) -> Tuple[int, int]:
-        week_meta = week_metas.get(week_key)
-        if not isinstance(week_meta, dict):
-            raise KeyError(f"Missing week metadata for split week '{week_key}'")
-        decision_range = week_meta.get("decision_ts_range")
-        if not isinstance(decision_range, dict):
-            raise KeyError(f"Week '{week_key}' missing decision_ts_range in metadata")
-        if "min" not in decision_range or "max" not in decision_range:
-            raise KeyError(f"Week '{week_key}' decision_ts_range must contain min/max")
-        start = int(decision_range["min"])
-        end_exclusive = int(decision_range["max"]) + 1
-        if start >= end_exclusive:
-            raise ValueError(f"Invalid decision_ts_range for week '{week_key}': {start}..{end_exclusive}")
-        return start, end_exclusive
-
-    train_start = _range_for(cmssl_train_weeks[0])[0]
-    train_end = _range_for(cmssl_train_weeks[-1])[1]
-    vals, vale = _range_for(cmssl_val_week)
     tests, teste = _range_for(cmssl_test_week)
-    evals, evale = _range_for(eval_week)
-
     span_rl = max(1, teste - tests)
     rl_40 = tests + int(np.floor(0.4 * span_rl))
     rl_70 = tests + int(np.floor(0.7 * span_rl))
@@ -837,24 +966,9 @@ def build_pipeline_splits(
     return {
         "protocol": protocol,
         "cmssl": {
-            "train": {
-                "weeks": list(cmssl_train_weeks),
-                "decision_ts_range": {"start": int(train_start), "end": int(train_end)},
-                "start": int(train_start),
-                "end": int(train_end),
-            },
-            "val": {
-                "week": cmssl_val_week,
-                "decision_ts_range": {"start": int(vals), "end": int(vale)},
-                "start": int(vals),
-                "end": int(vale),
-            },
-            "test": {
-                "week": cmssl_test_week,
-                "decision_ts_range": {"start": int(tests), "end": int(teste)},
-                "start": int(tests),
-                "end": int(teste),
-            },
+            "train": _train_entry(cmssl_train_weeks),
+            "val": _week_entry(cmssl_val_week),
+            "test": _week_entry(cmssl_test_week),
         },
         "rl": {
             "train": {"week": rl_week, "decision_ts_range": {"start": int(tests), "end": int(rl_40)}},
@@ -862,13 +976,10 @@ def build_pipeline_splits(
             "test": {"week": rl_week, "decision_ts_range": {"start": int(rl_70), "end": int(teste)}},
         },
         "eval": {
-            "full": {
-                "week": eval_week,
-                "decision_ts_range": {"start": int(evals), "end": int(evale)},
-                "start": int(evals),
-                "end": int(evale),
-            },
+            "full": _week_entry(eval_week),
         },
+        "available_stages": ["cmssl.train", "cmssl.val", "cmssl.test", "rl.train", "rl.val", "rl.test", "eval.full"],
+        "missing_stages": [],
     }
 
 
@@ -2393,6 +2504,7 @@ def build_global_meta_from_week_metas(
     pca_summary: dict,
     pca_var_ratio: Optional[np.ndarray],
     protocol: str,
+    ingest_stage: str,
     router: Optional[FlatWeekRouter],
     week_quality_records: Dict[str, dict],
 ) -> dict:
@@ -2413,6 +2525,8 @@ def build_global_meta_from_week_metas(
         "dataset_start": start_iso,
         "dataset_end": end_iso,
         "weeks_in_order": weeks_in_order,
+        "ingest_stage": ingest_stage,
+        "split_protocol": protocol,
         "decision_policy": DECISION_POLICY,
         "decision_time_basis": "ob_event_time",
         "window_ms": int(WINDOW_MS),
@@ -2524,6 +2638,7 @@ def process_all(
     pca_meta: dict,
     *,
     protocol: str,
+    ingest_stage: str = "full",
     append_missing_weeks: bool = False,
 ):
     """Run ingest across week pairs with ordered daily OB paths and mode-dependent TH paths (which may be empty in OB-only mode)."""
@@ -2598,8 +2713,8 @@ def process_all(
     if int(final_feature_dim) != int(FINAL_FEATURE_DIM):
         raise ValueError(f"Expected final_feature_dim={FINAL_FEATURE_DIM}, got {final_feature_dim}")
     weeks_in_order = [wk for wk, _ob, _th in pairs]
-    if append_missing_weeks and protocol != FIVE_WEEK_PROTOCOL:
-        raise ValueError("append_missing_weeks=True requires five-week protocol")
+    if append_missing_weeks and protocol not in {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}:
+        raise ValueError("append_missing_weeks=True requires a full four- or five-week protocol")
     expected_reuse_fields = {
         "feature_schema": FEATURE_SCHEMA,
         "aux_schema": AUX_SCHEMA,
@@ -2646,6 +2761,18 @@ def process_all(
     total_labels = 0
     week_index = _build_week_index(pairs_to_build)
 
+    existing_global_protocol = None
+    existing_global_meta_path = Path(out_root) / "meta.json"
+    if existing_global_meta_path.exists():
+        try:
+            existing_global_protocol = json.loads(existing_global_meta_path.read_text()).get("splits", {}).get("protocol")
+        except Exception:
+            existing_global_protocol = "<unreadable>"
+    print(
+        f"[append] requested_protocol={protocol} existing_global_protocol={existing_global_protocol} "
+        f"reusable_weeks={sorted(reused_week_metas.keys())} build_weeks={[wk for wk, _ob, _th in pairs_to_build]}",
+        flush=True,
+    )
     print(f"[append] requested_weeks={len(pairs)} reused={len(reused_week_metas)} build={len(pairs_to_build)}", flush=True)
     for wk in reused_week_metas:
         print(f"[reuse] week={wk}", flush=True)
@@ -2904,6 +3031,7 @@ def process_all(
         pca_summary=pca_summary,
         pca_var_ratio=pca_var_ratio,
         protocol=protocol,
+        ingest_stage=ingest_stage,
         router=router,
         week_quality_records=week_quality_records,
     )
@@ -3001,51 +3129,51 @@ def main():
         requested_set = set(requested_weeks)
         pairs = [pair for pair in pairs if pair[0] in requested_set]
 
-    pairs = _sort_pairs_by_end(pairs)
-    if len(pairs) not in (4, 5):
+    all_pairs = _sort_pairs_by_end(pairs)
+    if len(all_pairs) < 2:
         raise ValueError(
-            f"Need exactly 4 or 5 distinct consecutive weeks of data after BYBIT_WEEKS filtering; found {len(pairs)}."
+            f"Need at least 2 distinct consecutive weeks of data after BYBIT_WEEKS filtering; found {len(all_pairs)}."
         )
 
-    _assert_week_order(pairs)
-    _assert_weeks_consecutive(pairs)
+    _assert_week_order(all_pairs)
+    _assert_weeks_consecutive(all_pairs)
 
-    chosen_weeks = [wk for wk, _ob, _th in pairs]
+    protocol, selected_pairs = resolve_requested_protocol_and_pairs(all_pairs, INGEST_STAGE)
+    selected_weeks = [wk for wk, _ob, _th in selected_pairs]
+    train_week_keys = get_cmssl_train_week_keys_for_protocol(selected_weeks, protocol)
 
-    print(f"[plan ] weeks={len(pairs)} "
+    print(f"[plan ] available_weeks={len(all_pairs)} selected_weeks={len(selected_pairs)} "
           f"RAM={RAM_BUDGET}MB chunk_size={CHUNK_SIZE if CHUNK_SIZE>0 else 'auto'}")
-    print(f"[weeks] {', '.join(chosen_weeks)}")
+    print(f"[weeks] {', '.join(selected_weeks)}")
+    print(f"[ingest-stage] stage={INGEST_STAGE} protocol={protocol} selected_weeks={','.join(selected_weeks)}")
 
     print(f"[paths] OB_DIR={OB_DIR}")
     if trade_history_enabled:
         print(f"[paths] TH_DIR={TH_DIR}")
     print(f"[out  ] OUT_ROOT={OUT_ROOT}")
 
+    if APPEND_MISSING_WEEKS and INGEST_STAGE != "full":
+        raise ValueError("BYBIT_APPEND_MISSING_WEEKS=1 requires BYBIT_INGEST_STAGE=full")
+    if APPEND_MISSING_WEEKS and not PCA_USE_EXISTING:
+        raise ValueError("BYBIT_APPEND_MISSING_WEEKS=1 requires BYBIT_PCA_USE_EXISTING=1")
 
-    selected_weeks = [wk for wk, _ob, _th in pairs]
-    protocol = FIVE_WEEK_PROTOCOL if len(selected_weeks) == 5 else FOUR_WEEK_PROTOCOL
-    if APPEND_MISSING_WEEKS:
-        if protocol != FIVE_WEEK_PROTOCOL:
-            raise ValueError("BYBIT_APPEND_MISSING_WEEKS=1 requires exactly 5 weeks")
-        if not PCA_USE_EXISTING:
-            raise ValueError("BYBIT_APPEND_MISSING_WEEKS=1 requires BYBIT_PCA_USE_EXISTING=1")
-
-    if protocol == FOUR_WEEK_PROTOCOL:
-        week1, week2, week3, week4 = selected_weeks
-        print(
-            f"[split] protocol={FOUR_WEEK_PROTOCOL} cmssl.train={week1} cmssl.val={week2} cmssl.test={week3} rl={week3} eval={week4}"
-        )
-        train_week_keys = [week1]
-    else:
-        week1, week2, week3, week4, week5 = selected_weeks
-        print(
-            f"[split] protocol={FIVE_WEEK_PROTOCOL} cmssl.train={week1},{week2} cmssl.val={week3} cmssl.test={week4} rl={week4} eval={week5}"
-        )
-        print(f"[append] enabled={str(bool(APPEND_MISSING_WEEKS)).lower()}")
-        train_week_keys = [week1, week2]
+    split_preview = build_pipeline_splits(
+        selected_weeks,
+        {wk: {"decision_ts_range": {"min": i * 10, "max": i * 10 + 9}} for i, wk in enumerate(selected_weeks)},
+        protocol,
+    )
+    cmssl_preview = split_preview["cmssl"]
+    print(
+        f"[split] protocol={protocol} cmssl.train={','.join(cmssl_preview['train']['weeks'])} "
+        f"cmssl.val={','.join(cmssl_preview['val']['weeks'])} "
+        f"cmssl.test={','.join(cmssl_preview['test']['weeks']) if 'test' in cmssl_preview else '<missing>'} "
+        f"rl={','.join(split_preview.get('rl', {}).keys()) or '<missing>'} "
+        f"eval={','.join(split_preview.get('eval', {}).keys()) or '<missing>'}"
+    )
+    print(f"[append] enabled={str(bool(APPEND_MISSING_WEEKS)).lower()}")
 
     pca_fit_meta = maybe_fit_pca_model(
-        pairs,
+        selected_pairs,
         OUT_ROOT,
         train_week_keys,
         PCA_VAR_TARGET,
@@ -3057,10 +3185,11 @@ def main():
     )
 
     process_all(
-        pairs,
+        selected_pairs,
         OUT_ROOT,
         pca_fit_meta,
         protocol=protocol,
+        ingest_stage=INGEST_STAGE,
         append_missing_weeks=bool(APPEND_MISSING_WEEKS),
     )
 

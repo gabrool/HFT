@@ -43,6 +43,11 @@ from CMSSL17 import (  # type: ignore
     derive_dir_mag_predictions, derive_mag_pred_sqrt_for_mag_loss,
     SAM,
     build_dataset_from_split,
+    FOUR_WEEK_PROTOCOL,
+    FIVE_WEEK_PROTOCOL,
+    CMSSL_TRAIN_VAL_PROTOCOL,
+    CMSSL_TRAIN_VAL_TEST_PROTOCOL,
+    SUPPORTED_SPLIT_PROTOCOLS,
 )
 
 # ---------------- Config via env ----------------
@@ -97,9 +102,7 @@ print(f"[gate-config] warmup_steps={GATE_WARMUP_STEPS} gate_lr={GATE_LR}", flush
 
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
-FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
-FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
-SUPPORTED_PROTOCOLS = {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}
+SUPPORTED_PROTOCOLS = set(SUPPORTED_SPLIT_PROTOCOLS)
 FAST_VAL_MAX_ROWS = 200_000
 FULL_VAL_EVERY = 5
 TRAIN_ROW_STRIDE = int(os.environ.get("BYBIT_TRAIN_ROW_STRIDE", "5"))
@@ -236,11 +239,28 @@ def require_supported_pipeline_splits(meta: dict, out_root: Path) -> dict:
     if not isinstance(splits, dict):
         raise KeyError("meta['splits'] must be a dict. Rerun offline_ingest.")
 
+    protocol = splits.get("protocol")
+    if protocol not in SUPPORTED_PROTOCOLS:
+        raise ValueError(
+            f"meta['splits']['protocol'] must be one of {sorted(SUPPORTED_PROTOCOLS)}. Rerun offline_ingest."
+        )
+
     if "weeks_in_order" not in meta:
         raise KeyError("meta.json missing required key 'weeks_in_order'. Rerun offline_ingest.")
     weeks_in_order = meta["weeks_in_order"]
-    if not isinstance(weeks_in_order, list) or len(weeks_in_order) not in (4, 5) or not all(isinstance(w, str) and w for w in weeks_in_order):
-        raise KeyError("meta['weeks_in_order'] must be a list[str] with exactly 4 or 5 entries. Rerun offline_ingest.")
+    if not isinstance(weeks_in_order, list) or not all(isinstance(w, str) and w for w in weeks_in_order):
+        raise KeyError("meta['weeks_in_order'] must be a non-empty list[str]. Rerun offline_ingest.")
+    expected_week_counts = {
+        FIVE_WEEK_PROTOCOL: {5},
+        FOUR_WEEK_PROTOCOL: {4},
+        CMSSL_TRAIN_VAL_PROTOCOL: {2, 3},
+        CMSSL_TRAIN_VAL_TEST_PROTOCOL: {3, 4},
+    }[protocol]
+    if len(weeks_in_order) not in expected_week_counts:
+        raise KeyError(
+            f"meta['weeks_in_order'] has {len(weeks_in_order)} entries but protocol {protocol} requires "
+            f"{sorted(expected_week_counts)}. Rerun offline_ingest."
+        )
 
     decision_time_basis = meta.get("decision_time_basis")
     if decision_time_basis != EXPECTED_DECISION_TIME_BASIS:
@@ -259,12 +279,6 @@ def require_supported_pipeline_splits(meta: dict, out_root: Path) -> dict:
                 f"got {decision_policy!r}. "
                 "Rerun offline_ingest to regenerate metadata with event-time decisions enabled."
             )
-
-    protocol = splits.get("protocol")
-    if protocol not in SUPPORTED_PROTOCOLS:
-        raise ValueError(
-            f"meta['splits']['protocol'] must be one of {sorted(SUPPORTED_PROTOCOLS)}. Rerun offline_ingest."
-        )
 
     known_weeks = set(weeks_in_order)
 
@@ -308,25 +322,12 @@ def require_supported_pipeline_splits(meta: dict, out_root: Path) -> dict:
 
         decision_ts_range = entry.get("decision_ts_range")
         if require_range:
-            if not isinstance(decision_ts_range, dict):
+            if not isinstance(decision_ts_range, dict) or "start" not in decision_ts_range or "end" not in decision_ts_range:
                 raise KeyError(
                     f"meta['splits']['{stage}'] must include decision_ts_range with start/end. Rerun offline_ingest."
                 )
-            if "start" not in decision_ts_range or "end" not in decision_ts_range:
-                raise KeyError(
-                    f"meta['splits']['{stage}']['decision_ts_range'] must include start/end. Rerun offline_ingest."
-                )
-            try:
-                start = int(decision_ts_range["start"])
-                end = int(decision_ts_range["end"])
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"meta['splits']['{stage}']['decision_ts_range'] start/end must be integers. Rerun offline_ingest."
-                )
-            if start >= end:
-                raise ValueError(
-                    f"meta['splits']['{stage}']['decision_ts_range'] must satisfy start < end. Rerun offline_ingest."
-                )
+            start = int(decision_ts_range["start"])
+            end = int(decision_ts_range["end"])
         else:
             explicit_start = entry.get("start")
             explicit_end = entry.get("end")
@@ -335,35 +336,42 @@ def require_supported_pipeline_splits(meta: dict, out_root: Path) -> dict:
                     explicit_start = decision_ts_range.get("start")
                     explicit_end = decision_ts_range.get("end")
             if explicit_start is not None and explicit_end is not None:
-                try:
-                    start = int(explicit_start)
-                    end = int(explicit_end)
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        f"meta['splits']['{stage}'] explicit start/end must be integers. Rerun offline_ingest."
-                    )
+                start = int(explicit_start)
+                end = int(explicit_end)
             else:
                 start, end = _full_week_range(weeks[0], stage)
-            if start >= end:
-                raise ValueError(
-                    f"meta['splits']['{stage}'] must satisfy start < end. Rerun offline_ingest."
-                )
+        if start >= end:
+            raise ValueError(f"meta['splits']['{stage}'] must satisfy start < end. Rerun offline_ingest.")
 
         return {"weeks": weeks, "start": start, "end": end}
 
-    required_entries = {
-        "cmssl.train": ("cmssl", "train", False),
-        "cmssl.val": ("cmssl", "val", False),
-        "cmssl.test": ("cmssl", "test", False),
-        "rl.train": ("rl", "train", True),
-        "rl.val": ("rl", "val", True),
-        "rl.test": ("rl", "test", True),
-        "eval.full": ("eval", "full", False),
-    }
+    if protocol in {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}:
+        required_entries = {
+            "cmssl.train": ("cmssl", "train", False),
+            "cmssl.val": ("cmssl", "val", False),
+            "cmssl.test": ("cmssl", "test", False),
+            "rl.train": ("rl", "train", True),
+            "rl.val": ("rl", "val", True),
+            "rl.test": ("rl", "test", True),
+            "eval.full": ("eval", "full", False),
+        }
+    elif protocol == CMSSL_TRAIN_VAL_PROTOCOL:
+        required_entries = {
+            "cmssl.train": ("cmssl", "train", False),
+            "cmssl.val": ("cmssl", "val", False),
+        }
+    elif protocol == CMSSL_TRAIN_VAL_TEST_PROTOCOL:
+        required_entries = {
+            "cmssl.train": ("cmssl", "train", False),
+            "cmssl.val": ("cmssl", "val", False),
+            "cmssl.test": ("cmssl", "test", False),
+        }
+    else:
+        raise ValueError(f"Unsupported split protocol: {protocol}")
 
     normalized = {"protocol": protocol}
     for section in ("cmssl", "rl", "eval"):
-        sec = splits.get(section)
+        sec = splits.get(section, {})
         if not isinstance(sec, dict):
             raise KeyError(f"meta['splits']['{section}'] must be a dict. Rerun offline_ingest.")
         normalized[section] = {}
@@ -395,18 +403,42 @@ def require_supported_pipeline_splits(meta: dict, out_root: Path) -> dict:
             raise ValueError("meta['splits']['rl'] train/val/test must all reference weeks_in_order[3].")
         if normalized["eval"]["full"]["weeks"] != [week5]:
             raise ValueError("meta['splits']['eval']['full'] must reference weeks_in_order[4].")
+    elif protocol == CMSSL_TRAIN_VAL_PROTOCOL:
+        if len(weeks_in_order) == 3:
+            week1, week2, week3 = weeks_in_order
+            expected_train, expected_val = [week1, week2], [week3]
+        else:
+            week1, week2 = weeks_in_order
+            expected_train, expected_val = [week1], [week2]
+        if normalized["cmssl"]["train"]["weeks"] != expected_train:
+            raise ValueError("meta['splits']['cmssl']['train'] does not match the CMSSL train+val protocol week layout.")
+        if normalized["cmssl"]["val"]["weeks"] != expected_val:
+            raise ValueError("meta['splits']['cmssl']['val'] does not match the CMSSL train+val protocol week layout.")
+    elif protocol == CMSSL_TRAIN_VAL_TEST_PROTOCOL:
+        if len(weeks_in_order) == 4:
+            week1, week2, week3, week4 = weeks_in_order
+            expected_train, expected_val, expected_test = [week1, week2], [week3], [week4]
+        else:
+            week1, week2, week3 = weeks_in_order
+            expected_train, expected_val, expected_test = [week1], [week2], [week3]
+        if normalized["cmssl"]["train"]["weeks"] != expected_train:
+            raise ValueError("meta['splits']['cmssl']['train'] does not match the CMSSL train+val+test protocol week layout.")
+        if normalized["cmssl"]["val"]["weeks"] != expected_val:
+            raise ValueError("meta['splits']['cmssl']['val'] does not match the CMSSL train+val+test protocol week layout.")
+        if normalized["cmssl"]["test"]["weeks"] != expected_test:
+            raise ValueError("meta['splits']['cmssl']['test'] does not match the CMSSL train+val+test protocol week layout.")
 
-    rl_train = normalized["rl"]["train"]
-    rl_val = normalized["rl"]["val"]
-    rl_test = normalized["rl"]["test"]
-    if not (rl_train["end"] <= rl_val["start"] < rl_val["end"] <= rl_test["start"] < rl_test["end"]):
-        raise ValueError(
-            "meta['splits']['rl'] train/val/test decision_ts_range must be strictly ordered and non-overlapping."
-        )
-
-    eval_full = normalized["eval"]["full"]
-    if not eval_full["weeks"]:
-        raise ValueError("meta['splits']['eval']['full'] must reference at least one week.")
+    if protocol in {FOUR_WEEK_PROTOCOL, FIVE_WEEK_PROTOCOL}:
+        rl_train = normalized["rl"]["train"]
+        rl_val = normalized["rl"]["val"]
+        rl_test = normalized["rl"]["test"]
+        if not (rl_train["end"] <= rl_val["start"] < rl_val["end"] <= rl_test["start"] < rl_test["end"]):
+            raise ValueError(
+                "meta['splits']['rl'] train/val/test decision_ts_range must be strictly ordered and non-overlapping."
+            )
+        eval_full = normalized["eval"]["full"]
+        if not eval_full["weeks"]:
+            raise ValueError("meta['splits']['eval']['full'] must reference at least one week.")
 
     return {
         "protocol": protocol,
@@ -2356,31 +2388,41 @@ def train_from_offline():
 
     cmssl_train = splits['cmssl']['train']
     cmssl_val = splits['cmssl']['val']
-    cmssl_test = splits['cmssl']['test']
+    cmssl_test = splits["cmssl"].get("test")
+    has_cmssl_test = isinstance(cmssl_test, dict)
     train_week_keys = list(cmssl_train["weeks"])
-    print(
-        f"[split] protocol={protocol} cmssl.train={','.join(train_week_keys)} "
-        f"cmssl.val={cmssl_val['weeks']} cmssl.test={cmssl_test['weeks']}",
-        flush=True,
-    )
+    if has_cmssl_test:
+        print(
+            f"[split] protocol={protocol} cmssl.train={','.join(train_week_keys)} "
+            f"cmssl.val={cmssl_val['weeks']} cmssl.test={cmssl_test['weeks']}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[split] protocol={protocol} cmssl.train={','.join(train_week_keys)} "
+            f"cmssl.val={cmssl_val['weeks']} cmssl.test=<missing>",
+            flush=True,
+        )
     train_split_entries = [
         make_single_week_split_from_meta(out_root=out_root, global_meta=meta, week_key=wk)
         for wk in train_week_keys
     ]
     ds_train_list = [build_dataset_from_split(str(out_root), entry) for entry in train_split_entries]
     ds_val = build_dataset_from_split(str(out_root), cmssl_val)
-    ds_test = build_dataset_from_split(str(out_root), cmssl_test)
+    ds_test = build_dataset_from_split(str(out_root), cmssl_test) if has_cmssl_test else None
     F_total = int(meta.get("feature_dim_total", 0))
     for i, ds_train in enumerate(ds_train_list):
         if F_total != int(ds_train.feature_dim_total):
             raise ValueError(f"Feature dimension mismatch: meta={F_total}, train_dataset={int(ds_train.feature_dim_total)}")
         if int(ds_train.lookback) != int(LOOKBACK):
             raise ValueError(f"LOOKBACK mismatch: config={LOOKBACK}, train_dataset={int(ds_train.lookback)}")
-    for split_name, ds in (
+    split_items = [
         *[(f"train[{i}]/{train_week_keys[i]}", ds_train_i) for i, ds_train_i in enumerate(ds_train_list)],
         ("val", ds_val),
-        ("test", ds_test),
-    ):
+    ]
+    if has_cmssl_test:
+        split_items.append(("test", ds_test))
+    for split_name, ds in split_items:
         if len(ds.stores) != 1:
             raise ValueError(f"{split_name} split must have exactly one store/week, got {len(ds.stores)}")
         if ds.week_ids.size and not np.all(ds.week_ids == 0):
@@ -2393,7 +2435,10 @@ def train_from_offline():
     tr_start = int(min(entry["start"] for entry in train_split_entries))
     tr_end = int(max(entry["end"] for entry in train_split_entries))
     va_start,va_end=int(cmssl_val['start']),int(cmssl_val['end'])
-    te_start,te_end=int(cmssl_test['start']),int(cmssl_test['end'])
+    if has_cmssl_test:
+        te_start,te_end=int(cmssl_test['start']),int(cmssl_test['end'])
+    else:
+        te_start,te_end=None,None
 
     cache_path=out_root/'signed_side_trim_stats_cache.npz'
     cache_meta={
@@ -2907,32 +2952,35 @@ def train_from_offline():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    test_full_src = CPUWindowBatchSource(
-        ds_test,
-        device,
-        BATCH_SIZE,
-        shuffle=False,
-        drop_last=False,
-        row_stride=1,
-    )
-    print(
-        f"[cpu_test_data] test_full rows={test_full_src.n_rows} row_stride={test_full_src.row_stride} "
-        f"feature_shape={test_full_src.feature_shape} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
-        f"feature_gb_cpu={test_full_src.feature_gb:.3f} label_index_gb_cpu={test_full_src.label_index_gb:.3f} "
-        f"pin_memory={test_full_src.pin_memory}"
-    )
+    if has_cmssl_test:
+        test_full_src = CPUWindowBatchSource(
+            ds_test,
+            device,
+            BATCH_SIZE,
+            shuffle=False,
+            drop_last=False,
+            row_stride=1,
+        )
+        print(
+            f"[cpu_test_data] test_full rows={test_full_src.n_rows} row_stride={test_full_src.row_stride} "
+            f"feature_shape={test_full_src.feature_shape} feature_dtype={FEATURE_STORAGE_DTYPE_NAME} "
+            f"feature_gb_cpu={test_full_src.feature_gb:.3f} label_index_gb_cpu={test_full_src.label_index_gb:.3f} "
+            f"pin_memory={test_full_src.pin_memory}"
+        )
 
-    test=summarize_metrics(model, test_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name="test")
-    test_value, test_label = compute_primary_metric(test)
-    print(
-        f"[test] rows={test.get('n_eval_rows', 0)} primary_metric_name={test_label} value={test_value:.6f} "
-        f"guard_dir_bal_acc={test.get('primary_dir_bal_acc', float('nan')):.6f} "
-        f"guard_passed={test.get('primary_metric_guard_passed', False)}"
-    )
-    if BAND_DIAG:
-        best_epoch_or_0 = int(ckpt.get('epoch', 0)) if isinstance(ckpt, dict) else 0
-        print_band_metrics_summary(test["band_metrics"], split_name="test", epoch=best_epoch_or_0)
-        save_band_metrics_jsonl(out_root, test["band_metrics"], epoch=best_epoch_or_0, split_name="test")
+        test=summarize_metrics(model, test_full_src, device, stats, amp_enabled, amp_dtype, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name="test")
+        test_value, test_label = compute_primary_metric(test)
+        print(
+            f"[test] rows={test.get('n_eval_rows', 0)} primary_metric_name={test_label} value={test_value:.6f} "
+            f"guard_dir_bal_acc={test.get('primary_dir_bal_acc', float('nan')):.6f} "
+            f"guard_passed={test.get('primary_metric_guard_passed', False)}"
+        )
+        if BAND_DIAG:
+            best_epoch_or_0 = int(ckpt.get('epoch', 0)) if isinstance(ckpt, dict) else 0
+            print_band_metrics_summary(test["band_metrics"], split_name="test", epoch=best_epoch_or_0)
+            save_band_metrics_jsonl(out_root, test["band_metrics"], epoch=best_epoch_or_0, split_name="test")
+    else:
+        print(f"[test] skipped: cmssl.test split not present for protocol={protocol}", flush=True)
     print('[done] Training complete.')
 
 
