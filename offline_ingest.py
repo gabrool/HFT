@@ -69,9 +69,10 @@ PCA_MAX_COMPONENTS  = int(os.environ.get("BYBIT_PCA_MAX_COMPONENTS", "506"))
 PCA_BATCH_SIZE      = int(os.environ.get("BYBIT_PCA_BATCH", "4096"))
 PCA_MODEL_FILENAME  = os.environ.get("BYBIT_PCA_MODEL", "pca_model.npz")
 PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
-PCA_WEEKDAY_ROWS_PER_DAY = 20_000
+PCA_SAMPLE_ROWS = int(os.environ.get("BYBIT_PCA_SAMPLE_ROWS", "200000"))
 PCA_SAMPLE_START_UTC_HOUR = 14
 PCA_SAMPLE_START_UTC_MINUTE = 30
+PCA_SAMPLE_MODE = "first_monday_fixed_utc_200k_block_v1"
 if PCA_SELECT_MODE != "max_components":
     raise ValueError("BYBIT_PCA_SELECT_MODE must be 'max_components' for the 1s maker contract")
 
@@ -1810,17 +1811,9 @@ class EventFeeder:
             self._put(("eof", None, exc))
 
 
-def collect_weekday_fixed_utc_pca_sample(
-    train_pairs: List[WeekPair],
-    *,
-    rows_per_day: int = PCA_WEEKDAY_ROWS_PER_DAY,
-    start_hour_utc: int = PCA_SAMPLE_START_UTC_HOUR,
-    start_minute_utc: int = PCA_SAMPLE_START_UTC_MINUTE,
-) -> np.ndarray:
+def _first_monday_pca_day_entry(train_pairs: List[WeekPair]) -> Tuple[str, date, str, str]:
     if not train_pairs:
         raise ValueError("No train pairs provided for PCA sampling")
-    if rows_per_day < 1:
-        raise ValueError(f"PCA weekday rows_per_day must be >=1, got {rows_per_day}")
 
     day_entries: List[Tuple[str, date, str, str]] = []
     for week_key, ob_paths, th_paths in train_pairs:
@@ -1828,84 +1821,93 @@ def collect_weekday_fixed_utc_pca_sample(
             raise ValueError(f"PCA sampling week {week_key}: OB/TH day count mismatch")
         for idx, ob_path in enumerate(ob_paths):
             day = _daily_path_day(ob_path, "OB", week_key=week_key)
-            if day.weekday() > 4:
-                continue
             th_path = th_paths[idx] if th_paths else ""
             if th_path:
                 th_day = _daily_path_day(th_path, "TH", week_key=week_key)
                 if th_day != day:
                     raise ValueError(f"PCA sampling week {week_key}: OB/TH day mismatch for {day.isoformat()}")
-            day_entries.append((week_key, day, ob_path, th_path))
+            if day.weekday() == 0:
+                day_entries.append((week_key, day, ob_path, th_path))
 
     if not day_entries:
-        raise ValueError("No Monday-Friday train days available for PCA sampling")
-
+        raise ValueError("No Monday train day available for PCA sampling")
     day_entries.sort(key=lambda x: (x[1], x[0], x[2]))
-    unique_weekdays = len(day_entries)
-    expected_rows = int(unique_weekdays * rows_per_day)
+    return day_entries[0]
+
+
+def collect_first_monday_fixed_utc_pca_sample(
+    train_pairs: List[WeekPair],
+    *,
+    sample_rows: int = PCA_SAMPLE_ROWS,
+    start_hour_utc: int = PCA_SAMPLE_START_UTC_HOUR,
+    start_minute_utc: int = PCA_SAMPLE_START_UTC_MINUTE,
+) -> np.ndarray:
+    if sample_rows < 1:
+        raise ValueError(f"PCA sample_rows must be >=1, got {sample_rows}")
+
+    selected_week_key, selected_day, ob_path, th_path = _first_monday_pca_day_entry(train_pairs)
     print(
-        f"[pca-sample] mode=weekday_fixed_utc_block train_weeks={len(train_pairs)} "
-        f"weekdays={unique_weekdays} rows_per_day={rows_per_day} "
-        f"start_utc={start_hour_utc:02d}:{start_minute_utc:02d}:00 total_rows={expected_rows}",
+        f"[pca-sample] mode={PCA_SAMPLE_MODE} train_weeks={len(train_pairs)} "
+        f"day={selected_day.isoformat()} rows={sample_rows} "
+        f"start_utc={start_hour_utc:02d}:{start_minute_utc:02d}:00",
         flush=True,
     )
 
+    start_dt = datetime.combine(
+        selected_day,
+        datetime.min.time().replace(hour=start_hour_utc, minute=start_minute_utc),
+        tzinfo=timezone.utc,
+    )
+    start_ts_ms = _dt_to_epoch_ms(start_dt)
+    day_start_ms = _dt_to_epoch_ms(datetime.combine(selected_day, datetime.min.time(), tzinfo=timezone.utc))
+    day_end_ms = _dt_to_epoch_ms(datetime.combine(selected_day + ONE_DAY, datetime.min.time(), tzinfo=timezone.utc))
+
     fe = FeatureEngine()
     out_rows: List[np.ndarray] = []
+    first_ts: Optional[int] = None
+    last_ts: Optional[int] = None
     stream_started = time.monotonic()
-    for week_key, day, ob_path, th_path in day_entries:
-        start_dt = datetime.combine(
-            day,
-            datetime.min.time().replace(hour=start_hour_utc, minute=start_minute_utc),
-            tzinfo=timezone.utc,
-        )
-        start_ts_ms = _dt_to_epoch_ms(start_dt)
-        day_start_ms = _dt_to_epoch_ms(datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc))
-        day_end_ms = _dt_to_epoch_ms(datetime.combine(day + ONE_DAY, datetime.min.time(), tzinfo=timezone.utc))
-        ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day=None)
-        if th_path:
-            th_iter = safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day=None)
-            merged = merge_event_time(ob_iter, th_iter, dq_day=None, strict=bool(BYBIT_STRICT_DATA), B=0)
-        else:
-            merged = ob_iter
 
-        day_rows: List[np.ndarray] = []
-        first_ts: Optional[int] = None
-        last_ts: Optional[int] = None
-        for event in merged:
-            ts_ms, feat_z, _dt_ms, is_decision, _mid = fe.on_fast_event(event)
-            if not is_decision:
-                continue
-            ts_i = int(ts_ms)
-            if ts_i < start_ts_ms:
-                continue
-            if first_ts is None:
-                first_ts = ts_i
-            last_ts = ts_i
-            day_rows.append(np.asarray(feat_z, dtype=np.float32))
-            if len(day_rows) >= rows_per_day:
-                break
-        if len(day_rows) != rows_per_day:
-            raise ValueError(
-                f"PCA weekday sample for {day.isoformat()} produced {len(day_rows)} rows, expected {rows_per_day}. "
-                "Do not silently fall back to first-row PCA sampling."
-            )
-        out_rows.extend(day_rows)
-        print(
-            f"[pca-sample-day] day={day.isoformat()} week={week_key} rows={len(day_rows)} "
-            f"first_ts={first_ts} last_ts={last_ts}",
-            flush=True,
+    ob_iter = safe_ob_iter(ob_path, day_start_ms, day_end_ms, dq_day=None)
+    if th_path:
+        th_iter = safe_th_iter(th_path, day_start_ms, day_end_ms, dq_day=None)
+        merged = merge_event_time(ob_iter, th_iter, dq_day=None, strict=bool(BYBIT_STRICT_DATA), B=0)
+    else:
+        merged = ob_iter
+
+    for event in merged:
+        ts_ms, feat_z, _dt_ms, is_decision, _mid = fe.on_fast_event(event)
+        if not is_decision:
+            continue
+        ts_i = int(ts_ms)
+        if ts_i < start_ts_ms:
+            continue
+        if first_ts is None:
+            first_ts = ts_i
+        last_ts = ts_i
+        out_rows.append(np.asarray(feat_z, dtype=np.float32))
+        if len(out_rows) >= sample_rows:
+            break
+
+    if len(out_rows) != sample_rows:
+        raise ValueError(
+            f"PCA first-Monday sample for {selected_day.isoformat()} produced {len(out_rows)} rows, "
+            f"expected {sample_rows}. Do not spill to Tuesday or silently fall back."
         )
+    print(
+        f"[pca-sample-day] day={selected_day.isoformat()} week={selected_week_key} rows={len(out_rows)} "
+        f"first_ts={first_ts} last_ts={last_ts}",
+        flush=True,
+    )
 
     sample_array = np.asarray(out_rows, dtype=np.float32)
-    if int(sample_array.shape[0]) != expected_rows:
-        raise ValueError(f"PCA weekday sample rows mismatch: got {sample_array.shape[0]} expected {expected_rows}")
+    if int(sample_array.shape[0]) != int(sample_rows):
+        raise ValueError(f"PCA first-Monday sample rows mismatch: got {sample_array.shape[0]} expected {sample_rows}")
     _print_coarse_timing_totals(
         "[pca-time]",
         {"wall_s": time.monotonic() - stream_started},
     )
     return sample_array
-
 
 def _fit_pca_svd_from_sample(
     sample_rows: np.ndarray,
@@ -1997,6 +1999,11 @@ def maybe_fit_pca_model(
         f"[pca-feature-schema] schema={FEATURE_SCHEMA} raw_dim={len(feature_names_pre_pca)} names_hash={names_hash}",
         flush=True,
     )
+    if len(feature_names_pre_pca) < PCA_CORE_COMPONENTS:
+        raise ValueError(
+            f"Raw core feature dimension {len(feature_names_pre_pca)} is smaller than "
+            f"required PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS}; cannot produce final feature_dim_total=512."
+        )
     meta = {
         "applied": False,
         "var_kept": float(target_var),
@@ -2034,7 +2041,7 @@ def maybe_fit_pca_model(
                     raise ValueError("PCA feature names hash mismatch")
                 if str(model_meta.get("pca_select_mode", "")).strip().lower() != str(select_mode).strip().lower():
                     raise ValueError("PCA select mode mismatch")
-                if str(model_meta.get("pca_sample_mode", "")) != "weekday_fixed_utc_block":
+                if str(model_meta.get("pca_sample_mode", "")) != PCA_SAMPLE_MODE:
                     raise ValueError("PCA sample mode mismatch")
                 if int(model_meta.get("aux_dim", -1)) != int(AUX_DIM):
                     raise ValueError("PCA aux_dim mismatch")
@@ -2056,7 +2063,12 @@ def maybe_fit_pca_model(
             "final_feature_dim": int(FINAL_FEATURE_DIM),
             "pca_core_components_required": int(PCA_CORE_COMPONENTS),
             "model_path": model_filename,
-            "pca_sample_mode": "weekday_fixed_utc_block",
+            "pca_sample_mode": PCA_SAMPLE_MODE,
+            "pca_sample_start_utc": str(model_meta.get("pca_sample_start_utc", f"{PCA_SAMPLE_START_UTC_HOUR:02d}:{PCA_SAMPLE_START_UTC_MINUTE:02d}:00")),
+            "pca_sample_rows": int(model_meta.get("pca_sample_rows", 0)),
+            "pca_sample_day": str(model_meta.get("pca_sample_day", "")),
+            "pca_sample_week": str(model_meta.get("pca_sample_week", "")),
+            "pca_sample_warmup_from_day_start": bool(model_meta.get("pca_sample_warmup_from_day_start", True)),
         })
         print(f"[pca  ] Reusing existing PCA model '{model_path}' (k={k})")
         return meta
@@ -2067,9 +2079,10 @@ def maybe_fit_pca_model(
         raise ValueError(f"PCA is required for FEATURE_SCHEMA={FEATURE_SCHEMA}")
 
     _ = int(batch_size)
-    sample_array = collect_weekday_fixed_utc_pca_sample(train_pairs)
+    selected_week_key, selected_day, _selected_ob_path, _selected_th_path = _first_monday_pca_day_entry(train_pairs)
+    sample_array = collect_first_monday_fixed_utc_pca_sample(train_pairs)
     print(
-        f"[pca-fit] method=deterministic_weekday_fixed_utc rows={sample_array.shape[0]} raw_dim={sample_array.shape[1]}",
+        f"[pca-fit] method=deterministic_first_monday_fixed_utc rows={sample_array.shape[0]} raw_dim={sample_array.shape[1]}",
         flush=True,
     )
     pca_fit = _fit_pca_svd_from_sample(
@@ -2103,18 +2116,19 @@ def maybe_fit_pca_model(
                     "feature_names_hash": names_hash,
                     "created_by": "offline_ingest.py",
                     "stage": FEATURE_SCHEMA,
-                    "pca_fit_method": "deterministic_weekday_fixed_utc_svd",
+                    "pca_fit_method": "deterministic_first_monday_fixed_utc_svd",
                     "pca_select_mode": str(select_mode),
                     "pca_max_components": int(max_components),
                     "k": int(k),
                     "pca_k": int(k),
                     "final_feature_dim": int(FINAL_FEATURE_DIM),
                     "pca_core_components_required": int(PCA_CORE_COMPONENTS),
-                    "pca_sample_mode": "weekday_fixed_utc_block",
+                    "pca_sample_mode": PCA_SAMPLE_MODE,
                     "pca_sample_start_utc": f"{PCA_SAMPLE_START_UTC_HOUR:02d}:{PCA_SAMPLE_START_UTC_MINUTE:02d}:00",
-                    "pca_weekday_rows_per_day": int(PCA_WEEKDAY_ROWS_PER_DAY),
-                    "pca_sample_weekdays": int(sample_array.shape[0] // PCA_WEEKDAY_ROWS_PER_DAY),
                     "pca_sample_rows": int(sample_array.shape[0]),
+                    "pca_sample_day": selected_day.isoformat(),
+                    "pca_sample_week": selected_week_key,
+                    "pca_sample_warmup_from_day_start": True,
                     "pca_target_var": float(target_var),
                     "pca_total_explained_variance_ratio": float(total_kept),
                 },
@@ -2134,16 +2148,18 @@ def maybe_fit_pca_model(
             "model_path": model_filename,
             "rows_fitted": int(sample_array.shape[0]),
             "sample_rows": int(sample_array.shape[0]),
-            "fit_method": "deterministic_weekday_fixed_utc_svd",
+            "fit_method": "deterministic_first_monday_fixed_utc_svd",
             "pca_select_mode": str(select_mode),
             "pca_max_components": int(max_components),
             "pca_target_var": float(target_var),
             "pca_total_explained_variance_ratio": float(total_kept),
             "total_explained_variance_ratio": float(total_kept),
-            "pca_sample_mode": "weekday_fixed_utc_block",
+            "pca_sample_mode": PCA_SAMPLE_MODE,
             "pca_sample_start_utc": f"{PCA_SAMPLE_START_UTC_HOUR:02d}:{PCA_SAMPLE_START_UTC_MINUTE:02d}:00",
-            "pca_weekday_rows_per_day": int(PCA_WEEKDAY_ROWS_PER_DAY),
-            "pca_sample_weekdays": int(sample_array.shape[0] // PCA_WEEKDAY_ROWS_PER_DAY),
+            "pca_sample_rows": int(sample_array.shape[0]),
+            "pca_sample_day": selected_day.isoformat(),
+            "pca_sample_week": selected_week_key,
+            "pca_sample_warmup_from_day_start": True,
         }
     )
 
@@ -2170,9 +2186,12 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
         "feature_names_pre_pca": [],
         "feature_dim_core_pre_pca": 0,
         "feature_names_hash": "",
-        "pca_sample_mode": "weekday_fixed_utc_block",
+        "pca_sample_mode": PCA_SAMPLE_MODE,
         "pca_sample_start_utc": f"{PCA_SAMPLE_START_UTC_HOUR:02d}:{PCA_SAMPLE_START_UTC_MINUTE:02d}:00",
-        "pca_weekday_rows_per_day": int(PCA_WEEKDAY_ROWS_PER_DAY),
+        "pca_sample_rows": 0,
+        "pca_sample_day": "",
+        "pca_sample_week": "",
+        "pca_sample_warmup_from_day_start": True,
     }
     if not meta:
         return base
@@ -2193,9 +2212,10 @@ def _summarise_pca_meta(meta: Optional[dict]) -> dict:
             "feature_names_hash": str(meta.get("feature_names_hash", "")),
             "pca_sample_mode": str(meta.get("pca_sample_mode", base["pca_sample_mode"])),
             "pca_sample_start_utc": str(meta.get("pca_sample_start_utc", base["pca_sample_start_utc"])),
-            "pca_weekday_rows_per_day": int(meta.get("pca_weekday_rows_per_day", base["pca_weekday_rows_per_day"])),
             "pca_sample_rows": int(meta.get("sample_rows", meta.get("pca_sample_rows", 0))),
-            "pca_sample_weekdays": int(meta.get("pca_sample_weekdays", 0)),
+            "pca_sample_day": str(meta.get("pca_sample_day", base["pca_sample_day"])),
+            "pca_sample_week": str(meta.get("pca_sample_week", base["pca_sample_week"])),
+            "pca_sample_warmup_from_day_start": bool(meta.get("pca_sample_warmup_from_day_start", base["pca_sample_warmup_from_day_start"])),
             "pca_target_var": float(meta.get("pca_target_var", PCA_VAR_TARGET)),
             "pca_total_explained_variance_ratio": float(meta.get("pca_total_explained_variance_ratio", meta.get("total_explained_variance_ratio", 0.0))),
         }
@@ -2356,8 +2376,8 @@ def load_reusable_week_meta(
         )
     if str(pca.get("pca_select_mode", "")).strip().lower() != str(expected.get("pca_select_mode", "")).strip().lower():
         raise ValueError(f"[reuse] week={week_key} PCA select_mode mismatch")
-    if str(pca.get("pca_sample_mode", "")) != "weekday_fixed_utc_block":
-        raise ValueError(f"[reuse] week={week_key} PCA sample_mode must be weekday_fixed_utc_block")
+    if str(pca.get("pca_sample_mode", "")) != PCA_SAMPLE_MODE:
+        raise ValueError(f"[reuse] week={week_key} PCA sample_mode must be {PCA_SAMPLE_MODE}")
     if str(meta.get("feature_names_hash", "")) != str(expected.get("feature_names_hash", "")):
         raise ValueError(f"[reuse] week={week_key} feature_names_hash mismatch")
     if int(meta.get("aux_dim", -1)) != int(AUX_DIM):
@@ -2544,7 +2564,7 @@ def process_all(
         raise ValueError("PCA feature_names_hash mismatch")
     if str(model_meta.get("pca_select_mode", "")).strip().lower() != str(PCA_SELECT_MODE).strip().lower():
         raise ValueError("PCA pca_select_mode mismatch")
-    if str(model_meta.get("pca_sample_mode", "")) != "weekday_fixed_utc_block":
+    if str(model_meta.get("pca_sample_mode", "")) != PCA_SAMPLE_MODE:
         raise ValueError("PCA pca_sample_mode mismatch")
     if int(model_meta.get("aux_dim", -1)) != int(AUX_DIM):
         raise ValueError("PCA aux_dim mismatch")
