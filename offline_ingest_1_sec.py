@@ -1834,28 +1834,44 @@ class EventFeeder:
         self.queue: "queue.Queue[Tuple[str, Optional[str], Optional[object]]]" = queue.Queue(maxsize=maxsize)
         self._last_first_ts: Optional[int] = None
         self.collect_quality = bool(collect_quality)
+        self.stop_event = threading.Event()
         self.week_qualities: Dict[str, WeekQuality] = {}
         self.quality_by_week: Dict[str, Dict[str, object]] = {}
 
-    def _put(self, item: Tuple[str, Optional[str], Optional[object]]):
-        self.queue.put(item)
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _put(self, item: Tuple[str, Optional[str], Optional[object]]) -> bool:
+        while not self.stop_event.is_set():
+            try:
+                self.queue.put(item, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def run(self):
         try:
             for wk, ob_paths, th_paths in self.pairs:
+                if self.stop_event.is_set():
+                    return
                 week_quality: Optional[WeekQuality] = None
                 if self.collect_quality:
                     week_quality = WeekQuality(week_key=wk)
                     self.week_qualities[wk] = week_quality
                 merged = _iter_week_merged_events(wk, ob_paths, th_paths, week_quality=week_quality)
 
+                if self.stop_event.is_set():
+                    return
                 first_event = next(merged, None)
                 if first_event is None:
                     if week_quality is not None:
                         week_quality.recompute_totals()
                         self.quality_by_week[wk] = week_quality.to_dict()
-                    self._put(("first", wk, None))
-                    self._put(("eof", wk, None))
+                    if not self._put(("first", wk, None)):
+                        return
+                    if not self._put(("eof", wk, None)):
+                        return
                     continue
 
                 ts_first = _event_ts(first_event)
@@ -1868,17 +1884,27 @@ class EventFeeder:
 
                 # Forward the compact tuple unchanged so both PCA and main ingest
                 # can use FeatureEngine.on_fast_event(...).
-                self._put(("first", wk, first_event))
+                if not self._put(("first", wk, first_event)):
+                    return
                 for event in merged:
-                    self._put(("evt", wk, event))
+                    if self.stop_event.is_set():
+                        return
+                    if not self._put(("evt", wk, event)):
+                        return
                 if week_quality is not None:
                     week_quality.recompute_totals()
                     self.quality_by_week[wk] = week_quality.to_dict()
-                self._put(("eof", wk, None))
+                if not self._put(("eof", wk, None)):
+                    return
 
-            self._put(("eof", None, None))
+            if not self.stop_event.is_set():
+                self._put(("eof", None, None))
         except Exception as exc:
-            self._put(("eof", None, exc))
+            if not self.stop_event.is_set():
+                try:
+                    self.queue.put(("eof", None, exc), timeout=1.0)
+                except queue.Full:
+                    pass
 
 
 def _stream_core_features(pairs: List[WeekPair]):
@@ -1888,6 +1914,7 @@ def _stream_core_features(pairs: List[WeekPair]):
 
     fe = FeatureEngine()
     sample_count = 0
+    event_count = 0
     last_log = time.monotonic()
     last_wk = None
     stream_started = time.monotonic()
@@ -1903,7 +1930,18 @@ def _stream_core_features(pairs: List[WeekPair]):
     try:
         while True:
             t_q = time.monotonic()
-            kind, wk, payload = q.get()
+            try:
+                kind, wk, payload = q.get(timeout=60.0)
+            except queue.Empty:
+                now = time.monotonic()
+                queue_wait_s += now - t_q
+                print(
+                    f"[pca-heartbeat] waiting_for_events elapsed={now - stream_started:.1f}s "
+                    f"events={event_count} decisions={sample_count} sample_rows={sample_count} "
+                    f"producer_alive={producer_thread.is_alive()} qsize={q.qsize()}",
+                    flush=True,
+                )
+                continue
             queue_wait_s += time.monotonic() - t_q
 
             if kind == "first":
@@ -1912,6 +1950,7 @@ def _stream_core_features(pairs: List[WeekPair]):
                 if payload is None:
                     continue
                 event = payload
+                last_wk = wk
                 print(f"[pca-week] {wk}", flush=True)
             elif kind == "evt":
                 event = payload
@@ -1929,6 +1968,7 @@ def _stream_core_features(pairs: List[WeekPair]):
             if event is None:
                 continue
 
+            event_count += 1
             t_evt = time.monotonic()
             ts_ms, feat_z, _mid, _is_trade, _dt_ms = fe.on_fast_event(event)
             event_proc_s += time.monotonic() - t_evt
@@ -1942,12 +1982,18 @@ def _stream_core_features(pairs: List[WeekPair]):
                 continue
             sample_count += 1
             now = time.monotonic()
-            if now - last_log >= 300:
+            if now - last_log >= 60:
                 print(f"[pca-sample] rows={sample_count} last_wk={last_wk}", flush=True)
                 last_log = now
             yield np.asarray(feat_z, dtype=np.float32)
     finally:
-        producer_thread.join()
+        feeder.stop()
+        producer_thread.join(timeout=5.0)
+        if producer_thread.is_alive():
+            print(
+                "[pca] feeder thread did not exit after cancellation; continuing after early PCA stop",
+                flush=True,
+            )
         _print_coarse_timing_totals(
             "[pca-time]",
             {
@@ -1996,27 +2042,28 @@ def maybe_fit_pca_model(
     model_filename: str,
     use_existing: int,
 ):
-    """Fit (or reuse) a PCA model using the training subset of week-keyed daily paths.
+    """Fit (or reuse) a PCA model using capped OB decision core feature rows.
 
     Each pair is ``(week_key, ob_paths, th_paths)`` where ``ob_paths`` is an
     ordered per-day file-path list for the week and ``th_paths`` is either the
     aligned per-day trade-history list (trade-enabled mode) or ``[]`` in
     OB-only mode.
     """
+    del batch_size  # PCA fitting is intentionally sample-capped, not incremental.
+
     meta = {
         "applied": False,
         "var_kept": float(target_var),
         "k": 0,
         "model_path": None,
     }
-    last_log = time.monotonic()
-    batches = 0
 
     if target_var <= 0.0:
         return meta
 
+    model_path = os.path.join(out_root, model_filename)
+
     if int(use_existing) == 1:
-        model_path = os.path.join(out_root, model_filename)
         try:
             with np.load(model_path) as data:
                 components = data["components"]
@@ -2036,7 +2083,7 @@ def maybe_fit_pca_model(
         return meta
 
     try:
-        from sklearn.decomposition import IncrementalPCA  # type: ignore
+        from sklearn.decomposition import PCA  # type: ignore
     except Exception as exc:
         print(f"[pca  ] sklearn unavailable ({exc}); skipping PCA fit")
         return meta
@@ -2048,104 +2095,72 @@ def maybe_fit_pca_model(
         return meta
 
     sample_limit = max(1, int(sample_limit))
-    batch_size = int(batch_size)
-
     sample_rows: List[np.ndarray] = []
-    sample_array: Optional[np.ndarray] = None
-    pad_rows: Optional[np.ndarray] = None
-    ipca = None
-    fitted_rows = 0
-    total_rows = 0
-    pending: List[np.ndarray] = []
-    n_components = 0
-
-    def flush_pending(force: bool = False):
-        nonlocal pending, fitted_rows, batches, last_log
-        if ipca is None or not pending:
-            return
-        need = max(1, ipca.n_components)
-        thresh = max(need, batch_size) if batch_size > 0 else need
-        if not force and len(pending) < thresh:
-            return
-        arr = np.asarray(pending, dtype=np.float32)
-        actual_rows = arr.shape[0]
-        if actual_rows < need:
-            source = pad_rows if pad_rows is not None and pad_rows.size else sample_array
-            if source is not None and source.shape[0] >= need:
-                pad_needed = need - actual_rows
-                arr = np.vstack([arr, source[:pad_needed]])
-        ipca.partial_fit(arr)
-        fitted_rows += actual_rows
-        batches += 1
-        if time.monotonic() - last_log >= 300:
-            print(f"[pca-fit] fitted={fitted_rows} batches={batches}", flush=True)
-            last_log = time.monotonic()
-        pending = []
-
-    def ensure_ipca(force: bool = False):
-        nonlocal ipca, sample_array, pad_rows, n_components, fitted_rows, last_log
-        if ipca is not None:
-            return
-        if not sample_rows:
-            return
-        if not force and len(sample_rows) < sample_limit:
-            return
-        sample_array = np.asarray(sample_rows, dtype=np.float32)
-        n_components = _select_pca_components(sample_array, target_var)
-        if n_components <= 0:
-            return
-        ipca = IncrementalPCA(
-            n_components=n_components,
-            batch_size=None if batch_size <= 0 else max(batch_size, n_components),
-        )
-        ipca.partial_fit(sample_array)
-        print(f"[pca-init] n_components={n_components} sample_rows={sample_array.shape[0]}", flush=True)
-        last_log = time.monotonic()
-        fitted_rows += sample_array.shape[0]
-        pad_rows = sample_array[:n_components].copy()
-        sample_rows.clear()
 
     for feat in _stream_core_features(train_pairs):
-        total_rows += 1
-        vec = np.asarray(feat, dtype=np.float32)
-        if ipca is None:
-            sample_rows.append(vec)
-            ensure_ipca()
-            continue
-        pending.append(vec)
-        flush_pending()
+        sample_rows.append(np.asarray(feat, dtype=np.float32))
+        if len(sample_rows) >= sample_limit:
+            print(
+                f"[pca] reached sample cap rows={len(sample_rows)} max_rows={sample_limit}; stopping PCA stream",
+                flush=True,
+            )
+            break
 
-    ensure_ipca(force=True)
+    if not sample_rows:
+        print("[pca] no sample rows; PCA disabled", flush=True)
+        return {
+            **meta,
+            "sample_rows": 0,
+            "rows_fitted": 0,
+            "fitted": 0,
+            "rows_total": 0,
+        }
 
-    if ipca is None:
-        print("[pca  ] Unable to initialise PCA (insufficient data); skipping")
-        return meta
+    sample_array = np.asarray(sample_rows, dtype=np.float32)
+    print(
+        f"[pca] sample_rows={sample_array.shape[0]} max_rows={sample_limit}",
+        flush=True,
+    )
 
-    flush_pending(force=True)
+    n_components = _select_pca_components(sample_array, target_var)
+    if n_components <= 0:
+        print("[pca  ] Unable to select PCA components; skipping PCA fit", flush=True)
+        return {
+            **meta,
+            "sample_rows": int(sample_array.shape[0]),
+            "rows_fitted": 0,
+            "fitted": 0,
+            "rows_total": int(sample_array.shape[0]),
+        }
 
-    model_path = os.path.join(out_root, model_filename)
+    pca = PCA(n_components=n_components, svd_solver="full")
+    pca.fit(sample_array)
+
     ensure_dir(os.path.dirname(model_path))
     np.savez(
         model_path,
-        mean=ipca.mean_.astype(np.float32, copy=False),
-        components=ipca.components_.astype(np.float32, copy=False),
-        explained_variance_ratio=ipca.explained_variance_ratio_.astype(np.float32, copy=False),
+        mean=pca.mean_.astype(np.float32, copy=False),
+        components=pca.components_.astype(np.float32, copy=False),
+        explained_variance_ratio=pca.explained_variance_ratio_.astype(np.float32, copy=False),
     )
 
+    rows_used = int(sample_array.shape[0])
     meta.update(
         {
             "applied": True,
-            "k": int(ipca.n_components),
+            "k": int(n_components),
             "model_path": model_filename,
-            "rows_fitted": int(fitted_rows),
-            "rows_total": int(total_rows),
-            "sample_rows": int(sample_array.shape[0] if sample_array is not None else 0),
+            "sample_rows": rows_used,
+            "rows_fitted": rows_used,
+            "fitted": rows_used,
+            "rows_total": rows_used,
         }
     )
 
     print(
-        f"[pca  ] applied target={target_var:.4f} k={meta['k']} "
-        f"sample={meta.get('sample_rows', 0)} fitted={meta.get('rows_fitted', 0)}"
+        f"[pca  ] applied target={target_var:.4f} k={n_components} "
+        f"sample={rows_used} fitted={rows_used}",
+        flush=True,
     )
 
     return meta
