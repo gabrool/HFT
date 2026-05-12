@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from CMSSL17 import (  # type: ignore
+from CMSSL17_1_sec import (  # type: ignore
     # model + args
     SAMBA, ModelArgs,
     # core hypers

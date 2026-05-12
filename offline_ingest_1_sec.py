@@ -311,7 +311,7 @@ def _day_bad_abs_and_total(day_quality: DayQuality) -> Tuple[int, int]:
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-from CMSSL17 import (
+from CMSSL17_1_sec import (
     FeatureEngine,
     LabelBuilder,
     HORIZONS_MS,
@@ -2002,7 +2002,8 @@ def _stream_core_features(pairs: List[WeekPair]):
                 "event_proc_s": event_proc_s,
             },
         )
-        fe.print_timer_totals(prefix="[pca-timers]")
+        if hasattr(fe, "print_timer_totals"):
+            fe.print_timer_totals(prefix="[pca-timers]")
 
 
 def _select_pca_components(sample_rows: np.ndarray, target_var: float) -> int:
