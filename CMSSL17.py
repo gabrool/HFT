@@ -5474,12 +5474,13 @@ class FeatureEngine:
             self.consecutive_buy_trade_count = 0
             self.consecutive_sell_trade_count = 0
             trade_sign = 0
-        self.trade_sign_history.append((int(ts_ms), int(trade_sign), float(notional_usd)))
-        trade_cutoff = int(ts_ms) - int(max(TRADE_BURST_WINDOWS_MS) + 5_000)
-        while self.trade_sign_history and self.trade_sign_history[0][0] < trade_cutoff:
-            self.trade_sign_history.popleft()
-        for window in TRADE_BURST_WINDOWS_MS:
-            self._trade_burst_insert(window, int(ts_ms), int(trade_sign))
+        if TRADE_BURST_WINDOWS_MS:
+            self.trade_sign_history.append((int(ts_ms), int(trade_sign), float(notional_usd)))
+            trade_cutoff = int(ts_ms) - int(max(TRADE_BURST_WINDOWS_MS) + 5_000)
+            while self.trade_sign_history and self.trade_sign_history[0][0] < trade_cutoff:
+                self.trade_sign_history.popleft()
+            for window in TRADE_BURST_WINDOWS_MS:
+                self._trade_burst_insert(window, int(ts_ms), int(trade_sign))
 
         entry = (ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick)
         for window, deq in self._trade_window_deques.items():
