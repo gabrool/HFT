@@ -28,7 +28,7 @@ Environment variables (read via os.environ.get in this module):
   BYBIT_WEEKS=""                    # optional comma/space-separated week keys
   BYBIT_PCA_VAR=0.99
   BYBIT_PCA_SELECT_MODE=max_components
-  BYBIT_PCA_MAX_COMPONENTS=506
+  BYBIT_PCA_MAX_COMPONENTS=250
   BYBIT_PCA_BATCH=4096
   BYBIT_PCA_MODEL=pca_model.npz
   BYBIT_PCA_USE_EXISTING=0
@@ -65,7 +65,7 @@ RAW_BYBIT_WEEKS = os.environ.get("BYBIT_WEEKS", "")
 # Optional PCA dimensionality reduction on the core features
 PCA_VAR_TARGET      = float(os.environ.get("BYBIT_PCA_VAR", "0.99"))
 PCA_SELECT_MODE     = os.environ.get("BYBIT_PCA_SELECT_MODE", "max_components").strip().lower()
-PCA_MAX_COMPONENTS  = int(os.environ.get("BYBIT_PCA_MAX_COMPONENTS", "506"))
+PCA_MAX_COMPONENTS  = int(os.environ.get("BYBIT_PCA_MAX_COMPONENTS", "250"))
 PCA_BATCH_SIZE      = int(os.environ.get("BYBIT_PCA_BATCH", "4096"))
 PCA_MODEL_FILENAME  = os.environ.get("BYBIT_PCA_MODEL", "pca_model.npz")
 PCA_USE_EXISTING    = int(os.environ.get("BYBIT_PCA_USE_EXISTING", "0"))
@@ -352,11 +352,14 @@ from CMSSL17 import (
     SUPPORTED_SPLIT_PROTOCOLS,
 )  # keep shared model/data constants only; ingest helpers are local below
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
-FINAL_FEATURE_DIM = 512
-PCA_CORE_COMPONENTS = FINAL_FEATURE_DIM - AUX_DIM
+FINAL_FEATURE_DIM = 256
+PCA_CORE_COMPONENTS = FINAL_FEATURE_DIM - AUX_DIM  # 250 when AUX_DIM=6
 PCA_MAX_COMPONENTS = int(os.environ.get("BYBIT_PCA_MAX_COMPONENTS", str(PCA_CORE_COMPONENTS)))
 if PCA_MAX_COMPONENTS != PCA_CORE_COMPONENTS:
-    raise ValueError(f"BYBIT_PCA_MAX_COMPONENTS must equal PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS} for final feature_dim_total=512")
+    raise ValueError(
+        f"BYBIT_PCA_MAX_COMPONENTS must equal PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS} "
+        f"for final feature_dim_total={FINAL_FEATURE_DIM}"
+    )
 
 GRACE_MS = max(int(h) for h in HORIZONS_MS)
 EVENT_QUEUE_MAXSIZE = int(os.environ.get("BYBIT_EVENT_QUEUE_MAXSIZE", "4096"))
@@ -2056,7 +2059,7 @@ def _fit_pca_svd_from_sample(
     if int(n_features) < int(PCA_CORE_COMPONENTS):
         raise ValueError(
             f"Raw core feature dimension {int(n_features)} is smaller than required PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS}; "
-            "cannot produce final feature_dim_total=512."
+            f"cannot produce final feature_dim_total={FINAL_FEATURE_DIM}."
         )
     if int(max_components) != int(PCA_CORE_COMPONENTS):
         raise ValueError(f"PCA max_components must equal PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS}")
@@ -2110,10 +2113,12 @@ def maybe_fit_pca_model(
         f"[pca-feature-schema] schema={FEATURE_SCHEMA} raw_dim={len(feature_names_pre_pca)} names_hash={names_hash}",
         flush=True,
     )
-    if len(feature_names_pre_pca) < PCA_CORE_COMPONENTS:
+    raw_dim = len(feature_names_pre_pca)
+    if raw_dim > 406:
+        raise ValueError(f"RT-core schema raw_dim={raw_dim} exceeds target max 406")
+    if raw_dim < PCA_CORE_COMPONENTS:
         raise ValueError(
-            f"Raw core feature dimension {len(feature_names_pre_pca)} is smaller than "
-            f"required PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS}; cannot produce final feature_dim_total=512."
+            f"RT-core schema raw_dim={raw_dim} is below PCA_CORE_COMPONENTS={PCA_CORE_COMPONENTS}"
         )
     meta = {
         "applied": False,
