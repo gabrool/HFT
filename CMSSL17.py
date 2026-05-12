@@ -537,7 +537,7 @@ def inverse_softplus_torch(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     x = torch.clamp(x, min=eps)
     return torch.where(x > 20.0, x, torch.log(torch.expm1(x)))
 DIR_LOSS_WEIGHT = 1.00
-MAG_LOSS_WEIGHT = 0.25
+MAG_LOSS_WEIGHT = 0.00
 MAG_CORR_LOSS_WEIGHT = 0.00
 SINGLE_WEEK_PATIENCE = 1
 # Number of auxiliary channels appended after the PCA/core feature vector.
