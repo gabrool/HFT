@@ -819,6 +819,37 @@ def test_heavy_tailed_features_use_log_ewma() -> None:
 
 
 
+def test_event_density_counts_same_ms_trade_and_ob_without_popping_trade() -> None:
+    fe = FeatureEngine()
+
+    r0 = fe.on_fast_event(deep_snapshot_ob(1_700_002_000_000, n_levels=60))
+    assert r0.event_type == "ob"
+
+    # After first OB, 100ms event density has one timestamp.
+    assert len(fe._event_density_deques[100]) == 1
+
+    tr = fe.on_fast_event(trade(1_700_002_000_100))
+    assert tr.event_type == "trade"
+    assert len(fe._event_density_deques[100]) == 2
+
+    ob = fe.on_fast_event(("ob", 1_700_002_000_100, 2, 2, ((100.0, 2.5),), ((101.0, 2.5),)))
+    assert ob.event_type == "ob"
+
+    # Critical regression: same-ms OB must not pop the same-ms trade from mixed event density.
+    assert len(fe._event_density_deques[100]) == 3
+    assert list(fe._event_density_deques[100])[-2:] == [
+        1_700_002_000_100,
+        1_700_002_000_100,
+    ]
+
+
+def test_mixed_event_density_does_not_use_ob_jitter_guard() -> None:
+    from pathlib import Path
+
+    text = Path("CMSSL17.py").read_text()
+    assert "self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == \"ob\"))" not in text
+
+
 def test_transform_engine_uses_ob_clock_not_any_event_clock() -> None:
     fe = FeatureEngine()
 
@@ -950,6 +981,8 @@ def main() -> None:
     test_old_zscore_path_removed()
     test_ewma_transform_scores_before_update()
     test_bounded_features_are_not_ewma_z()
+    test_event_density_counts_same_ms_trade_and_ob_without_popping_trade()
+    test_mixed_event_density_does_not_use_ob_jitter_guard()
     test_transform_engine_uses_ob_clock_not_any_event_clock()
     test_micro_premia_is_bounded_ratio_transform()
     test_aux_transform_constant_and_metadata_contract()
