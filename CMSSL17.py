@@ -4016,7 +4016,10 @@ class FeatureEngine:
         )
 
         for w, deq in self._event_density_deques.items():
-            self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == "ob"))
+            # Mixed event-density counts all events, including same-ms trade+OB pairs.
+            # Do not apply OB jitter collapse here; otherwise a same-ms OB can pop
+            # the trade that preceded it.
+            self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=False)
 
         if etype == "trade":
             return self._handle_trade_event(ts_ms, payload, any_event_dt_ms)
