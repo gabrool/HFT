@@ -38,7 +38,7 @@ from CMSSL17 import (  # type: ignore
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, LABEL_TRIM_SCHEMA, CHECKPOINT_SCHEMA, MODEL_ARCH_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
     DIR_LOSS_WEIGHT, MAG_LOSS_WEIGHT, MAG_CORR_LOSS_WEIGHT, EMA_DECAY,
-    FEATURE_SCHEMA, FEATURE_TRANSFORM, AUX_SCHEMA, FEATURE_AUX_TAIL,
+    FEATURE_SCHEMA, FEATURE_TRANSFORM, FEATURE_TRANSFORM_POLICY, FEATURE_TRANSFORM_WARMUP_ROWS, AUX_SCHEMA, FEATURE_AUX_TAIL, feature_transform_spec_hash,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     derive_dir_mag_predictions, derive_mag_pred_sqrt_for_mag_loss,
     SAM,
@@ -501,6 +501,9 @@ def validate_contract_meta(meta: dict, source: str) -> None:
     ok = (
         meta.get("feature_schema") == FEATURE_SCHEMA
         and meta.get("feature_transform") == FEATURE_TRANSFORM
+        and meta.get("feature_transform_policy") == FEATURE_TRANSFORM_POLICY
+        and bool(meta.get("feature_transform_spec_hash"))
+        and int(meta.get("feature_transform_warmup_rows", -1)) == int(FEATURE_TRANSFORM_WARMUP_ROWS)
         and meta.get("aux_schema") == AUX_SCHEMA
         and meta.get("checkpoint_schema_expected") == CHECKPOINT_SCHEMA
         and meta.get("target_transform") == TARGET_TRANSFORM
@@ -519,12 +522,22 @@ def validate_contract_meta(meta: dict, source: str) -> None:
             f"FEATURE_SCHEMA={FEATURE_SCHEMA}. "
             f"Expected TARGET_TASK={TARGET_TASK}, TARGET_TRANSFORM={TARGET_TRANSFORM}, CHECKPOINT_SCHEMA={CHECKPOINT_SCHEMA}."
         )
+    expected_spec_hash = feature_transform_spec_hash(list(meta.get("feature_names", [])))
+    if str(meta.get("feature_transform_spec_hash")) != expected_spec_hash:
+        raise ValueError(
+            "Old or incompatible offline dataset transform spec hash. Rerun offline_ingest.py with "
+            f"FEATURE_SCHEMA={FEATURE_SCHEMA}."
+        )
 
 
 def validate_week_matches_global(global_meta: dict, week_meta: dict, source: str) -> None:
     checks = {
         "feature_schema": (week_meta.get("feature_schema"), global_meta.get("feature_schema")),
         "feature_transform": (week_meta.get("feature_transform"), global_meta.get("feature_transform")),
+        "feature_transform_policy": (week_meta.get("feature_transform_policy"), global_meta.get("feature_transform_policy")),
+        "feature_transform_spec_hash": (week_meta.get("feature_transform_spec_hash"), global_meta.get("feature_transform_spec_hash")),
+        "feature_transform_warmup_rows": (int(week_meta.get("feature_transform_warmup_rows", -1)), int(global_meta.get("feature_transform_warmup_rows", -2))),
+        "aux_transform": (week_meta.get("aux_transform"), global_meta.get("aux_transform")),
         "aux_schema": (week_meta.get("aux_schema"), global_meta.get("aux_schema")),
         "checkpoint_schema_expected": (
             week_meta.get("checkpoint_schema_expected"),
@@ -766,6 +779,9 @@ def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> 
     keys = (
         "feature_schema",
         "feature_transform",
+        "feature_transform_policy",
+        "feature_transform_spec_hash",
+        "feature_transform_warmup_rows",
         "feature_dim_core",
         "feature_dim_total",
         "feature_names_hash",
@@ -2435,6 +2451,9 @@ def train_from_offline():
     cache_meta={
         'feature_schema': meta.get('feature_schema'),
         'feature_transform': meta.get('feature_transform'),
+        'feature_transform_policy': meta.get('feature_transform_policy'),
+        'feature_transform_spec_hash': meta.get('feature_transform_spec_hash'),
+        'feature_transform_warmup_rows': int(meta.get('feature_transform_warmup_rows', -1)),
         'feature_dim_core': int(meta.get('feature_dim_core', -1)),
         'feature_dim_total': int(meta.get('feature_dim_total', -1)),
         'feature_names_hash': meta.get('feature_names_hash'),

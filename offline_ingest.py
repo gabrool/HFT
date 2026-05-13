@@ -334,6 +334,9 @@ from CMSSL17 import (
     AUX_DIM,
     FEATURE_SCHEMA,
     FEATURE_TRANSFORM,
+    FEATURE_TRANSFORM_POLICY,
+    FEATURE_TRANSFORM_WARMUP_ROWS,
+    FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT,
     AUX_SCHEMA,
     FEATURE_AUX_TAIL,
     _open_text,
@@ -344,6 +347,7 @@ from CMSSL17 import (
     LABEL_TRIM_SCHEMA,
     LOW_ABS_TRIM_FRACTION,
     HIGH_ABS_TRIM_FRACTION,
+    feature_transform_spec_hash,
     FOUR_WEEK_PROTOCOL,
     FIVE_WEEK_PROTOCOL,
     CMSSL_TRAIN_VAL_PROTOCOL,
@@ -353,6 +357,8 @@ from CMSSL17 import (
 # LOOKBACK is a shared model constant from CMSSL17 (single source of truth).
 RAW_FEATURE_NAMES = list(FeatureEngine().feature_names())
 RAW_FEATURE_NAMES_HASH = hashlib.sha256(json.dumps(RAW_FEATURE_NAMES).encode()).hexdigest()[:12]
+RAW_FEATURE_TRANSFORM_SPEC_HASH = feature_transform_spec_hash(RAW_FEATURE_NAMES)
+AUX_TRANSFORM = "prelog1p_no_ewma_v1"
 RAW_FEATURE_DIM_CORE = len(RAW_FEATURE_NAMES)
 RAW_FEATURE_DIM_TOTAL = RAW_FEATURE_DIM_CORE + int(AUX_DIM)
 if RAW_FEATURE_DIM_CORE <= 0:
@@ -1513,6 +1519,12 @@ class FlatWeekRouter:
             **canonical_mode_fields(),
             "lookback": int(LOOKBACK),
             "feature_transform": FEATURE_TRANSFORM,
+            "feature_transform_policy": FEATURE_TRANSFORM_POLICY,
+            "feature_transform_spec_hash": str(RAW_FEATURE_TRANSFORM_SPEC_HASH),
+            "feature_transform_diagnostics_path": "_feature_transform_diagnostics.json",
+            "feature_transform_warmup_rows": int(FEATURE_TRANSFORM_WARMUP_ROWS),
+            "feature_transform_output_clip_default": float(FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT),
+            "aux_transform": AUX_TRANSFORM,
             "feature_dim_total": int(RAW_FEATURE_DIM_TOTAL),
             "feature_dim_core": int(RAW_FEATURE_DIM_CORE),
             "feature_names": list(RAW_FEATURE_NAMES),
@@ -2087,6 +2099,11 @@ def load_reusable_week_meta(
         "feature_dim_core",
         "feature_dim_total",
         "feature_names_hash",
+        "feature_transform",
+        "feature_transform_policy",
+        "feature_transform_spec_hash",
+        "feature_transform_warmup_rows",
+        "aux_transform",
         "trade_history_enabled",
         "event_stream_mode",
     ):
@@ -2149,6 +2166,12 @@ def build_global_meta_from_week_metas(
         "label_units": "signed_log_return_bps",
         "feature_schema": FEATURE_SCHEMA,
         "feature_transform": FEATURE_TRANSFORM,
+        "feature_transform_policy": FEATURE_TRANSFORM_POLICY,
+        "feature_transform_spec_hash": str(RAW_FEATURE_TRANSFORM_SPEC_HASH),
+        "feature_transform_diagnostics_path": "_feature_transform_diagnostics.json",
+        "feature_transform_warmup_rows": int(FEATURE_TRANSFORM_WARMUP_ROWS),
+        "feature_transform_output_clip_default": float(FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT),
+        "aux_transform": AUX_TRANSFORM,
         "aux_schema": AUX_SCHEMA,
         "target_task": TARGET_TASK,
         "target_transform": TARGET_TRANSFORM,
@@ -2273,6 +2296,10 @@ def process_all(
         "feature_dim_total": int(RAW_FEATURE_DIM_TOTAL),
         "feature_names_hash": str(RAW_FEATURE_NAMES_HASH),
         "feature_transform": FEATURE_TRANSFORM,
+        "feature_transform_policy": FEATURE_TRANSFORM_POLICY,
+        "feature_transform_spec_hash": str(RAW_FEATURE_TRANSFORM_SPEC_HASH),
+        "feature_transform_warmup_rows": int(FEATURE_TRANSFORM_WARMUP_ROWS),
+        "aux_transform": AUX_TRANSFORM,
         **canonical_mode_fields(),
     }
     week_meta_records: Dict[str, dict] = {}
@@ -2605,6 +2632,10 @@ def process_all(
                 ("aux_names", list(FEATURE_AUX_TAIL)),
                 ("feature_names_hash", str(RAW_FEATURE_NAMES_HASH)),
                 ("feature_transform", FEATURE_TRANSFORM),
+                ("feature_transform_policy", FEATURE_TRANSFORM_POLICY),
+                ("feature_transform_spec_hash", str(RAW_FEATURE_TRANSFORM_SPEC_HASH)),
+                ("feature_transform_warmup_rows", int(FEATURE_TRANSFORM_WARMUP_ROWS)),
+                ("aux_transform", AUX_TRANSFORM),
                 ("feature_names", list(RAW_FEATURE_NAMES)),
             ):
                 if week_meta.get(field) != expected:
@@ -2617,6 +2648,10 @@ def process_all(
                     raise ValueError(
                         f"Inconsistent ingest mode in week '{wk}': {field}={observed!r} (expected {expected!r})"
                     )
+
+    transform_diag = fe.transform_diagnostics_summary()
+    with open(os.path.join(out_root, "_feature_transform_diagnostics.json"), "w") as f:
+        json.dump(transform_diag, f, indent=2)
 
     write_json_atomic_with_backup(Path(out_root) / "meta.json", meta)
 

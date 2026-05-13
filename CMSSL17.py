@@ -1,4 +1,4 @@
-import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time, heapq
+import os, math, copy, json, csv, zipfile, io, gzip, contextlib, time, heapq, hashlib
 from pathlib import Path
 from collections import deque
 from bisect import bisect_left, bisect_right, insort
@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from enum import IntEnum
 from datetime import datetime, timezone
 from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable, Union, Sequence
 from tqdm import tqdm
@@ -499,10 +500,14 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v3_raw_no_" + "p" + "ca" + "_pruned235"
-FEATURE_TRANSFORM = "raw_zscore_plus_aux_no_" + "p" + "ca" + "_v1"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v4_raw_no_" + "p" + "ca" + "_pruned235_xformv2"
+FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned235"
+FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
+FEATURE_TRANSFORM_WARMUP_ROWS = 50
+FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
+FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned235"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned235"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned235-xformv2"
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
 FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
@@ -2258,6 +2263,352 @@ class RollingReturnDistributionState:
     seq: int
 
 
+
+# -------------------------  Feature transforms v2  -------------------------
+XFORM_HL_FAST_MS = 5_000
+XFORM_HL_MEDIUM_MS = 30_000
+XFORM_HL_SLOW_MS = 120_000
+
+
+class RawTransformKind(IntEnum):
+    IDENTITY = 0
+    LOG1P_POS = 1
+    SIGNED_LOG1P = 2
+    FIXED_SCALE = 3
+    TANH_SCALE = 4
+    LOG1P_MS = 5
+
+
+class NormalizeKind(IntEnum):
+    NONE = 0
+    EWMA_Z = 1
+
+
+@dataclass(frozen=True)
+class FeatureTransformSpec:
+    name: str
+    raw_transform: RawTransformKind
+    normalize: NormalizeKind
+    half_life_ms: int
+    scale: float
+    input_clip_abs: float
+    output_clip_abs: float
+
+    def __post_init__(self) -> None:
+        if self.normalize == NormalizeKind.NONE and int(self.half_life_ms) != 0:
+            raise ValueError(f"half_life_ms must be 0 when normalize=NONE for {self.name!r}")
+        if self.normalize == NormalizeKind.EWMA_Z and int(self.half_life_ms) not in {XFORM_HL_FAST_MS, XFORM_HL_MEDIUM_MS, XFORM_HL_SLOW_MS}:
+            raise ValueError(f"invalid EWMA half_life_ms={self.half_life_ms} for {self.name!r}")
+        if self.raw_transform in {RawTransformKind.FIXED_SCALE, RawTransformKind.TANH_SCALE} and float(self.scale) <= 0.0:
+            raise ValueError(f"scale must be positive for {self.raw_transform.name} on {self.name!r}")
+        if float(self.input_clip_abs) < 0.0:
+            raise ValueError(f"input_clip_abs must be nonnegative for {self.name!r}")
+        if float(self.output_clip_abs) <= 0.0:
+            raise ValueError(f"output_clip_abs must be positive for {self.name!r}")
+
+
+def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureTransformSpec]:
+    def spec(name: str, raw: RawTransformKind, norm: NormalizeKind, hl: int = 0, scale: float = 1.0, inp: float = 0.0, out: float = FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT) -> FeatureTransformSpec:
+        return FeatureTransformSpec(name, raw, norm, int(hl), float(scale), float(inp), float(out))
+
+    def clip(name, out=8.0): return spec(name, RawTransformKind.IDENTITY, NormalizeKind.NONE, out=out)
+    def bounded(name, out=1.5): return spec(name, RawTransformKind.IDENTITY, NormalizeKind.NONE, out=out)
+    def ratio(name, out=5.0): return spec(name, RawTransformKind.IDENTITY, NormalizeKind.NONE, out=out)
+    def bps(name, scale=2.0, out=8.0): return spec(name, RawTransformKind.FIXED_SCALE, NormalizeKind.NONE, scale=scale, out=out)
+    def bps_tanh(name, scale=2.0, out=1.5): return spec(name, RawTransformKind.TANH_SCALE, NormalizeKind.NONE, scale=scale, out=out)
+    def log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.LOG1P_POS, NormalizeKind.EWMA_Z, hl=hl, out=out)
+    def signed_log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.SIGNED_LOG1P, NormalizeKind.EWMA_Z, hl=hl, out=out)
+    def log_ms(name, out=8.0): return spec(name, RawTransformKind.LOG1P_MS, NormalizeKind.NONE, out=out)
+
+    specs: List[FeatureTransformSpec] = []
+    for name in feature_names:
+        s: Optional[FeatureTransformSpec] = None
+        if name.startswith("max_abs_return_bps_"):
+            s = log_ewma(name, XFORM_HL_MEDIUM_MS)
+        elif name.startswith("obi_l") and ("_mean_" in name):
+            s = bounded(name)
+        elif name.startswith("obi_l"):
+            s = bounded(name)
+        elif (
+            name.startswith("depth_imbalance_within_")
+            or name.startswith("trade_imbalance_notional_")
+            or name.startswith("regime_flow_imbalance_")
+            or name.startswith("depth_imbalance_5bps_mean_")
+            or name.startswith("spread_time_above_1bp_frac_")
+            or name.startswith("down_up_vol_ratio_")
+            or name == "micro_minus_mid_over_spread"
+        ):
+            s = ratio(name) if name == "micro_minus_mid_over_spread" else bounded(name)
+        elif name.startswith("spread_z_") or name.startswith("depth_5bps_z_"):
+            s = clip(name)
+        elif name.startswith("time_since") or name.startswith("time_since_last_"):
+            s = log_ms(name, out=10.0)
+        elif name in {"last_trade_side_sign", "last_tick_sign", "last_is_zero_tick", "last_is_rpi"}:
+            s = bounded(name, out=1.0)
+        elif name.startswith("trade_toxicity_") or name.startswith("tick_imbalance_") or name.startswith("tick_sign_imbalance_") or name.startswith("zero_tick_fraction_"):
+            s = bounded(name)
+        elif name.startswith("consecutive_buy_trade_count") or name.startswith("consecutive_sell_trade_count"):
+            s = log_ewma(name, XFORM_HL_FAST_MS)
+        elif name in {"ofi_l1", "ofi_l3", "ofi_l5", "ofi_l10"}:
+            s = signed_log_ewma(name, XFORM_HL_FAST_MS)
+        elif (name.startswith("ofi_l") and ("_over_depth_" in name or "_sum_over_depth_" in name or "_accel_" in name)) or name.startswith("ofi_l1_pressure_over_depth_5bps_") or name.startswith("ofi_l1_pressure_over_realized_vol_"):
+            s = bps_tanh(name, scale=1.0)
+        elif name.startswith("ofi_l1_pressure_ewma_"):
+            s = signed_log_ewma(name, XFORM_HL_FAST_MS)
+        elif name.startswith("spread_delta_over_spread_"):
+            s = bps_tanh(name, scale=1.0)
+        elif name.startswith("mid_ret_bps_") or name.startswith("micro_ret_bps_"):
+            s = bps(name, scale=2.0)
+        elif name.startswith("mid_slope_bps_per_sec_") or name.startswith("micro_l5_slope_") or name.startswith("spread_widening_slope_bps_per_sec_"):
+            s = bps(name, scale=10.0)
+        elif name == "micro_minus_mid_bps" or name.startswith("micro_l") and name.endswith("_minus_mid_bps") or name.startswith("vamp_l") and name.endswith("_minus_mid_bps") or name == "micro_l1_minus_micro_l10_bps" or name == "micro_premia":
+            s = bps(name, scale=2.0)
+        elif name.startswith("vwap_vs_mid_bps_") or name.startswith("signed_trade_premium_bps_volume_weighted_"):
+            s = bps(name, scale=3.0)
+        elif name.startswith("depth_imbalance_5bps_slope_"):
+            s = bps(name, scale=1.0)
+        elif name in {"spread_bps", "gap_a_bps", "gap_b_bps"}:
+            s = log_ewma(name, XFORM_HL_SLOW_MS)
+        elif name.startswith("mid_range_bps_") or name.startswith("return_std_bps_") or name.startswith("regime_realized_vol_bps_"):
+            s = log_ewma(name, XFORM_HL_MEDIUM_MS)
+        elif name in {"bsz1", "asz1"} or name.startswith("bid_depth_within_") or name.startswith("ask_depth_within_"):
+            s = log_ewma(name, XFORM_HL_MEDIUM_MS)
+        elif name.startswith("regime_volume_ewma_"):
+            s = log_ewma(name, XFORM_HL_SLOW_MS)
+        elif (
+            name.startswith("spread_change_count_")
+            or name.startswith("bid_price_change_rate_")
+            or name.startswith("ask_price_change_rate_")
+            or name.startswith("ob_update_count_")
+            or name.startswith("ob_update_rate_")
+            or name.startswith("trade_count_")
+            or name.startswith("trade_count_per_second_")
+            or name.startswith("buy_trade_count_")
+            or name.startswith("sell_trade_count_")
+        ):
+            s = log_ewma(name, XFORM_HL_FAST_MS)
+        elif (
+            name.startswith("l1_bid_depletion_rate_")
+            or name.startswith("l1_ask_depletion_rate_")
+            or name.startswith("l1_bid_add_rate_")
+            or name.startswith("l1_ask_add_rate_")
+            or name.startswith("bid_l1_depletion_")
+            or name.startswith("ask_l1_depletion_")
+            or name.startswith("bid_l1_depletion_over_depth_")
+            or name.startswith("ask_l1_depletion_over_depth_")
+            or name.startswith("bid_l1_add_rate_over_depth_")
+            or name.startswith("ask_l1_add_rate_over_depth_")
+            or name.startswith("bid_l1_rem_rate_over_depth_")
+            or name.startswith("ask_l1_rem_rate_over_depth_")
+            or "replen" in name
+        ):
+            s = log_ewma(name, XFORM_HL_FAST_MS)
+        elif name.startswith("cvd_imbalance_") or name.startswith("signed_trade_count_imbalance_"):
+            s = bounded(name)
+        elif name.startswith("signed_notional_flow_usd_") or name.startswith("cvd_") or name.startswith("max_signed_trade_notional_usd_"):
+            s = signed_log_ewma(name, XFORM_HL_MEDIUM_MS)
+        elif name == "last_trade_notional_usd" or name.startswith("top5_trade_notional_sum_usd_") or name.startswith("top_trade_notional_sum_usd_"):
+            s = log_ewma(name, XFORM_HL_MEDIUM_MS)
+        elif name.startswith("buy_flow_without_price_up_") or name.startswith("sell_flow_without_price_down_") or name.startswith("absorption_bid_") or name.startswith("absorption_ask_"):
+            # These retained absorption/no-price-move features are strictly nonnegative scaled notional measures.
+            s = log_ewma(name, XFORM_HL_FAST_MS)
+        if s is None:
+            raise ValueError(f"No transform spec assigned for feature {name!r}")
+        specs.append(s)
+
+    if len(specs) != len(feature_names):
+        raise ValueError(f"Feature transform spec length mismatch: {len(specs)} != {len(feature_names)}")
+    if len({spec.name for spec in specs}) != len(specs):
+        raise ValueError("Duplicate feature transform spec names")
+    return specs
+
+
+def feature_transform_spec_records(feature_names: Sequence[str]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for s in build_feature_transform_specs(feature_names):
+        records.append({
+            "name": s.name,
+            "raw_transform": s.raw_transform.name,
+            "normalize": s.normalize.name,
+            "half_life_ms": int(s.half_life_ms),
+            "scale": float(s.scale),
+            "input_clip_abs": float(s.input_clip_abs),
+            "output_clip_abs": float(s.output_clip_abs),
+        })
+    return records
+
+
+def feature_transform_spec_hash(feature_names: Sequence[str]) -> str:
+    records = feature_transform_spec_records(feature_names)
+    return hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest()[:12]
+
+
+class FeatureTransformEngine:
+    def __init__(self, feature_names: Sequence[str], *, enable_diagnostics: bool = True):
+        self.feature_names = list(feature_names)
+        self.specs = build_feature_transform_specs(self.feature_names)
+        self.dim = len(self.specs)
+        self.enable_diagnostics = bool(enable_diagnostics)
+        self.raw_kind = np.asarray([int(s.raw_transform) for s in self.specs], dtype=np.int32)
+        self.norm_kind = np.asarray([int(s.normalize) for s in self.specs], dtype=np.int32)
+        self.half_life_ms = np.asarray([float(s.half_life_ms) for s in self.specs], dtype=np.float64)
+        self.scale = np.asarray([float(s.scale) for s in self.specs], dtype=np.float64)
+        self.input_clip_abs = np.asarray([float(s.input_clip_abs) for s in self.specs], dtype=np.float64)
+        self.output_clip_abs = np.asarray([float(s.output_clip_abs) for s in self.specs], dtype=np.float64)
+        self.ewma_mask = self.norm_kind == int(NormalizeKind.EWMA_Z)
+        self.mean = np.zeros(self.dim, dtype=np.float64)
+        self.m2 = np.zeros(self.dim, dtype=np.float64)
+        self.obs_count = np.zeros(self.dim, dtype=np.int64)
+        self.initialized = False
+        self.raw_nonfinite_count = np.zeros(self.dim, dtype=np.int64)
+        self.input_clip_count = np.zeros(self.dim, dtype=np.int64)
+        self.output_clip_count = np.zeros(self.dim, dtype=np.int64)
+        self.ewma_warmup_output_count = np.zeros(self.dim, dtype=np.int64)
+        self.n_rows_seen = 0
+        self.sum_final = np.zeros(self.dim, dtype=np.float64)
+        self.sumsq_final = np.zeros(self.dim, dtype=np.float64)
+        self.max_abs_final = np.zeros(self.dim, dtype=np.float64)
+        self.hl_diag: Dict[int, Dict[str, float]] = {
+            hl: {"feature_count": int(np.sum((self.half_life_ms == float(hl)) & self.ewma_mask)), "rows_after_warmup": 0.0, "output_clip_count": 0.0, "sum_abs_z": 0.0, "sum_z": 0.0, "sumsq_z": 0.0, "max_abs_z": 0.0}
+            for hl in (XFORM_HL_FAST_MS, XFORM_HL_MEDIUM_MS, XFORM_HL_SLOW_MS)
+        }
+        self.non_ewma_diag: Dict[str, Dict[str, float]] = {}
+
+    def apply(self, raw: np.ndarray, dt_ms: float) -> np.ndarray:
+        x = np.asarray(raw, dtype=np.float64)
+        if x.ndim != 1 or x.shape[0] != self.dim:
+            raise ValueError(f"FeatureTransformEngine expects shape ({self.dim},), got {x.shape}")
+        finite = np.isfinite(x)
+        if not np.all(finite):
+            self.raw_nonfinite_count += (~finite).astype(np.int64)
+            raise ValueError("Non-finite raw feature values passed to FeatureTransformEngine")
+        clip_mask = self.input_clip_abs > 0.0
+        if np.any(clip_mask):
+            before = x.copy()
+            x[clip_mask] = np.clip(x[clip_mask], -self.input_clip_abs[clip_mask], self.input_clip_abs[clip_mask])
+            self.input_clip_count += ((before != x) & clip_mask).astype(np.int64)
+        tx = x.copy()
+        for kind in RawTransformKind:
+            mask = self.raw_kind == int(kind)
+            if not np.any(mask):
+                continue
+            xm = x[mask]
+            if kind == RawTransformKind.IDENTITY:
+                tx[mask] = xm
+            elif kind == RawTransformKind.LOG1P_POS:
+                tx[mask] = np.log1p(np.maximum(xm, 0.0))
+            elif kind == RawTransformKind.SIGNED_LOG1P:
+                tx[mask] = np.sign(xm) * np.log1p(np.abs(xm))
+            elif kind == RawTransformKind.FIXED_SCALE:
+                tx[mask] = xm / self.scale[mask]
+            elif kind == RawTransformKind.TANH_SCALE:
+                tx[mask] = np.tanh(xm / self.scale[mask])
+            elif kind == RawTransformKind.LOG1P_MS:
+                tx[mask] = np.log1p(np.maximum(xm, 0.0))
+        out = tx.copy()
+        if np.any(self.ewma_mask):
+            warm = self.obs_count < int(FEATURE_TRANSFORM_WARMUP_ROWS)
+            score_mask = self.ewma_mask & (~warm)
+            out[self.ewma_mask & warm] = 0.0
+            self.ewma_warmup_output_count += (self.ewma_mask & warm).astype(np.int64)
+            if np.any(score_mask):
+                var = np.maximum(self.m2[score_mask] - self.mean[score_mask] * self.mean[score_mask], 1e-9)
+                out[score_mask] = (tx[score_mask] - self.mean[score_mask]) / np.sqrt(var)
+        preclip_out = out.copy()
+        out = np.clip(out, -self.output_clip_abs, self.output_clip_abs)
+        clipped = preclip_out != out
+        self.output_clip_count += clipped.astype(np.int64)
+        if np.any(self.ewma_mask):
+            ew = self.ewma_mask
+            if not self.initialized:
+                self.mean[ew] = tx[ew]
+                self.m2[ew] = tx[ew] * tx[ew]
+                self.obs_count[ew] += 1
+            else:
+                alpha = np.zeros(self.dim, dtype=np.float64)
+                alpha[ew] = 1.0 - np.power(0.5, max(1.0, float(dt_ms)) / self.half_life_ms[ew])
+                self.mean[ew] = (1.0 - alpha[ew]) * self.mean[ew] + alpha[ew] * tx[ew]
+                self.m2[ew] = (1.0 - alpha[ew]) * self.m2[ew] + alpha[ew] * (tx[ew] * tx[ew])
+                self.obs_count[ew] += 1
+        self.initialized = True
+        self.n_rows_seen += 1
+        self.sum_final += out
+        self.sumsq_final += out * out
+        self.max_abs_final = np.maximum(self.max_abs_final, np.abs(out))
+        for hl, d in self.hl_diag.items():
+            mask = self.ewma_mask & (self.half_life_ms == float(hl)) & (self.obs_count > FEATURE_TRANSFORM_WARMUP_ROWS)
+            if np.any(mask):
+                vals = out[mask]
+                d["rows_after_warmup"] += int(np.sum(mask))
+                d["output_clip_count"] += int(np.sum(clipped[mask]))
+                d["sum_abs_z"] += float(np.sum(np.abs(vals)))
+                d["sum_z"] += float(np.sum(vals))
+                d["sumsq_z"] += float(np.sum(vals * vals))
+                d["max_abs_z"] = max(float(d["max_abs_z"]), float(np.max(np.abs(vals))))
+        for kind in RawTransformKind:
+            mask = (~self.ewma_mask) & (self.raw_kind == int(kind))
+            if np.any(mask):
+                d = self.non_ewma_diag.setdefault(kind.name, {"feature_count": int(np.sum(mask)), "rows": 0.0, "sum_abs": 0.0, "sumsq": 0.0, "max_abs": 0.0})
+                vals = out[mask]
+                d["rows"] += int(np.sum(mask))
+                d["sum_abs"] += float(np.sum(np.abs(vals)))
+                d["sumsq"] += float(np.sum(vals * vals))
+                d["max_abs"] = max(float(d["max_abs"]), float(np.max(np.abs(vals))))
+        if not np.all(np.isfinite(out)):
+            raise ValueError("Non-finite transformed feature values produced")
+        return out.astype(np.float32)
+
+    def diagnostics_summary(self) -> Dict[str, Any]:
+        rows = max(1, int(self.n_rows_seen))
+        counts_raw = {kind.name: int(np.sum(self.raw_kind == int(kind))) for kind in RawTransformKind}
+        counts_norm = {kind.name: int(np.sum(self.norm_kind == int(kind))) for kind in NormalizeKind}
+        counts_hl = {str(hl): int(np.sum((self.half_life_ms == float(hl)) & self.ewma_mask)) for hl in (XFORM_HL_FAST_MS, XFORM_HL_MEDIUM_MS, XFORM_HL_SLOW_MS)}
+        out_frac = self.output_clip_count.astype(np.float64) / float(rows)
+        def rows_for(th: float) -> List[Dict[str, Any]]:
+            return [{"idx": int(i), "name": self.feature_names[int(i)], "output_clip_frac": float(out_frac[int(i)])} for i in np.flatnonzero(out_frac > th)]
+        top_idx = sorted(range(self.dim), key=lambda i: float(out_frac[i]), reverse=True)[:20]
+        hl_summary: Dict[str, Any] = {}
+        for hl, d in self.hl_diag.items():
+            denom = max(1.0, float(d["rows_after_warmup"]))
+            mean = float(d["sum_z"] / denom)
+            std = math.sqrt(max(0.0, float(d["sumsq_z"] / denom) - mean * mean))
+            abs_mean = float(d["sum_abs_z"] / denom)
+            clip_frac = float(d["output_clip_count"] / denom)
+            if clip_frac > 0.01:
+                warning = "too_many_clips_or_half_life_too_slow"
+            elif std < 0.5 and d["rows_after_warmup"] > 0:
+                warning = "possibly_too_fast_or_overcompressed"
+            elif std > 2.0:
+                warning = "possibly_too_slow_or_undercompressed"
+            else:
+                warning = "ok"
+            hl_summary[str(hl)] = {"feature_count": int(d["feature_count"]), "std_mean": std, "abs_mean": abs_mean, "clip_frac": clip_frac, "max_abs": float(d["max_abs_z"]), "warning": warning}
+        feature_rows = []
+        means = self.sum_final / float(rows)
+        stds = np.sqrt(np.maximum(0.0, self.sumsq_final / float(rows) - means * means))
+        for i, sp in enumerate(self.specs):
+            feature_rows.append({
+                "idx": int(i), "name": sp.name, "raw_transform": sp.raw_transform.name, "normalize": sp.normalize.name,
+                "half_life_ms": int(sp.half_life_ms), "output_clip_abs": float(sp.output_clip_abs),
+                "output_clip_frac": float(out_frac[i]), "warmup_frac": float(self.ewma_warmup_output_count[i] / float(rows)),
+                "final_mean": float(means[i]), "final_std": float(stds[i]), "final_max_abs": float(self.max_abs_final[i]),
+            })
+        return {
+            "version": "feature_transform_diag_v1",
+            "rows_seen": int(self.n_rows_seen),
+            "feature_count": int(self.dim),
+            "counts_by_raw_transform": counts_raw,
+            "counts_by_normalize": counts_norm,
+            "counts_by_half_life_ms": counts_hl,
+            "clip_summary": {
+                "features_with_output_clip_frac_gt_0p001": rows_for(0.001),
+                "features_with_output_clip_frac_gt_0p01": rows_for(0.01),
+                "top20_output_clip_frac": [{"idx": int(i), "name": self.feature_names[int(i)], "output_clip_frac": float(out_frac[int(i)])} for i in top_idx],
+            },
+            "half_life_summary": hl_summary,
+            "feature_rows": feature_rows,
+        }
+
 # -------------------------  Feature engine  -------------------------
 class FeatureEngine:
 
@@ -2281,7 +2632,6 @@ class FeatureEngine:
     def __init__(
         self,
         depth: int = MAX_BOOK_FEATURE_LEVEL,
-        z_hl_ms: int = 30_000,
     ):
         # feature_depth controls the cached top-of-book ladders used for feature extraction.
         # The full source snapshot/update book is stored in self.bids/self.asks so deeper
@@ -2294,8 +2644,6 @@ class FeatureEngine:
                 f"BOOK_DEPTH_FEATURE_LEVELS={BOOK_DEPTH_FEATURE_LEVELS}. "
                 f"Need feature_depth >= {MAX_BOOK_FEATURE_LEVEL}."
             )
-        self.z_hl_ms = int(z_hl_ms)
-
         # ---------- Book state ----------
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
@@ -2516,20 +2864,12 @@ class FeatureEngine:
         }
 
 
-        # ---------- Rolling z-score state (per-feature EWMA mean/var) ----------
-        self.z_mean: Optional[np.ndarray] = None
-        self.z_m2: Optional[np.ndarray] = None
-        self._feat_dim: Optional[int] = None
+        # ---------- Feature transform v2 state ----------
         self._feature_names_cache: Optional[List[str]] = None
-        self._z_half_lives_ms: Optional[List[Optional[int]]] = None
+        self._feature_transform_engine: Optional[FeatureTransformEngine] = None
         # Empty immutable-ish placeholder returned for trade events.
         # Trade rows return this after updating trade/flow state only, avoiding per-trade allocation.
         self._trade_fast_path_empty_feature = np.empty((0,), dtype=np.float32)
-        # Vectorized z-score metadata.
-        self._z_half_lives_arr: Optional[np.ndarray] = None
-        self._z_mask: Optional[np.ndarray] = None
-        self._last_z_ts_ms: Optional[int] = None
-
         self.trade_fast_path_count: int = 0
         self.ob_feature_build_count: int = 0
         self.strict_feature_validation = os.environ.get("BYBIT_STRICT_FEATURE_VALIDATION", "0") == "1"
@@ -4188,7 +4528,9 @@ class FeatureEngine:
                     for i in bad_idx[:20]
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
-        feat_z = self._zscore(feat, any_event_dt_ms)
+        feat_out = self._transform_features(feat, any_event_dt_ms)
+        if feat_out.shape != (235,):
+            raise ValueError(f"Expected transformed feature shape (235,), got {feat_out.shape}")
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
@@ -4202,7 +4544,7 @@ class FeatureEngine:
 
         return FeatureEventResult(
             ts_ms=int(ts_ms),
-            features=feat_z,
+            features=feat_out,
             dt_ms=float(any_event_dt_ms),
             is_decision=True,
             raw_mid=float(mid),
@@ -4530,82 +4872,16 @@ class FeatureEngine:
 
         return 0.0
 
-    def _feature_z_half_life_ms(self, feature_name: str) -> Optional[int]:
-        if (
-            feature_name.startswith("time_hour_")
-            or feature_name.startswith("time_dow_")
-            or feature_name.startswith("session_")
-        ):
-            return None
-        fast_tokens = (
-            "spread_delta", "spread_change_count", "bid_price_change", "ask_price_change",
-            "ofi_", "obi_", "pressure", "replen", "add_rate", "rem_rate",
-            "depletion", "ob_update_count", "ob_update_rate",
-        )
-        if any(tok in feature_name for tok in fast_tokens):
-            return 5_000
-        trade_tokens = (
-            "trade", "flow", "cvd", "large_", "absorption", "aggressor",
-            "signed_flow", "buy_flow", "sell_flow", "premium", "tick",
-        )
-        if any(tok in feature_name for tok in trade_tokens):
-            return 10_000
-        price_tokens = (
-            "price", "trend", "return", "vol", "regime", "depth", "liquidity",
-            "book_", "spread_mean", "spread_std", "spread_p90",
-            "spread_max", "spread_min", "spread_z", "range", "micro_l", "vamp_l",
-        )
-        if any(tok in feature_name for tok in price_tokens):
-            return 30_000
-        return 30_000
+    def _transform_features(self, raw: np.ndarray, dt_ms: float) -> np.ndarray:
+        names = self.feature_names()
+        if self._feature_transform_engine is None:
+            self._feature_transform_engine = FeatureTransformEngine(names, enable_diagnostics=True)
+        return self._feature_transform_engine.apply(raw, dt_ms)
 
-    def _zscore(self, x: np.ndarray, dt_ms: float) -> np.ndarray:
-        if x.ndim != 1:
-            raise ValueError(f"_zscore expects 1D feature vector, got shape={x.shape}")
-        if not np.all(np.isfinite(x)):
-            raise ValueError("Non-finite values passed to _zscore")
-
-        eps = 1e-9
-        x64 = np.asarray(x, dtype=np.float64)
-        dim = int(x64.shape[0])
-
-        if self._feat_dim is not None and dim != int(self._feat_dim):
-            raise ValueError(f"Feature dimension changed: got {x.shape[0]}, expected {self._feat_dim}")
-
-        if self._feat_dim is None:
-            self._feat_dim = dim
-            self.z_mean = x64.copy()
-            self.z_m2 = (x64 * x64).copy()
-            return np.zeros_like(x, dtype=np.float32)
-
-        if self.z_mean is None or self.z_m2 is None:
-            raise RuntimeError("z-score state is uninitialized despite _feat_dim being set")
-
-        hl = self._alpha_half_life_ms(self.z_hl_ms)
-        alpha = 1.0 - math.pow(0.5, max(1.0, float(dt_ms)) / float(hl))
-
-        self.z_mean = (1.0 - alpha) * self.z_mean + alpha * x64
-        self.z_m2 = (1.0 - alpha) * self.z_m2 + alpha * (x64 * x64)
-        var = np.maximum(self.z_m2 - self.z_mean * self.z_mean, eps)
-        z = (x64 - self.z_mean) / np.sqrt(var)
-        out = z.astype(np.float32)
-        if not np.all(np.isfinite(out)):
-            raise ValueError("Non-finite values produced by _zscore")
-        return out
-
-    def _ensure_zscore_metadata(self, names: List[str], dim: int) -> None:
-        if self._z_half_lives_ms is not None:
-            return
-
-        half_lives = [self._feature_z_half_life_ms(name) for name in names]
-        self._z_half_lives_ms = half_lives
-        mask = np.asarray([hl is not None for hl in half_lives], dtype=bool)
-        hl_arr = np.ones((dim,), dtype=np.float64)
-        for i, hl in enumerate(half_lives):
-            if hl is not None:
-                hl_arr[i] = float(max(1, int(hl)))
-        self._z_mask = mask
-        self._z_half_lives_arr = hl_arr
+    def transform_diagnostics_summary(self) -> Dict[str, Any]:
+        if self._feature_transform_engine is None:
+            return {"version": "feature_transform_diag_v1", "rows_seen": 0}
+        return self._feature_transform_engine.diagnostics_summary()
 
     # -------------------------------------------------------------------------
     # Public API
@@ -4801,7 +5077,7 @@ def _validate_flat_dataset_meta(meta: Dict[str, Any], source: str, *, require_st
     if label_dim_int != int(NUM_HORIZONS):
         raise ValueError(f"{source} has label_dim={label_dim_int}; expected {NUM_HORIZONS}.")
 
-    for field in ("feature_transform", "feature_dim_core", "feature_dim_total", "feature_names_hash", "aux_dim", "lookback"):
+    for field in ("feature_transform", "feature_transform_policy", "feature_transform_spec_hash", "feature_transform_warmup_rows", "feature_dim_core", "feature_dim_total", "feature_names_hash", "aux_dim", "lookback"):
         if field not in meta:
             raise ValueError(f"{source} missing required field '{field}'.")
 
@@ -4809,6 +5085,23 @@ def _validate_flat_dataset_meta(meta: Dict[str, Any], source: str, *, require_st
         raise ValueError(
             f"{source} has feature_transform={meta.get('feature_transform')!r}; expected {FEATURE_TRANSFORM!r}."
         )
+    if meta.get("feature_transform_policy") != FEATURE_TRANSFORM_POLICY:
+        raise ValueError(
+            f"{source} has feature_transform_policy={meta.get('feature_transform_policy')!r}; expected {FEATURE_TRANSFORM_POLICY!r}."
+        )
+    if int(meta.get("feature_transform_warmup_rows", -1)) != int(FEATURE_TRANSFORM_WARMUP_ROWS):
+        raise ValueError(
+            f"{source} has feature_transform_warmup_rows={meta.get('feature_transform_warmup_rows')!r}; expected {FEATURE_TRANSFORM_WARMUP_ROWS}."
+        )
+    if not str(meta.get("feature_transform_spec_hash", "")):
+        raise ValueError(f"{source} has empty feature_transform_spec_hash.")
+    if meta.get("feature_names"):
+        expected_spec_hash = feature_transform_spec_hash(list(meta.get("feature_names", [])))
+        if str(meta.get("feature_transform_spec_hash")) != expected_spec_hash:
+            raise ValueError(
+                f"{source} has feature_transform_spec_hash={meta.get('feature_transform_spec_hash')!r}; "
+                f"expected {expected_spec_hash!r}."
+            )
 
     for field in ("feature_dim_core", "feature_dim_total", "aux_dim", "lookback"):
         try:
