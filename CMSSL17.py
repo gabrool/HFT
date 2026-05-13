@@ -4456,7 +4456,7 @@ class FeatureEngine:
     # -------------------------------------------------------------------------
     # Event ingestion & feature build
     # -------------------------------------------------------------------------
-    def _parse_event(self, e: Any) -> Tuple[str, int, dict]:
+    def _parse_event(self, e: Any) -> Tuple[str, int, Any]:
         """
         Accepts multiple event shapes:
         - Tuple ('ob'|'trade', data:dict, ts_ms:int)
