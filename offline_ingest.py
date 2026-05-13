@@ -785,8 +785,8 @@ def build_aux_tail(fe: FeatureEngine, dt_ms: float) -> np.ndarray:
     )
 
 
-def build_token(fe: FeatureEngine, feat_z, dt_ms: float) -> np.ndarray:
-    core = np.asarray(feat_z, dtype=np.float32)
+def build_token(fe: FeatureEngine, features, dt_ms: float) -> np.ndarray:
+    core = np.asarray(features, dtype=np.float32)
     aux = build_aux_tail(fe, dt_ms)
     return np.concatenate([core, aux], axis=0).astype(np.float32, copy=False)
 
@@ -1990,16 +1990,16 @@ def collect_first_monday_fixed_utc_pca_sample(
         merged = ob_iter
 
     for event in merged:
-        ts_ms, feat_z, _dt_ms, is_decision, _mid = fe.on_fast_event(event)
-        if not is_decision:
+        result = fe.on_fast_event(e=event)
+        if not result.is_decision:
             continue
-        ts_i = int(ts_ms)
+        ts_i = int(result.ts_ms)
         if ts_i < start_ts_ms:
             continue
         if first_ts is None:
             first_ts = ts_i
         last_ts = ts_i
-        out_rows.append(np.asarray(feat_z, dtype=np.float32))
+        out_rows.append(np.asarray(result.features, dtype=np.float32))
         if len(out_rows) >= sample_rows:
             break
 
@@ -2614,14 +2614,14 @@ def _mature_with_next_week_context(
     context_last_ts: Optional[int] = None
     matured_labels = 0
     for event in _iter_week_merged_events(pair[0], pair[1], pair[2], week_quality=None):
-        ts_ms, feat_z, _dt_ms, is_decision, mid = fe.on_fast_event(event)
-        if not is_decision:
+        result = fe.on_fast_event(e=event)
+        if not result.is_decision:
             continue
-        if int(ts_ms) > cutoff_ts:
+        if int(result.ts_ms) > cutoff_ts:
             break
         context_events += 1
-        context_last_ts = int(ts_ms)
-        matured = labeler.on_event(int(ts_ms), float(mid))
+        context_last_ts = int(result.ts_ms)
+        matured = labeler.on_event(int(result.ts_ms), float(result.raw_mid))
         if matured is None:
             raise RuntimeError("Matured labels were not produced for OB context event")
         for yy in matured:
@@ -2833,13 +2833,15 @@ def process_all(
         if event is None:
             continue
 
-        ts_ms, feat_z, dt_ms, is_decision, mid = fe.on_fast_event(event)
+        result = fe.on_fast_event(e=event)
         events_seen += 1
-        if not is_decision and np.asarray(feat_z).shape[0] != 0:
+        if not result.is_decision and np.asarray(result.features).shape[0] != 0:
             raise RuntimeError("Non-decision fast path returned a non-empty feature vector")
 
-        if is_decision:
-            core_pre_pca = np.asarray(feat_z, dtype=np.float32, copy=False)
+        if result.is_decision:
+            ts_ms = result.ts_ms
+            features = result.features
+            core_pre_pca = np.asarray(features, dtype=np.float32, copy=False)
             assert len(feature_names_pre_pca) == core_pre_pca.shape[0]
             if core_pre_pca.shape[-1] != pre_pca_dim:
                 raise ValueError(
@@ -2892,7 +2894,7 @@ def process_all(
                 total_feature_rows += 1
             built_week_last_decision_ts[week_key] = int(ts_ms)
 
-            matured = labeler.on_event(int(ts_ms), float(mid))
+            matured = labeler.on_event(int(result.ts_ms), float(result.raw_mid))
             last_decision_ts_ms = int(ts_ms)
 
             if matured is None:
