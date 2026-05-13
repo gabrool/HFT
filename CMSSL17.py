@@ -500,14 +500,14 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v5_raw_no_" + "p" + "ca" + "_pruned245_xformv2"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v6_raw_no_" + "p" + "ca" + "_pruned239_xformv2"
 FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned235"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
 FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned235"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned245-xformv2"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned239-xformv2"
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
 FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
@@ -2292,6 +2292,8 @@ class RawTransformKind(IntEnum):
     FIXED_SCALE = 3
     TANH_SCALE = 4
     LOG1P_MS = 5
+    LOG_RATIO_POS = 6
+    LOG1P_POS_SCALE = 7
 
 
 class NormalizeKind(IntEnum):
@@ -2314,7 +2316,7 @@ class FeatureTransformSpec:
             raise ValueError(f"half_life_ms must be 0 when normalize=NONE for {self.name!r}")
         if self.normalize == NormalizeKind.EWMA_Z and int(self.half_life_ms) not in {XFORM_HL_FAST_MS, XFORM_HL_MEDIUM_MS, XFORM_HL_SLOW_MS}:
             raise ValueError(f"invalid EWMA half_life_ms={self.half_life_ms} for {self.name!r}")
-        if self.raw_transform in {RawTransformKind.FIXED_SCALE, RawTransformKind.TANH_SCALE} and float(self.scale) <= 0.0:
+        if self.raw_transform in {RawTransformKind.FIXED_SCALE, RawTransformKind.TANH_SCALE, RawTransformKind.LOG1P_POS_SCALE} and float(self.scale) <= 0.0:
             raise ValueError(f"scale must be positive for {self.raw_transform.name} on {self.name!r}")
         if float(self.input_clip_abs) < 0.0:
             raise ValueError(f"input_clip_abs must be nonnegative for {self.name!r}")
@@ -2333,8 +2335,10 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
     def bps_tanh(name, scale=2.0, out=1.5): return spec(name, RawTransformKind.TANH_SCALE, NormalizeKind.NONE, scale=scale, out=out)
     def log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.LOG1P_POS, NormalizeKind.EWMA_Z, hl=hl, out=out)
     def log_no_norm(name, out=20.0): return spec(name, RawTransformKind.LOG1P_POS, NormalizeKind.NONE, out=out)
+    def log_ratio_pos(name, out=5.0): return spec(name, RawTransformKind.LOG_RATIO_POS, NormalizeKind.NONE, scale=1.0, out=out)
+    def log_pos_scale(name, scale=10.0, out=3.0): return spec(name, RawTransformKind.LOG1P_POS_SCALE, NormalizeKind.NONE, scale=scale, out=out)
     def signed_log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.SIGNED_LOG1P, NormalizeKind.EWMA_Z, hl=hl, out=out)
-    def log_ms(name, out=8.0): return spec(name, RawTransformKind.LOG1P_MS, NormalizeKind.NONE, out=out)
+    def log_ms(name, out=12.0): return spec(name, RawTransformKind.LOG1P_MS, NormalizeKind.NONE, out=out)
 
     specs: List[FeatureTransformSpec] = []
     for name in feature_names:
@@ -2342,7 +2346,9 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
         if name in {"utc_hour_sin", "utc_hour_cos", "utc_dow_sin", "utc_dow_cos", "is_weekend"}:
             s = bounded(name, out=1.0)
         elif name in {"bid_l1_notional_usd", "ask_l1_notional_usd", "bid_depth_notional_5bps", "ask_depth_notional_5bps", "total_depth_notional_5bps"}:
-            s = log_no_norm(name, out=20.0)
+            s = log_pos_scale(name, scale=10.0, out=3.0)
+        elif name.startswith("down_up_vol_ratio_"):
+            s = log_ratio_pos(name, out=5.0)
         elif name.startswith("max_abs_return_bps_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
         elif name.startswith("obi_l") and ("_mean_" in name):
@@ -2354,16 +2360,14 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             or name.startswith("trade_imbalance_notional_")
             or name.startswith("regime_flow_imbalance_")
             or name.startswith("depth_imbalance_5bps_mean_")
-            or name.startswith("spread_time_above_1bp_frac_")
-            or name.startswith("down_up_vol_ratio_")
             or name == "micro_minus_mid_over_spread"
         ):
             s = ratio(name) if name == "micro_minus_mid_over_spread" else bounded(name)
         elif name.startswith("spread_z_") or name.startswith("depth_5bps_z_"):
             s = clip(name)
         elif name.startswith("time_since") or name.startswith("time_since_last_"):
-            s = log_ms(name, out=10.0)
-        elif name in {"last_trade_side_sign", "last_tick_sign", "last_is_zero_tick", "last_is_rpi"}:
+            s = log_ms(name)
+        elif name in {"last_trade_side_sign", "last_tick_sign", "last_is_zero_tick"}:
             s = bounded(name, out=1.0)
         elif name.startswith("trade_toxicity_") or name.startswith("tick_imbalance_") or name.startswith("tick_sign_imbalance_") or name.startswith("zero_tick_fraction_"):
             s = bounded(name)
@@ -2538,6 +2542,11 @@ class FeatureTransformEngine:
                 tx[mask] = np.tanh(xm / self.scale[mask])
             elif kind == RawTransformKind.LOG1P_MS:
                 tx[mask] = np.log1p(np.maximum(xm, 0.0))
+            elif kind == RawTransformKind.LOG_RATIO_POS:
+                eps = 1e-6
+                tx[mask] = np.log(np.maximum(xm, eps))
+            elif kind == RawTransformKind.LOG1P_POS_SCALE:
+                tx[mask] = np.log1p(np.maximum(xm, 0.0)) / self.scale[mask]
         out = tx.copy()
         if np.any(self.ewma_mask):
             warm = self.obs_count < int(FEATURE_TRANSFORM_WARMUP_ROWS)
@@ -2640,6 +2649,20 @@ class FeatureTransformEngine:
             },
             "half_life_summary": hl_summary,
             "feature_rows": feature_rows,
+            "actionable_summary": {
+                "dead_features": [
+                    row for row in feature_rows
+                    if (float(row["final_std"]) == 0.0 or float(row["final_max_abs"]) == 0.0)
+                ],
+                "low_variance_features": [
+                    row for row in feature_rows
+                    if (float(row["final_std"]) > 0.0 and float(row["final_std"]) < 0.01)
+                ],
+                "high_clip_features": [
+                    row for row in feature_rows
+                    if float(row["output_clip_frac"]) > 0.01
+                ],
+            },
         }
 
 # -------------------------  Feature engine  -------------------------
@@ -2714,7 +2737,7 @@ class FeatureEngine:
         self._mid_asof_history = PriceAsofHistory(self.price_history_keep_ms)
         self._micro_asof_history = PriceAsofHistory(self.price_history_keep_ms)
         self._price_window_mid_states: Dict[int, RollingPriceWindowState] = {
-            w: RollingPriceWindowState(w) for w in PRICE_WINDOWS_MS
+            w: RollingPriceWindowState(w) for w in PRICE_WINDOWS_MS if w != 200
         }
 
         # ---------- Rolling return histories ----------
@@ -2754,11 +2777,7 @@ class FeatureEngine:
         self._depth_5bps_imbalance_history: Deque[Tuple[int, float]] = deque()
         self._regime_metric_keep_ms = max(SPREAD_DEPTH_REGIME_WINDOWS_MS) + 5_000
         self._spread_bps_regime_states = {
-            ms: RollingScalarWindowState(
-                ms,
-                track_sorted=True,
-                above_thresholds=(1.0,),
-            )
+            ms: RollingScalarWindowState(ms)
             for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS
         }
         self._depth_5bps_total_regime_states = {
@@ -2854,7 +2873,6 @@ class FeatureEngine:
         self.last_tick_sign: int = 0
         self.last_is_zero_tick: int = 0
         self.last_trade_price: Optional[float] = None
-        self.last_is_rpi: int = 0
         self.last_trade_side_sign: float = 0.0
         self.last_trade_notional_usd: float = 0.0
         self.last_buy_trade_ts: Optional[int] = None
@@ -2916,8 +2934,10 @@ class FeatureEngine:
             names.extend([
                 f"mid_ret_bps_{w}ms",
                 f"micro_ret_bps_{w}ms",
-                f"mid_slope_bps_per_sec_{w}ms",
-                f"mid_range_bps_{w}ms",
+                *([] if w == 200 else [
+                    f"mid_slope_bps_per_sec_{w}ms",
+                    f"mid_range_bps_{w}ms",
+                ]),
             ])
         names.extend([
             "spread_bps",
@@ -3003,7 +3023,6 @@ class FeatureEngine:
             "last_trade_side_sign",
             "last_tick_sign",
             "last_is_zero_tick",
-            "last_is_rpi",
             "last_trade_notional_usd",
             "time_since_last_buy_trade_ms",
             "time_since_last_sell_trade_ms",
@@ -3044,7 +3063,6 @@ class FeatureEngine:
             names.extend([
                 f"spread_z_{ms}ms",
                 f"spread_widening_slope_bps_per_sec_{ms}ms",
-                f"spread_time_above_1bp_frac_{ms}ms",
                 f"depth_5bps_z_{ms}ms",
                 f"depth_imbalance_5bps_mean_{ms}ms",
                 f"depth_imbalance_5bps_slope_{ms}ms",
@@ -4340,13 +4358,16 @@ class FeatureEngine:
             past_micro = self._micro_asof_history.asof(ts_ms - w)
             mid_ret_bps = self._bps_return(mid, past_mid) if past_mid is not None else 0.0
             micro_ret_bps = self._bps_return(micro, past_micro) if past_micro is not None else 0.0
-            state = self._price_window_mid_states[w]
-            state.prune(ts_ms)  # critical: prune to current row timestamp before reading
-            mid_slope_bps_per_sec = state.slope_bps_per_sec()
-            mid_range_bps = state.range_bps()
-            price_features_by_window[w] = (
-                mid_ret_bps, micro_ret_bps, mid_slope_bps_per_sec, mid_range_bps,
-            )
+            if w == 200:
+                price_features_by_window[w] = (mid_ret_bps, micro_ret_bps)
+            else:
+                state = self._price_window_mid_states[w]
+                state.prune(ts_ms)  # critical: prune to current row timestamp before reading
+                mid_slope_bps_per_sec = state.slope_bps_per_sec()
+                mid_range_bps = state.range_bps()
+                price_features_by_window[w] = (
+                    mid_ret_bps, micro_ret_bps, mid_slope_bps_per_sec, mid_range_bps,
+                )
         bid_depth_5bps = self._depth_within_bps(self.bid_lvls, mid, 5.0, is_bid=True)
         ask_depth_5bps = self._depth_within_bps(self.ask_lvls, mid, 5.0, is_bid=False)
         depth_5bps_total = bid_depth_5bps + ask_depth_5bps
@@ -4538,7 +4559,6 @@ class FeatureEngine:
             float(self.last_trade_side_sign),
             float(self.last_tick_sign),
             float(self.last_is_zero_tick),
-            float(self.last_is_rpi),
             float(self.last_trade_notional_usd),
             float(ts_ms - self.last_buy_trade_ts) if self.last_buy_trade_ts is not None else 0.0,
             float(ts_ms - self.last_sell_trade_ts) if self.last_sell_trade_ts is not None else 0.0,
@@ -4600,7 +4620,6 @@ class FeatureEngine:
             spread_mean, spread_std = spread_win.mean_std()
             spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_mean) / max(spread_std, 1e-9)
             spread_slope = spread_win.slope()
-            spread_above = spread_win.frac_above(1.0)
 
             depth_mean, depth_std = depth_state.mean_std()
             depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_mean) / max(depth_std, 1e-9)
@@ -4610,7 +4629,6 @@ class FeatureEngine:
             feat_list.extend([
                 spread_z,
                 spread_slope,
-                spread_above,
                 depth_z,
                 imb_mean,
                 imb_slope,
@@ -4632,8 +4650,8 @@ class FeatureEngine:
                 f"len(feature_names)={len(names)}"
             )
         feat = np.asarray(feat_list, dtype=np.float64)
-        if len(names) != 245:
-            raise ValueError(f"Expected pruned raw core dim 245, got {len(names)}")
+        if len(names) != 239:
+            raise ValueError(f"Expected pruned raw core dim 239, got {len(names)}")
         if self.strict_feature_validation:
             if not np.all(np.isfinite(feat)):
                 bad_idx = np.flatnonzero(~np.isfinite(feat))
@@ -4643,8 +4661,8 @@ class FeatureEngine:
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
         feat_out = self._transform_features(feat, ob_dt_ms)
-        if feat_out.shape != (245,):
-            raise ValueError(f"Expected transformed feature shape (245,), got {feat_out.shape}")
+        if feat_out.shape != (239,):
+            raise ValueError(f"Expected transformed feature shape (239,), got {feat_out.shape}")
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
@@ -4729,14 +4747,13 @@ class FeatureEngine:
 
     def _update_trade_windows(self, ts_ms: int, trade_evt: Any, dt_ms: float):
         if isinstance(trade_evt, tuple):
-            price, size, side_code, tick_dir_code, is_rpi = trade_evt
+            price, size, side_code, tick_dir_code, _is_rpi = trade_evt
             side = 'buy' if int(side_code) > 0 else 'sell' if int(side_code) < 0 else 'unknown'
             side_sign = 1.0 if int(side_code) > 0 else -1.0 if int(side_code) < 0 else 0.0
             price = float(price)
             size = float(size)
             tick_sign = float(int(tick_dir_code))
             is_zero_tick = 1.0 if int(tick_dir_code) == 0 else 0.0
-            is_rpi = int(is_rpi)
         else:
             side = str(trade_evt['side']).lower()  # 'buy'|'sell'
             side_sign = 1.0 if side == "buy" else -1.0 if side == "sell" else 0.0
@@ -4746,29 +4763,6 @@ class FeatureEngine:
             tick_dir = trade_evt.get("tickDirection")
             tick_sign = float(int(self.last_tick_sign))
             is_zero_tick = float(int(self.last_is_zero_tick))
-            is_rpi = int(self.last_is_rpi)
-
-            rpi_raw = trade_evt.get("RPI")
-            if rpi_raw is None:
-                rpi_raw = trade_evt.get("rpi")
-
-            if rpi_raw is not None:
-                if isinstance(rpi_raw, str):
-                    rpi_norm = rpi_raw.strip().lower()
-                    if rpi_norm in {"1", "true", "t", "yes", "y"}:
-                        is_rpi = 1
-                    elif rpi_norm in {"0", "false", "f", "no", "n", ""}:
-                        is_rpi = 0
-                    else:
-                        try:
-                            is_rpi = 1 if float(rpi_norm) != 0.0 else 0
-                        except ValueError:
-                            pass
-                else:
-                    try:
-                        is_rpi = 1 if float(rpi_raw) != 0.0 else 0
-                    except (TypeError, ValueError):
-                        pass
 
             if tick_dir is not None:
                 td_sign, td_zero = self._interpret_tick_direction(tick_dir)
@@ -4791,7 +4785,6 @@ class FeatureEngine:
         self.last_tick_sign = int(tick_sign)
         self.last_is_zero_tick = int(is_zero_tick)
         self.last_trade_price = float(price)
-        self.last_is_rpi = int(is_rpi)
 
         notional_usd = float(price) * float(size)
         self.last_trade_side_sign = float(side_sign)
