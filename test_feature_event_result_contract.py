@@ -818,6 +818,63 @@ def test_heavy_tailed_features_use_log_ewma() -> None:
     assert specs["top5_trade_notional_sum_usd_1000ms"].normalize == NormalizeKind.EWMA_Z
 
 
+
+def test_transform_engine_uses_ob_clock_not_any_event_clock() -> None:
+    fe = FeatureEngine()
+
+    # First OB initializes book, OB feature clock, and transform engine.
+    r0 = fe.on_fast_event(deep_snapshot_ob(1_700_001_000_000, n_levels=60))
+    assert r0.event_type == "ob"
+    assert r0.is_decision is True
+
+    # Same-ms trade before OB: this updates _last_any_event_ts to the OB timestamp,
+    # so the following OB would see any_event_dt_ms=1.0 if the wrong clock is used.
+    tr = fe.on_fast_event(trade(1_700_001_000_100))
+    assert tr.event_type == "trade"
+    assert tr.is_decision is False
+
+    ob = fe.on_fast_event(("ob", 1_700_001_000_100, 2, 2, ((100.0, 2.5),), ((101.0, 2.5),)))
+    assert ob.event_type == "ob"
+    assert ob.is_decision is True
+
+    assert fe._feature_transform_engine is not None
+    assert fe._feature_transform_engine.last_apply_dt_ms == 100.0
+
+
+def test_micro_premia_is_bounded_ratio_transform() -> None:
+    from CMSSL17 import build_feature_transform_specs, RawTransformKind, NormalizeKind
+
+    fe = FeatureEngine()
+    specs = {s.name: s for s in build_feature_transform_specs(fe.feature_names())}
+    spec = specs["micro_premia"]
+
+    assert spec.raw_transform == RawTransformKind.IDENTITY
+    assert spec.normalize == NormalizeKind.NONE
+    assert spec.half_life_ms == 0
+    assert spec.scale == 1.0
+    assert spec.input_clip_abs == 0.0
+    assert spec.output_clip_abs == 1.5
+
+
+def test_aux_transform_constant_and_metadata_contract() -> None:
+    import CMSSL17
+    assert CMSSL17.AUX_TRANSFORM == "prelog1p_no_ewma_v1"
+
+
+def test_aux_transform_is_validated_in_training_loaders() -> None:
+    from pathlib import Path
+
+    cmssl_text = Path("CMSSL17.py").read_text()
+    offline_text = Path("CMSSL17_offline.py").read_text()
+    ingest_text = Path("offline_ingest.py").read_text()
+
+    assert "AUX_TRANSFORM" in cmssl_text
+    assert "aux_transform" in cmssl_text
+    assert "aux_transform" in offline_text
+    assert "AUX_TRANSFORM" in offline_text
+    assert "aux_transform" in ingest_text
+    assert "AUX_TRANSFORM" in ingest_text
+
 def test_transform_diagnostics_summary_has_required_fields() -> None:
     fe = FeatureEngine()
     for i in range(80):
@@ -893,6 +950,10 @@ def main() -> None:
     test_old_zscore_path_removed()
     test_ewma_transform_scores_before_update()
     test_bounded_features_are_not_ewma_z()
+    test_transform_engine_uses_ob_clock_not_any_event_clock()
+    test_micro_premia_is_bounded_ratio_transform()
+    test_aux_transform_constant_and_metadata_contract()
+    test_aux_transform_is_validated_in_training_loaders()
     test_heavy_tailed_features_use_log_ewma()
     test_transform_diagnostics_summary_has_required_fields()
 

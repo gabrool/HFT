@@ -2268,6 +2268,7 @@ class RollingReturnDistributionState:
 XFORM_HL_FAST_MS = 5_000
 XFORM_HL_MEDIUM_MS = 30_000
 XFORM_HL_SLOW_MS = 120_000
+AUX_TRANSFORM = "prelog1p_no_ewma_v1"
 
 
 class RawTransformKind(IntEnum):
@@ -2361,7 +2362,17 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bps(name, scale=2.0)
         elif name.startswith("mid_slope_bps_per_sec_") or name.startswith("micro_l5_slope_") or name.startswith("spread_widening_slope_bps_per_sec_"):
             s = bps(name, scale=10.0)
-        elif name == "micro_minus_mid_bps" or name.startswith("micro_l") and name.endswith("_minus_mid_bps") or name.startswith("vamp_l") and name.endswith("_minus_mid_bps") or name == "micro_l1_minus_micro_l10_bps" or name == "micro_premia":
+        elif name == "micro_premia":
+            s = FeatureTransformSpec(
+                name="micro_premia",
+                raw_transform=RawTransformKind.IDENTITY,
+                normalize=NormalizeKind.NONE,
+                half_life_ms=0,
+                scale=1.0,
+                input_clip_abs=0.0,
+                output_clip_abs=1.5,
+            )
+        elif name == "micro_minus_mid_bps" or name.startswith("micro_l") and name.endswith("_minus_mid_bps") or name.startswith("vamp_l") and name.endswith("_minus_mid_bps") or name == "micro_l1_minus_micro_l10_bps":
             s = bps(name, scale=2.0)
         elif name.startswith("vwap_vs_mid_bps_") or name.startswith("signed_trade_premium_bps_volume_weighted_"):
             s = bps(name, scale=3.0)
@@ -2460,6 +2471,7 @@ class FeatureTransformEngine:
         self.m2 = np.zeros(self.dim, dtype=np.float64)
         self.obs_count = np.zeros(self.dim, dtype=np.int64)
         self.initialized = False
+        self.last_apply_dt_ms: float = 0.0
         self.raw_nonfinite_count = np.zeros(self.dim, dtype=np.int64)
         self.input_clip_count = np.zeros(self.dim, dtype=np.int64)
         self.output_clip_count = np.zeros(self.dim, dtype=np.int64)
@@ -2475,6 +2487,8 @@ class FeatureTransformEngine:
         self.non_ewma_diag: Dict[str, Dict[str, float]] = {}
 
     def apply(self, raw: np.ndarray, dt_ms: float) -> np.ndarray:
+        dt_ms_f = max(1.0, float(dt_ms))
+        self.last_apply_dt_ms = dt_ms_f
         x = np.asarray(raw, dtype=np.float64)
         if x.ndim != 1 or x.shape[0] != self.dim:
             raise ValueError(f"FeatureTransformEngine expects shape ({self.dim},), got {x.shape}")
@@ -2526,7 +2540,7 @@ class FeatureTransformEngine:
                 self.obs_count[ew] += 1
             else:
                 alpha = np.zeros(self.dim, dtype=np.float64)
-                alpha[ew] = 1.0 - np.power(0.5, max(1.0, float(dt_ms)) / self.half_life_ms[ew])
+                alpha[ew] = 1.0 - np.power(0.5, dt_ms_f / self.half_life_ms[ew])
                 self.mean[ew] = (1.0 - alpha[ew]) * self.mean[ew] + alpha[ew] * tx[ew]
                 self.m2[ew] = (1.0 - alpha[ew]) * self.m2[ew] + alpha[ew] * (tx[ew] * tx[ew])
                 self.obs_count[ew] += 1
@@ -4528,7 +4542,7 @@ class FeatureEngine:
                     for i in bad_idx[:20]
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
-        feat_out = self._transform_features(feat, any_event_dt_ms)
+        feat_out = self._transform_features(feat, ob_dt_ms)
         if feat_out.shape != (235,):
             raise ValueError(f"Expected transformed feature shape (235,), got {feat_out.shape}")
         self._append_price_history(ts_ms, mid, micro)
@@ -5077,10 +5091,14 @@ def _validate_flat_dataset_meta(meta: Dict[str, Any], source: str, *, require_st
     if label_dim_int != int(NUM_HORIZONS):
         raise ValueError(f"{source} has label_dim={label_dim_int}; expected {NUM_HORIZONS}.")
 
-    for field in ("feature_transform", "feature_transform_policy", "feature_transform_spec_hash", "feature_transform_warmup_rows", "feature_dim_core", "feature_dim_total", "feature_names_hash", "aux_dim", "lookback"):
+    for field in ("feature_schema", "feature_transform", "feature_transform_policy", "feature_transform_spec_hash", "feature_transform_warmup_rows", "feature_dim_core", "feature_dim_total", "feature_names_hash", "aux_dim", "aux_names", "aux_transform", "lookback"):
         if field not in meta:
             raise ValueError(f"{source} missing required field '{field}'.")
 
+    if meta.get("feature_schema") != FEATURE_SCHEMA:
+        raise ValueError(
+            f"{source} has feature_schema={meta.get('feature_schema')!r}; expected {FEATURE_SCHEMA!r}."
+        )
     if meta.get("feature_transform") != FEATURE_TRANSFORM:
         raise ValueError(
             f"{source} has feature_transform={meta.get('feature_transform')!r}; expected {FEATURE_TRANSFORM!r}."
@@ -5088,6 +5106,11 @@ def _validate_flat_dataset_meta(meta: Dict[str, Any], source: str, *, require_st
     if meta.get("feature_transform_policy") != FEATURE_TRANSFORM_POLICY:
         raise ValueError(
             f"{source} has feature_transform_policy={meta.get('feature_transform_policy')!r}; expected {FEATURE_TRANSFORM_POLICY!r}."
+        )
+    if meta.get("aux_transform") != AUX_TRANSFORM:
+        raise ValueError(
+            f"Dataset aux_transform mismatch: got {meta.get('aux_transform')!r}, "
+            f"expected {AUX_TRANSFORM!r}"
         )
     if int(meta.get("feature_transform_warmup_rows", -1)) != int(FEATURE_TRANSFORM_WARMUP_ROWS):
         raise ValueError(
@@ -5116,6 +5139,12 @@ def _validate_flat_dataset_meta(meta: Dict[str, Any], source: str, *, require_st
             f"{source} has feature_dim_total={meta['feature_dim_total']!r}, "
             f"feature_dim_core={meta['feature_dim_core']!r}, aux_dim={meta['aux_dim']!r}; "
             "expected feature_dim_total == feature_dim_core + aux_dim."
+        )
+    if int(meta["aux_dim"]) != int(AUX_DIM):
+        raise ValueError(f"{source} has aux_dim={meta['aux_dim']!r}; expected {AUX_DIM}.")
+    if list(meta.get("aux_names", [])) != list(FEATURE_AUX_TAIL):
+        raise ValueError(
+            f"{source} has aux_names={meta.get('aux_names')!r}; expected {list(FEATURE_AUX_TAIL)!r}."
         )
     if not str(meta.get("feature_names_hash", "")):
         raise ValueError(f"{source} missing non-empty feature_names_hash.")
