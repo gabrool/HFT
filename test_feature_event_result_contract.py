@@ -701,6 +701,81 @@ def test_pruned_feature_vector_matches_names() -> None:
     assert result.features.shape == (235,)
     assert len(fe.feature_names()) == 235
 
+
+def test_no_empty_feature_family_scaffolding_remains() -> None:
+    import CMSSL17
+
+    forbidden_attrs = [
+        "INTERACTION_WINDOWS_MS",
+        "TRADE_BURST_WINDOWS_MS",
+        "LARGE_TRADE_CONTINUATION_WINDOWS_MS",
+        "MACD_TRIPLETS_MS",
+        "VPIN_BUCKET_SECS",
+        "BOOK_SHAPE_BANDS",
+        "SLIPPAGE_NOTIONAL_USD",
+        "LARGE_TRADE_NOTIONAL_USD",
+        "TRADE_IMBALANCE_DIFF_PAIRS_MS",
+        "NET_FLOW_DIFF_PAIRS_MS",
+        "OFI_IMBALANCE_DIFF_PAIRS_MS",
+    ]
+
+    for attr in forbidden_attrs:
+        assert not hasattr(CMSSL17, attr), attr
+
+
+def test_hot_path_pruned_feature_count_still_unchanged() -> None:
+    fe = FeatureEngine()
+    names = list(fe.feature_names())
+    assert len(names) == 235
+    assert fe.core_feature_dim() == 235
+    assert fe.feature_dim() == 241
+
+    result = fe.on_fast_event(deep_snapshot_ob(1_700_000_800_000, n_levels=60))
+    assert result.event_type == "ob"
+    assert result.is_decision is True
+    assert result.features.shape == (235,)
+
+
+def test_removed_hot_path_scaffolding_strings_absent() -> None:
+    from pathlib import Path
+
+    text = Path("CMSSL17.py").read_text()
+
+    forbidden = [
+        "band_depth_stats",
+        "shape_stats",
+        "slippage_by_notional",
+        "slippage_asymmetry_features",
+        "vpin_features",
+        "macd_features",
+        "rolling_obi_stats",
+        "state.slope()",
+        "state.persistence(",
+        "trade_sign_history",
+        "trade_burst_states",
+        "vpin_state",
+        "macd_state",
+        "threshold_counts",
+        "large_buy_count_ge_",
+        "large_sell_count_ge_",
+        "large_trade_imbalance_ge_",
+    ]
+
+    for token in forbidden:
+        assert token not in text, token
+
+
+def test_large_trade_and_cvd_windows_are_flow_only() -> None:
+    import CMSSL17
+
+    fe = FeatureEngine()
+    assert tuple(fe.large_trade_windows) == tuple(CMSSL17.FLOW_WINDOWS_MS)
+    assert tuple(fe.cvd_windows) == tuple(CMSSL17.FLOW_WINDOWS_MS)
+    assert set(fe.large_trade_states.keys()) == set(CMSSL17.FLOW_WINDOWS_MS)
+    assert set(fe.cvd_window_states.keys()) == set(CMSSL17.FLOW_WINDOWS_MS)
+    assert 3000 not in fe.large_trade_states
+    assert 3000 not in fe.cvd_window_states
+
 def main() -> None:
     fe = FeatureEngine()
 
@@ -755,6 +830,10 @@ def main() -> None:
     test_offline_ingest_no_overwrite_duplicate_timestamp_api()
     test_pruned_feature_schema_contract()
     test_pruned_feature_vector_matches_names()
+    test_no_empty_feature_family_scaffolding_remains()
+    test_hot_path_pruned_feature_count_still_unchanged()
+    test_removed_hot_path_scaffolding_strings_absent()
+    test_large_trade_and_cvd_windows_are_flow_only()
 
 
 if __name__ == "__main__":
