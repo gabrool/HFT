@@ -5953,10 +5953,24 @@ class FeatureEngine:
                 compact_payload = (int(payload[0]), payload[1], payload[2])
             else:
                 data = payload.get('data', payload)
+                tp_raw = payload.get("type")
+                if tp_raw is None and isinstance(data, dict):
+                    tp_raw = data.get("type")
+                if tp_raw is None:
+                    tp_raw = payload.get("DataType")
+
+                tp_norm = str(tp_raw or "").strip().lower()
+                if tp_norm == "snapshot":
+                    tp_code = 1
+                elif tp_norm == "delta":
+                    tp_code = 2
+                else:
+                    raise ValueError(f"Missing/unknown OB type in generic on_event payload: {tp_raw!r}")
+
                 compact_payload = (
-                    1 if str(payload.get('type') or data.get('type') or payload.get('DataType') or 'delta').strip().lower() == 'snapshot' else 2,
-                    tuple((float(p), float(q)) for p, q in data.get('b', [])),
-                    tuple((float(p), float(q)) for p, q in data.get('a', [])),
+                    tp_code,
+                    tuple((float(p), float(q)) for p, q in data.get("b", [])),
+                    tuple((float(p), float(q)) for p, q in data.get("a", [])),
                 )
             payload = compact_payload
         elif etype == 'trade' and not isinstance(payload, tuple):

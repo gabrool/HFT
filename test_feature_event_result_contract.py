@@ -348,6 +348,44 @@ def test_compact_ob_type_code_does_not_default_to_delta() -> None:
     assert offline_ingest._compact_ob_type_code("weird") == 0
 
 
+def generic_dict_ob(ts: int, ob_type=None):
+    event = {
+        "ts": ts,
+        "data": {
+            "b": [[100.0, 2.0], [99.5, 1.5]],
+            "a": [[101.0, 2.5], [101.5, 1.0]],
+        },
+    }
+    if ob_type is not None:
+        event["type"] = ob_type
+    return event
+
+
+def test_generic_dict_ob_type_parsing_is_explicit() -> None:
+    fe = FeatureEngine()
+
+    snapshot = fe.on_event(generic_dict_ob(1_700_000_600_000, "snapshot"))
+    assert snapshot.event_type == "ob"
+    assert snapshot.is_decision is True
+    assert snapshot.features.shape[0] > 0
+
+    delta = fe.on_event(generic_dict_ob(1_700_000_600_100, "delta"))
+    assert delta.event_type == "ob"
+    assert delta.is_decision is True
+    assert delta.features.shape[0] > 0
+
+    for bad_event in (
+        generic_dict_ob(1_700_000_600_200),
+        generic_dict_ob(1_700_000_600_300, "weird"),
+    ):
+        bad_fe = FeatureEngine()
+        try:
+            bad_fe.on_event(bad_event)
+            raise AssertionError("Generic dict OB with missing/unknown type should have raised")
+        except ValueError as exc:
+            assert "Missing/unknown OB type in generic on_event payload" in str(exc)
+
+
 def test_trade_does_not_pollute_ob_feature_state() -> None:
     fe = FeatureEngine()
 
@@ -464,6 +502,7 @@ def main() -> None:
     test_book_health_validation_rejects_bad_snapshots()
     test_malformed_delta_levels_are_ignored_but_valid_updates_apply()
     test_compact_ob_type_code_does_not_default_to_delta()
+    test_generic_dict_ob_type_parsing_is_explicit()
 
 
 if __name__ == "__main__":
