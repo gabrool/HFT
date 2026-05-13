@@ -500,14 +500,14 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v4_raw_no_" + "p" + "ca" + "_pruned235_xformv2"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v5_raw_no_" + "p" + "ca" + "_pruned245_xformv2"
 FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned235"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
 FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned235"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned235-xformv2"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned245-xformv2"
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
 FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
@@ -610,6 +610,20 @@ SPREAD_DEPTH_REGIME_WINDOWS_MS = (
 
 NORMALIZED_OFI_LEVELS = (1, 3, 5, 10)
 BPS_DEPTH_BANDS = (1.0, 2.0, 5.0, 10.0)
+CALENDAR_CONTEXT_FEATURES = (
+    "utc_hour_sin",
+    "utc_hour_cos",
+    "utc_dow_sin",
+    "utc_dow_cos",
+    "is_weekend",
+)
+NOTIONAL_CONTEXT_FEATURES = (
+    "bid_l1_notional_usd",
+    "ask_l1_notional_usd",
+    "bid_depth_notional_5bps",
+    "ask_depth_notional_5bps",
+    "total_depth_notional_5bps",
+)
 ROLLING_OFI_LEVELS = (1, 3, 5, 10)
 ROLLING_OBI_LEVELS = (3, 5, 10)
 DEEP_MICRO_LEVELS = (3, 5, 10)
@@ -2318,13 +2332,18 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
     def bps(name, scale=2.0, out=8.0): return spec(name, RawTransformKind.FIXED_SCALE, NormalizeKind.NONE, scale=scale, out=out)
     def bps_tanh(name, scale=2.0, out=1.5): return spec(name, RawTransformKind.TANH_SCALE, NormalizeKind.NONE, scale=scale, out=out)
     def log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.LOG1P_POS, NormalizeKind.EWMA_Z, hl=hl, out=out)
+    def log_no_norm(name, out=20.0): return spec(name, RawTransformKind.LOG1P_POS, NormalizeKind.NONE, out=out)
     def signed_log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.SIGNED_LOG1P, NormalizeKind.EWMA_Z, hl=hl, out=out)
     def log_ms(name, out=8.0): return spec(name, RawTransformKind.LOG1P_MS, NormalizeKind.NONE, out=out)
 
     specs: List[FeatureTransformSpec] = []
     for name in feature_names:
         s: Optional[FeatureTransformSpec] = None
-        if name.startswith("max_abs_return_bps_"):
+        if name in {"utc_hour_sin", "utc_hour_cos", "utc_dow_sin", "utc_dow_cos", "is_weekend"}:
+            s = bounded(name, out=1.0)
+        elif name in {"bid_l1_notional_usd", "ask_l1_notional_usd", "bid_depth_notional_5bps", "ask_depth_notional_5bps", "total_depth_notional_5bps"}:
+            s = log_no_norm(name, out=20.0)
+        elif name.startswith("max_abs_return_bps_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
         elif name.startswith("obi_l") and ("_mean_" in name):
             s = bounded(name)
@@ -2892,6 +2911,7 @@ class FeatureEngine:
         if self._feature_names_cache is not None:
             return list(self._feature_names_cache)
         names: List[str] = []
+        names.extend(CALENDAR_CONTEXT_FEATURES)
         for w in PRICE_WINDOWS_MS:
             names.extend([
                 f"mid_ret_bps_{w}ms",
@@ -2911,6 +2931,7 @@ class FeatureEngine:
             "time_since_trade_ms",
             "time_since_mid_change_ms",
         ])
+        names.extend(NOTIONAL_CONTEXT_FEATURES)
         for lvl in BOOK_SIGNAL_LEVELS:
             names.append(f"obi_l{lvl}")
         for lvl in BOOK_SIGNAL_LEVELS:
@@ -3631,6 +3652,58 @@ class FeatureEngine:
 
         return float(total_size)
 
+    def _calendar_context_features(self, ts_ms: int) -> List[float]:
+        dt = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc)
+
+        hour_float = (
+            float(dt.hour)
+            + float(dt.minute) / 60.0
+            + float(dt.second) / 3600.0
+            + float(dt.microsecond) / 3_600_000_000.0
+        )
+        hour_angle = 2.0 * math.pi * hour_float / 24.0
+
+        dow_float = float(dt.weekday()) + hour_float / 24.0
+        dow_angle = 2.0 * math.pi * dow_float / 7.0
+
+        return [
+            math.sin(hour_angle),
+            math.cos(hour_angle),
+            math.sin(dow_angle),
+            math.cos(dow_angle),
+            1.0 if dt.weekday() >= 5 else 0.0,
+        ]
+
+    def _notional_depth_within_bps(
+        self,
+        levels: List[Tuple[float, float]],
+        mid: float,
+        band_bps: float,
+        *,
+        is_bid: bool,
+    ) -> float:
+        if mid <= 0.0 or not levels:
+            return 0.0
+
+        band = float(band_bps)
+        total_notional = 0.0
+
+        for px, qty in levels:
+            price = float(px)
+            size = float(qty)
+            if price <= 0.0 or size <= 0.0:
+                continue
+
+            if is_bid:
+                dist_bps = 1e4 * max(0.0, (mid - price) / mid)
+            else:
+                dist_bps = 1e4 * max(0.0, (price - mid) / mid)
+
+            if dist_bps <= band:
+                total_notional += price * size
+
+        return float(total_notional)
+
     def _sorted_ladders(self):
         # Rebuild the cached top-feature-depth ladders from the full in-memory book.
         self.bid_lvls = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[: self.feature_depth]
@@ -4337,7 +4410,24 @@ class FeatureEngine:
             ys = [v for _, v in points]
             deep_micro_features[f"micro_l5_slope_{window}ms"] = self._lin_slope(xs, ys) if len(ys) >= 2 else 0.0
         deep_micro_features["micro_l1_minus_micro_l10_bps"] = self._bps(micro, micro_price_by_level.get(10, 0.0), 0.0)
+        bid_l1_notional_usd = bid1 * bsz1
+        ask_l1_notional_usd = ask1 * asz1
+        bid_depth_notional_5bps = self._notional_depth_within_bps(
+            self.bid_lvls,
+            mid,
+            5.0,
+            is_bid=True,
+        )
+        ask_depth_notional_5bps = self._notional_depth_within_bps(
+            self.ask_lvls,
+            mid,
+            5.0,
+            is_bid=False,
+        )
+        total_depth_notional_5bps = bid_depth_notional_5bps + ask_depth_notional_5bps
+
         feat_list: List[float] = []
+        feat_list.extend(self._calendar_context_features(ts_ms))
         for w in PRICE_WINDOWS_MS:
             feat_list.extend(price_features_by_window[w])
         feat_list.extend([
@@ -4345,6 +4435,13 @@ class FeatureEngine:
             micro_minus_mid_bps, micro_minus_mid_over_spread,
             dt_since_trade,
             time_since_mid_change_ms,
+        ])
+        feat_list.extend([
+            bid_l1_notional_usd,
+            ask_l1_notional_usd,
+            bid_depth_notional_5bps,
+            ask_depth_notional_5bps,
+            total_depth_notional_5bps,
         ])
         for lvl in BOOK_SIGNAL_LEVELS:
             feat_list.append(obi_by_level[lvl])
@@ -4535,8 +4632,8 @@ class FeatureEngine:
                 f"len(feature_names)={len(names)}"
             )
         feat = np.asarray(feat_list, dtype=np.float64)
-        if len(names) != 235:
-            raise ValueError(f"Expected pruned raw core dim 235, got {len(names)}")
+        if len(names) != 245:
+            raise ValueError(f"Expected pruned raw core dim 245, got {len(names)}")
         if self.strict_feature_validation:
             if not np.all(np.isfinite(feat)):
                 bad_idx = np.flatnonzero(~np.isfinite(feat))
@@ -4546,8 +4643,8 @@ class FeatureEngine:
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
         feat_out = self._transform_features(feat, ob_dt_ms)
-        if feat_out.shape != (235,):
-            raise ValueError(f"Expected transformed feature shape (235,), got {feat_out.shape}")
+        if feat_out.shape != (245,):
+            raise ValueError(f"Expected transformed feature shape (245,), got {feat_out.shape}")
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1

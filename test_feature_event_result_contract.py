@@ -536,9 +536,9 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     raw_names = list(fe.feature_names())
     forbidden = "p" + "ca"
     assert len(raw_names) > 0
-    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v4_raw_no_" + forbidden + "_pruned235_xformv2"
+    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v5_raw_no_" + forbidden + "_pruned245_xformv2"
     assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v2_pruned235"
-    assert CMSSL17.CHECKPOINT_SCHEMA == "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + forbidden + "-pruned235-xformv2"
+    assert CMSSL17.CHECKPOINT_SCHEMA == "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + forbidden + "-pruned245-xformv2"
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "p" + "ca250" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
@@ -560,9 +560,9 @@ def test_pruned_feature_schema_contract() -> None:
     fe = FeatureEngine()
     names = list(fe.feature_names())
 
-    assert len(names) == 235
-    assert fe.core_feature_dim() == 235
-    assert fe.feature_dim() == 241
+    assert len(names) == 245
+    assert fe.core_feature_dim() == 245
+    assert fe.feature_dim() == 251
 
     removed = {
         "time_hour_sin",
@@ -688,8 +688,8 @@ def test_pruned_feature_vector_matches_names() -> None:
     fe = FeatureEngine()
     result = fe.on_fast_event(deep_snapshot_ob(1_700_000_700_000, n_levels=60))
     assert result.event_type == "ob"
-    assert result.features.shape == (235,)
-    assert len(fe.feature_names()) == 235
+    assert result.features.shape == (245,)
+    assert len(fe.feature_names()) == 245
 
 
 def test_no_empty_feature_family_scaffolding_remains() -> None:
@@ -716,14 +716,14 @@ def test_no_empty_feature_family_scaffolding_remains() -> None:
 def test_hot_path_pruned_feature_count_still_unchanged() -> None:
     fe = FeatureEngine()
     names = list(fe.feature_names())
-    assert len(names) == 235
-    assert fe.core_feature_dim() == 235
-    assert fe.feature_dim() == 241
+    assert len(names) == 245
+    assert fe.core_feature_dim() == 245
+    assert fe.feature_dim() == 251
 
     result = fe.on_fast_event(deep_snapshot_ob(1_700_000_800_000, n_levels=60))
     assert result.event_type == "ob"
     assert result.is_decision is True
-    assert result.features.shape == (235,)
+    assert result.features.shape == (245,)
 
 
 def test_removed_hot_path_scaffolding_strings_absent() -> None:
@@ -769,16 +769,16 @@ def test_large_trade_and_cvd_windows_are_flow_only() -> None:
 
 def test_transform_v2_feature_count_unchanged() -> None:
     fe = FeatureEngine()
-    assert len(fe.feature_names()) == 235
+    assert len(fe.feature_names()) == 245
     r = fe.on_fast_event(deep_snapshot_ob(1_700_000_900_000, n_levels=60))
-    assert r.features.shape == (235,)
+    assert r.features.shape == (245,)
 
 
 def test_every_feature_has_exactly_one_transform_spec() -> None:
     from CMSSL17 import build_feature_transform_specs
     fe = FeatureEngine()
     specs = build_feature_transform_specs(fe.feature_names())
-    assert len(specs) == 235
+    assert len(specs) == 245
     assert [s.name for s in specs] == list(fe.feature_names())
 
 
@@ -817,6 +817,103 @@ def test_heavy_tailed_features_use_log_ewma() -> None:
     assert specs["top5_trade_notional_sum_usd_1000ms"].raw_transform == RawTransformKind.LOG1P_POS
     assert specs["top5_trade_notional_sum_usd_1000ms"].normalize == NormalizeKind.EWMA_Z
 
+
+
+def test_calendar_and_notional_context_features_present_and_transformed() -> None:
+    from CMSSL17 import (
+        build_feature_transform_specs,
+        RawTransformKind,
+        NormalizeKind,
+    )
+
+    fe = FeatureEngine()
+    names = list(fe.feature_names())
+    specs = {s.name: s for s in build_feature_transform_specs(names)}
+
+    expected = [
+        "utc_hour_sin",
+        "utc_hour_cos",
+        "utc_dow_sin",
+        "utc_dow_cos",
+        "is_weekend",
+        "bid_l1_notional_usd",
+        "ask_l1_notional_usd",
+        "bid_depth_notional_5bps",
+        "ask_depth_notional_5bps",
+        "total_depth_notional_5bps",
+    ]
+
+    for name in expected:
+        assert name in names, name
+        assert name in specs, name
+
+    assert names[:5] == [
+        "utc_hour_sin",
+        "utc_hour_cos",
+        "utc_dow_sin",
+        "utc_dow_cos",
+        "is_weekend",
+    ]
+    top_book_end = names.index("time_since_mid_change_ms") + 1
+    assert names[top_book_end:top_book_end + 5] == [
+        "bid_l1_notional_usd",
+        "ask_l1_notional_usd",
+        "bid_depth_notional_5bps",
+        "ask_depth_notional_5bps",
+        "total_depth_notional_5bps",
+    ]
+
+    for name in [
+        "utc_hour_sin",
+        "utc_hour_cos",
+        "utc_dow_sin",
+        "utc_dow_cos",
+        "is_weekend",
+    ]:
+        s = specs[name]
+        assert s.raw_transform == RawTransformKind.IDENTITY
+        assert s.normalize == NormalizeKind.NONE
+        assert s.output_clip_abs == 1.0
+
+    for name in [
+        "bid_l1_notional_usd",
+        "ask_l1_notional_usd",
+        "bid_depth_notional_5bps",
+        "ask_depth_notional_5bps",
+        "total_depth_notional_5bps",
+    ]:
+        s = specs[name]
+        assert s.raw_transform == RawTransformKind.LOG1P_POS
+        assert s.normalize == NormalizeKind.NONE
+        assert s.half_life_ms == 0
+        assert s.output_clip_abs == 20.0
+
+
+def test_calendar_and_notional_context_feature_values_are_sane() -> None:
+    fe = FeatureEngine()
+    result = fe.on_fast_event(deep_snapshot_ob(1_700_003_000_000, n_levels=60))
+
+    assert result.event_type == "ob"
+    assert result.features.shape == (245,)
+
+    names = list(fe.feature_names())
+    values = dict(zip(names, result.features.tolist()))
+
+    for name in ["utc_hour_sin", "utc_hour_cos", "utc_dow_sin", "utc_dow_cos"]:
+        assert -1.0 <= values[name] <= 1.0
+
+    assert values["is_weekend"] in (0.0, 1.0)
+
+    # These are transformed by log1p, so should be positive and finite.
+    for name in [
+        "bid_l1_notional_usd",
+        "ask_l1_notional_usd",
+        "bid_depth_notional_5bps",
+        "ask_depth_notional_5bps",
+        "total_depth_notional_5bps",
+    ]:
+        assert np.isfinite(values[name])
+        assert values[name] >= 0.0
 
 
 def test_event_density_counts_same_ms_trade_and_ob_without_popping_trade() -> None:
@@ -912,11 +1009,11 @@ def test_transform_diagnostics_summary_has_required_fields() -> None:
         fe.on_fast_event(deep_snapshot_ob(1_701_000_000_000 + i * 100, n_levels=60) if i == 0 else delta_ob(1_701_000_000_000 + i * 100))
     diag = fe.transform_diagnostics_summary()
     assert diag["version"] == "feature_transform_diag_v1"
-    assert diag["feature_count"] == 235
+    assert diag["feature_count"] == 245
     assert "clip_summary" in diag
     assert "half_life_summary" in diag
     assert "feature_rows" in diag
-    assert len(diag["feature_rows"]) == 235
+    assert len(diag["feature_rows"]) == 245
 
 def main() -> None:
     fe = FeatureEngine()
@@ -981,6 +1078,8 @@ def main() -> None:
     test_old_zscore_path_removed()
     test_ewma_transform_scores_before_update()
     test_bounded_features_are_not_ewma_z()
+    test_calendar_and_notional_context_features_present_and_transformed()
+    test_calendar_and_notional_context_feature_values_are_sane()
     test_event_density_counts_same_ms_trade_and_ob_without_popping_trade()
     test_mixed_event_density_does_not_use_ob_jitter_guard()
     test_transform_engine_uses_ob_clock_not_any_event_clock()
