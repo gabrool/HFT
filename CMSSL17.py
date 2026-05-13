@@ -665,6 +665,11 @@ class FeatureEventResult:
                 f"got event_type={self.event_type!r}, is_decision={self.is_decision!r}"
             )
 
+
+class BookValidationError(ValueError):
+    pass
+
+
 @dataclass
 class ModelArgs:
     d_model: int
@@ -4274,8 +4279,15 @@ class FeatureEngine:
     ) -> bool:
         rebuild = False
         for price_raw, size_raw in updates:
-            price = float(price_raw)
-            size = float(size_raw)
+            try:
+                price = float(price_raw)
+                size = float(size_raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(price) or not math.isfinite(size):
+                continue
+            if price <= 0.0:
+                continue
             if self._side_requires_full_rebuild(book, levels, price, size, is_bid):
                 rebuild = True
             if size <= 0.0:
@@ -4294,6 +4306,50 @@ class FeatureEngine:
         bsz = self.bid_lvls[0][1] if self.bid_lvls else 0.0
         asz = self.ask_lvls[0][1] if self.ask_lvls else 0.0
         return bid, ask, bsz, asz
+
+    def _validate_book_health(self, ts_ms: int, tp_code: int) -> None:
+        # Minimal invariant check only: non-empty, positive, finite, non-crossed top of book and sorted cached ladders.
+        self._ensure_book_ladders()
+
+        if not self.bid_lvls or not self.ask_lvls:
+            raise BookValidationError(
+                f"Book empty after OB update at ts={int(ts_ms)} "
+                f"type={int(tp_code)} bid_levels={len(self.bid_lvls)} ask_levels={len(self.ask_lvls)} "
+                f"full_bids={len(self.bids)} full_asks={len(self.asks)}"
+            )
+
+        bid1, ask1, bsz1, asz1 = self._book_best()
+
+        values = (bid1, ask1, bsz1, asz1)
+        if not all(math.isfinite(float(x)) for x in values):
+            raise BookValidationError(
+                f"Non-finite top-of-book after OB update at ts={int(ts_ms)} "
+                f"type={int(tp_code)} bid1={bid1} ask1={ask1} bsz1={bsz1} asz1={asz1}"
+            )
+
+        if bid1 <= 0.0 or ask1 <= 0.0 or bsz1 <= 0.0 or asz1 <= 0.0:
+            raise BookValidationError(
+                f"Non-positive top-of-book after OB update at ts={int(ts_ms)} "
+                f"type={int(tp_code)} bid1={bid1} ask1={ask1} bsz1={bsz1} asz1={asz1}"
+            )
+
+        if bid1 >= ask1:
+            raise BookValidationError(
+                f"Crossed/locked book after OB update at ts={int(ts_ms)} "
+                f"type={int(tp_code)} bid1={bid1} ask1={ask1}"
+            )
+
+        for i in range(1, len(self.bid_lvls)):
+            if self.bid_lvls[i - 1][0] <= self.bid_lvls[i][0]:
+                raise BookValidationError(
+                    f"Bid ladder not strictly descending after OB update at ts={int(ts_ms)}"
+                )
+
+        for i in range(1, len(self.ask_lvls)):
+            if self.ask_lvls[i - 1][0] >= self.ask_lvls[i][0]:
+                raise BookValidationError(
+                    f"Ask ladder not strictly ascending after OB update at ts={int(ts_ms)}"
+                )
 
     def _cum_depth(self, lvls: List[Tuple[float, float]], n: int) -> float:
         return float(sum(s for _, s in lvls[: n]))
@@ -4607,13 +4663,13 @@ class FeatureEngine:
 
         tp_code, bids, asks = payload
         self._update_book_from_ob(tp_code, bids, asks)
+        self._validate_book_health(ts_ms, tp_code)
 
         for window, deq in self._quote_window_deques.items():
             self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
 
         for window, deq in self._ob_update_deques.items():
             self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
-        self._ensure_book_ladders()
         session_features = self._compute_session_features(ts_ms)
         bid1, ask1, bsz1, asz1 = self._book_best()
         mid = 0.5 * (bid1 + ask1) if (bid1 > 0 and ask1 > 0) else 0.0

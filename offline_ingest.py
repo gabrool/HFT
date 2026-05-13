@@ -100,8 +100,25 @@ TRADE_TICK_ZERO = 0
 
 
 def _compact_ob_type_code(tp_raw: Any) -> int:
-    tp_norm = str(tp_raw or "delta").strip().lower()
-    return OB_TP_SNAPSHOT if tp_norm == "snapshot" else OB_TP_DELTA
+    """Return compact OB type code.
+
+    Missing/unknown type returns 0. It must not default to delta because that
+    can corrupt book reconstruction.
+    """
+    tp_norm = str(tp_raw or "").strip().lower()
+    if tp_norm == "snapshot":
+        return OB_TP_SNAPSHOT
+    if tp_norm == "delta":
+        return OB_TP_DELTA
+    return 0
+
+
+def _ob_type_name(tp_code: int) -> str:
+    if int(tp_code) == OB_TP_SNAPSHOT:
+        return "snapshot"
+    if int(tp_code) == OB_TP_DELTA:
+        return "delta"
+    return "unknown"
 
 
 def _compact_trade_side_code(side_raw: Any) -> int:
@@ -629,6 +646,12 @@ def _trade_iter_precise(rows: Iterable[Tuple[int, int, dict]]) -> Iterable[Tuple
 
 def safe_ob_iter(ob_path: str, day_start_ms: int, day_end_ms: int, dq_day: Optional[DayQuality] = None):
     last_ts: Optional[int] = None
+    accepted_ob_count = 0
+    first_accepted_ob_type_code: Optional[int] = None
+    snapshot_count = 0
+    delta_count = 0
+    unknown_type_count = 0
+    missing_type_count = 0
     with _open_text(ob_path) as f:
         for line_no, line in enumerate(f, start=1):
             if dq_day is not None:
@@ -696,13 +719,113 @@ def safe_ob_iter(ob_path: str, day_start_ms: int, day_end_ms: int, dq_day: Optio
                 dq_day.update_output_ts(out_ts)
 
             tp_raw = raw.get("type")
-            if tp_raw is None:
+            if tp_raw is None and isinstance(data, dict):
                 tp_raw = data.get("type")
-            if tp_raw is None:
-                tp_raw = raw.get("DataType")
             tp_code = _compact_ob_type_code(tp_raw)
+            if tp_raw is None:
+                missing_type_count += 1
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "missing_type")
+                    dq_day.append_example(
+                        "ob_missing_type",
+                        {
+                            "line": int(line_no),
+                            "ts": int(ts_ms),
+                            "path": os.path.basename(ob_path),
+                        },
+                    )
+            if tp_code == 0:
+                unknown_type_count += 1
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "unknown_type")
+                    dq_day.append_example(
+                        "ob_unknown_type",
+                        {
+                            "line": int(line_no),
+                            "type": str(tp_raw) if tp_raw is not None else None,
+                            "ts": int(ts_ms),
+                            "path": os.path.basename(ob_path),
+                        },
+                    )
+                continue
+
+            accepted_ob_count += 1
+            if tp_code == OB_TP_SNAPSHOT:
+                snapshot_count += 1
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "snapshot")
+            else:
+                delta_count += 1
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "delta")
+
+            if first_accepted_ob_type_code is None:
+                first_accepted_ob_type_code = int(tp_code)
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", f"first_type_{_ob_type_name(tp_code)}")
+                # A daily file must start from a snapshot. Deltas before the first snapshot cannot be applied safely.
+                if accepted_ob_count == 1 and tp_code != OB_TP_SNAPSHOT:
+                    if dq_day is not None:
+                        dq_day.increment_counter("ob", "first_event_not_snapshot")
+                        dq_day.append_example(
+                            "ob_first_event_not_snapshot",
+                            {
+                                "line": int(line_no),
+                                "type": _ob_type_name(tp_code),
+                                "ts": int(ts_ms),
+                                "path": os.path.basename(ob_path),
+                            },
+                        )
+                        dq_day.set_abort_flag("first_ob_not_snapshot", True)
+                    raise ValueError(
+                        f"First accepted OB event in {ob_path} must be snapshot; "
+                        f"got {_ob_type_name(tp_code)} at line {line_no}"
+                    )
+
             bids = _compact_book_levels(data.get("b", []))
             asks = _compact_book_levels(data.get("a", []))
+            if tp_code == OB_TP_SNAPSHOT:
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "snapshot_rows")
+                    if not bids:
+                        dq_day.increment_counter("ob", "snapshot_empty_bids")
+                    if not asks:
+                        dq_day.increment_counter("ob", "snapshot_empty_asks")
+                    if accepted_ob_count == 1:
+                        dq_day.append_example(
+                            "ob_first_snapshot",
+                            {
+                                "line": int(line_no),
+                                "ts": int(ts_ms),
+                                "bid_levels": int(len(bids)),
+                                "ask_levels": int(len(asks)),
+                                "path": os.path.basename(ob_path),
+                            },
+                        )
+            else:
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "delta_rows")
+                    if not bids and not asks:
+                        dq_day.increment_counter("ob", "delta_empty_both_sides")
+
+            if tp_code == OB_TP_SNAPSHOT and (not bids or not asks):
+                if dq_day is not None:
+                    dq_day.increment_counter("ob", "bad_snapshot_empty_side")
+                    dq_day.append_example(
+                        "ob_bad_snapshot_empty_side",
+                        {
+                            "line": int(line_no),
+                            "ts": int(ts_ms),
+                            "bid_levels": int(len(bids)),
+                            "ask_levels": int(len(asks)),
+                        },
+                    )
+                    dq_day.set_abort_flag("bad_snapshot_empty_side", True)
+                raise ValueError(
+                    f"Snapshot in {ob_path} at line {line_no} has empty bid or ask side: "
+                    f"bids={len(bids)} asks={len(asks)}"
+                )
+
             seq = _try_int(raw.get("seq"), 0)
             yield ("ob", int(out_ts), int(seq or 0), int(tp_code), bids, asks)
 

@@ -178,6 +178,50 @@ def deep_snapshot_ob(ts: int, n_levels: int = 60):
     return ("ob", ts, 1, 1, bids, asks)
 
 
+def crossed_snapshot_ob(ts: int):
+    return (
+        "ob",
+        ts,
+        1,
+        1,
+        ((101.0, 1.0),),
+        ((100.0, 1.0),),
+    )
+
+
+def empty_bid_snapshot_ob(ts: int):
+    return (
+        "ob",
+        ts,
+        1,
+        1,
+        tuple(),
+        ((101.0, 1.0),),
+    )
+
+
+def locked_snapshot_ob(ts: int):
+    return (
+        "ob",
+        ts,
+        1,
+        1,
+        ((100.0, 1.0),),
+        ((100.0, 1.0),),
+    )
+
+
+def malformed_delta_ob(ts: int):
+    return (
+        "ob",
+        ts,
+        2,
+        2,
+        ((float("nan"), 5.0), (-1.0, 1.0), (100.0, 2.25)),
+        ((float("inf"), 1.0), (0.0, 1.0), (101.0, 2.25)),
+    )
+
+
 def delete_top_bid_levels_ob(ts: int, n_delete: int):
     bids = tuple((100.0 - 0.5 * i, 0.0) for i in range(n_delete))
     asks = tuple()
@@ -264,6 +308,44 @@ def test_deeper_ask_snapshot_levels_promote_after_top_level_deletes() -> None:
     assert after_visible_ask_prices[-1] == 101.0 + 0.5 * 24
     assert 101.0 + 0.5 * 20 in after_visible_ask_prices
     assert len(fe.ask_lvls) == fe.feature_depth
+
+
+def test_book_health_validation_rejects_bad_snapshots() -> None:
+    for event in (
+        crossed_snapshot_ob(1_700_000_400_000),
+        empty_bid_snapshot_ob(1_700_000_400_100),
+        locked_snapshot_ob(1_700_000_400_200),
+    ):
+        fe = FeatureEngine()
+        try:
+            fe.on_fast_event(event)
+            raise AssertionError("Bad snapshot should have raised")
+        except Exception as exc:
+            assert exc.__class__.__name__ == "BookValidationError"
+
+
+def test_malformed_delta_levels_are_ignored_but_valid_updates_apply() -> None:
+    fe = FeatureEngine()
+    fe.on_fast_event(deep_snapshot_ob(1_700_000_500_000, n_levels=60))
+
+    result = fe.on_fast_event(malformed_delta_ob(1_700_000_500_100))
+    assert result.event_type == "ob"
+    assert result.is_decision is True
+
+    assert fe.bids[100.0] == 2.25
+    assert fe.asks[101.0] == 2.25
+    assert -1.0 not in fe.bids
+    assert 0.0 not in fe.asks
+
+
+def test_compact_ob_type_code_does_not_default_to_delta() -> None:
+    import offline_ingest
+
+    assert offline_ingest._compact_ob_type_code("snapshot") == offline_ingest.OB_TP_SNAPSHOT
+    assert offline_ingest._compact_ob_type_code("delta") == offline_ingest.OB_TP_DELTA
+    assert offline_ingest._compact_ob_type_code(None) == 0
+    assert offline_ingest._compact_ob_type_code("") == 0
+    assert offline_ingest._compact_ob_type_code("weird") == 0
 
 
 def test_trade_does_not_pollute_ob_feature_state() -> None:
@@ -379,6 +461,9 @@ def main() -> None:
     test_snapshot_stores_full_book_but_features_use_top_depth()
     test_deeper_snapshot_levels_promote_after_top_level_deletes()
     test_deeper_ask_snapshot_levels_promote_after_top_level_deletes()
+    test_book_health_validation_rejects_bad_snapshots()
+    test_malformed_delta_levels_are_ignored_but_valid_updates_apply()
+    test_compact_ob_type_code_does_not_default_to_delta()
 
 
 if __name__ == "__main__":
