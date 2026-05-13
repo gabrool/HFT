@@ -570,8 +570,6 @@ FLOW_WINDOWS_MS = (
     1_000,
 )
 
-INTERACTION_WINDOWS_MS = ()
-
 ROLLING_OFI_WINDOWS_MS = (
     200,
     500,
@@ -583,10 +581,6 @@ ROLLING_OBI_WINDOWS_MS = (
     500,
     1_000,
 )
-
-TRADE_BURST_WINDOWS_MS = ()
-
-LARGE_TRADE_CONTINUATION_WINDOWS_MS = ()
 
 REGIME_WINDOWS_MS = (
     500,
@@ -603,10 +597,6 @@ EVENT_DENSITY_WINDOWS_MS = (
 )
 
 
-MACD_TRIPLETS_MS = ()
-
-VPIN_BUCKET_SECS = ()
-
 SPREAD_DEPTH_REGIME_WINDOWS_MS = (
     500,
     1_000,
@@ -615,9 +605,6 @@ SPREAD_DEPTH_REGIME_WINDOWS_MS = (
 
 NORMALIZED_OFI_LEVELS = (1, 3, 5, 10)
 BPS_DEPTH_BANDS = (1.0, 2.0, 5.0, 10.0)
-BOOK_SHAPE_BANDS = ()
-SLIPPAGE_NOTIONAL_USD = ()
-LARGE_TRADE_NOTIONAL_USD = ()
 ROLLING_OFI_LEVELS = (1, 3, 5, 10)
 ROLLING_OBI_LEVELS = (3, 5, 10)
 DEEP_MICRO_LEVELS = (3, 5, 10)
@@ -625,9 +612,6 @@ OFI_ACCEL_PAIRS_MS = (
     (200, 500),
     (500, 1_000),
 )
-TRADE_IMBALANCE_DIFF_PAIRS_MS = ()
-NET_FLOW_DIFF_PAIRS_MS = ()
-OFI_IMBALANCE_DIFF_PAIRS_MS = ()
 BOOK_DEPTH_FEATURE_LEVELS = (1, 3, 5, 10, 20)
 BOOK_SIGNAL_LEVELS = (1, 3, 5, 10)
 MAX_BOOK_FEATURE_LEVEL = max(BOOK_DEPTH_FEATURE_LEVELS)
@@ -2163,57 +2147,13 @@ class PriceAsofHistory:
 @dataclass
 class LargeTradeWindowState:
     window_ms: int
-    threshold_counts: Dict[float, Dict[str, float]]
     max_heap: List[Tuple[float, int, float]]
 
     @classmethod
     def create(cls, window_ms: int) -> "LargeTradeWindowState":
         return cls(
             window_ms=int(window_ms),
-            threshold_counts={
-                float(t): {"buy_count": 0.0, "sell_count": 0.0, "buy_notional": 0.0, "sell_notional": 0.0}
-                for t in LARGE_TRADE_NOTIONAL_USD
-            },
             max_heap=[],
-        )
-
-
-@dataclass
-class TradeBurstWindowState:
-    window_ms: int
-    signs: Deque[Tuple[int, int, int]]
-    runs: Deque[Tuple[int, int, int]]
-    run_lengths: Dict[int, Tuple[int, int]]
-    buy_heap: List[Tuple[int, int]]
-    sell_heap: List[Tuple[int, int]]
-    buy_count: int
-    sell_count: int
-    pair_n: int
-    sum_x: float
-    sum_y: float
-    sum_x2: float
-    sum_y2: float
-    sum_xy: float
-    next_run_id: int
-
-    @classmethod
-    def create(cls, window_ms: int) -> "TradeBurstWindowState":
-        return cls(
-            window_ms=int(window_ms),
-            signs=deque(),
-            runs=deque(),
-            run_lengths={},
-            buy_heap=[],
-            sell_heap=[],
-            buy_count=0,
-            sell_count=0,
-            pair_n=0,
-            sum_x=0.0,
-            sum_y=0.0,
-            sum_x2=0.0,
-            sum_y2=0.0,
-            sum_xy=0.0,
-            next_run_id=1,
         )
 
 
@@ -2342,7 +2282,6 @@ class FeatureEngine:
         self,
         depth: int = MAX_BOOK_FEATURE_LEVEL,
         z_hl_ms: int = 30_000,
-        vpin_target_bucket_secs: float = 2.0,
     ):
         # feature_depth controls the cached top-of-book ladders used for feature extraction.
         # The full source snapshot/update book is stored in self.bids/self.asks so deeper
@@ -2356,8 +2295,6 @@ class FeatureEngine:
                 f"Need feature_depth >= {MAX_BOOK_FEATURE_LEVEL}."
             )
         self.z_hl_ms = int(z_hl_ms)
-        self.vpin_target_bucket_secs = float(vpin_target_bucket_secs)
-        self.vpin_bucket_secs: Tuple[float, ...] = VPIN_BUCKET_SECS
 
         # ---------- Book state ----------
         self.bids: Dict[float, float] = {}
@@ -2501,6 +2438,10 @@ class FeatureEngine:
         }
 
         # ---------- Trades windows ----------
+        # self.trade_windows includes FLOW_WINDOWS_MS plus REGIME_WINDOWS_MS because
+        # 3000ms trade stats are needed for regime features. Large-trade and CVD
+        # states are intentionally restricted to FLOW_WINDOWS_MS because only those
+        # windows are emitted as features.
         # (ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick)
         self.trade_windows: Tuple[int, ...] = tuple(sorted(set(FLOW_WINDOWS_MS) | set(REGIME_WINDOWS_MS)))
         self._trade_window_deques: Dict[int, Deque[Tuple[int, float, float, float, str, float, float, float]]] = {
@@ -2511,22 +2452,20 @@ class FeatureEngine:
             window: self._new_trade_window_state()
             for window in self.trade_windows
         }
+        self.large_trade_windows: Tuple[int, ...] = FLOW_WINDOWS_MS
         self.large_trade_states: Dict[int, LargeTradeWindowState] = {
-            ms: LargeTradeWindowState.create(ms) for ms in self.trade_windows
+            ms: LargeTradeWindowState.create(ms) for ms in self.large_trade_windows
         }
         self.cvd_notional = 0.0
         self._cvd_ema = {ms: 0.0 for ms in FLOW_WINDOWS_MS}
         self._cvd_ema_initialized = {ms: False for ms in FLOW_WINDOWS_MS}
+        self.cvd_windows: Tuple[int, ...] = FLOW_WINDOWS_MS
         self.cvd_window_states: Dict[int, CVDWindowState] = {
-            ms: CVDWindowState.create(ms, initial_cvd=0.0) for ms in self.trade_windows
+            ms: CVDWindowState.create(ms, initial_cvd=0.0) for ms in self.cvd_windows
         }
         self.last_cvd_update_ts: Optional[int] = None
         self.consecutive_buy_trade_count: int = 0
         self.consecutive_sell_trade_count: int = 0
-        self.trade_burst_states: Dict[int, TradeBurstWindowState] = {
-            ms: TradeBurstWindowState.create(ms) for ms in TRADE_BURST_WINDOWS_MS
-        }
-        self.trade_sign_history: Deque[Tuple[int, int, float]] = deque()
         self.last_ob_ofi_l5: float = 0.0
         self.last_ob_trade_imbalance_1000ms: float = 0.0
 
@@ -2553,12 +2492,6 @@ class FeatureEngine:
             ms: deque() for ms in EVENT_DENSITY_WINDOWS_MS
         }
 
-        # ---------- VPIN state ----------
-        self.vpin_state: Dict[float, Dict[str, Any]] = {
-            secs: {"Vb": None, "cum_buy": 0.0, "cum_sell": 0.0, "cum": 0.0, "phi": deque(maxlen=50)}
-            for secs in self.vpin_bucket_secs
-        }
-
         # ---------- Decayed pressure (EWMA of OFI L1) ----------
         self.ofi_pressure_by_window: Dict[int, float] = {ms: 0.0 for ms in FAST_WINDOWS_MS}
         self.ofi_level_histories: Dict[int, Deque[Tuple[int, float]]] = {
@@ -2573,27 +2506,13 @@ class FeatureEngine:
             for window in ROLLING_OFI_WINDOWS_MS
         }
         self._rolling_obi_states = {
-            (level, window): RollingScalarWindowState(
-                window,
-                track_sign=True,
-            )
+            (level, window): RollingScalarWindowState(window)
             for level in ROLLING_OBI_LEVELS
             for window in ROLLING_OBI_WINDOWS_MS
         }
         self.deep_micro_histories: Dict[int, Deque[Tuple[int, float]]] = {
             5: deque(),
             10: deque(),
-        }
-
-        # ---------- MACD state ----------
-        self.macd_state = {
-            (fast, slow, sig): {
-                "fast": None,
-                "slow": None,
-                "signal": 0.0,
-                "signal_initialized": False,
-            }
-            for (fast, slow, sig) in MACD_TRIPLETS_MS
         }
 
 
@@ -2671,32 +2590,6 @@ class FeatureEngine:
                 f"ask_depth_within_{b}bps",
                 f"depth_imbalance_within_{b}bps",
             ])
-        for band in BOOK_SHAPE_BANDS:
-            b = self._fmt_bps_band(band)
-            names.extend([
-                f"max_bid_size_within_{b}bps",
-                f"max_ask_size_within_{b}bps",
-                f"dist_to_max_bid_wall_bps_within_{b}bps",
-                f"dist_to_max_ask_wall_bps_within_{b}bps",
-                f"bid_depth_hhi_within_{b}bps",
-                f"ask_depth_hhi_within_{b}bps",
-                f"bid_top1_share_within_{b}bps",
-                f"ask_top1_share_within_{b}bps",
-            ])
-        for notional in SLIPPAGE_NOTIONAL_USD:
-            n = self._fmt_usd_notional(notional)
-            names.extend([
-                f"slippage_bps_to_buy_{n}",
-                f"slippage_bps_to_sell_{n}",
-                f"depth_needed_bps_to_buy_{n}",
-                f"depth_needed_bps_to_sell_{n}",
-            ])
-        for notional in SLIPPAGE_NOTIONAL_USD:
-            n = self._fmt_usd_notional(notional)
-            names.extend([
-                f"slippage_imbalance_bps_{n}",
-                f"depth_needed_imbalance_bps_{n}",
-            ])
         for ms in FAST_WINDOWS_MS:
             names.extend([
                 f"spread_delta_over_spread_{ms}ms",
@@ -2750,26 +2643,7 @@ class FeatureEngine:
             "consecutive_buy_trade_count",
             "consecutive_sell_trade_count",
         ])
-        for window in TRADE_BURST_WINDOWS_MS:
-            names.extend([
-                f"max_buy_run_length_{window}ms",
-                f"max_sell_run_length_{window}ms",
-                f"trade_sign_autocorr_lag1_{window}ms",
-                f"trade_sign_entropy_{window}ms",
-                f"trade_burst_score_{window}ms",
-                f"buy_trade_burst_score_{window}ms",
-                f"sell_trade_burst_score_{window}ms",
-            ])
         for ms in FLOW_WINDOWS_MS:
-            for threshold in LARGE_TRADE_NOTIONAL_USD:
-                thr = self._fmt_usd_notional(threshold)
-                names.extend([
-                    f"large_buy_count_ge_{thr}_{ms}ms",
-                    f"large_sell_count_ge_{thr}_{ms}ms",
-                    f"large_buy_notional_ge_{thr}_{ms}ms",
-                    f"large_sell_notional_ge_{thr}_{ms}ms",
-                    f"large_trade_imbalance_ge_{thr}_{ms}ms",
-                ])
             names.extend([
                 f"max_signed_trade_notional_usd_{ms}ms",
                 f"top5_trade_notional_sum_usd_{ms}ms",
@@ -2806,27 +2680,6 @@ class FeatureEngine:
                 f"ofi_l1_pressure_over_depth_5bps_{ms}ms",
                 f"ofi_l1_pressure_over_realized_vol_{ms}ms",
             ])
-        for ms in INTERACTION_WINDOWS_MS:
-            names.extend([
-                f"flow_agrees_with_book_{ms}ms",
-                f"flow_disagrees_with_book_{ms}ms",
-                f"trade_imbalance_x_obi_5bps_{ms}ms",
-                f"trade_imbalance_x_ofi_pressure_{ms}ms",
-                f"ofi_pressure_x_spread_bps_{ms}ms",
-                f"micro_premia_x_trade_imbalance_{ms}ms",
-                f"micro_premia_x_depth_imbalance_5bps_{ms}ms",
-                f"signed_flow_over_depth_5bps_{ms}ms",
-                f"signed_flow_over_spread_bps_{ms}ms",
-                f"abs_signed_flow_over_realized_vol_{ms}ms",
-            ])
-        for fast_ms, slow_ms, sig_ms in MACD_TRIPLETS_MS:
-            names.extend([
-                f"macd_micro_bps_{fast_ms}_{slow_ms}_{sig_ms}",
-                f"macd_signal_bps_{fast_ms}_{slow_ms}_{sig_ms}",
-                f"macd_hist_bps_{fast_ms}_{slow_ms}_{sig_ms}",
-            ])
-        for secs in VPIN_BUCKET_SECS:
-            names.append(f"vpin_{str(secs).replace('.', 'p')}s")
         if len(names) != len(set(names)):
             seen = set()
             duplicates = sorted({n for n in names if n in seen or seen.add(n)})
@@ -2887,8 +2740,6 @@ class FeatureEngine:
             return str(int(band))
         return str(float(band)).replace(".", "p")
 
-    def _fmt_usd_notional(self, notional: float) -> str:
-        return f"{int(round(float(notional)))}usd"
 
     # -------------------------------------------------------------------------
     # Helpers (kept inside the class)
@@ -2928,46 +2779,6 @@ class FeatureEngine:
         out.reverse()
         return out
 
-    def _rolling_stats_values(self, vals: List[float]) -> Dict[str, float]:
-        if not vals:
-            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "p90": 0.0}
-        arr = np.asarray(vals, dtype=np.float64)
-        return {
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr, ddof=0)),
-            "min": float(np.min(arr)),
-            "max": float(np.max(arr)),
-            "p90": float(np.quantile(arr, 0.90)),
-        }
-
-    def _rolling_mean_values(self, vals: List[float]) -> float:
-        n = 0
-        total = 0.0
-        for value in vals:
-            v = float(value)
-            if math.isfinite(v):
-                total += v
-                n += 1
-        return total / float(n) if n > 0 else 0.0
-
-    def _rolling_mean_std_values(self, vals: List[float]) -> Tuple[float, float]:
-        n = 0
-        total = 0.0
-        total_sq = 0.0
-        for value in vals:
-            v = float(value)
-            if math.isfinite(v):
-                total += v
-                total_sq += v * v
-                n += 1
-
-        if n <= 0:
-            return 0.0, 0.0
-
-        mean = total / float(n)
-        var = max(0.0, total_sq / float(n) - mean * mean)
-        return mean, math.sqrt(var)
-
     def _slope_from_points_no_numpy(self, points: List[Tuple[int, float]]) -> float:
         n = 0
         t0: Optional[int] = None
@@ -3001,8 +2812,6 @@ class FeatureEngine:
         out = num / den
         return float(out) if math.isfinite(out) else 0.0
 
-    def _rolling_value_slope(self, points: List[Tuple[int, float]]) -> float:
-        return self._slope_from_points_no_numpy(points)
 
     def _return_distribution_stats(self, vals: List[float]) -> Dict[str, float]:
         if not vals:
@@ -3107,7 +2916,8 @@ class FeatureEngine:
             while q and q[-1][1] <= notion:
                 q.pop()
             q.append((ts_i, notion))
-        self._large_trade_state_insert(window_ms, entry)
+        if window_ms in self.large_trade_states:
+            self._large_trade_state_insert(window_ms, entry)
 
     def _update_trade_window_state_with_expire(
         self,
@@ -3211,7 +3021,6 @@ class FeatureEngine:
             state["zero_tick"] = 0
             state["buy_max_q"].clear()
             state["sell_max_q"].clear()
-        self._large_trade_state_expire(window_ms, entry)
 
     def _prune_trade_window(self, now_ms: int, window_ms: int) -> None:
         deq = self._trade_window_deques[window_ms]
@@ -3329,8 +3138,6 @@ class FeatureEngine:
             return out if math.isfinite(out) else float(default)
         return float(default)
 
-    def _cum_side_qty(self, side_levels: Sequence[Tuple[float, float]], n: int) -> float:
-        return float(sum(float(size) for price, size in side_levels[:n] if float(price) > 0.0 and float(size) > 0.0))
 
     def _weighted_side_price(self, side_levels: Sequence[Tuple[float, float]], n: int) -> Tuple[float, float]:
         px_qty = 0.0
@@ -3354,70 +3161,20 @@ class FeatureEngine:
             return -1
         return 0
 
-    def _safe_corr_lag1(self, vals: List[float]) -> float:
-        if len(vals) < 2:
-            return 0.0
-        x = np.asarray(vals[:-1], dtype=np.float64)
-        y = np.asarray(vals[1:], dtype=np.float64)
-        if x.size < 1 or y.size < 1:
-            return 0.0
-        sx = float(np.std(x))
-        sy = float(np.std(y))
-        if sx <= 1e-12 or sy <= 1e-12:
-            return 1.0 if len(vals) >= 2 and all(v == vals[0] for v in vals) else 0.0
-        c = float(np.corrcoef(x, y)[0, 1])
-        return c if math.isfinite(c) else 0.0
-
     def _large_trade_state_insert(self, window_ms: int, entry: Tuple[int, float, float, float, str, float, float, float]) -> None:
         ts_ms, _price, _size, notional_usd, _side, side_sign, _tick_sign, _is_zero_tick = entry
         state = self.large_trade_states[window_ms]
         notion = float(notional_usd)
         ss = float(side_sign)
         ts_i = int(ts_ms)
-        for threshold, agg in state.threshold_counts.items():
-            if notion < threshold:
-                continue
-            if ss > 0:
-                agg["buy_count"] += 1.0
-                agg["buy_notional"] += notion
-            elif ss < 0:
-                agg["sell_count"] += 1.0
-                agg["sell_notional"] += notion
         if notion > 0.0:
             heapq.heappush(state.max_heap, (-notion, ts_i, ss))
-
-
-    def _large_trade_state_expire(self, window_ms: int, entry: Tuple[int, float, float, float, str, float, float, float]) -> None:
-        ts_ms, _price, _size, notional_usd, _side, side_sign, _tick_sign, _is_zero_tick = entry
-        state = self.large_trade_states[window_ms]
-        notion = float(notional_usd)
-        ss = float(side_sign)
-        ts_i = int(ts_ms)
-        for threshold, agg in state.threshold_counts.items():
-            if notion < threshold:
-                continue
-            if ss > 0:
-                agg["buy_count"] = max(0.0, agg["buy_count"] - 1.0)
-                agg["buy_notional"] = max(0.0, agg["buy_notional"] - notion)
-            elif ss < 0:
-                agg["sell_count"] = max(0.0, agg["sell_count"] - 1.0)
-                agg["sell_notional"] = max(0.0, agg["sell_notional"] - notion)
 
 
     def _large_trade_stats_from_state(self, ms: int, now_ms: int) -> Dict[str, float]:
         cutoff = int(now_ms) - int(ms)
         state = self.large_trade_states[ms]
         out: Dict[str, float] = {}
-        for threshold in LARGE_TRADE_NOTIONAL_USD:
-            thr_key = self._fmt_usd_notional(threshold)
-            agg = state.threshold_counts[float(threshold)]
-            lb_notional = float(agg["buy_notional"])
-            ls_notional = float(agg["sell_notional"])
-            out[f"large_buy_count_ge_{thr_key}_{ms}ms"] = float(agg["buy_count"])
-            out[f"large_sell_count_ge_{thr_key}_{ms}ms"] = float(agg["sell_count"])
-            out[f"large_buy_notional_ge_{thr_key}_{ms}ms"] = lb_notional
-            out[f"large_sell_notional_ge_{thr_key}_{ms}ms"] = ls_notional
-            out[f"large_trade_imbalance_ge_{thr_key}_{ms}ms"] = self._safe_div(lb_notional - ls_notional, lb_notional + ls_notional, 0.0)
         while state.max_heap and state.max_heap[0][1] < cutoff:
             heapq.heappop(state.max_heap)
         if state.max_heap:
@@ -3439,144 +3196,6 @@ class FeatureEngine:
         for item in popped:
             heapq.heappush(state.max_heap, item)
         out[f"top5_trade_notional_sum_usd_{ms}ms"] = top_sum
-        return out
-
-    def _trade_burst_insert(self, window_ms: int, ts_ms: int, sign: int) -> None:
-        if sign == 0:
-            return
-        st = self.trade_burst_states[window_ms]
-        ts_i = int(ts_ms)
-        run_id = -1
-        if st.signs:
-            prev_sign = st.signs[-1][1]
-            st.pair_n += 1
-            st.sum_x += prev_sign
-            st.sum_y += sign
-            st.sum_x2 += prev_sign * prev_sign
-            st.sum_y2 += sign * sign
-            st.sum_xy += prev_sign * sign
-        if sign > 0:
-            st.buy_count += 1
-        else:
-            st.sell_count += 1
-        if st.runs and st.runs[-1][1] == sign:
-            rid, _, length = st.runs.pop()
-            length += 1
-            st.runs.append((rid, sign, length))
-            st.run_lengths[rid] = (sign, length)
-            run_id = rid
-        else:
-            run_id = st.next_run_id
-            st.next_run_id += 1
-            st.runs.append((run_id, sign, 1))
-            st.run_lengths[run_id] = (sign, 1)
-        if sign > 0:
-            heapq.heappush(st.buy_heap, (-st.run_lengths[run_id][1], run_id))
-        else:
-            heapq.heappush(st.sell_heap, (-st.run_lengths[run_id][1], run_id))
-        st.signs.append((ts_i, sign, run_id))
-
-    def _trade_burst_prune(self, window_ms: int, now_ms: int) -> None:
-        cutoff = int(now_ms) - int(window_ms)
-        st = self.trade_burst_states[window_ms]
-        while st.signs and st.signs[0][0] < cutoff:
-            _ts, sign, _rid = st.signs.popleft()
-            if sign > 0:
-                st.buy_count = max(0, st.buy_count - 1)
-            else:
-                st.sell_count = max(0, st.sell_count - 1)
-            if st.signs:
-                nxt = st.signs[0][1]
-                st.pair_n = max(0, st.pair_n - 1)
-                st.sum_x -= sign
-                st.sum_y -= nxt
-                st.sum_x2 -= sign * sign
-                st.sum_y2 -= nxt * nxt
-                st.sum_xy -= sign * nxt
-            if st.runs:
-                rid, rsign, rlen = st.runs[0]
-                rlen -= 1
-                st.runs.popleft()
-                if rlen > 0:
-                    st.runs.appendleft((rid, rsign, rlen))
-                    st.run_lengths[rid] = (rsign, rlen)
-                    if rsign > 0:
-                        heapq.heappush(st.buy_heap, (-rlen, rid))
-                    else:
-                        heapq.heappush(st.sell_heap, (-rlen, rid))
-                else:
-                    st.run_lengths.pop(rid, None)
-
-    def _corr_lag1_from_sign_state(self, st: TradeBurstWindowState) -> float:
-        if st.buy_count < 0 or st.sell_count < 0 or st.pair_n < 0:
-            raise ValueError(
-                f"Invalid trade burst counts: buy={st.buy_count} sell={st.sell_count} pair_n={st.pair_n}"
-            )
-        total = int(st.buy_count + st.sell_count)
-        if total < 2 or st.pair_n <= 0:
-            return 0.0
-
-        n = float(st.pair_n)
-        var_x = st.sum_x2 - (st.sum_x * st.sum_x) / n
-        var_y = st.sum_y2 - (st.sum_y * st.sum_y) / n
-
-        if var_x <= 1e-12 or var_y <= 1e-12:
-            if total >= 2 and (st.buy_count == total or st.sell_count == total):
-                return 1.0
-            return 0.0
-
-        cov = st.sum_xy - (st.sum_x * st.sum_y) / n
-        corr = cov / math.sqrt(max(var_x, 1e-12) * max(var_y, 1e-12))
-        return float(corr) if math.isfinite(float(corr)) else 0.0
-
-    def _trade_burst_features_from_state(self, ts_ms: int) -> Dict[str, float]:
-        out: Dict[str, float] = {
-            "consecutive_buy_trade_count": float(self.consecutive_buy_trade_count),
-            "consecutive_sell_trade_count": float(self.consecutive_sell_trade_count),
-        }
-        for window in TRADE_BURST_WINDOWS_MS:
-            self._trade_burst_prune(window, ts_ms)
-            st = self.trade_burst_states[window]
-            total_signed = st.buy_count + st.sell_count
-            p_buy = self._safe_div(st.buy_count, max(total_signed, 1), 0.0)
-            p_sell = self._safe_div(st.sell_count, max(total_signed, 1), 0.0)
-            entropy = 0.0
-            if total_signed > 0:
-                if p_buy > 0.0:
-                    entropy -= p_buy * math.log(p_buy)
-                if p_sell > 0.0:
-                    entropy -= p_sell * math.log(p_sell)
-                entropy = self._safe_div(entropy, math.log(2.0), 0.0)
-            def _max_run(heap: List[Tuple[int, int]], sign_expected: int) -> int:
-                while heap:
-                    neg_len, rid = heap[0]
-                    cur = st.run_lengths.get(rid)
-                    if cur is None or cur[0] != sign_expected or cur[1] != -neg_len:
-                        heapq.heappop(heap)
-                        continue
-                    return int(-neg_len)
-                return 0
-            max_buy_run = _max_run(st.buy_heap, 1)
-            max_sell_run = _max_run(st.sell_heap, -1)
-            autocorr = self._corr_lag1_from_sign_state(st)
-            out.update({
-                f"max_buy_run_length_{window}ms": float(max_buy_run),
-                f"max_sell_run_length_{window}ms": float(max_sell_run),
-                f"trade_sign_autocorr_lag1_{window}ms": float(autocorr) if math.isfinite(autocorr) else 0.0,
-                f"trade_sign_entropy_{window}ms": float(entropy),
-                f"trade_burst_score_{window}ms": self._safe_div(max(max_buy_run, max_sell_run), max(total_signed, 1), 0.0),
-                f"buy_trade_burst_score_{window}ms": self._safe_div(max_buy_run, max(total_signed, 1), 0.0),
-                f"sell_trade_burst_score_{window}ms": self._safe_div(max_sell_run, max(total_signed, 1), 0.0),
-            })
-            for key in (
-                f"trade_sign_autocorr_lag1_{window}ms",
-                f"trade_sign_entropy_{window}ms",
-                f"trade_burst_score_{window}ms",
-                f"buy_trade_burst_score_{window}ms",
-                f"sell_trade_burst_score_{window}ms",
-            ):
-                if not math.isfinite(float(out[key])):
-                    raise ValueError(f"Non-finite trade burst feature {key}={out[key]!r}")
         return out
 
     def _bps_return(self, current: float, past: float) -> float:
@@ -3629,86 +3248,34 @@ class FeatureEngine:
     def _rolling_slope_simple(self, points: List[Tuple[int, float]]) -> float:
         return self._slope_from_points_no_numpy(points)
 
-    def _depth_within_bps(self, levels: List[Tuple[float, float]], mid: float, band_bps: float, is_bid: bool) -> dict:
-        eps = 1e-12
-        out = {
-            "size": 0.0,
-            "max_size": 0.0,
-            "dist_to_max_bps": 0.0,
-            "hhi": 0.0,
-            "top1_share": 0.0,
-        }
-        if mid <= 0.0 or not math.isfinite(mid):
-            return out
-        selected: List[Tuple[float, float, float]] = []
-        for price, size in levels:
-            p = float(price)
-            s = float(size)
-            if p <= 0.0 or s <= 0.0 or not math.isfinite(p) or not math.isfinite(s):
-                continue
-            if is_bid:
-                if p > mid:
-                    continue
-                dist = 1e4 * (mid - p) / mid
-            else:
-                if p < mid:
-                    continue
-                dist = 1e4 * (p - mid) / mid
-            if dist <= float(band_bps):
-                selected.append((p, s, dist))
-        if not selected:
-            return out
-        total_size = sum(s for _, s, _ in selected)
-        if total_size <= eps:
-            return out
-        _max_price, max_size, max_dist = max(selected, key=lambda t: t[1])
-        shares = [s / total_size for _, s, _ in selected]
-        out["size"] = float(total_size)
-        out["max_size"] = float(max_size)
-        out["dist_to_max_bps"] = float(max_dist)
-        out["hhi"] = float(sum(sh * sh for sh in shares))
-        out["top1_share"] = float(max_size / total_size)
-        return out
+    def _depth_within_bps(
+        self,
+        levels: List[Tuple[float, float]],
+        mid: float,
+        band_bps: float,
+        is_bid: bool,
+    ) -> float:
+        if mid <= 0.0 or not levels:
+            return 0.0
 
-    def _slippage_for_notional(self, levels: List[Tuple[float, float]], mid: float, notional_usd: float, is_buy: bool) -> dict:
-        bad = {"slippage_bps": 10_000.0, "depth_needed_bps": 10_000.0, "filled_fraction": 0.0}
-        if mid <= 0.0 or notional_usd <= 0.0:
-            return dict(bad)
-        filled_notional = 0.0
-        filled_base = 0.0
-        last_price = None
-        for price, size in levels:
-            p = float(price)
-            s = float(size)
-            if p <= 0.0 or s <= 0.0 or not math.isfinite(p) or not math.isfinite(s):
+        band = float(band_bps)
+        total_size = 0.0
+
+        for px, qty in levels:
+            price = float(px)
+            size = float(qty)
+            if price <= 0.0 or size <= 0.0:
                 continue
-            available_notional = p * s
-            take_notional = min(notional_usd - filled_notional, available_notional)
-            if take_notional <= 0.0:
-                continue
-            take_base = take_notional / p
-            filled_notional += take_notional
-            filled_base += take_base
-            last_price = p
-            if filled_notional >= notional_usd - 1e-9:
-                break
-        if filled_base <= 0.0 or last_price is None:
-            return dict(bad)
-        filled_fraction = max(0.0, min(1.0, filled_notional / max(notional_usd, 1e-12)))
-        if filled_fraction < 1.0 - 1e-9:
-            return {"slippage_bps": 10_000.0, "depth_needed_bps": 10_000.0, "filled_fraction": float(filled_fraction)}
-        vwap = filled_notional / filled_base
-        if is_buy:
-            slippage_bps = 1e4 * (vwap / mid - 1.0)
-            depth_needed_bps = 1e4 * max(last_price - mid, 0.0) / mid
-        else:
-            slippage_bps = 1e4 * (mid / vwap - 1.0) if vwap > 0.0 else 1e4 * ((mid - vwap) / max(mid, 1e-12))
-            depth_needed_bps = 1e4 * max(mid - last_price, 0.0) / mid
-        return {
-            "slippage_bps": float(max(slippage_bps, 0.0)),
-            "depth_needed_bps": float(max(depth_needed_bps, 0.0)),
-            "filled_fraction": float(filled_fraction),
-        }
+
+            if is_bid:
+                dist_bps = 1e4 * max(0.0, (mid - price) / mid)
+            else:
+                dist_bps = 1e4 * max(0.0, (price - mid) / mid)
+
+            if dist_bps <= band:
+                total_size += size
+
+        return float(total_size)
 
     def _sorted_ladders(self):
         # Rebuild the cached top-feature-depth ladders from the full in-memory book.
@@ -4154,9 +3721,6 @@ class FeatureEngine:
         for window in self._trade_window_deques:
             self._prune_trade_window(ts_ms, window)
 
-        for window in self.trade_burst_states:
-            self._trade_burst_prune(window, ts_ms)
-
         tp_code, bids, asks = payload
         self._update_book_from_ob(tp_code, bids, asks)
         self._validate_book_health(ts_ms, tp_code)
@@ -4268,8 +3832,12 @@ class FeatureEngine:
             for k, v in cvd_stats_by_ms[ms].items():
                 if not math.isfinite(float(v)):
                     raise ValueError(f"Non-finite CVD stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
-        large_stats_by_ms = {ms: self._large_trade_stats_from_state(ms, ts_ms) for ms in self.trade_windows}
-        trade_burst_features = self._trade_burst_features_from_state(ts_ms)
+        large_stats_by_ms = {
+            ms: self._large_trade_stats_from_state(ms, ts_ms)
+            for ms in self.large_trade_windows
+        }
+        consecutive_buy_trade_count = float(self.consecutive_buy_trade_count)
+        consecutive_sell_trade_count = float(self.consecutive_sell_trade_count)
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
             self.last_bid_price_change_ts = ts_ms
         if self.prev_ask1_price is None or ask1 != self.prev_ask1_price:
@@ -4334,10 +3902,6 @@ class FeatureEngine:
             self.flow_regime[ms] = trade_stats_by_ms[ms]["trade_imbalance_notional"]
         regime_flow_snapshot = {ms: self.flow_regime[ms] for ms in self.regime_windows_ms}
 
-        vpin_features = []
-        for secs in self.vpin_bucket_secs:
-            phi = self.vpin_state[secs]["phi"]
-            vpin_features.append((sum(phi) / len(phi)) if phi else 0.0)
 
         replen_rates = self._replenishment_rates()
         price_features_by_window: Dict[int, Tuple[float, ...]] = {}
@@ -4355,43 +3919,25 @@ class FeatureEngine:
             )
         bid_depth_5bps = self._depth_within_bps(self.bid_lvls, mid, 5.0, is_bid=True)
         ask_depth_5bps = self._depth_within_bps(self.ask_lvls, mid, 5.0, is_bid=False)
-        depth_5bps_total = bid_depth_5bps["size"] + ask_depth_5bps["size"]
+        depth_5bps_total = bid_depth_5bps + ask_depth_5bps
         depth_5bps_imbalance = self._safe_div(
-            bid_depth_5bps["size"] - ask_depth_5bps["size"],
-            bid_depth_5bps["size"] + ask_depth_5bps["size"],
+            bid_depth_5bps - ask_depth_5bps,
+            depth_5bps_total,
             0.0,
         )
         self._append_metric_history(self._spread_bps_history, ts_ms, spread_bps, self._regime_metric_keep_ms)
-        self._append_metric_history(self._bid_depth_5bps_history, ts_ms, bid_depth_5bps["size"], self._regime_metric_keep_ms)
-        self._append_metric_history(self._ask_depth_5bps_history, ts_ms, ask_depth_5bps["size"], self._regime_metric_keep_ms)
+        self._append_metric_history(self._bid_depth_5bps_history, ts_ms, bid_depth_5bps, self._regime_metric_keep_ms)
+        self._append_metric_history(self._ask_depth_5bps_history, ts_ms, ask_depth_5bps, self._regime_metric_keep_ms)
         self._append_metric_history(self._depth_5bps_total_history, ts_ms, depth_5bps_total, self._regime_metric_keep_ms)
         self._append_metric_history(self._depth_5bps_imbalance_history, ts_ms, depth_5bps_imbalance, self._regime_metric_keep_ms)
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
             self._spread_bps_regime_states[ms].update(ts_ms, spread_bps)
-            self._bid_depth_5bps_regime_states[ms].update(ts_ms, bid_depth_5bps["size"])
-            self._ask_depth_5bps_regime_states[ms].update(ts_ms, ask_depth_5bps["size"])
+            self._bid_depth_5bps_regime_states[ms].update(ts_ms, bid_depth_5bps)
+            self._ask_depth_5bps_regime_states[ms].update(ts_ms, ask_depth_5bps)
             self._depth_5bps_total_regime_states[ms].update(ts_ms, depth_5bps_total)
             self._depth_5bps_imbalance_regime_states[ms].update(ts_ms, depth_5bps_imbalance)
-        band_depth_stats: Dict[float, Dict[str, dict]] = {}
-        for band in BPS_DEPTH_BANDS:
-            band_depth_stats[band] = {
-                "bid": self._depth_within_bps(self.bid_lvls, mid, band, is_bid=True),
-                "ask": self._depth_within_bps(self.ask_lvls, mid, band, is_bid=False),
-            }
-        shape_stats: Dict[float, Dict[str, dict]] = {}
-        for band in BOOK_SHAPE_BANDS:
-            shape_stats[band] = {
-                "bid": self._depth_within_bps(self.bid_lvls, mid, band, is_bid=True),
-                "ask": self._depth_within_bps(self.ask_lvls, mid, band, is_bid=False),
-            }
-        slippage_by_notional: Dict[float, Dict[str, dict]] = {}
-        for notional in SLIPPAGE_NOTIONAL_USD:
-            slippage_by_notional[notional] = {
-                "buy": self._slippage_for_notional(self.ask_lvls, mid, notional, is_buy=True),
-                "sell": self._slippage_for_notional(self.bid_lvls, mid, notional, is_buy=False),
-            }
         rolling_ofi_sums: Dict[Tuple[int, int], float] = {}
-        rolling_obi_stats: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
+        rolling_obi_means: Dict[Tuple[int, int], float] = {}
         for level in ROLLING_OFI_LEVELS:
             value = ofi_by_level[level]
             self._append_metric_history(self.ofi_level_histories[level], ts_ms, value, keep_ms=10_000)
@@ -4406,13 +3952,8 @@ class FeatureEngine:
             for window in ROLLING_OFI_WINDOWS_MS:
                 rolling_ofi_sums[(level, window)] = self._rolling_ofi_states[(level, window)].sum_value()
         for level in ROLLING_OBI_LEVELS:
-            current_sign = self._sign(obi_by_level[level])
             for window in ROLLING_OBI_WINDOWS_MS:
-                state = self._rolling_obi_states[(level, window)]
-                mean_val = state.mean()
-                slope = state.slope()
-                persistence = state.persistence(current_sign)
-                rolling_obi_stats[(level, window)] = (mean_val, slope, persistence)
+                rolling_obi_means[(level, window)] = self._rolling_obi_states[(level, window)].mean()
         deep_micro_features: Dict[str, float] = {}
         deep_micro_minus_mid_bps: Dict[int, float] = {}
         micro_price_by_level: Dict[int, float] = {}
@@ -4467,8 +4008,7 @@ class FeatureEngine:
                 feat_list.append(rolling_ofi_sums[(level, fast_ms)] - rolling_ofi_sums[(level, slow_ms)])
         for level in ROLLING_OBI_LEVELS:
             for window in ROLLING_OBI_WINDOWS_MS:
-                mean_val, _slope, _persistence = rolling_obi_stats[(level, window)]
-                feat_list.append(mean_val)
+                feat_list.append(rolling_obi_means[(level, window)])
         for level in DEEP_MICRO_LEVELS:
             feat_list.extend([
                 deep_micro_features[f"micro_l{level}_minus_mid_bps"],
@@ -4480,42 +4020,17 @@ class FeatureEngine:
             deep_micro_features["micro_l1_minus_micro_l10_bps"],
         ])
         for band in BPS_DEPTH_BANDS:
-            bid_stats = band_depth_stats[band]["bid"]
-            ask_stats = band_depth_stats[band]["ask"]
-            bid_size = bid_stats["size"]
-            ask_size = ask_stats["size"]
+            if float(band) == 5.0:
+                bid_size = bid_depth_5bps
+                ask_size = ask_depth_5bps
+            else:
+                bid_size = self._depth_within_bps(self.bid_lvls, mid, band, is_bid=True)
+                ask_size = self._depth_within_bps(self.ask_lvls, mid, band, is_bid=False)
+
             feat_list.extend([
                 bid_size,
                 ask_size,
                 self._safe_div(bid_size - ask_size, bid_size + ask_size, 0.0),
-            ])
-        for band in BOOK_SHAPE_BANDS:
-            bid_stats = shape_stats[band]["bid"]
-            ask_stats = shape_stats[band]["ask"]
-            feat_list.extend([
-                bid_stats["max_size"],
-                ask_stats["max_size"],
-                bid_stats["dist_to_max_bps"],
-                ask_stats["dist_to_max_bps"],
-                bid_stats["hhi"],
-                ask_stats["hhi"],
-                bid_stats["top1_share"],
-                ask_stats["top1_share"],
-            ])
-        for notional in SLIPPAGE_NOTIONAL_USD:
-            buy = slippage_by_notional[notional]["buy"]
-            sell = slippage_by_notional[notional]["sell"]
-            feat_list.extend([
-                buy["slippage_bps"],
-                sell["slippage_bps"],
-                buy["depth_needed_bps"],
-                sell["depth_needed_bps"],
-            ])
-        for notional in SLIPPAGE_NOTIONAL_USD:
-            n = self._fmt_usd_notional(notional)
-            feat_list.extend([
-                slippage_asymmetry_features[f"slippage_imbalance_bps_{n}"],
-                slippage_asymmetry_features[f"depth_needed_imbalance_bps_{n}"],
             ])
         for ms in FAST_WINDOWS_MS:
             window_seconds = max(ms / 1000.0, 1e-9)
@@ -4582,30 +4097,11 @@ class FeatureEngine:
                 c["cvd_minus_ema_usd"],
             ])
         feat_list.extend([
-            trade_burst_features["consecutive_buy_trade_count"],
-            trade_burst_features["consecutive_sell_trade_count"],
+            consecutive_buy_trade_count,
+            consecutive_sell_trade_count,
         ])
-        for window in TRADE_BURST_WINDOWS_MS:
-            feat_list.extend([
-                trade_burst_features[f"max_buy_run_length_{window}ms"],
-                trade_burst_features[f"max_sell_run_length_{window}ms"],
-                trade_burst_features[f"trade_sign_autocorr_lag1_{window}ms"],
-                trade_burst_features[f"trade_sign_entropy_{window}ms"],
-                trade_burst_features[f"trade_burst_score_{window}ms"],
-                trade_burst_features[f"buy_trade_burst_score_{window}ms"],
-                trade_burst_features[f"sell_trade_burst_score_{window}ms"],
-            ])
         for ms in FLOW_WINDOWS_MS:
             large_stats = large_stats_by_ms[ms]
-            for threshold in LARGE_TRADE_NOTIONAL_USD:
-                thr = self._fmt_usd_notional(threshold)
-                feat_list.extend([
-                    large_stats[f"large_buy_count_ge_{thr}_{ms}ms"],
-                    large_stats[f"large_sell_count_ge_{thr}_{ms}ms"],
-                    large_stats[f"large_buy_notional_ge_{thr}_{ms}ms"],
-                    large_stats[f"large_sell_notional_ge_{thr}_{ms}ms"],
-                    large_stats[f"large_trade_imbalance_ge_{thr}_{ms}ms"],
-                ])
             feat_list.extend([
                 large_stats[f"max_signed_trade_notional_usd_{ms}ms"],
                 large_stats[f"top5_trade_notional_sum_usd_{ms}ms"],
@@ -4644,31 +4140,18 @@ class FeatureEngine:
                 dist["max_abs_return_bps"],
             ])
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
-            spread_state = self._spread_bps_regime_states[ms]
+            spread_win = self._spread_bps_regime_states[ms]
             depth_state = self._depth_5bps_total_regime_states[ms]
-            imb_state = self._depth_5bps_imbalance_regime_states[ms]
-            bid_state = self._bid_depth_5bps_regime_states[ms]
-            ask_state = self._ask_depth_5bps_regime_states[ms]
-
-            spread_mean, spread_std = spread_state.mean_std()
-            spread_stats = {
-                "mean": spread_mean,
-                "std": spread_std,
-                "p90": spread_state.p90(),
-                "max": spread_state.max(),
-                "min": spread_state.min(),
-            }
+            imb_win = self._depth_5bps_imbalance_regime_states[ms]
+            spread_mean, spread_std = spread_win.mean_std()
             spread_z = 0.0 if spread_std <= 1e-9 else (spread_bps - spread_mean) / max(spread_std, 1e-9)
-            spread_slope = spread_state.slope()
-            spread_above = spread_state.frac_above(1.0)
+            spread_slope = spread_win.slope()
+            spread_above = spread_win.frac_above(1.0)
 
             depth_mean, depth_std = depth_state.mean_std()
             depth_z = 0.0 if depth_std <= 1e-9 else (depth_5bps_total - depth_mean) / max(depth_std, 1e-9)
-            imb_mean = imb_state.mean()
-            imb_slope = imb_state.slope()
-
-            bid_mean = bid_state.mean()
-            ask_mean = ask_state.mean()
+            imb_mean = imb_win.mean()
+            imb_slope = imb_win.slope()
 
             feat_list.extend([
                 spread_z,
@@ -4678,14 +4161,7 @@ class FeatureEngine:
                 imb_mean,
                 imb_slope,
             ])
-        bid_depth_5bps_base = float(band_depth_stats[5.0]["bid"]["size"])
-        ask_depth_5bps_base = float(band_depth_stats[5.0]["ask"]["size"])
-        depth_imbalance_5bps = self._safe_div(
-            bid_depth_5bps_base - ask_depth_5bps_base,
-            bid_depth_5bps_base + ask_depth_5bps_base,
-            0.0,
-        )
-        depth_5bps_total_base = bid_depth_5bps_base + ask_depth_5bps_base
+        depth_5bps_total_base = depth_5bps_total
 
         for ms in FAST_WINDOWS_MS:
             ofi_pressure = ofi_pressure_by_ms[ms]
@@ -4695,53 +4171,6 @@ class FeatureEngine:
                 self._safe_div(ofi_pressure, max(self._realized_vol_for_pressure(ms), 1e-9), 0.0),
             ])
 
-        for ms in INTERACTION_WINDOWS_MS:
-            trade_imbalance = float(trade_stats_by_ms[ms]["trade_imbalance_notional"])
-            signed_flow_usd = float(trade_stats_by_ms[ms]["signed_notional_flow_usd"])
-            signed_flow_scaled = signed_flow_usd / 100_000.0
-            ofi_pressure = float(ofi_pressure_by_ms[ms])
-            realized_vol = self._realized_vol_for_pressure(ms)
-            flow_sign = 1 if trade_imbalance > 0.0 else (-1 if trade_imbalance < 0.0 else 0)
-            book_sign = 1 if depth_imbalance_5bps > 0.0 else (-1 if depth_imbalance_5bps < 0.0 else 0)
-            flow_agrees_with_book = 1.0 if (flow_sign != 0 and book_sign != 0 and flow_sign == book_sign) else 0.0
-            flow_disagrees_with_book = 1.0 if (flow_sign != 0 and book_sign != 0 and flow_sign != book_sign) else 0.0
-            feat_list.extend([
-                flow_agrees_with_book,
-                flow_disagrees_with_book,
-                trade_imbalance * depth_imbalance_5bps,
-                trade_imbalance * ofi_pressure,
-                ofi_pressure * spread_bps,
-                micro_premia * trade_imbalance,
-                micro_premia * depth_imbalance_5bps,
-                self._safe_div(signed_flow_usd, max(depth_5bps_total_base, 1e-9), 0.0),
-                self._safe_div(signed_flow_scaled, max(spread_bps, 0.1), 0.0),
-                self._safe_div(abs(signed_flow_scaled), max(realized_vol, 1e-9), 0.0),
-            ])
-
-        macd_features = []
-        for fast_ms, slow_ms, sig_ms in MACD_TRIPLETS_MS:
-            st = self.macd_state[(fast_ms, slow_ms, sig_ms)]
-            if st["fast"] is None:
-                st["fast"] = float(micro)
-            else:
-                st["fast"] = self._ewma_update(float(st["fast"]), float(micro), ob_dt_ms, int(fast_ms))
-            if st["slow"] is None:
-                st["slow"] = float(micro)
-            else:
-                st["slow"] = self._ewma_update(float(st["slow"]), float(micro), ob_dt_ms, int(slow_ms))
-            fast_ema = float(st["fast"])
-            slow_ema = float(st["slow"])
-            raw_bps = 1e4 * math.log(fast_ema / slow_ema) if (fast_ema > 0.0 and slow_ema > 0.0) else 0.0
-            if not bool(st["signal_initialized"]):
-                st["signal"] = float(raw_bps)
-                st["signal_initialized"] = True
-            else:
-                st["signal"] = self._ewma_update(float(st["signal"]), float(raw_bps), ob_dt_ms, int(sig_ms))
-            sig_bps = float(st["signal"])
-            hist_bps = float(raw_bps - sig_bps)
-            macd_features.extend([raw_bps, sig_bps, hist_bps])
-        feat_list.extend(macd_features)
-        feat_list.extend(vpin_features)
         names = self.feature_names()
         if len(feat_list) != len(names):
             raise ValueError(
@@ -4925,13 +4354,6 @@ class FeatureEngine:
             self.consecutive_buy_trade_count = 0
             self.consecutive_sell_trade_count = 0
             trade_sign = 0
-        if TRADE_BURST_WINDOWS_MS:
-            self.trade_sign_history.append((int(ts_ms), int(trade_sign), float(notional_usd)))
-            trade_cutoff = int(ts_ms) - int(max(TRADE_BURST_WINDOWS_MS) + 5_000)
-            while self.trade_sign_history and self.trade_sign_history[0][0] < trade_cutoff:
-                self.trade_sign_history.popleft()
-            for window in TRADE_BURST_WINDOWS_MS:
-                self._trade_burst_insert(window, int(ts_ms), int(trade_sign))
 
         entry = (ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick)
         for window, deq in self._trade_window_deques.items():
@@ -4969,30 +4391,6 @@ class FeatureEngine:
         vol_rate = size / (dt_trade_ms / 1000.0)  # base per second
         for hl in self.regime_windows_ms:
             self.volume_ewma[hl] = self._ewma_update(self.volume_ewma[hl], vol_rate, dt_trade_ms, hl)
-
-        # VPIN bucket sizing and accumulation per configured bucket scale
-        v_per_sec = max(self.volume_ewma[1_000], 1e-9)
-        for secs, st in self.vpin_state.items():
-            Vb = max(v_per_sec * float(secs), 1e-9)
-            st["Vb"] = Vb if st["Vb"] is None else (0.9 * st["Vb"] + 0.1 * Vb)
-            if side_sign > 0:
-                st["cum_buy"] += size
-            elif side_sign < 0:
-                st["cum_sell"] += size
-            st["cum"] += size
-
-            while st["cum"] >= (st["Vb"] or 1e9):
-                if st["Vb"] is None:
-                    break
-                total = max(st["cum"], 1e-12)
-                scale = st["Vb"] / total
-                buy_bucket = st["cum_buy"] * scale
-                sell_bucket = st["cum_sell"] * scale
-                phi = abs(buy_bucket - sell_bucket) / max(st["Vb"], 1e-12)
-                st["phi"].append(phi)
-                st["cum_buy"] -= buy_bucket
-                st["cum_sell"] -= sell_bucket
-                st["cum"] -= st["Vb"]
 
         self.last_trade_ts = ts_ms
 
@@ -5101,11 +4499,11 @@ class FeatureEngine:
         }
 
     def _realized_vol_for_pressure(self, ms: int) -> float:
-        """Return a finite realized-vol proxy for pressure/interaction features.
+        """Return a finite realized-vol proxy for pressure features.
 
-        INTERACTION_WINDOWS_MS and FAST_WINDOWS_MS are intentionally shorter than
-        REGIME_WINDOWS_MS in the 1s maker contract. Therefore self.realized_vol may
-        not contain every requested short window, especially 200ms.
+        FAST_WINDOWS_MS is intentionally shorter than REGIME_WINDOWS_MS in the 1s
+        maker contract. Therefore self.realized_vol may not contain every requested
+        short window, especially 200ms.
 
         Priority:
           1. Use self.realized_vol[ms] when available.
@@ -5147,15 +4545,15 @@ class FeatureEngine:
         if any(tok in feature_name for tok in fast_tokens):
             return 5_000
         trade_tokens = (
-            "trade", "flow", "cvd", "large_", "vpin", "absorption", "aggressor",
-            "signed_flow", "buy_flow", "sell_flow", "premium", "burst", "tick",
+            "trade", "flow", "cvd", "large_", "absorption", "aggressor",
+            "signed_flow", "buy_flow", "sell_flow", "premium", "tick",
         )
         if any(tok in feature_name for tok in trade_tokens):
             return 10_000
         price_tokens = (
             "price", "trend", "return", "vol", "regime", "depth", "liquidity",
-            "slippage", "book_", "spread_mean", "spread_std", "spread_p90",
-            "spread_max", "spread_min", "spread_z", "range", "macd", "micro_l", "vamp_l",
+            "book_", "spread_mean", "spread_std", "spread_p90",
+            "spread_max", "spread_min", "spread_z", "range", "micro_l", "vamp_l",
         )
         if any(tok in feature_name for tok in price_tokens):
             return 30_000
