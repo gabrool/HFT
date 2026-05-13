@@ -565,6 +565,142 @@ def test_offline_ingest_raw_feature_dims() -> None:
     assert offline_ingest.RAW_FEATURE_NAMES == raw_names
     assert offline_ingest.FEATURE_TRANSFORM == CMSSL17.FEATURE_TRANSFORM
 
+
+def test_pruned_feature_schema_contract() -> None:
+    fe = FeatureEngine()
+    names = list(fe.feature_names())
+
+    assert len(names) == 235
+    assert fe.core_feature_dim() == 235
+    assert fe.feature_dim() == 241
+
+    removed = {
+        "time_hour_sin",
+        "time_hour_cos",
+        "time_dow_sin",
+        "time_dow_cos",
+        "session_is_weekend",
+        "session_is_asia",
+        "session_is_europe",
+        "session_is_us",
+        "session_is_europe_us_overlap",
+
+        "mid_trend_r2_200ms",
+        "mid_position_in_range_200ms",
+        "mid_breakout_up_200ms",
+        "mid_breakout_down_200ms",
+        "sign_persistence_200ms",
+        "up_return_fraction_200ms",
+        "return_autocorr_lag1_200ms",
+
+        "cum_bid_l1",
+        "cum_ask_l1",
+        "cum_bid_l20",
+        "cum_ask_l20",
+        "obi_l20",
+        "ofi_l20",
+
+        "ofi_l1_over_spread_bps",
+        "ofi_l3_over_spread_bps",
+        "ofi_l5_over_spread_bps",
+        "ofi_l10_over_spread_bps",
+
+        "ofi_l1_sum_200ms",
+        "ofi_l3_sum_500ms",
+        "ofi_l10_sum_1000ms",
+        "ofi_l1_accel_200_minus_1000ms",
+
+        "micro_l3_minus_mid_over_spread",
+        "micro_l5_minus_mid_over_spread",
+        "micro_l10_minus_mid_over_spread",
+
+        "bid_notional_within_1bps",
+        "ask_notional_within_1bps",
+        "notional_imbalance_within_10bps",
+
+        "book_slope_bid_top5",
+        "book_convexity_ask_10bps",
+
+        "spread_delta_bps_200ms",
+        "spread_delta_bps_500ms",
+        "spread_delta_bps_1000ms",
+
+        "vwap_vs_micro_bps_200ms",
+        "signed_trade_premium_bps_count_weighted_500ms",
+        "buy_trade_premium_bps_1000ms",
+        "sell_trade_premium_bps_1000ms",
+
+        "large_trade_cluster_count_200ms",
+        "time_since_large_buy_ms",
+        "last_large_sell_notional_usd",
+        "return_since_last_large_buy_bps",
+
+        "signed_flow_per_bp_move_200ms",
+        "price_response_to_buy_flow_500ms",
+        "price_response_to_sell_flow_1000ms",
+
+        "variance_ratio_500ms_over_200ms",
+        "variance_ratio_1000ms_over_500ms",
+
+        "resid_spread_bps_200ms",
+        "resid_micro_minus_mid_bps_500ms",
+        "resid_trade_imbalance_notional_1000ms_1000ms",
+    }
+
+    for name in removed:
+        assert name not in names, name
+
+    retained = {
+        "mid_ret_bps_200ms",
+        "micro_ret_bps_500ms",
+        "mid_slope_bps_per_sec_1000ms",
+        "mid_range_bps_1000ms",
+        "spread_bps",
+        "bsz1",
+        "asz1",
+        "micro_minus_mid_bps",
+        "micro_minus_mid_over_spread",
+        "time_since_trade_ms",
+        "time_since_mid_change_ms",
+        "obi_l10",
+        "ofi_l10",
+        "ofi_l10_over_depth_l10",
+        "ofi_l10_over_depth_5bps",
+        "ofi_l10_sum_over_depth_1000ms",
+        "ofi_l10_accel_500_minus_1000ms",
+        "micro_l10_minus_mid_bps",
+        "vamp_l10_minus_mid_bps",
+        "bid_depth_within_10bps",
+        "ask_depth_within_10bps",
+        "depth_imbalance_within_10bps",
+        "vwap_vs_mid_bps_1000ms",
+        "signed_trade_premium_bps_volume_weighted_1000ms",
+        "signed_notional_flow_usd_1000ms",
+        "trade_imbalance_notional_1000ms",
+        "max_signed_trade_notional_usd_1000ms",
+        "top5_trade_notional_sum_usd_1000ms",
+        "buy_flow_without_price_up_1000ms",
+        "sell_flow_without_price_down_1000ms",
+        "absorption_bid_1000ms",
+        "absorption_ask_1000ms",
+        "return_std_bps_1000ms",
+        "regime_realized_vol_bps_1000ms",
+        "spread_z_1000ms",
+        "depth_imbalance_5bps_slope_1000ms",
+        "ofi_l1_pressure_ewma_1000ms",
+    }
+
+    for name in retained:
+        assert name in names, name
+
+
+def test_pruned_feature_vector_matches_names() -> None:
+    fe = FeatureEngine()
+    result = fe.on_fast_event(deep_snapshot_ob(1_700_000_700_000, n_levels=60))
+    assert result.event_type == "ob"
+    assert result.features.shape == (235,)
+    assert len(fe.feature_names()) == 235
+
 def main() -> None:
     fe = FeatureEngine()
 
@@ -617,6 +753,8 @@ def main() -> None:
     test_merge_event_time_ob_lower_timestamp_still_wins()
     test_duplicate_ob_timestamps_append_distinct_rows()
     test_offline_ingest_no_overwrite_duplicate_timestamp_api()
+    test_pruned_feature_schema_contract()
+    test_pruned_feature_vector_matches_names()
 
 
 if __name__ == "__main__":
