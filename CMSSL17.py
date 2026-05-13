@@ -2511,11 +2511,16 @@ class FeatureEngine:
         z_hl_ms: int = 30_000,
         vpin_target_bucket_secs: float = 2.0,
     ):
-        self.depth = int(depth)
-        if self.depth < MAX_BOOK_FEATURE_LEVEL:
+        # feature_depth controls the cached top-of-book ladders used for feature extraction.
+        # The full source snapshot/update book is stored in self.bids/self.asks so deeper
+        # levels can promote into the feature ladders after top-level deletes.
+        self.feature_depth = int(depth)
+        self.book_state_depth: Optional[int] = None
+        if self.feature_depth < MAX_BOOK_FEATURE_LEVEL:
             raise ValueError(
-                f"FeatureEngine depth={self.depth} is too small for BOOK_DEPTH_FEATURE_LEVELS={BOOK_DEPTH_FEATURE_LEVELS}. "
-                f"Need depth >= {MAX_BOOK_FEATURE_LEVEL}."
+                f"FeatureEngine feature_depth={self.feature_depth} is too small for "
+                f"BOOK_DEPTH_FEATURE_LEVELS={BOOK_DEPTH_FEATURE_LEVELS}. "
+                f"Need feature_depth >= {MAX_BOOK_FEATURE_LEVEL}."
             )
         self.z_hl_ms = int(z_hl_ms)
         self.vpin_target_bucket_secs = float(vpin_target_bucket_secs)
@@ -4194,9 +4199,9 @@ class FeatureEngine:
         return 0.0 if total <= eps else float(near / total)
 
     def _sorted_ladders(self):
-        # slow-path full rebuild, retained for snapshot resets / invalidated cached ladders
-        self.bid_lvls = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[: self.depth]
-        self.ask_lvls = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[: self.depth]
+        # Rebuild the cached top-feature-depth ladders from the full in-memory book.
+        self.bid_lvls = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[: self.feature_depth]
+        self.ask_lvls = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[: self.feature_depth]
         self._book_dirty = False
 
     def _insert_level(self, levels: List[Tuple[float, float]], price: float, size: float, is_bid: bool) -> bool:
@@ -4205,20 +4210,20 @@ class FeatureEngine:
             px_i = levels[insert_at][0]
             if px_i == price:
                 levels[insert_at] = (price, size)
-                return insert_at < self.depth
+                return insert_at < self.feature_depth
             if (price > px_i) if is_bid else (price < px_i):
                 break
             insert_at += 1
         levels.insert(insert_at, (price, size))
-        if len(levels) > self.depth:
+        if len(levels) > self.feature_depth:
             levels.pop()
-        return insert_at < self.depth
+        return insert_at < self.feature_depth
 
     def _remove_level(self, levels: List[Tuple[float, float]], price: float) -> bool:
         for idx, (px_i, _sz_i) in enumerate(levels):
             if px_i == price:
                 levels.pop(idx)
-                return idx < self.depth
+                return idx < self.feature_depth
         return False
 
     def _side_requires_full_rebuild(
@@ -4232,7 +4237,7 @@ class FeatureEngine:
         prev_size = book.get(price)
         was_tracked = any(px == price for px, _ in levels)
         best_price = levels[0][0] if levels else None
-        boundary_price = levels[-1][0] if len(levels) >= self.depth else None
+        boundary_price = levels[-1][0] if len(levels) >= self.feature_depth else None
         deleting = size <= 0.0
 
         if deleting and prev_size is None:
@@ -4241,7 +4246,7 @@ class FeatureEngine:
             return True
         if deleting:
             removed = self._remove_level(levels, price)
-            if removed and len(book) >= self.depth:
+            if removed and len(book) >= self.feature_depth:
                 return True
             return False
 
@@ -4249,7 +4254,7 @@ class FeatureEngine:
         if was_tracked:
             self._insert_level(levels, price, size, is_bid)
             return False
-        if len(levels) < self.depth:
+        if len(levels) < self.feature_depth:
             self._insert_level(levels, price, size, is_bid)
             return False
         if boundary_price is None:
@@ -5417,6 +5422,24 @@ class FeatureEngine:
             event_type="ob",
         )
 
+    def _levels_to_book_dict(
+        self,
+        levels: Sequence[Tuple[float, float]],
+    ) -> Dict[float, float]:
+        out: Dict[float, float] = {}
+        for price_raw, size_raw in levels:
+            try:
+                price = float(price_raw)
+                size = float(size_raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(price) or not math.isfinite(size):
+                continue
+            if price <= 0.0 or size <= 0.0:
+                continue
+            out[price] = size
+        return out
+
     def _update_book_from_ob(
         self,
         tp_code: int,
@@ -5424,8 +5447,10 @@ class FeatureEngine:
         asks: Sequence[Tuple[float, float]],
     ) -> None:
         if int(tp_code) == 1:
-            self.bids = {float(p): float(q) for p, q in bids[: self.depth]}
-            self.asks = {float(p): float(q) for p, q in asks[: self.depth]}
+            # Snapshot replaces the full in-memory book. Do not truncate to feature_depth here.
+            # Truncation happens only in _sorted_ladders().
+            self.bids = self._levels_to_book_dict(bids)
+            self.asks = self._levels_to_book_dict(asks)
             self._sorted_ladders()
             return
 

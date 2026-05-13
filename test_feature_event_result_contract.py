@@ -172,6 +172,24 @@ def delta_ob(ts: int):
     )
 
 
+def deep_snapshot_ob(ts: int, n_levels: int = 60):
+    bids = tuple((100.0 - 0.5 * i, 1.0 + 0.01 * i) for i in range(n_levels))
+    asks = tuple((101.0 + 0.5 * i, 1.0 + 0.01 * i) for i in range(n_levels))
+    return ("ob", ts, 1, 1, bids, asks)
+
+
+def delete_top_bid_levels_ob(ts: int, n_delete: int):
+    bids = tuple((100.0 - 0.5 * i, 0.0) for i in range(n_delete))
+    asks = tuple()
+    return ("ob", ts, 2, 2, bids, asks)
+
+
+def delete_top_ask_levels_ob(ts: int, n_delete: int):
+    bids = tuple()
+    asks = tuple((101.0 + 0.5 * i, 0.0) for i in range(n_delete))
+    return ("ob", ts, 3, 2, bids, asks)
+
+
 def trade(ts: int):
     return (
         "trade",
@@ -183,6 +201,69 @@ def trade(ts: int):
         0,
         0,
     )
+
+
+def test_snapshot_stores_full_book_but_features_use_top_depth() -> None:
+    fe = FeatureEngine()
+    result = fe.on_fast_event(deep_snapshot_ob(1_700_000_100_000, n_levels=60))
+
+    assert result.event_type == "ob"
+    assert result.is_decision is True
+    assert result.features.shape[0] > 0
+
+    assert fe.feature_depth == 20
+    assert len(fe.bids) == 60
+    assert len(fe.asks) == 60
+    assert len(fe.bid_lvls) == fe.feature_depth
+    assert len(fe.ask_lvls) == fe.feature_depth
+
+    assert fe.bid_lvls[0][0] == 100.0
+    assert fe.ask_lvls[0][0] == 101.0
+    assert fe.bid_lvls[-1][0] == 100.0 - 0.5 * 19
+    assert fe.ask_lvls[-1][0] == 101.0 + 0.5 * 19
+
+
+def test_deeper_snapshot_levels_promote_after_top_level_deletes() -> None:
+    fe = FeatureEngine()
+    fe.on_fast_event(deep_snapshot_ob(1_700_000_200_000, n_levels=60))
+
+    before_visible_bid_prices = [px for px, _ in fe.bid_lvls]
+    assert 100.0 - 0.5 * 20 not in before_visible_bid_prices
+    assert 100.0 - 0.5 * 20 in fe.bids
+
+    result = fe.on_fast_event(delete_top_bid_levels_ob(1_700_000_200_100, n_delete=5))
+    assert result.event_type == "ob"
+    assert result.is_decision is True
+
+    after_visible_bid_prices = [px for px, _ in fe.bid_lvls]
+
+    # Old levels 5..24 should now be visible after deleting original top 5.
+    assert after_visible_bid_prices[0] == 100.0 - 0.5 * 5
+    assert after_visible_bid_prices[-1] == 100.0 - 0.5 * 24
+
+    # Proves level 21+ was preserved and promoted.
+    assert 100.0 - 0.5 * 20 in after_visible_bid_prices
+    assert len(fe.bid_lvls) == fe.feature_depth
+
+
+def test_deeper_ask_snapshot_levels_promote_after_top_level_deletes() -> None:
+    fe = FeatureEngine()
+    fe.on_fast_event(deep_snapshot_ob(1_700_000_300_000, n_levels=60))
+
+    before_visible_ask_prices = [px for px, _ in fe.ask_lvls]
+    assert 101.0 + 0.5 * 20 not in before_visible_ask_prices
+    assert 101.0 + 0.5 * 20 in fe.asks
+
+    result = fe.on_fast_event(delete_top_ask_levels_ob(1_700_000_300_100, n_delete=5))
+    assert result.event_type == "ob"
+    assert result.is_decision is True
+
+    after_visible_ask_prices = [px for px, _ in fe.ask_lvls]
+
+    assert after_visible_ask_prices[0] == 101.0 + 0.5 * 5
+    assert after_visible_ask_prices[-1] == 101.0 + 0.5 * 24
+    assert 101.0 + 0.5 * 20 in after_visible_ask_prices
+    assert len(fe.ask_lvls) == fe.feature_depth
 
 
 def test_trade_does_not_pollute_ob_feature_state() -> None:
@@ -295,6 +376,9 @@ def main() -> None:
     assert_not_tuple_unpackable(result)
 
     test_trade_does_not_pollute_ob_feature_state()
+    test_snapshot_stores_full_book_but_features_use_top_depth()
+    test_deeper_snapshot_levels_promote_after_top_level_deletes()
+    test_deeper_ask_snapshot_levels_promote_after_top_level_deletes()
 
 
 if __name__ == "__main__":
