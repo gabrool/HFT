@@ -38,7 +38,7 @@ from CMSSL17 import (  # type: ignore
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, LABEL_TRIM_SCHEMA, CHECKPOINT_SCHEMA, MODEL_ARCH_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
     DIR_LOSS_WEIGHT, MAG_LOSS_WEIGHT, MAG_CORR_LOSS_WEIGHT, EMA_DECAY,
-    FEATURE_SCHEMA, AUX_SCHEMA, FEATURE_AUX_TAIL,
+    FEATURE_SCHEMA, FEATURE_TRANSFORM, AUX_SCHEMA, FEATURE_AUX_TAIL,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     derive_dir_mag_predictions, derive_mag_pred_sqrt_for_mag_loss,
     SAM,
@@ -500,6 +500,7 @@ def validate_loaded_label_array(y: np.ndarray, source: str) -> None:
 def validate_contract_meta(meta: dict, source: str) -> None:
     ok = (
         meta.get("feature_schema") == FEATURE_SCHEMA
+        and meta.get("feature_transform") == FEATURE_TRANSFORM
         and meta.get("aux_schema") == AUX_SCHEMA
         and meta.get("checkpoint_schema_expected") == CHECKPOINT_SCHEMA
         and meta.get("target_transform") == TARGET_TRANSFORM
@@ -508,11 +509,9 @@ def validate_contract_meta(meta: dict, source: str) -> None:
         and int(meta.get("aux_dim", -1)) == AUX_DIM
         and list(meta.get("aux_names", [])) == list(FEATURE_AUX_TAIL)
         and int(meta.get("feature_dim_total", -1)) == int(meta.get("feature_dim_core", -1)) + AUX_DIM
-        and bool(meta.get("feature_names_pre_pca"))
-        and int(meta.get("feature_dim_core_pre_pca", -1)) == len(meta.get("feature_names_pre_pca", []))
+        and bool(meta.get("feature_names"))
+        and int(meta.get("feature_dim_core", -1)) == len(meta.get("feature_names", []))
         and bool(meta.get("feature_names_hash"))
-        and bool(meta.get("pca", {}).get("applied", False))
-        and int(meta.get("pca", {}).get("k", -1)) == int(meta.get("feature_dim_core", -1))
     )
     if not ok:
         raise ValueError(
@@ -525,6 +524,7 @@ def validate_contract_meta(meta: dict, source: str) -> None:
 def validate_week_matches_global(global_meta: dict, week_meta: dict, source: str) -> None:
     checks = {
         "feature_schema": (week_meta.get("feature_schema"), global_meta.get("feature_schema")),
+        "feature_transform": (week_meta.get("feature_transform"), global_meta.get("feature_transform")),
         "aux_schema": (week_meta.get("aux_schema"), global_meta.get("aux_schema")),
         "checkpoint_schema_expected": (
             week_meta.get("checkpoint_schema_expected"),
@@ -540,10 +540,6 @@ def validate_week_matches_global(global_meta: dict, week_meta: dict, source: str
         "feature_dim_total": (
             int(week_meta.get("feature_dim_total", -1)),
             int(global_meta.get("feature_dim_total", -2)),
-        ),
-        "feature_dim_core_pre_pca": (
-            int(week_meta.get("feature_dim_core_pre_pca", -1)),
-            int(global_meta.get("feature_dim_core_pre_pca", -2)),
         ),
         "feature_names_hash": (
             week_meta.get("feature_names_hash"),
@@ -566,22 +562,9 @@ def validate_week_matches_global(global_meta: dict, week_meta: dict, source: str
             f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
         )
 
-    if list(week_meta.get("feature_names_pre_pca", [])) != list(global_meta.get("feature_names_pre_pca", [])):
+    if list(week_meta.get("feature_names", [])) != list(global_meta.get("feature_names", [])):
         raise ValueError(
-            "Week metadata feature_names_pre_pca do not match global metadata. "
-            f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
-        )
-
-    week_pca = week_meta.get("pca", {}) or {}
-    global_pca = global_meta.get("pca", {}) or {}
-    if bool(week_pca.get("applied", False)) != bool(global_pca.get("applied", False)):
-        raise ValueError(
-            "Week metadata PCA applied flag does not match global metadata. "
-            f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
-        )
-    if int(week_pca.get("k", -1)) != int(global_pca.get("k", -2)):
-        raise ValueError(
-            "Week metadata PCA k does not match global metadata. "
+            "Week metadata feature_names do not match global metadata. "
             f"source={source}. Rerun offline_ingest.py with FEATURE_SCHEMA={FEATURE_SCHEMA}."
         )
 
@@ -781,6 +764,12 @@ def save_stats_cache(path: Path, stats: Dict[str, np.ndarray], metadata: Dict[st
 
 def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> bool:
     keys = (
+        "feature_schema",
+        "feature_transform",
+        "feature_dim_core",
+        "feature_dim_total",
+        "feature_names_hash",
+        "aux_dim",
         "label_trim_schema",
         "low_abs_trim_fraction",
         "high_abs_trim_fraction",
@@ -2375,7 +2364,9 @@ def train_from_offline():
         validate_week_matches_global(meta, wk_meta, source)
     print(
         f"[metadata-contract] schema={FEATURE_SCHEMA} "
+        f"feature_transform={meta.get('feature_transform')} "
         f"feature_dim_core={meta.get('feature_dim_core')} "
+        f"aux_dim={meta.get('aux_dim')} "
         f"feature_dim_total={meta.get('feature_dim_total')} "
         f"feature_names_hash={meta.get('feature_names_hash')}",
         flush=True,
@@ -2442,6 +2433,12 @@ def train_from_offline():
 
     cache_path=out_root/'signed_side_trim_stats_cache.npz'
     cache_meta={
+        'feature_schema': meta.get('feature_schema'),
+        'feature_transform': meta.get('feature_transform'),
+        'feature_dim_core': int(meta.get('feature_dim_core', -1)),
+        'feature_dim_total': int(meta.get('feature_dim_total', -1)),
+        'feature_names_hash': meta.get('feature_names_hash'),
+        'aux_dim': int(meta.get('aux_dim', -1)),
         'label_trim_schema': LABEL_TRIM_SCHEMA,
         'low_abs_trim_fraction': float(LOW_ABS_TRIM_FRACTION),
         'high_abs_trim_fraction': float(HIGH_ABS_TRIM_FRACTION),
