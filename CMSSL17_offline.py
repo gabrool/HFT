@@ -38,7 +38,7 @@ from CMSSL17 import (  # type: ignore
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION, TARGET_TRANSFORM, TARGET_TASK, LABEL_TRIM_SCHEMA, CHECKPOINT_SCHEMA, MODEL_ARCH_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
     DIR_LOSS_WEIGHT, MAG_LOSS_WEIGHT, MAG_CORR_LOSS_WEIGHT, EMA_DECAY,
-    FEATURE_SCHEMA, FEATURE_TRANSFORM, FEATURE_TRANSFORM_POLICY, FEATURE_TRANSFORM_WARMUP_ROWS, AUX_SCHEMA, FEATURE_AUX_TAIL, feature_transform_spec_hash,
+    FEATURE_SCHEMA, FEATURE_TRANSFORM, FEATURE_TRANSFORM_POLICY, FEATURE_TRANSFORM_WARMUP_ROWS, AUX_TRANSFORM, AUX_SCHEMA, FEATURE_AUX_TAIL, feature_transform_spec_hash,
     SINGLE_WEEK_PATIENCE, get_primary_metric_mode, compute_primary_metric, is_metric_improved,
     derive_dir_mag_predictions, derive_mag_pred_sqrt_for_mag_loss,
     SAM,
@@ -502,6 +502,7 @@ def validate_contract_meta(meta: dict, source: str) -> None:
         meta.get("feature_schema") == FEATURE_SCHEMA
         and meta.get("feature_transform") == FEATURE_TRANSFORM
         and meta.get("feature_transform_policy") == FEATURE_TRANSFORM_POLICY
+        and meta.get("aux_transform") == AUX_TRANSFORM
         and bool(meta.get("feature_transform_spec_hash"))
         and int(meta.get("feature_transform_warmup_rows", -1)) == int(FEATURE_TRANSFORM_WARMUP_ROWS)
         and meta.get("aux_schema") == AUX_SCHEMA
@@ -786,6 +787,7 @@ def cache_matches(cached_meta: Dict[str, Any], current_meta: Dict[str, Any]) -> 
         "feature_dim_total",
         "feature_names_hash",
         "aux_dim",
+        "aux_transform",
         "label_trim_schema",
         "low_abs_trim_fraction",
         "high_abs_trim_fraction",
@@ -2458,6 +2460,7 @@ def train_from_offline():
         'feature_dim_total': int(meta.get('feature_dim_total', -1)),
         'feature_names_hash': meta.get('feature_names_hash'),
         'aux_dim': int(meta.get('aux_dim', -1)),
+        'aux_transform': meta.get('aux_transform'),
         'label_trim_schema': LABEL_TRIM_SCHEMA,
         'low_abs_trim_fraction': float(LOW_ABS_TRIM_FRACTION),
         'high_abs_trim_fraction': float(HIGH_ABS_TRIM_FRACTION),
