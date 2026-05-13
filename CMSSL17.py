@@ -2792,7 +2792,7 @@ class FeatureEngine:
         self._feature_names_cache: Optional[List[str]] = None
         self._z_half_lives_ms: Optional[List[Optional[int]]] = None
         # Empty immutable-ish placeholder returned for trade events.
-        # Trade rows are never consumed by offline_ingest, so this avoids per-trade allocation.
+        # Trade rows return this after updating trade/flow state only, avoiding per-trade allocation.
         self._trade_fast_path_empty_feature = np.empty((0,), dtype=np.float32)
         # Vectorized z-score metadata.
         self._z_half_lives_arr: Optional[np.ndarray] = None
@@ -2800,7 +2800,6 @@ class FeatureEngine:
         self._last_z_ts_ms: Optional[int] = None
 
         self.trade_fast_path_count: int = 0
-        self.trade_full_feature_state_update_count: int = 0
         self.ob_feature_build_count: int = 0
         self.strict_feature_validation = os.environ.get("BYBIT_STRICT_FEATURE_VALIDATION", "0") == "1"
 
@@ -4529,37 +4528,86 @@ class FeatureEngine:
         ts_ms: int,
         payload: Any,
     ) -> FeatureEventResult:
+        etype = str(etype).lower()
+        ts_ms = int(ts_ms)
+
         any_event_dt_ms = (
             1.0
             if self._last_any_event_ts is None
             else max(1.0, float(ts_ms - int(self._last_any_event_ts)))
         )
+
+        for w, deq in self._event_density_deques.items():
+            self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == "ob"))
+
+        if etype == "trade":
+            return self._handle_trade_event(ts_ms, payload, any_event_dt_ms)
+
+        if etype == "ob":
+            return self._handle_ob_event(ts_ms, payload, any_event_dt_ms)
+
+        raise ValueError(f"Unsupported event type in _dispatch_parsed_event: {etype!r}")
+
+    def _current_book_mid_or_trade_price(self, payload: Any) -> float:
+        bid1, ask1, _, _ = self._book_best()
+        if bid1 > 0.0 and ask1 > 0.0:
+            return 0.5 * (bid1 + ask1)
+
+        try:
+            if isinstance(payload, tuple):
+                return float(payload[0])
+            return float(payload.get("price", 0.0))
+        except Exception:
+            return 0.0
+
+    def _handle_trade_event(
+        self,
+        ts_ms: int,
+        payload: Any,
+        any_event_dt_ms: float,
+    ) -> FeatureEventResult:
+        self._update_trade_windows(ts_ms, payload, any_event_dt_ms)
+        self.trade_fast_path_count += 1
+        self._last_any_event_ts = int(ts_ms)
+
+        raw_mid = self._current_book_mid_or_trade_price(payload)
+
+        return FeatureEventResult(
+            ts_ms=int(ts_ms),
+            features=self._trade_fast_path_empty_feature,
+            dt_ms=float(any_event_dt_ms),
+            is_decision=False,
+            raw_mid=float(raw_mid),
+            event_type="trade",
+        )
+
+    def _handle_ob_event(
+        self,
+        ts_ms: int,
+        payload: Any,
+        any_event_dt_ms: float,
+    ) -> FeatureEventResult:
         prev_bid_l1 = self.prev_bsz
         prev_ask_l1 = self.prev_asz
         prev_bid_l2 = self.prev_bsz2
         prev_ask_l2 = self.prev_asz2
 
-        is_trade = (etype == 'trade')
-        for w, deq in self._event_density_deques.items():
-            self._append_ts_with_guard(deq, ts_ms, w, is_ob_event=(etype == 'ob'))
+        self._prune_replen_windows(ts_ms)
 
-        if etype == 'trade':
-            self._update_trade_windows(ts_ms, payload, any_event_dt_ms)
-            self.trade_fast_path_count += 1
-        elif etype == 'ob':
-            self._prune_replen_windows(ts_ms)
-            for window in self._trade_window_deques:
-                self._prune_trade_window(ts_ms, window)
-            for window in self.trade_burst_states:
-                self._trade_burst_prune(window, ts_ms)
-            tp_code, bids, asks = payload
-            self._update_book_from_ob(tp_code, bids, asks)
-            for window, deq in self._quote_window_deques.items():
-                self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
-            for window, deq in self._ob_update_deques.items():
-                self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
-        else:
-            raise ValueError(f"Unsupported event type in _dispatch_parsed_event: {etype!r}")
+        for window in self._trade_window_deques:
+            self._prune_trade_window(ts_ms, window)
+
+        for window in self.trade_burst_states:
+            self._trade_burst_prune(window, ts_ms)
+
+        tp_code, bids, asks = payload
+        self._update_book_from_ob(tp_code, bids, asks)
+
+        for window, deq in self._quote_window_deques.items():
+            self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
+
+        for window, deq in self._ob_update_deques.items():
+            self._append_ts_with_guard(deq, ts_ms, window, is_ob_event=True)
         self._ensure_book_ladders()
         session_features = self._compute_session_features(ts_ms)
         bid1, ask1, bsz1, asz1 = self._book_best()
@@ -4612,8 +4660,7 @@ class FeatureEngine:
         cum_bid10 = cum_bid_by_level[10]
         cum_ask10 = cum_ask_by_level[10]
 
-        if etype == 'ob':
-            self._append_ob_snapshot(ts_ms, bid1, ask1, bsz1, asz1, spread, cum_bid3, cum_ask3, cum_bid5, cum_ask5)
+        self._append_ob_snapshot(ts_ms, bid1, ask1, bsz1, asz1, spread, cum_bid3, cum_ask3, cum_bid5, cum_ask5)
 
         obi_by_level = {
             lvl: (cum_bid_by_level[lvl] - cum_ask_by_level[lvl]) / max(cum_bid_by_level[lvl] + cum_ask_by_level[lvl], 1e-12)
@@ -4659,9 +4706,8 @@ class FeatureEngine:
             self.ofi_pressure_by_window[ms] = self._ewma_update(self.ofi_pressure_by_window[ms], ofi_l1, ob_dt_ms, ms)
         ofi_pressure_by_ms = {ms: self.ofi_pressure_by_window[ms] for ms in FAST_WINDOWS_MS}
         trade_stats_by_ms = {ms: self._compute_trade_window_stats(ms, ts_ms, mid, micro) for ms in self.trade_windows}
-        if etype == "ob":
-            self.last_ob_ofi_l5 = float(ofi_l5)
-            self.last_ob_trade_imbalance_1000ms = float(trade_stats_by_ms[1_000]["trade_imbalance_notional"])
+        self.last_ob_ofi_l5 = float(ofi_l5)
+        self.last_ob_trade_imbalance_1000ms = float(trade_stats_by_ms[1_000]["trade_imbalance_notional"])
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in FLOW_WINDOWS_MS:
             cvd_state = self.cvd_window_states[ms]
@@ -4846,17 +4892,16 @@ class FeatureEngine:
             }
         rolling_ofi_sums: Dict[Tuple[int, int], float] = {}
         rolling_obi_stats: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
-        if etype == "ob":
-            for level in ROLLING_OFI_LEVELS:
-                value = ofi_by_level[level]
-                self._append_metric_history(self.ofi_level_histories[level], ts_ms, value, keep_ms=10_000)
-                for window in ROLLING_OFI_WINDOWS_MS:
-                    self._rolling_ofi_states[(level, window)].update(ts_ms, value)
-            for level in ROLLING_OBI_LEVELS:
-                value = obi_by_level[level]
-                self._append_metric_history(self.obi_level_histories[level], ts_ms, value, keep_ms=10_000)
-                for window in ROLLING_OBI_WINDOWS_MS:
-                    self._rolling_obi_states[(level, window)].update(ts_ms, value)
+        for level in ROLLING_OFI_LEVELS:
+            value = ofi_by_level[level]
+            self._append_metric_history(self.ofi_level_histories[level], ts_ms, value, keep_ms=10_000)
+            for window in ROLLING_OFI_WINDOWS_MS:
+                self._rolling_ofi_states[(level, window)].update(ts_ms, value)
+        for level in ROLLING_OBI_LEVELS:
+            value = obi_by_level[level]
+            self._append_metric_history(self.obi_level_histories[level], ts_ms, value, keep_ms=10_000)
+            for window in ROLLING_OBI_WINDOWS_MS:
+                self._rolling_obi_states[(level, window)].update(ts_ms, value)
         for level in ROLLING_OFI_LEVELS:
             for window in ROLLING_OFI_WINDOWS_MS:
                 rolling_ofi_sums[(level, window)] = self._rolling_ofi_states[(level, window)].sum_value()
@@ -4887,9 +4932,8 @@ class FeatureEngine:
             deep_micro_features[f"micro_l{level}_minus_mid_bps"] = deep_micro_minus_mid_bps[level]
             deep_micro_features[f"micro_l{level}_minus_mid_over_spread"] = self._safe_div(micro_l - mid, max(spread, 1e-12), 0.0)
             deep_micro_features[f"vamp_l{level}_minus_mid_bps"] = self._bps(vamp_l, mid, 0.0)
-        if etype == "ob":
-            self._append_metric_history(self.deep_micro_histories[5], ts_ms, deep_micro_minus_mid_bps.get(5, 0.0), keep_ms=10_000)
-            self._append_metric_history(self.deep_micro_histories[10], ts_ms, deep_micro_minus_mid_bps.get(10, 0.0), keep_ms=10_000)
+        self._append_metric_history(self.deep_micro_histories[5], ts_ms, deep_micro_minus_mid_bps.get(5, 0.0), keep_ms=10_000)
+        self._append_metric_history(self.deep_micro_histories[10], ts_ms, deep_micro_minus_mid_bps.get(10, 0.0), keep_ms=10_000)
         for window in (200, 1_000):
             points = self._metric_values(self.deep_micro_histories[5], ts_ms, window)
             xs = [(t - ts_ms) / 1000.0 for t, _ in points]
@@ -5363,24 +5407,14 @@ class FeatureEngine:
         self._last_any_event_ts = int(ts_ms)
 
         self.ob_feature_build_count += 1
-        event_type = "trade" if is_trade else "ob"
-        if is_trade:
-            self.trade_full_feature_state_update_count += 1
-            return FeatureEventResult(
-                ts_ms=int(ts_ms),
-                features=self._trade_fast_path_empty_feature,
-                dt_ms=float(any_event_dt_ms),
-                is_decision=False,
-                raw_mid=float(mid),
-                event_type=event_type,
-            )
+
         return FeatureEventResult(
             ts_ms=int(ts_ms),
             features=feat_z,
             dt_ms=float(any_event_dt_ms),
             is_decision=True,
             raw_mid=float(mid),
-            event_type=event_type,
+            event_type="ob",
         )
 
     def _update_book_from_ob(
@@ -5813,9 +5847,9 @@ class FeatureEngine:
         """Fast ingest path for compact tuples.
 
         Returns FeatureEventResult with named fields: ts_ms, features, dt_ms,
-        is_decision, raw_mid, and event_type. Trade rows update state but are
-        not decision rows, so they return an empty feature vector with
-        is_decision=False.
+        is_decision, raw_mid, and event_type. Trade rows update trade/flow
+        state and event-density state only. They do not build features and do
+        not update OB-clock feature state. OB rows are the only decision rows.
         """
         if not isinstance(e, tuple) or len(e) < 4 or not isinstance(e[0], str):
             raise ValueError(f"Expected compact ingest tuple, got: {e!r}")
