@@ -476,9 +476,7 @@ def test_trade_does_not_pollute_ob_feature_state() -> None:
     assert ob0.event_type == "ob"
     assert ob0.features.shape[0] > 0
 
-    z_mean_before = None if fe.z_mean is None else fe.z_mean.copy()
-    z_m2_before = None if fe.z_m2 is None else fe.z_m2.copy()
-    last_z_ts_before = fe._last_z_ts_ms
+    transform_rows_before = fe.transform_diagnostics_summary()["rows_seen"]
     mid_hist_len_before = len(fe._mid_history)
     micro_hist_len_before = len(fe._micro_history)
     ob_snapshots_len_before = len(fe._ob_snapshots)
@@ -519,17 +517,7 @@ def test_trade_does_not_pollute_ob_feature_state() -> None:
     assert dict(fe.prev_cum_bid_by_level) == prev_cum_bid_before
     assert dict(fe.prev_cum_ask_by_level) == prev_cum_ask_before
 
-    if z_mean_before is None:
-        assert fe.z_mean is None
-    else:
-        assert np.array_equal(fe.z_mean, z_mean_before)
-
-    if z_m2_before is None:
-        assert fe.z_m2 is None
-    else:
-        assert np.array_equal(fe.z_m2, z_m2_before)
-
-    assert fe._last_z_ts_ms == last_z_ts_before
+    assert fe.transform_diagnostics_summary()["rows_seen"] == transform_rows_before
 
     ob1 = fe.on_fast_event(delta_ob(1_700_000_000_100))
     assert ob1.event_type == "ob"
@@ -548,7 +536,9 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     raw_names = list(fe.feature_names())
     forbidden = "p" + "ca"
     assert len(raw_names) > 0
-    assert CMSSL17.FEATURE_TRANSFORM == "raw_zscore_plus_aux_no_" + forbidden + "_v1"
+    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v4_raw_no_" + forbidden + "_pruned235_xformv2"
+    assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v2_pruned235"
+    assert CMSSL17.CHECKPOINT_SCHEMA == "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + forbidden + "-pruned235-xformv2"
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "p" + "ca250" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
@@ -776,6 +766,70 @@ def test_large_trade_and_cvd_windows_are_flow_only() -> None:
     assert 3000 not in fe.large_trade_states
     assert 3000 not in fe.cvd_window_states
 
+
+def test_transform_v2_feature_count_unchanged() -> None:
+    fe = FeatureEngine()
+    assert len(fe.feature_names()) == 235
+    r = fe.on_fast_event(deep_snapshot_ob(1_700_000_900_000, n_levels=60))
+    assert r.features.shape == (235,)
+
+
+def test_every_feature_has_exactly_one_transform_spec() -> None:
+    from CMSSL17 import build_feature_transform_specs
+    fe = FeatureEngine()
+    specs = build_feature_transform_specs(fe.feature_names())
+    assert len(specs) == 235
+    assert [s.name for s in specs] == list(fe.feature_names())
+
+
+def test_old_zscore_path_removed() -> None:
+    from pathlib import Path
+    text = Path("CMSSL17.py").read_text()
+    forbidden = ["def _zscore", "_feature_z_half_life_ms", "_ensure_zscore_metadata", "z_mean", "z_m2", "_last_z_ts_ms"]
+    for token in forbidden:
+        assert token not in text, token
+
+
+def test_ewma_transform_scores_before_update() -> None:
+    from CMSSL17 import FeatureTransformEngine
+    names = ["trade_count_200ms"]
+    eng = FeatureTransformEngine(names)
+    for _ in range(60):
+        eng.apply(np.asarray([0.0], dtype=np.float32), 100.0)
+    y_jump = eng.apply(np.asarray([100.0], dtype=np.float32), 100.0)
+    assert y_jump[0] > 1.0
+
+
+def test_bounded_features_are_not_ewma_z() -> None:
+    from CMSSL17 import build_feature_transform_specs, NormalizeKind
+    fe = FeatureEngine()
+    specs = {s.name: s for s in build_feature_transform_specs(fe.feature_names())}
+    for name in ["obi_l1", "obi_l10", "depth_imbalance_within_10bps", "trade_imbalance_notional_1000ms", "spread_z_1000ms"]:
+        assert specs[name].normalize == NormalizeKind.NONE
+
+
+def test_heavy_tailed_features_use_log_ewma() -> None:
+    from CMSSL17 import build_feature_transform_specs, RawTransformKind, NormalizeKind
+    fe = FeatureEngine()
+    specs = {s.name: s for s in build_feature_transform_specs(fe.feature_names())}
+    assert specs["signed_notional_flow_usd_1000ms"].raw_transform == RawTransformKind.SIGNED_LOG1P
+    assert specs["signed_notional_flow_usd_1000ms"].normalize == NormalizeKind.EWMA_Z
+    assert specs["top5_trade_notional_sum_usd_1000ms"].raw_transform == RawTransformKind.LOG1P_POS
+    assert specs["top5_trade_notional_sum_usd_1000ms"].normalize == NormalizeKind.EWMA_Z
+
+
+def test_transform_diagnostics_summary_has_required_fields() -> None:
+    fe = FeatureEngine()
+    for i in range(80):
+        fe.on_fast_event(deep_snapshot_ob(1_701_000_000_000 + i * 100, n_levels=60) if i == 0 else delta_ob(1_701_000_000_000 + i * 100))
+    diag = fe.transform_diagnostics_summary()
+    assert diag["version"] == "feature_transform_diag_v1"
+    assert diag["feature_count"] == 235
+    assert "clip_summary" in diag
+    assert "half_life_summary" in diag
+    assert "feature_rows" in diag
+    assert len(diag["feature_rows"]) == 235
+
 def main() -> None:
     fe = FeatureEngine()
 
@@ -834,6 +888,13 @@ def main() -> None:
     test_hot_path_pruned_feature_count_still_unchanged()
     test_removed_hot_path_scaffolding_strings_absent()
     test_large_trade_and_cvd_windows_are_flow_only()
+    test_transform_v2_feature_count_unchanged()
+    test_every_feature_has_exactly_one_transform_spec()
+    test_old_zscore_path_removed()
+    test_ewma_transform_scores_before_update()
+    test_bounded_features_are_not_ewma_z()
+    test_heavy_tailed_features_use_log_ewma()
+    test_transform_diagnostics_summary_has_required_fields()
 
 
 if __name__ == "__main__":
