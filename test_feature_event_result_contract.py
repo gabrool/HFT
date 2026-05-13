@@ -100,11 +100,6 @@ def _install_optional_dependency_stubs() -> None:
     einops_mod.repeat = lambda x, *args, **kwargs: x
     sys.modules.setdefault("einops", einops_mod)
 
-    sklearn_mod = types.ModuleType("sklearn")
-    decomposition_mod = types.ModuleType("sklearn.decomposition")
-    decomposition_mod.PCA = type("PCA", (_Module,), {})
-    sys.modules.setdefault("sklearn", sklearn_mod)
-    sys.modules.setdefault("sklearn.decomposition", decomposition_mod)
 
     hub_mod = types.ModuleType("huggingface_hub")
     hub_mod.PyTorchModelHubMixin = type("PyTorchModelHubMixin", (), {})
@@ -458,6 +453,31 @@ def test_trade_does_not_pollute_ob_feature_state() -> None:
     assert fe._last_any_event_ts == 1_700_000_000_100
     assert len(fe._mid_history) == mid_hist_len_before + 1
 
+
+def test_feature_transform_contract_is_raw_no_projection() -> None:
+    import CMSSL17
+
+    fe = FeatureEngine()
+    raw_names = list(fe.feature_names())
+    forbidden = "p" + "ca"
+    assert len(raw_names) > 0
+    assert CMSSL17.FEATURE_TRANSFORM == "raw_zscore_plus_aux_no_" + forbidden + "_v1"
+    assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
+    assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
+    assert "p" + "ca250" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
+    assert "final256" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
+
+
+def test_offline_ingest_raw_feature_dims() -> None:
+    import CMSSL17
+    import offline_ingest
+
+    raw_names = list(FeatureEngine().feature_names())
+    assert offline_ingest.RAW_FEATURE_DIM_CORE == len(raw_names)
+    assert offline_ingest.RAW_FEATURE_DIM_TOTAL == len(raw_names) + CMSSL17.AUX_DIM
+    assert offline_ingest.RAW_FEATURE_NAMES == raw_names
+    assert offline_ingest.FEATURE_TRANSFORM == CMSSL17.FEATURE_TRANSFORM
+
 def main() -> None:
     fe = FeatureEngine()
 
@@ -503,6 +523,8 @@ def main() -> None:
     test_malformed_delta_levels_are_ignored_but_valid_updates_apply()
     test_compact_ob_type_code_does_not_default_to_delta()
     test_generic_dict_ob_type_parsing_is_explicit()
+    test_feature_transform_contract_is_raw_no_projection()
+    test_offline_ingest_raw_feature_dims()
 
 
 if __name__ == "__main__":
