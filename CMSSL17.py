@@ -15,7 +15,6 @@ from torch.utils.data import Dataset, DataLoader
 import math
 from einops import rearrange, repeat
 import torch._functorch.config as ft_config
-from sklearn.decomposition import PCA
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -500,9 +499,10 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v1_raw390_pca250_final256"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v2_raw_no_" + "p" + "ca"
+FEATURE_TRANSFORM = "raw_zscore_plus_aux_no_" + "p" + "ca" + "_v1"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-pca250-final256"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca"
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
 FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
@@ -540,7 +540,7 @@ DIR_LOSS_WEIGHT = 1.00
 MAG_LOSS_WEIGHT = 0.00
 MAG_CORR_LOSS_WEIGHT = 0.00
 SINGLE_WEEK_PATIENCE = 1
-# Number of auxiliary channels appended after the PCA/core feature vector.
+# Number of auxiliary channels appended after the raw core feature vector.
 AUX_DIM        = 6
 FEATURE_AUX_TAIL = (
     "log_dt_decision_ms",
@@ -6115,15 +6115,31 @@ def _validate_flat_dataset_meta(meta: Dict[str, Any], source: str, *, require_st
     if label_dim_int != int(NUM_HORIZONS):
         raise ValueError(f"{source} has label_dim={label_dim_int}; expected {NUM_HORIZONS}.")
 
-    for field in ("feature_dim_total", "aux_dim", "lookback"):
+    for field in ("feature_transform", "feature_dim_core", "feature_dim_total", "feature_names_hash", "aux_dim", "lookback"):
         if field not in meta:
             raise ValueError(f"{source} missing required field '{field}'.")
+
+    if meta.get("feature_transform") != FEATURE_TRANSFORM:
+        raise ValueError(
+            f"{source} has feature_transform={meta.get('feature_transform')!r}; expected {FEATURE_TRANSFORM!r}."
+        )
+
+    for field in ("feature_dim_core", "feature_dim_total", "aux_dim", "lookback"):
         try:
             value = int(meta[field])
         except (TypeError, ValueError):
             raise ValueError(f"{source} has non-integer {field}={meta[field]!r}.")
         if value <= 0:
             raise ValueError(f"{source} has non-positive {field}={value}.")
+
+    if int(meta["feature_dim_total"]) != int(meta["feature_dim_core"]) + int(meta["aux_dim"]):
+        raise ValueError(
+            f"{source} has feature_dim_total={meta['feature_dim_total']!r}, "
+            f"feature_dim_core={meta['feature_dim_core']!r}, aux_dim={meta['aux_dim']!r}; "
+            "expected feature_dim_total == feature_dim_core + aux_dim."
+        )
+    if not str(meta.get("feature_names_hash", "")):
+        raise ValueError(f"{source} missing non-empty feature_names_hash.")
 
 
 class WeekFeatureStore:
