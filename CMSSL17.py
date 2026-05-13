@@ -646,6 +646,25 @@ EMA_DECAY       = 0.99
 
 
 # ---------------------------  Building blocks  ----------------------------
+
+@dataclass(frozen=True)
+class FeatureEventResult:
+    ts_ms: int
+    features: np.ndarray
+    dt_ms: float
+    is_decision: bool
+    raw_mid: float
+    event_type: str
+
+    def __post_init__(self) -> None:
+        if self.event_type not in {"ob", "trade"}:
+            raise ValueError(f"event_type must be 'ob' or 'trade', got {self.event_type!r}")
+        if self.is_decision != (self.event_type == "ob"):
+            raise ValueError(
+                f"is_decision must be True exactly for OB events; "
+                f"got event_type={self.event_type!r}, is_decision={self.is_decision!r}"
+            )
+
 @dataclass
 class ModelArgs:
     d_model: int
@@ -4509,7 +4528,7 @@ class FeatureEngine:
         etype: str,
         ts_ms: int,
         payload: Any,
-    ) -> Tuple[int, np.ndarray, float, bool, float]:
+    ) -> FeatureEventResult:
         any_event_dt_ms = (
             1.0
             if self._last_any_event_ts is None
@@ -5344,10 +5363,25 @@ class FeatureEngine:
         self._last_any_event_ts = int(ts_ms)
 
         self.ob_feature_build_count += 1
+        event_type = "trade" if is_trade else "ob"
         if is_trade:
             self.trade_full_feature_state_update_count += 1
-            return ts_ms, self._trade_fast_path_empty_feature, mid, True, any_event_dt_ms
-        return ts_ms, feat_z, mid, False, any_event_dt_ms
+            return FeatureEventResult(
+                ts_ms=int(ts_ms),
+                features=self._trade_fast_path_empty_feature,
+                dt_ms=float(any_event_dt_ms),
+                is_decision=False,
+                raw_mid=float(mid),
+                event_type=event_type,
+            )
+        return FeatureEventResult(
+            ts_ms=int(ts_ms),
+            features=feat_z,
+            dt_ms=float(any_event_dt_ms),
+            is_decision=True,
+            raw_mid=float(mid),
+            event_type=event_type,
+        )
 
     def _update_book_from_ob(
         self,
@@ -5775,12 +5809,13 @@ class FeatureEngine:
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
-    def on_fast_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
-        """Fast ingest path returning decision-row semantics for compact tuples.
+    def on_fast_event(self, e: Any) -> FeatureEventResult:
+        """Fast ingest path for compact tuples.
 
-        Returns (ts_ms, feature_vector, dt_ms, is_decision, raw_mid). Trade rows
-        update state but are not decision rows, so they return an empty feature
-        vector with is_decision=False.
+        Returns FeatureEventResult with named fields: ts_ms, features, dt_ms,
+        is_decision, raw_mid, and event_type. Trade rows update state but are
+        not decision rows, so they return an empty feature vector with
+        is_decision=False.
         """
         if not isinstance(e, tuple) or len(e) < 4 or not isinstance(e[0], str):
             raise ValueError(f"Expected compact ingest tuple, got: {e!r}")
@@ -5792,11 +5827,10 @@ class FeatureEngine:
             payload = e[3:8]
         else:
             raise ValueError(f"Unsupported compact event type: {etype!r}")
-        parsed_ts_ms, feat_z, raw_mid, is_trade, dt_ms = self._dispatch_parsed_event(etype, ts_ms, payload)
-        return parsed_ts_ms, feat_z, dt_ms, (not is_trade), raw_mid
+        return self._dispatch_parsed_event(etype, ts_ms, payload)
 
-    def on_event(self, e: Any) -> Tuple[int, np.ndarray, float, bool, float]:
-        """Slow compatibility path for callers that still pass generic event shapes."""
+    def on_event(self, e: Any) -> FeatureEventResult:
+        """Slow path returning FeatureEventResult for generic event shapes."""
         etype, ts_ms, payload = self._parse_event(e)
 
         if etype == 'ob':
