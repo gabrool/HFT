@@ -2,6 +2,7 @@
 
 import sys
 import types
+from collections import deque
 
 import numpy as np
 
@@ -134,7 +135,7 @@ def _install_optional_dependency_stubs() -> None:
 
 _install_optional_dependency_stubs()
 
-from CMSSL17 import FeatureEngine, FeatureEventResult
+from CMSSL17 import FeatureEngine, FeatureEventResult, LabelBuilder
 
 
 def assert_not_tuple_unpackable(result: FeatureEventResult) -> None:
@@ -240,6 +241,92 @@ def trade(ts: int):
         0,
         0,
     )
+
+
+
+def test_merge_event_time_trade_wins_exact_timestamp_tie() -> None:
+    import offline_ingest
+
+    ob_events = iter([
+        ("ob", 1000, 1, 1, ((100.0, 1.0),), ((101.0, 1.0),)),
+    ])
+    tr_events = iter([
+        ("trade", 1000, 10, 100.5, 0.1, 1, 0, 0),
+    ])
+
+    merged = list(offline_ingest.merge_event_time(ob_events, tr_events, dq_day=None, strict=True))
+    assert [e[0] for e in merged] == ["trade", "ob"]
+    assert [e[1] for e in merged] == [1000, 1000]
+
+
+def test_merge_event_time_lower_timestamp_still_wins() -> None:
+    import offline_ingest
+
+    ob_events = iter([("ob", 1000, 1, 1, ((100.0, 1.0),), ((101.0, 1.0),))])
+    tr_events = iter([("trade", 999, 10, 100.5, 0.1, 1, 0, 0)])
+    merged = list(offline_ingest.merge_event_time(ob_events, tr_events, dq_day=None, strict=True))
+    assert [e[0] for e in merged] == ["trade", "ob"]
+    assert [e[1] for e in merged] == [999, 1000]
+
+
+def test_merge_event_time_ob_lower_timestamp_still_wins() -> None:
+    import offline_ingest
+
+    ob_events = iter([("ob", 999, 1, 1, ((100.0, 1.0),), ((101.0, 1.0),))])
+    tr_events = iter([("trade", 1000, 10, 100.5, 0.1, 1, 0, 0)])
+    merged = list(offline_ingest.merge_event_time(ob_events, tr_events, dq_day=None, strict=True))
+    assert [e[0] for e in merged] == ["ob", "trade"]
+    assert [e[1] for e in merged] == [999, 1000]
+
+
+def process_decision_results_for_test(results):
+    pending = deque()
+    labeler = LabelBuilder(delta_ms=0, horizons_ms=[200, 500, 1000])
+    rows = []
+    last_decision_ts = None
+
+    for result in results:
+        if not result.is_decision:
+            continue
+
+        ts = int(result.ts_ms)
+        if last_decision_ts is not None and ts < last_decision_ts:
+            raise RuntimeError("non-monotone")
+
+        row_idx = len(rows)
+        rows.append((ts, result.raw_mid))
+        pending.append(("week", row_idx, ts))
+        labeler.on_decision(ts)
+
+        matured = labeler.on_event(ts, float(result.raw_mid))
+        for _yy in matured:
+            pending.popleft()
+
+        last_decision_ts = ts
+
+    return rows, pending, labeler
+
+
+def test_duplicate_ob_timestamps_append_distinct_rows() -> None:
+    fe = FeatureEngine()
+    r0 = fe.on_fast_event(deep_snapshot_ob(1000, n_levels=60))
+    r1 = fe.on_fast_event(("ob", 1000, 2, 2, ((100.0, 2.5),), ((101.0, 2.5),)))
+
+    rows, pending, labeler = process_decision_results_for_test([r0, r1])
+
+    assert len(rows) == 2
+    assert rows[0][0] == 1000
+    assert rows[1][0] == 1000
+    assert len(pending) == 2
+    assert len(labeler.wait_delta) == 0
+    assert len(labeler.wait_mature) == 2
+
+
+def test_offline_ingest_no_overwrite_duplicate_timestamp_api() -> None:
+    from pathlib import Path
+
+    text = Path("offline_ingest.py").read_text()
+    assert "overwrite_latest_feature_row" not in text
 
 
 def test_snapshot_stores_full_book_but_features_use_top_depth() -> None:
@@ -525,6 +612,11 @@ def main() -> None:
     test_generic_dict_ob_type_parsing_is_explicit()
     test_feature_transform_contract_is_raw_no_projection()
     test_offline_ingest_raw_feature_dims()
+    test_merge_event_time_trade_wins_exact_timestamp_tie()
+    test_merge_event_time_lower_timestamp_still_wins()
+    test_merge_event_time_ob_lower_timestamp_still_wins()
+    test_duplicate_ob_timestamps_append_distinct_rows()
+    test_offline_ingest_no_overwrite_duplicate_timestamp_api()
 
 
 if __name__ == "__main__":

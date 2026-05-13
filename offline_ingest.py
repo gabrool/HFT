@@ -174,7 +174,7 @@ def _env_bool_int(name: str, default: int = 0) -> int:
 BYBIT_DAY_CLIP = int(os.environ.get("BYBIT_DAY_CLIP", "1"))
 BYBIT_TS_BACKSTEP_CLAMP_MS = int(os.environ.get("BYBIT_TS_BACKSTEP_CLAMP_MS", "5000"))
 BYBIT_STRICT_DATA = _env_bool_int("BYBIT_STRICT_DATA", 0)
-ALLOW_DUPLICATE_OB_TS = _env_bool_int("BYBIT_ALLOW_DUPLICATE_OB_TS", 0)
+ALLOW_DUPLICATE_OB_TS = _env_bool_int("BYBIT_ALLOW_DUPLICATE_OB_TS", 1)
 USE_TRADES = _env_bool_int("BYBIT_USE_TRADES", 1)
 APPEND_MISSING_WEEKS = _env_bool_int("BYBIT_APPEND_MISSING_WEEKS", 0)
 BYBIT_BAD_EXAMPLES_N = int(os.environ.get("BYBIT_BAD_EXAMPLES_N", "25"))
@@ -197,6 +197,7 @@ def quality_env_config() -> Dict[str, object]:
         "day_clip": int(BYBIT_DAY_CLIP),
         "ts_backstep_clamp_ms": int(BYBIT_TS_BACKSTEP_CLAMP_MS),
         "strict_data": int(BYBIT_STRICT_DATA),
+        "allow_duplicate_ob_ts": int(ALLOW_DUPLICATE_OB_TS),
         "bad_examples_n": int(BYBIT_BAD_EXAMPLES_N),
         "bad_frac_abort": float(BYBIT_BAD_FRAC_ABORT),
         "bad_abs_abort": int(BYBIT_BAD_ABS_ABORT),
@@ -385,14 +386,18 @@ def merge_event_time(ob_iter, tr_iter, dq_day: Optional[DayQuality] = None, stri
     while ob_item or tr_item:
         ob_ts = ob_item[1] if ob_item is not None else None
         tr_ts = tr_item[1] if tr_item is not None else None
-        if ob_item is not None and (tr_item is None or ob_ts <= tr_ts):
-            event = ob_item
-            ob_item = next(ob_iter, None)
-        else:
-            # OB wins exact timestamp ties so decision-time book state updates
-            # before same-ms trade-derived features are consumed.
+        if dq_day is not None and ob_item is not None and tr_item is not None and int(ob_ts) == int(tr_ts):
+            dq_day.increment_counter("merge", "same_ms_trade_ob_tie_trade_first")
+
+        # Trade wins exact timestamp ties. Bybit timestamps are millisecond-resolution,
+        # so same-ms trades and OB deltas may be causally related; process the trade
+        # first so trade/flow state is visible to the subsequent same-ms OB decision row.
+        if tr_item is not None and (ob_item is None or tr_ts <= ob_ts):
             event = tr_item
             tr_item = next(tr_iter, None)
+        else:
+            event = ob_item
+            ob_item = next(ob_iter, None)
         etype = event[0]
         ts = int(event[1])
         if ts + B < last_ts:
@@ -1177,19 +1182,6 @@ class FlatFeatureWriter:
         self.i += 1
         return int(row_idx)
 
-    def overwrite_latest_row(self, ts_decision_ms: int, features: np.ndarray) -> int:
-        if self.i <= 0:
-            raise RuntimeError("Cannot overwrite latest feature row in an empty open chunk")
-        row = np.asarray(features, dtype=np.float32, copy=False)
-        if row.shape != (self.final_feature_dim,):
-            raise ValueError(f"Feature dim mismatch: {row.shape} != {(self.final_feature_dim,)}")
-        if not np.all(np.isfinite(row)):
-            raise ValueError("Non-finite input features")
-        idx = self.i - 1
-        self.features[idx] = row
-        self.ts[idx] = int(ts_decision_ms)
-        return int(self.rows_total + idx)
-
     def _build_flush_job(self) -> Optional[FeatureFlushJob]:
         if self.i == 0:
             return None
@@ -1459,19 +1451,6 @@ class FlatWeekRouter:
         writer = self._ensure_feature_writer(wk)
         row_idx = writer.append_row(int(ts_decision_ms), features)
         self.week_rows_total[wk] = max(self.week_rows_total[wk], int(row_idx) + 1)
-        if wk not in self.week_decision_span:
-            self.week_decision_span[wk] = [int(ts_decision_ms), int(ts_decision_ms)]
-        else:
-            span = self.week_decision_span[wk]
-            span[0] = min(span[0], int(ts_decision_ms))
-            span[1] = max(span[1], int(ts_decision_ms))
-        return wk, int(row_idx)
-
-    def overwrite_latest_feature_row(self, ts_decision_ms: int, features: np.ndarray) -> Tuple[str, int]:
-        self._check_writer_exception()
-        wk = self._find_week_key(ts_decision_ms)
-        writer = self._ensure_feature_writer(wk)
-        row_idx = writer.overwrite_latest_row(int(ts_decision_ms), features)
         if wk not in self.week_decision_span:
             self.week_decision_span[wk] = [int(ts_decision_ms), int(ts_decision_ms)]
         else:
@@ -2141,6 +2120,7 @@ def build_global_meta_from_week_metas(
     ingest_stage: str,
     router: Optional[FlatWeekRouter],
     week_quality_records: Dict[str, dict],
+    duplicate_decision_ts_count: int = 0,
 ) -> dict:
     ds_start, ds_end = _compute_dataset_span(pairs)
     start_iso = ds_start.date().isoformat() if ds_start else None
@@ -2192,6 +2172,8 @@ def build_global_meta_from_week_metas(
         "horizons_ms": [int(h) for h in HORIZONS_MS],
         "total_feature_rows": total_feature_rows,
         "total_labels": total_labels,
+        "duplicate_decision_ts_count": int(duplicate_decision_ts_count),
+        "allow_duplicate_ob_ts": int(ALLOW_DUPLICATE_OB_TS),
         "week_row_counts": week_row_counts,
         "week_label_counts": week_label_counts,
         "weeks_meta": weeks_meta_paths,
@@ -2319,6 +2301,7 @@ def process_all(
     router: Optional[FlatWeekRouter] = None
     total_feature_rows = 0
     total_labels = 0
+    duplicate_decision_ts_count = 0
     week_index = _build_week_index(pairs_to_build)
 
     existing_global_protocol = None
@@ -2404,17 +2387,33 @@ def process_all(
                     f"expected {int(RAW_FEATURE_DIM_CORE)}"
                 )
 
-            is_duplicate_decision_ts = (last_decision_ts_ms is not None and int(ts_ms) == last_decision_ts_ms)
-            if last_decision_ts_ms is not None and int(ts_ms) < last_decision_ts_ms:
+            decision_ts = int(result.ts_ms)
+
+            is_duplicate_decision_ts = (
+                last_decision_ts_ms is not None and decision_ts == int(last_decision_ts_ms)
+            )
+
+            if last_decision_ts_ms is not None and decision_ts < int(last_decision_ts_ms):
                 raise RuntimeError(
-                    f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} < last_decision_ts_ms={last_decision_ts_ms}"
-                )
-            if is_duplicate_decision_ts and not ALLOW_DUPLICATE_OB_TS:
-                raise RuntimeError(
-                    f"Non-monotone decision timestamp: decision_ts_ms={int(ts_ms)} <= last_decision_ts_ms={last_decision_ts_ms}"
+                    f"Non-monotone decision timestamp: decision_ts_ms={decision_ts} "
+                    f"< last_decision_ts_ms={last_decision_ts_ms}"
                 )
 
-            dt_tick = 1 if last_decision_ts_ms is None else int(ts_ms - last_decision_ts_ms)
+            if is_duplicate_decision_ts and not ALLOW_DUPLICATE_OB_TS:
+                raise RuntimeError(
+                    f"Duplicate decision timestamp not allowed: decision_ts_ms={decision_ts} "
+                    f"== last_decision_ts_ms={last_decision_ts_ms}"
+                )
+
+            if is_duplicate_decision_ts:
+                duplicate_decision_ts_count += 1
+                week_quality = feeder.quality_by_week.get(wk)
+                if week_quality is not None:
+                    totals = week_quality.setdefault("totals", {})
+                    ob_totals = totals.setdefault("ob", {})
+                    ob_totals["duplicate_decision_ts"] = int(ob_totals.get("duplicate_decision_ts", 0) + 1)
+
+            dt_tick = 1 if last_decision_ts_ms is None else int(decision_ts - last_decision_ts_ms)
             aux_tail = build_aux_tail(fe, dt_tick)
             if int(aux_tail.shape[0]) != int(AUX_DIM):
                 raise ValueError(f"Aux dim mismatch: got {int(aux_tail.shape[0])}, expected {int(AUX_DIM)}")
@@ -2439,23 +2438,14 @@ def process_all(
             if router is None:
                 raise RuntimeError("Router not initialised")
 
-            if is_duplicate_decision_ts:
-                if not pending_decisions:
-                    raise RuntimeError("Duplicate OB timestamp cannot update state because no pending decision exists")
-                prev_week_key, _prev_row_idx, _prev_ts = pending_decisions[-1]
-                week_key, row_idx = router.overwrite_latest_feature_row(int(ts_ms), row_features)
-                if week_key != prev_week_key:
-                    raise RuntimeError("Duplicate timestamp mapped to a different week during overwrite")
-                pending_decisions[-1] = (week_key, row_idx, int(ts_ms))
-            else:
-                week_key, row_idx = router.append_feature_row(int(ts_ms), row_features)
-                pending_decisions.append((week_key, row_idx, int(ts_ms)))
-                labeler.on_decision(int(ts_ms))
-                total_feature_rows += 1
-            built_week_last_decision_ts[week_key] = int(ts_ms)
+            week_key, row_idx = router.append_feature_row(decision_ts, row_features)
+            pending_decisions.append((week_key, row_idx, decision_ts))
+            labeler.on_decision(decision_ts)
+            total_feature_rows += 1
+            built_week_last_decision_ts[week_key] = decision_ts
 
-            matured = labeler.on_event(int(result.ts_ms), float(result.raw_mid))
-            last_decision_ts_ms = int(ts_ms)
+            matured = labeler.on_event(decision_ts, float(result.raw_mid))
+            last_decision_ts_ms = decision_ts
 
             if matured is None:
                 raise RuntimeError("Matured labels were not produced for OB event")
@@ -2599,6 +2589,7 @@ def process_all(
         ingest_stage=ingest_stage,
         router=router,
         week_quality_records=week_quality_records,
+        duplicate_decision_ts_count=duplicate_decision_ts_count,
     )
     if week_meta_records:
         expected_mode = canonical_mode_fields()
