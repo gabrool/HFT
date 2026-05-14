@@ -536,9 +536,9 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     raw_names = list(fe.feature_names())
     forbidden = "p" + "ca"
     assert len(raw_names) > 0
-    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v6_raw_no_" + forbidden + "_pruned239_xformv2"
+    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v7_raw_no_" + forbidden + "_pruned239_xformv2"
     assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v2_pruned235"
-    assert CMSSL17.CHECKPOINT_SCHEMA == "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + forbidden + "-pruned239-xformv2"
+    assert CMSSL17.CHECKPOINT_SCHEMA == "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + forbidden + "-pruned239-xformv2-volimb"
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "p" + "ca250" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
@@ -641,6 +641,9 @@ def test_pruned_feature_schema_contract() -> None:
         "spread_time_above_1bp_frac_500ms",
         "spread_time_above_1bp_frac_1000ms",
         "spread_time_above_1bp_frac_3000ms",
+        "down_up_vol_ratio_500ms",
+        "down_up_vol_ratio_1000ms",
+        "down_up_vol_ratio_3000ms",
     }
 
     for name in removed:
@@ -681,6 +684,9 @@ def test_pruned_feature_schema_contract() -> None:
         "absorption_ask_1000ms",
         "return_std_bps_1000ms",
         "regime_realized_vol_bps_1000ms",
+        "down_up_vol_imbalance_500ms",
+        "down_up_vol_imbalance_1000ms",
+        "down_up_vol_imbalance_3000ms",
         "spread_z_1000ms",
         "depth_imbalance_5bps_slope_1000ms",
         "ofi_l1_pressure_ewma_1000ms",
@@ -826,22 +832,61 @@ def test_heavy_tailed_features_use_log_ewma() -> None:
 
 
 
-def test_down_up_vol_ratio_uses_log_ratio_transform() -> None:
+def test_down_up_vol_imbalance_is_bounded_identity_transform() -> None:
     from CMSSL17 import build_feature_transform_specs, RawTransformKind, NormalizeKind
 
     fe = FeatureEngine()
     specs = {s.name: s for s in build_feature_transform_specs(fe.feature_names())}
+    names = set(fe.feature_names())
 
-    for name in [
+    for old_name in [
         "down_up_vol_ratio_500ms",
         "down_up_vol_ratio_1000ms",
         "down_up_vol_ratio_3000ms",
     ]:
+        assert old_name not in names
+
+    for name in [
+        "down_up_vol_imbalance_500ms",
+        "down_up_vol_imbalance_1000ms",
+        "down_up_vol_imbalance_3000ms",
+    ]:
+        assert name in names
         s = specs[name]
-        assert s.raw_transform == RawTransformKind.LOG_RATIO_POS
+        assert s.raw_transform == RawTransformKind.IDENTITY
         assert s.normalize == NormalizeKind.NONE
         assert s.half_life_ms == 0
-        assert s.output_clip_abs == 5.0
+        assert s.scale == 1.0
+        assert s.input_clip_abs == 0.0
+        assert s.output_clip_abs == 1.0
+
+
+def test_down_up_vol_imbalance_values_are_bounded() -> None:
+    fe = FeatureEngine()
+
+    # Initialize book.
+    fe.on_fast_event(deep_snapshot_ob(1_703_000_000_000, n_levels=60))
+
+    result = None
+    # Feed alternating OB updates to create some return variation.
+    for i in range(1, 120):
+        ts = 1_703_000_000_000 + i * 100
+        bid = 100.0 + (0.05 if i % 3 == 0 else -0.02 if i % 5 == 0 else 0.0)
+        ask = 101.0 + (0.05 if i % 3 == 0 else -0.02 if i % 5 == 0 else 0.0)
+        result = fe.on_fast_event(("ob", ts, i + 1, 2, ((bid, 2.0),), ((ask, 2.0),)))
+
+    assert result is not None
+    names = list(fe.feature_names())
+    vals = dict(zip(names, result.features.tolist()))
+
+    for name in [
+        "down_up_vol_imbalance_500ms",
+        "down_up_vol_imbalance_1000ms",
+        "down_up_vol_imbalance_3000ms",
+    ]:
+        assert name in vals
+        assert np.isfinite(vals[name])
+        assert -1.0 <= vals[name] <= 1.0
 
 
 def test_time_since_features_clip_at_12() -> None:
@@ -1159,7 +1204,8 @@ def main() -> None:
     test_old_zscore_path_removed()
     test_ewma_transform_scores_before_update()
     test_bounded_features_are_not_ewma_z()
-    test_down_up_vol_ratio_uses_log_ratio_transform()
+    test_down_up_vol_imbalance_is_bounded_identity_transform()
+    test_down_up_vol_imbalance_values_are_bounded()
     test_time_since_features_clip_at_12()
     test_notional_context_uses_scaled_log_no_ewma()
     test_transform_diagnostics_actionable_summary_exists()
