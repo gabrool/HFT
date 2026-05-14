@@ -500,14 +500,14 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v6_raw_no_" + "p" + "ca" + "_pruned239_xformv2"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v7_raw_no_" + "p" + "ca" + "_pruned239_xformv2"
 FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned235"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
 FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned235"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned239-xformv2"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned239-xformv2-volimb"
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
 FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
@@ -2292,8 +2292,7 @@ class RawTransformKind(IntEnum):
     FIXED_SCALE = 3
     TANH_SCALE = 4
     LOG1P_MS = 5
-    LOG_RATIO_POS = 6
-    LOG1P_POS_SCALE = 7
+    LOG1P_POS_SCALE = 6
 
 
 class NormalizeKind(IntEnum):
@@ -2335,7 +2334,6 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
     def bps_tanh(name, scale=2.0, out=1.5): return spec(name, RawTransformKind.TANH_SCALE, NormalizeKind.NONE, scale=scale, out=out)
     def log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.LOG1P_POS, NormalizeKind.EWMA_Z, hl=hl, out=out)
     def log_no_norm(name, out=20.0): return spec(name, RawTransformKind.LOG1P_POS, NormalizeKind.NONE, out=out)
-    def log_ratio_pos(name, out=5.0): return spec(name, RawTransformKind.LOG_RATIO_POS, NormalizeKind.NONE, scale=1.0, out=out)
     def log_pos_scale(name, scale=10.0, out=3.0): return spec(name, RawTransformKind.LOG1P_POS_SCALE, NormalizeKind.NONE, scale=scale, out=out)
     def signed_log_ewma(name, hl, out=8.0): return spec(name, RawTransformKind.SIGNED_LOG1P, NormalizeKind.EWMA_Z, hl=hl, out=out)
     def log_ms(name, out=12.0): return spec(name, RawTransformKind.LOG1P_MS, NormalizeKind.NONE, out=out)
@@ -2347,8 +2345,16 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bounded(name, out=1.0)
         elif name in {"bid_l1_notional_usd", "ask_l1_notional_usd", "bid_depth_notional_5bps", "ask_depth_notional_5bps", "total_depth_notional_5bps"}:
             s = log_pos_scale(name, scale=10.0, out=3.0)
-        elif name.startswith("down_up_vol_ratio_"):
-            s = log_ratio_pos(name, out=5.0)
+        elif name.startswith("down_up_vol_imbalance_"):
+            s = FeatureTransformSpec(
+                name=name,
+                raw_transform=RawTransformKind.IDENTITY,
+                normalize=NormalizeKind.NONE,
+                half_life_ms=0,
+                scale=1.0,
+                input_clip_abs=0.0,
+                output_clip_abs=1.0,
+            )
         elif name.startswith("max_abs_return_bps_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
         elif name.startswith("obi_l") and ("_mean_" in name):
@@ -2542,9 +2548,6 @@ class FeatureTransformEngine:
                 tx[mask] = np.tanh(xm / self.scale[mask])
             elif kind == RawTransformKind.LOG1P_MS:
                 tx[mask] = np.log1p(np.maximum(xm, 0.0))
-            elif kind == RawTransformKind.LOG_RATIO_POS:
-                eps = 1e-6
-                tx[mask] = np.log(np.maximum(xm, eps))
             elif kind == RawTransformKind.LOG1P_POS_SCALE:
                 tx[mask] = np.log1p(np.maximum(xm, 0.0)) / self.scale[mask]
         out = tx.copy()
@@ -3056,7 +3059,7 @@ class FeatureEngine:
                 f"regime_volume_ewma_{ms}ms",
                 f"regime_realized_vol_bps_{ms}ms",
                 f"regime_flow_imbalance_{ms}ms",
-                f"down_up_vol_ratio_{ms}ms",
+                f"down_up_vol_imbalance_{ms}ms",
                 f"max_abs_return_bps_{ms}ms",
             ])
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
@@ -3211,7 +3214,7 @@ class FeatureEngine:
             return {
                 "realized_up_vol_bps": 0.0,
                 "realized_down_vol_bps": 0.0,
-                "down_up_vol_ratio": 0.0,
+                "down_up_vol_imbalance": 0.0,
                 "bipower_variation": 0.0,
                 "jump_variation": 0.0,
                 "max_abs_return_bps": 0.0,
@@ -3241,7 +3244,7 @@ class FeatureEngine:
         out = {
             "realized_up_vol_bps": up,
             "realized_down_vol_bps": down,
-            "down_up_vol_ratio": float(down / max(up, eps)),
+            "down_up_vol_imbalance": float(np.clip((down - up) / (down + up + 1e-12), -1.0, 1.0)),
             "bipower_variation": bipower,
             "jump_variation": jump_var,
             "max_abs_return_bps": max_abs,
@@ -4610,7 +4613,7 @@ class FeatureEngine:
                 regime_volume[ms],
                 regime_realized[ms],
                 regime_flow_snapshot[ms],
-                dist["down_up_vol_ratio"],
+                dist["down_up_vol_imbalance"],
                 dist["max_abs_return_bps"],
             ])
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
@@ -4939,7 +4942,7 @@ class FeatureEngine:
         return {
             "realized_up_vol_bps": float(up),
             "realized_down_vol_bps": float(down),
-            "down_up_vol_ratio": self._safe_div(down, max(up, eps), 0.0),
+            "down_up_vol_imbalance": float(np.clip(self._safe_div(down - up, down + up + 1e-12, 0.0), -1.0, 1.0)),
             "bipower_variation": float(bipower),
             "jump_variation": float(max(realized_var - bipower, 0.0)),
             "max_abs_return_bps": float(state.max_abs_q[0][2]) if state.max_abs_q else 0.0,
