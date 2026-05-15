@@ -592,6 +592,39 @@ REGIME_WINDOWS_MS = (
     3_000,
 )
 
+# v8/pruned187 retained computation scopes.
+RETURN_STD_WINDOWS_MS = (200,)
+
+# Retained large-trade outputs:
+# - 200ms: top5 only
+# - 500/1000ms: max_signed + top5
+LARGE_TRADE_TOP5_WINDOWS_MS = (200, 500, 1_000)
+LARGE_TRADE_MAX_SIGNED_WINDOWS_MS = (500, 1_000)
+
+# Retained CVD outputs:
+# - 200ms: slope + minus_ema only
+# - 500/1000ms: change + slope + minus_ema
+CVD_CHANGE_WINDOWS_MS = (500, 1_000)
+CVD_SLOPE_WINDOWS_MS = (200, 500, 1_000)
+CVD_MINUS_EMA_WINDOWS_MS = (200, 500, 1_000)
+
+# Retained replenishment/depletion outputs.
+REPLENISHMENT_KEYS_BY_WINDOW = {
+    200: (
+        ("bid", 1, "add"),
+        ("ask", 1, "add"),
+        ("bid", 1, "rem"),
+    ),
+    500: (
+        ("bid", 1, "add"),
+        ("ask", 1, "add"),
+    ),
+    1000: (
+        ("bid", 1, "add"),
+        ("ask", 1, "add"),
+    ),
+}
+
 EVENT_DENSITY_WINDOWS_MS = (
     100,
     200,
@@ -2742,13 +2775,12 @@ class FeatureEngine:
 
         # ---------- Rolling return histories ----------
         # Deques of (ts_ms, logret) to compute dispersion and variance-ratio ladders.
-        self.return_windows_ms: Tuple[int, ...] = FLOW_WINDOWS_MS
+        self.return_windows_ms: Tuple[int, ...] = RETURN_STD_WINDOWS_MS
         self.return_histories: Dict[int, RollingWindowStats] = {
-            ms: RollingWindowStats(ms) for ms in self.return_windows_ms
+            int(ms): RollingWindowStats(int(ms)) for ms in self.return_windows_ms
         }
 
         self.regime_windows_ms: Tuple[int, ...] = REGIME_WINDOWS_MS
-        self.rv_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.realized_vol: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.volume_ewma: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
         self.flow_regime: Dict[int, float] = {ms: 0.0 for ms in self.regime_windows_ms}
@@ -2819,21 +2851,21 @@ class FeatureEngine:
         self._bid_l1_depletion_sums: Dict[int, float] = {ms: 0.0 for ms in self.bestlvl_windows}
         self._ask_l1_depletion_sums: Dict[int, float] = {ms: 0.0 for ms in self.bestlvl_windows}
 
-        # ---------- Liquidity replenishment tracking (L1/L2) ----------
-        self.replen_windows_ms: Tuple[int, ...] = FAST_WINDOWS_MS
-        self._replen_keys: Tuple[Tuple[str, int, str], ...] = tuple(
-            (side, level, kind)
-            for side in ("bid", "ask")
-            for level in (1, 2)
-            for kind in ("add", "rem")
-        )
-        self.replen_deques: Dict[int, Dict[Tuple[str, int, str], Deque[Tuple[int, float]]]] = {
-            window: {key: deque() for key in self._replen_keys}
-            for window in self.replen_windows_ms
+        # ---------- Liquidity replenishment tracking (retained v8 L1 keys only) ----------
+        self._replen_keys_by_window: Dict[int, Tuple[Tuple[str, int, str], ...]] = {
+            int(window_ms): tuple(keys)
+            for window_ms, keys in REPLENISHMENT_KEYS_BY_WINDOW.items()
         }
-        self.replen_sums: Dict[int, Dict[Tuple[str, int, str], float]] = {
-            window: {key: 0.0 for key in self._replen_keys}
-            for window in self.replen_windows_ms
+        self.replen_windows_ms: Tuple[int, ...] = tuple(self._replen_keys_by_window.keys())
+        self.replen_deques: Dict[Tuple[int, Tuple[str, int, str]], Deque[Tuple[int, float]]] = {
+            (int(window_ms), key): deque()
+            for window_ms, keys in self._replen_keys_by_window.items()
+            for key in keys
+        }
+        self.replen_sums: Dict[Tuple[int, Tuple[str, int, str]], float] = {
+            (int(window_ms), key): 0.0
+            for window_ms, keys in self._replen_keys_by_window.items()
+            for key in keys
         }
 
         # ---------- Trades windows ----------
@@ -3554,31 +3586,63 @@ class FeatureEngine:
             heapq.heappush(state.max_heap, (-notion, ts_i, ss))
 
 
-    def _large_trade_stats_from_state(self, ms: int, now_ms: int) -> Dict[str, float]:
+    def _large_trade_stats_from_state(
+        self,
+        ms: int,
+        now_ms: int,
+        *,
+        need_max_signed: bool,
+        need_top5: bool,
+    ) -> Dict[str, float]:
         cutoff = int(now_ms) - int(ms)
         state = self.large_trade_states[ms]
         out: Dict[str, float] = {}
         while state.max_heap and state.max_heap[0][1] < cutoff:
             heapq.heappop(state.max_heap)
-        if state.max_heap:
-            notion = float(-state.max_heap[0][0])
-            ss = float(state.max_heap[0][2])
-            out[f"max_signed_trade_notional_usd_{ms}ms"] = ss * notion if ss != 0.0 else 0.0
-        else:
-            out[f"max_signed_trade_notional_usd_{ms}ms"] = 0.0
-        popped: List[Tuple[float, int, float]] = []
-        top_sum = 0.0
-        for _ in range(5):
-            while state.max_heap and state.max_heap[0][1] < cutoff:
-                heapq.heappop(state.max_heap)
-            if not state.max_heap:
-                break
-            item = heapq.heappop(state.max_heap)
-            popped.append(item)
-            top_sum += float(-item[0])
-        for item in popped:
-            heapq.heappush(state.max_heap, item)
-        out[f"top5_trade_notional_sum_usd_{ms}ms"] = top_sum
+        if need_max_signed:
+            if state.max_heap:
+                notion = float(-state.max_heap[0][0])
+                ss = float(state.max_heap[0][2])
+                out[f"max_signed_trade_notional_usd_{ms}ms"] = ss * notion if ss != 0.0 else 0.0
+            else:
+                out[f"max_signed_trade_notional_usd_{ms}ms"] = 0.0
+        if need_top5:
+            popped: List[Tuple[float, int, float]] = []
+            top_sum = 0.0
+            for _ in range(5):
+                while state.max_heap and state.max_heap[0][1] < cutoff:
+                    heapq.heappop(state.max_heap)
+                if not state.max_heap:
+                    break
+                item = heapq.heappop(state.max_heap)
+                popped.append(item)
+                top_sum += float(-item[0])
+            for item in popped:
+                heapq.heappush(state.max_heap, item)
+            out[f"top5_trade_notional_sum_usd_{ms}ms"] = top_sum
+        return out
+
+    def _cvd_stats_for_window(
+        self,
+        ms: int,
+        now_ms: int,
+        *,
+        need_change: bool,
+        need_slope: bool,
+        need_minus_ema: bool,
+    ) -> Dict[str, float]:
+        cvd_state = self.cvd_window_states[ms]
+        cvd_state.prune(now_ms)
+        out: Dict[str, float] = {}
+        if need_change:
+            out["cvd_change_usd"] = float(cvd_state.change_usd(now_ms, self.cvd_notional))
+        if need_slope:
+            out["cvd_slope_usd_per_sec"] = float(cvd_state.slope_usd_per_sec())
+        if need_minus_ema:
+            out["cvd_minus_ema_usd"] = float(self.cvd_notional - self._cvd_ema[ms])
+        for k, v in out.items():
+            if not math.isfinite(float(v)):
+                raise ValueError(f"Non-finite CVD stat {k}={v!r} at ts_ms={now_ms} window={ms}")
         return out
 
     def _bps_return(self, current: float, past: float) -> float:
@@ -3935,26 +3999,25 @@ class FeatureEngine:
             deq.popleft()
 
     def _prune_replen_windows(self, now_ms: int):
-        for window, key_map in self.replen_deques.items():
-            max_age = window
-            sums_map = self.replen_sums[window]
-            for key, dq in key_map.items():
-                while dq and (now_ms - dq[0][0] > max_age):
-                    _, val = dq.popleft()
-                    sums_map[key] -= val
+        for (window_ms, key), dq in self.replen_deques.items():
+            max_age = int(window_ms)
+            while dq and (now_ms - dq[0][0] > max_age):
+                _, val = dq.popleft()
+                self.replen_sums[(window_ms, key)] -= val
 
     def _record_replenishment(self, ts_ms: int, deltas: Dict[Tuple[str, int, str], float]):
         if not deltas:
             return
-        for window in self.replen_windows_ms:
-            key_map = self.replen_deques[window]
-            sums_map = self.replen_sums[window]
-            for key, value in deltas.items():
-                if value <= 0.0:
+        for key, value in deltas.items():
+            if value <= 0.0:
+                continue
+            for window_ms, keys in self._replen_keys_by_window.items():
+                if key not in keys:
                     continue
-                dq = key_map[key]
-                self._append_tuple_with_guard(dq, (ts_ms, value), ts_ms, window, is_ob_event=True)
-                sums_map[key] += value
+                state_key = (window_ms, key)
+                dq = self.replen_deques[state_key]
+                self._append_tuple_with_guard(dq, (ts_ms, value), ts_ms, window_ms, is_ob_event=True)
+                self.replen_sums[state_key] += value
 
     def _append_ob_snapshot(
         self,
@@ -4003,11 +4066,11 @@ class FeatureEngine:
 
     def _replenishment_rates(self) -> Dict[int, Dict[Tuple[str, int, str], float]]:
         rates: Dict[int, Dict[Tuple[str, int, str], float]] = {}
-        for window in self.replen_windows_ms:
-            scale = float(window) if window > 0 else 1.0
-            rates[window] = {
-                key: self.replen_sums[window][key] / scale
-                for key in self.replen_sums[window]
+        for window_ms, keys in self._replen_keys_by_window.items():
+            scale = max(float(window_ms) / 1000.0, 1e-12)
+            rates[window_ms] = {
+                key: self._safe_div(self.replen_sums.get((window_ms, key), 0.0), scale, 0.0)
+                for key in keys
             }
         return rates
 
@@ -4250,23 +4313,21 @@ class FeatureEngine:
         self.last_ob_trade_imbalance_1000ms = float(trade_stats_by_ms[1_000]["trade_imbalance_notional"])
         cvd_stats_by_ms: Dict[int, Dict[str, float]] = {}
         for ms in FLOW_WINDOWS_MS:
-            cvd_state = self.cvd_window_states[ms]
-            cvd_state.prune(ts_ms)
-            cvd_change = cvd_state.change_usd(ts_ms, self.cvd_notional)
-            cvd_slope = cvd_state.slope_usd_per_sec()
-            cvd_minus_ema = float(self.cvd_notional - self._cvd_ema[ms])
-            cvd_stats_by_ms[ms] = {
-                "cvd_change_usd": float(cvd_change),
-                "cvd_slope_usd_per_sec": float(cvd_slope),
-                "cvd_minus_ema_usd": float(cvd_minus_ema),
-            }
-            for k, v in cvd_stats_by_ms[ms].items():
-                if not math.isfinite(float(v)):
-                    raise ValueError(f"Non-finite CVD stat {k}={v!r} at ts_ms={ts_ms} window={ms}")
-        large_stats_by_ms = {
-            ms: self._large_trade_stats_from_state(ms, ts_ms)
-            for ms in self.large_trade_windows
-        }
+            cvd_stats_by_ms[ms] = self._cvd_stats_for_window(
+                ms,
+                ts_ms,
+                need_change=ms in CVD_CHANGE_WINDOWS_MS,
+                need_slope=ms in CVD_SLOPE_WINDOWS_MS,
+                need_minus_ema=ms in CVD_MINUS_EMA_WINDOWS_MS,
+            )
+        large_stats_by_ms: Dict[int, Dict[str, float]] = {}
+        for ms in FLOW_WINDOWS_MS:
+            large_stats_by_ms[ms] = self._large_trade_stats_from_state(
+                ms,
+                ts_ms,
+                need_max_signed=ms in LARGE_TRADE_MAX_SIGNED_WINDOWS_MS,
+                need_top5=ms in LARGE_TRADE_TOP5_WINDOWS_MS,
+            )
         consecutive_buy_trade_count = float(self.consecutive_buy_trade_count)
         consecutive_sell_trade_count = float(self.consecutive_sell_trade_count)
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
@@ -4318,10 +4379,9 @@ class FeatureEngine:
         time_since_mid_change_ms = float(ts_ms - self.last_mid_change_ts) if self.last_mid_change_ts is not None else 0.0
 
         self._add_return(ts_ms, mid, ob_dt_ms)
-        return_var = {ms: stats.mean_var()[1] for ms, stats in self.return_histories.items()}
-        return_std_bps = {ms: math.sqrt(var) for ms, var in return_var.items()}
+        _return_mean_200, return_var_200 = self.return_histories[200].mean_var()
+        return_std_bps_200 = math.sqrt(max(float(return_var_200), 0.0))
 
-        regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
         regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
         for ms in self.regime_windows_ms:
             self.flow_regime[ms] = trade_stats_by_ms[ms]["trade_imbalance_notional"]
@@ -4507,11 +4567,11 @@ class FeatureEngine:
             ])
         for ms in FAST_WINDOWS_MS:
             rates = replen_rates[ms]
-            bid_add_rate = rates[("bid", 1, "add")] * 1000.0
-            ask_add_rate = rates[("ask", 1, "add")] * 1000.0
+            bid_add_rate = rates[("bid", 1, "add")]
+            ask_add_rate = rates[("ask", 1, "add")]
             feat_list.append(self._safe_div(bid_add_rate, max(bsz1, 1e-9), 0.0))
             if ms == 200:
-                bid_rem_rate = rates[("bid", 1, "rem")] * 1000.0
+                bid_rem_rate = rates[("bid", 1, "rem")]
                 feat_list.append(self._safe_div(bid_rem_rate, max(bsz1, 1e-9), 0.0))
             feat_list.append(self._safe_div(ask_add_rate, max(asz1, 1e-9), 0.0))
 
@@ -4573,7 +4633,7 @@ class FeatureEngine:
                     raise ValueError(f"Non-finite absorption stat idx={i} value={value!r} at ts_ms={ts_ms} window={ms}")
             feat_list.extend(absorption_values)
 
-        feat_list.append(return_std_bps[200])
+        feat_list.append(return_std_bps_200)
         for ms in REGIME_WINDOWS_MS:
             dist = self._regime_distribution(ms)
             feat_list.append(regime_volume[ms])
@@ -4826,10 +4886,6 @@ class FeatureEngine:
 
         for ms, stats in self.return_histories.items():
             stats.add(ts_ms, r)
-
-        r2 = r * r
-        for hl in self.regime_windows_ms:
-            self.rv_ewma[hl] = self._ewma_update(self.rv_ewma[hl], r2, ob_dt_ms, hl)
 
         for ms, state in self.regime_return_states.items():
             self._regime_return_add(state, int(ts_ms), float(r))

@@ -695,6 +695,87 @@ def test_removed_v8_feature_names_not_in_production_feature_names() -> None:
     for banned in REMOVED_V8_FEATURES:
         assert banned not in names
 
+
+def test_v8_return_histories_only_track_retained_windows() -> None:
+    fe = FeatureEngine()
+    assert tuple(fe.return_windows_ms) == (200,)
+    assert set(fe.return_histories.keys()) == {200}
+
+    r = fe.on_fast_event(deep_snapshot_ob(1_700_004_000_000, n_levels=60))
+    assert r.features.shape == (187,)
+    assert set(fe.return_histories.keys()) == {200}
+
+
+def test_v8_replenishment_states_only_track_emitted_keys() -> None:
+    fe = FeatureEngine()
+
+    expected = {
+        200: (("bid", 1, "add"), ("ask", 1, "add"), ("bid", 1, "rem")),
+        500: (("bid", 1, "add"), ("ask", 1, "add")),
+        1000: (("bid", 1, "add"), ("ask", 1, "add")),
+    }
+
+    assert fe._replen_keys_by_window == expected
+
+    for (window_ms, key) in fe.replen_deques.keys():
+        assert window_ms in expected
+        assert key in expected[window_ms]
+        assert key[1] == 1
+
+    for (window_ms, key) in fe.replen_sums.keys():
+        assert window_ms in expected
+        assert key in expected[window_ms]
+        assert key[1] == 1
+
+
+def test_v8_removed_computation_strings_absent_from_production_cmssl17() -> None:
+    from pathlib import Path
+
+    text = Path("CMSSL17.py").read_text()
+
+    forbidden = [
+        "rv_ewma",
+        "regime_vol_ewma",
+        "max_signed_trade_notional_usd_200ms",
+        "cvd_change_usd_200ms",
+        "ask_l1_rem_rate_over_depth_200ms",
+        "bid_l1_rem_rate_over_depth_500ms",
+        "ask_l1_rem_rate_over_depth_500ms",
+        "bid_l1_rem_rate_over_depth_1000ms",
+        "ask_l1_rem_rate_over_depth_1000ms",
+    ]
+
+    for s in forbidden:
+        assert s not in text, s
+
+
+def test_v8_large_trade_and_cvd_representatives_still_present() -> None:
+    fe = FeatureEngine()
+    names = set(fe.feature_names())
+
+    retained = {
+        "top5_trade_notional_sum_usd_200ms",
+        "top5_trade_notional_sum_usd_500ms",
+        "top5_trade_notional_sum_usd_1000ms",
+        "max_signed_trade_notional_usd_500ms",
+        "max_signed_trade_notional_usd_1000ms",
+        "cvd_slope_usd_per_sec_200ms",
+        "cvd_minus_ema_usd_200ms",
+        "cvd_change_usd_500ms",
+        "cvd_slope_usd_per_sec_500ms",
+        "cvd_minus_ema_usd_500ms",
+        "cvd_change_usd_1000ms",
+        "cvd_slope_usd_per_sec_1000ms",
+        "cvd_minus_ema_usd_1000ms",
+    }
+
+    for name in retained:
+        assert name in names, name
+
+    assert "max_signed_trade_notional_usd_200ms" not in names
+    assert "cvd_change_usd_200ms" not in names
+
+
 def test_pruned_feature_vector_matches_names() -> None:
     fe = FeatureEngine()
     result = fe.on_fast_event(deep_snapshot_ob(1_700_000_700_000, n_levels=60))
@@ -1196,6 +1277,10 @@ def main() -> None:
     test_v8_pruned187_removed_features_absent_and_representatives_retained()
     test_v8_pruned187_event_feature_shape()
     test_removed_v8_feature_names_not_in_production_feature_names()
+    test_v8_return_histories_only_track_retained_windows()
+    test_v8_replenishment_states_only_track_emitted_keys()
+    test_v8_removed_computation_strings_absent_from_production_cmssl17()
+    test_v8_large_trade_and_cvd_representatives_still_present()
     test_pruned_feature_vector_matches_names()
     test_no_empty_feature_family_scaffolding_remains()
     test_hot_path_pruned_feature_count_still_unchanged()
