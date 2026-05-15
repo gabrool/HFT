@@ -466,7 +466,7 @@ LOOKBACK        = 100        # canonical event-time token lookback
 WINDOW_MS       = 10_000     # canonical rolling window span (10s)
 PAD_DT_FOR_LEFT = 0.0
 BATCH_SIZE      = 512
-DMODEL          = 1024
+DMODEL          = 512
 MAMBA_LAYERS    = 2
 DEPATCH_OFFSET_MODE = "learnable"
 ACT_DIAG_P95_MAX_ELEMS = max(
@@ -475,7 +475,7 @@ ACT_DIAG_P95_MAX_ELEMS = max(
 )
 print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
-MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_old_ctn6ci_linearproj_no_gate_no_mixed_v1"
+MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_ctn6ci_mamba512_bidir1024_pool512_head1024_v1"
 # ConvTimeNet topology intentionally matches original 1s path:
 # Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final_proj -> [B, patch_count, DMODEL].
 # No gate, no MLP projection, no mixed ConvTimeNet stack.
@@ -507,7 +507,12 @@ FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
 FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned187"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned187-xformv2"
+CHECKPOINT_SCHEMA = (
+    "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
+    + "p"
+    + "ca"
+    + "-pruned187-xformv2-mamba512-pool512-head1024"
+)
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
 FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
@@ -724,7 +729,7 @@ class RMSNorm(nn.Module):
 
 def _init_small(m: nn.Module):
     if isinstance(m, nn.Linear):
-        nn.init.normal_(m.weight, 0, .02)
+        nn.init.normal_(m.weight, 0.0, 0.01)
         if m.bias is not None: nn.init.zeros_(m.bias)
 
 def get_activation_fn(activation):
@@ -1426,18 +1431,32 @@ class ChannelFFN(nn.Module):
         return x + self.ff(self.ln(x))
 
 class GatedPooling(nn.Module):
-    """O(L) learned-query / gated pooling."""
+    """O(L) learned-query / gated pooling with stable query initialization."""
+
     def __init__(self, d_in, d_hidden=None):
         super().__init__()
-        d_hidden = d_hidden or d_in
-        self.W = nn.Linear(d_in, d_hidden)
-        self.u = nn.Parameter(torch.randn(d_hidden))
+        d_hidden = int(d_hidden) if d_hidden is not None else min(512, int(d_in))
+        if d_hidden <= 0:
+            raise ValueError(f"d_hidden must be positive, got {d_hidden}")
+
+        self.d_in = int(d_in)
+        self.d_hidden = int(d_hidden)
+
+        self.W = nn.Linear(self.d_in, self.d_hidden)
+        self.u = nn.Parameter(torch.empty(self.d_hidden))
+
+        # Keep W fan-aware while removing the oversized query scale from init.
+        nn.init.xavier_uniform_(self.W.weight)
+        if self.W.bias is not None:
+            nn.init.zeros_(self.W.bias)
+
+        nn.init.normal_(self.u, mean=0.0, std=1.0 / math.sqrt(float(self.d_hidden)))
 
     def forward(self, h):  # h: [B, L, D]
-        g = torch.tanh(self.W(h))        # [B, L, H]
-        scores = torch.matmul(g, self.u) # [B, L]
+        g = torch.tanh(self.W(h))          # [B, L, H]
+        scores = torch.matmul(g, self.u)   # [B, L]
         alpha = torch.softmax(scores, dim=1)
-        z = torch.einsum('bl,bld->bd', alpha, h)
+        z = torch.einsum("bl,bld->bd", alpha, h)
         return z
 
 class TaskTokenDecoder(nn.Module):
@@ -1535,7 +1554,7 @@ class SAMBA(nn.Module):
         self.mamba = Mamba(args, ff_hid=4*DMODEL)
 
         fused_dim = args.d_model * 2
-        head_hidden_dim = fused_dim * 2
+        head_hidden_dim = fused_dim
         self.dir_token_decoder = TaskTokenDecoder(
             dim=fused_dim,
             kernel_size=5,
@@ -1548,8 +1567,14 @@ class SAMBA(nn.Module):
             ff_mult=2,
             dropout=0.1,
         )
-        self.dir_pool = GatedPooling(fused_dim)
-        self.mag_pool = GatedPooling(fused_dim)
+        pool_hidden_dim = min(512, fused_dim)
+        print(
+            f"[head-config] fused_dim={fused_dim} head_hidden_dim={head_hidden_dim} "
+            f"task_decoder_ff_mult=2 pool_hidden_dim={pool_hidden_dim}",
+            flush=True,
+        )
+        self.dir_pool = GatedPooling(fused_dim, d_hidden=pool_hidden_dim)
+        self.mag_pool = GatedPooling(fused_dim, d_hidden=pool_hidden_dim)
         self.dir_head = nn.Sequential(
             nn.Linear(fused_dim, head_hidden_dim),
             nn.GELU(),
