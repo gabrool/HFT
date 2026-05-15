@@ -55,7 +55,10 @@ SEMANTIC_PRIORITY = {
     "ofi_normalized": 0.90,
     "ofi_pressure": 0.95,
     "trade_count": 0.75,
+    "trade_activity": 0.75,
     "trade_imbalance": 0.90,
+    "trade_toxicity": 0.90,
+    "book_dynamics": 0.80,
     "signed_notional_flow": 0.90,
     "cvd": 0.90,
     "absorption": 0.85,
@@ -66,8 +69,33 @@ SEMANTIC_PRIORITY = {
     "unknown": 0.50,
 }
 
-FAST_FAMILIES = {"top_book", "spread_gap", "returns", "micro_vamp", "ofi_raw", "ofi_normalized", "ofi_pressure", "trade_imbalance", "signed_notional_flow"}
-SLOW_FAMILIES = {"calendar", "notional_context", "depth", "rolling_obi", "cvd", "volatility_regime", "spread_depth_regime", "event_density_aux", "aux"}
+FAST_FAMILIES = {
+    "top_book",
+    "book_dynamics",
+    "spread_gap",
+    "returns",
+    "micro_vamp",
+    "ofi_raw",
+    "ofi_normalized",
+    "ofi_pressure",
+    "trade_activity",
+    "trade_imbalance",
+    "trade_toxicity",
+    "signed_notional_flow",
+    "absorption",
+}
+SLOW_FAMILIES = {
+    "calendar",
+    "notional_context",
+    "depth",
+    "depth_imbalance",
+    "rolling_obi",
+    "cvd",
+    "volatility_regime",
+    "spread_depth_regime",
+    "event_density_aux",
+    "aux",
+}
 
 
 def read_json(path: Path) -> dict:
@@ -621,12 +649,24 @@ def _has_token(n: str, token: str) -> bool:
     return re.search(rf"(^|_){re.escape(token)}($|_)", n) is not None
 
 
+def _starts_with_any(n: str, prefixes: Sequence[str]) -> bool:
+    return any(n.startswith(p) for p in prefixes)
+
+
+def _contains_any(n: str, parts: Sequence[str]) -> bool:
+    return any(p in n for p in parts)
+
+
+def _matches_any(n: str, patterns: Sequence[str]) -> bool:
+    return any(re.search(p, n) is not None for p in patterns)
+
+
 def parse_feature_name(name: str) -> dict:
     n = name.lower()
     family = "unknown"
-    if "down_up_vol_imbalance" in n:
-        family = "volatility_regime"
-    elif (
+
+    # 1. Calendar/context.
+    if (
         _has_token(n, "utc_hour")
         or _has_token(n, "utc_dow")
         or _has_token(n, "hour")
@@ -643,48 +683,181 @@ def parse_feature_name(name: str) -> dict:
         }
     ):
         family = "calendar"
-    elif any(k in n for k in ("notional", "usd", "quote_qty")) and "flow" not in n:
-        family = "notional_context"
-    elif "micro" in n or "vamp" in n:
-        family = "micro_vamp"
-    elif any(k in n for k in ("best_bid", "best_ask", "mid", "top_book", "bbo")):
-        family = "top_book"
-    elif "spread" in n and ("regime" not in n and "depth" not in n):
-        family = "spread_gap"
-    elif any(k in n for k in ("return", "ret_", "logret")):
-        family = "returns"
-    elif "depth_imbalance" in n or ("depth" in n and "imb" in n):
-        family = "depth_imbalance"
-    elif "rolling_obi" in n or ("obi" in n and any(k in n for k in ("roll", "ema", "mean"))):
-        family = "rolling_obi"
-    elif re.search(r"(^|_)obi(_|$)", n) or "order_book_imbalance" in n:
-        family = "obi"
+
+    # 2. Volatility / volatility asymmetry.
+    elif (
+        "down_up_vol_imbalance" in n
+        or "volatility" in n
+        or "vol_regime" in n
+        or ("realized_vol" in n and "ofi" not in n)
+        or "regime_volume" in n
+        or "regime_flow" in n
+        or "rv_" in n
+    ):
+        family = "volatility_regime"
+
+    # 3. CVD before notional/USD.
+    elif (
+        "cvd" in n
+        or "cumulative_volume_delta" in n
+    ):
+        family = "cvd"
+
+    # 4. Trade toxicity / trade imbalance / trade activity before generic notional.
+    elif "trade_toxicity" in n or "toxicity" in n:
+        family = "trade_toxicity"
+
+    elif (
+        "trade_imbalance" in n
+        or ("trade" in n and "imb" in n)
+        or ("buy" in n and "sell" in n and "trade" in n)
+        or "zero_tick_fraction" in n
+        or "tick_sign_imbalance" in n
+        or "last_tick_sign" in n
+    ):
+        family = "trade_imbalance"
+
+    elif (
+        "time_since_trade" in n
+        or "time_since_last_buy_trade" in n
+        or "time_since_last_sell_trade" in n
+        or "trade_count" in n
+        or ("trade" in n and "count" in n)
+        or "trade_rate" in n
+        or "last_trade_side_sign" in n
+        or "last_is_zero_tick" in n
+        or "last_trade_notional" in n
+        or "top5_trade_notional" in n
+    ):
+        family = "trade_activity"
+
+    # 5. Signed flow.
+    elif (
+        "signed_notional_flow" in n
+        or ("signed" in n and "notional" in n and "flow" in n)
+        or "max_signed_trade_notional" in n
+        or "signed_trade_premium" in n
+        or ("signed" in n and "flow" in n)
+    ):
+        family = "signed_notional_flow"
+
+    # 6. OFI variants.
     elif "ofi_pressure" in n or ("pressure" in n and "ofi" in n):
         family = "ofi_pressure"
-    elif "ofi_norm" in n or "normalized_ofi" in n or ("ofi" in n and "norm" in n):
+
+    elif (
+        "ofi_norm" in n
+        or "normalized_ofi" in n
+        or ("ofi" in n and "norm" in n)
+    ):
         family = "ofi_normalized"
+
     elif "ofi" in n:
         family = "ofi_raw"
-    elif "trade_count" in n or ("trade" in n and "count" in n):
-        family = "trade_count"
-    elif "trade_imbalance" in n or ("trade" in n and "imb" in n):
-        family = "trade_imbalance"
-    elif "signed_notional_flow" in n or ("signed" in n and "flow" in n):
-        family = "signed_notional_flow"
-    elif "cvd" in n or "cumulative_volume_delta" in n:
-        family = "cvd"
-    elif "absorption" in n:
+
+    # 7. Absorption / depletion / no-price-move.
+    elif (
+        "absorption" in n
+        or "no_price_move" in n
+        or "depletion" in n
+        or "l1_depletion" in n
+        or "depletion_over_depth" in n
+        or "flow_without_price" in n
+    ):
         family = "absorption"
-    elif "volatility" in n or "vol_regime" in n:
-        family = "volatility_regime"
-    elif "spread_depth" in n or ("spread" in n and "depth" in n and "regime" in n):
+
+    # 8. Returns before top_book, because mid_ret/micro_ret contain mid/micro.
+    elif (
+        "return" in n
+        or "ret_bps" in n
+        or "_ret_" in n
+        or n.startswith("ret_")
+        or "logret" in n
+        or "mid_ret_bps" in n
+        or "micro_ret_bps" in n
+        or "mid_slope_bps_per_sec" in n
+        or "mid_range_bps" in n
+    ):
+        family = "returns"
+
+    # 9. Micro/VAMP.
+    elif "micro" in n or "vamp" in n:
+        family = "micro_vamp"
+
+    # 10. Depth imbalance before generic depth.
+    elif (
+        "depth_imbalance" in n
+        or ("depth" in n and "imb" in n)
+    ):
+        family = "depth_imbalance"
+
+    # 11. OBI / rolling OBI.
+    elif (
+        "rolling_obi" in n
+        or ("obi" in n and _contains_any(n, ("roll", "ema", "mean", "slope", "persist")))
+    ):
+        family = "rolling_obi"
+
+    elif re.search(r"(^|_)obi(_|$)", n) or "order_book_imbalance" in n:
+        family = "obi"
+
+    # 12. Spread / gap.
+    elif (
+        "spread_depth" in n
+        or ("spread" in n and "depth" in n and "regime" in n)
+    ):
         family = "spread_depth_regime"
-    elif "event_density" in n:
+
+    elif (
+        ("spread" in n and "spread_change_count" not in n)
+        or n in {"gap_a_bps", "gap_b_bps"}
+        or re.search(r"(^|_)gap_[ab]_bps($|_)", n) is not None
+    ):
+        family = "spread_gap"
+
+    # 13. Book dynamics / top book.
+    elif (
+        "ob_update_rate" in n
+        or "book_update_rate" in n
+    ):
         family = "event_density_aux"
-    elif n.startswith("aux") or "_aux" in n:
-        family = "aux"
+
+    elif (
+        "bid_price_change_rate" in n
+        or "ask_price_change_rate" in n
+        or "price_change_rate" in n
+        or "spread_change_count" in n
+        or "time_since_mid_change" in n
+    ):
+        family = "book_dynamics"
+
+    elif (
+        n in {"bsz1", "asz1", "bid1", "ask1"}
+        or "vwap_vs_mid" in n
+        or _starts_with_any(n, ("bsz", "asz"))
+        or _contains_any(n, ("best_bid", "best_ask", "top_book", "bbo"))
+    ):
+        family = "top_book"
+
+    # 14. Notional context after trade/CVD/signed-flow.
+    elif (
+        (_contains_any(n, ("notional", "usd", "quote_qty")))
+        and "flow" not in n
+        and "cvd" not in n
+        and "trade" not in n
+    ):
+        family = "notional_context"
+
+    # 15. Generic depth.
     elif "depth" in n:
         family = "depth"
+
+    # 16. Event density / aux.
+    elif "event_density" in n or "event_rate" in n:
+        family = "event_density_aux"
+
+    elif n.startswith("aux") or "_aux" in n:
+        family = "aux"
 
     timescales_ms: List[int] = []
     for m in re.finditer(r"_(\d+)_minus_(\d+)ms\b", n):
@@ -711,7 +884,6 @@ def parse_feature_name(name: str) -> dict:
     side = "bid" if "bid" in n else ("ask" if "ask" in n else ("buy" if "buy" in n else ("sell" if "sell" in n else "")))
     is_relative = any(k in n for k in ("_minus_", "_over_", "_imbalance", "_slope", "_accel", "ratio"))
     return {"family": family, "timescale_ms": timescale, "timescales_ms": json.dumps(timescales_ms), "level": level, "band_bps": band_bps, "side": side, "is_relative": is_relative}
-
 
 def compute_scores(target_df: pd.DataFrame, health_df: pd.DataFrame, feature_names: List[str], week_id: np.ndarray, X: np.ndarray, Y: np.ndarray, horizons_ms: List[int], masks_by_horizon: Dict[int, Dict[str, np.ndarray]]) -> pd.DataFrame:
     kept = target_df[target_df["mask_type"] == "kept"].copy()
@@ -1105,6 +1277,7 @@ def family_summary(scores: pd.DataFrame, target_df: pd.DataFrame, corr_pairs: pd
             "best_auc_500": np.nan,
             "best_auc_1000": np.nan,
             "n_low_risk_remove": int(sum(action.get(f) == "remove_low_risk" for f in features)),
+            "n_remove_if_budget_tight": int(sum(action.get(f) == "remove_if_budget_tight" for f in features)),
             "n_keep": int(sum(action.get(f) == "keep" for f in features)),
             "n_needs_ablation": int(sum(action.get(f) == "needs_ablation" for f in features)),
         }
@@ -1122,16 +1295,47 @@ def family_summary(scores: pd.DataFrame, target_df: pd.DataFrame, corr_pairs: pd
 def _self_test_parsers() -> None:
     assert parse_feature_name("down_up_vol_imbalance_1000ms")["family"] == "volatility_regime"
     assert parse_feature_name("utc_dow_sin")["family"] == "calendar"
+
     assert parse_feature_name("micro_l1_minus_micro_l10_bps")["family"] == "micro_vamp"
     assert parse_feature_name("micro_minus_mid_bps")["family"] == "micro_vamp"
-    assert parse_feature_name("micro_ret_bps_500ms")["family"] == "micro_vamp"
+    assert parse_feature_name("micro_ret_bps_500ms")["family"] == "returns"
+
+    assert parse_feature_name("mid_ret_bps_1000ms")["family"] == "returns"
+
+    assert parse_feature_name("cvd_change_usd_500ms")["family"] == "cvd"
+    assert parse_feature_name("cvd_slope_usd_per_sec_1000ms")["family"] == "cvd"
+    assert parse_feature_name("cvd_minus_ema_usd_3000ms")["family"] == "cvd"
+
+    assert parse_feature_name("trade_imbalance_notional_1000ms")["family"] == "trade_imbalance"
+    assert parse_feature_name("trade_toxicity_notional_1000ms")["family"] == "trade_toxicity"
+    assert parse_feature_name("time_since_trade_ms")["family"] == "trade_activity"
+
+    assert parse_feature_name("gap_a_bps")["family"] == "spread_gap"
+    assert parse_feature_name("gap_b_bps")["family"] == "spread_gap"
+
+    assert parse_feature_name("bsz1")["family"] == "top_book"
+    assert parse_feature_name("asz1")["family"] == "top_book"
+
+    assert parse_feature_name("ob_update_rate_500ms")["family"] == "event_density_aux"
+    assert parse_feature_name("bid_l1_depletion_200ms")["family"] == "absorption"
+    assert parse_feature_name("ask_l1_depletion_over_depth_200ms")["family"] == "absorption"
+    assert parse_feature_name("bid_price_change_rate_200ms")["family"] == "book_dynamics"
+    assert parse_feature_name("spread_change_count_200ms")["family"] == "book_dynamics"
+
     p = parse_feature_name("ofi_l3_accel_200_minus_500ms")
     assert p["timescale_ms"] == 500
     assert json.loads(p["timescales_ms"]) == [200, 500]
+
     p = parse_feature_name("micro_ret_bps_1000ms")
     assert p["timescale_ms"] == 1000
     assert json.loads(p["timescales_ms"]) == [1000]
 
+
+def maybe_check_current_feature_parser_coverage(feature_names: Sequence[str], warnings_out: List[str]) -> None:
+    parsed = [parse_feature_name(f) for f in feature_names]
+    unknown = [f for f, p in zip(feature_names, parsed) if p["family"] == "unknown"]
+    if unknown:
+        warnings_out.append(f"unknown parser features sample: {unknown[:20]}")
 
 def validate_meta(global_meta: dict) -> Tuple[int, int, int, List[str], List[str], List[int]]:
     feature_dim_core = int(global_meta["feature_dim_core"])
@@ -1177,6 +1381,7 @@ def main() -> None:
     else:
         audit_feature_names = feature_names
         audit_feature_indices = np.arange(feature_dim_core, dtype=np.int64)
+    maybe_check_current_feature_parser_coverage(audit_feature_names, warnings_out)
     print(f"[audit-meta] schema={global_meta.get('feature_schema', '')} transform={global_meta.get('feature_transform', '')} feature_dim_core={feature_dim_core} feature_dim_total={feature_dim_total} train_weeks={train_weeks}", flush=True)
 
     X, Y, row_idx, label_ts, week_id, week_key, sample_rows_by_week = load_sampled_dataset(out_root, global_meta, audit_feature_indices, warnings_out)
@@ -1213,6 +1418,24 @@ def main() -> None:
     print(f"[audit-corr] wrote {corr_path}", flush=True)
 
     scores_df = compute_scores(target_df, health_df, audit_feature_names, week_id, X, Y, horizons_ms, masks_by_horizon)
+    parser_rows = []
+    for _, r in scores_df.iterrows():
+        parser_rows.append({
+            "feature": r["feature"],
+            "family": r["family"],
+            "timescale_ms": r["timescale_ms"],
+            "timescales_ms": r["timescales_ms"],
+            "level": r["level"],
+            "band_bps": r["band_bps"],
+            "side": r["side"],
+            "is_relative": r["is_relative"],
+        })
+
+    parser_df = pd.DataFrame(parser_rows)
+    parser_path = out_dir / "feature_parser_coverage.csv"
+    parser_df.to_csv(parser_path, index=False)
+    print(f"[audit-parser] wrote {parser_path}", flush=True)
+
     (
         cluster_df,
         pair_df,
@@ -1250,8 +1473,18 @@ def main() -> None:
     fam_df.to_csv(out_dir / "feature_family_summary.csv", index=False)
 
     unknown_count = int((scores_df["family"] == "unknown").sum())
+    unknown_frac = unknown_count / max(1, len(scores_df))
+
     if unknown_count:
         warnings_out.append(f"unknown feature families: {unknown_count}")
+
+    if unknown_frac > 0.10:
+        warnings_out.append(
+            f"WARNING: unknown family fraction too high: {unknown_count}/{len(scores_df)} = {unknown_frac:.3%}; parser coverage should be improved before using recommendations"
+        )
+
+    print(f"[audit-parser] unknown={unknown_count} unknown_frac={unknown_frac:.3%}", flush=True)
+
     n_low = int((removal_df["recommended_action"] == "remove_low_risk").sum())
     n_budget = int((removal_df["recommended_action"] == "remove_if_budget_tight").sum())
     n_ablate = int((removal_df["recommended_action"] == "needs_ablation").sum())
@@ -1285,6 +1518,7 @@ def main() -> None:
         "n_high_corr_cluster_nonrepresentatives": n_high_corr_cluster_nonrepresentatives,
         "n_high_corr_cluster_nonrep_remove_if_budget_tight": n_high_corr_cluster_nonrep_remove_if_budget_tight,
         "n_parser_unknown_family": unknown_count,
+        "parser_unknown_fraction": unknown_frac,
         "n_relative_features": int(scores_df["is_relative"].sum()),
         "n_remove_low_risk": n_low,
         "n_remove_if_budget_tight": n_budget,
