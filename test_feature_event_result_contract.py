@@ -10,6 +10,13 @@ import numpy as np
 def _install_optional_dependency_stubs() -> None:
     """Provide import-time stubs for model-only dependencies unused by this smoke test."""
 
+    try:
+        import torch as _real_torch  # noqa: F401
+        import torch.nn as _real_nn  # noqa: F401
+        real_torch_available = True
+    except Exception:
+        real_torch_available = False
+
     class _Dummy:
         def __init__(self, *args, **kwargs):
             pass
@@ -68,6 +75,7 @@ def _install_optional_dependency_stubs() -> None:
         normal_=lambda *args, **kwargs: None,
         zeros_=lambda *args, **kwargs: None,
         constant_=lambda *args, **kwargs: None,
+        xavier_uniform_=lambda *args, **kwargs: None,
     )
     functional_mod = types.ModuleType("torch.nn.functional")
     utils_mod = types.ModuleType("torch.utils")
@@ -83,14 +91,15 @@ def _install_optional_dependency_stubs() -> None:
     torch_mod.utils = utils_mod
     torch_mod._functorch = functorch_mod
 
-    sys.modules.setdefault("torch", torch_mod)
-    sys.modules.setdefault("torch.nn", nn_mod)
-    sys.modules.setdefault("torch.nn.functional", functional_mod)
-    sys.modules.setdefault("torch.optim", optim_mod)
-    sys.modules.setdefault("torch.utils", utils_mod)
-    sys.modules.setdefault("torch.utils.data", data_mod)
-    sys.modules.setdefault("torch._functorch", functorch_mod)
-    sys.modules.setdefault("torch._functorch.config", config_mod)
+    if not real_torch_available:
+        sys.modules.setdefault("torch", torch_mod)
+        sys.modules.setdefault("torch.nn", nn_mod)
+        sys.modules.setdefault("torch.nn.functional", functional_mod)
+        sys.modules.setdefault("torch.optim", optim_mod)
+        sys.modules.setdefault("torch.utils", utils_mod)
+        sys.modules.setdefault("torch.utils.data", data_mod)
+        sys.modules.setdefault("torch._functorch", functorch_mod)
+        sys.modules.setdefault("torch._functorch.config", config_mod)
 
     tqdm_mod = types.ModuleType("tqdm")
     tqdm_mod.tqdm = lambda iterable=None, *args, **kwargs: iterable if iterable is not None else []
@@ -616,12 +625,131 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     assert len(raw_names) > 0
     assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v8_raw_no_" + forbidden + "_pruned187_xformv2"
     assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v2_pruned187"
-    assert CMSSL17.CHECKPOINT_SCHEMA == "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + forbidden + "-pruned187-xformv2"
+    assert CMSSL17.CHECKPOINT_SCHEMA == (
+        "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
+        + forbidden
+        + "-pruned187-xformv2-mamba512-pool512-head1024"
+    )
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "p" + "ca250" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
     assert "final256" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
 
+
+
+def _real_torch_available() -> bool:
+    import torch
+
+    return getattr(torch, "__version__", None) is not None
+
+
+def test_v9_smallstable_model_width_contract() -> None:
+    from CMSSL17 import (
+        DMODEL,
+        NUM_HEADS,
+        ModelArgs,
+        LOOKBACK,
+        MAMBA_LAYERS,
+        FeatureEngine,
+        MODEL_ARCH_SCHEMA,
+        CHECKPOINT_SCHEMA,
+    )
+
+    assert DMODEL == 512
+    assert NUM_HEADS == 16
+
+    fe = FeatureEngine()
+    f_total = fe.feature_dim()
+    assert f_total == 193
+
+    args = ModelArgs(DMODEL, MAMBA_LAYERS, f_total, LOOKBACK)
+    assert args.headdim == 32
+
+    assert "mamba512" in MODEL_ARCH_SCHEMA
+    assert "mamba512" in CHECKPOINT_SCHEMA
+
+    if not _real_torch_available():
+        return
+
+    from CMSSL17 import SAMBA
+
+    model = SAMBA(args)
+
+    assert model.depatch_proj_encoder.final_proj.out_features == 512
+
+    fused_dim = DMODEL * 2
+    assert fused_dim == 1024
+
+    assert model.dir_head[0].in_features == fused_dim
+    assert model.dir_head[0].out_features == fused_dim
+    assert model.dir_head[-1].in_features == fused_dim
+    assert model.dir_head[-1].out_features == 3
+
+    assert model.mag_up_head[0].in_features == fused_dim
+    assert model.mag_up_head[0].out_features == fused_dim
+    assert model.mag_up_head[-1].in_features == fused_dim
+    assert model.mag_up_head[-1].out_features == 3
+
+    assert model.dir_token_decoder.ff[0].in_features == fused_dim
+    assert model.dir_token_decoder.ff[0].out_features == 2 * fused_dim
+    assert model.dir_token_decoder.ff[-1].out_features == fused_dim
+
+    assert model.dir_pool.d_hidden == 512
+    assert model.mag_pool.d_hidden == 512
+
+
+def test_v9_gated_pooling_query_scaled_init() -> None:
+    if not _real_torch_available():
+        return
+
+    import math
+    import torch
+    from CMSSL17 import GatedPooling
+
+    pool = GatedPooling(1024)
+    assert pool.d_hidden == 512
+    assert pool.u.shape == (512,)
+
+    # Do not require exact std because random sample variance is noisy.
+    # But it should be far closer to 1/sqrt(512) than to 1.0.
+    u_std = float(pool.u.detach().std(unbiased=False))
+    target = 1.0 / math.sqrt(512.0)
+
+    assert 0.25 * target <= u_std <= 4.0 * target
+    assert u_std < 0.20
+
+    h = torch.randn(4, 99, 1024)
+    z = pool(h)
+    assert z.shape == (4, 1024)
+    assert torch.isfinite(z).all()
+
+
+def test_v9_initial_direction_logits_not_extreme() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import DMODEL, MAMBA_LAYERS, LOOKBACK, ModelArgs, SAMBA, FeatureEngine
+
+    torch.manual_seed(123)
+
+    fe = FeatureEngine()
+    f_total = fe.feature_dim()
+    args = ModelArgs(DMODEL, MAMBA_LAYERS, f_total, LOOKBACK)
+    model = SAMBA(args)
+    model.eval()
+
+    x = torch.randn(4, LOOKBACK, f_total)
+
+    with torch.no_grad():
+        pred = model(x)
+
+    dir_logits = pred["dir_logits"].float()
+    assert dir_logits.shape == (4, 3)
+    assert torch.isfinite(dir_logits).all()
+
+    # This should be much lower than the failed run's dir_logit_std=13.8.
+    assert float(dir_logits.std(unbiased=False)) < 5.0
 
 def test_offline_ingest_raw_feature_dims() -> None:
     import CMSSL17
@@ -1267,6 +1395,9 @@ def main() -> None:
     test_compact_ob_type_code_does_not_default_to_delta()
     test_generic_dict_ob_type_parsing_is_explicit()
     test_feature_transform_contract_is_raw_no_projection()
+    test_v9_smallstable_model_width_contract()
+    test_v9_gated_pooling_query_scaled_init()
+    test_v9_initial_direction_logits_not_extreme()
     test_offline_ingest_raw_feature_dims()
     test_merge_event_time_trade_wins_exact_timestamp_tie()
     test_merge_event_time_lower_timestamp_still_wins()
