@@ -479,7 +479,7 @@ MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_ctn6ci_mamba512_bidir1024_pool512_head1024
 # ConvTimeNet topology intentionally matches original 1s path:
 # Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final_proj -> [B, patch_count, DMODEL].
 # No gate, no MLP projection, no mixed ConvTimeNet stack.
-CTN_CI_KERNELS = [3, 3, 5, 5, 7, 7]
+CTN_CI_KERNELS = [3, 3, 3, 3, 3, 3]
 CTN_MIXED_KERNELS = []
 CTN_CI_INTERNAL_DIM = 8
 CTN_CI_FF_MULT = 8
