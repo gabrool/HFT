@@ -500,14 +500,14 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v7_raw_no_" + "p" + "ca" + "_pruned239_xformv2"
-FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned235"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned187_xformv2"
+FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned187"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
-FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned235"
+FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned187"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
-CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned239-xformv2-volimb"
+CHECKPOINT_SCHEMA = "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-" + "p" + "ca" + "-pruned187-xformv2"
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
 FIVE_WEEK_PROTOCOL = "five_week_cmssl2w_val_test_rl_eval_v1"
@@ -582,7 +582,6 @@ ROLLING_OFI_WINDOWS_MS = (
 )
 
 ROLLING_OBI_WINDOWS_MS = (
-    200,
     500,
     1_000,
 )
@@ -609,7 +608,9 @@ SPREAD_DEPTH_REGIME_WINDOWS_MS = (
 )
 
 NORMALIZED_OFI_LEVELS = (1, 3, 5, 10)
-BPS_DEPTH_BANDS = (1.0, 2.0, 5.0, 10.0)
+EMIT_DEPTH_BPS_BANDS = (1.0,)
+INTERNAL_DEPTH_BPS_BANDS = (1.0, 5.0)
+BPS_DEPTH_BANDS = EMIT_DEPTH_BPS_BANDS
 CALENDAR_CONTEXT_FEATURES = (
     "utc_hour_sin",
     "utc_hour_cos",
@@ -625,7 +626,7 @@ NOTIONAL_CONTEXT_FEATURES = (
     "total_depth_notional_5bps",
 )
 ROLLING_OFI_LEVELS = (1, 3, 5, 10)
-ROLLING_OBI_LEVELS = (3, 5, 10)
+ROLLING_OBI_LEVELS = (3,)
 DEEP_MICRO_LEVELS = (3, 5, 10)
 OFI_ACCEL_PAIRS_MS = (
     (200, 500),
@@ -2385,8 +2386,6 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bps_tanh(name, scale=1.0)
         elif name.startswith("ofi_l1_pressure_ewma_"):
             s = signed_log_ewma(name, XFORM_HL_FAST_MS)
-        elif name.startswith("spread_delta_over_spread_"):
-            s = bps_tanh(name, scale=1.0)
         elif name.startswith("mid_ret_bps_") or name.startswith("micro_ret_bps_"):
             s = bps(name, scale=2.0)
         elif name.startswith("mid_slope_bps_per_sec_") or name.startswith("micro_l5_slope_") or name.startswith("spread_widening_slope_bps_per_sec_"):
@@ -2409,7 +2408,7 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bps(name, scale=1.0)
         elif name in {"spread_bps", "gap_a_bps", "gap_b_bps"}:
             s = log_ewma(name, XFORM_HL_SLOW_MS)
-        elif name.startswith("mid_range_bps_") or name.startswith("return_std_bps_") or name.startswith("regime_realized_vol_bps_"):
+        elif name.startswith("mid_range_bps_") or name.startswith("return_std_bps_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
         elif name in {"bsz1", "asz1"} or name.startswith("bid_depth_within_") or name.startswith("ask_depth_within_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
@@ -2418,7 +2417,6 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
         elif (
             name.startswith("spread_change_count_")
             or name.startswith("bid_price_change_rate_")
-            or name.startswith("ask_price_change_rate_")
             or name.startswith("ob_update_count_")
             or name.startswith("ob_update_rate_")
             or name.startswith("trade_count_")
@@ -2449,8 +2447,8 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = signed_log_ewma(name, XFORM_HL_MEDIUM_MS)
         elif name == "last_trade_notional_usd" or name.startswith("top5_trade_notional_sum_usd_") or name.startswith("top_trade_notional_sum_usd_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
-        elif name.startswith("buy_flow_without_price_up_") or name.startswith("sell_flow_without_price_down_") or name.startswith("absorption_bid_") or name.startswith("absorption_ask_"):
-            # These retained absorption/no-price-move features are strictly nonnegative scaled notional measures.
+        elif name.startswith("absorption_bid_") or name.startswith("absorption_ask_"):
+            # Retained absorption features are strictly nonnegative scaled notional measures.
             s = log_ewma(name, XFORM_HL_FAST_MS)
         if s is None:
             raise ValueError(f"No transform spec assigned for feature {name!r}")
@@ -2727,7 +2725,6 @@ class FeatureEngine:
         self.last_bid1_update_ts: Optional[int] = None
         self.last_ask1_update_ts: Optional[int] = None
         self.last_bid_price_change_ts: Optional[int] = None
-        self.last_ask_price_change_ts: Optional[int] = None
         self.last_mid_change_ts: Optional[int] = None
         self.prev_bid1_price: Optional[float] = None
         self.prev_ask1_price: Optional[float] = None
@@ -2816,7 +2813,6 @@ class FeatureEngine:
         # ---------- Best-level churn & depletion ----------
         self.bestlvl_windows: Tuple[int, ...] = FAST_WINDOWS_MS
         self._bid_price_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
-        self._ask_price_change_deques: Dict[int, Deque[int]] = {ms: deque() for ms in self.bestlvl_windows}
         self.last_bid1 = None; self.last_ask1 = None
         self._bid_l1_depletion_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self.bestlvl_windows}
         self._ask_l1_depletion_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self.bestlvl_windows}
@@ -2935,7 +2931,6 @@ class FeatureEngine:
         names.extend(CALENDAR_CONTEXT_FEATURES)
         for w in PRICE_WINDOWS_MS:
             names.extend([
-                f"mid_ret_bps_{w}ms",
                 f"micro_ret_bps_{w}ms",
                 *([] if w == 200 else [
                     f"mid_slope_bps_per_sec_{w}ms",
@@ -2960,7 +2955,6 @@ class FeatureEngine:
         for lvl in BOOK_SIGNAL_LEVELS:
             names.append(f"ofi_l{lvl}")
         for lvl in NORMALIZED_OFI_LEVELS:
-            names.append(f"ofi_l{lvl}_over_depth_l{lvl}")
             names.append(f"ofi_l{lvl}_over_depth_5bps")
         for level in ROLLING_OFI_LEVELS:
             for window in ROLLING_OFI_WINDOWS_MS:
@@ -2990,10 +2984,8 @@ class FeatureEngine:
             ])
         for ms in FAST_WINDOWS_MS:
             names.extend([
-                f"spread_delta_over_spread_{ms}ms",
                 f"spread_change_count_{ms}ms",
                 f"bid_price_change_rate_{ms}ms",
-                f"ask_price_change_rate_{ms}ms",
                 f"bid_l1_depletion_{ms}ms",
                 f"ask_l1_depletion_{ms}ms",
                 f"bid_l1_depletion_over_depth_{ms}ms",
@@ -3006,15 +2998,14 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             names.extend([
                 f"bid_l1_add_rate_over_depth_{ms}ms",
-                f"bid_l1_rem_rate_over_depth_{ms}ms",
+                *([f"bid_l1_rem_rate_over_depth_{ms}ms"] if ms == 200 else []),
                 f"ask_l1_add_rate_over_depth_{ms}ms",
-                f"ask_l1_rem_rate_over_depth_{ms}ms",
             ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
-                f"signed_notional_flow_usd_{ms}ms",
+                *([f"signed_notional_flow_usd_{ms}ms"] if ms == 200 else []),
                 f"signed_trade_count_imbalance_{ms}ms",
-                f"trade_imbalance_notional_{ms}ms",
+                *([f"trade_imbalance_notional_{ms}ms"] if ms != 200 else []),
                 f"trade_toxicity_notional_{ms}ms",
                 f"zero_tick_fraction_{ms}ms",
                 f"tick_sign_imbalance_{ms}ms",
@@ -3032,7 +3023,7 @@ class FeatureEngine:
         ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
-                f"cvd_change_usd_{ms}ms",
+                *([f"cvd_change_usd_{ms}ms"] if ms != 200 else []),
                 f"cvd_slope_usd_per_sec_{ms}ms",
                 f"cvd_minus_ema_usd_{ms}ms",
             ])
@@ -3042,23 +3033,19 @@ class FeatureEngine:
         ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
-                f"max_signed_trade_notional_usd_{ms}ms",
+                *([f"max_signed_trade_notional_usd_{ms}ms"] if ms != 200 else []),
                 f"top5_trade_notional_sum_usd_{ms}ms",
             ])
         for ms in FLOW_WINDOWS_MS:
             names.extend([
-                f"buy_flow_without_price_up_{ms}ms",
-                f"sell_flow_without_price_down_{ms}ms",
                 f"absorption_bid_{ms}ms",
                 f"absorption_ask_{ms}ms",
             ])
-        for ms in FLOW_WINDOWS_MS:
-            names.append(f"return_std_bps_{ms}ms")
+        names.append("return_std_bps_200ms")
         for ms in REGIME_WINDOWS_MS:
             names.extend([
                 f"regime_volume_ewma_{ms}ms",
-                f"regime_realized_vol_bps_{ms}ms",
-                f"regime_flow_imbalance_{ms}ms",
+                *([f"regime_flow_imbalance_{ms}ms"] if ms == 3_000 else []),
                 f"down_up_vol_imbalance_{ms}ms",
                 f"max_abs_return_bps_{ms}ms",
             ])
@@ -4192,13 +4179,6 @@ class FeatureEngine:
         spread = max(0.0, ask1 - bid1)
         spread_bps = 1e4 * spread / mid if mid > 0.0 else 0.0
 
-        spread_delta_bps: Dict[int, float] = {}
-        for window in self.ob_horizon_compare_windows_ms:
-            target_ts_ms = ts_ms - window
-            ob_snap = self.get_ob_snapshot_asof(target_ts_ms)
-            spread_t_minus_h = ob_snap.spread if ob_snap is not None else spread
-            spread_delta_bps[window] = 1e4 * (spread - spread_t_minus_h) / max(mid, 1e-12)
-
         ask2 = self.ask_lvls[1][0] if len(self.ask_lvls) > 1 else ask1
         bid2 = self.bid_lvls[1][0] if len(self.bid_lvls) > 1 else bid1
         gap_a = max(0.0, ask2 - ask1)
@@ -4291,8 +4271,6 @@ class FeatureEngine:
         consecutive_sell_trade_count = float(self.consecutive_sell_trade_count)
         if self.prev_bid1_price is None or bid1 != self.prev_bid1_price:
             self.last_bid_price_change_ts = ts_ms
-        if self.prev_ask1_price is None or ask1 != self.prev_ask1_price:
-            self.last_ask_price_change_ts = ts_ms
         if self.prev_mid_price_for_age is None or mid != self.prev_mid_price_for_age:
             self.last_mid_change_ts = ts_ms
         spread_changed = (self.last_spread is not None and spread != self.last_spread)
@@ -4308,11 +4286,8 @@ class FeatureEngine:
         bid_level_changed = (self.last_bid1 is None or bid1 != self.last_bid1 or bsz1 != prev_bid_l1)
         ask_level_changed = (self.last_ask1 is None or ask1 != self.last_ask1 or asz1 != prev_ask_l1)
         bid_price_changed = (self.prev_bid1_price is not None and bid1 != self.prev_bid1_price)
-        ask_price_changed = (self.prev_ask1_price is not None and ask1 != self.prev_ask1_price)
         for ms, dq in self._bid_price_change_deques.items():
             self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if bid_price_changed else self._prune_ts_deque(dq, ts_ms, ms)
-        for ms, dq in self._ask_price_change_deques.items():
-            self._append_ts_with_guard(dq, ts_ms, ms, is_ob_event=True) if ask_price_changed else self._prune_ts_deque(dq, ts_ms, ms)
         if bid_level_changed:
             self.last_bid1_update_ts = ts_ms
         if ask_level_changed:
@@ -4347,7 +4322,6 @@ class FeatureEngine:
         return_std_bps = {ms: math.sqrt(var) for ms, var in return_var.items()}
 
         regime_vol_ewma = {ms: math.sqrt(max(self.rv_ewma[ms], 1e-18)) for ms in self.regime_windows_ms}
-        regime_realized = {ms: self.realized_vol[ms] for ms in self.regime_windows_ms}
         regime_volume = {ms: self.volume_ewma[ms] for ms in self.regime_windows_ms}
         for ms in self.regime_windows_ms:
             self.flow_regime[ms] = trade_stats_by_ms[ms]["trade_imbalance_notional"]
@@ -4453,7 +4427,11 @@ class FeatureEngine:
         feat_list: List[float] = []
         feat_list.extend(self._calendar_context_features(ts_ms))
         for w in PRICE_WINDOWS_MS:
-            feat_list.extend(price_features_by_window[w])
+            price_features = price_features_by_window[w]
+            # mid_ret_bps remains available internally for absorption, but v8 emits micro returns only.
+            feat_list.append(price_features[1])
+            if w != 200:
+                feat_list.extend(price_features[2:])
         feat_list.extend([
             spread_bps, gap_a_bps, gap_b_bps, bsz1, asz1, micro_premia,
             micro_minus_mid_bps, micro_minus_mid_over_spread,
@@ -4473,8 +4451,6 @@ class FeatureEngine:
             feat_list.append(ofi_by_level[lvl])
         for lvl in NORMALIZED_OFI_LEVELS:
             ofi_val = ofi_by_level[lvl]
-            level_depth = cum_bid_by_level[lvl] + cum_ask_by_level[lvl]
-            feat_list.append(self._safe_div(ofi_val, level_depth, 0.0))
             feat_list.append(self._safe_div(ofi_val, depth_5bps_total, 0.0))
         for level in ROLLING_OFI_LEVELS:
             depth_l = cum_bid_by_level[level] + cum_ask_by_level[level]
@@ -4513,14 +4489,11 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             window_seconds = max(ms / 1000.0, 1e-9)
             bid_price_change_count = float(len(self._bid_price_change_deques[ms]))
-            ask_price_change_count = float(len(self._ask_price_change_deques[ms]))
             bid_l1_depletion = l1_depletion[ms][0]
             ask_l1_depletion = l1_depletion[ms][1]
             feat_list.extend([
-                self._safe_div(spread_delta_bps[ms], max(abs(spread_bps), 1e-12), 0.0),
                 float(len(self._spread_change_deques[ms])),
                 bid_price_change_count / window_seconds,
-                ask_price_change_count / window_seconds,
                 bid_l1_depletion,
                 ask_l1_depletion,
                 self._safe_div(bid_l1_depletion, max(bsz1, 1e-9), 0.0),
@@ -4535,22 +4508,21 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             rates = replen_rates[ms]
             bid_add_rate = rates[("bid", 1, "add")] * 1000.0
-            bid_rem_rate = rates[("bid", 1, "rem")] * 1000.0
             ask_add_rate = rates[("ask", 1, "add")] * 1000.0
-            ask_rem_rate = rates[("ask", 1, "rem")] * 1000.0
-            feat_list.extend([
-                self._safe_div(bid_add_rate, max(bsz1, 1e-9), 0.0),
-                self._safe_div(bid_rem_rate, max(bsz1, 1e-9), 0.0),
-                self._safe_div(ask_add_rate, max(asz1, 1e-9), 0.0),
-                self._safe_div(ask_rem_rate, max(asz1, 1e-9), 0.0),
-            ])
+            feat_list.append(self._safe_div(bid_add_rate, max(bsz1, 1e-9), 0.0))
+            if ms == 200:
+                bid_rem_rate = rates[("bid", 1, "rem")] * 1000.0
+                feat_list.append(self._safe_div(bid_rem_rate, max(bsz1, 1e-9), 0.0))
+            feat_list.append(self._safe_div(ask_add_rate, max(asz1, 1e-9), 0.0))
 
         for ms in FLOW_WINDOWS_MS:
             s = trade_stats_by_ms[ms]
+            if ms == 200:
+                feat_list.append(s["signed_notional_flow_usd"])
+            feat_list.append(s["signed_trade_count_imbalance"])
+            if ms != 200:
+                feat_list.append(s["trade_imbalance_notional"])
             feat_list.extend([
-                s["signed_notional_flow_usd"],
-                s["signed_trade_count_imbalance"],
-                s["trade_imbalance_notional"],
                 s["trade_toxicity_notional"],
                 s["zero_tick_fraction"],
                 s["tick_sign_imbalance"],
@@ -4568,8 +4540,9 @@ class FeatureEngine:
         ])
         for ms in FLOW_WINDOWS_MS:
             c = cvd_stats_by_ms[ms]
+            if ms != 200:
+                feat_list.append(c["cvd_change_usd"])
             feat_list.extend([
-                c["cvd_change_usd"],
                 c["cvd_slope_usd_per_sec"],
                 c["cvd_minus_ema_usd"],
             ])
@@ -4579,10 +4552,9 @@ class FeatureEngine:
         ])
         for ms in FLOW_WINDOWS_MS:
             large_stats = large_stats_by_ms[ms]
-            feat_list.extend([
-                large_stats[f"max_signed_trade_notional_usd_{ms}ms"],
-                large_stats[f"top5_trade_notional_sum_usd_{ms}ms"],
-            ])
+            if ms != 200:
+                feat_list.append(large_stats[f"max_signed_trade_notional_usd_{ms}ms"])
+            feat_list.append(large_stats[f"top5_trade_notional_sum_usd_{ms}ms"])
         for ms in FLOW_WINDOWS_MS:
             s = trade_stats_by_ms[ms]
             mid_ret_bps = price_features_by_window[ms][0] if ms in price_features_by_window else (
@@ -4590,13 +4562,9 @@ class FeatureEngine:
             )
             buy_notional_scaled = s["buy_notional_usd"] / 100_000.0
             sell_notional_scaled = s["sell_notional_usd"] / 100_000.0
-            buy_flow_without_price_up = buy_notional_scaled * math.exp(max(-max(mid_ret_bps, 0.0), -50.0))
-            sell_flow_without_price_down = sell_notional_scaled * math.exp(max(-max(-mid_ret_bps, 0.0), -50.0))
             absorption_ask = buy_notional_scaled / max(0.25, max(mid_ret_bps, 0.0))
             absorption_bid = sell_notional_scaled / max(0.25, max(-mid_ret_bps, 0.0))
             absorption_values = [
-                buy_flow_without_price_up,
-                sell_flow_without_price_down,
                 absorption_bid,
                 absorption_ask,
             ]
@@ -4605,14 +4573,13 @@ class FeatureEngine:
                     raise ValueError(f"Non-finite absorption stat idx={i} value={value!r} at ts_ms={ts_ms} window={ms}")
             feat_list.extend(absorption_values)
 
-        for ms in FLOW_WINDOWS_MS:
-            feat_list.append(return_std_bps[ms])
+        feat_list.append(return_std_bps[200])
         for ms in REGIME_WINDOWS_MS:
             dist = self._regime_distribution(ms)
+            feat_list.append(regime_volume[ms])
+            if ms == 3_000:
+                feat_list.append(regime_flow_snapshot[ms])
             feat_list.extend([
-                regime_volume[ms],
-                regime_realized[ms],
-                regime_flow_snapshot[ms],
                 dist["down_up_vol_imbalance"],
                 dist["max_abs_return_bps"],
             ])
@@ -4653,8 +4620,8 @@ class FeatureEngine:
                 f"len(feature_names)={len(names)}"
             )
         feat = np.asarray(feat_list, dtype=np.float64)
-        if len(names) != 239:
-            raise ValueError(f"Expected pruned raw core dim 239, got {len(names)}")
+        if len(names) != 187:
+            raise ValueError(f"Expected pruned raw core dim 187, got {len(names)}")
         if self.strict_feature_validation:
             if not np.all(np.isfinite(feat)):
                 bad_idx = np.flatnonzero(~np.isfinite(feat))
@@ -4664,8 +4631,8 @@ class FeatureEngine:
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
         feat_out = self._transform_features(feat, ob_dt_ms)
-        if feat_out.shape != (239,):
-            raise ValueError(f"Expected transformed feature shape (239,), got {feat_out.shape}")
+        if feat_out.shape != (187,):
+            raise ValueError(f"Expected transformed feature shape (187,), got {feat_out.shape}")
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
