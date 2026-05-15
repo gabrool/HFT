@@ -506,9 +506,10 @@ def validate_contract_meta(meta: dict, source: str) -> None:
         and bool(meta.get("feature_transform_spec_hash"))
         and int(meta.get("feature_transform_warmup_rows", -1)) == int(FEATURE_TRANSFORM_WARMUP_ROWS)
         and meta.get("aux_schema") == AUX_SCHEMA
-        and meta.get("checkpoint_schema_expected") == CHECKPOINT_SCHEMA
         and meta.get("target_transform") == TARGET_TRANSFORM
         and meta.get("target_task") == TARGET_TASK
+        and meta.get("label_trim_schema") == LABEL_TRIM_SCHEMA
+        and list(map(int, meta.get("horizons_ms", []))) == [int(h) for h in HORIZONS_MS]
         and int(meta.get("label_dim", -1)) == NUM_HORIZONS
         and int(meta.get("aux_dim", -1)) == AUX_DIM
         and list(meta.get("aux_names", [])) == list(FEATURE_AUX_TAIL)
@@ -519,15 +520,30 @@ def validate_contract_meta(meta: dict, source: str) -> None:
     )
     if not ok:
         raise ValueError(
-            "Old or incompatible offline dataset. Rerun offline_ingest.py with "
-            f"FEATURE_SCHEMA={FEATURE_SCHEMA}. "
-            f"Expected TARGET_TASK={TARGET_TASK}, TARGET_TRANSFORM={TARGET_TRANSFORM}, CHECKPOINT_SCHEMA={CHECKPOINT_SCHEMA}."
+            "Old or incompatible offline dataset. Expected offline data contract: "
+            f"FEATURE_SCHEMA={FEATURE_SCHEMA}, "
+            f"FEATURE_TRANSFORM={FEATURE_TRANSFORM}, "
+            f"FEATURE_TRANSFORM_POLICY={FEATURE_TRANSFORM_POLICY}, "
+            f"FEATURE_TRANSFORM_WARMUP_ROWS={FEATURE_TRANSFORM_WARMUP_ROWS}, "
+            f"AUX_SCHEMA={AUX_SCHEMA}, AUX_DIM={AUX_DIM}, "
+            f"TARGET_TASK={TARGET_TASK}, TARGET_TRANSFORM={TARGET_TRANSFORM}, "
+            f"LABEL_TRIM_SCHEMA={LABEL_TRIM_SCHEMA}, HORIZONS_MS={[int(h) for h in HORIZONS_MS]}, "
+            f"label_dim={NUM_HORIZONS}, feature_dim_total=feature_dim_core+{AUX_DIM}."
         )
     expected_spec_hash = feature_transform_spec_hash(list(meta.get("feature_names", [])))
     if str(meta.get("feature_transform_spec_hash")) != expected_spec_hash:
         raise ValueError(
             "Old or incompatible offline dataset transform spec hash. Rerun offline_ingest.py with "
             f"FEATURE_SCHEMA={FEATURE_SCHEMA}."
+        )
+
+    stored_ckpt_schema = meta.get("checkpoint_schema_expected")
+    if stored_ckpt_schema and stored_ckpt_schema != CHECKPOINT_SCHEMA:
+        print(
+            "[contract-warning] dataset checkpoint_schema_expected differs from current model "
+            f"stored={stored_ckpt_schema!r} current={CHECKPOINT_SCHEMA!r}; "
+            "allowed because checkpoint schema is model-side, not offline data-side.",
+            flush=True,
         )
 
 
