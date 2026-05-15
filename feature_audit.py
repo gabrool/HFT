@@ -415,6 +415,21 @@ def best_balanced_accuracy(y01: np.ndarray, x: np.ndarray) -> Tuple[float, float
     return float(best), float(best_thr)
 
 
+
+def sign_balanced_accuracy(y01: np.ndarray, x: np.ndarray) -> float:
+    mask = np.isfinite(x) & np.isfinite(y01)
+    y = y01[mask].astype(np.int8, copy=False)
+    xx = x[mask]
+    if xx.size < 3 or len(np.unique(y)) < 2:
+        return float("nan")
+
+    ba_pos = balanced_accuracy_at_threshold(y, xx, 0.0)
+    ba_neg = balanced_accuracy_at_threshold(y, -xx, 0.0)
+
+    vals = [v for v in (ba_pos, ba_neg) if np.isfinite(v)]
+    return float(max(vals)) if vals else float("nan")
+
+
 def compute_health(X: np.ndarray, feature_names: List[str], week_id: np.ndarray, n_weeks: int) -> pd.DataFrame:
     rows = []
     for j, name in enumerate(feature_names):
@@ -526,7 +541,8 @@ def compute_target_metrics(
                 else:
                     auc_best = float("nan")
                     auc_sign = 0
-                bal_acc, bal_thr = best_balanced_accuracy(direction, xx)
+                bal_sign = sign_balanced_accuracy(direction, xx)
+                bal_best, bal_thr = best_balanced_accuracy(direction, xx)
                 rows.append({
                     "feature": name,
                     "feature_index": j,
@@ -539,8 +555,9 @@ def compute_target_metrics(
                     "spearman_abs_return": spearman_abs,
                     "single_feature_auc_direction": auc_best,
                     "single_feature_auc_direction_sign": auc_sign,
-                    "single_feature_bal_acc_sign": bal_acc,
-                    "single_feature_bal_acc_best_threshold": bal_thr,
+                    "single_feature_bal_acc_sign": bal_sign,
+                    "single_feature_bal_acc_best_threshold": bal_best,
+                    "single_feature_bal_acc_best_threshold_value": bal_thr,
                     "mi_direction": float(mi_dir[j]) if mask_type == "kept" else float("nan"),
                     "mi_abs_return": float(mi_abs[j]) if mask_type == "kept" else float("nan"),
                 })
@@ -600,21 +617,42 @@ class UnionFind:
         self.size[ra] += self.size[rb]
 
 
+def _has_token(n: str, token: str) -> bool:
+    return re.search(rf"(^|_){re.escape(token)}($|_)", n) is not None
+
+
 def parse_feature_name(name: str) -> dict:
     n = name.lower()
     family = "unknown"
-    if any(k in n for k in ("hour", "dow", "minute", "calendar", "tod")):
+    if "down_up_vol_imbalance" in n:
+        family = "volatility_regime"
+    elif (
+        _has_token(n, "utc_hour")
+        or _has_token(n, "utc_dow")
+        or _has_token(n, "hour")
+        or _has_token(n, "dow")
+        or _has_token(n, "minute")
+        or _has_token(n, "calendar")
+        or _has_token(n, "tod")
+        or n in {
+            "utc_hour_sin",
+            "utc_hour_cos",
+            "utc_dow_sin",
+            "utc_dow_cos",
+            "is_weekend",
+        }
+    ):
         family = "calendar"
     elif any(k in n for k in ("notional", "usd", "quote_qty")) and "flow" not in n:
         family = "notional_context"
+    elif "micro" in n or "vamp" in n:
+        family = "micro_vamp"
     elif any(k in n for k in ("best_bid", "best_ask", "mid", "top_book", "bbo")):
         family = "top_book"
     elif "spread" in n and ("regime" not in n and "depth" not in n):
         family = "spread_gap"
     elif any(k in n for k in ("return", "ret_", "logret")):
         family = "returns"
-    elif "vamp" in n:
-        family = "micro_vamp"
     elif "depth_imbalance" in n or ("depth" in n and "imb" in n):
         family = "depth_imbalance"
     elif "rolling_obi" in n or ("obi" in n and any(k in n for k in ("roll", "ema", "mean"))):
@@ -648,14 +686,20 @@ def parse_feature_name(name: str) -> dict:
     elif "depth" in n:
         family = "depth"
 
-    timescale = None
-    m = re.search(r"(\d+)(?:ms|_ms)\b", n)
-    if m:
-        timescale = int(m.group(1))
-    else:
-        m = re.search(r"(?:^|_)(\d+)(?:s|sec)\b", n)
-        if m:
-            timescale = int(m.group(1)) * 1000
+    timescales_ms: List[int] = []
+    for m in re.finditer(r"_(\d+)_minus_(\d+)ms\b", n):
+        timescales_ms.extend([int(m.group(1)), int(m.group(2))])
+    for m in re.finditer(r"(\d+)ms\b", n):
+        timescales_ms.append(int(m.group(1)))
+    for m in re.finditer(r"(?:^|_)(\d+)(?:s|sec)\b", n):
+        timescales_ms.append(int(m.group(1)) * 1000)
+    dedup = []
+    for t in timescales_ms:
+        if t not in dedup:
+            dedup.append(t)
+    timescales_ms = dedup
+    timescale = max(timescales_ms) if timescales_ms else None
+
     level = None
     m = re.search(r"(?:level|lvl|l)(\d+)", n)
     if m:
@@ -666,7 +710,7 @@ def parse_feature_name(name: str) -> dict:
         band_bps = int(m.group(1))
     side = "bid" if "bid" in n else ("ask" if "ask" in n else ("buy" if "buy" in n else ("sell" if "sell" in n else "")))
     is_relative = any(k in n for k in ("_minus_", "_over_", "_imbalance", "_slope", "_accel", "ratio"))
-    return {"family": family, "timescale_ms": timescale, "level": level, "band_bps": band_bps, "side": side, "is_relative": is_relative}
+    return {"family": family, "timescale_ms": timescale, "timescales_ms": json.dumps(timescales_ms), "level": level, "band_bps": band_bps, "side": side, "is_relative": is_relative}
 
 
 def compute_scores(target_df: pd.DataFrame, health_df: pd.DataFrame, feature_names: List[str], week_id: np.ndarray, X: np.ndarray, Y: np.ndarray, horizons_ms: List[int], masks_by_horizon: Dict[int, Dict[str, np.ndarray]]) -> pd.DataFrame:
@@ -785,7 +829,7 @@ def pair_decision(i: int, j: int, p: float, s: float, scores: pd.DataFrame) -> d
     return {"feature_i": ri["feature"], "feature_j": rj["feature"], "corr_pearson": p, "corr_spearman": s, "winner": winner, "loser": loser, "confidence": confidence, "reason": reason}
 
 
-def build_clusters_and_pairs(pearson: np.ndarray, spearman: np.ndarray, scores: pd.DataFrame, high: float) -> Tuple[pd.DataFrame, pd.DataFrame, dict, Dict[str, int], Dict[str, str], Dict[str, float]]:
+def build_clusters_and_pairs(pearson: np.ndarray, spearman: np.ndarray, scores: pd.DataFrame, high: float) -> Tuple[pd.DataFrame, pd.DataFrame, dict, Dict[str, int], Dict[str, str], Dict[str, float], Dict[str, str], Dict[str, str]]:
     F = scores.shape[0]
     uf = UnionFind(F)
     pair_rows = []
@@ -810,13 +854,18 @@ def build_clusters_and_pairs(pearson: np.ndarray, spearman: np.ndarray, scores: 
     for i in range(F):
         groups[uf.find(i)].append(i)
     cluster_id_by_feature: Dict[str, int] = {}
+    cluster_representative_by_feature: Dict[str, str] = {}
+    cluster_nonrep_reason_by_feature: Dict[str, str] = {}
     cluster_rows = []
     summary_clusters = []
     cid = 0
     for _, members in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[1][0])):
         if len(members) < 2:
             for i in members:
-                cluster_id_by_feature[str(scores.iloc[i]["feature"])] = -1
+                feature = str(scores.iloc[i]["feature"])
+                cluster_id_by_feature[feature] = -1
+                cluster_representative_by_feature[feature] = ""
+                cluster_nonrep_reason_by_feature[feature] = ""
             continue
         sub_scores = scores.iloc[members]
         rep_idx = int(sub_scores["keep_score"].astype(float).idxmax())
@@ -830,28 +879,57 @@ def build_clusters_and_pairs(pearson: np.ndarray, spearman: np.ndarray, scores: 
             r = scores.iloc[i]
             feature = str(r["feature"])
             cluster_id_by_feature[feature] = cid
+            cluster_representative_by_feature[feature] = rep_feature
             is_rep = feature == rep_feature
-            rec_action = "keep" if is_rep else ("remove_low_risk" if better_feature.get(feature) else "needs_ablation")
+            cluster_nonrep_reason_by_feature[feature] = "" if is_rep else "high_corr_cluster_nonrepresentative"
+            if is_rep:
+                rec_action = "keep"
+                rec_reason = "cluster_representative"
+            elif better_feature.get(feature):
+                rec_action = "remove_low_risk"
+                rec_reason = "high_corr_with_clear_better_feature"
+            else:
+                rec_action = "remove_if_budget_tight"
+                rec_reason = "high_corr_cluster_nonrepresentative_scores_close"
             cluster_rows.append({
                 "cluster_id": cid,
                 "cluster_size": len(members),
                 "feature": feature,
                 "is_representative": bool(is_rep),
+                "representative_feature": rep_feature,
                 "family": r["family"],
                 "timescale_ms": r["timescale_ms"],
                 "best_horizon_auc": r["best_horizon_auc"],
                 "best_horizon_abs_spearman": r["best_horizon_abs_spearman"],
                 "stability_score": r["stability_score"],
                 "recommended_action": rec_action,
-                "reason": "cluster_representative" if is_rep else f"high_corr_with_{rep_feature}",
+                "reason": rec_reason,
             })
         summary_clusters.append({"cluster_id": cid, "size": len(members), "representative": rep_feature, "features": feature_list, "max_pair_corr": max_pair_corr})
         cid += 1
     summary = {"n_clusters": cid, "clusters": summary_clusters}
-    return pd.DataFrame(cluster_rows), pd.DataFrame(pair_rows), summary, cluster_id_by_feature, better_feature, max_corr_with_better
+    return (
+        pd.DataFrame(cluster_rows),
+        pd.DataFrame(pair_rows),
+        summary,
+        cluster_id_by_feature,
+        better_feature,
+        max_corr_with_better,
+        cluster_representative_by_feature,
+        cluster_nonrep_reason_by_feature,
+    )
 
 
-def generate_removal_candidates(scores: pd.DataFrame, health_df: pd.DataFrame, cluster_id_by_feature: Dict[str, int], better_feature: Dict[str, str], max_corr_better: Dict[str, float], scores_by_feature: Dict[str, dict]) -> pd.DataFrame:
+def generate_removal_candidates(
+    scores: pd.DataFrame,
+    health_df: pd.DataFrame,
+    cluster_id_by_feature: Dict[str, int],
+    better_feature: Dict[str, str],
+    max_corr_better: Dict[str, float],
+    scores_by_feature: Dict[str, dict],
+    cluster_representative_by_feature: Dict[str, str],
+    cluster_nonrep_reason_by_feature: Dict[str, str],
+) -> pd.DataFrame:
     health = health_df.set_index("feature").to_dict("index")
     rows = []
     for _, r in scores.iterrows():
@@ -864,13 +942,19 @@ def generate_removal_candidates(scores: pd.DataFrame, health_df: pd.DataFrame, c
         mc = max_corr_better.get(feature, np.nan)
         rep_target = scores_by_feature.get(bf, {}).get("target_score", np.nan) if bf else np.nan
         redundant_low_risk = bool(bf) and np.isfinite(mc) and mc >= AUDIT_HIGH_CORR and (scores_by_feature[bf]["keep_score"] - float(r["keep_score"])) >= 0.05 and float(r["target_score"]) <= float(rep_target) * 1.05
-        no_unique_cluster_role = int(cluster_id_by_feature.get(feature, -1)) == -1
+        cluster_id = int(cluster_id_by_feature.get(feature, -1))
+        cluster_rep = cluster_representative_by_feature.get(feature, "")
+        is_cluster_nonrep = cluster_id != -1 and bool(cluster_rep) and cluster_rep != feature
+        no_unique_cluster_role = cluster_id == -1
         if health_bad:
             action = "remove_low_risk"
             reason = "health_bad"
         elif redundant_low_risk:
             action = "remove_low_risk"
             reason = f"redundant_with_better_feature:{bf}"
+        elif is_cluster_nonrep and not bf:
+            action = "remove_if_budget_tight"
+            reason = f"high_corr_cluster_nonrepresentative_scores_close:{cluster_rep}"
         elif low_target and unstable and no_unique_cluster_role:
             action = "remove_low_risk"
             reason = "low_target_unstable_no_unique_cluster_role"
@@ -893,7 +977,9 @@ def generate_removal_candidates(scores: pd.DataFrame, health_df: pd.DataFrame, c
             "stability_score": r["stability_score"],
             "max_corr_with_better_feature": mc,
             "better_feature": bf,
-            "cluster_id": int(cluster_id_by_feature.get(feature, -1)),
+            "cluster_id": cluster_id,
+            "cluster_representative_feature": cluster_rep,
+            "cluster_nonrep_reason": cluster_nonrep_reason_by_feature.get(feature, ""),
             "timescale_ms": r["timescale_ms"],
             "is_relative": r["is_relative"],
             "health_bad": health_bad,
@@ -919,8 +1005,36 @@ def component_guess(name: str) -> str:
     return ""
 
 
-def relative_report(scores: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: pd.DataFrame) -> pd.DataFrame:
+def find_component_candidates(component: str, feature_names: Sequence[str], limit: int = 5) -> List[str]:
+    c = component.lower()
+    out = []
+    for f in feature_names:
+        fl = f.lower()
+        if fl == c or fl.endswith(c) or c.endswith(fl) or c in fl:
+            out.append(f)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _best_reported_corr_with_candidates(feature: str, candidates: Sequence[str], corr_pairs: pd.DataFrame) -> Tuple[float, str]:
+    if corr_pairs.empty or not candidates:
+        return np.nan, ""
+    candidate_set = set(candidates)
+    sub = corr_pairs[
+        ((corr_pairs["feature_i"] == feature) & corr_pairs["feature_j"].isin(candidate_set))
+        | ((corr_pairs["feature_j"] == feature) & corr_pairs["feature_i"].isin(candidate_set))
+    ]
+    if sub.empty:
+        return np.nan, ""
+    best = sub.sort_values("max_abs_corr", ascending=False).iloc[0]
+    other = str(best["feature_j"] if best["feature_i"] == feature else best["feature_i"])
+    return float(best["max_abs_corr"]), other
+
+
+def relative_report(scores: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: pd.DataFrame, feature_names: Sequence[str]) -> pd.DataFrame:
     action_by_feature = removal_df.set_index("feature").to_dict("index")
+    feature_set = set(feature_names)
     rows = []
     for _, r in scores[scores["is_relative"] == True].iterrows():  # noqa: E712
         feature = str(r["feature"])
@@ -932,6 +1046,23 @@ def relative_report(scores: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: 
             best = sub.sort_values("max_abs_corr", ascending=False).iloc[0]
             mc = float(best["max_abs_corr"])
             mf = str(best["feature_j"] if best["feature_i"] == feature else best["feature_i"])
+
+        component_candidates: List[str] = []
+        if "_minus_" in feature or "_over_" in feature:
+            sep = "_minus_" if "_minus_" in feature else "_over_"
+            left_guess, right_guess = feature.split(sep, 1)
+            if right_guess not in feature_set:
+                right_guess = re.sub(r"_(\d+)ms$", "", right_guess)
+            for component in (left_guess, right_guess):
+                if component in feature_set:
+                    candidates = [component]
+                else:
+                    candidates = find_component_candidates(component, feature_names)
+                for candidate in candidates:
+                    if candidate != feature and candidate not in component_candidates:
+                        component_candidates.append(candidate)
+        component_mc, component_mf = _best_reported_corr_with_candidates(feature, component_candidates, corr_pairs)
+
         act = action_by_feature.get(feature, {})
         rows.append({
             "feature": feature,
@@ -939,8 +1070,11 @@ def relative_report(scores: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: 
             "timescale_ms": r["timescale_ms"],
             "is_relative": r["is_relative"],
             "components_guess": component_guess(feature),
-            "max_corr_with_component_like_feature": mc,
-            "most_correlated_feature": mf,
+            "max_corr_with_any_reported_feature": mc,
+            "most_correlated_reported_feature": mf,
+            "component_candidates_json": json.dumps(component_candidates),
+            "max_corr_with_component_candidate": component_mc,
+            "most_correlated_component_candidate": component_mf,
             "target_score": r["target_score"],
             "keep_score": r["keep_score"],
             "recommended_action": act.get("recommended_action", ""),
@@ -949,8 +1083,12 @@ def relative_report(scores: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: 
     return pd.DataFrame(rows)
 
 
-def family_summary(scores: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: pd.DataFrame, horizons_ms: List[int]) -> pd.DataFrame:
+def family_summary(scores: pd.DataFrame, target_df: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: pd.DataFrame, horizons_ms: List[int]) -> pd.DataFrame:
     action = removal_df.set_index("feature")["recommended_action"].to_dict()
+    feature_to_family = scores.set_index("feature")["family"].to_dict()
+    target_df2 = target_df.copy()
+    target_df2["family"] = target_df2["feature"].map(feature_to_family)
+    kept = target_df2[target_df2["mask_type"] == "kept"]
     rows = []
     for fam, grp in scores.groupby("family", dropna=False):
         features = set(str(x) for x in grp["feature"])
@@ -970,12 +1108,29 @@ def family_summary(scores: pd.DataFrame, corr_pairs: pd.DataFrame, removal_df: p
             "n_keep": int(sum(action.get(f) == "keep" for f in features)),
             "n_needs_ablation": int(sum(action.get(f) == "needs_ablation" for f in features)),
         }
-        # Score table stores only overall best AUC; expose it for common requested columns.
-        best_auc = float(grp["best_horizon_auc"].max()) if len(grp) else np.nan
         for h in (200, 500, 1000):
-            row[f"best_auc_{h}"] = best_auc if h in horizons_ms else np.nan
+            if h in horizons_ms:
+                vals = kept[(kept["family"] == fam) & (kept["horizon_ms"] == h)]["single_feature_auc_direction"]
+                row[f"best_auc_{h}"] = float(vals.max()) if len(vals) else np.nan
+            else:
+                row[f"best_auc_{h}"] = np.nan
         rows.append(row)
     return pd.DataFrame(rows).sort_values("family")
+
+
+
+def _self_test_parsers() -> None:
+    assert parse_feature_name("down_up_vol_imbalance_1000ms")["family"] == "volatility_regime"
+    assert parse_feature_name("utc_dow_sin")["family"] == "calendar"
+    assert parse_feature_name("micro_l1_minus_micro_l10_bps")["family"] == "micro_vamp"
+    assert parse_feature_name("micro_minus_mid_bps")["family"] == "micro_vamp"
+    assert parse_feature_name("micro_ret_bps_500ms")["family"] == "micro_vamp"
+    p = parse_feature_name("ofi_l3_accel_200_minus_500ms")
+    assert p["timescale_ms"] == 500
+    assert json.loads(p["timescales_ms"]) == [200, 500]
+    p = parse_feature_name("micro_ret_bps_1000ms")
+    assert p["timescale_ms"] == 1000
+    assert json.loads(p["timescales_ms"]) == [1000]
 
 
 def validate_meta(global_meta: dict) -> Tuple[int, int, int, List[str], List[str], List[int]]:
@@ -1014,6 +1169,7 @@ def main() -> None:
         raise SystemExit(f"Missing meta.json: {meta_path}")
     global_meta = read_json(meta_path)
     feature_dim_core, feature_dim_total, aux_dim, feature_names, aux_names, horizons_ms = validate_meta(global_meta)
+    _self_test_parsers()
     train_weeks = list(global_meta["splits"]["cmssl"]["train"]["weeks"])
     if AUDIT_USE_AUX:
         audit_feature_names = feature_names + aux_names
@@ -1057,7 +1213,16 @@ def main() -> None:
     print(f"[audit-corr] wrote {corr_path}", flush=True)
 
     scores_df = compute_scores(target_df, health_df, audit_feature_names, week_id, X, Y, horizons_ms, masks_by_horizon)
-    cluster_df, pair_df, cluster_summary, cluster_id_by_feature, better_feature, max_corr_better = build_clusters_and_pairs(pearson, spearman, scores_df, AUDIT_HIGH_CORR)
+    (
+        cluster_df,
+        pair_df,
+        cluster_summary,
+        cluster_id_by_feature,
+        better_feature,
+        max_corr_better,
+        cluster_representative_by_feature,
+        cluster_nonrep_reason_by_feature,
+    ) = build_clusters_and_pairs(pearson, spearman, scores_df, AUDIT_HIGH_CORR)
     clusters_path = out_dir / "feature_clusters.csv"
     cluster_df.to_csv(clusters_path, index=False)
     write_json(out_dir / "feature_cluster_summary.json", cluster_summary)
@@ -1066,13 +1231,22 @@ def main() -> None:
     print(f"[audit-clusters] clusters={cluster_summary['n_clusters']} wrote {clusters_path}", flush=True)
 
     scores_by_feature = scores_df.set_index("feature").to_dict("index")
-    removal_df = generate_removal_candidates(scores_df, health_df, cluster_id_by_feature, better_feature, max_corr_better, scores_by_feature)
+    removal_df = generate_removal_candidates(
+        scores_df,
+        health_df,
+        cluster_id_by_feature,
+        better_feature,
+        max_corr_better,
+        scores_by_feature,
+        cluster_representative_by_feature,
+        cluster_nonrep_reason_by_feature,
+    )
     removal_path = out_dir / "removal_candidates_low_risk.csv"
     removal_df.head(AUDIT_TOP_REMOVAL_CANDIDATES).to_csv(removal_path, index=False)
 
-    rel_df = relative_report(scores_df, corr_pairs_df, removal_df)
+    rel_df = relative_report(scores_df, corr_pairs_df, removal_df, audit_feature_names)
     rel_df.to_csv(out_dir / "relative_feature_report.csv", index=False)
-    fam_df = family_summary(scores_df, corr_pairs_df, removal_df, horizons_ms)
+    fam_df = family_summary(scores_df, target_df, corr_pairs_df, removal_df, horizons_ms)
     fam_df.to_csv(out_dir / "feature_family_summary.csv", index=False)
 
     unknown_count = int((scores_df["family"] == "unknown").sum())
@@ -1082,6 +1256,15 @@ def main() -> None:
     n_budget = int((removal_df["recommended_action"] == "remove_if_budget_tight").sum())
     n_ablate = int((removal_df["recommended_action"] == "needs_ablation").sum())
     print(f"[audit-removal] low_risk={n_low} budget_tight={n_budget} needs_ablation={n_ablate}", flush=True)
+
+    n_high_corr_cluster_nonrepresentatives = int(sum(1 for v in cluster_nonrep_reason_by_feature.values() if v))
+    nonrep_features = [f for f, v in cluster_nonrep_reason_by_feature.items() if v]
+    n_high_corr_cluster_nonrep_remove_if_budget_tight = int(
+        removal_df[
+            removal_df["feature"].isin(nonrep_features)
+            & (removal_df["recommended_action"] == "remove_if_budget_tight")
+        ].shape[0]
+    )
 
     summary = {
         "out_root": str(out_root),
@@ -1099,10 +1282,20 @@ def main() -> None:
         "corr_threshold_medium": AUDIT_MED_CORR,
         "n_features": int(len(audit_feature_names)),
         "n_clusters_high_corr": int(cluster_summary["n_clusters"]),
+        "n_high_corr_cluster_nonrepresentatives": n_high_corr_cluster_nonrepresentatives,
+        "n_high_corr_cluster_nonrep_remove_if_budget_tight": n_high_corr_cluster_nonrep_remove_if_budget_tight,
+        "n_parser_unknown_family": unknown_count,
+        "n_relative_features": int(scores_df["is_relative"].sum()),
         "n_remove_low_risk": n_low,
         "n_remove_if_budget_tight": n_budget,
         "n_needs_ablation": n_ablate,
         "top_removal_candidates": removal_df[removal_df["recommended_action"] == "remove_low_risk"].head(25).to_dict("records"),
+        "known_limitations": [
+            "single-feature metrics do not capture nonlinear interactions",
+            "mutual information is approximate and sample-dependent",
+            "relative feature component matching is heuristic",
+            "recommendations are pruning candidates, not final proof",
+        ],
         "warnings": sorted(set(warnings_out)),
     }
     write_json(out_dir / "feature_audit_summary.json", summary)
