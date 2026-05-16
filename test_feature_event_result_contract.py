@@ -1103,6 +1103,160 @@ def test_stage3_dcn_final_mixer_budget_close_to_linear() -> None:
     assert 0.90 <= ratio <= 1.10, (linear_params, dcn_params, ratio)
 
 
+def test_stage4_final_mixer_factory_hybrid() -> None:
+    from CMSSL17 import (
+        build_final_mixer,
+        HybridFinalMixer,
+        DMODEL,
+    )
+
+    mixer = build_final_mixer(
+        "hybrid",
+        in_feats=193,
+        c_internal=8,
+        final_in_dim=193 * 8,
+        d_model=DMODEL,
+        patch_count=99,
+        dropout=0.1,
+    )
+
+    assert isinstance(mixer, HybridFinalMixer)
+    assert mixer.final_in_dim == 193 * 8
+    assert mixer.d_model == DMODEL
+    assert mixer.swiglu_hidden_dim > 0
+    assert mixer.dcn_rank > 0
+    assert mixer.dcn_num_layers == 1
+
+
+def test_stage4_hybrid_final_mixer_shape_and_finite() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import HybridFinalMixer, DMODEL
+
+    torch.manual_seed(123)
+
+    mixer = HybridFinalMixer(
+        final_in_dim=193 * 8,
+        d_model=DMODEL,
+        swiglu_hidden_dim=128,
+        dcn_rank=8,
+        dcn_num_layers=1,
+        dropout=0.0,
+    )
+
+    x = torch.randn(2, 99, 193, 8)
+    y = mixer(x)
+
+    assert y.shape == (2, 99, DMODEL)
+    assert torch.isfinite(y).all()
+
+
+def test_stage4_hybrid_final_mixer_matches_manual_formula() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    import torch.nn.functional as F
+    from CMSSL17 import HybridFinalMixer, legacy_flatten_ci_tokens, DMODEL
+
+    torch.manual_seed(123)
+
+    B, P, F_dim, C_dim = 2, 11, 7, 3
+    final_in_dim = F_dim * C_dim
+
+    mixer = HybridFinalMixer(
+        final_in_dim=final_in_dim,
+        d_model=DMODEL,
+        swiglu_hidden_dim=16,
+        dcn_rank=4,
+        dcn_num_layers=1,
+        dropout=0.0,
+    )
+    mixer.eval()
+
+    ci_tokens = torch.randn(B, P, F_dim, C_dim)
+
+    with torch.no_grad():
+        y = mixer(ci_tokens)
+
+        x = legacy_flatten_ci_tokens(ci_tokens)
+        x0 = mixer.norm(x)
+
+        gate, value = mixer.swiglu_in_proj(x0).chunk(2, dim=-1)
+        h_swiglu = F.silu(gate) * value
+
+        x_dcn = x0
+        for layer in mixer.cross_layers:
+            x_dcn = layer(x0, x_dcn)
+
+        h = torch.cat([h_swiglu, x_dcn], dim=-1)
+        y_manual = mixer.out_proj(h)
+
+    assert torch.allclose(y, y_manual, atol=0.0, rtol=0.0)
+
+
+def test_stage4_hybrid_final_mixer_uses_legacy_flatten_order() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import HybridFinalMixer, legacy_flatten_ci_tokens, DMODEL
+
+    torch.manual_seed(123)
+
+    B, P, F_dim, C_dim = 2, 5, 7, 3
+    mixer = HybridFinalMixer(
+        final_in_dim=F_dim * C_dim,
+        d_model=DMODEL,
+        swiglu_hidden_dim=16,
+        dcn_rank=4,
+        dcn_num_layers=1,
+        dropout=0.0,
+    )
+
+    ci_tokens = torch.randn(B, P, F_dim, C_dim)
+    x = legacy_flatten_ci_tokens(ci_tokens)
+
+    with torch.no_grad():
+        x0 = mixer.norm(x)
+        gate, value = mixer.swiglu_in_proj(x0).chunk(2, dim=-1)
+
+    assert gate.shape == (B, P, 16)
+    assert value.shape == (B, P, 16)
+
+
+def test_stage4_hybrid_final_mixer_budget_close_to_linear() -> None:
+    if not _real_torch_available():
+        return
+
+    from CMSSL17 import (
+        HybridFinalMixer,
+        LinearFinalMixer,
+        DMODEL,
+        module_parameter_count,
+    )
+
+    final_in_dim = 193 * 8
+
+    linear = LinearFinalMixer(final_in_dim=final_in_dim, d_model=DMODEL)
+    hybrid = HybridFinalMixer(
+        final_in_dim=final_in_dim,
+        d_model=DMODEL,
+        swiglu_hidden_dim=128,
+        dcn_rank=8,
+        dcn_num_layers=1,
+        dropout=0.1,
+    )
+
+    linear_params = module_parameter_count(linear)
+    hybrid_params = module_parameter_count(hybrid)
+    ratio = hybrid_params / max(1, linear_params)
+
+    assert 0.90 <= ratio <= 1.10, (linear_params, hybrid_params, ratio)
+
+
 def test_stage3_extractor_final_proj_unavailable_for_dcn() -> None:
     # This is better as a manual env smoke test because CTN_FINAL_MIXER
     # is import-time config. See manual command in the Stage 3 instructions.
@@ -1886,6 +2040,11 @@ def main() -> None:
     test_stage3_dcn_low_rank_cross_layer_matches_manual_formula()
     test_stage3_dcn_final_mixer_uses_legacy_flatten_order()
     test_stage3_dcn_final_mixer_budget_close_to_linear()
+    test_stage4_final_mixer_factory_hybrid()
+    test_stage4_hybrid_final_mixer_shape_and_finite()
+    test_stage4_hybrid_final_mixer_matches_manual_formula()
+    test_stage4_hybrid_final_mixer_uses_legacy_flatten_order()
+    test_stage4_hybrid_final_mixer_budget_close_to_linear()
     test_v9_smallstable_model_width_contract()
     test_conv_encoder_layer_prenorm_identity_batchnorm()
     test_conv_encoder_layer_prenorm_identity_layernorm()

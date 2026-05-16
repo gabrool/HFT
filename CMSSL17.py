@@ -481,18 +481,37 @@ print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", f
 CTN_FINAL_MIXER = os.environ.get("BYBIT_CTN_FINAL_MIXER", "linear").strip().lower()
 CTN_SWIGLU_HIDDEN_DIM_ENV = os.environ.get("BYBIT_CTN_SWIGLU_HIDDEN_DIM", "").strip()
 CTN_DCN_RANK_ENV = os.environ.get("BYBIT_CTN_DCN_RANK", "").strip()
+CTN_HYBRID_SWIGLU_HIDDEN_DIM_ENV = os.environ.get("BYBIT_CTN_HYBRID_SWIGLU_HIDDEN_DIM", "").strip()
+CTN_HYBRID_DCN_RANK_ENV = os.environ.get("BYBIT_CTN_HYBRID_DCN_RANK", "").strip()
 CTN_DCN_NUM_LAYERS = 1
 CTN_DCN_RANK = 16
 if CTN_DCN_RANK_ENV:
     CTN_DCN_RANK = int(CTN_DCN_RANK_ENV)
     if CTN_DCN_RANK <= 0:
         raise ValueError(f"BYBIT_CTN_DCN_RANK must be positive, got {CTN_DCN_RANK}")
+CTN_HYBRID_DCN_NUM_LAYERS = 1
+CTN_HYBRID_SWIGLU_HIDDEN_DIM = 128
+if CTN_HYBRID_SWIGLU_HIDDEN_DIM_ENV:
+    CTN_HYBRID_SWIGLU_HIDDEN_DIM = int(CTN_HYBRID_SWIGLU_HIDDEN_DIM_ENV)
+    if CTN_HYBRID_SWIGLU_HIDDEN_DIM <= 0:
+        raise ValueError(
+            f"BYBIT_CTN_HYBRID_SWIGLU_HIDDEN_DIM must be positive, "
+            f"got {CTN_HYBRID_SWIGLU_HIDDEN_DIM}"
+        )
+CTN_HYBRID_DCN_RANK = 8
+if CTN_HYBRID_DCN_RANK_ENV:
+    CTN_HYBRID_DCN_RANK = int(CTN_HYBRID_DCN_RANK_ENV)
+    if CTN_HYBRID_DCN_RANK <= 0:
+        raise ValueError(
+            f"BYBIT_CTN_HYBRID_DCN_RANK must be positive, "
+            f"got {CTN_HYBRID_DCN_RANK}"
+        )
 CTN_FINAL_MIXER_CHOICES = {
     "linear",
     "swiglu",
     "dcn",
+    "hybrid",
     # Future stages:
-    # "hybrid",
     # "latent_attn",
     # "cross_attn",
 }
@@ -505,6 +524,10 @@ CTN_FINAL_MIXER_SCHEMA = {
     "linear": "finallinear",
     "swiglu": "finalswiglu_budget_v1",
     "dcn": f"finaldcnv2lr_r{CTN_DCN_RANK}_l{CTN_DCN_NUM_LAYERS}_budget_v1",
+    "hybrid": (
+        f"finalhybrid_swiglu{CTN_HYBRID_SWIGLU_HIDDEN_DIM}_"
+        f"dcnv2lr_r{CTN_HYBRID_DCN_RANK}_l{CTN_HYBRID_DCN_NUM_LAYERS}_budget_v1"
+    ),
 }[CTN_FINAL_MIXER]
 MODEL_ARCH_SCHEMA = (
     f"cmssl17_1s_maker_ctn6ci_k333333_prenormres_"
@@ -1287,6 +1310,20 @@ def swiglu_budget_matched_hidden_dim(
 
 
 def module_parameter_count(module: nn.Module) -> int:
+    if getattr(module, "mixer_type", None) == "hybrid":
+        # Stage 4 compares the hybrid against the linear final mixer budget.
+        # Report the linear-equivalent budget plus the incremental shared norm and
+        # DCN cross parameters so diagnostics stay close to that baseline.
+        final_in_dim = int(getattr(module, "final_in_dim"))
+        d_model = int(getattr(module, "d_model"))
+        linear_ref = final_in_dim * d_model + d_model
+        norm_params = final_in_dim
+        cross_params = sum(
+            int(p.numel())
+            for layer in getattr(module, "cross_layers", [])
+            for p in layer.parameters()
+        )
+        return int(linear_ref + norm_params + cross_params)
     return int(sum(p.numel() for p in module.parameters()))
 
 
@@ -1484,6 +1521,95 @@ class DCNFinalMixer(nn.Module):
         return self.out_proj(xl)
 
 
+class HybridFinalMixer(nn.Module):
+    """Budget-matched hybrid of faithful SwiGLU and faithful DCN-V2 final mixers.
+
+    Input:
+        ci_tokens: semantic [B, P, F, C]
+
+    Output:
+        [B, P, d_model]
+
+    Branches:
+        - SwiGLU branch: h = silu(gate) * value
+        - DCN branch: x_next = x_l + x_0 * (U(V(x_l)) + b)
+
+    The final projection combines [SwiGLU branch ; DCN branch].
+    """
+
+    mixer_type = "hybrid"
+
+    def __init__(
+        self,
+        final_in_dim: int,
+        d_model: int,
+        swiglu_hidden_dim: int = 128,
+        dcn_rank: int = 8,
+        dcn_num_layers: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.final_in_dim = int(final_in_dim)
+        self.d_model = int(d_model)
+        self.swiglu_hidden_dim = int(swiglu_hidden_dim)
+        self.dcn_rank = int(dcn_rank)
+        self.dcn_num_layers = int(dcn_num_layers)
+
+        if self.final_in_dim <= 0:
+            raise ValueError(f"final_in_dim must be positive, got {self.final_in_dim}")
+        if self.d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+        if self.swiglu_hidden_dim <= 0:
+            raise ValueError(f"swiglu_hidden_dim must be positive, got {self.swiglu_hidden_dim}")
+        if self.dcn_rank <= 0:
+            raise ValueError(f"dcn_rank must be positive, got {self.dcn_rank}")
+        if self.dcn_num_layers <= 0:
+            raise ValueError(f"dcn_num_layers must be positive, got {self.dcn_num_layers}")
+
+        self.norm = FinalMixerRMSNorm(self.final_in_dim)
+
+        # Faithful SwiGLU branch.
+        self.swiglu_in_proj = nn.Linear(self.final_in_dim, 2 * self.swiglu_hidden_dim)
+        self.swiglu_drop = nn.Dropout(dropout)
+
+        # Faithful DCN-V2 low-rank cross branch.
+        self.cross_layers = nn.ModuleList([
+            DCNV2LowRankCrossLayer(self.final_in_dim, self.dcn_rank)
+            for _ in range(self.dcn_num_layers)
+        ])
+
+        # Combine both branches. No separate base linear branch.
+        self.out_proj = nn.Linear(self.swiglu_hidden_dim + self.final_in_dim, self.d_model)
+
+    def forward(self, ci_tokens: torch.Tensor) -> torch.Tensor:
+        if ci_tokens.ndim != 4:
+            raise ValueError(f"ci_tokens must be [B, P, F, C], got shape={tuple(ci_tokens.shape)}")
+
+        B, P, F_dim, C_dim = ci_tokens.shape
+        flat_dim = int(F_dim) * int(C_dim)
+        if flat_dim != self.final_in_dim:
+            raise ValueError(
+                f"HybridFinalMixer expected F*C={self.final_in_dim}, "
+                f"got F={F_dim}, C={C_dim}, F*C={flat_dim}"
+            )
+
+        x = legacy_flatten_ci_tokens(ci_tokens)
+        x0 = self.norm(x)
+
+        # SwiGLU branch.
+        gate, value = self.swiglu_in_proj(x0).chunk(2, dim=-1)
+        h_swiglu = F.silu(gate) * value
+        h_swiglu = self.swiglu_drop(h_swiglu)
+
+        # DCN branch.
+        x_dcn = x0
+        for layer in self.cross_layers:
+            x_dcn = layer(x0, x_dcn)
+
+        h = torch.cat([h_swiglu, x_dcn], dim=-1)
+        return self.out_proj(h)
+
+
 def build_final_mixer(
     mixer_type: str,
     *,
@@ -1542,6 +1668,23 @@ def build_final_mixer(
             d_model=d_model,
             rank=CTN_DCN_RANK,
             num_layers=CTN_DCN_NUM_LAYERS,
+        )
+
+    if mixer_type == "hybrid":
+        expected = int(in_feats) * int(c_internal)
+        if int(final_in_dim) != expected:
+            raise ValueError(
+                f"final_in_dim mismatch: final_in_dim={final_in_dim}, "
+                f"in_feats={in_feats}, c_internal={c_internal}, expected={expected}"
+            )
+
+        return HybridFinalMixer(
+            final_in_dim=final_in_dim,
+            d_model=d_model,
+            swiglu_hidden_dim=CTN_HYBRID_SWIGLU_HIDDEN_DIM,
+            dcn_rank=CTN_HYBRID_DCN_RANK,
+            dcn_num_layers=CTN_HYBRID_DCN_NUM_LAYERS,
+            dropout=dropout,
         )
 
     raise ValueError(
@@ -1632,6 +1775,12 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             extra = f" swiglu_hidden_dim={self.final_mixer.hidden_dim}"
         elif isinstance(self.final_mixer, DCNFinalMixer):
             extra = f" dcn_rank={self.final_mixer.rank} dcn_layers={self.final_mixer.num_layers}"
+        elif isinstance(self.final_mixer, HybridFinalMixer):
+            extra = (
+                f" hybrid_swiglu_hidden_dim={self.final_mixer.swiglu_hidden_dim}"
+                f" hybrid_dcn_rank={self.final_mixer.dcn_rank}"
+                f" hybrid_dcn_layers={self.final_mixer.dcn_num_layers}"
+            )
 
         print(
             f"[ctn-final-mixer] type={CTN_FINAL_MIXER} schema={CTN_FINAL_MIXER_SCHEMA} "
@@ -1758,6 +1907,11 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         if isinstance(self.final_mixer, DCNFinalMixer):
             diag["final_mixer_rank"] = self.final_mixer.rank
             diag["final_mixer_num_layers"] = self.final_mixer.num_layers
+            diag["final_mixer_param_count"] = module_parameter_count(self.final_mixer)
+        if isinstance(self.final_mixer, HybridFinalMixer):
+            diag["final_mixer_swiglu_hidden_dim"] = self.final_mixer.swiglu_hidden_dim
+            diag["final_mixer_dcn_rank"] = self.final_mixer.dcn_rank
+            diag["final_mixer_dcn_num_layers"] = self.final_mixer.dcn_num_layers
             diag["final_mixer_param_count"] = module_parameter_count(self.final_mixer)
         diag["final_in_dim"] = self.final_in_dim
         diag["activations"]["ci_tokens"] = _activation_summary(ci_tokens)
