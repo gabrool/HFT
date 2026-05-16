@@ -879,6 +879,98 @@ def test_stage1_extractor_final_proj_compatibility_property() -> None:
     assert extractor.final_proj.out_features == DMODEL
 
 
+def test_stage2_final_mixer_factory_swiglu() -> None:
+    from CMSSL17 import (
+        build_final_mixer,
+        SwiGLUFinalMixer,
+        DMODEL,
+    )
+
+    mixer = build_final_mixer(
+        "swiglu",
+        in_feats=193,
+        c_internal=8,
+        final_in_dim=193 * 8,
+        d_model=DMODEL,
+        patch_count=99,
+        dropout=0.1,
+    )
+    assert isinstance(mixer, SwiGLUFinalMixer)
+    assert mixer.final_in_dim == 193 * 8
+    assert mixer.d_model == DMODEL
+    assert mixer.hidden_dim > 0
+
+
+def test_stage2_swiglu_final_mixer_shape_and_finite() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import SwiGLUFinalMixer, DMODEL
+
+    torch.manual_seed(123)
+    mixer = SwiGLUFinalMixer(final_in_dim=193 * 8, d_model=DMODEL, dropout=0.0)
+
+    x = torch.randn(2, 99, 193, 8)
+    y = mixer(x)
+
+    assert y.shape == (2, 99, DMODEL)
+    assert torch.isfinite(y).all()
+
+
+def test_stage2_swiglu_final_mixer_uses_legacy_flatten_order() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    import torch.nn.functional as F
+    from CMSSL17 import SwiGLUFinalMixer, legacy_flatten_ci_tokens, DMODEL
+
+    torch.manual_seed(123)
+
+    B, P, F_dim, C_dim = 2, 11, 7, 3
+    final_in_dim = F_dim * C_dim
+    mixer = SwiGLUFinalMixer(final_in_dim=final_in_dim, d_model=DMODEL, hidden_dim=32, dropout=0.0)
+    mixer.eval()
+
+    ci_tokens = torch.randn(B, P, F_dim, C_dim)
+
+    with torch.no_grad():
+        y = mixer(ci_tokens)
+
+        x = legacy_flatten_ci_tokens(ci_tokens)
+        xn = mixer.norm(x)
+        gate, value = mixer.in_proj(xn).chunk(2, dim=-1)
+        h = F.silu(gate) * value
+        y_manual = mixer.out_proj(h)
+
+    assert torch.allclose(y, y_manual, atol=0.0, rtol=0.0)
+
+
+def test_stage2_swiglu_final_mixer_budget_close_to_linear() -> None:
+    if not _real_torch_available():
+        return
+
+    from CMSSL17 import (
+        SwiGLUFinalMixer,
+        LinearFinalMixer,
+        DMODEL,
+        module_parameter_count,
+        swiglu_budget_matched_hidden_dim,
+    )
+
+    final_in_dim = 193 * 8
+    assert swiglu_budget_matched_hidden_dim(final_in_dim, DMODEL) == 224
+    linear = LinearFinalMixer(final_in_dim=final_in_dim, d_model=DMODEL)
+    swiglu = SwiGLUFinalMixer(final_in_dim=final_in_dim, d_model=DMODEL, dropout=0.1)
+
+    linear_params = module_parameter_count(linear)
+    swiglu_params = module_parameter_count(swiglu)
+    ratio = swiglu_params / max(1, linear_params)
+
+    assert 0.90 <= ratio <= 1.10, (linear_params, swiglu_params, ratio)
+
+
 def test_v9_smallstable_model_width_contract() -> None:
     from CMSSL17 import (
         DMODEL,
@@ -1647,6 +1739,10 @@ def main() -> None:
     test_stage1_linear_final_mixer_shape_and_finite()
     test_stage1_linear_final_mixer_equivalent_to_old_final_proj_order()
     test_stage1_extractor_final_proj_compatibility_property()
+    test_stage2_final_mixer_factory_swiglu()
+    test_stage2_swiglu_final_mixer_shape_and_finite()
+    test_stage2_swiglu_final_mixer_uses_legacy_flatten_order()
+    test_stage2_swiglu_final_mixer_budget_close_to_linear()
     test_v9_smallstable_model_width_contract()
     test_conv_encoder_layer_prenorm_identity_batchnorm()
     test_conv_encoder_layer_prenorm_identity_layernorm()

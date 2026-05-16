@@ -479,11 +479,11 @@ print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", f
 # Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final mixer -> [B, patch_count, DMODEL].
 # No gate, no MLP projection, no mixed ConvTimeNet stack.
 CTN_FINAL_MIXER = os.environ.get("BYBIT_CTN_FINAL_MIXER", "linear").strip().lower()
+CTN_SWIGLU_HIDDEN_DIM_ENV = os.environ.get("BYBIT_CTN_SWIGLU_HIDDEN_DIM", "").strip()
 CTN_FINAL_MIXER_CHOICES = {
     "linear",
-    # Stage 1 only implements "linear".
-    # Future stages will add:
-    # "swiglu",
+    "swiglu",
+    # Future stages:
     # "dcn",
     # "hybrid",
     # "latent_attn",
@@ -496,6 +496,7 @@ if CTN_FINAL_MIXER not in CTN_FINAL_MIXER_CHOICES:
     )
 CTN_FINAL_MIXER_SCHEMA = {
     "linear": "finallinear",
+    "swiglu": "finalswiglu_budget_v1",
 }[CTN_FINAL_MIXER]
 MODEL_ARCH_SCHEMA = (
     f"cmssl17_1s_maker_ctn6ci_k333333_prenormres_"
@@ -1237,6 +1238,50 @@ def legacy_flatten_ci_tokens(ci_tokens: torch.Tensor) -> torch.Tensor:
     return ci_tokens.permute(0, 1, 3, 2).contiguous().reshape(B, P, F_dim * C_dim)
 
 
+class FinalMixerRMSNorm(nn.Module):
+    """RMSNorm over the last dimension for final-mixer flat inputs."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = int(dim)
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(self.dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != self.dim:
+            raise ValueError(f"FinalMixerRMSNorm expected last dim={self.dim}, got {x.shape[-1]}")
+        xf = x.float()
+        rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        y = x * rms.to(dtype=x.dtype)
+        return y * self.weight.to(dtype=x.dtype)
+
+
+def _round_to_multiple(x: float, multiple: int) -> int:
+    multiple = int(multiple)
+    return max(multiple, int(round(float(x) / multiple)) * multiple)
+
+
+def swiglu_budget_matched_hidden_dim(
+    final_in_dim: int,
+    d_model: int,
+    *,
+    multiple: int = 32,
+) -> int:
+    """Choose SwiGLU hidden dim so parameter count is close to Linear(final_in_dim -> d_model).
+
+    Ignoring RMSNorm's small vector, solve:
+        final_in_dim * d_model ~= h * (2 * final_in_dim + d_model)
+    """
+    final_in_dim = int(final_in_dim)
+    d_model = int(d_model)
+    raw = (final_in_dim * d_model) / max(1, (2 * final_in_dim + d_model))
+    return _round_to_multiple(raw, multiple)
+
+
+def module_parameter_count(module: nn.Module) -> int:
+    return int(sum(p.numel() for p in module.parameters()))
+
+
 class LinearFinalMixer(nn.Module):
     """Baseline final mixer equivalent to the old final_proj.
 
@@ -1274,6 +1319,63 @@ class LinearFinalMixer(nn.Module):
         return self.proj(x)
 
 
+class SwiGLUFinalMixer(nn.Module):
+    """Budget-matched SwiGLU / gated-bilinear final mixer.
+
+    Input:
+        ci_tokens: semantic [B, P, F, C]
+
+    Output:
+        [B, P, d_model]
+
+    This consumes the same legacy flat order as LinearFinalMixer so flat-vector
+    mixer comparisons remain fair and only the mixer architecture changes.
+    """
+
+    mixer_type = "swiglu"
+
+    def __init__(
+        self,
+        final_in_dim: int,
+        d_model: int,
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.final_in_dim = int(final_in_dim)
+        self.d_model = int(d_model)
+        if hidden_dim is None:
+            hidden_dim = swiglu_budget_matched_hidden_dim(self.final_in_dim, self.d_model)
+        self.hidden_dim = int(hidden_dim)
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
+
+        self.norm = FinalMixerRMSNorm(self.final_in_dim)
+        self.in_proj = nn.Linear(self.final_in_dim, 2 * self.hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(self.hidden_dim, self.d_model)
+
+    def forward(self, ci_tokens: torch.Tensor) -> torch.Tensor:
+        if ci_tokens.ndim != 4:
+            raise ValueError(f"ci_tokens must be [B, P, F, C], got shape={tuple(ci_tokens.shape)}")
+
+        B, P, F_dim, C_dim = ci_tokens.shape
+        flat_dim = int(F_dim) * int(C_dim)
+        if flat_dim != self.final_in_dim:
+            raise ValueError(
+                f"SwiGLUFinalMixer expected F*C={self.final_in_dim}, "
+                f"got F={F_dim}, C={C_dim}, F*C={flat_dim}"
+            )
+
+        x = legacy_flatten_ci_tokens(ci_tokens)
+        x = self.norm(x)
+
+        gate, value = self.in_proj(x).chunk(2, dim=-1)
+        h = F.silu(gate) * value
+        h = self.drop(h)
+        return self.out_proj(h)
+
+
 def build_final_mixer(
     mixer_type: str,
     *,
@@ -1284,10 +1386,9 @@ def build_final_mixer(
     patch_count: int,
     dropout: float,
 ) -> nn.Module:
-    # ``patch_count`` and ``dropout`` are intentionally part of this stage-1
-    # factory interface so later mixer implementations can be added without
-    # changing ConvTimeNetFeatureExtractor wiring.
-    del patch_count, dropout
+    # ``patch_count`` is intentionally part of the factory interface so later
+    # mixer implementations can be added without changing extractor wiring.
+    del patch_count
     mixer_type = str(mixer_type).strip().lower()
 
     if mixer_type == "linear":
@@ -1299,9 +1400,30 @@ def build_final_mixer(
             )
         return LinearFinalMixer(final_in_dim=final_in_dim, d_model=d_model)
 
+    if mixer_type == "swiglu":
+        expected = int(in_feats) * int(c_internal)
+        if int(final_in_dim) != expected:
+            raise ValueError(
+                f"final_in_dim mismatch: final_in_dim={final_in_dim}, "
+                f"in_feats={in_feats}, c_internal={c_internal}, expected={expected}"
+            )
+
+        hidden_dim = None
+        if CTN_SWIGLU_HIDDEN_DIM_ENV:
+            hidden_dim = int(CTN_SWIGLU_HIDDEN_DIM_ENV)
+            if hidden_dim <= 0:
+                raise ValueError(f"BYBIT_CTN_SWIGLU_HIDDEN_DIM must be positive, got {hidden_dim}")
+
+        return SwiGLUFinalMixer(
+            final_in_dim=final_in_dim,
+            d_model=d_model,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        )
+
     raise ValueError(
         f"Unsupported final mixer {mixer_type!r}; "
-        "Stage 1 only implements 'linear'."
+        f"supported choices are {sorted(CTN_FINAL_MIXER_CHOICES)}"
     )
 
 
@@ -1378,10 +1500,19 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             f"final_mixer={CTN_FINAL_MIXER} gate=disabled mixed=disabled",
             flush=True,
         )
+        linear_param_ref = (self.final_in_dim * d_model) + d_model
+        mixer_param_count = module_parameter_count(self.final_mixer)
+        ratio = mixer_param_count / max(1, linear_param_ref)
+
+        extra = ""
+        if isinstance(self.final_mixer, SwiGLUFinalMixer):
+            extra = f" swiglu_hidden_dim={self.final_mixer.hidden_dim}"
+
         print(
             f"[ctn-final-mixer] type={CTN_FINAL_MIXER} schema={CTN_FINAL_MIXER_SCHEMA} "
             f"in_feats={in_feats} c_internal={self.d_model_internal} "
-            f"final_in_dim={self.final_in_dim} d_model={d_model}",
+            f"final_in_dim={self.final_in_dim} d_model={d_model}{extra} "
+            f"params={mixer_param_count} linear_ref_params={linear_param_ref} ratio={ratio:.4f}",
             flush=True,
         )
 
@@ -1496,6 +1627,9 @@ class ConvTimeNetFeatureExtractor(nn.Module):
 
         diag["final_mixer_type"] = CTN_FINAL_MIXER
         diag["final_mixer_schema"] = CTN_FINAL_MIXER_SCHEMA
+        if isinstance(self.final_mixer, SwiGLUFinalMixer):
+            diag["final_mixer_hidden_dim"] = self.final_mixer.hidden_dim
+            diag["final_mixer_param_count"] = module_parameter_count(self.final_mixer)
         diag["final_in_dim"] = self.final_in_dim
         diag["activations"]["ci_tokens"] = _activation_summary(ci_tokens)
         diag["activations"]["ci_patch_flat"] = _activation_summary(ci_patch_flat)
