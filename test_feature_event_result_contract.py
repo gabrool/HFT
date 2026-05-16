@@ -1616,6 +1616,116 @@ def test_stage6_cross_attn_final_mixer_budget_close_to_linear() -> None:
     assert 0.90 <= ratio <= 1.10, (linear_params, cross_params, ratio)
 
 
+def test_stage5_latent_attn_disables_flash_sdp_in_subprocess() -> None:
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        r'''
+        import torch
+        import CMSSL17
+
+        print("mixer", CMSSL17.CTN_FINAL_MIXER)
+        if not torch.cuda.is_available():
+            print("sdpa_backend_checks_skipped no_cuda")
+        else:
+            print("flash", torch.backends.cuda.flash_sdp_enabled())
+            print("mem_eff", torch.backends.cuda.mem_efficient_sdp_enabled())
+            print("math", torch.backends.cuda.math_sdp_enabled())
+            if hasattr(torch.backends.cuda, "cudnn_sdp_enabled"):
+                print("cudnn", torch.backends.cuda.cudnn_sdp_enabled())
+
+            assert torch.backends.cuda.flash_sdp_enabled() is False
+            assert torch.backends.cuda.mem_efficient_sdp_enabled() is True
+            assert torch.backends.cuda.math_sdp_enabled() is True
+            if hasattr(torch.backends.cuda, "cudnn_sdp_enabled"):
+                assert torch.backends.cuda.cudnn_sdp_enabled() is False
+
+        assert CMSSL17.CTN_FINAL_MIXER == "latent_attn"
+        '''
+    )
+
+    env = os.environ.copy()
+    env["BYBIT_CTN_FINAL_MIXER"] = "latent_attn"
+    p = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=True,
+    )
+    assert "mixer latent_attn" in p.stdout
+    if "sdpa_backend_checks_skipped no_cuda" not in p.stdout:
+        assert "flash False" in p.stdout
+
+
+def test_stage6_cross_attn_disables_flash_sdp_in_subprocess() -> None:
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        r'''
+        import torch
+        import CMSSL17
+
+        assert CMSSL17.CTN_FINAL_MIXER == "cross_attn"
+        if not torch.cuda.is_available():
+            print("ok cross_attn no_cuda")
+        else:
+            assert torch.backends.cuda.flash_sdp_enabled() is False
+            assert torch.backends.cuda.mem_efficient_sdp_enabled() is True
+            assert torch.backends.cuda.math_sdp_enabled() is True
+            if hasattr(torch.backends.cuda, "cudnn_sdp_enabled"):
+                assert torch.backends.cuda.cudnn_sdp_enabled() is False
+            print("ok cross_attn flash disabled")
+        '''
+    )
+
+    env = os.environ.copy()
+    env["BYBIT_CTN_FINAL_MIXER"] = "cross_attn"
+    p = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=True,
+    )
+    assert (
+        "ok cross_attn flash disabled" in p.stdout
+        or "ok cross_attn no_cuda" in p.stdout
+    )
+
+
+def test_stage1_linear_does_not_force_disable_flash_sdp_in_subprocess() -> None:
+    import os
+    import subprocess
+    import sys
+
+    code = r'''
+import CMSSL17
+assert CMSSL17.CTN_FINAL_MIXER == "linear"
+print("ok linear import")
+'''
+
+    env = os.environ.copy()
+    env["BYBIT_CTN_FINAL_MIXER"] = "linear"
+    p = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=True,
+    )
+    assert "ok linear import" in p.stdout
+
+
 def test_stage3_extractor_final_proj_unavailable_for_dcn() -> None:
     # This is better as a manual env smoke test because CTN_FINAL_MIXER
     # is import-time config. See manual command in the Stage 3 instructions.
@@ -2414,6 +2524,9 @@ def main() -> None:
     test_stage6_cross_attn_final_mixer_matches_manual_formula()
     test_stage6_cross_attn_uses_semantic_feature_tokens()
     test_stage6_cross_attn_final_mixer_budget_close_to_linear()
+    test_stage5_latent_attn_disables_flash_sdp_in_subprocess()
+    test_stage6_cross_attn_disables_flash_sdp_in_subprocess()
+    test_stage1_linear_does_not_force_disable_flash_sdp_in_subprocess()
     test_v9_smallstable_model_width_contract()
     test_conv_encoder_layer_prenorm_identity_batchnorm()
     test_conv_encoder_layer_prenorm_identity_layernorm()

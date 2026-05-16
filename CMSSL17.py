@@ -491,6 +491,12 @@ CTN_CROSS_TOKEN_DIM_ENV = os.environ.get("BYBIT_CTN_CROSS_TOKEN_DIM", "").strip(
 CTN_CROSS_NUM_HEADS_ENV = os.environ.get("BYBIT_CTN_CROSS_NUM_HEADS", "").strip()
 CTN_CROSS_FF_MULT_ENV = os.environ.get("BYBIT_CTN_CROSS_FF_MULT", "").strip()
 CTN_CROSS_NUM_LAYERS_ENV = os.environ.get("BYBIT_CTN_CROSS_NUM_LAYERS", "").strip()
+CTN_DISABLE_FLASH_SDP_FOR_ATTENTION_MIXERS = (
+    os.environ.get("BYBIT_CTN_DISABLE_FLASH_SDP_FOR_ATTENTION_MIXERS", "1")
+    .strip()
+    .lower()
+    not in {"0", "false", "no", "off"}
+)
 CTN_DCN_NUM_LAYERS = 1
 CTN_DCN_RANK = 16
 if CTN_DCN_RANK_ENV:
@@ -605,6 +611,58 @@ CTN_FINAL_MIXER_SCHEMA = {
         f"h{CTN_CROSS_NUM_HEADS}_ff{CTN_CROSS_FF_MULT}_budget_v1"
     ),
 }[CTN_FINAL_MIXER]
+
+
+def configure_attention_sdp_backends_for_final_mixer() -> None:
+    """Avoid Flash SDP for final mixers that create huge batches of small attention calls.
+
+    latent_attn and cross_attn reshape [B, P] into [B*P] attention batches.
+    On the instance, PyTorch/Inductor selected FlashAttention and crashed with:
+        CUDA error: invalid configuration argument
+
+    This does not change model math. It only changes which exact SDPA backend
+    PyTorch uses for nn.MultiheadAttention / scaled_dot_product_attention.
+    """
+    if CTN_FINAL_MIXER not in {"latent_attn", "cross_attn"}:
+        return
+
+    if not CTN_DISABLE_FLASH_SDP_FOR_ATTENTION_MIXERS:
+        print(
+            f"[sdpa-config] final_mixer={CTN_FINAL_MIXER} "
+            "BYBIT_CTN_DISABLE_FLASH_SDP_FOR_ATTENTION_MIXERS=0; "
+            "leaving SDPA backends unchanged",
+            flush=True,
+        )
+        return
+
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+
+            # cuDNN SDPA exists in newer PyTorch versions. Disable it too for
+            # these feature-token attention variants if the API is available,
+            # so we avoid another fused SDPA backend selecting a bad kernel.
+            if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+                torch.backends.cuda.enable_cudnn_sdp(False)
+
+            print(
+                "[sdpa-config] final_mixer="
+                f"{CTN_FINAL_MIXER} flash_sdp=False "
+                "mem_efficient_sdp=True math_sdp=True cudnn_sdp=False",
+                flush=True,
+            )
+    except Exception as e:
+        print(
+            f"[sdpa-config-warning] failed to configure SDPA backends for "
+            f"final_mixer={CTN_FINAL_MIXER}: {type(e).__name__}: {e}",
+            flush=True,
+        )
+
+
+configure_attention_sdp_backends_for_final_mixer()
+
 MODEL_ARCH_SCHEMA = (
     f"cmssl17_1s_maker_ctn6ci_k333333_prenormres_"
     f"{CTN_FINAL_MIXER_SCHEMA}_"
