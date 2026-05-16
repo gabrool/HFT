@@ -66,6 +66,7 @@ def _install_optional_dependency_stubs() -> None:
         "Dropout",
         "LayerNorm",
         "BatchNorm1d",
+        "MultiheadAttention",
         "Sequential",
         "ModuleList",
     ):
@@ -1257,6 +1258,174 @@ def test_stage4_hybrid_final_mixer_budget_close_to_linear() -> None:
     assert 0.90 <= ratio <= 1.10, (linear_params, hybrid_params, ratio)
 
 
+def test_stage5_final_mixer_factory_latent_attn() -> None:
+    from CMSSL17 import (
+        build_final_mixer,
+        LatentAttentionFinalMixer,
+        DMODEL,
+    )
+
+    mixer = build_final_mixer(
+        "latent_attn",
+        in_feats=193,
+        c_internal=8,
+        final_in_dim=193 * 8,
+        d_model=DMODEL,
+        patch_count=99,
+        dropout=0.1,
+    )
+
+    assert isinstance(mixer, LatentAttentionFinalMixer)
+    assert mixer.in_feats == 193
+    assert mixer.c_internal == 8
+    assert mixer.d_model == DMODEL
+    assert mixer.latent_count > 0
+    assert mixer.token_dim > 0
+    assert mixer.num_heads > 0
+    assert mixer.token_dim % mixer.num_heads == 0
+
+
+def test_stage5_latent_attn_final_mixer_shape_and_finite() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import LatentAttentionFinalMixer, DMODEL
+
+    torch.manual_seed(123)
+
+    mixer = LatentAttentionFinalMixer(
+        in_feats=193,
+        c_internal=8,
+        d_model=DMODEL,
+        token_dim=80,
+        latent_count=16,
+        num_heads=4,
+        ff_mult=4,
+        dropout=0.0,
+    )
+
+    x = torch.randn(2, 99, 193, 8)
+    y = mixer(x)
+
+    assert y.shape == (2, 99, DMODEL)
+    assert torch.isfinite(y).all()
+
+
+def test_stage5_latent_attn_final_mixer_matches_manual_formula() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import LatentAttentionFinalMixer, DMODEL
+
+    torch.manual_seed(123)
+
+    B, P, F_dim, C_dim = 2, 5, 7, 3
+    mixer = LatentAttentionFinalMixer(
+        in_feats=F_dim,
+        c_internal=C_dim,
+        d_model=DMODEL,
+        token_dim=16,
+        latent_count=4,
+        num_heads=4,
+        ff_mult=2,
+        dropout=0.0,
+    )
+    mixer.eval()
+
+    ci_tokens = torch.randn(B, P, F_dim, C_dim)
+
+    with torch.no_grad():
+        y = mixer(ci_tokens)
+
+        x = ci_tokens.reshape(B * P, F_dim, C_dim)
+        feat = mixer.token_proj(x)
+        feat = feat + mixer.feature_embed.view(1, F_dim, mixer.token_dim)
+
+        latents = mixer.latents.view(1, mixer.latent_count, mixer.token_dim).expand(B * P, -1, -1)
+
+        q = mixer.latent_cross_norm(latents)
+        kv = mixer.feature_norm(feat)
+        cross_out, _ = mixer.cross_attn(q, kv, kv, need_weights=False)
+        latents = latents + mixer.cross_drop(cross_out)
+
+        z = mixer.latent_self_norm(latents)
+        self_out, _ = mixer.self_attn(z, z, z, need_weights=False)
+        latents = latents + mixer.self_drop(self_out)
+
+        latents = latents + mixer.ff_drop(mixer.latent_ff(mixer.latent_ff_norm(latents)))
+
+        flat = latents.reshape(B * P, mixer.latent_count * mixer.token_dim)
+        y_manual = mixer.out_proj(flat).view(B, P, DMODEL)
+
+    assert torch.allclose(y, y_manual, atol=0.0, rtol=0.0)
+
+
+def test_stage5_latent_attn_uses_semantic_feature_tokens() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import LatentAttentionFinalMixer
+
+    torch.manual_seed(123)
+
+    B, P, F_dim, C_dim = 2, 3, 5, 4
+    mixer = LatentAttentionFinalMixer(
+        in_feats=F_dim,
+        c_internal=C_dim,
+        d_model=32,
+        token_dim=8,
+        latent_count=2,
+        num_heads=2,
+        ff_mult=2,
+        dropout=0.0,
+    )
+
+    ci_tokens = torch.randn(B, P, F_dim, C_dim)
+
+    x = ci_tokens.reshape(B * P, F_dim, C_dim)
+    tokens = mixer.token_proj(x) + mixer.feature_embed.view(1, F_dim, mixer.token_dim)
+
+    for f in range(F_dim):
+        manual = mixer.token_proj(ci_tokens[:, :, f, :].reshape(B * P, C_dim))
+        manual = manual + mixer.feature_embed[f].view(1, mixer.token_dim)
+        assert torch.allclose(tokens[:, f, :], manual, atol=0.0, rtol=0.0)
+
+
+def test_stage5_latent_attn_final_mixer_budget_close_to_linear() -> None:
+    if not _real_torch_available():
+        return
+
+    from CMSSL17 import (
+        LatentAttentionFinalMixer,
+        LinearFinalMixer,
+        DMODEL,
+        module_parameter_count,
+    )
+
+    final_in_dim = 193 * 8
+
+    linear = LinearFinalMixer(final_in_dim=final_in_dim, d_model=DMODEL)
+    latent = LatentAttentionFinalMixer(
+        in_feats=193,
+        c_internal=8,
+        d_model=DMODEL,
+        token_dim=80,
+        latent_count=16,
+        num_heads=4,
+        ff_mult=4,
+        dropout=0.1,
+    )
+
+    linear_params = module_parameter_count(linear)
+    latent_params = module_parameter_count(latent)
+    ratio = latent_params / max(1, linear_params)
+
+    assert 0.90 <= ratio <= 1.10, (linear_params, latent_params, ratio)
+
+
 def test_stage3_extractor_final_proj_unavailable_for_dcn() -> None:
     # This is better as a manual env smoke test because CTN_FINAL_MIXER
     # is import-time config. See manual command in the Stage 3 instructions.
@@ -2045,6 +2214,11 @@ def main() -> None:
     test_stage4_hybrid_final_mixer_matches_manual_formula()
     test_stage4_hybrid_final_mixer_uses_legacy_flatten_order()
     test_stage4_hybrid_final_mixer_budget_close_to_linear()
+    test_stage5_final_mixer_factory_latent_attn()
+    test_stage5_latent_attn_final_mixer_shape_and_finite()
+    test_stage5_latent_attn_final_mixer_matches_manual_formula()
+    test_stage5_latent_attn_uses_semantic_feature_tokens()
+    test_stage5_latent_attn_final_mixer_budget_close_to_linear()
     test_v9_smallstable_model_width_contract()
     test_conv_encoder_layer_prenorm_identity_batchnorm()
     test_conv_encoder_layer_prenorm_identity_layernorm()

@@ -483,6 +483,10 @@ CTN_SWIGLU_HIDDEN_DIM_ENV = os.environ.get("BYBIT_CTN_SWIGLU_HIDDEN_DIM", "").st
 CTN_DCN_RANK_ENV = os.environ.get("BYBIT_CTN_DCN_RANK", "").strip()
 CTN_HYBRID_SWIGLU_HIDDEN_DIM_ENV = os.environ.get("BYBIT_CTN_HYBRID_SWIGLU_HIDDEN_DIM", "").strip()
 CTN_HYBRID_DCN_RANK_ENV = os.environ.get("BYBIT_CTN_HYBRID_DCN_RANK", "").strip()
+CTN_LATENT_TOKEN_DIM_ENV = os.environ.get("BYBIT_CTN_LATENT_TOKEN_DIM", "").strip()
+CTN_LATENT_COUNT_ENV = os.environ.get("BYBIT_CTN_LATENT_COUNT", "").strip()
+CTN_LATENT_NUM_HEADS_ENV = os.environ.get("BYBIT_CTN_LATENT_NUM_HEADS", "").strip()
+CTN_LATENT_FF_MULT_ENV = os.environ.get("BYBIT_CTN_LATENT_FF_MULT", "").strip()
 CTN_DCN_NUM_LAYERS = 1
 CTN_DCN_RANK = 16
 if CTN_DCN_RANK_ENV:
@@ -506,13 +510,44 @@ if CTN_HYBRID_DCN_RANK_ENV:
             f"BYBIT_CTN_HYBRID_DCN_RANK must be positive, "
             f"got {CTN_HYBRID_DCN_RANK}"
         )
+
+CTN_LATENT_TOKEN_DIM = 80
+if CTN_LATENT_TOKEN_DIM_ENV:
+    CTN_LATENT_TOKEN_DIM = int(CTN_LATENT_TOKEN_DIM_ENV)
+    if CTN_LATENT_TOKEN_DIM <= 0:
+        raise ValueError(f"BYBIT_CTN_LATENT_TOKEN_DIM must be positive, got {CTN_LATENT_TOKEN_DIM}")
+
+CTN_LATENT_COUNT = 16
+if CTN_LATENT_COUNT_ENV:
+    CTN_LATENT_COUNT = int(CTN_LATENT_COUNT_ENV)
+    if CTN_LATENT_COUNT <= 0:
+        raise ValueError(f"BYBIT_CTN_LATENT_COUNT must be positive, got {CTN_LATENT_COUNT}")
+
+CTN_LATENT_NUM_HEADS = 4
+if CTN_LATENT_NUM_HEADS_ENV:
+    CTN_LATENT_NUM_HEADS = int(CTN_LATENT_NUM_HEADS_ENV)
+    if CTN_LATENT_NUM_HEADS <= 0:
+        raise ValueError(f"BYBIT_CTN_LATENT_NUM_HEADS must be positive, got {CTN_LATENT_NUM_HEADS}")
+
+CTN_LATENT_FF_MULT = 4
+if CTN_LATENT_FF_MULT_ENV:
+    CTN_LATENT_FF_MULT = int(CTN_LATENT_FF_MULT_ENV)
+    if CTN_LATENT_FF_MULT <= 0:
+        raise ValueError(f"BYBIT_CTN_LATENT_FF_MULT must be positive, got {CTN_LATENT_FF_MULT}")
+
+if CTN_LATENT_TOKEN_DIM % CTN_LATENT_NUM_HEADS != 0:
+    raise ValueError(
+        f"CTN_LATENT_TOKEN_DIM must be divisible by CTN_LATENT_NUM_HEADS; "
+        f"got token_dim={CTN_LATENT_TOKEN_DIM}, heads={CTN_LATENT_NUM_HEADS}"
+    )
+
 CTN_FINAL_MIXER_CHOICES = {
     "linear",
     "swiglu",
     "dcn",
     "hybrid",
-    # Future stages:
-    # "latent_attn",
+    "latent_attn",
+    # Future stage:
     # "cross_attn",
 }
 if CTN_FINAL_MIXER not in CTN_FINAL_MIXER_CHOICES:
@@ -527,6 +562,10 @@ CTN_FINAL_MIXER_SCHEMA = {
     "hybrid": (
         f"finalhybrid_swiglu{CTN_HYBRID_SWIGLU_HIDDEN_DIM}_"
         f"dcnv2lr_r{CTN_HYBRID_DCN_RANK}_l{CTN_HYBRID_DCN_NUM_LAYERS}_budget_v1"
+    ),
+    "latent_attn": (
+        f"finallatentattn_l{CTN_LATENT_COUNT}_d{CTN_LATENT_TOKEN_DIM}_"
+        f"h{CTN_LATENT_NUM_HEADS}_ff{CTN_LATENT_FF_MULT}_budget_v1"
     ),
 }[CTN_FINAL_MIXER]
 MODEL_ARCH_SCHEMA = (
@@ -1610,6 +1649,149 @@ class HybridFinalMixer(nn.Module):
         return self.out_proj(h)
 
 
+class LatentAttentionFinalMixer(nn.Module):
+    """Latent feature-token attention final mixer.
+
+    Input:
+        ci_tokens: semantic [B, P, F, C]
+
+    Output:
+        [B, P, d_model]
+
+    Per patch:
+        feature tokens -> learned latent cross-attention -> latent self-attention
+        -> latent FFN -> flatten latents -> d_model
+
+    Unlike flat-vector mixers, this consumes the semantic [F, C] feature-token
+    structure directly and must not call legacy_flatten_ci_tokens().
+    """
+
+    mixer_type = "latent_attn"
+
+    def __init__(
+        self,
+        in_feats: int,
+        c_internal: int,
+        d_model: int,
+        token_dim: int = 80,
+        latent_count: int = 16,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.in_feats = int(in_feats)
+        self.c_internal = int(c_internal)
+        self.d_model = int(d_model)
+        self.token_dim = int(token_dim)
+        self.latent_count = int(latent_count)
+        self.num_heads = int(num_heads)
+        self.ff_mult = int(ff_mult)
+
+        if self.in_feats <= 0:
+            raise ValueError(f"in_feats must be positive, got {self.in_feats}")
+        if self.c_internal <= 0:
+            raise ValueError(f"c_internal must be positive, got {self.c_internal}")
+        if self.d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+        if self.token_dim <= 0:
+            raise ValueError(f"token_dim must be positive, got {self.token_dim}")
+        if self.latent_count <= 0:
+            raise ValueError(f"latent_count must be positive, got {self.latent_count}")
+        if self.num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {self.num_heads}")
+        if self.ff_mult <= 0:
+            raise ValueError(f"ff_mult must be positive, got {self.ff_mult}")
+        if self.token_dim % self.num_heads != 0:
+            raise ValueError(
+                f"token_dim must be divisible by num_heads; "
+                f"got token_dim={self.token_dim}, num_heads={self.num_heads}"
+            )
+
+        self.token_proj = nn.Linear(self.c_internal, self.token_dim)
+
+        # Feature identity matters because all feature tokens share token_proj.
+        self.feature_embed = nn.Parameter(torch.empty(self.in_feats, self.token_dim))
+
+        # Learned latent query tokens.
+        self.latents = nn.Parameter(torch.empty(self.latent_count, self.token_dim))
+
+        self.feature_norm = nn.LayerNorm(self.token_dim)
+        self.latent_cross_norm = nn.LayerNorm(self.token_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.token_dim,
+            num_heads=self.num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_drop = nn.Dropout(dropout)
+
+        self.latent_self_norm = nn.LayerNorm(self.token_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=self.token_dim,
+            num_heads=self.num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.self_drop = nn.Dropout(dropout)
+
+        ff_hidden = self.ff_mult * self.token_dim
+        self.latent_ff_norm = nn.LayerNorm(self.token_dim)
+        self.latent_ff = nn.Sequential(
+            nn.Linear(self.token_dim, ff_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_hidden, self.token_dim),
+        )
+        self.ff_drop = nn.Dropout(dropout)
+
+        self.out_proj = nn.Linear(self.latent_count * self.token_dim, self.d_model)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.feature_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.latents, mean=0.0, std=0.02)
+
+    def forward(self, ci_tokens: torch.Tensor) -> torch.Tensor:
+        if ci_tokens.ndim != 4:
+            raise ValueError(f"ci_tokens must be [B, P, F, C], got shape={tuple(ci_tokens.shape)}")
+
+        B, P, F_dim, C_dim = ci_tokens.shape
+        if int(F_dim) != self.in_feats:
+            raise ValueError(f"LatentAttentionFinalMixer expected F={self.in_feats}, got {F_dim}")
+        if int(C_dim) != self.c_internal:
+            raise ValueError(f"LatentAttentionFinalMixer expected C={self.c_internal}, got {C_dim}")
+
+        # [B, P, F, C] -> [B*P, F, C]
+        x = ci_tokens.reshape(B * P, F_dim, C_dim)
+
+        # Feature tokens: [B*P, F, token_dim]
+        feat = self.token_proj(x)
+        feat = feat + self.feature_embed.view(1, self.in_feats, self.token_dim)
+
+        # Learned latent tokens: [B*P, latent_count, token_dim]
+        latents = self.latents.view(1, self.latent_count, self.token_dim).expand(B * P, -1, -1)
+
+        # Cross-attention: latent queries attend to feature-token keys/values.
+        q = self.latent_cross_norm(latents)
+        kv = self.feature_norm(feat)
+        cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        latents = latents + self.cross_drop(cross_out)
+
+        # Latent self-attention.
+        z = self.latent_self_norm(latents)
+        self_out, _ = self.self_attn(z, z, z, need_weights=False)
+        latents = latents + self.self_drop(self_out)
+
+        # Latent FFN.
+        latents = latents + self.ff_drop(self.latent_ff(self.latent_ff_norm(latents)))
+
+        flat = latents.reshape(B * P, self.latent_count * self.token_dim)
+        out = self.out_proj(flat)
+        return out.view(B, P, self.d_model)
+
+
 def build_final_mixer(
     mixer_type: str,
     *,
@@ -1684,6 +1866,25 @@ def build_final_mixer(
             swiglu_hidden_dim=CTN_HYBRID_SWIGLU_HIDDEN_DIM,
             dcn_rank=CTN_HYBRID_DCN_RANK,
             dcn_num_layers=CTN_HYBRID_DCN_NUM_LAYERS,
+            dropout=dropout,
+        )
+
+    if mixer_type == "latent_attn":
+        expected = int(in_feats) * int(c_internal)
+        if int(final_in_dim) != expected:
+            raise ValueError(
+                f"final_in_dim mismatch: final_in_dim={final_in_dim}, "
+                f"in_feats={in_feats}, c_internal={c_internal}, expected={expected}"
+            )
+
+        return LatentAttentionFinalMixer(
+            in_feats=in_feats,
+            c_internal=c_internal,
+            d_model=d_model,
+            token_dim=CTN_LATENT_TOKEN_DIM,
+            latent_count=CTN_LATENT_COUNT,
+            num_heads=CTN_LATENT_NUM_HEADS,
+            ff_mult=CTN_LATENT_FF_MULT,
             dropout=dropout,
         )
 
@@ -1780,6 +1981,13 @@ class ConvTimeNetFeatureExtractor(nn.Module):
                 f" hybrid_swiglu_hidden_dim={self.final_mixer.swiglu_hidden_dim}"
                 f" hybrid_dcn_rank={self.final_mixer.dcn_rank}"
                 f" hybrid_dcn_layers={self.final_mixer.dcn_num_layers}"
+            )
+        elif isinstance(self.final_mixer, LatentAttentionFinalMixer):
+            extra = (
+                f" latent_count={self.final_mixer.latent_count}"
+                f" latent_token_dim={self.final_mixer.token_dim}"
+                f" latent_heads={self.final_mixer.num_heads}"
+                f" latent_ff_mult={self.final_mixer.ff_mult}"
             )
 
         print(
@@ -1912,6 +2120,12 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             diag["final_mixer_swiglu_hidden_dim"] = self.final_mixer.swiglu_hidden_dim
             diag["final_mixer_dcn_rank"] = self.final_mixer.dcn_rank
             diag["final_mixer_dcn_num_layers"] = self.final_mixer.dcn_num_layers
+            diag["final_mixer_param_count"] = module_parameter_count(self.final_mixer)
+        if isinstance(self.final_mixer, LatentAttentionFinalMixer):
+            diag["final_mixer_latent_count"] = self.final_mixer.latent_count
+            diag["final_mixer_token_dim"] = self.final_mixer.token_dim
+            diag["final_mixer_num_heads"] = self.final_mixer.num_heads
+            diag["final_mixer_ff_mult"] = self.final_mixer.ff_mult
             diag["final_mixer_param_count"] = module_parameter_count(self.final_mixer)
         diag["final_in_dim"] = self.final_in_dim
         diag["activations"]["ci_tokens"] = _activation_summary(ci_tokens)
