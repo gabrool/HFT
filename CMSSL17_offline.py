@@ -1969,7 +1969,7 @@ def model_param_groups(model: torch.nn.Module) -> Dict[str, List[Tuple[str, torc
         ("extractor_gate", "depatch_proj_encoder.feature_gate."),
         ("extractor_post_gate", "depatch_proj_encoder.post_gate_proj."),
         ("extractor_mixed", "depatch_proj_encoder.mixed_encoder."),
-        ("extractor_final_proj", "depatch_proj_encoder.final_mixer.proj."),
+        ("extractor_final_proj", "depatch_proj_encoder.final_mixer."),
         ("extractor_output_norm", "depatch_proj_encoder.output_norm."),
         ("mamba", "mamba."),
         ("task_decoders", "dir_token_decoder."),

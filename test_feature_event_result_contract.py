@@ -773,6 +773,50 @@ def test_stage1_final_mixer_factory_linear() -> None:
     assert isinstance(mixer, LinearFinalMixer)
 
 
+def test_stage1_ci_encoded_to_semantic_tokens_layout() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import ci_encoded_to_semantic_tokens
+
+    B, F, P, C = 2, 3, 5, 4
+    ci_t = torch.arange(B * F * C * P).reshape(B * F, C, P)
+
+    ci_tokens = ci_encoded_to_semantic_tokens(
+        ci_t,
+        batch_size=B,
+        in_feats=F,
+        patch_count=P,
+        c_internal=C,
+    )
+
+    assert ci_tokens.shape == (B, P, F, C)
+
+    for b in range(B):
+        for f in range(F):
+            for p in range(P):
+                for c in range(C):
+                    assert ci_tokens[b, p, f, c] == ci_t[b * F + f, c, p]
+
+
+def test_stage1_legacy_flatten_ci_tokens_matches_old_order() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import legacy_flatten_ci_tokens
+
+    B, P, F, C = 2, 5, 3, 4
+    ci_tokens = torch.arange(B * P * F * C).reshape(B, P, F, C)
+
+    got = legacy_flatten_ci_tokens(ci_tokens)
+    expected = ci_tokens.permute(0, 1, 3, 2).contiguous().reshape(B, P, F * C)
+
+    assert got.shape == (B, P, F * C)
+    assert torch.equal(got, expected)
+
+
 def test_stage1_linear_final_mixer_shape_and_finite() -> None:
     if not _real_torch_available():
         return
@@ -790,13 +834,13 @@ def test_stage1_linear_final_mixer_shape_and_finite() -> None:
     assert torch.isfinite(y).all()
 
 
-def test_stage1_linear_final_mixer_equivalent_to_direct_projection() -> None:
+def test_stage1_linear_final_mixer_equivalent_to_old_final_proj_order() -> None:
     if not _real_torch_available():
         return
 
     import torch
     import torch.nn as nn
-    from CMSSL17 import LinearFinalMixer, DMODEL
+    from CMSSL17 import LinearFinalMixer, legacy_flatten_ci_tokens, DMODEL
 
     torch.manual_seed(123)
 
@@ -810,10 +854,10 @@ def test_stage1_linear_final_mixer_equivalent_to_direct_projection() -> None:
         direct.weight.copy_(mixer.proj.weight)
         direct.bias.copy_(mixer.proj.bias)
 
-    x = torch.randn(B, P, F, C)
+    ci_tokens = torch.randn(B, P, F, C)
 
-    y_mixer = mixer(x)
-    y_direct = direct(x.reshape(B, P, final_in_dim))
+    y_mixer = mixer(ci_tokens)
+    y_direct = direct(legacy_flatten_ci_tokens(ci_tokens))
 
     assert torch.allclose(y_mixer, y_direct, atol=0.0, rtol=0.0)
 
@@ -1598,8 +1642,10 @@ def main() -> None:
     test_generic_dict_ob_type_parsing_is_explicit()
     test_feature_transform_contract_is_raw_no_projection()
     test_stage1_final_mixer_factory_linear()
+    test_stage1_ci_encoded_to_semantic_tokens_layout()
+    test_stage1_legacy_flatten_ci_tokens_matches_old_order()
     test_stage1_linear_final_mixer_shape_and_finite()
-    test_stage1_linear_final_mixer_equivalent_to_direct_projection()
+    test_stage1_linear_final_mixer_equivalent_to_old_final_proj_order()
     test_stage1_extractor_final_proj_compatibility_property()
     test_v9_smallstable_model_width_contract()
     test_conv_encoder_layer_prenorm_identity_batchnorm()
