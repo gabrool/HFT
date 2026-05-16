@@ -475,7 +475,7 @@ ACT_DIAG_P95_MAX_ELEMS = max(
 )
 print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
-MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_ctn6ci_mamba512_bidir1024_pool512_head1024_v1"
+MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_ctn6ci_k333333_prenormres_mamba512_bidir1024_pool512_head1024_v1"
 # ConvTimeNet topology intentionally matches original 1s path:
 # Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final_proj -> [B, patch_count, DMODEL].
 # No gate, no MLP projection, no mixed ConvTimeNet stack.
@@ -511,7 +511,7 @@ CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
     + "p"
     + "ca"
-    + "-pruned187-xformv2-mamba512-pool512-head1024"
+    + "-pruned187-xformv2-mamba512-pool512-head1024-k333333-prenormres"
 )
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -943,37 +943,38 @@ class _ConvEncoderLayer(nn.Module):
         self.sublayerconnect2 = SublayerConnection(enable_res_param, dropout)
         self.norm_ffn = nn.LayerNorm(d_model) if norm != 'batch' else nn.BatchNorm1d(d_model)
 
-    def forward(self, src:torch.Tensor) -> torch.Tensor: # [B, C, L]
-        if self.re_param:
-            out_x = self.DW_conv_large(src) + self.DW_conv_small(src)
-        else:
-            out_x = self.DW_conv(src)
+    def _norm_bcl(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Apply norm to x shaped [B, C, L] and return [B, C, L]."""
+        if self.norm_tp == "batch":
+            return norm(x)
 
-        residual_src = self.sublayerconnect1(src, self.dw_act(out_x))
-        
-        if self.norm_tp != 'batch':
-            # LayerNorm natively operates on C, so permute to (B, L, C)
-            normed_src = residual_src.permute(0, 2, 1).contiguous()
-            normed_src = self.dw_norm(normed_src)
-            
-            # Apply Linear FFN directly on (B, L, C)
-            ff_out = self.ff(normed_src)
-            
-            residual_src2 = self.sublayerconnect2(normed_src, ff_out)
-            normed_src2 = self.norm_ffn(residual_src2)
-            
-            # Return cleanly as (B, C, L)
-            return normed_src2.permute(0, 2, 1).contiguous()
+        # LayerNorm expects channels last: [B, L, C]
+        x_t = x.permute(0, 2, 1).contiguous()
+        x_t = norm(x_t)
+        return x_t.permute(0, 2, 1).contiguous()
+
+    def forward(self, src: torch.Tensor) -> torch.Tensor:  # [B, C, L]
+        x = src
+
+        # ----- Depthwise-conv sublayer: pre-norm, clean residual stream -----
+        conv_in = self._norm_bcl(self.dw_norm, x)
+
+        if self.re_param:
+            conv_raw = self.DW_conv_large(conv_in) + self.DW_conv_small(conv_in)
         else:
-            normed_src = self.dw_norm(residual_src)
-            
-            # Must temporarily permute to (B, L, C) for Linear FFN
-            normed_src_t = normed_src.permute(0, 2, 1).contiguous()
-            ff_out_t = self.ff(normed_src_t)
-            ff_out = ff_out_t.permute(0, 2, 1).contiguous()
-            
-            residual_src2 = self.sublayerconnect2(normed_src, ff_out)
-            return self.norm_ffn(residual_src2)
+            conv_raw = self.DW_conv(conv_in)
+
+        x = self.sublayerconnect1(x, self.dw_act(conv_raw))
+
+        # ----- FFN sublayer: pre-norm, clean residual stream -----
+        ff_in = self._norm_bcl(self.norm_ffn, x)              # [B, C, L]
+        ff_in_t = ff_in.permute(0, 2, 1).contiguous()         # [B, L, C]
+        ff_out_t = self.ff(ff_in_t)                           # [B, L, C]
+        ff_out = ff_out_t.permute(0, 2, 1).contiguous()       # [B, C, L]
+
+        x = self.sublayerconnect2(x, ff_out)
+
+        return x
 
 class ConvEncoder(nn.Module):
     def __init__(self, d_model, d_ff, kernel_size=[3,3,5,5,7,7], dropout=0.1, activation='gelu', 
