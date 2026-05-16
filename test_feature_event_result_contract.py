@@ -628,7 +628,7 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     assert CMSSL17.CHECKPOINT_SCHEMA == (
         "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
         + forbidden
-        + "-pruned187-xformv2-mamba512-pool512-head1024-k333333-prenormres"
+        + "-pruned187-xformv2-mamba512-pool512-head1024-k333333-prenormres-finallinear"
     )
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
@@ -638,6 +638,9 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
 
 
 def test_conv_encoder_layer_prenorm_identity_batchnorm() -> None:
+    if not _real_torch_available():
+        return
+
     import torch
     from CMSSL17 import _ConvEncoderLayer
 
@@ -669,6 +672,9 @@ def test_conv_encoder_layer_prenorm_identity_batchnorm() -> None:
 
 
 def test_conv_encoder_layer_prenorm_identity_layernorm() -> None:
+    if not _real_torch_available():
+        return
+
     import torch
     from CMSSL17 import _ConvEncoderLayer
 
@@ -700,6 +706,9 @@ def test_conv_encoder_layer_prenorm_identity_layernorm() -> None:
 
 
 def test_conv_encoder_layer_prenorm_sublayers_active_when_residual_scale_enabled() -> None:
+    if not _real_torch_available():
+        return
+
     import torch
     from CMSSL17 import _ConvEncoderLayer
 
@@ -740,6 +749,92 @@ def _real_torch_available() -> bool:
     return getattr(torch, "__version__", None) is not None
 
 
+def test_stage1_final_mixer_factory_linear() -> None:
+    from CMSSL17 import (
+        build_final_mixer,
+        LinearFinalMixer,
+        CTN_FINAL_MIXER,
+        CTN_FINAL_MIXER_SCHEMA,
+        DMODEL,
+    )
+
+    assert CTN_FINAL_MIXER == "linear"
+    assert CTN_FINAL_MIXER_SCHEMA == "finallinear"
+
+    mixer = build_final_mixer(
+        "linear",
+        in_feats=193,
+        c_internal=8,
+        final_in_dim=193 * 8,
+        d_model=DMODEL,
+        patch_count=99,
+        dropout=0.1,
+    )
+    assert isinstance(mixer, LinearFinalMixer)
+
+
+def test_stage1_linear_final_mixer_shape_and_finite() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import LinearFinalMixer, DMODEL
+
+    torch.manual_seed(123)
+    mixer = LinearFinalMixer(final_in_dim=193 * 8, d_model=DMODEL)
+
+    x = torch.randn(2, 99, 193, 8)
+    y = mixer(x)
+
+    assert y.shape == (2, 99, DMODEL)
+    assert torch.isfinite(y).all()
+
+
+def test_stage1_linear_final_mixer_equivalent_to_direct_projection() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    import torch.nn as nn
+    from CMSSL17 import LinearFinalMixer, DMODEL
+
+    torch.manual_seed(123)
+
+    B, P, F, C = 2, 11, 7, 3
+    final_in_dim = F * C
+
+    mixer = LinearFinalMixer(final_in_dim=final_in_dim, d_model=DMODEL)
+    direct = nn.Linear(final_in_dim, DMODEL)
+
+    with torch.no_grad():
+        direct.weight.copy_(mixer.proj.weight)
+        direct.bias.copy_(mixer.proj.bias)
+
+    x = torch.randn(B, P, F, C)
+
+    y_mixer = mixer(x)
+    y_direct = direct(x.reshape(B, P, final_in_dim))
+
+    assert torch.allclose(y_mixer, y_direct, atol=0.0, rtol=0.0)
+
+
+def test_stage1_extractor_final_proj_compatibility_property() -> None:
+    if not _real_torch_available():
+        return
+
+    from CMSSL17 import ConvTimeNetFeatureExtractor, DMODEL, LOOKBACK, LinearFinalMixer
+
+    extractor = ConvTimeNetFeatureExtractor(
+        in_feats=193,
+        seq_len=LOOKBACK,
+        d_model=DMODEL,
+    )
+
+    assert isinstance(extractor.final_mixer, LinearFinalMixer)
+    assert extractor.final_proj is extractor.final_mixer.proj
+    assert extractor.final_proj.out_features == DMODEL
+
+
 def test_v9_smallstable_model_width_contract() -> None:
     from CMSSL17 import (
         DMODEL,
@@ -750,6 +845,8 @@ def test_v9_smallstable_model_width_contract() -> None:
         FeatureEngine,
         MODEL_ARCH_SCHEMA,
         CHECKPOINT_SCHEMA,
+        CTN_FINAL_MIXER,
+        CTN_FINAL_MIXER_SCHEMA,
     )
 
     assert DMODEL == 512
@@ -768,6 +865,10 @@ def test_v9_smallstable_model_width_contract() -> None:
     assert "prenormres" in CHECKPOINT_SCHEMA
     assert "k333333" in MODEL_ARCH_SCHEMA
     assert "k333333" in CHECKPOINT_SCHEMA
+    assert CTN_FINAL_MIXER == "linear"
+    assert CTN_FINAL_MIXER_SCHEMA == "finallinear"
+    assert "finallinear" in MODEL_ARCH_SCHEMA
+    assert "finallinear" in CHECKPOINT_SCHEMA
 
     if not _real_torch_available():
         return
@@ -1496,6 +1597,10 @@ def main() -> None:
     test_compact_ob_type_code_does_not_default_to_delta()
     test_generic_dict_ob_type_parsing_is_explicit()
     test_feature_transform_contract_is_raw_no_projection()
+    test_stage1_final_mixer_factory_linear()
+    test_stage1_linear_final_mixer_shape_and_finite()
+    test_stage1_linear_final_mixer_equivalent_to_direct_projection()
+    test_stage1_extractor_final_proj_compatibility_property()
     test_v9_smallstable_model_width_contract()
     test_conv_encoder_layer_prenorm_identity_batchnorm()
     test_conv_encoder_layer_prenorm_identity_layernorm()
