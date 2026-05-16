@@ -628,13 +628,110 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     assert CMSSL17.CHECKPOINT_SCHEMA == (
         "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
         + forbidden
-        + "-pruned187-xformv2-mamba512-pool512-head1024"
+        + "-pruned187-xformv2-mamba512-pool512-head1024-k333333-prenormres"
     )
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "p" + "ca250" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
     assert "final256" not in CMSSL17.CHECKPOINT_SCHEMA.lower()
 
+
+
+def test_conv_encoder_layer_prenorm_identity_batchnorm() -> None:
+    import torch
+    from CMSSL17 import _ConvEncoderLayer
+
+    torch.manual_seed(123)
+
+    layer = _ConvEncoderLayer(
+        kernel_size=3,
+        d_model=8,
+        d_ff=16,
+        dropout=0.0,
+        activation="gelu",
+        enable_res_param=True,
+        norm="batch",
+        re_param=True,
+        small_ks=3,
+    )
+    layer.train()
+
+    x = torch.randn(4, 8, 17)
+
+    with torch.no_grad():
+        y = layer(x)
+
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+    max_abs_err = float((y - x).abs().max())
+    assert max_abs_err < 1e-5, max_abs_err
+
+
+def test_conv_encoder_layer_prenorm_identity_layernorm() -> None:
+    import torch
+    from CMSSL17 import _ConvEncoderLayer
+
+    torch.manual_seed(123)
+
+    layer = _ConvEncoderLayer(
+        kernel_size=3,
+        d_model=8,
+        d_ff=16,
+        dropout=0.0,
+        activation="gelu",
+        enable_res_param=True,
+        norm="layer",
+        re_param=True,
+        small_ks=3,
+    )
+    layer.train()
+
+    x = torch.randn(4, 8, 17)
+
+    with torch.no_grad():
+        y = layer(x)
+
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+    max_abs_err = float((y - x).abs().max())
+    assert max_abs_err < 1e-5, max_abs_err
+
+
+def test_conv_encoder_layer_prenorm_sublayers_active_when_residual_scale_enabled() -> None:
+    import torch
+    from CMSSL17 import _ConvEncoderLayer
+
+    torch.manual_seed(123)
+
+    layer = _ConvEncoderLayer(
+        kernel_size=3,
+        d_model=8,
+        d_ff=16,
+        dropout=0.0,
+        activation="gelu",
+        enable_res_param=True,
+        norm="batch",
+        re_param=True,
+        small_ks=3,
+    )
+    layer.train()
+
+    with torch.no_grad():
+        layer.sublayerconnect1.a.fill_(1.0)
+        layer.sublayerconnect2.a.fill_(1.0)
+
+    x = torch.randn(4, 8, 17)
+
+    with torch.no_grad():
+        y = layer(x)
+
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+    mean_abs_delta = float((y - x).abs().mean())
+    assert mean_abs_delta > 1e-4, mean_abs_delta
 
 
 def _real_torch_available() -> bool:
@@ -667,6 +764,10 @@ def test_v9_smallstable_model_width_contract() -> None:
 
     assert "mamba512" in MODEL_ARCH_SCHEMA
     assert "mamba512" in CHECKPOINT_SCHEMA
+    assert "prenormres" in MODEL_ARCH_SCHEMA
+    assert "prenormres" in CHECKPOINT_SCHEMA
+    assert "k333333" in MODEL_ARCH_SCHEMA
+    assert "k333333" in CHECKPOINT_SCHEMA
 
     if not _real_torch_available():
         return
@@ -1396,6 +1497,9 @@ def main() -> None:
     test_generic_dict_ob_type_parsing_is_explicit()
     test_feature_transform_contract_is_raw_no_projection()
     test_v9_smallstable_model_width_contract()
+    test_conv_encoder_layer_prenorm_identity_batchnorm()
+    test_conv_encoder_layer_prenorm_identity_layernorm()
+    test_conv_encoder_layer_prenorm_sublayers_active_when_residual_scale_enabled()
     test_v9_gated_pooling_query_scaled_init()
     test_v9_initial_direction_logits_not_extreme()
     test_offline_ingest_raw_feature_dims()
