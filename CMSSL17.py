@@ -1197,17 +1197,57 @@ def _activation_summary(t: torch.Tensor) -> dict:
     return out
 
 
+def ci_encoded_to_semantic_tokens(
+    ci_t: torch.Tensor,
+    *,
+    batch_size: int,
+    in_feats: int,
+    patch_count: int,
+    c_internal: int,
+) -> torch.Tensor:
+    """Convert CI encoder output [B*F, C, P] to semantic [B, P, F, C]."""
+    if ci_t.ndim != 3:
+        raise ValueError(f"ci_t must be [B*F, C, P], got shape={tuple(ci_t.shape)}")
+
+    bf, c, p = ci_t.shape
+    if bf != int(batch_size) * int(in_feats):
+        raise ValueError(
+            f"ci_t first dim mismatch: got {bf}, expected B*F={batch_size * in_feats}"
+        )
+    if c != int(c_internal):
+        raise ValueError(f"ci_t C mismatch: got {c}, expected {c_internal}")
+    if p != int(patch_count):
+        raise ValueError(f"ci_t P mismatch: got {p}, expected {patch_count}")
+
+    tmp = ci_t.permute(0, 2, 1).contiguous()
+    tmp = tmp.reshape(batch_size, in_feats, patch_count, c_internal)
+    return tmp.permute(0, 2, 1, 3).contiguous()
+
+
+def legacy_flatten_ci_tokens(ci_tokens: torch.Tensor) -> torch.Tensor:
+    """Flatten semantic [B, P, F, C] into the old final_proj order [B, P, C*F].
+
+    The old final_proj path flattened [C, F] order after a [B, P, C, F] layout.
+    Keep that order for exact linear-baseline compatibility.
+    """
+    if ci_tokens.ndim != 4:
+        raise ValueError(f"ci_tokens must be [B, P, F, C], got shape={tuple(ci_tokens.shape)}")
+
+    B, P, F_dim, C_dim = ci_tokens.shape
+    return ci_tokens.permute(0, 1, 3, 2).contiguous().reshape(B, P, F_dim * C_dim)
+
+
 class LinearFinalMixer(nn.Module):
     """Baseline final mixer equivalent to the old final_proj.
 
     Input:
-        ci_tokens: [B, P, F, C]
+        ci_tokens: semantic [B, P, F, C]
     Output:
         [B, P, d_model]
 
-    This is mathematically equivalent to:
-        flat = ci_tokens.reshape(B, P, F * C)
-        final_proj(flat)
+    LinearFinalMixer internally flattens as [B, P, C*F] to preserve
+    exact old final_proj behavior. Future token mixers should consume the
+    semantic feature-token layout directly.
     """
 
     mixer_type = "linear"
@@ -1230,7 +1270,7 @@ class LinearFinalMixer(nn.Module):
                 f"got F={F_dim}, C={C_dim}, F*C={flat_dim}"
             )
 
-        x = ci_tokens.reshape(B, P, self.final_in_dim)
+        x = legacy_flatten_ci_tokens(ci_tokens)
         return self.proj(x)
 
 
@@ -1386,16 +1426,15 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         F_in = x.size(-1)
         _, _, ci_t = self._ci_encode(x)
 
-        # Preserve patch/time tokens; final mixer is applied per patch.
-        out = ci_t.permute(0, 2, 1).contiguous()  # [B*F, patch_count, C_internal]
-        out = out.reshape(B, F_in, self.patch_count, self.d_model_internal)
-        out = out.permute(0, 2, 3, 1).contiguous()  # [B, patch_count, C_internal, F]
-        # IMPORTANT:
-        # The [B, P, F, C] -> [B, P, F*C] flatten order in LinearFinalMixer
-        # intentionally preserves the old final_proj feature order. The old path
-        # flattened a contiguous [B, P, C_internal, F] tensor, so the reshape below
-        # repacks those exact values into the mixer interface before flattening.
-        ci_tokens = out.reshape(B, self.patch_count, F_in, self.d_model_internal)
+        # ci_tokens is semantic [B, P, F, C] and is the stable interface for all final mixers.
+        # LinearFinalMixer internally flattens as [B, P, C*F] to preserve old final_proj behavior.
+        ci_tokens = ci_encoded_to_semantic_tokens(
+            ci_t,
+            batch_size=B,
+            in_feats=F_in,
+            patch_count=self.patch_count,
+            c_internal=self.d_model_internal,
+        )
         out = self.final_mixer(ci_tokens)  # [B, patch_count, DMODEL]
 
         if hasattr(self, "output_norm") and self.output_norm is not None:
@@ -1441,13 +1480,16 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         diag["activations"]["patch_embed"] = _activation_summary(patch_embed)
         diag["activations"]["ci_out"] = _activation_summary(ci_t)
 
-        out = ci_t.permute(0, 2, 1).contiguous()
-        out = out.reshape(B, F_in, self.patch_count, self.d_model_internal)
-        out = out.permute(0, 2, 3, 1).contiguous()
-        # IMPORTANT: keep this repacking aligned with forward() so diagnostics and
-        # LinearFinalMixer preserve the old final_proj flatten order exactly.
-        ci_tokens = out.reshape(B, self.patch_count, F_in, self.d_model_internal)
-        ci_patch_flat = ci_tokens.reshape(B, self.patch_count, self.final_in_dim)
+        # ci_tokens is semantic [B, P, F, C] and is the stable interface for all final mixers.
+        # LinearFinalMixer internally flattens as [B, P, C*F] to preserve old final_proj behavior.
+        ci_tokens = ci_encoded_to_semantic_tokens(
+            ci_t,
+            batch_size=B,
+            in_feats=F_in,
+            patch_count=self.patch_count,
+            c_internal=self.d_model_internal,
+        )
+        ci_patch_flat = legacy_flatten_ci_tokens(ci_tokens)
         final = self.final_mixer(ci_tokens)
         if hasattr(self, "output_norm") and self.output_norm is not None:
             final = self.output_norm(final)
