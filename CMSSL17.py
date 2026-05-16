@@ -475,10 +475,33 @@ ACT_DIAG_P95_MAX_ELEMS = max(
 )
 print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
-MODEL_ARCH_SCHEMA = "cmssl17_1s_maker_ctn6ci_k333333_prenormres_mamba512_bidir1024_pool512_head1024_v1"
 # ConvTimeNet topology intentionally matches original 1s path:
-# Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final_proj -> [B, patch_count, DMODEL].
+# Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final mixer -> [B, patch_count, DMODEL].
 # No gate, no MLP projection, no mixed ConvTimeNet stack.
+CTN_FINAL_MIXER = os.environ.get("BYBIT_CTN_FINAL_MIXER", "linear").strip().lower()
+CTN_FINAL_MIXER_CHOICES = {
+    "linear",
+    # Stage 1 only implements "linear".
+    # Future stages will add:
+    # "swiglu",
+    # "dcn",
+    # "hybrid",
+    # "latent_attn",
+    # "cross_attn",
+}
+if CTN_FINAL_MIXER not in CTN_FINAL_MIXER_CHOICES:
+    raise ValueError(
+        f"Unsupported BYBIT_CTN_FINAL_MIXER={CTN_FINAL_MIXER!r}; "
+        f"supported choices for this build are {sorted(CTN_FINAL_MIXER_CHOICES)}"
+    )
+CTN_FINAL_MIXER_SCHEMA = {
+    "linear": "finallinear",
+}[CTN_FINAL_MIXER]
+MODEL_ARCH_SCHEMA = (
+    f"cmssl17_1s_maker_ctn6ci_k333333_prenormres_"
+    f"{CTN_FINAL_MIXER_SCHEMA}_"
+    f"mamba512_bidir1024_pool512_head1024_v1"
+)
 CTN_CI_KERNELS = [3, 3, 3, 3, 3, 3]
 CTN_MIXED_KERNELS = []
 CTN_CI_INTERNAL_DIM = 8
@@ -511,7 +534,7 @@ CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
     + "p"
     + "ca"
-    + "-pruned187-xformv2-mamba512-pool512-head1024-k333333-prenormres"
+    + f"-pruned187-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
 )
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -1174,6 +1197,74 @@ def _activation_summary(t: torch.Tensor) -> dict:
     return out
 
 
+class LinearFinalMixer(nn.Module):
+    """Baseline final mixer equivalent to the old final_proj.
+
+    Input:
+        ci_tokens: [B, P, F, C]
+    Output:
+        [B, P, d_model]
+
+    This is mathematically equivalent to:
+        flat = ci_tokens.reshape(B, P, F * C)
+        final_proj(flat)
+    """
+
+    mixer_type = "linear"
+
+    def __init__(self, final_in_dim: int, d_model: int):
+        super().__init__()
+        self.final_in_dim = int(final_in_dim)
+        self.d_model = int(d_model)
+        self.proj = nn.Linear(self.final_in_dim, self.d_model)
+
+    def forward(self, ci_tokens: torch.Tensor) -> torch.Tensor:
+        if ci_tokens.ndim != 4:
+            raise ValueError(f"ci_tokens must be [B, P, F, C], got shape={tuple(ci_tokens.shape)}")
+
+        B, P, F_dim, C_dim = ci_tokens.shape
+        flat_dim = int(F_dim) * int(C_dim)
+        if flat_dim != self.final_in_dim:
+            raise ValueError(
+                f"LinearFinalMixer expected F*C={self.final_in_dim}, "
+                f"got F={F_dim}, C={C_dim}, F*C={flat_dim}"
+            )
+
+        x = ci_tokens.reshape(B, P, self.final_in_dim)
+        return self.proj(x)
+
+
+def build_final_mixer(
+    mixer_type: str,
+    *,
+    in_feats: int,
+    c_internal: int,
+    final_in_dim: int,
+    d_model: int,
+    patch_count: int,
+    dropout: float,
+) -> nn.Module:
+    # ``patch_count`` and ``dropout`` are intentionally part of this stage-1
+    # factory interface so later mixer implementations can be added without
+    # changing ConvTimeNetFeatureExtractor wiring.
+    del patch_count, dropout
+    mixer_type = str(mixer_type).strip().lower()
+
+    if mixer_type == "linear":
+        expected = int(in_feats) * int(c_internal)
+        if int(final_in_dim) != expected:
+            raise ValueError(
+                f"final_in_dim mismatch: final_in_dim={final_in_dim}, "
+                f"in_feats={in_feats}, c_internal={c_internal}, expected={expected}"
+            )
+        return LinearFinalMixer(final_in_dim=final_in_dim, d_model=d_model)
+
+    raise ValueError(
+        f"Unsupported final mixer {mixer_type!r}; "
+        "Stage 1 only implements 'linear'."
+    )
+
+
 class ConvTimeNetFeatureExtractor(nn.Module):
     def __init__(
         self,
@@ -1216,8 +1307,16 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             re_param=re_param,
             small_ks=re_param_kernel,
         )
-        self.final_proj = nn.Linear(self.final_in_dim, d_model)
-        # Match the original _1_sec ConvTimeNet path: no post-final_proj LayerNorm.
+        self.final_mixer = build_final_mixer(
+            mixer_type=CTN_FINAL_MIXER,
+            in_feats=in_feats,
+            c_internal=self.d_model_internal,
+            final_in_dim=self.final_in_dim,
+            d_model=d_model,
+            patch_count=self.patch_count,
+            dropout=dropout,
+        )
+        # Match the original _1_sec ConvTimeNet path: no post-final-mixer LayerNorm.
         self.output_norm = None
 
         effective_rf_samples = CTN_PATCH_SIZE + sum(int(k) - 1 for k in CTN_CI_KERNELS)
@@ -1235,9 +1334,22 @@ class ConvTimeNetFeatureExtractor(nn.Module):
             flush=True,
         )
         print(
-            f"[ctn-config] final_in_dim={self.final_in_dim} final_proj_out={d_model} gate=disabled mixed=disabled",
+            f"[ctn-config] final_in_dim={self.final_in_dim} final_proj_out={d_model} "
+            f"final_mixer={CTN_FINAL_MIXER} gate=disabled mixed=disabled",
             flush=True,
         )
+        print(
+            f"[ctn-final-mixer] type={CTN_FINAL_MIXER} schema={CTN_FINAL_MIXER_SCHEMA} "
+            f"in_feats={in_feats} c_internal={self.d_model_internal} "
+            f"final_in_dim={self.final_in_dim} d_model={d_model}",
+            flush=True,
+        )
+
+    @property
+    def final_proj(self) -> nn.Module:
+        if isinstance(self.final_mixer, LinearFinalMixer):
+            return self.final_mixer.proj
+        raise AttributeError("final_proj is only available for the linear final mixer")
 
     def set_gate_alpha(self, alpha: float) -> None:
         # Kept as a no-op compatibility hook for training code that may still
@@ -1274,12 +1386,17 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         F_in = x.size(-1)
         _, _, ci_t = self._ci_encode(x)
 
-        # Preserve patch/time tokens; final_proj is applied per patch.
+        # Preserve patch/time tokens; final mixer is applied per patch.
         out = ci_t.permute(0, 2, 1).contiguous()  # [B*F, patch_count, C_internal]
         out = out.reshape(B, F_in, self.patch_count, self.d_model_internal)
         out = out.permute(0, 2, 3, 1).contiguous()  # [B, patch_count, C_internal, F]
-        out = out.reshape(B, self.patch_count, self.final_in_dim)  # [B, patch_count, F*C_internal]
-        out = self.final_proj(out)  # [B, patch_count, DMODEL]
+        # IMPORTANT:
+        # The [B, P, F, C] -> [B, P, F*C] flatten order in LinearFinalMixer
+        # intentionally preserves the old final_proj feature order. The old path
+        # flattened a contiguous [B, P, C_internal, F] tensor, so the reshape below
+        # repacks those exact values into the mixer interface before flattening.
+        ci_tokens = out.reshape(B, self.patch_count, F_in, self.d_model_internal)
+        out = self.final_mixer(ci_tokens)  # [B, patch_count, DMODEL]
 
         if hasattr(self, "output_norm") and self.output_norm is not None:
             out = self.output_norm(out)
@@ -1327,15 +1444,24 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         out = ci_t.permute(0, 2, 1).contiguous()
         out = out.reshape(B, F_in, self.patch_count, self.d_model_internal)
         out = out.permute(0, 2, 3, 1).contiguous()
-        ci_patch_flat = out.reshape(B, self.patch_count, self.final_in_dim)
-        final = self.final_proj(ci_patch_flat)
+        # IMPORTANT: keep this repacking aligned with forward() so diagnostics and
+        # LinearFinalMixer preserve the old final_proj flatten order exactly.
+        ci_tokens = out.reshape(B, self.patch_count, F_in, self.d_model_internal)
+        ci_patch_flat = ci_tokens.reshape(B, self.patch_count, self.final_in_dim)
+        final = self.final_mixer(ci_tokens)
         if hasattr(self, "output_norm") and self.output_norm is not None:
             final = self.output_norm(final)
 
+        diag["final_mixer_type"] = CTN_FINAL_MIXER
+        diag["final_mixer_schema"] = CTN_FINAL_MIXER_SCHEMA
+        diag["final_in_dim"] = self.final_in_dim
+        diag["activations"]["ci_tokens"] = _activation_summary(ci_tokens)
         diag["activations"]["ci_patch_flat"] = _activation_summary(ci_patch_flat)
         diag["activations"]["ci_pooled_flat"] = diag["activations"]["ci_patch_flat"]
-        diag["activations"]["final_proj"] = _activation_summary(final)
-        diag["activations"]["extractor_out"] = diag["activations"]["final_proj"]
+        diag["activations"]["final_mixer_out"] = _activation_summary(final)
+        diag["activations"]["final_proj"] = diag["activations"]["final_mixer_out"]
+        diag["activations"]["extractor_out"] = diag["activations"]["final_mixer_out"]
+        diag["final_mixer_out_rms"] = diag["activations"]["final_mixer_out"]["rms"]
 
         # Compatibility aliases for older diagnostic print code. These summarize
         # the inactive stages without performing gate or mixed-conv computation.
