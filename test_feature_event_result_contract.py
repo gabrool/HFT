@@ -971,6 +971,144 @@ def test_stage2_swiglu_final_mixer_budget_close_to_linear() -> None:
     assert 0.90 <= ratio <= 1.10, (linear_params, swiglu_params, ratio)
 
 
+def test_stage3_final_mixer_factory_dcn() -> None:
+    from CMSSL17 import (
+        build_final_mixer,
+        DCNFinalMixer,
+        DMODEL,
+    )
+
+    mixer = build_final_mixer(
+        "dcn",
+        in_feats=193,
+        c_internal=8,
+        final_in_dim=193 * 8,
+        d_model=DMODEL,
+        patch_count=99,
+        dropout=0.1,
+    )
+
+    assert isinstance(mixer, DCNFinalMixer)
+    assert mixer.final_in_dim == 193 * 8
+    assert mixer.d_model == DMODEL
+    assert mixer.rank > 0
+    assert mixer.num_layers == 1
+
+
+def test_stage3_dcn_final_mixer_shape_and_finite() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import DCNFinalMixer, DMODEL
+
+    torch.manual_seed(123)
+
+    mixer = DCNFinalMixer(
+        final_in_dim=193 * 8,
+        d_model=DMODEL,
+        rank=16,
+        num_layers=1,
+    )
+
+    x = torch.randn(2, 99, 193, 8)
+    y = mixer(x)
+
+    assert y.shape == (2, 99, DMODEL)
+    assert torch.isfinite(y).all()
+
+
+def test_stage3_dcn_low_rank_cross_layer_matches_manual_formula() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import DCNV2LowRankCrossLayer
+
+    torch.manual_seed(123)
+
+    B, P, D, R = 2, 5, 11, 3
+    layer = DCNV2LowRankCrossLayer(dim=D, rank=R)
+    x0 = torch.randn(B, P, D)
+    xl = torch.randn(B, P, D)
+
+    with torch.no_grad():
+        y = layer(x0, xl)
+        manual_cross = layer.U(layer.V(xl))
+        y_manual = xl + x0 * manual_cross
+
+    assert torch.allclose(y, y_manual, atol=0.0, rtol=0.0)
+
+
+def test_stage3_dcn_final_mixer_uses_legacy_flatten_order() -> None:
+    if not _real_torch_available():
+        return
+
+    import torch
+    from CMSSL17 import DCNFinalMixer, legacy_flatten_ci_tokens, DMODEL
+
+    torch.manual_seed(123)
+
+    B, P, F_dim, C_dim = 2, 11, 7, 3
+    final_in_dim = F_dim * C_dim
+
+    mixer = DCNFinalMixer(
+        final_in_dim=final_in_dim,
+        d_model=DMODEL,
+        rank=4,
+        num_layers=1,
+    )
+    mixer.eval()
+
+    ci_tokens = torch.randn(B, P, F_dim, C_dim)
+
+    with torch.no_grad():
+        y = mixer(ci_tokens)
+
+        x = legacy_flatten_ci_tokens(ci_tokens)
+        x0 = mixer.norm(x)
+        xl = x0
+        for layer in mixer.cross_layers:
+            xl = layer(x0, xl)
+        y_manual = mixer.out_proj(xl)
+
+    assert torch.allclose(y, y_manual, atol=0.0, rtol=0.0)
+
+
+def test_stage3_dcn_final_mixer_budget_close_to_linear() -> None:
+    if not _real_torch_available():
+        return
+
+    from CMSSL17 import (
+        DCNFinalMixer,
+        LinearFinalMixer,
+        DMODEL,
+        module_parameter_count,
+    )
+
+    final_in_dim = 193 * 8
+
+    linear = LinearFinalMixer(final_in_dim=final_in_dim, d_model=DMODEL)
+    dcn = DCNFinalMixer(
+        final_in_dim=final_in_dim,
+        d_model=DMODEL,
+        rank=16,
+        num_layers=1,
+    )
+
+    linear_params = module_parameter_count(linear)
+    dcn_params = module_parameter_count(dcn)
+    ratio = dcn_params / max(1, linear_params)
+
+    assert 0.90 <= ratio <= 1.10, (linear_params, dcn_params, ratio)
+
+
+def test_stage3_extractor_final_proj_unavailable_for_dcn() -> None:
+    # This is better as a manual env smoke test because CTN_FINAL_MIXER
+    # is import-time config. See manual command in the Stage 3 instructions.
+    pass
+
+
 def test_v9_smallstable_model_width_contract() -> None:
     from CMSSL17 import (
         DMODEL,
@@ -1743,6 +1881,11 @@ def main() -> None:
     test_stage2_swiglu_final_mixer_shape_and_finite()
     test_stage2_swiglu_final_mixer_uses_legacy_flatten_order()
     test_stage2_swiglu_final_mixer_budget_close_to_linear()
+    test_stage3_final_mixer_factory_dcn()
+    test_stage3_dcn_final_mixer_shape_and_finite()
+    test_stage3_dcn_low_rank_cross_layer_matches_manual_formula()
+    test_stage3_dcn_final_mixer_uses_legacy_flatten_order()
+    test_stage3_dcn_final_mixer_budget_close_to_linear()
     test_v9_smallstable_model_width_contract()
     test_conv_encoder_layer_prenorm_identity_batchnorm()
     test_conv_encoder_layer_prenorm_identity_layernorm()

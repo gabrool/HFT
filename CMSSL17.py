@@ -480,11 +480,18 @@ print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", f
 # No gate, no MLP projection, no mixed ConvTimeNet stack.
 CTN_FINAL_MIXER = os.environ.get("BYBIT_CTN_FINAL_MIXER", "linear").strip().lower()
 CTN_SWIGLU_HIDDEN_DIM_ENV = os.environ.get("BYBIT_CTN_SWIGLU_HIDDEN_DIM", "").strip()
+CTN_DCN_RANK_ENV = os.environ.get("BYBIT_CTN_DCN_RANK", "").strip()
+CTN_DCN_NUM_LAYERS = 1
+CTN_DCN_RANK = 16
+if CTN_DCN_RANK_ENV:
+    CTN_DCN_RANK = int(CTN_DCN_RANK_ENV)
+    if CTN_DCN_RANK <= 0:
+        raise ValueError(f"BYBIT_CTN_DCN_RANK must be positive, got {CTN_DCN_RANK}")
 CTN_FINAL_MIXER_CHOICES = {
     "linear",
     "swiglu",
+    "dcn",
     # Future stages:
-    # "dcn",
     # "hybrid",
     # "latent_attn",
     # "cross_attn",
@@ -497,6 +504,7 @@ if CTN_FINAL_MIXER not in CTN_FINAL_MIXER_CHOICES:
 CTN_FINAL_MIXER_SCHEMA = {
     "linear": "finallinear",
     "swiglu": "finalswiglu_budget_v1",
+    "dcn": f"finaldcnv2lr_r{CTN_DCN_RANK}_l{CTN_DCN_NUM_LAYERS}_budget_v1",
 }[CTN_FINAL_MIXER]
 MODEL_ARCH_SCHEMA = (
     f"cmssl17_1s_maker_ctn6ci_k333333_prenormres_"
@@ -1376,6 +1384,106 @@ class SwiGLUFinalMixer(nn.Module):
         return self.out_proj(h)
 
 
+class DCNV2LowRankCrossLayer(nn.Module):
+    """One faithful low-rank DCN-V2 cross layer.
+
+    Formula:
+        x_next = x_l + x_0 * (U(V(x_l)) + b)
+
+    Shapes:
+        x0: [B, P, D]
+        xl: [B, P, D]
+        returns: [B, P, D]
+    """
+
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        self.dim = int(dim)
+        self.rank = int(rank)
+        if self.dim <= 0:
+            raise ValueError(f"dim must be positive, got {self.dim}")
+        if self.rank <= 0:
+            raise ValueError(f"rank must be positive, got {self.rank}")
+
+        # Low-rank W = U V. Bias b_l is the bias of U, matching W x + b.
+        self.V = nn.Linear(self.dim, self.rank, bias=False)
+        self.U = nn.Linear(self.rank, self.dim, bias=True)
+
+    def forward(self, x0: torch.Tensor, xl: torch.Tensor) -> torch.Tensor:
+        if x0.shape != xl.shape:
+            raise ValueError(f"x0/xl shape mismatch: x0={tuple(x0.shape)} xl={tuple(xl.shape)}")
+        if x0.shape[-1] != self.dim:
+            raise ValueError(f"expected last dim={self.dim}, got {x0.shape[-1]}")
+
+        cross = self.U(self.V(xl))
+        return xl + x0 * cross
+
+
+class DCNFinalMixer(nn.Module):
+    """Budget-conscious DCN-V2 low-rank cross final mixer.
+
+    Input:
+        ci_tokens: semantic [B, P, F, C]
+
+    Output:
+        [B, P, d_model]
+
+    Uses legacy_flatten_ci_tokens() for flat-vector mixer comparability.
+    """
+
+    mixer_type = "dcn"
+
+    def __init__(
+        self,
+        final_in_dim: int,
+        d_model: int,
+        rank: int = 16,
+        num_layers: int = 1,
+    ):
+        super().__init__()
+        self.final_in_dim = int(final_in_dim)
+        self.d_model = int(d_model)
+        self.rank = int(rank)
+        self.num_layers = int(num_layers)
+
+        if self.final_in_dim <= 0:
+            raise ValueError(f"final_in_dim must be positive, got {self.final_in_dim}")
+        if self.d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+        if self.rank <= 0:
+            raise ValueError(f"rank must be positive, got {self.rank}")
+        if self.num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {self.num_layers}")
+
+        self.norm = FinalMixerRMSNorm(self.final_in_dim)
+        self.cross_layers = nn.ModuleList([
+            DCNV2LowRankCrossLayer(self.final_in_dim, self.rank)
+            for _ in range(self.num_layers)
+        ])
+        self.out_proj = nn.Linear(self.final_in_dim, self.d_model)
+
+    def forward(self, ci_tokens: torch.Tensor) -> torch.Tensor:
+        if ci_tokens.ndim != 4:
+            raise ValueError(f"ci_tokens must be [B, P, F, C], got shape={tuple(ci_tokens.shape)}")
+
+        B, P, F_dim, C_dim = ci_tokens.shape
+        flat_dim = int(F_dim) * int(C_dim)
+        if flat_dim != self.final_in_dim:
+            raise ValueError(
+                f"DCNFinalMixer expected F*C={self.final_in_dim}, "
+                f"got F={F_dim}, C={C_dim}, F*C={flat_dim}"
+            )
+
+        x = legacy_flatten_ci_tokens(ci_tokens)
+        x0 = self.norm(x)
+        xl = x0
+
+        for layer in self.cross_layers:
+            xl = layer(x0, xl)
+
+        return self.out_proj(xl)
+
+
 def build_final_mixer(
     mixer_type: str,
     *,
@@ -1419,6 +1527,21 @@ def build_final_mixer(
             d_model=d_model,
             hidden_dim=hidden_dim,
             dropout=dropout,
+        )
+
+    if mixer_type == "dcn":
+        expected = int(in_feats) * int(c_internal)
+        if int(final_in_dim) != expected:
+            raise ValueError(
+                f"final_in_dim mismatch: final_in_dim={final_in_dim}, "
+                f"in_feats={in_feats}, c_internal={c_internal}, expected={expected}"
+            )
+
+        return DCNFinalMixer(
+            final_in_dim=final_in_dim,
+            d_model=d_model,
+            rank=CTN_DCN_RANK,
+            num_layers=CTN_DCN_NUM_LAYERS,
         )
 
     raise ValueError(
@@ -1507,6 +1630,8 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         extra = ""
         if isinstance(self.final_mixer, SwiGLUFinalMixer):
             extra = f" swiglu_hidden_dim={self.final_mixer.hidden_dim}"
+        elif isinstance(self.final_mixer, DCNFinalMixer):
+            extra = f" dcn_rank={self.final_mixer.rank} dcn_layers={self.final_mixer.num_layers}"
 
         print(
             f"[ctn-final-mixer] type={CTN_FINAL_MIXER} schema={CTN_FINAL_MIXER_SCHEMA} "
@@ -1629,6 +1754,10 @@ class ConvTimeNetFeatureExtractor(nn.Module):
         diag["final_mixer_schema"] = CTN_FINAL_MIXER_SCHEMA
         if isinstance(self.final_mixer, SwiGLUFinalMixer):
             diag["final_mixer_hidden_dim"] = self.final_mixer.hidden_dim
+            diag["final_mixer_param_count"] = module_parameter_count(self.final_mixer)
+        if isinstance(self.final_mixer, DCNFinalMixer):
+            diag["final_mixer_rank"] = self.final_mixer.rank
+            diag["final_mixer_num_layers"] = self.final_mixer.num_layers
             diag["final_mixer_param_count"] = module_parameter_count(self.final_mixer)
         diag["final_in_dim"] = self.final_in_dim
         diag["activations"]["ci_tokens"] = _activation_summary(ci_tokens)
