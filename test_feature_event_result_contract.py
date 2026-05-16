@@ -1386,12 +1386,29 @@ def test_stage5_latent_attn_uses_semantic_feature_tokens() -> None:
     ci_tokens = torch.randn(B, P, F_dim, C_dim)
 
     x = ci_tokens.reshape(B * P, F_dim, C_dim)
+
+    # Exact semantic-layout check before projection. The feature index f in x must
+    # correspond exactly to ci_tokens[:, :, f, :] flattened over [B, P].
+    for f in range(F_dim):
+        expected_feature_token = ci_tokens[:, :, f, :].reshape(B * P, C_dim)
+        assert torch.equal(x[:, f, :], expected_feature_token)
+
     tokens = mixer.token_proj(x) + mixer.feature_embed.view(1, F_dim, mixer.token_dim)
 
     for f in range(F_dim):
         manual = mixer.token_proj(ci_tokens[:, :, f, :].reshape(B * P, C_dim))
         manual = manual + mixer.feature_embed[f].view(1, mixer.token_dim)
-        assert torch.allclose(tokens[:, f, :], manual, atol=0.0, rtol=0.0)
+
+        max_abs_err = float((tokens[:, f, :] - manual).abs().max().detach().cpu())
+        # The exact layout invariant is tested above with torch.equal() before projection.
+        # After token_proj, batched Linear vs per-feature Linear can differ by tiny
+        # floating-point roundoff, so use a tight tolerance rather than exact equality.
+        assert torch.allclose(
+            tokens[:, f, :],
+            manual,
+            atol=1e-6,
+            rtol=1e-6,
+        ), max_abs_err
 
 
 def test_stage5_latent_attn_final_mixer_budget_close_to_linear() -> None:
