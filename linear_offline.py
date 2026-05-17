@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Linear offline entrypoint using CMSSL-compatible eval machinery."""
 
+import csv
 import json
 import math
 import os
@@ -31,6 +32,8 @@ from CMSSL17_offline import (  # type: ignore
     validate_loaded_label_array,
     compute_signed_raw_stats,
     build_signed_side_trim_masks_from_stats_np,
+    _binary_auc_np,
+    _safe_spearman_np,
     compute_dir_class_weights_from_train_labels,
     compute_mag_init_targets_from_train_labels,
     load_stats_cache,
@@ -60,6 +63,7 @@ from CMSSL17_linear import (  # type: ignore
     LinearSklearnTorchWrapper,
     save_linear_preprocess_bundle,
     save_linear_sklearn_bundle,
+    load_linear_sklearn_bundle,
 )
 
 
@@ -83,6 +87,18 @@ def _env_float_list(name: str, default: str) -> list[float]:
     if not raw:
         return []
     return [float(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def _env_str_list(name: str, default: str) -> list[str]:
+    raw = os.environ.get(name, default).strip()
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+
+def _env_int_list_allow_empty(name: str, default: str) -> list[int]:
+    raw = os.environ.get(name, default).strip()
+    if not raw:
+        return []
+    return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
 
 OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
@@ -132,6 +148,32 @@ LINEAR_STAGE4_MAX_VAL_ROWS = _env_int("BYBIT_LINEAR_STAGE4_MAX_VAL_ROWS", 0)
 LINEAR_STAGE4_MAX_TEST_ROWS = _env_int("BYBIT_LINEAR_STAGE4_MAX_TEST_ROWS", 0)
 LINEAR_STAGE4_SAVE_VAL_PREDICTIONS = _env_bool("BYBIT_LINEAR_STAGE4_SAVE_VAL_PREDICTIONS", 0)
 LINEAR_STAGE4_ALLOW_SAMPLE_TRIM_STATS = _env_bool("BYBIT_LINEAR_STAGE4_ALLOW_SAMPLE_TRIM_STATS", 0)
+
+LINEAR_STAGE5_SCHEMA = "linear_comparison_stage5_v1"
+LINEAR_STAGE5_EXTRACTORS = os.environ.get(
+    "BYBIT_LINEAR_STAGE5_EXTRACTORS",
+    "raw_linear,minirocket,multirocket,hydra,multirocket_hydra",
+).strip()
+LINEAR_STAGE5_EXTRACTOR_VALUES = _env_str_list(
+    "BYBIT_LINEAR_STAGE5_EXTRACTORS",
+    "raw_linear,minirocket,multirocket,hydra,multirocket_hydra",
+)
+LINEAR_STAGE5_PREPROCESS_NAME = os.environ.get("BYBIT_LINEAR_STAGE5_PREPROCESS_NAME", "default").strip()
+LINEAR_STAGE5_PREDICTOR = os.environ.get("BYBIT_LINEAR_STAGE5_PREDICTOR", "sgd_l2_huber").strip().lower()
+LINEAR_STAGE5_STRICT = _env_bool("BYBIT_LINEAR_STAGE5_STRICT", 0)
+LINEAR_STAGE5_REEVALUATE = _env_bool("BYBIT_LINEAR_STAGE5_REEVALUATE", 1)
+LINEAR_STAGE5_RUN_TEST = _env_bool("BYBIT_LINEAR_STAGE5_RUN_TEST", 1)
+LINEAR_STAGE5_BATCH_ROWS = _env_int("BYBIT_LINEAR_STAGE5_BATCH_ROWS", 8192)
+LINEAR_STAGE5_MAX_VAL_ROWS = _env_int("BYBIT_LINEAR_STAGE5_MAX_VAL_ROWS", 0)
+LINEAR_STAGE5_MAX_TEST_ROWS = _env_int("BYBIT_LINEAR_STAGE5_MAX_TEST_ROWS", 0)
+LINEAR_STAGE5_TOP_COEFS = _env_int("BYBIT_LINEAR_STAGE5_TOP_COEFS", 50)
+LINEAR_STAGE5_SAVE_PREDICTIONS = _env_bool("BYBIT_LINEAR_STAGE5_SAVE_PREDICTIONS", 0)
+LINEAR_STAGE5_PREDICTION_MAX_ROWS = _env_int("BYBIT_LINEAR_STAGE5_PREDICTION_MAX_ROWS", 0)
+LINEAR_STAGE5_LABEL_SHIFTS = os.environ.get("BYBIT_LINEAR_STAGE5_LABEL_SHIFTS", "-5,-1,1,5").strip()
+LINEAR_STAGE5_LABEL_SHIFT_VALUES = _env_int_list_allow_empty("BYBIT_LINEAR_STAGE5_LABEL_SHIFTS", "-5,-1,1,5")
+LINEAR_STAGE5_LABEL_PERMUTATION = _env_bool("BYBIT_LINEAR_STAGE5_LABEL_PERMUTATION", 1)
+LINEAR_STAGE5_PERMUTATION_SEED = _env_int("BYBIT_LINEAR_STAGE5_PERMUTATION_SEED", 17)
+LINEAR_STAGE5_BASELINE_METRICS_JSON = os.environ.get("BYBIT_LINEAR_STAGE5_BASELINE_METRICS_JSON", "").strip()
 
 LINEAR_EXTRACTOR = os.environ.get("BYBIT_LINEAR_EXTRACTOR", "raw_linear").strip().lower()
 LINEAR_EXTRACTOR_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_EXTRACTOR_FIT_MAX_ROWS", 50000)
@@ -215,9 +257,28 @@ if LINEAR_STAGE == "stage4":
         raise ValueError(f"BYBIT_LINEAR_STAGE4_MAG_FLOOR must be > 0, got {LINEAR_STAGE4_MAG_FLOOR}")
 
 
+if LINEAR_STAGE not in {"stage1", "stage2", "stage3", "stage4", "stage5"}:
+    raise ValueError(
+        "BYBIT_LINEAR_STAGE must be 'stage1', 'stage2', 'stage3', 'stage4', or 'stage5', "
+        f"got {LINEAR_STAGE!r}"
+    )
+
+if LINEAR_STAGE == "stage5":
+    if not LINEAR_STAGE5_EXTRACTOR_VALUES:
+        raise ValueError("BYBIT_LINEAR_STAGE5_EXTRACTORS must not be empty")
+    if LINEAR_STAGE5_BATCH_ROWS <= 0:
+        raise ValueError(f"BYBIT_LINEAR_STAGE5_BATCH_ROWS must be > 0, got {LINEAR_STAGE5_BATCH_ROWS}")
+    if LINEAR_STAGE5_TOP_COEFS < 0:
+        raise ValueError(f"BYBIT_LINEAR_STAGE5_TOP_COEFS must be >= 0, got {LINEAR_STAGE5_TOP_COEFS}")
+    if LINEAR_STAGE5_MAX_VAL_ROWS < 0 or LINEAR_STAGE5_MAX_TEST_ROWS < 0:
+        raise ValueError("BYBIT_LINEAR_STAGE5_MAX_VAL_ROWS and BYBIT_LINEAR_STAGE5_MAX_TEST_ROWS must be >= 0")
+    if LINEAR_STAGE5_PREDICTION_MAX_ROWS < 0:
+        raise ValueError(
+            f"BYBIT_LINEAR_STAGE5_PREDICTION_MAX_ROWS must be >= 0, got {LINEAR_STAGE5_PREDICTION_MAX_ROWS}"
+        )
+
+
 def _resolve_device() -> torch.device:
-    if LINEAR_STAGE not in {"stage1", "stage2", "stage3", "stage4"}:
-        raise ValueError(f"BYBIT_LINEAR_STAGE must be 'stage1', 'stage2', 'stage3', or 'stage4', got {LINEAR_STAGE!r}")
     if LINEAR_DEVICE not in {"cpu", "cuda", "auto"}:
         raise ValueError("BYBIT_LINEAR_DEVICE must be one of: cpu, cuda, auto")
     if LINEAR_EVAL_BATCH_SIZE <= 0:
@@ -229,7 +290,6 @@ def _resolve_device() -> torch.device:
             raise RuntimeError("BYBIT_LINEAR_DEVICE=cuda was requested, but CUDA is not available")
         return torch.device("cuda:0")
     return torch.device("cpu")
-
 
 def _validate_dataset_split(ds: Any, split_name: str, feature_dim_total: int) -> None:
     if feature_dim_total != int(ds.feature_dim_total):
@@ -1454,8 +1514,14 @@ def evaluate_stage4_bundle(
     device: torch.device,
     split_name: str,
     max_rows: int = 0,
+    batch_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
-    source = PreprocessedShardBatchSource(manifest, device=device, batch_rows=LINEAR_STAGE4_BATCH_ROWS, max_rows=max_rows)
+    source = PreprocessedShardBatchSource(
+        manifest,
+        device=device,
+        batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows),
+        max_rows=max_rows,
+    )
     model = LinearSklearnTorchWrapper(bundle).to(device)
     metrics = summarize_metrics(
         model,
@@ -1490,6 +1556,723 @@ def _jsonable_metrics(metrics: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
         return v
     return {str(k): conv(v) for k, v in metrics.items()}
 
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 comparison and sanity-check helpers
+# ---------------------------------------------------------------------------
+
+
+def resolve_stage4_dir(
+    linear_out_dir: Path,
+    extractor_name: str,
+    preprocess_name: str,
+    predictor: str,
+) -> Path:
+    return Path(linear_out_dir) / "stage4_models" / str(extractor_name) / str(preprocess_name) / str(predictor)
+
+
+def load_stage4_payload(
+    linear_out_dir: Path,
+    extractor_name: str,
+    preprocess_name: str,
+    predictor: str,
+) -> Dict[str, Any]:
+    stage4_dir = resolve_stage4_dir(linear_out_dir, extractor_name, preprocess_name, predictor)
+    path = stage4_dir / "linear_stage4_metrics.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing Stage 4 metrics for extractor={extractor_name}: {path}")
+    payload = load_json(path)
+    if payload.get("stage") != "stage4":
+        raise ValueError(f"Expected stage4 payload at {path}, got stage={payload.get('stage')!r}")
+    if "best_model_path" not in payload:
+        raise ValueError(f"Stage 4 payload missing best_model_path: {path}")
+    payload["payload_path"] = str(path)
+    return payload
+
+
+def load_stage4_artifacts_if_available(
+    linear_out_dir: Path,
+    extractor_name: str,
+    preprocess_name: str,
+    predictor: str,
+    *,
+    strict: bool,
+) -> Optional[Dict[str, Any]]:
+    try:
+        return load_stage4_payload(linear_out_dir, extractor_name, preprocess_name, predictor)
+    except FileNotFoundError as exc:
+        if strict:
+            raise
+        print(f"[linear-stage5-warn] skipping extractor={extractor_name}: {exc}", flush=True)
+        return None
+
+
+def _metric_float(metrics: Dict[str, Any], key: str, default: float = float("nan")) -> float:
+    try:
+        v = metrics.get(key, default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _metric_horizon_value(metrics: Dict[str, Any], key: str, horizon_idx: int, default: float = float("nan")) -> float:
+    if key in metrics:
+        v = metrics.get(key)
+        if isinstance(v, (list, tuple)) and horizon_idx < len(v):
+            try:
+                return float(v[horizon_idx])
+            except Exception:
+                return float(default)
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+    suffix_key = f"{key}_{int(HORIZONS_MS[horizon_idx])}ms"
+    return _metric_float(metrics, suffix_key, default)
+
+
+def extract_comparison_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not isinstance(metrics, dict):
+        return out
+
+    for h, horizon in enumerate([int(x) for x in HORIZONS_MS]):
+        for prefix in [
+            "dir_auc_kept",
+            "dir_bal_acc_kept",
+            "dir_auc_q50plus",
+            "dir_bal_acc_q50plus",
+            "edge_spearman_q50plus",
+            "edge_bal_q50plus",
+            "edge_bal_sign_acc_q50plus",
+        ]:
+            val = _metric_horizon_value(metrics, prefix, h)
+            if math.isfinite(val):
+                out[f"{prefix}_{horizon}ms"] = val
+
+    for key in [
+        "primary_metric_value",
+        "primary_dir_bal_acc",
+        "primary_metric_guard_passed",
+        "n_eval_rows",
+        "n_rows",
+    ]:
+        if key in metrics:
+            try:
+                out[key] = float(metrics[key])
+            except Exception:
+                pass
+    return out
+
+
+def collect_matching_metric_keys(metrics: Dict[str, Any]) -> Dict[str, float]:
+    patterns = (
+        "dir_auc",
+        "dir_bal",
+        "edge_spearman",
+        "edge_bal",
+        "prob_std",
+        "spread_pos_neg",
+    )
+    out: Dict[str, float] = {}
+    if not isinstance(metrics, dict):
+        return out
+    for k, v in metrics.items():
+        if not any(p in str(k) for p in patterns):
+            continue
+        if isinstance(v, (list, tuple)):
+            for h, item in enumerate(v[: len(HORIZONS_MS)]):
+                try:
+                    out[f"{k}_{int(HORIZONS_MS[h])}ms"] = float(item)
+                except Exception:
+                    pass
+        else:
+            try:
+                out[str(k)] = float(v)
+            except Exception:
+                pass
+    return out
+
+
+def _coef_array(model: Any) -> Optional[np.ndarray]:
+    if not hasattr(model, "coef_"):
+        return None
+    coef = np.asarray(model.coef_, dtype=np.float64)
+    return coef.reshape(-1)
+
+
+def _summarize_one_model_coefficients(model: Any, *, task: str, horizon_index: int, top_k: int) -> Dict[str, Any]:
+    coef = _coef_array(model)
+    intercept = float("nan")
+    if hasattr(model, "intercept_"):
+        try:
+            intercept = float(np.asarray(model.intercept_, dtype=np.float64).reshape(-1)[0])
+        except Exception:
+            intercept = float("nan")
+    row: Dict[str, Any] = {
+        "task": task,
+        "horizon_index": int(horizon_index),
+        "horizon_ms": int(HORIZONS_MS[horizon_index]),
+        "intercept": intercept,
+    }
+    if coef is None or coef.size == 0:
+        row.update({
+            "coef_l2": float("nan"),
+            "coef_l1": float("nan"),
+            "coef_abs_max": float("nan"),
+            "coef_nonzero_frac": float("nan"),
+            "n_coefficients": 0,
+            "top_coefficients": [],
+        })
+        return row
+    abs_coef = np.abs(coef)
+    row.update({
+        "coef_l2": float(np.linalg.norm(coef)),
+        "coef_l1": float(abs_coef.sum()),
+        "coef_abs_max": float(abs_coef.max()),
+        "coef_nonzero_frac": float(np.mean(abs_coef > 1e-12)),
+        "n_coefficients": int(coef.size),
+    })
+    if top_k > 0:
+        top_indices = np.argsort(-abs_coef)[: int(top_k)]
+        row["top_coefficients"] = [
+            {"index": int(i), "coef": float(coef[i]), "abs_coef": float(abs_coef[i])}
+            for i in top_indices
+        ]
+    else:
+        row["top_coefficients"] = []
+    return row
+
+
+def summarize_linear_model_coefficients(bundle: Any, *, top_k: int) -> Dict[str, Any]:
+    tasks = {
+        "direction": getattr(bundle, "direction_models", []),
+        "mag_up": getattr(bundle, "mag_up_models", []),
+        "mag_down": getattr(bundle, "mag_down_models", []),
+    }
+    out: Dict[str, Any] = {}
+    for task, models in tasks.items():
+        out[task] = [
+            _summarize_one_model_coefficients(model, task=task, horizon_index=h, top_k=top_k)
+            for h, model in enumerate(list(models)[: len(HORIZONS_MS)])
+        ]
+    return out
+
+
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x64 = np.asarray(x, dtype=np.float64)
+    return (1.0 / (1.0 + np.exp(-np.clip(x64, -60.0, 60.0)))).astype(np.float32)
+
+
+def collect_predictions_and_labels_from_manifest(
+    *,
+    bundle: LinearSklearnTakerBundle,
+    manifest: Dict[str, Any],
+    max_rows: int,
+    batch_rows: int,
+) -> Dict[str, np.ndarray]:
+    parts: Dict[str, list[np.ndarray]] = {
+        "dir_logits": [],
+        "p_up": [],
+        "mag_up_sqrt": [],
+        "mag_down_sqrt": [],
+        "mag_up_bps": [],
+        "mag_down_bps": [],
+        "edge_bps": [],
+        "y": [],
+        "positions": [],
+    }
+    seen = 0
+    for shard in manifest.get("shards", []):
+        if max_rows > 0 and seen >= max_rows:
+            break
+        with np.load(shard["path"], allow_pickle=False) as arr:
+            Z = arr["Z"].astype(np.float32, copy=False)
+            y = arr["y"].astype(np.float32, copy=False)
+            positions = arr["positions"].astype(np.int64, copy=False)
+        if max_rows > 0:
+            keep = max(0, min(Z.shape[0], int(max_rows) - seen))
+            Z, y, positions = Z[:keep], y[:keep], positions[:keep]
+        if Z.shape[0] <= 0:
+            continue
+        for start in range(0, Z.shape[0], int(batch_rows)):
+            end = min(Z.shape[0], start + int(batch_rows))
+            pred = bundle.predict_dict_np(Z[start:end])
+            dir_logits = np.asarray(pred["dir_logits"], dtype=np.float32)
+            mag_up_sqrt = np.asarray(pred["mag_up_sqrt"], dtype=np.float32)
+            mag_down_sqrt = np.asarray(pred["mag_down_sqrt"], dtype=np.float32)
+            p_up = _sigmoid_np(dir_logits)
+            mag_up_bps = (mag_up_sqrt * mag_up_sqrt)
+            mag_down_bps = (mag_down_sqrt * mag_down_sqrt)
+            edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
+            parts["dir_logits"].append(dir_logits)
+            parts["p_up"].append(p_up.astype(np.float32, copy=False))
+            parts["mag_up_sqrt"].append(mag_up_sqrt)
+            parts["mag_down_sqrt"].append(mag_down_sqrt)
+            parts["mag_up_bps"].append(mag_up_bps.astype(np.float32, copy=False))
+            parts["mag_down_bps"].append(mag_down_bps.astype(np.float32, copy=False))
+            parts["edge_bps"].append(edge_bps.astype(np.float32, copy=False))
+            parts["y"].append(y[start:end])
+            parts["positions"].append(positions[start:end])
+        seen += int(Z.shape[0])
+    if not parts["y"]:
+        raise ValueError(f"Manifest contains no rows: {manifest.get('manifest_path')}")
+    return {k: np.concatenate(v, axis=0) for k, v in parts.items()}
+
+
+def _array_stats_by_horizon(arr: np.ndarray) -> list[Dict[str, float]]:
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    out = []
+    for h in range(arr.shape[1]):
+        x = arr[:, h]
+        x = x[np.isfinite(x)]
+        if x.size <= 0:
+            out.append({k: float("nan") for k in ["mean", "std", "p01", "p05", "p50", "p95", "p99", "min", "max"]})
+            continue
+        out.append({
+            "mean": float(np.mean(x)),
+            "std": float(np.std(x, ddof=0)),
+            "p01": float(np.quantile(x, 0.01)),
+            "p05": float(np.quantile(x, 0.05)),
+            "p50": float(np.quantile(x, 0.50)),
+            "p95": float(np.quantile(x, 0.95)),
+            "p99": float(np.quantile(x, 0.99)),
+            "min": float(np.min(x)),
+            "max": float(np.max(x)),
+        })
+    return out
+
+
+def _primary_horizon_index() -> int:
+    try:
+        return [int(x) for x in HORIZONS_MS].index(int(PRIMARY_METRIC_HORIZON_MS))
+    except ValueError:
+        return len(HORIZONS_MS) - 1
+
+
+def summarize_edge_buckets(pred_payload: Dict[str, np.ndarray], split_name: str) -> Dict[str, Any]:
+    y = np.asarray(pred_payload["y"], dtype=np.float32)
+    edge = np.asarray(pred_payload["edge_bps"], dtype=np.float32)
+    h = _primary_horizon_index()
+    abs_edge = np.abs(edge[:, h])
+    if abs_edge.size < 4:
+        return {"split": split_name, "horizon_index": h, "buckets": []}
+    qs = np.unique(np.quantile(abs_edge.astype(np.float64), [0.0, 0.25, 0.50, 0.75, 1.0]))
+    buckets = []
+    for i in range(max(0, len(qs) - 1)):
+        lo, hi = float(qs[i]), float(qs[i + 1])
+        mask = (abs_edge >= lo) & (abs_edge <= hi if i == len(qs) - 2 else abs_edge < hi)
+        if not np.any(mask):
+            continue
+        truth = y[:, h][mask] > 0.0
+        pred_up = edge[:, h][mask] >= 0.0
+        buckets.append({
+            "bucket": int(i),
+            "abs_edge_lo": lo,
+            "abs_edge_hi": hi,
+            "n_rows": int(np.sum(mask)),
+            "realized_pos_frac": float(np.mean(truth)),
+            "edge_direction_acc": float(np.mean(pred_up == truth)),
+        })
+    return {"split": split_name, "horizon_index": h, "horizon_ms": int(HORIZONS_MS[h]), "buckets": buckets}
+
+
+def summarize_prediction_arrays(pred_payload: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    y = np.asarray(pred_payload["y"])
+    positions = np.asarray(pred_payload["positions"])
+    out: Dict[str, Any] = {
+        "n_rows": int(y.shape[0]),
+        "position_min": int(np.min(positions)) if positions.size else None,
+        "position_max": int(np.max(positions)) if positions.size else None,
+        "horizons_ms": [int(x) for x in HORIZONS_MS],
+    }
+    for key in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_bps", "mag_down_bps", "edge_bps", "y"]:
+        out[key] = _array_stats_by_horizon(np.asarray(pred_payload[key]))
+    edge = np.asarray(pred_payload["edge_bps"])
+    p_up = np.asarray(pred_payload["p_up"])
+    out["edge_positive_frac_by_horizon"] = [float(np.mean(edge[:, h] > 0.0)) for h in range(edge.shape[1])]
+    out["p_up_gt_0p5_frac_by_horizon"] = [float(np.mean(p_up[:, h] > 0.5)) for h in range(p_up.shape[1])]
+    out["edge_abs_p95_by_horizon"] = [float(np.quantile(np.abs(edge[:, h]), 0.95)) for h in range(edge.shape[1])]
+    out["edge_buckets_primary_horizon"] = summarize_edge_buckets(pred_payload, "prediction_summary")
+    return out
+
+
+def _balanced_acc_bool(pred: np.ndarray, truth: np.ndarray) -> float:
+    pred = np.asarray(pred, dtype=bool)
+    truth = np.asarray(truth, dtype=bool)
+    pos = truth
+    neg = ~truth
+    if not np.any(pos) or not np.any(neg):
+        return float("nan")
+    return 0.5 * (float(np.mean(pred[pos] == truth[pos])) + float(np.mean(pred[neg] == truth[neg])))
+
+
+def compute_array_metrics_with_cmssl_logic(
+    *,
+    pred: Dict[str, np.ndarray],
+    y: np.ndarray,
+    stats: Dict[str, np.ndarray],
+    split_name: str,
+) -> Dict[str, Any]:
+    y = np.asarray(y, dtype=np.float32)
+    keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_from_stats_np(y, stats)
+    out: Dict[str, Any] = {"split_name": split_name, "n_rows": int(y.shape[0])}
+    dir_logits = np.asarray(pred["dir_logits"], dtype=np.float32)
+    edge_bps = np.asarray(pred["edge_bps"], dtype=np.float32)
+    q50 = np.asarray(stats.get("kept_q50_abs_raw_bps", np.full(len(HORIZONS_MS), np.nan)), dtype=np.float32).reshape(-1)
+    for h, horizon in enumerate([int(x) for x in HORIZONS_MS]):
+        kh = keep_signed[:, h]
+        out[f"kept_frac_{horizon}ms"] = float(np.mean(kh)) if kh.size else float("nan")
+        if int(np.sum(kh)) >= 2:
+            truth = y[:, h][kh] > 0.0
+            scores = dir_logits[:, h][kh]
+            out[f"dir_auc_kept_{horizon}ms"] = _binary_auc_np(scores, truth)
+            out[f"dir_bal_acc_kept_{horizon}ms"] = _balanced_acc_bool(scores >= 0.0, truth)
+            out[f"edge_spearman_kept_{horizon}ms"] = _safe_spearman_np(edge_bps[:, h][kh], y[:, h][kh])
+        else:
+            out[f"dir_auc_kept_{horizon}ms"] = float("nan")
+            out[f"dir_bal_acc_kept_{horizon}ms"] = float("nan")
+            out[f"edge_spearman_kept_{horizon}ms"] = float("nan")
+        q50plus = kh & (np.abs(y[:, h]) >= float(q50[h] if h < q50.shape[0] else np.nan))
+        if int(np.sum(q50plus)) >= 2:
+            truth_q = y[:, h][q50plus] > 0.0
+            out[f"edge_spearman_q50plus_{horizon}ms"] = _safe_spearman_np(edge_bps[:, h][q50plus], y[:, h][q50plus])
+            out[f"edge_bal_q50plus_{horizon}ms"] = _balanced_acc_bool(edge_bps[:, h][q50plus] >= 0.0, truth_q)
+        else:
+            out[f"edge_spearman_q50plus_{horizon}ms"] = float("nan")
+            out[f"edge_bal_q50plus_{horizon}ms"] = float("nan")
+    ph = _primary_horizon_index()
+    out["primary_like_auc"] = out.get(f"dir_auc_kept_{int(HORIZONS_MS[ph])}ms", float("nan"))
+    out["primary_like_bal_acc"] = out.get(f"dir_bal_acc_kept_{int(HORIZONS_MS[ph])}ms", float("nan"))
+    return out
+
+
+def _slice_prediction_payload(pred_payload: Dict[str, np.ndarray], mask_or_indices: np.ndarray) -> Dict[str, np.ndarray]:
+    return {k: np.asarray(v)[mask_or_indices] for k, v in pred_payload.items()}
+
+
+def make_shifted_y(y: np.ndarray, shift: int) -> np.ndarray:
+    if shift == 0:
+        return y.copy()
+    y_shift = np.empty_like(y)
+    y_shift[:] = np.nan
+    if shift > 0:
+        y_shift[:-shift] = y[shift:]
+    else:
+        k = abs(shift)
+        y_shift[k:] = y[:-k]
+    return y_shift
+
+
+def run_label_shift_sanity_checks(
+    *,
+    pred_payload: Dict[str, np.ndarray],
+    stats: Dict[str, np.ndarray],
+    shifts: list[int],
+    split_name: str,
+) -> Dict[str, Any]:
+    checks: Dict[str, Any] = {}
+    for shift in shifts:
+        y_shift = make_shifted_y(np.asarray(pred_payload["y"], dtype=np.float32), int(shift))
+        valid = np.isfinite(y_shift).all(axis=1)
+        if not np.any(valid):
+            checks[f"shift_{int(shift)}"] = {"n_rows": 0, "error": "no valid shifted rows"}
+            continue
+        checks[f"shift_{int(shift)}"] = compute_array_metrics_with_cmssl_logic(
+            pred=_slice_prediction_payload(pred_payload, valid),
+            y=y_shift[valid],
+            stats=stats,
+            split_name=f"{split_name}_shift_{int(shift)}",
+        )
+    return checks
+
+
+def run_label_permutation_sanity_check(
+    *,
+    pred_payload: Dict[str, np.ndarray],
+    stats: Dict[str, np.ndarray],
+    seed: int,
+    split_name: str,
+) -> Dict[str, Any]:
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(pred_payload["y"].shape[0])
+    return compute_array_metrics_with_cmssl_logic(
+        pred=pred_payload,
+        y=np.asarray(pred_payload["y"])[perm],
+        stats=stats,
+        split_name=f"{split_name}_label_permutation_seed_{int(seed)}",
+    )
+
+
+def save_stage5_prediction_dump(path: Path, pred_payload: Dict[str, np.ndarray], max_rows: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = pred_payload["y"].shape[0] if max_rows <= 0 else min(int(max_rows), pred_payload["y"].shape[0])
+    np.savez_compressed(path, **{k: np.asarray(v)[:n] for k, v in pred_payload.items()})
+
+
+def build_stage5_comparison_row(
+    *,
+    extractor_name: str,
+    preprocess_name: str,
+    predictor: str,
+    stage4_payload: Dict[str, Any],
+    val_metrics: Dict[str, Any],
+    test_metrics: Optional[Dict[str, Any]],
+    diagnostics: Dict[str, Any],
+) -> Dict[str, Any]:
+    best_primary = stage4_payload.get("best_primary_metric", {}) or {}
+    row: Dict[str, Any] = {
+        "extractor": extractor_name,
+        "preprocess_name": preprocess_name,
+        "predictor": predictor,
+        "best_alpha": stage4_payload.get("best_alpha"),
+        "train_split": stage4_payload.get("train_split"),
+        "train_rows": stage4_payload.get("train_rows"),
+        "original_dim": stage4_payload.get("original_dim"),
+        "kept_dim": stage4_payload.get("kept_dim"),
+        "best_model_path": stage4_payload.get("best_model_path"),
+        "val_primary_metric_name": best_primary.get("name", best_primary.get("label")),
+        "val_primary_metric_value": best_primary.get("value"),
+        "val_guard_passed": best_primary.get("guard_passed"),
+    }
+    for k, v in extract_comparison_metrics(val_metrics).items():
+        row[f"val_{k}"] = v
+    for k, v in collect_matching_metric_keys(val_metrics).items():
+        row.setdefault(f"val_{k}", v)
+    if test_metrics:
+        for k, v in extract_comparison_metrics(test_metrics).items():
+            row[f"test_{k}"] = v
+        for k, v in collect_matching_metric_keys(test_metrics).items():
+            row.setdefault(f"test_{k}", v)
+    ph_ms = int(HORIZONS_MS[_primary_horizon_index()])
+    shift_checks = diagnostics.get("label_shift_sanity_val", {}) or {}
+    for shift_key, metrics in shift_checks.items():
+        if isinstance(metrics, dict):
+            row[f"val_{shift_key}_primary_like_auc_{ph_ms}ms"] = metrics.get("primary_like_auc", float("nan"))
+            row[f"val_{shift_key}_dir_auc_kept_{ph_ms}ms"] = metrics.get(f"dir_auc_kept_{ph_ms}ms", float("nan"))
+    perm = diagnostics.get("label_permutation_sanity_val")
+    if isinstance(perm, dict):
+        row[f"val_perm_dir_auc_kept_{ph_ms}ms"] = perm.get(f"dir_auc_kept_{ph_ms}ms", float("nan"))
+        row[f"val_perm_edge_spearman_q50plus_{ph_ms}ms"] = perm.get(f"edge_spearman_q50plus_{ph_ms}ms", float("nan"))
+    return row
+
+
+def write_rows_csv(path: Path, rows: list[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    all_keys = sorted({k for row in rows for k in row.keys()})
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=all_keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _maybe_add_baseline_row(rows: list[Dict[str, Any]], *, strict: bool) -> None:
+    if not LINEAR_STAGE5_BASELINE_METRICS_JSON:
+        return
+    try:
+        baseline = load_json(Path(LINEAR_STAGE5_BASELINE_METRICS_JSON))
+        metrics = baseline.get("val_metrics", baseline.get("val_full_metrics", baseline))
+        row: Dict[str, Any] = {"extractor": "CMSSL_neural_baseline", "preprocess_name": "", "predictor": "SAMBA"}
+        for k, v in extract_comparison_metrics(metrics).items():
+            row[f"val_{k}"] = v
+        for k, v in collect_matching_metric_keys(metrics).items():
+            row.setdefault(f"val_{k}", v)
+        rows.append(row)
+    except Exception as exc:
+        if strict:
+            raise
+        print(f"[linear-stage5-warn] could not parse baseline metrics JSON: {exc}", flush=True)
+
+
+def run_stage5_comparison(
+    *,
+    linear_out_dir: Path,
+    extractor_names: list[str],
+    preprocess_name: str,
+    predictor: str,
+    device: torch.device,
+) -> Dict[str, Any]:
+    stage5_dir = Path(linear_out_dir) / "stage5_comparison" / preprocess_name / predictor
+    diag_dir = stage5_dir / "stage5_diagnostics"
+    stage5_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[Dict[str, Any]] = []
+    diagnostics: Dict[str, Any] = {}
+    stats = load_linear_trim_stats(linear_out_dir)
+
+    for extractor_name in extractor_names:
+        stage4_payload = load_stage4_artifacts_if_available(
+            linear_out_dir,
+            extractor_name,
+            preprocess_name,
+            predictor,
+            strict=LINEAR_STAGE5_STRICT,
+        )
+        if stage4_payload is None:
+            continue
+        bundle_path = Path(str(stage4_payload["best_model_path"]))
+        bundle = load_linear_sklearn_bundle(bundle_path)
+        stage3_payload = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name)
+        val_manifest = load_stage3_manifest(stage3_payload, "val")
+        test_manifest = load_stage3_manifest(stage3_payload, "test")
+        if val_manifest is None:
+            raise ValueError(f"Missing val manifest for extractor={extractor_name}")
+        if LINEAR_STAGE5_RUN_TEST and test_manifest is None:
+            msg = f"Missing test manifest for extractor={extractor_name}"
+            if LINEAR_STAGE5_STRICT:
+                raise ValueError(msg)
+            print(f"[linear-stage5-warn] {msg}; skipping test diagnostics", flush=True)
+
+        if LINEAR_STAGE5_REEVALUATE:
+            val_metrics = evaluate_stage4_bundle(
+                bundle=bundle,
+                manifest=val_manifest,
+                stats=stats,
+                device=device,
+                split_name=f"stage5_val_{extractor_name}",
+                max_rows=LINEAR_STAGE5_MAX_VAL_ROWS,
+                batch_rows=LINEAR_STAGE5_BATCH_ROWS,
+            )
+        else:
+            val_metrics = stage4_payload.get("val_metrics", {}) or {}
+
+        test_metrics = None
+        if LINEAR_STAGE5_RUN_TEST and test_manifest is not None:
+            if LINEAR_STAGE5_REEVALUATE:
+                test_metrics = evaluate_stage4_bundle(
+                    bundle=bundle,
+                    manifest=test_manifest,
+                    stats=stats,
+                    device=device,
+                    split_name=f"stage5_test_{extractor_name}",
+                    max_rows=LINEAR_STAGE5_MAX_TEST_ROWS,
+                    batch_rows=LINEAR_STAGE5_BATCH_ROWS,
+                )
+            else:
+                test_metrics = stage4_payload.get("test_metrics")
+
+        coef_diag = summarize_linear_model_coefficients(bundle, top_k=LINEAR_STAGE5_TOP_COEFS)
+        pred_val = collect_predictions_and_labels_from_manifest(
+            bundle=bundle,
+            manifest=val_manifest,
+            max_rows=LINEAR_STAGE5_MAX_VAL_ROWS,
+            batch_rows=LINEAR_STAGE5_BATCH_ROWS,
+        )
+        pred_val_summary = summarize_prediction_arrays(pred_val)
+        shift_checks = run_label_shift_sanity_checks(
+            pred_payload=pred_val,
+            stats=stats,
+            shifts=LINEAR_STAGE5_LABEL_SHIFT_VALUES,
+            split_name=f"val_{extractor_name}",
+        ) if LINEAR_STAGE5_LABEL_SHIFT_VALUES else {}
+        perm_check = run_label_permutation_sanity_check(
+            pred_payload=pred_val,
+            stats=stats,
+            seed=LINEAR_STAGE5_PERMUTATION_SEED,
+            split_name=f"val_{extractor_name}",
+        ) if LINEAR_STAGE5_LABEL_PERMUTATION else None
+
+        pred_test_summary = None
+        shift_checks_test = {}
+        perm_check_test = None
+        if LINEAR_STAGE5_RUN_TEST and test_manifest is not None:
+            pred_test = collect_predictions_and_labels_from_manifest(
+                bundle=bundle,
+                manifest=test_manifest,
+                max_rows=LINEAR_STAGE5_MAX_TEST_ROWS,
+                batch_rows=LINEAR_STAGE5_BATCH_ROWS,
+            )
+            pred_test_summary = summarize_prediction_arrays(pred_test)
+            shift_checks_test = run_label_shift_sanity_checks(
+                pred_payload=pred_test,
+                stats=stats,
+                shifts=LINEAR_STAGE5_LABEL_SHIFT_VALUES,
+                split_name=f"test_{extractor_name}",
+            ) if LINEAR_STAGE5_LABEL_SHIFT_VALUES else {}
+            perm_check_test = run_label_permutation_sanity_check(
+                pred_payload=pred_test,
+                stats=stats,
+                seed=LINEAR_STAGE5_PERMUTATION_SEED,
+                split_name=f"test_{extractor_name}",
+            ) if LINEAR_STAGE5_LABEL_PERMUTATION else None
+            if LINEAR_STAGE5_SAVE_PREDICTIONS:
+                save_stage5_prediction_dump(
+                    diag_dir / extractor_name / "test_predictions.npz",
+                    pred_test,
+                    LINEAR_STAGE5_PREDICTION_MAX_ROWS,
+                )
+        if LINEAR_STAGE5_SAVE_PREDICTIONS:
+            save_stage5_prediction_dump(
+                diag_dir / extractor_name / "val_predictions.npz",
+                pred_val,
+                LINEAR_STAGE5_PREDICTION_MAX_ROWS,
+            )
+
+        diag = {
+            "stage4_payload_path": stage4_payload.get("payload_path"),
+            "best_model_path": str(bundle_path),
+            "coefficient_diagnostics": coef_diag,
+            "prediction_summary_val": pred_val_summary,
+            "prediction_summary_test": pred_test_summary,
+            "label_shift_sanity_val": shift_checks,
+            "label_permutation_sanity_val": perm_check,
+            "label_shift_sanity_test": shift_checks_test,
+            "label_permutation_sanity_test": perm_check_test,
+            "val_metrics": _jsonable_metrics(val_metrics),
+            "test_metrics": _jsonable_metrics(test_metrics),
+        }
+        diagnostics[extractor_name] = diag
+        row = build_stage5_comparison_row(
+            extractor_name=extractor_name,
+            preprocess_name=preprocess_name,
+            predictor=predictor,
+            stage4_payload=stage4_payload,
+            val_metrics=val_metrics,
+            test_metrics=test_metrics,
+            diagnostics=diag,
+        )
+        rows.append(row)
+        diag_path = stage5_dir / f"diagnostics_{extractor_name}.json"
+        diag_path.write_text(json.dumps(diag, allow_nan=True, indent=2), encoding="utf-8")
+        print(f"[linear-stage5] wrote {diag_path}", flush=True)
+
+    _maybe_add_baseline_row(rows, strict=LINEAR_STAGE5_STRICT)
+    csv_path = stage5_dir / "linear_stage5_comparison.csv"
+    json_path = stage5_dir / "linear_stage5_comparison.json"
+    copy_csv_path = Path(linear_out_dir) / "linear_stage5_comparison.csv"
+    copy_json_path = Path(linear_out_dir) / "linear_stage5_comparison.json"
+    write_rows_csv(csv_path, rows)
+    write_rows_csv(copy_csv_path, rows)
+    payload = {
+        "stage": "stage5",
+        "status": "ok",
+        "schema": LINEAR_STAGE5_SCHEMA,
+        "linear_out_dir": str(linear_out_dir),
+        "preprocess_name": preprocess_name,
+        "predictor": predictor,
+        "extractors_requested": extractor_names,
+        "extractors_completed": [row["extractor"] for row in rows if row.get("extractor") != "CMSSL_neural_baseline"],
+        "strict": bool(LINEAR_STAGE5_STRICT),
+        "reevaluate": bool(LINEAR_STAGE5_REEVALUATE),
+        "run_test": bool(LINEAR_STAGE5_RUN_TEST),
+        "label_shifts": LINEAR_STAGE5_LABEL_SHIFT_VALUES,
+        "label_permutation": bool(LINEAR_STAGE5_LABEL_PERMUTATION),
+        "comparison_rows": rows,
+        "diagnostics": diagnostics,
+        "saved_files": {
+            "comparison_csv": str(csv_path),
+            "comparison_json": str(json_path),
+            "comparison_csv_copy": str(copy_csv_path),
+            "comparison_json_copy": str(copy_json_path),
+        },
+    }
+    json_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8")
+    copy_json_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8")
+    print(f"[linear-stage5] wrote {csv_path}, {json_path}, {copy_csv_path}, and {copy_json_path}", flush=True)
+    return payload
 
 def run_stage4_training(
     *,
@@ -1792,6 +2575,21 @@ def main() -> None:
     linear_out_dir = Path(LINEAR_OUT_DIR) if LINEAR_OUT_DIR else out_root / "linear_stage1"
     linear_out_dir.mkdir(parents=True, exist_ok=True)
     device = _resolve_device()
+    if LINEAR_STAGE == "stage5":
+        print(
+            f"[linear-config] stage=stage5 extractors={LINEAR_STAGE5_EXTRACTOR_VALUES} "
+            f"preprocess={LINEAR_STAGE5_PREPROCESS_NAME} predictor={LINEAR_STAGE5_PREDICTOR} "
+            f"device={device} linear_out_dir={linear_out_dir}",
+            flush=True,
+        )
+        run_stage5_comparison(
+            linear_out_dir=linear_out_dir,
+            extractor_names=LINEAR_STAGE5_EXTRACTOR_VALUES,
+            preprocess_name=LINEAR_STAGE5_PREPROCESS_NAME,
+            predictor=LINEAR_STAGE5_PREDICTOR,
+            device=device,
+        )
+        return
     if LINEAR_STAGE == "stage3":
         print(
             f"[linear-config] stage=stage3 extractor={LINEAR_EXTRACTOR} device={device} "
@@ -2108,7 +2906,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if LINEAR_STAGE in {"stage3", "stage4"}:
+    if LINEAR_STAGE in {"stage3", "stage4", "stage5"}:
         assert OUT_ROOT or LINEAR_OUT_DIR, "Set BYBIT_OUT_ROOT or BYBIT_LINEAR_OUT_DIR"
     else:
         assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
