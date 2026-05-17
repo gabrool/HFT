@@ -54,6 +54,9 @@ def write_fake_stage2_manifest(tmp_path: Path, split: str, Z: np.ndarray, y: np.
         "split": split,
         "format": "npz_shards",
         "save_transforms": True,
+        "decision_stride_rows": 5,
+        "decision_offset_rows": 0,
+        "decision_row_policy": "linear_every_n_rows_v1",
         "n_rows": int(Z.shape[0]),
         "extractor_output_dim": int(Z.shape[1]),
         "max_z_chunk_mb": 1,
@@ -74,6 +77,9 @@ def write_fake_stage2_payload(tmp_path: Path, manifests):
     payload = {
         "stage": "stage2",
         "status": "ok",
+        "decision_stride_rows": 5,
+        "decision_offset_rows": 0,
+        "decision_row_policy": "linear_every_n_rows_v1",
         "extractor_output_dim": manifests["train_sample"]["extractor_output_dim"],
         "stage2_dir": str(stage2_dir),
         "manifests": manifests,
@@ -201,3 +207,25 @@ def test_stage3_manifest_row_alignment_and_bundle_reload(tmp_path, monkeypatch):
     loaded = load_linear_preprocess_bundle(Path(payload["preprocess_bundle_path"]))
     original = linear_offline.fit_linear_preprocessor_from_manifest(manifests["train_sample"], config=payload["preprocess_config"])
     np.testing.assert_allclose(original.transform(Z_val), loaded.transform(Z_val))
+
+
+def test_stage3_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
+    import pytest
+    import linear_offline
+
+    configure_stage3(monkeypatch, linear_offline)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+    Z = np.ones((4, 2), dtype=np.float32)
+    y = np.zeros((4, 3), dtype=np.float32)
+    manifests = {
+        "train_sample": write_fake_stage2_manifest(tmp_path, "train_sample", Z, y, np.arange(4)),
+        "val": write_fake_stage2_manifest(tmp_path, "val", Z, y, np.arange(4)),
+        "test": None,
+    }
+    manifests["train_sample"]["decision_stride_rows"] = 1
+    Path(manifests["train_sample"]["manifest_path"]).write_text(json.dumps(manifests["train_sample"], indent=2))
+    write_fake_stage2_payload(tmp_path, manifests)
+
+    with pytest.raises(ValueError, match="decision-row mismatch"):
+        linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
