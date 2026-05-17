@@ -87,6 +87,7 @@ LINEAR_EXTRACT_BATCH_ROWS = _env_int("BYBIT_LINEAR_EXTRACT_BATCH_ROWS", 4096)
 LINEAR_CHUNKED_TRANSFORMS = _env_bool("BYBIT_LINEAR_CHUNKED_TRANSFORMS", 1)
 LINEAR_TRANSFORM_SHARD_ROWS = _env_int("BYBIT_LINEAR_TRANSFORM_SHARD_ROWS", 50000)
 LINEAR_MAX_X_CHUNK_MB = _env_int("BYBIT_LINEAR_MAX_X_CHUNK_MB", 2048)
+LINEAR_MAX_Z_CHUNK_MB = _env_int("BYBIT_LINEAR_MAX_Z_CHUNK_MB", 2048)
 LINEAR_TRANSFORM_SAVE_FORMAT = os.environ.get("BYBIT_LINEAR_TRANSFORM_SAVE_FORMAT", "npz_shards").strip().lower()
 LINEAR_SAVE_TRANSFORMS = _env_bool("BYBIT_LINEAR_SAVE_TRANSFORMS", 1)
 LINEAR_EXTRACTOR_N_JOBS = _env_int("BYBIT_LINEAR_EXTRACTOR_N_JOBS", 1)
@@ -107,6 +108,8 @@ if LINEAR_STAGE == "stage2":
         raise ValueError(f"BYBIT_LINEAR_TRANSFORM_SHARD_ROWS must be > 0, got {LINEAR_TRANSFORM_SHARD_ROWS}")
     if LINEAR_MAX_X_CHUNK_MB <= 0:
         raise ValueError(f"BYBIT_LINEAR_MAX_X_CHUNK_MB must be > 0, got {LINEAR_MAX_X_CHUNK_MB}")
+    if LINEAR_MAX_Z_CHUNK_MB <= 0:
+        raise ValueError(f"BYBIT_LINEAR_MAX_Z_CHUNK_MB must be > 0, got {LINEAR_MAX_Z_CHUNK_MB}")
     if LINEAR_TRANSFORM_SAVE_FORMAT != "npz_shards":
         raise ValueError(
             f"BYBIT_LINEAR_TRANSFORM_SAVE_FORMAT must be 'npz_shards', got {LINEAR_TRANSFORM_SAVE_FORMAT!r}"
@@ -223,6 +226,10 @@ def estimate_x_window_mb(n_rows: int, lookback: int, feature_dim: int, dtype_byt
     return float(n_rows) * float(lookback) * float(feature_dim) * float(dtype_bytes) / (1024.0**2)
 
 
+def estimate_matrix_mb(n_rows: int, n_cols: int, dtype_bytes: int = 4) -> float:
+    return float(n_rows) * float(n_cols) * float(dtype_bytes) / (1024.0**2)
+
+
 def compute_safe_window_chunk_rows(
     *,
     requested_rows: int,
@@ -238,6 +245,41 @@ def compute_safe_window_chunk_rows(
     if hard_cap_rows > 0:
         by_mem = min(by_mem, int(hard_cap_rows))
     return max(1, by_mem)
+
+
+def compute_safe_transform_chunk_rows(
+    *,
+    requested_rows: int,
+    lookback: int,
+    feature_dim: int,
+    output_dim: int,
+    max_x_chunk_mb: int,
+    max_z_chunk_mb: int,
+    hard_cap_rows: int,
+) -> int:
+    if output_dim <= 0:
+        raise ValueError(f"output_dim must be > 0, got {output_dim}")
+
+    bytes_per_x_row = int(lookback) * int(feature_dim) * 4
+    bytes_per_z_row = int(output_dim) * 4
+
+    by_x_mem = max(
+        1,
+        int((int(max_x_chunk_mb) * 1024 * 1024) // max(1, bytes_per_x_row)),
+    )
+    by_z_mem = max(
+        1,
+        int((int(max_z_chunk_mb) * 1024 * 1024) // max(1, bytes_per_z_row)),
+    )
+
+    rows = min(by_x_mem, by_z_mem)
+
+    if requested_rows > 0:
+        rows = min(rows, int(requested_rows))
+    if hard_cap_rows > 0:
+        rows = min(rows, int(hard_cap_rows))
+
+    return max(1, int(rows))
 
 
 def assert_transform_matches_labels(Z: np.ndarray, y: np.ndarray, split_name: str) -> None:
@@ -399,30 +441,39 @@ def transform_dataset_to_npz_shards(
     collect_batch_rows: int,
     transform_shard_rows: int,
     max_x_chunk_mb: int,
+    max_z_chunk_mb: int,
+    extractor_output_dim: int,
     save_transforms: bool,
 ) -> Dict[str, Any]:
     positions = _dataset_positions(len(ds), int(max_rows))
     n_total = int(positions.shape[0])
     feature_dim = int(ds.feature_dim_total)
-    chunk_rows = compute_safe_window_chunk_rows(
+    chunk_rows = compute_safe_transform_chunk_rows(
         requested_rows=n_total,
         lookback=LOOKBACK,
         feature_dim=feature_dim,
+        output_dim=extractor_output_dim,
         max_x_chunk_mb=max_x_chunk_mb,
+        max_z_chunk_mb=max_z_chunk_mb,
         hard_cap_rows=transform_shard_rows,
     )
     print(
         f"[linear-memory] split={split_name} rows={n_total} "
         f"estimated_full_X_mb={estimate_x_window_mb(n_total, LOOKBACK, feature_dim):.1f} "
+        f"estimated_full_Z_mb={estimate_matrix_mb(n_total, extractor_output_dim):.1f} "
         f"chunk_rows={chunk_rows} "
-        f"estimated_chunk_X_mb={estimate_x_window_mb(chunk_rows, LOOKBACK, feature_dim):.1f}",
+        f"estimated_chunk_X_mb={estimate_x_window_mb(chunk_rows, LOOKBACK, feature_dim):.1f} "
+        f"estimated_chunk_Z_mb={estimate_matrix_mb(chunk_rows, extractor_output_dim):.1f} "
+        f"output_dim={extractor_output_dim}",
         flush=True,
     )
 
     shards: list[Dict[str, Any]] = []
     stats = _empty_streaming_stats()
     seconds_total = 0.0
+    processed_chunks = 0
     for shard_idx, start in enumerate(range(0, n_total, chunk_rows)):
+        processed_chunks += 1
         pos_chunk = positions[start : start + chunk_rows]
         X_chunk, y_chunk = collect_windows_for_positions(
             ds,
@@ -469,7 +520,7 @@ def transform_dataset_to_npz_shards(
             )
         _update_streaming_stats(stats, Z_chunk)
 
-    summary = _finalize_streaming_summary(stats, n_shards=len(shards), chunk_rows=chunk_rows, positions_rows=n_total)
+    summary = _finalize_streaming_summary(stats, n_shards=processed_chunks, chunk_rows=chunk_rows, positions_rows=n_total)
     if summary["finite_frac"] < 1.0:
         raise ValueError(f"Stage 2 extractor produced non-finite values for split={split_name}: {summary}")
     manifest_path = out_dir / f"{split_name}_transform_manifest.json"
@@ -478,6 +529,10 @@ def transform_dataset_to_npz_shards(
         "format": LINEAR_TRANSFORM_SAVE_FORMAT,
         "save_transforms": bool(save_transforms),
         "n_rows": int(stats["total_rows"]),
+        "extractor_output_dim": int(extractor_output_dim),
+        "max_z_chunk_mb": int(max_z_chunk_mb),
+        "processed_chunks": int(processed_chunks),
+        "n_saved_shards": len(shards),
         "n_shards": len(shards),
         "seconds_total": float(seconds_total),
         "summary": summary,
@@ -498,6 +553,8 @@ def transform_array_to_npz_shards(
     split_name: str,
     out_dir: Path,
     transform_shard_rows: int,
+    max_z_chunk_mb: int,
+    extractor_output_dim: int,
     save_transforms: bool,
 ) -> Dict[str, Any]:
     X = np.asarray(X, dtype=np.float32)
@@ -505,11 +562,27 @@ def transform_array_to_npz_shards(
     n_total = int(X.shape[0])
     if n_total <= 0:
         raise ValueError(f"Cannot transform empty array split={split_name}")
-    chunk_rows = max(1, min(n_total, int(transform_shard_rows)))
+    if extractor_output_dim <= 0:
+        raise ValueError(f"extractor_output_dim must be > 0, got {extractor_output_dim}")
+    z_cap_rows = max(
+        1,
+        int((int(max_z_chunk_mb) * 1024 * 1024) // max(1, int(extractor_output_dim) * 4)),
+    )
+    chunk_rows = max(1, min(n_total, int(transform_shard_rows), z_cap_rows))
+    print(
+        f"[linear-memory] split={split_name} rows={n_total} "
+        f"estimated_full_Z_mb={estimate_matrix_mb(n_total, extractor_output_dim):.1f} "
+        f"chunk_rows={chunk_rows} "
+        f"estimated_chunk_Z_mb={estimate_matrix_mb(chunk_rows, extractor_output_dim):.1f} "
+        f"output_dim={extractor_output_dim}",
+        flush=True,
+    )
     shards: list[Dict[str, Any]] = []
     stats = _empty_streaming_stats()
     seconds_total = 0.0
+    processed_chunks = 0
     for shard_idx, start in enumerate(range(0, n_total, chunk_rows)):
+        processed_chunks += 1
         end = min(n_total, start + chunk_rows)
         y_chunk = y[start:end]
         positions = np.arange(start, end, dtype=np.int64)
@@ -547,7 +620,7 @@ def transform_array_to_npz_shards(
             )
         _update_streaming_stats(stats, Z_chunk)
 
-    summary = _finalize_streaming_summary(stats, n_shards=len(shards), chunk_rows=chunk_rows, positions_rows=n_total)
+    summary = _finalize_streaming_summary(stats, n_shards=processed_chunks, chunk_rows=chunk_rows, positions_rows=n_total)
     if summary["finite_frac"] < 1.0:
         raise ValueError(f"Stage 2 extractor produced non-finite values for split={split_name}: {summary}")
     manifest_path = out_dir / f"{split_name}_transform_manifest.json"
@@ -557,6 +630,10 @@ def transform_array_to_npz_shards(
         "save_transforms": bool(save_transforms),
         "positions_reference": "train_fit_sample_order",
         "n_rows": int(stats["total_rows"]),
+        "extractor_output_dim": int(extractor_output_dim),
+        "max_z_chunk_mb": int(max_z_chunk_mb),
+        "processed_chunks": int(processed_chunks),
+        "n_saved_shards": len(shards),
         "n_shards": len(shards),
         "seconds_total": float(seconds_total),
         "summary": summary,
@@ -581,7 +658,8 @@ def run_stage2_extraction(
     train_week_keys: list[str],
     extractor_config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    stage2_dir = linear_out_dir / "stage2_extractors" / LINEAR_EXTRACTOR
+    extractor_name = str(extractor_config["extractor"]).strip().lower()
+    stage2_dir = linear_out_dir / "stage2_extractors" / extractor_name
     stage2_dir.mkdir(parents=True, exist_ok=True)
 
     if not LINEAR_CHUNKED_TRANSFORMS:
@@ -601,6 +679,24 @@ def run_stage2_extraction(
         flush=True,
     )
 
+    X_probe = X_fit[: min(128, X_fit.shape[0])]
+    Z_probe = extractor.transform(X_probe).astype(np.float32, copy=False)
+    if Z_probe.ndim != 2:
+        raise ValueError(f"Extractor probe produced non-2D output shape {Z_probe.shape}")
+    if Z_probe.shape[0] != X_probe.shape[0]:
+        raise ValueError(
+            f"Extractor probe rows {Z_probe.shape[0]} != X probe rows {X_probe.shape[0]}"
+        )
+    if not np.isfinite(Z_probe).all():
+        raise ValueError("Extractor probe produced non-finite values")
+    extractor_output_dim = int(Z_probe.shape[1])
+    print(
+        f"[linear-extractor-output] name={extractor.name} "
+        f"output_dim={extractor_output_dim} "
+        f"probe_rows={Z_probe.shape[0]}",
+        flush=True,
+    )
+
     train_sample_manifest = transform_array_to_npz_shards(
         extractor=extractor,
         X=X_fit,
@@ -608,6 +704,8 @@ def run_stage2_extraction(
         split_name="train_sample",
         out_dir=stage2_dir,
         transform_shard_rows=LINEAR_TRANSFORM_SHARD_ROWS,
+        max_z_chunk_mb=LINEAR_MAX_Z_CHUNK_MB,
+        extractor_output_dim=extractor_output_dim,
         save_transforms=LINEAR_SAVE_TRANSFORMS,
     )
     val_manifest = transform_dataset_to_npz_shards(
@@ -619,6 +717,8 @@ def run_stage2_extraction(
         collect_batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
         transform_shard_rows=LINEAR_TRANSFORM_SHARD_ROWS,
         max_x_chunk_mb=LINEAR_MAX_X_CHUNK_MB,
+        max_z_chunk_mb=LINEAR_MAX_Z_CHUNK_MB,
+        extractor_output_dim=extractor_output_dim,
         save_transforms=LINEAR_SAVE_TRANSFORMS,
     )
 
@@ -633,6 +733,8 @@ def run_stage2_extraction(
             collect_batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
             transform_shard_rows=LINEAR_TRANSFORM_SHARD_ROWS,
             max_x_chunk_mb=LINEAR_MAX_X_CHUNK_MB,
+            max_z_chunk_mb=LINEAR_MAX_Z_CHUNK_MB,
+            extractor_output_dim=extractor_output_dim,
             save_transforms=LINEAR_SAVE_TRANSFORMS,
         )
 
@@ -681,6 +783,8 @@ def run_stage2_extraction(
         "transform_save_format": LINEAR_TRANSFORM_SAVE_FORMAT,
         "transform_shard_rows": int(LINEAR_TRANSFORM_SHARD_ROWS),
         "max_x_chunk_mb": int(LINEAR_MAX_X_CHUNK_MB),
+        "max_z_chunk_mb": int(LINEAR_MAX_Z_CHUNK_MB),
+        "extractor_output_dim": int(extractor_output_dim),
         "transform_seconds": {
             "train_sample": float(train_sample_manifest["seconds_total"]),
             "val": float(val_manifest["seconds_total"]),
