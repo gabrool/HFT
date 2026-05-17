@@ -57,6 +57,9 @@ def configure_stage3(monkeypatch, linear_offline, *, audit=False):
     monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_NONFINITE_POLICY", "raise")
     monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_FIT_MAX_ROWS", 1000)
     monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB", 64)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS", 200_000)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS", 200_000)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS", 200_000)
     monkeypatch.setattr(linear_offline, "LINEAR_EXTRACT_BATCH_ROWS", 4)
     monkeypatch.setattr(linear_offline, "LINEAR_RUN_TEST", True)
     monkeypatch.setattr(linear_offline, "OUT_ROOT", "/tmp/fake-out-root")
@@ -123,6 +126,101 @@ def test_stage3_writes_audit_summary_files(monkeypatch, tmp_path):
     assert Path(payload["audit_summary_path"]).exists()
     assert Path(payload["audit_csv_path"]).exists()
     assert Path(payload["audit_top_features_csv_path"]).exists()
+
+
+def test_stage3_audit_uses_bounded_max_rows(monkeypatch, tmp_path):
+    import linear_offline
+
+    configure_stage3(monkeypatch, linear_offline, audit=True)
+    install_stage3_fakes(monkeypatch, linear_offline, tmp_path, has_test=True)
+    seen = {}
+
+    def fake_train_audit(**kwargs):
+        seen["train_max_rows"] = kwargs.get("max_rows")
+        return _summary(rows=200_000)
+
+    def fake_split_audit(*args, **kwargs):
+        split = kwargs.get("split_name", args[3] if len(args) > 3 else "unknown")
+        seen[f"{split}_max_rows"] = kwargs.get("max_rows")
+        return _summary(rows=200_000)
+
+    monkeypatch.setattr(linear_offline, "audit_preprocessing_streaming_train_plan", fake_train_audit)
+    monkeypatch.setattr(linear_offline, "_audit_stream_split", fake_split_audit)
+    monkeypatch.setattr(linear_offline, "write_preprocess_audit_csv", lambda path, summaries: Path(path).write_text("split\n"))
+    monkeypatch.setattr(linear_offline, "write_preprocess_top_features_csv", lambda path, summaries: Path(path).write_text("feature\n"))
+
+    payload = linear_offline.run_stage3_preprocessing(
+        linear_out_dir=tmp_path, extractor_name="raw_linear"
+    )
+
+    assert seen == {
+        "train_max_rows": 200_000,
+        "val_max_rows": 200_000,
+        "test_max_rows": 200_000,
+    }
+    assert payload["audit_max_train_rows"] == 200_000
+    assert payload["audit_max_val_rows"] == 200_000
+    assert payload["audit_max_test_rows"] == 200_000
+    assert payload["preprocess_config"]["audit_max_train_rows"] == 200_000
+    assert payload["preprocess_config"]["audit_max_val_rows"] == 200_000
+    assert payload["preprocess_config"]["audit_max_test_rows"] == 200_000
+    assert payload["audit_summary"]["audit_max_train_rows"] == 200_000
+
+
+def test_stage3_audit_zero_max_rows_requests_full_audit(monkeypatch, tmp_path):
+    import linear_offline
+
+    configure_stage3(monkeypatch, linear_offline, audit=True)
+    install_stage3_fakes(monkeypatch, linear_offline, tmp_path, has_test=True)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS", 0)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS", 0)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS", 0)
+    seen = {}
+
+    def fake_train_audit(**kwargs):
+        seen["train_max_rows"] = kwargs.get("max_rows")
+        return _summary(rows=10)
+
+    monkeypatch.setattr(linear_offline, "audit_preprocessing_streaming_train_plan", fake_train_audit)
+
+    def fake_split_audit(*args, **kwargs):
+        split = args[3]
+        seen[f"{split}_max_rows"] = kwargs.get("max_rows")
+        return _summary(rows=4)
+
+    monkeypatch.setattr(linear_offline, "_audit_stream_split", fake_split_audit)
+    monkeypatch.setattr(linear_offline, "write_preprocess_audit_csv", lambda path, summaries: Path(path).write_text("split\n"))
+    monkeypatch.setattr(linear_offline, "write_preprocess_top_features_csv", lambda path, summaries: Path(path).write_text("feature\n"))
+
+    payload = linear_offline.run_stage3_preprocessing(
+        linear_out_dir=tmp_path, extractor_name="raw_linear"
+    )
+
+    assert seen["train_max_rows"] == 0
+    assert seen["val_max_rows"] == 0
+    assert seen["test_max_rows"] == 0
+    assert payload["audit_max_train_rows"] == 0
+    assert payload["preprocess_config"]["audit_max_val_rows"] == 0
+
+
+@pytest.mark.parametrize(
+    ("attr", "env_name"),
+    [
+        ("LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS", "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS"),
+        ("LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS", "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS"),
+        ("LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS", "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS"),
+    ],
+)
+def test_stage3_audit_negative_caps_are_validated(monkeypatch, tmp_path, attr, env_name):
+    import linear_offline
+
+    configure_stage3(monkeypatch, linear_offline, audit=True)
+    monkeypatch.setattr(linear_offline, attr, -1)
+
+    with pytest.raises(ValueError, match=f"{env_name} must be >= 0"):
+        linear_offline.run_stage3_preprocessing(
+            linear_out_dir=tmp_path, extractor_name="raw_linear"
+        )
 
 
 def test_stage3_rejects_non_train_full_fit_split(monkeypatch, tmp_path):
