@@ -62,6 +62,7 @@ from CMSSL17_linear import (  # type: ignore
     LinearSklearnTakerBundle,
     LinearSklearnTorchWrapper,
     save_linear_preprocess_bundle,
+    load_linear_preprocess_bundle,
     save_linear_sklearn_bundle,
     load_linear_sklearn_bundle,
 )
@@ -145,7 +146,7 @@ LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE = _env_int(
 
 LINEAR_STAGE4_SCHEMA = "linear_target_models_stage4_v1"
 LINEAR_STAGE4_PREPROCESS_NAME = os.environ.get("BYBIT_LINEAR_STAGE4_PREPROCESS_NAME", "default").strip()
-LINEAR_STAGE4_TRAIN_SPLIT = os.environ.get("BYBIT_LINEAR_STAGE4_TRAIN_SPLIT", "train_sample").strip().lower()
+LINEAR_STAGE4_TRAIN_SPLIT = os.environ.get("BYBIT_LINEAR_STAGE4_TRAIN_SPLIT", "train_full").strip().lower()
 LINEAR_STAGE4_PREDICTOR = os.environ.get("BYBIT_LINEAR_STAGE4_PREDICTOR", "sgd_l2_huber").strip().lower()
 LINEAR_STAGE4_ALPHA_GRID = os.environ.get("BYBIT_LINEAR_STAGE4_ALPHA_GRID", "1e-6,3e-6,1e-5,3e-5,1e-4").strip()
 LINEAR_STAGE4_ALPHA_VALUES = _env_float_list("BYBIT_LINEAR_STAGE4_ALPHA_GRID", "1e-6,3e-6,1e-5,3e-5,1e-4")
@@ -768,6 +769,7 @@ def _finalize_streaming_summary(stats: Dict[str, Any], *, n_shards: int, chunk_r
     }
 
 
+# Legacy persisted-shard helper. Not used by the default streaming pipeline.
 def transform_dataset_to_npz_shards(
     *,
     extractor: Any,
@@ -883,6 +885,7 @@ def transform_dataset_to_npz_shards(
     return manifest
 
 
+# Legacy persisted-shard helper. Not used by the default streaming pipeline.
 def transform_array_to_npz_shards(
     *,
     extractor: Any,
@@ -1485,9 +1488,9 @@ def finalize_preprocess_audit(
         warnings.append("out_abs_gt_10_frac_high")
     if summary["out_abs_gt_20_frac"] > 1e-4:
         warnings.append("out_abs_gt_20_frac_high")
-    if split_name == "train_sample" and summary["out_mean_abs_p95"] > 0.05:
+    if split_name in {"train_sample", "train"} and summary["out_mean_abs_p95"] > 0.05:
         warnings.append("train_mean_not_centered")
-    if split_name == "train_sample" and (summary["out_std_p50"] < 0.8 or summary["out_std_p50"] > 1.2):
+    if split_name in {"train_sample", "train"} and (summary["out_std_p50"] < 0.8 or summary["out_std_p50"] > 1.2):
         warnings.append("train_std_not_unit_scaled")
     if summary["variance_removed_frac"] > 0.10:
         warnings.append("variance_removed_gt_10pct")
@@ -1578,7 +1581,7 @@ def write_preprocess_per_feature_npz(path: Path, split_summaries: Dict[str, Opti
         if summary is None:
             continue
         per = summary.get("_per_feature", {}) or {}
-        prefix = "train" if split == "train_sample" else split
+        prefix = "train" if split in {"train_sample", "train"} else split
         if "clip_frac" in per:
             arrays[f"{prefix}_clip_frac"] = per["clip_frac"]
         if "std_mean" in per:
@@ -1589,6 +1592,7 @@ def write_preprocess_per_feature_npz(path: Path, split_summaries: Dict[str, Opti
     np.savez_compressed(path, **arrays)
 
 
+# Legacy persisted-shard helper. Not used by the default streaming pipeline.
 def preprocess_manifest_to_npz_shards(
     *,
     bundle: LinearPreprocessBundle,
@@ -1915,6 +1919,7 @@ def load_stage3_payload(linear_out_dir: Path, extractor_name: str, preprocess_na
     return payload
 
 
+# Legacy persisted-shard helper. Not used by the default streaming pipeline.
 def load_stage3_manifest(payload: Dict[str, Any], split: str) -> Optional[Dict[str, Any]]:
     manifest = payload.get("manifests", {}).get(split)
     if manifest is None:
@@ -1987,6 +1992,7 @@ def manifest_dim(manifest: Dict[str, Any]) -> int:
     raise ValueError("Manifest missing kept_dim / summary.shape[1]")
 
 
+# Legacy persisted-shard helper. Not used by the default streaming pipeline.
 def iter_manifest_numpy_batches(
     manifest: Dict[str, Any],
     *,
@@ -2026,6 +2032,7 @@ def iter_manifest_numpy_batches(
             remaining -= n
 
 
+# Legacy persisted-shard helper. Not used by the default streaming pipeline.
 class PreprocessedShardBatchSource:
     def __init__(self, manifest: Dict[str, Any], device: torch.device, batch_rows: int, max_rows: int = 0):
         self.manifest = manifest
@@ -2760,7 +2767,7 @@ def add_stage3_audit_fields_to_comparison_row(row: Dict[str, Any], audit_summary
     if not isinstance(audit_summary, dict):
         return
     splits = audit_summary.get("splits", {}) if isinstance(audit_summary.get("splits"), dict) else {}
-    train = splits.get("train_sample") if isinstance(splits.get("train_sample"), dict) else {}
+    train = splits.get("train") if isinstance(splits.get("train"), dict) else (splits.get("train_sample") if isinstance(splits.get("train_sample"), dict) else {})
     val = splits.get("val") if isinstance(splits.get("val"), dict) else {}
     row["preprocess_kept_dim"] = train.get("kept_dim") or val.get("kept_dim") or audit_summary.get("kept_dim")
     row["preprocess_variance_removed_frac"] = train.get("variance_removed_frac", float("nan"))
@@ -3696,6 +3703,399 @@ def main() -> None:
     torch.save(ckpt, ckpt_path)
     print(f"[linear_ckpt] saved {ckpt_path}", flush=True)
 
+
+# ---------------------------------------------------------------------------
+# Streaming feature pipeline overrides (default path; persisted shards legacy)
+# ---------------------------------------------------------------------------
+
+
+def build_linear_cmssl_splits_from_out_root(*, out_root: Path) -> Dict[str, Any]:
+    out_root = Path(out_root)
+    meta = json.loads((out_root / "meta.json").read_text())
+    validate_contract_meta(meta, "global meta.json")
+    validate_dataset_label_dim(meta, "global meta.json")
+    split_info = require_supported_pipeline_splits(meta, out_root)
+    protocol = split_info["protocol"]
+    cmssl = split_info["splits"]["cmssl"]
+    train_week_keys = list(cmssl["train"]["weeks"])
+    cmssl_val = cmssl["val"]
+    cmssl_test = cmssl.get("test")
+    has_cmssl_test = cmssl_test is not None and bool(cmssl_test.get("weeks"))
+    train_split_entries = [make_single_week_split_from_meta(out_root=out_root, global_meta=meta, week_key=wk) for wk in train_week_keys]
+    ds_train_list = [build_dataset_from_split(str(out_root), entry) for entry in train_split_entries]
+    ds_val = build_dataset_from_split(str(out_root), cmssl_val)
+    ds_test = build_dataset_from_split(str(out_root), cmssl_test) if has_cmssl_test else None
+    feature_dim_total = int(meta["feature_dim_total"])
+    for i, ds_train in enumerate(ds_train_list):
+        _validate_dataset_split(ds_train, f"train[{i}]/{train_week_keys[i]}", feature_dim_total)
+    _validate_dataset_split(ds_val, "val", feature_dim_total)
+    if ds_test is not None:
+        _validate_dataset_split(ds_test, "test", feature_dim_total)
+    print(
+        f"[split] protocol={protocol} cmssl.train={','.join(train_week_keys)} "
+        f"cmssl.val={cmssl_val.get('weeks')} cmssl.test={cmssl_test.get('weeks') if has_cmssl_test else '<missing>'}",
+        flush=True,
+    )
+    return {
+        "meta": meta,
+        "protocol": protocol,
+        "train_week_keys": train_week_keys,
+        "train_split_entries": train_split_entries,
+        "ds_train_list": ds_train_list,
+        "ds_val": ds_val,
+        "ds_test": ds_test,
+        "has_cmssl_test": has_cmssl_test,
+        "feature_dim_total": feature_dim_total,
+        "val_split_entry": cmssl_val,
+        "test_split_entry": cmssl_test,
+    }
+
+
+def _stage_payload_path(linear_out_dir: Path, extractor_name: str, preprocess_name: str = "default") -> tuple[Path, Path]:
+    return (
+        resolve_stage2_dir(linear_out_dir, extractor_name) / "linear_stage2_extractor_metrics.json",
+        resolve_stage3_dir(linear_out_dir, extractor_name, preprocess_name) / "linear_stage3_preprocess_metrics.json",
+    )
+
+
+def load_stage2_payload(linear_out_dir: Path, extractor_name: str) -> Dict[str, Any]:  # type: ignore[override]
+    path, _ = _stage_payload_path(Path(linear_out_dir), extractor_name)
+    if not path.exists():
+        raise FileNotFoundError(f"Stage 2 payload not found for extractor={extractor_name!r}: {path}")
+    payload = load_json(path)
+    if payload.get("stage") != "stage2":
+        raise ValueError(f"Expected stage2 payload at {path}, got stage={payload.get('stage')!r}")
+    if not payload.get("streaming_features", False):
+        raise ValueError("Stage 2 payload was created by old persisted-shard pipeline. Rerun Stage 2 with the streaming pipeline.")
+    if "extractor_output_dim" not in payload or "extractor_pickle" not in payload:
+        raise ValueError(f"Stage 2 payload missing extractor_output_dim/extractor_pickle: {path}")
+    payload["payload_path"] = str(path)
+    return payload
+
+
+def load_stage2_extractor_bundle(*, linear_out_dir: Path, extractor_name: str) -> tuple[Any, Dict[str, Any]]:
+    payload = load_stage2_payload(linear_out_dir, extractor_name)
+    _validate_manifest_decision_policy(payload, context="stage2 extractor")
+    pkl_path = Path(str(payload["extractor_pickle"]))
+    if not pkl_path.exists():
+        raise FileNotFoundError(f"Stage 2 extractor pickle not found: {pkl_path}")
+    with pkl_path.open("rb") as f:
+        extractor = pickle.load(f)
+    return extractor, payload
+
+
+def load_stage3_payload(linear_out_dir: Path, extractor_name: str, preprocess_name: str) -> Dict[str, Any]:  # type: ignore[override]
+    _, path = _stage_payload_path(Path(linear_out_dir), extractor_name, preprocess_name)
+    if not path.exists():
+        raise FileNotFoundError(f"Stage 3 payload not found for extractor={extractor_name!r} preprocess={preprocess_name!r}: {path}")
+    payload = load_json(path)
+    if payload.get("stage") != "stage3":
+        raise ValueError(f"Expected stage3 payload at {path}, got stage={payload.get('stage')!r}")
+    if not payload.get("streaming_features", False):
+        raise ValueError("Stage 3 payload was created by old persisted-shard pipeline. Rerun Stage 3 with the streaming pipeline.")
+    payload["payload_path"] = str(path)
+    return payload
+
+
+def iter_dataset_window_batches(ds: Any, *, batch_rows: int, max_rows: int = 0, split_name: str, shuffle_within_batch: bool = False, rng: Optional[np.random.Generator] = None):
+    positions = _dataset_positions(len(ds), int(max_rows))
+    batch_rows = max(1, int(batch_rows))
+    for start in range(0, len(positions), batch_rows):
+        pos = positions[start:start + batch_rows]
+        if shuffle_within_batch:
+            rng = np.random.default_rng() if rng is None else rng
+            pos = pos[rng.permutation(len(pos))]
+        X, y = collect_windows_for_positions(ds, pos, batch_rows=batch_rows, split_name=split_name)
+        yield X, y, pos.astype(np.int64, copy=False)
+
+
+def _train_caps(ds_train_list: list[Any], max_rows: int) -> list[int]:
+    counts = [int(_decision_positions(len(ds)).shape[0]) for ds in ds_train_list]
+    if int(max_rows) <= 0:
+        return counts
+    total = sum(counts); cap = min(int(max_rows), total)
+    raw = np.asarray(counts, dtype=np.float64) * cap / max(1, total)
+    caps = np.floor(raw).astype(np.int64)
+    for idx in np.argsort(-(raw - caps))[: cap - int(caps.sum())]:
+        caps[idx] += 1
+    return [int(min(c, n)) for c, n in zip(caps, counts)]
+
+
+def iter_train_window_batches(ds_train_list: list[Any], *, batch_rows: int, max_rows: int = 0, split_name: str = "train", shuffle_within_batch: bool = False, rng: Optional[np.random.Generator] = None):
+    for week_idx, (ds, cap) in enumerate(zip(ds_train_list, _train_caps(ds_train_list, int(max_rows)))):
+        if cap <= 0:
+            continue
+        for X, y, positions in iter_dataset_window_batches(ds, batch_rows=batch_rows, max_rows=cap, split_name=f"{split_name}_week{week_idx}", shuffle_within_batch=shuffle_within_batch, rng=rng):
+            yield X, y, (week_idx, positions)
+
+
+def iter_extracted_batches_from_dataset(*, extractor: Any, ds: Any, batch_rows: int, max_rows: int, split_name: str, shuffle_within_batch: bool = False, rng: Optional[np.random.Generator] = None):
+    for X, y, positions in iter_dataset_window_batches(ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name, shuffle_within_batch=shuffle_within_batch, rng=rng):
+        Z = extractor.transform(X).astype(np.float32, copy=False)
+        assert_transform_matches_labels(Z, y, split_name)
+        if not np.isfinite(Z).all():
+            raise ValueError(f"Extractor produced non-finite values for split={split_name}")
+        yield Z, y, positions
+
+
+def iter_extracted_batches_from_train(*, extractor: Any, ds_train_list: list[Any], batch_rows: int, max_rows: int, split_name: str, shuffle_within_batch: bool = False, rng: Optional[np.random.Generator] = None):
+    for X, y, pos_info in iter_train_window_batches(ds_train_list, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name, shuffle_within_batch=shuffle_within_batch, rng=rng):
+        Z = extractor.transform(X).astype(np.float32, copy=False)
+        assert_transform_matches_labels(Z, y, split_name)
+        if not np.isfinite(Z).all():
+            raise ValueError(f"Extractor produced non-finite values for split={split_name}")
+        yield Z, y, pos_info
+
+
+def iter_preprocessed_batches_from_dataset(*, extractor: Any, bundle: LinearPreprocessBundle, ds: Any, batch_rows: int, max_rows: int, split_name: str, shuffle_within_batch: bool = False, rng: Optional[np.random.Generator] = None):
+    for Z, y, positions in iter_extracted_batches_from_dataset(extractor=extractor, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name, shuffle_within_batch=shuffle_within_batch, rng=rng):
+        yield bundle.transform(Z), y, positions
+
+
+def iter_preprocessed_batches_from_train(*, extractor: Any, bundle: LinearPreprocessBundle, ds_train_list: list[Any], batch_rows: int, max_rows: int, split_name: str, shuffle_within_batch: bool = False, rng: Optional[np.random.Generator] = None):
+    for Z, y, pos_info in iter_extracted_batches_from_train(extractor=extractor, ds_train_list=ds_train_list, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name, shuffle_within_batch=shuffle_within_batch, rng=rng):
+        yield bundle.transform(Z), y, pos_info
+
+
+def _fit_preprocess_from_stream(extractor: Any, ds_train_list: list[Any], config: Dict[str, Any], train_week_keys: list[str]) -> LinearPreprocessBundle:
+    policy = str(config.get("nonfinite_policy", "raise"))
+    parts = []
+    rows = 0
+    for Z, _y, _p in iter_extracted_batches_from_train(extractor=extractor, ds_train_list=ds_train_list, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=int(config["fit_max_rows"]), split_name="train_quantile_sample"):
+        Z = _apply_preprocess_nonfinite_policy(Z, policy=policy, context="train quantile sample")
+        parts.append(Z); rows += Z.shape[0]
+        if estimate_matrix_mb(rows, Z.shape[1]) >= int(config["fit_max_matrix_mb"]):
+            break
+    if not parts:
+        raise ValueError("Cannot fit preprocessor on empty streaming train sample")
+    sample = np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+    D = int(sample.shape[1])
+    cap_rows = max(1, int((int(config["fit_max_matrix_mb"]) * 1024 * 1024) // max(1, D * 4)))
+    if sample.shape[0] > cap_rows:
+        sample = sample[np.linspace(0, sample.shape[0] - 1, cap_rows, dtype=np.int64)]
+    print(f"[linear-stream] stage=stage3 action=fit_quantile_sample rows={sample.shape[0]}", flush=True)
+    winsorize = bool(config.get("winsorize", True))
+    lower = np.quantile(sample, float(config["winsor_q_lo"]), axis=0).astype(np.float32) if winsorize else np.full(D, -np.inf, dtype=np.float32)
+    upper = np.quantile(sample, float(config["winsor_q_hi"]), axis=0).astype(np.float32) if winsorize else np.full(D, np.inf, dtype=np.float32)
+    count = 0; sum_ = np.zeros(D, dtype=np.float64); sumsq = np.zeros(D, dtype=np.float64)
+    for Z, _y, _p in iter_extracted_batches_from_train(extractor=extractor, ds_train_list=ds_train_list, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name="train_mean_std"):
+        Z = _apply_preprocess_nonfinite_policy(Z, policy=policy, context="train mean/std")
+        Zc = np.clip(Z, lower, upper)
+        sum_ += Zc.sum(axis=0, dtype=np.float64); sumsq += np.square(Zc, dtype=np.float64).sum(axis=0); count += Zc.shape[0]
+    if count <= 0:
+        raise ValueError("Cannot fit preprocessor on empty streaming train split")
+    print(f"[linear-stream] stage=stage3 action=fit_mean_std rows={count}", flush=True)
+    mean64 = sum_ / count; std64 = np.sqrt(np.maximum(0.0, sumsq / count - mean64 * mean64))
+    mean = mean64.astype(np.float32) if bool(config.get("standardize", True)) else np.zeros(D, dtype=np.float32)
+    std = std64.astype(np.float32) if bool(config.get("standardize", True)) else np.ones(D, dtype=np.float32)
+    keep = (np.isfinite(std) & (std >= float(config.get("min_std", 0.0)))) if bool(config.get("variance_filter", True)) else np.ones(D, dtype=bool)
+    if not keep.any():
+        raise ValueError("Preprocessor variance filter removed all features")
+    fit_summary = {
+        "fit_mode": "streaming_full_train_v1", "fit_split": "train", "quantile_fit_rows": int(sample.shape[0]),
+        "mean_std_fit_rows": int(count), "train_weeks": list(train_week_keys), "extractor_output_dim": D,
+        "original_dim": D, "kept_dim": int(keep.sum()), "removed_dim": int(D - keep.sum()),
+        "fit_rows_for_quantiles": int(sample.shape[0]), "fit_rows_for_mean_std": int(count),
+        "winsorize": winsorize, "winsor_q_lo": float(config["winsor_q_lo"]), "winsor_q_hi": float(config["winsor_q_hi"]),
+        "standardize": bool(config.get("standardize", True)), "variance_filter": bool(config.get("variance_filter", True)),
+        "min_std": float(config.get("min_std", 0.0)), "std_eps": float(config.get("std_eps", 1e-6)),
+        "std_min": float(np.nanmin(std)), "std_p50": float(np.nanpercentile(std, 50)),
+        "std_p95": float(np.nanpercentile(std, 95)), "std_max": float(np.nanmax(std)),
+        "lower_finite_frac": float(np.isfinite(lower).mean()), "upper_finite_frac": float(np.isfinite(upper).mean()),
+    }
+    return LinearPreprocessBundle(str(config.get("schema", LINEAR_PREPROCESS_SCHEMA)), dict(config), D, int(keep.sum()), lower, upper, mean, std, keep.astype(bool), fit_summary)
+
+
+def _audit_stream_split(extractor: Any, bundle: LinearPreprocessBundle, source: Any, split_name: str, *, is_train: bool, audit_path: Optional[Path]) -> Dict[str, Any]:
+    stats = _empty_streaming_stats(); acc = new_preprocess_audit_accumulator(bundle.original_dim, bundle.kept_dim) if LINEAR_PREPROCESS_AUDIT else None
+    iterator = iter_extracted_batches_from_train(extractor=extractor, ds_train_list=source, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name=split_name) if is_train else iter_extracted_batches_from_dataset(extractor=extractor, ds=source, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name=split_name)
+    rows = chunks = 0
+    for Z, _y, _p in iterator:
+        if acc is not None:
+            update_preprocess_audit(acc, Z_raw=Z, bundle=bundle, max_sample_values=LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE)
+        Zp = bundle.transform(Z); _update_streaming_stats(stats, Zp); rows += Zp.shape[0]; chunks += 1
+    summary = _finalize_streaming_summary(stats, n_shards=chunks, chunk_rows=LINEAR_EXTRACT_BATCH_ROWS, positions_rows=rows)
+    audit = finalize_preprocess_audit(acc, bundle=bundle, split_name=split_name, top_k=LINEAR_PREPROCESS_AUDIT_TOP_K, max_sample_values=LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE) if acc is not None else None
+    if audit is not None and audit_path is not None:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_path.write_text(json.dumps({"stage": "stage3", "schema": "linear_preprocess_audit_v1", "split": split_name, "summary": jsonable_preprocess_audit_summary(audit, sample_values=LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES)}, allow_nan=True, indent=2), encoding="utf-8")
+    print(f"[linear-stream] stage=stage3 action=audit split={split_name} rows={rows}", flush=True)
+    return {"summary": summary, "audit_summary": compact_preprocess_audit_summary(audit), "_audit_full_summary": audit}
+
+
+def run_stage2_extraction(*, linear_out_dir: Path, ds_train_list: list[Any], ds_val: Any, ds_test: Optional[Any], has_cmssl_test: bool, meta: Dict[str, Any], protocol: str, train_week_keys: list[str], extractor_config: Dict[str, Any]) -> Dict[str, Any]:  # type: ignore[override]
+    del ds_val, ds_test, has_cmssl_test
+    name = str(extractor_config["extractor"]).strip().lower(); stage2_dir = Path(linear_out_dir) / "stage2_extractors" / name; stage2_dir.mkdir(parents=True, exist_ok=True)
+    _print_decision_row_policy("stage2")
+    extractor = build_linear_extractor_from_config(extractor_config)
+    X_fit, _y_fit = collect_fit_windows_from_train(ds_train_list, max_rows=LINEAR_EXTRACTOR_FIT_MAX_ROWS, batch_rows=LINEAR_EXTRACT_BATCH_ROWS)
+    t0 = time.time(); extractor.fit(X_fit); fit_seconds = time.time() - t0
+    print(f"[linear-stream] stage=stage2 action=fit_extractor rows={X_fit.shape[0]}", flush=True)
+    Zp = extractor.transform(X_fit[:min(128, len(X_fit))]).astype(np.float32, copy=False); D = int(Zp.shape[1])
+    pkl_path = stage2_dir / "extractor.pkl"
+    with pkl_path.open("wb") as f: pickle.dump(extractor, f)
+    payload = {"stage": "stage2", "status": "ok", "streaming_features": True, "persisted_feature_shards": False, **_decision_metadata(),
+        "linear_extractor_schema": LINEAR_EXTRACTOR_SCHEMA, "extractor_config": extractor_config, "extractor_summary": extractor.summary(),
+        "extractor_pickle": str(pkl_path), "extractor_output_dim": D, "fit_rows": int(X_fit.shape[0]), "fit_split": "train_fit_sample",
+        "fit_seconds": float(fit_seconds), "protocol": protocol, "train_week_keys": train_week_keys, "feature_dim_total": int(meta["feature_dim_total"]),
+        "lookback": LOOKBACK, "horizons_ms": [int(h) for h in HORIZONS_MS], "manifests": {}, "stage2_dir": str(stage2_dir)}
+    metrics_path = stage2_dir / "linear_stage2_extractor_metrics.json"; copy_path = Path(linear_out_dir) / "linear_stage2_extractor_metrics.json"
+    metrics_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8")
+    print(f"[linear-stage2] wrote {metrics_path} and {copy_path}", flush=True); return payload
+
+
+def run_stage3_preprocessing(*, linear_out_dir: Path, extractor_name: str, preprocess_name: str = "default") -> Dict[str, Any]:  # type: ignore[override]
+    splits = build_linear_cmssl_splits_from_out_root(out_root=Path(OUT_ROOT)); extractor, stage2_payload = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name)
+    stage3_dir = resolve_stage3_dir(linear_out_dir, extractor_name, preprocess_name); stage3_dir.mkdir(parents=True, exist_ok=True); audit_dir = resolve_stage3_audit_dir(stage3_dir) if LINEAR_PREPROCESS_AUDIT else None
+    cfg = {"schema": LINEAR_PREPROCESS_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "winsorize": LINEAR_PREPROCESS_WINSORIZE, "winsor_q_lo": LINEAR_PREPROCESS_WINSOR_Q_LO, "winsor_q_hi": LINEAR_PREPROCESS_WINSOR_Q_HI, "standardize": LINEAR_PREPROCESS_STANDARDIZE, "std_eps": LINEAR_PREPROCESS_STD_EPS, "variance_filter": LINEAR_PREPROCESS_VARIANCE_FILTER, "min_std": LINEAR_PREPROCESS_MIN_STD, "post_clip_abs": LINEAR_PREPROCESS_POST_CLIP_ABS, "nonfinite_policy": LINEAR_PREPROCESS_NONFINITE_POLICY, "fit_max_rows": LINEAR_PREPROCESS_FIT_MAX_ROWS, "fit_max_matrix_mb": LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB, **_decision_metadata()}
+    bundle = _fit_preprocess_from_stream(extractor, splits["ds_train_list"], cfg, splits["train_week_keys"]); bundle_path = stage3_dir / "linear_preprocess_bundle.npz"; save_linear_preprocess_bundle(bundle, bundle_path)
+    train_s = _audit_stream_split(extractor, bundle, splits["ds_train_list"], "train", is_train=True, audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_train.json")
+    val_s = _audit_stream_split(extractor, bundle, splits["ds_val"], "val", is_train=False, audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_val.json")
+    test_s = _audit_stream_split(extractor, bundle, splits["ds_test"], "test", is_train=False, audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_test.json") if splits["has_cmssl_test"] and splits["ds_test"] is not None and LINEAR_RUN_TEST else None
+    audits = {"train": train_s.pop("_audit_full_summary", None), "val": val_s.pop("_audit_full_summary", None), "test": None if test_s is None else test_s.pop("_audit_full_summary", None)}
+    combined = None; audit_summary_path = audit_csv_path = audit_top_path = None
+    if LINEAR_PREPROCESS_AUDIT and audit_dir is not None:
+        combined = {"stage": "stage3", "schema": "linear_preprocess_audit_v1", "extractor": extractor_name, "preprocess_name": preprocess_name, "bundle_path": str(bundle_path), "splits": {k: None if v is None else jsonable_preprocess_audit_summary(v, sample_values=LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES) for k, v in audits.items()}}
+        audit_summary_path = audit_dir / "preprocess_audit_summary.json"; audit_csv_path = audit_dir / "preprocess_audit_summary.csv"; audit_top_path = audit_dir / "preprocess_audit_top_features.csv"
+        audit_summary_path.write_text(json.dumps(combined, allow_nan=True, indent=2), encoding="utf-8"); write_preprocess_audit_csv(audit_csv_path, audits); write_preprocess_top_features_csv(audit_top_path, audits)
+    payload = {"stage": "stage3", "status": "ok", "schema": LINEAR_PREPROCESS_SCHEMA, "streaming_features": True, "persisted_preprocessed_shards": False, **_decision_metadata(), "extractor": extractor_name, "stage2_payload_path": stage2_payload.get("payload_path"), "stage3_dir": str(stage3_dir), "preprocess_config": cfg, "preprocess_bundle_path": str(bundle_path), "fit_summary": bundle.fit_summary, "original_dim": int(bundle.original_dim), "kept_dim": int(bundle.kept_dim), "train_summary": train_s["summary"], "val_summary": val_s["summary"], "test_summary": None if test_s is None else test_s["summary"], "audit_enabled": bool(LINEAR_PREPROCESS_AUDIT), "audit_dir": None if audit_dir is None else str(audit_dir), "audit_summary_path": None if audit_summary_path is None else str(audit_summary_path), "audit_csv_path": None if audit_csv_path is None else str(audit_csv_path), "audit_top_features_csv_path": None if audit_top_path is None else str(audit_top_path), "audit_summary": combined, "manifests": {}}
+    path = stage3_dir / "linear_stage3_preprocess_metrics.json"; copy = Path(linear_out_dir) / "linear_stage3_preprocess_metrics.json"; path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
+
+
+class StreamingPreprocessedBatchSource:
+    def __init__(self, *, extractor: Any, bundle: LinearPreprocessBundle, ds: Any, device: torch.device, batch_rows: int, max_rows: int, split_name: str):
+        self.extractor = extractor; self.bundle = bundle; self.ds = ds; self.target_device = device; self.device = torch.device("cpu"); self.batch_size = int(batch_rows); self.positions = _dataset_positions(len(ds), int(max_rows)); self.n_rows = int(self.positions.shape[0]); self.effective_rows_nominal = self.n_rows; self.num_horizons = len(HORIZONS_MS); self.feature_shape = (self.n_rows, int(bundle.kept_dim)); self.is_shared_feature_view = False; self.pin_memory = bool(device.type == "cuda"); self.split_name = split_name
+    def __len__(self): return (self.n_rows + self.batch_size - 1) // self.batch_size
+    def iter_epoch(self, epoch: int):
+        del epoch
+        for start in range(0, self.n_rows, self.batch_size):
+            pos = self.positions[start:start + self.batch_size]
+            X, y = collect_windows_for_positions(self.ds, pos, batch_rows=self.batch_size, split_name=self.split_name)
+            Z = self.bundle.transform(self.extractor.transform(X).astype(np.float32, copy=False))
+            yield torch.as_tensor(Z, dtype=torch.float32, device=self.target_device), torch.as_tensor(y, dtype=torch.float32, device=self.target_device)
+
+
+def initialize_stage4_candidate_bundle(*, alpha: float, config: Dict[str, Any]) -> LinearSklearnTakerBundle:
+    n_h = len(HORIZONS_MS)
+    return LinearSklearnTakerBundle(str(config["schema"]), dict(config, alpha=float(alpha)), [int(x) for x in HORIZONS_MS], [make_direction_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], float(config["mag_floor"]), {})
+
+
+def compute_global_direction_weights_from_train_labels_streaming(ds_train_list: list[Any], stats: Dict[str, np.ndarray], mode: str, batch_rows: int) -> list[tuple[float, float]]:
+    mode = str(mode).lower()
+    if mode == "none": return [(1.0, 1.0) for _ in HORIZONS_MS]
+    pos = np.zeros(len(HORIZONS_MS)); neg = np.zeros(len(HORIZONS_MS))
+    for ds in ds_train_list:
+        positions = _dataset_positions(len(ds), 0)
+        for start in range(0, len(positions), int(batch_rows)):
+            y = np.asarray(ds.y[positions[start:start + int(batch_rows)]], dtype=np.float32)
+            _kp, _kn, keep = build_signed_side_trim_masks_from_stats_np(y, stats)
+            for h in range(len(HORIZONS_MS)):
+                vals = y[keep[:, h], h] > 0.0; pos[h] += vals.sum(); neg[h] += (~vals).sum()
+    out = []
+    for p, n in zip(pos, neg):
+        total = p + n
+        if total <= 0 or p <= 0 or n <= 0: out.append((1.0, 1.0)); continue
+        pf = p / total; nf = n / total
+        out.append((0.5 / nf, 0.5 / pf) if mode == "balanced" else (math.sqrt(0.5 / nf), math.sqrt(0.5 / pf)))
+    return out
+
+
+def train_stage4_candidates_streaming(*, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds_train_list: list[Any], stats: Dict[str, np.ndarray], alpha_values: list[float], config: Dict[str, Any]) -> list[LinearSklearnTakerBundle]:
+    bundles = [initialize_stage4_candidate_bundle(alpha=float(a), config=config) for a in alpha_values]; n_h = len(HORIZONS_MS)
+    states = [{"df": [False]*n_h, "uf": [False]*n_h, "nf": [False]*n_h, "dc": np.zeros(n_h, dtype=np.int64), "uc": np.zeros(n_h, dtype=np.int64), "nc": np.zeros(n_h, dtype=np.int64)} for _ in bundles]
+    weights = compute_global_direction_weights_from_train_labels_streaming(ds_train_list, stats, str(config["direction_weighting"]), int(config["batch_rows"]))
+    train_rows = sum(int(_decision_positions(len(ds)).shape[0]) for ds in ds_train_list)
+    print(f"[linear-stream] stage=stage4 action=train_full rows={train_rows} alpha_count={len(bundles)}", flush=True)
+    for epoch in range(int(config["epochs"])):
+        rng = np.random.default_rng(int(config["random_state"]) + epoch)
+        for Z, y, _p in iter_preprocessed_batches_from_train(extractor=extractor, bundle=preprocess_bundle, ds_train_list=ds_train_list, batch_rows=int(config["batch_rows"]), max_rows=0, split_name="train_full", shuffle_within_batch=True, rng=rng):
+            keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_from_stats_np(y, stats)
+            for b, st in zip(bundles, states):
+                for h in range(n_h):
+                    rows = keep_signed[:, h]
+                    if rows.any():
+                        yd = (y[rows, h] > 0.0).astype(np.int64); neg_w, pos_w = weights[h]; sw = None if str(config["direction_weighting"]) == "none" else np.where(yd == 1, pos_w, neg_w).astype(np.float32)
+                        if not st["df"][h]: b.direction_models[h].partial_fit(Z[rows], yd, classes=np.array([0, 1], dtype=np.int64), sample_weight=sw); st["df"][h] = True
+                        else: b.direction_models[h].partial_fit(Z[rows], yd, sample_weight=sw)
+                        st["dc"][h] += yd.shape[0]
+                    rows = keep_pos[:, h]
+                    if rows.any():
+                        yu = np.sqrt(np.maximum(y[rows, h], 0.0)).astype(np.float32)
+                        (b.mag_up_models[h].partial_fit(Z[rows], yu)); st["uf"][h] = True; st["uc"][h] += yu.shape[0]
+                    rows = keep_neg[:, h]
+                    if rows.any():
+                        yn = np.sqrt(np.maximum(-y[rows, h], 0.0)).astype(np.float32)
+                        (b.mag_down_models[h].partial_fit(Z[rows], yn)); st["nf"][h] = True; st["nc"][h] += yn.shape[0]
+    for b, st in zip(bundles, states):
+        if not all(st["df"]) or not all(st["uf"]) or not all(st["nf"]): raise ValueError("Insufficient train rows for one or more target/horizon models")
+        b.fit_summary = {"alpha": float(b.config.get("alpha")), "train_rows": int(train_rows), "dir_rows_per_horizon": st["dc"].tolist(), "up_rows_per_horizon": st["uc"].tolist(), "down_rows_per_horizon": st["nc"].tolist(), "direction_weights_neg_pos": [(float(a), float(b)) for a, b in weights]}
+    return bundles
+
+
+def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, stats: Dict[str, np.ndarray], device: torch.device, split_name: str, max_rows: int = 0, batch_rows: Optional[int] = None) -> Dict[str, Any]:
+    source = StreamingPreprocessedBatchSource(extractor=extractor, bundle=preprocess_bundle, ds=ds, device=device, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), max_rows=max_rows, split_name=split_name)
+    print(f"[linear-stream] stage=stage4 action=eval split={split_name} rows={source.n_rows}", flush=True)
+    metrics = summarize_metrics(LinearSklearnTorchWrapper(bundle).to(device), source, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name=split_name)
+    pv, pl = compute_primary_metric(metrics); metrics["primary_metric_value"] = float(pv); metrics["primary_metric_label"] = str(pl); return metrics
+
+
+def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess_name: str, device: torch.device) -> Dict[str, Any]:  # type: ignore[override]
+    if LINEAR_STAGE4_TRAIN_SPLIT != "train_full": raise ValueError("Stage 4 now supports only train_full streaming")
+    splits = build_linear_cmssl_splits_from_out_root(out_root=Path(OUT_ROOT)); extractor, st2 = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name); st3 = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"]))); stats = load_linear_trim_stats(linear_out_dir)
+    cfg = {"schema": LINEAR_STAGE4_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "predictor": LINEAR_STAGE4_PREDICTOR, "penalty": LINEAR_STAGE4_PENALTY, "l1_ratio": LINEAR_STAGE4_L1_RATIO, "epochs": LINEAR_STAGE4_EPOCHS, "batch_rows": LINEAR_STAGE4_BATCH_ROWS, "random_state": LINEAR_STAGE4_RANDOM_SEED, "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING, "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING, "mag_floor": LINEAR_STAGE4_MAG_FLOOR, **_decision_metadata()}
+    cands = train_stage4_candidates_streaming(extractor=extractor, preprocess_bundle=pb, ds_train_list=splits["ds_train_list"], stats=stats, alpha_values=[float(a) for a in LINEAR_STAGE4_ALPHA_VALUES], config=cfg)
+    summaries=[]; best=None; best_metrics=None; best_score=float("-inf"); best_alpha=None
+    for b in cands:
+        vm = evaluate_stage4_bundle_streaming(bundle=b, extractor=extractor, preprocess_bundle=pb, ds=splits["ds_val"], stats=stats, device=device, split_name="val", max_rows=LINEAR_STAGE4_MAX_VAL_ROWS); pv, pl = compute_primary_metric(vm); score = float(pv) if bool(vm.get("primary_metric_guard_passed", True)) and math.isfinite(float(pv)) else float("-inf")
+        summaries.append({"alpha": float(b.config.get("alpha")), "primary_metric_label": str(pl), "primary_metric_value": float(pv), "guard_passed": score > float("-inf"), "val_metrics": _jsonable_metrics(vm), "fit_summary": b.fit_summary})
+        if best is None or is_metric_improved(score, best_score, "max"): best=b; best_metrics=vm; best_score=score; best_alpha=float(b.config.get("alpha"))
+    stage4_dir = Path(linear_out_dir) / "stage4_models" / extractor_name / preprocess_name / LINEAR_STAGE4_PREDICTOR; stage4_dir.mkdir(parents=True, exist_ok=True); model_path = stage4_dir / "linear_stage4_best_model.pkl"; save_linear_sklearn_bundle(best, model_path)
+    test_metrics = evaluate_stage4_bundle_streaming(bundle=best, extractor=extractor, preprocess_bundle=pb, ds=splits["ds_test"], stats=stats, device=device, split_name="test", max_rows=LINEAR_STAGE4_MAX_TEST_ROWS) if LINEAR_STAGE4_RUN_TEST and splits["has_cmssl_test"] and splits["ds_test"] is not None else None
+    train_rows = sum(int(_decision_positions(len(ds)).shape[0]) for ds in splits["ds_train_list"])
+    payload = {"stage": "stage4", "status": "ok", "schema": LINEAR_STAGE4_SCHEMA, "streaming_features": True, **_decision_metadata(), "stage4_config": cfg, "extractor": extractor_name, "preprocess_name": preprocess_name, "stage2_payload_path": st2.get("payload_path"), "stage3_payload_path": st3.get("payload_path"), "preprocess_bundle_path": str(st3["preprocess_bundle_path"]), "train_split": "train_full", "train_rows": int(train_rows), "val_rows": int(_dataset_positions(len(splits["ds_val"]), LINEAR_STAGE4_MAX_VAL_ROWS).shape[0]), "test_rows": None if splits["ds_test"] is None else int(_dataset_positions(len(splits["ds_test"]), LINEAR_STAGE4_MAX_TEST_ROWS).shape[0]), "original_dim": int(pb.original_dim), "kept_dim": int(pb.kept_dim), "best_alpha": float(best_alpha), "best_model_path": str(model_path), "best_primary_metric": {"label": str(best_metrics.get("primary_metric_label", PRIMARY_METRIC)), "value": float(best_metrics.get("primary_metric_value", best_score)), "guard_passed": bool(best_metrics.get("primary_metric_guard_passed", True))}, "candidate_summaries": summaries, "val_metrics": _jsonable_metrics(best_metrics), "test_metrics": _jsonable_metrics(test_metrics)}
+    path = stage4_dir / "linear_stage4_metrics.json"; copy = Path(linear_out_dir) / "linear_stage4_metrics.json"; path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
+
+
+def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, max_rows: int, batch_rows: int, split_name: str) -> Dict[str, np.ndarray]:
+    parts = {k: [] for k in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_bps", "mag_down_bps", "edge_bps", "y", "positions"]}
+    for Z, y, pos in iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name):
+        pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); up = np.asarray(pred["mag_up_sqrt"], dtype=np.float32); dn = np.asarray(pred["mag_down_sqrt"], dtype=np.float32); p = _sigmoid_np(dl); ub = up * up; db = dn * dn; edge = p * ub - (1.0 - p) * db
+        for k, v in [("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_bps", ub), ("mag_down_bps", db), ("edge_bps", edge), ("y", y), ("positions", pos)]: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
+    if not parts["y"]: raise ValueError(f"Streaming split contains no rows: {split_name}")
+    print(f"[linear-stream] stage=stage5 action=diagnostics split={split_name} rows={sum(x.shape[0] for x in parts['y'])}", flush=True)
+    return {k: np.concatenate(v, axis=0) for k, v in parts.items()}
+
+
+def run_stage5_comparison(*, linear_out_dir: Path, extractor_names: list[str], preprocess_name: str, predictor: str, device: torch.device) -> Dict[str, Any]:  # type: ignore[override]
+    stage5_dir = Path(linear_out_dir) / "stage5_comparison" / preprocess_name / predictor; diag_dir = stage5_dir / "stage5_diagnostics"; stage5_dir.mkdir(parents=True, exist_ok=True)
+    rows=[]; diagnostics={}; stats = load_linear_trim_stats(linear_out_dir); splits = build_linear_cmssl_splits_from_out_root(out_root=Path(OUT_ROOT)); _print_decision_row_policy("stage5")
+    for extractor_name in extractor_names:
+        st4 = load_stage4_artifacts_if_available(linear_out_dir, extractor_name, preprocess_name, predictor, strict=LINEAR_STAGE5_STRICT)
+        if st4 is None: continue
+        try:
+            _validate_manifest_decision_policy(st4, context=f"stage5 stage4 {extractor_name}"); extractor, _st2 = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name); st3 = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name); _validate_manifest_decision_policy(st3, context=f"stage5 stage3 {extractor_name}")
+        except (ValueError, FileNotFoundError) as exc:
+            if LINEAR_STAGE5_STRICT: raise
+            print(f"[linear-stage5-warn] {exc}; skipping extractor={extractor_name}", flush=True); continue
+        model_bundle = load_linear_sklearn_bundle(Path(str(st4["best_model_path"]))); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"])))
+        val_metrics = evaluate_stage4_bundle_streaming(bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=splits["ds_val"], stats=stats, device=device, split_name=f"stage5_val_{extractor_name}", max_rows=LINEAR_STAGE5_MAX_VAL_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS) if LINEAR_STAGE5_REEVALUATE else (st4.get("val_metrics", {}) or {})
+        test_metrics = None
+        if LINEAR_STAGE5_RUN_TEST and splits["has_cmssl_test"] and splits["ds_test"] is not None:
+            test_metrics = evaluate_stage4_bundle_streaming(bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=splits["ds_test"], stats=stats, device=device, split_name=f"stage5_test_{extractor_name}", max_rows=LINEAR_STAGE5_MAX_TEST_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS) if LINEAR_STAGE5_REEVALUATE else st4.get("test_metrics")
+        pred_val = collect_predictions_and_labels_streaming(model_bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=splits["ds_val"], max_rows=LINEAR_STAGE5_MAX_VAL_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS, split_name=f"val_{extractor_name}")
+        pred_val_summary = summarize_prediction_arrays(pred_val); shift = run_label_shift_sanity_checks(pred_payload=pred_val, stats=stats, shifts=LINEAR_STAGE5_LABEL_SHIFT_VALUES, split_name=f"val_{extractor_name}") if LINEAR_STAGE5_LABEL_SHIFT_VALUES else {}; perm = run_label_permutation_sanity_check(pred_payload=pred_val, stats=stats, seed=LINEAR_STAGE5_PERMUTATION_SEED, split_name=f"val_{extractor_name}") if LINEAR_STAGE5_LABEL_PERMUTATION else None
+        pred_test_summary=None; shift_t={}; perm_t=None
+        if LINEAR_STAGE5_RUN_TEST and splits["has_cmssl_test"] and splits["ds_test"] is not None:
+            pred_test = collect_predictions_and_labels_streaming(model_bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=splits["ds_test"], max_rows=LINEAR_STAGE5_MAX_TEST_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS, split_name=f"test_{extractor_name}"); pred_test_summary = summarize_prediction_arrays(pred_test); shift_t = run_label_shift_sanity_checks(pred_payload=pred_test, stats=stats, shifts=LINEAR_STAGE5_LABEL_SHIFT_VALUES, split_name=f"test_{extractor_name}") if LINEAR_STAGE5_LABEL_SHIFT_VALUES else {}; perm_t = run_label_permutation_sanity_check(pred_payload=pred_test, stats=stats, seed=LINEAR_STAGE5_PERMUTATION_SEED, split_name=f"test_{extractor_name}") if LINEAR_STAGE5_LABEL_PERMUTATION else None
+            if LINEAR_STAGE5_SAVE_PREDICTIONS: save_stage5_prediction_dump(diag_dir / extractor_name / "test_predictions.npz", pred_test, LINEAR_STAGE5_PREDICTION_MAX_ROWS)
+        if LINEAR_STAGE5_SAVE_PREDICTIONS: save_stage5_prediction_dump(diag_dir / extractor_name / "val_predictions.npz", pred_val, LINEAR_STAGE5_PREDICTION_MAX_ROWS)
+        audit = load_stage3_audit_summary_for_stage5(st3); diag = {"stage4_payload_path": st4.get("payload_path"), "stage3_audit_summary": audit, "best_model_path": str(st4["best_model_path"]), "coefficient_diagnostics": summarize_linear_model_coefficients(model_bundle, top_k=LINEAR_STAGE5_TOP_COEFS), "prediction_summary_val": pred_val_summary, "prediction_summary_test": pred_test_summary, "label_shift_sanity_val": shift, "label_permutation_sanity_val": perm, "label_shift_sanity_test": shift_t, "label_permutation_sanity_test": perm_t, "val_metrics": _jsonable_metrics(val_metrics), "test_metrics": _jsonable_metrics(test_metrics)}
+        diagnostics[extractor_name]=diag; row = build_stage5_comparison_row(extractor_name=extractor_name, preprocess_name=preprocess_name, predictor=predictor, stage4_payload=st4, val_metrics=val_metrics, test_metrics=test_metrics, diagnostics=diag); add_stage3_audit_fields_to_comparison_row(row, audit); row["decision_stride_rows"] = int(LINEAR_DECISION_STRIDE_ROWS); row["decision_offset_rows"] = int(LINEAR_DECISION_OFFSET_ROWS); rows.append(row)
+        ddir = diag_dir / extractor_name; ddir.mkdir(parents=True, exist_ok=True); (ddir / f"diagnostics_{extractor_name}.json").write_text(json.dumps(diag, allow_nan=True, indent=2), encoding="utf-8")
+    _maybe_add_baseline_row(rows, strict=LINEAR_STAGE5_STRICT)
+    csv_path = stage5_dir / "linear_stage5_comparison.csv"; json_path = stage5_dir / "linear_stage5_comparison.json"; copy_csv = Path(linear_out_dir) / "linear_stage5_comparison.csv"; copy_json = Path(linear_out_dir) / "linear_stage5_comparison.json"; write_rows_csv(csv_path, rows); write_rows_csv(copy_csv, rows)
+    payload = {"stage": "stage5", "status": "ok", "schema": LINEAR_STAGE5_SCHEMA, **_decision_metadata(), "linear_out_dir": str(linear_out_dir), "preprocess_name": preprocess_name, "predictor": predictor, "extractors_requested": extractor_names, "extractors_completed": [r["extractor"] for r in rows if r.get("extractor") != "CMSSL_neural_baseline"], "strict": bool(LINEAR_STAGE5_STRICT), "reevaluate": bool(LINEAR_STAGE5_REEVALUATE), "run_test": bool(LINEAR_STAGE5_RUN_TEST), "label_shifts": LINEAR_STAGE5_LABEL_SHIFT_VALUES, "label_permutation": bool(LINEAR_STAGE5_LABEL_PERMUTATION), "comparison_rows": rows, "diagnostics": diagnostics}
+    json_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy_json.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
 
 if __name__ == "__main__":
     if LINEAR_STAGE in {"stage3", "stage4", "stage5"}:
