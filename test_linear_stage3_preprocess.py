@@ -133,3 +133,23 @@ def test_stage3_rejects_non_train_full_fit_split(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="train_full"):
         linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+
+
+def test_streaming_stats_abs_sample_max_defined():
+    import numpy as np
+    import linear_offline
+
+    stats = linear_offline._empty_streaming_stats()
+    Z = np.asarray([[1.0, -2.0], [3.0, 0.0]], dtype=np.float32)
+
+    linear_offline._update_streaming_stats(stats, Z)
+    summary = linear_offline._finalize_streaming_summary(
+        stats,
+        n_shards=1,
+        chunk_rows=2,
+        positions_rows=2,
+    )
+
+    assert summary["shape"] == [2, 2]
+    assert summary["finite_frac"] == 1.0
+    assert "abs_p95" in summary
