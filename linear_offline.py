@@ -54,6 +54,8 @@ from CMSSL17_linear import (  # type: ignore
     build_constant_priors_from_train_labels,
     linear_model_summary,
     build_linear_extractor_from_config,
+    LinearPreprocessBundle,
+    save_linear_preprocess_bundle,
 )
 
 
@@ -79,6 +81,26 @@ LINEAR_DEVICE = os.environ.get("BYBIT_LINEAR_DEVICE", "cpu").strip().lower()
 LINEAR_EVAL_BATCH_SIZE = _env_int("BYBIT_LINEAR_BATCH_SIZE", BATCH_SIZE)
 LINEAR_RUN_TEST = _env_bool("BYBIT_LINEAR_RUN_TEST", 1)
 LINEAR_STAGE2_RUN_PRIOR_EVAL = _env_bool("BYBIT_LINEAR_STAGE2_RUN_PRIOR_EVAL", 1)
+
+LINEAR_PREPROCESS_SCHEMA = "linear_preprocess_stage3_v1"
+LINEAR_PREPROCESS_FIT_SPLIT = os.environ.get(
+    "BYBIT_LINEAR_PREPROCESS_FIT_SPLIT", "train_sample"
+).strip().lower()
+LINEAR_PREPROCESS_WINSORIZE = _env_bool("BYBIT_LINEAR_PREPROCESS_WINSORIZE", 1)
+LINEAR_PREPROCESS_WINSOR_Q_LO = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_WINSOR_Q_LO", "0.001"))
+LINEAR_PREPROCESS_WINSOR_Q_HI = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_WINSOR_Q_HI", "0.999"))
+LINEAR_PREPROCESS_STANDARDIZE = _env_bool("BYBIT_LINEAR_PREPROCESS_STANDARDIZE", 1)
+LINEAR_PREPROCESS_STD_EPS = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_STD_EPS", "1e-6"))
+LINEAR_PREPROCESS_VARIANCE_FILTER = _env_bool("BYBIT_LINEAR_PREPROCESS_VARIANCE_FILTER", 1)
+LINEAR_PREPROCESS_MIN_STD = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_MIN_STD", "1e-6"))
+LINEAR_PREPROCESS_POST_CLIP_ABS = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_POST_CLIP_ABS", "0.0"))
+LINEAR_PREPROCESS_NONFINITE_POLICY = os.environ.get(
+    "BYBIT_LINEAR_PREPROCESS_NONFINITE_POLICY", "raise"
+).strip().lower()
+LINEAR_PREPROCESS_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_PREPROCESS_FIT_MAX_ROWS", 50000)
+LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB = _env_int("BYBIT_LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB", 2048)
+LINEAR_PREPROCESS_SHARD_ROWS = _env_int("BYBIT_LINEAR_PREPROCESS_SHARD_ROWS", 50000)
+LINEAR_PREPROCESS_MAX_Z_CHUNK_MB = _env_int("BYBIT_LINEAR_PREPROCESS_MAX_Z_CHUNK_MB", 2048)
 
 LINEAR_EXTRACTOR = os.environ.get("BYBIT_LINEAR_EXTRACTOR", "raw_linear").strip().lower()
 LINEAR_EXTRACTOR_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_EXTRACTOR_FIT_MAX_ROWS", 50000)
@@ -116,10 +138,35 @@ if LINEAR_STAGE == "stage2":
         )
 
 
+if LINEAR_STAGE == "stage3":
+    if LINEAR_PREPROCESS_FIT_SPLIT not in {"train_sample"}:
+        raise ValueError("Stage 3 currently supports BYBIT_LINEAR_PREPROCESS_FIT_SPLIT=train_sample")
+    if not (0.0 <= LINEAR_PREPROCESS_WINSOR_Q_LO < LINEAR_PREPROCESS_WINSOR_Q_HI <= 1.0):
+        raise ValueError(
+            "BYBIT_LINEAR_PREPROCESS_WINSOR_Q_LO/HI must satisfy "
+            f"0 <= lo < hi <= 1, got {LINEAR_PREPROCESS_WINSOR_Q_LO}, {LINEAR_PREPROCESS_WINSOR_Q_HI}"
+        )
+    if LINEAR_PREPROCESS_STD_EPS <= 0.0:
+        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_STD_EPS must be > 0, got {LINEAR_PREPROCESS_STD_EPS}")
+    if LINEAR_PREPROCESS_MIN_STD < 0.0:
+        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_MIN_STD must be >= 0, got {LINEAR_PREPROCESS_MIN_STD}")
+    if LINEAR_PREPROCESS_NONFINITE_POLICY not in {"raise", "warn_zero"}:
+        raise ValueError("BYBIT_LINEAR_PREPROCESS_NONFINITE_POLICY must be one of: raise, warn_zero")
+    if LINEAR_PREPROCESS_FIT_MAX_ROWS <= 0:
+        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_FIT_MAX_ROWS must be > 0, got {LINEAR_PREPROCESS_FIT_MAX_ROWS}")
+    if LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB <= 0:
+        raise ValueError(
+            f"BYBIT_LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB must be > 0, got {LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB}"
+        )
+    if LINEAR_PREPROCESS_SHARD_ROWS <= 0:
+        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_SHARD_ROWS must be > 0, got {LINEAR_PREPROCESS_SHARD_ROWS}")
+    if LINEAR_PREPROCESS_MAX_Z_CHUNK_MB <= 0:
+        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_MAX_Z_CHUNK_MB must be > 0, got {LINEAR_PREPROCESS_MAX_Z_CHUNK_MB}")
+
 
 def _resolve_device() -> torch.device:
-    if LINEAR_STAGE not in {"stage1", "stage2"}:
-        raise ValueError(f"BYBIT_LINEAR_STAGE must be 'stage1' or 'stage2', got {LINEAR_STAGE!r}")
+    if LINEAR_STAGE not in {"stage1", "stage2", "stage3"}:
+        raise ValueError(f"BYBIT_LINEAR_STAGE must be 'stage1', 'stage2', or 'stage3', got {LINEAR_STAGE!r}")
     if LINEAR_DEVICE not in {"cpu", "cuda", "auto"}:
         raise ValueError("BYBIT_LINEAR_DEVICE must be one of: cpu, cuda, auto")
     if LINEAR_EVAL_BATCH_SIZE <= 0:
@@ -646,6 +693,393 @@ def transform_array_to_npz_shards(
     return manifest
 
 
+def load_json(path: Path) -> Dict[str, Any]:
+    return json.loads(Path(path).read_text())
+
+
+def resolve_stage2_dir(linear_out_dir: Path, extractor_name: str) -> Path:
+    return Path(linear_out_dir) / "stage2_extractors" / str(extractor_name)
+
+
+def load_stage2_payload(linear_out_dir: Path, extractor_name: str) -> Dict[str, Any]:
+    stage2_dir = resolve_stage2_dir(linear_out_dir, extractor_name)
+    path = stage2_dir / "linear_stage2_extractor_metrics.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Stage 2 payload not found for extractor={extractor_name!r}: {path}")
+    payload = load_json(path)
+    if payload.get("stage") != "stage2":
+        raise ValueError(f"Expected stage2 payload at {path}, got stage={payload.get('stage')!r}")
+    if "extractor_output_dim" not in payload:
+        raise ValueError(f"Stage 2 payload missing extractor_output_dim: {path}")
+    print(f"[linear-stage3] loaded stage2 payload {path}", flush=True)
+    return payload
+
+
+def load_manifest_from_payload(payload: Dict[str, Any], split: str) -> Optional[Dict[str, Any]]:
+    manifests = payload.get("manifests", {})
+    manifest = manifests.get(split)
+    if manifest is None:
+        return None
+    path = Path(str(manifest.get("manifest_path", ""))) if isinstance(manifest, dict) else Path("")
+    if path.exists():
+        loaded = load_json(path)
+        if "manifest_path" not in loaded:
+            loaded["manifest_path"] = str(path)
+        return loaded
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Invalid manifest payload for split={split}: {manifest!r}")
+    return manifest
+
+
+def _apply_preprocess_nonfinite_policy(Z: np.ndarray, *, policy: str, context: str) -> np.ndarray:
+    Z = np.asarray(Z, dtype=np.float32)
+    if np.isfinite(Z).all():
+        return Z
+    if policy == "raise":
+        raise ValueError(f"{context} contains non-finite values")
+    if policy == "warn_zero":
+        print(f"[linear-preprocess-warn] {context} contains non-finite values; replacing with zero", flush=True)
+        return np.where(np.isfinite(Z), Z, 0.0).astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported nonfinite_policy {policy!r}")
+
+
+def _manifest_dim(manifest: Dict[str, Any]) -> int:
+    summary = manifest.get("summary", {})
+    if "shape" in summary and len(summary["shape"]) >= 2:
+        return int(summary["shape"][1])
+    if "extractor_output_dim" in manifest:
+        return int(manifest["extractor_output_dim"])
+    raise ValueError("Manifest missing summary.shape[1] / extractor_output_dim")
+
+
+def load_sample_rows_from_manifest(
+    manifest: Dict[str, Any],
+    *,
+    max_rows: int,
+    max_matrix_mb: int,
+    split_name: str,
+) -> np.ndarray:
+    D = _manifest_dim(manifest)
+    n_rows = int(manifest.get("n_rows", 0))
+    if n_rows <= 0:
+        raise ValueError(f"Cannot sample empty manifest split={split_name}")
+    row_cap_by_mem = max(1, int((int(max_matrix_mb) * 1024 * 1024) // max(1, D * 4)))
+    n_sample = min(n_rows, int(max_rows), row_cap_by_mem)
+    sample_global = np.linspace(0, n_rows - 1, n_sample, dtype=np.int64)
+    parts: list[np.ndarray] = []
+    cursor = 0
+    for shard in manifest.get("shards", []):
+        rows = int(shard.get("rows", 0))
+        if rows <= 0:
+            continue
+        shard_start = cursor
+        shard_end = cursor + rows
+        mask = (sample_global >= shard_start) & (sample_global < shard_end)
+        if mask.any():
+            local = sample_global[mask] - shard_start
+            with np.load(shard["path"]) as arr:
+                Z = np.asarray(arr["Z"], dtype=np.float32)
+                if Z.ndim != 2 or Z.shape[1] != D:
+                    raise ValueError(f"Shard {shard['path']} has invalid Z shape {Z.shape}; expected width {D}")
+                parts.append(Z[local])
+        cursor = shard_end
+    if cursor != n_rows:
+        raise ValueError(f"Manifest split={split_name} shard rows {cursor} != n_rows {n_rows}")
+    Z_sample = np.concatenate(parts, axis=0) if parts else np.zeros((0, D), dtype=np.float32)
+    if Z_sample.shape != (n_sample, D):
+        raise ValueError(f"Sample shape mismatch for {split_name}: got {Z_sample.shape}, expected {(n_sample, D)}")
+    print(
+        f"[linear-preprocess-fit-sample] split={split_name} rows={n_sample} dim={D} "
+        f"matrix_mb={estimate_matrix_mb(n_sample, D):.1f}",
+        flush=True,
+    )
+    return Z_sample.astype(np.float32, copy=False)
+
+
+def fit_linear_preprocessor_from_manifest(
+    train_manifest: Dict[str, Any],
+    *,
+    config: Dict[str, Any],
+) -> LinearPreprocessBundle:
+    D = _manifest_dim(train_manifest)
+    policy = str(config.get("nonfinite_policy", "raise"))
+    Z_sample = load_sample_rows_from_manifest(
+        train_manifest,
+        max_rows=int(config["fit_max_rows"]),
+        max_matrix_mb=int(config["fit_max_matrix_mb"]),
+        split_name="train_sample",
+    )
+    Z_sample = _apply_preprocess_nonfinite_policy(Z_sample, policy=policy, context="train_sample quantile sample")
+    winsorize = bool(config.get("winsorize", True))
+    if winsorize:
+        lower = np.quantile(Z_sample, float(config["winsor_q_lo"]), axis=0).astype(np.float32)
+        upper = np.quantile(Z_sample, float(config["winsor_q_hi"]), axis=0).astype(np.float32)
+    else:
+        lower = np.full(D, -np.inf, dtype=np.float32)
+        upper = np.full(D, np.inf, dtype=np.float32)
+    if winsorize:
+        bad = ~np.isfinite(lower) | ~np.isfinite(upper) | (lower > upper)
+    else:
+        bad = lower > upper
+    if bad.any():
+        raise ValueError(f"Invalid winsor caps for {int(bad.sum())} features")
+
+    count = 0
+    sum_ = np.zeros(D, dtype=np.float64)
+    sumsq = np.zeros(D, dtype=np.float64)
+    for shard in train_manifest.get("shards", []):
+        with np.load(shard["path"]) as arr:
+            Z = _apply_preprocess_nonfinite_policy(arr["Z"], policy=policy, context=f"train shard {shard['path']}")
+        if Z.ndim != 2 or Z.shape[1] != D:
+            raise ValueError(f"Train shard {shard['path']} has invalid Z shape {Z.shape}; expected width {D}")
+        Zc = np.clip(Z, lower, upper)
+        sum_ += Zc.sum(axis=0, dtype=np.float64)
+        sumsq += np.square(Zc, dtype=np.float64).sum(axis=0)
+        count += int(Zc.shape[0])
+    if count <= 0:
+        raise ValueError("Cannot fit preprocessor on empty train_sample manifest")
+    mean64 = sum_ / count
+    var64 = np.maximum(0.0, sumsq / count - mean64 * mean64)
+    std64 = np.sqrt(var64)
+    if bool(config.get("standardize", True)):
+        mean = mean64.astype(np.float32)
+        std = std64.astype(np.float32)
+    else:
+        mean = np.zeros(D, dtype=np.float32)
+        std = np.ones(D, dtype=np.float32)
+    if bool(config.get("variance_filter", True)):
+        keep_mask = np.isfinite(std) & (std >= float(config.get("min_std", 0.0)))
+    else:
+        keep_mask = np.ones(D, dtype=bool)
+    if not keep_mask.any():
+        raise ValueError("Preprocessor variance filter removed all features")
+    kept_dim = int(keep_mask.sum())
+    fit_summary = {
+        "fit_split": "train_sample",
+        "original_dim": int(D),
+        "kept_dim": kept_dim,
+        "removed_dim": int(D - kept_dim),
+        "fit_rows_for_quantiles": int(Z_sample.shape[0]),
+        "fit_rows_for_mean_std": int(count),
+        "winsorize": winsorize,
+        "winsor_q_lo": float(config.get("winsor_q_lo", 0.0)),
+        "winsor_q_hi": float(config.get("winsor_q_hi", 1.0)),
+        "standardize": bool(config.get("standardize", True)),
+        "variance_filter": bool(config.get("variance_filter", True)),
+        "min_std": float(config.get("min_std", 0.0)),
+        "std_eps": float(config.get("std_eps", 1e-6)),
+        "std_min": float(np.nanmin(std)),
+        "std_p50": float(np.nanpercentile(std, 50)),
+        "std_p95": float(np.nanpercentile(std, 95)),
+        "std_max": float(np.nanmax(std)),
+        "lower_finite_frac": float(np.isfinite(lower).mean()),
+        "upper_finite_frac": float(np.isfinite(upper).mean()),
+    }
+    print(
+        f"[linear-preprocess-fit] original_dim={D} kept_dim={kept_dim} removed_dim={D - kept_dim}",
+        flush=True,
+    )
+    return LinearPreprocessBundle(
+        schema=str(config.get("schema", LINEAR_PREPROCESS_SCHEMA)),
+        config=dict(config),
+        original_dim=int(D),
+        kept_dim=kept_dim,
+        lower=lower.astype(np.float32),
+        upper=upper.astype(np.float32),
+        mean=mean.astype(np.float32),
+        std=std.astype(np.float32),
+        keep_mask=keep_mask.astype(bool),
+        fit_summary=fit_summary,
+    )
+
+
+def preprocess_manifest_to_npz_shards(
+    *,
+    bundle: LinearPreprocessBundle,
+    source_manifest: Dict[str, Any],
+    split_name: str,
+    out_dir: Path,
+    shard_rows: int,
+    max_z_chunk_mb: int,
+    bundle_path: Path,
+) -> Dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    z_cap_rows = max(1, int((int(max_z_chunk_mb) * 1024 * 1024) // max(1, int(bundle.kept_dim) * 4)))
+    chunk_rows = max(1, min(int(shard_rows), z_cap_rows))
+    shards: list[Dict[str, Any]] = []
+    stats = _empty_streaming_stats()
+    processed_chunks = 0
+    seconds_total = 0.0
+    shard_idx = 0
+    total_rows = 0
+    for source_shard in source_manifest.get("shards", []):
+        with np.load(source_shard["path"]) as arr:
+            Z_src = np.asarray(arr["Z"], dtype=np.float32)
+            y = np.asarray(arr["y"], dtype=np.float32)
+            positions = np.asarray(arr["positions"], dtype=np.int64)
+        if Z_src.shape[0] != y.shape[0] or Z_src.shape[0] != positions.shape[0]:
+            raise ValueError(f"Source shard row mismatch: {source_shard['path']}")
+        for start in range(0, Z_src.shape[0], chunk_rows):
+            end = min(Z_src.shape[0], start + chunk_rows)
+            t0 = time.time()
+            Z_out = bundle.transform(Z_src[start:end])
+            dt = time.time() - t0
+            y_out = y[start:end].astype(np.float32, copy=False)
+            pos_out = positions[start:end].astype(np.int64, copy=False)
+            if Z_out.shape[0] != y_out.shape[0] or Z_out.shape[0] != pos_out.shape[0]:
+                raise ValueError(f"Output shard row mismatch for split={split_name} shard={shard_idx:05d}")
+            if not np.isfinite(Z_out).all():
+                raise ValueError(f"Stage 3 produced non-finite values for split={split_name} shard={shard_idx:05d}")
+            path = out_dir / f"{split_name}_preprocessed_shard_{shard_idx:05d}.npz"
+            np.savez_compressed(path, Z=Z_out, y=y_out, positions=pos_out)
+            print(
+                f"[linear-preprocess-transform] split={split_name} shard={shard_idx:05d} "
+                f"rows={Z_out.shape[0]} Z_shape={list(Z_out.shape)} seconds={dt:.3f}",
+                flush=True,
+            )
+            shards.append(
+                {
+                    "shard": int(shard_idx),
+                    "path": str(path),
+                    "rows": int(Z_out.shape[0]),
+                    "z_shape": [int(x) for x in Z_out.shape],
+                    "y_shape": [int(x) for x in y_out.shape],
+                    "positions_start": int(pos_out[0]),
+                    "positions_end": int(pos_out[-1]),
+                    "source_shard_path": str(source_shard["path"]),
+                    "source_local_start": int(start),
+                    "source_local_end": int(end),
+                    "seconds": float(dt),
+                }
+            )
+            _update_streaming_stats(stats, Z_out)
+            total_rows += int(Z_out.shape[0])
+            seconds_total += dt
+            processed_chunks += 1
+            shard_idx += 1
+    summary = _finalize_streaming_summary(stats, n_shards=len(shards), chunk_rows=chunk_rows, positions_rows=total_rows)
+    manifest_path = out_dir / f"{split_name}_preprocessed_manifest.json"
+    manifest = {
+        "split": split_name,
+        "stage": "stage3",
+        "schema": LINEAR_PREPROCESS_SCHEMA,
+        "source_manifest_path": source_manifest.get("manifest_path"),
+        "preprocess_bundle_path": str(bundle_path),
+        "n_rows": int(total_rows),
+        "original_dim": int(bundle.original_dim),
+        "kept_dim": int(bundle.kept_dim),
+        "processed_chunks": int(processed_chunks),
+        "n_saved_shards": len(shards),
+        "n_shards": len(shards),
+        "seconds_total": float(seconds_total),
+        "max_z_chunk_mb": int(max_z_chunk_mb),
+        "summary": summary,
+        "shards": shards,
+        "manifest_path": str(manifest_path),
+    }
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, allow_nan=True, indent=2)
+    print(f"[linear-preprocess-manifest] wrote {manifest_path}", flush=True)
+    return manifest
+
+
+def run_stage3_preprocessing(
+    *,
+    linear_out_dir: Path,
+    extractor_name: str,
+) -> Dict[str, Any]:
+    stage2_dir = resolve_stage2_dir(linear_out_dir, extractor_name)
+    stage3_dir = Path(linear_out_dir) / "stage3_preprocess" / extractor_name / "default"
+    stage3_dir.mkdir(parents=True, exist_ok=True)
+    stage2_payload = load_stage2_payload(linear_out_dir, extractor_name)
+    train_manifest = load_manifest_from_payload(stage2_payload, "train_sample")
+    val_manifest = load_manifest_from_payload(stage2_payload, "val")
+    test_manifest = load_manifest_from_payload(stage2_payload, "test")
+    if train_manifest is None:
+        raise ValueError("Stage 3 requires a Stage 2 train_sample manifest")
+    if val_manifest is None:
+        raise ValueError("Stage 3 requires a Stage 2 val manifest")
+    preprocess_config = {
+        "schema": LINEAR_PREPROCESS_SCHEMA,
+        "extractor": extractor_name,
+        "fit_split": LINEAR_PREPROCESS_FIT_SPLIT,
+        "winsorize": bool(LINEAR_PREPROCESS_WINSORIZE),
+        "winsor_q_lo": float(LINEAR_PREPROCESS_WINSOR_Q_LO),
+        "winsor_q_hi": float(LINEAR_PREPROCESS_WINSOR_Q_HI),
+        "standardize": bool(LINEAR_PREPROCESS_STANDARDIZE),
+        "std_eps": float(LINEAR_PREPROCESS_STD_EPS),
+        "variance_filter": bool(LINEAR_PREPROCESS_VARIANCE_FILTER),
+        "min_std": float(LINEAR_PREPROCESS_MIN_STD),
+        "post_clip_abs": float(LINEAR_PREPROCESS_POST_CLIP_ABS),
+        "nonfinite_policy": LINEAR_PREPROCESS_NONFINITE_POLICY,
+        "fit_max_rows": int(LINEAR_PREPROCESS_FIT_MAX_ROWS),
+        "fit_max_matrix_mb": int(LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB),
+        "preprocess_shard_rows": int(LINEAR_PREPROCESS_SHARD_ROWS),
+        "preprocess_max_z_chunk_mb": int(LINEAR_PREPROCESS_MAX_Z_CHUNK_MB),
+    }
+    bundle = fit_linear_preprocessor_from_manifest(train_manifest, config=preprocess_config)
+    bundle_path = stage3_dir / "linear_preprocess_bundle.npz"
+    save_linear_preprocess_bundle(bundle, bundle_path)
+    train_pre_manifest = preprocess_manifest_to_npz_shards(
+        bundle=bundle,
+        source_manifest=train_manifest,
+        split_name="train_sample",
+        out_dir=stage3_dir,
+        shard_rows=LINEAR_PREPROCESS_SHARD_ROWS,
+        max_z_chunk_mb=LINEAR_PREPROCESS_MAX_Z_CHUNK_MB,
+        bundle_path=bundle_path,
+    )
+    val_pre_manifest = preprocess_manifest_to_npz_shards(
+        bundle=bundle,
+        source_manifest=val_manifest,
+        split_name="val",
+        out_dir=stage3_dir,
+        shard_rows=LINEAR_PREPROCESS_SHARD_ROWS,
+        max_z_chunk_mb=LINEAR_PREPROCESS_MAX_Z_CHUNK_MB,
+        bundle_path=bundle_path,
+    )
+    test_pre_manifest = None
+    if test_manifest is not None:
+        test_pre_manifest = preprocess_manifest_to_npz_shards(
+            bundle=bundle,
+            source_manifest=test_manifest,
+            split_name="test",
+            out_dir=stage3_dir,
+            shard_rows=LINEAR_PREPROCESS_SHARD_ROWS,
+            max_z_chunk_mb=LINEAR_PREPROCESS_MAX_Z_CHUNK_MB,
+            bundle_path=bundle_path,
+        )
+    payload = {
+        "stage": "stage3",
+        "status": "ok",
+        "schema": LINEAR_PREPROCESS_SCHEMA,
+        "extractor": extractor_name,
+        "stage2_dir": str(stage2_dir),
+        "stage3_dir": str(stage3_dir),
+        "preprocess_config": preprocess_config,
+        "preprocess_bundle_path": str(bundle_path),
+        "fit_summary": bundle.fit_summary,
+        "original_dim": int(bundle.original_dim),
+        "kept_dim": int(bundle.kept_dim),
+        "train_sample_summary": train_pre_manifest["summary"],
+        "val_summary": val_pre_manifest["summary"],
+        "test_summary": None if test_pre_manifest is None else test_pre_manifest["summary"],
+        "manifests": {
+            "train_sample": train_pre_manifest,
+            "val": val_pre_manifest,
+            "test": test_pre_manifest,
+        },
+    }
+    metrics_path = stage3_dir / "linear_stage3_preprocess_metrics.json"
+    copy_path = Path(linear_out_dir) / "linear_stage3_preprocess_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, allow_nan=True, indent=2)
+    with copy_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, allow_nan=True, indent=2)
+    print(f"[linear-stage3] wrote {metrics_path} and {copy_path}", flush=True)
+    return payload
+
+
 def run_stage2_extraction(
     *,
     linear_out_dir: Path,
@@ -821,6 +1255,14 @@ def main() -> None:
     linear_out_dir = Path(LINEAR_OUT_DIR) if LINEAR_OUT_DIR else out_root / "linear_stage1"
     linear_out_dir.mkdir(parents=True, exist_ok=True)
     device = _resolve_device()
+    if LINEAR_STAGE == "stage3":
+        print(
+            f"[linear-config] stage=stage3 extractor={LINEAR_EXTRACTOR} device={device} "
+            f"out_root={out_root} linear_out_dir={linear_out_dir}",
+            flush=True,
+        )
+        run_stage3_preprocessing(linear_out_dir=linear_out_dir, extractor_name=LINEAR_EXTRACTOR)
+        return
     if LINEAR_STAGE == "stage2":
         print(
             f"[linear-config] stage={LINEAR_STAGE} extractor={LINEAR_EXTRACTOR} device={device} "
