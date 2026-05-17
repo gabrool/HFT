@@ -1,4 +1,10 @@
+import os
+import sys
+import types
+
 import numpy as np
+
+os.environ.setdefault("BYBIT_FEATURE_STORAGE_DTYPE", "fp32")
 
 try:
     from test_feature_event_result_contract import _install_optional_dependency_stubs
@@ -7,6 +13,9 @@ except Exception:
 
 if _install_optional_dependency_stubs is not None:
     _install_optional_dependency_stubs()
+
+sys.modules.setdefault("torch._inductor", types.ModuleType("torch._inductor"))
+sys.modules.setdefault("torch._inductor.config", types.ModuleType("torch._inductor.config"))
 
 try:
     from CMSSL17 import NUM_HORIZONS
@@ -33,6 +42,38 @@ class FakeFlatDataset:
         return self.X[int(idx)], self.y[int(idx)]
 
 
+def test_compute_safe_transform_chunk_rows_respects_z_memory():
+    import linear_offline
+
+    rows = linear_offline.compute_safe_transform_chunk_rows(
+        requested_rows=100_000,
+        lookback=100,
+        feature_dim=200,
+        output_dim=50_000,
+        max_x_chunk_mb=2048,
+        max_z_chunk_mb=100,
+        hard_cap_rows=50_000,
+    )
+
+    # 100 MB / (50k * 4 bytes) ≈ 524 rows
+    assert 1 <= rows <= 600
+
+
+def test_compute_safe_transform_chunk_rows_respects_hard_cap():
+    import linear_offline
+
+    rows = linear_offline.compute_safe_transform_chunk_rows(
+        requested_rows=100_000,
+        lookback=100,
+        feature_dim=200,
+        output_dim=100,
+        max_x_chunk_mb=2048,
+        max_z_chunk_mb=2048,
+        hard_cap_rows=1234,
+    )
+    assert rows == 1234
+
+
 def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monkeypatch):
     import linear_offline
 
@@ -44,6 +85,7 @@ def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monke
     monkeypatch.setattr(linear_offline, "LINEAR_CHUNKED_TRANSFORMS", True)
     monkeypatch.setattr(linear_offline, "LINEAR_TRANSFORM_SHARD_ROWS", 5)
     monkeypatch.setattr(linear_offline, "LINEAR_MAX_X_CHUNK_MB", 1)
+    monkeypatch.setattr(linear_offline, "LINEAR_MAX_Z_CHUNK_MB", 1)
     monkeypatch.setattr(linear_offline, "LINEAR_SAVE_TRANSFORMS", True)
 
     ds_train = FakeFlatDataset(12)
@@ -79,8 +121,16 @@ def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monke
     assert (stage2_dir / "val_transform_manifest.json").exists()
     assert (stage2_dir / "test_transform_manifest.json").exists()
     assert payload["chunked_transforms"] is True
+    assert payload["max_z_chunk_mb"] == 1
+    assert payload["extractor_output_dim"] > 0
     assert payload["val_summary"]["shape"][0] == len(ds_val)
+    assert payload["val_summary"]["shape"][1] == payload["extractor_output_dim"]
     assert payload["val_summary"]["n_shards"] >= 2
+    val_manifest = payload["manifests"]["val"]
+    assert val_manifest["extractor_output_dim"] == payload["extractor_output_dim"]
+    assert val_manifest["max_z_chunk_mb"] == 1
+    assert val_manifest["processed_chunks"] >= 1
+    assert val_manifest["n_saved_shards"] >= 1
 
     shards = list(stage2_dir.glob("val_transform_shard_*.npz"))
     assert shards
