@@ -77,7 +77,7 @@ def write_stage3_manifest(tmp_path: Path, extractor: str, split: str, Z: np.ndar
     return manifest
 
 
-def write_stage3_payload(tmp_path: Path, extractor: str, manifests):
+def write_stage3_payload(tmp_path: Path, extractor: str, manifests, audit_summary=None):
     out_dir = tmp_path / "stage3_preprocess" / extractor / "default"
     payload = {
         "stage": "stage3",
@@ -87,6 +87,7 @@ def write_stage3_payload(tmp_path: Path, extractor: str, manifests):
         "decision_row_policy": "linear_every_n_rows_v1",
         "extractor": extractor,
         "manifests": manifests,
+        "audit_summary": audit_summary,
     }
     (out_dir / "linear_stage3_preprocess_metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
@@ -303,3 +304,53 @@ def test_stage5_decision_stride_mismatch_skip_vs_strict(tmp_path, monkeypatch):
             predictor="sgd_l2_huber",
             device=object(),
         )
+
+
+def test_stage5_comparison_row_includes_stage3_audit_fields(tmp_path, monkeypatch):
+    import linear_offline
+
+    configure_stage5(monkeypatch, linear_offline)
+    Z_train, y_train, pos_train = make_synthetic()
+    Z_val, y_val, pos_val = make_synthetic(120, 5)
+    extractor = "raw_linear"
+    manifests = {
+        "train_sample": write_stage3_manifest(tmp_path, extractor, "train_sample", Z_train, y_train, pos_train),
+        "val": write_stage3_manifest(tmp_path, extractor, "val", Z_val, y_val, pos_val),
+        "test": None,
+    }
+    audit_summary = {
+        "stage": "stage3",
+        "schema": "linear_preprocess_audit_v1",
+        "extractor": extractor,
+        "preprocess_name": "default",
+        "splits": {
+            "train_sample": {
+                "kept_dim": 5,
+                "variance_removed_frac": 0.2,
+                "winsor_total_clip_frac_p95": 0.01,
+                "warnings": ["variance_removed_gt_10pct"],
+            },
+            "val": {
+                "kept_dim": 5,
+                "winsor_total_clip_frac_p95": 0.03,
+                "out_abs_p999": 12.5,
+                "out_abs_gt_10_frac": 0.002,
+                "warnings": ["winsor_clip_p95_gt_1pct"],
+            },
+        },
+    }
+    write_stage3_payload(tmp_path, extractor, manifests, audit_summary=audit_summary)
+    write_stage4_payload_and_bundle(tmp_path, extractor)
+    write_trim_stats(tmp_path, y_train)
+
+    payload = linear_offline.run_stage5_comparison(
+        linear_out_dir=tmp_path,
+        extractor_names=[extractor],
+        preprocess_name="default",
+        predictor="sgd_l2_huber",
+        device=object(),
+    )
+    row = payload["comparison_rows"][0]
+    assert row["preprocess_val_clip_p95"] == 0.03
+    assert row["preprocess_val_out_abs_p999"] == 12.5
+    assert "val:winsor_clip_p95_gt_1pct" in row["preprocess_warnings"]
