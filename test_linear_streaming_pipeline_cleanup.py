@@ -249,3 +249,45 @@ def test_no_ds_train_list_in_linear_offline_source():
     text = Path("linear_offline.py").read_text(encoding="utf-8")
     assert "ds_train_list" not in text
     assert "train_sample manifest" not in text.lower()
+
+
+def test_build_single_linear_dataset_validates_dataset_label_array(monkeypatch, tmp_path):
+    import numpy as np
+    import linear_offline
+
+    class FakeDataset:
+        feature_dim_total = 4
+        lookback = linear_offline.LOOKBACK
+        stores = [object()]
+        week_ids = np.zeros(10, dtype=np.int64)
+        row_idx = np.arange(linear_offline.LOOKBACK - 1, linear_offline.LOOKBACK - 1 + 10)
+        y = np.zeros((10, len(linear_offline.HORIZONS_MS)), dtype=np.float32)
+
+        def __len__(self):
+            return 10
+
+    monkeypatch.setattr(
+        linear_offline,
+        "build_dataset_from_split",
+        lambda out_root, split_entry: FakeDataset(),
+    )
+
+    ds = linear_offline.build_single_linear_dataset_from_entry(
+        meta={"out_root": str(tmp_path), "feature_dim_total": 4},
+        split_entry={},
+        split_name="unit",
+    )
+
+    assert len(ds) == 10
+
+
+def test_validate_dataset_label_array_shape_rejects_bad_horizon_dim():
+    import numpy as np
+    import pytest
+    import linear_offline
+
+    class BadDataset:
+        y = np.zeros((10, len(linear_offline.HORIZONS_MS) + 1), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="label dimension mismatch"):
+        linear_offline.validate_dataset_label_array_shape(BadDataset(), "bad")

@@ -375,6 +375,22 @@ def _validate_dataset_split(ds: Any, split_name: str, feature_dim_total: int) ->
         )
 
 
+def validate_dataset_label_array_shape(ds: Any, split_name: str) -> None:
+    if not hasattr(ds, "y"):
+        raise ValueError(f"{split_name}: dataset missing y labels")
+
+    y = np.asarray(ds.y)
+    if y.ndim != 2:
+        raise ValueError(f"{split_name}: ds.y must be 2D, got shape={y.shape}")
+
+    expected = len(HORIZONS_MS)
+    if y.shape[1] != expected:
+        raise ValueError(
+            f"{split_name}: label dimension mismatch: ds.y.shape[1]={y.shape[1]}, "
+            f"expected {expected} horizons"
+        )
+
+
 def _make_cache_meta(meta: Dict[str, Any], protocol: str, train_week_keys: list[str], train_split_entries: list[dict]) -> Dict[str, Any]:
     tr_start = int(min(entry["start"] for entry in train_split_entries))
     tr_end = int(max(entry["end"] for entry in train_split_entries))
@@ -2203,7 +2219,7 @@ def build_single_linear_dataset_from_entry(*, meta: Dict[str, Any], split_entry:
     ds = build_dataset_from_split(str(out_root), split_entry)
     feature_dim_total = int(meta["feature_dim_total"])
     _validate_dataset_split(ds, split_name, feature_dim_total)
-    validate_dataset_label_dim(ds, split_name)
+    validate_dataset_label_array_shape(ds, split_name)
     log_memory(f"after_build_{split_name}")
     return ds
 
