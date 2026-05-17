@@ -7,7 +7,7 @@ import os
 import pickle
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 import numpy as np
 import torch
@@ -21,6 +21,7 @@ from CMSSL17 import (  # type: ignore
     MODEL_OUTPUT_SCHEMA,
     build_dataset_from_split,
     compute_primary_metric,
+    is_metric_improved,
 )
 from CMSSL17_offline import (  # type: ignore
     require_supported_pipeline_splits,
@@ -55,7 +56,10 @@ from CMSSL17_linear import (  # type: ignore
     linear_model_summary,
     build_linear_extractor_from_config,
     LinearPreprocessBundle,
+    LinearSklearnTakerBundle,
+    LinearSklearnTorchWrapper,
     save_linear_preprocess_bundle,
+    save_linear_sklearn_bundle,
 )
 
 
@@ -72,6 +76,13 @@ def _env_int_list(name: str, default: str) -> list[int]:
     if not raw:
         return []
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def _env_float_list(name: str, default: str) -> list[float]:
+    raw = os.environ.get(name, default).strip()
+    if not raw:
+        return []
+    return [float(part.strip()) for part in raw.split(",") if part.strip()]
 
 
 OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
@@ -101,6 +112,26 @@ LINEAR_PREPROCESS_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_PREPROCESS_FIT_MAX_ROWS"
 LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB = _env_int("BYBIT_LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB", 2048)
 LINEAR_PREPROCESS_SHARD_ROWS = _env_int("BYBIT_LINEAR_PREPROCESS_SHARD_ROWS", 50000)
 LINEAR_PREPROCESS_MAX_Z_CHUNK_MB = _env_int("BYBIT_LINEAR_PREPROCESS_MAX_Z_CHUNK_MB", 2048)
+
+LINEAR_STAGE4_SCHEMA = "linear_target_models_stage4_v1"
+LINEAR_STAGE4_PREPROCESS_NAME = os.environ.get("BYBIT_LINEAR_STAGE4_PREPROCESS_NAME", "default").strip()
+LINEAR_STAGE4_TRAIN_SPLIT = os.environ.get("BYBIT_LINEAR_STAGE4_TRAIN_SPLIT", "train_sample").strip().lower()
+LINEAR_STAGE4_PREDICTOR = os.environ.get("BYBIT_LINEAR_STAGE4_PREDICTOR", "sgd_l2_huber").strip().lower()
+LINEAR_STAGE4_ALPHA_GRID = os.environ.get("BYBIT_LINEAR_STAGE4_ALPHA_GRID", "1e-6,3e-6,1e-5,3e-5,1e-4").strip()
+LINEAR_STAGE4_ALPHA_VALUES = _env_float_list("BYBIT_LINEAR_STAGE4_ALPHA_GRID", "1e-6,3e-6,1e-5,3e-5,1e-4")
+LINEAR_STAGE4_PENALTY = os.environ.get("BYBIT_LINEAR_STAGE4_PENALTY", "l2").strip().lower()
+LINEAR_STAGE4_L1_RATIO = float(os.environ.get("BYBIT_LINEAR_STAGE4_L1_RATIO", "0.15"))
+LINEAR_STAGE4_EPOCHS = _env_int("BYBIT_LINEAR_STAGE4_EPOCHS", 3)
+LINEAR_STAGE4_BATCH_ROWS = _env_int("BYBIT_LINEAR_STAGE4_BATCH_ROWS", 8192)
+LINEAR_STAGE4_RANDOM_SEED = _env_int("BYBIT_LINEAR_STAGE4_RANDOM_SEED", 17)
+LINEAR_STAGE4_DIRECTION_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_DIRECTION_WEIGHTING", "tempered").strip().lower()
+LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING", "none").strip().lower()
+LINEAR_STAGE4_RUN_TEST = _env_bool("BYBIT_LINEAR_STAGE4_RUN_TEST", 1)
+LINEAR_STAGE4_MAG_FLOOR = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_FLOOR", "1e-4"))
+LINEAR_STAGE4_MAX_VAL_ROWS = _env_int("BYBIT_LINEAR_STAGE4_MAX_VAL_ROWS", 0)
+LINEAR_STAGE4_MAX_TEST_ROWS = _env_int("BYBIT_LINEAR_STAGE4_MAX_TEST_ROWS", 0)
+LINEAR_STAGE4_SAVE_VAL_PREDICTIONS = _env_bool("BYBIT_LINEAR_STAGE4_SAVE_VAL_PREDICTIONS", 0)
+LINEAR_STAGE4_ALLOW_SAMPLE_TRIM_STATS = _env_bool("BYBIT_LINEAR_STAGE4_ALLOW_SAMPLE_TRIM_STATS", 0)
 
 LINEAR_EXTRACTOR = os.environ.get("BYBIT_LINEAR_EXTRACTOR", "raw_linear").strip().lower()
 LINEAR_EXTRACTOR_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_EXTRACTOR_FIT_MAX_ROWS", 50000)
@@ -163,10 +194,30 @@ if LINEAR_STAGE == "stage3":
     if LINEAR_PREPROCESS_MAX_Z_CHUNK_MB <= 0:
         raise ValueError(f"BYBIT_LINEAR_PREPROCESS_MAX_Z_CHUNK_MB must be > 0, got {LINEAR_PREPROCESS_MAX_Z_CHUNK_MB}")
 
+if LINEAR_STAGE == "stage4":
+    if LINEAR_STAGE4_TRAIN_SPLIT not in {"train_sample"}:
+        raise ValueError("Stage 4 currently supports train_sample only")
+    if LINEAR_STAGE4_PREDICTOR not in {"sgd_l2_huber"}:
+        raise ValueError("Stage 4 currently supports BYBIT_LINEAR_STAGE4_PREDICTOR=sgd_l2_huber")
+    if LINEAR_STAGE4_PENALTY not in {"l2", "elasticnet"}:
+        raise ValueError("BYBIT_LINEAR_STAGE4_PENALTY must be one of: l2, elasticnet")
+    if not LINEAR_STAGE4_ALPHA_VALUES or any(a <= 0 for a in LINEAR_STAGE4_ALPHA_VALUES):
+        raise ValueError("BYBIT_LINEAR_STAGE4_ALPHA_GRID must contain positive alpha values")
+    if LINEAR_STAGE4_EPOCHS <= 0:
+        raise ValueError(f"BYBIT_LINEAR_STAGE4_EPOCHS must be > 0, got {LINEAR_STAGE4_EPOCHS}")
+    if LINEAR_STAGE4_BATCH_ROWS <= 0:
+        raise ValueError(f"BYBIT_LINEAR_STAGE4_BATCH_ROWS must be > 0, got {LINEAR_STAGE4_BATCH_ROWS}")
+    if LINEAR_STAGE4_DIRECTION_WEIGHTING not in {"none", "balanced", "tempered"}:
+        raise ValueError("BYBIT_LINEAR_STAGE4_DIRECTION_WEIGHTING must be one of: none, balanced, tempered")
+    if LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING not in {"none"}:
+        raise ValueError("Only none for magnitude weighting in first Stage 4 implementation")
+    if LINEAR_STAGE4_MAG_FLOOR <= 0:
+        raise ValueError(f"BYBIT_LINEAR_STAGE4_MAG_FLOOR must be > 0, got {LINEAR_STAGE4_MAG_FLOOR}")
+
 
 def _resolve_device() -> torch.device:
-    if LINEAR_STAGE not in {"stage1", "stage2", "stage3"}:
-        raise ValueError(f"BYBIT_LINEAR_STAGE must be 'stage1', 'stage2', or 'stage3', got {LINEAR_STAGE!r}")
+    if LINEAR_STAGE not in {"stage1", "stage2", "stage3", "stage4"}:
+        raise ValueError(f"BYBIT_LINEAR_STAGE must be 'stage1', 'stage2', 'stage3', or 'stage4', got {LINEAR_STAGE!r}")
     if LINEAR_DEVICE not in {"cpu", "cuda", "auto"}:
         raise ValueError("BYBIT_LINEAR_DEVICE must be one of: cpu, cuda, auto")
     if LINEAR_EVAL_BATCH_SIZE <= 0:
@@ -1080,6 +1131,492 @@ def run_stage3_preprocessing(
     return payload
 
 
+
+def resolve_stage3_dir(linear_out_dir: Path, extractor_name: str, preprocess_name: str) -> Path:
+    return Path(linear_out_dir) / "stage3_preprocess" / str(extractor_name) / str(preprocess_name)
+
+
+def load_stage3_payload(linear_out_dir: Path, extractor_name: str, preprocess_name: str) -> Dict[str, Any]:
+    stage3_dir = resolve_stage3_dir(linear_out_dir, extractor_name, preprocess_name)
+    path = stage3_dir / "linear_stage3_preprocess_metrics.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Stage 3 payload not found for extractor={extractor_name!r} preprocess={preprocess_name!r}: {path}")
+    payload = load_json(path)
+    if payload.get("stage") != "stage3":
+        raise ValueError(f"Expected stage3 payload at {path}, got stage={payload.get('stage')!r}")
+    if "manifests" not in payload:
+        raise ValueError(f"Stage 3 payload missing manifests: {path}")
+    payload["payload_path"] = str(path)
+    print(f"[linear-stage4] loaded stage3 payload {path}", flush=True)
+    return payload
+
+
+def load_stage3_manifest(payload: Dict[str, Any], split: str) -> Optional[Dict[str, Any]]:
+    manifest = payload.get("manifests", {}).get(split)
+    if manifest is None:
+        return None
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Invalid Stage 3 manifest payload for split={split}: {manifest!r}")
+    path = Path(str(manifest.get("manifest_path", "")))
+    if path.exists():
+        loaded = load_json(path)
+        if "manifest_path" not in loaded:
+            loaded["manifest_path"] = str(path)
+        return loaded
+    return manifest
+
+
+def load_linear_trim_stats(linear_out_dir: Path) -> Dict[str, np.ndarray]:
+    path = Path(linear_out_dir) / "linear_signed_side_trim_stats_cache.npz"
+    cached = load_stats_cache(path)
+    if not cached:
+        raise FileNotFoundError(f"Missing linear trim stats cache: {path}. Run stage1 or stage2 first.")
+    stats, _cache_meta = cached
+    print(f"[linear-stage4] loaded trim stats {path}", flush=True)
+    return stats
+
+
+def compute_sample_trim_stats_from_manifest(train_manifest: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    y_parts = []
+    for _Z, y_batch in iter_manifest_numpy_batches(train_manifest, batch_rows=LINEAR_STAGE4_BATCH_ROWS):
+        y_parts.append(y_batch.astype(np.float32, copy=False))
+    if not y_parts:
+        raise ValueError("Cannot compute sample trim stats from empty Stage 3 train manifest")
+    print("[linear-stage4-warn] computing trim stats from train_sample because BYBIT_LINEAR_STAGE4_ALLOW_SAMPLE_TRIM_STATS=1", flush=True)
+    return compute_signed_raw_stats(np.concatenate(y_parts, axis=0))
+
+
+def manifest_n_rows(manifest: Dict[str, Any]) -> int:
+    if "n_rows" in manifest:
+        return int(manifest["n_rows"])
+    return int(manifest["summary"]["shape"][0])
+
+
+def manifest_dim(manifest: Dict[str, Any]) -> int:
+    if "kept_dim" in manifest:
+        return int(manifest["kept_dim"])
+    summary = manifest.get("summary", {})
+    if "shape" in summary and len(summary["shape"]) >= 2:
+        return int(summary["shape"][1])
+    raise ValueError("Manifest missing kept_dim / summary.shape[1]")
+
+
+def iter_manifest_numpy_batches(
+    manifest: Dict[str, Any],
+    *,
+    batch_rows: int,
+    max_rows: int = 0,
+    shuffle: bool = False,
+    rng: Optional[np.random.Generator] = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    if int(batch_rows) <= 0:
+        raise ValueError(f"batch_rows must be > 0, got {batch_rows}")
+    remaining = None if int(max_rows) <= 0 else int(max_rows)
+    expected_dim = manifest_dim(manifest)
+    for shard in manifest.get("shards", []):
+        if remaining is not None and remaining <= 0:
+            break
+        with np.load(shard["path"]) as arr:
+            Z = np.asarray(arr["Z"], dtype=np.float32)
+            y = np.asarray(arr["y"], dtype=np.float32)
+        if Z.ndim != 2 or Z.shape[1] != expected_dim:
+            raise ValueError(f"Shard {shard['path']} has invalid Z shape {Z.shape}; expected width {expected_dim}")
+        if y.ndim != 2 or y.shape[1] != len(HORIZONS_MS) or y.shape[0] != Z.shape[0]:
+            raise ValueError(f"Shard {shard['path']} has invalid y shape {y.shape} for Z shape {Z.shape}")
+        n = int(Z.shape[0]) if remaining is None else min(int(Z.shape[0]), int(remaining))
+        if n <= 0:
+            continue
+        Z = Z[:n]
+        y = y[:n]
+        order = np.arange(n, dtype=np.int64)
+        if shuffle:
+            if rng is None:
+                rng = np.random.default_rng()
+            rng.shuffle(order)
+        for start in range(0, n, int(batch_rows)):
+            idx = order[start:min(n, start + int(batch_rows))]
+            yield Z[idx].astype(np.float32, copy=False), y[idx].astype(np.float32, copy=False)
+        if remaining is not None:
+            remaining -= n
+
+
+class PreprocessedShardBatchSource:
+    def __init__(self, manifest: Dict[str, Any], device: torch.device, batch_rows: int, max_rows: int = 0):
+        self.manifest = manifest
+        self.target_device = device
+        self.device = torch.device("cpu")
+        self.batch_size = int(batch_rows)
+        self.n_rows = manifest_n_rows(manifest) if int(max_rows) <= 0 else min(manifest_n_rows(manifest), int(max_rows))
+        self.effective_rows_nominal = int(self.n_rows)
+        self.num_horizons = len(HORIZONS_MS)
+        self.feature_shape = (int(self.n_rows), manifest_dim(manifest))
+        self.is_shared_feature_view = False
+        self.pin_memory = bool(device.type == "cuda")
+
+    def __len__(self) -> int:
+        return (int(self.n_rows) + self.batch_size - 1) // self.batch_size
+
+    def iter_epoch(self, epoch: int):
+        del epoch
+        for Z, y in iter_manifest_numpy_batches(self.manifest, batch_rows=self.batch_size, max_rows=self.n_rows, shuffle=False):
+            x_cpu = torch.as_tensor(Z, dtype=torch.float32)
+            y_cpu = torch.as_tensor(y, dtype=torch.float32)
+            if self.pin_memory:
+                x_cpu = x_cpu.pin_memory()
+                y_cpu = y_cpu.pin_memory()
+            yield x_cpu.to(self.target_device, non_blocking=self.pin_memory), y_cpu.to(self.target_device, non_blocking=self.pin_memory)
+
+
+def compute_direction_batch_sample_weight(y_binary: np.ndarray, *, mode: str) -> Optional[np.ndarray]:
+    mode = str(mode).strip().lower()
+    if mode == "none":
+        return None
+    yb = np.asarray(y_binary, dtype=np.int64).reshape(-1)
+    pos = int(np.sum(yb == 1))
+    neg = int(np.sum(yb == 0))
+    n = pos + neg
+    if n <= 0 or pos <= 0 or neg <= 0:
+        return np.ones_like(yb, dtype=np.float32)
+    pos_frac = pos / n
+    neg_frac = neg / n
+    if mode == "balanced":
+        pos_w = 0.5 / pos_frac
+        neg_w = 0.5 / neg_frac
+    elif mode == "tempered":
+        pos_w = math.sqrt(0.5 / pos_frac)
+        neg_w = math.sqrt(0.5 / neg_frac)
+    else:
+        raise ValueError(f"Unsupported direction weighting mode {mode!r}")
+    return np.where(yb == 1, pos_w, neg_w).astype(np.float32)
+
+
+def compute_global_direction_weights(train_manifest: Dict[str, Any], stats: Dict[str, np.ndarray], mode: str) -> list[tuple[float, float]]:
+    mode = str(mode).strip().lower()
+    if mode == "none":
+        return [(1.0, 1.0) for _ in HORIZONS_MS]
+    pos_counts = np.zeros(len(HORIZONS_MS), dtype=np.float64)
+    neg_counts = np.zeros(len(HORIZONS_MS), dtype=np.float64)
+    for _Z, y_batch in iter_manifest_numpy_batches(train_manifest, batch_rows=LINEAR_STAGE4_BATCH_ROWS):
+        keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_from_stats_np(y_batch, stats)
+        for h in range(len(HORIZONS_MS)):
+            rows = keep_signed[:, h]
+            if rows.any():
+                vals = y_batch[rows, h] > 0.0
+                pos_counts[h] += float(np.sum(vals))
+                neg_counts[h] += float(np.sum(~vals))
+    weights: list[tuple[float, float]] = []
+    for h in range(len(HORIZONS_MS)):
+        pos = float(pos_counts[h])
+        neg = float(neg_counts[h])
+        n = pos + neg
+        if n <= 0 or pos <= 0 or neg <= 0:
+            weights.append((1.0, 1.0))
+            continue
+        pos_frac = pos / n
+        neg_frac = neg / n
+        if mode == "balanced":
+            weights.append((0.5 / neg_frac, 0.5 / pos_frac))
+        elif mode == "tempered":
+            weights.append((math.sqrt(0.5 / neg_frac), math.sqrt(0.5 / pos_frac)))
+        else:
+            raise ValueError(f"Unsupported direction weighting mode {mode!r}")
+    return weights
+
+
+def make_direction_model(alpha: float, config: Dict[str, Any]) -> Any:
+    from sklearn.linear_model import SGDClassifier
+    return SGDClassifier(
+        loss="log_loss",
+        penalty=config["penalty"],
+        alpha=float(alpha),
+        l1_ratio=float(config["l1_ratio"]),
+        fit_intercept=True,
+        learning_rate="optimal",
+        average=True,
+        random_state=int(config["random_state"]),
+    )
+
+
+def make_magnitude_model(alpha: float, config: Dict[str, Any]) -> Any:
+    from sklearn.linear_model import SGDRegressor
+    return SGDRegressor(
+        loss="huber",
+        penalty=config["penalty"],
+        alpha=float(alpha),
+        l1_ratio=float(config["l1_ratio"]),
+        fit_intercept=True,
+        learning_rate="optimal",
+        average=True,
+        random_state=int(config["random_state"]),
+    )
+
+
+def train_stage4_candidate(
+    *,
+    train_manifest: Dict[str, Any],
+    stats: Dict[str, np.ndarray],
+    alpha: float,
+    config: Dict[str, Any],
+) -> LinearSklearnTakerBundle:
+    n_h = len(HORIZONS_MS)
+    direction_models = [make_direction_model(alpha, config) for _ in range(n_h)]
+    mag_up_models = [make_magnitude_model(alpha, config) for _ in range(n_h)]
+    mag_down_models = [make_magnitude_model(alpha, config) for _ in range(n_h)]
+    dir_fitted = [False] * n_h
+    up_fitted = [False] * n_h
+    down_fitted = [False] * n_h
+    dir_counts = np.zeros(n_h, dtype=np.int64)
+    up_counts = np.zeros(n_h, dtype=np.int64)
+    down_counts = np.zeros(n_h, dtype=np.int64)
+    dir_weights = compute_global_direction_weights(train_manifest, stats, str(config["direction_weighting"]))
+    rng = np.random.default_rng(int(config["random_state"]))
+
+    for epoch in range(int(config["epochs"])):
+        print(f"[linear-stage4-train] alpha={alpha} epoch={epoch + 1}/{config['epochs']}", flush=True)
+        for Z_batch, y_batch in iter_manifest_numpy_batches(
+            train_manifest,
+            batch_rows=int(config["batch_rows"]),
+            shuffle=True,
+            rng=rng,
+        ):
+            keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_from_stats_np(y_batch, stats)
+            for h in range(n_h):
+                rows = keep_signed[:, h]
+                if rows.any():
+                    y_dir = (y_batch[rows, h] > 0.0).astype(np.int64)
+                    X_dir = Z_batch[rows]
+                    if str(config["direction_weighting"]) == "none":
+                        sample_weight = None
+                    else:
+                        neg_w, pos_w = dir_weights[h]
+                        sample_weight = np.where(y_dir == 1, pos_w, neg_w).astype(np.float32)
+                    if not dir_fitted[h]:
+                        direction_models[h].partial_fit(X_dir, y_dir, classes=np.array([0, 1], dtype=np.int64), sample_weight=sample_weight)
+                        dir_fitted[h] = True
+                    else:
+                        direction_models[h].partial_fit(X_dir, y_dir, sample_weight=sample_weight)
+                    dir_counts[h] += int(y_dir.shape[0])
+
+                rows = keep_pos[:, h]
+                if rows.any():
+                    y_up = np.sqrt(np.maximum(y_batch[rows, h], 0.0)).astype(np.float32)
+                    if not up_fitted[h]:
+                        mag_up_models[h].partial_fit(Z_batch[rows], y_up)
+                        up_fitted[h] = True
+                    else:
+                        mag_up_models[h].partial_fit(Z_batch[rows], y_up)
+                    up_counts[h] += int(y_up.shape[0])
+
+                rows = keep_neg[:, h]
+                if rows.any():
+                    y_down = np.sqrt(np.maximum(-y_batch[rows, h], 0.0)).astype(np.float32)
+                    if not down_fitted[h]:
+                        mag_down_models[h].partial_fit(Z_batch[rows], y_down)
+                        down_fitted[h] = True
+                    else:
+                        mag_down_models[h].partial_fit(Z_batch[rows], y_down)
+                    down_counts[h] += int(y_down.shape[0])
+
+    if not all(dir_fitted) or not all(up_fitted) or not all(down_fitted):
+        raise ValueError("Insufficient train rows for one or more target/horizon models")
+    print(
+        f"[linear-stage4-counts] alpha={alpha} dir_rows={dir_counts.tolist()} up_rows={up_counts.tolist()} down_rows={down_counts.tolist()}",
+        flush=True,
+    )
+    fit_summary = {
+        "alpha": float(alpha),
+        "penalty": str(config["penalty"]),
+        "l1_ratio": float(config["l1_ratio"]),
+        "epochs": int(config["epochs"]),
+        "batch_rows": int(config["batch_rows"]),
+        "dir_rows_per_horizon": dir_counts.tolist(),
+        "up_rows_per_horizon": up_counts.tolist(),
+        "down_rows_per_horizon": down_counts.tolist(),
+        "direction_weights_neg_pos": [(float(a), float(b)) for a, b in dir_weights],
+    }
+    return LinearSklearnTakerBundle(
+        schema=str(config["schema"]),
+        config=dict(config, alpha=float(alpha)),
+        horizons_ms=[int(x) for x in HORIZONS_MS],
+        direction_models=direction_models,
+        mag_up_models=mag_up_models,
+        mag_down_models=mag_down_models,
+        mag_floor=float(config["mag_floor"]),
+        fit_summary=fit_summary,
+    )
+
+
+def evaluate_stage4_bundle(
+    *,
+    bundle: LinearSklearnTakerBundle,
+    manifest: Dict[str, Any],
+    stats: Dict[str, np.ndarray],
+    device: torch.device,
+    split_name: str,
+    max_rows: int = 0,
+) -> Dict[str, Any]:
+    source = PreprocessedShardBatchSource(manifest, device=device, batch_rows=LINEAR_STAGE4_BATCH_ROWS, max_rows=max_rows)
+    model = LinearSklearnTorchWrapper(bundle).to(device)
+    metrics = summarize_metrics(
+        model,
+        source,
+        device,
+        stats,
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        primary_only=False,
+        epoch=0,
+        band_diag=BAND_DIAG,
+        split_name=split_name,
+    )
+    primary_value, primary_label = compute_primary_metric(metrics)
+    metrics["primary_metric_value"] = float(primary_value)
+    metrics["primary_metric_label"] = str(primary_label)
+    return metrics
+
+
+def _jsonable_metrics(metrics: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if metrics is None:
+        return None
+    def conv(v):
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, (np.floating, np.integer)):
+            return v.item()
+        if isinstance(v, dict):
+            return {str(k): conv(val) for k, val in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [conv(x) for x in v]
+        return v
+    return {str(k): conv(v) for k, v in metrics.items()}
+
+
+def run_stage4_training(
+    *,
+    linear_out_dir: Path,
+    extractor_name: str,
+    preprocess_name: str,
+    device: torch.device,
+) -> Dict[str, Any]:
+    stage3_payload = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name)
+    train_manifest = load_stage3_manifest(stage3_payload, LINEAR_STAGE4_TRAIN_SPLIT)
+    val_manifest = load_stage3_manifest(stage3_payload, "val")
+    test_manifest = load_stage3_manifest(stage3_payload, "test")
+    if train_manifest is None:
+        raise ValueError("Stage 4 requires a Stage 3 train_sample manifest")
+    if val_manifest is None:
+        raise ValueError("Stage 4 requires a Stage 3 val manifest")
+    try:
+        stats = load_linear_trim_stats(linear_out_dir)
+        trim_stats_source = str(Path(linear_out_dir) / "linear_signed_side_trim_stats_cache.npz")
+    except FileNotFoundError:
+        if not LINEAR_STAGE4_ALLOW_SAMPLE_TRIM_STATS:
+            raise
+        stats = compute_sample_trim_stats_from_manifest(train_manifest)
+        trim_stats_source = "train_sample_manifest_escape_hatch"
+
+    stage4_dir = Path(linear_out_dir) / "stage4_models" / extractor_name / preprocess_name / LINEAR_STAGE4_PREDICTOR
+    stage4_dir.mkdir(parents=True, exist_ok=True)
+    stage4_config = {
+        "schema": LINEAR_STAGE4_SCHEMA,
+        "extractor": extractor_name,
+        "preprocess_name": preprocess_name,
+        "predictor": LINEAR_STAGE4_PREDICTOR,
+        "alpha_grid": [float(a) for a in LINEAR_STAGE4_ALPHA_VALUES],
+        "penalty": LINEAR_STAGE4_PENALTY,
+        "l1_ratio": float(LINEAR_STAGE4_L1_RATIO),
+        "epochs": int(LINEAR_STAGE4_EPOCHS),
+        "batch_rows": int(LINEAR_STAGE4_BATCH_ROWS),
+        "random_state": int(LINEAR_STAGE4_RANDOM_SEED),
+        "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING,
+        "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING,
+        "mag_floor": float(LINEAR_STAGE4_MAG_FLOOR),
+    }
+
+    candidate_summaries = []
+    best_bundle = None
+    best_val_metrics = None
+    best_score = float("-inf")
+    best_alpha = None
+    for alpha in LINEAR_STAGE4_ALPHA_VALUES:
+        print(f"[linear-stage4-train] alpha={alpha}", flush=True)
+        bundle = train_stage4_candidate(train_manifest=train_manifest, stats=stats, alpha=float(alpha), config=stage4_config)
+        val_metrics = evaluate_stage4_bundle(
+            bundle=bundle,
+            manifest=val_manifest,
+            stats=stats,
+            device=device,
+            split_name="val",
+            max_rows=LINEAR_STAGE4_MAX_VAL_ROWS,
+        )
+        primary_value, primary_label = compute_primary_metric(val_metrics)
+        guard_passed = bool(val_metrics.get("primary_metric_guard_passed", True)) and math.isfinite(float(primary_value))
+        candidate_score = float(primary_value) if guard_passed else float("-inf")
+        print(f"[linear-stage4-val] alpha={alpha} primary={primary_value} guard={guard_passed}", flush=True)
+        candidate_summaries.append({
+            "alpha": float(alpha),
+            "primary_metric_label": str(primary_label),
+            "primary_metric_value": float(primary_value),
+            "guard_passed": bool(guard_passed),
+            "val_metrics": _jsonable_metrics(val_metrics),
+            "fit_summary": bundle.fit_summary,
+        })
+        if best_bundle is None or is_metric_improved(candidate_score, best_score, "max"):
+            best_bundle = bundle
+            best_val_metrics = val_metrics
+            best_score = candidate_score
+            best_alpha = float(alpha)
+            print(f"[linear-stage4-best] alpha={best_alpha} metric={best_score}", flush=True)
+
+    if best_bundle is None or best_val_metrics is None or best_alpha is None:
+        raise ValueError("Stage 4 did not produce any trainable candidates")
+    bundle_path = stage4_dir / "linear_stage4_best_model.pkl"
+    save_linear_sklearn_bundle(best_bundle, bundle_path)
+
+    test_metrics = None
+    if LINEAR_STAGE4_RUN_TEST and test_manifest is not None:
+        print("[linear-stage4-test] evaluating best bundle", flush=True)
+        test_metrics = evaluate_stage4_bundle(
+            bundle=best_bundle,
+            manifest=test_manifest,
+            stats=stats,
+            device=device,
+            split_name="test",
+            max_rows=LINEAR_STAGE4_MAX_TEST_ROWS,
+        )
+
+    payload = {
+        "stage": "stage4",
+        "status": "ok",
+        "schema": LINEAR_STAGE4_SCHEMA,
+        "stage4_config": stage4_config,
+        "extractor": extractor_name,
+        "preprocess_name": preprocess_name,
+        "stage3_payload_path": stage3_payload.get("payload_path"),
+        "trim_stats_cache": trim_stats_source,
+        "train_split": LINEAR_STAGE4_TRAIN_SPLIT,
+        "train_rows": int(manifest_n_rows(train_manifest)),
+        "best_alpha": float(best_alpha),
+        "best_model_path": str(bundle_path),
+        "best_primary_metric": {
+            "label": str(best_val_metrics.get("primary_metric_label", PRIMARY_METRIC)),
+            "value": float(best_val_metrics.get("primary_metric_value", best_score)),
+            "guard_passed": bool(best_val_metrics.get("primary_metric_guard_passed", True)),
+        },
+        "candidate_summaries": candidate_summaries,
+        "val_metrics": _jsonable_metrics(best_val_metrics),
+        "test_metrics": _jsonable_metrics(test_metrics),
+        "train_manifest": train_manifest.get("manifest_path"),
+        "val_manifest": val_manifest.get("manifest_path"),
+        "test_manifest": None if test_manifest is None else test_manifest.get("manifest_path"),
+    }
+    metrics_path = stage4_dir / "linear_stage4_metrics.json"
+    copy_path = Path(linear_out_dir) / "linear_stage4_metrics.json"
+    metrics_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8")
+    copy_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8")
+    print(f"[linear-stage4] wrote {metrics_path} and {copy_path}", flush=True)
+    return payload
+
 def run_stage2_extraction(
     *,
     linear_out_dir: Path,
@@ -1262,6 +1799,20 @@ def main() -> None:
             flush=True,
         )
         run_stage3_preprocessing(linear_out_dir=linear_out_dir, extractor_name=LINEAR_EXTRACTOR)
+        return
+    if LINEAR_STAGE == "stage4":
+        print(
+            f"[linear-config] stage=stage4 extractor={LINEAR_EXTRACTOR} "
+            f"preprocess={LINEAR_STAGE4_PREPROCESS_NAME} predictor={LINEAR_STAGE4_PREDICTOR} "
+            f"device={device} linear_out_dir={linear_out_dir}",
+            flush=True,
+        )
+        run_stage4_training(
+            linear_out_dir=linear_out_dir,
+            extractor_name=LINEAR_EXTRACTOR,
+            preprocess_name=LINEAR_STAGE4_PREPROCESS_NAME,
+            device=device,
+        )
         return
     if LINEAR_STAGE == "stage2":
         print(
@@ -1557,5 +2108,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
+    if LINEAR_STAGE in {"stage3", "stage4"}:
+        assert OUT_ROOT or LINEAR_OUT_DIR, "Set BYBIT_OUT_ROOT or BYBIT_LINEAR_OUT_DIR"
+    else:
+        assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
     main()

@@ -5,6 +5,7 @@ smoke-testing the linear pipeline against CMSSL's existing dataset/eval path.
 """
 
 import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -73,6 +74,89 @@ class LinearPreprocessBundle:
         if post_clip_abs > 0.0:
             Zn = np.clip(Zn, -post_clip_abs, post_clip_abs)
         return Zn.astype(np.float32, copy=False)
+
+
+@dataclass
+class LinearSklearnTakerBundle:
+    schema: str
+    config: Dict[str, Any]
+    horizons_ms: list[int]
+    direction_models: list[Any]
+    mag_up_models: list[Any]
+    mag_down_models: list[Any]
+    mag_floor: float
+    fit_summary: Dict[str, Any]
+
+    def predict_dict_np(self, Z: np.ndarray) -> Dict[str, np.ndarray]:
+        Z = np.asarray(Z, dtype=np.float32)
+        if Z.ndim != 2:
+            raise ValueError(f"Z must have shape [N, D_preprocessed], got {Z.shape}")
+        n_h = int(NUM_HORIZONS)
+        if len(self.direction_models) != n_h or len(self.mag_up_models) != n_h or len(self.mag_down_models) != n_h:
+            raise ValueError(
+                "LinearSklearnTakerBundle must contain one direction/up/down model per horizon; "
+                f"got {len(self.direction_models)}, {len(self.mag_up_models)}, {len(self.mag_down_models)}"
+            )
+
+        dir_cols = []
+        up_cols = []
+        down_cols = []
+        for h in range(n_h):
+            model = self.direction_models[h]
+            if hasattr(model, "decision_function"):
+                logit = model.decision_function(Z)
+            elif hasattr(model, "predict_proba"):
+                p = model.predict_proba(Z)[:, 1]
+                logit = safe_logit_np(p)
+            else:
+                raise ValueError(f"Direction model for horizon index {h} has no decision_function or predict_proba")
+            logit = np.asarray(logit, dtype=np.float32).reshape(-1)
+            if logit.shape[0] != Z.shape[0]:
+                raise ValueError(f"Direction model horizon {h} returned shape {logit.shape}, expected [{Z.shape[0]}]")
+            dir_cols.append(logit)
+
+            up = np.asarray(self.mag_up_models[h].predict(Z), dtype=np.float32).reshape(-1)
+            down = np.asarray(self.mag_down_models[h].predict(Z), dtype=np.float32).reshape(-1)
+            if up.shape[0] != Z.shape[0] or down.shape[0] != Z.shape[0]:
+                raise ValueError(f"Magnitude model horizon {h} returned invalid row count")
+            up_cols.append(np.maximum(up, float(self.mag_floor)).astype(np.float32, copy=False))
+            down_cols.append(np.maximum(down, float(self.mag_floor)).astype(np.float32, copy=False))
+
+        return {
+            "dir_logits": np.stack(dir_cols, axis=1).astype(np.float32, copy=False),
+            "mag_up_sqrt": np.stack(up_cols, axis=1).astype(np.float32, copy=False),
+            "mag_down_sqrt": np.stack(down_cols, axis=1).astype(np.float32, copy=False),
+        }
+
+
+class LinearSklearnTorchWrapper(nn.Module):
+    def __init__(self, bundle: LinearSklearnTakerBundle):
+        super().__init__()
+        self.bundle = bundle
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        device = x.device
+        Z = x.detach().cpu().numpy().astype(np.float32, copy=False)
+        pred = self.bundle.predict_dict_np(Z)
+        return {
+            k: torch.as_tensor(v, dtype=torch.float32, device=device)
+            for k, v in pred.items()
+        }
+
+
+def save_linear_sklearn_bundle(bundle: LinearSklearnTakerBundle, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_linear_sklearn_bundle(path: Path) -> LinearSklearnTakerBundle:
+    with Path(path).open("rb") as f:
+        obj = pickle.load(f)
+    if not isinstance(obj, LinearSklearnTakerBundle):
+        raise ValueError(f"Expected LinearSklearnTakerBundle in {path}, got {type(obj).__name__}")
+    return obj
 
 
 def save_linear_preprocess_bundle(bundle: LinearPreprocessBundle, path: Path) -> None:
