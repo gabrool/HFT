@@ -10,15 +10,12 @@ import numpy as np
 import torch
 
 from CMSSL17 import (  # type: ignore
-    LOOKBACK, WINDOW_MS, HORIZONS_MS, NUM_HORIZONS, HORIZON_WEIGHTS,
+    LOOKBACK, WINDOW_MS, HORIZONS_MS,
     BATCH_SIZE,
     PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS, PRIMARY_DIR_BAL_ACC_GUARD,
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION,
     TARGET_TRANSFORM, TARGET_TASK, LABEL_TRIM_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
-    FEATURE_SCHEMA, FEATURE_TRANSFORM, FEATURE_TRANSFORM_POLICY,
-    FEATURE_TRANSFORM_WARMUP_ROWS,
-    AUX_TRANSFORM, AUX_SCHEMA,
     build_dataset_from_split,
     compute_primary_metric,
 )
@@ -36,7 +33,6 @@ from CMSSL17_offline import (  # type: ignore
     cache_matches,
     save_stats_cache,
     CPUWindowBatchSource,
-    MultiWeekTrainBatchSource,
     make_train_band_eval_source,
     summarize_metrics,
     print_band_metrics_summary,
@@ -225,11 +221,15 @@ def main() -> None:
         flush=True,
     )
 
+    train_keep_pos, train_keep_neg, train_keep_signed = build_signed_side_trim_masks_from_stats_np(y_train, stats)
     prior_info = build_constant_priors_from_train_labels(
         y_train=y_train,
         stats=stats,
         mag_up_sqrt_prior=mag_pos_init_sqrt,
         mag_down_sqrt_prior=mag_neg_init_sqrt,
+        keep_pos=train_keep_pos,
+        keep_neg=train_keep_neg,
+        keep_signed=train_keep_signed,
     )
     print(
         f"[linear-prior] p_up={prior_info['p_up_prior'].tolist()} "

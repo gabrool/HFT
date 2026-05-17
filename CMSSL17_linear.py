@@ -4,9 +4,7 @@ This module intentionally contains only lightweight constant-prior utilities for
 smoke-testing the linear pipeline against CMSSL's existing dataset/eval path.
 """
 
-import math
-from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -71,30 +69,47 @@ def build_constant_priors_from_train_labels(
     stats: Dict[str, np.ndarray],
     mag_up_sqrt_prior: np.ndarray,
     mag_down_sqrt_prior: np.ndarray,
+    keep_pos: Optional[np.ndarray] = None,
+    keep_neg: Optional[np.ndarray] = None,
+    keep_signed: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     y = np.asarray(y_train, dtype=np.float32)
     if y.ndim != 2 or y.shape[1] != NUM_HORIZONS:
         raise ValueError(f"y_train must have shape [N, {NUM_HORIZONS}], got {y.shape}")
 
-    pos_lo = np.asarray(stats["pos_lo_raw_bps"], dtype=np.float32).reshape(1, -1)
-    pos_hi = np.asarray(stats["pos_hi_raw_bps"], dtype=np.float32).reshape(1, -1)
-    neg_lo = np.asarray(stats["neg_lo_abs_bps"], dtype=np.float32).reshape(1, -1)
-    neg_hi = np.asarray(stats["neg_hi_abs_bps"], dtype=np.float32).reshape(1, -1)
-    for name, arr in (
-        ("pos_lo_raw_bps", pos_lo),
-        ("pos_hi_raw_bps", pos_hi),
-        ("neg_lo_abs_bps", neg_lo),
-        ("neg_hi_abs_bps", neg_hi),
-    ):
-        if arr.shape != (1, NUM_HORIZONS):
-            raise ValueError(f"stats[{name!r}] must have shape [{NUM_HORIZONS}], got {arr.reshape(-1).shape}")
+    if keep_pos is None or keep_neg is None or keep_signed is None:
+        pos_lo = np.asarray(stats["pos_lo_raw_bps"], dtype=np.float32).reshape(1, -1)
+        pos_hi = np.asarray(stats["pos_hi_raw_bps"], dtype=np.float32).reshape(1, -1)
+        neg_lo = np.asarray(stats["neg_lo_abs_bps"], dtype=np.float32).reshape(1, -1)
+        neg_hi = np.asarray(stats["neg_hi_abs_bps"], dtype=np.float32).reshape(1, -1)
+        for name, arr in (
+            ("pos_lo_raw_bps", pos_lo),
+            ("pos_hi_raw_bps", pos_hi),
+            ("neg_lo_abs_bps", neg_lo),
+            ("neg_hi_abs_bps", neg_hi),
+        ):
+            if arr.shape != (1, NUM_HORIZONS):
+                raise ValueError(f"stats[{name!r}] must have shape [{NUM_HORIZONS}], got {arr.reshape(-1).shape}")
 
-    pos = y > 0.0
-    neg = y < 0.0
-    neg_mag = (-y).clip(min=0.0)
-    keep_pos = pos & (y >= pos_lo) & (y <= pos_hi)
-    keep_neg = neg & (neg_mag >= neg_lo) & (neg_mag <= neg_hi)
-    keep_signed = keep_pos | keep_neg
+        pos = y > 0.0
+        neg = y < 0.0
+        neg_mag = (-y).clip(min=0.0)
+        keep_pos = pos & (y >= pos_lo) & (y <= pos_hi)
+        keep_neg = neg & (neg_mag >= neg_lo) & (neg_mag <= neg_hi)
+        keep_signed = keep_pos | keep_neg
+    else:
+        keep_pos = np.asarray(keep_pos, dtype=bool)
+        keep_neg = np.asarray(keep_neg, dtype=bool)
+        keep_signed = np.asarray(keep_signed, dtype=bool)
+        for name, arr in (
+            ("keep_pos", keep_pos),
+            ("keep_neg", keep_neg),
+            ("keep_signed", keep_signed),
+        ):
+            if arr.shape != y.shape:
+                raise ValueError(f"{name} must have shape {y.shape}, got {arr.shape}")
+        if not np.array_equal(keep_signed, keep_pos | keep_neg):
+            raise ValueError("keep_signed must equal keep_pos | keep_neg")
 
     signed_counts = keep_signed.sum(axis=0).astype(np.float64)
     if np.any(signed_counts <= 0.0):
