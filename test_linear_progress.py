@@ -114,17 +114,18 @@ def test_stage4_training_uses_progress_wrapper(monkeypatch):
         return mask, mask, mask
 
     monkeypatch.setattr(linear_offline, "progress_iter_rows", fake_progress)
-    monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_streaming", lambda *args, **kwargs: [(1.0, 1.0) for _ in range(n_h)])
+    monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0) for _ in range(n_h)])
     monkeypatch.setattr(linear_offline, "initialize_stage4_candidate_bundle", lambda **kwargs: FakeBundle())
-    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train", fake_iter)
+    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train_plan", fake_iter)
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: 2)
     monkeypatch.setattr(linear_offline, "build_signed_side_trim_masks_from_stats_np", fake_masks)
     monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
     monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
 
-    bundles = linear_offline.train_stage4_candidates_streaming(
+    bundles = linear_offline.train_stage4_candidates_streaming_from_plan(
         extractor=object(),
         preprocess_bundle=object(),
-        ds_train_list=[FakeDataset()],
+        plan={"train_split_entries": [{}], "train_week_keys": ["w0"]},
         stats={},
         alpha_values=[0.1],
         config={

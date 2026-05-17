@@ -224,3 +224,28 @@ def test_train_plan_iterator_releases_each_week(monkeypatch):
     assert rows == 4
     assert live["max"] <= 1
     assert live["count"] == 0
+
+
+def test_no_legacy_eager_or_manifest_pipeline_symbols():
+    import linear_offline
+
+    forbidden = [
+        "build_linear_cmssl_splits_from_out_root",
+        "transform_dataset_to_npz_shards",
+        "transform_array_to_npz_shards",
+        "load_stage3_manifest",
+        "iter_manifest_numpy_batches",
+        "compute_sample_trim_stats_from_manifest",
+        "_fit_preprocess_from_stream",
+        "train_stage4_candidates_streaming",
+        "iter_preprocessed_batches_from_train",
+    ]
+
+    for name in forbidden:
+        assert not hasattr(linear_offline, name), name
+
+
+def test_no_ds_train_list_in_linear_offline_source():
+    text = Path("linear_offline.py").read_text(encoding="utf-8")
+    assert "ds_train_list" not in text
+    assert "train_sample manifest" not in text.lower()

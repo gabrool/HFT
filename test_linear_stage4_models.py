@@ -28,55 +28,6 @@ def make_synthetic(n=240, d=5):
     return Z, y.astype(np.float32), np.arange(n, dtype=np.int64)
 
 
-def write_fake_stage3_manifest(tmp_path: Path, split: str, Z: np.ndarray, y: np.ndarray, positions: np.ndarray, shard_rows: int = 37):
-    out_dir = tmp_path / "stage3_preprocess" / "raw_linear" / "default"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    shards = []
-    for shard_idx, start in enumerate(range(0, Z.shape[0], shard_rows)):
-        end = min(Z.shape[0], start + shard_rows)
-        path = out_dir / f"{split}_preprocessed_shard_{shard_idx:05d}.npz"
-        np.savez_compressed(path, Z=Z[start:end].astype(np.float32), y=y[start:end].astype(np.float32), positions=positions[start:end])
-        shards.append({
-            "shard": shard_idx,
-            "path": str(path),
-            "rows": int(end - start),
-            "z_shape": [int(end - start), int(Z.shape[1])],
-            "y_shape": [int(end - start), int(y.shape[1])],
-        })
-    manifest = {
-        "split": split,
-        "stage": "stage3",
-        "schema": "linear_preprocess_stage3_v1",
-        "decision_stride_rows": 5,
-        "decision_offset_rows": 0,
-        "decision_row_policy": "linear_every_n_rows_v1",
-        "n_rows": int(Z.shape[0]),
-        "kept_dim": int(Z.shape[1]),
-        "summary": {"shape": [int(Z.shape[0]), int(Z.shape[1])], "finite_frac": 1.0},
-        "shards": shards,
-    }
-    manifest_path = out_dir / f"{split}_preprocessed_manifest.json"
-    manifest["manifest_path"] = str(manifest_path)
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    return manifest
-
-
-def write_fake_stage3_payload(tmp_path: Path, manifests):
-    out_dir = tmp_path / "stage3_preprocess" / "raw_linear" / "default"
-    payload = {
-        "stage": "stage3",
-        "status": "ok",
-        "schema": "linear_preprocess_stage3_v1",
-        "decision_stride_rows": 5,
-        "decision_offset_rows": 0,
-        "decision_row_policy": "linear_every_n_rows_v1",
-        "extractor": "raw_linear",
-        "manifests": manifests,
-    }
-    (out_dir / "linear_stage3_preprocess_metrics.json").write_text(json.dumps(payload, indent=2))
-    return payload
-
-
 def write_trim_stats(tmp_path: Path, y_train: np.ndarray):
     from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
 
@@ -104,7 +55,7 @@ def configure_stage4(monkeypatch, linear_offline):
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_DIRECTION_WEIGHTING", "tempered")
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING", "none")
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_RUN_TEST", True)
-    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_TRAIN_SPLIT", "train_sample")
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_TRAIN_SPLIT", "train_full")
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAX_VAL_ROWS", 0)
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAX_TEST_ROWS", 0)
 
@@ -140,15 +91,26 @@ def test_bundle_prediction_schema():
     assert (pred["mag_down_sqrt"] > 0).all()
 
 
-def test_train_stage4_candidate_fits_all_models(tmp_path, monkeypatch):
+def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, monkeypatch):
     pytest.importorskip("sklearn")
     import linear_offline
     from CMSSL17 import NUM_HORIZONS
 
     configure_stage4(monkeypatch, linear_offline)
-    Z, y, pos = make_synthetic()
-    train_manifest = write_fake_stage3_manifest(tmp_path, "train_sample", Z, y, pos)
+    Z, y, _pos = make_synthetic()
     stats = write_trim_stats(tmp_path, y)
+
+    def fake_iter(**kwargs):
+        del kwargs
+        yield Z, y, None
+
+    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train_plan", fake_iter)
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: int(y.shape[0]))
+    monkeypatch.setattr(
+        linear_offline,
+        "compute_global_direction_weights_from_train_labels_plan",
+        lambda **kwargs: [(1.0, 1.0) for _ in range(NUM_HORIZONS)],
+    )
     config = {
         "schema": linear_offline.LINEAR_STAGE4_SCHEMA,
         "penalty": "l2",
@@ -159,88 +121,18 @@ def test_train_stage4_candidate_fits_all_models(tmp_path, monkeypatch):
         "direction_weighting": "tempered",
         "mag_floor": 1e-4,
     }
-    bundle = linear_offline.train_stage4_candidate(train_manifest=train_manifest, stats=stats, alpha=1e-4, config=config)
+    bundles = linear_offline.train_stage4_candidates_streaming_from_plan(
+        extractor=object(),
+        preprocess_bundle=object(),
+        plan={"train_split_entries": [{}], "train_week_keys": ["w0"]},
+        stats=stats,
+        alpha_values=[1e-4],
+        config=config,
+    )
+    bundle = bundles[0]
     assert len(bundle.direction_models) == NUM_HORIZONS
     assert len(bundle.mag_up_models) == NUM_HORIZONS
     assert len(bundle.mag_down_models) == NUM_HORIZONS
-
-
-def test_stage4_end_to_end_fake_run(tmp_path, monkeypatch):
-    pytest.importorskip("sklearn")
-    import torch
-    if not hasattr(torch, "device"):
-        pytest.skip("real torch is not installed")
-    import linear_offline
-
-    configure_stage4(monkeypatch, linear_offline)
-    Z_train, y_train, pos_train = make_synthetic(n=240)
-    Z_val, y_val, pos_val = make_synthetic(n=120)
-    Z_test, y_test, pos_test = make_synthetic(n=120)
-    manifests = {
-        "train_sample": write_fake_stage3_manifest(tmp_path, "train_sample", Z_train, y_train, pos_train),
-        "val": write_fake_stage3_manifest(tmp_path, "val", Z_val, y_val, pos_val),
-        "test": write_fake_stage3_manifest(tmp_path, "test", Z_test, y_test, pos_test),
-    }
-    write_fake_stage3_payload(tmp_path, manifests)
-    write_trim_stats(tmp_path, y_train)
-
-    payload = linear_offline.legacy_run_stage4_training(
-        linear_out_dir=tmp_path,
-        extractor_name="raw_linear",
-        preprocess_name="default",
-        device=torch.device("cpu"),
-    )
-    assert payload["stage"] == "stage4"
-    assert payload["train_split"] == "train_sample"
-    assert Path(payload["best_model_path"]).exists()
-    assert "val_metrics" in payload
-    assert (tmp_path / "linear_stage4_metrics.json").exists()
-
-
-def test_stage4_training_uses_train_manifest_not_validation(tmp_path, monkeypatch):
-    pytest.importorskip("sklearn")
-    import torch
-    if not hasattr(torch, "device"):
-        pytest.skip("real torch is not installed")
-    import linear_offline
-
-    configure_stage4(monkeypatch, linear_offline)
-    Z_train, y_train, pos_train = make_synthetic(n=240)
-    Z_val, y_val, pos_val = make_synthetic(n=120)
-    manifests = {
-        "train_sample": write_fake_stage3_manifest(tmp_path, "train_sample", Z_train, y_train, pos_train),
-        "val": write_fake_stage3_manifest(tmp_path, "val", Z_val, -y_val, pos_val),
-        "test": None,
-    }
-    write_fake_stage3_payload(tmp_path, manifests)
-    write_trim_stats(tmp_path, y_train)
-
-    seen = {}
-    real_train = linear_offline.train_stage4_candidate
-
-    def wrapped_train_stage4_candidate(*, train_manifest, stats, alpha, config):
-        seen["path"] = train_manifest.get("manifest_path")
-        return real_train(train_manifest=train_manifest, stats=stats, alpha=alpha, config=config)
-
-    monkeypatch.setattr(linear_offline, "train_stage4_candidate", wrapped_train_stage4_candidate)
-    linear_offline.legacy_run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=torch.device("cpu"))
-    assert seen["path"].endswith("train_sample_preprocessed_manifest.json")
-
-
-def test_stage4_missing_trim_stats_fails(tmp_path, monkeypatch):
-    import linear_offline
-
-    configure_stage4(monkeypatch, linear_offline)
-    Z_train, y_train, pos_train = make_synthetic(n=240)
-    Z_val, y_val, pos_val = make_synthetic(n=120)
-    manifests = {
-        "train_sample": write_fake_stage3_manifest(tmp_path, "train_sample", Z_train, y_train, pos_train),
-        "val": write_fake_stage3_manifest(tmp_path, "val", Z_val, y_val, pos_val),
-        "test": None,
-    }
-    write_fake_stage3_payload(tmp_path, manifests)
-    with pytest.raises(FileNotFoundError, match="Missing linear trim stats cache"):
-        linear_offline.legacy_run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=object())
 
 
 def test_load_linear_trim_stats_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
@@ -324,31 +216,3 @@ def test_load_linear_trim_stats_rejects_decision_row_policy_mismatch(tmp_path, m
 
     with pytest.raises(ValueError, match="Trim stats cache decision_row_policy mismatch"):
         linear_offline.load_linear_trim_stats(tmp_path)
-
-
-def test_stage4_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
-    import linear_offline
-
-    configure_stage4(monkeypatch, linear_offline)
-    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
-    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
-    Z_train, y_train, pos_train = make_synthetic(n=240)
-    Z_val, y_val, pos_val = make_synthetic(n=120)
-    train_manifest = write_fake_stage3_manifest(tmp_path, "train_sample", Z_train, y_train, pos_train)
-    train_manifest["decision_stride_rows"] = 1
-    Path(train_manifest["manifest_path"]).write_text(json.dumps(train_manifest, indent=2))
-    manifests = {
-        "train_sample": train_manifest,
-        "val": write_fake_stage3_manifest(tmp_path, "val", Z_val, y_val, pos_val),
-        "test": None,
-    }
-    write_fake_stage3_payload(tmp_path, manifests)
-    write_trim_stats(tmp_path, y_train)
-
-    with pytest.raises(ValueError, match="decision-row mismatch"):
-        linear_offline.legacy_run_stage4_training(
-            linear_out_dir=tmp_path,
-            extractor_name="raw_linear",
-            preprocess_name="default",
-            device=object(),
-        )
