@@ -50,44 +50,22 @@ def make_synthetic(n=240, d=5):
     return Z, y.astype(np.float32), np.arange(n, dtype=np.int64)
 
 
-def write_stage3_manifest(tmp_path: Path, extractor: str, split: str, Z: np.ndarray, y: np.ndarray, positions: np.ndarray):
+def write_stage3_payload(tmp_path: Path, extractor: str, audit_summary=None):
     out_dir = tmp_path / "stage3_preprocess" / extractor / "default"
     out_dir.mkdir(parents=True, exist_ok=True)
-    shards = []
-    for shard_idx, start in enumerate(range(0, Z.shape[0], 41)):
-        end = min(Z.shape[0], start + 41)
-        path = out_dir / f"{split}_preprocessed_shard_{shard_idx:05d}.npz"
-        np.savez_compressed(path, Z=Z[start:end], y=y[start:end], positions=positions[start:end])
-        shards.append({"shard": shard_idx, "path": str(path), "rows": int(end - start)})
-    manifest = {
-        "split": split,
-        "stage": "stage3",
-        "schema": "linear_preprocess_stage3_v1",
-        "decision_stride_rows": 5,
-        "decision_offset_rows": 0,
-        "decision_row_policy": "linear_every_n_rows_v1",
-        "n_rows": int(Z.shape[0]),
-        "kept_dim": int(Z.shape[1]),
-        "summary": {"shape": [int(Z.shape[0]), int(Z.shape[1])], "finite_frac": 1.0},
-        "shards": shards,
-    }
-    manifest_path = out_dir / f"{split}_preprocessed_manifest.json"
-    manifest["manifest_path"] = str(manifest_path)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return manifest
-
-
-def write_stage3_payload(tmp_path: Path, extractor: str, manifests, audit_summary=None):
-    out_dir = tmp_path / "stage3_preprocess" / extractor / "default"
+    bundle_path = out_dir / "linear_preprocess_bundle.npz"
+    bundle_path.write_bytes(b"bundle")
     payload = {
         "stage": "stage3",
         "status": "ok",
+        "streaming_features": True,
         "decision_stride_rows": 5,
         "decision_offset_rows": 0,
         "decision_row_policy": "linear_every_n_rows_v1",
         "extractor": extractor,
-        "manifests": manifests,
+        "preprocess_bundle_path": str(bundle_path),
         "audit_summary": audit_summary,
+        "manifests": {},
     }
     (out_dir / "linear_stage3_preprocess_metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
@@ -137,7 +115,7 @@ def write_stage4_payload_and_bundle(tmp_path: Path, extractor: str):
         "decision_row_policy": "linear_every_n_rows_v1",
         "extractor": extractor,
         "preprocess_name": "default",
-        "train_split": "train_sample",
+        "train_split": "train_full",
         "train_rows": 240,
         "best_alpha": 1e-4,
         "best_model_path": str(bundle_path),
@@ -150,16 +128,28 @@ def write_stage4_payload_and_bundle(tmp_path: Path, extractor: str):
 
 
 def prepare_extractor(tmp_path: Path, extractor: str):
-    Z_train, y_train, pos_train = make_synthetic(n=240)
-    Z_val, y_val, pos_val = make_synthetic(n=120)
-    manifests = {
-        "train_sample": write_stage3_manifest(tmp_path, extractor, "train_sample", Z_train, y_train, pos_train),
-        "val": write_stage3_manifest(tmp_path, extractor, "val", Z_val, y_val, pos_val),
-        "test": None,
-    }
-    write_stage3_payload(tmp_path, extractor, manifests)
+    _Z_train, y_train, _pos_train = make_synthetic(n=240)
+    write_stage3_payload(tmp_path, extractor)
     write_stage4_payload_and_bundle(tmp_path, extractor)
     return y_train
+
+
+class FakePreprocessBundle:
+    kept_dim = 5
+
+    def transform(self, Z):
+        return Z.astype(np.float32, copy=False)
+
+
+class FakeValDataset:
+    def __init__(self, n=120, d=5):
+        self.Z, self.y, self.positions = make_synthetic(n, d)
+
+    def __len__(self):
+        return int(self.y.shape[0])
+
+    def close(self):
+        pass
 
 
 def configure_stage5(monkeypatch, linear_offline, *, save_predictions=False, strict=False):
@@ -175,6 +165,19 @@ def configure_stage5(monkeypatch, linear_offline, *, save_predictions=False, str
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE5_SAVE_PREDICTIONS", save_predictions)
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE5_PREDICTION_MAX_ROWS", 20)
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE5_BASELINE_METRICS_JSON", "")
+    monkeypatch.setattr(linear_offline, "OUT_ROOT", "/tmp/fake-out-root")
+    monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda out_root: {"train_split_entries": [{}], "train_week_keys": ["w0"], "has_cmssl_test": False})
+    monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}) if kwargs["extractor_name"] != "missing" else (_ for _ in ()).throw(FileNotFoundError("missing")))
+    monkeypatch.setattr(linear_offline, "load_linear_preprocess_bundle", lambda path: FakePreprocessBundle())
+    monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: FakeValDataset())
+
+    def fake_iter_dataset(**kwargs):
+        ds = kwargs["ds"]
+        max_rows = int(kwargs.get("max_rows", 0) or 0)
+        n = len(ds) if max_rows <= 0 else min(len(ds), max_rows)
+        yield ds.Z[:n], ds.y[:n], ds.positions[:n]
+
+    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_dataset", fake_iter_dataset)
 
 
 def test_stage5_comparison_discovers_multiple_extractors(tmp_path, monkeypatch):
@@ -266,7 +269,7 @@ def test_stage5_prediction_dump(tmp_path, monkeypatch):
         predictor="sgd_l2_huber",
         device=object(),
     )
-    dump_path = tmp_path / "stage5_comparison" / "default" / "sgd_l2_huber" / "stage5_diagnostics" / "raw_linear" / "val_predictions.npz"
+    dump_path = tmp_path / "stage5_comparison" / "default" / "sgd_l2_huber" / "diagnostics" / "raw_linear" / "val_predictions.npz"
     assert dump_path.exists()
     with np.load(dump_path) as arr:
         assert set(arr.files) >= {"positions", "y", "dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "edge_bps"}
@@ -310,14 +313,8 @@ def test_stage5_comparison_row_includes_stage3_audit_fields(tmp_path, monkeypatc
     import linear_offline
 
     configure_stage5(monkeypatch, linear_offline)
-    Z_train, y_train, pos_train = make_synthetic()
-    Z_val, y_val, pos_val = make_synthetic(120, 5)
+    _Z_train, y_train, _pos_train = make_synthetic()
     extractor = "raw_linear"
-    manifests = {
-        "train_sample": write_stage3_manifest(tmp_path, extractor, "train_sample", Z_train, y_train, pos_train),
-        "val": write_stage3_manifest(tmp_path, extractor, "val", Z_val, y_val, pos_val),
-        "test": None,
-    }
     audit_summary = {
         "stage": "stage3",
         "schema": "linear_preprocess_audit_v1",
@@ -339,7 +336,7 @@ def test_stage5_comparison_row_includes_stage3_audit_fields(tmp_path, monkeypatc
             },
         },
     }
-    write_stage3_payload(tmp_path, extractor, manifests, audit_summary=audit_summary)
+    write_stage3_payload(tmp_path, extractor, audit_summary=audit_summary)
     write_stage4_payload_and_bundle(tmp_path, extractor)
     write_trim_stats(tmp_path, y_train)
 
