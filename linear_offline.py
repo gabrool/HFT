@@ -839,6 +839,8 @@ class DatasetPositionsBatchSource:
         )
 
 
+ABS_SAMPLE_MAX = 2_000_000
+
 def _empty_streaming_stats() -> Dict[str, Any]:
     return {
         "total_rows": 0,
