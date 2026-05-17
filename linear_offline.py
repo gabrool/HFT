@@ -749,11 +749,6 @@ def collect_windows_for_positions(
         y_parts.append(np.stack(ys, axis=0).astype(np.float32, copy=False))
     X = np.concatenate(x_parts, axis=0).astype(np.float32, copy=False)
     y = np.concatenate(y_parts, axis=0).astype(np.float32, copy=False)
-    print(
-        f"[linear-extract-collect] split={split_name} rows={X.shape[0]} "
-        f"X_shape={list(X.shape)} y_shape={list(y.shape)}",
-        flush=True,
-    )
     return X, y
 
 
