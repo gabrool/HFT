@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Stage 1 linear offline entrypoint using CMSSL-compatible eval machinery."""
+"""Linear offline entrypoint using CMSSL-compatible eval machinery."""
 
 import json
 import os
+import pickle
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -46,23 +48,59 @@ from CMSSL17_offline import (  # type: ignore
 from CMSSL17_linear import (  # type: ignore
     LINEAR_CHECKPOINT_SCHEMA,
     LINEAR_MODEL_ARCH_SCHEMA,
+    LINEAR_EXTRACTOR_SCHEMA,
     LinearConstantPriorModel,
     build_constant_priors_from_train_labels,
     linear_model_summary,
+    build_linear_extractor_from_config,
 )
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
+
+
+def _env_bool(name: str, default: int = 0) -> bool:
+    return int(os.environ.get(name, str(int(default)))) == 1
+
+
+def _env_int_list(name: str, default: str) -> list[int]:
+    raw = os.environ.get(name, default).strip()
+    if not raw:
+        return []
+    return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
 
 OUT_ROOT = os.environ.get("BYBIT_OUT_ROOT", "").strip()
 LINEAR_OUT_DIR = os.environ.get("BYBIT_LINEAR_OUT_DIR", "").strip()
 LINEAR_STAGE = os.environ.get("BYBIT_LINEAR_STAGE", "stage1").strip().lower()
 LINEAR_DEVICE = os.environ.get("BYBIT_LINEAR_DEVICE", "cpu").strip().lower()
-LINEAR_EVAL_BATCH_SIZE = int(os.environ.get("BYBIT_LINEAR_BATCH_SIZE", str(BATCH_SIZE)))
-LINEAR_RUN_TEST = int(os.environ.get("BYBIT_LINEAR_RUN_TEST", "1")) == 1
+LINEAR_EVAL_BATCH_SIZE = _env_int("BYBIT_LINEAR_BATCH_SIZE", BATCH_SIZE)
+LINEAR_RUN_TEST = _env_bool("BYBIT_LINEAR_RUN_TEST", 1)
+LINEAR_STAGE2_RUN_PRIOR_EVAL = _env_bool("BYBIT_LINEAR_STAGE2_RUN_PRIOR_EVAL", 1)
+
+LINEAR_EXTRACTOR = os.environ.get("BYBIT_LINEAR_EXTRACTOR", "raw_linear").strip().lower()
+LINEAR_EXTRACTOR_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_EXTRACTOR_FIT_MAX_ROWS", 200000)
+LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT = _env_int("BYBIT_LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT", 0)
+LINEAR_EXTRACT_BATCH_ROWS = _env_int("BYBIT_LINEAR_EXTRACT_BATCH_ROWS", 8192)
+LINEAR_SAVE_TRANSFORMS = _env_bool("BYBIT_LINEAR_SAVE_TRANSFORMS", 1)
+LINEAR_EXTRACTOR_N_JOBS = _env_int("BYBIT_LINEAR_EXTRACTOR_N_JOBS", 1)
+LINEAR_RANDOM_SEED = _env_int("BYBIT_LINEAR_RANDOM_SEED", 17)
+
+RAW_LINEAR_MODE = os.environ.get("BYBIT_RAW_LINEAR_MODE", "lag_bank_stats").strip().lower()
+RAW_LINEAR_LAGS = _env_int_list("BYBIT_RAW_LINEAR_LAGS", "1,2,5,10,20,50")
+RAW_LINEAR_WINDOWS = _env_int_list("BYBIT_RAW_LINEAR_WINDOWS", "5,10,20,50")
+RAW_LINEAR_INCLUDE_STD = _env_bool("BYBIT_RAW_LINEAR_INCLUDE_STD", 1)
+RAW_LINEAR_INCLUDE_SLOPE = _env_bool("BYBIT_RAW_LINEAR_INCLUDE_SLOPE", 0)
+
+LINEAR_NUM_KERNELS = _env_int("BYBIT_LINEAR_NUM_KERNELS", 10000)
+LINEAR_HYDRA_N_KERNELS = _env_int("BYBIT_LINEAR_HYDRA_N_KERNELS", 8)
+LINEAR_HYDRA_N_GROUPS = _env_int("BYBIT_LINEAR_HYDRA_N_GROUPS", 64)
 
 
 def _resolve_device() -> torch.device:
-    if LINEAR_STAGE != "stage1":
-        raise ValueError(f"BYBIT_LINEAR_STAGE must be 'stage1' for this entrypoint, got {LINEAR_STAGE!r}")
+    if LINEAR_STAGE not in {"stage1", "stage2"}:
+        raise ValueError(f"BYBIT_LINEAR_STAGE must be 'stage1' or 'stage2', got {LINEAR_STAGE!r}")
     if LINEAR_DEVICE not in {"cpu", "cuda", "auto"}:
         raise ValueError("BYBIT_LINEAR_DEVICE must be one of: cpu, cuda, auto")
     if LINEAR_EVAL_BATCH_SIZE <= 0:
@@ -140,16 +178,275 @@ def _print_primary(tag: str, metrics: Dict[str, Any], primary_metric_value: floa
     )
 
 
+
+def _build_extractor_config() -> Dict[str, Any]:
+    return {
+        "extractor": LINEAR_EXTRACTOR,
+        "raw_mode": RAW_LINEAR_MODE,
+        "raw_lags": [int(x) for x in RAW_LINEAR_LAGS],
+        "raw_windows": [int(x) for x in RAW_LINEAR_WINDOWS],
+        "raw_include_std": bool(RAW_LINEAR_INCLUDE_STD),
+        "raw_include_slope": bool(RAW_LINEAR_INCLUDE_SLOPE),
+        "n_kernels": int(LINEAR_NUM_KERNELS),
+        "hydra_n_kernels": int(LINEAR_HYDRA_N_KERNELS),
+        "n_groups": int(LINEAR_HYDRA_N_GROUPS),
+        "n_jobs": int(LINEAR_EXTRACTOR_N_JOBS),
+        "random_state": int(LINEAR_RANDOM_SEED),
+    }
+
+
+def _dataset_positions(n_rows: int, max_rows: int) -> np.ndarray:
+    if n_rows <= 0:
+        raise ValueError("Cannot collect windows from empty dataset")
+    if max_rows <= 0 or max_rows >= n_rows:
+        return np.arange(n_rows, dtype=np.int64)
+    return np.linspace(0, n_rows - 1, int(max_rows), dtype=np.int64)
+
+
+def collect_windows_from_dataset(
+    ds: Any,
+    *,
+    max_rows: int,
+    batch_rows: int,
+    split_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    positions = _dataset_positions(len(ds), int(max_rows))
+    batch_rows = max(1, int(batch_rows))
+    x_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    for start in range(0, int(positions.shape[0]), batch_rows):
+        batch_pos = positions[start : start + batch_rows]
+        xs: list[np.ndarray] = []
+        ys: list[np.ndarray] = []
+        for pos in batch_pos:
+            x_i, y_i = ds[int(pos)]
+            if hasattr(x_i, "detach"):
+                x_i = x_i.detach().cpu().numpy()
+            if hasattr(y_i, "detach"):
+                y_i = y_i.detach().cpu().numpy()
+            xs.append(np.asarray(x_i, dtype=np.float32))
+            ys.append(np.asarray(y_i, dtype=np.float32))
+        x_parts.append(np.stack(xs, axis=0).astype(np.float32, copy=False))
+        y_parts.append(np.stack(ys, axis=0).astype(np.float32, copy=False))
+    X = np.concatenate(x_parts, axis=0).astype(np.float32, copy=False)
+    y = np.concatenate(y_parts, axis=0).astype(np.float32, copy=False)
+    print(
+        f"[linear-extract-collect] split={split_name} rows={X.shape[0]} "
+        f"X_shape={list(X.shape)} y_shape={list(y.shape)}",
+        flush=True,
+    )
+    return X, y
+
+
+def collect_fit_windows_from_train(
+    ds_train_list: list[Any],
+    max_rows: int,
+    batch_rows: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not ds_train_list:
+        raise ValueError("No train datasets supplied for extractor fitting")
+    if max_rows <= 0:
+        max_rows = sum(len(ds) for ds in ds_train_list)
+    per_week = int(np.ceil(max_rows / max(1, len(ds_train_list))))
+    x_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    for i, ds in enumerate(ds_train_list):
+        rows_i = min(len(ds), per_week)
+        X_i, y_i = collect_windows_from_dataset(
+            ds,
+            max_rows=rows_i,
+            batch_rows=batch_rows,
+            split_name=f"train_fit_week{i}",
+        )
+        x_parts.append(X_i)
+        y_parts.append(y_i)
+    X = np.concatenate(x_parts, axis=0)[:max_rows].astype(np.float32, copy=False)
+    y = np.concatenate(y_parts, axis=0)[:max_rows].astype(np.float32, copy=False)
+    print(
+        f"[linear-extract-collect] split=train_fit rows={X.shape[0]} "
+        f"X_shape={list(X.shape)} y_shape={list(y.shape)}",
+        flush=True,
+    )
+    return X, y
+
+
+def summarize_Z(Z: np.ndarray) -> Dict[str, Any]:
+    Z = np.asarray(Z)
+    return {
+        "shape": [int(x) for x in Z.shape],
+        "dtype": str(Z.dtype),
+        "finite_frac": float(np.isfinite(Z).mean()),
+        "mean": float(np.nanmean(Z)),
+        "std": float(np.nanstd(Z)),
+        "abs_p50": float(np.nanpercentile(np.abs(Z), 50)),
+        "abs_p95": float(np.nanpercentile(np.abs(Z), 95)),
+        "abs_p99": float(np.nanpercentile(np.abs(Z), 99)),
+        "zero_frac": float(np.mean(Z == 0.0)),
+    }
+
+
+def _transform_and_summarize(extractor: Any, X: np.ndarray, split_name: str) -> tuple[np.ndarray, Dict[str, Any], float]:
+    t0 = time.time()
+    Z = extractor.transform(X).astype(np.float32, copy=False)
+    seconds = time.time() - t0
+    summary = summarize_Z(Z)
+    print(
+        f"[linear-extractor-transform] split={split_name} rows={Z.shape[0]} "
+        f"Z_shape={list(Z.shape)} seconds={seconds:.3f}",
+        flush=True,
+    )
+    if summary["finite_frac"] < 1.0:
+        raise ValueError(f"Stage 2 extractor produced non-finite values for split={split_name}: {summary}")
+    return Z, summary, seconds
+
+
+def run_stage2_extraction(
+    *,
+    linear_out_dir: Path,
+    ds_train_list: list[Any],
+    ds_val: Any,
+    ds_test: Optional[Any],
+    has_cmssl_test: bool,
+    meta: Dict[str, Any],
+    protocol: str,
+    train_week_keys: list[str],
+    extractor_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    stage2_dir = linear_out_dir / "stage2_extractors" / LINEAR_EXTRACTOR
+    stage2_dir.mkdir(parents=True, exist_ok=True)
+
+    extractor = build_linear_extractor_from_config(extractor_config)
+    X_fit, y_fit = collect_fit_windows_from_train(
+        ds_train_list,
+        max_rows=LINEAR_EXTRACTOR_FIT_MAX_ROWS,
+        batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
+    )
+    t0 = time.time()
+    extractor.fit(X_fit)
+    fit_seconds = time.time() - t0
+    print(
+        f"[linear-extractor-fit] name={extractor.name} rows={X_fit.shape[0]} seconds={fit_seconds:.3f}",
+        flush=True,
+    )
+
+    Z_train_sample, train_summary, train_seconds = _transform_and_summarize(extractor, X_fit, "train_sample")
+    X_val, y_val = collect_windows_from_dataset(
+        ds_val,
+        max_rows=LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT,
+        batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
+        split_name="val",
+    )
+    Z_val, val_summary, val_seconds = _transform_and_summarize(extractor, X_val, "val")
+
+    Z_test = None
+    y_test = None
+    test_summary = None
+    test_seconds = None
+    if has_cmssl_test and ds_test is not None and LINEAR_RUN_TEST:
+        X_test, y_test = collect_windows_from_dataset(
+            ds_test,
+            max_rows=LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT,
+            batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
+            split_name="test",
+        )
+        Z_test, test_summary, test_seconds = _transform_and_summarize(extractor, X_test, "test")
+
+    saved_files: Dict[str, Optional[str]] = {
+        "train_sample_transform": None,
+        "val_transform": None,
+        "test_transform": None,
+        "extractor_pickle": None,
+        "stage2_metrics": None,
+        "stage2_metrics_copy": None,
+    }
+    if LINEAR_SAVE_TRANSFORMS:
+        train_path = stage2_dir / "train_sample_transform.npz"
+        np.savez_compressed(train_path, Z=Z_train_sample.astype(np.float32), y=y_fit.astype(np.float32))
+        saved_files["train_sample_transform"] = str(train_path)
+        val_path = stage2_dir / "val_transform.npz"
+        np.savez_compressed(val_path, Z=Z_val.astype(np.float32), y=y_val.astype(np.float32))
+        saved_files["val_transform"] = str(val_path)
+        if Z_test is not None and y_test is not None:
+            test_path = stage2_dir / "test_transform.npz"
+            np.savez_compressed(test_path, Z=Z_test.astype(np.float32), y=y_test.astype(np.float32))
+            saved_files["test_transform"] = str(test_path)
+
+    extractor_pickle_saved = False
+    pkl_path = stage2_dir / "extractor.pkl"
+    try:
+        with pkl_path.open("wb") as f:
+            pickle.dump(extractor, f)
+        extractor_pickle_saved = True
+        saved_files["extractor_pickle"] = str(pkl_path)
+    except Exception as exc:
+        print(
+            f"[linear-extractor-warn] pickle failed; transformed matrices and metadata were still saved: {exc}",
+            flush=True,
+        )
+
+    stage2_payload: Dict[str, Any] = {
+        "stage": "stage2",
+        "status": "ok",
+        "linear_extractor_schema": LINEAR_EXTRACTOR_SCHEMA,
+        "extractor_config": extractor_config,
+        "extractor_summary": extractor.summary(),
+        "out_root": str(OUT_ROOT),
+        "linear_out_dir": str(linear_out_dir),
+        "stage2_dir": str(stage2_dir),
+        "protocol": protocol,
+        "train_week_keys": train_week_keys,
+        "feature_dim_total": int(meta["feature_dim_total"]),
+        "lookback": LOOKBACK,
+        "horizons_ms": [int(h) for h in HORIZONS_MS],
+        "fit_rows": int(X_fit.shape[0]),
+        "fit_seconds": float(fit_seconds),
+        "transform_seconds": {
+            "train_sample": float(train_seconds),
+            "val": float(val_seconds),
+            "test": None if test_seconds is None else float(test_seconds),
+        },
+        "train_sample_summary": train_summary,
+        "val_summary": val_summary,
+        "test_summary": test_summary,
+        "extractor_pickle_saved": bool(extractor_pickle_saved),
+        "save_transforms": bool(LINEAR_SAVE_TRANSFORMS),
+        "saved_files": saved_files,
+    }
+
+    metrics_path = stage2_dir / "linear_stage2_extractor_metrics.json"
+    copy_path = linear_out_dir / "linear_stage2_extractor_metrics.json"
+    saved_files["stage2_metrics"] = str(metrics_path)
+    saved_files["stage2_metrics_copy"] = str(copy_path)
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(stage2_payload, f, allow_nan=True, indent=2)
+    with copy_path.open("w", encoding="utf-8") as f:
+        json.dump(stage2_payload, f, allow_nan=True, indent=2)
+    print(f"[linear-extractor-summary] {json.dumps(extractor.summary(), allow_nan=True)}", flush=True)
+    print(f"[linear-stage2] wrote {metrics_path} and {copy_path}", flush=True)
+    return stage2_payload
+
+
 def main() -> None:
     out_root = Path(OUT_ROOT)
     linear_out_dir = Path(LINEAR_OUT_DIR) if LINEAR_OUT_DIR else out_root / "linear_stage1"
     linear_out_dir.mkdir(parents=True, exist_ok=True)
     device = _resolve_device()
-    print(
-        f"[linear-config] stage={LINEAR_STAGE} device={device} batch_size={LINEAR_EVAL_BATCH_SIZE} "
-        f"run_test={int(LINEAR_RUN_TEST)} out_root={out_root} linear_out_dir={linear_out_dir}",
-        flush=True,
-    )
+    if LINEAR_STAGE == "stage2":
+        print(
+            f"[linear-config] stage={LINEAR_STAGE} extractor={LINEAR_EXTRACTOR} device={device} "
+            f"batch_size={LINEAR_EVAL_BATCH_SIZE} run_test={int(LINEAR_RUN_TEST)} "
+            f"out_root={out_root} linear_out_dir={linear_out_dir}",
+            flush=True,
+        )
+        extractor_config: Optional[Dict[str, Any]] = _build_extractor_config()
+        print(f"[linear-extractor-config] {json.dumps(extractor_config, sort_keys=True)}", flush=True)
+    else:
+        print(
+            f"[linear-config] stage={LINEAR_STAGE} device={device} batch_size={LINEAR_EVAL_BATCH_SIZE} "
+            f"run_test={int(LINEAR_RUN_TEST)} out_root={out_root} linear_out_dir={linear_out_dir}",
+            flush=True,
+        )
+        extractor_config = None
 
     meta = json.loads((out_root / "meta.json").read_text())
     validate_contract_meta(meta, "global meta.json")
@@ -242,6 +539,21 @@ def main() -> None:
         prior_info["mag_down_sqrt_prior"],
     ).to(device)
     model.eval()
+
+    if LINEAR_STAGE == "stage2":
+        run_stage2_extraction(
+            linear_out_dir=linear_out_dir,
+            ds_train_list=ds_train_list,
+            ds_val=ds_val,
+            ds_test=ds_test,
+            has_cmssl_test=has_cmssl_test,
+            meta=meta,
+            protocol=protocol,
+            train_week_keys=train_week_keys,
+            extractor_config=extractor_config or _build_extractor_config(),
+        )
+        if not LINEAR_STAGE2_RUN_PRIOR_EVAL:
+            return
 
     val_full_src = CPUWindowBatchSource(
         ds_val,
