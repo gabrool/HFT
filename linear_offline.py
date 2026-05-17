@@ -2,6 +2,7 @@
 """Linear offline entrypoint using CMSSL-compatible eval machinery."""
 
 import json
+import math
 import os
 import pickle
 import time
@@ -80,9 +81,13 @@ LINEAR_RUN_TEST = _env_bool("BYBIT_LINEAR_RUN_TEST", 1)
 LINEAR_STAGE2_RUN_PRIOR_EVAL = _env_bool("BYBIT_LINEAR_STAGE2_RUN_PRIOR_EVAL", 1)
 
 LINEAR_EXTRACTOR = os.environ.get("BYBIT_LINEAR_EXTRACTOR", "raw_linear").strip().lower()
-LINEAR_EXTRACTOR_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_EXTRACTOR_FIT_MAX_ROWS", 200000)
+LINEAR_EXTRACTOR_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_EXTRACTOR_FIT_MAX_ROWS", 50000)
 LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT = _env_int("BYBIT_LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT", 0)
-LINEAR_EXTRACT_BATCH_ROWS = _env_int("BYBIT_LINEAR_EXTRACT_BATCH_ROWS", 8192)
+LINEAR_EXTRACT_BATCH_ROWS = _env_int("BYBIT_LINEAR_EXTRACT_BATCH_ROWS", 4096)
+LINEAR_CHUNKED_TRANSFORMS = _env_bool("BYBIT_LINEAR_CHUNKED_TRANSFORMS", 1)
+LINEAR_TRANSFORM_SHARD_ROWS = _env_int("BYBIT_LINEAR_TRANSFORM_SHARD_ROWS", 50000)
+LINEAR_MAX_X_CHUNK_MB = _env_int("BYBIT_LINEAR_MAX_X_CHUNK_MB", 2048)
+LINEAR_TRANSFORM_SAVE_FORMAT = os.environ.get("BYBIT_LINEAR_TRANSFORM_SAVE_FORMAT", "npz_shards").strip().lower()
 LINEAR_SAVE_TRANSFORMS = _env_bool("BYBIT_LINEAR_SAVE_TRANSFORMS", 1)
 LINEAR_EXTRACTOR_N_JOBS = _env_int("BYBIT_LINEAR_EXTRACTOR_N_JOBS", 1)
 LINEAR_RANDOM_SEED = _env_int("BYBIT_LINEAR_RANDOM_SEED", 17)
@@ -96,6 +101,17 @@ RAW_LINEAR_INCLUDE_SLOPE = _env_bool("BYBIT_RAW_LINEAR_INCLUDE_SLOPE", 0)
 LINEAR_NUM_KERNELS = _env_int("BYBIT_LINEAR_NUM_KERNELS", 10000)
 LINEAR_HYDRA_N_KERNELS = _env_int("BYBIT_LINEAR_HYDRA_N_KERNELS", 8)
 LINEAR_HYDRA_N_GROUPS = _env_int("BYBIT_LINEAR_HYDRA_N_GROUPS", 64)
+
+if LINEAR_STAGE == "stage2":
+    if LINEAR_TRANSFORM_SHARD_ROWS <= 0:
+        raise ValueError(f"BYBIT_LINEAR_TRANSFORM_SHARD_ROWS must be > 0, got {LINEAR_TRANSFORM_SHARD_ROWS}")
+    if LINEAR_MAX_X_CHUNK_MB <= 0:
+        raise ValueError(f"BYBIT_LINEAR_MAX_X_CHUNK_MB must be > 0, got {LINEAR_MAX_X_CHUNK_MB}")
+    if LINEAR_TRANSFORM_SAVE_FORMAT != "npz_shards":
+        raise ValueError(
+            f"BYBIT_LINEAR_TRANSFORM_SAVE_FORMAT must be 'npz_shards', got {LINEAR_TRANSFORM_SAVE_FORMAT!r}"
+        )
+
 
 
 def _resolve_device() -> torch.device:
@@ -203,14 +219,48 @@ def _dataset_positions(n_rows: int, max_rows: int) -> np.ndarray:
     return np.linspace(0, n_rows - 1, int(max_rows), dtype=np.int64)
 
 
-def collect_windows_from_dataset(
-    ds: Any,
+def estimate_x_window_mb(n_rows: int, lookback: int, feature_dim: int, dtype_bytes: int = 4) -> float:
+    return float(n_rows) * float(lookback) * float(feature_dim) * float(dtype_bytes) / (1024.0**2)
+
+
+def compute_safe_window_chunk_rows(
     *,
-    max_rows: int,
+    requested_rows: int,
+    lookback: int,
+    feature_dim: int,
+    max_x_chunk_mb: int,
+    hard_cap_rows: int,
+) -> int:
+    bytes_per_row = int(lookback) * int(feature_dim) * 4
+    by_mem = max(1, int((int(max_x_chunk_mb) * 1024 * 1024) // max(1, bytes_per_row)))
+    if requested_rows > 0:
+        by_mem = min(by_mem, int(requested_rows))
+    if hard_cap_rows > 0:
+        by_mem = min(by_mem, int(hard_cap_rows))
+    return max(1, by_mem)
+
+
+def assert_transform_matches_labels(Z: np.ndarray, y: np.ndarray, split_name: str) -> None:
+    if Z.ndim != 2:
+        raise ValueError(f"{split_name}: Z must be 2D, got {Z.shape}")
+    if y.ndim != 2:
+        raise ValueError(f"{split_name}: y must be 2D, got {y.shape}")
+    if Z.shape[0] != y.shape[0]:
+        raise ValueError(f"{split_name}: Z rows {Z.shape[0]} != y rows {y.shape[0]}")
+
+
+def collect_windows_for_positions(
+    ds: Any,
+    positions: np.ndarray,
+    *,
     batch_rows: int,
     split_name: str,
 ) -> tuple[np.ndarray, np.ndarray]:
-    positions = _dataset_positions(len(ds), int(max_rows))
+    positions = np.asarray(positions, dtype=np.int64)
+    if positions.ndim != 1:
+        raise ValueError(f"positions must be 1D, got shape={positions.shape}")
+    if positions.size <= 0:
+        raise ValueError(f"Cannot collect zero rows for split={split_name}")
     batch_rows = max(1, int(batch_rows))
     x_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
@@ -236,6 +286,17 @@ def collect_windows_from_dataset(
         flush=True,
     )
     return X, y
+
+
+def collect_windows_from_dataset(
+    ds: Any,
+    *,
+    max_rows: int,
+    batch_rows: int,
+    split_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    positions = _dataset_positions(len(ds), int(max_rows))
+    return collect_windows_for_positions(ds, positions, batch_rows=batch_rows, split_name=split_name)
 
 
 def collect_fit_windows_from_train(
@@ -270,34 +331,242 @@ def collect_fit_windows_from_train(
     return X, y
 
 
-def summarize_Z(Z: np.ndarray) -> Dict[str, Any]:
-    Z = np.asarray(Z)
+ABS_SAMPLE_MAX = 2_000_000
+
+
+def _empty_streaming_stats() -> Dict[str, Any]:
     return {
-        "shape": [int(x) for x in Z.shape],
-        "dtype": str(Z.dtype),
-        "finite_frac": float(np.isfinite(Z).mean()),
-        "mean": float(np.nanmean(Z)),
-        "std": float(np.nanstd(Z)),
-        "abs_p50": float(np.nanpercentile(np.abs(Z), 50)),
-        "abs_p95": float(np.nanpercentile(np.abs(Z), 95)),
-        "abs_p99": float(np.nanpercentile(np.abs(Z), 99)),
-        "zero_frac": float(np.mean(Z == 0.0)),
+        "total_rows": 0,
+        "output_dim": None,
+        "sum": 0.0,
+        "sumsq": 0.0,
+        "zero_count": 0,
+        "finite_count": 0,
+        "total_count": 0,
+        "abs_sample_parts": [],
     }
 
 
-def _transform_and_summarize(extractor: Any, X: np.ndarray, split_name: str) -> tuple[np.ndarray, Dict[str, Any], float]:
-    t0 = time.time()
-    Z = extractor.transform(X).astype(np.float32, copy=False)
-    seconds = time.time() - t0
-    summary = summarize_Z(Z)
+def _update_streaming_stats(stats: Dict[str, Any], Z: np.ndarray) -> None:
+    vals = Z.reshape(-1)
+    stats["total_rows"] += int(Z.shape[0])
+    stats["output_dim"] = int(Z.shape[1])
+    stats["total_count"] += int(vals.size)
+    stats["finite_count"] += int(np.isfinite(vals).sum())
+    stats["sum"] += float(vals.sum(dtype=np.float64))
+    stats["sumsq"] += float(np.square(vals, dtype=np.float64).sum())
+    stats["zero_count"] += int(np.count_nonzero(vals == 0.0))
+    abs_vals = np.abs(vals)
+    if abs_vals.size > 0:
+        parts = stats["abs_sample_parts"]
+        stride = max(1, abs_vals.size // max(1, ABS_SAMPLE_MAX // max(1, len(parts) + 1)))
+        parts.append(abs_vals[::stride].astype(np.float32, copy=False))
+
+
+def _finalize_streaming_summary(stats: Dict[str, Any], *, n_shards: int, chunk_rows: int, positions_rows: int) -> Dict[str, Any]:
+    total_count = int(stats["total_count"])
+    if total_count <= 0:
+        raise ValueError("Cannot summarize empty transform output")
+    mean = float(stats["sum"] / total_count)
+    var = max(0.0, float(stats["sumsq"] / total_count - mean * mean))
+    sample_parts = stats["abs_sample_parts"]
+    sample = np.concatenate(sample_parts, axis=0) if sample_parts else np.zeros((0,), dtype=np.float32)
+    if sample.size > ABS_SAMPLE_MAX:
+        sample = sample[:ABS_SAMPLE_MAX]
+    return {
+        "shape": [int(stats["total_rows"]), int(stats["output_dim"])],
+        "dtype": "float32",
+        "finite_frac": float(stats["finite_count"] / total_count),
+        "mean": mean,
+        "std": float(math.sqrt(var)),
+        "abs_p50": float(np.percentile(sample, 50)) if sample.size else float("nan"),
+        "abs_p95": float(np.percentile(sample, 95)) if sample.size else float("nan"),
+        "abs_p99": float(np.percentile(sample, 99)) if sample.size else float("nan"),
+        "zero_frac": float(stats["zero_count"] / total_count),
+        "n_shards": int(n_shards),
+        "chunk_rows": int(chunk_rows),
+        "positions_rows": int(positions_rows),
+    }
+
+
+def transform_dataset_to_npz_shards(
+    *,
+    extractor: Any,
+    ds: Any,
+    split_name: str,
+    out_dir: Path,
+    max_rows: int,
+    collect_batch_rows: int,
+    transform_shard_rows: int,
+    max_x_chunk_mb: int,
+    save_transforms: bool,
+) -> Dict[str, Any]:
+    positions = _dataset_positions(len(ds), int(max_rows))
+    n_total = int(positions.shape[0])
+    feature_dim = int(ds.feature_dim_total)
+    chunk_rows = compute_safe_window_chunk_rows(
+        requested_rows=n_total,
+        lookback=LOOKBACK,
+        feature_dim=feature_dim,
+        max_x_chunk_mb=max_x_chunk_mb,
+        hard_cap_rows=transform_shard_rows,
+    )
     print(
-        f"[linear-extractor-transform] split={split_name} rows={Z.shape[0]} "
-        f"Z_shape={list(Z.shape)} seconds={seconds:.3f}",
+        f"[linear-memory] split={split_name} rows={n_total} "
+        f"estimated_full_X_mb={estimate_x_window_mb(n_total, LOOKBACK, feature_dim):.1f} "
+        f"chunk_rows={chunk_rows} "
+        f"estimated_chunk_X_mb={estimate_x_window_mb(chunk_rows, LOOKBACK, feature_dim):.1f}",
         flush=True,
     )
+
+    shards: list[Dict[str, Any]] = []
+    stats = _empty_streaming_stats()
+    seconds_total = 0.0
+    for shard_idx, start in enumerate(range(0, n_total, chunk_rows)):
+        pos_chunk = positions[start : start + chunk_rows]
+        X_chunk, y_chunk = collect_windows_for_positions(
+            ds,
+            pos_chunk,
+            batch_rows=collect_batch_rows,
+            split_name=f"{split_name}_shard_{shard_idx:05d}",
+        )
+        t0 = time.time()
+        Z_chunk = extractor.transform(X_chunk).astype(np.float32, copy=False)
+        dt = time.time() - t0
+        seconds_total += dt
+        assert_transform_matches_labels(Z_chunk, y_chunk, f"{split_name}_shard_{shard_idx:05d}")
+        if Z_chunk.shape[0] != pos_chunk.shape[0]:
+            raise ValueError(
+                f"{split_name}_shard_{shard_idx:05d}: Z rows {Z_chunk.shape[0]} != positions rows {pos_chunk.shape[0]}"
+            )
+        if not np.isfinite(Z_chunk).all():
+            raise ValueError(f"Stage 2 extractor produced non-finite values for split={split_name} shard={shard_idx:05d}")
+        print(
+            f"[linear-extractor-transform] split={split_name} shard={shard_idx:05d} "
+            f"rows={Z_chunk.shape[0]} Z_shape={list(Z_chunk.shape)} seconds={dt:.3f}",
+            flush=True,
+        )
+        if save_transforms:
+            path = out_dir / f"{split_name}_transform_shard_{shard_idx:05d}.npz"
+            np.savez_compressed(
+                path,
+                Z=Z_chunk,
+                y=y_chunk.astype(np.float32, copy=False),
+                positions=pos_chunk.astype(np.int64, copy=False),
+            )
+            print(f"[linear-transform-shard] wrote {path}", flush=True)
+            shards.append(
+                {
+                    "shard": int(shard_idx),
+                    "path": str(path),
+                    "rows": int(Z_chunk.shape[0]),
+                    "z_shape": [int(x) for x in Z_chunk.shape],
+                    "y_shape": [int(x) for x in y_chunk.shape],
+                    "positions_start": int(pos_chunk[0]),
+                    "positions_end": int(pos_chunk[-1]),
+                    "seconds": float(dt),
+                }
+            )
+        _update_streaming_stats(stats, Z_chunk)
+
+    summary = _finalize_streaming_summary(stats, n_shards=len(shards), chunk_rows=chunk_rows, positions_rows=n_total)
     if summary["finite_frac"] < 1.0:
         raise ValueError(f"Stage 2 extractor produced non-finite values for split={split_name}: {summary}")
-    return Z, summary, seconds
+    manifest_path = out_dir / f"{split_name}_transform_manifest.json"
+    manifest = {
+        "split": split_name,
+        "format": LINEAR_TRANSFORM_SAVE_FORMAT,
+        "save_transforms": bool(save_transforms),
+        "n_rows": int(stats["total_rows"]),
+        "n_shards": len(shards),
+        "seconds_total": float(seconds_total),
+        "summary": summary,
+        "shards": shards,
+        "manifest_path": str(manifest_path),
+    }
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, allow_nan=True, indent=2)
+    print(f"[linear-transform-manifest] wrote {manifest_path}", flush=True)
+    return manifest
+
+
+def transform_array_to_npz_shards(
+    *,
+    extractor: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    split_name: str,
+    out_dir: Path,
+    transform_shard_rows: int,
+    save_transforms: bool,
+) -> Dict[str, Any]:
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    n_total = int(X.shape[0])
+    if n_total <= 0:
+        raise ValueError(f"Cannot transform empty array split={split_name}")
+    chunk_rows = max(1, min(n_total, int(transform_shard_rows)))
+    shards: list[Dict[str, Any]] = []
+    stats = _empty_streaming_stats()
+    seconds_total = 0.0
+    for shard_idx, start in enumerate(range(0, n_total, chunk_rows)):
+        end = min(n_total, start + chunk_rows)
+        y_chunk = y[start:end]
+        positions = np.arange(start, end, dtype=np.int64)
+        t0 = time.time()
+        Z_chunk = extractor.transform(X[start:end]).astype(np.float32, copy=False)
+        dt = time.time() - t0
+        seconds_total += dt
+        assert_transform_matches_labels(Z_chunk, y_chunk, f"{split_name}_shard_{shard_idx:05d}")
+        if Z_chunk.shape[0] != positions.shape[0]:
+            raise ValueError(
+                f"{split_name}_shard_{shard_idx:05d}: Z rows {Z_chunk.shape[0]} != positions rows {positions.shape[0]}"
+            )
+        if not np.isfinite(Z_chunk).all():
+            raise ValueError(f"Stage 2 extractor produced non-finite values for split={split_name} shard={shard_idx:05d}")
+        print(
+            f"[linear-extractor-transform] split={split_name} shard={shard_idx:05d} "
+            f"rows={Z_chunk.shape[0]} Z_shape={list(Z_chunk.shape)} seconds={dt:.3f}",
+            flush=True,
+        )
+        if save_transforms:
+            path = out_dir / f"{split_name}_transform_shard_{shard_idx:05d}.npz"
+            np.savez_compressed(path, Z=Z_chunk, y=y_chunk.astype(np.float32, copy=False), positions=positions)
+            print(f"[linear-transform-shard] wrote {path}", flush=True)
+            shards.append(
+                {
+                    "shard": int(shard_idx),
+                    "path": str(path),
+                    "rows": int(Z_chunk.shape[0]),
+                    "z_shape": [int(x) for x in Z_chunk.shape],
+                    "y_shape": [int(x) for x in y_chunk.shape],
+                    "positions_start": int(positions[0]),
+                    "positions_end": int(positions[-1]),
+                    "seconds": float(dt),
+                }
+            )
+        _update_streaming_stats(stats, Z_chunk)
+
+    summary = _finalize_streaming_summary(stats, n_shards=len(shards), chunk_rows=chunk_rows, positions_rows=n_total)
+    if summary["finite_frac"] < 1.0:
+        raise ValueError(f"Stage 2 extractor produced non-finite values for split={split_name}: {summary}")
+    manifest_path = out_dir / f"{split_name}_transform_manifest.json"
+    manifest = {
+        "split": split_name,
+        "format": LINEAR_TRANSFORM_SAVE_FORMAT,
+        "save_transforms": bool(save_transforms),
+        "positions_reference": "train_fit_sample_order",
+        "n_rows": int(stats["total_rows"]),
+        "n_shards": len(shards),
+        "seconds_total": float(seconds_total),
+        "summary": summary,
+        "shards": shards,
+        "manifest_path": str(manifest_path),
+    }
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, allow_nan=True, indent=2)
+    print(f"[linear-transform-manifest] wrote {manifest_path}", flush=True)
+    return manifest
 
 
 def run_stage2_extraction(
@@ -315,6 +584,9 @@ def run_stage2_extraction(
     stage2_dir = linear_out_dir / "stage2_extractors" / LINEAR_EXTRACTOR
     stage2_dir.mkdir(parents=True, exist_ok=True)
 
+    if not LINEAR_CHUNKED_TRANSFORMS:
+        raise ValueError("Stage 2 currently supports only BYBIT_LINEAR_CHUNKED_TRANSFORMS=1")
+
     extractor = build_linear_extractor_from_config(extractor_config)
     X_fit, y_fit = collect_fit_windows_from_train(
         ds_train_list,
@@ -329,47 +601,52 @@ def run_stage2_extraction(
         flush=True,
     )
 
-    Z_train_sample, train_summary, train_seconds = _transform_and_summarize(extractor, X_fit, "train_sample")
-    X_val, y_val = collect_windows_from_dataset(
-        ds_val,
-        max_rows=LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT,
-        batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
-        split_name="val",
+    train_sample_manifest = transform_array_to_npz_shards(
+        extractor=extractor,
+        X=X_fit,
+        y=y_fit,
+        split_name="train_sample",
+        out_dir=stage2_dir,
+        transform_shard_rows=LINEAR_TRANSFORM_SHARD_ROWS,
+        save_transforms=LINEAR_SAVE_TRANSFORMS,
     )
-    Z_val, val_summary, val_seconds = _transform_and_summarize(extractor, X_val, "val")
+    val_manifest = transform_dataset_to_npz_shards(
+        extractor=extractor,
+        ds=ds_val,
+        split_name="val",
+        out_dir=stage2_dir,
+        max_rows=LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT,
+        collect_batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
+        transform_shard_rows=LINEAR_TRANSFORM_SHARD_ROWS,
+        max_x_chunk_mb=LINEAR_MAX_X_CHUNK_MB,
+        save_transforms=LINEAR_SAVE_TRANSFORMS,
+    )
 
-    Z_test = None
-    y_test = None
-    test_summary = None
-    test_seconds = None
+    test_manifest = None
     if has_cmssl_test and ds_test is not None and LINEAR_RUN_TEST:
-        X_test, y_test = collect_windows_from_dataset(
-            ds_test,
-            max_rows=LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT,
-            batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
+        test_manifest = transform_dataset_to_npz_shards(
+            extractor=extractor,
+            ds=ds_test,
             split_name="test",
+            out_dir=stage2_dir,
+            max_rows=LINEAR_TRANSFORM_MAX_ROWS_PER_SPLIT,
+            collect_batch_rows=LINEAR_EXTRACT_BATCH_ROWS,
+            transform_shard_rows=LINEAR_TRANSFORM_SHARD_ROWS,
+            max_x_chunk_mb=LINEAR_MAX_X_CHUNK_MB,
+            save_transforms=LINEAR_SAVE_TRANSFORMS,
         )
-        Z_test, test_summary, test_seconds = _transform_and_summarize(extractor, X_test, "test")
 
     saved_files: Dict[str, Optional[str]] = {
-        "train_sample_transform": None,
-        "val_transform": None,
-        "test_transform": None,
+        "train_sample_manifest": train_sample_manifest.get("manifest_path"),
+        "val_manifest": val_manifest.get("manifest_path"),
+        "test_manifest": None if test_manifest is None else test_manifest.get("manifest_path"),
+        "train_sample_transform_manifest": train_sample_manifest.get("manifest_path"),
+        "val_transform_manifest": val_manifest.get("manifest_path"),
+        "test_transform_manifest": None if test_manifest is None else test_manifest.get("manifest_path"),
         "extractor_pickle": None,
         "stage2_metrics": None,
         "stage2_metrics_copy": None,
     }
-    if LINEAR_SAVE_TRANSFORMS:
-        train_path = stage2_dir / "train_sample_transform.npz"
-        np.savez_compressed(train_path, Z=Z_train_sample.astype(np.float32), y=y_fit.astype(np.float32))
-        saved_files["train_sample_transform"] = str(train_path)
-        val_path = stage2_dir / "val_transform.npz"
-        np.savez_compressed(val_path, Z=Z_val.astype(np.float32), y=y_val.astype(np.float32))
-        saved_files["val_transform"] = str(val_path)
-        if Z_test is not None and y_test is not None:
-            test_path = stage2_dir / "test_transform.npz"
-            np.savez_compressed(test_path, Z=Z_test.astype(np.float32), y=y_test.astype(np.float32))
-            saved_files["test_transform"] = str(test_path)
 
     extractor_pickle_saved = False
     pkl_path = stage2_dir / "extractor.pkl"
@@ -400,14 +677,23 @@ def run_stage2_extraction(
         "horizons_ms": [int(h) for h in HORIZONS_MS],
         "fit_rows": int(X_fit.shape[0]),
         "fit_seconds": float(fit_seconds),
+        "chunked_transforms": True,
+        "transform_save_format": LINEAR_TRANSFORM_SAVE_FORMAT,
+        "transform_shard_rows": int(LINEAR_TRANSFORM_SHARD_ROWS),
+        "max_x_chunk_mb": int(LINEAR_MAX_X_CHUNK_MB),
         "transform_seconds": {
-            "train_sample": float(train_seconds),
-            "val": float(val_seconds),
-            "test": None if test_seconds is None else float(test_seconds),
+            "train_sample": float(train_sample_manifest["seconds_total"]),
+            "val": float(val_manifest["seconds_total"]),
+            "test": None if test_manifest is None else float(test_manifest["seconds_total"]),
         },
-        "train_sample_summary": train_summary,
-        "val_summary": val_summary,
-        "test_summary": test_summary,
+        "train_sample_summary": train_sample_manifest["summary"],
+        "val_summary": val_manifest["summary"],
+        "test_summary": None if test_manifest is None else test_manifest["summary"],
+        "manifests": {
+            "train_sample": train_sample_manifest,
+            "val": val_manifest,
+            "test": test_manifest,
+        },
         "extractor_pickle_saved": bool(extractor_pickle_saved),
         "save_transforms": bool(LINEAR_SAVE_TRANSFORMS),
         "saved_files": saved_files,

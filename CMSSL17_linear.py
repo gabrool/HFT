@@ -357,6 +357,28 @@ class AeonRocketExtractor(LinearExtractorBase):
         self._output_dim: Optional[int] = None
         self.transformer: Optional[Any] = None
 
+    def _new_minirocket_multivariate(self) -> Any:
+        import importlib
+        import inspect
+
+        module = importlib.import_module("aeon.transformations.collection.convolution_based")
+        if not hasattr(module, "MiniRocketMultivariate"):
+            raise ImportError("MiniRocket multivariate transformer unavailable in this aeon version")
+
+        cls = module.MiniRocketMultivariate
+        sig = inspect.signature(cls)
+        kwargs: Dict[str, Any] = {
+            "n_jobs": self.n_jobs,
+            "random_state": self.random_state,
+        }
+        if "n_kernels" in sig.parameters:
+            kwargs["n_kernels"] = self.n_kernels
+        elif "num_kernels" in sig.parameters:
+            kwargs["num_kernels"] = self.n_kernels
+        else:
+            raise TypeError("MiniRocketMultivariate has no n_kernels or num_kernels parameter")
+        return cls(**kwargs)
+
     def _new_transformer(self, class_name: Optional[str] = None) -> Any:
         import importlib
 
@@ -365,7 +387,7 @@ class AeonRocketExtractor(LinearExtractorBase):
         if name == "minirocket":
             return module.MiniRocket(n_kernels=self.n_kernels, n_jobs=self.n_jobs, random_state=self.random_state)
         if name == "MiniRocketMultivariate":
-            return module.MiniRocketMultivariate(n_kernels=self.n_kernels, n_jobs=self.n_jobs, random_state=self.random_state)
+            return self._new_minirocket_multivariate()
         if name == "multirocket":
             return module.MultiRocket(n_kernels=self.n_kernels, n_jobs=self.n_jobs, random_state=self.random_state)
         if name == "hydra":
@@ -374,6 +396,7 @@ class AeonRocketExtractor(LinearExtractorBase):
                 n_groups=self.n_groups,
                 n_jobs=self.n_jobs,
                 random_state=self.random_state,
+                output_type="numpy",
             )
         raise ValueError(f"Cannot build transformer for {name!r}")
 

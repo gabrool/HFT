@@ -105,3 +105,19 @@ def test_build_linear_extractor_factory_raw_linear():
         }
     )
     assert isinstance(ext, RawLinearExtractor)
+
+
+def test_hydra_extractor_returns_numpy_float32():
+    pytest.importorskip("aeon")
+    X = np.random.default_rng(23).normal(size=(8, 32, 4)).astype(np.float32)
+    ext = AeonRocketExtractor(
+        name="hydra",
+        n_kernels=128,
+        hydra_n_kernels=4,
+        n_groups=8,
+        n_jobs=1,
+        random_state=17,
+    )
+    Z = ext.fit_transform(X)
+    assert isinstance(Z, np.ndarray)
+    assert Z.dtype == np.float32
