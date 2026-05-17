@@ -1401,8 +1401,30 @@ def load_linear_trim_stats(linear_out_dir: Path) -> Dict[str, np.ndarray]:
     path = Path(linear_out_dir) / "linear_signed_side_trim_stats_cache.npz"
     cached = load_stats_cache(path)
     if not cached:
-        raise FileNotFoundError(f"Missing linear trim stats cache: {path}. Run stage1 or stage2 first.")
-    stats, _cache_meta = cached
+        raise FileNotFoundError(
+            f"Missing linear trim stats cache: {path}. Run stage1 or stage2 first."
+        )
+
+    stats, cache_meta = cached
+
+    stride = int(cache_meta.get("decision_stride_rows", -1))
+    offset = int(cache_meta.get("decision_offset_rows", -1))
+    policy = cache_meta.get("decision_row_policy")
+
+    if stride != int(LINEAR_DECISION_STRIDE_ROWS) or offset != int(LINEAR_DECISION_OFFSET_ROWS):
+        raise ValueError(
+            f"Trim stats cache decision-row mismatch: cache stride/offset={stride}/{offset}, "
+            f"current={LINEAR_DECISION_STRIDE_ROWS}/{LINEAR_DECISION_OFFSET_ROWS}. "
+            f"Delete/rebuild {path} by rerunning Stage 1 or Stage 2."
+        )
+
+    if policy != DECISION_ROW_POLICY:
+        raise ValueError(
+            f"Trim stats cache decision_row_policy mismatch: "
+            f"cache={policy!r}, current={DECISION_ROW_POLICY!r}. "
+            f"Delete/rebuild {path} by rerunning Stage 1 or Stage 2."
+        )
+
     print(f"[linear-stage4] loaded trim stats {path}", flush=True)
     return stats
 

@@ -96,7 +96,16 @@ def write_trim_stats(tmp_path: Path, y_train: np.ndarray):
     from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
 
     stats = compute_signed_raw_stats(y_train)
-    save_stats_cache(tmp_path / "linear_signed_side_trim_stats_cache.npz", stats, {"unit_test": True})
+    save_stats_cache(
+        tmp_path / "linear_signed_side_trim_stats_cache.npz",
+        stats,
+        {
+            "unit_test": True,
+            "decision_stride_rows": 5,
+            "decision_offset_rows": 0,
+            "decision_row_policy": "linear_every_n_rows_v1",
+        },
+    )
     return stats
 
 
