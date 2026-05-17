@@ -172,6 +172,15 @@ LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES = _env_bool(
 LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE = _env_int(
     "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE", 2_000_000
 )
+LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS = _env_int(
+    "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS", 200_000
+)
+LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS = _env_int(
+    "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS", 200_000
+)
+LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS = _env_int(
+    "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS", 200_000
+)
 
 LINEAR_STAGE4_SCHEMA = "linear_target_models_stage4_v1"
 LINEAR_STAGE4_PREPROCESS_NAME = os.environ.get("BYBIT_LINEAR_STAGE4_PREPROCESS_NAME", "default").strip()
@@ -285,6 +294,12 @@ if LINEAR_STAGE == "stage3":
             "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE must be > 0, "
             f"got {LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE}"
         )
+    if LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS < 0:
+        raise ValueError("BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS must be >= 0")
+    if LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS < 0:
+        raise ValueError("BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS must be >= 0")
+    if LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS < 0:
+        raise ValueError("BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS must be >= 0")
 
 if LINEAR_STAGE == "stage4":
     if LINEAR_STAGE4_TRAIN_SPLIT not in {"train_full"}:
@@ -2337,11 +2352,13 @@ def fit_linear_preprocessor_streaming_from_plan(*, extractor: Any, plan: Dict[st
     return LinearPreprocessBundle(str(config.get("schema", LINEAR_PREPROCESS_SCHEMA)), dict(config), D, int(keep.sum()), lower, upper, mean, std, keep.astype(bool), fit_summary)
 
 
-def audit_preprocessing_streaming_train_plan(*, extractor: Any, bundle: LinearPreprocessBundle, plan: Dict[str, Any], split_name: str, audit_path: Optional[Path]) -> Dict[str, Any]:
+def audit_preprocessing_streaming_train_plan(*, extractor: Any, bundle: LinearPreprocessBundle, plan: Dict[str, Any], split_name: str, audit_path: Optional[Path], max_rows: int = 0) -> Dict[str, Any]:
     stats = _empty_streaming_stats(); acc = new_preprocess_audit_accumulator(bundle.original_dim, bundle.kept_dim) if LINEAR_PREPROCESS_AUDIT else None
-    iterator = iter_extracted_batches_from_train_plan(extractor=extractor, plan=plan, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name=split_name)
+    max_rows = int(max_rows)
+    iterator = iter_extracted_batches_from_train_plan(extractor=extractor, plan=plan, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=max_rows, split_name=split_name)
     rows = chunks = 0
-    for Z, _y, _p in progress_iter_rows(iterator, total_rows=train_decision_row_count_from_plan(plan, max_rows=0), desc=_progress_desc("stage3", "audit", split_name)):
+    total = train_decision_row_count_from_plan(plan, max_rows=max_rows)
+    for Z, _y, _p in progress_iter_rows(iterator, total_rows=total, desc=_progress_desc("stage3", "audit", split_name)):
         if acc is not None:
             update_preprocess_audit(acc, Z_raw=Z, bundle=bundle, max_sample_values=LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE)
         Zp = bundle.transform(Z); _update_streaming_stats(stats, Zp); rows += Zp.shape[0]; chunks += 1
@@ -2353,10 +2370,11 @@ def audit_preprocessing_streaming_train_plan(*, extractor: Any, bundle: LinearPr
     print(f"[linear-stream] stage=stage3 action=audit split={split_name} rows={rows}", flush=True)
     return {"summary": summary, "audit_summary": compact_preprocess_audit_summary(audit), "_audit_full_summary": audit}
 
-def _audit_stream_split(extractor: Any, bundle: LinearPreprocessBundle, source: Any, split_name: str, *, audit_path: Optional[Path]) -> Dict[str, Any]:
+def _audit_stream_split(extractor: Any, bundle: LinearPreprocessBundle, source: Any, split_name: str, *, audit_path: Optional[Path], max_rows: int = 0) -> Dict[str, Any]:
     stats = _empty_streaming_stats(); acc = new_preprocess_audit_accumulator(bundle.original_dim, bundle.kept_dim) if LINEAR_PREPROCESS_AUDIT else None
-    iterator = iter_extracted_batches_from_dataset(extractor=extractor, ds=source, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name=split_name)
-    total_rows = describe_rows_for_split(source, max_rows=0)
+    max_rows = int(max_rows)
+    iterator = iter_extracted_batches_from_dataset(extractor=extractor, ds=source, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=max_rows, split_name=split_name)
+    total_rows = describe_rows_for_split(source, max_rows=max_rows)
     rows = chunks = 0
     for Z, _y, _p in progress_iter_rows(iterator, total_rows=total_rows, desc=_progress_desc("stage3", "audit", split_name)):
         if acc is not None:
@@ -2392,29 +2410,170 @@ def run_stage2_extraction(*, linear_out_dir: Path, plan: Dict[str, Any], extract
 
 
 def run_stage3_preprocessing(*, linear_out_dir: Path, extractor_name: str, preprocess_name: str = "default") -> Dict[str, Any]:  # type: ignore[override]
-    if LINEAR_PREPROCESS_FIT_SPLIT != "train_full": raise ValueError("Stage 3 now supports BYBIT_LINEAR_PREPROCESS_FIT_SPLIT=train_full only")
-    plan = load_linear_split_plan_from_out_root(out_root=Path(OUT_ROOT)); extractor, stage2_payload = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name)
-    stage3_dir = resolve_stage3_dir(linear_out_dir, extractor_name, preprocess_name); stage3_dir.mkdir(parents=True, exist_ok=True); audit_dir = resolve_stage3_audit_dir(stage3_dir) if LINEAR_PREPROCESS_AUDIT else None
-    cfg = {"schema": LINEAR_PREPROCESS_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "fit_split": "train_full", "winsorize": LINEAR_PREPROCESS_WINSORIZE, "winsor_q_lo": LINEAR_PREPROCESS_WINSOR_Q_LO, "winsor_q_hi": LINEAR_PREPROCESS_WINSOR_Q_HI, "standardize": LINEAR_PREPROCESS_STANDARDIZE, "std_eps": LINEAR_PREPROCESS_STD_EPS, "variance_filter": LINEAR_PREPROCESS_VARIANCE_FILTER, "min_std": LINEAR_PREPROCESS_MIN_STD, "post_clip_abs": LINEAR_PREPROCESS_POST_CLIP_ABS, "nonfinite_policy": LINEAR_PREPROCESS_NONFINITE_POLICY, "fit_max_rows": LINEAR_PREPROCESS_FIT_MAX_ROWS, "fit_max_matrix_mb": LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB, **_decision_metadata()}
-    bundle = fit_linear_preprocessor_streaming_from_plan(extractor=extractor, plan=plan, config=cfg, batch_rows=LINEAR_EXTRACT_BATCH_ROWS); bundle_path = stage3_dir / "linear_preprocess_bundle.npz"; save_linear_preprocess_bundle(bundle, bundle_path)
-    train_s = audit_preprocessing_streaming_train_plan(extractor=extractor, bundle=bundle, plan=plan, split_name="train", audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_train.json")
+    if LINEAR_PREPROCESS_FIT_SPLIT != "train_full":
+        raise ValueError("Stage 3 now supports BYBIT_LINEAR_PREPROCESS_FIT_SPLIT=train_full only")
+    if LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS < 0:
+        raise ValueError("BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS must be >= 0")
+    if LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS < 0:
+        raise ValueError("BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS must be >= 0")
+    if LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS < 0:
+        raise ValueError("BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS must be >= 0")
+    plan = load_linear_split_plan_from_out_root(out_root=Path(OUT_ROOT))
+    extractor, stage2_payload = load_stage2_extractor_bundle(
+        linear_out_dir=linear_out_dir, extractor_name=extractor_name
+    )
+    stage3_dir = resolve_stage3_dir(linear_out_dir, extractor_name, preprocess_name)
+    stage3_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir = resolve_stage3_audit_dir(stage3_dir) if LINEAR_PREPROCESS_AUDIT else None
+    cfg = {
+        "schema": LINEAR_PREPROCESS_SCHEMA,
+        "extractor": extractor_name,
+        "preprocess_name": preprocess_name,
+        "fit_split": "train_full",
+        "winsorize": LINEAR_PREPROCESS_WINSORIZE,
+        "winsor_q_lo": LINEAR_PREPROCESS_WINSOR_Q_LO,
+        "winsor_q_hi": LINEAR_PREPROCESS_WINSOR_Q_HI,
+        "standardize": LINEAR_PREPROCESS_STANDARDIZE,
+        "std_eps": LINEAR_PREPROCESS_STD_EPS,
+        "variance_filter": LINEAR_PREPROCESS_VARIANCE_FILTER,
+        "min_std": LINEAR_PREPROCESS_MIN_STD,
+        "post_clip_abs": LINEAR_PREPROCESS_POST_CLIP_ABS,
+        "nonfinite_policy": LINEAR_PREPROCESS_NONFINITE_POLICY,
+        "fit_max_rows": LINEAR_PREPROCESS_FIT_MAX_ROWS,
+        "fit_max_matrix_mb": LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB,
+        "audit_max_train_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS),
+        "audit_max_val_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS),
+        "audit_max_test_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS),
+        **_decision_metadata(),
+    }
+    bundle = fit_linear_preprocessor_streaming_from_plan(
+        extractor=extractor, plan=plan, config=cfg, batch_rows=LINEAR_EXTRACT_BATCH_ROWS
+    )
+    bundle_path = stage3_dir / "linear_preprocess_bundle.npz"
+    save_linear_preprocess_bundle(bundle, bundle_path)
+
+    print(
+        f"[linear-stage3-audit] split=train max_rows={LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS}",
+        flush=True,
+    )
+    train_s = audit_preprocessing_streaming_train_plan(
+        extractor=extractor,
+        bundle=bundle,
+        plan=plan,
+        split_name="train",
+        max_rows=LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS,
+        audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_train.json",
+    )
+
     ds_val = build_val_dataset_from_plan(plan)
-    try: val_s = _audit_stream_split(extractor, bundle, ds_val, "val", audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_val.json")
-    finally: close_dataset(ds_val, name="stage3_val_audit"); del ds_val; force_gc("stage3_val_audit")
+    try:
+        print(
+            f"[linear-stage3-audit] split=val max_rows={LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS}",
+            flush=True,
+        )
+        val_s = _audit_stream_split(
+            extractor,
+            bundle,
+            ds_val,
+            "val",
+            max_rows=LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS,
+            audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_val.json",
+        )
+    finally:
+        close_dataset(ds_val, name="stage3_val_audit")
+        del ds_val
+        force_gc("stage3_val_audit")
+
     test_s = None
     if plan["has_cmssl_test"] and LINEAR_RUN_TEST:
         ds_test = build_test_dataset_from_plan(plan)
         if ds_test is not None:
-            try: test_s = _audit_stream_split(extractor, bundle, ds_test, "test", audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_test.json")
-            finally: close_dataset(ds_test, name="stage3_test_audit"); del ds_test; force_gc("stage3_test_audit")
-    audits = {"train": train_s.pop("_audit_full_summary", None), "val": val_s.pop("_audit_full_summary", None), "test": None if test_s is None else test_s.pop("_audit_full_summary", None)}
-    combined = None; audit_summary_path = audit_csv_path = audit_top_path = None
+            try:
+                print(
+                    f"[linear-stage3-audit] split=test max_rows={LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS}",
+                    flush=True,
+                )
+                test_s = _audit_stream_split(
+                    extractor,
+                    bundle,
+                    ds_test,
+                    "test",
+                    max_rows=LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS,
+                    audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_test.json",
+                )
+            finally:
+                close_dataset(ds_test, name="stage3_test_audit")
+                del ds_test
+                force_gc("stage3_test_audit")
+
+    audits = {
+        "train": train_s.pop("_audit_full_summary", None),
+        "val": val_s.pop("_audit_full_summary", None),
+        "test": None if test_s is None else test_s.pop("_audit_full_summary", None),
+    }
+    combined = None
+    audit_summary_path = audit_csv_path = audit_top_path = None
     if LINEAR_PREPROCESS_AUDIT and audit_dir is not None:
-        combined = {"stage": "stage3", "schema": "linear_preprocess_audit_v1", "extractor": extractor_name, "preprocess_name": preprocess_name, "bundle_path": str(bundle_path), "splits": {k: None if v is None else jsonable_preprocess_audit_summary(v, sample_values=LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES) for k, v in audits.items()}}
-        audit_summary_path = audit_dir / "preprocess_audit_summary.json"; audit_csv_path = audit_dir / "preprocess_audit_summary.csv"; audit_top_path = audit_dir / "preprocess_audit_top_features.csv"
-        audit_summary_path.write_text(json.dumps(combined, allow_nan=True, indent=2), encoding="utf-8"); write_preprocess_audit_csv(audit_csv_path, audits); write_preprocess_top_features_csv(audit_top_path, audits)
-    payload = {"stage": "stage3", "status": "ok", "schema": LINEAR_PREPROCESS_SCHEMA, "streaming_features": True, "persisted_preprocessed_shards": False, **_decision_metadata(), **_progress_metadata(), "extractor": extractor_name, "stage2_payload_path": stage2_payload.get("payload_path"), "stage3_dir": str(stage3_dir), "preprocess_config": cfg, "preprocess_bundle_path": str(bundle_path), "fit_summary": bundle.fit_summary, "original_dim": int(bundle.original_dim), "kept_dim": int(bundle.kept_dim), "train_summary": train_s["summary"], "val_summary": val_s["summary"], "test_summary": None if test_s is None else test_s["summary"], "audit_enabled": bool(LINEAR_PREPROCESS_AUDIT), "audit_dir": None if audit_dir is None else str(audit_dir), "audit_summary_path": None if audit_summary_path is None else str(audit_summary_path), "audit_csv_path": None if audit_csv_path is None else str(audit_csv_path), "audit_top_features_csv_path": None if audit_top_path is None else str(audit_top_path), "audit_summary": combined, "manifests": {}}
-    path = stage3_dir / "linear_stage3_preprocess_metrics.json"; copy = Path(linear_out_dir) / "linear_stage3_preprocess_metrics.json"; path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
+        combined = {
+            "stage": "stage3",
+            "schema": "linear_preprocess_audit_v1",
+            "extractor": extractor_name,
+            "preprocess_name": preprocess_name,
+            "bundle_path": str(bundle_path),
+            "audit_max_train_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS),
+            "audit_max_val_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS),
+            "audit_max_test_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS),
+            "splits": {
+                k: None
+                if v is None
+                else jsonable_preprocess_audit_summary(
+                    v, sample_values=LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES
+                )
+                for k, v in audits.items()
+            },
+        }
+        audit_summary_path = audit_dir / "preprocess_audit_summary.json"
+        audit_csv_path = audit_dir / "preprocess_audit_summary.csv"
+        audit_top_path = audit_dir / "preprocess_audit_top_features.csv"
+        audit_summary_path.write_text(json.dumps(combined, allow_nan=True, indent=2), encoding="utf-8")
+        write_preprocess_audit_csv(audit_csv_path, audits)
+        write_preprocess_top_features_csv(audit_top_path, audits)
+
+    payload = {
+        "stage": "stage3",
+        "status": "ok",
+        "schema": LINEAR_PREPROCESS_SCHEMA,
+        "streaming_features": True,
+        "persisted_preprocessed_shards": False,
+        **_decision_metadata(),
+        **_progress_metadata(),
+        "extractor": extractor_name,
+        "stage2_payload_path": stage2_payload.get("payload_path"),
+        "stage3_dir": str(stage3_dir),
+        "preprocess_config": cfg,
+        "preprocess_bundle_path": str(bundle_path),
+        "fit_summary": bundle.fit_summary,
+        "original_dim": int(bundle.original_dim),
+        "kept_dim": int(bundle.kept_dim),
+        "train_summary": train_s["summary"],
+        "val_summary": val_s["summary"],
+        "test_summary": None if test_s is None else test_s["summary"],
+        "audit_enabled": bool(LINEAR_PREPROCESS_AUDIT),
+        "audit_max_train_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS),
+        "audit_max_val_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS),
+        "audit_max_test_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS),
+        "audit_dir": None if audit_dir is None else str(audit_dir),
+        "audit_summary_path": None if audit_summary_path is None else str(audit_summary_path),
+        "audit_csv_path": None if audit_csv_path is None else str(audit_csv_path),
+        "audit_top_features_csv_path": None if audit_top_path is None else str(audit_top_path),
+        "audit_summary": combined,
+        "manifests": {},
+    }
+    path = stage3_dir / "linear_stage3_preprocess_metrics.json"
+    copy = Path(linear_out_dir) / "linear_stage3_preprocess_metrics.json"
+    path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8")
+    copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8")
+    return payload
 
 
 class StreamingPreprocessedBatchSource:
