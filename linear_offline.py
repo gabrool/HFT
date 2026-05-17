@@ -131,6 +131,17 @@ LINEAR_PREPROCESS_FIT_MAX_ROWS = _env_int("BYBIT_LINEAR_PREPROCESS_FIT_MAX_ROWS"
 LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB = _env_int("BYBIT_LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB", 2048)
 LINEAR_PREPROCESS_SHARD_ROWS = _env_int("BYBIT_LINEAR_PREPROCESS_SHARD_ROWS", 50000)
 LINEAR_PREPROCESS_MAX_Z_CHUNK_MB = _env_int("BYBIT_LINEAR_PREPROCESS_MAX_Z_CHUNK_MB", 2048)
+LINEAR_PREPROCESS_AUDIT = _env_bool("BYBIT_LINEAR_PREPROCESS_AUDIT", 1)
+LINEAR_PREPROCESS_AUDIT_TOP_K = _env_int("BYBIT_LINEAR_PREPROCESS_AUDIT_TOP_K", 50)
+LINEAR_PREPROCESS_AUDIT_FULL_PER_FEATURE = _env_bool(
+    "BYBIT_LINEAR_PREPROCESS_AUDIT_FULL_PER_FEATURE", 0
+)
+LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES = _env_bool(
+    "BYBIT_LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES", 0
+)
+LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE = _env_int(
+    "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE", 2_000_000
+)
 
 LINEAR_STAGE4_SCHEMA = "linear_target_models_stage4_v1"
 LINEAR_STAGE4_PREPROCESS_NAME = os.environ.get("BYBIT_LINEAR_STAGE4_PREPROCESS_NAME", "default").strip()
@@ -253,6 +264,13 @@ if LINEAR_STAGE == "stage3":
         raise ValueError(f"BYBIT_LINEAR_PREPROCESS_SHARD_ROWS must be > 0, got {LINEAR_PREPROCESS_SHARD_ROWS}")
     if LINEAR_PREPROCESS_MAX_Z_CHUNK_MB <= 0:
         raise ValueError(f"BYBIT_LINEAR_PREPROCESS_MAX_Z_CHUNK_MB must be > 0, got {LINEAR_PREPROCESS_MAX_Z_CHUNK_MB}")
+    if LINEAR_PREPROCESS_AUDIT_TOP_K < 0:
+        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_AUDIT_TOP_K must be >= 0, got {LINEAR_PREPROCESS_AUDIT_TOP_K}")
+    if LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE <= 0:
+        raise ValueError(
+            "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE must be > 0, "
+            f"got {LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE}"
+        )
 
 if LINEAR_STAGE == "stage4":
     if LINEAR_STAGE4_TRAIN_SPLIT not in {"train_sample"}:
@@ -1167,6 +1185,410 @@ def fit_linear_preprocessor_from_manifest(
     )
 
 
+def resolve_stage3_audit_dir(stage3_dir: Path) -> Path:
+    audit_dir = Path(stage3_dir) / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    return audit_dir
+
+
+def summarize_vector(x: np.ndarray, *, prefix: str) -> Dict[str, float]:
+    x = np.asarray(x, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not finite.any():
+        return {
+            f"{prefix}_finite_frac": 0.0,
+            f"{prefix}_min": float("nan"),
+            f"{prefix}_p01": float("nan"),
+            f"{prefix}_p05": float("nan"),
+            f"{prefix}_p50": float("nan"),
+            f"{prefix}_p95": float("nan"),
+            f"{prefix}_p99": float("nan"),
+            f"{prefix}_max": float("nan"),
+            f"{prefix}_mean": float("nan"),
+        }
+    xf = x[finite]
+    return {
+        f"{prefix}_finite_frac": float(finite.mean()),
+        f"{prefix}_min": float(np.min(xf)),
+        f"{prefix}_p01": float(np.percentile(xf, 1)),
+        f"{prefix}_p05": float(np.percentile(xf, 5)),
+        f"{prefix}_p50": float(np.percentile(xf, 50)),
+        f"{prefix}_p95": float(np.percentile(xf, 95)),
+        f"{prefix}_p99": float(np.percentile(xf, 99)),
+        f"{prefix}_max": float(np.max(xf)),
+        f"{prefix}_mean": float(np.mean(xf)),
+    }
+
+
+def topk_feature_records(values: np.ndarray, *, k: int, metric_name: str, descending: bool = True) -> list[dict]:
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    if k <= 0 or vals.size == 0:
+        return []
+    finite_vals = np.where(np.isfinite(vals), vals, -np.inf if descending else np.inf)
+    order = np.argsort(-finite_vals if descending else finite_vals)[: min(int(k), vals.size)]
+    return [
+        {"feature_index": int(i), "metric": metric_name, "value": float(vals[i])}
+        for i in order
+    ]
+
+
+def _safe_percentile(x: np.ndarray, q: float) -> float:
+    vals = np.asarray(x, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return float("nan")
+    return float(np.percentile(vals, q))
+
+
+def _sample_array(parts: list[np.ndarray], *, max_values: int) -> np.ndarray:
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    vals = np.concatenate(parts).astype(np.float32, copy=False)
+    if vals.size > max_values:
+        vals = vals[:max_values]
+    return vals
+
+
+def _append_abs_sample(parts: list[np.ndarray], values: np.ndarray, *, max_values: int) -> None:
+    vals = np.abs(np.asarray(values).reshape(-1))
+    if vals.size == 0:
+        return
+    current_parts = max(1, len(parts) + 1)
+    stride = max(1, vals.size // max(1, int(max_values) // current_parts))
+    parts.append(vals[::stride].astype(np.float32, copy=False))
+
+
+def new_preprocess_audit_accumulator(original_dim: int, kept_dim: int) -> Dict[str, Any]:
+    return {
+        "rows": 0,
+        "original_dim": int(original_dim),
+        "kept_dim": int(kept_dim),
+        "raw_nonfinite_count": 0,
+        "raw_total_count": 0,
+        "below_lower_counts": np.zeros(original_dim, dtype=np.int64),
+        "above_upper_counts": np.zeros(original_dim, dtype=np.int64),
+        "raw_abs_sample": [],
+        "cap_abs_sample": [],
+        "std_abs_sample": [],
+        "out_abs_sample": [],
+        "std_sum": np.zeros(original_dim, dtype=np.float64),
+        "std_sumsq": np.zeros(original_dim, dtype=np.float64),
+        "std_count": 0,
+        "out_sum": np.zeros(kept_dim, dtype=np.float64),
+        "out_sumsq": np.zeros(kept_dim, dtype=np.float64),
+        "out_count": 0,
+        "std_abs_gt_5": 0,
+        "std_abs_gt_10": 0,
+        "std_abs_gt_20": 0,
+        "out_abs_gt_5": 0,
+        "out_abs_gt_10": 0,
+        "out_abs_gt_20": 0,
+        "post_clip_count": 0,
+        "post_clip_total": 0,
+    }
+
+
+def update_preprocess_audit(
+    acc: Dict[str, Any],
+    *,
+    Z_raw: np.ndarray,
+    bundle: LinearPreprocessBundle,
+    max_sample_values: int,
+) -> None:
+    Z_raw = np.asarray(Z_raw, dtype=np.float32)
+    if Z_raw.ndim != 2 or Z_raw.shape[1] != int(bundle.original_dim):
+        raise ValueError(f"Audit raw Z shape {Z_raw.shape} does not match original_dim={bundle.original_dim}")
+    N = int(Z_raw.shape[0])
+    acc["rows"] += N
+    acc["raw_total_count"] += int(Z_raw.size)
+    finite = np.isfinite(Z_raw)
+    nonfinite = int((~finite).sum())
+    acc["raw_nonfinite_count"] += nonfinite
+    policy = str(bundle.config.get("nonfinite_policy", "raise"))
+    if policy == "raise":
+        if nonfinite:
+            raise ValueError("nonfinite in audit raw Z")
+        Z0 = Z_raw
+    elif policy == "warn_zero":
+        Z0 = np.where(finite, Z_raw, 0.0).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"Unknown preprocessing nonfinite policy: {policy!r}")
+
+    lower = np.asarray(bundle.lower, dtype=np.float32)
+    upper = np.asarray(bundle.upper, dtype=np.float32)
+    below = Z0 < lower
+    above = Z0 > upper
+    acc["below_lower_counts"] += below.sum(axis=0)
+    acc["above_upper_counts"] += above.sum(axis=0)
+    Z_cap = np.minimum(np.maximum(Z0, lower), upper)
+
+    std_eps = float(bundle.config.get("std_eps", 1e-6))
+    Z_std = (Z_cap - bundle.mean) / np.maximum(bundle.std, std_eps)
+    acc["std_sum"] += Z_std.sum(axis=0, dtype=np.float64)
+    acc["std_sumsq"] += np.square(Z_std, dtype=np.float64).sum(axis=0)
+    acc["std_count"] += N
+
+    abs_std = np.abs(Z_std)
+    acc["std_abs_gt_5"] += int((abs_std > 5.0).sum())
+    acc["std_abs_gt_10"] += int((abs_std > 10.0).sum())
+    acc["std_abs_gt_20"] += int((abs_std > 20.0).sum())
+
+    Z_keep = Z_std[:, bundle.keep_mask]
+    post_clip_abs = float(bundle.config.get("post_clip_abs", 0.0))
+    if post_clip_abs > 0:
+        Z_out = np.clip(Z_keep, -post_clip_abs, post_clip_abs)
+        acc["post_clip_count"] += int((Z_keep != Z_out).sum())
+    else:
+        Z_out = Z_keep
+    acc["post_clip_total"] += int(Z_keep.size)
+
+    acc["out_sum"] += Z_out.sum(axis=0, dtype=np.float64)
+    acc["out_sumsq"] += np.square(Z_out, dtype=np.float64).sum(axis=0)
+    acc["out_count"] += N
+    abs_out = np.abs(Z_out)
+    acc["out_abs_gt_5"] += int((abs_out > 5.0).sum())
+    acc["out_abs_gt_10"] += int((abs_out > 10.0).sum())
+    acc["out_abs_gt_20"] += int((abs_out > 20.0).sum())
+
+    _append_abs_sample(acc["raw_abs_sample"], Z0, max_values=max_sample_values)
+    _append_abs_sample(acc["cap_abs_sample"], Z_cap, max_values=max_sample_values)
+    _append_abs_sample(acc["std_abs_sample"], Z_std, max_values=max_sample_values)
+    _append_abs_sample(acc["out_abs_sample"], Z_out, max_values=max_sample_values)
+
+
+def finalize_preprocess_audit(
+    acc: Dict[str, Any],
+    *,
+    bundle: LinearPreprocessBundle,
+    split_name: str,
+    top_k: int,
+    max_sample_values: int,
+) -> Dict[str, Any]:
+    rows = int(acc["rows"])
+    original_dim = int(acc["original_dim"])
+    kept_dim = int(acc["kept_dim"])
+    below_frac = acc["below_lower_counts"].astype(np.float64) / max(1, rows)
+    above_frac = acc["above_upper_counts"].astype(np.float64) / max(1, rows)
+    clip_frac = below_frac + above_frac
+
+    std_count = max(1, int(acc["std_count"]))
+    std_mean = acc["std_sum"] / std_count
+    std_var = np.maximum(0.0, acc["std_sumsq"] / std_count - std_mean * std_mean)
+    std_std = np.sqrt(std_var)
+
+    out_count = max(1, int(acc["out_count"]))
+    out_mean = acc["out_sum"] / out_count if kept_dim else np.zeros(0, dtype=np.float64)
+    out_var = np.maximum(0.0, acc["out_sumsq"] / out_count - out_mean * out_mean) if kept_dim else np.zeros(0)
+    out_std = np.sqrt(out_var)
+
+    raw_abs_sample = _sample_array(acc["raw_abs_sample"], max_values=max_sample_values)
+    cap_abs_sample = _sample_array(acc["cap_abs_sample"], max_values=max_sample_values)
+    std_abs_sample = _sample_array(acc["std_abs_sample"], max_values=max_sample_values)
+    out_abs_sample = _sample_array(acc["out_abs_sample"], max_values=max_sample_values)
+    total_original = max(1, rows * original_dim)
+    total_kept = max(1, rows * kept_dim)
+    raw_nonfinite_frac = float(acc["raw_nonfinite_count"] / max(1, acc["raw_total_count"]))
+    removed = ~np.asarray(bundle.keep_mask, dtype=bool)
+    removed_idx = np.where(removed)[0]
+    removed_sorted = removed_idx[np.argsort(np.asarray(bundle.std, dtype=np.float64)[removed_idx])] if removed_idx.size else []
+
+    summary: Dict[str, Any] = {
+        "split": split_name,
+        "rows": rows,
+        "original_dim": original_dim,
+        "kept_dim": kept_dim,
+        "winsor_below_frac_p50": _safe_percentile(below_frac, 50),
+        "winsor_below_frac_p95": _safe_percentile(below_frac, 95),
+        "winsor_below_frac_max": float(np.max(below_frac)) if below_frac.size else float("nan"),
+        "winsor_above_frac_p50": _safe_percentile(above_frac, 50),
+        "winsor_above_frac_p95": _safe_percentile(above_frac, 95),
+        "winsor_above_frac_max": float(np.max(above_frac)) if above_frac.size else float("nan"),
+        "winsor_total_clip_frac_mean": float(np.mean(clip_frac)) if clip_frac.size else float("nan"),
+        "winsor_total_clip_frac_p50": _safe_percentile(clip_frac, 50),
+        "winsor_total_clip_frac_p95": _safe_percentile(clip_frac, 95),
+        "winsor_total_clip_frac_p99": _safe_percentile(clip_frac, 99),
+        "winsor_total_clip_frac_max": float(np.max(clip_frac)) if clip_frac.size else float("nan"),
+        "winsor_features_gt_0p1pct": int((clip_frac > 0.001).sum()),
+        "winsor_features_gt_1pct": int((clip_frac > 0.01).sum()),
+        "winsor_features_gt_5pct": int((clip_frac > 0.05).sum()),
+        "std_mean_abs_p50": _safe_percentile(np.abs(std_mean), 50),
+        "std_mean_abs_p95": _safe_percentile(np.abs(std_mean), 95),
+        "std_mean_abs_max": float(np.max(np.abs(std_mean))) if std_mean.size else float("nan"),
+        "std_std_p05": _safe_percentile(std_std, 5),
+        "std_std_p50": _safe_percentile(std_std, 50),
+        "std_std_p95": _safe_percentile(std_std, 95),
+        "std_std_max": float(np.max(std_std)) if std_std.size else float("nan"),
+        "std_abs_gt_5_frac": float(acc["std_abs_gt_5"] / total_original),
+        "std_abs_gt_10_frac": float(acc["std_abs_gt_10"] / total_original),
+        "std_abs_gt_20_frac": float(acc["std_abs_gt_20"] / total_original),
+        "std_abs_p50": _safe_percentile(std_abs_sample, 50),
+        "std_abs_p95": _safe_percentile(std_abs_sample, 95),
+        "std_abs_p99": _safe_percentile(std_abs_sample, 99),
+        "std_abs_p999": _safe_percentile(std_abs_sample, 99.9),
+        "std_abs_max_sample": float(np.max(std_abs_sample)) if std_abs_sample.size else float("nan"),
+        "variance_original_dim": original_dim,
+        "variance_kept_dim": kept_dim,
+        "variance_removed_dim": int(original_dim - kept_dim),
+        "variance_removed_frac": float((original_dim - kept_dim) / max(1, original_dim)),
+        "variance_train_std_min": float(np.nanmin(bundle.std)) if original_dim else float("nan"),
+        "variance_train_std_p01": _safe_percentile(bundle.std, 1),
+        "variance_train_std_p05": _safe_percentile(bundle.std, 5),
+        "variance_train_std_p50": _safe_percentile(bundle.std, 50),
+        "variance_train_std_p95": _safe_percentile(bundle.std, 95),
+        "variance_train_std_max": float(np.nanmax(bundle.std)) if original_dim else float("nan"),
+        "variance_n_std_lt_1e-8": int((np.asarray(bundle.std) < 1e-8).sum()),
+        "variance_n_std_lt_1e-6": int((np.asarray(bundle.std) < 1e-6).sum()),
+        "variance_n_std_lt_1e-4": int((np.asarray(bundle.std) < 1e-4).sum()),
+        "out_mean_abs_p50": _safe_percentile(np.abs(out_mean), 50),
+        "out_mean_abs_p95": _safe_percentile(np.abs(out_mean), 95),
+        "out_mean_abs_max": float(np.max(np.abs(out_mean))) if out_mean.size else float("nan"),
+        "out_std_p05": _safe_percentile(out_std, 5),
+        "out_std_p50": _safe_percentile(out_std, 50),
+        "out_std_p95": _safe_percentile(out_std, 95),
+        "out_std_max": float(np.max(out_std)) if out_std.size else float("nan"),
+        "out_abs_p50": _safe_percentile(out_abs_sample, 50),
+        "out_abs_p95": _safe_percentile(out_abs_sample, 95),
+        "out_abs_p99": _safe_percentile(out_abs_sample, 99),
+        "out_abs_p999": _safe_percentile(out_abs_sample, 99.9),
+        "out_abs_gt_5_frac": float(acc["out_abs_gt_5"] / total_kept),
+        "out_abs_gt_10_frac": float(acc["out_abs_gt_10"] / total_kept),
+        "out_abs_gt_20_frac": float(acc["out_abs_gt_20"] / total_kept),
+        "post_clip_frac": float(acc["post_clip_count"] / max(1, acc["post_clip_total"])),
+        "raw_nonfinite_frac": raw_nonfinite_frac,
+        "top_clipped_features": topk_feature_records(clip_frac, k=top_k, metric_name="winsor_total_clip_frac"),
+        "top_abs_mean_shift_features": topk_feature_records(np.abs(std_mean), k=top_k, metric_name="std_abs_mean_shift"),
+        "top_std_ratio_features": topk_feature_records(np.abs(std_std - 1.0), k=top_k, metric_name="std_abs_std_minus_one"),
+        "top_removed_low_variance_features": [
+            {"feature_index": int(i), "metric": "removed_low_variance", "value": float(bundle.std[int(i)]), "train_std": float(bundle.std[int(i)])}
+            for i in list(removed_sorted)[: int(top_k)]
+        ],
+        "_per_feature": {
+            "clip_frac": clip_frac.astype(np.float32),
+            "std_mean": std_mean.astype(np.float32),
+            "std_std": std_std.astype(np.float32),
+        },
+        "_value_samples": {
+            "raw_abs_sample": raw_abs_sample,
+            "cap_abs_sample": cap_abs_sample,
+            "std_abs_sample": std_abs_sample,
+            "out_abs_sample": out_abs_sample,
+        },
+    }
+    warnings = []
+    if summary["winsor_total_clip_frac_p95"] > 0.01:
+        warnings.append("winsor_clip_p95_gt_1pct")
+    if summary["winsor_total_clip_frac_max"] > 0.05:
+        warnings.append("winsor_clip_max_gt_5pct")
+    if summary["std_abs_gt_20_frac"] > 1e-4:
+        warnings.append("std_abs_gt_20_frac_high")
+    if summary["out_abs_gt_10_frac"] > 1e-3:
+        warnings.append("out_abs_gt_10_frac_high")
+    if summary["out_abs_gt_20_frac"] > 1e-4:
+        warnings.append("out_abs_gt_20_frac_high")
+    if split_name == "train_sample" and summary["out_mean_abs_p95"] > 0.05:
+        warnings.append("train_mean_not_centered")
+    if split_name == "train_sample" and (summary["out_std_p50"] < 0.8 or summary["out_std_p50"] > 1.2):
+        warnings.append("train_std_not_unit_scaled")
+    if summary["variance_removed_frac"] > 0.10:
+        warnings.append("variance_removed_gt_10pct")
+    if raw_nonfinite_frac > 0:
+        warnings.append("raw_nonfinite_present")
+    summary["warnings"] = warnings
+    return summary
+
+
+def compact_preprocess_audit_summary(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if summary is None:
+        return None
+    compact = {}
+    for k, v in summary.items():
+        if k.startswith("_") or isinstance(v, (list, dict)):
+            continue
+        compact[k] = v
+    compact["warnings"] = list(summary.get("warnings", []))
+    return compact
+
+
+def jsonable_preprocess_audit_summary(summary: Dict[str, Any], *, sample_values: bool = False) -> Dict[str, Any]:
+    out = {k: v for k, v in summary.items() if not k.startswith("_")}
+    if sample_values:
+        samples = summary.get("_value_samples", {}) or {}
+        out["value_samples"] = {
+            key: np.asarray(value).astype(float).tolist()
+            for key, value in samples.items()
+        }
+    return out
+
+
+def write_preprocess_audit_csv(path: Path, split_summaries: Dict[str, Optional[Dict[str, Any]]]) -> None:
+    columns = [
+        "split", "rows", "original_dim", "kept_dim", "winsor_total_clip_frac_p50",
+        "winsor_total_clip_frac_p95", "winsor_total_clip_frac_max", "std_abs_p99",
+        "std_abs_p999", "std_abs_gt_10_frac", "out_abs_p99", "out_abs_p999",
+        "out_abs_gt_10_frac", "variance_removed_frac", "raw_nonfinite_frac", "post_clip_frac", "warnings",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for split, summary in split_summaries.items():
+            if summary is None:
+                continue
+            row = {c: summary.get(c) for c in columns}
+            row["split"] = split
+            row["warnings"] = ";".join(summary.get("warnings", []))
+            writer.writerow(row)
+
+
+def write_preprocess_top_features_csv(path: Path, split_summaries: Dict[str, Optional[Dict[str, Any]]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["split", "category", "rank", "feature_index", "value", "extra"])
+        writer.writeheader()
+        mapping = {
+            "top_clipped_features": "winsor_total_clip_frac",
+            "top_abs_mean_shift_features": "std_abs_mean_shift",
+            "top_std_ratio_features": "std_abs_std_minus_one",
+            "top_removed_low_variance_features": "removed_low_variance",
+        }
+        for split, summary in split_summaries.items():
+            if summary is None:
+                continue
+            for key, category in mapping.items():
+                for rank, rec in enumerate(summary.get(key, []) or [], start=1):
+                    extra = ""
+                    if "train_std" in rec:
+                        extra = json.dumps({"train_std": rec.get("train_std")})
+                    writer.writerow({
+                        "split": split,
+                        "category": category,
+                        "rank": rank,
+                        "feature_index": rec.get("feature_index"),
+                        "value": rec.get("value"),
+                        "extra": extra,
+                    })
+
+
+def write_preprocess_per_feature_npz(path: Path, split_summaries: Dict[str, Optional[Dict[str, Any]]], bundle: LinearPreprocessBundle) -> None:
+    arrays: Dict[str, np.ndarray] = {
+        "bundle_std": np.asarray(bundle.std, dtype=np.float32),
+        "keep_mask": np.asarray(bundle.keep_mask, dtype=bool),
+    }
+    for split, summary in split_summaries.items():
+        if summary is None:
+            continue
+        per = summary.get("_per_feature", {}) or {}
+        prefix = "train" if split == "train_sample" else split
+        if "clip_frac" in per:
+            arrays[f"{prefix}_clip_frac"] = per["clip_frac"]
+        if "std_mean" in per:
+            arrays[f"{prefix}_std_mean"] = per["std_mean"]
+        if "std_std" in per:
+            arrays[f"{prefix}_std_std"] = per["std_std"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **arrays)
+
+
 def preprocess_manifest_to_npz_shards(
     *,
     bundle: LinearPreprocessBundle,
@@ -1176,6 +1598,10 @@ def preprocess_manifest_to_npz_shards(
     shard_rows: int,
     max_z_chunk_mb: int,
     bundle_path: Path,
+    audit_enabled: bool = False,
+    audit_top_k: int = 0,
+    audit_max_sample_values: int = 2_000_000,
+    audit_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     z_cap_rows = max(1, int((int(max_z_chunk_mb) * 1024 * 1024) // max(1, int(bundle.kept_dim) * 4)))
@@ -1186,6 +1612,7 @@ def preprocess_manifest_to_npz_shards(
     seconds_total = 0.0
     shard_idx = 0
     total_rows = 0
+    audit_acc = new_preprocess_audit_accumulator(bundle.original_dim, bundle.kept_dim) if audit_enabled else None
     for source_shard in source_manifest.get("shards", []):
         with np.load(source_shard["path"]) as arr:
             Z_src = np.asarray(arr["Z"], dtype=np.float32)
@@ -1195,8 +1622,16 @@ def preprocess_manifest_to_npz_shards(
             raise ValueError(f"Source shard row mismatch: {source_shard['path']}")
         for start in range(0, Z_src.shape[0], chunk_rows):
             end = min(Z_src.shape[0], start + chunk_rows)
+            Z_chunk = Z_src[start:end]
+            if audit_acc is not None:
+                update_preprocess_audit(
+                    audit_acc,
+                    Z_raw=Z_chunk,
+                    bundle=bundle,
+                    max_sample_values=int(audit_max_sample_values),
+                )
             t0 = time.time()
-            Z_out = bundle.transform(Z_src[start:end])
+            Z_out = bundle.transform(Z_chunk)
             dt = time.time() - t0
             y_out = y[start:end].astype(np.float32, copy=False)
             pos_out = positions[start:end].astype(np.int64, copy=False)
@@ -1232,6 +1667,15 @@ def preprocess_manifest_to_npz_shards(
             processed_chunks += 1
             shard_idx += 1
     summary = _finalize_streaming_summary(stats, n_shards=len(shards), chunk_rows=chunk_rows, positions_rows=total_rows)
+    audit_summary = None
+    if audit_acc is not None:
+        audit_summary = finalize_preprocess_audit(
+            audit_acc,
+            bundle=bundle,
+            split_name=split_name,
+            top_k=int(audit_top_k),
+            max_sample_values=int(audit_max_sample_values),
+        )
     manifest_path = out_dir / f"{split_name}_preprocessed_manifest.json"
     manifest = {
         "split": split_name,
@@ -1249,11 +1693,30 @@ def preprocess_manifest_to_npz_shards(
         "seconds_total": float(seconds_total),
         "max_z_chunk_mb": int(max_z_chunk_mb),
         "summary": summary,
+        "audit_summary": compact_preprocess_audit_summary(audit_summary),
+        "audit_path": None if audit_path is None else str(audit_path),
         "shards": shards,
         "manifest_path": str(manifest_path),
     }
+    if audit_summary is not None and audit_path is not None:
+        audit_payload = {
+            "stage": "stage3",
+            "schema": "linear_preprocess_audit_v1",
+            "extractor": bundle.config.get("extractor"),
+            "split": split_name,
+            "preprocess_config": dict(bundle.config),
+            "bundle_path": str(bundle_path),
+            "summary": jsonable_preprocess_audit_summary(
+                audit_summary, sample_values=bool(LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES)
+            ),
+        }
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_path.write_text(json.dumps(audit_payload, allow_nan=True, indent=2), encoding="utf-8")
+        print(f"[linear-preprocess-audit] wrote {audit_path}", flush=True)
+    manifest["_audit_full_summary"] = audit_summary
     with manifest_path.open("w", encoding="utf-8") as f:
-        json.dump(manifest, f, allow_nan=True, indent=2)
+        json_manifest = {k: v for k, v in manifest.items() if k != "_audit_full_summary"}
+        json.dump(json_manifest, f, allow_nan=True, indent=2)
     print(f"[linear-preprocess-manifest] wrote {manifest_path}", flush=True)
     return manifest
 
@@ -1266,6 +1729,7 @@ def run_stage3_preprocessing(
     stage2_dir = resolve_stage2_dir(linear_out_dir, extractor_name)
     stage3_dir = Path(linear_out_dir) / "stage3_preprocess" / extractor_name / "default"
     stage3_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir = resolve_stage3_audit_dir(stage3_dir) if LINEAR_PREPROCESS_AUDIT else None
     stage2_payload = load_stage2_payload(linear_out_dir, extractor_name)
     train_manifest = load_manifest_from_payload(stage2_payload, "train_sample")
     val_manifest = load_manifest_from_payload(stage2_payload, "val")
@@ -1296,6 +1760,11 @@ def run_stage3_preprocessing(
         "fit_max_matrix_mb": int(LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB),
         "preprocess_shard_rows": int(LINEAR_PREPROCESS_SHARD_ROWS),
         "preprocess_max_z_chunk_mb": int(LINEAR_PREPROCESS_MAX_Z_CHUNK_MB),
+        "audit_enabled": bool(LINEAR_PREPROCESS_AUDIT),
+        "audit_top_k": int(LINEAR_PREPROCESS_AUDIT_TOP_K),
+        "audit_full_per_feature": bool(LINEAR_PREPROCESS_AUDIT_FULL_PER_FEATURE),
+        "audit_sample_values": bool(LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES),
+        "audit_max_value_sample": int(LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE),
         **_decision_metadata(),
     }
     bundle = fit_linear_preprocessor_from_manifest(train_manifest, config=preprocess_config)
@@ -1309,6 +1778,10 @@ def run_stage3_preprocessing(
         shard_rows=LINEAR_PREPROCESS_SHARD_ROWS,
         max_z_chunk_mb=LINEAR_PREPROCESS_MAX_Z_CHUNK_MB,
         bundle_path=bundle_path,
+        audit_enabled=bool(LINEAR_PREPROCESS_AUDIT),
+        audit_top_k=LINEAR_PREPROCESS_AUDIT_TOP_K,
+        audit_max_sample_values=LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE,
+        audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_train_sample.json",
     )
     val_pre_manifest = preprocess_manifest_to_npz_shards(
         bundle=bundle,
@@ -1318,6 +1791,10 @@ def run_stage3_preprocessing(
         shard_rows=LINEAR_PREPROCESS_SHARD_ROWS,
         max_z_chunk_mb=LINEAR_PREPROCESS_MAX_Z_CHUNK_MB,
         bundle_path=bundle_path,
+        audit_enabled=bool(LINEAR_PREPROCESS_AUDIT),
+        audit_top_k=LINEAR_PREPROCESS_AUDIT_TOP_K,
+        audit_max_sample_values=LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE,
+        audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_val.json",
     )
     test_pre_manifest = None
     if test_manifest is not None:
@@ -1329,7 +1806,51 @@ def run_stage3_preprocessing(
             shard_rows=LINEAR_PREPROCESS_SHARD_ROWS,
             max_z_chunk_mb=LINEAR_PREPROCESS_MAX_Z_CHUNK_MB,
             bundle_path=bundle_path,
+            audit_enabled=bool(LINEAR_PREPROCESS_AUDIT),
+            audit_top_k=LINEAR_PREPROCESS_AUDIT_TOP_K,
+            audit_max_sample_values=LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE,
+            audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_test.json",
         )
+
+    split_audit_summaries = {
+        "train_sample": train_pre_manifest.pop("_audit_full_summary", None),
+        "val": val_pre_manifest.pop("_audit_full_summary", None),
+        "test": None if test_pre_manifest is None else test_pre_manifest.pop("_audit_full_summary", None),
+    }
+    combined_audit_summary = None
+    audit_summary_path = None
+    audit_csv_path = None
+    audit_top_features_csv_path = None
+    if LINEAR_PREPROCESS_AUDIT and audit_dir is not None:
+        jsonable_splits = {
+            split: None if summary is None else jsonable_preprocess_audit_summary(
+                summary, sample_values=bool(LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES)
+            )
+            for split, summary in split_audit_summaries.items()
+        }
+        recommendation_hints = [
+            "Inspect preprocess_audit_summary.csv for compact split-level winsorization, standardization, variance-filter, nonfinite, and post-clip diagnostics.",
+            "Inspect preprocess_audit_top_features.csv for top problematic synthetic feature indices without a full per-feature dump.",
+        ]
+        combined_audit_summary = {
+            "stage": "stage3",
+            "schema": "linear_preprocess_audit_v1",
+            "extractor": extractor_name,
+            "preprocess_name": "default",
+            "bundle_path": str(bundle_path),
+            "splits": jsonable_splits,
+            "recommendation_hints": recommendation_hints,
+        }
+        audit_summary_path = audit_dir / "preprocess_audit_summary.json"
+        audit_csv_path = audit_dir / "preprocess_audit_summary.csv"
+        audit_top_features_csv_path = audit_dir / "preprocess_audit_top_features.csv"
+        audit_summary_path.write_text(json.dumps(combined_audit_summary, allow_nan=True, indent=2), encoding="utf-8")
+        write_preprocess_audit_csv(audit_csv_path, split_audit_summaries)
+        write_preprocess_top_features_csv(audit_top_features_csv_path, split_audit_summaries)
+        if LINEAR_PREPROCESS_AUDIT_FULL_PER_FEATURE:
+            write_preprocess_per_feature_npz(audit_dir / "preprocess_audit_per_feature.npz", split_audit_summaries, bundle)
+        print(f"[linear-preprocess-audit] wrote {audit_summary_path}, {audit_csv_path}, {audit_top_features_csv_path}", flush=True)
+
     payload = {
         "stage": "stage3",
         "status": "ok",
@@ -1346,6 +1867,18 @@ def run_stage3_preprocessing(
         "train_sample_summary": train_pre_manifest["summary"],
         "val_summary": val_pre_manifest["summary"],
         "test_summary": None if test_pre_manifest is None else test_pre_manifest["summary"],
+        "audit_enabled": bool(LINEAR_PREPROCESS_AUDIT),
+        "audit_dir": None if audit_dir is None else str(audit_dir),
+        "audit_summary_path": None if audit_summary_path is None else str(audit_summary_path),
+        "audit_csv_path": None if audit_csv_path is None else str(audit_csv_path),
+        "audit_top_features_csv_path": None if audit_top_features_csv_path is None else str(audit_top_features_csv_path),
+        "audit_summary": combined_audit_summary,
+        "saved_files": {
+            "preprocess_bundle": str(bundle_path),
+            "audit_summary": None if audit_summary_path is None else str(audit_summary_path),
+            "audit_csv": None if audit_csv_path is None else str(audit_csv_path),
+            "audit_top_features_csv": None if audit_top_features_csv_path is None else str(audit_top_features_csv_path),
+        },
         "manifests": {
             "train_sample": train_pre_manifest,
             "val": val_pre_manifest,
@@ -2206,6 +2739,42 @@ def save_stage5_prediction_dump(path: Path, pred_payload: Dict[str, np.ndarray],
     np.savez_compressed(path, **{k: np.asarray(v)[:n] for k, v in pred_payload.items()})
 
 
+
+def load_stage3_audit_summary_for_stage5(stage3_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    audit_summary = stage3_payload.get("audit_summary")
+    if isinstance(audit_summary, dict):
+        return audit_summary
+    audit_path = stage3_payload.get("audit_summary_path")
+    if audit_path:
+        path = Path(audit_path)
+        if path.exists():
+            try:
+                loaded = load_json(path)
+                return loaded if isinstance(loaded, dict) else None
+            except Exception as exc:
+                print(f"[linear-stage5-warn] could not load Stage 3 audit summary {path}: {exc}", flush=True)
+    return None
+
+
+def add_stage3_audit_fields_to_comparison_row(row: Dict[str, Any], audit_summary: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(audit_summary, dict):
+        return
+    splits = audit_summary.get("splits", {}) if isinstance(audit_summary.get("splits"), dict) else {}
+    train = splits.get("train_sample") if isinstance(splits.get("train_sample"), dict) else {}
+    val = splits.get("val") if isinstance(splits.get("val"), dict) else {}
+    row["preprocess_kept_dim"] = train.get("kept_dim") or val.get("kept_dim") or audit_summary.get("kept_dim")
+    row["preprocess_variance_removed_frac"] = train.get("variance_removed_frac", float("nan"))
+    row["preprocess_train_clip_p95"] = train.get("winsor_total_clip_frac_p95", float("nan"))
+    row["preprocess_val_clip_p95"] = val.get("winsor_total_clip_frac_p95", float("nan"))
+    row["preprocess_val_out_abs_p999"] = val.get("out_abs_p999", float("nan"))
+    row["preprocess_val_out_abs_gt_10_frac"] = val.get("out_abs_gt_10_frac", float("nan"))
+    warnings: list[str] = []
+    for split_name, summary in splits.items():
+        if isinstance(summary, dict):
+            for warning in summary.get("warnings", []) or []:
+                warnings.append(f"{split_name}:{warning}")
+    row["preprocess_warnings"] = ";".join(warnings)
+
 def build_stage5_comparison_row(
     *,
     extractor_name: str,
@@ -2421,8 +2990,10 @@ def run_stage5_comparison(
                 LINEAR_STAGE5_PREDICTION_MAX_ROWS,
             )
 
+        stage3_audit_summary = load_stage3_audit_summary_for_stage5(stage3_payload)
         diag = {
             "stage4_payload_path": stage4_payload.get("payload_path"),
+            "stage3_audit_summary": stage3_audit_summary,
             "best_model_path": str(bundle_path),
             "coefficient_diagnostics": coef_diag,
             "prediction_summary_val": pred_val_summary,
@@ -2444,6 +3015,7 @@ def run_stage5_comparison(
             test_metrics=test_metrics,
             diagnostics=diag,
         )
+        add_stage3_audit_fields_to_comparison_row(row, stage3_audit_summary)
         row["decision_stride_rows"] = int(LINEAR_DECISION_STRIDE_ROWS)
         row["decision_offset_rows"] = int(LINEAR_DECISION_OFFSET_ROWS)
         rows.append(row)
