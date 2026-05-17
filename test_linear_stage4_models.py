@@ -81,7 +81,16 @@ def write_trim_stats(tmp_path: Path, y_train: np.ndarray):
     from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
 
     stats = compute_signed_raw_stats(y_train)
-    save_stats_cache(tmp_path / "linear_signed_side_trim_stats_cache.npz", stats, {"unit_test": True})
+    save_stats_cache(
+        tmp_path / "linear_signed_side_trim_stats_cache.npz",
+        stats,
+        {
+            "unit_test": True,
+            "decision_stride_rows": 5,
+            "decision_offset_rows": 0,
+            "decision_row_policy": "linear_every_n_rows_v1",
+        },
+    )
     return stats
 
 
@@ -231,6 +240,89 @@ def test_stage4_missing_trim_stats_fails(tmp_path, monkeypatch):
     write_fake_stage3_payload(tmp_path, manifests)
     with pytest.raises(FileNotFoundError, match="Missing linear trim stats cache"):
         linear_offline.run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=object())
+
+
+def test_load_linear_trim_stats_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
+    import linear_offline
+    from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
+
+    y = np.tile(
+        np.array(
+            [
+                [1.0, -1.0, 2.0],
+                [-1.0, 1.0, -2.0],
+                [2.0, -2.0, 3.0],
+                [-2.0, 2.0, -3.0],
+            ],
+            dtype=np.float32,
+        ),
+        (60, 1),
+    )
+
+    stats = compute_signed_raw_stats(y)
+
+    # Deliberately stale/wrong cache metadata.
+    save_stats_cache(
+        tmp_path / "linear_signed_side_trim_stats_cache.npz",
+        stats,
+        {
+            "decision_stride_rows": 1,
+            "decision_offset_rows": 0,
+            "decision_row_policy": "linear_every_n_rows_v1",
+        },
+    )
+
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+
+    with pytest.raises(ValueError, match="Trim stats cache decision-row mismatch"):
+        linear_offline.load_linear_trim_stats(tmp_path)
+
+
+def test_load_linear_trim_stats_rejects_decision_offset_mismatch(tmp_path, monkeypatch):
+    import linear_offline
+    from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
+
+    _Z, y, _pos = make_synthetic(n=240)
+    stats = compute_signed_raw_stats(y)
+    save_stats_cache(
+        tmp_path / "linear_signed_side_trim_stats_cache.npz",
+        stats,
+        {
+            "decision_stride_rows": 5,
+            "decision_offset_rows": 1,
+            "decision_row_policy": "linear_every_n_rows_v1",
+        },
+    )
+
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+
+    with pytest.raises(ValueError, match="Trim stats cache decision-row mismatch"):
+        linear_offline.load_linear_trim_stats(tmp_path)
+
+
+def test_load_linear_trim_stats_rejects_decision_row_policy_mismatch(tmp_path, monkeypatch):
+    import linear_offline
+    from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
+
+    _Z, y, _pos = make_synthetic(n=240)
+    stats = compute_signed_raw_stats(y)
+    save_stats_cache(
+        tmp_path / "linear_signed_side_trim_stats_cache.npz",
+        stats,
+        {
+            "decision_stride_rows": 5,
+            "decision_offset_rows": 0,
+            "decision_row_policy": "legacy_policy",
+        },
+    )
+
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+
+    with pytest.raises(ValueError, match="Trim stats cache decision_row_policy mismatch"):
+        linear_offline.load_linear_trim_stats(tmp_path)
 
 
 def test_stage4_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
