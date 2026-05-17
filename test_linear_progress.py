@@ -42,6 +42,29 @@ def test_progress_iter_rows_yields_all_items(monkeypatch, capsys):
     assert "unit" in captured
 
 
+def test_progress_iter_rows_propagates_consumer_exception(monkeypatch):
+    import pytest
+    import linear_offline
+
+    monkeypatch.setattr(linear_offline, "LINEAR_PROGRESS", True)
+    monkeypatch.setattr(linear_offline, "LINEAR_PROGRESS_BACKEND", "auto")
+
+    items = [
+        (
+            np.zeros((1, 2), dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+            None,
+        )
+    ]
+
+    def consume():
+        for _ in linear_offline.progress_iter_rows(items, total_rows=1, desc="unit"):
+            raise RuntimeError("consumer failed")
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        consume()
+
+
 def test_progress_iter_rows_disabled(monkeypatch, capsys):
     import linear_offline
 

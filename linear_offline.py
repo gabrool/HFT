@@ -565,6 +565,14 @@ def progress_iter_rows(
                 dynamic_ncols=True,
                 smoothing=0.05,
             )
+        except Exception as exc:
+            if backend == "tqdm":
+                print(
+                    f"[linear-progress-warn] tqdm unavailable/failed for {desc}: {exc}; "
+                    "falling back to periodic logs",
+                    flush=True,
+                )
+        else:
             try:
                 for item in iterable:
                     rows = int(row_getter(item))
@@ -574,13 +582,6 @@ def progress_iter_rows(
             finally:
                 pbar.close()
             return
-        except Exception as exc:
-            if backend == "tqdm":
-                print(
-                    f"[linear-progress-warn] tqdm unavailable/failed for {desc}: {exc}; "
-                    "falling back to periodic logs",
-                    flush=True,
-                )
 
     start = time.time()
     last = start
