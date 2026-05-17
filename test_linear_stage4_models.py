@@ -104,6 +104,7 @@ def configure_stage4(monkeypatch, linear_offline):
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_DIRECTION_WEIGHTING", "tempered")
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING", "none")
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_RUN_TEST", True)
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_TRAIN_SPLIT", "train_sample")
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAX_VAL_ROWS", 0)
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAX_TEST_ROWS", 0)
 
@@ -183,7 +184,7 @@ def test_stage4_end_to_end_fake_run(tmp_path, monkeypatch):
     write_fake_stage3_payload(tmp_path, manifests)
     write_trim_stats(tmp_path, y_train)
 
-    payload = linear_offline.run_stage4_training(
+    payload = linear_offline.legacy_run_stage4_training(
         linear_out_dir=tmp_path,
         extractor_name="raw_linear",
         preprocess_name="default",
@@ -222,7 +223,7 @@ def test_stage4_training_uses_train_manifest_not_validation(tmp_path, monkeypatc
         return real_train(train_manifest=train_manifest, stats=stats, alpha=alpha, config=config)
 
     monkeypatch.setattr(linear_offline, "train_stage4_candidate", wrapped_train_stage4_candidate)
-    linear_offline.run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=torch.device("cpu"))
+    linear_offline.legacy_run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=torch.device("cpu"))
     assert seen["path"].endswith("train_sample_preprocessed_manifest.json")
 
 
@@ -239,7 +240,7 @@ def test_stage4_missing_trim_stats_fails(tmp_path, monkeypatch):
     }
     write_fake_stage3_payload(tmp_path, manifests)
     with pytest.raises(FileNotFoundError, match="Missing linear trim stats cache"):
-        linear_offline.run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=object())
+        linear_offline.legacy_run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=object())
 
 
 def test_load_linear_trim_stats_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
@@ -345,7 +346,7 @@ def test_stage4_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
     write_trim_stats(tmp_path, y_train)
 
     with pytest.raises(ValueError, match="decision-row mismatch"):
-        linear_offline.run_stage4_training(
+        linear_offline.legacy_run_stage4_training(
             linear_out_dir=tmp_path,
             extractor_name="raw_linear",
             preprocess_name="default",

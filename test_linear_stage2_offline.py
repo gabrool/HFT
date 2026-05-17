@@ -144,7 +144,7 @@ def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monke
     ds_val = FakeFlatDataset(9, seed=18)
     ds_test = FakeFlatDataset(7, seed=19)
 
-    payload = linear_offline.run_stage2_extraction(
+    payload = linear_offline.legacy_run_stage2_extraction(
         linear_out_dir=tmp_path,
         ds_train_list=[ds_train],
         ds_val=ds_val,

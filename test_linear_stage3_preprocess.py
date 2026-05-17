@@ -135,7 +135,7 @@ def test_stage3_preprocessor_standardizes_and_filters_constant_feature(tmp_path,
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     bundle = load_linear_preprocess_bundle(Path(payload["preprocess_bundle_path"]))
 
     assert bundle.original_dim == 4
@@ -162,7 +162,7 @@ def test_stage3_winsorization_uses_train_only_caps(tmp_path, monkeypatch):
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     bundle = load_linear_preprocess_bundle(Path(payload["preprocess_bundle_path"]))
     np.testing.assert_allclose(bundle.upper, np.array([3.0, 4.0], dtype=np.float32))
 
@@ -183,7 +183,7 @@ def test_stage3_no_validation_leakage_in_mean(tmp_path, monkeypatch):
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     bundle = load_linear_preprocess_bundle(Path(payload["preprocess_bundle_path"]))
     assert abs(float(bundle.mean[0]) - 10.0) < 1e-6
 
@@ -204,7 +204,7 @@ def test_stage3_manifest_row_alignment_and_bundle_reload(tmp_path, monkeypatch):
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     shard_path = payload["manifests"]["val"]["shards"][0]["path"]
     with np.load(shard_path) as arr:
         assert arr["Z"].shape[0] == arr["y"].shape[0] == arr["positions"].shape[0]
@@ -233,7 +233,7 @@ def test_stage3_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
     write_fake_stage2_payload(tmp_path, manifests)
 
     with pytest.raises(ValueError, match="decision-row mismatch"):
-        linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+        linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
 
 
 def test_stage3_audit_files_are_written(tmp_path, monkeypatch):
@@ -251,7 +251,7 @@ def test_stage3_audit_files_are_written(tmp_path, monkeypatch):
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     audit_dir = tmp_path / "stage3_preprocess" / "raw_linear" / "default" / "audit"
     assert (audit_dir / "preprocess_audit_summary.json").exists()
     assert (audit_dir / "preprocess_audit_summary.csv").exists()
@@ -275,7 +275,7 @@ def test_stage3_audit_winsor_clipping_detects_val_outlier(tmp_path, monkeypatch)
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     val_summary = payload["audit_summary"]["splits"]["val"]
     assert val_summary["winsor_total_clip_frac_max"] > 0
     assert val_summary["winsor_features_gt_1pct"] >= 1
@@ -294,7 +294,7 @@ def test_stage3_audit_standardization_detects_train_centering(tmp_path, monkeypa
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     train_summary = payload["audit_summary"]["splits"]["train_sample"]
     assert train_summary["out_mean_abs_p95"] < 1e-5
     assert 0.8 <= train_summary["out_std_p50"] <= 1.2
@@ -313,7 +313,7 @@ def test_stage3_audit_variance_filter_reports_constant_feature(tmp_path, monkeyp
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     summary = payload["audit_summary"]["splits"]["train_sample"]
     assert summary["variance_removed_dim"] == 1
     assert summary["variance_removed_frac"] > 0
@@ -335,7 +335,7 @@ def test_stage3_audit_warn_zero_reports_nonfinite(tmp_path, monkeypatch):
     }
     write_fake_stage2_payload(tmp_path, manifests)
 
-    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+    payload = linear_offline.legacy_run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
     summary = payload["audit_summary"]["splits"]["train_sample"]
     assert summary["raw_nonfinite_frac"] > 0
     assert "raw_nonfinite_present" in summary["warnings"]
