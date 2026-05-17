@@ -108,6 +108,9 @@ LINEAR_DEVICE = os.environ.get("BYBIT_LINEAR_DEVICE", "cpu").strip().lower()
 LINEAR_EVAL_BATCH_SIZE = _env_int("BYBIT_LINEAR_BATCH_SIZE", BATCH_SIZE)
 LINEAR_RUN_TEST = _env_bool("BYBIT_LINEAR_RUN_TEST", 1)
 LINEAR_STAGE2_RUN_PRIOR_EVAL = _env_bool("BYBIT_LINEAR_STAGE2_RUN_PRIOR_EVAL", 1)
+LINEAR_DECISION_STRIDE_ROWS = _env_int("BYBIT_LINEAR_DECISION_STRIDE_ROWS", 5)
+LINEAR_DECISION_OFFSET_ROWS = _env_int("BYBIT_LINEAR_DECISION_OFFSET_ROWS", 0)
+DECISION_ROW_POLICY = "linear_every_n_rows_v1"
 
 LINEAR_PREPROCESS_SCHEMA = "linear_preprocess_stage3_v1"
 LINEAR_PREPROCESS_FIT_SPLIT = os.environ.get(
@@ -197,6 +200,21 @@ RAW_LINEAR_INCLUDE_SLOPE = _env_bool("BYBIT_RAW_LINEAR_INCLUDE_SLOPE", 0)
 LINEAR_NUM_KERNELS = _env_int("BYBIT_LINEAR_NUM_KERNELS", 10000)
 LINEAR_HYDRA_N_KERNELS = _env_int("BYBIT_LINEAR_HYDRA_N_KERNELS", 8)
 LINEAR_HYDRA_N_GROUPS = _env_int("BYBIT_LINEAR_HYDRA_N_GROUPS", 64)
+
+if LINEAR_DECISION_STRIDE_ROWS <= 0:
+    raise ValueError(
+        f"BYBIT_LINEAR_DECISION_STRIDE_ROWS must be > 0, got {LINEAR_DECISION_STRIDE_ROWS}"
+    )
+if LINEAR_DECISION_OFFSET_ROWS < 0:
+    raise ValueError(
+        f"BYBIT_LINEAR_DECISION_OFFSET_ROWS must be >= 0, got {LINEAR_DECISION_OFFSET_ROWS}"
+    )
+if LINEAR_DECISION_OFFSET_ROWS >= LINEAR_DECISION_STRIDE_ROWS:
+    raise ValueError(
+        "BYBIT_LINEAR_DECISION_OFFSET_ROWS must be smaller than "
+        f"BYBIT_LINEAR_DECISION_STRIDE_ROWS; got offset={LINEAR_DECISION_OFFSET_ROWS}, "
+        f"stride={LINEAR_DECISION_STRIDE_ROWS}"
+    )
 
 if LINEAR_STAGE == "stage2":
     if LINEAR_TRANSFORM_SHARD_ROWS <= 0:
@@ -341,6 +359,7 @@ def _make_cache_meta(meta: Dict[str, Any], protocol: str, train_week_keys: list[
         "loss_weighting_schema": "dir_mag_signed_nonzero_side_trim_tempered_class_dir_plain_mag_q50_q85_ema_v1",
         "ranking_schema": "tie_aware_average_ranks_v1",
         "band_diag_quantiles": [float(x) for x in BAND_DIAG_QUANTILES],
+        **_decision_metadata(),
         "linear_stage": "stage1",
     }
 
@@ -354,6 +373,36 @@ def _print_primary(tag: str, metrics: Dict[str, Any], primary_metric_value: floa
         flush=True,
     )
 
+
+
+def _decision_metadata() -> Dict[str, Any]:
+    return {
+        "decision_stride_rows": int(LINEAR_DECISION_STRIDE_ROWS),
+        "decision_offset_rows": int(LINEAR_DECISION_OFFSET_ROWS),
+        "decision_row_policy": DECISION_ROW_POLICY,
+    }
+
+
+def _print_decision_row_policy(stage: str) -> None:
+    print(
+        f"[linear-decision-rows] stage={stage} "
+        f"stride_rows={LINEAR_DECISION_STRIDE_ROWS} "
+        f"offset_rows={LINEAR_DECISION_OFFSET_ROWS} policy={DECISION_ROW_POLICY}",
+        flush=True,
+    )
+
+
+def _validate_manifest_decision_policy(manifest: Dict[str, Any], *, context: str) -> None:
+    stride = int(manifest.get("decision_stride_rows", -1))
+    offset = int(manifest.get("decision_offset_rows", -1))
+    policy = manifest.get("decision_row_policy")
+    if stride != int(LINEAR_DECISION_STRIDE_ROWS) or offset != int(LINEAR_DECISION_OFFSET_ROWS):
+        raise ValueError(
+            f"{context} decision-row mismatch: manifest stride/offset={stride}/{offset}, "
+            f"current={LINEAR_DECISION_STRIDE_ROWS}/{LINEAR_DECISION_OFFSET_ROWS}"
+        )
+    if policy != DECISION_ROW_POLICY:
+        raise ValueError(f"{context} unexpected decision_row_policy={policy!r}")
 
 
 def _build_extractor_config() -> Dict[str, Any]:
@@ -372,12 +421,32 @@ def _build_extractor_config() -> Dict[str, Any]:
     }
 
 
-def _dataset_positions(n_rows: int, max_rows: int) -> np.ndarray:
+def _decision_positions(n_rows: int) -> np.ndarray:
     if n_rows <= 0:
-        raise ValueError("Cannot collect windows from empty dataset")
-    if max_rows <= 0 or max_rows >= n_rows:
-        return np.arange(n_rows, dtype=np.int64)
-    return np.linspace(0, n_rows - 1, int(max_rows), dtype=np.int64)
+        raise ValueError("Cannot collect rows from empty dataset")
+    if LINEAR_DECISION_OFFSET_ROWS >= n_rows:
+        raise ValueError(
+            f"Decision offset {LINEAR_DECISION_OFFSET_ROWS} is >= dataset rows {n_rows}"
+        )
+    return np.arange(
+        LINEAR_DECISION_OFFSET_ROWS,
+        n_rows,
+        LINEAR_DECISION_STRIDE_ROWS,
+        dtype=np.int64,
+    )
+
+
+def _dataset_positions(n_rows: int, max_rows: int) -> np.ndarray:
+    base = _decision_positions(n_rows)
+    if base.size <= 0:
+        raise ValueError(
+            f"No decision rows selected from n_rows={n_rows}, "
+            f"offset={LINEAR_DECISION_OFFSET_ROWS}, stride={LINEAR_DECISION_STRIDE_ROWS}"
+        )
+    if max_rows <= 0 or max_rows >= base.size:
+        return base
+    idx = np.linspace(0, base.size - 1, int(max_rows), dtype=np.int64)
+    return base[idx]
 
 
 def estimate_x_window_mb(n_rows: int, lookback: int, feature_dim: int, dtype_bytes: int = 4) -> float:
@@ -499,6 +568,98 @@ def collect_windows_from_dataset(
     return collect_windows_for_positions(ds, positions, batch_rows=batch_rows, split_name=split_name)
 
 
+def collect_labels_from_dataset_positions(
+    ds: Any,
+    *,
+    max_rows: int,
+    split_name: str,
+) -> np.ndarray:
+    positions = _dataset_positions(len(ds), int(max_rows))
+    y = np.asarray(ds.y[positions], dtype=np.float32)
+    if y.ndim != 2:
+        raise ValueError(f"{split_name}: labels must be 2D, got {y.shape}")
+    print(
+        f"[linear-label-collect] split={split_name} rows={y.shape[0]} "
+        f"stride={LINEAR_DECISION_STRIDE_ROWS} offset={LINEAR_DECISION_OFFSET_ROWS} "
+        f"y_shape={list(y.shape)}",
+        flush=True,
+    )
+    return y
+
+
+def collect_train_labels_from_datasets(
+    ds_train_list: list[Any],
+    *,
+    split_name: str = "train",
+) -> np.ndarray:
+    if not ds_train_list:
+        raise ValueError("No train datasets supplied for label collection")
+    parts = []
+    for i, ds in enumerate(ds_train_list):
+        parts.append(
+            collect_labels_from_dataset_positions(
+                ds,
+                max_rows=0,
+                split_name=f"{split_name}_week{i}",
+            )
+        )
+    y = np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+    validate_loaded_label_array(y, f"linear {split_name} decision-stride labels")
+    return y
+
+
+class DatasetPositionsBatchSource:
+    def __init__(
+        self,
+        ds: Any,
+        device: torch.device,
+        batch_rows: int,
+        *,
+        max_rows: int = 0,
+        split_name: str = "",
+        positions: Optional[np.ndarray] = None,
+    ):
+        self.ds = ds
+        self.device = device
+        self.batch_rows = max(1, int(batch_rows))
+        if positions is None:
+            positions = _dataset_positions(len(ds), int(max_rows))
+        self.positions = np.asarray(positions, dtype=np.int64)
+        if self.positions.ndim != 1 or self.positions.size <= 0:
+            raise ValueError(f"{split_name}: positions must be non-empty 1D, got {self.positions.shape}")
+        self.split_name = split_name
+        self.n_rows = int(self.positions.shape[0])
+
+    def __len__(self) -> int:
+        return int(math.ceil(self.n_rows / self.batch_rows))
+
+    def __iter__(self):
+        for start in range(0, self.n_rows, self.batch_rows):
+            pos = self.positions[start:start + self.batch_rows]
+            X, y = collect_windows_for_positions(
+                self.ds,
+                pos,
+                batch_rows=self.batch_rows,
+                split_name=f"{self.split_name}_batch",
+            )
+            yield (
+                torch.as_tensor(X, dtype=torch.float32, device=self.device),
+                torch.as_tensor(y, dtype=torch.float32, device=self.device),
+            )
+
+    def make_evenly_spaced_subset(self, max_rows: int):
+        if max_rows <= 0 or max_rows >= self.n_rows:
+            return self
+        idx = np.linspace(0, self.n_rows - 1, int(max_rows), dtype=np.int64)
+        return DatasetPositionsBatchSource(
+            self.ds,
+            self.device,
+            self.batch_rows,
+            positions=self.positions[idx],
+            split_name=f"{self.split_name}_subset",
+        )
+
+
 def collect_fit_windows_from_train(
     ds_train_list: list[Any],
     max_rows: int,
@@ -507,12 +668,12 @@ def collect_fit_windows_from_train(
     if not ds_train_list:
         raise ValueError("No train datasets supplied for extractor fitting")
     if max_rows <= 0:
-        max_rows = sum(len(ds) for ds in ds_train_list)
+        max_rows = sum(int(_decision_positions(len(ds)).shape[0]) for ds in ds_train_list)
     per_week = int(np.ceil(max_rows / max(1, len(ds_train_list))))
     x_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
     for i, ds in enumerate(ds_train_list):
-        rows_i = min(len(ds), per_week)
+        rows_i = min(int(_decision_positions(len(ds)).shape[0]), per_week)
         X_i, y_i = collect_windows_from_dataset(
             ds,
             max_rows=rows_i,
@@ -686,6 +847,7 @@ def transform_dataset_to_npz_shards(
         "split": split_name,
         "format": LINEAR_TRANSFORM_SAVE_FORMAT,
         "save_transforms": bool(save_transforms),
+        **_decision_metadata(),
         "n_rows": int(stats["total_rows"]),
         "extractor_output_dim": int(extractor_output_dim),
         "max_z_chunk_mb": int(max_z_chunk_mb),
@@ -787,6 +949,7 @@ def transform_array_to_npz_shards(
         "format": LINEAR_TRANSFORM_SAVE_FORMAT,
         "save_transforms": bool(save_transforms),
         "positions_reference": "train_fit_sample_order",
+        **_decision_metadata(),
         "n_rows": int(stats["total_rows"]),
         "extractor_output_dim": int(extractor_output_dim),
         "max_z_chunk_mb": int(max_z_chunk_mb),
@@ -1076,6 +1239,7 @@ def preprocess_manifest_to_npz_shards(
         "schema": LINEAR_PREPROCESS_SCHEMA,
         "source_manifest_path": source_manifest.get("manifest_path"),
         "preprocess_bundle_path": str(bundle_path),
+        **_decision_metadata(),
         "n_rows": int(total_rows),
         "original_dim": int(bundle.original_dim),
         "kept_dim": int(bundle.kept_dim),
@@ -1110,6 +1274,11 @@ def run_stage3_preprocessing(
         raise ValueError("Stage 3 requires a Stage 2 train_sample manifest")
     if val_manifest is None:
         raise ValueError("Stage 3 requires a Stage 2 val manifest")
+    _print_decision_row_policy("stage3")
+    _validate_manifest_decision_policy(train_manifest, context="stage3 train_sample")
+    _validate_manifest_decision_policy(val_manifest, context="stage3 val")
+    if test_manifest is not None:
+        _validate_manifest_decision_policy(test_manifest, context="stage3 test")
     preprocess_config = {
         "schema": LINEAR_PREPROCESS_SCHEMA,
         "extractor": extractor_name,
@@ -1127,6 +1296,7 @@ def run_stage3_preprocessing(
         "fit_max_matrix_mb": int(LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB),
         "preprocess_shard_rows": int(LINEAR_PREPROCESS_SHARD_ROWS),
         "preprocess_max_z_chunk_mb": int(LINEAR_PREPROCESS_MAX_Z_CHUNK_MB),
+        **_decision_metadata(),
     }
     bundle = fit_linear_preprocessor_from_manifest(train_manifest, config=preprocess_config)
     bundle_path = stage3_dir / "linear_preprocess_bundle.npz"
@@ -1164,6 +1334,7 @@ def run_stage3_preprocessing(
         "stage": "stage3",
         "status": "ok",
         "schema": LINEAR_PREPROCESS_SCHEMA,
+        **_decision_metadata(),
         "extractor": extractor_name,
         "stage2_dir": str(stage2_dir),
         "stage3_dir": str(stage3_dir),
@@ -2102,6 +2273,7 @@ def run_stage5_comparison(
     rows: list[Dict[str, Any]] = []
     diagnostics: Dict[str, Any] = {}
     stats = load_linear_trim_stats(linear_out_dir)
+    _print_decision_row_policy("stage5")
 
     for extractor_name in extractor_names:
         stage4_payload = load_stage4_artifacts_if_available(
@@ -2115,11 +2287,27 @@ def run_stage5_comparison(
             continue
         bundle_path = Path(str(stage4_payload["best_model_path"]))
         bundle = load_linear_sklearn_bundle(bundle_path)
+        try:
+            _validate_manifest_decision_policy(stage4_payload, context=f"stage5 stage4 {extractor_name}")
+        except ValueError as exc:
+            if LINEAR_STAGE5_STRICT:
+                raise
+            print(f"[linear-stage5-warn] {exc}; skipping extractor={extractor_name}", flush=True)
+            continue
         stage3_payload = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name)
         val_manifest = load_stage3_manifest(stage3_payload, "val")
         test_manifest = load_stage3_manifest(stage3_payload, "test")
         if val_manifest is None:
             raise ValueError(f"Missing val manifest for extractor={extractor_name}")
+        try:
+            _validate_manifest_decision_policy(val_manifest, context=f"stage5 val {extractor_name}")
+            if test_manifest is not None:
+                _validate_manifest_decision_policy(test_manifest, context=f"stage5 test {extractor_name}")
+        except ValueError as exc:
+            if LINEAR_STAGE5_STRICT:
+                raise
+            print(f"[linear-stage5-warn] {exc}; skipping extractor={extractor_name}", flush=True)
+            continue
         if LINEAR_STAGE5_RUN_TEST and test_manifest is None:
             msg = f"Missing test manifest for extractor={extractor_name}"
             if LINEAR_STAGE5_STRICT:
@@ -2234,12 +2422,17 @@ def run_stage5_comparison(
             test_metrics=test_metrics,
             diagnostics=diag,
         )
+        row["decision_stride_rows"] = int(LINEAR_DECISION_STRIDE_ROWS)
+        row["decision_offset_rows"] = int(LINEAR_DECISION_OFFSET_ROWS)
         rows.append(row)
         diag_path = stage5_dir / f"diagnostics_{extractor_name}.json"
         diag_path.write_text(json.dumps(diag, allow_nan=True, indent=2), encoding="utf-8")
         print(f"[linear-stage5] wrote {diag_path}", flush=True)
 
     _maybe_add_baseline_row(rows, strict=LINEAR_STAGE5_STRICT)
+    for row in rows:
+        row.setdefault("decision_stride_rows", int(LINEAR_DECISION_STRIDE_ROWS))
+        row.setdefault("decision_offset_rows", int(LINEAR_DECISION_OFFSET_ROWS))
     csv_path = stage5_dir / "linear_stage5_comparison.csv"
     json_path = stage5_dir / "linear_stage5_comparison.json"
     copy_csv_path = Path(linear_out_dir) / "linear_stage5_comparison.csv"
@@ -2250,6 +2443,7 @@ def run_stage5_comparison(
         "stage": "stage5",
         "status": "ok",
         "schema": LINEAR_STAGE5_SCHEMA,
+        **_decision_metadata(),
         "linear_out_dir": str(linear_out_dir),
         "preprocess_name": preprocess_name,
         "predictor": predictor,
@@ -2289,6 +2483,11 @@ def run_stage4_training(
         raise ValueError("Stage 4 requires a Stage 3 train_sample manifest")
     if val_manifest is None:
         raise ValueError("Stage 4 requires a Stage 3 val manifest")
+    _print_decision_row_policy("stage4")
+    _validate_manifest_decision_policy(train_manifest, context="stage4 train")
+    _validate_manifest_decision_policy(val_manifest, context="stage4 val")
+    if test_manifest is not None:
+        _validate_manifest_decision_policy(test_manifest, context="stage4 test")
     try:
         stats = load_linear_trim_stats(linear_out_dir)
         trim_stats_source = str(Path(linear_out_dir) / "linear_signed_side_trim_stats_cache.npz")
@@ -2314,6 +2513,7 @@ def run_stage4_training(
         "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING,
         "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING,
         "mag_floor": float(LINEAR_STAGE4_MAG_FLOOR),
+        **_decision_metadata(),
     }
 
     candidate_summaries = []
@@ -2372,6 +2572,7 @@ def run_stage4_training(
         "stage": "stage4",
         "status": "ok",
         "schema": LINEAR_STAGE4_SCHEMA,
+        **_decision_metadata(),
         "stage4_config": stage4_config,
         "extractor": extractor_name,
         "preprocess_name": preprocess_name,
@@ -2418,6 +2619,7 @@ def run_stage2_extraction(
 
     if not LINEAR_CHUNKED_TRANSFORMS:
         raise ValueError("Stage 2 currently supports only BYBIT_LINEAR_CHUNKED_TRANSFORMS=1")
+    _print_decision_row_policy("stage2")
 
     extractor = build_linear_extractor_from_config(extractor_config)
     X_fit, y_fit = collect_fit_windows_from_train(
@@ -2520,6 +2722,7 @@ def run_stage2_extraction(
     stage2_payload: Dict[str, Any] = {
         "stage": "stage2",
         "status": "ok",
+        **_decision_metadata(),
         "linear_extractor_schema": LINEAR_EXTRACTOR_SCHEMA,
         "extractor_config": extractor_config,
         "extractor_summary": extractor.summary(),
@@ -2662,8 +2865,8 @@ def main() -> None:
     if ds_test is not None:
         _validate_dataset_split(ds_test, "test", feature_dim_total)
 
-    y_train = np.concatenate([np.asarray(ds.y, dtype=np.float32) for ds in ds_train_list], axis=0)
-    validate_loaded_label_array(y_train, "linear train labels")
+    _print_decision_row_policy(LINEAR_STAGE)
+    y_train = collect_train_labels_from_datasets(ds_train_list, split_name="train")
 
     cache_path = linear_out_dir / "linear_signed_side_trim_stats_cache.npz"
     cache_meta = _make_cache_meta(meta, protocol, train_week_keys, train_split_entries)
@@ -2736,29 +2939,24 @@ def main() -> None:
         if not LINEAR_STAGE2_RUN_PRIOR_EVAL:
             return
 
-    val_full_src = CPUWindowBatchSource(
+    val_full_src = DatasetPositionsBatchSource(
         ds_val,
         device,
         LINEAR_EVAL_BATCH_SIZE,
-        shuffle=False,
-        drop_last=False,
-        row_stride=1,
+        split_name="linear_val_full",
     )
     val_fast_src = val_full_src.make_evenly_spaced_subset(FAST_VAL_MAX_ROWS)
 
     train_band_metrics: Optional[Dict[str, Any]] = None
     if BAND_DIAG and BAND_DIAG_TRAIN:
-        train_eval_row_stride = max(1, int(os.environ.get("BYBIT_LINEAR_TRAIN_EVAL_ROW_STRIDE", "1")))
         train_sources = [
-            CPUWindowBatchSource(
+            DatasetPositionsBatchSource(
                 ds,
                 device,
                 LINEAR_EVAL_BATCH_SIZE,
-                shuffle=False,
-                drop_last=False,
-                row_stride=train_eval_row_stride,
+                split_name=f"linear_train_band_week{i}",
             )
-            for ds in ds_train_list
+            for i, ds in enumerate(ds_train_list)
         ]
         train_band_src = make_train_band_eval_source(train_sources, BAND_DIAG_TRAIN_MAX_ROWS)
         train_band_metrics = summarize_metrics(
@@ -2812,13 +3010,11 @@ def main() -> None:
 
     test_metrics: Optional[Dict[str, Any]] = None
     if LINEAR_RUN_TEST and ds_test is not None:
-        test_src = CPUWindowBatchSource(
+        test_src = DatasetPositionsBatchSource(
             ds_test,
             device,
             LINEAR_EVAL_BATCH_SIZE,
-            shuffle=False,
-            drop_last=False,
-            row_stride=1,
+            split_name="linear_test",
         )
         test_metrics = summarize_metrics(
             model,
@@ -2843,6 +3039,7 @@ def main() -> None:
         "status": "ok",
         "out_root": str(out_root),
         "linear_out_dir": str(linear_out_dir),
+        **_decision_metadata(),
         "protocol": protocol,
         "train_week_keys": train_week_keys,
         "val_weeks": cmssl_val.get("weeks"),
@@ -2894,6 +3091,7 @@ def main() -> None:
             "primary_dir_bal_acc_guard": PRIMARY_DIR_BAL_ACC_GUARD,
             "split_protocol": protocol,
             "train_week_keys": train_week_keys,
+            **_decision_metadata(),
         },
         "prior": linear_model_summary(model),
         "stats": stats,

@@ -63,6 +63,9 @@ def write_stage3_manifest(tmp_path: Path, extractor: str, split: str, Z: np.ndar
         "split": split,
         "stage": "stage3",
         "schema": "linear_preprocess_stage3_v1",
+        "decision_stride_rows": 5,
+        "decision_offset_rows": 0,
+        "decision_row_policy": "linear_every_n_rows_v1",
         "n_rows": int(Z.shape[0]),
         "kept_dim": int(Z.shape[1]),
         "summary": {"shape": [int(Z.shape[0]), int(Z.shape[1])], "finite_frac": 1.0},
@@ -76,7 +79,15 @@ def write_stage3_manifest(tmp_path: Path, extractor: str, split: str, Z: np.ndar
 
 def write_stage3_payload(tmp_path: Path, extractor: str, manifests):
     out_dir = tmp_path / "stage3_preprocess" / extractor / "default"
-    payload = {"stage": "stage3", "status": "ok", "extractor": extractor, "manifests": manifests}
+    payload = {
+        "stage": "stage3",
+        "status": "ok",
+        "decision_stride_rows": 5,
+        "decision_offset_rows": 0,
+        "decision_row_policy": "linear_every_n_rows_v1",
+        "extractor": extractor,
+        "manifests": manifests,
+    }
     (out_dir / "linear_stage3_preprocess_metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
 
@@ -111,6 +122,9 @@ def write_stage4_payload_and_bundle(tmp_path: Path, extractor: str):
         "stage": "stage4",
         "status": "ok",
         "schema": "linear_target_models_stage4_v1",
+        "decision_stride_rows": 5,
+        "decision_offset_rows": 0,
+        "decision_row_policy": "linear_every_n_rows_v1",
         "extractor": extractor,
         "preprocess_name": "default",
         "train_split": "train_sample",
@@ -247,3 +261,36 @@ def test_stage5_prediction_dump(tmp_path, monkeypatch):
     with np.load(dump_path) as arr:
         assert set(arr.files) >= {"positions", "y", "dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "edge_bps"}
         assert arr["y"].shape[0] == 20
+
+
+def test_stage5_decision_stride_mismatch_skip_vs_strict(tmp_path, monkeypatch):
+    import linear_offline
+
+    y_train = prepare_extractor(tmp_path, "raw_linear")
+    write_trim_stats(tmp_path, y_train)
+    stage4_path = tmp_path / "stage4_models" / "raw_linear" / "default" / "sgd_l2_huber" / "linear_stage4_metrics.json"
+    payload = json.loads(stage4_path.read_text())
+    payload["decision_stride_rows"] = 1
+    stage4_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    configure_stage5(monkeypatch, linear_offline, strict=False)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+    result = linear_offline.run_stage5_comparison(
+        linear_out_dir=tmp_path,
+        extractor_names=["raw_linear"],
+        preprocess_name="default",
+        predictor="sgd_l2_huber",
+        device=object(),
+    )
+    assert result["extractors_completed"] == []
+
+    configure_stage5(monkeypatch, linear_offline, strict=True)
+    with pytest.raises(ValueError, match="decision-row mismatch"):
+        linear_offline.run_stage5_comparison(
+            linear_out_dir=tmp_path,
+            extractor_names=["raw_linear"],
+            preprocess_name="default",
+            predictor="sgd_l2_huber",
+            device=object(),
+        )

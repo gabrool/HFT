@@ -74,6 +74,56 @@ def test_compute_safe_transform_chunk_rows_respects_hard_cap():
     assert rows == 1234
 
 
+
+def test_dataset_positions_uses_decision_stride(monkeypatch):
+    import linear_offline
+
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+
+    pos = linear_offline._dataset_positions(20, 0)
+    np.testing.assert_array_equal(pos, np.array([0, 5, 10, 15], dtype=np.int64))
+
+
+def test_dataset_positions_uses_decision_offset(monkeypatch):
+    import linear_offline
+
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 1)
+
+    pos = linear_offline._dataset_positions(20, 0)
+    np.testing.assert_array_equal(pos, np.array([1, 6, 11, 16], dtype=np.int64))
+
+
+def test_dataset_positions_samples_after_stride(monkeypatch):
+    import linear_offline
+
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+
+    pos = linear_offline._dataset_positions(100, 4)
+    assert len(pos) == 4
+    assert np.all(pos % 5 == 0)
+
+
+def test_collect_train_labels_from_datasets_uses_decision_rows(monkeypatch):
+    import linear_offline
+
+    class FakeDataset:
+        def __init__(self, n):
+            self.y = np.arange(n * 3, dtype=np.float32).reshape(n, 3)
+
+        def __len__(self):
+            return len(self.y)
+
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+
+    ds = FakeDataset(20)
+    y = linear_offline.collect_train_labels_from_datasets([ds])
+    np.testing.assert_array_equal(y, ds.y[[0, 5, 10, 15]])
+
+
 def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monkeypatch):
     import linear_offline
 
@@ -87,6 +137,8 @@ def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monke
     monkeypatch.setattr(linear_offline, "LINEAR_MAX_X_CHUNK_MB", 1)
     monkeypatch.setattr(linear_offline, "LINEAR_MAX_Z_CHUNK_MB", 1)
     monkeypatch.setattr(linear_offline, "LINEAR_SAVE_TRANSFORMS", True)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
 
     ds_train = FakeFlatDataset(12)
     ds_val = FakeFlatDataset(9, seed=18)
@@ -123,11 +175,14 @@ def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monke
     assert payload["chunked_transforms"] is True
     assert payload["max_z_chunk_mb"] == 1
     assert payload["extractor_output_dim"] > 0
-    assert payload["val_summary"]["shape"][0] == len(ds_val)
+    assert payload["val_summary"]["shape"][0] == 2
     assert payload["val_summary"]["shape"][1] == payload["extractor_output_dim"]
-    assert payload["val_summary"]["n_shards"] >= 2
+    assert payload["val_summary"]["n_shards"] >= 1
     val_manifest = payload["manifests"]["val"]
     assert val_manifest["extractor_output_dim"] == payload["extractor_output_dim"]
+    assert val_manifest["decision_stride_rows"] == 5
+    assert val_manifest["decision_offset_rows"] == 0
+    assert val_manifest["decision_row_policy"] == "linear_every_n_rows_v1"
     assert val_manifest["max_z_chunk_mb"] == 1
     assert val_manifest["processed_chunks"] >= 1
     assert val_manifest["n_saved_shards"] >= 1
@@ -137,3 +192,4 @@ def test_run_stage2_extraction_raw_linear_writes_sharded_outputs(tmp_path, monke
     with np.load(shards[0]) as arr:
         assert "Z" in arr and "y" in arr and "positions" in arr
         assert arr["Z"].shape[0] == arr["y"].shape[0] == arr["positions"].shape[0]
+        assert np.all(arr["positions"] % 5 == 0)

@@ -47,6 +47,9 @@ def write_fake_stage3_manifest(tmp_path: Path, split: str, Z: np.ndarray, y: np.
         "split": split,
         "stage": "stage3",
         "schema": "linear_preprocess_stage3_v1",
+        "decision_stride_rows": 5,
+        "decision_offset_rows": 0,
+        "decision_row_policy": "linear_every_n_rows_v1",
         "n_rows": int(Z.shape[0]),
         "kept_dim": int(Z.shape[1]),
         "summary": {"shape": [int(Z.shape[0]), int(Z.shape[1])], "finite_frac": 1.0},
@@ -64,6 +67,9 @@ def write_fake_stage3_payload(tmp_path: Path, manifests):
         "stage": "stage3",
         "status": "ok",
         "schema": "linear_preprocess_stage3_v1",
+        "decision_stride_rows": 5,
+        "decision_offset_rows": 0,
+        "decision_row_policy": "linear_every_n_rows_v1",
         "extractor": "raw_linear",
         "manifests": manifests,
     }
@@ -225,3 +231,31 @@ def test_stage4_missing_trim_stats_fails(tmp_path, monkeypatch):
     write_fake_stage3_payload(tmp_path, manifests)
     with pytest.raises(FileNotFoundError, match="Missing linear trim stats cache"):
         linear_offline.run_stage4_training(linear_out_dir=tmp_path, extractor_name="raw_linear", preprocess_name="default", device=object())
+
+
+def test_stage4_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
+    import linear_offline
+
+    configure_stage4(monkeypatch, linear_offline)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_STRIDE_ROWS", 5)
+    monkeypatch.setattr(linear_offline, "LINEAR_DECISION_OFFSET_ROWS", 0)
+    Z_train, y_train, pos_train = make_synthetic(n=240)
+    Z_val, y_val, pos_val = make_synthetic(n=120)
+    train_manifest = write_fake_stage3_manifest(tmp_path, "train_sample", Z_train, y_train, pos_train)
+    train_manifest["decision_stride_rows"] = 1
+    Path(train_manifest["manifest_path"]).write_text(json.dumps(train_manifest, indent=2))
+    manifests = {
+        "train_sample": train_manifest,
+        "val": write_fake_stage3_manifest(tmp_path, "val", Z_val, y_val, pos_val),
+        "test": None,
+    }
+    write_fake_stage3_payload(tmp_path, manifests)
+    write_trim_stats(tmp_path, y_train)
+
+    with pytest.raises(ValueError, match="decision-row mismatch"):
+        linear_offline.run_stage4_training(
+            linear_out_dir=tmp_path,
+            extractor_name="raw_linear",
+            preprocess_name="default",
+            device=object(),
+        )
