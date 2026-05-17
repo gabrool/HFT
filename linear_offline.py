@@ -115,7 +115,7 @@ DECISION_ROW_POLICY = "linear_every_n_rows_v1"
 
 LINEAR_PREPROCESS_SCHEMA = "linear_preprocess_stage3_v1"
 LINEAR_PREPROCESS_FIT_SPLIT = os.environ.get(
-    "BYBIT_LINEAR_PREPROCESS_FIT_SPLIT", "train_sample"
+    "BYBIT_LINEAR_PREPROCESS_FIT_SPLIT", "train_full"
 ).strip().lower()
 LINEAR_PREPROCESS_WINSORIZE = _env_bool("BYBIT_LINEAR_PREPROCESS_WINSORIZE", 1)
 LINEAR_PREPROCESS_WINSOR_Q_LO = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_WINSOR_Q_LO", "0.001"))
@@ -228,22 +228,9 @@ if LINEAR_DECISION_OFFSET_ROWS >= LINEAR_DECISION_STRIDE_ROWS:
         f"stride={LINEAR_DECISION_STRIDE_ROWS}"
     )
 
-if LINEAR_STAGE == "stage2":
-    if LINEAR_TRANSFORM_SHARD_ROWS <= 0:
-        raise ValueError(f"BYBIT_LINEAR_TRANSFORM_SHARD_ROWS must be > 0, got {LINEAR_TRANSFORM_SHARD_ROWS}")
-    if LINEAR_MAX_X_CHUNK_MB <= 0:
-        raise ValueError(f"BYBIT_LINEAR_MAX_X_CHUNK_MB must be > 0, got {LINEAR_MAX_X_CHUNK_MB}")
-    if LINEAR_MAX_Z_CHUNK_MB <= 0:
-        raise ValueError(f"BYBIT_LINEAR_MAX_Z_CHUNK_MB must be > 0, got {LINEAR_MAX_Z_CHUNK_MB}")
-    if LINEAR_TRANSFORM_SAVE_FORMAT != "npz_shards":
-        raise ValueError(
-            f"BYBIT_LINEAR_TRANSFORM_SAVE_FORMAT must be 'npz_shards', got {LINEAR_TRANSFORM_SAVE_FORMAT!r}"
-        )
-
-
 if LINEAR_STAGE == "stage3":
-    if LINEAR_PREPROCESS_FIT_SPLIT not in {"train_sample"}:
-        raise ValueError("Stage 3 currently supports BYBIT_LINEAR_PREPROCESS_FIT_SPLIT=train_sample")
+    if LINEAR_PREPROCESS_FIT_SPLIT not in {"train_full"}:
+        raise ValueError("Stage 3 now supports BYBIT_LINEAR_PREPROCESS_FIT_SPLIT=train_full only")
     if not (0.0 <= LINEAR_PREPROCESS_WINSOR_Q_LO < LINEAR_PREPROCESS_WINSOR_Q_HI <= 1.0):
         raise ValueError(
             "BYBIT_LINEAR_PREPROCESS_WINSOR_Q_LO/HI must satisfy "
@@ -261,10 +248,6 @@ if LINEAR_STAGE == "stage3":
         raise ValueError(
             f"BYBIT_LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB must be > 0, got {LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB}"
         )
-    if LINEAR_PREPROCESS_SHARD_ROWS <= 0:
-        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_SHARD_ROWS must be > 0, got {LINEAR_PREPROCESS_SHARD_ROWS}")
-    if LINEAR_PREPROCESS_MAX_Z_CHUNK_MB <= 0:
-        raise ValueError(f"BYBIT_LINEAR_PREPROCESS_MAX_Z_CHUNK_MB must be > 0, got {LINEAR_PREPROCESS_MAX_Z_CHUNK_MB}")
     if LINEAR_PREPROCESS_AUDIT_TOP_K < 0:
         raise ValueError(f"BYBIT_LINEAR_PREPROCESS_AUDIT_TOP_K must be >= 0, got {LINEAR_PREPROCESS_AUDIT_TOP_K}")
     if LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE <= 0:
@@ -274,8 +257,8 @@ if LINEAR_STAGE == "stage3":
         )
 
 if LINEAR_STAGE == "stage4":
-    if LINEAR_STAGE4_TRAIN_SPLIT not in {"train_sample"}:
-        raise ValueError("Stage 4 currently supports train_sample only")
+    if LINEAR_STAGE4_TRAIN_SPLIT not in {"train_full"}:
+        raise ValueError("Stage 4 now supports only train_full streaming")
     if LINEAR_STAGE4_PREDICTOR not in {"sgd_l2_huber"}:
         raise ValueError("Stage 4 currently supports BYBIT_LINEAR_STAGE4_PREDICTOR=sgd_l2_huber")
     if LINEAR_STAGE4_PENALTY not in {"l2", "elasticnet"}:
@@ -995,6 +978,12 @@ def load_json(path: Path) -> Dict[str, Any]:
 def resolve_stage2_dir(linear_out_dir: Path, extractor_name: str) -> Path:
     return Path(linear_out_dir) / "stage2_extractors" / str(extractor_name)
 
+
+# ---------------------------------------------------------------------------
+# Legacy persisted-shard helpers.
+# Not used by the active streaming pipeline.
+# Kept temporarily for old tests/debug only.
+# ---------------------------------------------------------------------------
 
 def load_stage2_payload(linear_out_dir: Path, extractor_name: str) -> Dict[str, Any]:
     stage2_dir = resolve_stage2_dir(linear_out_dir, extractor_name)
@@ -1724,6 +1713,12 @@ def preprocess_manifest_to_npz_shards(
     print(f"[linear-preprocess-manifest] wrote {manifest_path}", flush=True)
     return manifest
 
+
+# ---------------------------------------------------------------------------
+# Legacy persisted-shard stage entry points.
+# Not used by the active streaming pipeline.
+# Kept temporarily for old tests/debug only; use legacy_run_stageX aliases.
+# ---------------------------------------------------------------------------
 
 def run_stage3_preprocessing(
     *,
@@ -3704,6 +3699,46 @@ def main() -> None:
     print(f"[linear_ckpt] saved {ckpt_path}", flush=True)
 
 
+# Legacy persisted-shard entry point aliases for tests/debug only.
+# The active pipeline below redefines the canonical run_stageX/load_stageX names.
+legacy_load_stage2_payload = load_stage2_payload
+legacy_load_stage3_payload = load_stage3_payload
+legacy_run_stage2_extraction = run_stage2_extraction
+_legacy_run_stage3_preprocessing_impl = run_stage3_preprocessing
+_legacy_run_stage4_training_impl = run_stage4_training
+_legacy_run_stage5_comparison_impl = run_stage5_comparison
+
+
+def legacy_run_stage3_preprocessing(*args, **kwargs):
+    global load_stage2_payload
+    active_load_stage2_payload = load_stage2_payload
+    load_stage2_payload = legacy_load_stage2_payload
+    try:
+        return _legacy_run_stage3_preprocessing_impl(*args, **kwargs)
+    finally:
+        load_stage2_payload = active_load_stage2_payload
+
+
+def legacy_run_stage4_training(*args, **kwargs):
+    global load_stage3_payload
+    active_load_stage3_payload = load_stage3_payload
+    load_stage3_payload = legacy_load_stage3_payload
+    try:
+        return _legacy_run_stage4_training_impl(*args, **kwargs)
+    finally:
+        load_stage3_payload = active_load_stage3_payload
+
+
+def legacy_run_stage5_comparison(*args, **kwargs):
+    global load_stage3_payload
+    active_load_stage3_payload = load_stage3_payload
+    load_stage3_payload = legacy_load_stage3_payload
+    try:
+        return _legacy_run_stage5_comparison_impl(*args, **kwargs)
+    finally:
+        load_stage3_payload = active_load_stage3_payload
+
+
 # ---------------------------------------------------------------------------
 # Streaming feature pipeline overrides (default path; persisted shards legacy)
 # ---------------------------------------------------------------------------
@@ -3750,6 +3785,12 @@ def build_linear_cmssl_splits_from_out_root(*, out_root: Path) -> Dict[str, Any]
         "test_split_entry": cmssl_test,
     }
 
+
+# ---------------------------------------------------------------------------
+# Active streaming-only pipeline definitions.
+# These override the legacy persisted-shard helpers above and are the only
+# run_stageX/load_stageX entry points used by main().
+# ---------------------------------------------------------------------------
 
 def _stage_payload_path(linear_out_dir: Path, extractor_name: str, preprocess_name: str = "default") -> tuple[Path, Path]:
     return (
@@ -3892,7 +3933,7 @@ def _fit_preprocess_from_stream(extractor: Any, ds_train_list: list[Any], config
     if not keep.any():
         raise ValueError("Preprocessor variance filter removed all features")
     fit_summary = {
-        "fit_mode": "streaming_full_train_v1", "fit_split": "train", "quantile_fit_rows": int(sample.shape[0]),
+        "fit_mode": "streaming_full_train_v1", "fit_split": "train_full", "quantile_fit_rows": int(sample.shape[0]),
         "mean_std_fit_rows": int(count), "train_weeks": list(train_week_keys), "extractor_output_dim": D,
         "original_dim": D, "kept_dim": int(keep.sum()), "removed_dim": int(D - keep.sum()),
         "fit_rows_for_quantiles": int(sample.shape[0]), "fit_rows_for_mean_std": int(count),
@@ -3945,9 +3986,11 @@ def run_stage2_extraction(*, linear_out_dir: Path, ds_train_list: list[Any], ds_
 
 
 def run_stage3_preprocessing(*, linear_out_dir: Path, extractor_name: str, preprocess_name: str = "default") -> Dict[str, Any]:  # type: ignore[override]
+    if LINEAR_PREPROCESS_FIT_SPLIT != "train_full":
+        raise ValueError("Stage 3 now supports BYBIT_LINEAR_PREPROCESS_FIT_SPLIT=train_full only")
     splits = build_linear_cmssl_splits_from_out_root(out_root=Path(OUT_ROOT)); extractor, stage2_payload = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name)
     stage3_dir = resolve_stage3_dir(linear_out_dir, extractor_name, preprocess_name); stage3_dir.mkdir(parents=True, exist_ok=True); audit_dir = resolve_stage3_audit_dir(stage3_dir) if LINEAR_PREPROCESS_AUDIT else None
-    cfg = {"schema": LINEAR_PREPROCESS_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "winsorize": LINEAR_PREPROCESS_WINSORIZE, "winsor_q_lo": LINEAR_PREPROCESS_WINSOR_Q_LO, "winsor_q_hi": LINEAR_PREPROCESS_WINSOR_Q_HI, "standardize": LINEAR_PREPROCESS_STANDARDIZE, "std_eps": LINEAR_PREPROCESS_STD_EPS, "variance_filter": LINEAR_PREPROCESS_VARIANCE_FILTER, "min_std": LINEAR_PREPROCESS_MIN_STD, "post_clip_abs": LINEAR_PREPROCESS_POST_CLIP_ABS, "nonfinite_policy": LINEAR_PREPROCESS_NONFINITE_POLICY, "fit_max_rows": LINEAR_PREPROCESS_FIT_MAX_ROWS, "fit_max_matrix_mb": LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB, **_decision_metadata()}
+    cfg = {"schema": LINEAR_PREPROCESS_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "fit_split": "train_full", "winsorize": LINEAR_PREPROCESS_WINSORIZE, "winsor_q_lo": LINEAR_PREPROCESS_WINSOR_Q_LO, "winsor_q_hi": LINEAR_PREPROCESS_WINSOR_Q_HI, "standardize": LINEAR_PREPROCESS_STANDARDIZE, "std_eps": LINEAR_PREPROCESS_STD_EPS, "variance_filter": LINEAR_PREPROCESS_VARIANCE_FILTER, "min_std": LINEAR_PREPROCESS_MIN_STD, "post_clip_abs": LINEAR_PREPROCESS_POST_CLIP_ABS, "nonfinite_policy": LINEAR_PREPROCESS_NONFINITE_POLICY, "fit_max_rows": LINEAR_PREPROCESS_FIT_MAX_ROWS, "fit_max_matrix_mb": LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB, **_decision_metadata()}
     bundle = _fit_preprocess_from_stream(extractor, splits["ds_train_list"], cfg, splits["train_week_keys"]); bundle_path = stage3_dir / "linear_preprocess_bundle.npz"; save_linear_preprocess_bundle(bundle, bundle_path)
     train_s = _audit_stream_split(extractor, bundle, splits["ds_train_list"], "train", is_train=True, audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_train.json")
     val_s = _audit_stream_split(extractor, bundle, splits["ds_val"], "val", is_train=False, audit_path=None if audit_dir is None else audit_dir / "preprocess_audit_val.json")
@@ -4041,7 +4084,7 @@ def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extrac
 
 def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess_name: str, device: torch.device) -> Dict[str, Any]:  # type: ignore[override]
     if LINEAR_STAGE4_TRAIN_SPLIT != "train_full": raise ValueError("Stage 4 now supports only train_full streaming")
-    splits = build_linear_cmssl_splits_from_out_root(out_root=Path(OUT_ROOT)); extractor, st2 = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name); st3 = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"]))); stats = load_linear_trim_stats(linear_out_dir)
+    splits = build_linear_cmssl_splits_from_out_root(out_root=Path(OUT_ROOT)); extractor, st2 = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name); st3 = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name); _validate_manifest_decision_policy(st3, context=f"stage4 stage3 {extractor_name}"); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"]))); stats = load_linear_trim_stats(linear_out_dir)
     cfg = {"schema": LINEAR_STAGE4_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "predictor": LINEAR_STAGE4_PREDICTOR, "penalty": LINEAR_STAGE4_PENALTY, "l1_ratio": LINEAR_STAGE4_L1_RATIO, "epochs": LINEAR_STAGE4_EPOCHS, "batch_rows": LINEAR_STAGE4_BATCH_ROWS, "random_state": LINEAR_STAGE4_RANDOM_SEED, "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING, "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING, "mag_floor": LINEAR_STAGE4_MAG_FLOOR, **_decision_metadata()}
     cands = train_stage4_candidates_streaming(extractor=extractor, preprocess_bundle=pb, ds_train_list=splits["ds_train_list"], stats=stats, alpha_values=[float(a) for a in LINEAR_STAGE4_ALPHA_VALUES], config=cfg)
     summaries=[]; best=None; best_metrics=None; best_score=float("-inf"); best_alpha=None
@@ -4098,8 +4141,5 @@ def run_stage5_comparison(*, linear_out_dir: Path, extractor_names: list[str], p
     json_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy_json.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
 
 if __name__ == "__main__":
-    if LINEAR_STAGE in {"stage3", "stage4", "stage5"}:
-        assert OUT_ROOT or LINEAR_OUT_DIR, "Set BYBIT_OUT_ROOT or BYBIT_LINEAR_OUT_DIR"
-    else:
-        assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
+    assert OUT_ROOT, "Set BYBIT_OUT_ROOT to the root created by offline_ingest.py"
     main()
