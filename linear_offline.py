@@ -15,9 +15,9 @@ import numpy as np
 import torch
 
 from CMSSL17 import (  # type: ignore
-    LOOKBACK, WINDOW_MS, HORIZONS_MS,
+    LOOKBACK, HORIZONS_MS,
     BATCH_SIZE,
-    PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS, PRIMARY_DIR_BAL_ACC_GUARD,
+    PRIMARY_METRIC, PRIMARY_METRIC_HORIZON_MS,
     LOW_ABS_TRIM_FRACTION, HIGH_ABS_TRIM_FRACTION,
     TARGET_TRANSFORM, TARGET_TASK, LABEL_TRIM_SCHEMA,
     MODEL_OUTPUT_SCHEMA,
@@ -35,29 +35,15 @@ from CMSSL17_offline import (  # type: ignore
     build_signed_side_trim_masks_from_stats_np,
     _binary_auc_np,
     _safe_spearman_np,
-    compute_dir_class_weights_from_train_labels,
-    compute_mag_init_targets_from_train_labels,
     load_stats_cache,
     cache_matches,
     save_stats_cache,
-    CPUWindowBatchSource,
-    make_train_band_eval_source,
     summarize_metrics,
-    print_band_metrics_summary,
-    save_band_metrics_jsonl,
-    FAST_VAL_MAX_ROWS,
     BAND_DIAG,
-    BAND_DIAG_TRAIN,
-    BAND_DIAG_TRAIN_MAX_ROWS,
     BAND_DIAG_QUANTILES,
 )
 from CMSSL17_linear import (  # type: ignore
-    LINEAR_CHECKPOINT_SCHEMA,
-    LINEAR_MODEL_ARCH_SCHEMA,
     LINEAR_EXTRACTOR_SCHEMA,
-    LinearConstantPriorModel,
-    build_constant_priors_from_train_labels,
-    linear_model_summary,
     build_linear_extractor_from_config,
     LinearPreprocessBundle,
     LinearSklearnTakerBundle,
@@ -147,7 +133,6 @@ LINEAR_STAGE = os.environ.get("BYBIT_LINEAR_STAGE", "stage1").strip().lower()
 LINEAR_DEVICE = os.environ.get("BYBIT_LINEAR_DEVICE", "cpu").strip().lower()
 LINEAR_EVAL_BATCH_SIZE = _env_int("BYBIT_LINEAR_BATCH_SIZE", BATCH_SIZE)
 LINEAR_RUN_TEST = _env_bool("BYBIT_LINEAR_RUN_TEST", 1)
-LINEAR_STAGE2_RUN_PRIOR_EVAL = _env_bool("BYBIT_LINEAR_STAGE2_RUN_PRIOR_EVAL", 1)
 LINEAR_DECISION_STRIDE_ROWS = _env_int("BYBIT_LINEAR_DECISION_STRIDE_ROWS", 5)
 LINEAR_DECISION_OFFSET_ROWS = _env_int("BYBIT_LINEAR_DECISION_OFFSET_ROWS", 0)
 LINEAR_PROGRESS = _env_bool("BYBIT_LINEAR_PROGRESS", 1)
@@ -425,6 +410,22 @@ def _make_cache_meta(meta: Dict[str, Any], protocol: str, train_week_keys: list[
         **_decision_metadata(),
         "linear_stage": "stage1",
     }
+
+
+def summarize_linear_trim_stats(stats: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    keys = [
+        "pos_lo_raw_bps",
+        "pos_hi_raw_bps",
+        "neg_lo_abs_bps",
+        "neg_hi_abs_bps",
+        "kept_pos_q50_abs_raw_bps",
+        "kept_neg_q50_abs_raw_bps",
+    ]
+    out: Dict[str, Any] = {}
+    for k in keys:
+        if k in stats:
+            out[k] = np.asarray(stats[k]).astype(float).tolist()
+    return out
 
 
 def _print_primary(tag: str, metrics: Dict[str, Any], primary_metric_value: float, primary_metric_label: str) -> None:
@@ -1329,7 +1330,7 @@ def load_linear_trim_stats(linear_out_dir: Path) -> Dict[str, np.ndarray]:
     cached = load_stats_cache(path)
     if not cached:
         raise FileNotFoundError(
-            f"Missing linear trim stats cache: {path}. Run stage1 or stage2 first."
+            f"Missing linear trim stats cache: {path}. Run stage1 first."
         )
 
     stats, cache_meta = cached
@@ -2001,10 +2002,15 @@ def main() -> None:
     protocol = plan["protocol"]
     train_week_keys = list(plan["train_week_keys"])
     train_split_entries = list(plan["train_split_entries"])
-    cmssl_val = plan["val_split_entry"]
-    cmssl_test = plan["test_split_entry"]
-    has_cmssl_test = bool(plan["has_cmssl_test"])
-    feature_dim_total = int(plan["feature_dim_total"])
+
+    if LINEAR_STAGE == "stage2":
+        with LinearTimer("stage2"):
+            run_stage2_extraction(
+                linear_out_dir=linear_out_dir,
+                plan=plan,
+                extractor_config=extractor_config or _build_extractor_config(),
+            )
+        return
 
     _print_decision_row_policy(LINEAR_STAGE)
     y_train = collect_train_labels_from_plan(plan)
@@ -2020,174 +2026,33 @@ def main() -> None:
         save_stats_cache(cache_path, stats, cache_meta)
         print(f"[linear-train-stats] wrote_cache={cache_path}", flush=True)
 
-    dir_pos_w, dir_neg_w = compute_dir_class_weights_from_train_labels(
-        y_train,
-        pos_lo=stats["pos_lo_raw_bps"],
-        pos_hi=stats["pos_hi_raw_bps"],
-        neg_lo=stats["neg_lo_abs_bps"],
-        neg_hi=stats["neg_hi_abs_bps"],
-    )
-    mag_pos_init_sqrt, mag_neg_init_sqrt = compute_mag_init_targets_from_train_labels(
-        y_train,
-        pos_lo=stats["pos_lo_raw_bps"],
-        pos_hi=stats["pos_hi_raw_bps"],
-        neg_lo=stats["neg_lo_abs_bps"],
-        neg_hi=stats["neg_hi_abs_bps"],
-        pos_q50=stats["kept_pos_q50_abs_raw_bps"],
-        neg_q50=stats["kept_neg_q50_abs_raw_bps"],
-    )
-    print(f"[linear-train-stats] dir_pos_w={dir_pos_w.tolist()} dir_neg_w={dir_neg_w.tolist()}", flush=True)
-    print(
-        f"[linear-prior-mag] pos_target_sqrt={mag_pos_init_sqrt.tolist()} "
-        f"neg_target_sqrt={mag_neg_init_sqrt.tolist()}",
-        flush=True,
-    )
-
-    train_keep_pos, train_keep_neg, train_keep_signed = build_signed_side_trim_masks_from_stats_np(y_train, stats)
-    prior_info = build_constant_priors_from_train_labels(
-        y_train=y_train,
-        stats=stats,
-        mag_up_sqrt_prior=mag_pos_init_sqrt,
-        mag_down_sqrt_prior=mag_neg_init_sqrt,
-        keep_pos=train_keep_pos,
-        keep_neg=train_keep_neg,
-        keep_signed=train_keep_signed,
-    )
-    print(
-        f"[linear-prior] p_up={prior_info['p_up_prior'].tolist()} "
-        f"dir_logit={prior_info['dir_logit_prior'].tolist()}",
-        flush=True,
-    )
-    model = LinearConstantPriorModel(
-        prior_info["dir_logit_prior"],
-        prior_info["mag_up_sqrt_prior"],
-        prior_info["mag_down_sqrt_prior"],
-    ).to(device)
-    model.eval()
-
-    if LINEAR_STAGE == "stage2":
-        with LinearTimer("stage2"):
-            run_stage2_extraction(
-                linear_out_dir=linear_out_dir,
-                plan=plan,
-                extractor_config=extractor_config or _build_extractor_config(),
-            )
-        if not LINEAR_STAGE2_RUN_PRIOR_EVAL:
-            return
-
-    train_band_metrics: Optional[Dict[str, Any]] = None
-    if BAND_DIAG and BAND_DIAG_TRAIN:
-        print("[linear-memory] stage1 train band diagnostics are skipped in streaming mode to avoid keeping train weeks alive", flush=True)
-
-    ds_val = build_val_dataset_from_plan(plan)
-    try:
-        val_full_src = DatasetPositionsBatchSource(ds_val, device, LINEAR_EVAL_BATCH_SIZE, split_name="linear_val_full")
-        val_fast_src = val_full_src.make_evenly_spaced_subset(FAST_VAL_MAX_ROWS)
-        val_fast = summarize_metrics(model, val_fast_src, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=True, epoch=0, band_diag=BAND_DIAG, split_name="linear_val_fast")
-        primary_metric_value, primary_metric_label = compute_primary_metric(val_fast)
-        _print_primary("linear_val_fast", val_fast, primary_metric_value, primary_metric_label)
-        val_full = summarize_metrics(model, val_full_src, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name="linear_val_full")
-        val_full_primary_value, val_full_primary_label = compute_primary_metric(val_full)
-        _print_primary("linear_val_full", val_full, val_full_primary_value, val_full_primary_label)
-        if BAND_DIAG and "band_metrics" in val_full:
-            print_band_metrics_summary(val_full["band_metrics"], split_name="linear_val_full", epoch=0)
-            save_band_metrics_jsonl(linear_out_dir, val_full["band_metrics"], epoch=0, split_name="linear_val_full")
-    finally:
-        if "val_fast_src" in locals():
-            del val_fast_src
-        if "val_full_src" in locals():
-            del val_full_src
-        close_dataset(ds_val, name="stage1_val")
-        del ds_val
-        force_gc("stage1_val")
-
-    test_metrics: Optional[Dict[str, Any]] = None
-    if LINEAR_RUN_TEST and has_cmssl_test:
-        ds_test = build_test_dataset_from_plan(plan)
-        if ds_test is not None:
-            try:
-                test_src = DatasetPositionsBatchSource(ds_test, device, LINEAR_EVAL_BATCH_SIZE, split_name="linear_test")
-                test_metrics = summarize_metrics(model, test_src, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name="linear_test")
-                test_primary_value, test_primary_label = compute_primary_metric(test_metrics)
-                _print_primary("linear_test", test_metrics, test_primary_value, test_primary_label)
-                if BAND_DIAG and "band_metrics" in test_metrics:
-                    print_band_metrics_summary(test_metrics["band_metrics"], split_name="linear_test", epoch=0)
-                    save_band_metrics_jsonl(linear_out_dir, test_metrics["band_metrics"], epoch=0, split_name="linear_test")
-            finally:
-                if "test_src" in locals():
-                    del test_src
-                close_dataset(ds_test, name="stage1_test")
-                del ds_test
-                force_gc("stage1_test")
-
     metrics_payload = {
         "stage": "stage1",
         "status": "ok",
+        "purpose": "linear_trim_stats_only",
         "out_root": str(out_root),
         "linear_out_dir": str(linear_out_dir),
         **_decision_metadata(),
         "protocol": protocol,
         "train_week_keys": train_week_keys,
-        "val_weeks": cmssl_val.get("weeks"),
-        "test_weeks": cmssl_test.get("weeks") if has_cmssl_test else None,
-        "feature_dim_total": feature_dim_total,
-        "lookback": LOOKBACK,
+        "val_weeks": plan["val_split_entry"].get("weeks"),
+        "test_weeks": plan["test_split_entry"].get("weeks") if plan.get("has_cmssl_test") else None,
+        "feature_dim_total": int(plan["feature_dim_total"]),
+        "lookback": int(LOOKBACK),
         "horizons_ms": [int(h) for h in HORIZONS_MS],
         "target_task": TARGET_TASK,
         "target_transform": TARGET_TRANSFORM,
         "label_trim_schema": LABEL_TRIM_SCHEMA,
         "model_output_schema": MODEL_OUTPUT_SCHEMA,
-        "linear_checkpoint_schema": LINEAR_CHECKPOINT_SCHEMA,
-        "linear_model_arch_schema": LINEAR_MODEL_ARCH_SCHEMA,
-        "prior": linear_model_summary(model),
-        "primary_metric": {
-            "name": primary_metric_label,
-            "value": float(primary_metric_value),
-            "guard_dir_bal_acc": float(val_fast.get("primary_dir_bal_acc", float("nan"))),
-            "guard_passed": bool(val_fast.get("primary_metric_guard_passed", False)),
-        },
-        "val_fast_metrics": val_fast,
-        "val_full_metrics": val_full,
-        "test_metrics": test_metrics,
-        "train_band_metrics": train_band_metrics,
+        "trim_stats_cache_path": str(cache_path),
+        "train_label_rows": int(y_train.shape[0]),
+        "stats_summary": summarize_linear_trim_stats(stats),
     }
     metrics_path = linear_out_dir / "linear_stage1_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics_payload, f, allow_nan=True, indent=2)
-    print(f"[linear_metrics] wrote {metrics_path}", flush=True)
-
-    ckpt = {
-        "state_dict": model.state_dict(),
-        "args": {
-            "linear_checkpoint_schema": LINEAR_CHECKPOINT_SCHEMA,
-            "linear_model_arch_schema": LINEAR_MODEL_ARCH_SCHEMA,
-            "model_output_schema": MODEL_OUTPUT_SCHEMA,
-            "stage": "stage1",
-            "feature_dim_total": feature_dim_total,
-            "LOOKBACK": LOOKBACK,
-            "WINDOW_MS": WINDOW_MS,
-            "HORIZONS_MS": HORIZONS_MS,
-            "target_task": TARGET_TASK,
-            "target_transform": TARGET_TRANSFORM,
-            "label_trim_schema": LABEL_TRIM_SCHEMA,
-            "low_abs_trim_fraction": float(LOW_ABS_TRIM_FRACTION),
-            "high_abs_trim_fraction": float(HIGH_ABS_TRIM_FRACTION),
-            "primary_metric": PRIMARY_METRIC,
-            "primary_metric_horizon_ms": PRIMARY_METRIC_HORIZON_MS,
-            "primary_dir_bal_acc_guard": PRIMARY_DIR_BAL_ACC_GUARD,
-            "split_protocol": protocol,
-            "train_week_keys": train_week_keys,
-            **_decision_metadata(),
-        },
-        "prior": linear_model_summary(model),
-        "stats": stats,
-        "val_fast_metrics": val_fast,
-        "val_full_metrics": val_full,
-    }
-    ckpt_path = linear_out_dir / "linear_stage1_prior.pt"
-    torch.save(ckpt, ckpt_path)
-    print(f"[linear_ckpt] saved {ckpt_path}", flush=True)
-
+    print(f"[linear-stage1] wrote stats metadata {metrics_path}", flush=True)
+    return
 
 
 def load_linear_split_plan_from_out_root(*, out_root: Path) -> Dict[str, Any]:
