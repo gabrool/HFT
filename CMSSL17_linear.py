@@ -4,6 +4,9 @@ This module intentionally contains only lightweight constant-prior utilities for
 smoke-testing the linear pipeline against CMSSL's existing dataset/eval path.
 """
 
+import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
@@ -18,6 +21,102 @@ LINEAR_MODEL_ARCH_SCHEMA = "linear_stage1_constant_prior_v1"
 LINEAR_EXTRACTOR_SCHEMA = "linear_extractor_stage2_v1"
 LINEAR_RAW_LINEAR_SCHEMA = "raw_linear_lag_bank_stats_v1"
 LINEAR_AEON_EXTRACTOR_SCHEMA = "aeon_rocket_hydra_stage2_v1"
+
+
+@dataclass
+class LinearPreprocessBundle:
+    schema: str
+    config: Dict[str, Any]
+    original_dim: int
+    kept_dim: int
+    lower: np.ndarray
+    upper: np.ndarray
+    mean: np.ndarray
+    std: np.ndarray
+    keep_mask: np.ndarray
+    fit_summary: Dict[str, Any]
+
+    def transform(self, Z: np.ndarray) -> np.ndarray:
+        Z = np.asarray(Z, dtype=np.float32)
+        if Z.ndim != 2:
+            raise ValueError(f"Z must have shape [N, D], got {Z.shape}")
+        if Z.shape[1] != int(self.original_dim):
+            raise ValueError(f"Z width {Z.shape[1]} != original_dim {self.original_dim}")
+
+        nonfinite_policy = str(self.config.get("nonfinite_policy", "raise")).strip().lower()
+        if nonfinite_policy == "raise":
+            if not np.isfinite(Z).all():
+                raise ValueError("Linear preprocessor input contains non-finite values")
+        elif nonfinite_policy == "warn_zero":
+            if not np.isfinite(Z).all():
+                print("[linear-preprocess-warn] replacing non-finite input values with zero", flush=True)
+                Z = np.where(np.isfinite(Z), Z, 0.0).astype(np.float32, copy=False)
+        else:
+            raise ValueError(f"Unsupported nonfinite_policy {nonfinite_policy!r}")
+
+        lower = np.asarray(self.lower, dtype=np.float32)
+        upper = np.asarray(self.upper, dtype=np.float32)
+        mean = np.asarray(self.mean, dtype=np.float32)
+        std = np.asarray(self.std, dtype=np.float32)
+        keep_mask = np.asarray(self.keep_mask, dtype=bool)
+        for name, arr in (("lower", lower), ("upper", upper), ("mean", mean), ("std", std), ("keep_mask", keep_mask)):
+            if arr.shape != (int(self.original_dim),):
+                raise ValueError(f"{name} must have shape [{self.original_dim}], got {arr.shape}")
+        if int(keep_mask.sum()) != int(self.kept_dim):
+            raise ValueError(f"keep_mask sum {int(keep_mask.sum())} != kept_dim {self.kept_dim}")
+
+        std_eps = float(self.config.get("std_eps", 1e-6))
+        post_clip_abs = float(self.config.get("post_clip_abs", 0.0))
+        Zc = np.minimum(np.maximum(Z, lower), upper)
+        Zn = (Zc - mean) / np.maximum(std, std_eps)
+        Zn = Zn[:, keep_mask]
+        if post_clip_abs > 0.0:
+            Zn = np.clip(Zn, -post_clip_abs, post_clip_abs)
+        return Zn.astype(np.float32, copy=False)
+
+
+def save_linear_preprocess_bundle(bundle: LinearPreprocessBundle, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema=np.array(str(bundle.schema)),
+        config_json=np.array(json.dumps(bundle.config, sort_keys=True)),
+        original_dim=np.array([bundle.original_dim], dtype=np.int64),
+        kept_dim=np.array([bundle.kept_dim], dtype=np.int64),
+        lower=np.asarray(bundle.lower, dtype=np.float32),
+        upper=np.asarray(bundle.upper, dtype=np.float32),
+        mean=np.asarray(bundle.mean, dtype=np.float32),
+        std=np.asarray(bundle.std, dtype=np.float32),
+        keep_mask=np.asarray(bundle.keep_mask, dtype=bool),
+        fit_summary_json=np.array(json.dumps(bundle.fit_summary, sort_keys=True, allow_nan=True)),
+    )
+
+
+def load_linear_preprocess_bundle(path: Path) -> LinearPreprocessBundle:
+    with np.load(Path(path), allow_pickle=False) as arr:
+        schema = str(arr["schema"].item())
+        config = json.loads(str(arr["config_json"].item()))
+        original_dim = int(np.asarray(arr["original_dim"]).reshape(-1)[0])
+        kept_dim = int(np.asarray(arr["kept_dim"]).reshape(-1)[0])
+        fit_summary = json.loads(str(arr["fit_summary_json"].item()))
+        bundle = LinearPreprocessBundle(
+            schema=schema,
+            config=config,
+            original_dim=original_dim,
+            kept_dim=kept_dim,
+            lower=np.asarray(arr["lower"], dtype=np.float32),
+            upper=np.asarray(arr["upper"], dtype=np.float32),
+            mean=np.asarray(arr["mean"], dtype=np.float32),
+            std=np.asarray(arr["std"], dtype=np.float32),
+            keep_mask=np.asarray(arr["keep_mask"], dtype=bool),
+            fit_summary=fit_summary,
+        )
+    if bundle.lower.shape != (bundle.original_dim,) or bundle.keep_mask.shape != (bundle.original_dim,):
+        raise ValueError(f"Invalid linear preprocess bundle shapes in {path}")
+    if int(bundle.keep_mask.sum()) != bundle.kept_dim:
+        raise ValueError(f"Invalid linear preprocess bundle kept_dim in {path}")
+    return bundle
 
 
 def safe_logit_np(p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
