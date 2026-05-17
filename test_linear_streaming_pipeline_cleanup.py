@@ -48,6 +48,38 @@ class FakeModelBundle:
         self.fit_summary = {"train_rows": 10}
 
 
+def test_dataset_positions_batch_source_has_iter_epoch(monkeypatch):
+    import numpy as np
+    import torch
+    import linear_offline
+
+    class FakeDataset:
+        y = np.zeros((10, len(linear_offline.HORIZONS_MS)), dtype=np.float32)
+
+        def __len__(self):
+            return 10
+
+    monkeypatch.setattr(
+        linear_offline,
+        "collect_windows_for_positions",
+        lambda ds, pos, batch_rows, split_name: (
+            np.zeros((len(pos), linear_offline.LOOKBACK, 4), dtype=np.float32),
+            np.zeros((len(pos), len(linear_offline.HORIZONS_MS)), dtype=np.float32),
+        ),
+    )
+
+    src = linear_offline.DatasetPositionsBatchSource(
+        FakeDataset(),
+        torch.device("cpu"),
+        batch_rows=2,
+        max_rows=4,
+        split_name="unit",
+    )
+
+    x, y = next(src.iter_epoch(0))
+    assert x.shape[0] == y.shape[0]
+
+
 def _stage3_payload(tmp_path: Path, **overrides):
     payload = {
         "stage": "stage3",
