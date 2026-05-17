@@ -111,6 +111,13 @@ LINEAR_RUN_TEST = _env_bool("BYBIT_LINEAR_RUN_TEST", 1)
 LINEAR_STAGE2_RUN_PRIOR_EVAL = _env_bool("BYBIT_LINEAR_STAGE2_RUN_PRIOR_EVAL", 1)
 LINEAR_DECISION_STRIDE_ROWS = _env_int("BYBIT_LINEAR_DECISION_STRIDE_ROWS", 5)
 LINEAR_DECISION_OFFSET_ROWS = _env_int("BYBIT_LINEAR_DECISION_OFFSET_ROWS", 0)
+LINEAR_PROGRESS = _env_bool("BYBIT_LINEAR_PROGRESS", 1)
+LINEAR_PROGRESS_BACKEND = os.environ.get(
+    "BYBIT_LINEAR_PROGRESS_BACKEND", "auto"
+).strip().lower()
+LINEAR_PROGRESS_EVERY_SEC = float(
+    os.environ.get("BYBIT_LINEAR_PROGRESS_EVERY_SEC", "10")
+)
 DECISION_ROW_POLICY = "linear_every_n_rows_v1"
 
 LINEAR_PREPROCESS_SCHEMA = "linear_preprocess_stage3_v1"
@@ -212,6 +219,15 @@ RAW_LINEAR_INCLUDE_SLOPE = _env_bool("BYBIT_RAW_LINEAR_INCLUDE_SLOPE", 0)
 LINEAR_NUM_KERNELS = _env_int("BYBIT_LINEAR_NUM_KERNELS", 10000)
 LINEAR_HYDRA_N_KERNELS = _env_int("BYBIT_LINEAR_HYDRA_N_KERNELS", 8)
 LINEAR_HYDRA_N_GROUPS = _env_int("BYBIT_LINEAR_HYDRA_N_GROUPS", 64)
+
+if LINEAR_PROGRESS_BACKEND not in {"auto", "tqdm", "log", "off"}:
+    raise ValueError(
+        "BYBIT_LINEAR_PROGRESS_BACKEND must be one of: auto, tqdm, log, off"
+    )
+if LINEAR_PROGRESS_EVERY_SEC <= 0:
+    raise ValueError(
+        f"BYBIT_LINEAR_PROGRESS_EVERY_SEC must be > 0, got {LINEAR_PROGRESS_EVERY_SEC}"
+    )
 
 if LINEAR_DECISION_STRIDE_ROWS <= 0:
     raise ValueError(
@@ -451,6 +467,187 @@ def _dataset_positions(n_rows: int, max_rows: int) -> np.ndarray:
     return base[idx]
 
 
+def decision_row_count(n_rows: int, max_rows: int = 0) -> int:
+    n_rows = int(n_rows)
+    max_rows = int(max_rows)
+
+    if n_rows <= 0:
+        return 0
+    if LINEAR_DECISION_OFFSET_ROWS >= n_rows:
+        return 0
+
+    base = ((n_rows - 1 - LINEAR_DECISION_OFFSET_ROWS) // LINEAR_DECISION_STRIDE_ROWS) + 1
+
+    if max_rows > 0:
+        return min(int(base), max_rows)
+    return int(base)
+
+
+def train_decision_row_count(ds_train_list: list[Any], max_rows: int = 0) -> int:
+    counts = [decision_row_count(len(ds), 0) for ds in ds_train_list]
+    total = int(sum(counts))
+    if int(max_rows) > 0:
+        return min(total, int(max_rows))
+    return total
+
+
+def describe_rows_for_split(obj: Any, *, max_rows: int = 0, is_train_list: bool = False) -> int:
+    if is_train_list:
+        return train_decision_row_count(obj, max_rows=max_rows)
+    return decision_row_count(len(obj), max_rows=max_rows)
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+    hours = minutes / 60.0
+    return f"{hours:.2f}h"
+
+
+def _progress_desc(stage: str, action: str, split: str = "", extra: str = "") -> str:
+    parts = [str(stage), str(action)]
+    if split:
+        parts.append(str(split))
+    if extra:
+        parts.append(str(extra))
+    return " ".join(parts)
+
+
+def _progress_metadata() -> Dict[str, Any]:
+    return {
+        "progress_enabled": bool(LINEAR_PROGRESS and LINEAR_PROGRESS_BACKEND != "off"),
+        "progress_backend": str(LINEAR_PROGRESS_BACKEND),
+    }
+
+
+def _default_row_getter(item) -> int:
+    # Most streaming iterators yield (Z_or_X, y, pos).
+    if isinstance(item, tuple) and len(item) >= 2:
+        y = item[1]
+        if hasattr(y, "shape"):
+            return int(y.shape[0])
+    return 0
+
+
+def progress_iter_rows(
+    iterable,
+    *,
+    total_rows: int,
+    desc: str,
+    row_getter=None,
+):
+    if row_getter is None:
+        row_getter = _default_row_getter
+
+    if (not LINEAR_PROGRESS) or LINEAR_PROGRESS_BACKEND == "off":
+        yield from iterable
+        return
+
+    total_rows = int(total_rows)
+    if total_rows < 0:
+        total_rows = 0
+
+    backend = LINEAR_PROGRESS_BACKEND
+    use_tqdm = backend in {"auto", "tqdm"}
+
+    if use_tqdm:
+        try:
+            from tqdm.auto import tqdm
+
+            pbar = tqdm(
+                total=total_rows if total_rows > 0 else None,
+                desc=desc,
+                unit="rows",
+                dynamic_ncols=True,
+                smoothing=0.05,
+            )
+            try:
+                for item in iterable:
+                    rows = int(row_getter(item))
+                    yield item
+                    if rows > 0:
+                        pbar.update(rows)
+            finally:
+                pbar.close()
+            return
+        except Exception as exc:
+            if backend == "tqdm":
+                print(
+                    f"[linear-progress-warn] tqdm unavailable/failed for {desc}: {exc}; "
+                    "falling back to periodic logs",
+                    flush=True,
+                )
+
+    start = time.time()
+    last = start
+    seen = 0
+
+    print(
+        f"[linear-progress] start {desc} total_rows={total_rows if total_rows > 0 else 'unknown'}",
+        flush=True,
+    )
+
+    for item in iterable:
+        rows = int(row_getter(item))
+        yield item
+        seen += max(0, rows)
+
+        now = time.time()
+        if now - last >= float(LINEAR_PROGRESS_EVERY_SEC):
+            elapsed = now - start
+            rate = seen / max(1e-9, elapsed)
+            if total_rows > 0:
+                remaining = max(0, total_rows - seen)
+                eta = remaining / max(1e-9, rate)
+                pct = 100.0 * seen / max(1, total_rows)
+                print(
+                    f"[linear-progress] {desc} rows={seen}/{total_rows} "
+                    f"pct={pct:.1f}% rate={rate:.1f} rows/s "
+                    f"elapsed={_format_seconds(elapsed)} eta={_format_seconds(eta)}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[linear-progress] {desc} rows={seen} "
+                    f"rate={rate:.1f} rows/s elapsed={_format_seconds(elapsed)}",
+                    flush=True,
+                )
+            last = now
+
+    elapsed = time.time() - start
+    rate = seen / max(1e-9, elapsed)
+    print(
+        f"[linear-progress] done {desc} rows={seen}"
+        + (f"/{total_rows}" if total_rows > 0 else "")
+        + f" rate={rate:.1f} rows/s elapsed={_format_seconds(elapsed)}",
+        flush=True,
+    )
+
+
+class LinearTimer:
+    def __init__(self, name: str):
+        self.name = name
+        self.start = 0.0
+
+    def __enter__(self):
+        self.start = time.time()
+        print(f"[linear-timer] start {self.name}", flush=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        elapsed = time.time() - self.start
+        status = "error" if exc_type is not None else "done"
+        print(
+            f"[linear-timer] {status} {self.name} elapsed={_format_seconds(elapsed)}",
+            flush=True,
+        )
+        return False
+
+
 def estimate_x_window_mb(n_rows: int, lookback: int, feature_dim: int, dtype_bytes: int = 4) -> float:
     return float(n_rows) * float(lookback) * float(feature_dim) * float(dtype_bytes) / (1024.0**2)
 
@@ -666,24 +863,36 @@ def collect_fit_windows_from_train(
     ds_train_list: list[Any],
     max_rows: int,
     batch_rows: int,
+    *,
+    progress_stage: str = "stage2",
+    progress_action: str = "fit_sample",
 ) -> tuple[np.ndarray, np.ndarray]:
     if not ds_train_list:
         raise ValueError("No train datasets supplied for extractor fitting")
     if max_rows <= 0:
-        max_rows = sum(int(_decision_positions(len(ds)).shape[0]) for ds in ds_train_list)
+        max_rows = train_decision_row_count(ds_train_list, 0)
     per_week = int(np.ceil(max_rows / max(1, len(ds_train_list))))
     x_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
     for i, ds in enumerate(ds_train_list):
-        rows_i = min(int(_decision_positions(len(ds)).shape[0]), per_week)
-        X_i, y_i = collect_windows_from_dataset(
+        rows_i = min(decision_row_count(len(ds), 0), per_week)
+        if rows_i <= 0:
+            continue
+        base_iter = iter_dataset_window_batches(
             ds,
             max_rows=rows_i,
             batch_rows=batch_rows,
             split_name=f"train_fit_week{i}",
         )
-        x_parts.append(X_i)
-        y_parts.append(y_i)
+        for X_i, y_i, _pos in progress_iter_rows(
+            base_iter,
+            total_rows=rows_i,
+            desc=_progress_desc(progress_stage, progress_action, f"train_fit_week{i}"),
+        ):
+            x_parts.append(X_i)
+            y_parts.append(y_i)
+    if not x_parts:
+        raise ValueError("Cannot collect zero fit rows from train datasets")
     X = np.concatenate(x_parts, axis=0)[:max_rows].astype(np.float32, copy=False)
     y = np.concatenate(y_parts, axis=0)[:max_rows].astype(np.float32, copy=False)
     print(
@@ -3381,13 +3590,14 @@ def main() -> None:
             f"device={device} linear_out_dir={linear_out_dir}",
             flush=True,
         )
-        run_stage5_comparison(
-            linear_out_dir=linear_out_dir,
-            extractor_names=LINEAR_STAGE5_EXTRACTOR_VALUES,
-            preprocess_name=LINEAR_STAGE5_PREPROCESS_NAME,
-            predictor=LINEAR_STAGE5_PREDICTOR,
-            device=device,
-        )
+        with LinearTimer("stage5"):
+            run_stage5_comparison(
+                linear_out_dir=linear_out_dir,
+                extractor_names=LINEAR_STAGE5_EXTRACTOR_VALUES,
+                preprocess_name=LINEAR_STAGE5_PREPROCESS_NAME,
+                predictor=LINEAR_STAGE5_PREDICTOR,
+                device=device,
+            )
         return
     if LINEAR_STAGE == "stage3":
         print(
@@ -3395,7 +3605,8 @@ def main() -> None:
             f"out_root={out_root} linear_out_dir={linear_out_dir}",
             flush=True,
         )
-        run_stage3_preprocessing(linear_out_dir=linear_out_dir, extractor_name=LINEAR_EXTRACTOR)
+        with LinearTimer("stage3"):
+            run_stage3_preprocessing(linear_out_dir=linear_out_dir, extractor_name=LINEAR_EXTRACTOR)
         return
     if LINEAR_STAGE == "stage4":
         print(
@@ -3404,12 +3615,13 @@ def main() -> None:
             f"device={device} linear_out_dir={linear_out_dir}",
             flush=True,
         )
-        run_stage4_training(
-            linear_out_dir=linear_out_dir,
-            extractor_name=LINEAR_EXTRACTOR,
-            preprocess_name=LINEAR_STAGE4_PREPROCESS_NAME,
-            device=device,
-        )
+        with LinearTimer("stage4"):
+            run_stage4_training(
+                linear_out_dir=linear_out_dir,
+                extractor_name=LINEAR_EXTRACTOR,
+                preprocess_name=LINEAR_STAGE4_PREPROCESS_NAME,
+                device=device,
+            )
         return
     if LINEAR_STAGE == "stage2":
         print(
@@ -3521,17 +3733,18 @@ def main() -> None:
     model.eval()
 
     if LINEAR_STAGE == "stage2":
-        run_stage2_extraction(
-            linear_out_dir=linear_out_dir,
-            ds_train_list=ds_train_list,
-            ds_val=ds_val,
-            ds_test=ds_test,
-            has_cmssl_test=has_cmssl_test,
-            meta=meta,
-            protocol=protocol,
-            train_week_keys=train_week_keys,
-            extractor_config=extractor_config or _build_extractor_config(),
-        )
+        with LinearTimer("stage2"):
+            run_stage2_extraction(
+                linear_out_dir=linear_out_dir,
+                ds_train_list=ds_train_list,
+                ds_val=ds_val,
+                ds_test=ds_test,
+                has_cmssl_test=has_cmssl_test,
+                meta=meta,
+                protocol=protocol,
+                train_week_keys=train_week_keys,
+                extractor_config=extractor_config or _build_extractor_config(),
+            )
         if not LINEAR_STAGE2_RUN_PRIOR_EVAL:
             return
 
@@ -3870,6 +4083,60 @@ def iter_train_window_batches(ds_train_list: list[Any], *, batch_rows: int, max_
             yield X, y, (week_idx, positions)
 
 
+def iter_dataset_window_batches_with_progress(
+    ds: Any,
+    *,
+    batch_rows: int,
+    max_rows: int = 0,
+    split_name: str,
+    stage: str,
+    action: str,
+    shuffle_within_batch: bool = False,
+    rng: Optional[np.random.Generator] = None,
+):
+    total = decision_row_count(len(ds), max_rows=max_rows)
+    base = iter_dataset_window_batches(
+        ds,
+        batch_rows=batch_rows,
+        max_rows=max_rows,
+        split_name=split_name,
+        shuffle_within_batch=shuffle_within_batch,
+        rng=rng,
+    )
+    return progress_iter_rows(
+        base,
+        total_rows=total,
+        desc=_progress_desc(stage, action, split_name),
+    )
+
+
+def iter_train_window_batches_with_progress(
+    ds_train_list: list[Any],
+    *,
+    batch_rows: int,
+    max_rows: int = 0,
+    split_name: str,
+    stage: str,
+    action: str,
+    shuffle_within_batch: bool = False,
+    rng: Optional[np.random.Generator] = None,
+):
+    total = train_decision_row_count(ds_train_list, max_rows=max_rows)
+    base = iter_train_window_batches(
+        ds_train_list,
+        batch_rows=batch_rows,
+        max_rows=max_rows,
+        split_name=split_name,
+        shuffle_within_batch=shuffle_within_batch,
+        rng=rng,
+    )
+    return progress_iter_rows(
+        base,
+        total_rows=total,
+        desc=_progress_desc(stage, action, split_name),
+    )
+
+
 def iter_extracted_batches_from_dataset(*, extractor: Any, ds: Any, batch_rows: int, max_rows: int, split_name: str, shuffle_within_batch: bool = False, rng: Optional[np.random.Generator] = None):
     for X, y, positions in iter_dataset_window_batches(ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name, shuffle_within_batch=shuffle_within_batch, rng=rng):
         Z = extractor.transform(X).astype(np.float32, copy=False)
@@ -3902,7 +4169,8 @@ def _fit_preprocess_from_stream(extractor: Any, ds_train_list: list[Any], config
     policy = str(config.get("nonfinite_policy", "raise"))
     parts = []
     rows = 0
-    for Z, _y, _p in iter_extracted_batches_from_train(extractor=extractor, ds_train_list=ds_train_list, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=int(config["fit_max_rows"]), split_name="train_quantile_sample"):
+    quantile_iter = iter_extracted_batches_from_train(extractor=extractor, ds_train_list=ds_train_list, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=int(config["fit_max_rows"]), split_name="train_quantile_sample")
+    for Z, _y, _p in progress_iter_rows(quantile_iter, total_rows=train_decision_row_count(ds_train_list, max_rows=int(config["fit_max_rows"])), desc="stage3 fit_quantile train"):
         Z = _apply_preprocess_nonfinite_policy(Z, policy=policy, context="train quantile sample")
         parts.append(Z); rows += Z.shape[0]
         if estimate_matrix_mb(rows, Z.shape[1]) >= int(config["fit_max_matrix_mb"]):
@@ -3919,7 +4187,8 @@ def _fit_preprocess_from_stream(extractor: Any, ds_train_list: list[Any], config
     lower = np.quantile(sample, float(config["winsor_q_lo"]), axis=0).astype(np.float32) if winsorize else np.full(D, -np.inf, dtype=np.float32)
     upper = np.quantile(sample, float(config["winsor_q_hi"]), axis=0).astype(np.float32) if winsorize else np.full(D, np.inf, dtype=np.float32)
     count = 0; sum_ = np.zeros(D, dtype=np.float64); sumsq = np.zeros(D, dtype=np.float64)
-    for Z, _y, _p in iter_extracted_batches_from_train(extractor=extractor, ds_train_list=ds_train_list, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name="train_mean_std"):
+    mean_std_iter = iter_extracted_batches_from_train(extractor=extractor, ds_train_list=ds_train_list, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name="train_mean_std")
+    for Z, _y, _p in progress_iter_rows(mean_std_iter, total_rows=train_decision_row_count(ds_train_list, max_rows=0), desc="stage3 fit_mean_std train"):
         Z = _apply_preprocess_nonfinite_policy(Z, policy=policy, context="train mean/std")
         Zc = np.clip(Z, lower, upper)
         sum_ += Zc.sum(axis=0, dtype=np.float64); sumsq += np.square(Zc, dtype=np.float64).sum(axis=0); count += Zc.shape[0]
@@ -3950,8 +4219,9 @@ def _fit_preprocess_from_stream(extractor: Any, ds_train_list: list[Any], config
 def _audit_stream_split(extractor: Any, bundle: LinearPreprocessBundle, source: Any, split_name: str, *, is_train: bool, audit_path: Optional[Path]) -> Dict[str, Any]:
     stats = _empty_streaming_stats(); acc = new_preprocess_audit_accumulator(bundle.original_dim, bundle.kept_dim) if LINEAR_PREPROCESS_AUDIT else None
     iterator = iter_extracted_batches_from_train(extractor=extractor, ds_train_list=source, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name=split_name) if is_train else iter_extracted_batches_from_dataset(extractor=extractor, ds=source, batch_rows=LINEAR_EXTRACT_BATCH_ROWS, max_rows=0, split_name=split_name)
+    total_rows = describe_rows_for_split(source, max_rows=0, is_train_list=is_train)
     rows = chunks = 0
-    for Z, _y, _p in iterator:
+    for Z, _y, _p in progress_iter_rows(iterator, total_rows=total_rows, desc=_progress_desc("stage3", "audit", split_name)):
         if acc is not None:
             update_preprocess_audit(acc, Z_raw=Z, bundle=bundle, max_sample_values=LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE)
         Zp = bundle.transform(Z); _update_streaming_stats(stats, Zp); rows += Zp.shape[0]; chunks += 1
@@ -3975,7 +4245,7 @@ def run_stage2_extraction(*, linear_out_dir: Path, ds_train_list: list[Any], ds_
     Zp = extractor.transform(X_fit[:min(128, len(X_fit))]).astype(np.float32, copy=False); D = int(Zp.shape[1])
     pkl_path = stage2_dir / "extractor.pkl"
     with pkl_path.open("wb") as f: pickle.dump(extractor, f)
-    payload = {"stage": "stage2", "status": "ok", "streaming_features": True, "persisted_feature_shards": False, **_decision_metadata(),
+    payload = {"stage": "stage2", "status": "ok", "streaming_features": True, "persisted_feature_shards": False, **_decision_metadata(), **_progress_metadata(),
         "linear_extractor_schema": LINEAR_EXTRACTOR_SCHEMA, "extractor_config": extractor_config, "extractor_summary": extractor.summary(),
         "extractor_pickle": str(pkl_path), "extractor_output_dim": D, "fit_rows": int(X_fit.shape[0]), "fit_split": "train_fit_sample",
         "fit_seconds": float(fit_seconds), "protocol": protocol, "train_week_keys": train_week_keys, "feature_dim_total": int(meta["feature_dim_total"]),
@@ -4001,20 +4271,18 @@ def run_stage3_preprocessing(*, linear_out_dir: Path, extractor_name: str, prepr
         combined = {"stage": "stage3", "schema": "linear_preprocess_audit_v1", "extractor": extractor_name, "preprocess_name": preprocess_name, "bundle_path": str(bundle_path), "splits": {k: None if v is None else jsonable_preprocess_audit_summary(v, sample_values=LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES) for k, v in audits.items()}}
         audit_summary_path = audit_dir / "preprocess_audit_summary.json"; audit_csv_path = audit_dir / "preprocess_audit_summary.csv"; audit_top_path = audit_dir / "preprocess_audit_top_features.csv"
         audit_summary_path.write_text(json.dumps(combined, allow_nan=True, indent=2), encoding="utf-8"); write_preprocess_audit_csv(audit_csv_path, audits); write_preprocess_top_features_csv(audit_top_path, audits)
-    payload = {"stage": "stage3", "status": "ok", "schema": LINEAR_PREPROCESS_SCHEMA, "streaming_features": True, "persisted_preprocessed_shards": False, **_decision_metadata(), "extractor": extractor_name, "stage2_payload_path": stage2_payload.get("payload_path"), "stage3_dir": str(stage3_dir), "preprocess_config": cfg, "preprocess_bundle_path": str(bundle_path), "fit_summary": bundle.fit_summary, "original_dim": int(bundle.original_dim), "kept_dim": int(bundle.kept_dim), "train_summary": train_s["summary"], "val_summary": val_s["summary"], "test_summary": None if test_s is None else test_s["summary"], "audit_enabled": bool(LINEAR_PREPROCESS_AUDIT), "audit_dir": None if audit_dir is None else str(audit_dir), "audit_summary_path": None if audit_summary_path is None else str(audit_summary_path), "audit_csv_path": None if audit_csv_path is None else str(audit_csv_path), "audit_top_features_csv_path": None if audit_top_path is None else str(audit_top_path), "audit_summary": combined, "manifests": {}}
+    payload = {"stage": "stage3", "status": "ok", "schema": LINEAR_PREPROCESS_SCHEMA, "streaming_features": True, "persisted_preprocessed_shards": False, **_decision_metadata(), **_progress_metadata(), "extractor": extractor_name, "stage2_payload_path": stage2_payload.get("payload_path"), "stage3_dir": str(stage3_dir), "preprocess_config": cfg, "preprocess_bundle_path": str(bundle_path), "fit_summary": bundle.fit_summary, "original_dim": int(bundle.original_dim), "kept_dim": int(bundle.kept_dim), "train_summary": train_s["summary"], "val_summary": val_s["summary"], "test_summary": None if test_s is None else test_s["summary"], "audit_enabled": bool(LINEAR_PREPROCESS_AUDIT), "audit_dir": None if audit_dir is None else str(audit_dir), "audit_summary_path": None if audit_summary_path is None else str(audit_summary_path), "audit_csv_path": None if audit_csv_path is None else str(audit_csv_path), "audit_top_features_csv_path": None if audit_top_path is None else str(audit_top_path), "audit_summary": combined, "manifests": {}}
     path = stage3_dir / "linear_stage3_preprocess_metrics.json"; copy = Path(linear_out_dir) / "linear_stage3_preprocess_metrics.json"; path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
 
 
 class StreamingPreprocessedBatchSource:
-    def __init__(self, *, extractor: Any, bundle: LinearPreprocessBundle, ds: Any, device: torch.device, batch_rows: int, max_rows: int, split_name: str):
-        self.extractor = extractor; self.bundle = bundle; self.ds = ds; self.target_device = device; self.device = torch.device("cpu"); self.batch_size = int(batch_rows); self.positions = _dataset_positions(len(ds), int(max_rows)); self.n_rows = int(self.positions.shape[0]); self.effective_rows_nominal = self.n_rows; self.num_horizons = len(HORIZONS_MS); self.feature_shape = (self.n_rows, int(bundle.kept_dim)); self.is_shared_feature_view = False; self.pin_memory = bool(device.type == "cuda"); self.split_name = split_name
+    def __init__(self, *, extractor: Any, bundle: LinearPreprocessBundle, ds: Any, device: torch.device, batch_rows: int, max_rows: int, split_name: str, stage: str = "stage4", action: str = "eval"):
+        self.extractor = extractor; self.bundle = bundle; self.ds = ds; self.target_device = device; self.device = torch.device("cpu"); self.batch_size = int(batch_rows); self.max_rows = int(max_rows); self.positions = _dataset_positions(len(ds), self.max_rows); self.n_rows = int(self.positions.shape[0]); self.total_rows = decision_row_count(len(ds), max_rows=self.max_rows); self.effective_rows_nominal = self.n_rows; self.num_horizons = len(HORIZONS_MS); self.feature_shape = (self.n_rows, int(bundle.kept_dim)); self.is_shared_feature_view = False; self.pin_memory = bool(device.type == "cuda"); self.split_name = split_name; self.stage = str(stage); self.action = str(action)
     def __len__(self): return (self.n_rows + self.batch_size - 1) // self.batch_size
     def iter_epoch(self, epoch: int):
         del epoch
-        for start in range(0, self.n_rows, self.batch_size):
-            pos = self.positions[start:start + self.batch_size]
-            X, y = collect_windows_for_positions(self.ds, pos, batch_rows=self.batch_size, split_name=self.split_name)
-            Z = self.bundle.transform(self.extractor.transform(X).astype(np.float32, copy=False))
+        base_iter = iter_preprocessed_batches_from_dataset(extractor=self.extractor, bundle=self.bundle, ds=self.ds, batch_rows=self.batch_size, max_rows=self.max_rows, split_name=self.split_name)
+        for Z, y, _pos in progress_iter_rows(base_iter, total_rows=self.total_rows, desc=_progress_desc(self.stage, self.action, self.split_name)):
             yield torch.as_tensor(Z, dtype=torch.float32, device=self.target_device), torch.as_tensor(y, dtype=torch.float32, device=self.target_device)
 
 
@@ -4027,13 +4295,19 @@ def compute_global_direction_weights_from_train_labels_streaming(ds_train_list: 
     mode = str(mode).lower()
     if mode == "none": return [(1.0, 1.0) for _ in HORIZONS_MS]
     pos = np.zeros(len(HORIZONS_MS)); neg = np.zeros(len(HORIZONS_MS))
-    for ds in ds_train_list:
-        positions = _dataset_positions(len(ds), 0)
-        for start in range(0, len(positions), int(batch_rows)):
-            y = np.asarray(ds.y[positions[start:start + int(batch_rows)]], dtype=np.float32)
-            _kp, _kn, keep = build_signed_side_trim_masks_from_stats_np(y, stats)
-            for h in range(len(HORIZONS_MS)):
-                vals = y[keep[:, h], h] > 0.0; pos[h] += vals.sum(); neg[h] += (~vals).sum()
+
+    def label_batches():
+        for week_idx, ds in enumerate(ds_train_list):
+            positions = _dataset_positions(len(ds), 0)
+            for start in range(0, len(positions), int(batch_rows)):
+                batch_pos = positions[start:start + int(batch_rows)]
+                y = np.asarray(ds.y[batch_pos], dtype=np.float32)
+                yield None, y, (week_idx, batch_pos)
+
+    for _x, y, _p in progress_iter_rows(label_batches(), total_rows=train_decision_row_count(ds_train_list, max_rows=0), desc="stage4 direction_weights train"):
+        _kp, _kn, keep = build_signed_side_trim_masks_from_stats_np(y, stats)
+        for h in range(len(HORIZONS_MS)):
+            vals = y[keep[:, h], h] > 0.0; pos[h] += vals.sum(); neg[h] += (~vals).sum()
     out = []
     for p, n in zip(pos, neg):
         total = p + n
@@ -4047,11 +4321,12 @@ def train_stage4_candidates_streaming(*, extractor: Any, preprocess_bundle: Line
     bundles = [initialize_stage4_candidate_bundle(alpha=float(a), config=config) for a in alpha_values]; n_h = len(HORIZONS_MS)
     states = [{"df": [False]*n_h, "uf": [False]*n_h, "nf": [False]*n_h, "dc": np.zeros(n_h, dtype=np.int64), "uc": np.zeros(n_h, dtype=np.int64), "nc": np.zeros(n_h, dtype=np.int64)} for _ in bundles]
     weights = compute_global_direction_weights_from_train_labels_streaming(ds_train_list, stats, str(config["direction_weighting"]), int(config["batch_rows"]))
-    train_rows = sum(int(_decision_positions(len(ds)).shape[0]) for ds in ds_train_list)
+    train_rows = train_decision_row_count(ds_train_list, max_rows=0)
     print(f"[linear-stream] stage=stage4 action=train_full rows={train_rows} alpha_count={len(bundles)}", flush=True)
     for epoch in range(int(config["epochs"])):
         rng = np.random.default_rng(int(config["random_state"]) + epoch)
-        for Z, y, _p in iter_preprocessed_batches_from_train(extractor=extractor, bundle=preprocess_bundle, ds_train_list=ds_train_list, batch_rows=int(config["batch_rows"]), max_rows=0, split_name="train_full", shuffle_within_batch=True, rng=rng):
+        train_iter = iter_preprocessed_batches_from_train(extractor=extractor, bundle=preprocess_bundle, ds_train_list=ds_train_list, batch_rows=int(config["batch_rows"]), max_rows=0, split_name="train_full", shuffle_within_batch=True, rng=rng)
+        for Z, y, _p in progress_iter_rows(train_iter, total_rows=train_rows, desc=f"stage4 train epoch {epoch + 1}/{config['epochs']}"):
             keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_from_stats_np(y, stats)
             for b, st in zip(bundles, states):
                 for h in range(n_h):
@@ -4076,7 +4351,9 @@ def train_stage4_candidates_streaming(*, extractor: Any, preprocess_bundle: Line
 
 
 def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, stats: Dict[str, np.ndarray], device: torch.device, split_name: str, max_rows: int = 0, batch_rows: Optional[int] = None) -> Dict[str, Any]:
-    source = StreamingPreprocessedBatchSource(extractor=extractor, bundle=preprocess_bundle, ds=ds, device=device, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), max_rows=max_rows, split_name=split_name)
+    eval_stage = "stage5" if str(split_name).startswith("stage5_") else "stage4"
+    eval_action = "reeval" if eval_stage == "stage5" else "eval"
+    source = StreamingPreprocessedBatchSource(extractor=extractor, bundle=preprocess_bundle, ds=ds, device=device, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), max_rows=max_rows, split_name=split_name, stage=eval_stage, action=eval_action)
     print(f"[linear-stream] stage=stage4 action=eval split={split_name} rows={source.n_rows}", flush=True)
     metrics = summarize_metrics(LinearSklearnTorchWrapper(bundle).to(device), source, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name=split_name)
     pv, pl = compute_primary_metric(metrics); metrics["primary_metric_value"] = float(pv); metrics["primary_metric_label"] = str(pl); return metrics
@@ -4094,14 +4371,15 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         if best is None or is_metric_improved(score, best_score, "max"): best=b; best_metrics=vm; best_score=score; best_alpha=float(b.config.get("alpha"))
     stage4_dir = Path(linear_out_dir) / "stage4_models" / extractor_name / preprocess_name / LINEAR_STAGE4_PREDICTOR; stage4_dir.mkdir(parents=True, exist_ok=True); model_path = stage4_dir / "linear_stage4_best_model.pkl"; save_linear_sklearn_bundle(best, model_path)
     test_metrics = evaluate_stage4_bundle_streaming(bundle=best, extractor=extractor, preprocess_bundle=pb, ds=splits["ds_test"], stats=stats, device=device, split_name="test", max_rows=LINEAR_STAGE4_MAX_TEST_ROWS) if LINEAR_STAGE4_RUN_TEST and splits["has_cmssl_test"] and splits["ds_test"] is not None else None
-    train_rows = sum(int(_decision_positions(len(ds)).shape[0]) for ds in splits["ds_train_list"])
-    payload = {"stage": "stage4", "status": "ok", "schema": LINEAR_STAGE4_SCHEMA, "streaming_features": True, **_decision_metadata(), "stage4_config": cfg, "extractor": extractor_name, "preprocess_name": preprocess_name, "stage2_payload_path": st2.get("payload_path"), "stage3_payload_path": st3.get("payload_path"), "preprocess_bundle_path": str(st3["preprocess_bundle_path"]), "train_split": "train_full", "train_rows": int(train_rows), "val_rows": int(_dataset_positions(len(splits["ds_val"]), LINEAR_STAGE4_MAX_VAL_ROWS).shape[0]), "test_rows": None if splits["ds_test"] is None else int(_dataset_positions(len(splits["ds_test"]), LINEAR_STAGE4_MAX_TEST_ROWS).shape[0]), "original_dim": int(pb.original_dim), "kept_dim": int(pb.kept_dim), "best_alpha": float(best_alpha), "best_model_path": str(model_path), "best_primary_metric": {"label": str(best_metrics.get("primary_metric_label", PRIMARY_METRIC)), "value": float(best_metrics.get("primary_metric_value", best_score)), "guard_passed": bool(best_metrics.get("primary_metric_guard_passed", True))}, "candidate_summaries": summaries, "val_metrics": _jsonable_metrics(best_metrics), "test_metrics": _jsonable_metrics(test_metrics)}
+    train_rows = train_decision_row_count(splits["ds_train_list"], max_rows=0)
+    payload = {"stage": "stage4", "status": "ok", "schema": LINEAR_STAGE4_SCHEMA, "streaming_features": True, **_decision_metadata(), **_progress_metadata(), "stage4_config": cfg, "extractor": extractor_name, "preprocess_name": preprocess_name, "stage2_payload_path": st2.get("payload_path"), "stage3_payload_path": st3.get("payload_path"), "preprocess_bundle_path": str(st3["preprocess_bundle_path"]), "train_split": "train_full", "train_rows": int(train_rows), "val_rows": int(_dataset_positions(len(splits["ds_val"]), LINEAR_STAGE4_MAX_VAL_ROWS).shape[0]), "test_rows": None if splits["ds_test"] is None else int(_dataset_positions(len(splits["ds_test"]), LINEAR_STAGE4_MAX_TEST_ROWS).shape[0]), "original_dim": int(pb.original_dim), "kept_dim": int(pb.kept_dim), "best_alpha": float(best_alpha), "best_model_path": str(model_path), "best_primary_metric": {"label": str(best_metrics.get("primary_metric_label", PRIMARY_METRIC)), "value": float(best_metrics.get("primary_metric_value", best_score)), "guard_passed": bool(best_metrics.get("primary_metric_guard_passed", True))}, "candidate_summaries": summaries, "val_metrics": _jsonable_metrics(best_metrics), "test_metrics": _jsonable_metrics(test_metrics)}
     path = stage4_dir / "linear_stage4_metrics.json"; copy = Path(linear_out_dir) / "linear_stage4_metrics.json"; path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
 
 
 def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, max_rows: int, batch_rows: int, split_name: str) -> Dict[str, np.ndarray]:
     parts = {k: [] for k in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_bps", "mag_down_bps", "edge_bps", "y", "positions"]}
-    for Z, y, pos in iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name):
+    base_iter = iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name)
+    for Z, y, pos in progress_iter_rows(base_iter, total_rows=decision_row_count(len(ds), max_rows=max_rows), desc=_progress_desc("stage5", "diagnostics", split_name)):
         pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); up = np.asarray(pred["mag_up_sqrt"], dtype=np.float32); dn = np.asarray(pred["mag_down_sqrt"], dtype=np.float32); p = _sigmoid_np(dl); ub = up * up; db = dn * dn; edge = p * ub - (1.0 - p) * db
         for k, v in [("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_bps", ub), ("mag_down_bps", db), ("edge_bps", edge), ("y", y), ("positions", pos)]: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
     if not parts["y"]: raise ValueError(f"Streaming split contains no rows: {split_name}")
@@ -4137,7 +4415,7 @@ def run_stage5_comparison(*, linear_out_dir: Path, extractor_names: list[str], p
         ddir = diag_dir / extractor_name; ddir.mkdir(parents=True, exist_ok=True); (ddir / f"diagnostics_{extractor_name}.json").write_text(json.dumps(diag, allow_nan=True, indent=2), encoding="utf-8")
     _maybe_add_baseline_row(rows, strict=LINEAR_STAGE5_STRICT)
     csv_path = stage5_dir / "linear_stage5_comparison.csv"; json_path = stage5_dir / "linear_stage5_comparison.json"; copy_csv = Path(linear_out_dir) / "linear_stage5_comparison.csv"; copy_json = Path(linear_out_dir) / "linear_stage5_comparison.json"; write_rows_csv(csv_path, rows); write_rows_csv(copy_csv, rows)
-    payload = {"stage": "stage5", "status": "ok", "schema": LINEAR_STAGE5_SCHEMA, **_decision_metadata(), "linear_out_dir": str(linear_out_dir), "preprocess_name": preprocess_name, "predictor": predictor, "extractors_requested": extractor_names, "extractors_completed": [r["extractor"] for r in rows if r.get("extractor") != "CMSSL_neural_baseline"], "strict": bool(LINEAR_STAGE5_STRICT), "reevaluate": bool(LINEAR_STAGE5_REEVALUATE), "run_test": bool(LINEAR_STAGE5_RUN_TEST), "label_shifts": LINEAR_STAGE5_LABEL_SHIFT_VALUES, "label_permutation": bool(LINEAR_STAGE5_LABEL_PERMUTATION), "comparison_rows": rows, "diagnostics": diagnostics}
+    payload = {"stage": "stage5", "status": "ok", "schema": LINEAR_STAGE5_SCHEMA, **_decision_metadata(), **_progress_metadata(), "linear_out_dir": str(linear_out_dir), "preprocess_name": preprocess_name, "predictor": predictor, "extractors_requested": extractor_names, "extractors_completed": [r["extractor"] for r in rows if r.get("extractor") != "CMSSL_neural_baseline"], "strict": bool(LINEAR_STAGE5_STRICT), "reevaluate": bool(LINEAR_STAGE5_REEVALUATE), "run_test": bool(LINEAR_STAGE5_RUN_TEST), "label_shifts": LINEAR_STAGE5_LABEL_SHIFT_VALUES, "label_permutation": bool(LINEAR_STAGE5_LABEL_PERMUTATION), "comparison_rows": rows, "diagnostics": diagnostics}
     json_path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy_json.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
 
 if __name__ == "__main__":
