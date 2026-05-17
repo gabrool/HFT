@@ -826,6 +826,10 @@ class DatasetPositionsBatchSource:
                 torch.as_tensor(y, dtype=torch.float32, device=self.device),
             )
 
+    def iter_epoch(self, epoch: int = 0):
+        del epoch
+        return iter(self)
+
     def make_evenly_spaced_subset(self, max_rows: int):
         if max_rows <= 0 or max_rows >= self.n_rows:
             return self
