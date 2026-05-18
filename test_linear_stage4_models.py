@@ -146,6 +146,11 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
         "mag_floor": 1e-4,
         "mag_up_scale_bps": [1.0, 1.0, 1.0],
         "mag_down_scale_bps": [1.0, 1.0, 1.0],
+        "mag_mode": "side_all_log",
+        "mag_log_scale_source": "train_median_nonzero_side",
+        "mag_log_scale_eps": 1e-6,
+        "mag_log_target_clip": 0.0,
+        "mag_log_pred_clip": 20.0,
     }
     bundles = linear_offline.train_stage4_candidates_streaming_from_plan(
         extractor=object(),
@@ -162,6 +167,11 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
     fit = bundle.fit_summary
     total_rows = int(Z.shape[0])
     assert fit["mag_mode"] == "side_all_log"
+    assert fit["mag_log_scale_source"] == "train_median_nonzero_side"
+    assert fit["mag_log_scale_eps"] == 1e-6
+    assert fit["mag_log_target_clip"] == 0.0
+    assert fit["mag_log_pred_clip"] == 20.0
+    assert fit["mag_training_rows"] == "all_decision_rows"
     assert fit["up_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
     assert fit["down_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
     assert all(c <= total_rows for c in fit["dir_rows_per_horizon"])
