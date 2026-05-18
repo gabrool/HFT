@@ -16,6 +16,13 @@ _install_optional_dependency_stubs()
 sys.modules.setdefault("torch._inductor", types.ModuleType("torch._inductor"))
 sys.modules.setdefault("torch._inductor.config", types.ModuleType("torch._inductor.config"))
 
+import torch
+
+if not hasattr(torch, "as_tensor"):
+    torch.as_tensor = lambda value, dtype=None, device=None: np.asarray(value, dtype=dtype)
+if not hasattr(torch, "device"):
+    torch.device = lambda value: value
+
 
 def make_synthetic(n=240, d=5):
     rng = np.random.default_rng(123)
@@ -90,6 +97,65 @@ def test_bundle_prediction_schema():
     assert (pred["mag_up_bps"] >= bundle.mag_floor).all()
     assert (pred["mag_down_bps"] >= bundle.mag_floor).all()
     assert np.allclose(pred["mag_up_sqrt"] ** 2, pred["mag_up_bps"], rtol=1e-4, atol=1e-6)
+
+
+def test_torch_wrapper_cmssl_schema_only_filters_extra_keys():
+    import torch
+    from CMSSL17 import NUM_HORIZONS
+    from CMSSL17_linear import LinearSklearnTakerBundle, LinearSklearnTorchWrapper
+
+    class FakeDirection:
+        def decision_function(self, Z):
+            return Z[:, 0]
+
+    class FakeRegressor:
+        def __init__(self, value):
+            self.value = value
+
+        def predict(self, Z):
+            return np.full(Z.shape[0], self.value, dtype=np.float32)
+
+    Z = np.ones((8, 4), dtype=np.float32)
+
+    bundle = LinearSklearnTakerBundle(
+        "linear_target_models_stage4_v1",
+        {"mag_log_pred_clip": 20.0},
+        [200, 500, 1000],
+        [FakeDirection() for _ in range(NUM_HORIZONS)],
+        [FakeRegressor(np.log1p(1.0)) for _ in range(NUM_HORIZONS)],
+        [FakeRegressor(np.log1p(1.0)) for _ in range(NUM_HORIZONS)],
+        1e-4,
+        {},
+        "side_all_log",
+        np.ones(NUM_HORIZONS, dtype=np.float32),
+        np.ones(NUM_HORIZONS, dtype=np.float32),
+    )
+
+    class FakeTensor:
+        device = torch.device("cpu")
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return Z
+
+    full = LinearSklearnTorchWrapper(bundle, cmssl_schema_only=False).forward(FakeTensor())
+    assert set(full) == {
+        "dir_logits",
+        "mag_up_log",
+        "mag_down_log",
+        "mag_up_bps",
+        "mag_down_bps",
+        "mag_up_sqrt",
+        "mag_down_sqrt",
+    }
+
+    strict = LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).forward(FakeTensor())
+    assert set(strict) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
 
 
 def test_side_log_mag_targets_np():
