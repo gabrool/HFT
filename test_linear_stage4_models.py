@@ -135,6 +135,70 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
     assert len(bundle.mag_down_models) == NUM_HORIZONS
 
 
+def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch):
+    import linear_offline
+
+    configure_stage4(monkeypatch, linear_offline)
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_ALPHA_VALUES", [1e-4])
+    monkeypatch.setattr(linear_offline, "OUT_ROOT", str(tmp_path / "out_root"))
+
+    fake_plan = {
+        "has_cmssl_test": False,
+        "train_split_entries": [{}],
+        "train_week_keys": ["w0"],
+        "val_split_entries": [{}],
+    }
+    fake_preprocess = types.SimpleNamespace(original_dim=5, kept_dim=5)
+    fake_bundle = types.SimpleNamespace(config={"alpha": 1e-4}, fit_summary={"unit_test": True})
+
+    metric_len = len(linear_offline.HORIZONS_MS)
+    fake_metrics = {
+        "dir_auc_kept": [0.71] * metric_len,
+        "dir_bal_acc_kept": [0.62] * metric_len,
+        "val_dir_bce_kept": [0.55] * metric_len,
+        "edge_spearman_kept": [0.13] * metric_len,
+        "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len,
+        "primary_metric_guard_passed": True,
+    }
+
+    monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda *, out_root: fake_plan)
+    monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}))
+    monkeypatch.setattr(
+        linear_offline,
+        "load_stage3_payload",
+        lambda *args, **kwargs: {"payload_path": "stage3.json", "preprocess_bundle_path": str(tmp_path / "preprocess.npz")},
+    )
+    monkeypatch.setattr(linear_offline, "_validate_manifest_decision_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "load_linear_preprocess_bundle", lambda path: fake_preprocess)
+    monkeypatch.setattr(linear_offline, "load_linear_trim_stats", lambda linear_out_dir: {})
+    monkeypatch.setattr(linear_offline, "train_stage4_candidates_streaming_from_plan", lambda **kwargs: [fake_bundle])
+    monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
+    monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
+    monkeypatch.setattr(linear_offline, "close_dataset", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "force_gc", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: 10)
+    monkeypatch.setattr(linear_offline, "split_decision_row_count_from_plan", lambda plan, split, max_rows=0: 5)
+
+    linear_offline.run_stage4_training(
+        linear_out_dir=tmp_path,
+        extractor_name="fake_extractor",
+        preprocess_name="fake_preprocess",
+        device=linear_offline.torch.device("cpu"),
+    )
+
+    out = capsys.readouterr().out
+    assert out.count("[linear-stage4-candidate]") == 1
+    assert out.count("[linear-stage4-best]") == 1
+    assert "alpha=0.0001" in out
+    assert "auc_1s=" in out
+    assert "bal_1s=" in out
+    assert "bce_1s=" in out
+    assert "edge_sp_1s=" in out
+    assert "mag_p90_ratio_1s=" in out
+    assert "primary=" in out
+    assert "guard_passed=" in out
+
+
 def test_load_linear_trim_stats_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
     import linear_offline
     from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache

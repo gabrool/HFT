@@ -2742,6 +2742,23 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         summaries.append({"alpha": alpha, "primary_metric_label": str(pl), "primary_metric_value": float(pv), "guard_passed": guard_passed, "val_metrics": _jsonable_metrics(vm), "fit_summary": b.fit_summary})
         if best is None or is_metric_improved(score, best_score, "max"): best=b; best_metrics=vm; best_score=score; best_alpha=alpha
     if best is None or best_metrics is None: raise ValueError("No Stage 4 candidate models were trained")
+    best_summary = next((s for s in summaries if float(s.get("alpha", float("nan"))) == float(best_alpha)), {})
+    best_val_metrics = best_summary.get("val_metrics", {})
+    best_auc_1s = _metric_at_primary_horizon(best_val_metrics, "dir_auc_kept")
+    best_bal_1s = _metric_at_primary_horizon(best_val_metrics, "dir_bal_acc_kept")
+    best_bce_1s = _metric_at_primary_horizon(best_val_metrics, "val_dir_bce_kept")
+    best_edge_sp_1s = _metric_at_primary_horizon(best_val_metrics, "edge_spearman_kept")
+    best_mag_ratio_1s = _metric_at_primary_horizon(best_val_metrics, "pred_abs_p90_over_true_abs_p90_kept")
+    print(
+        f"[linear-stage4-best] alpha={float(best_summary.get('alpha', float('nan'))):g} "
+        f"primary={best_summary.get('primary_metric_label')} "
+        f"value={float(best_summary.get('primary_metric_value', float('nan'))):.6g} "
+        f"auc_1s={best_auc_1s:.6g} bal_1s={best_bal_1s:.6g} "
+        f"bce_1s={best_bce_1s:.6g} edge_sp_1s={best_edge_sp_1s:.6g} "
+        f"mag_p90_ratio_1s={best_mag_ratio_1s:.6g} "
+        f"guard_passed={bool(best_summary.get('guard_passed'))}",
+        flush=True,
+    )
     stage4_dir = Path(linear_out_dir) / "stage4_models" / extractor_name / preprocess_name / LINEAR_STAGE4_PREDICTOR; stage4_dir.mkdir(parents=True, exist_ok=True); model_path = stage4_dir / "linear_stage4_best_model.pkl"; save_linear_sklearn_bundle(best, model_path)
     test_metrics = None
     if LINEAR_STAGE4_RUN_TEST and plan["has_cmssl_test"]:
