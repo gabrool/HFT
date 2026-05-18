@@ -80,15 +80,16 @@ def test_bundle_prediction_schema():
 
     Z, _y, _ = make_synthetic(n=24, d=4)
     direction_models = [FakeDirection(float(h)) for h in range(NUM_HORIZONS)]
-    mag_up_models = [FakeRegressor(0.2 + h) for h in range(NUM_HORIZONS)]
-    mag_down_models = [FakeRegressor(0.3 + h) for h in range(NUM_HORIZONS)]
-    bundle = LinearSklearnTakerBundle("linear_target_models_stage4_v1", {}, [1, 2, 3], direction_models, mag_up_models, mag_down_models, 1e-4, {})
+    mag_up_models = [FakeRegressor(np.log1p(0.2 + h)) for h in range(NUM_HORIZONS)]
+    mag_down_models = [FakeRegressor(np.log1p(0.3 + h)) for h in range(NUM_HORIZONS)]
+    bundle = LinearSklearnTakerBundle("linear_target_models_stage4_v1", {}, [1, 2, 3], direction_models, mag_up_models, mag_down_models, 1e-4, {}, "side_all_log", np.ones(NUM_HORIZONS, dtype=np.float32), np.ones(NUM_HORIZONS, dtype=np.float32))
     pred = bundle.predict_dict_np(Z[:11])
-    assert set(pred) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
+    assert set(pred) == {"dir_logits", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "mag_up_sqrt", "mag_down_sqrt"}
     assert pred["dir_logits"].shape == (11, NUM_HORIZONS)
     assert np.isfinite(pred["dir_logits"]).all()
-    assert (pred["mag_up_sqrt"] > 0).all()
-    assert (pred["mag_down_sqrt"] > 0).all()
+    assert (pred["mag_up_bps"] >= bundle.mag_floor).all()
+    assert (pred["mag_down_bps"] >= bundle.mag_floor).all()
+    assert np.allclose(pred["mag_up_sqrt"] ** 2, pred["mag_up_bps"], rtol=1e-4, atol=1e-6)
 
 
 def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, monkeypatch):
@@ -120,6 +121,8 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
         "random_state": 7,
         "direction_weighting": "tempered",
         "mag_floor": 1e-4,
+        "mag_up_scale_bps": [1.0, 1.0, 1.0],
+        "mag_down_scale_bps": [1.0, 1.0, 1.0],
     }
     bundles = linear_offline.train_stage4_candidates_streaming_from_plan(
         extractor=object(),
@@ -133,6 +136,11 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
     assert len(bundle.direction_models) == NUM_HORIZONS
     assert len(bundle.mag_up_models) == NUM_HORIZONS
     assert len(bundle.mag_down_models) == NUM_HORIZONS
+    fit = bundle.fit_summary
+    total_rows = int(Z.shape[0])
+    assert fit["mag_mode"] == "side_all_log"
+    assert fit["up_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
+    assert fit["down_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
 
 
 def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch):
@@ -171,6 +179,7 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     monkeypatch.setattr(linear_offline, "_validate_manifest_decision_policy", lambda *args, **kwargs: None)
     monkeypatch.setattr(linear_offline, "load_linear_preprocess_bundle", lambda path: fake_preprocess)
     monkeypatch.setattr(linear_offline, "load_linear_trim_stats", lambda linear_out_dir: {})
+    monkeypatch.setattr(linear_offline, "compute_side_log_mag_scales_from_train_plan", lambda **kwargs: (np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32), np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32)))
     monkeypatch.setattr(linear_offline, "train_stage4_candidates_streaming_from_plan", lambda **kwargs: [fake_bundle])
     monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
     monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))

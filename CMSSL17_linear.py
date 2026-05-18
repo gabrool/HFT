@@ -86,6 +86,9 @@ class LinearSklearnTakerBundle:
     mag_down_models: list[Any]
     mag_floor: float
     fit_summary: Dict[str, Any]
+    mag_mode: str = "side_all_log"
+    mag_up_scale_bps: Optional[np.ndarray] = None
+    mag_down_scale_bps: Optional[np.ndarray] = None
 
     def predict_dict_np(self, Z: np.ndarray) -> Dict[str, np.ndarray]:
         Z = np.asarray(Z, dtype=np.float32)
@@ -119,13 +122,26 @@ class LinearSklearnTakerBundle:
             down = np.asarray(self.mag_down_models[h].predict(Z), dtype=np.float32).reshape(-1)
             if up.shape[0] != Z.shape[0] or down.shape[0] != Z.shape[0]:
                 raise ValueError(f"Magnitude model horizon {h} returned invalid row count")
-            up_cols.append(np.maximum(up, float(self.mag_floor)).astype(np.float32, copy=False))
-            down_cols.append(np.maximum(down, float(self.mag_floor)).astype(np.float32, copy=False))
+            up_cols.append(up.astype(np.float32, copy=False))
+            down_cols.append(down.astype(np.float32, copy=False))
 
+        up_log = np.stack(up_cols, axis=1).astype(np.float32, copy=False)
+        down_log = np.stack(down_cols, axis=1).astype(np.float32, copy=False)
+        up_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_up_scale_bps is None else np.asarray(self.mag_up_scale_bps, dtype=np.float32)
+        down_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_down_scale_bps is None else np.asarray(self.mag_down_scale_bps, dtype=np.float32)
+        up_scale = up_scale_raw.reshape(1, -1)
+        down_scale = down_scale_raw.reshape(1, -1)
+        pred_log_clip = float(self.config.get("mag_log_pred_clip", 20.0))
+        up_bps = np.maximum(np.expm1(np.clip(np.maximum(up_log, 0.0), 0.0, pred_log_clip)) * up_scale, float(self.mag_floor))
+        down_bps = np.maximum(np.expm1(np.clip(np.maximum(down_log, 0.0), 0.0, pred_log_clip)) * down_scale, float(self.mag_floor))
         return {
             "dir_logits": np.stack(dir_cols, axis=1).astype(np.float32, copy=False),
-            "mag_up_sqrt": np.stack(up_cols, axis=1).astype(np.float32, copy=False),
-            "mag_down_sqrt": np.stack(down_cols, axis=1).astype(np.float32, copy=False),
+            "mag_up_log": up_log,
+            "mag_down_log": down_log,
+            "mag_up_bps": up_bps.astype(np.float32, copy=False),
+            "mag_down_bps": down_bps.astype(np.float32, copy=False),
+            "mag_up_sqrt": np.sqrt(np.maximum(up_bps, 0.0)).astype(np.float32, copy=False),
+            "mag_down_sqrt": np.sqrt(np.maximum(down_bps, 0.0)).astype(np.float32, copy=False),
         }
 
 

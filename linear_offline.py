@@ -231,6 +231,11 @@ LINEAR_STAGE4_DIRECTION_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_DIRECTIO
 LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING", "none").strip().lower()
 LINEAR_STAGE4_RUN_TEST = _env_bool("BYBIT_LINEAR_STAGE4_RUN_TEST", 1)
 LINEAR_STAGE4_MAG_FLOOR = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_FLOOR", "1e-4"))
+LINEAR_STAGE4_MAG_MODE = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_MODE", "side_all_log").strip().lower()
+LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE", "train_median_nonzero_side").strip().lower()
+LINEAR_STAGE4_MAG_LOG_SCALE_EPS = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_EPS", "1e-6"))
+LINEAR_STAGE4_MAG_LOG_TARGET_CLIP = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_TARGET_CLIP", "0.0"))
+LINEAR_STAGE4_MAG_LOG_PRED_CLIP = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_PRED_CLIP", "20.0"))
 LINEAR_STAGE4_MAX_VAL_ROWS = _env_int("BYBIT_LINEAR_STAGE4_MAX_VAL_ROWS", 0)
 LINEAR_STAGE4_MAX_TEST_ROWS = _env_int("BYBIT_LINEAR_STAGE4_MAX_TEST_ROWS", 0)
 LINEAR_STAGE4_SAVE_VAL_PREDICTIONS = _env_bool("BYBIT_LINEAR_STAGE4_SAVE_VAL_PREDICTIONS", 0)
@@ -354,6 +359,14 @@ if LINEAR_STAGE == "stage4":
         raise ValueError("Only none for magnitude weighting in first Stage 4 implementation")
     if LINEAR_STAGE4_MAG_FLOOR <= 0:
         raise ValueError(f"BYBIT_LINEAR_STAGE4_MAG_FLOOR must be > 0, got {LINEAR_STAGE4_MAG_FLOOR}")
+    if LINEAR_STAGE4_MAG_MODE not in {"side_all_log"}:
+        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_MODE currently supports only side_all_log")
+    if LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE not in {"train_median_nonzero_side", "train_q75_nonzero_side"}:
+        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE must be one of: train_median_nonzero_side, train_q75_nonzero_side")
+    if LINEAR_STAGE4_MAG_LOG_SCALE_EPS <= 0:
+        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_EPS must be > 0")
+    if LINEAR_STAGE4_MAG_LOG_TARGET_CLIP < 0:
+        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_LOG_TARGET_CLIP must be >= 0")
 
 
 if LINEAR_STAGE not in {"stage1", "stage2", "stage3", "stage4", "stage5"}:
@@ -2647,7 +2660,44 @@ class StreamingPreprocessedBatchSource:
 
 def initialize_stage4_candidate_bundle(*, alpha: float, config: Dict[str, Any]) -> LinearSklearnTakerBundle:
     n_h = len(HORIZONS_MS)
-    return LinearSklearnTakerBundle(str(config["schema"]), dict(config, alpha=float(alpha)), [int(x) for x in HORIZONS_MS], [make_direction_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], float(config["mag_floor"]), {})
+    return LinearSklearnTakerBundle(str(config["schema"]), dict(config, alpha=float(alpha)), [int(x) for x in HORIZONS_MS], [make_direction_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], float(config["mag_floor"]), {}, str(config.get("mag_mode", "side_all_log")), np.asarray(config.get("mag_up_scale_bps"), dtype=np.float32), np.asarray(config.get("mag_down_scale_bps"), dtype=np.float32))
+
+
+def side_log_mag_targets_np(y: np.ndarray, *, up_scale_bps: np.ndarray, down_scale_bps: np.ndarray, target_clip: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(y, dtype=np.float32)
+    up_scale = np.asarray(up_scale_bps, dtype=np.float32).reshape(1, -1)
+    down_scale = np.asarray(down_scale_bps, dtype=np.float32).reshape(1, -1)
+    up_log = np.log1p(np.maximum(y, 0.0) / up_scale)
+    down_log = np.log1p(np.maximum(-y, 0.0) / down_scale)
+    if target_clip > 0:
+        up_log = np.minimum(up_log, float(target_clip))
+        down_log = np.minimum(down_log, float(target_clip))
+    return up_log.astype(np.float32, copy=False), down_log.astype(np.float32, copy=False)
+
+
+def compute_side_log_mag_scales_from_train_plan(*, plan: Dict[str, Any], source: str, eps: float, batch_rows: int) -> tuple[np.ndarray, np.ndarray]:
+    n_h = len(HORIZONS_MS); up_parts = [[] for _ in range(n_h)]; down_parts = [[] for _ in range(n_h)]
+    for week_idx in range(len(plan["train_split_entries"])):
+        ds = build_train_week_dataset(plan=plan, week_index=week_idx); tag = f"stage4_mag_scales_week{week_idx}"
+        try:
+            positions = _dataset_positions(len(ds), 0)
+            for start in range(0, len(positions), int(batch_rows)):
+                y = np.asarray(ds.y[positions[start:start + int(batch_rows)]], dtype=np.float32)
+                for h in range(n_h):
+                    pos = y[:, h] > 0.0; neg = y[:, h] < 0.0
+                    if pos.any(): up_parts[h].append(y[pos, h])
+                    if neg.any(): down_parts[h].append(-y[neg, h])
+        finally:
+            close_dataset(ds, name=tag); del ds; force_gc(tag)
+    up_scale = np.zeros(n_h, dtype=np.float32); down_scale = np.zeros(n_h, dtype=np.float32)
+    for h in range(n_h):
+        uv = np.concatenate(up_parts[h], axis=0) if up_parts[h] else np.zeros(0, dtype=np.float32)
+        dv = np.concatenate(down_parts[h], axis=0) if down_parts[h] else np.zeros(0, dtype=np.float32)
+        us = np.percentile(uv, 75) if source == "train_q75_nonzero_side" and uv.size else (np.median(uv) if uv.size else eps)
+        ds = np.percentile(dv, 75) if source == "train_q75_nonzero_side" and dv.size else (np.median(dv) if dv.size else eps)
+        up_scale[h] = max(float(us), float(eps)); down_scale[h] = max(float(ds), float(eps))
+    print(f"[linear-mag-scale] mode=side_all_log source={source} up_scale_bps={up_scale.tolist()} down_scale_bps={down_scale.tolist()}", flush=True)
+    return up_scale, down_scale
 
 
 def compute_global_direction_weights_from_train_labels_plan(*, plan: Dict[str, Any], stats: Dict[str, np.ndarray], mode: str, batch_rows: int) -> list[tuple[float, float]]:
@@ -2682,11 +2732,14 @@ def train_stage4_candidates_streaming_from_plan(*, extractor: Any, preprocess_bu
     weights = compute_global_direction_weights_from_train_labels_plan(plan=plan, stats=stats, mode=str(config["direction_weighting"]), batch_rows=int(config["batch_rows"]))
     train_rows = train_decision_row_count_from_plan(plan, max_rows=0)
     print(f"[linear-stream] stage=stage4 action=train_full rows={train_rows} alpha_count={len(bundles)}", flush=True)
+    up_scale = np.asarray(config["mag_up_scale_bps"], dtype=np.float32)
+    down_scale = np.asarray(config["mag_down_scale_bps"], dtype=np.float32)
     for epoch in range(int(config["epochs"])):
         rng = np.random.default_rng(int(config["random_state"]) + epoch)
         train_iter = iter_preprocessed_batches_from_train_plan(extractor=extractor, bundle=preprocess_bundle, plan=plan, batch_rows=int(config["batch_rows"]), max_rows=0, split_name="train_full", shuffle_within_batch=True, rng=rng)
         for Z, y, _p in progress_iter_rows(train_iter, total_rows=train_rows, desc=f"stage4 train epoch {epoch + 1}/{config['epochs']}"):
             keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_from_stats_np(y, stats)
+            up_log_targets, down_log_targets = side_log_mag_targets_np(y, up_scale_bps=up_scale, down_scale_bps=down_scale, target_clip=float(config.get("mag_log_target_clip", 0.0)))
             for b, st in zip(bundles, states):
                 for h in range(n_h):
                     rows = keep_signed[:, h]
@@ -2695,13 +2748,11 @@ def train_stage4_candidates_streaming_from_plan(*, extractor: Any, preprocess_bu
                         if not st["df"][h]: b.direction_models[h].partial_fit(Z[rows], yd, classes=np.array([0, 1], dtype=np.int64), sample_weight=sw); st["df"][h] = True
                         else: b.direction_models[h].partial_fit(Z[rows], yd, sample_weight=sw)
                         st["dc"][h] += yd.shape[0]
-                    rows = keep_pos[:, h]
-                    if rows.any(): yu = np.sqrt(np.maximum(y[rows, h], 0.0)).astype(np.float32); b.mag_up_models[h].partial_fit(Z[rows], yu); st["uf"][h] = True; st["uc"][h] += yu.shape[0]
-                    rows = keep_neg[:, h]
-                    if rows.any(): yn = np.sqrt(np.maximum(-y[rows, h], 0.0)).astype(np.float32); b.mag_down_models[h].partial_fit(Z[rows], yn); st["nf"][h] = True; st["nc"][h] += yn.shape[0]
+                    yu = up_log_targets[:, h]; yn = down_log_targets[:, h]
+                    b.mag_up_models[h].partial_fit(Z, yu); b.mag_down_models[h].partial_fit(Z, yn); st["uf"][h] = True; st["nf"][h] = True; st["uc"][h] += yu.shape[0]; st["nc"][h] += yn.shape[0]
     for b, st in zip(bundles, states):
         if not all(st["df"]) or not all(st["uf"]) or not all(st["nf"]): raise ValueError("Insufficient train rows for one or more target/horizon models")
-        b.fit_summary = {"alpha": float(b.config.get("alpha")), "train_rows": int(train_rows), "dir_rows_per_horizon": st["dc"].tolist(), "up_rows_per_horizon": st["uc"].tolist(), "down_rows_per_horizon": st["nc"].tolist(), "direction_weights_neg_pos": [(float(a), float(b)) for a, b in weights]}
+        b.fit_summary = {"alpha": float(b.config.get("alpha")), "train_rows": int(train_rows), "dir_rows_per_horizon": st["dc"].tolist(), "up_rows_per_horizon": st["uc"].tolist(), "down_rows_per_horizon": st["nc"].tolist(), "direction_weights_neg_pos": [(float(a), float(b)) for a, b in weights], "mag_mode": "side_all_log", "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist()}
     return bundles
 
 def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, stats: Dict[str, np.ndarray], device: torch.device, split_name: str, max_rows: int = 0, batch_rows: Optional[int] = None) -> Dict[str, Any]:
@@ -2716,7 +2767,8 @@ def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extrac
 def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess_name: str, device: torch.device) -> Dict[str, Any]:  # type: ignore[override]
     if LINEAR_STAGE4_TRAIN_SPLIT != "train_full": raise ValueError("Stage 4 now supports only train_full streaming")
     plan = load_linear_split_plan_from_out_root(out_root=Path(OUT_ROOT)); extractor, st2 = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name); st3 = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name); _validate_manifest_decision_policy(st3, context=f"stage4 stage3 {extractor_name}"); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"]))); stats = load_linear_trim_stats(linear_out_dir)
-    cfg = {"schema": LINEAR_STAGE4_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "predictor": LINEAR_STAGE4_PREDICTOR, "penalty": LINEAR_STAGE4_PENALTY, "l1_ratio": LINEAR_STAGE4_L1_RATIO, "alpha_grid": [float(a) for a in LINEAR_STAGE4_ALPHA_VALUES], "epochs": LINEAR_STAGE4_EPOCHS, "batch_rows": LINEAR_STAGE4_BATCH_ROWS, "random_state": LINEAR_STAGE4_RANDOM_SEED, "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING, "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING, "mag_floor": LINEAR_STAGE4_MAG_FLOOR, **_decision_metadata()}
+    up_scale, down_scale = compute_side_log_mag_scales_from_train_plan(plan=plan, source=LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE, eps=LINEAR_STAGE4_MAG_LOG_SCALE_EPS, batch_rows=LINEAR_STAGE4_BATCH_ROWS)
+    cfg = {"schema": LINEAR_STAGE4_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "predictor": LINEAR_STAGE4_PREDICTOR, "penalty": LINEAR_STAGE4_PENALTY, "l1_ratio": LINEAR_STAGE4_L1_RATIO, "alpha_grid": [float(a) for a in LINEAR_STAGE4_ALPHA_VALUES], "epochs": LINEAR_STAGE4_EPOCHS, "batch_rows": LINEAR_STAGE4_BATCH_ROWS, "random_state": LINEAR_STAGE4_RANDOM_SEED, "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING, "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING, "mag_floor": LINEAR_STAGE4_MAG_FLOOR, "mag_mode": LINEAR_STAGE4_MAG_MODE, "mag_log_scale_source": LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE, "mag_log_scale_eps": LINEAR_STAGE4_MAG_LOG_SCALE_EPS, "mag_log_target_clip": LINEAR_STAGE4_MAG_LOG_TARGET_CLIP, "mag_log_pred_clip": LINEAR_STAGE4_MAG_LOG_PRED_CLIP, "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist(), **_decision_metadata()}
     cands = train_stage4_candidates_streaming_from_plan(extractor=extractor, preprocess_bundle=pb, plan=plan, stats=stats, alpha_values=[float(a) for a in LINEAR_STAGE4_ALPHA_VALUES], config=cfg)
     summaries=[]; best=None; best_metrics=None; best_score=float("-inf"); best_alpha=None
     for b in cands:
@@ -2729,7 +2781,9 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         bal_1s = _metric_at_primary_horizon(vm, "dir_bal_acc_kept")
         bce_1s = _metric_at_primary_horizon(vm, "val_dir_bce_kept")
         edge_sp_1s = _metric_at_primary_horizon(vm, "edge_spearman_kept")
-        mag_ratio_1s = _metric_at_primary_horizon(vm, "pred_abs_p90_over_true_abs_p90_kept")
+        mag_ratio_1s = _metric_at_primary_horizon(vm, "pred_expected_abs_p90_over_true_abs_p90_all")
+        if not np.isfinite(mag_ratio_1s):
+            mag_ratio_1s = _metric_at_primary_horizon(vm, "pred_abs_p90_over_true_abs_p90_kept")
         alpha = float(b.config.get("alpha"))
         print(
             f"[linear-stage4-candidate] alpha={alpha:g} "
@@ -2748,7 +2802,9 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
     best_bal_1s = _metric_at_primary_horizon(best_val_metrics, "dir_bal_acc_kept")
     best_bce_1s = _metric_at_primary_horizon(best_val_metrics, "val_dir_bce_kept")
     best_edge_sp_1s = _metric_at_primary_horizon(best_val_metrics, "edge_spearman_kept")
-    best_mag_ratio_1s = _metric_at_primary_horizon(best_val_metrics, "pred_abs_p90_over_true_abs_p90_kept")
+    best_mag_ratio_1s = _metric_at_primary_horizon(best_val_metrics, "pred_expected_abs_p90_over_true_abs_p90_all")
+    if not np.isfinite(best_mag_ratio_1s):
+        best_mag_ratio_1s = _metric_at_primary_horizon(best_val_metrics, "pred_abs_p90_over_true_abs_p90_kept")
     print(
         f"[linear-stage4-best] alpha={float(best_summary.get('alpha', float('nan'))):g} "
         f"primary={best_summary.get('primary_metric_label')} "
@@ -2775,7 +2831,13 @@ def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTaker
     parts = {k: [] for k in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_bps", "mag_down_bps", "edge_bps", "y", "positions"]}
     base_iter = iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name)
     for Z, y, pos in progress_iter_rows(base_iter, total_rows=decision_row_count(len(ds), max_rows=max_rows), desc=_progress_desc("stage5", "diagnostics", split_name)):
-        pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); up = np.asarray(pred["mag_up_sqrt"], dtype=np.float32); dn = np.asarray(pred["mag_down_sqrt"], dtype=np.float32); p = _sigmoid_np(dl); ub = up * up; db = dn * dn; edge = p * ub - (1.0 - p) * db
+        pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); p = _sigmoid_np(dl)
+        if "mag_up_bps" in pred and "mag_down_bps" in pred:
+            ub = np.asarray(pred["mag_up_bps"], dtype=np.float32); db = np.asarray(pred["mag_down_bps"], dtype=np.float32)
+            up = np.sqrt(np.maximum(ub, 0.0)); dn = np.sqrt(np.maximum(db, 0.0))
+        else:
+            up = np.asarray(pred["mag_up_sqrt"], dtype=np.float32); dn = np.asarray(pred["mag_down_sqrt"], dtype=np.float32); ub = up * up; db = dn * dn
+        edge = p * ub - (1.0 - p) * db
         for k, v in [("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_bps", ub), ("mag_down_bps", db), ("edge_bps", edge), ("y", y), ("positions", pos)]: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
     if not parts["y"]: raise ValueError(f"Streaming split contains no rows: {split_name}")
     print(f"[linear-stream] stage=stage5 action=diagnostics split={split_name} rows={sum(x.shape[0] for x in parts['y'])}", flush=True)
