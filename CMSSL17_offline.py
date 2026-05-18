@@ -80,17 +80,18 @@ BAND_DIAG_TRAIN = int(os.environ.get("BYBIT_BAND_DIAG_TRAIN", "1")) == 1
 BAND_DIAG_TRAIN_MAX_ROWS = max(1, int(os.environ.get("BYBIT_BAND_DIAG_TRAIN_MAX_ROWS", "200000")))
 BAND_DIAG_QUANTILES = np.array([0.00, 0.25, 0.50, 0.65, 0.75, 0.85, 0.925, 0.975, 1.00], dtype=np.float32)
 BAND_DIAG_NAMES = ["q00-q25", "q25-q50", "q50-q65", "q65-q75", "q75-q85", "q85-q925", "q925-q975", "q975-q100"]
-print(
-    f"[band-diag-config] enabled={int(BAND_DIAG)} train_enabled={int(BAND_DIAG_TRAIN)} "
-    f"train_max_rows={BAND_DIAG_TRAIN_MAX_ROWS} bands={','.join(BAND_DIAG_NAMES)}",
-    flush=True,
-)
-print(
-    f"[model-diag-config] enabled={int(MODEL_DIAG)} "
-    f"every={MODEL_DIAG_EVERY} max_batch={MODEL_DIAG_MAX_BATCH} "
-    f"grad_p95_max_elems={GRAD_DIAG_P95_MAX_ELEMS}",
-    flush=True,
-)
+if os.environ.get("BYBIT_SUPPRESS_CMSSL_CONFIG_PRINTS", "0").strip() != "1":
+    print(
+        f"[band-diag-config] enabled={int(BAND_DIAG)} train_enabled={int(BAND_DIAG_TRAIN)} "
+        f"train_max_rows={BAND_DIAG_TRAIN_MAX_ROWS} bands={','.join(BAND_DIAG_NAMES)}",
+        flush=True,
+    )
+    print(
+        f"[model-diag-config] enabled={int(MODEL_DIAG)} "
+        f"every={MODEL_DIAG_EVERY} max_batch={MODEL_DIAG_MAX_BATCH} "
+        f"grad_p95_max_elems={GRAD_DIAG_P95_MAX_ELEMS}",
+        flush=True,
+    )
 
 if not math.isfinite(SAM_RHO) or SAM_RHO < 0.0:
     raise ValueError(f"BYBIT_SAM_RHO must be finite and >= 0, got {SAM_RHO}")
@@ -98,7 +99,8 @@ if GATE_WARMUP_STEPS < 0:
     raise ValueError(f"BYBIT_GATE_WARMUP_STEPS must be >= 0, got {GATE_WARMUP_STEPS}")
 if not math.isfinite(GATE_LR) or GATE_LR <= 0.0:
     raise ValueError(f"BYBIT_GATE_LR must be finite and > 0, got {GATE_LR}")
-print(f"[gate-config] warmup_steps={GATE_WARMUP_STEPS} gate_lr={GATE_LR}", flush=True)
+if os.environ.get("BYBIT_SUPPRESS_CMSSL_CONFIG_PRINTS", "0").strip() != "1":
+    print(f"[gate-config] warmup_steps={GATE_WARMUP_STEPS} gate_lr={GATE_LR}", flush=True)
 
 EXPECTED_DECISION_TIME_BASIS = "ob_event_time"
 EXPECTED_DECISION_POLICY = "ob_event_time"
@@ -134,16 +136,17 @@ else:
 if TRAIN_ROW_STRIDE < 1:
     raise ValueError(f"BYBIT_TRAIN_ROW_STRIDE must be >= 1, got {TRAIN_ROW_STRIDE}")
 
-print(
-    f"[data-config] train_data_device={TRAIN_DATA_DEVICE} "
-    f"feature_storage_dtype={FEATURE_STORAGE_DTYPE_NAME}",
-    flush=True,
-)
-print(
-    f"[bf16-feature-debug-config] enabled={int(BF16_FEATURE_DEBUG)} "
-    f"max_batches={BF16_FEATURE_DEBUG_MAX_BATCHES}",
-    flush=True,
-)
+if os.environ.get("BYBIT_SUPPRESS_CMSSL_CONFIG_PRINTS", "0").strip() != "1":
+    print(
+        f"[data-config] train_data_device={TRAIN_DATA_DEVICE} "
+        f"feature_storage_dtype={FEATURE_STORAGE_DTYPE_NAME}",
+        flush=True,
+    )
+    print(
+        f"[bf16-feature-debug-config] enabled={int(BF16_FEATURE_DEBUG)} "
+        f"max_batches={BF16_FEATURE_DEBUG_MAX_BATCHES}",
+        flush=True,
+    )
 
 _BF16_FEATURE_DEBUG_BATCHES_PRINTED = 0
 DIR_CLASS_WEIGHT_TEMPER = 0.5
@@ -1606,6 +1609,16 @@ def summarize_label_band_audit(y_raw: np.ndarray, stats: Dict[str, np.ndarray], 
     return out
 
 
+def _stable_sigmoid_np(logits: np.ndarray) -> np.ndarray:
+    z = np.asarray(logits, dtype=np.float32)
+    out = np.empty_like(z, dtype=np.float32)
+    pos = z >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[~pos])
+    out[~pos] = ez / (1.0 + ez)
+    return out
+
+
 def summarize_band_metrics_from_arrays(
     *,
     dir_logits: np.ndarray,
@@ -1615,7 +1628,7 @@ def summarize_band_metrics_from_arrays(
     stats: Dict[str, np.ndarray],
     split_name: str,
 ) -> Dict[str, Any]:
-    p_up = 1.0 / (1.0 + np.exp(-dir_logits))
+    p_up = _stable_sigmoid_np(dir_logits)
     true_up = y_raw > 0
     pred_up = p_up >= 0.5
     mag_up_bps = mag_up_sqrt ** 2
@@ -1782,7 +1795,7 @@ def summarize_metrics(
             out["primary_metric_guard_passed"] = False
         else:
             dir_logits = np.concatenate(dir_parts, axis=0)
-            p_up = 1.0 / (1.0 + np.exp(-dir_logits))
+            p_up = _stable_sigmoid_np(dir_logits)
             mag_up_sqrt = np.concatenate(up_parts, axis=0)
             mag_down_sqrt = np.concatenate(down_parts, axis=0)
             y_raw = np.concatenate(y_parts, axis=0)
@@ -2086,7 +2099,8 @@ def build_optimizer_param_groups(model: torch.nn.Module, *, base_lr: float, gate
         else:
             main_params.append(p)
     if len(gate_params) <= 0:
-        print("[gate-config] no feature_gate parameters found; gate_lr disabled", flush=True)
+        if os.environ.get("BYBIT_SUPPRESS_CMSSL_CONFIG_PRINTS", "0").strip() != "1":
+            print("[gate-config] no feature_gate parameters found; gate_lr disabled", flush=True)
     if len(main_params) <= 0:
         raise ValueError("No trainable main parameters found for optimizer group.")
     gate_ids = {id(p) for p in gate_params}

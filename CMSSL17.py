@@ -473,7 +473,8 @@ ACT_DIAG_P95_MAX_ELEMS = max(
     1024,
     int(os.environ.get("BYBIT_ACT_DIAG_P95_MAX_ELEMS", "1000000")),
 )
-print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
+if os.environ.get("BYBIT_SUPPRESS_CMSSL_CONFIG_PRINTS", "0").strip() != "1":
+    print(f"[model-diag-config-model] act_p95_max_elems={ACT_DIAG_P95_MAX_ELEMS}", flush=True)
 
 # ConvTimeNet topology intentionally matches original 1s path:
 # Depatch -> 6 CI ConvEncoder layers -> per-patch flatten(F*C) -> linear final mixer -> [B, patch_count, DMODEL].

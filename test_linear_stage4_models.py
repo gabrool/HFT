@@ -216,3 +216,21 @@ def test_load_linear_trim_stats_rejects_decision_row_policy_mismatch(tmp_path, m
 
     with pytest.raises(ValueError, match="Trim stats cache decision_row_policy mismatch"):
         linear_offline.load_linear_trim_stats(tmp_path)
+
+
+def test_stable_sigmoid_handles_large_logits_without_warning():
+    import warnings
+    from CMSSL17_offline import _stable_sigmoid_np
+
+    logits = np.asarray([-1000.0, -100.0, 0.0, 100.0, 1000.0], dtype=np.float32)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        prob = _stable_sigmoid_np(logits)
+
+    assert caught == []
+    assert np.isfinite(prob).all()
+    assert (prob >= 0.0).all()
+    assert (prob <= 1.0).all()
+    assert prob[0] == 0.0
+    assert prob[2] == np.float32(0.5)
+    assert prob[-1] == 1.0
