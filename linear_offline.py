@@ -6,6 +6,10 @@ import gc
 import json
 import math
 import os
+
+if os.environ.get("BYBIT_LINEAR_SUPPRESS_CMSSL_CONFIG_PRINTS", "1").strip() == "1":
+    os.environ.setdefault("BYBIT_SUPPRESS_CMSSL_CONFIG_PRINTS", "1")
+
 import pickle
 import time
 from pathlib import Path
@@ -56,7 +60,30 @@ from CMSSL17_linear import (  # type: ignore
 
 
 
-def log_memory(tag: str) -> None:
+LINEAR_MEMORY_LOG = os.environ.get("BYBIT_LINEAR_MEMORY_LOG", "summary").strip().lower()
+if LINEAR_MEMORY_LOG not in {"off", "summary", "dataset", "debug"}:
+    raise ValueError("BYBIT_LINEAR_MEMORY_LOG must be one of: off, summary, dataset, debug")
+
+
+def _should_log_memory(level: str) -> bool:
+    mode = globals().get(
+        "LINEAR_MEMORY_LOG",
+        os.environ.get("BYBIT_LINEAR_MEMORY_LOG", "summary"),
+    ).strip().lower()
+    if mode == "off":
+        return False
+    if mode == "summary":
+        return level == "summary"
+    if mode == "dataset":
+        return level in {"summary", "dataset"}
+    if mode == "debug":
+        return True
+    return False
+
+
+def log_memory(tag: str, *, level: str = "dataset") -> None:
+    if not _should_log_memory(level):
+        return
     try:
         import resource
         rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -69,9 +96,9 @@ def force_gc(tag: str = "") -> None:
     gc.collect()
     if bool(getattr(torch.cuda, "is_available", lambda: False)()):
         torch.cuda.empty_cache()
-    if tag:
+    if tag and _should_log_memory("dataset"):
         print(f"[linear-memory] gc tag={tag}", flush=True)
-        log_memory(f"after_gc_{tag}")
+        log_memory(f"after_gc_{tag}", level="dataset")
 
 
 def close_dataset(ds: Any, *, name: str = "") -> None:
@@ -89,9 +116,9 @@ def release_dataset(ds: Any, *, name: str = "") -> None:
     gc.collect()
     if bool(getattr(torch.cuda, "is_available", lambda: False)()):
         torch.cuda.empty_cache()
-    if name:
+    if name and _should_log_memory("dataset"):
         print(f"[linear-memory] released dataset {name}", flush=True)
-        log_memory(f"after_release_{name}")
+        log_memory(f"after_release_{name}", level="dataset")
 
 def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
@@ -154,8 +181,8 @@ LINEAR_PREPROCESS_WINSOR_Q_HI = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_WI
 LINEAR_PREPROCESS_STANDARDIZE = _env_bool("BYBIT_LINEAR_PREPROCESS_STANDARDIZE", 1)
 LINEAR_PREPROCESS_STD_EPS = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_STD_EPS", "1e-6"))
 LINEAR_PREPROCESS_VARIANCE_FILTER = _env_bool("BYBIT_LINEAR_PREPROCESS_VARIANCE_FILTER", 1)
-LINEAR_PREPROCESS_MIN_STD = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_MIN_STD", "1e-6"))
-LINEAR_PREPROCESS_POST_CLIP_ABS = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_POST_CLIP_ABS", "0.0"))
+LINEAR_PREPROCESS_MIN_STD = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_MIN_STD", "1e-4"))
+LINEAR_PREPROCESS_POST_CLIP_ABS = float(os.environ.get("BYBIT_LINEAR_PREPROCESS_POST_CLIP_ABS", "10.0"))
 LINEAR_PREPROCESS_NONFINITE_POLICY = os.environ.get(
     "BYBIT_LINEAR_PREPROCESS_NONFINITE_POLICY", "raise"
 ).strip().lower()
@@ -170,7 +197,7 @@ LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES = _env_bool(
     "BYBIT_LINEAR_PREPROCESS_AUDIT_SAMPLE_VALUES", 0
 )
 LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE = _env_int(
-    "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE", 2_000_000
+    "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE", 200_000
 )
 LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS = _env_int(
     "BYBIT_LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS", 200_000
@@ -186,8 +213,15 @@ LINEAR_STAGE4_SCHEMA = "linear_target_models_stage4_v1"
 LINEAR_STAGE4_PREPROCESS_NAME = os.environ.get("BYBIT_LINEAR_STAGE4_PREPROCESS_NAME", "default").strip()
 LINEAR_STAGE4_TRAIN_SPLIT = os.environ.get("BYBIT_LINEAR_STAGE4_TRAIN_SPLIT", "train_full").strip().lower()
 LINEAR_STAGE4_PREDICTOR = os.environ.get("BYBIT_LINEAR_STAGE4_PREDICTOR", "sgd_l2_huber").strip().lower()
-LINEAR_STAGE4_ALPHA_GRID = os.environ.get("BYBIT_LINEAR_STAGE4_ALPHA_GRID", "1e-6,3e-6,1e-5,3e-5,1e-4").strip()
-LINEAR_STAGE4_ALPHA_VALUES = _env_float_list("BYBIT_LINEAR_STAGE4_ALPHA_GRID", "1e-6,3e-6,1e-5,3e-5,1e-4")
+DEFAULT_LINEAR_STAGE4_ALPHA_GRID = "1e-4,3e-4,1e-3,3e-3,1e-2"
+LINEAR_STAGE4_ALPHA_GRID = os.environ.get(
+    "BYBIT_LINEAR_STAGE4_ALPHA_GRID",
+    DEFAULT_LINEAR_STAGE4_ALPHA_GRID,
+).strip()
+LINEAR_STAGE4_ALPHA_VALUES = _env_float_list(
+    "BYBIT_LINEAR_STAGE4_ALPHA_GRID",
+    DEFAULT_LINEAR_STAGE4_ALPHA_GRID,
+)
 LINEAR_STAGE4_PENALTY = os.environ.get("BYBIT_LINEAR_STAGE4_PENALTY", "l2").strip().lower()
 LINEAR_STAGE4_L1_RATIO = float(os.environ.get("BYBIT_LINEAR_STAGE4_L1_RATIO", "0.15"))
 LINEAR_STAGE4_EPOCHS = _env_int("BYBIT_LINEAR_STAGE4_EPOCHS", 3)
@@ -688,6 +722,7 @@ class LinearTimer:
     def __enter__(self):
         self.start = time.time()
         print(f"[linear-timer] start {self.name}", flush=True)
+        log_memory(f"{self.name}_start", level="summary")
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -697,6 +732,7 @@ class LinearTimer:
             f"[linear-timer] {status} {self.name} elapsed={_format_seconds(elapsed)}",
             flush=True,
         )
+        log_memory(f"{self.name}_{status}", level="summary")
         return False
 
 
@@ -1644,9 +1680,29 @@ def summarize_linear_model_coefficients(bundle: Any, *, top_k: int) -> Dict[str,
     return out
 
 
+def _stable_sigmoid_np(logits: np.ndarray) -> np.ndarray:
+    z = np.asarray(logits, dtype=np.float32)
+    out = np.empty_like(z, dtype=np.float32)
+    pos = z >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[~pos])
+    out[~pos] = ez / (1.0 + ez)
+    return out
+
+
 def _sigmoid_np(x: np.ndarray) -> np.ndarray:
-    x64 = np.asarray(x, dtype=np.float64)
-    return (1.0 / (1.0 + np.exp(-np.clip(x64, -60.0, 60.0)))).astype(np.float32)
+    return _stable_sigmoid_np(x)
+
+
+def _metric_at_primary_horizon(metrics: Dict[str, Any], key: str) -> float:
+    vals = metrics.get(key)
+    if not isinstance(vals, list):
+        return float("nan")
+    try:
+        idx = list(map(int, HORIZONS_MS)).index(int(PRIMARY_METRIC_HORIZON_MS))
+        return float(vals[idx])
+    except Exception:
+        return float("nan")
 
 
 def _array_stats_by_horizon(arr: np.ndarray) -> list[Dict[str, float]]:
@@ -1986,6 +2042,7 @@ def main() -> None:
         print(
             f"[linear-config] stage=stage4 extractor={LINEAR_EXTRACTOR} "
             f"preprocess={LINEAR_STAGE4_PREPROCESS_NAME} predictor={LINEAR_STAGE4_PREDICTOR} "
+            f"alpha_grid={[float(a) for a in LINEAR_STAGE4_ALPHA_VALUES]} "
             f"device={device} linear_out_dir={linear_out_dir}",
             flush=True,
         )
@@ -2101,7 +2158,7 @@ def build_single_linear_dataset_from_entry(*, meta: Dict[str, Any], split_entry:
     feature_dim_total = int(meta["feature_dim_total"])
     _validate_dataset_split(ds, split_name, feature_dim_total)
     validate_dataset_label_array_shape(ds, split_name)
-    log_memory(f"after_build_{split_name}")
+    log_memory(f"after_build_{split_name}", level="dataset")
     return ds
 
 
@@ -2441,6 +2498,7 @@ def run_stage3_preprocessing(*, linear_out_dir: Path, extractor_name: str, prepr
         "nonfinite_policy": LINEAR_PREPROCESS_NONFINITE_POLICY,
         "fit_max_rows": LINEAR_PREPROCESS_FIT_MAX_ROWS,
         "fit_max_matrix_mb": LINEAR_PREPROCESS_FIT_MAX_MATRIX_MB,
+        "audit_max_value_sample": int(LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE),
         "audit_max_train_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TRAIN_ROWS),
         "audit_max_val_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_VAL_ROWS),
         "audit_max_test_rows": int(LINEAR_PREPROCESS_AUDIT_MAX_TEST_ROWS),
@@ -2658,7 +2716,7 @@ def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extrac
 def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess_name: str, device: torch.device) -> Dict[str, Any]:  # type: ignore[override]
     if LINEAR_STAGE4_TRAIN_SPLIT != "train_full": raise ValueError("Stage 4 now supports only train_full streaming")
     plan = load_linear_split_plan_from_out_root(out_root=Path(OUT_ROOT)); extractor, st2 = load_stage2_extractor_bundle(linear_out_dir=linear_out_dir, extractor_name=extractor_name); st3 = load_stage3_payload(linear_out_dir, extractor_name, preprocess_name); _validate_manifest_decision_policy(st3, context=f"stage4 stage3 {extractor_name}"); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"]))); stats = load_linear_trim_stats(linear_out_dir)
-    cfg = {"schema": LINEAR_STAGE4_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "predictor": LINEAR_STAGE4_PREDICTOR, "penalty": LINEAR_STAGE4_PENALTY, "l1_ratio": LINEAR_STAGE4_L1_RATIO, "epochs": LINEAR_STAGE4_EPOCHS, "batch_rows": LINEAR_STAGE4_BATCH_ROWS, "random_state": LINEAR_STAGE4_RANDOM_SEED, "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING, "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING, "mag_floor": LINEAR_STAGE4_MAG_FLOOR, **_decision_metadata()}
+    cfg = {"schema": LINEAR_STAGE4_SCHEMA, "extractor": extractor_name, "preprocess_name": preprocess_name, "predictor": LINEAR_STAGE4_PREDICTOR, "penalty": LINEAR_STAGE4_PENALTY, "l1_ratio": LINEAR_STAGE4_L1_RATIO, "alpha_grid": [float(a) for a in LINEAR_STAGE4_ALPHA_VALUES], "epochs": LINEAR_STAGE4_EPOCHS, "batch_rows": LINEAR_STAGE4_BATCH_ROWS, "random_state": LINEAR_STAGE4_RANDOM_SEED, "direction_weighting": LINEAR_STAGE4_DIRECTION_WEIGHTING, "mag_sample_weighting": LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING, "mag_floor": LINEAR_STAGE4_MAG_FLOOR, **_decision_metadata()}
     cands = train_stage4_candidates_streaming_from_plan(extractor=extractor, preprocess_bundle=pb, plan=plan, stats=stats, alpha_values=[float(a) for a in LINEAR_STAGE4_ALPHA_VALUES], config=cfg)
     summaries=[]; best=None; best_metrics=None; best_score=float("-inf"); best_alpha=None
     for b in cands:
@@ -2666,8 +2724,23 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         try: vm = evaluate_stage4_bundle_streaming(bundle=b, extractor=extractor, preprocess_bundle=pb, ds=ds_val, stats=stats, device=device, split_name="val", max_rows=LINEAR_STAGE4_MAX_VAL_ROWS)
         finally: close_dataset(ds_val, name="stage4_val_eval"); del ds_val; force_gc("stage4_val_eval")
         pv, pl = compute_primary_metric(vm); score = float(pv) if bool(vm.get("primary_metric_guard_passed", True)) and math.isfinite(float(pv)) else float("-inf")
-        summaries.append({"alpha": float(b.config.get("alpha")), "primary_metric_label": str(pl), "primary_metric_value": float(pv), "guard_passed": score > float("-inf"), "val_metrics": _jsonable_metrics(vm), "fit_summary": b.fit_summary})
-        if best is None or is_metric_improved(score, best_score, "max"): best=b; best_metrics=vm; best_score=score; best_alpha=float(b.config.get("alpha"))
+        guard_passed = score > float("-inf")
+        auc_1s = _metric_at_primary_horizon(vm, "dir_auc_kept")
+        bal_1s = _metric_at_primary_horizon(vm, "dir_bal_acc_kept")
+        bce_1s = _metric_at_primary_horizon(vm, "val_dir_bce_kept")
+        edge_sp_1s = _metric_at_primary_horizon(vm, "edge_spearman_kept")
+        mag_ratio_1s = _metric_at_primary_horizon(vm, "pred_abs_p90_over_true_abs_p90_kept")
+        alpha = float(b.config.get("alpha"))
+        print(
+            f"[linear-stage4-candidate] alpha={alpha:g} "
+            f"auc_1s={auc_1s:.6g} bal_1s={bal_1s:.6g} "
+            f"bce_1s={bce_1s:.6g} edge_sp_1s={edge_sp_1s:.6g} "
+            f"mag_p90_ratio_1s={mag_ratio_1s:.6g} "
+            f"guard_passed={bool(guard_passed)}",
+            flush=True,
+        )
+        summaries.append({"alpha": alpha, "primary_metric_label": str(pl), "primary_metric_value": float(pv), "guard_passed": guard_passed, "val_metrics": _jsonable_metrics(vm), "fit_summary": b.fit_summary})
+        if best is None or is_metric_improved(score, best_score, "max"): best=b; best_metrics=vm; best_score=score; best_alpha=alpha
     if best is None or best_metrics is None: raise ValueError("No Stage 4 candidate models were trained")
     stage4_dir = Path(linear_out_dir) / "stage4_models" / extractor_name / preprocess_name / LINEAR_STAGE4_PREDICTOR; stage4_dir.mkdir(parents=True, exist_ok=True); model_path = stage4_dir / "linear_stage4_best_model.pkl"; save_linear_sklearn_bundle(best, model_path)
     test_metrics = None

@@ -251,3 +251,54 @@ def test_streaming_stats_abs_sample_max_defined():
     assert summary["shape"] == [2, 2]
     assert summary["finite_frac"] == 1.0
     assert "abs_p95" in summary
+
+
+def test_linear_default_alpha_and_preprocess_config():
+    import os
+    import linear_offline
+
+    assert os.environ.get("BYBIT_SUPPRESS_CMSSL_CONFIG_PRINTS") == "1"
+    assert linear_offline.LINEAR_PREPROCESS_WINSOR_Q_LO == 0.001
+    assert linear_offline.LINEAR_PREPROCESS_WINSOR_Q_HI == 0.999
+    assert linear_offline.LINEAR_PREPROCESS_MIN_STD == 1e-4
+    assert linear_offline.LINEAR_PREPROCESS_POST_CLIP_ABS == 10.0
+    assert linear_offline.LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE == 200_000
+    assert linear_offline.LINEAR_STAGE4_ALPHA_VALUES == [1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+
+
+def test_stage3_payload_records_new_preprocess_defaults(monkeypatch, tmp_path):
+    import linear_offline
+
+    configure_stage3(monkeypatch, linear_offline)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_WINSOR_Q_LO", 0.001)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_WINSOR_Q_HI", 0.999)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_MIN_STD", 1e-4)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_POST_CLIP_ABS", 10.0)
+    monkeypatch.setattr(linear_offline, "LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE", 200_000)
+    install_stage3_fakes(monkeypatch, linear_offline, tmp_path)
+
+    payload = linear_offline.run_stage3_preprocessing(linear_out_dir=tmp_path, extractor_name="raw_linear")
+
+    cfg = payload["preprocess_config"]
+    assert cfg["winsor_q_lo"] == 0.001
+    assert cfg["winsor_q_hi"] == 0.999
+    assert cfg["min_std"] == 1e-4
+    assert cfg["post_clip_abs"] == 10.0
+    assert cfg["audit_max_value_sample"] == 200_000
+    assert cfg["audit_max_train_rows"] == 200_000
+    assert cfg["audit_max_val_rows"] == 200_000
+    assert cfg["audit_max_test_rows"] == 200_000
+
+
+def test_memory_summary_mode_suppresses_dataset_level_logs(monkeypatch, capsys):
+    import linear_offline
+
+    monkeypatch.setattr(linear_offline, "LINEAR_MEMORY_LOG", "summary")
+    linear_offline.log_memory("unit_dataset", level="dataset")
+    linear_offline.force_gc("unit_gc")
+    captured = capsys.readouterr().out
+    assert "[linear-memory]" not in captured
+
+    linear_offline.log_memory("unit_summary", level="summary")
+    captured = capsys.readouterr().out
+    assert "[linear-memory] tag=unit_summary" in captured
