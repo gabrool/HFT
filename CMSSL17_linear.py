@@ -192,14 +192,28 @@ class LinearSklearnTakerBundle:
 
 
 class LinearSklearnTorchWrapper(nn.Module):
-    def __init__(self, bundle: LinearSklearnTakerBundle):
+    def __init__(
+        self,
+        bundle: LinearSklearnTakerBundle,
+        *,
+        cmssl_schema_only: bool = False,
+    ):
         super().__init__()
         self.bundle = bundle
+        self.cmssl_schema_only = bool(cmssl_schema_only)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         device = x.device
         Z = x.detach().cpu().numpy().astype(np.float32, copy=False)
         pred = self.bundle.predict_dict_np(Z)
+
+        if self.cmssl_schema_only:
+            pred = {
+                "dir_logits": pred["dir_logits"],
+                "mag_up_sqrt": pred["mag_up_sqrt"],
+                "mag_down_sqrt": pred["mag_down_sqrt"],
+            }
+
         return {
             k: torch.as_tensor(v, dtype=torch.float32, device=device)
             for k, v in pred.items()
