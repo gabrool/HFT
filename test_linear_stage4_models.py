@@ -92,6 +92,29 @@ def test_bundle_prediction_schema():
     assert np.allclose(pred["mag_up_sqrt"] ** 2, pred["mag_up_bps"], rtol=1e-4, atol=1e-6)
 
 
+def test_side_log_mag_targets_np():
+    from CMSSL17_linear import side_log_mag_targets_np
+    y = np.asarray([[0.0, 1.0, -2.0], [3.0, 0.0, -4.0]], dtype=np.float32)
+    scale = np.ones(3, dtype=np.float32)
+    up_log, down_log = side_log_mag_targets_np(y, up_scale_bps=scale, down_scale_bps=scale, target_clip=0.0)
+    assert up_log[0, 0] == 0.0
+    assert np.isclose(up_log[0, 1], np.log1p(1.0))
+    assert up_log[0, 2] == 0.0
+    assert np.isclose(down_log[0, 2], np.log1p(2.0))
+    assert np.isclose(up_log[1, 0], np.log1p(3.0))
+    assert np.isclose(down_log[1, 2], np.log1p(4.0))
+
+
+def test_inverse_side_log_mag_np_roundtrip():
+    from CMSSL17_linear import inverse_side_log_mag_np, side_log_mag_targets_np
+    y = np.asarray([[0.0, 1.0, -2.0], [3.0, 0.0, -4.0]], dtype=np.float32)
+    scale = np.ones(3, dtype=np.float32)
+    up_log, down_log = side_log_mag_targets_np(y, up_scale_bps=scale, down_scale_bps=scale, target_clip=0.0)
+    up_bps, down_bps = inverse_side_log_mag_np(up_log, down_log, up_scale_bps=scale, down_scale_bps=scale, mag_floor_bps=0.0, pred_log_clip=20.0)
+    assert np.allclose(up_bps, np.maximum(y, 0.0), rtol=1e-5, atol=1e-6)
+    assert np.allclose(down_bps, np.maximum(-y, 0.0), rtol=1e-5, atol=1e-6)
+
+
 def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, monkeypatch):
     pytest.importorskip("sklearn")
     import linear_offline
@@ -141,6 +164,18 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
     assert fit["mag_mode"] == "side_all_log"
     assert fit["up_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
     assert fit["down_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
+    assert all(c <= total_rows for c in fit["dir_rows_per_horizon"])
+
+
+def test_add_side_all_log_magnitude_metrics_uses_all_rows():
+    import linear_offline
+    y = np.asarray([[0.0, 1.0, -2.0], [0.0, 0.0, 0.0], [2.0, -1.0, 4.0], [-3.0, 0.5, 0.0]], dtype=np.float32)
+    pred = {"dir_logits": np.zeros_like(y, dtype=np.float32), "mag_up_bps": np.maximum(y, 0.0) + 0.1, "mag_down_bps": np.maximum(-y, 0.0) + 0.1}
+    metrics = {}
+    linear_offline.add_side_all_log_magnitude_metrics(metrics, y=y, pred=pred)
+    assert len(metrics["mag_expected_abs_spearman_all"]) == y.shape[1]
+    assert len(metrics["pred_expected_abs_p90_over_true_abs_p90_all"]) == y.shape[1]
+    assert all(np.isfinite(metrics["pred_expected_abs_p90_over_true_abs_p90_all"]))
 
 
 def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch):
@@ -166,6 +201,8 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
         "val_dir_bce_kept": [0.55] * metric_len,
         "edge_spearman_kept": [0.13] * metric_len,
         "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len,
+        "pred_expected_abs_p90_over_true_abs_p90_all": [1.23] * metric_len,
+        "mag_expected_abs_spearman_all": [0.44] * metric_len,
         "primary_metric_guard_passed": True,
     }
 
@@ -203,6 +240,8 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     assert "bal_1s=" in out
     assert "bce_1s=" in out
     assert "edge_sp_1s=" in out
+    assert "mag_abs_sp_1s=0.44" in out
+    assert "mag_p90_ratio_1s=1.23" in out
     assert "mag_p90_ratio_1s=" in out
     assert "primary=" in out
     assert "guard_passed=" in out

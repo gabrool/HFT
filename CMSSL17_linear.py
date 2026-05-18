@@ -24,6 +24,48 @@ LINEAR_RAW_LINEAR_SCHEMA = "raw_linear_lag_bank_stats_v1"
 LINEAR_AEON_EXTRACTOR_SCHEMA = "aeon_rocket_hydra_stage2_v1"
 
 
+def side_log_mag_targets_np(
+    y: np.ndarray,
+    *,
+    up_scale_bps: np.ndarray,
+    down_scale_bps: np.ndarray,
+    target_clip: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim != 2 or y.shape[1] != int(NUM_HORIZONS):
+        raise ValueError(f"y must have shape [N, {NUM_HORIZONS}], got {y.shape}")
+    up_scale = np.asarray(up_scale_bps, dtype=np.float32).reshape(1, -1)
+    down_scale = np.asarray(down_scale_bps, dtype=np.float32).reshape(1, -1)
+    if up_scale.shape[1] != int(NUM_HORIZONS) or down_scale.shape[1] != int(NUM_HORIZONS):
+        raise ValueError("scale vectors must have NUM_HORIZONS entries")
+    up = np.maximum(y, 0.0)
+    down = np.maximum(-y, 0.0)
+    up_log = np.log1p(up / np.maximum(up_scale, 1e-12))
+    down_log = np.log1p(down / np.maximum(down_scale, 1e-12))
+    if target_clip > 0.0:
+        up_log = np.clip(up_log, 0.0, float(target_clip))
+        down_log = np.clip(down_log, 0.0, float(target_clip))
+    return up_log.astype(np.float32, copy=False), down_log.astype(np.float32, copy=False)
+
+
+def inverse_side_log_mag_np(
+    up_log: np.ndarray,
+    down_log: np.ndarray,
+    *,
+    up_scale_bps: np.ndarray,
+    down_scale_bps: np.ndarray,
+    mag_floor_bps: float = 0.0,
+    pred_log_clip: float = 20.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    up_log = np.asarray(up_log, dtype=np.float32)
+    down_log = np.asarray(down_log, dtype=np.float32)
+    up_scale = np.asarray(up_scale_bps, dtype=np.float32).reshape(1, -1)
+    down_scale = np.asarray(down_scale_bps, dtype=np.float32).reshape(1, -1)
+    up_bps = np.maximum(np.expm1(np.clip(np.maximum(up_log, 0.0), 0.0, float(pred_log_clip))) * up_scale, float(mag_floor_bps))
+    down_bps = np.maximum(np.expm1(np.clip(np.maximum(down_log, 0.0), 0.0, float(pred_log_clip))) * down_scale, float(mag_floor_bps))
+    return up_bps.astype(np.float32, copy=False), down_bps.astype(np.float32, copy=False)
+
+
 @dataclass
 class LinearPreprocessBundle:
     schema: str
@@ -129,11 +171,15 @@ class LinearSklearnTakerBundle:
         down_log = np.stack(down_cols, axis=1).astype(np.float32, copy=False)
         up_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_up_scale_bps is None else np.asarray(self.mag_up_scale_bps, dtype=np.float32)
         down_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_down_scale_bps is None else np.asarray(self.mag_down_scale_bps, dtype=np.float32)
-        up_scale = up_scale_raw.reshape(1, -1)
-        down_scale = down_scale_raw.reshape(1, -1)
         pred_log_clip = float(self.config.get("mag_log_pred_clip", 20.0))
-        up_bps = np.maximum(np.expm1(np.clip(np.maximum(up_log, 0.0), 0.0, pred_log_clip)) * up_scale, float(self.mag_floor))
-        down_bps = np.maximum(np.expm1(np.clip(np.maximum(down_log, 0.0), 0.0, pred_log_clip)) * down_scale, float(self.mag_floor))
+        up_bps, down_bps = inverse_side_log_mag_np(
+            up_log,
+            down_log,
+            up_scale_bps=up_scale_raw,
+            down_scale_bps=down_scale_raw,
+            mag_floor_bps=float(self.mag_floor),
+            pred_log_clip=pred_log_clip,
+        )
         return {
             "dir_logits": np.stack(dir_cols, axis=1).astype(np.float32, copy=False),
             "mag_up_log": up_log,
