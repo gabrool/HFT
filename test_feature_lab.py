@@ -1,8 +1,15 @@
-import json, os
+import json
 import numpy as np
 import pytest
 
-from feature_lab import eval_expr, evaluate_candidate_array, side_specific_keep_mask, select_feature_names_and_idx
+from feature_lab import (
+    eval_expr,
+    evaluate_candidate_array,
+    side_specific_keep_mask,
+    select_feature_names_and_idx,
+    resolve_train_weeks,
+    resolve_week_label_count,
+)
 
 
 def _mk():
@@ -75,3 +82,45 @@ def test_summary_is_compact_no_large_arrays():
     txt=json.dumps(summary)
     assert "candidate_values" not in txt
     assert len(txt)<20000
+
+
+def test_decile_report_has_10_deciles_per_horizon():
+    X, y, names, weeks = _mk()
+    _, _, _, _, _, dec = evaluate_candidate_array("sig", X[:, 0], X, y, names, weeks)
+    for h in [200, 500, 1000]:
+        d = {r["decile"] for r in dec if r["horizon_ms"] == h}
+        assert d == set(range(10))
+    assert len(dec) == 30
+
+
+def test_health_report_has_required_distribution_fields():
+    X, y, names, weeks = _mk()
+    health, *_ = evaluate_candidate_array("sig", X[:, 0], X, y, names, weeks)
+    for k in ["p01", "p05", "p50", "p95", "p99", "min", "max", "abs_max", "zero_frac", "near_zero_frac_abs_lt_1e-6"]:
+        assert k in health
+        assert np.isfinite(health[k])
+
+
+def test_relative_report_has_required_decision_context():
+    X, y, names, weeks = _mk()
+    *_, rel, summary, dec = evaluate_candidate_array("sig", X[:, 0], X, y, names, weeks)
+    for k in ["high_corr_duplicate", "medium_corr_related", "best_kept_auc_200ms", "best_kept_auc_500ms", "best_kept_auc_1000ms", "best_kept_bal_acc_1000ms", "best_abs_return_spearman", "best_mi_direction", "best_mi_abs_return", "finite_frac", "std", "week_std_cv"]:
+        assert k in rel
+
+
+def test_resolve_train_weeks_current_split_schema():
+    meta = {"splits": {"cmssl": {"train": {"weeks": ["w1", "w2"]}}}}
+    assert resolve_train_weeks(meta) == ["w1", "w2"]
+
+
+def test_resolve_train_weeks_legacy_schema():
+    meta = {"train_weeks": ["w1"]}
+    assert resolve_train_weeks(meta) == ["w1"]
+
+
+def test_resolve_week_label_count_labels_total():
+    assert resolve_week_label_count({"labels_total": 123}) == 123
+
+
+def test_resolve_week_label_count_chunks():
+    assert resolve_week_label_count({"label_chunks": [{"n": 5}, {"n": 7}]}) == 12
