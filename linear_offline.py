@@ -1888,6 +1888,12 @@ def _side_decile_calibration(pred_bps: np.ndarray, true_bps: np.ndarray) -> tupl
     lift = float(top_true_mean / max(bottom_true_mean, 1e-12)) if np.isfinite(top_true_mean) and np.isfinite(bottom_true_mean) else float("nan")
     return out, lift
 
+def _safe_nanmean_values(values) -> float:
+    arr = np.asarray(list(values), dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    return float(arr.mean()) if arr.size else float("nan")
+
+
 def add_side_cond_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarray, pred: Dict[str, np.ndarray], scale_up_bps: np.ndarray, scale_down_bps: np.ndarray) -> None:
     y = np.asarray(y, dtype=np.float32)
     mag_up_bps, mag_down_bps = extract_mag_bps_from_prediction(pred)
@@ -1921,12 +1927,12 @@ def add_side_cond_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarra
             metrics.setdefault(k,[]).append(v)
         metrics.setdefault("up_decile_calibration_cond",[]).append(up_dec)
         metrics.setdefault("down_decile_calibration_cond",[]).append(dn_dec)
-        metrics.setdefault("mean_side_log_huber_cond",[]).append(float(np.nanmean([up_h,dn_h])))
-        metrics.setdefault("mean_side_spearman_cond",[]).append(float(np.nanmean([up_sp,dn_sp])))
-        metrics.setdefault("mean_side_mean_ratio_cond",[]).append(float(np.nanmean([up_mr,dn_mr])))
-        metrics.setdefault("mean_side_p50_ratio_cond",[]).append(float(np.nanmean([up_p50,dn_p50])))
-        metrics.setdefault("mean_side_p90_ratio_cond",[]).append(float(np.nanmean([up_p90,dn_p90])))
-        metrics.setdefault("mean_side_top_bottom_true_mean_lift_cond",[]).append(float(np.nanmean([up_lift,dn_lift])))
+        metrics.setdefault("mean_side_log_huber_cond",[]).append(_safe_nanmean_values([up_h,dn_h]))
+        metrics.setdefault("mean_side_spearman_cond",[]).append(_safe_nanmean_values([up_sp,dn_sp]))
+        metrics.setdefault("mean_side_mean_ratio_cond",[]).append(_safe_nanmean_values([up_mr,dn_mr]))
+        metrics.setdefault("mean_side_p50_ratio_cond",[]).append(_safe_nanmean_values([up_p50,dn_p50]))
+        metrics.setdefault("mean_side_p90_ratio_cond",[]).append(_safe_nanmean_values([up_p90,dn_p90]))
+        metrics.setdefault("mean_side_top_bottom_true_mean_lift_cond",[]).append(_safe_nanmean_values([up_lift,dn_lift]))
         up_inactive = y[:, h] <= 0.0
         down_inactive = y[:, h] >= 0.0
         metrics.setdefault("up_inactive_pred_p90_bps",[]).append(float(np.percentile(mag_up_bps[up_inactive,h],90)) if np.any(up_inactive) else float('nan'))
