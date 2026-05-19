@@ -3536,7 +3536,7 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bps(name, scale=2.0)
         elif name.startswith("mid_slope_bps_per_sec_") or name.startswith("micro_l5_slope_") or name.startswith("spread_widening_slope_bps_per_sec_"):
             s = bps(name, scale=10.0)
-        elif name == "micro_minus_mid_bps" or name.startswith("micro_l") and name.endswith("_minus_mid_bps") or name.startswith("vamp_l") and name.endswith("_minus_mid_bps") or name == "micro_l1_minus_micro_l10_bps":
+        elif name == "micro_minus_mid_bps" or name.startswith("micro_l") and name.endswith("_minus_mid_bps") or name.startswith("vamp_l") and name.endswith("_minus_mid_bps"):
             s = bps(name, scale=2.0)
         elif name.startswith("vwap_vs_mid_bps_") or name.startswith("signed_trade_premium_bps_volume_weighted_"):
             s = bps(name, scale=3.0)
