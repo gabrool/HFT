@@ -2903,7 +2903,20 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         direction_summaries.append({"direction_alpha": alpha, "primary_metric_label": str(pl), "primary_metric_value": float(pv), "guard_passed": guard_passed, "auc_1s": auc_1s, "bal_1s": bal_1s, "bce_1s": bce_1s})
         if best is None or is_metric_improved(score, best_score, "max"): best=b; best_metrics=vm; best_score=score; best_alpha=alpha
     if best is None or best_metrics is None: raise ValueError("No Stage 4 candidate models were trained")
-    magnitude_results = train_magnitude_models_streaming_from_plan(extractor=extractor, preprocess_bundle=pb, plan=plan, mag_alpha_values=[float(a) for a in LINEAR_STAGE4_MAG_ALPHA_VALUES], config=cfg)
+    mag_alphas = [float(a) for a in LINEAR_STAGE4_MAG_ALPHA_VALUES]
+    remaining_mag_alphas = [a for a in mag_alphas if not math.isclose(float(a), float(reference_mag_alpha), rel_tol=0.0, abs_tol=1e-18)]
+    magnitude_results = [reference_mag_result]
+    if remaining_mag_alphas:
+        magnitude_results.extend(
+            train_magnitude_models_streaming_from_plan(
+                extractor=extractor,
+                preprocess_bundle=pb,
+                plan=plan,
+                mag_alpha_values=remaining_mag_alphas,
+                config=cfg,
+            )
+        )
+    magnitude_results = sorted(magnitude_results, key=lambda r: float(r["mag_alpha"]))
     mag_candidates = magnitude_results
     magnitude_summaries = []
     best_mag_alpha = float(LINEAR_STAGE4_MAG_ALPHA_VALUES[0]); best_mag_score = float("-inf"); best_mag_bundle = best
