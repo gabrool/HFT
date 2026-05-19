@@ -158,11 +158,11 @@ def test_torch_wrapper_cmssl_schema_only_filters_extra_keys():
     assert set(strict) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
 
 
-def test_side_log_mag_targets_np():
-    from CMSSL17_linear import side_log_mag_targets_np
+def test_side_cond_log_mag_targets_np():
+    from CMSSL17_linear import side_cond_log_mag_targets_np
     y = np.asarray([[0.0, 1.0, -2.0], [3.0, 0.0, -4.0]], dtype=np.float32)
     scale = np.ones(3, dtype=np.float32)
-    up_log, down_log = side_log_mag_targets_np(y, up_scale_bps=scale, down_scale_bps=scale, target_clip=0.0)
+    up_log, down_log = side_cond_log_mag_targets_np(y, up_scale_bps=scale, down_scale_bps=scale, target_clip=0.0)
     assert up_log[0, 0] == 0.0
     assert np.isclose(up_log[0, 1], np.log1p(1.0))
     assert up_log[0, 2] == 0.0
@@ -171,76 +171,14 @@ def test_side_log_mag_targets_np():
     assert np.isclose(down_log[1, 2], np.log1p(4.0))
 
 
-def test_inverse_side_log_mag_np_roundtrip():
-    from CMSSL17_linear import inverse_side_log_mag_np, side_log_mag_targets_np
+def test_inverse_side_cond_log_mag_np_roundtrip():
+    from CMSSL17_linear import inverse_side_cond_log_mag_np, side_cond_log_mag_targets_np
     y = np.asarray([[0.0, 1.0, -2.0], [3.0, 0.0, -4.0]], dtype=np.float32)
     scale = np.ones(3, dtype=np.float32)
-    up_log, down_log = side_log_mag_targets_np(y, up_scale_bps=scale, down_scale_bps=scale, target_clip=0.0)
-    up_bps, down_bps = inverse_side_log_mag_np(up_log, down_log, up_scale_bps=scale, down_scale_bps=scale, mag_floor_bps=0.0, pred_log_clip=20.0)
+    up_log, down_log = side_cond_log_mag_targets_np(y, up_scale_bps=scale, down_scale_bps=scale, target_clip=0.0)
+    up_bps, down_bps = inverse_side_cond_log_mag_np(up_log, down_log, up_scale_bps=scale, down_scale_bps=scale, mag_floor_bps=0.0, pred_log_clip=20.0)
     assert np.allclose(up_bps, np.maximum(y, 0.0), rtol=1e-5, atol=1e-6)
     assert np.allclose(down_bps, np.maximum(-y, 0.0), rtol=1e-5, atol=1e-6)
-
-
-def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, monkeypatch):
-    pytest.importorskip("sklearn")
-    import linear_offline
-    from CMSSL17 import NUM_HORIZONS
-
-    configure_stage4(monkeypatch, linear_offline)
-    Z, y, _pos = make_synthetic()
-    stats = write_trim_stats(tmp_path, y)
-
-    def fake_iter(**kwargs):
-        del kwargs
-        yield Z, y, None
-
-    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train_plan", fake_iter)
-    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: int(y.shape[0]))
-    monkeypatch.setattr(
-        linear_offline,
-        "compute_global_direction_weights_from_train_labels_plan",
-        lambda **kwargs: [(1.0, 1.0) for _ in range(NUM_HORIZONS)],
-    )
-    config = {
-        "schema": linear_offline.LINEAR_STAGE4_SCHEMA,
-        "penalty": "l2",
-        "l1_ratio": 0.15,
-        "epochs": 1,
-        "batch_rows": 32,
-        "random_state": 7,
-        "direction_weighting": "tempered",
-        "mag_floor": 1e-4,
-        "mag_up_scale_bps": [1.0, 1.0, 1.0],
-        "mag_down_scale_bps": [1.0, 1.0, 1.0],
-        "mag_mode": "side_cond_log",
-        "mag_log_scale_source": "train_median_nonzero_side",
-        "mag_log_scale_eps": 1e-6,
-        "mag_log_target_clip": 0.0,
-        "mag_log_pred_clip": 20.0,
-    }
-    bundles = linear_offline.train_stage4_candidates_streaming_from_plan(
-        extractor=object(),
-        preprocess_bundle=object(),
-        plan={"train_split_entries": [{}], "train_week_keys": ["w0"]},
-        stats=stats,
-        alpha_values=[1e-4],
-        config=config,
-    )
-    bundle = bundles[0]
-    assert len(bundle.direction_models) == NUM_HORIZONS
-    assert len(bundle.mag_up_models) == NUM_HORIZONS
-    assert len(bundle.mag_down_models) == NUM_HORIZONS
-    fit = bundle.fit_summary
-    total_rows = int(Z.shape[0])
-    assert fit["mag_mode"] == "side_cond_log"
-    assert fit["mag_log_scale_source"] == "train_median_nonzero_side"
-    assert fit["mag_log_scale_eps"] == 1e-6
-    assert fit["mag_log_target_clip"] == 0.0
-    assert fit["mag_log_pred_clip"] == 20.0
-    assert fit["mag_training_rows"] == "all_decision_rows"
-    assert fit["up_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
-    assert fit["down_rows_per_horizon"] == [total_rows] * NUM_HORIZONS
-    assert all(c <= total_rows for c in fit["dir_rows_per_horizon"])
 
 
 def test_direction_helper_trains_only_direction(tmp_path, monkeypatch):
@@ -273,16 +211,20 @@ def test_magnitude_helper_trains_only_magnitude(tmp_path, monkeypatch):
     assert calls["mag"] > 0
 
 
-def test_add_side_cond_log_magnitude_metrics_uses_all_rows():
+def test_add_side_cond_log_magnitude_metrics_conditional_keys():
     import linear_offline
     y = np.asarray([[0.0, 1.0, -2.0], [0.0, 0.0, 0.0], [2.0, -1.0, 4.0], [-3.0, 0.5, 0.0]], dtype=np.float32)
-    pred = {"dir_logits": np.zeros_like(y, dtype=np.float32), "mag_up_bps": np.maximum(y, 0.0) + 0.1, "mag_down_bps": np.maximum(-y, 0.0) + 0.1}
+    pred = {"dir_logits": np.zeros_like(y, dtype=np.float32), "mag_up_bps": np.maximum(y, 0.0) + 0.1, "mag_down_bps": np.maximum(-y, 0.0) + 0.1, "mag_up_log": np.log1p((np.maximum(y,0.0)+0.1)), "mag_down_log": np.log1p((np.maximum(-y,0.0)+0.1))}
     metrics = {}
     linear_offline.add_side_cond_log_magnitude_metrics(metrics, y=y, pred=pred, scale_up_bps=np.ones(y.shape[1],dtype=np.float32), scale_down_bps=np.ones(y.shape[1],dtype=np.float32))
     assert len(metrics["mean_side_spearman_cond"]) == y.shape[1]
     assert len(metrics["mean_side_p90_ratio_cond"]) == y.shape[1]
     assert len(metrics["mean_side_p50_ratio_cond"]) == y.shape[1]
-    assert all(np.isfinite(metrics["mean_side_p90_ratio_cond"]))
+    assert metrics["up_n_cond"][0] == int((y[:,0] > 0).sum())
+    assert metrics["down_n_cond"][0] == int((y[:,0] < 0).sum())
+    assert "mean_side_top_bottom_true_mean_lift_cond" in metrics
+    assert "up_inactive_pred_p90_bps" in metrics
+    assert "down_inactive_pred_p90_bps" in metrics
     assert "pred_expected_abs_p50_over_true_abs_p50_all" not in metrics
     assert "true_abs_bps_p50_all" not in metrics
     assert "pred_expected_abs_bps_p50_all" not in metrics
@@ -357,7 +299,7 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     assert "bal_1s=" in out
     assert "bce_1s=" in out
     assert "edge_sp_1s=" in out
-    assert "mag_abs_sp_1s=0.44" in out
+    assert "mag_sp_1s=0.44" in out
     assert "mag_p90_ratio_1s=1.23" in out
     assert "mag_p90_ratio_1s=" in out
     assert "selection_score=" in out
