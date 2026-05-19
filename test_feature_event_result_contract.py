@@ -2424,12 +2424,12 @@ def test_micro_minus_mid_bps_transform_contract() -> None:
     specs = {s.name: s for s in build_feature_transform_specs(fe.feature_names())}
     spec = specs["micro_minus_mid_bps"]
 
-    assert spec.raw_transform == RawTransformKind.IDENTITY
+    assert spec.raw_transform == RawTransformKind.FIXED_SCALE
     assert spec.normalize == NormalizeKind.NONE
     assert spec.half_life_ms == 0
-    assert spec.scale == 1.0
+    assert spec.scale == 2.0
     assert spec.input_clip_abs == 0.0
-    assert spec.output_clip_abs == 1.5
+    assert spec.output_clip_abs == 8.0
 
 
 def test_aux_transform_constant_and_metadata_contract() -> None:
