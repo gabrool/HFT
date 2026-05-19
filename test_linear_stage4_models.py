@@ -243,6 +243,36 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
     assert all(c <= total_rows for c in fit["dir_rows_per_horizon"])
 
 
+def test_direction_helper_trains_only_direction(tmp_path, monkeypatch):
+    import linear_offline
+    Z, y, _ = make_synthetic()
+    stats = write_trim_stats(tmp_path, y)
+    calls = {"dir": 0, "mag": 0}
+    class _M:
+        def partial_fit(self, *args, **kwargs):
+            return self
+    monkeypatch.setattr(linear_offline, "make_direction_model", lambda **kwargs: type("D", (), {"partial_fit": lambda self, *a, **k: calls.__setitem__("dir", calls["dir"] + 1) or self})())
+    monkeypatch.setattr(linear_offline, "make_magnitude_model", lambda **kwargs: type("M", (), {"partial_fit": lambda self, *a, **k: calls.__setitem__("mag", calls["mag"] + 1) or self})())
+    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train_plan", lambda **kwargs: iter([(Z, y, None)]))
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: int(y.shape[0]))
+    linear_offline.train_direction_models_streaming_from_plan(extractor=object(), preprocess_bundle=object(), plan={"train_split_entries": [{}]}, stats=stats, direction_alpha_values=[1e-3], config={"epochs": 1, "batch_rows": 32, "random_state": 1, "direction_weighting": "none"}, direction_weights=[(1.0, 1.0)] * len(linear_offline.HORIZONS_MS))
+    assert calls["dir"] > 0
+    assert calls["mag"] == 0
+
+
+def test_magnitude_helper_trains_only_magnitude(tmp_path, monkeypatch):
+    import linear_offline
+    Z, y, _ = make_synthetic()
+    calls = {"dir": 0, "mag": 0}
+    monkeypatch.setattr(linear_offline, "make_direction_model", lambda **kwargs: type("D", (), {"partial_fit": lambda self, *a, **k: calls.__setitem__("dir", calls["dir"] + 1) or self})())
+    monkeypatch.setattr(linear_offline, "make_magnitude_model", lambda **kwargs: type("M", (), {"partial_fit": lambda self, *a, **k: calls.__setitem__("mag", calls["mag"] + 1) or self})())
+    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train_plan", lambda **kwargs: iter([(Z, y, None)]))
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: int(y.shape[0]))
+    linear_offline.train_magnitude_models_streaming_from_plan(extractor=object(), preprocess_bundle=object(), plan={"train_split_entries": [{}]}, mag_alpha_values=[1e-4], config={"epochs": 1, "batch_rows": 32, "random_state": 1, "mag_up_scale_bps": [1.0, 1.0, 1.0], "mag_down_scale_bps": [1.0, 1.0, 1.0]})
+    assert calls["dir"] == 0
+    assert calls["mag"] > 0
+
+
 def test_add_side_all_log_magnitude_metrics_uses_all_rows():
     import linear_offline
     y = np.asarray([[0.0, 1.0, -2.0], [0.0, 0.0, 0.0], [2.0, -1.0, 4.0], [-3.0, 0.5, 0.0]], dtype=np.float32)
@@ -273,6 +303,8 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     }
     fake_preprocess = types.SimpleNamespace(original_dim=5, kept_dim=5)
     fake_bundle = types.SimpleNamespace(config={"alpha": 1e-4}, fit_summary={"unit_test": True})
+    fake_dir_result = {"direction_alpha": 1e-4, "direction_models": [], "fit_summary": {"direction_alpha": 1e-4}}
+    fake_mag_result = {"mag_alpha": 1e-4, "mag_up_models": [], "mag_down_models": [], "fit_summary": {"mag_alpha": 1e-4}}
 
     metric_len = len(linear_offline.HORIZONS_MS)
     fake_metrics = {
@@ -297,7 +329,10 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     monkeypatch.setattr(linear_offline, "load_linear_preprocess_bundle", lambda path: fake_preprocess)
     monkeypatch.setattr(linear_offline, "load_linear_trim_stats", lambda linear_out_dir: {})
     monkeypatch.setattr(linear_offline, "compute_side_log_mag_scales_from_train_plan", lambda **kwargs: (np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32), np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32)))
-    monkeypatch.setattr(linear_offline, "train_stage4_candidates_streaming_from_plan", lambda **kwargs: [fake_bundle])
+    monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0)] * len(linear_offline.HORIZONS_MS))
+    monkeypatch.setattr(linear_offline, "train_direction_models_streaming_from_plan", lambda **kwargs: [fake_dir_result])
+    monkeypatch.setattr(linear_offline, "train_magnitude_models_streaming_from_plan", lambda **kwargs: [fake_mag_result])
+    monkeypatch.setattr(linear_offline, "build_stage4_bundle_from_parts", lambda **kwargs: fake_bundle)
     monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
     monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
     monkeypatch.setattr(linear_offline, "close_dataset", lambda *args, **kwargs: None)
