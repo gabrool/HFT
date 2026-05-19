@@ -89,7 +89,7 @@ def test_bundle_prediction_schema():
     direction_models = [FakeDirection(float(h)) for h in range(NUM_HORIZONS)]
     mag_up_models = [FakeRegressor(np.log1p(0.2 + h)) for h in range(NUM_HORIZONS)]
     mag_down_models = [FakeRegressor(np.log1p(0.3 + h)) for h in range(NUM_HORIZONS)]
-    bundle = LinearSklearnTakerBundle("linear_target_models_stage4_v1", {}, [1, 2, 3], direction_models, mag_up_models, mag_down_models, 1e-4, {}, "side_all_log", np.ones(NUM_HORIZONS, dtype=np.float32), np.ones(NUM_HORIZONS, dtype=np.float32))
+    bundle = LinearSklearnTakerBundle("linear_target_models_stage4_v1", {}, [1, 2, 3], direction_models, mag_up_models, mag_down_models, 1e-4, {}, "side_cond_log", np.ones(NUM_HORIZONS, dtype=np.float32), np.ones(NUM_HORIZONS, dtype=np.float32))
     pred = bundle.predict_dict_np(Z[:11])
     assert set(pred) == {"dir_logits", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "mag_up_sqrt", "mag_down_sqrt"}
     assert pred["dir_logits"].shape == (11, NUM_HORIZONS)
@@ -126,7 +126,7 @@ def test_torch_wrapper_cmssl_schema_only_filters_extra_keys():
         [FakeRegressor(np.log1p(1.0)) for _ in range(NUM_HORIZONS)],
         1e-4,
         {},
-        "side_all_log",
+        "side_cond_log",
         np.ones(NUM_HORIZONS, dtype=np.float32),
         np.ones(NUM_HORIZONS, dtype=np.float32),
     )
@@ -212,7 +212,7 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
         "mag_floor": 1e-4,
         "mag_up_scale_bps": [1.0, 1.0, 1.0],
         "mag_down_scale_bps": [1.0, 1.0, 1.0],
-        "mag_mode": "side_all_log",
+        "mag_mode": "side_cond_log",
         "mag_log_scale_source": "train_median_nonzero_side",
         "mag_log_scale_eps": 1e-6,
         "mag_log_target_clip": 0.0,
@@ -232,7 +232,7 @@ def test_train_stage4_candidates_streaming_from_plan_fits_all_models(tmp_path, m
     assert len(bundle.mag_down_models) == NUM_HORIZONS
     fit = bundle.fit_summary
     total_rows = int(Z.shape[0])
-    assert fit["mag_mode"] == "side_all_log"
+    assert fit["mag_mode"] == "side_cond_log"
     assert fit["mag_log_scale_source"] == "train_median_nonzero_side"
     assert fit["mag_log_scale_eps"] == 1e-6
     assert fit["mag_log_target_clip"] == 0.0
@@ -273,16 +273,16 @@ def test_magnitude_helper_trains_only_magnitude(tmp_path, monkeypatch):
     assert calls["mag"] > 0
 
 
-def test_add_side_all_log_magnitude_metrics_uses_all_rows():
+def test_add_side_cond_log_magnitude_metrics_uses_all_rows():
     import linear_offline
     y = np.asarray([[0.0, 1.0, -2.0], [0.0, 0.0, 0.0], [2.0, -1.0, 4.0], [-3.0, 0.5, 0.0]], dtype=np.float32)
     pred = {"dir_logits": np.zeros_like(y, dtype=np.float32), "mag_up_bps": np.maximum(y, 0.0) + 0.1, "mag_down_bps": np.maximum(-y, 0.0) + 0.1}
     metrics = {}
-    linear_offline.add_side_all_log_magnitude_metrics(metrics, y=y, pred=pred)
-    assert len(metrics["mag_expected_abs_spearman_all"]) == y.shape[1]
-    assert len(metrics["pred_expected_abs_p90_over_true_abs_p90_all"]) == y.shape[1]
-    assert len(metrics["pred_expected_abs_p95_over_true_abs_p95_all"]) == y.shape[1]
-    assert all(np.isfinite(metrics["pred_expected_abs_p90_over_true_abs_p90_all"]))
+    linear_offline.add_side_cond_log_magnitude_metrics(metrics, y=y, pred=pred, scale_up_bps=np.ones(y.shape[1],dtype=np.float32), scale_down_bps=np.ones(y.shape[1],dtype=np.float32))
+    assert len(metrics["mean_side_spearman_cond"]) == y.shape[1]
+    assert len(metrics["mean_side_p90_ratio_cond"]) == y.shape[1]
+    assert len(metrics["mean_side_p50_ratio_cond"]) == y.shape[1]
+    assert all(np.isfinite(metrics["mean_side_p90_ratio_cond"]))
     assert "pred_expected_abs_p50_over_true_abs_p50_all" not in metrics
     assert "true_abs_bps_p50_all" not in metrics
     assert "pred_expected_abs_bps_p50_all" not in metrics
@@ -313,8 +313,8 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
         "val_dir_bce_kept": [0.55] * metric_len,
         "edge_spearman_kept": [0.13] * metric_len,
         "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len,
-        "pred_expected_abs_p90_over_true_abs_p90_all": [1.23] * metric_len,
-        "mag_expected_abs_spearman_all": [0.44] * metric_len,
+        "mean_side_p90_ratio_cond": [1.23] * metric_len,
+        "mean_side_spearman_cond": [0.44] * metric_len,
         "primary_metric_guard_passed": True,
     }
 
@@ -380,7 +380,7 @@ def test_stage4_records_distinct_direction_and_magnitude_alphas(tmp_path, monkey
     fake_mag_result = {"mag_alpha": 1e-4, "mag_up_models": fake_mag_up_models, "mag_down_models": fake_mag_down_models, "fit_summary": {"mag_alpha": 1e-4}}
 
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "pred_expected_abs_p90_over_true_abs_p90_all": [1.23] * metric_len, "mag_expected_abs_spearman_all": [0.44] * metric_len, "primary_metric_guard_passed": True}
+    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "mean_side_p90_ratio_cond": [1.23] * metric_len, "mean_side_spearman_cond": [0.44] * metric_len, "primary_metric_guard_passed": True}
 
     saved = {}
 
@@ -435,7 +435,7 @@ def test_stage4_reuses_reference_magnitude_alpha_without_retraining(tmp_path, mo
     fake_dir_result = {"direction_alpha": 1e-4, "direction_models": [], "fit_summary": {"direction_alpha": 1e-4}}
     fake_up, fake_down = [], []
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "pred_expected_abs_p90_over_true_abs_p90_all": [1.23] * metric_len, "mag_expected_abs_spearman_all": [0.44] * metric_len, "primary_metric_guard_passed": True}
+    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "mean_side_p90_ratio_cond": [1.23] * metric_len, "mean_side_spearman_cond": [0.44] * metric_len, "primary_metric_guard_passed": True}
     seen_mag_alpha_batches = []
 
     def fake_train_mag(**kwargs):

@@ -56,7 +56,7 @@ from CMSSL17_linear import (  # type: ignore
     load_linear_preprocess_bundle,
     save_linear_sklearn_bundle,
     load_linear_sklearn_bundle,
-    side_log_mag_targets_np,
+    side_cond_log_mag_targets_np,
 )
 
 
@@ -241,7 +241,7 @@ LINEAR_STAGE4_DIRECTION_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_DIRECTIO
 LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING", "none").strip().lower()
 LINEAR_STAGE4_RUN_TEST = _env_bool("BYBIT_LINEAR_STAGE4_RUN_TEST", 1)
 LINEAR_STAGE4_MAG_FLOOR = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_FLOOR", "1e-4"))
-LINEAR_STAGE4_MAG_MODE = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_MODE", "side_all_log").strip().lower()
+LINEAR_STAGE4_MAG_MODE = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_MODE", "side_cond_log").strip().lower()
 LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE", "train_median_nonzero_side").strip().lower()
 LINEAR_STAGE4_MAG_LOG_SCALE_EPS = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_EPS", "1e-6"))
 LINEAR_STAGE4_MAG_LOG_TARGET_CLIP = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_TARGET_CLIP", "0.0"))
@@ -371,8 +371,8 @@ if LINEAR_STAGE == "stage4":
         raise ValueError("Only none for magnitude weighting in first Stage 4 implementation")
     if LINEAR_STAGE4_MAG_FLOOR <= 0:
         raise ValueError(f"BYBIT_LINEAR_STAGE4_MAG_FLOOR must be > 0, got {LINEAR_STAGE4_MAG_FLOOR}")
-    if LINEAR_STAGE4_MAG_MODE not in {"side_all_log"}:
-        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_MODE currently supports only side_all_log")
+    if LINEAR_STAGE4_MAG_MODE not in {"side_cond_log"}:
+        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_MODE currently supports only side_cond_log")
     if LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE not in {"train_median_nonzero_side", "train_q75_nonzero_side"}:
         raise ValueError("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE must be one of: train_median_nonzero_side, train_q75_nonzero_side")
     if LINEAR_STAGE4_MAG_LOG_SCALE_EPS <= 0:
@@ -1859,40 +1859,48 @@ def compute_array_metrics_with_cmssl_logic(
     return out
 
 
-def add_side_all_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarray, pred: Dict[str, np.ndarray]) -> None:
+def add_side_cond_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarray, pred: Dict[str, np.ndarray], scale_up_bps: np.ndarray, scale_down_bps: np.ndarray) -> None:
     y = np.asarray(y, dtype=np.float32)
-    dir_logits = np.asarray(pred["dir_logits"], dtype=np.float32)
-    p_up = _stable_sigmoid_np(dir_logits)
     mag_up_bps, mag_down_bps = extract_mag_bps_from_prediction(pred)
-    true_up_bps = np.maximum(y, 0.0)
-    true_down_bps = np.maximum(-y, 0.0)
-    true_abs_bps = np.abs(y)
-    pred_expected_abs_bps = p_up * mag_up_bps + (1.0 - p_up) * mag_down_bps
-    pred_edge_bps = p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps
+    up_log = np.asarray(pred["mag_up_log"], dtype=np.float32)
+    down_log = np.asarray(pred["mag_down_log"], dtype=np.float32)
     eps = 1e-12
     for h in range(y.shape[1]):
-        true_abs_h = true_abs_bps[:, h]
-        pred_abs_h = pred_expected_abs_bps[:, h]
-        true_p75 = float(np.percentile(true_abs_h, 75))
-        true_p90 = float(np.percentile(true_abs_h, 90))
-        true_p95 = float(np.percentile(true_abs_h, 95))
-        pred_p75 = float(np.percentile(pred_abs_h, 75))
-        pred_p90 = float(np.percentile(pred_abs_h, 90))
-        pred_p95 = float(np.percentile(pred_abs_h, 95))
-        metrics.setdefault("mag_up_spearman_all", []).append(float(_safe_spearman_np(mag_up_bps[:, h], true_up_bps[:, h])))
-        metrics.setdefault("mag_down_spearman_all", []).append(float(_safe_spearman_np(mag_down_bps[:, h], true_down_bps[:, h])))
-        metrics.setdefault("mag_expected_abs_spearman_all", []).append(float(_safe_spearman_np(pred_abs_h, true_abs_h)))
-        metrics.setdefault("true_abs_bps_p75_all", []).append(true_p75)
-        metrics.setdefault("true_abs_bps_p90_all", []).append(true_p90)
-        metrics.setdefault("true_abs_bps_p95_all", []).append(true_p95)
-        metrics.setdefault("pred_expected_abs_bps_p75_all", []).append(pred_p75)
-        metrics.setdefault("pred_expected_abs_bps_p90_all", []).append(pred_p90)
-        metrics.setdefault("pred_expected_abs_bps_p95_all", []).append(pred_p95)
-        metrics.setdefault("pred_expected_abs_p75_over_true_abs_p75_all", []).append(float(pred_p75 / max(true_p75, eps)))
-        metrics.setdefault("pred_expected_abs_p90_over_true_abs_p90_all", []).append(float(pred_p90 / max(true_p90, eps)))
-        metrics.setdefault("pred_expected_abs_p95_over_true_abs_p95_all", []).append(float(pred_p95 / max(true_p95, eps)))
-        metrics.setdefault("pred_edge_mean_all", []).append(float(np.mean(pred_edge_bps[:, h])))
-        metrics.setdefault("pred_edge_std_all", []).append(float(np.std(pred_edge_bps[:, h])))
+        up_rows = y[:, h] > 0.0
+        down_rows = y[:, h] < 0.0
+        metrics.setdefault("up_n_cond", []).append(int(np.sum(up_rows)))
+        metrics.setdefault("down_n_cond", []).append(int(np.sum(down_rows)))
+        up_huber = down_huber = up_sp = down_sp = up_mr = down_mr = up_p50r = down_p50r = up_p90r = down_p90r = float("nan")
+        if np.any(up_rows):
+            true_up = y[up_rows, h]
+            pred_up = mag_up_bps[up_rows, h]
+            true_log = np.log1p(true_up / max(float(scale_up_bps[h]), eps))
+            err = up_log[up_rows, h] - true_log
+            up_huber = float(np.mean(np.where(np.abs(err) <= 1.0, 0.5 * err * err, np.abs(err) - 0.5)))
+            up_sp = float(_safe_spearman_np(pred_up, true_up))
+            up_mr = float(np.mean(pred_up) / max(float(np.mean(true_up)), eps))
+            up_p50r = float(np.percentile(pred_up, 50) / max(float(np.percentile(true_up, 50)), eps))
+            up_p90r = float(np.percentile(pred_up, 90) / max(float(np.percentile(true_up, 90)), eps))
+        if np.any(down_rows):
+            true_down = -y[down_rows, h]
+            pred_down = mag_down_bps[down_rows, h]
+            true_log = np.log1p(true_down / max(float(scale_down_bps[h]), eps))
+            err = down_log[down_rows, h] - true_log
+            down_huber = float(np.mean(np.where(np.abs(err) <= 1.0, 0.5 * err * err, np.abs(err) - 0.5)))
+            down_sp = float(_safe_spearman_np(pred_down, true_down))
+            down_mr = float(np.mean(pred_down) / max(float(np.mean(true_down)), eps))
+            down_p50r = float(np.percentile(pred_down, 50) / max(float(np.percentile(true_down, 50)), eps))
+            down_p90r = float(np.percentile(pred_down, 90) / max(float(np.percentile(true_down, 90)), eps))
+        for k, v in [("up_log_huber_cond", up_huber), ("down_log_huber_cond", down_huber), ("up_spearman_cond", up_sp), ("down_spearman_cond", down_sp), ("up_mean_ratio_cond", up_mr), ("down_mean_ratio_cond", down_mr), ("up_p50_ratio_cond", up_p50r), ("down_p50_ratio_cond", down_p50r), ("up_p90_ratio_cond", up_p90r), ("down_p90_ratio_cond", down_p90r)]:
+            metrics.setdefault(k, []).append(v)
+        metrics.setdefault("mean_side_log_huber_cond", []).append(float(np.nanmean([up_huber, down_huber])))
+        metrics.setdefault("mean_side_spearman_cond", []).append(float(np.nanmean([up_sp, down_sp])))
+        metrics.setdefault("mean_side_mean_ratio_cond", []).append(float(np.nanmean([up_mr, down_mr])))
+        metrics.setdefault("mean_side_p50_ratio_cond", []).append(float(np.nanmean([up_p50r, down_p50r])))
+        metrics.setdefault("mean_side_p90_ratio_cond", []).append(float(np.nanmean([up_p90r, down_p90r])))
+        metrics.setdefault("mean_side_top_bottom_true_mean_lift_cond", []).append(float("nan"))
+        zero_rows = y[:, h] == 0.0
+        metrics.setdefault("zero_row_mean_pred_abs_bps", []).append(float(np.mean((mag_up_bps[zero_rows, h] + mag_down_bps[zero_rows, h]) * 0.5)) if np.any(zero_rows) else float("nan"))
 
 
 def _slice_prediction_payload(pred_payload: Dict[str, np.ndarray], mask_or_indices: np.ndarray) -> Dict[str, np.ndarray]:
@@ -2708,11 +2716,11 @@ class StreamingPreprocessedBatchSource:
 
 def initialize_stage4_candidate_bundle(*, alpha: float, config: Dict[str, Any]) -> LinearSklearnTakerBundle:
     n_h = len(HORIZONS_MS)
-    return LinearSklearnTakerBundle(str(config["schema"]), dict(config, alpha=float(alpha)), [int(x) for x in HORIZONS_MS], [make_direction_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], float(config["mag_floor"]), {}, str(config.get("mag_mode", "side_all_log")), np.asarray(config.get("mag_up_scale_bps"), dtype=np.float32), np.asarray(config.get("mag_down_scale_bps"), dtype=np.float32))
+    return LinearSklearnTakerBundle(str(config["schema"]), dict(config, alpha=float(alpha)), [int(x) for x in HORIZONS_MS], [make_direction_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], [make_magnitude_model(alpha, config) for _ in range(n_h)], float(config["mag_floor"]), {}, str(config.get("mag_mode", "side_cond_log")), np.asarray(config.get("mag_up_scale_bps"), dtype=np.float32), np.asarray(config.get("mag_down_scale_bps"), dtype=np.float32))
 
 
 def _build_bundle_from_parts(*, dir_alpha: float, mag_alpha: float, config: Dict[str, Any], direction_models: list[Any], mag_up_models: list[Any], mag_down_models: list[Any], fit_summary: Dict[str, Any]) -> LinearSklearnTakerBundle:
-    return LinearSklearnTakerBundle(str(config["schema"]), dict(config, direction_alpha=float(dir_alpha), mag_alpha=float(mag_alpha), alpha=float(dir_alpha)), [int(x) for x in HORIZONS_MS], direction_models, mag_up_models, mag_down_models, float(config["mag_floor"]), dict(fit_summary), str(config.get("mag_mode", "side_all_log")), np.asarray(config.get("mag_up_scale_bps"), dtype=np.float32), np.asarray(config.get("mag_down_scale_bps"), dtype=np.float32))
+    return LinearSklearnTakerBundle(str(config["schema"]), dict(config, direction_alpha=float(dir_alpha), mag_alpha=float(mag_alpha), alpha=float(dir_alpha)), [int(x) for x in HORIZONS_MS], direction_models, mag_up_models, mag_down_models, float(config["mag_floor"]), dict(fit_summary), str(config.get("mag_mode", "side_cond_log")), np.asarray(config.get("mag_up_scale_bps"), dtype=np.float32), np.asarray(config.get("mag_down_scale_bps"), dtype=np.float32))
 
 
 def extract_mag_bps_from_prediction(pred: Dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
@@ -2746,7 +2754,7 @@ def compute_side_log_mag_scales_from_train_plan(*, plan: Dict[str, Any], source:
         us = np.percentile(uv, 75) if source == "train_q75_nonzero_side" and uv.size else (np.median(uv) if uv.size else eps)
         ds = np.percentile(dv, 75) if source == "train_q75_nonzero_side" and dv.size else (np.median(dv) if dv.size else eps)
         up_scale[h] = max(float(us), float(eps)); down_scale[h] = max(float(ds), float(eps))
-    print(f"[linear-mag-scale] mode=side_all_log source={source} up_scale_bps={up_scale.tolist()} down_scale_bps={down_scale.tolist()}", flush=True)
+    print(f"[linear-mag-scale] mode=side_cond_log source={source} up_scale_bps={up_scale.tolist()} down_scale_bps={down_scale.tolist()}", flush=True)
     return up_scale, down_scale
 
 
@@ -2789,7 +2797,7 @@ def train_stage4_candidates_streaming_from_plan(*, extractor: Any, preprocess_bu
         train_iter = iter_preprocessed_batches_from_train_plan(extractor=extractor, bundle=preprocess_bundle, plan=plan, batch_rows=int(config["batch_rows"]), max_rows=0, split_name="train_full", shuffle_within_batch=True, rng=rng)
         for Z, y, _p in progress_iter_rows(train_iter, total_rows=train_rows, desc=f"stage4 train epoch {epoch + 1}/{config['epochs']}"):
             keep_pos, keep_neg, keep_signed = build_signed_side_trim_masks_from_stats_np(y, stats)
-            up_log_targets, down_log_targets = side_log_mag_targets_np(y, up_scale_bps=up_scale, down_scale_bps=down_scale, target_clip=float(config.get("mag_log_target_clip", 0.0)))
+            up_log_targets, down_log_targets = side_cond_log_mag_targets_np(y, up_scale_bps=up_scale, down_scale_bps=down_scale, target_clip=float(config.get("mag_log_target_clip", 0.0)))
             for b, st in zip(bundles, states):
                 for h in range(n_h):
                     rows = keep_signed[:, h]
@@ -2798,11 +2806,15 @@ def train_stage4_candidates_streaming_from_plan(*, extractor: Any, preprocess_bu
                         if not st["df"][h]: b.direction_models[h].partial_fit(Z[rows], yd, classes=np.array([0, 1], dtype=np.int64), sample_weight=sw); st["df"][h] = True
                         else: b.direction_models[h].partial_fit(Z[rows], yd, sample_weight=sw)
                         st["dc"][h] += yd.shape[0]
-                    yu = up_log_targets[:, h]; yn = down_log_targets[:, h]
-                    b.mag_up_models[h].partial_fit(Z, yu); b.mag_down_models[h].partial_fit(Z, yn); st["uf"][h] = True; st["nf"][h] = True; st["uc"][h] += yu.shape[0]; st["nc"][h] += yn.shape[0]
+                    up_rows = y[:, h] > 0.0
+                    down_rows = y[:, h] < 0.0
+                    if np.any(up_rows):
+                        b.mag_up_models[h].partial_fit(Z[up_rows], up_log_targets[up_rows, h]); st["uf"][h] = True; st["uc"][h] += int(np.sum(up_rows))
+                    if np.any(down_rows):
+                        b.mag_down_models[h].partial_fit(Z[down_rows], down_log_targets[down_rows, h]); st["nf"][h] = True; st["nc"][h] += int(np.sum(down_rows))
     for b, st in zip(bundles, states):
         if not all(st["df"]) or not all(st["uf"]) or not all(st["nf"]): raise ValueError("Insufficient train rows for one or more target/horizon models")
-        b.fit_summary = {"alpha": float(b.config.get("alpha")), "train_rows": int(train_rows), "dir_rows_per_horizon": st["dc"].tolist(), "up_rows_per_horizon": st["uc"].tolist(), "down_rows_per_horizon": st["nc"].tolist(), "direction_weights_neg_pos": [(float(a), float(b)) for a, b in weights], "mag_mode": str(config.get("mag_mode", "side_all_log")), "mag_target_transform": "log1p(side_bps / side_scale_bps)", "mag_inverse_transform": "side_scale_bps * expm1(pred_log)", "mag_training_rows": "all_decision_rows", "mag_model_output_units": "log1p_side_bps_scaled", "mag_prediction_units": "bps", "mag_eval_compat_sqrt_aliases": True, "mag_log_scale_source": str(config.get("mag_log_scale_source", "train_median_nonzero_side")), "mag_log_scale_eps": float(config.get("mag_log_scale_eps", 1e-6)), "mag_log_target_clip": float(config.get("mag_log_target_clip", 0.0)), "mag_log_pred_clip": float(config.get("mag_log_pred_clip", 20.0)), "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist()}
+        b.fit_summary = {"alpha": float(b.config.get("alpha")), "train_rows": int(train_rows), "dir_rows_per_horizon": st["dc"].tolist(), "up_rows_per_horizon": st["uc"].tolist(), "down_rows_per_horizon": st["nc"].tolist(), "direction_weights_neg_pos": [(float(a), float(b)) for a, b in weights], "mag_mode": str(config.get("mag_mode", "side_cond_log")), "mag_target_transform": "log1p(side_bps / side_scale_bps)", "mag_inverse_transform": "side_scale_bps * expm1(pred_log)", "mag_training_rows": "side_active_rows", "mag_model_output_units": "log1p_side_bps_scaled", "mag_prediction_units": "bps", "mag_log_scale_source": str(config.get("mag_log_scale_source", "train_median_nonzero_side")), "mag_log_scale_eps": float(config.get("mag_log_scale_eps", 1e-6)), "mag_log_target_clip": float(config.get("mag_log_target_clip", 0.0)), "mag_log_pred_clip": float(config.get("mag_log_pred_clip", 20.0)), "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist()}
     return bundles
 
 
@@ -2841,19 +2853,24 @@ def train_magnitude_models_streaming_from_plan(*, extractor: Any, preprocess_bun
         rng = np.random.default_rng(int(config["random_state"]) + epoch)
         train_iter = iter_preprocessed_batches_from_train_plan(extractor=extractor, bundle=preprocess_bundle, plan=plan, batch_rows=int(config["batch_rows"]), max_rows=0, split_name="train_full", shuffle_within_batch=True, rng=rng)
         for Z, y, _p in progress_iter_rows(train_iter, total_rows=train_rows, desc=f"stage4 magnitude train epoch {epoch + 1}/{config['epochs']}"):
-            up_log_targets, down_log_targets = side_log_mag_targets_np(y, up_scale_bps=up_scale, down_scale_bps=down_scale, target_clip=float(config.get("mag_log_target_clip", 0.0)))
+            up_log_targets, down_log_targets = side_cond_log_mag_targets_np(y, up_scale_bps=up_scale, down_scale_bps=down_scale, target_clip=float(config.get("mag_log_target_clip", 0.0)))
             for c in cands:
                 for h in range(n_h):
-                    c["mag_up_models"][h].partial_fit(Z, up_log_targets[:, h]); c["mag_down_models"][h].partial_fit(Z, down_log_targets[:, h]); c["uc"][h] += up_log_targets.shape[0]; c["dc"][h] += down_log_targets.shape[0]
+                    up_rows = y[:, h] > 0.0
+                    down_rows = y[:, h] < 0.0
+                    if np.any(up_rows):
+                        c["mag_up_models"][h].partial_fit(Z[up_rows], up_log_targets[up_rows, h]); c["uc"][h] += int(np.sum(up_rows))
+                    if np.any(down_rows):
+                        c["mag_down_models"][h].partial_fit(Z[down_rows], down_log_targets[down_rows, h]); c["dc"][h] += int(np.sum(down_rows))
     out = []
     for c in cands:
-        out.append({"mag_alpha": float(c["mag_alpha"]), "mag_up_models": c["mag_up_models"], "mag_down_models": c["mag_down_models"], "fit_summary": {"mag_alpha": float(c["mag_alpha"]), "train_rows": int(train_rows), "up_rows_per_horizon": c["uc"].tolist(), "down_rows_per_horizon": c["dc"].tolist(), "mag_mode": "side_all_log", "mag_target_transform": "log1p(side_bps / side_scale_bps)", "mag_inverse_transform": "side_scale_bps * expm1(pred_log)", "mag_training_rows": "all_decision_rows", "mag_model_output_units": "log1p_side_bps_scaled", "mag_prediction_units": "bps", "mag_log_scale_source": str(config.get("mag_log_scale_source", "train_median_nonzero_side")), "mag_log_scale_eps": float(config.get("mag_log_scale_eps", 1e-6)), "mag_log_target_clip": float(config.get("mag_log_target_clip", 0.0)), "mag_log_pred_clip": float(config.get("mag_log_pred_clip", 20.0)), "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist()}})
+        out.append({"mag_alpha": float(c["mag_alpha"]), "mag_up_models": c["mag_up_models"], "mag_down_models": c["mag_down_models"], "fit_summary": {"mag_alpha": float(c["mag_alpha"]), "train_rows": int(train_rows), "up_rows_per_horizon": c["uc"].tolist(), "down_rows_per_horizon": c["dc"].tolist(), "mag_mode": "side_cond_log", "mag_target_transform": "log1p(side_bps / side_scale_bps)", "mag_inverse_transform": "side_scale_bps * expm1(pred_log)", "mag_training_rows": "side_active_rows", "mag_model_output_units": "log1p_side_bps_scaled", "mag_prediction_units": "bps", "mag_log_scale_source": str(config.get("mag_log_scale_source", "train_median_nonzero_side")), "mag_log_scale_eps": float(config.get("mag_log_scale_eps", 1e-6)), "mag_log_target_clip": float(config.get("mag_log_target_clip", 0.0)), "mag_log_pred_clip": float(config.get("mag_log_pred_clip", 20.0)), "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist()}})
     return out
 
 def build_stage4_bundle_from_parts(*, config: Dict[str, Any], horizons_ms: list[int], direction_result: Dict[str, Any], magnitude_result: Dict[str, Any]) -> LinearSklearnTakerBundle:
     bundle_config = dict(config); bundle_config["alpha"] = float(direction_result["direction_alpha"]); bundle_config["direction_alpha"] = float(direction_result["direction_alpha"]); bundle_config["mag_alpha"] = float(magnitude_result["mag_alpha"])
     fit_summary = {"direction_alpha": float(direction_result["direction_alpha"]), "mag_alpha": float(magnitude_result["mag_alpha"]), "direction_fit_summary": direction_result["fit_summary"], "magnitude_fit_summary": magnitude_result["fit_summary"], "combined_stage4_bundle": True}
-    return LinearSklearnTakerBundle(schema=LINEAR_STAGE4_SCHEMA, config=bundle_config, horizons_ms=[int(h) for h in horizons_ms], direction_models=direction_result["direction_models"], mag_up_models=magnitude_result["mag_up_models"], mag_down_models=magnitude_result["mag_down_models"], mag_floor=float(config["mag_floor"]), fit_summary=fit_summary, mag_mode=str(config.get("mag_mode", "side_all_log")), mag_up_scale_bps=np.asarray(config["mag_up_scale_bps"], dtype=np.float32), mag_down_scale_bps=np.asarray(config["mag_down_scale_bps"], dtype=np.float32))
+    return LinearSklearnTakerBundle(schema=LINEAR_STAGE4_SCHEMA, config=bundle_config, horizons_ms=[int(h) for h in horizons_ms], direction_models=direction_result["direction_models"], mag_up_models=magnitude_result["mag_up_models"], mag_down_models=magnitude_result["mag_down_models"], mag_floor=float(config["mag_floor"]), fit_summary=fit_summary, mag_mode=str(config.get("mag_mode", "side_cond_log")), mag_up_scale_bps=np.asarray(config["mag_up_scale_bps"], dtype=np.float32), mag_down_scale_bps=np.asarray(config["mag_down_scale_bps"], dtype=np.float32))
 
 def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, stats: Dict[str, np.ndarray], device: torch.device, split_name: str, max_rows: int = 0, batch_rows: Optional[int] = None, include_all_row_mag_metrics: bool = True) -> Dict[str, Any]:
     eval_stage = "stage5" if str(split_name).startswith("stage5_") else "stage4"
@@ -2863,7 +2880,7 @@ def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extrac
     metrics = summarize_metrics(LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).to(device), source, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name=split_name)
     if include_all_row_mag_metrics:
         pred_payload = collect_predictions_and_labels_streaming(model_bundle=bundle, extractor=extractor, preprocess_bundle=preprocess_bundle, ds=ds, max_rows=max_rows, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), split_name=f"{split_name}_all_rows_eval")
-        add_side_all_log_magnitude_metrics(metrics, y=np.asarray(pred_payload["y"], dtype=np.float32), pred=pred_payload)
+        add_side_cond_log_magnitude_metrics(metrics, y=np.asarray(pred_payload["y"], dtype=np.float32), pred=pred_payload, scale_up_bps=np.asarray(bundle.mag_up_scale_bps, dtype=np.float32), scale_down_bps=np.asarray(bundle.mag_down_scale_bps, dtype=np.float32))
     pv, pl = compute_primary_metric(metrics); metrics["primary_metric_value"] = float(pv); metrics["primary_metric_label"] = str(pl); return metrics
 
 
@@ -2888,8 +2905,8 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         bal_1s = _metric_at_primary_horizon(vm, "dir_bal_acc_kept")
         bce_1s = _metric_at_primary_horizon(vm, "val_dir_bce_kept")
         edge_sp_1s = _metric_at_primary_horizon(vm, "edge_spearman_kept")
-        mag_abs_sp_1s = _metric_at_primary_horizon(vm, "mag_expected_abs_spearman_all")
-        mag_ratio_1s = _metric_at_primary_horizon(vm, "pred_expected_abs_p90_over_true_abs_p90_all")
+        mag_abs_sp_1s = _metric_at_primary_horizon(vm, "mean_side_spearman_cond")
+        mag_ratio_1s = _metric_at_primary_horizon(vm, "mean_side_p90_ratio_cond")
         if not np.isfinite(mag_ratio_1s):
             mag_ratio_1s = _metric_at_primary_horizon(vm, "pred_abs_p90_over_true_abs_p90_kept")
         alpha = float(b.config.get("alpha"))
@@ -2926,13 +2943,17 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         ds_val = build_val_dataset_from_plan(plan)
         try: mvm = evaluate_stage4_bundle_streaming(bundle=combo, extractor=extractor, preprocess_bundle=pb, ds=ds_val, stats=stats, device=device, split_name="val", max_rows=LINEAR_STAGE4_MAX_VAL_ROWS)
         finally: close_dataset(ds_val, name="stage4_val_mag_eval"); del ds_val; force_gc("stage4_val_mag_eval")
-        mag_abs_sp_1s = _metric_at_primary_horizon(mvm, "mag_expected_abs_spearman_all")
-        mag_ratio_1s = _metric_at_primary_horizon(mvm, "pred_expected_abs_p90_over_true_abs_p90_all")
+        mag_log_huber_1s = _metric_at_primary_horizon(mvm, "mean_side_log_huber_cond")
+        mag_abs_sp_1s = _metric_at_primary_horizon(mvm, "mean_side_spearman_cond")
+        mag_p50_ratio_1s = _metric_at_primary_horizon(mvm, "mean_side_p50_ratio_cond")
+        mag_ratio_1s = _metric_at_primary_horizon(mvm, "mean_side_p90_ratio_cond")
+        mag_lift_1s = _metric_at_primary_horizon(mvm, "mean_side_top_bottom_true_mean_lift_cond")
+        zero_pred_1s = _metric_at_primary_horizon(mvm, "zero_row_mean_pred_abs_bps")
         edge_sp_1s = _metric_at_primary_horizon(mvm, "edge_spearman_all")
-        mag_score = float(mag_abs_sp_1s) - 0.05 * abs(math.log(max(float(mag_ratio_1s), 1e-12)))
+        mag_score = -float(mag_log_huber_1s) if np.isfinite(mag_log_huber_1s) else float("-inf")
         mag_alpha = float(mb.get("mag_alpha"))
-        print(f"[linear-stage4-mag-candidate] mag_alpha={mag_alpha:g} mag_abs_sp_1s={mag_abs_sp_1s:.6g} mag_p90_ratio_1s={mag_ratio_1s:.6g} edge_sp_1s={edge_sp_1s:.6g} selection_score={mag_score:.6g}", flush=True)
-        magnitude_summaries.append({"mag_alpha": mag_alpha, "mag_abs_sp_1s": mag_abs_sp_1s, "mag_p90_ratio_1s": mag_ratio_1s, "edge_sp_1s": edge_sp_1s, "selection_score": mag_score})
+        print(f"[linear-stage4-mag-candidate] mag_alpha={mag_alpha:g} log_huber_1s={mag_log_huber_1s:.6g} sp_1s={mag_abs_sp_1s:.6g} p50_ratio_1s={mag_p50_ratio_1s:.6g} p90_ratio_1s={mag_ratio_1s:.6g} lift_1s={mag_lift_1s:.6g} zero_pred_1s={zero_pred_1s:.6g} selection_score={mag_score:.6g}", flush=True)
+        magnitude_summaries.append({"mag_alpha": mag_alpha, "mag_log_huber_1s": mag_log_huber_1s, "mag_sp_1s": mag_abs_sp_1s, "mag_p50_ratio_1s": mag_p50_ratio_1s, "mag_p90_ratio_1s": mag_ratio_1s, "mag_lift_1s": mag_lift_1s, "zero_pred_1s": zero_pred_1s, "edge_sp_1s": edge_sp_1s, "selection_score": mag_score})
         if mag_score > best_mag_score: best_mag_score = mag_score; best_mag_alpha = mag_alpha; best_mag_bundle = combo; best_metrics = mvm
     best = best_mag_bundle
     best.fit_summary = {
@@ -2940,7 +2961,7 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         "mag_alpha": float(best_mag_alpha),
         "direction_fit_summary": best_direction_result["fit_summary"],
         "magnitude_fit_summary": next(mr for mr in magnitude_results if float(mr["mag_alpha"]) == float(best_mag_alpha))["fit_summary"],
-        "selection": {"direction_primary_metric_label": str(best_metrics.get("primary_metric_label", PRIMARY_METRIC)), "direction_primary_metric_value": float(best_score), "magnitude_selection_metric": "mag_rank_minus_p90_logratio_penalty", "magnitude_selection_score": float(best_mag_score)},
+        "selection": {"direction_primary_metric_label": str(best_metrics.get("primary_metric_label", PRIMARY_METRIC)), "direction_primary_metric_value": float(best_score), "magnitude_selection_metric": "-mean_side_log_huber_cond_1s", "magnitude_selection_score": float(best_mag_score)},
     }
     best_summary = next((s for s in direction_summaries if float(s.get("direction_alpha", float("nan"))) == float(best_alpha)), {})
     best_val_metrics = _jsonable_metrics(best_metrics)
@@ -2948,8 +2969,8 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
     best_bal_1s = _metric_at_primary_horizon(best_val_metrics, "dir_bal_acc_kept")
     best_bce_1s = _metric_at_primary_horizon(best_val_metrics, "val_dir_bce_kept")
     best_edge_sp_1s = _metric_at_primary_horizon(best_val_metrics, "edge_spearman_kept")
-    best_mag_abs_sp_1s = _metric_at_primary_horizon(best_val_metrics, "mag_expected_abs_spearman_all")
-    best_mag_ratio_1s = _metric_at_primary_horizon(best_val_metrics, "pred_expected_abs_p90_over_true_abs_p90_all")
+    best_mag_abs_sp_1s = _metric_at_primary_horizon(best_val_metrics, "mean_side_spearman_cond")
+    best_mag_ratio_1s = _metric_at_primary_horizon(best_val_metrics, "mean_side_p90_ratio_cond")
     if not np.isfinite(best_mag_ratio_1s):
         best_mag_ratio_1s = _metric_at_primary_horizon(best_val_metrics, "pred_abs_p90_over_true_abs_p90_kept")
     print(
@@ -2968,7 +2989,7 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
             try: test_metrics = evaluate_stage4_bundle_streaming(bundle=best, extractor=extractor, preprocess_bundle=pb, ds=ds_test, stats=stats, device=device, split_name="test", max_rows=LINEAR_STAGE4_MAX_TEST_ROWS)
             finally: close_dataset(ds_test, name="stage4_test_eval"); del ds_test; force_gc("stage4_test_eval")
     train_rows = train_decision_row_count_from_plan(plan, max_rows=0); val_rows = split_decision_row_count_from_plan(plan, "val", LINEAR_STAGE4_MAX_VAL_ROWS); test_rows = split_decision_row_count_from_plan(plan, "test", LINEAR_STAGE4_MAX_TEST_ROWS) if plan["has_cmssl_test"] and LINEAR_STAGE4_RUN_TEST else None
-    payload = {"stage": "stage4", "status": "ok", "schema": LINEAR_STAGE4_SCHEMA, "streaming_features": True, **_decision_metadata(), **_progress_metadata(), "stage4_config": cfg, "extractor": extractor_name, "preprocess_name": preprocess_name, "stage2_payload_path": st2.get("payload_path"), "stage3_payload_path": st3.get("payload_path"), "preprocess_bundle_path": str(st3["preprocess_bundle_path"]), "train_split": "train_full", "train_rows": int(train_rows), "val_rows": int(val_rows), "test_rows": test_rows, "original_dim": int(pb.original_dim), "kept_dim": int(pb.kept_dim), "mag_mode": LINEAR_STAGE4_MAG_MODE, "mag_target_transform": "log1p(side_bps / side_scale_bps)", "mag_inverse_transform": "side_scale_bps * expm1(pred_log)", "mag_training_rows": "all_decision_rows", "mag_prediction_units": "bps", "mag_model_output_units": "log1p_side_bps_scaled", "mag_eval_compat_sqrt_aliases": True, "mag_log_scale_source": LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE, "mag_log_scale_eps": LINEAR_STAGE4_MAG_LOG_SCALE_EPS, "mag_log_target_clip": LINEAR_STAGE4_MAG_LOG_TARGET_CLIP, "mag_log_pred_clip": LINEAR_STAGE4_MAG_LOG_PRED_CLIP, "best_alpha": float(best_alpha), "best_direction_alpha": float(best_alpha), "best_mag_alpha": float(best_mag_alpha), "best_model_path": str(model_path), "best_primary_metric": {"label": str(best_metrics.get("primary_metric_label", PRIMARY_METRIC)), "value": float(best_metrics.get("primary_metric_value", best_score)), "guard_passed": bool(best_metrics.get("primary_metric_guard_passed", True))}, "candidate_summaries": direction_summaries, "direction_candidate_summaries": direction_summaries, "magnitude_candidate_summaries": magnitude_summaries, "stage4_summary_metrics": {"primary_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS), "direction": {"auc_kept": best_auc_1s, "bal_acc_kept": best_bal_1s, "bce_kept": best_bce_1s, "pos_frac_pred_q50plus": _metric_at_primary_horizon(best_val_metrics, "dir_pos_frac_pred_q50plus"), "pos_frac_true_q50plus": _metric_at_primary_horizon(best_val_metrics, "dir_pos_frac_true_q50plus")}, "magnitude": {"expected_abs_spearman_all": best_mag_abs_sp_1s, "expected_abs_p90_ratio_all": best_mag_ratio_1s, "expected_abs_p95_ratio_all": _metric_at_primary_horizon(best_val_metrics, "pred_expected_abs_p95_over_true_abs_p95_all"), "true_abs_p90_bps_all": _metric_at_primary_horizon(best_val_metrics, "true_abs_bps_p90_all"), "pred_expected_abs_p90_bps_all": _metric_at_primary_horizon(best_val_metrics, "pred_expected_abs_bps_p90_all")}, "edge": {"spearman_all": _metric_at_primary_horizon(best_val_metrics, "edge_spearman_all"), "spearman_kept": _metric_at_primary_horizon(best_val_metrics, "edge_spearman_kept"), "sign_bal_acc_q50plus": _metric_at_primary_horizon(best_val_metrics, "edge_bal_sign_acc_q50plus")}}, "val_metrics": _jsonable_metrics(best_metrics), "test_metrics": _jsonable_metrics(test_metrics)}
+    payload = {"stage": "stage4", "status": "ok", "schema": LINEAR_STAGE4_SCHEMA, "streaming_features": True, **_decision_metadata(), **_progress_metadata(), "stage4_config": cfg, "extractor": extractor_name, "preprocess_name": preprocess_name, "stage2_payload_path": st2.get("payload_path"), "stage3_payload_path": st3.get("payload_path"), "preprocess_bundle_path": str(st3["preprocess_bundle_path"]), "train_split": "train_full", "train_rows": int(train_rows), "val_rows": int(val_rows), "test_rows": test_rows, "original_dim": int(pb.original_dim), "kept_dim": int(pb.kept_dim), "mag_mode": LINEAR_STAGE4_MAG_MODE, "mag_target_transform": "log1p(side_bps / side_scale_bps)", "mag_inverse_transform": "side_scale_bps * expm1(pred_log)", "mag_training_rows": "side_active_rows", "mag_prediction_units": "bps", "mag_model_output_units": "log1p_side_bps_scaled", "mag_log_scale_source": LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE, "mag_log_scale_eps": LINEAR_STAGE4_MAG_LOG_SCALE_EPS, "mag_log_target_clip": LINEAR_STAGE4_MAG_LOG_TARGET_CLIP, "mag_log_pred_clip": LINEAR_STAGE4_MAG_LOG_PRED_CLIP, "best_alpha": float(best_alpha), "best_direction_alpha": float(best_alpha), "best_mag_alpha": float(best_mag_alpha), "best_model_path": str(model_path), "best_primary_metric": {"label": str(best_metrics.get("primary_metric_label", PRIMARY_METRIC)), "value": float(best_metrics.get("primary_metric_value", best_score)), "guard_passed": bool(best_metrics.get("primary_metric_guard_passed", True))}, "candidate_summaries": direction_summaries, "direction_candidate_summaries": direction_summaries, "magnitude_candidate_summaries": magnitude_summaries, "stage4_summary_metrics": {"primary_horizon_ms": int(PRIMARY_METRIC_HORIZON_MS), "direction": {"auc_kept": best_auc_1s, "bal_acc_kept": best_bal_1s, "bce_kept": best_bce_1s, "pos_frac_pred_q50plus": _metric_at_primary_horizon(best_val_metrics, "dir_pos_frac_pred_q50plus"), "pos_frac_true_q50plus": _metric_at_primary_horizon(best_val_metrics, "dir_pos_frac_true_q50plus")}, "magnitude": {"expected_abs_spearman_all": best_mag_abs_sp_1s, "expected_abs_p90_ratio_all": best_mag_ratio_1s, "expected_abs_p95_ratio_all": _metric_at_primary_horizon(best_val_metrics, "mean_side_p90_ratio_cond_unused"), "true_abs_p90_bps_all": _metric_at_primary_horizon(best_val_metrics, "true_abs_bps_p90_all"), "pred_expected_abs_p90_bps_all": _metric_at_primary_horizon(best_val_metrics, "pred_expected_abs_bps_p90_all")}, "edge": {"spearman_all": _metric_at_primary_horizon(best_val_metrics, "edge_spearman_all"), "spearman_kept": _metric_at_primary_horizon(best_val_metrics, "edge_spearman_kept"), "sign_bal_acc_q50plus": _metric_at_primary_horizon(best_val_metrics, "edge_bal_sign_acc_q50plus")}}, "val_metrics": _jsonable_metrics(best_metrics), "test_metrics": _jsonable_metrics(test_metrics)}
     path = stage4_dir / "linear_stage4_metrics.json"; copy = Path(linear_out_dir) / "linear_stage4_metrics.json"; path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
 
 
