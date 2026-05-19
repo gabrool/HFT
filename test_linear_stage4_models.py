@@ -198,36 +198,112 @@ def test_direction_helper_trains_only_direction(tmp_path, monkeypatch):
     assert calls["mag"] == 0
 
 
-def test_magnitude_helper_trains_only_magnitude(tmp_path, monkeypatch):
+def test_magnitude_helper_trains_side_active_rows_only(tmp_path, monkeypatch):
     import linear_offline
-    Z, y, _ = make_synthetic()
-    calls = {"dir": 0, "mag": 0}
-    monkeypatch.setattr(linear_offline, "make_direction_model", lambda **kwargs: type("D", (), {"partial_fit": lambda self, *a, **k: calls.__setitem__("dir", calls["dir"] + 1) or self})())
-    monkeypatch.setattr(linear_offline, "make_magnitude_model", lambda **kwargs: type("M", (), {"partial_fit": lambda self, *a, **k: calls.__setitem__("mag", calls["mag"] + 1) or self})())
+    Z = np.arange(8 * 4, dtype=np.float32).reshape(8, 4)
+    y = np.asarray([
+        [ 1.0,  0.0, -2.0],
+        [ 0.0,  3.0,  0.0],
+        [-1.5,  0.0,  4.0],
+        [ 0.0, -2.0,  0.0],
+        [ 2.0,  1.0, -1.0],
+        [ 0.0,  0.0,  0.0],
+        [-3.0, -1.0,  2.0],
+        [ 0.5,  0.0,  0.0],
+    ], dtype=np.float32)
+
+    class RecordingMagnitudeModel:
+        def __init__(self):
+            self.n_rows = 0
+            self.targets = []
+        def partial_fit(self, X, target):
+            self.n_rows += int(X.shape[0])
+            self.targets.append(np.asarray(target, dtype=np.float32).copy())
+            return self
+
+    models = []
+    def fake_make_magnitude_model(**kwargs):
+        m = RecordingMagnitudeModel()
+        models.append(m)
+        return m
+
+    monkeypatch.setattr(linear_offline, "make_direction_model", lambda **kwargs: (_ for _ in ()).throw(AssertionError("direction should not be trained")))
+    monkeypatch.setattr(linear_offline, "make_magnitude_model", fake_make_magnitude_model)
     monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train_plan", lambda **kwargs: iter([(Z, y, None)]))
     monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: int(y.shape[0]))
-    linear_offline.train_magnitude_models_streaming_from_plan(extractor=object(), preprocess_bundle=object(), plan={"train_split_entries": [{}]}, mag_alpha_values=[1e-4], config={"epochs": 1, "batch_rows": 32, "random_state": 1, "mag_up_scale_bps": [1.0, 1.0, 1.0], "mag_down_scale_bps": [1.0, 1.0, 1.0]})
-    assert calls["dir"] == 0
-    assert calls["mag"] > 0
+
+    result = linear_offline.train_magnitude_models_streaming_from_plan(
+        extractor=object(), preprocess_bundle=object(), plan={"train_split_entries": [{}]}, mag_alpha_values=[1e-4],
+        config={"epochs": 1, "batch_rows": 32, "random_state": 1, "mag_up_scale_bps": [1.0, 1.0, 1.0], "mag_down_scale_bps": [1.0, 1.0, 1.0]}
+    )[0]
+
+    up_models = result["mag_up_models"]
+    down_models = result["mag_down_models"]
+    expected_up = [(y[:, h] > 0).sum() for h in range(y.shape[1])]
+    expected_down = [(y[:, h] < 0).sum() for h in range(y.shape[1])]
+
+    assert result["fit_summary"]["mag_training_rows"] == "side_active_rows"
+    assert result["fit_summary"]["up_rows_per_horizon"] == [int(x) for x in expected_up]
+    assert result["fit_summary"]["down_rows_per_horizon"] == [int(x) for x in expected_down]
+
+    for h in range(y.shape[1]):
+        assert up_models[h].n_rows == int(expected_up[h])
+        assert down_models[h].n_rows == int(expected_down[h])
+        up_targets = np.concatenate(up_models[h].targets) if up_models[h].targets else np.array([])
+        down_targets = np.concatenate(down_models[h].targets) if down_models[h].targets else np.array([])
+        assert up_targets.size == int(expected_up[h])
+        assert down_targets.size == int(expected_down[h])
+        assert np.all(up_targets > 0.0)
+        assert np.all(down_targets > 0.0)
 
 
-def test_add_side_cond_log_magnitude_metrics_conditional_keys():
+def test_add_side_cond_log_magnitude_metrics_values_and_no_all_row_keys():
     import linear_offline
-    y = np.asarray([[0.0, 1.0, -2.0], [0.0, 0.0, 0.0], [2.0, -1.0, 4.0], [-3.0, 0.5, 0.0]], dtype=np.float32)
-    pred = {"dir_logits": np.zeros_like(y, dtype=np.float32), "mag_up_bps": np.maximum(y, 0.0) + 0.1, "mag_down_bps": np.maximum(-y, 0.0) + 0.1, "mag_up_log": np.log1p((np.maximum(y,0.0)+0.1)), "mag_down_log": np.log1p((np.maximum(-y,0.0)+0.1))}
+    y = np.asarray([
+        [ 1.0,  0.0, -2.0],
+        [ 0.0,  3.0,  0.0],
+        [-2.0,  0.0,  4.0],
+        [ 0.0, -1.0,  0.0],
+        [ 4.0,  1.0, -1.0],
+        [ 0.0,  0.0,  0.0],
+    ], dtype=np.float32)
+    mag_up_bps = np.maximum(y, 0.0) * 2.0 + 0.1
+    mag_down_bps = np.maximum(-y, 0.0) * 0.5 + 0.1
+    pred = {"dir_logits": np.zeros_like(y, dtype=np.float32), "mag_up_bps": mag_up_bps, "mag_down_bps": mag_down_bps, "mag_up_log": np.log1p(mag_up_bps), "mag_down_log": np.log1p(mag_down_bps)}
     metrics = {}
     linear_offline.add_side_cond_log_magnitude_metrics(metrics, y=y, pred=pred, scale_up_bps=np.ones(y.shape[1],dtype=np.float32), scale_down_bps=np.ones(y.shape[1],dtype=np.float32))
-    assert len(metrics["mean_side_spearman_cond"]) == y.shape[1]
-    assert len(metrics["mean_side_p90_ratio_cond"]) == y.shape[1]
-    assert len(metrics["mean_side_p50_ratio_cond"]) == y.shape[1]
-    assert metrics["up_n_cond"][0] == int((y[:,0] > 0).sum())
-    assert metrics["down_n_cond"][0] == int((y[:,0] < 0).sum())
-    assert "mean_side_top_bottom_true_mean_lift_cond" in metrics
-    assert "up_inactive_pred_p90_bps" in metrics
-    assert "down_inactive_pred_p90_bps" in metrics
-    assert "pred_expected_abs_p50_over_true_abs_p50_all" not in metrics
-    assert "true_abs_bps_p50_all" not in metrics
-    assert "pred_expected_abs_bps_p50_all" not in metrics
+    h = 0
+    up_rows = y[:, h] > 0
+    true_up = y[up_rows, h]
+    pred_up = mag_up_bps[up_rows, h]
+    assert np.isclose(metrics["up_p50_ratio_cond"][h], np.percentile(pred_up, 50) / np.percentile(true_up, 50))
+    assert np.isclose(metrics["up_p90_ratio_cond"][h], np.percentile(pred_up, 90) / np.percentile(true_up, 90))
+    assert np.isclose(metrics["up_mean_ratio_cond"][h], np.mean(pred_up) / np.mean(true_up))
+    assert metrics["up_n_cond"][h] == int(up_rows.sum())
+    assert metrics["down_n_cond"][h] == int((y[:, h] < 0).sum())
+    for key in ["mean_side_log_huber_cond", "mean_side_spearman_cond", "mean_side_mean_ratio_cond", "mean_side_p50_ratio_cond", "mean_side_p90_ratio_cond", "mean_side_top_bottom_true_mean_lift_cond", "zero_row_mean_pred_abs_bps", "up_inactive_pred_p90_bps", "down_inactive_pred_p90_bps", "zero_row_up_pred_p90_bps", "zero_row_down_pred_p90_bps"]:
+        assert key in metrics
+    for key in ["mag_expected_abs_spearman_all", "pred_expected_abs_p90_over_true_abs_p90_all", "pred_expected_abs_p95_over_true_abs_p95_all", "pred_expected_abs_p50_over_true_abs_p50_all", "true_abs_bps_p50_all", "pred_expected_abs_bps_p50_all"]:
+        assert key not in metrics
+
+
+def test_add_side_cond_log_magnitude_metrics_deciles_and_lift():
+    import linear_offline
+    n = 100
+    y = np.zeros((n, 3), dtype=np.float32)
+    y[:, 0] = np.linspace(0.1, 10.0, n)
+    y[:, 1] = -np.linspace(0.1, 10.0, n)
+    up = np.tile(np.linspace(0.1, 10.0, n).reshape(-1, 1), (1, 3)).astype(np.float32)
+    down = np.tile(np.linspace(0.1, 10.0, n).reshape(-1, 1), (1, 3)).astype(np.float32)
+    pred = {"dir_logits": np.zeros_like(y, dtype=np.float32), "mag_up_bps": up, "mag_down_bps": down, "mag_up_log": np.log1p(up), "mag_down_log": np.log1p(down)}
+    metrics = {}
+    linear_offline.add_side_cond_log_magnitude_metrics(metrics, y=y, pred=pred, scale_up_bps=np.ones(y.shape[1],dtype=np.float32), scale_down_bps=np.ones(y.shape[1],dtype=np.float32))
+    assert len(metrics["up_decile_calibration_cond"][0]) == 10
+    assert np.isfinite(metrics["up_top_bottom_true_mean_lift_cond"][0])
+    assert metrics["up_top_bottom_true_mean_lift_cond"][0] > 1.0
+    assert len(metrics["down_decile_calibration_cond"][1]) == 10
+    assert np.isfinite(metrics["down_top_bottom_true_mean_lift_cond"][1])
+    assert metrics["down_top_bottom_true_mean_lift_cond"][1] > 1.0
 
 
 def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch):
@@ -254,9 +330,13 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
         "dir_bal_acc_kept": [0.62] * metric_len,
         "val_dir_bce_kept": [0.55] * metric_len,
         "edge_spearman_kept": [0.13] * metric_len,
-        "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len,
-        "mean_side_p90_ratio_cond": [1.23] * metric_len,
+        "edge_spearman_all": [0.14] * metric_len,
+        "mean_side_log_huber_cond": [0.22] * metric_len,
         "mean_side_spearman_cond": [0.44] * metric_len,
+        "mean_side_p50_ratio_cond": [0.88] * metric_len,
+        "mean_side_p90_ratio_cond": [1.23] * metric_len,
+        "mean_side_top_bottom_true_mean_lift_cond": [2.5] * metric_len,
+        "zero_row_mean_pred_abs_bps": [0.07] * metric_len,
         "primary_metric_guard_passed": True,
     }
 
@@ -299,9 +379,19 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     assert "bal_1s=" in out
     assert "bce_1s=" in out
     assert "edge_sp_1s=" in out
+    assert "log_huber_1s=0.22" in out
+    assert "sp_1s=0.44" in out
+    assert "p50_ratio_1s=0.88" in out
+    assert "p90_ratio_1s=1.23" in out
+    assert "lift_1s=2.5" in out
+    assert "zero_pred_1s=0.07" in out
+    assert "mag_log_huber_1s=0.22" in out
     assert "mag_sp_1s=0.44" in out
+    assert "mag_p50_ratio_1s=0.88" in out
     assert "mag_p90_ratio_1s=1.23" in out
-    assert "mag_p90_ratio_1s=" in out
+    assert "mag_lift_1s=2.5" in out
+    assert "mag_abs_sp_1s" not in out
+    assert "expected_abs" not in out
     assert "selection_score=" in out
 
 
