@@ -251,7 +251,11 @@ def test_add_side_all_log_magnitude_metrics_uses_all_rows():
     linear_offline.add_side_all_log_magnitude_metrics(metrics, y=y, pred=pred)
     assert len(metrics["mag_expected_abs_spearman_all"]) == y.shape[1]
     assert len(metrics["pred_expected_abs_p90_over_true_abs_p90_all"]) == y.shape[1]
+    assert len(metrics["pred_expected_abs_p95_over_true_abs_p95_all"]) == y.shape[1]
     assert all(np.isfinite(metrics["pred_expected_abs_p90_over_true_abs_p90_all"]))
+    assert "pred_expected_abs_p50_over_true_abs_p50_all" not in metrics
+    assert "true_abs_bps_p50_all" not in metrics
+    assert "pred_expected_abs_bps_p50_all" not in metrics
 
 
 def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch):
@@ -309,9 +313,11 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     )
 
     out = capsys.readouterr().out
-    assert out.count("[linear-stage4-candidate]") == 1
+    assert out.count("[linear-stage4-dir-candidate]") == 1
+    assert out.count("[linear-stage4-mag-candidate]") == 1
     assert out.count("[linear-stage4-best]") == 1
-    assert "alpha=0.0001" in out
+    assert "dir_alpha=0.0001" in out
+    assert "mag_alpha=" in out
     assert "auc_1s=" in out
     assert "bal_1s=" in out
     assert "bce_1s=" in out
@@ -319,8 +325,7 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     assert "mag_abs_sp_1s=0.44" in out
     assert "mag_p90_ratio_1s=1.23" in out
     assert "mag_p90_ratio_1s=" in out
-    assert "primary=" in out
-    assert "guard_passed=" in out
+    assert "selection_score=" in out
 
 
 def test_load_linear_trim_stats_rejects_decision_stride_mismatch(tmp_path, monkeypatch):

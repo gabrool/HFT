@@ -264,6 +264,7 @@ def test_linear_default_alpha_and_preprocess_config():
     assert linear_offline.LINEAR_PREPROCESS_POST_CLIP_ABS == 10.0
     assert linear_offline.LINEAR_PREPROCESS_AUDIT_MAX_VALUE_SAMPLE == 200_000
     assert linear_offline.LINEAR_STAGE4_ALPHA_VALUES == [1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+    assert linear_offline.LINEAR_STAGE4_MAG_ALPHA_VALUES == [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 
 
 def test_stage3_payload_records_new_preprocess_defaults(monkeypatch, tmp_path):
