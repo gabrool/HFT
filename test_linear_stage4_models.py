@@ -54,6 +54,7 @@ def write_trim_stats(tmp_path: Path, y_train: np.ndarray):
 
 def configure_stage4(monkeypatch, linear_offline):
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_ALPHA_VALUES", [1e-4])
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAG_ALPHA_VALUES", [1e-4])
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_EPOCHS", 1)
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_BATCH_ROWS", 32)
     monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_RANDOM_SEED", 7)
