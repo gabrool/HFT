@@ -1909,8 +1909,10 @@ def add_side_cond_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarra
             err=pred_log-true_log
             hub=float(np.mean(np.where(np.abs(err)<=1.0,0.5*err*err,np.abs(err)-0.5)))
             sp=float(_safe_spearman_np(pred_bps,true_bps))
-            ratio=np.asarray(pred_bps/np.maximum(true_bps,1e-12),dtype=np.float32)
-            mr=float(np.mean(ratio)); p50=float(np.percentile(ratio,50)); p90=float(np.percentile(ratio,90))
+            eps=1e-12
+            mr=float(np.mean(pred_bps)/max(float(np.mean(true_bps)),eps))
+            p50=float(np.percentile(pred_bps,50)/max(float(np.percentile(true_bps,50)),eps))
+            p90=float(np.percentile(pred_bps,90)/max(float(np.percentile(true_bps,90)),eps))
             dec,lift=_side_decile_calibration(pred_bps,true_bps)
             return (hub,sp,mr,p50,p90,float(rows.sum())), dec, lift
         (up_h,up_sp,up_mr,up_p50,up_p90,_), up_dec, up_lift = side_vals(up_rows,'up')
@@ -2869,14 +2871,14 @@ def build_stage4_bundle_from_parts(*, config: Dict[str, Any], horizons_ms: list[
     fit_summary = {"direction_alpha": float(direction_result["direction_alpha"]), "mag_alpha": float(magnitude_result["mag_alpha"]), "direction_fit_summary": direction_result["fit_summary"], "magnitude_fit_summary": magnitude_result["fit_summary"], "combined_stage4_bundle": True}
     return LinearSklearnTakerBundle(schema=LINEAR_STAGE4_SCHEMA, config=bundle_config, horizons_ms=[int(h) for h in horizons_ms], direction_models=direction_result["direction_models"], mag_up_models=magnitude_result["mag_up_models"], mag_down_models=magnitude_result["mag_down_models"], mag_floor=float(config["mag_floor"]), fit_summary=fit_summary, mag_mode=str(config.get("mag_mode", "side_cond_log")), mag_up_scale_bps=np.asarray(config["mag_up_scale_bps"], dtype=np.float32), mag_down_scale_bps=np.asarray(config["mag_down_scale_bps"], dtype=np.float32))
 
-def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, stats: Dict[str, np.ndarray], device: torch.device, split_name: str, max_rows: int = 0, batch_rows: Optional[int] = None, include_all_row_mag_metrics: bool = True) -> Dict[str, Any]:
+def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, stats: Dict[str, np.ndarray], device: torch.device, split_name: str, max_rows: int = 0, batch_rows: Optional[int] = None, include_cond_mag_metrics: bool = True) -> Dict[str, Any]:
     eval_stage = "stage5" if str(split_name).startswith("stage5_") else "stage4"
     eval_action = "reeval" if eval_stage == "stage5" else "eval"
     source = StreamingPreprocessedBatchSource(extractor=extractor, bundle=preprocess_bundle, ds=ds, device=device, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), max_rows=max_rows, split_name=split_name, stage=eval_stage, action=eval_action)
     print(f"[linear-stream] stage=stage4 action=eval split={split_name} rows={source.n_rows}", flush=True)
     metrics = summarize_metrics(LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).to(device), source, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name=split_name)
-    if include_all_row_mag_metrics:
-        pred_payload = collect_predictions_and_labels_streaming(model_bundle=bundle, extractor=extractor, preprocess_bundle=preprocess_bundle, ds=ds, max_rows=max_rows, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), split_name=f"{split_name}_all_rows_eval")
+    if include_cond_mag_metrics:
+        pred_payload = collect_predictions_and_labels_streaming(model_bundle=bundle, extractor=extractor, preprocess_bundle=preprocess_bundle, ds=ds, max_rows=max_rows, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), split_name=f"{split_name}_all_rows_eval", progress_stage=eval_stage, progress_action="cond_mag_eval" if eval_stage == "stage4" else "diagnostics")
         add_side_cond_log_magnitude_metrics(metrics, y=np.asarray(pred_payload["y"], dtype=np.float32), pred=pred_payload, scale_up_bps=np.asarray(bundle.mag_up_scale_bps, dtype=np.float32), scale_down_bps=np.asarray(bundle.mag_down_scale_bps, dtype=np.float32))
     pv, pl = compute_primary_metric(metrics); metrics["primary_metric_value"] = float(pv); metrics["primary_metric_label"] = str(pl); return metrics
 
@@ -2894,7 +2896,7 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
     direction_summaries=[]; best=None; best_metrics=None; best_score=float("-inf"); best_alpha=None
     for b in cands:
         ds_val = build_val_dataset_from_plan(plan)
-        try: vm = evaluate_stage4_bundle_streaming(bundle=b, extractor=extractor, preprocess_bundle=pb, ds=ds_val, stats=stats, device=device, split_name="val", max_rows=LINEAR_STAGE4_MAX_VAL_ROWS, include_all_row_mag_metrics=False)
+        try: vm = evaluate_stage4_bundle_streaming(bundle=b, extractor=extractor, preprocess_bundle=pb, ds=ds_val, stats=stats, device=device, split_name="val", max_rows=LINEAR_STAGE4_MAX_VAL_ROWS, include_cond_mag_metrics=False)
         finally: close_dataset(ds_val, name="stage4_val_eval"); del ds_val; force_gc("stage4_val_eval")
         pv, pl = compute_primary_metric(vm); score = float(pv) if bool(vm.get("primary_metric_guard_passed", True)) and math.isfinite(float(pv)) else float("-inf")
         guard_passed = score > float("-inf")
@@ -2995,17 +2997,17 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
     path = stage4_dir / "linear_stage4_metrics.json"; copy = Path(linear_out_dir) / "linear_stage4_metrics.json"; path.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); copy.write_text(json.dumps(payload, allow_nan=True, indent=2), encoding="utf-8"); return payload
 
 
-def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, max_rows: int, batch_rows: int, split_name: str) -> Dict[str, np.ndarray]:
+def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, max_rows: int, batch_rows: int, split_name: str, progress_stage: str = "stage4", progress_action: str = "diagnostics") -> Dict[str, np.ndarray]:
     parts = {k: [] for k in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "edge_bps", "y", "positions"]}
     base_iter = iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name)
-    for Z, y, pos in progress_iter_rows(base_iter, total_rows=decision_row_count(len(ds), max_rows=max_rows), desc=_progress_desc("stage5", "diagnostics", split_name)):
+    for Z, y, pos in progress_iter_rows(base_iter, total_rows=decision_row_count(len(ds), max_rows=max_rows), desc=_progress_desc(progress_stage, progress_action, split_name)):
         pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); p = _sigmoid_np(dl)
         ub, db = extract_mag_bps_from_prediction(pred)
         up = np.sqrt(np.maximum(ub, 0.0)); dn = np.sqrt(np.maximum(db, 0.0))
         edge = p * ub - (1.0 - p) * db
         for k, v in [("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_log", np.asarray(pred["mag_up_log"], dtype=np.float32)), ("mag_down_log", np.asarray(pred["mag_down_log"], dtype=np.float32)), ("mag_up_bps", ub), ("mag_down_bps", db), ("edge_bps", edge), ("y", y), ("positions", pos)]: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
     if not parts["y"]: raise ValueError(f"Streaming split contains no rows: {split_name}")
-    print(f"[linear-stream] stage=stage5 action=diagnostics split={split_name} rows={sum(x.shape[0] for x in parts['y'])}", flush=True)
+    print(f"[linear-stream] stage={progress_stage} action={progress_action} split={split_name} rows={sum(x.shape[0] for x in parts['y'])}", flush=True)
     return {k: np.concatenate(v, axis=0) for k, v in parts.items()}
 
 
@@ -3023,7 +3025,7 @@ def run_stage5_comparison(*, linear_out_dir: Path, extractor_names: list[str], p
         ds_val = build_val_dataset_from_plan(plan)
         try:
             val_metrics = evaluate_stage4_bundle_streaming(bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=ds_val, stats=stats, device=device, split_name=f"stage5_val_{extractor_name}", max_rows=LINEAR_STAGE5_MAX_VAL_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS) if LINEAR_STAGE5_REEVALUATE else (st4.get("val_metrics", {}) or {})
-            pred_val = collect_predictions_and_labels_streaming(model_bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=ds_val, max_rows=LINEAR_STAGE5_MAX_VAL_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS, split_name=f"val_{extractor_name}")
+            pred_val = collect_predictions_and_labels_streaming(model_bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=ds_val, max_rows=LINEAR_STAGE5_MAX_VAL_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS, split_name=f"val_{extractor_name}", progress_stage="stage5", progress_action="diagnostics")
         finally:
             close_dataset(ds_val, name=f"stage5_{extractor_name}_val"); del ds_val; force_gc(f"stage5_{extractor_name}_val")
         pred_val_summary = summarize_prediction_arrays(pred_val); shift = run_label_shift_sanity_checks(pred_payload=pred_val, stats=stats, shifts=LINEAR_STAGE5_LABEL_SHIFT_VALUES, split_name=f"val_{extractor_name}") if LINEAR_STAGE5_LABEL_SHIFT_VALUES else {}; perm = run_label_permutation_sanity_check(pred_payload=pred_val, stats=stats, seed=LINEAR_STAGE5_PERMUTATION_SEED, split_name=f"val_{extractor_name}") if LINEAR_STAGE5_LABEL_PERMUTATION else None
@@ -3033,7 +3035,7 @@ def run_stage5_comparison(*, linear_out_dir: Path, extractor_names: list[str], p
             if ds_test is not None:
                 try:
                     test_metrics = evaluate_stage4_bundle_streaming(bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=ds_test, stats=stats, device=device, split_name=f"stage5_test_{extractor_name}", max_rows=LINEAR_STAGE5_MAX_TEST_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS) if LINEAR_STAGE5_REEVALUATE else st4.get("test_metrics")
-                    pred_test = collect_predictions_and_labels_streaming(model_bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=ds_test, max_rows=LINEAR_STAGE5_MAX_TEST_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS, split_name=f"test_{extractor_name}"); pred_test_summary = summarize_prediction_arrays(pred_test); shift_t = run_label_shift_sanity_checks(pred_payload=pred_test, stats=stats, shifts=LINEAR_STAGE5_LABEL_SHIFT_VALUES, split_name=f"test_{extractor_name}") if LINEAR_STAGE5_LABEL_SHIFT_VALUES else {}; perm_t = run_label_permutation_sanity_check(pred_payload=pred_test, stats=stats, seed=LINEAR_STAGE5_PERMUTATION_SEED, split_name=f"test_{extractor_name}") if LINEAR_STAGE5_LABEL_PERMUTATION else None
+                    pred_test = collect_predictions_and_labels_streaming(model_bundle=model_bundle, extractor=extractor, preprocess_bundle=pb, ds=ds_test, max_rows=LINEAR_STAGE5_MAX_TEST_ROWS, batch_rows=LINEAR_STAGE5_BATCH_ROWS, split_name=f"test_{extractor_name}", progress_stage="stage5", progress_action="diagnostics"); pred_test_summary = summarize_prediction_arrays(pred_test); shift_t = run_label_shift_sanity_checks(pred_payload=pred_test, stats=stats, shifts=LINEAR_STAGE5_LABEL_SHIFT_VALUES, split_name=f"test_{extractor_name}") if LINEAR_STAGE5_LABEL_SHIFT_VALUES else {}; perm_t = run_label_permutation_sanity_check(pred_payload=pred_test, stats=stats, seed=LINEAR_STAGE5_PERMUTATION_SEED, split_name=f"test_{extractor_name}") if LINEAR_STAGE5_LABEL_PERMUTATION else None
                     if LINEAR_STAGE5_SAVE_PREDICTIONS: save_stage5_prediction_dump(diag_dir / extractor_name / "test_predictions.npz", pred_test, LINEAR_STAGE5_PREDICTION_MAX_ROWS)
                 finally:
                     close_dataset(ds_test, name=f"stage5_{extractor_name}_test"); del ds_test; force_gc(f"stage5_{extractor_name}_test")
