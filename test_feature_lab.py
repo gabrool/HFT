@@ -37,14 +37,37 @@ def test_expr_ast_safety():
             eval_expr(expr,X,names)
 
 
-def test_mask_semantics():
-    y=np.array([0.0,1e-8,0.1,-0.2,0.4,-0.6],dtype=np.float64)
-    cand=np.array([0,0,1,1,1,1],dtype=np.float64)
-    finite=np.isfinite(y)&np.isfinite(cand)
-    nonzero=finite&(np.abs(y)>1e-3)
-    assert nonzero.tolist()==[False,False,True,True,True,True]
-    kept=side_specific_keep_mask(y,0.25,0.25)
-    assert kept.sum()< (np.abs(y)>0).sum()
+def test_side_specific_keep_mask_respects_min_abs_label_eps():
+    y = np.array([0.0, 1e-8, -1e-8, 0.1, -0.2, 0.4, -0.6], dtype=np.float64)
+
+    kept_no_eps = side_specific_keep_mask(y, 0.0, 0.0, min_abs_label_eps=0.0)
+    kept_eps = side_specific_keep_mask(y, 0.0, 0.0, min_abs_label_eps=1e-3)
+
+    assert kept_no_eps.sum() == 6
+    assert kept_eps.sum() == 4
+    assert not kept_eps[1]
+    assert not kept_eps[2]
+
+
+def test_binary_auc_uses_average_ranks_for_ties():
+    from feature_lab import _binary_auc_np
+
+    y = np.array([0, 1, 0, 1], dtype=np.int64)
+    s = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float64)
+
+    assert abs(_binary_auc_np(y, s) - 0.5) < 1e-12
+
+
+def test_resolve_trim_fractions_preserves_explicit_zero():
+    from feature_lab import resolve_trim_fractions
+
+    low, high = resolve_trim_fractions({
+        "low_abs_trim_fraction": 0.0,
+        "high_abs_trim_fraction": 0.0,
+    })
+
+    assert low == 0.0
+    assert high == 0.0
 
 
 def test_mi_only_on_kept_and_corr_methods(monkeypatch):

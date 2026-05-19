@@ -23,19 +23,32 @@ class SafeNpNamespace:
     log1p=np.log1p; abs=np.abs; sign=np.sign; clip=np.clip; maximum=np.maximum; minimum=np.minimum
 
 def resolve_trim_fractions(meta: dict) -> tuple[float, float]:
-    low = (
-        meta.get("low_abs_trim_fraction")
-        or meta.get("LOW_ABS_TRIM_FRACTION")
-        or meta.get("label_low_abs_trim_fraction")
-        or DEFAULT_LOW_ABS_TRIM_FRACTION
+    low = _first_present(
+        meta,
+        (
+            "low_abs_trim_fraction",
+            "LOW_ABS_TRIM_FRACTION",
+            "label_low_abs_trim_fraction",
+        ),
+        DEFAULT_LOW_ABS_TRIM_FRACTION,
     )
-    high = (
-        meta.get("high_abs_trim_fraction")
-        or meta.get("HIGH_ABS_TRIM_FRACTION")
-        or meta.get("label_high_abs_trim_fraction")
-        or DEFAULT_HIGH_ABS_TRIM_FRACTION
+    high = _first_present(
+        meta,
+        (
+            "high_abs_trim_fraction",
+            "HIGH_ABS_TRIM_FRACTION",
+            "label_high_abs_trim_fraction",
+        ),
+        DEFAULT_HIGH_ABS_TRIM_FRACTION,
     )
     return float(low), float(high)
+
+
+def _first_present(meta: dict, keys: tuple[str, ...], default):
+    for k in keys:
+        if k in meta and meta[k] is not None:
+            return meta[k]
+    return default
 
 def resolve_train_weeks(meta: dict) -> list[str]:
     try:
@@ -95,11 +108,12 @@ def _safe_spearman_np(x,y):
     return _safe_pearson_np(_rankdata_average(x[m]),_rankdata_average(y[m]))
 
 def _binary_auc_np(y01,s):
-    m=np.isfinite(s); y=y01[m].astype(int); s=s[m]
+    y01=np.asarray(y01); s=np.asarray(s,dtype=np.float64)
+    m=np.isfinite(s)&np.isfinite(y01); y=y01[m].astype(int); s=s[m]
     pos=(y==1).sum(); neg=(y==0).sum()
     if pos==0 or neg==0:return np.nan
-    ord=np.argsort(s); r=np.empty_like(ord); r[ord]=np.arange(len(s))+1
-    return float((r[y==1].sum()-pos*(pos+1)/2)/(pos*neg))
+    ranks=_rankdata_average(s)
+    return float((ranks[y==1].sum()-pos*(pos+1)/2.0)/(pos*neg))
 
 def _bal_acc_best_threshold_np(y01,s):
     m=np.isfinite(s); y=y01[m].astype(int); s=s[m]
@@ -126,10 +140,17 @@ def _mutual_info_optional(x,y,is_cls):
     except Exception:
         return np.nan
 
-def side_specific_keep_mask(y_h: np.ndarray, low_frac: float, high_frac: float) -> np.ndarray:
+def side_specific_keep_mask(
+    y_h: np.ndarray,
+    low_frac: float,
+    high_frac: float,
+    min_abs_label_eps: float = 0.0,
+) -> np.ndarray:
     y=np.asarray(y_h,dtype=np.float64); finite=np.isfinite(y); keep=np.zeros_like(finite,dtype=bool)
-    for side_sign in (1.0,-1.0):
-        side=finite&(np.sign(y)==side_sign); abs_side=np.abs(y[side])
+    pos=finite&(y>min_abs_label_eps)
+    neg=finite&(y<-min_abs_label_eps)
+    for side in (pos,neg):
+        abs_side=np.abs(y[side])
         if abs_side.size==0: continue
         lo=np.quantile(abs_side,low_frac) if low_frac>0 else -np.inf
         hi=np.quantile(abs_side,1.0-high_frac) if high_frac>0 else np.inf
@@ -176,7 +197,7 @@ def compute_existing_feature_target_scores(X,y,feature_names,low_abs_trim_fracti
     for i,n in enumerate(feature_names):
         feat=X[:,i]; best_auc=np.nan; best_abs=np.nan
         for h_i,_h in enumerate([200,500,1000]):
-            ys=y[:,h_i]; kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction)&np.isfinite(feat)
+            ys=y[:,h_i]; kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction,MIN_ABS_LABEL_EPS)&np.isfinite(feat)
             if not kept.any(): continue
             xx=feat[kept]; yy=ys[kept]; dd=(yy>0).astype(int); aa=np.abs(yy)
             auc=_binary_auc_np(dd,xx); auc=max(auc,1-auc) if np.isfinite(auc) else np.nan
@@ -224,7 +245,7 @@ def evaluate_candidate_array(candidate_name,candidate,X,y,feature_names,week_key
         ys=y[:,h_i]; direction=(ys>0).astype(int); absr=np.abs(ys)
         finite=np.isfinite(ys)&np.isfinite(candidate)
         nonzero=finite&(np.abs(ys)>MIN_ABS_LABEL_EPS)
-        kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction)&np.isfinite(candidate)
+        kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction,MIN_ABS_LABEL_EPS)&np.isfinite(candidate)
         masks={"all_finite":finite,"nonzero":nonzero,"kept":kept}
         mi_dir_kept=np.nan; mi_abs_kept=np.nan
         if kept.any():
