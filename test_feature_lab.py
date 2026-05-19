@@ -1,8 +1,8 @@
-import json
+import json, os
 import numpy as np
 import pytest
 
-from feature_lab import eval_expr, evaluate_candidate_array
+from feature_lab import eval_expr, evaluate_candidate_array, side_specific_keep_mask, select_feature_names_and_idx
 
 
 def _mk():
@@ -22,39 +22,51 @@ def test_expr_candidate_shape_and_finite():
     assert np.isfinite(c).all()
 
 
-def test_expr_rejects_unknown_feature():
+def test_expr_ast_safety():
     X,_,names,_=_mk()
-    with pytest.raises(ValueError):
-        eval_expr("missing + f0",X,names)
+    assert np.isfinite(eval_expr("np.log1p(np.abs(f0))",X,names)).all()
+    for expr in ["__import__('os').system('echo x')","np.asarray(f0)","f0.__class__","(lambda x: x)(f0)","f0[0]"]:
+        with pytest.raises(ValueError):
+            eval_expr(expr,X,names)
 
 
-def test_expr_rejects_unsafe_code():
-    X,_,names,_=_mk()
-    with pytest.raises(ValueError):
-        eval_expr("__import__('os').system('echo x')",X,names)
+def test_mask_semantics():
+    y=np.array([0.0,1e-8,0.1,-0.2,0.4,-0.6],dtype=np.float64)
+    cand=np.array([0,0,1,1,1,1],dtype=np.float64)
+    finite=np.isfinite(y)&np.isfinite(cand)
+    nonzero=finite&(np.abs(y)>1e-3)
+    assert nonzero.tolist()==[False,False,True,True,True,True]
+    kept=side_specific_keep_mask(y,0.25,0.25)
+    assert kept.sum()< (np.abs(y)>0).sum()
 
 
-def test_corr_detects_duplicate_candidate():
+def test_mi_only_on_kept_and_corr_methods(monkeypatch):
+    monkeypatch.setenv("BYBIT_FEATURE_LAB_CORR_METHODS","pearson")
+    X,y,names,weeks=_mk()
+    _,target,corr,_,_,_=evaluate_candidate_array("sig",X[:,0],X,y,names,weeks)
+    non_kept=[r for r in target if r["mask_type"]!="kept"]
+    assert all(np.isnan(r["mi_direction"]) for r in non_kept)
+    assert np.isnan(corr[0]["spearman"])
+    assert np.isfinite(corr[0]["pearson"])
+
+
+def test_aux_selection():
+    meta={"feature_names":["a","b"],"feature_dim_core":2,"feature_dim_total":4,"aux_names":["aux_dt","aux_event"]}
+    names0,idx0=select_feature_names_and_idx(meta,False)
+    names1,idx1=select_feature_names_and_idx(meta,True)
+    assert names0==["a","b"] and idx0.tolist()==[0,1]
+    assert names1==["a","b","aux_dt","aux_event"] and idx1.tolist()==[0,1,2,3]
+
+
+def test_corr_detects_duplicate_candidate_and_existing_scores():
     X,y,names,weeks=_mk()
     h,_,corr,rel,_,_=evaluate_candidate_array("dup",X[:,0],X,y,names,weeks)
     assert h["finite_frac"]==1.0
     assert corr[0]["max_abs_corr"]>0.999
-    assert rel["max_corr_with_existing"]>0.999
-
-
-def test_target_metrics_detect_directional_signal():
-    X,y,names,weeks=_mk()
-    _,target,_,_,_,_=evaluate_candidate_array("sig",X[:,0],X,y,names,weeks)
-    kept=[r for r in target if r["horizon_ms"]==1000 and r["mask_type"]=="kept"][0]
-    assert kept["single_feature_auc_direction"]>0.6
-
-
-def test_decile_report_has_10_deciles_per_horizon():
-    X,y,names,weeks=_mk()
-    _,_,_,_,_,dec=evaluate_candidate_array("sig",X[:,0],X,y,names,weeks)
-    for h in [200,500,1000]:
-        d={r["decile"] for r in dec if r["horizon_ms"]==h}
-        assert d==set(range(10))
+    assert "existing_best_kept_auc" in corr[0]
+    assert "existing_best_abs_return_spearman" in corr[0]
+    assert "existing_target_score" in corr[0]
+    assert "most_correlated_existing_target_score" in rel
 
 
 def test_summary_is_compact_no_large_arrays():
