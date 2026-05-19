@@ -363,6 +363,110 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     assert "selection_score=" in out
 
 
+def test_stage4_records_distinct_direction_and_magnitude_alphas(tmp_path, monkeypatch):
+    import linear_offline
+
+    configure_stage4(monkeypatch, linear_offline)
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_ALPHA_VALUES", [1e-2])
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAG_ALPHA_VALUES", [1e-4])
+    monkeypatch.setattr(linear_offline, "OUT_ROOT", str(tmp_path / "out_root"))
+
+    fake_plan = {"has_cmssl_test": False, "train_split_entries": [{}], "train_week_keys": ["w0"], "val_split_entries": [{}]}
+    fake_preprocess = types.SimpleNamespace(original_dim=5, kept_dim=5)
+    fake_direction_models = []
+    fake_mag_up_models = []
+    fake_mag_down_models = []
+    fake_dir_result = {"direction_alpha": 1e-2, "direction_models": fake_direction_models, "fit_summary": {"direction_alpha": 1e-2}}
+    fake_mag_result = {"mag_alpha": 1e-4, "mag_up_models": fake_mag_up_models, "mag_down_models": fake_mag_down_models, "fit_summary": {"mag_alpha": 1e-4}}
+
+    metric_len = len(linear_offline.HORIZONS_MS)
+    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "pred_expected_abs_p90_over_true_abs_p90_all": [1.23] * metric_len, "mag_expected_abs_spearman_all": [0.44] * metric_len, "primary_metric_guard_passed": True}
+
+    saved = {}
+
+    def fake_save_bundle(bundle, path):
+        saved["bundle"] = bundle
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"bundle")
+
+    monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda *, out_root: fake_plan)
+    monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}))
+    monkeypatch.setattr(linear_offline, "load_stage3_payload", lambda *args, **kwargs: {"payload_path": "stage3.json", "preprocess_bundle_path": str(tmp_path / "preprocess.npz")})
+    monkeypatch.setattr(linear_offline, "_validate_manifest_decision_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "load_linear_preprocess_bundle", lambda path: fake_preprocess)
+    monkeypatch.setattr(linear_offline, "load_linear_trim_stats", lambda linear_out_dir: {})
+    monkeypatch.setattr(linear_offline, "compute_side_log_mag_scales_from_train_plan", lambda **kwargs: (np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32), np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32)))
+    monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0)] * len(linear_offline.HORIZONS_MS))
+    monkeypatch.setattr(linear_offline, "train_direction_models_streaming_from_plan", lambda **kwargs: [fake_dir_result])
+    monkeypatch.setattr(linear_offline, "train_magnitude_models_streaming_from_plan", lambda **kwargs: [fake_mag_result for _ in kwargs["mag_alpha_values"]])
+    monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
+    monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
+    monkeypatch.setattr(linear_offline, "close_dataset", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "force_gc", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: 10)
+    monkeypatch.setattr(linear_offline, "split_decision_row_count_from_plan", lambda plan, split, max_rows=0: 5)
+    monkeypatch.setattr(linear_offline, "save_linear_sklearn_bundle", fake_save_bundle)
+
+    payload = linear_offline.run_stage4_training(linear_out_dir=tmp_path, extractor_name="fake_extractor", preprocess_name="fake_preprocess", device=linear_offline.torch.device("cpu"))
+
+    assert payload["best_alpha"] == 1e-2
+    assert payload["best_direction_alpha"] == 1e-2
+    assert payload["best_mag_alpha"] == 1e-4
+
+    bundle = saved["bundle"]
+    assert bundle.config["direction_alpha"] == 1e-2
+    assert bundle.config["mag_alpha"] == 1e-4
+    assert bundle.fit_summary["direction_alpha"] == 1e-2
+    assert bundle.fit_summary["mag_alpha"] == 1e-4
+    assert "direction_fit_summary" in bundle.fit_summary
+    assert "magnitude_fit_summary" in bundle.fit_summary
+
+
+def test_stage4_reuses_reference_magnitude_alpha_without_retraining(tmp_path, monkeypatch):
+    import linear_offline
+
+    configure_stage4(monkeypatch, linear_offline)
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_ALPHA_VALUES", [1e-4])
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_MAG_ALPHA_VALUES", [1e-4, 1e-3, 1e-2])
+    monkeypatch.setattr(linear_offline, "OUT_ROOT", str(tmp_path / "out_root"))
+
+    fake_plan = {"has_cmssl_test": False, "train_split_entries": [{}], "train_week_keys": ["w0"], "val_split_entries": [{}]}
+    fake_preprocess = types.SimpleNamespace(original_dim=5, kept_dim=5)
+    fake_dir_result = {"direction_alpha": 1e-4, "direction_models": [], "fit_summary": {"direction_alpha": 1e-4}}
+    fake_up, fake_down = [], []
+    metric_len = len(linear_offline.HORIZONS_MS)
+    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "pred_expected_abs_p90_over_true_abs_p90_all": [1.23] * metric_len, "mag_expected_abs_spearman_all": [0.44] * metric_len, "primary_metric_guard_passed": True}
+    seen_mag_alpha_batches = []
+
+    def fake_train_mag(**kwargs):
+        alphas = list(kwargs["mag_alpha_values"])
+        seen_mag_alpha_batches.append(alphas)
+        return [{"mag_alpha": float(a), "mag_up_models": fake_up, "mag_down_models": fake_down, "fit_summary": {"mag_alpha": float(a)}} for a in alphas]
+
+    monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda *, out_root: fake_plan)
+    monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}))
+    monkeypatch.setattr(linear_offline, "load_stage3_payload", lambda *args, **kwargs: {"payload_path": "stage3.json", "preprocess_bundle_path": str(tmp_path / "preprocess.npz")})
+    monkeypatch.setattr(linear_offline, "_validate_manifest_decision_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "load_linear_preprocess_bundle", lambda path: fake_preprocess)
+    monkeypatch.setattr(linear_offline, "load_linear_trim_stats", lambda linear_out_dir: {})
+    monkeypatch.setattr(linear_offline, "compute_side_log_mag_scales_from_train_plan", lambda **kwargs: (np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32), np.ones(len(linear_offline.HORIZONS_MS), dtype=np.float32)))
+    monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0)] * len(linear_offline.HORIZONS_MS))
+    monkeypatch.setattr(linear_offline, "train_direction_models_streaming_from_plan", lambda **kwargs: [fake_dir_result])
+    monkeypatch.setattr(linear_offline, "train_magnitude_models_streaming_from_plan", fake_train_mag)
+    monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
+    monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
+    monkeypatch.setattr(linear_offline, "close_dataset", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "force_gc", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: 10)
+    monkeypatch.setattr(linear_offline, "split_decision_row_count_from_plan", lambda plan, split, max_rows=0: 5)
+    monkeypatch.setattr(linear_offline, "save_linear_sklearn_bundle", lambda bundle, path: Path(path).parent.mkdir(parents=True, exist_ok=True) or Path(path).write_bytes(b"bundle"))
+
+    linear_offline.run_stage4_training(linear_out_dir=tmp_path, extractor_name="fake_extractor", preprocess_name="fake_preprocess", device=linear_offline.torch.device("cpu"))
+
+    assert seen_mag_alpha_batches[0] == [1e-3]
+    assert seen_mag_alpha_batches[1] == [1e-4, 1e-2]
+
+
 def test_load_linear_trim_stats_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
     import linear_offline
     from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
