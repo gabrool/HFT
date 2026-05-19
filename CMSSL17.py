@@ -690,18 +690,18 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned187_xformv2"
-FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned187"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned172_xformv2"
+FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned172"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
-FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned187"
+FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned172"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
 CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
     + "p"
     + "ca"
-    + f"-pruned187-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
+    + f"-pruned172-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
 )
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -4091,21 +4091,26 @@ class FeatureEngine:
             "gap_b_bps",
             "bsz1",
             "asz1",
-            "micro_premia",
             "micro_minus_mid_bps",
-            "micro_minus_mid_over_spread",
             "time_since_trade_ms",
             "time_since_mid_change_ms",
         ])
         names.extend(NOTIONAL_CONTEXT_FEATURES)
         for lvl in BOOK_SIGNAL_LEVELS:
+            if lvl in {3, 5}:
+                continue
             names.append(f"obi_l{lvl}")
         for lvl in BOOK_SIGNAL_LEVELS:
+            if lvl == 10:
+                continue
             names.append(f"ofi_l{lvl}")
         for lvl in NORMALIZED_OFI_LEVELS:
             names.append(f"ofi_l{lvl}_over_depth_5bps")
+        skip_ofi_sum_over_depth = {(1, 1000), (3, 200), (3, 500), (3, 1000)}
         for level in ROLLING_OFI_LEVELS:
             for window in ROLLING_OFI_WINDOWS_MS:
+                if (level, window) in skip_ofi_sum_over_depth:
+                    continue
                 names.append(f"ofi_l{level}_sum_over_depth_{window}ms")
         for level in ROLLING_OFI_LEVELS:
             for fast_ms, slow_ms in OFI_ACCEL_PAIRS_MS:
@@ -4121,7 +4126,6 @@ class FeatureEngine:
         names.extend([
             "micro_l5_slope_200ms",
             "micro_l5_slope_1000ms",
-            "micro_l1_minus_micro_l10_bps",
         ])
         for band in BPS_DEPTH_BANDS:
             b = self._fmt_bps_band(band)
@@ -4136,7 +4140,7 @@ class FeatureEngine:
                 f"bid_price_change_rate_{ms}ms",
                 f"bid_l1_depletion_{ms}ms",
                 f"ask_l1_depletion_{ms}ms",
-                f"bid_l1_depletion_over_depth_{ms}ms",
+                *([] if ms == 200 else [f"bid_l1_depletion_over_depth_{ms}ms"]),
                 f"ask_l1_depletion_over_depth_{ms}ms",
             ])
         for ms in FAST_WINDOWS_MS:
@@ -4192,7 +4196,7 @@ class FeatureEngine:
         names.append("return_std_bps_200ms")
         for ms in REGIME_WINDOWS_MS:
             names.extend([
-                f"regime_volume_ewma_{ms}ms",
+                *([] if ms == 1_000 else [f"regime_volume_ewma_{ms}ms"]),
                 *([f"regime_flow_imbalance_{ms}ms"] if ms == 3_000 else []),
                 f"down_up_vol_imbalance_{ms}ms",
                 f"max_abs_return_bps_{ms}ms",
@@ -4207,10 +4211,33 @@ class FeatureEngine:
             ])
         for ms in FAST_WINDOWS_MS:
             names.extend([
-                f"ofi_l1_pressure_ewma_{ms}ms",
                 f"ofi_l1_pressure_over_depth_5bps_{ms}ms",
                 f"ofi_l1_pressure_over_realized_vol_{ms}ms",
             ])
+        removed_features = {
+            "micro_premia", "micro_minus_mid_over_spread", "obi_l3", "obi_l5",
+            "micro_l1_minus_micro_l10_bps", "ofi_l1_sum_over_depth_1000ms",
+            "ofi_l3_sum_over_depth_1000ms", "ofi_l3_sum_over_depth_500ms",
+            "ofi_l3_sum_over_depth_200ms", "ofi_l10", "ofi_l1_pressure_ewma_200ms",
+            "ofi_l1_pressure_ewma_500ms", "ofi_l1_pressure_ewma_1000ms",
+            "bid_l1_depletion_over_depth_200ms", "regime_volume_ewma_1000ms",
+        }
+        present_removed = sorted(set(names) & removed_features)
+        if present_removed:
+            raise AssertionError(f"Removed features still present: {present_removed}")
+        must_keep_features = {
+            "micro_minus_mid_bps", "obi_l1", "obi_l10", "micro_l10_minus_mid_bps",
+            "ofi_l5_sum_over_depth_1000ms", "ofi_l5_sum_over_depth_500ms",
+            "ofi_l5_sum_over_depth_200ms", "ofi_l10_over_depth_5bps",
+            "ofi_l1_pressure_over_depth_5bps_200ms",
+            "ofi_l1_pressure_over_depth_5bps_500ms",
+            "ofi_l1_pressure_over_depth_5bps_1000ms",
+            "bid_l1_rem_rate_over_depth_200ms", "regime_volume_ewma_500ms",
+            "regime_volume_ewma_3000ms",
+        }
+        missing_keep = sorted(must_keep_features - set(names))
+        if missing_keep:
+            raise AssertionError(f"Required kept features missing: {missing_keep}")
         if len(names) != len(set(names)):
             seen = set()
             duplicates = sorted({n for n in names if n in seen or seen.add(n)})
@@ -5609,8 +5636,8 @@ class FeatureEngine:
             if w != 200:
                 feat_list.extend(price_features[2:])
         feat_list.extend([
-            spread_bps, gap_a_bps, gap_b_bps, bsz1, asz1, micro_premia,
-            micro_minus_mid_bps, micro_minus_mid_over_spread,
+            spread_bps, gap_a_bps, gap_b_bps, bsz1, asz1,
+            micro_minus_mid_bps,
             dt_since_trade,
             time_since_mid_change_ms,
         ])
@@ -5622,15 +5649,22 @@ class FeatureEngine:
             total_depth_notional_5bps,
         ])
         for lvl in BOOK_SIGNAL_LEVELS:
+            if lvl in {3, 5}:
+                continue
             feat_list.append(obi_by_level[lvl])
         for lvl in BOOK_SIGNAL_LEVELS:
+            if lvl == 10:
+                continue
             feat_list.append(ofi_by_level[lvl])
         for lvl in NORMALIZED_OFI_LEVELS:
             ofi_val = ofi_by_level[lvl]
             feat_list.append(self._safe_div(ofi_val, depth_5bps_total, 0.0))
+        skip_ofi_sum_over_depth = {(1, 1000), (3, 200), (3, 500), (3, 1000)}
         for level in ROLLING_OFI_LEVELS:
             depth_l = cum_bid_by_level[level] + cum_ask_by_level[level]
             for window in ROLLING_OFI_WINDOWS_MS:
+                if (level, window) in skip_ofi_sum_over_depth:
+                    continue
                 ofi_sum = rolling_ofi_sums[(level, window)]
                 feat_list.append(self._safe_div(ofi_sum, depth_l, 0.0))
         for level in ROLLING_OFI_LEVELS:
@@ -5647,7 +5681,6 @@ class FeatureEngine:
         feat_list.extend([
             deep_micro_features["micro_l5_slope_200ms"],
             deep_micro_features["micro_l5_slope_1000ms"],
-            deep_micro_features["micro_l1_minus_micro_l10_bps"],
         ])
         for band in BPS_DEPTH_BANDS:
             if float(band) == 5.0:
@@ -5672,7 +5705,7 @@ class FeatureEngine:
                 bid_price_change_count / window_seconds,
                 bid_l1_depletion,
                 ask_l1_depletion,
-                self._safe_div(bid_l1_depletion, max(bsz1, 1e-9), 0.0),
+                *([] if ms == 200 else [self._safe_div(bid_l1_depletion, max(bsz1, 1e-9), 0.0)]),
                 self._safe_div(ask_l1_depletion, max(asz1, 1e-9), 0.0),
             ])
         for ms in FAST_WINDOWS_MS:
@@ -5752,7 +5785,8 @@ class FeatureEngine:
         feat_list.append(return_std_bps_200)
         for ms in REGIME_WINDOWS_MS:
             dist = self._regime_distribution(ms)
-            feat_list.append(regime_volume[ms])
+            if ms != 1_000:
+                feat_list.append(regime_volume[ms])
             if ms == 3_000:
                 feat_list.append(regime_flow_snapshot[ms])
             feat_list.extend([
@@ -5784,7 +5818,6 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             ofi_pressure = ofi_pressure_by_ms[ms]
             feat_list.extend([
-                ofi_pressure,
                 self._safe_div(ofi_pressure, max(depth_5bps_total_base, 1e-9), 0.0),
                 self._safe_div(ofi_pressure, max(self._realized_vol_for_pressure(ms), 1e-9), 0.0),
             ])
@@ -5796,8 +5829,8 @@ class FeatureEngine:
                 f"len(feature_names)={len(names)}"
             )
         feat = np.asarray(feat_list, dtype=np.float64)
-        if len(names) != 187:
-            raise ValueError(f"Expected pruned raw core dim 187, got {len(names)}")
+        if len(names) != 172:
+            raise ValueError(f"Expected pruned raw core dim 172, got {len(names)}")
         if self.strict_feature_validation:
             if not np.all(np.isfinite(feat)):
                 bad_idx = np.flatnonzero(~np.isfinite(feat))
@@ -5807,8 +5840,8 @@ class FeatureEngine:
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
         feat_out = self._transform_features(feat, ob_dt_ms)
-        if feat_out.shape != (187,):
-            raise ValueError(f"Expected transformed feature shape (187,), got {feat_out.shape}")
+        if feat_out.shape != (172,):
+            raise ValueError(f"Expected transformed feature shape (172,), got {feat_out.shape}")
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
