@@ -24,7 +24,7 @@ LINEAR_RAW_LINEAR_SCHEMA = "raw_linear_lag_bank_stats_v1"
 LINEAR_AEON_EXTRACTOR_SCHEMA = "aeon_rocket_hydra_stage2_v1"
 
 
-def side_log_mag_targets_np(
+def side_cond_log_mag_targets_np(
     y: np.ndarray,
     *,
     up_scale_bps: np.ndarray,
@@ -48,7 +48,7 @@ def side_log_mag_targets_np(
     return up_log.astype(np.float32, copy=False), down_log.astype(np.float32, copy=False)
 
 
-def inverse_side_log_mag_np(
+def inverse_side_cond_log_mag_np(
     up_log: np.ndarray,
     down_log: np.ndarray,
     *,
@@ -128,7 +128,7 @@ class LinearSklearnTakerBundle:
     mag_down_models: list[Any]
     mag_floor: float
     fit_summary: Dict[str, Any]
-    mag_mode: str = "side_all_log"
+    mag_mode: str = "side_cond_log"
     mag_up_scale_bps: Optional[np.ndarray] = None
     mag_down_scale_bps: Optional[np.ndarray] = None
 
@@ -172,7 +172,7 @@ class LinearSklearnTakerBundle:
         up_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_up_scale_bps is None else np.asarray(self.mag_up_scale_bps, dtype=np.float32)
         down_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_down_scale_bps is None else np.asarray(self.mag_down_scale_bps, dtype=np.float32)
         pred_log_clip = float(self.config.get("mag_log_pred_clip", 20.0))
-        up_bps, down_bps = inverse_side_log_mag_np(
+        up_bps, down_bps = inverse_side_cond_log_mag_np(
             up_log,
             down_log,
             up_scale_bps=up_scale_raw,
