@@ -212,6 +212,10 @@ REMOVED_V8_FEATURES = {
     "ask_l1_rem_rate_over_depth_500ms",
     "bid_l1_rem_rate_over_depth_1000ms",
     "ask_l1_rem_rate_over_depth_1000ms",
+    "obi_l3",
+    "obi_l5",
+    "ofi_l10",
+    "bid_l1_depletion_over_depth_200ms",
 }
 
 MUST_KEEP_V8_FEATURES = {
@@ -2587,3 +2591,31 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_removed_features_absent_from_feature_names_and_transform_specs():
+    from CMSSL17 import FeatureEngine, build_feature_transform_specs
+
+    names = list(FeatureEngine().feature_names())
+    specs = build_feature_transform_specs(names)
+
+    removed = {
+        "micro_premia",
+        "micro_minus_mid_over_spread",
+        "obi_l3",
+        "obi_l5",
+        "micro_l1_minus_micro_l10_bps",
+        "ofi_l1_sum_over_depth_1000ms",
+        "ofi_l3_sum_over_depth_1000ms",
+        "ofi_l3_sum_over_depth_500ms",
+        "ofi_l3_sum_over_depth_200ms",
+        "ofi_l10",
+        "ofi_l1_pressure_ewma_200ms",
+        "ofi_l1_pressure_ewma_500ms",
+        "ofi_l1_pressure_ewma_1000ms",
+        "bid_l1_depletion_over_depth_200ms",
+        "regime_volume_ewma_1000ms",
+    }
+
+    assert not (set(names) & removed)
+    assert len(specs) == len(names)

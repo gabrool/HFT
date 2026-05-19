@@ -3516,9 +3516,8 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             or name.startswith("trade_imbalance_notional_")
             or name.startswith("regime_flow_imbalance_")
             or name.startswith("depth_imbalance_5bps_mean_")
-            or name == "micro_minus_mid_over_spread"
         ):
-            s = ratio(name) if name == "micro_minus_mid_over_spread" else bounded(name)
+            s = bounded(name)
         elif name.startswith("spread_z_") or name.startswith("depth_5bps_z_"):
             s = clip(name)
         elif name.startswith("time_since") or name.startswith("time_since_last_"):
@@ -3529,26 +3528,14 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bounded(name)
         elif name.startswith("consecutive_buy_trade_count") or name.startswith("consecutive_sell_trade_count"):
             s = log_ewma(name, XFORM_HL_FAST_MS)
-        elif name in {"ofi_l1", "ofi_l3", "ofi_l5", "ofi_l10"}:
+        elif name in {"ofi_l1", "ofi_l3", "ofi_l5"}:
             s = signed_log_ewma(name, XFORM_HL_FAST_MS)
         elif (name.startswith("ofi_l") and ("_over_depth_" in name or "_sum_over_depth_" in name or "_accel_" in name)) or name.startswith("ofi_l1_pressure_over_depth_5bps_") or name.startswith("ofi_l1_pressure_over_realized_vol_"):
             s = bps_tanh(name, scale=1.0)
-        elif name.startswith("ofi_l1_pressure_ewma_"):
-            s = signed_log_ewma(name, XFORM_HL_FAST_MS)
         elif name.startswith("mid_ret_bps_") or name.startswith("micro_ret_bps_"):
             s = bps(name, scale=2.0)
         elif name.startswith("mid_slope_bps_per_sec_") or name.startswith("micro_l5_slope_") or name.startswith("spread_widening_slope_bps_per_sec_"):
             s = bps(name, scale=10.0)
-        elif name == "micro_premia":
-            s = FeatureTransformSpec(
-                name="micro_premia",
-                raw_transform=RawTransformKind.IDENTITY,
-                normalize=NormalizeKind.NONE,
-                half_life_ms=0,
-                scale=1.0,
-                input_clip_abs=0.0,
-                output_clip_abs=1.5,
-            )
         elif name == "micro_minus_mid_bps" or name.startswith("micro_l") and name.endswith("_minus_mid_bps") or name.startswith("vamp_l") and name.endswith("_minus_mid_bps") or name == "micro_l1_minus_micro_l10_bps":
             s = bps(name, scale=2.0)
         elif name.startswith("vwap_vs_mid_bps_") or name.startswith("signed_trade_premium_bps_volume_weighted_"):
