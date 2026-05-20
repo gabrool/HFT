@@ -6,6 +6,18 @@ import pytest
 import linear_feature_importance as lfi
 
 
+def test_base_names_synthesizes_missing_aux_names():
+    meta = {"feature_names": ["f0", "f1", "f2"]}
+    names = lfi._base_names_from_meta(meta, expected_total=5)
+    assert names == ["f0", "f1", "f2", "aux_003", "aux_004"]
+
+
+def test_base_names_errors_if_too_many_names():
+    meta = {"feature_names": ["f0", "f1", "f2"]}
+    with pytest.raises(ValueError, match="exceeds expected"):
+        lfi._base_names_from_meta(meta, expected_total=2)
+
+
 def test_raw_linear_feature_name_mapping():
     rows = lfi._build_raw_linear_extracted_names(["a", "b"], ["last", "delta_lag_1", "mean_w_5"])
     assert [r["extracted_feature_name"] for r in rows] == ["a:last", "b:last", "a:delta_lag_1", "b:delta_lag_1", "a:mean_w_5", "b:mean_w_5"]

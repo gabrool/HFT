@@ -35,15 +35,27 @@ def _build_raw_linear_extracted_names(base_names: list[str], blocks: list[str]) 
     return rows
 
 
-def _base_names_from_meta(meta: dict[str, Any]) -> list[str]:
+def _base_names_from_meta(meta: dict[str, Any], expected_total: int | None = None) -> list[str]:
     if isinstance(meta.get("feature_names"), list):
-        return list(meta.get("feature_names") or []) + list(meta.get("aux_feature_names") or [])
-    if isinstance(meta.get("raw_feature_names"), list):
-        return list(meta.get("raw_feature_names") or [])
-    out = list(meta.get("core_feature_names") or []) + list(meta.get("aux_feature_names") or [])
-    if out:
-        return out
-    raise ValueError("Unable to resolve base names from meta.json")
+        names = list(meta.get("feature_names") or []) + list(meta.get("aux_feature_names") or [])
+    elif isinstance(meta.get("raw_feature_names"), list):
+        names = list(meta.get("raw_feature_names") or [])
+    else:
+        names = list(meta.get("core_feature_names") or []) + list(meta.get("aux_feature_names") or [])
+
+    if not names:
+        raise ValueError("Unable to resolve base names from meta.json")
+
+    if expected_total is not None:
+        if len(names) > expected_total:
+            raise ValueError(
+                f"base name count exceeds expected feature_dim_total: got {len(names)} expected={expected_total}"
+            )
+
+        if len(names) < expected_total:
+            names = names + [f"aux_{i:03d}" for i in range(len(names), expected_total)]
+
+    return names
 
 
 def _parse_keep_indices(pb) -> np.ndarray:
@@ -342,7 +354,7 @@ def main() -> None:
     if str(st4.get("extractor") or st2.get("extractor_config", {}).get("name") or "").strip().lower() != "raw_linear":
         raise ValueError("linear_feature_importance.py currently supports raw_linear only")
     bundle = load_linear_sklearn_bundle(Path(str(st4["best_model_path"]))); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"])))
-    kept_indices = _parse_keep_indices(pb); base_names = _base_names_from_meta(meta); blocks = list((st2.get("extractor_summary", {}) or {}).get("blocks") or [])
+    kept_indices = _parse_keep_indices(pb); expected_total = int(st2["feature_dim_total"]); base_names = _base_names_from_meta(meta, expected_total=expected_total); blocks = list((st2.get("extractor_summary", {}) or {}).get("blocks") or [])
 
     if len(base_names) != int(st2["feature_dim_total"]):
         raise ValueError(f"base name count mismatch: got {len(base_names)} expected feature_dim_total={st2['feature_dim_total']}")
