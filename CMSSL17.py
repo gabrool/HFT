@@ -462,7 +462,7 @@ def coerce_ts_ms(value: Union[int, float, str]) -> int:
 
 
 # ---------------------------  Core hyper-params  ---------------------------
-LOOKBACK        = 100        # canonical event-time token lookback
+LOOKBACK        = 10        # canonical event-time token lookback
 WINDOW_MS       = 10_000     # canonical rolling window span (10s)
 PAD_DT_FOR_LEFT = 0.0
 BATCH_SIZE      = 512
@@ -690,18 +690,18 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned172_xformv2"
-FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned172"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned159_lb10_xformv2"
+FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned159_lb10"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
-FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned172"
+FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned159_lb10"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
 CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
     + "p"
     + "ca"
-    + f"-pruned172-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
+    + f"-pruned159_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
 )
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -801,7 +801,7 @@ LARGE_TRADE_MAX_SIGNED_WINDOWS_MS = (500, 1_000)
 # - 500/1000ms: change + slope + minus_ema
 CVD_CHANGE_WINDOWS_MS = (500, 1_000)
 CVD_SLOPE_WINDOWS_MS = (200, 500, 1_000)
-CVD_MINUS_EMA_WINDOWS_MS = (200, 500, 1_000)
+CVD_MINUS_EMA_WINDOWS_MS = (500, 1_000)
 
 # Retained replenishment/depletion outputs.
 REPLENISHMENT_KEYS_BY_WINDOW = {
@@ -841,9 +841,7 @@ INTERNAL_DEPTH_BPS_BANDS = (1.0, 5.0)
 BPS_DEPTH_BANDS = EMIT_DEPTH_BPS_BANDS
 CALENDAR_CONTEXT_FEATURES = (
     "utc_hour_sin",
-    "utc_hour_cos",
     "utc_dow_sin",
-    "utc_dow_cos",
     "is_weekend",
 )
 NOTIONAL_CONTEXT_FEATURES = (
@@ -3491,7 +3489,7 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
     specs: List[FeatureTransformSpec] = []
     for name in feature_names:
         s: Optional[FeatureTransformSpec] = None
-        if name in {"utc_hour_sin", "utc_hour_cos", "utc_dow_sin", "utc_dow_cos", "is_weekend"}:
+        if name in {"utc_hour_sin", "utc_dow_sin", "is_weekend"}:
             s = bounded(name, out=1.0)
         elif name in {"bid_l1_notional_usd", "ask_l1_notional_usd", "bid_depth_notional_5bps", "ask_depth_notional_5bps", "total_depth_notional_5bps"}:
             s = log_pos_scale(name, scale=10.0, out=3.0)
@@ -3522,7 +3520,7 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = clip(name)
         elif name.startswith("time_since") or name.startswith("time_since_last_"):
             s = log_ms(name)
-        elif name in {"last_trade_side_sign", "last_tick_sign", "last_is_zero_tick"}:
+        elif name in {"last_trade_side_sign", "last_tick_sign"}:
             s = bounded(name, out=1.0)
         elif name.startswith("trade_toxicity_") or name.startswith("tick_imbalance_") or name.startswith("tick_sign_imbalance_") or name.startswith("zero_tick_fraction_"):
             s = bounded(name)
@@ -3581,7 +3579,7 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bounded(name)
         elif name.startswith("signed_notional_flow_usd_") or name.startswith("cvd_") or name.startswith("max_signed_trade_notional_usd_"):
             s = signed_log_ewma(name, XFORM_HL_MEDIUM_MS)
-        elif name == "last_trade_notional_usd" or name.startswith("top5_trade_notional_sum_usd_") or name.startswith("top_trade_notional_sum_usd_"):
+        elif name.startswith("top5_trade_notional_sum_usd_") or name.startswith("top_trade_notional_sum_usd_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
         elif name.startswith("absorption_bid_") or name.startswith("absorption_ask_"):
             # Retained absorption features are strictly nonnegative scaled notional measures.
@@ -4005,10 +4003,8 @@ class FeatureEngine:
 
         # Tick-direction & RPI tracking
         self.last_tick_sign: int = 0
-        self.last_is_zero_tick: int = 0
         self.last_trade_price: Optional[float] = None
         self.last_trade_side_sign: float = 0.0
-        self.last_trade_notional_usd: float = 0.0
         self.last_buy_trade_ts: Optional[int] = None
         self.last_sell_trade_ts: Optional[int] = None
 
@@ -4123,7 +4119,7 @@ class FeatureEngine:
             ])
         for ms in FAST_WINDOWS_MS:
             names.extend([
-                f"spread_change_count_{ms}ms",
+                *([f"spread_change_count_{ms}ms"] if ms == 500 else []),
                 f"bid_price_change_rate_{ms}ms",
                 f"bid_l1_depletion_{ms}ms",
                 f"ask_l1_depletion_{ms}ms",
@@ -4145,8 +4141,8 @@ class FeatureEngine:
                 *([f"signed_notional_flow_usd_{ms}ms"] if ms == 200 else []),
                 f"signed_trade_count_imbalance_{ms}ms",
                 *([f"trade_imbalance_notional_{ms}ms"] if ms != 200 else []),
-                f"trade_toxicity_notional_{ms}ms",
-                f"zero_tick_fraction_{ms}ms",
+                *([f"trade_toxicity_notional_{ms}ms"] if ms != 1000 else []),
+                *([f"zero_tick_fraction_{ms}ms"] if ms != 500 else []),
                 f"tick_sign_imbalance_{ms}ms",
                 f"trade_count_per_second_{ms}ms",
                 f"vwap_vs_mid_bps_{ms}ms",
@@ -4155,8 +4151,6 @@ class FeatureEngine:
         names.extend([
             "last_trade_side_sign",
             "last_tick_sign",
-            "last_is_zero_tick",
-            "last_trade_notional_usd",
             "time_since_last_buy_trade_ms",
             "time_since_last_sell_trade_ms",
         ])
@@ -4164,7 +4158,7 @@ class FeatureEngine:
             names.extend([
                 *([f"cvd_change_usd_{ms}ms"] if ms != 200 else []),
                 f"cvd_slope_usd_per_sec_{ms}ms",
-                f"cvd_minus_ema_usd_{ms}ms",
+                *([f"cvd_minus_ema_usd_{ms}ms"] if ms != 200 else []),
             ])
         names.extend([
             "consecutive_buy_trade_count",
@@ -4183,16 +4177,16 @@ class FeatureEngine:
         names.append("return_std_bps_200ms")
         for ms in REGIME_WINDOWS_MS:
             names.extend([
-                *([] if ms == 1_000 else [f"regime_volume_ewma_{ms}ms"]),
+                f"regime_volume_ewma_{ms}ms",
                 *([f"regime_flow_imbalance_{ms}ms"] if ms == 3_000 else []),
                 f"down_up_vol_imbalance_{ms}ms",
-                f"max_abs_return_bps_{ms}ms",
+                *([f"max_abs_return_bps_{ms}ms"] if ms == 500 else []),
             ])
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
             names.extend([
                 f"spread_z_{ms}ms",
-                f"spread_widening_slope_bps_per_sec_{ms}ms",
-                f"depth_5bps_z_{ms}ms",
+                *([f"spread_widening_slope_bps_per_sec_{ms}ms"] if ms != 3000 else []),
+                *([f"depth_5bps_z_{ms}ms"] if ms != 1000 else []),
                 f"depth_imbalance_5bps_mean_{ms}ms",
                 f"depth_imbalance_5bps_slope_{ms}ms",
             ])
@@ -4207,7 +4201,7 @@ class FeatureEngine:
             "ofi_l3_sum_over_depth_1000ms", "ofi_l3_sum_over_depth_500ms",
             "ofi_l3_sum_over_depth_200ms", "ofi_l10", "ofi_l1_pressure_ewma_200ms",
             "ofi_l1_pressure_ewma_500ms", "ofi_l1_pressure_ewma_1000ms",
-            "bid_l1_depletion_over_depth_200ms", "regime_volume_ewma_1000ms",
+            "bid_l1_depletion_over_depth_200ms",
         }
         present_removed = sorted(set(names) & removed_features)
         if present_removed:
@@ -5719,8 +5713,8 @@ class FeatureEngine:
             if ms != 200:
                 feat_list.append(s["trade_imbalance_notional"])
             feat_list.extend([
-                s["trade_toxicity_notional"],
-                s["zero_tick_fraction"],
+                *([s["trade_toxicity_notional"]] if ms != 1000 else []),
+                *([s["zero_tick_fraction"]] if ms != 500 else []),
                 s["tick_sign_imbalance"],
                 s["trade_count_per_second"],
                 s["vwap_vs_mid_bps"],
@@ -5729,8 +5723,6 @@ class FeatureEngine:
         feat_list.extend([
             float(self.last_trade_side_sign),
             float(self.last_tick_sign),
-            float(self.last_is_zero_tick),
-            float(self.last_trade_notional_usd),
             float(ts_ms - self.last_buy_trade_ts) if self.last_buy_trade_ts is not None else 0.0,
             float(ts_ms - self.last_sell_trade_ts) if self.last_sell_trade_ts is not None else 0.0,
         ])
@@ -5740,7 +5732,7 @@ class FeatureEngine:
                 feat_list.append(c["cvd_change_usd"])
             feat_list.extend([
                 c["cvd_slope_usd_per_sec"],
-                c["cvd_minus_ema_usd"],
+                *([c["cvd_minus_ema_usd"]] if ms != 200 else []),
             ])
         feat_list.extend([
             consecutive_buy_trade_count,
@@ -5778,7 +5770,7 @@ class FeatureEngine:
                 feat_list.append(regime_flow_snapshot[ms])
             feat_list.extend([
                 dist["down_up_vol_imbalance"],
-                dist["max_abs_return_bps"],
+                *([dist["max_abs_return_bps"]] if ms == 500 else []),
             ])
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
             spread_win = self._spread_bps_regime_states[ms]
@@ -5928,7 +5920,6 @@ class FeatureEngine:
 
             tick_dir = trade_evt.get("tickDirection")
             tick_sign = float(int(self.last_tick_sign))
-            is_zero_tick = float(int(self.last_is_zero_tick))
 
             if tick_dir is not None:
                 td_sign, td_zero = self._interpret_tick_direction(tick_dir)
@@ -5949,12 +5940,10 @@ class FeatureEngine:
                 tick_sign, is_zero_tick = 0.0, 0.0
 
         self.last_tick_sign = int(tick_sign)
-        self.last_is_zero_tick = int(is_zero_tick)
         self.last_trade_price = float(price)
 
         notional_usd = float(price) * float(size)
         self.last_trade_side_sign = float(side_sign)
-        self.last_trade_notional_usd = float(notional_usd)
         if side_sign > 0:
             self.last_buy_trade_ts = int(ts_ms)
             self.consecutive_buy_trade_count += 1
