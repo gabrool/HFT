@@ -663,11 +663,19 @@ class AeonRocketExtractor(LinearExtractorBase):
     def __init__(
         self,
         name: str,
+        *,
         n_kernels: int = 10000,
-        n_groups: int = 64,
         hydra_n_kernels: int = 8,
+        n_groups: int = 64,
         n_jobs: int = 1,
         random_state: int = 17,
+        channel_filter_enabled: Optional[bool] = None,
+        channel_filter_std_eps: Optional[float] = None,
+        channel_filter_max_const_frac: Optional[float] = None,
+        channel_filter_min_p95_std: Optional[float] = None,
+        channel_filter_min_keep_channels: Optional[int] = None,
+        constant_fallback_enabled: Optional[bool] = None,
+        constant_fallback_eps: Optional[float] = None,
     ):
         name = str(name).strip().lower()
         if name not in self.ALLOWED_NAMES:
@@ -686,13 +694,41 @@ class AeonRocketExtractor(LinearExtractorBase):
         self.channel_filter_summary: Dict[str, Any] = {}
         self.n_input_channels_: Optional[int] = None
         self.n_kept_channels_: Optional[int] = None
-        self.channel_filter_enabled = bool(int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER", "1")))
-        self.channel_filter_std_eps = float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_STD_EPS", "1e-7"))
-        self.channel_filter_max_const_frac = float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MAX_CONST_FRAC", "0.995"))
-        self.channel_filter_min_p95_std = float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_P95_STD", "1e-7"))
-        self.channel_filter_min_keep_channels = int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_KEEP_CHANNELS", "16"))
-        self.constant_fallback_enabled = bool(int(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK", "1")))
-        self.constant_fallback_eps = float(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK_EPS", "1e-6"))
+        self.channel_filter_enabled = (
+            bool(int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER", "1")))
+            if channel_filter_enabled is None
+            else bool(channel_filter_enabled)
+        )
+        self.channel_filter_std_eps = (
+            float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_STD_EPS", "1e-7"))
+            if channel_filter_std_eps is None
+            else float(channel_filter_std_eps)
+        )
+        self.channel_filter_max_const_frac = (
+            float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MAX_CONST_FRAC", "0.995"))
+            if channel_filter_max_const_frac is None
+            else float(channel_filter_max_const_frac)
+        )
+        self.channel_filter_min_p95_std = (
+            float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_P95_STD", "1e-7"))
+            if channel_filter_min_p95_std is None
+            else float(channel_filter_min_p95_std)
+        )
+        self.channel_filter_min_keep_channels = (
+            int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_KEEP_CHANNELS", "16"))
+            if channel_filter_min_keep_channels is None
+            else int(channel_filter_min_keep_channels)
+        )
+        self.constant_fallback_enabled = (
+            bool(int(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK", "1")))
+            if constant_fallback_enabled is None
+            else bool(constant_fallback_enabled)
+        )
+        self.constant_fallback_eps = (
+            float(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK_EPS", "1e-6"))
+            if constant_fallback_eps is None
+            else float(constant_fallback_eps)
+        )
         self.constant_fallback_fit_fixed_pairs = 0
         self.constant_fallback_transform_fixed_pairs = 0
 
@@ -751,6 +787,13 @@ class AeonRocketExtractor(LinearExtractorBase):
                         hydra_n_kernels=self.hydra_n_kernels,
                         n_jobs=self.n_jobs,
                         random_state=self.random_state,
+                        channel_filter_enabled=self.channel_filter_enabled,
+                        channel_filter_std_eps=self.channel_filter_std_eps,
+                        channel_filter_max_const_frac=self.channel_filter_max_const_frac,
+                        channel_filter_min_p95_std=self.channel_filter_min_p95_std,
+                        channel_filter_min_keep_channels=self.channel_filter_min_keep_channels,
+                        constant_fallback_enabled=self.constant_fallback_enabled,
+                        constant_fallback_eps=self.constant_fallback_eps,
                     ),
                     AeonRocketExtractor(
                         "hydra",
@@ -759,6 +802,13 @@ class AeonRocketExtractor(LinearExtractorBase):
                         hydra_n_kernels=self.hydra_n_kernels,
                         n_jobs=self.n_jobs,
                         random_state=self.random_state,
+                        channel_filter_enabled=self.channel_filter_enabled,
+                        channel_filter_std_eps=self.channel_filter_std_eps,
+                        channel_filter_max_const_frac=self.channel_filter_max_const_frac,
+                        channel_filter_min_p95_std=self.channel_filter_min_p95_std,
+                        channel_filter_min_keep_channels=self.channel_filter_min_keep_channels,
+                        constant_fallback_enabled=self.constant_fallback_enabled,
+                        constant_fallback_eps=self.constant_fallback_eps,
                     ),
                 ],
             )
@@ -899,6 +949,15 @@ def build_linear_extractor_from_config(config: Dict[str, Any]) -> LinearExtracto
             include_slope=bool(config.get("raw_include_slope", False)),
         )
     if name in AeonRocketExtractor.ALLOWED_NAMES:
+        rocket_kwargs = dict(
+            channel_filter_enabled=bool(int(config.get("rocket_channel_filter", 1))),
+            channel_filter_std_eps=float(config.get("rocket_channel_filter_std_eps", 1e-7)),
+            channel_filter_max_const_frac=float(config.get("rocket_channel_filter_max_const_frac", 0.995)),
+            channel_filter_min_p95_std=float(config.get("rocket_channel_filter_min_p95_std", 1e-7)),
+            channel_filter_min_keep_channels=int(config.get("rocket_channel_filter_min_keep_channels", 16)),
+            constant_fallback_enabled=bool(int(config.get("rocket_constant_fallback", 1))),
+            constant_fallback_eps=float(config.get("rocket_constant_fallback_eps", 1e-6)),
+        )
         return AeonRocketExtractor(
             name=name,
             n_kernels=int(config.get("n_kernels", 10000)),
@@ -906,5 +965,6 @@ def build_linear_extractor_from_config(config: Dict[str, Any]) -> LinearExtracto
             n_groups=int(config.get("n_groups", 64)),
             n_jobs=int(config.get("n_jobs", 1)),
             random_state=int(config.get("random_state", 17)),
+            **rocket_kwargs,
         )
     raise ValueError(f"Unsupported linear extractor {name!r}")
