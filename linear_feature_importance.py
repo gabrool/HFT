@@ -82,14 +82,29 @@ def build_flat_importance_df(*, extracted_rows: list[dict], kept_indices: np.nda
 
 def aggregate_importance_by_base(flat_df: pd.DataFrame, base_names: list[str], blocks: list[str]) -> pd.DataFrame:
     rows = []
-    for name, g in flat_df.groupby("base_feature_name"):
+    for bi, name in enumerate(base_names):
+        g = flat_df[flat_df["base_feature_name"] == name]
+        if g.empty:
+            rows.append({
+                "base_feature_name": name,
+                "base_feature_index": bi,
+                "n_kept_columns": 0,
+                "n_total_columns": len(blocks),
+                "dir_importance_l2": 0.0,
+                "mag_importance_l2": 0.0,
+                "all_importance_l2": 0.0,
+                "dir_importance_1000ms_l2": 0.0,
+                "mag_importance_1000ms_l2": 0.0,
+                "all_importance_1000ms_l2": 0.0,
+            })
+            continue
         d = g[["dir_abs_coef_200ms", "dir_abs_coef_500ms", "dir_abs_coef_1000ms"]].to_numpy().reshape(-1)
         u = g[["mag_up_abs_coef_200ms", "mag_up_abs_coef_500ms", "mag_up_abs_coef_1000ms", "mag_down_abs_coef_200ms", "mag_down_abs_coef_500ms", "mag_down_abs_coef_1000ms"]].to_numpy().reshape(-1)
         rows.append({
             "base_feature_name": name,
             "n_kept_columns": int(len(g)),
             "n_total_columns": int(len(blocks)),
-            "base_feature_index": int(base_names.index(name)),
+            "base_feature_index": bi,
             "dir_importance_l2": float(np.sqrt(np.sum(d ** 2))),
             "mag_importance_l2": float(np.sqrt(np.sum(u ** 2))),
             "all_importance_l2": float(np.sqrt(np.sum(d ** 2) + np.sum(u ** 2))),
@@ -99,10 +114,10 @@ def aggregate_importance_by_base(flat_df: pd.DataFrame, base_names: list[str], b
     out = pd.DataFrame(rows)
     out["all_importance_1000ms_l2"] = np.sqrt(out["dir_importance_1000ms_l2"] ** 2 + out["mag_importance_1000ms_l2"] ** 2)
     for c in ("dir", "mag", "all"):
-        denom = float(out[f"{c}_importance_l2"].sum()) or 1.0
-        out[f"{c}_importance_l2_share"] = out[f"{c}_importance_l2"] / denom
-        denom_1s = float(out[f"{c}_importance_1000ms_l2"].sum()) or 1.0
-        out[f"{c}_importance_1000ms_l2_share"] = out[f"{c}_importance_1000ms_l2"] / denom_1s
+        denom = float(out[f"{c}_importance_l2"].sum())
+        out[f"{c}_importance_l2_share"] = out[f"{c}_importance_l2"] / denom if denom > 0 else 0.0
+        denom_1s = float(out[f"{c}_importance_1000ms_l2"].sum())
+        out[f"{c}_importance_1000ms_l2_share"] = out[f"{c}_importance_1000ms_l2"] / denom_1s if denom_1s > 0 else 0.0
     return out
 
 
@@ -123,7 +138,8 @@ def add_low_importance_flags(base_df: pd.DataFrame, *, low_share: float, low_dir
     out = base_df.copy()
     out["low_importance_candidate"] = (out["all_importance_l2_share"] <= low_share) & (out["dir_importance_l2_share"] <= low_dir_share) & (out["mag_importance_l2_share"] <= low_mag_share)
     absmax = flat_df.groupby("base_feature_name")["all_abs_coef_max"].max()
-    out["zero_or_near_zero_all_heads"] = out["base_feature_name"].map(absmax <= coef_eps).fillna(False)
+    mapped = out["base_feature_name"].map(absmax).fillna(0.0)
+    out["zero_or_near_zero_all_heads"] = mapped <= coef_eps
     return out
 
 
@@ -161,7 +177,83 @@ def _group_columns(flat_rows: list[dict], feature_name: str) -> dict[str, list[i
 
 
 def _direction_kept_mask_1s(y: np.ndarray) -> np.ndarray:
+    # Fallback kept-row mask when Stage 4 trim stats are unavailable.
+    # Matches the basic finite, nonzero 1000ms target filter.
     return np.isfinite(y[:, 2]) & (y[:, 2] != 0.0)
+
+
+def _binary_auc_np(scores: np.ndarray, truth: np.ndarray) -> float:
+    scores = np.asarray(scores, dtype=np.float64)
+    truth = np.asarray(truth, dtype=bool)
+    if scores.size == 0 or truth.size == 0:
+        return math.nan
+    n_pos = int(truth.sum())
+    n_neg = int((~truth).sum())
+    if n_pos == 0 or n_neg == 0:
+        return math.nan
+
+    order = np.argsort(scores)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, scores.size + 1, dtype=np.float64)
+
+    sorted_scores = scores[order]
+    i = 0
+    while i < scores.size:
+        j = i + 1
+        while j < scores.size and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        if j - i > 1:
+            avg = 0.5 * (i + 1 + j)
+            ranks[order[i:j]] = avg
+        i = j
+
+    sum_pos_ranks = float(ranks[truth].sum())
+    return float((sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+def _balanced_acc_bool(pred: np.ndarray, truth: np.ndarray) -> float:
+    pred = np.asarray(pred, dtype=bool)
+    truth = np.asarray(truth, dtype=bool)
+    if pred.size == 0:
+        return math.nan
+
+    pos = truth
+    neg = ~truth
+    tpr = float((pred[pos] == truth[pos]).mean()) if np.any(pos) else math.nan
+    tnr = float((pred[neg] == truth[neg]).mean()) if np.any(neg) else math.nan
+
+    vals = np.asarray([tpr, tnr], dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    return float(vals.mean()) if vals.size else math.nan
+
+
+def _safe_spearman_np(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 3:
+        return math.nan
+    if np.all(x == x[0]) or np.all(y == y[0]):
+        return math.nan
+
+    rx = pd.Series(x).rank(method="average").to_numpy(dtype=np.float64)
+    ry = pd.Series(y).rank(method="average").to_numpy(dtype=np.float64)
+    cx = rx - rx.mean()
+    cy = ry - ry.mean()
+    denom = float(np.sqrt(np.sum(cx * cx) * np.sum(cy * cy)))
+    return float(np.sum(cx * cy) / denom) if denom > 0 else math.nan
+
+
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    out = np.empty_like(x, dtype=np.float64)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    exp_x = np.exp(x[~pos])
+    out[~pos] = exp_x / (1.0 + exp_x)
+    return out
 
 
 def _huber_np(err: np.ndarray, delta: float = 1.0) -> float:
@@ -191,16 +283,15 @@ def _get_mag_scales(bundle: Any, st4: dict[str, Any]) -> tuple[np.ndarray, np.nd
     return up, dn
 
 
-def compute_ablation_metrics(*, y: np.ndarray, pred: dict[str, np.ndarray], mag_up_scale_bps: np.ndarray, mag_down_scale_bps: np.ndarray) -> dict[str, float]:
-    import linear_offline
+def compute_ablation_metrics(*, y: np.ndarray, pred: dict[str, np.ndarray], mag_up_scale_bps: np.ndarray, mag_down_scale_bps: np.ndarray, dir_kept_mask_1s: np.ndarray | None = None) -> dict[str, float]:
     h = 2
     scores = pred["dir_logits"][:, h]
-    kept = _direction_kept_mask_1s(y)
+    kept = _direction_kept_mask_1s(y) if dir_kept_mask_1s is None else np.asarray(dir_kept_mask_1s, dtype=bool).reshape(-1)
     truth_kept = y[kept, h] > 0.0
     scores_kept = scores[kept]
-    p_kept = 1.0 / (1.0 + np.exp(-scores_kept))
-    auc = linear_offline._binary_auc_np(scores_kept, truth_kept) if scores_kept.size else math.nan
-    bal = linear_offline._balanced_acc_bool(scores_kept >= 0.0, truth_kept) if scores_kept.size else math.nan
+    p_kept = _sigmoid_np(scores_kept)
+    auc = _binary_auc_np(scores_kept, truth_kept) if scores_kept.size else math.nan
+    bal = _balanced_acc_bool(scores_kept >= 0.0, truth_kept) if scores_kept.size else math.nan
     bce = float(-np.mean(truth_kept * np.log(np.clip(p_kept, 1e-8, 1.0)) + (1.0 - truth_kept) * np.log(np.clip(1.0 - p_kept, 1e-8, 1.0)))) if scores_kept.size else math.nan
     up_rows = y[:, h] > 0.0
     dn_rows = y[:, h] < 0.0
@@ -208,16 +299,16 @@ def compute_ablation_metrics(*, y: np.ndarray, pred: dict[str, np.ndarray], mag_
     up_h = _huber_np(pred["mag_up_log"][up_rows, h] - np.log1p(y[up_rows, h] / up_scale)) if np.any(up_rows) else math.nan
     dn_h = _huber_np(pred["mag_down_log"][dn_rows, h] - np.log1p((-y[dn_rows, h]) / dn_scale)) if np.any(dn_rows) else math.nan
     side_h = _safe_nanmean_pair(up_h, dn_h)
-    up_sp = linear_offline._safe_spearman_np(pred["mag_up_bps"][up_rows, h], y[up_rows, h]) if np.any(up_rows) else math.nan
-    dn_sp = linear_offline._safe_spearman_np(pred["mag_down_bps"][dn_rows, h], -y[dn_rows, h]) if np.any(dn_rows) else math.nan
+    up_sp = _safe_spearman_np(pred["mag_up_bps"][up_rows, h], y[up_rows, h]) if np.any(up_rows) else math.nan
+    dn_sp = _safe_spearman_np(pred["mag_down_bps"][dn_rows, h], -y[dn_rows, h]) if np.any(dn_rows) else math.nan
     side_sp = _safe_nanmean_pair(up_sp, dn_sp)
-    p_all = 1.0 / (1.0 + np.exp(-scores))
+    p_all = _sigmoid_np(scores)
     edge = p_all * pred["mag_up_bps"][:, h] - (1.0 - p_all) * pred["mag_down_bps"][:, h]
     return {
         "dir_auc_kept_1000ms": float(auc), "dir_bal_acc_kept_1000ms": float(bal), "dir_bce_kept_1000ms": float(bce),
         "mean_side_log_huber_cond_1000ms": float(side_h), "mean_side_spearman_cond_1000ms": float(side_sp),
-        "edge_spearman_all_1000ms": float(linear_offline._safe_spearman_np(edge, y[:, h])),
-        "edge_spearman_kept_1000ms": float(linear_offline._safe_spearman_np(edge[kept], y[kept, h])) if np.any(kept) else math.nan,
+        "edge_spearman_all_1000ms": float(_safe_spearman_np(edge, y[:, h])),
+        "edge_spearman_kept_1000ms": float(_safe_spearman_np(edge[kept], y[kept, h])) if np.any(kept) else math.nan,
     }
 
 
@@ -273,7 +364,14 @@ def main() -> None:
         Z = np.concatenate(z_parts, axis=0); y = np.concatenate(y_parts, axis=0)
         base_pred = bundle.predict_dict_np(Z)
         mag_up_scale_bps, mag_down_scale_bps = _get_mag_scales(bundle, st4)
-        base_metrics = compute_ablation_metrics(y=y, pred=base_pred, mag_up_scale_bps=mag_up_scale_bps, mag_down_scale_bps=mag_down_scale_bps)
+        # Matches Stage 4 dir_auc_kept semantics: signed side-trim kept rows at 1000ms.
+        _kp, _kn, keep_signed = linear_offline.build_signed_side_trim_masks_from_stats_np(
+            y, linear_offline.stats_dict_to_arrays(st4["signed_raw_stats"])
+        )
+        dir_kept_mask_1s = keep_signed[:, 2]
+        base_metrics = compute_ablation_metrics(
+            y=y, pred=base_pred, mag_up_scale_bps=mag_up_scale_bps, mag_down_scale_bps=mag_down_scale_bps, dir_kept_mask_1s=dir_kept_mask_1s
+        )
         groups = get_group_columns(flat_df.to_dict("records"), "base_feature_name")
         names = select_ablation_groups(base_df=base_df, low_df=low_df, top_n=int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_TOP_N", "25")), low_n=int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_LOW_N", "50")), groups_spec=os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_GROUPS", "low_importance,top_direction,top_magnitude,top_all"), all_base=int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_ALL_BASE", "0")) == 1)
         for name in names:
@@ -281,7 +379,9 @@ def main() -> None:
             if cols.size == 0:
                 continue
             Za = Z.copy(); Za[:, cols] = 0.0
-            m = compute_ablation_metrics(y=y, pred=bundle.predict_dict_np(Za), mag_up_scale_bps=mag_up_scale_bps, mag_down_scale_bps=mag_down_scale_bps)
+            m = compute_ablation_metrics(
+                y=y, pred=bundle.predict_dict_np(Za), mag_up_scale_bps=mag_up_scale_bps, mag_down_scale_bps=mag_down_scale_bps, dir_kept_mask_1s=dir_kept_mask_1s
+            )
             row = {"group_type": "base_feature", "group_name": name, "n_columns_zeroed": int(cols.size)}
             for k in base_metrics:
                 row[f"baseline_{k}"] = base_metrics[k]; row[f"ablated_{k}"] = m[k]; row[f"delta_{k}"] = float(m[k] - base_metrics[k])

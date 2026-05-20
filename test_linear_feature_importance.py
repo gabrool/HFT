@@ -81,6 +81,43 @@ def test_ablation_metric_semantics():
     assert m["edge_spearman_kept_1000ms"] != m["edge_spearman_all_1000ms"]
 
 
+def test_sigmoid_np_extreme_values():
+    x = np.array([-1000.0, 0.0, 1000.0])
+    y = lfi._sigmoid_np(x)
+    assert np.isfinite(y).all()
+    assert y[0] < 1e-12
+    assert np.isclose(y[1], 0.5)
+    assert y[2] > 1.0 - 1e-12
+
+
+def test_aggregate_base_includes_zero_kept_features():
+    rows = lfi._build_raw_linear_extracted_names(["a", "b"], ["last", "delta_lag_1"])
+    flat = lfi.build_flat_importance_df(
+        extracted_rows=rows,
+        kept_indices=np.array([0, 2]),
+        dir_coefs=_coefs([[1, 2], [1, 2], [1, 2]]),
+        mag_up_coefs=_coefs([[0, 0], [0, 0], [0, 0]]),
+        mag_down_coefs=_coefs([[0, 0], [0, 0], [0, 0]]),
+    )
+    base = lfi.aggregate_importance_by_base(flat, ["a", "b"], ["last", "delta_lag_1"])
+    idx = base.set_index("base_feature_name")
+    assert "b" in idx.index
+    assert idx.loc["b", "n_kept_columns"] == 0
+    assert idx.loc["b", "all_importance_l2"] == 0.0
+
+    flagged = lfi.add_low_importance_flags(
+        base,
+        low_share=5e-4,
+        low_dir_share=5e-4,
+        low_mag_share=5e-4,
+        coef_eps=1e-10,
+        flat_df=flat,
+    )
+    fidx = flagged.set_index("base_feature_name")
+    assert bool(fidx.loc["b", "low_importance_candidate"])
+    assert bool(fidx.loc["b", "zero_or_near_zero_all_heads"])
+
+
 def test_get_mag_scales_fallback_to_stage4_config():
     class Bundle:
         pass
