@@ -4864,9 +4864,7 @@ class FeatureEngine:
 
         return [
             math.sin(hour_angle),
-            math.cos(hour_angle),
             math.sin(dow_angle),
-            math.cos(dow_angle),
             1.0 if dt.weekday() >= 5 else 0.0,
         ]
 
