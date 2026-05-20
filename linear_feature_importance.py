@@ -283,6 +283,28 @@ def _get_mag_scales(bundle: Any, st4: dict[str, Any]) -> tuple[np.ndarray, np.nd
     return up, dn
 
 
+def _get_signed_raw_stats(
+    *,
+    linear_out_dir: Path,
+    st4: dict[str, Any],
+    linear_offline: Any,
+) -> dict[str, np.ndarray]:
+    """
+    Return signed side-trim stats for Stage-4-aligned kept-row masks.
+
+    Prefer signed_raw_stats embedded in linear_stage4_metrics.json if present.
+    Fall back to the Stage 1 trim-stats cache:
+        $BYBIT_LINEAR_OUT_DIR/linear_signed_side_trim_stats_cache.npz
+
+    The fallback goes through linear_offline.load_linear_trim_stats(...), which
+    also validates decision stride/offset/policy.
+    """
+    if "signed_raw_stats" in st4 and st4["signed_raw_stats"] is not None:
+        return linear_offline.stats_dict_to_arrays(st4["signed_raw_stats"])
+
+    return linear_offline.load_linear_trim_stats(Path(linear_out_dir))
+
+
 def compute_ablation_metrics(*, y: np.ndarray, pred: dict[str, np.ndarray], mag_up_scale_bps: np.ndarray, mag_down_scale_bps: np.ndarray, dir_kept_mask_1s: np.ndarray | None = None) -> dict[str, float]:
     h = 2
     scores = pred["dir_logits"][:, h]
@@ -365,8 +387,14 @@ def main() -> None:
         base_pred = bundle.predict_dict_np(Z)
         mag_up_scale_bps, mag_down_scale_bps = _get_mag_scales(bundle, st4)
         # Matches Stage 4 dir_auc_kept semantics: signed side-trim kept rows at 1000ms.
+        signed_raw_stats = _get_signed_raw_stats(
+            linear_out_dir=linear_out_dir,
+            st4=st4,
+            linear_offline=linear_offline,
+        )
         _kp, _kn, keep_signed = linear_offline.build_signed_side_trim_masks_from_stats_np(
-            y, linear_offline.stats_dict_to_arrays(st4["signed_raw_stats"])
+            y,
+            signed_raw_stats,
         )
         dir_kept_mask_1s = keep_signed[:, 2]
         base_metrics = compute_ablation_metrics(
