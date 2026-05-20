@@ -5,6 +5,7 @@ smoke-testing the linear pipeline against CMSSL's existing dataset/eval path.
 """
 
 import json
+import os
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,72 @@ LINEAR_MODEL_ARCH_SCHEMA = "linear_stage1_constant_prior_v1"
 LINEAR_EXTRACTOR_SCHEMA = "linear_extractor_stage2_v1"
 LINEAR_RAW_LINEAR_SCHEMA = "raw_linear_lag_bank_stats_v1"
 LINEAR_AEON_EXTRACTOR_SCHEMA = "aeon_rocket_hydra_stage2_v1"
+
+
+def _temporal_std_by_case_channel(X: np.ndarray) -> np.ndarray:
+    """Return temporal std for each case/channel pair from X [N, T, F] as [N, F]."""
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 3:
+        raise ValueError(f"X must have shape [N, T, F], got {X.shape}")
+    return X.std(axis=1, dtype=np.float64).astype(np.float32)
+
+
+def _fit_rocket_channel_mask(
+    X: np.ndarray,
+    *,
+    std_eps: float,
+    max_const_frac: float,
+    min_p95_std: float,
+    min_keep_channels: int,
+) -> tuple[np.ndarray, dict]:
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 3:
+        raise ValueError(f"X must have shape [N, T, F], got {X.shape}")
+    F = int(X.shape[2])
+    std_cf = _temporal_std_by_case_channel(X)
+    const_frac = np.mean(std_cf <= float(std_eps), axis=0)
+    median_std = np.percentile(std_cf, 50, axis=0)
+    p95_std = np.percentile(std_cf, 95, axis=0)
+    drop = (const_frac >= float(max_const_frac)) | (p95_std <= float(min_p95_std))
+    keep_mask = ~drop
+    kept = int(keep_mask.sum())
+    if kept < int(min_keep_channels):
+        raise ValueError(
+            f"Rocket channel filter would keep only {kept} / {F} channels; thresholds are too aggressive."
+        )
+    summary = {
+        "enabled": True,
+        "std_eps": float(std_eps),
+        "max_const_frac": float(max_const_frac),
+        "min_p95_std": float(min_p95_std),
+        "input_channels": F,
+        "kept_channels": kept,
+        "dropped_channels": int((~keep_mask).sum()),
+        "dropped_channel_indices": np.where(~keep_mask)[0].astype(int).tolist(),
+        "kept_channel_indices": np.where(keep_mask)[0].astype(int).tolist(),
+        "const_frac_dropped": const_frac[~keep_mask].astype(float).tolist(),
+        "p95_std_dropped": p95_std[~keep_mask].astype(float).tolist(),
+        "median_std_dropped": median_std[~keep_mask].astype(float).tolist(),
+    }
+    return keep_mask, summary
+
+
+def _sanitize_aeon_constant_case_channels(
+    X_aeon: np.ndarray,
+    *,
+    std_eps: float,
+    ramp_eps: float,
+) -> tuple[np.ndarray, int]:
+    std = np.asarray(X_aeon).std(axis=2)
+    bad = std <= float(std_eps)
+    n_bad = int(bad.sum())
+    if n_bad == 0:
+        return X_aeon, 0
+    X_aeon = np.array(X_aeon, dtype=np.float32, copy=True)
+    T = X_aeon.shape[2]
+    ramp = np.linspace(-0.5, 0.5, T, dtype=np.float32) * float(ramp_eps)
+    X_aeon[bad] += ramp
+    return X_aeon, n_bad
 
 
 def side_cond_log_mag_targets_np(
@@ -615,6 +682,19 @@ class AeonRocketExtractor(LinearExtractorBase):
         self.is_fitted = False
         self._output_dim: Optional[int] = None
         self.transformer: Optional[Any] = None
+        self.channel_keep_mask: Optional[np.ndarray] = None
+        self.channel_filter_summary: Dict[str, Any] = {}
+        self.n_input_channels_: Optional[int] = None
+        self.n_kept_channels_: Optional[int] = None
+        self.channel_filter_enabled = bool(int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER", "1")))
+        self.channel_filter_std_eps = float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_STD_EPS", "1e-7"))
+        self.channel_filter_max_const_frac = float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MAX_CONST_FRAC", "0.995"))
+        self.channel_filter_min_p95_std = float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_P95_STD", "1e-7"))
+        self.channel_filter_min_keep_channels = int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_KEEP_CHANNELS", "16"))
+        self.constant_fallback_enabled = bool(int(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK", "1")))
+        self.constant_fallback_eps = float(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK_EPS", "1e-6"))
+        self.constant_fallback_fit_fixed_pairs = 0
+        self.constant_fallback_transform_fixed_pairs = 0
 
     def _new_minirocket_multivariate(self) -> Any:
         import importlib
@@ -691,7 +771,7 @@ class AeonRocketExtractor(LinearExtractorBase):
             probe_transformer = self._new_transformer("minirocket")
             probe_transformer.fit(X_probe)
             return self._new_transformer("minirocket")
-        except Exception as mini_exc:
+        except (ImportError, AttributeError) as mini_exc:
             import importlib
 
             module = importlib.import_module("aeon.transformations.collection.convolution_based")
@@ -699,18 +779,63 @@ class AeonRocketExtractor(LinearExtractorBase):
                 raise ImportError("MiniRocket multivariate transformer unavailable in this aeon version") from mini_exc
             return self._new_transformer("MiniRocketMultivariate")
 
+    def _prepare_rocket_input(self, X: np.ndarray, *, phase: str) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float32)
+        if phase == "fit":
+            self.n_input_channels_ = int(X.shape[2])
+            if self.channel_filter_enabled:
+                keep_mask, summary = _fit_rocket_channel_mask(
+                    X,
+                    std_eps=self.channel_filter_std_eps,
+                    max_const_frac=self.channel_filter_max_const_frac,
+                    min_p95_std=self.channel_filter_min_p95_std,
+                    min_keep_channels=self.channel_filter_min_keep_channels,
+                )
+                self.channel_keep_mask = keep_mask
+                self.channel_filter_summary = summary
+            else:
+                self.channel_keep_mask = np.ones(X.shape[2], dtype=bool)
+                self.channel_filter_summary = {"enabled": False, "input_channels": int(X.shape[2]), "kept_channels": int(X.shape[2]), "dropped_channels": 0, "dropped_channel_indices": []}
+            print(f"[rocket-channel-filter] extractor={self.name} input_channels={self.channel_filter_summary['input_channels']} kept={self.channel_filter_summary['kept_channels']} dropped={self.channel_filter_summary['dropped_channels']} std_eps={self.channel_filter_std_eps} max_const_frac={self.channel_filter_max_const_frac} min_p95_std={self.channel_filter_min_p95_std}", flush=True)
+        if self.channel_keep_mask is None or self.n_input_channels_ is None:
+            raise RuntimeError("Rocket extractor used before fit")
+        if int(X.shape[2]) != int(self.n_input_channels_):
+            raise ValueError(f"Rocket input channel mismatch: got {X.shape[2]}, expected {self.n_input_channels_}")
+        X = X[:, :, self.channel_keep_mask]
+        self.n_kept_channels_ = int(X.shape[2])
+        X_aeon = np.ascontiguousarray(np.transpose(X, (0, 2, 1)))
+        if self.constant_fallback_enabled:
+            X_aeon, n_bad = _sanitize_aeon_constant_case_channels(
+                X_aeon,
+                std_eps=self.channel_filter_std_eps,
+                ramp_eps=self.constant_fallback_eps,
+            )
+            if phase == "fit":
+                self.constant_fallback_fit_fixed_pairs += int(n_bad)
+                if n_bad > 0:
+                    print(f"[rocket-constant-fallback] extractor={self.name} fit_fixed_case_channel_pairs={n_bad}", flush=True)
+            else:
+                self.constant_fallback_transform_fixed_pairs += int(n_bad)
+        return X_aeon
+
     def fit(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> "AeonRocketExtractor":
         X = validate_window_array(X)
         if self.name == "multirocket_hydra":
             self.transformer = self._build_transformer()
             self.transformer.fit(X, y=y)
+            self.channel_filter_summary = self.transformer.summary()
             self.is_fitted = True
             self._output_dim = self.transformer.output_dim
             return self
-        X_aeon = cmssl_windows_to_aeon(X)
+        X_aeon = self._prepare_rocket_input(X, phase="fit")
         probe = X_aeon[: min(2, X_aeon.shape[0])]
         self.transformer = self._build_transformer(probe)
-        self.transformer.fit(X_aeon)
+        try:
+            self.transformer.fit(X_aeon)
+        except ValueError as exc:
+            raise ValueError(
+                f"{self.name} aeon fit failed after channel filtering. channel_filter_summary={self.channel_filter_summary}. Original error: {exc}"
+            ) from exc
         self.is_fitted = True
         self._output_dim = None
         return self
@@ -722,7 +847,7 @@ class AeonRocketExtractor(LinearExtractorBase):
         if isinstance(self.transformer, CombinedLinearExtractor):
             Z = self.transformer.transform(X)
         else:
-            Z = self.transformer.transform(cmssl_windows_to_aeon(X))
+            Z = self.transformer.transform(self._prepare_rocket_input(X, phase="transform"))
         Z = np.asarray(Z, dtype=np.float32)
         if Z.ndim != 2:
             raise ValueError(f"Aeon extractor {self.name!r} produced non-2D output shape {Z.shape}")
@@ -751,6 +876,13 @@ class AeonRocketExtractor(LinearExtractorBase):
             "output_dim": None if self._output_dim is None else int(self._output_dim),
             "transformer_class": None if self.transformer is None else self.transformer.__class__.__name__,
         }
+        payload.update({
+            "channel_filter": self.channel_filter_summary,
+            "input_channels": None if self.n_input_channels_ is None else int(self.n_input_channels_),
+            "kept_channels": None if self.n_kept_channels_ is None else int(self.n_kept_channels_),
+            "constant_fallback_fit_fixed_pairs": int(self.constant_fallback_fit_fixed_pairs),
+            "constant_fallback_transform_fixed_pairs": int(self.constant_fallback_transform_fixed_pairs),
+        })
         if isinstance(self.transformer, CombinedLinearExtractor):
             payload["combined"] = self.transformer.summary()
         return payload

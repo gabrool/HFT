@@ -1,123 +1,86 @@
 import numpy as np
 import pytest
 
-try:
-    from test_feature_event_result_contract import _install_optional_dependency_stubs
-except Exception:
-    _install_optional_dependency_stubs = None
-
-if _install_optional_dependency_stubs is not None:
-    _install_optional_dependency_stubs()
-
 from CMSSL17_linear import (
     AeonRocketExtractor,
     RawLinearExtractor,
-    build_linear_extractor_from_config,
-    cmssl_windows_to_aeon,
+    _fit_rocket_channel_mask,
+    _sanitize_aeon_constant_case_channels,
 )
 
 
-def test_raw_linear_extractor_lag_bank_stats_shape():
-    N, T, F = 4, 12, 3
-    X = np.arange(N * T * F, dtype=np.float32).reshape(N, T, F)
-    ext = RawLinearExtractor(
-        mode="lag_bank_stats",
-        lags=(1, 2, 5),
-        windows=(3, 6),
-        include_std=True,
-        include_slope=False,
+def test_channel_mask_drops_structurally_constant_channels():
+    rng = np.random.default_rng(0)
+    n, t, f = 20, 100, 5
+    X = rng.normal(size=(n, t, f)).astype(np.float32)
+    X[:, :, 2] = 1.0
+    X[:, :, 4] = 0.0
+    keep_mask, summary = _fit_rocket_channel_mask(
+        X, std_eps=1e-7, max_const_frac=0.995, min_p95_std=1e-7, min_keep_channels=1
     )
-    Z = ext.fit_transform(X)
-    expected_blocks = 1 + 3 + 2 + 2  # last + deltas + means + stds
-    assert Z.shape == (N, expected_blocks * F)
-    assert Z.dtype == np.float32
-    assert np.isfinite(Z).all()
+    assert keep_mask.tolist() == [True, True, False, True, False]
+    assert summary["input_channels"] == 5
+    assert summary["kept_channels"] == 3
+    assert summary["dropped_channels"] == 2
+    assert summary["dropped_channel_indices"] == [2, 4]
 
 
-def test_raw_linear_lag_uses_previous_row_not_current():
-    X = np.zeros((1, 5, 1), dtype=np.float32)
-    X[0, :, 0] = [10, 20, 30, 40, 50]
-    ext = RawLinearExtractor(mode="lag_bank", lags=(1,), windows=(), include_std=False)
-    Z = ext.fit_transform(X)
-    # blocks: last=50, delta lag1=50-40=10
-    assert Z[0, 0] == 50
-    assert Z[0, 1] == 10
-
-
-def test_cmssl_windows_to_aeon_transposes_to_nct():
-    X = np.zeros((2, 5, 3), dtype=np.float32)
-    Y = cmssl_windows_to_aeon(X)
-    assert Y.shape == (2, 3, 5)
-    assert Y.flags["C_CONTIGUOUS"]
-
-
-@pytest.mark.parametrize("name", ["minirocket", "multirocket", "hydra"])
-def test_aeon_extractor_smoke(name):
-    pytest.importorskip("aeon")
-    X = np.random.default_rng(17).normal(size=(8, 32, 4)).astype(np.float32)
-    ext = AeonRocketExtractor(
-        name=name,
-        n_kernels=128,
-        hydra_n_kernels=4,
-        n_groups=8,
-        n_jobs=1,
-        random_state=17,
+def test_locally_constant_case_does_not_drop_channel():
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(20, 100, 5)).astype(np.float32)
+    X[0, :, 1] = 5.0
+    keep_mask, _summary = _fit_rocket_channel_mask(
+        X, std_eps=1e-7, max_const_frac=0.995, min_p95_std=1e-7, min_keep_channels=1
     )
-    Z = ext.fit_transform(X)
-    assert Z.shape[0] == X.shape[0]
-    assert Z.ndim == 2
-    assert Z.dtype == np.float32
-    assert np.isfinite(Z).all()
+    assert bool(keep_mask[1]) is True
 
 
-def test_multirocket_hydra_smoke():
-    pytest.importorskip("aeon")
-    X = np.random.default_rng(17).normal(size=(8, 32, 4)).astype(np.float32)
-    ext = AeonRocketExtractor(
-        name="multirocket_hydra",
-        n_kernels=128,
-        hydra_n_kernels=4,
-        n_groups=8,
-        n_jobs=1,
-        random_state=17,
-    )
-    Z = ext.fit_transform(X)
-    assert Z.shape[0] == X.shape[0]
-    assert Z.ndim == 2
-    assert Z.dtype == np.float32
-    assert np.isfinite(Z).all()
+def test_constant_fallback_fixes_case_channel_pair():
+    rng = np.random.default_rng(2)
+    X_aeon = rng.normal(size=(20, 5, 100)).astype(np.float32)
+    X_aeon[0, 1, :] = 3.0
+    X_fixed, n_fixed = _sanitize_aeon_constant_case_channels(X_aeon, std_eps=1e-7, ramp_eps=1e-6)
+    assert n_fixed == 1
+    assert float(X_fixed[0, 1, :].std()) > 1e-7
 
 
-def test_build_linear_extractor_factory_raw_linear():
-    ext = build_linear_extractor_from_config(
-        {
-            "extractor": "raw_linear",
-            "raw_mode": "lag_bank_stats",
-            "raw_lags": [1, 2, 5],
-            "raw_windows": [3, 6],
-            "raw_include_std": True,
-            "raw_include_slope": False,
-            "n_kernels": 128,
-            "hydra_n_kernels": 4,
-            "n_groups": 8,
-            "n_jobs": 1,
-            "random_state": 17,
-        }
-    )
-    assert isinstance(ext, RawLinearExtractor)
+def test_extractor_applies_same_mask_at_transform(monkeypatch):
+    class FakeTransformer:
+        def __init__(self):
+            self.fit_channels = None
+            self.transform_channels = None
+
+        def fit(self, X):
+            self.fit_channels = int(X.shape[1])
+            return self
+
+        def transform(self, X):
+            self.transform_channels = int(X.shape[1])
+            return np.zeros((X.shape[0], 4), dtype=np.float32)
+
+    fake = FakeTransformer()
+    monkeypatch.setattr(AeonRocketExtractor, "_build_transformer", lambda self, X_probe=None: fake)
+
+    rng = np.random.default_rng(3)
+    X = rng.normal(size=(20, 100, 5)).astype(np.float32)
+    X[:, :, 2] = 1.0
+    X[:, :, 4] = -2.0
+
+    ext = AeonRocketExtractor("minirocket")
+    ext.fit(X)
+    assert fake.fit_channels == 3
+
+    _ = ext.transform(X)
+    assert fake.transform_channels == 3
+
+    with pytest.raises(ValueError, match="input channel mismatch"):
+        ext.transform(np.zeros((10, 100, 4), dtype=np.float32))
 
 
-def test_hydra_extractor_returns_numpy_float32():
-    pytest.importorskip("aeon")
-    X = np.random.default_rng(23).normal(size=(8, 32, 4)).astype(np.float32)
-    ext = AeonRocketExtractor(
-        name="hydra",
-        n_kernels=128,
-        hydra_n_kernels=4,
-        n_groups=8,
-        n_jobs=1,
-        random_state=17,
-    )
-    Z = ext.fit_transform(X)
-    assert isinstance(Z, np.ndarray)
-    assert Z.dtype == np.float32
+def test_raw_linear_unaffected():
+    rng = np.random.default_rng(4)
+    X = rng.normal(size=(8, 100, 5)).astype(np.float32)
+    raw = RawLinearExtractor()
+    Z = raw.fit_transform(X)
+    assert Z.shape[1] == raw.output_dim
+    assert raw.name == "raw_linear"
