@@ -556,6 +556,13 @@ def _build_extractor_config() -> Dict[str, Any]:
         "n_groups": int(LINEAR_HYDRA_N_GROUPS),
         "n_jobs": int(LINEAR_EXTRACTOR_N_JOBS),
         "random_state": int(LINEAR_RANDOM_SEED),
+        "rocket_channel_filter": int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER", "1")),
+        "rocket_channel_filter_std_eps": float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_STD_EPS", "1e-7")),
+        "rocket_channel_filter_max_const_frac": float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MAX_CONST_FRAC", "0.995")),
+        "rocket_channel_filter_min_p95_std": float(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_P95_STD", "1e-7")),
+        "rocket_channel_filter_min_keep_channels": int(os.environ.get("BYBIT_ROCKET_CHANNEL_FILTER_MIN_KEEP_CHANNELS", "16")),
+        "rocket_constant_fallback": int(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK", "1")),
+        "rocket_constant_fallback_eps": float(os.environ.get("BYBIT_ROCKET_CONSTANT_FALLBACK_EPS", "1e-6")),
     }
 
 
