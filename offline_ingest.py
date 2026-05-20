@@ -361,6 +361,9 @@ RAW_FEATURE_NAMES_HASH = hashlib.sha256(json.dumps(RAW_FEATURE_NAMES).encode()).
 RAW_FEATURE_TRANSFORM_SPEC_HASH = feature_transform_spec_hash(RAW_FEATURE_NAMES)
 RAW_FEATURE_DIM_CORE = len(RAW_FEATURE_NAMES)
 RAW_FEATURE_DIM_TOTAL = RAW_FEATURE_DIM_CORE + int(AUX_DIM)
+AUX_FEATURE_NAMES = list(FEATURE_AUX_TAIL)
+if len(AUX_FEATURE_NAMES) != int(AUX_DIM):
+    raise ValueError(f"AUX_FEATURE_NAMES length mismatch: {len(AUX_FEATURE_NAMES)} != AUX_DIM={AUX_DIM}")
 if RAW_FEATURE_DIM_CORE <= 0:
     raise ValueError("FeatureEngine produced zero raw core features")
 if RAW_FEATURE_DIM_TOTAL <= RAW_FEATURE_DIM_CORE:
@@ -1530,7 +1533,8 @@ class FlatWeekRouter:
             "feature_names": list(RAW_FEATURE_NAMES),
             "feature_names_hash": str(RAW_FEATURE_NAMES_HASH),
             "aux_dim": int(AUX_DIM),
-            "aux_names": list(FEATURE_AUX_TAIL),
+            "aux_names": list(AUX_FEATURE_NAMES),
+            "aux_feature_names": list(AUX_FEATURE_NAMES),
             "label_dim": int(NUM_HORIZONS),  # one signed-return label per configured horizon
             "horizons_ms": [int(h) for h in HORIZONS_MS],
             "rows_total": rows_total,
@@ -2187,7 +2191,8 @@ def build_global_meta_from_week_metas(
         "feature_names": list(RAW_FEATURE_NAMES),
         "feature_names_hash": str(RAW_FEATURE_NAMES_HASH),
         "aux_dim": int(AUX_DIM),
-        "aux_names": list(FEATURE_AUX_TAIL),
+        "aux_names": list(AUX_FEATURE_NAMES),
+            "aux_feature_names": list(AUX_FEATURE_NAMES),
         "dtype": "float32",
         "ram_budget_mb": int(RAM_BUDGET),
         "chunk_size_used": 0 if (router is None or router.chunk_size_used == 0) else int(router.chunk_size_used),
@@ -2538,6 +2543,8 @@ def process_all(
         router.flush_all()
 
     feature_dim_total = int(F)
+    if feature_dim_core + len(AUX_FEATURE_NAMES) != feature_dim_total:
+        raise ValueError(f"feature_dim_total mismatch: core={feature_dim_core} aux={len(AUX_FEATURE_NAMES)} total={feature_dim_total}")
     feature_dim_core = int(RAW_FEATURE_DIM_CORE)
     label_dim = int(NUM_HORIZONS)
     if router is not None:
@@ -2629,7 +2636,8 @@ def process_all(
                 ("aux_schema", AUX_SCHEMA),
                 ("feature_dim_core", feature_dim_core),
                 ("feature_dim_total", feature_dim_total),
-                ("aux_names", list(FEATURE_AUX_TAIL)),
+                ("aux_names", list(AUX_FEATURE_NAMES)),
+                ("aux_feature_names", list(AUX_FEATURE_NAMES)),
                 ("feature_names_hash", str(RAW_FEATURE_NAMES_HASH)),
                 ("feature_transform", FEATURE_TRANSFORM),
                 ("feature_transform_policy", FEATURE_TRANSFORM_POLICY),
