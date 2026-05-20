@@ -639,12 +639,12 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     raw_names = list(fe.feature_names())
     forbidden = "p" + "ca"
     assert len(raw_names) > 0
-    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v8_raw_no_" + forbidden + "_pruned172_xformv2"
-    assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v2_pruned172"
+    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v8_raw_no_" + forbidden + "_pruned159_lb10_xformv2"
+    assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v2_pruned159_lb10"
     assert CMSSL17.CHECKPOINT_SCHEMA == (
         "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
         + forbidden
-        + "-pruned172-xformv2-mamba512-pool512-head1024-k333333-prenormres-finallinear"
+        + "-pruned159_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-finallinear"
     )
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()
@@ -912,7 +912,7 @@ def test_stage2_final_mixer_factory_swiglu() -> None:
         dropout=0.1,
     )
     assert isinstance(mixer, SwiGLUFinalMixer)
-    assert mixer.final_in_dim == 178 * 8
+    assert mixer.final_in_dim == 165 * 8
     assert mixer.d_model == DMODEL
     assert mixer.hidden_dim > 0
 
@@ -1005,7 +1005,7 @@ def test_stage3_final_mixer_factory_dcn() -> None:
     )
 
     assert isinstance(mixer, DCNFinalMixer)
-    assert mixer.final_in_dim == 178 * 8
+    assert mixer.final_in_dim == 165 * 8
     assert mixer.d_model == DMODEL
     assert mixer.rank > 0
     assert mixer.num_layers == 1
@@ -1137,7 +1137,7 @@ def test_stage4_final_mixer_factory_hybrid() -> None:
     )
 
     assert isinstance(mixer, HybridFinalMixer)
-    assert mixer.final_in_dim == 178 * 8
+    assert mixer.final_in_dim == 165 * 8
     assert mixer.d_model == DMODEL
     assert mixer.swiglu_hidden_dim > 0
     assert mixer.dcn_rank > 0
@@ -1291,7 +1291,7 @@ def test_stage5_final_mixer_factory_latent_attn() -> None:
     )
 
     assert isinstance(mixer, LatentAttentionFinalMixer)
-    assert mixer.in_feats == 178
+    assert mixer.in_feats == 165
     assert mixer.c_internal == 8
     assert mixer.d_model == DMODEL
     assert mixer.latent_count > 0
@@ -1476,7 +1476,7 @@ def test_stage6_final_mixer_factory_cross_attn() -> None:
     )
 
     assert isinstance(mixer, CrossChannelAttentionFinalMixer)
-    assert mixer.in_feats == 178
+    assert mixer.in_feats == 165
     assert mixer.c_internal == 8
     assert mixer.d_model == DMODEL
     assert mixer.token_dim > 0
@@ -1766,7 +1766,7 @@ def test_v9_smallstable_model_width_contract() -> None:
 
     fe = FeatureEngine()
     f_total = fe.feature_dim()
-    assert f_total == 178
+    assert f_total == 165
 
     args = ModelArgs(DMODEL, MAMBA_LAYERS, f_total, LOOKBACK)
     assert args.headdim == 32
@@ -1880,8 +1880,8 @@ def test_pruned_feature_schema_contract() -> None:
     fe = FeatureEngine()
     names = set(fe.feature_names())
 
-    assert fe.core_feature_dim() == 172
-    assert fe.feature_dim() == 178
+    assert fe.core_feature_dim() == 159
+    assert fe.feature_dim() == 165
 
     legacy_removed = {
         "time_hour_sin", "time_hour_cos", "time_dow_sin", "time_dow_cos",
@@ -1905,7 +1905,7 @@ def test_pruned_feature_schema_contract() -> None:
         assert name in names, name
 
 
-def test_v8_pruned172_removed_features_absent_and_representatives_retained() -> None:
+def test_v9_pruned159_removed_features_absent_and_representatives_retained() -> None:
     fe = FeatureEngine()
     names = set(fe.feature_names())
 
@@ -1917,16 +1917,16 @@ def test_v8_pruned172_removed_features_absent_and_representatives_retained() -> 
     for name in MUST_KEEP_V8_FEATURES:
         assert name in names, name
 
-    assert fe.core_feature_dim() == 172
-    assert fe.feature_dim() == 178
+    assert fe.core_feature_dim() == 159
+    assert fe.feature_dim() == 165
 
 
-def test_v8_pruned172_event_feature_shape() -> None:
+def test_v8_pruned159_lb10_event_feature_shape() -> None:
     fe = FeatureEngine()
     r = fe.on_fast_event(deep_snapshot_ob(1_700_003_000_000, n_levels=60))
     assert r.event_type == "ob"
     assert r.is_decision is True
-    assert r.features.shape == (172,)
+    assert r.features.shape == (159,)
     assert np.isfinite(r.features).all()
 
 
@@ -1944,7 +1944,7 @@ def test_v8_return_histories_only_track_retained_windows() -> None:
     assert set(fe.return_histories.keys()) == {200}
 
     r = fe.on_fast_event(deep_snapshot_ob(1_700_004_000_000, n_levels=60))
-    assert r.features.shape == (172,)
+    assert r.features.shape == (159,)
     assert set(fe.return_histories.keys()) == {200}
 
 
@@ -2022,8 +2022,8 @@ def test_pruned_feature_vector_matches_names() -> None:
     fe = FeatureEngine()
     result = fe.on_fast_event(deep_snapshot_ob(1_700_000_700_000, n_levels=60))
     assert result.event_type == "ob"
-    assert result.features.shape == (172,)
-    assert len(fe.feature_names()) == 172
+    assert result.features.shape == (159,)
+    assert len(fe.feature_names()) == 159
 
 
 def test_no_empty_feature_family_scaffolding_remains() -> None:
@@ -2050,14 +2050,14 @@ def test_no_empty_feature_family_scaffolding_remains() -> None:
 def test_hot_path_pruned_feature_count_still_unchanged() -> None:
     fe = FeatureEngine()
     names = list(fe.feature_names())
-    assert len(names) == 172
-    assert fe.core_feature_dim() == 172
-    assert fe.feature_dim() == 178
+    assert len(names) == 159
+    assert fe.core_feature_dim() == 159
+    assert fe.feature_dim() == 165
 
     result = fe.on_fast_event(deep_snapshot_ob(1_700_000_800_000, n_levels=60))
     assert result.event_type == "ob"
     assert result.is_decision is True
-    assert result.features.shape == (172,)
+    assert result.features.shape == (159,)
 
 
 def test_removed_hot_path_scaffolding_strings_absent() -> None:
@@ -2103,16 +2103,16 @@ def test_large_trade_and_cvd_windows_are_flow_only() -> None:
 
 def test_transform_v2_feature_count_unchanged() -> None:
     fe = FeatureEngine()
-    assert len(fe.feature_names()) == 172
+    assert len(fe.feature_names()) == 159
     r = fe.on_fast_event(deep_snapshot_ob(1_700_000_900_000, n_levels=60))
-    assert r.features.shape == (172,)
+    assert r.features.shape == (159,)
 
 
 def test_every_feature_has_exactly_one_transform_spec() -> None:
     from CMSSL17 import build_feature_transform_specs
     fe = FeatureEngine()
     specs = build_feature_transform_specs(fe.feature_names())
-    assert len(specs) == 172
+    assert len(specs) == 159
     assert [s.name for s in specs] == list(fe.feature_names())
 
 
@@ -2342,7 +2342,7 @@ def test_calendar_and_notional_context_feature_values_are_sane() -> None:
     result = fe.on_fast_event(deep_snapshot_ob(1_700_003_000_000, n_levels=60))
 
     assert result.event_type == "ob"
-    assert result.features.shape == (172,)
+    assert result.features.shape == (159,)
 
     names = list(fe.feature_names())
     values = dict(zip(names, result.features.tolist()))
@@ -2457,11 +2457,11 @@ def test_transform_diagnostics_summary_has_required_fields() -> None:
         fe.on_fast_event(deep_snapshot_ob(1_701_000_000_000 + i * 100, n_levels=60) if i == 0 else delta_ob(1_701_000_000_000 + i * 100))
     diag = fe.transform_diagnostics_summary()
     assert diag["version"] == "feature_transform_diag_v1"
-    assert diag["feature_count"] == 172
+    assert diag["feature_count"] == 159
     assert "clip_summary" in diag
     assert "half_life_summary" in diag
     assert "feature_rows" in diag
-    assert len(diag["feature_rows"]) == 172
+    assert len(diag["feature_rows"]) == 159
 
 def main() -> None:
     fe = FeatureEngine()
@@ -2555,8 +2555,8 @@ def main() -> None:
     test_duplicate_ob_timestamps_append_distinct_rows()
     test_offline_ingest_no_overwrite_duplicate_timestamp_api()
     test_pruned_feature_schema_contract()
-    test_v8_pruned172_removed_features_absent_and_representatives_retained()
-    test_v8_pruned172_event_feature_shape()
+    test_v9_pruned159_removed_features_absent_and_representatives_retained()
+    test_v8_pruned159_lb10_event_feature_shape()
     test_removed_v8_feature_names_not_in_production_feature_names()
     test_v8_return_histories_only_track_retained_windows()
     test_v8_replenishment_states_only_track_emitted_keys()
