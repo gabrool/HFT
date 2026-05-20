@@ -18,6 +18,8 @@ def test_flat_mapping_with_kept_indices():
     rows = lfi._build_raw_linear_extracted_names(["a", "b"], ["last", "delta_lag_1", "mean_w_5"])
     flat = lfi.build_flat_importance_df(extracted_rows=rows, kept_indices=np.array([0, 2, 5]), dir_coefs=_coefs([[1, 2, 3], [1, 2, 3], [1, 2, 3]]), mag_up_coefs=_coefs([[0, 0, 0], [0, 0, 0], [0, 0, 0]]), mag_down_coefs=_coefs([[0, 0, 0], [0, 0, 0], [0, 0, 0]]))
     assert flat["extracted_feature_name"].tolist() == ["a:last", "a:delta_lag_1", "b:mean_w_5"]
+    required = {"dir_abs_coef_max","dir_abs_coef_mean","mag_up_abs_coef_max","mag_up_abs_coef_mean","mag_down_abs_coef_max","mag_down_abs_coef_mean","mag_abs_coef_max","mag_abs_coef_mean","all_abs_coef_max","all_abs_coef_mean"}
+    assert required.issubset(set(flat.columns))
 
 
 def test_aggregation_helpers_values():
@@ -26,10 +28,16 @@ def test_aggregation_helpers_values():
     base = lfi.aggregate_importance_by_base(flat, ["a", "b"], ["last", "delta_lag_1", "mean_w_5"])
     block = lfi.aggregate_importance_by_block(flat)
     assert np.isclose(base["all_importance_l2_share"].sum(), 1.0)
-    a = base.set_index("base_feature_name").loc["a"]
+    idx = base.set_index("base_feature_name")
+    a = idx.loc["a"]
     assert np.isclose(a["dir_importance_1000ms_l2"], 1.0)
-    assert np.isclose(a["mag_importance_1000ms_l2"], 4.0)
+    assert np.isclose(a["mag_importance_1000ms_l2"], 0.0)
+    b = idx.loc["b"]
+    assert np.isclose(b["mag_importance_l2"], 4.0)
+    assert np.isclose(b["mag_importance_1000ms_l2"], 0.0)
     assert set(block.columns) >= {"dir_importance_l2", "mag_importance_l2", "all_importance_l2"}
+    assert {"dir_importance_l2_share", "mag_importance_l2_share", "all_importance_l2_share"}.issubset(block.columns)
+    assert np.isclose(block["all_importance_l2_share"].sum(), 1.0)
 
 
 def test_low_candidate_helper_flags():
@@ -71,3 +79,24 @@ def test_ablation_metric_semantics():
     assert "dir_auc_kept_1000ms" in m
     assert "mean_side_log_huber_cond_1000ms" in m
     assert m["edge_spearman_kept_1000ms"] != m["edge_spearman_all_1000ms"]
+
+
+def test_get_mag_scales_fallback_to_stage4_config():
+    class Bundle:
+        pass
+
+    st4 = {"stage4_config": {"mag_up_scale_bps": [1.0, 2.0, 3.0], "mag_down_scale_bps": [4.0, 5.0, 6.0]}}
+    up, dn = lfi._get_mag_scales(Bundle(), st4)
+    assert np.allclose(up, [1.0, 2.0, 3.0])
+    assert np.allclose(dn, [4.0, 5.0, 6.0])
+
+
+def test_get_mag_scales_prefers_bundle_attrs():
+    class Bundle:
+        mag_up_scale_bps = np.array([7.0, 8.0, 9.0])
+        mag_down_scale_bps = np.array([10.0, 11.0, 12.0])
+
+    st4 = {"stage4_config": {"mag_up_scale_bps": [1, 2, 3], "mag_down_scale_bps": [4, 5, 6]}}
+    up, dn = lfi._get_mag_scales(Bundle(), st4)
+    assert np.allclose(up, [7, 8, 9])
+    assert np.allclose(dn, [10, 11, 12])

@@ -66,7 +66,16 @@ def build_flat_importance_df(*, extracted_rows: list[dict], kept_indices: np.nda
             "dir_abs_coef_200ms": float(da[0]), "dir_abs_coef_500ms": float(da[1]), "dir_abs_coef_1000ms": float(da[2]),
             "mag_up_abs_coef_200ms": float(ua[0]), "mag_up_abs_coef_500ms": float(ua[1]), "mag_up_abs_coef_1000ms": float(ua[2]),
             "mag_down_abs_coef_200ms": float(na[0]), "mag_down_abs_coef_500ms": float(na[1]), "mag_down_abs_coef_1000ms": float(na[2]),
-            "mag_abs_coef_max": float(np.max(np.concatenate([ua, na]))), "all_abs_coef_max": float(np.max(allv)),
+            "dir_abs_coef_max": float(np.max(da)),
+            "dir_abs_coef_mean": float(np.mean(da)),
+            "mag_up_abs_coef_max": float(np.max(ua)),
+            "mag_up_abs_coef_mean": float(np.mean(ua)),
+            "mag_down_abs_coef_max": float(np.max(na)),
+            "mag_down_abs_coef_mean": float(np.mean(na)),
+            "mag_abs_coef_max": float(np.max(np.concatenate([ua, na]))),
+            "mag_abs_coef_mean": float(np.mean(np.concatenate([ua, na]))),
+            "all_abs_coef_max": float(np.max(allv)),
+            "all_abs_coef_mean": float(np.mean(allv)),
         })
     return pd.DataFrame(flat)
 
@@ -103,7 +112,11 @@ def aggregate_importance_by_block(flat_df: pd.DataFrame) -> pd.DataFrame:
         d = g[["dir_abs_coef_200ms", "dir_abs_coef_500ms", "dir_abs_coef_1000ms"]].to_numpy().reshape(-1)
         u = g[["mag_up_abs_coef_200ms", "mag_up_abs_coef_500ms", "mag_up_abs_coef_1000ms", "mag_down_abs_coef_200ms", "mag_down_abs_coef_500ms", "mag_down_abs_coef_1000ms"]].to_numpy().reshape(-1)
         out.append({"block_name": name, "n_kept_columns": int(len(g)), "dir_importance_l2": float(np.sqrt(np.sum(d**2))), "mag_importance_l2": float(np.sqrt(np.sum(u**2))), "all_importance_l2": float(np.sqrt(np.sum(d**2) + np.sum(u**2)))})
-    return pd.DataFrame(out)
+    out_df = pd.DataFrame(out)
+    for c in ("dir", "mag", "all"):
+        denom = float(out_df[f"{c}_importance_l2"].sum()) or 1.0
+        out_df[f"{c}_importance_l2_share"] = out_df[f"{c}_importance_l2"] / denom
+    return out_df
 
 
 def add_low_importance_flags(base_df: pd.DataFrame, *, low_share: float, low_dir_share: float, low_mag_share: float, coef_eps: float, flat_df: pd.DataFrame) -> pd.DataFrame:
@@ -156,6 +169,28 @@ def _huber_np(err: np.ndarray, delta: float = 1.0) -> float:
     return float(np.where(ae <= delta, 0.5 * ae * ae, delta * (ae - 0.5 * delta)).mean())
 
 
+def _safe_nanmean_pair(a: float, b: float) -> float:
+    vals = np.asarray([a, b], dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    return float(vals.mean()) if vals.size else math.nan
+
+
+def _get_mag_scales(bundle: Any, st4: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    up = getattr(bundle, "mag_up_scale_bps", None)
+    dn = getattr(bundle, "mag_down_scale_bps", None)
+    if up is None:
+        up = st4.get("stage4_config", {}).get("mag_up_scale_bps")
+    if dn is None:
+        dn = st4.get("stage4_config", {}).get("mag_down_scale_bps")
+    if up is None or dn is None:
+        raise ValueError("Unable to find mag_up_scale_bps / mag_down_scale_bps in model bundle or stage4_config")
+    up = np.asarray(up, dtype=np.float64)
+    dn = np.asarray(dn, dtype=np.float64)
+    if up.shape[0] < 3 or dn.shape[0] < 3:
+        raise ValueError(f"Bad magnitude scale shapes: up={up.shape} down={dn.shape}")
+    return up, dn
+
+
 def compute_ablation_metrics(*, y: np.ndarray, pred: dict[str, np.ndarray], mag_up_scale_bps: np.ndarray, mag_down_scale_bps: np.ndarray) -> dict[str, float]:
     import linear_offline
     h = 2
@@ -172,10 +207,10 @@ def compute_ablation_metrics(*, y: np.ndarray, pred: dict[str, np.ndarray], mag_
     up_scale = float(mag_up_scale_bps[h]); dn_scale = float(mag_down_scale_bps[h])
     up_h = _huber_np(pred["mag_up_log"][up_rows, h] - np.log1p(y[up_rows, h] / up_scale)) if np.any(up_rows) else math.nan
     dn_h = _huber_np(pred["mag_down_log"][dn_rows, h] - np.log1p((-y[dn_rows, h]) / dn_scale)) if np.any(dn_rows) else math.nan
-    side_h = float(np.nanmean([up_h, dn_h])) if (not math.isnan(up_h) or not math.isnan(dn_h)) else math.nan
+    side_h = _safe_nanmean_pair(up_h, dn_h)
     up_sp = linear_offline._safe_spearman_np(pred["mag_up_bps"][up_rows, h], y[up_rows, h]) if np.any(up_rows) else math.nan
     dn_sp = linear_offline._safe_spearman_np(pred["mag_down_bps"][dn_rows, h], -y[dn_rows, h]) if np.any(dn_rows) else math.nan
-    side_sp = float(np.nanmean([up_sp, dn_sp])) if (not math.isnan(up_sp) or not math.isnan(dn_sp)) else math.nan
+    side_sp = _safe_nanmean_pair(up_sp, dn_sp)
     p_all = 1.0 / (1.0 + np.exp(-scores))
     edge = p_all * pred["mag_up_bps"][:, h] - (1.0 - p_all) * pred["mag_down_bps"][:, h]
     return {
@@ -195,7 +230,29 @@ def main() -> None:
         raise ValueError("linear_feature_importance.py currently supports raw_linear only")
     bundle = load_linear_sklearn_bundle(Path(str(st4["best_model_path"]))); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"])))
     kept_indices = _parse_keep_indices(pb); base_names = _base_names_from_meta(meta); blocks = list((st2.get("extractor_summary", {}) or {}).get("blocks") or [])
-    flat_df = build_flat_importance_df(extracted_rows=_build_raw_linear_extracted_names(base_names, blocks), kept_indices=kept_indices, dir_coefs=[_extract_linear_coef(m) for m in bundle.direction_models], mag_up_coefs=[_extract_linear_coef(m) for m in bundle.mag_up_models], mag_down_coefs=[_extract_linear_coef(m) for m in bundle.mag_down_models])
+
+    if len(base_names) != int(st2["feature_dim_total"]):
+        raise ValueError(f"base name count mismatch: got {len(base_names)} expected feature_dim_total={st2['feature_dim_total']}")
+    extracted_rows = _build_raw_linear_extracted_names(base_names, blocks)
+    if len(extracted_rows) != int(st2["extractor_output_dim"]):
+        raise ValueError(f"extractor output dim mismatch: names={len(extracted_rows)} expected={st2['extractor_output_dim']}")
+    if kept_indices.size != int(pb.kept_dim):
+        raise ValueError(f"kept_indices size mismatch: got {kept_indices.size} expected kept_dim={pb.kept_dim}")
+    if kept_indices.size and int(np.max(kept_indices)) >= len(extracted_rows):
+        raise ValueError(f"kept index out of range: max={int(np.max(kept_indices))} extracted_dim={len(extracted_rows)}")
+
+    dir_coefs = [_extract_linear_coef(m) for m in bundle.direction_models]
+    up_coefs = [_extract_linear_coef(m) for m in bundle.mag_up_models]
+    dn_coefs = [_extract_linear_coef(m) for m in bundle.mag_down_models]
+    for name, coef in [
+        *[(f"direction_{i}", c) for i, c in enumerate(dir_coefs)],
+        *[(f"mag_up_{i}", c) for i, c in enumerate(up_coefs)],
+        *[(f"mag_down_{i}", c) for i, c in enumerate(dn_coefs)],
+    ]:
+        if coef.shape[0] != int(pb.kept_dim):
+            raise ValueError(f"Coefficient dim mismatch for {name}: got {coef.shape[0]} expected kept_dim={pb.kept_dim}")
+
+    flat_df = build_flat_importance_df(extracted_rows=extracted_rows, kept_indices=kept_indices, dir_coefs=dir_coefs, mag_up_coefs=up_coefs, mag_down_coefs=dn_coefs)
     base_df = aggregate_importance_by_base(flat_df, base_names, blocks)
     by_base_block = flat_df.groupby(["base_feature_name", "block_name"]).agg(dirv=("dir_abs_coef_1000ms", "max"), magv=("mag_abs_coef_max", "max"), allv=("all_abs_coef_max", "max")).reset_index()
     for metric, col in [("dirv", "top_block_by_direction_importance"), ("magv", "top_block_by_magnitude_importance"), ("allv", "top_block_by_all_importance")]:
@@ -215,7 +272,8 @@ def main() -> None:
             linear_offline.close_dataset(ds, name="importance_ablation")
         Z = np.concatenate(z_parts, axis=0); y = np.concatenate(y_parts, axis=0)
         base_pred = bundle.predict_dict_np(Z)
-        base_metrics = compute_ablation_metrics(y=y, pred=base_pred, mag_up_scale_bps=np.asarray(bundle.mag_up_scale_bps), mag_down_scale_bps=np.asarray(bundle.mag_down_scale_bps))
+        mag_up_scale_bps, mag_down_scale_bps = _get_mag_scales(bundle, st4)
+        base_metrics = compute_ablation_metrics(y=y, pred=base_pred, mag_up_scale_bps=mag_up_scale_bps, mag_down_scale_bps=mag_down_scale_bps)
         groups = get_group_columns(flat_df.to_dict("records"), "base_feature_name")
         names = select_ablation_groups(base_df=base_df, low_df=low_df, top_n=int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_TOP_N", "25")), low_n=int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_LOW_N", "50")), groups_spec=os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_GROUPS", "low_importance,top_direction,top_magnitude,top_all"), all_base=int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_ALL_BASE", "0")) == 1)
         for name in names:
@@ -223,14 +281,45 @@ def main() -> None:
             if cols.size == 0:
                 continue
             Za = Z.copy(); Za[:, cols] = 0.0
-            m = compute_ablation_metrics(y=y, pred=bundle.predict_dict_np(Za), mag_up_scale_bps=np.asarray(bundle.mag_up_scale_bps), mag_down_scale_bps=np.asarray(bundle.mag_down_scale_bps))
+            m = compute_ablation_metrics(y=y, pred=bundle.predict_dict_np(Za), mag_up_scale_bps=mag_up_scale_bps, mag_down_scale_bps=mag_down_scale_bps)
             row = {"group_type": "base_feature", "group_name": name, "n_columns_zeroed": int(cols.size)}
             for k in base_metrics:
                 row[f"baseline_{k}"] = base_metrics[k]; row[f"ablated_{k}"] = m[k]; row[f"delta_{k}"] = float(m[k] - base_metrics[k])
             ab_rows.append(row)
     flat_path = out_dir / "linear_importance_flat.csv"; base_path = out_dir / "linear_importance_by_base_feature.csv"; block_path = out_dir / "linear_importance_by_block.csv"; low_path = out_dir / "linear_importance_low_candidates.csv"; ab_path = out_dir / "linear_importance_ablation.csv"
     flat_df.to_csv(flat_path, index=False); base_df.sort_values("all_importance_l2", ascending=False).to_csv(base_path, index=False); block_df.sort_values("all_importance_l2", ascending=False).to_csv(block_path, index=False); low_df.to_csv(low_path, index=False); pd.DataFrame(ab_rows).to_csv(ab_path, index=False)
-    summary = {"top_base_features_direction_1000ms": list(base_df.sort_values("dir_importance_1000ms_l2", ascending=False).head(10)["base_feature_name"]), "top_base_features_magnitude_1000ms": list(base_df.sort_values("mag_importance_1000ms_l2", ascending=False).head(10)["base_feature_name"]), "top_base_features_all_1000ms": list(base_df.sort_values("all_importance_1000ms_l2", ascending=False).head(10)["base_feature_name"]), "top_base_features_direction_all_horizons": list(base_df.sort_values("dir_importance_l2", ascending=False).head(10)["base_feature_name"]), "top_base_features_magnitude_all_horizons": list(base_df.sort_values("mag_importance_l2", ascending=False).head(10)["base_feature_name"]), "top_base_features_all_horizons": list(base_df.sort_values("all_importance_l2", ascending=False).head(10)["base_feature_name"]), "n_low_importance_candidates": int(low_df.shape[0]), "ablation_rows": int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION_MAX_ROWS", "200000")), "ablation_n_groups": int(len(ab_rows))}
+    ablation_enabled = bool(int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION", "1")) == 1)
+    summary = {
+        "schema": "linear_feature_importance_v1",
+        "linear_out_dir": str(linear_out_dir),
+        "out_root": str(out_root),
+        "extractor": "raw_linear",
+        "kept_dim": int(pb.kept_dim),
+        "original_dim": int(pb.original_dim),
+        "n_base_features": int(len(base_names)),
+        "n_blocks": int(len(blocks)),
+        "top_base_features_direction_1000ms": list(base_df.sort_values("dir_importance_1000ms_l2", ascending=False).head(10)["base_feature_name"]),
+        "top_base_features_magnitude_1000ms": list(base_df.sort_values("mag_importance_1000ms_l2", ascending=False).head(10)["base_feature_name"]),
+        "top_base_features_all_1000ms": list(base_df.sort_values("all_importance_1000ms_l2", ascending=False).head(10)["base_feature_name"]),
+        "top_base_features_direction_all_horizons": list(base_df.sort_values("dir_importance_l2", ascending=False).head(10)["base_feature_name"]),
+        "top_base_features_magnitude_all_horizons": list(base_df.sort_values("mag_importance_l2", ascending=False).head(10)["base_feature_name"]),
+        "top_base_features_all_horizons": list(base_df.sort_values("all_importance_l2", ascending=False).head(10)["base_feature_name"]),
+        "top_blocks_all": list(block_df.sort_values("all_importance_l2", ascending=False).head(10)["block_name"]),
+        "top_blocks_direction": list(block_df.sort_values("dir_importance_l2", ascending=False).head(10)["block_name"]),
+        "top_blocks_magnitude": list(block_df.sort_values("mag_importance_l2", ascending=False).head(10)["block_name"]),
+        "n_low_importance_candidates": int(low_df.shape[0]),
+        "ablation_enabled": ablation_enabled,
+        "ablation_rows": int(max_rows if ablation_enabled else 0),
+        "ablation_n_groups": int(len(ab_rows)),
+        "paths": {
+            "flat": str(flat_path),
+            "base": str(base_path),
+            "block": str(block_path),
+            "low": str(low_path),
+            "ablation": str(ab_path),
+            "summary": str(out_dir / "linear_importance_summary.json"),
+        },
+    }
     (out_dir / "linear_importance_summary.json").write_text(json.dumps(summary, indent=2, allow_nan=True))
     print(f"[linear-importance] loaded model={st4['best_model_path']} kept_dim={pb.kept_dim} extractor=raw_linear", flush=True)
     print(f"[linear-importance] wrote flat={flat_path} base={base_path} block={block_path} low={low_path}", flush=True)
