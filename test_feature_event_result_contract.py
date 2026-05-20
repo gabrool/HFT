@@ -1921,6 +1921,18 @@ def test_v9_pruned159_removed_features_absent_and_representatives_retained() -> 
     assert fe.feature_dim() == 165
 
 
+
+
+def test_pruned_feature_vector_matches_names_on_decision_event() -> None:
+    fe = FeatureEngine()
+    result = fe.on_fast_event(deep_snapshot_ob(1_700_000_100_000, n_levels=60))
+    names = fe.feature_names()
+
+    assert result.is_decision is True
+    assert result.features.shape == (159,)
+    assert len(names) == 159
+    assert result.features.shape[0] == len(names)
+
 def test_v8_pruned159_lb10_event_feature_shape() -> None:
     fe = FeatureEngine()
     r = fe.on_fast_event(deep_snapshot_ob(1_700_003_000_000, n_levels=60))
@@ -2347,10 +2359,12 @@ def test_calendar_and_notional_context_feature_values_are_sane() -> None:
     names = list(fe.feature_names())
     values = dict(zip(names, result.features.tolist()))
 
-    for name in ["utc_hour_sin", "utc_hour_cos", "utc_dow_sin", "utc_dow_cos"]:
+    for name in ["utc_hour_sin", "utc_dow_sin"]:
         assert -1.0 <= values[name] <= 1.0
 
     assert values["is_weekend"] in (0.0, 1.0)
+    assert "utc_hour_cos" not in values
+    assert "utc_dow_cos" not in values
 
     # These are transformed by log1p, so should be positive and finite.
     for name in [
