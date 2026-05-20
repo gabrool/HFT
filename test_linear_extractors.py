@@ -6,6 +6,7 @@ from CMSSL17_linear import (
     RawLinearExtractor,
     _fit_rocket_channel_mask,
     _sanitize_aeon_constant_case_channels,
+    build_linear_extractor_from_config,
 )
 
 
@@ -66,7 +67,7 @@ def test_extractor_applies_same_mask_at_transform(monkeypatch):
     X[:, :, 2] = 1.0
     X[:, :, 4] = -2.0
 
-    ext = AeonRocketExtractor("minirocket")
+    ext = AeonRocketExtractor("minirocket", channel_filter_min_keep_channels=1)
     ext.fit(X)
     assert fake.fit_channels == 3
 
@@ -84,3 +85,59 @@ def test_raw_linear_unaffected():
     Z = raw.fit_transform(X)
     assert Z.shape[1] == raw.output_dim
     assert raw.name == "raw_linear"
+
+
+def test_build_linear_extractor_passes_rocket_channel_config():
+    cfg = {
+        "extractor": "minirocket",
+        "n_kernels": 100,
+        "hydra_n_kernels": 8,
+        "n_groups": 64,
+        "n_jobs": 1,
+        "random_state": 17,
+        "rocket_channel_filter": 1,
+        "rocket_channel_filter_std_eps": 2e-7,
+        "rocket_channel_filter_max_const_frac": 0.9,
+        "rocket_channel_filter_min_p95_std": 3e-7,
+        "rocket_channel_filter_min_keep_channels": 2,
+        "rocket_constant_fallback": 1,
+        "rocket_constant_fallback_eps": 5e-6,
+    }
+    ext = build_linear_extractor_from_config(cfg)
+    assert isinstance(ext, AeonRocketExtractor)
+    assert ext.channel_filter_enabled is True
+    assert ext.channel_filter_std_eps == 2e-7
+    assert ext.channel_filter_max_const_frac == 0.9
+    assert ext.channel_filter_min_p95_std == 3e-7
+    assert ext.channel_filter_min_keep_channels == 2
+    assert ext.constant_fallback_enabled is True
+    assert ext.constant_fallback_eps == 5e-6
+
+
+def test_build_multirocket_hydra_passes_rocket_channel_config():
+    cfg = {
+        "extractor": "multirocket_hydra",
+        "n_kernels": 100,
+        "hydra_n_kernels": 8,
+        "n_groups": 64,
+        "n_jobs": 1,
+        "random_state": 17,
+        "rocket_channel_filter": 1,
+        "rocket_channel_filter_std_eps": 2e-7,
+        "rocket_channel_filter_max_const_frac": 0.9,
+        "rocket_channel_filter_min_p95_std": 3e-7,
+        "rocket_channel_filter_min_keep_channels": 2,
+        "rocket_constant_fallback": 1,
+        "rocket_constant_fallback_eps": 5e-6,
+    }
+    ext = build_linear_extractor_from_config(cfg)
+    assert isinstance(ext, AeonRocketExtractor)
+    combined = ext._build_transformer()
+    for child in combined.extractors:
+        assert child.channel_filter_enabled is True
+        assert child.channel_filter_std_eps == 2e-7
+        assert child.channel_filter_max_const_frac == 0.9
+        assert child.channel_filter_min_p95_std == 3e-7
+        assert child.channel_filter_min_keep_channels == 2
+        assert child.constant_fallback_enabled is True
+        assert child.constant_fallback_eps == 5e-6
