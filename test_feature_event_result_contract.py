@@ -2291,9 +2291,7 @@ def test_calendar_and_notional_context_features_present_and_transformed() -> Non
 
     expected = [
         "utc_hour_sin",
-        "utc_hour_cos",
         "utc_dow_sin",
-        "utc_dow_cos",
         "is_weekend",
         "bid_l1_notional_usd",
         "ask_l1_notional_usd",
@@ -2306,13 +2304,13 @@ def test_calendar_and_notional_context_features_present_and_transformed() -> Non
         assert name in names, name
         assert name in specs, name
 
-    assert names[:5] == [
+    assert names[:3] == [
         "utc_hour_sin",
-        "utc_hour_cos",
         "utc_dow_sin",
-        "utc_dow_cos",
         "is_weekend",
     ]
+    assert "utc_hour_cos" not in names
+    assert "utc_dow_cos" not in names
     top_book_end = names.index("time_since_mid_change_ms") + 1
     assert names[top_book_end:top_book_end + 5] == [
         "bid_l1_notional_usd",
@@ -2324,9 +2322,7 @@ def test_calendar_and_notional_context_features_present_and_transformed() -> Non
 
     for name in [
         "utc_hour_sin",
-        "utc_hour_cos",
         "utc_dow_sin",
-        "utc_dow_cos",
         "is_weekend",
     ]:
         s = specs[name]
