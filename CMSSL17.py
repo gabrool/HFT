@@ -4177,7 +4177,7 @@ class FeatureEngine:
         names.append("return_std_bps_200ms")
         for ms in REGIME_WINDOWS_MS:
             names.extend([
-                f"regime_volume_ewma_{ms}ms",
+                *([f"regime_volume_ewma_{ms}ms"] if ms != 1_000 else []),
                 *([f"regime_flow_imbalance_{ms}ms"] if ms == 3_000 else []),
                 f"down_up_vol_imbalance_{ms}ms",
                 *([f"max_abs_return_bps_{ms}ms"] if ms == 500 else []),
@@ -4201,7 +4201,7 @@ class FeatureEngine:
             "ofi_l3_sum_over_depth_1000ms", "ofi_l3_sum_over_depth_500ms",
             "ofi_l3_sum_over_depth_200ms", "ofi_l10", "ofi_l1_pressure_ewma_200ms",
             "ofi_l1_pressure_ewma_500ms", "ofi_l1_pressure_ewma_1000ms",
-            "bid_l1_depletion_over_depth_200ms",
+            "bid_l1_depletion_over_depth_200ms", "regime_volume_ewma_1000ms",
         }
         present_removed = sorted(set(names) & removed_features)
         if present_removed:
@@ -5681,8 +5681,11 @@ class FeatureEngine:
             bid_price_change_count = float(len(self._bid_price_change_deques[ms]))
             bid_l1_depletion = l1_depletion[ms][0]
             ask_l1_depletion = l1_depletion[ms][1]
+
+            if ms == 500:
+                feat_list.append(float(len(self._spread_change_deques[ms])))
+
             feat_list.extend([
-                float(len(self._spread_change_deques[ms])),
                 bid_price_change_count / window_seconds,
                 bid_l1_depletion,
                 ask_l1_depletion,
@@ -5764,14 +5767,18 @@ class FeatureEngine:
         feat_list.append(return_std_bps_200)
         for ms in REGIME_WINDOWS_MS:
             dist = self._regime_distribution(ms)
+
             if ms != 1_000:
                 feat_list.append(regime_volume[ms])
+
             if ms == 3_000:
                 feat_list.append(regime_flow_snapshot[ms])
-            feat_list.extend([
-                dist["down_up_vol_imbalance"],
-                *([dist["max_abs_return_bps"]] if ms == 500 else []),
-            ])
+
+            feat_list.append(dist["down_up_vol_imbalance"])
+
+            if ms == 500:
+                feat_list.append(dist["max_abs_return_bps"])
+
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
             spread_win = self._spread_bps_regime_states[ms]
             depth_state = self._depth_5bps_total_regime_states[ms]
@@ -5785,10 +5792,15 @@ class FeatureEngine:
             imb_mean = imb_win.mean()
             imb_slope = imb_win.slope()
 
+            feat_list.append(spread_z)
+
+            if ms != 3_000:
+                feat_list.append(spread_slope)
+
+            if ms != 1_000:
+                feat_list.append(depth_z)
+
             feat_list.extend([
-                spread_z,
-                spread_slope,
-                depth_z,
                 imb_mean,
                 imb_slope,
             ])
@@ -5808,8 +5820,9 @@ class FeatureEngine:
                 f"len(feature_names)={len(names)}"
             )
         feat = np.asarray(feat_list, dtype=np.float64)
-        if len(names) != 172:
-            raise ValueError(f"Expected pruned raw core dim 172, got {len(names)}")
+        expected_core_dim = len(names)
+        if expected_core_dim != 159:
+            raise ValueError(f"Expected pruned raw core dim 159, got {expected_core_dim}")
         if self.strict_feature_validation:
             if not np.all(np.isfinite(feat)):
                 bad_idx = np.flatnonzero(~np.isfinite(feat))
@@ -5819,8 +5832,10 @@ class FeatureEngine:
                 ]
                 raise FloatingPointError("Non-finite feature values: " + ", ".join(details))
         feat_out = self._transform_features(feat, ob_dt_ms)
-        if feat_out.shape != (172,):
-            raise ValueError(f"Expected transformed feature shape (172,), got {feat_out.shape}")
+        if feat_out.shape != (expected_core_dim,):
+            raise ValueError(
+                f"Expected transformed feature shape ({expected_core_dim},), got {feat_out.shape}"
+            )
         self._append_price_history(ts_ms, mid, micro)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
