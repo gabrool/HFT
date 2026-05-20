@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
@@ -137,3 +138,44 @@ def test_get_mag_scales_prefers_bundle_attrs():
     up, dn = lfi._get_mag_scales(Bundle(), st4)
     assert np.allclose(up, [7, 8, 9])
     assert np.allclose(dn, [10, 11, 12])
+
+
+def test_get_signed_raw_stats_prefers_stage4_embedded_stats():
+    class FakeLinearOffline:
+        @staticmethod
+        def stats_dict_to_arrays(x):
+            return {"converted": np.asarray(x["value"])}
+
+        @staticmethod
+        def load_linear_trim_stats(linear_out_dir):
+            raise AssertionError("fallback should not be used")
+
+    st4 = {"signed_raw_stats": {"value": [1.0, 2.0, 3.0]}}
+    out = lfi._get_signed_raw_stats(
+        linear_out_dir=Path("/tmp/unused"),
+        st4=st4,
+        linear_offline=FakeLinearOffline,
+    )
+
+    assert np.allclose(out["converted"], [1.0, 2.0, 3.0])
+
+
+def test_get_signed_raw_stats_falls_back_to_trim_cache():
+    class FakeLinearOffline:
+        @staticmethod
+        def stats_dict_to_arrays(x):
+            raise AssertionError("embedded stats should not be used")
+
+        @staticmethod
+        def load_linear_trim_stats(linear_out_dir):
+            assert str(linear_out_dir) == "/tmp/run"
+            return {"from_cache": np.asarray([4.0, 5.0, 6.0])}
+
+    st4 = {}
+    out = lfi._get_signed_raw_stats(
+        linear_out_dir=Path("/tmp/run"),
+        st4=st4,
+        linear_offline=FakeLinearOffline,
+    )
+
+    assert np.allclose(out["from_cache"], [4.0, 5.0, 6.0])
