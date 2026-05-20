@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from CMSSL17 import FEATURE_AUX_TAIL
+
 
 def _extract_linear_coef(model: Any) -> np.ndarray:
     for candidate in (model, getattr(model, "estimator", None), getattr(model, "model", None)):
@@ -36,12 +38,28 @@ def _build_raw_linear_extracted_names(base_names: list[str], blocks: list[str]) 
 
 
 def _base_names_from_meta(meta: dict[str, Any], expected_total: int | None = None) -> list[str]:
-    if isinstance(meta.get("feature_names"), list):
-        names = list(meta.get("feature_names") or []) + list(meta.get("aux_feature_names") or [])
-    elif isinstance(meta.get("raw_feature_names"), list):
-        names = list(meta.get("raw_feature_names") or [])
+    canonical_aux = list(FEATURE_AUX_TAIL)
+
+    candidates: list[list[str]] = []
+    feature_names = list(meta.get("feature_names") or []) if isinstance(meta.get("feature_names"), list) else []
+    aux_feature_names = list(meta.get("aux_feature_names") or []) if isinstance(meta.get("aux_feature_names"), list) else []
+    raw_feature_names = list(meta.get("raw_feature_names") or []) if isinstance(meta.get("raw_feature_names"), list) else []
+    core_feature_names = list(meta.get("core_feature_names") or []) if isinstance(meta.get("core_feature_names"), list) else []
+
+    if feature_names:
+        candidates.append(feature_names + aux_feature_names)
+    if raw_feature_names:
+        candidates.append(raw_feature_names)
+    if core_feature_names:
+        candidates.append(core_feature_names + aux_feature_names)
+
+    names: list[str] = []
+    if expected_total is None:
+        names = next((c for c in candidates if c), [])
     else:
-        names = list(meta.get("core_feature_names") or []) + list(meta.get("aux_feature_names") or [])
+        names = next((c for c in candidates if len(c) == expected_total), [])
+        if not names:
+            names = next((c for c in candidates if c), [])
 
     if not names:
         raise ValueError("Unable to resolve base names from meta.json")
@@ -51,9 +69,17 @@ def _base_names_from_meta(meta: dict[str, Any], expected_total: int | None = Non
             raise ValueError(
                 f"base name count exceeds expected feature_dim_total: got {len(names)} expected={expected_total}"
             )
-
         if len(names) < expected_total:
-            names = names + [f"aux_{i:03d}" for i in range(len(names), expected_total)]
+            missing = expected_total - len(names)
+            if missing == len(canonical_aux) and not aux_feature_names:
+                names = names + canonical_aux
+            else:
+                start = len(names)
+                names = names + [f"aux_{i:03d}" for i in range(start, expected_total)]
+                print(
+                    f"[linear-importance-warning] aux_feature_names missing; using synthetic aux_{start:03d}..aux_{expected_total - 1:03d}",
+                    flush=True,
+                )
 
     return names
 

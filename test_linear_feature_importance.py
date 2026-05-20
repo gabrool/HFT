@@ -18,6 +18,18 @@ def test_base_names_errors_if_too_many_names():
         lfi._base_names_from_meta(meta, expected_total=2)
 
 
+
+
+def test_base_names_uses_real_aux_names_from_meta():
+    meta = {"feature_names": ["f0", "f1"], "aux_feature_names": ["aux_a", "aux_b"]}
+    assert lfi._base_names_from_meta(meta, expected_total=4) == ["f0", "f1", "aux_a", "aux_b"]
+
+
+def test_base_names_falls_back_to_canonical_aux_names():
+    meta = {"feature_names": ["f0", "f1"]}
+    names = lfi._base_names_from_meta(meta, expected_total=8)
+    assert names[:2] == ["f0", "f1"]
+    assert names[2:] == list(lfi.FEATURE_AUX_TAIL)
 def test_raw_linear_feature_name_mapping():
     rows = lfi._build_raw_linear_extracted_names(["a", "b"], ["last", "delta_lag_1", "mean_w_5"])
     assert [r["extracted_feature_name"] for r in rows] == ["a:last", "b:last", "a:delta_lag_1", "b:delta_lag_1", "a:mean_w_5", "b:mean_w_5"]
