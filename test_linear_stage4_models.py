@@ -219,6 +219,117 @@ def test_abs_all_log_cmssl_schema_only_matches_summarize_schema():
         pred["mag_up_sqrt"].detach().cpu().numpy(),
         pred["mag_down_sqrt"].detach().cpu().numpy(),
     )
+
+
+def test_collect_predictions_streaming_abs_mode_has_only_abs_keys(monkeypatch):
+    import linear_offline
+    from CMSSL17 import NUM_HORIZONS
+    from CMSSL17_linear import LinearSklearnTakerBundle
+
+    class FakeDirection:
+        def decision_function(self, Z):
+            return np.full(Z.shape[0], 0.25, dtype=np.float32)
+
+    class FakeRegressor:
+        def __init__(self, value):
+            self.value = value
+
+        def predict(self, Z):
+            return np.full(Z.shape[0], self.value, dtype=np.float32)
+
+    Z = np.ones((6, 4), dtype=np.float32)
+    y = np.zeros((6, 3), dtype=np.float32)
+    pos = np.arange(6, dtype=np.int64)
+    fake_ds = [None] * len(y)
+    monkeypatch.setattr(
+        linear_offline,
+        "iter_preprocessed_batches_from_dataset",
+        lambda **kwargs: iter([(Z, y, pos)]),
+    )
+
+    bundle = LinearSklearnTakerBundle(
+        "linear_target_models_stage4_v1",
+        {"mag_log_pred_clip": 20.0},
+        [200, 500, 1000],
+        [FakeDirection() for _ in range(NUM_HORIZONS)],
+        [],
+        [],
+        1e-4,
+        {},
+        "abs_all_log",
+        None,
+        None,
+        [FakeRegressor(np.log1p(1.5)) for _ in range(NUM_HORIZONS)],
+        np.ones(NUM_HORIZONS, dtype=np.float32),
+    )
+    payload = linear_offline.collect_predictions_and_labels_streaming(
+        model_bundle=bundle,
+        extractor=object(),
+        preprocess_bundle=object(),
+        ds=fake_ds,
+        max_rows=0,
+        batch_rows=8,
+        split_name="unit_abs",
+    )
+    assert set(payload) == {"dir_logits", "p_up", "mag_abs_log", "mag_abs_bps", "pred_abs_bps", "edge_bps", "y", "positions"}
+    assert "mag_up_sqrt" not in payload
+    assert "mag_down_sqrt" not in payload
+    assert payload["y"].shape[0] == 6
+
+
+def test_collect_predictions_streaming_side_mode_has_only_side_keys(monkeypatch):
+    import linear_offline
+    from CMSSL17 import NUM_HORIZONS
+    from CMSSL17_linear import LinearSklearnTakerBundle
+
+    class FakeDirection:
+        def decision_function(self, Z):
+            return np.full(Z.shape[0], 0.25, dtype=np.float32)
+
+    class FakeRegressor:
+        def __init__(self, value):
+            self.value = value
+
+        def predict(self, Z):
+            return np.full(Z.shape[0], self.value, dtype=np.float32)
+
+    Z = np.ones((6, 4), dtype=np.float32)
+    y = np.zeros((6, 3), dtype=np.float32)
+    pos = np.arange(6, dtype=np.int64)
+    fake_ds = [None] * len(y)
+    monkeypatch.setattr(
+        linear_offline,
+        "iter_preprocessed_batches_from_dataset",
+        lambda **kwargs: iter([(Z, y, pos)]),
+    )
+
+    bundle = LinearSklearnTakerBundle(
+        "linear_target_models_stage4_v1",
+        {"mag_log_pred_clip": 20.0},
+        [200, 500, 1000],
+        [FakeDirection() for _ in range(NUM_HORIZONS)],
+        [FakeRegressor(np.log1p(1.0)) for _ in range(NUM_HORIZONS)],
+        [FakeRegressor(np.log1p(1.25)) for _ in range(NUM_HORIZONS)],
+        1e-4,
+        {},
+        "side_cond_log",
+        np.ones(NUM_HORIZONS, dtype=np.float32),
+        np.ones(NUM_HORIZONS, dtype=np.float32),
+    )
+    payload = linear_offline.collect_predictions_and_labels_streaming(
+        model_bundle=bundle,
+        extractor=object(),
+        preprocess_bundle=object(),
+        ds=fake_ds,
+        max_rows=0,
+        batch_rows=8,
+        split_name="unit_side",
+    )
+    assert set(payload) == {"dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "pred_abs_bps", "edge_bps", "y", "positions"}
+    assert "mag_abs_log" not in payload
+    assert "mag_abs_bps" not in payload
+
+
 def test_side_cond_log_mag_targets_np():
     from CMSSL17_linear import side_cond_log_mag_targets_np
     y = np.asarray([[0.0, 1.0, -2.0], [3.0, 0.0, -4.0]], dtype=np.float32)

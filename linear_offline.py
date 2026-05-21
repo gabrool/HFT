@@ -3183,11 +3183,19 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
 
 
 def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, max_rows: int, batch_rows: int, split_name: str, progress_stage: str = "stage4", progress_action: str = "diagnostics") -> Dict[str, np.ndarray]:
-    parts = {k: [] for k in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "mag_abs_log", "mag_abs_bps", "pred_abs_bps", "edge_bps", "y", "positions"]}
+    mag_mode = str(getattr(model_bundle, "mag_mode", "side_cond_log")).strip().lower()
+    base_keys = ["dir_logits", "p_up", "edge_bps", "y", "positions"]
+    if mag_mode == "abs_all_log":
+        required_keys = base_keys + ["mag_abs_log", "mag_abs_bps", "pred_abs_bps"]
+    elif mag_mode == "side_cond_log":
+        required_keys = base_keys + ["mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "pred_abs_bps"]
+    else:
+        raise ValueError(f"Unsupported mag_mode={mag_mode!r}")
+    parts = {k: [] for k in required_keys}
     base_iter = iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name)
     for Z, y, pos in progress_iter_rows(base_iter, total_rows=decision_row_count(len(ds), max_rows=max_rows), desc=_progress_desc(progress_stage, progress_action, split_name)):
         pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); p = _sigmoid_np(dl)
-        if "mag_abs_bps" in pred:
+        if mag_mode == "abs_all_log":
             ab = np.asarray(pred["mag_abs_bps"], dtype=np.float32); edge = (2.0 * p - 1.0) * ab
             vals=[("dir_logits", dl), ("p_up", p), ("mag_abs_log", np.asarray(pred["mag_abs_log"], dtype=np.float32)), ("mag_abs_bps", ab), ("pred_abs_bps", ab), ("edge_bps", edge), ("y", y), ("positions", pos)]
         else:
@@ -3195,6 +3203,9 @@ def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTaker
             vals=[("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_log", np.asarray(pred["mag_up_log"], dtype=np.float32)), ("mag_down_log", np.asarray(pred["mag_down_log"], dtype=np.float32)), ("mag_up_bps", ub), ("mag_down_bps", db), ("pred_abs_bps", 0.5*(ub+db)), ("edge_bps", edge), ("y", y), ("positions", pos)]
         for k, v in vals: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
     if not parts["y"]: raise ValueError(f"Streaming split contains no rows: {split_name}")
+    missing = [k for k, v in parts.items() if not v]
+    if missing:
+        raise ValueError(f"collect_predictions_and_labels_streaming missing required prediction arrays for mag_mode={mag_mode!r}, split={split_name!r}: {missing}")
     print(f"[linear-stream] stage={progress_stage} action={progress_action} split={split_name} rows={sum(x.shape[0] for x in parts['y'])}", flush=True)
     return {k: np.concatenate(v, axis=0) for k, v in parts.items()}
 
