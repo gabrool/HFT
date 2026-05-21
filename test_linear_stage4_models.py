@@ -386,7 +386,7 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     assert "p90_ratio_1s=1.23" in out
     assert "lift_1s=2.5" in out
     assert "zero_pred_1s=0.07" in out
-    assert "mag_log_huber_1s=0.22" in out
+    assert "mag_huber_1s=0.22" in out
     assert "mag_sp_1s=0.44" in out
     assert "mag_p50_ratio_1s=0.88" in out
     assert "mag_p90_ratio_1s=1.23" in out
