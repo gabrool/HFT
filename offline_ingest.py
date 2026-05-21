@@ -2542,10 +2542,16 @@ def process_all(
     if router is not None:
         router.flush_all()
 
-    feature_dim_total = int(F)
-    if feature_dim_core + len(AUX_FEATURE_NAMES) != feature_dim_total:
-        raise ValueError(f"feature_dim_total mismatch: core={feature_dim_core} aux={len(AUX_FEATURE_NAMES)} total={feature_dim_total}")
     feature_dim_core = int(RAW_FEATURE_DIM_CORE)
+    feature_dim_total = int(F)
+    expected_feature_dim_core = int(RAW_FEATURE_DIM_CORE)
+    expected_feature_dim_total = int(RAW_FEATURE_DIM_TOTAL)
+    expected_aux_feature_names = list(AUX_FEATURE_NAMES)
+    if expected_feature_dim_core + len(expected_aux_feature_names) != expected_feature_dim_total:
+        raise ValueError(
+            f"feature_dim_total mismatch: core={expected_feature_dim_core} "
+            f"aux={len(expected_aux_feature_names)} total={expected_feature_dim_total}"
+        )
     label_dim = int(NUM_HORIZONS)
     if router is not None:
         week_meta_records.update(dict(router.week_metas))
@@ -2625,30 +2631,54 @@ def process_all(
         week_quality_records=week_quality_records,
         duplicate_decision_ts_count=duplicate_decision_ts_count,
     )
+    if "splits" not in meta:
+        raise ValueError("global meta missing required key 'splits'")
+    if int(meta.get("feature_dim_core", -1)) != expected_feature_dim_core:
+        raise ValueError(
+            f"global meta feature_dim_core mismatch: {meta.get('feature_dim_core')!r} expected={expected_feature_dim_core!r}"
+        )
+    if int(meta.get("feature_dim_total", -1)) != expected_feature_dim_total:
+        raise ValueError(
+            f"global meta feature_dim_total mismatch: {meta.get('feature_dim_total')!r} expected={expected_feature_dim_total!r}"
+        )
+    if len(meta.get("feature_names", [])) != expected_feature_dim_core:
+        raise ValueError(
+            f"global meta feature_names length mismatch: {len(meta.get('feature_names', []))!r} "
+            f"expected={expected_feature_dim_core!r}"
+        )
+    if len(meta.get("aux_feature_names", [])) != len(expected_aux_feature_names):
+        raise ValueError(
+            f"global meta aux_feature_names length mismatch: {len(meta.get('aux_feature_names', []))!r} "
+            f"expected={len(expected_aux_feature_names)!r}"
+        )
     if week_meta_records:
         expected_mode = canonical_mode_fields()
         for wk in weeks_in_order:
             week_meta = week_meta_records.get(wk)
             if not week_meta:
                 continue
-            for field, expected in (
+            expected_pairs = [
                 ("feature_schema", FEATURE_SCHEMA),
-                ("aux_schema", AUX_SCHEMA),
-                ("feature_dim_core", feature_dim_core),
-                ("feature_dim_total", feature_dim_total),
-                ("aux_names", list(AUX_FEATURE_NAMES)),
-                ("aux_feature_names", list(AUX_FEATURE_NAMES)),
-                ("feature_names_hash", str(RAW_FEATURE_NAMES_HASH)),
                 ("feature_transform", FEATURE_TRANSFORM),
                 ("feature_transform_policy", FEATURE_TRANSFORM_POLICY),
                 ("feature_transform_spec_hash", str(RAW_FEATURE_TRANSFORM_SPEC_HASH)),
+                ("feature_dim_core", expected_feature_dim_core),
+                ("feature_dim_total", expected_feature_dim_total),
+                ("feature_names_hash", str(RAW_FEATURE_NAMES_HASH)),
+                ("aux_schema", AUX_SCHEMA),
+                ("aux_dim", AUX_DIM),
+                ("aux_names", expected_aux_feature_names),
+                ("aux_feature_names", expected_aux_feature_names),
+                ("lookback", LOOKBACK),
                 ("feature_transform_warmup_rows", int(FEATURE_TRANSFORM_WARMUP_ROWS)),
                 ("aux_transform", AUX_TRANSFORM),
                 ("feature_names", list(RAW_FEATURE_NAMES)),
-            ):
-                if week_meta.get(field) != expected:
+            ]
+            for key, expected in expected_pairs:
+                observed = week_meta.get(key)
+                if observed != expected:
                     raise ValueError(
-                        f"Week/global metadata mismatch in week '{wk}': {field}={week_meta.get(field)!r} expected={expected!r}"
+                        f"week={wk} key={key} week_value={observed!r} expected_value={expected!r}"
                     )
             for field, expected in expected_mode.items():
                 observed = week_meta.get(field)
