@@ -198,21 +198,30 @@ class LinearSklearnTakerBundle:
     mag_mode: str = "side_cond_log"
     mag_up_scale_bps: Optional[np.ndarray] = None
     mag_down_scale_bps: Optional[np.ndarray] = None
+    mag_abs_models: Optional[list[Any]] = None
+    mag_abs_scale_bps: Optional[np.ndarray] = None
 
     def predict_dict_np(self, Z: np.ndarray) -> Dict[str, np.ndarray]:
         Z = np.asarray(Z, dtype=np.float32)
         if Z.ndim != 2:
             raise ValueError(f"Z must have shape [N, D_preprocessed], got {Z.shape}")
         n_h = int(NUM_HORIZONS)
-        if len(self.direction_models) != n_h or len(self.mag_up_models) != n_h or len(self.mag_down_models) != n_h:
+        mag_mode = str(getattr(self, "mag_mode", "side_cond_log"))
+        if len(self.direction_models) != n_h:
             raise ValueError(
-                "LinearSklearnTakerBundle must contain one direction/up/down model per horizon; "
-                f"got {len(self.direction_models)}, {len(self.mag_up_models)}, {len(self.mag_down_models)}"
+                "LinearSklearnTakerBundle must contain one direction model per horizon; "
+                f"got {len(self.direction_models)}"
             )
+        if mag_mode == "side_cond_log" and (len(self.mag_up_models) != n_h or len(self.mag_down_models) != n_h):
+            raise ValueError(
+                "LinearSklearnTakerBundle side_cond_log must contain one up/down magnitude model per horizon; "
+                f"got {len(self.mag_up_models)}, {len(self.mag_down_models)}"
+            )
+        if mag_mode == "abs_all_log" and (self.mag_abs_models is None or len(self.mag_abs_models) != n_h):
+            raise ValueError("LinearSklearnTakerBundle abs_all_log must contain one abs magnitude model per horizon")
 
         dir_cols = []
-        up_cols = []
-        down_cols = []
+        up_cols = []; down_cols = []; abs_cols = []
         for h in range(n_h):
             model = self.direction_models[h]
             if hasattr(model, "decision_function"):
@@ -227,34 +236,37 @@ class LinearSklearnTakerBundle:
                 raise ValueError(f"Direction model horizon {h} returned shape {logit.shape}, expected [{Z.shape[0]}]")
             dir_cols.append(logit)
 
-            up = np.asarray(self.mag_up_models[h].predict(Z), dtype=np.float32).reshape(-1)
-            down = np.asarray(self.mag_down_models[h].predict(Z), dtype=np.float32).reshape(-1)
-            if up.shape[0] != Z.shape[0] or down.shape[0] != Z.shape[0]:
-                raise ValueError(f"Magnitude model horizon {h} returned invalid row count")
-            up_cols.append(up.astype(np.float32, copy=False))
-            down_cols.append(down.astype(np.float32, copy=False))
+            if mag_mode == "side_cond_log":
+                up = np.asarray(self.mag_up_models[h].predict(Z), dtype=np.float32).reshape(-1)
+                down = np.asarray(self.mag_down_models[h].predict(Z), dtype=np.float32).reshape(-1)
+                if up.shape[0] != Z.shape[0] or down.shape[0] != Z.shape[0]:
+                    raise ValueError(f"Magnitude model horizon {h} returned invalid row count")
+                up_cols.append(up.astype(np.float32, copy=False))
+                down_cols.append(down.astype(np.float32, copy=False))
+            else:
+                abs_log = np.asarray(self.mag_abs_models[h].predict(Z), dtype=np.float32).reshape(-1)
+                abs_cols.append(abs_log.astype(np.float32, copy=False))
 
-        up_log = np.stack(up_cols, axis=1).astype(np.float32, copy=False)
-        down_log = np.stack(down_cols, axis=1).astype(np.float32, copy=False)
+        if mag_mode == "side_cond_log":
+            up_log = np.stack(up_cols, axis=1).astype(np.float32, copy=False)
+            down_log = np.stack(down_cols, axis=1).astype(np.float32, copy=False)
+        else:
+            abs_log = np.stack(abs_cols, axis=1).astype(np.float32, copy=False)
         up_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_up_scale_bps is None else np.asarray(self.mag_up_scale_bps, dtype=np.float32)
         down_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_down_scale_bps is None else np.asarray(self.mag_down_scale_bps, dtype=np.float32)
         pred_log_clip = float(self.config.get("mag_log_pred_clip", 20.0))
-        up_bps, down_bps = inverse_side_cond_log_mag_np(
-            up_log,
-            down_log,
-            up_scale_bps=up_scale_raw,
-            down_scale_bps=down_scale_raw,
-            mag_floor_bps=float(self.mag_floor),
-            pred_log_clip=pred_log_clip,
-        )
+        if mag_mode == "side_cond_log":
+            up_bps, down_bps = inverse_side_cond_log_mag_np(
+                up_log, down_log, up_scale_bps=up_scale_raw, down_scale_bps=down_scale_raw, mag_floor_bps=float(self.mag_floor), pred_log_clip=pred_log_clip,
+            )
+        else:
+            abs_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_abs_scale_bps is None else np.asarray(self.mag_abs_scale_bps, dtype=np.float32)
+            abs_log_clipped = np.minimum(np.maximum(abs_log, 0.0), pred_log_clip)
+            abs_bps = abs_scale_raw.reshape(1, -1) * np.expm1(abs_log_clipped)
+            abs_bps = np.maximum(abs_bps, float(self.mag_floor)).astype(np.float32, copy=False)
         return {
             "dir_logits": np.stack(dir_cols, axis=1).astype(np.float32, copy=False),
-            "mag_up_log": up_log,
-            "mag_down_log": down_log,
-            "mag_up_bps": up_bps.astype(np.float32, copy=False),
-            "mag_down_bps": down_bps.astype(np.float32, copy=False),
-            "mag_up_sqrt": np.sqrt(np.maximum(up_bps, 0.0)).astype(np.float32, copy=False),
-            "mag_down_sqrt": np.sqrt(np.maximum(down_bps, 0.0)).astype(np.float32, copy=False),
+            **({"mag_up_log": up_log, "mag_down_log": down_log, "mag_up_bps": up_bps.astype(np.float32, copy=False), "mag_down_bps": down_bps.astype(np.float32, copy=False), "mag_up_sqrt": np.sqrt(np.maximum(up_bps, 0.0)).astype(np.float32, copy=False), "mag_down_sqrt": np.sqrt(np.maximum(down_bps, 0.0)).astype(np.float32, copy=False)} if mag_mode == "side_cond_log" else {"mag_abs_log": abs_log, "mag_abs_bps": abs_bps, "pred_abs_bps": abs_bps}),
         }
 
 

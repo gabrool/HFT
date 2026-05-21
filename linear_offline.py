@@ -371,8 +371,8 @@ if LINEAR_STAGE == "stage4":
         raise ValueError("Only none for magnitude weighting in first Stage 4 implementation")
     if LINEAR_STAGE4_MAG_FLOOR <= 0:
         raise ValueError(f"BYBIT_LINEAR_STAGE4_MAG_FLOOR must be > 0, got {LINEAR_STAGE4_MAG_FLOOR}")
-    if LINEAR_STAGE4_MAG_MODE not in {"side_cond_log"}:
-        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_MODE currently supports only side_cond_log")
+    if LINEAR_STAGE4_MAG_MODE not in {"side_cond_log", "abs_all_log"}:
+        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_MODE currently supports only side_cond_log or abs_all_log")
     if LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE not in {"train_median_nonzero_side", "train_q75_nonzero_side"}:
         raise ValueError("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE must be one of: train_median_nonzero_side, train_q75_nonzero_side")
     if LINEAR_STAGE4_MAG_LOG_SCALE_EPS <= 0:
@@ -1947,6 +1947,32 @@ def add_side_cond_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarra
         metrics.setdefault("zero_row_up_pred_p90_bps",[]).append(float(np.percentile(mag_up_bps[zero_rows,h],90)) if np.any(zero_rows) else float('nan'))
         metrics.setdefault("zero_row_down_pred_p90_bps",[]).append(float(np.percentile(mag_down_bps[zero_rows,h],90)) if np.any(zero_rows) else float('nan'))
         metrics.setdefault("zero_row_mean_pred_abs_bps",[]).append(float(np.mean(0.5*(mag_up_bps[zero_rows,h]+mag_down_bps[zero_rows,h]))) if np.any(zero_rows) else float('nan'))
+        metrics.setdefault("mag_primary_huber", []).append(metrics["mean_side_log_huber_cond"][-1])
+        metrics.setdefault("mag_primary_spearman", []).append(metrics["mean_side_spearman_cond"][-1])
+        metrics.setdefault("mag_primary_p50_ratio", []).append(metrics["mean_side_p50_ratio_cond"][-1])
+        metrics.setdefault("mag_primary_p90_ratio", []).append(metrics["mean_side_p90_ratio_cond"][-1])
+        metrics.setdefault("mag_primary_top_bottom_true_mean_lift", []).append(metrics["mean_side_top_bottom_true_mean_lift_cond"][-1])
+
+def add_abs_all_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarray, pred: Dict[str, np.ndarray], scale_abs_bps: np.ndarray) -> None:
+    y = np.asarray(y, dtype=np.float32); pa = np.asarray(pred["mag_abs_bps"], dtype=np.float32)
+    pl = np.asarray(pred["mag_abs_log"], dtype=np.float32)
+    for h in range(y.shape[1]):
+        ta = np.abs(y[:, h]); zl = ta == 0.0; nz = ta > 0.0
+        tl = np.log1p(ta / max(float(scale_abs_bps[h]), 1e-12)); err = pl[:, h] - tl
+        hub = float(np.mean(np.where(np.abs(err) <= 1.0, 0.5 * err * err, np.abs(err) - 0.5)))
+        sp_all = float(_safe_spearman_np(pa[:, h], ta)); sp_nz = float(_safe_spearman_np(pa[nz, h], ta[nz])) if np.any(nz) else float("nan")
+        metrics.setdefault("abs_log_huber_all", []).append(hub); metrics.setdefault("abs_spearman_all", []).append(sp_all); metrics.setdefault("abs_spearman_nonzero", []).append(sp_nz)
+        metrics.setdefault("zero_row_mean_pred_abs_bps", []).append(float(np.mean(pa[zl, h])) if np.any(zl) else float("nan"))
+        metrics.setdefault("zero_row_p90_pred_abs_bps", []).append(float(np.percentile(pa[zl, h], 90)) if np.any(zl) else float("nan"))
+        metrics.setdefault("mag_primary_huber", []).append(hub); metrics.setdefault("mag_primary_spearman", []).append(sp_nz if np.isfinite(sp_nz) else sp_all)
+
+def add_direction_zero_row_diagnostics(metrics: Dict[str, Any], *, y: np.ndarray, pred: Dict[str, np.ndarray], stats: Dict[str, np.ndarray]) -> None:
+    dl = np.asarray(pred["dir_logits"], dtype=np.float32); pr = _sigmoid_np(dl); y = np.asarray(y, dtype=np.float32)
+    _kp, _kn, kept = build_signed_side_trim_masks_from_stats_np(y, stats)
+    for h in range(y.shape[1]):
+        for name, rows in [("zero", y[:, h] == 0.0), ("nonzero", y[:, h] != 0.0), ("kept", kept[:, h])]:
+            vals = np.abs(dl[rows, h]) if np.any(rows) else np.asarray([], dtype=np.float32)
+            metrics.setdefault(f"dir_{name}_abs_logit_mean", []).append(float(np.mean(vals)) if vals.size else float("nan"))
 
 
 def _slice_prediction_payload(pred_payload: Dict[str, np.ndarray], mask_or_indices: np.ndarray) -> Dict[str, np.ndarray]:
@@ -2892,7 +2918,11 @@ def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extrac
     metrics = summarize_metrics(LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).to(device), source, device, stats, amp_enabled=False, amp_dtype=torch.float32, primary_only=False, epoch=0, band_diag=BAND_DIAG, split_name=split_name)
     if include_cond_mag_metrics:
         pred_payload = collect_predictions_and_labels_streaming(model_bundle=bundle, extractor=extractor, preprocess_bundle=preprocess_bundle, ds=ds, max_rows=max_rows, batch_rows=LINEAR_STAGE4_BATCH_ROWS if batch_rows is None else int(batch_rows), split_name=f"{split_name}_all_rows_eval", progress_stage=eval_stage, progress_action="cond_mag_eval" if eval_stage == "stage4" else "diagnostics")
-        add_side_cond_log_magnitude_metrics(metrics, y=np.asarray(pred_payload["y"], dtype=np.float32), pred=pred_payload, scale_up_bps=np.asarray(bundle.mag_up_scale_bps, dtype=np.float32), scale_down_bps=np.asarray(bundle.mag_down_scale_bps, dtype=np.float32))
+        if str(getattr(bundle, "mag_mode", "side_cond_log")) == "abs_all_log":
+            add_abs_all_log_magnitude_metrics(metrics, y=np.asarray(pred_payload["y"], dtype=np.float32), pred=pred_payload, scale_abs_bps=np.asarray(bundle.mag_abs_scale_bps, dtype=np.float32))
+        else:
+            add_side_cond_log_magnitude_metrics(metrics, y=np.asarray(pred_payload["y"], dtype=np.float32), pred=pred_payload, scale_up_bps=np.asarray(bundle.mag_up_scale_bps, dtype=np.float32), scale_down_bps=np.asarray(bundle.mag_down_scale_bps, dtype=np.float32))
+        add_direction_zero_row_diagnostics(metrics, y=np.asarray(pred_payload["y"], dtype=np.float32), pred=pred_payload, stats=stats)
     pv, pl = compute_primary_metric(metrics); metrics["primary_metric_value"] = float(pv); metrics["primary_metric_label"] = str(pl); return metrics
 
 
@@ -3011,14 +3041,17 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
 
 
 def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, max_rows: int, batch_rows: int, split_name: str, progress_stage: str = "stage4", progress_action: str = "diagnostics") -> Dict[str, np.ndarray]:
-    parts = {k: [] for k in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "edge_bps", "y", "positions"]}
+    parts = {k: [] for k in ["dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "mag_abs_log", "mag_abs_bps", "pred_abs_bps", "edge_bps", "y", "positions"]}
     base_iter = iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name)
     for Z, y, pos in progress_iter_rows(base_iter, total_rows=decision_row_count(len(ds), max_rows=max_rows), desc=_progress_desc(progress_stage, progress_action, split_name)):
         pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); p = _sigmoid_np(dl)
-        ub, db = extract_mag_bps_from_prediction(pred)
-        up = np.sqrt(np.maximum(ub, 0.0)); dn = np.sqrt(np.maximum(db, 0.0))
-        edge = p * ub - (1.0 - p) * db
-        for k, v in [("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_log", np.asarray(pred["mag_up_log"], dtype=np.float32)), ("mag_down_log", np.asarray(pred["mag_down_log"], dtype=np.float32)), ("mag_up_bps", ub), ("mag_down_bps", db), ("edge_bps", edge), ("y", y), ("positions", pos)]: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
+        if "mag_abs_bps" in pred:
+            ab = np.asarray(pred["mag_abs_bps"], dtype=np.float32); edge = (2.0 * p - 1.0) * ab
+            vals=[("dir_logits", dl), ("p_up", p), ("mag_abs_log", np.asarray(pred["mag_abs_log"], dtype=np.float32)), ("mag_abs_bps", ab), ("pred_abs_bps", ab), ("edge_bps", edge), ("y", y), ("positions", pos)]
+        else:
+            ub, db = extract_mag_bps_from_prediction(pred); up = np.sqrt(np.maximum(ub, 0.0)); dn = np.sqrt(np.maximum(db, 0.0)); edge = p * ub - (1.0 - p) * db
+            vals=[("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_log", np.asarray(pred["mag_up_log"], dtype=np.float32)), ("mag_down_log", np.asarray(pred["mag_down_log"], dtype=np.float32)), ("mag_up_bps", ub), ("mag_down_bps", db), ("pred_abs_bps", 0.5*(ub+db)), ("edge_bps", edge), ("y", y), ("positions", pos)]
+        for k, v in vals: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
     if not parts["y"]: raise ValueError(f"Streaming split contains no rows: {split_name}")
     print(f"[linear-stream] stage={progress_stage} action={progress_action} split={split_name} rows={sum(x.shape[0] for x in parts['y'])}", flush=True)
     return {k: np.concatenate(v, axis=0) for k, v in parts.items()}
