@@ -2542,8 +2542,6 @@ def process_all(
     if router is not None:
         router.flush_all()
 
-    feature_dim_core = int(RAW_FEATURE_DIM_CORE)
-    feature_dim_total = int(F)
     expected_feature_dim_core = int(RAW_FEATURE_DIM_CORE)
     expected_feature_dim_total = int(RAW_FEATURE_DIM_TOTAL)
     expected_aux_feature_names = list(AUX_FEATURE_NAMES)
@@ -2695,7 +2693,7 @@ def process_all(
 
     print(
         f"[done ] dataset weeks={len(pairs)} total_rows={total_feature_rows} total_labels={total_labels} "
-        f"L={LOOKBACK} F={feature_dim_total or 0} chunkN={meta['chunk_size_used']}"
+        f"L={LOOKBACK} F={expected_feature_dim_total} chunkN={meta['chunk_size_used']}"
     )
     _print_coarse_timing_totals(
         "[ingest-time]",
