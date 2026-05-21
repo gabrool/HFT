@@ -57,6 +57,7 @@ from CMSSL17_linear import (  # type: ignore
     save_linear_sklearn_bundle,
     load_linear_sklearn_bundle,
     side_cond_log_mag_targets_np,
+    abs_all_log_mag_targets_np,
 )
 
 
@@ -2830,6 +2831,30 @@ def compute_side_log_mag_scales_from_train_plan(*, plan: Dict[str, Any], source:
     return up_scale, down_scale
 
 
+
+
+def compute_abs_log_mag_scales_from_train_plan(*, plan: Dict[str, Any], source: str, eps: float, batch_rows: int) -> np.ndarray:
+    n_h = len(HORIZONS_MS); parts = [[] for _ in range(n_h)]
+    for week_idx in range(len(plan["train_split_entries"])):
+        ds = build_train_week_dataset(plan=plan, week_index=week_idx); tag = f"stage4_mag_abs_scales_week{week_idx}"
+        try:
+            positions = _dataset_positions(len(ds), 0)
+            for start in range(0, len(positions), int(batch_rows)):
+                y = np.asarray(ds.y[positions[start:start + int(batch_rows)]], dtype=np.float32)
+                for h in range(n_h):
+                    v = np.abs(y[:, h]); v = v[v > 0.0]
+                    if v.size: parts[h].append(v.astype(np.float32, copy=False))
+        finally:
+            close_dataset(ds, name=tag); del ds; force_gc(tag)
+    out = np.zeros(n_h, dtype=np.float32)
+    for h in range(n_h):
+        x = np.concatenate(parts[h], axis=0) if parts[h] else np.asarray([], dtype=np.float32)
+        if x.size == 0: sc = float(eps)
+        elif source == "train_q75_nonzero_side": sc = float(np.quantile(x, 0.75))
+        else: sc = float(np.median(x))
+        out[h] = max(sc, float(eps))
+    print(f"[linear-mag-scale] mode=abs_all_log source={source} abs_scale_bps={out.tolist()}", flush=True)
+    return out
 def compute_global_direction_weights_from_train_labels_plan(*, plan: Dict[str, Any], stats: Dict[str, np.ndarray], mode: str, batch_rows: int) -> list[tuple[float, float]]:
     mode = str(mode).lower()
     if mode == "none": return [(1.0, 1.0) for _ in HORIZONS_MS]
@@ -2882,7 +2907,7 @@ def train_direction_models_streaming_from_plan(**kwargs: Any) -> list[LinearSkle
         out.append({"direction_alpha": float(c["direction_alpha"]), "direction_models": c["direction_models"], "fit_summary": {"direction_alpha": float(c["direction_alpha"]), "train_rows": int(train_rows), "dir_rows_per_horizon": c["dc"].tolist(), "direction_weights_neg_pos": [(float(a), float(b)) for a, b in direction_weights], "direction_training_rows": "kept_signed_rows"}})
     return out
 
-def train_magnitude_models_streaming_from_plan(*, extractor: Any, preprocess_bundle: LinearPreprocessBundle, plan: Dict[str, Any], mag_alpha_values: list[float], config: Dict[str, Any]) -> list[dict]:
+def _train_side_cond_log_magnitude_models_streaming_from_plan(*, extractor: Any, preprocess_bundle: LinearPreprocessBundle, plan: Dict[str, Any], mag_alpha_values: list[float], config: Dict[str, Any]) -> list[dict]:
     n_h = len(HORIZONS_MS)
     cands = [{"mag_alpha": float(a), "mag_up_models": [make_magnitude_model(alpha=float(a), config=config) for _ in HORIZONS_MS], "mag_down_models": [make_magnitude_model(alpha=float(a), config=config) for _ in HORIZONS_MS], "uc": np.zeros(n_h, dtype=np.int64), "dc": np.zeros(n_h, dtype=np.int64)} for a in mag_alpha_values]
     train_rows = train_decision_row_count_from_plan(plan, max_rows=0)
@@ -2894,21 +2919,48 @@ def train_magnitude_models_streaming_from_plan(*, extractor: Any, preprocess_bun
             up_log_targets, down_log_targets = side_cond_log_mag_targets_np(y, up_scale_bps=up_scale, down_scale_bps=down_scale, target_clip=float(config.get("mag_log_target_clip", 0.0)))
             for c in cands:
                 for h in range(n_h):
-                    up_rows = y[:, h] > 0.0
-                    down_rows = y[:, h] < 0.0
-                    if np.any(up_rows):
-                        c["mag_up_models"][h].partial_fit(Z[up_rows], up_log_targets[up_rows, h]); c["uc"][h] += int(np.sum(up_rows))
-                    if np.any(down_rows):
-                        c["mag_down_models"][h].partial_fit(Z[down_rows], down_log_targets[down_rows, h]); c["dc"][h] += int(np.sum(down_rows))
+                    up_rows = y[:, h] > 0.0; down_rows = y[:, h] < 0.0
+                    if np.any(up_rows): c["mag_up_models"][h].partial_fit(Z[up_rows], up_log_targets[up_rows, h]); c["uc"][h] += int(np.sum(up_rows))
+                    if np.any(down_rows): c["mag_down_models"][h].partial_fit(Z[down_rows], down_log_targets[down_rows, h]); c["dc"][h] += int(np.sum(down_rows))
     out = []
     for c in cands:
-        out.append({"mag_alpha": float(c["mag_alpha"]), "mag_up_models": c["mag_up_models"], "mag_down_models": c["mag_down_models"], "fit_summary": {"mag_alpha": float(c["mag_alpha"]), "train_rows": int(train_rows), "up_rows_per_horizon": c["uc"].tolist(), "down_rows_per_horizon": c["dc"].tolist(), "mag_mode": "side_cond_log", "mag_target_transform": "log1p(side_bps / side_scale_bps)", "mag_inverse_transform": "side_scale_bps * expm1(pred_log)", "mag_training_rows": "side_active_rows", "mag_model_output_units": "log1p_side_bps_scaled", "mag_prediction_units": "bps", "mag_log_scale_source": str(config.get("mag_log_scale_source", "train_median_nonzero_side")), "mag_log_scale_eps": float(config.get("mag_log_scale_eps", 1e-6)), "mag_log_target_clip": float(config.get("mag_log_target_clip", 0.0)), "mag_log_pred_clip": float(config.get("mag_log_pred_clip", 20.0)), "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist(), "mag_eval": "side_conditional_rows_only"}})
+        out.append({"mag_alpha": float(c["mag_alpha"]), "mag_mode": "side_cond_log", "mag_up_models": c["mag_up_models"], "mag_down_models": c["mag_down_models"], "mag_abs_models": [], "fit_summary": {"mag_alpha": float(c["mag_alpha"]), "train_rows": int(train_rows), "up_rows_per_horizon": c["uc"].tolist(), "down_rows_per_horizon": c["dc"].tolist(), "mag_mode": "side_cond_log", "mag_training_rows": "side_active_rows", "mag_up_scale_bps": up_scale.tolist(), "mag_down_scale_bps": down_scale.tolist(), "mag_eval": "side_conditional_rows_only"}})
     return out
+
+def _train_abs_all_log_magnitude_models_streaming_from_plan(*, extractor: Any, preprocess_bundle: LinearPreprocessBundle, plan: Dict[str, Any], mag_alpha_values: list[float], config: Dict[str, Any]) -> list[dict]:
+    n_h = len(HORIZONS_MS); train_rows = train_decision_row_count_from_plan(plan, max_rows=0); abs_scale = np.asarray(config["mag_abs_scale_bps"], dtype=np.float32); out=[]
+    for alpha in mag_alpha_values:
+        models = [make_magnitude_model(alpha=float(alpha), config=config) for _ in HORIZONS_MS]
+        rows = np.zeros(n_h, dtype=np.int64); zeros = np.zeros(n_h, dtype=np.int64); nonzeros = np.zeros(n_h, dtype=np.int64)
+        for epoch in range(int(config["epochs"])):
+            rng = np.random.default_rng(int(config["random_state"]) + epoch)
+            train_iter = iter_preprocessed_batches_from_train_plan(extractor=extractor, bundle=preprocess_bundle, plan=plan, batch_rows=int(config["batch_rows"]), max_rows=0, split_name="train_full", shuffle_within_batch=True, rng=rng)
+            for Z, y, _p in progress_iter_rows(train_iter, total_rows=train_rows, desc=f"stage4 magnitude train epoch {epoch + 1}/{config['epochs']}"):
+                target_log = abs_all_log_mag_targets_np(y, abs_scale_bps=abs_scale, target_clip=float(config.get("mag_log_target_clip", 0.0)))
+                for h in range(n_h):
+                    models[h].partial_fit(Z, target_log[:, h])
+                    if epoch == 0:
+                        rows[h] += int(y.shape[0]); zeros[h] += int(np.sum(y[:, h] == 0.0)); nonzeros[h] += int(np.sum(y[:, h] != 0.0))
+        out.append({"mag_alpha": float(alpha), "mag_mode": "abs_all_log", "mag_abs_models": models, "mag_up_models": [], "mag_down_models": [], "fit_summary": {"mag_mode": "abs_all_log", "mag_training_rows": "all_decision_rows", "abs_rows_per_horizon": rows.tolist(), "zero_rows_per_horizon": zeros.tolist(), "nonzero_rows_per_horizon": nonzeros.tolist(), "mag_abs_scale_bps": abs_scale.tolist()}})
+    return out
+
+def train_magnitude_models_streaming_from_plan(*, extractor: Any, preprocess_bundle: LinearPreprocessBundle, plan: Dict[str, Any], mag_alpha_values: list[float], config: Dict[str, Any]) -> list[dict]:
+    mag_mode = str(config.get("mag_mode", "side_cond_log")).strip().lower()
+    if mag_mode == "side_cond_log":
+        return _train_side_cond_log_magnitude_models_streaming_from_plan(extractor=extractor, preprocess_bundle=preprocess_bundle, plan=plan, mag_alpha_values=mag_alpha_values, config=config)
+    if mag_mode == "abs_all_log":
+        return _train_abs_all_log_magnitude_models_streaming_from_plan(extractor=extractor, preprocess_bundle=preprocess_bundle, plan=plan, mag_alpha_values=mag_alpha_values, config=config)
+    raise ValueError(f"Unsupported mag_mode={mag_mode!r}")
 
 def build_stage4_bundle_from_parts(*, config: Dict[str, Any], horizons_ms: list[int], direction_result: Dict[str, Any], magnitude_result: Dict[str, Any]) -> LinearSklearnTakerBundle:
     bundle_config = dict(config); bundle_config["alpha"] = float(direction_result["direction_alpha"]); bundle_config["direction_alpha"] = float(direction_result["direction_alpha"]); bundle_config["mag_alpha"] = float(magnitude_result["mag_alpha"])
     fit_summary = {"direction_alpha": float(direction_result["direction_alpha"]), "mag_alpha": float(magnitude_result["mag_alpha"]), "direction_fit_summary": direction_result["fit_summary"], "magnitude_fit_summary": magnitude_result["fit_summary"], "combined_stage4_bundle": True}
-    return LinearSklearnTakerBundle(schema=LINEAR_STAGE4_SCHEMA, config=bundle_config, horizons_ms=[int(h) for h in horizons_ms], direction_models=direction_result["direction_models"], mag_up_models=magnitude_result["mag_up_models"], mag_down_models=magnitude_result["mag_down_models"], mag_floor=float(config["mag_floor"]), fit_summary=fit_summary, mag_mode=str(config.get("mag_mode", "side_cond_log")), mag_up_scale_bps=np.asarray(config["mag_up_scale_bps"], dtype=np.float32), mag_down_scale_bps=np.asarray(config["mag_down_scale_bps"], dtype=np.float32))
+    mag_mode = str(config.get("mag_mode", "side_cond_log")).strip().lower()
+    if mag_mode == "side_cond_log":
+        return LinearSklearnTakerBundle(schema=LINEAR_STAGE4_SCHEMA, config=bundle_config, horizons_ms=[int(h) for h in horizons_ms], direction_models=direction_result["direction_models"], mag_up_models=magnitude_result["mag_up_models"], mag_down_models=magnitude_result["mag_down_models"], mag_floor=float(config["mag_floor"]), fit_summary=fit_summary, mag_mode=mag_mode, mag_up_scale_bps=np.asarray(config["mag_up_scale_bps"], dtype=np.float32), mag_down_scale_bps=np.asarray(config["mag_down_scale_bps"], dtype=np.float32), mag_abs_models=None, mag_abs_scale_bps=None)
+    if mag_mode == "abs_all_log":
+        return LinearSklearnTakerBundle(schema=LINEAR_STAGE4_SCHEMA, config=bundle_config, horizons_ms=[int(h) for h in horizons_ms], direction_models=direction_result["direction_models"], mag_up_models=[], mag_down_models=[], mag_floor=float(config["mag_floor"]), fit_summary=fit_summary, mag_mode=mag_mode, mag_up_scale_bps=None, mag_down_scale_bps=None, mag_abs_models=magnitude_result["mag_abs_models"], mag_abs_scale_bps=np.asarray(config["mag_abs_scale_bps"], dtype=np.float32))
+    raise ValueError(f"Unsupported mag_mode={mag_mode!r}")
 
 def evaluate_stage4_bundle_streaming(*, bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, stats: Dict[str, np.ndarray], device: torch.device, split_name: str, max_rows: int = 0, batch_rows: Optional[int] = None, include_cond_mag_metrics: bool = True) -> Dict[str, Any]:
     eval_stage = "stage5" if str(split_name).startswith("stage5_") else "stage4"

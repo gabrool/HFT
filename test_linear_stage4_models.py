@@ -602,6 +602,7 @@ def test_stable_sigmoid_handles_large_logits_without_warning():
 
 def test_abs_all_log_metrics_and_direction_zero_diag():
     import linear_offline
+    from CMSSL17_offline import compute_signed_raw_stats
     y = np.asarray([[0.0,1.0,-2.0],[0.0,0.0,0.0],[2.0,-1.0,4.0],[-3.0,0.5,0.0]],dtype=np.float32)
     pred = {
         "mag_abs_bps": np.abs(y)+0.1,
@@ -610,9 +611,9 @@ def test_abs_all_log_metrics_and_direction_zero_diag():
     }
     m={}
     linear_offline.add_abs_all_log_magnitude_metrics(m, y=y, pred=pred, scale_abs_bps=np.ones(y.shape[1],dtype=np.float32))
-    for k in ["abs_log_huber_all","abs_spearman_all","abs_spearman_nonzero","zero_row_mean_pred_abs_bps","zero_row_p90_pred_abs_bps","mag_primary_huber","mag_primary_spearman"]:
+    for k in ["abs_log_huber_all","abs_spearman_all","abs_spearman_nonzero","abs_p50_ratio_all","abs_p90_ratio_all","zero_row_mean_pred_abs_bps","zero_row_p90_pred_abs_bps","zero_row_frac_pred_abs_lt_0p1_bps","mag_primary_huber","mag_primary_spearman"]:
         assert k in m and len(m[k]) == y.shape[1]
-    stats = {"q_lo_pos": np.array([0,0,0],dtype=np.float32), "q_hi_pos": np.array([1e9,1e9,1e9],dtype=np.float32), "q_lo_neg": np.array([-1e9,-1e9,-1e9],dtype=np.float32), "q_hi_neg": np.array([0,0,0],dtype=np.float32)}
+    stats = compute_signed_raw_stats(y)
     linear_offline.add_direction_zero_row_diagnostics(m, y=y, pred=pred, stats=stats)
-    for k in ["dir_zero_abs_logit_mean","dir_nonzero_abs_logit_mean","dir_kept_abs_logit_mean"]:
+    for k in ["dir_zero_abs_logit_mean","dir_zero_abs_logit_p90","dir_zero_abs_prob_minus_0p5_mean","dir_zero_frac_abs_logit_lt_0p25","dir_nonzero_abs_logit_mean","dir_kept_abs_logit_mean"]:
         assert k in m and len(m[k]) == y.shape[1]
