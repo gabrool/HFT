@@ -321,7 +321,20 @@ class LinearSklearnTorchWrapper(nn.Module):
             if mag_mode == "side_cond_log":
                 pred = {"dir_logits": pred["dir_logits"], "mag_up_sqrt": pred["mag_up_sqrt"], "mag_down_sqrt": pred["mag_down_sqrt"]}
             elif mag_mode == "abs_all_log":
-                pred = {"dir_logits": pred["dir_logits"]}
+                abs_bps = np.asarray(
+                    pred.get("pred_abs_bps", pred.get("mag_abs_bps")),
+                    dtype=np.float32,
+                )
+                if abs_bps.ndim != 2:
+                    raise ValueError(f"abs_all_log pred_abs_bps must be 2D, got {abs_bps.shape}")
+
+                abs_sqrt = np.sqrt(np.maximum(abs_bps, 0.0)).astype(np.float32, copy=False)
+
+                pred = {
+                    "dir_logits": pred["dir_logits"],
+                    "mag_up_sqrt": abs_sqrt,
+                    "mag_down_sqrt": abs_sqrt,
+                }
             else:
                 raise ValueError(f"Unsupported mag_mode={mag_mode!r}")
 

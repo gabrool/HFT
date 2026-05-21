@@ -157,8 +157,68 @@ def test_torch_wrapper_cmssl_schema_only_filters_extra_keys():
 
     strict = LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).forward(FakeTensor())
     assert set(strict) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
+    assert strict["mag_up_sqrt"].shape == strict["dir_logits"].shape
+    assert strict["mag_down_sqrt"].shape == strict["dir_logits"].shape
+    assert np.allclose(
+        strict["mag_up_sqrt"].detach().cpu().numpy(),
+        strict["mag_down_sqrt"].detach().cpu().numpy(),
+    )
 
 
+def test_abs_all_log_cmssl_schema_only_matches_summarize_schema():
+    import torch
+    from CMSSL17 import NUM_HORIZONS
+    from CMSSL17_linear import LinearSklearnTakerBundle, LinearSklearnTorchWrapper
+
+    class FakeDirection:
+        def decision_function(self, Z):
+            return Z[:, 0]
+
+    class FakeRegressor:
+        def __init__(self, value):
+            self.value = value
+
+        def predict(self, Z):
+            return np.full(Z.shape[0], self.value, dtype=np.float32)
+
+    Z = np.ones((6, 4), dtype=np.float32)
+
+    bundle = LinearSklearnTakerBundle(
+        "linear_target_models_stage4_v1",
+        {"mag_log_pred_clip": 20.0},
+        [200, 500, 1000],
+        [FakeDirection() for _ in range(NUM_HORIZONS)],
+        [],
+        [],
+        1e-4,
+        {},
+        "abs_all_log",
+        None,
+        None,
+        [FakeRegressor(np.log1p(1.5)) for _ in range(NUM_HORIZONS)],
+        np.ones(NUM_HORIZONS, dtype=np.float32),
+    )
+
+    class FakeTensor:
+        device = torch.device("cpu")
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return Z
+
+    pred = LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).forward(FakeTensor())
+    assert set(pred.keys()) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
+    assert pred["mag_up_sqrt"].shape == pred["dir_logits"].shape
+    assert pred["mag_down_sqrt"].shape == pred["dir_logits"].shape
+    assert np.allclose(
+        pred["mag_up_sqrt"].detach().cpu().numpy(),
+        pred["mag_down_sqrt"].detach().cpu().numpy(),
+    )
 def test_side_cond_log_mag_targets_np():
     from CMSSL17_linear import side_cond_log_mag_targets_np
     y = np.asarray([[0.0, 1.0, -2.0], [3.0, 0.0, -4.0]], dtype=np.float32)
