@@ -393,8 +393,12 @@ def main() -> None:
         raise ValueError(f"kept index out of range: max={int(np.max(kept_indices))} extracted_dim={len(extracted_rows)}")
 
     dir_coefs = [_extract_linear_coef(m) for m in bundle.direction_models]
-    if getattr(bundle, "mag_abs_models", None):
-        raise ValueError("feature importance currently supports side_cond_log bundles only (mag_up_models/mag_down_models required)")
+    mag_mode = str(getattr(bundle, "mag_mode", "side_cond_log")).strip().lower()
+    if mag_mode != "side_cond_log":
+        raise ValueError(
+            "linear_feature_importance.py currently supports side_cond_log bundles only; "
+            f"got mag_mode={mag_mode!r}. Run feature importance on the side_cond_log baseline."
+        )
     up_coefs = [_extract_linear_coef(m) for m in bundle.mag_up_models]
     dn_coefs = [_extract_linear_coef(m) for m in bundle.mag_down_models]
     for name, coef in [
