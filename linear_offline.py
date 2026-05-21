@@ -3162,6 +3162,7 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
         f"mag_sp_1s={best_mag_sp_1s:.6g} "
         f"mag_p50_ratio_1s={best_mag_p50_ratio_1s:.6g} "
         f"mag_p90_ratio_1s={best_mag_ratio_1s:.6g} "
+        f"mag_lift_1s={best_mag_lift_1s:.6g} "
         f"zero_pred_1s={best_zero_pred_1s:.6g} "
         f"edge_sp_1s={best_edge_sp_all_1s:.6g}",
         flush=True,
