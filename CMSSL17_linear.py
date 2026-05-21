@@ -133,6 +133,38 @@ def inverse_side_cond_log_mag_np(
     return up_bps.astype(np.float32, copy=False), down_bps.astype(np.float32, copy=False)
 
 
+def abs_all_log_mag_targets_np(
+    y: np.ndarray,
+    *,
+    abs_scale_bps: np.ndarray,
+    target_clip: float = 0.0,
+) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim != 2 or y.shape[1] != int(NUM_HORIZONS):
+        raise ValueError(f"y must have shape [N, {NUM_HORIZONS}], got {y.shape}")
+    scale = np.asarray(abs_scale_bps, dtype=np.float32).reshape(1, -1)
+    if scale.shape[1] != int(NUM_HORIZONS):
+        raise ValueError("abs_scale_bps must have NUM_HORIZONS entries")
+    target = np.log1p(np.abs(y) / np.maximum(scale, 1e-12))
+    if target_clip > 0.0:
+        target = np.clip(target, 0.0, float(target_clip))
+    return target.astype(np.float32, copy=False)
+
+
+def inverse_abs_all_log_mag_np(
+    abs_log: np.ndarray,
+    *,
+    abs_scale_bps: np.ndarray,
+    mag_floor_bps: float = 0.0,
+    pred_log_clip: float = 20.0,
+) -> np.ndarray:
+    abs_log = np.asarray(abs_log, dtype=np.float32)
+    scale = np.asarray(abs_scale_bps, dtype=np.float32).reshape(1, -1)
+    pred = np.expm1(np.clip(np.maximum(abs_log, 0.0), 0.0, float(pred_log_clip))) * scale
+    pred = np.maximum(pred, float(mag_floor_bps))
+    return pred.astype(np.float32, copy=False)
+
+
 @dataclass
 class LinearPreprocessBundle:
     schema: str
@@ -261,9 +293,7 @@ class LinearSklearnTakerBundle:
             )
         else:
             abs_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_abs_scale_bps is None else np.asarray(self.mag_abs_scale_bps, dtype=np.float32)
-            abs_log_clipped = np.minimum(np.maximum(abs_log, 0.0), pred_log_clip)
-            abs_bps = abs_scale_raw.reshape(1, -1) * np.expm1(abs_log_clipped)
-            abs_bps = np.maximum(abs_bps, float(self.mag_floor)).astype(np.float32, copy=False)
+            abs_bps = inverse_abs_all_log_mag_np(abs_log, abs_scale_bps=abs_scale_raw, mag_floor_bps=float(self.mag_floor), pred_log_clip=pred_log_clip)
         return {
             "dir_logits": np.stack(dir_cols, axis=1).astype(np.float32, copy=False),
             **({"mag_up_log": up_log, "mag_down_log": down_log, "mag_up_bps": up_bps.astype(np.float32, copy=False), "mag_down_bps": down_bps.astype(np.float32, copy=False), "mag_up_sqrt": np.sqrt(np.maximum(up_bps, 0.0)).astype(np.float32, copy=False), "mag_down_sqrt": np.sqrt(np.maximum(down_bps, 0.0)).astype(np.float32, copy=False)} if mag_mode == "side_cond_log" else {"mag_abs_log": abs_log, "mag_abs_bps": abs_bps, "pred_abs_bps": abs_bps}),
@@ -287,11 +317,13 @@ class LinearSklearnTorchWrapper(nn.Module):
         pred = self.bundle.predict_dict_np(Z)
 
         if self.cmssl_schema_only:
-            pred = {
-                "dir_logits": pred["dir_logits"],
-                "mag_up_sqrt": pred["mag_up_sqrt"],
-                "mag_down_sqrt": pred["mag_down_sqrt"],
-            }
+            mag_mode = str(getattr(self.bundle, "mag_mode", "side_cond_log")).strip().lower()
+            if mag_mode == "side_cond_log":
+                pred = {"dir_logits": pred["dir_logits"], "mag_up_sqrt": pred["mag_up_sqrt"], "mag_down_sqrt": pred["mag_down_sqrt"]}
+            elif mag_mode == "abs_all_log":
+                pred = {"dir_logits": pred["dir_logits"]}
+            else:
+                raise ValueError(f"Unsupported mag_mode={mag_mode!r}")
 
         return {
             k: torch.as_tensor(v, dtype=torch.float32, device=device)
