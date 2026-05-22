@@ -689,18 +689,18 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned153_lb10_xformv2"
-FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned153_lb10"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned144_lb10_xformv2"
+FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned144_lb10"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
-FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned153_lb10"
+FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned144_lb10"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
 CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
     + "p"
     + "ca"
-    + f"-pruned153_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
+    + f"-pruned144_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
 )
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -799,8 +799,8 @@ LARGE_TRADE_MAX_SIGNED_WINDOWS_MS = (500, 1_000)
 # - 200ms: slope + minus_ema only
 # - 500/1000ms: change + slope + minus_ema
 CVD_CHANGE_WINDOWS_MS = (500, 1_000)
-CVD_SLOPE_WINDOWS_MS = (200, 500, 1_000)
-CVD_MINUS_EMA_WINDOWS_MS = (500, 1_000)
+CVD_SLOPE_WINDOWS_MS = (500, 1_000)
+CVD_MINUS_EMA_WINDOWS_MS = (500,)
 
 # Retained replenishment/depletion outputs.
 REPLENISHMENT_KEYS_BY_WINDOW = {
@@ -847,7 +847,7 @@ NOTIONAL_CONTEXT_FEATURES = (
 )
 ROLLING_OFI_LEVELS = (1, 3, 5, 10)
 ROLLING_OBI_LEVELS = (3,)
-DEEP_MICRO_LEVELS = (3, 5, 10)
+DEEP_MICRO_LEVELS = (5, 10)
 OFI_ACCEL_PAIRS_MS = (
     (200, 500),
     (500, 1_000),
@@ -3532,7 +3532,7 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = bps(name, scale=3.0)
         elif name.startswith("depth_imbalance_5bps_slope_"):
             s = bps(name, scale=1.0)
-        elif name in {"spread_bps", "gap_a_bps", "gap_b_bps"}:
+        elif name in {"spread_bps", "gap_b_bps"}:
             s = log_ewma(name, XFORM_HL_SLOW_MS)
         elif name.startswith("mid_range_bps_") or name.startswith("return_std_bps_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
@@ -4061,7 +4061,6 @@ class FeatureEngine:
             ])
         names.extend([
             "spread_bps",
-            "gap_a_bps",
             "gap_b_bps",
             "bsz1",
             "asz1",
@@ -4119,7 +4118,7 @@ class FeatureEngine:
             ])
         for ms in FAST_WINDOWS_MS:
             names.extend([
-                f"ob_update_rate_{ms}ms",
+                *([f"ob_update_rate_{ms}ms"] if ms != 1_000 else []),
             ])
         for ms in FAST_WINDOWS_MS:
             names.extend([
@@ -4136,8 +4135,8 @@ class FeatureEngine:
                 *([f"zero_tick_fraction_{ms}ms"] if ms != 500 else []),
                 *([f"tick_sign_imbalance_{ms}ms"] if ms != 500 else []),
                 f"trade_count_per_second_{ms}ms",
-                f"vwap_vs_mid_bps_{ms}ms",
-                f"signed_trade_premium_bps_volume_weighted_{ms}ms",
+                *([f"vwap_vs_mid_bps_{ms}ms"] if ms != 1_000 else []),
+                *([f"signed_trade_premium_bps_volume_weighted_{ms}ms"] if ms != 200 else []),
             ])
         names.extend([
             "last_trade_side_sign",
@@ -4148,8 +4147,8 @@ class FeatureEngine:
         for ms in FLOW_WINDOWS_MS:
             names.extend([
                 *([f"cvd_change_usd_{ms}ms"] if ms != 200 else []),
-                f"cvd_slope_usd_per_sec_{ms}ms",
-                *([f"cvd_minus_ema_usd_{ms}ms"] if ms != 200 else []),
+                *([f"cvd_slope_usd_per_sec_{ms}ms"] if ms != 200 else []),
+                *([f"cvd_minus_ema_usd_{ms}ms"] if ms == 500 else []),
             ])
         names.extend([
             "consecutive_buy_trade_count",
@@ -4177,7 +4176,7 @@ class FeatureEngine:
                 f"spread_z_{ms}ms",
                 *([f"spread_widening_slope_bps_per_sec_{ms}ms"] if ms != 3000 else []),
                 *([f"depth_5bps_z_{ms}ms"] if ms != 1000 else []),
-                f"depth_imbalance_5bps_mean_{ms}ms",
+                *([f"depth_imbalance_5bps_mean_{ms}ms"] if ms != 3_000 else []),
                 f"depth_imbalance_5bps_slope_{ms}ms",
             ])
         for ms in FAST_WINDOWS_MS:
@@ -5341,7 +5340,6 @@ class FeatureEngine:
         bid2 = self.bid_lvls[1][0] if len(self.bid_lvls) > 1 else bid1
         gap_a = max(0.0, ask2 - ask1)
         gap_b = max(0.0, bid1 - bid2)
-        gap_a_bps = 1e4 * gap_a / max(mid, 1e-12)
         gap_b_bps = 1e4 * gap_b / max(mid, 1e-12)
 
         bsz2 = self.bid_lvls[1][1] if len(self.bid_lvls) > 1 else 0.0
@@ -5587,7 +5585,7 @@ class FeatureEngine:
             if w != 200:
                 feat_list.extend(price_features[2:])
         feat_list.extend([
-            spread_bps, gap_a_bps, gap_b_bps, bsz1, asz1,
+            spread_bps, gap_b_bps, bsz1, asz1,
             micro_minus_mid_bps,
             dt_since_trade,
             time_since_mid_change_ms,
@@ -5665,9 +5663,10 @@ class FeatureEngine:
         for ms in FAST_WINDOWS_MS:
             window_seconds = max(ms / 1000.0, 1e-12)
             ob_count = float(len(self._ob_update_deques[ms]))
-            feat_list.extend([
-                ob_count / window_seconds,
-            ])
+            if ms != 1_000:
+                feat_list.extend([
+                    ob_count / window_seconds,
+                ])
         for ms in FAST_WINDOWS_MS:
             rates = replen_rates[ms]
             bid_add_rate = rates[("bid", 1, "add")]
@@ -5685,14 +5684,15 @@ class FeatureEngine:
             if ms != 1_000:
                 feat_list.append(s["signed_trade_count_imbalance"])
             if ms != 200:
-                feat_list.append(s["trade_imbalance_notional"])
+                if ms != 1_000:
+                    feat_list.append(s["trade_imbalance_notional"])
             feat_list.extend([
                 *([s["trade_toxicity_notional"]] if ms != 1000 else []),
                 *([s["zero_tick_fraction"]] if ms != 500 else []),
                 *([s["tick_sign_imbalance"]] if ms != 500 else []),
                 s["trade_count_per_second"],
-                s["vwap_vs_mid_bps"],
-                s["signed_trade_premium_bps_volume_weighted"],
+                *([s["vwap_vs_mid_bps"]] if ms != 1_000 else []),
+                *([s["signed_trade_premium_bps_volume_weighted"]] if ms != 200 else []),
             ])
         feat_list.extend([
             float(self.last_trade_side_sign),
@@ -5704,10 +5704,10 @@ class FeatureEngine:
             c = cvd_stats_by_ms[ms]
             if ms != 200:
                 feat_list.append(c["cvd_change_usd"])
-            feat_list.extend([
-                c["cvd_slope_usd_per_sec"],
-                *([c["cvd_minus_ema_usd"]] if ms != 200 else []),
-            ])
+            if ms != 200:
+                feat_list.append(c["cvd_slope_usd_per_sec"])
+            if ms == 500:
+                feat_list.append(c["cvd_minus_ema_usd"])
         feat_list.extend([
             consecutive_buy_trade_count,
             consecutive_sell_trade_count,
@@ -5768,10 +5768,9 @@ class FeatureEngine:
             if ms != 1_000:
                 feat_list.append(depth_z)
 
-            feat_list.extend([
-                imb_mean,
-                imb_slope,
-            ])
+            if ms != 3_000:
+                feat_list.append(imb_mean)
+            feat_list.append(imb_slope)
         depth_5bps_total_base = depth_5bps_total
 
         for ms in FAST_WINDOWS_MS:
