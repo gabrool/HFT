@@ -17,6 +17,8 @@ HEALTH_FIELDS=["candidate","n_rows","finite_frac","nan_count","inf_count","mean"
 TARGET_FIELDS=["candidate","horizon_ms","mask_type","pearson_signed_return","spearman_signed_return","pearson_abs_return","spearman_abs_return","single_feature_auc_direction","single_feature_auc_direction_sign","single_feature_bal_acc_sign","single_feature_bal_acc_best_threshold","single_feature_bal_acc_best_threshold_value","mi_direction","mi_abs_return","single_feature_auc_move","single_feature_auc_move_sign","single_feature_bal_acc_move_best_threshold","single_feature_bal_acc_move_best_threshold_value","mi_move","move_pos_frac"]
 CORR_FIELDS=["candidate","existing_feature","existing_feature_index","pearson","spearman","abs_pearson","abs_spearman","max_abs_corr","existing_family","existing_timescale_ms","existing_best_kept_auc","existing_best_abs_return_spearman","existing_best_move_auc","existing_target_score"]
 RELATIVE_FIELDS=["candidate","max_corr_with_existing","most_correlated_existing_feature","most_correlated_existing_target_score","candidate_target_score","candidate_minus_existing_target_score","high_corr_duplicate","medium_corr_related","best_kept_auc_200ms","best_kept_auc_500ms","best_kept_auc_1000ms","best_kept_bal_acc_1000ms","best_abs_return_spearman","best_abs_return_spearman_200ms","best_abs_return_spearman_500ms","best_abs_return_spearman_1000ms","best_move_auc","best_move_auc_200ms","best_move_auc_500ms","best_move_auc_1000ms","best_move_bal_acc_1000ms","best_mi_direction","best_mi_abs_return","best_mi_move","finite_frac","std","week_std_cv","decision","reason"]
+BATCH_RELATIVE_EXTRA_FIELDS=["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target","move_score_1000ms","move_score_best","mag_score_1000ms","mag_score_best","dir_score_1000ms","dir_score_best","novelty_score","candidate_priority_score"]
+BATCH_RELATIVE_FIELDS=RELATIVE_FIELDS+BATCH_RELATIVE_EXTRA_FIELDS
 DECILE_FIELDS=["candidate","horizon_ms","decile","n_rows","candidate_min","candidate_max","mean_signed_return","mean_abs_return","up_frac","move_frac","nonmove_frac","zero_frac"]
 
 def side_low_thresholds_from_sample(y: np.ndarray, low_abs_trim_fraction: float, min_abs_label_eps: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
@@ -332,15 +334,24 @@ def wcsv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
 
 def _score_rel_row(rel: dict, md: dict | None = None) -> dict:
     md = md or {}
-    def _f(x): return float(x) if np.isfinite(x) else 0.0
+    def _finite_or_nan(x) -> float:
+        try: v=float(x)
+        except Exception: return np.nan
+        return v if np.isfinite(v) else np.nan
+    def _auc_edge_score(x) -> float:
+        v=_finite_or_nan(x); return abs(v-0.5) if np.isfinite(v) else 0.0
+    def _abs_score(x) -> float:
+        v=_finite_or_nan(x); return abs(v) if np.isfinite(v) else 0.0
+    def _safe_metric(x, default=0.0) -> float:
+        v=_finite_or_nan(x); return float(v) if np.isfinite(v) else float(default)
     rel = dict(rel)
-    rel["move_score_1000ms"] = abs(_f(rel.get("best_move_auc_1000ms")) - 0.5)
-    rel["move_score_best"] = abs(_f(rel.get("best_move_auc")) - 0.5)
-    rel["mag_score_1000ms"] = abs(_f(rel.get("best_abs_return_spearman_1000ms")))
-    rel["mag_score_best"] = abs(_f(rel.get("best_abs_return_spearman")))
-    rel["dir_score_1000ms"] = abs(_f(rel.get("best_kept_auc_1000ms")) - 0.5)
-    rel["dir_score_best"] = abs(max(_f(rel.get("best_kept_auc_200ms")), _f(rel.get("best_kept_auc_500ms")), _f(rel.get("best_kept_auc_1000ms"))) - 0.5)
-    mxc = _f(rel.get("max_corr_with_existing"))
+    rel["move_score_1000ms"] = _auc_edge_score(rel.get("best_move_auc_1000ms"))
+    rel["move_score_best"] = _auc_edge_score(rel.get("best_move_auc"))
+    rel["mag_score_1000ms"] = _abs_score(rel.get("best_abs_return_spearman_1000ms"))
+    rel["mag_score_best"] = _abs_score(rel.get("best_abs_return_spearman"))
+    rel["dir_score_1000ms"] = _auc_edge_score(rel.get("best_kept_auc_1000ms"))
+    rel["dir_score_best"] = max(_auc_edge_score(rel.get("best_kept_auc_200ms")), _auc_edge_score(rel.get("best_kept_auc_500ms")), _auc_edge_score(rel.get("best_kept_auc_1000ms")))
+    mxc = _safe_metric(rel.get("max_corr_with_existing"), default=1.0)
     rel["novelty_score"] = max(0.0, 1.0 - mxc)
     cps = 1.0*rel["move_score_1000ms"] + 0.75*rel["mag_score_1000ms"] + 0.35*rel["dir_score_1000ms"] + 0.25*rel["novelty_score"]
     if mxc >= HIGH: cps *= 0.25
@@ -349,24 +360,47 @@ def _score_rel_row(rel: dict, md: dict | None = None) -> dict:
     rel.update({k: md.get(k) for k in ["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target"]})
     return rel
 
+def _candidate_health_from_array(candidate_name: str, arr: np.ndarray) -> dict:
+    arr=np.asarray(arr,dtype=np.float64); finite=np.isfinite(arr); fv=arr[finite]
+    q=lambda p: float(np.quantile(fv,p)) if fv.size else np.nan
+    return {"candidate":candidate_name,"n_rows":int(arr.shape[0]),"finite_frac":float(finite.mean()) if arr.size else 0.0,"nan_count":int(np.isnan(arr).sum()),"inf_count":int(np.isinf(arr).sum()),"mean":float(np.mean(fv)) if fv.size else np.nan,"std":float(np.std(fv)) if fv.size else 0.0,"p01":q(0.01),"p05":q(0.05),"p50":q(0.50),"p95":q(0.95),"p99":q(0.99),"min":float(np.min(fv)) if fv.size else np.nan,"max":float(np.max(fv)) if fv.size else np.nan,"abs_max":float(np.max(np.abs(fv))) if fv.size else 0.0,"zero_frac":float((arr==0).mean()) if arr.size else 0.0,"near_zero_frac_abs_lt_1e-6":float((np.abs(arr)<1e-6).mean()) if arr.size else 0.0,"week_std_cv":np.nan}
+
+def _rejected_candidate_result(candidate_name, arr, reason, metadata):
+    health=_candidate_health_from_array(candidate_name,arr)
+    rel={field:np.nan for field in RELATIVE_FIELDS}
+    rel.update({"candidate":candidate_name,"max_corr_with_existing":np.nan,"most_correlated_existing_feature":"","decision":"reject","reason":reason,"finite_frac":health["finite_frac"],"std":health["std"],"week_std_cv":health["week_std_cv"]})
+    rel=_score_rel_row(rel, metadata)
+    return health,[],[],rel,{"schema":"feature_lab_v3_batch_reject","candidate":candidate_name,"decision":"reject","reason":reason},[]
+
+def _assert_event_pack_filled(sample_map, filled, wk, di):
+    missing=set(sample_map.keys())-set(filled)
+    if missing:
+        preview=sorted(missing)[:20]
+        raise RuntimeError(f"event-pack failed to fill {len(missing)} sampled decision rows for week={wk}; first_missing={preview}; last_decision_i={di}")
+    if sample_map and di + 1 < max(sample_map.keys()) + 1:
+        raise RuntimeError(f"event-pack decision index bounds failure week={wk}; last_decision_i={di}; expected_at_least={max(sample_map.keys())}")
+
 def evaluate_candidate_batch(candidates, X, y, feature_names, week_keys, *, low_abs_trim_fraction, high_abs_trim_fraction, out_dir: Path, write_per_candidate_details=False, candidate_metadata=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     health_rows=[]; rel_rows=[]; summary_rows=[]; top_corr=[]; tgt=[]; dec=[]; promote=[]
     for n,arr in candidates.items():
-        h,t,c,r,s,d = evaluate_candidate_array(n, np.asarray(arr,dtype=np.float32), X,y,feature_names,week_keys, low_abs_trim_fraction=low_abs_trim_fraction, high_abs_trim_fraction=high_abs_trim_fraction)
         md=(candidate_metadata or {}).get(n,{})
-        r=_score_rel_row(r,md)
+        try:
+            h,t,c,r,s,d = evaluate_candidate_array(n, np.asarray(arr,dtype=np.float32), X,y,feature_names,week_keys, low_abs_trim_fraction=low_abs_trim_fraction, high_abs_trim_fraction=high_abs_trim_fraction)
+            r=_score_rel_row(r,md)
+        except Exception as e:
+            reason=f"evaluation_error:{type(e).__name__}:{str(e)[:160]}"
+            h,t,c,r,s,d=_rejected_candidate_result(n, np.asarray(arr,dtype=np.float32), reason, md)
         health_rows.append(h); rel_rows.append(r); summary_rows.append({"candidate":n,"decision":r.get("decision"),"candidate_priority_score":r.get("candidate_priority_score"),"candidate_target_score":r.get("candidate_target_score")})
         top_corr.extend(c); tgt.extend(t); dec.extend(d)
         if write_per_candidate_details:
             d0=out_dir/n; d0.mkdir(parents=True,exist_ok=True)
-            wcsv(d0/"candidate_health.csv",[h],HEALTH_FIELDS); wcsv(d0/"candidate_target_metrics.csv",t,TARGET_FIELDS); wcsv(d0/"candidate_corr_top_pairs.csv",c,CORR_FIELDS); wcsv(d0/"candidate_relative_report.csv",[r],RELATIVE_FIELDS+["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target","move_score_1000ms","mag_score_1000ms","dir_score_1000ms","novelty_score","candidate_priority_score"]); wcsv(d0/"candidate_decile_report.csv",d,DECILE_FIELDS); (d0/"feature_lab_summary.json").write_text(json.dumps(s,indent=2,sort_keys=True))
+            wcsv(d0/"candidate_health.csv",[h],HEALTH_FIELDS); wcsv(d0/"candidate_target_metrics.csv",t,TARGET_FIELDS); wcsv(d0/"candidate_corr_top_pairs.csv",c,CORR_FIELDS); wcsv(d0/"candidate_relative_report.csv",[r],BATCH_RELATIVE_FIELDS); wcsv(d0/"candidate_decile_report.csv",d,DECILE_FIELDS); (d0/"feature_lab_summary.json").write_text(json.dumps(s,indent=2,sort_keys=True))
         if r.get("decision") in {"promote_candidate","needs_ablation"} and float(r.get("max_corr_with_existing",1.0)) < 0.95 and (float(r.get("best_move_auc_1000ms",0))>=0.56 or abs(float(r.get("best_abs_return_spearman_1000ms",0)))>=0.03 or float(r.get("best_kept_auc_1000ms",0))>=0.56):
             promote.append({"name":n, "candidate_family":r.get("candidate_family"), "expected_target":r.get("expected_target"), "candidate_priority_score":r.get("candidate_priority_score"), "best_move_auc_1000ms":r.get("best_move_auc_1000ms"), "best_move_bal_acc_1000ms":r.get("best_move_bal_acc_1000ms"), "best_abs_return_spearman_1000ms":r.get("best_abs_return_spearman_1000ms"), "best_kept_auc_1000ms":r.get("best_kept_auc_1000ms"), "max_corr_with_existing":r.get("max_corr_with_existing"), "most_correlated_existing_feature":r.get("most_correlated_existing_feature"), "decision":r.get("decision"), "reason":r.get("reason")})
     rel_rows=sorted(rel_rows,key=lambda r:(-float(r.get("candidate_priority_score",0)),-float(r.get("candidate_target_score",0)),float(r.get("max_corr_with_existing",9))))
     wcsv(out_dir/"feature_lab_batch_health.csv", health_rows, HEALTH_FIELDS)
-    ext=RELATIVE_FIELDS+["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target","move_score_1000ms","mag_score_1000ms","dir_score_1000ms","novelty_score","candidate_priority_score"]
-    wcsv(out_dir/"feature_lab_batch_relative_report.csv", rel_rows, ext)
+    wcsv(out_dir/"feature_lab_batch_relative_report.csv", rel_rows, BATCH_RELATIVE_FIELDS)
     wcsv(out_dir/"feature_lab_batch_summary.csv", summary_rows, ["candidate","decision","candidate_priority_score","candidate_target_score"])
     wcsv(out_dir/"feature_lab_batch_top_corr.csv", top_corr, CORR_FIELDS)
     wcsv(out_dir/"feature_lab_batch_target_metrics.csv", tgt, TARGET_FIELDS)
@@ -439,8 +473,13 @@ def main():
                             for j in sample_map[di]:
                                 for nm,v in vals.items(): cands[nm][j]=v
                             filled.add(di)
+            _assert_event_pack_filled(sample_map, filled, wk, di)
             i += len(row_idx)
         md=pack.metadata()
+        expected_n=X.shape[0]
+        for nm,arr in cands.items():
+            if arr.shape!=(expected_n,): raise ValueError(f"event-pack candidate shape mismatch {nm}: {arr.shape} != {(expected_n,)}")
+            if not np.isfinite(arr).all(): raise ValueError(f"event-pack candidate contains nonfinite values: {nm}")
         out=Path(a.out_dir) if a.out_dir else Path(os.environ.get("BYBIT_FEATURE_LAB_OUT_DIR", str(out_root/"feature_lab")))
         evaluate_candidate_batch(cands,X,y,names,wks,low_abs_trim_fraction=low_trim,high_abs_trim_fraction=high_trim,out_dir=out,write_per_candidate_details=a.write_per_candidate_details,candidate_metadata=md); return
     health,target,corr,rel,summary,dec=evaluate_candidate_array(cname,cand,X,y,names,wks,low_abs_trim_fraction=low_trim,high_abs_trim_fraction=high_trim)
