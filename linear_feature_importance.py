@@ -465,6 +465,10 @@ def main() -> None:
         base_df[col] = base_df["base_feature_name"].map(top_map)
     base_df = add_low_importance_flags(base_df, low_share=float(os.getenv("BYBIT_LINEAR_IMPORTANCE_LOW_SHARE", "0.0005")), low_dir_share=float(os.getenv("BYBIT_LINEAR_IMPORTANCE_LOW_DIR_SHARE", "0.0005")), low_mag_share=float(os.getenv("BYBIT_LINEAR_IMPORTANCE_LOW_MAG_SHARE", "0.0005")), low_move_share=float(os.getenv("BYBIT_LINEAR_IMPORTANCE_LOW_MOVE_SHARE", "0.0005")), coef_eps=float(os.getenv("BYBIT_LINEAR_IMPORTANCE_COEF_EPS", "1e-10")), flat_df=flat_df)
     block_df = aggregate_importance_by_block(flat_df)
+    required_move_cols = ["move_abs_coef_1000ms", "move_importance_l2", "move_importance_l2_share"]
+    if not set(required_move_cols).issubset(set(flat_df.columns) | set(base_df.columns) | set(block_df.columns)):
+        missing = [c for c in required_move_cols if c not in set(flat_df.columns) | set(base_df.columns) | set(block_df.columns)]
+        raise ValueError(f"Missing required move importance columns: {missing}")
     low_df = base_df[base_df["low_importance_candidate"] | base_df["zero_or_near_zero_all_heads"]].copy()
     ab_rows = []
     if int(os.getenv("BYBIT_LINEAR_IMPORTANCE_ABLATION", "1")) == 1:

@@ -15,7 +15,7 @@ DEFAULT_HIGH_ABS_TRIM_FRACTION = 0.02
 ALLOWED_NP_FUNCS={"log1p":np.log1p,"abs":np.abs,"sign":np.sign,"clip":np.clip,"maximum":np.maximum,"minimum":np.minimum}
 HEALTH_FIELDS=["candidate","n_rows","finite_frac","nan_count","inf_count","mean","std","p01","p05","p50","p95","p99","min","max","abs_max","zero_frac","near_zero_frac_abs_lt_1e-6","week_std_cv"]
 TARGET_FIELDS=["candidate","horizon_ms","mask_type","pearson_signed_return","spearman_signed_return","pearson_abs_return","spearman_abs_return","single_feature_auc_direction","single_feature_auc_direction_sign","single_feature_bal_acc_sign","single_feature_bal_acc_best_threshold","single_feature_bal_acc_best_threshold_value","mi_direction","mi_abs_return","single_feature_auc_move","single_feature_auc_move_sign","single_feature_bal_acc_move_best_threshold","single_feature_bal_acc_move_best_threshold_value","mi_move","move_pos_frac"]
-CORR_FIELDS=["candidate","existing_feature","existing_feature_index","pearson","spearman","abs_pearson","abs_spearman","max_abs_corr","existing_family","existing_timescale_ms","existing_best_kept_auc","existing_best_abs_return_spearman","existing_target_score"]
+CORR_FIELDS=["candidate","existing_feature","existing_feature_index","pearson","spearman","abs_pearson","abs_spearman","max_abs_corr","existing_family","existing_timescale_ms","existing_best_kept_auc","existing_best_abs_return_spearman","existing_best_move_auc","existing_target_score"]
 RELATIVE_FIELDS=["candidate","max_corr_with_existing","most_correlated_existing_feature","most_correlated_existing_target_score","candidate_target_score","candidate_minus_existing_target_score","high_corr_duplicate","medium_corr_related","best_kept_auc_200ms","best_kept_auc_500ms","best_kept_auc_1000ms","best_kept_bal_acc_1000ms","best_abs_return_spearman","best_abs_return_spearman_200ms","best_abs_return_spearman_500ms","best_abs_return_spearman_1000ms","best_move_auc","best_move_auc_200ms","best_move_auc_500ms","best_move_auc_1000ms","best_move_bal_acc_1000ms","best_mi_direction","best_mi_abs_return","best_mi_move","finite_frac","std","week_std_cv","decision","reason"]
 DECILE_FIELDS=["candidate","horizon_ms","decile","n_rows","candidate_min","candidate_max","mean_signed_return","mean_abs_return","up_frac","move_frac","nonmove_frac","zero_frac"]
 
@@ -214,19 +214,21 @@ def compute_existing_feature_target_scores(X,y,feature_names,low_abs_trim_fracti
     out={}
     move_target = build_move_target_from_sample(y, low_abs_trim_fraction, MIN_ABS_LABEL_EPS)
     for i,n in enumerate(feature_names):
-        feat=X[:,i]; best_auc=np.nan; best_abs=np.nan
-        best_move_auc=np.nan
+        feat=X[:,i]; best_auc=np.nan; best_abs=np.nan; best_move_auc=np.nan
         for h_i,_h in enumerate([200,500,1000]):
-            ys=y[:,h_i]; kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction,MIN_ABS_LABEL_EPS)&np.isfinite(feat)
-            if not kept.any(): continue
-            xx=feat[kept]; yy=ys[kept]; dd=(yy>0).astype(int); aa=np.abs(yy)
-            auc=_binary_auc_np(dd,xx); auc=max(auc,1-auc) if np.isfinite(auc) else np.nan
-            abs_sp=abs(_safe_spearman_np(xx,aa))
-            best_auc=np.nanmax([best_auc,auc]); best_abs=np.nanmax([best_abs,abs_sp])
-            mv = move_target[:, h_i]
-            move_auc = _binary_auc_np(mv[np.isfinite(feat)], feat[np.isfinite(feat)])
-            move_auc = max(move_auc, 1 - move_auc) if np.isfinite(move_auc) else np.nan
-            best_move_auc = np.nanmax([best_move_auc, move_auc])
+            ys=y[:,h_i]
+            feat_finite=np.isfinite(feat)&np.isfinite(ys)
+            if feat_finite.any():
+                mv=move_target[:,h_i].astype(int)
+                move_auc=_binary_auc_np(mv[feat_finite],feat[feat_finite])
+                move_auc=max(move_auc,1.0-move_auc) if np.isfinite(move_auc) else np.nan
+                best_move_auc=np.nanmax([best_move_auc,move_auc])
+            kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction,MIN_ABS_LABEL_EPS)&feat_finite
+            if kept.any():
+                xx=feat[kept]; yy=ys[kept]; dd=(yy>0).astype(int); aa=np.abs(yy)
+                auc=_binary_auc_np(dd,xx); auc=max(auc,1-auc) if np.isfinite(auc) else np.nan
+                abs_sp=abs(_safe_spearman_np(xx,aa))
+                best_auc=np.nanmax([best_auc,auc]); best_abs=np.nanmax([best_abs,abs_sp])
         score=max(abs(best_auc-0.5) if np.isfinite(best_auc) else 0.0,0.5*abs(best_abs) if np.isfinite(best_abs) else 0.0,abs(best_move_auc-0.5) if np.isfinite(best_move_auc) else 0.0)
         out[n]={"existing_best_kept_auc":best_auc,"existing_best_abs_return_spearman":best_abs,"existing_best_move_auc":best_move_auc,"existing_target_score":float(score)}
     return out
