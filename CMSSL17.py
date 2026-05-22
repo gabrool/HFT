@@ -4219,6 +4219,9 @@ class FeatureEngine:
     def core_feature_dim(self) -> int:
         return len(self.feature_names())
 
+    def aux_dim(self) -> int:
+        return AUX_DIM
+
     def feature_schema(self) -> str:
         return FEATURE_SCHEMA
 
@@ -4226,7 +4229,7 @@ class FeatureEngine:
         return AUX_SCHEMA
 
     def feature_dim(self) -> int:
-        return self.core_feature_dim() + AUX_DIM
+        return self.core_feature_dim() + self.aux_dim()
 
     def _new_trade_window_state(self) -> Dict[str, Any]:
         return {

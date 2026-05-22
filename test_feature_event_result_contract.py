@@ -900,19 +900,26 @@ def test_stage2_final_mixer_factory_swiglu() -> None:
         build_final_mixer,
         SwiGLUFinalMixer,
         DMODEL,
+        FeatureEngine,
     )
+    fe = FeatureEngine()
+    in_feats = fe.feature_dim()
+    final_in_dim = in_feats * 8
 
     mixer = build_final_mixer(
         "swiglu",
-        in_feats=193,
+        in_feats=in_feats,
         c_internal=8,
-        final_in_dim=193 * 8,
+        final_in_dim=final_in_dim,
         d_model=DMODEL,
         patch_count=99,
         dropout=0.1,
     )
     assert isinstance(mixer, SwiGLUFinalMixer)
-    assert mixer.final_in_dim == 159 * 8
+    assert mixer.in_feats == in_feats
+    assert mixer.final_in_dim == final_in_dim
+    assert in_feats == 159
+    assert final_in_dim == 159 * 8
     assert mixer.d_model == DMODEL
     assert mixer.hidden_dim > 0
 
@@ -992,20 +999,27 @@ def test_stage3_final_mixer_factory_dcn() -> None:
         build_final_mixer,
         DCNFinalMixer,
         DMODEL,
+        FeatureEngine,
     )
+    fe = FeatureEngine()
+    in_feats = fe.feature_dim()
+    final_in_dim = in_feats * 8
 
     mixer = build_final_mixer(
         "dcn",
-        in_feats=193,
+        in_feats=in_feats,
         c_internal=8,
-        final_in_dim=193 * 8,
+        final_in_dim=final_in_dim,
         d_model=DMODEL,
         patch_count=99,
         dropout=0.1,
     )
 
     assert isinstance(mixer, DCNFinalMixer)
-    assert mixer.final_in_dim == 159 * 8
+    assert mixer.in_feats == in_feats
+    assert mixer.final_in_dim == final_in_dim
+    assert in_feats == 159
+    assert final_in_dim == 159 * 8
     assert mixer.d_model == DMODEL
     assert mixer.rank > 0
     assert mixer.num_layers == 1
@@ -1124,20 +1138,27 @@ def test_stage4_final_mixer_factory_hybrid() -> None:
         build_final_mixer,
         HybridFinalMixer,
         DMODEL,
+        FeatureEngine,
     )
+    fe = FeatureEngine()
+    in_feats = fe.feature_dim()
+    final_in_dim = in_feats * 8
 
     mixer = build_final_mixer(
         "hybrid",
-        in_feats=193,
+        in_feats=in_feats,
         c_internal=8,
-        final_in_dim=193 * 8,
+        final_in_dim=final_in_dim,
         d_model=DMODEL,
         patch_count=99,
         dropout=0.1,
     )
 
     assert isinstance(mixer, HybridFinalMixer)
-    assert mixer.final_in_dim == 159 * 8
+    assert mixer.in_feats == in_feats
+    assert mixer.final_in_dim == final_in_dim
+    assert in_feats == 159
+    assert final_in_dim == 159 * 8
     assert mixer.d_model == DMODEL
     assert mixer.swiglu_hidden_dim > 0
     assert mixer.dcn_rank > 0
@@ -1278,20 +1299,27 @@ def test_stage5_final_mixer_factory_latent_attn() -> None:
         build_final_mixer,
         LatentAttentionFinalMixer,
         DMODEL,
+        FeatureEngine,
     )
+    fe = FeatureEngine()
+    in_feats = fe.feature_dim()
+    final_in_dim = in_feats * 8
 
     mixer = build_final_mixer(
         "latent_attn",
-        in_feats=193,
+        in_feats=in_feats,
         c_internal=8,
-        final_in_dim=193 * 8,
+        final_in_dim=final_in_dim,
         d_model=DMODEL,
         patch_count=99,
         dropout=0.1,
     )
 
     assert isinstance(mixer, LatentAttentionFinalMixer)
-    assert mixer.in_feats == 159
+    assert mixer.in_feats == in_feats
+    assert mixer.final_in_dim == final_in_dim
+    assert in_feats == 159
+    assert final_in_dim == 159 * 8
     assert mixer.c_internal == 8
     assert mixer.d_model == DMODEL
     assert mixer.latent_count > 0
@@ -1463,20 +1491,27 @@ def test_stage6_final_mixer_factory_cross_attn() -> None:
         build_final_mixer,
         CrossChannelAttentionFinalMixer,
         DMODEL,
+        FeatureEngine,
     )
+    fe = FeatureEngine()
+    in_feats = fe.feature_dim()
+    final_in_dim = in_feats * 8
 
     mixer = build_final_mixer(
         "cross_attn",
-        in_feats=193,
+        in_feats=in_feats,
         c_internal=8,
-        final_in_dim=193 * 8,
+        final_in_dim=final_in_dim,
         d_model=DMODEL,
         patch_count=99,
         dropout=0.1,
     )
 
     assert isinstance(mixer, CrossChannelAttentionFinalMixer)
-    assert mixer.in_feats == 159
+    assert mixer.in_feats == in_feats
+    assert mixer.final_in_dim == final_in_dim
+    assert in_feats == 159
+    assert final_in_dim == 159 * 8
     assert mixer.c_internal == 8
     assert mixer.d_model == DMODEL
     assert mixer.token_dim > 0
@@ -1905,7 +1940,7 @@ def test_pruned_feature_schema_contract() -> None:
         assert name in names, name
 
 
-def test_v9_pruned159_removed_features_absent_and_representatives_retained() -> None:
+def test_v10_pruned153_removed_features_absent_and_representatives_retained() -> None:
     fe = FeatureEngine()
     names = set(fe.feature_names())
 
@@ -2545,7 +2580,7 @@ def main() -> None:
     test_duplicate_ob_timestamps_append_distinct_rows()
     test_offline_ingest_no_overwrite_duplicate_timestamp_api()
     test_pruned_feature_schema_contract()
-    test_v9_pruned159_removed_features_absent_and_representatives_retained()
+    test_v10_pruned153_removed_features_absent_and_representatives_retained()
     test_v8_pruned153_lb10_event_feature_shape()
     test_removed_v8_feature_names_not_in_production_feature_names()
     test_v8_return_histories_only_track_retained_windows()
