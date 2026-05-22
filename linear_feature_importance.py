@@ -12,6 +12,29 @@ import pandas as pd
 from CMSSL17 import FEATURE_AUX_TAIL
 
 
+def _resolve_extractor_name(st4: dict[str, Any], st2: dict[str, Any]) -> str:
+    st4_cfg = st4.get("stage4_config") or {}
+    st2_cfg = st2.get("extractor_config") or {}
+
+    candidates = [
+        st4.get("extractor"),
+        st4.get("extractor_name"),
+        st4_cfg.get("extractor"),
+        st4_cfg.get("extractor_name"),
+        st2.get("extractor"),
+        st2.get("extractor_name"),
+        st2_cfg.get("extractor"),
+        st2_cfg.get("name"),
+        st2_cfg.get("extractor_name"),
+    ]
+
+    for x in candidates:
+        if x is not None and str(x).strip():
+            return str(x).strip().lower()
+
+    return ""
+
+
 def _extract_linear_coef(model: Any) -> np.ndarray:
     for candidate in (model, getattr(model, "estimator", None), getattr(model, "model", None)):
         if candidate is not None and hasattr(candidate, "coef_"):
@@ -415,8 +438,17 @@ def main() -> None:
     import linear_offline
     linear_out_dir = Path(os.environ["BYBIT_LINEAR_OUT_DIR"]); out_root = Path(os.environ["BYBIT_OUT_ROOT"]); out_dir = linear_out_dir / "feature_importance"; out_dir.mkdir(parents=True, exist_ok=True)
     st4 = json.loads((linear_out_dir / "linear_stage4_metrics.json").read_text()); st2 = json.loads((linear_out_dir / "linear_stage2_extractor_metrics.json").read_text()); st3 = json.loads((linear_out_dir / "linear_stage3_preprocess_metrics.json").read_text()); meta = json.loads((out_root / "meta.json").read_text())
-    if str(st4.get("extractor") or st2.get("extractor_config", {}).get("name") or "").strip().lower() != "raw_linear":
-        raise ValueError("linear_feature_importance.py currently supports raw_linear only")
+    extractor_name = _resolve_extractor_name(st4, st2)
+    if extractor_name != "raw_linear":
+        raise ValueError(
+            "linear_feature_importance.py currently supports raw_linear only; "
+            f"resolved extractor={extractor_name!r}; "
+            f"st4.extractor={st4.get('extractor')!r}; "
+            f"st4.stage4_config.extractor={(st4.get('stage4_config') or {}).get('extractor')!r}; "
+            f"st2.extractor={st2.get('extractor')!r}; "
+            f"st2.extractor_config.extractor={(st2.get('extractor_config') or {}).get('extractor')!r}; "
+            f"st2.extractor_config.name={(st2.get('extractor_config') or {}).get('name')!r}"
+        )
     bundle = load_linear_sklearn_bundle(Path(str(st4["best_model_path"]))); pb = load_linear_preprocess_bundle(Path(str(st3["preprocess_bundle_path"])))
     kept_indices = _parse_keep_indices(pb); expected_total = int(st2["feature_dim_total"]); base_names = _base_names_from_meta(meta, expected_total=expected_total); blocks = list((st2.get("extractor_summary", {}) or {}).get("blocks") or [])
 
@@ -514,7 +546,7 @@ def main() -> None:
         "move_head_present": bool(has_move_head),
         "linear_out_dir": str(linear_out_dir),
         "out_root": str(out_root),
-        "extractor": "raw_linear",
+        "extractor": extractor_name,
         "kept_dim": int(pb.kept_dim),
         "original_dim": int(pb.original_dim),
         "n_base_features": int(len(base_names)),

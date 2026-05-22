@@ -42,3 +42,13 @@ def test_compute_ablation_metrics_move_and_gated():
         "edge_spearman_kept_1000ms",
     ]:
         assert k in m
+
+def test_resolve_extractor_name_accepts_extractor_config_extractor():
+    st4 = {}
+    st2 = {"extractor_config": {"extractor": "raw_linear"}}
+    assert lfi._resolve_extractor_name(st4, st2) == "raw_linear"
+
+def test_resolve_extractor_name_accepts_extractor_config_name():
+    st4 = {}
+    st2 = {"extractor_config": {"name": "raw_linear"}}
+    assert lfi._resolve_extractor_name(st4, st2) == "raw_linear"
