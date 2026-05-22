@@ -39,7 +39,7 @@ _install_optional_dependency_stubs()
 offline_ingest = importlib.import_module("offline_ingest")
 
 
-def test_global_meta_pruned153_lb10_has_required_linear_keys(tmp_path):
+def test_global_meta_pruned144_lb10_has_required_linear_keys(tmp_path):
     weeks = [
         "22-02-2026-to-28-02-2026",
         "01-03-2026-to-07-03-2026",
@@ -84,10 +84,10 @@ def test_global_meta_pruned153_lb10_has_required_linear_keys(tmp_path):
         duplicate_decision_ts_count=0,
     )
 
-    assert meta["feature_dim_core"] == 153
-    assert meta["feature_dim_total"] == 159
+    assert meta["feature_dim_core"] == 144
+    assert meta["feature_dim_total"] == 150
     assert meta["lookback"] == 10
-    assert len(meta["feature_names"]) == 153
+    assert len(meta["feature_names"]) == 144
     assert len(meta["aux_feature_names"]) == 6
     assert "splits" in meta
     splits = meta["splits"]
@@ -104,9 +104,9 @@ def test_global_meta_pruned153_lb10_has_required_linear_keys(tmp_path):
     assert {"train", "val", "test"}.issubset(splits["rl"].keys())
 
 
-def test_offline_ingest_pruned153_lb10_constants():
-    assert offline_ingest.RAW_FEATURE_DIM_CORE == 153
-    assert offline_ingest.RAW_FEATURE_DIM_TOTAL == 159
+def test_offline_ingest_pruned144_lb10_constants():
+    assert offline_ingest.RAW_FEATURE_DIM_CORE == 144
+    assert offline_ingest.RAW_FEATURE_DIM_TOTAL == 150
     assert offline_ingest.LOOKBACK == 10
     assert len(offline_ingest.AUX_FEATURE_NAMES) == 6
-    assert "pruned153_lb10" in offline_ingest.FEATURE_SCHEMA
+    assert "pruned144_lb10" in offline_ingest.FEATURE_SCHEMA
