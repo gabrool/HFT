@@ -317,7 +317,12 @@ def test_add_move_head_metrics_outputs_move_and_edge_metrics():
         "cond_edge_bps": np.full((n, NUM_HORIZONS), 0.2, dtype=np.float32),
         "edge_bps": np.full((n, NUM_HORIZONS), 0.1, dtype=np.float32),
     }
-    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32)}
+    stats = {
+        "pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32),
+        "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32),
+        "pos_hi_raw_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32),
+        "neg_hi_abs_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32),
+    }
     m = {}
     linear_offline.add_move_head_metrics(m, y=y, pred=pred, stats=stats)
     for k in ["move_auc", "move_bal_acc", "move_bce", "move_pos_frac_true", "move_prob_mean_zero_rows", "move_prob_mean_nonmove_rows", "move_prob_mean_move_rows", "cond_edge_spearman_all", "cond_edge_spearman_kept", "edge_spearman_all", "edge_spearman_kept", "edge_bal_sign_acc_q50plus"]:
