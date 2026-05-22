@@ -215,7 +215,9 @@ class MovementMicrostructureCandidatePack:
         return (ba-bb)/max(mid,EPS)*1e4 if mid>0 and bb>0 and ba>0 else 0.0
     def emit(self):
         o={}; ts=self.ts; depths=self._depths_1_5_10(); bid_1=depths["bid_1"]; ask_1=depths["ask_1"]; bid_5=depths["bid_5"]; ask_5=depths["ask_5"]; bid_10=depths["bid_10"]; ask_10=depths["ask_10"]; total_depth_5=max(depths["total_5"],EPS)
-        for w in (200,500,1000): c=self.churn[w].sum(); o[f"l1_churn_notional_{w}ms"]=c; o[f"l1_churn_over_depth_{w}ms"]=c/total_depth_5
+        churn_200=self.churn[200].sum(); churn_500=self.churn[500].sum(); churn_1000=self.churn[1000].sum()
+        o["l1_churn_notional_200ms"]=churn_200; o["l1_churn_notional_500ms"]=churn_500; o["l1_churn_notional_1000ms"]=churn_1000
+        o["l1_churn_over_depth_200ms"]=churn_200/total_depth_5; o["l1_churn_over_depth_500ms"]=churn_500/total_depth_5; o["l1_churn_over_depth_1000ms"]=churn_1000/total_depth_5
         bid_add_200=self.bid_add[200].sum(); ask_add_200=self.ask_add[200].sum(); bid_cancel_200=self.bid_cancel[200].sum(); ask_cancel_200=self.ask_cancel[200].sum(); bid_add_500=self.bid_add[500].sum(); ask_add_500=self.ask_add[500].sum(); bid_cancel_500=self.bid_cancel[500].sum(); ask_cancel_500=self.ask_cancel[500].sum()
         o["bid_l1_cancel_to_add_ratio_200ms"]=np.clip(bid_cancel_200/max(bid_add_200,EPS),0.0,RATIO_CLIP); o["ask_l1_cancel_to_add_ratio_200ms"]=np.clip(ask_cancel_200/max(ask_add_200,EPS),0.0,RATIO_CLIP); o["bid_l1_cancel_to_add_ratio_500ms"]=np.clip(bid_cancel_500/max(bid_add_500,EPS),0.0,RATIO_CLIP); o["ask_l1_cancel_to_add_ratio_500ms"]=np.clip(ask_cancel_500/max(ask_add_500,EPS),0.0,RATIO_CLIP)
         o["same_side_replenishment_after_depletion_200ms"]=(min(bid_add_200,bid_cancel_200)+min(ask_add_200,ask_cancel_200))/max(bid_cancel_200+ask_cancel_200,EPS); o["opposite_side_replenishment_after_depletion_200ms"]=(min(ask_add_200,bid_cancel_200)+min(bid_add_200,ask_cancel_200))/max(bid_cancel_200+ask_cancel_200,EPS)
