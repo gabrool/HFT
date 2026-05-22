@@ -223,8 +223,9 @@ class LinearSklearnTakerBundle:
                 "LinearSklearnTakerBundle side_cond_log must contain one up/down magnitude model per horizon; "
                 f"got {len(self.mag_up_models)}, {len(self.mag_down_models)}"
             )
-        if self.move_models is not None and len(self.move_models) != n_h:
-            raise ValueError(f"LinearSklearnTakerBundle must contain one move model per horizon; got {len(self.move_models)}")
+        move_models = getattr(self, "move_models", None)
+        if move_models is not None and len(move_models) != n_h:
+            raise ValueError(f"LinearSklearnTakerBundle must contain one move model per horizon; got {len(move_models)}")
 
         dir_cols = []
         up_cols = []
@@ -251,11 +252,11 @@ class LinearSklearnTakerBundle:
                 raise ValueError(f"Magnitude model horizon {h} returned invalid row count")
             up_cols.append(up.astype(np.float32, copy=False))
             down_cols.append(down.astype(np.float32, copy=False))
-            if self.move_models is None:
+            if move_models is None:
                 move_logits_cols.append(np.full((Z.shape[0],), np.inf, dtype=np.float32))
                 move_prob_cols.append(np.ones((Z.shape[0],), dtype=np.float32))
             else:
-                model = self.move_models[h]
+                model = move_models[h]
                 if hasattr(model, "decision_function"):
                     mv_logit = np.asarray(model.decision_function(Z), dtype=np.float32).reshape(-1)
                     mv_prob = sigmoid_np(mv_logit)
