@@ -266,7 +266,7 @@ def test_inverse_side_cond_log_mag_np_roundtrip():
 def test_build_move_target_from_stats_np():
     import linear_offline
     y = np.asarray([[0.00, 0.01, -0.01], [0.04, 0.10, -0.10], [-0.04, -0.10, 0.10], [5.00, -5.00, 0.00]], dtype=np.float32)
-    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32)}
+    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "pos_hi_raw_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32), "neg_hi_abs_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32)}
     tgt = linear_offline.build_move_target_from_stats_np(y, stats)
     assert tgt.shape == y.shape
     assert np.array_equal(tgt[0], np.array([0.0, 0.0, 0.0], dtype=np.float32))
@@ -284,7 +284,9 @@ def test_train_move_models_streaming_from_plan_uses_all_rows(monkeypatch):
 
     class RecordingModel:
         def __init__(self): self.rows = []
-        def partial_fit(self, X, t, classes=None): self.rows.append((X.shape[0], np.asarray(t))); return self
+        def partial_fit(self, X, t, classes=None, sample_weight=None):
+            self.rows.append((X.shape[0], np.asarray(t), None if sample_weight is None else np.asarray(sample_weight)))
+            return self
 
     made = []
     monkeypatch.setattr(linear_offline, "make_move_model", lambda **kwargs: made.append(RecordingModel()) or made[-1])
@@ -301,7 +303,7 @@ def test_train_move_models_streaming_from_plan_uses_all_rows(monkeypatch):
         assert fs["move_pos_rows_per_horizon"] == expected_t.sum(axis=0).astype(int).tolist()
         assert fs["move_neg_rows_per_horizon"] == (y.shape[0] - expected_t.sum(axis=0)).astype(int).tolist()
     for m in made:
-        assert sum(r for r, _ in m.rows) == y.shape[0]
+        assert sum(r for r, _, _ in m.rows) == y.shape[0]
 
 
 def test_add_move_head_metrics_outputs_move_and_edge_metrics():
@@ -467,20 +469,7 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     fake_mag_result = {"mag_alpha": 1e-4, "mag_up_models": [], "mag_down_models": [], "fit_summary": {"mag_alpha": 1e-4}}
 
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {
-        "dir_auc_kept": [0.71] * metric_len,
-        "dir_bal_acc_kept": [0.62] * metric_len,
-        "val_dir_bce_kept": [0.55] * metric_len,
-        "edge_spearman_kept": [0.13] * metric_len,
-        "edge_spearman_all": [0.14] * metric_len,
-        "mean_side_log_huber_cond": [0.22] * metric_len,
-        "mean_side_spearman_cond": [0.44] * metric_len,
-        "mean_side_p50_ratio_cond": [0.88] * metric_len,
-        "mean_side_p90_ratio_cond": [1.23] * metric_len,
-        "mean_side_top_bottom_true_mean_lift_cond": [2.5] * metric_len,
-        "zero_row_mean_pred_abs_bps": [0.07] * metric_len,
-        "primary_metric_guard_passed": True,
-    }
+    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.22] * metric_len, "mag_primary_spearman": [0.44] * metric_len, "mag_primary_p50_ratio": [0.88] * metric_len, "mag_primary_p90_ratio": [1.23] * metric_len, "mag_primary_top_bottom_true_mean_lift": [2.5] * metric_len, "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.07, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
 
     monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda *, out_root: fake_plan)
     monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}))
@@ -496,6 +485,8 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0)] * len(linear_offline.HORIZONS_MS))
     monkeypatch.setattr(linear_offline, "train_direction_models_streaming_from_plan", lambda **kwargs: [fake_dir_result])
     monkeypatch.setattr(linear_offline, "train_magnitude_models_streaming_from_plan", lambda **kwargs: [fake_mag_result])
+    fake_move_result = {"move_alpha": 1e-4, "move_models": [], "fit_summary": {"move_alpha": 1e-4, "move_training_rows": "all_decision_rows", "move_target_schema": "abs_return_exceeds_side_low_threshold_v1", "move_weighting": "balanced"}}
+    monkeypatch.setattr(linear_offline, "train_move_models_streaming_from_plan", lambda **kwargs: [fake_move_result])
     monkeypatch.setattr(linear_offline, "build_stage4_bundle_from_parts", lambda **kwargs: fake_bundle)
     monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
     monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
@@ -554,7 +545,7 @@ def test_stage4_records_distinct_direction_and_magnitude_alphas(tmp_path, monkey
     fake_mag_result = {"mag_alpha": 1e-4, "mag_up_models": fake_mag_up_models, "mag_down_models": fake_mag_down_models, "fit_summary": {"mag_alpha": 1e-4}}
 
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "mean_side_p90_ratio_cond": [1.23] * metric_len, "mean_side_spearman_cond": [0.44] * metric_len, "primary_metric_guard_passed": True}
+    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.10, 0.09, 0.08], "mag_primary_spearman": [0.10, 0.12, 0.14], "mag_primary_p50_ratio": [1.0, 1.0, 1.0], "mag_primary_p90_ratio": [0.5, 0.5, 0.5], "mag_primary_top_bottom_true_mean_lift": [2.0, 2.1, 2.2], "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.10, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
 
     saved = {}
 
@@ -573,6 +564,8 @@ def test_stage4_records_distinct_direction_and_magnitude_alphas(tmp_path, monkey
     monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0)] * len(linear_offline.HORIZONS_MS))
     monkeypatch.setattr(linear_offline, "train_direction_models_streaming_from_plan", lambda **kwargs: [fake_dir_result])
     monkeypatch.setattr(linear_offline, "train_magnitude_models_streaming_from_plan", lambda **kwargs: [fake_mag_result for _ in kwargs["mag_alpha_values"]])
+    fake_move_result = {"move_alpha": 1e-4, "move_models": [], "fit_summary": {"move_alpha": 1e-4, "move_training_rows": "all_decision_rows", "move_target_schema": "abs_return_exceeds_side_low_threshold_v1", "move_weighting": "balanced"}}
+    monkeypatch.setattr(linear_offline, "train_move_models_streaming_from_plan", lambda **kwargs: [fake_move_result])
     monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
     monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
     monkeypatch.setattr(linear_offline, "close_dataset", lambda *args, **kwargs: None)
@@ -609,7 +602,7 @@ def test_stage4_reuses_reference_magnitude_alpha_without_retraining(tmp_path, mo
     fake_dir_result = {"direction_alpha": 1e-4, "direction_models": [], "fit_summary": {"direction_alpha": 1e-4}}
     fake_up, fake_down = [], []
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.71] * metric_len, "dir_bal_acc_kept": [0.62] * metric_len, "val_dir_bce_kept": [0.55] * metric_len, "edge_spearman_kept": [0.13] * metric_len, "pred_abs_p90_over_true_abs_p90_kept": [0.91] * metric_len, "mean_side_p90_ratio_cond": [1.23] * metric_len, "mean_side_spearman_cond": [0.44] * metric_len, "primary_metric_guard_passed": True}
+    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.10, 0.09, 0.08], "mag_primary_spearman": [0.10, 0.12, 0.14], "mag_primary_p50_ratio": [1.0, 1.0, 1.0], "mag_primary_p90_ratio": [0.5, 0.5, 0.5], "mag_primary_top_bottom_true_mean_lift": [2.0, 2.1, 2.2], "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.10, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
     seen_mag_alpha_batches = []
 
     def fake_train_mag(**kwargs):
@@ -627,6 +620,7 @@ def test_stage4_reuses_reference_magnitude_alpha_without_retraining(tmp_path, mo
     monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0)] * len(linear_offline.HORIZONS_MS))
     monkeypatch.setattr(linear_offline, "train_direction_models_streaming_from_plan", lambda **kwargs: [fake_dir_result])
     monkeypatch.setattr(linear_offline, "train_magnitude_models_streaming_from_plan", fake_train_mag)
+    monkeypatch.setattr(linear_offline, "train_move_models_streaming_from_plan", lambda **kwargs: [{"move_alpha": 1e-4, "move_models": [], "fit_summary": {"move_alpha": 1e-4, "move_training_rows": "all_decision_rows", "move_target_schema": "abs_return_exceeds_side_low_threshold_v1", "move_weighting": "balanced"}}])
     monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
     monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
     monkeypatch.setattr(linear_offline, "close_dataset", lambda *args, **kwargs: None)
