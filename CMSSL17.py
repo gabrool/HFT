@@ -689,18 +689,18 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned159_lb10_xformv2"
-FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned159_lb10"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v8_raw_no_" + "p" + "ca" + "_pruned153_lb10_xformv2"
+FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned153_lb10"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
-FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned159_lb10"
+FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned153_lb10"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
 CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
     + "p"
     + "ca"
-    + f"-pruned159_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
+    + f"-pruned153_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
 )
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -5785,9 +5785,12 @@ class FeatureEngine:
                 f"len(feature_names)={len(names)}"
             )
         feat = np.asarray(feat_list, dtype=np.float64)
-        expected_core_dim = len(names)
-        if expected_core_dim != 159:
-            raise ValueError(f"Expected pruned raw core dim 159, got {expected_core_dim}")
+        expected_core_dim = len(self.feature_names())
+        if len(feat_list) != expected_core_dim:
+            raise ValueError(
+                f"Feature vector length mismatch: got {len(feat_list)} "
+                f"expected_core_dim={expected_core_dim}"
+            )
         if self.strict_feature_validation:
             if not np.all(np.isfinite(feat)):
                 bad_idx = np.flatnonzero(~np.isfinite(feat))
