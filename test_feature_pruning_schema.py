@@ -30,24 +30,24 @@ def deep_snapshot_ob(ts: int, n_levels: int = 60):
 
 def test_removed_features_not_in_emitted_schema() -> None:
     names = FeatureEngine().feature_names()
-    assert len(names) == 144
+    assert len(names) == 143
     assert not (REMOVED_FEATURES & set(names))
 
 
 def test_core_and_total_feature_dims_are_consistent() -> None:
     fe = FeatureEngine()
     names = fe.feature_names()
-    assert fe.core_feature_dim() == len(names) == 144
+    assert fe.core_feature_dim() == len(names) == 143
     assert fe.aux_dim() == 6
-    assert fe.feature_dim() == 150
+    assert fe.feature_dim() == 149
     assert fe.feature_dim() == fe.core_feature_dim() + fe.aux_dim()
 
 
-def test_decision_event_feature_vector_matches_pruned144_schema() -> None:
+def test_decision_event_feature_vector_matches_pruned143_schema() -> None:
     fe = FeatureEngine()
     result = fe.on_fast_event(deep_snapshot_ob(1000, n_levels=60))
     assert result is not None
-    assert result.features.shape == (144,)
+    assert result.features.shape == (143,)
     assert result.features.shape[0] == len(fe.feature_names())
 
 
@@ -64,3 +64,24 @@ def test_no_stale_pruned_schema_references() -> None:
         text = Path(path).read_text(encoding="utf-8")
         assert "pruned153" not in text
         assert "pruned159" not in text
+        assert "pruned144" not in text
+
+
+def test_retained_neighbor_features_still_present() -> None:
+    names = set(FeatureEngine().feature_names())
+    retained = {
+        "trade_imbalance_notional_500ms",
+        "vwap_vs_mid_bps_200ms",
+        "vwap_vs_mid_bps_500ms",
+        "micro_l5_minus_mid_bps",
+        "micro_l10_minus_mid_bps",
+        "gap_b_bps",
+        "cvd_minus_ema_usd_500ms",
+        "cvd_slope_usd_per_sec_500ms",
+        "cvd_slope_usd_per_sec_1000ms",
+        "ob_update_rate_200ms",
+        "ob_update_rate_500ms",
+        "log_events_1000ms",
+    }
+    missing = retained - names
+    assert not missing
