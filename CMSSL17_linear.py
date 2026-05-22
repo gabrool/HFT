@@ -133,36 +133,9 @@ def inverse_side_cond_log_mag_np(
     return up_bps.astype(np.float32, copy=False), down_bps.astype(np.float32, copy=False)
 
 
-def abs_all_log_mag_targets_np(
-    y: np.ndarray,
-    *,
-    abs_scale_bps: np.ndarray,
-    target_clip: float = 0.0,
-) -> np.ndarray:
-    y = np.asarray(y, dtype=np.float32)
-    if y.ndim != 2 or y.shape[1] != int(NUM_HORIZONS):
-        raise ValueError(f"y must have shape [N, {NUM_HORIZONS}], got {y.shape}")
-    scale = np.asarray(abs_scale_bps, dtype=np.float32).reshape(1, -1)
-    if scale.shape[1] != int(NUM_HORIZONS):
-        raise ValueError("abs_scale_bps must have NUM_HORIZONS entries")
-    target = np.log1p(np.abs(y) / np.maximum(scale, 1e-12))
-    if target_clip > 0.0:
-        target = np.clip(target, 0.0, float(target_clip))
-    return target.astype(np.float32, copy=False)
-
-
-def inverse_abs_all_log_mag_np(
-    abs_log: np.ndarray,
-    *,
-    abs_scale_bps: np.ndarray,
-    mag_floor_bps: float = 0.0,
-    pred_log_clip: float = 20.0,
-) -> np.ndarray:
-    abs_log = np.asarray(abs_log, dtype=np.float32)
-    scale = np.asarray(abs_scale_bps, dtype=np.float32).reshape(1, -1)
-    pred = np.expm1(np.clip(np.maximum(abs_log, 0.0), 0.0, float(pred_log_clip))) * scale
-    pred = np.maximum(pred, float(mag_floor_bps))
-    return pred.astype(np.float32, copy=False)
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    return (1.0 / (1.0 + np.exp(-np.clip(x, -50.0, 50.0)))).astype(np.float32, copy=False)
 
 
 @dataclass
@@ -230,30 +203,34 @@ class LinearSklearnTakerBundle:
     mag_mode: str = "side_cond_log"
     mag_up_scale_bps: Optional[np.ndarray] = None
     mag_down_scale_bps: Optional[np.ndarray] = None
-    mag_abs_models: Optional[list[Any]] = None
-    mag_abs_scale_bps: Optional[np.ndarray] = None
+    move_models: Optional[list[Any]] = None
 
     def predict_dict_np(self, Z: np.ndarray) -> Dict[str, np.ndarray]:
         Z = np.asarray(Z, dtype=np.float32)
         if Z.ndim != 2:
             raise ValueError(f"Z must have shape [N, D_preprocessed], got {Z.shape}")
         n_h = int(NUM_HORIZONS)
-        mag_mode = str(getattr(self, "mag_mode", "side_cond_log"))
+        mag_mode = str(getattr(self, "mag_mode", "side_cond_log")).strip().lower()
+        if mag_mode != "side_cond_log":
+            raise ValueError("Only side_cond_log is supported; abs_all_log experiment was removed")
         if len(self.direction_models) != n_h:
             raise ValueError(
                 "LinearSklearnTakerBundle must contain one direction model per horizon; "
                 f"got {len(self.direction_models)}"
             )
-        if mag_mode == "side_cond_log" and (len(self.mag_up_models) != n_h or len(self.mag_down_models) != n_h):
+        if len(self.mag_up_models) != n_h or len(self.mag_down_models) != n_h:
             raise ValueError(
                 "LinearSklearnTakerBundle side_cond_log must contain one up/down magnitude model per horizon; "
                 f"got {len(self.mag_up_models)}, {len(self.mag_down_models)}"
             )
-        if mag_mode == "abs_all_log" and (self.mag_abs_models is None or len(self.mag_abs_models) != n_h):
-            raise ValueError("LinearSklearnTakerBundle abs_all_log must contain one abs magnitude model per horizon")
+        if self.move_models is not None and len(self.move_models) != n_h:
+            raise ValueError(f"LinearSklearnTakerBundle must contain one move model per horizon; got {len(self.move_models)}")
 
         dir_cols = []
-        up_cols = []; down_cols = []; abs_cols = []
+        up_cols = []
+        down_cols = []
+        move_logits_cols = []
+        move_prob_cols = []
         for h in range(n_h):
             model = self.direction_models[h]
             if hasattr(model, "decision_function"):
@@ -268,35 +245,46 @@ class LinearSklearnTakerBundle:
                 raise ValueError(f"Direction model horizon {h} returned shape {logit.shape}, expected [{Z.shape[0]}]")
             dir_cols.append(logit)
 
-            if mag_mode == "side_cond_log":
-                up = np.asarray(self.mag_up_models[h].predict(Z), dtype=np.float32).reshape(-1)
-                down = np.asarray(self.mag_down_models[h].predict(Z), dtype=np.float32).reshape(-1)
-                if up.shape[0] != Z.shape[0] or down.shape[0] != Z.shape[0]:
-                    raise ValueError(f"Magnitude model horizon {h} returned invalid row count")
-                up_cols.append(up.astype(np.float32, copy=False))
-                down_cols.append(down.astype(np.float32, copy=False))
+            up = np.asarray(self.mag_up_models[h].predict(Z), dtype=np.float32).reshape(-1)
+            down = np.asarray(self.mag_down_models[h].predict(Z), dtype=np.float32).reshape(-1)
+            if up.shape[0] != Z.shape[0] or down.shape[0] != Z.shape[0]:
+                raise ValueError(f"Magnitude model horizon {h} returned invalid row count")
+            up_cols.append(up.astype(np.float32, copy=False))
+            down_cols.append(down.astype(np.float32, copy=False))
+            if self.move_models is None:
+                move_logits_cols.append(np.full((Z.shape[0],), np.inf, dtype=np.float32))
+                move_prob_cols.append(np.ones((Z.shape[0],), dtype=np.float32))
             else:
-                abs_log = np.asarray(self.mag_abs_models[h].predict(Z), dtype=np.float32).reshape(-1)
-                abs_cols.append(abs_log.astype(np.float32, copy=False))
+                model = self.move_models[h]
+                if hasattr(model, "decision_function"):
+                    mv_logit = np.asarray(model.decision_function(Z), dtype=np.float32).reshape(-1)
+                    mv_prob = sigmoid_np(mv_logit)
+                elif hasattr(model, "predict_proba"):
+                    mv_prob = np.asarray(model.predict_proba(Z)[:, 1], dtype=np.float32).reshape(-1)
+                    mv_logit = safe_logit_np(mv_prob)
+                else:
+                    raise ValueError("Move model must expose decision_function or predict_proba")
+                move_logits_cols.append(mv_logit.astype(np.float32, copy=False))
+                move_prob_cols.append(mv_prob.astype(np.float32, copy=False))
 
-        if mag_mode == "side_cond_log":
-            up_log = np.stack(up_cols, axis=1).astype(np.float32, copy=False)
-            down_log = np.stack(down_cols, axis=1).astype(np.float32, copy=False)
-        else:
-            abs_log = np.stack(abs_cols, axis=1).astype(np.float32, copy=False)
+        up_log = np.stack(up_cols, axis=1).astype(np.float32, copy=False)
+        down_log = np.stack(down_cols, axis=1).astype(np.float32, copy=False)
         up_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_up_scale_bps is None else np.asarray(self.mag_up_scale_bps, dtype=np.float32)
         down_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_down_scale_bps is None else np.asarray(self.mag_down_scale_bps, dtype=np.float32)
         pred_log_clip = float(self.config.get("mag_log_pred_clip", 20.0))
-        if mag_mode == "side_cond_log":
-            up_bps, down_bps = inverse_side_cond_log_mag_np(
-                up_log, down_log, up_scale_bps=up_scale_raw, down_scale_bps=down_scale_raw, mag_floor_bps=float(self.mag_floor), pred_log_clip=pred_log_clip,
-            )
-        else:
-            abs_scale_raw = np.ones(n_h, dtype=np.float32) if self.mag_abs_scale_bps is None else np.asarray(self.mag_abs_scale_bps, dtype=np.float32)
-            abs_bps = inverse_abs_all_log_mag_np(abs_log, abs_scale_bps=abs_scale_raw, mag_floor_bps=float(self.mag_floor), pred_log_clip=pred_log_clip)
+        up_bps, down_bps = inverse_side_cond_log_mag_np(
+            up_log, down_log, up_scale_bps=up_scale_raw, down_scale_bps=down_scale_raw, mag_floor_bps=float(self.mag_floor), pred_log_clip=pred_log_clip,
+        )
         return {
             "dir_logits": np.stack(dir_cols, axis=1).astype(np.float32, copy=False),
-            **({"mag_up_log": up_log, "mag_down_log": down_log, "mag_up_bps": up_bps.astype(np.float32, copy=False), "mag_down_bps": down_bps.astype(np.float32, copy=False), "mag_up_sqrt": np.sqrt(np.maximum(up_bps, 0.0)).astype(np.float32, copy=False), "mag_down_sqrt": np.sqrt(np.maximum(down_bps, 0.0)).astype(np.float32, copy=False)} if mag_mode == "side_cond_log" else {"mag_abs_log": abs_log, "mag_abs_bps": abs_bps, "pred_abs_bps": abs_bps}),
+            "move_logits": np.stack(move_logits_cols, axis=1).astype(np.float32, copy=False),
+            "p_move": np.stack(move_prob_cols, axis=1).astype(np.float32, copy=False),
+            "mag_up_log": up_log,
+            "mag_down_log": down_log,
+            "mag_up_bps": up_bps.astype(np.float32, copy=False),
+            "mag_down_bps": down_bps.astype(np.float32, copy=False),
+            "mag_up_sqrt": np.sqrt(np.maximum(up_bps, 0.0)).astype(np.float32, copy=False),
+            "mag_down_sqrt": np.sqrt(np.maximum(down_bps, 0.0)).astype(np.float32, copy=False),
         }
 
 
@@ -317,26 +305,7 @@ class LinearSklearnTorchWrapper(nn.Module):
         pred = self.bundle.predict_dict_np(Z)
 
         if self.cmssl_schema_only:
-            mag_mode = str(getattr(self.bundle, "mag_mode", "side_cond_log")).strip().lower()
-            if mag_mode == "side_cond_log":
-                pred = {"dir_logits": pred["dir_logits"], "mag_up_sqrt": pred["mag_up_sqrt"], "mag_down_sqrt": pred["mag_down_sqrt"]}
-            elif mag_mode == "abs_all_log":
-                abs_bps = np.asarray(
-                    pred.get("pred_abs_bps", pred.get("mag_abs_bps")),
-                    dtype=np.float32,
-                )
-                if abs_bps.ndim != 2:
-                    raise ValueError(f"abs_all_log pred_abs_bps must be 2D, got {abs_bps.shape}")
-
-                abs_sqrt = np.sqrt(np.maximum(abs_bps, 0.0)).astype(np.float32, copy=False)
-
-                pred = {
-                    "dir_logits": pred["dir_logits"],
-                    "mag_up_sqrt": abs_sqrt,
-                    "mag_down_sqrt": abs_sqrt,
-                }
-            else:
-                raise ValueError(f"Unsupported mag_mode={mag_mode!r}")
+            pred = {"dir_logits": pred["dir_logits"], "mag_up_sqrt": pred["mag_up_sqrt"], "mag_down_sqrt": pred["mag_down_sqrt"]}
 
         return {
             k: torch.as_tensor(v, dtype=torch.float32, device=device)
