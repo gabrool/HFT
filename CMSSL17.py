@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from enum import IntEnum
-from datetime import datetime, timezone
 from typing import Deque, Any, List, Dict, Tuple, Generator, Optional, Iterable, Union, Sequence
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -839,11 +838,6 @@ NORMALIZED_OFI_LEVELS = (1, 3, 5, 10)
 EMIT_DEPTH_BPS_BANDS = (1.0,)
 INTERNAL_DEPTH_BPS_BANDS = (1.0, 5.0)
 BPS_DEPTH_BANDS = EMIT_DEPTH_BPS_BANDS
-CALENDAR_CONTEXT_FEATURES = (
-    "utc_hour_sin",
-    "utc_dow_sin",
-    "is_weekend",
-)
 NOTIONAL_CONTEXT_FEATURES = (
     "bid_l1_notional_usd",
     "ask_l1_notional_usd",
@@ -3489,9 +3483,7 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
     specs: List[FeatureTransformSpec] = []
     for name in feature_names:
         s: Optional[FeatureTransformSpec] = None
-        if name in {"utc_hour_sin", "utc_dow_sin", "is_weekend"}:
-            s = bounded(name, out=1.0)
-        elif name in {"bid_l1_notional_usd", "ask_l1_notional_usd", "bid_depth_notional_5bps", "ask_depth_notional_5bps", "total_depth_notional_5bps"}:
+        if name in {"bid_l1_notional_usd", "ask_l1_notional_usd", "bid_depth_notional_5bps", "ask_depth_notional_5bps", "total_depth_notional_5bps"}:
             s = log_pos_scale(name, scale=10.0, out=3.0)
         elif name.startswith("down_up_vol_imbalance_"):
             s = FeatureTransformSpec(
@@ -4059,7 +4051,6 @@ class FeatureEngine:
         if self._feature_names_cache is not None:
             return list(self._feature_names_cache)
         names: List[str] = []
-        names.extend(CALENDAR_CONTEXT_FEATURES)
         for w in PRICE_WINDOWS_MS:
             names.extend([
                 f"micro_ret_bps_{w}ms",
@@ -4139,11 +4130,11 @@ class FeatureEngine:
         for ms in FLOW_WINDOWS_MS:
             names.extend([
                 *([f"signed_notional_flow_usd_{ms}ms"] if ms == 200 else []),
-                f"signed_trade_count_imbalance_{ms}ms",
+                *([f"signed_trade_count_imbalance_{ms}ms"] if ms != 1_000 else []),
                 *([f"trade_imbalance_notional_{ms}ms"] if ms != 200 else []),
                 *([f"trade_toxicity_notional_{ms}ms"] if ms != 1000 else []),
                 *([f"zero_tick_fraction_{ms}ms"] if ms != 500 else []),
-                f"tick_sign_imbalance_{ms}ms",
+                *([f"tick_sign_imbalance_{ms}ms"] if ms != 500 else []),
                 f"trade_count_per_second_{ms}ms",
                 f"vwap_vs_mid_bps_{ms}ms",
                 f"signed_trade_premium_bps_volume_weighted_{ms}ms",
@@ -4178,7 +4169,6 @@ class FeatureEngine:
         for ms in REGIME_WINDOWS_MS:
             names.extend([
                 *([f"regime_volume_ewma_{ms}ms"] if ms != 1_000 else []),
-                *([f"regime_flow_imbalance_{ms}ms"] if ms == 3_000 else []),
                 f"down_up_vol_imbalance_{ms}ms",
                 *([f"max_abs_return_bps_{ms}ms"] if ms == 500 else []),
             ])
@@ -4847,26 +4837,6 @@ class FeatureEngine:
                 total_size += size
 
         return float(total_size)
-
-    def _calendar_context_features(self, ts_ms: int) -> List[float]:
-        dt = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc)
-
-        hour_float = (
-            float(dt.hour)
-            + float(dt.minute) / 60.0
-            + float(dt.second) / 3600.0
-            + float(dt.microsecond) / 3_600_000_000.0
-        )
-        hour_angle = 2.0 * math.pi * hour_float / 24.0
-
-        dow_float = float(dt.weekday()) + hour_float / 24.0
-        dow_angle = 2.0 * math.pi * dow_float / 7.0
-
-        return [
-            math.sin(hour_angle),
-            math.sin(dow_angle),
-            1.0 if dt.weekday() >= 5 else 0.0,
-        ]
 
     def _notional_depth_within_bps(
         self,
@@ -5607,7 +5577,6 @@ class FeatureEngine:
         total_depth_notional_5bps = bid_depth_notional_5bps + ask_depth_notional_5bps
 
         feat_list: List[float] = []
-        feat_list.extend(self._calendar_context_features(ts_ms))
         for w in PRICE_WINDOWS_MS:
             price_features = price_features_by_window[w]
             # mid_ret_bps remains available internally for absorption, but v8 emits micro returns only.
@@ -5710,13 +5679,14 @@ class FeatureEngine:
             s = trade_stats_by_ms[ms]
             if ms == 200:
                 feat_list.append(s["signed_notional_flow_usd"])
-            feat_list.append(s["signed_trade_count_imbalance"])
+            if ms != 1_000:
+                feat_list.append(s["signed_trade_count_imbalance"])
             if ms != 200:
                 feat_list.append(s["trade_imbalance_notional"])
             feat_list.extend([
                 *([s["trade_toxicity_notional"]] if ms != 1000 else []),
                 *([s["zero_tick_fraction"]] if ms != 500 else []),
-                s["tick_sign_imbalance"],
+                *([s["tick_sign_imbalance"]] if ms != 500 else []),
                 s["trade_count_per_second"],
                 s["vwap_vs_mid_bps"],
                 s["signed_trade_premium_bps_volume_weighted"],
@@ -5768,9 +5738,6 @@ class FeatureEngine:
 
             if ms != 1_000:
                 feat_list.append(regime_volume[ms])
-
-            if ms == 3_000:
-                feat_list.append(regime_flow_snapshot[ms])
 
             feat_list.append(dist["down_up_vol_imbalance"])
 

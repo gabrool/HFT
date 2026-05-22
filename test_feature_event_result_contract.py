@@ -2278,7 +2278,7 @@ def test_transform_diagnostics_actionable_summary_exists() -> None:
     assert isinstance(summary["low_variance_features"], list)
     assert isinstance(summary["high_clip_features"], list)
 
-def test_calendar_and_notional_context_features_present_and_transformed() -> None:
+def test_notional_context_features_present_and_transformed() -> None:
     from CMSSL17 import (
         build_feature_transform_specs,
         RawTransformKind,
@@ -2290,9 +2290,6 @@ def test_calendar_and_notional_context_features_present_and_transformed() -> Non
     specs = {s.name: s for s in build_feature_transform_specs(names)}
 
     expected = [
-        "utc_hour_sin",
-        "utc_dow_sin",
-        "is_weekend",
         "bid_l1_notional_usd",
         "ask_l1_notional_usd",
         "bid_depth_notional_5bps",
@@ -2304,13 +2301,9 @@ def test_calendar_and_notional_context_features_present_and_transformed() -> Non
         assert name in names, name
         assert name in specs, name
 
-    assert names[:3] == [
-        "utc_hour_sin",
-        "utc_dow_sin",
-        "is_weekend",
-    ]
-    assert "utc_hour_cos" not in names
-    assert "utc_dow_cos" not in names
+    assert "utc_hour_sin" not in names
+    assert "utc_dow_sin" not in names
+    assert "is_weekend" not in names
     top_book_end = names.index("time_since_mid_change_ms") + 1
     assert names[top_book_end:top_book_end + 5] == [
         "bid_l1_notional_usd",
@@ -2319,16 +2312,6 @@ def test_calendar_and_notional_context_features_present_and_transformed() -> Non
         "ask_depth_notional_5bps",
         "total_depth_notional_5bps",
     ]
-
-    for name in [
-        "utc_hour_sin",
-        "utc_dow_sin",
-        "is_weekend",
-    ]:
-        s = specs[name]
-        assert s.raw_transform == RawTransformKind.IDENTITY
-        assert s.normalize == NormalizeKind.NONE
-        assert s.output_clip_abs == 1.0
 
     for name in [
         "bid_l1_notional_usd",
@@ -2345,22 +2328,19 @@ def test_calendar_and_notional_context_features_present_and_transformed() -> Non
         assert s.output_clip_abs == 3.0
 
 
-def test_calendar_and_notional_context_feature_values_are_sane() -> None:
+def test_notional_context_feature_values_are_sane() -> None:
     fe = FeatureEngine()
     result = fe.on_fast_event(deep_snapshot_ob(1_700_003_000_000, n_levels=60))
 
     assert result.event_type == "ob"
-    assert result.features.shape == (159,)
+    assert result.features.shape == (153,)
 
     names = list(fe.feature_names())
     values = dict(zip(names, result.features.tolist()))
 
-    for name in ["utc_hour_sin", "utc_dow_sin"]:
-        assert -1.0 <= values[name] <= 1.0
-
-    assert values["is_weekend"] in (0.0, 1.0)
-    assert "utc_hour_cos" not in values
-    assert "utc_dow_cos" not in values
+    assert "utc_hour_sin" not in values
+    assert "utc_dow_sin" not in values
+    assert "is_weekend" not in values
 
     # These are transformed by log1p, so should be positive and finite.
     for name in [

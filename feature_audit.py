@@ -674,13 +674,6 @@ def parse_feature_name(name: str) -> dict:
         or _has_token(n, "minute")
         or _has_token(n, "calendar")
         or _has_token(n, "tod")
-        or n in {
-            "utc_hour_sin",
-            "utc_hour_cos",
-            "utc_dow_sin",
-            "utc_dow_cos",
-            "is_weekend",
-        }
     ):
         family = "calendar"
 
@@ -1294,7 +1287,7 @@ def family_summary(scores: pd.DataFrame, target_df: pd.DataFrame, corr_pairs: pd
 
 def _self_test_parsers() -> None:
     assert parse_feature_name("down_up_vol_imbalance_1000ms")["family"] == "volatility_regime"
-    assert parse_feature_name("utc_dow_sin")["family"] == "calendar"
+    assert parse_feature_name("session_utc_hour")["family"] == "calendar"
 
     assert parse_feature_name("micro_l1_minus_micro_l10_bps")["family"] == "micro_vamp"
     assert parse_feature_name("micro_minus_mid_bps")["family"] == "micro_vamp"
