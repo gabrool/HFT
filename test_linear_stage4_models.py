@@ -671,6 +671,47 @@ def test_stage4_reuses_reference_magnitude_alpha_without_retraining(tmp_path, mo
     assert seen_mag_alpha_batches[1] == [1e-4, 1e-2]
 
 
+def test_stage4_payload_contains_final_move_metrics_and_test_metrics(tmp_path, monkeypatch):
+    import linear_offline
+
+    configure_stage4(monkeypatch, linear_offline)
+    monkeypatch.setattr(linear_offline, "LINEAR_STAGE4_RUN_TEST", True)
+    monkeypatch.setattr(linear_offline, "OUT_ROOT", str(tmp_path / "out_root"))
+    fake_plan = {"has_cmssl_test": True, "train_split_entries": [{}], "train_week_keys": ["w0"], "val_split_entries": [{}], "test_split_entries": [{}]}
+    fake_preprocess = types.SimpleNamespace(original_dim=5, kept_dim=5)
+    metric_len = len(linear_offline.HORIZONS_MS)
+    fake_metrics = {"dir_auc_kept": [0.7] * metric_len, "dir_bal_acc_kept": [0.6] * metric_len, "dir_bce_kept": [0.5] * metric_len, "mag_primary_huber": [0.2] * metric_len, "mag_primary_spearman": [0.3] * metric_len, "mag_primary_p50_ratio": [1.0] * metric_len, "mag_primary_p90_ratio": [1.1] * metric_len, "mag_primary_top_bottom_true_mean_lift": [0.4] * metric_len, "move_auc": [0.65] * metric_len, "move_bal_acc": [0.55] * metric_len, "move_bce": [0.45] * metric_len, "move_pos_frac_true": [0.25] * metric_len, "move_prob_mean_zero_rows": [0.1] * metric_len, "move_prob_mean_nonmove_rows": [0.2] * metric_len, "move_prob_mean_move_rows": [0.8] * metric_len, "cond_edge_spearman_all": [0.15] * metric_len, "cond_edge_spearman_kept": [0.2] * metric_len, "edge_spearman_all": [0.12] * metric_len, "edge_spearman_kept": [0.18] * metric_len, "edge_bal_sign_acc_q50plus": [0.52] * metric_len, "primary_metric_guard_passed": True}
+
+    monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda *, out_root: fake_plan)
+    monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}))
+    monkeypatch.setattr(linear_offline, "load_stage3_payload", lambda *args, **kwargs: {"payload_path": "stage3.json", "preprocess_bundle_path": str(tmp_path / "preprocess.npz")})
+    monkeypatch.setattr(linear_offline, "_validate_manifest_decision_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "load_linear_preprocess_bundle", lambda path: fake_preprocess)
+    monkeypatch.setattr(linear_offline, "load_linear_trim_stats", lambda linear_out_dir: {})
+    monkeypatch.setattr(linear_offline, "compute_side_log_mag_scales_from_train_plan", lambda **kwargs: (np.ones(metric_len, dtype=np.float32), np.ones(metric_len, dtype=np.float32)))
+    monkeypatch.setattr(linear_offline, "compute_global_direction_weights_from_train_labels_plan", lambda **kwargs: [(1.0, 1.0)] * metric_len)
+    monkeypatch.setattr(linear_offline, "train_direction_models_streaming_from_plan", lambda **kwargs: [{"direction_alpha": 1e-2, "direction_models": [], "fit_summary": {}}])
+    monkeypatch.setattr(linear_offline, "train_magnitude_models_streaming_from_plan", lambda **kwargs: [{"mag_alpha": 1e-3, "mag_up_models": [], "mag_down_models": [], "fit_summary": {}} for _ in kwargs["mag_alpha_values"]])
+    monkeypatch.setattr(linear_offline, "train_move_models_streaming_from_plan", lambda **kwargs: [{"move_alpha": 1e-3, "move_models": [], "fit_summary": {}}])
+    monkeypatch.setattr(linear_offline, "build_val_dataset_from_plan", lambda plan: object())
+    monkeypatch.setattr(linear_offline, "build_test_dataset_from_plan", lambda plan: object())
+    monkeypatch.setattr(linear_offline, "evaluate_stage4_bundle_streaming", lambda **kwargs: dict(fake_metrics))
+    monkeypatch.setattr(linear_offline, "close_dataset", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "force_gc", lambda *args, **kwargs: None)
+    monkeypatch.setattr(linear_offline, "save_linear_sklearn_bundle", lambda bundle, path: Path(path).parent.mkdir(parents=True, exist_ok=True) or Path(path).write_bytes(b"bundle"))
+
+    payload = linear_offline.run_stage4_training(linear_out_dir=tmp_path, extractor_name="fake_extractor", preprocess_name="fake_preprocess", device=linear_offline.torch.device("cpu"))
+    assert "best_move_alpha" in payload
+    assert "move_candidate_summaries" in payload
+    assert "val_metrics" in payload
+    assert "test_metrics" in payload
+    assert "move" in payload["stage4_summary_metrics"]
+    assert "edge" in payload["stage4_summary_metrics"]
+    assert payload["stage4_summary_metrics"]["edge"]["schema"] == "p_move_times_conditional_side_edge_v1"
+    assert "mag_abs_scale_bps" not in payload
+    assert "direction_zero_rows" not in payload["stage4_summary_metrics"]
+
+
 def test_load_linear_trim_stats_rejects_decision_stride_mismatch(tmp_path, monkeypatch):
     import linear_offline
     from CMSSL17_offline import compute_signed_raw_stats, save_stats_cache
