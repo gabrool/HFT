@@ -57,7 +57,6 @@ from CMSSL17_linear import (  # type: ignore
     save_linear_sklearn_bundle,
     load_linear_sklearn_bundle,
     side_cond_log_mag_targets_np,
-    abs_all_log_mag_targets_np,
 )
 
 
@@ -242,7 +241,7 @@ LINEAR_STAGE4_DIRECTION_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_DIRECTIO
 LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_SAMPLE_WEIGHTING", "none").strip().lower()
 LINEAR_STAGE4_RUN_TEST = _env_bool("BYBIT_LINEAR_STAGE4_RUN_TEST", 1)
 LINEAR_STAGE4_MAG_FLOOR = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_FLOOR", "1e-4"))
-LINEAR_STAGE4_MAG_MODE = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_MODE", "side_cond_log").strip().lower()
+LINEAR_STAGE4_MAG_MODE = "side_cond_log"
 LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE = os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE", "train_median_nonzero_side").strip().lower()
 LINEAR_STAGE4_MAG_LOG_SCALE_EPS = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_EPS", "1e-6"))
 LINEAR_STAGE4_MAG_LOG_TARGET_CLIP = float(os.environ.get("BYBIT_LINEAR_STAGE4_MAG_LOG_TARGET_CLIP", "0.0"))
@@ -372,8 +371,6 @@ if LINEAR_STAGE == "stage4":
         raise ValueError("Only none for magnitude weighting in first Stage 4 implementation")
     if LINEAR_STAGE4_MAG_FLOOR <= 0:
         raise ValueError(f"BYBIT_LINEAR_STAGE4_MAG_FLOOR must be > 0, got {LINEAR_STAGE4_MAG_FLOOR}")
-    if LINEAR_STAGE4_MAG_MODE not in {"side_cond_log", "abs_all_log"}:
-        raise ValueError("BYBIT_LINEAR_STAGE4_MAG_MODE currently supports only side_cond_log or abs_all_log")
     if LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE not in {"train_median_nonzero_side", "train_q75_nonzero_side"}:
         raise ValueError("BYBIT_LINEAR_STAGE4_MAG_LOG_SCALE_SOURCE must be one of: train_median_nonzero_side, train_q75_nonzero_side")
     if LINEAR_STAGE4_MAG_LOG_SCALE_EPS <= 0:
@@ -1995,57 +1992,12 @@ def add_side_cond_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarra
         metrics.setdefault("mag_primary_p90_ratio", []).append(metrics["mean_side_p90_ratio_cond"][-1])
         metrics.setdefault("mag_primary_top_bottom_true_mean_lift", []).append(metrics["mean_side_top_bottom_true_mean_lift_cond"][-1])
 
-def add_abs_all_log_magnitude_metrics(metrics: Dict[str, Any], *, y: np.ndarray, pred: Dict[str, np.ndarray], scale_abs_bps: np.ndarray) -> None:
-    y = np.asarray(y, dtype=np.float32); pa = np.asarray(pred["pred_abs_bps"] if "pred_abs_bps" in pred else pred["mag_abs_bps"], dtype=np.float32)
-    pl = np.asarray(pred["mag_abs_log"], dtype=np.float32)
-    for h in range(y.shape[1]):
-        ta = np.abs(y[:, h]); zl = ta == 0.0; nz = ta > 0.0
-        tl = np.log1p(ta / max(float(scale_abs_bps[h]), 1e-12)); err = pl[:, h] - tl
-        hub = float(np.mean(np.where(np.abs(err) <= 1.0, 0.5 * err * err, np.abs(err) - 0.5)))
-        sp_all = float(_safe_spearman_np(pa[:, h], ta)); sp_nz = float(_safe_spearman_np(pa[nz, h], ta[nz])) if np.any(nz) else float("nan")
-        eps = 1e-12
-        dec, lift = _side_decile_calibration(pa[:, h], ta)
-        metrics.setdefault("abs_decile_calibration_all", []).append(dec)
-        metrics.setdefault("abs_log_huber_all", []).append(hub); metrics.setdefault("abs_spearman_all", []).append(sp_all); metrics.setdefault("abs_spearman_nonzero", []).append(sp_nz)
-        metrics.setdefault("abs_mean_ratio_all", []).append(float(np.mean(pa[:, h]) / max(float(np.mean(ta)), eps)))
-        metrics.setdefault("abs_p50_ratio_all", []).append(float(np.percentile(pa[:, h], 50) / max(float(np.percentile(ta, 50)), eps)))
-        metrics.setdefault("abs_p90_ratio_all", []).append(float(np.percentile(pa[:, h], 90) / max(float(np.percentile(ta, 90)), eps)))
-        metrics.setdefault("abs_p95_ratio_all", []).append(float(np.percentile(pa[:, h], 95) / max(float(np.percentile(ta, 95)), eps)))
-        metrics.setdefault("abs_top_bottom_true_mean_lift_all", []).append(float(lift))
-        metrics.setdefault("zero_row_mean_pred_abs_bps", []).append(float(np.mean(pa[zl, h])) if np.any(zl) else float("nan"))
-        metrics.setdefault("zero_row_p50_pred_abs_bps", []).append(float(np.percentile(pa[zl, h], 50)) if np.any(zl) else float("nan"))
-        metrics.setdefault("zero_row_p90_pred_abs_bps", []).append(float(np.percentile(pa[zl, h], 90)) if np.any(zl) else float("nan"))
-        metrics.setdefault("zero_row_p95_pred_abs_bps", []).append(float(np.percentile(pa[zl, h], 95)) if np.any(zl) else float("nan"))
-        metrics.setdefault("zero_row_frac_pred_abs_lt_0p05_bps", []).append(float(np.mean(pa[zl, h] < 0.05)) if np.any(zl) else float("nan"))
-        frac_lt_0p10 = float(np.mean(pa[zl, h] < 0.10)) if np.any(zl) else float("nan")
-        metrics.setdefault("zero_row_frac_pred_abs_lt_0p10_bps", []).append(frac_lt_0p10)
-        metrics.setdefault("zero_row_frac_pred_abs_lt_0p1_bps", []).append(frac_lt_0p10)
-        metrics.setdefault("zero_row_frac_pred_abs_lt_0p25_bps", []).append(float(np.mean(pa[zl, h] < 0.25)) if np.any(zl) else float("nan"))
-        metrics.setdefault("nonzero_row_mean_pred_abs_bps", []).append(float(np.mean(pa[nz, h])) if np.any(nz) else float("nan"))
-        metrics.setdefault("nonzero_row_p50_pred_abs_bps", []).append(float(np.percentile(pa[nz, h], 50)) if np.any(nz) else float("nan"))
-        metrics.setdefault("nonzero_row_p90_pred_abs_bps", []).append(float(np.percentile(pa[nz, h], 90)) if np.any(nz) else float("nan"))
-        metrics.setdefault("mag_primary_huber", []).append(hub); metrics.setdefault("mag_primary_spearman", []).append(sp_nz if np.isfinite(sp_nz) else sp_all)
-        metrics.setdefault("mag_primary_p50_ratio", []).append(metrics["abs_p50_ratio_all"][-1]); metrics.setdefault("mag_primary_p90_ratio", []).append(metrics["abs_p90_ratio_all"][-1]); metrics.setdefault("mag_primary_top_bottom_true_mean_lift", []).append(float(lift))
-
-def add_direction_zero_row_diagnostics(metrics: Dict[str, Any], *, y: np.ndarray, pred: Dict[str, np.ndarray], stats: Dict[str, np.ndarray]) -> None:
-    dl = np.asarray(pred["dir_logits"], dtype=np.float32); pr = _sigmoid_np(dl); y = np.asarray(y, dtype=np.float32)
-    _kp, _kn, kept = build_signed_side_trim_masks_from_stats_np(y, stats)
-    for h in range(y.shape[1]):
-        for name, rows in [("zero", y[:, h] == 0.0), ("nonzero", y[:, h] != 0.0), ("kept", kept[:, h])]:
-            vals = np.abs(dl[rows, h]) if np.any(rows) else np.asarray([], dtype=np.float32)
-            ap = np.abs(pr[rows, h] - 0.5) if np.any(rows) else np.asarray([], dtype=np.float32)
-            metrics.setdefault(f"dir_{name}_n", []).append(int(rows.sum()))
-            metrics.setdefault(f"dir_{name}_abs_logit_mean", []).append(float(np.mean(vals)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_abs_logit_p50", []).append(float(np.percentile(vals, 50)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_abs_logit_p90", []).append(float(np.percentile(vals, 90)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_abs_logit_p95", []).append(float(np.percentile(vals, 95)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_abs_logit_p99", []).append(float(np.percentile(vals, 99)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_abs_prob_minus_0p5_mean", []).append(float(np.mean(ap)) if ap.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_abs_prob_minus_0p5_p90", []).append(float(np.percentile(ap, 90)) if ap.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_frac_abs_logit_lt_0p1", []).append(float(np.mean(vals < 0.1)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_frac_abs_logit_lt_0p25", []).append(float(np.mean(vals < 0.25)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_frac_abs_logit_lt_0p5", []).append(float(np.mean(vals < 0.5)) if vals.size else float("nan"))
-            metrics.setdefault(f"dir_{name}_frac_abs_logit_lt_1p0", []).append(float(np.mean(vals < 1.0)) if vals.size else float("nan"))
+def build_move_target_from_stats_np(y: np.ndarray, stats: dict) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    pos_lo = np.asarray(stats["pos_lo_raw_bps"], dtype=np.float32).reshape(1, -1)
+    neg_lo = np.asarray(stats["neg_lo_abs_bps"], dtype=np.float32).reshape(1, -1)
+    move = ((y > 0.0) & (y >= pos_lo)) | ((y < 0.0) & ((-y) >= neg_lo))
+    return move.astype(np.int64)
 
 
 def _slice_prediction_payload(pred_payload: Dict[str, np.ndarray], mask_or_indices: np.ndarray) -> Dict[str, np.ndarray]:
@@ -3183,29 +3135,23 @@ def run_stage4_training(*, linear_out_dir: Path, extractor_name: str, preprocess
 
 
 def collect_predictions_and_labels_streaming(*, model_bundle: LinearSklearnTakerBundle, extractor: Any, preprocess_bundle: LinearPreprocessBundle, ds: Any, max_rows: int, batch_rows: int, split_name: str, progress_stage: str = "stage4", progress_action: str = "diagnostics") -> Dict[str, np.ndarray]:
-    mag_mode = str(getattr(model_bundle, "mag_mode", "side_cond_log")).strip().lower()
-    base_keys = ["dir_logits", "p_up", "edge_bps", "y", "positions"]
-    if mag_mode == "abs_all_log":
-        required_keys = base_keys + ["mag_abs_log", "mag_abs_bps", "pred_abs_bps"]
-    elif mag_mode == "side_cond_log":
-        required_keys = base_keys + ["mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "pred_abs_bps"]
-    else:
-        raise ValueError(f"Unsupported mag_mode={mag_mode!r}")
+    required_keys = ["dir_logits", "p_up", "move_logits", "p_move", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "cond_edge_bps", "edge_bps", "y", "positions"]
     parts = {k: [] for k in required_keys}
     base_iter = iter_preprocessed_batches_from_dataset(extractor=extractor, bundle=preprocess_bundle, ds=ds, batch_rows=batch_rows, max_rows=max_rows, split_name=split_name)
     for Z, y, pos in progress_iter_rows(base_iter, total_rows=decision_row_count(len(ds), max_rows=max_rows), desc=_progress_desc(progress_stage, progress_action, split_name)):
         pred = model_bundle.predict_dict_np(Z); dl = np.asarray(pred["dir_logits"], dtype=np.float32); p = _sigmoid_np(dl)
-        if mag_mode == "abs_all_log":
-            ab = np.asarray(pred["mag_abs_bps"], dtype=np.float32); edge = (2.0 * p - 1.0) * ab
-            vals=[("dir_logits", dl), ("p_up", p), ("mag_abs_log", np.asarray(pred["mag_abs_log"], dtype=np.float32)), ("mag_abs_bps", ab), ("pred_abs_bps", ab), ("edge_bps", edge), ("y", y), ("positions", pos)]
-        else:
-            ub, db = extract_mag_bps_from_prediction(pred); up = np.sqrt(np.maximum(ub, 0.0)); dn = np.sqrt(np.maximum(db, 0.0)); edge = p * ub - (1.0 - p) * db
-            vals=[("dir_logits", dl), ("p_up", p), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_log", np.asarray(pred["mag_up_log"], dtype=np.float32)), ("mag_down_log", np.asarray(pred["mag_down_log"], dtype=np.float32)), ("mag_up_bps", ub), ("mag_down_bps", db), ("pred_abs_bps", 0.5*(ub+db)), ("edge_bps", edge), ("y", y), ("positions", pos)]
+        ub, db = extract_mag_bps_from_prediction(pred)
+        up = np.sqrt(np.maximum(ub, 0.0)); dn = np.sqrt(np.maximum(db, 0.0))
+        pm = np.asarray(pred["p_move"], dtype=np.float32)
+        ml = np.asarray(pred["move_logits"], dtype=np.float32)
+        cond_edge = p * ub - (1.0 - p) * db
+        edge = pm * cond_edge
+        vals=[("dir_logits", dl), ("p_up", p), ("move_logits", ml), ("p_move", pm), ("mag_up_sqrt", up), ("mag_down_sqrt", dn), ("mag_up_log", np.asarray(pred["mag_up_log"], dtype=np.float32)), ("mag_down_log", np.asarray(pred["mag_down_log"], dtype=np.float32)), ("mag_up_bps", ub), ("mag_down_bps", db), ("cond_edge_bps", cond_edge), ("edge_bps", edge), ("y", y), ("positions", pos)]
         for k, v in vals: parts[k].append(v.astype(np.int64 if k == "positions" else np.float32, copy=False))
     if not parts["y"]: raise ValueError(f"Streaming split contains no rows: {split_name}")
     missing = [k for k, v in parts.items() if not v]
     if missing:
-        raise ValueError(f"collect_predictions_and_labels_streaming missing required prediction arrays for mag_mode={mag_mode!r}, split={split_name!r}: {missing}")
+        raise ValueError(f"collect_predictions_and_labels_streaming missing required prediction arrays for split={split_name!r}: {missing}")
     print(f"[linear-stream] stage={progress_stage} action={progress_action} split={split_name} rows={sum(x.shape[0] for x in parts['y'])}", flush=True)
     return {k: np.concatenate(v, axis=0) for k, v in parts.items()}
 
