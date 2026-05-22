@@ -92,8 +92,12 @@ def test_bundle_prediction_schema():
     mag_down_models = [FakeRegressor(np.log1p(0.3 + h)) for h in range(NUM_HORIZONS)]
     bundle = LinearSklearnTakerBundle("linear_target_models_stage4_v1", {}, [1, 2, 3], direction_models, mag_up_models, mag_down_models, 1e-4, {}, "side_cond_log", np.ones(NUM_HORIZONS, dtype=np.float32), np.ones(NUM_HORIZONS, dtype=np.float32))
     pred = bundle.predict_dict_np(Z[:11])
-    assert set(pred) == {"dir_logits", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "mag_up_sqrt", "mag_down_sqrt"}
+    assert set(pred) == {"dir_logits", "move_logits", "p_move", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "mag_up_sqrt", "mag_down_sqrt"}
     assert pred["dir_logits"].shape == (11, NUM_HORIZONS)
+    assert pred["move_logits"].shape == (11, NUM_HORIZONS)
+    assert pred["p_move"].shape == (11, NUM_HORIZONS)
+    assert np.isfinite(pred["p_move"]).all()
+    assert ((pred["p_move"] >= 0.0) & (pred["p_move"] <= 1.0)).all()
     assert np.isfinite(pred["dir_logits"]).all()
     assert (pred["mag_up_bps"] >= bundle.mag_floor).all()
     assert (pred["mag_down_bps"] >= bundle.mag_floor).all()
@@ -147,6 +151,8 @@ def test_torch_wrapper_cmssl_schema_only_filters_extra_keys():
     full = LinearSklearnTorchWrapper(bundle, cmssl_schema_only=False).forward(FakeTensor())
     assert set(full) == {
         "dir_logits",
+        "move_logits",
+        "p_move",
         "mag_up_log",
         "mag_down_log",
         "mag_up_bps",
@@ -154,6 +160,8 @@ def test_torch_wrapper_cmssl_schema_only_filters_extra_keys():
         "mag_up_sqrt",
         "mag_down_sqrt",
     }
+    assert np.allclose(full["p_move"].detach().cpu().numpy(), 1.0)
+    assert np.isposinf(full["move_logits"].detach().cpu().numpy()).all()
 
     strict = LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).forward(FakeTensor())
     assert set(strict) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
@@ -165,116 +173,8 @@ def test_torch_wrapper_cmssl_schema_only_filters_extra_keys():
     )
 
 
-def test_abs_all_log_cmssl_schema_only_matches_summarize_schema():
-    import torch
-    from CMSSL17 import NUM_HORIZONS
-    from CMSSL17_linear import LinearSklearnTakerBundle, LinearSklearnTorchWrapper
-
-    class FakeDirection:
-        def decision_function(self, Z):
-            return Z[:, 0]
-
-    class FakeRegressor:
-        def __init__(self, value):
-            self.value = value
-
-        def predict(self, Z):
-            return np.full(Z.shape[0], self.value, dtype=np.float32)
-
-    Z = np.ones((6, 4), dtype=np.float32)
-
-    bundle = LinearSklearnTakerBundle(
-        "linear_target_models_stage4_v1",
-        {"mag_log_pred_clip": 20.0},
-        [200, 500, 1000],
-        [FakeDirection() for _ in range(NUM_HORIZONS)],
-        [],
-        [],
-        1e-4,
-        {},
-        "abs_all_log",
-        None,
-        None,
-        [FakeRegressor(np.log1p(1.5)) for _ in range(NUM_HORIZONS)],
-        np.ones(NUM_HORIZONS, dtype=np.float32),
-    )
-
-    class FakeTensor:
-        device = torch.device("cpu")
-
-        def detach(self):
-            return self
-
-        def cpu(self):
-            return self
-
-        def numpy(self):
-            return Z
-
-    pred = LinearSklearnTorchWrapper(bundle, cmssl_schema_only=True).forward(FakeTensor())
-    assert set(pred.keys()) == {"dir_logits", "mag_up_sqrt", "mag_down_sqrt"}
-    assert pred["mag_up_sqrt"].shape == pred["dir_logits"].shape
-    assert pred["mag_down_sqrt"].shape == pred["dir_logits"].shape
-    assert np.allclose(
-        pred["mag_up_sqrt"].detach().cpu().numpy(),
-        pred["mag_down_sqrt"].detach().cpu().numpy(),
-    )
 
 
-def test_collect_predictions_streaming_abs_mode_has_only_abs_keys(monkeypatch):
-    import linear_offline
-    from CMSSL17 import NUM_HORIZONS
-    from CMSSL17_linear import LinearSklearnTakerBundle
-
-    class FakeDirection:
-        def decision_function(self, Z):
-            return np.full(Z.shape[0], 0.25, dtype=np.float32)
-
-    class FakeRegressor:
-        def __init__(self, value):
-            self.value = value
-
-        def predict(self, Z):
-            return np.full(Z.shape[0], self.value, dtype=np.float32)
-
-    Z = np.ones((6, 4), dtype=np.float32)
-    y = np.zeros((6, 3), dtype=np.float32)
-    pos = np.arange(6, dtype=np.int64)
-    fake_ds = [None] * len(y)
-    monkeypatch.setattr(
-        linear_offline,
-        "iter_preprocessed_batches_from_dataset",
-        lambda **kwargs: iter([(Z, y, pos)]),
-    )
-
-    bundle = LinearSklearnTakerBundle(
-        "linear_target_models_stage4_v1",
-        {"mag_log_pred_clip": 20.0},
-        [200, 500, 1000],
-        [FakeDirection() for _ in range(NUM_HORIZONS)],
-        [],
-        [],
-        1e-4,
-        {},
-        "abs_all_log",
-        None,
-        None,
-        [FakeRegressor(np.log1p(1.5)) for _ in range(NUM_HORIZONS)],
-        np.ones(NUM_HORIZONS, dtype=np.float32),
-    )
-    payload = linear_offline.collect_predictions_and_labels_streaming(
-        model_bundle=bundle,
-        extractor=object(),
-        preprocess_bundle=object(),
-        ds=fake_ds,
-        max_rows=0,
-        batch_rows=8,
-        split_name="unit_abs",
-    )
-    assert set(payload) == {"dir_logits", "p_up", "mag_abs_log", "mag_abs_bps", "pred_abs_bps", "edge_bps", "y", "positions"}
-    assert "mag_up_sqrt" not in payload
-    assert "mag_down_sqrt" not in payload
-    assert payload["y"].shape[0] == 6
 
 
 def test_collect_predictions_streaming_side_mode_has_only_side_keys(monkeypatch):
@@ -325,9 +225,19 @@ def test_collect_predictions_streaming_side_mode_has_only_side_keys(monkeypatch)
         batch_rows=8,
         split_name="unit_side",
     )
-    assert set(payload) == {"dir_logits", "p_up", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "pred_abs_bps", "edge_bps", "y", "positions"}
+    assert set(payload) == {"dir_logits", "p_up", "move_logits", "p_move", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "cond_edge_bps", "edge_bps", "y", "positions"}
     assert "mag_abs_log" not in payload
     assert "mag_abs_bps" not in payload
+    p_up = 1.0 / (1.0 + np.exp(-np.clip(payload["dir_logits"], -50.0, 50.0)))
+    expected_cond_edge = (
+        p_up * payload["mag_up_bps"]
+        - (1.0 - p_up) * payload["mag_down_bps"]
+    )
+    expected_edge = payload["p_move"] * expected_cond_edge
+    assert np.allclose(payload["cond_edge_bps"], expected_cond_edge, rtol=1e-5, atol=1e-6)
+    assert np.allclose(payload["edge_bps"], expected_edge, rtol=1e-5, atol=1e-6)
+    assert np.allclose(payload["p_move"], 1.0)
+    assert np.allclose(payload["edge_bps"], payload["cond_edge_bps"])
 
 
 def test_side_cond_log_mag_targets_np():
@@ -351,6 +261,66 @@ def test_inverse_side_cond_log_mag_np_roundtrip():
     up_bps, down_bps = inverse_side_cond_log_mag_np(up_log, down_log, up_scale_bps=scale, down_scale_bps=scale, mag_floor_bps=0.0, pred_log_clip=20.0)
     assert np.allclose(up_bps, np.maximum(y, 0.0), rtol=1e-5, atol=1e-6)
     assert np.allclose(down_bps, np.maximum(-y, 0.0), rtol=1e-5, atol=1e-6)
+
+
+def test_build_move_target_from_stats_np():
+    import linear_offline
+    y = np.asarray([[0.00, 0.01, -0.01], [0.04, 0.10, -0.10], [-0.04, -0.10, 0.10], [5.00, -5.00, 0.00]], dtype=np.float32)
+    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32)}
+    tgt = linear_offline.build_move_target_from_stats_np(y, stats)
+    assert tgt.shape == y.shape
+    assert np.array_equal(tgt[0], np.array([0.0, 0.0, 0.0], dtype=np.float32))
+    assert np.array_equal(tgt[1], np.array([1.0, 1.0, 1.0], dtype=np.float32))
+    assert np.array_equal(tgt[2], np.array([1.0, 1.0, 1.0], dtype=np.float32))
+    assert np.array_equal(tgt[3], np.array([1.0, 1.0, 0.0], dtype=np.float32))
+
+
+def test_train_move_models_streaming_from_plan_uses_all_rows(monkeypatch):
+    import linear_offline
+    from CMSSL17 import NUM_HORIZONS
+    Z = np.ones((8, 4), dtype=np.float32)
+    y = np.asarray([[0.0, 0.01, -0.01], [0.04, 0.10, -0.10], [-0.04, -0.10, 0.10], [5.0, -5.0, 0.0], [0.01, 0.01, -0.01], [0.04, 0.0, -0.1], [-0.04, -0.1, 0.1], [0.0, 0.0, 0.0]], dtype=np.float32)
+    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32)}
+
+    class RecordingModel:
+        def __init__(self): self.rows = []
+        def partial_fit(self, X, t, classes=None): self.rows.append((X.shape[0], np.asarray(t))); return self
+
+    made = []
+    monkeypatch.setattr(linear_offline, "make_move_model", lambda **kwargs: made.append(RecordingModel()) or made[-1])
+    monkeypatch.setattr(linear_offline, "iter_preprocessed_batches_from_train_plan", lambda **kwargs: iter([(Z, y, None)]))
+    monkeypatch.setattr(linear_offline, "train_decision_row_count_from_plan", lambda plan, max_rows=0: int(y.shape[0]))
+    alphas = [1e-3, 1e-2]
+    results = linear_offline.train_move_models_streaming_from_plan(extractor=object(), preprocess_bundle=object(), plan={"train_split_entries": [{}]}, stats=stats, move_alpha_values=alphas, config={"epochs": 1, "batch_rows": 64, "random_state": 1, "move_weighting": "balanced"})
+    assert len(results) == len(alphas)
+    expected_t = linear_offline.build_move_target_from_stats_np(y, stats)
+    for result in results:
+        assert len(result["move_models"]) == NUM_HORIZONS
+        fs = result["fit_summary"]
+        assert fs["move_training_rows"] == "all_decision_rows"
+        assert fs["move_pos_rows_per_horizon"] == expected_t.sum(axis=0).astype(int).tolist()
+        assert fs["move_neg_rows_per_horizon"] == (y.shape[0] - expected_t.sum(axis=0)).astype(int).tolist()
+    for m in made:
+        assert sum(r for r, _ in m.rows) == y.shape[0]
+
+
+def test_add_move_head_metrics_outputs_move_and_edge_metrics():
+    import linear_offline
+    from CMSSL17 import NUM_HORIZONS
+    n = 16
+    y = np.tile(np.array([[0.0, 0.1, -0.1]], dtype=np.float32), (n, 1))
+    pred = {
+        "p_move": np.full((n, NUM_HORIZONS), 0.5, dtype=np.float32),
+        "move_logits": np.zeros((n, NUM_HORIZONS), dtype=np.float32),
+        "cond_edge_bps": np.full((n, NUM_HORIZONS), 0.2, dtype=np.float32),
+        "edge_bps": np.full((n, NUM_HORIZONS), 0.1, dtype=np.float32),
+    }
+    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32)}
+    m = {}
+    linear_offline.add_move_head_metrics(m, y=y, pred=pred, stats=stats)
+    for k in ["move_auc", "move_bal_acc", "move_bce", "move_pos_frac_true", "move_prob_mean_zero_rows", "move_prob_mean_nonmove_rows", "move_prob_mean_move_rows", "cond_edge_spearman_all", "cond_edge_spearman_kept", "edge_spearman_all", "edge_spearman_kept", "edge_bal_sign_acc_q50plus"]:
+        assert k in m
+        assert len(m[k]) == NUM_HORIZONS
 
 
 def test_direction_helper_trains_only_direction(tmp_path, monkeypatch):
@@ -811,25 +781,3 @@ def test_stable_sigmoid_handles_large_logits_without_warning():
     assert prob[0] == 0.0
     assert prob[2] == np.float32(0.5)
     assert prob[-1] == 1.0
-
-def test_abs_all_log_metrics_and_direction_zero_diag():
-    import linear_offline
-    y = np.asarray([[0.0,1.0,-2.0],[0.0,0.0,0.0],[2.0,-1.0,4.0],[-3.0,0.5,0.0]],dtype=np.float32)
-    pred = {
-        "mag_abs_bps": np.abs(y)+0.1,
-        "mag_abs_log": np.log1p((np.abs(y)+0.1)/1.0),
-        "dir_logits": np.asarray([[0.0,0.1,0.2],[0.0,0.0,0.0],[3.0,-3.0,2.0],[-4.0,2.0,0.0]],dtype=np.float32),
-    }
-    m={}
-    linear_offline.add_abs_all_log_magnitude_metrics(m, y=y, pred=pred, scale_abs_bps=np.ones(y.shape[1],dtype=np.float32))
-    for k in ["abs_log_huber_all","abs_spearman_all","abs_spearman_nonzero","abs_p50_ratio_all","abs_p90_ratio_all","zero_row_mean_pred_abs_bps","zero_row_p90_pred_abs_bps","zero_row_frac_pred_abs_lt_0p1_bps","mag_primary_huber","mag_primary_spearman"]:
-        assert k in m and len(m[k]) == y.shape[1]
-    stats = {
-        "pos_lo_raw_bps": np.zeros(y.shape[1], dtype=np.float32),
-        "pos_hi_raw_bps": np.full(y.shape[1], 1e9, dtype=np.float32),
-        "neg_lo_abs_bps": np.zeros(y.shape[1], dtype=np.float32),
-        "neg_hi_abs_bps": np.full(y.shape[1], 1e9, dtype=np.float32),
-    }
-    linear_offline.add_direction_zero_row_diagnostics(m, y=y, pred=pred, stats=stats)
-    for k in ["dir_zero_abs_logit_mean","dir_zero_abs_logit_p90","dir_zero_abs_prob_minus_0p5_mean","dir_zero_frac_abs_logit_lt_0p25","dir_nonzero_abs_logit_mean","dir_kept_abs_logit_mean"]:
-        assert k in m and len(m[k]) == y.shape[1]
