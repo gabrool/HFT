@@ -26,4 +26,19 @@ def test_compute_ablation_metrics_move_and_gated():
     pred={'dir_logits':np.array([[1,1,1],[-1,-1,-1],[0,0,0],[2,2,2]],float),'mag_up_bps':np.ones((4,3)),'mag_down_bps':np.ones((4,3)),'mag_up_log':np.zeros((4,3)),'mag_down_log':np.zeros((4,3)),'p_move':np.array([[0.9,0.9,0.9],[0.9,0.9,0.9],[0.1,0.1,0.1],[0.9,0.9,0.9]])}
     stats={'pos_lo_raw_bps':np.array([0.5,0.5,0.5]),'neg_lo_abs_bps':np.array([0.5,0.5,0.5])}
     m=lfi.compute_ablation_metrics(y=y,pred=pred,mag_up_scale_bps=np.ones(3),mag_down_scale_bps=np.ones(3),signed_raw_stats=stats)
-    assert 'move_auc_1000ms' in m and 'gated_edge_spearman_all_1000ms' in m
+    for k in [
+        "move_auc_1000ms",
+        "move_bal_acc_1000ms",
+        "move_bce_1000ms",
+        "move_pos_frac_true_1000ms",
+        "p_move_mean_zero_rows_1000ms",
+        "p_move_mean_nonmove_rows_1000ms",
+        "p_move_mean_move_rows_1000ms",
+        "cond_edge_spearman_all_1000ms",
+        "cond_edge_spearman_kept_1000ms",
+        "gated_edge_spearman_all_1000ms",
+        "gated_edge_spearman_kept_1000ms",
+        "edge_spearman_all_1000ms",
+        "edge_spearman_kept_1000ms",
+    ]:
+        assert k in m
