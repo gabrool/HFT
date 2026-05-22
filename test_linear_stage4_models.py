@@ -325,9 +325,42 @@ def test_add_move_head_metrics_outputs_move_and_edge_metrics():
     }
     m = {}
     linear_offline.add_move_head_metrics(m, y=y, pred=pred, stats=stats)
-    for k in ["move_auc", "move_bal_acc", "move_bce", "move_pos_frac_true", "move_prob_mean_zero_rows", "move_prob_mean_nonmove_rows", "move_prob_mean_move_rows", "cond_edge_spearman_all", "cond_edge_spearman_kept", "edge_spearman_all", "edge_spearman_kept", "edge_bal_sign_acc_q50plus"]:
+    for k in ["move_auc", "move_bal_acc", "move_bce", "move_pos_frac_true", "move_prob_mean_zero_rows", "move_prob_mean_nonmove_rows", "move_prob_mean_move_rows", "cond_edge_spearman_all", "cond_edge_spearman_kept", "gated_edge_spearman_all", "gated_edge_spearman_kept", "gated_edge_bal_sign_acc_q50plus"]:
         assert k in m
         assert len(m[k]) == NUM_HORIZONS
+
+
+def test_add_move_head_metrics_computes_move_auc_with_scores_first():
+    import linear_offline
+    n = 20
+    y = np.zeros((n, 3), dtype=np.float32)
+    y[:10, 2] = 0.20
+    y[10:, 2] = 0.0
+    pred = {
+        "p_move": np.vstack([np.tile([0.5, 0.5, 0.9], (10, 1)), np.tile([0.5, 0.5, 0.1], (10, 1))]).astype(np.float32),
+        "move_logits": np.zeros((n, 3), dtype=np.float32),
+        "cond_edge_bps": np.zeros((n, 3), dtype=np.float32),
+        "edge_bps": np.zeros((n, 3), dtype=np.float32),
+    }
+    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "pos_hi_raw_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32), "neg_hi_abs_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32)}
+    metrics = {}
+    linear_offline.add_move_head_metrics(metrics, y=y, pred=pred, stats=stats)
+    auc_1s = linear_offline._metric_at_primary_horizon(metrics, "move_auc")
+    assert np.isfinite(auc_1s)
+    assert 0.0 <= auc_1s <= 1.0
+
+
+def test_add_move_head_metrics_does_not_collide_with_legacy_edge_keys():
+    import linear_offline
+    y = np.tile(np.array([[0.0, 0.1, -0.1]], dtype=np.float32), (16, 1))
+    pred = {"p_move": np.full((16, 3), 0.5, dtype=np.float32), "move_logits": np.zeros((16, 3), dtype=np.float32), "cond_edge_bps": np.full((16, 3), 0.2, dtype=np.float32), "edge_bps": np.full((16, 3), 0.1, dtype=np.float32)}
+    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "pos_hi_raw_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32), "neg_hi_abs_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32)}
+    metrics = {"edge_spearman_all": [111.0, 222.0, 333.0], "edge_spearman_kept": [111.0, 222.0, 333.0]}
+    linear_offline.add_move_head_metrics(metrics, y=y, pred=pred, stats=stats)
+    assert metrics["edge_spearman_all"] == [111.0, 222.0, 333.0]
+    assert metrics["edge_spearman_kept"] == [111.0, 222.0, 333.0]
+    assert len(metrics["gated_edge_spearman_all"]) == len(linear_offline.HORIZONS_MS)
+    assert len(metrics["gated_edge_spearman_kept"]) == len(linear_offline.HORIZONS_MS)
 
 
 def test_direction_helper_trains_only_direction(tmp_path, monkeypatch):
@@ -474,7 +507,7 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     fake_mag_result = {"mag_alpha": 1e-4, "mag_up_models": [], "mag_down_models": [], "fit_summary": {"mag_alpha": 1e-4}}
 
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.22] * metric_len, "mag_primary_spearman": [0.44] * metric_len, "mag_primary_p50_ratio": [0.88] * metric_len, "mag_primary_p90_ratio": [1.23] * metric_len, "mag_primary_top_bottom_true_mean_lift": [2.5] * metric_len, "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.07, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
+    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.22] * metric_len, "mag_primary_spearman": [0.44] * metric_len, "mag_primary_p50_ratio": [0.88] * metric_len, "mag_primary_p90_ratio": [1.23] * metric_len, "mag_primary_top_bottom_true_mean_lift": [2.5] * metric_len, "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.07, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "gated_edge_spearman_all": [0.35, 0.37, 0.39], "gated_edge_spearman_kept": [0.41, 0.43, 0.45], "gated_edge_bal_sign_acc_q50plus": [0.70, 0.71, 0.72], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
 
     monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda *, out_root: fake_plan)
     monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}))
@@ -558,7 +591,7 @@ def test_stage4_records_distinct_direction_and_magnitude_alphas(tmp_path, monkey
     fake_mag_result = {"mag_alpha": 1e-4, "mag_up_models": fake_mag_up_models, "mag_down_models": fake_mag_down_models, "fit_summary": {"mag_alpha": 1e-4}}
 
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.10, 0.09, 0.08], "mag_primary_spearman": [0.10, 0.12, 0.14], "mag_primary_p50_ratio": [1.0, 1.0, 1.0], "mag_primary_p90_ratio": [0.5, 0.5, 0.5], "mag_primary_top_bottom_true_mean_lift": [2.0, 2.1, 2.2], "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.10, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
+    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.10, 0.09, 0.08], "mag_primary_spearman": [0.10, 0.12, 0.14], "mag_primary_p50_ratio": [1.0, 1.0, 1.0], "mag_primary_p90_ratio": [0.5, 0.5, 0.5], "mag_primary_top_bottom_true_mean_lift": [2.0, 2.1, 2.2], "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.10, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "gated_edge_spearman_all": [0.35, 0.37, 0.39], "gated_edge_spearman_kept": [0.41, 0.43, 0.45], "gated_edge_bal_sign_acc_q50plus": [0.70, 0.71, 0.72], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
 
     saved = {}
 
@@ -615,7 +648,7 @@ def test_stage4_reuses_reference_magnitude_alpha_without_retraining(tmp_path, mo
     fake_dir_result = {"direction_alpha": 1e-4, "direction_models": [], "fit_summary": {"direction_alpha": 1e-4}}
     fake_up, fake_down = [], []
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.10, 0.09, 0.08], "mag_primary_spearman": [0.10, 0.12, 0.14], "mag_primary_p50_ratio": [1.0, 1.0, 1.0], "mag_primary_p90_ratio": [0.5, 0.5, 0.5], "mag_primary_top_bottom_true_mean_lift": [2.0, 2.1, 2.2], "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.10, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
+    fake_metrics = {"dir_auc_kept": [0.70, 0.72, 0.75], "dir_bal_acc_kept": [0.65, 0.66, 0.67], "dir_bce_kept": [0.60, 0.58, 0.56], "mag_primary_huber": [0.10, 0.09, 0.08], "mag_primary_spearman": [0.10, 0.12, 0.14], "mag_primary_p50_ratio": [1.0, 1.0, 1.0], "mag_primary_p90_ratio": [0.5, 0.5, 0.5], "mag_primary_top_bottom_true_mean_lift": [2.0, 2.1, 2.2], "move_auc": [0.60, 0.62, 0.65], "move_bal_acc": [0.58, 0.60, 0.62], "move_bce": [0.68, 0.66, 0.64], "move_pos_frac_true": [0.30, 0.30, 0.30], "move_prob_mean_zero_rows": [0.10, 0.12, 0.14], "move_prob_mean_nonmove_rows": [0.20, 0.22, 0.24], "move_prob_mean_move_rows": [0.70, 0.72, 0.74], "cond_edge_spearman_all": [0.20, 0.22, 0.24], "cond_edge_spearman_kept": [0.30, 0.32, 0.34], "edge_spearman_all": [0.25, 0.27, 0.29], "edge_spearman_kept": [0.31, 0.33, 0.35], "edge_bal_sign_acc_q50plus": [0.60, 0.61, 0.62], "gated_edge_spearman_all": [0.35, 0.37, 0.39], "gated_edge_spearman_kept": [0.41, 0.43, 0.45], "gated_edge_bal_sign_acc_q50plus": [0.70, 0.71, 0.72], "n_eval_rows": 123, "primary_metric_guard_passed": True, "primary_dir_bal_acc": 0.67}
     seen_mag_alpha_batches = []
 
     def fake_train_mag(**kwargs):
@@ -657,7 +690,7 @@ def test_stage4_payload_contains_final_move_metrics_and_test_metrics(tmp_path, m
     fake_plan = {"has_cmssl_test": True, "train_split_entries": [{}], "train_week_keys": ["w0"], "val_split_entries": [{}], "test_split_entries": [{}]}
     fake_preprocess = types.SimpleNamespace(original_dim=5, kept_dim=5)
     metric_len = len(linear_offline.HORIZONS_MS)
-    fake_metrics = {"dir_auc_kept": [0.7] * metric_len, "dir_bal_acc_kept": [0.6] * metric_len, "dir_bce_kept": [0.5] * metric_len, "mag_primary_huber": [0.2] * metric_len, "mag_primary_spearman": [0.3] * metric_len, "mag_primary_p50_ratio": [1.0] * metric_len, "mag_primary_p90_ratio": [1.1] * metric_len, "mag_primary_top_bottom_true_mean_lift": [0.4] * metric_len, "move_auc": [0.65] * metric_len, "move_bal_acc": [0.55] * metric_len, "move_bce": [0.45] * metric_len, "move_pos_frac_true": [0.25] * metric_len, "move_prob_mean_zero_rows": [0.1] * metric_len, "move_prob_mean_nonmove_rows": [0.2] * metric_len, "move_prob_mean_move_rows": [0.8] * metric_len, "cond_edge_spearman_all": [0.15] * metric_len, "cond_edge_spearman_kept": [0.2] * metric_len, "edge_spearman_all": [0.12] * metric_len, "edge_spearman_kept": [0.18] * metric_len, "edge_bal_sign_acc_q50plus": [0.52] * metric_len, "primary_metric_guard_passed": True}
+    fake_metrics = {"dir_auc_kept": [0.7] * metric_len, "dir_bal_acc_kept": [0.6] * metric_len, "dir_bce_kept": [0.5] * metric_len, "mag_primary_huber": [0.2] * metric_len, "mag_primary_spearman": [0.3] * metric_len, "mag_primary_p50_ratio": [1.0] * metric_len, "mag_primary_p90_ratio": [1.1] * metric_len, "mag_primary_top_bottom_true_mean_lift": [0.4] * metric_len, "move_auc": [0.65] * metric_len, "move_bal_acc": [0.55] * metric_len, "move_bce": [0.45] * metric_len, "move_pos_frac_true": [0.25] * metric_len, "move_prob_mean_zero_rows": [0.1] * metric_len, "move_prob_mean_nonmove_rows": [0.2] * metric_len, "move_prob_mean_move_rows": [0.8] * metric_len, "cond_edge_spearman_all": [0.15] * metric_len, "cond_edge_spearman_kept": [0.2] * metric_len, "edge_spearman_all": [0.12] * metric_len, "edge_spearman_kept": [0.18] * metric_len, "edge_bal_sign_acc_q50plus": [0.52] * metric_len, "gated_edge_spearman_all": [0.22] * metric_len, "gated_edge_spearman_kept": [0.28] * metric_len, "gated_edge_bal_sign_acc_q50plus": [0.62] * metric_len, "primary_metric_guard_passed": True}
 
     monkeypatch.setattr(linear_offline, "load_linear_split_plan_from_out_root", lambda *, out_root: fake_plan)
     monkeypatch.setattr(linear_offline, "load_stage2_extractor_bundle", lambda **kwargs: (object(), {"payload_path": "stage2.json"}))
