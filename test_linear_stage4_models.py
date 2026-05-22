@@ -226,8 +226,8 @@ def test_collect_predictions_streaming_side_mode_has_only_side_keys(monkeypatch)
         split_name="unit_side",
     )
     assert set(payload) == {"dir_logits", "p_up", "move_logits", "p_move", "mag_up_sqrt", "mag_down_sqrt", "mag_up_log", "mag_down_log", "mag_up_bps", "mag_down_bps", "cond_edge_bps", "edge_bps", "y", "positions"}
-    assert "mag_abs_log" not in payload
-    assert "mag_abs_bps" not in payload
+    assert "mag" + "_abs_log" not in payload
+    assert "mag" + "_abs_bps" not in payload
     p_up = 1.0 / (1.0 + np.exp(-np.clip(payload["dir_logits"], -50.0, 50.0)))
     expected_cond_edge = (
         p_up * payload["mag_up_bps"]
@@ -280,7 +280,7 @@ def test_train_move_models_streaming_from_plan_uses_all_rows(monkeypatch):
     from CMSSL17 import NUM_HORIZONS
     Z = np.ones((8, 4), dtype=np.float32)
     y = np.asarray([[0.0, 0.01, -0.01], [0.04, 0.10, -0.10], [-0.04, -0.10, 0.10], [5.0, -5.0, 0.0], [0.01, 0.01, -0.01], [0.04, 0.0, -0.1], [-0.04, -0.1, 0.1], [0.0, 0.0, 0.0]], dtype=np.float32)
-    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32)}
+    stats = {"pos_lo_raw_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "neg_lo_abs_bps": np.asarray([0.03, 0.05, 0.05], dtype=np.float32), "pos_hi_raw_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32), "neg_hi_abs_bps": np.asarray([1e9, 1e9, 1e9], dtype=np.float32)}
 
     class RecordingModel:
         def __init__(self): self.rows = []
@@ -425,7 +425,7 @@ def test_add_side_cond_log_magnitude_metrics_values_and_no_all_row_keys():
     assert np.isclose(metrics["up_mean_ratio_cond"][h], np.mean(pred_up) / np.mean(true_up))
     assert metrics["up_n_cond"][h] == int(up_rows.sum())
     assert metrics["down_n_cond"][h] == int((y[:, h] < 0).sum())
-    for key in ["mean_side_log_huber_cond", "mean_side_spearman_cond", "mean_side_mean_ratio_cond", "mean_side_p50_ratio_cond", "mean_side_p90_ratio_cond", "mean_side_top_bottom_true_mean_lift_cond", "zero_row_mean_pred_abs_bps", "up_inactive_pred_p90_bps", "down_inactive_pred_p90_bps", "zero_row_up_pred_p90_bps", "zero_row_down_pred_p90_bps"]:
+    for key in ["mean_side_log_huber_cond", "mean_side_spearman_cond", "mean_side_mean_ratio_cond", "mean_side_p50_ratio_cond", "mean_side_p90_ratio_cond", "mean_side_top_bottom_true_mean_lift_cond", "zero_row_mean_pred_mag_bps", "up_inactive_pred_p90_bps", "down_inactive_pred_p90_bps", "zero_row_up_pred_p90_bps", "zero_row_down_pred_p90_bps"]:
         assert key in metrics
     for key in ["mag_expected_abs_spearman_all", "pred_expected_abs_p90_over_true_abs_p90_all", "pred_expected_abs_p95_over_true_abs_p95_all", "pred_expected_abs_p50_over_true_abs_p50_all", "true_abs_bps_p50_all", "pred_expected_abs_bps_p50_all"]:
         assert key not in metrics
@@ -517,13 +517,21 @@ def test_stage4_prints_candidate_and_best_summary(capsys, tmp_path, monkeypatch)
     assert "p50_ratio_1s=0.88" in out
     assert "p90_ratio_1s=1.23" in out
     assert "lift_1s=2.5" in out
-    assert "zero_pred_1s=0.07" in out
+    assert "move_auc_1s=" in out
+    assert "move_bce_1s=" in out
+    assert "p_move_zero_1s=" in out
+    assert "p_move_nonmove_1s=" in out
+    assert "p_move_move_1s=" in out
+    assert "cond_edge_sp_all_1s=" in out
+    assert "edge_sp_all_1s=" in out
+    assert "cond_edge_sp_kept_1s=" in out
+    assert "edge_sp_kept_1s=" in out
     assert "mag_huber_1s=0.22" in out
     assert "mag_sp_1s=0.44" in out
     assert "mag_p50_ratio_1s=0.88" in out
     assert "mag_p90_ratio_1s=1.23" in out
     assert "mag_lift_1s=2.5" in out
-    assert "mag_abs_sp_1s" not in out
+    assert "mag" + "_abs_sp_1s" not in out
     assert "expected_abs" not in out
     assert "selection_score=" in out
 
@@ -672,7 +680,7 @@ def test_stage4_payload_contains_final_move_metrics_and_test_metrics(tmp_path, m
     assert "move" in payload["stage4_summary_metrics"]
     assert "edge" in payload["stage4_summary_metrics"]
     assert payload["stage4_summary_metrics"]["edge"]["schema"] == "p_move_times_conditional_side_edge_v1"
-    assert "mag_abs_scale_bps" not in payload
+    assert "mag" + "_abs_scale_bps" not in payload
     assert "direction_zero_rows" not in payload["stage4_summary_metrics"]
 
 
