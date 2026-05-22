@@ -91,3 +91,13 @@ class ShortHorizonAbsReturnPressure(CandidateFromExisting):
         if not vals:
             raise KeyError(f"None of candidate pressure names found: {candidates}")
         return np.max(np.stack(vals, axis=1), axis=1).astype(np.float32)
+
+
+class CandidatePackFromExisting:
+    name = "candidate_pack_from_existing"
+
+    def compute_many(self, X: np.ndarray, feature_names: list[str]) -> dict[str, np.ndarray]:
+        raise NotImplementedError
+
+    def metadata(self) -> dict[str, dict]:
+        return {}

@@ -328,10 +328,58 @@ def wcsv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
         if rows:
             w.writerows(rows)
 
+
+
+def _score_rel_row(rel: dict, md: dict | None = None) -> dict:
+    md = md or {}
+    def _f(x): return float(x) if np.isfinite(x) else 0.0
+    rel = dict(rel)
+    rel["move_score_1000ms"] = abs(_f(rel.get("best_move_auc_1000ms")) - 0.5)
+    rel["move_score_best"] = abs(_f(rel.get("best_move_auc")) - 0.5)
+    rel["mag_score_1000ms"] = abs(_f(rel.get("best_abs_return_spearman_1000ms")))
+    rel["mag_score_best"] = abs(_f(rel.get("best_abs_return_spearman")))
+    rel["dir_score_1000ms"] = abs(_f(rel.get("best_kept_auc_1000ms")) - 0.5)
+    rel["dir_score_best"] = abs(max(_f(rel.get("best_kept_auc_200ms")), _f(rel.get("best_kept_auc_500ms")), _f(rel.get("best_kept_auc_1000ms"))) - 0.5)
+    mxc = _f(rel.get("max_corr_with_existing"))
+    rel["novelty_score"] = max(0.0, 1.0 - mxc)
+    cps = 1.0*rel["move_score_1000ms"] + 0.75*rel["mag_score_1000ms"] + 0.35*rel["dir_score_1000ms"] + 0.25*rel["novelty_score"]
+    if mxc >= HIGH: cps *= 0.25
+    elif mxc >= MED: cps *= 0.60
+    rel["candidate_priority_score"] = float(cps)
+    rel.update({k: md.get(k) for k in ["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target"]})
+    return rel
+
+def evaluate_candidate_batch(candidates, X, y, feature_names, week_keys, *, low_abs_trim_fraction, high_abs_trim_fraction, out_dir: Path, write_per_candidate_details=False, candidate_metadata=None):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    health_rows=[]; rel_rows=[]; summary_rows=[]; top_corr=[]; tgt=[]; dec=[]; promote=[]
+    for n,arr in candidates.items():
+        h,t,c,r,s,d = evaluate_candidate_array(n, np.asarray(arr,dtype=np.float32), X,y,feature_names,week_keys, low_abs_trim_fraction=low_abs_trim_fraction, high_abs_trim_fraction=high_abs_trim_fraction)
+        md=(candidate_metadata or {}).get(n,{})
+        r=_score_rel_row(r,md)
+        health_rows.append(h); rel_rows.append(r); summary_rows.append({"candidate":n,"decision":r.get("decision"),"candidate_priority_score":r.get("candidate_priority_score"),"candidate_target_score":r.get("candidate_target_score")})
+        top_corr.extend(c); tgt.extend(t); dec.extend(d)
+        if write_per_candidate_details:
+            d0=out_dir/n; d0.mkdir(parents=True,exist_ok=True)
+            wcsv(d0/"candidate_health.csv",[h],HEALTH_FIELDS); wcsv(d0/"candidate_target_metrics.csv",t,TARGET_FIELDS); wcsv(d0/"candidate_corr_top_pairs.csv",c,CORR_FIELDS); wcsv(d0/"candidate_relative_report.csv",[r],RELATIVE_FIELDS+["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target","move_score_1000ms","mag_score_1000ms","dir_score_1000ms","novelty_score","candidate_priority_score"]); wcsv(d0/"candidate_decile_report.csv",d,DECILE_FIELDS); (d0/"feature_lab_summary.json").write_text(json.dumps(s,indent=2,sort_keys=True))
+        if r.get("decision") in {"promote_candidate","needs_ablation"} and float(r.get("max_corr_with_existing",1.0)) < 0.95 and (float(r.get("best_move_auc_1000ms",0))>=0.56 or abs(float(r.get("best_abs_return_spearman_1000ms",0)))>=0.03 or float(r.get("best_kept_auc_1000ms",0))>=0.56):
+            promote.append({"name":n, "candidate_family":r.get("candidate_family"), "expected_target":r.get("expected_target"), "candidate_priority_score":r.get("candidate_priority_score"), "best_move_auc_1000ms":r.get("best_move_auc_1000ms"), "best_move_bal_acc_1000ms":r.get("best_move_bal_acc_1000ms"), "best_abs_return_spearman_1000ms":r.get("best_abs_return_spearman_1000ms"), "best_kept_auc_1000ms":r.get("best_kept_auc_1000ms"), "max_corr_with_existing":r.get("max_corr_with_existing"), "most_correlated_existing_feature":r.get("most_correlated_existing_feature"), "decision":r.get("decision"), "reason":r.get("reason")})
+    rel_rows=sorted(rel_rows,key=lambda r:(-float(r.get("candidate_priority_score",0)),-float(r.get("candidate_target_score",0)),float(r.get("max_corr_with_existing",9))))
+    wcsv(out_dir/"feature_lab_batch_health.csv", health_rows, HEALTH_FIELDS)
+    ext=RELATIVE_FIELDS+["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target","move_score_1000ms","mag_score_1000ms","dir_score_1000ms","novelty_score","candidate_priority_score"]
+    wcsv(out_dir/"feature_lab_batch_relative_report.csv", rel_rows, ext)
+    wcsv(out_dir/"feature_lab_batch_summary.csv", summary_rows, ["candidate","decision","candidate_priority_score","candidate_target_score"])
+    wcsv(out_dir/"feature_lab_batch_top_corr.csv", top_corr, CORR_FIELDS)
+    wcsv(out_dir/"feature_lab_batch_target_metrics.csv", tgt, TARGET_FIELDS)
+    wcsv(out_dir/"feature_lab_batch_decile_report.csv", dec, DECILE_FIELDS)
+    (out_dir/"feature_lab_batch_summary.json").write_text(json.dumps({"n_candidates":len(candidates),"promote_n":len(promote)}, indent=2))
+    promote=sorted(promote,key=lambda z: float(z.get("candidate_priority_score",0)), reverse=True)
+    (out_dir/"feature_lab_promote_candidates.json").write_text(json.dumps(promote, indent=2))
+    return {"relative":rel_rows,"promote":promote}
+
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("--mode",required=True,choices=["expr","plugin","event"]); ap.add_argument("--candidate-name",default=""); ap.add_argument("--expr",default=""); ap.add_argument("--candidate-module",default="feature_candidates"); ap.add_argument("--candidate-class",default=""); ap.add_argument("--out-dir",default="")
+    ap=argparse.ArgumentParser(); ap.add_argument("--mode",required=True,choices=["expr","plugin","plugin-pack","event-pack"]); ap.add_argument("--candidate-name",default=""); ap.add_argument("--expr",default=""); ap.add_argument("--candidate-module",default="feature_candidates"); ap.add_argument("--candidate-class",default=""); ap.add_argument("--out-dir",default=""); ap.add_argument("--candidate-pack-module",default="feature_event_candidates"); ap.add_argument("--candidate-pack-class",default="MovementMicrostructureCandidatePack"); ap.add_argument("--write-per-candidate-details",action="store_true"); ap.add_argument("--max-candidates",type=int,default=0)
     a=ap.parse_args()
-    if a.mode=="event": raise NotImplementedError("event mode is intentionally deferred; use expr/plugin mode first")
+    
     out_root=Path(os.environ.get("BYBIT_OUT_ROOT","").strip()); meta=read_json(out_root/"meta.json")
     low_trim, high_trim = resolve_trim_fractions(meta)
     names,idx=select_feature_names_and_idx(meta,USE_AUX)
@@ -355,9 +403,46 @@ def main():
     if not Xs:
         raise RuntimeError("No feature_lab rows sampled; check train week metadata and sampling config")
     X=np.concatenate(Xs,0); y=np.concatenate(Ys,0); names,_=select_feature_names_and_idx(meta,USE_AUX,X.shape[1])
-    if a.mode=="expr": cname=a.candidate_name or "expr_candidate"; cand=eval_expr(a.expr,X,names)
-    else:
+    if a.mode=="expr": cname=a.candidate_name or "expr_candidate"; cand=eval_expr(a.expr,X,names);
+    elif a.mode=="plugin":
         mod=importlib.import_module(a.candidate_module); cls=getattr(mod,a.candidate_class); obj=cls(); cname=getattr(obj,"name",a.candidate_class); cand=np.asarray(obj.compute(X,names),dtype=np.float32)
+    elif a.mode=="plugin-pack":
+        mod=importlib.import_module(a.candidate_module); cls=getattr(mod,a.candidate_class); obj=cls(); cands={k:np.asarray(v,dtype=np.float32) for k,v in obj.compute_many(X,names).items()};
+        md=obj.metadata() if hasattr(obj,"metadata") else {}
+        if a.max_candidates>0: cands={k:cands[k] for k in list(cands)[:a.max_candidates]}
+        out=Path(a.out_dir) if a.out_dir else Path(os.environ.get("BYBIT_FEATURE_LAB_OUT_DIR", str(out_root/"feature_lab")))
+        evaluate_candidate_batch(cands,X,y,names,wks,low_abs_trim_fraction=low_trim,high_abs_trim_fraction=high_trim,out_dir=out,write_per_candidate_details=a.write_per_candidate_details,candidate_metadata=md); return
+    else:
+        mod=importlib.import_module(a.candidate_pack_module); cls=getattr(mod,a.candidate_pack_class); pack=cls();
+        cands={n:np.zeros((X.shape[0],),dtype=np.float32) for n in pack.feature_names()}
+        i=0
+        for wk in train_weeks:
+            wm=week_metas[wk]; n=targets.get(wk,0)
+            if n<=0: continue
+            n_labels=resolve_week_label_count(wm); pos=systematic_positions(n_labels,n,SEED+train_weeks.index(wk)); row_idx,_,_=load_labels_for_positions(out_root,wk,wm["label_chunks"],pos)
+            sample_map={}
+            for off,r in enumerate(row_idx.astype(np.int64)): sample_map.setdefault(int(r),[]).append(i+off)
+            from offline_ingest import pair_weeks, iter_weekly_event_stream
+            ob=os.environ.get("BYBIT_OB_DIR",""); th=os.environ.get("BYBIT_TH_DIR","")
+            if not ob or not th: raise RuntimeError("BYBIT_OB_DIR and BYBIT_TH_DIR must be set for event-pack")
+            pairs=[p for p in pair_weeks(ob,th) if p[0]==wk]
+            if not pairs: raise RuntimeError(f"No raw week files resolved for {wk}")
+            pack.reset(); di=-1; filled=set()
+            for kind,ww,payload in iter_weekly_event_stream(pairs,collect_quality=False):
+                if ww!=wk: continue
+                if kind in {"first","evt"} and payload is not None:
+                    ev=payload; pack.on_event(ev)
+                    if ev[0]=="ob":
+                        di+=1
+                        if di in sample_map:
+                            vals=pack.emit()
+                            for j in sample_map[di]:
+                                for nm,v in vals.items(): cands[nm][j]=v
+                            filled.add(di)
+            i += len(row_idx)
+        md=pack.metadata()
+        out=Path(a.out_dir) if a.out_dir else Path(os.environ.get("BYBIT_FEATURE_LAB_OUT_DIR", str(out_root/"feature_lab")))
+        evaluate_candidate_batch(cands,X,y,names,wks,low_abs_trim_fraction=low_trim,high_abs_trim_fraction=high_trim,out_dir=out,write_per_candidate_details=a.write_per_candidate_details,candidate_metadata=md); return
     health,target,corr,rel,summary,dec=evaluate_candidate_array(cname,cand,X,y,names,wks,low_abs_trim_fraction=low_trim,high_abs_trim_fraction=high_trim)
     out=Path(a.out_dir) if a.out_dir else Path(os.environ.get("BYBIT_FEATURE_LAB_OUT_DIR", str(out_root/"feature_lab")))/cname; out.mkdir(parents=True,exist_ok=True)
     wcsv(out/"candidate_health.csv",[health],HEALTH_FIELDS); wcsv(out/"candidate_target_metrics.csv",target,TARGET_FIELDS); wcsv(out/"candidate_corr_top_pairs.csv",corr,CORR_FIELDS); wcsv(out/"candidate_relative_report.csv",[rel],RELATIVE_FIELDS); wcsv(out/"candidate_decile_report.csv",dec,DECILE_FIELDS)
