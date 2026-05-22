@@ -14,10 +14,28 @@ DEFAULT_HIGH_ABS_TRIM_FRACTION = 0.02
 
 ALLOWED_NP_FUNCS={"log1p":np.log1p,"abs":np.abs,"sign":np.sign,"clip":np.clip,"maximum":np.maximum,"minimum":np.minimum}
 HEALTH_FIELDS=["candidate","n_rows","finite_frac","nan_count","inf_count","mean","std","p01","p05","p50","p95","p99","min","max","abs_max","zero_frac","near_zero_frac_abs_lt_1e-6","week_std_cv"]
-TARGET_FIELDS=["candidate","horizon_ms","mask_type","pearson_signed_return","spearman_signed_return","pearson_abs_return","spearman_abs_return","single_feature_auc_direction","single_feature_auc_direction_sign","single_feature_bal_acc_sign","single_feature_bal_acc_best_threshold","single_feature_bal_acc_best_threshold_value","mi_direction","mi_abs_return"]
+TARGET_FIELDS=["candidate","horizon_ms","mask_type","pearson_signed_return","spearman_signed_return","pearson_abs_return","spearman_abs_return","single_feature_auc_direction","single_feature_auc_direction_sign","single_feature_bal_acc_sign","single_feature_bal_acc_best_threshold","single_feature_bal_acc_best_threshold_value","mi_direction","mi_abs_return","single_feature_auc_move","single_feature_auc_move_sign","single_feature_bal_acc_move_best_threshold","single_feature_bal_acc_move_best_threshold_value","mi_move","move_pos_frac"]
 CORR_FIELDS=["candidate","existing_feature","existing_feature_index","pearson","spearman","abs_pearson","abs_spearman","max_abs_corr","existing_family","existing_timescale_ms","existing_best_kept_auc","existing_best_abs_return_spearman","existing_target_score"]
-RELATIVE_FIELDS=["candidate","max_corr_with_existing","most_correlated_existing_feature","most_correlated_existing_target_score","candidate_target_score","candidate_minus_existing_target_score","high_corr_duplicate","medium_corr_related","best_kept_auc_200ms","best_kept_auc_500ms","best_kept_auc_1000ms","best_kept_bal_acc_1000ms","best_abs_return_spearman","best_abs_return_spearman_200ms","best_abs_return_spearman_500ms","best_abs_return_spearman_1000ms","best_mi_direction","best_mi_abs_return","finite_frac","std","week_std_cv","decision","reason"]
-DECILE_FIELDS=["candidate","horizon_ms","decile","n_rows","candidate_min","candidate_max","mean_signed_return","mean_abs_return","up_frac"]
+RELATIVE_FIELDS=["candidate","max_corr_with_existing","most_correlated_existing_feature","most_correlated_existing_target_score","candidate_target_score","candidate_minus_existing_target_score","high_corr_duplicate","medium_corr_related","best_kept_auc_200ms","best_kept_auc_500ms","best_kept_auc_1000ms","best_kept_bal_acc_1000ms","best_abs_return_spearman","best_abs_return_spearman_200ms","best_abs_return_spearman_500ms","best_abs_return_spearman_1000ms","best_move_auc","best_move_auc_200ms","best_move_auc_500ms","best_move_auc_1000ms","best_move_bal_acc_1000ms","best_mi_direction","best_mi_abs_return","best_mi_move","finite_frac","std","week_std_cv","decision","reason"]
+DECILE_FIELDS=["candidate","horizon_ms","decile","n_rows","candidate_min","candidate_max","mean_signed_return","mean_abs_return","up_frac","move_frac","nonmove_frac","zero_frac"]
+
+def side_low_thresholds_from_sample(y: np.ndarray, low_abs_trim_fraction: float, min_abs_label_eps: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(y, dtype=np.float64)
+    pos_lo = np.zeros(y.shape[1], dtype=np.float64)
+    neg_lo = np.zeros(y.shape[1], dtype=np.float64)
+    for h in range(y.shape[1]):
+        yh = y[:, h]
+        finite = np.isfinite(yh)
+        pos_abs = yh[finite & (yh > min_abs_label_eps)]
+        neg_abs = -yh[finite & (yh < -min_abs_label_eps)]
+        pos_lo[h] = np.quantile(pos_abs, low_abs_trim_fraction) if pos_abs.size else np.inf
+        neg_lo[h] = np.quantile(neg_abs, low_abs_trim_fraction) if neg_abs.size else np.inf
+    return pos_lo, neg_lo
+
+def build_move_target_from_sample(y: np.ndarray, low_abs_trim_fraction: float, min_abs_label_eps: float = 0.0) -> np.ndarray:
+    pos_lo, neg_lo = side_low_thresholds_from_sample(y, low_abs_trim_fraction, min_abs_label_eps)
+    y = np.asarray(y, dtype=np.float64)
+    return (((y > min_abs_label_eps) & (y >= pos_lo.reshape(1, -1))) | ((y < -min_abs_label_eps) & ((-y) >= neg_lo.reshape(1, -1)))).astype(np.int8)
 
 class SafeNpNamespace:
     log1p=np.log1p; abs=np.abs; sign=np.sign; clip=np.clip; maximum=np.maximum; minimum=np.minimum
@@ -194,8 +212,10 @@ def select_feature_names_and_idx(meta:dict,use_aux:bool,X_cols:int|None=None):
 
 def compute_existing_feature_target_scores(X,y,feature_names,low_abs_trim_fraction,high_abs_trim_fraction):
     out={}
+    move_target = build_move_target_from_sample(y, low_abs_trim_fraction, MIN_ABS_LABEL_EPS)
     for i,n in enumerate(feature_names):
         feat=X[:,i]; best_auc=np.nan; best_abs=np.nan
+        best_move_auc=np.nan
         for h_i,_h in enumerate([200,500,1000]):
             ys=y[:,h_i]; kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction,MIN_ABS_LABEL_EPS)&np.isfinite(feat)
             if not kept.any(): continue
@@ -203,8 +223,12 @@ def compute_existing_feature_target_scores(X,y,feature_names,low_abs_trim_fracti
             auc=_binary_auc_np(dd,xx); auc=max(auc,1-auc) if np.isfinite(auc) else np.nan
             abs_sp=abs(_safe_spearman_np(xx,aa))
             best_auc=np.nanmax([best_auc,auc]); best_abs=np.nanmax([best_abs,abs_sp])
-        score=max(abs(best_auc-0.5) if np.isfinite(best_auc) else 0.0,0.5*abs(best_abs) if np.isfinite(best_abs) else 0.0)
-        out[n]={"existing_best_kept_auc":best_auc,"existing_best_abs_return_spearman":best_abs,"existing_target_score":float(score)}
+            mv = move_target[:, h_i]
+            move_auc = _binary_auc_np(mv[np.isfinite(feat)], feat[np.isfinite(feat)])
+            move_auc = max(move_auc, 1 - move_auc) if np.isfinite(move_auc) else np.nan
+            best_move_auc = np.nanmax([best_move_auc, move_auc])
+        score=max(abs(best_auc-0.5) if np.isfinite(best_auc) else 0.0,0.5*abs(best_abs) if np.isfinite(best_abs) else 0.0,abs(best_move_auc-0.5) if np.isfinite(best_move_auc) else 0.0)
+        out[n]={"existing_best_kept_auc":best_auc,"existing_best_abs_return_spearman":best_abs,"existing_best_move_auc":best_move_auc,"existing_target_score":float(score)}
     return out
 
 def candidate_decile_bins(candidate: np.ndarray, n_deciles: int = 10) -> np.ndarray:
@@ -239,11 +263,13 @@ def evaluate_candidate_array(candidate_name,candidate,X,y,feature_names,week_key
         corr.append((m,{"candidate":candidate_name,"existing_feature":n,"existing_feature_index":i,"pearson":p,"spearman":s,"abs_pearson":abs(p) if np.isfinite(p) else np.nan,"abs_spearman":abs(s) if np.isfinite(s) else np.nan,"max_abs_corr":m,"existing_family":parsed.get("family","unknown"),"existing_timescale_ms":parsed.get("timescale_ms",np.nan),**target_lookup.get(n,{})}))
     corr_rows=[r[1] for r in sorted(corr,key=lambda z:z[0],reverse=True)[:TOP]]
     horizons=[200,500,1000]; target_rows=[]; dec=[]
-    per_h_auc={}; per_h_abs={}; per_h_bal={}
+    per_h_auc={}; per_h_abs={}; per_h_bal={}; per_h_move_auc={}; per_h_move_bal={}
+    move_target = build_move_target_from_sample(y, low_abs_trim_fraction, MIN_ABS_LABEL_EPS)
     bins = candidate_decile_bins(candidate, 10)
     for h_i,h in enumerate(horizons):
         ys=y[:,h_i]; direction=(ys>0).astype(int); absr=np.abs(ys)
         finite=np.isfinite(ys)&np.isfinite(candidate)
+        mv = move_target[:, h_i].astype(int)
         nonzero=finite&(np.abs(ys)>MIN_ABS_LABEL_EPS)
         kept=side_specific_keep_mask(ys,low_abs_trim_fraction,high_abs_trim_fraction,MIN_ABS_LABEL_EPS)&np.isfinite(candidate)
         masks={"all_finite":finite,"nonzero":nonzero,"kept":kept}
@@ -251,19 +277,32 @@ def evaluate_candidate_array(candidate_name,candidate,X,y,feature_names,week_key
         if kept.any():
             xk=candidate[kept]; yk=ys[kept]; dk=(yk>0).astype(np.int64); ak=np.abs(yk); sub=deterministic_subsample_indices(len(xk),MI_MAX,SEED+h_i)
             mi_dir_kept=_mutual_info_optional(xk[sub],dk[sub],True); mi_abs_kept=_mutual_info_optional(xk[sub],ak[sub],False)
+        mi_move_all=np.nan
+        if finite.any():
+            xf = candidate[finite]
+            mf = mv[finite]
+            sub = deterministic_subsample_indices(len(xf), MI_MAX, SEED + 100 + h_i)
+            mi_move_all = _mutual_info_optional(xf[sub], mf[sub], True)
         for mk,m in masks.items():
             xx=candidate[m]; yy=ys[m]; dd=direction[m]; aa=absr[m]
             auc=_binary_auc_np(dd,xx); bal,sign,thr=_bal_acc_best_threshold_np(dd,xx)
-            target_rows.append({"candidate":candidate_name,"horizon_ms":h,"mask_type":mk,"pearson_signed_return":_safe_pearson_np(xx,yy),"spearman_signed_return":_safe_spearman_np(xx,yy),"pearson_abs_return":_safe_pearson_np(xx,aa),"spearman_abs_return":_safe_spearman_np(xx,aa),"single_feature_auc_direction":max(auc,1-auc) if np.isfinite(auc) else np.nan,"single_feature_auc_direction_sign":1 if (np.isfinite(auc) and auc>=0.5) else (-1 if np.isfinite(auc) else 0),"single_feature_bal_acc_sign":sign,"single_feature_bal_acc_best_threshold":bal,"single_feature_bal_acc_best_threshold_value":thr,"mi_direction":mi_dir_kept if mk=="kept" else np.nan,"mi_abs_return":mi_abs_kept if mk=="kept" else np.nan})
+            move_auc = _binary_auc_np(mv[m], candidate[m]) if m.any() else np.nan
+            move_auc_best = max(move_auc, 1.0 - move_auc) if np.isfinite(move_auc) else np.nan
+            move_sign = 1 if (np.isfinite(move_auc) and move_auc >= 0.5) else (-1 if np.isfinite(move_auc) else 0)
+            move_bal, _move_sign, move_thr = _bal_acc_best_threshold_np(mv[m], candidate[m]) if m.any() else (np.nan, 0, np.nan)
+            target_rows.append({"candidate":candidate_name,"horizon_ms":h,"mask_type":mk,"pearson_signed_return":_safe_pearson_np(xx,yy),"spearman_signed_return":_safe_spearman_np(xx,yy),"pearson_abs_return":_safe_pearson_np(xx,aa),"spearman_abs_return":_safe_spearman_np(xx,aa),"single_feature_auc_direction":max(auc,1-auc) if np.isfinite(auc) else np.nan,"single_feature_auc_direction_sign":1 if (np.isfinite(auc) and auc>=0.5) else (-1 if np.isfinite(auc) else 0),"single_feature_bal_acc_sign":sign,"single_feature_bal_acc_best_threshold":bal,"single_feature_bal_acc_best_threshold_value":thr,"mi_direction":mi_dir_kept if mk=="kept" else np.nan,"mi_abs_return":mi_abs_kept if mk=="kept" else np.nan,"single_feature_auc_move":move_auc_best,"single_feature_auc_move_sign":move_sign,"single_feature_bal_acc_move_best_threshold":move_bal,"single_feature_bal_acc_move_best_threshold_value":move_thr,"mi_move":mi_move_all if mk=="all_finite" else np.nan,"move_pos_frac":float(mv[m].mean()) if m.any() else np.nan})
         for d in range(10):
             m = (bins == d) & np.isfinite(ys)
-            dec.append({"candidate": candidate_name, "horizon_ms": h, "decile": d, "n_rows": int(m.sum()), "candidate_min": float(np.min(candidate[m])) if m.any() else np.nan, "candidate_max": float(np.max(candidate[m])) if m.any() else np.nan, "mean_signed_return": float(np.mean(ys[m])) if m.any() else np.nan, "mean_abs_return": float(np.mean(np.abs(ys[m]))) if m.any() else np.nan, "up_frac": float(np.mean(ys[m] > 0)) if m.any() else np.nan})
+            dec.append({"candidate": candidate_name, "horizon_ms": h, "decile": d, "n_rows": int(m.sum()), "candidate_min": float(np.min(candidate[m])) if m.any() else np.nan, "candidate_max": float(np.max(candidate[m])) if m.any() else np.nan, "mean_signed_return": float(np.mean(ys[m])) if m.any() else np.nan, "mean_abs_return": float(np.mean(np.abs(ys[m]))) if m.any() else np.nan, "up_frac": float(np.mean(ys[m] > 0)) if m.any() else np.nan, "move_frac": float(np.mean(mv[m] == 1)) if m.any() else np.nan, "nonmove_frac": float(np.mean(mv[m] == 0)) if m.any() else np.nan, "zero_frac": float(np.mean(ys[m] == 0.0)) if m.any() else np.nan})
         per_h_auc[h]=max((r["single_feature_auc_direction"] for r in target_rows if r["horizon_ms"]==h and r["mask_type"]=="kept"),default=np.nan)
         per_h_abs[h]=max((abs(r["spearman_abs_return"]) for r in target_rows if r["horizon_ms"]==h and r["mask_type"]=="kept"),default=np.nan)
         per_h_bal[h]=max((r["single_feature_bal_acc_best_threshold"] for r in target_rows if r["horizon_ms"]==h and r["mask_type"]=="kept"),default=np.nan)
+        per_h_move_auc[h]=max((r["single_feature_auc_move"] for r in target_rows if r["horizon_ms"]==h and r["mask_type"]=="all_finite"),default=np.nan)
+        per_h_move_bal[h]=max((r["single_feature_bal_acc_move_best_threshold"] for r in target_rows if r["horizon_ms"]==h and r["mask_type"]=="all_finite"),default=np.nan)
     max_corr=float(corr_rows[0]["max_abs_corr"]) if corr_rows else np.nan
     best_auc=max(per_h_auc.values()) if per_h_auc else np.nan; best_abs=max(per_h_abs.values()) if per_h_abs else np.nan
-    candidate_target_score=max(abs(best_auc-0.5) if np.isfinite(best_auc) else 0.0,0.5*abs(best_abs) if np.isfinite(best_abs) else 0.0)
+    best_move_auc=max(per_h_move_auc.values()) if per_h_move_auc else np.nan
+    candidate_target_score=max(abs(best_auc-0.5) if np.isfinite(best_auc) else 0.0,0.5*abs(best_abs) if np.isfinite(best_abs) else 0.0,abs(best_move_auc-0.5) if np.isfinite(best_move_auc) else 0.0)
     existing_score=(corr_rows[0].get("existing_target_score") if corr_rows else np.nan)
     decision,reason="needs_ablation","plausible"
     if health["finite_frac"]<1.0: decision,reason="reject","nonfinite_candidate"
@@ -271,12 +310,13 @@ def evaluate_candidate_array(candidate_name,candidate,X,y,feature_names,week_key
     elif max_corr>=HIGH:
         if candidate_target_score <= (existing_score*1.03 if np.isfinite(existing_score) else np.inf): decision,reason="reject","high_corr_duplicate_without_target_improvement"
         else: decision,reason="needs_ablation","high_corr_but_target_improved"
-    elif best_auc<=0.55 and best_abs<=0.03: decision,reason="reject","weak_direction_and_magnitude"
-    elif max_corr<MED and (best_auc>0.56 or best_abs>0.03): decision,reason="promote_candidate","useful_signal_and_low_redundancy"
+    elif best_auc<=0.55 and best_abs<=0.03 and best_move_auc<=0.55: decision,reason="reject","weak_direction_magnitude_and_move"
+    elif max_corr<MED and (best_auc>0.56 or best_abs>0.03 or best_move_auc>0.56): decision,reason="promote_candidate","useful_signal_and_low_redundancy"
     best_mi_direction=max((r["mi_direction"] for r in target_rows if r["mask_type"]=="kept" and np.isfinite(r["mi_direction"])),default=np.nan)
     best_mi_abs_return=max((r["mi_abs_return"] for r in target_rows if r["mask_type"]=="kept" and np.isfinite(r["mi_abs_return"])),default=np.nan)
-    rel={"candidate":candidate_name,"max_corr_with_existing":max_corr,"most_correlated_existing_feature":corr_rows[0]["existing_feature"] if corr_rows else "","most_correlated_existing_target_score":existing_score,"candidate_target_score":candidate_target_score,"candidate_minus_existing_target_score":candidate_target_score-existing_score if np.isfinite(existing_score) else np.nan,"high_corr_duplicate":bool(max_corr >= HIGH),"medium_corr_related":bool(MED <= max_corr < HIGH),"best_kept_auc_200ms":per_h_auc.get(200, np.nan),"best_kept_auc_500ms":per_h_auc.get(500, np.nan),"best_kept_auc_1000ms":per_h_auc.get(1000, np.nan),"best_kept_bal_acc_1000ms":per_h_bal.get(1000, np.nan),"best_abs_return_spearman":best_abs,"best_abs_return_spearman_200ms":per_h_abs.get(200, np.nan),"best_abs_return_spearman_500ms":per_h_abs.get(500, np.nan),"best_abs_return_spearman_1000ms":per_h_abs.get(1000, np.nan),"best_mi_direction":best_mi_direction,"best_mi_abs_return":best_mi_abs_return,"finite_frac":health["finite_frac"],"std":health["std"],"week_std_cv":health["week_std_cv"],"decision":decision,"reason":reason}
-    summary={"schema":"feature_lab_v1","candidate":candidate_name,"n_rows":int(len(candidate)),"feature_dim":int(X.shape[1]),"use_aux":USE_AUX,"health":{"finite_frac":1.0,"std":health["std"],"week_std_cv":health["week_std_cv"],"mean_by_week":mean_by_week,"std_by_week":std_by_week},"best_direction":{"best_kept_auc":best_auc,"best_kept_auc_200ms":per_h_auc.get(200,np.nan),"best_kept_auc_500ms":per_h_auc.get(500,np.nan),"best_kept_auc_1000ms":per_h_auc.get(1000,np.nan),"best_kept_bal_acc_1000ms":per_h_bal.get(1000,np.nan)},"best_magnitude":{"best_abs_return_spearman":best_abs,"best_abs_return_spearman_200ms":per_h_abs.get(200,np.nan),"best_abs_return_spearman_500ms":per_h_abs.get(500,np.nan),"best_abs_return_spearman_1000ms":per_h_abs.get(1000,np.nan),"best_mi_abs_return":best_mi_abs_return},"correlation":{"max_abs_corr":max_corr},"decision":decision,"reason":reason}
+    best_mi_move=max((r["mi_move"] for r in target_rows if r["mask_type"]=="all_finite" and np.isfinite(r["mi_move"])),default=np.nan)
+    rel={"candidate":candidate_name,"max_corr_with_existing":max_corr,"most_correlated_existing_feature":corr_rows[0]["existing_feature"] if corr_rows else "","most_correlated_existing_target_score":existing_score,"candidate_target_score":candidate_target_score,"candidate_minus_existing_target_score":candidate_target_score-existing_score if np.isfinite(existing_score) else np.nan,"high_corr_duplicate":bool(max_corr >= HIGH),"medium_corr_related":bool(MED <= max_corr < HIGH),"best_kept_auc_200ms":per_h_auc.get(200, np.nan),"best_kept_auc_500ms":per_h_auc.get(500, np.nan),"best_kept_auc_1000ms":per_h_auc.get(1000, np.nan),"best_kept_bal_acc_1000ms":per_h_bal.get(1000, np.nan),"best_abs_return_spearman":best_abs,"best_abs_return_spearman_200ms":per_h_abs.get(200, np.nan),"best_abs_return_spearman_500ms":per_h_abs.get(500, np.nan),"best_abs_return_spearman_1000ms":per_h_abs.get(1000, np.nan),"best_move_auc":best_move_auc,"best_move_auc_200ms":per_h_move_auc.get(200, np.nan),"best_move_auc_500ms":per_h_move_auc.get(500, np.nan),"best_move_auc_1000ms":per_h_move_auc.get(1000, np.nan),"best_move_bal_acc_1000ms":per_h_move_bal.get(1000, np.nan),"best_mi_direction":best_mi_direction,"best_mi_abs_return":best_mi_abs_return,"best_mi_move":best_mi_move,"finite_frac":health["finite_frac"],"std":health["std"],"week_std_cv":health["week_std_cv"],"decision":decision,"reason":reason}
+    summary={"schema":"feature_lab_v2_move_head","candidate":candidate_name,"n_rows":int(len(candidate)),"feature_dim":int(X.shape[1]),"use_aux":USE_AUX,"health":{"finite_frac":1.0,"std":health["std"],"week_std_cv":health["week_std_cv"],"mean_by_week":mean_by_week,"std_by_week":std_by_week},"best_direction":{"best_kept_auc":best_auc,"best_kept_auc_200ms":per_h_auc.get(200,np.nan),"best_kept_auc_500ms":per_h_auc.get(500,np.nan),"best_kept_auc_1000ms":per_h_auc.get(1000,np.nan),"best_kept_bal_acc_1000ms":per_h_bal.get(1000,np.nan)},"best_magnitude":{"best_abs_return_spearman":best_abs,"best_abs_return_spearman_200ms":per_h_abs.get(200,np.nan),"best_abs_return_spearman_500ms":per_h_abs.get(500,np.nan),"best_abs_return_spearman_1000ms":per_h_abs.get(1000,np.nan),"best_mi_abs_return":best_mi_abs_return},"best_move":{"best_move_auc":best_move_auc,"best_move_auc_200ms":per_h_move_auc.get(200,np.nan),"best_move_auc_500ms":per_h_move_auc.get(500,np.nan),"best_move_auc_1000ms":per_h_move_auc.get(1000,np.nan),"best_move_bal_acc_1000ms":per_h_move_bal.get(1000,np.nan),"best_mi_move":best_mi_move},"correlation":{"max_abs_corr":max_corr},"decision":decision,"reason":reason}
     return health,target_rows,corr_rows,rel,summary,dec
 
 def wcsv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
