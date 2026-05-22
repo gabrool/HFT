@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from CMSSL17 import FeatureEngine
+from CMSSL17 import FEATURE_AUX_TAIL, FeatureEngine
 
 
 REMOVED_FEATURES = {
@@ -68,7 +68,8 @@ def test_no_stale_pruned_schema_references() -> None:
 
 
 def test_retained_neighbor_features_still_present() -> None:
-    names = set(FeatureEngine().feature_names())
+    core_names = set(FeatureEngine().feature_names())
+    all_names = core_names | set(FEATURE_AUX_TAIL)
     retained = {
         "trade_imbalance_notional_500ms",
         "vwap_vs_mid_bps_200ms",
@@ -83,5 +84,10 @@ def test_retained_neighbor_features_still_present() -> None:
         "ob_update_rate_500ms",
         "log_events_1000ms",
     }
-    missing = retained - names
+    missing = retained - all_names
     assert not missing
+
+
+def test_retained_aux_features_still_present() -> None:
+    aux_names = set(FEATURE_AUX_TAIL)
+    assert "log_events_1000ms" in aux_names
