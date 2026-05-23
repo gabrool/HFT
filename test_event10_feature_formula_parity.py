@@ -3,7 +3,71 @@ from collections import deque
 
 import numpy as np
 
-from test_feature_event_result_contract import _install_optional_dependency_stubs
+import sys
+import types
+
+
+def _install_optional_dependency_stubs():
+    class _Dummy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, *args, **kwargs):
+            return self
+
+        def __getattr__(self, _name):
+            return self
+
+    class _Module:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _Parameter:
+        def __init__(self, value=None, *args, **kwargs):
+            self.value = value
+
+    torch_mod = types.ModuleType("torch")
+    torch_mod.Tensor = _Dummy
+    torch_mod.cuda = types.SimpleNamespace(empty_cache=lambda: None)
+    torch_mod.ones = lambda *args, **kwargs: np.ones(args[0] if args else (), dtype=np.float32)
+    torch_mod.tensor = lambda *args, **kwargs: np.asarray(args[0] if args else 0)
+    torch_mod.empty = lambda *args, **kwargs: np.empty(args[0] if len(args) == 1 else args, dtype=np.float32)
+    torch_mod.randn = lambda *args, **kwargs: np.random.randn(*args)
+    torch_mod.exp = np.exp
+    torch_mod.log = np.log
+    torch_mod.arange = lambda *args, **kwargs: np.arange(*args)
+    torch_mod.float32 = np.float32
+    torch_mod.no_grad = lambda func=None: (lambda f: f) if func is None else func
+
+    nn_mod = types.ModuleType("torch.nn")
+    nn_mod.Module = _Module
+    nn_mod.Parameter = _Parameter
+    for name in ("Linear", "Conv1d", "SiLU", "ReLU", "GELU", "Dropout", "LayerNorm", "BatchNorm1d", "MultiheadAttention", "Sequential", "ModuleList"):
+        setattr(nn_mod, name, type(name, (_Module,), {}))
+    functional_mod = types.ModuleType("torch.nn.functional")
+    utils_mod = types.ModuleType("torch.utils")
+    data_mod = types.ModuleType("torch.utils.data")
+    data_mod.Dataset = type("Dataset", (_Module,), {})
+    data_mod.DataLoader = type("DataLoader", (_Module,), {})
+    functorch_mod = types.ModuleType("torch._functorch")
+    config_mod = types.ModuleType("torch._functorch.config")
+    optim_mod = types.ModuleType("torch.optim")
+    optim_mod.Optimizer = type("Optimizer", (_Module,), {"__init__": lambda self, *args, **kwargs: None})
+
+    torch_mod.optim = optim_mod
+    torch_mod.nn = nn_mod
+    torch_mod.utils = utils_mod
+    torch_mod._functorch = functorch_mod
+
+    sys.modules["torch"] = torch_mod
+    sys.modules["torch.nn"] = nn_mod
+    sys.modules["torch.nn.functional"] = functional_mod
+    sys.modules["torch.optim"] = optim_mod
+    sys.modules["torch.utils"] = utils_mod
+    sys.modules["torch.utils.data"] = data_mod
+    sys.modules["torch._functorch"] = functorch_mod
+    sys.modules["torch._functorch.config"] = config_mod
+
 
 _install_optional_dependency_stubs()
 from CMSSL17 import FeatureEngine
@@ -24,8 +88,9 @@ PROMOTED = [
 ]
 
 
-def _ob(ts, tp, bids, asks):
-    return ("ob", ts, 0, tp, tuple(bids), tuple(asks))
+def _ob(ts, change_id, bids, asks):
+    _ = change_id
+    return ("ob", ts, 0, 1, tuple(bids), tuple(asks))
 
 
 def _tr(ts, price, size, side_sign):
@@ -61,26 +126,49 @@ def _depth_notional_5bps(levels, mid, side):
 def _liquidity_void_bps(levels, mid, side, max_bps=10.0):
     if mid <= 0.0 or len(levels) < 2:
         return 0.0
-    top = levels[0][0]
-    for px, sz in levels[1:]:
-        if float(sz) > EPS:
-            gap = (top - px) if side == "bid" else (px - top)
-            bps = 1e4 * gap / mid
-            return float(min(max(bps, 0.0), max_bps))
-    return float(max_bps)
+
+    if side == "bid":
+        filtered = [float(px) for px, sz in levels if float(sz) > EPS and float(px) >= mid * (1.0 - max_bps / 1e4)]
+    else:
+        filtered = [float(px) for px, sz in levels if float(sz) > EPS and float(px) <= mid * (1.0 + max_bps / 1e4)]
+
+    if len(filtered) < 2:
+        return 0.0
+
+    gaps = [abs(filtered[i] - filtered[i + 1]) / max(mid, EPS) * 1e4 for i in range(len(filtered) - 1)]
+    return float(min(max(max(gaps) if gaps else 0.0, 0.0), max_bps))
 
 
 def _zero_cross_rate(points):
-    signs = []
-    for _, v in points:
-        if v > 0.0:
-            signs.append(1)
-        elif v < 0.0:
-            signs.append(-1)
-    if len(signs) < 2:
+    vals = np.asarray([v for _, v in points], dtype=np.float64)
+    if vals.size <= 1:
         return 0.0
-    crosses = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1])
-    return float(crosses / max(len(signs) - 1, 1))
+    signs = np.sign(vals)
+    last = 0.0
+    filled = []
+    for s in signs:
+        if s == 0:
+            filled.append(last)
+        else:
+            filled.append(s)
+            last = s
+    f = np.asarray(filled, dtype=np.float64)
+    v = f[f != 0]
+    return 0.0 if v.size <= 1 else float(np.sum(v[1:] != v[:-1]) / max(len(v) - 1, 1))
+
+
+def _max_same_side_run_notional(cluster_dq):
+    max_run = 0.0
+    cur_side = None
+    cur_sum = 0.0
+    for _, notional, side_sign in cluster_dq:
+        if cur_side is None or side_sign != cur_side:
+            cur_side = side_sign
+            cur_sum = notional
+        else:
+            cur_sum += notional
+        max_run = max(max_run, cur_sum)
+    return float(max_run)
 
 
 def _reference(events):
@@ -98,9 +186,8 @@ def _reference(events):
     for e in events:
         if e[0] == "trade":
             _, ts, _, px, sz, side_sign, *_ = e
-            side = "Buy" if side_sign > 0 else "Sell"
             notional = float(px) * float(sz)
-            trade_dq.append((ts, notional, side))
+            trade_dq.append((ts, notional, side_sign))
             cluster.append((ts, notional, side_sign))
             _prune(trade_dq, ts, 3000)
             _prune(cluster, ts, 1000)
@@ -130,15 +217,23 @@ def _reference(events):
         ask_add200.append((ts, max(ad_notional, 0.0)))
         bid_add200.append((ts, max(bd_notional, 0.0)))
 
-        for dq, w in ((churn500, 500), (churn1000, 1000), (ofi500, 500), (ask_add200, 200), (bid_add200, 200), (dim_hist, 1000), (micro_hist, 1000), (cluster, 1000), (trade_dq, 3000)):
-            _prune(dq, ts, w)
+        _prune(churn500, ts, 500)
+        _prune(churn1000, ts, 1000)
+        _prune(ofi500, ts, 500)
+        _prune(ask_add200, ts, 200)
+        _prune(bid_add200, ts, 200)
+        _prune(cluster, ts, 1000)
+        _prune(trade_dq, ts, 3000)
 
         bid5 = _depth_notional_5bps(bids, mid, "bid")
         ask5 = _depth_notional_5bps(asks, mid, "ask")
         total5 = bid5 + ask5
         dim5 = (bid5 - ask5) / max(total5, EPS)
+
         dim_hist.append((ts, dim5))
+        _prune(dim_hist, ts, 1000)
         micro_hist.append((ts, micro_minus_mid_bps))
+        _prune(micro_hist, ts, 1000)
 
         top5_share = 0.0
         if trade_dq:
@@ -155,27 +250,15 @@ def _reference(events):
         l1_churn_1000 = _sum_values(churn1000) / max(total5, EPS)
         ofi_pressure = abs(_sum_values(ofi500) / max(total5, EPS))
 
-        buy_ntl_200 = sum(n for t, n, s in trade_dq if (ts - t) <= 200 and s == "Buy")
-        sell_ntl_200 = sum(n for t, n, s in trade_dq if (ts - t) <= 200 and s == "Sell")
-
-        last_side = None
-        run_notional = 0.0
-        for _, n, sgn in cluster:
-            if last_side is None:
-                last_side = sgn
-                run_notional = n
-            elif sgn == last_side:
-                run_notional += n
-            else:
-                last_side = sgn
-                run_notional = n
+        buy_ntl_200 = sum(n for t, n, s in trade_dq if (ts - t) <= 200 and s > 0)
+        sell_ntl_200 = sum(n for t, n, s in trade_dq if (ts - t) <= 200 and s < 0)
 
         out = {
             "top5_trade_share_notional_3000ms": top5_share,
             "depth_imbalance_realized_vol_1000ms": depth_rv,
             "microprice_zero_cross_rate_1000ms": micro_cross,
             "l1_churn_over_depth_1000ms": l1_churn_1000,
-            "same_side_trade_cluster_notional_1000ms": float(run_notional),
+            "same_side_trade_cluster_notional_1000ms": _max_same_side_run_notional(cluster),
             "ofi_pressure_x_churn_500ms": ofi_pressure * l1_churn_500,
             "bid_liquidity_void_bps": _liquidity_void_bps(bids, mid, "bid"),
             "ask_liquidity_void_bps": _liquidity_void_bps(asks, mid, "ask"),
@@ -188,16 +271,20 @@ def _reference(events):
 
 def test_event10_promoted_feature_formula_parity():
     fe = FeatureEngine()
+    fe._transform_features = lambda raw, dt_ms: raw.astype(np.float32)
+
     events = [
-        _ob(0, 1, [(100.00, 10.0), (99.95, 4.0), (99.70, 8.0)], [(100.02, 10.0), (100.07, 5.0), (100.30, 8.0)]),
-        _tr(100, 100.02, 5.0, 1),
-        _ob(150, 2, [(100.01, 12.0), (99.98, 7.0), (99.70, 8.0)], [(100.02, 9.0), (100.04, 7.0), (100.30, 8.0)]),
-        _tr(300, 100.03, 8.0, 1),
-        _ob(450, 3, [(99.99, 8.0), (99.93, 10.0), (99.70, 8.0)], [(100.03, 13.0), (100.10, 2.0), (100.30, 8.0)]),
+        _ob(0, 1, [(100.00, 10.0), (99.98, 4.0), (99.91, 8.0)], [(100.03, 8.0), (100.05, 5.0), (100.12, 8.0)]),
+        _tr(100, 100.03, 5.0, +1),
+        _ob(150, 2, [(100.01, 6.0), (99.99, 6.0), (99.92, 8.0)], [(100.04, 13.0), (100.06, 7.0), (100.13, 8.0)]),
+        _tr(300, 100.04, 8.0, +1),
+        _ob(450, 3, [(99.99, 14.0), (99.95, 10.0), (99.90, 8.0)], [(100.03, 7.0), (100.08, 2.0), (100.13, 8.0)]),
         _tr(700, 99.99, 6.0, -1),
-        _ob(900, 4, [(100.01, 14.0), (99.98, 8.0), (99.70, 8.0)], [(100.04, 7.0), (100.09, 7.0), (100.30, 8.0)]),
-        _tr(1050, 100.04, 4.0, 1),
-        _ob(1200, 5, [(100.02, 9.0), (99.96, 11.0), (99.70, 8.0)], [(100.05, 15.0), (100.12, 3.0), (100.30, 8.0)]),
+        _ob(900, 4, [(100.01, 8.0), (99.98, 8.0), (99.92, 8.0)], [(100.04, 8.0), (100.09, 7.0), (100.13, 8.0)]),
+        _tr(1000, 100.04, 4.0, +1),
+        _tr(1050, 100.04, 6.0, +1),
+        _tr(1100, 100.02, 5.0, -1),
+        _ob(1200, 5, [(100.02, 14.0), (99.99, 9.0), (99.92, 8.0)], [(100.05, 15.0), (100.10, 3.0), (100.14, 8.0)]),
     ]
 
     last = None
@@ -230,7 +317,7 @@ def test_event10_promoted_feature_formula_parity():
     prod_cross = float(last.features[names.index("microprice_zero_cross_rate_1000ms")])
 
     assert prod_ofi >= 0.0
-    assert prod_churn < 10.0
+    assert 0.0 < prod_churn < 10.0
     assert prod_buy_repl > 1e-3
     assert prod_sell_repl > 1e-3
     assert prod_depth_rv > 0.0
