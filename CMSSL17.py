@@ -5835,7 +5835,11 @@ class FeatureEngine:
         l1_churn_over_depth_500 = self._safe_div(self._l1_churn_sums.get(500, 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
         l1_churn_over_depth_1000 = self._safe_div(self._l1_churn_sums.get(1000, 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
         run_notional = self._same_side_trade_cluster_notional(ts_ms, 1000)
-        ofi_pressure_500_over_depth = abs(self._safe_div(rolling_ofi_sums[(1, 500)], max(depth_5bps_total_base, 1e-9), 0.0))
+        ofi_pressure_500_over_depth = self._safe_div(
+            rolling_ofi_sums[(1, 500)],
+            max(depth_5bps_total_base, 1e-9),
+            0.0,
+        )
         ofi_pressure_x_churn_500 = ofi_pressure_500_over_depth * l1_churn_over_depth_500
         bid_void = self._liquidity_void_bps_side("bid", mid, 10.0)
         ask_void = self._liquidity_void_bps_side("ask", mid, 10.0)
