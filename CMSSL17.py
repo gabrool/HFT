@@ -690,11 +690,11 @@ TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
 FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v11_raw_no_" + "p" + "ca" + "_pruned143_lb10_xformv2"
-FEATURE_TRANSFORM = "feature_transform_spec_v2_pruned143_lb10"
+FEATURE_TRANSFORM = "feature_transform_spec_v12_pruned153_lb10_event10_xformv2"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
 FEATURE_TRANSFORM_OUTPUT_CLIP_DEFAULT = 8.0
-FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v2_pruned143_lb10"
+FEATURE_TRANSFORM_SPEC_VERSION = "feature_transform_spec_v12_pruned153_lb10_event10_xformv2"
 AUX_SCHEMA = "cmssl17_aux_ob_decision_density_1s_v1"
 CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
@@ -3793,6 +3793,19 @@ class FeatureTransformEngine:
         }
 
 # -------------------------  Feature engine  -------------------------
+NEW_PRODUCTION_EVENT_FEATURES = [
+    "top5_trade_share_notional_3000ms",
+    "depth_imbalance_realized_vol_1000ms",
+    "microprice_zero_cross_rate_1000ms",
+    "l1_churn_over_depth_1000ms",
+    "same_side_trade_cluster_notional_1000ms",
+    "ofi_pressure_x_churn_500ms",
+    "bid_liquidity_void_bps",
+    "ask_liquidity_void_bps",
+    "post_buy_trade_ask_replenishment_200ms",
+    "post_sell_trade_bid_replenishment_200ms",
+]
+
 class FeatureEngine:
 
     @dataclass(frozen=True)
@@ -4031,6 +4044,8 @@ class FeatureEngine:
             for level in ROLLING_OBI_LEVELS
             for window in ROLLING_OBI_WINDOWS_MS
         }
+        self._micro_history_points: Deque[Tuple[int, float]] = deque()
+        self._trade_sign_notional_hist: Deque[Tuple[int, int, float]] = deque()
         self.deep_micro_histories: Dict[int, Deque[Tuple[int, float]]] = {
             5: deque(),
             10: deque(),
@@ -4184,6 +4199,7 @@ class FeatureEngine:
                 f"ofi_l1_pressure_over_depth_5bps_{ms}ms",
                 f"ofi_l1_pressure_over_realized_vol_{ms}ms",
             ])
+        names.extend(NEW_PRODUCTION_EVENT_FEATURES)
         removed_features = {
             "micro_premia", "micro_minus_mid_over_spread", "obi_l3", "obi_l5",
             "micro_l1_minus_micro_l10_bps", "ofi_l1_sum_over_depth_1000ms",
@@ -5780,6 +5796,21 @@ class FeatureEngine:
                 self._safe_div(ofi_pressure, max(self._realized_vol_for_pressure(ms), 1e-9), 0.0),
             ])
 
+        trades_3000 = [x[3] for x in self._trade_window_deques[3000] if (ts_ms - x[0]) <= 3000 and x[3] > 0.0]
+        top5_share_3000 = float(np.sort(np.asarray(trades_3000, dtype=np.float64))[-5:].sum() / max(float(np.sum(trades_3000)), 1e-9)) if trades_3000 else 0.0
+        dim_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, 1000)
+        dim_vals = np.asarray([v for _, v in dim_points], dtype=np.float64)
+        depth_imbalance_realized_vol_1000 = float(np.sqrt(np.sum(np.diff(dim_vals) ** 2))) if dim_vals.size > 1 else 0.0
+        microprice_zero_cross_rate_1000 = self._zero_cross_rate_from_points(self._metric_values(self._micro_history_points, ts_ms, 1000))
+        l1_churn_over_depth_1000 = self._safe_div(self.replen_sums.get((1000, ("bid", 1, "add")), 0.0) + self.replen_sums.get((1000, ("bid", 1, "rem")), 0.0) + self.replen_sums.get((1000, ("ask", 1, "add")), 0.0) + self.replen_sums.get((1000, ("ask", 1, "rem")), 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
+        run_notional = self._same_side_trade_cluster_notional(ts_ms, 1000)
+        ofi_pressure_x_churn_500 = abs(self._safe_div(ofi_by_level[1], max(depth_5bps_total_base, 1e-9), 0.0)) * self._safe_div(self.replen_sums.get((500, ("bid", 1, "add")), 0.0) + self.replen_sums.get((500, ("bid", 1, "rem")), 0.0) + self.replen_sums.get((500, ("ask", 1, "add")), 0.0) + self.replen_sums.get((500, ("ask", 1, "rem")), 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
+        bid_void = self._liquidity_void_bps_side("bid", mid, 10.0)
+        ask_void = self._liquidity_void_bps_side("ask", mid, 10.0)
+        post_buy_repl = self._safe_div(self.replen_sums.get((200, ("ask", 1, "add")), 0.0), max(trade_stats_by_ms[200]["buy_notional_usd"], 1e-9), 0.0)
+        post_sell_repl = self._safe_div(self.replen_sums.get((200, ("bid", 1, "add")), 0.0), max(trade_stats_by_ms[200]["sell_notional_usd"], 1e-9), 0.0)
+        feat_list.extend([top5_share_3000, depth_imbalance_realized_vol_1000, microprice_zero_cross_rate_1000, l1_churn_over_depth_1000, run_notional, ofi_pressure_x_churn_500, bid_void, ask_void, post_buy_repl, post_sell_repl])
+
         names = self.feature_names()
         if len(feat_list) != len(names):
             raise ValueError(
@@ -5807,6 +5838,7 @@ class FeatureEngine:
                 f"Expected transformed feature shape ({expected_core_dim},), got {feat_out.shape}"
             )
         self._append_price_history(ts_ms, mid, micro)
+        self._append_metric_history(self._micro_history_points, ts_ms, micro_minus_mid_bps, keep_ms=5000)
         self.prev_bid1_price = bid1
         self.prev_ask1_price = ask1
         self.prev_mid_price_for_age = mid
@@ -5945,6 +5977,10 @@ class FeatureEngine:
             trade_sign = 0
 
         entry = (ts_ms, price, size, notional_usd, side, side_sign, tick_sign, is_zero_tick)
+        if trade_sign != 0:
+            self._trade_sign_notional_hist.append((int(ts_ms), int(trade_sign), float(notional_usd)))
+            while self._trade_sign_notional_hist and (ts_ms - self._trade_sign_notional_hist[0][0] > 3500):
+                self._trade_sign_notional_hist.popleft()
         for window, deq in self._trade_window_deques.items():
             deq.append(entry)
             self._update_trade_window_state_with_insert(window, entry)
@@ -6129,6 +6165,54 @@ class FeatureEngine:
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
+    def _zero_cross_rate_from_points(self, points: Sequence[Tuple[int, float]]) -> float:
+        vals = np.asarray([v for _, v in points], dtype=np.float64)
+        if vals.size <= 1:
+            return 0.0
+        signs = np.sign(vals)
+        last = 0.0
+        filled = []
+        for s in signs:
+            if s == 0:
+                filled.append(last)
+            else:
+                filled.append(s)
+                last = s
+        f = np.asarray(filled, dtype=np.float64)
+        v = f[f != 0]
+        return 0.0 if v.size <= 1 else float(np.sum(v[1:] != v[:-1]) / max(len(v) - 1, 1))
+
+    def _same_side_trade_cluster_notional(self, ts_ms: int, window_ms: int) -> float:
+        trades = [(s, n) for t, s, n in self._trade_sign_notional_hist if (ts_ms - t) <= window_ms]
+        if not trades:
+            return 0.0
+        best = 0.0
+        cur_s = None
+        cur_n = 0.0
+        for s, n in trades:
+            if s == cur_s:
+                cur_n += n
+            else:
+                best = max(best, cur_n)
+                cur_s = s
+                cur_n = n
+        return float(max(best, cur_n))
+
+    def _liquidity_void_bps_side(self, side: str, mid: float, max_bps: float = 10.0) -> float:
+        if mid <= 0.0:
+            return 0.0
+        levels = self.bid_lvls if side == "bid" else self.ask_lvls
+        if len(levels) < 2:
+            return 0.0
+        if side == "bid":
+            filt = [p for p, _ in levels if p >= mid * (1.0 - max_bps / 1e4)]
+        else:
+            filt = [p for p, _ in levels if p <= mid * (1.0 + max_bps / 1e4)]
+        if len(filt) < 2:
+            return 0.0
+        gaps = [abs(filt[i] - filt[i + 1]) / max(mid, 1e-9) * 1e4 for i in range(len(filt) - 1)]
+        return float(max(gaps)) if gaps else 0.0
+
     def on_fast_event(self, e: Any) -> FeatureEventResult:
         """Fast ingest path for compact tuples.
 
