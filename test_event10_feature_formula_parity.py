@@ -3,74 +3,15 @@ from collections import deque
 
 import numpy as np
 
-import sys
-import types
-
-
-def _install_optional_dependency_stubs():
-    class _Dummy:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __call__(self, *args, **kwargs):
-            return self
-
-        def __getattr__(self, _name):
-            return self
-
-    class _Module:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    class _Parameter:
-        def __init__(self, value=None, *args, **kwargs):
-            self.value = value
-
-    torch_mod = types.ModuleType("torch")
-    torch_mod.Tensor = _Dummy
-    torch_mod.cuda = types.SimpleNamespace(empty_cache=lambda: None)
-    torch_mod.ones = lambda *args, **kwargs: np.ones(args[0] if args else (), dtype=np.float32)
-    torch_mod.tensor = lambda *args, **kwargs: np.asarray(args[0] if args else 0)
-    torch_mod.empty = lambda *args, **kwargs: np.empty(args[0] if len(args) == 1 else args, dtype=np.float32)
-    torch_mod.randn = lambda *args, **kwargs: np.random.randn(*args)
-    torch_mod.exp = np.exp
-    torch_mod.log = np.log
-    torch_mod.arange = lambda *args, **kwargs: np.arange(*args)
-    torch_mod.float32 = np.float32
-    torch_mod.no_grad = lambda func=None: (lambda f: f) if func is None else func
-
-    nn_mod = types.ModuleType("torch.nn")
-    nn_mod.Module = _Module
-    nn_mod.Parameter = _Parameter
-    for name in ("Linear", "Conv1d", "SiLU", "ReLU", "GELU", "Dropout", "LayerNorm", "BatchNorm1d", "MultiheadAttention", "Sequential", "ModuleList"):
-        setattr(nn_mod, name, type(name, (_Module,), {}))
-    functional_mod = types.ModuleType("torch.nn.functional")
-    utils_mod = types.ModuleType("torch.utils")
-    data_mod = types.ModuleType("torch.utils.data")
-    data_mod.Dataset = type("Dataset", (_Module,), {})
-    data_mod.DataLoader = type("DataLoader", (_Module,), {})
-    functorch_mod = types.ModuleType("torch._functorch")
-    config_mod = types.ModuleType("torch._functorch.config")
-    optim_mod = types.ModuleType("torch.optim")
-    optim_mod.Optimizer = type("Optimizer", (_Module,), {"__init__": lambda self, *args, **kwargs: None})
-
-    torch_mod.optim = optim_mod
-    torch_mod.nn = nn_mod
-    torch_mod.utils = utils_mod
-    torch_mod._functorch = functorch_mod
-
-    sys.modules["torch"] = torch_mod
-    sys.modules["torch.nn"] = nn_mod
-    sys.modules["torch.nn.functional"] = functional_mod
-    sys.modules["torch.optim"] = optim_mod
-    sys.modules["torch.utils"] = utils_mod
-    sys.modules["torch.utils.data"] = data_mod
-    sys.modules["torch._functorch"] = functorch_mod
-    sys.modules["torch._functorch.config"] = config_mod
-
+try:
+    from test_feature_event_result_contract import _install_optional_dependency_stubs
+except ImportError:
+    from test_offline_ingest_global_meta import _install_optional_dependency_stubs
 
 _install_optional_dependency_stubs()
+
 from CMSSL17 import FeatureEngine
+
 
 
 EPS = 1e-9
