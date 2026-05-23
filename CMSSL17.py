@@ -5412,6 +5412,8 @@ class FeatureEngine:
         bid_l1_notional_now = bid1 * max(bsz1, 0.0)
         ask_l1_notional_now = ask1 * max(asz1, 0.0)
         if self._event10_prev_bid_l1_notional is None or self._event10_prev_ask_l1_notional is None:
+            # Do not count the first valid snapshot as L1 churn/add/cancel/OFI.
+            # That would create a fake book-vs-zero event at dataset start.
             bd_notional = 0.0
             ad_notional = 0.0
         else:
@@ -5874,19 +5876,19 @@ class FeatureEngine:
         micro_points_1000 = self._metric_values(self._micro_history_points, ts_ms, 1000)
         micro_points_1000.append((ts_ms, micro_minus_mid_bps))
         microprice_zero_cross_rate_1000 = self._zero_cross_rate_from_points(micro_points_1000)
-        l1_churn_over_depth_500 = self._safe_div(self._event10_l1_churn_notional_windows[500].sum(), max(total_depth_notional_5bps_base, 1e-9), 0.0)
-        l1_churn_over_depth_1000 = self._safe_div(self._event10_l1_churn_notional_windows[1000].sum(), max(total_depth_notional_5bps_base, 1e-9), 0.0)
+        l1_churn_over_depth_500 = self._safe_div(self._event10_l1_churn_notional_windows[500].sum_value(), max(total_depth_notional_5bps_base, 1e-9), 0.0)
+        l1_churn_over_depth_1000 = self._safe_div(self._event10_l1_churn_notional_windows[1000].sum_value(), max(total_depth_notional_5bps_base, 1e-9), 0.0)
         run_notional = self._same_side_trade_cluster_notional(ts_ms, 1000)
         ofi_pressure_500_over_depth = self._safe_div(
-            abs(self._event10_ofi1_notional_windows[500].sum()),
+            abs(self._event10_ofi1_notional_windows[500].sum_value()),
             max(total_depth_notional_5bps_base, 1e-9),
             0.0,
         )
         ofi_pressure_x_churn_500 = ofi_pressure_500_over_depth * l1_churn_over_depth_500
         bid_void = self._liquidity_void_bps_side("bid", mid, 10.0)
         ask_void = self._liquidity_void_bps_side("ask", mid, 10.0)
-        post_buy_repl = self._safe_div(self._event10_ask_l1_add_notional_windows[200].sum(), max(trade_stats_by_ms[200]["buy_notional_usd"], 1e-9), 0.0)
-        post_sell_repl = self._safe_div(self._event10_bid_l1_add_notional_windows[200].sum(), max(trade_stats_by_ms[200]["sell_notional_usd"], 1e-9), 0.0)
+        post_buy_repl = self._safe_div(self._event10_ask_l1_add_notional_windows[200].sum_value(), max(trade_stats_by_ms[200]["buy_notional_usd"], 1e-9), 0.0)
+        post_sell_repl = self._safe_div(self._event10_bid_l1_add_notional_windows[200].sum_value(), max(trade_stats_by_ms[200]["sell_notional_usd"], 1e-9), 0.0)
         feat_list.extend([top5_share_3000, depth_imbalance_realized_vol_1000, microprice_zero_cross_rate_1000, l1_churn_over_depth_1000, run_notional, ofi_pressure_x_churn_500, bid_void, ask_void, post_buy_repl, post_sell_repl])
 
         names = self.feature_names()
