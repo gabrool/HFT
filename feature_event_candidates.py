@@ -218,6 +218,7 @@ class MovementMicrostructureCandidatePack:
         churn_200=self.churn[200].sum(); churn_500=self.churn[500].sum(); churn_1000=self.churn[1000].sum()
         o["l1_churn_notional_200ms"]=churn_200; o["l1_churn_notional_500ms"]=churn_500; o["l1_churn_notional_1000ms"]=churn_1000
         o["l1_churn_over_depth_200ms"]=churn_200/total_depth_5; o["l1_churn_over_depth_500ms"]=churn_500/total_depth_5
+        l1_churn_over_depth_1000 = churn_1000 / total_depth_5
         bid_add_200=self.bid_add[200].sum(); ask_add_200=self.ask_add[200].sum(); bid_cancel_200=self.bid_cancel[200].sum(); ask_cancel_200=self.ask_cancel[200].sum(); bid_add_500=self.bid_add[500].sum(); ask_add_500=self.ask_add[500].sum(); bid_cancel_500=self.bid_cancel[500].sum(); ask_cancel_500=self.ask_cancel[500].sum()
         o["bid_l1_cancel_to_add_ratio_200ms"]=np.clip(bid_cancel_200/max(bid_add_200,EPS),0.0,RATIO_CLIP); o["ask_l1_cancel_to_add_ratio_200ms"]=np.clip(ask_cancel_200/max(ask_add_200,EPS),0.0,RATIO_CLIP); o["bid_l1_cancel_to_add_ratio_500ms"]=np.clip(bid_cancel_500/max(bid_add_500,EPS),0.0,RATIO_CLIP); o["ask_l1_cancel_to_add_ratio_500ms"]=np.clip(ask_cancel_500/max(ask_add_500,EPS),0.0,RATIO_CLIP)
         o["same_side_replenishment_after_depletion_200ms"]=(min(bid_add_200,bid_cancel_200)+min(ask_add_200,ask_cancel_200))/max(bid_cancel_200+ask_cancel_200,EPS); o["opposite_side_replenishment_after_depletion_200ms"]=(min(ask_add_200,bid_cancel_200)+min(bid_add_200,ask_cancel_200))/max(bid_cancel_200+ask_cancel_200,EPS)
@@ -246,7 +247,7 @@ class MovementMicrostructureCandidatePack:
         o["microprice_realized_vol_500ms"]=self._realized_vol(self.micro_hist,500); o["microprice_realized_vol_1000ms"]=self._realized_vol(self.micro_hist,1000); o["obi_realized_vol_500ms"]=self._realized_vol(self.obi_hist,500); o["obi_realized_vol_1000ms"]=self._realized_vol(self.obi_hist,1000); o["spread_realized_vol_1000ms"]=self._realized_vol(self.spread_hist,1000)
         o["obi_zero_cross_rate_1000ms"]=self._zero_cross_rate(self.obi_hist,1000)
         spread_vol_1000=o["spread_realized_vol_1000ms"]; micro_vol_1000=o["microprice_realized_vol_1000ms"]; event_cv_1000=o["event_interarrival_cv_1000ms"]
-        o["book_stability_score_1000ms"]=1.0/(1.0+o["l1_churn_over_depth_1000ms"]+spread_vol_1000+micro_vol_1000); o["book_stability_score_3000ms"]=1.0/(1.0+o["l1_churn_over_depth_1000ms"]+event_cv_1000+spread_vol_1000)
+        o["book_stability_score_1000ms"]=1.0/(1.0+l1_churn_over_depth_1000+spread_vol_1000+micro_vol_1000); o["book_stability_score_3000ms"]=1.0/(1.0+l1_churn_over_depth_1000+event_cv_1000+spread_vol_1000)
         last_noise_ts=max(self.last_trade_ts,self.last_l1_change); o["no_trade_no_book_change_age_ms"]=min(ts-last_noise_ts,AGE_CLIP_MS) if last_noise_ts else 0.0; o["mid_unchanged_and_depth_stable_ms"]=min(ts-self.last_mid_depth_change,AGE_CLIP_MS) if self.last_mid_depth_change else 0.0
         depth_score=math.log1p(total_depth_5); thin_score=1.0/max(depth_score,EPS); activity_score=self.ef.value(ts); quiet_score=1.0/(1.0+activity_score); spread_penalty=1.0/(1.0+max(self._spread_bps(),0.0))
         o["quiet_liquid_state_score"]=quiet_score*depth_score*spread_penalty; o["quiet_thin_state_score"]=quiet_score*thin_score; o["active_liquid_state_score"]=activity_score*depth_score; o["active_thin_state_score"]=activity_score*thin_score
