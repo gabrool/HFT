@@ -84,10 +84,10 @@ def test_global_meta_pruned143_lb10_has_required_linear_keys(tmp_path):
         duplicate_decision_ts_count=0,
     )
 
-    assert meta["feature_dim_core"] == 143
-    assert meta["feature_dim_total"] == 149
+    assert meta["feature_dim_core"] == 153
+    assert meta["feature_dim_total"] == 159
     assert meta["lookback"] == 10
-    assert len(meta["feature_names"]) == 143
+    assert len(meta["feature_names"]) == 153
     assert len(meta["aux_feature_names"]) == 6
     assert "splits" in meta
     splits = meta["splits"]
@@ -105,8 +105,8 @@ def test_global_meta_pruned143_lb10_has_required_linear_keys(tmp_path):
 
 
 def test_offline_ingest_pruned143_lb10_constants():
-    assert offline_ingest.RAW_FEATURE_DIM_CORE == 143
-    assert offline_ingest.RAW_FEATURE_DIM_TOTAL == 149
+    assert offline_ingest.RAW_FEATURE_DIM_CORE == 153
+    assert offline_ingest.RAW_FEATURE_DIM_TOTAL == 159
     assert offline_ingest.LOOKBACK == 10
     assert len(offline_ingest.AUX_FEATURE_NAMES) == 6
     assert "pruned143_lb10" in offline_ingest.FEATURE_SCHEMA

@@ -640,7 +640,7 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     forbidden = "p" + "ca"
     assert len(raw_names) > 0
     assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v8_raw_no_" + forbidden + "_pruned153_lb10_xformv2"
-    assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v2_pruned153_lb10"
+    assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v12_pruned153_lb10_event10_xformv2"
     assert CMSSL17.CHECKPOINT_SCHEMA == (
         "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
         + forbidden

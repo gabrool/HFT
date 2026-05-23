@@ -30,16 +30,16 @@ def deep_snapshot_ob(ts: int, n_levels: int = 60):
 
 def test_removed_features_not_in_emitted_schema() -> None:
     names = FeatureEngine().feature_names()
-    assert len(names) == 143
+    assert len(names) == 153
     assert not (REMOVED_FEATURES & set(names))
 
 
 def test_core_and_total_feature_dims_are_consistent() -> None:
     fe = FeatureEngine()
     names = fe.feature_names()
-    assert fe.core_feature_dim() == len(names) == 143
+    assert fe.core_feature_dim() == len(names) == 153
     assert fe.aux_dim() == 6
-    assert fe.feature_dim() == 149
+    assert fe.feature_dim() == 159
     assert fe.feature_dim() == fe.core_feature_dim() + fe.aux_dim()
 
 
