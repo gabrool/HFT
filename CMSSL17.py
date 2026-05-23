@@ -689,7 +689,7 @@ HIGH_ABS_TRIM_FRACTION = 0.02
 TARGET_TRANSFORM = "raw_signed_bps_to_direction_and_conditional_abs_sqrt_bps"
 TARGET_TASK = "direction_and_conditional_magnitude_raw_bps_targets"
 LABEL_TRIM_SCHEMA = "signed_nonzero_per_side_quantile_v1"
-FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v11_raw_no_" + "p" + "ca" + "_pruned143_lb10_xformv2"
+FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v12_raw_no_pca_pruned153_lb10_event10_xformv2"
 FEATURE_TRANSFORM = "feature_transform_spec_v12_pruned153_lb10_event10_xformv2"
 FEATURE_TRANSFORM_POLICY = "deterministic_transform_plus_selective_causal_preupdate_ewma_v1"
 FEATURE_TRANSFORM_WARMUP_ROWS = 50
@@ -700,7 +700,7 @@ CHECKPOINT_SCHEMA = (
     "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
     + "p"
     + "ca"
-    + f"-pruned143_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
+    + f"-pruned153_lb10_event10-xformv2-mamba512-pool512-head1024-k333333-prenormres-{CTN_FINAL_MIXER_SCHEMA}"
 )
 
 FOUR_WEEK_PROTOCOL = "four_week_cmssl_val_test_rl_eval_v2"
@@ -3573,6 +3573,14 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = signed_log_ewma(name, XFORM_HL_MEDIUM_MS)
         elif name.startswith("top5_trade_notional_sum_usd_") or name.startswith("top_trade_notional_sum_usd_"):
             s = log_ewma(name, XFORM_HL_MEDIUM_MS)
+        elif name == "top5_trade_share_notional_3000ms":
+            s = bounded(name, out=1.5)
+        elif name in {"microprice_zero_cross_rate_1000ms"}:
+            s = bounded(name, out=1.5)
+        elif name in {"depth_imbalance_realized_vol_1000ms", "l1_churn_over_depth_1000ms", "same_side_trade_cluster_notional_1000ms", "bid_liquidity_void_bps", "ask_liquidity_void_bps", "post_buy_trade_ask_replenishment_200ms", "post_sell_trade_bid_replenishment_200ms"}:
+            s = log_ewma(name, XFORM_HL_FAST_MS)
+        elif name == "ofi_pressure_x_churn_500ms":
+            s = log_ewma(name, XFORM_HL_FAST_MS)
         elif name.startswith("absorption_bid_") or name.startswith("absorption_ask_"):
             # Retained absorption features are strictly nonnegative scaled notional measures.
             s = log_ewma(name, XFORM_HL_FAST_MS)
@@ -3973,6 +3981,9 @@ class FeatureEngine:
             for window_ms, keys in self._replen_keys_by_window.items()
             for key in keys
         }
+        self._l1_churn_windows_ms: Tuple[int, ...] = (200, 500, 1000)
+        self._l1_churn_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self._l1_churn_windows_ms}
+        self._l1_churn_sums: Dict[int, float] = {ms: 0.0 for ms in self._l1_churn_windows_ms}
 
         # ---------- Trades windows ----------
         # self.trade_windows includes FLOW_WINDOWS_MS plus REGIME_WINDOWS_MS because
@@ -5129,6 +5140,17 @@ class FeatureEngine:
                 self._append_tuple_with_guard(dq, (ts_ms, value), ts_ms, window_ms, is_ob_event=True)
                 self.replen_sums[state_key] += value
 
+    def _record_l1_churn(self, ts_ms: int, churn_notional: float) -> None:
+        value = max(float(churn_notional), 0.0)
+        for window_ms in self._l1_churn_windows_ms:
+            dq = self._l1_churn_deques[window_ms]
+            dq.append((int(ts_ms), value))
+            self._l1_churn_sums[window_ms] += value
+            cutoff = int(ts_ms) - int(window_ms)
+            while dq and dq[0][0] < cutoff:
+                _, v = dq.popleft()
+                self._l1_churn_sums[window_ms] -= v
+
     def _append_ob_snapshot(
         self,
         ts_ms: int,
@@ -5371,6 +5393,12 @@ class FeatureEngine:
             ("ask", 2, "rem"): max(prev_ask_l2 - asz2, 0.0),
         }
         self._record_replenishment(ts_ms, replen_deltas)
+        bid_l1_notional_prev = bid1 * max(prev_bid_l1, 0.0)
+        ask_l1_notional_prev = ask1 * max(prev_ask_l1, 0.0)
+        bid_l1_notional_now = bid1 * max(bsz1, 0.0)
+        ask_l1_notional_now = ask1 * max(asz1, 0.0)
+        l1_churn_notional = abs(bid_l1_notional_now - bid_l1_notional_prev) + abs(ask_l1_notional_now - ask_l1_notional_prev)
+        self._record_l1_churn(ts_ms, l1_churn_notional)
 
         cum_bid_by_level = {lvl: self._cum_depth(self.bid_lvls, lvl) for lvl in BOOK_SIGNAL_LEVELS}
         cum_ask_by_level = {lvl: self._cum_depth(self.ask_lvls, lvl) for lvl in BOOK_SIGNAL_LEVELS}
@@ -5801,10 +5829,14 @@ class FeatureEngine:
         dim_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, 1000)
         dim_vals = np.asarray([v for _, v in dim_points], dtype=np.float64)
         depth_imbalance_realized_vol_1000 = float(np.sqrt(np.sum(np.diff(dim_vals) ** 2))) if dim_vals.size > 1 else 0.0
-        microprice_zero_cross_rate_1000 = self._zero_cross_rate_from_points(self._metric_values(self._micro_history_points, ts_ms, 1000))
-        l1_churn_over_depth_1000 = self._safe_div(self.replen_sums.get((1000, ("bid", 1, "add")), 0.0) + self.replen_sums.get((1000, ("bid", 1, "rem")), 0.0) + self.replen_sums.get((1000, ("ask", 1, "add")), 0.0) + self.replen_sums.get((1000, ("ask", 1, "rem")), 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
+        micro_points_1000 = self._metric_values(self._micro_history_points, ts_ms, 1000)
+        micro_points_1000.append((ts_ms, micro_minus_mid_bps))
+        microprice_zero_cross_rate_1000 = self._zero_cross_rate_from_points(micro_points_1000)
+        l1_churn_over_depth_500 = self._safe_div(self._l1_churn_sums.get(500, 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
+        l1_churn_over_depth_1000 = self._safe_div(self._l1_churn_sums.get(1000, 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
         run_notional = self._same_side_trade_cluster_notional(ts_ms, 1000)
-        ofi_pressure_x_churn_500 = abs(self._safe_div(ofi_by_level[1], max(depth_5bps_total_base, 1e-9), 0.0)) * self._safe_div(self.replen_sums.get((500, ("bid", 1, "add")), 0.0) + self.replen_sums.get((500, ("bid", 1, "rem")), 0.0) + self.replen_sums.get((500, ("ask", 1, "add")), 0.0) + self.replen_sums.get((500, ("ask", 1, "rem")), 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
+        ofi_pressure_500_over_depth = abs(self._safe_div(rolling_ofi_sums[(1, 500)], max(depth_5bps_total_base, 1e-9), 0.0))
+        ofi_pressure_x_churn_500 = ofi_pressure_500_over_depth * l1_churn_over_depth_500
         bid_void = self._liquidity_void_bps_side("bid", mid, 10.0)
         ask_void = self._liquidity_void_bps_side("ask", mid, 10.0)
         post_buy_repl = self._safe_div(self.replen_sums.get((200, ("ask", 1, "add")), 0.0), max(trade_stats_by_ms[200]["buy_notional_usd"], 1e-9), 0.0)

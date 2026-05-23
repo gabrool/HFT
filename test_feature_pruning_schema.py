@@ -43,11 +43,11 @@ def test_core_and_total_feature_dims_are_consistent() -> None:
     assert fe.feature_dim() == fe.core_feature_dim() + fe.aux_dim()
 
 
-def test_decision_event_feature_vector_matches_pruned143_schema() -> None:
+def test_decision_event_feature_vector_matches_pruned153_event10_schema() -> None:
     fe = FeatureEngine()
     result = fe.on_fast_event(deep_snapshot_ob(1000, n_levels=60))
     assert result is not None
-    assert result.features.shape == (143,)
+    assert result.features.shape == (153,)
     assert result.features.shape[0] == len(fe.feature_names())
 
 
@@ -62,7 +62,8 @@ def test_no_stale_pruned_schema_references() -> None:
     paths = ["CMSSL17.py", "offline_ingest.py"]
     for path in paths:
         text = Path(path).read_text(encoding="utf-8")
-        assert "pruned153" not in text
+        assert "v10_pruned153" not in text
+        assert "pruned143_lb10_xformv2" not in text
         assert "pruned159" not in text
         assert "pruned144" not in text
 
@@ -91,3 +92,21 @@ def test_retained_neighbor_features_still_present() -> None:
 def test_retained_aux_features_still_present() -> None:
     aux_names = set(FEATURE_AUX_TAIL)
     assert "log_events_1000ms" in aux_names
+
+
+def test_new_production_event_features_present_once() -> None:
+    names = FeatureEngine().feature_names()
+    promoted = {
+        "top5_trade_share_notional_3000ms",
+        "depth_imbalance_realized_vol_1000ms",
+        "microprice_zero_cross_rate_1000ms",
+        "l1_churn_over_depth_1000ms",
+        "same_side_trade_cluster_notional_1000ms",
+        "ofi_pressure_x_churn_500ms",
+        "bid_liquidity_void_bps",
+        "ask_liquidity_void_bps",
+        "post_buy_trade_ask_replenishment_200ms",
+        "post_sell_trade_bid_replenishment_200ms",
+    }
+    for n in promoted:
+        assert names.count(n) == 1
