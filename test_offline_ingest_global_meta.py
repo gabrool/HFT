@@ -109,7 +109,10 @@ def test_offline_ingest_pruned153_event10_constants():
     assert offline_ingest.RAW_FEATURE_DIM_TOTAL == 159
     assert offline_ingest.LOOKBACK == 10
     assert len(offline_ingest.AUX_FEATURE_NAMES) == 6
-    assert "pruned153_event10" in offline_ingest.FEATURE_SCHEMA
+    EXPECTED_FEATURE_SCHEMA = "cmssl17_1s_maker_rtcore_v12_raw_no_pca_pruned153_lb10_event10_xformv2"
+    EXPECTED_FEATURE_TRANSFORM = "feature_transform_spec_v12_pruned153_lb10_event10_xformv2"
+    assert offline_ingest.FEATURE_SCHEMA == EXPECTED_FEATURE_SCHEMA
+    assert offline_ingest.FEATURE_TRANSFORM == EXPECTED_FEATURE_TRANSFORM
 
 
 def test_schema_not_old_v10_pruned153_regression():
