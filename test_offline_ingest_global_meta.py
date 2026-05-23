@@ -39,7 +39,7 @@ _install_optional_dependency_stubs()
 offline_ingest = importlib.import_module("offline_ingest")
 
 
-def test_global_meta_pruned143_lb10_has_required_linear_keys(tmp_path):
+def test_global_meta_pruned153_event10_has_required_linear_keys(tmp_path):
     weeks = [
         "22-02-2026-to-28-02-2026",
         "01-03-2026-to-07-03-2026",
@@ -104,9 +104,15 @@ def test_global_meta_pruned143_lb10_has_required_linear_keys(tmp_path):
     assert {"train", "val", "test"}.issubset(splits["rl"].keys())
 
 
-def test_offline_ingest_pruned143_lb10_constants():
+def test_offline_ingest_pruned153_event10_constants():
     assert offline_ingest.RAW_FEATURE_DIM_CORE == 153
     assert offline_ingest.RAW_FEATURE_DIM_TOTAL == 159
     assert offline_ingest.LOOKBACK == 10
     assert len(offline_ingest.AUX_FEATURE_NAMES) == 6
-    assert "pruned143_lb10" in offline_ingest.FEATURE_SCHEMA
+    assert "pruned153_event10" in offline_ingest.FEATURE_SCHEMA
+
+
+def test_schema_not_old_v10_pruned153_regression():
+    old_v10 = "cmssl17_1s_maker_rtcore_v8_raw_no_pca_pruned153_lb10_xformv2"
+    assert offline_ingest.FEATURE_SCHEMA != old_v10
+    assert "pruned143" not in offline_ingest.FEATURE_SCHEMA

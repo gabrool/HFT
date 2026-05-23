@@ -639,12 +639,12 @@ def test_feature_transform_contract_is_raw_no_projection() -> None:
     raw_names = list(fe.feature_names())
     forbidden = "p" + "ca"
     assert len(raw_names) > 0
-    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v8_raw_no_" + forbidden + "_pruned153_lb10_xformv2"
+    assert CMSSL17.FEATURE_SCHEMA == "cmssl17_1s_maker_rtcore_v12_raw_no_pca_pruned153_lb10_event10_xformv2"
     assert CMSSL17.FEATURE_TRANSFORM == "feature_transform_spec_v12_pruned153_lb10_event10_xformv2"
     assert CMSSL17.CHECKPOINT_SCHEMA == (
         "cmssl17-dir-mag-v1-1s-maker-rtcore-raw-no-"
         + forbidden
-        + "-pruned153_lb10-xformv2-mamba512-pool512-head1024-k333333-prenormres-finallinear"
+        + "-pruned153_lb10_event10-xformv2-mamba512-pool512-head1024-k333333-prenormres-finallinear"
     )
     assert "p" + "ca250" not in CMSSL17.FEATURE_SCHEMA.lower()
     assert "final256" not in CMSSL17.FEATURE_SCHEMA.lower()

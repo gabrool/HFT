@@ -21,8 +21,13 @@ def test_pack_emits_all_requested_features():
     ]
     for e in events: p.on_event(e)
     names=p.feature_names(); assert set(names)==set(REQUESTED_FEATURES); assert len(names)==len(set(names))
+    promoted={"top5_trade_share_notional_3000ms","depth_imbalance_realized_vol_1000ms","microprice_zero_cross_rate_1000ms","l1_churn_over_depth_1000ms","same_side_trade_cluster_notional_1000ms","ofi_pressure_x_churn_500ms","bid_liquidity_void_bps","ask_liquidity_void_bps","post_buy_trade_ask_replenishment_200ms","post_sell_trade_bid_replenishment_200ms"}
+    assert len(REQUESTED_FEATURES)==77
+    assert len(names)==77
+    assert not (promoted & set(names))
+
     out=p.emit(); assert set(out)==set(names)
-    representatives=["l1_churn_notional_200ms","l1_churn_over_depth_500ms","bid_l1_cancel_to_add_ratio_200ms","same_side_replenishment_after_depletion_200ms","buy_trade_depth_recovery_ratio_500ms","post_buy_trade_ask_replenishment_200ms","trade_impact_decay_ratio_200_to_1000ms","event_interarrival_cv_1000ms","trade_burstiness_ewma_fast_slow","aggressor_run_length_current","trade_sign_entropy_1000ms","trade_sign_flip_rate_1000ms","same_side_trade_cluster_notional_1000ms","trade_size_hhi_1000ms","largest_trade_share_notional_1000ms","bid_depth_convexity_1_5_10bps","bid_liquidity_void_bps","depth_slope_bid_1_to_10","bid_queue_cliff_ratio_l1_l2","near_touch_depth_drop_bid","book_stability_score_1000ms","quiet_liquid_state_score","microprice_realized_vol_1000ms","obi_realized_vol_1000ms","depth_imbalance_realized_vol_1000ms","spread_realized_vol_1000ms","ofi_l1_over_effective_depth_200ms","ofi_pressure_x_churn_500ms","abs_ofi_over_depth_1000ms"]
+    representatives=["l1_churn_notional_200ms","l1_churn_over_depth_500ms","bid_l1_cancel_to_add_ratio_200ms","same_side_replenishment_after_depletion_200ms","buy_trade_depth_recovery_ratio_500ms","trade_impact_decay_ratio_200_to_1000ms","event_interarrival_cv_1000ms","trade_burstiness_ewma_fast_slow","aggressor_run_length_current","trade_sign_entropy_1000ms","trade_sign_flip_rate_1000ms","trade_size_hhi_1000ms","largest_trade_share_notional_1000ms","bid_depth_convexity_1_5_10bps","depth_slope_bid_1_to_10","bid_queue_cliff_ratio_l1_l2","near_touch_depth_drop_bid","book_stability_score_1000ms","quiet_liquid_state_score","microprice_realized_vol_1000ms","obi_realized_vol_1000ms","spread_realized_vol_1000ms","ofi_l1_over_effective_depth_200ms","abs_ofi_over_depth_1000ms"]
     for k in representatives: assert np.isfinite(out[k]) and out[k]!=0.0, k
     vals=np.array(list(out.values()),dtype=np.float64); assert np.isfinite(vals).all(); assert sum(abs(v)>1e-12 for v in vals) >= int(0.50*len(vals))
 
@@ -78,7 +83,7 @@ def test_metadata_has_specific_families():
     assert md["buy_trade_depth_recovery_ratio_500ms"]["candidate_family"] == "book_resilience"
     assert md["trade_size_hhi_1000ms"]["candidate_family"] == "trade_concentration"
     assert md["bid_queue_cliff_ratio_l1_l2"]["candidate_family"] == "queue_cliff"
-    assert md["ofi_pressure_x_churn_500ms"]["candidate_family"] == "ofi_pressure"
+    assert md["signed_ofi_over_depth_1000ms"]["candidate_family"] == "ofi_pressure"
 
 def test_queue_cliff_uses_same_side_levels():
     p=MovementMicrostructureCandidatePack(); p.on_event(("ob",1000,0,1,[(100,10),(99,5),(98,4),(97,3),(96,2)],[(101,8),(102,4),(103,3),(104,2),(105,1)]))
