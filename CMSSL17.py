@@ -3984,6 +3984,22 @@ class FeatureEngine:
         self._l1_churn_windows_ms: Tuple[int, ...] = (200, 500, 1000)
         self._l1_churn_deques: Dict[int, Deque[Tuple[int, float]]] = {ms: deque() for ms in self._l1_churn_windows_ms}
         self._l1_churn_sums: Dict[int, float] = {ms: 0.0 for ms in self._l1_churn_windows_ms}
+        self._event10_prev_bid_l1_notional: Optional[float] = None
+        self._event10_prev_ask_l1_notional: Optional[float] = None
+        self._event10_l1_churn_notional_windows: Dict[int, RollingScalarWindowState] = {
+            500: RollingScalarWindowState(500),
+            1000: RollingScalarWindowState(1000),
+        }
+        self._event10_bid_l1_add_notional_windows: Dict[int, RollingScalarWindowState] = {
+            200: RollingScalarWindowState(200),
+        }
+        self._event10_ask_l1_add_notional_windows: Dict[int, RollingScalarWindowState] = {
+            200: RollingScalarWindowState(200),
+        }
+        self._event10_ofi1_notional_windows: Dict[int, RollingScalarWindowState] = {
+            500: RollingScalarWindowState(500),
+        }
+        self._event10_depth_5bps_notional_imbalance_history: Deque[Tuple[int, float]] = deque()
 
         # ---------- Trades windows ----------
         # self.trade_windows includes FLOW_WINDOWS_MS plus REGIME_WINDOWS_MS because
@@ -5393,12 +5409,23 @@ class FeatureEngine:
             ("ask", 2, "rem"): max(prev_ask_l2 - asz2, 0.0),
         }
         self._record_replenishment(ts_ms, replen_deltas)
-        bid_l1_notional_prev = bid1 * max(prev_bid_l1, 0.0)
-        ask_l1_notional_prev = ask1 * max(prev_ask_l1, 0.0)
         bid_l1_notional_now = bid1 * max(bsz1, 0.0)
         ask_l1_notional_now = ask1 * max(asz1, 0.0)
-        l1_churn_notional = abs(bid_l1_notional_now - bid_l1_notional_prev) + abs(ask_l1_notional_now - ask_l1_notional_prev)
+        if self._event10_prev_bid_l1_notional is None or self._event10_prev_ask_l1_notional is None:
+            bd_notional = 0.0
+            ad_notional = 0.0
+        else:
+            bd_notional = bid_l1_notional_now - float(self._event10_prev_bid_l1_notional)
+            ad_notional = ask_l1_notional_now - float(self._event10_prev_ask_l1_notional)
+        l1_churn_notional = abs(bd_notional) + abs(ad_notional)
         self._record_l1_churn(ts_ms, l1_churn_notional)
+        self._event10_l1_churn_notional_windows[500].update(ts_ms, l1_churn_notional)
+        self._event10_l1_churn_notional_windows[1000].update(ts_ms, l1_churn_notional)
+        self._event10_bid_l1_add_notional_windows[200].update(ts_ms, max(bd_notional, 0.0))
+        self._event10_ask_l1_add_notional_windows[200].update(ts_ms, max(ad_notional, 0.0))
+        self._event10_ofi1_notional_windows[500].update(ts_ms, bd_notional - ad_notional)
+        self._event10_prev_bid_l1_notional = bid_l1_notional_now
+        self._event10_prev_ask_l1_notional = ask_l1_notional_now
 
         cum_bid_by_level = {lvl: self._cum_depth(self.bid_lvls, lvl) for lvl in BOOK_SIGNAL_LEVELS}
         cum_ask_by_level = {lvl: self._cum_depth(self.ask_lvls, lvl) for lvl in BOOK_SIGNAL_LEVELS}
@@ -5555,6 +5582,20 @@ class FeatureEngine:
         self._append_metric_history(self._ask_depth_5bps_history, ts_ms, ask_depth_5bps, self._regime_metric_keep_ms)
         self._append_metric_history(self._depth_5bps_total_history, ts_ms, depth_5bps_total, self._regime_metric_keep_ms)
         self._append_metric_history(self._depth_5bps_imbalance_history, ts_ms, depth_5bps_imbalance, self._regime_metric_keep_ms)
+        bid_depth_notional_5bps = self._notional_depth_within_bps(self.bid_lvls, mid, 5.0, is_bid=True)
+        ask_depth_notional_5bps = self._notional_depth_within_bps(self.ask_lvls, mid, 5.0, is_bid=False)
+        total_depth_notional_5bps = bid_depth_notional_5bps + ask_depth_notional_5bps
+        dim5_notional = self._safe_div(
+            bid_depth_notional_5bps - ask_depth_notional_5bps,
+            max(total_depth_notional_5bps, 1e-9),
+            0.0,
+        )
+        self._append_metric_history(
+            self._event10_depth_5bps_notional_imbalance_history,
+            ts_ms,
+            dim5_notional,
+            self._regime_metric_keep_ms,
+        )
         for ms in SPREAD_DEPTH_REGIME_WINDOWS_MS:
             self._spread_bps_regime_states[ms].update(ts_ms, spread_bps)
             self._bid_depth_5bps_regime_states[ms].update(ts_ms, bid_depth_5bps)
@@ -5816,6 +5857,7 @@ class FeatureEngine:
                 feat_list.append(imb_mean)
             feat_list.append(imb_slope)
         depth_5bps_total_base = depth_5bps_total
+        total_depth_notional_5bps_base = total_depth_notional_5bps
 
         for ms in FAST_WINDOWS_MS:
             ofi_pressure = ofi_pressure_by_ms[ms]
@@ -5826,25 +5868,25 @@ class FeatureEngine:
 
         trades_3000 = [x[3] for x in self._trade_window_deques[3000] if (ts_ms - x[0]) <= 3000 and x[3] > 0.0]
         top5_share_3000 = float(np.sort(np.asarray(trades_3000, dtype=np.float64))[-5:].sum() / max(float(np.sum(trades_3000)), 1e-9)) if trades_3000 else 0.0
-        dim_points = self._metric_values(self._depth_5bps_imbalance_history, ts_ms, 1000)
+        dim_points = self._metric_values(self._event10_depth_5bps_notional_imbalance_history, ts_ms, 1000)
         dim_vals = np.asarray([v for _, v in dim_points], dtype=np.float64)
         depth_imbalance_realized_vol_1000 = float(np.sqrt(np.sum(np.diff(dim_vals) ** 2))) if dim_vals.size > 1 else 0.0
         micro_points_1000 = self._metric_values(self._micro_history_points, ts_ms, 1000)
         micro_points_1000.append((ts_ms, micro_minus_mid_bps))
         microprice_zero_cross_rate_1000 = self._zero_cross_rate_from_points(micro_points_1000)
-        l1_churn_over_depth_500 = self._safe_div(self._l1_churn_sums.get(500, 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
-        l1_churn_over_depth_1000 = self._safe_div(self._l1_churn_sums.get(1000, 0.0), max(depth_5bps_total_base, 1e-9), 0.0)
+        l1_churn_over_depth_500 = self._safe_div(self._event10_l1_churn_notional_windows[500].sum(), max(total_depth_notional_5bps_base, 1e-9), 0.0)
+        l1_churn_over_depth_1000 = self._safe_div(self._event10_l1_churn_notional_windows[1000].sum(), max(total_depth_notional_5bps_base, 1e-9), 0.0)
         run_notional = self._same_side_trade_cluster_notional(ts_ms, 1000)
         ofi_pressure_500_over_depth = self._safe_div(
-            rolling_ofi_sums[(1, 500)],
-            max(depth_5bps_total_base, 1e-9),
+            abs(self._event10_ofi1_notional_windows[500].sum()),
+            max(total_depth_notional_5bps_base, 1e-9),
             0.0,
         )
         ofi_pressure_x_churn_500 = ofi_pressure_500_over_depth * l1_churn_over_depth_500
         bid_void = self._liquidity_void_bps_side("bid", mid, 10.0)
         ask_void = self._liquidity_void_bps_side("ask", mid, 10.0)
-        post_buy_repl = self._safe_div(self.replen_sums.get((200, ("ask", 1, "add")), 0.0), max(trade_stats_by_ms[200]["buy_notional_usd"], 1e-9), 0.0)
-        post_sell_repl = self._safe_div(self.replen_sums.get((200, ("bid", 1, "add")), 0.0), max(trade_stats_by_ms[200]["sell_notional_usd"], 1e-9), 0.0)
+        post_buy_repl = self._safe_div(self._event10_ask_l1_add_notional_windows[200].sum(), max(trade_stats_by_ms[200]["buy_notional_usd"], 1e-9), 0.0)
+        post_sell_repl = self._safe_div(self._event10_bid_l1_add_notional_windows[200].sum(), max(trade_stats_by_ms[200]["sell_notional_usd"], 1e-9), 0.0)
         feat_list.extend([top5_share_3000, depth_imbalance_realized_vol_1000, microprice_zero_cross_rate_1000, l1_churn_over_depth_1000, run_notional, ofi_pressure_x_churn_500, bid_void, ask_void, post_buy_repl, post_sell_repl])
 
         names = self.feature_names()
