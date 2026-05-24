@@ -365,7 +365,7 @@ class NovelMicrostructureCandidatePack:
         self.bid_delta_sign_hist=RollingValueWindow(); self.ask_delta_sign_hist=RollingValueWindow()
         self.bid_alt_events=RollingValueWindow(); self.ask_alt_events=RollingValueWindow()
         self.prev_bid_delta_sign=0; self.prev_ask_delta_sign=0
-        self.prev_mid=0.0; self.prev_micro_bps=0.0; self.mid_delta_sign_hist=RollingValueWindow(); self.current_mid_run_sign=0; self.current_mid_run_len=0; self.mid_run_len_hist=RollingValueWindow(); self.micro_lead_events=RollingValueWindow(); self.divergence_start_ts=None
+        self.prev_mid=0.0; self.prev_micro_bps=0.0; self.prev_nonzero_micro_sign=0; self.mid_delta_sign_hist=RollingValueWindow(); self.current_mid_run_sign=0; self.current_mid_run_len=0; self.mid_run_len_hist=RollingValueWindow(); self.micro_lead_events=RollingValueWindow(); self.divergence_start_ts=None
         self.min_positive_spread_bps=None; self.in_one_tick_spread=False; self.one_tick_spread_entry_ts=None; self.in_wide_spread=False; self.wide_spread_entry_ts=None
         self.depth_ewma_10bps=EWMAValue(5000); self.last_mid_or_depth_stable_break_ts=None; self.prev_stable_mid=0.0; self.prev_stable_total_depth_5bps=0.0
         self.prev_bid_px=0; self.prev_ask_px=0; self.prev_bid_sz=0; self.prev_ask_sz=0; self.prev_bid_l1=0; self.prev_ask_l1=0; self.prev_spread=0; self.best_bid_price_last_change_ts=None; self.best_ask_price_last_change_ts=None; self.best_bid_size_last_change_ts=None; self.best_ask_size_last_change_ts=None
@@ -449,10 +449,12 @@ class NovelMicrostructureCandidatePack:
             n=float(p)*float(s); self.trade_hist.add(ts,n); self.trade_size_ewma_3000.update(ts,n); self.trade_i.on_event(ts); self.trade_fast.update(ts,1); self.trade_slow.update(ts,1); self.last_trade_ts=ts
             if sg>0: self.buy_hist.add(ts,n)
             elif sg<0: self.sell_hist.add(ts,n)
-            valid_mid=self._mid() if self._valid_book() else 0.0
-            mid_at_trade=valid_mid if valid_mid>0.0 else float(p)
-            rec={"ts":ts,"price":float(p),"size":float(s),"notional":n,"side":int(sg),"mid_at_trade":mid_at_trade,"bid_depth_5_at_trade":self._depth('bid',5) if self._valid_book() else 0.0,"ask_depth_5_at_trade":self._depth('ask',5) if self._valid_book() else 0.0}
-            if sg!=0:
+            has_valid_book=self._valid_book()
+            mid_at_trade=self._mid() if has_valid_book else float(p)
+            bid_depth_5_at_trade=self._depth('bid',5) if has_valid_book else 0.0
+            ask_depth_5_at_trade=self._depth('ask',5) if has_valid_book else 0.0
+            rec={"ts":ts,"price":float(p),"size":float(s),"notional":n,"side":int(sg),"mid_at_trade":mid_at_trade,"bid_depth_5_at_trade":bid_depth_5_at_trade,"ask_depth_5_at_trade":ask_depth_5_at_trade}
+            if sg!=0 and mid_at_trade>0:
                 self.trade_records.append(rec)
                 if sg>0: self.last_buy_trade=rec
                 elif sg<0: self.last_sell_trade=rec
@@ -479,7 +481,7 @@ class NovelMicrostructureCandidatePack:
                 return
             bm=self._current_book_metrics(ts); bb,ba,bs,az,b1,a1,m,sp=bm["bb"],bm["ba"],bm["bs"],bm["az"],bm["b1"],bm["a1"],bm["mid"],bm["spread_bps"]
             if not self.has_valid_book:
-                self.has_valid_book=True; self.have_valid_book=True; self.prev_bid_px=bb; self.prev_ask_px=ba; self.prev_bid_sz=bs; self.prev_ask_sz=az; self.prev_bid_l1=b1; self.prev_ask_l1=a1; self.prev_spread=sp; self.best_bid_price_last_change_ts=ts; self.best_ask_price_last_change_ts=ts; self.best_bid_size_last_change_ts=ts; self.best_ask_size_last_change_ts=ts; self.last_l1_change_ts=ts; self.last_mid_or_depth_stable_break_ts=ts; self.prev_stable_mid=m; self.prev_stable_total_depth_5bps=bm["total_depth_5"]; self.mid_hist.add(ts,m); self.obi_hist.add(ts,bm["obi"]); self.micro_hist.add(ts,bm["micro_bps"]); self.depth_ewma_10bps.update(ts,bm["depth_bid_10"]+bm["depth_ask_10"]); return
+                self.has_valid_book=True; self.have_valid_book=True; self.prev_bid_px=bb; self.prev_ask_px=ba; self.prev_bid_sz=bs; self.prev_ask_sz=az; self.prev_bid_l1=b1; self.prev_ask_l1=a1; self.prev_spread=sp; self.best_bid_price_last_change_ts=ts; self.best_ask_price_last_change_ts=ts; self.best_bid_size_last_change_ts=ts; self.best_ask_size_last_change_ts=ts; self.last_l1_change_ts=ts; self.last_mid_or_depth_stable_break_ts=ts; self.prev_stable_mid=m; self.prev_stable_total_depth_5bps=bm["total_depth_5"]; self.mid_hist.add(ts,m); self.obi_hist.add(ts,bm["obi"]); self.micro_hist.add(ts,bm["micro_bps"]); self.depth_ewma_10bps.update(ts,bm["depth_bid_10"]+bm["depth_ask_10"]); self.prev_mid=m; self.prev_micro_bps=bm["micro_bps"]; self.prev_nonzero_micro_sign=int(np.sign(bm["micro_bps"])) if bm["micro_bps"]!=0 else 0; return
             bd,ad=b1-self.prev_bid_l1,a1-self.prev_ask_l1
             self.bid_delta.add(ts,bd); self.ask_delta.add(ts,ad); self.bid_add.add(ts,max(bd,0)); self.ask_add.add(ts,max(ad,0)); self.bid_cancel.add(ts,max(-bd,0)); self.ask_cancel.add(ts,max(-ad,0)); self.churn.add(ts,abs(bd)+abs(ad))
             bid_add=max(bd,0); ask_add=max(ad,0); bid_cancel=max(-bd,0); ask_cancel=max(-ad,0)
@@ -505,23 +507,29 @@ class NovelMicrostructureCandidatePack:
                 self.ask_delta_sign_hist.add(ts,sad)
                 if self.prev_ask_delta_sign!=0 and sad!=self.prev_ask_delta_sign: self.ask_alt_events.add(ts,1)
                 self.prev_ask_delta_sign=sad
-            if abs(bd)+abs(ad)>0: self.last_l1_change_ts=ts
-            if bb!=self.prev_bid_px: self.bid_rep.add(ts,1); self.quote_life.add(ts,ts-self.best_bid_price_last_change_ts); self.best_bid_price_last_change_ts=ts
-            if ba!=self.prev_ask_px: self.ask_rep.add(ts,1); self.quote_life.add(ts,ts-self.best_ask_price_last_change_ts); self.best_ask_price_last_change_ts=ts
-            if bs!=self.prev_bid_sz: self.best_bid_size_last_change_ts=ts
-            if az!=self.prev_ask_sz: self.best_ask_size_last_change_ts=ts
+            bid_price_changed=(bb!=self.prev_bid_px); ask_price_changed=(ba!=self.prev_ask_px)
+            bid_size_changed=bid_price_changed or (bs!=self.prev_bid_sz); ask_size_changed=ask_price_changed or (az!=self.prev_ask_sz)
+            l1_notional_changed=(abs(bd)+abs(ad)>0)
+            if l1_notional_changed or bid_price_changed or ask_price_changed or bid_size_changed or ask_size_changed: self.last_l1_change_ts=ts
+            if bid_price_changed: self.bid_rep.add(ts,1); self.quote_life.add(ts,ts-self.best_bid_price_last_change_ts); self.best_bid_price_last_change_ts=ts
+            if ask_price_changed: self.ask_rep.add(ts,1); self.quote_life.add(ts,ts-self.best_ask_price_last_change_ts); self.best_ask_price_last_change_ts=ts
+            if bid_size_changed: self.best_bid_size_last_change_ts=ts
+            if ask_size_changed: self.best_ask_size_last_change_ts=ts
             if sp>self.prev_spread+EPS: self.spread_widen.add(ts,1)
             if sp<self.prev_spread-EPS: self.spread_tighten.add(ts,1)
             obi=bm["obi"]; mb=bm["micro_bps"]
             pm=self.mid_hist.max(1000,ts); sm=np.sign(m-pm)
             self.obi_hist.add(ts,obi); self.micro_hist.add(ts,mb); self.mid_hist.add(ts,m); self.mid_sign.add(ts,sm)
+            prev_nonzero_micro_sign_for_lead=self.prev_nonzero_micro_sign
             mid_delta=m-self.prev_mid if self.prev_mid>0 else 0.0; ms=int(np.sign(mid_delta))
             if ms!=0:
                 self.mid_delta_sign_hist.add(ts,ms)
                 if ms==self.current_mid_run_sign: self.current_mid_run_len += 1
                 else: self.current_mid_run_sign=ms; self.current_mid_run_len=1
                 self.mid_run_len_hist.add(ts,self.current_mid_run_len)
-                if int(np.sign(self.prev_micro_bps))==ms: self.micro_lead_events.add(ts,1)
+                if prev_nonzero_micro_sign_for_lead==ms: self.micro_lead_events.add(ts,1)
+            current_micro_sign=int(np.sign(mb))
+            if current_micro_sign!=0: self.prev_nonzero_micro_sign=current_micro_sign
             micro_sign=int(np.sign(mb)); div=(micro_sign!=0 and self.current_mid_run_sign!=0 and micro_sign!=self.current_mid_run_sign)
             if div and self.divergence_start_ts is None: self.divergence_start_ts=ts
             if not div: self.divergence_start_ts=None
@@ -725,7 +733,7 @@ class NovelMicrostructureCandidatePack:
             pe3000=_safe_div(abs(mid_vals_3000[-1]-mid_vals_3000[0]),max(np.abs(np.diff(mid_vals_3000)).sum(),EPS))
             o["mid_price_path_efficiency_3000ms"]=_finite_float(pe3000,RATIO_CLIP); o["mid_price_reversal_ratio_3000ms"]=_finite_float(1.0-pe3000,RATIO_CLIP)
         o["microprice_leads_mid_cross_count_1000ms"]=self.micro_lead_events.sum(1000,ts)
-        o["microprice_mid_divergence_persistence_ms"]=(ts-self.divergence_start_ts) if self.divergence_start_ts is not None else 0.0
+        o["microprice_mid_divergence_persistence_ms"]=(0.0 if self.divergence_start_ts is None else min(max(ts-self.divergence_start_ts,0.0),AGE_CLIP_MS))
         o["event_interarrival_p90_over_p10_1000ms"]=self.event_i.p90_over_p10(1000,ts)
         o["trade_interarrival_p90_over_p10_1000ms"]=self.trade_i.p90_over_p10(1000,ts)
         o["ob_interarrival_p90_over_p10_1000ms"]=self.ob_i.p90_over_p10(1000,ts)
