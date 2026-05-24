@@ -23,6 +23,17 @@ def test_source_guards_and_explicit_assignments():
     for n in ROUND2_REQUESTED_FEATURES:
         assert f'o["{n}"]' in src or f"o['{n}']" in src
 
+
+
+def test_emit_does_not_use_book_helpers_after_invalid_branch_setup():
+    src=inspect.getsource(NovelMicrostructureCandidatePack.emit)
+    marker='o["trade_size_hhi_3000ms"]'
+    assert marker in src
+    formula_src=src[src.index(marker):]
+    forbidden=["self._depth(","self._level_notional(","self._levels(","self._depth_centroid("]
+    for token in forbidden:
+        assert token not in formula_src, token
+
 def test_round2_interarrival_queries_are_non_mutating():
     p=NovelMicrostructureCandidatePack()
     _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",70,2,100.01,1,1,1,0),("ob",210,3,2,[(100.0,11)],[]),("trade",430,4,100.01,2,-1,-1,0),("ob",900,5,2,[],[(100.02,11)])])
@@ -44,11 +55,15 @@ def test_round2_no_future_leakage_prefix_emits_identical_values():
 
 def test_round2_crossed_book_emits_finite_neutral_book_features():
     p=NovelMicrostructureCandidatePack()
-    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)])])
+    _feed(p,[
+        ("ob",0,1,1,[(100.00,10),(99.99,8),(99.98,5)],[(100.02,10),(100.03,8),(100.04,5)]),
+        ("trade",20,2,100.02,2.0,1,1,0),
+        ("trade",40,3,100.00,2.0,-1,-1,0),
+    ])
     prev_l1=p.last_l1_change_ts
     prev_one=p.one_tick_spread_entry_ts
     prev_wide=p.wide_spread_entry_ts
-    p.on_event(("ob",100,2,1,[(100.03,10)],[(100.01,10)]))
+    p.on_event(("ob",100,4,1,[(100.03,10)],[(100.01,10)]))
     o=p.emit()
     assert p.book_valid is False
     assert set(o)==set(ROUND2_REQUESTED_FEATURES)
@@ -61,6 +76,7 @@ def test_round2_crossed_book_emits_finite_neutral_book_features():
         "ask_depth_centroid_bps_25bps","depth_centroid_imbalance_25bps","bid_near_touch_depth_share_10bps",
         "ask_near_touch_depth_share_10bps","near_touch_depth_share_asymmetry_10bps","far_depth_wall_ratio_10_to_25bps",
         "spread_one_tick_persistence_ms","spread_wide_state_age_ms",
+        "buy_trade_depth_recovery_ratio_500ms","sell_trade_depth_recovery_ratio_500ms",
     ]
     for k in neutral_book_features:
         assert np.isclose(float(o[k]),0.0,atol=1e-12),(k,o[k])
