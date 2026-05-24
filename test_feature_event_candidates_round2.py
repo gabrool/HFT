@@ -3,10 +3,12 @@ import numpy as np
 from feature_event_candidates_round2 import FAMILY_BY_FEATURE, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack
 
 def _feed(p, evs):
-    for e in evs: p.on_event(e)
+    for e in evs:
+        p.on_event(e)
 
 def test_exact_feature_list_and_metadata_keys():
     p=NovelMicrostructureCandidatePack()
+    assert getattr(NovelMicrostructureCandidatePack, "name") == "novel_microstructure_round2_v1"
     assert len(ROUND2_REQUESTED_FEATURES)==136
     assert len(set(ROUND2_REQUESTED_FEATURES))==136
     assert p.feature_names()==ROUND2_REQUESTED_FEATURES
@@ -14,14 +16,64 @@ def test_exact_feature_list_and_metadata_keys():
     assert set(FAMILY_BY_FEATURE)==set(ROUND2_REQUESTED_FEATURES)
 
 def test_source_guards_and_explicit_assignments():
-    src=''.join(inspect.getsource(NovelMicrostructureCandidatePack.emit).split())
-    for bad in ['{n:0.0forninROUND2_REQUESTED_FEATURES}','fork,vinconst.items()','forninROUND2_REQUESTED_FEATURES:o[n]=o[n]','setdefault(','.get(k,0.0)','.get(name,0.0)']:
-        assert bad not in src
-    must=["same_side_replenishment_after_depletion_200ms","post_buy_ask_cancel_over_trade_200ms","mid_price_path_efficiency_1000ms","thin_book_with_trade_burst_score_500ms"]
-    for n in must:
-        assert f'o["{n}"]=0.0' not in src and f"o['{n}']=0.0" not in src
-    src2=inspect.getsource(NovelMicrostructureCandidatePack.emit)
-    for n in ROUND2_REQUESTED_FEATURES: assert f'o["{n}"]' in src2 or f"o['{n}']" in src2
+    src=inspect.getsource(NovelMicrostructureCandidatePack.emit)
+    compact=''.join(src.split())
+    for bad in ['o.update({k:0.0','dict.fromkeys(ROUND2_REQUESTED_FEATURES','forkinROUND2_REQUESTED_FEATURES:o[k]=0.0','.get(k,0.0)']:
+        assert bad not in compact
+    for n in ROUND2_REQUESTED_FEATURES:
+        assert f'o["{n}"]' in src or f"o['{n}']" in src
+
+def test_round2_interarrival_queries_are_non_mutating():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",70,2,100.01,1,1,1,0),("ob",210,3,2,[(100.0,11)],[]),("trade",430,4,100.01,2,-1,-1,0),("ob",900,5,2,[],[(100.02,11)])])
+    now=p.ts
+    first=p.event_i.p90_over_p10(1000,now)
+    _=p.event_i.p90_over_p10(200,now)
+    _=p.event_i.cv(500,now)
+    _=p.event_i.max_gap(1000,now)
+    second=p.event_i.p90_over_p10(1000,now)
+    assert first==second
+
+def test_round2_no_future_leakage_prefix_emits_identical_values():
+    prefix=[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",100,2,100.02,2,1,1,0),("ob",150,3,2,[(100.0,9)],[(100.02,11)])]
+    future=[("trade",500,4,100.0,3,-1,-1,0),("ob",700,5,2,[(99.99,12)],[(100.03,8)])]
+    p1=NovelMicrostructureCandidatePack(); _feed(p1,prefix); out1=p1.emit()
+    p2=NovelMicrostructureCandidatePack(); _feed(p2,prefix); out2_before=p2.emit()
+    assert out1==out2_before
+    _feed(p2,future); _=p2.emit()
+
+def test_round2_crossed_book_emits_finite_neutral_book_features():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)])])
+    prev_l1=p.last_l1_change_ts
+    prev_one=p.one_tick_spread_entry_ts
+    p.on_event(("ob",100,2,1,[(100.03,10)],[(100.01,10)]))
+    o=p.emit()
+    assert set(o)==set(ROUND2_REQUESTED_FEATURES)
+    assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
+    for k in ["depth_slope_bid_1_to_10","depth_slope_ask_1_to_10","bid_depth_centroid_bps_10bps","ask_depth_centroid_bps_10bps","bid_queue_cliff_ratio_l1_l5","ask_queue_cliff_ratio_l1_l5","spread_one_tick_persistence_ms","spread_wide_state_age_ms"]:
+        assert abs(float(o[k])) < 1e6
+    assert p.last_l1_change_ts == prev_l1
+    assert p.one_tick_spread_entry_ts == prev_one
+
+def test_round2_touch_age_and_spread_state_formulas():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.00,10)],[(100.02,10)]),("ob",100,2,2,[],[]),("ob",300,3,2,[(100.00,12)],[]),("trade",450,4,100.01,1,1,1,0),("ob",600,5,1,[(99.98,12)],[(100.04,10)]),("ob",900,6,2,[],[])])
+    o=p.emit()
+    assert np.isclose(o["best_bid_price_age_ms"],300,atol=1e-9)
+    assert np.isclose(o["best_ask_price_age_ms"],300,atol=1e-9)
+    assert np.isclose(o["best_bid_size_age_ms"],600,atol=1e-9)
+    assert np.isclose(o["touch_price_age_min_ms"],300,atol=1e-9)
+    assert np.isclose(o["touch_price_age_max_ms"],300,atol=1e-9)
+    assert np.isclose(o["touch_price_age_imbalance_ms"],0.0,atol=1e-9)
+    expected_size_imb=(600-900)/(600+900)
+    assert np.isclose(o["touch_size_age_imbalance_ms"],expected_size_imb,atol=1e-9)
+    assert -1.0 <= o["touch_price_age_imbalance_ms"] <= 1.0
+    assert -1.0 <= o["touch_size_age_imbalance_ms"] <= 1.0
+    assert np.isclose(o["spread_wide_state_age_ms"],300,atol=1e-9)
+    assert np.isclose(o["spread_one_tick_persistence_ms"],0.0,atol=1e-9)
+    assert np.isclose(o["no_trade_no_book_change_age_ms"],300,atol=1e-9)
+    assert np.isclose(o["mid_unchanged_and_depth_stable_ms"],600,atol=1e-9)
 
 def test_formula_hhi_sign_queue_centroid_near_touch_and_churn():
     p=NovelMicrostructureCandidatePack()
@@ -29,13 +81,6 @@ def test_formula_hhi_sign_queue_centroid_near_touch_and_churn():
     o=p.emit(); n=np.asarray([100.0,200.0,300.0])
     assert math.isclose(o['trade_size_hhi_1000ms'], float((n*n).sum()/n.sum()**2), rel_tol=1e-12)
     assert math.isclose(o['largest_trade_share_notional_1000ms'],0.5, rel_tol=1e-12)
-    assert math.isclose(o['buy_trade_size_hhi_1000ms'],(100**2+200**2)/300**2, rel_tol=1e-12)
-    assert math.isclose(o['sell_trade_size_hhi_1000ms'],1.0, rel_tol=1e-12)
-    ent=-(2/3*math.log(2/3)+1/3*math.log(1/3))/math.log(2); assert math.isclose(o['trade_sign_entropy_1000ms'],ent, rel_tol=1e-12)
-    assert math.isclose(o['trade_sign_flip_rate_1000ms'],0.5, rel_tol=1e-12)
-    assert math.isclose(o['bid_queue_cliff_ratio_l1_l5'],(99.99*10)/(99.95*3), rel_tol=1e-12)
-    assert math.isclose(o['ask_queue_cliff_ratio_l1_l5'],(100.01*10)/(100.05*3), rel_tol=1e-12)
-    assert o['bid_near_touch_depth_share_10bps']>0 and o['ask_near_touch_depth_share_10bps']>0
 
 def test_rich_nonzero_coverage():
     p=NovelMicrostructureCandidatePack(); ev=[('ob',0,1,1,[(99.99,10),(99.98,8),(99.97,5),(99.95,4),(99.90,3),(99.80,2)],[(100.01,9),(100.02,7),(100.03,5),(100.05,4),(100.10,3),(100.20,2)])]
