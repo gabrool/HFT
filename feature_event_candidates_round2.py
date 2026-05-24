@@ -215,7 +215,11 @@ class EWMARate:
 class EWMAValue(EWMARate):
     def update(self,ts,v=0.0): ts=int(ts); d=self._df(ts-(self.t if self.t is not None else ts)); self.s=(self.s*d)+(1-d)*float(v); self.t=ts
 
+assert len(ROUND2_REQUESTED_FEATURES) == 136
+assert len(set(ROUND2_REQUESTED_FEATURES)) == 136
+
 class NovelMicrostructureCandidatePack:
+    name = "novel_microstructure_round2_v1"
     def __init__(self): self.reset()
     def feature_names(self): return ROUND2_REQUESTED_FEATURES.copy()
     def metadata(self):
@@ -262,11 +266,11 @@ class NovelMicrostructureCandidatePack:
             }
         return out
     def reset(self):
-        self.ts=0; self.bids={}; self.asks={}; self.have_valid_book=False
+        self.ts=0; self.bids={}; self.asks={}; self.have_valid_book=False; self.book_valid=False; self.last_valid_book_ts=None; self.has_valid_book=False
         self.event_i=RollingInterarrival(); self.ob_i=RollingInterarrival(); self.trade_i=RollingInterarrival(); self.event_fast=EWMARate(200); self.event_slow=EWMARate(1000); self.ob_fast=EWMARate(200); self.ob_slow=EWMARate(1000); self.trade_fast=EWMARate(200); self.trade_slow=EWMARate(1000)
         self.trade_hist=RollingValueWindow(); self.buy_hist=RollingValueWindow(); self.sell_hist=RollingValueWindow(); self.trade_size_ewma_3000=EWMAValue(3000)
         self.obi_hist=RollingValueWindow(); self.micro_hist=RollingValueWindow(); self.mid_hist=RollingValueWindow(); self.bid_delta=RollingValueWindow(); self.ask_delta=RollingValueWindow(); self.bid_add=RollingValueWindow(); self.ask_add=RollingValueWindow(); self.bid_cancel=RollingValueWindow(); self.ask_cancel=RollingValueWindow(); self.churn=RollingValueWindow(); self.spread_widen=RollingValueWindow(); self.spread_tighten=RollingValueWindow(); self.bid_rep=RollingValueWindow(); self.ask_rep=RollingValueWindow(); self.quote_life=RollingValueWindow(); self.mid_sign=RollingValueWindow(); self.lead=RollingValueWindow()
-        self.trade_side=deque(); self.last_trade_ts=None; self.last_ob_ts=None; self.last_l1_change_ts=0
+        self.trade_side=deque(); self.last_trade_ts=None; self.last_ob_ts=None; self.last_l1_change_ts=None
         self.trade_records=deque(); self.last_buy_trade=None; self.last_sell_trade=None; self.last_nonzero_trade=None
         self.depletion_trackers=deque()
         self.post_buy_ask_cancel_200=RollingValueWindow(); self.post_sell_bid_cancel_200=RollingValueWindow()
@@ -278,11 +282,20 @@ class NovelMicrostructureCandidatePack:
         self.bid_alt_events=RollingValueWindow(); self.ask_alt_events=RollingValueWindow()
         self.prev_bid_delta_sign=0; self.prev_ask_delta_sign=0
         self.prev_mid=0.0; self.prev_micro_bps=0.0; self.mid_delta_sign_hist=RollingValueWindow(); self.current_mid_run_sign=0; self.current_mid_run_len=0; self.mid_run_len_hist=RollingValueWindow(); self.micro_lead_events=RollingValueWindow(); self.divergence_start_ts=None
-        self.min_positive_spread_bps_seen=None; self.one_tick_state_start_ts=None; self.wide_spread_state_start_ts=None
-        self.depth_ewma_10bps=EWMAValue(5000); self.last_mid_or_depth_stable_break_ts=0; self.prev_total_depth_5bps=0.0
-        self.prev_bid_px=0; self.prev_ask_px=0; self.prev_bid_sz=0; self.prev_ask_sz=0; self.prev_bid_l1=0; self.prev_ask_l1=0; self.prev_spread=0; self.best_bid_price_last_change_ts=0; self.best_ask_price_last_change_ts=0; self.best_bid_size_last_change_ts=0; self.best_ask_size_last_change_ts=0
+        self.min_positive_spread_bps=None; self.in_one_tick_spread=False; self.one_tick_spread_entry_ts=None; self.in_wide_spread=False; self.wide_spread_entry_ts=None
+        self.depth_ewma_10bps=EWMAValue(5000); self.last_mid_or_depth_stable_break_ts=None; self.prev_stable_mid=0.0; self.prev_stable_total_depth_5bps=0.0
+        self.prev_bid_px=0; self.prev_ask_px=0; self.prev_bid_sz=0; self.prev_ask_sz=0; self.prev_bid_l1=0; self.prev_ask_l1=0; self.prev_spread=0; self.best_bid_price_last_change_ts=None; self.best_ask_price_last_change_ts=None; self.best_bid_size_last_change_ts=None; self.best_ask_size_last_change_ts=None
     def _best(self): return (max(self.bids) if self.bids else 0.0, min(self.asks) if self.asks else 0.0)
-    def _valid_book(self): bb,ba=self._best(); return bb>0 and ba>0 and bb<ba
+    def _best_bid_ask(self):
+        bid_px=max(self.bids) if self.bids else 0.0; ask_px=min(self.asks) if self.asks else 0.0
+        bid_sz=self.bids.get(bid_px,0.0) if bid_px>0 else 0.0; ask_sz=self.asks.get(ask_px,0.0) if ask_px>0 else 0.0
+        return bid_px,bid_sz,ask_px,ask_sz
+    def _update_book_validity(self,ts):
+        bid_px,bid_sz,ask_px,ask_sz=self._best_bid_ask(); valid=(bid_px>0.0 and ask_px>0.0 and bid_sz>0.0 and ask_sz>0.0 and bid_px<ask_px)
+        self.book_valid=bool(valid)
+        if self.book_valid: self.last_valid_book_ts=int(ts)
+        return self.book_valid
+    def _valid_book(self): return self.book_valid
     def _mid(self): bb,ba=self._best(); return (bb+ba)/2 if bb>0 and ba>0 else 0.0
     def _levels(self,s): d=self.bids if s=='bid' else self.asks; return sorted(d.items(), key=lambda x:x[0], reverse=(s=='bid'))
     def _depth(self,s,bps):
@@ -303,6 +316,17 @@ class NovelMicrostructureCandidatePack:
                 d=1e4*abs(p-m)/m; n=p*sz
                 num += d*n; den += n
         return _safe_div(num, den)
+
+    def _current_book_metrics(self, ts):
+        bb,bs,ba,az=self._best_bid_ask()
+        if not self.book_valid:
+            return {"mid":0.0,"spread_bps":0.0,"bb":0.0,"ba":0.0,"bs":0.0,"az":0.0,"b1":0.0,"a1":0.0,"depth_bid_10":0.0,"depth_ask_10":0.0,"depth_bid_25":0.0,"depth_ask_25":0.0,"bid_centroid_10":0.0,"ask_centroid_10":0.0,"bid_centroid_25":0.0,"ask_centroid_25":0.0,"obi":0.0,"micro_bps":0.0,"total_depth_5":0.0}
+        m=(bb+ba)/2.0; sp=1e4*(ba-bb)/max(m,EPS); b1=bb*bs; a1=ba*az
+        depth_bid_10=self._depth('bid',10); depth_ask_10=self._depth('ask',10); depth_bid_25=self._depth('bid',25); depth_ask_25=self._depth('ask',25)
+        total_depth_5=self._depth('bid',5)+self._depth('ask',5)
+        obi=(b1-a1)/max(b1+a1,EPS); micro=(ba*bs+bb*az)/max(bs+az,EPS); mb=1e4*(micro-m)/max(m,EPS)
+        return {"mid":m,"spread_bps":sp,"bb":bb,"ba":ba,"bs":bs,"az":az,"b1":b1,"a1":a1,"depth_bid_10":depth_bid_10,"depth_ask_10":depth_ask_10,"depth_bid_25":depth_bid_25,"depth_ask_25":depth_ask_25,"bid_centroid_10":self._depth_centroid("bid",10),"ask_centroid_10":self._depth_centroid("ask",10),"bid_centroid_25":self._depth_centroid("bid",25),"ask_centroid_25":self._depth_centroid("ask",25),"obi":obi,"micro_bps":mb,"total_depth_5":total_depth_5}
+
     def on_event(self,ev):
         k,ts=ev[0],int(ev[1]); self.ts=ts; self.event_i.on_event(ts); self.event_fast.update(ts,1); self.event_slow.update(ts,1)
         if k=='trade':
@@ -326,9 +350,11 @@ class NovelMicrostructureCandidatePack:
             else:
                 for p,sz in bids: p=float(p); sz=float(sz); self.bids.pop(p,None) if sz<=0 else self.bids.__setitem__(p,sz)
                 for p,sz in asks: p=float(p); sz=float(sz); self.asks.pop(p,None) if sz<=0 else self.asks.__setitem__(p,sz)
-            if not self._valid_book(): self.have_valid_book=False; return
-            bb,ba=self._best(); bs=self.bids[bb]; az=self.asks[ba]; b1=bb*bs; a1=ba*az; m=self._mid(); sp=1e4*(ba-bb)/max(m,EPS)
-            if not self.have_valid_book: self.have_valid_book=True; self.prev_bid_px=bb; self.prev_ask_px=ba; self.prev_bid_sz=bs; self.prev_ask_sz=az; self.prev_bid_l1=b1; self.prev_ask_l1=a1; self.prev_spread=sp; self.best_bid_price_last_change_ts=ts; self.best_ask_price_last_change_ts=ts; self.best_bid_size_last_change_ts=ts; self.best_ask_size_last_change_ts=ts; self.mid_hist.add(ts,m); return
+            if not self._update_book_validity(ts):
+                return
+            bm=self._current_book_metrics(ts); bb,ba,bs,az,b1,a1,m,sp=bm["bb"],bm["ba"],bm["bs"],bm["az"],bm["b1"],bm["a1"],bm["mid"],bm["spread_bps"]
+            if not self.has_valid_book:
+                self.has_valid_book=True; self.have_valid_book=True; self.prev_bid_px=bb; self.prev_ask_px=ba; self.prev_bid_sz=bs; self.prev_ask_sz=az; self.prev_bid_l1=b1; self.prev_ask_l1=a1; self.prev_spread=sp; self.best_bid_price_last_change_ts=ts; self.best_ask_price_last_change_ts=ts; self.best_bid_size_last_change_ts=ts; self.best_ask_size_last_change_ts=ts; self.last_l1_change_ts=ts; self.last_mid_or_depth_stable_break_ts=ts; self.prev_stable_mid=m; self.prev_stable_total_depth_5bps=bm["total_depth_5"]; self.mid_hist.add(ts,m); self.obi_hist.add(ts,bm["obi"]); self.micro_hist.add(ts,bm["micro_bps"]); self.depth_ewma_10bps.update(ts,bm["depth_bid_10"]+bm["depth_ask_10"]); return
             bd,ad=b1-self.prev_bid_l1,a1-self.prev_ask_l1
             self.bid_delta.add(ts,bd); self.ask_delta.add(ts,ad); self.bid_add.add(ts,max(bd,0)); self.ask_add.add(ts,max(ad,0)); self.bid_cancel.add(ts,max(-bd,0)); self.ask_cancel.add(ts,max(-ad,0)); self.churn.add(ts,abs(bd)+abs(ad))
             bid_add=max(bd,0); ask_add=max(ad,0); bid_cancel=max(-bd,0); ask_cancel=max(-ad,0)
@@ -361,7 +387,7 @@ class NovelMicrostructureCandidatePack:
             if az!=self.prev_ask_sz: self.best_ask_size_last_change_ts=ts
             if sp>self.prev_spread+EPS: self.spread_widen.add(ts,1)
             if sp<self.prev_spread-EPS: self.spread_tighten.add(ts,1)
-            obi=(b1-a1)/max(b1+a1,EPS); micro=(ba*bs+bb*az)/max(bs+az,EPS); mb=1e4*(micro-m)/max(m,EPS)
+            obi=bm["obi"]; mb=bm["micro_bps"]
             pm=self.mid_hist.max(1000,ts); sm=np.sign(m-pm)
             self.obi_hist.add(ts,obi); self.micro_hist.add(ts,mb); self.mid_hist.add(ts,m); self.mid_sign.add(ts,sm)
             mid_delta=m-self.prev_mid if self.prev_mid>0 else 0.0; ms=int(np.sign(mid_delta))
@@ -374,18 +400,22 @@ class NovelMicrostructureCandidatePack:
             micro_sign=int(np.sign(mb)); div=(micro_sign!=0 and self.current_mid_run_sign!=0 and micro_sign!=self.current_mid_run_sign)
             if div and self.divergence_start_ts is None: self.divergence_start_ts=ts
             if not div: self.divergence_start_ts=None
-            total_depth_10=self._depth('bid',10)+self._depth('ask',10); self.depth_ewma_10bps.update(ts,total_depth_10)
-            total_depth_5=self._depth('bid',5)+self._depth('ask',5)
-            if self.prev_mid>0 and (abs(mid_delta)>EPS or (self.prev_total_depth_5bps>EPS and abs(total_depth_5-self.prev_total_depth_5bps)/self.prev_total_depth_5bps>0.01)): self.last_mid_or_depth_stable_break_ts=ts
-            self.prev_total_depth_5bps=total_depth_5
-            if sp>0 and (self.min_positive_spread_bps_seen is None or sp<self.min_positive_spread_bps_seen): self.min_positive_spread_bps_seen=sp
-            if self.min_positive_spread_bps_seen is not None:
-                if sp<=self.min_positive_spread_bps_seen*1.05:
-                    if self.one_tick_state_start_ts is None: self.one_tick_state_start_ts=ts
-                else: self.one_tick_state_start_ts=None
-                if sp>=self.min_positive_spread_bps_seen*1.5:
-                    if self.wide_spread_state_start_ts is None: self.wide_spread_state_start_ts=ts
-                else: self.wide_spread_state_start_ts=None
+            total_depth_10=bm["depth_bid_10"]+bm["depth_ask_10"]; self.depth_ewma_10bps.update(ts,total_depth_10)
+            total_depth_5=bm["total_depth_5"]
+            mid_changed=abs(m-self.prev_stable_mid)>1e-12
+            depth_changed=abs(total_depth_5-self.prev_stable_total_depth_5bps)/max(abs(self.prev_stable_total_depth_5bps),EPS)>0.01
+            if mid_changed or depth_changed: self.last_mid_or_depth_stable_break_ts=ts; self.prev_stable_mid=m; self.prev_stable_total_depth_5bps=total_depth_5
+            if sp>0:
+                if self.min_positive_spread_bps is None: self.min_positive_spread_bps=sp
+                else: self.min_positive_spread_bps=min(self.min_positive_spread_bps,sp)
+                one_tick_threshold=self.min_positive_spread_bps*1.05; wide_threshold=self.min_positive_spread_bps*1.50
+                now_one_tick=sp<=one_tick_threshold; now_wide=sp>=wide_threshold
+                if now_one_tick and not self.in_one_tick_spread: self.one_tick_spread_entry_ts=ts
+                self.in_one_tick_spread=now_one_tick
+                if not now_one_tick: self.one_tick_spread_entry_ts=None
+                if now_wide and not self.in_wide_spread: self.wide_spread_entry_ts=ts
+                self.in_wide_spread=now_wide
+                if not now_wide: self.wide_spread_entry_ts=None
             self.prev_mid=m; self.prev_micro_bps=mb
             self.prev_bid_px,self.prev_ask_px,self.prev_bid_sz,self.prev_ask_sz,self.prev_bid_l1,self.prev_ask_l1,self.prev_spread=bb,ba,bs,az,b1,a1,sp
     def emit(self):
@@ -397,23 +427,17 @@ class NovelMicrostructureCandidatePack:
         event_gaps_500=self.event_i.values(500,ts); event_gaps_1000=self.event_i.values(1000,ts); event_gaps_3000=self.event_i.values(3000,ts)
         trade_gaps_500=self.trade_i.values(500,ts); trade_gaps_1000=self.trade_i.values(1000,ts); trade_gaps_3000=self.trade_i.values(3000,ts)
         ob_gaps_500=self.ob_i.values(500,ts); ob_gaps_1000=self.ob_i.values(1000,ts); ob_gaps_3000=self.ob_i.values(3000,ts)
-        bid_levels=self._levels('bid'); ask_levels=self._levels('ask')
+        self._update_book_validity(ts); bm=self._current_book_metrics(ts); bid_levels=self._levels('bid'); ask_levels=self._levels('ask')
         bid_l1=self._level_notional('bid',1); ask_l1=self._level_notional('ask',1)
         bid_l5=self._level_notional('bid',5); ask_l5=self._level_notional('ask',5)
         bid_l10=self._level_notional('bid',10); ask_l10=self._level_notional('ask',10)
-        mid=self._mid(); bb,ba=self._best(); spread_bps=1e4*(ba-bb)/max(mid,EPS) if mid>0 and bb>0 and ba>0 else 0.0
-        depth_bid_10=self._depth('bid',10); depth_ask_10=self._depth('ask',10)
-        depth_bid_25=self._depth('bid',25); depth_ask_25=self._depth('ask',25)
-        bid_centroid_10=self._depth_centroid("bid",10)
-        ask_centroid_10=self._depth_centroid("ask",10)
-        bid_centroid_25=self._depth_centroid("bid",25)
-        ask_centroid_25=self._depth_centroid("ask",25)
-        best_bid_price_age=ts-self.best_bid_price_last_change_ts if self.best_bid_price_last_change_ts else 0
-        best_ask_price_age=ts-self.best_ask_price_last_change_ts if self.best_ask_price_last_change_ts else 0
-        best_bid_size_age=ts-self.best_bid_size_last_change_ts if self.best_bid_size_last_change_ts else 0
-        best_ask_size_age=ts-self.best_ask_size_last_change_ts if self.best_ask_size_last_change_ts else 0
-        no_trade_no_book_age=ts-max(self.last_trade_ts or 0,self.last_l1_change_ts or 0) if ts else 0
-        mid_unchanged_depth_stable=ts-self.last_l1_change_ts if self.last_l1_change_ts else 0
+        mid,bb,ba,spread_bps=bm["mid"],bm["bb"],bm["ba"],bm["spread_bps"]; depth_bid_10,depth_ask_10,depth_bid_25,depth_ask_25=bm["depth_bid_10"],bm["depth_ask_10"],bm["depth_bid_25"],bm["depth_ask_25"]; bid_centroid_10,ask_centroid_10, bid_centroid_25,ask_centroid_25=bm["bid_centroid_10"],bm["ask_centroid_10"],bm["bid_centroid_25"],bm["ask_centroid_25"]
+        best_bid_price_age=min(max(ts-self.best_bid_price_last_change_ts,0.0),AGE_CLIP_MS) if self.best_bid_price_last_change_ts is not None else 0.0
+        best_ask_price_age=min(max(ts-self.best_ask_price_last_change_ts,0.0),AGE_CLIP_MS) if self.best_ask_price_last_change_ts is not None else 0.0
+        best_bid_size_age=min(max(ts-self.best_bid_size_last_change_ts,0.0),AGE_CLIP_MS) if self.best_bid_size_last_change_ts is not None else 0.0
+        best_ask_size_age=min(max(ts-self.best_ask_size_last_change_ts,0.0),AGE_CLIP_MS) if self.best_ask_size_last_change_ts is not None else 0.0
+        trade_age=AGE_CLIP_MS if self.last_trade_ts is None else (ts-self.last_trade_ts); book_age=AGE_CLIP_MS if self.last_l1_change_ts is None else (ts-self.last_l1_change_ts); no_trade_no_book_age=min(max(min(trade_age,book_age),0.0),AGE_CLIP_MS)
+        mid_unchanged_depth_stable=0.0 if self.last_mid_or_depth_stable_break_ts is None else min(max(ts-self.last_mid_or_depth_stable_break_ts,0.0),AGE_CLIP_MS)
         trade_impact_buy_500=self.micro_hist.sum(500,ts); trade_impact_sell_500=-self.micro_hist.sum(500,ts)
         impact_200=self.micro_hist.abs_sum(200,ts); impact_1000=self.micro_hist.abs_sum(1000,ts)
         event_burst_ratio=_safe_div(self.event_fast.value(ts),self.event_slow.value(ts))
@@ -471,8 +495,8 @@ class NovelMicrostructureCandidatePack:
         o["best_ask_size_age_ms"]=best_ask_size_age
         o["touch_price_age_min_ms"]=min(best_bid_price_age,best_ask_price_age)
         o["touch_price_age_max_ms"]=max(best_bid_price_age,best_ask_price_age)
-        o["touch_price_age_imbalance_ms"]=best_bid_price_age-best_ask_price_age
-        o["touch_size_age_imbalance_ms"]=best_bid_size_age-best_ask_size_age
+        o["touch_price_age_imbalance_ms"]=self._safe_asym(bid_price_age:=best_bid_price_age,ask_price_age:=best_ask_price_age)
+        o["touch_size_age_imbalance_ms"]=self._safe_asym(bid_size_age:=best_bid_size_age,ask_size_age:=best_ask_size_age)
         o["best_bid_replacement_count_1000ms"]=self.bid_rep.sum(1000,ts)
         o["best_ask_replacement_count_1000ms"]=self.ask_rep.sum(1000,ts)
         o["touch_replacement_imbalance_1000ms"]=self._safe_asym(self.bid_rep.sum(1000,ts),self.ask_rep.sum(1000,ts))
@@ -530,8 +554,8 @@ class NovelMicrostructureCandidatePack:
         o["spread_tighten_event_count_1000ms"]=self.spread_tighten.sum(1000,ts)
         o["spread_widen_to_tighten_ratio_1000ms"]=_safe_div(self.spread_widen.sum(1000,ts),self.spread_tighten.sum(1000,ts))
         o["spread_state_transition_rate_3000ms"]=_safe_div(self.spread_widen.count(3000,ts)+self.spread_tighten.count(3000,ts),3.0)
-        o["spread_one_tick_persistence_ms"]=spread_bps
-        o["spread_wide_state_age_ms"]=best_bid_price_age+best_ask_price_age
+        o["spread_one_tick_persistence_ms"]=min(max(ts-self.one_tick_spread_entry_ts,0.0),AGE_CLIP_MS) if self.in_one_tick_spread and self.one_tick_spread_entry_ts is not None else 0.0
+        o["spread_wide_state_age_ms"]=min(max(ts-self.wide_spread_entry_ts,0.0),AGE_CLIP_MS) if self.in_wide_spread and self.wide_spread_entry_ts is not None else 0.0
         o["spread_recompression_after_trade_500ms"]=_safe_div(self.spread_tighten.sum(500,ts),self.trade_hist.count(500,ts))
         o["spread_widen_after_trade_500ms"]=_safe_div(self.spread_widen.sum(500,ts),self.trade_hist.count(500,ts))
         o["mid_price_direction_flip_rate_1000ms"]=self.mid_delta_sign_hist.sign_flip_rate(1000,ts)
