@@ -206,3 +206,57 @@ def test_round2_depth_recovery_ratio_current_over_trade_depth():
     assert math.isclose(run(10,20,1)["buy_trade_depth_recovery_ratio_500ms"],2.0,rel_tol=1e-12)
     assert math.isclose(run(10,5,1)["buy_trade_depth_recovery_ratio_500ms"],0.5,rel_tol=1e-12)
     assert math.isclose(run(10,10,-1)["sell_trade_depth_recovery_ratio_500ms"],1.0,rel_tol=1e-12)
+
+def test_round2_trade_impact_sum_outputs_clip_to_ratio_clip():
+    p = NovelMicrostructureCandidatePack()
+    _feed(p, [
+        ("ob", 0, 1, 1, [(99.99, 10.0)], [(100.01, 10.0)]),
+        ("trade", 100, 2, 100.01, 1.0, 1, 1, 0),
+        ("ob", 200, 3, 1, [(199.99, 10.0)], [(200.01, 10.0)]),
+    ])
+    o = p.emit()
+    assert o["buy_trade_impact_sum_bps_500ms"] == RATIO_CLIP
+    assert np.isfinite(o["buy_trade_impact_sum_bps_500ms"])
+
+def test_round2_sell_trade_impact_sum_outputs_clip_to_ratio_clip():
+    p = NovelMicrostructureCandidatePack()
+    _feed(p, [
+        ("ob", 0, 1, 1, [(99.99, 10.0)], [(100.01, 10.0)]),
+        ("trade", 100, 2, 99.99, 1.0, -1, -1, 0),
+        ("ob", 200, 3, 1, [(0.99, 10.0)], [(1.01, 10.0)]),
+    ])
+    o = p.emit()
+    assert o["sell_trade_impact_sum_bps_500ms"] == RATIO_CLIP
+    assert np.isfinite(o["sell_trade_impact_sum_bps_500ms"])
+
+def test_round2_trade_impact_sum_outputs_clip_negative_to_ratio_clip():
+    p = NovelMicrostructureCandidatePack()
+    _feed(p, [
+        ("ob", 0, 1, 1, [(99.99, 10.0)], [(100.01, 10.0)]),
+        ("trade", 100, 2, 100.01, 1.0, 1, 1, 0),
+        ("ob", 200, 3, 1, [(0.99, 10.0)], [(1.01, 10.0)]),
+    ])
+    o = p.emit()
+    assert o["buy_trade_impact_sum_bps_500ms"] == -RATIO_CLIP
+    assert np.isfinite(o["buy_trade_impact_sum_bps_500ms"])
+
+def test_round2_sell_trade_impact_sum_outputs_clip_negative_to_ratio_clip():
+    p = NovelMicrostructureCandidatePack()
+    _feed(p, [
+        ("ob", 0, 1, 1, [(99.99, 10.0)], [(100.01, 10.0)]),
+        ("trade", 100, 2, 99.99, 1.0, -1, -1, 0),
+        ("ob", 200, 3, 1, [(199.99, 10.0)], [(200.01, 10.0)]),
+    ])
+    o = p.emit()
+    assert o["sell_trade_impact_sum_bps_500ms"] == -RATIO_CLIP
+    assert np.isfinite(o["sell_trade_impact_sum_bps_500ms"])
+
+def test_round2_trade_impact_sum_outputs_preserve_normal_values():
+    p = NovelMicrostructureCandidatePack()
+    _feed(p, [
+        ("ob", 0, 1, 1, [(99.99, 10.0)], [(100.01, 10.0)]),
+        ("trade", 100, 2, 100.01, 1.0, 1, 1, 0),
+        ("ob", 200, 3, 1, [(100.19, 10.0)], [(100.21, 10.0)]),
+    ])
+    o = p.emit()
+    assert math.isclose(o["buy_trade_impact_sum_bps_500ms"], 20.0, rel_tol=1e-9, abs_tol=1e-9)
