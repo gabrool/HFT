@@ -47,14 +47,41 @@ def test_round2_crossed_book_emits_finite_neutral_book_features():
     _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)])])
     prev_l1=p.last_l1_change_ts
     prev_one=p.one_tick_spread_entry_ts
+    prev_wide=p.wide_spread_entry_ts
     p.on_event(("ob",100,2,1,[(100.03,10)],[(100.01,10)]))
     o=p.emit()
+    assert p.book_valid is False
     assert set(o)==set(ROUND2_REQUESTED_FEATURES)
     assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
-    for k in ["depth_slope_bid_1_to_10","depth_slope_ask_1_to_10","bid_depth_centroid_bps_10bps","ask_depth_centroid_bps_10bps","bid_queue_cliff_ratio_l1_l5","ask_queue_cliff_ratio_l1_l5","spread_one_tick_persistence_ms","spread_wide_state_age_ms"]:
-        assert abs(float(o[k])) < 1e6
+    neutral_book_features=[
+        "depth_slope_bid_1_to_10","depth_slope_ask_1_to_10","depth_slope_imbalance_1_to_10",
+        "thin_side_depth_gap_ratio","book_shape_asymmetry_convexity","bid_queue_cliff_ratio_l1_l5",
+        "ask_queue_cliff_ratio_l1_l5","near_touch_depth_drop_asymmetry","bid_depth_centroid_bps_10bps",
+        "ask_depth_centroid_bps_10bps","depth_centroid_imbalance_10bps","bid_depth_centroid_bps_25bps",
+        "ask_depth_centroid_bps_25bps","depth_centroid_imbalance_25bps","bid_near_touch_depth_share_10bps",
+        "ask_near_touch_depth_share_10bps","near_touch_depth_share_asymmetry_10bps","far_depth_wall_ratio_10_to_25bps",
+        "spread_one_tick_persistence_ms","spread_wide_state_age_ms",
+    ]
+    for k in neutral_book_features:
+        assert np.isclose(float(o[k]),0.0,atol=1e-12),(k,o[k])
     assert p.last_l1_change_ts == prev_l1
     assert p.one_tick_spread_entry_ts == prev_one
+    assert p.wide_spread_entry_ts == prev_wide
+
+
+
+def test_round2_invalid_book_emit_does_not_use_crossed_dictionaries():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)])])
+    p.on_event(("ob",100,2,1,[(100.03,10)],[(100.01,10)]))
+    o=p.emit()
+    assert p.book_valid is False
+    assert np.isclose(o["bid_queue_cliff_ratio_l1_l5"],0.0,atol=1e-12)
+    assert np.isclose(o["ask_queue_cliff_ratio_l1_l5"],0.0,atol=1e-12)
+    assert np.isclose(o["depth_slope_bid_1_to_10"],0.0,atol=1e-12)
+    assert np.isclose(o["depth_slope_ask_1_to_10"],0.0,atol=1e-12)
+    assert np.isclose(o["bid_depth_centroid_bps_10bps"],0.0,atol=1e-12)
+    assert np.isclose(o["ask_depth_centroid_bps_10bps"],0.0,atol=1e-12)
 
 def test_round2_touch_age_and_spread_state_formulas():
     p=NovelMicrostructureCandidatePack()
@@ -75,12 +102,35 @@ def test_round2_touch_age_and_spread_state_formulas():
     assert np.isclose(o["no_trade_no_book_change_age_ms"],300,atol=1e-9)
     assert np.isclose(o["mid_unchanged_and_depth_stable_ms"],600,atol=1e-9)
 
-def test_formula_hhi_sign_queue_centroid_near_touch_and_churn():
+def test_formula_hhi_sign_queue_centroid_and_near_touch():
     p=NovelMicrostructureCandidatePack()
-    _feed(p,[("ob",0,1,1,[(99.99,10),(99.98,8),(99.97,5),(99.96,4),(99.95,3)],[(100.01,10),(100.02,8),(100.03,5),(100.04,4),(100.05,3)]),("trade",100,2,100,1,1,1,0),("trade",200,3,100,2,1,1,0),("trade",300,4,100,3,-1,-1,0)])
+    bids=[(99.99,10),(99.98,8),(99.97,5),(99.96,4),(99.95,3)]
+    asks=[(100.01,10),(100.02,8),(100.03,5),(100.04,4),(100.05,3)]
+    _feed(p,[("ob",0,1,1,bids,asks),("trade",100,2,100,1,1,1,0),("trade",200,3,100,2,1,1,0),("trade",300,4,100,3,-1,-1,0)])
     o=p.emit(); n=np.asarray([100.0,200.0,300.0])
     assert math.isclose(o['trade_size_hhi_1000ms'], float((n*n).sum()/n.sum()**2), rel_tol=1e-12)
     assert math.isclose(o['largest_trade_share_notional_1000ms'],0.5, rel_tol=1e-12)
+    p_buy=2.0/3.0; p_sell=1.0/3.0
+    expected_entropy=-(p_buy*math.log(p_buy)+p_sell*math.log(p_sell))/math.log(2.0)
+    assert math.isclose(o["trade_sign_entropy_1000ms"], expected_entropy, rel_tol=1e-12, abs_tol=1e-12)
+    assert math.isclose(o["trade_sign_flip_rate_1000ms"],0.5,rel_tol=1e-12,abs_tol=1e-12)
+    expected_bid_l1=99.99*10; expected_bid_l5=99.95*3
+    expected_ask_l1=100.01*10; expected_ask_l5=100.05*3
+    assert math.isclose(o["bid_queue_cliff_ratio_l1_l5"],expected_bid_l1/expected_bid_l5,rel_tol=1e-12,abs_tol=1e-12)
+    assert math.isclose(o["ask_queue_cliff_ratio_l1_l5"],expected_ask_l1/expected_ask_l5,rel_tol=1e-12,abs_tol=1e-12)
+    mid=100.0
+    bid_not=[px*sz for px,sz in bids if px>=mid*(1-10/1e4)]
+    bid_dist=[1e4*abs(px-mid)/mid for px,_ in bids if px>=mid*(1-10/1e4)]
+    ask_not=[px*sz for px,sz in asks if px<=mid*(1+10/1e4)]
+    ask_dist=[1e4*abs(px-mid)/mid for px,_ in asks if px<=mid*(1+10/1e4)]
+    expected_bid_centroid=sum(d*n for d,n in zip(bid_dist,bid_not))/sum(bid_not)
+    expected_ask_centroid=sum(d*n for d,n in zip(ask_dist,ask_not))/sum(ask_not)
+    assert math.isclose(o["bid_depth_centroid_bps_10bps"],expected_bid_centroid,rel_tol=1e-12,abs_tol=1e-12)
+    assert math.isclose(o["ask_depth_centroid_bps_10bps"],expected_ask_centroid,rel_tol=1e-12,abs_tol=1e-12)
+    bid_depth_1=sum(px*sz for px,sz in bids if px>=mid*(1-1/1e4)); bid_depth_10=sum(bid_not)
+    ask_depth_1=sum(px*sz for px,sz in asks if px<=mid*(1+1/1e4)); ask_depth_10=sum(ask_not)
+    assert math.isclose(o["bid_near_touch_depth_share_10bps"],bid_depth_1/bid_depth_10,rel_tol=1e-12,abs_tol=1e-12)
+    assert math.isclose(o["ask_near_touch_depth_share_10bps"],ask_depth_1/ask_depth_10,rel_tol=1e-12,abs_tol=1e-12)
 
 def test_rich_nonzero_coverage():
     p=NovelMicrostructureCandidatePack(); ev=[('ob',0,1,1,[(99.99,10),(99.98,8),(99.97,5),(99.95,4),(99.90,3),(99.80,2)],[(100.01,9),(100.02,7),(100.03,5),(100.05,4),(100.10,3),(100.20,2)])]

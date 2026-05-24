@@ -427,11 +427,22 @@ class NovelMicrostructureCandidatePack:
         event_gaps_500=self.event_i.values(500,ts); event_gaps_1000=self.event_i.values(1000,ts); event_gaps_3000=self.event_i.values(3000,ts)
         trade_gaps_500=self.trade_i.values(500,ts); trade_gaps_1000=self.trade_i.values(1000,ts); trade_gaps_3000=self.trade_i.values(3000,ts)
         ob_gaps_500=self.ob_i.values(500,ts); ob_gaps_1000=self.ob_i.values(1000,ts); ob_gaps_3000=self.ob_i.values(3000,ts)
-        self._update_book_validity(ts); bm=self._current_book_metrics(ts); bid_levels=self._levels('bid'); ask_levels=self._levels('ask')
-        bid_l1=self._level_notional('bid',1); ask_l1=self._level_notional('ask',1)
-        bid_l5=self._level_notional('bid',5); ask_l5=self._level_notional('ask',5)
-        bid_l10=self._level_notional('bid',10); ask_l10=self._level_notional('ask',10)
-        mid,bb,ba,spread_bps=bm["mid"],bm["bb"],bm["ba"],bm["spread_bps"]; depth_bid_10,depth_ask_10,depth_bid_25,depth_ask_25=bm["depth_bid_10"],bm["depth_ask_10"],bm["depth_bid_25"],bm["depth_ask_25"]; bid_centroid_10,ask_centroid_10, bid_centroid_25,ask_centroid_25=bm["bid_centroid_10"],bm["ask_centroid_10"],bm["bid_centroid_25"],bm["ask_centroid_25"]
+        self._update_book_validity(ts); bm=self._current_book_metrics(ts)
+        if not self.book_valid:
+            bid_levels=[]; ask_levels=[]
+            bid_l1=ask_l1=0.0; bid_l5=ask_l5=0.0; bid_l10=ask_l10=0.0
+            bid_depth_1=ask_depth_1=0.0; depth_bid_10=depth_ask_10=0.0; depth_bid_25=depth_ask_25=0.0
+            bid_centroid_10=ask_centroid_10=0.0; bid_centroid_25=ask_centroid_25=0.0
+            mid=0.0; bb=ba=0.0; spread_bps=0.0
+        else:
+            bid_levels=self._levels('bid'); ask_levels=self._levels('ask')
+            bid_l1=self._level_notional('bid',1); ask_l1=self._level_notional('ask',1)
+            bid_l5=self._level_notional('bid',5); ask_l5=self._level_notional('ask',5)
+            bid_l10=self._level_notional('bid',10); ask_l10=self._level_notional('ask',10)
+            bid_depth_1=self._depth('bid',1); ask_depth_1=self._depth('ask',1)
+            mid=bm["mid"]; bb=bm["bb"]; ba=bm["ba"]; spread_bps=bm["spread_bps"]
+            depth_bid_10=bm["depth_bid_10"]; depth_ask_10=bm["depth_ask_10"]; depth_bid_25=bm["depth_bid_25"]; depth_ask_25=bm["depth_ask_25"]
+            bid_centroid_10=bm["bid_centroid_10"]; ask_centroid_10=bm["ask_centroid_10"]; bid_centroid_25=bm["bid_centroid_25"]; ask_centroid_25=bm["ask_centroid_25"]
         best_bid_price_age=min(max(ts-self.best_bid_price_last_change_ts,0.0),AGE_CLIP_MS) if self.best_bid_price_last_change_ts is not None else 0.0
         best_ask_price_age=min(max(ts-self.best_ask_price_last_change_ts,0.0),AGE_CLIP_MS) if self.best_ask_price_last_change_ts is not None else 0.0
         best_bid_size_age=min(max(ts-self.best_bid_size_last_change_ts,0.0),AGE_CLIP_MS) if self.best_bid_size_last_change_ts is not None else 0.0
@@ -479,14 +490,14 @@ class NovelMicrostructureCandidatePack:
         sells=[r for r in self.trade_records if r["side"]<0 and ts-r["ts"]<=500]; o["sell_trade_depth_recovery_ratio_500ms"]=_safe_div(sum(max(self._depth("bid",5)-r["bid_depth_5_at_trade"],0.0) for r in sells),sum(r["bid_depth_5_at_trade"] for r in sells))
         o["trade_impact_decay_ratio_200_to_1000ms"]=_safe_div(impact_200,impact_1000)
         o["trade_impact_half_life_proxy"]=float(np.clip(_safe_div(math.log(max(impact_200,EPS)/max(impact_1000,EPS)),math.log(5.0),clip=10.0),-10,10)) if impact_200>EPS and impact_1000>EPS else 0.0
-        bid_depth_1=self._depth("bid",1); ask_depth_1=self._depth("ask",1); o["depth_slope_bid_1_to_10"]=_safe_div(depth_bid_10-bid_depth_1,depth_bid_10)
+        o["depth_slope_bid_1_to_10"]=_safe_div(depth_bid_10-bid_depth_1,depth_bid_10)
         o["depth_slope_ask_1_to_10"]=_safe_div(depth_ask_10-ask_depth_1,depth_ask_10)
         o["depth_slope_imbalance_1_to_10"]=self._safe_asym(o["depth_slope_bid_1_to_10"],o["depth_slope_ask_1_to_10"])
         o["thin_side_depth_gap_ratio"]=_safe_div(min(depth_bid_10,depth_ask_10),max(depth_bid_10,depth_ask_10,EPS))
-        o["book_shape_asymmetry_convexity"]=self._safe_asym(_safe_div(depth_bid_10,self._depth("bid",25)),_safe_div(depth_ask_10,self._depth("ask",25)))
+        o["book_shape_asymmetry_convexity"]=self._safe_asym(_safe_div(depth_bid_10,depth_bid_25),_safe_div(depth_ask_10,depth_ask_25))
         o["bid_queue_cliff_ratio_l1_l5"]=_safe_div(bid_l1,bid_l5)
         o["ask_queue_cliff_ratio_l1_l5"]=_safe_div(ask_l1,ask_l5)
-        o["near_touch_depth_drop_asymmetry"]=self._safe_asym(_safe_div(self._depth("bid",1),depth_bid_10),_safe_div(self._depth("ask",1),depth_ask_10))
+        o["near_touch_depth_drop_asymmetry"]=self._safe_asym(_safe_div(bid_depth_1,depth_bid_10),_safe_div(ask_depth_1,depth_ask_10))
         o["no_trade_no_book_change_age_ms"]=no_trade_no_book_age
         o["mid_unchanged_and_depth_stable_ms"]=mid_unchanged_depth_stable
         o["best_bid_price_age_ms"]=best_bid_price_age
