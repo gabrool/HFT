@@ -1,6 +1,6 @@
 import inspect, math
 import numpy as np
-from feature_event_candidates_round2 import FAMILY_BY_FEATURE, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack, EWMAValue, RATIO_CLIP
+from feature_event_candidates_round2 import FAMILY_BY_FEATURE, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack, EWMAValue, RATIO_CLIP, RollingValueWindow
 
 def _feed(p, evs):
     for e in evs:
@@ -174,3 +174,35 @@ def test_round2_source_guards_new_formulas():
     src=''.join(inspect.getsource(NovelMicrostructureCandidatePack.emit).split())
     for bad in ['min(depth_bid_10,depth_ask_10)','trade_impact_buy_500-trade_impact_sell_500','spread_bps*trade_burst_ratio','*(1.0-_safe_div']:
         assert bad not in src
+
+
+def test_round2_zero_cross_rate_carries_exact_zeros():
+    w=RollingValueWindow()
+    w.add(0,1.0); w.add(100,0.0); w.add(200,-1.0)
+    assert math.isclose(w.zero_cross_rate(1000,200),0.5,rel_tol=1e-12)
+    w=RollingValueWindow()
+    w.add(0,0.0); w.add(100,1.0); w.add(200,0.0); w.add(300,-1.0)
+    assert math.isclose(w.zero_cross_rate(1000,300),0.5,rel_tol=1e-12)
+
+def test_round2_trade_sign_entropy_one_sided_exact_zero():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",100,2,100.02,1.0,1,1,0),("trade",200,3,100.02,2.0,1,1,0)])
+    o=p.emit()
+    assert o["trade_sign_entropy_1000ms"]==0.0
+
+def test_round2_large_trade_side_dominance_uses_largest_notional_not_share():
+    p=NovelMicrostructureCandidatePack(); _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",100,2,100.02,1,1,1,0),("trade",110,3,100.02,1,-1,-1,0),("trade",120,4,100.02,1,-1,-1,0),("trade",130,5,100.02,1,-1,-1,0),("trade",140,6,100.02,1,-1,-1,0)])
+    o=p.emit()
+    assert math.isclose(o["buy_largest_trade_share_3000ms"],1.0,rel_tol=1e-12)
+    assert math.isclose(o["sell_largest_trade_share_3000ms"],0.25,rel_tol=1e-12)
+    assert math.isclose(o["large_trade_side_dominance_3000ms"],0.0,abs_tol=1e-12)
+
+def test_round2_depth_recovery_ratio_current_over_trade_depth():
+    def run(a0,a1,side):
+        p=NovelMicrostructureCandidatePack(); _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,a0)])])
+        _feed(p,[("trade",100,2,100.02 if side>0 else 100.0,1.0,side,side,0),("ob",200,3,1,[(100.0,a1)],[(100.02,a1)])])
+        return p.emit()
+    assert math.isclose(run(10,10,1)["buy_trade_depth_recovery_ratio_500ms"],1.0,rel_tol=1e-12)
+    assert math.isclose(run(10,20,1)["buy_trade_depth_recovery_ratio_500ms"],2.0,rel_tol=1e-12)
+    assert math.isclose(run(10,5,1)["buy_trade_depth_recovery_ratio_500ms"],0.5,rel_tol=1e-12)
+    assert math.isclose(run(10,10,-1)["sell_trade_depth_recovery_ratio_500ms"],1.0,rel_tol=1e-12)
