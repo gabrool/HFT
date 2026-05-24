@@ -431,7 +431,7 @@ class NovelMicrostructureCandidatePack:
         if not self.book_valid:
             bid_levels=[]; ask_levels=[]
             bid_l1=ask_l1=0.0; bid_l5=ask_l5=0.0; bid_l10=ask_l10=0.0
-            bid_depth_1=ask_depth_1=0.0; depth_bid_10=depth_ask_10=0.0; depth_bid_25=depth_ask_25=0.0
+            bid_depth_1=ask_depth_1=0.0; depth_bid_5=depth_ask_5=0.0; depth_bid_10=depth_ask_10=0.0; depth_bid_25=depth_ask_25=0.0
             bid_centroid_10=ask_centroid_10=0.0; bid_centroid_25=ask_centroid_25=0.0
             mid=0.0; bb=ba=0.0; spread_bps=0.0
         else:
@@ -440,6 +440,7 @@ class NovelMicrostructureCandidatePack:
             bid_l5=self._level_notional('bid',5); ask_l5=self._level_notional('ask',5)
             bid_l10=self._level_notional('bid',10); ask_l10=self._level_notional('ask',10)
             bid_depth_1=self._depth('bid',1); ask_depth_1=self._depth('ask',1)
+            depth_bid_5=self._depth('bid',5); depth_ask_5=self._depth('ask',5)
             mid=bm["mid"]; bb=bm["bb"]; ba=bm["ba"]; spread_bps=bm["spread_bps"]
             depth_bid_10=bm["depth_bid_10"]; depth_ask_10=bm["depth_ask_10"]; depth_bid_25=bm["depth_bid_25"]; depth_ask_25=bm["depth_ask_25"]
             bid_centroid_10=bm["bid_centroid_10"]; ask_centroid_10=bm["ask_centroid_10"]; bid_centroid_25=bm["bid_centroid_25"]; ask_centroid_25=bm["ask_centroid_25"]
@@ -486,8 +487,8 @@ class NovelMicrostructureCandidatePack:
         o["trade_sign_flip_rate_3000ms"]=float(np.mean(signs_3000[1:]!=signs_3000[:-1])) if signs_3000.size>1 else 0.0
         trk=[t for t in self.depletion_trackers if ts-t["ts"]<=200]; o["same_side_replenishment_after_depletion_200ms"]=_safe_div(sum(min(t["same_recovered"],t["amount"]) for t in trk),sum(t["amount"] for t in trk))
         o["opposite_side_replenishment_after_depletion_200ms"]=_safe_div(sum(min(t["opp_recovered"],t["amount"]) for t in trk),sum(t["amount"] for t in trk))
-        buys=[r for r in self.trade_records if r["side"]>0 and ts-r["ts"]<=500]; o["buy_trade_depth_recovery_ratio_500ms"]=_safe_div(sum(max(self._depth("ask",5)-r["ask_depth_5_at_trade"],0.0) for r in buys),sum(r["ask_depth_5_at_trade"] for r in buys))
-        sells=[r for r in self.trade_records if r["side"]<0 and ts-r["ts"]<=500]; o["sell_trade_depth_recovery_ratio_500ms"]=_safe_div(sum(max(self._depth("bid",5)-r["bid_depth_5_at_trade"],0.0) for r in sells),sum(r["bid_depth_5_at_trade"] for r in sells))
+        buys=[r for r in self.trade_records if r["side"]>0 and ts-r["ts"]<=500]; o["buy_trade_depth_recovery_ratio_500ms"]=_safe_div(sum(max(depth_ask_5-r["ask_depth_5_at_trade"],0.0) for r in buys),sum(r["ask_depth_5_at_trade"] for r in buys))
+        sells=[r for r in self.trade_records if r["side"]<0 and ts-r["ts"]<=500]; o["sell_trade_depth_recovery_ratio_500ms"]=_safe_div(sum(max(depth_bid_5-r["bid_depth_5_at_trade"],0.0) for r in sells),sum(r["bid_depth_5_at_trade"] for r in sells))
         o["trade_impact_decay_ratio_200_to_1000ms"]=_safe_div(impact_200,impact_1000)
         o["trade_impact_half_life_proxy"]=float(np.clip(_safe_div(math.log(max(impact_200,EPS)/max(impact_1000,EPS)),math.log(5.0),clip=10.0),-10,10)) if impact_200>EPS and impact_1000>EPS else 0.0
         o["depth_slope_bid_1_to_10"]=_safe_div(depth_bid_10-bid_depth_1,depth_bid_10)
