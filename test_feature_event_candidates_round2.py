@@ -135,11 +135,11 @@ def test_round2_touch_age_and_spread_state_formulas():
     o=p.emit()
     assert np.isclose(o["best_bid_price_age_ms"],300,atol=1e-9)
     assert np.isclose(o["best_ask_price_age_ms"],300,atol=1e-9)
-    assert np.isclose(o["best_bid_size_age_ms"],600,atol=1e-9)
+    assert np.isclose(o["best_bid_size_age_ms"],300,atol=1e-9)
     assert np.isclose(o["touch_price_age_min_ms"],300,atol=1e-9)
     assert np.isclose(o["touch_price_age_max_ms"],300,atol=1e-9)
     assert np.isclose(o["touch_price_age_imbalance_ms"],0.0,atol=1e-9)
-    expected_size_imb=(600-900)/(600+900)
+    expected_size_imb=0.0
     assert np.isclose(o["touch_size_age_imbalance_ms"],expected_size_imb,atol=1e-9)
     assert -1.0 <= o["touch_price_age_imbalance_ms"] <= 1.0
     assert -1.0 <= o["touch_size_age_imbalance_ms"] <= 1.0
@@ -204,6 +204,11 @@ def test_round2_source_guards_new_formulas():
     src=''.join(inspect.getsource(NovelMicrostructureCandidatePack.emit).split())
     for bad in ['min(depth_bid_10,depth_ask_10)','trade_impact_buy_500-trade_impact_sell_500','spread_bps*trade_burst_ratio','*(1.0-_safe_div']:
         assert bad not in src
+    for bad in ['_safe_div(self.spread_tighten.count(500,ts),self.trade_hist.count(500,ts))','_safe_div(self.spread_widen.count(500,ts),self.trade_hist.count(500,ts))']:
+        assert bad not in src
+    full_src=inspect.getsource(NovelMicrostructureCandidatePack)
+    assert "prev_nonzero_micro_sign" in full_src
+    assert "microprice_mid_divergence_persistence_ms" in full_src and "AGE_CLIP_MS" in full_src
 
 def test_round2_spread_after_trade_features_are_zero_without_recent_trades():
     p=NovelMicrostructureCandidatePack()
@@ -229,6 +234,19 @@ def test_round2_trade_mid_at_trade_falls_back_to_trade_price_before_book():
     assert np.isfinite(o["last_buy_mid_impact_bps_since_trade"]) and o["last_buy_mid_impact_bps_since_trade"]!=0.0
     assert np.isfinite(o["last_trade_mid_impact_signed_bps"]) and o["last_trade_mid_impact_signed_bps"]!=0.0
 
+def test_round2_trade_impact_uses_price_fallback_before_first_book():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("trade",100,1,100.0,1.0,1,1,0),("ob",200,2,1,[(100.19,10.0)],[(100.21,10.0)])])
+    o=p.emit()
+    assert np.isclose(o["last_buy_mid_impact_bps_since_trade"],20.0,atol=1e-9)
+    assert np.isclose(o["buy_trade_impact_sum_bps_500ms"],20.0,atol=1e-9)
+    assert np.isfinite(o["impact_per_notional_buy_1000ms"]) and o["impact_per_notional_buy_1000ms"]!=0.0
+    p2=NovelMicrostructureCandidatePack()
+    _feed(p2,[("trade",100,1,100.0,1.0,-1,-1,0),("ob",200,2,1,[(99.79,10.0)],[(99.81,10.0)])])
+    o2=p2.emit()
+    assert np.isclose(o2["last_sell_mid_impact_bps_since_trade"],20.0,atol=1e-9)
+    assert np.isclose(o2["sell_trade_impact_sum_bps_500ms"],20.0,atol=1e-9)
+
 def test_round2_trade_mid_at_trade_falls_back_during_crossed_book():
     p=NovelMicrostructureCandidatePack()
     _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("ob",100,2,1,[(100.03,10)],[(100.01,10)]),("trade",120,3,100.00,1.0,-1,-1,0)])
@@ -246,6 +264,66 @@ def test_round2_incremental_ob_ignores_nonpositive_prices():
     assert p.book_valid is True
     assert o["bid_queue_cliff_ratio_l1_l5"]!=0.0 or o["spread_state_transition_rate_3000ms"]>=0.0
     assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
+
+def test_round2_best_size_age_resets_on_price_replacement_even_same_size():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.00,10)],[(100.02,10)]),("ob",100,2,1,[(100.01,10)],[(100.02,10)])])
+    p.ts=300
+    o=p.emit()
+    assert np.isclose(o["best_bid_price_age_ms"],200.0,atol=1e-9)
+    assert np.isclose(o["best_bid_size_age_ms"],200.0,atol=1e-9)
+    p2=NovelMicrostructureCandidatePack()
+    _feed(p2,[("ob",0,1,1,[(100.00,10)],[(100.02,10)]),("ob",100,2,1,[(100.00,10)],[(100.03,10)])])
+    p2.ts=300
+    o2=p2.emit()
+    assert np.isclose(o2["best_ask_price_age_ms"],200.0,atol=1e-9)
+    assert np.isclose(o2["best_ask_size_age_ms"],200.0,atol=1e-9)
+
+def test_round2_no_trade_no_book_change_resets_on_price_change_with_same_notional():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.00,10)],[(100.02,10)]),("ob",100,2,1,[(99.90,1000.0/99.90)],[(100.02,10)])])
+    p.ts=300
+    o=p.emit()
+    assert np.isclose(o["no_trade_no_book_change_age_ms"],200.0,atol=1e-9)
+
+def test_round2_first_mid_move_after_initial_book_is_counted():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(99.99,10)],[(100.01,10)]),("ob",100,2,1,[(100.09,10)],[(100.11,10)])])
+    o=p.emit()
+    assert np.isclose(o["mid_price_run_length_current"],1.0,atol=1e-9)
+    assert o["mid_price_run_length_max_3000ms"]>=1.0
+    p.on_event(("ob",200,3,1,[(100.19,10)],[(100.21,10)]))
+    o2=p.emit()
+    assert np.isclose(o2["mid_price_run_length_current"],2.0,atol=1e-9)
+
+def test_round2_microprice_lead_uses_previous_nonzero_micro_sign_across_zero():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(99.99,20)],[(100.01,10)]),("ob",100,2,1,[(99.99,10)],[(100.01,10)]),("ob",200,3,1,[(100.09,10)],[(100.11,10)])])
+    o=p.emit()
+    assert np.isclose(o["microprice_leads_mid_cross_count_1000ms"],1.0,atol=1e-9)
+
+def test_round2_microprice_divergence_persistence_is_age_clipped():
+    from feature_event_candidates_round2 import AGE_CLIP_MS
+    p=NovelMicrostructureCandidatePack()
+    p.ts=int(AGE_CLIP_MS*2)
+    p.divergence_start_ts=0
+    o=p.emit()
+    assert o["microprice_mid_divergence_persistence_ms"]==AGE_CLIP_MS
+    p.ts=500
+    p.divergence_start_ts=100
+    o2=p.emit()
+    assert o2["microprice_mid_divergence_persistence_ms"]==400.0
+
+def test_round2_spread_after_trade_zero_when_no_recent_trades():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("ob",100,2,1,[(100.0,10)],[(100.03,10)]),("ob",200,3,1,[(100.0,10)],[(100.01,10)])])
+    o=p.emit()
+    assert o["spread_recompression_after_trade_500ms"]==0.0
+    assert o["spread_widen_after_trade_500ms"]==0.0
+    p2=NovelMicrostructureCandidatePack()
+    _feed(p2,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",50,2,100.01,1.0,1,1,0),("ob",100,3,1,[(100.0,10)],[(100.03,10)])])
+    o2=p2.emit()
+    assert np.isclose(o2["spread_widen_after_trade_500ms"],1.0,atol=1e-9)
 
 def test_round2_mid_path_reversal_neutral_with_insufficient_history():
     p=NovelMicrostructureCandidatePack(); p.on_event(("ob",0,1,1,[(100.0,10)],[(100.02,10)])); o=p.emit()
