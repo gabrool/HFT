@@ -1,6 +1,6 @@
 import inspect, math
 import numpy as np
-from feature_event_candidates_round2 import FAMILY_BY_FEATURE, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack
+from feature_event_candidates_round2 import FAMILY_BY_FEATURE, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack, EWMAValue, RATIO_CLIP
 
 def _feed(p, evs):
     for e in evs:
@@ -155,3 +155,22 @@ def test_rich_nonzero_coverage():
     assert set(o)==set(ROUND2_REQUESTED_FEATURES)
     assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
     assert sum(abs(float(v))>1e-12 for v in o.values())>=80
+
+def test_round2_ewma_value_decay_add_first_update():
+    e=EWMAValue(3000)
+    e.update(100,5.0)
+    assert math.isclose(e.value(100),5.0,rel_tol=1e-12)
+    e.update(3100,1.0)
+    assert e.value(3100)>3.4 and e.value(3100)<3.6
+
+def test_round2_trade_impact_invalid_current_book_neutral():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",100,2,100.01,1,1,1,0),("ob",200,3,1,[(100.03,10)],[(100.01,10)])])
+    o=p.emit()
+    assert o["last_buy_mid_impact_bps_since_trade"]==0.0
+    assert o["buy_trade_impact_sum_bps_500ms"]==0.0
+
+def test_round2_source_guards_new_formulas():
+    src=''.join(inspect.getsource(NovelMicrostructureCandidatePack.emit).split())
+    for bad in ['min(depth_bid_10,depth_ask_10)','trade_impact_buy_500-trade_impact_sell_500','spread_bps*trade_burst_ratio','*(1.0-_safe_div']:
+        assert bad not in src
