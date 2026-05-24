@@ -1,7 +1,7 @@
 import inspect, math
 import numpy as np
 import pandas as pd
-from feature_event_candidates_round2 import FAMILY_BY_FEATURE, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack, EWMAValue, RATIO_CLIP, RollingValueWindow
+from feature_event_candidates_round2 import FAMILY_BY_FEATURE, INVALID_BOOK_NEUTRAL_FEATURES, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack, EWMAValue, RATIO_CLIP, RollingValueWindow
 
 def _feed(p, evs):
     for e in evs:
@@ -69,21 +69,50 @@ def test_round2_crossed_book_emits_finite_neutral_book_features():
     assert p.book_valid is False
     assert set(o)==set(ROUND2_REQUESTED_FEATURES)
     assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
-    neutral_book_features=[
-        "depth_slope_bid_1_to_10","depth_slope_ask_1_to_10","depth_slope_imbalance_1_to_10",
-        "thin_side_depth_gap_ratio","book_shape_asymmetry_convexity","bid_queue_cliff_ratio_l1_l5",
-        "ask_queue_cliff_ratio_l1_l5","near_touch_depth_drop_asymmetry","bid_depth_centroid_bps_10bps",
-        "ask_depth_centroid_bps_10bps","depth_centroid_imbalance_10bps","bid_depth_centroid_bps_25bps",
-        "ask_depth_centroid_bps_25bps","depth_centroid_imbalance_25bps","bid_near_touch_depth_share_10bps",
-        "ask_near_touch_depth_share_10bps","near_touch_depth_share_asymmetry_10bps","far_depth_wall_ratio_10_to_25bps",
-        "spread_one_tick_persistence_ms","spread_wide_state_age_ms",
-        "buy_trade_depth_recovery_ratio_500ms","sell_trade_depth_recovery_ratio_500ms",
-    ]
+    neutral_book_features=list(INVALID_BOOK_NEUTRAL_FEATURES)
     for k in neutral_book_features:
         assert np.isclose(float(o[k]),0.0,atol=1e-12),(k,o[k])
     assert p.last_l1_change_ts == prev_l1
     assert p.one_tick_spread_entry_ts == prev_one
     assert p.wide_spread_entry_ts == prev_wide
+
+def test_round2_crossed_book_neutralizes_stale_stress_composites():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[
+        ("ob",0,1,1,[(100.00,10),(99.99,8),(99.98,5)],[(100.02,10),(100.03,8),(100.04,5)]),
+        ("trade",20,2,100.02,2.0,1,1,0),
+        ("trade",40,3,100.00,2.0,-1,-1,0),
+        ("ob",100,4,1,[(100.03,10)],[(100.01,10)]),
+    ])
+    o=p.emit()
+    assert p.book_valid is False
+    for k in [
+        "thin_book_with_trade_burst_score_500ms","stale_touch_with_trade_burst_score_1000ms",
+        "stale_touch_with_low_depth_score_1000ms","fresh_touch_with_high_depth_score_1000ms",
+        "trade_burst_without_book_replenishment_score_1000ms","depth_centroid_far_with_trade_burst_score_1000ms",
+        "impact_per_notional_high_and_replenishment_low_score_1000ms","touch_price_age_min_ms",
+        "touch_price_age_max_ms","mid_unchanged_and_depth_stable_ms",
+    ]:
+        assert np.isclose(float(o[k]),0.0,atol=1e-12),(k,o[k])
+    assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
+
+def test_round2_crossed_book_neutral_then_recovers_after_valid_book():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[
+        ("ob",0,1,1,[(100.00,10),(99.99,8),(99.98,5),(99.97,4),(99.96,3)],[(100.02,10),(100.03,8),(100.04,5),(100.05,4),(100.06,3)]),
+        ("trade",20,2,100.02,2.0,1,1,0),
+        ("ob",100,3,1,[(100.03,10)],[(100.01,10)]),
+    ])
+    invalid=p.emit()
+    assert p.book_valid is False
+    assert invalid["thin_book_with_trade_burst_score_500ms"]==0.0
+    assert invalid["touch_price_age_min_ms"]==0.0
+    p.on_event(("ob",200,4,1,[(99.99,10),(99.98,8),(99.97,5),(99.96,4),(99.95,3)],[(100.01,10),(100.02,8),(100.03,5),(100.04,4),(100.05,3)]))
+    valid=p.emit()
+    assert p.book_valid is True
+    assert set(valid)==set(ROUND2_REQUESTED_FEATURES)
+    assert np.isfinite(np.asarray(list(valid.values()),dtype=float)).all()
+    assert sum(abs(float(v))>1e-12 for v in valid.values()) > sum(abs(float(v))>1e-12 for v in invalid.values())
 
 
 
