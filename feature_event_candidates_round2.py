@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import re
 from collections import deque
 import numpy as np
 
@@ -18,6 +19,147 @@ def _safe_div(num, den, eps=EPS, clip=RATIO_CLIP):
 
 ROUND2_REQUESTED_FEATURES = [
 "trade_size_hhi_3000ms","trade_size_hhi_1000ms","largest_trade_share_notional_3000ms","largest_trade_share_notional_1000ms","trade_size_p90_over_median_3000ms","trade_size_max_over_ewma_3000ms","obi_realized_vol_500ms","obi_realized_vol_1000ms","microprice_realized_vol_500ms","microprice_realized_vol_1000ms","obi_zero_cross_rate_1000ms","max_event_gap_1000ms","min_event_gap_1000ms","ob_interarrival_cv_500ms","trade_interarrival_cv_500ms","event_interarrival_cv_500ms","event_interarrival_cv_1000ms","event_burstiness_ewma_fast_slow","trade_burstiness_ewma_fast_slow","ob_burstiness_ewma_fast_slow","trade_sign_entropy_1000ms","trade_sign_entropy_3000ms","trade_sign_flip_rate_1000ms","trade_sign_flip_rate_3000ms","same_side_replenishment_after_depletion_200ms","opposite_side_replenishment_after_depletion_200ms","buy_trade_depth_recovery_ratio_500ms","sell_trade_depth_recovery_ratio_500ms","trade_impact_decay_ratio_200_to_1000ms","trade_impact_half_life_proxy","depth_slope_bid_1_to_10","depth_slope_ask_1_to_10","depth_slope_imbalance_1_to_10","thin_side_depth_gap_ratio","book_shape_asymmetry_convexity","bid_queue_cliff_ratio_l1_l5","ask_queue_cliff_ratio_l1_l5","near_touch_depth_drop_asymmetry","no_trade_no_book_change_age_ms","mid_unchanged_and_depth_stable_ms","best_bid_price_age_ms","best_ask_price_age_ms","best_bid_size_age_ms","best_ask_size_age_ms","touch_price_age_min_ms","touch_price_age_max_ms","touch_price_age_imbalance_ms","touch_size_age_imbalance_ms","best_bid_replacement_count_1000ms","best_ask_replacement_count_1000ms","touch_replacement_imbalance_1000ms","touch_replacement_rate_3000ms","quote_lifetime_cv_3000ms","bid_l1_size_flip_rate_500ms","ask_l1_size_flip_rate_500ms","bid_l1_size_flip_rate_1000ms","ask_l1_size_flip_rate_1000ms","l1_size_flip_imbalance_1000ms","bid_l1_add_cancel_alternation_rate_1000ms","ask_l1_add_cancel_alternation_rate_1000ms","touch_flicker_score_1000ms","touch_flicker_score_3000ms","post_buy_ask_cancel_over_trade_200ms","post_sell_bid_cancel_over_trade_200ms","post_buy_ask_net_replenishment_over_trade_200ms","post_sell_bid_net_replenishment_over_trade_200ms","post_buy_bid_add_over_trade_200ms","post_sell_ask_add_over_trade_200ms","post_buy_opposite_side_support_ratio_500ms","post_sell_opposite_side_support_ratio_500ms","trade_side_quote_response_asymmetry_500ms","last_buy_mid_impact_bps_since_trade","last_sell_mid_impact_bps_since_trade","last_trade_mid_impact_signed_bps","buy_trade_impact_sum_bps_500ms","sell_trade_impact_sum_bps_500ms","trade_impact_asymmetry_bps_500ms","buy_trade_impact_decay_200_to_1000ms","sell_trade_impact_decay_200_to_1000ms","impact_per_notional_buy_1000ms","impact_per_notional_sell_1000ms","buy_trade_size_hhi_1000ms","sell_trade_size_hhi_1000ms","buy_trade_size_hhi_3000ms","sell_trade_size_hhi_3000ms","buy_largest_trade_share_3000ms","sell_largest_trade_share_3000ms","buy_trade_p90_over_median_3000ms","sell_trade_p90_over_median_3000ms","trade_size_concentration_asymmetry_3000ms","large_trade_side_dominance_3000ms","bid_depth_centroid_bps_10bps","ask_depth_centroid_bps_10bps","depth_centroid_imbalance_10bps","bid_depth_centroid_bps_25bps","ask_depth_centroid_bps_25bps","depth_centroid_imbalance_25bps","bid_near_touch_depth_share_10bps","ask_near_touch_depth_share_10bps","near_touch_depth_share_asymmetry_10bps","far_depth_wall_ratio_10_to_25bps","spread_widen_event_count_1000ms","spread_tighten_event_count_1000ms","spread_widen_to_tighten_ratio_1000ms","spread_state_transition_rate_3000ms","spread_one_tick_persistence_ms","spread_wide_state_age_ms","spread_recompression_after_trade_500ms","spread_widen_after_trade_500ms","mid_price_direction_flip_rate_1000ms","mid_price_run_length_current","mid_price_run_length_max_3000ms","mid_price_path_efficiency_1000ms","mid_price_path_efficiency_3000ms","mid_price_reversal_ratio_1000ms","mid_price_reversal_ratio_3000ms","microprice_leads_mid_cross_count_1000ms","microprice_mid_divergence_persistence_ms","event_interarrival_p90_over_p10_1000ms","trade_interarrival_p90_over_p10_1000ms","ob_interarrival_p90_over_p10_1000ms","event_interarrival_entropy_3000ms","trade_arrival_clumpiness_3000ms","ob_arrival_clumpiness_3000ms","max_trade_silence_gap_3000ms","max_ob_silence_gap_3000ms","thin_book_with_trade_burst_score_500ms","thin_book_with_quote_flicker_score_1000ms","wide_spread_with_trade_burst_score_1000ms","stale_touch_with_trade_burst_score_1000ms","stale_touch_with_low_depth_score_1000ms","fresh_touch_with_high_depth_score_1000ms","quote_pull_before_trade_burst_score_1000ms","trade_burst_without_book_replenishment_score_1000ms","depth_centroid_far_with_trade_burst_score_1000ms","impact_per_notional_high_and_replenishment_low_score_1000ms"]
+
+FAMILY_BY_FEATURE = {
+    "trade_size_hhi_3000ms": "trade_concentration",
+    "trade_size_hhi_1000ms": "trade_concentration",
+    "largest_trade_share_notional_3000ms": "trade_concentration",
+    "largest_trade_share_notional_1000ms": "trade_concentration",
+    "trade_size_p90_over_median_3000ms": "trade_concentration",
+    "trade_size_max_over_ewma_3000ms": "event_irregularity",
+    "obi_realized_vol_500ms": "realized_vol",
+    "obi_realized_vol_1000ms": "realized_vol",
+    "microprice_realized_vol_500ms": "realized_vol",
+    "microprice_realized_vol_1000ms": "realized_vol",
+    "obi_zero_cross_rate_1000ms": "realized_vol",
+    "max_event_gap_1000ms": "event_timing",
+    "min_event_gap_1000ms": "event_timing",
+    "ob_interarrival_cv_500ms": "event_timing",
+    "trade_interarrival_cv_500ms": "event_timing",
+    "event_interarrival_cv_500ms": "event_timing",
+    "event_interarrival_cv_1000ms": "event_timing",
+    "event_burstiness_ewma_fast_slow": "event_timing",
+    "trade_burstiness_ewma_fast_slow": "event_timing",
+    "ob_burstiness_ewma_fast_slow": "event_timing",
+    "trade_sign_entropy_1000ms": "trade_sign",
+    "trade_sign_entropy_3000ms": "trade_sign",
+    "trade_sign_flip_rate_1000ms": "trade_sign",
+    "trade_sign_flip_rate_3000ms": "trade_sign",
+    "same_side_replenishment_after_depletion_200ms": "book_resilience",
+    "opposite_side_replenishment_after_depletion_200ms": "book_resilience",
+    "buy_trade_depth_recovery_ratio_500ms": "book_resilience",
+    "sell_trade_depth_recovery_ratio_500ms": "book_resilience",
+    "trade_impact_decay_ratio_200_to_1000ms": "trade_impact",
+    "trade_impact_half_life_proxy": "trade_impact",
+    "depth_slope_bid_1_to_10": "book_shape",
+    "depth_slope_ask_1_to_10": "book_shape",
+    "depth_slope_imbalance_1_to_10": "book_shape",
+    "thin_side_depth_gap_ratio": "book_shape",
+    "book_shape_asymmetry_convexity": "book_shape",
+    "bid_queue_cliff_ratio_l1_l5": "book_shape",
+    "ask_queue_cliff_ratio_l1_l5": "book_shape",
+    "near_touch_depth_drop_asymmetry": "book_shape",
+    "no_trade_no_book_change_age_ms": "touch_age",
+    "mid_unchanged_and_depth_stable_ms": "touch_age",
+    "best_bid_price_age_ms": "touch_age",
+    "best_ask_price_age_ms": "touch_age",
+    "best_bid_size_age_ms": "touch_age",
+    "best_ask_size_age_ms": "touch_age",
+    "touch_price_age_min_ms": "touch_age",
+    "touch_price_age_max_ms": "touch_age",
+    "touch_price_age_imbalance_ms": "touch_age",
+    "touch_size_age_imbalance_ms": "touch_age",
+    "best_bid_replacement_count_1000ms": "quote_lifetime",
+    "best_ask_replacement_count_1000ms": "quote_lifetime",
+    "touch_replacement_imbalance_1000ms": "quote_lifetime",
+    "touch_replacement_rate_3000ms": "quote_lifetime",
+    "quote_lifetime_cv_3000ms": "quote_lifetime",
+    "bid_l1_size_flip_rate_500ms": "l1_flicker",
+    "ask_l1_size_flip_rate_500ms": "l1_flicker",
+    "bid_l1_size_flip_rate_1000ms": "l1_flicker",
+    "ask_l1_size_flip_rate_1000ms": "l1_flicker",
+    "l1_size_flip_imbalance_1000ms": "event_irregularity",
+    "bid_l1_add_cancel_alternation_rate_1000ms": "l1_flicker",
+    "ask_l1_add_cancel_alternation_rate_1000ms": "l1_flicker",
+    "touch_flicker_score_1000ms": "l1_flicker",
+    "touch_flicker_score_3000ms": "l1_flicker",
+    "post_buy_ask_cancel_over_trade_200ms": "quote_response",
+    "post_sell_bid_cancel_over_trade_200ms": "quote_response",
+    "post_buy_ask_net_replenishment_over_trade_200ms": "book_resilience",
+    "post_sell_bid_net_replenishment_over_trade_200ms": "book_resilience",
+    "post_buy_bid_add_over_trade_200ms": "quote_response",
+    "post_sell_ask_add_over_trade_200ms": "quote_response",
+    "post_buy_opposite_side_support_ratio_500ms": "quote_response",
+    "post_sell_opposite_side_support_ratio_500ms": "quote_response",
+    "trade_side_quote_response_asymmetry_500ms": "quote_response",
+    "last_buy_mid_impact_bps_since_trade": "event_irregularity",
+    "last_sell_mid_impact_bps_since_trade": "event_irregularity",
+    "last_trade_mid_impact_signed_bps": "event_irregularity",
+    "buy_trade_impact_sum_bps_500ms": "trade_impact",
+    "sell_trade_impact_sum_bps_500ms": "trade_impact",
+    "trade_impact_asymmetry_bps_500ms": "trade_impact",
+    "buy_trade_impact_decay_200_to_1000ms": "trade_impact",
+    "sell_trade_impact_decay_200_to_1000ms": "trade_impact",
+    "impact_per_notional_buy_1000ms": "trade_impact",
+    "impact_per_notional_sell_1000ms": "trade_impact",
+    "buy_trade_size_hhi_1000ms": "trade_concentration",
+    "sell_trade_size_hhi_1000ms": "trade_concentration",
+    "buy_trade_size_hhi_3000ms": "trade_concentration",
+    "sell_trade_size_hhi_3000ms": "trade_concentration",
+    "buy_largest_trade_share_3000ms": "trade_concentration",
+    "sell_largest_trade_share_3000ms": "trade_concentration",
+    "buy_trade_p90_over_median_3000ms": "trade_concentration",
+    "sell_trade_p90_over_median_3000ms": "trade_concentration",
+    "trade_size_concentration_asymmetry_3000ms": "trade_concentration",
+    "large_trade_side_dominance_3000ms": "trade_concentration",
+    "bid_depth_centroid_bps_10bps": "depth_centroid",
+    "ask_depth_centroid_bps_10bps": "depth_centroid",
+    "depth_centroid_imbalance_10bps": "depth_centroid",
+    "bid_depth_centroid_bps_25bps": "depth_centroid",
+    "ask_depth_centroid_bps_25bps": "depth_centroid",
+    "depth_centroid_imbalance_25bps": "depth_centroid",
+    "bid_near_touch_depth_share_10bps": "event_irregularity",
+    "ask_near_touch_depth_share_10bps": "event_irregularity",
+    "near_touch_depth_share_asymmetry_10bps": "event_irregularity",
+    "far_depth_wall_ratio_10_to_25bps": "event_irregularity",
+    "spread_widen_event_count_1000ms": "spread_regime",
+    "spread_tighten_event_count_1000ms": "spread_regime",
+    "spread_widen_to_tighten_ratio_1000ms": "spread_regime",
+    "spread_state_transition_rate_3000ms": "spread_regime",
+    "spread_one_tick_persistence_ms": "spread_regime",
+    "spread_wide_state_age_ms": "spread_regime",
+    "spread_recompression_after_trade_500ms": "spread_regime",
+    "spread_widen_after_trade_500ms": "spread_regime",
+    "mid_price_direction_flip_rate_1000ms": "mid_path",
+    "mid_price_run_length_current": "mid_path",
+    "mid_price_run_length_max_3000ms": "mid_path",
+    "mid_price_path_efficiency_1000ms": "mid_path",
+    "mid_price_path_efficiency_3000ms": "mid_path",
+    "mid_price_reversal_ratio_1000ms": "mid_path",
+    "mid_price_reversal_ratio_3000ms": "mid_path",
+    "microprice_leads_mid_cross_count_1000ms": "mid_path",
+    "microprice_mid_divergence_persistence_ms": "mid_path",
+    "event_interarrival_p90_over_p10_1000ms": "event_timing",
+    "trade_interarrival_p90_over_p10_1000ms": "event_timing",
+    "ob_interarrival_p90_over_p10_1000ms": "event_timing",
+    "event_interarrival_entropy_3000ms": "event_timing",
+    "trade_arrival_clumpiness_3000ms": "event_timing",
+    "ob_arrival_clumpiness_3000ms": "event_timing",
+    "max_trade_silence_gap_3000ms": "event_timing",
+    "max_ob_silence_gap_3000ms": "event_timing",
+    "thin_book_with_trade_burst_score_500ms": "stress_regime",
+    "thin_book_with_quote_flicker_score_1000ms": "stress_regime",
+    "wide_spread_with_trade_burst_score_1000ms": "spread_regime",
+    "stale_touch_with_trade_burst_score_1000ms": "stress_regime",
+    "stale_touch_with_low_depth_score_1000ms": "stress_regime",
+    "fresh_touch_with_high_depth_score_1000ms": "stress_regime",
+    "quote_pull_before_trade_burst_score_1000ms": "stress_regime",
+    "trade_burst_without_book_replenishment_score_1000ms": "book_resilience",
+    "depth_centroid_far_with_trade_burst_score_1000ms": "depth_centroid",
+    "impact_per_notional_high_and_replenishment_low_score_1000ms": "trade_impact",
+}
+
+assert set(FAMILY_BY_FEATURE) == set(ROUND2_REQUESTED_FEATURES)
 
 class RollingValueWindow:
     def __init__(self, max_window_ms=MAX_KEEP_MS): self.max_window_ms=max_window_ms; self.d=deque()
@@ -77,8 +219,47 @@ class NovelMicrostructureCandidatePack:
     def __init__(self): self.reset()
     def feature_names(self): return ROUND2_REQUESTED_FEATURES.copy()
     def metadata(self):
-        fam={"trade_size_hhi_1000ms":"trade_concentration","obi_realized_vol_1000ms":"realized_vol","event_interarrival_cv_1000ms":"event_timing","trade_sign_entropy_1000ms":"trade_sign","same_side_replenishment_after_depletion_200ms":"book_resilience","depth_slope_bid_1_to_10":"book_shape","best_bid_price_age_ms":"touch_age","quote_lifetime_cv_3000ms":"quote_lifetime","touch_flicker_score_1000ms":"l1_flicker","post_buy_ask_cancel_over_trade_200ms":"quote_response","last_buy_mid_impact_bps_since_trade":"trade_impact","bid_depth_centroid_bps_10bps":"depth_centroid","spread_widen_event_count_1000ms":"spread_regime","mid_price_path_efficiency_1000ms":"mid_path","event_interarrival_entropy_3000ms":"event_irregularity","thin_book_with_trade_burst_score_500ms":"stress_regime"}
-        return {n:{"candidate_family":fam.get(n,"event_timing"),"candidate_kind":"event_derived","candidate_horizon_ms": next((w for w in (200,500,1000,3000) if f'_{w}ms' in n),None),"uses_book_state":True,"uses_trade_state":True,"expected_target":"all"} for n in ROUND2_REQUESTED_FEATURES}
+        expected_target_by_family = {
+            "trade_concentration": "magnitude",
+            "realized_vol": "magnitude",
+            "event_timing": "timing",
+            "trade_sign": "direction",
+            "book_resilience": "magnitude",
+            "book_shape": "magnitude",
+            "touch_age": "timing",
+            "quote_lifetime": "timing",
+            "l1_flicker": "timing",
+            "quote_response": "direction",
+            "trade_impact": "direction",
+            "depth_centroid": "magnitude",
+            "spread_regime": "classification",
+            "mid_path": "direction",
+            "event_irregularity": "timing",
+            "stress_regime": "classification",
+        }
+
+        def _candidate_horizon_ms(feature_name):
+            match = re.search(r"_(200|500|1000|3000)ms$", feature_name)
+            return int(match.group(1)) if match else None
+
+        out = {}
+        for feature_name in ROUND2_REQUESTED_FEATURES:
+            if feature_name not in FAMILY_BY_FEATURE:
+                raise KeyError(f"Unknown feature family for {feature_name}")
+            family = FAMILY_BY_FEATURE[feature_name]
+            if family not in expected_target_by_family:
+                raise KeyError(f"Unknown expected target family mapping for {family}")
+            uses_trade_state = family in {"trade_concentration", "trade_sign", "trade_impact", "quote_response", "stress_regime", "event_timing", "mid_path", "realized_vol", "event_irregularity"}
+            uses_book_state = family in {"book_resilience", "book_shape", "touch_age", "quote_lifetime", "l1_flicker", "quote_response", "depth_centroid", "spread_regime", "stress_regime", "mid_path", "realized_vol", "event_timing", "event_irregularity", "trade_impact"}
+            out[feature_name] = {
+                "candidate_family": family,
+                "candidate_kind": "event_derived",
+                "candidate_horizon_ms": _candidate_horizon_ms(feature_name),
+                "uses_book_state": uses_book_state,
+                "uses_trade_state": uses_trade_state,
+                "expected_target": expected_target_by_family[family],
+            }
+        return out
     def reset(self):
         self.ts=0; self.bids={}; self.asks={}; self.have_valid_book=False
         self.event_i=RollingInterarrival(); self.ob_i=RollingInterarrival(); self.trade_i=RollingInterarrival(); self.event_fast=EWMARate(200); self.event_slow=EWMARate(1000); self.ob_fast=EWMARate(200); self.ob_slow=EWMARate(1000); self.trade_fast=EWMARate(200); self.trade_slow=EWMARate(1000)
