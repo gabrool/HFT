@@ -1,5 +1,6 @@
 import inspect, math
 import numpy as np
+import pandas as pd
 from feature_event_candidates_round2 import FAMILY_BY_FEATURE, ROUND2_REQUESTED_FEATURES, NovelMicrostructureCandidatePack, EWMAValue, RATIO_CLIP, RollingValueWindow
 
 def _feed(p, evs):
@@ -174,6 +175,106 @@ def test_round2_source_guards_new_formulas():
     src=''.join(inspect.getsource(NovelMicrostructureCandidatePack.emit).split())
     for bad in ['min(depth_bid_10,depth_ask_10)','trade_impact_buy_500-trade_impact_sell_500','spread_bps*trade_burst_ratio','*(1.0-_safe_div']:
         assert bad not in src
+
+def test_round2_spread_after_trade_features_are_zero_without_recent_trades():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("ob",100,2,1,[(100.0,10)],[(100.03,10)]),("ob",200,3,1,[(100.0,10)],[(100.01,10)])])
+    o=p.emit()
+    assert o["spread_widen_event_count_1000ms"]>0 or o["spread_tighten_event_count_1000ms"]>0
+    assert o["spread_recompression_after_trade_500ms"]==0.0
+    assert o["spread_widen_after_trade_500ms"]==0.0
+    assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
+    p2=NovelMicrostructureCandidatePack()
+    _feed(p2,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("trade",100,2,100.01,1,1,1,0),("ob",200,3,1,[(100.0,10)],[(100.03,10)]),("ob",300,4,1,[(100.0,10)],[(100.01,10)])])
+    o2=p2.emit()
+    assert np.isfinite(o2["spread_recompression_after_trade_500ms"]) and abs(o2["spread_recompression_after_trade_500ms"])<100
+    assert np.isfinite(o2["spread_widen_after_trade_500ms"]) and abs(o2["spread_widen_after_trade_500ms"])<100
+
+def test_round2_trade_mid_at_trade_falls_back_to_trade_price_before_book():
+    p=NovelMicrostructureCandidatePack()
+    p.on_event(("trade",100,1,100.25,2.0,1,1,0))
+    assert p.last_buy_trade is not None
+    assert p.last_buy_trade["mid_at_trade"]==100.25
+    p.on_event(("ob",200,2,1,[(100.30,10)],[(100.40,10)]))
+    o=p.emit()
+    assert np.isfinite(o["last_buy_mid_impact_bps_since_trade"]) and o["last_buy_mid_impact_bps_since_trade"]!=0.0
+    assert np.isfinite(o["last_trade_mid_impact_signed_bps"]) and o["last_trade_mid_impact_signed_bps"]!=0.0
+
+def test_round2_trade_mid_at_trade_falls_back_during_crossed_book():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("ob",100,2,1,[(100.03,10)],[(100.01,10)]),("trade",120,3,100.00,1.0,-1,-1,0)])
+    assert p.last_sell_trade is not None
+    assert p.last_sell_trade["mid_at_trade"]==100.00
+    p.on_event(("ob",200,4,1,[(99.98,10)],[(100.00,10)]))
+    o=p.emit()
+    assert np.isfinite(o["last_sell_mid_impact_bps_since_trade"]) and o["last_sell_mid_impact_bps_since_trade"]!=0.0
+
+def test_round2_incremental_ob_ignores_nonpositive_prices():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.00,10)],[(100.02,10)]),("ob",100,2,2,[(-1.0,5.0)],[(0.0,5.0)])])
+    o=p.emit()
+    assert 0.0 not in p.asks and -1.0 not in p.bids
+    assert p.book_valid is True
+    assert o["bid_queue_cliff_ratio_l1_l5"]!=0.0 or o["spread_state_transition_rate_3000ms"]>=0.0
+    assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
+
+def test_round2_mid_path_reversal_neutral_with_insufficient_history():
+    p=NovelMicrostructureCandidatePack(); p.on_event(("ob",0,1,1,[(100.0,10)],[(100.02,10)])); o=p.emit()
+    assert o["mid_price_path_efficiency_1000ms"]==0.0 and o["mid_price_path_efficiency_3000ms"]==0.0
+    assert o["mid_price_reversal_ratio_1000ms"]==0.0 and o["mid_price_reversal_ratio_3000ms"]==0.0
+    p2=NovelMicrostructureCandidatePack()
+    _feed(p2,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("ob",100,2,1,[(100.01,10)],[(100.03,10)]),("ob",200,3,1,[(99.99,10)],[(100.01,10)]),("ob",300,4,1,[(100.00,10)],[(100.02,10)])])
+    o2=p2.emit()
+    assert 0.0<=o2["mid_price_path_efficiency_1000ms"]<=1e9
+    assert np.isfinite(o2["mid_price_reversal_ratio_1000ms"])
+    assert abs(o2["mid_price_reversal_ratio_1000ms"]-(1.0-o2["mid_price_path_efficiency_1000ms"]))<1e-9
+
+def test_round2_metadata_usage_flags_are_feature_specific():
+    m=NovelMicrostructureCandidatePack().metadata()
+    assert set(m)==set(ROUND2_REQUESTED_FEATURES)
+    assert m["obi_realized_vol_500ms"]["uses_book_state"] is True and m["obi_realized_vol_500ms"]["uses_trade_state"] is False
+    assert m["trade_size_hhi_1000ms"]["uses_book_state"] is False and m["trade_size_hhi_1000ms"]["uses_trade_state"] is True
+    assert m["ob_interarrival_cv_500ms"]["uses_book_state"] is True and m["ob_interarrival_cv_500ms"]["uses_trade_state"] is False
+    assert m["trade_interarrival_cv_500ms"]["uses_book_state"] is False and m["trade_interarrival_cv_500ms"]["uses_trade_state"] is True
+    assert m["event_interarrival_cv_1000ms"]["uses_book_state"] is True and m["event_interarrival_cv_1000ms"]["uses_trade_state"] is True
+    assert m["last_buy_mid_impact_bps_since_trade"]["uses_book_state"] is True and m["last_buy_mid_impact_bps_since_trade"]["uses_trade_state"] is True
+    assert m["bid_depth_centroid_bps_10bps"]["uses_book_state"] is True and m["bid_depth_centroid_bps_10bps"]["uses_trade_state"] is False
+    for v in m.values():
+        for k in ["candidate_family","candidate_kind","candidate_horizon_ms","uses_book_state","uses_trade_state","expected_target"]:
+            assert k in v
+
+def test_round2_batch_writer_two_candidates(tmp_path):
+    from feature_lab import evaluate_candidate_batch
+    n=200; rng=np.random.default_rng(0)
+    X=rng.normal(size=(n,3)).astype(np.float32); y=rng.normal(size=(n,3)).astype(np.float32); week=["w"]*n
+    cand_move=np.linspace(-1,1,n); cand_mag=np.abs(np.linspace(-1,1,n)); cand_constant=np.zeros(n)
+    candidates={"cand_move":cand_move,"cand_mag":cand_mag,"cand_constant":cand_constant}
+    md={k:{"candidate_family":"test","candidate_kind":"event_derived","candidate_horizon_ms":1000,"uses_book_state":True,"uses_trade_state":True,"expected_target":"move"} for k in candidates}
+    evaluate_candidate_batch(candidates,X,y,["f1","f2","f3"],week,low_abs_trim_fraction=0.02,high_abs_trim_fraction=0.02,out_dir=tmp_path,candidate_metadata=md)
+    out=tmp_path/"feature_lab_batch_relative_report.csv"
+    assert out.exists()
+    df=pd.read_csv(out)
+    assert "cand_constant" in set(df["candidate"])
+    row=df[df["candidate"]=="cand_constant"].iloc[0]
+    assert row["decision"]=="reject"
+    assert ("evaluation_error" in str(row.get("reason",""))) or ("constant" in str(row.get("reason","")).lower()) or ("variance" in str(row.get("reason","")).lower())
+    assert "cand_move" in set(df["candidate"]) and "cand_mag" in set(df["candidate"])
+
+def test_round2_emit_output_finite_after_bad_inputs():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("ob",50,2,2,[(-1.0,5.0)],[(0.0,5.0)]),("ob",100,3,1,[(100.03,10)],[(100.01,10)]),("trade",150,4,100.01,1.0,0,0,0),("trade",200,5,100.02,1.0,1,1,0),("ob",250,6,1,[(100.01,10)],[(100.03,10)])])
+    o=p.emit()
+    assert set(o)==set(ROUND2_REQUESTED_FEATURES)
+    assert np.isfinite(np.asarray(list(o.values()),dtype=float)).all()
+    assert p.book_valid is True
+
+def test_round2_crossed_book_state_recovers_after_valid_update():
+    p=NovelMicrostructureCandidatePack()
+    _feed(p,[("ob",0,1,1,[(100.0,10)],[(100.02,10)]),("ob",100,2,1,[(100.03,10)],[(100.01,10)])]); o1=p.emit()
+    assert p.book_valid is False and o1["bid_queue_cliff_ratio_l1_l5"]==0.0
+    p.on_event(("ob",200,3,1,[(100.0,11)],[(100.02,9)])); o2=p.emit()
+    assert p.book_valid is True
+    assert np.isfinite(o2["bid_queue_cliff_ratio_l1_l5"])
 
 
 def test_round2_zero_cross_rate_carries_exact_zeros():

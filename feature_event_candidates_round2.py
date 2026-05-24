@@ -297,6 +297,11 @@ class NovelMicrostructureCandidatePack:
             match = re.search(r"_(200|500|1000|3000)ms$", feature_name)
             return int(match.group(1)) if match else None
 
+        trade_only_features = {
+            "trade_size_hhi_3000ms","trade_size_hhi_1000ms","largest_trade_share_notional_3000ms","largest_trade_share_notional_1000ms","trade_size_p90_over_median_3000ms","trade_size_max_over_ewma_3000ms","trade_sign_entropy_1000ms","trade_sign_entropy_3000ms","trade_sign_flip_rate_1000ms","trade_sign_flip_rate_3000ms","buy_trade_size_hhi_1000ms","sell_trade_size_hhi_1000ms","buy_trade_size_hhi_3000ms","sell_trade_size_hhi_3000ms","buy_largest_trade_share_3000ms","sell_largest_trade_share_3000ms","buy_trade_p90_over_median_3000ms","sell_trade_p90_over_median_3000ms","trade_size_concentration_asymmetry_3000ms","large_trade_side_dominance_3000ms","trade_interarrival_cv_500ms","trade_burstiness_ewma_fast_slow","trade_interarrival_p90_over_p10_1000ms","trade_arrival_clumpiness_3000ms","max_trade_silence_gap_3000ms"
+        }
+        event_wide_timing_features = {"max_event_gap_1000ms","min_event_gap_1000ms","event_interarrival_cv_500ms","event_interarrival_cv_1000ms","event_burstiness_ewma_fast_slow","event_interarrival_p90_over_p10_1000ms","event_interarrival_entropy_3000ms"}
+        both_features = {"same_side_replenishment_after_depletion_200ms","opposite_side_replenishment_after_depletion_200ms","buy_trade_depth_recovery_ratio_500ms","sell_trade_depth_recovery_ratio_500ms","trade_impact_decay_ratio_200_to_1000ms","trade_impact_half_life_proxy","no_trade_no_book_change_age_ms","post_buy_ask_cancel_over_trade_200ms","post_sell_bid_cancel_over_trade_200ms","post_buy_ask_net_replenishment_over_trade_200ms","post_sell_bid_net_replenishment_over_trade_200ms","post_buy_bid_add_over_trade_200ms","post_sell_ask_add_over_trade_200ms","post_buy_opposite_side_support_ratio_500ms","post_sell_opposite_side_support_ratio_500ms","trade_side_quote_response_asymmetry_500ms","last_buy_mid_impact_bps_since_trade","last_sell_mid_impact_bps_since_trade","last_trade_mid_impact_signed_bps","buy_trade_impact_sum_bps_500ms","sell_trade_impact_sum_bps_500ms","trade_impact_asymmetry_bps_500ms","buy_trade_impact_decay_200_to_1000ms","sell_trade_impact_decay_200_to_1000ms","impact_per_notional_buy_1000ms","impact_per_notional_sell_1000ms","spread_recompression_after_trade_500ms","spread_widen_after_trade_500ms","thin_book_with_trade_burst_score_500ms","thin_book_with_quote_flicker_score_1000ms","wide_spread_with_trade_burst_score_1000ms","stale_touch_with_trade_burst_score_1000ms","stale_touch_with_low_depth_score_1000ms","fresh_touch_with_high_depth_score_1000ms","quote_pull_before_trade_burst_score_1000ms","trade_burst_without_book_replenishment_score_1000ms","depth_centroid_far_with_trade_burst_score_1000ms","impact_per_notional_high_and_replenishment_low_score_1000ms"}
         out = {}
         for feature_name in ROUND2_REQUESTED_FEATURES:
             if feature_name not in FAMILY_BY_FEATURE:
@@ -304,8 +309,12 @@ class NovelMicrostructureCandidatePack:
             family = FAMILY_BY_FEATURE[feature_name]
             if family not in expected_target_by_family:
                 raise KeyError(f"Unknown expected target family mapping for {family}")
-            uses_trade_state = family in {"trade_concentration", "trade_sign", "trade_impact", "quote_response", "stress_regime", "event_timing", "mid_path", "realized_vol", "event_irregularity"}
-            uses_book_state = family in {"book_resilience", "book_shape", "touch_age", "quote_lifetime", "l1_flicker", "quote_response", "depth_centroid", "spread_regime", "stress_regime", "mid_path", "realized_vol", "event_timing", "event_irregularity", "trade_impact"}
+            if feature_name in trade_only_features:
+                uses_book_state = False; uses_trade_state = True
+            elif feature_name in event_wide_timing_features or feature_name in both_features:
+                uses_book_state = True; uses_trade_state = True
+            else:
+                uses_book_state = True; uses_trade_state = False
             out[feature_name] = {
                 "candidate_family": family,
                 "candidate_kind": "event_derived",
@@ -415,8 +424,10 @@ class NovelMicrostructureCandidatePack:
             n=float(p)*float(s); self.trade_hist.add(ts,n); self.trade_size_ewma_3000.update(ts,n); self.trade_i.on_event(ts); self.trade_fast.update(ts,1); self.trade_slow.update(ts,1); self.last_trade_ts=ts
             if sg>0: self.buy_hist.add(ts,n)
             elif sg<0: self.sell_hist.add(ts,n)
-            rec={"ts":ts,"price":float(p),"size":float(s),"notional":n,"side":int(sg),"mid_at_trade":self._mid() if self._valid_book() else 0.0,"bid_depth_5_at_trade":self._depth('bid',5) if self._valid_book() else 0.0,"ask_depth_5_at_trade":self._depth('ask',5) if self._valid_book() else 0.0}
-            if sg!=0 and rec["mid_at_trade"]>0:
+            valid_mid=self._mid() if self._valid_book() else 0.0
+            mid_at_trade=valid_mid if valid_mid>0.0 else float(p)
+            rec={"ts":ts,"price":float(p),"size":float(s),"notional":n,"side":int(sg),"mid_at_trade":mid_at_trade,"bid_depth_5_at_trade":self._depth('bid',5) if self._valid_book() else 0.0,"ask_depth_5_at_trade":self._depth('ask',5) if self._valid_book() else 0.0}
+            if sg!=0:
                 self.trade_records.append(rec)
                 if sg>0: self.last_buy_trade=rec
                 elif sg<0: self.last_sell_trade=rec
@@ -429,8 +440,16 @@ class NovelMicrostructureCandidatePack:
             _,_,_,tp,bids,asks=ev
             if int(tp)==1: self.bids={float(p):float(sz) for p,sz in bids if float(p)>0 and float(sz)>0}; self.asks={float(p):float(sz) for p,sz in asks if float(p)>0 and float(sz)>0}
             else:
-                for p,sz in bids: p=float(p); sz=float(sz); self.bids.pop(p,None) if sz<=0 else self.bids.__setitem__(p,sz)
-                for p,sz in asks: p=float(p); sz=float(sz); self.asks.pop(p,None) if sz<=0 else self.asks.__setitem__(p,sz)
+                for p,sz in bids:
+                    try: p=float(p); sz=float(sz)
+                    except (TypeError, ValueError): continue
+                    if p<=0.0: self.bids.pop(p,None); continue
+                    self.bids.pop(p,None) if sz<=0 else self.bids.__setitem__(p,sz)
+                for p,sz in asks:
+                    try: p=float(p); sz=float(sz)
+                    except (TypeError, ValueError): continue
+                    if p<=0.0: self.asks.pop(p,None); continue
+                    self.asks.pop(p,None) if sz<=0 else self.asks.__setitem__(p,sz)
             if not self._update_book_validity(ts):
                 return
             bm=self._current_book_metrics(ts); bb,ba,bs,az,b1,a1,m,sp=bm["bb"],bm["ba"],bm["bs"],bm["az"],bm["b1"],bm["a1"],bm["mid"],bm["spread_bps"]
@@ -658,15 +677,28 @@ class NovelMicrostructureCandidatePack:
         o["spread_state_transition_rate_3000ms"]=_safe_div(self.spread_widen.count(3000,ts)+self.spread_tighten.count(3000,ts),3.0)
         o["spread_one_tick_persistence_ms"]=min(max(ts-self.one_tick_spread_entry_ts,0.0),AGE_CLIP_MS) if self.in_one_tick_spread and self.one_tick_spread_entry_ts is not None else 0.0
         o["spread_wide_state_age_ms"]=min(max(ts-self.wide_spread_entry_ts,0.0),AGE_CLIP_MS) if self.in_wide_spread and self.wide_spread_entry_ts is not None else 0.0
-        o["spread_recompression_after_trade_500ms"]=_safe_div(self.spread_tighten.sum(500,ts),self.trade_hist.count(500,ts))
-        o["spread_widen_after_trade_500ms"]=_safe_div(self.spread_widen.sum(500,ts),self.trade_hist.count(500,ts))
+        trade_count_500=self.trade_hist.count(500,ts)
+        if trade_count_500<=0:
+            o["spread_recompression_after_trade_500ms"]=0.0
+            o["spread_widen_after_trade_500ms"]=0.0
+        else:
+            o["spread_recompression_after_trade_500ms"]=_finite_float(self.spread_tighten.sum(500,ts)/trade_count_500,RATIO_CLIP)
+            o["spread_widen_after_trade_500ms"]=_finite_float(self.spread_widen.sum(500,ts)/trade_count_500,RATIO_CLIP)
         o["mid_price_direction_flip_rate_1000ms"]=self.mid_delta_sign_hist.sign_flip_rate(1000,ts)
         o["mid_price_run_length_current"]=float(self.current_mid_run_len)
         o["mid_price_run_length_max_3000ms"]=self.mid_run_len_hist.max(3000,ts)
-        o["mid_price_path_efficiency_1000ms"]=(_safe_div(abs(self.mid_hist.values(1000,ts)[-1]-self.mid_hist.values(1000,ts)[0]),np.abs(np.diff(self.mid_hist.values(1000,ts))).sum()) if self.mid_hist.values(1000,ts).size>1 else 0.0)
-        o["mid_price_path_efficiency_3000ms"]=(_safe_div(abs(self.mid_hist.values(3000,ts)[-1]-self.mid_hist.values(3000,ts)[0]),np.abs(np.diff(self.mid_hist.values(3000,ts))).sum()) if self.mid_hist.values(3000,ts).size>1 else 0.0)
-        o["mid_price_reversal_ratio_1000ms"]=1.0-o["mid_price_path_efficiency_1000ms"]
-        o["mid_price_reversal_ratio_3000ms"]=1.0-o["mid_price_path_efficiency_3000ms"]
+        mid_vals_1000=self.mid_hist.values(1000,ts)
+        mid_vals_3000=self.mid_hist.values(3000,ts)
+        if mid_vals_1000.size<2:
+            o["mid_price_path_efficiency_1000ms"]=0.0; o["mid_price_reversal_ratio_1000ms"]=0.0
+        else:
+            pe1000=_safe_div(abs(mid_vals_1000[-1]-mid_vals_1000[0]),max(np.abs(np.diff(mid_vals_1000)).sum(),EPS))
+            o["mid_price_path_efficiency_1000ms"]=_finite_float(pe1000,RATIO_CLIP); o["mid_price_reversal_ratio_1000ms"]=_finite_float(1.0-pe1000,RATIO_CLIP)
+        if mid_vals_3000.size<2:
+            o["mid_price_path_efficiency_3000ms"]=0.0; o["mid_price_reversal_ratio_3000ms"]=0.0
+        else:
+            pe3000=_safe_div(abs(mid_vals_3000[-1]-mid_vals_3000[0]),max(np.abs(np.diff(mid_vals_3000)).sum(),EPS))
+            o["mid_price_path_efficiency_3000ms"]=_finite_float(pe3000,RATIO_CLIP); o["mid_price_reversal_ratio_3000ms"]=_finite_float(1.0-pe3000,RATIO_CLIP)
         o["microprice_leads_mid_cross_count_1000ms"]=self.micro_lead_events.sum(1000,ts)
         o["microprice_mid_divergence_persistence_ms"]=(ts-self.divergence_start_ts) if self.divergence_start_ts is not None else 0.0
         o["event_interarrival_p90_over_p10_1000ms"]=self.event_i.p90_over_p10(1000,ts)
