@@ -623,9 +623,9 @@ class NovelMicrostructureCandidatePack:
         o["last_buy_mid_impact_bps_since_trade"]=(1e4*(mid-self.last_buy_trade["mid_at_trade"])/max(self.last_buy_trade["mid_at_trade"],EPS)) if self.last_buy_trade and mid>0 else 0.0
         o["last_sell_mid_impact_bps_since_trade"]=(1e4*(self.last_sell_trade["mid_at_trade"]-mid)/max(self.last_sell_trade["mid_at_trade"],EPS)) if self.last_sell_trade and mid>0 else 0.0
         o["last_trade_mid_impact_signed_bps"]=((1e4*(mid-self.last_nonzero_trade["mid_at_trade"])/max(self.last_nonzero_trade["mid_at_trade"],EPS))*np.sign(self.last_nonzero_trade["side"])) if self.last_nonzero_trade and mid>0 else 0.0
-        o["buy_trade_impact_sum_bps_500ms"]=trade_impact_buy_500
-        o["sell_trade_impact_sum_bps_500ms"]=trade_impact_sell_500
-        o["trade_impact_asymmetry_bps_500ms"]=self._safe_asym(o["buy_trade_impact_sum_bps_500ms"],o["sell_trade_impact_sum_bps_500ms"])
+        o["buy_trade_impact_sum_bps_500ms"]=_finite_float(trade_impact_buy_500,RATIO_CLIP)
+        o["sell_trade_impact_sum_bps_500ms"]=_finite_float(trade_impact_sell_500,RATIO_CLIP)
+        o["trade_impact_asymmetry_bps_500ms"]=self._safe_asym(trade_impact_buy_500,trade_impact_sell_500)
         o["buy_trade_impact_decay_200_to_1000ms"]=_safe_div(abs(sum(bi200)),abs(sum(bi1000)))
         o["sell_trade_impact_decay_200_to_1000ms"]=_safe_div(abs(sum(si200)),abs(sum(si1000)))
         o["impact_per_notional_buy_1000ms"]=_signed_safe_div(sum(bi1000),buy_notional_1000)
