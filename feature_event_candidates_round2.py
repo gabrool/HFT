@@ -21,6 +21,20 @@ def _signed_safe_div(num, den, eps=EPS, clip=RATIO_CLIP):
     out = float(num) / max(abs(float(den)), eps)
     return _finite_float(out, clip)
 
+def _trade_sign_entropy(signs):
+    signs = np.asarray(signs, dtype=np.float64)
+    signs = signs[signs != 0]
+    if signs.size < 2:
+        return 0.0
+    buy = int(np.sum(signs > 0))
+    sell = int(np.sum(signs < 0))
+    total = buy + sell
+    if total < 2 or buy == 0 or sell == 0:
+        return 0.0
+    p_buy = buy / total
+    p_sell = sell / total
+    return _finite_float(-(p_buy * math.log(p_buy) + p_sell * math.log(p_sell)) / math.log(2.0))
+
 ROUND2_REQUESTED_FEATURES = [
 "trade_size_hhi_3000ms","trade_size_hhi_1000ms","largest_trade_share_notional_3000ms","largest_trade_share_notional_1000ms","trade_size_p90_over_median_3000ms","trade_size_max_over_ewma_3000ms","obi_realized_vol_500ms","obi_realized_vol_1000ms","microprice_realized_vol_500ms","microprice_realized_vol_1000ms","obi_zero_cross_rate_1000ms","max_event_gap_1000ms","min_event_gap_1000ms","ob_interarrival_cv_500ms","trade_interarrival_cv_500ms","event_interarrival_cv_500ms","event_interarrival_cv_1000ms","event_burstiness_ewma_fast_slow","trade_burstiness_ewma_fast_slow","ob_burstiness_ewma_fast_slow","trade_sign_entropy_1000ms","trade_sign_entropy_3000ms","trade_sign_flip_rate_1000ms","trade_sign_flip_rate_3000ms","same_side_replenishment_after_depletion_200ms","opposite_side_replenishment_after_depletion_200ms","buy_trade_depth_recovery_ratio_500ms","sell_trade_depth_recovery_ratio_500ms","trade_impact_decay_ratio_200_to_1000ms","trade_impact_half_life_proxy","depth_slope_bid_1_to_10","depth_slope_ask_1_to_10","depth_slope_imbalance_1_to_10","thin_side_depth_gap_ratio","book_shape_asymmetry_convexity","bid_queue_cliff_ratio_l1_l5","ask_queue_cliff_ratio_l1_l5","near_touch_depth_drop_asymmetry","no_trade_no_book_change_age_ms","mid_unchanged_and_depth_stable_ms","best_bid_price_age_ms","best_ask_price_age_ms","best_bid_size_age_ms","best_ask_size_age_ms","touch_price_age_min_ms","touch_price_age_max_ms","touch_price_age_imbalance_ms","touch_size_age_imbalance_ms","best_bid_replacement_count_1000ms","best_ask_replacement_count_1000ms","touch_replacement_imbalance_1000ms","touch_replacement_rate_3000ms","quote_lifetime_cv_3000ms","bid_l1_size_flip_rate_500ms","ask_l1_size_flip_rate_500ms","bid_l1_size_flip_rate_1000ms","ask_l1_size_flip_rate_1000ms","l1_size_flip_imbalance_1000ms","bid_l1_add_cancel_alternation_rate_1000ms","ask_l1_add_cancel_alternation_rate_1000ms","touch_flicker_score_1000ms","touch_flicker_score_3000ms","post_buy_ask_cancel_over_trade_200ms","post_sell_bid_cancel_over_trade_200ms","post_buy_ask_net_replenishment_over_trade_200ms","post_sell_bid_net_replenishment_over_trade_200ms","post_buy_bid_add_over_trade_200ms","post_sell_ask_add_over_trade_200ms","post_buy_opposite_side_support_ratio_500ms","post_sell_opposite_side_support_ratio_500ms","trade_side_quote_response_asymmetry_500ms","last_buy_mid_impact_bps_since_trade","last_sell_mid_impact_bps_since_trade","last_trade_mid_impact_signed_bps","buy_trade_impact_sum_bps_500ms","sell_trade_impact_sum_bps_500ms","trade_impact_asymmetry_bps_500ms","buy_trade_impact_decay_200_to_1000ms","sell_trade_impact_decay_200_to_1000ms","impact_per_notional_buy_1000ms","impact_per_notional_sell_1000ms","buy_trade_size_hhi_1000ms","sell_trade_size_hhi_1000ms","buy_trade_size_hhi_3000ms","sell_trade_size_hhi_3000ms","buy_largest_trade_share_3000ms","sell_largest_trade_share_3000ms","buy_trade_p90_over_median_3000ms","sell_trade_p90_over_median_3000ms","trade_size_concentration_asymmetry_3000ms","large_trade_side_dominance_3000ms","bid_depth_centroid_bps_10bps","ask_depth_centroid_bps_10bps","depth_centroid_imbalance_10bps","bid_depth_centroid_bps_25bps","ask_depth_centroid_bps_25bps","depth_centroid_imbalance_25bps","bid_near_touch_depth_share_10bps","ask_near_touch_depth_share_10bps","near_touch_depth_share_asymmetry_10bps","far_depth_wall_ratio_10_to_25bps","spread_widen_event_count_1000ms","spread_tighten_event_count_1000ms","spread_widen_to_tighten_ratio_1000ms","spread_state_transition_rate_3000ms","spread_one_tick_persistence_ms","spread_wide_state_age_ms","spread_recompression_after_trade_500ms","spread_widen_after_trade_500ms","mid_price_direction_flip_rate_1000ms","mid_price_run_length_current","mid_price_run_length_max_3000ms","mid_price_path_efficiency_1000ms","mid_price_path_efficiency_3000ms","mid_price_reversal_ratio_1000ms","mid_price_reversal_ratio_3000ms","microprice_leads_mid_cross_count_1000ms","microprice_mid_divergence_persistence_ms","event_interarrival_p90_over_p10_1000ms","trade_interarrival_p90_over_p10_1000ms","ob_interarrival_p90_over_p10_1000ms","event_interarrival_entropy_3000ms","trade_arrival_clumpiness_3000ms","ob_arrival_clumpiness_3000ms","max_trade_silence_gap_3000ms","max_ob_silence_gap_3000ms","thin_book_with_trade_burst_score_500ms","thin_book_with_quote_flicker_score_1000ms","wide_spread_with_trade_burst_score_1000ms","stale_touch_with_trade_burst_score_1000ms","stale_touch_with_low_depth_score_1000ms","fresh_touch_with_high_depth_score_1000ms","quote_pull_before_trade_burst_score_1000ms","trade_burst_without_book_replenishment_score_1000ms","depth_centroid_far_with_trade_burst_score_1000ms","impact_per_notional_high_and_replenishment_low_score_1000ms"]
 
@@ -185,7 +199,19 @@ class RollingValueWindow:
     def sign_flip_rate(self,w,n):
         a=np.sign(self.values(w,n)); a=a[a!=0]
         return float(np.sum(a[1:]!=a[:-1])/max(a.size-1,1)) if a.size>1 else 0.0
-    def zero_cross_rate(self,w,n): return self.sign_flip_rate(w,n)
+    def zero_cross_rate(self,w,n):
+        a=self.values(w,n)
+        if a.size<2: return 0.0
+        carried=[]; last=0
+        for v in a:
+            s=int(np.sign(v))
+            if s==0:
+                if last!=0: carried.append(last)
+            else:
+                carried.append(s); last=s
+        if len(carried)<2: return 0.0
+        arr=np.asarray(carried,dtype=np.int8)
+        return float(np.sum(arr[1:]!=arr[:-1])/max(arr.size-1,1))
     def realized_vol(self,w,n): a=self.values(w,n); return float(np.sqrt(np.sum(np.diff(a)**2))) if a.size>1 else 0.0
 
 class RollingInterarrival:
@@ -331,6 +357,23 @@ class NovelMicrostructureCandidatePack:
     def _level_notional(self,s,i): lv=self._levels(s); return lv[i-1][0]*lv[i-1][1] if len(lv)>=i else 0.0
     def _hhi(self,a): return float((a*a).sum()/max(float(a.sum())**2,EPS)) if a.size else 0.0
     def _safe_asym(self,a,b): return _safe_div(float(a)-float(b), abs(float(a))+abs(float(b))+EPS)
+    def _depth_recovery_ratio(self, side, window_ms, now, current_depth_5):
+        current_depth_5=float(current_depth_5) if current_depth_5>0 else 0.0
+        num=0.0; den=0.0
+        for r in self.trade_records:
+            if now-r["ts"]>window_ms: continue
+            if side=="buy":
+                if r["side"]<=0: continue
+                depth0=float(r.get("ask_depth_5_at_trade",0.0))
+            else:
+                if r["side"]>=0: continue
+                depth0=float(r.get("bid_depth_5_at_trade",0.0))
+            notional=float(r.get("notional",0.0))
+            if depth0<=0 or notional<=0: continue
+            ratio=current_depth_5/max(depth0,EPS)
+            num += ratio*notional; den += notional
+        if den<=0: return 0.0
+        return _finite_float(num/den,RATIO_CLIP)
     def _depth_centroid(self, side, bps):
         m=self._mid()
         if m<=0: return 0.0
@@ -468,15 +511,16 @@ class NovelMicrostructureCandidatePack:
         self._update_book_validity(ts); bm=self._current_book_metrics(ts)
         if not self.book_valid:
             bid_levels=[]; ask_levels=[]
-            bid_l1=ask_l1=0.0; bid_l5=ask_l5=0.0; bid_l10=ask_l10=0.0
+            bid_l1=ask_l1=0.0; bid_l2=ask_l2=0.0; bid_l5=ask_l5=0.0; bid_l10=ask_l10=0.0
             bid_depth_1=ask_depth_1=0.0; depth_bid_5=depth_ask_5=0.0; depth_bid_10=depth_ask_10=0.0; depth_bid_25=depth_ask_25=0.0
             bid_centroid_10=ask_centroid_10=0.0; bid_centroid_25=ask_centroid_25=0.0
             mid=0.0; bb=ba=0.0; spread_bps=0.0
         else:
             bid_levels=self._levels('bid'); ask_levels=self._levels('ask')
-            bid_l1=self._level_notional('bid',1); ask_l1=self._level_notional('ask',1)
-            bid_l5=self._level_notional('bid',5); ask_l5=self._level_notional('ask',5)
-            bid_l10=self._level_notional('bid',10); ask_l10=self._level_notional('ask',10)
+            bid_l1=bid_levels[0][0]*bid_levels[0][1] if len(bid_levels)>=1 else 0.0; ask_l1=ask_levels[0][0]*ask_levels[0][1] if len(ask_levels)>=1 else 0.0
+            bid_l2=bid_levels[1][0]*bid_levels[1][1] if len(bid_levels)>=2 else 0.0; ask_l2=ask_levels[1][0]*ask_levels[1][1] if len(ask_levels)>=2 else 0.0
+            bid_l5=bid_levels[4][0]*bid_levels[4][1] if len(bid_levels)>=5 else 0.0; ask_l5=ask_levels[4][0]*ask_levels[4][1] if len(ask_levels)>=5 else 0.0
+            bid_l10=bid_levels[9][0]*bid_levels[9][1] if len(bid_levels)>=10 else 0.0; ask_l10=ask_levels[9][0]*ask_levels[9][1] if len(ask_levels)>=10 else 0.0
             bid_depth_1=self._depth('bid',1); ask_depth_1=self._depth('ask',1)
             depth_bid_5=self._depth('bid',5); depth_ask_5=self._depth('ask',5)
             mid=bm["mid"]; bb=bm["bb"]; ba=bm["ba"]; spread_bps=bm["spread_bps"]
@@ -501,10 +545,6 @@ class NovelMicrostructureCandidatePack:
         signs_1000=np.asarray([sg for t,sg in self.trade_side if t>=ts-1000],dtype=np.float64)
         signs_3000=np.asarray([sg for t,sg in self.trade_side if t>=ts-3000],dtype=np.float64)
         buy_notional_200=self.buy_hist.sum(200,ts); sell_notional_200=self.sell_hist.sum(200,ts); buy_notional_500=self.buy_hist.sum(500,ts); sell_notional_500=self.sell_hist.sum(500,ts); buy_notional_1000=self.buy_hist.sum(1000,ts); sell_notional_1000=self.sell_hist.sum(1000,ts)
-        sign_p_1000=max((signs_1000>0).mean() if signs_1000.size else 0.0, EPS)
-        sign_n_1000=max((signs_1000<0).mean() if signs_1000.size else 0.0, EPS)
-        sign_p_3000=max((signs_3000>0).mean() if signs_3000.size else 0.0, EPS)
-        sign_n_3000=max((signs_3000<0).mean() if signs_3000.size else 0.0, EPS)
         o["trade_size_hhi_3000ms"]=self._hhi(trade_3000)
         o["trade_size_hhi_1000ms"]=self._hhi(trade_1000)
         o["largest_trade_share_notional_3000ms"]=_safe_div(trade_3000.max() if trade_3000.size else 0.0, trade_3000.sum() if trade_3000.size else 1.0)
@@ -525,14 +565,18 @@ class NovelMicrostructureCandidatePack:
         o["event_burstiness_ewma_fast_slow"]=event_burst_ratio
         o["trade_burstiness_ewma_fast_slow"]=trade_burst_ratio
         o["ob_burstiness_ewma_fast_slow"]=ob_burst_ratio
-        o["trade_sign_entropy_1000ms"]=-(sign_p_1000*math.log(sign_p_1000)+sign_n_1000*math.log(sign_n_1000))/math.log(2.0)
-        o["trade_sign_entropy_3000ms"]=-(sign_p_3000*math.log(sign_p_3000)+sign_n_3000*math.log(sign_n_3000))/math.log(2.0)
+        o["trade_sign_entropy_1000ms"]=_trade_sign_entropy(signs_1000)
+        o["trade_sign_entropy_3000ms"]=_trade_sign_entropy(signs_3000)
         o["trade_sign_flip_rate_1000ms"]=float(np.mean(signs_1000[1:]!=signs_1000[:-1])) if signs_1000.size>1 else 0.0
         o["trade_sign_flip_rate_3000ms"]=float(np.mean(signs_3000[1:]!=signs_3000[:-1])) if signs_3000.size>1 else 0.0
         trk=[t for t in self.depletion_trackers if ts-t["ts"]<=200]; o["same_side_replenishment_after_depletion_200ms"]=_safe_div(sum(min(t["same_recovered"],t["amount"]) for t in trk),sum(t["amount"] for t in trk))
         o["opposite_side_replenishment_after_depletion_200ms"]=_safe_div(sum(min(t["opp_recovered"],t["amount"]) for t in trk),sum(t["amount"] for t in trk))
-        buys=[r for r in self.trade_records if r["side"]>0 and ts-r["ts"]<=500]; o["buy_trade_depth_recovery_ratio_500ms"]=_safe_div(sum(max(depth_ask_5-r["ask_depth_5_at_trade"],0.0) for r in buys),sum(r["ask_depth_5_at_trade"] for r in buys))
-        sells=[r for r in self.trade_records if r["side"]<0 and ts-r["ts"]<=500]; o["sell_trade_depth_recovery_ratio_500ms"]=_safe_div(sum(max(depth_bid_5-r["bid_depth_5_at_trade"],0.0) for r in sells),sum(r["bid_depth_5_at_trade"] for r in sells))
+        if self.book_valid:
+            o["buy_trade_depth_recovery_ratio_500ms"]=self._depth_recovery_ratio("buy",500,ts,depth_ask_5)
+            o["sell_trade_depth_recovery_ratio_500ms"]=self._depth_recovery_ratio("sell",500,ts,depth_bid_5)
+        else:
+            o["buy_trade_depth_recovery_ratio_500ms"]=0.0
+            o["sell_trade_depth_recovery_ratio_500ms"]=0.0
         o["trade_impact_decay_ratio_200_to_1000ms"]=_safe_div(impact_200,impact_1000)
         o["trade_impact_half_life_proxy"]=float(np.clip(_safe_div(math.log(max(impact_200,EPS)/max(impact_1000,EPS)),math.log(5.0),clip=10.0),-10,10)) if impact_200>EPS and impact_1000>EPS else 0.0
         o["depth_slope_bid_1_to_10"]=_safe_div(depth_bid_10-bid_depth_1,depth_bid_10)
@@ -542,7 +586,7 @@ class NovelMicrostructureCandidatePack:
         bid_convexity=_signed_safe_div(depth_bid_10-2.0*depth_bid_5+bid_depth_1,depth_bid_10,clip=1e9); ask_convexity=_signed_safe_div(depth_ask_10-2.0*depth_ask_5+ask_depth_1,depth_ask_10,clip=1e9); o["book_shape_asymmetry_convexity"]=self._safe_asym(bid_convexity,ask_convexity)
         o["bid_queue_cliff_ratio_l1_l5"]=_safe_div(bid_l1,bid_l5)
         o["ask_queue_cliff_ratio_l1_l5"]=_safe_div(ask_l1,ask_l5)
-        bid_l2=self._level_notional("bid",2) if self.book_valid else 0.0; ask_l2=self._level_notional("ask",2) if self.book_valid else 0.0; bid_drop=_safe_div(max(0.0,bid_l1-bid_l2),bid_l1,clip=1e9); ask_drop=_safe_div(max(0.0,ask_l1-ask_l2),ask_l1,clip=1e9); o["near_touch_depth_drop_asymmetry"]=self._safe_asym(bid_drop,ask_drop)
+        bid_drop=_safe_div(max(0.0,bid_l1-bid_l2),bid_l1,clip=1e9); ask_drop=_safe_div(max(0.0,ask_l1-ask_l2),ask_l1,clip=1e9); o["near_touch_depth_drop_asymmetry"]=self._safe_asym(bid_drop,ask_drop)
         o["no_trade_no_book_change_age_ms"]=no_trade_no_book_age
         o["mid_unchanged_and_depth_stable_ms"]=mid_unchanged_depth_stable
         o["best_bid_price_age_ms"]=best_bid_price_age
@@ -590,12 +634,14 @@ class NovelMicrostructureCandidatePack:
         o["sell_trade_size_hhi_1000ms"]=self._hhi(sell_1000)
         o["buy_trade_size_hhi_3000ms"]=self._hhi(buy_3000)
         o["sell_trade_size_hhi_3000ms"]=self._hhi(sell_3000)
-        o["buy_largest_trade_share_3000ms"]=_safe_div(buy_3000.max() if buy_3000.size else 0.0,buy_3000.sum() if buy_3000.size else 1.0)
-        o["sell_largest_trade_share_3000ms"]=_safe_div(sell_3000.max() if sell_3000.size else 0.0,sell_3000.sum() if sell_3000.size else 1.0)
+        buy_largest_notional_3000=float(buy_3000.max()) if buy_3000.size else 0.0
+        sell_largest_notional_3000=float(sell_3000.max()) if sell_3000.size else 0.0
+        o["buy_largest_trade_share_3000ms"]=_safe_div(buy_largest_notional_3000,float(buy_3000.sum()) if buy_3000.size else 1.0)
+        o["sell_largest_trade_share_3000ms"]=_safe_div(sell_largest_notional_3000,float(sell_3000.sum()) if sell_3000.size else 1.0)
         o["buy_trade_p90_over_median_3000ms"]=_safe_div(np.percentile(buy_3000,90) if buy_3000.size else 0.0,np.median(buy_3000) if buy_3000.size else 1.0)
         o["sell_trade_p90_over_median_3000ms"]=_safe_div(np.percentile(sell_3000,90) if sell_3000.size else 0.0,np.median(sell_3000) if sell_3000.size else 1.0)
         o["trade_size_concentration_asymmetry_3000ms"]=self._safe_asym(o["buy_trade_size_hhi_3000ms"],o["sell_trade_size_hhi_3000ms"])
-        o["large_trade_side_dominance_3000ms"]=self._safe_asym(o["buy_largest_trade_share_3000ms"],o["sell_largest_trade_share_3000ms"])
+        o["large_trade_side_dominance_3000ms"]=_safe_div(buy_largest_notional_3000-sell_largest_notional_3000,buy_largest_notional_3000+sell_largest_notional_3000)
         o["bid_depth_centroid_bps_10bps"]=bid_centroid_10
         o["ask_depth_centroid_bps_10bps"]=ask_centroid_10
         o["depth_centroid_imbalance_10bps"]=self._safe_asym(bid_centroid_10,ask_centroid_10)
