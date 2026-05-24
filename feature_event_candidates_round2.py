@@ -268,6 +268,31 @@ class EWMAValue:
 assert len(ROUND2_REQUESTED_FEATURES) == 136
 assert len(set(ROUND2_REQUESTED_FEATURES)) == 136
 
+INVALID_BOOK_NEUTRAL_FEATURES = (
+    "depth_slope_bid_1_to_10","depth_slope_ask_1_to_10","depth_slope_imbalance_1_to_10",
+    "thin_side_depth_gap_ratio","book_shape_asymmetry_convexity","bid_queue_cliff_ratio_l1_l5",
+    "ask_queue_cliff_ratio_l1_l5","near_touch_depth_drop_asymmetry",
+    "bid_depth_centroid_bps_10bps","ask_depth_centroid_bps_10bps","depth_centroid_imbalance_10bps",
+    "bid_depth_centroid_bps_25bps","ask_depth_centroid_bps_25bps","depth_centroid_imbalance_25bps",
+    "bid_near_touch_depth_share_10bps","ask_near_touch_depth_share_10bps","near_touch_depth_share_asymmetry_10bps",
+    "far_depth_wall_ratio_10_to_25bps",
+    "best_bid_price_age_ms","best_ask_price_age_ms","best_bid_size_age_ms","best_ask_size_age_ms",
+    "touch_price_age_min_ms","touch_price_age_max_ms","touch_price_age_imbalance_ms","touch_size_age_imbalance_ms",
+    "mid_unchanged_and_depth_stable_ms","spread_one_tick_persistence_ms","spread_wide_state_age_ms",
+    "buy_trade_depth_recovery_ratio_500ms","sell_trade_depth_recovery_ratio_500ms",
+    "last_buy_mid_impact_bps_since_trade","last_sell_mid_impact_bps_since_trade","last_trade_mid_impact_signed_bps",
+    "buy_trade_impact_sum_bps_500ms","sell_trade_impact_sum_bps_500ms","trade_impact_asymmetry_bps_500ms",
+    "buy_trade_impact_decay_200_to_1000ms","sell_trade_impact_decay_200_to_1000ms",
+    "impact_per_notional_buy_1000ms","impact_per_notional_sell_1000ms",
+    "trade_impact_decay_ratio_200_to_1000ms","trade_impact_half_life_proxy",
+    "thin_book_with_trade_burst_score_500ms","thin_book_with_quote_flicker_score_1000ms",
+    "wide_spread_with_trade_burst_score_1000ms","stale_touch_with_trade_burst_score_1000ms",
+    "stale_touch_with_low_depth_score_1000ms","fresh_touch_with_high_depth_score_1000ms",
+    "quote_pull_before_trade_burst_score_1000ms","trade_burst_without_book_replenishment_score_1000ms",
+    "depth_centroid_far_with_trade_burst_score_1000ms",
+    "impact_per_notional_high_and_replenishment_low_score_1000ms",
+)
+
 class NovelMicrostructureCandidatePack:
     name = "novel_microstructure_round2_v1"
     def __init__(self): self.reset()
@@ -719,6 +744,9 @@ class NovelMicrostructureCandidatePack:
         repl=_safe_div(self.bid_add.sum(1000,ts)+self.ask_add.sum(1000,ts),depth_bid_10+depth_ask_10,clip=1e9); o["trade_burst_without_book_replenishment_score_1000ms"]=_safe_div(trade_burst_ratio,1.0+repl,clip=1e9)
         o["depth_centroid_far_with_trade_burst_score_1000ms"]=o["far_depth_wall_ratio_10_to_25bps"]*trade_burst_ratio
         impact_hi=max(abs(o["impact_per_notional_buy_1000ms"]),abs(o["impact_per_notional_sell_1000ms"])); o["impact_per_notional_high_and_replenishment_low_score_1000ms"]=_safe_div(impact_hi,1.0+repl,clip=1e9)
+        if not self.book_valid:
+            for k in INVALID_BOOK_NEUTRAL_FEATURES:
+                o[k]=0.0
         missing=set(ROUND2_REQUESTED_FEATURES)-set(o)
         extra=set(o)-set(ROUND2_REQUESTED_FEATURES)
         if missing or extra:
