@@ -3274,6 +3274,42 @@ class RollingPriceWindowState:
         high = self.sorted_prices[-1]
         return float(1e4 * math.log(high / low)) if high > 0.0 and low > 0.0 else 0.0
 
+class Round2InterarrivalState:
+    def __init__(self, max_window_ms: int):
+        self.max_window_ms = int(max_window_ms)
+        self.last_ts: Optional[int] = None
+        self.gaps: Deque[Tuple[int, float]] = deque()
+
+    def on_event(self, ts_ms: int) -> None:
+        ts = int(ts_ms)
+        if self.last_ts is not None:
+            self.gaps.append((ts, float(max(0, ts - self.last_ts))))
+        self.last_ts = ts
+        self.prune(ts)
+
+    def prune(self, now_ms: int) -> None:
+        cutoff = int(now_ms) - self.max_window_ms
+        while self.gaps and int(self.gaps[0][0]) < cutoff:
+            self.gaps.popleft()
+
+    def values(self, window_ms: int, now_ms: int) -> List[float]:
+        self.prune(now_ms)
+        cutoff = int(now_ms) - int(window_ms)
+        return [float(g) for t, g in self.gaps if int(t) >= cutoff]
+
+    def max_gap(self, window_ms: int, now_ms: int) -> float:
+        vals = self.values(window_ms, now_ms)
+        return float(max(vals)) if vals else 0.0
+
+    def clumpiness(self, window_ms: int, now_ms: int) -> float:
+        vals = self.values(window_ms, now_ms)
+        if len(vals) < 2:
+            return 0.0
+        arr = np.asarray(vals, dtype=np.float64)
+        p10 = float(np.percentile(arr, 10))
+        p90 = float(np.percentile(arr, 90))
+        return _finite_float((p90 - p10) / max(p90 + p10, EPS), clip=100.0)
+
 
 class PriceAsofHistory:
     def __init__(self, keep_ms: int):
@@ -4100,8 +4136,8 @@ class FeatureEngine:
             10: deque(),
         }
         # ---------- Round2 promoted event features ----------
-        self._round2_trade_interarrival = RollingScalarWindowState(3500, track_sorted=True)
-        self._round2_ob_interarrival = RollingScalarWindowState(3500, track_sorted=True)
+        self._round2_trade_interarrival = Round2InterarrivalState(3500)
+        self._round2_ob_interarrival = Round2InterarrivalState(3500)
         self._round2_buy_trade_notional_3000 = RollingScalarWindowState(3000, track_sorted=True)
         self._round2_sell_trade_notional_3000 = RollingScalarWindowState(3000, track_sorted=True)
         self._round2_prev_bid_l1_notional: Optional[float] = None
@@ -4797,6 +4833,37 @@ class FeatureEngine:
         if v < 0.0:
             return -1
         return 0
+
+    def _depth_centroid_bps(self, levels: Sequence[Tuple[float, float]], mid: float, bps: float, side: str) -> float:
+        if mid <= 0.0:
+            return 0.0
+        lo = mid * (1.0 - float(bps) / 1e4)
+        hi = mid * (1.0 + float(bps) / 1e4)
+        num = 0.0
+        den = 0.0
+        for px, sz in levels:
+            p = float(px); q = float(sz)
+            if p <= 0.0 or q <= 0.0:
+                continue
+            if side == "bid" and p < lo:
+                continue
+            if side == "ask" and p > hi:
+                continue
+            n = p * q
+            d = 1e4 * abs(p - mid) / mid
+            num += d * n
+            den += n
+        return self._safe_div(num, den, 0.0)
+
+    def _round2_p90_over_median(self, state: RollingScalarWindowState, now_ms: int) -> float:
+        state.prune(now_ms)
+        vals = [float(v) for _ts, v, _tr in state.deq]
+        if not vals:
+            return 0.0
+        med = float(np.median(np.asarray(vals, dtype=np.float64)))
+        if med <= EPS:
+            return 0.0
+        return float(np.clip(float(np.percentile(np.asarray(vals, dtype=np.float64), 90)) / med, -100.0, 100.0))
 
     def _large_trade_state_insert(self, window_ms: int, entry: Tuple[int, float, float, float, str, float, float, float]) -> None:
         ts_ms, _price, _size, notional_usd, _side, side_sign, _tick_sign, _is_zero_tick = entry
@@ -5713,14 +5780,18 @@ class FeatureEngine:
         deep_micro_features["micro_l1_minus_micro_l10_bps"] = self._bps(micro, micro_price_by_level.get(10, 0.0), 0.0)
         bid_l1_notional_usd = bid1 * bsz1
         ask_l1_notional_usd = ask1 * asz1
-        self._round2_ob_interarrival.add(int(ts_ms), float(ts_ms))
-        prev_bid_n = bid_l1_notional_usd if self._round2_prev_bid_l1_notional is None else float(self._round2_prev_bid_l1_notional)
-        prev_ask_n = ask_l1_notional_usd if self._round2_prev_ask_l1_notional is None else float(self._round2_prev_ask_l1_notional)
-        bid_delta_n = bid_l1_notional_usd - prev_bid_n
-        ask_delta_n = ask_l1_notional_usd - prev_ask_n
+        self._round2_ob_interarrival.on_event(int(ts_ms))
+        if self._round2_prev_bid_l1_notional is None or self._round2_prev_ask_l1_notional is None:
+            bid_delta_n = 0.0
+            ask_delta_n = 0.0
+        else:
+            prev_bid_n = float(self._round2_prev_bid_l1_notional)
+            prev_ask_n = float(self._round2_prev_ask_l1_notional)
+            bid_delta_n = bid_l1_notional_usd - prev_bid_n
+            ask_delta_n = ask_l1_notional_usd - prev_ask_n
         bid_add, ask_add = max(bid_delta_n, 0.0), max(ask_delta_n, 0.0)
         bid_cancel, ask_cancel = max(-bid_delta_n, 0.0), max(-ask_delta_n, 0.0)
-        self._round2_l1_churn_notional_3000.add(int(ts_ms), abs(bid_delta_n) + abs(ask_delta_n))
+        self._round2_l1_churn_notional_3000.update(int(ts_ms), abs(bid_delta_n) + abs(ask_delta_n))
         for delta, sdeq, adeq, prev_attr in ((bid_delta_n, self._round2_bid_signs_3000, self._round2_bid_alt_3000, "_round2_prev_bid_sign"), (ask_delta_n, self._round2_ask_signs_3000, self._round2_ask_alt_3000, "_round2_prev_ask_sign")):
             sign = 1 if delta > 0 else -1 if delta < 0 else 0
             if sign != 0:
@@ -5740,8 +5811,45 @@ class FeatureEngine:
             if ds != 0:
                 self._round2_mid_run_len = self._round2_mid_run_len + 1 if ds == self._round2_mid_run_sign else 1
                 self._round2_mid_run_sign = ds
-                self._round2_mid_run_len_3000.add(int(ts_ms), float(self._round2_mid_run_len))
+                self._round2_mid_run_len_3000.update(int(ts_ms), float(self._round2_mid_run_len))
         self._round2_prev_mid = float(mid)
+        total_depth_5 = bid_depth_5bps + ask_depth_5bps
+        if self._round2_stable_break_ts is None:
+            self._round2_stable_break_ts = int(ts_ms)
+            self._round2_prev_stable_mid = float(mid)
+            self._round2_prev_stable_depth_5bps_notional = float(total_depth_5)
+        else:
+            pm = float(self._round2_prev_stable_mid)
+            pd = float(self._round2_prev_stable_depth_5bps_notional)
+            if abs(mid - pm) > 1e-12 or self._safe_div(abs(total_depth_5 - pd), max(abs(pd), EPS), 0.0) > 0.01:
+                self._round2_stable_break_ts = int(ts_ms)
+                self._round2_prev_stable_mid = float(mid)
+                self._round2_prev_stable_depth_5bps_notional = float(total_depth_5)
+        if self._round2_best_bid_size_change_ts is None:
+            self._round2_best_bid_size_change_ts = int(ts_ms); self._round2_prev_best_bid_size = float(bsz1)
+            self._round2_best_ask_size_change_ts = int(ts_ms); self._round2_prev_best_ask_size = float(asz1)
+        else:
+            if abs(float(bsz1) - float(self._round2_prev_best_bid_size)) > 1e-12:
+                self._round2_best_bid_size_change_ts = int(ts_ms); self._round2_prev_best_bid_size = float(bsz1)
+            if abs(float(asz1) - float(self._round2_prev_best_ask_size)) > 1e-12:
+                self._round2_best_ask_size_change_ts = int(ts_ms); self._round2_prev_best_ask_size = float(asz1)
+        for tr in self._round2_depletion_trackers:
+            if int(tr["ts"]) >= int(ts_ms):
+                continue
+            if tr["side"] == "bid":
+                tr["same_recovered"] += bid_add; tr["opp_recovered"] += ask_add
+            else:
+                tr["same_recovered"] += ask_add; tr["opp_recovered"] += bid_add
+        if bid_cancel > 0.0:
+            self._round2_depletion_trackers.append({"ts": int(ts_ms), "side": "bid", "amount": float(bid_cancel), "same_recovered": 0.0, "opp_recovered": 0.0})
+        if ask_cancel > 0.0:
+            self._round2_depletion_trackers.append({"ts": int(ts_ms), "side": "ask", "amount": float(ask_cancel), "same_recovered": 0.0, "opp_recovered": 0.0})
+        while self._round2_depletion_trackers and (int(ts_ms) - int(self._round2_depletion_trackers[0]["ts"]) > 500):
+            self._round2_depletion_trackers.popleft()
+        if self.last_buy_trade_ts is not None and ts_ms - int(self.last_buy_trade_ts) <= 500:
+            self._round2_post_buy_bid_add_500.update(int(ts_ms), float(bid_add))
+        if self.last_sell_trade_ts is not None and ts_ms - int(self.last_sell_trade_ts) <= 500:
+            self._round2_post_sell_ask_add_500.update(int(ts_ms), float(ask_add))
         self._round2_prev_bid_l1_notional = float(bid_l1_notional_usd); self._round2_prev_ask_l1_notional = float(ask_l1_notional_usd)
         bid_depth_notional_5bps = self._notional_depth_within_bps(
             self.bid_lvls,
@@ -5987,17 +6095,58 @@ class FeatureEngine:
         bid_alt_rate = self._safe_div(len(self._round2_bid_alt_3000), max(len(self._round2_bid_signs_3000) - 1, 1), 0.0); ask_alt_rate = self._safe_div(len(self._round2_ask_alt_3000), max(len(self._round2_ask_signs_3000) - 1, 1), 0.0)
         touch_flicker_score_3000ms = 0.5 * (bid_alt_rate + ask_alt_rate) * self._safe_div(self._round2_l1_churn_notional_3000.sum_value(), max(depth_bid_10_n + depth_ask_10_n, 1e-9), 0.0)
         spread_state_transition_rate_3000ms = (len(self._round2_spread_widen_3000) + len(self._round2_spread_tighten_3000)) / 3.0
-        trade_ts = [int(t) for t, _, _ in self._round2_trade_interarrival.deq if int(ts_ms) - int(t) <= 3000]
-        max_trade_silence_gap_3000ms = float(max([trade_ts[i] - trade_ts[i - 1] for i in range(1, len(trade_ts))], default=0.0))
+        max_trade_silence_gap_3000ms = self._round2_trade_interarrival.max_gap(3000, ts_ms)
+        ask_depth_centroid_bps_25bps = self._depth_centroid_bps(self.ask_lvls, mid, 25.0, "ask")
+        bid_depth_centroid_bps_25bps = self._depth_centroid_bps(self.bid_lvls, mid, 25.0, "bid")
         micro_points_1000 = self._metric_values(self._micro_history_points, ts_ms, 1000); micro_points_1000.append((ts_ms, micro_minus_mid_bps)); mvals = np.asarray([v for _, v in micro_points_1000], dtype=np.float64)
         microprice_realized_vol_1000ms = float(np.sqrt(np.sum(np.diff(mvals) ** 2))) if mvals.size > 1 else 0.0
-        buy_trade_p90_over_median_3000ms = self._safe_div(self._round2_buy_trade_notional_3000.p90(), self._round2_buy_trade_notional_3000.quantile(0.5), 0.0)
-        sell_trade_p90_over_median_3000ms = self._safe_div(self._round2_sell_trade_notional_3000.p90(), self._round2_sell_trade_notional_3000.quantile(0.5), 0.0)
-        ob_arrival_clumpiness_3000ms = 0.0; trade_sign_entropy_3000ms = 0.0
+        buy_trade_p90_over_median_3000ms = self._round2_p90_over_median(self._round2_buy_trade_notional_3000, ts_ms)
+        sell_trade_p90_over_median_3000ms = self._round2_p90_over_median(self._round2_sell_trade_notional_3000, ts_ms)
+        ob_arrival_clumpiness_3000ms = self._round2_ob_interarrival.clumpiness(3000, ts_ms)
+        trade_sign_entropy_3000ms = 0.0
         bcnt = float(trade_stats_by_ms[3000]["buy_count"]); scnt = float(trade_stats_by_ms[3000]["sell_count"]); tot = bcnt + scnt
         if tot >= 2 and bcnt > 0 and scnt > 0: pb = bcnt / tot; ps = scnt / tot; trade_sign_entropy_3000ms = -(pb * math.log(pb) + ps * math.log(ps)) / math.log(2.0)
+        self._round2_mid_run_len_3000.prune(ts_ms)
         mid_price_run_length_max_3000ms = self._round2_mid_run_len_3000.max()
-        feat_list.extend([touch_flicker_score_3000ms, spread_state_transition_rate_3000ms, max_trade_silence_gap_3000ms, 0.0, 0.0, microprice_realized_vol_1000ms, buy_trade_p90_over_median_3000ms, sell_trade_p90_over_median_3000ms, ob_arrival_clumpiness_3000ms, trade_sign_entropy_3000ms, mid_price_run_length_max_3000ms, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        mid_unchanged_and_depth_stable_ms = 0.0 if self._round2_stable_break_ts is None else float(min(max(ts_ms - self._round2_stable_break_ts, 0), 60000))
+        best_bid_size_age_ms = 0.0 if self._round2_best_bid_size_change_ts is None else float(min(max(ts_ms - self._round2_best_bid_size_change_ts, 0), 60000))
+        best_ask_size_age_ms = 0.0 if self._round2_best_ask_size_change_ts is None else float(min(max(ts_ms - self._round2_best_ask_size_change_ts, 0), 60000))
+        active_dep = [d for d in self._round2_depletion_trackers if ts_ms - int(d["ts"]) <= 200]
+        dep_den = sum(float(d["amount"]) for d in active_dep)
+        opposite_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["opp_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, EPS), 0.0)
+        same_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["same_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, EPS), 0.0)
+        self._round2_post_buy_bid_add_500.prune(ts_ms)
+        self._round2_post_sell_ask_add_500.prune(ts_ms)
+        post_buy_support = self._safe_div(self._round2_post_buy_bid_add_500.sum_value(), max(trade_stats_by_ms[500]["buy_notional_usd"], EPS), 0.0)
+        post_sell_support = self._safe_div(self._round2_post_sell_ask_add_500.sum_value(), max(trade_stats_by_ms[500]["sell_notional_usd"], EPS), 0.0)
+        trade_side_quote_response_asymmetry_500ms = self._safe_asym_ratio(post_buy_support, post_sell_support)
+        bid_l2 = float(self.bid_lvls[1][0] * self.bid_lvls[1][1]) if len(self.bid_lvls) > 1 else 0.0
+        ask_l2 = float(self.ask_lvls[1][0] * self.ask_lvls[1][1]) if len(self.ask_lvls) > 1 else 0.0
+        bid_drop = self._safe_div(max(0.0, bid_l1_notional_usd - bid_l2), max(bid_l1_notional_usd, EPS), 0.0)
+        ask_drop = self._safe_div(max(0.0, ask_l1_notional_usd - ask_l2), max(ask_l1_notional_usd, EPS), 0.0)
+        near_touch_depth_drop_asymmetry = self._safe_asym_ratio(bid_drop, ask_drop)
+        impact_200_num = impact_200_den = impact_1000_num = impact_1000_den = 0.0
+        for rec in self._round2_trade_impact_records:
+            age = ts_ms - int(rec["ts"])
+            if age > 1000:
+                continue
+            m0 = max(float(rec["mid_at_trade"]), EPS)
+            imp = (1e4 * (mid - m0) / m0) if int(rec["side"]) > 0 else (1e4 * (m0 - mid) / m0)
+            w = float(rec["notional"])
+            impact_1000_num += abs(imp) * w
+            impact_1000_den += w
+            if age <= 200:
+                impact_200_num += abs(imp) * w
+                impact_200_den += w
+        impact_200 = self._safe_div(impact_200_num, max(impact_200_den, EPS), 0.0)
+        impact_1000 = self._safe_div(impact_1000_num, max(impact_1000_den, EPS), 0.0)
+        trade_impact_half_life_proxy = float(np.clip(math.log(max(impact_200, EPS) / max(impact_1000, EPS)) / math.log(5.0), -10.0, 10.0)) if impact_200 > EPS and impact_1000 > EPS else 0.0
+        round2_values = [touch_flicker_score_3000ms, spread_state_transition_rate_3000ms, max_trade_silence_gap_3000ms, ask_depth_centroid_bps_25bps, bid_depth_centroid_bps_25bps, microprice_realized_vol_1000ms, buy_trade_p90_over_median_3000ms, sell_trade_p90_over_median_3000ms, ob_arrival_clumpiness_3000ms, trade_sign_entropy_3000ms, mid_price_run_length_max_3000ms, mid_unchanged_and_depth_stable_ms, best_bid_size_age_ms, best_ask_size_age_ms, opposite_side_replenishment_after_depletion_200ms, same_side_replenishment_after_depletion_200ms, trade_side_quote_response_asymmetry_500ms, near_touch_depth_drop_asymmetry, trade_impact_half_life_proxy]
+        if len(round2_values) != len(ROUND2_PRODUCTION_EVENT_FEATURES):
+            raise RuntimeError("round2 feature length mismatch")
+        if not np.isfinite(np.asarray(round2_values, dtype=np.float64)).all():
+            raise RuntimeError("nonfinite round2 feature")
+        feat_list.extend(round2_values)
 
         names = self.feature_names()
         if len(feat_list) != len(names):
@@ -6148,16 +6297,16 @@ class FeatureEngine:
         self.last_trade_price = float(price)
 
         notional_usd = float(price) * float(size)
-        self._round2_trade_interarrival.update(int(ts_ms), float(ts_ms))
+        self._round2_trade_interarrival.on_event(int(ts_ms))
         self.last_trade_side_sign = float(side_sign)
         if side_sign > 0:
-            self._round2_buy_trade_notional_3000.add(int(ts_ms), float(notional_usd))
+            self._round2_buy_trade_notional_3000.update(int(ts_ms), float(notional_usd))
             self.last_buy_trade_ts = int(ts_ms)
             self.consecutive_buy_trade_count += 1
             self.consecutive_sell_trade_count = 0
             trade_sign = 1
         elif side_sign < 0:
-            self._round2_sell_trade_notional_3000.add(int(ts_ms), float(notional_usd))
+            self._round2_sell_trade_notional_3000.update(int(ts_ms), float(notional_usd))
             self.last_sell_trade_ts = int(ts_ms)
             self.consecutive_sell_trade_count += 1
             self.consecutive_buy_trade_count = 0
