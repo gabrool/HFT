@@ -6163,8 +6163,8 @@ class FeatureEngine:
         same_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["same_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, ROUND2_EPS), 0.0)
         self._round2_post_buy_bid_add_500.prune(ts_ms)
         self._round2_post_sell_ask_add_500.prune(ts_ms)
-        post_buy_support = self._safe_div(self._round2_post_buy_bid_add_500.sum_value(), max(trade_stats_by_ms[500]["buy_notional_usd"], ROUND2_EPS), 0.0)
-        post_sell_support = self._safe_div(self._round2_post_sell_ask_add_500.sum_value(), max(trade_stats_by_ms[500]["sell_notional_usd"], ROUND2_EPS), 0.0)
+        post_buy_support = self._safe_ratio_clip(self._round2_post_buy_bid_add_500.sum_value(), max(trade_stats_by_ms[500]["buy_notional_usd"], ROUND2_EPS), 0.0)
+        post_sell_support = self._safe_ratio_clip(self._round2_post_sell_ask_add_500.sum_value(), max(trade_stats_by_ms[500]["sell_notional_usd"], ROUND2_EPS), 0.0)
         trade_side_quote_response_asymmetry_500ms = self._safe_asym_ratio(post_buy_support, post_sell_support)
         bid_l2 = float(self.bid_lvls[1][0] * self.bid_lvls[1][1]) if len(self.bid_lvls) > 1 else 0.0
         ask_l2 = float(self.ask_lvls[1][0] * self.ask_lvls[1][1]) if len(self.ask_lvls) > 1 else 0.0
