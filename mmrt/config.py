@@ -1,0 +1,306 @@
+"""This module contains immutable default configuration objects for the new microsecond-native Tardis/Binance linear market-making pipeline. It is intentionally IO-free and does not read environment variables."""
+
+from dataclasses import dataclass, field
+from typing import Iterable
+
+from mmrt.contracts import (
+    AsOfPolicy,
+    DecisionReason,
+    LabelSpec,
+    PriceReference,
+    StorageFormat,
+    TardisDataType,
+    TimeUnit,
+)
+
+US_PER_MS = 1_000
+US_PER_SECOND = 1_000_000
+
+DEFAULT_EXCHANGE = "binance-futures"
+DEFAULT_SYMBOL = "BTCUSDT"
+
+DEFAULT_SOURCE_DATA_TYPES = (
+    TardisDataType.BOOK_SNAPSHOT_25,
+    TardisDataType.TRADES,
+)
+
+DEFAULT_DISABLED_CONTEXT_DATA_TYPES = (
+    TardisDataType.DERIVATIVE_TICKER,
+    TardisDataType.LIQUIDATIONS,
+    TardisDataType.BOOK_TICKER,
+)
+
+DEFAULT_HORIZONS_US = (
+    200_000,
+    500_000,
+    1_000_000,
+)
+DEFAULT_ENTRY_DELAY_US = 1_000
+
+DEFAULT_LOOKBACK_ROWS = 10
+DEFAULT_DECISION_REASON = DecisionReason.BOOK_EVENT
+DEFAULT_DECISION_POLICY = "book_event"
+DEFAULT_DECISION_STRIDE_ROWS = 1
+
+DEFAULT_PIPELINE_SCHEMA_VERSION = "mmrt_pipeline_config_v1"
+DEFAULT_FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v1"
+DEFAULT_STORAGE_FORMAT = StorageFormat.FLAT_DECISION_ROWS_US_V1
+DEFAULT_TIME_UNIT = TimeUnit.MICROSECOND
+
+DEFAULT_STRICT_VALIDATION = True
+DEFAULT_FAIL_ON_NON_MONOTONIC_LOCAL_TS = True
+DEFAULT_ALLOW_EQUAL_LOCAL_TS = True
+DEFAULT_DROP_DUPLICATE_TRADES = True
+
+DEFAULT_FEATURE_DTYPE = "float32"
+DEFAULT_LABEL_DTYPE = "float32"
+DEFAULT_TIMESTAMP_DTYPE = "int64"
+
+
+def _require_nonempty_str(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _require_positive_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive int")
+    return value
+
+
+def _require_nonnegative_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative int")
+    return value
+
+
+def _require_bool(value: bool, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be bool")
+    return value
+
+
+def _tuple_of_unique_data_types(values: Iterable[TardisDataType | str], name: str) -> tuple[TardisDataType, ...]:
+    seq = tuple(values)
+    out: list[TardisDataType] = []
+    for idx, value in enumerate(seq):
+        try:
+            out.append(TardisDataType(value))
+        except ValueError as exc:
+            raise ValueError(f"{name}[{idx}] has invalid data type {value!r}") from exc
+    if len(set(out)) != len(out):
+        raise ValueError(f"{name} must contain unique data types")
+    return tuple(out)
+
+
+def _tuple_of_positive_ints(values: Iterable[int], name: str, *, sort: bool = False) -> tuple[int, ...]:
+    seq = tuple(values)
+    out: list[int] = []
+    for idx, value in enumerate(seq):
+        out.append(_require_positive_int(value, f"{name}[{idx}]"))
+    if len(set(out)) != len(out):
+        raise ValueError(f"{name} must contain unique values")
+    return tuple(sorted(out) if sort else out)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketConfig:
+    exchange: str = DEFAULT_EXCHANGE
+    symbol: str = DEFAULT_SYMBOL
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.exchange, "exchange")
+        _require_nonempty_str(self.symbol, "symbol")
+
+
+@dataclass(frozen=True, slots=True)
+class DataConfig:
+    source_data_types: tuple[TardisDataType, ...] = DEFAULT_SOURCE_DATA_TYPES
+    disabled_context_data_types: tuple[TardisDataType, ...] = DEFAULT_DISABLED_CONTEXT_DATA_TYPES
+    strict_validation: bool = DEFAULT_STRICT_VALIDATION
+    fail_on_non_monotonic_local_ts: bool = DEFAULT_FAIL_ON_NON_MONOTONIC_LOCAL_TS
+    allow_equal_local_ts: bool = DEFAULT_ALLOW_EQUAL_LOCAL_TS
+    drop_duplicate_trades: bool = DEFAULT_DROP_DUPLICATE_TRADES
+
+    def __post_init__(self) -> None:
+        source = _tuple_of_unique_data_types(self.source_data_types, "source_data_types")
+        if not source:
+            raise ValueError("source_data_types must be non-empty")
+        disabled = _tuple_of_unique_data_types(self.disabled_context_data_types, "disabled_context_data_types")
+        if set(source).intersection(disabled):
+            raise ValueError("source_data_types and disabled_context_data_types must not overlap")
+        _require_bool(self.strict_validation, "strict_validation")
+        _require_bool(self.fail_on_non_monotonic_local_ts, "fail_on_non_monotonic_local_ts")
+        _require_bool(self.allow_equal_local_ts, "allow_equal_local_ts")
+        _require_bool(self.drop_duplicate_trades, "drop_duplicate_trades")
+        object.__setattr__(self, "source_data_types", source)
+        object.__setattr__(self, "disabled_context_data_types", disabled)
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionConfig:
+    policy: str = DEFAULT_DECISION_POLICY
+    reason: DecisionReason = DEFAULT_DECISION_REASON
+    stride_rows: int = DEFAULT_DECISION_STRIDE_ROWS
+
+    def __post_init__(self) -> None:
+        if _require_nonempty_str(self.policy, "policy") != DEFAULT_DECISION_POLICY:
+            raise ValueError("policy must be 'book_event' for v1")
+        try:
+            reason = DecisionReason(self.reason)
+        except ValueError as exc:
+            raise ValueError("reason must be DecisionReason.BOOK_EVENT for v1") from exc
+        if reason != DecisionReason.BOOK_EVENT:
+            raise ValueError("reason must be DecisionReason.BOOK_EVENT for v1")
+        if _require_positive_int(self.stride_rows, "stride_rows") != 1:
+            raise ValueError("stride_rows must be 1 for v1")
+        object.__setattr__(self, "reason", reason)
+
+
+@dataclass(frozen=True, slots=True)
+class LabelConfig:
+    horizons_us: tuple[int, ...] = DEFAULT_HORIZONS_US
+    entry_delay_us: int = DEFAULT_ENTRY_DELAY_US
+    price_reference: PriceReference = PriceReference.MID
+    asof_policy: AsOfPolicy = AsOfPolicy.LAST_OBSERVATION
+
+    def __post_init__(self) -> None:
+        horizons = _tuple_of_positive_ints(self.horizons_us, "horizons_us", sort=True)
+        if not horizons:
+            raise ValueError("horizons_us must be non-empty")
+        entry_delay = _require_nonnegative_int(self.entry_delay_us, "entry_delay_us")
+        try:
+            price_reference = PriceReference(self.price_reference)
+        except ValueError as exc:
+            raise ValueError("price_reference has invalid value") from exc
+        if price_reference != PriceReference.MID:
+            raise ValueError("price_reference must be PriceReference.MID for v1")
+        try:
+            asof_policy = AsOfPolicy(self.asof_policy)
+        except ValueError as exc:
+            raise ValueError("asof_policy has invalid value") from exc
+        if asof_policy != AsOfPolicy.LAST_OBSERVATION:
+            raise ValueError("asof_policy must be AsOfPolicy.LAST_OBSERVATION for v1")
+        object.__setattr__(self, "horizons_us", horizons)
+        object.__setattr__(self, "entry_delay_us", entry_delay)
+        object.__setattr__(self, "price_reference", price_reference)
+        object.__setattr__(self, "asof_policy", asof_policy)
+
+    def to_label_spec(self) -> LabelSpec:
+        return LabelSpec(
+            horizons_us=self.horizons_us,
+            entry_delay_us=self.entry_delay_us,
+            price_reference=self.price_reference,
+            asof_policy=self.asof_policy,
+        )
+
+    @property
+    def label_context_us(self) -> int:
+        return self.entry_delay_us + max(self.horizons_us)
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureRuntimeConfig:
+    lookback_rows: int = DEFAULT_LOOKBACK_ROWS
+    feature_dtype: str = DEFAULT_FEATURE_DTYPE
+    label_dtype: str = DEFAULT_LABEL_DTYPE
+    timestamp_dtype: str = DEFAULT_TIMESTAMP_DTYPE
+
+    def __post_init__(self) -> None:
+        _require_positive_int(self.lookback_rows, "lookback_rows")
+        if self.feature_dtype != "float32":
+            raise ValueError("feature_dtype must be 'float32' for v1")
+        if self.label_dtype != "float32":
+            raise ValueError("label_dtype must be 'float32' for v1")
+        if self.timestamp_dtype != "int64":
+            raise ValueError("timestamp_dtype must be 'int64' for v1")
+
+
+@dataclass(frozen=True, slots=True)
+class StorageConfig:
+    storage_format: StorageFormat = DEFAULT_STORAGE_FORMAT
+    time_unit: TimeUnit = DEFAULT_TIME_UNIT
+    pipeline_schema_version: str = DEFAULT_PIPELINE_SCHEMA_VERSION
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        try:
+            storage_format = StorageFormat(self.storage_format)
+        except ValueError as exc:
+            raise ValueError("storage_format has invalid value") from exc
+        if storage_format != StorageFormat.FLAT_DECISION_ROWS_US_V1:
+            raise ValueError("storage_format must be StorageFormat.FLAT_DECISION_ROWS_US_V1 for v1")
+        try:
+            time_unit = TimeUnit(self.time_unit)
+        except ValueError as exc:
+            raise ValueError("time_unit has invalid value") from exc
+        if time_unit != TimeUnit.MICROSECOND:
+            raise ValueError("time_unit must be TimeUnit.MICROSECOND for v1")
+        _require_nonempty_str(self.pipeline_schema_version, "pipeline_schema_version")
+        _require_nonempty_str(self.feature_schema_version, "feature_schema_version")
+        object.__setattr__(self, "storage_format", storage_format)
+        object.__setattr__(self, "time_unit", time_unit)
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineConfig:
+    market: MarketConfig = field(default_factory=MarketConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    decision: DecisionConfig = field(default_factory=DecisionConfig)
+    labels: LabelConfig = field(default_factory=LabelConfig)
+    runtime: FeatureRuntimeConfig = field(default_factory=FeatureRuntimeConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
+
+    def __post_init__(self) -> None:
+        required = {TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES}
+        if not required.issubset(set(DEFAULT_SOURCE_DATA_TYPES)):
+            raise ValueError("DEFAULT_SOURCE_DATA_TYPES must include BOOK_SNAPSHOT_25 and TRADES")
+        forbidden = {TardisDataType.BOOK_SNAPSHOT_5, TardisDataType.QUOTES, TardisDataType.OPTIONS_CHAIN}
+        if set(self.data.source_data_types).intersection(forbidden):
+            raise ValueError("source_data_types includes unsupported types for v1")
+
+    @property
+    def label_spec(self) -> LabelSpec:
+        return self.labels.to_label_spec()
+
+    @property
+    def source_data_type_values(self) -> tuple[str, ...]:
+        return tuple(dtype.value for dtype in self.data.source_data_types)
+
+
+def default_config() -> PipelineConfig:
+    return PipelineConfig()
+
+
+def default_label_spec() -> LabelSpec:
+    return default_config().label_spec
+
+
+__all__ = [
+    "US_PER_MS",
+    "US_PER_SECOND",
+    "DEFAULT_EXCHANGE",
+    "DEFAULT_SYMBOL",
+    "DEFAULT_SOURCE_DATA_TYPES",
+    "DEFAULT_DISABLED_CONTEXT_DATA_TYPES",
+    "DEFAULT_HORIZONS_US",
+    "DEFAULT_ENTRY_DELAY_US",
+    "DEFAULT_LOOKBACK_ROWS",
+    "DEFAULT_DECISION_POLICY",
+    "DEFAULT_DECISION_STRIDE_ROWS",
+    "DEFAULT_PIPELINE_SCHEMA_VERSION",
+    "DEFAULT_FEATURE_SCHEMA_VERSION",
+    "DEFAULT_FEATURE_DTYPE",
+    "DEFAULT_LABEL_DTYPE",
+    "DEFAULT_TIMESTAMP_DTYPE",
+    "MarketConfig",
+    "DataConfig",
+    "DecisionConfig",
+    "LabelConfig",
+    "FeatureRuntimeConfig",
+    "StorageConfig",
+    "PipelineConfig",
+    "default_config",
+    "default_label_spec",
+]
