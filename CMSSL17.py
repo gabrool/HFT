@@ -3611,6 +3611,8 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             or name.startswith("sell_trade_count_")
         ):
             s = log_ewma(name, XFORM_HL_FAST_MS)
+        elif name in {"ob_arrival_clumpiness_3000ms", "trade_sign_entropy_3000ms", "opposite_side_replenishment_after_depletion_200ms", "same_side_replenishment_after_depletion_200ms", "trade_side_quote_response_asymmetry_500ms", "near_touch_depth_drop_asymmetry"}:
+            s = bounded(name, out=1.5)
         elif (
             name.startswith("l1_bid_depletion_rate_")
             or name.startswith("l1_ask_depletion_rate_")
@@ -3643,8 +3645,6 @@ def build_feature_transform_specs(feature_names: Sequence[str]) -> List[FeatureT
             s = log_ewma(name, XFORM_HL_FAST_MS)
         elif name in {"max_trade_silence_gap_3000ms", "mid_unchanged_and_depth_stable_ms", "best_bid_size_age_ms", "best_ask_size_age_ms"}:
             s = log_ms(name)
-        elif name in {"ob_arrival_clumpiness_3000ms", "trade_sign_entropy_3000ms", "opposite_side_replenishment_after_depletion_200ms", "same_side_replenishment_after_depletion_200ms", "trade_side_quote_response_asymmetry_500ms", "near_touch_depth_drop_asymmetry"}:
-            s = bounded(name, out=1.5)
         elif name in {"touch_flicker_score_3000ms", "spread_state_transition_rate_3000ms", "mid_price_run_length_max_3000ms", "buy_trade_p90_over_median_3000ms", "sell_trade_p90_over_median_3000ms"}:
             s = log_ewma(name, XFORM_HL_FAST_MS)
         elif name in {"ask_depth_centroid_bps_25bps", "bid_depth_centroid_bps_25bps", "microprice_realized_vol_1000ms"}:
