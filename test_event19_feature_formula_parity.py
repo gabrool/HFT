@@ -2,7 +2,7 @@ import math
 import numpy as np
 import pytest
 
-from CMSSL17 import FeatureEngine, ROUND2_PRODUCTION_EVENT_FEATURES, FEATURE_SCHEMA, FEATURE_TRANSFORM, CHECKPOINT_SCHEMA, build_feature_transform_specs, AUX_DIM
+from CMSSL17 import FeatureEngine, ROUND2_PRODUCTION_EVENT_FEATURES, FEATURE_SCHEMA, FEATURE_TRANSFORM, CHECKPOINT_SCHEMA, build_feature_transform_specs, AUX_DIM, ROUND2_EPS
 from feature_event_candidates_round2 import NovelMicrostructureCandidatePack
 
 
@@ -156,6 +156,26 @@ def test_event19_trade_side_quote_response_asymmetry_hand_formula():
     assert np.isfinite(cm["trade_side_quote_response_asymmetry_500ms"])
     assert cm["trade_side_quote_response_asymmetry_500ms"]==pytest.approx(exp,rel=1e-6,abs=1e-6)
     assert cm["trade_side_quote_response_asymmetry_500ms"]==pytest.approx(rf["trade_side_quote_response_asymmetry_500ms"],rel=1e-6,abs=1e-6)
+
+def test_event19_quote_response_ignores_floating_dust_without_side_trades():
+    eng = make_engine_identity()
+    events = [
+        ("ob", 0, 1, 1, [(100.00, 10.0)], [(100.02, 10.0)]),
+        ("trade", 100, 2, 100.02, 2.0, 1, 1, 0),
+        ("ob", 150, 3, 1, [(100.00, 12.0)], [(100.02, 10.0)]),
+    ]
+    for ev in events:
+        out = eng.on_fast_event(ev)
+        if ev[0] == "ob":
+            assert out.is_decision
+    eng._round2_post_sell_ask_add_500.update(200, ROUND2_EPS * 0.1)
+    final = eng.on_fast_event(("ob", 200, 4, 1, [(100.00, 12.0)], [(100.02, 10.0)]))
+    assert final.is_decision
+    cm = dict(zip(eng.feature_names(), final.features))
+    buy_notional_500 = 100.02 * 2.0
+    post_buy_support = 200.0 / buy_notional_500
+    expected = post_buy_support / (abs(post_buy_support) + ROUND2_EPS)
+    assert cm["trade_side_quote_response_asymmetry_500ms"] == pytest.approx(expected, rel=1e-6, abs=1e-6)
 
 def test_event19_trade_impact_half_life_proxy_hand_formula():
     ev=[("ob",0,1,1,[(99.99,10.0)],[(100.01,10.0)]),("trade",100,2,100.01,2.0,1,1,0),("ob",600,3,1,[(99.99,11.0)],[(100.01,9.0)]),("trade",700,4,99.99,1.0,-1,-1,0),("ob",800,5,1,[(100.04,10.0)],[(100.06,10.0)])]

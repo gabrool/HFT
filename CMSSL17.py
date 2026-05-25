@@ -4818,7 +4818,7 @@ class FeatureEngine:
     def _safe_ratio_clip(self, num: float, den: float, default: float = 0.0, clip: float = 100.0) -> float:
         return float(np.clip(self._safe_div(num, den, default), -abs(float(clip)), abs(float(clip))))
     def _safe_asym_ratio(self, a: float, b: float) -> float:
-        return self._safe_div(float(a) - float(b), abs(float(a)) + abs(float(b)) + 1e-12, 0.0)
+        return self._safe_div(float(a) - float(b), abs(float(a)) + abs(float(b)) + ROUND2_EPS, 0.0)
     def _prune_ts_deque_plain(self, deq: Deque[int], now_ms: int, window_ms: int) -> None:
         cutoff = int(now_ms) - int(window_ms)
         while deq and int(deq[0]) < cutoff:
@@ -6163,8 +6163,14 @@ class FeatureEngine:
         same_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["same_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, ROUND2_EPS), 0.0)
         self._round2_post_buy_bid_add_500.prune(ts_ms)
         self._round2_post_sell_ask_add_500.prune(ts_ms)
-        post_buy_support = self._safe_ratio_clip(self._round2_post_buy_bid_add_500.sum_value(), max(trade_stats_by_ms[500]["buy_notional_usd"], ROUND2_EPS), 0.0)
-        post_sell_support = self._safe_ratio_clip(self._round2_post_sell_ask_add_500.sum_value(), max(trade_stats_by_ms[500]["sell_notional_usd"], ROUND2_EPS), 0.0)
+        post_buy_bid_add_500 = float(self._round2_post_buy_bid_add_500.sum_value())
+        post_sell_ask_add_500 = float(self._round2_post_sell_ask_add_500.sum_value())
+        if abs(post_buy_bid_add_500) <= ROUND2_EPS:
+            post_buy_bid_add_500 = 0.0
+        if abs(post_sell_ask_add_500) <= ROUND2_EPS:
+            post_sell_ask_add_500 = 0.0
+        post_buy_support = self._safe_ratio_clip(post_buy_bid_add_500, max(trade_stats_by_ms[500]["buy_notional_usd"], ROUND2_EPS), 0.0)
+        post_sell_support = self._safe_ratio_clip(post_sell_ask_add_500, max(trade_stats_by_ms[500]["sell_notional_usd"], ROUND2_EPS), 0.0)
         trade_side_quote_response_asymmetry_500ms = self._safe_asym_ratio(post_buy_support, post_sell_support)
         bid_l2 = float(self.bid_lvls[1][0] * self.bid_lvls[1][1]) if len(self.bid_lvls) > 1 else 0.0
         ask_l2 = float(self.ask_lvls[1][0] * self.ask_lvls[1][1]) if len(self.ask_lvls) > 1 else 0.0
