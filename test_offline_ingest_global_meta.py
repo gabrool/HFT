@@ -39,7 +39,7 @@ _install_optional_dependency_stubs()
 offline_ingest = importlib.import_module("offline_ingest")
 
 
-def test_global_meta_pruned153_event10_has_required_linear_keys(tmp_path):
+def test_global_meta_pruned172_event10_has_required_linear_keys(tmp_path):
     weeks = [
         "22-02-2026-to-28-02-2026",
         "01-03-2026-to-07-03-2026",
@@ -84,11 +84,15 @@ def test_global_meta_pruned153_event10_has_required_linear_keys(tmp_path):
         duplicate_decision_ts_count=0,
     )
 
-    assert meta["feature_dim_core"] == 153
-    assert meta["feature_dim_total"] == 159
+    assert meta["feature_dim_core"] == 172
+    assert meta["feature_dim_total"] == 178
     assert meta["lookback"] == 10
-    assert len(meta["feature_names"]) == 153
+    assert len(meta["feature_names"]) == 172
     assert len(meta["aux_feature_names"]) == 6
+    assert meta["feature_schema"] == offline_ingest.FEATURE_SCHEMA
+    assert meta["feature_transform"] == offline_ingest.FEATURE_TRANSFORM
+    assert "pruned172" in meta["feature_schema"]
+    assert "round2xformv3" in meta["feature_transform"]
     assert "splits" in meta
     splits = meta["splits"]
     assert splits["protocol"] == offline_ingest.FIVE_WEEK_PROTOCOL
