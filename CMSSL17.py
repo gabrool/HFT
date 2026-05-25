@@ -3274,6 +3274,30 @@ class RollingPriceWindowState:
         high = self.sorted_prices[-1]
         return float(1e4 * math.log(high / low)) if high > 0.0 and low > 0.0 else 0.0
 
+ROUND2_EPS = 1e-9
+
+def _round2_finite_float(x, clip=1e9):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    c = abs(float(clip))
+    return float(np.clip(v, -c, c))
+
+def _round2_safe_div(num, den, *, clip=100.0):
+    d = abs(float(den))
+    if d <= ROUND2_EPS:
+        return 0.0
+    return _round2_finite_float(float(num) / d, clip=clip)
+
+def _round2_asym(a, b, *, clip=100.0):
+    denom = abs(float(a)) + abs(float(b))
+    if denom <= ROUND2_EPS:
+        return 0.0
+    return _round2_finite_float((float(a) - float(b)) / denom, clip=clip)
+
 class Round2InterarrivalState:
     def __init__(self, max_window_ms: int):
         self.max_window_ms = int(max_window_ms)
@@ -3308,7 +3332,7 @@ class Round2InterarrivalState:
         arr = np.asarray(vals, dtype=np.float64)
         p10 = float(np.percentile(arr, 10))
         p90 = float(np.percentile(arr, 90))
-        return _finite_float((p90 - p10) / max(p90 + p10, EPS), clip=100.0)
+        return _round2_finite_float((p90 - p10) / max(p90 + p10, ROUND2_EPS), clip=100.0)
 
 
 class PriceAsofHistory:
@@ -4861,7 +4885,7 @@ class FeatureEngine:
         if not vals:
             return 0.0
         med = float(np.median(np.asarray(vals, dtype=np.float64)))
-        if med <= EPS:
+        if med <= ROUND2_EPS:
             return 0.0
         return float(np.clip(float(np.percentile(np.asarray(vals, dtype=np.float64), 90)) / med, -100.0, 100.0))
 
@@ -5821,7 +5845,7 @@ class FeatureEngine:
         else:
             pm = float(self._round2_prev_stable_mid)
             pd = float(self._round2_prev_stable_depth_5bps_notional)
-            if abs(mid - pm) > 1e-12 or self._safe_div(abs(total_depth_5 - pd), max(abs(pd), EPS), 0.0) > 0.01:
+            if abs(mid - pm) > 1e-12 or self._safe_div(abs(total_depth_5 - pd), max(abs(pd), ROUND2_EPS), 0.0) > 0.01:
                 self._round2_stable_break_ts = int(ts_ms)
                 self._round2_prev_stable_mid = float(mid)
                 self._round2_prev_stable_depth_5bps_notional = float(total_depth_5)
@@ -6113,24 +6137,24 @@ class FeatureEngine:
         best_ask_size_age_ms = 0.0 if self._round2_best_ask_size_change_ts is None else float(min(max(ts_ms - self._round2_best_ask_size_change_ts, 0), 60000))
         active_dep = [d for d in self._round2_depletion_trackers if ts_ms - int(d["ts"]) <= 200]
         dep_den = sum(float(d["amount"]) for d in active_dep)
-        opposite_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["opp_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, EPS), 0.0)
-        same_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["same_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, EPS), 0.0)
+        opposite_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["opp_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, ROUND2_EPS), 0.0)
+        same_side_replenishment_after_depletion_200ms = self._safe_div(sum(min(float(d["same_recovered"]), float(d["amount"])) for d in active_dep), max(dep_den, ROUND2_EPS), 0.0)
         self._round2_post_buy_bid_add_500.prune(ts_ms)
         self._round2_post_sell_ask_add_500.prune(ts_ms)
-        post_buy_support = self._safe_div(self._round2_post_buy_bid_add_500.sum_value(), max(trade_stats_by_ms[500]["buy_notional_usd"], EPS), 0.0)
-        post_sell_support = self._safe_div(self._round2_post_sell_ask_add_500.sum_value(), max(trade_stats_by_ms[500]["sell_notional_usd"], EPS), 0.0)
+        post_buy_support = self._safe_div(self._round2_post_buy_bid_add_500.sum_value(), max(trade_stats_by_ms[500]["buy_notional_usd"], ROUND2_EPS), 0.0)
+        post_sell_support = self._safe_div(self._round2_post_sell_ask_add_500.sum_value(), max(trade_stats_by_ms[500]["sell_notional_usd"], ROUND2_EPS), 0.0)
         trade_side_quote_response_asymmetry_500ms = self._safe_asym_ratio(post_buy_support, post_sell_support)
         bid_l2 = float(self.bid_lvls[1][0] * self.bid_lvls[1][1]) if len(self.bid_lvls) > 1 else 0.0
         ask_l2 = float(self.ask_lvls[1][0] * self.ask_lvls[1][1]) if len(self.ask_lvls) > 1 else 0.0
-        bid_drop = self._safe_div(max(0.0, bid_l1_notional_usd - bid_l2), max(bid_l1_notional_usd, EPS), 0.0)
-        ask_drop = self._safe_div(max(0.0, ask_l1_notional_usd - ask_l2), max(ask_l1_notional_usd, EPS), 0.0)
+        bid_drop = self._safe_div(max(0.0, bid_l1_notional_usd - bid_l2), max(bid_l1_notional_usd, ROUND2_EPS), 0.0)
+        ask_drop = self._safe_div(max(0.0, ask_l1_notional_usd - ask_l2), max(ask_l1_notional_usd, ROUND2_EPS), 0.0)
         near_touch_depth_drop_asymmetry = self._safe_asym_ratio(bid_drop, ask_drop)
         impact_200_num = impact_200_den = impact_1000_num = impact_1000_den = 0.0
         for rec in self._round2_trade_impact_records:
             age = ts_ms - int(rec["ts"])
             if age > 1000:
                 continue
-            m0 = max(float(rec["mid_at_trade"]), EPS)
+            m0 = max(float(rec["mid_at_trade"]), ROUND2_EPS)
             imp = (1e4 * (mid - m0) / m0) if int(rec["side"]) > 0 else (1e4 * (m0 - mid) / m0)
             w = float(rec["notional"])
             impact_1000_num += abs(imp) * w
@@ -6138,9 +6162,9 @@ class FeatureEngine:
             if age <= 200:
                 impact_200_num += abs(imp) * w
                 impact_200_den += w
-        impact_200 = self._safe_div(impact_200_num, max(impact_200_den, EPS), 0.0)
-        impact_1000 = self._safe_div(impact_1000_num, max(impact_1000_den, EPS), 0.0)
-        trade_impact_half_life_proxy = float(np.clip(math.log(max(impact_200, EPS) / max(impact_1000, EPS)) / math.log(5.0), -10.0, 10.0)) if impact_200 > EPS and impact_1000 > EPS else 0.0
+        impact_200 = self._safe_div(impact_200_num, max(impact_200_den, ROUND2_EPS), 0.0)
+        impact_1000 = self._safe_div(impact_1000_num, max(impact_1000_den, ROUND2_EPS), 0.0)
+        trade_impact_half_life_proxy = float(np.clip(math.log(max(impact_200, ROUND2_EPS) / max(impact_1000, ROUND2_EPS)) / math.log(5.0), -10.0, 10.0)) if impact_200 > ROUND2_EPS and impact_1000 > ROUND2_EPS else 0.0
         round2_values = [touch_flicker_score_3000ms, spread_state_transition_rate_3000ms, max_trade_silence_gap_3000ms, ask_depth_centroid_bps_25bps, bid_depth_centroid_bps_25bps, microprice_realized_vol_1000ms, buy_trade_p90_over_median_3000ms, sell_trade_p90_over_median_3000ms, ob_arrival_clumpiness_3000ms, trade_sign_entropy_3000ms, mid_price_run_length_max_3000ms, mid_unchanged_and_depth_stable_ms, best_bid_size_age_ms, best_ask_size_age_ms, opposite_side_replenishment_after_depletion_200ms, same_side_replenishment_after_depletion_200ms, trade_side_quote_response_asymmetry_500ms, near_touch_depth_drop_asymmetry, trade_impact_half_life_proxy]
         if len(round2_values) != len(ROUND2_PRODUCTION_EVENT_FEATURES):
             raise RuntimeError("round2 feature length mismatch")
