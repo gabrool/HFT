@@ -84,7 +84,7 @@ def _require_nonempty_str(value: str, name: str) -> str:
 
 
 def _require_int_us(value: int, name: str, *, allow_zero: bool = False) -> int:
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an int")
     if allow_zero:
         if value < 0:
@@ -95,19 +95,19 @@ def _require_int_us(value: int, name: str, *, allow_zero: bool = False) -> int:
 
 
 def _require_nonnegative_int(value: int, name: str) -> int:
-    if not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative int")
     return value
 
 
 def _require_positive_float(value: float, name: str) -> float:
-    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a finite float > 0")
     return float(value)
 
 
 def _require_nonnegative_float(value: float, name: str) -> float:
-    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite float >= 0")
     return float(value)
 
@@ -122,7 +122,7 @@ def _tuple_of_ints(values: Any, name: str, *, positive: bool = True) -> tuple[in
         if positive:
             out.append(_require_int_us(v, f"{name}[{idx}]"))
         else:
-            if not isinstance(v, int):
+            if isinstance(v, bool) or not isinstance(v, int):
                 raise ValueError(f"{name}[{idx}] must be int")
             out.append(v)
     return tuple(out)
@@ -135,7 +135,7 @@ def _tuple_of_floats(values: Any, name: str) -> tuple[float, ...]:
         seq = tuple(values)
     out: list[float] = []
     for idx, v in enumerate(seq):
-        if not isinstance(v, (int, float)) or not math.isfinite(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
             raise ValueError(f"{name}[{idx}] must be finite float")
         out.append(float(v))
     return tuple(out)
@@ -202,6 +202,10 @@ class BookSnapshotEvent:
             raise ValueError("meta.source_data_type must be BOOK_SNAPSHOT_25 or BOOK_SNAPSHOT_5")
         if self.depth_limit not in (5, 25):
             raise ValueError("depth_limit must be 5 or 25")
+        if self.meta.source_data_type == TardisDataType.BOOK_SNAPSHOT_5 and self.depth_limit != 5:
+            raise ValueError("depth_limit must be 5 for BOOK_SNAPSHOT_5")
+        if self.meta.source_data_type == TardisDataType.BOOK_SNAPSHOT_25 and self.depth_limit != 25:
+            raise ValueError("depth_limit must be 25 for BOOK_SNAPSHOT_25")
         if len(self.bids) > self.depth_limit or len(self.asks) > self.depth_limit:
             raise ValueError("bids/asks exceed depth_limit")
         for lvl in self.bids:
@@ -263,6 +267,8 @@ class BookDeltaEvent:
         object.__setattr__(self, "side", _coerce_enum(BookSide, self.side, "side"))
         _require_positive_float(self.price, "price")
         _require_nonnegative_float(self.amount, "amount")
+        if not isinstance(self.is_snapshot, bool):
+            raise ValueError("is_snapshot must be bool")
 
     @property
     def event_type(self) -> EventType:
@@ -400,6 +406,8 @@ class FeatureBuildResult:
         }.get(self.meta.source_data_type)
         if expected_event_type is not None and self.event_type != expected_event_type:
             raise ValueError("event_type must match originating event type")
+        if not isinstance(self.is_decision, bool):
+            raise ValueError("is_decision must be bool")
         _require_int_us(self.dt_us, "dt_us", allow_zero=True)
         feats = _tuple_of_floats(self.features, "features")
         object.__setattr__(self, "features", feats)
@@ -442,10 +450,12 @@ class LabelSpec:
     asof_policy: AsOfPolicy = AsOfPolicy.LAST_OBSERVATION
 
     def __post_init__(self) -> None:
-        horizons = sorted(set(_tuple_of_ints(self.horizons_us, "horizons_us", positive=True)))
+        horizons = _tuple_of_ints(self.horizons_us, "horizons_us", positive=True)
         if not horizons:
             raise ValueError("horizons_us must be non-empty")
-        object.__setattr__(self, "horizons_us", tuple(horizons))
+        if len(set(horizons)) != len(horizons):
+            raise ValueError("horizons_us must not contain duplicates")
+        object.__setattr__(self, "horizons_us", tuple(sorted(horizons)))
         _require_int_us(self.entry_delay_us, "entry_delay_us", allow_zero=True)
         object.__setattr__(self, "price_reference", _coerce_enum(PriceReference, self.price_reference, "price_reference"))
         object.__setattr__(self, "asof_policy", _coerce_enum(AsOfPolicy, self.asof_policy, "asof_policy"))
@@ -468,11 +478,15 @@ class LabelResult:
         if self.entry_ts_us < self.decision_ts_us:
             raise ValueError("entry_ts_us must be >= decision_ts_us")
         horizons = _tuple_of_ints(self.horizons_us, "horizons_us", positive=True)
+        vals = _tuple_of_floats(self.values_bps, "values_bps")
+        object.__setattr__(self, "horizons_us", horizons)
+        object.__setattr__(self, "values_bps", vals)
         if not horizons:
             raise ValueError("horizons_us must be non-empty")
         if tuple(sorted(horizons)) != horizons:
             raise ValueError("horizons_us must be sorted ascending")
-        vals = _tuple_of_floats(self.values_bps, "values_bps")
+        if len(set(horizons)) != len(horizons):
+            raise ValueError("horizons_us must not contain duplicates")
         if len(vals) != len(horizons):
             raise ValueError("values_bps length must match horizons_us")
 
@@ -568,9 +582,7 @@ class DatasetManifest:
     lookback_rows: int
     feature_schema_version: str
     feature_names_hash: str
-    feature_dim_core: int
-    aux_dim: int
-    feature_dim_total: int
+    feature_dim: int
     segments: tuple[SegmentSpec, ...]
     split_plan: SplitPlan | None = None
 
@@ -592,15 +604,13 @@ class DatasetManifest:
         _require_int_us(self.lookback_rows, "lookback_rows")
         _require_nonempty_str(self.feature_schema_version, "feature_schema_version")
         _require_nonempty_str(self.feature_names_hash, "feature_names_hash")
-        _require_int_us(self.feature_dim_core, "feature_dim_core")
-        _require_nonnegative_int(self.aux_dim, "aux_dim")
-        _require_int_us(self.feature_dim_total, "feature_dim_total")
-        if self.feature_dim_total != self.feature_dim_core + self.aux_dim:
-            raise ValueError("feature_dim_total must equal feature_dim_core + aux_dim")
+        _require_int_us(self.feature_dim, "feature_dim")
         if not isinstance(self.segments, tuple):
             object.__setattr__(self, "segments", tuple(self.segments))
         if not self.segments:
             raise ValueError("segments must be non-empty")
+        if self.split_plan is not None and not isinstance(self.split_plan, SplitPlan):
+            raise ValueError("split_plan must be SplitPlan or None")
 
     @property
     def total_rows(self) -> int:
@@ -609,3 +619,36 @@ class DatasetManifest:
     @property
     def total_labels(self) -> int:
         return sum(seg.label_count for seg in self.segments)
+
+
+__all__ = [
+    "TimeUnit",
+    "TardisDataType",
+    "EventType",
+    "BookSide",
+    "AggressorSide",
+    "DecisionReason",
+    "PriceReference",
+    "AsOfPolicy",
+    "SplitRole",
+    "StorageFormat",
+    "EventMeta",
+    "PriceLevel",
+    "BookSnapshotEvent",
+    "BookDeltaEvent",
+    "TradeEvent",
+    "BookTickerEvent",
+    "DerivativeTickerEvent",
+    "LiquidationEvent",
+    "MarketEvent",
+    "event_type",
+    "FeatureBuildResult",
+    "DecisionRowRef",
+    "LabelSpec",
+    "LabelResult",
+    "TimeRangeUS",
+    "SegmentSpec",
+    "SplitEntry",
+    "SplitPlan",
+    "DatasetManifest",
+]

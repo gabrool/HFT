@@ -1,3 +1,3 @@
-"""MMRT package."""
+"""MMRT: microsecond-native Tardis/Binance linear market-making pipeline."""
 
-from .contracts import *  # noqa: F401,F403
+__all__ = []
