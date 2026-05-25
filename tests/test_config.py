@@ -110,5 +110,48 @@ def test_pipeline_config_invariants() -> None:
         PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.OPTIONS_CHAIN, TardisDataType.TRADES)))
 
 
+def test_pipeline_config_requires_book_and_trades() -> None:
+    with pytest.raises(ValueError):
+        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.TRADES,)))
+    with pytest.raises(ValueError):
+        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25,)))
+
+
+def test_pipeline_config_allows_additional_supported_source_types() -> None:
+    cfg = PipelineConfig(
+        data=DataConfig(
+            source_data_types=(
+                TardisDataType.BOOK_SNAPSHOT_25,
+                TardisDataType.TRADES,
+                TardisDataType.DERIVATIVE_TICKER,
+            ),
+            disabled_context_data_types=(
+                TardisDataType.LIQUIDATIONS,
+                TardisDataType.BOOK_TICKER,
+            ),
+        )
+    )
+    assert cfg.data.source_data_types == (
+        TardisDataType.BOOK_SNAPSHOT_25,
+        TardisDataType.TRADES,
+        TardisDataType.DERIVATIVE_TICKER,
+    )
+
+
+def test_pipeline_config_rejects_invalid_nested_config_objects() -> None:
+    with pytest.raises(ValueError):
+        PipelineConfig(market="bad")
+    with pytest.raises(ValueError):
+        PipelineConfig(data="bad")
+    with pytest.raises(ValueError):
+        PipelineConfig(decision="bad")
+    with pytest.raises(ValueError):
+        PipelineConfig(labels="bad")
+    with pytest.raises(ValueError):
+        PipelineConfig(runtime="bad")
+    with pytest.raises(ValueError):
+        PipelineConfig(storage="bad")
+
+
 def test_label_config_v1_asof_policy() -> None:
     assert LabelConfig(asof_policy=AsOfPolicy.LAST_OBSERVATION).asof_policy == AsOfPolicy.LAST_OBSERVATION

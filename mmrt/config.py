@@ -253,11 +253,25 @@ class PipelineConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.market, MarketConfig):
+            raise ValueError("market must be MarketConfig")
+        if not isinstance(self.data, DataConfig):
+            raise ValueError("data must be DataConfig")
+        if not isinstance(self.decision, DecisionConfig):
+            raise ValueError("decision must be DecisionConfig")
+        if not isinstance(self.labels, LabelConfig):
+            raise ValueError("labels must be LabelConfig")
+        if not isinstance(self.runtime, FeatureRuntimeConfig):
+            raise ValueError("runtime must be FeatureRuntimeConfig")
+        if not isinstance(self.storage, StorageConfig):
+            raise ValueError("storage must be StorageConfig")
+
+        source = set(self.data.source_data_types)
         required = {TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES}
-        if not required.issubset(set(DEFAULT_SOURCE_DATA_TYPES)):
-            raise ValueError("DEFAULT_SOURCE_DATA_TYPES must include BOOK_SNAPSHOT_25 and TRADES")
+        if not required.issubset(source):
+            raise ValueError("source_data_types must include BOOK_SNAPSHOT_25 and TRADES for v1")
         forbidden = {TardisDataType.BOOK_SNAPSHOT_5, TardisDataType.QUOTES, TardisDataType.OPTIONS_CHAIN}
-        if set(self.data.source_data_types).intersection(forbidden):
+        if source.intersection(forbidden):
             raise ValueError("source_data_types includes unsupported types for v1")
 
     @property
