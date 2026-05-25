@@ -40,6 +40,76 @@ def test_event19_transform_specs_cover_all_features():
     smap = {s.name: s for s in specs}
     for n in ROUND2_PRODUCTION_EVENT_FEATURES: assert n in smap
 
+
+
+def test_event19_round2_transform_specs_exact():
+    names = FeatureEngine().feature_names()
+    specs = build_feature_transform_specs(names)
+    smap = {s.name: s for s in specs}
+
+    for n in ROUND2_PRODUCTION_EVENT_FEATURES:
+        assert n in smap
+
+    def assert_spec(name, raw, norm, half_life, output_clip):
+        spec = smap[name]
+        assert spec.raw_transform.name == raw
+        assert spec.normalize.name == norm
+        if half_life is None:
+            assert spec.half_life_ms in (0, None)
+        else:
+            assert spec.half_life_ms == half_life
+        assert spec.output_clip_abs == pytest.approx(output_clip)
+
+    fast = {
+        "touch_flicker_score_3000ms",
+        "spread_state_transition_rate_3000ms",
+        "buy_trade_p90_over_median_3000ms",
+        "sell_trade_p90_over_median_3000ms",
+        "mid_price_run_length_max_3000ms",
+    }
+    medium = {
+        "ask_depth_centroid_bps_25bps",
+        "bid_depth_centroid_bps_25bps",
+        "microprice_realized_vol_1000ms",
+    }
+    ms_age = {
+        "max_trade_silence_gap_3000ms",
+        "mid_unchanged_and_depth_stable_ms",
+        "best_bid_size_age_ms",
+        "best_ask_size_age_ms",
+    }
+    bounded = {
+        "ob_arrival_clumpiness_3000ms",
+        "trade_sign_entropy_3000ms",
+        "opposite_side_replenishment_after_depletion_200ms",
+        "same_side_replenishment_after_depletion_200ms",
+        "trade_side_quote_response_asymmetry_500ms",
+        "near_touch_depth_drop_asymmetry",
+    }
+
+    from CMSSL17 import XFORM_HL_FAST_MS, XFORM_HL_MEDIUM_MS
+
+    for n in fast:
+        assert_spec(n, "LOG1P_POS", "EWMA_Z", XFORM_HL_FAST_MS, 8.0)
+    for n in medium:
+        assert_spec(n, "LOG1P_POS", "EWMA_Z", XFORM_HL_MEDIUM_MS, 8.0)
+    for n in ms_age:
+        assert_spec(n, "LOG1P_MS", "NONE", None, 12.0)
+    for n in bounded:
+        assert_spec(n, "IDENTITY", "NONE", None, 1.5)
+
+    assert_spec("trade_impact_half_life_proxy", "IDENTITY", "NONE", None, 10.0)
+
+    opp = smap["opposite_side_replenishment_after_depletion_200ms"]
+    same = smap["same_side_replenishment_after_depletion_200ms"]
+    for spec in (opp, same):
+        assert not (
+            spec.raw_transform.name == "LOG1P_POS"
+            and spec.normalize.name == "EWMA_Z"
+            and spec.half_life_ms == XFORM_HL_FAST_MS
+            and spec.output_clip_abs == pytest.approx(8.0)
+        )
+
 RICH_VALID_EVENTS = [
     ("ob",0,1,1,[(100.00,10),(99.99,8),(99.98,5),(99.96,4),(99.94,3)],[(100.02,9),(100.03,7),(100.04,5),(100.06,4),(100.08,3)]),
     ("trade",50,2,100.02,2.0,1,1,0),
