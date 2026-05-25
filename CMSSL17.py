@@ -5833,18 +5833,31 @@ class FeatureEngine:
         self._round2_prev_spread_bps = float(spread_bps); self._prune_ts_deque_plain(self._round2_spread_widen_3000, ts_ms, 3000); self._prune_ts_deque_plain(self._round2_spread_tighten_3000, ts_ms, 3000)
         if mid > 0:
             if not self._round2_mid_run_initialized:
+                # First valid book is initialization only.
+                # Match NovelMicrostructureCandidatePack semantics:
+                # do NOT set _round2_prev_mid here and do NOT create a run sample.
                 self._round2_mid_run_initialized = True
+            elif self._round2_prev_mid is None:
+                # Second valid book establishes the comparison baseline only.
+                # Do NOT create a run sample here.
                 self._round2_prev_mid = float(mid)
             else:
                 dm = float(mid) - float(self._round2_prev_mid)
                 ds = 1 if dm > 0.0 else -1 if dm < 0.0 else 0
+
                 if ds != 0:
                     if ds == self._round2_mid_run_sign:
                         self._round2_mid_run_len += 1
                     else:
                         self._round2_mid_run_sign = ds
                         self._round2_mid_run_len = 1
-                    self._round2_mid_run_len_3000.update(int(ts_ms), float(self._round2_mid_run_len))
+
+                    self._round2_mid_run_len_3000.update(
+                        int(ts_ms),
+                        float(self._round2_mid_run_len),
+                    )
+
+                # Always advance baseline after the comparison branch.
                 self._round2_prev_mid = float(mid)
         total_depth_5 = bid_depth_5bps + ask_depth_5bps
         if self._round2_stable_break_ts is None:
