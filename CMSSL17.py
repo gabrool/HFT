@@ -4177,6 +4177,7 @@ class FeatureEngine:
         self._round2_spread_tighten_3000: Deque[int] = deque()
         self._round2_prev_spread_bps: Optional[float] = None
         self._round2_prev_mid: Optional[float] = None
+        self._round2_mid_run_initialized = False
         self._round2_mid_run_sign = 0
         self._round2_mid_run_len = 0
         self._round2_mid_run_len_3000 = RollingScalarWindowState(3000)
@@ -5830,13 +5831,22 @@ class FeatureEngine:
             if spread_bps > self._round2_prev_spread_bps + 1e-12: self._round2_spread_widen_3000.append(int(ts_ms))
             if spread_bps < self._round2_prev_spread_bps - 1e-12: self._round2_spread_tighten_3000.append(int(ts_ms))
         self._round2_prev_spread_bps = float(spread_bps); self._prune_ts_deque_plain(self._round2_spread_widen_3000, ts_ms, 3000); self._prune_ts_deque_plain(self._round2_spread_tighten_3000, ts_ms, 3000)
-        if self._round2_prev_mid is not None:
-            ds = 1 if mid > self._round2_prev_mid else -1 if mid < self._round2_prev_mid else 0
-            if ds != 0:
-                self._round2_mid_run_len = self._round2_mid_run_len + 1 if ds == self._round2_mid_run_sign else 1
-                self._round2_mid_run_sign = ds
-                self._round2_mid_run_len_3000.update(int(ts_ms), float(self._round2_mid_run_len))
-        self._round2_prev_mid = float(mid)
+        if mid > 0:
+            if not self._round2_mid_run_initialized:
+                self._round2_mid_run_initialized = True
+            else:
+                if self._round2_prev_mid is not None:
+                    dm = float(mid) - float(self._round2_prev_mid)
+                    ds = 1 if dm > 0.0 else -1 if dm < 0.0 else 0
+                    if ds != 0:
+                        if ds == self._round2_mid_run_sign:
+                            self._round2_mid_run_len += 1
+                        else:
+                            self._round2_mid_run_sign = ds
+                            self._round2_mid_run_len = 1
+                        self._round2_mid_run_len_3000.update(int(ts_ms), float(self._round2_mid_run_len))
+
+            self._round2_prev_mid = float(mid)
         total_depth_5 = bid_depth_5bps + ask_depth_5bps
         if self._round2_stable_break_ts is None:
             self._round2_stable_break_ts = int(ts_ms)
