@@ -5834,19 +5834,18 @@ class FeatureEngine:
         if mid > 0:
             if not self._round2_mid_run_initialized:
                 self._round2_mid_run_initialized = True
+                self._round2_prev_mid = float(mid)
             else:
-                if self._round2_prev_mid is not None:
-                    dm = float(mid) - float(self._round2_prev_mid)
-                    ds = 1 if dm > 0.0 else -1 if dm < 0.0 else 0
-                    if ds != 0:
-                        if ds == self._round2_mid_run_sign:
-                            self._round2_mid_run_len += 1
-                        else:
-                            self._round2_mid_run_sign = ds
-                            self._round2_mid_run_len = 1
-                        self._round2_mid_run_len_3000.update(int(ts_ms), float(self._round2_mid_run_len))
-
-            self._round2_prev_mid = float(mid)
+                dm = float(mid) - float(self._round2_prev_mid)
+                ds = 1 if dm > 0.0 else -1 if dm < 0.0 else 0
+                if ds != 0:
+                    if ds == self._round2_mid_run_sign:
+                        self._round2_mid_run_len += 1
+                    else:
+                        self._round2_mid_run_sign = ds
+                        self._round2_mid_run_len = 1
+                    self._round2_mid_run_len_3000.update(int(ts_ms), float(self._round2_mid_run_len))
+                self._round2_prev_mid = float(mid)
         total_depth_5 = bid_depth_5bps + ask_depth_5bps
         if self._round2_stable_break_ts is None:
             self._round2_stable_break_ts = int(ts_ms)
