@@ -182,6 +182,97 @@ def test_dataset_manifest_rejects_invalid_split_plan_type():
         )
 
 
+def test_segment_spec_rejects_invalid_time_range_type():
+    with pytest.raises(ValueError):
+        SegmentSpec("seg", "not-a-time-range", ("a.csv",), 10, 5)
+
+
+def test_split_entry_rejects_invalid_time_range_type():
+    with pytest.raises(ValueError):
+        SplitEntry(SplitRole.TRAIN, "seg", 0, 1, "not-a-time-range")
+
+
+def test_dataset_manifest_rejects_invalid_label_spec_type():
+    seg = SegmentSpec("seg", TimeRangeUS(1, 2), ("a.csv",), 10, 5)
+    with pytest.raises(ValueError):
+        DatasetManifest(
+            schema_version="v1",
+            storage_format=StorageFormat.FLAT_DECISION_ROWS_US_V1,
+            exchange="binance-futures",
+            symbol="BTCUSDT",
+            time_unit=TimeUnit.MICROSECOND,
+            source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES),
+            label_spec="not-a-label-spec",
+            lookback_rows=10,
+            feature_schema_version="f1",
+            feature_names_hash="abc",
+            feature_dim=6,
+            segments=(seg,),
+            split_plan=None,
+        )
+
+
+def test_dataset_manifest_rejects_invalid_segment_item_type():
+    with pytest.raises(ValueError):
+        DatasetManifest(
+            schema_version="v1",
+            storage_format=StorageFormat.FLAT_DECISION_ROWS_US_V1,
+            exchange="binance-futures",
+            symbol="BTCUSDT",
+            time_unit=TimeUnit.MICROSECOND,
+            source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES),
+            label_spec=LabelSpec((100,), 0),
+            lookback_rows=10,
+            feature_schema_version="f1",
+            feature_names_hash="abc",
+            feature_dim=6,
+            segments=("not-a-segment",),
+            split_plan=None,
+        )
+
+
+def test_dataset_manifest_rejects_duplicate_source_data_types():
+    seg = SegmentSpec("seg", TimeRangeUS(1, 2), ("a.csv",), 10, 5)
+    with pytest.raises(ValueError):
+        DatasetManifest(
+            schema_version="v1",
+            storage_format=StorageFormat.FLAT_DECISION_ROWS_US_V1,
+            exchange="binance-futures",
+            symbol="BTCUSDT",
+            time_unit=TimeUnit.MICROSECOND,
+            source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_25),
+            label_spec=LabelSpec((100,), 0),
+            lookback_rows=10,
+            feature_schema_version="f1",
+            feature_names_hash="abc",
+            feature_dim=6,
+            segments=(seg,),
+            split_plan=None,
+        )
+
+
+def test_dataset_manifest_accepts_string_enums_for_unique_source_data_types():
+    seg = SegmentSpec("seg", TimeRangeUS(1, 2), ("a.csv",), 10, 5)
+    manifest = DatasetManifest(
+        schema_version="v1",
+        storage_format="flat_decision_rows_us_v1",
+        exchange="binance-futures",
+        symbol="BTCUSDT",
+        time_unit="us",
+        source_data_types=("book_snapshot_25", "trades"),
+        label_spec=LabelSpec((100,), 0),
+        lookback_rows=10,
+        feature_schema_version="f1",
+        feature_names_hash="abc",
+        feature_dim=6,
+        segments=(seg,),
+        split_plan=None,
+    )
+    assert manifest.storage_format == StorageFormat.FLAT_DECISION_ROWS_US_V1
+    assert manifest.time_unit == TimeUnit.MICROSECOND
+    assert manifest.source_data_types == (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES)
+
+
 def test_split_plan_requires_train_and_val():
     entry = SplitEntry(SplitRole.TRAIN, "seg", 0, 1, TimeRangeUS(1, 2))
     with pytest.raises(ValueError):

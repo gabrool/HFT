@@ -522,6 +522,8 @@ class SegmentSpec:
         for i, p in enumerate(self.source_files):
             if not isinstance(p, str):
                 raise ValueError(f"source_files[{i}] must be str")
+        if not isinstance(self.time_range, TimeRangeUS):
+            raise ValueError("time_range must be TimeRangeUS")
         _require_nonnegative_int(self.row_count, "row_count")
         _require_nonnegative_int(self.label_count, "label_count")
         if self.label_count > self.row_count:
@@ -541,6 +543,8 @@ class SplitEntry:
         _require_nonempty_str(self.segment_key, "segment_key")
         _require_nonnegative_int(self.start_row, "start_row")
         _require_nonnegative_int(self.end_row, "end_row")
+        if not isinstance(self.time_range, TimeRangeUS):
+            raise ValueError("time_range must be TimeRangeUS")
         if self.end_row < self.start_row:
             raise ValueError("end_row must be >= start_row")
 
@@ -600,7 +604,12 @@ class DatasetManifest:
             object.__setattr__(self, "source_data_types", tuple(self.source_data_types))
         if not self.source_data_types:
             raise ValueError("source_data_types must be non-empty")
-        object.__setattr__(self, "source_data_types", tuple(_coerce_enum(TardisDataType, d, "source_data_types") for d in self.source_data_types))
+        source_data_types = tuple(_coerce_enum(TardisDataType, d, "source_data_types") for d in self.source_data_types)
+        if len(set(source_data_types)) != len(source_data_types):
+            raise ValueError("source_data_types must not contain duplicates")
+        object.__setattr__(self, "source_data_types", source_data_types)
+        if not isinstance(self.label_spec, LabelSpec):
+            raise ValueError("label_spec must be LabelSpec")
         _require_int_us(self.lookback_rows, "lookback_rows")
         _require_nonempty_str(self.feature_schema_version, "feature_schema_version")
         _require_nonempty_str(self.feature_names_hash, "feature_names_hash")
@@ -609,6 +618,9 @@ class DatasetManifest:
             object.__setattr__(self, "segments", tuple(self.segments))
         if not self.segments:
             raise ValueError("segments must be non-empty")
+        for i, segment in enumerate(self.segments):
+            if not isinstance(segment, SegmentSpec):
+                raise ValueError(f"segments[{i}] must be SegmentSpec")
         if self.split_plan is not None and not isinstance(self.split_plan, SplitPlan):
             raise ValueError("split_plan must be SplitPlan or None")
 
