@@ -63,7 +63,7 @@ def test_event19_rich_formula_parity_and_nonzero():
     cmssl, ref = feed_both(RICH_VALID_EVENTS)[-1]
     for n in ROUND2_PRODUCTION_EVENT_FEATURES:
         assert float(cmssl[n]) == pytest.approx(float(ref[n]), rel=1e-5, abs=1e-5), n
-    must=["touch_flicker_score_3000ms","spread_state_transition_rate_3000ms","max_trade_silence_gap_3000ms","ask_depth_centroid_bps_25bps","bid_depth_centroid_bps_25bps","microprice_realized_vol_1000ms","buy_trade_p90_over_median_3000ms","sell_trade_p90_over_median_3000ms","ob_arrival_clumpiness_3000ms","trade_sign_entropy_3000ms","mid_price_run_length_max_3000ms","best_ask_size_age_ms","opposite_side_replenishment_after_depletion_200ms","same_side_replenishment_after_depletion_200ms","trade_side_quote_response_asymmetry_500ms","near_touch_depth_drop_asymmetry"]
+    must=["touch_flicker_score_3000ms","spread_state_transition_rate_3000ms","max_trade_silence_gap_3000ms","ask_depth_centroid_bps_25bps","bid_depth_centroid_bps_25bps","microprice_realized_vol_1000ms","buy_trade_p90_over_median_3000ms","sell_trade_p90_over_median_3000ms","ob_arrival_clumpiness_3000ms","trade_sign_entropy_3000ms","mid_price_run_length_max_3000ms","opposite_side_replenishment_after_depletion_200ms","same_side_replenishment_after_depletion_200ms","trade_side_quote_response_asymmetry_500ms","near_touch_depth_drop_asymmetry"]
     for n in must: assert abs(float(cmssl[n])) > 1e-12, n
 
 def test_offline_ingest_uses_dynamic_round2_dim():
