@@ -55,6 +55,18 @@ class DecisionRow:
 
 
 @dataclass(frozen=True, slots=True)
+class _ValidatedRow:
+    decision_index: int
+    ts_us: int
+    local_ts_us: int
+    event_seq: int
+    raw_mid: float
+    label_entry_ts_us: int
+    label_values: tuple[float, ...]
+    feature_values: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class WriterConfig:
     dataset_id: str
     created_at_utc: str
@@ -190,27 +202,27 @@ class DecisionRowWriter:
     def append(self, row: DecisionRow) -> None:
         if self._final_manifest is not None:
             raise RuntimeError("writer already finalized")
-        self._validate_row(row)
+        vr = self._validate_row(row)
         row_idx = self.next_row_idx
         self._columns[mf.ROW_IDX_COLUMN].append(row_idx)
-        self._columns[mf.DECISION_INDEX_COLUMN].append(row.decision_index)
-        self._columns[mf.TS_US_COLUMN].append(row.ts_us)
-        self._columns[mf.LOCAL_TS_US_COLUMN].append(row.local_ts_us)
-        self._columns[mf.EVENT_SEQ_COLUMN].append(row.event_seq)
-        self._columns[mf.RAW_MID_COLUMN].append(row.raw_mid)
-        self._columns[mf.LABEL_ENTRY_TS_US_COLUMN].append(row.label_entry_ts_us)
+        self._columns[mf.DECISION_INDEX_COLUMN].append(vr.decision_index)
+        self._columns[mf.TS_US_COLUMN].append(vr.ts_us)
+        self._columns[mf.LOCAL_TS_US_COLUMN].append(vr.local_ts_us)
+        self._columns[mf.EVENT_SEQ_COLUMN].append(vr.event_seq)
+        self._columns[mf.RAW_MID_COLUMN].append(vr.raw_mid)
+        self._columns[mf.LABEL_ENTRY_TS_US_COLUMN].append(vr.label_entry_ts_us)
         for i, col in enumerate(self.label_columns):
-            self._columns[col].append(row.label_values[i])
+            self._columns[col].append(vr.label_values[i])
         for i, col in enumerate(self.feature_columns):
-            self._columns[col].append(row.feature_values[i])
+            self._columns[col].append(vr.feature_values[i])
 
         self.next_row_idx += 1
-        self.previous_decision_index = row.decision_index
-        self.previous_local_ts_us = row.local_ts_us
-        self.segment_min_ts_us = row.ts_us if self.segment_min_ts_us is None else min(self.segment_min_ts_us, row.ts_us)
-        self.segment_max_ts_us = row.ts_us if self.segment_max_ts_us is None else max(self.segment_max_ts_us, row.ts_us)
-        self.segment_min_local_ts_us = row.local_ts_us if self.segment_min_local_ts_us is None else min(self.segment_min_local_ts_us, row.local_ts_us)
-        self.segment_max_local_ts_us = row.local_ts_us if self.segment_max_local_ts_us is None else max(self.segment_max_local_ts_us, row.local_ts_us)
+        self.previous_decision_index = vr.decision_index
+        self.previous_local_ts_us = vr.local_ts_us
+        self.segment_min_ts_us = vr.ts_us if self.segment_min_ts_us is None else min(self.segment_min_ts_us, vr.ts_us)
+        self.segment_max_ts_us = vr.ts_us if self.segment_max_ts_us is None else max(self.segment_max_ts_us, vr.ts_us)
+        self.segment_min_local_ts_us = vr.local_ts_us if self.segment_min_local_ts_us is None else min(self.segment_min_local_ts_us, vr.local_ts_us)
+        self.segment_max_local_ts_us = vr.local_ts_us if self.segment_max_local_ts_us is None else max(self.segment_max_local_ts_us, vr.local_ts_us)
         if self.segment_first_row_idx is None:
             self.segment_first_row_idx = row_idx
         self.segment_last_row_idx = row_idx
@@ -218,7 +230,7 @@ class DecisionRowWriter:
         if len(self._columns[mf.ROW_IDX_COLUMN]) >= self.config.chunk_rows:
             self.flush()
 
-    def _validate_row(self, row: DecisionRow) -> None:
+    def _validate_row(self, row: DecisionRow) -> _ValidatedRow:
         decision_index = _require_nonnegative_int(row.decision_index, "decision_index")
         ts_us = _require_positive_int(row.ts_us, "ts_us")
         local_ts_us = _require_positive_int(row.local_ts_us, "local_ts_us")
@@ -237,14 +249,16 @@ class DecisionRowWriter:
         if self.previous_local_ts_us is not None and local_ts_us < self.previous_local_ts_us:
             raise ValueError("local_ts_us must be nondecreasing")
 
-        object.__setattr__(row, "raw_mid", raw_mid)
-        object.__setattr__(row, "label_values", labels)
-        object.__setattr__(row, "feature_values", features)
-        object.__setattr__(row, "event_seq", event_seq)
-        object.__setattr__(row, "decision_index", decision_index)
-        object.__setattr__(row, "ts_us", ts_us)
-        object.__setattr__(row, "local_ts_us", local_ts_us)
-        object.__setattr__(row, "label_entry_ts_us", label_entry_ts_us)
+        return _ValidatedRow(
+            decision_index=decision_index,
+            ts_us=ts_us,
+            local_ts_us=local_ts_us,
+            event_seq=event_seq,
+            raw_mid=raw_mid,
+            label_entry_ts_us=label_entry_ts_us,
+            label_values=labels,
+            feature_values=features,
+        )
 
     def _buffer_to_table(self) -> pa.Table:
         arrays = []
@@ -279,8 +293,8 @@ class DecisionRowWriter:
                 parquet_path=rel_path,
                 row_count=table.num_rows,
                 label_count=table.num_rows,
-                time_range=TimeRangeUS(self.segment_min_ts_us, self.segment_max_ts_us),
-                local_time_range=TimeRangeUS(self.segment_min_local_ts_us, self.segment_max_local_ts_us),
+                time_range=TimeRangeUS(self.segment_min_ts_us, self.segment_max_ts_us + 1),
+                local_time_range=TimeRangeUS(self.segment_min_local_ts_us, self.segment_max_local_ts_us + 1),
                 first_row_idx=self.segment_first_row_idx,
                 last_row_idx=self.segment_last_row_idx,
                 source_files=self.source_files,
