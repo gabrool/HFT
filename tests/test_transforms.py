@@ -229,6 +229,45 @@ def test_snapshot_load_and_reset():
     assert t2.diagnostics.rows_seen == 0
 
 
+def test_snapshot_rejects_nonfinite_mean():
+    mean = np.zeros(FEATURE_COUNT, dtype=np.float64)
+    var = np.zeros(FEATURE_COUNT, dtype=np.float64)
+    count = np.zeros(FEATURE_COUNT, dtype=np.int64)
+    mean[0] = np.nan
+    with pytest.raises(ValueError):
+        tr.TransformStateSnapshot(0, None, mean, var, count)
+
+    mean[0] = np.inf
+    with pytest.raises(ValueError):
+        tr.TransformStateSnapshot(0, None, mean, var, count)
+
+
+def test_snapshot_rejects_invalid_var_and_count():
+    mean = np.zeros(FEATURE_COUNT, dtype=np.float64)
+    var = np.zeros(FEATURE_COUNT, dtype=np.float64)
+    count = np.zeros(FEATURE_COUNT, dtype=np.int64)
+
+    bad_var = var.copy()
+    bad_var[0] = np.nan
+    with pytest.raises(ValueError):
+        tr.TransformStateSnapshot(0, None, mean, bad_var, count)
+
+    bad_var = var.copy()
+    bad_var[0] = -1.0
+    with pytest.raises(ValueError):
+        tr.TransformStateSnapshot(0, None, mean, bad_var, count)
+
+    bad_count = count.copy()
+    bad_count[0] = -1
+    with pytest.raises(ValueError):
+        tr.TransformStateSnapshot(0, None, mean, var, bad_count)
+
+
+def test_transformer_constructor_does_not_accept_initial_snapshot_alias():
+    with pytest.raises(TypeError):
+        tr.CausalFeatureTransformer(cfg(), initial_snapshot=None)
+
+
 def test_diagnostics_counts():
     c = cfg(min_obs=2, raw_clip=10.0, bounded_abs_clip=2.0, z_clip=1.0)
     t = tr.CausalFeatureTransformer(c)
