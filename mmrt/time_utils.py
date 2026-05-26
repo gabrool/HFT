@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import math
+import re
 from typing import Iterable, Sequence
 
 US_PER_MS = 1_000
@@ -14,6 +15,8 @@ US_PER_DAY = 24 * US_PER_HOUR
 TARDIS_TIMESTAMP_UNIT = "us"
 
 UNIX_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def _reject_bool(value, name: str) -> None:
@@ -185,13 +188,8 @@ def duration_label_us(duration_us: int) -> str:
 
 
 def label_name_for_horizon_us(prefix: str, horizon_us: int, *, entry_delay_us: int | None = None) -> str:
-    if not isinstance(prefix, str) or prefix == "":
-        raise ValueError("prefix must be non-empty string")
-    if not prefix[0].islower() or not prefix[0].isalpha():
+    if not isinstance(prefix, str) or _PREFIX_RE.fullmatch(prefix) is None:
         raise ValueError("prefix must match ^[a-z][a-z0-9_]*$")
-    for ch in prefix:
-        if not (ch.islower() or ch.isdigit() or ch == "_"):
-            raise ValueError("prefix must match ^[a-z][a-z0-9_]*$")
 
     horizon_us = require_positive_duration_us(horizon_us, "horizon_us")
     if entry_delay_us is None:
