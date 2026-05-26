@@ -9,16 +9,15 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from mmrt.contracts import TardisDataType
-from mmrt.data.tardis_csv import (
-    BOOK_SIDE_ASK,
-    BOOK_SIDE_BID,
-    BOOK_SIDE_UNKNOWN,
-    SIDE_BUY,
-    SIDE_SELL,
-    SIDE_UNKNOWN,
-)
-
 BINANCE_FUTURES_EXCHANGE = "binance-futures"
+SIDE_UNKNOWN = 0
+SIDE_BUY = 1
+SIDE_SELL = -1
+
+BOOK_SIDE_UNKNOWN = 0
+BOOK_SIDE_BID = 1
+BOOK_SIDE_ASK = -1
+
 BINANCE_FUTURES_V1_SYMBOL = "BTCUSDT"
 BINANCE_FUTURES_V1_SYMBOLS = ("BTCUSDT",)
 
@@ -47,13 +46,29 @@ BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES = (
 
 BINANCE_FUTURES_DEFAULT_MERGE_RANKS = {
     TardisDataType.BOOK_SNAPSHOT_25: 0,
-    TardisDataType.BOOK_SNAPSHOT_5: 0,
-    TardisDataType.INCREMENTAL_BOOK_L2: 0,
-    TardisDataType.TRADES: 1,
-    TardisDataType.BOOK_TICKER: 2,
-    TardisDataType.LIQUIDATIONS: 3,
-    TardisDataType.DERIVATIVE_TICKER: 4,
+    TardisDataType.BOOK_SNAPSHOT_5: 1,
+    TardisDataType.INCREMENTAL_BOOK_L2: 2,
+    TardisDataType.TRADES: 3,
+    TardisDataType.BOOK_TICKER: 4,
+    TardisDataType.LIQUIDATIONS: 5,
+    TardisDataType.DERIVATIVE_TICKER: 6,
 }
+
+
+def _validate_unique_merge_ranks() -> None:
+    ranks = tuple(BINANCE_FUTURES_DEFAULT_MERGE_RANKS.values())
+    if len(set(ranks)) != len(ranks):
+        raise ValueError("BINANCE_FUTURES_DEFAULT_MERGE_RANKS values must be unique")
+    missing = tuple(
+        dtype
+        for dtype in BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES
+        if dtype not in BINANCE_FUTURES_DEFAULT_MERGE_RANKS
+    )
+    if missing:
+        raise ValueError(f"missing default merge ranks for: {missing!r}")
+
+
+_validate_unique_merge_ranks()
 
 BINANCE_FUTURES_TRADE_SIDE_TO_CODE = {
     "buy": SIDE_BUY,
@@ -241,6 +256,12 @@ __all__ = [
     "BINANCE_FUTURES_V1_UNSUPPORTED_DATA_TYPES",
     "BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES",
     "BINANCE_FUTURES_DEFAULT_MERGE_RANKS",
+    "SIDE_UNKNOWN",
+    "SIDE_BUY",
+    "SIDE_SELL",
+    "BOOK_SIDE_UNKNOWN",
+    "BOOK_SIDE_BID",
+    "BOOK_SIDE_ASK",
     "BINANCE_FUTURES_TRADE_SIDE_TO_CODE",
     "BINANCE_FUTURES_BOOK_SIDE_TO_CODE",
     "BinanceFuturesMarket",

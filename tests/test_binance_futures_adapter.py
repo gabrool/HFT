@@ -10,6 +10,12 @@ from mmrt.data.binance_futures_adapter import (
     BINANCE_FUTURES_V1_CONTEXT_DATA_TYPES,
     BINANCE_FUTURES_V1_SOURCE_DATA_TYPES,
     BINANCE_FUTURES_V1_SYMBOL,
+    BOOK_SIDE_ASK,
+    BOOK_SIDE_BID,
+    BOOK_SIDE_UNKNOWN,
+    SIDE_BUY,
+    SIDE_SELL,
+    SIDE_UNKNOWN,
     BinanceFuturesMarket,
     binance_futures_book_side_code,
     binance_futures_default_merge_rank,
@@ -28,7 +34,6 @@ from mmrt.data.binance_futures_adapter import (
     require_binance_futures_v1_data_type,
     validate_binance_futures_market,
 )
-from mmrt.data.tardis_csv import BOOK_SIDE_ASK, BOOK_SIDE_BID, BOOK_SIDE_UNKNOWN, SIDE_BUY, SIDE_SELL, SIDE_UNKNOWN
 
 
 def test_constants_match_tardis_policy():
@@ -48,6 +53,15 @@ def test_constants_match_tardis_policy():
         TardisDataType.BOOK_SNAPSHOT_5,
     ):
         assert dtype in BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES
+
+
+def test_local_side_code_constants():
+    assert SIDE_BUY == 1
+    assert SIDE_SELL == -1
+    assert SIDE_UNKNOWN == 0
+    assert BOOK_SIDE_BID == 1
+    assert BOOK_SIDE_ASK == -1
+    assert BOOK_SIDE_UNKNOWN == 0
 
 
 def test_market_dataclass_validation():
@@ -138,18 +152,20 @@ def test_default_data_type_functions():
 
 def test_default_merge_rank():
     assert binance_futures_default_merge_rank(TardisDataType.BOOK_SNAPSHOT_25) == 0
-    assert binance_futures_default_merge_rank(TardisDataType.BOOK_SNAPSHOT_5) == 0
-    assert binance_futures_default_merge_rank(TardisDataType.INCREMENTAL_BOOK_L2) == 0
-    assert binance_futures_default_merge_rank(TardisDataType.TRADES) == 1
-    assert binance_futures_default_merge_rank(TardisDataType.BOOK_TICKER) == 2
-    assert binance_futures_default_merge_rank(TardisDataType.LIQUIDATIONS) == 3
-    assert binance_futures_default_merge_rank(TardisDataType.DERIVATIVE_TICKER) == 4
+    assert binance_futures_default_merge_rank(TardisDataType.BOOK_SNAPSHOT_5) == 1
+    assert binance_futures_default_merge_rank(TardisDataType.INCREMENTAL_BOOK_L2) == 2
+    assert binance_futures_default_merge_rank(TardisDataType.TRADES) == 3
+    assert binance_futures_default_merge_rank(TardisDataType.BOOK_TICKER) == 4
+    assert binance_futures_default_merge_rank(TardisDataType.LIQUIDATIONS) == 5
+    assert binance_futures_default_merge_rank(TardisDataType.DERIVATIVE_TICKER) == 6
     with pytest.raises(ValueError):
         binance_futures_default_merge_rank(TardisDataType.QUOTES)
     with pytest.raises(ValueError):
         binance_futures_default_merge_rank(TardisDataType.OPTIONS_CHAIN)
     for dtype in BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES:
         assert isinstance(binance_futures_default_merge_rank(dtype), int)
+    ranks = [binance_futures_default_merge_rank(dtype) for dtype in BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES]
+    assert len(set(ranks)) == len(ranks)
 
 
 def test_trade_side_code():
@@ -212,6 +228,18 @@ def test_adapter_import_smoke():
     assert adapter.BINANCE_FUTURES_EXCHANGE == "binance-futures"
 
 
+
+
+def test_adapter_does_not_import_heavy_data_modules():
+    import sys
+    import mmrt.data.binance_futures_adapter as adapter
+
+    assert adapter.BINANCE_FUTURES_EXCHANGE == "binance-futures"
+    assert "po" + "lars" not in sys.modules
+    assert "mmrt.data.tardis_csv" not in sys.modules
+    assert "mmrt.data.event_merge" not in sys.modules
+
+
 def test_no_feature_label_or_decision_concepts():
     import mmrt.data.binance_futures_adapter as a
 
@@ -226,4 +254,4 @@ def test_no_feature_label_or_decision_concepts():
 
     assert BINANCE_FUTURES_TRADE_SIDE_TO_CODE["buy"] == SIDE_BUY
     assert BINANCE_FUTURES_BOOK_SIDE_TO_CODE["bid"] == BOOK_SIDE_BID
-    assert BINANCE_FUTURES_DEFAULT_MERGE_RANKS[TardisDataType.TRADES] == 1
+    assert BINANCE_FUTURES_DEFAULT_MERGE_RANKS[TardisDataType.TRADES] == 3
