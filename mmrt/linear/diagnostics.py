@@ -253,8 +253,9 @@ class CoefficientDiagnostics:
             records = getattr(self, field)
             if not isinstance(records, tuple) or not all(isinstance(r, CoefficientRecord) for r in records):
                 raise ValueError(f"{field} must contain CoefficientRecord values")
-            if self.n_features > 0 and len(records) == 0:
-                raise ValueError(f"{field} must be non-empty when n_features > 0")
+
+        if self.n_features > 0 and len(self.top_abs) == 0:
+            raise ValueError("top_abs must be non-empty when n_features > 0")
 
     def as_dict(self) -> dict[str, object]:
         return {

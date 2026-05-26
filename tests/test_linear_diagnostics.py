@@ -87,6 +87,46 @@ def test_coefficient_diagnostics_basic():
     assert isinstance(out.as_dict()["top_abs"], list)
 
 
+def test_coefficient_diagnostics_all_zero_or_one_sided_weights():
+    cfg = dg.DiagnosticsConfig(top_k=2)
+
+    zero = dg.coefficient_diagnostics(
+        head_name="direction",
+        feature_columns=("a", "b"),
+        weights=np.array([0.0, 0.0]),
+        intercept=0.0,
+        config=cfg,
+    )
+    assert [r.feature for r in zero.top_abs] == ["a", "b"]
+    assert zero.top_positive == ()
+    assert zero.top_negative == ()
+    assert zero.l1_norm == 0.0
+    assert zero.l2_norm == 0.0
+    assert zero.max_abs == 0.0
+
+    pos = dg.coefficient_diagnostics(
+        head_name="direction",
+        feature_columns=("a", "b"),
+        weights=np.array([1.0, 2.0]),
+        intercept=0.0,
+        config=cfg,
+    )
+    assert [r.feature for r in pos.top_abs] == ["b", "a"]
+    assert [r.feature for r in pos.top_positive] == ["b", "a"]
+    assert pos.top_negative == ()
+
+    neg = dg.coefficient_diagnostics(
+        head_name="direction",
+        feature_columns=("a", "b"),
+        weights=np.array([-1.0, -2.0]),
+        intercept=0.0,
+        config=cfg,
+    )
+    assert [r.feature for r in neg.top_abs] == ["b", "a"]
+    assert neg.top_positive == ()
+    assert [r.feature for r in neg.top_negative] == ["b", "a"]
+
+
 def test_coefficient_diagnostics_validation():
     with pytest.raises(ValueError):
         dg.coefficient_diagnostics(head_name="x", feature_columns=("a", "a"), weights=np.array([1.0, 2.0]), intercept=0.0)
@@ -181,6 +221,9 @@ def test_dataclass_validation():
     rec = dg.CoefficientRecord("a", 1.0, 1.0, 1)
     with pytest.raises(ValueError):
         dg.CoefficientDiagnostics("x", 1, 0.0, 1.0, 1.0, 1.0, ("bad",), (rec,), (rec,))
+    with pytest.raises(ValueError):
+        dg.CoefficientDiagnostics("x", 1, 0.0, 1.0, 1.0, 1.0, (), (), ())
+    dg.CoefficientDiagnostics("x", 1, 0.0, 1.0, 1.0, 1.0, (rec,), (), ())
     vs = dg.summarize_vector(np.array([1.0]), name="x")
     with pytest.raises(ValueError):
         dg.PreprocessDiagnostics(3, 1, 1, vs, vs, ("a",))
