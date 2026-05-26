@@ -7,7 +7,7 @@ import pytest
 
 from mmrt.features import transforms as tr
 from mmrt.features import specs
-from mmrt.features.specs import FEATURE_COUNT, TransformKey, feature_index, feature_spec_by_name
+from mmrt.features.specs import FEATURE_COUNT, TransformKey, feature_index
 
 
 def cfg(**kwargs):
@@ -24,22 +24,39 @@ def val(vec, name): return vec[feature_index(name)]
 
 
 def test_public_api_boundary():
-    expected = {"DEFAULT_FAST_HALF_LIFE_US","DEFAULT_MEDIUM_HALF_LIFE_US","DEFAULT_SLOW_HALF_LIFE_US","DEFAULT_MIN_OBS","DEFAULT_VARIANCE_FLOOR","DEFAULT_Z_CLIP","DEFAULT_RAW_CLIP","DEFAULT_BOUNDED_ABS_CLIP","TransformConfig","TransformDiagnostics","TransformStateSnapshot","CausalFeatureTransformer","feature_transform_keys","transform_key_for_feature","ewma_feature_indices","no_ewma_feature_indices","base_transform_values","transform_feature_matrix_causal"}
+    expected = {"DEFAULT_FAST_HALF_LIFE_US", "DEFAULT_MEDIUM_HALF_LIFE_US", "DEFAULT_SLOW_HALF_LIFE_US", "DEFAULT_MIN_OBS", "DEFAULT_VARIANCE_FLOOR", "DEFAULT_Z_CLIP", "DEFAULT_RAW_CLIP", "DEFAULT_BOUNDED_ABS_CLIP", "TransformConfig", "TransformDiagnostics", "TransformStateSnapshot", "CausalFeatureTransformer", "feature_transform_keys", "transform_key_for_feature", "ewma_feature_indices", "no_ewma_feature_indices", "base_transform_values", "transform_feature_matrix_causal"}
     assert set(tr.__all__) == expected
     for name in tr.__all__:
         assert not name.startswith("_")
-        low = name.lower()
-        for s in ["bybit","cmssl","aux","pca","label","target","future","storage","fit"]:
-            assert s not in low
 
 
 def test_no_forbidden_imports():
-    code = "import sys; before=set(sys.modules.keys()); import mmrt.features.transforms as t; after=set(sys.modules.keys()); print('\\n'.join(sorted(after-before)))"
-    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
-    delta = proc.stdout
-    forbidden = ["pan" + "das","po" + "lars","to" + "rch","py" + "arrow","num" + "ba","mmrt.features.engine","mmrt.features." + "la" + "bels","mmrt.data.tardis_csv","mmrt.data.event_merge","mmrt.data.quality","mmrt.storage","mmrt.linear","CM" + "SSL17","offline_" + "ingest"]
-    for f in forbidden:
-        assert f not in delta
+    code = r'''
+import sys
+before = set(sys.modules)
+import mmrt.features.transforms  # noqa: F401
+after = set(sys.modules) - before
+forbidden = (
+    "pan" + "das",
+    "po" + "lars",
+    "to" + "rch",
+    "py" + "arrow",
+    "num" + "ba",
+    "mmrt.features.engine",
+    "mmrt.features." + "la" + "bels",
+    "mmrt.data.tardis_csv",
+    "mmrt.data.event_merge",
+    "mmrt.data.quality",
+    "mmrt.storage",
+    "mmrt.linear",
+    "CM" + "SSL17",
+    "offline_" + "ingest",
+)
+bad = sorted(name for name in forbidden if name in after)
+if bad:
+    raise SystemExit(repr(bad))
+'''
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_config_validation_and_as_dict():
@@ -87,48 +104,219 @@ def test_base_transform_formulas_representative_features():
 
 
 def test_base_transform_nonfinite_inputs_become_zero():
-    x = raw_zero(); x0 = x.copy()
-    for n, v in [("spread_bps", np.nan), ("log_dt_decision_us", np.inf), ("signed_notional_flow_usd_200000us", -np.inf)]: set_feature(x, n, v)
+    x = raw_zero()
+    set_feature(x, "spread_bps", np.nan)
+    set_feature(x, "log_dt_decision_us", np.inf)
+    set_feature(x, "signed_notional_flow_usd_200000us", -np.inf)
+    x_before = x.copy()
+
     b = tr.base_transform_values(x, cfg())
+
     assert np.isfinite(b).all()
-    assert val(b, "spread_bps") == 0 and val(b, "log_dt_decision_us") == 0 and val(b, "signed_notional_flow_usd_200000us") == 0
-    assert np.array_equal(x, x0)
+    assert val(b, "spread_bps") == 0.0
+    assert val(b, "log_dt_decision_us") == 0.0
+    assert val(b, "signed_notional_flow_usd_200000us") == 0.0
+    assert np.array_equal(x, x_before, equal_nan=True)
 
-# remaining tests condensed for coverage
 
-def test_causality_and_clipping():
+def test_transform_one_pre_update_causality():
+    t = tr.CausalFeatureTransformer(cfg(min_obs=2, variance_floor=1e-12, output_dtype="float64"))
+    i = feature_index("spread_bps")
+    o1 = t.transform_one(1000, set_feature(raw_zero(), "spread_bps", 10.0))
+    o2 = t.transform_one(1100, set_feature(raw_zero(), "spread_bps", 12.0))
+    o3 = t.transform_one(1200, set_feature(raw_zero(), "spread_bps", 12.0))
+    assert o1[i] == 0.0
+    assert o2[i] == 0.0
+    assert o3[i] == pytest.approx(1.0)
+
+
+def test_transform_updates_after_output_not_before():
     t = tr.CausalFeatureTransformer(cfg())
     i = feature_index("spread_bps")
-    r = raw_zero(); r[i]=10; o1=t.transform_one(1000,r)
-    r = raw_zero(); r[i]=12; o2=t.transform_one(1100,r)
-    r = raw_zero(); r[i]=12; o3=t.transform_one(1200,r)
-    assert o1[i] == 0 and o2[i] == 0 and o3[i] == pytest.approx(1.0)
-    t2 = tr.CausalFeatureTransformer(cfg())
-    t2.transform_one(1000,set_feature(raw_zero(),"spread_bps",10)); t2.transform_one(1100,set_feature(raw_zero(),"spread_bps",12)); o=t2.transform_one(1200,set_feature(raw_zero(),"spread_bps",100))
-    assert o[i] == 8.0
+    t.transform_one(1000, set_feature(raw_zero(), "spread_bps", 10.0))
+    t.transform_one(1100, set_feature(raw_zero(), "spread_bps", 12.0))
+    o3 = t.transform_one(1200, set_feature(raw_zero(), "spread_bps", 100.0))
+    assert o3[i] == 8.0
 
 
-def test_many_snapshot_diagnostics_and_validation():
-    c = cfg()
-    mat = np.zeros((10, FEATURE_COUNT), dtype=float)
-    ts = np.arange(1000,1010)
-    mat[:, feature_index("spread_bps")] = np.linspace(1,10,10)
-    full, snap, d = tr.transform_feature_matrix_causal(ts, mat, c)
-    p1, s1, _ = tr.transform_feature_matrix_causal(ts[:4], mat[:4], c)
-    p2, s2, _ = tr.transform_feature_matrix_causal(ts[4:], mat[4:], c, initial_snapshot=s1)
-    assert np.allclose(full, np.vstack([p1,p2]))
-    assert isinstance(d.as_dict(), dict)
-    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([1,0]), mat[:2], c)
-    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([1.5]), mat[:1], c)
-    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([True]), mat[:1], c)
+def test_no_ewma_features_output_immediately():
+    o = tr.CausalFeatureTransformer(cfg()).transform_one(
+        1000,
+        set_feature(
+            set_feature(
+                set_feature(raw_zero(), "last_trade_side_sign", 2.5),
+                "log_dt_decision_us",
+                999.0,
+            ),
+            "time_since_trade_us",
+            999.0,
+        ),
+    )
+    assert val(o, "last_trade_side_sign") == 1.0
+    assert val(o, "log_dt_decision_us") == pytest.approx(math.log1p(999.0))
+    assert val(o, "time_since_trade_us") == pytest.approx(math.log1p(999.0))
 
 
-def test_output_dtype_and_no_global_fit_api():
+def test_equal_timestamps_allowed_and_do_not_move_ewma():
+    t = tr.CausalFeatureTransformer(cfg(min_obs=2))
+    i = feature_index("spread_bps")
+    t.transform_one(1000, set_feature(raw_zero(), "spread_bps", 10.0))
+    t.transform_one(1000, set_feature(raw_zero(), "spread_bps", 20.0))
+    o3 = t.transform_one(1100, set_feature(raw_zero(), "spread_bps", 20.0))
+    assert o3[i] == 0.0
+    assert t.mean[i] == pytest.approx(15.0)
+
+
+def test_decreasing_timestamp_rejected():
+    t = tr.CausalFeatureTransformer(cfg())
+    t.transform_one(1000, raw_zero())
+    with pytest.raises(ValueError):
+        t.transform_one(999, raw_zero())
+
+
+def test_transform_many_matches_transform_one_loop():
+    mat = np.zeros((5, FEATURE_COUNT), dtype=np.float64)
+    set_feature(mat[0], "spread_bps", 10.0); set_feature(mat[1], "spread_bps", 12.0); set_feature(mat[2], "spread_bps", 14.0); set_feature(mat[3], "spread_bps", 16.0); set_feature(mat[4], "spread_bps", 18.0)
+    for i, s in enumerate([-1.0, 1.0, -1.0, 1.0, 0.0]):
+        set_feature(mat[i], "last_trade_side_sign", s)
+    ts = np.array([1000, 1100, 1200, 1300, 1400], dtype=np.int64)
+    a = tr.CausalFeatureTransformer(cfg()).transform_many(ts, mat)
+    t = tr.CausalFeatureTransformer(cfg())
+    b = np.vstack([t.transform_one(int(ts[i]), mat[i]) for i in range(mat.shape[0])])
+    assert np.allclose(a, b)
+
+
+def test_chunked_snapshot_matches_full_sequence():
+    mat = np.zeros((10, FEATURE_COUNT), dtype=np.float64)
+    ts = np.arange(1000, 2000, 100, dtype=np.int64)
+    mat[:, feature_index("spread_bps")] = np.linspace(1.0, 10.0, 10)
+    mat[:, feature_index("signed_notional_flow_usd_200000us")] = np.linspace(-50.0, 50.0, 10)
+    mat[:, feature_index("last_trade_side_sign")] = np.array([1 if i % 2 else -1 for i in range(10)], dtype=np.float64)
+
+    full_out, full_snap, _ = tr.transform_feature_matrix_causal(ts, mat, cfg())
+    p1, snap1, _ = tr.transform_feature_matrix_causal(ts[:4], mat[:4], cfg())
+    p2, snap2, _ = tr.transform_feature_matrix_causal(ts[4:], mat[4:], cfg(), initial_snapshot=snap1)
+
+    assert np.allclose(full_out, np.vstack([p1, p2]))
+    assert snap2.rows_seen == full_snap.rows_seen
+    assert snap2.last_ts_us == full_snap.last_ts_us
+    assert np.allclose(snap2.mean, full_snap.mean)
+    assert np.allclose(snap2.var, full_snap.var)
+    assert np.array_equal(snap2.count, full_snap.count)
+
+    t = tr.CausalFeatureTransformer(cfg(), snapshot=snap1)
+    old = t.mean[0]
+    snap1.mean[0] += 123.0
+    assert t.mean[0] == old
+
+
+def test_snapshot_load_and_reset():
+    t1 = tr.CausalFeatureTransformer(cfg())
+    for j, v in enumerate([10.0, 12.0, 14.0]):
+        t1.transform_one(1000 + j * 100, set_feature(raw_zero(), "spread_bps", v))
+    snap = t1.snapshot()
+    t2 = tr.CausalFeatureTransformer(cfg(), snapshot=snap)
+    r4 = set_feature(raw_zero(), "spread_bps", 16.0)
+    o1 = t1.transform_one(1300, r4)
+    o2 = t2.transform_one(1300, r4)
+    assert np.allclose(o1, o2)
+    t2.reset()
+    assert t2.rows_seen == 0
+    assert t2.last_ts_us is None
+    assert np.allclose(t2.mean, 0.0)
+    assert np.allclose(t2.var, 0.0)
+    assert np.array_equal(t2.count, np.zeros(FEATURE_COUNT, dtype=np.int64))
+    assert t2.diagnostics.rows_seen == 0
+
+
+def test_diagnostics_counts():
+    c = cfg(min_obs=2, raw_clip=10.0, bounded_abs_clip=2.0, z_clip=1.0)
+    t = tr.CausalFeatureTransformer(c)
+    rows = []
+    r1 = raw_zero()
+    set_feature(r1, "spread_bps", 0.0)
+    set_feature(r1, "signed_notional_flow_usd_200000us", 0.0)
+    set_feature(r1, "trade_side_quote_response_asymmetry_500000us", 0.0)
+    set_feature(r1, "last_trade_side_sign", 0.0)
+    rows.append((1000, r1))
+    rows.append((1100, set_feature(raw_zero(), "spread_bps", 2.0)))
+    r3 = raw_zero()
+    set_feature(r3, "spread_bps", 100.0)
+    set_feature(r3, "micro_ret_bps_200000us", 100.0)
+    set_feature(r3, "trade_side_quote_response_asymmetry_500000us", 3.0)
+    set_feature(r3, "last_trade_side_sign", 3.0)
+    set_feature(r3, "trade_count_per_second_500000us", np.inf)
+    rows.append((1200, r3))
+    for ts, row in rows:
+        t.transform_one(ts, row)
+    d = t.diagnostics_snapshot()
+    assert d.rows_seen == len(rows)
+    assert d.nonfinite_raw_count > 0
+    assert d.raw_clip_count > 0
+    assert d.bounded_clip_count > 0
+    assert d.z_clip_count > 0
+    assert d.warmup_ewma_count > 0
+    assert d.as_dict() == {
+        "rows_seen": d.rows_seen,
+        "nonfinite_raw_count": d.nonfinite_raw_count,
+        "raw_clip_count": d.raw_clip_count,
+        "bounded_clip_count": d.bounded_clip_count,
+        "z_clip_count": d.z_clip_count,
+        "warmup_ewma_count": d.warmup_ewma_count,
+    }
+
+
+def test_output_dtype_and_shape():
     t = tr.CausalFeatureTransformer()
     o = t.transform_one(1, raw_zero())
-    assert o.dtype == np.float32 and o.shape == (FEATURE_COUNT,) and np.isfinite(o).all()
-    for n in ["fit", "fit_" + "transform", "Standard" + "Scaler", "GlobalStandardizer"]:
-        assert not hasattr(tr, n)
+    assert o.dtype == np.float32
+    assert o.shape == (FEATURE_COUNT,)
+    assert np.isfinite(o).all()
+    many = t.transform_many(np.array([2, 3], dtype=np.int64), np.vstack([raw_zero(), raw_zero()]))
+    assert many.shape == (2, FEATURE_COUNT)
+    assert np.isfinite(many).all()
+    o64 = tr.CausalFeatureTransformer(cfg(output_dtype="float64")).transform_one(1, raw_zero())
+    assert o64.dtype == np.float64
+
+
+def test_transform_feature_matrix_validates_inputs():
+    mat = np.zeros((2, FEATURE_COUNT), dtype=np.float64)
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([1, 2]), np.zeros(FEATURE_COUNT), cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([1, 2]), np.zeros((2, FEATURE_COUNT - 1)), cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([1]), mat, cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([-1, 2]), mat, cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([1.5, 2.0]), mat, cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([True, False]), mat, cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([2, 1]), mat, cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array(["1", "2"], dtype=object), mat, cfg())
+    with pytest.raises(ValueError): tr.transform_feature_matrix_causal(np.array([1 + 0j, 2 + 0j]), mat, cfg())
+    out, _, _ = tr.transform_feature_matrix_causal(np.array([1.0, 2.0]), mat, cfg())
+    assert out.shape == (2, FEATURE_COUNT)
+
+
+def test_input_arrays_not_mutated():
+    x = raw_zero()
+    set_feature(x, "spread_bps", np.nan)
+    set_feature(x, "signed_notional_flow_usd_200000us", 123.0)
+    x_before = x.copy()
+    tr.CausalFeatureTransformer(cfg()).transform_one(1000, x)
+    assert np.array_equal(x, x_before, equal_nan=True)
+
+    mat = np.vstack([raw_zero(), raw_zero()])
+    set_feature(mat[0], "spread_bps", np.nan)
+    set_feature(mat[1], "spread_bps", 5.0)
+    ts = np.array([1000.0, 1100.0], dtype=np.float64)
+    mat_before = mat.copy()
+    ts_before = ts.copy()
+    tr.transform_feature_matrix_causal(ts, mat, cfg())
+    assert np.array_equal(mat, mat_before, equal_nan=True)
+    assert np.array_equal(ts, ts_before)
+
+
+def test_no_labels_targets_or_storage_residue():
+    public = " ".join(tr.__all__).lower()
+    for bad in ["label", "target", "future", "storage", "fit", "pca", "aux", "bybit", "cmssl"]:
+        assert bad not in public
 
 
 def test_all_feature_transform_keys_supported():
@@ -138,5 +326,22 @@ def test_all_feature_transform_keys_supported():
     assert np.isfinite(b).all()
     o = tr.CausalFeatureTransformer(cfg()).transform_one(1, x)
     assert np.isfinite(o).all()
-    used = {s.transform_key for s in specs.FEATURE_SPECS}
-    assert used.issubset(set(TransformKey))
+    supported = {
+      TransformKey.IDENTITY_EWMA_FAST,
+      TransformKey.IDENTITY_EWMA_MEDIUM,
+      TransformKey.IDENTITY_EWMA_SLOW,
+      TransformKey.IDENTITY_NO_EWMA,
+      TransformKey.LOG1P_POS_NO_EWMA,
+      TransformKey.LOG1P_POS_EWMA,
+      TransformKey.SIGNED_LOG1P_EWMA,
+      TransformKey.RATIO_BOUNDED,
+      TransformKey.SIGN_NO_EWMA,
+      TransformKey.TIME_LOG1P_NO_EWMA,
+    }
+    for spec in specs.FEATURE_SPECS:
+        assert spec.transform_key in supported
+
+
+def test_no_global_fit_api():
+    for n in ["fit", "fit_" + "transform", "Standard" + "Scaler", "GlobalStandardizer", "P" + "CA"]:
+        assert not hasattr(tr, n)
