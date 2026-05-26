@@ -28,6 +28,31 @@ def manifest_one_segment():
     return mf.make_manifest(dataset_id="ds1", created_at_utc="2026-05-26T00:00:00Z", segments=(segment(),))
 
 
+def manifest_from_base_with_columns(base, *, feature_columns=None, label_columns=None, required_columns=None):
+    return mf.StorageManifest(
+        manifest_schema_version=base["manifest_schema_version"],
+        dataset_id=base["dataset_id"],
+        created_at_utc=base["created_at_utc"],
+        pipeline_config=base["pipeline_config"],
+        writer_metadata=base["writer_metadata"],
+        feature_schema=base["feature_schema"],
+        label_spec=mf.label_spec_from_dict(base["label_spec"]),
+        transform_config=base["transform_config"],
+        transform_diagnostics=base["transform_diagnostics"],
+        exchange=base["exchange"],
+        symbol=base["symbol"],
+        storage_format=base["storage_format"],
+        time_unit=base["time_unit"],
+        decision_stride_us=base["decision_stride_us"],
+        feature_columns=list(base["feature_columns"]) if feature_columns is None else feature_columns,
+        label_columns=list(base["label_columns"]) if label_columns is None else label_columns,
+        required_columns=list(base["required_columns"]) if required_columns is None else required_columns,
+        segments=tuple(mf.StorageSegment.from_dict(s) for s in base["segments"]),
+        splits=tuple(mf.SplitMetadata.from_dict(sp) for sp in base.get("splits", [])),
+        notes=base.get("notes"),
+    )
+
+
 def test_public_api_boundary():
     expected = {
         "MANIFEST_SCHEMA_VERSION", "DEFAULT_MANIFEST_FILENAME", "ROW_IDX_COLUMN", "DECISION_INDEX_COLUMN", "TS_US_COLUMN",
@@ -155,6 +180,29 @@ def test_make_manifest_defaults_and_validation():
     assert m.x_columns == m.feature_columns and m.y_columns == m.label_columns
     h = m.content_hash()
     assert len(h) == 64 and all(c in "0123456789abcdef" for c in h)
+
+
+def test_manifest_constructor_coerces_column_lists_to_tuples():
+    base = manifest_one_segment().to_dict()
+    m = manifest_from_base_with_columns(base)
+
+    assert isinstance(m.feature_columns, tuple)
+    assert isinstance(m.label_columns, tuple)
+    assert isinstance(m.required_columns, tuple)
+    assert isinstance(m.x_columns, tuple)
+    assert isinstance(m.y_columns, tuple)
+    assert m.feature_columns == mf.feature_columns()
+    assert m.label_columns == mf.label_columns(m.label_spec)
+    assert m.required_columns == mf.required_row_columns(m.label_spec)
+
+
+def test_manifest_constructor_rejects_wrong_column_lists():
+    base = manifest_one_segment().to_dict()
+    bad = list(base["feature_columns"])
+    bad = bad[:-1]
+
+    with pytest.raises(ValueError):
+        manifest_from_base_with_columns(base, feature_columns=bad)
 
 
 def test_manifest_to_dict_from_dict_and_canonical_json():
