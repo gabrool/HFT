@@ -84,7 +84,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=tg.DEFAULT_TARGET_DTYPE,
     )
 
-    parser.add_argument("--variance-floor", type=_nonnegative_float, default=pp.DEFAULT_VARIANCE_FLOOR)
+    parser.add_argument("--variance-floor", type=_positive_float, default=pp.DEFAULT_VARIANCE_FLOOR)
     parser.add_argument("--clip-z", type=_positive_float, default=pp.DEFAULT_CLIP_Z)
     parser.add_argument(
         "--preprocess-output-dtype",
