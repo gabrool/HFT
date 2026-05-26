@@ -34,7 +34,7 @@ def test_canonical_names_are_microsecond_native():
 def test_legacy_to_canonical_roundtrip():
     for legacy in specs.LEGACY_CORE_FEATURE_NAMES + specs.LEGACY_EVENT_CONTEXT_FEATURE_NAMES:
         canonical = specs.legacy_name_to_canonical_name(legacy)
-        assert specs.canonical_to_legacy_name(canonical) == legacy
+        assert specs.canonical_name_to_legacy_name(canonical) == legacy
 
 
 def test_context_tail_after_legacy_core():
