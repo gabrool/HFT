@@ -63,6 +63,31 @@ def make_dataset(tmp_path, *, rows=20, chunk_rows=5, row_fn=row):
     return root, manifest
 
 
+def manifest_with_splits(manifest: mf.StorageManifest, splits: tuple[mf.SplitMetadata, ...]) -> mf.StorageManifest:
+    return mf.StorageManifest(
+        manifest_schema_version=manifest.manifest_schema_version,
+        dataset_id=manifest.dataset_id,
+        created_at_utc=manifest.created_at_utc,
+        pipeline_config=manifest.pipeline_config,
+        writer_metadata=manifest.writer_metadata,
+        feature_schema=manifest.feature_schema,
+        label_spec=manifest.label_spec,
+        transform_config=manifest.transform_config,
+        transform_diagnostics=manifest.transform_diagnostics,
+        exchange=manifest.exchange,
+        symbol=manifest.symbol,
+        storage_format=manifest.storage_format,
+        time_unit=manifest.time_unit,
+        decision_stride_us=manifest.decision_stride_us,
+        feature_columns=manifest.feature_columns,
+        label_columns=manifest.label_columns,
+        required_columns=manifest.required_columns,
+        segments=manifest.segments,
+        splits=tuple(splits),
+        notes=manifest.notes,
+    )
+
+
 def test_public_api_boundary():
     assert sp.__all__ == [
         "DEFAULT_SPLIT_BATCH_SIZE",
@@ -222,7 +247,7 @@ def test_window_with_too_few_rows_skipped_when_allowed(tmp_path):
 def test_apply_split_plan_replaces_existing_splits(tmp_path):
     _, manifest = make_dataset(tmp_path, rows=6)
     old = mf.SplitMetadata(role="train", segment_key=manifest.segments[0].segment_key, start_row=0, end_row=2, local_time_range=TimeRangeUS(1_000_000, 1_500_000), embargo_before_us=0, embargo_after_us=0)
-    m2 = manifest.model_copy(update={"splits": (old,)})
+    m2 = manifest_with_splits(manifest, (old,))
     new = mf.SplitMetadata(role="val", segment_key=manifest.segments[0].segment_key, start_row=2, end_row=4, local_time_range=TimeRangeUS(2_000_000, 2_500_000), embargo_before_us=0, embargo_after_us=0)
     plan = sp.SplitPlan(dataset_id=manifest.dataset_id, entries=(new,), purge_before_us=0, purge_after_us=0, embargo_before_us=0, embargo_after_us=0, source_windows=(sp.SplitWindow("val", 1, 10),))
     out = sp.apply_split_plan(m2, plan, replace_existing=True)
@@ -233,7 +258,7 @@ def test_apply_split_plan_replaces_existing_splits(tmp_path):
 def test_apply_split_plan_append_rejects_overlap(tmp_path):
     _, manifest = make_dataset(tmp_path, rows=6)
     old = mf.SplitMetadata(role="train", segment_key=manifest.segments[0].segment_key, start_row=0, end_row=5, local_time_range=TimeRangeUS(1_000_000, 3_500_000), embargo_before_us=0, embargo_after_us=0)
-    m2 = manifest.model_copy(update={"splits": (old,)})
+    m2 = manifest_with_splits(manifest, (old,))
     p = mf.SplitMetadata(role="val", segment_key=manifest.segments[0].segment_key, start_row=4, end_row=6, local_time_range=TimeRangeUS(3_000_000, 4_000_000), embargo_before_us=0, embargo_after_us=0)
     plan = sp.SplitPlan(dataset_id=manifest.dataset_id, entries=(p,), purge_before_us=0, purge_after_us=0, embargo_before_us=0, embargo_after_us=0, source_windows=(sp.SplitWindow("val", 1, 10),))
     with pytest.raises(ValueError):
@@ -243,7 +268,7 @@ def test_apply_split_plan_append_rejects_overlap(tmp_path):
 def test_apply_split_plan_append_nonoverlap(tmp_path):
     _, manifest = make_dataset(tmp_path, rows=10)
     old = mf.SplitMetadata(role="train", segment_key=manifest.segments[0].segment_key, start_row=0, end_row=5, local_time_range=TimeRangeUS(1_000_000, 3_500_000), embargo_before_us=0, embargo_after_us=0)
-    m2 = manifest.model_copy(update={"splits": (old,)})
+    m2 = manifest_with_splits(manifest, (old,))
     p = mf.SplitMetadata(role="val", segment_key=manifest.segments[1].segment_key, start_row=5, end_row=10, local_time_range=TimeRangeUS(3_500_000, 6_000_000), embargo_before_us=0, embargo_after_us=0)
     plan = sp.SplitPlan(dataset_id=manifest.dataset_id, entries=(p,), purge_before_us=0, purge_after_us=0, embargo_before_us=0, embargo_after_us=0, source_windows=(sp.SplitWindow("val", 1, 10),))
     out = sp.apply_split_plan(m2, plan, replace_existing=False)
@@ -252,7 +277,7 @@ def test_apply_split_plan_append_nonoverlap(tmp_path):
 
 def test_write_split_manifest_atomic_update(tmp_path):
     root, manifest = make_dataset(tmp_path)
-    seg_paths = [root / s.path for s in manifest.segments]
+    seg_paths = [root / s.parquet_path for s in manifest.segments]
     cfg = sp.SplitConfig(windows=sp.chronological_windows(train=(1_000_000, 4_000_000), val=(4_000_000, 7_000_000)), purge_before_us=0, purge_after_us=0, embargo_before_us=0, embargo_after_us=0)
     plan = sp.build_split_plan(str(root), cfg)
     sp.write_split_manifest(str(root), plan)
@@ -285,7 +310,7 @@ def test_reader_consumes_generated_splits(tmp_path):
 def test_build_split_plan_rejects_nonmonotonic_reader_rows(tmp_path):
     root, manifest = make_dataset(tmp_path)
     seg = manifest.segments[0]
-    p = root / seg.path
+    p = root / seg.parquet_path
     table = pq.read_table(p)
     vals = table[mf.LOCAL_TS_US_COLUMN].to_pylist()
     vals[-1] = vals[0] - 1
