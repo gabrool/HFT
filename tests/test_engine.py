@@ -119,20 +119,39 @@ def test_config_validation():
 
 def test_engine_decision_validation_and_copy():
     vec = np.ones(FEATURE_COUNT, dtype=np.float64)
-    d = eg.EngineDecision(0, 1, 1, -1, vec, "ok")
+    d = eg.EngineDecision(0, 1, 1, -1, 100.0, vec, "ok")
     vec[0] = 99.0
     assert d.feature_vector[0] == 1.0
+
+    d_int = eg.EngineDecision(0, 1, 1, -1, 100, np.ones(FEATURE_COUNT), "ok")
+    d_float = eg.EngineDecision(0, 1, 1, -1, 100.5, np.ones(FEATURE_COUNT), "ok")
+    d_np = eg.EngineDecision(0, 1, 1, -1, np.float64(101.5), np.ones(FEATURE_COUNT), "ok")
+    assert isinstance(d_int.raw_mid, float)
+    assert isinstance(d_float.raw_mid, float)
+    assert isinstance(d_np.raw_mid, float)
+
+    with pytest.raises(ValueError, match="raw_mid"):
+        eg.EngineDecision(0, 1, 1, -1, 0.0, np.ones(FEATURE_COUNT), "ok")
+    with pytest.raises(ValueError, match="raw_mid"):
+        eg.EngineDecision(0, 1, 1, -1, -1.0, np.ones(FEATURE_COUNT), "ok")
+    with pytest.raises(ValueError, match="raw_mid"):
+        eg.EngineDecision(0, 1, 1, -1, np.nan, np.ones(FEATURE_COUNT), "ok")
+    with pytest.raises(ValueError, match="raw_mid"):
+        eg.EngineDecision(0, 1, 1, -1, np.inf, np.ones(FEATURE_COUNT), "ok")
+    with pytest.raises(ValueError, match="raw_mid"):
+        eg.EngineDecision(0, 1, 1, -1, True, np.ones(FEATURE_COUNT), "ok")
+
     with pytest.raises(ValueError):
-        eg.EngineDecision(0, 0, 1, -1, np.ones(FEATURE_COUNT), "ok")
+        eg.EngineDecision(0, 0, 1, -1, 100.0, np.ones(FEATURE_COUNT), "ok")
     with pytest.raises(ValueError):
-        eg.EngineDecision(0, 1, 0, -1, np.ones(FEATURE_COUNT), "ok")
+        eg.EngineDecision(0, 1, 0, -1, 100.0, np.ones(FEATURE_COUNT), "ok")
     with pytest.raises(ValueError):
-        eg.EngineDecision(0, 1, 1, -1, np.ones(FEATURE_COUNT - 1), "ok")
+        eg.EngineDecision(0, 1, 1, -1, 100.0, np.ones(FEATURE_COUNT - 1), "ok")
     with pytest.raises(ValueError):
-        eg.EngineDecision(0, 1, 1, -1, np.ones(FEATURE_COUNT), "")
-    eg.EngineDecision(0, 1, 1, 0, np.ones(FEATURE_COUNT), "ok")
+        eg.EngineDecision(0, 1, 1, -1, 100.0, np.ones(FEATURE_COUNT), "")
+    eg.EngineDecision(0, 1, 1, 0, 100.0, np.ones(FEATURE_COUNT), "ok")
     with pytest.raises(ValueError):
-        eg.EngineDecision(0, 1, 1, -2, np.ones(FEATURE_COUNT), "ok")
+        eg.EngineDecision(0, 1, 1, -2, 100.0, np.ones(FEATURE_COUNT), "ok")
 
 
 def test_event_history_counts_inclusive():
@@ -198,6 +217,44 @@ def test_long_gap_emits_at_most_one_decision():
     assert e.decision_count == c + 1
     assert e.next_decision_local_ts_us > 4_000_000
 
+
+
+def test_emitted_decision_carries_decision_time_raw_mid():
+    e = eg.FeatureEngine(config=eg.FeatureEngineConfig(decision_stride_us=100_000))
+    e.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
+
+    snap1 = make_snapshot(2_000_000, mid=100.0)
+    d1 = e.on_book_snapshot(snap1)
+    assert d1 is not None
+    assert d1.raw_mid == pytest.approx(100.0)
+    assert d1.local_ts_us == snap1.local_ts_us
+    assert d1.ts_us == snap1.ts_us
+    assert d1.event_seq == snap1.event_seq
+
+    snap2 = make_snapshot(2_100_000, mid=101.0)
+    d2 = e.on_book_snapshot(snap2)
+    assert d2 is not None
+    assert d2.raw_mid == pytest.approx(101.0)
+    assert d2.local_ts_us == snap2.local_ts_us
+    assert d2.ts_us == snap2.ts_us
+    assert d2.event_seq == snap2.event_seq
+
+
+def test_runner_handoff_payload_uses_decision_raw_mid_without_book_lookup():
+    e = eg.FeatureEngine(config=eg.FeatureEngineConfig(decision_stride_us=100_000))
+    e.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
+    d = e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
+    assert d is not None
+
+    row_payload = {
+        "decision_index": d.decision_index,
+        "ts_us": d.ts_us,
+        "local_ts_us": d.local_ts_us,
+        "event_seq": d.event_seq,
+        "raw_mid": d.raw_mid,
+        "feature_values": tuple(d.feature_vector),
+    }
+    assert row_payload["raw_mid"] > 0.0
 
 def test_feature_vector_shape_and_all_finite():
     e = eg.FeatureEngine()
