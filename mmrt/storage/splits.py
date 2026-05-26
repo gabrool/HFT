@@ -7,7 +7,7 @@ import pyarrow as pa
 
 from mmrt.contracts import SplitRole, TimeRangeUS
 from mmrt.storage import manifest as mf
-from mmrt.storage.reader import ReaderConfig, StorageDatasetReader, open_dataset
+from mmrt.storage.reader import StorageDatasetReader, open_dataset
 
 DEFAULT_SPLIT_BATCH_SIZE = 65_536
 
@@ -145,17 +145,19 @@ class SplitPlan:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataset_id", _require_nonempty_str(self.dataset_id, "dataset_id"))
-        object.__setattr__(self, "entries", tuple(self.entries))
+        entries = tuple(self.entries)
+        object.__setattr__(self, "entries", entries)
         object.__setattr__(self, "source_windows", _coerce_window_tuple(self.source_windows))
         _require_nonnegative_int(self.purge_before_us, "purge_before_us")
         _require_nonnegative_int(self.purge_after_us, "purge_after_us")
         _require_nonnegative_int(self.embargo_before_us, "embargo_before_us")
         _require_nonnegative_int(self.embargo_after_us, "embargo_after_us")
-        for i, entry in enumerate(self.entries):
+        for i, entry in enumerate(entries):
             if not isinstance(entry, mf.SplitMetadata):
                 raise ValueError(f"entries[{i}] must be SplitMetadata")
             if entry.embargo_before_us != self.embargo_before_us or entry.embargo_after_us != self.embargo_after_us:
                 raise ValueError("entry embargo values must match SplitPlan embargo values")
+        _assert_nonoverlapping_entries(entries)
 
     @property
     def roles(self) -> tuple[SplitRole, ...]:
@@ -200,11 +202,9 @@ def build_split_plan(dataset_root: str, config: SplitConfig) -> SplitPlan:
         prev = ts
 
     entries: list[mf.SplitMetadata] = []
-    effective_by_window: dict[SplitWindow, tuple[int, int]] = {}
     for window in config.windows:
         effective_start = window.start_local_ts_us + purge_before + embargo_before
         effective_end = window.end_local_ts_us - purge_after - embargo_after
-        effective_by_window[window] = (effective_start, effective_end)
         if effective_end <= effective_start:
             if not config.allow_empty_roles:
                 raise ValueError(f"window {window.role.value} has no rows after purge/embargo")
@@ -227,6 +227,8 @@ def build_split_plan(dataset_root: str, config: SplitConfig) -> SplitPlan:
                 continue
             entry_local_start = local_ts[seg_start]
             entry_local_end = local_ts[seg_end - 1] + 1
+            if entry_local_start < effective_start or entry_local_end > effective_end:
+                raise ValueError("entry local_time_range outside effective window")
             entries.append(
                 mf.SplitMetadata(
                     role=window.role,
@@ -250,12 +252,6 @@ def build_split_plan(dataset_root: str, config: SplitConfig) -> SplitPlan:
             if not any(e.role == w.role for e in entries_tuple):
                 raise ValueError(f"role {w.role.value} has no split entries")
 
-    for e in entries_tuple:
-        w = next(w for w in config.windows if w.role == e.role and w.start_local_ts_us <= e.local_time_range.start_us)
-        eff_start, eff_end = effective_by_window[w]
-        if e.local_time_range.start_us < eff_start or e.local_time_range.end_us > eff_end + 1:
-            raise ValueError("entry local_time_range outside effective window")
-
     return SplitPlan(
         dataset_id=reader.manifest.dataset_id,
         entries=entries_tuple,
@@ -273,12 +269,11 @@ def apply_split_plan(manifest: mf.StorageManifest, plan: SplitPlan, *, replace_e
     _require_bool(replace_existing, "replace_existing")
 
     if replace_existing:
-        new_splits = plan.entries
+        new_splits = tuple(plan.entries)
     else:
-        existing = tuple(manifest.splits)
-        combined = existing + plan.entries
-        _assert_nonoverlapping_entries(combined)
-        new_splits = combined
+        new_splits = tuple(manifest.splits) + tuple(plan.entries)
+
+    _assert_nonoverlapping_entries(new_splits)
 
     return mf.StorageManifest(
         manifest_schema_version=manifest.manifest_schema_version,
