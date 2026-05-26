@@ -1,9 +1,13 @@
 """Latency-aware label construction for the MMRT feature pipeline.
 
 This module builds fixed-horizon return labels from causal book-mid price
-observations. It consumes already-normalized microsecond timestamps and prices.
-It does not parse market data, compute features, apply transforms, or write
-storage artifacts.
+observations. All timestamps accepted by this module are local/causal
+microsecond timestamps (`local_ts_us`), not exchange event timestamps (`ts_us`).
+The shared LabelResult contract still uses generic `decision_ts_us` and
+`entry_ts_us` field names, but values produced here are local-clock values.
+
+This module does not parse market data, compute features, apply transforms,
+split rows, or write storage artifacts.
 """
 
 from dataclasses import dataclass
@@ -62,54 +66,54 @@ def _safe_log_return_bps(exit_price: float, entry_price: float) -> float:
 
 @dataclass(frozen=True, slots=True)
 class PriceObservation:
-    ts_us: int
+    local_ts_us: int
     price: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ts_us", _require_int_us(self.ts_us, "ts_us", allow_zero=True))
+        object.__setattr__(self, "local_ts_us", _require_int_us(self.local_ts_us, "local_ts_us", allow_zero=True))
         object.__setattr__(self, "price", _require_positive_float(self.price, "price"))
 
 
 @dataclass(frozen=True, slots=True)
 class PendingLabel:
-    decision_ts_us: int
-    entry_ts_us: int
-    ready_ts_us: int
+    decision_local_ts_us: int
+    entry_local_ts_us: int
+    ready_local_ts_us: int
     horizons_us: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        decision = _require_int_us(self.decision_ts_us, "decision_ts_us", allow_zero=True)
-        entry = _require_int_us(self.entry_ts_us, "entry_ts_us", allow_zero=True)
-        ready = _require_int_us(self.ready_ts_us, "ready_ts_us", allow_zero=True)
+        decision = _require_int_us(self.decision_local_ts_us, "decision_local_ts_us", allow_zero=True)
+        entry = _require_int_us(self.entry_local_ts_us, "entry_local_ts_us", allow_zero=True)
+        ready = _require_int_us(self.ready_local_ts_us, "ready_local_ts_us", allow_zero=True)
         if entry < decision:
-            raise ValueError("entry_ts_us must be >= decision_ts_us")
+            raise ValueError("entry_local_ts_us must be >= decision_local_ts_us")
         if ready < entry:
-            raise ValueError("ready_ts_us must be >= entry_ts_us")
+            raise ValueError("ready_local_ts_us must be >= entry_local_ts_us")
         horizons = tuple(sorted({
             _require_int_us(h, f"horizons_us[{idx}]", positive=True) for idx, h in enumerate(self.horizons_us)
         }))
         if not horizons:
             raise ValueError("horizons_us must be non-empty")
-        object.__setattr__(self, "decision_ts_us", decision)
-        object.__setattr__(self, "entry_ts_us", entry)
-        object.__setattr__(self, "ready_ts_us", ready)
+        object.__setattr__(self, "decision_local_ts_us", decision)
+        object.__setattr__(self, "entry_local_ts_us", entry)
+        object.__setattr__(self, "ready_local_ts_us", ready)
         object.__setattr__(self, "horizons_us", horizons)
 
 
 class PriceHistory:
     def __init__(self, capacity: int = DEFAULT_PRICE_HISTORY_CAPACITY):
         self.capacity = _require_int_us(capacity, "capacity", positive=True)
-        self._ts: list[int] = []
+        self._local_ts: list[int] = []
         self._price: list[float] = []
         self._start = 0
 
     @property
     def size(self) -> int:
-        return len(self._ts) - self._start
+        return len(self._local_ts) - self._start
 
     @property
-    def latest_ts_us(self) -> int | None:
-        return self._ts[-1] if self.size > 0 else None
+    def latest_local_ts_us(self) -> int | None:
+        return self._local_ts[-1] if self.size > 0 else None
 
     @property
     def latest_price(self) -> float | None:
@@ -119,46 +123,46 @@ class PriceHistory:
         if not isinstance(obs, PriceObservation):
             raise ValueError("obs must be PriceObservation")
         if self.size == 0:
-            self._ts.append(obs.ts_us)
+            self._local_ts.append(obs.local_ts_us)
             self._price.append(obs.price)
         else:
-            last_ts = self._ts[-1]
-            if obs.ts_us < last_ts:
-                raise ValueError("price timestamp must be nondecreasing")
-            if obs.ts_us == last_ts:
+            last_ts = self._local_ts[-1]
+            if obs.local_ts_us < last_ts:
+                raise ValueError("price local_ts_us must be nondecreasing")
+            if obs.local_ts_us == last_ts:
                 self._price[-1] = obs.price
             else:
-                self._ts.append(obs.ts_us)
+                self._local_ts.append(obs.local_ts_us)
                 self._price.append(obs.price)
         if self.size > self.capacity:
-            self._start = len(self._ts) - self.capacity
+            self._start = len(self._local_ts) - self.capacity
         self._maybe_compact()
 
     def _maybe_compact(self) -> None:
-        if self._start >= COMPACT_MIN_START and self._start >= len(self._ts) * COMPACT_FRACTION:
-            self._ts = self._ts[self._start :]
+        if self._start >= COMPACT_MIN_START and self._start >= len(self._local_ts) * COMPACT_FRACTION:
+            self._local_ts = self._local_ts[self._start :]
             self._price = self._price[self._start :]
             self._start = 0
 
-    def asof_price(self, ts_us: int) -> float | None:
-        _require_int_us(ts_us, "ts_us", allow_zero=True)
-        idx = bisect.bisect_right(self._ts, ts_us, lo=self._start) - 1
+    def asof_price(self, local_ts_us: int) -> float | None:
+        _require_int_us(local_ts_us, "local_ts_us", allow_zero=True)
+        idx = bisect.bisect_right(self._local_ts, local_ts_us, lo=self._start) - 1
         if idx < self._start:
             return None
         return self._price[idx]
 
-    def latest_reaches(self, ts_us: int) -> bool:
-        latest = self.latest_ts_us
-        return latest is not None and latest >= ts_us
+    def latest_reaches(self, local_ts_us: int) -> bool:
+        latest = self.latest_local_ts_us
+        return latest is not None and latest >= local_ts_us
 
     def active_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         return (
-            np.asarray(self._ts[self._start :], dtype=np.int64).copy(),
+            np.asarray(self._local_ts[self._start :], dtype=np.int64).copy(),
             np.asarray(self._price[self._start :], dtype=np.float64).copy(),
         )
 
     def reset(self) -> None:
-        self._ts.clear()
+        self._local_ts.clear()
         self._price.clear()
         self._start = 0
 
@@ -169,15 +173,15 @@ class LabelBuilder:
         self.price_history = PriceHistory(price_history_capacity)
         self.pending: list[PendingLabel] = []
         self._pending_start = 0
-        self._last_decision_ts_us: int | None = None
+        self._last_decision_local_ts_us: int | None = None
 
     @property
     def pending_count(self) -> int:
         return len(self.pending) - self._pending_start
 
     @property
-    def latest_price_ts_us(self) -> int | None:
-        return self.price_history.latest_ts_us
+    def latest_price_local_ts_us(self) -> int | None:
+        return self.price_history.latest_local_ts_us
 
     @property
     def label_context_us(self) -> int:
@@ -187,24 +191,24 @@ class LabelBuilder:
         self.price_history.reset()
         self.pending.clear()
         self._pending_start = 0
-        self._last_decision_ts_us = None
+        self._last_decision_local_ts_us = None
 
-    def observe_price(self, ts_us: int, price: float) -> list[LabelResult]:
-        self.price_history.append(PriceObservation(ts_us, price))
+    def observe_price_local(self, local_ts_us: int, price: float) -> list[LabelResult]:
+        self.price_history.append(PriceObservation(local_ts_us, price))
         return self.mature_ready()
 
-    def on_decision(self, decision_ts_us: int) -> None:
-        decision_ts_us = _require_int_us(decision_ts_us, "decision_ts_us", allow_zero=True)
-        if self._last_decision_ts_us is not None and decision_ts_us < self._last_decision_ts_us:
-            raise ValueError("decision_ts_us must be nondecreasing")
-        self._last_decision_ts_us = decision_ts_us
-        entry_ts_us = decision_ts_us + self.spec.entry_delay_us
-        ready_ts_us = entry_ts_us + max(self.spec.horizons_us)
+    def on_decision_local(self, decision_local_ts_us: int) -> None:
+        decision_local_ts_us = _require_int_us(decision_local_ts_us, "decision_local_ts_us", allow_zero=True)
+        if self._last_decision_local_ts_us is not None and decision_local_ts_us < self._last_decision_local_ts_us:
+            raise ValueError("decision_local_ts_us must be nondecreasing")
+        self._last_decision_local_ts_us = decision_local_ts_us
+        entry_local_ts_us = decision_local_ts_us + self.spec.entry_delay_us
+        ready_local_ts_us = entry_local_ts_us + max(self.spec.horizons_us)
         self.pending.append(
             PendingLabel(
-                decision_ts_us=decision_ts_us,
-                entry_ts_us=entry_ts_us,
-                ready_ts_us=ready_ts_us,
+                decision_local_ts_us=decision_local_ts_us,
+                entry_local_ts_us=entry_local_ts_us,
+                ready_local_ts_us=ready_local_ts_us,
                 horizons_us=self.spec.horizons_us,
             )
         )
@@ -213,16 +217,16 @@ class LabelBuilder:
         out: list[LabelResult] = []
         while self._pending_start < len(self.pending):
             pend = self.pending[self._pending_start]
-            if not self.price_history.latest_reaches(pend.ready_ts_us):
+            if not self.price_history.latest_reaches(pend.ready_local_ts_us):
                 break
-            entry_price = self.price_history.asof_price(pend.entry_ts_us)
+            entry_price = self.price_history.asof_price(pend.entry_local_ts_us)
             if entry_price is None:
                 break
             values: list[float] = []
             complete = True
             for horizon in pend.horizons_us:
-                exit_ts = pend.entry_ts_us + horizon
-                exit_price = self.price_history.asof_price(exit_ts)
+                exit_local_ts_us = pend.entry_local_ts_us + horizon
+                exit_price = self.price_history.asof_price(exit_local_ts_us)
                 if exit_price is None:
                     complete = False
                     break
@@ -230,9 +234,10 @@ class LabelBuilder:
             if not complete:
                 break
             out.append(
+                # LabelResult uses generic ts field names; values here are local-clock timestamps.
                 LabelResult(
-                    decision_ts_us=pend.decision_ts_us,
-                    entry_ts_us=pend.entry_ts_us,
+                    decision_ts_us=pend.decision_local_ts_us,
+                    entry_ts_us=pend.entry_local_ts_us,
                     horizons_us=self.spec.horizons_us,
                     values_bps=tuple(values),
                 )
@@ -243,27 +248,32 @@ class LabelBuilder:
             self._pending_start = 0
         return out
 
-    def label_now(self, decision_ts_us: int) -> LabelResult | None:
-        decision_ts_us = _require_int_us(decision_ts_us, "decision_ts_us", allow_zero=True)
-        entry_ts_us = decision_ts_us + self.spec.entry_delay_us
-        ready_ts_us = entry_ts_us + max(self.spec.horizons_us)
-        if not self.price_history.latest_reaches(ready_ts_us):
+    def label_now_local(self, decision_local_ts_us: int) -> LabelResult | None:
+        decision_local_ts_us = _require_int_us(decision_local_ts_us, "decision_local_ts_us", allow_zero=True)
+        entry_local_ts_us = decision_local_ts_us + self.spec.entry_delay_us
+        ready_local_ts_us = entry_local_ts_us + max(self.spec.horizons_us)
+        if not self.price_history.latest_reaches(ready_local_ts_us):
             return None
-        entry_price = self.price_history.asof_price(entry_ts_us)
+        entry_price = self.price_history.asof_price(entry_local_ts_us)
         if entry_price is None:
             return None
         values: list[float] = []
         for horizon in self.spec.horizons_us:
-            exit_price = self.price_history.asof_price(entry_ts_us + horizon)
+            exit_price = self.price_history.asof_price(entry_local_ts_us + horizon)
             if exit_price is None:
                 return None
             values.append(_safe_log_return_bps(exit_price, entry_price))
-        return LabelResult(decision_ts_us=decision_ts_us, entry_ts_us=entry_ts_us, horizons_us=self.spec.horizons_us, values_bps=tuple(values))
+        return LabelResult(
+            decision_ts_us=decision_local_ts_us,
+            entry_ts_us=entry_local_ts_us,
+            horizons_us=self.spec.horizons_us,
+            values_bps=tuple(values),
+        )
 
-    def on_price_and_decision(self, ts_us: int, price: float, *, is_decision: bool) -> list[LabelResult]:
-        out = self.observe_price(ts_us, price)
+    def on_price_and_decision_local(self, local_ts_us: int, price: float, *, is_decision: bool) -> list[LabelResult]:
+        out = self.observe_price_local(local_ts_us, price)
         if is_decision:
-            self.on_decision(ts_us)
+            self.on_decision_local(local_ts_us)
             out.extend(self.mature_ready())
         return out
 
@@ -299,20 +309,20 @@ def _coerce_timestamp_array(values: np.ndarray, name: str) -> np.ndarray:
         raise ValueError(f"{name} must be nondecreasing")
     return out
 
-def build_labels_from_price_arrays(
-    decision_ts_us: np.ndarray,
-    price_ts_us: np.ndarray,
+def build_labels_from_local_price_arrays(
+    decision_local_ts_us: np.ndarray,
+    price_local_ts_us: np.ndarray,
     price_values: np.ndarray,
     spec: LabelSpec,
 ) -> tuple[np.ndarray, np.ndarray]:
     spec = _coerce_label_spec(spec)
-    dec = _coerce_timestamp_array(decision_ts_us, "decision_ts_us")
-    pts = _coerce_timestamp_array(price_ts_us, "price_ts_us")
+    dec = _coerce_timestamp_array(decision_local_ts_us, "decision_local_ts_us")
+    pts = _coerce_timestamp_array(price_local_ts_us, "price_local_ts_us")
     pval = np.asarray(price_values)
     if pval.ndim != 1:
         raise ValueError("price_values must be 1D")
     if pts.shape[0] != pval.shape[0]:
-        raise ValueError("price_ts_us and price_values length mismatch")
+        raise ValueError("price_local_ts_us and price_values length mismatch")
     if pval.size and (not np.all(np.isfinite(pval)) or np.any(pval <= 0.0)):
         raise ValueError("price_values must be finite and > 0")
 
@@ -354,16 +364,16 @@ def label_value_names(spec: LabelSpec) -> tuple[str, ...]:
     return tuple(f"ret_bps_{h}us" for h in spec.horizons_us)
 
 
-def label_ready_ts_us(decision_ts_us: int, spec: LabelSpec) -> int:
-    decision_ts_us = _require_int_us(decision_ts_us, "decision_ts_us", allow_zero=True)
+def label_ready_local_ts_us(decision_local_ts_us: int, spec: LabelSpec) -> int:
+    decision_local_ts_us = _require_int_us(decision_local_ts_us, "decision_local_ts_us", allow_zero=True)
     spec = _coerce_label_spec(spec)
-    return decision_ts_us + spec.entry_delay_us + max(spec.horizons_us)
+    return decision_local_ts_us + spec.entry_delay_us + max(spec.horizons_us)
 
 
-def label_entry_ts_us(decision_ts_us: int, spec: LabelSpec) -> int:
-    decision_ts_us = _require_int_us(decision_ts_us, "decision_ts_us", allow_zero=True)
+def label_entry_local_ts_us(decision_local_ts_us: int, spec: LabelSpec) -> int:
+    decision_local_ts_us = _require_int_us(decision_local_ts_us, "decision_local_ts_us", allow_zero=True)
     spec = _coerce_label_spec(spec)
-    return decision_ts_us + spec.entry_delay_us
+    return decision_local_ts_us + spec.entry_delay_us
 
 
 __all__ = [
@@ -372,8 +382,8 @@ __all__ = [
     "PendingLabel",
     "PriceHistory",
     "LabelBuilder",
-    "build_labels_from_price_arrays",
+    "build_labels_from_local_price_arrays",
     "label_value_names",
-    "label_ready_ts_us",
-    "label_entry_ts_us",
+    "label_ready_local_ts_us",
+    "label_entry_local_ts_us",
 ]
