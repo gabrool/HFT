@@ -82,7 +82,7 @@ def make_dataset_with_splits(tmp_path: Path, *, with_test: bool = True, with_spl
             splits=tuple(splits),
             notes=manifest.notes,
         )
-        mf.write_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME, updated)
+        mf.write_manifest_json(updated, root / mf.DEFAULT_MANIFEST_FILENAME)
         manifest = updated
     return root, manifest
 
