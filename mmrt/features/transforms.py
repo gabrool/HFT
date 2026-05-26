@@ -1,9 +1,12 @@
 """Causal feature transforms for the MMRT feature pipeline.
 
-This module applies per-feature raw transforms and causal EWMA normalization to
-raw engine feature vectors. It consumes already-built feature rows ordered on
-the microsecond local clock. It does not compute features, build labels, parse
-market data, fit global dataset scalers, or write storage artifacts.
+All timestamps accepted by this module are local/causal microsecond timestamps
+(`local_ts_us`), not exchange event timestamps (`ts_us`). EWMA decay and
+monotonicity checks therefore advance on the same local clock used by the
+feature engine, label builder, storage writer, and split metadata.
+
+This module does not parse market data, compute labels, split rows, write
+storage artifacts, or train models.
 """
 
 from dataclasses import dataclass
@@ -88,27 +91,29 @@ def _require_output_dtype(value: str) -> str:
     return value
 
 
-def _coerce_ts_array(ts_us: np.ndarray, expected_len: int) -> np.ndarray:
+def _coerce_local_ts_array(local_ts_us: np.ndarray, expected_len: int) -> np.ndarray:
     _require_nonnegative_int(expected_len, "expected_len")
-    arr = np.asarray(ts_us)
-    if arr.ndim != 1 or arr.shape[0] != expected_len:
-        raise ValueError("ts_us must be 1D with expected length")
+    arr = np.asarray(local_ts_us)
+    if arr.ndim != 1:
+        raise ValueError("local_ts_us must be 1D")
+    if arr.shape[0] != expected_len:
+        raise ValueError("local_ts_us length mismatch")
     if arr.dtype == np.dtype(bool) or arr.dtype.kind == "b":
-        raise ValueError("ts_us bool dtype not allowed")
+        raise ValueError("local_ts_us must not be bool")
     if arr.dtype.kind in ("i", "u"):
         out = arr.astype(np.int64, copy=False)
     elif arr.dtype.kind == "f":
         if not np.all(np.isfinite(arr)):
-            raise ValueError("ts_us float entries must be finite integers")
+            raise ValueError("local_ts_us must be finite")
         if not np.all(np.equal(arr, np.floor(arr))):
-            raise ValueError("ts_us float entries must be finite integers")
+            raise ValueError("local_ts_us must be integer-valued")
         out = arr.astype(np.int64, copy=False)
     else:
-        raise ValueError("ts_us must be integer or integer-valued float")
+        raise ValueError("local_ts_us must be integer-valued")
     if out.size and np.any(out < 0):
-        raise ValueError("ts_us must be nonnegative")
+        raise ValueError("local_ts_us must be nonnegative")
     if out.size and np.any(np.diff(out) < 0):
-        raise ValueError("ts_us must be nondecreasing")
+        raise ValueError("local_ts_us must be nondecreasing")
     return np.ascontiguousarray(out)
 
 
@@ -200,14 +205,14 @@ class TransformDiagnostics:
 @dataclass(frozen=True, slots=True)
 class TransformStateSnapshot:
     rows_seen: int
-    last_ts_us: int | None
+    last_local_ts_us: int | None
     mean: np.ndarray
     var: np.ndarray
     count: np.ndarray
     def __post_init__(self) -> None:
         object.__setattr__(self, "rows_seen", _require_nonnegative_int(self.rows_seen, "rows_seen"))
-        if self.last_ts_us is not None:
-            object.__setattr__(self, "last_ts_us", _require_nonnegative_int(self.last_ts_us, "last_ts_us"))
+        if self.last_local_ts_us is not None:
+            object.__setattr__(self, "last_local_ts_us", _require_nonnegative_int(self.last_local_ts_us, "last_local_ts_us"))
         mean = np.ascontiguousarray(np.asarray(self.mean, dtype=np.float64))
         var = np.ascontiguousarray(np.asarray(self.var, dtype=np.float64))
         count = np.ascontiguousarray(np.asarray(self.count, dtype=np.int64))
@@ -271,7 +276,7 @@ class CausalFeatureTransformer:
         self.var = np.zeros(FEATURE_COUNT, dtype=np.float64)
         self.count = np.zeros(FEATURE_COUNT, dtype=np.int64)
         self.rows_seen = 0
-        self.last_ts_us = None
+        self.last_local_ts_us = None
         self.diagnostics = TransformDiagnostics()
         self._ewma_indices = np.asarray(EWMA_FEATURE_INDICES_DEFAULT, dtype=np.int64)
         self._no_ewma_indices = np.asarray(NO_EWMA_FEATURE_INDICES_DEFAULT, dtype=np.int64)
@@ -287,15 +292,15 @@ class CausalFeatureTransformer:
     @property
     def is_initialized(self) -> bool: return self.rows_seen > 0
     def reset(self) -> None:
-        self.mean.fill(0.0); self.var.fill(0.0); self.count.fill(0); self.rows_seen = 0; self.last_ts_us = None; self.diagnostics.reset()
+        self.mean.fill(0.0); self.var.fill(0.0); self.count.fill(0); self.rows_seen = 0; self.last_local_ts_us = None; self.diagnostics.reset()
     def snapshot(self) -> TransformStateSnapshot:
-        return TransformStateSnapshot(self.rows_seen, self.last_ts_us, self.mean.copy(), self.var.copy(), self.count.copy())
+        return TransformStateSnapshot(self.rows_seen, self.last_local_ts_us, self.mean.copy(), self.var.copy(), self.count.copy())
     def load_snapshot(self, snapshot: TransformStateSnapshot) -> None:
-        s = TransformStateSnapshot(snapshot.rows_seen, snapshot.last_ts_us, snapshot.mean, snapshot.var, snapshot.count)
-        self.mean = s.mean.copy(); self.var = s.var.copy(); self.count = s.count.copy(); self.rows_seen = s.rows_seen; self.last_ts_us = s.last_ts_us; self.diagnostics.reset()
-    def transform_one(self, ts_us: int, raw: np.ndarray) -> np.ndarray:
-        ts = _require_nonnegative_int(ts_us, "ts_us")
-        if self.last_ts_us is not None and ts < self.last_ts_us: raise ValueError("decreasing ts_us")
+        s = TransformStateSnapshot(snapshot.rows_seen, snapshot.last_local_ts_us, snapshot.mean, snapshot.var, snapshot.count)
+        self.mean = s.mean.copy(); self.var = s.var.copy(); self.count = s.count.copy(); self.rows_seen = s.rows_seen; self.last_local_ts_us = s.last_local_ts_us; self.diagnostics.reset()
+    def transform_one_local(self, local_ts_us: int, raw: np.ndarray) -> np.ndarray:
+        local_ts = _require_nonnegative_int(local_ts_us, "local_ts_us")
+        if self.last_local_ts_us is not None and local_ts < self.last_local_ts_us: raise ValueError("decreasing local_ts_us")
         raw64 = _coerce_feature_vector(raw)
         base, n_nonfinite, rawc, boundc = _base_transform_values_with_counts(raw64, self.config)
         out = base.copy()
@@ -318,21 +323,21 @@ class CausalFeatureTransformer:
                     zc = np.clip(z, -self.config.z_clip, self.config.z_clip)
                     self.diagnostics.z_clip_count += int(np.sum(z != zc))
                     out[good_idx] = zc
-        self._update_ewma_state(ts, base)
+        self._update_ewma_state(local_ts, base)
         self.rows_seen += 1
-        self.last_ts_us = ts
+        self.last_local_ts_us = local_ts
         self.diagnostics.rows_seen += 1
         self.diagnostics.nonfinite_raw_count += n_nonfinite
         self.diagnostics.raw_clip_count += rawc
         self.diagnostics.bounded_clip_count += boundc
         out = out.astype(self.config.dtype, copy=False)
         return np.ascontiguousarray(out)
-    def _update_ewma_state(self, ts_us: int, base: np.ndarray) -> None:
+    def _update_ewma_state(self, local_ts_us: int, base: np.ndarray) -> None:
         idx = self._ewma_indices
         if idx.size == 0: return
         if self.rows_seen == 0:
             self.mean[idx] = base[idx]; self.var[idx] = 0.0; self.count[idx] = 1; return
-        dt = max(0, ts_us - int(self.last_ts_us))
+        dt = max(0, local_ts_us - int(self.last_local_ts_us))
         if dt == 0:
             alpha = np.zeros(idx.shape[0], dtype=np.float64)
         else:
@@ -343,19 +348,19 @@ class CausalFeatureTransformer:
         self.mean[idx] = new_mean
         self.var[idx] = np.maximum(new_var, 0.0)
         self.count[idx] += 1
-    def transform_many(self, ts_us: np.ndarray, raw_matrix: np.ndarray) -> np.ndarray:
+    def transform_many_local(self, local_ts_us: np.ndarray, raw_matrix: np.ndarray) -> np.ndarray:
         mat = _coerce_feature_matrix(raw_matrix)
-        ts = _coerce_ts_array(ts_us, mat.shape[0])
+        local_ts = _coerce_local_ts_array(local_ts_us, mat.shape[0])
         out = np.empty((mat.shape[0], FEATURE_COUNT), dtype=self.config.dtype)
-        for i in range(mat.shape[0]): out[i] = self.transform_one(int(ts[i]), mat[i])
+        for i in range(mat.shape[0]): out[i] = self.transform_one_local(int(local_ts[i]), mat[i])
         return out
     def diagnostics_snapshot(self) -> TransformDiagnostics:
         d = self.diagnostics
         return TransformDiagnostics(d.rows_seen, d.nonfinite_raw_count, d.raw_clip_count, d.bounded_clip_count, d.z_clip_count, d.warmup_ewma_count)
 
-def transform_feature_matrix_causal(ts_us: np.ndarray, raw_matrix: np.ndarray, config: TransformConfig | None = None, initial_snapshot: TransformStateSnapshot | None = None) -> tuple[np.ndarray, TransformStateSnapshot, TransformDiagnostics]:
+def transform_feature_matrix_causal_local(local_ts_us: np.ndarray, raw_matrix: np.ndarray, config: TransformConfig | None = None, initial_snapshot: TransformStateSnapshot | None = None) -> tuple[np.ndarray, TransformStateSnapshot, TransformDiagnostics]:
     transformer = CausalFeatureTransformer(config=config, snapshot=initial_snapshot)
-    transformed = transformer.transform_many(ts_us, raw_matrix)
+    transformed = transformer.transform_many_local(local_ts_us, raw_matrix)
     return transformed, transformer.snapshot(), transformer.diagnostics_snapshot()
 
 __all__ = [
@@ -363,5 +368,5 @@ __all__ = [
     "DEFAULT_VARIANCE_FLOOR", "DEFAULT_Z_CLIP", "DEFAULT_RAW_CLIP", "DEFAULT_BOUNDED_ABS_CLIP", "TransformConfig",
     "TransformDiagnostics", "TransformStateSnapshot", "CausalFeatureTransformer", "feature_transform_keys",
     "transform_key_for_feature", "ewma_feature_indices", "no_ewma_feature_indices", "base_transform_values",
-    "transform_feature_matrix_causal",
+    "transform_feature_matrix_causal_local",
 ]
