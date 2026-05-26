@@ -95,17 +95,22 @@ def _coerce_ts_array(ts_us: np.ndarray, expected_len: int) -> np.ndarray:
     arr = np.asarray(ts_us)
     if arr.ndim != 1 or arr.shape[0] != expected_len:
         raise ValueError("ts_us must be 1D with expected length")
-    if arr.dtype == np.bool_:
+    if arr.dtype == np.dtype(bool) or arr.dtype.kind == "b":
         raise ValueError("ts_us bool dtype not allowed")
-    if np.issubdtype(arr.dtype, np.integer):
+    if arr.dtype.kind in ("i", "u"):
+        out = arr.astype(np.int64, copy=False)
+    elif arr.dtype.kind == "f":
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("ts_us float entries must be finite integers")
+        if not np.all(np.equal(arr, np.floor(arr))):
+            raise ValueError("ts_us float entries must be finite integers")
         out = arr.astype(np.int64, copy=False)
     else:
-        arrf = arr.astype(np.float64, copy=False)
-        if not np.all(np.isfinite(arrf)) or not np.all(arrf == np.floor(arrf)):
-            raise ValueError("ts_us float entries must be finite integers")
-        out = arrf.astype(np.int64)
-    if np.any(out < 0) or np.any(np.diff(out) < 0):
-        raise ValueError("ts_us must be nonnegative and nondecreasing")
+        raise ValueError("ts_us must be integer or integer-valued float")
+    if out.size and np.any(out < 0):
+        raise ValueError("ts_us must be nonnegative")
+    if out.size and np.any(np.diff(out) < 0):
+        raise ValueError("ts_us must be nondecreasing")
     return np.ascontiguousarray(out)
 
 
@@ -185,7 +190,14 @@ class TransformDiagnostics:
     def reset(self) -> None:
         self.rows_seen = 0; self.nonfinite_raw_count = 0; self.raw_clip_count = 0; self.bounded_clip_count = 0; self.z_clip_count = 0; self.warmup_ewma_count = 0
     def as_dict(self) -> dict[str, int]:
-        return {k: int(v) for k, v in self.__dict__.items()}
+        return {
+            "rows_seen": int(self.rows_seen),
+            "nonfinite_raw_count": int(self.nonfinite_raw_count),
+            "raw_clip_count": int(self.raw_clip_count),
+            "bounded_clip_count": int(self.bounded_clip_count),
+            "z_clip_count": int(self.z_clip_count),
+            "warmup_ewma_count": int(self.warmup_ewma_count),
+        }
 
 @dataclass(frozen=True, slots=True)
 class TransformStateSnapshot:
@@ -251,7 +263,7 @@ def base_transform_values(raw: np.ndarray, config: TransformConfig | None = None
     return base
 
 class CausalFeatureTransformer:
-    def __init__(self, config: TransformConfig | None = None, snapshot: TransformStateSnapshot | None = None):
+    def __init__(self, config: TransformConfig | None = None, snapshot: TransformStateSnapshot | None = None, initial_snapshot: TransformStateSnapshot | None = None):
         self.config = config or TransformConfig()
         self.mean = np.zeros(FEATURE_COUNT, dtype=np.float64)
         self.var = np.zeros(FEATURE_COUNT, dtype=np.float64)
@@ -267,8 +279,9 @@ class CausalFeatureTransformer:
         self._half_life_us_by_index[list(_IDENTITY_EWMA_SLOW_IDX)] = self.config.slow_half_life_us
         self._half_life_us_by_index[list(_LOG1P_POS_EWMA_IDX)] = self.config.medium_half_life_us
         self._half_life_us_by_index[list(_SIGNED_LOG1P_EWMA_IDX)] = self.config.medium_half_life_us
-        if snapshot is not None:
-            self.load_snapshot(snapshot)
+        init_snapshot = initial_snapshot if initial_snapshot is not None else snapshot
+        if init_snapshot is not None:
+            self.load_snapshot(init_snapshot)
 
     @property
     def is_initialized(self) -> bool: return self.rows_seen > 0
