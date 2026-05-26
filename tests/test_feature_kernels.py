@@ -1,4 +1,5 @@
 import math
+import subprocess
 import sys
 
 import numpy as np
@@ -20,19 +21,30 @@ def test_public_api_boundary():
 
 
 def test_no_forbidden_imports():
-    forbidden = (
-        "po" + "lars",
-        "pan" + "das",
-        "tor" + "ch",
-        "pya" + "rrow",
-        "mmrt.data.tardis_csv",
-        "mmrt.data.event_merge",
-        "mmrt.data.quality",
-        "CM" + "SSL17",
-        "offline_" + "ingest",
-    )
-    for name in forbidden:
-        assert name not in sys.modules
+    code = r'''
+import sys
+
+before = set(sys.modules)
+import mmrt.features.kernels  # noqa: F401
+after = set(sys.modules) - before
+
+forbidden = (
+    "po" + "lars",
+    "pan" + "das",
+    "tor" + "ch",
+    "pya" + "rrow",
+    "mmrt.data.tardis_csv",
+    "mmrt.data.event_merge",
+    "mmrt.data.quality",
+    "CM" + "SSL17",
+    "offline_" + "ingest",
+)
+
+bad = sorted(name for name in forbidden if name in after)
+if bad:
+    raise SystemExit("forbidden imports loaded by kernels: " + repr(bad))
+'''
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_validation_helpers():
