@@ -7,7 +7,6 @@ models, inspect raw events, repair ordering, or mutate the dataset manifest.
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Sequence
 
@@ -20,13 +19,6 @@ def _positive_int(text: str) -> int:
     value = int(text)
     if value <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
-    return value
-
-
-def _nonnegative_int(text: str) -> int:
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("value must be a non-negative integer")
     return value
 
 

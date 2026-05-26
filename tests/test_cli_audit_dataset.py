@@ -114,11 +114,28 @@ def test_audit_dataset_with_train_val_test_splits(tmp_path: Path) -> None:
     root, manifest = make_dataset(tmp_path, rows=12, chunk_rows=4)
     seg0, seg1, seg2 = manifest.segments
     splits = (
-        mf.SplitMetadata("train_0", SplitRole.TRAIN, seg0.segment_key, 0, 4, TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us), "train"),
-        mf.SplitMetadata("val_0", SplitRole.VAL, seg1.segment_key, 4, 8, TimeRangeUS(seg1.local_time_range.start_us, seg1.local_time_range.end_us), "val"),
-        mf.SplitMetadata("test_0", SplitRole.TEST, seg2.segment_key, 8, 12, TimeRangeUS(seg2.local_time_range.start_us, seg2.local_time_range.end_us), "test"),
+        mf.SplitMetadata(
+            role=SplitRole.TRAIN,
+            segment_key=seg0.segment_key,
+            start_row=0,
+            end_row=4,
+            local_time_range=TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us),
+        ),
+        mf.SplitMetadata(
+            role=SplitRole.VAL,
+            segment_key=seg1.segment_key,
+            start_row=4,
+            end_row=8,
+            local_time_range=TimeRangeUS(seg1.local_time_range.start_us, seg1.local_time_range.end_us),
+        ),
+        mf.SplitMetadata(
+            role=SplitRole.TEST,
+            segment_key=seg2.segment_key,
+            start_row=8,
+            end_row=12,
+            local_time_range=TimeRangeUS(seg2.local_time_range.start_us, seg2.local_time_range.end_us),
+        ),
     )
-    m2 = mf.StorageManifest(*manifest.as_dict().values())
     m2 = mf.StorageManifest(
         manifest.manifest_schema_version, manifest.dataset_id, manifest.created_at_utc, manifest.pipeline_config, manifest.writer_metadata,
         manifest.feature_schema, manifest.label_spec, manifest.transform_config, manifest.transform_diagnostics,
@@ -148,8 +165,13 @@ def test_audit_dataset_with_train_val_test_splits(tmp_path: Path) -> None:
 def test_audit_dataset_scan_limit(tmp_path: Path) -> None:
     root, manifest = make_dataset(tmp_path, rows=4, chunk_rows=4)
     seg0 = manifest.segments[0]
-    split = (mf.SplitMetadata("train_0", SplitRole.TRAIN, seg0.segment_key, 0, 4, TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us), "train"),)
-    make_dataset(tmp_path, rows=4, chunk_rows=4, splits=split)
+    split = (mf.SplitMetadata(
+            role=SplitRole.TRAIN,
+            segment_key=seg0.segment_key,
+            start_row=0,
+            end_row=4,
+            local_time_range=TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us),
+        ),)
     m0 = mf.read_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME)
     m1 = mf.StorageManifest(
         m0.manifest_schema_version, m0.dataset_id, m0.created_at_utc, m0.pipeline_config, m0.writer_metadata,
@@ -170,8 +192,20 @@ def test_audit_dataset_no_scan_splits_does_not_iterate(tmp_path: Path, monkeypat
     root, manifest = make_dataset(tmp_path, rows=8, chunk_rows=4)
     seg0, seg1 = manifest.segments[:2]
     splits = (
-        mf.SplitMetadata("train_0", SplitRole.TRAIN, seg0.segment_key, 0, 4, TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us), "train"),
-        mf.SplitMetadata("val_0", SplitRole.VAL, seg1.segment_key, 4, 8, TimeRangeUS(seg1.local_time_range.start_us, seg1.local_time_range.end_us), "val"),
+        mf.SplitMetadata(
+            role=SplitRole.TRAIN,
+            segment_key=seg0.segment_key,
+            start_row=0,
+            end_row=4,
+            local_time_range=TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us),
+        ),
+        mf.SplitMetadata(
+            role=SplitRole.VAL,
+            segment_key=seg1.segment_key,
+            start_row=4,
+            end_row=8,
+            local_time_range=TimeRangeUS(seg1.local_time_range.start_us, seg1.local_time_range.end_us),
+        ),
     )
     m0 = mf.read_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME)
     m1 = mf.StorageManifest(
@@ -193,8 +227,20 @@ def test_audit_dataset_uses_streaming_split_batches(tmp_path: Path, monkeypatch:
     root, manifest = make_dataset(tmp_path, rows=8, chunk_rows=4)
     seg0, seg1 = manifest.segments[:2]
     splits = (
-        mf.SplitMetadata("train_0", SplitRole.TRAIN, seg0.segment_key, 0, 4, TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us), "train"),
-        mf.SplitMetadata("val_0", SplitRole.VAL, seg1.segment_key, 4, 8, TimeRangeUS(seg1.local_time_range.start_us, seg1.local_time_range.end_us), "val"),
+        mf.SplitMetadata(
+            role=SplitRole.TRAIN,
+            segment_key=seg0.segment_key,
+            start_row=0,
+            end_row=4,
+            local_time_range=TimeRangeUS(seg0.local_time_range.start_us, seg0.local_time_range.end_us),
+        ),
+        mf.SplitMetadata(
+            role=SplitRole.VAL,
+            segment_key=seg1.segment_key,
+            start_row=4,
+            end_row=8,
+            local_time_range=TimeRangeUS(seg1.local_time_range.start_us, seg1.local_time_range.end_us),
+        ),
     )
     m0 = mf.read_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME)
     m1 = mf.StorageManifest(
