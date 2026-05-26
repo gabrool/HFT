@@ -91,8 +91,7 @@ def test_config_validation():
         ex.LinearFeatureExtractorConfig(feature_columns=[""])
     with pytest.raises(ValueError):
         ex.LinearFeatureExtractorConfig(feature_columns=[1])
-    with pytest.raises(ValueError):
-        ex.LinearFeatureExtractorConfig(copy=1)
+    assert not hasattr(cfg, "copy")
     assert not hasattr(cfg, "require_all_finite")
     assert not hasattr(cfg, "extractor_type")
     assert not hasattr(cfg, "rand"+"om_state")
@@ -160,6 +159,17 @@ def test_table_to_feature_matrix_missing_or_nonfinite_rejected():
     assert ok.shape == (2, 2)
 
 
+def test_table_to_feature_matrix_copy_argument_supported_and_validated():
+    table = pa.table({"x_a": [1.0, 2.0], "x_b": [3.0, 4.0]})
+    cols = ("x_a", "x_b")
+    x1 = ex.table_to_feature_matrix(table, cols, copy=True)
+    x2 = ex.table_to_feature_matrix(table, cols, copy=False)
+    assert x1.shape == x2.shape
+    assert x1.dtype == x2.dtype
+    with pytest.raises(ValueError):
+        ex.table_to_feature_matrix(table, cols, copy=1)
+
+
 def test_identity_extractor_resolves_manifest_and_transforms_table():
     m = make_manifest()
     cols = tuple(m.feature_columns[:3])
@@ -176,6 +186,7 @@ def test_identity_extractor_resolves_manifest_and_transforms_table():
     assert d["feature_columns"] == list(cols)
     assert d["feature_schema_hash"] == m.feature_schema.get("feature_specs_hash")
     assert "require_all_finite" not in d
+    assert "copy" not in d
 
 
 def test_identity_extractor_subset_projection():
@@ -190,7 +201,7 @@ def test_identity_extractor_subset_projection():
 
 
 def test_identity_extractor_transform_numpy():
-    cfg = ex.LinearFeatureExtractorConfig(output_dtype="float64", copy=True)
+    cfg = ex.LinearFeatureExtractorConfig(output_dtype="float64")
     ext = ex.IdentityFeatureExtractor(config=cfg)
     out = ext.transform_numpy(np.array([[1, 2], [3, 4]], dtype=np.int64), feature_columns=("a", "b"))
     assert out.X.dtype == np.float64
@@ -201,6 +212,15 @@ def test_identity_extractor_transform_numpy():
     ext2 = ex.IdentityFeatureExtractor(config=ex.LinearFeatureExtractorConfig(output_dtype="float32"), manifest=make_manifest())
     with pytest.raises(ValueError):
         ext2.transform_numpy(np.array([[np.nan] * len(ext2.feature_columns)], dtype=np.float32), feature_columns=ext2.feature_columns)
+
+
+def test_identity_extractor_defensive_copy_without_config_copy():
+    ext = ex.IdentityFeatureExtractor()
+    arr = np.array([[1.0, 2.0]], dtype=np.float32)
+    batch = ext.transform_numpy(arr, feature_columns=("a", "b"))
+    arr[0, 0] = 999.0
+    assert batch.X[0, 0] == 1.0
+    assert not hasattr(ext.config, "copy")
 
 
 def test_identity_extractor_has_no_fit_or_stage_api():
@@ -218,7 +238,11 @@ def test_identity_extractor_has_no_fit_or_stage_api():
 
 def test_no_future_leakage_or_timestamp_surface():
     cfg_src = inspect.getsource(ex.LinearFeatureExtractorConfig)
+    assert "copy" not in cfg_src
     assert "require_all_finite" not in cfg_src
+    as_dict_src = inspect.getsource(ex.IdentityFeatureExtractor.as_dict)
+    assert '"copy"' not in as_dict_src
+    assert "copy" not in as_dict_src
     src = inspect.getsource(ex)
     assert "StorageDataset" + "Reader" not in src
     assert "storage." + "reader" not in src
