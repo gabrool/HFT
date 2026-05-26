@@ -263,6 +263,46 @@ def test_consecutive_counts():
     assert st.consecutive_sell_trade_count == 0 and st.consecutive_buy_trade_count == 0
 
 
+def test_trade_history_asof_nonpositive_query_returns_default():
+    h = ts.TradeHistory()
+    assert h.asof_value("cvd_notional", 0, default=-7.0) == -7.0
+    assert h.asof_value("cvd_notional", -1, default=-7.0) == -7.0
+
+    h.append(
+        ts_us=1_000_000,
+        price=100.0,
+        amount=1.0,
+        notional=100.0,
+        signed_notional=100.0,
+        side_code=ts.BUY_SIDE_CODE,
+        tick_sign=0,
+        buy_notional=100.0,
+        sell_notional=0.0,
+        buy_count=1,
+        sell_count=0,
+        unknown_count=0,
+        cvd_notional=100.0,
+    )
+
+    assert h.asof_value("cvd_notional", 0, default=-7.0) == -7.0
+    assert h.asof_value("cvd_notional", -1, default=-7.0) == -7.0
+    assert h.asof_value("cvd_notional", 999_999, default=-7.0) == -7.0
+    assert h.asof_value("cvd_notional", 1_000_000, default=-7.0) == 100.0
+
+
+def test_fill_trade_features_handles_early_asof_windows_without_crashing():
+    st = ts.TradeState()
+    st.apply_trade(make_trade(local_ts_us=1_000_000, price=100.0, amount=2.0, side_code=ts.BUY_SIDE_CODE))
+
+    out = np.full(FEATURE_COUNT, np.nan, dtype=np.float64)
+    st.fill_trade_features(out, as_of_local_ts_us=1_000_000)
+
+    trade_idx = ts.trade_owned_feature_indices()
+    assert np.all(np.isfinite(out[list(trade_idx)]))
+    assert fv_value(out, "cvd_change_usd_1000000us") == pytest.approx(100.0 * 2.0)
+    assert fv_value(out, "cvd_change_usd_3000000us") == pytest.approx(100.0 * 2.0)
+
+
 def test_top5_and_max_signed_notional():
     st = ts.TradeState()
     vals = [(10, +1), (50, -1), (30, +1), (20, -1), (40, +1), (60, -1)]
