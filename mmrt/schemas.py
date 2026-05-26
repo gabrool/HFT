@@ -236,8 +236,8 @@ def book_ticker_columns() -> tuple[ColumnSpec, ...]:
     return _common_columns() + (
         ColumnSpec("ask_amount", ColumnKind.FLOAT, nullable=True),
         ColumnSpec("ask_price", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("bid_price", ColumnKind.FLOAT, nullable=True),
         ColumnSpec("bid_amount", ColumnKind.FLOAT, nullable=True),
+        ColumnSpec("bid_price", ColumnKind.FLOAT, nullable=True),
     )
 
 
