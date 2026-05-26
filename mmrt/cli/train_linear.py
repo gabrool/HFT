@@ -9,7 +9,6 @@ dataset manifest.
 import argparse
 import json
 import math
-import sys
 from typing import Sequence
 
 import mmrt.linear.diagnostics as dg

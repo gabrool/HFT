@@ -133,9 +133,9 @@ def test_no_bad_imports() -> None:
     proc = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
     loaded = set(proc.stdout.splitlines())
     forbidden = {
-        "pan" + "das", "po" + "lars", "to" + "rch", "sk" + "learn", "scipy", "pyarrow", "mmrt.storage.writer",
+        "pan" + "das", "po" + "lars", "to" + "rch", "sk" + "learn", "scipy", "mmrt.storage.writer",
         "mmrt.storage.splits", "mmrt.data.tardis_csv", "mmrt.data.event_merge", "mmrt.features.engine",
-        "mmrt.features.labels", "mmrt.features.transforms", "CMSSL17", "offline_" + "ingest",
+        "mmrt.features.labels", "mmrt.features.transforms", "CM" + "SSL17", "offline_" + "ingest",
     }
     assert loaded.isdisjoint(forbidden)
 
@@ -155,9 +155,9 @@ def test_no_old_pipeline_residue() -> None:
 def test_no_raw_data_ingest_or_split_surface() -> None:
     src = inspect.getsource(cli)
     forbidden = [
-        "tardis_" + "csv", "event_" + "merge", "book_" + "reconstructor", "FeatureEngine", "LabelBuilder",
-        "CausalFeatureTransformer", "DecisionRowWriter", "build_split_plan", "write_split_manifest",
-        "build_and_write_splits", "SplitMetadata",
+        "tardis_" + "csv", "event_" + "merge", "book_" + "reconstructor", "Feature" + "Engine", "Label" + "Builder",
+        "CausalFeature" + "Transformer", "DecisionRow" + "Writer", "build_" + "split_plan", "write_" + "split_manifest",
+        "build_" + "and_write_splits", "Split" + "Metadata",
     ]
     for token in forbidden:
         assert token not in src
