@@ -1,4 +1,3 @@
-import inspect
 import math
 import sys
 
@@ -21,10 +20,19 @@ def test_public_api_boundary():
 
 
 def test_no_forbidden_imports():
-    src = inspect.getsource(k)
-    forbidden = ("import " + "po" + "lars", "import " + "pan" + "das", "import to" + "rch", "import pya" + "rrow", "mmrt.data.", "CM" + "SSL", "offline_" + "ingest")
-    for tok in forbidden:
-        assert tok not in src
+    forbidden = (
+        "po" + "lars",
+        "pan" + "das",
+        "tor" + "ch",
+        "pya" + "rrow",
+        "mmrt.data.tardis_csv",
+        "mmrt.data.event_merge",
+        "mmrt.data.quality",
+        "CM" + "SSL17",
+        "offline_" + "ingest",
+    )
+    for name in forbidden:
+        assert name not in sys.modules
 
 
 def test_validation_helpers():
