@@ -309,7 +309,6 @@ class FeatureEngine:
         vwap_vs_mid_500 = 0.0 if mid <= 0.0 or vwap_500 <= 0.0 else _safe_bps_change(vwap_500, mid)
         setf("vwap_vs_mid_bps_200000us", vwap_vs_mid_200); setf("vwap_vs_mid_bps_500000us", vwap_vs_mid_500)
 
-        pod = {}
         for w in (WINDOW_200MS_US, WINDOW_500MS_US, WINDOW_1000MS_US):
             buy_n = self._trade_buy_notional(w, now); sell_n = self._trade_sell_notional(w, now); total = buy_n + sell_n
             bid_add = self._book_sum("bid_l1_add", w, now); bid_rem = self._book_sum("bid_l1_rem", w, now)
