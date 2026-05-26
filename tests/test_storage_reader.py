@@ -69,7 +69,7 @@ def make_dataset(tmp_path, *, rows=5, chunk_rows=2, splits=(), row_fn=row):
             tuple(splits),
             m0.notes,
         )
-        mf.write_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME, m1)
+        mf.write_manifest_json(m1, root / mf.DEFAULT_MANIFEST_FILENAME)
         manifest = m1
     return root, manifest
 
@@ -305,7 +305,7 @@ def test_split_entries_and_read_split_table(tmp_path):
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
-    mf.write_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME, m2)
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
     assert len(r.split_entries("train")) == 1
     tr = r.read_split_table(SplitRole.TRAIN, columns=(mf.ROW_IDX_COLUMN, mf.LOCAL_TS_US_COLUMN))
@@ -324,13 +324,97 @@ def test_iter_split_batches(tmp_path):
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
-    mf.write_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME, m2)
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
     vals = []
     for b in r.iter_split_batches("val", columns=(mf.ROW_IDX_COLUMN,), batch_size=2):
         vals.extend(b.column(0).to_pylist())
     assert vals == [3, 4, 5]
 
+
+
+
+def test_read_split_table_filters_with_internal_row_idx_projection(tmp_path):
+    root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
+    splits = (
+        mf.SplitMetadata(
+            SplitRole.TRAIN,
+            "seg_000000",
+            1,
+            3,
+            m.segments[0].local_time_range,
+        ),
+    )
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version,
+        m.dataset_id,
+        m.created_at_utc,
+        m.pipeline_config,
+        m.writer_metadata,
+        m.feature_schema,
+        m.label_spec,
+        m.transform_config,
+        m.transform_diagnostics,
+        m.exchange,
+        m.symbol,
+        m.storage_format,
+        m.time_unit,
+        m.decision_stride_us,
+        m.feature_columns,
+        m.label_columns,
+        m.required_columns,
+        m.segments,
+        splits,
+        m.notes,
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+
+    r = rd.open_dataset(str(root))
+    table = r.read_split_table("train", columns=(mf.LOCAL_TS_US_COLUMN,))
+    assert table.column_names == [mf.LOCAL_TS_US_COLUMN]
+    assert table.num_rows == 2
+    assert mf.ROW_IDX_COLUMN not in table.column_names
+
+
+def test_iter_split_batches_without_row_idx_projection(tmp_path):
+    root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
+    splits = (
+        mf.SplitMetadata(
+            SplitRole.TRAIN,
+            "seg_000000",
+            1,
+            3,
+            m.segments[0].local_time_range,
+        ),
+    )
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version,
+        m.dataset_id,
+        m.created_at_utc,
+        m.pipeline_config,
+        m.writer_metadata,
+        m.feature_schema,
+        m.label_spec,
+        m.transform_config,
+        m.transform_diagnostics,
+        m.exchange,
+        m.symbol,
+        m.storage_format,
+        m.time_unit,
+        m.decision_stride_us,
+        m.feature_columns,
+        m.label_columns,
+        m.required_columns,
+        m.segments,
+        splits,
+        m.notes,
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+
+    r = rd.open_dataset(str(root))
+    batches = list(r.iter_split_batches("train", columns=(mf.LOCAL_TS_US_COLUMN,), batch_size=1))
+    assert all(b.schema.names == [mf.LOCAL_TS_US_COLUMN] for b in batches)
+    assert [b.num_rows for b in batches] == [1, 1]
 
 def test_tardis_ts_and_local_ts_are_preserved_and_not_collapsed(tmp_path):
     root, _ = make_dataset(tmp_path, rows=3, row_fn=lambda i: row(i, local_ts_us=2_000_000 + i, ts_us=1_000_000 + i))
