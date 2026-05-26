@@ -7,7 +7,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-from mmrt.contracts import SplitRole, StorageFormat, TimeRangeUS, TimeUnit
+from mmrt.contracts import SplitRole, TimeRangeUS
 from mmrt.storage import manifest as mf
 
 DEFAULT_BATCH_SIZE = 65_536
@@ -235,13 +235,31 @@ class StorageDatasetReader:
         entries = self.split_entries(role)
         if not entries:
             raise ValueError("no split entries for role")
-        cols = self.required_columns if columns is None else columns
-        _ensure_columns_exist(cols, self.required_columns)
+
+        if columns is None:
+            requested_cols = self.required_columns
+            read_cols = self.required_columns
+        else:
+            requested_cols = tuple(columns)
+            _ensure_columns_exist(requested_cols, self.required_columns)
+            read_cols = requested_cols
+            if mf.ROW_IDX_COLUMN not in read_cols:
+                read_cols = (mf.ROW_IDX_COLUMN,) + read_cols
+
+        read_cols = _unique_preserve_order(tuple(read_cols))
+
         pieces: list[pa.Table] = []
         for sp in entries:
-            table = self.read_segment_table(sp.segment_key, columns=cols)
-            mask = pc.and_(pc.greater_equal(table[mf.ROW_IDX_COLUMN], sp.start_row), pc.less(table[mf.ROW_IDX_COLUMN], sp.end_row))
-            pieces.append(table.filter(mask))
+            table = self.read_segment_table(sp.segment_key, columns=read_cols)
+            mask = pc.and_(
+                pc.greater_equal(table[mf.ROW_IDX_COLUMN], sp.start_row),
+                pc.less(table[mf.ROW_IDX_COLUMN], sp.end_row),
+            )
+            filtered = table.filter(mask)
+            if columns is not None:
+                filtered = filtered.select(list(requested_cols))
+            pieces.append(filtered)
+
         return pa.concat_tables(pieces) if len(pieces) > 1 else pieces[0]
 
     def iter_split_batches(self, role: SplitRole | str, columns: tuple[str, ...] | None = None, batch_size: int | None = None) -> Iterator[pa.RecordBatch]:
