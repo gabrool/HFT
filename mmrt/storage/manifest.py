@@ -400,6 +400,22 @@ class StorageManifest:
         if _require_positive_int(self.decision_stride_us, "decision_stride_us") != 500_000:
             raise ValueError("storage/time/stride invalid")
         self._validate_pipeline_config_consistency()
+
+        feature_cols = tuple(self.feature_columns)
+        label_cols = tuple(self.label_columns)
+        required_cols = tuple(self.required_columns)
+
+        if feature_cols != feature_columns():
+            raise ValueError("column schema drift")
+        if label_cols != label_columns(self.label_spec):
+            raise ValueError("column schema drift")
+        if required_cols != required_row_columns(self.label_spec):
+            raise ValueError("column schema drift")
+
+        object.__setattr__(self, "feature_columns", feature_cols)
+        object.__setattr__(self, "label_columns", label_cols)
+        object.__setattr__(self, "required_columns", required_cols)
+
         self.validate_against_current_code()
 
         segs = tuple(self.segments)
