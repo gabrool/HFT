@@ -33,13 +33,13 @@ def test_canonical_names_are_microsecond_native():
 
 def test_legacy_to_canonical_roundtrip():
     for legacy in specs.LEGACY_CORE_FEATURE_NAMES + specs.LEGACY_EVENT_CONTEXT_FEATURE_NAMES:
-        canonical = specs.legacy_to_canonical_name(legacy)
+        canonical = specs.legacy_name_to_canonical_name(legacy)
         assert specs.canonical_to_legacy_name(canonical) == legacy
 
 
 def test_context_tail_after_legacy_core():
     assert specs.LEGACY_CORE_FEATURE_COUNT == 172
-    assert specs.FEATURE_NAMES[:172] == tuple(specs.legacy_to_canonical_name(n) for n in specs.LEGACY_CORE_FEATURE_NAMES)
+    assert specs.FEATURE_NAMES[:172] == tuple(specs.legacy_name_to_canonical_name(n) for n in specs.LEGACY_CORE_FEATURE_NAMES)
 
 
 def test_required_windows_and_depth():
@@ -75,12 +75,14 @@ def test_lookup_helpers_and_errors():
         specs.feature_name(10_000)
 
 
-def test_schema_record_contents():
-    rec = specs.feature_spec_by_name("micro_ret_bps_200000us").schema_record()
-    assert rec["name"] == "micro_ret_bps_200000us"
-    assert rec["index"] == 0
-    assert rec["source"] == "book"
-    assert rec["owner"] == "book_state"
+def test_feature_spec_record_contents():
+    spec = specs.feature_spec_by_name("micro_ret_bps_200000us")
+    assert spec.name == "micro_ret_bps_200000us"
+    assert spec.index == 0
+    assert spec.source == specs.FeatureSource.BOOK
+    assert spec.owner == specs.FeatureOwner.BOOK_STATE
+    assert spec.legacy_name == "micro_ret_bps_200ms"
+    assert spec.required_book_depth >= 1
 
 
 def test_stable_hashes():
@@ -89,7 +91,7 @@ def test_stable_hashes():
 
 
 def test_public_schema_has_no_aux_core_split():
-    schema = specs.feature_schema_dict()
+    schema = specs.schema_record()
     text = str(schema)
     assert "feature" + "_dim_" + "core" not in text
     assert "feature" + "_dim_" + "total" not in text
