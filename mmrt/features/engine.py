@@ -91,6 +91,16 @@ def _require_positive_capacity(value: int, name: str) -> int:
     return value
 
 
+
+
+def _require_positive_finite_float(value: float, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite float > 0")
+    out = float(value)
+    if not np.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{name} must be finite float > 0")
+    return out
+
 def _require_feature_vector(out: np.ndarray) -> np.ndarray:
     arr = np.asarray(out)
     if arr.ndim != 1 or arr.shape[0] != FEATURE_COUNT:
@@ -135,6 +145,7 @@ class EngineDecision:
     local_ts_us: int
     ts_us: int
     event_seq: int
+    raw_mid: float
     feature_vector: np.ndarray
     reason: str
 
@@ -143,6 +154,7 @@ class EngineDecision:
         object.__setattr__(self, "ts_us", _require_int(self.ts_us, "ts_us", positive=True))
         if self.event_seq != -1:
             object.__setattr__(self, "event_seq", _require_int(self.event_seq, "event_seq"))
+        object.__setattr__(self, "raw_mid", _require_positive_finite_float(self.raw_mid, "raw_mid"))
         arr = _require_feature_vector(self.feature_vector)
         if not isinstance(self.reason, str) or not self.reason:
             raise ValueError("reason")
@@ -245,8 +257,10 @@ class FeatureEngine:
 
     def _emit_decision(self, local_ts_us: int, ts_us: int, event_seq: int) -> EngineDecision:
         prev = self.last_decision_local_ts_us
+        summary = self.book_state.current_summary()
+        raw_mid = summary.mid
         fv = self._build_feature_vector_for_decision(local_ts_us, prev)
-        d = EngineDecision(self.decision_count, local_ts_us, ts_us, event_seq, fv, "book_stride")
+        d = EngineDecision(self.decision_count, local_ts_us, ts_us, event_seq, raw_mid, fv, "book_stride")
         self.decision_count += 1
         self.last_decision_local_ts_us = local_ts_us
         return d
