@@ -48,6 +48,39 @@ def _ensure_columns_exist(columns: tuple[str, ...], required_columns: tuple[str,
         raise ValueError(f"unknown column(s): {missing!r}")
 
 
+def _resolve_split_scan_columns(
+    columns: tuple[str, ...] | None,
+    required_columns: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
+    if columns is None:
+        requested_cols = required_columns
+        scan_cols = required_columns
+        drop_internal_row_idx = False
+    else:
+        requested_cols = tuple(columns)
+        _ensure_columns_exist(requested_cols, required_columns)
+        scan_cols = requested_cols
+        drop_internal_row_idx = False
+        if mf.ROW_IDX_COLUMN not in scan_cols:
+            scan_cols = (mf.ROW_IDX_COLUMN,) + scan_cols
+            drop_internal_row_idx = True
+
+    scan_cols = _unique_preserve_order(tuple(scan_cols))
+    return requested_cols, scan_cols, drop_internal_row_idx
+
+
+def _select_record_batch_columns(batch: pa.RecordBatch, columns: tuple[str, ...]) -> pa.RecordBatch:
+    arrays: list[pa.Array] = []
+    fields: list[pa.Field] = []
+    for name in columns:
+        idx = batch.schema.get_field_index(name)
+        if idx < 0:
+            raise ValueError(f"column {name!r} missing from record batch")
+        arrays.append(batch.column(idx))
+        fields.append(batch.schema.field(idx))
+    return pa.record_batch(arrays, schema=pa.schema(fields))
+
+
 def _column_type_map_for_manifest(manifest: mf.StorageManifest) -> dict[str, pa.DataType]:
     out = {c: pa.float32() for c in manifest.x_columns}
     out.update({c: pa.float32() for c in manifest.y_columns})
@@ -264,8 +297,25 @@ class StorageDatasetReader:
 
     def iter_split_batches(self, role: SplitRole | str, columns: tuple[str, ...] | None = None, batch_size: int | None = None) -> Iterator[pa.RecordBatch]:
         bs = self.config.batch_size if batch_size is None else _require_positive_int(batch_size, "batch_size")
-        table = self.read_split_table(role, columns=columns)
-        yield from table.to_batches(max_chunksize=bs)
+        entries = self.split_entries(role)
+        if not entries:
+            raise ValueError("no split entries for role")
+
+        requested_cols, scan_cols, drop_internal_row_idx = _resolve_split_scan_columns(columns, self.required_columns)
+
+        for sp in entries:
+            row_field = ds.field(mf.ROW_IDX_COLUMN)
+            filt = (row_field >= sp.start_row) & (row_field < sp.end_row)
+            scanner = self.dataset(segments=(sp.segment_key,)).scanner(
+                columns=list(scan_cols),
+                filter=filt,
+                batch_size=bs,
+            )
+            for batch in scanner.to_batches():
+                if drop_internal_row_idx:
+                    yield _select_record_batch_columns(batch, requested_cols)
+                else:
+                    yield batch
 
     def validate_dataset(self) -> None:
         self.manifest.validate_against_current_code()

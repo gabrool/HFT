@@ -439,5 +439,138 @@ def test_no_future_leakage_or_repair_surface():
         "re" + "pair",
         "de" + "dupe",
         "sh" + "uffle",
+        "BY" + "BIT",
+        "CM" + "SSL",
+        "offline_" + "ingest",
+        "Mini" + "Rocket",
+        "Multi" + "Rocket",
+        "Hy" + "dra",
+        "Ae" + "on",
+        "sklearn",
+        "torch",
+        "pandas",
+        "polars",
     )
     assert all(term not in src for term in forbidden)
+
+
+def test_iter_split_batches_does_not_materialize_split_table(tmp_path, monkeypatch):
+    root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
+    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 5, m.segments[0].local_time_range),)
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
+        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+    r = rd.open_dataset(str(root))
+    monkeypatch.setattr(r, "read_split_table", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")))
+    batches = list(r.iter_split_batches("train", columns=(mf.ROW_IDX_COLUMN,), batch_size=2))
+    vals = [x for b in batches for x in b.column(0).to_pylist()]
+    assert vals == [1, 2, 3, 4]
+
+
+def test_iter_split_batches_does_not_call_read_segment_table(tmp_path, monkeypatch):
+    root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
+    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 0, 3, m.segments[0].local_time_range),)
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
+        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+    r = rd.open_dataset(str(root))
+    monkeypatch.setattr(r, "read_segment_table", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")))
+    vals = [x for b in r.iter_split_batches("train", columns=(mf.ROW_IDX_COLUMN,), batch_size=2) for x in b.column(0).to_pylist()]
+    assert vals == [0, 1, 2]
+
+
+def test_iter_split_batches_filters_by_row_idx_without_returning_internal_row_idx(tmp_path):
+    root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
+    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 3, m.segments[0].local_time_range),)
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
+        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+    r = rd.open_dataset(str(root))
+    col = m.x_columns[0]
+    batches = list(r.iter_split_batches("train", columns=(col,), batch_size=1))
+    assert all(b.schema.names == [col] for b in batches)
+    vals = [x for b in batches for x in b.column(0).to_pylist()]
+    assert vals == [feature_values()[0], feature_values()[0]]
+
+
+def test_iter_split_batches_returns_row_idx_when_requested(tmp_path):
+    root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
+    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 4, m.segments[0].local_time_range),)
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
+        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+    r = rd.open_dataset(str(root))
+    vals = [x for b in r.iter_split_batches("train", columns=(mf.ROW_IDX_COLUMN,), batch_size=2) for x in b.column(0).to_pylist()]
+    assert vals == [1, 2]
+
+
+def test_iter_split_batches_preserves_requested_column_order(tmp_path):
+    root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
+    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 3, 6, m.segments[1].local_time_range),)
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
+        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+    r = rd.open_dataset(str(root))
+    cols = (m.x_columns[1], mf.ROW_IDX_COLUMN, m.x_columns[0])
+    batches = list(r.iter_split_batches("train", columns=cols, batch_size=2))
+    assert batches
+    assert all(b.schema.names == list(cols) for b in batches)
+
+
+def test_iter_split_batches_preserves_multiple_split_entry_order(tmp_path):
+    root, m = make_dataset(tmp_path, rows=10, chunk_rows=5)
+    splits = (
+        mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 3, m.segments[0].local_time_range),
+        mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 7, 9, m.segments[1].local_time_range),
+    )
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
+        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+    r = rd.open_dataset(str(root))
+    vals = [x for b in r.iter_split_batches("train", columns=(mf.ROW_IDX_COLUMN,), batch_size=2) for x in b.column(0).to_pylist()]
+    assert vals == [1, 2, 7, 8]
+
+
+def test_iter_split_batches_honors_batch_size(tmp_path):
+    root, m = make_dataset(tmp_path, rows=8, chunk_rows=4)
+    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 4, 8, m.segments[1].local_time_range),)
+    m2 = mf.StorageManifest(
+        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
+        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+    )
+    mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
+    r = rd.open_dataset(str(root))
+    batches = list(r.iter_split_batches("train", columns=(mf.ROW_IDX_COLUMN,), batch_size=2))
+    assert all(b.num_rows <= 2 for b in batches)
+    vals = [x for b in batches for x in b.column(0).to_pylist()]
+    expect = r.read_split_table("train", columns=(mf.ROW_IDX_COLUMN,))[mf.ROW_IDX_COLUMN].to_pylist()
+    assert vals == expect
+
+
+def test_iter_split_batches_source_is_streaming():
+    src = inspect.getsource(rd.StorageDatasetReader.iter_split_batches)
+    assert "read_split_table" not in src
+    assert "read_segment_table" not in src
+    assert "concat_tables" not in src
+    assert "to_batches(max_chunksize" not in src
+    assert ".scanner(" in src
+    assert ".to_batches()" in src
