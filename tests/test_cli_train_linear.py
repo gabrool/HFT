@@ -5,6 +5,9 @@ import sys
 
 import pytest
 
+pytest.importorskip("pyarrow")
+pytest.importorskip("pyarrow.parquet")
+
 import mmrt.cli.train_linear as cli
 import mmrt.linear.diagnostics as dg
 import mmrt.linear.models as lm
@@ -74,7 +77,7 @@ def test_parser_rejects_bad_numeric_values() -> None:
     parser = cli.build_arg_parser()
     bad = [
         ["--batch-size", "0"], ["--epochs", "0"], ["--target-horizon-us", "0"],
-        ["--direction-deadband-bps", "-0.1"], ["--variance-floor", "-1"], ["--clip-z", "0"],
+        ["--direction-deadband-bps", "-0.1"], ["--variance-floor", "-1"], ["--variance-floor", "0"], ["--clip-z", "0"],
         ["--learning-rate", "0"], ["--l2", "-1"], ["--max-grad-norm", "0"],
         ["--diagnostics-top-k", "0"], ["--diagnostics-num-bins", "0"], ["--diagnostics-max-rows", "0"],
         ["--learning-rate", "nan"], ["--learning-rate", "inf"],
