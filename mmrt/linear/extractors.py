@@ -42,14 +42,11 @@ def _coerce_feature_columns(feature_columns: Sequence[str] | None) -> tuple[str,
 class LinearFeatureExtractorConfig:
     feature_columns: tuple[str, ...] | None = None
     output_dtype: str = DEFAULT_EXTRACTOR_DTYPE
-    copy: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "feature_columns", _coerce_feature_columns(self.feature_columns))
         if self.output_dtype not in ALLOWED_EXTRACTOR_DTYPES:
             raise ValueError(f"output_dtype must be one of {ALLOWED_EXTRACTOR_DTYPES}")
-        if not isinstance(self.copy, bool):
-            raise ValueError("copy must be bool")
 
     @property
     def dtype(self) -> np.dtype:
@@ -181,7 +178,7 @@ class IdentityFeatureExtractor:
             selected,
             output_dtype=self.config.output_dtype,
             require_all_finite=True,
-            copy=self.config.copy,
+            copy=False,
         )
         return LinearFeatureBatch(X=X, feature_columns=selected)
 
@@ -206,8 +203,6 @@ class IdentityFeatureExtractor:
         arr = np.ascontiguousarray(arr, dtype=self.config.dtype)
         if not np.isfinite(arr).all():
             raise ValueError("X contains non-finite values")
-        if self.config.copy:
-            arr = arr.copy()
         return LinearFeatureBatch(X=arr, feature_columns=cols2)
 
     def as_dict(self) -> dict[str, object]:
@@ -215,7 +210,6 @@ class IdentityFeatureExtractor:
             "extractor": "identity",
             "feature_columns": list(self.feature_columns) if self.feature_columns is not None else None,
             "output_dtype": self.config.output_dtype,
-            "copy": self.config.copy,
             "feature_schema_hash": self.feature_schema_hash,
         }
 
