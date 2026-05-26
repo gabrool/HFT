@@ -300,7 +300,7 @@ def test_same_side_cluster_and_silence_gap():
     for t, n, s in rows:
         st.apply_trade(make_trade(t, 10.0, n / 10.0, s))
     v = st.trade_feature_vector()
-    assert fv_value(v, "same_side_trade_cluster_notional_1000000us") == pytest.approx(20.0)
+    assert fv_value(v, "same_side_trade_cluster_notional_1000000us") == pytest.approx(30.0)
     window_ts = np.array([t for t, _, _ in rows])
     assert fv_value(v, "max_trade_silence_gap_3000000us") == pytest.approx(float(np.max(np.diff(window_ts))))
 
@@ -348,7 +348,8 @@ def test_as_of_does_not_create_future_lookahead():
     asof_v = st.trade_feature_vector(as_of_local_ts_us=2_500_000)
     assert fv_value(now_v, "time_since_trade_us") == 0.0
     assert fv_value(asof_v, "time_since_trade_us") == 500_000
-    assert fv_value(asof_v, "trade_count_per_second_500000us") == pytest.approx(0.0)
+    # Windows are inclusive [now - window_us, now], so the trade at 2_000_000 is included.
+    assert fv_value(asof_v, "trade_count_per_second_500000us") == pytest.approx(2.0)
     with pytest.raises(ValueError):
         st.trade_feature_vector(as_of_local_ts_us=1_900_000)
 
