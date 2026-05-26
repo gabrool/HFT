@@ -443,6 +443,7 @@ def test_all_engine_features_assigned_no_placeholders():
     e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0, bid_sz0=10.0, ask_sz0=10.0))
     e.on_trade(make_trade(2_150_000, 99.0, 2.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_300_000, mid=100.2, bid_sz0=12.0, ask_sz0=8.0))
+    e.on_trade(make_trade(2_450_000, 100.8, 1.0, BUY_SIDE_CODE))
     d = e.on_book_snapshot(make_snapshot(2_500_000, mid=100.1, bid_sz0=11.0, ask_sz0=9.0))
     assert d is not None
     vec = d.feature_vector
