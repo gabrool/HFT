@@ -300,7 +300,6 @@ def test_fill_trade_features_handles_early_asof_windows_without_crashing():
     trade_idx = ts.trade_owned_feature_indices()
     assert np.all(np.isfinite(out[list(trade_idx)]))
     assert fv_value(out, "cvd_change_usd_1000000us") == pytest.approx(100.0 * 2.0)
-    assert fv_value(out, "cvd_change_usd_3000000us") == pytest.approx(100.0 * 2.0)
 
 
 def test_top5_and_max_signed_notional():

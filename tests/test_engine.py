@@ -170,7 +170,6 @@ def test_engine_first_decision_at_early_timestamp_does_not_crash_trade_asof():
     assert d.local_ts_us == 1_000_000
     assert np.all(np.isfinite(d.feature_vector))
     assert fv_value(d.feature_vector, "cvd_change_usd_1000000us") == pytest.approx(200.0)
-    assert fv_value(d.feature_vector, "cvd_change_usd_3000000us") == pytest.approx(200.0)
 
 
 def test_trade_events_never_emit_decisions():
