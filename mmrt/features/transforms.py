@@ -13,12 +13,10 @@ import numpy as np
 
 from mmrt.features.specs import (
     FEATURE_COUNT,
-    FEATURE_NAMES,
     FEATURE_NAMES_HASH,
     FEATURE_SPECS,
     FEATURE_SPECS_HASH,
     TransformKey,
-    feature_index,
     feature_spec_by_name,
 )
 
@@ -215,8 +213,12 @@ class TransformStateSnapshot:
         count = np.ascontiguousarray(np.asarray(self.count, dtype=np.int64))
         if mean.shape != (FEATURE_COUNT,) or var.shape != (FEATURE_COUNT,) or count.shape != (FEATURE_COUNT,):
             raise ValueError("snapshot arrays must be shape (FEATURE_COUNT,)")
-        if np.any(~np.isfinite(var)) or np.any(var < 0) or np.any(count < 0):
-            raise ValueError("invalid snapshot arrays")
+        if np.any(~np.isfinite(mean)):
+            raise ValueError("snapshot mean must be finite")
+        if np.any(~np.isfinite(var)) or np.any(var < 0):
+            raise ValueError("snapshot var must be finite and nonnegative")
+        if np.any(count < 0):
+            raise ValueError("snapshot count must be nonnegative")
         object.__setattr__(self, "mean", mean.copy())
         object.__setattr__(self, "var", var.copy())
         object.__setattr__(self, "count", count.copy())
@@ -263,7 +265,7 @@ def base_transform_values(raw: np.ndarray, config: TransformConfig | None = None
     return base
 
 class CausalFeatureTransformer:
-    def __init__(self, config: TransformConfig | None = None, snapshot: TransformStateSnapshot | None = None, initial_snapshot: TransformStateSnapshot | None = None):
+    def __init__(self, config: TransformConfig | None = None, snapshot: TransformStateSnapshot | None = None):
         self.config = config or TransformConfig()
         self.mean = np.zeros(FEATURE_COUNT, dtype=np.float64)
         self.var = np.zeros(FEATURE_COUNT, dtype=np.float64)
@@ -279,9 +281,8 @@ class CausalFeatureTransformer:
         self._half_life_us_by_index[list(_IDENTITY_EWMA_SLOW_IDX)] = self.config.slow_half_life_us
         self._half_life_us_by_index[list(_LOG1P_POS_EWMA_IDX)] = self.config.medium_half_life_us
         self._half_life_us_by_index[list(_SIGNED_LOG1P_EWMA_IDX)] = self.config.medium_half_life_us
-        init_snapshot = initial_snapshot if initial_snapshot is not None else snapshot
-        if init_snapshot is not None:
-            self.load_snapshot(init_snapshot)
+        if snapshot is not None:
+            self.load_snapshot(snapshot)
 
     @property
     def is_initialized(self) -> bool: return self.rows_seen > 0
