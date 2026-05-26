@@ -202,6 +202,20 @@ def test_on_decision_rejects_decreasing_decision_timestamps():
         b.on_decision(999_999)
 
 
+def test_on_decision_rejects_decreasing_after_pending_matures():
+    s = spec(horizons=(100_000,), entry_delay=0)
+    b = lb.LabelBuilder(s)
+    b.on_decision(1_000_000)
+    b.observe_price(1_000_000, 100.0)
+    out = b.observe_price(1_100_000, 101.0)
+    assert len(out) == 1
+    assert b.pending_count == 0
+    with pytest.raises(ValueError):
+        b.on_decision(999_999)
+    b.on_decision(1_000_000)
+    b.on_decision(1_000_001)
+
+
 def test_label_now_does_not_mutate_pending():
     s = spec(horizons=(100_000,), entry_delay=0)
     b = lb.LabelBuilder(s)
@@ -272,6 +286,34 @@ def test_batch_validates_sorted_inputs():
         lb.build_labels_from_price_arrays(np.array([1]), np.array([1]), np.array([0.0]), s)
     with pytest.raises(ValueError):
         lb.build_labels_from_price_arrays(np.array([[1]]), np.array([1]), np.array([1.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([-1]), np.array([1]), np.array([1.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([1]), np.array([-1]), np.array([1.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([1.5]), np.array([1, 2]), np.array([1.0, 2.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([1]), np.array([1.5]), np.array([1.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([math.nan]), np.array([1]), np.array([1.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([1]), np.array([math.inf]), np.array([1.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([True]), np.array([1]), np.array([1.0]), s)
+    with pytest.raises(ValueError):
+        lb.build_labels_from_price_arrays(np.array([1]), np.array([True]), np.array([1.0]), s)
+
+
+def test_batch_accepts_integer_valued_float_timestamps():
+    s = spec(horizons=(100_000,), entry_delay=0)
+    labels, mask = lb.build_labels_from_price_arrays(
+        np.array([1_000_000.0]),
+        np.array([1_000_000.0, 1_100_000.0]),
+        np.array([100.0, 101.0]),
+        s,
+    )
+    assert mask.tolist() == [True]
+    assert labels[0, 0] == pytest.approx(10_000.0 * math.log(101.0 / 100.0))
 
 
 def test_no_feature_engine_transform_storage_imports_or_public_residue():

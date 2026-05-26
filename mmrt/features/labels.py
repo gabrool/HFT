@@ -9,7 +9,6 @@ storage artifacts.
 from dataclasses import dataclass
 import bisect
 import math
-from typing import Iterable
 
 import numpy as np
 
@@ -170,6 +169,7 @@ class LabelBuilder:
         self.price_history = PriceHistory(price_history_capacity)
         self.pending: list[PendingLabel] = []
         self._pending_start = 0
+        self._last_decision_ts_us: int | None = None
 
     @property
     def pending_count(self) -> int:
@@ -187,6 +187,7 @@ class LabelBuilder:
         self.price_history.reset()
         self.pending.clear()
         self._pending_start = 0
+        self._last_decision_ts_us = None
 
     def observe_price(self, ts_us: int, price: float) -> list[LabelResult]:
         self.price_history.append(PriceObservation(ts_us, price))
@@ -194,10 +195,9 @@ class LabelBuilder:
 
     def on_decision(self, decision_ts_us: int) -> None:
         decision_ts_us = _require_int_us(decision_ts_us, "decision_ts_us", allow_zero=True)
-        if self.pending_count > 0:
-            prev = self.pending[-1].decision_ts_us
-            if decision_ts_us < prev:
-                raise ValueError("decision_ts_us must be nondecreasing")
+        if self._last_decision_ts_us is not None and decision_ts_us < self._last_decision_ts_us:
+            raise ValueError("decision_ts_us must be nondecreasing")
+        self._last_decision_ts_us = decision_ts_us
         entry_ts_us = decision_ts_us + self.spec.entry_delay_us
         ready_ts_us = entry_ts_us + max(self.spec.horizons_us)
         self.pending.append(
@@ -276,6 +276,29 @@ def _dedupe_equal_timestamps_keep_last(ts: np.ndarray, price: np.ndarray) -> tup
     return ts[keep].astype(np.int64, copy=False), price[keep].astype(np.float64, copy=False)
 
 
+
+def _coerce_timestamp_array(values: np.ndarray, name: str) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be 1D")
+    if arr.dtype == np.dtype(bool) or arr.dtype.kind == "b":
+        raise ValueError(f"{name} must not be bool")
+    if arr.dtype.kind in ("i", "u"):
+        out = arr.astype(np.int64, copy=False)
+    elif arr.dtype.kind == "f":
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name} must be finite")
+        if not np.all(np.equal(arr, np.floor(arr))):
+            raise ValueError(f"{name} must be integer-valued")
+        out = arr.astype(np.int64, copy=False)
+    else:
+        raise ValueError(f"{name} must be numeric integer timestamps")
+    if out.size and np.any(out < 0):
+        raise ValueError(f"{name} must be nonnegative")
+    if out.size and np.any(np.diff(out) < 0):
+        raise ValueError(f"{name} must be nondecreasing")
+    return out
+
 def build_labels_from_price_arrays(
     decision_ts_us: np.ndarray,
     price_ts_us: np.ndarray,
@@ -283,23 +306,17 @@ def build_labels_from_price_arrays(
     spec: LabelSpec,
 ) -> tuple[np.ndarray, np.ndarray]:
     spec = _coerce_label_spec(spec)
-    dec = np.asarray(decision_ts_us)
-    pts = np.asarray(price_ts_us)
+    dec = _coerce_timestamp_array(decision_ts_us, "decision_ts_us")
+    pts = _coerce_timestamp_array(price_ts_us, "price_ts_us")
     pval = np.asarray(price_values)
-    if dec.ndim != 1 or pts.ndim != 1 or pval.ndim != 1:
-        raise ValueError("decision_ts_us, price_ts_us, and price_values must be 1D")
+    if pval.ndim != 1:
+        raise ValueError("price_values must be 1D")
     if pts.shape[0] != pval.shape[0]:
         raise ValueError("price_ts_us and price_values length mismatch")
-    if dec.size and np.any(np.diff(dec.astype(np.int64, copy=False)) < 0):
-        raise ValueError("decision_ts_us must be nondecreasing")
-    if pts.size and np.any(np.diff(pts.astype(np.int64, copy=False)) < 0):
-        raise ValueError("price_ts_us must be nondecreasing")
-
-    dec = dec.astype(np.int64, copy=False)
-    pts = pts.astype(np.int64, copy=False)
-    pval = pval.astype(np.float64, copy=False)
     if pval.size and (not np.all(np.isfinite(pval)) or np.any(pval <= 0.0)):
         raise ValueError("price_values must be finite and > 0")
+
+    pval = pval.astype(np.float64, copy=False)
 
     pts, pval = _dedupe_equal_timestamps_keep_last(pts, pval)
     n = dec.shape[0]
