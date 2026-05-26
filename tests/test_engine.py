@@ -234,10 +234,9 @@ def test_vwap_vs_mid_formula_manual():
 def test_absorption_formula_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000, 100.0, 2.0, BUY_SIDE_CODE))
-    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, bid_sz0=10.0, ask_sz0=10.0))
-    d = e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
-    assert d is None
+    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
+    e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
     vec = e.build_feature_vector()
     eps = eg.FLOAT_EPS
     bid_add = e._book_sum("bid_l1_add", 200_000, 2_100_000)
@@ -273,8 +272,8 @@ def test_ofi_pressure_formulas_manual():
 def test_post_trade_replenishment_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000, 100.0, 2.0, BUY_SIDE_CODE))
-    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, bid_sz0=10.0, ask_sz0=10.0))
+    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
     vec = e.build_feature_vector()
     eps = eg.FLOAT_EPS
@@ -296,8 +295,8 @@ def test_post_trade_replenishment_manual():
 def test_same_and_opposite_replenishment_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000, 100.0, 2.0, BUY_SIDE_CODE))
-    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, bid_sz0=10.0, ask_sz0=10.0))
+    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
     vec = e.build_feature_vector()
     bid_add = e._book_sum("bid_l1_add", 200_000, 2_100_000)
@@ -314,8 +313,8 @@ def test_same_and_opposite_replenishment_manual():
 def test_trade_side_quote_response_asymmetry_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000, 100.0, 2.0, BUY_SIDE_CODE))
-    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, bid_sz0=10.0, ask_sz0=10.0))
+    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
     vec = e.build_feature_vector()
     eps = eg.FLOAT_EPS
@@ -337,8 +336,8 @@ def test_trade_side_quote_response_asymmetry_manual():
 def test_trade_impact_half_life_proxy_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000, 102.0, 1.0, BUY_SIDE_CODE))
-    e.on_trade(make_trade(2_300_000, 98.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
+    e.on_trade(make_trade(2_300_000, 98.0, 1.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_500_000, mid=100.0))
     v = e.build_feature_vector()
     impact_200 = abs(fv_value(v, "vwap_vs_mid_bps_200000us"))
@@ -441,8 +440,8 @@ def test_no_future_leakage_with_as_of():
 def test_all_engine_features_assigned_no_placeholders():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000, 101.0, 3.0, BUY_SIDE_CODE))
-    e.on_trade(make_trade(2_150_000, 99.0, 2.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0, bid_sz0=10.0, ask_sz0=10.0))
+    e.on_trade(make_trade(2_150_000, 99.0, 2.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_300_000, mid=100.2, bid_sz0=12.0, ask_sz0=8.0))
     d = e.on_book_snapshot(make_snapshot(2_500_000, mid=100.1, bid_sz0=11.0, ask_sz0=9.0))
     assert d is not None
