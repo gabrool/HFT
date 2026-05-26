@@ -320,7 +320,6 @@ class BookState:
         def setf(name,v):
             if name not in BOOK_FEATURE_NAME_SET: raise KeyError(name)
             arr[feature_spec_by_name(name).index]=_finite(v); assigned.add(name)
-        # Temporary zero because this requires trade timestamps; trade_state/engine must override or re-own before production.
         setf("spread_bps",s.spread_bps); setf("gap_b_bps",self._gap_b_bps()); setf("bsz1",self.current_bid_sz[0]); setf("asz1",self.current_ask_sz[0]); setf("micro_minus_mid_bps",s.micro_minus_mid_bps); setf("time_since_mid_change_us",now-self.last_mid_change_ts_us)
         setf("micro_ret_bps_200000us",self._ret_bps_asof("microprice",WINDOW_200MS_US)); setf("micro_ret_bps_500000us",self._ret_bps_asof("microprice",WINDOW_500MS_US)); setf("micro_ret_bps_1000000us",self._ret_bps_asof("microprice",WINDOW_1000MS_US))
         setf("mid_slope_bps_per_sec_500000us",self._rolling_mid_slope_bps_per_sec(WINDOW_500MS_US)); setf("mid_slope_bps_per_sec_1000000us",self._rolling_mid_slope_bps_per_sec(WINDOW_1000MS_US)); setf("mid_range_bps_500000us",self._rolling_range_bps('mid',WINDOW_500MS_US)); setf("mid_range_bps_1000000us",self._rolling_range_bps('mid',WINDOW_1000MS_US))
