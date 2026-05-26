@@ -73,7 +73,7 @@ def _tuple_of_data_types(values: Sequence[TardisDataType | str], name: str) -> t
     seq = tuple(values)
     if not seq:
         raise ValueError(f"{name} must not be empty")
-    return tuple(_coerce_data_type(v) for v in seq)
+    return tuple(_require_supported_merge_data_type(_coerce_data_type(v)) for v in seq)
 
 
 def event_type_for_data_type(data_type: TardisDataType | str) -> EventType:
@@ -91,6 +91,11 @@ def event_type_for_data_type(data_type: TardisDataType | str) -> EventType:
     if dtype == TardisDataType.LIQUIDATIONS:
         return EventType.LIQUIDATION
     raise ValueError(f"unsupported data_type for event mapping: {dtype.value}")
+
+
+def _require_supported_merge_data_type(dtype: TardisDataType) -> TardisDataType:
+    event_type_for_data_type(dtype)
+    return dtype
 
 
 def event_type_code_for_event_type(event_type: EventType | str) -> int:
@@ -122,7 +127,11 @@ class EventMergeInput:
     source_name: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "data_type", _coerce_data_type(self.data_type))
+        object.__setattr__(
+            self,
+            "data_type",
+            _require_supported_merge_data_type(_coerce_data_type(self.data_type)),
+        )
         if not isinstance(self.frame, pl.LazyFrame):
             raise ValueError("frame must be pl.LazyFrame")
         _require_nonnegative_int(self.input_rank, "input_rank")
@@ -149,7 +158,7 @@ class MergedEventFile:
 def parquet_merge_input(path: str | Path, data_type: TardisDataType | str, input_rank: int) -> EventMergeInput:
     p = Path(path)
     return EventMergeInput(
-        data_type=_coerce_data_type(data_type),
+        data_type=data_type,
         frame=pl.scan_parquet(p),
         input_rank=input_rank,
         source_name=str(p),

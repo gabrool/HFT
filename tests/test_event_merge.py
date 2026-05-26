@@ -158,6 +158,43 @@ def test_validate_merge_input_schema_rejects_missing_or_reordered_columns():
         validate_merge_input_schema(EventMergeInput(TardisDataType.TRADES, _trades_df([1]).select(cols).lazy(), 0))
 
 
+
+
+def test_expected_merged_columns_rejects_unsupported_data_types():
+    with pytest.raises(ValueError):
+        expected_merged_columns([TardisDataType.QUOTES])
+    with pytest.raises(ValueError):
+        expected_merged_columns([TardisDataType.OPTIONS_CHAIN])
+    with pytest.raises(ValueError):
+        expected_merged_columns(["quotes"])
+    with pytest.raises(ValueError):
+        expected_merged_columns(["options_chain"])
+
+
+def test_event_merge_input_rejects_unsupported_data_types():
+    lf = _trades_df([1]).lazy()
+    with pytest.raises(ValueError):
+        EventMergeInput(TardisDataType.QUOTES, lf, 0)
+    with pytest.raises(ValueError):
+        EventMergeInput(TardisDataType.OPTIONS_CHAIN, lf, 0)
+
+
+def test_merged_event_file_rejects_unsupported_data_types():
+    with pytest.raises(ValueError):
+        MergedEventFile(Path("bad.parquet"), 1, (TardisDataType.QUOTES,), None)
+    with pytest.raises(ValueError):
+        MergedEventFile(Path("bad.parquet"), 1, (TardisDataType.OPTIONS_CHAIN,), None)
+
+
+def test_parquet_merge_input_rejects_unsupported_data_types(tmp_path):
+    path = tmp_path / "trades.parquet"
+    _trades_df([10]).write_parquet(path)
+
+    with pytest.raises(ValueError):
+        parquet_merge_input(path, TardisDataType.QUOTES, 0)
+    with pytest.raises(ValueError):
+        parquet_merge_input(path, TardisDataType.OPTIONS_CHAIN, 0)
+
 def test_expected_merged_columns_stable_order():
     cols = expected_merged_columns([TardisDataType.TRADES, TardisDataType.BOOK_SNAPSHOT_25])
     assert cols[:11] == (
