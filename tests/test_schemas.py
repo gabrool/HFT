@@ -92,8 +92,8 @@ def test_book_ticker_columns_order_and_nullable():
         "local_timestamp",
         "ask_amount",
         "ask_price",
-        "bid_price",
         "bid_amount",
+        "bid_price",
     )
     assert all(col.nullable for col in schema.columns[4:])
 

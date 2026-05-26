@@ -120,6 +120,7 @@ def test_scan_tardis_csv_normalized_trades(tmp_path):
     assert df[RAW_SOURCE_ROW].to_list() == [0, 1, 2, 3]
     assert df[TS_US].dtype == pl.Int64
     assert df[LOCAL_TS_US].dtype == pl.Int64
+    assert df[RAW_SOURCE_ROW].dtype == pl.Int64
     assert df[SOURCE_FILE].to_list() == [str(p)] * 4
     assert df[SOURCE_DATA_TYPE].to_list() == ["trades"] * 4
     assert df["side_code"].to_list() == [SIDE_BUY, SIDE_SELL, SIDE_UNKNOWN, SIDE_UNKNOWN]
@@ -141,6 +142,7 @@ def test_scan_tardis_csv_normalized_book_snapshot_25(tmp_path):
         assert c in df.columns
     assert "asks[0].price" not in df.columns
     assert df[RAW_SOURCE_ROW].to_list() == [0]
+    assert df[RAW_SOURCE_ROW].dtype == pl.Int64
     assert "mid" not in df.columns
     assert "spread_bps" not in df.columns
     assert "microprice" not in df.columns
@@ -171,6 +173,36 @@ def test_scan_tardis_csv_normalized_liquidations(tmp_path):
     df = scan_tardis_csv_normalized(p, TardisDataType.LIQUIDATIONS).collect()
     assert "side_code" in df.columns
     assert df["side_code"].to_list() == [SIDE_BUY, SIDE_SELL]
+
+
+def test_scan_tardis_csv_normalized_book_ticker_order(tmp_path):
+    p = tmp_path / "book_ticker.csv"
+    p.write_text(
+        "exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_amount,bid_price\n"
+        "binance-futures,BTCUSDT,1,2,1.5,101.0,2.0,100.0\n",
+        encoding="utf-8",
+    )
+    df = scan_tardis_csv_normalized(p, TardisDataType.BOOK_TICKER).collect()
+
+    assert df.columns == list(expected_normalized_columns(TardisDataType.BOOK_TICKER))
+    assert df["ask_amount"].to_list() == [1.5]
+    assert df["ask_price"].to_list() == [101.0]
+    assert df["bid_amount"].to_list() == [2.0]
+    assert df["bid_price"].to_list() == [100.0]
+    assert df[RAW_SOURCE_ROW].dtype == pl.Int64
+    assert "side_code" not in df.columns
+    assert "book_side_code" not in df.columns
+
+
+def test_book_ticker_rejects_old_wrong_bid_order(tmp_path):
+    p = tmp_path / "book_ticker_wrong.csv"
+    p.write_text(
+        "exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_price,bid_amount\n"
+        "binance-futures,BTCUSDT,1,2,1.5,101.0,100.0,2.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        validate_tardis_csv_header(p, TardisDataType.BOOK_TICKER)
 
 
 def test_validate_normalized_timestamps():

@@ -191,7 +191,7 @@ def scan_tardis_csv_normalized(
     with_cols: list[pl.Expr] = [
         pl.col(TS_US).cast(pl.Int64),
         pl.col(LOCAL_TS_US).cast(pl.Int64),
-        pl.col(row_index_name).cast(pl.UInt32),
+        pl.col(row_index_name).cast(pl.Int64),
         pl.lit(source_file if source_file is not None else str(csv_path)).cast(pl.Utf8).alias(SOURCE_FILE),
         pl.lit(schema.data_type.value).cast(pl.Utf8).alias(SOURCE_DATA_TYPE),
     ]
