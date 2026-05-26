@@ -456,7 +456,10 @@ def test_no_future_leakage_or_repair_surface():
 
 def test_iter_split_batches_does_not_materialize_split_table(tmp_path, monkeypatch):
     root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
-    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 5, m.segments[0].local_time_range),)
+    splits = (
+        mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 3, m.segments[0].local_time_range),
+        mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 3, 5, m.segments[1].local_time_range),
+    )
     m2 = mf.StorageManifest(
         m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
@@ -504,7 +507,9 @@ def test_iter_split_batches_filters_by_row_idx_without_returning_internal_row_id
 
 def test_iter_split_batches_returns_row_idx_when_requested(tmp_path):
     root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
-    splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 4, m.segments[0].local_time_range),)
+    splits = (
+        mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 3, m.segments[0].local_time_range),
+    )
     m2 = mf.StorageManifest(
         m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
