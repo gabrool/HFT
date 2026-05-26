@@ -385,23 +385,45 @@ def infer_windows_us_from_legacy_name(legacy_name: str) -> tuple[int, ...]:
 def infer_source(legacy_name: str) -> FeatureSource:
     if legacy_name in LEGACY_EVENT_CONTEXT_FEATURE_NAMES:
         return FeatureSource.EVENT_CONTEXT
+    exact_cross_names = {
+        "trade_side_quote_response_asymmetry_500ms",
+        "trade_impact_half_life_proxy",
+    }
+    if legacy_name in exact_cross_names:
+        return FeatureSource.CROSS
+    cross_prefixes = (
+        "absorption_",
+        "ofi_l1_pressure_",
+        "post_buy_trade_",
+        "post_sell_trade_",
+        "opposite_side_replenishment_",
+        "same_side_replenishment_",
+    )
+    if legacy_name.startswith(cross_prefixes):
+        return FeatureSource.CROSS
     trade_prefixes = (
-        "signed_", "trade_", "zero_tick_", "tick_sign_", "last_trade_", "last_tick_",
-        "time_since_last_buy_trade", "time_since_last_sell_trade", "cvd_", "consecutive_buy_trade",
-        "consecutive_sell_trade", "top5_trade", "max_signed_trade", "buy_trade_", "sell_trade_",
+        "signed_",
+        "trade_",
+        "zero_tick_",
+        "tick_sign_",
+        "last_trade_",
+        "last_tick_",
+        "time_since_last_buy_trade",
+        "time_since_last_sell_trade",
+        "cvd_",
+        "consecutive_buy_trade",
+        "consecutive_sell_trade",
+        "top5_trade",
+        "max_signed_trade",
+        "buy_trade_",
+        "sell_trade_",
     )
     if legacy_name.startswith(trade_prefixes) or legacy_name in {
-        "max_trade_silence_gap_3000ms", "trade_sign_entropy_3000ms", "same_side_trade_cluster_notional_1000ms"
+        "max_trade_silence_gap_3000ms",
+        "trade_sign_entropy_3000ms",
+        "same_side_trade_cluster_notional_1000ms",
     }:
         return FeatureSource.TRADE
-    cross_prefixes = (
-        "absorption_", "ofi_l1_pressure_", "post_buy_trade_", "post_sell_trade_",
-        "opposite_side_replenishment_", "same_side_replenishment_",
-    )
-    if legacy_name.startswith(cross_prefixes) or legacy_name in {
-        "trade_side_quote_response_asymmetry_500ms", "trade_impact_half_life_proxy"
-    }:
-        return FeatureSource.CROSS
     return FeatureSource.BOOK
 
 

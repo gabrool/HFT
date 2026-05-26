@@ -1,3 +1,6 @@
+import sys
+import importlib
+
 import pytest
 
 from mmrt.features import specs
@@ -199,8 +202,27 @@ def test_no_heavy_imports():
         "mmrt.data.event_merge",
         "mmrt.data.quality",
     )
-    loaded_by_specs = set(getattr(specs, "__dict__", {}))
-    assert all(name not in loaded_by_specs for name in forbidden)
+    for name in forbidden:
+        sys.modules.pop(name, None)
+    importlib.reload(specs)
+    for name in forbidden:
+        assert name not in sys.modules
+
+
+def test_trade_book_interaction_features_are_cross_owned_by_engine():
+    quote_response = specs.feature_spec_by_name("trade_side_quote_response_asymmetry_500000us")
+    assert quote_response.source == specs.FeatureSource.CROSS
+    assert quote_response.owner == specs.FeatureOwner.ENGINE
+    assert quote_response.family == specs.FeatureFamily.CROSS_SIGNAL
+    assert quote_response.formula_group == "cross_signal"
+    assert quote_response.required_book_depth == 20
+
+    impact_half_life = specs.feature_spec_by_name("trade_impact_half_life_proxy")
+    assert impact_half_life.source == specs.FeatureSource.CROSS
+    assert impact_half_life.owner == specs.FeatureOwner.ENGINE
+    assert impact_half_life.family == specs.FeatureFamily.CROSS_SIGNAL
+    assert impact_half_life.formula_group == "cross_signal"
+    assert impact_half_life.required_book_depth == 20
 
 
 def test_specs_have_no_future_leakage_concepts():
