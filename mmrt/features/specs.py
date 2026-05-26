@@ -385,11 +385,20 @@ def infer_windows_us_from_legacy_name(legacy_name: str) -> tuple[int, ...]:
 def infer_source(legacy_name: str) -> FeatureSource:
     if legacy_name in LEGACY_EVENT_CONTEXT_FEATURE_NAMES:
         return FeatureSource.EVENT_CONTEXT
-    exact_cross_names = {
+    trade_exact_names = {
+        "time_since_trade_ms",
+        "regime_volume_ewma_500ms",
+        "regime_volume_ewma_3000ms",
+    }
+    cross_exact_names = {
         "trade_side_quote_response_asymmetry_500ms",
         "trade_impact_half_life_proxy",
+        "vwap_vs_mid_bps_200ms",
+        "vwap_vs_mid_bps_500ms",
     }
-    if legacy_name in exact_cross_names:
+    if legacy_name in trade_exact_names:
+        return FeatureSource.TRADE
+    if legacy_name in cross_exact_names:
         return FeatureSource.CROSS
     cross_prefixes = (
         "absorption_",
@@ -439,6 +448,12 @@ def infer_owner(source: FeatureSource) -> FeatureOwner:
 def infer_family(legacy_name: str, source: FeatureSource) -> FeatureFamily:
     if source == FeatureSource.EVENT_CONTEXT:
         return FeatureFamily.EVENT_CONTEXT
+    if legacy_name in {"vwap_vs_mid_bps_200ms", "vwap_vs_mid_bps_500ms"}:
+        return FeatureFamily.CROSS_SIGNAL
+    if legacy_name in {"regime_volume_ewma_500ms", "regime_volume_ewma_3000ms"}:
+        return FeatureFamily.REGIME
+    if legacy_name == "time_since_trade_ms":
+        return FeatureFamily.TRADE_FLOW
     if legacy_name.startswith("micro_ret") or legacy_name.startswith("mid_") or "microprice" in legacy_name or legacy_name in {"micro_minus_mid_bps"}:
         return FeatureFamily.PRICE
     if legacy_name.startswith("obi_") or legacy_name.startswith("ofi_") or "_ofi_" in legacy_name:
@@ -483,7 +498,16 @@ def infer_unit(legacy_name: str) -> FeatureUnit:
 
 
 def infer_required_book_depth(legacy_name: str, source: FeatureSource) -> int:
+    trade_exact_names = {
+        "time_since_trade_ms",
+        "regime_volume_ewma_500ms",
+        "regime_volume_ewma_3000ms",
+    }
     if source == FeatureSource.EVENT_CONTEXT:
+        return 0
+    if legacy_name in {"vwap_vs_mid_bps_200ms", "vwap_vs_mid_bps_500ms"}:
+        return 1
+    if source == FeatureSource.TRADE and legacy_name in trade_exact_names:
         return 0
     if source == FeatureSource.TRADE and not any(k in legacy_name for k in ("depth", "book", "l1", "l3", "l5", "l10", "vamp", "micro_l", "replenishment")):
         return 0
@@ -527,6 +551,12 @@ def infer_transform_key(legacy_name: str, unit: FeatureUnit, source: FeatureSour
 def infer_formula_group(legacy_name: str, source: FeatureSource, family: FeatureFamily) -> str:
     if source == FeatureSource.EVENT_CONTEXT:
         return "event_context"
+    if legacy_name in {"vwap_vs_mid_bps_200ms", "vwap_vs_mid_bps_500ms"}:
+        return "cross_signal"
+    if legacy_name in {"regime_volume_ewma_500ms", "regime_volume_ewma_3000ms"}:
+        return "regime"
+    if legacy_name == "time_since_trade_ms":
+        return "trade_window"
     if family == FeatureFamily.PRICE:
         return "price_history"
     if legacy_name in {"spread_bps", "gap_b_bps", "bsz1", "asz1"}:
