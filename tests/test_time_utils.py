@@ -107,6 +107,15 @@ def test_label_name_helper():
         label_name_for_horizon_us("Ret", 1_000_000)
     with pytest.raises(ValueError):
         label_name_for_horizon_us("ret-bps", 1_000_000)
+    with pytest.raises(ValueError):
+        label_name_for_horizon_us("ré", 1_000_000)
+    with pytest.raises(ValueError):
+        label_name_for_horizon_us("ret_β", 1_000_000)
+    with pytest.raises(ValueError):
+        label_name_for_horizon_us("_ret", 1_000_000)
+    with pytest.raises(ValueError):
+        label_name_for_horizon_us("ret.bps", 1_000_000)
+    assert label_name_for_horizon_us("ret_bps_1", 1_000_000) == "ret_bps_1_1s"
 
 
 def test_ordering_helpers():
