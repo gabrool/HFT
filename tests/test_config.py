@@ -1,5 +1,7 @@
 import pytest
 
+import mmrt.config as cfg_module
+from mmrt.features import specs
 from mmrt.config import (
     DataConfig,
     DecisionConfig,
@@ -30,6 +32,8 @@ def test_default_config_core_values() -> None:
     assert cfg.labels.entry_delay_us == 1_000
     assert cfg.runtime.lookback_rows == 10
     assert cfg.storage.time_unit == TimeUnit.MICROSECOND
+    assert cfg.decision.stride_us == 500_000
+    assert cfg.storage.feature_schema_version == specs.FEATURE_SCHEMA_VERSION
 
 
 def test_default_label_spec() -> None:
@@ -68,16 +72,25 @@ def test_data_config_validation() -> None:
         DataConfig(strict_validation=1)
     with pytest.raises(ValueError):
         DataConfig(allow_equal_local_ts="true")
+    with pytest.raises(TypeError):
+        DataConfig(**{"drop_duplicate_" + "trades": True})
 
 
 def test_decision_config_v1_constraints() -> None:
-    DecisionConfig()
+    assert DecisionConfig().stride_us == 500_000
+    assert DecisionConfig(stride_us=500_000).stride_us == 500_000
     with pytest.raises(ValueError):
         DecisionConfig(policy="scheduled_time")
     with pytest.raises(ValueError):
-        DecisionConfig(stride_rows=5)
-    with pytest.raises(ValueError):
         DecisionConfig(reason=DecisionReason.SCHEDULED_TIME)
+    with pytest.raises(ValueError):
+        DecisionConfig(stride_us=0)
+    with pytest.raises(ValueError):
+        DecisionConfig(stride_us=True)
+    with pytest.raises(ValueError):
+        DecisionConfig(stride_us=1)
+    with pytest.raises(TypeError):
+        DecisionConfig(**{"stride_" + "rows": 1})
 
 
 def test_feature_runtime_config_v1_constraints() -> None:
@@ -91,7 +104,7 @@ def test_feature_runtime_config_v1_constraints() -> None:
 
 
 def test_storage_config_v1_constraints() -> None:
-    StorageConfig()
+    assert StorageConfig().feature_schema_version == specs.FEATURE_SCHEMA_VERSION
     assert StorageConfig(time_unit="us").time_unit == TimeUnit.MICROSECOND
     assert StorageConfig(storage_format="flat_decision_rows_us_v1").storage_format == StorageFormat.FLAT_DECISION_ROWS_US_V1
     with pytest.raises(ValueError):
@@ -101,6 +114,8 @@ def test_storage_config_v1_constraints() -> None:
 def test_pipeline_config_invariants() -> None:
     cfg = PipelineConfig()
     assert cfg.source_data_type_values == ("book_snapshot_25", "trades")
+    assert cfg.decision.stride_us == cfg_module.DEFAULT_DECISION_STRIDE_US
+    assert cfg.storage.feature_schema_version == specs.FEATURE_SCHEMA_VERSION
     assert cfg.label_spec == cfg.labels.to_label_spec()
     with pytest.raises(ValueError):
         PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_5, TardisDataType.TRADES)))
@@ -155,3 +170,24 @@ def test_pipeline_config_rejects_invalid_nested_config_objects() -> None:
 
 def test_label_config_v1_asof_policy() -> None:
     assert LabelConfig(asof_policy=AsOfPolicy.LAST_OBSERVATION).asof_policy == AsOfPolicy.LAST_OBSERVATION
+
+
+def test_public_api_alignment() -> None:
+    assert cfg_module.DEFAULT_DECISION_STRIDE_US == 500_000
+    assert cfg_module.DEFAULT_FEATURE_SCHEMA_VERSION == specs.FEATURE_SCHEMA_VERSION
+    assert "DEFAULT_DECISION_STRIDE_US" in cfg_module.__all__
+    assert "DEFAULT_DECISION_STRIDE_" + "ROWS" not in cfg_module.__all__
+    assert "DEFAULT_DROP_DUPLICATE_" + "TRADES" not in cfg_module.__all__
+
+
+def test_legacy_surface_removed() -> None:
+    assert not hasattr(cfg_module, "DEFAULT_DECISION_STRIDE_" + "ROWS")
+    assert not hasattr(DecisionConfig(), "stride_" + "rows")
+    assert not hasattr(cfg_module, "DEFAULT_DROP_DUPLICATE_" + "TRADES")
+    assert not hasattr(DataConfig(), "drop_duplicate_" + "trades")
+
+
+def test_default_config_alignment() -> None:
+    c = default_config()
+    assert c.decision.stride_us == cfg_module.DEFAULT_DECISION_STRIDE_US
+    assert c.storage.feature_schema_version == specs.FEATURE_SCHEMA_VERSION

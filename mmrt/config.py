@@ -12,6 +12,7 @@ from mmrt.contracts import (
     TardisDataType,
     TimeUnit,
 )
+from mmrt.features.specs import FEATURE_SCHEMA_VERSION as DEFAULT_FEATURE_SCHEMA_VERSION
 
 US_PER_MS = 1_000
 US_PER_SECOND = 1_000_000
@@ -40,17 +41,15 @@ DEFAULT_ENTRY_DELAY_US = 1_000
 DEFAULT_LOOKBACK_ROWS = 10
 DEFAULT_DECISION_REASON = DecisionReason.BOOK_EVENT
 DEFAULT_DECISION_POLICY = "book_event"
-DEFAULT_DECISION_STRIDE_ROWS = 1
+DEFAULT_DECISION_STRIDE_US = 500_000
 
 DEFAULT_PIPELINE_SCHEMA_VERSION = "mmrt_pipeline_config_v1"
-DEFAULT_FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v1"
 DEFAULT_STORAGE_FORMAT = StorageFormat.FLAT_DECISION_ROWS_US_V1
 DEFAULT_TIME_UNIT = TimeUnit.MICROSECOND
 
 DEFAULT_STRICT_VALIDATION = True
 DEFAULT_FAIL_ON_NON_MONOTONIC_LOCAL_TS = True
 DEFAULT_ALLOW_EQUAL_LOCAL_TS = True
-DEFAULT_DROP_DUPLICATE_TRADES = True
 
 DEFAULT_FEATURE_DTYPE = "float32"
 DEFAULT_LABEL_DTYPE = "float32"
@@ -121,7 +120,6 @@ class DataConfig:
     strict_validation: bool = DEFAULT_STRICT_VALIDATION
     fail_on_non_monotonic_local_ts: bool = DEFAULT_FAIL_ON_NON_MONOTONIC_LOCAL_TS
     allow_equal_local_ts: bool = DEFAULT_ALLOW_EQUAL_LOCAL_TS
-    drop_duplicate_trades: bool = DEFAULT_DROP_DUPLICATE_TRADES
 
     def __post_init__(self) -> None:
         source = _tuple_of_unique_data_types(self.source_data_types, "source_data_types")
@@ -133,7 +131,6 @@ class DataConfig:
         _require_bool(self.strict_validation, "strict_validation")
         _require_bool(self.fail_on_non_monotonic_local_ts, "fail_on_non_monotonic_local_ts")
         _require_bool(self.allow_equal_local_ts, "allow_equal_local_ts")
-        _require_bool(self.drop_duplicate_trades, "drop_duplicate_trades")
         object.__setattr__(self, "source_data_types", source)
         object.__setattr__(self, "disabled_context_data_types", disabled)
 
@@ -142,7 +139,7 @@ class DataConfig:
 class DecisionConfig:
     policy: str = DEFAULT_DECISION_POLICY
     reason: DecisionReason = DEFAULT_DECISION_REASON
-    stride_rows: int = DEFAULT_DECISION_STRIDE_ROWS
+    stride_us: int = DEFAULT_DECISION_STRIDE_US
 
     def __post_init__(self) -> None:
         if _require_nonempty_str(self.policy, "policy") != DEFAULT_DECISION_POLICY:
@@ -153,9 +150,11 @@ class DecisionConfig:
             raise ValueError("reason must be DecisionReason.BOOK_EVENT for v1") from exc
         if reason != DecisionReason.BOOK_EVENT:
             raise ValueError("reason must be DecisionReason.BOOK_EVENT for v1")
-        if _require_positive_int(self.stride_rows, "stride_rows") != 1:
-            raise ValueError("stride_rows must be 1 for v1")
+        stride_us = _require_positive_int(self.stride_us, "stride_us")
+        if stride_us != DEFAULT_DECISION_STRIDE_US:
+            raise ValueError("stride_us must be 500_000 for v1")
         object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "stride_us", stride_us)
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +301,7 @@ __all__ = [
     "DEFAULT_ENTRY_DELAY_US",
     "DEFAULT_LOOKBACK_ROWS",
     "DEFAULT_DECISION_POLICY",
-    "DEFAULT_DECISION_STRIDE_ROWS",
+    "DEFAULT_DECISION_STRIDE_US",
     "DEFAULT_PIPELINE_SCHEMA_VERSION",
     "DEFAULT_FEATURE_SCHEMA_VERSION",
     "DEFAULT_FEATURE_DTYPE",
