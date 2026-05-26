@@ -65,6 +65,7 @@ def test_no_forbidden_imports():
         "mmrt.data.tardis_csv",
         "mmrt.data.event_merge",
         "mmrt.storage.writer",
+        "mmrt.storage." + "reader",
         "CM" + "SSL17",
         "offline_" + "ingest",
     ]
@@ -91,9 +92,8 @@ def test_config_validation():
     with pytest.raises(ValueError):
         ex.LinearFeatureExtractorConfig(feature_columns=[1])
     with pytest.raises(ValueError):
-        ex.LinearFeatureExtractorConfig(require_all_finite=1)
-    with pytest.raises(ValueError):
         ex.LinearFeatureExtractorConfig(copy=1)
+    assert not hasattr(cfg, "require_all_finite")
     assert not hasattr(cfg, "extractor_type")
     assert not hasattr(cfg, "rand"+"om_state")
     assert not hasattr(cfg, "window_size")
@@ -175,6 +175,7 @@ def test_identity_extractor_resolves_manifest_and_transforms_table():
     assert d["output_dtype"] == "float32"
     assert d["feature_columns"] == list(cols)
     assert d["feature_schema_hash"] == m.feature_schema.get("feature_specs_hash")
+    assert "require_all_finite" not in d
 
 
 def test_identity_extractor_subset_projection():
@@ -197,7 +198,7 @@ def test_identity_extractor_transform_numpy():
         ext.transform_numpy(np.array([[1.0, 2.0]], dtype=np.float64), feature_columns=("a", "c"))
     with pytest.raises(ValueError):
         ext.transform_numpy(np.array([[1.0]], dtype=np.float64))
-    ext2 = ex.IdentityFeatureExtractor(config=ex.LinearFeatureExtractorConfig(require_all_finite=True), manifest=make_manifest())
+    ext2 = ex.IdentityFeatureExtractor(config=ex.LinearFeatureExtractorConfig(output_dtype="float32"), manifest=make_manifest())
     with pytest.raises(ValueError):
         ext2.transform_numpy(np.array([[np.nan] * len(ext2.feature_columns)], dtype=np.float32), feature_columns=ext2.feature_columns)
 
@@ -216,7 +217,11 @@ def test_identity_extractor_has_no_fit_or_stage_api():
 
 
 def test_no_future_leakage_or_timestamp_surface():
+    cfg_src = inspect.getsource(ex.LinearFeatureExtractorConfig)
+    assert "require_all_finite" not in cfg_src
     src = inspect.getsource(ex)
+    assert "StorageDataset" + "Reader" not in src
+    assert "storage." + "reader" not in src
     forbidden = [
         "future_" + "mid",
         "future_" + "ret",
