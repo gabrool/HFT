@@ -404,7 +404,9 @@ class FeatureBuildResult:
             TardisDataType.DERIVATIVE_TICKER: EventType.DERIVATIVE_TICKER,
             TardisDataType.LIQUIDATIONS: EventType.LIQUIDATION,
         }.get(self.meta.source_data_type)
-        if expected_event_type is not None and self.event_type != expected_event_type:
+        if expected_event_type is None:
+            raise ValueError("meta.source_data_type has no supported FeatureBuildResult event type")
+        if self.event_type != expected_event_type:
             raise ValueError("event_type must match originating event type")
         if not isinstance(self.is_decision, bool):
             raise ValueError("is_decision must be bool")

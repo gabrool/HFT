@@ -116,6 +116,56 @@ def test_feature_build_result_rejects_non_decision_with_features():
         FeatureBuildResult(_meta(TardisDataType.TRADES), EventType.TRADE, False, None, (1.0,), None, 0)
 
 
+
+
+def test_feature_build_result_rejects_unsupported_source_data_types():
+    for dtype in (TardisDataType.QUOTES, TardisDataType.OPTIONS_CHAIN):
+        with pytest.raises(ValueError):
+            FeatureBuildResult(
+                meta=_meta(dtype),
+                event_type=EventType.TRADE,
+                is_decision=False,
+                decision_reason=None,
+                features=(),
+                raw_mid=None,
+                dt_us=0,
+            )
+
+
+def test_feature_build_result_accepts_supported_source_type_mappings():
+    cases = (
+        (TardisDataType.BOOK_SNAPSHOT_25, EventType.BOOK_SNAPSHOT),
+        (TardisDataType.BOOK_SNAPSHOT_5, EventType.BOOK_SNAPSHOT),
+        (TardisDataType.INCREMENTAL_BOOK_L2, EventType.BOOK_DELTA),
+        (TardisDataType.TRADES, EventType.TRADE),
+        (TardisDataType.BOOK_TICKER, EventType.BOOK_TICKER),
+        (TardisDataType.DERIVATIVE_TICKER, EventType.DERIVATIVE_TICKER),
+        (TardisDataType.LIQUIDATIONS, EventType.LIQUIDATION),
+    )
+    for dtype, event_type in cases:
+        result = FeatureBuildResult(
+            meta=_meta(dtype),
+            event_type=event_type,
+            is_decision=False,
+            decision_reason=None,
+            features=(),
+            raw_mid=None,
+            dt_us=0,
+        )
+        assert result.event_type == event_type
+
+
+def test_feature_build_result_rejects_event_type_mismatch():
+    with pytest.raises(ValueError):
+        FeatureBuildResult(
+            meta=_meta(TardisDataType.TRADES),
+            event_type=EventType.BOOK_SNAPSHOT,
+            is_decision=False,
+            decision_reason=None,
+            features=(),
+            raw_mid=None,
+            dt_us=0,
+        )
 def test_feature_build_result_rejects_bad_decision_payload():
     with pytest.raises(ValueError):
         FeatureBuildResult(_meta(TardisDataType.TRADES), EventType.TRADE, True, DecisionReason.BOOK_EVENT, (), 100.0, 1)
