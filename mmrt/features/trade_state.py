@@ -204,12 +204,13 @@ class TradeHistory:
 
     def asof_value(self, field_name: str, query_ts_us: int, default: float = 0.0) -> float:
         ts = self.ordered_ts()
-        if ts.size == 0:
-            return default
-        idx = k.asof_index_right(ts, query_ts_us)
+        if ts.size == 0 or query_ts_us <= 0:
+            return float(default)
+        idx = k.asof_index_right(ts.astype(np.int64, copy=False), int(query_ts_us))
         if idx < 0:
-            return default
-        return _finite(self.ordered_slice(field_name)[idx])
+            return float(default)
+        val = self.ordered_slice(field_name)[idx]
+        return float(val) if np.isfinite(val) else float(default)
 
 
 class TradeState:
