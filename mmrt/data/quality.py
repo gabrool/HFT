@@ -152,78 +152,95 @@ def analyze_normalized_lazyframe(
     expected = expected_normalized_columns(dt)
     actual = tuple(lf.collect_schema().names())
     actual_set = set(actual)
+    expected_set = set(expected)
     missing = tuple(c for c in expected if c not in actual_set)
-    unexpected = tuple(c for c in actual if c not in set(expected))
+    unexpected = tuple(c for c in actual if c not in expected_set)
     if missing:
         issues.append(_issue("missing_columns", QualitySeverity.ERROR, len(missing), f"normalized data is missing expected columns: {', '.join(missing)}"))
     if unexpected:
         issues.append(_issue("unexpected_columns", QualitySeverity.WARNING, len(unexpected), f"normalized data contains unexpected columns: {', '.join(unexpected)}"))
+    if not missing and not unexpected and actual != expected:
+        issues.append(_issue("column_order_mismatch", QualitySeverity.ERROR, 1, "normalized columns are present but not in expected order"))
 
     has_ts = TS_US in actual_set
     has_local_ts = LOCAL_TS_US in actual_set
-    agg_exprs: list[pl.Expr] = [pl.len().alias("row_count")]
+    has_raw_source_row = RAW_SOURCE_ROW in actual_set
+    has_source_data_type = SOURCE_DATA_TYPE in actual_set
+    has_source_file = SOURCE_FILE in actual_set
+    common_metrics_exprs: list[pl.Expr] = [pl.len().alias("row_count")]
     if has_ts:
-        agg_exprs += [
+        common_metrics_exprs += [
             pl.col(TS_US).min().alias("min_ts_us"), pl.col(TS_US).max().alias("max_ts_us"),
             pl.col(TS_US).is_null().sum().alias("null_ts_count"),
             ((pl.col(TS_US) <= 0) & pl.col(TS_US).is_not_null()).sum().alias("nonpositive_ts_count"),
         ]
     if has_local_ts:
-        agg_exprs += [
+        common_metrics_exprs += [
             pl.col(LOCAL_TS_US).min().alias("min_local_ts_us"), pl.col(LOCAL_TS_US).max().alias("max_local_ts_us"),
             pl.col(LOCAL_TS_US).is_null().sum().alias("null_local_ts_count"),
             ((pl.col(LOCAL_TS_US) <= 0) & pl.col(LOCAL_TS_US).is_not_null()).sum().alias("nonpositive_local_ts_count"),
+            (
+                pl.col(LOCAL_TS_US).diff().is_not_null()
+                & (pl.col(LOCAL_TS_US).diff() < 0)
+            ).sum().alias("local_ts_us_decreases"),
         ]
-    s = lf.select(agg_exprs).collect().row(0, named=True)
-    row_count = int(s["row_count"])
-    min_ts_us = int(s["min_ts_us"]) if has_ts and s["min_ts_us"] is not None else None
-    max_ts_us = int(s["max_ts_us"]) if has_ts and s["max_ts_us"] is not None else None
-    min_local_ts_us = int(s["min_local_ts_us"]) if has_local_ts and s["min_local_ts_us"] is not None else None
-    max_local_ts_us = int(s["max_local_ts_us"]) if has_local_ts and s["max_local_ts_us"] is not None else None
+    if has_raw_source_row:
+        common_metrics_exprs += [
+            pl.col(RAW_SOURCE_ROW).is_null().sum().alias("null_raw_source_row_count"),
+            ((pl.col(RAW_SOURCE_ROW) < 0) & pl.col(RAW_SOURCE_ROW).is_not_null()).sum().alias("negative_raw_source_row_count"),
+            (
+                pl.col(RAW_SOURCE_ROW).diff().is_not_null()
+                & (pl.col(RAW_SOURCE_ROW).diff() != 1)
+            ).sum().alias("raw_source_row_not_contiguous"),
+        ]
+    if has_source_data_type:
+        common_metrics_exprs.append((pl.col(SOURCE_DATA_TYPE).is_null() | (pl.col(SOURCE_DATA_TYPE) != dt.value)).sum().alias("bad_source_data_type_count"))
+    if has_source_file:
+        common_metrics_exprs.append((pl.col(SOURCE_FILE).is_null() | (pl.col(SOURCE_FILE) == "")).sum().alias("missing_source_file_count"))
+
+    common = lf.select(common_metrics_exprs).collect().row(0, named=True)
+    row_count = int(common["row_count"])
+    min_ts_us = int(common["min_ts_us"]) if has_ts and common["min_ts_us"] is not None else None
+    max_ts_us = int(common["max_ts_us"]) if has_ts and common["max_ts_us"] is not None else None
+    min_local_ts_us = int(common["min_local_ts_us"]) if has_local_ts and common["min_local_ts_us"] is not None else None
+    max_local_ts_us = int(common["max_local_ts_us"]) if has_local_ts and common["max_local_ts_us"] is not None else None
 
     if row_count == 0:
         issues.append(_issue("empty_data", QualitySeverity.WARNING, 1, "normalized data contains zero rows"))
 
-    if has_ts and int(s["null_ts_count"]) > 0:
-        issues.append(_issue("null_ts_us", QualitySeverity.ERROR, int(s["null_ts_count"]), "ts_us contains null values"))
-    if has_local_ts and int(s["null_local_ts_count"]) > 0:
-        issues.append(_issue("null_local_ts_us", QualitySeverity.ERROR, int(s["null_local_ts_count"]), "local_ts_us contains null values"))
-    if has_ts and int(s["nonpositive_ts_count"]) > 0:
-        issues.append(_issue("nonpositive_ts_us", QualitySeverity.ERROR, int(s["nonpositive_ts_count"]), "ts_us must be positive integer microseconds"))
-    if has_local_ts and int(s["nonpositive_local_ts_count"]) > 0:
-        issues.append(_issue("nonpositive_local_ts_us", QualitySeverity.ERROR, int(s["nonpositive_local_ts_count"]), "local_ts_us must be positive integer microseconds"))
-
-    if has_local_ts and row_count > 1:
-        count = int(lf.select((pl.col(LOCAL_TS_US).diff() < 0).sum().alias("c")).collect().item())
-        if count > 0:
-            issues.append(_issue("local_ts_us_decreases", QualitySeverity.ERROR, count, "local_ts_us decreases within the normalized file"))
-
-    if RAW_SOURCE_ROW in actual_set and row_count > 1:
-        expr = (pl.col(RAW_SOURCE_ROW).diff().is_not_null() & (pl.col(RAW_SOURCE_ROW).diff() != 1)).sum().alias("c")
-        count = int(lf.select(expr).collect().item())
-        if count > 0:
-            issues.append(_issue("raw_source_row_not_contiguous", QualitySeverity.ERROR, count, "raw_source_row should preserve contiguous input row order"))
+    if has_ts and int(common["null_ts_count"]) > 0:
+        issues.append(_issue("null_ts_us", QualitySeverity.ERROR, int(common["null_ts_count"]), "ts_us contains null values"))
+    if has_local_ts and int(common["null_local_ts_count"]) > 0:
+        issues.append(_issue("null_local_ts_us", QualitySeverity.ERROR, int(common["null_local_ts_count"]), "local_ts_us contains null values"))
+    if has_ts and int(common["nonpositive_ts_count"]) > 0:
+        issues.append(_issue("nonpositive_ts_us", QualitySeverity.ERROR, int(common["nonpositive_ts_count"]), "ts_us must be positive integer microseconds"))
+    if has_local_ts and int(common["nonpositive_local_ts_count"]) > 0:
+        issues.append(_issue("nonpositive_local_ts_us", QualitySeverity.ERROR, int(common["nonpositive_local_ts_count"]), "local_ts_us must be positive integer microseconds"))
+    if has_local_ts and int(common["local_ts_us_decreases"]) > 0:
+        issues.append(_issue("local_ts_us_decreases", QualitySeverity.ERROR, int(common["local_ts_us_decreases"]), "local_ts_us decreases within the normalized file"))
+    if has_raw_source_row and int(common["null_raw_source_row_count"]) > 0:
+        issues.append(_issue("null_raw_source_row", QualitySeverity.ERROR, int(common["null_raw_source_row_count"]), "raw_source_row contains null values"))
+    if has_raw_source_row and int(common["negative_raw_source_row_count"]) > 0:
+        issues.append(_issue("negative_raw_source_row", QualitySeverity.ERROR, int(common["negative_raw_source_row_count"]), "raw_source_row must be non-negative"))
+    if has_raw_source_row and int(common["raw_source_row_not_contiguous"]) > 0:
+        issues.append(_issue("raw_source_row_not_contiguous", QualitySeverity.ERROR, int(common["raw_source_row_not_contiguous"]), "raw_source_row should preserve contiguous input row order"))
 
     if SOURCE_FILE in actual_set and RAW_SOURCE_ROW in actual_set:
         count = int(lf.select(pl.struct([SOURCE_FILE, RAW_SOURCE_ROW]).is_duplicated().sum().alias("c")).collect().item())
         if count > 0:
             issues.append(_issue("duplicate_source_rows", QualitySeverity.ERROR, count, "duplicate source_file/raw_source_row pairs found"))
 
-    if SOURCE_DATA_TYPE in actual_set:
-        count = int(lf.select((pl.col(SOURCE_DATA_TYPE).is_null() | (pl.col(SOURCE_DATA_TYPE) != dt.value)).sum().alias("c")).collect().item())
-        if count > 0:
-            issues.append(_issue("bad_source_data_type", QualitySeverity.ERROR, count, "source_data_type values do not match requested data_type"))
+    if has_source_data_type and int(common["bad_source_data_type_count"]) > 0:
+        issues.append(_issue("bad_source_data_type", QualitySeverity.ERROR, int(common["bad_source_data_type_count"]), "source_data_type values do not match requested data_type"))
 
-    if SOURCE_FILE in actual_set:
-        count = int(lf.select((pl.col(SOURCE_FILE).is_null() | (pl.col(SOURCE_FILE) == "")).sum().alias("c")).collect().item())
-        if count > 0:
-            issues.append(_issue("missing_source_file", QualitySeverity.WARNING, count, "source_file is null or empty"))
+    if has_source_file and int(common["missing_source_file_count"]) > 0:
+        issues.append(_issue("missing_source_file", QualitySeverity.WARNING, int(common["missing_source_file_count"]), "source_file is null or empty"))
 
     if dt in (TardisDataType.TRADES, TardisDataType.LIQUIDATIONS) and {"price", "amount", "side_code"}.issubset(actual_set):
         m = lf.select([
             (pl.col("price").is_null() | (pl.col("price") <= 0)).sum().alias("invalid_price"),
             (pl.col("amount").is_null() | (pl.col("amount") <= 0)).sum().alias("invalid_amount"),
-            (~pl.col("side_code").is_in([SIDE_SELL, SIDE_UNKNOWN, SIDE_BUY])).sum().alias("invalid_side_code"),
+            (pl.col("side_code").is_null() | ~pl.col("side_code").is_in([SIDE_SELL, SIDE_UNKNOWN, SIDE_BUY])).sum().alias("invalid_side_code"),
         ]).collect().row(0, named=True)
         for k in ("invalid_price", "invalid_amount", "invalid_side_code"):
             if int(m[k]) > 0:
@@ -233,7 +250,7 @@ def analyze_normalized_lazyframe(
         m = lf.select([
             (pl.col("price").is_null() | (pl.col("price") <= 0)).sum().alias("invalid_price"),
             (pl.col("amount").is_null() | (pl.col("amount") < 0)).sum().alias("invalid_amount"),
-            (~pl.col("book_side_code").is_in([BOOK_SIDE_BID, BOOK_SIDE_UNKNOWN, BOOK_SIDE_ASK])).sum().alias("invalid_book_side_code"),
+            (pl.col("book_side_code").is_null() | ~pl.col("book_side_code").is_in([BOOK_SIDE_BID, BOOK_SIDE_UNKNOWN, BOOK_SIDE_ASK])).sum().alias("invalid_book_side_code"),
             pl.col("is_snapshot").is_null().sum().alias("null_is_snapshot"),
             (pl.col("is_snapshot") == True).sum().alias("snapshot_marker_count"),
         ]).collect().row(0, named=True)

@@ -38,8 +38,11 @@ def _good_trades_df() -> pl.DataFrame:
 
 
 def _good_liquidations_df() -> pl.DataFrame:
-    df = _good_trades_df().rename({"side_code": "side_code"})
-    return df.select(list(expected_normalized_columns(TardisDataType.LIQUIDATIONS)))
+    r0 = _base_row(TardisDataType.LIQUIDATIONS)
+    r0.update({"id": "1", "side": "buy", "price": 10.0, "amount": 2.0, "side_code": 1})
+    r1 = dict(r0)
+    r1.update({RAW_SOURCE_ROW: 1, TS_US: 200, LOCAL_TS_US: 210, "id": "2", "side": "sell", "side_code": -1})
+    return pl.DataFrame([r0, r1]).select(list(expected_normalized_columns(TardisDataType.LIQUIDATIONS)))
 
 
 def _good_incremental_df() -> pl.DataFrame:
@@ -127,6 +130,20 @@ def test_unexpected_columns_warning():
     assert _find(r, "unexpected_columns").severity == QualitySeverity.WARNING
 
 
+def test_column_order_mismatch_error():
+    df = _good_trades_df()
+    cols = list(df.columns)
+    i = cols.index("price")
+    j = cols.index("amount")
+    cols[i], cols[j] = cols[j], cols[i]
+    df = df.select(cols)
+    r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.TRADES)
+    issue = _find(r, "column_order_mismatch")
+    assert issue is not None
+    assert issue.severity == QualitySeverity.ERROR
+    assert issue.count == 1
+
+
 def test_timestamp_errors():
     df = _good_trades_df().with_columns([pl.lit(0).alias(TS_US), pl.lit(None).cast(pl.Int64).alias(LOCAL_TS_US)])
     r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.TRADES)
@@ -150,6 +167,13 @@ def test_raw_source_row_contiguity_error():
     assert _find(r, "raw_source_row_not_contiguous") is not None
 
 
+def test_raw_source_row_null_and_negative_errors():
+    df = _good_trades_df().with_columns(pl.Series(RAW_SOURCE_ROW, [None, -1], dtype=pl.Int64))
+    r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.TRADES)
+    assert _find(r, "null_raw_source_row") is not None
+    assert _find(r, "negative_raw_source_row") is not None
+
+
 def test_duplicate_source_row_error():
     df = _good_trades_df().with_columns(pl.Series(RAW_SOURCE_ROW, [0, 0]))
     r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.TRADES)
@@ -168,10 +192,24 @@ def test_trades_value_checks():
     assert _find(r, "invalid_price") and _find(r, "invalid_amount") and _find(r, "invalid_side_code")
 
 
+def test_trades_null_side_code_is_invalid():
+    df = _good_trades_df().with_columns(pl.Series("side_code", [1, None], dtype=pl.Int8))
+    r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.TRADES)
+    issue = _find(r, "invalid_side_code")
+    assert issue is not None
+    assert issue.count == 1
+
+
 def test_liquidations_value_checks():
     df = _good_liquidations_df().with_columns([pl.lit(0.0).alias("price"), pl.lit(0.0).alias("amount"), pl.lit(99).alias("side_code")])
     r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.LIQUIDATIONS)
     assert _find(r, "invalid_price") and _find(r, "invalid_amount") and _find(r, "invalid_side_code")
+
+
+def test_good_liquidations_have_no_source_type_error():
+    r = analyze_normalized_lazyframe(_good_liquidations_df().lazy(), TardisDataType.LIQUIDATIONS)
+    assert _find(r, "bad_source_data_type") is None
+    assert not r.has_errors
 
 
 def test_incremental_l2_checks_and_snapshot_info():
@@ -179,6 +217,14 @@ def test_incremental_l2_checks_and_snapshot_info():
     r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.INCREMENTAL_BOOK_L2)
     assert _find(r, "invalid_amount") and _find(r, "invalid_book_side_code")
     assert _find(r, "incremental_snapshot_markers").count == 1
+
+
+def test_incremental_l2_null_book_side_code_is_invalid():
+    df = _good_incremental_df().with_columns(pl.Series("book_side_code", [1, None], dtype=pl.Int8))
+    r = analyze_normalized_lazyframe(df.lazy(), TardisDataType.INCREMENTAL_BOOK_L2)
+    issue = _find(r, "invalid_book_side_code")
+    assert issue is not None
+    assert issue.count == 1
 
 
 def test_snapshot_25_quality_checks():
