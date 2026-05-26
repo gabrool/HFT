@@ -108,12 +108,12 @@ class TradeInput:
     event_seq: int = -1
 
     def __post_init__(self) -> None:
-        _require_int(self.local_ts_us, "local_ts_us", positive=True)
-        _require_int(self.ts_us, "ts_us", positive=True)
-        _require_finite_positive_float(self.price, "price")
-        _require_finite_positive_float(self.amount, "amount")
-        _coerce_side_code(self.side_code)
-        _require_int(self.event_seq, "event_seq", allow_minus_one=True)
+        object.__setattr__(self, "local_ts_us", _require_int(self.local_ts_us, "local_ts_us", positive=True))
+        object.__setattr__(self, "ts_us", _require_int(self.ts_us, "ts_us", positive=True))
+        object.__setattr__(self, "price", _require_finite_positive_float(self.price, "price"))
+        object.__setattr__(self, "amount", _require_finite_positive_float(self.amount, "amount"))
+        object.__setattr__(self, "side_code", _coerce_side_code(self.side_code))
+        object.__setattr__(self, "event_seq", _require_int(self.event_seq, "event_seq", allow_minus_one=True))
 
 
 @dataclass(frozen=True, slots=True)
