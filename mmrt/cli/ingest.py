@@ -462,8 +462,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     shutil.rmtree(work_dir)
     summary = {
-        "status": "ok", "dataset_root": str(dataset_root), "dataset_id": manifest.dataset_id, "exchange": manifest.pipeline_config.market.exchange,
-        "symbol": manifest.pipeline_config.market.symbol, "book_data_type": "book_snapshot_25", "trade_data_type": "trades",
+        "status": "ok", "dataset_root": str(dataset_root), "dataset_id": manifest.dataset_id, "exchange": manifest.exchange,
+        "symbol": manifest.symbol, "book_data_type": "book_snapshot_25", "trade_data_type": "trades",
         "manifest_path": str(dataset_root / mf.DEFAULT_MANIFEST_FILENAME), "segments": len(manifest.segments), "rows": manifest.total_rows,
         "decisions_emitted": counters.decisions_emitted, "rows_written": counters.rows_written, "pending_decisions_at_eof": counters.pending_decisions_at_eof,
         "splits_written": bool(manifest.splits), "split_roles": [s.role.value for s in manifest.splits], "work_dir": str(work_dir), "work_dir_removed": True,

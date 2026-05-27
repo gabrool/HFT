@@ -178,7 +178,7 @@ def test_ingest_uses_canonical_market_symbol(tmp_path: Path, capsys):
     cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--symbol", cfg.DEFAULT_SYMBOL.lower(), "--label-horizons-us", "1000", "--label-entry-delay-us", "1"])
     out = json.loads(capsys.readouterr().out.strip())
     man = mf.read_manifest_json(root / "manifest.json")
-    assert man.pipeline_config.market.symbol == cfg.DEFAULT_SYMBOL
+    assert man.symbol == cfg.DEFAULT_SYMBOL
     assert out["symbol"] == cfg.DEFAULT_SYMBOL
 
 
@@ -226,11 +226,16 @@ def test_max_events_counts_only_processed_rows(tmp_path: Path, capsys):
     assert out["rows_written"] == man.total_rows
     assert man.total_rows > 0
     assert man.segments[0].source_files == ("source/book_snapshot_25/000000_book.csv", "source/trades/000000_trades.csv")
+    all_sources = []
     for seg in man.segments:
-        for src in seg.source_files:
-            assert not src.startswith("/")
-            assert "\\" not in src
-            assert src.startswith("source/")
+        all_sources.extend(seg.source_files)
+    assert all_sources
+    assert "source/book_snapshot_25/000000_book.csv" in all_sources
+    assert "source/trades/000000_trades.csv" in all_sources
+    for src in all_sources:
+        assert not src.startswith("/")
+        assert "\\" not in src
+        assert src.startswith("source/")
 
 
 def test_work_dir_removed_on_success(tmp_path: Path, capsys):
