@@ -10,6 +10,7 @@ import shutil
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import polars as pl
 import pyarrow.parquet as pq
 
 from mmrt import config as cfg
@@ -99,20 +100,31 @@ def _resolve_paths(paths: Sequence[str], name: str) -> tuple[Path, ...]:
     return tuple(out)
 
 
-def _build_pipeline_config(args: argparse.Namespace) -> cfg.PipelineConfig:
+def _build_pipeline_config(args: argparse.Namespace, *, exchange: str, symbol: str, label_horizons_us: tuple[int, ...]) -> cfg.PipelineConfig:
     base = cfg.default_config()
     return cfg.PipelineConfig(
-        market=cfg.MarketConfig(exchange=args.exchange, symbol=args.symbol),
+        market=cfg.MarketConfig(exchange=exchange, symbol=symbol),
         data=cfg.DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES), disabled_context_data_types=base.data.disabled_context_data_types),
         decision=cfg.DecisionConfig(policy=base.decision.policy, reason=base.decision.reason, stride_us=args.decision_stride_us),
-        labels=cfg.LabelConfig(horizons_us=_parse_csv_ints(args.label_horizons_us, "label_horizons_us"), entry_delay_us=args.label_entry_delay_us),
+        labels=cfg.LabelConfig(horizons_us=label_horizons_us, entry_delay_us=args.label_entry_delay_us),
         runtime=base.runtime,
         storage=base.storage,
     )
 
 
+def _validate_normalized_market(normalized_file: tc.NormalizedTardisFile, *, exchange: str, symbol: str) -> None:
+    bad = (
+        pl.scan_parquet(str(normalized_file.output_path))
+        .select(["exchange", "symbol"])
+        .filter((pl.col("exchange").is_not_null() & (pl.col("exchange") != exchange)) | (pl.col("symbol").is_not_null() & (pl.col("symbol") != symbol)))
+        .limit(1)
+        .collect()
+    )
+    if bad.height:
+        raise ValueError(f"normalized file market mismatch: path={normalized_file.output_path} expected_exchange={exchange} expected_symbol={symbol} actual={bad.to_dicts()[0]}")
+
+
 def _normalize_input_files(book_csv: tuple[Path, ...], trades_csv: tuple[Path, ...], work_dir: Path, exchange: str, symbol: str) -> tuple[tc.NormalizedTardisFile, ...]:
-    _ = (exchange, symbol)
     out: list[tc.NormalizedTardisFile] = []
     bdir = work_dir / "normalized" / "book_snapshot_25"
     tdir = work_dir / "normalized" / "trades"
@@ -120,10 +132,14 @@ def _normalize_input_files(book_csv: tuple[Path, ...], trades_csv: tuple[Path, .
     tdir.mkdir(parents=True, exist_ok=True)
     for i, src in enumerate(book_csv):
         dst = bdir / f"book_snapshot_25_{i:06d}.parquet"
-        out.append(tc.write_normalized_parquet(src, dst, TardisDataType.BOOK_SNAPSHOT_25, source_file=str(src)))
+        nf = tc.write_normalized_parquet(src, dst, TardisDataType.BOOK_SNAPSHOT_25, source_file=str(src))
+        _validate_normalized_market(nf, exchange=exchange, symbol=symbol)
+        out.append(nf)
     for i, src in enumerate(trades_csv):
         dst = tdir / f"trades_{i:06d}.parquet"
-        out.append(tc.write_normalized_parquet(src, dst, TardisDataType.TRADES, source_file=str(src)))
+        nf = tc.write_normalized_parquet(src, dst, TardisDataType.TRADES, source_file=str(src))
+        _validate_normalized_market(nf, exchange=exchange, symbol=symbol)
+        out.append(nf)
     return tuple(out)
 
 
@@ -218,7 +234,7 @@ def _write_matured_labels(label_results, pending_decisions: dict[int, PendingDec
         if key not in pending_decisions:
             raise KeyError(f"missing pending decision for {key}")
         p = pending_decisions.pop(key)
-        writer.append_values(decision_index=p.decision_index, ts_us=p.ts_us, local_ts_us=p.local_ts_us, event_seq=p.event_seq, raw_mid=p.raw_mid, label_entry_ts_us=int(label.entry_ts_us), label_values=label.values, feature_values=p.feature_values)
+        writer.append_values(decision_index=p.decision_index, ts_us=p.ts_us, local_ts_us=p.local_ts_us, event_seq=p.event_seq, raw_mid=p.raw_mid, label_entry_ts_us=int(label.entry_ts_us), label_values=label.values_bps, feature_values=p.feature_values)
         counters.labels_matured += 1
         counters.rows_written += 1
 
@@ -233,9 +249,9 @@ def _run_causal_ingest(merged_path: Path, writer: wr.DecisionRowWriter, pipeline
     cols = [em.EVENT_TYPE_CODE, em.EVENT_SEQ, tc.TS_US, tc.LOCAL_TS_US, "price", "amount", "side_code", *[f"bid_px_{i:02d}" for i in range(25)], *[f"bid_sz_{i:02d}" for i in range(25)], *[f"ask_px_{i:02d}" for i in range(25)], *[f"ask_sz_{i:02d}" for i in range(25)]]
 
     for row in _iter_record_batch_rows(merged_path, cols, event_batch_size):
-        counters.merged_events_seen += 1
-        if max_events is not None and counters.merged_events_seen > max_events:
+        if max_events is not None and counters.merged_events_seen >= max_events:
             break
+        counters.merged_events_seen += 1
         code = int(row[em.EVENT_TYPE_CODE])
         if code == em.EVENT_TYPE_CODE_TRADE:
             counters.trade_events_seen += 1
@@ -295,9 +311,29 @@ def _patch_manifest_transform_metadata(dataset_root: Path, transform_config: Tra
     return updated
 
 
+
+
+def _split_related_args_supplied(args: argparse.Namespace) -> bool:
+    return any(getattr(args, n) is not None for n in ("split_train", "split_val", "split_test", "purge_before_us", "purge_after_us", "embargo_before_us", "embargo_after_us"))
+
+
+def _validate_split_args(args: argparse.Namespace) -> None:
+    if not _split_related_args_supplied(args):
+        return
+    if args.split_train is None or args.split_val is None:
+        raise ValueError("if any split args are supplied, both --split-train and --split-val are required")
+    _parse_us_range(args.split_train, "split_train")
+    _parse_us_range(args.split_val, "split_val")
+    if args.split_test is not None:
+        _parse_us_range(args.split_test, "split_test")
+    for name in ("purge_before_us", "purge_after_us", "embargo_before_us", "embargo_after_us"):
+        v = getattr(args, name)
+        if v is not None:
+            _require_nonnegative_int(v, name)
+
+
 def _maybe_apply_splits(dataset_root: Path, args: argparse.Namespace):
-    supplied = any(getattr(args, n) is not None for n in ("split_train", "split_val", "split_test", "purge_before_us", "purge_after_us", "embargo_before_us", "embargo_after_us"))
-    if not supplied:
+    if not _split_related_args_supplied(args):
         return None
     if args.split_train is None or args.split_val is None:
         raise ValueError("if any split args are supplied, both --split-train and --split-val are required")
@@ -359,7 +395,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     _require_positive_int(args.min_rows_per_split, "min_rows_per_split")
     if args.max_events is not None:
         _require_positive_int(args.max_events, "max_events")
-    bfa.validate_binance_futures_market(args.exchange, args.symbol)
+    if args.created_at_utc is not None:
+        _require_nonempty_str(args.created_at_utc, "created_at_utc")
+    label_horizons_us = _parse_csv_ints(args.label_horizons_us, "label_horizons_us")
+    _validate_split_args(args)
+    market = bfa.validate_binance_futures_market(args.exchange, args.symbol)
+    exchange = market.exchange
+    symbol = market.symbol
 
     dataset_root = Path(args.dataset_root)
     dataset_root.mkdir(parents=True, exist_ok=True)
@@ -377,16 +419,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise FileExistsError(f"work_dir exists and is not empty: {work_dir}")
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    pipeline_config = _build_pipeline_config(args)
+    pipeline_config = _build_pipeline_config(args, exchange=exchange, symbol=symbol, label_horizons_us=label_horizons_us)
 
-    normalized_files = _normalize_input_files(book_paths, trade_paths, work_dir, args.exchange, args.symbol)
+    normalized_files = _normalize_input_files(book_paths, trade_paths, work_dir, exchange, symbol)
     merged_path = _write_merged_events(normalized_files, work_dir)
 
-    writer_cfg = wr.WriterConfig(dataset_id=_require_nonempty_str(args.dataset_id, "dataset_id"), created_at_utc=args.created_at_utc or _utc_now_iso(), dataset_root=str(dataset_root), config=pipeline_config, chunk_rows=args.chunk_rows, row_group_rows=args.row_group_rows, transform_config=_transform_config_to_dict(TransformConfig()), transform_diagnostics={}, source_files=tuple(str(p) for p in (*book_paths, *trade_paths)), notes={"cli": "mmrt.cli.ingest", "book_data_type": "book_snapshot_25", "trade_data_type": "trades"})
+    writer_cfg = wr.WriterConfig(dataset_id=_require_nonempty_str(args.dataset_id, "dataset_id"), created_at_utc=args.created_at_utc or _utc_now_iso(), dataset_root=str(dataset_root), config=pipeline_config, chunk_rows=args.chunk_rows, row_group_rows=args.row_group_rows, transform_config=_transform_config_to_dict(TransformConfig()), transform_diagnostics={}, source_files=tuple(str(p) for p in (*book_paths, *trade_paths)), notes={"cli": "mmrt.cli.ingest", "book_data_type": "book_snapshot_25", "trade_data_type": "trades", "exchange": exchange, "symbol": symbol})
 
     with wr.DecisionRowWriter(writer_cfg) as writer:
         counters, tcfg, tdiag = _run_causal_ingest(merged_path, writer, pipeline_config, args.event_batch_size, args.max_events)
         manifest = writer.finalize()
+
+    counters.input_book_files = len(book_paths)
+    counters.input_trade_files = len(trade_paths)
+    counters.normalized_files = len(normalized_files)
+    counters.output_segments = len(manifest.segments)
+    counters.output_rows = manifest.total_rows
 
     manifest = _patch_manifest_transform_metadata(dataset_root, tcfg, tdiag, counters)
     split_manifest = _maybe_apply_splits(dataset_root, args)
@@ -396,8 +444,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_output_dataset(dataset_root)
 
     shutil.rmtree(work_dir)
-    counters.output_segments = len(manifest.segments)
-    counters.output_rows = manifest.total_rows
     summary = {
         "status": "ok", "dataset_root": str(dataset_root), "dataset_id": manifest.dataset_id, "exchange": manifest.pipeline_config.market.exchange,
         "symbol": manifest.pipeline_config.market.symbol, "book_data_type": "book_snapshot_25", "trade_data_type": "trades",
