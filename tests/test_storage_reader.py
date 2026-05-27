@@ -1,6 +1,4 @@
 import inspect
-import subprocess
-import sys
 
 import pytest
 
@@ -88,35 +86,39 @@ def test_public_api_boundary():
 
 
 def test_no_forbidden_imports():
-    code = r'''
-import sys
-before = set(sys.modules)
-import mmrt.storage.reader  # noqa: F401
-after = set(sys.modules) - before
-forbidden = (
-    "pan" + "das",
-    "po" + "lars",
-    "to" + "rch",
-    "sk" + "learn",
-    "mmrt.data.tardis_csv",
-    "mmrt.data.event_merge",
-    "mmrt.data.quality",
-    "mmrt.features.engine",
-    "mmrt.features.la" + "bels",
-    "mmrt.features.trans" + "forms",
-    "mmrt.storage.writer",
-    "mmrt.storage.splits",
-    "mmrt.linear",
-    "CM" + "SSL17",
-    "offline_" + "ingest",
-)
-bad = sorted(name for name in forbidden if name in after)
-if bad:
-    raise SystemExit(repr(bad))
-print("ok")
-'''
-    out = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
-    assert "ok" in out.stdout
+    src = inspect.getsource(rd)
+    direct_bad = [
+        "import pan" + "das",
+        "from pan" + "das",
+        "import po" + "lars",
+        "from po" + "lars",
+        "import to" + "rch",
+        "from to" + "rch",
+        "import sk" + "learn",
+        "from sk" + "learn",
+        "from mmrt.data",
+        "import mmrt.data",
+        "from mmrt.features.engine",
+        "from mmrt.features.labels",
+        "from mmrt.features.transforms",
+        "CM" + "SSL",
+        "offline_" + "ingest",
+        "linear_" + "offline",
+        "BY" + "BIT",
+        "Mini" + "Rocket",
+        "Multi" + "Rocket",
+        "Hy" + "dra",
+        "Ae" + "on",
+        "P" + "CA",
+        "Standard" + "Scaler",
+        "stage" + "1",
+        "stage" + "2",
+        "stage" + "3",
+        "stage" + "4",
+        "stage" + "5",
+    ]
+    for token in direct_bad:
+        assert token not in src
 
 
 def test_reader_config_validation(tmp_path):

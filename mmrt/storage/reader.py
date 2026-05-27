@@ -312,8 +312,13 @@ class StorageDatasetReader:
                 batch_size=bs,
             )
             for batch in scanner.to_batches():
+                if batch.num_rows == 0:
+                    continue
                 if drop_internal_row_idx:
-                    yield _select_record_batch_columns(batch, requested_cols)
+                    out = _select_record_batch_columns(batch, requested_cols)
+                    if out.num_rows == 0:
+                        continue
+                    yield out
                 else:
                     yield batch
 

@@ -179,7 +179,9 @@ def chronological_windows(*, train: tuple[int, int], val: tuple[int, int], test:
     ]
     if test is not None:
         windows.append(SplitWindow(role=SplitRole.TEST, start_local_ts_us=test[0], end_local_ts_us=test[1]))
-    return tuple(windows)
+    out = tuple(windows)
+    _assert_nonoverlapping_windows(out)
+    return out
 
 
 def build_split_plan(dataset_root: str, config: SplitConfig) -> SplitPlan:

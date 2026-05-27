@@ -100,6 +100,22 @@ def _resolve_paths(paths: Sequence[str], name: str) -> tuple[Path, ...]:
     return tuple(out)
 
 
+
+
+def _safe_posix_leaf(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name.strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or "input.csv"
+
+
+def _safe_manifest_source_files(book_paths: Sequence[Path], trade_paths: Sequence[Path]) -> tuple[str, ...]:
+    out: list[str] = []
+    for i, p in enumerate(book_paths):
+        out.append(f"source/book_snapshot_25/{i:06d}_{_safe_posix_leaf(p.name)}")
+    for i, p in enumerate(trade_paths):
+        out.append(f"source/trades/{i:06d}_{_safe_posix_leaf(p.name)}")
+    return tuple(out)
+
 def _build_pipeline_config(args: argparse.Namespace, *, exchange: str, symbol: str, label_horizons_us: tuple[int, ...]) -> cfg.PipelineConfig:
     base = cfg.default_config()
     return cfg.PipelineConfig(
@@ -426,7 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     normalized_files = _normalize_input_files(book_paths, trade_paths, work_dir, exchange, symbol)
     merged_path = _write_merged_events(normalized_files, work_dir)
 
-    writer_cfg = wr.WriterConfig(dataset_id=_require_nonempty_str(args.dataset_id, "dataset_id"), created_at_utc=args.created_at_utc or _utc_now_iso(), dataset_root=str(dataset_root), config=pipeline_config, chunk_rows=args.chunk_rows, row_group_rows=args.row_group_rows, transform_config=_transform_config_to_dict(TransformConfig()), transform_diagnostics={}, source_files=tuple(str(p) for p in (*book_paths, *trade_paths)), notes={"cli": "mmrt.cli.ingest", "book_data_type": "book_snapshot_25", "trade_data_type": "trades"})
+    writer_cfg = wr.WriterConfig(dataset_id=_require_nonempty_str(args.dataset_id, "dataset_id"), created_at_utc=args.created_at_utc or _utc_now_iso(), dataset_root=str(dataset_root), config=pipeline_config, chunk_rows=args.chunk_rows, row_group_rows=args.row_group_rows, transform_config=_transform_config_to_dict(TransformConfig()), transform_diagnostics={}, source_files=_safe_manifest_source_files(book_paths, trade_paths), notes={"cli": "mmrt.cli.ingest", "book_data_type": "book_snapshot_25", "trade_data_type": "trades"})
 
     with wr.DecisionRowWriter(writer_cfg) as writer:
         counters, tcfg, tdiag = _run_causal_ingest(merged_path, writer, pipeline_config, args.event_batch_size, args.max_events)
