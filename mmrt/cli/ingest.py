@@ -389,6 +389,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("cli.ingest v1 supports only book_snapshot_25 book inputs")
     _require_positive_int(args.event_batch_size, "event_batch_size")
     _require_positive_int(args.chunk_rows, "chunk_rows")
+    if args.decision_stride_us != cfg.DEFAULT_DECISION_STRIDE_US:
+        raise ValueError("decision_stride_us must be 500_000 for cli.ingest v1")
     _require_positive_int(args.row_group_rows, "row_group_rows")
     _require_positive_int(args.decision_stride_us, "decision_stride_us")
     _require_nonnegative_int(args.label_entry_delay_us, "label_entry_delay_us")
