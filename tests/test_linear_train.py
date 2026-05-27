@@ -214,7 +214,7 @@ def test_result_dataclass_validation():
 
 def test_no_old_pipeline_residue():
     source = inspect.getsource(tr)
-    for bad in ["BY" + "BIT", "CM" + "SSL", "offline_" + "ingest", "stage" + "1", "Mini" + "Rocket", "Multi" + "Rocket", "Hy" + "dra", "Ae" + "on", "sklearn", "torch", "pandas", "polars", "PCA"]:
+    for bad in ["BY" + "BIT", "CM" + "SSL", "offline_" + "ingest", "stage" + "1", "Mini" + "Rocket", "Multi" + "Rocket", "Hy" + "dra", "Ae" + "on", "sk" + "learn", "to" + "rch", "pan" + "das", "po" + "lars", "P" + "CA"]:
         assert bad not in source
 
 

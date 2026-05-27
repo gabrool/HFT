@@ -12,6 +12,7 @@ import json
 from typing import Sequence
 
 import numpy as np
+import pyarrow as pa
 
 from mmrt.contracts import SplitRole
 from mmrt.storage import manifest as mf
@@ -249,7 +250,12 @@ def _column_projection(manifest: mf.StorageManifest, extractor: ex.IdentityFeatu
 
 
 def _split_batches(reader: rd.StorageDatasetReader, role: SplitRole | str, columns: Sequence[str], batch_size: int):
-    yield from reader.iter_split_batches(role, columns=tuple(columns), batch_size=batch_size)
+    for batch in reader.iter_split_batches(role, columns=tuple(columns), batch_size=batch_size):
+        if not isinstance(batch, pa.RecordBatch):
+            raise ValueError("reader.iter_split_batches must yield pyarrow.RecordBatch")
+        if batch.num_rows == 0:
+            continue
+        yield pa.Table.from_batches([batch])
 
 
 def fit_preprocessor_from_train_split(reader: rd.StorageDatasetReader, *, manifest: mf.StorageManifest, config: LinearTrainConfig) -> pp.LinearPreprocessState:
