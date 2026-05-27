@@ -34,7 +34,13 @@ def _write_csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
             w.writerows(rows)
 
 
-def _book_trade_files(tmp_path: Path, n_book: int = 8, n_trade: int = 4, symbol: str = cfg.DEFAULT_SYMBOL):
+def _book_trade_files(
+    tmp_path: Path,
+    n_book: int = 8,
+    n_trade: int = 4,
+    symbol: str = cfg.DEFAULT_SYMBOL,
+    step_us: int = cfg.DEFAULT_DECISION_STRIDE_US,
+):
     b_schema = tardis_csv_schema(TardisDataType.BOOK_SNAPSHOT_25)
     t_schema = tardis_csv_schema(TardisDataType.TRADES)
     bh = list(b_schema.column_names)
@@ -47,8 +53,8 @@ def _book_trade_files(tmp_path: Path, n_book: int = 8, n_trade: int = 4, symbol:
         for c in bh:
             if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
             elif c == "symbol": row.append(symbol)
-            elif c == "timestamp": row.append(1_000_000 + i * 1_000)
-            elif c == "local_timestamp": row.append(1_000_000 + i * 1_000)
+            elif c == "timestamp": row.append(1_000_000 + i * step_us)
+            elif c == "local_timestamp": row.append(1_000_000 + i * step_us)
             elif c.startswith("asks[") and c.endswith("].price"):
                 lvl = int(c.split("[")[1].split("]")[0]); row.append(100.1 + lvl * 0.1 + i * 0.01)
             elif c.startswith("asks[") and c.endswith("].amount"):
@@ -66,8 +72,8 @@ def _book_trade_files(tmp_path: Path, n_book: int = 8, n_trade: int = 4, symbol:
         for c in th:
             if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
             elif c == "symbol": row.append(symbol)
-            elif c == "timestamp": row.append(1_000_000 + i * 1_000)
-            elif c == "local_timestamp": row.append(1_000_000 + i * 1_000)
+            elif c == "timestamp": row.append(1_000_000 + i * step_us)
+            elif c == "local_timestamp": row.append(1_000_000 + i * step_us)
             elif c == "price": row.append(100.0 + i * 0.01)
             elif c == "amount": row.append(0.5)
             elif c == "side": row.append("buy" if i % 2 == 0 else "sell")
@@ -84,7 +90,7 @@ def _run_ok(tmp_path: Path, capsys, *extra: str):
     root = tmp_path / "ds"
     rc = cli.main([
         "--dataset-root", str(root), "--dataset-id", "tiny", "--book-csv", str(b), "--trades-csv", str(t),
-        "--label-horizons-us", "1000", "--label-entry-delay-us", "1", "--decision-stride-us", "500", "--event-batch-size", "2",
+        "--label-horizons-us", "1000", "--label-entry-delay-us", "1", "--event-batch-size", "2",
         "--chunk-rows", "2", "--row-group-rows", "2", *extra,
     ])
     assert rc == 0
@@ -120,6 +126,7 @@ def test_parser_defaults(tmp_path: Path):
     assert args.symbol == cfg.DEFAULT_SYMBOL
     assert args.book_data_type == "book_snapshot_25"
     assert args.validate_output is True
+    assert args.decision_stride_us == cfg.DEFAULT_DECISION_STRIDE_US
 
 
 def test_reject_unsupported_book_data_type(tmp_path: Path):
@@ -132,6 +139,22 @@ def test_rejects_other_unsupported_book_type(tmp_path: Path):
     b, t = _book_trade_files(tmp_path)
     with pytest.raises(ValueError, match="supports only book_snapshot_25"):
         cli.main(["--dataset-root", str(tmp_path / "ds"), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--book-data-type", "book_snapshot_5"])
+
+
+def test_rejects_non_default_decision_stride(tmp_path: Path):
+    b, t = _book_trade_files(tmp_path)
+    root, wd = tmp_path / "ds", tmp_path / "wd"
+    with pytest.raises(ValueError, match="500_000"):
+        cli.main([
+            "--dataset-root", str(root),
+            "--dataset-id", "x",
+            "--book-csv", str(b),
+            "--trades-csv", str(t),
+            "--decision-stride-us", "500",
+            "--work-dir", str(wd),
+        ])
+    assert not (root / "manifest.json").exists()
+    assert not wd.exists()
 
 
 def test_parse_us_range():
@@ -152,7 +175,7 @@ def test_no_stale_imports_source_residue():
 def test_ingest_uses_canonical_market_symbol(tmp_path: Path, capsys):
     b, t = _book_trade_files(tmp_path)
     root = tmp_path / "ds"
-    cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--symbol", cfg.DEFAULT_SYMBOL.lower(), "--label-horizons-us", "1000", "--label-entry-delay-us", "1", "--decision-stride-us", "500"])
+    cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--symbol", cfg.DEFAULT_SYMBOL.lower(), "--label-horizons-us", "1000", "--label-entry-delay-us", "1"])
     out = json.loads(capsys.readouterr().out.strip())
     man = mf.read_manifest_json(root / "manifest.json")
     assert man.pipeline_config.market.symbol == cfg.DEFAULT_SYMBOL
@@ -190,7 +213,6 @@ def test_max_events_counts_only_processed_rows(tmp_path: Path, capsys):
         "--max-events", "18",
         "--label-horizons-us", "1000",
         "--label-entry-delay-us", "1",
-        "--decision-stride-us", "500",
         "--event-batch-size", "2",
         "--chunk-rows", "2",
         "--row-group-rows", "2",
@@ -222,7 +244,7 @@ def test_work_dir_preserved_on_failure(tmp_path: Path):
 
 
 def test_end_to_end_with_explicit_splits(tmp_path: Path, capsys):
-    root, out = _run_ok(tmp_path, capsys, "--split-train", "1000000:1007000", "--split-val", "1007000:1012000")
+    root, out = _run_ok(tmp_path, capsys, "--split-train", "1000000:3500000", "--split-val", "3500000:6500000")
     man = mf.read_manifest_json(root / "manifest.json")
     roles = {s.role.value for s in man.splits}
     assert "train" in roles and "val" in roles
@@ -242,7 +264,7 @@ def test_reject_partial_split_args(tmp_path: Path):
 def test_pending_eof_decisions_are_not_force_labeled(tmp_path: Path, capsys):
     b, t = _book_trade_files(tmp_path, n_book=12, n_trade=8)
     root = tmp_path / "ds"
-    cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--label-horizons-us", "3000", "--label-entry-delay-us", "1", "--decision-stride-us", "500"])
+    cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--label-horizons-us", "1500000", "--label-entry-delay-us", "1"])
     out = json.loads(capsys.readouterr().out.strip())
     assert out["pending_decisions_at_eof"] > 0
     assert out["rows_written"] < out["decisions_emitted"]
