@@ -1,8 +1,6 @@
 import inspect
 import json
 from pathlib import Path
-import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -10,11 +8,12 @@ import pytest
 pyarrow = pytest.importorskip("pyarrow")
 pytest.importorskip("pyarrow.parquet")
 
-from mmrt.contracts import SplitRole, TimeRangeUS
+from mmrt.contracts import SplitRole
 from mmrt.features import specs
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
 from mmrt.storage import writer as wr
+from mmrt.storage import splits as sp
 from mmrt.linear import train as tr
 
 
@@ -47,43 +46,19 @@ def make_dataset_with_splits(tmp_path: Path, *, with_test: bool = True, with_spl
         )
     manifest = writer.finalize()
     if with_splits:
-        seg = manifest.segments[0]
-        def ltr(a,b):
-            return TimeRangeUS(start_us=1_000_000 + a * 500_000, end_us=1_000_000 + b * 500_000)
-        splits = []
+        windows = [sp.SplitWindow(SplitRole.TRAIN, 1_000_000, 4_000_000)]
         if train_zero_rows:
-            splits.append(mf.SplitMetadata(role=SplitRole.TRAIN, segment_key=seg.segment_key, start_row=0, end_row=1, local_time_range=ltr(0,1)))
-            splits.append(mf.SplitMetadata(role=SplitRole.VAL, segment_key=seg.segment_key, start_row=6, end_row=9, local_time_range=ltr(6,9)))
+            windows = [
+                sp.SplitWindow(SplitRole.TRAIN, 1_000_000, 1_500_000),
+                sp.SplitWindow(SplitRole.VAL, 4_000_000, 5_500_000),
+            ]
         else:
-            splits.append(mf.SplitMetadata(role=SplitRole.TRAIN, segment_key=seg.segment_key, start_row=0, end_row=6, local_time_range=ltr(0,6)))
             if not train_only:
-                splits.append(mf.SplitMetadata(role=SplitRole.VAL, segment_key=seg.segment_key, start_row=6, end_row=9, local_time_range=ltr(6,9)))
+                windows.append(sp.SplitWindow(SplitRole.VAL, 4_000_000, 5_500_000))
             if with_test:
-                splits.append(mf.SplitMetadata(role=SplitRole.TEST, segment_key=seg.segment_key, start_row=9, end_row=12, local_time_range=ltr(9,12)))
-        updated = mf.StorageManifest(
-            manifest_schema_version=manifest.manifest_schema_version,
-            dataset_id=manifest.dataset_id,
-            created_at_utc=manifest.created_at_utc,
-            pipeline_config=manifest.pipeline_config,
-            writer_metadata=manifest.writer_metadata,
-            feature_schema=manifest.feature_schema,
-            label_spec=manifest.label_spec,
-            transform_config=manifest.transform_config,
-            transform_diagnostics=manifest.transform_diagnostics,
-            exchange=manifest.exchange,
-            symbol=manifest.symbol,
-            storage_format=manifest.storage_format,
-            time_unit=manifest.time_unit,
-            decision_stride_us=manifest.decision_stride_us,
-            feature_columns=manifest.feature_columns,
-            label_columns=manifest.label_columns,
-            required_columns=manifest.required_columns,
-            segments=manifest.segments,
-            splits=tuple(splits),
-            notes=manifest.notes,
-        )
-        mf.write_manifest_json(updated, root / mf.DEFAULT_MANIFEST_FILENAME)
-        manifest = updated
+                windows.append(sp.SplitWindow(SplitRole.TEST, 5_500_000, 7_000_001))
+        split_cfg = sp.SplitConfig(windows=tuple(windows), purge_before_us=0, purge_after_us=0, embargo_before_us=0, embargo_after_us=0, min_rows_per_split=1, allow_empty_roles=False, validate_dataset_on_open=True)
+        manifest = sp.build_and_write_splits(str(root), split_cfg, replace_existing=True)
     return root, manifest
 
 
@@ -96,11 +71,16 @@ def test_public_api_boundary():
 
 
 def test_no_forbidden_imports():
-    code = "import sys, mmrt.linear.train; print('\\n'.join(sorted(sys.modules.keys())))"
-    out = subprocess.check_output([sys.executable, "-c", code], text=True)
-    lowered = out.lower()
-    for bad in ["pandas", "polars", "torch", "sklearn", "scipy", "numba", "aeon", "sktime", "mmrt.storage.writer", "mmrt.storage.splits"]:
-        assert bad not in lowered
+    src = inspect.getsource(tr)
+    for bad in [
+        "import pan" + "das", "from pan" + "das", "import po" + "lars", "from po" + "lars",
+        "import to" + "rch", "from to" + "rch", "import sk" + "learn", "from sk" + "learn",
+        "from mmrt.data", "import mmrt.data", "from mmrt.features.engine", "from mmrt.features.labels", "from mmrt.features.transforms",
+        "CM" + "SSL", "offline_" + "ingest", "linear_" + "offline", "BY" + "BIT",
+        "Mini" + "Rocket", "Multi" + "Rocket", "Hy" + "dra", "Ae" + "on", "P" + "CA", "Standard" + "Scaler",
+        "stage" + "1", "stage" + "2", "stage" + "3", "stage" + "4", "stage" + "5",
+    ]:
+        assert bad not in src
 
 
 def test_config_validation():

@@ -129,7 +129,7 @@ def test_writer_writes_single_segment_and_manifest(tmp_path):
     assert seg.first_row_idx == 0 and seg.last_row_idx == 2
     assert seg.source_files == ("raw/day.csv.gz",)
     table = pq.read_table(tmp_path / "d" / seg.parquet_path)
-    assert table.names == list(m.required_columns)
+    assert table.column_names == list(m.required_columns)
     assert table.column("row_idx").to_pylist() == [0, 1, 2]
 
 

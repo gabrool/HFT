@@ -109,7 +109,7 @@ def test_write_matured_labels_uses_values_bps():
             self.kwargs = kwargs
 
     pending = {10: cli.PendingDecision(1, 10, 10, 1, 100.0, (0.1,))}
-    label = LabelResult(decision_ts_us=10, entry_ts_us=11, target_ts_us=(12,), values_bps=(1.0, 2.0, 3.0))
+    label = LabelResult(decision_ts_us=10, entry_ts_us=11, horizons_us=(12, 13, 14), values_bps=(1.0, 2.0, 3.0))
     counters = cli.IngestCounters()
     w = W()
     cli._write_matured_labels([label], pending, w, counters)
@@ -225,6 +225,12 @@ def test_max_events_counts_only_processed_rows(tmp_path: Path, capsys):
     assert man.notes["ingest_counters"]["merged_events_seen"] == 18
     assert out["rows_written"] == man.total_rows
     assert man.total_rows > 0
+    assert man.segments[0].source_files == ("source/book_snapshot_25/000000_book.csv", "source/trades/000000_trades.csv")
+    for seg in man.segments:
+        for src in seg.source_files:
+            assert not src.startswith("/")
+            assert "\\" not in src
+            assert src.startswith("source/")
 
 
 def test_work_dir_removed_on_success(tmp_path: Path, capsys):

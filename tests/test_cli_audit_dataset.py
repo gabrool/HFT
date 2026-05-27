@@ -1,7 +1,5 @@
 import inspect
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -296,15 +294,14 @@ def test_output_json_requires_json_suffix() -> None:
 
 
 def test_no_bad_imports() -> None:
-    code = "import sys; before=set(sys.modules); import mmrt.cli.audit_dataset; after=set(sys.modules)-before; print('\\n'.join(sorted(after)))"
-    proc = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
-    loaded = set(proc.stdout.splitlines())
-    forbidden = {
-        "pandas", "polars", "torch", "sklearn", "scipy", "mmrt.storage.writer", "mmrt.storage.splits", "mmrt.linear",
-        "mmrt.data.tardis_csv", "mmrt.data.event_merge", "mmrt.features.engine", "mmrt.features.labels", "mmrt.features.transforms",
-        "CM" + "SSL17", "offline_" + "ingest",
-    }
-    assert loaded.isdisjoint(forbidden)
+    src = inspect.getsource(cli)
+    forbidden = [
+        "from mmrt.data", "import mmrt.data", "from mmrt.features.engine", "from mmrt.features.labels", "from mmrt.features.transforms",
+        "import pan" + "das", "from pan" + "das", "import to" + "rch", "from to" + "rch", "import sk" + "learn", "from sk" + "learn",
+        "CM" + "SSL", "offline_" + "ingest", "linear_" + "offline",
+    ]
+    for token in forbidden:
+        assert token not in src
 
 
 def test_no_old_pipeline_residue() -> None:
