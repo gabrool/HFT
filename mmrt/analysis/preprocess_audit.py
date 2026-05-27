@@ -74,7 +74,7 @@ def _require_bool(value: bool, name: str) -> bool:
 def _require_non_empty_str(value: str, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty str")
-    return value
+    return value.strip()
 
 
 def _require_finite_float(value: float, name: str, *, allow_nan: bool = False) -> float:
@@ -295,6 +295,10 @@ class PreprocessSplitSummary:
         _require_nonnegative_int(self.manifest_row_count, "manifest_row_count")
         _require_nonnegative_int(self.scanned_rows, "scanned_rows")
         _require_nonnegative_int(self.sampled_rows, "sampled_rows")
+        if self.sampled_rows > self.scanned_rows:
+            raise ValueError("sampled_rows must be <= scanned_rows")
+        if self.scanned_rows > self.manifest_row_count:
+            raise ValueError("scanned_rows must be <= manifest_row_count")
         if self.sample_stride is not None:
             _require_positive_int(self.sample_stride, "sample_stride")
         _require_positive_int(self.n_features, "n_features")
@@ -309,7 +313,9 @@ class PreprocessSplitSummary:
             "features_drift_review_count",
             "features_not_binding_count",
         ):
-            _require_nonnegative_int(getattr(self, name), name)
+            value = _require_nonnegative_int(getattr(self, name), name)
+            if value > self.n_features:
+                raise ValueError(f"{name} must be <= n_features")
 
         for name in (
             "max_clip_total_rate",
@@ -348,6 +354,12 @@ class PreprocessAuditResult:
             raise ValueError("preprocess_state must be dict")
         if not isinstance(self.splits, dict):
             raise ValueError("splits must be dict")
+        for key, value in self.splits.items():
+            _role_to_str(key)
+            if not isinstance(value, PreprocessSplitSummary):
+                raise ValueError("splits values must be PreprocessSplitSummary")
+            if value.split != key:
+                raise ValueError("split summary key must match split")
         if not {"train", "val"}.issubset(set(self.splits.keys())):
             raise ValueError("splits must include train and val")
         if not set(self.splits.keys()).issubset(set(ALLOWED_SPLITS)):
@@ -583,7 +595,11 @@ def _audit_split(
         inactive_count=int(np.sum(~preprocess_state.active_mask)),
         features_clip_review_count=sum(record.status == "clip_review" for record in feature_records),
         features_clip_excessive_count=sum(record.status == "clip_excessive" for record in feature_records),
-        features_drift_review_count=sum(record.status == "drift_review" for record in feature_records),
+        features_drift_review_count=sum(
+            record.status == "drift_review"
+            or record.recommendation == "review_clip_z_and_drift"
+            for record in feature_records
+        ),
         features_not_binding_count=sum(
             (record.z_pre_abs_p99 < CLIP_NOT_BINDING_ABS_Z_FRACTION * clip_z)
             if np.isfinite(record.z_pre_abs_p99)
@@ -606,7 +622,7 @@ def run_preprocess_audit(
     *,
     config: PreprocessAuditConfig | None = None,
 ) -> PreprocessAuditResult:
-    _require_non_empty_str(dataset_root, "dataset_root")
+    dataset_root = _require_non_empty_str(dataset_root, "dataset_root")
     cfg = config if config is not None else PreprocessAuditConfig()
 
     reader = rd.open_dataset(

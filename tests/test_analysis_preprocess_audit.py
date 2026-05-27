@@ -100,6 +100,20 @@ def test_clip_detection(tmp_path: Path):
     assert v0.recommendation in {"review_clip_z", "review_clip_z_and_drift"}
 
 
+def test_clip_and_drift_counts_as_drift_warning(tmp_path: Path):
+    root = tmp_path / "clip_and_drift"
+    _write_ds(root, train_rows=100, val_rows=100, shift=10_000.0, clip=True)
+
+    out = pa.run_preprocess_audit(str(root))
+
+    v0 = [record for record in out.feature_records if record.split == "val" and record.feature_index == 0][0]
+    assert v0.clip_total_rate > 0
+    assert v0.recommendation == "review_clip_z_and_drift"
+
+    assert out.splits["val"].features_drift_review_count > 0
+    assert "drift_review:val" in out.warnings
+
+
 def test_inactive_detection(tmp_path: Path):
     root = tmp_path / "inactive"
     _write_ds(root, constant=True)
@@ -150,3 +164,49 @@ def test_result_json_excludes_feature_records(tmp_path: Path):
     out = pa.run_preprocess_audit(str(root))
     payload = out.as_dict()
     assert "feature_records" not in payload
+
+
+def test_split_summary_rejects_sampled_rows_above_scanned_rows():
+    with pytest.raises(ValueError):
+        pa.PreprocessSplitSummary(
+            split="train",
+            manifest_row_count=10,
+            scanned_rows=5,
+            sampled_rows=6,
+            sample_stride=1,
+            n_features=2,
+            active_count=2,
+            inactive_count=0,
+            features_clip_review_count=0,
+            features_clip_excessive_count=0,
+            features_drift_review_count=0,
+            features_not_binding_count=0,
+            max_clip_total_rate=0.0,
+            median_clip_total_rate=0.0,
+            max_near_clip_rate=0.0,
+            max_abs_drift_mean_z=0.0,
+            min_drift_std_ratio=1.0,
+            max_drift_std_ratio=1.0,
+        )
+
+
+def test_result_rejects_malformed_split_values(tmp_path: Path):
+    root = tmp_path / "result_validation"
+    _write_ds(root)
+    out = pa.run_preprocess_audit(str(root))
+
+    bad_splits = dict(out.splits)
+    bad_splits["train"] = {"not": "a split summary"}
+
+    with pytest.raises(ValueError):
+        pa.PreprocessAuditResult(
+            schema_version=pa.PREPROCESS_AUDIT_SCHEMA_VERSION,
+            dataset_root=out.dataset_root,
+            dataset_id=out.dataset_id,
+            manifest_hash=out.manifest_hash,
+            config=out.config,
+            preprocess_state=out.preprocess_state,
+            splits=bad_splits,
+            feature_records=out.feature_records,
+            warnings=out.warnings,
+        )
