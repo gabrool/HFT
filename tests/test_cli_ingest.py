@@ -118,6 +118,8 @@ def test_parser_defaults(tmp_path: Path):
     args = cli.build_arg_parser().parse_args(["--dataset-root", str(tmp_path / "ds"), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t)])
     assert args.exchange == cfg.DEFAULT_EXCHANGE
     assert args.symbol == cfg.DEFAULT_SYMBOL
+    assert args.book_data_type == "book_snapshot_25"
+    assert args.validate_output is True
 
 
 def test_reject_unsupported_book_data_type(tmp_path: Path):
@@ -134,6 +136,9 @@ def test_rejects_other_unsupported_book_type(tmp_path: Path):
 
 def test_parse_us_range():
     assert cli._parse_us_range("100:200", "x") == (100, 200)
+    for bad in ["200:100", "abc:200", "100", "100:200:300"]:
+        with pytest.raises(ValueError):
+            cli._parse_us_range(bad, "x")
 
 
 def test_no_stale_imports_source_residue():
@@ -173,19 +178,31 @@ def test_manifest_notes_include_complete_ingest_counters(tmp_path: Path, capsys)
     assert c["rows_written"] == man.total_rows
 
 
-def test_max_events_counts_only_processed_rows(monkeypatch, tmp_path):
-    b, t = _book_trade_files(tmp_path)
+def test_max_events_counts_only_processed_rows(tmp_path: Path, capsys):
+    b, t = _book_trade_files(tmp_path, n_book=12, n_trade=8)
     root = tmp_path / "ds"
-    orig = cli._iter_record_batch_rows
 
-    def wrapped(*args, **kwargs):
-        yield from orig(*args, **kwargs)
+    rc = cli.main([
+        "--dataset-root", str(root),
+        "--dataset-id", "x",
+        "--book-csv", str(b),
+        "--trades-csv", str(t),
+        "--max-events", "18",
+        "--label-horizons-us", "1000",
+        "--label-entry-delay-us", "1",
+        "--decision-stride-us", "500",
+        "--event-batch-size", "2",
+        "--chunk-rows", "2",
+        "--row-group-rows", "2",
+    ])
 
-    monkeypatch.setattr(cli, "_iter_record_batch_rows", wrapped)
-    with pytest.raises(ValueError):
-        cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--max-events", "2", "--label-horizons-us", "1000"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out.strip())
     man = mf.read_manifest_json(root / "manifest.json")
-    assert man.notes["ingest_counters"]["merged_events_seen"] == 2
+
+    assert man.notes["ingest_counters"]["merged_events_seen"] == 18
+    assert out["rows_written"] == man.total_rows
+    assert man.total_rows > 0
 
 
 def test_work_dir_removed_on_success(tmp_path: Path, capsys):
@@ -262,5 +279,13 @@ def test_existing_segments_fail_before_work(tmp_path: Path):
 
 
 def test_subprocess_help_entrypoint():
-    p = subprocess.run([sys.executable, "-m", "mmrt.cli.ingest", "--help"], capture_output=True, text=True)
+    p = subprocess.run(
+        [sys.executable, "-m", "mmrt.cli.ingest", "--help"],
+        capture_output=True,
+        text=True,
+    )
     assert p.returncode == 0
+    assert "--dataset-root" in p.stdout
+    assert "--book-csv" in p.stdout
+    assert "--trades-csv" in p.stdout
+    assert "--split-train" in p.stdout
