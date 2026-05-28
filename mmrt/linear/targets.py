@@ -18,7 +18,7 @@ import pyarrow as pa
 from mmrt.storage import manifest as mf
 
 DEFAULT_TARGET_HORIZON_US = 1_000_000
-DEFAULT_DIRECTION_DEADBAND_BPS = 0.0
+DEFAULT_MOVE_DEADBAND_BPS = 0.0
 DEFAULT_TARGET_DTYPE = "float32"
 ALLOWED_TARGET_DTYPES = ("float32", "float64")
 
@@ -62,15 +62,15 @@ def _coerce_return_vector(values: np.ndarray, *, dtype: np.dtype, name: str = "r
 @dataclass(frozen=True, slots=True)
 class LinearTargetConfig:
     target_horizon_us: int = DEFAULT_TARGET_HORIZON_US
-    direction_deadband_bps: float = DEFAULT_DIRECTION_DEADBAND_BPS
+    move_deadband_bps: float = DEFAULT_MOVE_DEADBAND_BPS
     output_dtype: str = DEFAULT_TARGET_DTYPE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_horizon_us", _require_positive_int(self.target_horizon_us, "target_horizon_us"))
         object.__setattr__(
             self,
-            "direction_deadband_bps",
-            _require_nonnegative_finite_float(self.direction_deadband_bps, "direction_deadband_bps"),
+            "move_deadband_bps",
+            _require_nonnegative_finite_float(self.move_deadband_bps, "move_deadband_bps"),
         )
         object.__setattr__(self, "output_dtype", _require_output_dtype(self.output_dtype))
 
@@ -81,16 +81,20 @@ class LinearTargetConfig:
 
 @dataclass(frozen=True, slots=True)
 class LinearTargetBatch:
-    return_bps: np.ndarray
+    y_return_bps: np.ndarray
+    y_no_move: np.ndarray
     y_direction: np.ndarray
-    direction_mask: np.ndarray
     y_magnitude_up: np.ndarray
     y_magnitude_down: np.ndarray
+    no_move_mask: np.ndarray
+    move_mask: np.ndarray
+    up_move_mask: np.ndarray
+    down_move_mask: np.ndarray
     target_column: str
     horizon_us: int
 
     def __post_init__(self) -> None:
-        ret = np.asarray(self.return_bps)
+        ret = np.asarray(self.y_return_bps)
         if ret.ndim != 1 or ret.dtype.name not in ALLOWED_TARGET_DTYPES or not ret.flags.c_contiguous or not np.isfinite(ret).all():
             raise ValueError("return_bps must be 1D contiguous finite float32/float64")
 
@@ -100,11 +104,29 @@ class LinearTargetBatch:
         if not np.isin(y_dir, np.array([DIRECTION_INVALID_CLASS, DIRECTION_DOWN_CLASS, DIRECTION_UP_CLASS], dtype=np.int8)).all():
             raise ValueError("y_direction has invalid class values")
 
-        dmask = np.asarray(self.direction_mask)
-        if dmask.ndim != 1 or dmask.dtype != np.bool_ or dmask.shape[0] != ret.shape[0]:
-            raise ValueError("direction_mask must be 1D bool with matching length")
-        if not np.array_equal(dmask, y_dir != DIRECTION_INVALID_CLASS):
-            raise ValueError("direction_mask inconsistent with y_direction")
+        y_no_move = np.asarray(self.y_no_move)
+        if y_no_move.ndim != 1 or y_no_move.shape[0] != ret.shape[0]:
+            raise ValueError("y_no_move must be 1D with matching length")
+        if not np.isin(y_no_move, np.array([0.0, 1.0], dtype=y_no_move.dtype)).all():
+            raise ValueError("y_no_move must be binary 0/1")
+
+        no_move_mask = np.asarray(self.no_move_mask)
+        move_mask = np.asarray(self.move_mask)
+        up_move_mask = np.asarray(self.up_move_mask)
+        down_move_mask = np.asarray(self.down_move_mask)
+        for arr, name in ((no_move_mask, "no_move_mask"), (move_mask, "move_mask"), (up_move_mask, "up_move_mask"), (down_move_mask, "down_move_mask")):
+            if arr.ndim != 1 or arr.dtype != np.bool_ or arr.shape[0] != ret.shape[0]:
+                raise ValueError(f"{name} must be 1D bool with matching length")
+        if not np.array_equal(no_move_mask, ~move_mask):
+            raise ValueError("no_move_mask must equal ~move_mask")
+        if not np.array_equal(move_mask, up_move_mask | down_move_mask):
+            raise ValueError("move_mask must equal up_move_mask | down_move_mask")
+        if np.any(up_move_mask & down_move_mask):
+            raise ValueError("up_move_mask and down_move_mask must be disjoint")
+        if not np.array_equal(y_dir == DIRECTION_UP_CLASS, up_move_mask):
+            raise ValueError("y_direction up class mismatch")
+        if not np.array_equal(y_dir == DIRECTION_DOWN_CLASS, down_move_mask):
+            raise ValueError("y_direction down class mismatch")
 
         up = np.asarray(self.y_magnitude_up)
         down = np.asarray(self.y_magnitude_down)
@@ -118,24 +140,28 @@ class LinearTargetBatch:
             raise ValueError("target_column must be a non-empty string")
         _require_positive_int(self.horizon_us, "horizon_us")
 
-        object.__setattr__(self, "return_bps", np.ascontiguousarray(ret, dtype=ret.dtype).copy())
+        object.__setattr__(self, "y_return_bps", np.ascontiguousarray(ret, dtype=ret.dtype).copy())
+        object.__setattr__(self, "y_no_move", np.ascontiguousarray(y_no_move, dtype=ret.dtype).copy())
         object.__setattr__(self, "y_direction", np.ascontiguousarray(y_dir, dtype=np.int8).copy())
-        object.__setattr__(self, "direction_mask", np.ascontiguousarray(dmask, dtype=np.bool_).copy())
         object.__setattr__(self, "y_magnitude_up", np.ascontiguousarray(up, dtype=ret.dtype).copy())
         object.__setattr__(self, "y_magnitude_down", np.ascontiguousarray(down, dtype=ret.dtype).copy())
+        object.__setattr__(self, "no_move_mask", np.ascontiguousarray(no_move_mask, dtype=np.bool_).copy())
+        object.__setattr__(self, "move_mask", np.ascontiguousarray(move_mask, dtype=np.bool_).copy())
+        object.__setattr__(self, "up_move_mask", np.ascontiguousarray(up_move_mask, dtype=np.bool_).copy())
+        object.__setattr__(self, "down_move_mask", np.ascontiguousarray(down_move_mask, dtype=np.bool_).copy())
         object.__setattr__(self, "target_column", self.target_column.strip())
 
     @property
     def n_rows(self) -> int:
-        return int(self.return_bps.shape[0])
+        return int(self.y_return_bps.shape[0])
 
     @property
     def dtype(self) -> np.dtype:
-        return self.return_bps.dtype
+        return self.y_return_bps.dtype
 
     @property
     def direction_valid_count(self) -> int:
-        return int(self.direction_mask.sum())
+        return int(self.move_mask.sum())
 
 
 def target_column_for_horizon(horizon_us: int) -> str:
@@ -188,11 +214,13 @@ def build_linear_targets(return_bps: np.ndarray, *, config: LinearTargetConfig |
     ret = _coerce_return_vector(return_bps, dtype=cfg.dtype)
     h = cfg.target_horizon_us
     col = target_column or target_column_for_horizon(h)
-    deadband = cfg.direction_deadband_bps
+    deadband = cfg.move_deadband_bps
 
+    abs_ret = np.abs(ret)
+    no_move_mask = abs_ret <= deadband
+    move_mask = abs_ret > deadband
     up = ret > deadband
     down = ret < -deadband
-    direction_mask = up | down
 
     y_direction = np.full(ret.shape[0], DIRECTION_INVALID_CLASS, dtype=np.int8)
     y_direction[up] = DIRECTION_UP_CLASS
@@ -202,11 +230,15 @@ def build_linear_targets(return_bps: np.ndarray, *, config: LinearTargetConfig |
     y_magnitude_down = np.log1p(np.maximum(-ret, 0.0)).astype(cfg.dtype, copy=False)
 
     return LinearTargetBatch(
-        return_bps=ret,
+        y_return_bps=ret,
+        y_no_move=no_move_mask.astype(cfg.dtype, copy=False),
         y_direction=y_direction,
-        direction_mask=direction_mask,
         y_magnitude_up=y_magnitude_up,
         y_magnitude_down=y_magnitude_down,
+        no_move_mask=no_move_mask,
+        move_mask=move_mask,
+        up_move_mask=up,
+        down_move_mask=down,
         target_column=col,
         horizon_us=h,
     )
@@ -252,7 +284,7 @@ class LinearTargetBuilder:
         return {
             "target_horizon_us": self.config.target_horizon_us,
             "target_column": self.target_column,
-            "direction_deadband_bps": self.config.direction_deadband_bps,
+            "move_deadband_bps": self.config.move_deadband_bps,
             "output_dtype": self.config.output_dtype,
             "direction_invalid_class": DIRECTION_INVALID_CLASS,
             "direction_down_class": DIRECTION_DOWN_CLASS,

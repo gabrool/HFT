@@ -20,10 +20,11 @@ DEFAULT_L2 = 1e-4
 DEFAULT_MAX_GRAD_NORM = 10.0
 DEFAULT_INIT_SCALE = 0.0
 
+NO_MOVE_HEAD = "no_move"
 DIRECTION_HEAD = "direction"
 MAGNITUDE_UP_HEAD = "magnitude_up"
 MAGNITUDE_DOWN_HEAD = "magnitude_down"
-MODEL_HEADS = (DIRECTION_HEAD, MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD)
+MODEL_HEADS = (NO_MOVE_HEAD, DIRECTION_HEAD, MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD)
 
 
 def _require_positive_int(value: int, name: str) -> int:
@@ -334,6 +335,30 @@ class DirectionLinearHead(BaseLinearHead):
         return float(ce + reg)
 
 
+class NoMoveLinearHead(BaseLinearHead):
+    def __init__(self, feature_columns: Sequence[str], config: LinearModelConfig | None = None):
+        super().__init__(NO_MOVE_HEAD, feature_columns, config)
+
+    def partial_fit(self, X: np.ndarray, y_no_move: np.ndarray) -> "NoMoveLinearHead":
+        Xc = _coerce_matrix(X, n_features=len(self.feature_columns))
+        y = _coerce_binary_classes(y_no_move, n_rows=Xc.shape[0])
+        n_rows = Xc.shape[0]
+        if n_rows == 0:
+            return self
+        logits = Xc @ self.weights + self.intercept
+        p = _sigmoid(logits)
+        err = p - y
+        self._apply_gradient((Xc.T @ err) / n_rows, float(np.mean(err)), n_rows)
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        p = _sigmoid(_coerce_matrix(X, n_features=len(self.feature_columns)) @ self.weights + self.intercept)
+        return np.ascontiguousarray(np.column_stack([1.0 - p, p]).astype(self.config.dtype, copy=False))
+
+    def predict(self, X: np.ndarray, *, threshold: float = 0.5) -> np.ndarray:
+        return (self.predict_proba(X)[:, 1] >= float(threshold)).astype(np.int8, copy=False)
+
+
 class MagnitudeLinearHead(BaseLinearHead):
     def __init__(self, head_name: str, feature_columns: Sequence[str], config: LinearModelConfig | None = None):
         if head_name not in (MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD):
@@ -374,6 +399,7 @@ class MagnitudeLinearHead(BaseLinearHead):
 
 @dataclass(slots=True)
 class LinearModelBundle:
+    no_move: NoMoveLinearHead
     direction: DirectionLinearHead
     magnitude_up: MagnitudeLinearHead
     magnitude_down: MagnitudeLinearHead
@@ -389,7 +415,7 @@ class LinearModelBundle:
             raise ValueError("magnitude_up has wrong head_name")
         if self.magnitude_down.head_name != MAGNITUDE_DOWN_HEAD:
             raise ValueError("magnitude_down has wrong head_name")
-        if self.direction.config != self.magnitude_up.config or self.direction.config != self.magnitude_down.config:
+        if self.no_move.config != self.direction.config or self.direction.config != self.magnitude_up.config or self.direction.config != self.magnitude_down.config:
             raise ValueError("all heads must share identical config")
 
     @property
@@ -409,7 +435,8 @@ class LinearModelBundle:
 
     def heads_share_feature_columns(self) -> bool:
         return (
-            self.direction.feature_columns
+            self.no_move.feature_columns
+            == self.direction.feature_columns
             == self.magnitude_up.feature_columns
             == self.magnitude_down.feature_columns
         )
@@ -429,13 +456,15 @@ class LinearModelBundle:
         return {
             "direction_proba": self.direction.predict_proba(X),
             "direction_pred": self.direction.predict(X),
+            "no_move_proba": self.no_move.predict_proba(X),
+            "no_move_pred": self.no_move.predict(X),
             "magnitude_up": self.magnitude_up.predict_nonnegative(X),
             "magnitude_down": self.magnitude_down.predict_nonnegative(X),
         }
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "bundle_type": "linear_three_head",
+            "bundle_type": "linear_four_head_gated",
             "feature_columns_by_head": {
                 head: list(cols)
                 for head, cols in self.feature_columns_by_head.items()
@@ -451,8 +480,9 @@ class LinearModelBundle:
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> "LinearModelBundle":
-        if d.get("bundle_type") != "linear_three_head":
+        if d.get("bundle_type") != "linear_four_head_gated":
             raise ValueError("unsupported bundle_type")
+        no_move = load_linear_head_state(LinearHeadState.from_dict(d["no_move"]))
         direction = load_linear_head_state(LinearHeadState.from_dict(d["direction"]))
         magnitude_up = load_linear_head_state(LinearHeadState.from_dict(d["magnitude_up"]))
         magnitude_down = load_linear_head_state(LinearHeadState.from_dict(d["magnitude_down"]))
@@ -460,7 +490,7 @@ class LinearModelBundle:
             raise ValueError("direction state is invalid")
         if not isinstance(magnitude_up, MagnitudeLinearHead) or not isinstance(magnitude_down, MagnitudeLinearHead):
             raise ValueError("magnitude states are invalid")
-        return cls(direction=direction, magnitude_up=magnitude_up, magnitude_down=magnitude_down)
+        return cls(no_move=no_move, direction=direction, magnitude_up=magnitude_up, magnitude_down=magnitude_down)
 
 
 def make_linear_model_bundle(
@@ -471,14 +501,17 @@ def make_linear_model_bundle(
     if isinstance(feature_columns_by_head, Mapping):
         if set(feature_columns_by_head.keys()) != set(MODEL_HEADS):
             raise ValueError("feature_columns_by_head keys must exactly match MODEL_HEADS")
+        no_move_cols = tuple(feature_columns_by_head[NO_MOVE_HEAD])
         direction_cols = tuple(feature_columns_by_head[DIRECTION_HEAD])
         up_cols = tuple(feature_columns_by_head[MAGNITUDE_UP_HEAD])
         down_cols = tuple(feature_columns_by_head[MAGNITUDE_DOWN_HEAD])
     else:
+        no_move_cols = tuple(feature_columns_by_head)
         direction_cols = tuple(feature_columns_by_head)
         up_cols = direction_cols
         down_cols = direction_cols
     return LinearModelBundle(
+        no_move=NoMoveLinearHead(no_move_cols, cfg),
         direction=DirectionLinearHead(direction_cols, cfg),
         magnitude_up=MagnitudeLinearHead(MAGNITUDE_UP_HEAD, up_cols, cfg),
         magnitude_down=MagnitudeLinearHead(MAGNITUDE_DOWN_HEAD, down_cols, cfg),
@@ -486,7 +519,9 @@ def make_linear_model_bundle(
 
 
 def load_linear_head_state(state: LinearHeadState) -> BaseLinearHead:
-    if state.head_name == DIRECTION_HEAD:
+    if state.head_name == NO_MOVE_HEAD:
+        head: BaseLinearHead = NoMoveLinearHead(state.feature_columns, state.config)
+    elif state.head_name == DIRECTION_HEAD:
         head: BaseLinearHead = DirectionLinearHead(state.feature_columns, state.config)
     elif state.head_name in (MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD):
         head = MagnitudeLinearHead(state.head_name, state.feature_columns, state.config)
@@ -521,3 +556,11 @@ __all__ = [
     "load_linear_head_state",
     "load_linear_model_bundle",
 ]
+        if not isinstance(self.no_move, NoMoveLinearHead):
+            raise ValueError("no_move must be NoMoveLinearHead")
+            NO_MOVE_HEAD: self.no_move.feature_columns,
+            "no_move": self.no_move.as_dict(),
+        if not isinstance(no_move, NoMoveLinearHead):
+            raise ValueError("no_move state is invalid")
+    "NO_MOVE_HEAD",
+    "NoMoveLinearHead",
