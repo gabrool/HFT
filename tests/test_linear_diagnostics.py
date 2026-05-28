@@ -20,10 +20,13 @@ def test_public_api_boundary():
         "prediction_diagnostics", "build_linear_diagnostics_report",
     ]
     assert dg.__all__ == expected
-    forbidden = ("bybit", "cmssl", "stage", "pca", "sklearn", "torch", "pandas", "polars", "reader", "writer", "storage", "extract", "train", "model")
+    forbidden = ("bybit", "cmssl", "stage", "pca", "sklearn", "torch", "pandas", "polars", "reader", "writer", "storage", "extract", "model")
+    forbidden_exact_exports = {"train", "fit", "fit_transform", "partial_fit", "evaluate", "read_split", "write_report", "save", "load"}
     lowered = [name.lower() for name in dg.__all__]
     for name in lowered:
         assert not any(tok in name for tok in forbidden)
+
+    assert set(dg.__all__).isdisjoint(forbidden_exact_exports)
 
 
 def test_no_forbidden_imports():
