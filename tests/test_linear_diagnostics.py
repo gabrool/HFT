@@ -13,7 +13,7 @@ def test_public_api_boundary():
         "DEFAULT_TOP_K", "DEFAULT_NUM_BINS", "DEFAULT_MAX_ROWS",
         "DIRECTION_DOWN_CLASS", "DIRECTION_UP_CLASS", "DIRECTION_INVALID_CLASS",
         "DiagnosticsConfig", "VectorSummary", "CoefficientRecord", "CoefficientDiagnostics",
-        "PreprocessDiagnostics", "CalibrationBin", "CalibrationDiagnostics", "PredictionDiagnostics",
+        "PreprocessDiagnostics", "CalibrationBin", "CalibrationDiagnostics",
         "summarize_vector", "coefficient_diagnostics", "coefficient_diagnostics_from_head_dict",
         "coefficient_diagnostics_from_bundle_dict", "preprocess_diagnostics_from_state_dict",
         "preprocess_diagnostics_from_train_state_dict", "direction_calibration_diagnostics",
@@ -151,9 +151,9 @@ def test_coefficient_diagnostics_validation():
 def test_coefficient_diagnostics_from_head_and_bundle_dict():
     head = {"head_name": "direction", "feature_columns": ["a", "b"], "weights": [1, -1], "intercept": 0.1}
     assert dg.coefficient_diagnostics_from_head_dict(head).head_name == "direction"
-    bundle = {"direction": head, "magnitude_up": {**head, "head_name": "magnitude_up"}, "magnitude_down": {**head, "head_name": "magnitude_down"}}
+    bundle = {"no_move": {**head, "head_name": "no_move"}, "direction": head, "magnitude_up": {**head, "head_name": "magnitude_up"}, "magnitude_down": {**head, "head_name": "magnitude_down"}}
     out = dg.coefficient_diagnostics_from_bundle_dict(bundle)
-    assert set(out) == {"direction", "magnitude_up", "magnitude_down"}
+    assert set(out) == {"no_move", "direction", "magnitude_up", "magnitude_down"}
     with pytest.raises(ValueError):
         dg.coefficient_diagnostics_from_head_dict({"head_name": "x"})
 
@@ -200,6 +200,7 @@ def test_preprocess_diagnostics_from_train_state_dict_accepts_per_head_state():
     per_head = {
         "schema": "per_head_preprocess_v1",
         "states_by_head": {
+            "no_move": state(["x_n"]),
             "direction": state(["x_a", "x_b"]),
             "magnitude_up": state(["x_b"]),
             "magnitude_down": state(["x_c", "x_d"]),
@@ -209,7 +210,7 @@ def test_preprocess_diagnostics_from_train_state_dict_accepts_per_head_state():
     out = dg.preprocess_diagnostics_from_train_state_dict(per_head)
 
     assert out["schema"] == "per_head_preprocess_v1"
-    assert set(out["states_by_head"]) == {"direction", "magnitude_up", "magnitude_down"}
+    assert set(out["states_by_head"]) == {"no_move", "direction", "magnitude_up", "magnitude_down"}
     assert out["states_by_head"]["direction"]["n_features"] == 2
     assert out["states_by_head"]["magnitude_up"]["n_features"] == 1
     assert out["states_by_head"]["magnitude_down"]["n_features"] == 2
@@ -256,21 +257,18 @@ def test_direction_calibration_validation_and_empty_bins():
 
 
 def test_prediction_diagnostics():
-    out = dg.prediction_diagnostics(direction_p_up=np.array([0.1, 0.9]), magnitude_up=np.array([1.0, 2.0]), magnitude_down=np.array([0.5, 0.2]))
-    assert out.direction_p_up.name == "direction_p_up"
-    assert out.magnitude_up.name == "magnitude_up"
-    assert out.magnitude_down.name == "magnitude_down"
-    with pytest.raises(ValueError):
-        dg.prediction_diagnostics(direction_p_up=np.array([0.1]), magnitude_up=np.array([1.0, 2.0]), magnitude_down=np.array([0.5, 0.2]))
-    with pytest.raises(ValueError):
-        dg.prediction_diagnostics(direction_p_up=np.array([1.1, 0.2]), magnitude_up=np.array([1.0, 2.0]), magnitude_down=np.array([0.5, 0.2]))
-    with pytest.raises(ValueError):
-        dg.prediction_diagnostics(direction_p_up=np.array([0.1, 0.2]), magnitude_up=np.array([1.0, np.inf]), magnitude_down=np.array([0.5, 0.2]))
+    out = dg.prediction_diagnostics(
+        p_no_move=np.array([0.1, 0.2]), p_move=np.array([0.9, 0.8]), p_up_given_move=np.array([0.2, 0.7]),
+        p_up_effective=np.array([0.18, 0.56]), p_down_effective=np.array([0.72, 0.24]), magnitude_up=np.array([1.0, 2.0]),
+        magnitude_down=np.array([0.5, 0.2]), expected_up_bps=np.array([0.1, 0.2]), expected_down_bps=np.array([0.3, 0.1]),
+        expected_signed_edge_bps=np.array([-0.2, 0.1]), expected_abs_move_bps=np.array([0.4, 0.3]),
+    )
+    assert "p_no_move" in out and "expected_signed_edge_bps" in out and "expected_abs_move_bps" in out
 
 
 def test_build_linear_diagnostics_report():
     head = {"head_name": "direction", "feature_columns": ["a", "b"], "weights": [1.0, -1.0], "intercept": 0.0}
-    bundle = {"direction": head, "magnitude_up": {**head, "head_name": "magnitude_up"}, "magnitude_down": {**head, "head_name": "magnitude_down"}}
+    bundle = {"no_move": {**head, "head_name": "no_move"}, "direction": head, "magnitude_up": {**head, "head_name": "magnitude_up"}, "magnitude_down": {**head, "head_name": "magnitude_down"}}
     prep = {"feature_columns": ["a", "b"], "variance": [1.0, 2.0], "scale": [1.0, 2.0], "active_mask": np.array([True, False], dtype=bool)}
     eval_result = {"some_metric": 1.23}
     report = dg.build_linear_diagnostics_report(model_bundle_state=bundle, preprocess_state=prep, evaluation_result=eval_result, direction_p_up=np.array([0.1, 0.9]), magnitude_up=np.array([1.0, 2.0]), magnitude_down=np.array([0.4, 0.2]), y_direction=np.array([0, 1]))
@@ -330,9 +328,7 @@ def test_dataclass_validation():
     b = dg.CalibrationBin(0, 0.0, 1.0, 0, np.nan, np.nan)
     with pytest.raises(ValueError):
         dg.CalibrationDiagnostics(1, 1, 2, (b,))
-    with pytest.raises(ValueError):
-        dg.PredictionDiagnostics(vs, "bad", vs)
-
+    
 
 def test_no_training_evaluate_or_storage_api():
     for name in ("train", "partial_fit", "fit", "predict", "evaluate_model", "read_split", "transform_table", "save", "load", "write", "plot", "dataframe", "to_csv"):

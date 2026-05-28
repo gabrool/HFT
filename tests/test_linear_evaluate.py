@@ -18,6 +18,7 @@ def test_public_api_boundary():
         "DirectionMetrics",
         "RegressionMetrics",
         "LinearEvaluationResult",
+        "derive_gated_signal_predictions",
         "evaluate_direction",
         "evaluate_regression",
         "evaluate_linear_predictions",
@@ -64,7 +65,7 @@ def test_direction_metrics_basic():
     assert np.isfinite(out.brier)
     assert out.valid_count == 4 and out.positive_count == 2 and out.negative_count == 2
     assert out.has_both_classes is True
-    assert set(out.as_dict()) == {"n_rows", "valid_count", "positive_count", "negative_count", "accuracy", "balanced_accuracy", "auc", "log_loss", "brier", "threshold"}
+    assert set(out.as_dict()) == {"n_rows", "valid_count", "positive_count", "negative_count", "positive_rate", "predicted_positive_rate", "accuracy", "balanced_accuracy", "auc", "log_loss", "brier", "threshold"}
 
 
 def test_direction_metrics_without_mask_uses_invalid_class():
@@ -211,12 +212,12 @@ def test_evaluate_linear_predictions_bundle():
 
 def test_metrics_dataclass_validation():
     with pytest.raises(ValueError):
-        ev.DirectionMetrics(-1, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5)
+        ev.DirectionMetrics(-1, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5)
     with pytest.raises(ValueError):
-        ev.DirectionMetrics(2, 2, 1, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5)
-    ev.DirectionMetrics(1, 1, 1, 0, np.nan, np.nan, np.nan, np.nan, np.nan, 0.5)
+        ev.DirectionMetrics(2, 2, 1, 0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5)
+    ev.DirectionMetrics(1, 1, 1, 0, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.5)
     with pytest.raises(ValueError):
-        ev.DirectionMetrics(1, 1, 1, 0, np.inf, 0.0, 0.0, 0.0, 0.0, 0.5)
+        ev.DirectionMetrics(1, 1, 1, 0, np.inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5)
     with pytest.raises(ValueError):
         ev.DirectionMetrics(1, 1, 1, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2)
 

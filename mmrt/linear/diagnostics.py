@@ -335,7 +335,7 @@ def coefficient_diagnostics_from_bundle_dict(bundle_state: dict[str, object], *,
     if not isinstance(bundle_state, dict):
         raise ValueError("bundle_state must be a dict")
     output: dict[str, dict[str, object]] = {}
-    for key in ("direction", "magnitude_up", "magnitude_down"):
+    for key in MODEL_HEADS:
         if key not in bundle_state:
             raise ValueError(f"missing required key: {key}")
         output[key] = coefficient_diagnostics_from_head_dict(bundle_state[key], config=config).as_dict()
@@ -530,24 +530,6 @@ def direction_calibration_diagnostics(y_direction: np.ndarray, p_up: np.ndarray,
     return CalibrationDiagnostics(n_rows=int(y.shape[0]), valid_count=valid_count, num_bins=cfg.num_bins, bins=tuple(bins))
 
 
-@dataclass(frozen=True, slots=True)
-class PredictionDiagnostics:
-    direction_p_up: VectorSummary
-    magnitude_up: VectorSummary
-    magnitude_down: VectorSummary
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.direction_p_up, VectorSummary) or not isinstance(self.magnitude_up, VectorSummary) or not isinstance(self.magnitude_down, VectorSummary):
-            raise ValueError("all fields must be VectorSummary")
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "direction_p_up": self.direction_p_up.as_dict(),
-            "magnitude_up": self.magnitude_up.as_dict(),
-            "magnitude_down": self.magnitude_down.as_dict(),
-        }
-
-
 def prediction_diagnostics(*, p_no_move: np.ndarray, p_move: np.ndarray, p_up_given_move: np.ndarray, p_up_effective: np.ndarray, p_down_effective: np.ndarray, magnitude_up: np.ndarray, magnitude_down: np.ndarray, expected_up_bps: np.ndarray, expected_down_bps: np.ndarray, expected_signed_edge_bps: np.ndarray, expected_abs_move_bps: np.ndarray, config: DiagnosticsConfig | None = None) -> dict[str, object]:
     cfg = config or DiagnosticsConfig()
     return {
@@ -599,7 +581,6 @@ __all__ = [
     "PreprocessDiagnostics",
     "CalibrationBin",
     "CalibrationDiagnostics",
-    "PredictionDiagnostics",
     "summarize_vector",
     "coefficient_diagnostics",
     "coefficient_diagnostics_from_head_dict",

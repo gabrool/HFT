@@ -172,6 +172,8 @@ class DirectionMetrics:
     valid_count: int
     positive_count: int
     negative_count: int
+    positive_rate: float
+    predicted_positive_rate: float
     accuracy: float
     balanced_accuracy: float
     auc: float
@@ -188,6 +190,8 @@ class DirectionMetrics:
             raise ValueError("valid_count must be <= n_rows")
         if self.positive_count + self.negative_count != self.valid_count:
             raise ValueError("positive_count + negative_count must equal valid_count")
+        object.__setattr__(self, "positive_rate", _require_metric_float(self.positive_rate, "positive_rate"))
+        object.__setattr__(self, "predicted_positive_rate", _require_metric_float(self.predicted_positive_rate, "predicted_positive_rate"))
         object.__setattr__(self, "accuracy", _require_metric_float(self.accuracy, "accuracy"))
         object.__setattr__(self, "balanced_accuracy", _require_metric_float(self.balanced_accuracy, "balanced_accuracy"))
         object.__setattr__(self, "auc", _require_metric_float(self.auc, "auc"))
@@ -205,6 +209,8 @@ class DirectionMetrics:
             "valid_count": int(self.valid_count),
             "positive_count": int(self.positive_count),
             "negative_count": int(self.negative_count),
+            "positive_rate": float(self.positive_rate),
+            "predicted_positive_rate": float(self.predicted_positive_rate),
             "accuracy": float(self.accuracy),
             "balanced_accuracy": float(self.balanced_accuracy),
             "auc": float(self.auc),
@@ -333,6 +339,8 @@ def evaluate_direction(
             valid_count=0,
             positive_count=0,
             negative_count=0,
+            positive_rate=_nan(),
+            predicted_positive_rate=_nan(),
             accuracy=_nan(),
             balanced_accuracy=_nan(),
             auc=_nan(),
@@ -349,6 +357,8 @@ def evaluate_direction(
 
     positive_count = int(np.sum(yv == DIRECTION_UP_CLASS))
     negative_count = int(np.sum(yv == DIRECTION_DOWN_CLASS))
+    positive_rate = float(positive_count / valid_count)
+    predicted_positive_rate = float(np.mean(pred == 1))
 
     if positive_count > 0 and negative_count > 0:
         tp = int(np.sum((pred == 1) & (yv == 1)))
@@ -370,6 +380,8 @@ def evaluate_direction(
         valid_count=valid_count,
         positive_count=positive_count,
         negative_count=negative_count,
+        positive_rate=positive_rate,
+        predicted_positive_rate=predicted_positive_rate,
         accuracy=accuracy,
         balanced_accuracy=balanced_accuracy,
         auc=auc,
@@ -485,9 +497,9 @@ __all__ = [
     "DirectionMetrics",
     "RegressionMetrics",
     "LinearEvaluationResult",
+    "derive_gated_signal_predictions",
     "evaluate_direction",
     "evaluate_regression",
     "evaluate_linear_predictions",
     "confusion_counts",
 ]
-
