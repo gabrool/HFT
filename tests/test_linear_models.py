@@ -215,7 +215,7 @@ def test_bundle_predictions_and_validation():
             magnitude_up=lm.MagnitudeLinearHead(lm.MAGNITUDE_UP_HEAD, ("a",)),
             magnitude_down=lm.MagnitudeLinearHead(lm.MAGNITUDE_DOWN_HEAD, ("a",)),
         )
-    with pytest.raises(ValueError, match="name must be one of"):
+    with pytest.raises(ValueError, match="magnitude head"):
         lm.MagnitudeLinearHead("bad_head", ("a",))
 
 
