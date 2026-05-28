@@ -183,6 +183,15 @@ def _feature_meta_from_column(column: str) -> _FeatureMeta:
     )
 
 
+def _resolve_audit_feature_columns(
+    manifest: mf.StorageManifest,
+    feature_columns: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    selected = ex.resolve_feature_columns(manifest, feature_columns)
+    selected_set = set(selected)
+    return tuple(column for column in manifest.feature_columns if column in selected_set)
+
+
 @dataclass(slots=True)
 class _StreamingFeatureStats:
     n_rows: int
@@ -251,6 +260,7 @@ class _StreamingTrainCorrelationStats:
 
     @classmethod
     def empty(cls, n_features: int) -> "_StreamingTrainCorrelationStats":
+        _require_positive_int(n_features, "n_features")
         return cls(
             0,
             n_features,
@@ -679,7 +689,7 @@ class FeatureAuditResult:
 
 def _scan_split_features(reader, manifest, role, config):
     role_s = _role_to_str(role)
-    cols = ex.resolve_feature_columns(manifest, config.feature_columns)
+    cols = _resolve_audit_feature_columns(manifest, config.feature_columns)
     metas = [_feature_meta_from_column(c) for c in cols]
 
     stats = _StreamingFeatureStats.empty(len(cols))
@@ -982,21 +992,26 @@ def run_feature_audit(dataset_root: str, *, config: FeatureAuditConfig | None = 
         for fam in families:
             recs = [record for record in split_recs if record.family == fam]
             family_idxs = [i for i, meta in enumerate(metas) if meta.family == fam]
-            high_count = float("nan")
-            max_abs = float("nan")
-            mean_abs = float("nan")
+            if split == "train":
+                high_count = 0.0
+                max_abs = float("nan")
+                mean_abs = float("nan")
 
-            if split == "train" and len(family_idxs) >= 2:
-                vals = [
-                    abs(corr[a, b])
-                    for ai, a in enumerate(family_idxs)
-                    for b in family_idxs[ai + 1 :]
-                    if np.isfinite(corr[a, b])
-                ]
-                if vals:
-                    high_count = float(sum(v >= cfg.high_corr_threshold for v in vals))
-                    max_abs = float(max(vals))
-                    mean_abs = float(np.mean(vals))
+                if len(family_idxs) >= 2:
+                    vals = [
+                        abs(corr[a, b])
+                        for ai, a in enumerate(family_idxs)
+                        for b in family_idxs[ai + 1 :]
+                        if np.isfinite(corr[a, b])
+                    ]
+                    if vals:
+                        high_count = float(sum(v >= cfg.high_corr_threshold for v in vals))
+                        max_abs = float(max(vals))
+                        mean_abs = float(np.mean(vals))
+            else:
+                high_count = float("nan")
+                max_abs = float("nan")
+                mean_abs = float("nan")
 
             family.append(
                 FeatureFamilySummaryRecord(
