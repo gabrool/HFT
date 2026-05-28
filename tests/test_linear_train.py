@@ -127,10 +127,10 @@ def test_train_model_bundle_from_train_split_updates_models_only_from_train(tmp_
     st = tr.fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved, config=cfg)
     bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, head_features=resolved, preprocess_states_by_head=st, config=cfg)
     train_rets = np.array([-2.0, -1.0, 0.0, 1.0, 2.0, -3.0])
-    valid = np.sum(train_rets != 0.0)
-    assert bundle.direction.n_rows_seen == 2 * int(valid)
-    assert bundle.magnitude_up.n_rows_seen == 2 * 6
-    assert bundle.magnitude_down.n_rows_seen == 2 * 6
+    assert bundle.no_move.n_rows_seen == 12
+    assert bundle.direction.n_rows_seen == 10
+    assert bundle.magnitude_up.n_rows_seen == 4
+    assert bundle.magnitude_down.n_rows_seen == 6
     assert bundle.direction.is_fitted()
 
 
@@ -157,9 +157,20 @@ def test_train_linear_model_end_to_end(tmp_path: Path):
     assert result.manifest_hash == rd.open_dataset(str(root)).manifest.content_hash()
     assert set(result.splits.keys()) == {"train", "val", "test"}
     assert result.splits["train"].n_rows == 6 and result.splits["val"].n_rows == 3
-    assert {"direction", "magnitude_up", "magnitude_down"}.issubset(result.model_bundle_state.keys())
+    assert {"no_move", "direction", "magnitude_up", "magnitude_down"}.issubset(result.model_bundle_state.keys())
     assert result.preprocess_state["schema"] == "per_head_preprocess_v1"
     assert set(result.preprocess_state["states_by_head"].keys()) == set(lm.MODEL_HEADS)
+    payload = result.as_dict()
+    assert "no_move" in payload["model_bundle_state"]
+    assert "no_move" in payload["model_bundle_state"]["feature_columns_by_head"]
+    assert "no_move" in payload["preprocess_state"]["states_by_head"]
+    assert "no_move" in payload["config"]["resolved_head_features"]["feature_columns_by_head"]
+    for split in payload["splits"].values():
+        assert "no_move" in split["evaluation"]
+        assert "gated_signal" in split["evaluation"]
+        assert "no_move" in split["diagnostics"]["coefficients"]
+        assert "p_no_move" in split["diagnostics"]["predictions"]
+        assert "expected_signed_edge_bps" in split["diagnostics"]["predictions"]
     json.dumps(result.as_dict(), allow_nan=True)
 
 
@@ -193,8 +204,10 @@ def test_direction_invalid_rows_filtered_for_direction_head(tmp_path: Path):
     resolved = hf.resolve_head_feature_sets(manifest)
     st = tr.fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved, config=cfg)
     bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, head_features=resolved, preprocess_states_by_head=st, config=cfg)
+    assert bundle.no_move.n_rows_seen == 6
     assert bundle.direction.n_rows_seen == 5
-    assert bundle.magnitude_up.n_rows_seen == 6
+    assert bundle.magnitude_up.n_rows_seen == 2
+    assert bundle.magnitude_down.n_rows_seen == 3
 
 
 def test_write_linear_train_artifacts(tmp_path: Path):

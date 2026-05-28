@@ -208,17 +208,44 @@ def test_bundle_predictions_and_validation():
     assert out["magnitude_up"].shape == (3,)
     assert out["magnitude_down"].shape == (3,)
     assert bundle.direction.config == bundle.magnitude_up.config == bundle.magnitude_down.config
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="no_move"):
         lm.LinearModelBundle(
+            no_move=object(),
             direction=lm.DirectionLinearHead(("a",)),
             magnitude_up=lm.MagnitudeLinearHead(lm.MAGNITUDE_UP_HEAD, ("a",)),
-            magnitude_down=lm.MagnitudeLinearHead(lm.MAGNITUDE_DOWN_HEAD, ("b",)),
+            magnitude_down=lm.MagnitudeLinearHead(lm.MAGNITUDE_DOWN_HEAD, ("a",)),
         )
+    with pytest.raises(ValueError, match="name must be one of"):
+        lm.MagnitudeLinearHead("bad_head", ("a",))
+
+
+def test_no_move_partial_fit_updates_and_reduces_loss():
+    X = np.array([[-2.0], [-1.0], [1.0], [2.0]])
+    y = np.array([1, 1, 0, 0])
+    head = lm.NoMoveLinearHead(("x",), config=lm.LinearModelConfig(learning_rate=0.2, l2=0.0))
+    before = head.loss(X, y)
+    for _ in range(50):
+        head.partial_fit(X, y)
+    after = head.loss(X, y)
+
+    assert after < before
+    assert head.n_updates == 50
+    assert head.n_rows_seen == 200
+    assert head.predict_proba(X).shape == (4, 2)
+
+
+def test_no_move_predict_threshold_validation():
+    head = lm.NoMoveLinearHead(("x",))
+    X = np.array([[0.0], [1.0]])
+    for bad in (-0.1, 1.1, np.nan, True):
+        with pytest.raises(ValueError):
+            head.predict(X, threshold=bad)
 
 
 def test_bundle_n_features_rejects_nonshared_feature_columns():
     bundle = lm.make_linear_model_bundle(
         {
+            lm.NO_MOVE_HEAD: ("x_n",),
             lm.DIRECTION_HEAD: ("x_a", "x_b"),
             lm.MAGNITUDE_UP_HEAD: ("x_a",),
             lm.MAGNITUDE_DOWN_HEAD: ("x_b",),
@@ -232,6 +259,7 @@ def test_bundle_n_features_rejects_nonshared_feature_columns():
 def test_bundle_serialization_roundtrip():
     bundle = lm.make_linear_model_bundle(("x",))
     X = np.array([[-1.0], [1.0]])
+    bundle.no_move.partial_fit(X, np.array([1, 0]))
     bundle.direction.partial_fit(X, np.array([0, 1]))
     bundle.magnitude_up.partial_fit(X, np.array([0.0, 1.0]))
     bundle.magnitude_down.partial_fit(X, np.array([1.0, 0.0]))
@@ -239,6 +267,9 @@ def test_bundle_serialization_roundtrip():
     loaded = lm.load_linear_model_bundle(dct)
     p1 = bundle.predict(X)
     p2 = loaded.predict(X)
+    assert "no_move" in bundle.as_dict()
+    assert lm.NO_MOVE_HEAD in bundle.feature_columns_by_head
+    assert "no_move_proba" in p1 and "no_move_pred" in p1
     for key in p1:
         assert np.allclose(p1[key], p2[key])
 

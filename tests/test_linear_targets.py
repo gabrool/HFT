@@ -29,7 +29,7 @@ def make_manifest() -> mf.StorageManifest:
 def test_public_api_boundary():
     assert tg.__all__ == [
         "DEFAULT_TARGET_HORIZON_US",
-        "DEFAULT_DIRECTION_DEADBAND_BPS",
+        "DEFAULT_MOVE_DEADBAND_BPS",
         "DEFAULT_TARGET_DTYPE",
         "ALLOWED_TARGET_DTYPES",
         "DIRECTION_INVALID_CLASS",
@@ -72,7 +72,7 @@ for f in forbidden:
 def test_config_validation():
     cfg = tg.LinearTargetConfig()
     assert cfg.target_horizon_us == 1_000_000
-    assert cfg.direction_deadband_bps == 0.0
+    assert cfg.move_deadband_bps == 0.0
     assert cfg.output_dtype == "float32"
     assert cfg.dtype == np.dtype("float32")
     assert tg.LinearTargetConfig(output_dtype="float64").dtype == np.dtype("float64")
@@ -81,7 +81,7 @@ def test_config_validation():
             tg.LinearTargetConfig(target_horizon_us=bad)
     for bad in (-1, np.nan, np.inf, True):
         with pytest.raises(ValueError):
-            tg.LinearTargetConfig(direction_deadband_bps=bad)
+            tg.LinearTargetConfig(move_deadband_bps=bad)
     with pytest.raises(ValueError):
         tg.LinearTargetConfig(output_dtype="float16")
     for attr in ("target_type", "no_move_head", "stage", "mask_quantile", "scaler", "model"):
@@ -237,3 +237,31 @@ def test_vectorized_no_row_loop_smoke():
     src = inspect.getsource(tg)
     for tok in (".iterrows", "to_pandas", "for i in range(len("):
         assert tok not in src
+
+def test_public_api_move_deadband_export():
+    assert "DEFAULT_MOVE_DEADBAND_BPS" in tg.__all__
+    assert "DEFAULT_DIRECTION_DEADBAND_BPS" not in tg.__all__
+
+
+def test_mask_and_class_semantics():
+    ret = np.array([-2.0, 0.0, 1.5], dtype=np.float32)
+    tb = tg.build_linear_targets(ret, config=tg.LinearTargetConfig(move_deadband_bps=0.0))
+    assert tb.y_no_move.tolist() == [0.0, 1.0, 0.0]
+    assert tb.move_mask.tolist() == [True, False, True]
+    assert tb.no_move_mask.tolist() == [False, True, False]
+    assert tb.down_move_mask.tolist() == [True, False, False]
+    assert tb.up_move_mask.tolist() == [False, False, True]
+    assert tb.y_direction.tolist() == [0, -1, 1]
+
+
+def test_deadband_boundary_and_mask_consistency():
+    ret = np.array([-0.5, 0.0, 0.5, 0.5001, -0.5001], dtype=np.float32)
+    cfg = tg.LinearTargetConfig(move_deadband_bps=0.5)
+    tb = tg.build_linear_targets(ret, config=cfg)
+    expected_no_move = np.abs(ret) <= 0.5
+    expected_move = np.abs(ret) > 0.5
+    assert np.array_equal(tb.no_move_mask, expected_no_move)
+    assert np.array_equal(tb.move_mask, expected_move)
+    assert np.array_equal(tb.no_move_mask, ~tb.move_mask)
+    assert np.array_equal(tb.move_mask, tb.up_move_mask | tb.down_move_mask)
+    assert not np.any(tb.up_move_mask & tb.down_move_mask)

@@ -451,6 +451,10 @@ def evaluate_linear_predictions(
     pupm = _coerce_probability_vector(p_up_given_move, n_rows=n_rows, name="p_up_given_move")
     pmu = _coerce_1d_float(pred_magnitude_up, name="pred_magnitude_up")
     pmd = _coerce_1d_float(pred_magnitude_down, name="pred_magnitude_down")
+    if pmu.shape[0] != n_rows:
+        raise ValueError("pred_magnitude_up must have shape (n_rows,)")
+    if pmd.shape[0] != n_rows:
+        raise ValueError("pred_magnitude_down must have shape (n_rows,)")
     if not np.array_equal(nm_mask, ynm == 1.0):
         raise ValueError("no_move_mask must match y_no_move == 1")
     if not np.array_equal(mv_mask, ~nm_mask):
@@ -459,6 +463,12 @@ def evaluate_linear_predictions(
         raise ValueError("move_mask must equal up_move_mask | down_move_mask")
     if np.any(up_mask & dn_mask):
         raise ValueError("up_move_mask and down_move_mask must be disjoint")
+    if not np.array_equal(ydir == DIRECTION_UP_CLASS, up_mask):
+        raise ValueError("y_direction up class must match up_move_mask")
+    if not np.array_equal(ydir == DIRECTION_DOWN_CLASS, dn_mask):
+        raise ValueError("y_direction down class must match down_move_mask")
+    if not np.array_equal(ydir == DIRECTION_INVALID_CLASS, nm_mask):
+        raise ValueError("y_direction invalid class must match no_move_mask")
     no_move = evaluate_direction(ynm.astype(np.int8), pnm, direction_mask=np.ones(n_rows, dtype=bool), threshold=threshold)
     direction = evaluate_direction(ydir, pupm, direction_mask=mv_mask, threshold=threshold)
     magnitude_up = evaluate_regression(np.log1p(np.maximum(yret[up_mask], 0.0)), pmu[up_mask])

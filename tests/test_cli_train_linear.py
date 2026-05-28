@@ -182,3 +182,33 @@ def test_cli_init_is_empty_package_marker() -> None:
     forbidden = ["import mmrt.cli.train_linear", "ingest", "audit_dataset", "storage", "linear", "data", "features"]
     for token in forbidden:
         assert token not in src
+
+def test_cli_written_artifact_contains_no_move(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    result_path = tmp_path / "result.json"
+    artifact_payload = {
+        "model_bundle_state": {"no_move": {}, "feature_columns_by_head": {"no_move": ["x"]}},
+        "preprocess_state": {"states_by_head": {"no_move": {}}},
+        "config": {"resolved_head_features": {"feature_columns_by_head": {"no_move": ["x"]}}},
+        "splits": {"train": {"evaluation": {"no_move": {}}, "diagnostics": {"coefficients": {"no_move": {}}}}},
+    }
+
+    def fake_train(*args, **kwargs):
+        se = lt.SplitEvaluation("train", 1, evaluation={}, diagnostics={})
+        return lt.LinearTrainResult(schema_version=1, dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se})
+
+    def fake_write(*args, **kwargs):
+        result_path.write_text(json.dumps(artifact_payload))
+        return {"result_json": str(result_path)}
+
+    monkeypatch.setattr(lt, "train_linear_model", fake_train)
+    monkeypatch.setattr(lt, "write_linear_train_artifacts", fake_write)
+    rc = cli.main(["--dataset-root", "ds", "--output-dir", "out"])
+    assert rc == 0
+    payload = json.loads(result_path.read_text())
+    assert "no_move" in payload["model_bundle_state"]
+    assert "no_move" in payload["model_bundle_state"]["feature_columns_by_head"]
+    assert "no_move" in payload["preprocess_state"]["states_by_head"]
+    assert "no_move" in payload["config"]["resolved_head_features"]["feature_columns_by_head"]
+    for split in payload["splits"].values():
+        assert "no_move" in split["evaluation"]
+        assert "no_move" in split["diagnostics"]["coefficients"]

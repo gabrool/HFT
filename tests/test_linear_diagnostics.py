@@ -263,24 +263,38 @@ def test_prediction_diagnostics():
         magnitude_down=np.array([0.5, 0.2]), expected_up_bps=np.array([0.1, 0.2]), expected_down_bps=np.array([0.3, 0.1]),
         expected_signed_edge_bps=np.array([-0.2, 0.1]), expected_abs_move_bps=np.array([0.4, 0.3]),
     )
-    assert "p_no_move" in out and "expected_signed_edge_bps" in out and "expected_abs_move_bps" in out
+    assert set(out) == {"p_no_move", "p_move", "p_up_given_move", "p_up_effective", "p_down_effective", "magnitude_up", "magnitude_down", "expected_up_bps", "expected_down_bps", "expected_signed_edge_bps", "expected_abs_move_bps"}
 
 
+
+
+def test_coefficient_diagnostics_rejects_missing_no_move():
+    head = {"head_name": "direction", "feature_columns": ["a"], "weights": [1.0], "intercept": 0.0}
+    bundle = {"no_move": {**head, "head_name": "no_move"}, "direction": {**head, "head_name": "direction"}, "magnitude_up": {**head, "head_name": "magnitude_up"}, "magnitude_down": {**head, "head_name": "magnitude_down"}}
+    bad = dict(bundle)
+    bad.pop("no_move")
+    with pytest.raises(ValueError, match="no_move"):
+        dg.coefficient_diagnostics_from_bundle_dict(bad)
 def test_build_linear_diagnostics_report():
     head = {"head_name": "direction", "feature_columns": ["a", "b"], "weights": [1.0, -1.0], "intercept": 0.0}
     bundle = {"no_move": {**head, "head_name": "no_move"}, "direction": head, "magnitude_up": {**head, "head_name": "magnitude_up"}, "magnitude_down": {**head, "head_name": "magnitude_down"}}
     prep = {"feature_columns": ["a", "b"], "variance": [1.0, 2.0], "scale": [1.0, 2.0], "active_mask": np.array([True, False], dtype=bool)}
     eval_result = {"some_metric": 1.23}
-    report = dg.build_linear_diagnostics_report(model_bundle_state=bundle, preprocess_state=prep, evaluation_result=eval_result, direction_p_up=np.array([0.1, 0.9]), magnitude_up=np.array([1.0, 2.0]), magnitude_down=np.array([0.4, 0.2]), y_direction=np.array([0, 1]))
+    report = dg.build_linear_diagnostics_report(model_bundle_state=bundle, preprocess_state=prep, evaluation_result=eval_result, p_no_move=np.array([0.2, 0.8]), p_move=np.array([0.8, 0.2]), p_up_given_move=np.array([0.6, 0.4]), p_up_effective=np.array([0.48, 0.08]), p_down_effective=np.array([0.32, 0.12]), magnitude_up=np.array([0.1, 0.2]), magnitude_down=np.array([0.3, 0.4]), expected_up_bps=np.array([0.05, 0.02]), expected_down_bps=np.array([0.10, 0.03]), expected_signed_edge_bps=np.array([-0.05, -0.01]), expected_abs_move_bps=np.array([0.15, 0.05]), y_no_move=np.array([0, 1]), y_direction=np.array([0, -1], dtype=np.int8), move_mask=np.array([True, False], dtype=bool))
     assert set(report) == {"diagnostics_version", "config", "coefficients", "preprocess", "predictions", "calibration", "evaluation"}
+    assert "no_move" in report["coefficients"]
+    assert "p_no_move" in report["predictions"]
+    assert "expected_signed_edge_bps" in report["predictions"]
+    assert set(report["calibration"]) == {"no_move", "direction"}
     assert report["evaluation"] is eval_result
 
 
 def test_build_linear_diagnostics_report_accepts_per_head_preprocess_state():
     model_bundle_state = {
-        "bundle_type": "linear_four_head",
-        "feature_columns_by_head": {"direction": ["x_a"], "magnitude_up": ["x_b"], "magnitude_down": ["x_c"]},
-        "feature_counts_by_head": {"direction": 1, "magnitude_up": 1, "magnitude_down": 1},
+        "bundle_type": "linear_four_head_gated",
+        "feature_columns_by_head": {"no_move": ["x_n"], "direction": ["x_a"], "magnitude_up": ["x_b"], "magnitude_down": ["x_c"]},
+        "feature_counts_by_head": {"no_move": 1, "direction": 1, "magnitude_up": 1, "magnitude_down": 1},
+        "no_move": {"head_name": "no_move", "feature_columns": ["x_n"], "weights": [0.05], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
         "direction": {"head_name": "direction", "feature_columns": ["x_a"], "weights": [0.1], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
         "magnitude_up": {"head_name": "magnitude_up", "feature_columns": ["x_b"], "weights": [0.2], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
         "magnitude_down": {"head_name": "magnitude_down", "feature_columns": ["x_c"], "weights": [-0.2], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
@@ -288,6 +302,7 @@ def test_build_linear_diagnostics_report_accepts_per_head_preprocess_state():
     preprocess_state = {
         "schema": "per_head_preprocess_v1",
         "states_by_head": {
+            "no_move": {"feature_columns": ["x_n"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
             "direction": {"feature_columns": ["x_a"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
             "magnitude_up": {"feature_columns": ["x_b"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
             "magnitude_down": {"feature_columns": ["x_c"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
@@ -297,12 +312,21 @@ def test_build_linear_diagnostics_report_accepts_per_head_preprocess_state():
     report = dg.build_linear_diagnostics_report(
         model_bundle_state=model_bundle_state,
         preprocess_state=preprocess_state,
-        evaluation_result={"direction": {}, "magnitude_up": {}, "magnitude_down": {}},
-        direction_p_up=np.array([0.4, 0.6], dtype=np.float64),
+        evaluation_result={"no_move": {}, "direction": {}, "magnitude_up": {}, "magnitude_down": {}},
+        p_no_move=np.array([0.1, 0.2], dtype=np.float64),
+        p_move=np.array([0.9, 0.8], dtype=np.float64),
+        p_up_given_move=np.array([0.4, 0.6], dtype=np.float64),
+        p_up_effective=np.array([0.36, 0.48], dtype=np.float64),
+        p_down_effective=np.array([0.54, 0.32], dtype=np.float64),
         magnitude_up=np.array([0.1, 0.2], dtype=np.float64),
         magnitude_down=np.array([0.2, 0.1], dtype=np.float64),
+        expected_up_bps=np.array([0.036, 0.096], dtype=np.float64),
+        expected_down_bps=np.array([0.108, 0.032], dtype=np.float64),
+        expected_signed_edge_bps=np.array([-0.072, 0.064], dtype=np.float64),
+        expected_abs_move_bps=np.array([0.144, 0.128], dtype=np.float64),
+        y_no_move=np.array([0, 0], dtype=np.float64),
         y_direction=np.array([0, 1], dtype=np.int8),
-        direction_mask=np.array([True, True], dtype=bool),
+        move_mask=np.array([True, True], dtype=bool),
     )
 
     assert report["preprocess"]["schema"] == "per_head_preprocess_v1"

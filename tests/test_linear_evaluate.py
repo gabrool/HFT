@@ -212,6 +212,16 @@ def test_evaluate_linear_predictions_mask_validation():
     )
     with pytest.raises(ValueError, match="no_move_mask"):
         ev.evaluate_linear_predictions(**{**kwargs, "no_move_mask": np.array([True, True, False, False])})
+    with pytest.raises(ValueError, match="pred_magnitude_up"):
+        ev.evaluate_linear_predictions(**{**kwargs, "pred_magnitude_up": np.array([0.1, 0.2])})
+    with pytest.raises(ValueError, match="pred_magnitude_down"):
+        ev.evaluate_linear_predictions(**{**kwargs, "pred_magnitude_down": np.array([0.1, 0.2])})
+    with pytest.raises(ValueError, match="up class"):
+        ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([0, -1, 0, 0], dtype=np.int8)})
+    with pytest.raises(ValueError, match="down class"):
+        ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([1, -1, 1, 1], dtype=np.int8)})
+    with pytest.raises(ValueError, match="invalid class"):
+        ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([0, 0, 1, 0], dtype=np.int8)})
 
 
 def test_derive_gated_signal_predictions():
@@ -243,20 +253,21 @@ def test_derive_gated_signal_predictions():
 
 def test_metrics_dataclass_validation():
     with pytest.raises(ValueError):
-        ev.DirectionMetrics(-1, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5)
+        ev.DirectionMetrics(n_rows=-1, valid_count=0, positive_count=0, negative_count=0, positive_rate=0.0, predicted_positive_rate=0.0, accuracy=0.0, balanced_accuracy=0.0, auc=0.0, log_loss=0.0, brier=0.0, threshold=0.5)
     with pytest.raises(ValueError):
-        ev.DirectionMetrics(2, 2, 1, 0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5)
-    ev.DirectionMetrics(1, 1, 1, 0, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.5)
+        ev.DirectionMetrics(n_rows=2, valid_count=2, positive_count=1, negative_count=0, positive_rate=0.5, predicted_positive_rate=0.5, accuracy=0.0, balanced_accuracy=0.0, auc=0.0, log_loss=0.0, brier=0.0, threshold=0.5)
+    ev.DirectionMetrics(n_rows=1, valid_count=1, positive_count=1, negative_count=0, positive_rate=np.nan, predicted_positive_rate=np.nan, accuracy=np.nan, balanced_accuracy=np.nan, auc=np.nan, log_loss=0.1, brier=0.1, threshold=0.5)
     with pytest.raises(ValueError):
-        ev.DirectionMetrics(1, 1, 1, 0, np.inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5)
+        ev.DirectionMetrics(n_rows=1, valid_count=1, positive_count=1, negative_count=0, positive_rate=np.inf, predicted_positive_rate=0.0, accuracy=0.0, balanced_accuracy=0.0, auc=0.0, log_loss=0.0, brier=0.0, threshold=0.5)
     with pytest.raises(ValueError):
-        ev.DirectionMetrics(1, 1, 1, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2)
+        ev.DirectionMetrics(n_rows=1, valid_count=1, positive_count=1, negative_count=0, positive_rate=0.0, predicted_positive_rate=0.0, accuracy=0.0, balanced_accuracy=0.0, auc=0.0, log_loss=0.0, brier=0.0, threshold=1.2)
 
     with pytest.raises(ValueError):
         ev.RegressionMetrics(1, np.inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-    with pytest.raises(TypeError):
-        ev.LinearEvaluationResult(no_move=object(), direction=object(), magnitude_up=object(), magnitude_down=object(), gated_signal={})
+    dm = ev.DirectionMetrics(n_rows=1, valid_count=1, positive_count=1, negative_count=0, positive_rate=1.0, predicted_positive_rate=1.0, accuracy=1.0, balanced_accuracy=np.nan, auc=np.nan, log_loss=0.1, brier=0.1, threshold=0.5)
+    rm = ev.RegressionMetrics(1, 0.0, 0.0, 0.0, np.nan, 0.0, 0.0, 0.0)
+    ev.LinearEvaluationResult(no_move=dm, direction=dm, magnitude_up=rm, magnitude_down=rm, gated_signal={"signed_edge": {}, "abs_move": {}, "n_rows": 1})
 
 
 def test_no_model_training_or_storage_api():
