@@ -278,7 +278,7 @@ def test_build_linear_diagnostics_report():
 
 def test_build_linear_diagnostics_report_accepts_per_head_preprocess_state():
     model_bundle_state = {
-        "bundle_type": "linear_three_head",
+        "bundle_type": "linear_four_head",
         "feature_columns_by_head": {"direction": ["x_a"], "magnitude_up": ["x_b"], "magnitude_down": ["x_c"]},
         "feature_counts_by_head": {"direction": 1, "magnitude_up": 1, "magnitude_down": 1},
         "direction": {"head_name": "direction", "feature_columns": ["x_a"], "weights": [0.1], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},

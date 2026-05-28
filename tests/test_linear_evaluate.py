@@ -175,39 +175,70 @@ def test_regression_validation():
 
 def test_evaluate_linear_predictions_bundle():
     out = ev.evaluate_linear_predictions(
-        y_direction=np.array([0, 1, 0, 1]),
-        direction_p_up=np.array([0.2, 0.7, 0.6, 0.8]),
-        y_magnitude_up=np.array([0.1, 0.2, 0.3, 0.4]),
-        pred_magnitude_up=np.array([0.1, 0.3, 0.2, 0.5]),
-        y_magnitude_down=np.array([0.5, 0.4, 0.3, 0.2]),
-        pred_magnitude_down=np.array([0.6, 0.3, 0.4, 0.1]),
-        direction_mask=np.array([True, True, True, True]),
+        y_return_bps=np.array([-2.0, 0.0, 1.5, -1.0], dtype=np.float64),
+        y_no_move=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64),
+        y_direction=np.array([0, -1, 1, 0], dtype=np.int8),
+        no_move_mask=np.array([False, True, False, False]),
+        move_mask=np.array([True, False, True, True]),
+        up_move_mask=np.array([False, False, True, False]),
+        down_move_mask=np.array([True, False, False, True]),
+        p_no_move=np.array([0.1, 0.8, 0.2, 0.3]),
+        p_up_given_move=np.array([0.2, 0.5, 0.7, 0.3]),
+        pred_magnitude_up=np.log1p(np.array([0.5, 0.5, 1.4, 0.5])),
+        pred_magnitude_down=np.log1p(np.array([1.8, 0.2, 0.2, 0.9])),
     )
-    assert isinstance(out.direction, ev.DirectionMetrics)
-    assert isinstance(out.magnitude_up, ev.RegressionMetrics)
-    assert isinstance(out.magnitude_down, ev.RegressionMetrics)
     bundle = out.as_dict()
-    assert set(bundle) == {"direction", "magnitude_up", "magnitude_down"}
+    assert set(bundle) == {"no_move", "direction", "magnitude_up", "magnitude_down", "gated_signal"}
+    assert bundle["no_move"]["n_rows"] == 4
+    assert bundle["direction"]["valid_count"] == 3
+    assert bundle["magnitude_up"]["n_rows"] == 1
+    assert bundle["magnitude_down"]["n_rows"] == 2
+    assert set(bundle["gated_signal"]) == {"signed_edge", "abs_move", "n_rows"}
 
-    with pytest.raises(ValueError):
-        ev.evaluate_linear_predictions(
-            y_direction=np.array([0, 1]),
-            direction_p_up=np.array([0.2]),
-            y_magnitude_up=np.array([0.1, 0.2]),
-            pred_magnitude_up=np.array([0.1, 0.2]),
-            y_magnitude_down=np.array([0.1, 0.2]),
-            pred_magnitude_down=np.array([0.1, 0.2]),
-        )
-    with pytest.raises(ValueError):
-        ev.evaluate_linear_predictions(
-            y_direction=np.array([0, 1]),
-            direction_p_up=np.array([0.2, 0.8]),
-            y_magnitude_up=np.array([0.1, 0.2]),
-            pred_magnitude_up=np.array([0.1, 0.2]),
-            y_magnitude_down=np.array([0.1, 0.2]),
-            pred_magnitude_down=np.array([0.1, 0.2]),
-            direction_mask=np.array([True]),
-        )
+
+def test_evaluate_linear_predictions_mask_validation():
+    kwargs = dict(
+        y_return_bps=np.array([-2.0, 0.0, 1.5, -1.0], dtype=np.float64),
+        y_no_move=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64),
+        y_direction=np.array([0, -1, 1, 0], dtype=np.int8),
+        no_move_mask=np.array([False, True, False, False]),
+        move_mask=np.array([True, False, True, True]),
+        up_move_mask=np.array([False, False, True, False]),
+        down_move_mask=np.array([True, False, False, True]),
+        p_no_move=np.array([0.1, 0.8, 0.2, 0.3]),
+        p_up_given_move=np.array([0.2, 0.5, 0.7, 0.3]),
+        pred_magnitude_up=np.log1p(np.array([0.5, 0.5, 1.4, 0.5])),
+        pred_magnitude_down=np.log1p(np.array([1.8, 0.2, 0.2, 0.9])),
+    )
+    with pytest.raises(ValueError, match="no_move_mask"):
+        ev.evaluate_linear_predictions(**{**kwargs, "no_move_mask": np.array([True, True, False, False])})
+
+
+def test_derive_gated_signal_predictions():
+    g = ev.derive_gated_signal_predictions(
+        p_no_move=np.array([0.2]),
+        p_up_given_move=np.array([0.75]),
+        pred_magnitude_up=np.array([np.log1p(2.0)]),
+        pred_magnitude_down=np.array([np.log1p(1.0)]),
+    )
+    assert g["p_move"][0] == pytest.approx(0.8)
+    assert g["p_up_effective"][0] == pytest.approx(0.6)
+    assert g["p_down_effective"][0] == pytest.approx(0.2)
+    assert g["expected_up_bps"][0] == pytest.approx(1.2)
+    assert g["expected_down_bps"][0] == pytest.approx(0.2)
+    assert g["expected_signed_edge_bps"][0] == pytest.approx(1.0)
+    assert g["expected_abs_move_bps"][0] == pytest.approx(1.4)
+    for bad in (-0.1, 1.1):
+        with pytest.raises(ValueError):
+            ev.derive_gated_signal_predictions(
+                p_no_move=np.array([bad]), p_up_given_move=np.array([0.5]),
+                pred_magnitude_up=np.array([0.0]), pred_magnitude_down=np.array([0.0]),
+            )
+        with pytest.raises(ValueError):
+            ev.derive_gated_signal_predictions(
+                p_no_move=np.array([0.5]), p_up_given_move=np.array([bad]),
+                pred_magnitude_up=np.array([0.0]), pred_magnitude_down=np.array([0.0]),
+            )
 
 
 def test_metrics_dataclass_validation():
@@ -225,7 +256,7 @@ def test_metrics_dataclass_validation():
         ev.RegressionMetrics(1, np.inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
     with pytest.raises(TypeError):
-        ev.LinearEvaluationResult(direction=object(), magnitude_up=object(), magnitude_down=object())
+        ev.LinearEvaluationResult(no_move=object(), direction=object(), magnitude_up=object(), magnitude_down=object(), gated_signal={})
 
 
 def test_no_model_training_or_storage_api():

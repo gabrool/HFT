@@ -282,7 +282,11 @@ def derive_gated_signal_predictions(
     *, p_no_move: np.ndarray, p_up_given_move: np.ndarray, pred_magnitude_up: np.ndarray, pred_magnitude_down: np.ndarray
 ) -> dict[str, np.ndarray]:
     pnm = _coerce_1d_float(p_no_move, name="p_no_move")
+    if np.any((pnm < 0.0) | (pnm > 1.0)):
+        raise ValueError("p_no_move values must be in [0, 1]")
     pum = _coerce_1d_float(p_up_given_move, name="p_up_given_move")
+    if np.any((pum < 0.0) | (pum > 1.0)):
+        raise ValueError("p_up_given_move values must be in [0, 1]")
     mup = _coerce_1d_float(pred_magnitude_up, name="pred_magnitude_up")
     mdn = _coerce_1d_float(pred_magnitude_down, name="pred_magnitude_down")
     n = pnm.shape[0]
@@ -436,6 +440,8 @@ def evaluate_linear_predictions(
     yret = _coerce_1d_float(y_return_bps, name="y_return_bps")
     n_rows = yret.shape[0]
     ynm = _coerce_probability_vector(y_no_move, n_rows=n_rows, name="y_no_move")
+    if not np.all((ynm == 0.0) | (ynm == 1.0)):
+        raise ValueError("y_no_move must contain only 0/1 values")
     ydir = _coerce_direction_classes(y_direction)
     nm_mask = _coerce_bool_mask(no_move_mask, n_rows=n_rows, name="no_move_mask")
     mv_mask = _coerce_bool_mask(move_mask, n_rows=n_rows, name="move_mask")
@@ -445,6 +451,14 @@ def evaluate_linear_predictions(
     pupm = _coerce_probability_vector(p_up_given_move, n_rows=n_rows, name="p_up_given_move")
     pmu = _coerce_1d_float(pred_magnitude_up, name="pred_magnitude_up")
     pmd = _coerce_1d_float(pred_magnitude_down, name="pred_magnitude_down")
+    if not np.array_equal(nm_mask, ynm == 1.0):
+        raise ValueError("no_move_mask must match y_no_move == 1")
+    if not np.array_equal(mv_mask, ~nm_mask):
+        raise ValueError("move_mask must equal ~no_move_mask")
+    if not np.array_equal(mv_mask, up_mask | dn_mask):
+        raise ValueError("move_mask must equal up_move_mask | down_move_mask")
+    if np.any(up_mask & dn_mask):
+        raise ValueError("up_move_mask and down_move_mask must be disjoint")
     no_move = evaluate_direction(ynm.astype(np.int8), pnm, direction_mask=np.ones(n_rows, dtype=bool), threshold=threshold)
     direction = evaluate_direction(ydir, pupm, direction_mask=mv_mask, threshold=threshold)
     magnitude_up = evaluate_regression(np.log1p(np.maximum(yret[up_mask], 0.0)), pmu[up_mask])
