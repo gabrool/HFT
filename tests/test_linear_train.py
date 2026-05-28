@@ -96,6 +96,7 @@ def test_config_validation():
         tr.LinearTrainConfig(extractor_config=object())
     d = cfg.as_dict()
     assert set(d.keys()) >= {"extractor_config", "target_config", "preprocess_config", "model_config", "diagnostics_config"}
+    assert d["model_config"]["magnitude_huber_delta"] == 1.0
     for forbidden in ["random_state", "shuffle", "pca_components", "split_config", "output_dir", "early_stopping", "class_weight", "sample_weight"]:
         assert not hasattr(cfg, forbidden)
 
@@ -161,6 +162,30 @@ def test_train_linear_model_end_to_end(tmp_path: Path):
     assert result.preprocess_state["schema"] == "per_head_preprocess_v1"
     assert set(result.preprocess_state["states_by_head"].keys()) == set(lm.MODEL_HEADS)
     payload = result.as_dict()
+    selection = payload["selection_summary"]
+    assert selection["selection_split"] == "val"
+    assert set(selection["primary_metrics"]) == {"no_move", "direction", "magnitude_up", "magnitude_down"}
+    assert selection["primary_metrics"]["no_move"]["metric"] == "auc"
+    assert selection["primary_metrics"]["no_move"]["mode"] == "max"
+    assert selection["primary_metrics"]["no_move"]["scope"] == "all_rows"
+    assert selection["primary_metrics"]["direction"]["metric"] == "auc"
+    assert selection["primary_metrics"]["direction"]["mode"] == "max"
+    assert selection["primary_metrics"]["direction"]["scope"] == "move_mask"
+    assert selection["primary_metrics"]["magnitude_up"]["metric"] == "mae"
+    assert selection["primary_metrics"]["magnitude_up"]["mode"] == "min"
+    assert selection["primary_metrics"]["magnitude_up"]["scope"] == "up_move_mask"
+    assert selection["primary_metrics"]["magnitude_down"]["metric"] == "mae"
+    assert selection["primary_metrics"]["magnitude_down"]["mode"] == "min"
+    assert selection["primary_metrics"]["magnitude_down"]["scope"] == "down_move_mask"
+    assert set(selection["guardrails"]["no_move"]) == {"log_loss", "brier"}
+    assert set(selection["guardrails"]["direction"]) == {"log_loss", "brier"}
+    assert set(selection["guardrails"]["magnitude_up"]) == {"spearman", "rmse"}
+    assert set(selection["guardrails"]["magnitude_down"]) == {"spearman", "rmse"}
+    for head_payload in selection["primary_metrics"].values():
+        assert isinstance(head_payload["value"], float)
+    for guard_payload in selection["guardrails"].values():
+        for value in guard_payload.values():
+            assert isinstance(value, float)
     assert "no_move" in payload["model_bundle_state"]
     assert "no_move" in payload["model_bundle_state"]["feature_columns_by_head"]
     assert "no_move" in payload["preprocess_state"]["states_by_head"]
@@ -231,7 +256,7 @@ def test_result_dataclass_validation():
     with pytest.raises(ValueError):
         tr.SplitEvaluation(role="bad", n_rows=0, evaluation={}, diagnostics={})
     with pytest.raises(ValueError):
-        tr.LinearTrainResult(schema_version=2, dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se})
+        tr.LinearTrainResult(schema_version=2, dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
 
 
 def test_no_old_pipeline_residue():

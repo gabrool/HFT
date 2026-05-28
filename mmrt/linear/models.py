@@ -1,8 +1,9 @@
 """Linear model heads for storage-backed MMRT training.
 
 This module implements NumPy-only linear heads for direction and magnitude
-prediction. It consumes already-preprocessed feature matrices and explicit
-target arrays. It does not read storage, build features, construct targets,
+prediction. Magnitude heads use Huber loss on log1p side-specific magnitude
+targets. It consumes already-preprocessed feature matrices and explicit target
+arrays. It does not read storage, build features, construct targets,
 fit preprocessing, inspect row timing fields, evaluate metrics, or run
 training orchestration.
 """
@@ -19,6 +20,7 @@ DEFAULT_LEARNING_RATE = 0.05
 DEFAULT_L2 = 1e-4
 DEFAULT_MAX_GRAD_NORM = 10.0
 DEFAULT_INIT_SCALE = 0.0
+DEFAULT_MAGNITUDE_HUBER_DELTA = 1.0
 
 NO_MOVE_HEAD = "no_move"
 DIRECTION_HEAD = "direction"
@@ -130,18 +132,34 @@ def _clip_gradient(vec: np.ndarray, max_norm: float) -> np.ndarray:
     return grad.copy()
 
 
+def _huber_loss_and_grad(residual: np.ndarray, delta: float) -> tuple[float, np.ndarray]:
+    r = np.asarray(residual, dtype=np.float64)
+    d = _require_positive_float(delta, "magnitude_huber_delta")
+    abs_r = np.abs(r)
+    quadratic = abs_r <= d
+    loss = np.where(quadratic, 0.5 * r * r, d * (abs_r - 0.5 * d))
+    grad = np.where(quadratic, r, d * np.sign(r))
+    return float(np.mean(loss)) if r.size else 0.0, np.ascontiguousarray(grad, dtype=np.float64)
+
+
 @dataclass(frozen=True, slots=True)
 class LinearModelConfig:
     learning_rate: float = DEFAULT_LEARNING_RATE
     l2: float = DEFAULT_L2
     max_grad_norm: float = DEFAULT_MAX_GRAD_NORM
     output_dtype: str = DEFAULT_MODEL_DTYPE
+    magnitude_huber_delta: float = DEFAULT_MAGNITUDE_HUBER_DELTA
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "learning_rate", _require_positive_float(self.learning_rate, "learning_rate"))
         object.__setattr__(self, "l2", _require_nonnegative_float(self.l2, "l2"))
         object.__setattr__(self, "max_grad_norm", _require_positive_float(self.max_grad_norm, "max_grad_norm"))
         object.__setattr__(self, "output_dtype", _require_output_dtype(self.output_dtype))
+        object.__setattr__(
+            self,
+            "magnitude_huber_delta",
+            _require_positive_float(self.magnitude_huber_delta, "magnitude_huber_delta"),
+        )
 
     @property
     def dtype(self) -> np.dtype:
@@ -195,6 +213,7 @@ class LinearHeadState:
                 "l2": self.config.l2,
                 "max_grad_norm": self.config.max_grad_norm,
                 "output_dtype": self.config.output_dtype,
+                "magnitude_huber_delta": self.config.magnitude_huber_delta,
             },
         }
 
@@ -208,6 +227,7 @@ class LinearHeadState:
             l2=cfg_raw["l2"],
             max_grad_norm=cfg_raw["max_grad_norm"],
             output_dtype=cfg_raw["output_dtype"],
+            magnitude_huber_delta=cfg_raw["magnitude_huber_delta"],
         )
         return cls(
             head_name=d["head_name"],
@@ -389,9 +409,10 @@ class MagnitudeLinearHead(BaseLinearHead):
         if n_rows == 0:
             return self
         pred = Xc @ self.weights + self.intercept
-        err = pred - y
-        grad_w = (Xc.T @ err) / n_rows
-        grad_b = float(np.mean(err))
+        residual = pred - y
+        _, grad_pred = _huber_loss_and_grad(residual, self.config.magnitude_huber_delta)
+        grad_w = (Xc.T @ grad_pred) / n_rows
+        grad_b = float(np.mean(grad_pred))
         self._apply_gradient(grad_w, grad_b, n_rows)
         return self
 
@@ -408,10 +429,11 @@ class MagnitudeLinearHead(BaseLinearHead):
         y = _coerce_regression_target(y_magnitude, n_rows=Xc.shape[0], name="y_magnitude")
         if Xc.shape[0] == 0:
             return 0.5 * self.config.l2 * float(np.dot(self.weights, self.weights))
-        err = (Xc @ self.weights + self.intercept) - y
-        mse_half = 0.5 * float(np.mean(err * err))
+        pred = Xc @ self.weights + self.intercept
+        residual = pred - y
+        data_loss, _ = _huber_loss_and_grad(residual, self.config.magnitude_huber_delta)
         reg = 0.5 * self.config.l2 * float(np.dot(self.weights, self.weights))
-        return mse_half + reg
+        return float(data_loss + reg)
 
 
 @dataclass(slots=True)
@@ -565,6 +587,7 @@ __all__ = [
     "DEFAULT_L2",
     "DEFAULT_MAX_GRAD_NORM",
     "DEFAULT_INIT_SCALE",
+    "DEFAULT_MAGNITUDE_HUBER_DELTA",
     "NO_MOVE_HEAD",
     "DIRECTION_HEAD",
     "MAGNITUDE_UP_HEAD",
