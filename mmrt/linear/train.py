@@ -154,7 +154,7 @@ class LinearTrainConfig:
             "head_feature_config": self.head_feature_config.as_dict(),
             "target_config": {
                 "target_horizon_us": self.target_config.target_horizon_us,
-                "direction_deadband_bps": self.target_config.direction_deadband_bps,
+                "move_deadband_bps": self.target_config.move_deadband_bps,
                 "output_dtype": self.target_config.output_dtype,
             },
             "preprocess_config": {
@@ -323,8 +323,8 @@ def train_model_bundle_from_train_split(reader: rd.StorageDatasetReader, *, mani
                 tb = target_builder.transform_table(table)
                 Xz = pre.transform(xb.X, feature_columns=xb.feature_columns)
                 if head == lm.DIRECTION_HEAD:
-                    if tb.direction_mask.any():
-                        bundle.direction.partial_fit(Xz[tb.direction_mask], tb.y_direction[tb.direction_mask])
+                    if tb.move_mask.any():
+                        bundle.direction.partial_fit(Xz[tb.move_mask], tb.y_direction[tb.move_mask])
                 elif head == lm.MAGNITUDE_UP_HEAD:
                     bundle.magnitude_up.partial_fit(Xz, tb.y_magnitude_up)
                 elif head == lm.MAGNITUDE_DOWN_HEAD:
@@ -339,7 +339,12 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
     target_builder = tg.LinearTargetBuilder(config.target_config, manifest=manifest)
 
     y_direction_parts: list[np.ndarray] = []
-    direction_mask_parts: list[np.ndarray] = []
+    no_move_mask_parts: list[np.ndarray] = []
+    move_mask_parts: list[np.ndarray] = []
+    up_move_mask_parts: list[np.ndarray] = []
+    down_move_mask_parts: list[np.ndarray] = []
+    y_no_move_parts: list[np.ndarray] = []
+    no_move_p_parts: list[np.ndarray] = []
     direction_p_up_parts: list[np.ndarray] = []
     y_mag_up_parts: list[np.ndarray] = []
     pred_mag_up_parts: list[np.ndarray] = []
@@ -357,8 +362,12 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
         pred = model_bundle.direction.predict_proba(Xz)[:, 1]
 
         y_direction_parts.append(tb.y_direction)
-        direction_mask_parts.append(tb.direction_mask)
+        move_mask_parts.append(tb.move_mask)
+        no_move_mask_parts.append(tb.no_move_mask)
+        up_move_mask_parts.append(tb.up_move_mask)
+        down_move_mask_parts.append(tb.down_move_mask)
         direction_p_up_parts.append(pred)
+
     for head, pred_parts, target_parts, model_head in (
         (lm.MAGNITUDE_UP_HEAD, pred_mag_up_parts, y_mag_up_parts, model_bundle.magnitude_up),
         (lm.MAGNITUDE_DOWN_HEAD, pred_mag_down_parts, y_mag_down_parts, model_bundle.magnitude_down),
