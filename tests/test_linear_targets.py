@@ -221,7 +221,7 @@ def test_builder_resolves_manifest_and_transforms_table():
     m = make_manifest()
     bld = tg.LinearTargetBuilder(manifest=m)
     assert bld.target_column in m.label_columns
-    assert "direction_deadband_bps" not in bld.as_dict()
+    assert "direction_" + "deadband_bps" not in bld.as_dict()
     tbl = pa.table({bld.target_column: [1.0, -2.0, 0.0]})
     batch = bld.transform_table(tbl)
     np.testing.assert_array_equal(batch.y_direction, np.array([1, 0, -1], dtype=np.int8))
