@@ -130,6 +130,48 @@ def test_feature_subset(tmp_path: Path):
     assert {r.feature for r in out.health_records} == set(cols)
 
 
+def test_single_feature_subset_family_summary_is_valid(tmp_path: Path):
+    root = tmp_path / "single_feature"
+    _write_feature_audit_ds(root)
+
+    col = mf.feature_columns()[0]
+    out = fa.run_feature_audit(
+        str(root),
+        config=fa.FeatureAuditConfig(feature_columns=(col,)),
+    )
+
+    assert {record.feature for record in out.health_records} == {col}
+    assert len(out.correlation_pairs) == 0
+
+    train_family_records = [record for record in out.family_records if record.split == "train"]
+    assert train_family_records
+    for record in train_family_records:
+        assert record.train_high_corr_pair_count == 0.0
+
+
+def test_reversed_feature_columns_are_canonicalized(tmp_path: Path):
+    root = tmp_path / "reversed"
+    _write_feature_audit_ds(root, correlated=True)
+
+    cols = tuple(reversed(mf.feature_columns()[:2]))
+    out = fa.run_feature_audit(
+        str(root),
+        config=fa.FeatureAuditConfig(feature_columns=cols),
+    )
+
+    health_features = [record.feature for record in out.health_records if record.split == "train"]
+    assert health_features == list(mf.feature_columns()[:2])
+
+    pair = [record for record in out.correlation_pairs if record.index_a == 0 and record.index_b == 1][0]
+    assert pair.feature_a == mf.feature_columns()[0]
+    assert pair.feature_b == mf.feature_columns()[1]
+
+
+def test_train_correlation_stats_rejects_invalid_feature_count():
+    with pytest.raises(ValueError):
+        fa._StreamingTrainCorrelationStats.empty(0)
+
+
 def test_sampling_deterministic(tmp_path: Path):
     root = tmp_path / "deterministic"
     _write_feature_audit_ds(root, train_rows=100, val_rows=100)
