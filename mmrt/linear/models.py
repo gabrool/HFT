@@ -393,14 +393,37 @@ class LinearModelBundle:
             raise ValueError("all heads must share identical config")
 
     @property
-    def feature_columns(self) -> tuple[str, ...]:
-        return self.direction.feature_columns
+    def feature_columns_by_head(self) -> dict[str, tuple[str, ...]]:
+        return {
+            DIRECTION_HEAD: self.direction.feature_columns,
+            MAGNITUDE_UP_HEAD: self.magnitude_up.feature_columns,
+            MAGNITUDE_DOWN_HEAD: self.magnitude_down.feature_columns,
+        }
+
+    @property
+    def feature_counts_by_head(self) -> dict[str, int]:
+        return {
+            head: len(cols)
+            for head, cols in self.feature_columns_by_head.items()
+        }
+
+    def heads_share_feature_columns(self) -> bool:
+        return (
+            self.direction.feature_columns
+            == self.magnitude_up.feature_columns
+            == self.magnitude_down.feature_columns
+        )
 
     @property
     def n_features(self) -> int:
-        return len(self.feature_columns)
+        return len(self.direction.feature_columns)
 
     def predict(self, X: np.ndarray) -> dict[str, np.ndarray]:
+        if not self.heads_share_feature_columns():
+            raise ValueError(
+                "LinearModelBundle.predict(X) requires all heads to share identical feature_columns; "
+                "use per-head prediction paths for per-head feature sets"
+            )
         return {
             "direction_proba": self.direction.predict_proba(X),
             "direction_pred": self.direction.predict(X),
@@ -409,13 +432,20 @@ class LinearModelBundle:
         }
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "bundle_type": "linear_three_head",
-            "feature_columns": list(self.feature_columns),
+            "feature_columns_by_head": {
+                head: list(cols)
+                for head, cols in self.feature_columns_by_head.items()
+            },
+            "feature_counts_by_head": self.feature_counts_by_head,
             "direction": self.direction.as_dict(),
             "magnitude_up": self.magnitude_up.as_dict(),
             "magnitude_down": self.magnitude_down.as_dict(),
         }
+        if self.heads_share_feature_columns():
+            payload["shared_feature_columns"] = list(self.direction.feature_columns)
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> "LinearModelBundle":
@@ -437,6 +467,8 @@ def make_linear_model_bundle(
 ) -> LinearModelBundle:
     cfg = config if config is not None else LinearModelConfig()
     if isinstance(feature_columns_by_head, Mapping):
+        if set(feature_columns_by_head.keys()) != set(MODEL_HEADS):
+            raise ValueError("feature_columns_by_head keys must exactly match MODEL_HEADS")
         direction_cols = tuple(feature_columns_by_head[DIRECTION_HEAD])
         up_cols = tuple(feature_columns_by_head[MAGNITUDE_UP_HEAD])
         down_cols = tuple(feature_columns_by_head[MAGNITUDE_DOWN_HEAD])

@@ -194,7 +194,8 @@ def test_bundle_predictions_and_validation():
     assert isinstance(bundle.direction, lm.DirectionLinearHead)
     assert isinstance(bundle.magnitude_up, lm.MagnitudeLinearHead)
     assert isinstance(bundle.magnitude_down, lm.MagnitudeLinearHead)
-    assert bundle.feature_columns == ("a", "b")
+    assert bundle.feature_columns_by_head[lm.DIRECTION_HEAD] == ("a", "b")
+    assert bundle.heads_share_feature_columns()
     out = bundle.predict(np.zeros((3, 2)))
     assert set(out) == {"direction_proba", "direction_pred", "magnitude_up", "magnitude_down"}
     assert out["direction_proba"].shape == (3, 2)

@@ -44,3 +44,9 @@ def test_missing_defaults_overlap_and_manifest_order(tmp_path: Path):
     assert set(r.feature_columns_by_head.keys()) == set(lm.MODEL_HEADS)
     d = r.as_dict()
     assert 'feature_counts_by_head' in d and 'feature_schema_hash' in d
+
+
+def test_resolved_feature_schema_hash_matches_manifest_feature_specs_hash(tmp_path: Path):
+    manifest = _manifest(tmp_path)
+    resolved = hf.resolve_head_feature_sets(manifest)
+    assert resolved.feature_schema_hash == manifest.feature_schema.get("feature_specs_hash")
