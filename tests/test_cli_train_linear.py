@@ -26,7 +26,7 @@ def test_build_arg_parser_defaults() -> None:
     assert args.result_filename == lt.DEFAULT_OUTPUT_FILENAME
     assert args.no_validate_on_open is False
     assert args.target_horizon_us == tg.DEFAULT_TARGET_HORIZON_US
-    assert args.direction_deadband_bps == tg.DEFAULT_DIRECTION_DEADBAND_BPS
+    assert args.move_deadband_bps == tg.DEFAULT_MOVE_DEADBAND_BPS
     assert args.target_output_dtype == tg.DEFAULT_TARGET_DTYPE
     assert args.variance_floor == pp.DEFAULT_VARIANCE_FLOOR
     assert args.clip_z == pp.DEFAULT_CLIP_Z
@@ -45,7 +45,7 @@ def test_config_from_args_constructs_frozen_config() -> None:
     args = parser.parse_args(
         [
             "--dataset-root", "ds", "--output-dir", "out", "--batch-size", "7", "--epochs", "3", "--no-validate-on-open",
-            "--target-horizon-us", "500000", "--direction-deadband-bps", "0.25", "--target-output-dtype", "float64",
+            "--target-horizon-us", "500000", "--move-deadband-bps", "0.25", "--target-output-dtype", "float64",
             "--variance-floor", "1e-8", "--clip-z", "5.0", "--preprocess-output-dtype", "float64",
             "--learning-rate", "0.01", "--l2", "0.001", "--max-grad-norm", "10.0", "--model-output-dtype", "float64",
             "--diagnostics-top-k", "5", "--diagnostics-num-bins", "4", "--diagnostics-max-rows", "123",
@@ -57,7 +57,7 @@ def test_config_from_args_constructs_frozen_config() -> None:
     assert cfg.epochs == 3
     assert cfg.validate_dataset_on_open is False
     assert cfg.target_config.target_horizon_us == 500000
-    assert cfg.target_config.direction_deadband_bps == 0.25
+    assert cfg.target_config.move_deadband_bps == 0.25
     assert cfg.target_config.output_dtype == "float64"
     assert cfg.preprocess_config.variance_floor == 1e-8
     assert cfg.preprocess_config.clip_z == 5.0
@@ -75,7 +75,7 @@ def test_parser_rejects_bad_numeric_values() -> None:
     parser = cli.build_arg_parser()
     bad = [
         ["--batch-size", "0"], ["--epochs", "0"], ["--target-horizon-us", "0"],
-        ["--direction-deadband-bps", "-0.1"], ["--variance-floor", "-1"], ["--variance-floor", "0"], ["--clip-z", "0"],
+        ["--move-deadband-bps", "-0.1"], ["--variance-floor", "-1"], ["--variance-floor", "0"], ["--clip-z", "0"],
         ["--learning-rate", "0"], ["--l2", "-1"], ["--max-grad-norm", "0"],
         ["--diagnostics-top-k", "0"], ["--diagnostics-num-bins", "0"], ["--diagnostics-max-rows", "0"],
         ["--learning-rate", "nan"], ["--learning-rate", "inf"],
@@ -138,6 +138,9 @@ def test_no_bad_imports() -> None:
     ]
     for token in forbidden:
         assert token not in src
+    assert "direction_deadband_bps" not in src
+    assert "DEFAULT_DIRECTION_DEADBAND_BPS" not in src
+    assert "--direction-deadband-bps" not in src
 
 
 def test_no_old_pipeline_residue() -> None:

@@ -74,9 +74,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--target-horizon-us", type=_positive_int, default=tg.DEFAULT_TARGET_HORIZON_US)
     parser.add_argument(
-        "--direction-deadband-bps",
+        "--move-deadband-bps",
         type=_nonnegative_float,
-        default=tg.DEFAULT_DIRECTION_DEADBAND_BPS,
+        default=tg.DEFAULT_MOVE_DEADBAND_BPS,
     )
     parser.add_argument(
         "--target-output-dtype",
@@ -114,7 +114,7 @@ def _config_from_args(args: argparse.Namespace) -> lt.LinearTrainConfig:
         validate_dataset_on_open=not args.no_validate_on_open,
         target_config=tg.LinearTargetConfig(
             target_horizon_us=args.target_horizon_us,
-            direction_deadband_bps=args.direction_deadband_bps,
+            move_deadband_bps=args.move_deadband_bps,
             output_dtype=args.target_output_dtype,
         ),
         preprocess_config=pp.LinearPreprocessConfig(

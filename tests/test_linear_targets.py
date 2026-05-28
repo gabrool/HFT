@@ -140,59 +140,87 @@ def test_build_linear_targets_default_formulas():
     ret = np.array([2.0, -3.0, 0.0], dtype=np.float64)
     b = tg.build_linear_targets(ret)
     np.testing.assert_array_equal(b.y_direction, np.array([1, 0, -1], dtype=np.int8))
-    np.testing.assert_array_equal(b.direction_mask, np.array([True, True, False]))
+    np.testing.assert_array_equal(b.y_no_move, np.array([0.0, 0.0, 1.0], dtype=b.dtype))
+    np.testing.assert_array_equal(b.move_mask, np.array([True, True, False]))
+    np.testing.assert_array_equal(b.no_move_mask, np.array([False, False, True]))
+    np.testing.assert_array_equal(b.up_move_mask, np.array([True, False, False]))
+    np.testing.assert_array_equal(b.down_move_mask, np.array([False, True, False]))
     np.testing.assert_allclose(b.y_magnitude_up, np.log1p(np.array([2.0, 0.0, 0.0], dtype=np.float32)))
     np.testing.assert_allclose(b.y_magnitude_down, np.log1p(np.array([0.0, 3.0, 0.0], dtype=np.float32)))
-    assert b.return_bps.dtype == np.float32
+    assert b.y_return_bps.dtype == np.float32
     assert b.n_rows == 3
     assert b.direction_valid_count == 2
     assert b.target_column == "y_ret_bps_1000000us"
 
 
 def test_build_linear_targets_deadband():
-    cfg = tg.LinearTargetConfig(direction_deadband_bps=0.5)
-    b = tg.build_linear_targets(np.array([0.4, 0.6, -0.4, -0.6]), config=cfg)
-    np.testing.assert_array_equal(b.y_direction, np.array([-1, 1, -1, 0], dtype=np.int8))
-    np.testing.assert_array_equal(b.direction_mask, np.array([False, True, False, True]))
-    np.testing.assert_allclose(b.y_magnitude_up, np.log1p(np.array([0.4, 0.6, 0.0, 0.0], dtype=np.float32)))
+    ret = np.array([-0.5, 0.0, 0.5, 0.5001, -0.5001], dtype=np.float32)
+    cfg = tg.LinearTargetConfig(move_deadband_bps=0.5)
+    b = tg.build_linear_targets(ret, config=cfg)
+    np.testing.assert_array_equal(b.no_move_mask, np.array([True, True, True, False, False]))
+    np.testing.assert_array_equal(b.move_mask, np.array([False, False, False, True, True]))
+    np.testing.assert_array_equal(b.up_move_mask, np.array([False, False, False, True, False]))
+    np.testing.assert_array_equal(b.down_move_mask, np.array([False, False, False, False, True]))
+    np.testing.assert_array_equal(b.y_direction, np.array([-1, -1, -1, 1, 0], dtype=np.int8))
 
 
 def test_linear_target_batch_validation_and_copy():
     ret = np.array([1.0, -1.0], dtype=np.float32)
-    ydir = np.array([1, 0], dtype=np.int8)
-    dmask = np.array([True, True], dtype=bool)
-    yup = np.array([1.0, 0.0], dtype=np.float32)
-    ydown = np.array([0.0, 1.0], dtype=np.float32)
-    b = tg.LinearTargetBatch(ret, ydir, dmask, yup, ydown, "y_ret_bps_1000000us", 1_000_000)
+    y_no_move = np.array([0.0, 0.0], dtype=np.float32)
+    y_direction = np.array([1, 0], dtype=np.int8)
+    y_up = np.array([1.0, 0.0], dtype=np.float32)
+    y_down = np.array([0.0, 1.0], dtype=np.float32)
+    no_move_mask = np.array([False, False], dtype=bool)
+    move_mask = np.array([True, True], dtype=bool)
+    up_move_mask = np.array([True, False], dtype=bool)
+    down_move_mask = np.array([False, True], dtype=bool)
+
+    b = tg.LinearTargetBatch(
+        y_return_bps=ret,
+        y_no_move=y_no_move,
+        y_direction=y_direction,
+        y_magnitude_up=y_up,
+        y_magnitude_down=y_down,
+        no_move_mask=no_move_mask,
+        move_mask=move_mask,
+        up_move_mask=up_move_mask,
+        down_move_mask=down_move_mask,
+        target_column="y_ret_bps_1000000us",
+        horizon_us=1_000_000,
+    )
     ret[0] = 9.0
-    assert b.return_bps[0] == 1.0
+    assert b.y_return_bps[0] == 1.0
+
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([1.0], np.float32), ydir, dmask, yup, ydown, "c", 1)
+        tg.LinearTargetBatch(y_return_bps=np.array([1.0], np.float32), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([np.nan, 1.0], np.float32), ydir, dmask, yup, ydown, "c", 1)
+        tg.LinearTargetBatch(y_return_bps=np.array([np.nan, 1.0], np.float32), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([1.0, 1.0], np.float32), np.array([2, 0], np.int8), dmask, yup, ydown, "c", 1)
+        tg.LinearTargetBatch(y_return_bps=np.asfortranarray(np.array([1.0, 1.0], np.float32)), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([1.0, 1.0], np.float32), np.array([-1, 0], np.int8), dmask, yup, ydown, "c", 1)
+        tg.LinearTargetBatch(y_return_bps=np.array([1.0, 1.0], np.float32), y_no_move=np.array([0.0, 2.0], np.float32), y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([1.0, 1.0], np.float32), ydir, np.array([1, 1], np.int8), yup, ydown, "c", 1)
+        tg.LinearTargetBatch(y_return_bps=np.array([1.0, 1.0], np.float32), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=np.array([True, False]), move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([1.0, 1.0], np.float32), ydir, dmask, np.array([-1.0, 0.0], np.float32), ydown, "c", 1)
+        tg.LinearTargetBatch(y_return_bps=np.array([1.0, 1.0], np.float32), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=np.array([True, True]), down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([1.0, 1.0], np.float32), ydir, dmask, yup, ydown, "", 1)
+        tg.LinearTargetBatch(y_return_bps=np.array([1.0, 1.0], np.float32), y_no_move=y_no_move, y_direction=np.array([1, 1], np.int8), y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(np.array([1.0, 1.0], np.float32), ydir, dmask, yup, ydown, "c", 0)
+        tg.LinearTargetBatch(y_return_bps=np.array([1.0, 1.0], np.float32), y_no_move=y_no_move, y_direction=np.array([0, 0], np.int8), y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
+    with pytest.raises(ValueError):
+        tg.LinearTargetBatch(y_return_bps=np.array([1.0, 1.0], np.float32), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=np.array([-1.0, 0.0], np.float32), y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
 
 
 def test_builder_resolves_manifest_and_transforms_table():
     m = make_manifest()
     bld = tg.LinearTargetBuilder(manifest=m)
     assert bld.target_column in m.label_columns
+    assert "direction_deadband_bps" not in bld.as_dict()
     tbl = pa.table({bld.target_column: [1.0, -2.0, 0.0]})
     batch = bld.transform_table(tbl)
     np.testing.assert_array_equal(batch.y_direction, np.array([1, 0, -1], dtype=np.int8))
     d = bld.as_dict()
-    for k in ("target_horizon_us", "target_column", "direction_deadband_bps", "output_dtype", "label_spec"):
+    for k in ("target_horizon_us", "target_column", "move_deadband_bps", "output_dtype", "label_spec"):
         assert k in d
     for k in ("stage", "model", "preprocess"):
         assert k not in d
