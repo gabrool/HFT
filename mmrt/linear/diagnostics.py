@@ -19,10 +19,11 @@ DIRECTION_DOWN_CLASS = 0
 DIRECTION_UP_CLASS = 1
 DIRECTION_INVALID_CLASS = -1
 
+NO_MOVE_HEAD = "no_move"
 DIRECTION_HEAD = "direction"
 MAGNITUDE_UP_HEAD = "magnitude_up"
 MAGNITUDE_DOWN_HEAD = "magnitude_down"
-MODEL_HEADS = (DIRECTION_HEAD, MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD)
+MODEL_HEADS = (NO_MOVE_HEAD, DIRECTION_HEAD, MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD)
 
 PER_HEAD_PREPROCESS_SCHEMA = "per_head_preprocess_v1"
 
@@ -547,21 +548,24 @@ class PredictionDiagnostics:
         }
 
 
-def prediction_diagnostics(*, direction_p_up: np.ndarray, magnitude_up: np.ndarray, magnitude_down: np.ndarray, config: DiagnosticsConfig | None = None) -> PredictionDiagnostics:
+def prediction_diagnostics(*, p_no_move: np.ndarray, p_move: np.ndarray, p_up_given_move: np.ndarray, p_up_effective: np.ndarray, p_down_effective: np.ndarray, magnitude_up: np.ndarray, magnitude_down: np.ndarray, expected_up_bps: np.ndarray, expected_down_bps: np.ndarray, expected_signed_edge_bps: np.ndarray, expected_abs_move_bps: np.ndarray, config: DiagnosticsConfig | None = None) -> dict[str, object]:
     cfg = config or DiagnosticsConfig()
-    p = _coerce_probability_vector(direction_p_up, n_rows=len(direction_p_up), name="direction_p_up")
-    up = _coerce_1d_float(magnitude_up, name="magnitude_up")
-    down = _coerce_1d_float(magnitude_down, name="magnitude_down")
-    if not (p.shape[0] == up.shape[0] == down.shape[0]):
-        raise ValueError("prediction vectors must have matching lengths")
-    return PredictionDiagnostics(
-        direction_p_up=summarize_vector(p, name="direction_p_up", config=cfg),
-        magnitude_up=summarize_vector(up, name="magnitude_up", config=cfg),
-        magnitude_down=summarize_vector(down, name="magnitude_down", config=cfg),
-    )
+    return {
+        "p_no_move": summarize_vector(p_no_move, name="p_no_move", config=cfg).as_dict(),
+        "p_move": summarize_vector(p_move, name="p_move", config=cfg).as_dict(),
+        "p_up_given_move": summarize_vector(p_up_given_move, name="p_up_given_move", config=cfg).as_dict(),
+        "p_up_effective": summarize_vector(p_up_effective, name="p_up_effective", config=cfg).as_dict(),
+        "p_down_effective": summarize_vector(p_down_effective, name="p_down_effective", config=cfg).as_dict(),
+        "magnitude_up": summarize_vector(magnitude_up, name="magnitude_up", config=cfg).as_dict(),
+        "magnitude_down": summarize_vector(magnitude_down, name="magnitude_down", config=cfg).as_dict(),
+        "expected_up_bps": summarize_vector(expected_up_bps, name="expected_up_bps", config=cfg).as_dict(),
+        "expected_down_bps": summarize_vector(expected_down_bps, name="expected_down_bps", config=cfg).as_dict(),
+        "expected_signed_edge_bps": summarize_vector(expected_signed_edge_bps, name="expected_signed_edge_bps", config=cfg).as_dict(),
+        "expected_abs_move_bps": summarize_vector(expected_abs_move_bps, name="expected_abs_move_bps", config=cfg).as_dict(),
+    }
 
 
-def build_linear_diagnostics_report(*, model_bundle_state: dict[str, object], preprocess_state: dict[str, object], evaluation_result: dict[str, object], direction_p_up: np.ndarray, magnitude_up: np.ndarray, magnitude_down: np.ndarray, y_direction: np.ndarray, direction_mask: np.ndarray | None = None, config: DiagnosticsConfig | None = None) -> dict[str, object]:
+def build_linear_diagnostics_report(*, model_bundle_state: dict[str, object], preprocess_state: dict[str, object], evaluation_result: dict[str, object], p_no_move: np.ndarray, p_move: np.ndarray, p_up_given_move: np.ndarray, p_up_effective: np.ndarray, p_down_effective: np.ndarray, magnitude_up: np.ndarray, magnitude_down: np.ndarray, expected_up_bps: np.ndarray, expected_down_bps: np.ndarray, expected_signed_edge_bps: np.ndarray, expected_abs_move_bps: np.ndarray, y_no_move: np.ndarray, y_direction: np.ndarray, move_mask: np.ndarray | None = None, config: DiagnosticsConfig | None = None) -> dict[str, object]:
     cfg = config or DiagnosticsConfig()
     if not isinstance(evaluation_result, dict):
         raise ValueError("evaluation_result must be a dict")
@@ -571,17 +575,12 @@ def build_linear_diagnostics_report(*, model_bundle_state: dict[str, object], pr
         "coefficients": coefficient_diagnostics_from_bundle_dict(model_bundle_state, config=cfg),
         "preprocess": preprocess_diagnostics_from_train_state_dict(preprocess_state, config=cfg),
         "predictions": prediction_diagnostics(
-            direction_p_up=direction_p_up,
-            magnitude_up=magnitude_up,
-            magnitude_down=magnitude_down,
-            config=cfg,
-        ).as_dict(),
-        "calibration": direction_calibration_diagnostics(
-            y_direction,
-            direction_p_up,
-            direction_mask=direction_mask,
-            config=cfg,
-        ).as_dict(),
+            p_no_move=p_no_move, p_move=p_move, p_up_given_move=p_up_given_move, p_up_effective=p_up_effective, p_down_effective=p_down_effective, magnitude_up=magnitude_up, magnitude_down=magnitude_down, expected_up_bps=expected_up_bps, expected_down_bps=expected_down_bps, expected_signed_edge_bps=expected_signed_edge_bps, expected_abs_move_bps=expected_abs_move_bps, config=cfg,
+        ),
+        "calibration": {
+            "no_move": direction_calibration_diagnostics(y_no_move.astype(np.int8), p_no_move, direction_mask=np.ones_like(y_no_move, dtype=bool), config=cfg).as_dict(),
+            "direction": direction_calibration_diagnostics(y_direction, p_up_given_move, direction_mask=move_mask, config=cfg).as_dict(),
+        },
         "evaluation": evaluation_result,
     }
 

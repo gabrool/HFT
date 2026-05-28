@@ -322,13 +322,17 @@ def train_model_bundle_from_train_split(reader: rd.StorageDatasetReader, *, mani
                 xb = extractor.transform_table(table)
                 tb = target_builder.transform_table(table)
                 Xz = pre.transform(xb.X, feature_columns=xb.feature_columns)
-                if head == lm.DIRECTION_HEAD:
+                if head == lm.NO_MOVE_HEAD:
+                    bundle.no_move.partial_fit(Xz, tb.y_no_move)
+                elif head == lm.DIRECTION_HEAD:
                     if tb.move_mask.any():
                         bundle.direction.partial_fit(Xz[tb.move_mask], tb.y_direction[tb.move_mask])
                 elif head == lm.MAGNITUDE_UP_HEAD:
-                    bundle.magnitude_up.partial_fit(Xz, tb.y_magnitude_up)
+                    if tb.up_move_mask.any():
+                        bundle.magnitude_up.partial_fit(Xz[tb.up_move_mask], tb.y_magnitude_up[tb.up_move_mask])
                 elif head == lm.MAGNITUDE_DOWN_HEAD:
-                    bundle.magnitude_down.partial_fit(Xz, tb.y_magnitude_down)
+                    if tb.down_move_mask.any():
+                        bundle.magnitude_down.partial_fit(Xz[tb.down_move_mask], tb.y_magnitude_down[tb.down_move_mask])
                 else:
                     raise ValueError("unknown head")
     return bundle
@@ -338,6 +342,7 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
     role_str = _role_to_str(role)
     target_builder = tg.LinearTargetBuilder(config.target_config, manifest=manifest)
 
+    y_return_bps_parts: list[np.ndarray] = []
     y_direction_parts: list[np.ndarray] = []
     no_move_mask_parts: list[np.ndarray] = []
     move_mask_parts: list[np.ndarray] = []
@@ -351,22 +356,27 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
     y_mag_down_parts: list[np.ndarray] = []
     pred_mag_down_parts: list[np.ndarray] = []
 
-    direction_cols = head_features.columns_for_head(lm.DIRECTION_HEAD)
-    direction_ex = _extractor_for_columns(direction_cols, config, manifest)
-    direction_pre = pp.LinearPreprocessor.from_state(preprocess_states_by_head[lm.DIRECTION_HEAD])
-    direction_projection = _projection_for_head(manifest, direction_cols, target_builder)
-    for table in _split_batches(reader, role, direction_projection, config.batch_size):
-        xb = direction_ex.transform_table(table)
-        tb = target_builder.transform_table(table)
-        Xz = direction_pre.transform(xb.X, feature_columns=xb.feature_columns)
-        pred = model_bundle.direction.predict_proba(Xz)[:, 1]
-
-        y_direction_parts.append(tb.y_direction)
-        move_mask_parts.append(tb.move_mask)
-        no_move_mask_parts.append(tb.no_move_mask)
-        up_move_mask_parts.append(tb.up_move_mask)
-        down_move_mask_parts.append(tb.down_move_mask)
-        direction_p_up_parts.append(pred)
+    for head, proba_parts, model_head in (
+        (lm.NO_MOVE_HEAD, no_move_p_parts, model_bundle.no_move),
+        (lm.DIRECTION_HEAD, direction_p_up_parts, model_bundle.direction),
+    ):
+        cols = head_features.columns_for_head(head)
+        extractor = _extractor_for_columns(cols, config, manifest)
+        pre = pp.LinearPreprocessor.from_state(preprocess_states_by_head[head])
+        projection = _projection_for_head(manifest, cols, target_builder)
+        for table in _split_batches(reader, role, projection, config.batch_size):
+            xb = extractor.transform_table(table)
+            tb = target_builder.transform_table(table)
+            Xz = pre.transform(xb.X, feature_columns=xb.feature_columns)
+            proba_parts.append(model_head.predict_proba(Xz)[:, 1])
+            if head == lm.DIRECTION_HEAD:
+                y_direction_parts.append(tb.y_direction)
+                move_mask_parts.append(tb.move_mask)
+                no_move_mask_parts.append(tb.no_move_mask)
+                up_move_mask_parts.append(tb.up_move_mask)
+                down_move_mask_parts.append(tb.down_move_mask)
+                y_no_move_parts.append(tb.y_no_move)
+                y_return_bps_parts.append(tb.y_return_bps)
 
     for head, pred_parts, target_parts, model_head in (
         (lm.MAGNITUDE_UP_HEAD, pred_mag_up_parts, y_mag_up_parts, model_bundle.magnitude_up),
@@ -387,20 +397,30 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
                 target_parts.append(tb.y_magnitude_down)
 
     y_direction = _concat_1d(y_direction_parts, dtype=np.dtype(np.int8), name="y_direction")
-    direction_mask = _concat_1d(direction_mask_parts, dtype=np.dtype(bool), name="direction_mask")
+    y_return_bps = _concat_1d(y_return_bps_parts, dtype=np.dtype(np.float64), name="y_return_bps")
     direction_p_up = _concat_1d(direction_p_up_parts, dtype=np.dtype(np.float64), name="direction_p_up")
+    no_move_p = _concat_1d(no_move_p_parts, dtype=np.dtype(np.float64), name="no_move_p")
+    y_no_move = _concat_1d(y_no_move_parts, dtype=np.dtype(np.float64), name="y_no_move")
+    no_move_mask = _concat_1d(no_move_mask_parts, dtype=np.dtype(bool), name="no_move_mask")
+    move_mask = _concat_1d(move_mask_parts, dtype=np.dtype(bool), name="move_mask")
+    up_move_mask = _concat_1d(up_move_mask_parts, dtype=np.dtype(bool), name="up_move_mask")
+    down_move_mask = _concat_1d(down_move_mask_parts, dtype=np.dtype(bool), name="down_move_mask")
     y_mag_up = _concat_1d(y_mag_up_parts, dtype=np.dtype(np.float64), name="y_mag_up")
     pred_mag_up = _concat_1d(pred_mag_up_parts, dtype=np.dtype(np.float64), name="pred_mag_up")
     y_mag_down = _concat_1d(y_mag_down_parts, dtype=np.dtype(np.float64), name="y_mag_down")
     pred_mag_down = _concat_1d(pred_mag_down_parts, dtype=np.dtype(np.float64), name="pred_mag_down")
 
     evaluation = ev.evaluate_linear_predictions(
+        y_return_bps=y_return_bps,
+        y_no_move=y_no_move,
         y_direction=y_direction,
-        direction_mask=direction_mask,
-        direction_p_up=direction_p_up,
-        y_magnitude_up=y_mag_up,
+        no_move_mask=no_move_mask,
+        move_mask=move_mask,
+        up_move_mask=up_move_mask,
+        down_move_mask=down_move_mask,
+        p_no_move=no_move_p,
+        p_up_given_move=direction_p_up,
         pred_magnitude_up=pred_mag_up,
-        y_magnitude_down=y_mag_down,
         pred_magnitude_down=pred_mag_down,
     ).as_dict()
 
@@ -408,11 +428,20 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
         model_bundle_state=model_bundle.as_dict(),
         preprocess_state=_preprocess_states_as_dict(preprocess_states_by_head),
         evaluation_result=evaluation,
-        direction_p_up=direction_p_up,
+        p_no_move=no_move_p,
+        p_move=1.0 - no_move_p,
+        p_up_given_move=direction_p_up,
+        p_up_effective=(1.0 - no_move_p) * direction_p_up,
+        p_down_effective=(1.0 - no_move_p) * (1.0 - direction_p_up),
         magnitude_up=pred_mag_up,
         magnitude_down=pred_mag_down,
+        expected_up_bps=((1.0 - no_move_p) * direction_p_up) * np.expm1(pred_mag_up),
+        expected_down_bps=((1.0 - no_move_p) * (1.0 - direction_p_up)) * np.expm1(pred_mag_down),
+        expected_signed_edge_bps=(((1.0 - no_move_p) * direction_p_up) * np.expm1(pred_mag_up)) - (((1.0 - no_move_p) * (1.0 - direction_p_up)) * np.expm1(pred_mag_down)),
+        expected_abs_move_bps=(((1.0 - no_move_p) * direction_p_up) * np.expm1(pred_mag_up)) + (((1.0 - no_move_p) * (1.0 - direction_p_up)) * np.expm1(pred_mag_down)),
+        y_no_move=y_no_move,
         y_direction=y_direction,
-        direction_mask=direction_mask,
+        move_mask=move_mask,
         config=config.diagnostics_config,
     )
 

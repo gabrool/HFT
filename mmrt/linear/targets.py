@@ -5,8 +5,8 @@ fixed-horizon return column into target arrays for linear heads. It does not
 parse market data, compute labels from prices, inspect row timing fields,
 build splits, fit preprocessing, train models, or evaluate metrics.
 
-The v1 heads are direction, magnitude-up, and magnitude-down. Stored return
-labels are the source of truth.
+The v1 gated linear heads are no_move, direction, magnitude_up, and magnitude_down.
+Stored return labels are the source of truth.
 """
 
 from dataclasses import dataclass
@@ -302,7 +302,7 @@ def make_target_builder(manifest: mf.StorageManifest, config: LinearTargetConfig
 
 __all__: Sequence[str] = [
     "DEFAULT_TARGET_HORIZON_US",
-    "DEFAULT_DIRECTION_DEADBAND_BPS",
+    "DEFAULT_MOVE_DEADBAND_BPS",
     "DEFAULT_TARGET_DTYPE",
     "ALLOWED_TARGET_DTYPES",
     "DIRECTION_INVALID_CLASS",
