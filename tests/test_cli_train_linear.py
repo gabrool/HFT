@@ -96,6 +96,7 @@ def test_main_calls_train_and_writer_and_prints_compact_json(monkeypatch: pytest
         preprocess_state={},
         model_bundle_state={},
         splits={"train": se_train, "val": se_val},
+        selection_summary={"selection_split": "val", "primary_metrics": {}, "guardrails": {}},
     )
     calls: dict[str, object] = {}
 
@@ -193,11 +194,12 @@ def test_cli_written_artifact_contains_no_move(tmp_path, monkeypatch: pytest.Mon
         "preprocess_state": {"states_by_head": {"no_move": {}}},
         "config": {"resolved_head_features": {"feature_columns_by_head": {"no_move": ["x"]}}},
         "splits": {"train": {"evaluation": {"no_move": {}}, "diagnostics": {"coefficients": {"no_move": {}}}}},
+        "selection_summary": {"selection_split": "val", "primary_metrics": {"no_move": {"metric": "auc", "value": 0.5, "mode": "max", "scope": "all_rows"}, "direction": {"metric": "auc", "value": 0.5, "mode": "max", "scope": "move_mask"}, "magnitude_up": {"metric": "mae", "value": 1.0, "mode": "min", "scope": "up_move_mask"}, "magnitude_down": {"metric": "mae", "value": 1.0, "mode": "min", "scope": "down_move_mask"}}, "guardrails": {"no_move": {"log_loss": 1.0, "brier": 0.25}, "direction": {"log_loss": 1.0, "brier": 0.25}, "magnitude_up": {"spearman": 0.0, "rmse": 1.0}, "magnitude_down": {"spearman": 0.0, "rmse": 1.0}}},
     }
 
     def fake_train(*args, **kwargs):
         se = lt.SplitEvaluation("train", 1, evaluation={}, diagnostics={})
-        return lt.LinearTrainResult(schema_version=1, dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se})
+        return lt.LinearTrainResult(schema_version=1, dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": lt.SplitEvaluation("val", 1, evaluation={}, diagnostics={})}, selection_summary={"selection_split": "val", "primary_metrics": {}, "guardrails": {}})
 
     def fake_write(*args, **kwargs):
         result_path.write_text(json.dumps(artifact_payload))
@@ -215,3 +217,5 @@ def test_cli_written_artifact_contains_no_move(tmp_path, monkeypatch: pytest.Mon
     for split in payload["splits"].values():
         assert "no_move" in split["evaluation"]
         assert "no_move" in split["diagnostics"]["coefficients"]
+    assert payload["selection_summary"]["primary_metrics"]["direction"]["metric"] == "auc"
+    assert payload["selection_summary"]["primary_metrics"]["magnitude_up"]["metric"] == "mae"

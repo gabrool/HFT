@@ -16,6 +16,7 @@ def test_public_api_boundary():
         "DEFAULT_L2",
         "DEFAULT_MAX_GRAD_NORM",
         "DEFAULT_INIT_SCALE",
+        "DEFAULT_MAGNITUDE_HUBER_DELTA",
         "NO_MOVE_HEAD",
         "DIRECTION_HEAD",
         "MAGNITUDE_UP_HEAD",
@@ -34,6 +35,7 @@ def test_public_api_boundary():
     ]
     assert lm.__all__ == expected
     assert lm.MODEL_HEADS == ("no_move", "direction", "magnitude_up", "magnitude_down")
+    assert lm.DEFAULT_MAGNITUDE_HUBER_DELTA == 1.0
     forbidden = ["bybit", "cmssl", "stage", "pca", "sklearn", "torch", "pandas", "polars", "reader", "writer", "storage", "extract", "preprocess", "evaluate"]
     lowered = [name.lower() for name in lm.__all__]
     for needle in forbidden:
@@ -66,6 +68,7 @@ def test_config_validation():
     assert cfg.l2 == 1e-4
     assert cfg.max_grad_norm == 10.0
     assert cfg.output_dtype == "float32"
+    assert cfg.magnitude_huber_delta == 1.0
     assert lm.LinearModelConfig(output_dtype="float64").dtype == np.dtype("float64")
     for bad in [0.0, -1.0, np.nan, np.inf, True]:
         with pytest.raises(ValueError):
@@ -79,6 +82,9 @@ def test_config_validation():
             lm.LinearModelConfig(max_grad_norm=bad)
     with pytest.raises(ValueError):
         lm.LinearModelConfig(output_dtype="bad")
+    for bad in [0.0, -1.0, np.nan, np.inf, True]:
+        with pytest.raises(ValueError):
+            lm.LinearModelConfig(magnitude_huber_delta=bad)
     for attr in ["solver", "random_state", "class_weight", "epochs", "batch_size", "stage", "no_move"]:
         assert not hasattr(cfg, attr)
 
@@ -166,6 +172,24 @@ def test_magnitude_validates_targets():
     head.partial_fit(np.empty((0, 1)), np.empty((0,)))
     assert (head.n_updates, head.n_rows_seen) == before
 
+
+
+def test_magnitude_huber_limits_outlier_gradient():
+    X = np.array([[1.0], [1.0]], dtype=np.float64)
+    y = np.array([0.0, 100.0], dtype=np.float64)
+
+    cfg = lm.LinearModelConfig(
+        learning_rate=1.0,
+        l2=0.0,
+        max_grad_norm=1e9,
+        magnitude_huber_delta=1.0,
+    )
+    head = lm.MagnitudeLinearHead(lm.MAGNITUDE_UP_HEAD, ("x",), cfg)
+
+    head.partial_fit(X, y)
+
+    assert head.weights[0] == pytest.approx(0.5)
+    assert head.intercept == pytest.approx(0.5)
 
 def test_gradient_clipping_keeps_params_finite():
     X = np.array([[1e6, -1e6], [-1e6, 1e6]], dtype=np.float64)

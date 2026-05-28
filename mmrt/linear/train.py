@@ -167,6 +167,7 @@ class LinearTrainConfig:
                 "l2": self.model_config.l2,
                 "max_grad_norm": self.model_config.max_grad_norm,
                 "output_dtype": self.model_config.output_dtype,
+                "magnitude_huber_delta": self.model_config.magnitude_huber_delta,
             },
             "diagnostics_config": {
                 "top_k": self.diagnostics_config.top_k,
@@ -215,6 +216,7 @@ class LinearTrainResult:
     preprocess_state: dict[str, object]
     model_bundle_state: dict[str, object]
     splits: dict[str, SplitEvaluation]
+    selection_summary: dict[str, object]
 
     def __post_init__(self) -> None:
         if self.schema_version != TRAIN_RESULT_SCHEMA_VERSION:
@@ -224,8 +226,8 @@ class LinearTrainResult:
         for name in ("config", "preprocess_state", "model_bundle_state"):
             if not isinstance(getattr(self, name), dict):
                 raise ValueError(f"{name} must be dict")
-        if not isinstance(self.splits, dict):
-            raise ValueError("splits must be dict")
+        if not isinstance(self.selection_summary, dict):
+            raise ValueError("selection_summary must be dict")
         keys = set(self.splits.keys())
         if not keys.issubset({"train", "val", "test"}):
             raise ValueError("splits keys must be subset of train/val/test")
@@ -247,6 +249,7 @@ class LinearTrainResult:
                 "preprocess_state": self.preprocess_state,
                 "model_bundle_state": self.model_bundle_state,
                 "splits": {k: v.as_dict() for k, v in self.splits.items()},
+                "selection_summary": self.selection_summary,
             },
             name="linear_train_result",
         )
@@ -446,6 +449,38 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
     return SplitEvaluation(role=role_str, n_rows=int(y_direction.shape[0]), evaluation=evaluation, diagnostics=diagnostics)
 
 
+
+def _selection_summary_from_splits(splits: dict[str, SplitEvaluation]) -> dict[str, object]:
+    if "val" not in splits:
+        raise ValueError("selection summary requires val split")
+    val_eval = splits["val"].evaluation
+
+    def req(path: tuple[str, ...]) -> float:
+        cur: object = val_eval
+        prefix = "evaluation"
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                raise ValueError(f"missing required selection metric: {prefix}[{key!r}]")
+            cur = cur[key]
+            prefix += f"[{key!r}]"
+        return float(cur)
+
+    return {
+        "selection_split": "val",
+        "primary_metrics": {
+            "no_move": {"metric": "auc", "value": req(("no_move", "auc")), "mode": "max", "scope": "all_rows"},
+            "direction": {"metric": "auc", "value": req(("direction", "auc")), "mode": "max", "scope": "move_mask"},
+            "magnitude_up": {"metric": "mae", "value": req(("magnitude_up", "mae")), "mode": "min", "scope": "up_move_mask"},
+            "magnitude_down": {"metric": "mae", "value": req(("magnitude_down", "mae")), "mode": "min", "scope": "down_move_mask"},
+        },
+        "guardrails": {
+            "no_move": {"log_loss": req(("no_move", "log_loss")), "brier": req(("no_move", "brier"))},
+            "direction": {"log_loss": req(("direction", "log_loss")), "brier": req(("direction", "brier"))},
+            "magnitude_up": {"spearman": req(("magnitude_up", "spearman")), "rmse": req(("magnitude_up", "rmse"))},
+            "magnitude_down": {"spearman": req(("magnitude_down", "spearman")), "rmse": req(("magnitude_down", "rmse"))},
+        },
+    }
+
 def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = None) -> LinearTrainResult:
     cfg = config or LinearTrainConfig()
     root_str = _require_non_empty_str(dataset_root, "dataset_root")
@@ -477,6 +512,8 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
             config=cfg,
         )
 
+    selection_summary = _selection_summary_from_splits(split_evals)
+
     return LinearTrainResult(
         schema_version=TRAIN_RESULT_SCHEMA_VERSION,
         dataset_id=manifest.dataset_id,
@@ -485,6 +522,7 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
         preprocess_state=_preprocess_states_as_dict(preprocess_states_by_head),
         model_bundle_state=model_bundle.as_dict(),
         splits=split_evals,
+        selection_summary=selection_summary,
     )
 
 
