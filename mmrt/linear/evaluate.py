@@ -246,11 +246,15 @@ class RegressionMetrics:
 
 @dataclass(frozen=True, slots=True)
 class LinearEvaluationResult:
+    no_move: DirectionMetrics
     direction: DirectionMetrics
     magnitude_up: RegressionMetrics
     magnitude_down: RegressionMetrics
+    gated_signal: dict[str, object]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.no_move, DirectionMetrics):
+            raise TypeError("no_move must be DirectionMetrics")
         if not isinstance(self.direction, DirectionMetrics):
             raise TypeError("direction must be DirectionMetrics")
         if not isinstance(self.magnitude_up, RegressionMetrics):
@@ -260,10 +264,43 @@ class LinearEvaluationResult:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "no_move": self.no_move.as_dict(),
             "direction": self.direction.as_dict(),
             "magnitude_up": self.magnitude_up.as_dict(),
             "magnitude_down": self.magnitude_down.as_dict(),
+            "gated_signal": self.gated_signal,
         }
+
+
+def derive_gated_signal_predictions(
+    *, p_no_move: np.ndarray, p_up_given_move: np.ndarray, pred_magnitude_up: np.ndarray, pred_magnitude_down: np.ndarray
+) -> dict[str, np.ndarray]:
+    pnm = _coerce_1d_float(p_no_move, name="p_no_move")
+    pum = _coerce_1d_float(p_up_given_move, name="p_up_given_move")
+    mup = _coerce_1d_float(pred_magnitude_up, name="pred_magnitude_up")
+    mdn = _coerce_1d_float(pred_magnitude_down, name="pred_magnitude_down")
+    n = pnm.shape[0]
+    for name, arr in (("p_up_given_move", pum), ("pred_magnitude_up", mup), ("pred_magnitude_down", mdn)):
+        if arr.shape[0] != n:
+            raise ValueError(f"{name} must match p_no_move length")
+    p_move = 1.0 - pnm
+    p_up_effective = p_move * pum
+    p_down_effective = p_move * (1.0 - pum)
+    mag_up_bps = np.expm1(mup)
+    mag_down_bps = np.expm1(mdn)
+    expected_up_bps = p_up_effective * mag_up_bps
+    expected_down_bps = p_down_effective * mag_down_bps
+    return {
+        "p_move": p_move,
+        "p_up_effective": p_up_effective,
+        "p_down_effective": p_down_effective,
+        "mag_up_bps": mag_up_bps,
+        "mag_down_bps": mag_down_bps,
+        "expected_up_bps": expected_up_bps,
+        "expected_down_bps": expected_down_bps,
+        "expected_signed_edge_bps": expected_up_bps - expected_down_bps,
+        "expected_abs_move_bps": expected_up_bps + expected_down_bps,
+    }
 
 
 def evaluate_direction(
@@ -371,33 +408,42 @@ def evaluate_regression(y_true: np.ndarray, y_pred: np.ndarray) -> RegressionMet
 
 def evaluate_linear_predictions(
     *,
+    y_return_bps: np.ndarray,
+    y_no_move: np.ndarray,
     y_direction: np.ndarray,
-    direction_p_up: np.ndarray,
-    y_magnitude_up: np.ndarray,
+    no_move_mask: np.ndarray,
+    move_mask: np.ndarray,
+    up_move_mask: np.ndarray,
+    down_move_mask: np.ndarray,
+    p_no_move: np.ndarray,
+    p_up_given_move: np.ndarray,
     pred_magnitude_up: np.ndarray,
-    y_magnitude_down: np.ndarray,
     pred_magnitude_down: np.ndarray,
-    direction_mask: np.ndarray | None = None,
     threshold: float = DEFAULT_CLASSIFICATION_THRESHOLD,
 ) -> LinearEvaluationResult:
-    n_rows = np.asarray(y_direction).shape[0]
-    arrays: Sequence[tuple[str, np.ndarray]] = (
-        ("direction_p_up", direction_p_up),
-        ("y_magnitude_up", y_magnitude_up),
-        ("pred_magnitude_up", pred_magnitude_up),
-        ("y_magnitude_down", y_magnitude_down),
-        ("pred_magnitude_down", pred_magnitude_down),
-    )
-    for name, arr in arrays:
-        if np.asarray(arr).ndim != 1 or np.asarray(arr).shape[0] != n_rows:
-            raise ValueError(f"{name} must be 1D with length matching y_direction")
-    if direction_mask is not None and np.asarray(direction_mask).shape[0] != n_rows:
-        raise ValueError("direction_mask must have length matching y_direction")
-
-    direction = evaluate_direction(y_direction, direction_p_up, direction_mask=direction_mask, threshold=threshold)
-    magnitude_up = evaluate_regression(y_magnitude_up, pred_magnitude_up)
-    magnitude_down = evaluate_regression(y_magnitude_down, pred_magnitude_down)
-    return LinearEvaluationResult(direction=direction, magnitude_up=magnitude_up, magnitude_down=magnitude_down)
+    yret = _coerce_1d_float(y_return_bps, name="y_return_bps")
+    n_rows = yret.shape[0]
+    ynm = _coerce_probability_vector(y_no_move, n_rows=n_rows, name="y_no_move")
+    ydir = _coerce_direction_classes(y_direction)
+    nm_mask = _coerce_bool_mask(no_move_mask, n_rows=n_rows, name="no_move_mask")
+    mv_mask = _coerce_bool_mask(move_mask, n_rows=n_rows, name="move_mask")
+    up_mask = _coerce_bool_mask(up_move_mask, n_rows=n_rows, name="up_move_mask")
+    dn_mask = _coerce_bool_mask(down_move_mask, n_rows=n_rows, name="down_move_mask")
+    pnm = _coerce_probability_vector(p_no_move, n_rows=n_rows, name="p_no_move")
+    pupm = _coerce_probability_vector(p_up_given_move, n_rows=n_rows, name="p_up_given_move")
+    pmu = _coerce_1d_float(pred_magnitude_up, name="pred_magnitude_up")
+    pmd = _coerce_1d_float(pred_magnitude_down, name="pred_magnitude_down")
+    no_move = evaluate_direction(ynm.astype(np.int8), pnm, direction_mask=np.ones(n_rows, dtype=bool), threshold=threshold)
+    direction = evaluate_direction(ydir, pupm, direction_mask=mv_mask, threshold=threshold)
+    magnitude_up = evaluate_regression(np.log1p(np.maximum(yret[up_mask], 0.0)), pmu[up_mask])
+    magnitude_down = evaluate_regression(np.log1p(np.maximum(-yret[dn_mask], 0.0)), pmd[dn_mask])
+    gated = derive_gated_signal_predictions(p_no_move=pnm, p_up_given_move=pupm, pred_magnitude_up=pmu, pred_magnitude_down=pmd)
+    gated_signal = {
+        "signed_edge": evaluate_regression(yret, gated["expected_signed_edge_bps"]).as_dict(),
+        "abs_move": evaluate_regression(np.abs(yret), gated["expected_abs_move_bps"]).as_dict(),
+        "n_rows": int(n_rows),
+    }
+    return LinearEvaluationResult(no_move=no_move, direction=direction, magnitude_up=magnitude_up, magnitude_down=magnitude_down, gated_signal=gated_signal)
 
 
 def confusion_counts(
@@ -444,3 +490,4 @@ __all__ = [
     "evaluate_linear_predictions",
     "confusion_counts",
 ]
+

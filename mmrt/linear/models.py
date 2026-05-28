@@ -353,10 +353,27 @@ class NoMoveLinearHead(BaseLinearHead):
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         p = _sigmoid(_coerce_matrix(X, n_features=len(self.feature_columns)) @ self.weights + self.intercept)
-        return np.ascontiguousarray(np.column_stack([1.0 - p, p]).astype(self.config.dtype, copy=False))
+        proba = np.ascontiguousarray(np.column_stack([1.0 - p, p]).astype(self.config.dtype, copy=False))
+        if not np.isfinite(proba).all():
+            raise ValueError("predict_proba produced non-finite values")
+        return proba
 
     def predict(self, X: np.ndarray, *, threshold: float = 0.5) -> np.ndarray:
-        return (self.predict_proba(X)[:, 1] >= float(threshold)).astype(np.int8, copy=False)
+        thr = float(threshold)
+        if not np.isfinite(thr) or thr < 0.0 or thr > 1.0:
+            raise ValueError("threshold must be finite and within [0, 1]")
+        return (self.predict_proba(X)[:, 1] >= thr).astype(np.int8, copy=False)
+
+    def loss(self, X: np.ndarray, y_no_move: np.ndarray) -> float:
+        Xc = _coerce_matrix(X, n_features=len(self.feature_columns))
+        y = _coerce_binary_classes(y_no_move, n_rows=Xc.shape[0])
+        if Xc.shape[0] == 0:
+            return 0.5 * self.config.l2 * float(np.dot(self.weights, self.weights))
+        p = _sigmoid(Xc @ self.weights + self.intercept)
+        p = np.clip(p, 1e-12, 1.0 - 1e-12)
+        ce = -np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
+        reg = 0.5 * self.config.l2 * float(np.dot(self.weights, self.weights))
+        return float(ce + reg)
 
 
 class MagnitudeLinearHead(BaseLinearHead):
@@ -405,6 +422,8 @@ class LinearModelBundle:
     magnitude_down: MagnitudeLinearHead
 
     def __post_init__(self) -> None:
+        if not isinstance(self.no_move, NoMoveLinearHead):
+            raise ValueError("no_move must be NoMoveLinearHead")
         if not isinstance(self.direction, DirectionLinearHead):
             raise ValueError("direction must be DirectionLinearHead")
         if not isinstance(self.magnitude_up, MagnitudeLinearHead):
@@ -421,6 +440,7 @@ class LinearModelBundle:
     @property
     def feature_columns_by_head(self) -> dict[str, tuple[str, ...]]:
         return {
+            NO_MOVE_HEAD: self.no_move.feature_columns,
             DIRECTION_HEAD: self.direction.feature_columns,
             MAGNITUDE_UP_HEAD: self.magnitude_up.feature_columns,
             MAGNITUDE_DOWN_HEAD: self.magnitude_down.feature_columns,
@@ -470,6 +490,7 @@ class LinearModelBundle:
                 for head, cols in self.feature_columns_by_head.items()
             },
             "feature_counts_by_head": self.feature_counts_by_head,
+            "no_move": self.no_move.as_dict(),
             "direction": self.direction.as_dict(),
             "magnitude_up": self.magnitude_up.as_dict(),
             "magnitude_down": self.magnitude_down.as_dict(),
@@ -486,6 +507,8 @@ class LinearModelBundle:
         direction = load_linear_head_state(LinearHeadState.from_dict(d["direction"]))
         magnitude_up = load_linear_head_state(LinearHeadState.from_dict(d["magnitude_up"]))
         magnitude_down = load_linear_head_state(LinearHeadState.from_dict(d["magnitude_down"]))
+        if not isinstance(no_move, NoMoveLinearHead):
+            raise ValueError("no_move state is invalid")
         if not isinstance(direction, DirectionLinearHead):
             raise ValueError("direction state is invalid")
         if not isinstance(magnitude_up, MagnitudeLinearHead) or not isinstance(magnitude_down, MagnitudeLinearHead):
@@ -542,6 +565,7 @@ __all__ = [
     "DEFAULT_L2",
     "DEFAULT_MAX_GRAD_NORM",
     "DEFAULT_INIT_SCALE",
+    "NO_MOVE_HEAD",
     "DIRECTION_HEAD",
     "MAGNITUDE_UP_HEAD",
     "MAGNITUDE_DOWN_HEAD",
@@ -549,6 +573,7 @@ __all__ = [
     "LinearModelConfig",
     "LinearHeadState",
     "BaseLinearHead",
+    "NoMoveLinearHead",
     "DirectionLinearHead",
     "MagnitudeLinearHead",
     "LinearModelBundle",
@@ -556,11 +581,3 @@ __all__ = [
     "load_linear_head_state",
     "load_linear_model_bundle",
 ]
-        if not isinstance(self.no_move, NoMoveLinearHead):
-            raise ValueError("no_move must be NoMoveLinearHead")
-            NO_MOVE_HEAD: self.no_move.feature_columns,
-            "no_move": self.no_move.as_dict(),
-        if not isinstance(no_move, NoMoveLinearHead):
-            raise ValueError("no_move state is invalid")
-    "NO_MOVE_HEAD",
-    "NoMoveLinearHead",
