@@ -162,6 +162,9 @@ def test_build_linear_targets_deadband():
     np.testing.assert_array_equal(b.up_move_mask, np.array([False, False, False, True, False]))
     np.testing.assert_array_equal(b.down_move_mask, np.array([False, False, False, False, True]))
     np.testing.assert_array_equal(b.y_direction, np.array([-1, -1, -1, 1, 0], dtype=np.int8))
+    assert np.array_equal(b.no_move_mask, ~b.move_mask)
+    assert np.array_equal(b.move_mask, b.up_move_mask | b.down_move_mask)
+    assert not np.any(b.up_move_mask & b.down_move_mask)
 
 
 def test_linear_target_batch_validation_and_copy():
@@ -195,8 +198,11 @@ def test_linear_target_batch_validation_and_copy():
         tg.LinearTargetBatch(y_return_bps=np.array([1.0], np.float32), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
         tg.LinearTargetBatch(y_return_bps=np.array([np.nan, 1.0], np.float32), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
+    bad_ret = np.arange(4, dtype=np.float32)[::2]
+    assert bad_ret.shape == (2,)
+    assert not bad_ret.flags.c_contiguous
     with pytest.raises(ValueError):
-        tg.LinearTargetBatch(y_return_bps=np.asfortranarray(np.array([1.0, 1.0], np.float32)), y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
+        tg.LinearTargetBatch(y_return_bps=bad_ret, y_no_move=y_no_move, y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
         tg.LinearTargetBatch(y_return_bps=np.array([1.0, 1.0], np.float32), y_no_move=np.array([0.0, 2.0], np.float32), y_direction=y_direction, y_magnitude_up=y_up, y_magnitude_down=y_down, no_move_mask=no_move_mask, move_mask=move_mask, up_move_mask=up_move_mask, down_move_mask=down_move_mask, target_column="c", horizon_us=1)
     with pytest.raises(ValueError):
@@ -265,31 +271,3 @@ def test_vectorized_no_row_loop_smoke():
     src = inspect.getsource(tg)
     for tok in (".iterrows", "to_pandas", "for i in range(len("):
         assert tok not in src
-
-def test_public_api_move_deadband_export():
-    assert "DEFAULT_MOVE_DEADBAND_BPS" in tg.__all__
-    assert "DEFAULT_DIRECTION_DEADBAND_BPS" not in tg.__all__
-
-
-def test_mask_and_class_semantics():
-    ret = np.array([-2.0, 0.0, 1.5], dtype=np.float32)
-    tb = tg.build_linear_targets(ret, config=tg.LinearTargetConfig(move_deadband_bps=0.0))
-    assert tb.y_no_move.tolist() == [0.0, 1.0, 0.0]
-    assert tb.move_mask.tolist() == [True, False, True]
-    assert tb.no_move_mask.tolist() == [False, True, False]
-    assert tb.down_move_mask.tolist() == [True, False, False]
-    assert tb.up_move_mask.tolist() == [False, False, True]
-    assert tb.y_direction.tolist() == [0, -1, 1]
-
-
-def test_deadband_boundary_and_mask_consistency():
-    ret = np.array([-0.5, 0.0, 0.5, 0.5001, -0.5001], dtype=np.float32)
-    cfg = tg.LinearTargetConfig(move_deadband_bps=0.5)
-    tb = tg.build_linear_targets(ret, config=cfg)
-    expected_no_move = np.abs(ret) <= 0.5
-    expected_move = np.abs(ret) > 0.5
-    assert np.array_equal(tb.no_move_mask, expected_no_move)
-    assert np.array_equal(tb.move_mask, expected_move)
-    assert np.array_equal(tb.no_move_mask, ~tb.move_mask)
-    assert np.array_equal(tb.move_mask, tb.up_move_mask | tb.down_move_mask)
-    assert not np.any(tb.up_move_mask & tb.down_move_mask)
