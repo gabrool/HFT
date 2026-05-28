@@ -416,6 +416,8 @@ class LinearModelBundle:
 
     @property
     def n_features(self) -> int:
+        if not self.heads_share_feature_columns():
+            raise ValueError("n_features is only defined when all heads share feature_columns")
         return len(self.direction.feature_columns)
 
     def predict(self, X: np.ndarray) -> dict[str, np.ndarray]:

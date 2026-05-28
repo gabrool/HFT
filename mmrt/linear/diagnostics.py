@@ -19,6 +19,13 @@ DIRECTION_DOWN_CLASS = 0
 DIRECTION_UP_CLASS = 1
 DIRECTION_INVALID_CLASS = -1
 
+DIRECTION_HEAD = "direction"
+MAGNITUDE_UP_HEAD = "magnitude_up"
+MAGNITUDE_DOWN_HEAD = "magnitude_down"
+MODEL_HEADS = (DIRECTION_HEAD, MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD)
+
+PER_HEAD_PREPROCESS_SCHEMA = "per_head_preprocess_v1"
+
 
 def _require_positive_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -395,6 +402,36 @@ def preprocess_diagnostics_from_state_dict(state: dict[str, object], *, config: 
     )
 
 
+def preprocess_diagnostics_from_train_state_dict(
+    state: dict[str, object],
+    *,
+    config: DiagnosticsConfig | None = None,
+) -> dict[str, object]:
+    if not isinstance(state, dict):
+        raise ValueError("preprocess_state must be a dict")
+
+    if state.get("schema") != PER_HEAD_PREPROCESS_SCHEMA:
+        return preprocess_diagnostics_from_state_dict(state, config=config).as_dict()
+
+    states_by_head = state.get("states_by_head")
+    if not isinstance(states_by_head, dict):
+        raise ValueError("states_by_head must be a dict")
+
+    if set(states_by_head.keys()) != set(MODEL_HEADS):
+        raise ValueError("states_by_head keys must exactly match model heads")
+
+    return {
+        "schema": PER_HEAD_PREPROCESS_SCHEMA,
+        "states_by_head": {
+            head: preprocess_diagnostics_from_state_dict(
+                states_by_head[head],
+                config=config,
+            ).as_dict()
+            for head in MODEL_HEADS
+        },
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class CalibrationBin:
     bin_index: int
@@ -532,7 +569,7 @@ def build_linear_diagnostics_report(*, model_bundle_state: dict[str, object], pr
         "diagnostics_version": 1,
         "config": {"top_k": cfg.top_k, "num_bins": cfg.num_bins, "max_rows": cfg.max_rows},
         "coefficients": coefficient_diagnostics_from_bundle_dict(model_bundle_state, config=cfg),
-        "preprocess": preprocess_diagnostics_from_state_dict(preprocess_state, config=cfg).as_dict(),
+        "preprocess": preprocess_diagnostics_from_train_state_dict(preprocess_state, config=cfg),
         "predictions": prediction_diagnostics(
             direction_p_up=direction_p_up,
             magnitude_up=magnitude_up,
@@ -569,6 +606,7 @@ __all__ = [
     "coefficient_diagnostics_from_head_dict",
     "coefficient_diagnostics_from_bundle_dict",
     "preprocess_diagnostics_from_state_dict",
+    "preprocess_diagnostics_from_train_state_dict",
     "direction_calibration_diagnostics",
     "prediction_diagnostics",
     "build_linear_diagnostics_report",

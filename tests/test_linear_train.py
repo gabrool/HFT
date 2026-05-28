@@ -300,6 +300,14 @@ def test_train_linear_model_respects_per_head_feature_subsets(tmp_path: Path):
             lm.MAGNITUDE_DOWN_HEAD,
         }
 
+    for split_eval in result.splits.values():
+        pre_diag = split_eval.diagnostics["preprocess"]
+        assert pre_diag["schema"] == "per_head_preprocess_v1"
+        assert set(pre_diag["states_by_head"]) == set(lm.MODEL_HEADS)
+        assert pre_diag["states_by_head"][lm.DIRECTION_HEAD]["n_features"] == 2
+        assert pre_diag["states_by_head"][lm.MAGNITUDE_UP_HEAD]["n_features"] == 2
+        assert pre_diag["states_by_head"][lm.MAGNITUDE_DOWN_HEAD]["n_features"] == 2
+
 
 def test_train_missing_head_feature_entry_defaults_to_all_features(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
