@@ -37,8 +37,9 @@ def test_unknown_head_and_feature_and_duplicates(tmp_path: Path):
 def test_missing_defaults_overlap_and_manifest_order(tmp_path: Path):
     m = _manifest(tmp_path)
     cols = tuple(m.feature_columns)
-    cfg = hf.HeadFeatureConfig({lm.DIRECTION_HEAD: (cols[3], cols[1]), lm.MAGNITUDE_UP_HEAD: (cols[1], cols[2])})
+    cfg = hf.HeadFeatureConfig({lm.NO_MOVE_HEAD: (cols[2], cols[0]), lm.DIRECTION_HEAD: (cols[3], cols[1]), lm.MAGNITUDE_UP_HEAD: (cols[1], cols[2])})
     r = hf.resolve_head_feature_sets(m, cfg)
+    assert r.columns_for_head(lm.NO_MOVE_HEAD) == (cols[0], cols[2])
     assert r.columns_for_head(lm.DIRECTION_HEAD) == (cols[1], cols[3])
     assert r.columns_for_head(lm.MAGNITUDE_DOWN_HEAD) == cols
     assert set(r.feature_columns_by_head.keys()) == set(lm.MODEL_HEADS)

@@ -16,6 +16,7 @@ def test_public_api_boundary():
         "DEFAULT_L2",
         "DEFAULT_MAX_GRAD_NORM",
         "DEFAULT_INIT_SCALE",
+        "NO_MOVE_HEAD",
         "DIRECTION_HEAD",
         "MAGNITUDE_UP_HEAD",
         "MAGNITUDE_DOWN_HEAD",
@@ -23,6 +24,7 @@ def test_public_api_boundary():
         "LinearModelConfig",
         "LinearHeadState",
         "BaseLinearHead",
+        "NoMoveLinearHead",
         "DirectionLinearHead",
         "MagnitudeLinearHead",
         "LinearModelBundle",
@@ -31,6 +33,7 @@ def test_public_api_boundary():
         "load_linear_model_bundle",
     ]
     assert lm.__all__ == expected
+    assert lm.MODEL_HEADS == ("no_move", "direction", "magnitude_up", "magnitude_down")
     forbidden = ["bybit", "cmssl", "stage", "pca", "sklearn", "torch", "pandas", "polars", "reader", "writer", "storage", "extract", "preprocess", "evaluate"]
     lowered = [name.lower() for name in lm.__all__]
     for needle in forbidden:
@@ -191,6 +194,7 @@ def test_l2_regularizes_weights_not_intercept_smoke():
 
 def test_bundle_predictions_and_validation():
     bundle = lm.make_linear_model_bundle(("a", "b"))
+    assert isinstance(bundle.no_move, lm.NoMoveLinearHead)
     assert isinstance(bundle.direction, lm.DirectionLinearHead)
     assert isinstance(bundle.magnitude_up, lm.MagnitudeLinearHead)
     assert isinstance(bundle.magnitude_down, lm.MagnitudeLinearHead)
@@ -198,7 +202,7 @@ def test_bundle_predictions_and_validation():
     assert bundle.heads_share_feature_columns()
     assert bundle.n_features == 2
     out = bundle.predict(np.zeros((3, 2)))
-    assert set(out) == {"direction_proba", "direction_pred", "magnitude_up", "magnitude_down"}
+    assert set(out) == {"no_move_proba", "no_move_pred", "direction_proba", "direction_pred", "magnitude_up", "magnitude_down"}
     assert out["direction_proba"].shape == (3, 2)
     assert out["direction_pred"].shape == (3,)
     assert out["magnitude_up"].shape == (3,)
