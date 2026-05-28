@@ -196,6 +196,7 @@ def test_bundle_predictions_and_validation():
     assert isinstance(bundle.magnitude_down, lm.MagnitudeLinearHead)
     assert bundle.feature_columns_by_head[lm.DIRECTION_HEAD] == ("a", "b")
     assert bundle.heads_share_feature_columns()
+    assert bundle.n_features == 2
     out = bundle.predict(np.zeros((3, 2)))
     assert set(out) == {"direction_proba", "direction_pred", "magnitude_up", "magnitude_down"}
     assert out["direction_proba"].shape == (3, 2)
@@ -209,6 +210,19 @@ def test_bundle_predictions_and_validation():
             magnitude_up=lm.MagnitudeLinearHead(lm.MAGNITUDE_UP_HEAD, ("a",)),
             magnitude_down=lm.MagnitudeLinearHead(lm.MAGNITUDE_DOWN_HEAD, ("b",)),
         )
+
+
+def test_bundle_n_features_rejects_nonshared_feature_columns():
+    bundle = lm.make_linear_model_bundle(
+        {
+            lm.DIRECTION_HEAD: ("x_a", "x_b"),
+            lm.MAGNITUDE_UP_HEAD: ("x_a",),
+            lm.MAGNITUDE_DOWN_HEAD: ("x_b",),
+        }
+    )
+
+    with pytest.raises(ValueError, match="only defined when all heads share"):
+        _ = bundle.n_features
 
 
 def test_bundle_serialization_roundtrip():

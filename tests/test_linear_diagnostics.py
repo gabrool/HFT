@@ -16,7 +16,8 @@ def test_public_api_boundary():
         "PreprocessDiagnostics", "CalibrationBin", "CalibrationDiagnostics", "PredictionDiagnostics",
         "summarize_vector", "coefficient_diagnostics", "coefficient_diagnostics_from_head_dict",
         "coefficient_diagnostics_from_bundle_dict", "preprocess_diagnostics_from_state_dict",
-        "direction_calibration_diagnostics", "prediction_diagnostics", "build_linear_diagnostics_report",
+        "preprocess_diagnostics_from_train_state_dict", "direction_calibration_diagnostics",
+        "prediction_diagnostics", "build_linear_diagnostics_report",
     ]
     assert dg.__all__ == expected
     forbidden = ("bybit", "cmssl", "stage", "pca", "sklearn", "torch", "pandas", "polars", "reader", "writer", "storage", "extract", "train", "model")
@@ -169,6 +170,65 @@ def test_preprocess_diagnostics_from_state_dict():
         dg.preprocess_diagnostics_from_state_dict({**state, "active_mask": np.array([0, 1, 1])})
 
 
+def test_preprocess_diagnostics_from_train_state_dict_accepts_flat_state():
+    state = {
+        "feature_columns": ["x_a", "x_b"],
+        "variance": [1.0, 0.0],
+        "scale": [1.0, 1.0],
+        "active_mask": [True, False],
+    }
+
+    out = dg.preprocess_diagnostics_from_train_state_dict(state)
+
+    assert out["n_features"] == 2
+    assert out["active_count"] == 1
+    assert out["inactive_count"] == 1
+
+
+def test_preprocess_diagnostics_from_train_state_dict_accepts_per_head_state():
+    def state(cols):
+        return {
+            "feature_columns": cols,
+            "variance": [1.0 for _ in cols],
+            "scale": [1.0 for _ in cols],
+            "active_mask": [True for _ in cols],
+        }
+
+    per_head = {
+        "schema": "per_head_preprocess_v1",
+        "states_by_head": {
+            "direction": state(["x_a", "x_b"]),
+            "magnitude_up": state(["x_b"]),
+            "magnitude_down": state(["x_c", "x_d"]),
+        },
+    }
+
+    out = dg.preprocess_diagnostics_from_train_state_dict(per_head)
+
+    assert out["schema"] == "per_head_preprocess_v1"
+    assert set(out["states_by_head"]) == {"direction", "magnitude_up", "magnitude_down"}
+    assert out["states_by_head"]["direction"]["n_features"] == 2
+    assert out["states_by_head"]["magnitude_up"]["n_features"] == 1
+    assert out["states_by_head"]["magnitude_down"]["n_features"] == 2
+
+
+def test_preprocess_diagnostics_from_train_state_dict_rejects_bad_per_head_keys():
+    state = {
+        "schema": "per_head_preprocess_v1",
+        "states_by_head": {
+            "direction": {
+                "feature_columns": ["x_a"],
+                "variance": [1.0],
+                "scale": [1.0],
+                "active_mask": [True],
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="model heads"):
+        dg.preprocess_diagnostics_from_train_state_dict(state)
+
+
 def test_direction_calibration_diagnostics_basic():
     y = np.array([0, 1, 1, 0, -1])
     p = np.array([0.1, 0.2, 0.8, 0.9, 0.5])
@@ -213,6 +273,39 @@ def test_build_linear_diagnostics_report():
     report = dg.build_linear_diagnostics_report(model_bundle_state=bundle, preprocess_state=prep, evaluation_result=eval_result, direction_p_up=np.array([0.1, 0.9]), magnitude_up=np.array([1.0, 2.0]), magnitude_down=np.array([0.4, 0.2]), y_direction=np.array([0, 1]))
     assert set(report) == {"diagnostics_version", "config", "coefficients", "preprocess", "predictions", "calibration", "evaluation"}
     assert report["evaluation"] is eval_result
+
+
+def test_build_linear_diagnostics_report_accepts_per_head_preprocess_state():
+    model_bundle_state = {
+        "bundle_type": "linear_three_head",
+        "feature_columns_by_head": {"direction": ["x_a"], "magnitude_up": ["x_b"], "magnitude_down": ["x_c"]},
+        "feature_counts_by_head": {"direction": 1, "magnitude_up": 1, "magnitude_down": 1},
+        "direction": {"head_name": "direction", "feature_columns": ["x_a"], "weights": [0.1], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
+        "magnitude_up": {"head_name": "magnitude_up", "feature_columns": ["x_b"], "weights": [0.2], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
+        "magnitude_down": {"head_name": "magnitude_down", "feature_columns": ["x_c"], "weights": [-0.2], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
+    }
+    preprocess_state = {
+        "schema": "per_head_preprocess_v1",
+        "states_by_head": {
+            "direction": {"feature_columns": ["x_a"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
+            "magnitude_up": {"feature_columns": ["x_b"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
+            "magnitude_down": {"feature_columns": ["x_c"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
+        },
+    }
+
+    report = dg.build_linear_diagnostics_report(
+        model_bundle_state=model_bundle_state,
+        preprocess_state=preprocess_state,
+        evaluation_result={"direction": {}, "magnitude_up": {}, "magnitude_down": {}},
+        direction_p_up=np.array([0.4, 0.6], dtype=np.float64),
+        magnitude_up=np.array([0.1, 0.2], dtype=np.float64),
+        magnitude_down=np.array([0.2, 0.1], dtype=np.float64),
+        y_direction=np.array([0, 1], dtype=np.int8),
+        direction_mask=np.array([True, True], dtype=bool),
+    )
+
+    assert report["preprocess"]["schema"] == "per_head_preprocess_v1"
+    assert report["preprocess"]["states_by_head"]["direction"]["n_features"] == 1
 
 
 def test_dataclass_validation():
