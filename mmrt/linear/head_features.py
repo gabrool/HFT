@@ -125,7 +125,10 @@ def resolve_head_feature_sets(
         if not cols:
             raise ValueError(f"resolved feature columns for {head} must be non-empty")
         resolved[head] = cols
-    return ResolvedHeadFeatureSets(feature_columns_by_head=resolved, feature_schema_hash=manifest.feature_schema_hash)
+    return ResolvedHeadFeatureSets(
+        feature_columns_by_head=resolved,
+        feature_schema_hash=manifest.feature_schema.get("feature_specs_hash"),
+    )
 
 
 __all__ = [

@@ -15,6 +15,7 @@ from mmrt.storage import reader as rd
 from mmrt.storage import writer as wr
 from mmrt.storage import splits as sp
 from mmrt.linear import train as tr
+from mmrt.linear import extractors as ex
 from mmrt.linear import head_features as hf
 from mmrt.linear import models as lm
 
@@ -242,3 +243,142 @@ def test_no_row_loop_over_examples():
     source = inspect.getsource(tr)
     for bad in [".iterrows", "to_pandas", "for row in", "for sample in"]:
         assert bad not in source
+
+
+def test_train_config_rejects_global_extractor_feature_columns(tmp_path: Path):
+    _, manifest = make_dataset_with_splits(tmp_path)
+    col = manifest.feature_columns[0]
+
+    with pytest.raises(ValueError, match="head_feature_config"):
+        tr.LinearTrainConfig(
+            extractor_config=ex.LinearFeatureExtractorConfig(feature_columns=(col,))
+        )
+
+
+def test_train_linear_model_respects_per_head_feature_subsets(tmp_path: Path):
+    root, manifest = make_dataset_with_splits(tmp_path)
+    cols = tuple(manifest.feature_columns)
+
+    cfg = tr.LinearTrainConfig(
+        epochs=1,
+        batch_size=3,
+        head_feature_config=hf.HeadFeatureConfig(
+            {
+                lm.DIRECTION_HEAD: (cols[0], cols[1]),
+                lm.MAGNITUDE_UP_HEAD: (cols[1], cols[2]),
+                lm.MAGNITUDE_DOWN_HEAD: (cols[2], cols[3]),
+            }
+        ),
+    )
+
+    result = tr.train_linear_model(str(root), config=cfg)
+
+    expected = {
+        lm.DIRECTION_HEAD: [cols[0], cols[1]],
+        lm.MAGNITUDE_UP_HEAD: [cols[1], cols[2]],
+        lm.MAGNITUDE_DOWN_HEAD: [cols[2], cols[3]],
+    }
+
+    resolved = result.config["resolved_head_features"]["feature_columns_by_head"]
+    assert resolved == expected
+
+    states = result.preprocess_state["states_by_head"]
+    for head, expected_cols in expected.items():
+        assert states[head]["feature_columns"] == expected_cols
+        assert result.model_bundle_state[head]["feature_columns"] == expected_cols
+
+    assert result.model_bundle_state["feature_columns_by_head"] == expected
+    assert result.model_bundle_state["feature_counts_by_head"] == {
+        head: len(cols_for_head)
+        for head, cols_for_head in expected.items()
+    }
+
+    for split_eval in result.splits.values():
+        assert set(split_eval.evaluation.keys()) == {
+            lm.DIRECTION_HEAD,
+            lm.MAGNITUDE_UP_HEAD,
+            lm.MAGNITUDE_DOWN_HEAD,
+        }
+
+
+def test_train_missing_head_feature_entry_defaults_to_all_features(tmp_path: Path):
+    root, manifest = make_dataset_with_splits(tmp_path)
+    cols = tuple(manifest.feature_columns)
+
+    cfg = tr.LinearTrainConfig(
+        epochs=1,
+        batch_size=3,
+        head_feature_config=hf.HeadFeatureConfig(
+            {
+                lm.DIRECTION_HEAD: (cols[0], cols[1]),
+            }
+        ),
+    )
+
+    result = tr.train_linear_model(str(root), config=cfg)
+    resolved = result.config["resolved_head_features"]["feature_columns_by_head"]
+
+    assert resolved[lm.DIRECTION_HEAD] == [cols[0], cols[1]]
+    assert resolved[lm.MAGNITUDE_UP_HEAD] == list(cols)
+    assert resolved[lm.MAGNITUDE_DOWN_HEAD] == list(cols)
+
+    assert result.preprocess_state["states_by_head"][lm.MAGNITUDE_UP_HEAD]["feature_columns"] == list(cols)
+    assert result.model_bundle_state[lm.MAGNITUDE_DOWN_HEAD]["feature_columns"] == list(cols)
+
+
+def test_train_per_head_feature_order_is_manifest_order(tmp_path: Path):
+    root, manifest = make_dataset_with_splits(tmp_path)
+    cols = tuple(manifest.feature_columns)
+
+    cfg = tr.LinearTrainConfig(
+        epochs=1,
+        batch_size=3,
+        head_feature_config=hf.HeadFeatureConfig(
+            {
+                lm.DIRECTION_HEAD: (cols[3], cols[1]),
+                lm.MAGNITUDE_UP_HEAD: (cols[2], cols[0]),
+                lm.MAGNITUDE_DOWN_HEAD: (cols[4], cols[1]),
+            }
+        ),
+    )
+
+    result = tr.train_linear_model(str(root), config=cfg)
+    resolved = result.config["resolved_head_features"]["feature_columns_by_head"]
+
+    assert resolved[lm.DIRECTION_HEAD] == [cols[1], cols[3]]
+    assert resolved[lm.MAGNITUDE_UP_HEAD] == [cols[0], cols[2]]
+    assert resolved[lm.MAGNITUDE_DOWN_HEAD] == [cols[1], cols[4]]
+
+
+def test_model_bundle_predict_rejects_nonshared_feature_columns():
+    bundle = lm.make_linear_model_bundle(
+        {
+            lm.DIRECTION_HEAD: ("x_a", "x_b"),
+            lm.MAGNITUDE_UP_HEAD: ("x_a",),
+            lm.MAGNITUDE_DOWN_HEAD: ("x_b",),
+        },
+        lm.LinearModelConfig(),
+    )
+
+    with pytest.raises(ValueError, match="requires all heads to share"):
+        bundle.predict(np.zeros((2, 2), dtype=np.float32))
+
+
+def test_make_linear_model_bundle_requires_exact_mapping_keys():
+    with pytest.raises(ValueError):
+        lm.make_linear_model_bundle(
+            {
+                lm.DIRECTION_HEAD: ("x_a",),
+                lm.MAGNITUDE_UP_HEAD: ("x_a",),
+            }
+        )
+
+    with pytest.raises(ValueError):
+        lm.make_linear_model_bundle(
+            {
+                lm.DIRECTION_HEAD: ("x_a",),
+                lm.MAGNITUDE_UP_HEAD: ("x_a",),
+                lm.MAGNITUDE_DOWN_HEAD: ("x_a",),
+                "bad": ("x_a",),
+            }
+        )
