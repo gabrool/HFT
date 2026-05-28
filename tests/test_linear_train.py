@@ -15,6 +15,8 @@ from mmrt.storage import reader as rd
 from mmrt.storage import writer as wr
 from mmrt.storage import splits as sp
 from mmrt.linear import train as tr
+from mmrt.linear import head_features as hf
+from mmrt.linear import models as lm
 
 
 def feature_values(row_idx: int) -> tuple[float, ...]:
@@ -65,7 +67,7 @@ def make_dataset_with_splits(tmp_path: Path, *, with_test: bool = True, with_spl
 def test_public_api_boundary():
     assert tr.__all__ == [
         "DEFAULT_TRAIN_BATCH_SIZE", "DEFAULT_EPOCHS", "DEFAULT_OUTPUT_FILENAME", "TRAIN_RESULT_SCHEMA_VERSION",
-        "LinearTrainConfig", "SplitEvaluation", "LinearTrainResult", "fit_preprocessor_from_train_split",
+        "LinearTrainConfig", "SplitEvaluation", "LinearTrainResult", "fit_preprocessors_from_train_split",
         "train_model_bundle_from_train_split", "evaluate_model_on_split", "train_linear_model", "write_linear_train_artifacts",
     ]
 
@@ -106,21 +108,23 @@ def test_train_requires_existing_train_and_val_splits(tmp_path: Path):
         tr.train_linear_model(str(root2))
 
 
-def test_fit_preprocessor_from_train_split_uses_train_only(tmp_path: Path):
+def test_fit_preprocessors_from_train_split_uses_train_only(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     reader = rd.open_dataset(str(root), validate_on_open=True, batch_size=3)
     cfg = tr.LinearTrainConfig(batch_size=3)
-    st = tr.fit_preprocessor_from_train_split(reader, manifest=manifest, config=cfg)
-    assert st.n_rows_fit == 6
-    assert np.isclose(st.mean[0], np.mean([-1.0] * 6))
+    resolved = hf.resolve_head_feature_sets(manifest)
+    st = tr.fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved, config=cfg)
+    assert st[lm.DIRECTION_HEAD].n_rows_fit == 6
+    assert np.isclose(st[lm.DIRECTION_HEAD].mean[0], np.mean([-1.0] * 6))
 
 
 def test_train_model_bundle_from_train_split_updates_models_only_from_train(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     reader = rd.open_dataset(str(root), validate_on_open=True, batch_size=3)
     cfg = tr.LinearTrainConfig(batch_size=3, epochs=2)
-    st = tr.fit_preprocessor_from_train_split(reader, manifest=manifest, config=cfg)
-    bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, preprocess_state=st, config=cfg)
+    resolved = hf.resolve_head_feature_sets(manifest)
+    st = tr.fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved, config=cfg)
+    bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, head_features=resolved, preprocess_states_by_head=st, config=cfg)
     train_rets = np.array([-2.0, -1.0, 0.0, 1.0, 2.0, -3.0])
     valid = np.sum(train_rets != 0.0)
     assert bundle.direction.n_rows_seen == 2 * int(valid)
@@ -133,10 +137,11 @@ def test_evaluate_model_on_split_does_not_update_state(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     reader = rd.open_dataset(str(root), validate_on_open=True, batch_size=3)
     cfg = tr.LinearTrainConfig(batch_size=3, epochs=1)
-    st = tr.fit_preprocessor_from_train_split(reader, manifest=manifest, config=cfg)
-    bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, preprocess_state=st, config=cfg)
+    resolved = hf.resolve_head_feature_sets(manifest)
+    st = tr.fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved, config=cfg)
+    bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, head_features=resolved, preprocess_states_by_head=st, config=cfg)
     snap = bundle.as_dict()
-    out = tr.evaluate_model_on_split(reader, manifest=manifest, role=SplitRole.VAL, preprocess_state=st, model_bundle=bundle, config=cfg)
+    out = tr.evaluate_model_on_split(reader, manifest=manifest, role=SplitRole.VAL, head_features=resolved, preprocess_states_by_head=st, model_bundle=bundle, config=cfg)
     assert bundle.as_dict() == snap
     assert out.role == "val" and out.n_rows == 3
     assert isinstance(out.evaluation, dict) and isinstance(out.diagnostics, dict)
@@ -152,7 +157,8 @@ def test_train_linear_model_end_to_end(tmp_path: Path):
     assert set(result.splits.keys()) == {"train", "val", "test"}
     assert result.splits["train"].n_rows == 6 and result.splits["val"].n_rows == 3
     assert {"direction", "magnitude_up", "magnitude_down"}.issubset(result.model_bundle_state.keys())
-    assert {"feature_columns", "mean", "variance", "scale", "active_mask"}.issubset(result.preprocess_state.keys())
+    assert result.preprocess_state["schema"] == "per_head_preprocess_v1"
+    assert set(result.preprocess_state["states_by_head"].keys()) == set(lm.MODEL_HEADS)
     json.dumps(result.as_dict(), allow_nan=True)
 
 
@@ -172,9 +178,10 @@ def test_column_projection_reads_only_features_and_target(tmp_path: Path, monkey
         captured.append(tuple(columns))
         yield from orig(reader_, role, columns, batch_size)
     monkeypatch.setattr(tr, "_split_batches", wrapped)
-    st = tr.fit_preprocessor_from_train_split(reader, manifest=manifest, config=cfg)
+    resolved = hf.resolve_head_feature_sets(manifest)
+    st = tr.fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved, config=cfg)
     assert captured[-1] == tuple(manifest.feature_columns)
-    _ = tr.train_model_bundle_from_train_split(reader, manifest=manifest, preprocess_state=st, config=cfg)
+    _ = tr.train_model_bundle_from_train_split(reader, manifest=manifest, head_features=resolved, preprocess_states_by_head=st, config=cfg)
     assert len(captured[-1]) == len(manifest.feature_columns) + 1
 
 
@@ -182,8 +189,9 @@ def test_direction_invalid_rows_filtered_for_direction_head(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     reader = rd.open_dataset(str(root), validate_on_open=True, batch_size=3)
     cfg = tr.LinearTrainConfig(epochs=1)
-    st = tr.fit_preprocessor_from_train_split(reader, manifest=manifest, config=cfg)
-    bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, preprocess_state=st, config=cfg)
+    resolved = hf.resolve_head_feature_sets(manifest)
+    st = tr.fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved, config=cfg)
+    bundle = tr.train_model_bundle_from_train_split(reader, manifest=manifest, head_features=resolved, preprocess_states_by_head=st, config=cfg)
     assert bundle.direction.n_rows_seen == 5
     assert bundle.magnitude_up.n_rows_seen == 6
 

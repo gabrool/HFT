@@ -8,7 +8,7 @@ training orchestration.
 """
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -389,9 +389,6 @@ class LinearModelBundle:
             raise ValueError("magnitude_up has wrong head_name")
         if self.magnitude_down.head_name != MAGNITUDE_DOWN_HEAD:
             raise ValueError("magnitude_down has wrong head_name")
-        cols = self.direction.feature_columns
-        if self.magnitude_up.feature_columns != cols or self.magnitude_down.feature_columns != cols:
-            raise ValueError("all heads must share feature_columns")
         if self.direction.config != self.magnitude_up.config or self.direction.config != self.magnitude_down.config:
             raise ValueError("all heads must share identical config")
 
@@ -434,12 +431,23 @@ class LinearModelBundle:
         return cls(direction=direction, magnitude_up=magnitude_up, magnitude_down=magnitude_down)
 
 
-def make_linear_model_bundle(feature_columns: Sequence[str], config: LinearModelConfig | None = None) -> LinearModelBundle:
+def make_linear_model_bundle(
+    feature_columns_by_head: Mapping[str, Sequence[str]] | Sequence[str],
+    config: LinearModelConfig | None = None,
+) -> LinearModelBundle:
     cfg = config if config is not None else LinearModelConfig()
+    if isinstance(feature_columns_by_head, Mapping):
+        direction_cols = tuple(feature_columns_by_head[DIRECTION_HEAD])
+        up_cols = tuple(feature_columns_by_head[MAGNITUDE_UP_HEAD])
+        down_cols = tuple(feature_columns_by_head[MAGNITUDE_DOWN_HEAD])
+    else:
+        direction_cols = tuple(feature_columns_by_head)
+        up_cols = direction_cols
+        down_cols = direction_cols
     return LinearModelBundle(
-        direction=DirectionLinearHead(feature_columns, cfg),
-        magnitude_up=MagnitudeLinearHead(MAGNITUDE_UP_HEAD, feature_columns, cfg),
-        magnitude_down=MagnitudeLinearHead(MAGNITUDE_DOWN_HEAD, feature_columns, cfg),
+        direction=DirectionLinearHead(direction_cols, cfg),
+        magnitude_up=MagnitudeLinearHead(MAGNITUDE_UP_HEAD, up_cols, cfg),
+        magnitude_down=MagnitudeLinearHead(MAGNITUDE_DOWN_HEAD, down_cols, cfg),
     )
 
 

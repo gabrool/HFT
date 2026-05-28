@@ -18,6 +18,7 @@ from mmrt.contracts import SplitRole
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
 from mmrt.linear import extractors as ex
+from mmrt.linear import head_features as hf
 from mmrt.linear import targets as tg
 from mmrt.linear import preprocess as pp
 from mmrt.linear import models as lm
@@ -110,6 +111,7 @@ class LinearTrainConfig:
     epochs: int = DEFAULT_EPOCHS
     validate_dataset_on_open: bool = True
     extractor_config: ex.LinearFeatureExtractorConfig = ex.LinearFeatureExtractorConfig()
+    head_feature_config: hf.HeadFeatureConfig = hf.HeadFeatureConfig()
     target_config: tg.LinearTargetConfig = tg.LinearTargetConfig()
     preprocess_config: pp.LinearPreprocessConfig = pp.LinearPreprocessConfig()
     model_config: lm.LinearModelConfig = lm.LinearModelConfig()
@@ -125,6 +127,12 @@ class LinearTrainConfig:
         )
         if not isinstance(self.extractor_config, ex.LinearFeatureExtractorConfig):
             raise ValueError("extractor_config must be LinearFeatureExtractorConfig")
+        if self.extractor_config.feature_columns is not None:
+            raise ValueError(
+                "extractor_config.feature_columns is no longer supported; use head_feature_config"
+            )
+        if not isinstance(self.head_feature_config, hf.HeadFeatureConfig):
+            raise ValueError("head_feature_config must be HeadFeatureConfig")
         if not isinstance(self.target_config, tg.LinearTargetConfig):
             raise ValueError("target_config must be LinearTargetConfig")
         if not isinstance(self.preprocess_config, pp.LinearPreprocessConfig):
@@ -143,6 +151,7 @@ class LinearTrainConfig:
                 "feature_columns": list(self.extractor_config.feature_columns) if self.extractor_config.feature_columns is not None else None,
                 "output_dtype": self.extractor_config.output_dtype,
             },
+            "head_feature_config": self.head_feature_config.as_dict(),
             "target_config": {
                 "target_horizon_us": self.target_config.target_horizon_us,
                 "direction_deadband_bps": self.target_config.direction_deadband_bps,
@@ -243,10 +252,27 @@ class LinearTrainResult:
         )
 
 
-def _column_projection(manifest: mf.StorageManifest, extractor: ex.IdentityFeatureExtractor, target_builder: tg.LinearTargetBuilder) -> tuple[str, ...]:
-    x_cols = extractor.column_projection(manifest)
+def _projection_for_head(
+    manifest: mf.StorageManifest,
+    feature_columns: tuple[str, ...],
+    target_builder: tg.LinearTargetBuilder,
+) -> tuple[str, ...]:
     y_cols = target_builder.column_projection(manifest)
-    return tuple(x_cols) + tuple(c for c in y_cols if c not in x_cols)
+    return tuple(feature_columns) + tuple(c for c in y_cols if c not in feature_columns)
+
+
+def _extractor_for_columns(
+    columns: tuple[str, ...],
+    config: LinearTrainConfig,
+    manifest: mf.StorageManifest,
+) -> ex.IdentityFeatureExtractor:
+    return ex.IdentityFeatureExtractor(
+        ex.LinearFeatureExtractorConfig(
+            feature_columns=columns,
+            output_dtype=config.extractor_config.output_dtype,
+        ),
+        manifest=manifest,
+    )
 
 
 def _split_batches(reader: rd.StorageDatasetReader, role: SplitRole | str, columns: Sequence[str], batch_size: int):
@@ -258,40 +284,59 @@ def _split_batches(reader: rd.StorageDatasetReader, role: SplitRole | str, colum
         yield pa.Table.from_batches([batch])
 
 
-def fit_preprocessor_from_train_split(reader: rd.StorageDatasetReader, *, manifest: mf.StorageManifest, config: LinearTrainConfig) -> pp.LinearPreprocessState:
-    extractor = ex.IdentityFeatureExtractor(config.extractor_config, manifest=manifest)
-    x_cols = extractor.column_projection(manifest)
-    pre = pp.LinearPreprocessor(config.preprocess_config)
-    for table in _split_batches(reader, SplitRole.TRAIN, x_cols, config.batch_size):
-        batch = extractor.transform_table(table)
-        pre.partial_fit(batch.X, feature_columns=batch.feature_columns)
-    return pre.finalize()
+def _preprocess_states_as_dict(states_by_head: dict[str, pp.LinearPreprocessState]) -> dict[str, object]:
+    if set(states_by_head.keys()) != set(lm.MODEL_HEADS):
+        raise ValueError("states_by_head keys must exactly match model heads")
+    for v in states_by_head.values():
+        if not isinstance(v, pp.LinearPreprocessState):
+            raise ValueError("states_by_head values must be LinearPreprocessState")
+    return {
+        "schema": "per_head_preprocess_v1",
+        "states_by_head": {head: states_by_head[head].as_dict() for head in lm.MODEL_HEADS},
+    }
 
 
-def train_model_bundle_from_train_split(reader: rd.StorageDatasetReader, *, manifest: mf.StorageManifest, preprocess_state: pp.LinearPreprocessState, config: LinearTrainConfig) -> lm.LinearModelBundle:
-    extractor = ex.IdentityFeatureExtractor(config.extractor_config, manifest=manifest)
+def fit_preprocessors_from_train_split(reader: rd.StorageDatasetReader, *, manifest: mf.StorageManifest, head_features: hf.ResolvedHeadFeatureSets, config: LinearTrainConfig) -> dict[str, pp.LinearPreprocessState]:
+    out: dict[str, pp.LinearPreprocessState] = {}
+    for head in lm.MODEL_HEADS:
+        cols = head_features.columns_for_head(head)
+        extractor = _extractor_for_columns(cols, config, manifest)
+        pre = pp.LinearPreprocessor(config.preprocess_config)
+        for table in _split_batches(reader, SplitRole.TRAIN, cols, config.batch_size):
+            batch = extractor.transform_table(table)
+            pre.partial_fit(batch.X, feature_columns=batch.feature_columns)
+        out[head] = pre.finalize()
+    return out
+
+
+def train_model_bundle_from_train_split(reader: rd.StorageDatasetReader, *, manifest: mf.StorageManifest, head_features: hf.ResolvedHeadFeatureSets, preprocess_states_by_head: dict[str, pp.LinearPreprocessState], config: LinearTrainConfig) -> lm.LinearModelBundle:
     target_builder = tg.LinearTargetBuilder(config.target_config, manifest=manifest)
-    projection = _column_projection(manifest, extractor, target_builder)
-    pre = pp.LinearPreprocessor.from_state(preprocess_state)
-    bundle = lm.make_linear_model_bundle(preprocess_state.feature_columns, config.model_config)
+    bundle = lm.make_linear_model_bundle(head_features.feature_columns_by_head, config.model_config)
     for _ in range(config.epochs):
-        for table in _split_batches(reader, SplitRole.TRAIN, projection, config.batch_size):
-            xb = extractor.transform_table(table)
-            tb = target_builder.transform_table(table)
-            Xz = pre.transform(xb.X, feature_columns=xb.feature_columns)
-            if tb.direction_mask.any():
-                bundle.direction.partial_fit(Xz[tb.direction_mask], tb.y_direction[tb.direction_mask])
-            bundle.magnitude_up.partial_fit(Xz, tb.y_magnitude_up)
-            bundle.magnitude_down.partial_fit(Xz, tb.y_magnitude_down)
+        for head in lm.MODEL_HEADS:
+            cols = head_features.columns_for_head(head)
+            extractor = _extractor_for_columns(cols, config, manifest)
+            projection = _projection_for_head(manifest, cols, target_builder)
+            pre = pp.LinearPreprocessor.from_state(preprocess_states_by_head[head])
+            for table in _split_batches(reader, SplitRole.TRAIN, projection, config.batch_size):
+                xb = extractor.transform_table(table)
+                tb = target_builder.transform_table(table)
+                Xz = pre.transform(xb.X, feature_columns=xb.feature_columns)
+                if head == lm.DIRECTION_HEAD:
+                    if tb.direction_mask.any():
+                        bundle.direction.partial_fit(Xz[tb.direction_mask], tb.y_direction[tb.direction_mask])
+                elif head == lm.MAGNITUDE_UP_HEAD:
+                    bundle.magnitude_up.partial_fit(Xz, tb.y_magnitude_up)
+                elif head == lm.MAGNITUDE_DOWN_HEAD:
+                    bundle.magnitude_down.partial_fit(Xz, tb.y_magnitude_down)
+                else:
+                    raise ValueError("unknown head")
     return bundle
 
 
-def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.StorageManifest, role: SplitRole | str, preprocess_state: pp.LinearPreprocessState, model_bundle: lm.LinearModelBundle, config: LinearTrainConfig) -> SplitEvaluation:
+def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.StorageManifest, role: SplitRole | str, head_features: hf.ResolvedHeadFeatureSets, preprocess_states_by_head: dict[str, pp.LinearPreprocessState], model_bundle: lm.LinearModelBundle, config: LinearTrainConfig) -> SplitEvaluation:
     role_str = _role_to_str(role)
-    extractor = ex.IdentityFeatureExtractor(config.extractor_config, manifest=manifest)
     target_builder = tg.LinearTargetBuilder(config.target_config, manifest=manifest)
-    projection = _column_projection(manifest, extractor, target_builder)
-    pre = pp.LinearPreprocessor.from_state(preprocess_state)
 
     y_direction_parts: list[np.ndarray] = []
     direction_mask_parts: list[np.ndarray] = []
@@ -301,19 +346,36 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
     y_mag_down_parts: list[np.ndarray] = []
     pred_mag_down_parts: list[np.ndarray] = []
 
-    for table in _split_batches(reader, role, projection, config.batch_size):
-        xb = extractor.transform_table(table)
+    direction_cols = head_features.columns_for_head(lm.DIRECTION_HEAD)
+    direction_ex = _extractor_for_columns(direction_cols, config, manifest)
+    direction_pre = pp.LinearPreprocessor.from_state(preprocess_states_by_head[lm.DIRECTION_HEAD])
+    direction_projection = _projection_for_head(manifest, direction_cols, target_builder)
+    for table in _split_batches(reader, role, direction_projection, config.batch_size):
+        xb = direction_ex.transform_table(table)
         tb = target_builder.transform_table(table)
-        Xz = pre.transform(xb.X, feature_columns=xb.feature_columns)
-        pred = model_bundle.predict(Xz)
+        Xz = direction_pre.transform(xb.X, feature_columns=xb.feature_columns)
+        pred = model_bundle.direction.predict_proba(Xz)[:, 1]
 
         y_direction_parts.append(tb.y_direction)
         direction_mask_parts.append(tb.direction_mask)
-        direction_p_up_parts.append(pred["direction_proba"][:, 1])
-        y_mag_up_parts.append(tb.y_magnitude_up)
-        pred_mag_up_parts.append(pred["magnitude_up"])
-        y_mag_down_parts.append(tb.y_magnitude_down)
-        pred_mag_down_parts.append(pred["magnitude_down"])
+        direction_p_up_parts.append(pred)
+    for head, pred_parts, target_parts, model_head in (
+        (lm.MAGNITUDE_UP_HEAD, pred_mag_up_parts, y_mag_up_parts, model_bundle.magnitude_up),
+        (lm.MAGNITUDE_DOWN_HEAD, pred_mag_down_parts, y_mag_down_parts, model_bundle.magnitude_down),
+    ):
+        cols = head_features.columns_for_head(head)
+        extractor = _extractor_for_columns(cols, config, manifest)
+        pre = pp.LinearPreprocessor.from_state(preprocess_states_by_head[head])
+        projection = _projection_for_head(manifest, cols, target_builder)
+        for table in _split_batches(reader, role, projection, config.batch_size):
+            xb = extractor.transform_table(table)
+            tb = target_builder.transform_table(table)
+            Xz = pre.transform(xb.X, feature_columns=xb.feature_columns)
+            pred_parts.append(model_head.predict_nonnegative(Xz))
+            if head == lm.MAGNITUDE_UP_HEAD:
+                target_parts.append(tb.y_magnitude_up)
+            else:
+                target_parts.append(tb.y_magnitude_down)
 
     y_direction = _concat_1d(y_direction_parts, dtype=np.dtype(np.int8), name="y_direction")
     direction_mask = _concat_1d(direction_mask_parts, dtype=np.dtype(bool), name="direction_mask")
@@ -335,7 +397,7 @@ def evaluate_model_on_split(reader: rd.StorageDatasetReader, *, manifest: mf.Sto
 
     diagnostics = dg.build_linear_diagnostics_report(
         model_bundle_state=model_bundle.as_dict(),
-        preprocess_state=preprocess_state.as_dict(),
+        preprocess_state=_preprocess_states_as_dict(preprocess_states_by_head),
         evaluation_result=evaluation,
         direction_p_up=direction_p_up,
         magnitude_up=pred_mag_up,
@@ -356,11 +418,13 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
     manifest.validate_against_current_code()
     roles = _require_manifest_has_split_roles(manifest)
 
-    preprocess_state = fit_preprocessor_from_train_split(reader, manifest=manifest, config=cfg)
+    resolved_head_features = hf.resolve_head_feature_sets(manifest, cfg.head_feature_config)
+    preprocess_states_by_head = fit_preprocessors_from_train_split(reader, manifest=manifest, head_features=resolved_head_features, config=cfg)
     model_bundle = train_model_bundle_from_train_split(
         reader,
         manifest=manifest,
-        preprocess_state=preprocess_state,
+        head_features=resolved_head_features,
+        preprocess_states_by_head=preprocess_states_by_head,
         config=cfg,
     )
 
@@ -371,7 +435,8 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
             reader,
             manifest=manifest,
             role=role,
-            preprocess_state=preprocess_state,
+            head_features=resolved_head_features,
+            preprocess_states_by_head=preprocess_states_by_head,
             model_bundle=model_bundle,
             config=cfg,
         )
@@ -380,8 +445,8 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
         schema_version=TRAIN_RESULT_SCHEMA_VERSION,
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest.content_hash(),
-        config=cfg.as_dict(),
-        preprocess_state=preprocess_state.as_dict(),
+        config={**cfg.as_dict(), "resolved_head_features": resolved_head_features.as_dict()},
+        preprocess_state=_preprocess_states_as_dict(preprocess_states_by_head),
         model_bundle_state=model_bundle.as_dict(),
         splits=split_evals,
     )
@@ -411,7 +476,7 @@ __all__ = [
     "LinearTrainConfig",
     "SplitEvaluation",
     "LinearTrainResult",
-    "fit_preprocessor_from_train_split",
+    "fit_preprocessors_from_train_split",
     "train_model_bundle_from_train_split",
     "evaluate_model_on_split",
     "train_linear_model",
