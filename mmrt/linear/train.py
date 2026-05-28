@@ -228,6 +228,8 @@ class LinearTrainResult:
                 raise ValueError(f"{name} must be dict")
         if not isinstance(self.selection_summary, dict):
             raise ValueError("selection_summary must be dict")
+        if not isinstance(self.splits, dict):
+            raise ValueError("splits must be dict")
         keys = set(self.splits.keys())
         if not keys.issubset({"train", "val", "test"}):
             raise ValueError("splits keys must be subset of train/val/test")

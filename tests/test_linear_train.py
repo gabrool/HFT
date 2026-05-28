@@ -259,6 +259,24 @@ def test_result_dataclass_validation():
         tr.LinearTrainResult(schema_version=2, dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
 
 
+def test_linear_train_result_rejects_non_dict_splits():
+    with pytest.raises(ValueError, match="splits must be dict"):
+        tr.LinearTrainResult(
+            schema_version=tr.TRAIN_RESULT_SCHEMA_VERSION,
+            dataset_id="d1",
+            manifest_hash="h1",
+            config={},
+            preprocess_state={},
+            model_bundle_state={},
+            splits=[],  # type: ignore[arg-type]
+            selection_summary={
+                "selection_split": "val",
+                "primary_metrics": {},
+                "guardrails": {},
+            },
+        )
+
+
 def test_no_old_pipeline_residue():
     source = inspect.getsource(tr)
     for bad in ["BY" + "BIT", "CM" + "SSL", "offline_" + "ingest", "stage" + "1", "Mini" + "Rocket", "Multi" + "Rocket", "Hy" + "dra", "Ae" + "on", "sk" + "learn", "to" + "rch", "pan" + "das", "po" + "lars", "P" + "CA"]:
