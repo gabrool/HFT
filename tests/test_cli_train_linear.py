@@ -194,7 +194,41 @@ def test_cli_written_artifact_contains_no_move(tmp_path, monkeypatch: pytest.Mon
         "preprocess_state": {"states_by_head": {"no_move": {}}},
         "config": {"resolved_head_features": {"feature_columns_by_head": {"no_move": ["x"]}}},
         "splits": {"train": {"evaluation": {"no_move": {}}, "diagnostics": {"coefficients": {"no_move": {}}}}},
-        "selection_summary": {"selection_split": "val", "primary_metrics": {"no_move": {"metric": "auc", "value": 0.5, "mode": "max", "scope": "all_rows"}, "direction": {"metric": "auc", "value": 0.5, "mode": "max", "scope": "move_mask"}, "magnitude_up": {"metric": "mae", "value": 1.0, "mode": "min", "scope": "up_move_mask"}, "magnitude_down": {"metric": "mae", "value": 1.0, "mode": "min", "scope": "down_move_mask"}}, "guardrails": {"no_move": {"log_loss": 1.0, "brier": 0.25}, "direction": {"log_loss": 1.0, "brier": 0.25}, "magnitude_up": {"spearman": 0.0, "rmse": 1.0}, "magnitude_down": {"spearman": 0.0, "rmse": 1.0}}},
+        "selection_summary": {
+            "selection_split": "val",
+            "primary_metrics": {
+                "no_move": {
+                    "metric": "auc",
+                    "value": 0.5,
+                    "mode": "max",
+                    "scope": "all_rows",
+                },
+                "direction": {
+                    "metric": "auc",
+                    "value": 0.5,
+                    "mode": "max",
+                    "scope": "move_mask",
+                },
+                "magnitude_up": {
+                    "metric": "mae",
+                    "value": 1.0,
+                    "mode": "min",
+                    "scope": "up_move_mask",
+                },
+                "magnitude_down": {
+                    "metric": "mae",
+                    "value": 1.0,
+                    "mode": "min",
+                    "scope": "down_move_mask",
+                },
+            },
+            "guardrails": {
+                "no_move": {"log_loss": 1.0, "brier": 0.25},
+                "direction": {"log_loss": 1.0, "brier": 0.25},
+                "magnitude_up": {"spearman": 0.0, "rmse": 1.0},
+                "magnitude_down": {"spearman": 0.0, "rmse": 1.0},
+            },
+        },
     }
 
     def fake_train(*args, **kwargs):
