@@ -75,7 +75,8 @@ def _write_predictive_ds(root: Path, *, train_rows: int = 60, val_rows: int = 30
 @pytest.fixture()
 def trained_artifact(tmp_path: Path) -> tuple[Path, Path]:
     root = _write_predictive_ds(tmp_path / "ds")
-    cols = mf.feature_columns()[:4]
+    all_cols = mf.feature_columns()
+    cols = (all_cols[0], all_cols[2], all_cols[4], all_cols[6])
     head_cfg = hf.HeadFeatureConfig(feature_columns_by_head={head: cols for head in lm.MODEL_HEADS})
     result = tr.train_linear_model(str(root), config=tr.LinearTrainConfig(batch_size=13, epochs=20, head_feature_config=head_cfg))
     paths = tr.write_linear_train_artifacts(result, str(tmp_path / "train"))
@@ -130,6 +131,59 @@ def test_importance_uses_validation_not_train_or_test(trained_artifact):
     direction = [r for r in out.records if r.head == lm.DIRECTION_HEAD]
     assert {r.n_eval_rows for r in direction} == {25}
     assert out.n_sample_rows == 30
+
+
+def test_feature_index_is_canonical_not_head_local(trained_artifact):
+    root, artifact = trained_artifact
+    out = fi.run_feature_importance(str(root), str(artifact))
+
+    for record in out.records:
+        canonical = record.feature[len(mf.FEATURE_COLUMN_PREFIX) :]
+        expected = specs.feature_spec_by_name(canonical).index
+        assert record.feature_index == expected
+
+
+def test_run_feature_importance_streams_validation_sampling(trained_artifact, monkeypatch):
+    root, artifact = trained_artifact
+
+    from mmrt.storage import reader as rd
+
+    def boom(*args, **kwargs):
+        raise AssertionError("read_split_table must not be used by feature importance")
+
+    monkeypatch.setattr(rd.StorageDatasetReader, "read_split_table", boom)
+
+    out = fi.run_feature_importance(
+        str(root),
+        str(artifact),
+        config=fi.FeatureImportanceConfig(max_sample_rows=12, batch_size=5),
+    )
+
+    assert out.n_sample_rows == 12
+    assert set(r.head for r in out.records) == set(lm.MODEL_HEADS)
+
+
+def test_max_sample_rows_bounds_validation_sample(trained_artifact):
+    root, artifact = trained_artifact
+    out = fi.run_feature_importance(
+        str(root),
+        str(artifact),
+        config=fi.FeatureImportanceConfig(max_sample_rows=7, batch_size=3),
+    )
+    assert out.n_sample_rows == 7
+    assert {r.n_eval_rows for r in out.records if r.head == lm.NO_MOVE_HEAD} == {7}
+
+
+def test_zero_sample_rows_produces_empty_importance_metrics(trained_artifact):
+    root, artifact = trained_artifact
+    out = fi.run_feature_importance(
+        str(root),
+        str(artifact),
+        config=fi.FeatureImportanceConfig(max_sample_rows=0),
+    )
+    assert out.n_sample_rows == 0
+    assert set(r.head for r in out.records) == set(lm.MODEL_HEADS)
+    assert all(r.n_eval_rows == 0 for r in out.records)
 
 
 def test_rejects_manifest_hash_mismatch(trained_artifact, tmp_path: Path):
