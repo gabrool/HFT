@@ -355,14 +355,65 @@ def _head_features(artifact: dict[str, object]) -> dict[str, tuple[str, ...]]:
     return {head: tuple(str(c) for c in by_head[head]) for head in lm.MODEL_HEADS}
 
 
-def _sample_table(table: pa.Table, max_sample_rows: int) -> pa.Table:
-    n_rows = table.num_rows
-    if max_sample_rows == 0:
-        return table.slice(0, 0)
-    if n_rows <= max_sample_rows:
-        return table
-    idx = np.unique(np.linspace(0, n_rows - 1, max_sample_rows, dtype=np.int64))
-    return table.take(pa.array(idx, type=pa.int64()))
+def _split_row_count(reader: rd.StorageDatasetReader, role: SplitRole) -> int:
+    entries = reader.split_entries(role)
+    if not entries:
+        raise ValueError("storage dataset must include validation split")
+    total = 0
+    for entry in entries:
+        if hasattr(entry, "row_count"):
+            total += int(entry.row_count)
+        else:
+            total += int(entry.end_row) - int(entry.start_row)
+    return int(total)
+
+
+def _sample_positions(n_rows: int, max_sample_rows: int) -> np.ndarray:
+    n = _require_nonnegative_int(n_rows, "n_rows")
+    max_n = _require_nonnegative_int(max_sample_rows, "max_sample_rows")
+    if max_n == 0 or n == 0:
+        return np.empty((0,), dtype=np.int64)
+    if n <= max_n:
+        return np.arange(n, dtype=np.int64)
+    return np.unique(np.linspace(0, n - 1, max_n, dtype=np.int64))
+
+
+def _read_sampled_split_table(
+    reader: rd.StorageDatasetReader,
+    role: SplitRole,
+    *,
+    columns: tuple[str, ...],
+    max_sample_rows: int,
+    batch_size: int,
+) -> pa.Table:
+    n_rows = _split_row_count(reader, role)
+    sample_pos = _sample_positions(n_rows, max_sample_rows)
+    cursor = 0
+    batch_start = 0
+    pieces: list[pa.Table] = []
+    empty_schema_table: pa.Table | None = None
+
+    for batch in reader.iter_split_batches(role, columns=columns, batch_size=batch_size):
+        if empty_schema_table is None:
+            empty_schema_table = pa.Table.from_batches([batch]).slice(0, 0)
+        batch_n = batch.num_rows
+        batch_end = batch_start + batch_n
+        while cursor < sample_pos.size and sample_pos[cursor] < batch_start:
+            cursor += 1
+        start_cursor = cursor
+        while cursor < sample_pos.size and sample_pos[cursor] < batch_end:
+            cursor += 1
+        if cursor > start_cursor:
+            local_indices = sample_pos[start_cursor:cursor] - batch_start
+            piece = pa.Table.from_batches([batch]).take(pa.array(local_indices, type=pa.int64()))
+            pieces.append(piece)
+        batch_start = batch_end
+
+    if pieces:
+        return pa.concat_tables(pieces)
+    if empty_schema_table is not None:
+        return empty_schema_table
+    return pa.table({column: pa.array([]) for column in columns})
 
 
 def _coefficient_ranks(weights: np.ndarray) -> dict[int, int]:
@@ -429,7 +480,7 @@ def _records_for_head(
         rec = FeatureImportanceRecord(
             head=head,
             feature=feature,
-            feature_index=j,
+            feature_index=meta.feature_index,
             source=meta.source,
             owner=meta.owner,
             family=meta.family,
@@ -535,19 +586,33 @@ def run_feature_importance(
     target_builder = tg.LinearTargetBuilder(target_config, manifest=manifest)
     target_column = target_builder.resolve_target_column(manifest)
 
+    all_feature_columns = tuple(
+        dict.fromkeys(
+            col
+            for head in lm.MODEL_HEADS
+            for col in feature_columns_by_head[head]
+        )
+    )
+    sample_columns = tuple(dict.fromkeys((*all_feature_columns, target_column)))
+    sample_table = _read_sampled_split_table(
+        reader,
+        SplitRole.VAL,
+        columns=sample_columns,
+        max_sample_rows=cfg.max_sample_rows,
+        batch_size=cfg.batch_size,
+    )
+    n_sample_rows = sample_table.num_rows
+
     records: list[FeatureImportanceRecord] = []
     heads_summary: dict[str, object] = {}
-    n_sample_rows = 0
     for head_index, head in enumerate(lm.MODEL_HEADS):
         feature_columns = feature_columns_by_head[head]
-        columns = tuple(dict.fromkeys((*feature_columns, target_column)))
-        val_table = reader.read_split_table(SplitRole.VAL, columns=columns)
-        sample_table = _sample_table(val_table, cfg.max_sample_rows)
-        n_sample_rows = max(n_sample_rows, sample_table.num_rows)
+        head_columns = tuple(dict.fromkeys((*feature_columns, target_column)))
+        head_table = sample_table.select(list(head_columns))
         head_records, head_summary = _records_for_head(
             head=head,
             head_index=head_index,
-            table=sample_table,
+            table=head_table,
             manifest=manifest,
             feature_columns=feature_columns,
             preprocess_state=preprocess_states[head],
