@@ -29,6 +29,21 @@ from mmrt.analysis.feature_audit import (
     run_feature_audit,
     write_feature_audit_artifacts,
 )
+from mmrt.analysis.feature_importance import (
+    FEATURE_IMPORTANCE_SCHEMA_VERSION,
+    DEFAULT_FEATURE_IMPORTANCE_BATCH_SIZE,
+    DEFAULT_FEATURE_IMPORTANCE_MAX_SAMPLE_ROWS,
+    DEFAULT_FEATURE_IMPORTANCE_SEED,
+    DEFAULT_FEATURE_IMPORTANCE_SUMMARY_FILENAME,
+    DEFAULT_FEATURE_IMPORTANCE_BY_HEAD_FILENAME,
+    DEFAULT_FEATURE_IMPORTANCE_FAMILY_SUMMARY_FILENAME,
+    FeatureImportanceConfig,
+    FeatureImportanceRecord,
+    FeatureImportanceFamilyRecord,
+    FeatureImportanceResult,
+    run_feature_importance,
+    write_feature_importance_artifacts,
+)
 
 __all__ = [
     "DEFAULT_PREPROCESS_AUDIT_MAX_SAMPLE_ROWS",
@@ -58,4 +73,17 @@ __all__ = [
     "FeatureAuditResult",
     "run_feature_audit",
     "write_feature_audit_artifacts",
+    "FEATURE_IMPORTANCE_SCHEMA_VERSION",
+    "DEFAULT_FEATURE_IMPORTANCE_BATCH_SIZE",
+    "DEFAULT_FEATURE_IMPORTANCE_MAX_SAMPLE_ROWS",
+    "DEFAULT_FEATURE_IMPORTANCE_SEED",
+    "DEFAULT_FEATURE_IMPORTANCE_SUMMARY_FILENAME",
+    "DEFAULT_FEATURE_IMPORTANCE_BY_HEAD_FILENAME",
+    "DEFAULT_FEATURE_IMPORTANCE_FAMILY_SUMMARY_FILENAME",
+    "FeatureImportanceConfig",
+    "FeatureImportanceRecord",
+    "FeatureImportanceFamilyRecord",
+    "FeatureImportanceResult",
+    "run_feature_importance",
+    "write_feature_importance_artifacts",
 ]
