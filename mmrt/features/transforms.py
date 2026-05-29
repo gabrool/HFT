@@ -9,7 +9,7 @@ This module does not parse market data, compute labels, split rows, write
 storage artifacts, or train models.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 import numpy as np
@@ -23,9 +23,14 @@ from mmrt.features.specs import (
     feature_spec_by_name,
 )
 
-DEFAULT_FAST_HALF_LIFE_US = 30_000_000
-DEFAULT_MEDIUM_HALF_LIFE_US = 120_000_000
-DEFAULT_SLOW_HALF_LIFE_US = 600_000_000
+# EWMA half-lives are normalization-state half-lives, not feature-window lengths.
+# For 1s MMRT prediction, use a fast 5s normalizer for price/book-pressure
+# signals, 30s for flow/depth scale signals, and 120s for slower regime
+# signals. These values are intentionally much faster than the old
+# 30s/120s/600s defaults.
+DEFAULT_FAST_HALF_LIFE_US = 5_000_000
+DEFAULT_MEDIUM_HALF_LIFE_US = 30_000_000
+DEFAULT_SLOW_HALF_LIFE_US = 120_000_000
 DEFAULT_MIN_OBS = 20
 DEFAULT_VARIANCE_FLOOR = 1e-6
 DEFAULT_Z_CLIP = 8.0
@@ -34,14 +39,19 @@ DEFAULT_BOUNDED_ABS_CLIP = 10.0
 FLOAT_EPS = 1e-12
 
 TRANSFORM_KEYS = tuple(spec.transform_key for spec in FEATURE_SPECS)
+TRANSFORM_KEY_VALUES = tuple(key.value for key in TRANSFORM_KEYS)
 
 _IDENTITY_EWMA_FAST_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.IDENTITY_EWMA_FAST)
 _IDENTITY_EWMA_MEDIUM_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.IDENTITY_EWMA_MEDIUM)
 _IDENTITY_EWMA_SLOW_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.IDENTITY_EWMA_SLOW)
 _IDENTITY_NO_EWMA_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.IDENTITY_NO_EWMA)
 _LOG1P_POS_NO_EWMA_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.LOG1P_POS_NO_EWMA)
-_LOG1P_POS_EWMA_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.LOG1P_POS_EWMA)
-_SIGNED_LOG1P_EWMA_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.SIGNED_LOG1P_EWMA)
+_LOG1P_POS_EWMA_FAST_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.LOG1P_POS_EWMA_FAST)
+_LOG1P_POS_EWMA_MEDIUM_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.LOG1P_POS_EWMA_MEDIUM)
+_LOG1P_POS_EWMA_SLOW_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.LOG1P_POS_EWMA_SLOW)
+_SIGNED_LOG1P_EWMA_FAST_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.SIGNED_LOG1P_EWMA_FAST)
+_SIGNED_LOG1P_EWMA_MEDIUM_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.SIGNED_LOG1P_EWMA_MEDIUM)
+_SIGNED_LOG1P_EWMA_SLOW_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.SIGNED_LOG1P_EWMA_SLOW)
 _RATIO_BOUNDED_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.RATIO_BOUNDED)
 _SIGN_NO_EWMA_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.SIGN_NO_EWMA)
 _TIME_LOG1P_NO_EWMA_IDX = tuple(i for i, k in enumerate(TRANSFORM_KEYS) if k == TransformKey.TIME_LOG1P_NO_EWMA)
@@ -52,8 +62,12 @@ EWMA_FEATURE_INDICES_DEFAULT = tuple(
         TransformKey.IDENTITY_EWMA_FAST,
         TransformKey.IDENTITY_EWMA_MEDIUM,
         TransformKey.IDENTITY_EWMA_SLOW,
-        TransformKey.LOG1P_POS_EWMA,
-        TransformKey.SIGNED_LOG1P_EWMA,
+        TransformKey.LOG1P_POS_EWMA_FAST,
+        TransformKey.LOG1P_POS_EWMA_MEDIUM,
+        TransformKey.LOG1P_POS_EWMA_SLOW,
+        TransformKey.SIGNED_LOG1P_EWMA_FAST,
+        TransformKey.SIGNED_LOG1P_EWMA_MEDIUM,
+        TransformKey.SIGNED_LOG1P_EWMA_SLOW,
     }
 )
 NO_EWMA_FEATURE_INDICES_DEFAULT = tuple(i for i in range(FEATURE_COUNT) if i not in set(EWMA_FEATURE_INDICES_DEFAULT))
@@ -190,9 +204,20 @@ class TransformDiagnostics:
     bounded_clip_count: int = 0
     z_clip_count: int = 0
     warmup_ewma_count: int = 0
+    warmup_by_transform_key: dict[str, int] = field(default_factory=dict)
+    z_clip_by_transform_key: dict[str, int] = field(default_factory=dict)
+
     def reset(self) -> None:
-        self.rows_seen = 0; self.nonfinite_raw_count = 0; self.raw_clip_count = 0; self.bounded_clip_count = 0; self.z_clip_count = 0; self.warmup_ewma_count = 0
-    def as_dict(self) -> dict[str, int]:
+        self.rows_seen = 0
+        self.nonfinite_raw_count = 0
+        self.raw_clip_count = 0
+        self.bounded_clip_count = 0
+        self.z_clip_count = 0
+        self.warmup_ewma_count = 0
+        self.warmup_by_transform_key.clear()
+        self.z_clip_by_transform_key.clear()
+
+    def as_dict(self) -> dict[str, object]:
         return {
             "rows_seen": int(self.rows_seen),
             "nonfinite_raw_count": int(self.nonfinite_raw_count),
@@ -200,6 +225,8 @@ class TransformDiagnostics:
             "bounded_clip_count": int(self.bounded_clip_count),
             "z_clip_count": int(self.z_clip_count),
             "warmup_ewma_count": int(self.warmup_ewma_count),
+            "warmup_by_transform_key": dict(self.warmup_by_transform_key),
+            "z_clip_by_transform_key": dict(self.z_clip_by_transform_key),
         }
 
 @dataclass(frozen=True, slots=True)
@@ -251,10 +278,15 @@ def _base_transform_values_with_counts(raw64: np.ndarray, config: TransformConfi
         base[idx] = clipped
     if _LOG1P_POS_NO_EWMA_IDX:
         idx = np.array(_LOG1P_POS_NO_EWMA_IDX, dtype=np.int64); base[idx] = np.log1p(np.maximum(base[idx], 0.0))
-    if _LOG1P_POS_EWMA_IDX:
-        idx = np.array(_LOG1P_POS_EWMA_IDX, dtype=np.int64); base[idx] = np.log1p(np.maximum(base[idx], 0.0))
-    if _SIGNED_LOG1P_EWMA_IDX:
-        idx = np.array(_SIGNED_LOG1P_EWMA_IDX, dtype=np.int64); x = base[idx]; base[idx] = np.sign(x) * np.log1p(np.abs(x))
+    log1p_pos_ewma_idx = _LOG1P_POS_EWMA_FAST_IDX + _LOG1P_POS_EWMA_MEDIUM_IDX + _LOG1P_POS_EWMA_SLOW_IDX
+    if log1p_pos_ewma_idx:
+        idx = np.array(log1p_pos_ewma_idx, dtype=np.int64)
+        base[idx] = np.log1p(np.maximum(base[idx], 0.0))
+    signed_log1p_ewma_idx = _SIGNED_LOG1P_EWMA_FAST_IDX + _SIGNED_LOG1P_EWMA_MEDIUM_IDX + _SIGNED_LOG1P_EWMA_SLOW_IDX
+    if signed_log1p_ewma_idx:
+        idx = np.array(signed_log1p_ewma_idx, dtype=np.int64)
+        x = base[idx]
+        base[idx] = np.sign(x) * np.log1p(np.abs(x))
     if _RATIO_BOUNDED_IDX:
         idx = np.array(_RATIO_BOUNDED_IDX, dtype=np.int64); orig = raw64[idx]; lo, hi = -config.bounded_abs_clip, config.bounded_abs_clip; base[idx] = np.clip(base[idx], lo, hi); bounded_clip_count += int(np.sum(np.isfinite(orig) & ((orig < lo) | (orig > hi))))
     if _SIGN_NO_EWMA_IDX:
@@ -284,8 +316,12 @@ class CausalFeatureTransformer:
         self._half_life_us_by_index[list(_IDENTITY_EWMA_FAST_IDX)] = self.config.fast_half_life_us
         self._half_life_us_by_index[list(_IDENTITY_EWMA_MEDIUM_IDX)] = self.config.medium_half_life_us
         self._half_life_us_by_index[list(_IDENTITY_EWMA_SLOW_IDX)] = self.config.slow_half_life_us
-        self._half_life_us_by_index[list(_LOG1P_POS_EWMA_IDX)] = self.config.medium_half_life_us
-        self._half_life_us_by_index[list(_SIGNED_LOG1P_EWMA_IDX)] = self.config.medium_half_life_us
+        self._half_life_us_by_index[list(_LOG1P_POS_EWMA_FAST_IDX)] = self.config.fast_half_life_us
+        self._half_life_us_by_index[list(_LOG1P_POS_EWMA_MEDIUM_IDX)] = self.config.medium_half_life_us
+        self._half_life_us_by_index[list(_LOG1P_POS_EWMA_SLOW_IDX)] = self.config.slow_half_life_us
+        self._half_life_us_by_index[list(_SIGNED_LOG1P_EWMA_FAST_IDX)] = self.config.fast_half_life_us
+        self._half_life_us_by_index[list(_SIGNED_LOG1P_EWMA_MEDIUM_IDX)] = self.config.medium_half_life_us
+        self._half_life_us_by_index[list(_SIGNED_LOG1P_EWMA_SLOW_IDX)] = self.config.slow_half_life_us
         if snapshot is not None:
             self.load_snapshot(snapshot)
 
@@ -308,8 +344,12 @@ class CausalFeatureTransformer:
         if idx.size:
             counts = self.count[idx]
             warm = counts < self.config.min_obs
-            out[idx[warm]] = 0.0
+            warm_idx = idx[warm]
+            out[warm_idx] = 0.0
             self.diagnostics.warmup_ewma_count += int(np.sum(warm))
+            for feature_idx in warm_idx:
+                key = TRANSFORM_KEY_VALUES[int(feature_idx)]
+                self.diagnostics.warmup_by_transform_key[key] = self.diagnostics.warmup_by_transform_key.get(key, 0) + 1
             ready_idx = idx[~warm]
             if ready_idx.size:
                 v = self.var[ready_idx]
@@ -321,7 +361,11 @@ class CausalFeatureTransformer:
                 if good_idx.size:
                     z = (base[good_idx] - self.mean[good_idx]) / np.sqrt(self.var[good_idx])
                     zc = np.clip(z, -self.config.z_clip, self.config.z_clip)
-                    self.diagnostics.z_clip_count += int(np.sum(z != zc))
+                    clipped = z != zc
+                    self.diagnostics.z_clip_count += int(np.sum(clipped))
+                    for feature_idx in good_idx[clipped]:
+                        key = TRANSFORM_KEY_VALUES[int(feature_idx)]
+                        self.diagnostics.z_clip_by_transform_key[key] = self.diagnostics.z_clip_by_transform_key.get(key, 0) + 1
                     out[good_idx] = zc
         self._update_ewma_state(local_ts, base)
         self.rows_seen += 1
@@ -356,7 +400,16 @@ class CausalFeatureTransformer:
         return out
     def diagnostics_snapshot(self) -> TransformDiagnostics:
         d = self.diagnostics
-        return TransformDiagnostics(d.rows_seen, d.nonfinite_raw_count, d.raw_clip_count, d.bounded_clip_count, d.z_clip_count, d.warmup_ewma_count)
+        return TransformDiagnostics(
+            d.rows_seen,
+            d.nonfinite_raw_count,
+            d.raw_clip_count,
+            d.bounded_clip_count,
+            d.z_clip_count,
+            d.warmup_ewma_count,
+            dict(d.warmup_by_transform_key),
+            dict(d.z_clip_by_transform_key),
+        )
 
 def transform_feature_matrix_causal_local(local_ts_us: np.ndarray, raw_matrix: np.ndarray, config: TransformConfig | None = None, initial_snapshot: TransformStateSnapshot | None = None) -> tuple[np.ndarray, TransformStateSnapshot, TransformDiagnostics]:
     transformer = CausalFeatureTransformer(config=config, snapshot=initial_snapshot)

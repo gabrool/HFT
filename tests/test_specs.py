@@ -32,14 +32,14 @@ def test_canonical_names_are_microsecond_native():
 
 
 def test_legacy_to_canonical_roundtrip():
-    for legacy in specs.LEGACY_CORE_FEATURE_NAMES + specs.LEGACY_EVENT_CONTEXT_FEATURE_NAMES:
+    for legacy in specs.CORE_FEATURE_NAMES + specs.EVENT_CONTEXT_FEATURE_NAMES:
         canonical = specs.legacy_name_to_canonical_name(legacy)
         assert specs.canonical_name_to_legacy_name(canonical) == legacy
 
 
-def test_context_tail_after_legacy_core():
-    assert specs.LEGACY_CORE_FEATURE_COUNT == 172
-    assert specs.FEATURE_NAMES[:172] == tuple(specs.legacy_name_to_canonical_name(n) for n in specs.LEGACY_CORE_FEATURE_NAMES)
+def test_context_tail_after_core_features():
+    assert specs.CORE_FEATURE_COUNT == 172
+    assert specs.FEATURE_NAMES[:172] == tuple(specs.legacy_name_to_canonical_name(n) for n in specs.CORE_FEATURE_NAMES)
 
 
 def test_required_windows_and_depth():
@@ -124,6 +124,83 @@ def test_corrected_non_book_ownership():
         assert spec.owner == owner
         assert spec.family == family
         assert spec.required_book_depth == depth
+
+
+def test_feature_schema_version_is_core_not_legacy():
+    assert specs.FEATURE_SCHEMA_VERSION == "mmrt_feature_schema_v1_snapshot25_trades_core172_ctx6_us"
+    assert "legacy" not in specs.FEATURE_SCHEMA_VERSION
+
+
+def test_no_public_legacy_core_names_required_for_new_code():
+    legacy_exports = {name for name in specs.__all__ if name.startswith("LEGACY_")}
+    assert legacy_exports == set()
+
+
+def test_transform_keys_include_log_ewma_half_life_classes():
+    assert TransformKey.LOG1P_POS_EWMA_FAST.value == "log1p_pos_ewma_fast"
+    assert TransformKey.LOG1P_POS_EWMA_MEDIUM.value == "log1p_pos_ewma_medium"
+    assert TransformKey.LOG1P_POS_EWMA_SLOW.value == "log1p_pos_ewma_slow"
+    assert TransformKey.SIGNED_LOG1P_EWMA_FAST.value == "signed_log1p_ewma_fast"
+    assert TransformKey.SIGNED_LOG1P_EWMA_MEDIUM.value == "signed_log1p_ewma_medium"
+    assert TransformKey.SIGNED_LOG1P_EWMA_SLOW.value == "signed_log1p_ewma_slow"
+
+
+def test_event_context_features_are_no_ewma():
+    for name in specs.FEATURE_NAMES[-specs.EVENT_CONTEXT_FEATURE_COUNT:]:
+        assert specs.feature_spec_by_name(name).transform_key == TransformKey.LOG1P_POS_NO_EWMA
+
+
+def test_time_features_are_time_log1p_no_ewma():
+    for spec in specs.FEATURE_SPECS:
+        if spec.unit == specs.FeatureUnit.MICROSECONDS:
+            assert spec.transform_key == TransformKey.TIME_LOG1P_NO_EWMA
+
+
+def test_sign_features_are_sign_no_ewma():
+    assert specs.feature_spec_by_name("last_trade_side_sign").transform_key == TransformKey.SIGN_NO_EWMA
+    assert specs.feature_spec_by_name("last_tick_sign").transform_key == TransformKey.SIGN_NO_EWMA
+
+
+def test_bounded_ratio_features_are_ratio_bounded():
+    for name in [
+        "zero_tick_fraction_200000us",
+        "tick_sign_imbalance_200000us",
+        "top5_trade_share_notional_3000000us",
+        "trade_sign_entropy_3000000us",
+        "trade_side_quote_response_asymmetry_500000us",
+        "trade_impact_half_life_proxy",
+    ]:
+        assert specs.feature_spec_by_name(name).transform_key == TransformKey.RATIO_BOUNDED
+
+
+def test_short_horizon_price_and_ofi_features_are_fast():
+    assert specs.feature_spec_by_name("micro_ret_bps_200000us").transform_key == TransformKey.IDENTITY_EWMA_FAST
+    assert specs.feature_spec_by_name("spread_bps").transform_key == TransformKey.IDENTITY_EWMA_FAST
+    assert specs.feature_spec_by_name("ofi_l1").transform_key == TransformKey.IDENTITY_EWMA_FAST
+    assert specs.feature_spec_by_name("ofi_l1_sum_over_depth_200000us").transform_key == TransformKey.RATIO_BOUNDED
+
+
+def test_short_horizon_trade_flow_features_are_fast_or_bounded():
+    assert specs.feature_spec_by_name("signed_notional_flow_usd_200000us").transform_key == TransformKey.SIGNED_LOG1P_EWMA_FAST
+    assert specs.feature_spec_by_name("trade_count_per_second_200000us").transform_key == TransformKey.LOG1P_POS_EWMA_FAST
+    assert specs.feature_spec_by_name("signed_trade_count_imbalance_200000us").transform_key == TransformKey.RATIO_BOUNDED
+
+
+def test_scale_depth_features_are_medium():
+    assert specs.feature_spec_by_name("bid_depth_notional_5bps").transform_key == TransformKey.LOG1P_POS_EWMA_MEDIUM
+    assert specs.feature_spec_by_name("cvd_change_usd_500000us").transform_key == TransformKey.SIGNED_LOG1P_EWMA_MEDIUM
+
+
+def test_regime_features_are_slow_or_bounded():
+    assert specs.feature_spec_by_name("regime_volume_ewma_3000000us").transform_key == TransformKey.LOG1P_POS_EWMA_SLOW
+    assert specs.feature_spec_by_name("return_std_bps_200000us").transform_key == TransformKey.IDENTITY_EWMA_SLOW
+    assert specs.feature_spec_by_name("down_up_vol_imbalance_500000us").transform_key == TransformKey.RATIO_BOUNDED
+
+
+def test_every_feature_has_explicit_transform_policy():
+    supported = set(TransformKey)
+    for spec in specs.FEATURE_SPECS:
+        assert spec.transform_key in supported
 
 
 def test_no_heavy_imports():

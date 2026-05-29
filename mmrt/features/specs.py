@@ -11,9 +11,9 @@ import hashlib
 import re
 from typing import Iterable, Mapping, Sequence
 
-FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v1_snapshot25_trades_legacy172_ctx6_us"
+FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v1_snapshot25_trades_core172_ctx6_us"
 
-LEGACY_CORE_FEATURE_COUNT = 172
+CORE_FEATURE_COUNT = 172
 EVENT_CONTEXT_FEATURE_COUNT = 6
 FEATURE_COUNT = 178
 
@@ -30,7 +30,7 @@ SUPPORTED_WINDOWS_US = (
 
 DEFAULT_FEATURE_DTYPE = "float32"
 
-LEGACY_CORE_FEATURE_NAMES = (
+CORE_FEATURE_NAMES = (
     "micro_ret_bps_200ms",
     "micro_ret_bps_500ms",
     "mid_slope_bps_per_sec_500ms",
@@ -204,10 +204,10 @@ LEGACY_CORE_FEATURE_NAMES = (
     "near_touch_depth_drop_asymmetry",
     "trade_impact_half_life_proxy",
 )
-assert len(LEGACY_CORE_FEATURE_NAMES) == 172
-assert len(set(LEGACY_CORE_FEATURE_NAMES)) == 172
+assert len(CORE_FEATURE_NAMES) == 172
+assert len(set(CORE_FEATURE_NAMES)) == 172
 
-LEGACY_EVENT_CONTEXT_FEATURE_NAMES = (
+EVENT_CONTEXT_FEATURE_NAMES = (
     "log_dt_decision_ms",
     "log_events_100ms",
     "log_events_200ms",
@@ -215,8 +215,8 @@ LEGACY_EVENT_CONTEXT_FEATURE_NAMES = (
     "log_events_1000ms",
     "log_events_3000ms",
 )
-assert len(LEGACY_EVENT_CONTEXT_FEATURE_NAMES) == 6
-assert not set(LEGACY_EVENT_CONTEXT_FEATURE_NAMES).intersection(LEGACY_CORE_FEATURE_NAMES)
+assert len(EVENT_CONTEXT_FEATURE_NAMES) == 6
+assert not set(EVENT_CONTEXT_FEATURE_NAMES).intersection(CORE_FEATURE_NAMES)
 
 
 class FeatureSource(str, Enum):
@@ -266,8 +266,12 @@ class TransformKey(str, Enum):
     IDENTITY_EWMA_SLOW = "identity_ewma_slow"
     IDENTITY_NO_EWMA = "identity_no_ewma"
     LOG1P_POS_NO_EWMA = "log1p_pos_no_ewma"
-    LOG1P_POS_EWMA = "log1p_pos_ewma"
-    SIGNED_LOG1P_EWMA = "signed_log1p_ewma"
+    LOG1P_POS_EWMA_FAST = "log1p_pos_ewma_fast"
+    LOG1P_POS_EWMA_MEDIUM = "log1p_pos_ewma_medium"
+    LOG1P_POS_EWMA_SLOW = "log1p_pos_ewma_slow"
+    SIGNED_LOG1P_EWMA_FAST = "signed_log1p_ewma_fast"
+    SIGNED_LOG1P_EWMA_MEDIUM = "signed_log1p_ewma_medium"
+    SIGNED_LOG1P_EWMA_SLOW = "signed_log1p_ewma_slow"
     RATIO_BOUNDED = "ratio_bounded"
     SIGN_NO_EWMA = "sign_no_ewma"
     TIME_LOG1P_NO_EWMA = "time_log1p_no_ewma"
@@ -383,7 +387,7 @@ def infer_windows_us_from_legacy_name(legacy_name: str) -> tuple[int, ...]:
 
 
 def infer_source(legacy_name: str) -> FeatureSource:
-    if legacy_name in LEGACY_EVENT_CONTEXT_FEATURE_NAMES:
+    if legacy_name in EVENT_CONTEXT_FEATURE_NAMES:
         return FeatureSource.EVENT_CONTEXT
     trade_exact_names = {
         "time_since_trade_ms",
@@ -486,14 +490,14 @@ def infer_unit(legacy_name: str) -> FeatureUnit:
         return FeatureUnit.BPS
     if "usd" in legacy_name or "notional" in legacy_name:
         return FeatureUnit.NOTIONAL_USD
+    if any(k in legacy_name for k in ("imbalance", "fraction", "share", "entropy", "asymmetry", "proxy", "score")):
+        return FeatureUnit.RATIO
     if "count" in legacy_name or "run_length" in legacy_name:
         return FeatureUnit.COUNT
     if "per_second" in legacy_name or "rate" in legacy_name or "slope" in legacy_name:
         return FeatureUnit.RATE_PER_SECOND
     if "sign" in legacy_name or legacy_name in {"last_trade_side_sign", "last_tick_sign"}:
         return FeatureUnit.SIGN
-    if any(k in legacy_name for k in ("imbalance", "fraction", "share", "entropy", "asymmetry", "proxy", "score")):
-        return FeatureUnit.RATIO
     return FeatureUnit.SCORE
 
 
@@ -528,25 +532,114 @@ def infer_required_book_depth(legacy_name: str, source: FeatureSource) -> int:
     return 1 if source == FeatureSource.BOOK else 0
 
 
-def infer_transform_key(legacy_name: str, unit: FeatureUnit, source: FeatureSource) -> TransformKey:
+def _has_window_at_most(legacy_name: str, max_window_us: int) -> bool:
+    windows_us = infer_windows_us_from_legacy_name(legacy_name)
+    return bool(windows_us) and min(windows_us) <= max_window_us
+
+
+def _has_window_at_least(legacy_name: str, min_window_us: int) -> bool:
+    windows_us = infer_windows_us_from_legacy_name(legacy_name)
+    return bool(windows_us) and max(windows_us) >= min_window_us
+
+
+def _is_ratio_or_bounded_feature(legacy_name: str, unit: FeatureUnit) -> bool:
+    if unit == FeatureUnit.RATIO:
+        return True
+    bounded_terms = (
+        "imbalance",
+        "fraction",
+        "share",
+        "entropy",
+        "asymmetry",
+        "proxy",
+        "score",
+        "over_depth",
+    )
+    return any(term in legacy_name for term in bounded_terms)
+
+
+def _is_slow_regime_feature(legacy_name: str) -> bool:
+    slow_exact = {
+        "regime_volume_ewma_500ms",
+        "regime_volume_ewma_3000ms",
+        "return_std_bps_200ms",
+        "microprice_realized_vol_1000ms",
+        "max_abs_return_bps_500ms",
+        "depth_imbalance_realized_vol_1000ms",
+    }
+    return legacy_name in slow_exact or legacy_name.startswith("spread_z_") or legacy_name.startswith("depth_5bps_z_")
+
+
+def _is_fast_microstructure_feature(legacy_name: str, source: FeatureSource, family: FeatureFamily) -> bool:
+    if _is_slow_regime_feature(legacy_name) or not _has_window_at_most(legacy_name, 1_000_000):
+        return legacy_name in {"spread_bps", "gap_b_bps", "micro_minus_mid_bps", "ofi_l1", "ofi_l3", "ofi_l5", "ofi_l10", "obi_l1", "obi_l10"}
+    return source in {FeatureSource.BOOK, FeatureSource.TRADE, FeatureSource.CROSS} and family in {
+        FeatureFamily.PRICE,
+        FeatureFamily.OFI_OBI,
+        FeatureFamily.BOOK_DYNAMICS,
+        FeatureFamily.TRADE_FLOW,
+        FeatureFamily.ABSORPTION,
+        FeatureFamily.CROSS_SIGNAL,
+    }
+
+
+def _signed_log_ewma_key(legacy_name: str, source: FeatureSource, family: FeatureFamily) -> TransformKey:
+    if _is_slow_regime_feature(legacy_name):
+        return TransformKey.SIGNED_LOG1P_EWMA_SLOW
+    if _is_fast_microstructure_feature(legacy_name, source, family) and not legacy_name.startswith("cvd_"):
+        return TransformKey.SIGNED_LOG1P_EWMA_FAST
+    return TransformKey.SIGNED_LOG1P_EWMA_MEDIUM
+
+
+def _positive_log_ewma_key(legacy_name: str, source: FeatureSource, family: FeatureFamily) -> TransformKey:
+    if _is_slow_regime_feature(legacy_name):
+        return TransformKey.LOG1P_POS_EWMA_SLOW
+    if _is_fast_microstructure_feature(legacy_name, source, family) and not any(
+        term in legacy_name for term in ("depth_notional", "depth_within", "top5_trade_notional", "max_trade_silence_gap", "p90_over_median")
+    ):
+        return TransformKey.LOG1P_POS_EWMA_FAST
+    return TransformKey.LOG1P_POS_EWMA_MEDIUM
+
+
+def infer_transform_key(legacy_name: str, unit: FeatureUnit, source: FeatureSource, family: FeatureFamily) -> TransformKey:
     if source == FeatureSource.EVENT_CONTEXT:
         return TransformKey.LOG1P_POS_NO_EWMA
     if unit == FeatureUnit.MICROSECONDS:
         return TransformKey.TIME_LOG1P_NO_EWMA
     if unit == FeatureUnit.SIGN:
         return TransformKey.SIGN_NO_EWMA
-    if any(k in legacy_name for k in ("fraction", "imbalance", "share", "entropy", "asymmetry", "proxy", "score")):
+    if _is_ratio_or_bounded_feature(legacy_name, unit):
         return TransformKey.RATIO_BOUNDED
-    if "notional" in legacy_name or "usd" in legacy_name:
-        return TransformKey.SIGNED_LOG1P_EWMA if ("signed" in legacy_name or "cvd" in legacy_name) else TransformKey.LOG1P_POS_EWMA
-    if "count" in legacy_name or "rate" in legacy_name or "run_length" in legacy_name:
-        return TransformKey.LOG1P_POS_EWMA
-    if legacy_name == "spread_bps" or legacy_name == "micro_minus_mid_bps" or "ret_bps" in legacy_name or "bps" in legacy_name:
-        return TransformKey.IDENTITY_EWMA_FAST
-    if any(k in legacy_name for k in ("regime", "z_", "realized_vol", "return_std")):
-        return TransformKey.IDENTITY_EWMA_SLOW
-    return TransformKey.IDENTITY_EWMA_MEDIUM
 
+    signed_heavy_tailed = (
+        legacy_name.startswith("signed_notional_flow_usd_")
+        or legacy_name.startswith("cvd_")
+        or legacy_name.startswith("max_signed_trade_notional_usd_")
+    )
+    if signed_heavy_tailed:
+        return _signed_log_ewma_key(legacy_name, source, family)
+
+    positive_heavy_tailed = (
+        legacy_name.startswith("regime_volume_ewma_")
+        or "notional" in legacy_name
+        or "usd" in legacy_name
+        or unit in {FeatureUnit.COUNT, FeatureUnit.RATE_PER_SECOND}
+    )
+    if positive_heavy_tailed:
+        return _positive_log_ewma_key(legacy_name, source, family)
+
+    if unit == FeatureUnit.BPS:
+        if _is_slow_regime_feature(legacy_name):
+            return TransformKey.IDENTITY_EWMA_SLOW
+        return TransformKey.IDENTITY_EWMA_FAST
+
+    if _is_slow_regime_feature(legacy_name):
+        return TransformKey.IDENTITY_EWMA_SLOW
+    if _is_fast_microstructure_feature(legacy_name, source, family):
+        return TransformKey.IDENTITY_EWMA_FAST
+    if _has_window_at_least(legacy_name, 3_000_000):
+        return TransformKey.IDENTITY_EWMA_MEDIUM
+    return TransformKey.IDENTITY_EWMA_MEDIUM
 
 def infer_formula_group(legacy_name: str, source: FeatureSource, family: FeatureFamily) -> str:
     if source == FeatureSource.EVENT_CONTEXT:
@@ -583,19 +676,19 @@ def infer_formula_group(legacy_name: str, source: FeatureSource, family: Feature
 
 
 def _build_feature_specs() -> tuple[FeatureSpec, ...]:
-    canonical_core_names = tuple(legacy_name_to_canonical_name(n) for n in LEGACY_CORE_FEATURE_NAMES)
-    canonical_context_names = tuple(legacy_name_to_canonical_name(n) for n in LEGACY_EVENT_CONTEXT_FEATURE_NAMES)
+    canonical_core_names = tuple(legacy_name_to_canonical_name(n) for n in CORE_FEATURE_NAMES)
+    canonical_context_names = tuple(legacy_name_to_canonical_name(n) for n in EVENT_CONTEXT_FEATURE_NAMES)
     feature_names = canonical_core_names + canonical_context_names
     assert len(feature_names) == FEATURE_COUNT
     assert len(set(feature_names)) == FEATURE_COUNT
     specs = []
-    legacy_names = LEGACY_CORE_FEATURE_NAMES + LEGACY_EVENT_CONTEXT_FEATURE_NAMES
+    legacy_names = CORE_FEATURE_NAMES + EVENT_CONTEXT_FEATURE_NAMES
     for index, (name, legacy_name) in enumerate(zip(feature_names, legacy_names)):
         source = infer_source(legacy_name)
         owner = infer_owner(source)
         family = infer_family(legacy_name, source)
         unit = infer_unit(legacy_name)
-        transform_key = infer_transform_key(legacy_name, unit, source)
+        transform_key = infer_transform_key(legacy_name, unit, source, family)
         windows_us = infer_windows_us_from_legacy_name(legacy_name)
         required_book_depth = infer_required_book_depth(legacy_name, source)
         formula_group = infer_formula_group(legacy_name, source, family)
@@ -605,8 +698,8 @@ def _build_feature_specs() -> tuple[FeatureSpec, ...]:
 
 FEATURE_SPECS = _build_feature_specs()
 FEATURE_NAMES = tuple(spec.name for spec in FEATURE_SPECS)
-LEGACY_TO_CANONICAL_FEATURE_NAME = {spec.legacy_name: spec.name for spec in FEATURE_SPECS}
-CANONICAL_TO_LEGACY_FEATURE_NAME = {spec.name: spec.legacy_name for spec in FEATURE_SPECS}
+SOURCE_TO_CANONICAL_FEATURE_NAME = {spec.legacy_name: spec.name for spec in FEATURE_SPECS}
+CANONICAL_TO_SOURCE_FEATURE_NAME = {spec.name: spec.legacy_name for spec in FEATURE_SPECS}
 FEATURE_NAME_TO_INDEX = {spec.name: spec.index for spec in FEATURE_SPECS}
 
 assert len(FEATURE_SPECS) == FEATURE_COUNT
@@ -618,7 +711,7 @@ assert max(spec.required_book_depth for spec in FEATURE_SPECS) == MAX_REQUIRED_B
 
 
 def canonical_name_to_legacy_name(name: str) -> str:
-    return CANONICAL_TO_LEGACY_FEATURE_NAME[name]
+    return CANONICAL_TO_SOURCE_FEATURE_NAME[name]
 
 
 def feature_names_hash(names: Sequence[str] = FEATURE_NAMES) -> str:
@@ -647,7 +740,7 @@ def all_feature_names() -> tuple[str, ...]:
     return FEATURE_NAMES
 
 def legacy_feature_names() -> tuple[str, ...]:
-    return LEGACY_CORE_FEATURE_NAMES + LEGACY_EVENT_CONTEXT_FEATURE_NAMES
+    return CORE_FEATURE_NAMES + EVENT_CONTEXT_FEATURE_NAMES
 
 def feature_count() -> int:
     return FEATURE_COUNT
@@ -669,10 +762,10 @@ def feature_name(index: int) -> str:
     return FEATURE_NAMES[index]
 
 def legacy_name_for_feature(name: str) -> str:
-    return CANONICAL_TO_LEGACY_FEATURE_NAME[name]
+    return CANONICAL_TO_SOURCE_FEATURE_NAME[name]
 
 def canonical_name_for_legacy_feature(legacy_name: str) -> str:
-    return LEGACY_TO_CANONICAL_FEATURE_NAME[legacy_name]
+    return SOURCE_TO_CANONICAL_FEATURE_NAME[legacy_name]
 
 def feature_indices_by_source(source: FeatureSource | str) -> tuple[int, ...]:
     source_enum = _coerce_enum(FeatureSource, source, "source")
@@ -710,11 +803,11 @@ def schema_record() -> Mapping[str, object]:
     }
 
 __all__ = [
-    "FEATURE_SCHEMA_VERSION", "LEGACY_CORE_FEATURE_COUNT", "EVENT_CONTEXT_FEATURE_COUNT", "FEATURE_COUNT",
+    "FEATURE_SCHEMA_VERSION", "CORE_FEATURE_COUNT", "EVENT_CONTEXT_FEATURE_COUNT", "FEATURE_COUNT",
     "REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH", "MAX_REQUIRED_BOOK_FEATURE_DEPTH", "SUPPORTED_WINDOWS_US",
-    "DEFAULT_FEATURE_DTYPE", "LEGACY_CORE_FEATURE_NAMES", "LEGACY_EVENT_CONTEXT_FEATURE_NAMES", "FeatureSource",
+    "DEFAULT_FEATURE_DTYPE", "CORE_FEATURE_NAMES", "EVENT_CONTEXT_FEATURE_NAMES", "FeatureSource",
     "FeatureOwner", "FeatureFamily", "FeatureUnit", "TransformKey", "FeatureSpec", "FEATURE_SPECS",
-    "FEATURE_NAMES", "LEGACY_TO_CANONICAL_FEATURE_NAME", "CANONICAL_TO_LEGACY_FEATURE_NAME", "FEATURE_NAME_TO_INDEX",
+    "FEATURE_NAMES", "SOURCE_TO_CANONICAL_FEATURE_NAME", "CANONICAL_TO_SOURCE_FEATURE_NAME", "FEATURE_NAME_TO_INDEX",
     "FEATURE_NAMES_HASH", "FEATURE_SPECS_HASH", "legacy_name_to_canonical_name", "infer_windows_us_from_legacy_name",
     "all_feature_names", "legacy_feature_names", "feature_count", "feature_specs", "feature_spec_by_name",
     "feature_index", "feature_name", "legacy_name_for_feature", "canonical_name_for_legacy_feature",

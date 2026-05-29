@@ -111,6 +111,9 @@ def test_config_validation_and_as_dict():
     with pytest.raises(ValueError): tr.TransformConfig(bounded_abs_clip=0)
     with pytest.raises(ValueError): tr.TransformConfig(output_dtype="float16")
     with pytest.raises(ValueError): tr.TransformConfig(fast_half_life_us=True)
+    assert c.fast_half_life_us == 5_000_000
+    assert c.medium_half_life_us == 30_000_000
+    assert c.slow_half_life_us == 120_000_000
     d = c.as_dict()
     assert d["feature_names_hash"] and d["feature_specs_hash"]
 
@@ -343,7 +346,11 @@ def test_diagnostics_counts():
         "bounded_clip_count": d.bounded_clip_count,
         "z_clip_count": d.z_clip_count,
         "warmup_ewma_count": d.warmup_ewma_count,
+        "warmup_by_transform_key": d.warmup_by_transform_key,
+        "z_clip_by_transform_key": d.z_clip_by_transform_key,
     }
+    assert "warmup_by_transform_key" in d.as_dict()
+    assert "z_clip_by_transform_key" in d.as_dict()
 
 
 def test_output_dtype_and_shape():
@@ -412,14 +419,37 @@ def test_all_feature_transform_keys_supported():
       TransformKey.IDENTITY_EWMA_SLOW,
       TransformKey.IDENTITY_NO_EWMA,
       TransformKey.LOG1P_POS_NO_EWMA,
-      TransformKey.LOG1P_POS_EWMA,
-      TransformKey.SIGNED_LOG1P_EWMA,
+      TransformKey.LOG1P_POS_EWMA_FAST,
+      TransformKey.LOG1P_POS_EWMA_MEDIUM,
+      TransformKey.LOG1P_POS_EWMA_SLOW,
+      TransformKey.SIGNED_LOG1P_EWMA_FAST,
+      TransformKey.SIGNED_LOG1P_EWMA_MEDIUM,
+      TransformKey.SIGNED_LOG1P_EWMA_SLOW,
       TransformKey.RATIO_BOUNDED,
       TransformKey.SIGN_NO_EWMA,
       TransformKey.TIME_LOG1P_NO_EWMA,
     }
     for spec in specs.FEATURE_SPECS:
         assert spec.transform_key in supported
+
+
+def test_log_ewma_half_life_classes_use_configured_half_lives():
+    c = tr.TransformConfig(
+        fast_half_life_us=11,
+        medium_half_life_us=22,
+        slow_half_life_us=33,
+        output_dtype="float64",
+    )
+    t = tr.CausalFeatureTransformer(c)
+
+    def first_index(key):
+        return next(spec.index for spec in specs.FEATURE_SPECS if spec.transform_key == key)
+
+    assert t._half_life_us_by_index[first_index(TransformKey.LOG1P_POS_EWMA_FAST)] == 11
+    assert t._half_life_us_by_index[first_index(TransformKey.LOG1P_POS_EWMA_MEDIUM)] == 22
+    assert t._half_life_us_by_index[first_index(TransformKey.LOG1P_POS_EWMA_SLOW)] == 33
+    assert t._half_life_us_by_index[first_index(TransformKey.SIGNED_LOG1P_EWMA_FAST)] == 11
+    assert t._half_life_us_by_index[first_index(TransformKey.SIGNED_LOG1P_EWMA_MEDIUM)] == 22
 
 
 def test_no_global_fit_api():
