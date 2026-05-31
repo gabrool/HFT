@@ -266,6 +266,12 @@ def test_no_move_predict_threshold_validation():
             head.predict(X, threshold=bad)
 
 
+def test_direction_predict_threshold_rejects_bool():
+    head = lm.DirectionLinearHead(("x",))
+    X = np.array([[0.0], [1.0]])
+    with pytest.raises(ValueError):
+        head.predict(X, threshold=True)
+
 def test_bundle_n_features_rejects_nonshared_feature_columns():
     bundle = lm.make_linear_model_bundle(
         {

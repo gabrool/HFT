@@ -219,9 +219,9 @@ def test_evaluate_linear_predictions_mask_validation():
     with pytest.raises(ValueError, match="up class"):
         ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([0, -1, 0, 0], dtype=np.int8)})
     with pytest.raises(ValueError, match="down class"):
-        ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([1, -1, 1, 1], dtype=np.int8)})
+        ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([0, -1, 1, -1], dtype=np.int8)})
     with pytest.raises(ValueError, match="invalid class"):
-        ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([0, 0, 1, 0], dtype=np.int8)})
+        ev.evaluate_linear_predictions(**{**kwargs, "y_direction": np.array([0, 2, 1, 0], dtype=np.int8)})
 
 
 def test_derive_gated_signal_predictions():

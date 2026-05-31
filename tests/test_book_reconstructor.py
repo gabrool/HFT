@@ -1,4 +1,5 @@
 import importlib
+import subprocess
 import sys
 
 import pytest
@@ -195,11 +196,35 @@ def test_reconstruct_final_snapshot_raises_when_no_snapshot_emitted():
 
 
 def test_no_heavy_data_imports():
-    importlib.import_module("mmrt.data.book_reconstructor")
-    assert ("po" + "lars") not in sys.modules
-    assert "mmrt.data.tardis_csv" not in sys.modules
-    assert "mmrt.data.event_merge" not in sys.modules
-    assert "mmrt.data.quality" not in sys.modules
+    code = r'''
+import sys
+
+before = set(sys.modules)
+import mmrt.data.book_reconstructor
+after = set(sys.modules)
+new = after - before
+
+forbidden = {
+    "polars",
+    "pandas",
+    "sklearn",
+    "scipy",
+    "torch",
+    "numba",
+    "mmrt.data.tardis_csv",
+    "mmrt.data.event_merge",
+    "mmrt.storage",
+    "mmrt.linear",
+}
+
+bad = sorted(
+    mod for mod in new
+    if any(mod == banned or mod.startswith(banned + ".") for banned in forbidden)
+)
+if bad:
+    raise SystemExit("forbidden imports loaded: " + repr(bad))
+'''
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_no_feature_label_or_decision_concepts():

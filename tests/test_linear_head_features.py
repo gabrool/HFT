@@ -12,7 +12,16 @@ def _manifest(tmp_path: Path):
     root = tmp_path / 'ds'
     writer = wr.DecisionRowWriter(wr.WriterConfig(dataset_id='d1', created_at_utc='2026-01-01T00:00:00Z', dataset_root=str(root), chunk_rows=2))
     fv = tuple(float(i) for i in range(specs.FEATURE_COUNT))
-    writer.append_values(1,1,1,1,100.0,1,(0.0,0.0,0.0),fv)
+    writer.append_values(
+        decision_index=1,
+        ts_us=1,
+        local_ts_us=1,
+        event_seq=1,
+        raw_mid=100.0,
+        label_entry_ts_us=1,
+        label_values=(0.0, 0.0, 0.0),
+        feature_values=fv,
+    )
     return writer.finalize()
 
 

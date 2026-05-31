@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 
 from mmrt.contracts import TardisDataType
@@ -231,13 +234,38 @@ def test_adapter_import_smoke():
 
 
 def test_adapter_does_not_import_heavy_data_modules():
-    import sys
-    import mmrt.data.binance_futures_adapter as adapter
+    code = r'''
+import sys
 
-    assert adapter.BINANCE_FUTURES_EXCHANGE == "binance-futures"
-    assert "po" + "lars" not in sys.modules
-    assert "mmrt.data.tardis_csv" not in sys.modules
-    assert "mmrt.data.event_merge" not in sys.modules
+before = set(sys.modules)
+import mmrt.data.binance_futures_adapter as adapter
+after = set(sys.modules)
+new = after - before
+
+assert adapter.BINANCE_FUTURES_EXCHANGE == "binance-futures"
+
+forbidden = {
+    "polars",
+    "pyarrow",
+    "pandas",
+    "sklearn",
+    "scipy",
+    "torch",
+    "numba",
+    "mmrt.data.tardis_csv",
+    "mmrt.data.event_merge",
+    "mmrt.storage",
+    "mmrt.linear",
+}
+
+bad = sorted(
+    mod for mod in new
+    if any(mod == banned or mod.startswith(banned + ".") for banned in forbidden)
+)
+if bad:
+    raise SystemExit("forbidden imports loaded: " + repr(bad))
+'''
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_no_feature_label_or_decision_concepts():
