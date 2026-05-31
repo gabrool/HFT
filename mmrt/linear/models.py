@@ -59,6 +59,15 @@ def _require_positive_float(value: float, name: str) -> float:
     return coerced
 
 
+def _require_probability_threshold(value: float, name: str = "threshold") -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite and within [0, 1]")
+    out = float(value)
+    if not np.isfinite(out) or out < 0.0 or out > 1.0:
+        raise ValueError(f"{name} must be finite and within [0, 1]")
+    return out
+
+
 def _require_output_dtype(value: str) -> str:
     if value not in ALLOWED_MODEL_DTYPES:
         raise ValueError(f"output_dtype must be one of {ALLOWED_MODEL_DTYPES}")
@@ -337,9 +346,7 @@ class DirectionLinearHead(BaseLinearHead):
         return proba
 
     def predict(self, X: np.ndarray, *, threshold: float = 0.5) -> np.ndarray:
-        thr = float(threshold)
-        if not np.isfinite(thr) or thr < 0.0 or thr > 1.0:
-            raise ValueError("threshold must be finite and within [0, 1]")
+        thr = _require_probability_threshold(threshold)
         p_up = self.predict_proba(X)[:, 1]
         return (p_up >= thr).astype(np.int8, copy=False)
 
@@ -379,9 +386,7 @@ class NoMoveLinearHead(BaseLinearHead):
         return proba
 
     def predict(self, X: np.ndarray, *, threshold: float = 0.5) -> np.ndarray:
-        thr = float(threshold)
-        if not np.isfinite(thr) or thr < 0.0 or thr > 1.0:
-            raise ValueError("threshold must be finite and within [0, 1]")
+        thr = _require_probability_threshold(threshold)
         return (self.predict_proba(X)[:, 1] >= thr).astype(np.int8, copy=False)
 
     def loss(self, X: np.ndarray, y_no_move: np.ndarray) -> float:
