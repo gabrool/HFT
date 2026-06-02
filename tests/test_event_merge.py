@@ -12,7 +12,6 @@ from mmrt.data.event_merge import (
     EVENT_TYPE_CODE_BOOK_SNAPSHOT,
     EVENT_TYPE_CODE_TRADE,
     MERGE_INPUT_RANK,
-    MergedEventFile,
     ParquetEventStreamInput,
     event_type_code_for_data_type,
     event_type_for_data_type,
@@ -21,7 +20,6 @@ from mmrt.data.event_merge import (
     parquet_event_stream_input,
     validate_merge_input_schema,
     validate_merged_event_frame,
-    write_merged_events_parquet,
 )
 from mmrt.data.tardis_csv import LOCAL_TS_US, RAW_SOURCE_ROW, SOURCE_DATA_TYPE, SOURCE_FILE, TS_US, expected_normalized_columns
 
@@ -92,6 +90,26 @@ def _stream_df(inputs):
     return pl.DataFrame(rows).select(list(expected_merged_columns([inp.data_type for inp in inputs])))
 
 
+def test_event_merge_has_no_merged_parquet_writer_api():
+    import inspect
+    import mmrt.data.event_merge as em
+
+    src = inspect.getsource(em)
+
+    forbidden = [
+        "MergedEventFile",
+        "write_merged_events_parquet",
+        "ParquetWriter",
+        "DEFAULT_PARQUET_COMPRESSION",
+        "merged/events.parquet",
+        "merge_normalized_events",
+    ]
+    for token in forbidden:
+        assert token not in src
+
+    assert "iter_merged_events_streaming" in src
+
+
 def test_event_type_mappings():
     assert event_type_for_data_type(TardisDataType.BOOK_SNAPSHOT_25) == EventType.BOOK_SNAPSHOT
     assert event_type_for_data_type(TardisDataType.BOOK_SNAPSHOT_5) == EventType.BOOK_SNAPSHOT
@@ -126,19 +144,6 @@ def test_parquet_event_stream_input_validation(tmp_path: Path):
         ParquetEventStreamInput(TardisDataType.TRADES, path, 0, 123)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         parquet_event_stream_input(path, TardisDataType.QUOTES, 0)
-
-
-def test_merged_event_file_validation():
-    m = MergedEventFile(Path("a.parquet"), 1, (TardisDataType.TRADES,), None)
-    assert m.input_count == 1
-    with pytest.raises(ValueError):
-        MergedEventFile(Path("a.parquet"), 0, (TardisDataType.TRADES,), None)
-    with pytest.raises(ValueError):
-        MergedEventFile(Path("a.parquet"), 1, (TardisDataType.TRADES,), True)
-    with pytest.raises(ValueError):
-        MergedEventFile(Path("a.parquet"), 1, (), None)
-
-
 def test_validate_merge_input_schema_accepts_exact_schema(tmp_path: Path):
     inp = parquet_event_stream_input(_write_norm_parquet(tmp_path, "t.parquet", _trades_df([1])), TardisDataType.TRADES, 0)
     validate_merge_input_schema(inp)
@@ -255,11 +260,3 @@ def test_reference_equivalence_to_small_global_sort(tmp_path: Path):
         .select(list(expected_merged_columns([dt for dt, _, _ in frames])))
     )
     assert streaming.to_dicts() == reference.to_dicts()
-
-
-def test_write_merged_events_parquet_streaming_utility(tmp_path: Path):
-    inputs = [parquet_event_stream_input(_write_norm_parquet(tmp_path, "t.parquet", _trades_df([10, 20])), TardisDataType.TRADES, 0)]
-    out = tmp_path / "merged.parquet"
-    meta = write_merged_events_parquet(inputs, out, batch_size=1)
-    assert meta.row_count == 2
-    assert pl.read_parquet(out)[EVENT_SEQ].to_list() == [0, 1]
