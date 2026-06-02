@@ -1,16 +1,21 @@
-"""Canonical event-stream merging for normalized Tardis data.
+"""Canonical streaming event merge for normalized Tardis data.
 
-This module merges normalized LazyFrames/Parquet files produced by mmrt.data.tardis_csv
+This module merges sorted normalized Parquet files produced by mmrt.data.tardis_csv
 into a deterministic local_ts_us-ordered event stream. It does not parse raw CSV,
 repair data, reconstruct books, compute features, compute labels, or make trading
 decisions.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+import heapq
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Iterator, Sequence
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from mmrt.contracts import EventType, TardisDataType
 from mmrt.data.tardis_csv import (
@@ -55,12 +60,6 @@ def _coerce_data_type(data_type: TardisDataType | str) -> TardisDataType:
         except ValueError as exc:
             raise ValueError(f"invalid data_type: {data_type!r}") from exc
     raise ValueError("data_type must be TardisDataType or str")
-
-
-def _require_nonempty_str(value: str, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{name} must be a non-empty string")
-    return value
 
 
 def _require_nonnegative_int(value: int, name: str) -> int:
@@ -120,23 +119,26 @@ def event_type_code_for_data_type(data_type: TardisDataType | str) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class EventMergeInput:
+class ParquetEventStreamInput:
     data_type: TardisDataType
-    frame: pl.LazyFrame
+    path: Path
     input_rank: int
     source_name: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "data_type",
-            _require_supported_merge_data_type(_coerce_data_type(self.data_type)),
-        )
-        if not isinstance(self.frame, pl.LazyFrame):
-            raise ValueError("frame must be pl.LazyFrame")
+        object.__setattr__(self, "data_type", _require_supported_merge_data_type(_coerce_data_type(self.data_type)))
+        p = Path(self.path)
+        if not p.exists() or not p.is_file():
+            raise ValueError(f"path must exist and be a file: {p}")
+        object.__setattr__(self, "path", p)
         _require_nonnegative_int(self.input_rank, "input_rank")
         if not isinstance(self.source_name, str):
             raise ValueError("source_name must be str")
+
+
+def parquet_event_stream_input(path: str | Path, data_type: TardisDataType | str, input_rank: int) -> ParquetEventStreamInput:
+    p = Path(path)
+    return ParquetEventStreamInput(data_type=data_type, path=p, input_rank=input_rank, source_name=str(p))
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,40 +157,16 @@ class MergedEventFile:
             _require_nonnegative_int(self.row_count, "row_count")
 
 
-def parquet_merge_input(path: str | Path, data_type: TardisDataType | str, input_rank: int) -> EventMergeInput:
-    p = Path(path)
-    return EventMergeInput(
-        data_type=data_type,
-        frame=pl.scan_parquet(p),
-        input_rank=input_rank,
-        source_name=str(p),
-    )
-
-
-def validate_merge_input_schema(inp: EventMergeInput) -> None:
+def validate_merge_input_schema(inp: ParquetEventStreamInput) -> None:
     expected = expected_normalized_columns(inp.data_type)
-    actual = tuple(inp.frame.collect_schema().names())
+    actual = tuple(pq.ParquetFile(inp.path).schema_arrow.names)
     if actual != expected:
-        raise ValueError(
-            f"normalized input schema mismatch for {inp.data_type.value}: expected {expected}, got {actual}"
-        )
+        raise ValueError(f"normalized input schema mismatch for {inp.data_type.value}: expected {expected}, got {actual}")
 
 
 def expected_merged_columns(data_types: Sequence[TardisDataType | str]) -> tuple[str, ...]:
     dtypes = _tuple_of_data_types(data_types, "data_types")
-    base = [
-        EVENT_SEQ,
-        EVENT_TYPE_CODE,
-        EVENT_TYPE,
-        MERGE_INPUT_RANK,
-        RAW_SOURCE_ROW,
-        SOURCE_FILE,
-        SOURCE_DATA_TYPE,
-        "exchange",
-        "symbol",
-        TS_US,
-        LOCAL_TS_US,
-    ]
+    base = [EVENT_SEQ, EVENT_TYPE_CODE, EVENT_TYPE, MERGE_INPUT_RANK, RAW_SOURCE_ROW, SOURCE_FILE, SOURCE_DATA_TYPE, "exchange", "symbol", TS_US, LOCAL_TS_US]
     excluded = {RAW_SOURCE_ROW, SOURCE_FILE, SOURCE_DATA_TYPE, "exchange", "symbol", TS_US, LOCAL_TS_US}
     present = set(dtypes)
     payload: list[str] = []
@@ -204,52 +182,119 @@ def expected_merged_columns(data_types: Sequence[TardisDataType | str]) -> tuple
     return tuple(base + payload)
 
 
-def _prepare_input_for_merge(inp: EventMergeInput) -> pl.LazyFrame:
-    validate_merge_input_schema(inp)
-    event_type = event_type_for_data_type(inp.data_type)
-    code = event_type_code_for_event_type(event_type)
-    return inp.frame.with_columns(
-        [
-            pl.lit(inp.input_rank).cast(pl.Int64).alias(MERGE_INPUT_RANK),
-            pl.lit(event_type.value).cast(pl.Utf8).alias(EVENT_TYPE),
-            pl.lit(code).cast(pl.Int8).alias(EVENT_TYPE_CODE),
-        ]
-    ).select([EVENT_TYPE_CODE, EVENT_TYPE, MERGE_INPUT_RANK, *expected_normalized_columns(inp.data_type)])
+class _BatchRowReader:
+    def __init__(self, inp: ParquetEventStreamInput, input_index: int, batch_size: int):
+        self.inp = inp
+        self.input_index = input_index
+        self._batches = pq.ParquetFile(inp.path).iter_batches(batch_size=batch_size)
+        self._data: dict[str, list[Any]] = {}
+        self._batch_rows = 0
+        self._row_idx = 0
+        self._prev_key: tuple[int, int] | None = None
+
+    def next_row(self) -> dict[str, Any] | None:
+        while self._row_idx >= self._batch_rows:
+            try:
+                batch = next(self._batches)
+            except StopIteration:
+                return None
+            self._data = batch.to_pydict()
+            self._batch_rows = batch.num_rows
+            self._row_idx = 0
+            if self._batch_rows == 0:
+                continue
+        row = {k: self._data[k][self._row_idx] for k in self._data}
+        self._row_idx += 1
+        key = (int(row[LOCAL_TS_US]), int(row[RAW_SOURCE_ROW]))
+        if self._prev_key is not None and key < self._prev_key:
+            raise ValueError("streaming merge input is not sorted by local_ts_us, raw_source_row")
+        self._prev_key = key
+        return row
 
 
-def merge_normalized_events(inputs: Sequence[EventMergeInput]) -> pl.LazyFrame:
+def iter_merged_events_streaming(inputs: Sequence[ParquetEventStreamInput], *, batch_size: int = 65536) -> Iterator[dict[str, Any]]:
     inps = tuple(inputs)
     if not inps:
         raise ValueError("inputs must not be empty")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive int")
     for idx, inp in enumerate(inps):
-        if not isinstance(inp, EventMergeInput):
-            raise ValueError(f"inputs[{idx}] must be EventMergeInput")
+        if not isinstance(inp, ParquetEventStreamInput):
+            raise ValueError(f"inputs[{idx}] must be ParquetEventStreamInput")
     ranks = [inp.input_rank for inp in inps]
     if len(set(ranks)) != len(ranks):
         raise ValueError("input_rank values must be unique")
-    prepared = [_prepare_input_for_merge(inp) for inp in inps]
-    merged = pl.concat(prepared, how="diagonal_relaxed")
-    merged = merged.sort([LOCAL_TS_US, MERGE_INPUT_RANK, RAW_SOURCE_ROW], maintain_order=True)
-    merged = merged.with_row_index(EVENT_SEQ).with_columns(pl.col(EVENT_SEQ).cast(pl.Int64))
-    return merged.select(list(expected_merged_columns(tuple(inp.data_type for inp in inps))))
+    for inp in inps:
+        validate_merge_input_schema(inp)
+
+    out_cols = expected_merged_columns(tuple(inp.data_type for inp in inps))
+    readers = [_BatchRowReader(inp, idx, batch_size) for idx, inp in enumerate(inps)]
+    heap: list[tuple[tuple[int, int, int, int], int, dict[str, Any]]] = []
+
+    for reader in readers:
+        row = reader.next_row()
+        if row is None:
+            continue
+        inp = reader.inp
+        key = (int(row[LOCAL_TS_US]), int(inp.input_rank), int(row[RAW_SOURCE_ROW]), int(reader.input_index))
+        heapq.heappush(heap, (key, reader.input_index, row))
+
+    event_seq = 0
+    while heap:
+        _, input_index, row = heapq.heappop(heap)
+        reader = readers[input_index]
+        inp = reader.inp
+        event_type = event_type_for_data_type(inp.data_type)
+        out = {c: None for c in out_cols}
+        out.update(row)
+        out[EVENT_SEQ] = event_seq
+        out[EVENT_TYPE_CODE] = event_type_code_for_event_type(event_type)
+        out[EVENT_TYPE] = event_type.value
+        out[MERGE_INPUT_RANK] = inp.input_rank
+        yield out
+        event_seq += 1
+
+        next_row = reader.next_row()
+        if next_row is not None:
+            next_key = (int(next_row[LOCAL_TS_US]), int(inp.input_rank), int(next_row[RAW_SOURCE_ROW]), int(input_index))
+            heapq.heappush(heap, (next_key, input_index, next_row))
 
 
 def write_merged_events_parquet(
-    inputs: Sequence[EventMergeInput],
+    inputs: Sequence[ParquetEventStreamInput],
     output_path: str | Path,
     *,
     compression: str = DEFAULT_PARQUET_COMPRESSION,
+    batch_size: int = 65536,
 ) -> MergedEventFile:
+    """Small utility that writes the streaming merge without global concat/sort."""
+    inps = tuple(inputs)
     out = Path(output_path)
-    lf = merge_normalized_events(inputs)
     out.parent.mkdir(parents=True, exist_ok=True)
-    lf.sink_parquet(out, compression=compression)
-    return MergedEventFile(
-        output_path=out,
-        input_count=len(inputs),
-        data_types=tuple(inp.data_type for inp in inputs),
-        row_count=None,
-    )
+    cols = list(expected_merged_columns(tuple(inp.data_type for inp in inps)))
+    writer: pq.ParquetWriter | None = None
+    row_buf: list[dict[str, Any]] = []
+    row_count = 0
+    try:
+        for row in iter_merged_events_streaming(inps, batch_size=batch_size):
+            row_buf.append(row)
+            if len(row_buf) >= batch_size:
+                table = pa.Table.from_pydict({c: [row.get(c) for row in row_buf] for c in cols})
+                if writer is None:
+                    writer = pq.ParquetWriter(out, table.schema, compression=compression)
+                writer.write_table(table)
+                row_count += len(row_buf)
+                row_buf.clear()
+        if row_buf or writer is None:
+            table = pa.Table.from_pydict({c: [row.get(c) for row in row_buf] for c in cols})
+            if writer is None:
+                writer = pq.ParquetWriter(out, table.schema, compression=compression)
+            writer.write_table(table)
+            row_count += len(row_buf)
+    finally:
+        if writer is not None:
+            writer.close()
+    return MergedEventFile(output_path=out, input_count=len(inps), data_types=tuple(inp.data_type for inp in inps), row_count=row_count)
 
 
 def validate_merged_event_frame(df: pl.DataFrame, data_types: Sequence[TardisDataType | str]) -> None:
@@ -282,15 +327,15 @@ __all__ = [
     "EVENT_TYPE_CODE_DERIVATIVE_TICKER",
     "EVENT_TYPE_CODE_LIQUIDATION",
     "MERGED_PAYLOAD_TYPE_ORDER",
-    "EventMergeInput",
+    "ParquetEventStreamInput",
     "MergedEventFile",
     "event_type_for_data_type",
     "event_type_code_for_event_type",
     "event_type_code_for_data_type",
-    "parquet_merge_input",
+    "parquet_event_stream_input",
     "validate_merge_input_schema",
     "expected_merged_columns",
-    "merge_normalized_events",
+    "iter_merged_events_streaming",
     "write_merged_events_parquet",
     "validate_merged_event_frame",
 ]
