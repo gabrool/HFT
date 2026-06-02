@@ -237,6 +237,7 @@ def write_normalized_parquet(
         source_file=source_file,
         validate_header=validate_header,
     )
+    lf = lf.sort([LOCAL_TS_US, RAW_SOURCE_ROW], maintain_order=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lf.sink_parquet(out_path, compression=compression)
     schema = tardis_csv_schema(data_type)

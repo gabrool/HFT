@@ -229,6 +229,21 @@ def test_write_normalized_parquet(tmp_path):
     assert pl.read_parquet(dst).columns == list(expected_normalized_columns(TardisDataType.TRADES))
 
 
+def test_write_normalized_parquet_sorts_by_local_ts_then_raw_source_row(tmp_path):
+    src = tmp_path / "trades_unsorted.csv"
+    dst = tmp_path / "out" / "trades.parquet"
+    src.write_text(
+        "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n"
+        "binance-futures,BTCUSDT,30,30,t0,buy,100.0,0.5\n"
+        "binance-futures,BTCUSDT,10,10,t1,buy,101.0,0.5\n"
+        "binance-futures,BTCUSDT,20,10,t2,sell,102.0,0.5\n",
+        encoding="utf-8",
+    )
+    write_normalized_parquet(src, dst, TardisDataType.TRADES)
+    df = pl.read_parquet(dst)
+    assert df.select([LOCAL_TS_US, RAW_SOURCE_ROW]).rows() == [(10, 1), (10, 2), (30, 0)]
+
+
 def test_expected_normalized_columns():
     tcols = expected_normalized_columns(TardisDataType.TRADES)
     assert RAW_SOURCE_ROW in tcols

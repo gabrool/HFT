@@ -7,12 +7,10 @@ import json
 import math
 from pathlib import Path
 import shutil
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import polars as pl
-import pyarrow.parquet as pq
-
 from mmrt import config as cfg
 from mmrt.contracts import TardisDataType
 from mmrt.data import binance_futures_adapter as bfa
@@ -163,29 +161,13 @@ def _validate_normalized_market(normalized_file: tc.NormalizedTardisFile, *, exc
         )
 
 
-def _build_merge_inputs(normalized_files: Sequence[tc.NormalizedTardisFile]) -> tuple[em.EventMergeInput, ...]:
-    out: list[em.EventMergeInput] = []
+def _build_stream_merge_inputs(normalized_files: Sequence[tc.NormalizedTardisFile]) -> tuple[em.ParquetEventStreamInput, ...]:
+    out: list[em.ParquetEventStreamInput] = []
     for i, nf in enumerate(normalized_files):
         base = bfa.binance_futures_default_merge_rank(nf.data_type)
         rank = base * 1_000_000 + i
-        out.append(em.parquet_merge_input(nf.output_path, nf.data_type, rank))
+        out.append(em.parquet_event_stream_input(nf.output_path, nf.data_type, rank))
     return tuple(out)
-
-
-def _write_merged_events(normalized_files: Sequence[tc.NormalizedTardisFile], work_dir: Path) -> Path:
-    out_path = work_dir / "merged" / "events.parquet"
-    em.write_merged_events_parquet(_build_merge_inputs(normalized_files), out_path)
-    return out_path
-
-
-def _iter_record_batch_rows(parquet_path: Path, columns: Sequence[str], batch_size: int):
-    pf = pq.ParquetFile(parquet_path)
-    for batch in pf.iter_batches(columns=list(columns), batch_size=batch_size):
-        data = batch.to_pydict()
-        names = list(data.keys())
-        n = batch.num_rows
-        for i in range(n):
-            yield {k: data[k][i] for k in names}
 
 
 def _to_float_or_zero(v: Any) -> float:
@@ -259,16 +241,14 @@ def _write_matured_labels(label_results, pending_decisions: dict[int, PendingDec
         counters.rows_written += 1
 
 
-def _run_causal_ingest(merged_path: Path, writer: wr.DecisionRowWriter, pipeline_config: cfg.PipelineConfig, event_batch_size: int, max_events: int | None) -> tuple[IngestCounters, TransformConfig, TransformDiagnostics]:
+def _run_causal_ingest_rows(rows: Iterable[Mapping[str, Any]], writer: wr.DecisionRowWriter, pipeline_config: cfg.PipelineConfig, max_events: int | None) -> tuple[IngestCounters, TransformConfig, TransformDiagnostics]:
     counters = IngestCounters()
     engine = FeatureEngine(FeatureEngineConfig(decision_stride_us=pipeline_config.decision.stride_us))
     label_builder = LabelBuilder(pipeline_config.label_spec)
     tcfg = TransformConfig()
     transformer = CausalFeatureTransformer(tcfg)
     pending_decisions: dict[int, PendingDecision] = {}
-    cols = [em.EVENT_TYPE_CODE, em.EVENT_SEQ, tc.TS_US, tc.LOCAL_TS_US, "price", "amount", "side_code", *[f"bid_px_{i:02d}" for i in range(25)], *[f"bid_sz_{i:02d}" for i in range(25)], *[f"ask_px_{i:02d}" for i in range(25)], *[f"ask_sz_{i:02d}" for i in range(25)]]
-
-    for row in _iter_record_batch_rows(merged_path, cols, event_batch_size):
+    for row in rows:
         if max_events is not None and counters.merged_events_seen >= max_events:
             break
         counters.merged_events_seen += 1
@@ -440,12 +420,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     pipeline_config = _build_pipeline_config(args, exchange=exchange, symbol=symbol, label_horizons_us=label_horizons_us)
 
     normalized_files = _normalize_input_files(book_paths, trade_paths, work_dir, exchange, symbol)
-    merged_path = _write_merged_events(normalized_files, work_dir)
+    stream_inputs = _build_stream_merge_inputs(normalized_files)
+    event_rows = em.iter_merged_events_streaming(stream_inputs, batch_size=args.event_batch_size)
 
     writer_cfg = wr.WriterConfig(dataset_id=_require_nonempty_str(args.dataset_id, "dataset_id"), created_at_utc=args.created_at_utc or _utc_now_iso(), dataset_root=str(dataset_root), config=pipeline_config, chunk_rows=args.chunk_rows, row_group_rows=args.row_group_rows, transform_config=_transform_config_to_dict(TransformConfig()), transform_diagnostics={}, source_files=_safe_manifest_source_files(book_paths, trade_paths), notes={"cli": "mmrt.cli.ingest", "book_data_type": "book_snapshot_25", "trade_data_type": "trades"})
 
     with wr.DecisionRowWriter(writer_cfg) as writer:
-        counters, tcfg, tdiag = _run_causal_ingest(merged_path, writer, pipeline_config, args.event_batch_size, args.max_events)
+        counters, tcfg, tdiag = _run_causal_ingest_rows(event_rows, writer, pipeline_config, args.max_events)
         manifest = writer.finalize()
 
     counters.input_book_files = len(book_paths)
@@ -466,7 +447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "symbol": manifest.symbol, "book_data_type": "book_snapshot_25", "trade_data_type": "trades",
         "manifest_path": str(dataset_root / mf.DEFAULT_MANIFEST_FILENAME), "segments": len(manifest.segments), "rows": manifest.total_rows,
         "decisions_emitted": counters.decisions_emitted, "rows_written": counters.rows_written, "pending_decisions_at_eof": counters.pending_decisions_at_eof,
-        "splits_written": bool(manifest.splits), "split_roles": [s.role.value for s in manifest.splits], "work_dir": str(work_dir), "work_dir_removed": True,
+        "splits_written": bool(manifest.splits), "split_roles": [s.role.value for s in manifest.splits], "merge_mode": "streaming_external", "work_dir": str(work_dir), "work_dir_removed": True,
     }
     print(json.dumps(summary, sort_keys=True))
     return 0

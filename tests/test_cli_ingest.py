@@ -172,6 +172,20 @@ def test_no_stale_imports_source_residue():
         assert token not in src
 
 
+def test_ingest_uses_streaming_merge_only():
+    src = inspect.getsource(cli)
+    forbidden = [
+        "_write_merged_events",
+        "write_merged_events_parquet",
+        "merge_normalized_events(",
+        "merged/events.parquet",
+        "_iter_record_batch_rows",
+    ]
+    for token in forbidden:
+        assert token not in src
+    assert "iter_merged_events_streaming" in src
+
+
 def test_ingest_uses_canonical_market_symbol(tmp_path: Path, capsys):
     b, t = _book_trade_files(tmp_path)
     root = tmp_path / "ds"
@@ -236,6 +250,64 @@ def test_max_events_counts_only_processed_rows(tmp_path: Path, capsys):
         assert not src.startswith("/")
         assert "\\" not in src
         assert src.startswith("source/")
+
+
+def test_unsorted_raw_csv_ingest_succeeds_and_output_ordered(tmp_path: Path, capsys):
+    b_schema = tardis_csv_schema(TardisDataType.BOOK_SNAPSHOT_25)
+    t_schema = tardis_csv_schema(TardisDataType.TRADES)
+    bh = list(b_schema.column_names)
+    th = list(t_schema.column_names)
+    book = tmp_path / "book_unsorted.csv"
+    trade = tmp_path / "trades_unsorted.csv"
+
+    def book_row(i: int, local_ts: int):
+        row = []
+        for c in bh:
+            if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
+            elif c == "symbol": row.append(cfg.DEFAULT_SYMBOL)
+            elif c == "timestamp": row.append(local_ts)
+            elif c == "local_timestamp": row.append(local_ts)
+            elif c.startswith("asks[") and c.endswith("].price"):
+                lvl = int(c.split("[")[1].split("]")[0]); row.append(100.1 + lvl * 0.1 + i * 0.01)
+            elif c.startswith("asks[") and c.endswith("].amount"): row.append(1.0)
+            elif c.startswith("bids[") and c.endswith("].price"):
+                lvl = int(c.split("[")[1].split("]")[0]); row.append(99.9 - lvl * 0.1 + i * 0.01)
+            elif c.startswith("bids[") and c.endswith("].amount"): row.append(1.0)
+            else: row.append("")
+        return row
+
+    def trade_row(i: int, local_ts: int):
+        row = []
+        for c in th:
+            if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
+            elif c == "symbol": row.append(cfg.DEFAULT_SYMBOL)
+            elif c == "timestamp": row.append(local_ts)
+            elif c == "local_timestamp": row.append(local_ts)
+            elif c == "price": row.append(100.0 + i * 0.01)
+            elif c == "amount": row.append(0.5)
+            elif c == "side": row.append("buy" if i % 2 == 0 else "sell")
+            elif "id" in c: row.append(str(i + 1))
+            else: row.append("")
+        return row
+
+    times = [1_000_000 + i * cfg.DEFAULT_DECISION_STRIDE_US for i in range(12)]
+    _write_csv(book, bh, [book_row(i, t) for i, t in reversed(list(enumerate(times)))])
+    _write_csv(trade, th, [trade_row(i, t) for i, t in reversed(list(enumerate(times[:8])))])
+    root = tmp_path / "ds"
+    rc = cli.main([
+        "--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(book), "--trades-csv", str(trade),
+        "--label-horizons-us", "1000", "--label-entry-delay-us", "1", "--event-batch-size", "2",
+        "--chunk-rows", "2", "--row-group-rows", "2",
+    ])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out.strip())
+    assert out["rows_written"] > 0
+    r = rd.open_dataset(str(root), validate_on_open=True)
+    table = r.read_table(columns=(mf.LOCAL_TS_US_COLUMN, mf.EVENT_SEQ_COLUMN))
+    local = table[mf.LOCAL_TS_US_COLUMN].to_pylist()
+    seq = table[mf.EVENT_SEQ_COLUMN].to_pylist()
+    assert local == sorted(local)
+    assert seq == sorted(seq)
 
 
 def test_work_dir_removed_on_success(tmp_path: Path, capsys):
