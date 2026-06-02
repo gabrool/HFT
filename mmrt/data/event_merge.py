@@ -14,12 +14,10 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 import polars as pl
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from mmrt.contracts import EventType, TardisDataType
 from mmrt.data.tardis_csv import (
-    DEFAULT_PARQUET_COMPRESSION,
     LOCAL_TS_US,
     RAW_SOURCE_ROW,
     SOURCE_DATA_TYPE,
@@ -141,22 +139,6 @@ def parquet_event_stream_input(path: str | Path, data_type: TardisDataType | str
     return ParquetEventStreamInput(data_type=data_type, path=p, input_rank=input_rank, source_name=str(p))
 
 
-@dataclass(frozen=True, slots=True)
-class MergedEventFile:
-    output_path: Path
-    input_count: int
-    data_types: tuple[TardisDataType, ...]
-    row_count: int | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "output_path", Path(self.output_path))
-        if isinstance(self.input_count, bool) or not isinstance(self.input_count, int) or self.input_count <= 0:
-            raise ValueError("input_count must be a positive int")
-        object.__setattr__(self, "data_types", _tuple_of_data_types(self.data_types, "data_types"))
-        if self.row_count is not None:
-            _require_nonnegative_int(self.row_count, "row_count")
-
-
 def validate_merge_input_schema(inp: ParquetEventStreamInput) -> None:
     expected = expected_normalized_columns(inp.data_type)
     actual = tuple(pq.ParquetFile(inp.path).schema_arrow.names)
@@ -260,43 +242,6 @@ def iter_merged_events_streaming(inputs: Sequence[ParquetEventStreamInput], *, b
             heapq.heappush(heap, (next_key, input_index, next_row))
 
 
-def write_merged_events_parquet(
-    inputs: Sequence[ParquetEventStreamInput],
-    output_path: str | Path,
-    *,
-    compression: str = DEFAULT_PARQUET_COMPRESSION,
-    batch_size: int = 65536,
-) -> MergedEventFile:
-    """Small utility that writes the streaming merge without global concat/sort."""
-    inps = tuple(inputs)
-    out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    cols = list(expected_merged_columns(tuple(inp.data_type for inp in inps)))
-    writer: pq.ParquetWriter | None = None
-    row_buf: list[dict[str, Any]] = []
-    row_count = 0
-    try:
-        for row in iter_merged_events_streaming(inps, batch_size=batch_size):
-            row_buf.append(row)
-            if len(row_buf) >= batch_size:
-                table = pa.Table.from_pydict({c: [row.get(c) for row in row_buf] for c in cols})
-                if writer is None:
-                    writer = pq.ParquetWriter(out, table.schema, compression=compression)
-                writer.write_table(table)
-                row_count += len(row_buf)
-                row_buf.clear()
-        if row_buf or writer is None:
-            table = pa.Table.from_pydict({c: [row.get(c) for row in row_buf] for c in cols})
-            if writer is None:
-                writer = pq.ParquetWriter(out, table.schema, compression=compression)
-            writer.write_table(table)
-            row_count += len(row_buf)
-    finally:
-        if writer is not None:
-            writer.close()
-    return MergedEventFile(output_path=out, input_count=len(inps), data_types=tuple(inp.data_type for inp in inps), row_count=row_count)
-
-
 def validate_merged_event_frame(df: pl.DataFrame, data_types: Sequence[TardisDataType | str]) -> None:
     expected_cols = list(expected_merged_columns(data_types))
     if df.columns != expected_cols:
@@ -328,7 +273,6 @@ __all__ = [
     "EVENT_TYPE_CODE_LIQUIDATION",
     "MERGED_PAYLOAD_TYPE_ORDER",
     "ParquetEventStreamInput",
-    "MergedEventFile",
     "event_type_for_data_type",
     "event_type_code_for_event_type",
     "event_type_code_for_data_type",
@@ -336,6 +280,5 @@ __all__ = [
     "validate_merge_input_schema",
     "expected_merged_columns",
     "iter_merged_events_streaming",
-    "write_merged_events_parquet",
     "validate_merged_event_frame",
 ]
