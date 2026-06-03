@@ -197,7 +197,6 @@ def test_all_trade_features_assigned_and_dynamic_nonzero():
     assert fv_value(v, "trade_count_per_second_500000us") > 0
     assert fv_value(v, "signed_trade_premium_bps_volume_weighted_500000us") != 0
     assert fv_value(v, "cvd_change_usd_500000us") != 0
-    assert fv_value(v, "cvd_slope_usd_per_sec_500000us") != 0
     assert fv_value(v, "max_signed_trade_notional_usd_500000us") != 0
     assert fv_value(v, "top5_trade_notional_sum_usd_1000000us") > 0
     assert fv_value(v, "regime_volume_ewma_3000000us") > 0
@@ -233,7 +232,6 @@ def test_cvd_features_manual():
     st.apply_trade(make_trade(1_600_000, 100, 3, +1))
     v = st.trade_feature_vector()
     assert fv_value(v, "cvd_change_usd_500000us") == pytest.approx(100.0)
-    assert fv_value(v, "cvd_slope_usd_per_sec_500000us") == pytest.approx(200.0)
     assert np.isfinite(fv_value(v, "cvd_minus_ema_usd_500000us"))
 
 
@@ -403,7 +401,6 @@ def test_no_invalid_placeholders():
     assert fv_value(v, "trade_count_per_second_500000us") > 0
     assert fv_value(v, "signed_trade_premium_bps_volume_weighted_500000us") != 0
     assert fv_value(v, "cvd_change_usd_500000us") != 0
-    assert fv_value(v, "cvd_slope_usd_per_sec_500000us") != 0
     assert fv_value(v, "max_signed_trade_notional_usd_500000us") != 0
     assert fv_value(v, "top5_trade_notional_sum_usd_1000000us") > 0
     assert fv_value(v, "regime_volume_ewma_3000000us") > 0

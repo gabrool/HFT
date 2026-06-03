@@ -130,7 +130,7 @@ class BookSummary:
     bid_depth_5bps_size:float; ask_depth_5bps_size:float; bid_depth_5bps_notional:float; ask_depth_5bps_notional:float; total_depth_5bps_size:float; total_depth_5bps_notional:float; depth_imbalance_5bps:float; is_crossed:bool; update_count:int
 
 class BookHistory:
-    FIELDS=("ts_us","mid","spread_bps","microprice","micro_minus_mid_bps","mid_return_bps","bid_sz1","ask_sz1","bid_px1","ask_px1","obi_l1","obi_l3","obi_l10","depth_imbalance_1bps","depth_imbalance_5bps","total_depth_1bps_size","bid_depth_1bps_size","ask_depth_1bps_size","total_depth_5bps_size","bid_depth_5bps_size","ask_depth_5bps_size","total_depth_5bps_notional","bid_depth_5bps_notional","ask_depth_5bps_notional","ofi_l1","ofi_l3","ofi_l5","ofi_l10","bid_l1_add","bid_l1_rem","ask_l1_add","ask_l1_rem","bid_price_changed","ask_price_changed","spread_changed","mid_changed","micro_l5_minus_mid_bps","micro_l10_minus_mid_bps","vamp_l5_minus_mid_bps","vamp_l10_minus_mid_bps")
+    FIELDS=("ts_us","mid","spread_bps","microprice","micro_minus_mid_bps","mid_return_bps","bid_sz1","ask_sz1","bid_px1","ask_px1","obi_l1","obi_l3","depth_imbalance_1bps","depth_imbalance_5bps","total_depth_1bps_size","bid_depth_1bps_size","ask_depth_1bps_size","total_depth_5bps_size","bid_depth_5bps_size","ask_depth_5bps_size","total_depth_5bps_notional","bid_depth_5bps_notional","ask_depth_5bps_notional","ofi_l1","ofi_l3","ofi_l5","ofi_l10","bid_l1_add","bid_l1_rem","ask_l1_add","ask_l1_rem","bid_price_changed","ask_price_changed","spread_changed","mid_changed","micro_l5_minus_mid_bps","micro_l10_minus_mid_bps","vamp_l5_minus_mid_bps","vamp_l10_minus_mid_bps")
     def __init__(self, capacity: int = DEFAULT_HISTORY_CAPACITY):
         self.capacity = _require_positive_capacity(capacity); self.size = 0; self.write_pos = 0
         self._arrays = {f: np.zeros(self.capacity, dtype=np.int64 if f=="ts_us" else np.float64) for f in self.FIELDS}
@@ -240,7 +240,7 @@ class BookState:
         b5s=self._depth_size_within_bps("bid",5.0); a5s=self._depth_size_within_bps("ask",5.0); t5s=b5s+a5s
         b5n=self._depth_notional_within_bps("bid",5.0); a5n=self._depth_notional_within_bps("ask",5.0); t5n=b5n+a5n
         di1=0.0 if t1<=FLOAT_EPS else (b1-a1)/t1; di5=0.0 if t5n<=FLOAT_EPS else (b5n-a5n)/t5n
-        self.history.append(ts_us=now,mid=mid,spread_bps=spread,microprice=micro,micro_minus_mid_bps=mmm,mid_return_bps=mid_ret,bid_sz1=self.current_bid_sz[0],ask_sz1=self.current_ask_sz[0],bid_px1=self.current_bid_px[0],ask_px1=self.current_ask_px[0],obi_l1=self._obi(1),obi_l3=self._obi(3),obi_l10=self._obi(10),depth_imbalance_1bps=di1,depth_imbalance_5bps=di5,total_depth_1bps_size=t1,bid_depth_1bps_size=b1,ask_depth_1bps_size=a1,total_depth_5bps_size=t5s,bid_depth_5bps_size=b5s,ask_depth_5bps_size=a5s,total_depth_5bps_notional=t5n,bid_depth_5bps_notional=b5n,ask_depth_5bps_notional=a5n,ofi_l1=ofi1,ofi_l3=ofi3,ofi_l5=ofi5,ofi_l10=ofi10,bid_l1_add=bid_add,bid_l1_rem=bid_rem,ask_l1_add=ask_add,ask_l1_rem=ask_rem,bid_price_changed=bid_price_changed,ask_price_changed=ask_price_changed,spread_changed=spread_changed,mid_changed=mid_changed,micro_l5_minus_mid_bps=m5,micro_l10_minus_mid_bps=m10,vamp_l5_minus_mid_bps=v5,vamp_l10_minus_mid_bps=v10)
+        self.history.append(ts_us=now,mid=mid,spread_bps=spread,microprice=micro,micro_minus_mid_bps=mmm,mid_return_bps=mid_ret,bid_sz1=self.current_bid_sz[0],ask_sz1=self.current_ask_sz[0],bid_px1=self.current_bid_px[0],ask_px1=self.current_ask_px[0],obi_l1=self._obi(1),obi_l3=self._obi(3),depth_imbalance_1bps=di1,depth_imbalance_5bps=di5,total_depth_1bps_size=t1,bid_depth_1bps_size=b1,ask_depth_1bps_size=a1,total_depth_5bps_size=t5s,bid_depth_5bps_size=b5s,ask_depth_5bps_size=a5s,total_depth_5bps_notional=t5n,bid_depth_5bps_notional=b5n,ask_depth_5bps_notional=a5n,ofi_l1=ofi1,ofi_l3=ofi3,ofi_l5=ofi5,ofi_l10=ofi10,bid_l1_add=bid_add,bid_l1_rem=bid_rem,ask_l1_add=ask_add,ask_l1_rem=ask_rem,bid_price_changed=bid_price_changed,ask_price_changed=ask_price_changed,spread_changed=spread_changed,mid_changed=mid_changed,micro_l5_minus_mid_bps=m5,micro_l10_minus_mid_bps=m10,vamp_l5_minus_mid_bps=v5,vamp_l10_minus_mid_bps=v10)
         return self.current_summary()
     def current_summary(self)->BookSummary:
         if not self.has_book(): raise ValueError("no book")
@@ -324,41 +324,130 @@ class BookState:
         depth = max(s.total_depth_5bps_size, FLOAT_EPS)
         bid_depth_1bps = max(self._depth_size_within_bps("bid", 1.0), FLOAT_EPS)
         ask_depth_1bps = max(self._depth_size_within_bps("ask", 1.0), FLOAT_EPS)
-        def setf(name,v):
+
+        def setf(name, v):
             if name not in BOOK_FEATURE_NAME_SET:
                 raise KeyError(name)
             arr[feature_spec_by_name(name).index] = _finite(v)
             assigned.add(name)
+
         setf("spread_bps", s.spread_bps)
         setf("gap_b_bps", self._gap_b_bps())
         setf("bsz1", self.current_bid_sz[0])
         setf("asz1", self.current_ask_sz[0])
         setf("micro_minus_mid_bps", s.micro_minus_mid_bps)
         setf("time_since_mid_change_us", now - self.last_mid_change_ts_us)
-        setf("micro_ret_bps_200000us",self._ret_bps_asof("microprice",WINDOW_200MS_US)); setf("micro_ret_bps_500000us",self._ret_bps_asof("microprice",WINDOW_500MS_US)); setf("micro_ret_bps_1000000us",self._ret_bps_asof("microprice",WINDOW_1000MS_US))
-        setf("mid_slope_bps_per_sec_500000us",self._rolling_mid_slope_bps_per_sec(WINDOW_500MS_US)); setf("mid_slope_bps_per_sec_1000000us",self._rolling_mid_slope_bps_per_sec(WINDOW_1000MS_US)); setf("mid_range_bps_500000us",self._rolling_range_bps('mid',WINDOW_500MS_US)); setf("mid_range_bps_1000000us",self._rolling_range_bps('mid',WINDOW_1000MS_US))
-        setf("bid_l1_notional_usd",self.current_bid_px[0]*self.current_bid_sz[0]); setf("ask_l1_notional_usd",self.current_ask_px[0]*self.current_ask_sz[0]); setf("bid_depth_notional_5bps",s.bid_depth_5bps_notional); setf("ask_depth_notional_5bps",s.ask_depth_5bps_notional); setf("total_depth_notional_5bps",s.total_depth_5bps_notional)
-        setf("obi_l1",self._obi(1)); setf("obi_l10",self._obi(10)); setf("ofi_l1",self._window_values('ofi_l1',1)[-1]); setf("ofi_l3",self._window_values('ofi_l3',1)[-1]); setf("ofi_l5",self._window_values('ofi_l5',1)[-1])
-        for n in ["ofi_l1","ofi_l3","ofi_l5","ofi_l10"]: setf(f"{n}_over_depth_5bps",self._window_values(n,1)[-1]/depth)
-        for n,w in [("ofi_l1",WINDOW_200MS_US),("ofi_l1",WINDOW_500MS_US),("ofi_l5",WINDOW_200MS_US),("ofi_l5",WINDOW_500MS_US),("ofi_l5",WINDOW_1000MS_US),("ofi_l10",WINDOW_200MS_US),("ofi_l10",WINDOW_500MS_US),("ofi_l10",WINDOW_1000MS_US)]: setf(f"{n}_sum_over_depth_{w}us",self._rolling_sum(n,w)/depth)
-        def norm(n,w): return self._rolling_sum(n,w)/depth
-        setf("ofi_l1_accel_200000us_minus_500000us",norm('ofi_l1',WINDOW_200MS_US)-norm('ofi_l1',WINDOW_500MS_US)); setf("ofi_l1_accel_500000us_minus_1000000us",norm('ofi_l1',WINDOW_500MS_US)-norm('ofi_l1',WINDOW_1000MS_US)); setf("ofi_l3_accel_200000us_minus_500000us",norm('ofi_l3',WINDOW_200MS_US)-norm('ofi_l3',WINDOW_500MS_US)); setf("ofi_l3_accel_500000us_minus_1000000us",norm('ofi_l3',WINDOW_500MS_US)-norm('ofi_l3',WINDOW_1000MS_US)); setf("ofi_l5_accel_200000us_minus_500000us",norm('ofi_l5',WINDOW_200MS_US)-norm('ofi_l5',WINDOW_500MS_US)); setf("ofi_l5_accel_500000us_minus_1000000us",norm('ofi_l5',WINDOW_500MS_US)-norm('ofi_l5',WINDOW_1000MS_US)); setf("ofi_l10_accel_200000us_minus_500000us",norm('ofi_l10',WINDOW_200MS_US)-norm('ofi_l10',WINDOW_500MS_US)); setf("ofi_l10_accel_500000us_minus_1000000us",norm('ofi_l10',WINDOW_500MS_US)-norm('ofi_l10',WINDOW_1000MS_US))
-        setf("obi_l3_mean_500000us",self._rolling_mean('obi_l3',WINDOW_500MS_US)); setf("obi_l3_mean_1000000us",self._rolling_mean('obi_l3',WINDOW_1000MS_US)); setf("micro_l5_minus_mid_bps",self._minus_mid_bps(self._micro_depth(5))); setf("vamp_l5_minus_mid_bps",self._minus_mid_bps(self._vamp_depth(5))); setf("micro_l10_minus_mid_bps",self._minus_mid_bps(self._micro_depth(10))); setf("vamp_l10_minus_mid_bps",self._minus_mid_bps(self._vamp_depth(10))); setf("micro_l5_slope_200000us",self._rolling_slope_per_sec('micro_l5_minus_mid_bps',WINDOW_200MS_US)); setf("micro_l5_slope_1000000us",self._rolling_slope_per_sec('micro_l5_minus_mid_bps',WINDOW_1000MS_US))
+
+        setf("micro_ret_bps_200000us", self._ret_bps_asof("microprice", WINDOW_200MS_US))
+        setf("mid_slope_bps_per_sec_500000us", self._rolling_mid_slope_bps_per_sec(WINDOW_500MS_US))
+        setf("mid_slope_bps_per_sec_1000000us", self._rolling_mid_slope_bps_per_sec(WINDOW_1000MS_US))
+        setf("mid_range_bps_500000us", self._rolling_range_bps("mid", WINDOW_500MS_US))
+        setf("mid_range_bps_1000000us", self._rolling_range_bps("mid", WINDOW_1000MS_US))
+
+        setf("bid_l1_notional_usd", self.current_bid_px[0] * self.current_bid_sz[0])
+        setf("ask_l1_notional_usd", self.current_ask_px[0] * self.current_ask_sz[0])
+        setf("bid_depth_notional_5bps", s.bid_depth_5bps_notional)
+        setf("ask_depth_notional_5bps", s.ask_depth_5bps_notional)
+        setf("total_depth_notional_5bps", s.total_depth_5bps_notional)
+        setf("obi_l1", self._obi(1))
+
+        ofi3 = self._window_values("ofi_l3", 1)[-1]
+        setf("ofi_l3", ofi3)
+        setf("ofi_l3_over_depth_5bps", ofi3 / depth)
+        for name, field, window in (
+            ("ofi_l5_sum_over_depth_200000us", "ofi_l5", WINDOW_200MS_US),
+            ("ofi_l5_sum_over_depth_500000us", "ofi_l5", WINDOW_500MS_US),
+            ("ofi_l10_sum_over_depth_1000000us", "ofi_l10", WINDOW_1000MS_US),
+        ):
+            setf(name, self._rolling_sum(field, window) / depth)
+
+        def norm(n, w):
+            return self._rolling_sum(n, w) / depth
+
+        setf("ofi_l3_accel_200000us_minus_500000us", norm("ofi_l3", WINDOW_200MS_US) - norm("ofi_l3", WINDOW_500MS_US))
+        setf("ofi_l3_accel_500000us_minus_1000000us", norm("ofi_l3", WINDOW_500MS_US) - norm("ofi_l3", WINDOW_1000MS_US))
+        setf("obi_l3_mean_500000us", self._rolling_mean("obi_l3", WINDOW_500MS_US))
+        setf("obi_l3_mean_1000000us", self._rolling_mean("obi_l3", WINDOW_1000MS_US))
+
+        setf("micro_l5_minus_mid_bps", self._minus_mid_bps(self._micro_depth(5)))
+        setf("vamp_l5_minus_mid_bps", self._minus_mid_bps(self._vamp_depth(5)))
+        setf("micro_l10_minus_mid_bps", self._minus_mid_bps(self._micro_depth(10)))
+        setf("vamp_l10_minus_mid_bps", self._minus_mid_bps(self._vamp_depth(10)))
+        setf("micro_l5_slope_200000us", self._rolling_slope_per_sec("micro_l5_minus_mid_bps", WINDOW_200MS_US))
+        setf("micro_l5_slope_1000000us", self._rolling_slope_per_sec("micro_l5_minus_mid_bps", WINDOW_1000MS_US))
+
         setf("bid_depth_within_1bps", bid_depth_1bps)
         setf("ask_depth_within_1bps", ask_depth_1bps)
         setf("depth_imbalance_within_1bps", self._depth_imbalance_within_bps(1.0))
-        for w,sn in [(WINDOW_200MS_US,'200000us'),(WINDOW_500MS_US,'500000us'),(WINDOW_1000MS_US,'1000000us')]:
-            setf(f"bid_price_change_rate_{sn}",self._rolling_sum('bid_price_changed',w)/(w/1e6)); setf(f"bid_l1_depletion_{sn}",self._rolling_sum('bid_l1_rem',w)); setf(f"ask_l1_depletion_{sn}",self._rolling_sum('ask_l1_rem',w));
-        setf("ask_l1_depletion_over_depth_200000us",self._rolling_sum('ask_l1_rem',WINDOW_200MS_US)/ask_depth_1bps); setf("bid_l1_depletion_over_depth_500000us",self._rolling_sum('bid_l1_rem',WINDOW_500MS_US)/bid_depth_1bps); setf("ask_l1_depletion_over_depth_500000us",self._rolling_sum('ask_l1_rem',WINDOW_500MS_US)/ask_depth_1bps); setf("bid_l1_depletion_over_depth_1000000us",self._rolling_sum('bid_l1_rem',WINDOW_1000MS_US)/bid_depth_1bps); setf("ask_l1_depletion_over_depth_1000000us",self._rolling_sum('ask_l1_rem',WINDOW_1000MS_US)/ask_depth_1bps)
-        setf("spread_change_count_500000us",self._rolling_sum('spread_changed',WINDOW_500MS_US)); setf("ob_update_rate_200000us",self._rolling_update_rate(WINDOW_200MS_US)); setf("ob_update_rate_500000us",self._rolling_update_rate(WINDOW_500MS_US))
-        setf("bid_l1_add_rate_over_depth_200000us",self._rolling_sum('bid_l1_add',WINDOW_200MS_US)/(0.2*bid_depth_1bps)); setf("bid_l1_rem_rate_over_depth_200000us",self._rolling_sum('bid_l1_rem',WINDOW_200MS_US)/(0.2*bid_depth_1bps)); setf("ask_l1_add_rate_over_depth_200000us",self._rolling_sum('ask_l1_add',WINDOW_200MS_US)/(0.2*ask_depth_1bps)); setf("bid_l1_add_rate_over_depth_500000us",self._rolling_sum('bid_l1_add',WINDOW_500MS_US)/(0.5*bid_depth_1bps)); setf("ask_l1_add_rate_over_depth_500000us",self._rolling_sum('ask_l1_add',WINDOW_500MS_US)/(0.5*ask_depth_1bps)); setf("bid_l1_add_rate_over_depth_1000000us",self._rolling_sum('bid_l1_add',WINDOW_1000MS_US)/bid_depth_1bps); setf("ask_l1_add_rate_over_depth_1000000us",self._rolling_sum('ask_l1_add',WINDOW_1000MS_US)/ask_depth_1bps)
-        setf("return_std_bps_200000us",self._return_std_bps(WINDOW_200MS_US)); setf("down_up_vol_imbalance_500000us",self._down_up_vol_imbalance(WINDOW_500MS_US)); setf("max_abs_return_bps_500000us",self._max_abs_mid_return_bps(WINDOW_500MS_US)); setf("down_up_vol_imbalance_1000000us",self._down_up_vol_imbalance(WINDOW_1000MS_US)); setf("down_up_vol_imbalance_3000000us",self._down_up_vol_imbalance(WINDOW_3000MS_US))
-        for w,sn in [(WINDOW_500MS_US,'500000us'),(WINDOW_1000MS_US,'1000000us'),(WINDOW_3000MS_US,'3000000us')]:
-            m=self._rolling_mean('spread_bps',w); sd=self._rolling_std('spread_bps',w); setf(f"spread_z_{sn}",_safe_z(s.spread_bps,m,sd))
-        setf("spread_widening_slope_bps_per_sec_500000us",self._rolling_slope_per_sec('spread_bps',WINDOW_500MS_US)); setf("depth_5bps_z_500000us",_safe_z(s.total_depth_5bps_notional,self._rolling_mean('total_depth_5bps_notional',WINDOW_500MS_US),self._rolling_std('total_depth_5bps_notional',WINDOW_500MS_US))); setf("depth_imbalance_5bps_mean_500000us",self._rolling_mean('depth_imbalance_5bps',WINDOW_500MS_US)); setf("depth_imbalance_5bps_slope_500000us",self._rolling_slope_per_sec('depth_imbalance_5bps',WINDOW_500MS_US)); setf("spread_widening_slope_bps_per_sec_1000000us",self._rolling_slope_per_sec('spread_bps',WINDOW_1000MS_US)); setf("depth_imbalance_5bps_mean_1000000us",self._rolling_mean('depth_imbalance_5bps',WINDOW_1000MS_US)); setf("depth_imbalance_5bps_slope_1000000us",self._rolling_slope_per_sec('depth_imbalance_5bps',WINDOW_1000MS_US)); setf("depth_5bps_z_3000000us",_safe_z(s.total_depth_5bps_notional,self._rolling_mean('total_depth_5bps_notional',WINDOW_3000MS_US),self._rolling_std('total_depth_5bps_notional',WINDOW_3000MS_US))); setf("depth_imbalance_5bps_slope_3000000us",self._rolling_slope_per_sec('depth_imbalance_5bps',WINDOW_3000MS_US)); setf("depth_imbalance_realized_vol_1000000us",self._rolling_diff_std('depth_imbalance_5bps',WINDOW_1000MS_US)); setf("microprice_zero_cross_rate_1000000us",self._zero_cross_rate(WINDOW_1000MS_US)); setf("l1_churn_over_depth_1000000us",(self._rolling_sum('bid_l1_add',WINDOW_1000MS_US)+self._rolling_sum('bid_l1_rem',WINDOW_1000MS_US)+self._rolling_sum('ask_l1_add',WINDOW_1000MS_US)+self._rolling_sum('ask_l1_rem',WINDOW_1000MS_US))/max(self._rolling_mean('total_depth_1bps_size',WINDOW_1000MS_US),FLOAT_EPS)); setf("ofi_pressure_x_churn_500000us",norm('ofi_l1',WINDOW_500MS_US)*(self._rolling_sum('bid_l1_add',WINDOW_500MS_US)+self._rolling_sum('bid_l1_rem',WINDOW_500MS_US)+self._rolling_sum('ask_l1_add',WINDOW_500MS_US)+self._rolling_sum('ask_l1_rem',WINDOW_500MS_US))/max(self._rolling_mean('total_depth_1bps_size',WINDOW_500MS_US),FLOAT_EPS)); setf("bid_liquidity_void_bps",self._liquidity_void('bid')); setf("ask_liquidity_void_bps",self._liquidity_void('ask')); setf("touch_flicker_score_3000000us",(self._rolling_sum('bid_price_changed',WINDOW_3000MS_US)+self._rolling_sum('ask_price_changed',WINDOW_3000MS_US))/max(self._rolling_count('mid',WINDOW_3000MS_US),1.0)); setf("spread_state_transition_rate_3000000us",self._rolling_sum('spread_changed',WINDOW_3000MS_US)/3.0); setf("ask_depth_centroid_bps_25bps",self._depth_centroid('ask',25.0)); setf("bid_depth_centroid_bps_25bps",self._depth_centroid('bid',25.0)); setf("microprice_realized_vol_1000000us",self._rolling_realized_vol_bps('microprice',WINDOW_1000MS_US)); setf("ob_arrival_clumpiness_3000000us",self._arrival_clumpiness(WINDOW_3000MS_US)); setf("mid_price_run_length_max_3000000us",self._mid_run_length_max(WINDOW_3000MS_US)); setf("mid_unchanged_and_depth_stable_us",now-self.depth_stable_start_ts_us); setf("best_bid_size_age_us",now-self.bid_size_age_start_ts_us); setf("best_ask_size_age_us",now-self.ask_size_age_start_ts_us)
-        bd=self._rolling_sum('bid_l1_rem',WINDOW_200MS_US); ad=self._rolling_sum('ask_l1_rem',WINDOW_200MS_US); d=bd+ad; setf("near_touch_depth_drop_asymmetry",0.0 if d<=FLOAT_EPS else (ad-bd)/d)
-        missing=BOOK_FEATURE_NAME_SET-assigned; extra=assigned-BOOK_FEATURE_NAME_SET
-        if missing or extra: raise RuntimeError(f"incomplete book feature assignment missing={sorted(missing)} extra={sorted(extra)}")
+        for w, sn in (
+            (WINDOW_200MS_US, "200000us"),
+            (WINDOW_500MS_US, "500000us"),
+            (WINDOW_1000MS_US, "1000000us"),
+        ):
+            setf(f"bid_price_change_rate_{sn}", self._rolling_sum("bid_price_changed", w) / (w / 1e6))
+            setf(f"bid_l1_depletion_{sn}", self._rolling_sum("bid_l1_rem", w))
+            setf(f"ask_l1_depletion_{sn}", self._rolling_sum("ask_l1_rem", w))
+        setf("ask_l1_depletion_over_depth_200000us", self._rolling_sum("ask_l1_rem", WINDOW_200MS_US) / ask_depth_1bps)
+        setf("bid_l1_depletion_over_depth_500000us", self._rolling_sum("bid_l1_rem", WINDOW_500MS_US) / bid_depth_1bps)
+        setf("ask_l1_depletion_over_depth_500000us", self._rolling_sum("ask_l1_rem", WINDOW_500MS_US) / ask_depth_1bps)
+        setf("bid_l1_depletion_over_depth_1000000us", self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US) / bid_depth_1bps)
+        setf("ask_l1_depletion_over_depth_1000000us", self._rolling_sum("ask_l1_rem", WINDOW_1000MS_US) / ask_depth_1bps)
+
+        setf("ob_update_rate_200000us", self._rolling_update_rate(WINDOW_200MS_US))
+        setf("ob_update_rate_500000us", self._rolling_update_rate(WINDOW_500MS_US))
+        setf("bid_l1_add_rate_over_depth_200000us", self._rolling_sum("bid_l1_add", WINDOW_200MS_US) / (0.2 * bid_depth_1bps))
+        setf("bid_l1_rem_rate_over_depth_200000us", self._rolling_sum("bid_l1_rem", WINDOW_200MS_US) / (0.2 * bid_depth_1bps))
+        setf("ask_l1_add_rate_over_depth_200000us", self._rolling_sum("ask_l1_add", WINDOW_200MS_US) / (0.2 * ask_depth_1bps))
+        setf("bid_l1_add_rate_over_depth_500000us", self._rolling_sum("bid_l1_add", WINDOW_500MS_US) / (0.5 * bid_depth_1bps))
+        setf("ask_l1_add_rate_over_depth_500000us", self._rolling_sum("ask_l1_add", WINDOW_500MS_US) / (0.5 * ask_depth_1bps))
+        setf("bid_l1_add_rate_over_depth_1000000us", self._rolling_sum("bid_l1_add", WINDOW_1000MS_US) / bid_depth_1bps)
+        setf("ask_l1_add_rate_over_depth_1000000us", self._rolling_sum("ask_l1_add", WINDOW_1000MS_US) / ask_depth_1bps)
+
+        setf("return_std_bps_200000us", self._return_std_bps(WINDOW_200MS_US))
+        setf("down_up_vol_imbalance_500000us", self._down_up_vol_imbalance(WINDOW_500MS_US))
+        setf("max_abs_return_bps_500000us", self._max_abs_mid_return_bps(WINDOW_500MS_US))
+        setf("down_up_vol_imbalance_1000000us", self._down_up_vol_imbalance(WINDOW_1000MS_US))
+        setf("down_up_vol_imbalance_3000000us", self._down_up_vol_imbalance(WINDOW_3000MS_US))
+        for w, sn in (
+            (WINDOW_500MS_US, "500000us"),
+            (WINDOW_1000MS_US, "1000000us"),
+            (WINDOW_3000MS_US, "3000000us"),
+        ):
+            m = self._rolling_mean("spread_bps", w)
+            sd = self._rolling_std("spread_bps", w)
+            setf(f"spread_z_{sn}", _safe_z(s.spread_bps, m, sd))
+        setf("spread_widening_slope_bps_per_sec_500000us", self._rolling_slope_per_sec("spread_bps", WINDOW_500MS_US))
+        setf("depth_5bps_z_500000us", _safe_z(s.total_depth_5bps_notional, self._rolling_mean("total_depth_5bps_notional", WINDOW_500MS_US), self._rolling_std("total_depth_5bps_notional", WINDOW_500MS_US)))
+        setf("depth_imbalance_5bps_slope_500000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_500MS_US))
+        setf("spread_widening_slope_bps_per_sec_1000000us", self._rolling_slope_per_sec("spread_bps", WINDOW_1000MS_US))
+        setf("depth_imbalance_5bps_mean_1000000us", self._rolling_mean("depth_imbalance_5bps", WINDOW_1000MS_US))
+        setf("depth_imbalance_5bps_slope_1000000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_1000MS_US))
+        setf("depth_5bps_z_3000000us", _safe_z(s.total_depth_5bps_notional, self._rolling_mean("total_depth_5bps_notional", WINDOW_3000MS_US), self._rolling_std("total_depth_5bps_notional", WINDOW_3000MS_US)))
+        setf("depth_imbalance_5bps_slope_3000000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_3000MS_US))
+        setf("depth_imbalance_realized_vol_1000000us", self._rolling_diff_std("depth_imbalance_5bps", WINDOW_1000MS_US))
+        setf("microprice_zero_cross_rate_1000000us", self._zero_cross_rate(WINDOW_1000MS_US))
+        setf("l1_churn_over_depth_1000000us", (self._rolling_sum("bid_l1_add", WINDOW_1000MS_US) + self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US) + self._rolling_sum("ask_l1_add", WINDOW_1000MS_US) + self._rolling_sum("ask_l1_rem", WINDOW_1000MS_US)) / max(self._rolling_mean("total_depth_1bps_size", WINDOW_1000MS_US), FLOAT_EPS))
+        setf("ofi_pressure_x_churn_500000us", norm("ofi_l1", WINDOW_500MS_US) * (self._rolling_sum("bid_l1_add", WINDOW_500MS_US) + self._rolling_sum("bid_l1_rem", WINDOW_500MS_US) + self._rolling_sum("ask_l1_add", WINDOW_500MS_US) + self._rolling_sum("ask_l1_rem", WINDOW_500MS_US)) / max(self._rolling_mean("total_depth_1bps_size", WINDOW_500MS_US), FLOAT_EPS))
+        setf("bid_liquidity_void_bps", self._liquidity_void("bid"))
+        setf("ask_liquidity_void_bps", self._liquidity_void("ask"))
+        setf("touch_flicker_score_3000000us", (self._rolling_sum("bid_price_changed", WINDOW_3000MS_US) + self._rolling_sum("ask_price_changed", WINDOW_3000MS_US)) / max(self._rolling_count("mid", WINDOW_3000MS_US), 1.0))
+        setf("spread_state_transition_rate_3000000us", self._rolling_sum("spread_changed", WINDOW_3000MS_US) / 3.0)
+        setf("ask_depth_centroid_bps_25bps", self._depth_centroid("ask", 25.0))
+        setf("bid_depth_centroid_bps_25bps", self._depth_centroid("bid", 25.0))
+        setf("microprice_realized_vol_1000000us", self._rolling_realized_vol_bps("microprice", WINDOW_1000MS_US))
+        setf("ob_arrival_clumpiness_3000000us", self._arrival_clumpiness(WINDOW_3000MS_US))
+        setf("mid_price_run_length_max_3000000us", self._mid_run_length_max(WINDOW_3000MS_US))
+        setf("mid_unchanged_and_depth_stable_us", now - self.depth_stable_start_ts_us)
+        setf("best_bid_size_age_us", now - self.bid_size_age_start_ts_us)
+        setf("best_ask_size_age_us", now - self.ask_size_age_start_ts_us)
+        bd = self._rolling_sum("bid_l1_rem", WINDOW_200MS_US)
+        ad = self._rolling_sum("ask_l1_rem", WINDOW_200MS_US)
+        d = bd + ad
+        setf("near_touch_depth_drop_asymmetry", 0.0 if d <= FLOAT_EPS else (ad - bd) / d)
+        missing = BOOK_FEATURE_NAME_SET - assigned
+        extra = assigned - BOOK_FEATURE_NAME_SET
+        if missing or extra:
+            raise RuntimeError(f"incomplete book feature assignment missing={sorted(missing)} extra={sorted(extra)}")
         return out
 
 def book_owned_feature_names() -> tuple[str, ...]: return BOOK_FEATURE_NAMES

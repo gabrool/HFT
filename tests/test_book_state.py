@@ -159,7 +159,7 @@ def test_all_book_features_assigned_and_dynamic_nonzero():
     assert fv_value(out, "micro_ret_bps_200000us") != 0
     assert fv_value(out, "mid_slope_bps_per_sec_500000us") != 0
     assert fv_value(out, "mid_range_bps_500000us") > 0
-    assert fv_value(out, "ofi_l1") != 0
+    assert fv_value(out, "ofi_l3") != 0
     assert fv_value(out, "ofi_l5_sum_over_depth_200000us") != 0
     assert fv_value(out, "ob_update_rate_500000us") > 0
     assert fv_value(out, "max_abs_return_bps_500000us") > 0
@@ -215,10 +215,9 @@ def test_liquidity_void_distance_from_mid():
 
 def test_ofi_first_snapshot_zero():
     st = bs.BookState(); st.apply_snapshot(make_snapshot()); out = np.zeros(FEATURE_COUNT); st.fill_book_features(out)
-    assert fv_value(out, "ofi_l1") == 0
     assert fv_value(out, "ofi_l3") == 0
-    assert fv_value(out, "ofi_l5") == 0
-    assert fv_value(out, "ofi_l1_sum_over_depth_200000us") == 0
+    assert fv_value(out, "ofi_l3_over_depth_5bps") == 0
+    assert fv_value(out, "ofi_l5_sum_over_depth_200000us") == 0
     assert fv_value(out, "bid_l1_depletion_200000us") == 0
     assert fv_value(out, "ask_l1_depletion_200000us") == 0
 
@@ -226,9 +225,9 @@ def test_ofi_first_snapshot_zero():
 def test_ofi_second_snapshot_size_change():
     st = bs.BookState(); st.apply_snapshot(make_snapshot(bid_sz0=10, ask_sz0=12)); st.apply_snapshot(make_snapshot(local_ts_us=1_200_000, bid_sz0=15, ask_sz0=10))
     out = np.zeros(FEATURE_COUNT); st.fill_book_features(out)
-    assert fv_value(out, "ofi_l1") == pytest.approx(7)
-    assert fv_value(out, "ofi_l1_over_depth_5bps") > 0
-    assert fv_value(out, "ofi_l1_sum_over_depth_200000us") > 0
+    assert fv_value(out, "ofi_l3") > 0
+    assert fv_value(out, "ofi_l3_over_depth_5bps") > 0
+    assert fv_value(out, "ofi_l5_sum_over_depth_200000us") > 0
 
 
 def test_l1_add_rem_are_side_specific():

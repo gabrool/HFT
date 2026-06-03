@@ -1,5 +1,7 @@
+import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -8,11 +10,15 @@ from mmrt.features.specs import FeatureFamily, FeatureOwner, FeatureSource, Tran
 
 
 def test_feature_count_and_order():
-    assert specs.FEATURE_COUNT == 178
-    assert len(specs.FEATURE_NAMES) == 178
+    assert specs.CORE_FEATURE_COUNT == 146
+    assert specs.EVENT_CONTEXT_FEATURE_COUNT == 6
+    assert specs.FEATURE_COUNT == 152
+    assert len(specs.FEATURE_SPECS) == 152
+    assert len(specs.FEATURE_NAMES) == 152
+    assert len(set(specs.FEATURE_NAMES)) == 152
     assert specs.FEATURE_NAMES[0] == "micro_ret_bps_200000us"
-    assert specs.FEATURE_NAMES[171] == "trade_impact_half_life_proxy"
-    assert specs.FEATURE_NAMES[172:] == (
+    assert specs.FEATURE_NAMES[145] == "trade_impact_half_life_proxy"
+    assert specs.FEATURE_NAMES[146:] == (
         "log_dt_decision_us",
         "log_events_100000us",
         "log_events_200000us",
@@ -38,8 +44,113 @@ def test_legacy_to_canonical_roundtrip():
 
 
 def test_context_tail_after_core_features():
-    assert specs.CORE_FEATURE_COUNT == 172
-    assert specs.FEATURE_NAMES[:172] == tuple(specs.legacy_name_to_canonical_name(n) for n in specs.CORE_FEATURE_NAMES)
+    assert specs.CORE_FEATURE_COUNT == 146
+    assert specs.FEATURE_NAMES[:146] == tuple(specs.legacy_name_to_canonical_name(n) for n in specs.CORE_FEATURE_NAMES)
+
+
+
+
+def test_pruned_correlated_features_absent_from_feature_registry():
+    dropped = {
+        "micro_ret_bps_500000us",
+        "micro_ret_bps_1000000us",
+        "obi_l10",
+        "ofi_l1",
+        "ofi_l5",
+        "ofi_l1_over_depth_5bps",
+        "ofi_l5_over_depth_5bps",
+        "ofi_l10_over_depth_5bps",
+        "ofi_l1_sum_over_depth_200000us",
+        "ofi_l1_sum_over_depth_500000us",
+        "ofi_l10_sum_over_depth_200000us",
+        "ofi_l10_sum_over_depth_500000us",
+        "ofi_l5_sum_over_depth_1000000us",
+        "ofi_l1_pressure_over_depth_5bps_1000000us",
+        "ofi_l1_accel_200000us_minus_500000us",
+        "ofi_l5_accel_200000us_minus_500000us",
+        "ofi_l10_accel_200000us_minus_500000us",
+        "ofi_l1_accel_500000us_minus_1000000us",
+        "ofi_l5_accel_500000us_minus_1000000us",
+        "ofi_l10_accel_500000us_minus_1000000us",
+        "spread_change_count_500000us",
+        "cvd_slope_usd_per_sec_500000us",
+        "cvd_slope_usd_per_sec_1000000us",
+        "post_sell_trade_bid_replenishment_200000us",
+        "post_buy_trade_ask_replenishment_200000us",
+        "depth_imbalance_5bps_mean_500000us",
+    }
+    assert specs.CORE_FEATURE_COUNT == 146
+    assert specs.EVENT_CONTEXT_FEATURE_COUNT == 6
+    assert specs.FEATURE_COUNT == 152
+    assert len(specs.FEATURE_SPECS) == 152
+    assert len(specs.FEATURE_NAMES) == 152
+    assert len(set(specs.FEATURE_NAMES)) == 152
+    assert not dropped.intersection(set(specs.FEATURE_NAMES))
+    for name in dropped:
+        assert name not in specs.FEATURE_NAME_TO_INDEX
+
+
+def test_retained_correlated_cluster_representatives_still_exist():
+    retained = {
+        "mid_slope_bps_per_sec_500000us",
+        "mid_slope_bps_per_sec_1000000us",
+        "obi_l1",
+        "ofi_l3",
+        "ofi_l3_over_depth_5bps",
+        "ofi_l1_pressure_over_depth_5bps_200000us",
+        "ofi_l1_pressure_over_depth_5bps_500000us",
+        "ofi_l5_sum_over_depth_200000us",
+        "ofi_l5_sum_over_depth_500000us",
+        "ofi_l10_sum_over_depth_1000000us",
+        "ofi_l3_accel_200000us_minus_500000us",
+        "ofi_l3_accel_500000us_minus_1000000us",
+        "bid_price_change_rate_500000us",
+        "cvd_change_usd_500000us",
+        "cvd_change_usd_1000000us",
+        "absorption_bid_200000us",
+        "absorption_ask_200000us",
+        "depth_imbalance_5bps_mean_1000000us",
+    }
+    assert retained.issubset(set(specs.FEATURE_NAMES))
+
+
+def test_no_pruned_output_assignment_remains():
+    dropped = {
+        "micro_ret_bps_500000us",
+        "micro_ret_bps_1000000us",
+        "obi_l10",
+        "ofi_l1",
+        "ofi_l5",
+        "ofi_l1_over_depth_5bps",
+        "ofi_l5_over_depth_5bps",
+        "ofi_l10_over_depth_5bps",
+        "ofi_l1_sum_over_depth_200000us",
+        "ofi_l1_sum_over_depth_500000us",
+        "ofi_l10_sum_over_depth_200000us",
+        "ofi_l10_sum_over_depth_500000us",
+        "ofi_l5_sum_over_depth_1000000us",
+        "ofi_l1_pressure_over_depth_5bps_1000000us",
+        "ofi_l1_accel_200000us_minus_500000us",
+        "ofi_l5_accel_200000us_minus_500000us",
+        "ofi_l10_accel_200000us_minus_500000us",
+        "ofi_l1_accel_500000us_minus_1000000us",
+        "ofi_l5_accel_500000us_minus_1000000us",
+        "ofi_l10_accel_500000us_minus_1000000us",
+        "spread_change_count_500000us",
+        "cvd_slope_usd_per_sec_500000us",
+        "cvd_slope_usd_per_sec_1000000us",
+        "post_sell_trade_bid_replenishment_200000us",
+        "post_buy_trade_ask_replenishment_200000us",
+        "depth_imbalance_5bps_mean_500000us",
+    }
+    for relpath in (
+        "mmrt/features/book_state.py",
+        "mmrt/features/trade_state.py",
+        "mmrt/features/engine.py",
+    ):
+        text = Path(relpath).read_text()
+        assigned = set(re.findall(r'setf\(\s*f?["\']([^"\']+)["\']', text))
+        assert not dropped.intersection(assigned)
 
 
 def test_required_windows_and_depth():
@@ -127,7 +238,7 @@ def test_corrected_non_book_ownership():
 
 
 def test_feature_schema_version_is_core_not_legacy():
-    assert specs.FEATURE_SCHEMA_VERSION == "mmrt_feature_schema_v1_snapshot25_trades_core172_ctx6_us"
+    assert specs.FEATURE_SCHEMA_VERSION == "mmrt_feature_schema_v2_snapshot25_trades_core146_ctx6_us_corr_pruned"
     assert "legacy" not in specs.FEATURE_SCHEMA_VERSION
 
 
@@ -176,8 +287,8 @@ def test_bounded_ratio_features_are_ratio_bounded():
 def test_short_horizon_price_and_ofi_features_are_fast():
     assert specs.feature_spec_by_name("micro_ret_bps_200000us").transform_key == TransformKey.IDENTITY_EWMA_FAST
     assert specs.feature_spec_by_name("spread_bps").transform_key == TransformKey.IDENTITY_EWMA_FAST
-    assert specs.feature_spec_by_name("ofi_l1").transform_key == TransformKey.IDENTITY_EWMA_FAST
-    assert specs.feature_spec_by_name("ofi_l1_sum_over_depth_200000us").transform_key == TransformKey.RATIO_BOUNDED
+    assert specs.feature_spec_by_name("ofi_l3").transform_key == TransformKey.IDENTITY_EWMA_FAST
+    assert specs.feature_spec_by_name("ofi_l5_sum_over_depth_200000us").transform_key == TransformKey.RATIO_BOUNDED
 
 
 def test_short_horizon_trade_flow_features_are_fast_or_bounded():
