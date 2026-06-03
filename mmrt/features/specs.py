@@ -11,11 +11,11 @@ import hashlib
 import re
 from typing import Iterable, Mapping, Sequence
 
-FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v1_snapshot25_trades_core172_ctx6_us"
+FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v2_snapshot25_trades_core146_ctx6_us_corr_pruned"
 
-CORE_FEATURE_COUNT = 172
+CORE_FEATURE_COUNT = 146
 EVENT_CONTEXT_FEATURE_COUNT = 6
-FEATURE_COUNT = 178
+FEATURE_COUNT = 152
 
 REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH = 25
 MAX_REQUIRED_BOOK_FEATURE_DEPTH = 20
@@ -32,10 +32,8 @@ DEFAULT_FEATURE_DTYPE = "float32"
 
 CORE_FEATURE_NAMES = (
     "micro_ret_bps_200ms",
-    "micro_ret_bps_500ms",
     "mid_slope_bps_per_sec_500ms",
     "mid_range_bps_500ms",
-    "micro_ret_bps_1000ms",
     "mid_slope_bps_per_sec_1000ms",
     "mid_range_bps_1000ms",
     "spread_bps",
@@ -51,30 +49,13 @@ CORE_FEATURE_NAMES = (
     "ask_depth_notional_5bps",
     "total_depth_notional_5bps",
     "obi_l1",
-    "obi_l10",
-    "ofi_l1",
     "ofi_l3",
-    "ofi_l5",
-    "ofi_l1_over_depth_5bps",
     "ofi_l3_over_depth_5bps",
-    "ofi_l5_over_depth_5bps",
-    "ofi_l10_over_depth_5bps",
-    "ofi_l1_sum_over_depth_200ms",
-    "ofi_l1_sum_over_depth_500ms",
     "ofi_l5_sum_over_depth_200ms",
     "ofi_l5_sum_over_depth_500ms",
-    "ofi_l5_sum_over_depth_1000ms",
-    "ofi_l10_sum_over_depth_200ms",
-    "ofi_l10_sum_over_depth_500ms",
     "ofi_l10_sum_over_depth_1000ms",
-    "ofi_l1_accel_200_minus_500ms",
-    "ofi_l1_accel_500_minus_1000ms",
     "ofi_l3_accel_200_minus_500ms",
     "ofi_l3_accel_500_minus_1000ms",
-    "ofi_l5_accel_200_minus_500ms",
-    "ofi_l5_accel_500_minus_1000ms",
-    "ofi_l10_accel_200_minus_500ms",
-    "ofi_l10_accel_500_minus_1000ms",
     "obi_l3_mean_500ms",
     "obi_l3_mean_1000ms",
     "micro_l5_minus_mid_bps",
@@ -90,7 +71,6 @@ CORE_FEATURE_NAMES = (
     "bid_l1_depletion_200ms",
     "ask_l1_depletion_200ms",
     "ask_l1_depletion_over_depth_200ms",
-    "spread_change_count_500ms",
     "bid_price_change_rate_500ms",
     "bid_l1_depletion_500ms",
     "ask_l1_depletion_500ms",
@@ -132,10 +112,8 @@ CORE_FEATURE_NAMES = (
     "time_since_last_buy_trade_ms",
     "time_since_last_sell_trade_ms",
     "cvd_change_usd_500ms",
-    "cvd_slope_usd_per_sec_500ms",
     "cvd_minus_ema_usd_500ms",
     "cvd_change_usd_1000ms",
-    "cvd_slope_usd_per_sec_1000ms",
     "consecutive_buy_trade_count",
     "consecutive_sell_trade_count",
     "top5_trade_notional_sum_usd_200ms",
@@ -159,7 +137,6 @@ CORE_FEATURE_NAMES = (
     "spread_z_500ms",
     "spread_widening_slope_bps_per_sec_500ms",
     "depth_5bps_z_500ms",
-    "depth_imbalance_5bps_mean_500ms",
     "depth_imbalance_5bps_slope_500ms",
     "spread_z_1000ms",
     "spread_widening_slope_bps_per_sec_1000ms",
@@ -172,7 +149,6 @@ CORE_FEATURE_NAMES = (
     "ofi_l1_pressure_over_realized_vol_200ms",
     "ofi_l1_pressure_over_depth_5bps_500ms",
     "ofi_l1_pressure_over_realized_vol_500ms",
-    "ofi_l1_pressure_over_depth_5bps_1000ms",
     "ofi_l1_pressure_over_realized_vol_1000ms",
     "top5_trade_share_notional_3000ms",
     "depth_imbalance_realized_vol_1000ms",
@@ -182,8 +158,6 @@ CORE_FEATURE_NAMES = (
     "ofi_pressure_x_churn_500ms",
     "bid_liquidity_void_bps",
     "ask_liquidity_void_bps",
-    "post_buy_trade_ask_replenishment_200ms",
-    "post_sell_trade_bid_replenishment_200ms",
     "touch_flicker_score_3000ms",
     "spread_state_transition_rate_3000ms",
     "max_trade_silence_gap_3000ms",
@@ -204,8 +178,8 @@ CORE_FEATURE_NAMES = (
     "near_touch_depth_drop_asymmetry",
     "trade_impact_half_life_proxy",
 )
-assert len(CORE_FEATURE_NAMES) == 172
-assert len(set(CORE_FEATURE_NAMES)) == 172
+assert len(CORE_FEATURE_NAMES) == 146
+assert len(set(CORE_FEATURE_NAMES)) == 146
 
 EVENT_CONTEXT_FEATURE_NAMES = (
     "log_dt_decision_ms",
@@ -572,7 +546,7 @@ def _is_slow_regime_feature(legacy_name: str) -> bool:
 
 def _is_fast_microstructure_feature(legacy_name: str, source: FeatureSource, family: FeatureFamily) -> bool:
     if _is_slow_regime_feature(legacy_name) or not _has_window_at_most(legacy_name, 1_000_000):
-        return legacy_name in {"spread_bps", "gap_b_bps", "micro_minus_mid_bps", "ofi_l1", "ofi_l3", "ofi_l5", "ofi_l10", "obi_l1", "obi_l10"}
+        return legacy_name in {"spread_bps", "gap_b_bps", "micro_minus_mid_bps", "ofi_l3", "obi_l1"}
     return source in {FeatureSource.BOOK, FeatureSource.TRADE, FeatureSource.CROSS} and family in {
         FeatureFamily.PRICE,
         FeatureFamily.OFI_OBI,

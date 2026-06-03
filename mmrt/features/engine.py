@@ -65,8 +65,7 @@ for n in (
     "absorption_bid_500000us", "absorption_ask_500000us", "absorption_bid_1000000us", "absorption_ask_1000000us",
     "ofi_l1_pressure_over_depth_5bps_200000us", "ofi_l1_pressure_over_realized_vol_200000us",
     "ofi_l1_pressure_over_depth_5bps_500000us", "ofi_l1_pressure_over_realized_vol_500000us",
-    "ofi_l1_pressure_over_depth_5bps_1000000us", "ofi_l1_pressure_over_realized_vol_1000000us",
-    "post_buy_trade_ask_replenishment_200000us", "post_sell_trade_bid_replenishment_200000us",
+    "ofi_l1_pressure_over_realized_vol_1000000us",
     "opposite_side_replenishment_after_depletion_200000us", "same_side_replenishment_after_depletion_200000us",
     "trade_side_quote_response_asymmetry_500000us", "trade_impact_half_life_proxy",
 ):
@@ -346,7 +345,8 @@ class FeatureEngine:
             setf(f"absorption_ask_{w}us", aa)
             ofi_pressure = self._book_sum("ofi_l1", w, now)
             p_over_d = _safe_div(ofi_pressure, max(s.total_depth_5bps_size, FLOAT_EPS), 0.0)
-            setf(f"ofi_l1_pressure_over_depth_5bps_{w}us", p_over_d)
+            if w in (WINDOW_200MS_US, WINDOW_500MS_US):
+                setf(f"ofi_l1_pressure_over_depth_5bps_{w}us", p_over_d)
             rv = self._book_realized_vol_bps("microprice", w, now)
             setf(f"ofi_l1_pressure_over_realized_vol_{w}us", 0.0 if rv <= FLOAT_EPS else _safe_div(p_over_d, max(rv, FLOAT_EPS), 0.0))
             if w == WINDOW_500MS_US:
@@ -354,8 +354,6 @@ class FeatureEngine:
                 sell_share = _safe_div(sell_n, max(total, FLOAT_EPS), 0.0)
                 setf("trade_side_quote_response_asymmetry_500000us", buy_share * ask_rr - sell_share * bid_rr)
             if w == WINDOW_200MS_US:
-                setf("post_buy_trade_ask_replenishment_200000us", _safe_div(buy_n, max(total, FLOAT_EPS), 0.0) * ask_rr)
-                setf("post_sell_trade_bid_replenishment_200000us", _safe_div(sell_n, max(total, FLOAT_EPS), 0.0) * bid_rr)
                 depth = max(s.total_depth_5bps_size, FLOAT_EPS)
                 setf("same_side_replenishment_after_depletion_200000us", (min(bid_add, bid_rem) + min(ask_add, ask_rem)) / depth)
                 setf("opposite_side_replenishment_after_depletion_200000us", (min(bid_add, ask_rem) + min(ask_add, bid_rem)) / depth)

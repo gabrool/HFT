@@ -369,9 +369,6 @@ class TradeState:
         past = self.history.asof_value("cvd_notional", now_us - window_us, default=0.0)
         return current - past
 
-    def _cvd_slope(self, window_us: int, now_us: int) -> float:
-        return _safe_div(self._cvd_change(window_us, now_us), window_us / 1e6)
-
     def _cvd_ema(self, window_us: int, now_us: int) -> float:
         vals = self._window_values("cvd_notional", window_us, now_us)
         if vals.size == 0:
@@ -472,7 +469,6 @@ class TradeState:
         setf("trade_count_per_second_500000us", s500["trade_count_per_second"])
         setf("signed_trade_premium_bps_volume_weighted_500000us", s500["signed_trade_premium_bps_volume_weighted"])
         setf("cvd_change_usd_500000us", self._cvd_change(WINDOW_500MS_US, now))
-        setf("cvd_slope_usd_per_sec_500000us", self._cvd_slope(WINDOW_500MS_US, now))
         setf("cvd_minus_ema_usd_500000us", self.cvd_notional - self._cvd_ema(WINDOW_500MS_US, now))
         setf("max_signed_trade_notional_usd_500000us", s500["max_signed_trade_notional"])
         setf("top5_trade_notional_sum_usd_500000us", s500["top5_trade_notional_sum"])
@@ -490,7 +486,6 @@ class TradeState:
         setf("trade_count_per_second_1000000us", s1000["trade_count_per_second"])
         setf("signed_trade_premium_bps_volume_weighted_1000000us", s1000["signed_trade_premium_bps_volume_weighted"])
         setf("cvd_change_usd_1000000us", self._cvd_change(WINDOW_1000MS_US, now))
-        setf("cvd_slope_usd_per_sec_1000000us", self._cvd_slope(WINDOW_1000MS_US, now))
         setf("max_signed_trade_notional_usd_1000000us", s1000["max_signed_trade_notional"])
         setf("top5_trade_notional_sum_usd_1000000us", s1000["top5_trade_notional_sum"])
         setf("same_side_trade_cluster_notional_1000000us", self._same_side_trade_cluster_notional(WINDOW_1000MS_US, now))

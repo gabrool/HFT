@@ -337,7 +337,7 @@ def test_ofi_pressure_formulas_manual():
     assert fv_value(vec, "ofi_l1_pressure_over_realized_vol_200000us") == pytest.approx(expected_vol)
 
 
-def test_post_trade_replenishment_manual():
+def test_absorption_replenishment_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000, 100.0, 2.0, BUY_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, bid_sz0=10.0, ask_sz0=10.0))
@@ -356,8 +356,8 @@ def test_post_trade_replenishment_manual():
     sell_share = sell_n / total
     ask_rr = ask_add / max(ask_add + ask_rem, eps)
     bid_rr = bid_add / max(bid_add + bid_rem, eps)
-    assert fv_value(vec, "post_buy_trade_ask_replenishment_200000us") == pytest.approx(buy_share * ask_rr)
-    assert fv_value(vec, "post_sell_trade_bid_replenishment_200000us") == pytest.approx(sell_share * bid_rr)
+    assert fv_value(vec, "absorption_ask_200000us") == pytest.approx(buy_share * ask_rr)
+    assert fv_value(vec, "absorption_bid_200000us") == pytest.approx(sell_share * bid_rr)
 
 
 def test_same_and_opposite_replenishment_manual():
@@ -523,9 +523,5 @@ def test_all_engine_features_assigned_no_placeholders():
         or abs(fv_value(vec, "absorption_ask_200000us")) > 0.0
     )
     assert abs(fv_value(vec, "ofi_l1_pressure_over_depth_5bps_200000us")) > 0.0
-    assert (
-        abs(fv_value(vec, "post_buy_trade_ask_replenishment_200000us")) > 0.0
-        or abs(fv_value(vec, "post_sell_trade_bid_replenishment_200000us")) > 0.0
-    )
     assert abs(fv_value(vec, "trade_side_quote_response_asymmetry_500000us")) > 0.0
     assert fv_value(vec, "log_events_500000us") > 0.0
