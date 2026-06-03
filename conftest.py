@@ -56,10 +56,6 @@ def install_optional_dependency_stubs() -> None:
     config_mod = types.ModuleType("torch._functorch.config")
     optim_mod = types.ModuleType("torch.optim")
     optim_mod.Optimizer = type("Optimizer", (_Module,), {"__init__": lambda self, *args, **kwargs: None})
-    torch_mod.optim = optim_mod
-    torch_mod.nn = nn_mod
-    torch_mod.utils = utils_mod
-    torch_mod._functorch = functorch_mod
 
     if not real_torch_available:
         sys.modules.setdefault("torch", torch_mod)
