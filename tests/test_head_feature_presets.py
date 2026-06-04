@@ -10,9 +10,11 @@ from mmrt.linear import models as lm
 def test_available_presets_are_stable():
     assert hp.ALL_FEATURES_PRESET == "all"
     assert hp.CORR_PRUNED152_HEAD_SUBSET_V1 == "corr_pruned152_head_subset_v1"
+    assert hp.CORR_PRUNED152_HEAD_SUBSET_V2 == "corr_pruned152_head_subset_v2"
     assert hp.AVAILABLE_HEAD_FEATURE_PRESETS == (
         "all",
         "corr_pruned152_head_subset_v1",
+        "corr_pruned152_head_subset_v2",
     )
 
 
@@ -60,8 +62,22 @@ def test_corr_pruned152_preset_counts_and_heads():
     }
 
 
-def test_corr_pruned152_preset_has_no_duplicate_columns():
-    cfg = hp.head_feature_config_for_preset("corr_pruned152_head_subset_v1")
+def test_corr_pruned152_v2_preset_counts_and_heads():
+    cfg = hp.head_feature_config_for_preset("corr_pruned152_head_subset_v2")
+    assert isinstance(cfg, hf.HeadFeatureConfig)
+    assert set(cfg.feature_columns_by_head) == set(lm.MODEL_HEADS)
+    assert len(cfg.feature_columns_by_head[lm.DIRECTION_HEAD]) == 34
+    assert len(cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]) == 39
+    assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]) == 19
+    assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]) == 9
+
+
+@pytest.mark.parametrize("preset", [
+    "corr_pruned152_head_subset_v1",
+    "corr_pruned152_head_subset_v2",
+])
+def test_corr_pruned152_presets_have_no_duplicate_columns(preset):
+    cfg = hp.head_feature_config_for_preset(preset)
     for cols in cfg.feature_columns_by_head.values():
         assert len(cols) == len(set(cols))
 
@@ -82,9 +98,28 @@ def test_corr_pruned152_anchor_features_present():
     assert "x_time_since_mid_change_us" in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
 
 
+def test_corr_pruned152_v2_anchor_features_present():
+    cfg = hp.head_feature_config_for_preset("corr_pruned152_head_subset_v2")
+    assert "x_depth_imbalance_within_1bps" in cfg.feature_columns_by_head[lm.DIRECTION_HEAD]
+    assert "x_trade_imbalance_notional_500000us" in cfg.feature_columns_by_head[lm.DIRECTION_HEAD]
+    assert "x_log_events_1000000us" in cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]
+    assert "x_trade_count_per_second_1000000us" in cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]
+    assert "x_bid_depth_notional_5bps" in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
+
+
 def test_harmful_features_excluded_from_specific_heads():
     cfg = hp.head_feature_config_for_preset("corr_pruned152_head_subset_v1")
     assert "x_ask_l1_notional_usd" not in cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]
     assert "x_obi_l1" not in cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]
     assert "x_spread_z_1000000us" not in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
     assert "x_cvd_change_usd_1000000us" not in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
+
+
+def test_corr_pruned152_v2_excludes_bad_features():
+    cfg = hp.head_feature_config_for_preset("corr_pruned152_head_subset_v2")
+    assert "x_ask_l1_add_rate_over_depth_200000us" not in cfg.feature_columns_by_head[lm.DIRECTION_HEAD]
+    assert "x_max_abs_return_bps_500000us" not in cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]
+    assert "x_spread_state_transition_rate_3000000us" not in cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]
+    assert "x_asz1" not in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
+    assert "x_obi_l1" not in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
+    assert "x_bid_l1_notional_usd" not in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
