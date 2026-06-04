@@ -12,6 +12,7 @@ import math
 from typing import Sequence
 
 import mmrt.linear.diagnostics as dg
+import mmrt.linear.head_feature_presets as hp
 import mmrt.linear.models as lm
 import mmrt.linear.preprocess as pp
 import mmrt.linear.targets as tg
@@ -71,6 +72,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip reader validation when opening the dataset.",
     )
+    parser.add_argument(
+        "--head-feature-preset",
+        choices=hp.AVAILABLE_HEAD_FEATURE_PRESETS,
+        default=hp.ALL_FEATURES_PRESET,
+        help=(
+            "Named per-head feature subset preset. "
+            "'all' uses every manifest feature for every head."
+        ),
+    )
 
     parser.add_argument("--target-horizon-us", type=_positive_int, default=tg.DEFAULT_TARGET_HORIZON_US)
     parser.add_argument(
@@ -112,6 +122,7 @@ def _config_from_args(args: argparse.Namespace) -> lt.LinearTrainConfig:
         batch_size=args.batch_size,
         epochs=args.epochs,
         validate_dataset_on_open=not args.no_validate_on_open,
+        head_feature_config=hp.head_feature_config_for_preset(args.head_feature_preset),
         target_config=tg.LinearTargetConfig(
             target_horizon_us=args.target_horizon_us,
             move_deadband_bps=args.move_deadband_bps,
