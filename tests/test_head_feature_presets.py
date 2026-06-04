@@ -49,12 +49,12 @@ def test_feature_subset_preset_counts_and_heads():
     assert isinstance(cfg, hf.HeadFeatureConfig)
     assert set(cfg.feature_columns_by_head) == set(lm.MODEL_HEADS)
     assert len(cfg.feature_columns_by_head[lm.DIRECTION_HEAD]) == 20
-    assert len(cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]) == 31
+    assert len(cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]) == 30
     assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]) == 13
     assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]) == 6
     assert hp.preset_feature_counts("feature_subset") == {
         lm.DIRECTION_HEAD: 20,
-        lm.NO_MOVE_HEAD: 31,
+        lm.NO_MOVE_HEAD: 30,
         lm.MAGNITUDE_UP_HEAD: 13,
         lm.MAGNITUDE_DOWN_HEAD: 6,
     }
@@ -94,7 +94,8 @@ def test_feature_subset_no_move_keeps_core_features():
     assert "x_log_events_1000000us" in no_move
     assert "x_touch_flicker_score_3000000us" in no_move
     assert "x_bid_price_change_rate_1000000us" in no_move
-    assert "x_asz1" in no_move
+    assert "x_bid_l1_depletion_1000000us" in no_move
+    assert "x_trade_sign_entropy_3000000us" in no_move
 
 
 def test_feature_subset_excludes_removed_features():
@@ -115,6 +116,7 @@ def test_feature_subset_excludes_removed_features():
     assert "x_bid_depth_centroid_bps_25bps" not in no_move
     assert "x_bsz1" not in no_move
     assert "x_ask_depth_centroid_bps_25bps" not in no_move
+    assert "x_asz1" not in no_move
 
     mag_up = cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]
     assert "x_spread_z_500000us" not in mag_up
