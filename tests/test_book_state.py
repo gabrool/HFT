@@ -60,6 +60,16 @@ def test_book_history_fields_are_active_minimal():
     )
 
 
+def test_book_windows_are_active_only():
+    assert bs.BOOK_WINDOWS_US == (
+        bs.WINDOW_200MS_US,
+        bs.WINDOW_500MS_US,
+        bs.WINDOW_1000MS_US,
+        bs.WINDOW_3000MS_US,
+    )
+    assert not hasattr(bs, "WINDOW_100MS_US")
+
+
 def test_no_inactive_book_feature_computation_remains():
     import inspect
 
@@ -88,9 +98,51 @@ def test_no_inactive_book_feature_computation_remains():
         "ofi_l3",
         "ofi_l5",
         "obi_l3",
+        "WINDOW_100MS_US",
+        "first_mid_ts_us",
+        "depth_stable_start_ts_us",
+        "_asof_value",
+        "def asof_value",
+        "_new_feature_vector",
     ]
     for token in forbidden:
         assert token not in src
+
+
+def test_book_history_append_requires_exact_active_fields():
+    h = bs.BookHistory(capacity=4)
+
+    row = {
+        "ts_us": 1_000_000,
+        "mid": 100.0,
+        "microprice": 100.01,
+        "micro_minus_mid_bps": 1.0,
+        "depth_imbalance_5bps": 0.1,
+        "total_depth_1bps_size": 50.0,
+        "ofi_l1": 0.0,
+        "ofi_l10": 0.0,
+        "bid_l1_add": 1.0,
+        "bid_l1_rem": 0.0,
+        "ask_l1_add": 0.0,
+        "ask_l1_rem": 1.0,
+        "bid_price_changed": 0.0,
+        "ask_price_changed": 0.0,
+        "spread_changed": 0.0,
+    }
+
+    h.append(**row)
+    assert h.size == 1
+    assert h.ordered_ts().tolist() == [1_000_000]
+
+    missing = dict(row)
+    missing.pop("ofi_l10")
+    with pytest.raises(KeyError, match="missing"):
+        h.append(**missing)
+
+    extra = dict(row)
+    extra["unused_field"] = 1.0
+    with pytest.raises(KeyError, match="extra"):
+        h.append(**extra)
 
 
 def test_no_forbidden_imports():

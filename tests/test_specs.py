@@ -131,6 +131,12 @@ def test_no_inactive_runtime_computation_tokens_remain():
             "ofi_l3",
             "ofi_l5",
             "obi_l3",
+            "WINDOW_100MS_US",
+            "first_mid_ts_us",
+            "depth_stable_start_ts_us",
+            "_asof_value",
+            "def asof_value",
+            "_new_feature_vector",
         },
         "mmrt/features/engine.py": {
             "WINDOW_100MS_US",
