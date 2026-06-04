@@ -222,6 +222,43 @@ def test_column_projection_reads_only_features_and_target(tmp_path: Path, monkey
     assert len(captured[-1]) == len(manifest.feature_columns) + 1
 
 
+def test_column_projection_uses_head_subset_plus_target(tmp_path: Path, monkeypatch):
+    root, manifest = make_dataset_with_splits(tmp_path)
+    reader = rd.open_dataset(str(root), validate_on_open=True, batch_size=3)
+    subset = tuple(manifest.feature_columns[:4])
+    cfg = tr.LinearTrainConfig(
+        batch_size=3,
+        epochs=1,
+        head_feature_config=hf.HeadFeatureConfig(
+            feature_columns_by_head={head: subset for head in lm.MODEL_HEADS}
+        ),
+    )
+    captured = []
+    orig = tr._split_batches
+
+    def wrapped(reader_, role, columns, batch_size):
+        captured.append(tuple(columns))
+        yield from orig(reader_, role, columns, batch_size)
+
+    monkeypatch.setattr(tr, "_split_batches", wrapped)
+    resolved = hf.resolve_head_feature_sets(manifest, cfg.head_feature_config)
+    st = tr.fit_preprocessors_from_train_split(
+        reader,
+        manifest=manifest,
+        head_features=resolved,
+        config=cfg,
+    )
+    assert captured[-1] == subset
+    _ = tr.train_model_bundle_from_train_split(
+        reader,
+        manifest=manifest,
+        head_features=resolved,
+        preprocess_states_by_head=st,
+        config=cfg,
+    )
+    assert captured[-1] == subset + ("y_ret_bps_1000000us",)
+
+
 def test_direction_invalid_rows_filtered_for_direction_head(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     reader = rd.open_dataset(str(root), validate_on_open=True, batch_size=3)
@@ -367,6 +404,34 @@ def test_train_linear_model_respects_per_head_feature_subsets(tmp_path: Path):
         assert pre_diag["states_by_head"][lm.DIRECTION_HEAD]["n_features"] == 2
         assert pre_diag["states_by_head"][lm.MAGNITUDE_UP_HEAD]["n_features"] == 2
         assert pre_diag["states_by_head"][lm.MAGNITUDE_DOWN_HEAD]["n_features"] == 2
+
+
+def test_train_linear_model_with_head_feature_subset_serializes_counts(tmp_path: Path):
+    root, manifest = make_dataset_with_splits(tmp_path)
+    available = tuple(manifest.feature_columns)
+    cfg = tr.LinearTrainConfig(
+        epochs=1,
+        batch_size=3,
+        head_feature_config=hf.HeadFeatureConfig(
+            feature_columns_by_head={
+                lm.NO_MOVE_HEAD: available[:3],
+                lm.DIRECTION_HEAD: available[:4],
+                lm.MAGNITUDE_UP_HEAD: available[:2],
+                lm.MAGNITUDE_DOWN_HEAD: available[:5],
+            }
+        ),
+    )
+
+    result = tr.train_linear_model(str(root), config=cfg)
+    payload = result.as_dict()
+    counts = payload["config"]["resolved_head_features"]["feature_counts_by_head"]
+
+    assert counts[lm.NO_MOVE_HEAD] == 3
+    assert counts[lm.DIRECTION_HEAD] == 4
+    assert counts[lm.MAGNITUDE_UP_HEAD] == 2
+    assert counts[lm.MAGNITUDE_DOWN_HEAD] == 5
+    assert len(payload["model_bundle_state"]["feature_columns_by_head"][lm.NO_MOVE_HEAD]) == 3
+    assert len(payload["preprocess_state"]["states_by_head"][lm.DIRECTION_HEAD]["feature_columns"]) == 4
 
 
 def test_train_missing_head_feature_entry_defaults_to_all_features(tmp_path: Path):

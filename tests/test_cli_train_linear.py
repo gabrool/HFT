@@ -8,6 +8,7 @@ pytest.importorskip("pyarrow.parquet")
 
 import mmrt.cli.train_linear as cli
 import mmrt.linear.diagnostics as dg
+import mmrt.linear.head_feature_presets as hp
 import mmrt.linear.models as lm
 import mmrt.linear.preprocess as pp
 import mmrt.linear.targets as tg
@@ -25,6 +26,7 @@ def test_build_arg_parser_defaults() -> None:
     assert args.epochs == lt.DEFAULT_EPOCHS
     assert args.result_filename == lt.DEFAULT_OUTPUT_FILENAME
     assert args.no_validate_on_open is False
+    assert args.head_feature_preset == hp.ALL_FEATURES_PRESET
     assert args.target_horizon_us == tg.DEFAULT_TARGET_HORIZON_US
     assert args.move_deadband_bps == tg.DEFAULT_MOVE_DEADBAND_BPS
     assert args.target_output_dtype == tg.DEFAULT_TARGET_DTYPE
@@ -69,6 +71,38 @@ def test_config_from_args_constructs_frozen_config() -> None:
     assert cfg.diagnostics_config.top_k == 5
     assert cfg.diagnostics_config.num_bins == 4
     assert cfg.diagnostics_config.max_rows == 123
+
+
+def test_train_linear_default_head_feature_preset_is_all() -> None:
+    parser = cli.build_arg_parser()
+    args = parser.parse_args(["--dataset-root", "/tmp/ds", "--output-dir", "/tmp/out"])
+    cfg = cli._config_from_args(args)
+    assert cfg.head_feature_config.feature_columns_by_head is None
+
+
+def test_train_linear_accepts_corr_pruned_head_feature_preset() -> None:
+    parser = cli.build_arg_parser()
+    args = parser.parse_args([
+        "--dataset-root", "/tmp/ds",
+        "--output-dir", "/tmp/out",
+        "--head-feature-preset", "corr_pruned152_head_subset_v1",
+    ])
+    cfg = cli._config_from_args(args)
+    assert cfg.head_feature_config.feature_columns_by_head is not None
+    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 40
+    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 40
+    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 30
+    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 40
+
+
+def test_parser_rejects_bad_head_feature_preset() -> None:
+    parser = cli.build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--dataset-root", "ds",
+            "--output-dir", "out",
+            "--head-feature-preset", "__missing__",
+        ])
 
 
 def test_parser_rejects_bad_numeric_values() -> None:
