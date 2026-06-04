@@ -216,7 +216,7 @@ def test_head_scopes_are_correct(trained_artifact):
     root, artifact = trained_artifact
     out = fi.run_feature_importance(str(root), str(artifact))
     counts = {head: {r.n_eval_rows for r in out.records if r.head == head} for head in lm.MODEL_HEADS}
-    assert counts[lm.NO_MOVE_HEAD] == {30}
+    assert counts[lm.NO_MOVE_HEAD] == {28}
     assert counts[lm.DIRECTION_HEAD] == {25}
     assert counts[lm.MAGNITUDE_UP_HEAD] == {10}
     assert counts[lm.MAGNITUDE_DOWN_HEAD] == {15}

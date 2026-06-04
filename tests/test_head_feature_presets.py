@@ -48,15 +48,15 @@ def test_feature_subset_preset_counts_and_heads():
     cfg = hp.head_feature_config_for_preset("feature_subset")
     assert isinstance(cfg, hf.HeadFeatureConfig)
     assert set(cfg.feature_columns_by_head) == set(lm.MODEL_HEADS)
-    assert len(cfg.feature_columns_by_head[lm.DIRECTION_HEAD]) == 20
-    assert len(cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]) == 30
-    assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]) == 13
-    assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]) == 6
+    assert len(cfg.feature_columns_by_head[lm.DIRECTION_HEAD]) == 17
+    assert len(cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]) == 28
+    assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]) == 11
+    assert len(cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]) == 5
     assert hp.preset_feature_counts("feature_subset") == {
-        lm.DIRECTION_HEAD: 20,
-        lm.NO_MOVE_HEAD: 30,
-        lm.MAGNITUDE_UP_HEAD: 13,
-        lm.MAGNITUDE_DOWN_HEAD: 6,
+        lm.DIRECTION_HEAD: 17,
+        lm.NO_MOVE_HEAD: 28,
+        lm.MAGNITUDE_UP_HEAD: 11,
+        lm.MAGNITUDE_DOWN_HEAD: 5,
     }
 
 
@@ -75,12 +75,26 @@ def test_unknown_preset_rejected():
 
 def test_feature_subset_anchor_features_present():
     cfg = hp.head_feature_config_for_preset("feature_subset")
-    assert "x_depth_imbalance_within_1bps" in cfg.feature_columns_by_head[lm.DIRECTION_HEAD]
-    assert "x_trade_imbalance_notional_500000us" in cfg.feature_columns_by_head[lm.DIRECTION_HEAD]
-    assert "x_log_events_1000000us" in cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]
-    assert "x_trade_count_per_second_1000000us" in cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]
-    assert "x_bid_depth_notional_5bps" in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
-    assert "x_max_trade_silence_gap_3000000us" in cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
+    direction = cfg.feature_columns_by_head[lm.DIRECTION_HEAD]
+    assert "x_depth_imbalance_within_1bps" in direction
+    assert "x_obi_l1" in direction
+    assert "x_ask_l1_notional_usd" in direction
+    assert "x_bid_l1_notional_usd" in direction
+    assert "x_max_signed_trade_notional_usd_1000000us" in direction
+
+    no_move = cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]
+    assert "x_ask_l1_notional_usd" in no_move
+    assert "x_bid_l1_notional_usd" in no_move
+    assert "x_total_depth_notional_5bps" in no_move
+    assert "x_log_events_1000000us" in no_move
+
+    magnitude_up = cfg.feature_columns_by_head[lm.MAGNITUDE_UP_HEAD]
+    assert "x_trade_count_per_second_1000000us" in magnitude_up
+    assert "x_log_events_1000000us" in magnitude_up
+
+    magnitude_down = cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
+    assert "x_max_trade_silence_gap_3000000us" in magnitude_down
+    assert "x_microprice_zero_cross_rate_1000000us" in magnitude_down
 
 
 def test_feature_subset_no_move_keeps_core_features():
@@ -105,7 +119,6 @@ def test_feature_subset_excludes_removed_features():
     assert "x_down_up_vol_imbalance_3000000us" not in direction
     assert "x_ask_l1_depletion_over_depth_500000us" not in direction
     assert "x_last_trade_side_sign" not in direction
-    assert "x_bid_depth_notional_5bps" not in direction
     assert "x_bid_depth_centroid_bps_25bps" not in direction
 
     no_move = cfg.feature_columns_by_head[lm.NO_MOVE_HEAD]
@@ -123,4 +136,14 @@ def test_feature_subset_excludes_removed_features():
     assert "x_ofi_l1_pressure_over_depth_5bps_200000us" not in mag_up
 
     mag_down = cfg.feature_columns_by_head[lm.MAGNITUDE_DOWN_HEAD]
-    assert len(mag_down) == 6
+    assert len(mag_down) == 5
+
+    removed_corr90 = {
+        "x_depth_imbalance_5bps_mean_1000000us",
+        "x_ask_depth_notional_5bps",
+        "x_bid_depth_notional_5bps",
+        "x_micro_minus_mid_bps",
+        "x_cvd_change_usd_1000000us",
+    }
+    for cols in cfg.feature_columns_by_head.values():
+        assert not removed_corr90.intersection(cols)

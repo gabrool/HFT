@@ -89,10 +89,10 @@ def test_train_linear_accepts_feature_subset_preset() -> None:
     ])
     cfg = cli._config_from_args(args)
     assert cfg.head_feature_config.feature_columns_by_head is not None
-    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 20
-    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 30
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 13
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 6
+    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 17
+    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 28
+    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 11
+    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 5
 
 
 def test_parser_rejects_bad_head_feature_preset() -> None:

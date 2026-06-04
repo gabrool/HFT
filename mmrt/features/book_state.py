@@ -48,6 +48,38 @@ FLOAT_EPS = 1e-12
 BOOK_FEATURE_INDICES = feature_indices_by_source(FeatureSource.BOOK)
 BOOK_FEATURE_NAMES = tuple(FEATURE_NAMES[i] for i in BOOK_FEATURE_INDICES)
 BOOK_FEATURE_NAME_SET = frozenset(BOOK_FEATURE_NAMES)
+ACTIVE_BOOK_FEATURES = {
+    "mid_slope_bps_per_sec_1000000us",
+    "time_since_mid_change_us",
+    "bid_l1_notional_usd",
+    "ask_l1_notional_usd",
+    "total_depth_notional_5bps",
+    "obi_l1",
+    "ofi_l10_sum_over_depth_1000000us",
+    "micro_l10_minus_mid_bps",
+    "ask_depth_within_1bps",
+    "depth_imbalance_within_1bps",
+    "ask_l1_depletion_over_depth_200000us",
+    "ask_l1_depletion_500000us",
+    "bid_price_change_rate_1000000us",
+    "bid_l1_depletion_1000000us",
+    "bid_l1_depletion_over_depth_1000000us",
+    "ask_l1_depletion_over_depth_1000000us",
+    "ob_update_rate_200000us",
+    "ob_update_rate_500000us",
+    "bid_l1_rem_rate_over_depth_200000us",
+    "depth_imbalance_5bps_slope_1000000us",
+    "depth_imbalance_5bps_slope_3000000us",
+    "microprice_zero_cross_rate_1000000us",
+    "l1_churn_over_depth_1000000us",
+    "touch_flicker_score_3000000us",
+    "spread_state_transition_rate_3000000us",
+    "microprice_realized_vol_1000000us",
+    "best_bid_size_age_us",
+    "best_ask_size_age_us",
+    "near_touch_depth_drop_asymmetry",
+}
+assert BOOK_FEATURE_NAME_SET == ACTIVE_BOOK_FEATURES
 assert BOOK_FEATURE_INDICES
 assert all(FEATURE_SPECS[i].source == FeatureSource.BOOK for i in BOOK_FEATURE_INDICES)
 assert MAX_EMITTED_DEPTH <= BOOK_DEPTH
@@ -331,113 +363,32 @@ class BookState:
             arr[feature_spec_by_name(name).index] = _finite(v)
             assigned.add(name)
 
-        setf("spread_bps", s.spread_bps)
-        setf("gap_b_bps", self._gap_b_bps())
-        setf("bsz1", self.current_bid_sz[0])
-        setf("asz1", self.current_ask_sz[0])
-        setf("micro_minus_mid_bps", s.micro_minus_mid_bps)
-        setf("time_since_mid_change_us", now - self.last_mid_change_ts_us)
-
-        setf("micro_ret_bps_200000us", self._ret_bps_asof("microprice", WINDOW_200MS_US))
-        setf("mid_slope_bps_per_sec_500000us", self._rolling_mid_slope_bps_per_sec(WINDOW_500MS_US))
         setf("mid_slope_bps_per_sec_1000000us", self._rolling_mid_slope_bps_per_sec(WINDOW_1000MS_US))
-        setf("mid_range_bps_500000us", self._rolling_range_bps("mid", WINDOW_500MS_US))
-        setf("mid_range_bps_1000000us", self._rolling_range_bps("mid", WINDOW_1000MS_US))
-
+        setf("time_since_mid_change_us", now - self.last_mid_change_ts_us)
         setf("bid_l1_notional_usd", self.current_bid_px[0] * self.current_bid_sz[0])
         setf("ask_l1_notional_usd", self.current_ask_px[0] * self.current_ask_sz[0])
-        setf("bid_depth_notional_5bps", s.bid_depth_5bps_notional)
-        setf("ask_depth_notional_5bps", s.ask_depth_5bps_notional)
         setf("total_depth_notional_5bps", s.total_depth_5bps_notional)
         setf("obi_l1", self._obi(1))
-
-        ofi3 = self._window_values("ofi_l3", 1)[-1]
-        setf("ofi_l3", ofi3)
-        setf("ofi_l3_over_depth_5bps", ofi3 / depth)
-        for name, field, window in (
-            ("ofi_l5_sum_over_depth_200000us", "ofi_l5", WINDOW_200MS_US),
-            ("ofi_l5_sum_over_depth_500000us", "ofi_l5", WINDOW_500MS_US),
-            ("ofi_l10_sum_over_depth_1000000us", "ofi_l10", WINDOW_1000MS_US),
-        ):
-            setf(name, self._rolling_sum(field, window) / depth)
-
-        def norm(n, w):
-            return self._rolling_sum(n, w) / depth
-
-        setf("ofi_l3_accel_200000us_minus_500000us", norm("ofi_l3", WINDOW_200MS_US) - norm("ofi_l3", WINDOW_500MS_US))
-        setf("ofi_l3_accel_500000us_minus_1000000us", norm("ofi_l3", WINDOW_500MS_US) - norm("ofi_l3", WINDOW_1000MS_US))
-        setf("obi_l3_mean_500000us", self._rolling_mean("obi_l3", WINDOW_500MS_US))
-        setf("obi_l3_mean_1000000us", self._rolling_mean("obi_l3", WINDOW_1000MS_US))
-
-        setf("micro_l5_minus_mid_bps", self._minus_mid_bps(self._micro_depth(5)))
-        setf("vamp_l5_minus_mid_bps", self._minus_mid_bps(self._vamp_depth(5)))
+        setf("ofi_l10_sum_over_depth_1000000us", self._rolling_sum("ofi_l10", WINDOW_1000MS_US) / depth)
         setf("micro_l10_minus_mid_bps", self._minus_mid_bps(self._micro_depth(10)))
-        setf("vamp_l10_minus_mid_bps", self._minus_mid_bps(self._vamp_depth(10)))
-        setf("micro_l5_slope_200000us", self._rolling_slope_per_sec("micro_l5_minus_mid_bps", WINDOW_200MS_US))
-        setf("micro_l5_slope_1000000us", self._rolling_slope_per_sec("micro_l5_minus_mid_bps", WINDOW_1000MS_US))
-
-        setf("bid_depth_within_1bps", bid_depth_1bps)
         setf("ask_depth_within_1bps", ask_depth_1bps)
         setf("depth_imbalance_within_1bps", self._depth_imbalance_within_bps(1.0))
-        for w, sn in (
-            (WINDOW_200MS_US, "200000us"),
-            (WINDOW_500MS_US, "500000us"),
-            (WINDOW_1000MS_US, "1000000us"),
-        ):
-            setf(f"bid_price_change_rate_{sn}", self._rolling_sum("bid_price_changed", w) / (w / 1e6))
-            setf(f"bid_l1_depletion_{sn}", self._rolling_sum("bid_l1_rem", w))
-            setf(f"ask_l1_depletion_{sn}", self._rolling_sum("ask_l1_rem", w))
         setf("ask_l1_depletion_over_depth_200000us", self._rolling_sum("ask_l1_rem", WINDOW_200MS_US) / ask_depth_1bps)
-        setf("bid_l1_depletion_over_depth_500000us", self._rolling_sum("bid_l1_rem", WINDOW_500MS_US) / bid_depth_1bps)
-        setf("ask_l1_depletion_over_depth_500000us", self._rolling_sum("ask_l1_rem", WINDOW_500MS_US) / ask_depth_1bps)
+        setf("ask_l1_depletion_500000us", self._rolling_sum("ask_l1_rem", WINDOW_500MS_US))
+        setf("bid_price_change_rate_1000000us", self._rolling_sum("bid_price_changed", WINDOW_1000MS_US))
+        setf("bid_l1_depletion_1000000us", self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US))
         setf("bid_l1_depletion_over_depth_1000000us", self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US) / bid_depth_1bps)
         setf("ask_l1_depletion_over_depth_1000000us", self._rolling_sum("ask_l1_rem", WINDOW_1000MS_US) / ask_depth_1bps)
-
         setf("ob_update_rate_200000us", self._rolling_update_rate(WINDOW_200MS_US))
         setf("ob_update_rate_500000us", self._rolling_update_rate(WINDOW_500MS_US))
-        setf("bid_l1_add_rate_over_depth_200000us", self._rolling_sum("bid_l1_add", WINDOW_200MS_US) / (0.2 * bid_depth_1bps))
         setf("bid_l1_rem_rate_over_depth_200000us", self._rolling_sum("bid_l1_rem", WINDOW_200MS_US) / (0.2 * bid_depth_1bps))
-        setf("ask_l1_add_rate_over_depth_200000us", self._rolling_sum("ask_l1_add", WINDOW_200MS_US) / (0.2 * ask_depth_1bps))
-        setf("bid_l1_add_rate_over_depth_500000us", self._rolling_sum("bid_l1_add", WINDOW_500MS_US) / (0.5 * bid_depth_1bps))
-        setf("ask_l1_add_rate_over_depth_500000us", self._rolling_sum("ask_l1_add", WINDOW_500MS_US) / (0.5 * ask_depth_1bps))
-        setf("bid_l1_add_rate_over_depth_1000000us", self._rolling_sum("bid_l1_add", WINDOW_1000MS_US) / bid_depth_1bps)
-        setf("ask_l1_add_rate_over_depth_1000000us", self._rolling_sum("ask_l1_add", WINDOW_1000MS_US) / ask_depth_1bps)
-
-        setf("return_std_bps_200000us", self._return_std_bps(WINDOW_200MS_US))
-        setf("down_up_vol_imbalance_500000us", self._down_up_vol_imbalance(WINDOW_500MS_US))
-        setf("max_abs_return_bps_500000us", self._max_abs_mid_return_bps(WINDOW_500MS_US))
-        setf("down_up_vol_imbalance_1000000us", self._down_up_vol_imbalance(WINDOW_1000MS_US))
-        setf("down_up_vol_imbalance_3000000us", self._down_up_vol_imbalance(WINDOW_3000MS_US))
-        for w, sn in (
-            (WINDOW_500MS_US, "500000us"),
-            (WINDOW_1000MS_US, "1000000us"),
-            (WINDOW_3000MS_US, "3000000us"),
-        ):
-            m = self._rolling_mean("spread_bps", w)
-            sd = self._rolling_std("spread_bps", w)
-            setf(f"spread_z_{sn}", _safe_z(s.spread_bps, m, sd))
-        setf("spread_widening_slope_bps_per_sec_500000us", self._rolling_slope_per_sec("spread_bps", WINDOW_500MS_US))
-        setf("depth_5bps_z_500000us", _safe_z(s.total_depth_5bps_notional, self._rolling_mean("total_depth_5bps_notional", WINDOW_500MS_US), self._rolling_std("total_depth_5bps_notional", WINDOW_500MS_US)))
-        setf("depth_imbalance_5bps_slope_500000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_500MS_US))
-        setf("spread_widening_slope_bps_per_sec_1000000us", self._rolling_slope_per_sec("spread_bps", WINDOW_1000MS_US))
-        setf("depth_imbalance_5bps_mean_1000000us", self._rolling_mean("depth_imbalance_5bps", WINDOW_1000MS_US))
         setf("depth_imbalance_5bps_slope_1000000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_1000MS_US))
-        setf("depth_5bps_z_3000000us", _safe_z(s.total_depth_5bps_notional, self._rolling_mean("total_depth_5bps_notional", WINDOW_3000MS_US), self._rolling_std("total_depth_5bps_notional", WINDOW_3000MS_US)))
         setf("depth_imbalance_5bps_slope_3000000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_3000MS_US))
-        setf("depth_imbalance_realized_vol_1000000us", self._rolling_diff_std("depth_imbalance_5bps", WINDOW_1000MS_US))
         setf("microprice_zero_cross_rate_1000000us", self._zero_cross_rate(WINDOW_1000MS_US))
         setf("l1_churn_over_depth_1000000us", (self._rolling_sum("bid_l1_add", WINDOW_1000MS_US) + self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US) + self._rolling_sum("ask_l1_add", WINDOW_1000MS_US) + self._rolling_sum("ask_l1_rem", WINDOW_1000MS_US)) / max(self._rolling_mean("total_depth_1bps_size", WINDOW_1000MS_US), FLOAT_EPS))
-        setf("ofi_pressure_x_churn_500000us", norm("ofi_l1", WINDOW_500MS_US) * (self._rolling_sum("bid_l1_add", WINDOW_500MS_US) + self._rolling_sum("bid_l1_rem", WINDOW_500MS_US) + self._rolling_sum("ask_l1_add", WINDOW_500MS_US) + self._rolling_sum("ask_l1_rem", WINDOW_500MS_US)) / max(self._rolling_mean("total_depth_1bps_size", WINDOW_500MS_US), FLOAT_EPS))
-        setf("bid_liquidity_void_bps", self._liquidity_void("bid"))
-        setf("ask_liquidity_void_bps", self._liquidity_void("ask"))
         setf("touch_flicker_score_3000000us", (self._rolling_sum("bid_price_changed", WINDOW_3000MS_US) + self._rolling_sum("ask_price_changed", WINDOW_3000MS_US)) / max(self._rolling_count("mid", WINDOW_3000MS_US), 1.0))
         setf("spread_state_transition_rate_3000000us", self._rolling_sum("spread_changed", WINDOW_3000MS_US) / 3.0)
-        setf("ask_depth_centroid_bps_25bps", self._depth_centroid("ask", 25.0))
-        setf("bid_depth_centroid_bps_25bps", self._depth_centroid("bid", 25.0))
         setf("microprice_realized_vol_1000000us", self._rolling_realized_vol_bps("microprice", WINDOW_1000MS_US))
-        setf("ob_arrival_clumpiness_3000000us", self._arrival_clumpiness(WINDOW_3000MS_US))
-        setf("mid_price_run_length_max_3000000us", self._mid_run_length_max(WINDOW_3000MS_US))
-        setf("mid_unchanged_and_depth_stable_us", now - self.depth_stable_start_ts_us)
         setf("best_bid_size_age_us", now - self.bid_size_age_start_ts_us)
         setf("best_ask_size_age_us", now - self.ask_size_age_start_ts_us)
         bd = self._rolling_sum("bid_l1_rem", WINDOW_200MS_US)
@@ -454,4 +405,4 @@ def book_owned_feature_names() -> tuple[str, ...]: return BOOK_FEATURE_NAMES
 
 def book_owned_feature_indices() -> tuple[int, ...]: return BOOK_FEATURE_INDICES
 
-__all__ = ["BOOK_DEPTH","MAX_EMITTED_DEPTH","BID_SIDE_CODE","ASK_SIDE_CODE","BOOK_WINDOWS_US","DEFAULT_HISTORY_CAPACITY","BOOK_FEATURE_INDICES","BOOK_FEATURE_NAMES","BookSnapshotInput","BookSummary","BookHistory","BookState","book_owned_feature_names","book_owned_feature_indices"]
+__all__ = ["BOOK_DEPTH","MAX_EMITTED_DEPTH","BID_SIDE_CODE","ASK_SIDE_CODE","BOOK_WINDOWS_US","DEFAULT_HISTORY_CAPACITY","BOOK_FEATURE_INDICES","BOOK_FEATURE_NAMES","ACTIVE_BOOK_FEATURES","BookSnapshotInput","BookSummary","BookHistory","BookState","book_owned_feature_names","book_owned_feature_indices"]

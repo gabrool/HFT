@@ -11,11 +11,11 @@ import hashlib
 import re
 from typing import Iterable, Mapping, Sequence
 
-FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v2_snapshot25_trades_core146_ctx6_us_corr_pruned"
+FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v3_snapshot25_trades_active44_ctx4_feature_subset_corr90"
 
-CORE_FEATURE_COUNT = 146
-EVENT_CONTEXT_FEATURE_COUNT = 6
-FEATURE_COUNT = 152
+CORE_FEATURE_COUNT = 44
+EVENT_CONTEXT_FEATURE_COUNT = 4
+FEATURE_COUNT = 48
 
 REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH = 25
 MAX_REQUIRED_BOOK_FEATURE_DEPTH = 20
@@ -31,165 +31,61 @@ SUPPORTED_WINDOWS_US = (
 DEFAULT_FEATURE_DTYPE = "float32"
 
 CORE_FEATURE_NAMES = (
-    "micro_ret_bps_200ms",
-    "mid_slope_bps_per_sec_500ms",
-    "mid_range_bps_500ms",
     "mid_slope_bps_per_sec_1000ms",
-    "mid_range_bps_1000ms",
-    "spread_bps",
-    "gap_b_bps",
-    "bsz1",
-    "asz1",
-    "micro_minus_mid_bps",
-    "time_since_trade_ms",
     "time_since_mid_change_ms",
     "bid_l1_notional_usd",
     "ask_l1_notional_usd",
-    "bid_depth_notional_5bps",
-    "ask_depth_notional_5bps",
     "total_depth_notional_5bps",
     "obi_l1",
-    "ofi_l3",
-    "ofi_l3_over_depth_5bps",
-    "ofi_l5_sum_over_depth_200ms",
-    "ofi_l5_sum_over_depth_500ms",
     "ofi_l10_sum_over_depth_1000ms",
-    "ofi_l3_accel_200_minus_500ms",
-    "ofi_l3_accel_500_minus_1000ms",
-    "obi_l3_mean_500ms",
-    "obi_l3_mean_1000ms",
-    "micro_l5_minus_mid_bps",
-    "vamp_l5_minus_mid_bps",
     "micro_l10_minus_mid_bps",
-    "vamp_l10_minus_mid_bps",
-    "micro_l5_slope_200ms",
-    "micro_l5_slope_1000ms",
-    "bid_depth_within_1bps",
     "ask_depth_within_1bps",
     "depth_imbalance_within_1bps",
-    "bid_price_change_rate_200ms",
-    "bid_l1_depletion_200ms",
-    "ask_l1_depletion_200ms",
     "ask_l1_depletion_over_depth_200ms",
-    "bid_price_change_rate_500ms",
-    "bid_l1_depletion_500ms",
     "ask_l1_depletion_500ms",
-    "bid_l1_depletion_over_depth_500ms",
-    "ask_l1_depletion_over_depth_500ms",
     "bid_price_change_rate_1000ms",
     "bid_l1_depletion_1000ms",
-    "ask_l1_depletion_1000ms",
     "bid_l1_depletion_over_depth_1000ms",
     "ask_l1_depletion_over_depth_1000ms",
     "ob_update_rate_200ms",
     "ob_update_rate_500ms",
-    "bid_l1_add_rate_over_depth_200ms",
     "bid_l1_rem_rate_over_depth_200ms",
-    "ask_l1_add_rate_over_depth_200ms",
-    "bid_l1_add_rate_over_depth_500ms",
-    "ask_l1_add_rate_over_depth_500ms",
-    "bid_l1_add_rate_over_depth_1000ms",
-    "ask_l1_add_rate_over_depth_1000ms",
-    "signed_notional_flow_usd_200ms",
-    "signed_trade_count_imbalance_200ms",
-    "trade_toxicity_notional_200ms",
-    "zero_tick_fraction_200ms",
-    "tick_sign_imbalance_200ms",
     "trade_count_per_second_200ms",
-    "vwap_vs_mid_bps_200ms",
-    "signed_trade_count_imbalance_500ms",
     "trade_imbalance_notional_500ms",
-    "trade_toxicity_notional_500ms",
     "trade_count_per_second_500ms",
-    "vwap_vs_mid_bps_500ms",
-    "signed_trade_premium_bps_volume_weighted_500ms",
     "zero_tick_fraction_1000ms",
-    "tick_sign_imbalance_1000ms",
     "trade_count_per_second_1000ms",
-    "signed_trade_premium_bps_volume_weighted_1000ms",
-    "last_trade_side_sign",
-    "last_tick_sign",
     "time_since_last_buy_trade_ms",
     "time_since_last_sell_trade_ms",
-    "cvd_change_usd_500ms",
-    "cvd_minus_ema_usd_500ms",
-    "cvd_change_usd_1000ms",
-    "consecutive_buy_trade_count",
-    "consecutive_sell_trade_count",
-    "top5_trade_notional_sum_usd_200ms",
-    "max_signed_trade_notional_usd_500ms",
-    "top5_trade_notional_sum_usd_500ms",
     "max_signed_trade_notional_usd_1000ms",
-    "top5_trade_notional_sum_usd_1000ms",
-    "absorption_bid_200ms",
-    "absorption_ask_200ms",
-    "absorption_bid_500ms",
-    "absorption_ask_500ms",
     "absorption_bid_1000ms",
     "absorption_ask_1000ms",
-    "return_std_bps_200ms",
-    "regime_volume_ewma_500ms",
-    "down_up_vol_imbalance_500ms",
-    "max_abs_return_bps_500ms",
-    "down_up_vol_imbalance_1000ms",
-    "regime_volume_ewma_3000ms",
-    "down_up_vol_imbalance_3000ms",
-    "spread_z_500ms",
-    "spread_widening_slope_bps_per_sec_500ms",
-    "depth_5bps_z_500ms",
-    "depth_imbalance_5bps_slope_500ms",
-    "spread_z_1000ms",
-    "spread_widening_slope_bps_per_sec_1000ms",
-    "depth_imbalance_5bps_mean_1000ms",
     "depth_imbalance_5bps_slope_1000ms",
-    "spread_z_3000ms",
-    "depth_5bps_z_3000ms",
     "depth_imbalance_5bps_slope_3000ms",
-    "ofi_l1_pressure_over_depth_5bps_200ms",
-    "ofi_l1_pressure_over_realized_vol_200ms",
-    "ofi_l1_pressure_over_depth_5bps_500ms",
-    "ofi_l1_pressure_over_realized_vol_500ms",
     "ofi_l1_pressure_over_realized_vol_1000ms",
-    "top5_trade_share_notional_3000ms",
-    "depth_imbalance_realized_vol_1000ms",
     "microprice_zero_cross_rate_1000ms",
     "l1_churn_over_depth_1000ms",
     "same_side_trade_cluster_notional_1000ms",
-    "ofi_pressure_x_churn_500ms",
-    "bid_liquidity_void_bps",
-    "ask_liquidity_void_bps",
     "touch_flicker_score_3000ms",
     "spread_state_transition_rate_3000ms",
     "max_trade_silence_gap_3000ms",
-    "ask_depth_centroid_bps_25bps",
-    "bid_depth_centroid_bps_25bps",
     "microprice_realized_vol_1000ms",
-    "buy_trade_p90_over_median_3000ms",
-    "sell_trade_p90_over_median_3000ms",
-    "ob_arrival_clumpiness_3000ms",
     "trade_sign_entropy_3000ms",
-    "mid_price_run_length_max_3000ms",
-    "mid_unchanged_and_depth_stable_ms",
     "best_bid_size_age_ms",
     "best_ask_size_age_ms",
-    "opposite_side_replenishment_after_depletion_200ms",
-    "same_side_replenishment_after_depletion_200ms",
     "trade_side_quote_response_asymmetry_500ms",
     "near_touch_depth_drop_asymmetry",
-    "trade_impact_half_life_proxy",
 )
-assert len(CORE_FEATURE_NAMES) == 146
-assert len(set(CORE_FEATURE_NAMES)) == 146
+assert len(CORE_FEATURE_NAMES) == 44
+assert len(set(CORE_FEATURE_NAMES)) == 44
 
 EVENT_CONTEXT_FEATURE_NAMES = (
-    "log_dt_decision_ms",
-    "log_events_100ms",
     "log_events_200ms",
     "log_events_500ms",
     "log_events_1000ms",
     "log_events_3000ms",
 )
-assert len(EVENT_CONTEXT_FEATURE_NAMES) == 6
+assert len(EVENT_CONTEXT_FEATURE_NAMES) == 4
 assert not set(EVENT_CONTEXT_FEATURE_NAMES).intersection(CORE_FEATURE_NAMES)
 
 
@@ -432,7 +328,7 @@ def infer_family(legacy_name: str, source: FeatureSource) -> FeatureFamily:
         return FeatureFamily.REGIME
     if legacy_name == "time_since_trade_ms":
         return FeatureFamily.TRADE_FLOW
-    if legacy_name.startswith("micro_ret") or legacy_name.startswith("mid_") or "microprice" in legacy_name or legacy_name in {"micro_minus_mid_bps"}:
+    if legacy_name.startswith("micro_ret") or legacy_name.startswith("mid_") or "microprice" in legacy_name:
         return FeatureFamily.PRICE
     if legacy_name.startswith("obi_") or legacy_name.startswith("ofi_") or "_ofi_" in legacy_name:
         return FeatureFamily.OFI_OBI
@@ -546,7 +442,7 @@ def _is_slow_regime_feature(legacy_name: str) -> bool:
 
 def _is_fast_microstructure_feature(legacy_name: str, source: FeatureSource, family: FeatureFamily) -> bool:
     if _is_slow_regime_feature(legacy_name) or not _has_window_at_most(legacy_name, 1_000_000):
-        return legacy_name in {"spread_bps", "gap_b_bps", "micro_minus_mid_bps", "ofi_l3", "obi_l1"}
+        return legacy_name in {"spread_bps", "gap_b_bps", "ofi_l3", "obi_l1"}
     return source in {FeatureSource.BOOK, FeatureSource.TRADE, FeatureSource.CROSS} and family in {
         FeatureFamily.PRICE,
         FeatureFamily.OFI_OBI,
@@ -677,9 +573,11 @@ CANONICAL_TO_SOURCE_FEATURE_NAME = {spec.name: spec.legacy_name for spec in FEAT
 FEATURE_NAME_TO_INDEX = {spec.name: spec.index for spec in FEATURE_SPECS}
 
 assert len(FEATURE_SPECS) == FEATURE_COUNT
-assert FEATURE_NAMES[-6:] == (
-    "log_dt_decision_us", "log_events_100000us", "log_events_200000us",
-    "log_events_500000us", "log_events_1000000us", "log_events_3000000us",
+assert FEATURE_NAMES[-4:] == (
+    "log_events_200000us",
+    "log_events_500000us",
+    "log_events_1000000us",
+    "log_events_3000000us",
 )
 assert max(spec.required_book_depth for spec in FEATURE_SPECS) == MAX_REQUIRED_BOOK_FEATURE_DEPTH
 
