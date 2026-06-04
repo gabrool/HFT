@@ -71,7 +71,6 @@ NO_MOVE_FEATURE_SUBSET = (
     "x_microprice_zero_cross_rate_1000000us",
     "x_bid_l1_depletion_1000000us",
     "x_trade_sign_entropy_3000000us",
-    "x_asz1",
     "x_bid_price_change_rate_1000000us",
 )
 
@@ -122,7 +121,7 @@ def _assert_unique_columns(cols: Sequence[str]) -> None:
 
 
 assert len(DIRECTION_FEATURE_SUBSET) == 20
-assert len(NO_MOVE_FEATURE_SUBSET) == 31
+assert len(NO_MOVE_FEATURE_SUBSET) == 30
 assert len(MAGNITUDE_UP_FEATURE_SUBSET) == 13
 assert len(MAGNITUDE_DOWN_FEATURE_SUBSET) == 6
 
@@ -135,6 +134,7 @@ for _cols in (
     _assert_unique_columns(_cols)
 
 assert set(FEATURE_SUBSET_COLUMNS_BY_HEAD) == set(lm.MODEL_HEADS)
+assert "x_asz1" not in NO_MOVE_FEATURE_SUBSET
 assert "x_top5_trade_notional_sum_usd_500000us" not in NO_MOVE_FEATURE_SUBSET
 assert "x_bid_depth_centroid_bps_25bps" not in NO_MOVE_FEATURE_SUBSET
 assert "x_bsz1" not in NO_MOVE_FEATURE_SUBSET
