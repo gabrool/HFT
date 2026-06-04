@@ -80,77 +80,17 @@ def test_train_linear_default_head_feature_preset_is_all() -> None:
     assert cfg.head_feature_config.feature_columns_by_head is None
 
 
-def test_train_linear_accepts_corr_pruned_head_feature_preset() -> None:
+def test_train_linear_accepts_feature_subset_preset() -> None:
     parser = cli.build_arg_parser()
     args = parser.parse_args([
         "--dataset-root", "/tmp/ds",
         "--output-dir", "/tmp/out",
-        "--head-feature-preset", "corr_pruned152_head_subset_v1",
-    ])
-    cfg = cli._config_from_args(args)
-    assert cfg.head_feature_config.feature_columns_by_head is not None
-    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 40
-    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 40
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 30
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 40
-
-
-def test_train_linear_accepts_corr_pruned_v2_head_feature_preset() -> None:
-    parser = cli.build_arg_parser()
-    args = parser.parse_args([
-        "--dataset-root", "/tmp/ds",
-        "--output-dir", "/tmp/out",
-        "--head-feature-preset", "corr_pruned152_head_subset_v2",
-    ])
-    cfg = cli._config_from_args(args)
-    assert cfg.head_feature_config.feature_columns_by_head is not None
-    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 34
-    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 39
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 19
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 9
-
-
-def test_train_linear_accepts_corr_pruned_v3_head_feature_preset() -> None:
-    parser = cli.build_arg_parser()
-    args = parser.parse_args([
-        "--dataset-root", "/tmp/ds",
-        "--output-dir", "/tmp/out",
-        "--head-feature-preset", "corr_pruned152_head_subset_v3",
-    ])
-    cfg = cli._config_from_args(args)
-    assert cfg.head_feature_config.feature_columns_by_head is not None
-    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 25
-    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 38
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 15
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 6
-
-
-def test_train_linear_accepts_corr_pruned_v4_head_feature_preset() -> None:
-    parser = cli.build_arg_parser()
-    args = parser.parse_args([
-        "--dataset-root", "/tmp/ds",
-        "--output-dir", "/tmp/out",
-        "--head-feature-preset", "corr_pruned152_head_subset_v4",
-    ])
-    cfg = cli._config_from_args(args)
-    assert cfg.head_feature_config.feature_columns_by_head is not None
-    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 23
-    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 38
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 14
-    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 6
-
-
-def test_train_linear_accepts_corr_pruned_v5_head_feature_preset() -> None:
-    parser = cli.build_arg_parser()
-    args = parser.parse_args([
-        "--dataset-root", "/tmp/ds",
-        "--output-dir", "/tmp/out",
-        "--head-feature-preset", "corr_pruned152_head_subset_v5",
+        "--head-feature-preset", "feature_subset",
     ])
     cfg = cli._config_from_args(args)
     assert cfg.head_feature_config.feature_columns_by_head is not None
     assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 20
-    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 35
+    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 34
     assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 13
     assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 6
 
@@ -162,6 +102,20 @@ def test_parser_rejects_bad_head_feature_preset() -> None:
             "--dataset-root", "ds",
             "--output-dir", "out",
             "--head-feature-preset", "__missing__",
+        ])
+
+
+@pytest.mark.parametrize(
+    "old_preset",
+    ["corr_" + f"pruned152_head_subset_v{version}" for version in range(1, 6)],
+)
+def test_parser_rejects_old_versioned_head_feature_presets(old_preset: str) -> None:
+    parser = cli.build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--dataset-root", "ds",
+            "--output-dir", "out",
+            "--head-feature-preset", old_preset,
         ])
 
 
