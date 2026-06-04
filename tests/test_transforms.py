@@ -120,9 +120,9 @@ def test_config_validation_and_as_dict():
 
 def test_transform_key_helpers_match_specs():
     assert tr.feature_transform_keys() == tuple(spec.transform_key for spec in specs.FEATURE_SPECS)
-    assert tr.transform_key_for_feature("spread_bps") == TransformKey.IDENTITY_EWMA_FAST
-    assert tr.transform_key_for_feature("time_since_trade_us") == TransformKey.TIME_LOG1P_NO_EWMA
-    assert tr.transform_key_for_feature("last_trade_side_sign") == TransformKey.SIGN_NO_EWMA
+    assert tr.transform_key_for_feature("obi_l1") == TransformKey.IDENTITY_EWMA_FAST
+    assert tr.transform_key_for_feature("time_since_mid_change_us") == TransformKey.TIME_LOG1P_NO_EWMA
+    assert tr.transform_key_for_feature("time_since_last_buy_trade_us") == TransformKey.TIME_LOG1P_NO_EWMA
     ew = set(tr.ewma_feature_indices()); ne = set(tr.no_ewma_feature_indices())
     assert ew | ne == set(range(FEATURE_COUNT))
     assert not (ew & ne)
@@ -130,45 +130,45 @@ def test_transform_key_helpers_match_specs():
 
 def test_base_transform_formulas_representative_features():
     x = raw_zero()
-    set_feature(x, "spread_bps", 12.5)
-    set_feature(x, "log_dt_decision_us", 999.0)
-    set_feature(x, "time_since_trade_us", 999.0)
-    set_feature(x, "signed_notional_flow_usd_200000us", -99.0)
+    set_feature(x, "obi_l1", 12.5)
+    set_feature(x, "log_events_200000us", 999.0)
+    set_feature(x, "time_since_mid_change_us", 999.0)
+    set_feature(x, "max_signed_trade_notional_usd_1000000us", -99.0)
     set_feature(x, "trade_count_per_second_500000us", 9.0)
-    set_feature(x, "last_trade_side_sign", 2.5)
+    set_feature(x, "time_since_last_buy_trade_us", 2.5)
     set_feature(x, "trade_side_quote_response_asymmetry_500000us", 12.0)
     b = tr.base_transform_values(x, cfg())
-    assert val(b, "spread_bps") == 12.5
-    assert val(b, "log_dt_decision_us") == pytest.approx(math.log1p(999.0))
-    assert val(b, "time_since_trade_us") == pytest.approx(math.log1p(999.0))
-    assert val(b, "signed_notional_flow_usd_200000us") == pytest.approx(-math.log1p(99.0))
+    assert val(b, "obi_l1") == 12.5
+    assert val(b, "log_events_200000us") == pytest.approx(math.log1p(999.0))
+    assert val(b, "time_since_mid_change_us") == pytest.approx(math.log1p(999.0))
+    assert val(b, "max_signed_trade_notional_usd_1000000us") == pytest.approx(-math.log1p(99.0))
     assert val(b, "trade_count_per_second_500000us") == pytest.approx(math.log1p(9.0))
-    assert val(b, "last_trade_side_sign") == 1.0
+    assert val(b, "time_since_last_buy_trade_us") == pytest.approx(math.log1p(2.5))
     assert val(b, "trade_side_quote_response_asymmetry_500000us") == 10.0
 
 
 def test_base_transform_nonfinite_inputs_become_zero():
     x = raw_zero()
-    set_feature(x, "spread_bps", np.nan)
-    set_feature(x, "log_dt_decision_us", np.inf)
-    set_feature(x, "signed_notional_flow_usd_200000us", -np.inf)
+    set_feature(x, "obi_l1", np.nan)
+    set_feature(x, "log_events_200000us", np.inf)
+    set_feature(x, "max_signed_trade_notional_usd_1000000us", -np.inf)
     x_before = x.copy()
 
     b = tr.base_transform_values(x, cfg())
 
     assert np.isfinite(b).all()
-    assert val(b, "spread_bps") == 0.0
-    assert val(b, "log_dt_decision_us") == 0.0
-    assert val(b, "signed_notional_flow_usd_200000us") == 0.0
+    assert val(b, "obi_l1") == 0.0
+    assert val(b, "log_events_200000us") == 0.0
+    assert val(b, "max_signed_trade_notional_usd_1000000us") == 0.0
     assert np.array_equal(x, x_before, equal_nan=True)
 
 
 def test_transform_one_local_pre_update_causality():
     t = tr.CausalFeatureTransformer(cfg(min_obs=2, variance_floor=1e-12, output_dtype="float64"))
-    i = feature_index("spread_bps")
-    o1 = t.transform_one_local(1000, set_feature(raw_zero(), "spread_bps", 10.0))
-    o2 = t.transform_one_local(1100, set_feature(raw_zero(), "spread_bps", 12.0))
-    o3 = t.transform_one_local(1200, set_feature(raw_zero(), "spread_bps", 12.0))
+    i = feature_index("obi_l1")
+    o1 = t.transform_one_local(1000, set_feature(raw_zero(), "obi_l1", 10.0))
+    o2 = t.transform_one_local(1100, set_feature(raw_zero(), "obi_l1", 12.0))
+    o3 = t.transform_one_local(1200, set_feature(raw_zero(), "obi_l1", 12.0))
     assert o1[i] == 0.0
     assert o2[i] == 0.0
     assert o3[i] == pytest.approx(1.0)
@@ -176,10 +176,10 @@ def test_transform_one_local_pre_update_causality():
 
 def test_transform_updates_after_output_not_before():
     t = tr.CausalFeatureTransformer(cfg())
-    i = feature_index("spread_bps")
-    t.transform_one_local(1000, set_feature(raw_zero(), "spread_bps", 10.0))
-    t.transform_one_local(1100, set_feature(raw_zero(), "spread_bps", 12.0))
-    o3 = t.transform_one_local(1200, set_feature(raw_zero(), "spread_bps", 100.0))
+    i = feature_index("obi_l1")
+    t.transform_one_local(1000, set_feature(raw_zero(), "obi_l1", 10.0))
+    t.transform_one_local(1100, set_feature(raw_zero(), "obi_l1", 12.0))
+    o3 = t.transform_one_local(1200, set_feature(raw_zero(), "obi_l1", 100.0))
     assert o3[i] == 8.0
 
 
@@ -188,25 +188,25 @@ def test_no_ewma_features_output_immediately():
         1000,
         set_feature(
             set_feature(
-                set_feature(raw_zero(), "last_trade_side_sign", 2.5),
-                "log_dt_decision_us",
+                set_feature(raw_zero(), "time_since_last_buy_trade_us", 2.5),
+                "log_events_200000us",
                 999.0,
             ),
-            "time_since_trade_us",
+            "time_since_mid_change_us",
             999.0,
         ),
     )
-    assert val(o, "last_trade_side_sign") == 1.0
-    assert val(o, "log_dt_decision_us") == pytest.approx(math.log1p(999.0))
-    assert val(o, "time_since_trade_us") == pytest.approx(math.log1p(999.0))
+    assert val(o, "time_since_last_buy_trade_us") == pytest.approx(math.log1p(2.5))
+    assert val(o, "log_events_200000us") == pytest.approx(math.log1p(999.0))
+    assert val(o, "time_since_mid_change_us") == pytest.approx(math.log1p(999.0))
 
 
 def test_equal_timestamps_allowed_and_do_not_move_ewma():
     t = tr.CausalFeatureTransformer(cfg(min_obs=2))
-    i = feature_index("spread_bps")
-    t.transform_one_local(1000, set_feature(raw_zero(), "spread_bps", 10.0))
-    t.transform_one_local(1000, set_feature(raw_zero(), "spread_bps", 20.0))
-    o3 = t.transform_one_local(1100, set_feature(raw_zero(), "spread_bps", 20.0))
+    i = feature_index("obi_l1")
+    t.transform_one_local(1000, set_feature(raw_zero(), "obi_l1", 10.0))
+    t.transform_one_local(1000, set_feature(raw_zero(), "obi_l1", 20.0))
+    o3 = t.transform_one_local(1100, set_feature(raw_zero(), "obi_l1", 20.0))
     assert o3[i] == 0.0
     assert t.mean[i] == pytest.approx(15.0)
 
@@ -220,9 +220,9 @@ def test_decreasing_local_timestamp_rejected():
 
 def test_transform_many_matches_transform_one_loop():
     mat = np.zeros((5, FEATURE_COUNT), dtype=np.float64)
-    set_feature(mat[0], "spread_bps", 10.0); set_feature(mat[1], "spread_bps", 12.0); set_feature(mat[2], "spread_bps", 14.0); set_feature(mat[3], "spread_bps", 16.0); set_feature(mat[4], "spread_bps", 18.0)
+    set_feature(mat[0], "obi_l1", 10.0); set_feature(mat[1], "obi_l1", 12.0); set_feature(mat[2], "obi_l1", 14.0); set_feature(mat[3], "obi_l1", 16.0); set_feature(mat[4], "obi_l1", 18.0)
     for i, s in enumerate([-1.0, 1.0, -1.0, 1.0, 0.0]):
-        set_feature(mat[i], "last_trade_side_sign", s)
+        set_feature(mat[i], "time_since_last_buy_trade_us", s)
     ts = np.array([1000, 1100, 1200, 1300, 1400], dtype=np.int64)
     a = tr.CausalFeatureTransformer(cfg()).transform_many_local(ts, mat)
     t = tr.CausalFeatureTransformer(cfg())
@@ -233,9 +233,9 @@ def test_transform_many_matches_transform_one_loop():
 def test_chunked_snapshot_matches_full_sequence():
     mat = np.zeros((10, FEATURE_COUNT), dtype=np.float64)
     ts = np.arange(1000, 2000, 100, dtype=np.int64)
-    mat[:, feature_index("spread_bps")] = np.linspace(1.0, 10.0, 10)
-    mat[:, feature_index("signed_notional_flow_usd_200000us")] = np.linspace(-50.0, 50.0, 10)
-    mat[:, feature_index("last_trade_side_sign")] = np.array([1 if i % 2 else -1 for i in range(10)], dtype=np.float64)
+    mat[:, feature_index("obi_l1")] = np.linspace(1.0, 10.0, 10)
+    mat[:, feature_index("max_signed_trade_notional_usd_1000000us")] = np.linspace(-50.0, 50.0, 10)
+    mat[:, feature_index("time_since_last_buy_trade_us")] = np.array([1 if i % 2 else -1 for i in range(10)], dtype=np.float64)
 
     full_out, full_snap, _ = tr.transform_feature_matrix_causal_local(ts, mat, cfg())
     p1, snap1, _ = tr.transform_feature_matrix_causal_local(ts[:4], mat[:4], cfg())
@@ -257,10 +257,10 @@ def test_chunked_snapshot_matches_full_sequence():
 def test_snapshot_load_and_reset():
     t1 = tr.CausalFeatureTransformer(cfg())
     for j, v in enumerate([10.0, 12.0, 14.0]):
-        t1.transform_one_local(1000 + j * 100, set_feature(raw_zero(), "spread_bps", v))
+        t1.transform_one_local(1000 + j * 100, set_feature(raw_zero(), "obi_l1", v))
     snap = t1.snapshot()
     t2 = tr.CausalFeatureTransformer(cfg(), snapshot=snap)
-    r4 = set_feature(raw_zero(), "spread_bps", 16.0)
+    r4 = set_feature(raw_zero(), "obi_l1", 16.0)
     o1 = t1.transform_one_local(1300, r4)
     o2 = t2.transform_one_local(1300, r4)
     assert np.allclose(o1, o2)
@@ -317,17 +317,17 @@ def test_diagnostics_counts():
     t = tr.CausalFeatureTransformer(c)
     rows = []
     r1 = raw_zero()
-    set_feature(r1, "spread_bps", 0.0)
-    set_feature(r1, "signed_notional_flow_usd_200000us", 0.0)
+    set_feature(r1, "obi_l1", 0.0)
+    set_feature(r1, "max_signed_trade_notional_usd_1000000us", 0.0)
     set_feature(r1, "trade_side_quote_response_asymmetry_500000us", 0.0)
-    set_feature(r1, "last_trade_side_sign", 0.0)
+    set_feature(r1, "time_since_last_buy_trade_us", 0.0)
     rows.append((1000, r1))
-    rows.append((1100, set_feature(raw_zero(), "spread_bps", 2.0)))
+    rows.append((1100, set_feature(raw_zero(), "obi_l1", 2.0)))
     r3 = raw_zero()
-    set_feature(r3, "spread_bps", 100.0)
-    set_feature(r3, "micro_ret_bps_200000us", 100.0)
+    set_feature(r3, "obi_l1", 100.0)
+    set_feature(r3, "micro_l10_minus_mid_bps", 100.0)
     set_feature(r3, "trade_side_quote_response_asymmetry_500000us", 3.0)
-    set_feature(r3, "last_trade_side_sign", 3.0)
+    set_feature(r3, "time_since_last_buy_trade_us", 3.0)
     set_feature(r3, "trade_count_per_second_500000us", np.inf)
     rows.append((1200, r3))
     for ts, row in rows:
@@ -383,15 +383,15 @@ def test_transform_feature_matrix_validates_inputs():
 
 def test_input_arrays_not_mutated():
     x = raw_zero()
-    set_feature(x, "spread_bps", np.nan)
-    set_feature(x, "signed_notional_flow_usd_200000us", 123.0)
+    set_feature(x, "obi_l1", np.nan)
+    set_feature(x, "max_signed_trade_notional_usd_1000000us", 123.0)
     x_before = x.copy()
     tr.CausalFeatureTransformer(cfg()).transform_one_local(1000, x)
     assert np.array_equal(x, x_before, equal_nan=True)
 
     mat = np.vstack([raw_zero(), raw_zero()])
-    set_feature(mat[0], "spread_bps", np.nan)
-    set_feature(mat[1], "spread_bps", 5.0)
+    set_feature(mat[0], "obi_l1", np.nan)
+    set_feature(mat[1], "obi_l1", 5.0)
     ts = np.array([1000.0, 1100.0], dtype=np.float64)
     mat_before = mat.copy()
     ts_before = ts.copy()
@@ -447,9 +447,6 @@ def test_log_ewma_half_life_classes_use_configured_half_lives():
 
     assert t._half_life_us_by_index[first_index(TransformKey.LOG1P_POS_EWMA_FAST)] == 11
     assert t._half_life_us_by_index[first_index(TransformKey.LOG1P_POS_EWMA_MEDIUM)] == 22
-    assert t._half_life_us_by_index[first_index(TransformKey.LOG1P_POS_EWMA_SLOW)] == 33
-    assert t._half_life_us_by_index[first_index(TransformKey.SIGNED_LOG1P_EWMA_FAST)] == 11
-    assert t._half_life_us_by_index[first_index(TransformKey.SIGNED_LOG1P_EWMA_MEDIUM)] == 22
 
 
 def test_no_global_fit_api():

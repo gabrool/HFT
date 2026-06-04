@@ -39,6 +39,20 @@ FLOAT_EPS = 1e-12
 TRADE_FEATURE_INDICES = feature_indices_by_source(FeatureSource.TRADE)
 TRADE_FEATURE_NAMES = tuple(FEATURE_NAMES[i] for i in TRADE_FEATURE_INDICES)
 TRADE_FEATURE_NAME_SET = frozenset(TRADE_FEATURE_NAMES)
+ACTIVE_TRADE_FEATURES = {
+    "trade_count_per_second_200000us",
+    "trade_imbalance_notional_500000us",
+    "trade_count_per_second_500000us",
+    "zero_tick_fraction_1000000us",
+    "trade_count_per_second_1000000us",
+    "time_since_last_buy_trade_us",
+    "time_since_last_sell_trade_us",
+    "max_signed_trade_notional_usd_1000000us",
+    "same_side_trade_cluster_notional_1000000us",
+    "max_trade_silence_gap_3000000us",
+    "trade_sign_entropy_3000000us",
+}
+assert TRADE_FEATURE_NAME_SET == ACTIVE_TRADE_FEATURES
 
 assert TRADE_FEATURE_INDICES
 assert all(FEATURE_SPECS[i].source == FeatureSource.TRADE for i in TRADE_FEATURE_INDICES)
@@ -448,59 +462,16 @@ class TradeState:
         s200 = self._window_trade_stats(WINDOW_200MS_US, now)
         s500 = self._window_trade_stats(WINDOW_500MS_US, now)
         s1000 = self._window_trade_stats(WINDOW_1000MS_US, now)
-        s3000 = self._window_trade_stats(WINDOW_3000MS_US, now)
-        setf("time_since_trade_us", float(now - self.last_local_ts_us))
-        setf("last_trade_side_sign", float(self.last_side_code))
-        setf("last_tick_sign", float(self.last_tick_sign))
+        setf("trade_count_per_second_200000us", s200["trade_count_per_second"])
+        setf("trade_imbalance_notional_500000us", s500["trade_imbalance_notional"])
+        setf("trade_count_per_second_500000us", s500["trade_count_per_second"])
+        setf("zero_tick_fraction_1000000us", s1000["zero_tick_fraction"])
+        setf("trade_count_per_second_1000000us", s1000["trade_count_per_second"])
         setf("time_since_last_buy_trade_us", float(0 if self.last_buy_trade_ts_us is None else now - self.last_buy_trade_ts_us))
         setf("time_since_last_sell_trade_us", float(0 if self.last_sell_trade_ts_us is None else now - self.last_sell_trade_ts_us))
-        setf("consecutive_buy_trade_count", float(self.consecutive_buy_trade_count))
-        setf("consecutive_sell_trade_count", float(self.consecutive_sell_trade_count))
-        setf("signed_notional_flow_usd_200000us", s200["signed_notional"])
-        setf("signed_trade_count_imbalance_200000us", s200["signed_trade_count_imbalance"])
-        setf("trade_toxicity_notional_200000us", s200["trade_toxicity_notional"])
-        setf("zero_tick_fraction_200000us", s200["zero_tick_fraction"])
-        setf("tick_sign_imbalance_200000us", s200["tick_sign_imbalance"])
-        setf("trade_count_per_second_200000us", s200["trade_count_per_second"])
-        setf("top5_trade_notional_sum_usd_200000us", s200["top5_trade_notional_sum"])
-        setf("signed_trade_count_imbalance_500000us", s500["signed_trade_count_imbalance"])
-        setf("trade_imbalance_notional_500000us", s500["trade_imbalance_notional"])
-        setf("trade_toxicity_notional_500000us", s500["trade_toxicity_notional"])
-        setf("trade_count_per_second_500000us", s500["trade_count_per_second"])
-        setf("signed_trade_premium_bps_volume_weighted_500000us", s500["signed_trade_premium_bps_volume_weighted"])
-        setf("cvd_change_usd_500000us", self._cvd_change(WINDOW_500MS_US, now))
-        setf("cvd_minus_ema_usd_500000us", self.cvd_notional - self._cvd_ema(WINDOW_500MS_US, now))
-        setf("max_signed_trade_notional_usd_500000us", s500["max_signed_trade_notional"])
-        setf("top5_trade_notional_sum_usd_500000us", s500["top5_trade_notional_sum"])
-        vals500 = self._window_values("notional", WINDOW_500MS_US, now)
-        
-        ew500 = 0.0
-        if vals500.size:
-            alpha500 = 2.0 / (vals500.size + 1.0)
-            ew500 = float(vals500[0])
-            for v in vals500[1:]:
-                ew500 = alpha500 * float(v) + (1.0 - alpha500) * ew500
-        setf("regime_volume_ewma_500000us", ew500)
-        setf("zero_tick_fraction_1000000us", s1000["zero_tick_fraction"])
-        setf("tick_sign_imbalance_1000000us", s1000["tick_sign_imbalance"])
-        setf("trade_count_per_second_1000000us", s1000["trade_count_per_second"])
-        setf("signed_trade_premium_bps_volume_weighted_1000000us", s1000["signed_trade_premium_bps_volume_weighted"])
-        setf("cvd_change_usd_1000000us", self._cvd_change(WINDOW_1000MS_US, now))
         setf("max_signed_trade_notional_usd_1000000us", s1000["max_signed_trade_notional"])
-        setf("top5_trade_notional_sum_usd_1000000us", s1000["top5_trade_notional_sum"])
         setf("same_side_trade_cluster_notional_1000000us", self._same_side_trade_cluster_notional(WINDOW_1000MS_US, now))
-        vals3000 = self._window_values("notional", WINDOW_3000MS_US, now)
-        ew = 0.0
-        if vals3000.size:
-            alpha = 2.0 / (vals3000.size + 1.0)
-            ew = float(vals3000[0])
-            for v in vals3000[1:]:
-                ew = alpha * float(v) + (1.0 - alpha) * ew
-        setf("regime_volume_ewma_3000000us", ew)
-        setf("top5_trade_share_notional_3000000us", s3000["top5_trade_share_notional"])
         setf("max_trade_silence_gap_3000000us", self._max_trade_silence_gap(WINDOW_3000MS_US, now))
-        setf("buy_trade_p90_over_median_3000000us", self._p90_over_median(BUY_SIDE_CODE, WINDOW_3000MS_US, now))
-        setf("sell_trade_p90_over_median_3000000us", self._p90_over_median(SELL_SIDE_CODE, WINDOW_3000MS_US, now))
         setf("trade_sign_entropy_3000000us", self._trade_sign_entropy(WINDOW_3000MS_US, now))
         missing = TRADE_FEATURE_NAME_SET - assigned
         extra = assigned - TRADE_FEATURE_NAME_SET
@@ -523,6 +494,6 @@ def trade_owned_feature_indices() -> tuple[int, ...]:
 
 __all__ = (
     "BUY_SIDE_CODE", "SELL_SIDE_CODE", "UNKNOWN_SIDE_CODE", "TRADE_WINDOWS_US", "DEFAULT_HISTORY_CAPACITY",
-    "TRADE_FEATURE_INDICES", "TRADE_FEATURE_NAMES", "TradeInput", "TradeSummary", "TradeHistory", "TradeState",
+    "TRADE_FEATURE_INDICES", "TRADE_FEATURE_NAMES", "ACTIVE_TRADE_FEATURES", "TradeInput", "TradeSummary", "TradeHistory", "TradeState",
     "trade_owned_feature_names", "trade_owned_feature_indices",
 )

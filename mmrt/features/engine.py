@@ -60,18 +60,22 @@ assert EVENT_CONTEXT_FEATURE_INDICES
 assert all(FEATURE_SPECS[i].source == FeatureSource.CROSS for i in CROSS_FEATURE_INDICES)
 assert all(FEATURE_SPECS[i].source == FeatureSource.EVENT_CONTEXT for i in EVENT_CONTEXT_FEATURE_INDICES)
 assert len(ENGINE_FEATURE_NAMES) == len(ENGINE_FEATURE_NAME_SET)
-for n in (
-    "vwap_vs_mid_bps_200000us", "vwap_vs_mid_bps_500000us", "absorption_bid_200000us", "absorption_ask_200000us",
-    "absorption_bid_500000us", "absorption_ask_500000us", "absorption_bid_1000000us", "absorption_ask_1000000us",
-    "ofi_l1_pressure_over_depth_5bps_200000us", "ofi_l1_pressure_over_realized_vol_200000us",
-    "ofi_l1_pressure_over_depth_5bps_500000us", "ofi_l1_pressure_over_realized_vol_500000us",
+ACTIVE_CROSS_FEATURES = {
+    "absorption_bid_1000000us",
+    "absorption_ask_1000000us",
     "ofi_l1_pressure_over_realized_vol_1000000us",
-    "opposite_side_replenishment_after_depletion_200000us", "same_side_replenishment_after_depletion_200000us",
-    "trade_side_quote_response_asymmetry_500000us", "trade_impact_half_life_proxy",
-):
-    assert n in CROSS_FEATURE_NAME_SET
-for n in ("log_dt_decision_us", "log_events_100000us", "log_events_200000us", "log_events_500000us", "log_events_1000000us", "log_events_3000000us"):
-    assert n in EVENT_CONTEXT_FEATURE_NAME_SET
+    "trade_side_quote_response_asymmetry_500000us",
+}
+
+ACTIVE_EVENT_CONTEXT_FEATURES = {
+    "log_events_200000us",
+    "log_events_500000us",
+    "log_events_1000000us",
+    "log_events_3000000us",
+}
+
+assert CROSS_FEATURE_NAME_SET == ACTIVE_CROSS_FEATURES
+assert EVENT_CONTEXT_FEATURE_NAME_SET == ACTIVE_EVENT_CONTEXT_FEATURES
 
 
 def _require_int(value: int, name: str, *, positive: bool = False) -> int:
@@ -321,49 +325,37 @@ class FeatureEngine:
             assigned.add(name)
 
         s = self._book_current_summary()
-        mid = s.mid
-        vwap_200 = self._trade_vwap(WINDOW_200MS_US, now)
-        vwap_500 = self._trade_vwap(WINDOW_500MS_US, now)
-        vwap_vs_mid_200 = 0.0 if mid <= 0.0 or vwap_200 <= 0.0 else _safe_bps_change(vwap_200, mid)
-        vwap_vs_mid_500 = 0.0 if mid <= 0.0 or vwap_500 <= 0.0 else _safe_bps_change(vwap_500, mid)
-        setf("vwap_vs_mid_bps_200000us", vwap_vs_mid_200)
-        setf("vwap_vs_mid_bps_500000us", vwap_vs_mid_500)
+        buy_n = self._trade_buy_notional(WINDOW_1000MS_US, now)
+        sell_n = self._trade_sell_notional(WINDOW_1000MS_US, now)
+        total = buy_n + sell_n
+        bid_add = self._book_sum("bid_l1_add", WINDOW_1000MS_US, now)
+        bid_rem = self._book_sum("bid_l1_rem", WINDOW_1000MS_US, now)
+        ask_add = self._book_sum("ask_l1_add", WINDOW_1000MS_US, now)
+        ask_rem = self._book_sum("ask_l1_rem", WINDOW_1000MS_US, now)
+        bid_rr = self._replenishment_ratio(bid_add, bid_rem)
+        ask_rr = self._replenishment_ratio(ask_add, ask_rem)
+        setf("absorption_bid_1000000us", _safe_div(sell_n, max(total, FLOAT_EPS), 0.0) * bid_rr)
+        setf("absorption_ask_1000000us", _safe_div(buy_n, max(total, FLOAT_EPS), 0.0) * ask_rr)
+        ofi_pressure = self._book_sum("ofi_l1", WINDOW_1000MS_US, now)
+        p_over_d = _safe_div(ofi_pressure, max(s.total_depth_5bps_size, FLOAT_EPS), 0.0)
+        rv = self._book_realized_vol_bps("microprice", WINDOW_1000MS_US, now)
+        setf("ofi_l1_pressure_over_realized_vol_1000000us", 0.0 if rv <= FLOAT_EPS else _safe_div(p_over_d, max(rv, FLOAT_EPS), 0.0))
 
-        for w in (WINDOW_200MS_US, WINDOW_500MS_US, WINDOW_1000MS_US):
-            buy_n = self._trade_buy_notional(w, now)
-            sell_n = self._trade_sell_notional(w, now)
-            total = buy_n + sell_n
-            bid_add = self._book_sum("bid_l1_add", w, now)
-            bid_rem = self._book_sum("bid_l1_rem", w, now)
-            ask_add = self._book_sum("ask_l1_add", w, now)
-            ask_rem = self._book_sum("ask_l1_rem", w, now)
-            bid_rr = self._replenishment_ratio(bid_add, bid_rem)
-            ask_rr = self._replenishment_ratio(ask_add, ask_rem)
-            ab = _safe_div(sell_n, max(total, FLOAT_EPS), 0.0) * bid_rr
-            aa = _safe_div(buy_n, max(total, FLOAT_EPS), 0.0) * ask_rr
-            setf(f"absorption_bid_{w}us", ab)
-            setf(f"absorption_ask_{w}us", aa)
-            ofi_pressure = self._book_sum("ofi_l1", w, now)
-            p_over_d = _safe_div(ofi_pressure, max(s.total_depth_5bps_size, FLOAT_EPS), 0.0)
-            if w in (WINDOW_200MS_US, WINDOW_500MS_US):
-                setf(f"ofi_l1_pressure_over_depth_5bps_{w}us", p_over_d)
-            rv = self._book_realized_vol_bps("microprice", w, now)
-            setf(f"ofi_l1_pressure_over_realized_vol_{w}us", 0.0 if rv <= FLOAT_EPS else _safe_div(p_over_d, max(rv, FLOAT_EPS), 0.0))
-            if w == WINDOW_500MS_US:
-                buy_share = _safe_div(buy_n, max(total, FLOAT_EPS), 0.0)
-                sell_share = _safe_div(sell_n, max(total, FLOAT_EPS), 0.0)
-                setf("trade_side_quote_response_asymmetry_500000us", buy_share * ask_rr - sell_share * bid_rr)
-            if w == WINDOW_200MS_US:
-                depth = max(s.total_depth_5bps_size, FLOAT_EPS)
-                setf("same_side_replenishment_after_depletion_200000us", (min(bid_add, bid_rem) + min(ask_add, ask_rem)) / depth)
-                setf("opposite_side_replenishment_after_depletion_200000us", (min(bid_add, ask_rem) + min(ask_add, bid_rem)) / depth)
+        buy_500 = self._trade_buy_notional(WINDOW_500MS_US, now)
+        sell_500 = self._trade_sell_notional(WINDOW_500MS_US, now)
+        total_500 = buy_500 + sell_500
+        bid_rr_500 = self._replenishment_ratio(
+            self._book_sum("bid_l1_add", WINDOW_500MS_US, now),
+            self._book_sum("bid_l1_rem", WINDOW_500MS_US, now),
+        )
+        ask_rr_500 = self._replenishment_ratio(
+            self._book_sum("ask_l1_add", WINDOW_500MS_US, now),
+            self._book_sum("ask_l1_rem", WINDOW_500MS_US, now),
+        )
+        buy_share = _safe_div(buy_500, max(total_500, FLOAT_EPS), 0.0)
+        sell_share = _safe_div(sell_500, max(total_500, FLOAT_EPS), 0.0)
+        setf("trade_side_quote_response_asymmetry_500000us", buy_share * ask_rr_500 - sell_share * bid_rr_500)
 
-        impact_200 = abs(vwap_vs_mid_200)
-        impact_500 = abs(vwap_vs_mid_500)
-        setf("trade_impact_half_life_proxy", 0.0 if impact_200 <= FLOAT_EPS else min(max(impact_500 / impact_200, 0.0), 10.0))
-        dt = 0 if previous_decision_local_ts_us is None else max(0, now - previous_decision_local_ts_us)
-        setf("log_dt_decision_us", _safe_log1p(dt))
-        setf("log_events_100000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_100MS_US)))
         setf("log_events_200000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_200MS_US)))
         setf("log_events_500000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_500MS_US)))
         setf("log_events_1000000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_1000MS_US)))
@@ -371,7 +363,8 @@ class FeatureEngine:
 
         missing = ENGINE_FEATURE_NAME_SET - assigned
         extra = assigned - ENGINE_FEATURE_NAME_SET
-        if missing or extra: raise RuntimeError("feature assignment mismatch")
+        if missing or extra:
+            raise RuntimeError("feature assignment mismatch")
         return arr
 
 

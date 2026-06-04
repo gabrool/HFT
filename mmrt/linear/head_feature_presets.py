@@ -19,79 +19,71 @@ AVAILABLE_HEAD_FEATURE_PRESETS = (
 )
 
 DIRECTION_FEATURE_SUBSET = (
-    "x_depth_imbalance_within_1bps",
-    "x_depth_imbalance_5bps_mean_1000000us",
-    "x_ask_l1_notional_usd",
     "x_bid_l1_notional_usd",
-    "x_trade_side_quote_response_asymmetry_500000us",
-    "x_trade_imbalance_notional_500000us",
+    "x_ask_l1_notional_usd",
     "x_obi_l1",
     "x_ofi_l10_sum_over_depth_1000000us",
-    "x_near_touch_depth_drop_asymmetry",
-    "x_max_signed_trade_notional_usd_1000000us",
-    "x_ofi_l1_pressure_over_realized_vol_1000000us",
-    "x_cvd_change_usd_1000000us",
-    "x_best_ask_size_age_us",
-    "x_absorption_bid_1000000us",
-    "x_depth_imbalance_5bps_slope_3000000us",
-    "x_absorption_ask_1000000us",
-    "x_best_bid_size_age_us",
+    "x_depth_imbalance_within_1bps",
+    "x_trade_imbalance_notional_500000us",
     "x_time_since_last_buy_trade_us",
-    "x_micro_minus_mid_bps",
     "x_time_since_last_sell_trade_us",
+    "x_max_signed_trade_notional_usd_1000000us",
+    "x_absorption_bid_1000000us",
+    "x_absorption_ask_1000000us",
+    "x_depth_imbalance_5bps_slope_3000000us",
+    "x_ofi_l1_pressure_over_realized_vol_1000000us",
+    "x_best_bid_size_age_us",
+    "x_best_ask_size_age_us",
+    "x_trade_side_quote_response_asymmetry_500000us",
+    "x_near_touch_depth_drop_asymmetry",
 )
 
 NO_MOVE_FEATURE_SUBSET = (
-    "x_ask_l1_notional_usd",
-    "x_bid_l1_notional_usd",
-    "x_total_depth_notional_5bps",
-    "x_spread_state_transition_rate_3000000us",
-    "x_log_events_500000us",
-    "x_touch_flicker_score_3000000us",
-    "x_log_events_1000000us",
-    "x_l1_churn_over_depth_1000000us",
     "x_time_since_mid_change_us",
-    "x_log_events_3000000us",
-    "x_ask_depth_notional_5bps",
-    "x_bid_depth_notional_5bps",
-    "x_ob_update_rate_500000us",
-    "x_log_events_200000us",
-    "x_ask_l1_depletion_over_depth_1000000us",
-    "x_trade_count_per_second_1000000us",
-    "x_trade_count_per_second_200000us",
-    "x_time_since_last_buy_trade_us",
-    "x_bid_l1_depletion_over_depth_1000000us",
-    "x_time_since_last_sell_trade_us",
-    "x_ob_update_rate_200000us",
-    "x_bid_l1_rem_rate_over_depth_200000us",
-    "x_zero_tick_fraction_1000000us",
-    "x_microprice_realized_vol_1000000us",
-    "x_same_side_trade_cluster_notional_1000000us",
-    "x_trade_count_per_second_500000us",
-    "x_microprice_zero_cross_rate_1000000us",
-    "x_bid_l1_depletion_1000000us",
-    "x_trade_sign_entropy_3000000us",
+    "x_bid_l1_notional_usd",
+    "x_ask_l1_notional_usd",
+    "x_total_depth_notional_5bps",
     "x_bid_price_change_rate_1000000us",
+    "x_bid_l1_depletion_1000000us",
+    "x_bid_l1_depletion_over_depth_1000000us",
+    "x_ask_l1_depletion_over_depth_1000000us",
+    "x_ob_update_rate_200000us",
+    "x_ob_update_rate_500000us",
+    "x_bid_l1_rem_rate_over_depth_200000us",
+    "x_trade_count_per_second_200000us",
+    "x_trade_count_per_second_500000us",
+    "x_zero_tick_fraction_1000000us",
+    "x_trade_count_per_second_1000000us",
+    "x_time_since_last_buy_trade_us",
+    "x_time_since_last_sell_trade_us",
+    "x_microprice_zero_cross_rate_1000000us",
+    "x_l1_churn_over_depth_1000000us",
+    "x_same_side_trade_cluster_notional_1000000us",
+    "x_touch_flicker_score_3000000us",
+    "x_spread_state_transition_rate_3000000us",
+    "x_microprice_realized_vol_1000000us",
+    "x_trade_sign_entropy_3000000us",
+    "x_log_events_200000us",
+    "x_log_events_500000us",
+    "x_log_events_1000000us",
+    "x_log_events_3000000us",
 )
 
 MAGNITUDE_UP_FEATURE_SUBSET = (
+    "x_ofi_l10_sum_over_depth_1000000us",
+    "x_micro_l10_minus_mid_bps",
+    "x_ask_depth_within_1bps",
+    "x_ask_l1_depletion_over_depth_200000us",
+    "x_ask_l1_depletion_500000us",
+    "x_bid_l1_depletion_over_depth_1000000us",
+    "x_ob_update_rate_500000us",
     "x_trade_count_per_second_1000000us",
-    "x_bid_depth_notional_5bps",
+    "x_depth_imbalance_5bps_slope_1000000us",
     "x_trade_sign_entropy_3000000us",
     "x_log_events_1000000us",
-    "x_ask_depth_within_1bps",
-    "x_ob_update_rate_500000us",
-    "x_ask_l1_depletion_500000us",
-    "x_ask_depth_notional_5bps",
-    "x_depth_imbalance_5bps_slope_1000000us",
-    "x_micro_l10_minus_mid_bps",
-    "x_ask_l1_depletion_over_depth_200000us",
-    "x_bid_l1_depletion_over_depth_1000000us",
-    "x_ofi_l10_sum_over_depth_1000000us",
 )
 
 MAGNITUDE_DOWN_FEATURE_SUBSET = (
-    "x_bid_depth_notional_5bps",
     "x_touch_flicker_score_3000000us",
     "x_max_trade_silence_gap_3000000us",
     "x_ob_update_rate_500000us",
@@ -120,10 +112,10 @@ def _assert_unique_columns(cols: Sequence[str]) -> None:
     assert len(cols) == len(set(cols))
 
 
-assert len(DIRECTION_FEATURE_SUBSET) == 20
-assert len(NO_MOVE_FEATURE_SUBSET) == 30
-assert len(MAGNITUDE_UP_FEATURE_SUBSET) == 13
-assert len(MAGNITUDE_DOWN_FEATURE_SUBSET) == 6
+assert len(DIRECTION_FEATURE_SUBSET) == 17
+assert len(NO_MOVE_FEATURE_SUBSET) == 28
+assert len(MAGNITUDE_UP_FEATURE_SUBSET) == 11
+assert len(MAGNITUDE_DOWN_FEATURE_SUBSET) == 5
 
 for _cols in (
     DIRECTION_FEATURE_SUBSET,
@@ -134,6 +126,18 @@ for _cols in (
     _assert_unique_columns(_cols)
 
 assert set(FEATURE_SUBSET_COLUMNS_BY_HEAD) == set(lm.MODEL_HEADS)
+
+_CORR90_REMOVED_FEATURES = {
+    "x_depth_imbalance_5bps_mean_1000000us",
+    "x_ask_depth_notional_5bps",
+    "x_bid_depth_notional_5bps",
+    "x_micro_minus_mid_bps",
+    "x_cvd_change_usd_1000000us",
+}
+
+for _cols in FEATURE_SUBSET_COLUMNS_BY_HEAD.values():
+    assert not _CORR90_REMOVED_FEATURES.intersection(_cols)
+
 assert "x_asz1" not in NO_MOVE_FEATURE_SUBSET
 assert "x_top5_trade_notional_sum_usd_500000us" not in NO_MOVE_FEATURE_SUBSET
 assert "x_bid_depth_centroid_bps_25bps" not in NO_MOVE_FEATURE_SUBSET

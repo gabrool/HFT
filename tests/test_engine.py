@@ -188,7 +188,7 @@ def test_engine_first_decision_at_early_timestamp_does_not_crash_trade_asof():
     assert d is not None
     assert d.local_ts_us == 1_000_000
     assert np.all(np.isfinite(d.feature_vector))
-    assert fv_value(d.feature_vector, "cvd_change_usd_1000000us") == pytest.approx(200.0)
+    assert fv_value(d.feature_vector, "max_signed_trade_notional_usd_1000000us") == pytest.approx(200.0)
 
 
 def test_trade_events_never_emit_decisions():
@@ -270,10 +270,10 @@ def test_feature_vector_shape_and_all_finite():
 def test_non_engine_features_filled_by_states_and_engine_features_filled_by_engine():
     e, d = feed_ready_engine()
     assert np.all(np.isfinite(d.feature_vector))
-    assert math.isfinite(fv_value(d.feature_vector, "spread_bps"))
-    assert math.isfinite(fv_value(d.feature_vector, "signed_notional_flow_usd_200000us"))
-    assert math.isfinite(fv_value(d.feature_vector, "vwap_vs_mid_bps_200000us"))
-    assert math.isfinite(fv_value(d.feature_vector, "log_events_100000us"))
+    assert math.isfinite(fv_value(d.feature_vector, "obi_l1"))
+    assert math.isfinite(fv_value(d.feature_vector, "trade_count_per_second_200000us"))
+    assert math.isfinite(fv_value(d.feature_vector, "absorption_bid_1000000us"))
+    assert math.isfinite(fv_value(d.feature_vector, "log_events_200000us"))
 
 
 def test_engine_owned_indices_match_specs():
@@ -285,18 +285,8 @@ def test_engine_owned_indices_match_specs():
     assert eg.cross_feature_names() == tuple(spec.name for spec in FEATURE_SPECS if spec.source == FeatureSource.CROSS)
     assert eg.event_context_feature_names() == tuple(spec.name for spec in FEATURE_SPECS if spec.source == FeatureSource.EVENT_CONTEXT)
     assert eg.engine_owned_feature_names() == eg.cross_feature_names() + eg.event_context_feature_names()
-    for n in ("spread_bps", "micro_ret_bps_200000us", "signed_notional_flow_usd_200000us", "cvd_change_usd_500000us"):
+    for n in ("obi_l1", "trade_count_per_second_200000us", "max_signed_trade_notional_usd_1000000us"):
         assert n not in set(eg.engine_owned_feature_names())
-
-
-def test_vwap_vs_mid_formula_manual():
-    e = eg.FeatureEngine()
-    e.on_trade(make_trade(2_000_000, 101.0, 2.0, BUY_SIDE_CODE))
-    d = e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
-    assert d is not None
-    expect = k.bps_change(101.0, 100.0)
-    assert fv_value(d.feature_vector, "vwap_vs_mid_bps_200000us") == pytest.approx(expect)
-    assert fv_value(d.feature_vector, "vwap_vs_mid_bps_500000us") == pytest.approx(expect)
 
 
 def test_absorption_formula_manual():
@@ -307,17 +297,17 @@ def test_absorption_formula_manual():
     e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
     vec = e.build_feature_vector()
     eps = eg.FLOAT_EPS
-    bid_add = e._book_sum("bid_l1_add", 200_000, 2_100_000)
-    bid_rem = e._book_sum("bid_l1_rem", 200_000, 2_100_000)
-    ask_add = e._book_sum("ask_l1_add", 200_000, 2_100_000)
-    ask_rem = e._book_sum("ask_l1_rem", 200_000, 2_100_000)
-    buy_n = e._trade_buy_notional(200_000, 2_100_000)
-    sell_n = e._trade_sell_notional(200_000, 2_100_000)
+    bid_add = e._book_sum("bid_l1_add", 1_000_000, 2_100_000)
+    bid_rem = e._book_sum("bid_l1_rem", 1_000_000, 2_100_000)
+    ask_add = e._book_sum("ask_l1_add", 1_000_000, 2_100_000)
+    ask_rem = e._book_sum("ask_l1_rem", 1_000_000, 2_100_000)
+    buy_n = e._trade_buy_notional(1_000_000, 2_100_000)
+    sell_n = e._trade_sell_notional(1_000_000, 2_100_000)
     total = buy_n + sell_n
     expected_bid = (sell_n / total) * (bid_add / max(bid_add + bid_rem, eps))
     expected_ask = (buy_n / total) * (ask_add / max(ask_add + ask_rem, eps))
-    assert fv_value(vec, "absorption_bid_200000us") == pytest.approx(expected_bid)
-    assert fv_value(vec, "absorption_ask_200000us") == pytest.approx(expected_ask)
+    assert fv_value(vec, "absorption_bid_1000000us") == pytest.approx(expected_bid)
+    assert fv_value(vec, "absorption_ask_1000000us") == pytest.approx(expected_ask)
 
 
 def test_ofi_pressure_formulas_manual():
@@ -328,13 +318,12 @@ def test_ofi_pressure_formulas_manual():
     e.on_book_snapshot(make_snapshot(2_100_000, mid=100.2, bid_sz0=11.0, ask_sz0=9.0))
     vec = e.build_feature_vector()
     now = e.book_state.last_local_ts_us
-    ofi_pressure = e._book_sum("ofi_l1", 200_000, now)
+    ofi_pressure = e._book_sum("ofi_l1", 1_000_000, now)
     depth = e.book_state.current_summary().total_depth_5bps_size
     expected_depth = ofi_pressure / depth
-    rv = e._book_realized_vol_bps("microprice", 200_000, now)
+    rv = e._book_realized_vol_bps("microprice", 1_000_000, now)
     expected_vol = 0.0 if rv <= eg.FLOAT_EPS else expected_depth / rv
-    assert fv_value(vec, "ofi_l1_pressure_over_depth_5bps_200000us") == pytest.approx(expected_depth)
-    assert fv_value(vec, "ofi_l1_pressure_over_realized_vol_200000us") == pytest.approx(expected_vol)
+    assert fv_value(vec, "ofi_l1_pressure_over_realized_vol_1000000us") == pytest.approx(expected_vol)
 
 
 def test_absorption_replenishment_manual():
@@ -345,37 +334,19 @@ def test_absorption_replenishment_manual():
     e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
     vec = e.build_feature_vector()
     eps = eg.FLOAT_EPS
-    bid_add = e._book_sum("bid_l1_add", 200_000, 2_100_000)
-    bid_rem = e._book_sum("bid_l1_rem", 200_000, 2_100_000)
-    ask_add = e._book_sum("ask_l1_add", 200_000, 2_100_000)
-    ask_rem = e._book_sum("ask_l1_rem", 200_000, 2_100_000)
-    buy_n = e._trade_buy_notional(200_000, 2_100_000)
-    sell_n = e._trade_sell_notional(200_000, 2_100_000)
+    bid_add = e._book_sum("bid_l1_add", 1_000_000, 2_100_000)
+    bid_rem = e._book_sum("bid_l1_rem", 1_000_000, 2_100_000)
+    ask_add = e._book_sum("ask_l1_add", 1_000_000, 2_100_000)
+    ask_rem = e._book_sum("ask_l1_rem", 1_000_000, 2_100_000)
+    buy_n = e._trade_buy_notional(1_000_000, 2_100_000)
+    sell_n = e._trade_sell_notional(1_000_000, 2_100_000)
     total = buy_n + sell_n
     buy_share = buy_n / total
     sell_share = sell_n / total
     ask_rr = ask_add / max(ask_add + ask_rem, eps)
     bid_rr = bid_add / max(bid_add + bid_rem, eps)
-    assert fv_value(vec, "absorption_ask_200000us") == pytest.approx(buy_share * ask_rr)
-    assert fv_value(vec, "absorption_bid_200000us") == pytest.approx(sell_share * bid_rr)
-
-
-def test_same_and_opposite_replenishment_manual():
-    e = eg.FeatureEngine()
-    e.on_trade(make_trade(2_000_000, 100.0, 2.0, BUY_SIDE_CODE))
-    e.on_book_snapshot(make_snapshot(2_000_000, bid_sz0=10.0, ask_sz0=10.0))
-    e.on_trade(make_trade(2_050_000, 100.0, 1.0, SELL_SIDE_CODE))
-    e.on_book_snapshot(make_snapshot(2_100_000, bid_sz0=13.0, ask_sz0=8.0))
-    vec = e.build_feature_vector()
-    bid_add = e._book_sum("bid_l1_add", 200_000, 2_100_000)
-    bid_rem = e._book_sum("bid_l1_rem", 200_000, 2_100_000)
-    ask_add = e._book_sum("ask_l1_add", 200_000, 2_100_000)
-    ask_rem = e._book_sum("ask_l1_rem", 200_000, 2_100_000)
-    depth = e.book_state.current_summary().total_depth_5bps_size
-    expected_same = (min(bid_add, bid_rem) + min(ask_add, ask_rem)) / depth
-    expected_opp = (min(bid_add, ask_rem) + min(ask_add, bid_rem)) / depth
-    assert fv_value(vec, "same_side_replenishment_after_depletion_200000us") == pytest.approx(expected_same)
-    assert fv_value(vec, "opposite_side_replenishment_after_depletion_200000us") == pytest.approx(expected_opp)
+    assert fv_value(vec, "absorption_ask_1000000us") == pytest.approx(buy_share * ask_rr)
+    assert fv_value(vec, "absorption_bid_1000000us") == pytest.approx(sell_share * bid_rr)
 
 
 def test_trade_side_quote_response_asymmetry_manual():
@@ -401,25 +372,6 @@ def test_trade_side_quote_response_asymmetry_manual():
     assert fv_value(vec, "trade_side_quote_response_asymmetry_500000us") == pytest.approx(expected)
 
 
-def test_trade_impact_half_life_proxy_manual():
-    e = eg.FeatureEngine()
-    e.on_trade(make_trade(2_000_000, 102.0, 1.0, BUY_SIDE_CODE))
-    e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
-    e.on_trade(make_trade(2_300_000, 98.0, 1.0, SELL_SIDE_CODE))
-    e.on_book_snapshot(make_snapshot(2_500_000, mid=100.0))
-    v = e.build_feature_vector()
-    impact_200 = abs(fv_value(v, "vwap_vs_mid_bps_200000us"))
-    impact_500 = abs(fv_value(v, "vwap_vs_mid_bps_500000us"))
-    expected = min(max(impact_500 / impact_200, 0.0), 10.0)
-    assert fv_value(v, "trade_impact_half_life_proxy") == pytest.approx(expected)
-
-    e2 = eg.FeatureEngine()
-    e2.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
-    e2.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
-    v2 = e2.build_feature_vector()
-    assert fv_value(v2, "trade_impact_half_life_proxy") == 0.0
-
-
 def test_event_context_formulas_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000))
@@ -427,11 +379,8 @@ def test_event_context_formulas_manual():
     e.on_trade(make_trade(2_300_000, side_code=UNKNOWN_SIDE_CODE))
     d2 = e.on_book_snapshot(make_snapshot(2_500_000))
     assert d1 is not None and d2 is not None
-    assert fv_value(d1.feature_vector, "log_dt_decision_us") == 0.0
-    assert fv_value(d2.feature_vector, "log_dt_decision_us") == pytest.approx(math.log1p(500_000))
     now = 2_500_000
     for w, name in [
-        (100_000, "log_events_100000us"),
         (200_000, "log_events_200000us"),
         (500_000, "log_events_500000us"),
         (1_000_000, "log_events_1000000us"),
@@ -447,19 +396,16 @@ def test_same_timestamp_ordering_is_caller_order():
     e.on_trade(make_trade(t, 110.0, 3.0, BUY_SIDE_CODE))
     d = e.on_book_snapshot(make_snapshot(t, mid=100.0))
     assert d is not None
-    assert abs(fv_value(d.feature_vector, "signed_notional_flow_usd_200000us")) > 0.0
-    assert fv_value(d.feature_vector, "vwap_vs_mid_bps_200000us") == pytest.approx(k.bps_change(110.0, 100.0))
+    assert abs(fv_value(d.feature_vector, "max_signed_trade_notional_usd_1000000us")) > 0.0
 
     e2 = eg.FeatureEngine()
     e2.on_trade(make_trade(t - 500_000, 100.0, 1.0, BUY_SIDE_CODE))
     e2.on_book_snapshot(make_snapshot(t - 500_000, mid=100.0))
     d2 = e2.on_book_snapshot(make_snapshot(t, mid=100.0))
     assert d2 is not None
-    pre_vwap = fv_value(d2.feature_vector, "vwap_vs_mid_bps_200000us")
-    pre_signed = fv_value(d2.feature_vector, "signed_notional_flow_usd_200000us")
+    pre_max = fv_value(d2.feature_vector, "max_signed_trade_notional_usd_1000000us")
     e2.on_trade(make_trade(t, 140.0, 10.0, BUY_SIDE_CODE))
-    assert fv_value(d2.feature_vector, "vwap_vs_mid_bps_200000us") == pre_vwap
-    assert fv_value(d2.feature_vector, "signed_notional_flow_usd_200000us") == pre_signed
+    assert fv_value(d2.feature_vector, "max_signed_trade_notional_usd_1000000us") == pre_max
 
 
 def test_out_of_order_events_rejected():
@@ -517,11 +463,10 @@ def test_all_engine_features_assigned_no_placeholders():
     vec = d.feature_vector
     for idx in eg.CROSS_FEATURE_INDICES + eg.EVENT_CONTEXT_FEATURE_INDICES:
         assert np.isfinite(vec[idx])
-    assert abs(fv_value(vec, "vwap_vs_mid_bps_200000us")) > 0.0
     assert (
-        abs(fv_value(vec, "absorption_bid_200000us")) > 0.0
-        or abs(fv_value(vec, "absorption_ask_200000us")) > 0.0
+        abs(fv_value(vec, "absorption_bid_1000000us")) > 0.0
+        or abs(fv_value(vec, "absorption_ask_1000000us")) > 0.0
     )
-    assert abs(fv_value(vec, "ofi_l1_pressure_over_depth_5bps_200000us")) > 0.0
+    assert np.isfinite(fv_value(vec, "ofi_l1_pressure_over_realized_vol_1000000us"))
     assert abs(fv_value(vec, "trade_side_quote_response_asymmetry_500000us")) > 0.0
     assert fv_value(vec, "log_events_500000us") > 0.0

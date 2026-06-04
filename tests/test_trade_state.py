@@ -60,6 +60,7 @@ def test_public_api_boundary():
         "TradeState",
         "trade_owned_feature_names",
         "trade_owned_feature_indices",
+        "ACTIVE_TRADE_FEATURES",
     }
     assert set(ts.__all__) == expected
     assert all(not name.startswith("_") for name in ts.__all__)
@@ -192,14 +193,11 @@ def test_all_trade_features_assigned_and_dynamic_nonzero():
     v = st.trade_feature_vector()
     for i in ts.trade_owned_feature_indices():
         assert np.isfinite(v[i])
-    assert fv_value(v, "time_since_trade_us") == 0.0
-    assert fv_value(v, "trade_toxicity_notional_200000us") >= 0
+    assert fv_value(v, "trade_count_per_second_200000us") > 0
+    assert fv_value(v, "trade_imbalance_notional_500000us") != 0
     assert fv_value(v, "trade_count_per_second_500000us") > 0
-    assert fv_value(v, "signed_trade_premium_bps_volume_weighted_500000us") != 0
-    assert fv_value(v, "cvd_change_usd_500000us") != 0
-    assert fv_value(v, "max_signed_trade_notional_usd_500000us") != 0
-    assert fv_value(v, "top5_trade_notional_sum_usd_1000000us") > 0
-    assert fv_value(v, "regime_volume_ewma_3000000us") > 0
+    assert fv_value(v, "max_signed_trade_notional_usd_1000000us") != 0
+    assert fv_value(v, "same_side_trade_cluster_notional_1000000us") > 0
     assert fv_value(v, "trade_sign_entropy_3000000us") > 0
 
 
@@ -209,9 +207,6 @@ def test_window_trade_stats_manual_200ms():
     st.apply_trade(make_trade(1_100_000, 101, 2, -1))
     st.apply_trade(make_trade(1_300_000, 102, 1, +1))
     v = st.trade_feature_vector()
-    assert fv_value(v, "signed_notional_flow_usd_200000us") == pytest.approx(-100.0)
-    assert fv_value(v, "signed_trade_count_imbalance_200000us") == pytest.approx(0.0)
-    assert fv_value(v, "trade_toxicity_notional_200000us") == pytest.approx(abs(102 - 202) / 304)
     assert fv_value(v, "trade_count_per_second_200000us") == pytest.approx(10.0)
 
 
@@ -220,19 +215,7 @@ def test_tick_sign_features():
     for i, p in enumerate([100, 101, 101, 100]):
         st.apply_trade(make_trade(1_000_000 + i, p, 1, +1))
     v = st.trade_feature_vector()
-    assert fv_value(v, "last_tick_sign") == -1
     assert fv_value(v, "zero_tick_fraction_1000000us") > 0
-    assert fv_value(v, "tick_sign_imbalance_1000000us") == pytest.approx(0.0)
-
-
-def test_cvd_features_manual():
-    st = ts.TradeState()
-    st.apply_trade(make_trade(1_000_000, 100, 1, +1))
-    st.apply_trade(make_trade(1_300_000, 100, 2, -1))
-    st.apply_trade(make_trade(1_600_000, 100, 3, +1))
-    v = st.trade_feature_vector()
-    assert fv_value(v, "cvd_change_usd_500000us") == pytest.approx(100.0)
-    assert np.isfinite(fv_value(v, "cvd_minus_ema_usd_500000us"))
 
 
 def test_time_since_features_with_as_of():
@@ -240,7 +223,6 @@ def test_time_since_features_with_as_of():
     st.apply_trade(make_trade(1_000_000, 100, 1, +1))
     out = np.zeros(FEATURE_COUNT)
     st.fill_trade_features(out, as_of_local_ts_us=1_250_000)
-    assert fv_value(out, "time_since_trade_us") == 250_000
     assert fv_value(out, "time_since_last_buy_trade_us") == 250_000
     assert fv_value(out, "time_since_last_sell_trade_us") == 0
     with pytest.raises(ValueError):
@@ -297,7 +279,7 @@ def test_fill_trade_features_handles_early_asof_windows_without_crashing():
 
     trade_idx = ts.trade_owned_feature_indices()
     assert np.all(np.isfinite(out[list(trade_idx)]))
-    assert fv_value(out, "cvd_change_usd_1000000us") == pytest.approx(100.0 * 2.0)
+    assert fv_value(out, "max_signed_trade_notional_usd_1000000us") == pytest.approx(100.0 * 2.0)
 
 
 def test_top5_and_max_signed_notional():
@@ -306,7 +288,6 @@ def test_top5_and_max_signed_notional():
     for i, (n, s) in enumerate(vals):
         st.apply_trade(make_trade(1_000_000 + i * 100_000, 10.0, n / 10.0, s))
     v = st.trade_feature_vector()
-    assert fv_value(v, "top5_trade_notional_sum_usd_1000000us") == pytest.approx(60 + 50 + 40 + 30 + 20)
     assert fv_value(v, "max_signed_trade_notional_usd_1000000us") == pytest.approx(-60)
 
 
@@ -316,8 +297,6 @@ def test_p90_over_median_and_entropy():
     for i, (n, s) in enumerate(rows):
         st.apply_trade(make_trade(1_000_000 + i * 300_000, 10.0, n / 10.0, s))
     v = st.trade_feature_vector()
-    assert fv_value(v, "buy_trade_p90_over_median_3000000us") > 0
-    assert fv_value(v, "sell_trade_p90_over_median_3000000us") > 0
     ent = fv_value(v, "trade_sign_entropy_3000000us")
     assert 0 <= ent <= 1
     assert ent > 0
@@ -347,17 +326,9 @@ def test_no_cross_book_or_event_context_features_written():
     out = np.full(FEATURE_COUNT, -123.0)
     apply_trade_sequence(st)
     st.fill_trade_features(out)
-    for name in (
-        "spread_bps",
-        "micro_ret_bps_200000us",
-        "bid_depth_notional_5bps",
-        "vwap_vs_mid_bps_200000us",
-        "vwap_vs_mid_bps_500000us",
-        "absorption_bid_200000us",
-        "ofi_l1_pressure_over_depth_5bps_200000us",
-        "log_events_100000us",
-    ):
-        assert fv_value(out, name) == -123.0
+    for spec in FEATURE_SPECS:
+        if spec.source != FeatureSource.TRADE:
+            assert out[spec.index] == -123.0
 
 
 def test_apply_trade_rejects_non_trade_input():
@@ -383,8 +354,8 @@ def test_as_of_does_not_create_future_lookahead():
     st.apply_trade(make_trade(2_000_000, 100, 1, +1))
     now_v = st.trade_feature_vector()
     asof_v = st.trade_feature_vector(as_of_local_ts_us=2_500_000)
-    assert fv_value(now_v, "time_since_trade_us") == 0.0
-    assert fv_value(asof_v, "time_since_trade_us") == 500_000
+    assert fv_value(now_v, "time_since_last_buy_trade_us") == 0.0
+    assert fv_value(asof_v, "time_since_last_buy_trade_us") == 500_000
     # Windows are inclusive [now - window_us, now], so the trade at 2_000_000 is included.
     assert fv_value(asof_v, "trade_count_per_second_500000us") == pytest.approx(2.0)
     with pytest.raises(ValueError):
@@ -397,11 +368,8 @@ def test_no_invalid_placeholders():
     v = st.trade_feature_vector()
     for i in ts.trade_owned_feature_indices():
         assert np.isfinite(v[i])
-    assert fv_value(v, "trade_toxicity_notional_200000us") >= 0
+    assert fv_value(v, "trade_imbalance_notional_500000us") != 0
     assert fv_value(v, "trade_count_per_second_500000us") > 0
-    assert fv_value(v, "signed_trade_premium_bps_volume_weighted_500000us") != 0
-    assert fv_value(v, "cvd_change_usd_500000us") != 0
-    assert fv_value(v, "max_signed_trade_notional_usd_500000us") != 0
-    assert fv_value(v, "top5_trade_notional_sum_usd_1000000us") > 0
-    assert fv_value(v, "regime_volume_ewma_3000000us") > 0
+    assert fv_value(v, "max_signed_trade_notional_usd_1000000us") != 0
+    assert fv_value(v, "same_side_trade_cluster_notional_1000000us") > 0
     assert fv_value(v, "trade_sign_entropy_3000000us") > 0

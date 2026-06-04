@@ -271,7 +271,7 @@ def test_head_scopes_are_correct(trained_artifact, tmp_path: Path):
     root, artifact = trained_artifact
     out = fl.run_feature_lab(str(root), str(artifact), str(_candidate_path(tmp_path / "c.parquet")))
     counts = {r.head: r.n_val_rows for r in out.head_metric_records if r.candidate == "c_noise"}
-    assert counts[lm.NO_MOVE_HEAD] == 30
+    assert counts[lm.NO_MOVE_HEAD] == 28
     assert counts[lm.DIRECTION_HEAD] == 25
     assert counts[lm.MAGNITUDE_UP_HEAD] == 10
     assert counts[lm.MAGNITUDE_DOWN_HEAD] == 15
