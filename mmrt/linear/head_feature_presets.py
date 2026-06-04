@@ -14,12 +14,14 @@ ALL_FEATURES_PRESET = "all"
 CORR_PRUNED152_HEAD_SUBSET_V1 = "corr_pruned152_head_subset_v1"
 CORR_PRUNED152_HEAD_SUBSET_V2 = "corr_pruned152_head_subset_v2"
 CORR_PRUNED152_HEAD_SUBSET_V3 = "corr_pruned152_head_subset_v3"
+CORR_PRUNED152_HEAD_SUBSET_V4 = "corr_pruned152_head_subset_v4"
 
 AVAILABLE_HEAD_FEATURE_PRESETS = (
     ALL_FEATURES_PRESET,
     CORR_PRUNED152_HEAD_SUBSET_V1,
     CORR_PRUNED152_HEAD_SUBSET_V2,
     CORR_PRUNED152_HEAD_SUBSET_V3,
+    CORR_PRUNED152_HEAD_SUBSET_V4,
 )
 
 DIRECTION_CORR_PRUNED152_V1 = (
@@ -416,6 +418,60 @@ CORR_PRUNED152_HEAD_SUBSET_V3_COLUMNS_BY_HEAD = {
     lm.MAGNITUDE_DOWN_HEAD: MAGNITUDE_DOWN_CORR_PRUNED152_V3,
 }
 
+DIRECTION_CORR_PRUNED152_V4 = (
+    "x_depth_imbalance_within_1bps",
+    "x_depth_imbalance_5bps_mean_1000000us",
+    "x_ask_l1_notional_usd",
+    "x_bid_l1_notional_usd",
+    "x_trade_side_quote_response_asymmetry_500000us",
+    "x_trade_imbalance_notional_500000us",
+    "x_obi_l1",
+    "x_ofi_l10_sum_over_depth_1000000us",
+    "x_near_touch_depth_drop_asymmetry",
+    "x_max_signed_trade_notional_usd_1000000us",
+    "x_ofi_l1_pressure_over_realized_vol_1000000us",
+    "x_cvd_change_usd_1000000us",
+    "x_best_ask_size_age_us",
+    "x_absorption_bid_1000000us",
+    "x_depth_imbalance_5bps_slope_3000000us",
+    "x_absorption_ask_1000000us",
+    "x_best_bid_size_age_us",
+    "x_time_since_last_buy_trade_us",
+    "x_ask_l1_depletion_over_depth_500000us",
+    "x_micro_minus_mid_bps",
+    "x_time_since_last_sell_trade_us",
+    "x_last_trade_side_sign",
+    "x_down_up_vol_imbalance_3000000us",
+)
+
+NO_MOVE_CORR_PRUNED152_V4 = NO_MOVE_CORR_PRUNED152_V3
+
+MAGNITUDE_UP_CORR_PRUNED152_V4 = (
+    "x_trade_count_per_second_1000000us",
+    "x_bid_depth_notional_5bps",
+    "x_trade_sign_entropy_3000000us",
+    "x_log_events_1000000us",
+    "x_ask_depth_within_1bps",
+    "x_ob_update_rate_500000us",
+    "x_ask_l1_depletion_500000us",
+    "x_ask_depth_notional_5bps",
+    "x_depth_imbalance_5bps_slope_1000000us",
+    "x_spread_z_500000us",
+    "x_micro_l10_minus_mid_bps",
+    "x_ask_l1_depletion_over_depth_200000us",
+    "x_bid_l1_depletion_over_depth_1000000us",
+    "x_ofi_l10_sum_over_depth_1000000us",
+)
+
+MAGNITUDE_DOWN_CORR_PRUNED152_V4 = MAGNITUDE_DOWN_CORR_PRUNED152_V3
+
+CORR_PRUNED152_HEAD_SUBSET_V4_COLUMNS_BY_HEAD = {
+    lm.DIRECTION_HEAD: DIRECTION_CORR_PRUNED152_V4,
+    lm.NO_MOVE_HEAD: NO_MOVE_CORR_PRUNED152_V4,
+    lm.MAGNITUDE_UP_HEAD: MAGNITUDE_UP_CORR_PRUNED152_V4,
+    lm.MAGNITUDE_DOWN_HEAD: MAGNITUDE_DOWN_CORR_PRUNED152_V4,
+}
+
 
 def _require_preset_name(name: str) -> str:
     if name not in AVAILABLE_HEAD_FEATURE_PRESETS:
@@ -442,6 +498,10 @@ assert len(DIRECTION_CORR_PRUNED152_V3) == 25
 assert len(NO_MOVE_CORR_PRUNED152_V3) == 38
 assert len(MAGNITUDE_UP_CORR_PRUNED152_V3) == 15
 assert len(MAGNITUDE_DOWN_CORR_PRUNED152_V3) == 6
+assert len(DIRECTION_CORR_PRUNED152_V4) == 23
+assert len(NO_MOVE_CORR_PRUNED152_V4) == 38
+assert len(MAGNITUDE_UP_CORR_PRUNED152_V4) == 14
+assert len(MAGNITUDE_DOWN_CORR_PRUNED152_V4) == 6
 
 for _cols in (
     DIRECTION_CORR_PRUNED152_V1,
@@ -456,12 +516,17 @@ for _cols in (
     NO_MOVE_CORR_PRUNED152_V3,
     MAGNITUDE_UP_CORR_PRUNED152_V3,
     MAGNITUDE_DOWN_CORR_PRUNED152_V3,
+    DIRECTION_CORR_PRUNED152_V4,
+    NO_MOVE_CORR_PRUNED152_V4,
+    MAGNITUDE_UP_CORR_PRUNED152_V4,
+    MAGNITUDE_DOWN_CORR_PRUNED152_V4,
 ):
     _assert_unique_columns(_cols)
 
 assert set(CORR_PRUNED152_HEAD_SUBSET_V1_COLUMNS_BY_HEAD) == set(lm.MODEL_HEADS)
 assert set(CORR_PRUNED152_HEAD_SUBSET_V2_COLUMNS_BY_HEAD) == set(lm.MODEL_HEADS)
 assert set(CORR_PRUNED152_HEAD_SUBSET_V3_COLUMNS_BY_HEAD) == set(lm.MODEL_HEADS)
+assert set(CORR_PRUNED152_HEAD_SUBSET_V4_COLUMNS_BY_HEAD) == set(lm.MODEL_HEADS)
 
 
 def head_feature_config_for_preset(name: str) -> hf.HeadFeatureConfig:
@@ -480,6 +545,10 @@ def head_feature_config_for_preset(name: str) -> hf.HeadFeatureConfig:
         return hf.HeadFeatureConfig(
             feature_columns_by_head=CORR_PRUNED152_HEAD_SUBSET_V3_COLUMNS_BY_HEAD
         )
+    if preset == CORR_PRUNED152_HEAD_SUBSET_V4:
+        return hf.HeadFeatureConfig(
+            feature_columns_by_head=CORR_PRUNED152_HEAD_SUBSET_V4_COLUMNS_BY_HEAD
+        )
     raise AssertionError("unreachable")
 
 
@@ -495,6 +564,7 @@ __all__ = [
     "CORR_PRUNED152_HEAD_SUBSET_V1",
     "CORR_PRUNED152_HEAD_SUBSET_V2",
     "CORR_PRUNED152_HEAD_SUBSET_V3",
+    "CORR_PRUNED152_HEAD_SUBSET_V4",
     "AVAILABLE_HEAD_FEATURE_PRESETS",
     "DIRECTION_CORR_PRUNED152_V1",
     "NO_MOVE_CORR_PRUNED152_V1",
@@ -508,9 +578,14 @@ __all__ = [
     "NO_MOVE_CORR_PRUNED152_V3",
     "MAGNITUDE_UP_CORR_PRUNED152_V3",
     "MAGNITUDE_DOWN_CORR_PRUNED152_V3",
+    "DIRECTION_CORR_PRUNED152_V4",
+    "NO_MOVE_CORR_PRUNED152_V4",
+    "MAGNITUDE_UP_CORR_PRUNED152_V4",
+    "MAGNITUDE_DOWN_CORR_PRUNED152_V4",
     "CORR_PRUNED152_HEAD_SUBSET_V1_COLUMNS_BY_HEAD",
     "CORR_PRUNED152_HEAD_SUBSET_V2_COLUMNS_BY_HEAD",
     "CORR_PRUNED152_HEAD_SUBSET_V3_COLUMNS_BY_HEAD",
+    "CORR_PRUNED152_HEAD_SUBSET_V4_COLUMNS_BY_HEAD",
     "head_feature_config_for_preset",
     "preset_feature_counts",
 ]
