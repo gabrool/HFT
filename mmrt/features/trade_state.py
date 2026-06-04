@@ -142,19 +142,21 @@ class TradeSummary:
     tick_sign: int
     last_trade_side_sign: int
     last_tick_sign: int
-    cvd_notional: float
     trade_count: int
     buy_trade_count: int
     sell_trade_count: int
     unknown_trade_count: int
-    consecutive_buy_trade_count: int
-    consecutive_sell_trade_count: int
 
 
 class TradeHistory:
     FIELDS = (
-        "ts_us", "price", "amount", "notional", "signed_notional", "side_code", "tick_sign", "buy_notional", "sell_notional",
-        "buy_count", "sell_count", "unknown_count", "cvd_notional",
+        "ts_us",
+        "notional",
+        "signed_notional",
+        "side_code",
+        "tick_sign",
+        "buy_notional",
+        "sell_notional",
     )
 
     def __init__(self, capacity: int = DEFAULT_HISTORY_CAPACITY):
@@ -165,16 +167,10 @@ class TradeHistory:
             "ts_us": np.zeros(self.capacity, dtype=np.int64),
             "side_code": np.zeros(self.capacity, dtype=np.int64),
             "tick_sign": np.zeros(self.capacity, dtype=np.int64),
-            "buy_count": np.zeros(self.capacity, dtype=np.int64),
-            "sell_count": np.zeros(self.capacity, dtype=np.int64),
-            "unknown_count": np.zeros(self.capacity, dtype=np.int64),
-            "price": np.zeros(self.capacity, dtype=np.float64),
-            "amount": np.zeros(self.capacity, dtype=np.float64),
             "notional": np.zeros(self.capacity, dtype=np.float64),
             "signed_notional": np.zeros(self.capacity, dtype=np.float64),
             "buy_notional": np.zeros(self.capacity, dtype=np.float64),
             "sell_notional": np.zeros(self.capacity, dtype=np.float64),
-            "cvd_notional": np.zeros(self.capacity, dtype=np.float64),
         }
 
     def append(self, **kwargs: float | int) -> None:
@@ -246,9 +242,6 @@ class TradeState:
         self.last_tick_sign = 0
         self.last_buy_trade_ts_us = None
         self.last_sell_trade_ts_us = None
-        self.cvd_notional = 0.0
-        self.consecutive_buy_trade_count = 0
-        self.consecutive_sell_trade_count = 0
 
     def has_trades(self) -> bool:
         return self.trade_count > 0
@@ -270,36 +263,23 @@ class TradeState:
         notional = trade.price * trade.amount
         tick_sign = self._tick_sign(trade.price)
         signed_notional = trade.side_code * notional
-        self.cvd_notional += signed_notional
         self.trade_count += 1
         if trade.side_code == BUY_SIDE_CODE:
             self.buy_trade_count += 1
-            self.consecutive_buy_trade_count += 1
-            self.consecutive_sell_trade_count = 0
             self.last_buy_trade_ts_us = trade.local_ts_us
         elif trade.side_code == SELL_SIDE_CODE:
             self.sell_trade_count += 1
-            self.consecutive_sell_trade_count += 1
-            self.consecutive_buy_trade_count = 0
             self.last_sell_trade_ts_us = trade.local_ts_us
         else:
             self.unknown_trade_count += 1
-            self.consecutive_buy_trade_count = 0
-            self.consecutive_sell_trade_count = 0
         self.history.append(
             ts_us=trade.local_ts_us,
-            price=trade.price,
-            amount=trade.amount,
             notional=notional,
             signed_notional=signed_notional,
             side_code=trade.side_code,
             tick_sign=tick_sign,
             buy_notional=notional if trade.side_code == BUY_SIDE_CODE else 0.0,
             sell_notional=notional if trade.side_code == SELL_SIDE_CODE else 0.0,
-            buy_count=1 if trade.side_code == BUY_SIDE_CODE else 0,
-            sell_count=1 if trade.side_code == SELL_SIDE_CODE else 0,
-            unknown_count=1 if trade.side_code == UNKNOWN_SIDE_CODE else 0,
-            cvd_notional=self.cvd_notional,
         )
         self.last_local_ts_us = trade.local_ts_us
         self.last_trade = trade
@@ -312,10 +292,22 @@ class TradeState:
         if not self.has_trades() or self.last_trade is None:
             raise ValueError("no trades")
         t = self.last_trade
-        return TradeSummary(t.local_ts_us, t.ts_us, t.event_seq, t.price, t.amount, t.price * t.amount, t.side_code, self.last_tick_sign,
-                            self.last_side_code, self.last_tick_sign, self.cvd_notional, self.trade_count, self.buy_trade_count,
-                            self.sell_trade_count, self.unknown_trade_count, self.consecutive_buy_trade_count,
-                            self.consecutive_sell_trade_count)
+        return TradeSummary(
+            t.local_ts_us,
+            t.ts_us,
+            t.event_seq,
+            t.price,
+            t.amount,
+            t.price * t.amount,
+            t.side_code,
+            self.last_tick_sign,
+            self.last_side_code,
+            self.last_tick_sign,
+            self.trade_count,
+            self.buy_trade_count,
+            self.sell_trade_count,
+            self.unknown_trade_count,
+        )
 
     def _window_values(self, field_name: str, window_us: int, now_us: int | None = None) -> np.ndarray:
         now = self.last_local_ts_us if now_us is None else now_us
@@ -325,73 +317,24 @@ class TradeState:
         now = self.last_local_ts_us if now_us is None else now_us
         return self.history.ts_in_window(now, window_us)
 
-    def _window_trade_stats(self, window_us: int, now_us: int | None = None) -> dict[str, float]:
-        side = self._window_values("side_code", window_us, now_us)
-        notional = self._window_values("notional", window_us, now_us)
-        signed = self._window_values("signed_notional", window_us, now_us)
+    def _trade_count_per_second(self, window_us: int, now_us: int) -> float:
+        return _safe_div(float(self._window_ts(window_us, now_us).size), window_us / 1e6)
+
+    def _trade_imbalance_notional(self, window_us: int, now_us: int) -> float:
+        buy = float(np.sum(self._window_values("buy_notional", window_us, now_us)))
+        sell = float(np.sum(self._window_values("sell_notional", window_us, now_us)))
+        return _safe_div(buy - sell, buy + sell)
+
+    def _zero_tick_fraction(self, window_us: int, now_us: int) -> float:
         tick = self._window_values("tick_sign", window_us, now_us)
-        price = self._window_values("price", window_us, now_us)
-        buy_notional = float(np.sum(notional[side == BUY_SIDE_CODE])) if side.size else 0.0
-        sell_notional = float(np.sum(notional[side == SELL_SIDE_CODE])) if side.size else 0.0
-        total_notional = float(np.sum(notional))
-        buy_count = float(np.sum(side == BUY_SIDE_CODE))
-        sell_count = float(np.sum(side == SELL_SIDE_CODE))
-        unknown_count = float(np.sum(side == UNKNOWN_SIDE_CODE))
-        trade_count = float(notional.size)
-        signed_trade_count = buy_count + sell_count
-        zero_tick_count = float(np.sum(tick == 0))
-        plus_tick_count = float(np.sum(tick > 0))
-        minus_tick_count = float(np.sum(tick < 0))
-        top5 = np.sort(notional)[-5:] if notional.size else np.array([], dtype=np.float64)
-        top5_sum = float(np.sum(top5))
-        max_signed = 0.0
-        if signed.size:
-            idx = int(np.argmax(np.abs(signed)))
-            max_signed = float(signed[idx])
-        anchor_price = 0.0
-        for p in price:
-            if p > 0.0 and math.isfinite(float(p)):
-                anchor_price = float(p)
-                break
-        prem_num = 0.0
-        if anchor_price > 0.0:
-            prem_num = float(np.sum(side * notional * 10_000.0 * (price / anchor_price - 1.0)))
-        return {
-            "buy_notional": buy_notional,
-            "sell_notional": sell_notional,
-            "total_notional": total_notional,
-            "signed_notional": float(np.sum(signed)),
-            "buy_count": buy_count,
-            "sell_count": sell_count,
-            "unknown_count": unknown_count,
-            "trade_count": trade_count,
-            "signed_trade_count": signed_trade_count,
-            "signed_trade_count_imbalance": _safe_div(buy_count - sell_count, signed_trade_count),
-            "trade_imbalance_notional": _safe_div(buy_notional - sell_notional, total_notional),
-            "trade_toxicity_notional": _safe_div(abs(buy_notional - sell_notional), total_notional),
-            "zero_tick_fraction": _safe_div(zero_tick_count, trade_count),
-            "tick_sign_imbalance": _safe_div(plus_tick_count - minus_tick_count, trade_count),
-            "trade_count_per_second": _safe_div(trade_count, window_us / 1e6),
-            "signed_trade_premium_bps_volume_weighted": _safe_div(prem_num, float(np.sum(np.abs(signed)))),
-            "top5_trade_notional_sum": top5_sum,
-            "max_signed_trade_notional": max_signed,
-            "top5_trade_share_notional": _safe_div(top5_sum, total_notional),
-        }
+        return _safe_div(float(np.sum(tick == 0)), float(tick.size))
 
-    def _cvd_change(self, window_us: int, now_us: int) -> float:
-        current = self.history.asof_value("cvd_notional", now_us, default=self.cvd_notional)
-        past = self.history.asof_value("cvd_notional", now_us - window_us, default=0.0)
-        return current - past
-
-    def _cvd_ema(self, window_us: int, now_us: int) -> float:
-        vals = self._window_values("cvd_notional", window_us, now_us)
-        if vals.size == 0:
+    def _max_signed_trade_notional(self, window_us: int, now_us: int) -> float:
+        signed = self._window_values("signed_notional", window_us, now_us)
+        if signed.size == 0:
             return 0.0
-        alpha = 2.0 / (vals.size + 1.0)
-        ema = float(vals[0])
-        for v in vals[1:]:
-            ema = alpha * float(v) + (1.0 - alpha) * ema
-        return ema
+        idx = int(np.argmax(np.abs(signed)))
+        return float(signed[idx])
 
     def _max_trade_silence_gap(self, window_us: int, now_us: int) -> float:
         ts = self._window_ts(window_us, now_us)
@@ -431,17 +374,6 @@ class TradeState:
                 best = cur
         return best
 
-    def _p90_over_median(self, side_code: int, window_us: int, now_us: int) -> float:
-        side = self._window_values("side_code", window_us, now_us)
-        notional = self._window_values("notional", window_us, now_us)
-        selected = notional[side == side_code]
-        if selected.size < 2:
-            return 0.0
-        med = float(np.median(selected))
-        if med <= FLOAT_EPS:
-            return 0.0
-        return float(np.percentile(selected, 90) / med)
-
     def fill_trade_features(self, out: np.ndarray, *, as_of_local_ts_us: int | None = None) -> np.ndarray:
         if not self.has_trades():
             raise ValueError("no trades")
@@ -459,17 +391,14 @@ class TradeState:
             arr[feature_spec_by_name(name).index] = _finite(value)
             assigned.add(name)
 
-        s200 = self._window_trade_stats(WINDOW_200MS_US, now)
-        s500 = self._window_trade_stats(WINDOW_500MS_US, now)
-        s1000 = self._window_trade_stats(WINDOW_1000MS_US, now)
-        setf("trade_count_per_second_200000us", s200["trade_count_per_second"])
-        setf("trade_imbalance_notional_500000us", s500["trade_imbalance_notional"])
-        setf("trade_count_per_second_500000us", s500["trade_count_per_second"])
-        setf("zero_tick_fraction_1000000us", s1000["zero_tick_fraction"])
-        setf("trade_count_per_second_1000000us", s1000["trade_count_per_second"])
+        setf("trade_count_per_second_200000us", self._trade_count_per_second(WINDOW_200MS_US, now))
+        setf("trade_imbalance_notional_500000us", self._trade_imbalance_notional(WINDOW_500MS_US, now))
+        setf("trade_count_per_second_500000us", self._trade_count_per_second(WINDOW_500MS_US, now))
+        setf("zero_tick_fraction_1000000us", self._zero_tick_fraction(WINDOW_1000MS_US, now))
+        setf("trade_count_per_second_1000000us", self._trade_count_per_second(WINDOW_1000MS_US, now))
         setf("time_since_last_buy_trade_us", float(0 if self.last_buy_trade_ts_us is None else now - self.last_buy_trade_ts_us))
         setf("time_since_last_sell_trade_us", float(0 if self.last_sell_trade_ts_us is None else now - self.last_sell_trade_ts_us))
-        setf("max_signed_trade_notional_usd_1000000us", s1000["max_signed_trade_notional"])
+        setf("max_signed_trade_notional_usd_1000000us", self._max_signed_trade_notional(WINDOW_1000MS_US, now))
         setf("same_side_trade_cluster_notional_1000000us", self._same_side_trade_cluster_notional(WINDOW_1000MS_US, now))
         setf("max_trade_silence_gap_3000000us", self._max_trade_silence_gap(WINDOW_3000MS_US, now))
         setf("trade_sign_entropy_3000000us", self._trade_sign_entropy(WINDOW_3000MS_US, now))

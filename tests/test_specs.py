@@ -96,6 +96,61 @@ def test_no_pruned_output_assignment_remains():
         assert not dropped.intersection(assigned)
 
 
+def test_no_inactive_runtime_computation_tokens_remain():
+    files_and_forbidden = {
+        "mmrt/features/trade_state.py": {
+            "_window_trade_stats",
+            "_cvd_change",
+            "_cvd_ema",
+            "_p90_over_median",
+            "top5",
+            "p90",
+            "premium",
+            "toxicity",
+            "cvd_notional",
+            "consecutive_buy_trade_count",
+            "consecutive_sell_trade_count",
+        },
+        "mmrt/features/book_state.py": {
+            "_safe_z",
+            "_gap_b_bps",
+            "_liquidity_void",
+            "_depth_centroid",
+            "_vamp_depth",
+            "_ret_bps_asof",
+            "_mid_returns_in_window",
+            "_return_std_bps",
+            "_max_abs_mid_return_bps",
+            "_down_up_vol_imbalance",
+            "_arrival_clumpiness",
+            "_mid_run_length_max",
+            "micro_l5_minus_mid_bps",
+            "vamp_l5_minus_mid_bps",
+            "vamp_l10_minus_mid_bps",
+            "mid_return_bps",
+            "ofi_l3",
+            "ofi_l5",
+            "obi_l3",
+        },
+        "mmrt/features/engine.py": {
+            "WINDOW_100MS_US",
+            "_trade_total_notional",
+            "_trade_vwap",
+            "_book_mean",
+            "_current_depth_size",
+            "_current_depth_notional",
+            "log_events_100000us",
+            "vwap_vs_mid",
+            "trade_impact_half_life",
+        },
+    }
+
+    for relpath, forbidden in files_and_forbidden.items():
+        text = Path(relpath).read_text()
+        for token in forbidden:
+            assert token not in text, f"{token} still present in {relpath}"
+
+
 def test_required_windows_and_depth():
     assert specs.SUPPORTED_WINDOWS_US == (100_000, 200_000, 500_000, 1_000_000, 3_000_000)
     assert specs.REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH == 25
