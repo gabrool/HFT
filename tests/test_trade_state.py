@@ -70,6 +70,42 @@ def test_public_api_boundary():
         assert not any(tok in lowered for tok in forbidden)
 
 
+def test_trade_history_fields_are_active_minimal():
+    assert ts.TradeHistory.FIELDS == (
+        "ts_us",
+        "notional",
+        "signed_notional",
+        "side_code",
+        "tick_sign",
+        "buy_notional",
+        "sell_notional",
+    )
+
+
+def test_no_inactive_trade_feature_computation_remains():
+    import inspect
+
+    src = inspect.getsource(ts)
+    forbidden = [
+        "_window_trade_stats",
+        "_cvd_change",
+        "_cvd_ema",
+        "_p90_over_median",
+        "top5",
+        "p90",
+        "premium",
+        "toxicity",
+        "cvd_notional",
+        "consecutive_buy_trade_count",
+        "consecutive_sell_trade_count",
+        "signed_trade_count_imbalance",
+        "tick_sign_imbalance",
+        "top5_trade_share",
+    ]
+    for token in forbidden:
+        assert token not in src
+
+
 def test_no_forbidden_imports():
     code = r'''
 import sys
@@ -131,11 +167,9 @@ def test_apply_trade_summary():
     assert sm.notional == 100.0
     assert sm.side_code == +1
     assert sm.tick_sign == 0
-    assert sm.cvd_notional == 100.0
     assert sm.trade_count == 1
     assert sm.buy_trade_count == 1
     assert sm.sell_trade_count == 0
-    assert sm.consecutive_buy_trade_count == 1
     assert st.has_trades() is True
 
 
@@ -229,46 +263,25 @@ def test_time_since_features_with_as_of():
         st.fill_trade_features(out, as_of_local_ts_us=999_999)
 
 
-def test_consecutive_counts():
-    st = ts.TradeState()
-    st.apply_trade(make_trade(1, 100, 1, +1))
-    assert st.consecutive_buy_trade_count == 1
-    st.apply_trade(make_trade(2, 100, 1, +1))
-    assert st.consecutive_buy_trade_count == 2
-    st.apply_trade(make_trade(3, 100, 1, -1))
-    assert st.consecutive_sell_trade_count == 1 and st.consecutive_buy_trade_count == 0
-    st.apply_trade(make_trade(4, 100, 1, -1))
-    assert st.consecutive_sell_trade_count == 2
-    st.apply_trade(make_trade(5, 100, 1, 0))
-    assert st.consecutive_sell_trade_count == 0 and st.consecutive_buy_trade_count == 0
-
-
 def test_trade_history_asof_nonpositive_query_returns_default():
     h = ts.TradeHistory()
-    assert h.asof_value("cvd_notional", 0, default=-7.0) == -7.0
-    assert h.asof_value("cvd_notional", -1, default=-7.0) == -7.0
+    assert h.asof_value("notional", 0, default=-7.0) == -7.0
+    assert h.asof_value("notional", -1, default=-7.0) == -7.0
 
     h.append(
         ts_us=1_000_000,
-        price=100.0,
-        amount=1.0,
         notional=100.0,
         signed_notional=100.0,
         side_code=ts.BUY_SIDE_CODE,
         tick_sign=0,
         buy_notional=100.0,
         sell_notional=0.0,
-        buy_count=1,
-        sell_count=0,
-        unknown_count=0,
-        cvd_notional=100.0,
     )
 
-    assert h.asof_value("cvd_notional", 0, default=-7.0) == -7.0
-    assert h.asof_value("cvd_notional", -1, default=-7.0) == -7.0
-    assert h.asof_value("cvd_notional", 999_999, default=-7.0) == -7.0
-    assert h.asof_value("cvd_notional", 1_000_000, default=-7.0) == 100.0
-
+    assert h.asof_value("notional", 0, default=-7.0) == -7.0
+    assert h.asof_value("notional", -1, default=-7.0) == -7.0
+    assert h.asof_value("notional", 999_999, default=-7.0) == -7.0
+    assert h.asof_value("notional", 1_000_000, default=-7.0) == 100.0
 
 def test_fill_trade_features_handles_early_asof_windows_without_crashing():
     st = ts.TradeState()
@@ -282,7 +295,7 @@ def test_fill_trade_features_handles_early_asof_windows_without_crashing():
     assert fv_value(out, "max_signed_trade_notional_usd_1000000us") == pytest.approx(100.0 * 2.0)
 
 
-def test_top5_and_max_signed_notional():
+def test_max_signed_trade_notional_preserves_largest_abs_sign():
     st = ts.TradeState()
     vals = [(10, +1), (50, -1), (30, +1), (20, -1), (40, +1), (60, -1)]
     for i, (n, s) in enumerate(vals):
@@ -291,7 +304,7 @@ def test_top5_and_max_signed_notional():
     assert fv_value(v, "max_signed_trade_notional_usd_1000000us") == pytest.approx(-60)
 
 
-def test_p90_over_median_and_entropy():
+def test_trade_sign_entropy_is_bounded_and_nonzero():
     st = ts.TradeState()
     rows = [(10, +1), (20, +1), (40, +1), (15, -1), (30, -1), (60, -1), (5, 0)]
     for i, (n, s) in enumerate(rows):

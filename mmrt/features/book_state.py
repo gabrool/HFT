@@ -133,9 +133,6 @@ def _finite(value: float) -> float:
 def _safe_bps_change(new_value: float, old_value: float) -> float:
     return _finite(k.bps_change(new_value, old_value))
 
-def _safe_z(current: float, mean: float, std: float) -> float:
-    return 0.0 if std <= FLOAT_EPS else _finite((current - mean) / std)
-
 @dataclass(frozen=True, slots=True)
 class BookSnapshotInput:
     local_ts_us: int
@@ -162,7 +159,23 @@ class BookSummary:
     bid_depth_5bps_size:float; ask_depth_5bps_size:float; bid_depth_5bps_notional:float; ask_depth_5bps_notional:float; total_depth_5bps_size:float; total_depth_5bps_notional:float; depth_imbalance_5bps:float; is_crossed:bool; update_count:int
 
 class BookHistory:
-    FIELDS=("ts_us","mid","spread_bps","microprice","micro_minus_mid_bps","mid_return_bps","bid_sz1","ask_sz1","bid_px1","ask_px1","obi_l1","obi_l3","depth_imbalance_1bps","depth_imbalance_5bps","total_depth_1bps_size","bid_depth_1bps_size","ask_depth_1bps_size","total_depth_5bps_size","bid_depth_5bps_size","ask_depth_5bps_size","total_depth_5bps_notional","bid_depth_5bps_notional","ask_depth_5bps_notional","ofi_l1","ofi_l3","ofi_l5","ofi_l10","bid_l1_add","bid_l1_rem","ask_l1_add","ask_l1_rem","bid_price_changed","ask_price_changed","spread_changed","mid_changed","micro_l5_minus_mid_bps","micro_l10_minus_mid_bps","vamp_l5_minus_mid_bps","vamp_l10_minus_mid_bps")
+    FIELDS = (
+        "ts_us",
+        "mid",
+        "microprice",
+        "micro_minus_mid_bps",
+        "depth_imbalance_5bps",
+        "total_depth_1bps_size",
+        "ofi_l1",
+        "ofi_l10",
+        "bid_l1_add",
+        "bid_l1_rem",
+        "ask_l1_add",
+        "ask_l1_rem",
+        "bid_price_changed",
+        "ask_price_changed",
+        "spread_changed",
+    )
     def __init__(self, capacity: int = DEFAULT_HISTORY_CAPACITY):
         self.capacity = _require_positive_capacity(capacity); self.size = 0; self.write_pos = 0
         self._arrays = {f: np.zeros(self.capacity, dtype=np.int64 if f=="ts_us" else np.float64) for f in self.FIELDS}
@@ -203,26 +216,13 @@ class BookState:
     def _microprice_l1(self)->float: return _finite(k.microprice(self.current_bid_px[0],self.current_ask_px[0],self.current_bid_sz[0],self.current_ask_sz[0]))
     def _micro_minus_mid_bps(self)->float: return _safe_bps_change(self._microprice_l1(), self._mid())
     def _sum_size(self, side:str, n:int)->float: return float(np.sum((self.current_bid_sz if side=="bid" else self.current_ask_sz)[:n]))
-    def _sum_notional(self, side:str, n:int)->float: px=self.current_bid_px if side=="bid" else self.current_ask_px; sz=self.current_bid_sz if side=="bid" else self.current_ask_sz; return float(np.sum(px[:n]*sz[:n]))
     def _obi(self,n:int)->float: b=self._sum_size("bid",n); a=self._sum_size("ask",n); d=b+a; return 0.0 if d<=FLOAT_EPS else (b-a)/d
     def _depth_size_within_bps(self, side:str, bps:float)->float: code=BID_SIDE_CODE if side=="bid" else ASK_SIDE_CODE; return _finite(k.depth_within_bps(self.current_bid_px if side=="bid" else self.current_ask_px, self.current_bid_sz if side=="bid" else self.current_ask_sz, self._mid(), code, float(bps)))
     def _depth_notional_within_bps(self, side:str, bps:float)->float: code=BID_SIDE_CODE if side=="bid" else ASK_SIDE_CODE; return _finite(k.notional_depth_within_bps(self.current_bid_px if side=="bid" else self.current_ask_px, self.current_bid_sz if side=="bid" else self.current_ask_sz, self._mid(), code, float(bps)))
     def _depth_imbalance_within_bps(self,bps:float)->float: b=self._depth_size_within_bps("bid",bps); a=self._depth_size_within_bps("ask",bps); d=a+b; return 0.0 if d<=FLOAT_EPS else (b-a)/d
     def _micro_depth(self,n:int)->float:
         num=float(np.sum(self.current_ask_px[:n]*self.current_bid_sz[:n]+self.current_bid_px[:n]*self.current_ask_sz[:n])); den=float(np.sum(self.current_bid_sz[:n]+self.current_ask_sz[:n])); return 0.0 if den<=FLOAT_EPS else num/den
-    def _vamp_depth(self,n:int)->float:
-        num=float(np.sum(self.current_ask_px[:n]*self.current_ask_sz[:n]+self.current_bid_px[:n]*self.current_bid_sz[:n])); den=float(np.sum(self.current_bid_sz[:n]+self.current_ask_sz[:n])); return 0.0 if den<=FLOAT_EPS else num/den
     def _minus_mid_bps(self,value:float)->float: return _safe_bps_change(value,self._mid())
-    def _gap_b_bps(self)->float: return _safe_bps_change(self.current_bid_px[0],self.current_bid_px[1]) if self.current_bid_px[1]>0 else 0.0
-    def _liquidity_void(self,side:str)->float:
-        px=self.current_bid_px if side=="bid" else self.current_ask_px; sz=self.current_bid_sz if side=="bid" else self.current_ask_sz
-        pos=sz[:MAX_EMITTED_DEPTH][sz[:MAX_EMITTED_DEPTH]>0.0]
-        if pos.size==0: return 0.0
-        min_size=float(np.median(pos)); code=BID_SIDE_CODE if side=="bid" else ASK_SIDE_CODE
-        return _finite(k.liquidity_void_bps(px,sz,self._mid(),code,min_size))
-    def _depth_centroid(self, side:str, max_bps:float=25.0)->float:
-        code=BID_SIDE_CODE if side=="bid" else ASK_SIDE_CODE
-        return _finite(k.depth_centroid_bps(self.current_bid_px if side=="bid" else self.current_ask_px, self.current_bid_sz if side=="bid" else self.current_ask_sz, self._mid(), code, max_bps))
     def _ofi_by_level(self)->np.ndarray:
         if self.update_count<=1: return np.zeros(10,dtype=np.float64)
         out=np.zeros(10,dtype=np.float64)
@@ -246,33 +246,89 @@ class BookState:
             d=self.current_ask_sz[0]-self.previous_ask_sz[0]; ask_add=max(d,0.0); ask_rem=max(-d,0.0)
         return bid_add,bid_rem,ask_add,ask_rem
     def apply_snapshot(self, snapshot: BookSnapshotInput) -> BookSummary:
-        if not isinstance(snapshot, BookSnapshotInput): raise TypeError("snapshot")
-        if self.last_local_ts_us is not None and snapshot.local_ts_us < self.last_local_ts_us: raise ValueError("local_ts_us")
-        self.previous_bid_px[:]=self.current_bid_px; self.previous_bid_sz[:]=self.current_bid_sz; self.previous_ask_px[:]=self.current_ask_px; self.previous_ask_sz[:]=self.current_ask_sz
-        self.current_bid_px[:]=snapshot.bid_px; self.current_bid_sz[:]=snapshot.bid_sz; self.current_ask_px[:]=snapshot.ask_px; self.current_ask_sz[:]=snapshot.ask_sz
-        self.last_snapshot=snapshot; self.last_local_ts_us=snapshot.local_ts_us; self.update_count+=1
-        now=snapshot.local_ts_us; mid=self._mid(); spread=self._spread_bps(); micro=self._microprice_l1(); mmm=self._micro_minus_mid_bps()
-        m5=self._minus_mid_bps(self._micro_depth(5)); m10=self._minus_mid_bps(self._micro_depth(10)); v5=self._minus_mid_bps(self._vamp_depth(5)); v10=self._minus_mid_bps(self._vamp_depth(10))
-        ofi=self._ofi_by_level(); ofi1,ofi3,ofi5,ofi10=ofi[0],float(np.sum(ofi[:3])),float(np.sum(ofi[:5])),float(np.sum(ofi[:10]))
-        bid_add,bid_rem,ask_add,ask_rem=self._l1_add_rem()
-        first=self.update_count==1
-        bid_price_changed=0.0 if first else float(self.current_bid_px[0]!=self.previous_bid_px[0])
-        ask_price_changed=0.0 if first else float(self.current_ask_px[0]!=self.previous_ask_px[0])
-        prev_spread=spread if first else _finite(k.spread_bps(self.previous_bid_px[0],self.previous_ask_px[0]))
-        spread_changed=0.0 if first else float(abs(spread-prev_spread)>FLOAT_EPS)
-        prev_mid=mid if first else _finite(k.mid_price(self.previous_bid_px[0],self.previous_ask_px[0]))
-        mid_changed=0.0 if first else float(abs(mid-prev_mid)>FLOAT_EPS)
-        mid_ret=0.0 if first else (10_000.0*math.log(mid/prev_mid) if prev_mid>0 and mid>0 else 0.0)
-        if self.first_mid_ts_us is None: self.first_mid_ts_us=now
-        if self.last_mid_change_ts_us is None or mid_changed>0: self.last_mid_change_ts_us=now
-        if self.bid_size_age_start_ts_us is None or self.current_bid_px[0]!=self.previous_bid_px[0] or self.current_bid_sz[0]!=self.previous_bid_sz[0]: self.bid_size_age_start_ts_us=now
-        if self.ask_size_age_start_ts_us is None or self.current_ask_px[0]!=self.previous_ask_px[0] or self.current_ask_sz[0]!=self.previous_ask_sz[0]: self.ask_size_age_start_ts_us=now
-        if self.depth_stable_start_ts_us is None or mid_changed>0 or self.current_bid_sz[0]!=self.previous_bid_sz[0] or self.current_ask_sz[0]!=self.previous_ask_sz[0]: self.depth_stable_start_ts_us=now
-        b1=self._depth_size_within_bps("bid",1.0); a1=self._depth_size_within_bps("ask",1.0); t1=b1+a1
-        b5s=self._depth_size_within_bps("bid",5.0); a5s=self._depth_size_within_bps("ask",5.0); t5s=b5s+a5s
-        b5n=self._depth_notional_within_bps("bid",5.0); a5n=self._depth_notional_within_bps("ask",5.0); t5n=b5n+a5n
-        di1=0.0 if t1<=FLOAT_EPS else (b1-a1)/t1; di5=0.0 if t5n<=FLOAT_EPS else (b5n-a5n)/t5n
-        self.history.append(ts_us=now,mid=mid,spread_bps=spread,microprice=micro,micro_minus_mid_bps=mmm,mid_return_bps=mid_ret,bid_sz1=self.current_bid_sz[0],ask_sz1=self.current_ask_sz[0],bid_px1=self.current_bid_px[0],ask_px1=self.current_ask_px[0],obi_l1=self._obi(1),obi_l3=self._obi(3),depth_imbalance_1bps=di1,depth_imbalance_5bps=di5,total_depth_1bps_size=t1,bid_depth_1bps_size=b1,ask_depth_1bps_size=a1,total_depth_5bps_size=t5s,bid_depth_5bps_size=b5s,ask_depth_5bps_size=a5s,total_depth_5bps_notional=t5n,bid_depth_5bps_notional=b5n,ask_depth_5bps_notional=a5n,ofi_l1=ofi1,ofi_l3=ofi3,ofi_l5=ofi5,ofi_l10=ofi10,bid_l1_add=bid_add,bid_l1_rem=bid_rem,ask_l1_add=ask_add,ask_l1_rem=ask_rem,bid_price_changed=bid_price_changed,ask_price_changed=ask_price_changed,spread_changed=spread_changed,mid_changed=mid_changed,micro_l5_minus_mid_bps=m5,micro_l10_minus_mid_bps=m10,vamp_l5_minus_mid_bps=v5,vamp_l10_minus_mid_bps=v10)
+        if not isinstance(snapshot, BookSnapshotInput):
+            raise TypeError("snapshot")
+        if self.last_local_ts_us is not None and snapshot.local_ts_us < self.last_local_ts_us:
+            raise ValueError("local_ts_us")
+        self.previous_bid_px[:] = self.current_bid_px
+        self.previous_bid_sz[:] = self.current_bid_sz
+        self.previous_ask_px[:] = self.current_ask_px
+        self.previous_ask_sz[:] = self.current_ask_sz
+        self.current_bid_px[:] = snapshot.bid_px
+        self.current_bid_sz[:] = snapshot.bid_sz
+        self.current_ask_px[:] = snapshot.ask_px
+        self.current_ask_sz[:] = snapshot.ask_sz
+        self.last_snapshot = snapshot
+        self.last_local_ts_us = snapshot.local_ts_us
+        self.update_count += 1
+
+        now = snapshot.local_ts_us
+        mid = self._mid()
+        spread = self._spread_bps()
+        micro = self._microprice_l1()
+        micro_minus_mid = self._micro_minus_mid_bps()
+        ofi = self._ofi_by_level()
+        ofi_l1 = float(ofi[0])
+        ofi_l10 = float(np.sum(ofi[:10]))
+        bid_add, bid_rem, ask_add, ask_rem = self._l1_add_rem()
+        first = self.update_count == 1
+        bid_price_changed = 0.0 if first else float(self.current_bid_px[0] != self.previous_bid_px[0])
+        ask_price_changed = 0.0 if first else float(self.current_ask_px[0] != self.previous_ask_px[0])
+        prev_spread = spread if first else _finite(k.spread_bps(self.previous_bid_px[0], self.previous_ask_px[0]))
+        spread_changed = 0.0 if first else float(abs(spread - prev_spread) > FLOAT_EPS)
+        prev_mid = mid if first else _finite(k.mid_price(self.previous_bid_px[0], self.previous_ask_px[0]))
+        mid_changed = 0.0 if first else float(abs(mid - prev_mid) > FLOAT_EPS)
+
+        if self.first_mid_ts_us is None:
+            self.first_mid_ts_us = now
+        if self.last_mid_change_ts_us is None or mid_changed > 0:
+            self.last_mid_change_ts_us = now
+        if (
+            self.bid_size_age_start_ts_us is None
+            or self.current_bid_px[0] != self.previous_bid_px[0]
+            or self.current_bid_sz[0] != self.previous_bid_sz[0]
+        ):
+            self.bid_size_age_start_ts_us = now
+        if (
+            self.ask_size_age_start_ts_us is None
+            or self.current_ask_px[0] != self.previous_ask_px[0]
+            or self.current_ask_sz[0] != self.previous_ask_sz[0]
+        ):
+            self.ask_size_age_start_ts_us = now
+        if (
+            self.depth_stable_start_ts_us is None
+            or mid_changed > 0
+            or self.current_bid_sz[0] != self.previous_bid_sz[0]
+            or self.current_ask_sz[0] != self.previous_ask_sz[0]
+        ):
+            self.depth_stable_start_ts_us = now
+
+        total_depth_1bps = self._depth_size_within_bps("bid", 1.0) + self._depth_size_within_bps("ask", 1.0)
+        bid_depth_5bps_notional = self._depth_notional_within_bps("bid", 5.0)
+        ask_depth_5bps_notional = self._depth_notional_within_bps("ask", 5.0)
+        total_depth_5bps_notional = bid_depth_5bps_notional + ask_depth_5bps_notional
+        depth_imbalance_5bps = (
+            0.0
+            if total_depth_5bps_notional <= FLOAT_EPS
+            else (bid_depth_5bps_notional - ask_depth_5bps_notional) / total_depth_5bps_notional
+        )
+        self.history.append(
+            ts_us=now,
+            mid=mid,
+            microprice=micro,
+            micro_minus_mid_bps=micro_minus_mid,
+            depth_imbalance_5bps=depth_imbalance_5bps,
+            total_depth_1bps_size=total_depth_1bps,
+            ofi_l1=ofi_l1,
+            ofi_l10=ofi_l10,
+            bid_l1_add=bid_add,
+            bid_l1_rem=bid_rem,
+            ask_l1_add=ask_add,
+            ask_l1_rem=ask_rem,
+            bid_price_changed=bid_price_changed,
+            ask_price_changed=ask_price_changed,
+            spread_changed=spread_changed,
+        )
         return self.current_summary()
     def current_summary(self)->BookSummary:
         if not self.has_book(): raise ValueError("no book")
@@ -280,32 +336,9 @@ class BookState:
         return BookSummary(self.last_snapshot.local_ts_us,self.last_snapshot.ts_us,self.last_snapshot.event_seq,self.current_bid_px[0],self.current_ask_px[0],self.current_bid_sz[0],self.current_ask_sz[0],mid,self._spread_bps(),self._microprice_l1(),self._micro_minus_mid_bps(),b5s,a5s,b5n,a5n,t5s,t5n,0.0 if t5n<=FLOAT_EPS else (b5n-a5n)/t5n,self.current_bid_px[0]>self.current_ask_px[0],self.update_count)
     def _window_values(self, field_name:str, window_us:int)->np.ndarray: return self.history.values_in_window(field_name,self.last_local_ts_us,window_us)
     def _asof_value(self, field_name: str, query_ts_us: int, default: float = 0.0) -> float: return self.history.asof_value(field_name, query_ts_us, default)
-    def _ret_bps_asof(self, field_name: str, window_us: int) -> float:
-        now=self.last_local_ts_us; cur=self._asof_value(field_name, now, 0.0); past=self._asof_value(field_name, now-window_us, 0.0)
-        if past<=0.0 or cur<=0.0: return 0.0
-        return _safe_bps_change(cur,past)
-    def _mid_returns_in_window(self, window_us: int) -> np.ndarray:
-        vals=self._window_values("mid_return_bps",window_us); vals=vals[np.isfinite(vals)]
-        return vals
-    def _return_std_bps(self, window_us: int) -> float:
-        r=self._mid_returns_in_window(window_us); return float(np.std(r)) if r.size>=2 else 0.0
-    def _max_abs_mid_return_bps(self, window_us: int) -> float:
-        r=self._mid_returns_in_window(window_us); return float(np.max(np.abs(r))) if r.size else 0.0
-    def _down_up_vol_imbalance(self, window_us: int) -> float:
-        r=self._mid_returns_in_window(window_us)
-        if r.size==0: return 0.0
-        up=math.sqrt(float(np.sum(np.square(r[r>0.0])))) if np.any(r>0.0) else 0.0
-        down=math.sqrt(float(np.sum(np.square(r[r<0.0])))) if np.any(r<0.0) else 0.0
-        den=down+up
-        return 0.0 if den<=FLOAT_EPS else float(np.clip((down-up)/den,-1.0,1.0))
     def _window_ts(self, window_us:int)->np.ndarray: return self.history.ts_in_window(self.last_local_ts_us,window_us)
     def _rolling_sum(self, field_name:str, window_us:int)->float: return float(np.sum(self._window_values(field_name,window_us)))
     def _rolling_mean(self, field_name:str, window_us:int)->float: v=self._window_values(field_name,window_us); return float(np.mean(v)) if v.size else 0.0
-    def _rolling_std(self, field_name:str, window_us:int)->float: v=self._window_values(field_name,window_us); return float(np.std(v)) if v.size else 0.0
-    def _rolling_max_abs(self, field_name:str, window_us:int)->float: v=self._window_values(field_name,window_us); return float(np.max(np.abs(v))) if v.size else 0.0
-    def _rolling_range_bps(self, field_name:str, window_us:int)->float:
-        v=self._window_values(field_name,window_us); v=v[np.isfinite(v) & (v>0)]
-        return _safe_bps_change(float(np.max(v)),float(np.min(v))) if v.size else 0.0
     def _rolling_slope_per_sec(self, field_name:str, window_us:int)->float:
         v=self._window_values(field_name,window_us); t=self._window_ts(window_us)
         if v.size<2: return 0.0
@@ -320,30 +353,15 @@ class BookState:
         return 0.0 if dt<=FLOAT_EPS else _safe_bps_change(v[p[-1]],v[p[0]])/dt
     def _rolling_update_rate(self, window_us:int)->float: return float(self._window_ts(window_us).size)/(window_us/1e6)
     def _rolling_count(self, field_name:str, window_us:int)->float: return float(self._window_values(field_name,window_us).size)
-    def _rolling_return_std_bps(self, field_name:str, window_us:int)->float:
+    def _rolling_realized_vol_bps(self, field_name:str, window_us:int)->float:
         v=self._window_values(field_name,window_us); v=v[np.isfinite(v)&(v>0)]
         if v.size<2: return 0.0
         r=np.array([_safe_bps_change(v[i],v[i-1]) for i in range(1,v.size)],dtype=np.float64)
         return float(np.std(r)) if r.size else 0.0
-    def _rolling_realized_vol_bps(self, field_name:str, window_us:int)->float: return self._rolling_return_std_bps(field_name,window_us)
-    def _rolling_diff_std(self, field_name:str, window_us:int)->float:
-        v=self._window_values(field_name,window_us); d=np.diff(v)
-        return float(np.std(d)) if d.size else 0.0
     def _zero_cross_rate(self, window_us:int)->float:
         v=self._window_values("micro_minus_mid_bps",window_us); s=np.sign(v); s=s[s!=0]
         if s.size<2: return 0.0
         return float(np.sum(s[1:]!=s[:-1]))/(window_us/1e6)
-    def _arrival_clumpiness(self, window_us:int)->float:
-        t=self._window_ts(window_us)
-        if t.size<3: return 0.0
-        d=np.diff(t).astype(np.float64); m=float(np.mean(d))
-        return 0.0 if m<=FLOAT_EPS else float(np.std(d)/m)
-    def _mid_run_length_max(self, window_us:int)->float:
-        v=self._window_values("mid",window_us)
-        if v.size==0: return 0.0
-        best=run=1
-        for i in range(1,v.size): run=run+1 if abs(v[i]-v[i-1])<=1e-12 else 1; best=max(best,run)
-        return float(best)
     def fill_book_features(self, out: np.ndarray) -> np.ndarray:
         if not self.has_book():
             raise ValueError

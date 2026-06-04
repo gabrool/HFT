@@ -79,6 +79,34 @@ def test_public_api_boundary():
                 assert tok not in low
 
 
+def test_engine_event_windows_are_active_only():
+    assert eg.ENGINE_EVENT_WINDOWS_US == (
+        eg.WINDOW_200MS_US,
+        eg.WINDOW_500MS_US,
+        eg.WINDOW_1000MS_US,
+        eg.WINDOW_3000MS_US,
+    )
+
+
+def test_no_inactive_engine_helpers_remain():
+    import inspect
+
+    src = inspect.getsource(eg)
+    forbidden = [
+        "WINDOW_" + "100MS_US",
+        "_trade_total_" + "notional",
+        "_trade_" + "vwap",
+        "_book_" + "mean",
+        "_current_depth_" + "size",
+        "_current_depth_" + "notional",
+        "log_events_" + "100000us",
+        "vwap_vs_" + "mid",
+        "trade_impact_" + "half_life",
+    ]
+    for token in forbidden:
+        assert token not in src
+
+
 def test_no_forbidden_imports():
     code = r'''
 import sys

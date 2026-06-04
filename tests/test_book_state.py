@@ -40,6 +40,59 @@ def test_public_api_boundary():
             assert bad not in low
 
 
+def test_book_history_fields_are_active_minimal():
+    assert bs.BookHistory.FIELDS == (
+        "ts_us",
+        "mid",
+        "microprice",
+        "micro_minus_mid_bps",
+        "depth_imbalance_5bps",
+        "total_depth_1bps_size",
+        "ofi_l1",
+        "ofi_l10",
+        "bid_l1_add",
+        "bid_l1_rem",
+        "ask_l1_add",
+        "ask_l1_rem",
+        "bid_price_changed",
+        "ask_price_changed",
+        "spread_changed",
+    )
+
+
+def test_no_inactive_book_feature_computation_remains():
+    import inspect
+
+    src = inspect.getsource(bs)
+    forbidden = [
+        "_safe_z",
+        "_gap_b_bps",
+        "_liquidity_void",
+        "_depth_centroid",
+        "_vamp_depth",
+        "_ret_bps_asof",
+        "_mid_returns_in_window",
+        "_return_std_bps",
+        "_max_abs_mid_return_bps",
+        "_down_up_vol_imbalance",
+        "_rolling_std",
+        "_rolling_max_abs",
+        "_rolling_range_bps",
+        "_rolling_diff_std",
+        "_arrival_clumpiness",
+        "_mid_run_length_max",
+        "micro_l5_minus_mid_bps",
+        "vamp_l5_minus_mid_bps",
+        "vamp_l10_minus_mid_bps",
+        "mid_return_bps",
+        "ofi_l3",
+        "ofi_l5",
+        "obi_l3",
+    ]
+    for token in forbidden:
+        assert token not in src
+
+
 def test_no_forbidden_imports():
     code = r'''
 import sys

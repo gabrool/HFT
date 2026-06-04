@@ -35,13 +35,12 @@ TRADE_EVENT_CODE = 2
 
 DECISION_STRIDE_US = 500_000
 
-WINDOW_100MS_US = 100_000
 WINDOW_200MS_US = 200_000
 WINDOW_500MS_US = 500_000
 WINDOW_1000MS_US = 1_000_000
 WINDOW_3000MS_US = 3_000_000
 
-ENGINE_EVENT_WINDOWS_US = (WINDOW_100MS_US, WINDOW_200MS_US, WINDOW_500MS_US, WINDOW_1000MS_US, WINDOW_3000MS_US)
+ENGINE_EVENT_WINDOWS_US = (WINDOW_200MS_US, WINDOW_500MS_US, WINDOW_1000MS_US, WINDOW_3000MS_US)
 DEFAULT_EVENT_HISTORY_CAPACITY = 131_072
 FLOAT_EPS = 1e-12
 
@@ -291,15 +290,9 @@ class FeatureEngine:
     def _trade_sum(self, field_name: str, window_us: int, now_us: int) -> float: return float(np.sum(self._trade_values(field_name, window_us, now_us)))
     def _trade_buy_notional(self, window_us: int, now_us: int) -> float: return self._trade_sum("buy_notional", window_us, now_us)
     def _trade_sell_notional(self, window_us: int, now_us: int) -> float: return self._trade_sum("sell_notional", window_us, now_us)
-    def _trade_total_notional(self, window_us: int, now_us: int) -> float: return self._trade_buy_notional(window_us, now_us) + self._trade_sell_notional(window_us, now_us)
-    def _trade_vwap(self, window_us: int, now_us: int) -> float:
-        amount = self._trade_values("amount", window_us, now_us); notional = self._trade_values("notional", window_us, now_us)
-        den = float(np.sum(amount)); return 0.0 if den <= FLOAT_EPS else _safe_div(float(np.sum(notional)), den, 0.0)
     def _book_values(self, field_name: str, window_us: int, now_us: int) -> np.ndarray:
         return self.book_state.history.values_in_window(field_name, now_us, window_us)
     def _book_sum(self, field_name: str, window_us: int, now_us: int) -> float: return float(np.sum(self._book_values(field_name, window_us, now_us)))
-    def _book_mean(self, field_name: str, window_us: int, now_us: int) -> float:
-        v = self._book_values(field_name, window_us, now_us); return float(np.mean(v)) if v.size else 0.0
     def _book_realized_vol_bps(self, field_name: str, window_us: int, now_us: int) -> float:
         vals = self._book_values(field_name, window_us, now_us)
         vals = vals[np.isfinite(vals) & (vals > 0.0)]
@@ -308,8 +301,7 @@ class FeatureEngine:
         return float(np.std(ret)) if ret.size else 0.0
     def _book_current_summary(self) -> BookSummary: return self.book_state.current_summary()
     def _replenishment_ratio(self, add_sum: float, rem_sum: float) -> float: return _safe_div(add_sum, max(add_sum + rem_sum, FLOAT_EPS), 0.0)
-    def _current_depth_size(self) -> float: return self._book_current_summary().total_depth_5bps_size
-    def _current_depth_notional(self) -> float: return self._book_current_summary().total_depth_5bps_notional
+
 
     def fill_engine_features(self, out: np.ndarray, *, as_of_local_ts_us: int, previous_decision_local_ts_us: int | None = None) -> np.ndarray:
         if not self.is_ready():
