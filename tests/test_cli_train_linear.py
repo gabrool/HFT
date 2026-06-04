@@ -125,6 +125,21 @@ def test_train_linear_accepts_corr_pruned_v3_head_feature_preset() -> None:
     assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 6
 
 
+def test_train_linear_accepts_corr_pruned_v4_head_feature_preset() -> None:
+    parser = cli.build_arg_parser()
+    args = parser.parse_args([
+        "--dataset-root", "/tmp/ds",
+        "--output-dir", "/tmp/out",
+        "--head-feature-preset", "corr_pruned152_head_subset_v4",
+    ])
+    cfg = cli._config_from_args(args)
+    assert cfg.head_feature_config.feature_columns_by_head is not None
+    assert len(cfg.head_feature_config.feature_columns_by_head["direction"]) == 23
+    assert len(cfg.head_feature_config.feature_columns_by_head["no_move"]) == 38
+    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_up"]) == 14
+    assert len(cfg.head_feature_config.feature_columns_by_head["magnitude_down"]) == 6
+
+
 def test_parser_rejects_bad_head_feature_preset() -> None:
     parser = cli.build_arg_parser()
     with pytest.raises(SystemExit):
