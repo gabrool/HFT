@@ -28,14 +28,12 @@ MAX_EMITTED_DEPTH = 20
 BID_SIDE_CODE = 1
 ASK_SIDE_CODE = -1
 
-WINDOW_100MS_US = 100_000
 WINDOW_200MS_US = 200_000
 WINDOW_500MS_US = 500_000
 WINDOW_1000MS_US = 1_000_000
 WINDOW_3000MS_US = 3_000_000
 
 BOOK_WINDOWS_US = (
-    WINDOW_100MS_US,
     WINDOW_200MS_US,
     WINDOW_500MS_US,
     WINDOW_1000MS_US,
@@ -124,8 +122,6 @@ def _validate_book_order(px: np.ndarray, side_name: str) -> None:
                 raise ValueError(side_name)
         prev = p
 
-def _new_feature_vector(fill_value: float = 0.0) -> np.ndarray:
-    return np.full((FEATURE_COUNT,), fill_value, dtype=np.float64)
 
 def _finite(value: float) -> float:
     return float(value) if np.isfinite(value) else 0.0
@@ -180,9 +176,18 @@ class BookHistory:
         self.capacity = _require_positive_capacity(capacity); self.size = 0; self.write_pos = 0
         self._arrays = {f: np.zeros(self.capacity, dtype=np.int64 if f=="ts_us" else np.float64) for f in self.FIELDS}
     def append(self, **kwargs):
+        got = set(kwargs)
+        expected = set(self.FIELDS)
+        missing = expected - got
+        extra = got - expected
+        if missing or extra:
+            raise KeyError(f"book history fields mismatch missing={sorted(missing)} extra={sorted(extra)}")
+
         i = self.write_pos
-        for f,a in self._arrays.items(): a[i] = kwargs.get(f, 0)
-        self.write_pos = (i+1)%self.capacity; self.size = min(self.size+1, self.capacity)
+        for f, a in self._arrays.items():
+            a[i] = kwargs[f]
+        self.write_pos = (i + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
     def ordered_slice(self, field_name:str)->np.ndarray:
         arr=self._arrays[field_name]
         if self.size==0: return arr[:0].copy()
@@ -194,13 +199,6 @@ class BookHistory:
         return vals[ts>=now_us-window_us] if ts.size else vals
     def ts_in_window(self, now_us:int, window_us:int)->np.ndarray:
         ts=self.ordered_ts(); return ts[ts>=now_us-window_us] if ts.size else ts
-    def asof_value(self, field_name: str, query_ts_us: int, default: float = 0.0) -> float:
-        ts = self.ordered_ts(); vals = self.ordered_slice(field_name)
-        if ts.size == 0 or query_ts_us <= 0: return float(default)
-        idx = k.asof_index_right(ts.astype(np.int64, copy=False), int(query_ts_us))
-        if idx < 0: return float(default)
-        val = vals[idx]
-        return float(val) if np.isfinite(val) else float(default)
 
 class BookState:
     def __init__(self, history_capacity:int=DEFAULT_HISTORY_CAPACITY): self._history_capacity=_require_positive_capacity(history_capacity); self.history=BookHistory(self._history_capacity); self.reset()
@@ -209,7 +207,7 @@ class BookState:
         z=np.zeros(BOOK_DEPTH,dtype=np.float64)
         self.current_bid_px=z.copy(); self.current_bid_sz=z.copy(); self.current_ask_px=z.copy(); self.current_ask_sz=z.copy()
         self.previous_bid_px=z.copy(); self.previous_bid_sz=z.copy(); self.previous_ask_px=z.copy(); self.previous_ask_sz=z.copy()
-        self.first_mid_ts_us=None; self.last_mid_change_ts_us=None; self.bid_size_age_start_ts_us=None; self.ask_size_age_start_ts_us=None; self.depth_stable_start_ts_us=None
+        self.last_mid_change_ts_us=None; self.bid_size_age_start_ts_us=None; self.ask_size_age_start_ts_us=None
     def has_book(self)->bool: return self.update_count>0
     def _mid(self)->float: return _finite(k.mid_price(self.current_bid_px[0],self.current_ask_px[0]))
     def _spread_bps(self)->float: return _finite(k.spread_bps(self.current_bid_px[0],self.current_ask_px[0]))
@@ -279,8 +277,6 @@ class BookState:
         prev_mid = mid if first else _finite(k.mid_price(self.previous_bid_px[0], self.previous_ask_px[0]))
         mid_changed = 0.0 if first else float(abs(mid - prev_mid) > FLOAT_EPS)
 
-        if self.first_mid_ts_us is None:
-            self.first_mid_ts_us = now
         if self.last_mid_change_ts_us is None or mid_changed > 0:
             self.last_mid_change_ts_us = now
         if (
@@ -295,14 +291,6 @@ class BookState:
             or self.current_ask_sz[0] != self.previous_ask_sz[0]
         ):
             self.ask_size_age_start_ts_us = now
-        if (
-            self.depth_stable_start_ts_us is None
-            or mid_changed > 0
-            or self.current_bid_sz[0] != self.previous_bid_sz[0]
-            or self.current_ask_sz[0] != self.previous_ask_sz[0]
-        ):
-            self.depth_stable_start_ts_us = now
-
         total_depth_1bps = self._depth_size_within_bps("bid", 1.0) + self._depth_size_within_bps("ask", 1.0)
         bid_depth_5bps_notional = self._depth_notional_within_bps("bid", 5.0)
         ask_depth_5bps_notional = self._depth_notional_within_bps("ask", 5.0)
@@ -335,7 +323,6 @@ class BookState:
         mid=self._mid(); b5s=self._depth_size_within_bps("bid",5.0); a5s=self._depth_size_within_bps("ask",5.0); b5n=self._depth_notional_within_bps("bid",5.0); a5n=self._depth_notional_within_bps("ask",5.0); t5s=b5s+a5s; t5n=b5n+a5n
         return BookSummary(self.last_snapshot.local_ts_us,self.last_snapshot.ts_us,self.last_snapshot.event_seq,self.current_bid_px[0],self.current_ask_px[0],self.current_bid_sz[0],self.current_ask_sz[0],mid,self._spread_bps(),self._microprice_l1(),self._micro_minus_mid_bps(),b5s,a5s,b5n,a5n,t5s,t5n,0.0 if t5n<=FLOAT_EPS else (b5n-a5n)/t5n,self.current_bid_px[0]>self.current_ask_px[0],self.update_count)
     def _window_values(self, field_name:str, window_us:int)->np.ndarray: return self.history.values_in_window(field_name,self.last_local_ts_us,window_us)
-    def _asof_value(self, field_name: str, query_ts_us: int, default: float = 0.0) -> float: return self.history.asof_value(field_name, query_ts_us, default)
     def _window_ts(self, window_us:int)->np.ndarray: return self.history.ts_in_window(self.last_local_ts_us,window_us)
     def _rolling_sum(self, field_name:str, window_us:int)->float: return float(np.sum(self._window_values(field_name,window_us)))
     def _rolling_mean(self, field_name:str, window_us:int)->float: v=self._window_values(field_name,window_us); return float(np.mean(v)) if v.size else 0.0
