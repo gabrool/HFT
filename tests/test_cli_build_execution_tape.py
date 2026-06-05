@@ -8,8 +8,10 @@ from mmrt.cli.build_execution_tape import (
     ExecutionTapeBuildConfig,
     build_arg_parser,
     build_execution_tape_from_config,
+    load_reconstructed_l2_events,
     main,
 )
+from mmrt.execution.contracts import SymbolSpec
 from mmrt.execution.event_merge import ExecutionMergeTiePolicy
 from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_CODE_TRADE, load_execution_tape
 
@@ -24,8 +26,9 @@ def _write_l2_csv(path: Path, rows: list[dict[str, object]]) -> Path:
     return path
 
 
-def _write_trade_csv(path: Path, rows: list[dict[str, object]]) -> Path:
-    columns = ["timestamp", "local_timestamp", "side", "price", "amount", "trade_id"]
+def _write_trade_csv(path: Path, rows: list[dict[str, object]], columns: list[str] | None = None) -> Path:
+    if columns is None:
+        columns = ["timestamp", "local_timestamp", "side", "price", "amount", "trade_id"]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
@@ -127,6 +130,104 @@ def test_overwrite_protection(tmp_path):
         )
     )
     assert summary["status"] == "ok"
+
+
+def test_existing_build_summary_preflight_blocks_partial_tape_write(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+    output_root = tmp_path / "tape"
+    output_root.mkdir()
+    (output_root / "build_summary.json").write_text('{"old": true}\n', encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="build_summary"):
+        build_execution_tape_from_config(
+            ExecutionTapeBuildConfig(
+                l2_inputs=(str(l2_path),),
+                trade_inputs=(str(trade_path),),
+                output_root=str(output_root),
+            )
+        )
+
+    assert not (output_root / "manifest.json").exists()
+    assert not (output_root / "arrays").exists()
+
+
+def test_fallback_trade_source_rows_are_zero_based(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+    output_root = tmp_path / "tape"
+
+    build_execution_tape_from_config(
+        ExecutionTapeBuildConfig(
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(output_root),
+        )
+    )
+
+    loaded = load_execution_tape(output_root)
+    assert loaded.arrays.trades["source_row"].tolist() == [0, 1]
+
+
+def test_explicit_trade_source_rows_are_preserved(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(
+        tmp_path / "trades.csv",
+        [
+            {
+                "timestamp": 150,
+                "local_timestamp": 150,
+                "side": "buy",
+                "price": 100.2,
+                "amount": 0.01,
+                "trade_id": "t1",
+                "source_row": 10,
+            },
+            {
+                "timestamp": 250,
+                "local_timestamp": 250,
+                "side": "sell",
+                "price": 100.1,
+                "amount": 0.02,
+                "trade_id": "t2",
+                "source_row": 11,
+            },
+        ],
+        columns=["timestamp", "local_timestamp", "side", "price", "amount", "trade_id", "source_row"],
+    )
+    output_root = tmp_path / "tape"
+
+    build_execution_tape_from_config(
+        ExecutionTapeBuildConfig(
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(output_root),
+        )
+    )
+
+    loaded = load_execution_tape(output_root)
+    assert loaded.arrays.trades["source_row"].tolist() == [10, 11]
+
+
+def test_l2_stats_are_json_safe_and_do_not_include_reconstructor(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+
+    _, stats = load_reconstructed_l2_events(
+        (l2_path,),
+        symbol_spec=SymbolSpec(
+            exchange="binance-futures",
+            symbol="BTCUSDT",
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            max_qty=100.0,
+            min_notional=5.0,
+        ),
+        batch_size=65_536,
+    )
+
+    assert "reconstructor" not in stats
+    json.dumps(stats, sort_keys=True, allow_nan=True)
 
 
 def test_max_row_limits(tmp_path):
