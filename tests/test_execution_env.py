@@ -8,7 +8,6 @@ from mmrt.execution.contracts import (
     ActionSpec,
     BookLevelSnapshot,
     BookTop,
-    FillReason,
     OrderSide,
     PositionState,
     SymbolSpec,
@@ -269,7 +268,7 @@ def test_ask_trade_fill_updates_short_position():
     assert step.position.cash == pytest.approx(100.2)
 
 
-def test_l2_queue_depletion_fill_uses_book_depth_arrays():
+def test_l2_queue_decrease_advances_queue_without_artificial_fill():
     l2_events = [
         _l2(
             seq=0,
@@ -296,9 +295,14 @@ def test_l2_queue_depletion_fill_uses_book_depth_arrays():
 
     step = env.step(_bid_only_action())
 
-    assert len(step.fills) == 1
-    assert step.fills[0].reason == FillReason.QUEUE_DEPLETION
-    assert step.position.inventory_qty == pytest.approx(1.0)
+    assert step.fills == ()
+    assert step.position == PositionState()
+    assert len(env._state.live_orders) == 1
+    order = env._state.live_orders[0]
+    assert order.side == OrderSide.BUY
+    assert order.price_tick == 1000
+    assert order.queue_ahead_qty == pytest.approx(0.0)
+    assert order.remaining_qty == pytest.approx(1.0)
 
 
 def test_repeated_decision_cancels_previous_live_order():
@@ -402,6 +406,23 @@ def test_reset_rejects_tape_without_valid_two_sided_book():
         env.reset()
 
 
+def test_env_step_info_is_json_safe_and_validated_by_contract():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [],
+    )
+    env = ExecutionEnv(tape, config=_env_config())
+    env.reset()
+
+    step = env.step(_disabled_action())
+
+    assert isinstance(step.info["quote_bid_enabled"], bool)
+    assert isinstance(step.info["quote_bid_disabled_reason"], str)
+    assert isinstance(step.info["events_processed"], int)
+    assert isinstance(step.info["previous_equity"], float)
+    assert step.execution.info is step.info or step.execution.info == step.info
+
+
 def test_env_has_no_forbidden_imports():
     source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
 
@@ -415,6 +436,13 @@ def test_env_has_no_forbidden_imports():
     assert "mmrt.storage" not in source
     assert "mmrt.linear.models" not in source
     assert "mmrt.rl" not in source
+
+
+def test_env_does_not_bypass_execution_step_result_info_validation():
+    source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
+
+    assert 'object.__setattr__(execution, "info"' not in source
+    assert "object.__setattr__(execution, 'info'" not in source
 
 
 def test_reset_with_start_event_index_starts_later_in_tape():
