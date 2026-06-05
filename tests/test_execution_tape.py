@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from mmrt.contracts import AggressorSide
-from mmrt.execution.contracts import BookTop, ExecutionEventRef, ExecutionEventType, SymbolSpec, TradePrint
+from mmrt.execution.contracts import BookLevelSnapshot, BookTop, ExecutionEventRef, ExecutionEventType, SymbolSpec, TradePrint
 from mmrt.execution.event_merge import MergedExecutionEvent, merge_execution_events
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.execution_tape import (
@@ -17,6 +17,10 @@ from mmrt.execution.execution_tape import (
     EVENTS_ARRAY_NAME,
     L2_EVENTS_ARRAY_NAME,
     TRADES_ARRAY_NAME,
+    BOOK_BID_TICKS_ARRAY_NAME,
+    BOOK_BID_SIZES_ARRAY_NAME,
+    BOOK_ASK_TICKS_ARRAY_NAME,
+    BOOK_ASK_SIZES_ARRAY_NAME,
     ExecutionTape,
     ExecutionTapeArrays,
     build_execution_tape,
@@ -39,6 +43,16 @@ def _spec():
     )
 
 
+def _snapshot(local_ts_us=100):
+    return BookLevelSnapshot(
+        local_ts_us=local_ts_us,
+        bid_ticks=(1000, 999),
+        bid_sizes=(1.0, 2.0),
+        ask_ticks=(1002, 1003),
+        ask_sizes=(1.5, 2.5),
+    )
+
+
 def _l2(local, seq=0, top=True):
     book_top = BookTop(local, 1000 + seq, 1002 + seq, 1.0, 2.0) if top else None
     return ReconstructedL2Event(
@@ -51,6 +65,7 @@ def _l2(local, seq=0, top=True):
         book_top=book_top,
         bid_depth=3,
         ask_depth=4,
+        book_snapshot=_snapshot(local),
     )
 
 
@@ -71,6 +86,21 @@ def _basic_tape():
     trades = [_trade(200, idx=0), _trade(400, idx=1)]
     plan = merge_execution_events(l2, trades)
     return build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=trades, merged_events=plan.events)
+
+
+
+def _arrays_with(tape, **overrides):
+    values = {
+        "events": tape.arrays.events,
+        "l2_events": tape.arrays.l2_events,
+        "trades": tape.arrays.trades,
+        "book_bid_ticks": tape.arrays.book_bid_ticks,
+        "book_bid_sizes": tape.arrays.book_bid_sizes,
+        "book_ask_ticks": tape.arrays.book_ask_ticks,
+        "book_ask_sizes": tape.arrays.book_ask_sizes,
+    }
+    values.update(overrides)
+    return ExecutionTapeArrays(**values)
 
 
 def test_build_tape_arrays_basic():
@@ -94,7 +124,20 @@ def test_build_tape_arrays_basic():
     assert tape.manifest.num_l2_batches == len(tape.arrays.l2_events)
     assert tape.manifest.num_trades == len(tape.arrays.trades)
     assert [value.value for value in tape.manifest.source_data_types] == ["incremental_book_L2", "trades"]
-    assert tape.manifest.array_names == (EVENTS_ARRAY_NAME, L2_EVENTS_ARRAY_NAME, TRADES_ARRAY_NAME)
+    assert tape.manifest.array_names == (
+        EVENTS_ARRAY_NAME,
+        L2_EVENTS_ARRAY_NAME,
+        TRADES_ARRAY_NAME,
+        BOOK_BID_TICKS_ARRAY_NAME,
+        BOOK_BID_SIZES_ARRAY_NAME,
+        BOOK_ASK_TICKS_ARRAY_NAME,
+        BOOK_ASK_SIZES_ARRAY_NAME,
+    )
+    assert tape.arrays.book_bid_ticks.shape == (2, 2)
+    assert tape.arrays.book_bid_sizes.shape == (2, 2)
+    assert tape.arrays.book_ask_ticks.shape == (2, 2)
+    assert tape.arrays.book_ask_sizes.shape == (2, 2)
+    assert tape.manifest.notes["book_depth"] == "2"
 
 
 def test_l2_book_top_none_uses_sentinel_values():
@@ -116,7 +159,7 @@ def test_trade_side_encoding():
         _trade(300, idx=2, side=AggressorSide.UNKNOWN),
     ]
     plan = merge_execution_events([], trades)
-    tape = build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=plan.events)
+    tape = build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=plan.events, book_depth=2)
 
     assert tape.arrays.trades["side_code"].tolist() == [1, -1, 0]
 
@@ -141,7 +184,7 @@ def test_rejects_trade_pointer_mismatch():
     plan = merge_execution_events([], [trade_a])
 
     with pytest.raises(ValueError, match="merged trade event pointer"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=[trade_b], merged_events=plan.events)
+        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=[trade_b], merged_events=plan.events, book_depth=2)
 
 
 def test_rejects_unreferenced_l2_event():
@@ -169,6 +212,7 @@ def test_rejects_unreferenced_trade():
             l2_events=[],
             trades=[trade_a, trade_b],
             merged_events=plan.events,
+            book_depth=2,
         )
 
 
@@ -233,7 +277,7 @@ def test_rejects_duplicate_trade_ptr():
     ]
 
     with pytest.raises(ValueError, match="duplicate trade_ptr"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=merged)
+        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=merged, book_depth=2)
 
 
 def test_rejects_unsorted_source_arrays_or_merged_events():
@@ -269,7 +313,7 @@ def test_rejects_unsorted_source_arrays_or_merged_events():
                 trade=trades[0],
             )
         ]
-        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=merged)
+        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=merged, book_depth=2)
 
     l2 = [_l2(100, seq=0)]
     bad_event = MergedExecutionEvent(
@@ -327,10 +371,18 @@ def test_save_and_load_round_trip(tmp_path):
     assert np.array_equal(loaded.arrays.events, tape.arrays.events)
     assert np.array_equal(loaded.arrays.l2_events, tape.arrays.l2_events)
     assert np.array_equal(loaded.arrays.trades, tape.arrays.trades)
+    assert np.array_equal(loaded.arrays.book_bid_ticks, tape.arrays.book_bid_ticks)
+    assert np.array_equal(loaded.arrays.book_bid_sizes, tape.arrays.book_bid_sizes)
+    assert np.array_equal(loaded.arrays.book_ask_ticks, tape.arrays.book_ask_ticks)
+    assert np.array_equal(loaded.arrays.book_ask_sizes, tape.arrays.book_ask_sizes)
     assert (path / "manifest.json").exists()
     assert (path / "arrays" / "events.npy").exists()
     assert (path / "arrays" / "l2_events.npy").exists()
     assert (path / "arrays" / "trades.npy").exists()
+    assert (path / "arrays" / "book_bid_ticks.npy").exists()
+    assert (path / "arrays" / "book_bid_sizes.npy").exists()
+    assert (path / "arrays" / "book_ask_ticks.npy").exists()
+    assert (path / "arrays" / "book_ask_sizes.npy").exists()
 
 
 def test_overwrite_protection(tmp_path):
@@ -369,7 +421,7 @@ def test_execution_tape_arrays_reject_invalid_event_pointers():
     events[0]["trade_ptr"] = 0
 
     with pytest.raises(ValueError):
-        ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=tape.arrays.trades)
+        _arrays_with(tape, events=events)
 
 
 def test_execution_tape_arrays_reject_duplicate_l2_pointer():
@@ -380,7 +432,7 @@ def test_execution_tape_arrays_reject_duplicate_l2_pointer():
     events[2]["book_ptr"] = events[0]["book_ptr"]
 
     with pytest.raises(ValueError, match="duplicate L2 book_ptr"):
-        ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=tape.arrays.trades)
+        _arrays_with(tape, events=events)
 
 
 def test_execution_tape_arrays_reject_duplicate_trade_pointer():
@@ -391,16 +443,28 @@ def test_execution_tape_arrays_reject_duplicate_trade_pointer():
     events[3]["trade_ptr"] = events[1]["trade_ptr"]
 
     with pytest.raises(ValueError, match="duplicate trade_ptr"):
-        ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=tape.arrays.trades)
+        _arrays_with(tape, events=events)
 
 
 def test_execution_tape_arrays_reject_unreferenced_l2_row():
     tape = _basic_tape()
     events = tape.arrays.events.copy()
     l2_events = np.concatenate([tape.arrays.l2_events, tape.arrays.l2_events[:1]])
+    book_bid_ticks = np.concatenate([tape.arrays.book_bid_ticks, tape.arrays.book_bid_ticks[:1]])
+    book_bid_sizes = np.concatenate([tape.arrays.book_bid_sizes, tape.arrays.book_bid_sizes[:1]])
+    book_ask_ticks = np.concatenate([tape.arrays.book_ask_ticks, tape.arrays.book_ask_ticks[:1]])
+    book_ask_sizes = np.concatenate([tape.arrays.book_ask_sizes, tape.arrays.book_ask_sizes[:1]])
 
     with pytest.raises(ValueError, match="reference every l2_event"):
-        ExecutionTapeArrays(events=events, l2_events=l2_events, trades=tape.arrays.trades)
+        _arrays_with(
+            tape,
+            events=events,
+            l2_events=l2_events,
+            book_bid_ticks=book_bid_ticks,
+            book_bid_sizes=book_bid_sizes,
+            book_ask_ticks=book_ask_ticks,
+            book_ask_sizes=book_ask_sizes,
+        )
 
 
 def test_execution_tape_arrays_reject_unreferenced_trade_row():
@@ -409,7 +473,7 @@ def test_execution_tape_arrays_reject_unreferenced_trade_row():
     trades = np.concatenate([tape.arrays.trades, tape.arrays.trades[:1]])
 
     with pytest.raises(ValueError, match="reference every trade"):
-        ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=trades)
+        _arrays_with(tape, events=events, trades=trades)
 
 
 def test_no_forbidden_imports():
@@ -419,3 +483,58 @@ def test_no_forbidden_imports():
     assert "import pyarrow" not in source
     assert "import torch" not in source
     assert "import numba" not in source
+
+
+def test_missing_book_snapshot_rejected():
+    l2 = [_l2(100, seq=0)]
+    bad_l2 = [ReconstructedL2Event(
+        batch_seq=l2[0].batch_seq,
+        local_ts_us=l2[0].local_ts_us,
+        min_ts_us=l2[0].min_ts_us,
+        max_ts_us=l2[0].max_ts_us,
+        num_updates=l2[0].num_updates,
+        is_snapshot_batch=l2[0].is_snapshot_batch,
+        book_top=l2[0].book_top,
+        bid_depth=l2[0].bid_depth,
+        ask_depth=l2[0].ask_depth,
+        book_snapshot=None,
+    )]
+    plan = merge_execution_events(bad_l2, [])
+
+    with pytest.raises(ValueError, match="book_snapshot"):
+        build_execution_tape(symbol_spec=_spec(), l2_events=bad_l2, trades=[], merged_events=plan.events)
+
+
+@pytest.mark.parametrize(
+    "override,match",
+    [
+        ({"book_bid_sizes": np.zeros((2, 3), dtype=np.float32)}, "same shape"),
+        ({"book_bid_ticks": np.array([[1000, 0, 999], [1000, 999, 0]], dtype=np.int64),
+          "book_bid_sizes": np.array([[1.0, 0.0, 2.0], [1.0, 2.0, 0.0]], dtype=np.float32),
+          "book_ask_ticks": np.array([[1002, 1003, 0], [1002, 1003, 0]], dtype=np.int64),
+          "book_ask_sizes": np.array([[1.5, 2.5, 0.0], [1.5, 2.5, 0.0]], dtype=np.float32)}, "zero padding"),
+        ({"book_bid_sizes": np.array([[1.0, 0.0], [1.0, 2.0]], dtype=np.float32)}, "exactly when tick"),
+        ({"book_bid_ticks": np.array([[1000, 0], [1000, 999]], dtype=np.int64),
+          "book_bid_sizes": np.array([[1.0, 2.0], [1.0, 2.0]], dtype=np.float32)}, "exactly when tick"),
+        ({"book_bid_ticks": np.array([[999, 1000], [1000, 999]], dtype=np.int64)}, "descending"),
+        ({"book_ask_ticks": np.array([[1003, 1002], [1002, 1003]], dtype=np.int64)}, "ascending"),
+    ],
+)
+def test_invalid_book_depth_arrays_rejected(override, match):
+    tape = _basic_tape()
+
+    with pytest.raises(ValueError, match=match):
+        _arrays_with(tape, **override)
+
+
+def test_explicit_book_depth_pads_snapshots():
+    l2 = [_l2(100, seq=0), _l2(200, seq=1)]
+    plan = merge_execution_events(l2, [])
+
+    tape = build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=[], merged_events=plan.events, book_depth=3)
+
+    assert tape.arrays.book_bid_ticks.shape == (2, 3)
+    assert tape.arrays.book_bid_ticks[0].tolist() == [1000, 999, 0]
+    assert tape.arrays.book_bid_sizes[0].tolist() == [1.0, 2.0, 0.0]
+    assert tape.manifest.schema_version == "mmrt_execution_tape_v2_book_depth"
+    assert tape.manifest.notes["book_depth"] == "3"

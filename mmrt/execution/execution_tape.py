@@ -26,13 +26,17 @@ from mmrt.execution.contracts import (
 from mmrt.execution.event_merge import MergedExecutionEvent
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 
-EXECUTION_TAPE_SCHEMA_VERSION = "mmrt_execution_tape_v1"
+EXECUTION_TAPE_SCHEMA_VERSION = "mmrt_execution_tape_v2_book_depth"
 MANIFEST_FILENAME = "manifest.json"
 ARRAYS_DIRNAME = "arrays"
 
 EVENTS_ARRAY_NAME = "events"
 L2_EVENTS_ARRAY_NAME = "l2_events"
 TRADES_ARRAY_NAME = "trades"
+BOOK_BID_TICKS_ARRAY_NAME = "book_bid_ticks"
+BOOK_BID_SIZES_ARRAY_NAME = "book_bid_sizes"
+BOOK_ASK_TICKS_ARRAY_NAME = "book_ask_ticks"
+BOOK_ASK_SIZES_ARRAY_NAME = "book_ask_sizes"
 
 EVENT_TYPE_CODE_L2_BATCH = 1
 EVENT_TYPE_CODE_TRADE = 2
@@ -78,7 +82,15 @@ TRADE_DTYPE = np.dtype(
     ]
 )
 
-_EXPECTED_ARRAY_NAMES = (EVENTS_ARRAY_NAME, L2_EVENTS_ARRAY_NAME, TRADES_ARRAY_NAME)
+_EXPECTED_ARRAY_NAMES = (
+    EVENTS_ARRAY_NAME,
+    L2_EVENTS_ARRAY_NAME,
+    TRADES_ARRAY_NAME,
+    BOOK_BID_TICKS_ARRAY_NAME,
+    BOOK_BID_SIZES_ARRAY_NAME,
+    BOOK_ASK_TICKS_ARRAY_NAME,
+    BOOK_ASK_SIZES_ARRAY_NAME,
+)
 _ALLOWED_MMAP_MODES = (None, "r", "r+")
 
 
@@ -87,11 +99,22 @@ class ExecutionTapeArrays:
     events: np.ndarray
     l2_events: np.ndarray
     trades: np.ndarray
+    book_bid_ticks: np.ndarray
+    book_bid_sizes: np.ndarray
+    book_ask_ticks: np.ndarray
+    book_ask_sizes: np.ndarray
 
     def __post_init__(self) -> None:
         _validate_array(self.events, EVENT_DTYPE, "events")
         _validate_array(self.l2_events, L2_EVENT_DTYPE, "l2_events")
         _validate_array(self.trades, TRADE_DTYPE, "trades")
+        _validate_book_depth_arrays(
+            self.book_bid_ticks,
+            self.book_bid_sizes,
+            self.book_ask_ticks,
+            self.book_ask_sizes,
+            num_l2_events=len(self.l2_events),
+        )
         _validate_events_array(self.events, len(self.l2_events), len(self.trades))
 
 
@@ -110,16 +133,28 @@ class ExecutionTape:
             raise ValueError("manifest.num_events must match events length")
         if self.manifest.num_l2_batches != len(self.arrays.l2_events):
             raise ValueError("manifest.num_l2_batches must match l2_events length")
+        book_depth = int(self.arrays.book_bid_ticks.shape[1])
+        if self.manifest.num_l2_batches != len(self.arrays.book_bid_ticks):
+            raise ValueError("manifest.num_l2_batches must match book depth arrays length")
         if self.manifest.num_trades != len(self.arrays.trades):
             raise ValueError("manifest.num_trades must match trades length")
         if self.manifest.num_decisions != 0:
-            raise ValueError("execution tape v1 requires num_decisions == 0")
+            raise ValueError("execution tape v2 requires num_decisions == 0")
         if tuple(self.manifest.array_names) != _EXPECTED_ARRAY_NAMES:
-            raise ValueError("manifest.array_names must be events, l2_events, trades")
+            raise ValueError("manifest.array_names must match execution tape v2 arrays")
         if self.manifest.schema_version != EXECUTION_TAPE_SCHEMA_VERSION:
             raise ValueError("unsupported execution tape schema_version")
         if self.manifest.tape_format != ExecutionTapeFormat.L2_TRADES_ARRAYS_V1:
             raise ValueError("unsupported execution tape format")
+        notes_book_depth = self.manifest.notes.get("book_depth") if self.manifest.notes is not None else None
+        if notes_book_depth is None:
+            raise ValueError("manifest.notes must include book_depth")
+        try:
+            manifest_book_depth = int(notes_book_depth)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("manifest.notes book_depth must be a positive int") from exc
+        if manifest_book_depth != book_depth:
+            raise ValueError("manifest.notes book_depth must match book depth arrays")
         if len(self.arrays.events) == 0:
             raise ValueError("execution tape must contain at least one event")
 
@@ -206,6 +241,7 @@ def build_execution_tape(
     l2_events: tuple[ReconstructedL2Event, ...] | list[ReconstructedL2Event],
     trades: tuple[TradePrint, ...] | list[TradePrint],
     merged_events: tuple[MergedExecutionEvent, ...] | list[MergedExecutionEvent],
+    book_depth: int | None = None,
     created_at_utc: str = "",
     notes: Mapping[str, str] | None = None,
 ) -> ExecutionTape:
@@ -228,6 +264,11 @@ def build_execution_tape(
     l2_arr = _build_l2_events_array(l2_events_tuple)
     trade_arr = _build_trades_array(trades_tuple)
     events_arr = _build_events_array(merged_events_tuple, l2_events_tuple, trades_tuple)
+    book_bid_ticks, book_bid_sizes, book_ask_ticks, book_ask_sizes = _build_book_snapshot_arrays(
+        l2_events_tuple, book_depth=book_depth
+    )
+    actual_book_depth = int(book_bid_ticks.shape[1])
+    clean_notes["book_depth"] = str(actual_book_depth)
 
     start_local_ts_us = int(events_arr["local_ts_us"][0])
     end_local_ts_us = int(events_arr["local_ts_us"][-1])
@@ -251,7 +292,18 @@ def build_execution_tape(
         created_at_utc=created_at_utc,
         notes=clean_notes,
     )
-    return ExecutionTape(manifest=manifest, arrays=ExecutionTapeArrays(events=events_arr, l2_events=l2_arr, trades=trade_arr))
+    return ExecutionTape(
+        manifest=manifest,
+        arrays=ExecutionTapeArrays(
+            events=events_arr,
+            l2_events=l2_arr,
+            trades=trade_arr,
+            book_bid_ticks=book_bid_ticks,
+            book_bid_sizes=book_bid_sizes,
+            book_ask_ticks=book_ask_ticks,
+            book_ask_sizes=book_ask_sizes,
+        ),
+    )
 
 
 def save_execution_tape(tape: ExecutionTape, root: str | Path, *, overwrite: bool = False) -> None:
@@ -265,6 +317,10 @@ def save_execution_tape(tape: ExecutionTape, root: str | Path, *, overwrite: boo
         arrays_dir / f"{EVENTS_ARRAY_NAME}.npy",
         arrays_dir / f"{L2_EVENTS_ARRAY_NAME}.npy",
         arrays_dir / f"{TRADES_ARRAY_NAME}.npy",
+        arrays_dir / f"{BOOK_BID_TICKS_ARRAY_NAME}.npy",
+        arrays_dir / f"{BOOK_BID_SIZES_ARRAY_NAME}.npy",
+        arrays_dir / f"{BOOK_ASK_TICKS_ARRAY_NAME}.npy",
+        arrays_dir / f"{BOOK_ASK_SIZES_ARRAY_NAME}.npy",
     )
     if not overwrite:
         existing = [path for path in paths if path.exists()]
@@ -275,6 +331,10 @@ def save_execution_tape(tape: ExecutionTape, root: str | Path, *, overwrite: boo
     np.save(arrays_dir / f"{EVENTS_ARRAY_NAME}.npy", tape.arrays.events)
     np.save(arrays_dir / f"{L2_EVENTS_ARRAY_NAME}.npy", tape.arrays.l2_events)
     np.save(arrays_dir / f"{TRADES_ARRAY_NAME}.npy", tape.arrays.trades)
+    np.save(arrays_dir / f"{BOOK_BID_TICKS_ARRAY_NAME}.npy", tape.arrays.book_bid_ticks)
+    np.save(arrays_dir / f"{BOOK_BID_SIZES_ARRAY_NAME}.npy", tape.arrays.book_bid_sizes)
+    np.save(arrays_dir / f"{BOOK_ASK_TICKS_ARRAY_NAME}.npy", tape.arrays.book_ask_ticks)
+    np.save(arrays_dir / f"{BOOK_ASK_SIZES_ARRAY_NAME}.npy", tape.arrays.book_ask_sizes)
 
     manifest_text = json.dumps(execution_tape_manifest_to_dict(tape.manifest), sort_keys=True, indent=2)
     tmp_path = root_path / f"{MANIFEST_FILENAME}.tmp"
@@ -293,6 +353,10 @@ def load_execution_tape(root: str | Path, *, mmap_mode: str | None = None) -> Ex
         events=np.load(arrays_dir / f"{EVENTS_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
         l2_events=np.load(arrays_dir / f"{L2_EVENTS_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
         trades=np.load(arrays_dir / f"{TRADES_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
+        book_bid_ticks=np.load(arrays_dir / f"{BOOK_BID_TICKS_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
+        book_bid_sizes=np.load(arrays_dir / f"{BOOK_BID_SIZES_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
+        book_ask_ticks=np.load(arrays_dir / f"{BOOK_ASK_TICKS_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
+        book_ask_sizes=np.load(arrays_dir / f"{BOOK_ASK_SIZES_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
     )
     return ExecutionTape(manifest=manifest, arrays=arrays)
 
@@ -336,7 +400,7 @@ def _build_events_array(
             seen_trades[event.ref.trade_ptr] = True
             code = EVENT_TYPE_CODE_TRADE
         else:
-            raise ValueError("execution tape v1 supports only L2_BATCH and TRADE events")
+            raise ValueError("execution tape v2 supports only L2_BATCH and TRADE events")
 
         events_arr[i] = (
             event.ref.event_seq,
@@ -388,6 +452,51 @@ def _build_l2_events_array(l2_events: tuple[ReconstructedL2Event, ...]) -> np.nd
     return l2_arr
 
 
+
+def _build_book_snapshot_arrays(
+    l2_events: tuple[ReconstructedL2Event, ...], *, book_depth: int | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not l2_events:
+        if book_depth is None:
+            raise ValueError("execution tape v2 requires at least one L2 event to infer book_depth")
+        depth = _require_positive_int(book_depth, "book_depth")
+    elif book_depth is None:
+        first_snapshot = l2_events[0].book_snapshot
+        if first_snapshot is None:
+            raise ValueError("execution tape v2 requires every L2 event to include book_snapshot")
+        depth = max(len(first_snapshot.bid_ticks), len(first_snapshot.ask_ticks))
+        if depth <= 0:
+            raise ValueError("book_depth must be a positive int")
+    else:
+        depth = _require_positive_int(book_depth, "book_depth")
+
+    n = len(l2_events)
+    bid_ticks = np.zeros((n, depth), dtype=np.int64)
+    ask_ticks = np.zeros((n, depth), dtype=np.int64)
+    bid_sizes = np.zeros((n, depth), dtype=np.float32)
+    ask_sizes = np.zeros((n, depth), dtype=np.float32)
+
+    for i, event in enumerate(l2_events):
+        snapshot = event.book_snapshot
+        if snapshot is None:
+            raise ValueError("execution tape v2 requires every L2 event to include book_snapshot")
+        if snapshot.local_ts_us != event.local_ts_us:
+            raise ValueError("book_snapshot local_ts_us must match L2 event local_ts_us")
+        if len(snapshot.bid_ticks) > depth or len(snapshot.ask_ticks) > depth:
+            raise ValueError("book_snapshot depth exceeds tape book_depth")
+        bid_count = len(snapshot.bid_ticks)
+        ask_count = len(snapshot.ask_ticks)
+        if bid_count:
+            bid_ticks[i, :bid_count] = snapshot.bid_ticks
+            bid_sizes[i, :bid_count] = snapshot.bid_sizes
+        if ask_count:
+            ask_ticks[i, :ask_count] = snapshot.ask_ticks
+            ask_sizes[i, :ask_count] = snapshot.ask_sizes
+
+    _validate_book_depth_arrays(bid_ticks, bid_sizes, ask_ticks, ask_sizes, num_l2_events=n)
+    return bid_ticks, bid_sizes, ask_ticks, ask_sizes
+
+
 def _build_trades_array(trades: tuple[TradePrint, ...]) -> np.ndarray:
     trade_arr = np.empty(len(trades), dtype=TRADE_DTYPE)
     for i, trade in enumerate(trades):
@@ -413,6 +522,69 @@ def _trade_side_code(side: AggressorSide) -> int:
     if side.value == "unknown":
         return 0
     raise ValueError(f"unsupported trade side {side!r}")
+
+
+
+def _validate_book_depth_arrays(
+    book_bid_ticks: np.ndarray,
+    book_bid_sizes: np.ndarray,
+    book_ask_ticks: np.ndarray,
+    book_ask_sizes: np.ndarray,
+    *,
+    num_l2_events: int,
+) -> None:
+    _validate_book_array(book_bid_ticks, np.dtype(np.int64), "book_bid_ticks")
+    _validate_book_array(book_ask_ticks, np.dtype(np.int64), "book_ask_ticks")
+    _validate_book_array(book_bid_sizes, np.dtype(np.float32), "book_bid_sizes")
+    _validate_book_array(book_ask_sizes, np.dtype(np.float32), "book_ask_sizes")
+    shape = book_bid_ticks.shape
+    if book_bid_sizes.shape != shape or book_ask_ticks.shape != shape or book_ask_sizes.shape != shape:
+        raise ValueError("all book depth arrays must have the same shape")
+    if shape[0] != num_l2_events:
+        raise ValueError("book depth arrays first dimension must equal l2_events length")
+    if shape[1] <= 0:
+        raise ValueError("book depth arrays second dimension must be > 0")
+    if np.any(book_bid_ticks < 0) or np.any(book_ask_ticks < 0):
+        raise ValueError("book depth array ticks must be >= 0")
+    if not np.all(np.isfinite(book_bid_sizes)) or not np.all(np.isfinite(book_ask_sizes)):
+        raise ValueError("book depth array sizes must be finite")
+    if np.any(book_bid_sizes < 0.0) or np.any(book_ask_sizes < 0.0):
+        raise ValueError("book depth array sizes must be >= 0")
+
+    for row_idx in range(shape[0]):
+        _validate_padded_book_side(
+            book_bid_ticks[row_idx], book_bid_sizes[row_idx], descending=True, name=f"book_bid[{row_idx}]"
+        )
+        _validate_padded_book_side(
+            book_ask_ticks[row_idx], book_ask_sizes[row_idx], descending=False, name=f"book_ask[{row_idx}]"
+        )
+
+
+def _validate_book_array(array: np.ndarray, dtype: np.dtype, name: str) -> None:
+    if not isinstance(array, np.ndarray):
+        raise ValueError(f"{name} must be a NumPy array")
+    if array.dtype != dtype:
+        raise ValueError(f"{name} dtype must be {dtype}")
+    if array.ndim != 2:
+        raise ValueError(f"{name} must be 2D")
+    if array.dtype.hasobject:
+        raise ValueError(f"{name} must not use object dtype")
+
+
+def _validate_padded_book_side(ticks: np.ndarray, sizes: np.ndarray, *, descending: bool, name: str) -> None:
+    nonzero = ticks > 0
+    if np.any(nonzero[1:] & ~nonzero[:-1]):
+        raise ValueError(f"{name} zero padding must occur only after nonzero entries")
+    if not np.array_equal(sizes > 0.0, nonzero):
+        raise ValueError(f"{name} size must be > 0 exactly when tick > 0")
+    active_ticks = ticks[nonzero]
+    if len(active_ticks) <= 1:
+        return
+    if descending:
+        if np.any(active_ticks[1:] >= active_ticks[:-1]):
+            raise ValueError(f"{name} ticks must be strictly descending")
+    elif np.any(active_ticks[1:] <= active_ticks[:-1]):
+        raise ValueError(f"{name} ticks must be strictly ascending")
 
 
 def _validate_array(array: np.ndarray, dtype: np.dtype, name: str) -> None:
@@ -531,6 +703,10 @@ __all__ = [
     "EVENTS_ARRAY_NAME",
     "L2_EVENTS_ARRAY_NAME",
     "TRADES_ARRAY_NAME",
+    "BOOK_BID_TICKS_ARRAY_NAME",
+    "BOOK_BID_SIZES_ARRAY_NAME",
+    "BOOK_ASK_TICKS_ARRAY_NAME",
+    "BOOK_ASK_SIZES_ARRAY_NAME",
     "EVENT_TYPE_CODE_L2_BATCH",
     "EVENT_TYPE_CODE_TRADE",
     "EVENT_DTYPE",

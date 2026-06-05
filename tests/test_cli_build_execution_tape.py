@@ -71,6 +71,10 @@ def test_build_execution_tape_from_csv_inputs(tmp_path):
     assert (output_root / "arrays" / "events.npy").exists()
     assert (output_root / "arrays" / "l2_events.npy").exists()
     assert (output_root / "arrays" / "trades.npy").exists()
+    assert (output_root / "arrays" / "book_bid_ticks.npy").exists()
+    assert (output_root / "arrays" / "book_bid_sizes.npy").exists()
+    assert (output_root / "arrays" / "book_ask_ticks.npy").exists()
+    assert (output_root / "arrays" / "book_ask_sizes.npy").exists()
     assert (output_root / "build_summary.json").exists()
 
     loaded = load_execution_tape(output_root)
@@ -78,6 +82,9 @@ def test_build_execution_tape_from_csv_inputs(tmp_path):
     assert loaded.manifest.num_trades == summary["tape"]["num_trades"]
     assert loaded.manifest.num_events == summary["tape"]["num_events"]
     assert loaded.manifest.num_decisions == 0
+    assert summary["tape"]["book_depth"] == 25
+    assert loaded.arrays.book_bid_ticks.shape[1] == 25
+    assert loaded.arrays.book_ask_ticks.shape[1] == 25
 
 
 def test_event_ordering_and_tie_policy(tmp_path):
@@ -314,6 +321,8 @@ def test_parser_smoke():
             "10",
             "--max-trade-rows",
             "11",
+            "--book-depth",
+            "3",
         ]
     )
     assert args.l2_input == ["l2.csv"]
@@ -323,6 +332,7 @@ def test_parser_smoke():
     assert args.overwrite is True
     assert args.max_l2_rows == 10
     assert args.max_trade_rows == 11
+    assert args.book_depth == 3
 
 
 def test_cli_main_writes_summary_and_prints_same_summary(tmp_path, capsys):
@@ -361,3 +371,30 @@ def test_no_forbidden_imports():
     assert "import torch" not in source
     assert "import pandas" not in source
     assert "import sklearn" not in source
+
+
+def test_book_depth_argument_controls_saved_snapshot_depth(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+    output_root = tmp_path / "tape"
+
+    summary = build_execution_tape_from_config(
+        ExecutionTapeBuildConfig(
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(output_root),
+            book_depth=3,
+        )
+    )
+    loaded = load_execution_tape(output_root)
+
+    assert summary["tape"]["book_depth"] == 3
+    assert summary["reconstruction"]["book_depth"] == 3
+    assert loaded.arrays.book_bid_ticks.shape[1] == 3
+    assert loaded.arrays.book_ask_ticks.shape[1] == 3
+    assert loaded.manifest.notes["book_depth"] == "3"
+
+
+def test_config_rejects_nonpositive_book_depth(tmp_path):
+    with pytest.raises(ValueError, match="book_depth"):
+        ExecutionTapeBuildConfig(l2_inputs=("l2.csv",), trade_inputs=("trades.csv",), output_root=str(tmp_path / "tape"), book_depth=0)

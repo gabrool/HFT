@@ -91,6 +91,7 @@ class ReconstructedL2Event:
     book_top: BookTop | None
     bid_depth: int
     ask_depth: int
+    book_snapshot: BookLevelSnapshot | None = None
     crossed_repaired: bool = False
     crossed_levels_removed: int = 0
 
@@ -105,6 +106,15 @@ class ReconstructedL2Event:
         _require_bool(self.is_snapshot_batch, "is_snapshot_batch")
         if self.book_top is not None and not isinstance(self.book_top, BookTop):
             raise ValueError("book_top must be BookTop or None")
+        if self.book_snapshot is not None:
+            if not isinstance(self.book_snapshot, BookLevelSnapshot):
+                raise ValueError("book_snapshot must be BookLevelSnapshot or None")
+            if self.book_snapshot.local_ts_us != self.local_ts_us:
+                raise ValueError("book_snapshot.local_ts_us must equal event local_ts_us")
+            if len(self.book_snapshot.bid_ticks) != len(self.book_snapshot.bid_sizes):
+                raise ValueError("book_snapshot bid ticks/sizes lengths must match")
+            if len(self.book_snapshot.ask_ticks) != len(self.book_snapshot.ask_sizes):
+                raise ValueError("book_snapshot ask ticks/sizes lengths must match")
         _require_nonnegative_int(self.bid_depth, "bid_depth")
         _require_nonnegative_int(self.ask_depth, "ask_depth")
         _require_bool(self.crossed_repaired, "crossed_repaired")
@@ -180,6 +190,7 @@ class _SideBook:
 class L2BookReconstructor:
     __slots__ = (
         "symbol_spec",
+        "snapshot_depth",
         "_bids",
         "_asks",
         "_seen_snapshot",
@@ -202,10 +213,11 @@ class L2BookReconstructor:
         "_max_batch_size",
     )
 
-    def __init__(self, symbol_spec: SymbolSpec) -> None:
+    def __init__(self, symbol_spec: SymbolSpec, *, snapshot_depth: int = 25) -> None:
         if not isinstance(symbol_spec, SymbolSpec):
             raise ValueError("symbol_spec must be SymbolSpec")
         self.symbol_spec = symbol_spec
+        self.snapshot_depth = _require_positive_int(snapshot_depth, "snapshot_depth")
         self._bids = _SideBook(BookSide.BID)
         self._asks = _SideBook(BookSide.ASK)
         self._seen_snapshot = False
@@ -345,6 +357,7 @@ class L2BookReconstructor:
             book_top=self.book_top(local_ts_us=batch.local_ts_us),
             bid_depth=bid_depth,
             ask_depth=ask_depth,
+            book_snapshot=self.snapshot(depth=self.snapshot_depth, local_ts_us=batch.local_ts_us),
             crossed_repaired=batch_crossed_repaired,
             crossed_levels_removed=batch_crossed_levels_removed,
         )
