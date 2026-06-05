@@ -178,6 +178,30 @@ class _SideBook:
 
 
 class L2BookReconstructor:
+    __slots__ = (
+        "symbol_spec",
+        "_bids",
+        "_asks",
+        "_seen_snapshot",
+        "_previous_row_was_snapshot",
+        "_last_batch_local_ts_us",
+        "_batches_seen",
+        "_updates_seen",
+        "_skipped_pre_snapshot_updates",
+        "_snapshot_reset_count",
+        "_applied_update_count",
+        "_deleted_level_count",
+        "_missing_delete_count",
+        "_emitted_event_count",
+        "_crossed_batch_count",
+        "_crossed_repair_count",
+        "_crossed_levels_removed",
+        "_local_ts_decrease_count",
+        "_max_bid_depth",
+        "_max_ask_depth",
+        "_max_batch_size",
+    )
+
     def __init__(self, symbol_spec: SymbolSpec) -> None:
         if not isinstance(symbol_spec, SymbolSpec):
             raise ValueError("symbol_spec must be SymbolSpec")
@@ -258,7 +282,8 @@ class L2BookReconstructor:
         if len(updates) > self._max_batch_size:
             self._max_batch_size = len(updates)
 
-        any_book_mutation = False
+        any_ready_update = False
+        last_positive_update_side: BookSide | None = None
         batch_crossed_repaired = False
         batch_crossed_levels_removed = 0
 
@@ -280,17 +305,20 @@ class L2BookReconstructor:
                     self._deleted_level_count += 1
                 else:
                     self._missing_delete_count += 1
-                any_book_mutation = True
+                any_ready_update = True
             else:
                 side_book.upsert(update.price_tick, update.amount)
                 self._applied_update_count += 1
-                any_book_mutation = True
-                crossed_repaired, removed = self._repair_crossed_after_update(update.side)
-                if crossed_repaired:
-                    batch_crossed_repaired = True
-                    batch_crossed_levels_removed += removed
+                any_ready_update = True
+                last_positive_update_side = update.side
 
             self._previous_row_was_snapshot = update.is_snapshot
+
+        if last_positive_update_side is not None:
+            crossed_repaired, removed = self._repair_crossed_after_update(last_positive_update_side)
+            if crossed_repaired:
+                batch_crossed_repaired = True
+                batch_crossed_levels_removed += removed
 
         bid_depth = len(self._bids)
         ask_depth = len(self._asks)
@@ -300,7 +328,7 @@ class L2BookReconstructor:
             self._max_ask_depth = ask_depth
         self._last_batch_local_ts_us = batch.local_ts_us
 
-        if not any_book_mutation:
+        if not any_ready_update:
             return None
 
         if batch_crossed_repaired:

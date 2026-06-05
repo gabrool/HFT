@@ -167,6 +167,77 @@ def test_local_timestamps_must_be_strictly_increasing_per_batch():
     assert reconstructor.counters.local_ts_decrease_count == 2
 
 
+def test_transient_crossing_inside_batch_is_not_repaired_before_batch_end():
+    reconstructor = L2BookReconstructor(_spec())
+    reconstructor.apply_batch(
+        _batch(
+            100,
+            [
+                _u(100, 90, BookSide.BID, 1000, 1.0, snap=True),
+                _u(100, 91, BookSide.ASK, 1002, 1.0, snap=True),
+            ],
+        )
+    )
+
+    event = reconstructor.apply_batch(
+        _batch(
+            101,
+            [
+                _u(101, 92, BookSide.ASK, 999, 1.0),
+                _u(101, 93, BookSide.BID, 1000, 0.0),
+            ],
+            seq=1,
+        )
+    )
+
+    assert event is not None
+    assert event.crossed_repaired is False
+    assert event.crossed_levels_removed == 0
+    assert reconstructor.counters.crossed_repair_count == 0
+    assert reconstructor.counters.crossed_levels_removed == 0
+
+    snapshot = reconstructor.snapshot(depth=5)
+    assert snapshot.bid_ticks == ()
+    assert snapshot.ask_ticks == (999, 1002)
+
+
+def test_final_crossing_after_full_batch_is_repaired_once():
+    reconstructor = L2BookReconstructor(_spec())
+    reconstructor.apply_batch(
+        _batch(
+            100,
+            [
+                _u(100, 90, BookSide.BID, 1000, 1.0, snap=True),
+                _u(100, 91, BookSide.ASK, 1002, 1.0, snap=True),
+                _u(100, 92, BookSide.ASK, 1004, 1.0, snap=True),
+            ],
+        )
+    )
+
+    event = reconstructor.apply_batch(
+        _batch(
+            101,
+            [
+                _u(101, 93, BookSide.BID, 1003, 1.0),
+                _u(101, 94, BookSide.BID, 1001, 2.0),
+            ],
+            seq=1,
+        )
+    )
+
+    assert event is not None
+    assert event.crossed_repaired is True
+    assert event.crossed_levels_removed == 1
+    assert reconstructor.counters.crossed_batch_count == 1
+    assert reconstructor.counters.crossed_repair_count == 1
+    assert reconstructor.counters.crossed_levels_removed == 1
+
+    top = reconstructor.book_top()
+    assert top is not None
+    assert top.best_bid_tick == 1003
+    assert top.best_ask_tick == 1004
+
+
 def test_crossed_repair_when_bid_update_crosses_ask():
     reconstructor = L2BookReconstructor(_spec())
     reconstructor.apply_batch(
