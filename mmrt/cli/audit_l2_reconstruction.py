@@ -508,7 +508,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = audit_l2_reconstruction(config)
     if args.output_json is not None:
         report = dict(report)
-        report["output_json"] = _write_json_atomic(report, args.output_json)
+        output_json = str(args.output_json)
+        report["output_json"] = output_json
+        _write_json_atomic(report, output_json)
     _print_json(report)
     return 0
 

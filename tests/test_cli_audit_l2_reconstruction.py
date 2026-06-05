@@ -11,6 +11,7 @@ from mmrt.cli.audit_l2_reconstruction import (
     _write_json_atomic,
     audit_l2_reconstruction,
     build_arg_parser,
+    main,
 )
 
 
@@ -113,6 +114,28 @@ def test_output_json(tmp_path: Path) -> None:
     assert returned == str(path)
     assert path.exists()
     assert json.loads(path.read_text(encoding="utf-8")) == {"status": "ok"}
+
+
+def test_main_output_json_matches_stdout(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_rows())
+    output_path = tmp_path / "audit.json"
+
+    rc = main(
+        [
+            "--l2-input",
+            str(l2_path),
+            "--output-json",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 0
+    printed = json.loads(capsys.readouterr().out)
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert printed == saved
+    assert printed["output_json"] == str(output_path)
+    assert printed["status"] == "ok"
 
 
 def test_cli_parser_smoke() -> None:
