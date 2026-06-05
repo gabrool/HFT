@@ -10,7 +10,7 @@ decision scheduling, tape writing, fill simulation, or ML/dataframe work.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator
 
 from mmrt.execution.contracts import (
     ExecutionEventRef,
@@ -50,6 +50,8 @@ class MergedExecutionEvent:
             raise ValueError("ref must be ExecutionEventRef")
         _require_positive_int(self.local_ts_us, "local_ts_us")
         _require_positive_int(self.ts_us, "ts_us")
+        if self.ref.local_ts_us != self.local_ts_us:
+            raise ValueError("ref.local_ts_us must equal local_ts_us")
 
         has_l2 = self.l2_event is not None
         has_trade = self.trade is not None
@@ -89,8 +91,6 @@ class ExecutionMergePlan:
     def __post_init__(self) -> None:
         if not isinstance(self.events, tuple):
             raise ValueError("events must be a tuple")
-        if not isinstance(self.events, Sequence):
-            raise ValueError("events must be a sequence")
         if not isinstance(self.counters, ExecutionMergeCounters):
             raise ValueError("counters must be ExecutionMergeCounters")
 
@@ -288,11 +288,6 @@ def _require_positive_int(value: int, name: str) -> int:
         raise ValueError(f"{name} must be > 0")
     return value
 
-
-def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be bool")
-    return value
 
 
 __all__ = [
