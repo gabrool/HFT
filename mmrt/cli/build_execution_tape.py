@@ -98,6 +98,10 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
     )
     l2_paths = _resolve_input_paths(config.l2_inputs, "l2_inputs")
     trade_paths = _resolve_input_paths(config.trade_inputs, "trade_inputs")
+    output_root = Path(config.output_root)
+    summary_path = output_root / "build_summary.json"
+    if summary_path.exists() and not config.overwrite:
+        raise FileExistsError(f"JSON output already exists: {summary_path}")
 
     l2_events, l2_stats = load_reconstructed_l2_events(
         l2_paths,
@@ -130,10 +134,9 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
         },
     )
 
-    output_root = Path(config.output_root)
     save_execution_tape(tape, output_root, overwrite=config.overwrite)
     summary = _build_summary(config, output_root, l2_stats, trade_stats, plan, tape)
-    _write_json_atomic(summary, output_root / "build_summary.json", overwrite=config.overwrite)
+    _write_json_atomic(summary, summary_path, overwrite=config.overwrite)
     return summary
 
 
@@ -158,8 +161,9 @@ def load_reconstructed_l2_events(
                 if max_rows is not None and rows_seen >= max_rows:
                     scan_limit_hit = True
                     return
+                fallback_source_row = rows_seen
                 rows_seen += 1
-                update = _row_to_l2_update(row, symbol_spec=symbol_spec, fallback_source_row=rows_seen)
+                update = _row_to_l2_update(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
                 if first_local_ts_us is None:
                     first_local_ts_us = update.local_ts_us
                 last_local_ts_us = update.local_ts_us
@@ -177,7 +181,6 @@ def load_reconstructed_l2_events(
         "scan_limit_hit": scan_limit_hit,
         "first_local_ts_us": first_local_ts_us,
         "last_local_ts_us": last_local_ts_us,
-        "reconstructor": reconstructor,
         "status": reconstructor.status.value,
         "is_ready": reconstructor.is_ready,
         "batches_seen": counters.batches_seen,
@@ -225,8 +228,9 @@ def load_trade_prints(
                     "last_local_ts_us": last_local_ts_us,
                 }
                 return trades, stats
+            fallback_source_row = rows_seen
             rows_seen += 1
-            trade = _row_to_trade_print(row, symbol_spec=symbol_spec, fallback_source_row=rows_seen)
+            trade = _row_to_trade_print(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
             if prev_local_ts_us is not None and trade.local_ts_us < prev_local_ts_us:
                 raise ValueError("trades must be sorted by nondecreasing local_ts_us")
             if first_local_ts_us is None:
