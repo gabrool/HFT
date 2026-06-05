@@ -1,0 +1,259 @@
+import math
+
+import pytest
+
+from mmrt.contracts import AggressorSide, BookSide, TardisDataType
+from mmrt.execution.contracts import (
+    ActiveOrder,
+    BookLevelSnapshot,
+    BookTop,
+    DecisionRef,
+    ExecutionEventRef,
+    ExecutionEventType,
+    ExecutionTapeFormat,
+    ExecutionTapeManifest,
+    Fill,
+    FillReason,
+    L2Update,
+    L2UpdateBatch,
+    LinearSignal,
+    OrderSide,
+    OrderStatus,
+    QuoteIntent,
+    RewardComponents,
+    SymbolSpec,
+)
+
+
+def _spec(**overrides):
+    kwargs = {
+        "exchange": "binance-futures",
+        "symbol": "BTCUSDT",
+        "tick_size": 0.1,
+        "step_size": 0.001,
+        "min_qty": 0.001,
+        "max_qty": 100.0,
+        "min_notional": 5.0,
+    }
+    kwargs.update(overrides)
+    return SymbolSpec(**kwargs)
+
+
+def _update(**overrides):
+    kwargs = {
+        "local_ts_us": 100,
+        "ts_us": 90,
+        "side": BookSide.BID,
+        "price_tick": 1000,
+        "amount": 1.0,
+        "is_snapshot": False,
+    }
+    kwargs.update(overrides)
+    return L2Update(**kwargs)
+
+
+def test_execution_contracts_importable():
+    import mmrt.execution.contracts as c
+
+    assert c.ExecutionTapeFormat.L2_TRADES_ARRAYS_V1.value == "l2_trades_arrays_v1"
+
+
+def test_symbol_spec_conversions_and_validation():
+    spec = _spec()
+
+    assert spec.price_to_tick(100.0) == 1000
+    assert spec.tick_to_price(1000) == pytest.approx(100.0)
+    assert spec.qty_to_steps_floor(0.0019) == 1
+    assert spec.steps_to_qty(2) == pytest.approx(0.002)
+    assert spec.round_qty_down(0.0019) == pytest.approx(0.001)
+    assert spec.notional(0.1, 1000) == pytest.approx(10.0)
+    assert spec.is_valid_notional(0.1, 1000)
+    assert spec.is_valid_qty(0.001)
+    assert not spec.is_valid_qty(0.0019)
+
+    with pytest.raises(ValueError):
+        _spec(tick_size=0)
+    with pytest.raises(ValueError):
+        _spec(step_size=0)
+    with pytest.raises(ValueError):
+        _spec(min_qty=2.0, max_qty=1.0)
+
+
+def test_l2_update_batch_atomicity():
+    update = _update()
+    batch = L2UpdateBatch(
+        local_ts_us=100,
+        min_ts_us=90,
+        max_ts_us=95,
+        updates=(update, _update(ts_us=95, is_snapshot=True)),
+        is_snapshot_batch=True,
+        batch_seq=0,
+    )
+    assert batch.local_ts_us == 100
+
+    with pytest.raises(ValueError):
+        L2UpdateBatch(100, 90, 95, (_update(local_ts_us=101),), False, 0)
+    with pytest.raises(ValueError):
+        L2UpdateBatch(100, 90, 95, (), False, 0)
+    with pytest.raises(ValueError):
+        L2UpdateBatch(100, 90, 95, (_update(is_snapshot=True),), False, 0)
+
+
+def test_book_top_properties_and_cross_validation():
+    top = BookTop(100, 1000, 1002, 1.5, 2.5)
+
+    assert top.spread_ticks == 2
+    assert top.mid_tick_x2 == 2002
+
+    with pytest.raises(ValueError):
+        BookTop(100, 1000, 1000, 1.0, 1.0)
+    with pytest.raises(ValueError):
+        BookTop(100, 1001, 1000, 1.0, 1.0)
+
+
+def test_book_level_snapshot_ordering_and_lengths():
+    snapshot = BookLevelSnapshot(100, (1000, 999), (1.0, 2.0), (1002, 1003), (1.5, 2.5))
+    assert snapshot.bid_ticks == (1000, 999)
+
+    with pytest.raises(ValueError):
+        BookLevelSnapshot(100, (999, 1000), (1.0, 2.0), (1002,), (1.0,))
+    with pytest.raises(ValueError):
+        BookLevelSnapshot(100, (1000,), (1.0,), (1003, 1002), (1.0, 2.0))
+    with pytest.raises(ValueError):
+        BookLevelSnapshot(100, (1000,), (1.0,), (1000,), (1.0,))
+    with pytest.raises(ValueError):
+        BookLevelSnapshot(100, (1000,), (1.0, 2.0), (1002,), (1.0,))
+
+
+def test_execution_event_ref_pointer_requirements():
+    assert ExecutionEventRef(0, 100, ExecutionEventType.L2_BATCH, book_ptr=0).book_ptr == 0
+    assert ExecutionEventRef(1, 101, "trade", trade_ptr=2).trade_ptr == 2
+    assert ExecutionEventRef(2, 102, ExecutionEventType.DECISION, decision_ptr=3).decision_ptr == 3
+
+    with pytest.raises(ValueError):
+        ExecutionEventRef(0, 100, ExecutionEventType.L2_BATCH)
+    with pytest.raises(ValueError):
+        ExecutionEventRef(1, 101, ExecutionEventType.TRADE)
+    with pytest.raises(ValueError):
+        ExecutionEventRef(2, 102, ExecutionEventType.DECISION)
+
+
+def test_decision_ref_sequence_window_validation():
+    ref = DecisionRef(0, 100, 5, 5, 1)
+    assert ref.event_seq_end_next == 5
+
+    with pytest.raises(ValueError):
+        DecisionRef(0, 100, 5, 4, 1)
+
+
+def test_linear_signal_bounds_and_negative_expected_return():
+    signal = LinearSignal(0.2, 0.7, 1.0, 2.0, -0.5, 0.9)
+    assert signal.expected_return_bps == pytest.approx(-0.5)
+
+    with pytest.raises(ValueError):
+        LinearSignal(0.2, 1.1, 1.0, 2.0, 0.0, 0.9)
+    with pytest.raises(ValueError):
+        LinearSignal(0.2, 0.7, -1.0, 2.0, 0.0, 0.9)
+
+
+def test_quote_intent_validation():
+    quote = QuoteIntent(True, True, bid_price_tick=1000, ask_price_tick=1002, bid_qty=0.01, ask_qty=0.02)
+    assert quote.bid_enabled and quote.ask_enabled
+
+    one_sided = QuoteIntent(True, False, bid_price_tick=1000, bid_qty=0.01)
+    assert one_sided.ask_price_tick == 0
+
+    with pytest.raises(ValueError):
+        QuoteIntent(True, False, bid_price_tick=1000, bid_qty=0.0)
+    with pytest.raises(ValueError):
+        QuoteIntent(True, True, bid_price_tick=1002, ask_price_tick=1001, bid_qty=0.01, ask_qty=0.02)
+
+
+def test_active_order_and_fill_validation_and_properties():
+    order = ActiveOrder(
+        order_id=1,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.02,
+        remaining_qty=0.005,
+        queue_ahead_qty=1.0,
+        status=OrderStatus.PARTIALLY_FILLED,
+        created_local_ts_us=100,
+        last_update_local_ts_us=110,
+    )
+    assert order.filled_qty == pytest.approx(0.015)
+    assert order.is_live
+    assert not ActiveOrder(1, OrderSide.SELL, 1002, 0.02, 0.0, 0.0, OrderStatus.FILLED, 100, 110).is_live
+
+    fill = Fill(1, "buy", 120, 1000, 0.01, -0.001, FillReason.TRADE_AT_LEVEL)
+    assert fill.fee == pytest.approx(-0.001)
+
+    with pytest.raises(ValueError):
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.03, 0.0, OrderStatus.ACTIVE, 100, 110)
+
+
+def test_reward_components_total_and_penalties():
+    reward = RewardComponents(
+        raw_equity_delta=10.0,
+        inventory_penalty=1.0,
+        drawdown_penalty=2.0,
+        turnover_penalty=0.5,
+        cancel_penalty=0.25,
+        terminal_penalty=0.75,
+    )
+    assert reward.total_reward == pytest.approx(5.5)
+
+    with pytest.raises(ValueError):
+        RewardComponents(1.0, inventory_penalty=-0.1)
+
+
+def test_execution_tape_manifest_required_metadata():
+    spec = _spec()
+    manifest = ExecutionTapeManifest(
+        schema_version="1",
+        tape_format=ExecutionTapeFormat.L2_TRADES_ARRAYS_V1,
+        exchange="binance-futures",
+        symbol="BTCUSDT",
+        symbol_spec=spec,
+        source_data_types=(TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES),
+        array_names=("events", "books", "trades"),
+        num_events=10,
+        num_l2_batches=5,
+        num_trades=3,
+        num_decisions=2,
+        start_local_ts_us=100,
+        end_local_ts_us=200,
+    )
+    assert manifest.num_events == 10
+
+    kwargs = {
+        "schema_version": "1",
+        "tape_format": ExecutionTapeFormat.L2_TRADES_ARRAYS_V1,
+        "exchange": "binance-futures",
+        "symbol": "BTCUSDT",
+        "symbol_spec": spec,
+        "source_data_types": (TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES),
+        "array_names": ("events",),
+        "num_events": 2,
+        "num_l2_batches": 1,
+        "num_trades": 1,
+        "num_decisions": 0,
+        "start_local_ts_us": 100,
+        "end_local_ts_us": 200,
+    }
+    with pytest.raises(ValueError):
+        ExecutionTapeManifest(**{**kwargs, "source_data_types": (TardisDataType.TRADES,)})
+    with pytest.raises(ValueError):
+        ExecutionTapeManifest(**{**kwargs, "source_data_types": (TardisDataType.INCREMENTAL_BOOK_L2,)})
+    with pytest.raises(ValueError):
+        ExecutionTapeManifest(**{**kwargs, "end_local_ts_us": 100})
+    with pytest.raises(ValueError):
+        ExecutionTapeManifest(**{**kwargs, "symbol_spec": _spec(symbol="ETHUSDT")})
+
+
+def test_trade_print_allows_unknown_aggressor_side():
+    from mmrt.execution.contracts import TradePrint
+
+    trade = TradePrint(100, 90, AggressorSide.UNKNOWN, 1000, 0.1)
+    assert trade.side == AggressorSide.UNKNOWN
+    assert math.isfinite(trade.amount)
