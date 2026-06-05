@@ -49,6 +49,7 @@ class ExecutionTapeBuildConfig:
     min_notional: float = 5.0
 
     batch_size: int = 65_536
+    book_depth: int = 25
     max_l2_rows: int | None = None
     max_trade_rows: int | None = None
     tie_policy: ExecutionMergeTiePolicy | str = ExecutionMergeTiePolicy.L2_BEFORE_TRADE
@@ -73,6 +74,7 @@ class ExecutionTapeBuildConfig:
             raise ValueError("max_qty must be >= min_qty")
         object.__setattr__(self, "min_notional", _require_nonnegative_float(self.min_notional, "min_notional"))
         object.__setattr__(self, "batch_size", _require_positive_int(self.batch_size, "batch_size"))
+        object.__setattr__(self, "book_depth", _require_positive_int(self.book_depth, "book_depth"))
         object.__setattr__(self, "max_l2_rows", _optional_positive_int(self.max_l2_rows, "max_l2_rows"))
         object.__setattr__(self, "max_trade_rows", _optional_positive_int(self.max_trade_rows, "max_trade_rows"))
         object.__setattr__(self, "tie_policy", _coerce_tie_policy(self.tie_policy))
@@ -108,6 +110,7 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
         symbol_spec=symbol_spec,
         batch_size=config.batch_size,
         max_rows=config.max_l2_rows,
+        book_depth=config.book_depth,
     )
     trades, trade_stats = load_trade_prints(
         trade_paths,
@@ -127,6 +130,7 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
         l2_events=l2_events,
         trades=trades,
         merged_events=plan.events,
+        book_depth=config.book_depth,
         created_at_utc=config.created_at_utc,
         notes={
             "builder": "mmrt.cli.build_execution_tape",
@@ -146,8 +150,10 @@ def load_reconstructed_l2_events(
     symbol_spec: SymbolSpec,
     batch_size: int,
     max_rows: int | None = None,
+    book_depth: int = 25,
 ) -> tuple[list[ReconstructedL2Event], dict[str, object]]:
-    reconstructor = L2BookReconstructor(symbol_spec)
+    book_depth = _require_positive_int(book_depth, "book_depth")
+    reconstructor = L2BookReconstructor(symbol_spec, snapshot_depth=book_depth)
     events: list[ReconstructedL2Event] = []
     rows_seen = 0
     first_local_ts_us: int | None = None
@@ -198,6 +204,7 @@ def load_reconstructed_l2_events(
         "max_bid_depth": counters.max_bid_depth,
         "max_ask_depth": counters.max_ask_depth,
         "max_batch_size": counters.max_batch_size,
+        "book_depth": book_depth,
     }
     return events, stats
 
@@ -262,6 +269,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-qty", type=float, default=100.0)
     parser.add_argument("--min-notional", type=float, default=5.0)
     parser.add_argument("--batch-size", type=int, default=65_536)
+    parser.add_argument("--book-depth", type=int, default=25)
     parser.add_argument("--max-l2-rows", type=int)
     parser.add_argument("--max-trade-rows", type=int)
     parser.add_argument(
@@ -288,6 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_qty=args.max_qty,
         min_notional=args.min_notional,
         batch_size=args.batch_size,
+        book_depth=args.book_depth,
         max_l2_rows=args.max_l2_rows,
         max_trade_rows=args.max_trade_rows,
         tie_policy=args.tie_policy,
@@ -422,6 +431,7 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
             "max_l2_rows": config.max_l2_rows,
             "max_trade_rows": config.max_trade_rows,
             "batch_size": config.batch_size,
+            "book_depth": config.book_depth,
         },
         "market": {
             "exchange": config.exchange,
@@ -459,6 +469,7 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
             "max_bid_depth": l2_stats["max_bid_depth"],
             "max_ask_depth": l2_stats["max_ask_depth"],
             "max_batch_size": l2_stats["max_batch_size"],
+            "book_depth": l2_stats["book_depth"],
         },
         "merge": {
             "tie_policy": config.tie_policy.value,
@@ -475,6 +486,7 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
             "num_l2_batches": tape.manifest.num_l2_batches,
             "num_trades": tape.manifest.num_trades,
             "num_decisions": tape.manifest.num_decisions,
+            "book_depth": config.book_depth,
             "start_local_ts_us": tape.manifest.start_local_ts_us,
             "end_local_ts_us": tape.manifest.end_local_ts_us,
         },

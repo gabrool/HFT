@@ -299,6 +299,9 @@ def test_one_sided_book_top_returns_none_and_snapshot_still_works():
 
     assert event is not None
     assert event.book_top is None
+    assert event.book_snapshot is not None
+    assert event.book_snapshot.bid_ticks == (1000, 999)
+    assert event.book_snapshot.ask_ticks == ()
     assert reconstructor.book_top() is None
     snapshot = reconstructor.snapshot(depth=5)
     assert snapshot.bid_ticks == (1000, 999)
@@ -349,3 +352,33 @@ def test_l2_reconstructor_has_no_heavy_imports():
     assert "import polars" not in source
     assert "import pandas" not in source
     assert "import pyarrow" not in source
+
+
+def test_reconstructed_event_includes_top_n_snapshot():
+    reconstructor = L2BookReconstructor(_spec(), snapshot_depth=2)
+    event = reconstructor.apply_batch(
+        _batch(
+            100,
+            [
+                _u(100, 90, BookSide.BID, 1000, 1.0, snap=True),
+                _u(100, 91, BookSide.BID, 999, 2.0, snap=True),
+                _u(100, 92, BookSide.BID, 998, 3.0, snap=True),
+                _u(100, 93, BookSide.ASK, 1002, 1.5, snap=True),
+                _u(100, 94, BookSide.ASK, 1003, 2.5, snap=True),
+                _u(100, 95, BookSide.ASK, 1004, 3.5, snap=True),
+            ],
+        )
+    )
+
+    assert event is not None
+    assert event.book_snapshot is not None
+    assert event.book_snapshot.local_ts_us == event.local_ts_us
+    assert event.book_snapshot.bid_ticks == (1000, 999)
+    assert event.book_snapshot.bid_sizes == (1.0, 2.0)
+    assert event.book_snapshot.ask_ticks == (1002, 1003)
+    assert event.book_snapshot.ask_sizes == (1.5, 2.5)
+
+
+def test_reconstructor_snapshot_depth_must_be_positive():
+    with pytest.raises(ValueError, match="snapshot_depth"):
+        L2BookReconstructor(_spec(), snapshot_depth=0)
