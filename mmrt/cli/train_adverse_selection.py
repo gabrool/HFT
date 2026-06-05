@@ -446,9 +446,19 @@ def _fit_baselines(
     train_fraction: float,
     ridge_l2: float,
     min_train_samples: int,
-) -> _BaselineFitResult | None:
+) -> _BaselineFitResult:
     n = int(dataset.num_decisions)
     if n < 2:
+        targets_metrics = {
+            target_name: {
+                "target_name": target_name,
+                "train_rows": 0,
+                "val_rows": 0,
+                "skipped": True,
+                "skip_reason": "not_enough_decisions",
+            }
+            for target_name in target_names
+        }
         return _BaselineFitResult(
             target_names=(),
             feature_names=tuple(dataset.feature_names),
@@ -460,6 +470,14 @@ def _fit_baselines(
             intercepts=np.asarray([], dtype=np.float64),
             metrics={
                 "enabled": True,
+                "train_fraction": train_fraction,
+                "ridge_l2": ridge_l2,
+                "min_train_samples": min_train_samples,
+                "train_rows_total": 0,
+                "val_rows_total": 0,
+                "fitted_target_count": 0,
+                "requested_target_count": len(target_names),
+                "targets": targets_metrics,
                 "skipped": True,
                 "skip_reason": "not_enough_decisions",
             },
@@ -509,7 +527,30 @@ def _fit_baselines(
         intercepts.append(intercept)
         targets_metrics[target_name] = _target_metrics(y_train, pred_train, y_val, pred_val, target_name)
     if not fitted_names:
-        return None
+        metrics: dict[str, object] = {
+            "enabled": True,
+            "train_fraction": train_fraction,
+            "ridge_l2": ridge_l2,
+            "min_train_samples": min_train_samples,
+            "train_rows_total": int(len(train_idx)),
+            "val_rows_total": int(len(val_idx)),
+            "fitted_target_count": 0,
+            "requested_target_count": len(target_names),
+            "targets": targets_metrics,
+            "skipped": True,
+            "skip_reason": "all_targets_skipped",
+        }
+        return _BaselineFitResult(
+            target_names=(),
+            feature_names=tuple(dataset.feature_names),
+            train_rows=int(len(train_idx)),
+            val_rows=int(len(val_idx)),
+            feature_mean=feature_mean,
+            feature_scale=feature_scale,
+            coefficients=np.empty((0, dataset.num_features), dtype=np.float64),
+            intercepts=np.asarray([], dtype=np.float64),
+            metrics=metrics,
+        )
     metrics: dict[str, object] = {
         "enabled": True,
         "train_fraction": train_fraction,
@@ -555,36 +596,20 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         ridge_l2=config.ridge_l2,
         min_train_samples=config.min_train_samples,
     )
-    baseline_summary: dict[str, object]
+    baseline_summary = baseline_fit.metrics
     model_written = False
-    if baseline_fit is None:
-        baseline_summary = {
-            "enabled": True,
-            "train_fraction": config.train_fraction,
-            "ridge_l2": config.ridge_l2,
-            "min_train_samples": config.min_train_samples,
-            "train_rows_total": 0,
-            "val_rows_total": 0,
-            "fitted_target_count": 0,
-            "requested_target_count": len(config.target_names),
-            "targets": {},
-            "skipped": True,
-            "skip_reason": "all_targets_skipped",
-        }
-    else:
-        baseline_summary = baseline_fit.metrics
-        if baseline_fit.target_names:
-            _write_npz_atomic(
-                model_npz,
-                schema_version=np.array("mmrt_adverse_selection_ridge_v1"),
-                feature_names=np.asarray(baseline_fit.feature_names, dtype=object),
-                target_names=np.asarray(baseline_fit.target_names, dtype=object),
-                feature_mean=baseline_fit.feature_mean.astype(np.float32),
-                feature_scale=baseline_fit.feature_scale.astype(np.float32),
-                coefficients=baseline_fit.coefficients.astype(np.float32),
-                intercepts=baseline_fit.intercepts.astype(np.float32),
-            )
-            model_written = True
+    if baseline_fit.target_names:
+        _write_npz_atomic(
+            model_npz,
+            schema_version=np.array("mmrt_adverse_selection_ridge_v1"),
+            feature_names=np.asarray(baseline_fit.feature_names, dtype=object),
+            target_names=np.asarray(baseline_fit.target_names, dtype=object),
+            feature_mean=baseline_fit.feature_mean.astype(np.float32),
+            feature_scale=baseline_fit.feature_scale.astype(np.float32),
+            coefficients=baseline_fit.coefficients.astype(np.float32),
+            intercepts=baseline_fit.intercepts.astype(np.float32),
+        )
+        model_written = True
     status = "ok" if dataset.num_decisions >= 1 and model_written else "warning"
     manifest = tape.manifest
     summary = {

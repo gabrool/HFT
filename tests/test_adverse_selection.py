@@ -293,6 +293,82 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
         assert "coefficients" in npz
 
 
+def test_adverse_selection_all_unknown_targets_preserves_skip_reasons(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
+    output_json = tmp_path / "summary.json"
+    model_npz = tmp_path / "model.npz"
+
+    summary = run_adverse_selection_training(
+        AdverseSelectionTrainCLIConfig(
+            tape_root=str(tape_root),
+            output_json=str(output_json),
+            model_npz=str(model_npz),
+            overwrite=True,
+            decision_interval_us=100,
+            max_decisions=10,
+            fill_horizon_us=1_000,
+            adverse_horizon_us=1_000,
+            order_qty=1.0,
+            min_train_samples=1,
+            target_names=("not_a_label", "also_not_a_label"),
+        )
+    )
+
+    assert summary["status"] == "warning"
+    assert summary["model_npz"] is None
+    assert not model_npz.exists()
+
+    baseline = summary["baseline"]
+    assert baseline["skipped"] is True
+    assert baseline["skip_reason"] == "all_targets_skipped"
+    assert baseline["fitted_target_count"] == 0
+    assert baseline["requested_target_count"] == 2
+
+    assert set(baseline["targets"]) == {"not_a_label", "also_not_a_label"}
+    assert baseline["targets"]["not_a_label"]["skipped"] is True
+    assert baseline["targets"]["not_a_label"]["skip_reason"] == "unknown_target"
+    assert baseline["targets"]["also_not_a_label"]["skip_reason"] == "unknown_target"
+
+
+def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tmp_path):
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [],
+    )
+    tape_root = _tiny_tape_root(tmp_path, tape)
+    output_json = tmp_path / "summary.json"
+    model_npz = tmp_path / "model.npz"
+
+    summary = run_adverse_selection_training(
+        AdverseSelectionTrainCLIConfig(
+            tape_root=str(tape_root),
+            output_json=str(output_json),
+            model_npz=str(model_npz),
+            overwrite=True,
+            decision_interval_us=100,
+            max_decisions=1,
+            fill_horizon_us=1_000,
+            adverse_horizon_us=1_000,
+            order_qty=1.0,
+            drop_incomplete_horizon=False,
+            target_names=("bid_filled", "ask_filled"),
+        )
+    )
+
+    assert summary["status"] == "warning"
+    assert summary["model_npz"] is None
+    assert not model_npz.exists()
+
+    baseline = summary["baseline"]
+    assert baseline["skipped"] is True
+    assert baseline["skip_reason"] == "not_enough_decisions"
+    assert baseline["fitted_target_count"] == 0
+    assert baseline["requested_target_count"] == 2
+    assert set(baseline["targets"]) == {"bid_filled", "ask_filled"}
+    assert baseline["targets"]["bid_filled"]["skip_reason"] == "not_enough_decisions"
+    assert baseline["targets"]["ask_filled"]["skip_reason"] == "not_enough_decisions"
+
+
 def test_train_adverse_selection_main_writes_summary_and_prints_json(tmp_path, capsys):
     tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
     output_json = tmp_path / "summary.json"
