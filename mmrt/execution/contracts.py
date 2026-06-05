@@ -14,7 +14,7 @@ from enum import Enum
 import math
 from typing import Any
 
-from mmrt.contracts import AggressorSide, BookSide, SplitRole, TardisDataType
+from mmrt.contracts import AggressorSide, BookSide, TardisDataType
 
 
 class _StrEnum(str, Enum):
@@ -84,6 +84,8 @@ def _coerce_enum(enum_cls: type[Enum], value: Any, name: str):
 
 
 def _tuple_of_nonempty_str(values: Any, name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be an iterable of non-empty strings, not a single string/bytes value")
     try:
         seq = values if isinstance(values, tuple) else tuple(values)
     except TypeError as exc:
@@ -92,6 +94,8 @@ def _tuple_of_nonempty_str(values: Any, name: str) -> tuple[str, ...]:
 
 
 def _tuple_of_positive_ints(values: Any, name: str) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be an iterable, not a single string/bytes value")
     try:
         seq = values if isinstance(values, tuple) else tuple(values)
     except TypeError as exc:
@@ -100,6 +104,8 @@ def _tuple_of_positive_ints(values: Any, name: str) -> tuple[int, ...]:
 
 
 def _tuple_of_nonnegative_floats(values: Any, name: str) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be an iterable, not a single string/bytes value")
     try:
         seq = values if isinstance(values, tuple) else tuple(values)
     except TypeError as exc:
@@ -268,6 +274,8 @@ class L2UpdateBatch:
                 raise ValueError("updates must contain L2Update values")
             if update.local_ts_us != self.local_ts_us:
                 raise ValueError("all updates must share local_ts_us")
+            if update.ts_us < self.min_ts_us or update.ts_us > self.max_ts_us:
+                raise ValueError("update.ts_us must be within [min_ts_us, max_ts_us]")
         object.__setattr__(self, "updates", updates)
         _require_bool(self.is_snapshot_batch, "is_snapshot_batch")
         if self.is_snapshot_batch != any(update.is_snapshot for update in updates):
@@ -372,13 +380,16 @@ class ExecutionEventRef:
             if isinstance(value, bool) or not isinstance(value, int) or value < -1:
                 raise ValueError(f"{name} must be >= -1")
         if self.event_type == ExecutionEventType.L2_BATCH:
-            if self.book_ptr < 0 or self.trade_ptr != -1:
-                raise ValueError("L2_BATCH requires book_ptr >= 0 and trade_ptr == -1")
+            if self.book_ptr < 0 or self.trade_ptr != -1 or self.decision_ptr != -1:
+                raise ValueError("L2_BATCH requires book_ptr >= 0 and trade_ptr == decision_ptr == -1")
         elif self.event_type == ExecutionEventType.TRADE:
-            if self.trade_ptr < 0:
-                raise ValueError("TRADE requires trade_ptr >= 0")
-        elif self.event_type == ExecutionEventType.DECISION and self.decision_ptr < 0:
-            raise ValueError("DECISION requires decision_ptr >= 0")
+            if self.trade_ptr < 0 or self.decision_ptr != -1:
+                raise ValueError("TRADE requires trade_ptr >= 0 and decision_ptr == -1")
+        elif self.event_type == ExecutionEventType.DECISION:
+            if self.decision_ptr < 0 or self.book_ptr != -1 or self.trade_ptr != -1:
+                raise ValueError("DECISION requires decision_ptr >= 0 and book_ptr == trade_ptr == -1")
+        else:
+            raise ValueError("unknown event_type")
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,6 +504,12 @@ class ActiveOrder:
             raise ValueError("remaining_qty must be <= qty")
         object.__setattr__(self, "queue_ahead_qty", _require_nonnegative_float(self.queue_ahead_qty, "queue_ahead_qty"))
         object.__setattr__(self, "status", _coerce_enum(OrderStatus, self.status, "status"))
+        if self.status == OrderStatus.FILLED and self.remaining_qty != 0.0:
+            raise ValueError("FILLED order requires remaining_qty == 0")
+        if self.status == OrderStatus.PARTIALLY_FILLED and not (0.0 < self.remaining_qty < self.qty):
+            raise ValueError("PARTIALLY_FILLED order requires 0 < remaining_qty < qty")
+        if self.status == OrderStatus.ACTIVE and self.remaining_qty <= 0.0:
+            raise ValueError("ACTIVE order requires remaining_qty > 0")
         _require_positive_int(self.created_local_ts_us, "created_local_ts_us")
         _require_positive_int(self.last_update_local_ts_us, "last_update_local_ts_us")
         if self.last_update_local_ts_us < self.created_local_ts_us:
@@ -544,7 +561,7 @@ class PositionState:
 
     def mark_to_market(self, mid_price: float, contract_size: float = 1.0) -> float:
         """Return cash + inventory_qty * mid_price * contract_size."""
-        mid_price = _require_finite_float(mid_price, "mid_price")
+        mid_price = _require_positive_float(mid_price, "mid_price")
         contract_size = _require_positive_float(contract_size, "contract_size")
         return self.cash + self.inventory_qty * mid_price * contract_size
 
@@ -636,6 +653,8 @@ class ExecutionTapeManifest:
         source_data_types = tuple(_coerce_enum(TardisDataType, value, f"source_data_types[{i}]") for i, value in enumerate(self.source_data_types))
         if not source_data_types:
             raise ValueError("source_data_types must be non-empty")
+        if len(set(source_data_types)) != len(source_data_types):
+            raise ValueError("source_data_types must not contain duplicates")
         if TardisDataType.INCREMENTAL_BOOK_L2 not in source_data_types:
             raise ValueError("source_data_types must include INCREMENTAL_BOOK_L2")
         if TardisDataType.TRADES not in source_data_types:
@@ -644,6 +663,8 @@ class ExecutionTapeManifest:
         array_names = _tuple_of_nonempty_str(self.array_names, "array_names")
         if not array_names:
             raise ValueError("array_names must be non-empty")
+        if len(set(array_names)) != len(array_names):
+            raise ValueError("array_names must not contain duplicates")
         object.__setattr__(self, "array_names", array_names)
         for name in ("num_events", "num_l2_batches", "num_trades", "num_decisions"):
             _require_nonnegative_int(getattr(self, name), name)
