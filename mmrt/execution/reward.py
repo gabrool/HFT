@@ -5,6 +5,8 @@ and computes mark-to-market reward components. It intentionally avoids owning
 quote construction, fill simulation, order lifecycle, observations, or RL logic.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Sequence
 
