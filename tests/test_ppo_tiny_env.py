@@ -1,0 +1,365 @@
+import inspect
+import json
+
+import pytest
+import torch
+
+from mmrt.contracts import AggressorSide
+from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, TradePrint
+from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
+from mmrt.execution.event_merge import merge_execution_events
+from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
+from mmrt.execution.l2_reconstructor import ReconstructedL2Event
+from mmrt.cli.train_execution_ppo import (
+    ExecutionPPOTrainCLIConfig,
+    main,
+    run_execution_ppo_training,
+)
+from mmrt.rl.normalization import ObservationNormalizer
+from mmrt.rl.rollout import RolloutCollector, RolloutConfig
+from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
+from mmrt.rl.ppo import PPOConfig
+from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy, make_training_checkpoint_payload
+
+
+def _spec() -> SymbolSpec:
+    return SymbolSpec(
+        exchange="binance-futures",
+        symbol="BTCUSDT",
+        tick_size=0.1,
+        step_size=0.001,
+        min_qty=0.001,
+        max_qty=100.0,
+        min_notional=0.0,
+    )
+
+
+def _l2(
+    *,
+    seq: int,
+    local_ts_us: int,
+    bid_ticks=(1000, 999),
+    bid_sizes=(1.0, 2.0),
+    ask_ticks=(1002, 1003),
+    ask_sizes=(1.0, 2.0),
+) -> ReconstructedL2Event:
+    top = BookTop(
+        local_ts_us=local_ts_us,
+        best_bid_tick=bid_ticks[0],
+        best_ask_tick=ask_ticks[0],
+        best_bid_size=bid_sizes[0],
+        best_ask_size=ask_sizes[0],
+    )
+    snapshot = BookLevelSnapshot(
+        local_ts_us=local_ts_us,
+        bid_ticks=tuple(bid_ticks),
+        bid_sizes=tuple(bid_sizes),
+        ask_ticks=tuple(ask_ticks),
+        ask_sizes=tuple(ask_sizes),
+    )
+    return ReconstructedL2Event(
+        batch_seq=seq,
+        local_ts_us=local_ts_us,
+        min_ts_us=local_ts_us - 10,
+        max_ts_us=local_ts_us - 5,
+        num_updates=1,
+        is_snapshot_batch=(seq == 0),
+        book_top=top,
+        bid_depth=len(bid_ticks),
+        ask_depth=len(ask_ticks),
+        book_snapshot=snapshot,
+    )
+
+
+def _trade(
+    *,
+    local_ts_us: int,
+    side: AggressorSide,
+    price_tick: int,
+    amount: float,
+    source_row: int,
+) -> TradePrint:
+    return TradePrint(
+        local_ts_us=local_ts_us,
+        ts_us=local_ts_us - 1,
+        side=side,
+        price_tick=price_tick,
+        amount=amount,
+        trade_id=str(source_row),
+        source_row=source_row,
+    )
+
+
+def _tape(l2_events, trades):
+    plan = merge_execution_events(l2_events, trades)
+    return build_execution_tape(
+        symbol_spec=_spec(),
+        l2_events=l2_events,
+        trades=trades,
+        merged_events=plan.events,
+        book_depth=2,
+    )
+
+
+def _save_tape(tmp_path, tape):
+    root = tmp_path / "execution_tape"
+    save_execution_tape(tape, root, overwrite=True)
+    return root
+
+
+def _tiny_events():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=200),
+        _l2(seq=2, local_ts_us=300),
+        _l2(seq=3, local_ts_us=400),
+        _l2(seq=4, local_ts_us=500),
+    ]
+    trades = [
+        _trade(
+            local_ts_us=250,
+            side=AggressorSide.SELL,
+            price_tick=1000,
+            amount=1.0,
+            source_row=0,
+        )
+    ]
+    return l2_events, trades
+
+
+def _tiny_tape():
+    l2_events, trades = _tiny_events()
+    return _tape(l2_events, trades)
+
+
+def _tiny_tape_root(tmp_path):
+    return _save_tape(tmp_path, _tiny_tape())
+
+
+def _tiny_env() -> ExecutionEnv:
+    return ExecutionEnv(
+        _tiny_tape(),
+        config=ExecutionEnvConfig(
+            decision_interval_us=50,
+            max_episode_steps=4,
+        ),
+    )
+
+
+def test_rollout_collector_collects_tiny_env_batch():
+    env = _tiny_env()
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(
+        obs_dim=obs_dim,
+        config=ActorCriticConfig(hidden_sizes=(8,)),
+    )
+    normalizer = ObservationNormalizer(obs_shape=obs_dim)
+    collector = RolloutCollector(
+        env,
+        policy,
+        config=RolloutConfig(
+            rollout_steps=4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            device="cpu",
+        ),
+        observation_normalizer=normalizer,
+    )
+    batch = collector.collect()
+
+    assert batch.num_steps == 4
+    assert batch.observations.shape == (4, obs_dim)
+    assert batch.actions.shape == (4, 6)
+    assert batch.log_probs.shape == (4,)
+    assert batch.values.shape == (4,)
+    assert batch.advantages.shape == (4,)
+    assert batch.returns.shape == (4,)
+    assert torch.isfinite(batch.observations).all()
+    assert torch.isfinite(batch.actions).all()
+    assert torch.isfinite(batch.log_probs).all()
+    assert torch.isfinite(batch.values).all()
+    assert torch.isfinite(batch.advantages).all()
+    assert torch.isfinite(batch.returns).all()
+    assert normalizer.running.count > normalizer.running.initial_epsilon
+
+
+def test_train_ppo_policy_runs_one_update_on_tiny_env():
+    env = _tiny_env()
+    config = PPOTrainingConfig(
+        num_updates=1,
+        learning_rate=1e-3,
+        seed=123,
+        network_config=ActorCriticConfig(hidden_sizes=(8,)),
+        rollout_config=RolloutConfig(
+            rollout_steps=4,
+            device="cpu",
+            dtype=torch.float32,
+        ),
+        ppo_config=PPOConfig(
+            update_epochs=1,
+            minibatch_size=2,
+        ),
+    )
+
+    result = train_ppo_policy(env, config=config)
+
+    assert result.updates_completed == 1
+    assert len(result.history) == 1
+    assert result.history[0].ppo.minibatches_processed == 2
+    assert result.observation_normalizer is not None
+    summary = result.summary_dict()
+    assert summary["status"] == "ok"
+    assert summary["updates_completed"] == 1
+
+    payload = make_training_checkpoint_payload(result)
+    assert payload["schema_version"] == "mmrt_execution_ppo_checkpoint_v1"
+    assert "policy_state_dict" in payload
+    assert "optimizer_state_dict" in payload
+    assert payload["observation_normalizer_state_dict"] is not None
+
+
+def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path)
+    output_json = tmp_path / "summary.json"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    summary = run_execution_ppo_training(
+        ExecutionPPOTrainCLIConfig(
+            tape_root=str(tape_root),
+            output_json=str(output_json),
+            checkpoint_path=str(checkpoint_path),
+            overwrite=True,
+            num_updates=1,
+            rollout_steps=4,
+            update_epochs=1,
+            minibatch_size=2,
+            hidden_sizes=(8,),
+            decision_interval_us=50,
+            max_episode_steps=4,
+            seed=123,
+        )
+    )
+
+    assert output_json.exists()
+    assert checkpoint_path.exists()
+    assert json.loads(output_json.read_text()) == summary
+    assert summary["status"] == "ok"
+    assert summary["run_type"] == "train_execution_ppo"
+    assert summary["checkpoint_saved"] is True
+    assert summary["training"]["updates_completed"] == 1
+    assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    assert ckpt["schema_version"] == "mmrt_execution_ppo_checkpoint_v1"
+    assert ckpt["updates_completed"] == 1
+    assert "policy_state_dict" in ckpt
+    assert ckpt["tape"]["symbol"] == "BTCUSDT"
+
+
+def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):
+    tape_root = _tiny_tape_root(tmp_path)
+    output_json = tmp_path / "summary.json"
+
+    rc = main(
+        [
+            "--tape-root",
+            str(tape_root),
+            "--output-json",
+            str(output_json),
+            "--num-updates",
+            "1",
+            "--rollout-steps",
+            "4",
+            "--update-epochs",
+            "1",
+            "--minibatch-size",
+            "2",
+            "--hidden-sizes",
+            "8",
+            "--decision-interval-us",
+            "50",
+            "--max-episode-steps",
+            "4",
+            "--seed",
+            "123",
+            "--no-checkpoint",
+            "--overwrite",
+        ]
+    )
+
+    assert rc == 0
+    assert output_json.exists()
+    stdout_payload = json.loads(capsys.readouterr().out)
+    disk_payload = json.loads(output_json.read_text())
+    assert stdout_payload == disk_payload
+    assert stdout_payload["checkpoint_saved"] is False
+    assert stdout_payload["training"]["updates_completed"] == 1
+
+
+def test_train_execution_ppo_refuses_overwrite_without_flag(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path)
+    output_json = tmp_path / "summary.json"
+    output_json.write_text("{}")
+
+    with pytest.raises(FileExistsError):
+        run_execution_ppo_training(
+            ExecutionPPOTrainCLIConfig(
+                tape_root=str(tape_root),
+                output_json=str(output_json),
+                save_checkpoint=False,
+                num_updates=1,
+                rollout_steps=2,
+                update_epochs=1,
+                minibatch_size=2,
+                hidden_sizes=(8,),
+            )
+        )
+
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_bytes(b"existing")
+    with pytest.raises(FileExistsError):
+        run_execution_ppo_training(
+            ExecutionPPOTrainCLIConfig(
+                tape_root=str(tape_root),
+                output_json=str(tmp_path / "fresh.json"),
+                checkpoint_path=str(checkpoint_path),
+                save_checkpoint=True,
+                num_updates=1,
+                rollout_steps=2,
+                update_epochs=1,
+                minibatch_size=2,
+                hidden_sizes=(8,),
+            )
+        )
+
+
+def test_train_execution_ppo_cli_config_parses_hidden_sizes_and_dtype():
+    cfg = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        hidden_sizes="8,4",
+        dtype="float64",
+        queue_mode="balanced",
+    )
+    assert cfg.hidden_sizes == (8, 4)
+    assert cfg.dtype is torch.float64
+    assert cfg.queue_mode.value == "balanced"
+
+    cfg = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", hidden_sizes="none")
+    assert cfg.hidden_sizes == ()
+
+
+def test_train_execution_ppo_cli_does_not_import_forbidden_modules():
+    import mmrt.cli.train_execution_ppo as cli
+
+    source = inspect.getsource(cli)
+    for text in (
+        "pandas",
+        "polars",
+        "pyarrow",
+        "sklearn",
+        "gym",
+        "gymnasium",
+        "mmrt.linear",
+        "mmrt.storage",
+        "build_execution_tape",
+    ):
+        assert text not in source
