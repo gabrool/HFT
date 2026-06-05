@@ -4,12 +4,14 @@ import pytest
 
 from mmrt.contracts import AggressorSide, BookSide, TardisDataType
 from mmrt.execution.contracts import (
+    ActionSpec,
     ActiveOrder,
     BookLevelSnapshot,
     BookTop,
     DecisionRef,
     ExecutionEventRef,
     ExecutionEventType,
+    ExecutionStepResult,
     ExecutionTapeFormat,
     ExecutionTapeManifest,
     Fill,
@@ -19,6 +21,7 @@ from mmrt.execution.contracts import (
     LinearSignal,
     OrderSide,
     OrderStatus,
+    PositionState,
     QuoteIntent,
     RewardComponents,
     SymbolSpec,
@@ -97,6 +100,10 @@ def test_l2_update_batch_atomicity():
         L2UpdateBatch(100, 90, 95, (), False, 0)
     with pytest.raises(ValueError):
         L2UpdateBatch(100, 90, 95, (_update(is_snapshot=True),), False, 0)
+    with pytest.raises(ValueError):
+        L2UpdateBatch(100, 90, 95, (_update(ts_us=89),), False, 0)
+    with pytest.raises(ValueError):
+        L2UpdateBatch(100, 90, 95, (_update(ts_us=96),), False, 0)
 
 
 def test_book_top_properties_and_cross_validation():
@@ -136,6 +143,14 @@ def test_execution_event_ref_pointer_requirements():
         ExecutionEventRef(1, 101, ExecutionEventType.TRADE)
     with pytest.raises(ValueError):
         ExecutionEventRef(2, 102, ExecutionEventType.DECISION)
+    with pytest.raises(ValueError):
+        ExecutionEventRef(0, 100, ExecutionEventType.L2_BATCH, book_ptr=0, decision_ptr=1)
+    with pytest.raises(ValueError):
+        ExecutionEventRef(1, 101, ExecutionEventType.TRADE, trade_ptr=2, decision_ptr=1)
+    with pytest.raises(ValueError):
+        ExecutionEventRef(2, 102, ExecutionEventType.DECISION, decision_ptr=3, book_ptr=1)
+    with pytest.raises(ValueError):
+        ExecutionEventRef(2, 102, ExecutionEventType.DECISION, decision_ptr=3, trade_ptr=1)
 
 
 def test_decision_ref_sequence_window_validation():
@@ -154,6 +169,20 @@ def test_linear_signal_bounds_and_negative_expected_return():
         LinearSignal(0.2, 1.1, 1.0, 2.0, 0.0, 0.9)
     with pytest.raises(ValueError):
         LinearSignal(0.2, 0.7, -1.0, 2.0, 0.0, 0.9)
+
+
+def test_action_spec_validation():
+    spec = ActionSpec(max_distance_ticks=10, max_order_qty=0.02)
+    assert spec.max_distance_ticks == 10
+
+    with pytest.raises(ValueError):
+        ActionSpec(max_distance_ticks=0)
+
+    with pytest.raises(ValueError):
+        ActionSpec(max_order_qty=0.0)
+
+    with pytest.raises(ValueError):
+        ActionSpec(allow_bid=False, allow_ask=False)
 
 
 def test_quote_intent_validation():
@@ -190,6 +219,23 @@ def test_active_order_and_fill_validation_and_properties():
 
     with pytest.raises(ValueError):
         ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.03, 0.0, OrderStatus.ACTIVE, 100, 110)
+    with pytest.raises(ValueError):
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.01, 0.0, OrderStatus.FILLED, 100, 110)
+    with pytest.raises(ValueError):
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.02, 0.0, OrderStatus.PARTIALLY_FILLED, 100, 110)
+    with pytest.raises(ValueError):
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.0, 0.0, OrderStatus.ACTIVE, 100, 110)
+
+
+def test_position_state_mark_to_market_requires_positive_mid():
+    pos = PositionState(cash=10.0, inventory_qty=0.5)
+    assert pos.mark_to_market(100.0) == pytest.approx(60.0)
+
+    with pytest.raises(ValueError):
+        pos.mark_to_market(0.0)
+
+    with pytest.raises(ValueError):
+        pos.mark_to_market(-1.0)
 
 
 def test_reward_components_total_and_penalties():
@@ -205,6 +251,36 @@ def test_reward_components_total_and_penalties():
 
     with pytest.raises(ValueError):
         RewardComponents(1.0, inventory_penalty=-0.1)
+
+
+def test_execution_step_result_validation():
+    fill = Fill(1, OrderSide.BUY, 120, 1000, 0.01, -0.001, FillReason.TRADE_AT_LEVEL)
+    result = ExecutionStepResult(
+        reward=RewardComponents(1.0),
+        position=PositionState(),
+        fills=(fill,),
+        done=False,
+        truncated=False,
+        info={"equity": 1.0},
+    )
+    assert result.fills == (fill,)
+    assert result.info == {"equity": 1.0}
+
+    with pytest.raises(ValueError):
+        ExecutionStepResult(RewardComponents(1.0), PositionState(), fills=(object(),), done=False, truncated=False)
+
+    with pytest.raises(ValueError):
+        ExecutionStepResult(RewardComponents(1.0), PositionState(), fills=(), done=0, truncated=False)
+
+    with pytest.raises(ValueError):
+        ExecutionStepResult(
+            RewardComponents(1.0),
+            PositionState(),
+            fills=(),
+            done=False,
+            truncated=False,
+            info={"x": float("nan")},
+        )
 
 
 def test_execution_tape_manifest_required_metadata():
@@ -242,9 +318,24 @@ def test_execution_tape_manifest_required_metadata():
         "end_local_ts_us": 200,
     }
     with pytest.raises(ValueError):
+        ExecutionTapeManifest(**{**kwargs, "array_names": "events"})
+    with pytest.raises(ValueError):
         ExecutionTapeManifest(**{**kwargs, "source_data_types": (TardisDataType.TRADES,)})
     with pytest.raises(ValueError):
         ExecutionTapeManifest(**{**kwargs, "source_data_types": (TardisDataType.INCREMENTAL_BOOK_L2,)})
+    with pytest.raises(ValueError):
+        ExecutionTapeManifest(
+            **{
+                **kwargs,
+                "source_data_types": (
+                    TardisDataType.INCREMENTAL_BOOK_L2,
+                    TardisDataType.TRADES,
+                    TardisDataType.TRADES,
+                ),
+            }
+        )
+    with pytest.raises(ValueError):
+        ExecutionTapeManifest(**{**kwargs, "array_names": ("events", "events")})
     with pytest.raises(ValueError):
         ExecutionTapeManifest(**{**kwargs, "end_local_ts_us": 100})
     with pytest.raises(ValueError):
