@@ -72,6 +72,20 @@ def _require_nonnegative_float(value: float, name: str) -> float:
     return value
 
 
+def _clean_info_value(value: object, name: str) -> object:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return _require_finite_float(value, name)
+    if isinstance(value, str):
+        return value
+    raise ValueError(f"{name} must be a JSON-safe scalar")
+
+
 def _coerce_enum(enum_cls: type[Enum], value: Any, name: str):
     if isinstance(value, enum_cls):
         return value
@@ -599,7 +613,7 @@ class ExecutionStepResult:
     fills: tuple[Fill, ...]
     done: bool
     truncated: bool
-    info: dict[str, float] | None = None
+    info: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reward, RewardComponents):
@@ -614,12 +628,12 @@ class ExecutionStepResult:
         _require_bool(self.truncated, "truncated")
         if self.info is not None:
             if not isinstance(self.info, dict):
-                raise ValueError("info must be None or dict[str, float]")
-            clean: dict[str, float] = {}
+                raise ValueError("info must be None or dict[str, object]")
+            clean: dict[str, object] = {}
             for key, value in self.info.items():
                 if not isinstance(key, str):
                     raise ValueError("info keys must be str")
-                clean[key] = _require_finite_float(value, f"info[{key!r}]")
+                clean[key] = _clean_info_value(value, f"info[{key!r}]")
             object.__setattr__(self, "info", clean)
 
 

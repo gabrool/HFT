@@ -412,9 +412,8 @@ class ExecutionEnv:
             fills=step_fills,
             done=done,
             truncated=truncated,
-            info=None,
+            info=info,
         )
-        object.__setattr__(execution, "info", info)
         observation = self._build_observation()
         return ExecutionEnvStep(
             observation=observation,
@@ -494,7 +493,7 @@ class ExecutionEnv:
                 updated_orders,
                 side=order.side,
                 price_tick=order.price_tick,
-                prev_level_qty=(prev_qty if prev_qty is not None else 0.0) + order.remaining_qty,
+                prev_level_qty=prev_qty if prev_qty is not None else 0.0,
                 curr_level_qty=curr_qty if curr_qty is not None else 0.0,
                 local_ts_us=local_ts_us,
                 symbol_spec=self.tape.manifest.symbol_spec,

@@ -283,6 +283,51 @@ def test_execution_step_result_validation():
         )
 
 
+def test_execution_step_result_info_accepts_json_safe_scalars():
+    result = ExecutionStepResult(
+        reward=RewardComponents(raw_equity_delta=1.0),
+        position=PositionState(),
+        fills=(),
+        done=False,
+        truncated=False,
+        info={
+            "float_value": 1.5,
+            "int_value": 2,
+            "bool_value": True,
+            "str_value": "reason",
+            "none_value": None,
+        },
+    )
+
+    assert result.info["float_value"] == pytest.approx(1.5)
+    assert result.info["int_value"] == 2
+    assert result.info["bool_value"] is True
+    assert result.info["str_value"] == "reason"
+    assert result.info["none_value"] is None
+
+
+def test_execution_step_result_info_rejects_non_scalar_or_nonfinite_values():
+    base = dict(
+        reward=RewardComponents(raw_equity_delta=0.0),
+        position=PositionState(),
+        fills=(),
+        done=False,
+        truncated=False,
+    )
+
+    with pytest.raises(ValueError):
+        ExecutionStepResult(**base, info={"bad": float("nan")})
+
+    with pytest.raises(ValueError):
+        ExecutionStepResult(**base, info={"bad": float("inf")})
+
+    with pytest.raises(ValueError):
+        ExecutionStepResult(**base, info={"bad": ["nested"]})
+
+    with pytest.raises(ValueError):
+        ExecutionStepResult(**base, info={1: "bad_key"})
+
+
 def test_execution_tape_manifest_required_metadata():
     spec = _spec()
     manifest = ExecutionTapeManifest(
