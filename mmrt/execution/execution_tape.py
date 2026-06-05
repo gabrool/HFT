@@ -303,6 +303,8 @@ def _build_events_array(
     trades: tuple[TradePrint, ...],
 ) -> np.ndarray:
     events_arr = np.empty(len(merged_events), dtype=EVENT_DTYPE)
+    seen_l2 = np.zeros(len(l2_events), dtype=bool)
+    seen_trades = np.zeros(len(trades), dtype=bool)
     prev_local_ts_us: int | None = None
     for i, event in enumerate(merged_events):
         if event.ref.event_seq != i:
@@ -318,6 +320,9 @@ def _build_events_array(
                 raise ValueError("merged L2 event trade_ptr must be -1")
             if event.l2_event is not l2_events[event.ref.book_ptr]:
                 raise ValueError("merged L2 event pointer does not match l2_events")
+            if seen_l2[event.ref.book_ptr]:
+                raise ValueError("duplicate L2 book_ptr in merged events")
+            seen_l2[event.ref.book_ptr] = True
             code = EVENT_TYPE_CODE_L2_BATCH
         elif event.ref.event_type == ExecutionEventType.TRADE:
             if event.ref.trade_ptr < 0 or event.ref.trade_ptr >= len(trades):
@@ -326,6 +331,9 @@ def _build_events_array(
                 raise ValueError("merged trade event book_ptr must be -1")
             if event.trade is not trades[event.ref.trade_ptr]:
                 raise ValueError("merged trade event pointer does not match trades")
+            if seen_trades[event.ref.trade_ptr]:
+                raise ValueError("duplicate trade_ptr in merged events")
+            seen_trades[event.ref.trade_ptr] = True
             code = EVENT_TYPE_CODE_TRADE
         else:
             raise ValueError("execution tape v1 supports only L2_BATCH and TRADE events")
@@ -338,6 +346,11 @@ def _build_events_array(
             event.ref.book_ptr,
             event.ref.trade_ptr,
         )
+
+    if not np.all(seen_l2):
+        raise ValueError("merged_events do not reference every l2_event")
+    if not np.all(seen_trades):
+        raise ValueError("merged_events do not reference every trade")
     return events_arr
 
 
@@ -414,8 +427,6 @@ def _validate_array(array: np.ndarray, dtype: np.dtype, name: str) -> None:
 
 
 def _validate_events_array(events: np.ndarray, num_l2_events: int, num_trades: int) -> None:
-    if len(events) == 0:
-        return
     expected_event_seq = np.arange(len(events), dtype=np.int64)
     if not np.array_equal(events["event_seq"], expected_event_seq):
         raise ValueError("events event_seq values must be contiguous from 0")
@@ -425,6 +436,8 @@ def _validate_events_array(events: np.ndarray, num_l2_events: int, num_trades: i
     event_type_codes = events["event_type_code"]
     book_ptrs = events["book_ptr"]
     trade_ptrs = events["trade_ptr"]
+    seen_l2 = np.zeros(num_l2_events, dtype=bool)
+    seen_trades = np.zeros(num_trades, dtype=bool)
     for i in range(len(events)):
         code = int(event_type_codes[i])
         book_ptr = int(book_ptrs[i])
@@ -432,11 +445,22 @@ def _validate_events_array(events: np.ndarray, num_l2_events: int, num_trades: i
         if code == EVENT_TYPE_CODE_L2_BATCH:
             if book_ptr < 0 or book_ptr >= num_l2_events or trade_ptr != -1:
                 raise ValueError("L2 events require valid book_ptr and trade_ptr == -1")
+            if seen_l2[book_ptr]:
+                raise ValueError("duplicate L2 book_ptr in events array")
+            seen_l2[book_ptr] = True
         elif code == EVENT_TYPE_CODE_TRADE:
             if trade_ptr < 0 or trade_ptr >= num_trades or book_ptr != -1:
                 raise ValueError("trade events require valid trade_ptr and book_ptr == -1")
+            if seen_trades[trade_ptr]:
+                raise ValueError("duplicate trade_ptr in events array")
+            seen_trades[trade_ptr] = True
         else:
             raise ValueError("unknown event_type_code")
+
+    if not np.all(seen_l2):
+        raise ValueError("events array does not reference every l2_event")
+    if not np.all(seen_trades):
+        raise ValueError("events array does not reference every trade")
 
 
 def _require_nonnegative_int(value: int, name: str) -> int:

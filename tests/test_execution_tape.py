@@ -144,6 +144,98 @@ def test_rejects_trade_pointer_mismatch():
         build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=[trade_b], merged_events=plan.events)
 
 
+def test_rejects_unreferenced_l2_event():
+    l2_a = _l2(100, seq=0)
+    l2_b = _l2(200, seq=1)
+    plan = merge_execution_events([l2_a], [])
+
+    with pytest.raises(ValueError, match="reference every l2_event"):
+        build_execution_tape(
+            symbol_spec=_spec(),
+            l2_events=[l2_a, l2_b],
+            trades=[],
+            merged_events=plan.events,
+        )
+
+
+def test_rejects_unreferenced_trade():
+    trade_a = _trade(100, idx=0)
+    trade_b = _trade(200, idx=1)
+    plan = merge_execution_events([], [trade_a])
+
+    with pytest.raises(ValueError, match="reference every trade"):
+        build_execution_tape(
+            symbol_spec=_spec(),
+            l2_events=[],
+            trades=[trade_a, trade_b],
+            merged_events=plan.events,
+        )
+
+
+def test_rejects_duplicate_l2_book_ptr():
+    l2 = [_l2(100, seq=0)]
+
+    merged = [
+        MergedExecutionEvent(
+            ref=ExecutionEventRef(
+                event_seq=0,
+                local_ts_us=l2[0].local_ts_us,
+                event_type=ExecutionEventType.L2_BATCH,
+                book_ptr=0,
+            ),
+            local_ts_us=l2[0].local_ts_us,
+            ts_us=l2[0].max_ts_us,
+            l2_event=l2[0],
+        ),
+        MergedExecutionEvent(
+            ref=ExecutionEventRef(
+                event_seq=1,
+                local_ts_us=l2[0].local_ts_us,
+                event_type=ExecutionEventType.L2_BATCH,
+                book_ptr=0,
+            ),
+            local_ts_us=l2[0].local_ts_us,
+            ts_us=l2[0].max_ts_us,
+            l2_event=l2[0],
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate L2 book_ptr"):
+        build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=[], merged_events=merged)
+
+
+def test_rejects_duplicate_trade_ptr():
+    trades = [_trade(100, idx=0)]
+
+    merged = [
+        MergedExecutionEvent(
+            ref=ExecutionEventRef(
+                event_seq=0,
+                local_ts_us=trades[0].local_ts_us,
+                event_type=ExecutionEventType.TRADE,
+                trade_ptr=0,
+            ),
+            local_ts_us=trades[0].local_ts_us,
+            ts_us=trades[0].ts_us,
+            trade=trades[0],
+        ),
+        MergedExecutionEvent(
+            ref=ExecutionEventRef(
+                event_seq=1,
+                local_ts_us=trades[0].local_ts_us,
+                event_type=ExecutionEventType.TRADE,
+                trade_ptr=0,
+            ),
+            local_ts_us=trades[0].local_ts_us,
+            ts_us=trades[0].ts_us,
+            trade=trades[0],
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate trade_ptr"):
+        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=merged)
+
+
 def test_rejects_unsorted_source_arrays_or_merged_events():
     with pytest.raises(ValueError, match="l2_events local_ts_us"):
         l2 = [_l2(300, seq=0), _l2(100, seq=1)]
@@ -278,6 +370,46 @@ def test_execution_tape_arrays_reject_invalid_event_pointers():
 
     with pytest.raises(ValueError):
         ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=tape.arrays.trades)
+
+
+def test_execution_tape_arrays_reject_duplicate_l2_pointer():
+    tape = _basic_tape()
+    events = tape.arrays.events.copy()
+
+    # Make event 2 point to the same L2 row as event 0.
+    events[2]["book_ptr"] = events[0]["book_ptr"]
+
+    with pytest.raises(ValueError, match="duplicate L2 book_ptr"):
+        ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=tape.arrays.trades)
+
+
+def test_execution_tape_arrays_reject_duplicate_trade_pointer():
+    tape = _basic_tape()
+    events = tape.arrays.events.copy()
+
+    # Make event 3 point to the same trade row as event 1.
+    events[3]["trade_ptr"] = events[1]["trade_ptr"]
+
+    with pytest.raises(ValueError, match="duplicate trade_ptr"):
+        ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=tape.arrays.trades)
+
+
+def test_execution_tape_arrays_reject_unreferenced_l2_row():
+    tape = _basic_tape()
+    events = tape.arrays.events.copy()
+    l2_events = np.concatenate([tape.arrays.l2_events, tape.arrays.l2_events[:1]])
+
+    with pytest.raises(ValueError, match="reference every l2_event"):
+        ExecutionTapeArrays(events=events, l2_events=l2_events, trades=tape.arrays.trades)
+
+
+def test_execution_tape_arrays_reject_unreferenced_trade_row():
+    tape = _basic_tape()
+    events = tape.arrays.events.copy()
+    trades = np.concatenate([tape.arrays.trades, tape.arrays.trades[:1]])
+
+    with pytest.raises(ValueError, match="reference every trade"):
+        ExecutionTapeArrays(events=events, l2_events=tape.arrays.l2_events, trades=trades)
 
 
 def test_no_forbidden_imports():
