@@ -425,8 +425,11 @@ class ExecutionEnv:
         state = self._require_state()
         book_top = self._current_book_top()
         l2_row = self.tape.arrays.l2_events[state.current_book_ptr]
+        current_local_ts_us = book_top.local_ts_us
+        if self._last_step_fills:
+            current_local_ts_us = max(current_local_ts_us, max(fill.local_ts_us for fill in self._last_step_fills))
         context = ObservationContext(
-            current_local_ts_us=book_top.local_ts_us,
+            current_local_ts_us=current_local_ts_us,
             episode_start_local_ts_us=self._episode_start_local_ts_us,
             current_event_index=state.event_index,
             total_events=len(self.tape.arrays.events),
