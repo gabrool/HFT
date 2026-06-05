@@ -156,6 +156,32 @@ def test_merged_execution_event_validation():
     with pytest.raises(ValueError):
         MergedExecutionEvent(ref=l2_ref, local_ts_us=101, ts_us=95, l2_event=l2)
 
+    with pytest.raises(ValueError):
+        MergedExecutionEvent(
+            ref=ExecutionEventRef(
+                event_seq=0,
+                local_ts_us=999,
+                event_type=ExecutionEventType.L2_BATCH,
+                book_ptr=0,
+            ),
+            local_ts_us=100,
+            ts_us=95,
+            l2_event=l2,
+        )
+
+    with pytest.raises(ValueError):
+        MergedExecutionEvent(
+            ref=ExecutionEventRef(
+                event_seq=0,
+                local_ts_us=999,
+                event_type=ExecutionEventType.TRADE,
+                trade_ptr=0,
+            ),
+            local_ts_us=100,
+            ts_us=99,
+            trade=trade,
+        )
+
 
 def test_execution_event_merge_has_no_heavy_imports():
     source = Path("mmrt/execution/event_merge.py").read_text()
