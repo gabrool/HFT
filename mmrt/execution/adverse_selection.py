@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Any, Iterable, Mapping, NamedTuple, Sequence
+from typing import NamedTuple, Sequence
 
 import numpy as np
 
@@ -95,18 +95,6 @@ def _positive_int_tuple(values: Sequence[int], name: str) -> tuple[int, ...]:
     if not result:
         raise ValueError(f"{name} must be non-empty")
     return tuple(_require_positive_int(value, f"{name}[{i}]") for i, value in enumerate(result))
-
-
-def _positive_float_tuple(values: Sequence[float], name: str) -> tuple[float, ...]:
-    if isinstance(values, (str, bytes)):
-        raise ValueError(f"{name} must be a sequence of positive floats")
-    try:
-        result = tuple(values)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a sequence of positive floats") from exc
-    if not result:
-        raise ValueError(f"{name} must be non-empty")
-    return tuple(_require_positive_float(value, f"{name}[{i}]") for i, value in enumerate(result))
 
 
 def _safe_div(num: float, den: float, default: float = 0.0) -> float:
@@ -268,13 +256,6 @@ class _KyleSample(NamedTuple):
     end_local_ts_us: int
     x_flow: float
     y_mid_bps: float
-
-
-class _PendingKyleSample(NamedTuple):
-    start_local_ts_us: int
-    response_local_ts_us: int
-    start_mid_tick: float
-    signed_flow: float
 
 
 @dataclass(slots=True)
@@ -629,24 +610,26 @@ def _counterfactual_fill_one_side(
                 else:
                     prev_qty = _book_qty_at_price(tape.arrays.book_ask_ticks[prev_book_ptr], tape.arrays.book_ask_sizes[prev_book_ptr], price_tick)
                     curr_qty = _book_qty_at_price(tape.arrays.book_ask_ticks[curr_book_ptr], tape.arrays.book_ask_sizes[curr_book_ptr], price_tick)
-                if prev_qty is not None and curr_qty is not None:
-                    visible_decrease = max(prev_qty - curr_qty, 0.0)
-                    effective_l2_advance = visible_decrease * qm.l2_decrease_weight
-                    queue_before = queue_ahead
-                    queue_consumed = min(queue_ahead, effective_l2_advance)
-                    queue_ahead = max(queue_ahead - effective_l2_advance, 0.0)
-                    leftover = max(effective_l2_advance - queue_consumed, 0.0)
-                    fillable_qty = min(remaining_qty, leftover)
-                    if fillable_qty > qm.qty_epsilon:
-                        return _clean_fill_result(
-                            filled=True,
-                            fill_local_ts_us=local_ts_us,
-                            fill_price_tick=price_tick,
-                            fill_reason=FillReason.QUEUE_DEPLETION,
-                            decision_local_ts_us=decision_local_ts_us,
-                            queue_ahead_at_start=queue_at_start,
-                            queue_ahead_before_fill=queue_before,
-                        )
+                if prev_qty is not None:
+                    curr_visible_qty = 0.0 if curr_qty is None else curr_qty
+                    visible_decrease = max(prev_qty - curr_visible_qty, 0.0)
+                    if visible_decrease > 0.0:
+                        effective_l2_advance = visible_decrease * qm.l2_decrease_weight
+                        queue_before = queue_ahead
+                        queue_consumed = min(queue_ahead, effective_l2_advance)
+                        queue_ahead = max(queue_ahead - effective_l2_advance, 0.0)
+                        leftover = max(effective_l2_advance - queue_consumed, 0.0)
+                        fillable_qty = min(remaining_qty, leftover)
+                        if fillable_qty > qm.qty_epsilon:
+                            return _clean_fill_result(
+                                filled=True,
+                                fill_local_ts_us=local_ts_us,
+                                fill_price_tick=price_tick,
+                                fill_reason=FillReason.QUEUE_DEPLETION,
+                                decision_local_ts_us=decision_local_ts_us,
+                                queue_ahead_at_start=queue_at_start,
+                                queue_ahead_before_fill=queue_before,
+                            )
             prev_book_ptr = curr_book_ptr
     return _clean_fill_result(
         filled=False,
