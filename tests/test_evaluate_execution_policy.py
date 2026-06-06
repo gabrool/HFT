@@ -279,7 +279,10 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert json.loads(output_json.read_text()) == summary
     assert summary["status"] in ("ok", "warning", "error")
     assert summary["run_type"] == "evaluate_execution_policy"
-    assert summary["checkpoint"]["schema_version"] == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
+    assert (
+        summary["checkpoint"]["schema_version"]
+        == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
+    )
     assert summary["checkpoint"]["updates_completed"] == 1
     assert summary["checkpoint"]["has_observation_normalizer"] is True
     assert summary["env_config_source"] == "checkpoint_cli_config"
@@ -287,8 +290,13 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["evaluation"]["steps"] <= 4
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
     assert summary["tape"]["symbol"] == "BTCUSDT"
-    assert summary["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v2_no_move_gated"
-
+    assert (
+        summary["linear_signals"]["schema_version"]
+        == "mmrt_execution_linear_signals_v2_no_move_gated"
+    )
+    assert summary["linear_signals"]["n_rows"] >= 1
+    assert summary["linear_signals"]["fields"] == train_summary["linear_signals"]["fields"]
+    assert summary["observation_schema"] == train_summary["observation_schema"]
 
 
 def test_evaluate_execution_policy_requires_linear_signals_file(tmp_path):
@@ -310,7 +318,9 @@ def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path)
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     checkpoint["observation_schema"] = dict(checkpoint["observation_schema"])
-    checkpoint["observation_schema"]["field_names"] = checkpoint["observation_schema"]["field_names"][:-1]
+    checkpoint["observation_schema"]["field_names"] = checkpoint["observation_schema"][
+        "field_names"
+    ][:-1]
     bad_checkpoint = tmp_path / "bad_checkpoint.pt"
     torch.save(checkpoint, bad_checkpoint)
 
@@ -324,6 +334,48 @@ def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path)
                 max_steps=4,
             )
         )
+
+
+def test_evaluate_execution_policy_rejects_checkpoint_missing_linear_signal_metadata(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint.pop("linear_signals", None)
+
+    bad_checkpoint = tmp_path / "missing_linear_metadata.pt"
+    torch.save(checkpoint, bad_checkpoint)
+
+    with pytest.raises(ValueError, match="linear_signals"):
+        run_execution_policy_evaluation(
+            ExecutionPolicyEvaluationCLIConfig(
+                tape_root=str(tape_root),
+                checkpoint_path=str(bad_checkpoint),
+                output_json=str(tmp_path / "eval_missing_linear.json"),
+                overwrite=True,
+                max_steps=4,
+            )
+        )
+
+
+def test_evaluate_execution_policy_rejects_linear_signal_field_mismatch(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint["linear_signals"] = dict(checkpoint["linear_signals"])
+    checkpoint["linear_signals"]["fields"] = checkpoint["linear_signals"]["fields"][:-1]
+
+    bad_checkpoint = tmp_path / "bad_linear_fields.pt"
+    torch.save(checkpoint, bad_checkpoint)
+
+    with pytest.raises(ValueError, match="linear signal fields"):
+        run_execution_policy_evaluation(
+            ExecutionPolicyEvaluationCLIConfig(
+                tape_root=str(tape_root),
+                checkpoint_path=str(bad_checkpoint),
+                output_json=str(tmp_path / "eval_bad_linear_fields.json"),
+                overwrite=True,
+                max_steps=4,
+            )
+        )
+
 
 def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path, capsys):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
@@ -352,6 +404,11 @@ def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path,
     assert stdout_payload == disk_payload
     assert stdout_payload["run_type"] == "evaluate_execution_policy"
     assert stdout_payload["evaluation"]["steps"] > 0
+    assert (
+        stdout_payload["linear_signals"]["schema_version"]
+        == "mmrt_execution_linear_signals_v2_no_move_gated"
+    )
+    assert "observation_schema" in stdout_payload
 
 
 def test_evaluate_execution_policy_refuses_overwrite_without_flag(tmp_path):

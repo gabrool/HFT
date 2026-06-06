@@ -613,6 +613,10 @@ def run_execution_policy_evaluation(
                 else None
             ),
         },
+        "observation_schema": env.config.observation_schema.as_dict(),
+        "linear_signals": linear_signal_arrays_summary(
+            linear_signals, path=str(linear_signals_path)
+        ),
         "evaluation": result.as_dict(),
     }
     _write_json_atomic(output_json, summary)
