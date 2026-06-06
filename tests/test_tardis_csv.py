@@ -236,7 +236,7 @@ def test_write_normalized_parquet(tmp_path):
     assert pl.read_parquet(dst).columns == list(expected_normalized_columns(TardisDataType.TRADES))
 
 
-def test_write_normalized_parquet_sorts_by_local_ts_then_raw_source_row(tmp_path):
+def test_write_normalized_parquet_preserves_source_row_order(tmp_path):
     src = tmp_path / "trades_unsorted.csv"
     dst = tmp_path / "out" / "trades.parquet"
     src.write_text(
@@ -248,7 +248,7 @@ def test_write_normalized_parquet_sorts_by_local_ts_then_raw_source_row(tmp_path
     )
     write_normalized_parquet(src, dst, TardisDataType.TRADES)
     df = pl.read_parquet(dst)
-    assert df.select([LOCAL_TS_US, RAW_SOURCE_ROW]).rows() == [(10, 1), (10, 2), (30, 0)]
+    assert df.select([LOCAL_TS_US, RAW_SOURCE_ROW]).rows() == [(30, 0), (10, 1), (10, 2)]
 
 
 def test_expected_normalized_columns():

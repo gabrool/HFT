@@ -37,7 +37,7 @@ class AggressorSide(_StrEnum):
 
 
 class DecisionReason(_StrEnum):
-    BOOK_EVENT = "book_event"
+    BOOK_STRIDE = "book_stride"
 
 
 class PriceReference(_StrEnum):

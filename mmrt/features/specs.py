@@ -226,8 +226,14 @@ _US_WINDOW_RE = re.compile(r"(?P<num>\d+)us")
 _ACCEL_US_RE = re.compile(r"(?P<fast>\d+)us_minus_(?P<slow>\d+)us")
 
 
-def infer_windows_us_from_name(name: str) -> tuple[int, ...]:
+def _require_known_feature_name(name: str) -> str:
     name = _require_nonempty_str(name, "name")
+    if name not in CORE_FEATURE_NAMES and name not in EVENT_CONTEXT_FEATURE_NAMES:
+        raise ValueError(f"unknown active feature name: {name}")
+    return name
+
+def infer_windows_us_from_name(name: str) -> tuple[int, ...]:
+    name = _require_known_feature_name(name)
     if "ms" in name:
         raise ValueError("name must not contain ms")
     match = _ACCEL_US_RE.search(name)
@@ -251,15 +257,9 @@ def infer_source(name: str) -> FeatureSource:
     if name in EVENT_CONTEXT_FEATURE_NAMES:
         return FeatureSource.EVENT_CONTEXT
     trade_exact_names = {
-        "time_since_trade_us",
-        "regime_volume_ewma_500000us",
-        "regime_volume_ewma_3000000us",
-    }
+            }
     cross_exact_names = {
         "trade_side_quote_response_asymmetry_500000us",
-        "trade_impact_half_life_proxy",
-        "vwap_vs_mid_bps_200000us",
-        "vwap_vs_mid_bps_500000us",
     }
     if name in trade_exact_names:
         return FeatureSource.TRADE
@@ -311,14 +311,9 @@ def infer_owner(source: FeatureSource) -> FeatureOwner:
 
 
 def infer_family(name: str, source: FeatureSource) -> FeatureFamily:
+    name = _require_known_feature_name(name)
     if source == FeatureSource.EVENT_CONTEXT:
         return FeatureFamily.EVENT_CONTEXT
-    if name in {"vwap_vs_mid_bps_200000us", "vwap_vs_mid_bps_500000us"}:
-        return FeatureFamily.CROSS_SIGNAL
-    if name in {"regime_volume_ewma_500000us", "regime_volume_ewma_3000000us"}:
-        return FeatureFamily.REGIME
-    if name == "time_since_trade_us":
-        return FeatureFamily.TRADE_FLOW
     if name.startswith("micro_ret") or name.startswith("mid_") or "microprice" in name:
         return FeatureFamily.PRICE
     if name.startswith("obi_") or name.startswith("ofi_") or "_ofi_" in name:
@@ -363,15 +358,11 @@ def infer_unit(name: str) -> FeatureUnit:
 
 
 def infer_required_book_depth(name: str, source: FeatureSource) -> int:
+    name = _require_known_feature_name(name)
     trade_exact_names = {
-        "time_since_trade_us",
-        "regime_volume_ewma_500000us",
-        "regime_volume_ewma_3000000us",
-    }
+            }
     if source == FeatureSource.EVENT_CONTEXT:
         return 0
-    if name in {"vwap_vs_mid_bps_200000us", "vwap_vs_mid_bps_500000us"}:
-        return 1
     if source == FeatureSource.TRADE and name in trade_exact_names:
         return 0
     if source == FeatureSource.TRADE and not any(k in name for k in ("depth", "book", "l1", "l3", "l5", "l10", "vamp", "micro_l", "replenishment")):
@@ -386,7 +377,7 @@ def infer_required_book_depth(name: str, source: FeatureSource) -> int:
         return 5
     if "_l3" in name or "l3_" in name:
         return 3
-    if "_l1" in name or "l1_" in name or name in {"bsz1", "asz1", "gap_b_bps"}:
+    if "_l1" in name or "l1_" in name:
         return 1
     if any(k in name for k in ("depth", "vamp", "micro_l", "liquidity_void", "centroid")):
         return 20
@@ -421,8 +412,6 @@ def _is_ratio_or_bounded_feature(name: str, unit: FeatureUnit) -> bool:
 
 def _is_slow_regime_feature(name: str) -> bool:
     slow_exact = {
-        "regime_volume_ewma_500000us",
-        "regime_volume_ewma_3000000us",
         "return_std_bps_200000us",
         "microprice_realized_vol_1000000us",
         "max_abs_return_bps_500000us",
@@ -433,7 +422,7 @@ def _is_slow_regime_feature(name: str) -> bool:
 
 def _is_fast_microstructure_feature(name: str, source: FeatureSource, family: FeatureFamily) -> bool:
     if _is_slow_regime_feature(name) or not _has_window_at_most(name, 1_000_000):
-        return name in {"spread_bps", "gap_b_bps", "ofi_l3", "obi_l1"}
+        return name in {"ofi_l3", "obi_l1"}
     return source in {FeatureSource.BOOK, FeatureSource.TRADE, FeatureSource.CROSS} and family in {
         FeatureFamily.PRICE,
         FeatureFamily.OFI_OBI,
@@ -463,6 +452,7 @@ def _positive_log_ewma_key(name: str, source: FeatureSource, family: FeatureFami
 
 
 def infer_transform_key(name: str, unit: FeatureUnit, source: FeatureSource, family: FeatureFamily) -> TransformKey:
+    name = _require_known_feature_name(name)
     if source == FeatureSource.EVENT_CONTEXT:
         return TransformKey.LOG1P_POS_NO_EWMA
     if unit == FeatureUnit.MICROSECONDS:
@@ -481,8 +471,7 @@ def infer_transform_key(name: str, unit: FeatureUnit, source: FeatureSource, fam
         return _signed_log_ewma_key(name, source, family)
 
     positive_heavy_tailed = (
-        name.startswith("regime_volume_ewma_")
-        or "notional" in name
+"notional" in name
         or "usd" in name
         or unit in {FeatureUnit.COUNT, FeatureUnit.RATE_PER_SECOND}
     )
@@ -503,18 +492,11 @@ def infer_transform_key(name: str, unit: FeatureUnit, source: FeatureSource, fam
     return TransformKey.IDENTITY_EWMA_MEDIUM
 
 def infer_formula_group(name: str, source: FeatureSource, family: FeatureFamily) -> str:
+    name = _require_known_feature_name(name)
     if source == FeatureSource.EVENT_CONTEXT:
         return "event_context"
-    if name in {"vwap_vs_mid_bps_200000us", "vwap_vs_mid_bps_500000us"}:
-        return "cross_signal"
-    if name in {"regime_volume_ewma_500000us", "regime_volume_ewma_3000000us"}:
-        return "regime"
-    if name == "time_since_trade_us":
-        return "trade_window"
     if family == FeatureFamily.PRICE:
         return "price_history"
-    if name in {"spread_bps", "gap_b_bps", "bsz1", "asz1"}:
-        return "top_of_book"
     if family == FeatureFamily.DEPTH:
         return "depth_curve"
     if family == FeatureFamily.OFI_OBI:

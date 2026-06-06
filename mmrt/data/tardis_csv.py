@@ -266,7 +266,6 @@ def write_normalized_parquet(
     )
     schema = tardis_csv_schema(data_type)
     _validate_side_values(lf, schema)
-    lf = lf.sort([LOCAL_TS_US, RAW_SOURCE_ROW], maintain_order=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lf.sink_parquet(out_path, compression=compression)
     return NormalizedTardisFile(data_type=schema.data_type, input_path=in_path, output_path=out_path, row_count=None)

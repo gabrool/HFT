@@ -31,8 +31,8 @@ DEFAULT_HORIZONS_US = (
 DEFAULT_ENTRY_DELAY_US = 1_000
 
 DEFAULT_LOOKBACK_ROWS = 10
-DEFAULT_DECISION_REASON = DecisionReason.BOOK_EVENT
-DEFAULT_DECISION_POLICY = "book_event"
+DEFAULT_DECISION_REASON = DecisionReason.BOOK_STRIDE
+DEFAULT_DECISION_POLICY = "book_stride"
 DEFAULT_DECISION_STRIDE_US = 500_000
 
 DEFAULT_PIPELINE_SCHEMA = "mmrt_pipeline_config"
@@ -116,13 +116,13 @@ class DecisionConfig:
 
     def __post_init__(self) -> None:
         if _require_nonempty_str(self.policy, "policy") != DEFAULT_DECISION_POLICY:
-            raise ValueError("policy must be 'book_event'")
+            raise ValueError("policy must be 'book_stride'")
         try:
             reason = DecisionReason(self.reason)
         except ValueError as exc:
-            raise ValueError("reason must be DecisionReason.BOOK_EVENT") from exc
-        if reason != DecisionReason.BOOK_EVENT:
-            raise ValueError("reason must be DecisionReason.BOOK_EVENT")
+            raise ValueError("reason must be DecisionReason.BOOK_STRIDE") from exc
+        if reason != DecisionReason.BOOK_STRIDE:
+            raise ValueError("reason must be DecisionReason.BOOK_STRIDE")
         stride_us = _require_positive_int(self.stride_us, "stride_us")
         if stride_us != DEFAULT_DECISION_STRIDE_US:
             raise ValueError("stride_us must be 500_000")

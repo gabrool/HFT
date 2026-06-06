@@ -252,17 +252,11 @@ class ObservationBuilder:
             set_field("step_fill_notional", step_fill_notional)
 
         local_time_since_start_s = (context.current_local_ts_us - context.episode_start_local_ts_us) / 1_000_000.0
-        if context.total_events <= 1:
-            event_progress = 0.0
-        else:
-            event_progress = context.current_event_index / (context.total_events - 1)
-            event_progress = min(max(event_progress, 0.0), 1.0)
         if context.previous_event_local_ts_us is None:
             time_since_last_event_ms = 0.0
         else:
             time_since_last_event_ms = (context.current_local_ts_us - context.previous_event_local_ts_us) / 1000.0
         set_field("local_time_since_start_s", local_time_since_start_s)
-        set_field("event_progress", event_progress)
         set_field("time_since_last_event_ms", time_since_last_event_ms)
 
         if config.max_abs_observation is not None:

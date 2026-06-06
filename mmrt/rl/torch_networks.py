@@ -11,10 +11,10 @@ from torch import nn
 EXECUTION_ACTION_DIM = 6
 
 ACTION_COMPONENT_NAMES = (
-    "bid_enable_logit",
-    "ask_enable_logit",
-    "bid_distance_raw",
-    "ask_distance_raw",
+    "bid_enabled",
+    "ask_enabled",
+    "bid_price_raw",
+    "ask_price_raw",
     "bid_size_raw",
     "ask_size_raw",
 )
@@ -82,9 +82,11 @@ class ActorCriticConfig:
     layer_norm: bool = False
     orthogonal_init: bool = True
 
-    policy_log_std_init: float = -0.5
-    policy_log_std_min: float = -5.0
-    policy_log_std_max: float = 2.0
+    enable_threshold: float = 0.5
+    enable_logit_bias_init: float = 0.0
+    continuous_log_std_init: float = -0.5
+    continuous_log_std_min: float = -5.0
+    continuous_log_std_max: float = 2.0
 
     policy_head_gain: float = 0.01
     value_head_gain: float = 1.0
@@ -99,23 +101,28 @@ class ActorCriticConfig:
         if not isinstance(self.orthogonal_init, bool):
             raise TypeError("orthogonal_init must be bool")
 
+        threshold = _require_finite_float(self.enable_threshold, "enable_threshold")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("enable_threshold must be in [0, 1]")
+        object.__setattr__(self, "enable_threshold", threshold)
+        object.__setattr__(self, "enable_logit_bias_init", _require_finite_float(self.enable_logit_bias_init, "enable_logit_bias_init"))
         object.__setattr__(
             self,
-            "policy_log_std_init",
-            _require_finite_float(self.policy_log_std_init, "policy_log_std_init"),
+            "continuous_log_std_init",
+            _require_finite_float(self.continuous_log_std_init, "continuous_log_std_init"),
         )
-        policy_log_std_min = _require_finite_float(
-            self.policy_log_std_min,
-            "policy_log_std_min",
+        continuous_log_std_min = _require_finite_float(
+            self.continuous_log_std_min,
+            "continuous_log_std_min",
         )
-        policy_log_std_max = _require_finite_float(
-            self.policy_log_std_max,
-            "policy_log_std_max",
+        continuous_log_std_max = _require_finite_float(
+            self.continuous_log_std_max,
+            "continuous_log_std_max",
         )
-        if policy_log_std_min >= policy_log_std_max:
-            raise ValueError("policy_log_std_min must be less than policy_log_std_max")
-        object.__setattr__(self, "policy_log_std_min", policy_log_std_min)
-        object.__setattr__(self, "policy_log_std_max", policy_log_std_max)
+        if continuous_log_std_min >= continuous_log_std_max:
+            raise ValueError("continuous_log_std_min must be less than continuous_log_std_max")
+        object.__setattr__(self, "continuous_log_std_min", continuous_log_std_min)
+        object.__setattr__(self, "continuous_log_std_max", continuous_log_std_max)
         object.__setattr__(
             self,
             "policy_head_gain",
@@ -129,8 +136,9 @@ class ActorCriticConfig:
 
 
 class ActorCriticOutput(NamedTuple):
-    action_mean: torch.Tensor
-    action_log_std: torch.Tensor
+    enable_logits: torch.Tensor
+    continuous_mean: torch.Tensor
+    continuous_log_std: torch.Tensor
     value: torch.Tensor
 
 
@@ -185,6 +193,20 @@ def build_mlp(
     return nn.Sequential(*layers), previous_dim
 
 
+def _bernoulli_log_prob(action: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    action = _require_float_tensor_2d(action, "action")
+    logits = _require_float_tensor_2d(logits, "logits")
+    if action.shape != logits.shape:
+        raise ValueError("action and logits must have the same shape")
+    return -torch.nn.functional.binary_cross_entropy_with_logits(logits, action, reduction="none")
+
+
+def _bernoulli_entropy(logits: torch.Tensor) -> torch.Tensor:
+    logits = _require_float_tensor_2d(logits, "logits")
+    probs = torch.sigmoid(logits)
+    return torch.nn.functional.binary_cross_entropy_with_logits(logits, probs, reduction="none")
+
+
 def diagonal_gaussian_log_prob(
     action: torch.Tensor,
     mean: torch.Tensor,
@@ -222,6 +244,8 @@ class ActorCriticNetwork(nn.Module):
 
         self.obs_dim = _require_positive_int(obs_dim, "obs_dim")
         self.action_dim = _require_positive_int(action_dim, "action_dim")
+        if self.action_dim != EXECUTION_ACTION_DIM:
+            raise ValueError("hybrid execution policy action_dim must be 6")
         self.config = config
 
         self.backbone, features_dim = build_mlp(
@@ -231,10 +255,11 @@ class ActorCriticNetwork(nn.Module):
             layer_norm=config.layer_norm,
         )
 
-        self.action_mean_head = nn.Linear(features_dim, self.action_dim)
+        self.enable_head = nn.Linear(features_dim, 2)
+        self.continuous_mean_head = nn.Linear(features_dim, 4)
         self.value_head = nn.Linear(features_dim, 1)
-        self.action_log_std = nn.Parameter(
-            torch.full((self.action_dim,), config.policy_log_std_init)
+        self.continuous_log_std = nn.Parameter(
+            torch.full((4,), config.continuous_log_std_init)
         )
 
         self.reset_parameters()
@@ -246,14 +271,17 @@ class ActorCriticNetwork(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=math.sqrt(2.0))
                     nn.init.zeros_(module.bias)
             nn.init.orthogonal_(
-                self.action_mean_head.weight,
+                self.continuous_mean_head.weight,
                 gain=self.config.policy_head_gain,
             )
-            nn.init.zeros_(self.action_mean_head.bias)
+            nn.init.zeros_(self.continuous_mean_head.bias)
+            nn.init.orthogonal_(self.enable_head.weight, gain=self.config.policy_head_gain)
+            nn.init.constant_(self.enable_head.bias, self.config.enable_logit_bias_init)
             nn.init.orthogonal_(self.value_head.weight, gain=self.config.value_head_gain)
             nn.init.zeros_(self.value_head.bias)
 
-        self.action_log_std.data.fill_(self.config.policy_log_std_init)
+        self.continuous_log_std.data.fill_(self.config.continuous_log_std_init)
+        nn.init.constant_(self.enable_head.bias, self.config.enable_logit_bias_init)
 
     def forward(self, obs: torch.Tensor) -> ActorCriticOutput:
         obs = _require_float_tensor_2d(obs, "obs")
@@ -261,15 +289,16 @@ class ActorCriticNetwork(nn.Module):
             raise ValueError("obs last dimension must equal obs_dim")
 
         features = self.backbone(obs)
-        action_mean = self.action_mean_head(features)
+        enable_logits = self.enable_head(features)
+        continuous_mean = self.continuous_mean_head(features)
         clamped_log_std = torch.clamp(
-            self.action_log_std,
-            min=self.config.policy_log_std_min,
-            max=self.config.policy_log_std_max,
+            self.continuous_log_std,
+            min=self.config.continuous_log_std_min,
+            max=self.config.continuous_log_std_max,
         )
-        action_log_std = clamped_log_std.expand_as(action_mean)
+        continuous_log_std = clamped_log_std.expand_as(continuous_mean)
         value = self.value_head(features).squeeze(-1)
-        return ActorCriticOutput(action_mean, action_log_std, value)
+        return ActorCriticOutput(enable_logits, continuous_mean, continuous_log_std, value)
 
     def sample_action(
         self,
@@ -279,24 +308,20 @@ class ActorCriticNetwork(nn.Module):
     ) -> PolicyAction:
         output = self.forward(obs)
         if deterministic:
-            action = output.action_mean
+            enable = (torch.sigmoid(output.enable_logits) >= self.config.enable_threshold).to(output.continuous_mean.dtype)
+            continuous = output.continuous_mean
         else:
-            std = torch.exp(output.action_log_std)
-            action = output.action_mean + torch.randn_like(output.action_mean) * std
-        log_prob = diagonal_gaussian_log_prob(
-            action,
-            output.action_mean,
-            output.action_log_std,
+            enable = torch.bernoulli(torch.sigmoid(output.enable_logits))
+            std = torch.exp(output.continuous_log_std)
+            continuous = output.continuous_mean + torch.randn_like(output.continuous_mean) * std
+        action = torch.cat((enable, continuous), dim=-1)
+        log_prob = _bernoulli_log_prob(enable, output.enable_logits).sum(dim=-1) + diagonal_gaussian_log_prob(
+            continuous, output.continuous_mean, output.continuous_log_std
         )
-        entropy = diagonal_gaussian_entropy(output.action_log_std)
-        return PolicyAction(
-            action,
-            log_prob,
-            entropy,
-            output.value,
-            output.action_mean,
-            output.action_log_std,
-        )
+        entropy = _bernoulli_entropy(output.enable_logits).sum(dim=-1) + diagonal_gaussian_entropy(output.continuous_log_std)
+        action_mean = torch.cat((torch.sigmoid(output.enable_logits), output.continuous_mean), dim=-1)
+        action_log_std = torch.cat((torch.zeros_like(output.enable_logits), output.continuous_log_std), dim=-1)
+        return PolicyAction(action, log_prob, entropy, output.value, action_mean, action_log_std)
 
     def evaluate_actions(
         self,
@@ -305,14 +330,14 @@ class ActorCriticNetwork(nn.Module):
     ) -> PolicyEvaluation:
         actions = _require_float_tensor_2d(actions, "actions")
         output = self.forward(obs)
-        if actions.shape != output.action_mean.shape:
-            raise ValueError("actions shape must match action_mean shape")
-        log_prob = diagonal_gaussian_log_prob(
-            actions,
-            output.action_mean,
-            output.action_log_std,
+        if actions.shape != (obs.shape[0], self.action_dim):
+            raise ValueError("actions shape must match policy action shape")
+        enable = actions[:, :2]
+        continuous = actions[:, 2:]
+        log_prob = _bernoulli_log_prob(enable, output.enable_logits).sum(dim=-1) + diagonal_gaussian_log_prob(
+            continuous, output.continuous_mean, output.continuous_log_std
         )
-        entropy = diagonal_gaussian_entropy(output.action_log_std)
+        entropy = _bernoulli_entropy(output.enable_logits).sum(dim=-1) + diagonal_gaussian_entropy(output.continuous_log_std)
         return PolicyEvaluation(log_prob, entropy, output.value)
 
     def num_parameters(self, *, trainable_only: bool = True) -> int:

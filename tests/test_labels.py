@@ -22,7 +22,7 @@ def spec(horizons=(200_000, 500_000, 1_000_000), entry_delay=1_000):
 def test_public_api_boundary():
     expected = {
         "DEFAULT_PRICE_HISTORY_CAPACITY", "PriceObservation", "PendingLabel", "PriceHistory",
-        "LabelBuilder", "build_labels_from_local_price_arrays", "label_value_names", "label_ready_local_ts_us", "label_entry_local_ts_us",
+        "LabelBuilder", "build_labels_from_price_event_arrays", "label_value_names", "label_ready_local_ts_us", "label_entry_local_ts_us",
     }
     assert set(lb.__all__) == expected
     for name in lb.__all__:
@@ -41,7 +41,7 @@ def test_public_api_uses_local_clock_names():
     assert "on_decision" not in dir(lb.LabelBuilder)
     assert "label_now" not in dir(lb.LabelBuilder)
     assert "on_price_and_decision" not in dir(lb.LabelBuilder)
-    assert "build_labels_from_local_price_arrays" in lb.__all__
+    assert "build_labels_from_price_event_arrays" in lb.__all__
     assert "label_ready_local_ts_us" in lb.__all__
     assert "label_entry_local_ts_us" in lb.__all__
     assert "build_labels_from_price_arrays" not in lb.__all__
@@ -50,7 +50,7 @@ def test_public_api_uses_local_clock_names():
 
 
 def test_price_observation_uses_local_ts_field():
-    obs = lb.PriceObservation(local_ts_us=1_000_000, price=100.0)
+    obs = lb.PriceObservation(local_ts_us=1_000_000, event_seq=0, price=100.0)
     assert obs.local_ts_us == 1_000_000
     assert not hasattr(obs, "ts_us")
 
@@ -99,31 +99,31 @@ def test_rejects_unsupported_spec_modes():
 
 
 def test_price_observation_validation():
-    obs = lb.PriceObservation(local_ts_us=1, price=np.float64(10.0))
+    obs = lb.PriceObservation(local_ts_us=1, event_seq=0, price=np.float64(10.0))
     assert isinstance(obs.price, float)
     for bad in (-1.0, 0.0, math.nan, math.inf):
         with pytest.raises(ValueError):
-            lb.PriceObservation(local_ts_us=1, price=bad)
+            lb.PriceObservation(local_ts_us=1, event_seq=0, price=bad)
     with pytest.raises(ValueError):
-        lb.PriceObservation(local_ts_us=-1, price=1.0)
+        lb.PriceObservation(local_ts_us=-1, event_seq=0, price=1.0)
     with pytest.raises(ValueError):
-        lb.PriceObservation(local_ts_us=True, price=1.0)
+        lb.PriceObservation(local_ts_us=True, event_seq=0, price=1.0)
 
 
 def test_price_history_append_asof_and_equal_timestamp_replace():
     ph = lb.PriceHistory()
-    ph.append(lb.PriceObservation(1000, 100.0))
-    ph.append(lb.PriceObservation(2000, 101.0))
+    ph.append(lb.PriceObservation(1000, 0, 100.0))
+    ph.append(lb.PriceObservation(2000, 0, 101.0))
     assert ph.asof_price(999) is None
     assert ph.asof_price(1000) == 100.0
     assert ph.asof_price(1500) == 100.0
     assert ph.asof_price(2000) == 101.0
     size = ph.size
-    ph.append(lb.PriceObservation(2000, 102.0))
+    ph.append(lb.PriceObservation(2000, 0, 102.0))
     assert ph.asof_price(2000) == 102.0
     assert ph.size == size
     with pytest.raises(ValueError):
-        ph.append(lb.PriceObservation(1999, 99.0))
+        ph.append(lb.PriceObservation(1999, 0, 99.0))
     ts, px = ph.active_arrays()
     assert np.array_equal(ts, np.array([1000, 2000], dtype=np.int64))
     assert np.array_equal(px, np.array([100.0, 102.0], dtype=np.float64))
@@ -164,11 +164,11 @@ def test_label_entry_ready_helpers_and_names():
 def test_streaming_label_maturation_with_entry_delay():
     s = spec(horizons=(200_000, 500_000), entry_delay=1_000)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    assert b.observe_price_local(1_000_000, 100.0) == []
-    assert b.observe_price_local(1_001_000, 101.0) == []
-    assert b.observe_price_local(1_201_000, 102.0) == []
-    out = b.observe_price_local(1_501_000, 104.0)
+    b.on_decision_local(1_000_000, 0)
+    assert b.observe_price_local(1_000_000, 0, 100.0) == []
+    assert b.observe_price_local(1_001_000, 0, 101.0) == []
+    assert b.observe_price_local(1_201_000, 0, 102.0) == []
+    out = b.observe_price_local(1_501_000, 0, 104.0)
     assert len(out) == 1
     r = out[0]
     assert r.decision_ts_us == 1_000_000
@@ -180,10 +180,10 @@ def test_streaming_label_maturation_with_entry_delay():
 def test_last_observation_policy_inclusive_boundaries():
     s = spec(horizons=(200_000,), entry_delay=1_000)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.observe_price_local(1_000_999, 100.0)
-    b.observe_price_local(1_001_000, 101.0)
-    out = b.observe_price_local(1_201_000, 103.0)
+    b.on_decision_local(1_000_000, 0)
+    b.observe_price_local(1_000_999, 0, 100.0)
+    b.observe_price_local(1_001_000, 0, 101.0)
+    out = b.observe_price_local(1_201_000, 0, 103.0)
     assert len(out) == 1
     assert out[0].values_bps[0] == pytest.approx(10_000.0 * math.log(103 / 101))
 
@@ -191,11 +191,11 @@ def test_last_observation_policy_inclusive_boundaries():
 def test_last_observation_policy_uses_previous_when_no_exact_timestamp():
     s = spec(horizons=(200_000,), entry_delay=1_000)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.observe_price_local(1_000_900, 100.0)
-    b.observe_price_local(1_001_500, 101.0)
-    b.observe_price_local(1_200_000, 102.0)
-    out = b.observe_price_local(1_250_000, 103.0)
+    b.on_decision_local(1_000_000, 0)
+    b.observe_price_local(1_000_900, 0, 100.0)
+    b.observe_price_local(1_001_500, 0, 101.0)
+    b.observe_price_local(1_200_000, 0, 102.0)
+    out = b.observe_price_local(1_250_000, 0, 103.0)
     assert len(out) == 1
     assert out[0].values_bps[0] == pytest.approx(10_000.0 * math.log(102 / 100))
 
@@ -203,21 +203,21 @@ def test_last_observation_policy_uses_previous_when_no_exact_timestamp():
 def test_decision_without_entry_price_stays_pending_until_entry_asof_exists():
     s = spec(horizons=(200_000,), entry_delay=1_000)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    assert b.observe_price_local(1_500_000, 100.0) == []
-    assert b.observe_price_local(1_700_000, 101.0) == []
+    b.on_decision_local(1_000_000, 0)
+    assert b.observe_price_local(1_500_000, 0, 100.0) == []
+    assert b.observe_price_local(1_700_000, 0, 101.0) == []
     assert b.pending_count == 1
 
 
 def test_multiple_pending_decisions_mature_fifo():
     s = spec(horizons=(100_000,), entry_delay=0)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.on_decision_local(1_100_000)
+    b.on_decision_local(1_000_000, 0)
+    b.on_decision_local(1_100_000, 0)
     out = []
-    out.extend(b.observe_price_local(1_000_000, 100.0))
-    out.extend(b.observe_price_local(1_100_000, 101.0))
-    out.extend(b.observe_price_local(1_200_000, 102.0))
+    out.extend(b.observe_price_local(1_000_000, 0, 100.0))
+    out.extend(b.observe_price_local(1_100_000, 0, 101.0))
+    out.extend(b.observe_price_local(1_200_000, 0, 102.0))
     assert [x.decision_ts_us for x in out] == [1_000_000, 1_100_000]
     assert b.pending_count == 0
 
@@ -225,10 +225,10 @@ def test_multiple_pending_decisions_mature_fifo():
 def test_equal_decision_timestamps_allowed():
     s = spec(horizons=(100_000,), entry_delay=0)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.on_decision_local(1_000_000)
-    b.observe_price_local(1_000_000, 100.0)
-    out = b.observe_price_local(1_100_000, 105.0)
+    b.on_decision_local(1_000_000, 0)
+    b.on_decision_local(1_000_000, 0)
+    b.observe_price_local(1_000_000, 0, 100.0)
+    out = b.observe_price_local(1_100_000, 0, 105.0)
     assert len(out) == 2
     assert out[0].decision_ts_us == out[1].decision_ts_us == 1_000_000
     assert out[0].values_bps == pytest.approx(out[1].values_bps)
@@ -236,32 +236,32 @@ def test_equal_decision_timestamps_allowed():
 
 def test_on_decision_local_rejects_decreasing_decision_local_timestamps():
     b = lb.LabelBuilder(spec())
-    b.on_decision_local(1_000_000)
+    b.on_decision_local(1_000_000, 0)
     with pytest.raises(ValueError):
-        b.on_decision_local(999_999)
+        b.on_decision_local(999_999, 0)
 
 
 def test_on_decision_rejects_decreasing_after_pending_matures():
     s = spec(horizons=(100_000,), entry_delay=0)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.observe_price_local(1_000_000, 100.0)
-    out = b.observe_price_local(1_100_000, 101.0)
+    b.on_decision_local(1_000_000, 0)
+    b.observe_price_local(1_000_000, 0, 100.0)
+    out = b.observe_price_local(1_100_000, 0, 101.0)
     assert len(out) == 1
     assert b.pending_count == 0
     with pytest.raises(ValueError):
-        b.on_decision_local(999_999)
-    b.on_decision_local(1_000_000)
-    b.on_decision_local(1_000_001)
+        b.on_decision_local(999_999, 0)
+    b.on_decision_local(1_000_000, 0)
+    b.on_decision_local(1_000_001, 0)
 
 
 def test_label_now_does_not_mutate_pending():
     s = spec(horizons=(100_000,), entry_delay=0)
     b = lb.LabelBuilder(s)
-    b.observe_price_local(1_000_000, 100.0)
-    b.observe_price_local(1_100_000, 105.0)
+    b.observe_price_local(1_000_000, 0, 100.0)
+    b.observe_price_local(1_100_000, 0, 105.0)
     before = b.pending_count
-    r = b.label_now_local(1_000_000)
+    r = b.label_now_local(1_000_000, 0)
     assert isinstance(r, LabelResult)
     assert b.pending_count == before
 
@@ -279,10 +279,10 @@ def test_label_result_fields_remain_contract_generic_but_values_are_local():
     s = spec(horizons=(100_000,), entry_delay=1_000)
     b = lb.LabelBuilder(s)
     decision_local_ts_us = 1_000_000
-    b.on_decision_local(decision_local_ts_us)
-    b.observe_price_local(1_000_000, 100.0)
-    b.observe_price_local(1_001_000, 101.0)
-    out = b.observe_price_local(1_101_000, 102.0)
+    b.on_decision_local(decision_local_ts_us, 0)
+    b.observe_price_local(1_000_000, 0, 100.0)
+    b.observe_price_local(1_001_000, 0, 101.0)
+    out = b.observe_price_local(1_101_000, 0, 102.0)
     assert len(out) == 1
     result = out[0]
     assert result.decision_ts_us == decision_local_ts_us
@@ -294,12 +294,12 @@ def test_batch_labels_match_streaming():
     pts = np.array([1_000_000, 1_100_000, 1_200_000, 1_300_000])
     pvals = np.array([100.0, 101.0, 102.0, 103.0])
     dec = np.array([1_000_000, 1_100_000])
-    labels, mask = lb.build_labels_from_local_price_arrays(dec, pts, pvals, s)
+    labels, mask = lb.build_labels_from_price_event_arrays(dec, np.arange(len(dec)), pts, np.arange(len(pts)), pvals, s)
     assert mask.all()
 
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.on_decision_local(1_100_000)
+    b.on_decision_local(1_000_000, 0)
+    b.on_decision_local(1_100_000, 0)
     out = []
     for t, p in zip(pts, pvals):
         out.extend(b.observe_price_local(int(t), float(p)))
@@ -312,7 +312,7 @@ def test_batch_invalid_rows_for_insufficient_future_context():
     pts = np.array([1_000_000, 1_100_000])
     pvals = np.array([100.0, 101.0])
     dec = np.array([1_000_000, 1_100_000])
-    labels, mask = lb.build_labels_from_local_price_arrays(dec, pts, pvals, s)
+    labels, mask = lb.build_labels_from_price_event_arrays(dec, np.arange(len(dec)), pts, np.arange(len(pts)), pvals, s)
     assert mask.tolist() == [False, False]
     assert np.isnan(labels).all()
 
@@ -322,7 +322,7 @@ def test_batch_dedupes_equal_price_timestamps_keep_last():
     pts = np.array([1_000_000, 1_000_000, 1_100_000])
     pvals = np.array([100.0, 101.0, 102.0])
     dec = np.array([1_000_000])
-    labels, mask = lb.build_labels_from_local_price_arrays(dec, pts, pvals, s)
+    labels, mask = lb.build_labels_from_price_event_arrays(dec, np.arange(len(dec)), pts, np.arange(len(pts)), pvals, s)
     assert mask[0]
     assert labels[0, 0] == pytest.approx(10_000.0 * math.log(102 / 101))
 
@@ -330,36 +330,36 @@ def test_batch_dedupes_equal_price_timestamps_keep_last():
 def test_batch_validates_sorted_inputs():
     s = spec(horizons=(1,), entry_delay=0)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([2, 1]), np.array([1, 2]), np.array([1.0, 2.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([2, 1]), np.array([1, 2]), np.array([1.0, 2.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1, 2]), np.array([2, 1]), np.array([1.0, 2.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1, 2]), np.array([2, 1]), np.array([1.0, 2.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1, 2]), np.array([1, 2]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1, 2]), np.array([1, 2]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1]), np.array([1]), np.array([0.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1]), np.array([1]), np.array([0.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([[1]]), np.array([1]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([[1]]), np.array([1]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([-1]), np.array([1]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([-1]), np.array([1]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1]), np.array([-1]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1]), np.array([-1]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1.5]), np.array([1, 2]), np.array([1.0, 2.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1.5]), np.array([1, 2]), np.array([1.0, 2.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1]), np.array([1.5]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1]), np.array([1.5]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([math.nan]), np.array([1]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([math.nan]), np.array([1]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1]), np.array([math.inf]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1]), np.array([math.inf]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([True]), np.array([1]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([True]), np.array([1]), np.array([1.0]), s)
     with pytest.raises(ValueError):
-        lb.build_labels_from_local_price_arrays(np.array([1]), np.array([True]), np.array([1.0]), s)
+        lb.build_labels_from_price_event_arrays(np.array([1]), np.array([True]), np.array([1.0]), s)
 
 
 def test_batch_accepts_integer_valued_float_timestamps():
     s = spec(horizons=(100_000,), entry_delay=0)
-    labels, mask = lb.build_labels_from_local_price_arrays(
+    labels, mask = lb.build_labels_from_price_event_arrays(
         np.array([1_000_000.0]),
         np.array([1_000_000.0, 1_100_000.0]),
         np.array([100.0, 101.0]),
@@ -379,19 +379,19 @@ def test_no_feature_engine_transform_storage_imports_or_public_residue():
 def test_no_future_leakage_in_streaming_features_sense():
     s = spec(horizons=(200_000,), entry_delay=0)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.observe_price_local(1_000_000, 100.0)
-    assert b.observe_price_local(1_199_999, 101.0) == []
+    b.on_decision_local(1_000_000, 0)
+    b.observe_price_local(1_000_000, 0, 100.0)
+    assert b.observe_price_local(1_199_999, 0, 101.0) == []
     assert b.pending_count == 1
-    assert len(b.observe_price_local(1_200_000, 102.0)) == 1
+    assert len(b.observe_price_local(1_200_000, 0, 102.0)) == 1
 
 
 def test_label_result_contract():
     s = spec(horizons=(100_000, 200_000), entry_delay=0)
     b = lb.LabelBuilder(s)
-    b.on_decision_local(1_000_000)
-    b.observe_price_local(1_000_000, 100.0)
-    out = b.observe_price_local(1_200_000, 102.0)
+    b.on_decision_local(1_000_000, 0)
+    b.observe_price_local(1_000_000, 0, 100.0)
+    out = b.observe_price_local(1_200_000, 0, 102.0)
     assert isinstance(out[0], LabelResult)
     assert out[0].horizons_us == tuple(sorted(out[0].horizons_us))
     assert len(out[0].values_bps) == len(out[0].horizons_us)

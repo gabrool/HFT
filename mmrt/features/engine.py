@@ -11,6 +11,7 @@ import math
 
 import numpy as np
 
+from mmrt.contracts import DecisionReason
 from mmrt.features import kernels as k
 from mmrt.features.book_state import BookSnapshotInput, BookState, BookSummary
 from mmrt.features.trade_state import (
@@ -262,7 +263,7 @@ class FeatureEngine:
         summary = self.book_state.current_summary()
         raw_mid = summary.mid
         fv = self._build_feature_vector_for_decision(local_ts_us, prev)
-        d = EngineDecision(self.decision_count, local_ts_us, ts_us, event_seq, raw_mid, fv, "book_stride")
+        d = EngineDecision(self.decision_count, local_ts_us, ts_us, event_seq, raw_mid, fv, DecisionReason.BOOK_STRIDE.value)
         self.decision_count += 1
         self.last_decision_local_ts_us = local_ts_us
         return d

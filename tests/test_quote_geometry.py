@@ -5,11 +5,12 @@ import pytest
 
 from mmrt.execution.contracts import ActionSpec, BookTop, QuoteIntent, SymbolSpec
 from mmrt.execution.quote_geometry import (
-    ContinuousQuoteAction,
+    QuoteAction,
     QuoteGeometryConfig,
     QuoteGeometryResult,
     continuous_action_to_quote,
-    raw_distance_to_ticks,
+    raw_bid_price_to_tick,
+    raw_ask_price_to_tick,
     raw_size_to_qty,
 )
 
@@ -22,7 +23,7 @@ def _spec() -> SymbolSpec:
         step_size=0.001,
         min_qty=0.001,
         max_qty=100.0,
-        min_notional=0.49,
+        min_notional=0.0,
     )
 
 
@@ -36,29 +37,29 @@ def _top() -> BookTop:
     )
 
 
-def _action(**kwargs) -> ContinuousQuoteAction:
+def _action(**kwargs) -> QuoteAction:
     base = dict(
-        bid_enable_logit=1.0,
-        ask_enable_logit=1.0,
-        bid_distance_raw=0.0,
-        ask_distance_raw=0.0,
+        bid_enabled=True,
+        ask_enabled=True,
+        bid_price_raw=0.0,
+        ask_price_raw=0.0,
         bid_size_raw=0.0,
         ask_size_raw=0.0,
     )
     base.update(kwargs)
-    return ContinuousQuoteAction(**base)
+    return QuoteAction(**base)
 
 
-def test_raw_distance_to_ticks_is_bounded_and_monotonic():
-    vals = [
-        raw_distance_to_ticks(x, max_distance_ticks=20, min_distance_ticks=1)
-        for x in [-10.0, -1.0, 0.0, 1.0, 10.0]
-    ]
-    assert all(1 <= v <= 20 for v in vals)
-    assert vals == sorted(vals)
-
-    with pytest.raises(ValueError):
-        raw_distance_to_ticks(0.0, max_distance_ticks=0)
+def test_raw_price_to_tick_is_bounded_and_monotonic():
+    top = _top()
+    spec = ActionSpec(max_distance_ticks=20)
+    config = QuoteGeometryConfig()
+    bids = [raw_bid_price_to_tick(x, book_top=top, action_spec=spec, config=config) for x in [-10.0, -1.0, 0.0, 1.0, 10.0]]
+    asks = [raw_ask_price_to_tick(x, book_top=top, action_spec=spec, config=config) for x in [-10.0, -1.0, 0.0, 1.0, 10.0]]
+    assert bids == sorted(bids)
+    assert asks == sorted(asks, reverse=True)
+    assert all(v < top.best_ask_tick for v in bids)
+    assert all(v > top.best_bid_tick for v in asks)
 
 
 def test_raw_size_to_qty_uses_step_grid_and_bounds():
@@ -97,7 +98,7 @@ def test_continuous_action_builds_two_sided_passive_quote():
 
 def test_action_logits_disable_sides():
     result = continuous_action_to_quote(
-        action=_action(bid_enable_logit=-1.0, ask_enable_logit=-1.0),
+        action=_action(bid_enabled=False, ask_enabled=False),
         book_top=_top(),
         symbol_spec=_spec(),
         action_spec=ActionSpec(),
@@ -203,7 +204,7 @@ def test_position_notional_limit_disables_projected_breach():
         book_top=_top(),
         symbol_spec=_spec(),
         action_spec=ActionSpec(max_order_qty=1.0),
-        config=QuoteGeometryConfig(max_position_notional=1.0),
+        config=QuoteGeometryConfig(max_position_notional=0.01),
         inventory_qty=0.0,
     )
 
@@ -229,7 +230,7 @@ def test_quantity_below_minimum_disables_side():
 
 def test_config_validation():
     with pytest.raises(ValueError):
-        QuoteGeometryConfig(min_distance_ticks=0)
+        QuoteGeometryConfig(post_only_gap_ticks=0)
 
     with pytest.raises(ValueError):
         QuoteGeometryConfig(default_order_qty=0.0)
@@ -240,21 +241,21 @@ def test_config_validation():
 
 def test_action_validation_rejects_nan_and_inf():
     with pytest.raises(ValueError):
-        ContinuousQuoteAction(
-            bid_enable_logit=math.nan,
-            ask_enable_logit=1.0,
-            bid_distance_raw=0.0,
-            ask_distance_raw=0.0,
+        QuoteAction(
+            bid_enabled=math.nan,
+            ask_enabled=True,
+            bid_price_raw=0.0,
+            ask_price_raw=0.0,
             bid_size_raw=0.0,
             ask_size_raw=0.0,
         )
 
     with pytest.raises(ValueError):
-        ContinuousQuoteAction(
-            bid_enable_logit=math.inf,
-            ask_enable_logit=1.0,
-            bid_distance_raw=0.0,
-            ask_distance_raw=0.0,
+        QuoteAction(
+            bid_enabled=math.inf,
+            ask_enabled=True,
+            bid_price_raw=0.0,
+            ask_price_raw=0.0,
             bid_size_raw=0.0,
             ask_size_raw=0.0,
         )

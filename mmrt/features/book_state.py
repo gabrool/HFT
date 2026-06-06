@@ -146,6 +146,7 @@ class BookSnapshotInput:
         ap = _coerce_book_array(self.ask_px, "ask_px"); az = _coerce_book_array(self.ask_sz, "ask_sz")
         _validate_book_order(bp, "bid"); _validate_book_order(ap, "ask")
         if bp[0] <= 0 or ap[0] <= 0: raise ValueError("best")
+        if bp[0] >= ap[0]: raise ValueError("best bid must be < best ask")
         object.__setattr__(self, "bid_px", bp); object.__setattr__(self, "bid_sz", bs)
         object.__setattr__(self, "ask_px", ap); object.__setattr__(self, "ask_sz", az)
 
@@ -321,7 +322,7 @@ class BookState:
     def current_summary(self)->BookSummary:
         if not self.has_book(): raise ValueError("no book")
         mid=self._mid(); b5s=self._depth_size_within_bps("bid",5.0); a5s=self._depth_size_within_bps("ask",5.0); b5n=self._depth_notional_within_bps("bid",5.0); a5n=self._depth_notional_within_bps("ask",5.0); t5s=b5s+a5s; t5n=b5n+a5n
-        return BookSummary(self.last_snapshot.local_ts_us,self.last_snapshot.ts_us,self.last_snapshot.event_seq,self.current_bid_px[0],self.current_ask_px[0],self.current_bid_sz[0],self.current_ask_sz[0],mid,self._spread_bps(),self._microprice_l1(),self._micro_minus_mid_bps(),b5s,a5s,b5n,a5n,t5s,t5n,0.0 if t5n<=FLOAT_EPS else (b5n-a5n)/t5n,self.current_bid_px[0]>self.current_ask_px[0],self.update_count)
+        return BookSummary(self.last_snapshot.local_ts_us,self.last_snapshot.ts_us,self.last_snapshot.event_seq,self.current_bid_px[0],self.current_ask_px[0],self.current_bid_sz[0],self.current_ask_sz[0],mid,self._spread_bps(),self._microprice_l1(),self._micro_minus_mid_bps(),b5s,a5s,b5n,a5n,t5s,t5n,0.0 if t5n<=FLOAT_EPS else (b5n-a5n)/t5n,self.current_bid_px[0]>=self.current_ask_px[0],self.update_count)
     def _window_values(self, field_name:str, window_us:int)->np.ndarray: return self.history.values_in_window(field_name,self.last_local_ts_us,window_us)
     def _window_ts(self, window_us:int)->np.ndarray: return self.history.ts_in_window(self.last_local_ts_us,window_us)
     def _rolling_sum(self, field_name:str, window_us:int)->float: return float(np.sum(self._window_values(field_name,window_us)))
