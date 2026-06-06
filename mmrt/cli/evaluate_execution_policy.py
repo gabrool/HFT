@@ -85,6 +85,13 @@ def _require_positive_float(value: float, name: str) -> float:
     return value
 
 
+def _require_probability(value: float, name: str) -> float:
+    value = _require_finite_float(value, name)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    return value
+
+
 def _require_nonnegative_float(value: float, name: str) -> float:
     value = _require_finite_float(value, name)
     if value < 0.0:
@@ -194,8 +201,8 @@ class ExecutionPolicyEvaluationCLIConfig:
         _require_positive_int(self.min_distance_ticks, "min_distance_ticks")
         _require_positive_float(self.default_order_qty, "default_order_qty")
         object.__setattr__(self, "queue_mode", _coerce_queue_mode(self.queue_mode))
-        _require_positive_float(self.l2_decrease_weight, "l2_decrease_weight")
-        _require_positive_float(self.trade_at_level_weight, "trade_at_level_weight")
+        _require_probability(self.l2_decrease_weight, "l2_decrease_weight")
+        _require_probability(self.trade_at_level_weight, "trade_at_level_weight")
         _require_nonnegative_float(
             self.unknown_level_queue_ahead_qty,
             "unknown_level_queue_ahead_qty",
@@ -313,11 +320,11 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
         "default_order_qty",
     )
     queue_mode = _coerce_queue_mode(raw.get("queue_mode", QueueModelMode.BALANCED))
-    l2_decrease_weight = _require_positive_float(
+    l2_decrease_weight = _require_probability(
         raw.get("l2_decrease_weight", 1.0),
         "l2_decrease_weight",
     )
-    trade_at_level_weight = _require_positive_float(
+    trade_at_level_weight = _require_probability(
         raw.get("trade_at_level_weight", 1.0),
         "trade_at_level_weight",
     )

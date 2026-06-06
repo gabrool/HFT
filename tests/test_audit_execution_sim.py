@@ -290,6 +290,25 @@ def test_execution_sim_audit_config_validation():
         ExecutionSimAuditConfig(tape_root="x", queue_mode="bad")
 
 
+def test_audit_execution_sim_accepts_zero_queue_weights():
+    cfg = ExecutionSimAuditConfig(
+        tape_root="/tmp/tape",
+        l2_decrease_weight=0.0,
+        trade_at_level_weight=0.0,
+    )
+
+    assert cfg.l2_decrease_weight == 0.0
+    assert cfg.trade_at_level_weight == 0.0
+
+
+def test_audit_execution_sim_rejects_queue_weights_above_one():
+    with pytest.raises(ValueError):
+        ExecutionSimAuditConfig(tape_root="/tmp/tape", l2_decrease_weight=1.1)
+
+    with pytest.raises(ValueError):
+        ExecutionSimAuditConfig(tape_root="/tmp/tape", trade_at_level_weight=1.1)
+
+
 def test_audit_modules_have_no_forbidden_imports():
     paths = [
         Path("mmrt/execution/metrics.py"),

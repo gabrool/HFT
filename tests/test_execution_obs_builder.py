@@ -121,6 +121,9 @@ def test_default_schema_fields_and_groups():
     assert schema.field_names == DEFAULT_OBSERVATION_FIELDS
     assert schema.index("spread_ticks") == 0
     assert schema.has_field("linear_expected_return_bps")
+    legacy_inventory_pnl_name = "_".join(("unrealized", "inventory", "pnl"))
+    assert schema.has_field("inventory_abs_notional")
+    assert not schema.has_field(legacy_inventory_pnl_name)
     assert not schema.has_field("missing")
 
     groups = observation_field_groups()
@@ -227,12 +230,18 @@ def test_build_observation_uses_linear_signal():
 
 def test_build_observation_position_fields():
     schema = default_observation_schema()
-    position = PositionState(cash=10.0, inventory_qty=2.0, fees_paid=0.25)
+    position = PositionState(cash=10.0, inventory_qty=-2.0, fees_paid=0.25)
 
     obs = build_observation(
         ObservationInput(
             symbol_spec=_spec(),
-            book_top=_top(),
+            book_top=BookTop(
+                local_ts_us=1_000_000,
+                best_bid_tick=999,
+                best_ask_tick=1001,
+                best_bid_size=2.0,
+                best_ask_size=1.0,
+            ),
             bid_depth=1,
             ask_depth=1,
             position=position,
@@ -240,15 +249,15 @@ def test_build_observation_position_fields():
         schema=schema,
     )
 
-    mid = 100.1
-    inventory_notional = 2.0 * mid
+    mid = 100.0
+    inventory_notional = -2.0 * mid
     equity = 10.0 + inventory_notional
 
     assert obs[schema.index("cash")] == pytest.approx(10.0)
-    assert obs[schema.index("inventory_qty")] == pytest.approx(2.0)
+    assert obs[schema.index("inventory_qty")] == pytest.approx(-2.0)
     assert obs[schema.index("inventory_notional")] == pytest.approx(inventory_notional)
     assert obs[schema.index("equity")] == pytest.approx(equity)
-    assert obs[schema.index("unrealized_inventory_pnl")] == pytest.approx(inventory_notional)
+    assert obs[schema.index("inventory_abs_notional")] == pytest.approx(abs(inventory_notional))
     assert obs[schema.index("fees_paid")] == pytest.approx(0.25)
 
 

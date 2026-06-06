@@ -50,7 +50,7 @@ POSITION_FIELDS = (
     "inventory_notional",
     "inventory_notional_bps",
     "equity",
-    "unrealized_inventory_pnl",
+    "inventory_abs_notional",
     "fees_paid",
 )
 

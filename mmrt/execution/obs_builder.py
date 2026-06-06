@@ -185,6 +185,7 @@ class ObservationBuilder:
 
         position = inputs.position
         inventory_notional = position.inventory_qty * mid_price * symbol_spec.contract_size
+        inventory_abs_notional = abs(inventory_notional)
         equity = position.mark_to_market(mid_price, symbol_spec.contract_size)
         inventory_notional_bps = inventory_notional / max(abs(equity), config.equity_epsilon) * 10_000.0
         set_field("cash", position.cash)
@@ -192,7 +193,7 @@ class ObservationBuilder:
         set_field("inventory_notional", inventory_notional)
         set_field("inventory_notional_bps", inventory_notional_bps)
         set_field("equity", equity)
-        set_field("unrealized_inventory_pnl", inventory_notional)
+        set_field("inventory_abs_notional", inventory_abs_notional)
         set_field("fees_paid", position.fees_paid)
 
         bid_order, ask_order = _live_orders_by_side(inputs.live_orders)

@@ -320,6 +320,34 @@ def test_evaluate_execution_policy_config_parses_dtype_and_queue_mode():
         )
 
 
+def test_evaluate_execution_policy_accepts_zero_queue_weights():
+    cfg = ExecutionPolicyEvaluationCLIConfig(
+        tape_root="/tmp/tape",
+        checkpoint_path="/tmp/checkpoint.pt",
+        l2_decrease_weight=0.0,
+        trade_at_level_weight=0.0,
+    )
+
+    assert cfg.l2_decrease_weight == 0.0
+    assert cfg.trade_at_level_weight == 0.0
+
+
+def test_evaluate_execution_policy_rejects_queue_weights_above_one():
+    with pytest.raises(ValueError):
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root="/tmp/tape",
+            checkpoint_path="/tmp/checkpoint.pt",
+            l2_decrease_weight=1.1,
+        )
+
+    with pytest.raises(ValueError):
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root="/tmp/tape",
+            checkpoint_path="/tmp/checkpoint.pt",
+            trade_at_level_weight=1.1,
+        )
+
+
 def test_evaluate_execution_policy_can_use_cli_env_config_instead_of_checkpoint(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
 
