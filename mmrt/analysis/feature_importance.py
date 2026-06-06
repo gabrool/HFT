@@ -67,8 +67,10 @@ def _json_safe(value: object) -> object:
     if isinstance(value, np.ndarray):
         return _json_safe(value.tolist())
     if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, (str, int, float, bool)) or value is None:
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
         return value
     raise ValueError(f"unsupported JSON type: {type(value)!r}")
 
@@ -654,7 +656,7 @@ def run_feature_importance(
 def _write_json_atomic(path: Path, payload: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(_json_safe(payload), sort_keys=True, indent=2, allow_nan = True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(_json_safe(payload), sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     tmp.replace(path)
     return str(path)
 

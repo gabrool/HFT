@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass
 import gzip
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -26,11 +27,8 @@ except ModuleNotFoundError:  # optional dependency for Parquet input
 from mmrt.contracts import BookSide
 from mmrt.execution.contracts import L2Update, SymbolSpec
 from mmrt.execution.l2_reconstructor import L2BookReconstructor, ReconstructedL2Event, iter_l2_update_batches
-
-
-DEFAULT_TICK_SIZE = 0.1
-DEFAULT_STEP_SIZE = 0.001
-DEFAULT_MIN_NOTIONAL = 5.0
+from mmrt.metadata.binance_exchange_info import load_binance_usdm_exchange_info_symbol_rules
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode, read_symbol_rules_json
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,11 +36,9 @@ class L2AuditConfig:
     l2_inputs: tuple[str, ...]
     exchange: str = "binance-futures"
     symbol: str = "BTCUSDT"
-    tick_size: float = DEFAULT_TICK_SIZE
-    step_size: float = DEFAULT_STEP_SIZE
-    min_qty: float = 0.001
-    max_qty: float = 100.0
-    min_notional: float = DEFAULT_MIN_NOTIONAL
+    exchange_info_json: str | None = None
+    symbol_rules_json: str | None = None
+    symbol_rules_mode: SymbolRuleMode | str = SymbolRuleMode.CURRENT_RULES_REPLAY
     max_rows: int | None = None
     sample_event_limit: int = 10
     batch_size: int = 65_536
@@ -54,13 +50,13 @@ class L2AuditConfig:
         object.__setattr__(self, "l2_inputs", inputs)
         _require_nonempty_str(self.exchange, "exchange")
         _require_nonempty_str(self.symbol, "symbol")
-        object.__setattr__(self, "tick_size", _require_positive_float(self.tick_size, "tick_size"))
-        object.__setattr__(self, "step_size", _require_positive_float(self.step_size, "step_size"))
-        object.__setattr__(self, "min_qty", _require_nonnegative_float(self.min_qty, "min_qty"))
-        object.__setattr__(self, "max_qty", _require_positive_float(self.max_qty, "max_qty"))
-        object.__setattr__(self, "min_notional", _require_nonnegative_float(self.min_notional, "min_notional"))
-        if self.max_qty < self.min_qty:
-            raise ValueError("max_qty must be >= min_qty")
+        if (self.exchange_info_json is None) == (self.symbol_rules_json is None):
+            raise ValueError("exactly one of exchange_info_json or symbol_rules_json is required")
+        if self.exchange_info_json is not None:
+            object.__setattr__(self, "exchange_info_json", _require_nonempty_str(self.exchange_info_json, "exchange_info_json"))
+        if self.symbol_rules_json is not None:
+            object.__setattr__(self, "symbol_rules_json", _require_nonempty_str(self.symbol_rules_json, "symbol_rules_json"))
+        object.__setattr__(self, "symbol_rules_mode", _coerce_symbol_rules_mode(self.symbol_rules_mode))
         if self.max_rows is not None:
             _require_positive_int(self.max_rows, "max_rows")
         _require_nonnegative_int(self.sample_event_limit, "sample_event_limit")
@@ -71,6 +67,31 @@ def _require_nonempty_str(value: str, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value
+
+
+def _coerce_symbol_rules_mode(value: SymbolRuleMode | str) -> SymbolRuleMode:
+    try:
+        return value if isinstance(value, SymbolRuleMode) else SymbolRuleMode(value)
+    except ValueError as exc:
+        raise ValueError("symbol_rules_mode must be a valid SymbolRuleMode") from exc
+
+
+def _load_symbol_rules(config: L2AuditConfig) -> ExchangeSymbolRules:
+    if config.exchange_info_json is not None:
+        rules = load_binance_usdm_exchange_info_symbol_rules(
+            config.exchange_info_json,
+            symbol=config.symbol,
+            exchange=config.exchange,
+            mode=config.symbol_rules_mode,
+        )
+    elif config.symbol_rules_json is not None:
+        rules = read_symbol_rules_json(config.symbol_rules_json)
+    else:
+        raise ValueError("exactly one of exchange_info_json or symbol_rules_json is required")
+
+    if rules.exchange != config.exchange or rules.symbol != config.symbol:
+        raise ValueError("symbol rules exchange/symbol must match audit config")
+    return rules
 
 
 def _tuple_of_nonempty_str(values: Any, name: str) -> tuple[str, ...]:
@@ -284,15 +305,8 @@ def _event_sample(event: ReconstructedL2Event) -> dict[str, object]:
 def audit_l2_reconstruction(config: L2AuditConfig) -> dict[str, object]:
     if not isinstance(config, L2AuditConfig):
         raise ValueError("config must be L2AuditConfig")
-    symbol_spec = SymbolSpec(
-        exchange=config.exchange,
-        symbol=config.symbol,
-        tick_size=config.tick_size,
-        step_size=config.step_size,
-        min_qty=config.min_qty,
-        max_qty=config.max_qty,
-        min_notional=config.min_notional,
-    )
+    rules = _load_symbol_rules(config)
+    symbol_spec = rules.to_symbol_spec()
     reconstructor = L2BookReconstructor(symbol_spec)
     paths = tuple(Path(p) for p in config.l2_inputs)
 
@@ -375,12 +389,12 @@ def audit_l2_reconstruction(config: L2AuditConfig) -> dict[str, object]:
         "market": {
             "exchange": config.exchange,
             "symbol": config.symbol,
-            "tick_size": config.tick_size,
-            "step_size": config.step_size,
-            "min_qty": config.min_qty,
-            "max_qty": config.max_qty,
-            "min_notional": config.min_notional,
+            "symbol_rules_mode": rules.mode.value,
+            "symbol_rules_source": rules.source,
+            "symbol_rules_source_sha256": rules.source_sha256,
+            "symbol_rules_captured_at_utc": rules.captured_at_utc,
         },
+        "symbol_rules": rules.to_dict(),
         "counts": {
             "rows_seen": rows_seen,
             "updates_converted": updates_converted,
@@ -456,6 +470,20 @@ def _warnings_from_values(
     return warnings
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _write_json_atomic(report: dict[str, object], path: str) -> str:
     if not isinstance(path, str) or not path.strip():
         raise ValueError("path must be a non-empty string")
@@ -463,7 +491,7 @@ def _write_json_atomic(report: dict[str, object], path: str) -> str:
     if target.suffix != ".json":
         raise ValueError("output path must end with .json")
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(report, sort_keys=True, indent=2, allow_nan = True) + "\n"
+    payload = json.dumps(_json_safe(report), sort_keys=True, indent=2, allow_nan=False) + "\n"
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(payload, encoding="utf-8")
     tmp.replace(target)
@@ -471,7 +499,7 @@ def _write_json_atomic(report: dict[str, object], path: str) -> str:
 
 
 def _print_json(payload: dict[str, object]) -> None:
-    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan = True))
+    print(json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":"), allow_nan=False))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -482,11 +510,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l2-input", nargs="+", required=True, dest="l2_inputs", help="Input .parquet, .csv, or .csv.gz files.")
     parser.add_argument("--exchange", default="binance-futures")
     parser.add_argument("--symbol", default="BTCUSDT")
-    parser.add_argument("--tick" + "-size", type=float, default=DEFAULT_TICK_SIZE)
-    parser.add_argument("--step" + "-size", type=float, default=DEFAULT_STEP_SIZE)
-    parser.add_argument("--min-qty", type=float, default=0.001)
-    parser.add_argument("--max-qty", type=float, default=100.0)
-    parser.add_argument("--min" + "-notional", type=float, default=DEFAULT_MIN_NOTIONAL)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--exchange-info-json")
+    group.add_argument("--symbol-rules-json")
+    parser.add_argument(
+        "--symbol-rules-mode",
+        choices=[mode.value for mode in SymbolRuleMode],
+        default=SymbolRuleMode.CURRENT_RULES_REPLAY.value,
+    )
     parser.add_argument("--max-rows", type=_positive_int, default=None)
     parser.add_argument("--batch-size", type=_positive_int, default=65_536)
     parser.add_argument("--sample-event-limit", type=_nonnegative_int, default=10)
@@ -501,11 +532,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         l2_inputs=tuple(args.l2_inputs),
         exchange=args.exchange,
         symbol=args.symbol,
-        tick_size=args.tick_size,
-        step_size=args.step_size,
-        min_qty=args.min_qty,
-        max_qty=args.max_qty,
-        min_notional=args.min_notional,
+        exchange_info_json=args.exchange_info_json,
+        symbol_rules_json=args.symbol_rules_json,
+        symbol_rules_mode=args.symbol_rules_mode,
         max_rows=args.max_rows,
         sample_event_limit=args.sample_event_limit,
         batch_size=args.batch_size,

@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     paths = fi.write_feature_importance_artifacts(result, args.output_dir)
     print(
         json.dumps(
-            {
+            fi._json_safe({
                 "status": "ok",
                 "dataset_root": args.dataset_root,
                 "train_result_json": args.train_result_json,
@@ -65,10 +65,10 @@ def main(argv: list[str] | None = None) -> int:
                 "manifest_hash": result.manifest_hash,
                 "selection_split": result.selection_split,
                 "n_sample_rows": result.n_sample_rows,
-            },
+            }),
             sort_keys=True,
             separators=(",", ":"),
-            allow_nan = True,
+            allow_nan=False,
         )
     )
     return 0

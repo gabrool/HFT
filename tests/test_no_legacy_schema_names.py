@@ -1,4 +1,5 @@
 from pathlib import Path
+import ast
 import json
 
 import numpy as np
@@ -264,7 +265,10 @@ def test_adapter_has_no_source_context_accepted_policy_helpers():
 def test_no_allow_nan_true_in_mmrt():
     offenders = []
     for path in Path("mmrt").rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if "allow_nan" + "=True" in text:
-            offenders.append(str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg == "allow_nan" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                        offenders.append(f"{path}:{node.lineno}")
     assert offenders == []
