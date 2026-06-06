@@ -510,6 +510,21 @@ def _effective_start_event_index(value: int | None) -> int:
     return 0 if value is None else value
 
 
+def _resolve_evaluation_start_event_index(
+    *,
+    config_start_event_index: int | None,
+    checkpoint_cli_config: Mapping[str, object] | None,
+) -> int | None:
+    if config_start_event_index is not None:
+        return _require_nonnegative_int(config_start_event_index, "start_event_index")
+    if checkpoint_cli_config is None:
+        return None
+    return _optional_nonnegative_int(
+        checkpoint_cli_config.get("start_event_index"),
+        "checkpoint cli_config start_event_index",
+    )
+
+
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -538,13 +553,20 @@ def run_execution_policy_evaluation(
     )
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
 
+    checkpoint_cli_config: Mapping[str, object] | None = None
+
     if config.use_checkpoint_cli_env_config:
-        raw_cli_config = _mapping_get_mapping(checkpoint, "cli_config")
-        env_config = _env_config_from_training_cli_config(raw_cli_config)
+        checkpoint_cli_config = _mapping_get_mapping(checkpoint, "cli_config")
+        env_config = _env_config_from_training_cli_config(checkpoint_cli_config)
         env_config_source = "checkpoint_cli_config"
     else:
         env_config = _env_config_from_cli_config(config)
         env_config_source = "evaluation_cli_config"
+
+    effective_start_event_index = _resolve_evaluation_start_event_index(
+        config_start_event_index=config.start_event_index,
+        checkpoint_cli_config=checkpoint_cli_config,
+    )
 
     validate_linear_signal_artifact_metadata(
         linear_signals,
@@ -557,7 +579,7 @@ def run_execution_policy_evaluation(
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
         decision_interval_us=env_config.decision_interval_us,
-        start_event_index=_effective_start_event_index(config.start_event_index),
+        start_event_index=_effective_start_event_index(effective_start_event_index),
         min_rows=(env_config.max_episode_steps + 1) if env_config.max_episode_steps is not None else None,
     )
 
@@ -593,7 +615,7 @@ def run_execution_policy_evaluation(
     )
     eval_config = PolicyEvaluationConfig(
         max_steps=config.max_steps,
-        start_event_index=config.start_event_index,
+        start_event_index=effective_start_event_index,
         deterministic=config.deterministic,
         reset_env=True,
         device=device,
@@ -615,6 +637,7 @@ def run_execution_policy_evaluation(
         "output_json": str(output_json),
         "config": _summary_config(config),
         "env_config_source": env_config_source,
+        "effective_start_event_index": effective_start_event_index,
         "checkpoint": {
             "schema_version": checkpoint.get("schema_version"),
             "updates_completed": checkpoint.get("updates_completed"),
