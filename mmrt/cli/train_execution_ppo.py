@@ -14,6 +14,11 @@ from mmrt.execution.contracts import ActionSpec, PositionState, QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
+from mmrt.execution.linear_signal import (
+    LINEAR_SIGNALS_FILENAME,
+    load_linear_signal_arrays_npz,
+    linear_signal_arrays_summary,
+)
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.quote_geometry import QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
@@ -156,6 +161,7 @@ class ExecutionPPOTrainCLIConfig:
     tape_root: str
     output_json: str | None = None
     checkpoint_path: str | None = None
+    linear_signals_npz: str | None = None
     overwrite: bool = False
     save_checkpoint: bool = True
     mmap_mode: str | None = "r"
@@ -230,6 +236,8 @@ class ExecutionPPOTrainCLIConfig:
             _require_nonempty_str(self.output_json, "output_json")
         if self.checkpoint_path is not None:
             _require_nonempty_str(self.checkpoint_path, "checkpoint_path")
+        if self.linear_signals_npz is not None:
+            _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
         _require_bool(self.overwrite, "overwrite")
         _require_bool(self.save_checkpoint, "save_checkpoint")
         if self.mmap_mode not in (None, "r"):
@@ -308,6 +316,7 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "tape_root": config.tape_root,
         "output_json": config.output_json,
         "checkpoint_path": config.checkpoint_path,
+        "linear_signals_npz": config.linear_signals_npz,
         "overwrite": config.overwrite,
         "save_checkpoint": config.save_checkpoint,
         "mmap_mode": config.mmap_mode,
@@ -467,6 +476,10 @@ def _default_checkpoint_path(tape_root: str) -> Path:
     return Path(tape_root) / "execution_ppo_checkpoint.pt"
 
 
+def _default_linear_signals_npz(tape_root: str) -> Path:
+    return Path(tape_root) / LINEAR_SIGNALS_FILENAME
+
+
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -499,8 +512,14 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         raise FileExistsError(str(checkpoint_path))
 
     tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode)
+    linear_signals_path = (
+        Path(config.linear_signals_npz)
+        if config.linear_signals_npz is not None
+        else _default_linear_signals_npz(config.tape_root)
+    )
+    linear_signals = load_linear_signal_arrays_npz(linear_signals_path)
     env_config = _build_env_config(config)
-    env = ExecutionEnv(tape, config=env_config)
+    env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals)
     training_config = _build_training_config(config)
     result = train_ppo_policy(env, config=training_config)
 
@@ -523,12 +542,16 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "book_depth": tape.manifest.notes.get("book_depth") if tape.manifest.notes is not None else None,
         },
         "training": result.summary_dict(),
+        "observation_schema": env.config.observation_schema.as_dict(),
+        "linear_signals": linear_signal_arrays_summary(linear_signals, path=str(linear_signals_path)),
     }
 
     if config.save_checkpoint:
         checkpoint_payload = make_training_checkpoint_payload(result)
         checkpoint_payload["cli_config"] = _summary_config(config)
         checkpoint_payload["tape"] = summary["tape"]
+        checkpoint_payload["observation_schema"] = env.config.observation_schema.as_dict()
+        checkpoint_payload["linear_signals"] = linear_signal_arrays_summary(linear_signals, path=str(linear_signals_path))
         _save_checkpoint_atomic(checkpoint_path, checkpoint_payload)
         summary["checkpoint_saved"] = True
     else:
@@ -544,6 +567,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--output-json")
     parser.add_argument("--checkpoint-path")
+    parser.add_argument(
+        "--linear-signals-npz",
+        help="Canonical no-move-gated linear signal NPZ. Defaults to <tape-root>/linear_signals.npz. Required; missing file is an error.",
+    )
     parser.add_argument("--no-checkpoint", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
@@ -618,6 +645,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         tape_root=args.tape_root,
         output_json=args.output_json,
         checkpoint_path=args.checkpoint_path,
+        linear_signals_npz=args.linear_signals_npz,
         overwrite=args.overwrite,
         save_checkpoint=not args.no_checkpoint,
         mmap_mode=None if args.no_mmap else "r",

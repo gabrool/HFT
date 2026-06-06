@@ -37,10 +37,15 @@ MARKET_FIELDS = (
 
 LINEAR_SIGNAL_FIELDS = (
     "linear_p_no_move",
-    "linear_p_up",
-    "linear_mag_up_bps",
-    "linear_mag_down_bps",
+    "linear_p_move",
+    "linear_p_up_move",
+    "linear_p_down_move",
+    "linear_signed_move_prob",
+    "linear_expected_up_bps",
+    "linear_expected_down_bps",
     "linear_expected_return_bps",
+    "linear_expected_abs_move_bps",
+    "linear_predicted_vol_bps",
     "linear_confidence",
 )
 

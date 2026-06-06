@@ -1,6 +1,8 @@
 import inspect
 import json
 
+import numpy as np
+
 import pytest
 import torch
 
@@ -10,6 +12,15 @@ from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
+from mmrt.execution.linear_signal import (
+    DIRECTION_PROBA_KEY,
+    LINEAR_SIGNALS_FILENAME,
+    MAGNITUDE_DOWN_KEY,
+    MAGNITUDE_UP_KEY,
+    NO_MOVE_PROBA_KEY,
+    predictions_to_signal_arrays,
+    save_linear_signal_arrays_npz,
+)
 from mmrt.cli.train_execution_ppo import (
     ExecutionPPOTrainCLIConfig,
     main,
@@ -127,18 +138,38 @@ def _tiny_events():
     return l2_events, trades
 
 
+def _save_linear_signals(root, n_rows: int = 16):
+    arrays = predictions_to_signal_arrays({
+        NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
+        DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
+        MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
+        MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
+    })
+    path = root / LINEAR_SIGNALS_FILENAME
+    save_linear_signal_arrays_npz(path, arrays, overwrite=True)
+    return path
+
+
 def _tiny_tape():
     l2_events, trades = _tiny_events()
     return _tape(l2_events, trades)
 
 
 def _tiny_tape_root(tmp_path):
-    return _save_tape(tmp_path, _tiny_tape())
+    root = _save_tape(tmp_path, _tiny_tape())
+    _save_linear_signals(root)
+    return root
 
 
 def _tiny_env() -> ExecutionEnv:
     return ExecutionEnv(
         _tiny_tape(),
+        linear_signals=predictions_to_signal_arrays({
+            NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (16, 1)),
+            DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (16, 1)),
+            MAGNITUDE_UP_KEY: np.full(16, np.log1p(10.0), dtype=np.float32),
+            MAGNITUDE_DOWN_KEY: np.full(16, np.log1p(5.0), dtype=np.float32),
+        }),
         config=ExecutionEnvConfig(
             decision_interval_us=50,
             max_episode_steps=4,
@@ -212,7 +243,7 @@ def test_train_ppo_policy_runs_one_update_on_tiny_env():
     assert summary["updates_completed"] == 1
 
     payload = make_training_checkpoint_payload(result)
-    assert payload["schema_version"] == "mmrt_execution_ppo_checkpoint_v1"
+    assert payload["schema_version"] == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
     assert "policy_state_dict" in payload
     assert "optimizer_state_dict" in payload
     assert payload["observation_normalizer_state_dict"] is not None
@@ -247,12 +278,16 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["checkpoint_saved"] is True
     assert summary["training"]["updates_completed"] == 1
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
+    assert summary["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v2_no_move_gated"
+    assert summary["linear_signals"]["n_rows"] >= 1
 
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-    assert ckpt["schema_version"] == "mmrt_execution_ppo_checkpoint_v1"
+    assert ckpt["schema_version"] == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
     assert ckpt["updates_completed"] == 1
     assert "policy_state_dict" in ckpt
     assert ckpt["tape"]["symbol"] == "BTCUSDT"
+    assert ckpt["observation_schema"] == summary["observation_schema"]
+    assert ckpt["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v2_no_move_gated"
 
 
 def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -294,6 +329,25 @@ def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsy
     assert stdout_payload["checkpoint_saved"] is False
     assert stdout_payload["training"]["updates_completed"] == 1
 
+
+
+def test_train_execution_ppo_requires_linear_signals_file(tmp_path):
+    tape_root = _save_tape(tmp_path, _tiny_tape())
+    with pytest.raises(FileNotFoundError):
+        run_execution_ppo_training(
+            ExecutionPPOTrainCLIConfig(
+                tape_root=str(tape_root),
+                output_json=str(tmp_path / "summary.json"),
+                save_checkpoint=False,
+                overwrite=True,
+                num_updates=1,
+                rollout_steps=2,
+                update_epochs=1,
+                minibatch_size=2,
+                hidden_sizes=(8,),
+                max_episode_steps=2,
+            )
+        )
 
 def test_train_execution_ppo_refuses_overwrite_without_flag(tmp_path):
     tape_root = _tiny_tape_root(tmp_path)

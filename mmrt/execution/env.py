@@ -218,13 +218,17 @@ class ExecutionEnv:
         self,
         tape: ExecutionTape,
         *,
+        linear_signals: LinearSignalArrays,
         config: ExecutionEnvConfig = ExecutionEnvConfig(),
-        linear_signals: LinearSignalArrays | None = None,
     ) -> None:
         self.tape = _require_tape(tape)
         self.config = _require_config(config)
-        if linear_signals is not None and not isinstance(linear_signals, LinearSignalArrays):
-            raise ValueError("linear_signals must be None or LinearSignalArrays")
+        if not isinstance(linear_signals, LinearSignalArrays):
+            raise ValueError("linear_signals must be LinearSignalArrays")
+        if linear_signals.n_rows <= 0:
+            raise ValueError("linear_signals must contain at least one row")
+        if config.max_episode_steps is not None and linear_signals.n_rows < config.max_episode_steps + 1:
+            raise ValueError("linear_signals must contain at least max_episode_steps + 1 rows")
         self.linear_signals = linear_signals
         self.observation_builder = ObservationBuilder(
             schema=config.observation_schema,
@@ -449,8 +453,6 @@ class ExecutionEnv:
         return self.observation_builder.build(inputs, out=self._obs_buffer)
 
     def _linear_signal_for_step(self, step_index: int):
-        if self.linear_signals is None:
-            return None
         if step_index >= self.linear_signals.n_rows:
             raise ValueError("linear_signals does not contain a row for current step_index")
         return linear_signal_at(self.linear_signals, step_index)

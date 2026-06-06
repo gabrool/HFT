@@ -427,25 +427,52 @@ class DecisionRef:
             raise ValueError("linear_pred_ptr must be >= -1")
 
 
+_LINEAR_SIGNAL_CONSISTENCY_EPS = 1e-5
+
+
 @dataclass(frozen=True, slots=True)
 class LinearSignal:
     p_no_move: float
-    p_up: float
-    mag_up_bps: float
-    mag_down_bps: float
+    p_move: float
+
+    p_up_move: float
+    p_down_move: float
+    signed_move_prob: float
+
+    expected_up_bps: float
+    expected_down_bps: float
     expected_return_bps: float
+    expected_abs_move_bps: float
+    predicted_vol_bps: float
+
     confidence: float
 
     def __post_init__(self) -> None:
-        for name in ("p_no_move", "p_up"):
+        for name in ("p_no_move", "p_move", "p_up_move", "p_down_move"):
             value = _require_finite_float(getattr(self, name), name)
             if value < 0 or value > 1:
                 raise ValueError(f"{name} must be in [0, 1]")
             object.__setattr__(self, name, value)
-        object.__setattr__(self, "mag_up_bps", _require_nonnegative_float(self.mag_up_bps, "mag_up_bps"))
-        object.__setattr__(self, "mag_down_bps", _require_nonnegative_float(self.mag_down_bps, "mag_down_bps"))
+
+        signed_move_prob = _require_finite_float(self.signed_move_prob, "signed_move_prob")
+        if signed_move_prob < -1.0 or signed_move_prob > 1.0:
+            raise ValueError("signed_move_prob must be in [-1, 1]")
+        object.__setattr__(self, "signed_move_prob", signed_move_prob)
+
+        for name in (
+            "expected_up_bps",
+            "expected_down_bps",
+            "expected_abs_move_bps",
+            "predicted_vol_bps",
+            "confidence",
+        ):
+            object.__setattr__(self, name, _require_nonnegative_float(getattr(self, name), name))
         object.__setattr__(self, "expected_return_bps", _require_finite_float(self.expected_return_bps, "expected_return_bps"))
-        object.__setattr__(self, "confidence", _require_nonnegative_float(self.confidence, "confidence"))
+
+        if abs((self.p_no_move + self.p_move) - 1.0) > _LINEAR_SIGNAL_CONSISTENCY_EPS:
+            raise ValueError("p_no_move + p_move must be approximately 1")
+        if abs((self.p_up_move + self.p_down_move) - self.p_move) > _LINEAR_SIGNAL_CONSISTENCY_EPS:
+            raise ValueError("p_up_move + p_down_move must be approximately p_move")
 
 
 @dataclass(frozen=True, slots=True)

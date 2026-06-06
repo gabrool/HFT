@@ -13,6 +13,11 @@ from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_exec
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
+from mmrt.execution.linear_signal import (
+    LINEAR_SIGNALS_FILENAME,
+    load_linear_signal_arrays_npz,
+    linear_signal_arrays_summary,
+)
 from mmrt.execution.metrics import ExecutionMetricAccumulator
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.quote_geometry import ContinuousQuoteAction, QuoteGeometryConfig
@@ -123,6 +128,7 @@ def _coerce_queue_mode(value: QueueModelMode | str) -> QueueModelMode:
 
 def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
     return {
+        "linear_signals_npz": config.linear_signals_npz,
         "policy": config.policy,
         "max_steps": config.max_steps,
         "start_event_index": config.start_event_index,
@@ -150,6 +156,7 @@ def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
 class ExecutionSimAuditConfig:
     tape_root: str
     output_json: str | None = None
+    linear_signals_npz: str | None = None
     overwrite: bool = False
 
     policy: str = "alternate_bid_ask"
@@ -181,6 +188,8 @@ class ExecutionSimAuditConfig:
         _require_nonempty_str(self.tape_root, "tape_root")
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
+        if self.linear_signals_npz is not None:
+            _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
         _require_bool(self.overwrite, "overwrite")
         if self.policy not in AUDIT_POLICIES:
             raise ValueError(f"policy must be one of {AUDIT_POLICIES}")
@@ -206,6 +215,10 @@ class ExecutionSimAuditConfig:
         _require_nonnegative_float(self.terminal_inventory_penalty_bps, "terminal_inventory_penalty_bps")
 
 
+def _default_linear_signals_npz(tape_root: str) -> Path:
+    return Path(tape_root) / LINEAR_SIGNALS_FILENAME
+
+
 def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object]:
     if not isinstance(config, ExecutionSimAuditConfig):
         raise ValueError("config must be ExecutionSimAuditConfig")
@@ -215,6 +228,12 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         raise FileExistsError(str(output_path))
 
     tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode)
+    linear_signals_path = (
+        Path(config.linear_signals_npz)
+        if config.linear_signals_npz is not None
+        else _default_linear_signals_npz(config.tape_root)
+    )
+    linear_signals = load_linear_signal_arrays_npz(linear_signals_path)
     env_config = ExecutionEnvConfig(
         decision_interval_us=config.decision_interval_us,
         action_spec=ActionSpec(
@@ -245,7 +264,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         max_episode_steps=config.max_steps,
     )
 
-    env = ExecutionEnv(tape, config=env_config)
+    env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals)
     env.reset(start_event_index=config.start_event_index)
 
     acc = ExecutionMetricAccumulator()
@@ -278,6 +297,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         },
         "metrics": metrics,
         "diagnostics": report.as_dict(),
+        "linear_signals": linear_signal_arrays_summary(linear_signals, path=str(linear_signals_path)),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,6 +311,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Audit an execution tape with a deterministic simple quote policy.")
     parser.add_argument("--tape-root", required=True)
     parser.add_argument("--output-json")
+    parser.add_argument(
+        "--linear-signals-npz",
+        help="Canonical no-move-gated linear signal NPZ. Defaults to <tape-root>/linear_signals.npz. Required; missing file is an error.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--policy", choices=AUDIT_POLICIES, default="alternate_bid_ask")
     parser.add_argument("--max-steps", type=int, default=1000)
@@ -320,6 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = ExecutionSimAuditConfig(
         tape_root=args.tape_root,
         output_json=args.output_json,
+        linear_signals_npz=args.linear_signals_npz,
         overwrite=args.overwrite,
         policy=args.policy,
         max_steps=args.max_steps,
