@@ -163,3 +163,59 @@ def test_execution_tape_manifest_rejects_retired_schema_field():
     }
     with pytest.raises(ValueError, match="schema"):
         execution_tape_manifest_from_dict(payload)
+
+
+def test_no_dead_generic_contract_layer_symbols():
+    text = Path("mmrt/contracts.py").read_text(encoding="utf-8")
+    forbidden = (
+        "Event" + "Type",
+        "Event" + "Meta",
+        "Price" + "Level",
+        "Book" + "SnapshotEvent",
+        "Book" + "DeltaEvent",
+        "Trade" + "Event",
+        "Book" + "TickerEvent",
+        "Derivative" + "TickerEvent",
+        "Liquidation" + "Event",
+        "Market" + "Event",
+        "Feature" + "BuildResult",
+        "Decision" + "RowRef",
+        "Segment" + "Spec",
+        "Split" + "Entry",
+        "Split" + "Plan",
+        "Dataset" + "Manifest",
+    )
+    offenders = [name for name in forbidden if name in text]
+    assert offenders == []
+
+
+def test_no_unused_tardis_schema_symbols():
+    text = Path("mmrt/schemas.py").read_text(encoding="utf-8")
+    forbidden = (
+        "BOOK" + "_SNAPSHOT_5",
+        "BOOK" + "_TICKER",
+        "DERIVATIVE" + "_TICKER",
+        "LIQ" + "UIDATIONS",
+        "OPTIONS" + "_CHAIN",
+        "QU" + "OTES",
+        "Feature" + "Field",
+        "Feature" + "Schema",
+        "DECISION" + "_ROW_FIXED_COLUMNS",
+        "LABEL" + "_ROW_FIXED_COLUMNS",
+    )
+    offenders = [name for name in forbidden if name in text]
+    assert offenders == []
+
+
+def test_ingest_has_no_numeric_zero_coercion_or_skip_counters():
+    text = Path("mmrt/cli/ingest.py").read_text(encoding="utf-8")
+    forbidden = (
+        "_to_float" + "_or_zero",
+        "skipped_bad" + "_trade_events",
+        "skipped_empty" + "_book_events",
+    )
+    offenders = [name for name in forbidden if name in text]
+    assert offenders == []
+    assert "def _book_snapshot_input_from_row" in text
+    assert "return None" not in text.split("def _book_snapshot_input_from_row", 1)[1].split("def _trade_input_from_row", 1)[0]
+    assert "return None" not in text.split("def _trade_input_from_row", 1)[1].split("@dataclass", 1)[0]

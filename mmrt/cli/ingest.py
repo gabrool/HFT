@@ -118,7 +118,7 @@ def _build_pipeline_config(args: argparse.Namespace, *, exchange: str, symbol: s
     base = cfg.default_config()
     return cfg.PipelineConfig(
         market=cfg.MarketConfig(exchange=exchange, symbol=symbol),
-        data=cfg.DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES), disabled_context_data_types=base.data.disabled_context_data_types),
+        data=cfg.DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES)),
         decision=cfg.DecisionConfig(policy=base.decision.policy, reason=base.decision.reason, stride_us=args.decision_stride_us),
         labels=cfg.LabelConfig(horizons_us=label_horizons_us, entry_delay_us=args.label_entry_delay_us),
         runtime=base.runtime,
@@ -170,31 +170,66 @@ def _build_stream_merge_inputs(normalized_files: Sequence[tc.NormalizedTardisFil
     return tuple(out)
 
 
-def _to_float_or_zero(v: Any) -> float:
-    if v is None:
+def _required_finite_float(value: Any, name: str) -> float:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite float") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be finite float")
+    return out
+
+
+def _required_positive_float(value: Any, name: str) -> float:
+    out = _required_finite_float(value, name)
+    if out <= 0.0:
+        raise ValueError(f"{name} must be > 0")
+    return out
+
+
+def _nullable_nonnegative_float_or_zero(value: Any, name: str) -> float:
+    if value is None:
         return 0.0
     try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return 0.0
-    return 0.0 if not math.isfinite(f) else f
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite float or null") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be finite float or null")
+    if out < 0.0:
+        raise ValueError(f"{name} must be >= 0")
+    return out
 
 
-def _book_snapshot_input_from_row(row: Mapping[str, Any]) -> BookSnapshotInput | None:
-    bid_px = np.array([_to_float_or_zero(row.get(f"bid_px_{i:02d}")) for i in range(25)], dtype=np.float64)
-    bid_sz = np.array([_to_float_or_zero(row.get(f"bid_sz_{i:02d}")) for i in range(25)], dtype=np.float64)
-    ask_px = np.array([_to_float_or_zero(row.get(f"ask_px_{i:02d}")) for i in range(25)], dtype=np.float64)
-    ask_sz = np.array([_to_float_or_zero(row.get(f"ask_sz_{i:02d}")) for i in range(25)], dtype=np.float64)
-    if bid_px[0] <= 0.0 or ask_px[0] <= 0.0:
-        return None
+def _book_level_value(row: Mapping[str, Any], prefix: str, i: int) -> tuple[float, float]:
+    px_name = f"{prefix}_px_{i:02d}"
+    sz_name = f"{prefix}_sz_{i:02d}"
+    if i == 0:
+        px = _required_positive_float(row.get(px_name), px_name)
+        sz = _required_positive_float(row.get(sz_name), sz_name)
+    else:
+        px = _nullable_nonnegative_float_or_zero(row.get(px_name), px_name)
+        sz = _nullable_nonnegative_float_or_zero(row.get(sz_name), sz_name)
+        if (px <= 0.0) != (sz <= 0.0):
+            raise ValueError(f"{prefix} level {i} has partial price/size")
+    return px, sz
+
+
+def _book_snapshot_input_from_row(row: Mapping[str, Any]) -> BookSnapshotInput:
+    bid_levels = [_book_level_value(row, "bid", i) for i in range(25)]
+    ask_levels = [_book_level_value(row, "ask", i) for i in range(25)]
+    bid_px = np.array([px for px, _ in bid_levels], dtype=np.float64)
+    bid_sz = np.array([sz for _, sz in bid_levels], dtype=np.float64)
+    ask_px = np.array([px for px, _ in ask_levels], dtype=np.float64)
+    ask_sz = np.array([sz for _, sz in ask_levels], dtype=np.float64)
     return BookSnapshotInput(local_ts_us=int(row[tc.LOCAL_TS_US]), ts_us=int(row[tc.TS_US]), event_seq=int(row[em.EVENT_SEQ]), bid_px=bid_px, bid_sz=bid_sz, ask_px=ask_px, ask_sz=ask_sz)
 
 
-def _trade_input_from_row(row: Mapping[str, Any]) -> TradeInput | None:
-    price = _to_float_or_zero(row.get("price"))
-    amount = _to_float_or_zero(row.get("amount"))
-    if price <= 0.0 or amount <= 0.0:
-        return None
+def _trade_input_from_row(row: Mapping[str, Any]) -> TradeInput:
+    price = _required_positive_float(row.get("price"), "trade.price")
+    amount = _required_positive_float(row.get("amount"), "trade.amount")
     return TradeInput(local_ts_us=int(row[tc.LOCAL_TS_US]), ts_us=int(row[tc.TS_US]), price=price, amount=amount, side_code=int(row["side_code"]), event_seq=int(row[em.EVENT_SEQ]))
 
 
@@ -216,8 +251,6 @@ class IngestCounters:
     merged_events_seen: int = 0
     book_events_seen: int = 0
     trade_events_seen: int = 0
-    skipped_empty_book_events: int = 0
-    skipped_bad_trade_events: int = 0
     decisions_emitted: int = 0
     labels_matured: int = 0
     rows_written: int = 0
@@ -255,18 +288,18 @@ def _run_causal_ingest_rows(rows: Iterable[Mapping[str, Any]], writer: wr.Decisi
         code = int(row[em.EVENT_TYPE_CODE])
         if code == em.EVENT_TYPE_CODE_TRADE:
             counters.trade_events_seen += 1
-            tr = _trade_input_from_row(row)
-            if tr is None:
-                counters.skipped_bad_trade_events += 1
-                continue
+            try:
+                tr = _trade_input_from_row(row)
+            except ValueError as exc:
+                raise ValueError(f"bad trade row at merged_event={counters.merged_events_seen}") from exc
             engine.on_trade(tr)
             continue
         if code == em.EVENT_TYPE_CODE_BOOK_SNAPSHOT:
             counters.book_events_seen += 1
-            snap = _book_snapshot_input_from_row(row)
-            if snap is None:
-                counters.skipped_empty_book_events += 1
-                continue
+            try:
+                snap = _book_snapshot_input_from_row(row)
+            except ValueError as exc:
+                raise ValueError(f"bad book row at merged_event={counters.merged_events_seen}") from exc
             decision = engine.on_book_snapshot(snap)
             # Causality contract: observe current book price first, mature older labels,
             # then create/store current decision transformed at decision time.

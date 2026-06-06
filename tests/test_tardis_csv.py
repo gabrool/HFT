@@ -162,49 +162,6 @@ def test_scan_tardis_csv_normalized_incremental_book_l2(tmp_path):
     assert "side" in df.columns
 
 
-def test_scan_tardis_csv_normalized_liquidations(tmp_path):
-    p = tmp_path / "liq.csv"
-    p.write_text(
-        "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n"
-        "binance-futures,BTCUSDT,1,2,l1,buy,100.0,1.0\n"
-        "binance-futures,BTCUSDT,3,4,l2,sell,99.0,2.0\n",
-        encoding="utf-8",
-    )
-    df = scan_tardis_csv_normalized(p, TardisDataType.LIQUIDATIONS).collect()
-    assert "side_code" in df.columns
-    assert df["side_code"].to_list() == [SIDE_BUY, SIDE_SELL]
-
-
-def test_scan_tardis_csv_normalized_book_ticker_order(tmp_path):
-    p = tmp_path / "book_ticker.csv"
-    p.write_text(
-        "exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_amount,bid_price\n"
-        "binance-futures,BTCUSDT,1,2,1.5,101.0,2.0,100.0\n",
-        encoding="utf-8",
-    )
-    df = scan_tardis_csv_normalized(p, TardisDataType.BOOK_TICKER).collect()
-
-    assert df.columns == list(expected_normalized_columns(TardisDataType.BOOK_TICKER))
-    assert df["ask_amount"].to_list() == [1.5]
-    assert df["ask_price"].to_list() == [101.0]
-    assert df["bid_amount"].to_list() == [2.0]
-    assert df["bid_price"].to_list() == [100.0]
-    assert df[RAW_SOURCE_ROW].dtype == pl.Int64
-    assert "side_code" not in df.columns
-    assert "book_side_code" not in df.columns
-
-
-def test_book_ticker_rejects_old_wrong_bid_order(tmp_path):
-    p = tmp_path / "book_ticker_wrong.csv"
-    p.write_text(
-        "exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_price,bid_amount\n"
-        "binance-futures,BTCUSDT,1,2,1.5,101.0,100.0,2.0\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError):
-        validate_tardis_csv_header(p, TardisDataType.BOOK_TICKER)
-
-
 def test_validate_normalized_timestamps():
     df = pl.DataFrame({TS_US: [1, 2], LOCAL_TS_US: [3, 4]})
     validate_normalized_timestamps(df)
@@ -260,15 +217,6 @@ def test_expected_normalized_columns():
 
     forbidden = ("mid", "spread", "microprice", "label", "ta" + "rget", "fu" + "ture")
     assert not any(any(f in c for f in forbidden) for c in tcols + bcols + icols)
-
-
-def test_unsupported_schemas_raise(tmp_path):
-    p = tmp_path / "dummy.csv"
-    p.write_text("exchange,symbol,timestamp,local_timestamp\nex,sym,1,2\n", encoding="utf-8")
-    with pytest.raises(ValueError):
-        scan_tardis_csv_normalized(p, TardisDataType.QUOTES, validate_header=False)
-    with pytest.raises(ValueError):
-        scan_tardis_csv_normalized(p, TardisDataType.OPTIONS_CHAIN, validate_header=False)
 
 
 def test_no_sorting_row_order_preserved(tmp_path):

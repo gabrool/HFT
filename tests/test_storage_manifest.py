@@ -331,7 +331,7 @@ def test_manifest_split_validation():
 
 def test_pipeline_config_to_manifest_dict():
     d = mf.pipeline_config_to_manifest_dict(default_config())
-    for k in ("exchange", "symbol", "source_data_types", "disabled_context_data_types", "decision_policy", "decision_reason", "decision_stride_us", "horizons_us", "entry_delay_us", "price_reference", "asof_policy", "lookback_rows", "feature_dtype", "label_dtype", "timestamp_dtype", "storage_format", "time_unit", "pipeline_schema", "feature_schema"):
+    for k in ("exchange", "symbol", "source_data_types", "decision_policy", "decision_reason", "decision_stride_us", "horizons_us", "entry_delay_us", "price_reference", "asof_policy", "lookback_rows", "feature_dtype", "label_dtype", "timestamp_dtype", "storage_format", "time_unit", "pipeline_schema", "feature_schema"):
         assert k in d
     assert d["decision_stride_us"] == 500_000
     assert d["storage_format"] == "flat_decision_rows_us"

@@ -113,7 +113,7 @@ def normalized_snapshot_column_name(raw_name: str) -> str:
 
 def normalized_column_renames(schema: TardisCSVSchema) -> dict[str, str]:
     renames = {"timestamp": TS_US, "local_timestamp": LOCAL_TS_US}
-    if schema.data_type in (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_5):
+    if schema.data_type == TardisDataType.BOOK_SNAPSHOT_25:
         for name in schema.column_names:
             if name.startswith("asks[") or name.startswith("bids["):
                 renames[name] = normalized_snapshot_column_name(name)
@@ -148,18 +148,12 @@ def _book_side_expr(column: str = "side") -> pl.Expr:
     )
 
 
-def _ensure_supported_scan_type(data_type: TardisDataType) -> None:
-    if data_type in (TardisDataType.QUOTES, TardisDataType.OPTIONS_CHAIN):
-        raise ValueError(f"unsupported data_type for normalization: {data_type.value}")
-
-
 def expected_normalized_columns(data_type: TardisDataType | str) -> tuple[str, ...]:
     schema = tardis_csv_schema(data_type)
-    _ensure_supported_scan_type(schema.data_type)
     renames = normalized_column_renames(schema)
     cols = [RAW_SOURCE_ROW]
     cols.extend(renames.get(name, name) for name in schema.column_names)
-    if schema.data_type in (TardisDataType.TRADES, TardisDataType.LIQUIDATIONS):
+    if schema.data_type == TardisDataType.TRADES:
         cols.append("side_code")
     if schema.data_type == TardisDataType.INCREMENTAL_BOOK_L2:
         cols.append("book_side_code")
@@ -177,7 +171,6 @@ def scan_tardis_csv_normalized(
 ) -> pl.LazyFrame:
     csv_path = Path(path)
     schema = validate_tardis_csv_header(csv_path, data_type) if validate_header else tardis_csv_schema(data_type)
-    _ensure_supported_scan_type(schema.data_type)
 
     lf = pl.scan_csv(
         csv_path,
@@ -196,12 +189,12 @@ def scan_tardis_csv_normalized(
         pl.lit(schema.data_type.value).cast(pl.Utf8).alias(SOURCE_DATA_TYPE),
     ]
 
-    if schema.data_type in (TardisDataType.TRADES, TardisDataType.LIQUIDATIONS):
+    if schema.data_type == TardisDataType.TRADES:
         with_cols.append(_trade_side_expr())
     if schema.data_type == TardisDataType.INCREMENTAL_BOOK_L2:
         with_cols.append(_book_side_expr())
 
-    if schema.data_type in (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_5):
+    if schema.data_type == TardisDataType.BOOK_SNAPSHOT_25:
         renames = normalized_column_renames(schema)
         for original in schema.column_names:
             if original.startswith("asks[") or original.startswith("bids["):

@@ -182,7 +182,6 @@ def pipeline_config_to_manifest_dict(config: PipelineConfig) -> dict[str, Any]:
         "exchange": config.market.exchange,
         "symbol": config.market.symbol,
         "source_data_types": [d.value for d in config.data.source_data_types],
-        "disabled_context_data_types": [d.value for d in config.data.disabled_context_data_types],
         "decision_policy": config.decision.policy,
         "decision_reason": config.decision.reason.value,
         "decision_stride_us": config.decision.stride_us,

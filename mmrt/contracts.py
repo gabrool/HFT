@@ -1,15 +1,14 @@
-"""Stable typed contracts for the microsecond-native Tardis/Binance linear market-making
-pipeline.
+"""Stable typed contracts for the current MMRT pipeline.
 
-This module is intentionally IO-free and dependency-light. It defines shared enums,
-validation helpers, and immutable dataclasses used across ingestion, feature building,
-labeling, and dataset metadata boundaries.
+This module is intentionally IO-free and dependency-light. It defines only the
+shared enums, validation helpers, and immutable dataclasses used by the active
+microsecond-native supervised storage ingest and execution tape paths.
 """
 
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Any, Union
+from typing import Any
 
 
 class _StrEnum(str, Enum):
@@ -23,22 +22,7 @@ class TimeUnit(_StrEnum):
 class TardisDataType(_StrEnum):
     INCREMENTAL_BOOK_L2 = "incremental_book_L2"
     BOOK_SNAPSHOT_25 = "book_snapshot_25"
-    BOOK_SNAPSHOT_5 = "book_snapshot_5"
     TRADES = "trades"
-    OPTIONS_CHAIN = "options_chain"
-    QUOTES = "quotes"
-    BOOK_TICKER = "book_ticker"
-    DERIVATIVE_TICKER = "derivative_ticker"
-    LIQUIDATIONS = "liquidations"
-
-
-class EventType(_StrEnum):
-    BOOK_SNAPSHOT = "book_snapshot"
-    BOOK_DELTA = "book_delta"
-    TRADE = "trade"
-    BOOK_TICKER = "book_ticker"
-    DERIVATIVE_TICKER = "derivative_ticker"
-    LIQUIDATION = "liquidation"
 
 
 class BookSide(_StrEnum):
@@ -54,13 +38,10 @@ class AggressorSide(_StrEnum):
 
 class DecisionReason(_StrEnum):
     BOOK_EVENT = "book_event"
-    SCHEDULED_TIME = "scheduled_time"
 
 
 class PriceReference(_StrEnum):
     MID = "mid"
-    MICROPRICE = "microprice"
-    MARK = "mark"
 
 
 class AsOfPolicy(_StrEnum):
@@ -92,24 +73,6 @@ def _require_int_us(value: int, name: str, *, allow_zero: bool = False) -> int:
     elif value <= 0:
         raise ValueError(f"{name} must be > 0")
     return value
-
-
-def _require_nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative int")
-    return value
-
-
-def _require_positive_float(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{name} must be a finite float > 0")
-    return float(value)
-
-
-def _require_nonnegative_float(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be a finite float >= 0")
-    return float(value)
 
 
 def _tuple_of_ints(values: Any, name: str, *, positive: bool = True) -> tuple[int, ...]:
@@ -150,298 +113,6 @@ def _coerce_enum(enum_cls: type[Enum], value: Any, name: str):
         except ValueError as exc:
             raise ValueError(f"{name} has invalid value {value!r}") from exc
     raise ValueError(f"{name} must be {enum_cls.__name__} or str")
-
-
-@dataclass(frozen=True, slots=True)
-class EventMeta:
-    exchange: str
-    symbol: str
-    ts_us: int
-    local_ts_us: int
-    source_data_type: TardisDataType
-    source_row: int
-    source_file: str = ""
-    sequence_id: str = ""
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.exchange, "exchange")
-        _require_nonempty_str(self.symbol, "symbol")
-        _require_int_us(self.ts_us, "ts_us")
-        _require_int_us(self.local_ts_us, "local_ts_us")
-        _require_nonnegative_int(self.source_row, "source_row")
-        object.__setattr__(self, "source_data_type", _coerce_enum(TardisDataType, self.source_data_type, "source_data_type"))
-        if not isinstance(self.source_file, str):
-            raise ValueError("source_file must be str")
-        if not isinstance(self.sequence_id, str):
-            raise ValueError("sequence_id must be str")
-
-    @property
-    def order_key(self) -> tuple[int, int, int]:
-        return (self.local_ts_us, self.ts_us, self.source_row)
-
-
-@dataclass(frozen=True, slots=True)
-class PriceLevel:
-    price: float
-    amount: float
-
-    def __post_init__(self) -> None:
-        _require_positive_float(self.price, "price")
-        _require_nonnegative_float(self.amount, "amount")
-
-
-@dataclass(frozen=True, slots=True)
-class BookSnapshotEvent:
-    meta: EventMeta
-    bids: tuple[PriceLevel, ...]
-    asks: tuple[PriceLevel, ...]
-    depth_limit: int = 25
-
-    def __post_init__(self) -> None:
-        if self.meta.source_data_type not in (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_5):
-            raise ValueError("meta.source_data_type must be BOOK_SNAPSHOT_25 or BOOK_SNAPSHOT_5")
-        if self.depth_limit not in (5, 25):
-            raise ValueError("depth_limit must be 5 or 25")
-        if self.meta.source_data_type == TardisDataType.BOOK_SNAPSHOT_5 and self.depth_limit != 5:
-            raise ValueError("depth_limit must be 5 for BOOK_SNAPSHOT_5")
-        if self.meta.source_data_type == TardisDataType.BOOK_SNAPSHOT_25 and self.depth_limit != 25:
-            raise ValueError("depth_limit must be 25 for BOOK_SNAPSHOT_25")
-        if len(self.bids) > self.depth_limit or len(self.asks) > self.depth_limit:
-            raise ValueError("bids/asks exceed depth_limit")
-        for lvl in self.bids:
-            if lvl.amount <= 0:
-                raise ValueError("snapshot bid amount must be > 0")
-        for lvl in self.asks:
-            if lvl.amount <= 0:
-                raise ValueError("snapshot ask amount must be > 0")
-        for i in range(1, len(self.bids)):
-            if self.bids[i - 1].price <= self.bids[i].price:
-                raise ValueError("bids must be strictly descending by price")
-        for i in range(1, len(self.asks)):
-            if self.asks[i - 1].price >= self.asks[i].price:
-                raise ValueError("asks must be strictly ascending by price")
-        if self.bids and self.asks and self.bids[0].price >= self.asks[0].price:
-            raise ValueError("best_bid must be < best_ask")
-
-    @property
-    def event_type(self) -> EventType:
-        return EventType.BOOK_SNAPSHOT
-
-    @property
-    def best_bid(self) -> PriceLevel | None:
-        return self.bids[0] if self.bids else None
-
-    @property
-    def best_ask(self) -> PriceLevel | None:
-        return self.asks[0] if self.asks else None
-
-    @property
-    def mid(self) -> float | None:
-        if not (self.best_bid and self.best_ask):
-            return None
-        return (self.best_bid.price + self.best_ask.price) / 2.0
-
-    @property
-    def spread(self) -> float | None:
-        if not (self.best_bid and self.best_ask):
-            return None
-        return self.best_ask.price - self.best_bid.price
-
-
-@dataclass(frozen=True, slots=True)
-class BookDeltaEvent:
-    """Incremental L2 delta: amount is absolute at level; amount=0 removes the level.
-
-    This contract does not apply deltas or group updates.
-    """
-
-    meta: EventMeta
-    side: BookSide
-    price: float
-    amount: float
-    is_snapshot: bool
-
-    def __post_init__(self) -> None:
-        if self.meta.source_data_type != TardisDataType.INCREMENTAL_BOOK_L2:
-            raise ValueError("meta.source_data_type must be INCREMENTAL_BOOK_L2")
-        object.__setattr__(self, "side", _coerce_enum(BookSide, self.side, "side"))
-        _require_positive_float(self.price, "price")
-        _require_nonnegative_float(self.amount, "amount")
-        if not isinstance(self.is_snapshot, bool):
-            raise ValueError("is_snapshot must be bool")
-
-    @property
-    def event_type(self) -> EventType:
-        return EventType.BOOK_DELTA
-
-
-@dataclass(frozen=True, slots=True)
-class TradeEvent:
-    meta: EventMeta
-    trade_id: str
-    side: AggressorSide
-    price: float
-    amount: float
-
-    def __post_init__(self) -> None:
-        if self.meta.source_data_type != TardisDataType.TRADES:
-            raise ValueError("meta.source_data_type must be TRADES")
-        if not isinstance(self.trade_id, str):
-            raise ValueError("trade_id must be str")
-        object.__setattr__(self, "side", _coerce_enum(AggressorSide, self.side, "side"))
-        _require_positive_float(self.price, "price")
-        _require_positive_float(self.amount, "amount")
-
-    @property
-    def event_type(self) -> EventType:
-        return EventType.TRADE
-
-
-@dataclass(frozen=True, slots=True)
-class BookTickerEvent:
-    meta: EventMeta
-    bid_price: float
-    bid_amount: float
-    ask_price: float
-    ask_amount: float
-
-    def __post_init__(self) -> None:
-        if self.meta.source_data_type != TardisDataType.BOOK_TICKER:
-            raise ValueError("meta.source_data_type must be BOOK_TICKER")
-        _require_positive_float(self.bid_price, "bid_price")
-        _require_nonnegative_float(self.bid_amount, "bid_amount")
-        _require_positive_float(self.ask_price, "ask_price")
-        _require_nonnegative_float(self.ask_amount, "ask_amount")
-        if self.bid_price >= self.ask_price:
-            raise ValueError("bid_price must be < ask_price")
-
-    @property
-    def event_type(self) -> EventType:
-        return EventType.BOOK_TICKER
-
-
-@dataclass(frozen=True, slots=True)
-class DerivativeTickerEvent:
-    meta: EventMeta
-    funding_timestamp_us: int | None = None
-    funding_rate: float | None = None
-    predicted_funding_rate: float | None = None
-    open_interest: float | None = None
-    last_price: float | None = None
-    index_price: float | None = None
-    mark_price: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.meta.source_data_type != TardisDataType.DERIVATIVE_TICKER:
-            raise ValueError("meta.source_data_type must be DERIVATIVE_TICKER")
-        if self.funding_timestamp_us is not None:
-            _require_int_us(self.funding_timestamp_us, "funding_timestamp_us")
-        if self.open_interest is not None:
-            _require_nonnegative_float(self.open_interest, "open_interest")
-        for fld in ("last_price", "index_price", "mark_price"):
-            value = getattr(self, fld)
-            if value is not None:
-                _require_positive_float(value, fld)
-        for fld in ("funding_rate", "predicted_funding_rate"):
-            value = getattr(self, fld)
-            if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value)):
-                raise ValueError(f"{fld} must be finite if present")
-
-    @property
-    def event_type(self) -> EventType:
-        return EventType.DERIVATIVE_TICKER
-
-
-@dataclass(frozen=True, slots=True)
-class LiquidationEvent:
-    """Tardis liquidation side values are buy/sell/unknown but semantics differ from trades."""
-
-    meta: EventMeta
-    liquidation_id: str
-    side: AggressorSide
-    price: float
-    amount: float
-
-    def __post_init__(self) -> None:
-        if self.meta.source_data_type != TardisDataType.LIQUIDATIONS:
-            raise ValueError("meta.source_data_type must be LIQUIDATIONS")
-        if not isinstance(self.liquidation_id, str):
-            raise ValueError("liquidation_id must be str")
-        object.__setattr__(self, "side", _coerce_enum(AggressorSide, self.side, "side"))
-        _require_positive_float(self.price, "price")
-        _require_positive_float(self.amount, "amount")
-
-    @property
-    def event_type(self) -> EventType:
-        return EventType.LIQUIDATION
-
-
-MarketEvent = Union[BookSnapshotEvent, BookDeltaEvent, TradeEvent, BookTickerEvent, DerivativeTickerEvent, LiquidationEvent]
-
-
-def event_type(event: MarketEvent) -> EventType:
-    return event.event_type
-
-
-@dataclass(frozen=True, slots=True)
-class FeatureBuildResult:
-    meta: EventMeta
-    event_type: EventType
-    is_decision: bool
-    decision_reason: DecisionReason | None
-    features: tuple[float, ...]
-    raw_mid: float | None
-    dt_us: int
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "event_type", _coerce_enum(EventType, self.event_type, "event_type"))
-        expected_event_type = {
-            TardisDataType.BOOK_SNAPSHOT_25: EventType.BOOK_SNAPSHOT,
-            TardisDataType.BOOK_SNAPSHOT_5: EventType.BOOK_SNAPSHOT,
-            TardisDataType.INCREMENTAL_BOOK_L2: EventType.BOOK_DELTA,
-            TardisDataType.TRADES: EventType.TRADE,
-            TardisDataType.BOOK_TICKER: EventType.BOOK_TICKER,
-            TardisDataType.DERIVATIVE_TICKER: EventType.DERIVATIVE_TICKER,
-            TardisDataType.LIQUIDATIONS: EventType.LIQUIDATION,
-        }.get(self.meta.source_data_type)
-        if expected_event_type is None:
-            raise ValueError("meta.source_data_type has no supported FeatureBuildResult event type")
-        if self.event_type != expected_event_type:
-            raise ValueError("event_type must match originating event type")
-        if not isinstance(self.is_decision, bool):
-            raise ValueError("is_decision must be bool")
-        _require_int_us(self.dt_us, "dt_us", allow_zero=True)
-        feats = _tuple_of_floats(self.features, "features")
-        object.__setattr__(self, "features", feats)
-        if self.is_decision:
-            if self.decision_reason is None:
-                raise ValueError("decision_reason is required when is_decision is True")
-            object.__setattr__(self, "decision_reason", _coerce_enum(DecisionReason, self.decision_reason, "decision_reason"))
-            if not feats:
-                raise ValueError("features must be non-empty when is_decision is True")
-            if self.raw_mid is None or _require_positive_float(self.raw_mid, "raw_mid") <= 0:
-                raise ValueError("raw_mid must be > 0 when is_decision is True")
-        else:
-            if self.decision_reason is not None:
-                raise ValueError("decision_reason must be None when is_decision is False")
-            if feats:
-                raise ValueError("features must be empty when is_decision is False")
-            if self.raw_mid is not None:
-                _require_positive_float(self.raw_mid, "raw_mid")
-
-
-@dataclass(frozen=True, slots=True)
-class DecisionRowRef:
-    segment_key: str
-    row_idx: int
-    ts_us: int
-    local_ts_us: int
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.segment_key, "segment_key")
-        _require_nonnegative_int(self.row_idx, "row_idx")
-        _require_int_us(self.ts_us, "ts_us")
-        _require_int_us(self.local_ts_us, "local_ts_us")
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,136 +180,9 @@ class TimeRangeUS:
         return self.start_us <= ts_us < self.end_us
 
 
-@dataclass(frozen=True, slots=True)
-class SegmentSpec:
-    segment_key: str
-    time_range: TimeRangeUS
-    source_files: tuple[str, ...]
-    row_count: int
-    label_count: int
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.segment_key, "segment_key")
-        if not isinstance(self.source_files, tuple):
-            object.__setattr__(self, "source_files", tuple(self.source_files))
-        for i, p in enumerate(self.source_files):
-            if not isinstance(p, str):
-                raise ValueError(f"source_files[{i}] must be str")
-        if not isinstance(self.time_range, TimeRangeUS):
-            raise ValueError("time_range must be TimeRangeUS")
-        _require_nonnegative_int(self.row_count, "row_count")
-        _require_nonnegative_int(self.label_count, "label_count")
-        if self.label_count > self.row_count:
-            raise ValueError("label_count must be <= row_count")
-
-
-@dataclass(frozen=True, slots=True)
-class SplitEntry:
-    role: SplitRole
-    segment_key: str
-    start_row: int
-    end_row: int
-    time_range: TimeRangeUS
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "role", _coerce_enum(SplitRole, self.role, "role"))
-        _require_nonempty_str(self.segment_key, "segment_key")
-        _require_nonnegative_int(self.start_row, "start_row")
-        _require_nonnegative_int(self.end_row, "end_row")
-        if not isinstance(self.time_range, TimeRangeUS):
-            raise ValueError("time_range must be TimeRangeUS")
-        if self.end_row < self.start_row:
-            raise ValueError("end_row must be >= start_row")
-
-
-@dataclass(frozen=True, slots=True)
-class SplitPlan:
-    entries: tuple[SplitEntry, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.entries, tuple):
-            object.__setattr__(self, "entries", tuple(self.entries))
-        if not self.entries:
-            raise ValueError("entries must be non-empty")
-        roles = {e.role for e in self.entries}
-        if SplitRole.TRAIN not in roles or SplitRole.VAL not in roles:
-            raise ValueError("entries must contain TRAIN and VAL roles")
-
-    def entries_for(self, role: SplitRole) -> tuple[SplitEntry, ...]:
-        role = _coerce_enum(SplitRole, role, "role")
-        return tuple(e for e in self.entries if e.role == role)
-
-    def roles_present(self) -> tuple[SplitRole, ...]:
-        seen: list[SplitRole] = []
-        for e in self.entries:
-            if e.role not in seen:
-                seen.append(e.role)
-        return tuple(seen)
-
-
-@dataclass(frozen=True, slots=True)
-class DatasetManifest:
-    schema: str
-    storage_format: StorageFormat
-    exchange: str
-    symbol: str
-    time_unit: TimeUnit
-    source_data_types: tuple[TardisDataType, ...]
-    label_spec: LabelSpec
-    lookback_rows: int
-    feature_schema: str
-    feature_names_hash: str
-    feature_dim: int
-    segments: tuple[SegmentSpec, ...]
-    split_plan: SplitPlan | None = None
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.schema, "schema")
-        object.__setattr__(self, "storage_format", _coerce_enum(StorageFormat, self.storage_format, "storage_format"))
-        if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US:
-            raise ValueError("storage_format must be FLAT_DECISION_ROWS_US")
-        _require_nonempty_str(self.exchange, "exchange")
-        _require_nonempty_str(self.symbol, "symbol")
-        object.__setattr__(self, "time_unit", _coerce_enum(TimeUnit, self.time_unit, "time_unit"))
-        if self.time_unit != TimeUnit.MICROSECOND:
-            raise ValueError("time_unit must be MICROSECOND")
-        if not isinstance(self.source_data_types, tuple):
-            object.__setattr__(self, "source_data_types", tuple(self.source_data_types))
-        if not self.source_data_types:
-            raise ValueError("source_data_types must be non-empty")
-        source_data_types = tuple(_coerce_enum(TardisDataType, d, "source_data_types") for d in self.source_data_types)
-        if len(set(source_data_types)) != len(source_data_types):
-            raise ValueError("source_data_types must not contain duplicates")
-        object.__setattr__(self, "source_data_types", source_data_types)
-        if not isinstance(self.label_spec, LabelSpec):
-            raise ValueError("label_spec must be LabelSpec")
-        _require_int_us(self.lookback_rows, "lookback_rows")
-        _require_nonempty_str(self.feature_schema, "feature_schema")
-        _require_nonempty_str(self.feature_names_hash, "feature_names_hash")
-        _require_int_us(self.feature_dim, "feature_dim")
-        if not isinstance(self.segments, tuple):
-            object.__setattr__(self, "segments", tuple(self.segments))
-        if not self.segments:
-            raise ValueError("segments must be non-empty")
-        for i, segment in enumerate(self.segments):
-            if not isinstance(segment, SegmentSpec):
-                raise ValueError(f"segments[{i}] must be SegmentSpec")
-        if self.split_plan is not None and not isinstance(self.split_plan, SplitPlan):
-            raise ValueError("split_plan must be SplitPlan or None")
-
-    @property
-    def total_rows(self) -> int:
-        return sum(seg.row_count for seg in self.segments)
-
-    @property
-    def total_labels(self) -> int:
-        return sum(seg.label_count for seg in self.segments)
-
-
 __all__ = [
     "TimeUnit",
     "TardisDataType",
-    "EventType",
     "BookSide",
     "AggressorSide",
     "DecisionReason",
@@ -646,23 +190,7 @@ __all__ = [
     "AsOfPolicy",
     "SplitRole",
     "StorageFormat",
-    "EventMeta",
-    "PriceLevel",
-    "BookSnapshotEvent",
-    "BookDeltaEvent",
-    "TradeEvent",
-    "BookTickerEvent",
-    "DerivativeTickerEvent",
-    "LiquidationEvent",
-    "MarketEvent",
-    "event_type",
-    "FeatureBuildResult",
-    "DecisionRowRef",
     "LabelSpec",
     "LabelResult",
     "TimeRangeUS",
-    "SegmentSpec",
-    "SplitEntry",
-    "SplitPlan",
-    "DatasetManifest",
 ]

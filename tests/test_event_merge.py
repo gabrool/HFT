@@ -3,7 +3,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from mmrt.contracts import EventType, TardisDataType
+from mmrt.contracts import TardisDataType
 from mmrt.data.event_merge import (
     EVENT_SEQ,
     EVENT_TYPE,
@@ -111,17 +111,13 @@ def test_event_merge_has_no_merged_parquet_writer_api():
 
 
 def test_event_type_mappings():
-    assert event_type_for_data_type(TardisDataType.BOOK_SNAPSHOT_25) == EventType.BOOK_SNAPSHOT
-    assert event_type_for_data_type(TardisDataType.BOOK_SNAPSHOT_5) == EventType.BOOK_SNAPSHOT
-    assert event_type_for_data_type(TardisDataType.INCREMENTAL_BOOK_L2) == EventType.BOOK_DELTA
-    assert event_type_for_data_type(TardisDataType.TRADES) == EventType.TRADE
-    assert event_type_for_data_type(TardisDataType.BOOK_TICKER) == EventType.BOOK_TICKER
-    assert event_type_for_data_type(TardisDataType.DERIVATIVE_TICKER) == EventType.DERIVATIVE_TICKER
-    assert event_type_for_data_type(TardisDataType.LIQUIDATIONS) == EventType.LIQUIDATION
+    assert event_type_for_data_type(TardisDataType.BOOK_SNAPSHOT_25) == "book_snapshot"
+    assert event_type_for_data_type(TardisDataType.INCREMENTAL_BOOK_L2) == "book_delta"
+    assert event_type_for_data_type(TardisDataType.TRADES) == "trade"
     with pytest.raises(ValueError):
-        event_type_for_data_type(TardisDataType.QUOTES)
+        event_type_for_data_type("quotes")
     with pytest.raises(ValueError):
-        event_type_for_data_type(TardisDataType.OPTIONS_CHAIN)
+        event_type_for_data_type("options_chain")
     assert event_type_code_for_data_type(TardisDataType.BOOK_SNAPSHOT_25) == EVENT_TYPE_CODE_BOOK_SNAPSHOT
     assert event_type_code_for_data_type(TardisDataType.INCREMENTAL_BOOK_L2) == EVENT_TYPE_CODE_BOOK_DELTA
     assert event_type_code_for_data_type(TardisDataType.TRADES) == EVENT_TYPE_CODE_TRADE
@@ -143,7 +139,8 @@ def test_parquet_event_stream_input_validation(tmp_path: Path):
     with pytest.raises(ValueError):
         ParquetEventStreamInput(TardisDataType.TRADES, path, 0, 123)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
-        parquet_event_stream_input(path, TardisDataType.QUOTES, 0)
+        parquet_event_stream_input(path, "quotes", 0)
+
 def test_validate_merge_input_schema_accepts_exact_schema(tmp_path: Path):
     inp = parquet_event_stream_input(_write_norm_parquet(tmp_path, "t.parquet", _trades_df([1])), TardisDataType.TRADES, 0)
     validate_merge_input_schema(inp)
@@ -182,7 +179,7 @@ def test_event_type_and_code_added_correctly(tmp_path: Path):
     t = parquet_event_stream_input(_write_norm_parquet(tmp_path, "t.parquet", _trades_df([20])), TardisDataType.TRADES, 1)
     s = parquet_event_stream_input(_write_norm_parquet(tmp_path, "s.parquet", _snapshot_df([10])), TardisDataType.BOOK_SNAPSHOT_25, 0)
     df = _stream_df([t, s])
-    assert df[EVENT_TYPE].to_list() == [EventType.BOOK_SNAPSHOT.value, EventType.TRADE.value]
+    assert df[EVENT_TYPE].to_list() == ["book_snapshot", "trade"]
     assert df[EVENT_TYPE_CODE].to_list() == [EVENT_TYPE_CODE_BOOK_SNAPSHOT, EVENT_TYPE_CODE_TRADE]
 
 
@@ -251,7 +248,7 @@ def test_reference_equivalence_to_small_global_sort(tmp_path: Path):
     prepared = []
     for dt, rank, df in frames:
         et = event_type_for_data_type(dt)
-        prepared.append(df.with_columns(pl.lit(rank).alias(MERGE_INPUT_RANK), pl.lit(et.value).alias(EVENT_TYPE), pl.lit(event_type_code_for_data_type(dt)).alias(EVENT_TYPE_CODE)).select([EVENT_TYPE_CODE, EVENT_TYPE, MERGE_INPUT_RANK, *expected_normalized_columns(dt)]))
+        prepared.append(df.with_columns(pl.lit(rank).alias(MERGE_INPUT_RANK), pl.lit(et).alias(EVENT_TYPE), pl.lit(event_type_code_for_data_type(dt)).alias(EVENT_TYPE_CODE)).select([EVENT_TYPE_CODE, EVENT_TYPE, MERGE_INPUT_RANK, *expected_normalized_columns(dt)]))
     reference = (
         pl.concat(prepared, how="diagonal_relaxed")
         .sort([LOCAL_TS_US, MERGE_INPUT_RANK, RAW_SOURCE_ROW], maintain_order=True)
