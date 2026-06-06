@@ -126,7 +126,7 @@ class ExecutionMetricAccumulator:
     turnover_penalty_total: float = 0.0
     cancel_penalty_total: float = 0.0
     terminal_penalty_total: float = 0.0
-    total_reward: float = 0.0
+    total_reward_raw: float = 0.0
 
     final_cash: float = 0.0
     final_inventory_qty: float = 0.0
@@ -191,7 +191,7 @@ class ExecutionMetricAccumulator:
         self.cancel_penalty_total += reward.cancel_penalty
         self.terminal_penalty_total += reward.terminal_penalty
         total_reward = reward.total_reward
-        self.total_reward += total_reward
+        self.total_reward_raw += total_reward
         self._reward_stat.update(total_reward)
 
         self.final_cash = step.position.cash
@@ -229,7 +229,7 @@ class ExecutionMetricAccumulator:
                 "events_processed_mean": self._events_per_step_stat.mean,
             },
             "rewards": {
-                "total": self.total_reward,
+                "total_raw": self.total_reward_raw,
                 "mean": self._reward_stat.mean,
                 "std": self._reward_stat.std,
                 "min": self._reward_stat.min_value,

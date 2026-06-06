@@ -187,7 +187,7 @@ def test_metrics_empty_summary():
 
     assert summary["steps"]["count"] == 0
     assert summary["fills"]["count"] == 0
-    assert summary["rewards"]["total"] == 0.0
+    assert summary["rewards"]["total_raw"] == 0.0
 
 
 def test_disabled_audit_runs_and_warns_no_fills(tmp_path):
@@ -246,6 +246,9 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
             decision_interval_us=250,
             max_order_qty=1.0,
             default_order_qty=1.0,
+            decision_compute_latency_us=0,
+            order_entry_latency_us=0,
+            cancel_latency_us=0,
             overwrite=True,
         )
     )
@@ -253,9 +256,9 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
     metrics = summary["metrics"]
     assert metrics["fills"]["count"] == 1
     assert metrics["fills"]["buy_count"] == 1
-    assert metrics["fills"]["reason_counts"][FillReason.TRADE_AT_LEVEL.value] == 1
+    assert metrics["fills"]["reason_counts"][FillReason.TRADE_THROUGH.value] == 1
     assert metrics["position"]["final_inventory_qty"] == pytest.approx(1.0)
-    assert metrics["rewards"]["total"] == pytest.approx(0.1)
+    assert metrics["rewards"]["total_raw"] == pytest.approx(0.005005)
 
 
 def test_diagnostics_errors_on_zero_steps():
@@ -274,7 +277,7 @@ def test_diagnostics_threshold_warnings():
     metrics["orders"]["cancel_rate_per_step"] = 2.0
     metrics["position"]["max_abs_inventory_qty"] = 5.0
     metrics["equity"]["max_drawdown"] = 3.0
-    metrics["rewards"]["total"] = -10.0
+    metrics["rewards"]["total_raw"] = -10.0
 
     report = diagnose_execution_metrics(
         metrics,

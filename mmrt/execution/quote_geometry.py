@@ -14,7 +14,8 @@ __all__ = [
     "QuoteGeometryConfig",
     "QuoteAction",
     "QuoteGeometryResult",
-    "raw_price_to_index",
+    "raw_bid_price_to_tick",
+    "raw_ask_price_to_tick",
     "raw_size_to_qty",
     "continuous_action_to_quote",
 ]
@@ -123,16 +124,16 @@ class QuoteGeometryResult:
     """Quote intent plus stable debug metadata for quote shaping decisions."""
 
     quote: QuoteIntent
-    bid_distance_ticks: int
-    ask_distance_ticks: int
+    bid_offset_ticks: int
+    ask_offset_ticks: int
     bid_disabled_reason: str = ""
     ask_disabled_reason: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.quote, QuoteIntent):
             raise ValueError("quote must be QuoteIntent")
-        _require_nonnegative_int(self.bid_distance_ticks, "bid_distance_ticks")
-        _require_nonnegative_int(self.ask_distance_ticks, "ask_distance_ticks")
+        _require_nonnegative_int(self.bid_offset_ticks, "bid_offset_ticks")
+        _require_nonnegative_int(self.ask_offset_ticks, "ask_offset_ticks")
         if not isinstance(self.bid_disabled_reason, str):
             raise ValueError("bid_disabled_reason must be str")
         if not isinstance(self.ask_disabled_reason, str):
@@ -141,8 +142,8 @@ class QuoteGeometryResult:
 def _disabled_result(bid_reason: str, ask_reason: str) -> QuoteGeometryResult:
     return QuoteGeometryResult(
         quote=QuoteIntent(False, False),
-        bid_distance_ticks=0,
-        ask_distance_ticks=0,
+        bid_offset_ticks=0,
+        ask_offset_ticks=0,
         bid_disabled_reason=bid_reason,
         ask_disabled_reason=ask_reason,
     )
@@ -238,8 +239,8 @@ def continuous_action_to_quote(
     bid_high = book_top.best_ask_tick - config.post_only_gap_ticks
     ask_low = book_top.best_bid_tick + config.post_only_gap_ticks
     ask_high = book_top.best_ask_tick + action_spec.max_distance_ticks - 1
-    bid_distance_ticks = 0
-    ask_distance_ticks = 0
+    bid_offset_ticks = 0
+    ask_offset_ticks = 0
 
     bid_enabled = action.bid_enabled
     ask_enabled = action.ask_enabled
@@ -275,7 +276,7 @@ def continuous_action_to_quote(
             bid_reason = _REASON_INVALID_GEOMETRY
         else:
             bid_price_tick = raw_bid_price_to_tick(action.bid_price_raw, book_top=book_top, action_spec=action_spec, config=config)
-            bid_distance_ticks = max(0, book_top.best_bid_tick - bid_price_tick + 1)
+            bid_offset_ticks = max(0, book_top.best_bid_tick - bid_price_tick + 1)
         if not bid_enabled:
             pass
         elif bid_price_tick <= 0 or bid_price_tick >= book_top.best_ask_tick:
@@ -303,7 +304,7 @@ def continuous_action_to_quote(
             ask_reason = _REASON_INVALID_GEOMETRY
         else:
             ask_price_tick = raw_ask_price_to_tick(action.ask_price_raw, book_top=book_top, action_spec=action_spec, config=config)
-            ask_distance_ticks = max(0, ask_price_tick - book_top.best_ask_tick + 1)
+            ask_offset_ticks = max(0, ask_price_tick - book_top.best_ask_tick + 1)
         if not ask_enabled:
             pass
         elif ask_price_tick <= 0 or ask_price_tick <= book_top.best_bid_tick:
@@ -350,8 +351,8 @@ def continuous_action_to_quote(
     )
     return QuoteGeometryResult(
         quote=quote,
-        bid_distance_ticks=bid_distance_ticks,
-        ask_distance_ticks=ask_distance_ticks,
+        bid_offset_ticks=bid_offset_ticks,
+        ask_offset_ticks=ask_offset_ticks,
         bid_disabled_reason=bid_reason if not bid_enabled else "",
         ask_disabled_reason=ask_reason if not ask_enabled else "",
     )

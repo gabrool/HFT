@@ -6,6 +6,7 @@ import pytest
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import (
     ActionSpec,
+    LatencyConfig,
     BookLevelSnapshot,
     BookTop,
     OrderSide,
@@ -122,7 +123,7 @@ def _env_config(**kwargs) -> ExecutionEnvConfig:
         decision_interval_us=100,
         action_spec=ActionSpec(max_distance_ticks=1, max_order_qty=1.0),
         quote_geometry_config=QuoteGeometryConfig(
-            min_distance_ticks=1,
+            post_only_gap_ticks=1,
             default_order_qty=1.0,
         ),
         fill_simulator_config=FillSimulatorConfig(
@@ -133,6 +134,7 @@ def _env_config(**kwargs) -> ExecutionEnvConfig:
             ),
             maker_fee_bps=0.0,
         ),
+        latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0, cancel_latency_us=0),
         reward_config=RewardConfig(),
     )
     base.update(kwargs)
@@ -291,13 +293,13 @@ def test_bid_trade_fill_updates_position_and_reward():
     assert len(step.fills) == 1
     fill = step.fills[0]
     assert fill.side == OrderSide.BUY
-    assert fill.price_tick == 1000
+    assert fill.price_tick == 1001
     assert fill.qty == pytest.approx(1.0)
     assert step.position.inventory_qty == pytest.approx(1.0)
-    assert step.position.cash == pytest.approx(-100.0)
+    assert step.position.cash == pytest.approx(-100.1)
 
-    assert step.execution.reward.raw_equity_delta == pytest.approx(0.1)
-    assert step.reward == pytest.approx(0.1)
+    assert step.execution.reward.raw_equity_delta == pytest.approx(0.0)
+    assert step.reward == pytest.approx(0.0)
 
 
 def test_ask_trade_fill_updates_short_position():
@@ -323,7 +325,7 @@ def test_ask_trade_fill_updates_short_position():
     assert len(step.fills) == 1
     assert step.fills[0].side == OrderSide.SELL
     assert step.position.inventory_qty == pytest.approx(-1.0)
-    assert step.position.cash == pytest.approx(100.2)
+    assert step.position.cash == pytest.approx(100.1)
 
 
 def test_l2_queue_decrease_advances_queue_without_artificial_fill():
@@ -358,7 +360,7 @@ def test_l2_queue_decrease_advances_queue_without_artificial_fill():
     assert len(env._state.live_orders) == 1
     order = env._state.live_orders[0]
     assert order.side == OrderSide.BUY
-    assert order.price_tick == 1000
+    assert order.price_tick == 1001
     assert order.queue_ahead_qty == pytest.approx(0.0)
     assert order.remaining_qty == pytest.approx(1.0)
 
@@ -376,7 +378,7 @@ def test_repeated_decision_cancels_previous_live_order():
     first = env.step(_bid_only_action())
     assert first.info["cancel_count"] == 0
 
-    second = env.step(_bid_only_action())
+    second = env.step(_ask_only_action())
     assert second.info["cancel_count"] == 1
 
 

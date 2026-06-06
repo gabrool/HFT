@@ -151,7 +151,7 @@ def diagnose_execution_metrics(
         warnings.append("max_abs_inventory_qty_exceeded")
     if config.max_drawdown_warn is not None and _number(metrics, "equity", "max_drawdown", 0.0) > config.max_drawdown_warn:
         warnings.append("max_drawdown_exceeded")
-    if config.min_total_reward_warn is not None and _number(metrics, "rewards", "total", 0.0) < config.min_total_reward_warn:
+    if config.min_total_reward_warn is not None and _number(metrics, "rewards", "total_raw", 0.0) < config.min_total_reward_warn:
         warnings.append("total_reward_below_threshold")
     if _number(metrics, "steps", "terminal_count", 0.0) == 0:
         warnings.append("episode_never_terminal")

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from mmrt.execution.contracts import ActionSpec, PositionState, QueueModelMode
+from mmrt.execution.contracts import ActionSpec, LatencyConfig, PositionState, QueueModelMode
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.execution_tape import load_execution_tape
@@ -76,14 +76,18 @@ def _require_positive_int(value: int, name: str) -> int:
     return value
 
 
-def _optional_nonnegative_int(value: int | None, name: str) -> int | None:
-    if value is None:
-        return None
+def _require_nonnegative_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an int or None")
+        raise ValueError(f"{name} must be an int")
     if value < 0:
         raise ValueError(f"{name} must be >= 0")
     return value
+
+
+def _optional_nonnegative_int(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_nonnegative_int(value, name)
 
 
 def _require_finite_float(value: float, name: str) -> float:
@@ -137,7 +141,7 @@ def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
         "mmap_mode": config.mmap_mode,
         "max_distance_ticks": config.max_distance_ticks,
         "max_order_qty": config.max_order_qty,
-        "min_distance_ticks": config.min_distance_ticks,
+        "post_only_gap_ticks": config.post_only_gap_ticks,
         "default_order_qty": config.default_order_qty,
         "action_size_raw": config.action_size_raw,
         "queue_mode": config.queue_mode.value,
@@ -145,11 +149,15 @@ def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
         "trade_at_level_weight": config.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
         "maker_fee_bps": config.maker_fee_bps,
+        "decision_compute_latency_us": config.decision_compute_latency_us,
+        "order_entry_latency_us": config.order_entry_latency_us,
+        "cancel_latency_us": config.cancel_latency_us,
         "inventory_penalty_bps": config.inventory_penalty_bps,
         "turnover_penalty_bps": config.turnover_penalty_bps,
         "cancel_penalty": config.cancel_penalty,
         "drawdown_penalty_rate": config.drawdown_penalty_rate,
         "terminal_inventory_penalty_bps": config.terminal_inventory_penalty_bps,
+        "reward_scale": config.reward_scale,
     }
 
 
@@ -168,22 +176,27 @@ class ExecutionSimAuditConfig:
 
     max_distance_ticks: int = 1
     max_order_qty: float = 0.001
-    min_distance_ticks: int = 1
+    post_only_gap_ticks: int = 1
     default_order_qty: float = 0.001
     action_size_raw: float = 100.0
 
-    queue_mode: QueueModelMode | str = QueueModelMode.BALANCED
-    l2_decrease_weight: float = 1.0
-    trade_at_level_weight: float = 1.0
-    unknown_level_queue_ahead_qty: float = 0.0
+    queue_mode: QueueModelMode | str = QueueModelMode.CONSERVATIVE
+    l2_decrease_weight: float = 0.25
+    trade_at_level_weight: float = 0.5
+    unknown_level_queue_ahead_qty: float = 1_000_000_000.0
 
     maker_fee_bps: float = -0.5
+
+    decision_compute_latency_us: int = 50
+    order_entry_latency_us: int = 500
+    cancel_latency_us: int = 500
 
     inventory_penalty_bps: float = 0.0
     turnover_penalty_bps: float = 0.0
     cancel_penalty: float = 0.0
     drawdown_penalty_rate: float = 0.0
     terminal_inventory_penalty_bps: float = 0.0
+    reward_scale: float = 1.0
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
@@ -201,7 +214,7 @@ class ExecutionSimAuditConfig:
             raise ValueError('mmap_mode must be None or "r"')
         _require_positive_int(self.max_distance_ticks, "max_distance_ticks")
         _require_positive_float(self.max_order_qty, "max_order_qty")
-        _require_positive_int(self.min_distance_ticks, "min_distance_ticks")
+        _require_positive_int(self.post_only_gap_ticks, "post_only_gap_ticks")
         _require_positive_float(self.default_order_qty, "default_order_qty")
         _require_finite_float(self.action_size_raw, "action_size_raw")
         object.__setattr__(self, "queue_mode", _coerce_queue_mode(self.queue_mode))
@@ -209,11 +222,15 @@ class ExecutionSimAuditConfig:
         _require_probability(self.trade_at_level_weight, "trade_at_level_weight")
         _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty")
         _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
+        _require_nonnegative_int(self.decision_compute_latency_us, "decision_compute_latency_us")
+        _require_nonnegative_int(self.order_entry_latency_us, "order_entry_latency_us")
+        _require_nonnegative_int(self.cancel_latency_us, "cancel_latency_us")
         _require_nonnegative_float(self.inventory_penalty_bps, "inventory_penalty_bps")
         _require_nonnegative_float(self.turnover_penalty_bps, "turnover_penalty_bps")
         _require_nonnegative_float(self.cancel_penalty, "cancel_penalty")
         _require_nonnegative_float(self.drawdown_penalty_rate, "drawdown_penalty_rate")
         _require_nonnegative_float(self.terminal_inventory_penalty_bps, "terminal_inventory_penalty_bps")
+        _require_positive_float(self.reward_scale, "reward_scale")
 
 
 def _default_linear_signals_npz(tape_root: str) -> Path:
@@ -260,8 +277,13 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
             max_order_qty=config.max_order_qty,
         ),
         quote_geometry_config=QuoteGeometryConfig(
-            post_only_gap_ticks=config.min_distance_ticks,
+            post_only_gap_ticks=config.post_only_gap_ticks,
             default_order_qty=config.default_order_qty,
+        ),
+        latency_config=LatencyConfig(
+            decision_compute_latency_us=config.decision_compute_latency_us,
+            order_entry_latency_us=config.order_entry_latency_us,
+            cancel_latency_us=config.cancel_latency_us,
         ),
         fill_simulator_config=FillSimulatorConfig(
             queue_model=QueueModelConfig(
@@ -278,6 +300,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
             cancel_penalty=config.cancel_penalty,
             drawdown_penalty_rate=config.drawdown_penalty_rate,
             terminal_inventory_penalty_bps=config.terminal_inventory_penalty_bps,
+            reward_scale=config.reward_scale,
         ),
         initial_position=PositionState(),
         max_episode_steps=config.max_steps,
@@ -342,19 +365,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-mmap", action="store_true")
     parser.add_argument("--max-distance-ticks", type=int, default=1)
     parser.add_argument("--max-order-qty", type=float, default=0.001)
-    parser.add_argument("--min-distance-ticks", type=int, default=1)
+    parser.add_argument("--post-only-gap-ticks", type=int, default=1)
     parser.add_argument("--default-order-qty", type=float, default=0.001)
     parser.add_argument("--action-size-raw", type=float, default=100.0)
-    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="balanced")
-    parser.add_argument("--l2-decrease-weight", type=float, default=1.0)
-    parser.add_argument("--trade-at-level-weight", type=float, default=1.0)
-    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=0.0)
+    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="conservative")
+    parser.add_argument("--l2-decrease-weight", type=float, default=0.25)
+    parser.add_argument("--trade-at-level-weight", type=float, default=0.5)
+    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=1000000000.0)
     parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
+    parser.add_argument("--decision-compute-latency-us", type=int, default=50)
+    parser.add_argument("--order-entry-latency-us", type=int, default=500)
+    parser.add_argument("--cancel-latency-us", type=int, default=500)
     parser.add_argument("--inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--turnover-penalty-bps", type=float, default=0.0)
     parser.add_argument("--cancel-penalty", type=float, default=0.0)
     parser.add_argument("--drawdown-penalty-rate", type=float, default=0.0)
     parser.add_argument("--terminal-inventory-penalty-bps", type=float, default=0.0)
+    parser.add_argument("--reward-scale", type=float, default=1.0)
     return parser
 
 
@@ -372,7 +399,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         mmap_mode=None if args.no_mmap else "r",
         max_distance_ticks=args.max_distance_ticks,
         max_order_qty=args.max_order_qty,
-        min_distance_ticks=args.min_distance_ticks,
+        post_only_gap_ticks=args.post_only_gap_ticks,
         default_order_qty=args.default_order_qty,
         action_size_raw=args.action_size_raw,
         queue_mode=args.queue_mode,
@@ -380,11 +407,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         trade_at_level_weight=args.trade_at_level_weight,
         unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
         maker_fee_bps=args.maker_fee_bps,
+        decision_compute_latency_us=args.decision_compute_latency_us,
+        order_entry_latency_us=args.order_entry_latency_us,
+        cancel_latency_us=args.cancel_latency_us,
         inventory_penalty_bps=args.inventory_penalty_bps,
         turnover_penalty_bps=args.turnover_penalty_bps,
         cancel_penalty=args.cancel_penalty,
         drawdown_penalty_rate=args.drawdown_penalty_rate,
         terminal_inventory_penalty_bps=args.terminal_inventory_penalty_bps,
+        reward_scale=args.reward_scale,
     )
     summary = run_execution_sim_audit(config)
     print(json.dumps(summary, sort_keys=True, separators=(",", ":")))

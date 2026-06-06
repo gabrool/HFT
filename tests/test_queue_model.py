@@ -74,7 +74,7 @@ def test_queue_model_config_validation():
 
 def test_estimate_initial_queue_ahead():
     assert estimate_initial_queue_ahead(2.5) == 2.5
-    assert estimate_initial_queue_ahead(None) == 0.0
+    assert estimate_initial_queue_ahead(None) == 1_000_000_000.0
     assert estimate_initial_queue_ahead(None, config=QueueModelConfig(unknown_level_queue_ahead_qty=3.0)) == 3.0
 
     with pytest.raises(ValueError):
@@ -113,6 +113,7 @@ def test_classify_trade_against_ask_order():
 def test_trade_at_level_advances_queue_without_fill_when_queue_remains():
     update = update_queue_position(
         _order(queue_ahead_qty=2.0, remaining_qty=1.0),
+        config=QueueModelConfig(mode=QueueModelMode.BALANCED, trade_at_level_weight=1.0),
         trade=_trade(side=AggressorSide.SELL, price_tick=1000, amount=0.5),
     )
 
@@ -129,6 +130,7 @@ def test_trade_at_level_advances_queue_without_fill_when_queue_remains():
 def test_trade_at_level_leftover_becomes_fillable():
     update = update_queue_position(
         _order(queue_ahead_qty=0.5, remaining_qty=1.0),
+        config=QueueModelConfig(mode=QueueModelMode.BALANCED, trade_at_level_weight=1.0),
         trade=_trade(side=AggressorSide.SELL, price_tick=1000, amount=0.75),
     )
 
@@ -192,7 +194,7 @@ def test_balanced_mode_l2_decrease_advances_queue():
 def test_balanced_l2_decrease_beyond_queue_creates_fillable_signal():
     update = update_queue_position(
         _order(queue_ahead_qty=0.5, remaining_qty=1.0),
-        config=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0),
+        config=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0, trade_at_level_weight=1.0),
         prev_level_qty=5.0,
         curr_level_qty=4.0,
     )
@@ -218,7 +220,7 @@ def test_l2_increase_does_not_worsen_queue():
 def test_combined_trade_and_l2_applies_trade_first():
     update = update_queue_position(
         _order(queue_ahead_qty=2.0, remaining_qty=1.0),
-        config=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0),
+        config=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0, trade_at_level_weight=1.0),
         trade=_trade(side=AggressorSide.SELL, price_tick=1000, amount=1.0),
         prev_level_qty=5.0,
         curr_level_qty=4.0,

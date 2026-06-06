@@ -26,7 +26,8 @@ def test_entry_delay_zero_uses_decision_event_key():
     b.observe_price_local(1_000_000, 0, 100.0)
     b.on_decision_local(1_000_000, 0)
     b.observe_price_local(1_000_000, 1, 200.0)
-    out = b.observe_price_local(1_000_100, 2, 110.0)
+    assert b.observe_price_local(1_000_100, 2, 110.0) == []
+    out = b.observe_price_local(1_000_101, 3, 110.0)
     assert len(out) == 1
     assert out[0].values_bps[0] == pytest.approx(10_000.0 * math.log(110.0 / 100.0))
 
@@ -38,7 +39,8 @@ def test_entry_delay_positive_can_use_future_timestamp_last_event():
     b.on_decision_local(1_000_000, 0)
     b.observe_price_local(1_000_100, 1, 101.0)
     b.observe_price_local(1_000_100, 2, 102.0)
-    out = b.observe_price_local(1_000_200, 3, 104.0)
+    assert b.observe_price_local(1_000_200, 3, 104.0) == []
+    out = b.observe_price_local(1_000_201, 4, 104.0)
     assert out[0].values_bps[0] == pytest.approx(10_000.0 * math.log(104.0 / 102.0))
 
 
@@ -65,4 +67,5 @@ def test_vectorized_matches_incremental_builder():
     out = []
     for t, q, p in zip(pts, pseq, vals, strict=True):
         out.extend(b.observe_price_local(int(t), int(q), float(p)))
+    out.extend(b.finalize_at_eof())
     assert np.allclose(labels[valid], np.array([r.values_bps for r in out]))

@@ -77,18 +77,18 @@ def test_label_spec_rejects_invalid(kwargs):
 
 
 def test_label_result_validation():
-    r = LabelResult(decision_ts_us=100, entry_ts_us=101, horizons_us=(10, 20), values_bps=(1.5, -2.0))
+    r = LabelResult(decision_ts_us=100, decision_event_seq=0, entry_ts_us=101, horizons_us=(10, 20), values_bps=(1.5, -2.0))
     assert r.values_bps == (1.5, -2.0)
 
     with pytest.raises(ValueError):
-        LabelResult(100, 99, (10,), (0.0,))
+        LabelResult(100, 0, 99, (10,), (0.0,))
     with pytest.raises(ValueError):
-        LabelResult(100, 100, (), ())
+        LabelResult(100, 0, 100, (), ())
     with pytest.raises(ValueError):
-        LabelResult(100, 100, (20, 10), (0.0, 0.0))
+        LabelResult(100, 0, 100, (20, 10), (0.0, 0.0))
     with pytest.raises(ValueError):
-        LabelResult(100, 100, (10, 10), (0.0, 0.0))
+        LabelResult(100, 0, 100, (10, 10), (0.0, 0.0))
     with pytest.raises(ValueError):
-        LabelResult(100, 100, (10,), (0.0, 1.0))
+        LabelResult(100, 0, 100, (10,), (0.0, 1.0))
     with pytest.raises(ValueError):
-        LabelResult(100, 100, (10,), (math.inf,))
+        LabelResult(100, 0, 100, (10,), (math.inf,))

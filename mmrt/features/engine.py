@@ -31,7 +31,7 @@ from mmrt.features.specs import (
     feature_spec_by_name,
 )
 
-BOOK_EVENT_CODE = 1
+L2_EVENT_CODE = 1
 TRADE_EVENT_CODE = 2
 
 DECISION_STRIDE_US = 500_000
@@ -240,7 +240,7 @@ class FeatureEngine:
     def on_book_snapshot(self, snapshot: BookSnapshotInput) -> EngineDecision | None:
         if not isinstance(snapshot, BookSnapshotInput): raise TypeError("snapshot")
         self._validate_event_time(snapshot.local_ts_us)
-        self.event_history.append(snapshot.local_ts_us, BOOK_EVENT_CODE)
+        self.event_history.append(snapshot.local_ts_us, L2_EVENT_CODE)
         self.book_state.apply_snapshot(snapshot)
         self.last_event_local_ts_us = snapshot.local_ts_us
         if not self.is_ready(): return None
@@ -375,7 +375,7 @@ def engine_owned_feature_indices() -> tuple[int, ...]: return ENGINE_FEATURE_IND
 
 
 __all__ = [
-    "BOOK_EVENT_CODE", "TRADE_EVENT_CODE", "DECISION_STRIDE_US", "ENGINE_EVENT_WINDOWS_US", "DEFAULT_EVENT_HISTORY_CAPACITY",
+    "L2_EVENT_CODE", "TRADE_EVENT_CODE", "DECISION_STRIDE_US", "ENGINE_EVENT_WINDOWS_US", "DEFAULT_EVENT_HISTORY_CAPACITY",
     "CROSS_FEATURE_INDICES", "CROSS_FEATURE_NAMES", "EVENT_CONTEXT_FEATURE_INDICES", "EVENT_CONTEXT_FEATURE_NAMES",
     "ENGINE_FEATURE_INDICES", "ENGINE_FEATURE_NAMES", "FeatureEngineConfig", "EngineDecision", "EventHistory", "FeatureEngine",
     "cross_feature_names", "cross_feature_indices", "event_context_feature_names", "event_context_feature_indices",

@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from mmrt.features import specs
 from mmrt.features.specs import FeatureFamily, FeatureOwner, FeatureSource, TransformKey
 
@@ -49,10 +51,11 @@ def test_feature_registry_has_no_retired_name_layer():
 
 
 def test_infer_windows_us_from_current_name():
-    assert specs.infer_windows_us_from_name("foo_200000us") == (200_000,)
-    assert specs.infer_windows_us_from_name("foo_200000us_minus_1000000us") == (200_000, 1_000_000)
-    assert specs.infer_windows_us_from_name("spread_bps") == ()
-
+    assert specs.infer_windows_us_from_name("trade_count_per_second_200000us") == (200_000,)
+    assert specs.infer_windows_us_from_name("mid_slope_bps_per_sec_1000000us") == (1_000_000,)
+    assert specs.infer_windows_us_from_name("near_touch_depth_drop_asymmetry") == ()
+    with pytest.raises(ValueError):
+        specs.infer_windows_us_from_name("foo_200000us")
 
 def test_active_registry_matches_current_feature_subset_union():
     from mmrt.linear import head_feature_presets as hp

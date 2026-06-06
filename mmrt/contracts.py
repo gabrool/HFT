@@ -141,12 +141,16 @@ class LabelSpec:
 @dataclass(frozen=True, slots=True)
 class LabelResult:
     decision_ts_us: int
+    decision_event_seq: int
     entry_ts_us: int
     horizons_us: tuple[int, ...]
     values_bps: tuple[float, ...]
 
     def __post_init__(self) -> None:
         _require_int_us(self.decision_ts_us, "decision_ts_us")
+        _require_int_us(self.decision_event_seq, "decision_event_seq", allow_zero=True)
+        if self.decision_event_seq < 0:
+            raise ValueError("decision_event_seq must be >= 0")
         _require_int_us(self.entry_ts_us, "entry_ts_us")
         if self.entry_ts_us < self.decision_ts_us:
             raise ValueError("entry_ts_us must be >= decision_ts_us")

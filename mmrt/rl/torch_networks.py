@@ -147,8 +147,9 @@ class PolicyAction(NamedTuple):
     log_prob: torch.Tensor
     entropy: torch.Tensor
     value: torch.Tensor
-    action_mean: torch.Tensor
-    action_log_std: torch.Tensor
+    enable_prob: torch.Tensor
+    continuous_mean: torch.Tensor
+    continuous_log_std: torch.Tensor
 
 
 class PolicyEvaluation(NamedTuple):
@@ -319,9 +320,16 @@ class ActorCriticNetwork(nn.Module):
             continuous, output.continuous_mean, output.continuous_log_std
         )
         entropy = _bernoulli_entropy(output.enable_logits).sum(dim=-1) + diagonal_gaussian_entropy(output.continuous_log_std)
-        action_mean = torch.cat((torch.sigmoid(output.enable_logits), output.continuous_mean), dim=-1)
-        action_log_std = torch.cat((torch.zeros_like(output.enable_logits), output.continuous_log_std), dim=-1)
-        return PolicyAction(action, log_prob, entropy, output.value, action_mean, action_log_std)
+        enable_prob = torch.sigmoid(output.enable_logits)
+        return PolicyAction(
+            action=action,
+            log_prob=log_prob,
+            entropy=entropy,
+            value=output.value,
+            enable_prob=enable_prob,
+            continuous_mean=output.continuous_mean,
+            continuous_log_std=output.continuous_log_std,
+        )
 
     def evaluate_actions(
         self,

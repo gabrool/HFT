@@ -520,8 +520,10 @@ class ExecutionEnv:
         for order in tuple(updated_orders):
             if not order.is_live:
                 continue
-            prev_qty = self._level_qty(book_ptr=state.current_book_ptr, side=order.side, price_tick=order.price_tick)
-            curr_qty = self._level_qty(book_ptr=curr_book_ptr, side=order.side, price_tick=order.price_tick)
+            prev_qty, prev_known = self._level_qty_with_depth_status(book_ptr=state.current_book_ptr, side=order.side, price_tick=order.price_tick)
+            curr_qty, curr_known = self._level_qty_with_depth_status(book_ptr=curr_book_ptr, side=order.side, price_tick=order.price_tick)
+            if not (prev_known and curr_known):
+                continue
             result = simulate_l2_level_update(
                 updated_orders,
                 side=order.side,
@@ -570,6 +572,14 @@ class ExecutionEnv:
         if not active:
             return False
         return min(active) <= price_tick <= max(active)
+
+    def _level_qty_with_depth_status(self, *, book_ptr: int, side: OrderSide, price_tick: int) -> tuple[float | None, bool]:
+        level = self._level_qty(book_ptr=book_ptr, side=side, price_tick=price_tick)
+        if level is not None:
+            return level, True
+        if self._price_within_known_depth(book_ptr=book_ptr, side=side, price_tick=price_tick):
+            return 0.0, True
+        return None, False
 
     def _level_qty(self, *, book_ptr: int, side: OrderSide, price_tick: int) -> float | None:
         if side == OrderSide.BUY:
