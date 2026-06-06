@@ -9,6 +9,7 @@ from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, ExecutionEventRef, ExecutionEventType, SymbolSpec, TradePrint
 from mmrt.execution.event_merge import MergedExecutionEvent, merge_execution_events
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
+from mmrt.metadata.rule_compatibility import RuleCompatibilityMode, RuleCompatibilityReport
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import (
     EVENT_DTYPE,
@@ -111,6 +112,25 @@ def _basic_tape():
     plan = merge_execution_events(l2, trades)
     return build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=trades, merged_events=plan.events)
 
+
+def _compat_report():
+    return RuleCompatibilityReport(
+        mode=RuleCompatibilityMode.WARN,
+        price_count=3,
+        price_grid_violation_count=1,
+        price_grid_violation_fraction=1 / 3,
+        max_abs_price_residual_ticks=0.5,
+        qty_count=2,
+        qty_grid_violation_count=0,
+        qty_grid_violation_fraction=0.0,
+        max_abs_qty_residual_steps=0.0,
+        min_price_seen=100.0,
+        max_price_seen=101.0,
+        min_qty_seen=0.001,
+        max_qty_seen=0.01,
+        examples=({"kind": "price", "value": 100.05, "residual": 0.5, "source": "l2.price"},),
+        status="warning",
+    )
 
 
 def _arrays_with(tape, **overrides):
@@ -439,6 +459,27 @@ def test_manifest_json_helpers_round_trip():
 
     assert restored == tape.manifest
     assert json.loads(json.dumps(payload))["tape_format"] == "l2_trades_arrays"
+
+
+
+def test_manifest_roundtrip_preserves_symbol_rule_compatibility_report():
+    l2 = [_l2(100, seq=0), _l2(300, seq=1)]
+    trades = [_trade(200, idx=0)]
+    plan = merge_execution_events(l2, trades)
+    tape = build_execution_tape(
+        symbol_spec=_spec(),
+        symbol_rules=_rules(),
+        symbol_rule_compatibility=_compat_report(),
+        l2_events=l2,
+        trades=trades,
+        merged_events=plan.events,
+    )
+
+    payload = execution_tape_manifest_to_dict(tape.manifest)
+    restored = execution_tape_manifest_from_dict(payload)
+
+    assert restored.symbol_rule_compatibility == tape.manifest.symbol_rule_compatibility
+    assert payload["symbol_rule_compatibility"]["status"] == "warning"
 
 
 def test_execution_tape_arrays_reject_invalid_event_pointers():

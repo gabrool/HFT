@@ -1,4 +1,5 @@
 import csv
+import dataclasses
 import json
 from pathlib import Path
 
@@ -90,6 +91,39 @@ def _good_trade_rows() -> list[dict[str, object]]:
     ]
 
 
+def _off_grid_l2_rows() -> list[dict[str, object]]:
+    rows = _good_l2_rows()
+    rows[0] = dict(rows[0], price=100.05)
+    return rows
+
+
+def _exchange_info_path(tmp_path: Path) -> str:
+    payload = {
+        "symbols": [
+            {
+                "symbol": "BTCUSDT",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+                "marginAsset": "USDT",
+                "contractType": "PERPETUAL",
+                "status": "TRADING",
+                "pricePrecision": 999,
+                "quantityPrecision": 999,
+                "orderTypes": ["LIMIT", "MARKET"],
+                "timeInForce": ["GTC", "GTX"],
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.1", "minPrice": "0.1", "maxPrice": "1000000"},
+                    {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001", "maxQty": "100"},
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                ],
+            }
+        ]
+    }
+    path = tmp_path / "exchangeInfo.json"
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return str(path)
+
+
 def test_build_execution_tape_from_csv_inputs(tmp_path):
     l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
     trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
@@ -119,9 +153,120 @@ def test_build_execution_tape_from_csv_inputs(tmp_path):
     assert loaded.manifest.num_trades == summary["tape"]["num_trades"]
     assert loaded.manifest.num_events == summary["tape"]["num_events"]
     assert loaded.manifest.num_decisions == 0
+    assert summary["market"]["symbol_rules_mode"] == loaded.manifest.symbol_rules.mode.value
+    assert summary["market"]["symbol_rules_source"] == loaded.manifest.symbol_rules.source
+    assert summary["market"]["symbol_rules_source_sha256"] == loaded.manifest.symbol_rules.source_sha256
+    assert summary["market"]["symbol_rules_captured_at_utc"] == loaded.manifest.symbol_rules.captured_at_utc
+    assert summary["symbol_rules"]["symbol"] == "BTCUSDT"
+    assert summary["symbol_rules"]["tick_size"] == "0.1"
+    assert summary["symbol_rule_compatibility"]["mode"] == "warn"
+    assert "price_grid_violation_count" in summary["symbol_rule_compatibility"]
     assert summary["tape"]["book_depth"] == 25
     assert loaded.arrays.book_bid_ticks.shape[1] == 25
     assert loaded.arrays.book_ask_ticks.shape[1] == 25
+
+
+
+def test_build_summary_reports_actual_symbol_rules_mode_from_artifact(tmp_path):
+    rules = dataclasses.replace(_rules(), mode=SymbolRuleMode.USER_SUPPLIED_RULES)
+    rules_path = tmp_path / "rules.json"
+    write_symbol_rules_json(rules_path, rules, overwrite=True)
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+
+    summary = build_execution_tape_from_config(
+        ExecutionTapeBuildConfig(
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(tmp_path / "tape"),
+            symbol_rules_json=str(rules_path),
+        )
+    )
+
+    loaded = load_execution_tape(tmp_path / "tape")
+    assert summary["market"]["symbol_rules_mode"] == "user_supplied_rules"
+    assert loaded.manifest.symbol_rules.mode == SymbolRuleMode.USER_SUPPLIED_RULES
+    assert summary["market"]["symbol_rules_source"] == loaded.manifest.symbol_rules.source
+    assert summary["market"]["symbol_rules_source_sha256"] == loaded.manifest.symbol_rules.source_sha256
+    assert summary["market"]["symbol_rules_captured_at_utc"] == loaded.manifest.symbol_rules.captured_at_utc
+
+
+def test_build_execution_tape_from_exchange_info_json(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+
+    summary = build_execution_tape_from_config(
+        ExecutionTapeBuildConfig(
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(tmp_path / "tape"),
+            exchange_info_json=_exchange_info_path(tmp_path),
+        )
+    )
+
+    loaded = load_execution_tape(tmp_path / "tape")
+    assert loaded.manifest.symbol_rules.source == "binance_usdm_exchange_info"
+    assert len(loaded.manifest.symbol_rules.source_sha256) == 64
+    assert loaded.manifest.symbol_rules.tick_size == Decimal("0.1")
+    assert summary["symbol_rules"]["source"] == "binance_usdm_exchange_info"
+    assert summary["market"]["symbol_rules_mode"] == loaded.manifest.symbol_rules.mode.value
+
+
+def test_build_execution_tape_warn_mode_records_grid_violation_without_failing(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _off_grid_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+
+    summary = build_execution_tape_from_config(
+        _config(
+            tmp_path,
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(tmp_path / "warn_tape"),
+            symbol_rule_compatibility_mode="warn",
+        )
+    )
+
+    assert summary["symbol_rule_compatibility"]["status"] == "warning"
+    assert summary["symbol_rule_compatibility"]["price_grid_violation_count"] >= 1
+    loaded = load_execution_tape(tmp_path / "warn_tape")
+    assert loaded.manifest.symbol_rule_compatibility.status == "warning"
+
+
+def test_build_execution_tape_strict_mode_rejects_grid_violation(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _off_grid_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+
+    with pytest.raises(ValueError, match="strict mode"):
+        build_execution_tape_from_config(
+            _config(
+                tmp_path,
+                l2_inputs=(str(l2_path),),
+                trade_inputs=(str(trade_path),),
+                output_root=str(tmp_path / "strict_tape"),
+                symbol_rule_compatibility_mode="strict",
+            )
+        )
+
+    assert not (tmp_path / "strict_tape" / "manifest.json").exists()
+
+
+def test_build_execution_tape_off_mode_omits_compatibility_report(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _off_grid_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+
+    summary = build_execution_tape_from_config(
+        _config(
+            tmp_path,
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(tmp_path / "off_tape"),
+            symbol_rule_compatibility_mode="off",
+        )
+    )
+
+    assert summary["symbol_rule_compatibility"] is None
+    loaded = load_execution_tape(tmp_path / "off_tape")
+    assert loaded.manifest.symbol_rule_compatibility is None
 
 
 def test_event_ordering_and_tie_policy(tmp_path):
