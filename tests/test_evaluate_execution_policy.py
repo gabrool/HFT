@@ -711,3 +711,23 @@ def test_evaluate_modules_do_not_import_forbidden_layers():
         "update_ppo",
     ):
         assert text not in cli_source
+
+
+def test_parser_can_disable_l2_trade_dedupe():
+    from mmrt.cli.evaluate_execution_policy import build_arg_parser, _env_config_from_cli_config, _config_from_args
+
+    parser = build_arg_parser()
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--checkpoint-path", "/tmp/ckpt.pt", "--no-dedupe-l2-decrease-with-trade-prints"])
+    config = _config_from_args(args)
+    env_config = _env_config_from_cli_config(config)
+    assert config.dedupe_l2_decrease_with_trade_prints is False
+    assert env_config.fill_simulator_config.queue_model.dedupe_l2_decrease_with_trade_prints is False
+
+
+def test_parser_dedupe_l2_trade_default_enabled():
+    from mmrt.cli.evaluate_execution_policy import build_arg_parser, _config_from_args
+
+    parser = build_arg_parser()
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--checkpoint-path", "/tmp/ckpt.pt"])
+    config = _config_from_args(args)
+    assert config.dedupe_l2_decrease_with_trade_prints is True

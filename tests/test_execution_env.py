@@ -204,6 +204,29 @@ def _linear_signals(tape, n_rows: int = 16, *, start_event_index: int = 0) -> Li
     )
 
 
+def _linear_signals_for_decisions(tape, decision_event_index, decision_local_ts_us):
+    arrays = _signal_arrays(max(len(decision_event_index), 2))
+    metadata = LinearSignalArtifactMetadata(
+        tape_schema=tape.manifest.schema,
+        exchange=tape.manifest.exchange,
+        symbol=tape.manifest.symbol,
+        num_events=tape.manifest.num_events,
+        num_l2_batches=tape.manifest.num_l2_batches,
+        num_trades=tape.manifest.num_trades,
+        start_local_ts_us=tape.manifest.start_local_ts_us,
+        end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_interval_us=100,
+        start_event_index=0,
+        n_rows=len(decision_event_index),
+    )
+    return LinearSignalArtifact(
+        arrays=arrays,
+        metadata=metadata,
+        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
+        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+    )
+
+
 def _bid_only_action() -> QuoteAction:
     return QuoteAction(
         bid_enabled=True,
@@ -590,3 +613,215 @@ def test_unknown_trade_side_does_not_fill():
 
     assert step.fills == ()
     assert step.position == PositionState()
+
+
+def test_post_only_safe_at_decision_but_marketable_at_activation_is_rejected():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+        _l2(seq=1, local_ts_us=150, bid_ticks=(999,), bid_sizes=(1.0,), ask_ticks=(1001,), ask_sizes=(1.0,)),
+        _l2(seq=2, local_ts_us=300, bid_ticks=(999,), bid_sizes=(1.0,), ask_ticks=(1001,), ask_sizes=(1.0,)),
+    ]
+    trades = [
+        _trade(local_ts_us=200, side=AggressorSide.SELL, price_tick=1001, amount=10.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 2], [100, 150]),
+        config=_env_config(
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=50,
+                cancel_latency_us=0,
+            )
+        ),
+    )
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert step.info["post_only_reject_count"] == 1
+    assert step.fills == ()
+    assert step.info["orders_live_count"] == 0
+
+
+def test_activation_at_exact_event_key_does_not_fill_on_that_event():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+        _l2(seq=1, local_ts_us=160, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+    ]
+    trades = [
+        _trade(local_ts_us=150, side=AggressorSide.SELL, price_tick=1001, amount=10.0, source_row=0),
+        _trade(local_ts_us=170, side=AggressorSide.SELL, price_tick=1001, amount=10.0, source_row=1),
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 160]),
+        config=_env_config(
+            decision_interval_us=200,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=50,
+                cancel_latency_us=0,
+            ),
+        ),
+    )
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert len(step.fills) == 1
+    assert step.fills[0].local_ts_us == 170
+    assert step.fills[0].event_seq > 0
+
+
+def test_cancel_exact_event_key_blocks_fill_on_that_event():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=200),
+        _l2(seq=2, local_ts_us=300),
+    ]
+    trades = [
+        _trade(local_ts_us=250, side=AggressorSide.SELL, price_tick=1001, amount=10.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals(tape),
+        config=_env_config(
+            decision_interval_us=50,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=0,
+                cancel_latency_us=50,
+            ),
+        ),
+    )
+    env.reset()
+
+    first = env.step(_bid_only_action())
+    assert first.info["orders_live_count"] >= 1
+
+    second = env.step(_disabled_action())
+
+    assert second.info["effective_cancel_count"] >= 1
+    assert second.fills == ()
+
+
+def test_repeated_same_quote_before_activation_preserves_pending_new_order():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=150),
+        _l2(seq=2, local_ts_us=200),
+        _l2(seq=3, local_ts_us=500),
+    ]
+    tape = _tape(l2_events, [])
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals(tape),
+        config=_env_config(
+            decision_interval_us=25,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=300,
+                cancel_latency_us=0,
+            ),
+        ),
+    )
+    env.reset()
+
+    first = env.step(_bid_only_action())
+    assert first.info["cancel_count"] == 0
+    first_orders = tuple(env._state.live_orders)
+    assert len(first_orders) == 1
+    order_id = first_orders[0].order_id
+    effective_key = first_orders[0].effective_key
+
+    second = env.step(_bid_only_action())
+    assert second.info["cancel_count"] == 0
+    assert len(env._state.live_orders) == 1
+    assert env._state.live_orders[0].order_id == order_id
+    assert env._state.live_orders[0].effective_key == effective_key
+
+
+def test_balanced_mode_trade_l2_dedupe_enabled_vs_disabled():
+    l2_events = [
+        _l2(
+            seq=0,
+            local_ts_us=100,
+            bid_ticks=(1001,),
+            bid_sizes=(1.0,),
+            ask_ticks=(1003,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=1,
+            local_ts_us=160,
+            bid_ticks=(1001,),
+            bid_sizes=(0.5,),
+            ask_ticks=(1003,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=2,
+            local_ts_us=300,
+            bid_ticks=(1001,),
+            bid_sizes=(0.5,),
+            ask_ticks=(1003,),
+            ask_sizes=(1.0,),
+        ),
+    ]
+    trades = [
+        _trade(local_ts_us=150, side=AggressorSide.SELL, price_tick=1001, amount=0.5, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+
+    enabled_config = _env_config(
+        fill_simulator_config=FillSimulatorConfig(
+            queue_model=QueueModelConfig(
+                mode=QueueModelMode.BALANCED,
+                l2_decrease_weight=1.0,
+                trade_at_level_weight=1.0,
+                dedupe_l2_decrease_with_trade_prints=True,
+            ),
+            maker_fee_bps=0.0,
+        )
+    )
+    enabled_env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=enabled_config)
+    enabled_env.reset()
+    enabled_step = enabled_env.step(QuoteAction(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_raw=-100.0,
+        ask_price_raw=0.0,
+        bid_size_raw=100.0,
+        ask_size_raw=0.0,
+    ))
+
+    disabled_config = _env_config(
+        fill_simulator_config=FillSimulatorConfig(
+            queue_model=QueueModelConfig(
+                mode=QueueModelMode.BALANCED,
+                l2_decrease_weight=1.0,
+                trade_at_level_weight=1.0,
+                dedupe_l2_decrease_with_trade_prints=False,
+            ),
+            maker_fee_bps=0.0,
+        )
+    )
+    disabled_env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=disabled_config)
+    disabled_env.reset()
+    disabled_step = disabled_env.step(QuoteAction(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_raw=-100.0,
+        ask_price_raw=0.0,
+        bid_size_raw=100.0,
+        ask_size_raw=0.0,
+    ))
+
+    assert enabled_step.info["l2_trade_dedupe_qty"] == pytest.approx(0.5)
+    assert enabled_step.info["l2_effective_decrease_qty"] == pytest.approx(0.0)
+    assert disabled_step.info["l2_trade_dedupe_qty"] == pytest.approx(0.0)
+    assert disabled_step.info["l2_effective_decrease_qty"] == pytest.approx(0.5)

@@ -46,3 +46,16 @@ def test_no_stale_execution_migration_tokens_in_production():
                     if token in line:
                         offenders.append(f"{path}:{line_no}: {line.strip()}")
     assert offenders == []
+
+
+def test_dedupe_cli_flag_exposed_in_relevant_clis():
+    paths = [
+        Path("mmrt/cli/audit_execution_sim.py"),
+        Path("mmrt/cli/train_execution_ppo.py"),
+        Path("mmrt/cli/evaluate_execution_policy.py"),
+        Path("mmrt/cli/train_adverse_selection.py"),
+    ]
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "--no-dedupe-l2-decrease-with-trade-prints" in text
+        assert "dedupe_l2_decrease_with_trade_prints=not args.no_dedupe_l2_decrease_with_trade_prints" in text
