@@ -15,7 +15,6 @@ from mmrt.contracts import TardisDataType
 from mmrt.data.tardis_csv import (
     BOOK_SIDE_ASK,
     BOOK_SIDE_BID,
-    BOOK_SIDE_UNKNOWN,
     LOCAL_TS_US,
     RAW_SOURCE_ROW,
     SIDE_BUY,
@@ -250,7 +249,7 @@ def analyze_normalized_lazyframe(
         m = lf.select([
             (pl.col("price").is_null() | (pl.col("price") <= 0)).sum().alias("invalid_price"),
             (pl.col("amount").is_null() | (pl.col("amount") < 0)).sum().alias("invalid_amount"),
-            (pl.col("book_side_code").is_null() | ~pl.col("book_side_code").is_in([BOOK_SIDE_BID, BOOK_SIDE_UNKNOWN, BOOK_SIDE_ASK])).sum().alias("invalid_book_side_code"),
+            (pl.col("book_side_code").is_null() | ~pl.col("book_side_code").is_in([BOOK_SIDE_BID, BOOK_SIDE_ASK])).sum().alias("invalid_book_side_code"),
             pl.col("is_snapshot").is_null().sum().alias("null_is_snapshot"),
             (pl.col("is_snapshot") == True).sum().alias("snapshot_marker_count"),
         ]).collect().row(0, named=True)

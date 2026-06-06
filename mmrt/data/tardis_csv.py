@@ -22,7 +22,6 @@ SIDE_UNKNOWN = 0
 SIDE_BUY = 1
 SIDE_SELL = -1
 
-BOOK_SIDE_UNKNOWN = 0
 BOOK_SIDE_BID = 1
 BOOK_SIDE_ASK = -1
 
@@ -120,29 +119,64 @@ def normalized_column_renames(schema: TardisCSVSchema) -> dict[str, str]:
     return renames
 
 
+def _normalized_str_expr(column: str) -> pl.Expr:
+    return pl.col(column).cast(pl.Utf8).str.strip_chars().str.to_lowercase()
+
+
+def _invalid_trade_side_filter(column: str = "side") -> pl.Expr:
+    side = _normalized_str_expr(column)
+    return side.is_null() | (side == "") | ~side.is_in(["buy", "sell", "unknown"])
+
+
+def _invalid_book_side_filter(column: str = "side") -> pl.Expr:
+    side = _normalized_str_expr(column)
+    return side.is_null() | (side == "") | ~side.is_in(["bid", "ask"])
+
+
+def _validate_side_values(lf: pl.LazyFrame, schema: TardisCSVSchema) -> None:
+    if schema.data_type == TardisDataType.TRADES:
+        bad = (
+            lf.select([RAW_SOURCE_ROW, "side"])
+            .filter(_invalid_trade_side_filter("side"))
+            .limit(1)
+            .collect()
+        )
+        if bad.height:
+            raise ValueError(f"invalid trade side in {schema.data_type.value}: {bad.to_dicts()[0]!r}")
+    elif schema.data_type == TardisDataType.INCREMENTAL_BOOK_L2:
+        bad = (
+            lf.select([RAW_SOURCE_ROW, "side"])
+            .filter(_invalid_book_side_filter("side"))
+            .limit(1)
+            .collect()
+        )
+        if bad.height:
+            raise ValueError(f"invalid book side in {schema.data_type.value}: {bad.to_dicts()[0]!r}")
+
+
 def _trade_side_expr(column: str = "side") -> pl.Expr:
-    side = pl.col(column).cast(pl.Utf8).str.to_lowercase().fill_null("")
+    side = _normalized_str_expr(column)
     return (
-        pl.when((side == "") | (side == "unknown"))
+        pl.when(side == "unknown")
         .then(pl.lit(SIDE_UNKNOWN))
         .when(side == "buy")
         .then(pl.lit(SIDE_BUY))
         .when(side == "sell")
         .then(pl.lit(SIDE_SELL))
-        .otherwise(pl.lit(SIDE_UNKNOWN))
+        .otherwise(pl.lit(None))
         .cast(pl.Int8)
         .alias("side_code")
     )
 
 
 def _book_side_expr(column: str = "side") -> pl.Expr:
-    side = pl.col(column).cast(pl.Utf8).str.to_lowercase().fill_null("")
+    side = _normalized_str_expr(column)
     return (
         pl.when(side == "bid")
         .then(pl.lit(BOOK_SIDE_BID))
         .when(side == "ask")
         .then(pl.lit(BOOK_SIDE_ASK))
-        .otherwise(pl.lit(BOOK_SIDE_UNKNOWN))
+        .otherwise(pl.lit(None))
         .cast(pl.Int8)
         .alias("book_side_code")
     )
@@ -230,10 +264,11 @@ def write_normalized_parquet(
         source_file=source_file,
         validate_header=validate_header,
     )
+    schema = tardis_csv_schema(data_type)
+    _validate_side_values(lf, schema)
     lf = lf.sort([LOCAL_TS_US, RAW_SOURCE_ROW], maintain_order=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lf.sink_parquet(out_path, compression=compression)
-    schema = tardis_csv_schema(data_type)
     return NormalizedTardisFile(data_type=schema.data_type, input_path=in_path, output_path=out_path, row_count=None)
 
 
@@ -246,7 +281,6 @@ __all__ = [
     "SIDE_UNKNOWN",
     "SIDE_BUY",
     "SIDE_SELL",
-    "BOOK_SIDE_UNKNOWN",
     "BOOK_SIDE_BID",
     "BOOK_SIDE_ASK",
     "DEFAULT_PARQUET_COMPRESSION",

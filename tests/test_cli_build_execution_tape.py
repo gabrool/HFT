@@ -10,7 +10,9 @@ from mmrt.cli.build_execution_tape import (
     build_execution_tape_from_config,
     load_reconstructed_l2_events,
     main,
+    _parse_trade_side,
 )
+from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import SymbolSpec
 from mmrt.execution.event_merge import ExecutionMergeTiePolicy
 from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_CODE_TRADE, load_execution_tape
@@ -234,7 +236,7 @@ def test_l2_stats_are_json_safe_and_do_not_include_reconstructor(tmp_path):
     )
 
     assert "reconstructor" not in stats
-    json.dumps(stats, sort_keys=True, allow_nan=True)
+    json.dumps(stats, sort_keys=True, allow_nan=False)
 
 
 def test_max_row_limits(tmp_path):
@@ -255,6 +257,31 @@ def test_max_row_limits(tmp_path):
     assert summary["counts"]["trade_rows_seen"] == 1
     assert "l2_scan_limit_hit" in summary["warnings"]
     assert "trade_scan_limit_hit" in summary["warnings"]
+
+
+def test_build_execution_tape_rejects_missing_trade_side(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(
+        tmp_path / "trades.csv",
+        [{"timestamp": 150, "local_timestamp": 150, "price": 100.2, "amount": 0.01, "trade_id": "t1"}],
+        columns=["timestamp", "local_timestamp", "price", "amount", "trade_id"],
+    )
+
+    with pytest.raises(ValueError, match="trade row missing side or side_code"):
+        build_execution_tape_from_config(
+            ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+        )
+
+
+def test_build_execution_tape_accepts_explicit_unknown_trade_side():
+    assert _parse_trade_side({"side": "unknown"}) is AggressorSide.UNKNOWN
+    assert _parse_trade_side({"side_code": 0}) is AggressorSide.UNKNOWN
+
+
+def test_build_execution_tape_json_is_strict():
+    source = Path("mmrt/cli/build_execution_tape.py").read_text(encoding="utf-8")
+    assert "allow_nan" + "=True" not in source
+    assert "allow_nan=False" in source
 
 
 def test_rejects_no_reconstructed_l2_events(tmp_path):
@@ -341,8 +368,14 @@ def test_cli_main_writes_summary_and_prints_same_summary(tmp_path, capsys):
     output_root = tmp_path / "tape"
 
     rc = main(["--l2-input", str(l2_path), "--trade-input", str(trade_path), "--output-root", str(output_root)])
-    printed = json.loads(capsys.readouterr().out)
-    saved = json.loads((output_root / "build_summary.json").read_text(encoding="utf-8"))
+    output_text = capsys.readouterr().out
+    assert "NaN" not in output_text
+    assert "Infinity" not in output_text
+    printed = json.loads(output_text, parse_constant=lambda x: (_ for _ in ()).throw(AssertionError(x)))
+    saved_text = (output_root / "build_summary.json").read_text(encoding="utf-8")
+    assert "NaN" not in saved_text
+    assert "Infinity" not in saved_text
+    saved = json.loads(saved_text, parse_constant=lambda x: (_ for _ in ()).throw(AssertionError(x)))
 
     assert rc == 0
     assert printed == saved

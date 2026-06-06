@@ -12,6 +12,7 @@ import csv
 from dataclasses import dataclass
 import gzip
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -304,7 +305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         created_at_utc=args.created_at_utc,
     )
     summary = build_execution_tape_from_config(config)
-    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+    print(json.dumps(_json_safe_summary(summary), sort_keys=True, separators=(",", ":"), allow_nan=False))
     return 0
 
 
@@ -502,10 +503,25 @@ def _write_json_atomic(payload: dict[str, object], path: str | Path, *, overwrit
         raise FileExistsError(f"JSON output already exists: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
-    text = json.dumps(payload, sort_keys=True, indent=2, allow_nan=True)
+    safe_payload = _json_safe_summary(payload)
+    text = json.dumps(safe_payload, sort_keys=True, indent=2, allow_nan=False)
     tmp_path.write_text(text + "\n", encoding="utf-8")
     tmp_path.replace(path)
     return str(path)
+
+
+def _json_safe_summary(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe_summary(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_summary(v) for v in value]
+    return value
 
 
 def _tuple_of_nonempty_str(values: Any, name: str) -> tuple[str, ...]:
@@ -658,7 +674,7 @@ def _parse_trade_side(row: Mapping[str, Any]) -> AggressorSide:
                 return AggressorSide.BUY
             if normalized == "sell":
                 return AggressorSide.SELL
-            if normalized in ("unknown", ""):
+            if normalized == "unknown":
                 return AggressorSide.UNKNOWN
         raise ValueError(f"unsupported trade side: {value!r}")
 
@@ -671,7 +687,7 @@ def _parse_trade_side(row: Mapping[str, Any]) -> AggressorSide:
         if code == 0:
             return AggressorSide.UNKNOWN
         raise ValueError(f"unsupported side_code: {code!r}")
-    return AggressorSide.UNKNOWN
+    raise ValueError("trade row missing side or side_code")
 
 
 def _coerce_int(value: Any, name: str) -> int:

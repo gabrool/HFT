@@ -19,7 +19,6 @@ except Exception:
 
 FLOAT_EPS = 1e-12
 BPS_SCALE = 10_000.0
-US_PER_SECOND = 1_000_000.0
 
 NUMBA_AVAILABLE = njit is not None
 
@@ -589,7 +588,6 @@ def finite_or_zero_array(values: np.ndarray) -> np.ndarray:
 __all__ = [
     "FLOAT_EPS",
     "BPS_SCALE",
-    "US_PER_SECOND",
     "NUMBA_AVAILABLE",
     "require_1d_float_array",
     "require_same_shape_1d",

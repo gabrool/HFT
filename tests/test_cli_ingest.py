@@ -124,21 +124,9 @@ def test_parser_defaults(tmp_path: Path):
     args = cli.build_arg_parser().parse_args(["--dataset-root", str(tmp_path / "ds"), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t)])
     assert args.exchange == cfg.DEFAULT_EXCHANGE
     assert args.symbol == cfg.DEFAULT_SYMBOL
-    assert args.book_data_type == "book_snapshot_25"
-    assert args.validate_output is True
+    assert not hasattr(args, "book_data_type")
+    assert not hasattr(args, "validate_output")
     assert args.decision_stride_us == cfg.DEFAULT_DECISION_STRIDE_US
-
-
-def test_reject_unsupported_book_data_type(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path)
-    with pytest.raises(ValueError, match="book_snapshot_25"):
-        cli.main(["--dataset-root", str(tmp_path / "ds"), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--book-data-type", "incremental_book_L2"])
-
-
-def test_rejects_other_unsupported_book_type(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path)
-    with pytest.raises(ValueError, match="supports only book_snapshot_25"):
-        cli.main(["--dataset-root", str(tmp_path / "ds"), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--book-data-type", "book_snapshot_5"])
 
 
 def test_rejects_non_default_decision_stride(tmp_path: Path):
@@ -170,6 +158,14 @@ def test_no_stale_imports_source_residue():
         assert token not in src
     for token in ["mmrt." + "linear", "read_" + "split_" + "table", "read_" + "ta" + "ble(", "to_" + "pan" + "das"]:
         assert token not in src
+
+
+def test_ingest_has_no_fake_data_type_or_validation_opt_out_flags():
+    src = inspect.getsource(cli)
+    assert "--book" + "-data-type" not in src
+    assert "--no" + "-validate-output" not in src
+    assert "--validate" + "-output" not in src
+    assert "args.validate" + "_output" not in src
 
 
 def test_ingest_uses_streaming_merge_only():
@@ -394,6 +390,9 @@ def test_subprocess_help_entrypoint():
     assert "--book-csv" in p.stdout
     assert "--trades-csv" in p.stdout
     assert "--split-train" in p.stdout
+    assert "--book" + "-data-type" not in p.stdout
+    assert "--validate" + "-output" not in p.stdout
+    assert "--no" + "-validate-output" not in p.stdout
 
 
 class _NoopWriter:

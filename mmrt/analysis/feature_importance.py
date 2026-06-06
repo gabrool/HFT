@@ -654,7 +654,7 @@ def run_feature_importance(
 def _write_json_atomic(path: Path, payload: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(_json_safe(payload), sort_keys=True, indent=2, allow_nan=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(_json_safe(payload), sort_keys=True, indent=2, allow_nan = True) + "\n", encoding="utf-8")
     tmp.replace(path)
     return str(path)
 

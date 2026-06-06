@@ -111,21 +111,20 @@ def test_scan_tardis_csv_normalized_trades(tmp_path):
         "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n"
         "binance-futures,BTCUSDT,300,300,t1,buy,100.0,0.5\n"
         "binance-futures,BTCUSDT,100,100,t2,sell,101.0,0.6\n"
-        "binance-futures,BTCUSDT,200,200,t3,unknown,102.0,0.7\n"
-        "binance-futures,BTCUSDT,400,400,t4,,103.0,0.8\n",
+        "binance-futures,BTCUSDT,200,200,t3,unknown,102.0,0.7\n",
         encoding="utf-8",
     )
     df = scan_tardis_csv_normalized(p, TardisDataType.TRADES).collect()
     assert df.columns == list(expected_normalized_columns(TardisDataType.TRADES))
-    assert df[RAW_SOURCE_ROW].to_list() == [0, 1, 2, 3]
+    assert df[RAW_SOURCE_ROW].to_list() == [0, 1, 2]
     assert df[TS_US].dtype == pl.Int64
     assert df[LOCAL_TS_US].dtype == pl.Int64
     assert df[RAW_SOURCE_ROW].dtype == pl.Int64
-    assert df[SOURCE_FILE].to_list() == [str(p)] * 4
-    assert df[SOURCE_DATA_TYPE].to_list() == ["trades"] * 4
-    assert df["side_code"].to_list() == [SIDE_BUY, SIDE_SELL, SIDE_UNKNOWN, SIDE_UNKNOWN]
+    assert df[SOURCE_FILE].to_list() == [str(p)] * 3
+    assert df[SOURCE_DATA_TYPE].to_list() == ["trades"] * 3
+    assert df["side_code"].to_list() == [SIDE_BUY, SIDE_SELL, SIDE_UNKNOWN]
     assert "side" in df.columns
-    assert df[TS_US].to_list() == [300, 100, 200, 400]
+    assert df[TS_US].to_list() == [300, 100, 200]
 
 
 def test_scan_tardis_csv_normalized_book_snapshot_25(tmp_path):
@@ -169,6 +168,57 @@ def test_validate_normalized_timestamps():
         validate_normalized_timestamps(pl.DataFrame({TS_US: [0], LOCAL_TS_US: [1]}))
     with pytest.raises(ValueError):
         validate_normalized_timestamps(pl.DataFrame({LOCAL_TS_US: [1]}))
+
+
+def test_write_normalized_parquet_rejects_invalid_trade_side(tmp_path):
+    src = tmp_path / "bad_trades.csv"
+    dst = tmp_path / "out.parquet"
+    src.write_text(
+        "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n"
+        "binance-futures,BTCUSDT,1,2,t1,bid,100.0,0.5\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid trade side"):
+        write_normalized_parquet(src, dst, TardisDataType.TRADES)
+    assert not dst.exists()
+
+
+def test_write_normalized_parquet_rejects_blank_trade_side(tmp_path):
+    src = tmp_path / "blank_trades.csv"
+    dst = tmp_path / "out.parquet"
+    src.write_text(
+        "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n"
+        "binance-futures,BTCUSDT,1,2,t1, ,100.0,0.5\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid trade side"):
+        write_normalized_parquet(src, dst, TardisDataType.TRADES)
+    assert not dst.exists()
+
+
+def test_write_normalized_parquet_rejects_invalid_l2_side(tmp_path):
+    src = tmp_path / "bad_l2.csv"
+    dst = tmp_path / "out.parquet"
+    src.write_text(
+        "exchange,symbol,timestamp,local_timestamp,is_snapshot,side,price,amount\n"
+        "binance-futures,BTCUSDT,1,2,false,unknown,100.0,1.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid book side"):
+        write_normalized_parquet(src, dst, TardisDataType.INCREMENTAL_BOOK_L2)
+    assert not dst.exists()
+
+
+def test_write_normalized_parquet_accepts_trade_unknown_side(tmp_path):
+    src = tmp_path / "unknown_trades.csv"
+    dst = tmp_path / "out.parquet"
+    src.write_text(
+        "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n"
+        "binance-futures,BTCUSDT,1,2,t1,unknown,100.0,0.5\n",
+        encoding="utf-8",
+    )
+    write_normalized_parquet(src, dst, TardisDataType.TRADES)
+    assert pl.read_parquet(dst)["side_code"].to_list() == [SIDE_UNKNOWN]
 
 
 def test_write_normalized_parquet(tmp_path):

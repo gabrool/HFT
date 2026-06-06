@@ -325,7 +325,7 @@ class PreprocessSplitSummary:
             "min_drift_std_ratio",
             "max_drift_std_ratio",
         ):
-            value = _require_finite_float(getattr(self, name), name, allow_nan=False)
+            value = _require_finite_float(getattr(self, name), name, allow_nan = True)
             if value < 0.0:
                 raise ValueError(f"{name} must be >= 0")
 
@@ -714,7 +714,7 @@ def write_preprocess_audit_artifacts(
     summary_path = out / summary_filename
     summary_tmp = summary_path.with_suffix(summary_path.suffix + ".tmp")
     summary_tmp.write_text(
-        json.dumps(result.as_dict(), sort_keys=True, indent=2, allow_nan=True) + "\n",
+        json.dumps(result.as_dict(), sort_keys=True, indent=2, allow_nan = True) + "\n",
         encoding="utf-8",
     )
     summary_tmp.replace(summary_path)

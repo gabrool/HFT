@@ -9,6 +9,7 @@ fields, run hyperparameter search, or modify dataset manifests.
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import math
 from typing import Sequence
 
 import numpy as np
@@ -526,6 +527,25 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
     )
 
 
+def _json_dump_safe(obj: object) -> object:
+    if obj is None or isinstance(obj, (bool, int, str)):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        value = float(obj)
+        return value if math.isfinite(value) else None
+    if isinstance(obj, np.ndarray):
+        return _json_dump_safe(obj.tolist())
+    if isinstance(obj, (list, tuple)):
+        return [_json_dump_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _json_dump_safe(v) for k, v in obj.items()}
+    return obj
+
+
 def write_linear_train_artifacts(result: LinearTrainResult, output_dir: str, *, filename: str = DEFAULT_OUTPUT_FILENAME) -> dict[str, str]:
     if not isinstance(result, LinearTrainResult):
         raise ValueError("result must be LinearTrainResult")
@@ -536,7 +556,7 @@ def write_linear_train_artifacts(result: LinearTrainResult, output_dir: str, *, 
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / name
     tmp = Path(str(target) + ".tmp")
-    payload = json.dumps(result.as_dict(), sort_keys=True, indent=2, allow_nan=True) + "\n"
+    payload = json.dumps(_json_dump_safe(result.as_dict()), sort_keys=True, indent=2, allow_nan=False) + "\n"
     tmp.write_text(payload, encoding="utf-8")
     tmp.replace(target)
     return {"result_json": str(target)}

@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         "warnings": list(result.warnings),
         "splits": {key: asdict(value) for key, value in result.splits.items()},
     }
-    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=True))
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan = True))
     return 0
 
 

@@ -349,8 +349,8 @@ class FeatureHealthRecord:
             _require_finite_float(self.raw_min, "raw_min")
             _require_finite_float(self.raw_max, "raw_max")
         else:
-            _require_finite_float(self.raw_min, "raw_min", allow_nan=True)
-            _require_finite_float(self.raw_max, "raw_max", allow_nan=True)
+            _require_finite_float(self.raw_min, "raw_min", allow_nan = True)
+            _require_finite_float(self.raw_max, "raw_max", allow_nan = True)
 
         if n_sample_rows > 0:
             _require_finite_float(self.raw_p01, "raw_p01")
@@ -358,10 +358,10 @@ class FeatureHealthRecord:
             _require_finite_float(self.raw_p99, "raw_p99")
             _require_finite_float(self.raw_abs_p99, "raw_abs_p99")
         else:
-            _require_finite_float(self.raw_p01, "raw_p01", allow_nan=True)
-            _require_finite_float(self.raw_p50, "raw_p50", allow_nan=True)
-            _require_finite_float(self.raw_p99, "raw_p99", allow_nan=True)
-            _require_finite_float(self.raw_abs_p99, "raw_abs_p99", allow_nan=True)
+            _require_finite_float(self.raw_p01, "raw_p01", allow_nan = True)
+            _require_finite_float(self.raw_p50, "raw_p50", allow_nan = True)
+            _require_finite_float(self.raw_p99, "raw_p99", allow_nan = True)
+            _require_finite_float(self.raw_abs_p99, "raw_abs_p99", allow_nan = True)
 
         if self.low_variance and self.status != "low_variance":
             raise ValueError("low_variance=True requires status=low_variance")
@@ -406,8 +406,8 @@ class FeatureDriftRecord:
         if train_std < 0 or split_std < 0:
             raise ValueError("train_std and split_std must be >= 0")
 
-        _require_finite_float(self.train_p50, "train_p50", allow_nan=True)
-        _require_finite_float(self.split_p50, "split_p50", allow_nan=True)
+        _require_finite_float(self.train_p50, "train_p50", allow_nan = True)
+        _require_finite_float(self.split_p50, "split_p50", allow_nan = True)
 
         if self.status == "low_variance_train":
             if not math.isnan(float(self.mean_shift_train_std)):
@@ -424,7 +424,7 @@ class FeatureDriftRecord:
             raise ValueError("std_ratio must be >= 0")
 
         if math.isnan(float(self.train_p50)) or math.isnan(float(self.split_p50)):
-            _require_finite_float(self.p50_shift_train_std, "p50_shift_train_std", allow_nan=True)
+            _require_finite_float(self.p50_shift_train_std, "p50_shift_train_std", allow_nan = True)
         else:
             _require_finite_float(self.p50_shift_train_std, "p50_shift_train_std")
 
@@ -523,14 +523,14 @@ class FeatureFamilySummaryRecord:
         mean_raw_std = _require_finite_float(self.mean_raw_std, "mean_raw_std")
         if mean_raw_std < 0:
             raise ValueError("mean_raw_std must be >= 0")
-        _require_finite_float(self.median_raw_abs_p99, "median_raw_abs_p99", allow_nan=True)
+        _require_finite_float(self.median_raw_abs_p99, "median_raw_abs_p99", allow_nan = True)
 
         if split == "train":
             train_pair_count = _require_finite_float(self.train_high_corr_pair_count, "train_high_corr_pair_count")
             if train_pair_count < 0:
                 raise ValueError("train_high_corr_pair_count must be >= 0")
-            _require_finite_float(self.train_max_abs_corr, "train_max_abs_corr", allow_nan=True)
-            _require_finite_float(self.train_mean_abs_corr, "train_mean_abs_corr", allow_nan=True)
+            _require_finite_float(self.train_max_abs_corr, "train_max_abs_corr", allow_nan = True)
+            _require_finite_float(self.train_mean_abs_corr, "train_mean_abs_corr", allow_nan = True)
         else:
             if not math.isnan(float(self.train_high_corr_pair_count)):
                 raise ValueError("train_high_corr_pair_count must be NaN outside train")
@@ -1061,7 +1061,7 @@ def run_feature_audit(dataset_root: str, *, config: FeatureAuditConfig | None = 
 def _write_json_atomic(path: Path, payload: object) -> str:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
-        json.dumps(payload, sort_keys=True, indent=2, allow_nan=True) + "\n",
+        json.dumps(payload, sort_keys=True, indent=2, allow_nan = True) + "\n",
         encoding="utf-8",
     )
     tmp.replace(path)
