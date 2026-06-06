@@ -67,7 +67,7 @@ def make_dataset_with_splits(tmp_path: Path, *, with_test: bool = True, with_spl
 
 def test_public_api_boundary():
     assert tr.__all__ == [
-        "DEFAULT_TRAIN_BATCH_SIZE", "DEFAULT_EPOCHS", "DEFAULT_OUTPUT_FILENAME", "TRAIN_RESULT_SCHEMA_VERSION",
+        "DEFAULT_TRAIN_BATCH_SIZE", "DEFAULT_EPOCHS", "DEFAULT_OUTPUT_FILENAME", "LINEAR_TRAINING_RESULT_SCHEMA",
         "LinearTrainConfig", "SplitEvaluation", "LinearTrainResult", "fit_preprocessors_from_train_split",
         "train_model_bundle_from_train_split", "evaluate_model_on_split", "train_linear_model", "write_linear_train_artifacts",
     ]
@@ -153,13 +153,13 @@ def test_train_linear_model_end_to_end(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     cfg = tr.LinearTrainConfig(epochs=2, batch_size=3)
     result = tr.train_linear_model(str(root), config=cfg)
-    assert result.schema_version == 1
+    assert result.schema == "mmrt_linear_training_result"
     assert result.dataset_id == manifest.dataset_id
     assert result.manifest_hash == rd.open_dataset(str(root)).manifest.content_hash()
     assert set(result.splits.keys()) == {"train", "val", "test"}
     assert result.splits["train"].n_rows == 6 and result.splits["val"].n_rows == 3
     assert {"no_move", "direction", "magnitude_up", "magnitude_down"}.issubset(result.model_bundle_state.keys())
-    assert result.preprocess_state["schema"] == "per_head_preprocess_v1"
+    assert result.preprocess_state["schema"] == "mmrt_linear_preprocess"
     assert set(result.preprocess_state["states_by_head"].keys()) == set(lm.MODEL_HEADS)
     payload = result.as_dict()
     selection = payload["selection_summary"]
@@ -293,13 +293,13 @@ def test_result_dataclass_validation():
     with pytest.raises(ValueError):
         tr.SplitEvaluation(role="bad", n_rows=0, evaluation={}, diagnostics={})
     with pytest.raises(ValueError):
-        tr.LinearTrainResult(schema_version=2, dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
+        tr.LinearTrainResult(schema="bad", dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
 
 
 def test_linear_train_result_rejects_non_dict_splits():
     with pytest.raises(ValueError, match="splits must be dict"):
         tr.LinearTrainResult(
-            schema_version=tr.TRAIN_RESULT_SCHEMA_VERSION,
+            schema=tr.LINEAR_TRAINING_RESULT_SCHEMA,
             dataset_id="d1",
             manifest_hash="h1",
             config={},
@@ -398,7 +398,7 @@ def test_train_linear_model_respects_per_head_feature_subsets(tmp_path: Path):
 
     for split_eval in result.splits.values():
         pre_diag = split_eval.diagnostics["preprocess"]
-        assert pre_diag["schema"] == "per_head_preprocess_v1"
+        assert pre_diag["schema"] == "mmrt_linear_preprocess"
         assert set(pre_diag["states_by_head"]) == set(lm.MODEL_HEADS)
         assert pre_diag["states_by_head"][lm.NO_MOVE_HEAD]["n_features"] == len(cols)
         assert pre_diag["states_by_head"][lm.DIRECTION_HEAD]["n_features"] == 2

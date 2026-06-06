@@ -13,11 +13,12 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+LINEAR_MODEL_SCHEMA = "mmrt_linear_model"
 DEFAULT_MODEL_DTYPE = "float32"
 ALLOWED_MODEL_DTYPES = ("float32", "float64")
 
 DEFAULT_LEARNING_RATE = 0.05
-DEFAULT_L2 = 1e-2
+DEFAULT_L2 = 1e-4
 DEFAULT_MAX_GRAD_NORM = 10.0
 DEFAULT_INIT_SCALE = 0.0
 DEFAULT_MAGNITUDE_HUBER_DELTA = 1.0
@@ -511,6 +512,7 @@ class LinearModelBundle:
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
+            "schema": LINEAR_MODEL_SCHEMA,
             "bundle_type": "linear_four_head_gated",
             "feature_columns_by_head": {
                 head: list(cols)
@@ -586,6 +588,7 @@ def load_linear_model_bundle(d: dict[str, object]) -> LinearModelBundle:
 
 
 __all__ = [
+    "LINEAR_MODEL_SCHEMA",
     "DEFAULT_MODEL_DTYPE",
     "ALLOWED_MODEL_DTYPES",
     "DEFAULT_LEARNING_RATE",

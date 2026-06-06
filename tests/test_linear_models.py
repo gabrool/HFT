@@ -10,6 +10,7 @@ import mmrt.linear.models as lm
 
 def test_public_api_boundary():
     expected = [
+        "LINEAR_MODEL_SCHEMA",
         "DEFAULT_MODEL_DTYPE",
         "ALLOWED_MODEL_DTYPES",
         "DEFAULT_LEARNING_RATE",

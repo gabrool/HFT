@@ -168,7 +168,7 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         decision_event_index.append(decision_event_index[-1] + 1)
         decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
     metadata = LinearSignalArtifactMetadata(
-        tape_schema_version=tape.manifest.schema_version,
+        tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
         symbol=tape.manifest.symbol,
         num_events=tape.manifest.num_events,
@@ -287,7 +287,7 @@ def test_train_ppo_policy_runs_one_update_on_tiny_env():
     assert summary["updates_completed"] == 1
 
     payload = make_training_checkpoint_payload(result)
-    assert payload["schema_version"] == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
+    assert payload["schema"] == "mmrt_execution_ppo_checkpoint"
     assert "policy_state_dict" in payload
     assert "optimizer_state_dict" in payload
     assert payload["observation_normalizer_state_dict"] is not None
@@ -322,16 +322,16 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["checkpoint_saved"] is True
     assert summary["training"]["updates_completed"] == 1
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
-    assert summary["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v3_aligned"
+    assert summary["linear_signals"]["schema"] == "mmrt_execution_linear_signals_aligned"
     assert summary["linear_signals"]["n_rows"] >= 1
 
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-    assert ckpt["schema_version"] == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
+    assert ckpt["schema"] == "mmrt_execution_ppo_checkpoint"
     assert ckpt["updates_completed"] == 1
     assert "policy_state_dict" in ckpt
     assert ckpt["tape"]["symbol"] == "BTCUSDT"
     assert ckpt["observation_schema"] == summary["observation_schema"]
-    assert ckpt["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v3_aligned"
+    assert ckpt["linear_signals"]["schema"] == "mmrt_execution_linear_signals_aligned"
 
 
 def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):

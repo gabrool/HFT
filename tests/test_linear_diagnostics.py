@@ -198,7 +198,7 @@ def test_preprocess_diagnostics_from_train_state_dict_accepts_per_head_state():
         }
 
     per_head = {
-        "schema": "per_head_preprocess_v1",
+        "schema": "mmrt_linear_preprocess",
         "states_by_head": {
             "no_move": state(["x_n"]),
             "direction": state(["x_a", "x_b"]),
@@ -209,7 +209,7 @@ def test_preprocess_diagnostics_from_train_state_dict_accepts_per_head_state():
 
     out = dg.preprocess_diagnostics_from_train_state_dict(per_head)
 
-    assert out["schema"] == "per_head_preprocess_v1"
+    assert out["schema"] == "mmrt_linear_preprocess"
     assert set(out["states_by_head"]) == {"no_move", "direction", "magnitude_up", "magnitude_down"}
     assert out["states_by_head"]["direction"]["n_features"] == 2
     assert out["states_by_head"]["magnitude_up"]["n_features"] == 1
@@ -218,7 +218,7 @@ def test_preprocess_diagnostics_from_train_state_dict_accepts_per_head_state():
 
 def test_preprocess_diagnostics_from_train_state_dict_rejects_bad_per_head_keys():
     state = {
-        "schema": "per_head_preprocess_v1",
+        "schema": "mmrt_linear_preprocess",
         "states_by_head": {
             "direction": {
                 "feature_columns": ["x_a"],
@@ -300,7 +300,7 @@ def test_build_linear_diagnostics_report_accepts_per_head_preprocess_state():
         "magnitude_down": {"head_name": "magnitude_down", "feature_columns": ["x_c"], "weights": [-0.2], "intercept": 0.0, "n_updates": 1, "n_rows_seen": 2, "config": {"learning_rate": 0.05, "l2": 0.0001, "max_grad_norm": 10.0, "output_dtype": "float32"}},
     }
     preprocess_state = {
-        "schema": "per_head_preprocess_v1",
+        "schema": "mmrt_linear_preprocess",
         "states_by_head": {
             "no_move": {"feature_columns": ["x_n"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
             "direction": {"feature_columns": ["x_a"], "variance": [1.0], "scale": [1.0], "active_mask": [True]},
@@ -329,7 +329,7 @@ def test_build_linear_diagnostics_report_accepts_per_head_preprocess_state():
         move_mask=np.array([True, True], dtype=bool),
     )
 
-    assert report["preprocess"]["schema"] == "per_head_preprocess_v1"
+    assert report["preprocess"]["schema"] == "mmrt_linear_preprocess"
     assert report["preprocess"]["states_by_head"]["direction"]["n_features"] == 1
 
 

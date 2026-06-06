@@ -27,7 +27,7 @@ from mmrt.linear import targets as tg
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
 
-FEATURE_LAB_SCHEMA_VERSION = 1
+FEATURE_LAB_REPORT_TYPE = "feature_lab"
 
 DEFAULT_FEATURE_LAB_BATCH_SIZE = rd.DEFAULT_BATCH_SIZE
 DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_TRAIN = 100_000
@@ -211,7 +211,7 @@ class CandidateRecommendationRecord:
 
 @dataclass(frozen=True, slots=True)
 class FeatureLabResult:
-    schema_version: int
+    report_type: str
     dataset_id: str
     manifest_hash: str
     train_result_path: str
@@ -230,7 +230,7 @@ class FeatureLabResult:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": self.schema_version,
+            "report_type": self.report_type,
             "dataset_id": self.dataset_id,
             "manifest_hash": self.manifest_hash,
             "train_result_path": self.train_result_path,
@@ -874,7 +874,7 @@ def run_feature_lab(dataset_root: str, train_result_json: str, candidate_feature
 
     warnings: tuple[str, ...] = ()
     base_summary = {
-        "schema_version": FEATURE_LAB_SCHEMA_VERSION,
+        "report_type": FEATURE_LAB_REPORT_TYPE,
         "dataset_id": manifest.dataset_id,
         "manifest_hash": manifest_hash,
         "train_result_path": str(Path(train_result_json)),
@@ -886,7 +886,7 @@ def run_feature_lab(dataset_root: str, train_result_json: str, candidate_feature
     }
     summary = _summary(base_summary, metric_records, recommendation_records, health_records, redundancy_records, warnings)
     return FeatureLabResult(
-        schema_version=FEATURE_LAB_SCHEMA_VERSION,
+        report_type=FEATURE_LAB_REPORT_TYPE,
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest_hash,
         train_result_path=str(Path(train_result_json)),
@@ -940,7 +940,7 @@ def write_feature_lab_artifacts(result: FeatureLabResult, output_dir: str) -> di
 
 
 __all__ = [
-    "FEATURE_LAB_SCHEMA_VERSION",
+    "FEATURE_LAB_REPORT_TYPE",
     "DEFAULT_FEATURE_LAB_BATCH_SIZE",
     "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_TRAIN",
     "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_VAL",

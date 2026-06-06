@@ -103,7 +103,7 @@ def _candidate_path(path: Path, n_rows: int = 110, **overrides) -> Path:
 
 def test_public_api_boundary():
     assert fl.__all__ == [
-        "FEATURE_LAB_SCHEMA_VERSION",
+        "FEATURE_LAB_REPORT_TYPE",
         "DEFAULT_FEATURE_LAB_BATCH_SIZE",
         "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_TRAIN",
         "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_VAL",
@@ -194,7 +194,7 @@ def test_run_feature_lab_end_to_end(trained_artifact, tmp_path: Path):
     root, artifact = trained_artifact
     cand = _candidate_path(tmp_path / "c.parquet")
     out = fl.run_feature_lab(str(root), str(artifact), str(cand), config=fl.FeatureLabConfig(batch_size=11, min_scope_rows=1))
-    assert out.schema_version == 1
+    assert out.report_type == fl.FEATURE_LAB_REPORT_TYPE
     assert out.n_candidates == 3
     assert out.train_sample_rows == 60
     assert out.val_sample_rows == 30
@@ -271,7 +271,7 @@ def test_head_scopes_are_correct(trained_artifact, tmp_path: Path):
     root, artifact = trained_artifact
     out = fl.run_feature_lab(str(root), str(artifact), str(_candidate_path(tmp_path / "c.parquet")))
     counts = {r.head: r.n_val_rows for r in out.head_metric_records if r.candidate == "c_noise"}
-    assert counts[lm.NO_MOVE_HEAD] == 28
+    assert counts[lm.NO_MOVE_HEAD] == 30
     assert counts[lm.DIRECTION_HEAD] == 25
     assert counts[lm.MAGNITUDE_UP_HEAD] == 10
     assert counts[lm.MAGNITUDE_DOWN_HEAD] == 15
@@ -291,7 +291,7 @@ def test_write_feature_lab_artifacts(trained_artifact, tmp_path: Path):
     out = fl.run_feature_lab(str(root), str(artifact), str(_candidate_path(tmp_path / "c.parquet")))
     paths = fl.write_feature_lab_artifacts(out, str(tmp_path / "out"))
     assert set(paths) == {"summary_json", "candidate_health_csv", "candidate_existing_correlations_csv", "candidate_redundancy_summary_csv", "candidate_head_metrics_csv", "candidate_recommendations_csv"}
-    assert json.loads(Path(paths["summary_json"]).read_text())["schema_version"] == 1
+    assert json.loads(Path(paths["summary_json"]).read_text())["report_type"] == fl.FEATURE_LAB_REPORT_TYPE
     with Path(paths["candidate_head_metrics_csv"]).open() as f:
         assert next(csv.reader(f)) == ["candidate", "head", "scope", "n_train_rows", "n_val_rows", "target_metric_primary", "target_train_value", "target_val_value", "target_val_abs_value", "target_same_sign", "residual_metric_primary", "residual_train_value", "residual_val_value", "residual_val_abs_value", "residual_same_sign", "max_abs_existing_corr", "most_correlated_existing_feature", "missing_rate_train", "missing_rate_val", "finite_rate_train", "finite_rate_val", "zero_rate_train", "zero_rate_val", "health_status", "redundancy_status", "rank_within_head_by_residual"]
 

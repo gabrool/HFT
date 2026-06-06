@@ -200,7 +200,7 @@ def test_result_rejects_malformed_split_values(tmp_path: Path):
 
     with pytest.raises(ValueError):
         pa.PreprocessAuditResult(
-            schema_version=pa.PREPROCESS_AUDIT_SCHEMA_VERSION,
+            report_type=pa.PREPROCESS_AUDIT_REPORT_TYPE,
             dataset_root=out.dataset_root,
             dataset_id=out.dataset_id,
             manifest_hash=out.manifest_hash,

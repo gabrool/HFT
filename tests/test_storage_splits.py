@@ -69,7 +69,7 @@ def split_time_range_for_rows(start_row: int, end_row: int, *, base_us: int = 1_
     return TimeRangeUS(start_us=base_us + start_row * step_us, end_us=base_us + (end_row - 1) * step_us + 1)
 def manifest_with_splits(manifest: mf.StorageManifest, splits: tuple[mf.SplitMetadata, ...]) -> mf.StorageManifest:
     return mf.StorageManifest(
-        manifest_schema_version=manifest.manifest_schema_version,
+        schema=manifest.schema,
         dataset_id=manifest.dataset_id,
         created_at_utc=manifest.created_at_utc,
         pipeline_config=manifest.pipeline_config,

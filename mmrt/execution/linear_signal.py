@@ -24,7 +24,7 @@ NO_MOVE_PROBA_KEY = "no_move_proba"
 MAGNITUDE_UP_KEY = "magnitude_up"
 MAGNITUDE_DOWN_KEY = "magnitude_down"
 
-LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION = "mmrt_execution_linear_signals_v3_aligned"
+LINEAR_SIGNAL_ARTIFACT_SCHEMA = "mmrt_execution_linear_signals_aligned"
 LINEAR_SIGNALS_FILENAME = "linear_signals.npz"
 _LINEAR_SIGNAL_CONSISTENCY_EPS = 1e-5
 _LINEAR_SIGNAL_ARRAY_FIELDS = (
@@ -288,7 +288,7 @@ def linear_signal_at(arrays: LinearSignalArrays, row: int) -> LinearSignal:
 
 @dataclass(frozen=True, slots=True)
 class LinearSignalArtifactMetadata:
-    tape_schema_version: str
+    tape_schema: str
     exchange: str
     symbol: str
     num_events: int
@@ -301,7 +301,7 @@ class LinearSignalArtifactMetadata:
     n_rows: int
 
     def __post_init__(self) -> None:
-        for name in ("tape_schema_version", "exchange", "symbol"):
+        for name in ("tape_schema", "exchange", "symbol"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{name} must be a non-empty string")
@@ -318,7 +318,7 @@ class LinearSignalArtifactMetadata:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "tape_schema_version": self.tape_schema_version,
+            "tape_schema": self.tape_schema,
             "exchange": self.exchange,
             "symbol": self.symbol,
             "num_events": self.num_events,
@@ -336,7 +336,7 @@ class LinearSignalArtifactMetadata:
         if not isinstance(raw, Mapping):
             raise ValueError("metadata must be a mapping")
         required = (
-            "tape_schema_version",
+            "tape_schema",
             "exchange",
             "symbol",
             "num_events",
@@ -406,7 +406,7 @@ def save_linear_signal_artifact_npz(
     if tmp.exists():
         tmp.unlink()
     payload = {name: getattr(artifact.arrays, name) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
-    payload["schema_version"] = np.array(LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION)
+    payload["schema"] = np.array(LINEAR_SIGNAL_ARTIFACT_SCHEMA)
     payload["metadata_json"] = np.array(json.dumps(artifact.metadata.as_dict(), sort_keys=True))
     payload["decision_event_index"] = artifact.decision_event_index
     payload["decision_local_ts_us"] = artifact.decision_local_ts_us
@@ -416,18 +416,18 @@ def save_linear_signal_artifact_npz(
 
 
 def load_linear_signal_artifact_npz(path: str | Path, *, mmap_mode: str | None = None) -> LinearSignalArtifact:
-    """Load a canonical v3 aligned linear signal artifact."""
+    """Load a canonical aligned linear signal artifact."""
 
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(str(path))
     with np.load(path, mmap_mode=mmap_mode, allow_pickle=False) as data:
         keys = set(data.files)
-        if "schema_version" not in keys:
-            raise ValueError("linear signal NPZ missing schema_version")
-        schema_version = str(np.asarray(data["schema_version"]).item())
-        if schema_version != LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION:
-            raise ValueError("linear signal NPZ schema_version mismatch")
+        if "schema" not in keys:
+            raise ValueError("linear signal NPZ missing schema")
+        schema = str(np.asarray(data["schema"]).item())
+        if schema != LINEAR_SIGNAL_ARTIFACT_SCHEMA:
+            raise ValueError("linear signal NPZ schema mismatch")
         required = set(_LINEAR_SIGNAL_ARRAY_FIELDS) | {"metadata_json", "decision_event_index", "decision_local_ts_us"}
         missing = sorted(required - keys)
         if missing:
@@ -449,7 +449,7 @@ def linear_signal_artifact_summary(artifact: LinearSignalArtifact, *, path: str 
     if not isinstance(artifact, LinearSignalArtifact):
         raise ValueError("artifact must be LinearSignalArtifact")
     return {
-        "schema_version": LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION,
+        "schema": LINEAR_SIGNAL_ARTIFACT_SCHEMA,
         "path": path,
         "n_rows": artifact.n_rows,
         "dtype": str(artifact.arrays.dtype),
@@ -465,7 +465,7 @@ def linear_signal_artifact_summary(artifact: LinearSignalArtifact, *, path: str 
 def validate_linear_signal_artifact_metadata(
     artifact: LinearSignalArtifact,
     *,
-    tape_schema_version: str,
+    tape_schema: str,
     exchange: str,
     symbol: str,
     num_events: int,
@@ -480,7 +480,7 @@ def validate_linear_signal_artifact_metadata(
     if not isinstance(artifact, LinearSignalArtifact):
         raise ValueError("linear signal artifact must be LinearSignalArtifact")
     expected = LinearSignalArtifactMetadata(
-        tape_schema_version=tape_schema_version,
+        tape_schema=tape_schema,
         exchange=exchange,
         symbol=symbol,
         num_events=num_events,
@@ -650,7 +650,7 @@ __all__ = [
     "NO_MOVE_PROBA_KEY",
     "MAGNITUDE_UP_KEY",
     "MAGNITUDE_DOWN_KEY",
-    "LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION",
+    "LINEAR_SIGNAL_ARTIFACT_SCHEMA",
     "LINEAR_SIGNALS_FILENAME",
     "LinearSignalConfig",
     "LinearSignalArrays",

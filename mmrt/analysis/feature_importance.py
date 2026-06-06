@@ -24,7 +24,7 @@ from mmrt.linear import targets as tg
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
 
-FEATURE_IMPORTANCE_SCHEMA_VERSION = 1
+FEATURE_IMPORTANCE_REPORT_TYPE = "feature_importance"
 
 DEFAULT_FEATURE_IMPORTANCE_BATCH_SIZE = rd.DEFAULT_BATCH_SIZE
 DEFAULT_FEATURE_IMPORTANCE_MAX_SAMPLE_ROWS = 100_000
@@ -129,7 +129,7 @@ class FeatureImportanceFamilyRecord:
 
 @dataclass(frozen=True, slots=True)
 class FeatureImportanceResult:
-    schema_version: int
+    report_type: str
     dataset_id: str
     manifest_hash: str
     train_result_path: str
@@ -142,7 +142,7 @@ class FeatureImportanceResult:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": self.schema_version,
+            "report_type": self.report_type,
             "dataset_id": self.dataset_id,
             "manifest_hash": self.manifest_hash,
             "train_result_path": self.train_result_path,
@@ -627,7 +627,7 @@ def run_feature_importance(
     records_tuple = tuple(sorted(records, key=lambda r: (head_order[r.head], r.importance_rank, r.feature_index)))
     family_tuple = _family_records(records_tuple)
     summary: dict[str, object] = {
-        "schema_version": FEATURE_IMPORTANCE_SCHEMA_VERSION,
+        "report_type": FEATURE_IMPORTANCE_REPORT_TYPE,
         "dataset_id": manifest.dataset_id,
         "manifest_hash": manifest_hash,
         "train_result_path": str(Path(train_result_json)),
@@ -638,7 +638,7 @@ def run_feature_importance(
         "heads": heads_summary,
     }
     return FeatureImportanceResult(
-        schema_version=FEATURE_IMPORTANCE_SCHEMA_VERSION,
+        report_type=FEATURE_IMPORTANCE_REPORT_TYPE,
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest_hash,
         train_result_path=str(Path(train_result_json)),
@@ -729,7 +729,7 @@ def write_feature_importance_artifacts(
 
 
 __all__ = [
-    "FEATURE_IMPORTANCE_SCHEMA_VERSION",
+    "FEATURE_IMPORTANCE_REPORT_TYPE",
     "DEFAULT_FEATURE_IMPORTANCE_BATCH_SIZE",
     "DEFAULT_FEATURE_IMPORTANCE_MAX_SAMPLE_ROWS",
     "DEFAULT_FEATURE_IMPORTANCE_SEED",

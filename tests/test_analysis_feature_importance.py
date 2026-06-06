@@ -85,7 +85,7 @@ def trained_artifact(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_public_api_boundary():
     assert fi.__all__ == [
-        "FEATURE_IMPORTANCE_SCHEMA_VERSION",
+        "FEATURE_IMPORTANCE_REPORT_TYPE",
         "DEFAULT_FEATURE_IMPORTANCE_BATCH_SIZE",
         "DEFAULT_FEATURE_IMPORTANCE_MAX_SAMPLE_ROWS",
         "DEFAULT_FEATURE_IMPORTANCE_SEED",
@@ -119,7 +119,7 @@ def test_config_validation():
 def test_run_feature_importance_end_to_end(trained_artifact):
     root, artifact = trained_artifact
     out = fi.run_feature_importance(str(root), str(artifact), config=fi.FeatureImportanceConfig(batch_size=11))
-    assert out.schema_version == 1
+    assert out.report_type == fi.FEATURE_IMPORTANCE_REPORT_TYPE
     assert out.selection_split == "val"
     assert set(r.head for r in out.records) == set(lm.MODEL_HEADS)
     assert set(out.summary["heads"].keys()) == set(lm.MODEL_HEADS)
@@ -216,7 +216,7 @@ def test_head_scopes_are_correct(trained_artifact):
     root, artifact = trained_artifact
     out = fi.run_feature_importance(str(root), str(artifact))
     counts = {head: {r.n_eval_rows for r in out.records if r.head == head} for head in lm.MODEL_HEADS}
-    assert counts[lm.NO_MOVE_HEAD] == {28}
+    assert counts[lm.NO_MOVE_HEAD] == {30}
     assert counts[lm.DIRECTION_HEAD] == {25}
     assert counts[lm.MAGNITUDE_UP_HEAD] == {10}
     assert counts[lm.MAGNITUDE_DOWN_HEAD] == {15}

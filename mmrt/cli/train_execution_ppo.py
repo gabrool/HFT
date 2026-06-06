@@ -526,7 +526,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
     env_config = _build_env_config(config)
     validate_linear_signal_artifact_metadata(
         linear_signals,
-        tape_schema_version=tape.manifest.schema_version,
+        tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
         symbol=tape.manifest.symbol,
         num_events=tape.manifest.num_events,
@@ -550,7 +550,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         "checkpoint_path": None if not config.save_checkpoint else str(checkpoint_path),
         "config": _summary_config(config),
         "tape": {
-            "schema_version": tape.manifest.schema_version,
+            "schema": tape.manifest.schema,
             "exchange": tape.manifest.exchange,
             "symbol": tape.manifest.symbol,
             "num_events": tape.manifest.num_events,

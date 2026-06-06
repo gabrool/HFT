@@ -601,7 +601,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     if baseline_fit.target_names:
         _write_npz_atomic(
             model_npz,
-            schema_version=np.array("mmrt_adverse_selection_ridge_v1"),
+            schema=np.array("mmrt_adverse_selection_ridge"),
             feature_names=np.asarray(baseline_fit.feature_names, dtype=object),
             target_names=np.asarray(baseline_fit.target_names, dtype=object),
             feature_mean=baseline_fit.feature_mean.astype(np.float32),
@@ -620,7 +620,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         "model_npz": str(model_npz) if model_written else None,
         "config": _summary_config(config),
         "tape": {
-            "schema_version": manifest.schema_version,
+            "schema": manifest.schema,
             "exchange": manifest.exchange,
             "symbol": manifest.symbol,
             "num_events": manifest.num_events,

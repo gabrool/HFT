@@ -170,7 +170,7 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         decision_event_index.append(decision_event_index[-1] + 1)
         decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
     metadata = LinearSignalArtifactMetadata(
-        tape_schema_version=tape.manifest.schema_version,
+        tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
         symbol=tape.manifest.symbol,
         num_events=tape.manifest.num_events,
@@ -324,8 +324,8 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["status"] in ("ok", "warning", "error")
     assert summary["run_type"] == "evaluate_execution_policy"
     assert (
-        summary["checkpoint"]["schema_version"]
-        == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
+        summary["checkpoint"]["schema"]
+        == "mmrt_execution_ppo_checkpoint"
     )
     assert summary["checkpoint"]["updates_completed"] == 1
     assert summary["checkpoint"]["has_observation_normalizer"] is True
@@ -336,8 +336,8 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
     assert summary["tape"]["symbol"] == "BTCUSDT"
     assert (
-        summary["linear_signals"]["schema_version"]
-        == "mmrt_execution_linear_signals_v3_aligned"
+        summary["linear_signals"]["schema"]
+        == "mmrt_execution_linear_signals_aligned"
     )
     assert summary["linear_signals"]["n_rows"] >= 1
     assert summary["linear_signals"]["fields"] == train_summary["linear_signals"]["fields"]
@@ -571,8 +571,8 @@ def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path,
     assert stdout_payload["run_type"] == "evaluate_execution_policy"
     assert stdout_payload["evaluation"]["steps"] > 0
     assert (
-        stdout_payload["linear_signals"]["schema_version"]
-        == "mmrt_execution_linear_signals_v3_aligned"
+        stdout_payload["linear_signals"]["schema"]
+        == "mmrt_execution_linear_signals_aligned"
     )
     assert "observation_schema" in stdout_payload
 

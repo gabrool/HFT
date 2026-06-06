@@ -128,7 +128,7 @@ def _tuple_of_nonnegative_floats(values: Any, name: str) -> tuple[float, ...]:
 
 
 class ExecutionTapeFormat(_StrEnum):
-    L2_TRADES_ARRAYS_V1 = "l2_trades_arrays_v1"
+    L2_TRADES_ARRAYS = "l2_trades_arrays"
 
 
 class ExecutionEventType(_StrEnum):
@@ -666,7 +666,7 @@ class ExecutionStepResult:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionTapeManifest:
-    schema_version: str
+    schema: str
     tape_format: ExecutionTapeFormat
     exchange: str
     symbol: str
@@ -683,7 +683,7 @@ class ExecutionTapeManifest:
     notes: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
-        _require_nonempty_str(self.schema_version, "schema_version")
+        _require_nonempty_str(self.schema, "schema")
         object.__setattr__(self, "tape_format", _coerce_enum(ExecutionTapeFormat, self.tape_format, "tape_format"))
         _require_nonempty_str(self.exchange, "exchange")
         _require_nonempty_str(self.symbol, "symbol")

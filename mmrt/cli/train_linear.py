@@ -159,7 +159,7 @@ def _summary_from_result(
         "dataset_root": dataset_root,
         "output_dir": output_dir,
         "result_json": paths["result_json"],
-        "schema_version": result.schema_version,
+        "schema": result.schema,
         "dataset_id": result.dataset_id,
         "manifest_hash": result.manifest_hash,
         "splits": {

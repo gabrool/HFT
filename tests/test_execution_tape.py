@@ -412,7 +412,7 @@ def test_manifest_json_helpers_round_trip():
     restored = execution_tape_manifest_from_dict(payload)
 
     assert restored == tape.manifest
-    assert json.loads(json.dumps(payload))["tape_format"] == "l2_trades_arrays_v1"
+    assert json.loads(json.dumps(payload))["tape_format"] == "l2_trades_arrays"
 
 
 def test_execution_tape_arrays_reject_invalid_event_pointers():
@@ -536,5 +536,5 @@ def test_explicit_book_depth_pads_snapshots():
     assert tape.arrays.book_bid_ticks.shape == (2, 3)
     assert tape.arrays.book_bid_ticks[0].tolist() == [1000, 999, 0]
     assert tape.arrays.book_bid_sizes[0].tolist() == [1.0, 2.0, 0.0]
-    assert tape.manifest.schema_version == "mmrt_execution_tape_v2_book_depth"
+    assert tape.manifest.schema == "mmrt_execution_tape_book_depth"
     assert tape.manifest.notes["book_depth"] == "3"

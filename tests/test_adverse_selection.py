@@ -288,7 +288,7 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     assert summary["baseline"]["enabled"] is True
     if model_npz.exists():
         npz = np.load(model_npz, allow_pickle=True)
-        assert str(npz["schema_version"]) == "mmrt_adverse_selection_ridge_v1"
+        assert str(npz["schema"]) == "mmrt_adverse_selection_ridge"
         assert "feature_mean" in npz
         assert "coefficients" in npz
 

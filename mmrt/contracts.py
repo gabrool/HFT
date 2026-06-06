@@ -74,7 +74,7 @@ class SplitRole(_StrEnum):
 
 
 class StorageFormat(_StrEnum):
-    FLAT_DECISION_ROWS_US_V1 = "flat_decision_rows_us_v1"
+    FLAT_DECISION_ROWS_US = "flat_decision_rows_us"
 
 
 def _require_nonempty_str(value: str, name: str) -> str:
@@ -578,7 +578,7 @@ class SplitPlan:
 
 @dataclass(frozen=True, slots=True)
 class DatasetManifest:
-    schema_version: str
+    schema: str
     storage_format: StorageFormat
     exchange: str
     symbol: str
@@ -586,17 +586,17 @@ class DatasetManifest:
     source_data_types: tuple[TardisDataType, ...]
     label_spec: LabelSpec
     lookback_rows: int
-    feature_schema_version: str
+    feature_schema: str
     feature_names_hash: str
     feature_dim: int
     segments: tuple[SegmentSpec, ...]
     split_plan: SplitPlan | None = None
 
     def __post_init__(self) -> None:
-        _require_nonempty_str(self.schema_version, "schema_version")
+        _require_nonempty_str(self.schema, "schema")
         object.__setattr__(self, "storage_format", _coerce_enum(StorageFormat, self.storage_format, "storage_format"))
-        if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US_V1:
-            raise ValueError("storage_format must be FLAT_DECISION_ROWS_US_V1")
+        if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US:
+            raise ValueError("storage_format must be FLAT_DECISION_ROWS_US")
         _require_nonempty_str(self.exchange, "exchange")
         _require_nonempty_str(self.symbol, "symbol")
         object.__setattr__(self, "time_unit", _coerce_enum(TimeUnit, self.time_unit, "time_unit"))
@@ -613,7 +613,7 @@ class DatasetManifest:
         if not isinstance(self.label_spec, LabelSpec):
             raise ValueError("label_spec must be LabelSpec")
         _require_int_us(self.lookback_rows, "lookback_rows")
-        _require_nonempty_str(self.feature_schema_version, "feature_schema_version")
+        _require_nonempty_str(self.feature_schema, "feature_schema")
         _require_nonempty_str(self.feature_names_hash, "feature_names_hash")
         _require_int_us(self.feature_dim, "feature_dim")
         if not isinstance(self.segments, tuple):

@@ -240,7 +240,7 @@ def test_dataclass_validation_errors():
     base_split = fa.FeatureAuditSplitSummary("train", 10, 10, 10, 1, 2, 0, 0)
     with pytest.raises(ValueError):
         fa.FeatureAuditResult(
-            fa.FEATURE_AUDIT_SCHEMA_VERSION,
+            fa.FEATURE_AUDIT_REPORT_TYPE,
             "a",
             "b",
             "c",
@@ -257,7 +257,7 @@ def test_dataclass_validation_errors():
         )
     with pytest.raises(ValueError):
         fa.FeatureAuditResult(
-            fa.FEATURE_AUDIT_SCHEMA_VERSION,
+            fa.FEATURE_AUDIT_REPORT_TYPE,
             "a",
             "b",
             "c",
