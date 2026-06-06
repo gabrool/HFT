@@ -23,6 +23,13 @@ from mmrt.execution.env import (
     action_array_to_continuous_action,
 )
 from mmrt.execution.fill_sim import FillSimulatorConfig
+from mmrt.execution.linear_signal import (
+    DIRECTION_PROBA_KEY,
+    MAGNITUDE_DOWN_KEY,
+    MAGNITUDE_UP_KEY,
+    NO_MOVE_PROBA_KEY,
+    predictions_to_signal_arrays,
+)
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.queue_model import QueueModelConfig, QueueModelMode
 from mmrt.execution.quote_geometry import ContinuousQuoteAction, QuoteGeometryConfig
@@ -130,6 +137,16 @@ def _env_config(**kwargs) -> ExecutionEnvConfig:
     return ExecutionEnvConfig(**base)
 
 
+def _linear_signals(n_rows: int = 16):
+    prediction = {
+        NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
+        DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
+        MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
+        MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
+    }
+    return predictions_to_signal_arrays(prediction)
+
+
 def _bid_only_action() -> ContinuousQuoteAction:
     return ContinuousQuoteAction(
         bid_enable_logit=1.0,
@@ -182,7 +199,7 @@ def test_reset_returns_initial_observation():
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
     )
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
 
     reset = env.reset()
 
@@ -198,7 +215,7 @@ def test_disabled_action_advances_without_orders_or_fills():
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
     )
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
     env.reset()
 
     step = env.step(_disabled_action())
@@ -225,7 +242,7 @@ def test_bid_trade_fill_updates_position_and_reward():
         )
     ]
     tape = _tape(l2_events, trades)
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
     env.reset()
 
     step = env.step(_bid_only_action())
@@ -257,7 +274,7 @@ def test_ask_trade_fill_updates_short_position():
         )
     ]
     tape = _tape(l2_events, trades)
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
     env.reset()
 
     step = env.step(_ask_only_action())
@@ -290,7 +307,7 @@ def test_l2_queue_decrease_advances_queue_without_artificial_fill():
         ),
     ]
     tape = _tape(l2_events, [])
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
     env.reset()
 
     step = env.step(_bid_only_action())
@@ -312,7 +329,7 @@ def test_repeated_decision_cancels_previous_live_order():
         _l2(seq=2, local_ts_us=300),
     ]
     tape = _tape(l2_events, [])
-    env = ExecutionEnv(tape, config=_env_config(decision_interval_us=50))
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config(decision_interval_us=50))
     env.reset()
 
     first = env.step(_bid_only_action())
@@ -331,7 +348,7 @@ def test_max_episode_steps_truncates():
         ],
         [],
     )
-    env = ExecutionEnv(tape, config=_env_config(max_episode_steps=1))
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config(max_episode_steps=1))
     env.reset()
 
     step = env.step(_disabled_action())
@@ -345,7 +362,7 @@ def test_step_after_terminal_rejected():
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
     )
-    env = ExecutionEnv(tape, config=_env_config(max_episode_steps=1))
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config(max_episode_steps=1))
     env.reset()
     env.step(_disabled_action())
 
@@ -354,28 +371,37 @@ def test_step_after_terminal_rejected():
 
 
 def test_linear_signal_rows_used_by_step_index():
-    from mmrt.execution.linear_signal import LinearSignalArrays
-
-    signals = LinearSignalArrays(
-        p_no_move=np.array([0.1, 0.2], dtype=np.float32),
-        p_up=np.array([0.6, 0.7], dtype=np.float32),
-        mag_up_bps=np.array([1.0, 2.0], dtype=np.float32),
-        mag_down_bps=np.array([3.0, 4.0], dtype=np.float32),
-        expected_return_bps=np.array([5.0, 6.0], dtype=np.float32),
-        confidence=np.array([0.11, 0.22], dtype=np.float32),
-    )
+    signals = _linear_signals(n_rows=2)
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
     )
-    env = ExecutionEnv(tape, config=_env_config(), linear_signals=signals)
+    env = ExecutionEnv(tape, linear_signals=signals, config=_env_config())
 
     reset = env.reset()
     idx = env.config.observation_schema.index("linear_p_no_move")
-    assert reset.observation[idx] == pytest.approx(0.1)
+    assert reset.observation[idx] == pytest.approx(0.2)
 
     step = env.step(_disabled_action())
     assert step.observation[idx] == pytest.approx(0.2)
+
+
+def test_execution_env_requires_linear_signals():
+    tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
+    with pytest.raises((TypeError, ValueError)):
+        ExecutionEnv(tape, config=_env_config(), linear_signals=None)
+
+
+def test_execution_env_rejects_insufficient_linear_signal_rows():
+    tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
+    with pytest.raises(ValueError, match="linear_signals"):
+        ExecutionEnv(tape, linear_signals=_linear_signals(n_rows=4), config=_env_config(max_episode_steps=4))
+
+
+def test_execution_env_source_has_no_linear_fallback():
+    source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
+    assert "neutral_linear_signal" not in source
+    assert "linear_signals is None" not in source
 
 
 def test_reset_rejects_tape_without_valid_two_sided_book():
@@ -400,7 +426,7 @@ def test_reset_rejects_tape_without_valid_two_sided_book():
         book_snapshot=snapshot,
     )
     tape = _tape([l2_event], [])
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
 
     with pytest.raises(ValueError, match="valid two-sided"):
         env.reset()
@@ -411,7 +437,7 @@ def test_env_step_info_is_json_safe_and_validated_by_contract():
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
     )
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
     env.reset()
 
     step = env.step(_disabled_action())
@@ -450,7 +476,7 @@ def test_reset_with_start_event_index_starts_later_in_tape():
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
         [],
     )
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
 
     reset = env.reset(start_event_index=1)
 
@@ -470,7 +496,7 @@ def test_unknown_trade_side_does_not_fill():
         )
     ]
     tape = _tape(l2_events, trades)
-    env = ExecutionEnv(tape, config=_env_config())
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(), config=_env_config())
     env.reset()
 
     step = env.step(_bid_only_action())

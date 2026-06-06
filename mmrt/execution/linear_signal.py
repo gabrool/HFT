@@ -1,9 +1,10 @@
-"""Adapters from supervised linear model predictions to execution signals."""
+"""Adapters from supervised linear model predictions to no-move-gated execution signals."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -21,6 +22,23 @@ DIRECTION_PROBA_KEY = "direction_proba"
 NO_MOVE_PROBA_KEY = "no_move_proba"
 MAGNITUDE_UP_KEY = "magnitude_up"
 MAGNITUDE_DOWN_KEY = "magnitude_down"
+
+LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION = "mmrt_execution_linear_signals_v2_no_move_gated"
+LINEAR_SIGNALS_FILENAME = "linear_signals.npz"
+_LINEAR_SIGNAL_CONSISTENCY_EPS = 1e-5
+_LINEAR_SIGNAL_ARRAY_FIELDS = (
+    "p_no_move",
+    "p_move",
+    "p_up_move",
+    "p_down_move",
+    "signed_move_prob",
+    "expected_up_bps",
+    "expected_down_bps",
+    "expected_return_bps",
+    "expected_abs_move_bps",
+    "predicted_vol_bps",
+    "confidence",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,28 +64,28 @@ class LinearSignalConfig:
 
 @dataclass(frozen=True, slots=True)
 class LinearSignalArrays:
-    """Compact vector representation of precomputed linear signals."""
+    """Validated vector representation of no-move-gated linear execution signals."""
 
     p_no_move: np.ndarray
-    p_up: np.ndarray
-    mag_up_bps: np.ndarray
-    mag_down_bps: np.ndarray
+    p_move: np.ndarray
+
+    p_up_move: np.ndarray
+    p_down_move: np.ndarray
+    signed_move_prob: np.ndarray
+
+    expected_up_bps: np.ndarray
+    expected_down_bps: np.ndarray
     expected_return_bps: np.ndarray
+    expected_abs_move_bps: np.ndarray
+    predicted_vol_bps: np.ndarray
+
     confidence: np.ndarray
 
     def __post_init__(self) -> None:
-        arrays = {
-            "p_no_move": self.p_no_move,
-            "p_up": self.p_up,
-            "mag_up_bps": self.mag_up_bps,
-            "mag_down_bps": self.mag_down_bps,
-            "expected_return_bps": self.expected_return_bps,
-            "confidence": self.confidence,
-        }
+        arrays = {name: getattr(self, name) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
         cleaned: dict[str, np.ndarray] = {}
         n_rows: int | None = None
         dtype: np.dtype | None = None
-
         for name, arr in arrays.items():
             if not isinstance(arr, np.ndarray):
                 raise ValueError(f"{name} must be a NumPy array")
@@ -81,18 +99,36 @@ class LinearSignalArrays:
             elif arr_dtype != dtype:
                 raise ValueError("all arrays must have the same dtype")
             if n_rows is None:
-                n_rows = arr.shape[0]
-            elif arr.shape[0] != n_rows:
+                n_rows = int(arr.shape[0])
+            elif int(arr.shape[0]) != n_rows:
                 raise ValueError("all arrays must have the same length")
             if not np.isfinite(arr).all():
                 raise ValueError(f"{name} must contain only finite values")
             cleaned[name] = np.ascontiguousarray(arr, dtype=arr_dtype)
+        if n_rows is None or n_rows == 0:
+            raise ValueError("linear signal arrays must contain at least one row")
 
-        if not ((cleaned["p_no_move"] >= 0.0).all() and (cleaned["p_no_move"] <= 1.0).all()):
-            raise ValueError("p_no_move must be in [0, 1]")
-        if not ((cleaned["p_up"] >= 0.0).all() and (cleaned["p_up"] <= 1.0).all()):
-            raise ValueError("p_up must be in [0, 1]")
-        for name in ("mag_up_bps", "mag_down_bps", "confidence"):
+        for name in ("p_no_move", "p_move", "p_up_move", "p_down_move"):
+            arr = cleaned[name]
+            if ((arr < 0.0) | (arr > 1.0)).any():
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not np.allclose(
+            cleaned["p_no_move"] + cleaned["p_move"],
+            1.0,
+            rtol=0.0,
+            atol=_LINEAR_SIGNAL_CONSISTENCY_EPS,
+        ):
+            raise ValueError("p_no_move + p_move must be approximately 1")
+        if not np.allclose(
+            cleaned["p_up_move"] + cleaned["p_down_move"],
+            cleaned["p_move"],
+            rtol=0.0,
+            atol=_LINEAR_SIGNAL_CONSISTENCY_EPS,
+        ):
+            raise ValueError("p_up_move + p_down_move must be approximately p_move")
+        if (np.abs(cleaned["signed_move_prob"]) > 1.0 + _LINEAR_SIGNAL_CONSISTENCY_EPS).any():
+            raise ValueError("signed_move_prob must have abs <= 1 + tolerance")
+        for name in ("expected_up_bps", "expected_down_bps", "expected_abs_move_bps", "predicted_vol_bps", "confidence"):
             if (cleaned[name] < 0.0).any():
                 raise ValueError(f"{name} must be nonnegative")
 
@@ -108,11 +144,7 @@ class LinearSignalArrays:
         return np.dtype(self.p_no_move.dtype)
 
 
-def magnitude_to_bps(
-    value: float,
-    *,
-    config: LinearSignalConfig = LinearSignalConfig(),
-) -> float:
+def magnitude_to_bps(value: float, *, config: LinearSignalConfig = LinearSignalConfig()) -> float:
     """Convert a scalar magnitude output to basis points."""
 
     config = _require_config(config)
@@ -124,41 +156,7 @@ def magnitude_to_bps(
     raise ValueError(f"unsupported magnitude_input: {config.magnitude_input}")
 
 
-def expected_return_bps(
-    *,
-    p_no_move: float,
-    p_up: float,
-    mag_up_bps: float,
-    mag_down_bps: float,
-    config: LinearSignalConfig = LinearSignalConfig(),
-) -> float:
-    """Compute signed expected return in bps from no-move, direction, and magnitude heads."""
-
-    config = _require_config(config)
-    p_no_move = _require_probability(p_no_move, "p_no_move", eps=config.probability_epsilon)
-    p_up = _require_probability(p_up, "p_up", eps=config.probability_epsilon)
-    mag_up_bps = _require_nonnegative_float(mag_up_bps, "mag_up_bps")
-    mag_down_bps = _require_nonnegative_float(mag_down_bps, "mag_down_bps")
-    p_move = 1.0 - p_no_move
-    return float(p_move * (p_up * mag_up_bps - (1.0 - p_up) * mag_down_bps))
-
-
-def signal_confidence(
-    *,
-    p_no_move: float,
-    p_up: float,
-    config: LinearSignalConfig = LinearSignalConfig(),
-) -> float:
-    """Compute bounded directional confidence from move probability and direction edge."""
-
-    config = _require_config(config)
-    p_no_move = _require_probability(p_no_move, "p_no_move", eps=config.probability_epsilon)
-    p_up = _require_probability(p_up, "p_up", eps=config.probability_epsilon)
-    p_move = 1.0 - p_no_move
-    return float(p_move * abs(2.0 * p_up - 1.0))
-
-
-def make_linear_signal(
+def build_gated_linear_signal(
     *,
     p_no_move: float,
     p_up: float,
@@ -166,41 +164,39 @@ def make_linear_signal(
     magnitude_down: float,
     config: LinearSignalConfig = LinearSignalConfig(),
 ) -> LinearSignal:
-    """Build a :class:`LinearSignal` from scalar probability and magnitude outputs."""
+    """Build a scalar no-move-gated execution signal from raw linear-head outputs."""
 
     config = _require_config(config)
     p_no_move = _require_probability(p_no_move, "p_no_move", eps=config.probability_epsilon)
     p_up = _require_probability(p_up, "p_up", eps=config.probability_epsilon)
     mag_up_bps = magnitude_to_bps(magnitude_up, config=config)
     mag_down_bps = magnitude_to_bps(magnitude_down, config=config)
-    expected = expected_return_bps(
-        p_no_move=p_no_move,
-        p_up=p_up,
-        mag_up_bps=mag_up_bps,
-        mag_down_bps=mag_down_bps,
-        config=config,
-    )
-    confidence = signal_confidence(p_no_move=p_no_move, p_up=p_up, config=config)
+
+    p_move = 1.0 - p_no_move
+    p_up_move = p_move * p_up
+    p_down_move = p_move * (1.0 - p_up)
+    signed_move_prob = p_up_move - p_down_move
+    expected_up_bps = p_up_move * mag_up_bps
+    expected_down_bps = p_down_move * mag_down_bps
+    expected_return_bps = expected_up_bps - expected_down_bps
+    expected_abs_move_bps = expected_up_bps + expected_down_bps
+    second_moment_bps2 = p_up_move * mag_up_bps * mag_up_bps + p_down_move * mag_down_bps * mag_down_bps
+    variance_bps2 = max(second_moment_bps2 - expected_return_bps * expected_return_bps, 0.0)
+    predicted_vol_bps = math.sqrt(variance_bps2)
+    confidence = abs(signed_move_prob)
+
     return LinearSignal(
         p_no_move=p_no_move,
-        p_up=p_up,
-        mag_up_bps=mag_up_bps,
-        mag_down_bps=mag_down_bps,
-        expected_return_bps=expected,
+        p_move=p_move,
+        p_up_move=p_up_move,
+        p_down_move=p_down_move,
+        signed_move_prob=signed_move_prob,
+        expected_up_bps=expected_up_bps,
+        expected_down_bps=expected_down_bps,
+        expected_return_bps=expected_return_bps,
+        expected_abs_move_bps=expected_abs_move_bps,
+        predicted_vol_bps=predicted_vol_bps,
         confidence=confidence,
-    )
-
-
-def neutral_linear_signal() -> LinearSignal:
-    """Return a neutral signal for rows without a supervised linear prediction."""
-
-    return LinearSignal(
-        p_no_move=1.0,
-        p_up=0.5,
-        mag_up_bps=0.0,
-        mag_down_bps=0.0,
-        expected_return_bps=0.0,
-        confidence=0.0,
     )
 
 
@@ -210,7 +206,7 @@ def prediction_row_to_signal(
     *,
     config: LinearSignalConfig = LinearSignalConfig(),
 ) -> LinearSignal:
-    """Convert one row from a linear model prediction dictionary into a signal."""
+    """Convert one row from a linear model prediction dictionary into a gated signal."""
 
     config = _require_config(config)
     row = _require_nonnegative_int(row, "row")
@@ -219,7 +215,7 @@ def prediction_row_to_signal(
         dtype=np.dtype("float64"),
     )
     row = _require_row_index(row, no_move_proba.shape[0])
-    return make_linear_signal(
+    return build_gated_linear_signal(
         p_no_move=float(no_move_proba[row, 1]),
         p_up=float(direction_proba[row, 1]),
         magnitude_up=float(magnitude_up[row]),
@@ -234,39 +230,47 @@ def predictions_to_signal_arrays(
     config: LinearSignalConfig = LinearSignalConfig(),
     output_dtype: str = "float32",
 ) -> LinearSignalArrays:
-    """Vectorize a batch of linear model predictions into compact signal arrays."""
+    """Vectorize raw linear model predictions into no-move-gated signal arrays."""
 
     config = _require_config(config)
     dtype = _require_output_dtype(output_dtype)
     no_move_proba, direction_proba, magnitude_up, magnitude_down = _required_prediction_arrays(prediction, dtype=dtype)
+    if no_move_proba.shape[0] == 0:
+        raise ValueError("prediction arrays must contain at least one row")
 
-    no_move_proba = _clean_probability_array(
-        no_move_proba,
-        eps=config.probability_epsilon,
-        name=NO_MOVE_PROBA_KEY,
-    )
-    direction_proba = _clean_probability_array(
-        direction_proba,
-        eps=config.probability_epsilon,
-        name=DIRECTION_PROBA_KEY,
-    )
+    no_move_proba = _clean_probability_array(no_move_proba, eps=config.probability_epsilon, name=NO_MOVE_PROBA_KEY)
+    direction_proba = _clean_probability_array(direction_proba, eps=config.probability_epsilon, name=DIRECTION_PROBA_KEY)
     p_no_move = no_move_proba[:, 1]
     p_up = direction_proba[:, 1]
-    mag_up_bps = _convert_magnitude_array(magnitude_up, config=config, dtype=dtype, name="magnitude_up")
-    mag_down_bps = _convert_magnitude_array(magnitude_down, config=config, dtype=dtype, name="magnitude_down")
+    mag_up_bps = _convert_magnitude_array(magnitude_up, config=config, dtype=dtype, name=MAGNITUDE_UP_KEY)
+    mag_down_bps = _convert_magnitude_array(magnitude_down, config=config, dtype=dtype, name=MAGNITUDE_DOWN_KEY)
 
     one = np.array(1.0, dtype=dtype)
-    two = np.array(2.0, dtype=dtype)
     p_move = one - p_no_move
-    expected = p_move * (p_up * mag_up_bps - (one - p_up) * mag_down_bps)
-    confidence = p_move * np.abs(two * p_up - one)
+    p_up_move = p_move * p_up
+    p_down_move = p_move * (one - p_up)
+    signed_move_prob = p_up_move - p_down_move
+    expected_up_bps = p_up_move * mag_up_bps
+    expected_down_bps = p_down_move * mag_down_bps
+    expected_return_bps = expected_up_bps - expected_down_bps
+    expected_abs_move_bps = expected_up_bps + expected_down_bps
+    second_moment_bps2 = p_up_move * mag_up_bps * mag_up_bps + p_down_move * mag_down_bps * mag_down_bps
+    variance_bps2 = second_moment_bps2 - expected_return_bps * expected_return_bps
+    variance_bps2 = np.maximum(variance_bps2, np.array(0.0, dtype=dtype))
+    predicted_vol_bps = np.sqrt(variance_bps2).astype(dtype, copy=False)
+    confidence = np.abs(signed_move_prob)
 
     return LinearSignalArrays(
         p_no_move=np.ascontiguousarray(p_no_move, dtype=dtype),
-        p_up=np.ascontiguousarray(p_up, dtype=dtype),
-        mag_up_bps=np.ascontiguousarray(mag_up_bps, dtype=dtype),
-        mag_down_bps=np.ascontiguousarray(mag_down_bps, dtype=dtype),
-        expected_return_bps=np.ascontiguousarray(expected, dtype=dtype),
+        p_move=np.ascontiguousarray(p_move, dtype=dtype),
+        p_up_move=np.ascontiguousarray(p_up_move, dtype=dtype),
+        p_down_move=np.ascontiguousarray(p_down_move, dtype=dtype),
+        signed_move_prob=np.ascontiguousarray(signed_move_prob, dtype=dtype),
+        expected_up_bps=np.ascontiguousarray(expected_up_bps, dtype=dtype),
+        expected_down_bps=np.ascontiguousarray(expected_down_bps, dtype=dtype),
+        expected_return_bps=np.ascontiguousarray(expected_return_bps, dtype=dtype),
+        expected_abs_move_bps=np.ascontiguousarray(expected_abs_move_bps, dtype=dtype),
+        predicted_vol_bps=np.ascontiguousarray(predicted_vol_bps, dtype=dtype),
         confidence=np.ascontiguousarray(confidence, dtype=dtype),
     )
 
@@ -277,14 +281,59 @@ def linear_signal_at(arrays: LinearSignalArrays, row: int) -> LinearSignal:
     if not isinstance(arrays, LinearSignalArrays):
         raise ValueError("arrays must be a LinearSignalArrays instance")
     row = _require_row_index(row, arrays.n_rows)
-    return LinearSignal(
-        p_no_move=float(arrays.p_no_move[row]),
-        p_up=float(arrays.p_up[row]),
-        mag_up_bps=float(arrays.mag_up_bps[row]),
-        mag_down_bps=float(arrays.mag_down_bps[row]),
-        expected_return_bps=float(arrays.expected_return_bps[row]),
-        confidence=float(arrays.confidence[row]),
-    )
+    return LinearSignal(**{name: float(getattr(arrays, name)[row]) for name in _LINEAR_SIGNAL_ARRAY_FIELDS})
+
+
+def save_linear_signal_arrays_npz(path: str | Path, arrays: LinearSignalArrays, *, overwrite: bool = False) -> None:
+    """Save validated linear signal arrays to the canonical execution NPZ artifact."""
+
+    if not isinstance(arrays, LinearSignalArrays):
+        raise ValueError("arrays must be LinearSignalArrays")
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(str(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    payload = {name: getattr(arrays, name) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
+    payload["schema_version"] = np.array(LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION)
+    with tmp.open("wb") as handle:
+        np.savez(handle, **payload)
+    tmp.replace(path)
+
+
+def load_linear_signal_arrays_npz(path: str | Path, *, mmap_mode: str | None = None) -> LinearSignalArrays:
+    """Load the required canonical no-move-gated linear signal NPZ artifact."""
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    with np.load(path, mmap_mode=mmap_mode) as data:
+        keys = set(data.files)
+        if "schema_version" not in keys:
+            raise ValueError("linear signal NPZ missing schema_version")
+        schema_version = str(np.asarray(data["schema_version"]).item())
+        if schema_version != LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION:
+            raise ValueError("linear signal NPZ schema_version mismatch")
+        required = set(_LINEAR_SIGNAL_ARRAY_FIELDS)
+        missing = sorted(required - keys)
+        if missing:
+            raise ValueError(f"linear signal NPZ missing required arrays: {missing}")
+        arrays = {name: np.array(data[name], copy=True) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
+    return LinearSignalArrays(**arrays)
+
+
+def linear_signal_arrays_summary(arrays: LinearSignalArrays, *, path: str | None = None) -> dict[str, object]:
+    if not isinstance(arrays, LinearSignalArrays):
+        raise ValueError("arrays must be LinearSignalArrays")
+    return {
+        "schema_version": LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION,
+        "path": path,
+        "n_rows": arrays.n_rows,
+        "dtype": str(arrays.dtype),
+        "fields": list(_LINEAR_SIGNAL_ARRAY_FIELDS),
+    }
 
 
 def _require_config(value: Any) -> LinearSignalConfig:
@@ -390,13 +439,7 @@ def _clean_probability_array(values: np.ndarray, *, eps: float, name: str) -> np
     return out
 
 
-def _convert_magnitude_array(
-    values: np.ndarray,
-    *,
-    config: LinearSignalConfig,
-    dtype: np.dtype,
-    name: str,
-) -> np.ndarray:
+def _convert_magnitude_array(values: np.ndarray, *, config: LinearSignalConfig, dtype: np.dtype, name: str) -> np.ndarray:
     if not np.isfinite(values).all():
         raise ValueError(f"{name} must contain only finite values")
     if (values < 0.0).any():
@@ -409,21 +452,23 @@ def _convert_magnitude_array(
 
 
 __all__ = [
-    "DIRECTION_PROBA_KEY",
-    "MAGNITUDE_DOWN_KEY",
-    "MAGNITUDE_INPUT_BPS",
     "MAGNITUDE_INPUT_LOG1P_BPS",
+    "MAGNITUDE_INPUT_BPS",
     "MAGNITUDE_INPUT_MODES",
-    "MAGNITUDE_UP_KEY",
+    "DIRECTION_PROBA_KEY",
     "NO_MOVE_PROBA_KEY",
-    "LinearSignalArrays",
+    "MAGNITUDE_UP_KEY",
+    "MAGNITUDE_DOWN_KEY",
+    "LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION",
+    "LINEAR_SIGNALS_FILENAME",
     "LinearSignalConfig",
-    "expected_return_bps",
-    "linear_signal_at",
+    "LinearSignalArrays",
     "magnitude_to_bps",
-    "make_linear_signal",
-    "neutral_linear_signal",
+    "build_gated_linear_signal",
     "prediction_row_to_signal",
     "predictions_to_signal_arrays",
-    "signal_confidence",
+    "linear_signal_at",
+    "save_linear_signal_arrays_npz",
+    "load_linear_signal_arrays_npz",
+    "linear_signal_arrays_summary",
 ]

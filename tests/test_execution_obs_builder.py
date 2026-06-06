@@ -14,6 +14,7 @@ from mmrt.execution.contracts import (
     PositionState,
     SymbolSpec,
 )
+from mmrt.execution.linear_signal import build_gated_linear_signal
 from mmrt.execution.obs_schema import (
     DEFAULT_OBSERVATION_FIELDS,
     MARKET_FIELDS,
@@ -59,13 +60,11 @@ def _top(local_ts_us: int = 1_000_000) -> BookTop:
 
 
 def _signal() -> LinearSignal:
-    return LinearSignal(
+    return build_gated_linear_signal(
         p_no_move=0.2,
         p_up=0.7,
-        mag_up_bps=10.0,
-        mag_down_bps=5.0,
-        expected_return_bps=4.4,
-        confidence=0.32,
+        magnitude_up=np.log1p(10.0),
+        magnitude_down=np.log1p(5.0),
     )
 
 
@@ -117,10 +116,23 @@ def _fill(
 def test_default_schema_fields_and_groups():
     schema = default_observation_schema()
 
-    assert schema.dim == 48
+    assert schema.dim == 53
     assert schema.field_names == DEFAULT_OBSERVATION_FIELDS
     assert schema.index("spread_ticks") == 0
+    assert schema.has_field("linear_p_no_move")
+    assert schema.has_field("linear_p_move")
+    assert schema.has_field("linear_p_up_move")
+    assert schema.has_field("linear_p_down_move")
+    assert schema.has_field("linear_signed_move_prob")
+    assert schema.has_field("linear_expected_up_bps")
+    assert schema.has_field("linear_expected_down_bps")
     assert schema.has_field("linear_expected_return_bps")
+    assert schema.has_field("linear_expected_abs_move_bps")
+    assert schema.has_field("linear_predicted_vol_bps")
+    assert schema.has_field("linear_confidence")
+    assert not schema.has_field("linear_" + "p_up")
+    assert not schema.has_field("linear_" + "mag_up_bps")
+    assert not schema.has_field("linear_" + "mag_down_bps")
     legacy_inventory_pnl_name = "_".join(("unrealized", "inventory", "pnl"))
     assert schema.has_field("inventory_abs_notional")
     assert not schema.has_field(legacy_inventory_pnl_name)
@@ -183,6 +195,7 @@ def test_build_market_neutral_observation():
         book_top=_top(),
         bid_depth=10,
         ask_depth=12,
+        linear_signal=_signal(),
     )
 
     obs = builder.build(inputs)
@@ -201,10 +214,9 @@ def test_build_market_neutral_observation():
     microprice = (100.0 * 1.0 + 100.2 * 2.0) / 3.0
     assert obs[schema.index("microprice_bps")] == pytest.approx((microprice - 100.1) / 100.1 * 10_000.0)
 
-    # No signal provided -> neutral.
-    assert obs[schema.index("linear_p_no_move")] == pytest.approx(1.0)
-    assert obs[schema.index("linear_p_up")] == pytest.approx(0.5)
-    assert obs[schema.index("linear_expected_return_bps")] == pytest.approx(0.0)
+    assert obs[schema.index("linear_p_no_move")] == pytest.approx(0.2)
+    assert obs[schema.index("linear_p_move")] == pytest.approx(0.8)
+    assert obs[schema.index("linear_expected_abs_move_bps")] == pytest.approx(6.8)
 
 
 def test_build_observation_uses_linear_signal():
@@ -221,10 +233,15 @@ def test_build_observation_uses_linear_signal():
     )
 
     assert obs[schema.index("linear_p_no_move")] == pytest.approx(0.2)
-    assert obs[schema.index("linear_p_up")] == pytest.approx(0.7)
-    assert obs[schema.index("linear_mag_up_bps")] == pytest.approx(10.0)
-    assert obs[schema.index("linear_mag_down_bps")] == pytest.approx(5.0)
+    assert obs[schema.index("linear_p_move")] == pytest.approx(0.8)
+    assert obs[schema.index("linear_p_up_move")] == pytest.approx(0.56)
+    assert obs[schema.index("linear_p_down_move")] == pytest.approx(0.24)
+    assert obs[schema.index("linear_signed_move_prob")] == pytest.approx(0.32)
+    assert obs[schema.index("linear_expected_up_bps")] == pytest.approx(5.6)
+    assert obs[schema.index("linear_expected_down_bps")] == pytest.approx(1.2)
     assert obs[schema.index("linear_expected_return_bps")] == pytest.approx(4.4)
+    assert obs[schema.index("linear_expected_abs_move_bps")] == pytest.approx(6.8)
+    assert obs[schema.index("linear_predicted_vol_bps")] == pytest.approx(np.sqrt(62.0 - 4.4 * 4.4))
     assert obs[schema.index("linear_confidence")] == pytest.approx(0.32)
 
 
@@ -244,6 +261,7 @@ def test_build_observation_position_fields():
             ),
             bid_depth=1,
             ask_depth=1,
+            linear_signal=_signal(),
             position=position,
         ),
         schema=schema,
@@ -272,6 +290,7 @@ def test_build_observation_live_order_fields():
             book_top=_top(local_ts_us=1_000_000),
             bid_depth=1,
             ask_depth=1,
+            linear_signal=_signal(),
             live_orders=(bid, ask),
         ),
         schema=schema,
@@ -307,6 +326,7 @@ def test_non_live_orders_ignored():
             book_top=_top(),
             bid_depth=1,
             ask_depth=1,
+            linear_signal=_signal(),
             live_orders=(cancelled,),
         ),
         schema=schema,
@@ -327,6 +347,7 @@ def test_duplicate_live_side_rejected():
                 book_top=_top(),
                 bid_depth=1,
                 ask_depth=1,
+                linear_signal=_signal(),
                 live_orders=(bid1, bid2),
             )
         )
@@ -343,6 +364,7 @@ def test_build_observation_fill_fields():
             book_top=_top(local_ts_us=1_000_000),
             bid_depth=1,
             ask_depth=1,
+            linear_signal=_signal(),
             recent_fills=(buy, sell),
         ),
         schema=schema,
@@ -371,6 +393,7 @@ def test_future_fill_rejected():
                 book_top=_top(local_ts_us=1_000_000),
                 bid_depth=1,
                 ask_depth=1,
+                linear_signal=_signal(),
                 recent_fills=(future,),
             )
         )
@@ -392,6 +415,7 @@ def test_time_context_fields():
             book_top=_top(local_ts_us=2_000_000),
             bid_depth=1,
             ask_depth=1,
+            linear_signal=_signal(),
             context=context,
         ),
         schema=schema,
@@ -403,7 +427,7 @@ def test_time_context_fields():
 
 
 def test_custom_schema_subset():
-    schema = ObservationSchema(field_names=("spread_ticks", "linear_p_up", "cash"), dtype="float32")
+    schema = ObservationSchema(field_names=("spread_ticks", "linear_p_up_move", "cash"), dtype="float32")
 
     obs = build_observation(
         ObservationInput(
@@ -411,15 +435,15 @@ def test_custom_schema_subset():
             book_top=_top(),
             bid_depth=1,
             ask_depth=1,
-            position=PositionState(cash=123.0),
             linear_signal=_signal(),
+            position=PositionState(cash=123.0),
         ),
         schema=schema,
     )
 
     assert obs.shape == (3,)
     assert obs[0] == pytest.approx(2.0)
-    assert obs[1] == pytest.approx(0.7)
+    assert obs[1] == pytest.approx(0.56)
     assert obs[2] == pytest.approx(123.0)
 
 
@@ -434,6 +458,7 @@ def test_out_buffer_reused_and_zeroed():
             book_top=_top(),
             bid_depth=1,
             ask_depth=1,
+            linear_signal=_signal(),
         ),
         out=out,
     )
@@ -450,6 +475,7 @@ def test_out_buffer_reused_and_zeroed():
                 book_top=_top(),
                 bid_depth=1,
                 ask_depth=1,
+                linear_signal=_signal(),
             ),
             out=bad_out,
         )
@@ -468,6 +494,7 @@ def test_max_abs_observation_clipping():
             book_top=_top(),
             bid_depth=1,
             ask_depth=1,
+            linear_signal=_signal(),
             position=PositionState(cash=123.0),
         )
     )
@@ -482,7 +509,14 @@ def test_invalid_observation_inputs_rejected():
             book_top=_top(),
             bid_depth=-1,
             ask_depth=1,
+            linear_signal=_signal(),
         )
+
+    with pytest.raises(TypeError):
+        ObservationInput(symbol_spec=_spec(), book_top=_top(), bid_depth=1, ask_depth=1)
+
+    with pytest.raises(ValueError):
+        ObservationInput(symbol_spec=_spec(), book_top=_top(), bid_depth=1, ask_depth=1, linear_signal=None)
 
     with pytest.raises(ValueError):
         ObservationContext(

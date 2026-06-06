@@ -1,6 +1,8 @@
 import inspect
 import json
 
+import numpy as np
+
 import pytest
 import torch
 
@@ -10,6 +12,15 @@ from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
+from mmrt.execution.linear_signal import (
+    DIRECTION_PROBA_KEY,
+    LINEAR_SIGNALS_FILENAME,
+    MAGNITUDE_DOWN_KEY,
+    MAGNITUDE_UP_KEY,
+    NO_MOVE_PROBA_KEY,
+    predictions_to_signal_arrays,
+    save_linear_signal_arrays_npz,
+)
 from mmrt.cli.train_execution_ppo import ExecutionPPOTrainCLIConfig, run_execution_ppo_training
 from mmrt.cli.evaluate_execution_policy import (
     ExecutionPolicyEvaluationCLIConfig,
@@ -129,6 +140,18 @@ def _tiny_events():
     return l2_events, trades
 
 
+def _save_linear_signals(root, n_rows: int = 16):
+    arrays = predictions_to_signal_arrays({
+        NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
+        DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
+        MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
+        MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
+    })
+    path = root / LINEAR_SIGNALS_FILENAME
+    save_linear_signal_arrays_npz(path, arrays, overwrite=True)
+    return path
+
+
 def _tiny_tape():
     l2_events, trades = _tiny_events()
     return _tape(l2_events, trades)
@@ -137,6 +160,12 @@ def _tiny_tape():
 def _tiny_env(max_episode_steps: int | None = 4) -> ExecutionEnv:
     return ExecutionEnv(
         _tiny_tape(),
+        linear_signals=predictions_to_signal_arrays({
+            NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (16, 1)),
+            DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (16, 1)),
+            MAGNITUDE_UP_KEY: np.full(16, np.log1p(10.0), dtype=np.float32),
+            MAGNITUDE_DOWN_KEY: np.full(16, np.log1p(5.0), dtype=np.float32),
+        }),
         config=ExecutionEnvConfig(
             decision_interval_us=50,
             max_episode_steps=max_episode_steps,
@@ -145,7 +174,9 @@ def _tiny_env(max_episode_steps: int | None = 4) -> ExecutionEnv:
 
 
 def _tiny_tape_root(tmp_path):
-    return _save_tape(tmp_path, _tiny_tape())
+    root = _save_tape(tmp_path, _tiny_tape())
+    _save_linear_signals(root)
+    return root
 
 
 def _train_tiny_checkpoint(tmp_path):
@@ -248,7 +279,7 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert json.loads(output_json.read_text()) == summary
     assert summary["status"] in ("ok", "warning", "error")
     assert summary["run_type"] == "evaluate_execution_policy"
-    assert summary["checkpoint"]["schema_version"] == "mmrt_execution_ppo_checkpoint_v1"
+    assert summary["checkpoint"]["schema_version"] == "mmrt_execution_ppo_checkpoint_v2_required_linear_signals"
     assert summary["checkpoint"]["updates_completed"] == 1
     assert summary["checkpoint"]["has_observation_normalizer"] is True
     assert summary["env_config_source"] == "checkpoint_cli_config"
@@ -256,7 +287,43 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["evaluation"]["steps"] <= 4
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
     assert summary["tape"]["symbol"] == "BTCUSDT"
+    assert summary["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v2_no_move_gated"
 
+
+
+def test_evaluate_execution_policy_requires_linear_signals_file(tmp_path):
+    _, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    eval_root = _save_tape(tmp_path / "eval", _tiny_tape())
+    with pytest.raises(FileNotFoundError):
+        run_execution_policy_evaluation(
+            ExecutionPolicyEvaluationCLIConfig(
+                tape_root=str(eval_root),
+                checkpoint_path=str(checkpoint_path),
+                output_json=str(tmp_path / "eval_summary.json"),
+                overwrite=True,
+                max_steps=4,
+            )
+        )
+
+
+def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint["observation_schema"] = dict(checkpoint["observation_schema"])
+    checkpoint["observation_schema"]["field_names"] = checkpoint["observation_schema"]["field_names"][:-1]
+    bad_checkpoint = tmp_path / "bad_checkpoint.pt"
+    torch.save(checkpoint, bad_checkpoint)
+
+    with pytest.raises(ValueError, match="observation_schema"):
+        run_execution_policy_evaluation(
+            ExecutionPolicyEvaluationCLIConfig(
+                tape_root=str(tape_root),
+                checkpoint_path=str(bad_checkpoint),
+                output_json=str(tmp_path / "eval_bad_summary.json"),
+                overwrite=True,
+                max_steps=4,
+            )
+        )
 
 def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path, capsys):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)

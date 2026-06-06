@@ -428,7 +428,7 @@ def make_training_checkpoint_payload(result: PPOTrainingResult) -> dict[str, obj
         raise TypeError("result must be a PPOTrainingResult")
 
     return {
-        "schema_version": "mmrt_execution_ppo_checkpoint_v1",
+        "schema_version": "mmrt_execution_ppo_checkpoint_v2_required_linear_signals",
         "updates_completed": result.updates_completed,
         "config": training_config_to_dict(result.config),
         "summary": result.summary_dict(),

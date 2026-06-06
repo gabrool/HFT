@@ -162,13 +162,27 @@ def test_decision_ref_sequence_window_validation():
 
 
 def test_linear_signal_bounds_and_negative_expected_return():
-    signal = LinearSignal(0.2, 0.7, 1.0, 2.0, -0.5, 0.9)
-    assert signal.expected_return_bps == pytest.approx(-0.5)
+    signal = LinearSignal(
+        p_no_move=0.2,
+        p_move=0.8,
+        p_up_move=0.3,
+        p_down_move=0.5,
+        signed_move_prob=-0.2,
+        expected_up_bps=1.0,
+        expected_down_bps=2.0,
+        expected_return_bps=-1.0,
+        expected_abs_move_bps=3.0,
+        predicted_vol_bps=1.5,
+        confidence=0.2,
+    )
+    assert signal.expected_return_bps == pytest.approx(-1.0)
 
     with pytest.raises(ValueError):
-        LinearSignal(0.2, 1.1, 1.0, 2.0, 0.0, 0.9)
+        LinearSignal(0.2, 1.1, 0.3, 0.5, -0.2, 1.0, 2.0, -1.0, 3.0, 1.5, 0.2)
     with pytest.raises(ValueError):
-        LinearSignal(0.2, 0.7, -1.0, 2.0, 0.0, 0.9)
+        LinearSignal(0.2, 0.8, 0.3, 0.5, -0.2, -1.0, 2.0, -1.0, 3.0, 1.5, 0.2)
+    with pytest.raises(ValueError):
+        LinearSignal(0.2, 0.9, 0.3, 0.5, -0.2, 1.0, 2.0, -1.0, 3.0, 1.5, 0.2)
 
 
 def test_action_spec_validation():

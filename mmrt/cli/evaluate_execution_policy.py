@@ -14,6 +14,12 @@ from mmrt.execution.contracts import ActionSpec, PositionState, QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
+from mmrt.execution.linear_signal import (
+    LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION,
+    LINEAR_SIGNALS_FILENAME,
+    load_linear_signal_arrays_npz,
+    linear_signal_arrays_summary,
+)
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.quote_geometry import QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
@@ -152,6 +158,7 @@ class ExecutionPolicyEvaluationCLIConfig:
     tape_root: str
     checkpoint_path: str
     output_json: str | None = None
+    linear_signals_npz: str | None = None
     overwrite: bool = False
     mmap_mode: str | None = "r"
 
@@ -190,6 +197,8 @@ class ExecutionPolicyEvaluationCLIConfig:
         _require_nonempty_str(self.checkpoint_path, "checkpoint_path")
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
+        if self.linear_signals_npz is not None:
+            _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
         _require_bool(self.overwrite, "overwrite")
         if self.mmap_mode not in (None, "r"):
             raise ValueError('mmap_mode must be None or "r"')
@@ -235,6 +244,7 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "tape_root": config.tape_root,
         "checkpoint_path": config.checkpoint_path,
         "output_json": config.output_json,
+        "linear_signals_npz": config.linear_signals_npz,
         "overwrite": config.overwrite,
         "mmap_mode": config.mmap_mode,
         "decision_interval_us": config.decision_interval_us,
@@ -385,8 +395,8 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
 def _load_checkpoint(path: str | Path, *, device: torch.device) -> Mapping[str, object]:
     payload = torch.load(path, map_location=device)
     payload = _require_mapping(payload, "checkpoint payload")
-    if payload.get("schema_version") != "mmrt_execution_ppo_checkpoint_v1":
-        raise ValueError("checkpoint schema_version is not mmrt_execution_ppo_checkpoint_v1")
+    if payload.get("schema_version") != "mmrt_execution_ppo_checkpoint_v2_required_linear_signals":
+        raise ValueError("checkpoint schema_version is not mmrt_execution_ppo_checkpoint_v2_required_linear_signals")
     _mapping_get_mapping(payload, "config")
     if "policy_state_dict" not in payload:
         raise ValueError("policy_state_dict is required")
@@ -491,6 +501,10 @@ def _default_output_json(tape_root: str) -> Path:
     return Path(tape_root) / "evaluate_execution_policy_summary.json"
 
 
+def _default_linear_signals_npz(tape_root: str) -> Path:
+    return Path(tape_root) / LINEAR_SIGNALS_FILENAME
+
+
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -512,6 +526,12 @@ def run_execution_policy_evaluation(
     dtype = _coerce_dtype(config.dtype)
     checkpoint = _load_checkpoint(config.checkpoint_path, device=device)
     tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode)
+    linear_signals_path = (
+        Path(config.linear_signals_npz)
+        if config.linear_signals_npz is not None
+        else _default_linear_signals_npz(config.tape_root)
+    )
+    linear_signals = load_linear_signal_arrays_npz(linear_signals_path)
 
     raw_cli_config = _mapping_get_optional_mapping(checkpoint, "cli_config")
     if config.use_checkpoint_cli_env_config and raw_cli_config is not None:
@@ -521,7 +541,20 @@ def run_execution_policy_evaluation(
         env_config = _env_config_from_cli_config(config)
         env_config_source = "evaluation_cli_config"
 
-    env = ExecutionEnv(tape, config=env_config)
+    env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals)
+    checkpoint_schema = checkpoint.get("observation_schema")
+    if checkpoint_schema is None:
+        raise ValueError("checkpoint missing observation_schema")
+    if checkpoint_schema != env.config.observation_schema.as_dict():
+        raise ValueError("checkpoint observation_schema does not match evaluation env observation_schema")
+    checkpoint_linear_schema = checkpoint.get("linear_signals")
+    if checkpoint_linear_schema is None:
+        raise ValueError("checkpoint missing linear_signals metadata")
+    checkpoint_linear_schema = _require_mapping(checkpoint_linear_schema, "checkpoint linear_signals")
+    if checkpoint_linear_schema.get("schema_version") != LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION:
+        raise ValueError("checkpoint linear signal schema mismatch")
+    if checkpoint_linear_schema.get("fields") != linear_signal_arrays_summary(linear_signals)["fields"]:
+        raise ValueError("checkpoint linear signal fields mismatch")
     obs_dim = int(env.config.observation_schema.dim)
     policy = _load_policy_from_checkpoint(
         checkpoint,
@@ -594,6 +627,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-path", required=True)
 
     parser.add_argument("--output-json")
+    parser.add_argument(
+        "--linear-signals-npz",
+        help="Canonical no-move-gated linear signal NPZ. Defaults to <tape-root>/linear_signals.npz. Required; missing file is an error.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
 
@@ -630,6 +667,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         tape_root=args.tape_root,
         checkpoint_path=args.checkpoint_path,
         output_json=args.output_json,
+        linear_signals_npz=args.linear_signals_npz,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
         decision_interval_us=args.decision_interval_us,

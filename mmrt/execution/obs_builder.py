@@ -17,7 +17,6 @@ from mmrt.execution.contracts import (
     PositionState,
     SymbolSpec,
 )
-from mmrt.execution.linear_signal import neutral_linear_signal
 from mmrt.execution.obs_schema import (
     ObservationSchema,
     default_observation_schema,
@@ -81,10 +80,11 @@ class ObservationInput:
     book_top: BookTop
     bid_depth: int
     ask_depth: int
+    linear_signal: LinearSignal
+
     position: PositionState = PositionState()
     live_orders: tuple[ActiveOrder, ...] = ()
     recent_fills: tuple[Fill, ...] = ()
-    linear_signal: LinearSignal | None = None
     context: ObservationContext | None = None
 
     def __post_init__(self) -> None:
@@ -95,8 +95,8 @@ class ObservationInput:
         _require_position(self.position)
         object.__setattr__(self, "live_orders", _orders_tuple(self.live_orders))
         object.__setattr__(self, "recent_fills", _fills_tuple(self.recent_fills))
-        if self.linear_signal is not None and not isinstance(self.linear_signal, LinearSignal):
-            raise ValueError("linear_signal must be None or LinearSignal")
+        if not isinstance(self.linear_signal, LinearSignal):
+            raise ValueError("linear_signal must be LinearSignal")
         if self.context is not None and not isinstance(self.context, ObservationContext):
             raise ValueError("context must be None or ObservationContext")
 
@@ -175,12 +175,17 @@ class ObservationBuilder:
         set_field("bid_top_size", bid_top_size)
         set_field("ask_top_size", ask_top_size)
 
-        signal = inputs.linear_signal if inputs.linear_signal is not None else neutral_linear_signal()
+        signal = inputs.linear_signal
         set_field("linear_p_no_move", signal.p_no_move)
-        set_field("linear_p_up", signal.p_up)
-        set_field("linear_mag_up_bps", signal.mag_up_bps)
-        set_field("linear_mag_down_bps", signal.mag_down_bps)
+        set_field("linear_p_move", signal.p_move)
+        set_field("linear_p_up_move", signal.p_up_move)
+        set_field("linear_p_down_move", signal.p_down_move)
+        set_field("linear_signed_move_prob", signal.signed_move_prob)
+        set_field("linear_expected_up_bps", signal.expected_up_bps)
+        set_field("linear_expected_down_bps", signal.expected_down_bps)
         set_field("linear_expected_return_bps", signal.expected_return_bps)
+        set_field("linear_expected_abs_move_bps", signal.expected_abs_move_bps)
+        set_field("linear_predicted_vol_bps", signal.predicted_vol_bps)
         set_field("linear_confidence", signal.confidence)
 
         position = inputs.position

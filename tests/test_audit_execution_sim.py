@@ -18,6 +18,15 @@ from mmrt.execution.contracts import (
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
+from mmrt.execution.linear_signal import (
+    DIRECTION_PROBA_KEY,
+    LINEAR_SIGNALS_FILENAME,
+    MAGNITUDE_DOWN_KEY,
+    MAGNITUDE_UP_KEY,
+    NO_MOVE_PROBA_KEY,
+    predictions_to_signal_arrays,
+    save_linear_signal_arrays_npz,
+)
 from mmrt.execution.metrics import ExecutionMetricAccumulator, summarize_execution_steps
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
 from mmrt.cli.audit_execution_sim import (
@@ -112,6 +121,18 @@ def _save_tape(tmp_path, tape):
     return root
 
 
+def _save_linear_signals(root: Path, n_rows: int = 16) -> Path:
+    arrays = predictions_to_signal_arrays({
+        NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
+        DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
+        MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
+        MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
+    })
+    path = root / LINEAR_SIGNALS_FILENAME
+    save_linear_signal_arrays_npz(path, arrays, overwrite=True)
+    return path
+
+
 def test_metrics_empty_summary():
     acc = ExecutionMetricAccumulator()
     summary = acc.as_dict()
@@ -127,6 +148,7 @@ def test_disabled_audit_runs_and_warns_no_fills(tmp_path):
         [],
     )
     tape_root = _save_tape(tmp_path, tape)
+    _save_linear_signals(tape_root)
     output_json = tmp_path / "summary.json"
 
     summary = run_execution_sim_audit(
@@ -165,6 +187,7 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
         )
     ]
     tape_root = _save_tape(tmp_path, _tape(l2_events, trades))
+    _save_linear_signals(tape_root)
 
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
@@ -225,12 +248,28 @@ def test_diagnostics_threshold_warnings():
     assert "total_reward_below_threshold" in report.warnings
 
 
+
+def test_audit_execution_sim_requires_linear_signals_file(tmp_path):
+    tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
+    tape_root = _save_tape(tmp_path, tape)
+    with pytest.raises(FileNotFoundError):
+        run_execution_sim_audit(
+            ExecutionSimAuditConfig(
+                tape_root=str(tape_root),
+                output_json=str(tmp_path / "summary.json"),
+                policy="disabled",
+                max_steps=1,
+                overwrite=True,
+            )
+        )
+
 def test_audit_execution_sim_main_writes_summary_and_prints_json(tmp_path, capsys):
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
     )
     tape_root = _save_tape(tmp_path, tape)
+    _save_linear_signals(tape_root)
     output_json = tmp_path / "summary.json"
 
     rc = main(
@@ -263,6 +302,7 @@ def test_audit_execution_sim_refuses_overwrite_without_flag(tmp_path):
         [],
     )
     tape_root = _save_tape(tmp_path, tape)
+    _save_linear_signals(tape_root)
     output_json = tmp_path / "summary.json"
     output_json.write_text("{}", encoding="utf-8")
 
