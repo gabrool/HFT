@@ -500,7 +500,6 @@ class ActionSpec:
     mode: ActionMode = ActionMode.CONTINUOUS_LATENT
     max_distance_ticks: int = 20
     max_order_qty: float = 0.01
-    default_order_qty: float = 0.001
     allow_bid: bool = True
     allow_ask: bool = True
 
@@ -508,7 +507,6 @@ class ActionSpec:
         object.__setattr__(self, "mode", _coerce_enum(ActionMode, self.mode, "mode"))
         _require_positive_int(self.max_distance_ticks, "max_distance_ticks")
         object.__setattr__(self, "max_order_qty", _require_positive_float(self.max_order_qty, "max_order_qty"))
-        object.__setattr__(self, "default_order_qty", _require_positive_float(self.default_order_qty, "default_order_qty"))
         _require_bool(self.allow_bid, "allow_bid")
         _require_bool(self.allow_ask, "allow_ask")
         if not (self.allow_bid or self.allow_ask):

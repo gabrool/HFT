@@ -226,17 +226,31 @@ def test_multiple_pending_decisions_mature_fifo():
     assert b.pending_count == 0
 
 
-def test_equal_decision_timestamps_allowed():
+def test_same_timestamp_distinct_decision_event_sequences_allowed():
     s = spec(horizons=(100_000,), entry_delay=0)
     b = lb.LabelBuilder(s)
+
     b.on_decision_local(1_000_000, 0)
-    b.on_decision_local(1_000_000, 0)
+    b.on_decision_local(1_000_000, 1)
+
     b.observe_price_local(1_000_000, 0, 100.0)
-    b.observe_price_local(1_100_000, 0, 105.0)
-    out = b.observe_price_local(1_100_001, 0, 105.0)
+    b.observe_price_local(1_000_000, 1, 101.0)
+    b.observe_price_local(1_100_000, 2, 105.0)
+    out = b.observe_price_local(1_100_001, 3, 105.0)
+
     assert len(out) == 2
-    assert out[0].decision_ts_us == out[1].decision_ts_us == 1_000_000
-    assert out[0].values_bps == pytest.approx(out[1].values_bps)
+    assert [(r.decision_ts_us, r.decision_event_seq) for r in out] == [
+        (1_000_000, 0),
+        (1_000_000, 1),
+    ]
+
+
+def test_duplicate_decision_event_key_rejected():
+    b = lb.LabelBuilder(spec(horizons=(100_000,), entry_delay=0))
+
+    b.on_decision_local(1_000_000, 0)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        b.on_decision_local(1_000_000, 0)
 
 
 def test_on_decision_local_rejects_decreasing_decision_local_timestamps():
@@ -257,7 +271,8 @@ def test_on_decision_rejects_decreasing_after_pending_matures():
     assert b.pending_count == 0
     with pytest.raises(ValueError):
         b.on_decision_local(999_999, 0)
-    b.on_decision_local(1_000_000, 0)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        b.on_decision_local(1_000_000, 0)
     b.on_decision_local(1_000_001, 0)
 
 

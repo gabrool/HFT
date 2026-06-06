@@ -119,6 +119,23 @@ def test_write_matured_labels_uses_values_bps():
     assert counters.rows_written == 1
 
 
+def test_write_matured_labels_missing_full_event_key_raises():
+    class W:
+        def append_values(self, **kwargs):
+            raise AssertionError("writer should not be called")
+
+    pending = {(10, 2): cli.PendingDecision(1, 10, 10, 2, 100.0, (0.1,))}
+    label = LabelResult(decision_ts_us=10, decision_event_seq=1, entry_ts_us=11, horizons_us=(12,), values_bps=(1.0,))
+    counters = cli.IngestCounters()
+
+    with pytest.raises(KeyError):
+        cli._write_matured_labels([label], pending, W(), counters)
+
+    assert pending == {(10, 2): cli.PendingDecision(1, 10, 10, 2, 100.0, (0.1,))}
+    assert counters.labels_matured == 0
+    assert counters.rows_written == 0
+
+
 def test_parser_defaults(tmp_path: Path):
     b, t = _book_trade_files(tmp_path)
     args = cli.build_arg_parser().parse_args(["--dataset-root", str(tmp_path / "ds"), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t)])
