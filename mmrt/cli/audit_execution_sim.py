@@ -15,8 +15,9 @@ from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
-    load_linear_signal_arrays_npz,
-    linear_signal_arrays_summary,
+    load_linear_signal_artifact_npz,
+    linear_signal_artifact_summary,
+    validate_linear_signal_artifact_metadata,
 )
 from mmrt.execution.metrics import ExecutionMetricAccumulator
 from mmrt.execution.queue_model import QueueModelConfig
@@ -219,6 +220,10 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
+def _effective_start_event_index(value: int | None) -> int:
+    return 0 if value is None else value
+
+
 def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object]:
     if not isinstance(config, ExecutionSimAuditConfig):
         raise ValueError("config must be ExecutionSimAuditConfig")
@@ -233,7 +238,21 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         if config.linear_signals_npz is not None
         else _default_linear_signals_npz(config.tape_root)
     )
-    linear_signals = load_linear_signal_arrays_npz(linear_signals_path)
+    linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
+    validate_linear_signal_artifact_metadata(
+        linear_signals,
+        tape_schema_version=tape.manifest.schema_version,
+        exchange=tape.manifest.exchange,
+        symbol=tape.manifest.symbol,
+        num_events=tape.manifest.num_events,
+        num_l2_batches=tape.manifest.num_l2_batches,
+        num_trades=tape.manifest.num_trades,
+        start_local_ts_us=tape.manifest.start_local_ts_us,
+        end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_interval_us=config.decision_interval_us,
+        start_event_index=_effective_start_event_index(config.start_event_index),
+        min_rows=(config.max_steps + 1) if config.max_steps is not None else None,
+    )
     env_config = ExecutionEnvConfig(
         decision_interval_us=config.decision_interval_us,
         action_spec=ActionSpec(
@@ -297,7 +316,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         },
         "metrics": metrics,
         "diagnostics": report.as_dict(),
-        "linear_signals": linear_signal_arrays_summary(linear_signals, path=str(linear_signals_path)),
+        "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
