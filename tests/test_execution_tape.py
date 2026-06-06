@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,7 @@ from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, ExecutionEventRef, ExecutionEventType, SymbolSpec, TradePrint
 from mmrt.execution.event_merge import MergedExecutionEvent, merge_execution_events
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import (
     EVENT_DTYPE,
     L2_EVENT_DTYPE,
@@ -30,6 +32,28 @@ from mmrt.execution.execution_tape import (
     save_execution_tape,
 )
 
+
+
+def _rules():
+    return ExchangeSymbolRules(
+        exchange="binance-futures",
+        symbol="BTCUSDT",
+        mode=SymbolRuleMode.CURRENT_RULES_REPLAY,
+        base_asset="BTC",
+        quote_asset="USDT",
+        margin_asset="USDT",
+        contract_type="PERPETUAL",
+        status="TRADING",
+        tick_size=Decimal("0.1"),
+        min_price=Decimal("0.1"),
+        max_price=Decimal("1000000"),
+        step_size=Decimal("0.001"),
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("100"),
+        min_notional=Decimal("5"),
+        allowed_order_types=("LIMIT",),
+        allowed_time_in_force=("GTC", "GTX"),
+    )
 
 def _spec():
     return SymbolSpec(
@@ -85,7 +109,7 @@ def _basic_tape():
     l2 = [_l2(100, seq=0), _l2(300, seq=1)]
     trades = [_trade(200, idx=0), _trade(400, idx=1)]
     plan = merge_execution_events(l2, trades)
-    return build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=trades, merged_events=plan.events)
+    return build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=trades, merged_events=plan.events)
 
 
 
@@ -143,7 +167,7 @@ def test_build_tape_arrays_basic():
 def test_l2_book_top_none_uses_sentinel_values():
     l2 = [_l2(100, seq=0, top=False)]
     plan = merge_execution_events(l2, [])
-    tape = build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=[], merged_events=plan.events)
+    tape = build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=[], merged_events=plan.events)
 
     row = tape.arrays.l2_events[0]
     assert int(row["best_bid_tick"]) == -1
@@ -159,14 +183,14 @@ def test_trade_side_encoding():
         _trade(300, idx=2, side=AggressorSide.UNKNOWN),
     ]
     plan = merge_execution_events([], trades)
-    tape = build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=plan.events, book_depth=2)
+    tape = build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=[], trades=trades, merged_events=plan.events, book_depth=2)
 
     assert tape.arrays.trades["side_code"].tolist() == [1, -1, 0]
 
 
 def test_rejects_empty_tape():
     with pytest.raises(ValueError):
-        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=[], merged_events=[])
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=[], trades=[], merged_events=[])
 
 
 def test_rejects_l2_pointer_mismatch():
@@ -175,7 +199,7 @@ def test_rejects_l2_pointer_mismatch():
     plan = merge_execution_events([l2_a], [])
 
     with pytest.raises(ValueError, match="merged L2 event pointer"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=[l2_b], trades=[], merged_events=plan.events)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=[l2_b], trades=[], merged_events=plan.events)
 
 
 def test_rejects_trade_pointer_mismatch():
@@ -184,7 +208,7 @@ def test_rejects_trade_pointer_mismatch():
     plan = merge_execution_events([], [trade_a])
 
     with pytest.raises(ValueError, match="merged trade event pointer"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=[trade_b], merged_events=plan.events, book_depth=2)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=[], trades=[trade_b], merged_events=plan.events, book_depth=2)
 
 
 def test_rejects_unreferenced_l2_event():
@@ -195,6 +219,7 @@ def test_rejects_unreferenced_l2_event():
     with pytest.raises(ValueError, match="reference every l2_event"):
         build_execution_tape(
             symbol_spec=_spec(),
+            symbol_rules=_rules(),
             l2_events=[l2_a, l2_b],
             trades=[],
             merged_events=plan.events,
@@ -209,6 +234,7 @@ def test_rejects_unreferenced_trade():
     with pytest.raises(ValueError, match="reference every trade"):
         build_execution_tape(
             symbol_spec=_spec(),
+            symbol_rules=_rules(),
             l2_events=[],
             trades=[trade_a, trade_b],
             merged_events=plan.events,
@@ -245,7 +271,7 @@ def test_rejects_duplicate_l2_book_ptr():
     ]
 
     with pytest.raises(ValueError, match="duplicate L2 book_ptr"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=[], merged_events=merged)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=[], merged_events=merged)
 
 
 def test_rejects_duplicate_trade_ptr():
@@ -277,7 +303,7 @@ def test_rejects_duplicate_trade_ptr():
     ]
 
     with pytest.raises(ValueError, match="duplicate trade_ptr"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=merged, book_depth=2)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=[], trades=trades, merged_events=merged, book_depth=2)
 
 
 def test_rejects_unsorted_source_arrays_or_merged_events():
@@ -296,7 +322,7 @@ def test_rejects_unsorted_source_arrays_or_merged_events():
                 l2_event=l2[0],
             )
         ]
-        build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=[], merged_events=merged)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=[], merged_events=merged)
 
     with pytest.raises(ValueError, match="trades local_ts_us"):
         trades = [_trade(300, idx=0), _trade(100, idx=1)]
@@ -313,7 +339,7 @@ def test_rejects_unsorted_source_arrays_or_merged_events():
                 trade=trades[0],
             )
         ]
-        build_execution_tape(symbol_spec=_spec(), l2_events=[], trades=trades, merged_events=merged, book_depth=2)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=[], trades=trades, merged_events=merged, book_depth=2)
 
     l2 = [_l2(100, seq=0)]
     bad_event = MergedExecutionEvent(
@@ -328,7 +354,7 @@ def test_rejects_unsorted_source_arrays_or_merged_events():
         l2_event=l2[0],
     )
     with pytest.raises(ValueError, match="event_seq"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=[], merged_events=[bad_event])
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=[], merged_events=[bad_event])
 
     first = _trade(300, idx=0)
     second = _l2(100, seq=0)
@@ -357,7 +383,7 @@ def test_rejects_unsorted_source_arrays_or_merged_events():
         ),
     ]
     with pytest.raises(ValueError, match="merged_events local_ts_us"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=[second], trades=[first], merged_events=bad_merged)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=[second], trades=[first], merged_events=bad_merged)
 
 
 def test_save_and_load_round_trip(tmp_path):
@@ -502,7 +528,7 @@ def test_missing_book_snapshot_rejected():
     plan = merge_execution_events(bad_l2, [])
 
     with pytest.raises(ValueError, match="book_snapshot"):
-        build_execution_tape(symbol_spec=_spec(), l2_events=bad_l2, trades=[], merged_events=plan.events)
+        build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=bad_l2, trades=[], merged_events=plan.events)
 
 
 @pytest.mark.parametrize(
@@ -531,7 +557,7 @@ def test_explicit_book_depth_pads_snapshots():
     l2 = [_l2(100, seq=0), _l2(200, seq=1)]
     plan = merge_execution_events(l2, [])
 
-    tape = build_execution_tape(symbol_spec=_spec(), l2_events=l2, trades=[], merged_events=plan.events, book_depth=3)
+    tape = build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=[], merged_events=plan.events, book_depth=3)
 
     assert tape.arrays.book_bid_ticks.shape == (2, 3)
     assert tape.arrays.book_bid_ticks[0].tolist() == [1000, 999, 0]

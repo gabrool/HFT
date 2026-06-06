@@ -15,6 +15,8 @@ import math
 from typing import Any
 
 from mmrt.contracts import AggressorSide, BookSide, TardisDataType
+from mmrt.metadata.rule_compatibility import RuleCompatibilityReport
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules
 
 
 class _StrEnum(str, Enum):
@@ -712,6 +714,7 @@ class ExecutionTapeManifest:
     exchange: str
     symbol: str
     symbol_spec: SymbolSpec
+    symbol_rules: ExchangeSymbolRules
     source_data_types: tuple[TardisDataType, ...]
     array_names: tuple[str, ...]
     num_events: int
@@ -720,6 +723,7 @@ class ExecutionTapeManifest:
     num_decisions: int
     start_local_ts_us: int
     end_local_ts_us: int
+    symbol_rule_compatibility: RuleCompatibilityReport | None = None
     created_at_utc: str = ""
     notes: dict[str, str] | None = None
 
@@ -732,6 +736,18 @@ class ExecutionTapeManifest:
             raise ValueError("symbol_spec must be SymbolSpec")
         if self.symbol_spec.exchange != self.exchange or self.symbol_spec.symbol != self.symbol:
             raise ValueError("symbol_spec exchange/symbol must match manifest")
+        if not isinstance(self.symbol_rules, ExchangeSymbolRules):
+            raise ValueError("symbol_rules must be ExchangeSymbolRules")
+        if self.symbol_rules.exchange != self.exchange or self.symbol_rules.symbol != self.symbol:
+            raise ValueError("symbol_rules exchange/symbol must match manifest")
+        expected_spec = self.symbol_rules.to_symbol_spec()
+        if expected_spec.exchange != self.symbol_spec.exchange or expected_spec.symbol != self.symbol_spec.symbol:
+            raise ValueError("symbol_spec must match symbol_rules")
+        for field in ("tick_size", "step_size", "min_qty", "max_qty", "min_notional", "contract_size"):
+            if not math.isclose(getattr(expected_spec, field), getattr(self.symbol_spec, field), rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("symbol_spec must equal symbol_rules.to_symbol_spec()")
+        if self.symbol_rule_compatibility is not None and not isinstance(self.symbol_rule_compatibility, RuleCompatibilityReport):
+            raise ValueError("symbol_rule_compatibility must be None or RuleCompatibilityReport")
         source_data_types = tuple(_coerce_enum(TardisDataType, value, f"source_data_types[{i}]") for i, value in enumerate(self.source_data_types))
         if not source_data_types:
             raise ValueError("source_data_types must be non-empty")

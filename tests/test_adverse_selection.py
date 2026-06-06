@@ -1,5 +1,6 @@
 import inspect
 import json
+from decimal import Decimal
 from collections import deque
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, QueueModelMode, SymbolSpec, TradePrint
 from mmrt.execution.event_merge import merge_execution_events
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.queue_model import QueueModelConfig
@@ -26,6 +28,16 @@ from mmrt.cli.train_adverse_selection import (
     run_adverse_selection_training,
 )
 
+
+
+def _rules():
+    return ExchangeSymbolRules(
+        exchange="binance-futures", symbol="BTCUSDT", mode=SymbolRuleMode.CURRENT_RULES_REPLAY,
+        base_asset="BTC", quote_asset="USDT", margin_asset="USDT", contract_type="PERPETUAL", status="TRADING",
+        tick_size=Decimal("0.1"), min_price=Decimal("0.1"), max_price=Decimal("1000000"),
+        step_size=Decimal("0.001"), min_qty=Decimal("0.001"), max_qty=Decimal("100"), min_notional=Decimal("0"),
+        allowed_order_types=("LIMIT",), allowed_time_in_force=("GTC", "GTX"),
+    )
 
 def _spec() -> SymbolSpec:
     return SymbolSpec(
@@ -96,6 +108,7 @@ def _tape(l2_events, trades):
     merged = merge_execution_events(l2_events, trades).events
     return build_execution_tape(
         symbol_spec=_spec(),
+        symbol_rules=_rules(),
         l2_events=tuple(l2_events),
         trades=tuple(trades),
         merged_events=merged,

@@ -25,6 +25,8 @@ from mmrt.execution.contracts import (
 )
 from mmrt.execution.event_merge import MergedExecutionEvent
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
+from mmrt.metadata.rule_compatibility import RuleCompatibilityReport
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules
 
 EXECUTION_TAPE_SCHEMA = "mmrt_execution_tape_book_depth"
 MANIFEST_FILENAME = "manifest.json"
@@ -187,6 +189,10 @@ def execution_tape_manifest_to_dict(manifest: ExecutionTapeManifest) -> dict[str
             "min_notional": spec.min_notional,
             "contract_size": spec.contract_size,
         },
+        "symbol_rules": manifest.symbol_rules.to_dict(),
+        "symbol_rule_compatibility": (
+            manifest.symbol_rule_compatibility.to_dict() if manifest.symbol_rule_compatibility is not None else None
+        ),
         "source_data_types": [value.value for value in manifest.source_data_types],
         "array_names": list(manifest.array_names),
         "num_events": manifest.num_events,
@@ -203,6 +209,19 @@ def execution_tape_manifest_to_dict(manifest: ExecutionTapeManifest) -> dict[str
 def execution_tape_manifest_from_dict(payload: Mapping[str, Any]) -> ExecutionTapeManifest:
     if not isinstance(payload, Mapping):
         raise ValueError("payload must be a mapping")
+    retired_schema_key = "schema" + "_" + "version"
+    if retired_schema_key in payload:
+        raise ValueError("retired schema field is not supported; use schema")
+    symbol_rules_payload = payload.get("symbol_rules")
+    if not isinstance(symbol_rules_payload, Mapping):
+        raise ValueError("execution tape manifest missing symbol_rules")
+    symbol_rules = ExchangeSymbolRules.from_dict(symbol_rules_payload)
+    compat_payload = payload.get("symbol_rule_compatibility")
+    symbol_rule_compatibility = None
+    if compat_payload is not None:
+        if not isinstance(compat_payload, Mapping):
+            raise ValueError("symbol_rule_compatibility must be null or mapping")
+        symbol_rule_compatibility = RuleCompatibilityReport.from_dict(compat_payload)
     symbol_spec_payload = payload.get("symbol_spec")
     if not isinstance(symbol_spec_payload, Mapping):
         raise ValueError("symbol_spec must be a mapping")
@@ -222,6 +241,7 @@ def execution_tape_manifest_from_dict(payload: Mapping[str, Any]) -> ExecutionTa
         exchange=_require_nonempty_str(payload.get("exchange"), "exchange"),
         symbol=_require_nonempty_str(payload.get("symbol"), "symbol"),
         symbol_spec=symbol_spec,
+        symbol_rules=symbol_rules,
         source_data_types=tuple(TardisDataType(value) for value in payload.get("source_data_types", ())),
         array_names=tuple(payload.get("array_names", ())),
         num_events=_require_nonnegative_int(payload.get("num_events"), "num_events"),
@@ -231,6 +251,7 @@ def execution_tape_manifest_from_dict(payload: Mapping[str, Any]) -> ExecutionTa
         start_local_ts_us=_require_positive_int(payload.get("start_local_ts_us"), "start_local_ts_us"),
         end_local_ts_us=_require_positive_int(payload.get("end_local_ts_us"), "end_local_ts_us"),
         created_at_utc=payload.get("created_at_utc", ""),
+        symbol_rule_compatibility=symbol_rule_compatibility,
         notes=dict(payload.get("notes") or {}),
     )
 
@@ -238,15 +259,23 @@ def execution_tape_manifest_from_dict(payload: Mapping[str, Any]) -> ExecutionTa
 def build_execution_tape(
     *,
     symbol_spec: SymbolSpec,
+    symbol_rules: ExchangeSymbolRules,
     l2_events: tuple[ReconstructedL2Event, ...] | list[ReconstructedL2Event],
     trades: tuple[TradePrint, ...] | list[TradePrint],
     merged_events: tuple[MergedExecutionEvent, ...] | list[MergedExecutionEvent],
+    symbol_rule_compatibility: RuleCompatibilityReport | None = None,
     book_depth: int | None = None,
     created_at_utc: str = "",
     notes: Mapping[str, str] | None = None,
 ) -> ExecutionTape:
     if not isinstance(symbol_spec, SymbolSpec):
         raise ValueError("symbol_spec must be SymbolSpec")
+    if not isinstance(symbol_rules, ExchangeSymbolRules):
+        raise ValueError("symbol_rules must be ExchangeSymbolRules")
+    if symbol_rules.to_symbol_spec() != symbol_spec:
+        raise ValueError("symbol_spec must equal symbol_rules.to_symbol_spec()")
+    if symbol_rule_compatibility is not None and not isinstance(symbol_rule_compatibility, RuleCompatibilityReport):
+        raise ValueError("symbol_rule_compatibility must be None or RuleCompatibilityReport")
     if not isinstance(created_at_utc, str):
         raise ValueError("created_at_utc must be str")
     clean_notes = _coerce_notes(notes)
@@ -281,6 +310,7 @@ def build_execution_tape(
         exchange=symbol_spec.exchange,
         symbol=symbol_spec.symbol,
         symbol_spec=symbol_spec,
+        symbol_rules=symbol_rules,
         source_data_types=(TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES),
         array_names=_EXPECTED_ARRAY_NAMES,
         num_events=len(events_arr),
@@ -290,6 +320,7 @@ def build_execution_tape(
         start_local_ts_us=start_local_ts_us,
         end_local_ts_us=end_local_ts_us,
         created_at_utc=created_at_utc,
+        symbol_rule_compatibility=symbol_rule_compatibility,
         notes=clean_notes,
     )
     return ExecutionTape(

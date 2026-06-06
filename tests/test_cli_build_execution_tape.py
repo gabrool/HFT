@@ -16,7 +16,42 @@ from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import SymbolSpec
 from mmrt.execution.event_merge import ExecutionMergeTiePolicy
 from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_CODE_TRADE, load_execution_tape
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode, write_symbol_rules_json
+from decimal import Decimal
 
+
+
+def _rules() -> ExchangeSymbolRules:
+    return ExchangeSymbolRules(
+        exchange="binance-futures",
+        symbol="BTCUSDT",
+        mode=SymbolRuleMode.CURRENT_RULES_REPLAY,
+        base_asset="BTC",
+        quote_asset="USDT",
+        margin_asset="USDT",
+        contract_type="PERPETUAL",
+        status="TRADING",
+        tick_size=Decimal("0.1"),
+        min_price=Decimal("0.1"),
+        max_price=Decimal("1000000"),
+        step_size=Decimal("0.001"),
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("100"),
+        min_notional=Decimal("5"),
+        allowed_order_types=("LIMIT",),
+        allowed_time_in_force=("GTC", "GTX"),
+    )
+
+
+def _rules_path(tmp_path: Path) -> str:
+    path = tmp_path / "BTCUSDT.symbol_rules.json"
+    write_symbol_rules_json(path, _rules(), overwrite=True)
+    return str(path)
+
+
+def _config(tmp_path: Path, **kwargs) -> ExecutionTapeBuildConfig:
+    kwargs.setdefault("symbol_rules_json", _rules_path(tmp_path))
+    return ExecutionTapeBuildConfig(**kwargs)
 
 def _write_l2_csv(path: Path, rows: list[dict[str, object]]) -> Path:
     columns = ["timestamp", "local_timestamp", "is_snapshot", "side", "price", "amount"]
@@ -61,7 +96,7 @@ def test_build_execution_tape_from_csv_inputs(tmp_path):
     output_root = tmp_path / "tape"
 
     summary = build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(output_root),
@@ -97,7 +132,7 @@ def test_event_ordering_and_tie_policy(tmp_path):
     )
 
     default_summary = build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(tmp_path / "default"),
@@ -108,7 +143,7 @@ def test_event_ordering_and_tie_policy(tmp_path):
     assert list(default_tape.arrays.events["event_type_code"]) == [EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_CODE_TRADE]
 
     trade_first_summary = build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(tmp_path / "trade_first"),
@@ -124,14 +159,14 @@ def test_overwrite_protection(tmp_path):
     l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
     trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
     output_root = tmp_path / "tape"
-    config = ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(output_root))
+    config = _config(tmp_path, l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(output_root))
 
     build_execution_tape_from_config(config)
     with pytest.raises(FileExistsError):
         build_execution_tape_from_config(config)
 
     summary = build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(output_root),
@@ -150,7 +185,7 @@ def test_existing_build_summary_preflight_blocks_partial_tape_write(tmp_path):
 
     with pytest.raises(FileExistsError, match="build_summary"):
         build_execution_tape_from_config(
-            ExecutionTapeBuildConfig(
+            _config(tmp_path,
                 l2_inputs=(str(l2_path),),
                 trade_inputs=(str(trade_path),),
                 output_root=str(output_root),
@@ -167,7 +202,7 @@ def test_fallback_trade_source_rows_are_zero_based(tmp_path):
     output_root = tmp_path / "tape"
 
     build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(output_root),
@@ -207,7 +242,7 @@ def test_explicit_trade_source_rows_are_preserved(tmp_path):
     output_root = tmp_path / "tape"
 
     build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(output_root),
@@ -244,7 +279,7 @@ def test_max_row_limits(tmp_path):
     trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
 
     summary = build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(tmp_path / "tape"),
@@ -269,7 +304,7 @@ def test_build_execution_tape_rejects_missing_trade_side(tmp_path):
 
     with pytest.raises(ValueError, match="trade row missing side or side_code"):
         build_execution_tape_from_config(
-            ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+            _config(tmp_path, l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
         )
 
 
@@ -293,7 +328,7 @@ def test_rejects_no_reconstructed_l2_events(tmp_path):
 
     with pytest.raises(ValueError, match="without reconstructed L2 events"):
         build_execution_tape_from_config(
-            ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+            _config(tmp_path, l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
         )
 
 
@@ -303,7 +338,7 @@ def test_rejects_no_trades(tmp_path):
 
     with pytest.raises(ValueError, match="without trades"):
         build_execution_tape_from_config(
-            ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+            _config(tmp_path, l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
         )
 
 
@@ -319,7 +354,7 @@ def test_rejects_unsorted_trades(tmp_path):
 
     with pytest.raises(ValueError, match="trades must be sorted"):
         build_execution_tape_from_config(
-            ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+            _config(tmp_path, l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
         )
 
 
@@ -328,7 +363,7 @@ def test_rejects_missing_input_files(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         build_execution_tape_from_config(
-            ExecutionTapeBuildConfig(l2_inputs=(str(tmp_path / "missing.csv"),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+            _config(tmp_path, l2_inputs=(str(tmp_path / "missing.csv"),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
         )
 
 
@@ -341,6 +376,8 @@ def test_parser_smoke():
             "trades.csv",
             "--output-root",
             "out",
+            "--symbol-rules-json",
+            "rules.json",
             "--tie-policy",
             "trade_before_l2",
             "--overwrite",
@@ -367,7 +404,7 @@ def test_cli_main_writes_summary_and_prints_same_summary(tmp_path, capsys):
     trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
     output_root = tmp_path / "tape"
 
-    rc = main(["--l2-input", str(l2_path), "--trade-input", str(trade_path), "--output-root", str(output_root)])
+    rc = main(["--l2-input", str(l2_path), "--trade-input", str(trade_path), "--output-root", str(output_root), "--symbol-rules-json", _rules_path(tmp_path)])
     output_text = capsys.readouterr().out
     assert "NaN" not in output_text
     assert "Infinity" not in output_text
@@ -391,7 +428,7 @@ def test_parquet_input(tmp_path):
     pq.write_table(pa.Table.from_pylist(_good_trade_rows()), trade_path)
 
     summary = build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+        _config(tmp_path, l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
     )
 
     assert summary["status"] == "ok"
@@ -412,7 +449,7 @@ def test_book_depth_argument_controls_saved_snapshot_depth(tmp_path):
     output_root = tmp_path / "tape"
 
     summary = build_execution_tape_from_config(
-        ExecutionTapeBuildConfig(
+        _config(tmp_path,
             l2_inputs=(str(l2_path),),
             trade_inputs=(str(trade_path),),
             output_root=str(output_root),
@@ -430,4 +467,22 @@ def test_book_depth_argument_controls_saved_snapshot_depth(tmp_path):
 
 def test_config_rejects_nonpositive_book_depth(tmp_path):
     with pytest.raises(ValueError, match="book_depth"):
-        ExecutionTapeBuildConfig(l2_inputs=("l2.csv",), trade_inputs=("trades.csv",), output_root=str(tmp_path / "tape"), book_depth=0)
+        _config(tmp_path, l2_inputs=("l2.csv",), trade_inputs=("trades.csv",), output_root=str(tmp_path / "tape"), book_depth=0)
+
+
+def test_config_requires_exactly_one_rules_input(tmp_path):
+    l2_path = tmp_path / "l2.csv"
+    trade_path = tmp_path / "trades.csv"
+    with pytest.raises(ValueError, match="exactly one"):
+        ExecutionTapeBuildConfig(l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "out"))
+    rules_path = _rules_path(tmp_path)
+    exchange_info_path = tmp_path / "exchangeInfo.json"
+    exchange_info_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="exactly one"):
+        ExecutionTapeBuildConfig(
+            l2_inputs=(str(l2_path),),
+            trade_inputs=(str(trade_path),),
+            output_root=str(tmp_path / "out"),
+            symbol_rules_json=rules_path,
+            exchange_info_json=str(exchange_info_path),
+        )
