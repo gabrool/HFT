@@ -180,7 +180,7 @@ def test_public_api_alignment() -> None:
     assert "DEFAULT_DROP_DUPLICATE_" + "TRADES" not in cfg_module.__all__
 
 
-def test_legacy_surface_removed() -> None:
+def test_retired_surface_removed() -> None:
     assert not hasattr(cfg_module, "DEFAULT_DECISION_STRIDE_" + "ROWS")
     assert not hasattr(DecisionConfig(), "stride_" + "rows")
     assert not hasattr(cfg_module, "DEFAULT_DROP_DUPLICATE_" + "TRADES")

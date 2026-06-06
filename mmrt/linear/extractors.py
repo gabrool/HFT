@@ -5,9 +5,7 @@ outputs and converts them to NumPy matrices for linear models. It does not
 parse market data, compute features, build rolling windows, apply transforms,
 compute targets, train models, or evaluate metrics.
 
-The only supported extractor is identity/projection over stored feature
-columns. Legacy nonlinear extractor families and staged compatibility layers
-are intentionally not implemented.
+The only supported extractor is identity/projection over stored feature columns.
 """
 
 from dataclasses import dataclass

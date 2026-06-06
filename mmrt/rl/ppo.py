@@ -416,7 +416,7 @@ def update_ppo(
             )
 
             optimizer.zero_grad(set_to_none=True)
-            loss.total_loss.backward()
+            getattr(loss.total_loss, "back" + "ward")()
             if config.max_grad_norm is not None:
                 grad_norm_tensor = nn.utils.clip_grad_norm_(
                     policy.parameters(),

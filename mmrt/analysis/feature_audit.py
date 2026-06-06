@@ -154,7 +154,6 @@ class FeatureAuditConfig:
 @dataclass(frozen=True, slots=True)
 class _FeatureMeta:
     column: str
-    canonical_name: str
     feature_index: int
     source: str
     owner: str
@@ -168,11 +167,10 @@ def _feature_meta_from_column(column: str) -> _FeatureMeta:
     col = _require_non_empty_str(column, "column")
     if not col.startswith(mf.FEATURE_COLUMN_PREFIX):
         raise ValueError("feature column must have x_ prefix")
-    canonical_name = col[len(mf.FEATURE_COLUMN_PREFIX) :]
-    spec = specs.feature_spec_by_name(canonical_name)
+    name = col[len(mf.FEATURE_COLUMN_PREFIX) :]
+    spec = specs.feature_spec_by_name(name)
     return _FeatureMeta(
         col,
-        canonical_name,
         spec.index,
         spec.source.value,
         spec.owner.value,
@@ -303,7 +301,6 @@ class _StreamingTrainCorrelationStats:
 class FeatureHealthRecord:
     split: str
     feature: str
-    canonical_name: str
     feature_index: int
     source: str
     owner: str
@@ -327,7 +324,6 @@ class FeatureHealthRecord:
     def __post_init__(self) -> None:
         _role_to_str(self.split)
         _require_non_empty_str(self.feature, "feature")
-        _require_non_empty_str(self.canonical_name, "canonical_name")
         _require_non_empty_str(self.source, "source")
         _require_non_empty_str(self.owner, "owner")
         _require_non_empty_str(self.family, "family")
@@ -377,7 +373,6 @@ class FeatureHealthRecord:
 class FeatureDriftRecord:
     split: str
     feature: str
-    canonical_name: str
     feature_index: int
     source: str
     owner: str
@@ -397,7 +392,6 @@ class FeatureDriftRecord:
         if self.split not in ("val", "test"):
             raise ValueError("split must be val/test for drift")
         _require_non_empty_str(self.feature, "feature")
-        _require_non_empty_str(self.canonical_name, "canonical_name")
         _require_non_empty_str(self.source, "source")
         _require_non_empty_str(self.owner, "owner")
         _require_non_empty_str(self.family, "family")
@@ -439,8 +433,6 @@ class FeatureDriftRecord:
 class FeatureCorrelationPairRecord:
     feature_a: str
     feature_b: str
-    canonical_a: str
-    canonical_b: str
     index_a: int
     index_b: int
     source_a: str
@@ -456,8 +448,6 @@ class FeatureCorrelationPairRecord:
     def __post_init__(self) -> None:
         _require_non_empty_str(self.feature_a, "feature_a")
         _require_non_empty_str(self.feature_b, "feature_b")
-        _require_non_empty_str(self.canonical_a, "canonical_a")
-        _require_non_empty_str(self.canonical_b, "canonical_b")
         _require_non_empty_str(self.source_a, "source_a")
         _require_non_empty_str(self.source_b, "source_b")
         _require_non_empty_str(self.family_a, "family_a")
@@ -483,7 +473,6 @@ class FeatureCorrelationPairRecord:
 @dataclass(frozen=True, slots=True)
 class FeatureClusterRecord:
     feature: str
-    canonical_name: str
     feature_index: int
     source: str
     family: str
@@ -494,7 +483,6 @@ class FeatureClusterRecord:
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.feature, "feature")
-        _require_non_empty_str(self.canonical_name, "canonical_name")
         _require_non_empty_str(self.source, "source")
         _require_non_empty_str(self.family, "family")
         rep = _require_non_empty_str(self.representative_feature, "representative_feature")
@@ -751,7 +739,6 @@ def _scan_split_features(reader, manifest, role, config):
             FeatureHealthRecord(
                 split=role_s,
                 feature=meta.column,
-                canonical_name=meta.canonical_name,
                 feature_index=meta.feature_index,
                 source=meta.source,
                 owner=meta.owner,
@@ -854,8 +841,6 @@ def run_feature_audit(dataset_root: str, *, config: FeatureAuditConfig | None = 
                     FeatureCorrelationPairRecord(
                         feature_a=metas[i].column,
                         feature_b=metas[j].column,
-                        canonical_a=metas[i].canonical_name,
-                        canonical_b=metas[j].canonical_name,
                         index_a=metas[i].feature_index,
                         index_b=metas[j].feature_index,
                         source_a=metas[i].source,
@@ -905,7 +890,6 @@ def run_feature_audit(dataset_root: str, *, config: FeatureAuditConfig | None = 
             clusters.append(
                 FeatureClusterRecord(
                     feature=meta.column,
-                    canonical_name=meta.canonical_name,
                     feature_index=meta.feature_index,
                     source=meta.source,
                     family=meta.family,
@@ -921,7 +905,6 @@ def run_feature_audit(dataset_root: str, *, config: FeatureAuditConfig | None = 
             clusters.append(
                 FeatureClusterRecord(
                     feature=meta.column,
-                    canonical_name=meta.canonical_name,
                     feature_index=meta.feature_index,
                     source=meta.source,
                     family=meta.family,
@@ -962,7 +945,6 @@ def run_feature_audit(dataset_root: str, *, config: FeatureAuditConfig | None = 
                 FeatureDriftRecord(
                     split=split,
                     feature=meta.column,
-                    canonical_name=meta.canonical_name,
                     feature_index=meta.feature_index,
                     source=meta.source,
                     owner=meta.owner,

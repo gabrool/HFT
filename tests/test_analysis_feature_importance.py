@@ -133,13 +133,13 @@ def test_importance_uses_validation_not_train_or_test(trained_artifact):
     assert out.n_sample_rows == 30
 
 
-def test_feature_index_is_canonical_not_head_local(trained_artifact):
+def test_feature_index_is_registry_not_head_local(trained_artifact):
     root, artifact = trained_artifact
     out = fi.run_feature_importance(str(root), str(artifact))
 
     for record in out.records:
-        canonical = record.feature[len(mf.FEATURE_COLUMN_PREFIX) :]
-        expected = specs.feature_spec_by_name(canonical).index
+        name = record.feature[len(mf.FEATURE_COLUMN_PREFIX) :]
+        expected = specs.feature_spec_by_name(name).index
         assert record.feature_index == expected
 
 

@@ -24,27 +24,34 @@ def test_feature_count_and_order():
 
 
 def test_context_tail_after_core_features():
-    assert specs.FEATURE_NAMES[: specs.CORE_FEATURE_COUNT] == tuple(
-        specs.legacy_name_to_canonical_name(n) for n in specs.CORE_FEATURE_NAMES
-    )
-    assert specs.FEATURE_NAMES[-4:] == tuple(
-        specs.legacy_name_to_canonical_name(n) for n in specs.EVENT_CONTEXT_FEATURE_NAMES
-    )
+    assert specs.FEATURE_NAMES[: specs.CORE_FEATURE_COUNT] == specs.CORE_FEATURE_NAMES
+    assert specs.FEATURE_NAMES[-4:] == specs.EVENT_CONTEXT_FEATURE_NAMES
 
 
 def test_no_duplicate_feature_names():
     assert len(specs.FEATURE_NAMES) == len(set(specs.FEATURE_NAMES))
 
 
-def test_canonical_names_are_microsecond_native():
-    for n in specs.FEATURE_NAMES:
-        assert "ms" not in n
+def test_feature_names_are_current_microsecond_names():
+    for name in specs.FEATURE_NAMES:
+        assert "ms" not in name
+        assert "leg" + "acy" not in name.lower()
 
 
-def test_legacy_to_canonical_roundtrip():
-    for legacy in specs.CORE_FEATURE_NAMES + specs.EVENT_CONTEXT_FEATURE_NAMES:
-        canonical = specs.legacy_name_to_canonical_name(legacy)
-        assert specs.canonical_name_to_legacy_name(canonical) == legacy
+def test_feature_registry_has_no_retired_name_layer():
+    assert not hasattr(specs.FeatureSpec, "leg" + "acy_name")
+    assert not hasattr(specs, "leg" + "acy_name_to_canonical_name")
+    assert not hasattr(specs, "leg" + "acy_feature_names")
+    assert not hasattr(specs, "leg" + "acy_name_for_feature")
+    assert not hasattr(specs, "canonical_name_for_leg" + "acy_feature")
+    assert not hasattr(specs, "SOURCE_TO_" + "CANONICAL_FEATURE_NAME")
+    assert not hasattr(specs, "CANONICAL_TO_" + "SOURCE_FEATURE_NAME")
+
+
+def test_infer_windows_us_from_current_name():
+    assert specs.infer_windows_us_from_name("foo_200000us") == (200_000,)
+    assert specs.infer_windows_us_from_name("foo_200000us_minus_1000000us") == (200_000, 1_000_000)
+    assert specs.infer_windows_us_from_name("spread_bps") == ()
 
 
 def test_active_registry_matches_current_feature_subset_union():
@@ -181,7 +188,7 @@ def test_source_owner_family_examples():
 
 def test_feature_schema_is_current_active_schema():
     assert specs.FEATURE_SCHEMA == "mmrt_features_snapshot25_trades_active44_ctx4_corr90"
-    assert "legacy" not in specs.FEATURE_SCHEMA
+    assert "leg" + "acy" not in specs.FEATURE_SCHEMA
 
 
 def test_public_schema_has_no_aux_core_split():

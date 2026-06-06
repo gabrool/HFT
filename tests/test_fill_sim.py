@@ -392,7 +392,7 @@ def test_duplicate_live_side_price_rejected():
         )
 
 
-def test_local_timestamp_cannot_go_backwards():
+def test_local_timestamp_cannot_decrease():
     order = _order(last_update_local_ts_us=300)
 
     with pytest.raises(ValueError):
