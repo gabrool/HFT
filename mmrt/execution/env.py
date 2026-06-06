@@ -36,7 +36,8 @@ from mmrt.execution.fill_sim import (
     simulate_l2_level_update,
     simulate_trade_event,
 )
-from mmrt.execution.linear_signal import LinearSignalArrays, linear_signal_at
+from mmrt.execution.contracts import LinearSignal
+from mmrt.execution.linear_signal import LinearSignalArtifact, linear_signal_at
 from mmrt.execution.obs_builder import (
     ObservationBuilder,
     ObservationBuilderConfig,
@@ -218,13 +219,13 @@ class ExecutionEnv:
         self,
         tape: ExecutionTape,
         *,
-        linear_signals: LinearSignalArrays,
+        linear_signals: LinearSignalArtifact,
         config: ExecutionEnvConfig = ExecutionEnvConfig(),
     ) -> None:
         self.tape = _require_tape(tape)
         self.config = _require_config(config)
-        if not isinstance(linear_signals, LinearSignalArrays):
-            raise ValueError("linear_signals must be LinearSignalArrays")
+        if not isinstance(linear_signals, LinearSignalArtifact):
+            raise ValueError("linear_signals must be LinearSignalArtifact")
         if linear_signals.n_rows <= 0:
             raise ValueError("linear_signals must contain at least one row")
         if config.max_episode_steps is not None and linear_signals.n_rows < config.max_episode_steps + 1:
@@ -447,15 +448,40 @@ class ExecutionEnv:
             position=state.position,
             live_orders=state.live_orders,
             recent_fills=self._last_step_fills,
-            linear_signal=self._linear_signal_for_step(state.step_index),
+            linear_signal=self._linear_signal_for_step(
+                state.step_index,
+                expected_event_index=state.event_index,
+                expected_local_ts_us=book_top.local_ts_us,
+            ),
             context=context,
         )
         return self.observation_builder.build(inputs, out=self._obs_buffer)
 
-    def _linear_signal_for_step(self, step_index: int):
+    def _linear_signal_for_step(
+        self,
+        step_index: int,
+        *,
+        expected_event_index: int,
+        expected_local_ts_us: int,
+    ) -> LinearSignal:
         if step_index >= self.linear_signals.n_rows:
             raise ValueError("linear_signals does not contain a row for current step_index")
-        return linear_signal_at(self.linear_signals, step_index)
+
+        actual_event_index = int(self.linear_signals.decision_event_index[step_index])
+        if actual_event_index != expected_event_index:
+            raise ValueError(
+                "linear signal decision_event_index mismatch: "
+                f"row={step_index} expected={expected_event_index} actual={actual_event_index}"
+            )
+
+        actual_local_ts_us = int(self.linear_signals.decision_local_ts_us[step_index])
+        if actual_local_ts_us != expected_local_ts_us:
+            raise ValueError(
+                "linear signal decision_local_ts_us mismatch: "
+                f"row={step_index} expected={expected_local_ts_us} actual={actual_local_ts_us}"
+            )
+
+        return linear_signal_at(self.linear_signals.arrays, step_index)
 
     def _process_event(self, event_index: int) -> tuple[Fill, ...]:
         state = self._require_state()

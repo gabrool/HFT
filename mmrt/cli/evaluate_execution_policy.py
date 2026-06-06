@@ -15,10 +15,11 @@ from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
 from mmrt.execution.linear_signal import (
-    LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION,
+    LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION,
     LINEAR_SIGNALS_FILENAME,
-    load_linear_signal_arrays_npz,
-    linear_signal_arrays_summary,
+    load_linear_signal_artifact_npz,
+    linear_signal_artifact_summary,
+    validate_linear_signal_artifact_metadata,
 )
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.quote_geometry import QuoteGeometryConfig
@@ -505,6 +506,10 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
+def _effective_start_event_index(value: int | None) -> int:
+    return 0 if value is None else value
+
+
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -531,15 +536,30 @@ def run_execution_policy_evaluation(
         if config.linear_signals_npz is not None
         else _default_linear_signals_npz(config.tape_root)
     )
-    linear_signals = load_linear_signal_arrays_npz(linear_signals_path)
+    linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
 
-    raw_cli_config = _mapping_get_optional_mapping(checkpoint, "cli_config")
-    if config.use_checkpoint_cli_env_config and raw_cli_config is not None:
+    if config.use_checkpoint_cli_env_config:
+        raw_cli_config = _mapping_get_mapping(checkpoint, "cli_config")
         env_config = _env_config_from_training_cli_config(raw_cli_config)
         env_config_source = "checkpoint_cli_config"
     else:
         env_config = _env_config_from_cli_config(config)
         env_config_source = "evaluation_cli_config"
+
+    validate_linear_signal_artifact_metadata(
+        linear_signals,
+        tape_schema_version=tape.manifest.schema_version,
+        exchange=tape.manifest.exchange,
+        symbol=tape.manifest.symbol,
+        num_events=tape.manifest.num_events,
+        num_l2_batches=tape.manifest.num_l2_batches,
+        num_trades=tape.manifest.num_trades,
+        start_local_ts_us=tape.manifest.start_local_ts_us,
+        end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_interval_us=env_config.decision_interval_us,
+        start_event_index=_effective_start_event_index(config.start_event_index),
+        min_rows=(env_config.max_episode_steps + 1) if env_config.max_episode_steps is not None else None,
+    )
 
     env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals)
     checkpoint_schema = checkpoint.get("observation_schema")
@@ -551,9 +571,12 @@ def run_execution_policy_evaluation(
     if checkpoint_linear_schema is None:
         raise ValueError("checkpoint missing linear_signals metadata")
     checkpoint_linear_schema = _require_mapping(checkpoint_linear_schema, "checkpoint linear_signals")
-    if checkpoint_linear_schema.get("schema_version") != LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION:
+    if checkpoint_linear_schema.get("schema_version") != LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION:
         raise ValueError("checkpoint linear signal schema mismatch")
-    if checkpoint_linear_schema.get("fields") != linear_signal_arrays_summary(linear_signals)["fields"]:
+    checkpoint_linear_metadata = checkpoint_linear_schema.get("metadata")
+    if checkpoint_linear_metadata is None:
+        raise ValueError("checkpoint missing linear signal metadata")
+    if checkpoint_linear_schema.get("fields") != linear_signal_artifact_summary(linear_signals)["fields"]:
         raise ValueError("checkpoint linear signal fields mismatch")
     obs_dim = int(env.config.observation_schema.dim)
     policy = _load_policy_from_checkpoint(
@@ -614,7 +637,7 @@ def run_execution_policy_evaluation(
             ),
         },
         "observation_schema": env.config.observation_schema.as_dict(),
-        "linear_signals": linear_signal_arrays_summary(
+        "linear_signals": linear_signal_artifact_summary(
             linear_signals, path=str(linear_signals_path)
         ),
         "evaluation": result.as_dict(),

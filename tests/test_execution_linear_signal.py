@@ -6,7 +6,7 @@ import pytest
 from mmrt.execution.contracts import LinearSignal
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
-    LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION,
+    LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION,
     LINEAR_SIGNALS_FILENAME,
     MAGNITUDE_DOWN_KEY,
     MAGNITUDE_INPUT_BPS,
@@ -14,15 +14,18 @@ from mmrt.execution.linear_signal import (
     MAGNITUDE_UP_KEY,
     NO_MOVE_PROBA_KEY,
     LinearSignalArrays,
+    LinearSignalArtifact,
+    LinearSignalArtifactMetadata,
     LinearSignalConfig,
     build_gated_linear_signal,
-    linear_signal_arrays_summary,
+    linear_signal_artifact_summary,
     linear_signal_at,
-    load_linear_signal_arrays_npz,
+    load_linear_signal_artifact_npz,
     magnitude_to_bps,
     prediction_row_to_signal,
     predictions_to_signal_arrays,
-    save_linear_signal_arrays_npz,
+    save_linear_signal_artifact_npz,
+    validate_linear_signal_artifact_metadata,
 )
 
 
@@ -33,6 +36,35 @@ def _prediction_dict():
         MAGNITUDE_UP_KEY: np.log1p(np.array([10.0, 4.0], dtype=np.float32)),
         MAGNITUDE_DOWN_KEY: np.log1p(np.array([5.0, 8.0], dtype=np.float32)),
     }
+
+
+def _artifact(n_rows: int) -> LinearSignalArtifact:
+    prediction = {
+        NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
+        DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
+        MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
+        MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
+    }
+    arrays = predictions_to_signal_arrays(prediction)
+    metadata = LinearSignalArtifactMetadata(
+        tape_schema_version="tape_v1",
+        exchange="X",
+        symbol="BTC-USD",
+        num_events=5,
+        num_l2_batches=4,
+        num_trades=1,
+        start_local_ts_us=100,
+        end_local_ts_us=200,
+        decision_interval_us=50,
+        start_event_index=0,
+        n_rows=n_rows,
+    )
+    return LinearSignalArtifact(
+        arrays=arrays,
+        metadata=metadata,
+        decision_event_index=np.arange(n_rows, dtype=np.int64),
+        decision_local_ts_us=np.arange(100, 100 + n_rows * 50, 50, dtype=np.int64),
+    )
 
 
 def test_linear_signal_config_validation():
@@ -222,7 +254,7 @@ def test_bps_magnitude_input_mode():
 
 def test_linear_signal_arrays_validation():
     valid = predictions_to_signal_arrays(_prediction_dict())
-    kwargs = {name: getattr(valid, name) for name in linear_signal_arrays_summary(valid)["fields"]}
+    kwargs = {name: getattr(valid, name) for name in linear_signal_artifact_summary(_artifact(2))["fields"]}
     bad = dict(kwargs)
     bad["p_move"] = valid.p_move[:-1]
     with pytest.raises(ValueError):
@@ -234,19 +266,70 @@ def test_linear_signal_arrays_validation():
 
 
 def test_npz_round_trip(tmp_path):
-    arrays = predictions_to_signal_arrays(_prediction_dict())
+    artifact = _artifact(2)
     path = tmp_path / LINEAR_SIGNALS_FILENAME
-    save_linear_signal_arrays_npz(path, arrays)
-    loaded = load_linear_signal_arrays_npz(path)
-    assert loaded.n_rows == arrays.n_rows
-    np.testing.assert_allclose(loaded.expected_abs_move_bps, arrays.expected_abs_move_bps)
+    save_linear_signal_artifact_npz(path, artifact)
+    loaded = load_linear_signal_artifact_npz(path)
+    assert loaded.metadata == artifact.metadata
+    np.testing.assert_array_equal(loaded.decision_event_index, artifact.decision_event_index)
+    np.testing.assert_array_equal(loaded.decision_local_ts_us, artifact.decision_local_ts_us)
+    np.testing.assert_allclose(loaded.arrays.expected_abs_move_bps, artifact.arrays.expected_abs_move_bps)
 
 
-def test_bad_schema_rejected(tmp_path):
+def test_metadata_free_old_schema_rejected(tmp_path):
     path = tmp_path / "bad.npz"
-    np.savez(path, schema_version=np.array("bad"), p_no_move=np.array([1.0], dtype=np.float32))
+    arrays = predictions_to_signal_arrays(_prediction_dict())
+    payload = {name: getattr(arrays, name) for name in linear_signal_artifact_summary(_artifact(2))["fields"]}
+    payload["schema_version"] = np.array("mmrt_execution_linear_signals_v2_no_move_gated")
+    np.savez(path, **payload)
     with pytest.raises(ValueError):
-        load_linear_signal_arrays_npz(path)
+        load_linear_signal_artifact_npz(path)
+
+
+def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
+    artifact = _artifact(2)
+    validate_linear_signal_artifact_metadata(
+        artifact,
+        tape_schema_version="tape_v1",
+        exchange="X",
+        symbol="BTC-USD",
+        num_events=5,
+        num_l2_batches=4,
+        num_trades=1,
+        start_local_ts_us=100,
+        end_local_ts_us=200,
+        decision_interval_us=50,
+        start_event_index=0,
+        min_rows=2,
+    )
+    with pytest.raises(ValueError, match="linear signal metadata mismatch"):
+        validate_linear_signal_artifact_metadata(
+            artifact,
+            tape_schema_version="tape_v1",
+            exchange="X",
+            symbol="ETH-USD",
+            num_events=5,
+            num_l2_batches=4,
+            num_trades=1,
+            start_local_ts_us=100,
+            end_local_ts_us=200,
+            decision_interval_us=50,
+            start_event_index=0,
+        )
+    with pytest.raises(ValueError, match="linear signal metadata mismatch"):
+        validate_linear_signal_artifact_metadata(
+            artifact,
+            tape_schema_version="tape_v1",
+            exchange="X",
+            symbol="BTC-USD",
+            num_events=5,
+            num_l2_batches=4,
+            num_trades=1,
+            start_local_ts_us=100,
+            end_local_ts_us=200,
+            decision_interval_us=100,
+            start_event_index=0,
+        )
 
 
 def test_linear_signal_has_no_forbidden_imports():

@@ -10,7 +10,7 @@ from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, TradePrint
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.event_merge import merge_execution_events
-from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
+from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -18,8 +18,10 @@ from mmrt.execution.linear_signal import (
     MAGNITUDE_DOWN_KEY,
     MAGNITUDE_UP_KEY,
     NO_MOVE_PROBA_KEY,
+    LinearSignalArtifact,
+    LinearSignalArtifactMetadata,
     predictions_to_signal_arrays,
-    save_linear_signal_arrays_npz,
+    save_linear_signal_artifact_npz,
 )
 from mmrt.cli.train_execution_ppo import (
     ExecutionPPOTrainCLIConfig,
@@ -138,15 +140,61 @@ def _tiny_events():
     return l2_events, trades
 
 
-def _save_linear_signals(root, n_rows: int = 16):
-    arrays = predictions_to_signal_arrays({
+def _signal_arrays(n_rows: int = 16):
+    return predictions_to_signal_arrays({
         NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
         DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
         MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
         MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
     })
+
+
+def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
+    arrays = _signal_arrays(n_rows)
+    pairs = []
+    for event_index, event in enumerate(tape.arrays.events):
+        if event_index < start_event_index:
+            continue
+        if int(event["event_type_code"]) != 1:
+            continue
+        book_ptr = int(event["book_ptr"])
+        if book_ptr >= 0:
+            pairs.append((event_index, int(tape.arrays.l2_events[book_ptr]["local_ts_us"])))
+    if not pairs:
+        pairs.append((start_event_index, int(tape.manifest.start_local_ts_us)))
+    decision_event_index = [pair[0] for pair in pairs[:n_rows]]
+    decision_local_ts_us = [pair[1] for pair in pairs[:n_rows]]
+    while len(decision_event_index) < n_rows:
+        decision_event_index.append(decision_event_index[-1] + 1)
+        decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
+    metadata = LinearSignalArtifactMetadata(
+        tape_schema_version=tape.manifest.schema_version,
+        exchange=tape.manifest.exchange,
+        symbol=tape.manifest.symbol,
+        num_events=tape.manifest.num_events,
+        num_l2_batches=tape.manifest.num_l2_batches,
+        num_trades=tape.manifest.num_trades,
+        start_local_ts_us=tape.manifest.start_local_ts_us,
+        end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_interval_us=decision_interval_us,
+        start_event_index=start_event_index,
+        n_rows=n_rows,
+    )
+    return LinearSignalArtifact(
+        arrays=arrays,
+        metadata=metadata,
+        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
+        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+    )
+
+
+def _save_linear_signals(root, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
+    tape = load_execution_tape(root)
+    artifact = _linear_artifact_for_tape(
+        tape, n_rows=n_rows, decision_interval_us=decision_interval_us, start_event_index=start_event_index
+    )
     path = root / LINEAR_SIGNALS_FILENAME
-    save_linear_signal_arrays_npz(path, arrays, overwrite=True)
+    save_linear_signal_artifact_npz(path, artifact, overwrite=True)
     return path
 
 
@@ -162,14 +210,10 @@ def _tiny_tape_root(tmp_path):
 
 
 def _tiny_env() -> ExecutionEnv:
+    tape = _tiny_tape()
     return ExecutionEnv(
-        _tiny_tape(),
-        linear_signals=predictions_to_signal_arrays({
-            NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (16, 1)),
-            DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (16, 1)),
-            MAGNITUDE_UP_KEY: np.full(16, np.log1p(10.0), dtype=np.float32),
-            MAGNITUDE_DOWN_KEY: np.full(16, np.log1p(5.0), dtype=np.float32),
-        }),
+        tape,
+        linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50),
         config=ExecutionEnvConfig(
             decision_interval_us=50,
             max_episode_steps=4,
@@ -278,7 +322,7 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["checkpoint_saved"] is True
     assert summary["training"]["updates_completed"] == 1
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
-    assert summary["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v2_no_move_gated"
+    assert summary["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v3_aligned"
     assert summary["linear_signals"]["n_rows"] >= 1
 
     ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -287,7 +331,7 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert "policy_state_dict" in ckpt
     assert ckpt["tape"]["symbol"] == "BTCUSDT"
     assert ckpt["observation_schema"] == summary["observation_schema"]
-    assert ckpt["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v2_no_move_gated"
+    assert ckpt["linear_signals"]["schema_version"] == "mmrt_execution_linear_signals_v3_aligned"
 
 
 def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):

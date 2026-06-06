@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,7 +24,7 @@ NO_MOVE_PROBA_KEY = "no_move_proba"
 MAGNITUDE_UP_KEY = "magnitude_up"
 MAGNITUDE_DOWN_KEY = "magnitude_down"
 
-LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION = "mmrt_execution_linear_signals_v2_no_move_gated"
+LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION = "mmrt_execution_linear_signals_v3_aligned"
 LINEAR_SIGNALS_FILENAME = "linear_signals.npz"
 _LINEAR_SIGNAL_CONSISTENCY_EPS = 1e-5
 _LINEAR_SIGNAL_ARRAY_FIELDS = (
@@ -284,9 +285,233 @@ def linear_signal_at(arrays: LinearSignalArrays, row: int) -> LinearSignal:
     return LinearSignal(**{name: float(getattr(arrays, name)[row]) for name in _LINEAR_SIGNAL_ARRAY_FIELDS})
 
 
-def save_linear_signal_arrays_npz(path: str | Path, arrays: LinearSignalArrays, *, overwrite: bool = False) -> None:
-    """Save validated linear signal arrays to the canonical execution NPZ artifact."""
 
+@dataclass(frozen=True, slots=True)
+class LinearSignalArtifactMetadata:
+    tape_schema_version: str
+    exchange: str
+    symbol: str
+    num_events: int
+    num_l2_batches: int
+    num_trades: int
+    start_local_ts_us: int
+    end_local_ts_us: int
+    decision_interval_us: int
+    start_event_index: int
+    n_rows: int
+
+    def __post_init__(self) -> None:
+        for name in ("tape_schema_version", "exchange", "symbol"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        object.__setattr__(self, "num_events", _require_positive_int(self.num_events, "num_events"))
+        for name in ("num_l2_batches", "num_trades"):
+            object.__setattr__(self, name, _require_nonnegative_int(getattr(self, name), name))
+        object.__setattr__(self, "start_local_ts_us", _require_positive_int(self.start_local_ts_us, "start_local_ts_us"))
+        object.__setattr__(self, "end_local_ts_us", _require_positive_int(self.end_local_ts_us, "end_local_ts_us"))
+        if self.end_local_ts_us < self.start_local_ts_us:
+            raise ValueError("end_local_ts_us must be >= start_local_ts_us")
+        object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
+        object.__setattr__(self, "start_event_index", _require_nonnegative_int(self.start_event_index, "start_event_index"))
+        object.__setattr__(self, "n_rows", _require_positive_int(self.n_rows, "n_rows"))
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "tape_schema_version": self.tape_schema_version,
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "num_events": self.num_events,
+            "num_l2_batches": self.num_l2_batches,
+            "num_trades": self.num_trades,
+            "start_local_ts_us": self.start_local_ts_us,
+            "end_local_ts_us": self.end_local_ts_us,
+            "decision_interval_us": self.decision_interval_us,
+            "start_event_index": self.start_event_index,
+            "n_rows": self.n_rows,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> "LinearSignalArtifactMetadata":
+        if not isinstance(raw, Mapping):
+            raise ValueError("metadata must be a mapping")
+        required = (
+            "tape_schema_version",
+            "exchange",
+            "symbol",
+            "num_events",
+            "num_l2_batches",
+            "num_trades",
+            "start_local_ts_us",
+            "end_local_ts_us",
+            "decision_interval_us",
+            "start_event_index",
+            "n_rows",
+        )
+        missing = [key for key in required if key not in raw]
+        if missing:
+            raise ValueError(f"linear signal metadata missing fields: {missing}")
+        return cls(**{key: raw[key] for key in required})  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class LinearSignalArtifact:
+    arrays: LinearSignalArrays
+    metadata: LinearSignalArtifactMetadata
+    decision_event_index: np.ndarray
+    decision_local_ts_us: np.ndarray
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.arrays, LinearSignalArrays):
+            raise ValueError("arrays must be LinearSignalArrays")
+        if not isinstance(self.metadata, LinearSignalArtifactMetadata):
+            raise ValueError("metadata must be LinearSignalArtifactMetadata")
+        decision_event_index = _coerce_int64_vector(self.decision_event_index, name="decision_event_index")
+        decision_local_ts_us = _coerce_int64_vector(self.decision_local_ts_us, name="decision_local_ts_us")
+        if decision_event_index.shape[0] != self.arrays.n_rows or decision_local_ts_us.shape[0] != self.arrays.n_rows:
+            raise ValueError("decision alignment arrays length must equal signal array rows")
+        if self.metadata.n_rows != self.arrays.n_rows:
+            raise ValueError("metadata.n_rows must equal signal array rows")
+        if (decision_event_index < 0).any():
+            raise ValueError("decision_event_index must be nonnegative")
+        if (decision_local_ts_us <= 0).any():
+            raise ValueError("decision_local_ts_us must be positive")
+        if decision_event_index.shape[0] > 1 and (np.diff(decision_event_index) <= 0).any():
+            raise ValueError("decision_event_index must be strictly increasing")
+        if decision_local_ts_us.shape[0] > 1 and (np.diff(decision_local_ts_us) <= 0).any():
+            raise ValueError("decision_local_ts_us must be strictly increasing")
+        object.__setattr__(self, "decision_event_index", decision_event_index)
+        object.__setattr__(self, "decision_local_ts_us", decision_local_ts_us)
+
+    @property
+    def n_rows(self) -> int:
+        return self.arrays.n_rows
+
+
+def save_linear_signal_artifact_npz(
+    path: str | Path,
+    artifact: LinearSignalArtifact,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Save a validated aligned linear signal artifact to the canonical execution NPZ."""
+
+    if not isinstance(artifact, LinearSignalArtifact):
+        raise ValueError("artifact must be LinearSignalArtifact")
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(str(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    payload = {name: getattr(artifact.arrays, name) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
+    payload["schema_version"] = np.array(LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION)
+    payload["metadata_json"] = np.array(json.dumps(artifact.metadata.as_dict(), sort_keys=True))
+    payload["decision_event_index"] = artifact.decision_event_index
+    payload["decision_local_ts_us"] = artifact.decision_local_ts_us
+    with tmp.open("wb") as handle:
+        np.savez(handle, **payload)
+    tmp.replace(path)
+
+
+def load_linear_signal_artifact_npz(path: str | Path, *, mmap_mode: str | None = None) -> LinearSignalArtifact:
+    """Load a canonical v3 aligned linear signal artifact."""
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    with np.load(path, mmap_mode=mmap_mode, allow_pickle=False) as data:
+        keys = set(data.files)
+        if "schema_version" not in keys:
+            raise ValueError("linear signal NPZ missing schema_version")
+        schema_version = str(np.asarray(data["schema_version"]).item())
+        if schema_version != LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION:
+            raise ValueError("linear signal NPZ schema_version mismatch")
+        required = set(_LINEAR_SIGNAL_ARRAY_FIELDS) | {"metadata_json", "decision_event_index", "decision_local_ts_us"}
+        missing = sorted(required - keys)
+        if missing:
+            raise ValueError(f"linear signal NPZ missing required arrays: {missing}")
+        metadata_raw = json.loads(str(np.asarray(data["metadata_json"]).item()))
+        metadata = LinearSignalArtifactMetadata.from_dict(metadata_raw)
+        arrays = LinearSignalArrays(**{name: np.array(data[name], copy=True) for name in _LINEAR_SIGNAL_ARRAY_FIELDS})
+        decision_event_index = np.array(data["decision_event_index"], copy=True)
+        decision_local_ts_us = np.array(data["decision_local_ts_us"], copy=True)
+    return LinearSignalArtifact(
+        arrays=arrays,
+        metadata=metadata,
+        decision_event_index=decision_event_index,
+        decision_local_ts_us=decision_local_ts_us,
+    )
+
+
+def linear_signal_artifact_summary(artifact: LinearSignalArtifact, *, path: str | None = None) -> dict[str, object]:
+    if not isinstance(artifact, LinearSignalArtifact):
+        raise ValueError("artifact must be LinearSignalArtifact")
+    return {
+        "schema_version": LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION,
+        "path": path,
+        "n_rows": artifact.n_rows,
+        "dtype": str(artifact.arrays.dtype),
+        "fields": list(_LINEAR_SIGNAL_ARRAY_FIELDS),
+        "metadata": artifact.metadata.as_dict(),
+        "first_decision_event_index": int(artifact.decision_event_index[0]),
+        "last_decision_event_index": int(artifact.decision_event_index[-1]),
+        "first_decision_local_ts_us": int(artifact.decision_local_ts_us[0]),
+        "last_decision_local_ts_us": int(artifact.decision_local_ts_us[-1]),
+    }
+
+
+def validate_linear_signal_artifact_metadata(
+    artifact: LinearSignalArtifact,
+    *,
+    tape_schema_version: str,
+    exchange: str,
+    symbol: str,
+    num_events: int,
+    num_l2_batches: int,
+    num_trades: int,
+    start_local_ts_us: int,
+    end_local_ts_us: int,
+    decision_interval_us: int,
+    start_event_index: int,
+    min_rows: int | None = None,
+) -> None:
+    if not isinstance(artifact, LinearSignalArtifact):
+        raise ValueError("linear signal artifact must be LinearSignalArtifact")
+    expected = LinearSignalArtifactMetadata(
+        tape_schema_version=tape_schema_version,
+        exchange=exchange,
+        symbol=symbol,
+        num_events=num_events,
+        num_l2_batches=num_l2_batches,
+        num_trades=num_trades,
+        start_local_ts_us=start_local_ts_us,
+        end_local_ts_us=end_local_ts_us,
+        decision_interval_us=decision_interval_us,
+        start_event_index=start_event_index,
+        n_rows=artifact.metadata.n_rows,
+    )
+    actual = artifact.metadata
+    for key, expected_value in expected.as_dict().items():
+        if key == "n_rows":
+            continue
+        actual_value = getattr(actual, key)
+        if actual_value != expected_value:
+            raise ValueError(
+                f"linear signal metadata mismatch for {key}: "
+                f"expected={expected_value!r} actual={actual_value!r}"
+            )
+    if actual.n_rows != artifact.n_rows:
+        raise ValueError("linear signal metadata n_rows mismatch")
+    if min_rows is not None:
+        min_rows = _require_nonnegative_int(min_rows, "min_rows")
+        if artifact.n_rows < min_rows:
+            raise ValueError("linear signal artifact does not contain enough rows")
+
+
+# Private compatibility helpers for non-execution internals/tests that still need raw array files.
+def _save_linear_signal_arrays_npz(path: str | Path, arrays: LinearSignalArrays, *, overwrite: bool = False) -> None:
     if not isinstance(arrays, LinearSignalArrays):
         raise ValueError("arrays must be LinearSignalArrays")
     path = Path(path)
@@ -297,43 +522,9 @@ def save_linear_signal_arrays_npz(path: str | Path, arrays: LinearSignalArrays, 
     if tmp.exists():
         tmp.unlink()
     payload = {name: getattr(arrays, name) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
-    payload["schema_version"] = np.array(LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION)
     with tmp.open("wb") as handle:
         np.savez(handle, **payload)
     tmp.replace(path)
-
-
-def load_linear_signal_arrays_npz(path: str | Path, *, mmap_mode: str | None = None) -> LinearSignalArrays:
-    """Load the required canonical no-move-gated linear signal NPZ artifact."""
-
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(str(path))
-    with np.load(path, mmap_mode=mmap_mode) as data:
-        keys = set(data.files)
-        if "schema_version" not in keys:
-            raise ValueError("linear signal NPZ missing schema_version")
-        schema_version = str(np.asarray(data["schema_version"]).item())
-        if schema_version != LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION:
-            raise ValueError("linear signal NPZ schema_version mismatch")
-        required = set(_LINEAR_SIGNAL_ARRAY_FIELDS)
-        missing = sorted(required - keys)
-        if missing:
-            raise ValueError(f"linear signal NPZ missing required arrays: {missing}")
-        arrays = {name: np.array(data[name], copy=True) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
-    return LinearSignalArrays(**arrays)
-
-
-def linear_signal_arrays_summary(arrays: LinearSignalArrays, *, path: str | None = None) -> dict[str, object]:
-    if not isinstance(arrays, LinearSignalArrays):
-        raise ValueError("arrays must be LinearSignalArrays")
-    return {
-        "schema_version": LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION,
-        "path": path,
-        "n_rows": arrays.n_rows,
-        "dtype": str(arrays.dtype),
-        "fields": list(_LINEAR_SIGNAL_ARRAY_FIELDS),
-    }
 
 
 def _require_config(value: Any) -> LinearSignalConfig:
@@ -367,6 +558,23 @@ def _require_nonnegative_float(value: float, name: str) -> float:
         raise ValueError(f"{name} must be nonnegative")
     return value
 
+
+
+def _require_positive_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a positive int")
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return value
+
+
+def _coerce_int64_vector(values: Any, *, name: str) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be a 1D array")
+    if not np.issubdtype(arr.dtype, np.integer):
+        raise ValueError(f"{name} must have integer dtype")
+    return np.ascontiguousarray(arr, dtype=np.int64)
 
 def _require_nonnegative_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -459,16 +667,19 @@ __all__ = [
     "NO_MOVE_PROBA_KEY",
     "MAGNITUDE_UP_KEY",
     "MAGNITUDE_DOWN_KEY",
-    "LINEAR_SIGNAL_ARRAYS_SCHEMA_VERSION",
+    "LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION",
     "LINEAR_SIGNALS_FILENAME",
     "LinearSignalConfig",
     "LinearSignalArrays",
+    "LinearSignalArtifactMetadata",
+    "LinearSignalArtifact",
     "magnitude_to_bps",
     "build_gated_linear_signal",
     "prediction_row_to_signal",
     "predictions_to_signal_arrays",
     "linear_signal_at",
-    "save_linear_signal_arrays_npz",
-    "load_linear_signal_arrays_npz",
-    "linear_signal_arrays_summary",
+    "save_linear_signal_artifact_npz",
+    "load_linear_signal_artifact_npz",
+    "linear_signal_artifact_summary",
+    "validate_linear_signal_artifact_metadata",
 ]

@@ -16,7 +16,7 @@ from mmrt.execution.contracts import (
     TradePrint,
 )
 from mmrt.execution.event_merge import merge_execution_events
-from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
+from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -24,8 +24,10 @@ from mmrt.execution.linear_signal import (
     MAGNITUDE_DOWN_KEY,
     MAGNITUDE_UP_KEY,
     NO_MOVE_PROBA_KEY,
+    LinearSignalArtifact,
+    LinearSignalArtifactMetadata,
     predictions_to_signal_arrays,
-    save_linear_signal_arrays_npz,
+    save_linear_signal_artifact_npz,
 )
 from mmrt.execution.metrics import ExecutionMetricAccumulator, summarize_execution_steps
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
@@ -121,15 +123,61 @@ def _save_tape(tmp_path, tape):
     return root
 
 
-def _save_linear_signals(root: Path, n_rows: int = 16) -> Path:
-    arrays = predictions_to_signal_arrays({
+def _signal_arrays(n_rows: int = 16):
+    return predictions_to_signal_arrays({
         NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
         DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
         MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
         MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
     })
+
+
+def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
+    arrays = _signal_arrays(n_rows)
+    pairs = []
+    for event_index, event in enumerate(tape.arrays.events):
+        if event_index < start_event_index:
+            continue
+        if int(event["event_type_code"]) != 1:
+            continue
+        book_ptr = int(event["book_ptr"])
+        if book_ptr >= 0:
+            pairs.append((event_index, int(tape.arrays.l2_events[book_ptr]["local_ts_us"])))
+    if not pairs:
+        pairs.append((start_event_index, int(tape.manifest.start_local_ts_us)))
+    decision_event_index = [pair[0] for pair in pairs[:n_rows]]
+    decision_local_ts_us = [pair[1] for pair in pairs[:n_rows]]
+    while len(decision_event_index) < n_rows:
+        decision_event_index.append(decision_event_index[-1] + 1)
+        decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
+    metadata = LinearSignalArtifactMetadata(
+        tape_schema_version=tape.manifest.schema_version,
+        exchange=tape.manifest.exchange,
+        symbol=tape.manifest.symbol,
+        num_events=tape.manifest.num_events,
+        num_l2_batches=tape.manifest.num_l2_batches,
+        num_trades=tape.manifest.num_trades,
+        start_local_ts_us=tape.manifest.start_local_ts_us,
+        end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_interval_us=decision_interval_us,
+        start_event_index=start_event_index,
+        n_rows=n_rows,
+    )
+    return LinearSignalArtifact(
+        arrays=arrays,
+        metadata=metadata,
+        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
+        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+    )
+
+
+def _save_linear_signals(root, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
+    tape = load_execution_tape(root)
+    artifact = _linear_artifact_for_tape(
+        tape, n_rows=n_rows, decision_interval_us=decision_interval_us, start_event_index=start_event_index
+    )
     path = root / LINEAR_SIGNALS_FILENAME
-    save_linear_signal_arrays_npz(path, arrays, overwrite=True)
+    save_linear_signal_artifact_npz(path, artifact, overwrite=True)
     return path
 
 
@@ -187,15 +235,15 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
         )
     ]
     tape_root = _save_tape(tmp_path, _tape(l2_events, trades))
-    _save_linear_signals(tape_root)
+    _save_linear_signals(tape_root, decision_interval_us=250)
 
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
             tape_root=str(tape_root),
             output_json=str(tmp_path / "summary.json"),
             policy="bid",
-            max_steps=1,
-            decision_interval_us=100,
+            max_steps=2,
+            decision_interval_us=250,
             max_order_qty=1.0,
             default_order_qty=1.0,
             overwrite=True,
@@ -282,6 +330,8 @@ def test_audit_execution_sim_main_writes_summary_and_prints_json(tmp_path, capsy
             "disabled",
             "--max-steps",
             "1",
+            "--decision-interval-us",
+            "50",
             "--overwrite",
         ]
     )
