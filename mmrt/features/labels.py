@@ -210,8 +210,8 @@ class LabelBuilder:
 
     def on_decision_local(self, decision_local_ts_us: int, event_seq: int) -> None:
         decision_key = EventKey(decision_local_ts_us, event_seq)
-        if self._last_decision_key is not None and decision_key < self._last_decision_key:
-            raise ValueError("decision EventKey must be nondecreasing")
+        if self._last_decision_key is not None and decision_key <= self._last_decision_key:
+            raise ValueError("decision EventKey must be strictly increasing")
         self._last_decision_key = decision_key
         entry_local_ts_us = decision_local_ts_us + self.spec.entry_delay_us
         ready_local_ts_us = entry_local_ts_us + max(self.spec.horizons_us)

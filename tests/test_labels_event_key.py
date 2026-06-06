@@ -69,3 +69,30 @@ def test_vectorized_matches_incremental_builder():
         out.extend(b.observe_price_local(int(t), int(q), float(p)))
     out.extend(b.finalize_at_eof())
     assert np.allclose(labels[valid], np.array([r.values_bps for r in out]))
+
+
+def test_same_timestamp_distinct_decision_event_sequences_allowed():
+    spec = LabelSpec(horizons_us=(100_000,), entry_delay_us=0)
+    b = LabelBuilder(spec)
+
+    b.on_decision_local(1_000_000, 0)
+    b.on_decision_local(1_000_000, 1)
+
+    b.observe_price_local(1_000_000, 0, 100.0)
+    b.observe_price_local(1_000_000, 1, 101.0)
+    b.observe_price_local(1_100_000, 2, 105.0)
+    out = b.observe_price_local(1_100_001, 3, 105.0)
+
+    assert len(out) == 2
+    assert [(r.decision_ts_us, r.decision_event_seq) for r in out] == [
+        (1_000_000, 0),
+        (1_000_000, 1),
+    ]
+
+
+def test_duplicate_decision_event_key_rejected():
+    b = LabelBuilder(LabelSpec(horizons_us=(100_000,), entry_delay_us=0))
+
+    b.on_decision_local(1_000_000, 0)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        b.on_decision_local(1_000_000, 0)

@@ -49,6 +49,9 @@ def _order(
     status: OrderStatus = OrderStatus.ACTIVE,
     created_local_ts_us: int = 100,
     last_update_local_ts_us: int = 100,
+    effective_local_ts_us: int = 0,
+    cancel_requested_local_ts_us: int = 0,
+    cancel_effective_local_ts_us: int = 0,
 ) -> ActiveOrder:
     return ActiveOrder(
         order_id=order_id,
@@ -60,6 +63,9 @@ def _order(
         status=status,
         created_local_ts_us=created_local_ts_us,
         last_update_local_ts_us=last_update_local_ts_us,
+        effective_local_ts_us=effective_local_ts_us,
+        cancel_requested_local_ts_us=cancel_requested_local_ts_us,
+        cancel_effective_local_ts_us=cancel_effective_local_ts_us,
     )
 
 
@@ -173,6 +179,66 @@ def test_sync_orders_to_quote_cancels_live_and_appends_new():
     assert len(out) == 3
     assert out[1].order_id == 10
     assert out[2].order_id == 11
+
+
+def test_sync_same_price_pending_cancel_places_replacement_without_double_counting_cancel():
+    pending_cancel = _order(
+        order_id=1,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        created_local_ts_us=100,
+        last_update_local_ts_us=150,
+        cancel_requested_local_ts_us=150,
+        cancel_effective_local_ts_us=250,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=1000,
+        bid_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [pending_cancel],
+        quote,
+        next_order_id=10,
+        decision_local_ts_us=200,
+        order_effective_local_ts_us=260,
+        cancel_effective_local_ts_us=300,
+    )
+
+    assert cancel_count == 0
+    assert len(out) == 2
+    old, replacement = out
+    assert old.order_id == 1
+    assert old.cancel_effective_local_ts_us == 250
+    assert replacement.order_id == 10
+    assert replacement.side == OrderSide.BUY
+    assert replacement.price_tick == 1000
+    assert replacement.effective_local_ts_us == 260
+
+
+def test_pending_cancel_and_future_replacement_same_price_not_duplicate_before_overlap():
+    old = _order(
+        order_id=1,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        cancel_requested_local_ts_us=150,
+        cancel_effective_local_ts_us=250,
+        last_update_local_ts_us=150,
+    )
+    replacement = _order(
+        order_id=2,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        created_local_ts_us=200,
+        last_update_local_ts_us=200,
+        effective_local_ts_us=260,
+    )
+
+    simulate_trade_event([old, replacement], _trade(local_ts_us=220), symbol_spec=_spec())
+    simulate_trade_event([old, replacement], _trade(local_ts_us=255), symbol_spec=_spec())
+    simulate_trade_event([old, replacement], _trade(local_ts_us=270), symbol_spec=_spec())
 
 
 def test_live_orders_filters_correctly():
@@ -381,7 +447,7 @@ def test_l2_update_nonmatching_level_ignored():
     assert result.fills == ()
 
 
-def test_duplicate_live_side_price_rejected():
+def test_two_simultaneously_fillable_same_side_price_orders_rejected():
     order1 = _order(order_id=1, side=OrderSide.BUY, price_tick=1000)
     order2 = _order(order_id=2, side=OrderSide.BUY, price_tick=1000)
 

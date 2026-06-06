@@ -189,6 +189,8 @@ def test_action_spec_validation():
     spec = ActionSpec(max_distance_ticks=10, max_order_qty=0.02)
     assert spec.max_distance_ticks == 10
 
+    assert not hasattr(spec, "default_order_qty")
+
     with pytest.raises(ValueError):
         ActionSpec(max_distance_ticks=0)
 
@@ -197,6 +199,11 @@ def test_action_spec_validation():
 
     with pytest.raises(ValueError):
         ActionSpec(allow_bid=False, allow_ask=False)
+
+
+def test_action_spec_has_no_quote_geometry_defaults():
+    spec = ActionSpec()
+    assert not hasattr(spec, "default_order_qty")
 
 
 def test_quote_intent_validation():

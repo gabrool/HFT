@@ -96,7 +96,21 @@ def test_continuous_action_builds_two_sided_passive_quote():
     assert quote.ask_qty > 0
 
 
-def test_action_logits_disable_sides():
+def test_quote_geometry_result_uses_offset_fields_only():
+    result = continuous_action_to_quote(
+        action=_action(),
+        book_top=_top(),
+        symbol_spec=_spec(),
+        action_spec=ActionSpec(max_distance_ticks=20, max_order_qty=0.01),
+    )
+
+    assert hasattr(result, "bid_offset_ticks")
+    assert hasattr(result, "ask_offset_ticks")
+    assert not hasattr(result, "bid_distance_ticks")
+    assert not hasattr(result, "ask_distance_ticks")
+
+
+def test_action_enable_flags_disable_sides():
     result = continuous_action_to_quote(
         action=_action(bid_enabled=False, ask_enabled=False),
         book_top=_top(),
