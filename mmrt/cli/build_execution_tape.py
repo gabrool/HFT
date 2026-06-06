@@ -33,6 +33,13 @@ from mmrt.execution.l2_reconstructor import (
     ReconstructedL2Event,
     iter_l2_update_batches,
 )
+from mmrt.metadata.binance_exchange_info import load_binance_usdm_exchange_info_symbol_rules
+from mmrt.metadata.rule_compatibility import (
+    RuleCompatibilityAccumulator,
+    RuleCompatibilityConfig,
+    RuleCompatibilityMode,
+)
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode, read_symbol_rules_json
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,11 +50,12 @@ class ExecutionTapeBuildConfig:
 
     exchange: str = "binance-futures"
     symbol: str = "BTCUSDT"
-    tick_size: float = 0.1
-    step_size: float = 0.001
-    min_qty: float = 0.001
-    max_qty: float = 100.0
-    min_notional: float = 5.0
+    exchange_info_json: str | None = None
+    symbol_rules_json: str | None = None
+    symbol_rules_mode: SymbolRuleMode | str = SymbolRuleMode.CURRENT_RULES_REPLAY
+    symbol_rule_compatibility_mode: RuleCompatibilityMode | str = RuleCompatibilityMode.WARN
+    price_grid_tolerance_ticks: float = 1e-6
+    qty_grid_tolerance_steps: float = 1e-6
 
     batch_size: int = 65_536
     book_depth: int = 25
@@ -67,13 +75,16 @@ class ExecutionTapeBuildConfig:
         _require_nonempty_str(self.output_root, "output_root")
         _require_nonempty_str(self.exchange, "exchange")
         _require_nonempty_str(self.symbol, "symbol")
-        object.__setattr__(self, "tick_size", _require_positive_float(self.tick_size, "tick_size"))
-        object.__setattr__(self, "step_size", _require_positive_float(self.step_size, "step_size"))
-        object.__setattr__(self, "min_qty", _require_nonnegative_float(self.min_qty, "min_qty"))
-        object.__setattr__(self, "max_qty", _require_positive_float(self.max_qty, "max_qty"))
-        if self.max_qty < self.min_qty:
-            raise ValueError("max_qty must be >= min_qty")
-        object.__setattr__(self, "min_notional", _require_nonnegative_float(self.min_notional, "min_notional"))
+        if (self.exchange_info_json is None) == (self.symbol_rules_json is None):
+            raise ValueError("exactly one of exchange_info_json or symbol_rules_json is required")
+        if self.exchange_info_json is not None:
+            _require_nonempty_str(self.exchange_info_json, "exchange_info_json")
+        if self.symbol_rules_json is not None:
+            _require_nonempty_str(self.symbol_rules_json, "symbol_rules_json")
+        object.__setattr__(self, "symbol_rules_mode", _coerce_symbol_rules_mode(self.symbol_rules_mode))
+        object.__setattr__(self, "symbol_rule_compatibility_mode", _coerce_compatibility_mode(self.symbol_rule_compatibility_mode))
+        object.__setattr__(self, "price_grid_tolerance_ticks", _require_nonnegative_float(self.price_grid_tolerance_ticks, "price_grid_tolerance_ticks"))
+        object.__setattr__(self, "qty_grid_tolerance_steps", _require_nonnegative_float(self.qty_grid_tolerance_steps, "qty_grid_tolerance_steps"))
         object.__setattr__(self, "batch_size", _require_positive_int(self.batch_size, "batch_size"))
         object.__setattr__(self, "book_depth", _require_positive_int(self.book_depth, "book_depth"))
         object.__setattr__(self, "max_l2_rows", _optional_positive_int(self.max_l2_rows, "max_l2_rows"))
@@ -90,14 +101,15 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
     if not isinstance(config, ExecutionTapeBuildConfig):
         raise ValueError("config must be ExecutionTapeBuildConfig")
 
-    symbol_spec = SymbolSpec(
-        exchange=config.exchange,
-        symbol=config.symbol,
-        tick_size=config.tick_size,
-        step_size=config.step_size,
-        min_qty=config.min_qty,
-        max_qty=config.max_qty,
-        min_notional=config.min_notional,
+    rules = _load_symbol_rules(config)
+    symbol_spec = rules.to_symbol_spec()
+    compat = RuleCompatibilityAccumulator(
+        rules,
+        RuleCompatibilityConfig(
+            mode=config.symbol_rule_compatibility_mode,
+            price_tolerance_ticks=config.price_grid_tolerance_ticks,
+            qty_tolerance_steps=config.qty_grid_tolerance_steps,
+        ),
     )
     l2_paths = _resolve_input_paths(config.l2_inputs, "l2_inputs")
     trade_paths = _resolve_input_paths(config.trade_inputs, "trade_inputs")
@@ -112,13 +124,17 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
         batch_size=config.batch_size,
         max_rows=config.max_l2_rows,
         book_depth=config.book_depth,
+        compatibility=compat,
     )
     trades, trade_stats = load_trade_prints(
         trade_paths,
         symbol_spec=symbol_spec,
         batch_size=config.batch_size,
         max_rows=config.max_trade_rows,
+        compatibility=compat,
     )
+
+    compatibility_report = compat.report() if config.symbol_rule_compatibility_mode is not RuleCompatibilityMode.OFF else None
 
     if not l2_events:
         raise ValueError("cannot build execution tape without reconstructed L2 events")
@@ -128,6 +144,8 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
     plan = merge_execution_events(l2_events, trades, tie_policy=config.tie_policy)
     tape = build_execution_tape_object(
         symbol_spec=symbol_spec,
+        symbol_rules=rules,
+        symbol_rule_compatibility=compatibility_report,
         l2_events=l2_events,
         trades=trades,
         merged_events=plan.events,
@@ -152,6 +170,7 @@ def load_reconstructed_l2_events(
     batch_size: int,
     max_rows: int | None = None,
     book_depth: int = 25,
+    compatibility: RuleCompatibilityAccumulator | None = None,
 ) -> tuple[list[ReconstructedL2Event], dict[str, object]]:
     book_depth = _require_positive_int(book_depth, "book_depth")
     reconstructor = L2BookReconstructor(symbol_spec, snapshot_depth=book_depth)
@@ -170,6 +189,8 @@ def load_reconstructed_l2_events(
                     return
                 fallback_source_row = rows_seen
                 rows_seen += 1
+                if compatibility is not None:
+                    _observe_l2_row_compatibility(row, compatibility)
                 update = _row_to_l2_update(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
                 if first_local_ts_us is None:
                     first_local_ts_us = update.local_ts_us
@@ -216,6 +237,7 @@ def load_trade_prints(
     symbol_spec: SymbolSpec,
     batch_size: int,
     max_rows: int | None = None,
+    compatibility: RuleCompatibilityAccumulator | None = None,
 ) -> tuple[list[TradePrint], dict[str, object]]:
     trades: list[TradePrint] = []
     rows_seen = 0
@@ -238,6 +260,8 @@ def load_trade_prints(
                 return trades, stats
             fallback_source_row = rows_seen
             rows_seen += 1
+            if compatibility is not None:
+                _observe_trade_row_compatibility(row, compatibility)
             trade = _row_to_trade_print(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
             if prev_local_ts_us is not None and trade.local_ts_us < prev_local_ts_us:
                 raise ValueError("trades must be sorted by nondecreasing local_ts_us")
@@ -264,11 +288,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--exchange", default="binance-futures")
     parser.add_argument("--symbol", default="BTCUSDT")
-    parser.add_argument("--tick-size", type=float, default=0.1)
-    parser.add_argument("--step-size", type=float, default=0.001)
-    parser.add_argument("--min-qty", type=float, default=0.001)
-    parser.add_argument("--max-qty", type=float, default=100.0)
-    parser.add_argument("--min-notional", type=float, default=5.0)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--exchange-info-json")
+    group.add_argument("--symbol-rules-json")
+    parser.add_argument("--symbol-rules-mode", choices=[mode.value for mode in SymbolRuleMode], default=SymbolRuleMode.CURRENT_RULES_REPLAY.value)
+    parser.add_argument("--symbol-rule-compatibility-mode", choices=[mode.value for mode in RuleCompatibilityMode], default=RuleCompatibilityMode.WARN.value)
+    parser.add_argument("--price-grid-tolerance-ticks", type=float, default=1e-6)
+    parser.add_argument("--qty-grid-tolerance-steps", type=float, default=1e-6)
     parser.add_argument("--batch-size", type=int, default=65_536)
     parser.add_argument("--book-depth", type=int, default=25)
     parser.add_argument("--max-l2-rows", type=int)
@@ -291,11 +317,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_root=args.output_root,
         exchange=args.exchange,
         symbol=args.symbol,
-        tick_size=args.tick_size,
-        step_size=args.step_size,
-        min_qty=args.min_qty,
-        max_qty=args.max_qty,
-        min_notional=args.min_notional,
+        exchange_info_json=args.exchange_info_json,
+        symbol_rules_json=args.symbol_rules_json,
+        symbol_rules_mode=args.symbol_rules_mode,
+        symbol_rule_compatibility_mode=args.symbol_rule_compatibility_mode,
+        price_grid_tolerance_ticks=args.price_grid_tolerance_ticks,
+        qty_grid_tolerance_steps=args.qty_grid_tolerance_steps,
         batch_size=args.batch_size,
         book_depth=args.book_depth,
         max_l2_rows=args.max_l2_rows,
@@ -437,11 +464,8 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
         "market": {
             "exchange": config.exchange,
             "symbol": config.symbol,
-            "tick_size": config.tick_size,
-            "step_size": config.step_size,
-            "min_qty": config.min_qty,
-            "max_qty": config.max_qty,
-            "min_notional": config.min_notional,
+            "symbol_rules_mode": config.symbol_rules_mode.value,
+            "symbol_rule_compatibility_mode": config.symbol_rule_compatibility_mode.value,
         },
         "counts": {
             "l2_rows_seen": l2_stats["rows_seen"],
@@ -689,6 +713,64 @@ def _parse_trade_side(row: Mapping[str, Any]) -> AggressorSide:
         raise ValueError(f"unsupported side_code: {code!r}")
     raise ValueError("trade row missing side or side_code")
 
+
+def _coerce_symbol_rules_mode(value: SymbolRuleMode | str) -> SymbolRuleMode:
+    if isinstance(value, SymbolRuleMode):
+        return value
+    if isinstance(value, str):
+        return SymbolRuleMode(value)
+    raise ValueError("symbol_rules_mode must be SymbolRuleMode or str")
+
+
+def _coerce_compatibility_mode(value: RuleCompatibilityMode | str) -> RuleCompatibilityMode:
+    if isinstance(value, RuleCompatibilityMode):
+        return value
+    if isinstance(value, str):
+        return RuleCompatibilityMode(value)
+    raise ValueError("symbol_rule_compatibility_mode must be RuleCompatibilityMode or str")
+
+
+def _load_symbol_rules(config: ExecutionTapeBuildConfig) -> ExchangeSymbolRules:
+    if config.exchange_info_json is not None:
+        rules = load_binance_usdm_exchange_info_symbol_rules(
+            config.exchange_info_json,
+            symbol=config.symbol,
+            exchange=config.exchange,
+            mode=config.symbol_rules_mode,
+        )
+    elif config.symbol_rules_json is not None:
+        rules = read_symbol_rules_json(config.symbol_rules_json)
+    else:  # guarded by config validation
+        raise ValueError("exactly one of exchange_info_json or symbol_rules_json is required")
+    if rules.exchange != config.exchange or rules.symbol != config.symbol:
+        raise ValueError("symbol rules exchange/symbol must match build config")
+    return rules
+
+
+def _observe_l2_row_compatibility(row: Mapping[str, Any], compatibility: RuleCompatibilityAccumulator) -> None:
+    local_ts_us = _compat_local_ts(row)
+    if _has_nonempty(row, "price"):
+        compatibility.observe_price(_coerce_float(row["price"], "price"), source="l2.price", local_ts_us=local_ts_us)
+    if _has_nonempty(row, "amount"):
+        amount = _coerce_float(row["amount"], "amount")
+        if amount > 0:
+            compatibility.observe_qty(amount, source="l2.amount", local_ts_us=local_ts_us)
+
+
+def _observe_trade_row_compatibility(row: Mapping[str, Any], compatibility: RuleCompatibilityAccumulator) -> None:
+    local_ts_us = _compat_local_ts(row)
+    if _has_nonempty(row, "price"):
+        compatibility.observe_price(_coerce_float(row["price"], "price"), source="trade.price", local_ts_us=local_ts_us)
+    if _has_nonempty(row, "amount"):
+        compatibility.observe_qty(_coerce_float(row["amount"], "amount"), source="trade.amount", local_ts_us=local_ts_us)
+
+
+def _compat_local_ts(row: Mapping[str, Any]) -> int | None:
+    if _has_nonempty(row, "local_ts_us"):
+        return _coerce_positive_int(row["local_ts_us"], "local_ts_us")
+    if _has_nonempty(row, "local_timestamp"):
+        return _coerce_positive_int(row["local_timestamp"], "local_timestamp")
+    return None
 
 def _coerce_int(value: Any, name: str) -> int:
     if isinstance(value, bool):

@@ -1,8 +1,10 @@
 import math
+from decimal import Decimal
 
 import pytest
 
 from mmrt.contracts import AggressorSide, BookSide, TardisDataType
+from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.contracts import (
     ActionSpec,
     ActiveOrder,
@@ -27,6 +29,19 @@ from mmrt.execution.contracts import (
     SymbolSpec,
 )
 
+
+
+def _rules(**overrides):
+    kwargs = {
+        "exchange": "binance-futures", "symbol": "BTCUSDT", "mode": SymbolRuleMode.CURRENT_RULES_REPLAY,
+        "base_asset": "BTC", "quote_asset": "USDT", "margin_asset": "USDT",
+        "contract_type": "PERPETUAL", "status": "TRADING",
+        "tick_size": Decimal("0.1"), "min_price": Decimal("0.1"), "max_price": Decimal("1000000"),
+        "step_size": Decimal("0.001"), "min_qty": Decimal("0.001"), "max_qty": Decimal("100"),
+        "min_notional": Decimal("5"), "allowed_order_types": ("LIMIT",), "allowed_time_in_force": ("GTC", "GTX"),
+    }
+    kwargs.update(overrides)
+    return ExchangeSymbolRules(**kwargs)
 
 def _spec(**overrides):
     kwargs = {
@@ -357,6 +372,7 @@ def test_execution_tape_manifest_required_metadata():
         exchange="binance-futures",
         symbol="BTCUSDT",
         symbol_spec=spec,
+        symbol_rules=_rules(),
         source_data_types=(TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES),
         array_names=("events", "books", "trades"),
         num_events=10,
@@ -374,6 +390,7 @@ def test_execution_tape_manifest_required_metadata():
         "exchange": "binance-futures",
         "symbol": "BTCUSDT",
         "symbol_spec": spec,
+        "symbol_rules": _rules(),
         "source_data_types": (TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES),
         "array_names": ("events",),
         "num_events": 2,
