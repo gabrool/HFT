@@ -13,6 +13,7 @@ from dataclasses import asdict
 from mmrt.analysis.preprocess_audit import (
     DEFAULT_PREPROCESS_AUDIT_MAX_SAMPLE_ROWS,
     PreprocessAuditConfig,
+    _json_safe,
     run_preprocess_audit,
     write_preprocess_audit_artifacts,
 )
@@ -106,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         "warnings": list(result.warnings),
         "splits": {key: asdict(value) for key, value in result.splits.items()},
     }
-    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan = True))
+    print(json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":"), allow_nan=False))
     return 0
 
 

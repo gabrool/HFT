@@ -7,12 +7,25 @@ models, inspect raw events, repair ordering, or mutate the dataset manifest.
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Sequence
 
 from mmrt.contracts import SplitRole
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return value
 
 
 def _positive_int(text: str) -> int:
@@ -233,7 +246,7 @@ def _write_json_atomic(report: dict[str, object], path: str) -> str:
     if target.suffix != ".json":
         raise ValueError("output path must end with .json")
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(report, sort_keys=True, indent=2, allow_nan = True) + "\n"
+    payload = json.dumps(_json_safe(report), sort_keys=True, indent=2, allow_nan=False) + "\n"
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(payload, encoding="utf-8")
     tmp.replace(target)
@@ -241,7 +254,7 @@ def _write_json_atomic(report: dict[str, object], path: str) -> str:
 
 
 def _print_json(payload: dict[str, object]) -> None:
-    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan = True))
+    print(json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":"), allow_nan=False))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

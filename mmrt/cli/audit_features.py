@@ -21,6 +21,7 @@ from mmrt.analysis.feature_audit import (
     DEFAULT_MAX_CORR_PAIRS,
     DEFAULT_MIN_CORR_OUTPUT_THRESHOLD,
     FeatureAuditConfig,
+    _json_safe,
     run_feature_audit,
     write_feature_audit_artifacts,
 )
@@ -159,15 +160,15 @@ def main(argv: list[str] | None = None) -> int:
     paths = write_feature_audit_artifacts(result, args.output_dir)
     print(
         json.dumps(
-            {
+            _json_safe({
                 "status": "ok",
                 **paths,
                 "warnings": list(result.warnings),
                 "splits": {k: asdict(v) for k, v in result.splits.items()},
-            },
+            }),
             sort_keys=True,
             separators=(",", ":"),
-            allow_nan = True,
+            allow_nan=False,
         )
     )
     return 0

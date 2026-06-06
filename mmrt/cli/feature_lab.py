@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     paths = feature_lab.write_feature_lab_artifacts(result, args.output_dir)
     print(
         json.dumps(
-            {
+            feature_lab._json_safe({
                 "status": "ok",
                 "dataset_root": args.dataset_root,
                 "train_result_json": args.train_result_json,
@@ -76,10 +76,10 @@ def main(argv: list[str] | None = None) -> int:
                 "n_candidates": result.n_candidates,
                 "train_sample_rows": result.train_sample_rows,
                 "val_sample_rows": result.val_sample_rows,
-            },
+            }),
             sort_keys=True,
             separators=(",", ":"),
-            allow_nan = True,
+            allow_nan=False,
         )
     )
     return 0

@@ -77,12 +77,12 @@ def _require_non_empty_str(value: str, name: str) -> str:
     return value.strip()
 
 
-def _require_finite_float(value: float, name: str, *, allow_nan: bool = False) -> float:
+def _require_finite_float(value: float, name: str, *, allow_nonfinite: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float, np.floating, np.integer)):
         raise ValueError(f"{name} must be a float")
     float_value = float(value)
     if math.isnan(float_value):
-        if allow_nan:
+        if allow_nonfinite:
             return float_value
         raise ValueError(f"{name} must be finite")
     if not math.isfinite(float_value):
@@ -103,8 +103,10 @@ def _json_safe(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, (str, int, float, bool)) or value is None:
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
         return value
     raise ValueError(f"unsupported JSON type: {type(value)!r}")
 
@@ -248,8 +250,8 @@ class PreprocessFeatureRecord:
             "z_post_mean", "z_post_std", "clip_pos_rate", "clip_neg_rate", "clip_total_rate", "near_clip_rate", "drift_mean_z", "drift_std_ratio",
         )
         for name in float_fields:
-            allow_nan = self.n_sample_rows == 0 and name in quantile_fields
-            value = _require_finite_float(getattr(self, name), name, allow_nan=allow_nan)
+            allow_nonfinite = self.n_sample_rows == 0 and name in quantile_fields
+            value = _require_finite_float(getattr(self, name), name, allow_nonfinite=allow_nonfinite)
             if not math.isnan(value) and value < 0.0 and name in {
                 "train_variance", "train_scale", "raw_std", "z_pre_std", "z_post_std", "clip_pos_rate", "clip_neg_rate", "clip_total_rate", "near_clip_rate",
             }:
@@ -325,7 +327,7 @@ class PreprocessSplitSummary:
             "min_drift_std_ratio",
             "max_drift_std_ratio",
         ):
-            value = _require_finite_float(getattr(self, name), name, allow_nan = True)
+            value = _require_finite_float(getattr(self, name), name, allow_nonfinite=True)
             if value < 0.0:
                 raise ValueError(f"{name} must be >= 0")
 
@@ -714,7 +716,7 @@ def write_preprocess_audit_artifacts(
     summary_path = out / summary_filename
     summary_tmp = summary_path.with_suffix(summary_path.suffix + ".tmp")
     summary_tmp.write_text(
-        json.dumps(result.as_dict(), sort_keys=True, indent=2, allow_nan = True) + "\n",
+        json.dumps(_json_safe(result.as_dict()), sort_keys=True, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     summary_tmp.replace(summary_path)
