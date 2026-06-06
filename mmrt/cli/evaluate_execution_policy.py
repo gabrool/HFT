@@ -748,6 +748,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l2-decrease-weight", type=float, default=0.25)
     parser.add_argument("--trade-at-level-weight", type=float, default=0.5)
     parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=1000000000.0)
+    parser.add_argument(
+        "--no-dedupe-l2-decrease-with-trade-prints",
+        action="store_true",
+        help="Disable de-duplication of L2 visible decreases already explained by same-level trade prints.",
+    )
     parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
     parser.add_argument("--decision-compute-latency-us", type=int, default=50)
     parser.add_argument("--order-entry-latency-us", type=int, default=500)
@@ -788,6 +793,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         l2_decrease_weight=args.l2_decrease_weight,
         trade_at_level_weight=args.trade_at_level_weight,
         unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
+        dedupe_l2_decrease_with_trade_prints=not args.no_dedupe_l2_decrease_with_trade_prints,
         maker_fee_bps=args.maker_fee_bps,
         decision_compute_latency_us=args.decision_compute_latency_us,
         order_entry_latency_us=args.order_entry_latency_us,

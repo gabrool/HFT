@@ -671,6 +671,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l2-decrease-weight", type=float, default=1.0)
     parser.add_argument("--trade-at-level-weight", type=float, default=1.0)
     parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=0.0)
+    parser.add_argument(
+        "--no-dedupe-l2-decrease-with-trade-prints",
+        action="store_true",
+        help="Disable de-duplication of L2 visible decreases already explained by same-level trade prints.",
+    )
     parser.add_argument("--train-fraction", type=float, default=0.7)
     parser.add_argument("--ridge-l2", type=float, default=0.001)
     parser.add_argument("--min-train-samples", type=int, default=10)
@@ -708,6 +713,7 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         l2_decrease_weight=args.l2_decrease_weight,
         trade_at_level_weight=args.trade_at_level_weight,
         unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
+        dedupe_l2_decrease_with_trade_prints=not args.no_dedupe_l2_decrease_with_trade_prints,
         train_fraction=args.train_fraction,
         ridge_l2=args.ridge_l2,
         min_train_samples=args.min_train_samples,

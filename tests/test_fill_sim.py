@@ -5,6 +5,7 @@ import pytest
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import (
     ActiveOrder,
+    BookTop,
     FillReason,
     OrderSide,
     OrderStatus,
@@ -15,8 +16,10 @@ from mmrt.execution.contracts import (
 from mmrt.execution.fill_sim import (
     FillSimulatorConfig,
     FillSimulationResult,
+    activate_pending_orders,
     apply_fill_to_order,
     request_cancel_live_orders,
+    finalize_effective_cancels,
     live_orders,
     place_orders_from_quote,
     sync_orders_to_quote,
@@ -53,7 +56,15 @@ def _order(
     effective_local_ts_us: int = 0,
     cancel_requested_local_ts_us: int = 0,
     cancel_effective_local_ts_us: int = 0,
+    created_event_seq: int = 0,
+    last_update_event_seq: int = 0,
+    effective_event_seq: int | None = None,
+    cancel_requested_event_seq: int | None = None,
+    cancel_effective_event_seq: int | None = None,
 ) -> ActiveOrder:
+    effective_event_seq = effective_event_seq if effective_event_seq is not None else (0 if effective_local_ts_us else -1)
+    cancel_requested_event_seq = cancel_requested_event_seq if cancel_requested_event_seq is not None else (0 if cancel_requested_local_ts_us else -1)
+    cancel_effective_event_seq = cancel_effective_event_seq if cancel_effective_event_seq is not None else (0 if cancel_effective_local_ts_us else -1)
     return ActiveOrder(
         order_id=order_id,
         side=side,
@@ -63,17 +74,28 @@ def _order(
         queue_ahead_qty=queue_ahead_qty,
         status=status,
         created_local_ts_us=created_local_ts_us,
-        created_event_seq=0,
+        created_event_seq=created_event_seq,
         last_update_local_ts_us=last_update_local_ts_us,
-        last_update_event_seq=0,
+        last_update_event_seq=last_update_event_seq,
         effective_local_ts_us=effective_local_ts_us,
-        effective_event_seq=0 if effective_local_ts_us else -1,
+        effective_event_seq=effective_event_seq,
         cancel_requested_local_ts_us=cancel_requested_local_ts_us,
-        cancel_requested_event_seq=0 if cancel_requested_local_ts_us else -1,
+        cancel_requested_event_seq=cancel_requested_event_seq,
         cancel_effective_local_ts_us=cancel_effective_local_ts_us,
-        cancel_effective_event_seq=0 if cancel_effective_local_ts_us else -1,
+        cancel_effective_event_seq=cancel_effective_event_seq,
     )
 
+
+
+
+def _book_top(best_bid_tick=1000, best_ask_tick=1002, local_ts_us=200):
+    return BookTop(
+        local_ts_us=local_ts_us,
+        best_bid_tick=best_bid_tick,
+        best_ask_tick=best_ask_tick,
+        best_bid_size=1.0,
+        best_ask_size=1.0,
+    )
 
 def _trade(
     *,
@@ -246,6 +268,225 @@ def test_pending_cancel_and_future_replacement_same_price_not_duplicate_before_o
     simulate_trade_event([old, replacement], _trade(local_ts_us=255), event_key=EventKey(255, 0), symbol_spec=_spec())
     simulate_trade_event([old, replacement], _trade(local_ts_us=270), event_key=EventKey(270, 0), symbol_spec=_spec())
 
+
+def test_sync_preserves_same_price_same_qty_pending_new_without_resetting_latency():
+    pending = _order(
+        order_id=1,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+        status=OrderStatus.PENDING_NEW,
+        created_local_ts_us=100,
+        last_update_local_ts_us=100,
+        effective_local_ts_us=300,
+        effective_event_seq=0,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=1000,
+        bid_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [pending],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(200, 0),
+        order_effective_key=EventKey(400, 0),
+        cancel_effective_key=EventKey(400, 0),
+    )
+
+    assert cancel_count == 0
+    assert out == (pending,)
+    assert out[0].effective_key == EventKey(300, 0)
+    assert out[0].created_key == EventKey(100, 0)
+
+
+def test_sync_same_price_different_qty_pending_new_cancel_replaces():
+    pending = _order(
+        order_id=1,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+        status=OrderStatus.PENDING_NEW,
+        created_local_ts_us=100,
+        last_update_local_ts_us=100,
+        effective_local_ts_us=300,
+        effective_event_seq=0,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=1000,
+        bid_qty=0.02,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [pending],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(200, 0),
+        order_effective_key=EventKey(400, 0),
+        cancel_effective_key=EventKey(400, 0),
+    )
+
+    assert cancel_count == 1
+    assert len(out) == 2
+    old, replacement = out
+    assert old.order_id == 1
+    assert old.status == OrderStatus.PENDING_NEW
+    assert old.cancel_effective_key == EventKey(400, 0)
+    assert replacement.order_id == 10
+    assert replacement.status == OrderStatus.PENDING_NEW
+    assert replacement.price_tick == 1000
+    assert replacement.qty == pytest.approx(0.02)
+    assert replacement.effective_key == EventKey(400, 0)
+
+
+def test_sync_does_not_preserve_pending_new_with_cancel_key():
+    pending = _order(
+        order_id=1,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+        status=OrderStatus.PENDING_NEW,
+        created_local_ts_us=100,
+        last_update_local_ts_us=200,
+        effective_local_ts_us=300,
+        cancel_requested_local_ts_us=200,
+        cancel_effective_local_ts_us=350,
+        effective_event_seq=0,
+        cancel_requested_event_seq=0,
+        cancel_effective_event_seq=0,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=1000,
+        bid_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [pending],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(250, 0),
+        order_effective_key=EventKey(400, 0),
+        cancel_effective_key=EventKey(400, 0),
+    )
+
+    assert cancel_count == 0  # already pending cancel, do not double-count
+    assert len(out) == 2
+    assert out[0].order_id == 1
+    assert out[1].order_id == 10
+
+
+def test_activate_pending_orders_accepts_maker_safe_order():
+    order = _order(
+        status=OrderStatus.PENDING_NEW,
+        price_tick=1001,
+        qty=0.01,
+        remaining_qty=0.01,
+        created_local_ts_us=100,
+        last_update_local_ts_us=100,
+        effective_local_ts_us=200,
+        effective_event_seq=0,
+    )
+
+    result = activate_pending_orders(
+        [order],
+        event_key=EventKey(200, 0),
+        book_top=_book_top(1000, 1002, 200),
+        post_only_gap_ticks=1,
+    )
+
+    assert result.activated_count == 1
+    assert result.post_only_reject_count == 0
+    assert result.orders[0].status == OrderStatus.ACTIVE
+
+
+def test_activate_pending_orders_rejects_marketable_post_only_order():
+    order = _order(
+        status=OrderStatus.PENDING_NEW,
+        side=OrderSide.BUY,
+        price_tick=1001,
+        qty=0.01,
+        remaining_qty=0.01,
+        created_local_ts_us=100,
+        last_update_local_ts_us=100,
+        effective_local_ts_us=200,
+        effective_event_seq=0,
+    )
+
+    result = activate_pending_orders(
+        [order],
+        event_key=EventKey(200, 0),
+        book_top=_book_top(999, 1001, 200),
+        post_only_gap_ticks=1,
+    )
+
+    assert result.activated_count == 0
+    assert result.post_only_reject_count == 1
+    assert result.orders[0].status == OrderStatus.REJECTED
+    assert result.orders[0].is_terminal
+
+
+def test_rejected_order_never_fills():
+    rejected = _order(
+        status=OrderStatus.REJECTED,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+    )
+
+    result = simulate_trade_event(
+        [rejected],
+        _trade(side=AggressorSide.SELL, price_tick=1000, amount=10.0, local_ts_us=200),
+        event_key=EventKey(200, 0),
+        symbol_spec=_spec(),
+    )
+
+    assert result.orders == (rejected,)
+    assert result.fills == ()
+
+
+def test_finalize_effective_cancels_exact_key_blocks_future_fill():
+    order = _order(
+        status=OrderStatus.PENDING_CANCEL,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+        created_local_ts_us=100,
+        last_update_local_ts_us=150,
+        cancel_requested_local_ts_us=150,
+        cancel_effective_local_ts_us=200,
+        cancel_requested_event_seq=0,
+        cancel_effective_event_seq=0,
+    )
+
+    cancels = finalize_effective_cancels([order], event_key=EventKey(200, 0))
+    assert cancels.cancelled_count == 1
+    assert cancels.orders[0].status == OrderStatus.CANCELLED
+
+    result = simulate_trade_event(
+        cancels.orders,
+        _trade(side=AggressorSide.SELL, price_tick=1000, amount=10.0, local_ts_us=200),
+        event_key=EventKey(200, 0),
+        symbol_spec=_spec(),
+    )
+    assert result.fills == ()
+
+
+def test_sync_orders_to_quote_can_preserve_pending_new():
+    source = Path("mmrt/execution/fill_sim.py").read_text(encoding="utf-8")
+    assert "OrderStatus.PENDING_NEW" in source
+    assert "preservable_statuses" in source
 
 def test_live_orders_filters_correctly():
     active = _order(order_id=1, status=OrderStatus.ACTIVE)

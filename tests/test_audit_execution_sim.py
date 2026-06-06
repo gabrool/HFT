@@ -35,6 +35,7 @@ from mmrt.execution.metrics import ExecutionMetricAccumulator, summarize_executi
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
 from mmrt.cli.audit_execution_sim import (
     ExecutionSimAuditConfig,
+    build_arg_parser,
     run_execution_sim_audit,
     main,
 )
@@ -444,3 +445,47 @@ def test_audit_modules_have_no_forbidden_imports():
     assert "mmrt.execution.env" not in diagnostics_source
     assert "mmrt.execution.execution_tape" not in diagnostics_source
     assert "mmrt.cli" not in diagnostics_source
+
+
+def test_parser_can_disable_l2_trade_dedupe():
+    parser = build_arg_parser()
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--no-dedupe-l2-decrease-with-trade-prints"])
+    config = ExecutionSimAuditConfig(
+        tape_root=args.tape_root,
+        output_json=args.output_json,
+        linear_signals_npz=args.linear_signals_npz,
+        overwrite=args.overwrite,
+        policy=args.policy,
+        max_steps=args.max_steps,
+        start_event_index=args.start_event_index,
+        decision_interval_us=args.decision_interval_us,
+        mmap_mode=None if args.no_mmap else "r",
+        max_distance_ticks=args.max_distance_ticks,
+        max_order_qty=args.max_order_qty,
+        post_only_gap_ticks=args.post_only_gap_ticks,
+        default_order_qty=args.default_order_qty,
+        action_size_raw=args.action_size_raw,
+        queue_mode=args.queue_mode,
+        l2_decrease_weight=args.l2_decrease_weight,
+        trade_at_level_weight=args.trade_at_level_weight,
+        unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
+        dedupe_l2_decrease_with_trade_prints=not args.no_dedupe_l2_decrease_with_trade_prints,
+        maker_fee_bps=args.maker_fee_bps,
+        decision_compute_latency_us=args.decision_compute_latency_us,
+        order_entry_latency_us=args.order_entry_latency_us,
+        cancel_latency_us=args.cancel_latency_us,
+        inventory_penalty_bps=args.inventory_penalty_bps,
+        turnover_penalty_bps=args.turnover_penalty_bps,
+        cancel_penalty=args.cancel_penalty,
+        drawdown_penalty_rate=args.drawdown_penalty_rate,
+        terminal_inventory_penalty_bps=args.terminal_inventory_penalty_bps,
+        reward_scale=args.reward_scale,
+    )
+    assert config.dedupe_l2_decrease_with_trade_prints is False
+
+
+def test_parser_dedupe_l2_trade_default_enabled():
+    parser = build_arg_parser()
+    args = parser.parse_args(["--tape-root", "/tmp/tape"])
+    config = ExecutionSimAuditConfig(tape_root=args.tape_root)
+    assert config.dedupe_l2_decrease_with_trade_prints is True

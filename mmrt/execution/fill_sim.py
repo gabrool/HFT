@@ -338,8 +338,13 @@ def sync_orders_to_quote(
             updated.append(order)
             continue
         enabled, desired_price, desired_qty = target[order.side]
+        preservable_statuses = (
+            OrderStatus.PENDING_NEW,
+            OrderStatus.ACTIVE,
+            OrderStatus.PARTIALLY_FILLED,
+        )
         preserve = (
-            order.status in (OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED)
+            order.status in preservable_statuses
             and enabled
             and order.price_tick == desired_price
             and abs(order.remaining_qty - desired_qty) <= qty_epsilon
