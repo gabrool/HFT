@@ -168,7 +168,7 @@ def _linear_signals(tape, n_rows: int = 16, *, start_event_index: int = 0) -> Li
         decision_event_index.append(decision_event_index[-1] + 1)
         decision_local_ts_us.append(decision_local_ts_us[-1] + 100)
     metadata = LinearSignalArtifactMetadata(
-        tape_schema_version=tape.manifest.schema_version,
+        tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
         symbol=tape.manifest.symbol,
         num_events=tape.manifest.num_events,

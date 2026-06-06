@@ -23,7 +23,7 @@ from mmrt.linear import extractors as ex
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
 
-FEATURE_AUDIT_SCHEMA_VERSION = 1
+FEATURE_AUDIT_REPORT_TYPE = "feature_audit"
 DEFAULT_FEATURE_AUDIT_MAX_SAMPLE_ROWS = 100_000
 DEFAULT_FEATURE_AUDIT_BATCH_SIZE = rd.DEFAULT_BATCH_SIZE
 DEFAULT_FEATURE_AUDIT_SUMMARY_FILENAME = "feature_audit_summary.json"
@@ -590,7 +590,7 @@ class FeatureAuditSplitSummary:
 
 @dataclass(frozen=True, slots=True)
 class FeatureAuditResult:
-    schema_version: int
+    report_type: str
     dataset_root: str
     dataset_id: str
     manifest_hash: str
@@ -606,8 +606,8 @@ class FeatureAuditResult:
     warnings: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != FEATURE_AUDIT_SCHEMA_VERSION:
-            raise ValueError("schema_version mismatch")
+        if self.report_type != FEATURE_AUDIT_REPORT_TYPE:
+            raise ValueError("schema mismatch")
         _require_non_empty_str(self.dataset_root, "dataset_root")
         _require_non_empty_str(self.dataset_id, "dataset_id")
         _require_non_empty_str(self.manifest_hash, "manifest_hash")
@@ -664,7 +664,7 @@ class FeatureAuditResult:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": self.schema_version,
+            "report_type": self.report_type,
             "dataset_root": self.dataset_root,
             "dataset_id": self.dataset_id,
             "manifest_hash": self.manifest_hash,
@@ -1046,7 +1046,7 @@ def run_feature_audit(dataset_root: str, *, config: FeatureAuditConfig | None = 
     }
 
     return FeatureAuditResult(
-        schema_version=FEATURE_AUDIT_SCHEMA_VERSION,
+        report_type=FEATURE_AUDIT_REPORT_TYPE,
         dataset_root=dataset_root,
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest.content_hash(),

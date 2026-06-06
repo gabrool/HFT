@@ -479,7 +479,7 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
             "same_local_ts_tie_count": plan.counters.same_local_ts_tie_count,
         },
         "tape": {
-            "schema_version": tape.manifest.schema_version,
+            "schema": tape.manifest.schema,
             "tape_format": tape.manifest.tape_format.value,
             "array_names": list(tape.manifest.array_names),
             "num_events": tape.manifest.num_events,

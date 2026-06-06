@@ -12,7 +12,7 @@ from mmrt.contracts import (
     TardisDataType,
     TimeUnit,
 )
-from mmrt.features.specs import FEATURE_SCHEMA_VERSION as DEFAULT_FEATURE_SCHEMA_VERSION
+from mmrt.features.specs import FEATURE_SCHEMA as DEFAULT_FEATURE_SCHEMA
 
 US_PER_MS = 1_000
 US_PER_SECOND = 1_000_000
@@ -43,8 +43,8 @@ DEFAULT_DECISION_REASON = DecisionReason.BOOK_EVENT
 DEFAULT_DECISION_POLICY = "book_event"
 DEFAULT_DECISION_STRIDE_US = 500_000
 
-DEFAULT_PIPELINE_SCHEMA_VERSION = "mmrt_pipeline_config_v1"
-DEFAULT_STORAGE_FORMAT = StorageFormat.FLAT_DECISION_ROWS_US_V1
+DEFAULT_PIPELINE_SCHEMA = "mmrt_pipeline_config"
+DEFAULT_STORAGE_FORMAT = StorageFormat.FLAT_DECISION_ROWS_US
 DEFAULT_TIME_UNIT = TimeUnit.MICROSECOND
 
 DEFAULT_STRICT_VALIDATION = True
@@ -143,16 +143,16 @@ class DecisionConfig:
 
     def __post_init__(self) -> None:
         if _require_nonempty_str(self.policy, "policy") != DEFAULT_DECISION_POLICY:
-            raise ValueError("policy must be 'book_event' for v1")
+            raise ValueError("policy must be 'book_event'")
         try:
             reason = DecisionReason(self.reason)
         except ValueError as exc:
-            raise ValueError("reason must be DecisionReason.BOOK_EVENT for v1") from exc
+            raise ValueError("reason must be DecisionReason.BOOK_EVENT") from exc
         if reason != DecisionReason.BOOK_EVENT:
-            raise ValueError("reason must be DecisionReason.BOOK_EVENT for v1")
+            raise ValueError("reason must be DecisionReason.BOOK_EVENT")
         stride_us = _require_positive_int(self.stride_us, "stride_us")
         if stride_us != DEFAULT_DECISION_STRIDE_US:
-            raise ValueError("stride_us must be 500_000 for v1")
+            raise ValueError("stride_us must be 500_000")
         object.__setattr__(self, "reason", reason)
         object.__setattr__(self, "stride_us", stride_us)
 
@@ -174,13 +174,13 @@ class LabelConfig:
         except ValueError as exc:
             raise ValueError("price_reference has invalid value") from exc
         if price_reference != PriceReference.MID:
-            raise ValueError("price_reference must be PriceReference.MID for v1")
+            raise ValueError("price_reference must be PriceReference.MID")
         try:
             asof_policy = AsOfPolicy(self.asof_policy)
         except ValueError as exc:
             raise ValueError("asof_policy has invalid value") from exc
         if asof_policy != AsOfPolicy.LAST_OBSERVATION:
-            raise ValueError("asof_policy must be AsOfPolicy.LAST_OBSERVATION for v1")
+            raise ValueError("asof_policy must be AsOfPolicy.LAST_OBSERVATION")
         object.__setattr__(self, "horizons_us", horizons)
         object.__setattr__(self, "entry_delay_us", entry_delay)
         object.__setattr__(self, "price_reference", price_reference)
@@ -209,35 +209,35 @@ class FeatureRuntimeConfig:
     def __post_init__(self) -> None:
         _require_positive_int(self.lookback_rows, "lookback_rows")
         if self.feature_dtype != "float32":
-            raise ValueError("feature_dtype must be 'float32' for v1")
+            raise ValueError("feature_dtype must be 'float32'")
         if self.label_dtype != "float32":
-            raise ValueError("label_dtype must be 'float32' for v1")
+            raise ValueError("label_dtype must be 'float32'")
         if self.timestamp_dtype != "int64":
-            raise ValueError("timestamp_dtype must be 'int64' for v1")
+            raise ValueError("timestamp_dtype must be 'int64'")
 
 
 @dataclass(frozen=True, slots=True)
 class StorageConfig:
     storage_format: StorageFormat = DEFAULT_STORAGE_FORMAT
     time_unit: TimeUnit = DEFAULT_TIME_UNIT
-    pipeline_schema_version: str = DEFAULT_PIPELINE_SCHEMA_VERSION
-    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION
+    pipeline_schema: str = DEFAULT_PIPELINE_SCHEMA
+    feature_schema: str = DEFAULT_FEATURE_SCHEMA
 
     def __post_init__(self) -> None:
         try:
             storage_format = StorageFormat(self.storage_format)
         except ValueError as exc:
             raise ValueError("storage_format has invalid value") from exc
-        if storage_format != StorageFormat.FLAT_DECISION_ROWS_US_V1:
-            raise ValueError("storage_format must be StorageFormat.FLAT_DECISION_ROWS_US_V1 for v1")
+        if storage_format != StorageFormat.FLAT_DECISION_ROWS_US:
+            raise ValueError("storage_format must be StorageFormat.FLAT_DECISION_ROWS_US")
         try:
             time_unit = TimeUnit(self.time_unit)
         except ValueError as exc:
             raise ValueError("time_unit has invalid value") from exc
         if time_unit != TimeUnit.MICROSECOND:
-            raise ValueError("time_unit must be TimeUnit.MICROSECOND for v1")
-        _require_nonempty_str(self.pipeline_schema_version, "pipeline_schema_version")
-        _require_nonempty_str(self.feature_schema_version, "feature_schema_version")
+            raise ValueError("time_unit must be TimeUnit.MICROSECOND")
+        _require_nonempty_str(self.pipeline_schema, "pipeline_schema")
+        _require_nonempty_str(self.feature_schema, "feature_schema")
         object.__setattr__(self, "storage_format", storage_format)
         object.__setattr__(self, "time_unit", time_unit)
 
@@ -268,10 +268,10 @@ class PipelineConfig:
         source = set(self.data.source_data_types)
         required = {TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES}
         if not required.issubset(source):
-            raise ValueError("source_data_types must include BOOK_SNAPSHOT_25 and TRADES for v1")
+            raise ValueError("source_data_types must include BOOK_SNAPSHOT_25 and TRADES")
         forbidden = {TardisDataType.BOOK_SNAPSHOT_5, TardisDataType.QUOTES, TardisDataType.OPTIONS_CHAIN}
         if source.intersection(forbidden):
-            raise ValueError("source_data_types includes unsupported types for v1")
+            raise ValueError("source_data_types includes unsupported types")
 
     @property
     def label_spec(self) -> LabelSpec:
@@ -302,8 +302,8 @@ __all__ = [
     "DEFAULT_LOOKBACK_ROWS",
     "DEFAULT_DECISION_POLICY",
     "DEFAULT_DECISION_STRIDE_US",
-    "DEFAULT_PIPELINE_SCHEMA_VERSION",
-    "DEFAULT_FEATURE_SCHEMA_VERSION",
+    "DEFAULT_PIPELINE_SCHEMA",
+    "DEFAULT_FEATURE_SCHEMA",
     "DEFAULT_FEATURE_DTYPE",
     "DEFAULT_LABEL_DTYPE",
     "DEFAULT_TIMESTAMP_DTYPE",

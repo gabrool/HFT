@@ -18,15 +18,15 @@ BOOK_SIDE_UNKNOWN = 0
 BOOK_SIDE_BID = 1
 BOOK_SIDE_ASK = -1
 
-BINANCE_FUTURES_V1_SYMBOL = "BTCUSDT"
-BINANCE_FUTURES_V1_SYMBOLS = ("BTCUSDT",)
+BINANCE_FUTURES_SYMBOL = "BTCUSDT"
+BINANCE_FUTURES_SYMBOLS = ("BTCUSDT",)
 
-BINANCE_FUTURES_V1_SOURCE_DATA_TYPES = (
+BINANCE_FUTURES_SOURCE_DATA_TYPES = (
     TardisDataType.BOOK_SNAPSHOT_25,
     TardisDataType.TRADES,
 )
 
-BINANCE_FUTURES_V1_CONTEXT_DATA_TYPES = (
+BINANCE_FUTURES_CONTEXT_DATA_TYPES = (
     TardisDataType.BOOK_TICKER,
     TardisDataType.DERIVATIVE_TICKER,
     TardisDataType.LIQUIDATIONS,
@@ -34,14 +34,14 @@ BINANCE_FUTURES_V1_CONTEXT_DATA_TYPES = (
     TardisDataType.BOOK_SNAPSHOT_5,
 )
 
-BINANCE_FUTURES_V1_UNSUPPORTED_DATA_TYPES = (
+BINANCE_FUTURES_UNSUPPORTED_DATA_TYPES = (
     TardisDataType.QUOTES,
     TardisDataType.OPTIONS_CHAIN,
 )
 
-BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES = (
-    *BINANCE_FUTURES_V1_SOURCE_DATA_TYPES,
-    *BINANCE_FUTURES_V1_CONTEXT_DATA_TYPES,
+BINANCE_FUTURES_ACCEPTED_DATA_TYPES = (
+    *BINANCE_FUTURES_SOURCE_DATA_TYPES,
+    *BINANCE_FUTURES_CONTEXT_DATA_TYPES,
 )
 
 BINANCE_FUTURES_DEFAULT_MERGE_RANKS = {
@@ -61,7 +61,7 @@ def _validate_unique_merge_ranks() -> None:
         raise ValueError("BINANCE_FUTURES_DEFAULT_MERGE_RANKS values must be unique")
     missing = tuple(
         dtype
-        for dtype in BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES
+        for dtype in BINANCE_FUTURES_ACCEPTED_DATA_TYPES
         if dtype not in BINANCE_FUTURES_DEFAULT_MERGE_RANKS
     )
     if missing:
@@ -119,7 +119,7 @@ def _tuple_of_data_types(values: Sequence[TardisDataType | str], name: str) -> t
 @dataclass(frozen=True, slots=True)
 class BinanceFuturesMarket:
     exchange: str = BINANCE_FUTURES_EXCHANGE
-    symbol: str = BINANCE_FUTURES_V1_SYMBOL
+    symbol: str = BINANCE_FUTURES_SYMBOL
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "exchange", normalize_binance_futures_exchange(self.exchange))
@@ -135,7 +135,7 @@ def normalize_binance_futures_exchange(exchange: str) -> str:
 
 def normalize_binance_futures_symbol(symbol: str) -> str:
     normalized = _require_nonempty_str(symbol, "symbol").upper()
-    if normalized not in BINANCE_FUTURES_V1_SYMBOLS:
+    if normalized not in BINANCE_FUTURES_SYMBOLS:
         raise ValueError(f"unsupported symbol: {symbol!r}")
     return normalized
 
@@ -147,46 +147,46 @@ def validate_binance_futures_market(exchange: str, symbol: str) -> BinanceFuture
     )
 
 
-def is_binance_futures_v1_source_data_type(data_type: TardisDataType | str) -> bool:
-    return _coerce_data_type(data_type) in BINANCE_FUTURES_V1_SOURCE_DATA_TYPES
+def is_binance_futures_source_data_type(data_type: TardisDataType | str) -> bool:
+    return _coerce_data_type(data_type) in BINANCE_FUTURES_SOURCE_DATA_TYPES
 
 
-def is_binance_futures_v1_context_data_type(data_type: TardisDataType | str) -> bool:
-    return _coerce_data_type(data_type) in BINANCE_FUTURES_V1_CONTEXT_DATA_TYPES
+def is_binance_futures_context_data_type(data_type: TardisDataType | str) -> bool:
+    return _coerce_data_type(data_type) in BINANCE_FUTURES_CONTEXT_DATA_TYPES
 
 
-def is_binance_futures_v1_accepted_data_type(data_type: TardisDataType | str) -> bool:
-    return _coerce_data_type(data_type) in BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES
+def is_binance_futures_accepted_data_type(data_type: TardisDataType | str) -> bool:
+    return _coerce_data_type(data_type) in BINANCE_FUTURES_ACCEPTED_DATA_TYPES
 
 
-def require_binance_futures_v1_data_type(data_type: TardisDataType | str) -> TardisDataType:
+def require_binance_futures_data_type(data_type: TardisDataType | str) -> TardisDataType:
     dtype = _coerce_data_type(data_type)
-    if dtype not in BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES:
-        raise ValueError(f"unsupported Binance futures v1 data_type: {dtype.value}")
+    if dtype not in BINANCE_FUTURES_ACCEPTED_DATA_TYPES:
+        raise ValueError(f"unsupported Binance futures data_type: {dtype.value}")
     return dtype
 
 
-def normalize_binance_futures_v1_data_types(
+def normalize_binance_futures_data_types(
     data_types: Sequence[TardisDataType | str],
 ) -> tuple[TardisDataType, ...]:
     dtypes = _tuple_of_data_types(data_types, "data_types")
-    return tuple(require_binance_futures_v1_data_type(dtype) for dtype in dtypes)
+    return tuple(require_binance_futures_data_type(dtype) for dtype in dtypes)
 
 
-def default_binance_futures_v1_source_data_types() -> tuple[TardisDataType, ...]:
-    return BINANCE_FUTURES_V1_SOURCE_DATA_TYPES
+def default_binance_futures_source_data_types() -> tuple[TardisDataType, ...]:
+    return BINANCE_FUTURES_SOURCE_DATA_TYPES
 
 
-def default_binance_futures_v1_context_data_types() -> tuple[TardisDataType, ...]:
-    return BINANCE_FUTURES_V1_CONTEXT_DATA_TYPES
+def default_binance_futures_context_data_types() -> tuple[TardisDataType, ...]:
+    return BINANCE_FUTURES_CONTEXT_DATA_TYPES
 
 
-def default_binance_futures_v1_accepted_data_types() -> tuple[TardisDataType, ...]:
-    return BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES
+def default_binance_futures_accepted_data_types() -> tuple[TardisDataType, ...]:
+    return BINANCE_FUTURES_ACCEPTED_DATA_TYPES
 
 
 def binance_futures_default_merge_rank(data_type: TardisDataType | str) -> int:
-    dtype = require_binance_futures_v1_data_type(data_type)
+    dtype = require_binance_futures_data_type(data_type)
     if dtype not in BINANCE_FUTURES_DEFAULT_MERGE_RANKS:
         raise ValueError(f"no default merge rank for data_type: {dtype.value}")
     return BINANCE_FUTURES_DEFAULT_MERGE_RANKS[dtype]
@@ -231,7 +231,7 @@ def normalized_parquet_basename(
 ) -> str:
     normalized_exchange = normalize_binance_futures_exchange(exchange)
     normalized_symbol = normalize_binance_futures_symbol(symbol)
-    dtype = require_binance_futures_v1_data_type(data_type)
+    dtype = require_binance_futures_data_type(data_type)
     normalized_date = _validate_iso_date(date)
     return f"{normalized_exchange}_{normalized_symbol}_{dtype.value}_{normalized_date}.parquet"
 
@@ -249,12 +249,12 @@ def merged_parquet_basename(
 
 __all__ = [
     "BINANCE_FUTURES_EXCHANGE",
-    "BINANCE_FUTURES_V1_SYMBOL",
-    "BINANCE_FUTURES_V1_SYMBOLS",
-    "BINANCE_FUTURES_V1_SOURCE_DATA_TYPES",
-    "BINANCE_FUTURES_V1_CONTEXT_DATA_TYPES",
-    "BINANCE_FUTURES_V1_UNSUPPORTED_DATA_TYPES",
-    "BINANCE_FUTURES_V1_ACCEPTED_DATA_TYPES",
+    "BINANCE_FUTURES_SYMBOL",
+    "BINANCE_FUTURES_SYMBOLS",
+    "BINANCE_FUTURES_SOURCE_DATA_TYPES",
+    "BINANCE_FUTURES_CONTEXT_DATA_TYPES",
+    "BINANCE_FUTURES_UNSUPPORTED_DATA_TYPES",
+    "BINANCE_FUTURES_ACCEPTED_DATA_TYPES",
     "BINANCE_FUTURES_DEFAULT_MERGE_RANKS",
     "SIDE_UNKNOWN",
     "SIDE_BUY",
@@ -268,14 +268,14 @@ __all__ = [
     "normalize_binance_futures_exchange",
     "normalize_binance_futures_symbol",
     "validate_binance_futures_market",
-    "is_binance_futures_v1_source_data_type",
-    "is_binance_futures_v1_context_data_type",
-    "is_binance_futures_v1_accepted_data_type",
-    "require_binance_futures_v1_data_type",
-    "normalize_binance_futures_v1_data_types",
-    "default_binance_futures_v1_source_data_types",
-    "default_binance_futures_v1_context_data_types",
-    "default_binance_futures_v1_accepted_data_types",
+    "is_binance_futures_source_data_type",
+    "is_binance_futures_context_data_type",
+    "is_binance_futures_accepted_data_type",
+    "require_binance_futures_data_type",
+    "normalize_binance_futures_data_types",
+    "default_binance_futures_source_data_types",
+    "default_binance_futures_context_data_types",
+    "default_binance_futures_accepted_data_types",
     "binance_futures_default_merge_rank",
     "binance_futures_trade_side_code",
     "binance_futures_book_side_code",

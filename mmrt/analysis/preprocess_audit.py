@@ -26,7 +26,7 @@ DEFAULT_PREPROCESS_AUDIT_MAX_SAMPLE_ROWS = 100_000
 DEFAULT_PREPROCESS_AUDIT_BATCH_SIZE = rd.DEFAULT_BATCH_SIZE
 DEFAULT_PREPROCESS_AUDIT_SUMMARY_FILENAME = "preprocess_audit_summary.json"
 DEFAULT_PREPROCESS_AUDIT_FEATURES_FILENAME = "preprocess_audit_features.csv"
-PREPROCESS_AUDIT_SCHEMA_VERSION = 1
+PREPROCESS_AUDIT_REPORT_TYPE = "preprocess_audit"
 
 CLIP_REVIEW_RATE = 0.001
 CLIP_EXCESSIVE_RATE = 0.01
@@ -332,7 +332,7 @@ class PreprocessSplitSummary:
 
 @dataclass(frozen=True, slots=True)
 class PreprocessAuditResult:
-    schema_version: int
+    report_type: str
     dataset_root: str
     dataset_id: str
     manifest_hash: str
@@ -343,8 +343,8 @@ class PreprocessAuditResult:
     warnings: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != PREPROCESS_AUDIT_SCHEMA_VERSION:
-            raise ValueError("schema_version mismatch")
+        if self.report_type != PREPROCESS_AUDIT_REPORT_TYPE:
+            raise ValueError("schema mismatch")
         _require_non_empty_str(self.dataset_root, "dataset_root")
         _require_non_empty_str(self.dataset_id, "dataset_id")
         _require_non_empty_str(self.manifest_hash, "manifest_hash")
@@ -385,7 +385,7 @@ class PreprocessAuditResult:
             "variance_floor": state["config"]["variance_floor"],
         }
         return {
-            "schema_version": self.schema_version,
+            "report_type": self.report_type,
             "dataset_root": self.dataset_root,
             "dataset_id": self.dataset_id,
             "manifest_hash": self.manifest_hash,
@@ -665,7 +665,7 @@ def run_preprocess_audit(
         warnings.append("inactive_features_present")
 
     return PreprocessAuditResult(
-        schema_version=PREPROCESS_AUDIT_SCHEMA_VERSION,
+        report_type=PREPROCESS_AUDIT_REPORT_TYPE,
         dataset_root=dataset_root,
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest.content_hash(),

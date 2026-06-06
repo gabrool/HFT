@@ -6,7 +6,7 @@ import pytest
 from mmrt.execution.contracts import LinearSignal
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
-    LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION,
+    LINEAR_SIGNAL_ARTIFACT_SCHEMA,
     LINEAR_SIGNALS_FILENAME,
     MAGNITUDE_DOWN_KEY,
     MAGNITUDE_INPUT_BPS,
@@ -47,7 +47,7 @@ def _artifact(n_rows: int) -> LinearSignalArtifact:
     }
     arrays = predictions_to_signal_arrays(prediction)
     metadata = LinearSignalArtifactMetadata(
-        tape_schema_version="tape_v1",
+        tape_schema="tape",
         exchange="X",
         symbol="BTC-USD",
         num_events=5,
@@ -280,7 +280,7 @@ def test_metadata_free_old_schema_rejected(tmp_path):
     path = tmp_path / "bad.npz"
     arrays = predictions_to_signal_arrays(_prediction_dict())
     payload = {name: getattr(arrays, name) for name in linear_signal_artifact_summary(_artifact(2))["fields"]}
-    payload["schema_version"] = np.array("mmrt_execution_linear_signals_v2_no_move_gated")
+    payload["schema"] = np.array("mmrt_execution_linear_signals_no_move_gated")
     np.savez(path, **payload)
     with pytest.raises(ValueError):
         load_linear_signal_artifact_npz(path)
@@ -290,7 +290,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
     artifact = _artifact(2)
     validate_linear_signal_artifact_metadata(
         artifact,
-        tape_schema_version="tape_v1",
+        tape_schema="tape",
         exchange="X",
         symbol="BTC-USD",
         num_events=5,
@@ -305,7 +305,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
     with pytest.raises(ValueError, match="linear signal metadata mismatch"):
         validate_linear_signal_artifact_metadata(
             artifact,
-            tape_schema_version="tape_v1",
+            tape_schema="tape",
             exchange="X",
             symbol="ETH-USD",
             num_events=5,
@@ -319,7 +319,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
     with pytest.raises(ValueError, match="linear signal metadata mismatch"):
         validate_linear_signal_artifact_metadata(
             artifact,
-            tape_schema_version="tape_v1",
+            tape_schema="tape",
             exchange="X",
             symbol="BTC-USD",
             num_events=5,

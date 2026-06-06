@@ -278,7 +278,7 @@ def apply_split_plan(manifest: mf.StorageManifest, plan: SplitPlan, *, replace_e
     _assert_nonoverlapping_entries(new_splits)
 
     return mf.StorageManifest(
-        manifest_schema_version=manifest.manifest_schema_version,
+        schema=manifest.schema,
         dataset_id=manifest.dataset_id,
         created_at_utc=manifest.created_at_utc,
         pipeline_config=manifest.pipeline_config,

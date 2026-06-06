@@ -14,7 +14,11 @@ from mmrt.rl.rollout import RolloutBatch, RolloutCollector, RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 
 
+PPO_CHECKPOINT_SCHEMA = "mmrt_execution_ppo_checkpoint"
+
+
 __all__ = [
+    "PPO_CHECKPOINT_SCHEMA",
     "PPOTrainingConfig",
     "PPOTrainingIterationStats",
     "PPOTrainingResult",
@@ -428,7 +432,7 @@ def make_training_checkpoint_payload(result: PPOTrainingResult) -> dict[str, obj
         raise TypeError("result must be a PPOTrainingResult")
 
     return {
-        "schema_version": "mmrt_execution_ppo_checkpoint_v2_required_linear_signals",
+        "schema": PPO_CHECKPOINT_SCHEMA,
         "updates_completed": result.updates_completed,
         "config": training_config_to_dict(result.config),
         "summary": result.summary_dict(),

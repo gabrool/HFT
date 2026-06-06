@@ -46,7 +46,7 @@ def make_dataset(tmp_path, *, rows=5, chunk_rows=2, splits=(), row_fn=row):
     if splits:
         m0 = mf.read_manifest_json(root / mf.DEFAULT_MANIFEST_FILENAME)
         m1 = mf.StorageManifest(
-            m0.manifest_schema_version,
+            m0.schema,
             m0.dataset_id,
             m0.created_at_utc,
             m0.pipeline_config,
@@ -303,7 +303,7 @@ def test_split_entries_and_read_split_table(tmp_path):
         mf.SplitMetadata(SplitRole.VAL, "seg_000001", 3, 6, TimeRangeUS(m.segments[1].local_time_range.start_us, m.segments[1].local_time_range.end_us)),
     )
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -322,7 +322,7 @@ def test_iter_split_batches(tmp_path):
     root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
     splits = (mf.SplitMetadata(SplitRole.VAL, "seg_000001", 3, 6, m.segments[1].local_time_range),)
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -348,7 +348,7 @@ def test_read_split_table_filters_with_internal_row_idx_projection(tmp_path):
         ),
     )
     m2 = mf.StorageManifest(
-        m.manifest_schema_version,
+        m.schema,
         m.dataset_id,
         m.created_at_utc,
         m.pipeline_config,
@@ -390,7 +390,7 @@ def test_iter_split_batches_without_row_idx_projection(tmp_path):
         ),
     )
     m2 = mf.StorageManifest(
-        m.manifest_schema_version,
+        m.schema,
         m.dataset_id,
         m.created_at_utc,
         m.pipeline_config,
@@ -463,7 +463,7 @@ def test_iter_split_batches_does_not_materialize_split_table(tmp_path, monkeypat
         mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 3, 5, m.segments[1].local_time_range),
     )
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -479,7 +479,7 @@ def test_iter_split_batches_does_not_call_read_segment_table(tmp_path, monkeypat
     root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
     splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 0, 3, m.segments[0].local_time_range),)
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -494,7 +494,7 @@ def test_iter_split_batches_filters_by_row_idx_without_returning_internal_row_id
     root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
     splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 3, m.segments[0].local_time_range),)
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -513,7 +513,7 @@ def test_iter_split_batches_returns_row_idx_when_requested(tmp_path):
         mf.SplitMetadata(SplitRole.TRAIN, "seg_000000", 1, 3, m.segments[0].local_time_range),
     )
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -527,7 +527,7 @@ def test_iter_split_batches_preserves_requested_column_order(tmp_path):
     root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
     splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 3, 6, m.segments[1].local_time_range),)
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -546,7 +546,7 @@ def test_iter_split_batches_preserves_multiple_split_entry_order(tmp_path):
         mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 7, 9, m.segments[1].local_time_range),
     )
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
@@ -560,7 +560,7 @@ def test_iter_split_batches_honors_batch_size(tmp_path):
     root, m = make_dataset(tmp_path, rows=8, chunk_rows=4)
     splits = (mf.SplitMetadata(SplitRole.TRAIN, "seg_000001", 4, 8, m.segments[1].local_time_range),)
     m2 = mf.StorageManifest(
-        m.manifest_schema_version, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
+        m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
         m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )

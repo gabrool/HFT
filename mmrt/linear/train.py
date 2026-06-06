@@ -28,7 +28,7 @@ from mmrt.linear import diagnostics as dg
 DEFAULT_TRAIN_BATCH_SIZE = 8192
 DEFAULT_EPOCHS = 5
 DEFAULT_OUTPUT_FILENAME = "linear_train_result.json"
-TRAIN_RESULT_SCHEMA_VERSION = 1
+LINEAR_TRAINING_RESULT_SCHEMA = "mmrt_linear_training_result"
 
 
 def _require_positive_int(value: int, name: str) -> int:
@@ -209,7 +209,7 @@ class SplitEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class LinearTrainResult:
-    schema_version: int
+    schema: str
     dataset_id: str
     manifest_hash: str
     config: dict[str, object]
@@ -219,8 +219,8 @@ class LinearTrainResult:
     selection_summary: dict[str, object]
 
     def __post_init__(self) -> None:
-        if self.schema_version != TRAIN_RESULT_SCHEMA_VERSION:
-            raise ValueError("invalid schema_version")
+        if self.schema != LINEAR_TRAINING_RESULT_SCHEMA:
+            raise ValueError("invalid schema")
         object.__setattr__(self, "dataset_id", _require_non_empty_str(self.dataset_id, "dataset_id"))
         object.__setattr__(self, "manifest_hash", _require_non_empty_str(self.manifest_hash, "manifest_hash"))
         for name in ("config", "preprocess_state", "model_bundle_state"):
@@ -244,7 +244,7 @@ class LinearTrainResult:
     def as_dict(self) -> dict[str, object]:
         return _json_safe(
             {
-                "schema_version": self.schema_version,
+                "schema": self.schema,
                 "dataset_id": self.dataset_id,
                 "manifest_hash": self.manifest_hash,
                 "config": self.config,
@@ -296,7 +296,7 @@ def _preprocess_states_as_dict(states_by_head: dict[str, pp.LinearPreprocessStat
         if not isinstance(v, pp.LinearPreprocessState):
             raise ValueError("states_by_head values must be LinearPreprocessState")
     return {
-        "schema": "per_head_preprocess_v1",
+        "schema": "mmrt_linear_preprocess",
         "states_by_head": {head: states_by_head[head].as_dict() for head in lm.MODEL_HEADS},
     }
 
@@ -517,7 +517,7 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
     selection_summary = _selection_summary_from_splits(split_evals)
 
     return LinearTrainResult(
-        schema_version=TRAIN_RESULT_SCHEMA_VERSION,
+        schema=LINEAR_TRAINING_RESULT_SCHEMA,
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest.content_hash(),
         config={**cfg.as_dict(), "resolved_head_features": resolved_head_features.as_dict()},
@@ -548,7 +548,7 @@ __all__ = [
     "DEFAULT_TRAIN_BATCH_SIZE",
     "DEFAULT_EPOCHS",
     "DEFAULT_OUTPUT_FILENAME",
-    "TRAIN_RESULT_SCHEMA_VERSION",
+    "LINEAR_TRAINING_RESULT_SCHEMA",
     "LinearTrainConfig",
     "SplitEvaluation",
     "LinearTrainResult",

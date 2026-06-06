@@ -25,7 +25,7 @@ MAGNITUDE_UP_HEAD = "magnitude_up"
 MAGNITUDE_DOWN_HEAD = "magnitude_down"
 MODEL_HEADS = (NO_MOVE_HEAD, DIRECTION_HEAD, MAGNITUDE_UP_HEAD, MAGNITUDE_DOWN_HEAD)
 
-PER_HEAD_PREPROCESS_SCHEMA = "per_head_preprocess_v1"
+LINEAR_PREPROCESS_SCHEMA = "mmrt_linear_preprocess"
 
 
 def _require_positive_int(value: int, name: str) -> int:
@@ -411,7 +411,7 @@ def preprocess_diagnostics_from_train_state_dict(
     if not isinstance(state, dict):
         raise ValueError("preprocess_state must be a dict")
 
-    if state.get("schema") != PER_HEAD_PREPROCESS_SCHEMA:
+    if state.get("schema") != LINEAR_PREPROCESS_SCHEMA:
         return preprocess_diagnostics_from_state_dict(state, config=config).as_dict()
 
     states_by_head = state.get("states_by_head")
@@ -422,7 +422,7 @@ def preprocess_diagnostics_from_train_state_dict(
         raise ValueError("states_by_head keys must exactly match model heads")
 
     return {
-        "schema": PER_HEAD_PREPROCESS_SCHEMA,
+        "schema": LINEAR_PREPROCESS_SCHEMA,
         "states_by_head": {
             head: preprocess_diagnostics_from_state_dict(
                 states_by_head[head],

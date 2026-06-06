@@ -33,7 +33,7 @@ def test_default_config_core_values() -> None:
     assert cfg.runtime.lookback_rows == 10
     assert cfg.storage.time_unit == TimeUnit.MICROSECOND
     assert cfg.decision.stride_us == 500_000
-    assert cfg.storage.feature_schema_version == specs.FEATURE_SCHEMA_VERSION
+    assert cfg.storage.feature_schema == specs.FEATURE_SCHEMA
 
 
 def test_default_label_spec() -> None:
@@ -51,7 +51,7 @@ def test_label_config_sorting_and_duplicate_rejection() -> None:
         LabelConfig(horizons_us=(200_000, 200_000))
 
 
-def test_label_config_rejects_unsupported_price_refs_v1() -> None:
+def test_label_config_rejects_unsupported_price_refs() -> None:
     with pytest.raises(ValueError):
         LabelConfig(price_reference=PriceReference.MICROPRICE)
     with pytest.raises(ValueError):
@@ -76,7 +76,7 @@ def test_data_config_validation() -> None:
         DataConfig(**{"drop_duplicate_" + "trades": True})
 
 
-def test_decision_config_v1_constraints() -> None:
+def test_decision_config_constraints() -> None:
     assert DecisionConfig().stride_us == 500_000
     assert DecisionConfig(stride_us=500_000).stride_us == 500_000
     with pytest.raises(ValueError):
@@ -93,7 +93,7 @@ def test_decision_config_v1_constraints() -> None:
         DecisionConfig(**{"stride_" + "rows": 1})
 
 
-def test_feature_runtime_config_v1_constraints() -> None:
+def test_feature_runtime_config_constraints() -> None:
     FeatureRuntimeConfig()
     with pytest.raises(ValueError):
         FeatureRuntimeConfig(lookback_rows=0)
@@ -103,19 +103,19 @@ def test_feature_runtime_config_v1_constraints() -> None:
         FeatureRuntimeConfig(timestamp_dtype="float64")
 
 
-def test_storage_config_v1_constraints() -> None:
-    assert StorageConfig().feature_schema_version == specs.FEATURE_SCHEMA_VERSION
+def test_storage_config_constraints() -> None:
+    assert StorageConfig().feature_schema == specs.FEATURE_SCHEMA
     assert StorageConfig(time_unit="us").time_unit == TimeUnit.MICROSECOND
-    assert StorageConfig(storage_format="flat_decision_rows_us_v1").storage_format == StorageFormat.FLAT_DECISION_ROWS_US_V1
+    assert StorageConfig(storage_format="flat_decision_rows_us").storage_format == StorageFormat.FLAT_DECISION_ROWS_US
     with pytest.raises(ValueError):
-        StorageConfig(pipeline_schema_version="")
+        StorageConfig(pipeline_schema="")
 
 
 def test_pipeline_config_invariants() -> None:
     cfg = PipelineConfig()
     assert cfg.source_data_type_values == ("book_snapshot_25", "trades")
     assert cfg.decision.stride_us == cfg_module.DEFAULT_DECISION_STRIDE_US
-    assert cfg.storage.feature_schema_version == specs.FEATURE_SCHEMA_VERSION
+    assert cfg.storage.feature_schema == specs.FEATURE_SCHEMA
     assert cfg.label_spec == cfg.labels.to_label_spec()
     with pytest.raises(ValueError):
         PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_5, TardisDataType.TRADES)))
@@ -168,13 +168,13 @@ def test_pipeline_config_rejects_invalid_nested_config_objects() -> None:
         PipelineConfig(storage="bad")
 
 
-def test_label_config_v1_asof_policy() -> None:
+def test_label_config_asof_policy() -> None:
     assert LabelConfig(asof_policy=AsOfPolicy.LAST_OBSERVATION).asof_policy == AsOfPolicy.LAST_OBSERVATION
 
 
 def test_public_api_alignment() -> None:
     assert cfg_module.DEFAULT_DECISION_STRIDE_US == 500_000
-    assert cfg_module.DEFAULT_FEATURE_SCHEMA_VERSION == specs.FEATURE_SCHEMA_VERSION
+    assert cfg_module.DEFAULT_FEATURE_SCHEMA == specs.FEATURE_SCHEMA
     assert "DEFAULT_DECISION_STRIDE_US" in cfg_module.__all__
     assert "DEFAULT_DECISION_STRIDE_" + "ROWS" not in cfg_module.__all__
     assert "DEFAULT_DROP_DUPLICATE_" + "TRADES" not in cfg_module.__all__
@@ -190,4 +190,4 @@ def test_legacy_surface_removed() -> None:
 def test_default_config_alignment() -> None:
     c = default_config()
     assert c.decision.stride_us == cfg_module.DEFAULT_DECISION_STRIDE_US
-    assert c.storage.feature_schema_version == specs.FEATURE_SCHEMA_VERSION
+    assert c.storage.feature_schema == specs.FEATURE_SCHEMA

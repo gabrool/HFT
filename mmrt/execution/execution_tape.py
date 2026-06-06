@@ -26,7 +26,7 @@ from mmrt.execution.contracts import (
 from mmrt.execution.event_merge import MergedExecutionEvent
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 
-EXECUTION_TAPE_SCHEMA_VERSION = "mmrt_execution_tape_v2_book_depth"
+EXECUTION_TAPE_SCHEMA = "mmrt_execution_tape_book_depth"
 MANIFEST_FILENAME = "manifest.json"
 ARRAYS_DIRNAME = "arrays"
 
@@ -139,12 +139,12 @@ class ExecutionTape:
         if self.manifest.num_trades != len(self.arrays.trades):
             raise ValueError("manifest.num_trades must match trades length")
         if self.manifest.num_decisions != 0:
-            raise ValueError("execution tape v2 requires num_decisions == 0")
+            raise ValueError("execution tape requires num_decisions == 0")
         if tuple(self.manifest.array_names) != _EXPECTED_ARRAY_NAMES:
-            raise ValueError("manifest.array_names must match execution tape v2 arrays")
-        if self.manifest.schema_version != EXECUTION_TAPE_SCHEMA_VERSION:
-            raise ValueError("unsupported execution tape schema_version")
-        if self.manifest.tape_format != ExecutionTapeFormat.L2_TRADES_ARRAYS_V1:
+            raise ValueError("manifest.array_names must match execution tape arrays")
+        if self.manifest.schema != EXECUTION_TAPE_SCHEMA:
+            raise ValueError("unsupported execution tape schema")
+        if self.manifest.tape_format != ExecutionTapeFormat.L2_TRADES_ARRAYS:
             raise ValueError("unsupported execution tape format")
         notes_book_depth = self.manifest.notes.get("book_depth") if self.manifest.notes is not None else None
         if notes_book_depth is None:
@@ -173,7 +173,7 @@ def execution_tape_manifest_to_dict(manifest: ExecutionTapeManifest) -> dict[str
         raise ValueError("manifest must be ExecutionTapeManifest")
     spec = manifest.symbol_spec
     return {
-        "schema_version": manifest.schema_version,
+        "schema": manifest.schema,
         "tape_format": manifest.tape_format.value,
         "exchange": manifest.exchange,
         "symbol": manifest.symbol,
@@ -217,7 +217,7 @@ def execution_tape_manifest_from_dict(payload: Mapping[str, Any]) -> ExecutionTa
         contract_size=_require_finite_float(symbol_spec_payload.get("contract_size", 1.0), "symbol_spec.contract_size"),
     )
     return ExecutionTapeManifest(
-        schema_version=_require_nonempty_str(payload.get("schema_version"), "schema_version"),
+        schema=_require_nonempty_str(payload.get("schema"), "schema"),
         tape_format=ExecutionTapeFormat(payload.get("tape_format")),
         exchange=_require_nonempty_str(payload.get("exchange"), "exchange"),
         symbol=_require_nonempty_str(payload.get("symbol"), "symbol"),
@@ -276,8 +276,8 @@ def build_execution_tape(
         end_local_ts_us = start_local_ts_us + 1
 
     manifest = ExecutionTapeManifest(
-        schema_version=EXECUTION_TAPE_SCHEMA_VERSION,
-        tape_format=ExecutionTapeFormat.L2_TRADES_ARRAYS_V1,
+        schema=EXECUTION_TAPE_SCHEMA,
+        tape_format=ExecutionTapeFormat.L2_TRADES_ARRAYS,
         exchange=symbol_spec.exchange,
         symbol=symbol_spec.symbol,
         symbol_spec=symbol_spec,
@@ -400,7 +400,7 @@ def _build_events_array(
             seen_trades[event.ref.trade_ptr] = True
             code = EVENT_TYPE_CODE_TRADE
         else:
-            raise ValueError("execution tape v2 supports only L2_BATCH and TRADE events")
+            raise ValueError("execution tape supports only L2_BATCH and TRADE events")
 
         events_arr[i] = (
             event.ref.event_seq,
@@ -458,12 +458,12 @@ def _build_book_snapshot_arrays(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not l2_events:
         if book_depth is None:
-            raise ValueError("execution tape v2 requires at least one L2 event to infer book_depth")
+            raise ValueError("execution tape requires at least one L2 event to infer book_depth")
         depth = _require_positive_int(book_depth, "book_depth")
     elif book_depth is None:
         first_snapshot = l2_events[0].book_snapshot
         if first_snapshot is None:
-            raise ValueError("execution tape v2 requires every L2 event to include book_snapshot")
+            raise ValueError("execution tape requires every L2 event to include book_snapshot")
         depth = max(len(first_snapshot.bid_ticks), len(first_snapshot.ask_ticks))
         if depth <= 0:
             raise ValueError("book_depth must be a positive int")
@@ -479,7 +479,7 @@ def _build_book_snapshot_arrays(
     for i, event in enumerate(l2_events):
         snapshot = event.book_snapshot
         if snapshot is None:
-            raise ValueError("execution tape v2 requires every L2 event to include book_snapshot")
+            raise ValueError("execution tape requires every L2 event to include book_snapshot")
         if snapshot.local_ts_us != event.local_ts_us:
             raise ValueError("book_snapshot local_ts_us must match L2 event local_ts_us")
         if len(snapshot.bid_ticks) > depth or len(snapshot.ask_ticks) > depth:
@@ -697,7 +697,7 @@ def _coerce_notes(notes: Mapping[str, str] | None) -> dict[str, str]:
 
 
 __all__ = [
-    "EXECUTION_TAPE_SCHEMA_VERSION",
+    "EXECUTION_TAPE_SCHEMA",
     "MANIFEST_FILENAME",
     "ARRAYS_DIRNAME",
     "EVENTS_ARRAY_NAME",

@@ -1,4 +1,5 @@
 from mmrt.analysis.preprocess_audit import (
+    PREPROCESS_AUDIT_REPORT_TYPE,
     DEFAULT_PREPROCESS_AUDIT_MAX_SAMPLE_ROWS,
     DEFAULT_PREPROCESS_AUDIT_SUMMARY_FILENAME,
     DEFAULT_PREPROCESS_AUDIT_FEATURES_FILENAME,
@@ -10,6 +11,7 @@ from mmrt.analysis.preprocess_audit import (
     write_preprocess_audit_artifacts,
 )
 from mmrt.analysis.feature_audit import (
+    FEATURE_AUDIT_REPORT_TYPE,
     DEFAULT_FEATURE_AUDIT_MAX_SAMPLE_ROWS,
     DEFAULT_FEATURE_AUDIT_SUMMARY_FILENAME,
     DEFAULT_FEATURE_AUDIT_HEALTH_FILENAME,
@@ -30,7 +32,7 @@ from mmrt.analysis.feature_audit import (
     write_feature_audit_artifacts,
 )
 from mmrt.analysis.feature_importance import (
-    FEATURE_IMPORTANCE_SCHEMA_VERSION,
+    FEATURE_IMPORTANCE_REPORT_TYPE,
     DEFAULT_FEATURE_IMPORTANCE_BATCH_SIZE,
     DEFAULT_FEATURE_IMPORTANCE_MAX_SAMPLE_ROWS,
     DEFAULT_FEATURE_IMPORTANCE_SEED,
@@ -45,7 +47,7 @@ from mmrt.analysis.feature_importance import (
     write_feature_importance_artifacts,
 )
 from mmrt.analysis.feature_lab import (
-    FEATURE_LAB_SCHEMA_VERSION,
+    FEATURE_LAB_REPORT_TYPE,
     DEFAULT_FEATURE_LAB_BATCH_SIZE,
     DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_TRAIN,
     DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_VAL,
@@ -68,6 +70,7 @@ from mmrt.analysis.feature_lab import (
 )
 
 __all__ = [
+    "PREPROCESS_AUDIT_REPORT_TYPE",
     "DEFAULT_PREPROCESS_AUDIT_MAX_SAMPLE_ROWS",
     "DEFAULT_PREPROCESS_AUDIT_SUMMARY_FILENAME",
     "DEFAULT_PREPROCESS_AUDIT_FEATURES_FILENAME",
@@ -77,6 +80,7 @@ __all__ = [
     "PreprocessAuditResult",
     "run_preprocess_audit",
     "write_preprocess_audit_artifacts",
+    "FEATURE_AUDIT_REPORT_TYPE",
     "DEFAULT_FEATURE_AUDIT_MAX_SAMPLE_ROWS",
     "DEFAULT_FEATURE_AUDIT_SUMMARY_FILENAME",
     "DEFAULT_FEATURE_AUDIT_HEALTH_FILENAME",
@@ -95,7 +99,7 @@ __all__ = [
     "FeatureAuditResult",
     "run_feature_audit",
     "write_feature_audit_artifacts",
-    "FEATURE_IMPORTANCE_SCHEMA_VERSION",
+    "FEATURE_IMPORTANCE_REPORT_TYPE",
     "DEFAULT_FEATURE_IMPORTANCE_BATCH_SIZE",
     "DEFAULT_FEATURE_IMPORTANCE_MAX_SAMPLE_ROWS",
     "DEFAULT_FEATURE_IMPORTANCE_SEED",
@@ -108,7 +112,7 @@ __all__ = [
     "FeatureImportanceResult",
     "run_feature_importance",
     "write_feature_importance_artifacts",
-    "FEATURE_LAB_SCHEMA_VERSION",
+    "FEATURE_LAB_REPORT_TYPE",
     "DEFAULT_FEATURE_LAB_BATCH_SIZE",
     "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_TRAIN",
     "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_VAL",

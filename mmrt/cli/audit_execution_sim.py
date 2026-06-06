@@ -241,7 +241,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
     validate_linear_signal_artifact_metadata(
         linear_signals,
-        tape_schema_version=tape.manifest.schema_version,
+        tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
         symbol=tape.manifest.symbol,
         num_events=tape.manifest.num_events,
@@ -304,7 +304,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         "output_json": output_path_str,
         "config": _summary_config(config),
         "tape": {
-            "schema_version": tape.manifest.schema_version,
+            "schema": tape.manifest.schema,
             "exchange": tape.manifest.exchange,
             "symbol": tape.manifest.symbol,
             "num_events": tape.manifest.num_events,

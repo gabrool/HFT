@@ -11,7 +11,7 @@ import hashlib
 import re
 from typing import Iterable, Mapping, Sequence
 
-FEATURE_SCHEMA_VERSION = "mmrt_feature_schema_v3_snapshot25_trades_active44_ctx4_feature_subset_corr90"
+FEATURE_SCHEMA = "mmrt_features_snapshot25_trades_active44_ctx4_corr90"
 
 CORE_FEATURE_COUNT = 44
 EVENT_CONTEXT_FEATURE_COUNT = 4
@@ -661,7 +661,7 @@ assert max_required_book_depth() <= REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH
 
 def schema_record() -> Mapping[str, object]:
     return {
-      "feature_schema_version": FEATURE_SCHEMA_VERSION,
+      "schema": FEATURE_SCHEMA,
       "feature_count": FEATURE_COUNT,
       "feature_names_hash": FEATURE_NAMES_HASH,
       "feature_specs_hash": FEATURE_SPECS_HASH,
@@ -675,7 +675,7 @@ def schema_record() -> Mapping[str, object]:
     }
 
 __all__ = [
-    "FEATURE_SCHEMA_VERSION", "CORE_FEATURE_COUNT", "EVENT_CONTEXT_FEATURE_COUNT", "FEATURE_COUNT",
+    "FEATURE_SCHEMA", "CORE_FEATURE_COUNT", "EVENT_CONTEXT_FEATURE_COUNT", "FEATURE_COUNT",
     "REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH", "MAX_REQUIRED_BOOK_FEATURE_DEPTH", "SUPPORTED_WINDOWS_US",
     "DEFAULT_FEATURE_DTYPE", "CORE_FEATURE_NAMES", "EVENT_CONTEXT_FEATURE_NAMES", "FeatureSource",
     "FeatureOwner", "FeatureFamily", "FeatureUnit", "TransformKey", "FeatureSpec", "FEATURE_SPECS",

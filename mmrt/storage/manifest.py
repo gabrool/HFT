@@ -9,7 +9,7 @@ from mmrt.config import PipelineConfig, default_config
 from mmrt.contracts import AsOfPolicy, LabelSpec, PriceReference, SplitRole, StorageFormat, TimeRangeUS, TimeUnit
 from mmrt.features import specs
 
-MANIFEST_SCHEMA_VERSION = "mmrt_storage_manifest_v1"
+STORAGE_MANIFEST_SCHEMA = "mmrt_storage_manifest"
 DEFAULT_MANIFEST_FILENAME = "manifest.json"
 ROW_IDX_COLUMN = "row_idx"
 DECISION_INDEX_COLUMN = "decision_index"
@@ -132,7 +132,7 @@ def feature_schema_record() -> dict[str, Any]:
 
 def default_writer_metadata() -> dict[str, Any]:
     return {
-        "storage_format": StorageFormat.FLAT_DECISION_ROWS_US_V1.value,
+        "storage_format": StorageFormat.FLAT_DECISION_ROWS_US.value,
         "compression": DEFAULT_COMPRESSION,
         "parquet_version": DEFAULT_PARQUET_VERSION,
         "feature_column_prefix": FEATURE_COLUMN_PREFIX,
@@ -196,8 +196,8 @@ def pipeline_config_to_manifest_dict(config: PipelineConfig) -> dict[str, Any]:
         "timestamp_dtype": config.runtime.timestamp_dtype,
         "storage_format": config.storage.storage_format.value,
         "time_unit": config.storage.time_unit.value,
-        "pipeline_schema_version": config.storage.pipeline_schema_version,
-        "feature_schema_version": config.storage.feature_schema_version,
+        "pipeline_schema": config.storage.pipeline_schema,
+        "feature_schema": config.storage.feature_schema,
     }
 
 
@@ -338,7 +338,7 @@ class SplitMetadata:
 
 @dataclass(frozen=True, slots=True)
 class StorageManifest:
-    manifest_schema_version: str
+    schema: str
     dataset_id: str
     created_at_utc: str
     pipeline_config: dict[str, Any]
@@ -361,11 +361,11 @@ class StorageManifest:
 
     def _validate_pipeline_config_consistency(self) -> None:
         pc = self.pipeline_config
-        if "feature_schema_version" in pc and pc["feature_schema_version"] != specs.FEATURE_SCHEMA_VERSION:
-            raise ValueError("pipeline_config feature_schema_version drift")
+        if "feature_schema" in pc and pc["feature_schema"] != specs.FEATURE_SCHEMA:
+            raise ValueError("pipeline_config feature_schema drift")
         if "time_unit" in pc and pc["time_unit"] != TimeUnit.MICROSECOND.value:
             raise ValueError("pipeline_config time_unit drift")
-        if "storage_format" in pc and pc["storage_format"] != StorageFormat.FLAT_DECISION_ROWS_US_V1.value:
+        if "storage_format" in pc and pc["storage_format"] != StorageFormat.FLAT_DECISION_ROWS_US.value:
             raise ValueError("pipeline_config storage_format drift")
         if "decision_stride_us" in pc and pc["decision_stride_us"] != self.decision_stride_us:
             raise ValueError("pipeline_config decision_stride_us drift")
@@ -375,7 +375,7 @@ class StorageManifest:
             raise ValueError("pipeline_config symbol drift")
 
     def __post_init__(self) -> None:
-        if self.manifest_schema_version != MANIFEST_SCHEMA_VERSION:
+        if self.schema != STORAGE_MANIFEST_SCHEMA:
             raise ValueError("invalid manifest schema")
         ds = _require_nonempty_str(self.dataset_id, "dataset_id")
         if any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:" for c in ds):
@@ -393,7 +393,7 @@ class StorageManifest:
         object.__setattr__(self, "symbol", _require_nonempty_str(self.symbol, "symbol"))
         object.__setattr__(self, "storage_format", StorageFormat(self.storage_format))
         object.__setattr__(self, "time_unit", TimeUnit(self.time_unit))
-        if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US_V1:
+        if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US:
             raise ValueError("storage/time/stride invalid")
         if self.time_unit != TimeUnit.MICROSECOND:
             raise ValueError("storage/time/stride invalid")
@@ -478,7 +478,7 @@ class StorageManifest:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "manifest_schema_version": self.manifest_schema_version,
+            "schema": self.schema,
             "dataset_id": self.dataset_id,
             "created_at_utc": self.created_at_utc,
             "pipeline_config": self.pipeline_config,
@@ -506,7 +506,7 @@ class StorageManifest:
         _require_keys(
             m,
             (
-                "manifest_schema_version",
+                "schema",
                 "dataset_id",
                 "created_at_utc",
                 "pipeline_config",
@@ -528,7 +528,7 @@ class StorageManifest:
             "manifest",
         )
         return cls(
-            _required(m, "manifest_schema_version", "manifest"),
+            _required(m, "schema", "manifest"),
             _required(m, "dataset_id", "manifest"),
             _required(m, "created_at_utc", "manifest"),
             dict(_required(m, "pipeline_config", "manifest")),
@@ -556,7 +556,7 @@ class StorageManifest:
     def validate_against_current_code(self) -> None:
         fs = self.feature_schema
         checks = {
-            "feature_schema_version": specs.FEATURE_SCHEMA_VERSION,
+            "schema": specs.FEATURE_SCHEMA,
             "feature_count": specs.FEATURE_COUNT,
             "feature_names_hash": specs.FEATURE_NAMES_HASH,
             "feature_specs_hash": specs.FEATURE_SPECS_HASH,
@@ -574,7 +574,7 @@ class StorageManifest:
             raise ValueError("column schema drift")
         if self.time_unit != TimeUnit.MICROSECOND:
             raise ValueError("time_unit drift")
-        if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US_V1:
+        if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US:
             raise ValueError("storage_format drift")
         if self.decision_stride_us != 500_000:
             raise ValueError("decision_stride_us drift")
@@ -593,7 +593,7 @@ def make_manifest(
 ) -> StorageManifest:
     cfg = default_config() if config is None else config
     return StorageManifest(
-        MANIFEST_SCHEMA_VERSION,
+        STORAGE_MANIFEST_SCHEMA,
         dataset_id,
         created_at_utc,
         pipeline_config_to_manifest_dict(cfg),
@@ -641,7 +641,7 @@ def read_manifest_json(path: str | object) -> StorageManifest:
 
 
 __all__ = [
-    "MANIFEST_SCHEMA_VERSION",
+    "STORAGE_MANIFEST_SCHEMA",
     "DEFAULT_MANIFEST_FILENAME",
     "ROW_IDX_COLUMN",
     "DECISION_INDEX_COLUMN",

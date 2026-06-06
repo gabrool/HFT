@@ -85,7 +85,7 @@ def test_arrow_schema_matches_manifest_contract():
     for c in mf.feature_columns():
         assert schema.field(c).type == __import__("pyarrow").float32()
     md = schema.metadata
-    for k in (b"manifest_schema_version", b"storage_format", b"time_unit", b"feature_schema_version", b"feature_count"):
+    for k in (b"schema", b"storage_format", b"time_unit", b"feature_schema", b"feature_count"):
         assert k in md
 
 

@@ -30,7 +30,7 @@ def manifest_one_segment():
 
 def manifest_from_base_with_columns(base, *, feature_columns=None, label_columns=None, required_columns=None):
     return mf.StorageManifest(
-        manifest_schema_version=base["manifest_schema_version"],
+        schema=base["schema"],
         dataset_id=base["dataset_id"],
         created_at_utc=base["created_at_utc"],
         pipeline_config=base["pipeline_config"],
@@ -55,7 +55,7 @@ def manifest_from_base_with_columns(base, *, feature_columns=None, label_columns
 
 def test_public_api_boundary():
     expected = {
-        "MANIFEST_SCHEMA_VERSION", "DEFAULT_MANIFEST_FILENAME", "ROW_IDX_COLUMN", "DECISION_INDEX_COLUMN", "TS_US_COLUMN",
+        "STORAGE_MANIFEST_SCHEMA", "DEFAULT_MANIFEST_FILENAME", "ROW_IDX_COLUMN", "DECISION_INDEX_COLUMN", "TS_US_COLUMN",
         "LOCAL_TS_US_COLUMN", "EVENT_SEQ_COLUMN", "RAW_MID_COLUMN", "LABEL_ENTRY_TS_US_COLUMN", "FEATURE_COLUMN_PREFIX",
         "LABEL_COLUMN_PREFIX", "BASE_ROW_COLUMNS", "DEFAULT_COMPRESSION", "DEFAULT_PARQUET_VERSION", "StorageSegment",
         "SplitMetadata", "StorageManifest", "feature_columns", "label_columns", "required_row_columns", "feature_schema_record",
@@ -103,7 +103,7 @@ def test_feature_and_label_columns_match_specs():
 def test_feature_schema_record_matches_specs():
     got = mf.feature_schema_record()
     want = specs.schema_record()
-    for k in ("feature_schema_version", "feature_count", "feature_names_hash", "feature_specs_hash", "feature_dtype", "time_unit"):
+    for k in ("schema", "feature_count", "feature_names_hash", "feature_specs_hash", "feature_dtype", "time_unit"):
         assert got[k] == want[k]
 
 
@@ -165,8 +165,8 @@ def test_time_range_serialization_roundtrip_and_missing_keys():
 def test_make_manifest_defaults_and_validation():
     cfg = default_config()
     m = manifest_one_segment()
-    assert m.manifest_schema_version == mf.MANIFEST_SCHEMA_VERSION
-    assert m.storage_format == StorageFormat.FLAT_DECISION_ROWS_US_V1
+    assert m.schema == mf.STORAGE_MANIFEST_SCHEMA
+    assert m.storage_format == StorageFormat.FLAT_DECISION_ROWS_US
     assert m.time_unit == TimeUnit.MICROSECOND
     assert m.decision_stride_us == 500_000
     assert m.exchange == cfg.market.exchange and m.symbol == cfg.market.symbol
@@ -234,7 +234,7 @@ def test_manifest_rejects_feature_schema_drift():
         "feature_count": specs.FEATURE_COUNT + 1,
         "feature_names_hash": "bad",
         "feature_specs_hash": "bad",
-        "feature_schema_version": "bad",
+        "schema": "bad",
         "feature_dtype": "float64",
         "time_unit": "ms",
     }.items():
@@ -256,7 +256,7 @@ def test_validate_against_current_code_catches_post_construction_mutation():
         "feature_count": specs.FEATURE_COUNT + 1,
         "feature_names_hash": "bad",
         "feature_specs_hash": "bad",
-        "feature_schema_version": "bad",
+        "schema": "bad",
         "feature_dtype": "float64",
         "time_unit": "ms",
     }.items():
@@ -268,7 +268,7 @@ def test_validate_against_current_code_catches_post_construction_mutation():
 def test_manifest_rejects_pipeline_config_inconsistency():
     base = manifest_one_segment().to_dict()
     for k, v in {
-        "feature_schema_version": "bad",
+        "feature_schema": "bad",
         "time_unit": "ms",
         "storage_format": "bad",
         "decision_stride_us": 123,
@@ -279,7 +279,7 @@ def test_manifest_rejects_pipeline_config_inconsistency():
         d["pipeline_config"][k] = v
         with pytest.raises(ValueError): mf.StorageManifest.from_dict(d)
     d = json.loads(json.dumps(base))
-    for k in ("feature_schema_version", "time_unit", "storage_format", "decision_stride_us", "exchange", "symbol"):
+    for k in ("feature_schema", "time_unit", "storage_format", "decision_stride_us", "exchange", "symbol"):
         del d["pipeline_config"][k]
     mf.StorageManifest.from_dict(d)
 
@@ -331,12 +331,12 @@ def test_manifest_split_validation():
 
 def test_pipeline_config_to_manifest_dict():
     d = mf.pipeline_config_to_manifest_dict(default_config())
-    for k in ("exchange", "symbol", "source_data_types", "disabled_context_data_types", "decision_policy", "decision_reason", "decision_stride_us", "horizons_us", "entry_delay_us", "price_reference", "asof_policy", "lookback_rows", "feature_dtype", "label_dtype", "timestamp_dtype", "storage_format", "time_unit", "pipeline_schema_version", "feature_schema_version"):
+    for k in ("exchange", "symbol", "source_data_types", "disabled_context_data_types", "decision_policy", "decision_reason", "decision_stride_us", "horizons_us", "entry_delay_us", "price_reference", "asof_policy", "lookback_rows", "feature_dtype", "label_dtype", "timestamp_dtype", "storage_format", "time_unit", "pipeline_schema", "feature_schema"):
         assert k in d
     assert d["decision_stride_us"] == 500_000
-    assert d["storage_format"] == "flat_decision_rows_us_v1"
+    assert d["storage_format"] == "flat_decision_rows_us"
     assert d["time_unit"] == "us"
-    assert d["feature_schema_version"] == specs.FEATURE_SCHEMA_VERSION
+    assert d["feature_schema"] == specs.FEATURE_SCHEMA
 
 
 def test_transform_metadata_json_safe():
@@ -356,7 +356,7 @@ def test_transform_metadata_json_safe():
 
 def test_manifest_from_dict_missing_required_keys_raise_value_error():
     base = manifest_one_segment().to_dict()
-    required = ["manifest_schema_version", "dataset_id", "created_at_utc", "pipeline_config", "writer_metadata", "feature_schema", "label_spec", "transform_config", "transform_diagnostics", "exchange", "symbol", "storage_format", "time_unit", "decision_stride_us", "feature_columns", "label_columns", "required_columns", "segments"]
+    required = ["schema", "dataset_id", "created_at_utc", "pipeline_config", "writer_metadata", "feature_schema", "label_spec", "transform_config", "transform_diagnostics", "exchange", "symbol", "storage_format", "time_unit", "decision_stride_us", "feature_columns", "label_columns", "required_columns", "segments"]
     for key in required:
         d = json.loads(json.dumps(base))
         del d[key]

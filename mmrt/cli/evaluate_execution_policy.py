@@ -15,7 +15,7 @@ from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
 from mmrt.execution.linear_signal import (
-    LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION,
+    LINEAR_SIGNAL_ARTIFACT_SCHEMA,
     LINEAR_SIGNALS_FILENAME,
     load_linear_signal_artifact_npz,
     linear_signal_artifact_summary,
@@ -26,6 +26,7 @@ from mmrt.execution.quote_geometry import QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
 from mmrt.rl.evaluate import PolicyEvaluationConfig, evaluate_policy
 from mmrt.rl.normalization import ObservationNormalizer, ObservationNormalizerConfig
+from mmrt.rl.train import PPO_CHECKPOINT_SCHEMA
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 
 __all__ = [
@@ -396,8 +397,8 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
 def _load_checkpoint(path: str | Path, *, device: torch.device) -> Mapping[str, object]:
     payload = torch.load(path, map_location=device)
     payload = _require_mapping(payload, "checkpoint payload")
-    if payload.get("schema_version") != "mmrt_execution_ppo_checkpoint_v2_required_linear_signals":
-        raise ValueError("checkpoint schema_version is not mmrt_execution_ppo_checkpoint_v2_required_linear_signals")
+    if payload.get("schema") != PPO_CHECKPOINT_SCHEMA:
+        raise ValueError("checkpoint schema mismatch")
     _mapping_get_mapping(payload, "config")
     if "policy_state_dict" not in payload:
         raise ValueError("policy_state_dict is required")
@@ -570,7 +571,7 @@ def run_execution_policy_evaluation(
 
     validate_linear_signal_artifact_metadata(
         linear_signals,
-        tape_schema_version=tape.manifest.schema_version,
+        tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
         symbol=tape.manifest.symbol,
         num_events=tape.manifest.num_events,
@@ -593,7 +594,7 @@ def run_execution_policy_evaluation(
     if checkpoint_linear_schema is None:
         raise ValueError("checkpoint missing linear_signals metadata")
     checkpoint_linear_schema = _require_mapping(checkpoint_linear_schema, "checkpoint linear_signals")
-    if checkpoint_linear_schema.get("schema_version") != LINEAR_SIGNAL_ARTIFACT_SCHEMA_VERSION:
+    if checkpoint_linear_schema.get("schema") != LINEAR_SIGNAL_ARTIFACT_SCHEMA:
         raise ValueError("checkpoint linear signal schema mismatch")
     checkpoint_linear_metadata = checkpoint_linear_schema.get("metadata")
     if checkpoint_linear_metadata is None:
@@ -639,13 +640,13 @@ def run_execution_policy_evaluation(
         "env_config_source": env_config_source,
         "effective_start_event_index": effective_start_event_index,
         "checkpoint": {
-            "schema_version": checkpoint.get("schema_version"),
+            "schema": checkpoint.get("schema"),
             "updates_completed": checkpoint.get("updates_completed"),
             "has_observation_normalizer": checkpoint.get("observation_normalizer_state_dict")
             is not None,
         },
         "tape": {
-            "schema_version": tape.manifest.schema_version,
+            "schema": tape.manifest.schema,
             "exchange": tape.manifest.exchange,
             "symbol": tape.manifest.symbol,
             "num_events": tape.manifest.num_events,

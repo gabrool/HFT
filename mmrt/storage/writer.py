@@ -88,7 +88,7 @@ class WriterConfig:
             raise ValueError("dataset_root must be non-empty")
         if not isinstance(self.config, PipelineConfig):
             raise ValueError("config must be PipelineConfig")
-        if self.config.storage.storage_format != StorageFormat.FLAT_DECISION_ROWS_US_V1:
+        if self.config.storage.storage_format != StorageFormat.FLAT_DECISION_ROWS_US:
             raise ValueError("unsupported storage format")
         if self.config.storage.time_unit != TimeUnit.MICROSECOND:
             raise ValueError("unsupported time unit")
@@ -119,10 +119,10 @@ def arrow_schema(label_spec: LabelSpec) -> pa.Schema:
             ftype = pa.int64()
         fields.append(pa.field(name, ftype, nullable=False))
     md = {
-        "manifest_schema_version": mf.MANIFEST_SCHEMA_VERSION,
-        "storage_format": StorageFormat.FLAT_DECISION_ROWS_US_V1.value,
+        "schema": mf.STORAGE_MANIFEST_SCHEMA,
+        "storage_format": StorageFormat.FLAT_DECISION_ROWS_US.value,
         "time_unit": TimeUnit.MICROSECOND.value,
-        "feature_schema_version": str(mf.feature_schema_record()["feature_schema_version"]),
+        "feature_schema": str(mf.feature_schema_record()["schema"]),
         "feature_count": str(len(mf.feature_columns())),
     }
     return pa.schema(fields, metadata={k: v.encode("utf-8") for k, v in md.items()})

@@ -49,7 +49,7 @@ def test_parser_rejects_bad_numeric_values():
 def test_main_calls_analysis_and_writer_and_prints_compact_json(monkeypatch, tmp_path: Path, capsys):
     calls = {}
     result = feature_lab.FeatureLabResult(
-        schema_version=1,
+        report_type=feature_lab.FEATURE_LAB_REPORT_TYPE,
         dataset_id="d1",
         manifest_hash="h1",
         train_result_path="train.json",
@@ -63,7 +63,7 @@ def test_main_calls_analysis_and_writer_and_prints_compact_json(monkeypatch, tmp
         redundancy_records=(),
         head_metric_records=(),
         recommendation_records=(),
-        summary={"schema_version": 1},
+        summary={"schema": 1},
         warnings=(),
     )
 

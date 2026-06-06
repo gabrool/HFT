@@ -2,7 +2,7 @@ def test_analysis_package_exports_feature_lab_api():
     import mmrt.analysis as analysis
 
     expected = {
-        "FEATURE_LAB_SCHEMA_VERSION",
+        "FEATURE_LAB_REPORT_TYPE",
         "DEFAULT_FEATURE_LAB_BATCH_SIZE",
         "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_TRAIN",
         "DEFAULT_FEATURE_LAB_MAX_SAMPLE_ROWS_VAL",

@@ -179,9 +179,9 @@ def test_source_owner_family_examples():
         assert spec.required_book_depth == depth
 
 
-def test_feature_schema_version_is_current_active_schema():
-    assert specs.FEATURE_SCHEMA_VERSION == "mmrt_feature_schema_v3_snapshot25_trades_active44_ctx4_feature_subset_corr90"
-    assert "legacy" not in specs.FEATURE_SCHEMA_VERSION
+def test_feature_schema_is_current_active_schema():
+    assert specs.FEATURE_SCHEMA == "mmrt_features_snapshot25_trades_active44_ctx4_corr90"
+    assert "legacy" not in specs.FEATURE_SCHEMA
 
 
 def test_public_schema_has_no_aux_core_split():

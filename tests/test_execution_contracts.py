@@ -58,7 +58,7 @@ def _update(**overrides):
 def test_execution_contracts_importable():
     import mmrt.execution.contracts as c
 
-    assert c.ExecutionTapeFormat.L2_TRADES_ARRAYS_V1.value == "l2_trades_arrays_v1"
+    assert c.ExecutionTapeFormat.L2_TRADES_ARRAYS.value == "l2_trades_arrays"
 
 
 def test_symbol_spec_conversions_and_validation():
@@ -345,8 +345,8 @@ def test_execution_step_result_info_rejects_non_scalar_or_nonfinite_values():
 def test_execution_tape_manifest_required_metadata():
     spec = _spec()
     manifest = ExecutionTapeManifest(
-        schema_version="1",
-        tape_format=ExecutionTapeFormat.L2_TRADES_ARRAYS_V1,
+        schema="1",
+        tape_format=ExecutionTapeFormat.L2_TRADES_ARRAYS,
         exchange="binance-futures",
         symbol="BTCUSDT",
         symbol_spec=spec,
@@ -362,8 +362,8 @@ def test_execution_tape_manifest_required_metadata():
     assert manifest.num_events == 10
 
     kwargs = {
-        "schema_version": "1",
-        "tape_format": ExecutionTapeFormat.L2_TRADES_ARRAYS_V1,
+        "schema": "1",
+        "tape_format": ExecutionTapeFormat.L2_TRADES_ARRAYS,
         "exchange": "binance-futures",
         "symbol": "BTCUSDT",
         "symbol_spec": spec,

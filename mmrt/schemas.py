@@ -33,7 +33,7 @@ SUPPORTED_TARDIS_SCHEMA_TYPES = (
     TardisDataType.LIQUIDATIONS,
 )
 
-UNSUPPORTED_TARDIS_SCHEMA_TYPES_V1 = (
+UNSUPPORTED_TARDIS_SCHEMA_TYPES = (
     TardisDataType.OPTIONS_CHAIN,
     TardisDataType.QUOTES,
 )
@@ -145,8 +145,8 @@ class TardisCSVSchema:
             raise ValueError(f"first four columns must be {COMMON_TARDIS_COLUMNS!r}")
 
         if data_type not in SUPPORTED_TARDIS_SCHEMA_TYPES:
-            if data_type in UNSUPPORTED_TARDIS_SCHEMA_TYPES_V1:
-                raise ValueError(f"{data_type.value} schema is unsupported in v1")
+            if data_type in UNSUPPORTED_TARDIS_SCHEMA_TYPES:
+                raise ValueError(f"{data_type.value} schema is unsupported in")
             raise ValueError(f"unsupported data_type for schema registry: {data_type.value}")
 
         if data_type == TardisDataType.BOOK_SNAPSHOT_25:
@@ -306,8 +306,8 @@ TARDIS_CSV_SCHEMAS = {
 
 def tardis_csv_schema(data_type: TardisDataType | str) -> TardisCSVSchema:
     dtype = _coerce_data_type(data_type, "data_type")
-    if dtype in UNSUPPORTED_TARDIS_SCHEMA_TYPES_V1:
-        raise ValueError(f"{dtype.value} schema is explicitly unsupported in v1")
+    if dtype in UNSUPPORTED_TARDIS_SCHEMA_TYPES:
+        raise ValueError(f"{dtype.value} schema is explicitly unsupported in")
     try:
         return TARDIS_CSV_SCHEMAS[dtype]
     except KeyError as exc:
@@ -329,7 +329,7 @@ class FeatureField:
         object.__setattr__(self, "name", _validate_feature_name(self.name))
         object.__setattr__(self, "family", _require_nonempty_str(self.family, "family"))
         if self.dtype != "float32":
-            raise ValueError("dtype must be 'float32' in v1")
+            raise ValueError("dtype must be 'float32' in")
         object.__setattr__(self, "unit", _require_nonempty_str(self.unit, "unit"))
 
 
@@ -408,7 +408,7 @@ __all__ = [
     "CURRENT_MAX_REQUIRED_BOOK_DEPTH",
     "CURRENT_REQUIRED_BOOK_SNAPSHOT_DEPTH",
     "SUPPORTED_TARDIS_SCHEMA_TYPES",
-    "UNSUPPORTED_TARDIS_SCHEMA_TYPES_V1",
+    "UNSUPPORTED_TARDIS_SCHEMA_TYPES",
     "book_snapshot_columns",
     "incremental_book_l2_columns",
     "trades_columns",

@@ -5,7 +5,7 @@ fixed-horizon return column into target arrays for linear heads. It does not
 parse market data, compute labels from prices, inspect row timing fields,
 build splits, fit preprocessing, train models, or evaluate metrics.
 
-The v1 gated linear heads are no_move, direction, magnitude_up, and magnitude_down.
+The gated linear heads are no_move, direction, magnitude_up, and magnitude_down.
 Stored return labels are the source of truth.
 """
 
