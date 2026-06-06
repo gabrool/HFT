@@ -9,7 +9,7 @@ It does not parse market data, reconstruct books, simulate fills, compute
 rewards, write artifacts, or import ML/dataframe libraries.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 from typing import Any
@@ -173,6 +173,26 @@ class RewardMode(_StrEnum):
 
 class ActionMode(_StrEnum):
     CONTINUOUS_LATENT = "continuous_latent"
+
+
+@dataclass(frozen=True, slots=True)
+class LatencyConfig:
+    decision_compute_latency_us: int = 50
+    order_entry_latency_us: int = 500
+    cancel_latency_us: int = 500
+
+    def __post_init__(self) -> None:
+        _require_nonnegative_int(self.decision_compute_latency_us, "decision_compute_latency_us")
+        _require_nonnegative_int(self.order_entry_latency_us, "order_entry_latency_us")
+        _require_nonnegative_int(self.cancel_latency_us, "cancel_latency_us")
+
+    @property
+    def order_activation_delay_us(self) -> int:
+        return self.decision_compute_latency_us + self.order_entry_latency_us
+
+    @property
+    def cancel_effective_delay_us(self) -> int:
+        return self.decision_compute_latency_us + self.cancel_latency_us
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +500,7 @@ class ActionSpec:
     mode: ActionMode = ActionMode.CONTINUOUS_LATENT
     max_distance_ticks: int = 20
     max_order_qty: float = 0.01
+    default_order_qty: float = 0.001
     allow_bid: bool = True
     allow_ask: bool = True
 
@@ -487,6 +508,7 @@ class ActionSpec:
         object.__setattr__(self, "mode", _coerce_enum(ActionMode, self.mode, "mode"))
         _require_positive_int(self.max_distance_ticks, "max_distance_ticks")
         object.__setattr__(self, "max_order_qty", _require_positive_float(self.max_order_qty, "max_order_qty"))
+        object.__setattr__(self, "default_order_qty", _require_positive_float(self.default_order_qty, "default_order_qty"))
         _require_bool(self.allow_bid, "allow_bid")
         _require_bool(self.allow_ask, "allow_ask")
         if not (self.allow_bid or self.allow_ask):
@@ -534,6 +556,9 @@ class ActiveOrder:
     status: OrderStatus
     created_local_ts_us: int
     last_update_local_ts_us: int
+    effective_local_ts_us: int = 0
+    cancel_requested_local_ts_us: int = 0
+    cancel_effective_local_ts_us: int = 0
 
     def __post_init__(self) -> None:
         _require_nonnegative_int(self.order_id, "order_id")
@@ -555,6 +580,15 @@ class ActiveOrder:
         _require_positive_int(self.last_update_local_ts_us, "last_update_local_ts_us")
         if self.last_update_local_ts_us < self.created_local_ts_us:
             raise ValueError("last_update_local_ts_us must be >= created_local_ts_us")
+        _require_nonnegative_int(self.effective_local_ts_us, "effective_local_ts_us")
+        _require_nonnegative_int(self.cancel_requested_local_ts_us, "cancel_requested_local_ts_us")
+        _require_nonnegative_int(self.cancel_effective_local_ts_us, "cancel_effective_local_ts_us")
+        if self.effective_local_ts_us and self.effective_local_ts_us < self.created_local_ts_us:
+            raise ValueError("effective_local_ts_us must be >= created_local_ts_us")
+        if self.cancel_effective_local_ts_us and not self.cancel_requested_local_ts_us:
+            raise ValueError("cancel_effective_local_ts_us requires cancel_requested_local_ts_us")
+        if self.cancel_requested_local_ts_us and self.cancel_effective_local_ts_us < self.cancel_requested_local_ts_us:
+            raise ValueError("cancel_effective_local_ts_us must be >= cancel_requested_local_ts_us")
 
     @property
     def filled_qty(self) -> float:
@@ -563,6 +597,15 @@ class ActiveOrder:
     @property
     def is_live(self) -> bool:
         return self.status in (OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED)
+
+    def is_fillable_at(self, local_ts_us: int) -> bool:
+        _require_positive_int(local_ts_us, "local_ts_us")
+        if not self.is_live:
+            return False
+        effective = self.effective_local_ts_us or self.created_local_ts_us
+        if local_ts_us < effective:
+            return False
+        return self.cancel_effective_local_ts_us == 0 or local_ts_us < self.cancel_effective_local_ts_us
 
 
 @dataclass(frozen=True, slots=True)
@@ -738,6 +781,7 @@ __all__ = [
     "FillReason",
     "RewardMode",
     "ActionMode",
+    "LatencyConfig",
     "SymbolSpec",
     "L2Update",
     "L2UpdateBatch",

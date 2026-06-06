@@ -342,7 +342,7 @@ def compute_ppo_loss(
     )
 
     with torch.no_grad():
-        approx_kl = (old_log_probs - new_log_probs).mean()
+        approx_kl = ((ratio - 1.0) - log_ratio).mean()
         clip_fraction = (
             ((ratio - 1.0).abs() > config.clip_range).to(observations.dtype).mean()
         )
@@ -416,7 +416,7 @@ def update_ppo(
             )
 
             optimizer.zero_grad(set_to_none=True)
-            getattr(loss.total_loss, "back" + "ward")()
+            loss.total_loss.backward()
             if config.max_grad_norm is not None:
                 grad_norm_tensor = nn.utils.clip_grad_norm_(
                     policy.parameters(),

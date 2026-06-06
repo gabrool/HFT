@@ -12,9 +12,9 @@ from mmrt.execution.contracts import ActionSpec, BookTop, QuoteIntent, SymbolSpe
 
 __all__ = [
     "QuoteGeometryConfig",
-    "ContinuousQuoteAction",
+    "QuoteAction",
     "QuoteGeometryResult",
-    "raw_distance_to_ticks",
+    "raw_price_to_index",
     "raw_size_to_qty",
     "continuous_action_to_quote",
 ]
@@ -72,13 +72,13 @@ def _sigmoid(x: float) -> float:
 class QuoteGeometryConfig:
     """Configuration for shaping continuous actions into quote intents."""
 
-    min_distance_ticks: int = 1
+    post_only_gap_ticks: int = 1
     default_order_qty: float = 0.001
     max_inventory_abs_qty: float | None = None
     max_position_notional: float | None = None
 
     def __post_init__(self) -> None:
-        _require_positive_int(self.min_distance_ticks, "min_distance_ticks")
+        _require_positive_int(self.post_only_gap_ticks, "post_only_gap_ticks")
         object.__setattr__(
             self,
             "default_order_qty",
@@ -99,25 +99,22 @@ class QuoteGeometryConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ContinuousQuoteAction:
-    """Continuous latent action emitted by a future policy."""
+class QuoteAction:
+    """Hybrid quote action: Bernoulli enable flags plus continuous price/size raw values."""
 
-    bid_enable_logit: float
-    ask_enable_logit: float
-    bid_distance_raw: float
-    ask_distance_raw: float
+    bid_enabled: bool
+    ask_enabled: bool
+    bid_price_raw: float
+    ask_price_raw: float
     bid_size_raw: float
     ask_size_raw: float
 
     def __post_init__(self) -> None:
-        for name in (
-            "bid_enable_logit",
-            "ask_enable_logit",
-            "bid_distance_raw",
-            "ask_distance_raw",
-            "bid_size_raw",
-            "ask_size_raw",
-        ):
+        if not isinstance(self.bid_enabled, bool):
+            raise ValueError("bid_enabled must be bool")
+        if not isinstance(self.ask_enabled, bool):
+            raise ValueError("ask_enabled must be bool")
+        for name in ("bid_price_raw", "ask_price_raw", "bid_size_raw", "ask_size_raw"):
             object.__setattr__(self, name, _require_finite_float(getattr(self, name), name))
 
 
@@ -151,18 +148,28 @@ def _disabled_result(bid_reason: str, ask_reason: str) -> QuoteGeometryResult:
     )
 
 
-def raw_distance_to_ticks(raw: float, *, max_distance_ticks: int, min_distance_ticks: int = 1) -> int:
-    """Map an unconstrained finite raw distance to bounded integer ticks."""
-
+def _map_raw_to_tick(raw: float, low: int, high: int, *, reverse: bool = False) -> int:
     raw = _require_finite_float(raw, "raw")
-    _require_positive_int(max_distance_ticks, "max_distance_ticks")
-    _require_positive_int(min_distance_ticks, "min_distance_ticks")
-    if min_distance_ticks > max_distance_ticks:
-        raise ValueError("min_distance_ticks must be <= max_distance_ticks")
-
+    _require_positive_int(low, "low")
+    _require_positive_int(high, "high")
+    if low > high:
+        raise ValueError("low must be <= high")
     unit = _sigmoid(raw)
-    ticks = min_distance_ticks + int(math.floor(unit * (max_distance_ticks - min_distance_ticks + 1)))
-    return min(ticks, max_distance_ticks)
+    idx = int(math.floor(unit * (high - low + 1)))
+    idx = min(idx, high - low)
+    return high - idx if reverse else low + idx
+
+
+def raw_bid_price_to_tick(raw: float, *, book_top: BookTop, action_spec: ActionSpec, config: QuoteGeometryConfig) -> int:
+    bid_low = max(1, book_top.best_bid_tick - action_spec.max_distance_ticks + 1)
+    bid_high = book_top.best_ask_tick - config.post_only_gap_ticks
+    return _map_raw_to_tick(raw, bid_low, bid_high)
+
+
+def raw_ask_price_to_tick(raw: float, *, book_top: BookTop, action_spec: ActionSpec, config: QuoteGeometryConfig) -> int:
+    ask_low = book_top.best_bid_tick + config.post_only_gap_ticks
+    ask_high = book_top.best_ask_tick + action_spec.max_distance_ticks - 1
+    return _map_raw_to_tick(raw, ask_low, ask_high, reverse=True)
 
 
 def raw_size_to_qty(
@@ -184,10 +191,15 @@ def raw_size_to_qty(
     if max_qty < symbol_spec.min_qty:
         return 0.0
 
-    lo = max(symbol_spec.min_qty, min(default_order_qty, max_qty))
+    lo = symbol_spec.min_qty
     hi = max_qty
-    unit = _sigmoid(raw)
-    target_qty = min(lo + unit * (hi - lo), max_qty)
+    if hi == lo:
+        return symbol_spec.round_qty_down(hi)
+    default = min(max(default_order_qty, lo), hi)
+    default_unit = min(max((default - lo) / (hi - lo), 1e-12), 1.0 - 1e-12)
+    shift = math.log(default_unit / (1.0 - default_unit))
+    unit = _sigmoid(raw + shift)
+    target_qty = lo + unit * (hi - lo)
     qty = symbol_spec.round_qty_down(target_qty)
     if qty > max_qty:
         qty = symbol_spec.round_qty_down(max_qty)
@@ -198,7 +210,7 @@ def raw_size_to_qty(
 
 def continuous_action_to_quote(
     *,
-    action: ContinuousQuoteAction,
+    action: QuoteAction,
     book_top: BookTop | None,
     symbol_spec: SymbolSpec,
     action_spec: ActionSpec,
@@ -207,8 +219,8 @@ def continuous_action_to_quote(
 ) -> QuoteGeometryResult:
     """Convert a continuous quote action into a validated maker-safe QuoteIntent."""
 
-    if not isinstance(action, ContinuousQuoteAction):
-        raise ValueError("action must be ContinuousQuoteAction")
+    if not isinstance(action, QuoteAction):
+        raise ValueError("action must be QuoteAction")
     if book_top is not None and not isinstance(book_top, BookTop):
         raise ValueError("book_top must be BookTop or None")
     if not isinstance(symbol_spec, SymbolSpec):
@@ -222,19 +234,15 @@ def continuous_action_to_quote(
     if book_top is None:
         return _disabled_result(_REASON_MISSING_BOOK_TOP, _REASON_MISSING_BOOK_TOP)
 
-    bid_distance_ticks = raw_distance_to_ticks(
-        action.bid_distance_raw,
-        max_distance_ticks=action_spec.max_distance_ticks,
-        min_distance_ticks=config.min_distance_ticks,
-    )
-    ask_distance_ticks = raw_distance_to_ticks(
-        action.ask_distance_raw,
-        max_distance_ticks=action_spec.max_distance_ticks,
-        min_distance_ticks=config.min_distance_ticks,
-    )
+    bid_low = max(1, book_top.best_bid_tick - action_spec.max_distance_ticks + 1)
+    bid_high = book_top.best_ask_tick - config.post_only_gap_ticks
+    ask_low = book_top.best_bid_tick + config.post_only_gap_ticks
+    ask_high = book_top.best_ask_tick + action_spec.max_distance_ticks - 1
+    bid_distance_ticks = 0
+    ask_distance_ticks = 0
 
-    bid_enabled = action.bid_enable_logit > 0
-    ask_enabled = action.ask_enable_logit > 0
+    bid_enabled = action.bid_enabled
+    ask_enabled = action.ask_enabled
     bid_reason = ""
     ask_reason = ""
 
@@ -262,10 +270,15 @@ def continuous_action_to_quote(
             max_order_qty=action_spec.max_order_qty,
             default_order_qty=config.default_order_qty,
         )
-        bid_price_tick = book_top.best_bid_tick - bid_distance_ticks + 1
-        max_bid_tick = book_top.best_ask_tick - config.min_distance_ticks
-        bid_price_tick = min(bid_price_tick, max_bid_tick)
-        if bid_price_tick <= 0:
+        if bid_low > bid_high:
+            bid_enabled = False
+            bid_reason = _REASON_INVALID_GEOMETRY
+        else:
+            bid_price_tick = raw_bid_price_to_tick(action.bid_price_raw, book_top=book_top, action_spec=action_spec, config=config)
+            bid_distance_ticks = max(0, book_top.best_bid_tick - bid_price_tick + 1)
+        if not bid_enabled:
+            pass
+        elif bid_price_tick <= 0 or bid_price_tick >= book_top.best_ask_tick:
             bid_enabled = False
             bid_reason = _REASON_INVALID_GEOMETRY
         elif bid_qty <= 0:
@@ -285,10 +298,15 @@ def continuous_action_to_quote(
             max_order_qty=action_spec.max_order_qty,
             default_order_qty=config.default_order_qty,
         )
-        ask_price_tick = book_top.best_ask_tick + ask_distance_ticks - 1
-        min_ask_tick = book_top.best_bid_tick + config.min_distance_ticks
-        ask_price_tick = max(ask_price_tick, min_ask_tick)
-        if ask_price_tick <= 0:
+        if ask_low > ask_high:
+            ask_enabled = False
+            ask_reason = _REASON_INVALID_GEOMETRY
+        else:
+            ask_price_tick = raw_ask_price_to_tick(action.ask_price_raw, book_top=book_top, action_spec=action_spec, config=config)
+            ask_distance_ticks = max(0, ask_price_tick - book_top.best_ask_tick + 1)
+        if not ask_enabled:
+            pass
+        elif ask_price_tick <= 0 or ask_price_tick <= book_top.best_bid_tick:
             ask_enabled = False
             ask_reason = _REASON_INVALID_GEOMETRY
         elif ask_qty <= 0:

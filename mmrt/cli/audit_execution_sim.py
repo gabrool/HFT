@@ -21,7 +21,7 @@ from mmrt.execution.linear_signal import (
 )
 from mmrt.execution.metrics import ExecutionMetricAccumulator
 from mmrt.execution.queue_model import QueueModelConfig
-from mmrt.execution.quote_geometry import ContinuousQuoteAction, QuoteGeometryConfig
+from mmrt.execution.quote_geometry import QuoteAction, QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
 
 AUDIT_POLICIES = (
@@ -33,24 +33,24 @@ AUDIT_POLICIES = (
 )
 
 
-def _policy_action(policy: str, step_index: int, *, action_size_raw: float) -> ContinuousQuoteAction:
+def _policy_action(policy: str, step_index: int, *, action_size_raw: float) -> QuoteAction:
     if policy not in AUDIT_POLICIES:
         raise ValueError(f"policy must be one of {AUDIT_POLICIES}")
     if policy == "disabled":
-        bid_logit, ask_logit = -1.0, -1.0
+        bid_enabled, ask_enabled = False, False
     elif policy == "bid":
-        bid_logit, ask_logit = 1.0, -1.0
+        bid_enabled, ask_enabled = True, False
     elif policy == "ask":
-        bid_logit, ask_logit = -1.0, 1.0
+        bid_enabled, ask_enabled = False, True
     elif policy == "two_sided":
-        bid_logit, ask_logit = 1.0, 1.0
+        bid_enabled, ask_enabled = True, True
     else:
-        bid_logit, ask_logit = (1.0, -1.0) if step_index % 2 == 0 else (-1.0, 1.0)
-    return ContinuousQuoteAction(
-        bid_enable_logit=bid_logit,
-        ask_enable_logit=ask_logit,
-        bid_distance_raw=0.0,
-        ask_distance_raw=0.0,
+        bid_enabled, ask_enabled = (True, False) if step_index % 2 == 0 else (False, True)
+    return QuoteAction(
+        bid_enabled=bid_enabled,
+        ask_enabled=ask_enabled,
+        bid_price_raw=0.0,
+        ask_price_raw=0.0,
         bid_size_raw=action_size_raw,
         ask_size_raw=action_size_raw,
     )
@@ -177,7 +177,7 @@ class ExecutionSimAuditConfig:
     trade_at_level_weight: float = 1.0
     unknown_level_queue_ahead_qty: float = 0.0
 
-    maker_fee_bps: float = 0.0
+    maker_fee_bps: float = -0.5
 
     inventory_penalty_bps: float = 0.0
     turnover_penalty_bps: float = 0.0
@@ -208,7 +208,7 @@ class ExecutionSimAuditConfig:
         _require_probability(self.l2_decrease_weight, "l2_decrease_weight")
         _require_probability(self.trade_at_level_weight, "trade_at_level_weight")
         _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty")
-        _require_nonnegative_float(self.maker_fee_bps, "maker_fee_bps")
+        _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
         _require_nonnegative_float(self.inventory_penalty_bps, "inventory_penalty_bps")
         _require_nonnegative_float(self.turnover_penalty_bps, "turnover_penalty_bps")
         _require_nonnegative_float(self.cancel_penalty, "cancel_penalty")
@@ -260,7 +260,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
             max_order_qty=config.max_order_qty,
         ),
         quote_geometry_config=QuoteGeometryConfig(
-            min_distance_ticks=config.min_distance_ticks,
+            post_only_gap_ticks=config.min_distance_ticks,
             default_order_qty=config.default_order_qty,
         ),
         fill_simulator_config=FillSimulatorConfig(
@@ -349,7 +349,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l2-decrease-weight", type=float, default=1.0)
     parser.add_argument("--trade-at-level-weight", type=float, default=1.0)
     parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=0.0)
-    parser.add_argument("--maker-fee-bps", type=float, default=0.0)
+    parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
     parser.add_argument("--inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--turnover-penalty-bps", type=float, default=0.0)
     parser.add_argument("--cancel-penalty", type=float, default=0.0)

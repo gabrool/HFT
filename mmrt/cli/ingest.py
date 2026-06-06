@@ -304,10 +304,10 @@ def _run_causal_ingest_rows(rows: Iterable[Mapping[str, Any]], writer: wr.Decisi
             # Causality contract: observe current book price first, mature older labels,
             # then create/store current decision transformed at decision time.
             mid = engine.book_state.current_summary().mid
-            _write_matured_labels(label_builder.observe_price_local(snap.local_ts_us, mid), pending_decisions, writer, counters)
+            _write_matured_labels(label_builder.observe_price_local(snap.local_ts_us, snap.event_seq, mid), pending_decisions, writer, counters)
             if decision is not None:
                 transformed = transformer.transform_one_local(decision.local_ts_us, decision.feature_vector)
-                label_builder.on_decision_local(decision.local_ts_us)
+                label_builder.on_decision_local(decision.local_ts_us, decision.event_seq)
                 pending_decisions[decision.local_ts_us] = PendingDecision(decision_index=decision.decision_index, ts_us=decision.ts_us, local_ts_us=decision.local_ts_us, event_seq=decision.event_seq, raw_mid=decision.raw_mid, feature_values=tuple(float(x) for x in transformed))
                 counters.decisions_emitted += 1
 

@@ -18,6 +18,7 @@ from mmrt.execution.contracts import (
     ActionSpec,
     ActiveOrder,
     BookTop,
+    LatencyConfig,
     ExecutionStepResult,
     Fill,
     OrderSide,
@@ -32,9 +33,10 @@ from mmrt.execution.execution_tape import (
 )
 from mmrt.execution.fill_sim import (
     FillSimulatorConfig,
-    replace_orders_from_quote,
+    finalize_effective_cancels,
     simulate_l2_level_update,
     simulate_trade_event,
+    sync_orders_to_quote,
 )
 from mmrt.execution.contracts import LinearSignal
 from mmrt.execution.linear_signal import LinearSignalArtifact, linear_signal_at
@@ -47,7 +49,7 @@ from mmrt.execution.obs_builder import (
 from mmrt.execution.obs_schema import ObservationSchema, default_observation_schema
 from mmrt.execution.queue_model import QueueModelConfig, QueueModelMode, estimate_initial_queue_ahead
 from mmrt.execution.quote_geometry import (
-    ContinuousQuoteAction,
+    QuoteAction,
     QuoteGeometryConfig,
     continuous_action_to_quote,
 )
@@ -108,9 +110,8 @@ class ExecutionEnvConfig:
     decision_interval_us: int = 500_000
     action_spec: ActionSpec = field(default_factory=ActionSpec)
     quote_geometry_config: QuoteGeometryConfig = field(default_factory=QuoteGeometryConfig)
-    fill_simulator_config: FillSimulatorConfig = field(
-        default_factory=lambda: FillSimulatorConfig(queue_model=QueueModelConfig(mode=QueueModelMode.BALANCED))
-    )
+    fill_simulator_config: FillSimulatorConfig = field(default_factory=FillSimulatorConfig)
+    latency_config: LatencyConfig = field(default_factory=LatencyConfig)
     reward_config: RewardConfig = field(default_factory=RewardConfig)
     observation_schema: ObservationSchema = field(default_factory=default_observation_schema)
     observation_builder_config: ObservationBuilderConfig = field(default_factory=ObservationBuilderConfig)
@@ -125,6 +126,8 @@ class ExecutionEnvConfig:
             raise ValueError("quote_geometry_config must be QuoteGeometryConfig")
         if not isinstance(self.fill_simulator_config, FillSimulatorConfig):
             raise ValueError("fill_simulator_config must be FillSimulatorConfig")
+        if not isinstance(self.latency_config, LatencyConfig):
+            raise ValueError("latency_config must be LatencyConfig")
         if not isinstance(self.reward_config, RewardConfig):
             raise ValueError("reward_config must be RewardConfig")
         if not isinstance(self.observation_schema, ObservationSchema):
@@ -194,7 +197,7 @@ class _EnvState:
     truncated: bool
 
 
-def action_array_to_continuous_action(values: Sequence[float] | np.ndarray) -> ContinuousQuoteAction:
+def action_array_to_continuous_action(values: Sequence[float] | np.ndarray) -> QuoteAction:
     if isinstance(values, (str, bytes)):
         raise ValueError("values must be a sequence or ndarray of six finite numeric values")
     try:
@@ -204,11 +207,11 @@ def action_array_to_continuous_action(values: Sequence[float] | np.ndarray) -> C
     if len(seq) != 6:
         raise ValueError("values must contain exactly 6 values")
     cleaned = tuple(_require_finite_float(value, f"values[{i}]") for i, value in enumerate(seq))
-    return ContinuousQuoteAction(
-        bid_enable_logit=cleaned[0],
-        ask_enable_logit=cleaned[1],
-        bid_distance_raw=cleaned[2],
-        ask_distance_raw=cleaned[3],
+    return QuoteAction(
+        bid_enabled=cleaned[0] >= 0.5,
+        ask_enabled=cleaned[1] >= 0.5,
+        bid_price_raw=cleaned[2],
+        ask_price_raw=cleaned[3],
         bid_size_raw=cleaned[4],
         ask_size_raw=cleaned[5],
     )
@@ -294,7 +297,7 @@ class ExecutionEnv:
             },
         )
 
-    def step(self, action: ContinuousQuoteAction | Sequence[float] | np.ndarray) -> ExecutionEnvStep:
+    def step(self, action: QuoteAction | Sequence[float] | np.ndarray) -> ExecutionEnvStep:
         state = self._require_state()
         if state.done or state.truncated:
             raise RuntimeError("environment is done; call reset() before step()")
@@ -318,25 +321,19 @@ class ExecutionEnv:
         )
         quote = quote_result.quote
 
-        bid_queue_ahead_qty = 0.0
-        if quote.bid_enabled:
-            bid_queue_ahead_qty = estimate_initial_queue_ahead(
-                self._level_qty(book_ptr=state.current_book_ptr, side=OrderSide.BUY, price_tick=quote.bid_price_tick),
-                config=self.config.fill_simulator_config.queue_model,
-            )
-        ask_queue_ahead_qty = 0.0
-        if quote.ask_enabled:
-            ask_queue_ahead_qty = estimate_initial_queue_ahead(
-                self._level_qty(book_ptr=state.current_book_ptr, side=OrderSide.SELL, price_tick=quote.ask_price_tick),
-                config=self.config.fill_simulator_config.queue_model,
-            )
+        bid_queue_ahead_qty = self._queue_ahead_for_new_order(OrderSide.BUY, quote.bid_price_tick, state.current_book_ptr) if quote.bid_enabled else 0.0
+        ask_queue_ahead_qty = self._queue_ahead_for_new_order(OrderSide.SELL, quote.ask_price_tick, state.current_book_ptr) if quote.ask_enabled else 0.0
 
-        cancel_count = len(state.live_orders)
-        replacement_orders = replace_orders_from_quote(
+        decision_ts = previous_book_top.local_ts_us
+        order_effective_ts = decision_ts + self.config.latency_config.order_activation_delay_us
+        cancel_effective_ts = decision_ts + self.config.latency_config.cancel_effective_delay_us
+        replacement_orders, cancel_count = sync_orders_to_quote(
             state.live_orders,
             quote,
             next_order_id=state.next_order_id,
-            local_ts_us=previous_book_top.local_ts_us,
+            decision_local_ts_us=decision_ts,
+            order_effective_local_ts_us=order_effective_ts,
+            cancel_effective_local_ts_us=cancel_effective_ts,
             bid_queue_ahead_qty=bid_queue_ahead_qty,
             ask_queue_ahead_qty=ask_queue_ahead_qty,
         )
@@ -358,6 +355,7 @@ class ExecutionEnv:
 
             event_code = int(events[next_event_index]["event_type_code"])
             event_book_ptr = int(events[next_event_index]["book_ptr"])
+            state.live_orders = _live_orders_tuple(finalize_effective_cancels(state.live_orders, local_ts_us=event_local))
             fills.extend(self._process_event(next_event_index))
             if event_code == EVENT_TYPE_CODE_L2_BATCH and event_book_ptr >= 0:
                 processed_valid_l2 = processed_valid_l2 or self._book_top_from_ptr(event_book_ptr) is not None
@@ -410,6 +408,10 @@ class ExecutionEnv:
             "current_equity": reward_step.current_equity,
             "peak_equity": reward_step.peak_equity,
             "turnover_notional": reward_step.turnover_notional,
+            "reward_scale": self.config.reward_config.reward_scale,
+            "decision_compute_latency_us": self.config.latency_config.decision_compute_latency_us,
+            "order_entry_latency_us": self.config.latency_config.order_entry_latency_us,
+            "cancel_latency_us": self.config.latency_config.cancel_latency_us,
         }
         execution = ExecutionStepResult(
             reward=reward_step.reward,
@@ -422,7 +424,7 @@ class ExecutionEnv:
         observation = self._build_observation()
         return ExecutionEnvStep(
             observation=observation,
-            reward=reward_step.reward.total_reward,
+            reward=reward_step.reward.total_reward * self.config.reward_config.reward_scale,
             execution=execution,
         )
 
@@ -548,6 +550,27 @@ class ExecutionEnv:
             source_row=source_row,
         )
 
+    def _queue_ahead_for_new_order(self, side: OrderSide, price_tick: int, book_ptr: int) -> float:
+        top = self._book_top_from_ptr(book_ptr)
+        if top is not None:
+            if side == OrderSide.BUY and top.best_bid_tick < price_tick < top.best_ask_tick:
+                return 0.0
+            if side == OrderSide.SELL and top.best_bid_tick < price_tick < top.best_ask_tick:
+                return 0.0
+        level = self._level_qty(book_ptr=book_ptr, side=side, price_tick=price_tick)
+        if level is not None:
+            return estimate_initial_queue_ahead(level, config=self.config.fill_simulator_config.queue_model)
+        if self._price_within_known_depth(book_ptr=book_ptr, side=side, price_tick=price_tick):
+            return 0.0
+        return self.config.fill_simulator_config.queue_model.unknown_level_queue_ahead_qty
+
+    def _price_within_known_depth(self, *, book_ptr: int, side: OrderSide, price_tick: int) -> bool:
+        ticks = self.tape.arrays.book_bid_ticks[book_ptr] if side == OrderSide.BUY else self.tape.arrays.book_ask_ticks[book_ptr]
+        active = [int(t) for t in ticks if int(t) > 0]
+        if not active:
+            return False
+        return min(active) <= price_tick <= max(active)
+
     def _level_qty(self, *, book_ptr: int, side: OrderSide, price_tick: int) -> float | None:
         if side == OrderSide.BUY:
             ticks = self.tape.arrays.book_bid_ticks[book_ptr]
@@ -608,8 +631,8 @@ def _require_tape(value: Any) -> ExecutionTape:
     return value
 
 
-def _coerce_action(value: ContinuousQuoteAction | Sequence[float] | np.ndarray) -> ContinuousQuoteAction:
-    if isinstance(value, ContinuousQuoteAction):
+def _coerce_action(value: QuoteAction | Sequence[float] | np.ndarray) -> QuoteAction:
+    if isinstance(value, QuoteAction):
         return value
     return action_array_to_continuous_action(value)
 

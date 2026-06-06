@@ -177,7 +177,7 @@ class ExecutionPolicyEvaluationCLIConfig:
     trade_at_level_weight: float = 1.0
     unknown_level_queue_ahead_qty: float = 0.0
 
-    maker_fee_bps: float = 0.0
+    maker_fee_bps: float = -0.5
 
     inventory_penalty_bps: float = 0.0
     turnover_penalty_bps: float = 0.0
@@ -218,7 +218,7 @@ class ExecutionPolicyEvaluationCLIConfig:
             self.unknown_level_queue_ahead_qty,
             "unknown_level_queue_ahead_qty",
         )
-        _require_nonnegative_float(self.maker_fee_bps, "maker_fee_bps")
+        _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
         _require_nonnegative_float(self.inventory_penalty_bps, "inventory_penalty_bps")
         _require_nonnegative_float(self.turnover_penalty_bps, "turnover_penalty_bps")
         _require_nonnegative_float(self.cancel_penalty, "cancel_penalty")
@@ -285,7 +285,7 @@ def _env_config_from_cli_config(
             max_order_qty=config.max_order_qty,
         ),
         quote_geometry_config=QuoteGeometryConfig(
-            min_distance_ticks=config.min_distance_ticks,
+            post_only_gap_ticks=config.min_distance_ticks,
             default_order_qty=config.default_order_qty,
         ),
         fill_simulator_config=FillSimulatorConfig(
@@ -344,7 +344,7 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
         raw.get("unknown_level_queue_ahead_qty", 0.0),
         "unknown_level_queue_ahead_qty",
     )
-    maker_fee_bps = _require_nonnegative_float(raw.get("maker_fee_bps", 0.0), "maker_fee_bps")
+    maker_fee_bps = _require_nonnegative_float(raw.get("maker_fee_bps", -0.5), "maker_fee_bps")
     inventory_penalty_bps = _require_nonnegative_float(
         raw.get("inventory_penalty_bps", 0.0),
         "inventory_penalty_bps",
@@ -695,7 +695,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l2-decrease-weight", type=float, default=1.0)
     parser.add_argument("--trade-at-level-weight", type=float, default=1.0)
     parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=0.0)
-    parser.add_argument("--maker-fee-bps", type=float, default=0.0)
+    parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
     parser.add_argument("--inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--turnover-penalty-bps", type=float, default=0.0)
     parser.add_argument("--cancel-penalty", type=float, default=0.0)

@@ -34,7 +34,7 @@ from mmrt.execution.linear_signal import (
 )
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.queue_model import QueueModelConfig, QueueModelMode
-from mmrt.execution.quote_geometry import ContinuousQuoteAction, QuoteGeometryConfig
+from mmrt.execution.quote_geometry import QuoteAction, QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
 
 
@@ -188,34 +188,34 @@ def _linear_signals(tape, n_rows: int = 16, *, start_event_index: int = 0) -> Li
     )
 
 
-def _bid_only_action() -> ContinuousQuoteAction:
-    return ContinuousQuoteAction(
-        bid_enable_logit=1.0,
-        ask_enable_logit=-1.0,
-        bid_distance_raw=0.0,
-        ask_distance_raw=0.0,
+def _bid_only_action() -> QuoteAction:
+    return QuoteAction(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_raw=0.0,
+        ask_price_raw=0.0,
         bid_size_raw=100.0,
         ask_size_raw=0.0,
     )
 
 
-def _ask_only_action() -> ContinuousQuoteAction:
-    return ContinuousQuoteAction(
-        bid_enable_logit=-1.0,
-        ask_enable_logit=1.0,
-        bid_distance_raw=0.0,
-        ask_distance_raw=0.0,
+def _ask_only_action() -> QuoteAction:
+    return QuoteAction(
+        bid_enabled=False,
+        ask_enabled=True,
+        bid_price_raw=0.0,
+        ask_price_raw=0.0,
         bid_size_raw=0.0,
         ask_size_raw=100.0,
     )
 
 
-def _disabled_action() -> ContinuousQuoteAction:
-    return ContinuousQuoteAction(
-        bid_enable_logit=-1.0,
-        ask_enable_logit=-1.0,
-        bid_distance_raw=0.0,
-        ask_distance_raw=0.0,
+def _disabled_action() -> QuoteAction:
+    return QuoteAction(
+        bid_enabled=False,
+        ask_enabled=False,
+        bid_price_raw=0.0,
+        ask_price_raw=0.0,
         bid_size_raw=0.0,
         ask_size_raw=0.0,
     )
@@ -224,9 +224,9 @@ def _disabled_action() -> ContinuousQuoteAction:
 def test_action_array_to_continuous_action():
     action = action_array_to_continuous_action(np.array([1, -1, 0, 0, 2, -2], dtype=np.float32))
 
-    assert isinstance(action, ContinuousQuoteAction)
-    assert action.bid_enable_logit == pytest.approx(1.0)
-    assert action.ask_enable_logit == pytest.approx(-1.0)
+    assert isinstance(action, QuoteAction)
+    assert action.bid_enabled is True
+    assert action.ask_enabled is False
 
     with pytest.raises(ValueError):
         action_array_to_continuous_action([1.0, 2.0])

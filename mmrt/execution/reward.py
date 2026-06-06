@@ -123,6 +123,7 @@ class RewardConfig:
     cancel_penalty: float = 0.0
     drawdown_penalty_rate: float = 0.0
     terminal_inventory_penalty_bps: float = 0.0
+    reward_scale: float = 1.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -131,6 +132,7 @@ class RewardConfig:
             "cancel_penalty",
             "drawdown_penalty_rate",
             "terminal_inventory_penalty_bps",
+            "reward_scale",
         ):
             object.__setattr__(self, name, _require_nonnegative_float(getattr(self, name), name))
 

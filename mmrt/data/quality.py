@@ -188,8 +188,8 @@ def analyze_normalized_lazyframe(
             pl.col(RAW_SOURCE_ROW).is_null().sum().alias("null_raw_source_row_count"),
             ((pl.col(RAW_SOURCE_ROW) < 0) & pl.col(RAW_SOURCE_ROW).is_not_null()).sum().alias("negative_raw_source_row_count"),
             (
-                pl.col(RAW_SOURCE_ROW).diff().is_not_null()
-                & (pl.col(RAW_SOURCE_ROW).diff() != 1)
+                pl.col(RAW_SOURCE_ROW).diff().over(SOURCE_FILE).is_not_null()
+                & (pl.col(RAW_SOURCE_ROW).diff().over(SOURCE_FILE) != 1)
             ).sum().alias("raw_source_row_not_contiguous"),
         ]
     if has_source_data_type:
@@ -216,13 +216,13 @@ def analyze_normalized_lazyframe(
     if has_local_ts and int(common["nonpositive_local_ts_count"]) > 0:
         issues.append(_issue("nonpositive_local_ts_us", QualitySeverity.ERROR, int(common["nonpositive_local_ts_count"]), "local_ts_us must be positive integer microseconds"))
     if has_local_ts and int(common["local_ts_us_decreases"]) > 0:
-        issues.append(_issue("local_ts_us_decreases", QualitySeverity.ERROR, int(common["local_ts_us_decreases"]), "local_ts_us decreases within the normalized file"))
+        issues.append(_issue("local_ts_us_decreases", QualitySeverity.ERROR, int(common["local_ts_us_decreases"]), "local_ts_us must be nondecreasing in stored row order"))
     if has_raw_source_row and int(common["null_raw_source_row_count"]) > 0:
         issues.append(_issue("null_raw_source_row", QualitySeverity.ERROR, int(common["null_raw_source_row_count"]), "raw_source_row contains null values"))
     if has_raw_source_row and int(common["negative_raw_source_row_count"]) > 0:
         issues.append(_issue("negative_raw_source_row", QualitySeverity.ERROR, int(common["negative_raw_source_row_count"]), "raw_source_row must be non-negative"))
     if has_raw_source_row and int(common["raw_source_row_not_contiguous"]) > 0:
-        issues.append(_issue("raw_source_row_not_contiguous", QualitySeverity.ERROR, int(common["raw_source_row_not_contiguous"]), "raw_source_row should preserve contiguous input row order"))
+        issues.append(_issue("raw_source_row_not_contiguous", QualitySeverity.ERROR, int(common["raw_source_row_not_contiguous"]), "raw_source_row should preserve source-file row order"))
 
     if SOURCE_FILE in actual_set and RAW_SOURCE_ROW in actual_set:
         count = int(lf.select(pl.struct([SOURCE_FILE, RAW_SOURCE_ROW]).is_duplicated().sum().alias("c")).collect().item())

@@ -90,7 +90,6 @@ FILLS_FIELDS = (
 
 TIME_FIELDS = (
     "local_time_since_start_s",
-    "event_progress",
     "time_since_last_event_ms",
 )
 

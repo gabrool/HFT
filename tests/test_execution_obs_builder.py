@@ -116,7 +116,7 @@ def _fill(
 def test_default_schema_fields_and_groups():
     schema = default_observation_schema()
 
-    assert schema.dim == 53
+    assert schema.dim == 52
     assert schema.field_names == DEFAULT_OBSERVATION_FIELDS
     assert schema.index("spread_ticks") == 0
     assert schema.has_field("linear_p_no_move")
@@ -422,7 +422,7 @@ def test_time_context_fields():
     )
 
     assert obs[schema.index("local_time_since_start_s")] == pytest.approx(1.0)
-    assert obs[schema.index("event_progress")] == pytest.approx(0.5)
+    assert "event_progress" not in schema.field_names
     assert obs[schema.index("time_since_last_event_ms")] == pytest.approx(10.0)
 
 

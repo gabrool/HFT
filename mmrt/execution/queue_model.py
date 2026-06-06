@@ -107,9 +107,9 @@ def _require_trade(trade: Any) -> TradePrint:
 @dataclass(frozen=True, slots=True)
 class QueueModelConfig:
     mode: QueueModelMode = QueueModelMode.CONSERVATIVE
-    l2_decrease_weight: float = 0.5
-    trade_at_level_weight: float = 1.0
-    unknown_level_queue_ahead_qty: float = 0.0
+    l2_decrease_weight: float = 0.25
+    trade_at_level_weight: float = 0.5
+    unknown_level_queue_ahead_qty: float = 1_000_000_000.0
     qty_epsilon: float = 1e-12
 
     def __post_init__(self) -> None:

@@ -22,6 +22,7 @@ from mmrt.execution.queue_model import QueueModelConfig, QueueModelUpdate, updat
 
 
 _INF = float("inf")
+DEFAULT_MAKER_FEE_BPS = -0.5
 
 
 def _require_finite_float(value: float, name: str) -> float:
@@ -43,7 +44,7 @@ def _require_positive_float(value: float, name: str) -> float:
 @dataclass(frozen=True, slots=True)
 class FillSimulatorConfig:
     queue_model: QueueModelConfig = QueueModelConfig()
-    maker_fee_bps: float = 0.0
+    maker_fee_bps: float = -0.5
     qty_epsilon: float = 1e-12
 
     def __post_init__(self) -> None:
@@ -77,12 +78,16 @@ def place_orders_from_quote(
     local_ts_us: int,
     bid_queue_ahead_qty: float = 0.0,
     ask_queue_ahead_qty: float = 0.0,
+    effective_local_ts_us: int = 0,
 ) -> tuple[ActiveOrder, ...]:
     quote = _require_quote(quote)
     next_order_id = _require_nonnegative_int(next_order_id, "next_order_id")
     local_ts_us = _require_positive_int(local_ts_us, "local_ts_us")
     bid_queue_ahead_qty = _require_nonnegative_float(bid_queue_ahead_qty, "bid_queue_ahead_qty")
     ask_queue_ahead_qty = _require_nonnegative_float(ask_queue_ahead_qty, "ask_queue_ahead_qty")
+    effective_local_ts_us = _require_nonnegative_int(effective_local_ts_us, "effective_local_ts_us")
+    if effective_local_ts_us and effective_local_ts_us < local_ts_us:
+        raise ValueError("effective_local_ts_us must be >= local_ts_us")
 
     orders: list[ActiveOrder] = []
     if quote.bid_enabled:
@@ -97,6 +102,7 @@ def place_orders_from_quote(
                 status=OrderStatus.ACTIVE,
                 created_local_ts_us=local_ts_us,
                 last_update_local_ts_us=local_ts_us,
+                effective_local_ts_us=effective_local_ts_us,
             )
         )
     if quote.ask_enabled:
@@ -111,12 +117,43 @@ def place_orders_from_quote(
                 status=OrderStatus.ACTIVE,
                 created_local_ts_us=local_ts_us,
                 last_update_local_ts_us=local_ts_us,
+                effective_local_ts_us=effective_local_ts_us,
             )
         )
     return tuple(orders)
 
 
-def cancel_live_orders(
+def request_cancel_live_orders(
+    orders: Sequence[ActiveOrder],
+    *,
+    request_local_ts_us: int,
+    cancel_effective_local_ts_us: int,
+) -> tuple[ActiveOrder, ...]:
+    orders_tuple = _orders_tuple(orders)
+    request_local_ts_us = _require_positive_int(request_local_ts_us, "request_local_ts_us")
+    cancel_effective_local_ts_us = _require_positive_int(cancel_effective_local_ts_us, "cancel_effective_local_ts_us")
+    if cancel_effective_local_ts_us < request_local_ts_us:
+        raise ValueError("cancel_effective_local_ts_us must be >= request_local_ts_us")
+    out: list[ActiveOrder] = []
+    for order in orders_tuple:
+        if not order.is_live:
+            out.append(order)
+            continue
+        _validate_local_ts_for_order(order, request_local_ts_us)
+        effective = order.cancel_effective_local_ts_us
+        if effective and effective <= cancel_effective_local_ts_us:
+            out.append(order)
+            continue
+        out.append(replace(
+            order,
+            cancel_requested_local_ts_us=request_local_ts_us,
+            cancel_effective_local_ts_us=cancel_effective_local_ts_us,
+            last_update_local_ts_us=request_local_ts_us,
+        ))
+    return tuple(out)
+
+
+def finalize_effective_cancels(
     orders: Sequence[ActiveOrder],
     *,
     local_ts_us: int,
@@ -125,11 +162,11 @@ def cancel_live_orders(
     local_ts_us = _require_positive_int(local_ts_us, "local_ts_us")
     out: list[ActiveOrder] = []
     for order in orders_tuple:
-        if not order.is_live:
+        if order.is_live and order.cancel_effective_local_ts_us and order.cancel_effective_local_ts_us <= local_ts_us:
+            _validate_local_ts_for_order(order, local_ts_us)
+            out.append(replace(order, status=OrderStatus.CANCELLED, last_update_local_ts_us=local_ts_us))
+        else:
             out.append(order)
-            continue
-        _validate_local_ts_for_order(order, local_ts_us)
-        out.append(replace(order, status=OrderStatus.CANCELLED, last_update_local_ts_us=local_ts_us))
     return tuple(out)
 
 
@@ -192,7 +229,7 @@ def simulate_trade_event(
     updated_orders: list[ActiveOrder] = []
     fills: list[Fill] = []
     for order in orders_tuple:
-        if not order.is_live:
+        if not order.is_fillable_at(trade.local_ts_us):
             updated_orders.append(order)
             continue
         _validate_local_ts_for_order(order, trade.local_ts_us)
@@ -235,7 +272,7 @@ def simulate_l2_level_update(
     updated_orders: list[ActiveOrder] = []
     fills: list[Fill] = []
     for order in orders_tuple:
-        if not order.is_live or order.side != side or order.price_tick != price_tick:
+        if not order.is_fillable_at(local_ts_us) or order.side != side or order.price_tick != price_tick:
             updated_orders.append(order)
             continue
         _validate_local_ts_for_order(order, local_ts_us)
@@ -258,24 +295,66 @@ def simulate_l2_level_update(
     return FillSimulationResult(orders=tuple(updated_orders), fills=tuple(fills))
 
 
-def replace_orders_from_quote(
+def sync_orders_to_quote(
     existing_orders: Sequence[ActiveOrder],
     quote: QuoteIntent,
     *,
     next_order_id: int,
-    local_ts_us: int,
+    decision_local_ts_us: int,
+    order_effective_local_ts_us: int,
+    cancel_effective_local_ts_us: int,
     bid_queue_ahead_qty: float = 0.0,
     ask_queue_ahead_qty: float = 0.0,
-) -> tuple[ActiveOrder, ...]:
-    cancelled = cancel_live_orders(existing_orders, local_ts_us=local_ts_us)
+) -> tuple[tuple[ActiveOrder, ...], int]:
+    existing = _orders_tuple(existing_orders)
+    quote = _require_quote(quote)
+    next_order_id = _require_nonnegative_int(next_order_id, "next_order_id")
+    decision_local_ts_us = _require_positive_int(decision_local_ts_us, "decision_local_ts_us")
+    order_effective_local_ts_us = _require_positive_int(order_effective_local_ts_us, "order_effective_local_ts_us")
+    cancel_effective_local_ts_us = _require_positive_int(cancel_effective_local_ts_us, "cancel_effective_local_ts_us")
+    if order_effective_local_ts_us < decision_local_ts_us or cancel_effective_local_ts_us < decision_local_ts_us:
+        raise ValueError("effective timestamps must be >= decision_local_ts_us")
+
+    target = {
+        OrderSide.BUY: quote.bid_price_tick if quote.bid_enabled else 0,
+        OrderSide.SELL: quote.ask_price_tick if quote.ask_enabled else 0,
+    }
+    updated: list[ActiveOrder] = []
+    cancel_count = 0
+    preserved: set[OrderSide] = set()
+    for order in existing:
+        if not order.is_live:
+            updated.append(order)
+            continue
+        desired_price = target[order.side]
+        if desired_price == order.price_tick:
+            preserved.add(order.side)
+            updated.append(order)
+        else:
+            cancel_count += 1 if order.cancel_effective_local_ts_us == 0 else 0
+            updated.append(request_cancel_live_orders(
+                (order,),
+                request_local_ts_us=decision_local_ts_us,
+                cancel_effective_local_ts_us=cancel_effective_local_ts_us,
+            )[0])
+
+    new_quote = QuoteIntent(
+        bid_enabled=quote.bid_enabled and OrderSide.BUY not in preserved,
+        ask_enabled=quote.ask_enabled and OrderSide.SELL not in preserved,
+        bid_price_tick=quote.bid_price_tick if quote.bid_enabled and OrderSide.BUY not in preserved else 0,
+        ask_price_tick=quote.ask_price_tick if quote.ask_enabled and OrderSide.SELL not in preserved else 0,
+        bid_qty=quote.bid_qty if quote.bid_enabled and OrderSide.BUY not in preserved else 0.0,
+        ask_qty=quote.ask_qty if quote.ask_enabled and OrderSide.SELL not in preserved else 0.0,
+    )
     new_orders = place_orders_from_quote(
-        quote,
+        new_quote,
         next_order_id=next_order_id,
-        local_ts_us=local_ts_us,
+        local_ts_us=decision_local_ts_us,
         bid_queue_ahead_qty=bid_queue_ahead_qty,
         ask_queue_ahead_qty=ask_queue_ahead_qty,
+        effective_local_ts_us=order_effective_local_ts_us,
     )
-    return cancelled + new_orders
+    return tuple(updated) + new_orders, cancel_count
 
 
 def _apply_queue_update_to_order(
@@ -488,11 +567,13 @@ def _assert_no_duplicate_live_side_price(orders: tuple[ActiveOrder, ...]) -> Non
 
 
 __all__ = [
+    "DEFAULT_MAKER_FEE_BPS",
     "FillSimulatorConfig",
     "FillSimulationResult",
     "place_orders_from_quote",
-    "cancel_live_orders",
-    "replace_orders_from_quote",
+    "request_cancel_live_orders",
+    "finalize_effective_cancels",
+    "sync_orders_to_quote",
     "live_orders",
     "apply_fill_to_order",
     "simulate_trade_event",
