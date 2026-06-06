@@ -91,6 +91,13 @@ def _require_positive_float(value: float, name: str) -> float:
     return value
 
 
+def _require_probability(value: float, name: str) -> float:
+    value = _require_finite_float(value, name)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    return value
+
+
 def _require_nonnegative_float(value: float, name: str) -> float:
     value = _require_finite_float(value, name)
     if value < 0.0:
@@ -235,8 +242,8 @@ class ExecutionPPOTrainCLIConfig:
         _require_positive_int(self.min_distance_ticks, "min_distance_ticks")
         _require_positive_float(self.default_order_qty, "default_order_qty")
         object.__setattr__(self, "queue_mode", _coerce_queue_mode(self.queue_mode))
-        _require_positive_float(self.l2_decrease_weight, "l2_decrease_weight")
-        _require_positive_float(self.trade_at_level_weight, "trade_at_level_weight")
+        _require_probability(self.l2_decrease_weight, "l2_decrease_weight")
+        _require_probability(self.trade_at_level_weight, "trade_at_level_weight")
         _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty")
         _require_nonnegative_float(self.maker_fee_bps, "maker_fee_bps")
         _require_nonnegative_float(self.inventory_penalty_bps, "inventory_penalty_bps")

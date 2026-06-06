@@ -347,6 +347,25 @@ def test_train_execution_ppo_cli_config_parses_hidden_sizes_and_dtype():
     assert cfg.hidden_sizes == ()
 
 
+def test_train_execution_ppo_accepts_zero_queue_weights():
+    cfg = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        l2_decrease_weight=0.0,
+        trade_at_level_weight=0.0,
+    )
+
+    assert cfg.l2_decrease_weight == 0.0
+    assert cfg.trade_at_level_weight == 0.0
+
+
+def test_train_execution_ppo_rejects_queue_weights_above_one():
+    with pytest.raises(ValueError):
+        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", l2_decrease_weight=1.1)
+
+    with pytest.raises(ValueError):
+        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", trade_at_level_weight=1.1)
+
+
 def test_train_execution_ppo_cli_does_not_import_forbidden_modules():
     import mmrt.cli.train_execution_ppo as cli
 
