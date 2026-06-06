@@ -330,6 +330,7 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["checkpoint"]["updates_completed"] == 1
     assert summary["checkpoint"]["has_observation_normalizer"] is True
     assert summary["env_config_source"] == "checkpoint_cli_config"
+    assert summary["effective_start_event_index"] == 0
     assert summary["evaluation"]["steps"] > 0
     assert summary["evaluation"]["steps"] <= 4
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
@@ -478,6 +479,68 @@ def test_evaluate_execution_policy_can_explicitly_ignore_missing_checkpoint_cli_
         )
     )
     assert summary["env_config_source"] == "evaluation_cli_config"
+    assert summary["effective_start_event_index"] is None
+
+
+def test_evaluate_execution_policy_inherits_checkpoint_start_event_index_when_unset(tmp_path):
+    tape = _tape([_l2(seq=seq, local_ts_us=100 + seq * 100) for seq in range(8)], [])
+    tape_root = _save_tape(tmp_path, tape)
+
+    _save_linear_signals(
+        tape_root,
+        decision_interval_us=50,
+        start_event_index=1,
+    )
+
+    checkpoint_path = tmp_path / "checkpoint_start_1.pt"
+    run_execution_ppo_training(
+        ExecutionPPOTrainCLIConfig(
+            tape_root=str(tape_root),
+            output_json=str(tmp_path / "train_start_1_summary.json"),
+            checkpoint_path=str(checkpoint_path),
+            overwrite=True,
+            num_updates=1,
+            rollout_steps=3,
+            update_epochs=1,
+            minibatch_size=1,
+            hidden_sizes=(8,),
+            decision_interval_us=50,
+            max_episode_steps=4,
+            start_event_index=1,
+            seed=123,
+        )
+    )
+
+    summary = run_execution_policy_evaluation(
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root=str(tape_root),
+            checkpoint_path=str(checkpoint_path),
+            output_json=str(tmp_path / "eval_start_1_summary.json"),
+            overwrite=True,
+            max_steps=3,
+        )
+    )
+
+    assert summary["env_config_source"] == "checkpoint_cli_config"
+    assert summary["effective_start_event_index"] == 1
+    assert summary["linear_signals"]["metadata"]["start_event_index"] == 1
+    assert summary["evaluation"]["steps"] > 0
+
+
+def test_evaluate_execution_policy_explicit_start_event_index_override_must_match_signal_metadata(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+
+    with pytest.raises(ValueError, match="linear signal metadata mismatch"):
+        run_execution_policy_evaluation(
+            ExecutionPolicyEvaluationCLIConfig(
+                tape_root=str(tape_root),
+                checkpoint_path=str(checkpoint_path),
+                output_json=str(tmp_path / "eval_bad_start_override.json"),
+                overwrite=True,
+                max_steps=3,
+                start_event_index=1,
+            )
+        )
 
 
 def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -592,6 +655,7 @@ def test_evaluate_execution_policy_can_use_cli_env_config_instead_of_checkpoint(
     )
 
     assert summary["env_config_source"] == "evaluation_cli_config"
+    assert summary["effective_start_event_index"] is None
 
 
 def test_evaluate_modules_do_not_import_forbidden_layers():

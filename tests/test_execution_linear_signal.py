@@ -343,3 +343,10 @@ def test_linear_signal_has_no_forbidden_imports():
     assert "mmrt.linear.targets" not in source
     assert "mmrt.storage" not in source
     assert "neutral_linear_signal" not in source
+
+
+def test_linear_signal_has_no_metadata_free_artifact_helpers():
+    source = Path("mmrt/execution/linear_signal.py").read_text(encoding="utf-8")
+    assert "_save_linear_signal_arrays_npz" not in source
+    assert "save_linear_signal_arrays_npz" not in source
+    assert "load_linear_signal_arrays_npz" not in source

@@ -510,23 +510,6 @@ def validate_linear_signal_artifact_metadata(
             raise ValueError("linear signal artifact does not contain enough rows")
 
 
-# Private compatibility helpers for non-execution internals/tests that still need raw array files.
-def _save_linear_signal_arrays_npz(path: str | Path, arrays: LinearSignalArrays, *, overwrite: bool = False) -> None:
-    if not isinstance(arrays, LinearSignalArrays):
-        raise ValueError("arrays must be LinearSignalArrays")
-    path = Path(path)
-    if path.exists() and not overwrite:
-        raise FileExistsError(str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-    payload = {name: getattr(arrays, name) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
-    with tmp.open("wb") as handle:
-        np.savez(handle, **payload)
-    tmp.replace(path)
-
-
 def _require_config(value: Any) -> LinearSignalConfig:
     if not isinstance(value, LinearSignalConfig):
         raise ValueError("config must be a LinearSignalConfig")
