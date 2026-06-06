@@ -1,6 +1,8 @@
 from decimal import Decimal
 import json
 
+import pytest
+
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode, canonical_symbol_rules_json
 
 
@@ -39,3 +41,18 @@ def test_symbol_rules_roundtrip_preserves_decimal_strings_and_spec():
     assert spec.step_size == 0.001
     assert spec.min_notional == 5.0
     assert restored.source_sha256 == "abc"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("min_price", Decimal("-0.1")),
+        ("max_price", Decimal("0")),
+        ("max_price", Decimal("0.01")),
+    ],
+)
+def test_symbol_rules_reject_bad_price_filter_bounds(field, value):
+    kwargs = _rules().to_dict()
+    kwargs[field] = str(value)
+    with pytest.raises(ValueError):
+        ExchangeSymbolRules.from_dict(kwargs)

@@ -42,3 +42,17 @@ def test_strict_raises_on_violation():
     acc.observe_price(100.05, source="p")
     with pytest.raises(ValueError, match="strict mode"):
         acc.report()
+
+
+@pytest.mark.parametrize("bad", [True, False, float("nan"), float("inf"), -1.0, "1"])
+def test_compatibility_config_rejects_bad_tolerances(bad):
+    with pytest.raises(ValueError):
+        RuleCompatibilityConfig(price_tolerance_ticks=bad)
+    with pytest.raises(ValueError):
+        RuleCompatibilityConfig(qty_tolerance_steps=bad)
+
+
+@pytest.mark.parametrize("bad", [True, False, -1, 1.5, "10"])
+def test_compatibility_config_rejects_bad_max_examples(bad):
+    with pytest.raises(ValueError):
+        RuleCompatibilityConfig(max_examples=bad)

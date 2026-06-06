@@ -99,6 +99,10 @@ class ExchangeSymbolRules:
             raise ValueError("tick_size must be > 0")
         if self.step_size <= 0:
             raise ValueError("step_size must be > 0")
+        if self.min_price < 0:
+            raise ValueError("min_price must be >= 0")
+        if self.max_price <= 0 or self.max_price < self.min_price:
+            raise ValueError("max_price must be > 0 and >= min_price")
         if self.min_qty < 0:
             raise ValueError("min_qty must be >= 0")
         if self.max_qty <= 0 or self.max_qty < self.min_qty:

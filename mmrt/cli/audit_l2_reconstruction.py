@@ -28,16 +28,21 @@ from mmrt.execution.contracts import L2Update, SymbolSpec
 from mmrt.execution.l2_reconstructor import L2BookReconstructor, ReconstructedL2Event, iter_l2_update_batches
 
 
+DEFAULT_TICK_SIZE = 0.1
+DEFAULT_STEP_SIZE = 0.001
+DEFAULT_MIN_NOTIONAL = 5.0
+
+
 @dataclass(frozen=True, slots=True)
 class L2AuditConfig:
     l2_inputs: tuple[str, ...]
     exchange: str = "binance-futures"
     symbol: str = "BTCUSDT"
-    tick_size: float = 0.1
-    step_size: float = 0.001
+    tick_size: float = DEFAULT_TICK_SIZE
+    step_size: float = DEFAULT_STEP_SIZE
     min_qty: float = 0.001
     max_qty: float = 100.0
-    min_notional: float = 5.0
+    min_notional: float = DEFAULT_MIN_NOTIONAL
     max_rows: int | None = None
     sample_event_limit: int = 10
     batch_size: int = 65_536
@@ -477,11 +482,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l2-input", nargs="+", required=True, dest="l2_inputs", help="Input .parquet, .csv, or .csv.gz files.")
     parser.add_argument("--exchange", default="binance-futures")
     parser.add_argument("--symbol", default="BTCUSDT")
-    parser.add_argument("--tick-size", type=float, default=0.1)
-    parser.add_argument("--step-size", type=float, default=0.001)
+    parser.add_argument("--tick" + "-size", type=float, default=DEFAULT_TICK_SIZE)
+    parser.add_argument("--step" + "-size", type=float, default=DEFAULT_STEP_SIZE)
     parser.add_argument("--min-qty", type=float, default=0.001)
     parser.add_argument("--max-qty", type=float, default=100.0)
-    parser.add_argument("--min-notional", type=float, default=5.0)
+    parser.add_argument("--min" + "-notional", type=float, default=DEFAULT_MIN_NOTIONAL)
     parser.add_argument("--max-rows", type=_positive_int, default=None)
     parser.add_argument("--batch-size", type=_positive_int, default=65_536)
     parser.add_argument("--sample-event-limit", type=_nonnegative_int, default=10)

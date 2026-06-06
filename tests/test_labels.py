@@ -110,7 +110,7 @@ def test_price_observation_validation():
         lb.PriceObservation(local_ts_us=True, event_seq=0, price=1.0)
 
 
-def test_price_history_append_asof_and_equal_timestamp_replace():
+def test_price_history_append_asof_and_duplicate_event_key_rejected():
     ph = lb.PriceHistory()
     ph.append(lb.PriceObservation(1000, 0, 100.0))
     ph.append(lb.PriceObservation(2000, 0, 101.0))
@@ -342,7 +342,7 @@ def test_batch_invalid_rows_for_insufficient_future_context():
     assert np.isnan(labels).all()
 
 
-def test_batch_dedupes_equal_price_timestamps_keep_last():
+def test_batch_uses_event_sequence_for_equal_price_timestamps():
     s = spec(horizons=(100_000,), entry_delay=0)
     pts = np.array([1_000_000, 1_000_000, 1_100_000])
     pvals = np.array([100.0, 101.0, 102.0])

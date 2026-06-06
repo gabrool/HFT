@@ -464,9 +464,18 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
         "market": {
             "exchange": config.exchange,
             "symbol": config.symbol,
-            "symbol_rules_mode": config.symbol_rules_mode.value,
+            "symbol_rules_mode": tape.manifest.symbol_rules.mode.value,
+            "symbol_rules_source": tape.manifest.symbol_rules.source,
+            "symbol_rules_source_sha256": tape.manifest.symbol_rules.source_sha256,
+            "symbol_rules_captured_at_utc": tape.manifest.symbol_rules.captured_at_utc,
             "symbol_rule_compatibility_mode": config.symbol_rule_compatibility_mode.value,
         },
+        "symbol_rules": tape.manifest.symbol_rules.to_dict(),
+        "symbol_rule_compatibility": (
+            None
+            if tape.manifest.symbol_rule_compatibility is None
+            else tape.manifest.symbol_rule_compatibility.to_dict()
+        ),
         "counts": {
             "l2_rows_seen": l2_stats["rows_seen"],
             "l2_updates_converted": l2_stats["updates_converted"],

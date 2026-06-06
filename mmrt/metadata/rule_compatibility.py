@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
+import math
 from typing import Mapping
 
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules
@@ -16,6 +17,23 @@ class RuleCompatibilityMode(str, Enum):
     STRICT = "strict"
 
 
+def _finite_nonnegative_float(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite nonnegative float")
+    out = float(value)
+    if not math.isfinite(out) or out < 0.0:
+        raise ValueError(f"{name} must be a finite nonnegative float")
+    return out
+
+
+def _nonnegative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a nonnegative int")
+    if value < 0:
+        raise ValueError(f"{name} must be a nonnegative int")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class RuleCompatibilityConfig:
     mode: RuleCompatibilityMode = RuleCompatibilityMode.WARN
@@ -25,10 +43,17 @@ class RuleCompatibilityConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", self.mode if isinstance(self.mode, RuleCompatibilityMode) else RuleCompatibilityMode(self.mode))
-        if self.price_tolerance_ticks < 0 or self.qty_tolerance_steps < 0:
-            raise ValueError("compatibility tolerances must be >= 0")
-        if self.max_examples < 0:
-            raise ValueError("max_examples must be >= 0")
+        object.__setattr__(
+            self,
+            "price_tolerance_ticks",
+            _finite_nonnegative_float(self.price_tolerance_ticks, "price_tolerance_ticks"),
+        )
+        object.__setattr__(
+            self,
+            "qty_tolerance_steps",
+            _finite_nonnegative_float(self.qty_tolerance_steps, "qty_tolerance_steps"),
+        )
+        object.__setattr__(self, "max_examples", _nonnegative_int(self.max_examples, "max_examples"))
 
 
 @dataclass(frozen=True, slots=True)
