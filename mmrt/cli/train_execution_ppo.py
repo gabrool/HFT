@@ -10,7 +10,7 @@ from typing import Sequence
 
 import torch
 
-from mmrt.execution.contracts import ActionSpec, PositionState, QueueModelMode
+from mmrt.execution.contracts import ActionSpec, LatencyConfig, PositionState, QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
@@ -172,21 +172,26 @@ class ExecutionPPOTrainCLIConfig:
 
     max_distance_ticks: int = 1
     max_order_qty: float = 0.001
-    min_distance_ticks: int = 1
+    post_only_gap_ticks: int = 1
     default_order_qty: float = 0.001
 
-    queue_mode: QueueModelMode | str = QueueModelMode.BALANCED
-    l2_decrease_weight: float = 1.0
-    trade_at_level_weight: float = 1.0
-    unknown_level_queue_ahead_qty: float = 0.0
+    queue_mode: QueueModelMode | str = QueueModelMode.CONSERVATIVE
+    l2_decrease_weight: float = 0.25
+    trade_at_level_weight: float = 0.5
+    unknown_level_queue_ahead_qty: float = 1_000_000_000.0
 
     maker_fee_bps: float = -0.5
+
+    decision_compute_latency_us: int = 50
+    order_entry_latency_us: int = 500
+    cancel_latency_us: int = 500
 
     inventory_penalty_bps: float = 0.0
     turnover_penalty_bps: float = 0.0
     cancel_penalty: float = 0.0
     drawdown_penalty_rate: float = 0.0
     terminal_inventory_penalty_bps: float = 0.0
+    reward_scale: float = 1.0
 
     num_updates: int = 10
     learning_rate: float = 3e-4
@@ -207,9 +212,11 @@ class ExecutionPPOTrainCLIConfig:
     activation: str = "tanh"
     layer_norm: bool = False
     orthogonal_init: bool = True
-    policy_log_std_init: float = -0.5
-    policy_log_std_min: float = -5.0
-    policy_log_std_max: float = 2.0
+    enable_threshold: float = 0.5
+    enable_logit_bias_init: float = 0.0
+    continuous_log_std_init: float = -0.5
+    continuous_log_std_min: float = -5.0
+    continuous_log_std_max: float = 2.0
     policy_head_gain: float = 0.01
     value_head_gain: float = 1.0
 
@@ -248,18 +255,22 @@ class ExecutionPPOTrainCLIConfig:
         _optional_positive_int(self.max_episode_steps, "max_episode_steps")
         _require_positive_int(self.max_distance_ticks, "max_distance_ticks")
         _require_positive_float(self.max_order_qty, "max_order_qty")
-        _require_positive_int(self.min_distance_ticks, "min_distance_ticks")
+        _require_positive_int(self.post_only_gap_ticks, "post_only_gap_ticks")
         _require_positive_float(self.default_order_qty, "default_order_qty")
         object.__setattr__(self, "queue_mode", _coerce_queue_mode(self.queue_mode))
         _require_probability(self.l2_decrease_weight, "l2_decrease_weight")
         _require_probability(self.trade_at_level_weight, "trade_at_level_weight")
         _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty")
         _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
+        _require_nonnegative_int(self.decision_compute_latency_us, "decision_compute_latency_us")
+        _require_nonnegative_int(self.order_entry_latency_us, "order_entry_latency_us")
+        _require_nonnegative_int(self.cancel_latency_us, "cancel_latency_us")
         _require_nonnegative_float(self.inventory_penalty_bps, "inventory_penalty_bps")
         _require_nonnegative_float(self.turnover_penalty_bps, "turnover_penalty_bps")
         _require_nonnegative_float(self.cancel_penalty, "cancel_penalty")
         _require_nonnegative_float(self.drawdown_penalty_rate, "drawdown_penalty_rate")
         _require_nonnegative_float(self.terminal_inventory_penalty_bps, "terminal_inventory_penalty_bps")
+        _require_positive_float(self.reward_scale, "reward_scale")
 
         _require_positive_int(self.num_updates, "num_updates")
         _require_positive_float(self.learning_rate, "learning_rate")
@@ -282,11 +293,13 @@ class ExecutionPPOTrainCLIConfig:
             raise ValueError('activation must be one of "tanh", "relu", or "silu"')
         _require_bool(self.layer_norm, "layer_norm")
         _require_bool(self.orthogonal_init, "orthogonal_init")
-        _require_finite_float(self.policy_log_std_init, "policy_log_std_init")
-        policy_log_std_min = _require_finite_float(self.policy_log_std_min, "policy_log_std_min")
-        policy_log_std_max = _require_finite_float(self.policy_log_std_max, "policy_log_std_max")
-        if policy_log_std_min >= policy_log_std_max:
-            raise ValueError("policy_log_std_min must be less than policy_log_std_max")
+        _require_probability(self.enable_threshold, "enable_threshold")
+        _require_finite_float(self.enable_logit_bias_init, "enable_logit_bias_init")
+        _require_finite_float(self.continuous_log_std_init, "continuous_log_std_init")
+        continuous_log_std_min = _require_finite_float(self.continuous_log_std_min, "continuous_log_std_min")
+        continuous_log_std_max = _require_finite_float(self.continuous_log_std_max, "continuous_log_std_max")
+        if continuous_log_std_min >= continuous_log_std_max:
+            raise ValueError("continuous_log_std_min must be less than continuous_log_std_max")
         _require_positive_float(self.policy_head_gain, "policy_head_gain")
         _require_positive_float(self.value_head_gain, "value_head_gain")
 
@@ -325,18 +338,22 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "max_episode_steps": config.max_episode_steps,
         "max_distance_ticks": config.max_distance_ticks,
         "max_order_qty": config.max_order_qty,
-        "min_distance_ticks": config.min_distance_ticks,
+        "post_only_gap_ticks": config.post_only_gap_ticks,
         "default_order_qty": config.default_order_qty,
         "queue_mode": config.queue_mode.value,
         "l2_decrease_weight": config.l2_decrease_weight,
         "trade_at_level_weight": config.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
         "maker_fee_bps": config.maker_fee_bps,
+        "decision_compute_latency_us": config.decision_compute_latency_us,
+        "order_entry_latency_us": config.order_entry_latency_us,
+        "cancel_latency_us": config.cancel_latency_us,
         "inventory_penalty_bps": config.inventory_penalty_bps,
         "turnover_penalty_bps": config.turnover_penalty_bps,
         "cancel_penalty": config.cancel_penalty,
         "drawdown_penalty_rate": config.drawdown_penalty_rate,
         "terminal_inventory_penalty_bps": config.terminal_inventory_penalty_bps,
+        "reward_scale": config.reward_scale,
         "num_updates": config.num_updates,
         "learning_rate": config.learning_rate,
         "adam_eps": config.adam_eps,
@@ -354,9 +371,11 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "activation": config.activation,
         "layer_norm": config.layer_norm,
         "orthogonal_init": config.orthogonal_init,
-        "policy_log_std_init": config.policy_log_std_init,
-        "policy_log_std_min": config.policy_log_std_min,
-        "policy_log_std_max": config.policy_log_std_max,
+        "enable_threshold": config.enable_threshold,
+        "enable_logit_bias_init": config.enable_logit_bias_init,
+        "continuous_log_std_init": config.continuous_log_std_init,
+        "continuous_log_std_min": config.continuous_log_std_min,
+        "continuous_log_std_max": config.continuous_log_std_max,
         "policy_head_gain": config.policy_head_gain,
         "value_head_gain": config.value_head_gain,
         "update_epochs": config.update_epochs,
@@ -386,8 +405,13 @@ def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
             max_order_qty=config.max_order_qty,
         ),
         quote_geometry_config=QuoteGeometryConfig(
-            post_only_gap_ticks=config.min_distance_ticks,
+            post_only_gap_ticks=config.post_only_gap_ticks,
             default_order_qty=config.default_order_qty,
+        ),
+        latency_config=LatencyConfig(
+            decision_compute_latency_us=config.decision_compute_latency_us,
+            order_entry_latency_us=config.order_entry_latency_us,
+            cancel_latency_us=config.cancel_latency_us,
         ),
         fill_simulator_config=FillSimulatorConfig(
             queue_model=QueueModelConfig(
@@ -404,6 +428,7 @@ def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
             cancel_penalty=config.cancel_penalty,
             drawdown_penalty_rate=config.drawdown_penalty_rate,
             terminal_inventory_penalty_bps=config.terminal_inventory_penalty_bps,
+            reward_scale=config.reward_scale,
         ),
         initial_position=PositionState(),
         max_episode_steps=config.max_episode_steps,
@@ -416,9 +441,11 @@ def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingCon
         activation=config.activation,
         layer_norm=config.layer_norm,
         orthogonal_init=config.orthogonal_init,
-        policy_log_std_init=config.policy_log_std_init,
-        policy_log_std_min=config.policy_log_std_min,
-        policy_log_std_max=config.policy_log_std_max,
+        enable_threshold=config.enable_threshold,
+        enable_logit_bias_init=config.enable_logit_bias_init,
+        continuous_log_std_init=config.continuous_log_std_init,
+        continuous_log_std_min=config.continuous_log_std_min,
+        continuous_log_std_max=config.continuous_log_std_max,
         policy_head_gain=config.policy_head_gain,
         value_head_gain=config.value_head_gain,
     )
@@ -600,18 +627,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-episode-steps", type=int)
     parser.add_argument("--max-distance-ticks", type=int, default=1)
     parser.add_argument("--max-order-qty", type=float, default=0.001)
-    parser.add_argument("--min-distance-ticks", type=int, default=1)
+    parser.add_argument("--post-only-gap-ticks", type=int, default=1)
     parser.add_argument("--default-order-qty", type=float, default=0.001)
-    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="balanced")
-    parser.add_argument("--l2-decrease-weight", type=float, default=1.0)
-    parser.add_argument("--trade-at-level-weight", type=float, default=1.0)
-    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=0.0)
+    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="conservative")
+    parser.add_argument("--l2-decrease-weight", type=float, default=0.25)
+    parser.add_argument("--trade-at-level-weight", type=float, default=0.5)
+    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=1000000000.0)
     parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
+    parser.add_argument("--decision-compute-latency-us", type=int, default=50)
+    parser.add_argument("--order-entry-latency-us", type=int, default=500)
+    parser.add_argument("--cancel-latency-us", type=int, default=500)
     parser.add_argument("--inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--turnover-penalty-bps", type=float, default=0.0)
     parser.add_argument("--cancel-penalty", type=float, default=0.0)
     parser.add_argument("--drawdown-penalty-rate", type=float, default=0.0)
     parser.add_argument("--terminal-inventory-penalty-bps", type=float, default=0.0)
+    parser.add_argument("--reward-scale", type=float, default=1.0)
 
     parser.add_argument("--num-updates", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -632,9 +663,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--activation", choices=("tanh", "relu", "silu"), default="tanh")
     parser.add_argument("--layer-norm", action="store_true")
     parser.add_argument("--no-orthogonal-init", action="store_true")
-    parser.add_argument("--policy-log-std-init", type=float, default=-0.5)
-    parser.add_argument("--policy-log-std-min", type=float, default=-5.0)
-    parser.add_argument("--policy-log-std-max", type=float, default=2.0)
+    parser.add_argument("--enable-threshold", type=float, default=0.5)
+    parser.add_argument("--enable-logit-bias-init", type=float, default=0.0)
+    parser.add_argument("--continuous-log-std-init", type=float, default=-0.5)
+    parser.add_argument("--continuous-log-std-min", type=float, default=-5.0)
+    parser.add_argument("--continuous-log-std-max", type=float, default=2.0)
     parser.add_argument("--policy-head-gain", type=float, default=0.01)
     parser.add_argument("--value-head-gain", type=float, default=1.0)
 
@@ -674,18 +707,22 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         max_episode_steps=args.max_episode_steps,
         max_distance_ticks=args.max_distance_ticks,
         max_order_qty=args.max_order_qty,
-        min_distance_ticks=args.min_distance_ticks,
+        post_only_gap_ticks=args.post_only_gap_ticks,
         default_order_qty=args.default_order_qty,
         queue_mode=args.queue_mode,
         l2_decrease_weight=args.l2_decrease_weight,
         trade_at_level_weight=args.trade_at_level_weight,
         unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
         maker_fee_bps=args.maker_fee_bps,
+        decision_compute_latency_us=args.decision_compute_latency_us,
+        order_entry_latency_us=args.order_entry_latency_us,
+        cancel_latency_us=args.cancel_latency_us,
         inventory_penalty_bps=args.inventory_penalty_bps,
         turnover_penalty_bps=args.turnover_penalty_bps,
         cancel_penalty=args.cancel_penalty,
         drawdown_penalty_rate=args.drawdown_penalty_rate,
         terminal_inventory_penalty_bps=args.terminal_inventory_penalty_bps,
+        reward_scale=args.reward_scale,
         num_updates=args.num_updates,
         learning_rate=args.learning_rate,
         adam_eps=args.adam_eps,
@@ -703,9 +740,11 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         activation=args.activation,
         layer_norm=args.layer_norm,
         orthogonal_init=not args.no_orthogonal_init,
-        policy_log_std_init=args.policy_log_std_init,
-        policy_log_std_min=args.policy_log_std_min,
-        policy_log_std_max=args.policy_log_std_max,
+        enable_threshold=args.enable_threshold,
+        enable_logit_bias_init=args.enable_logit_bias_init,
+        continuous_log_std_init=args.continuous_log_std_init,
+        continuous_log_std_min=args.continuous_log_std_min,
+        continuous_log_std_max=args.continuous_log_std_max,
         policy_head_gain=args.policy_head_gain,
         value_head_gain=args.value_head_gain,
         update_epochs=args.update_epochs,

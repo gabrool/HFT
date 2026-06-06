@@ -187,7 +187,8 @@ def test_snapshot_input_validation_full():
         s = make_snapshot(); ap = s.ask_px.copy(); ap[1] = ap[0] - 0.01; bs.BookSnapshotInput(s.local_ts_us, s.ts_us, s.bid_px, s.bid_sz, ap, s.ask_sz)
     with pytest.raises(ValueError):
         s = make_snapshot(); bp = s.bid_px.copy(); bp[5] = 0.0; bp[6] = 1.0; bs.BookSnapshotInput(s.local_ts_us, s.ts_us, bp, s.bid_sz, s.ask_px, s.ask_sz)
-    st = bs.BookState(); c = make_snapshot(mid=100.0, spread=-0.01); st.apply_snapshot(c); assert st.current_summary().is_crossed
+    with pytest.raises(ValueError):
+        make_snapshot(mid=100.0, spread=-0.01)
 
 
 def test_apply_snapshot_summary():

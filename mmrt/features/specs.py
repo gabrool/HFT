@@ -254,15 +254,12 @@ def infer_windows_us_from_name(name: str) -> tuple[int, ...]:
 
 
 def infer_source(name: str) -> FeatureSource:
+    name = _require_known_feature_name(name)
     if name in EVENT_CONTEXT_FEATURE_NAMES:
         return FeatureSource.EVENT_CONTEXT
-    trade_exact_names = {
-            }
     cross_exact_names = {
         "trade_side_quote_response_asymmetry_500000us",
     }
-    if name in trade_exact_names:
-        return FeatureSource.TRADE
     if name in cross_exact_names:
         return FeatureSource.CROSS
     cross_prefixes = (
@@ -328,7 +325,7 @@ def infer_family(name: str, source: FeatureSource) -> FeatureFamily:
         return FeatureFamily.LARGE_TRADE
     if name.startswith("absorption_"):
         return FeatureFamily.ABSORPTION
-    if any(k in name for k in ("regime", "down_up_vol", "return_std", "realized_vol", "max_abs_return")) or name.startswith("spread_z"):
+    if "realized_vol" in name:
         return FeatureFamily.REGIME
     if source == FeatureSource.TRADE:
         return FeatureFamily.TRADE_FLOW
@@ -338,11 +335,12 @@ def infer_family(name: str, source: FeatureSource) -> FeatureFamily:
 
 
 def infer_unit(name: str) -> FeatureUnit:
+    name = _require_known_feature_name(name)
     if name.startswith("log_"):
         return FeatureUnit.LOG1P
     if "time_since" in name or "age_us" in name or "silence_gap" in name:
         return FeatureUnit.MICROSECONDS
-    if "bps" in name or "spread_z" in name or "return_std" in name or "realized_vol" in name:
+    if "bps" in name or "realized_vol" in name:
         return FeatureUnit.BPS
     if "usd" in name or "notional" in name:
         return FeatureUnit.NOTIONAL_USD
@@ -359,11 +357,7 @@ def infer_unit(name: str) -> FeatureUnit:
 
 def infer_required_book_depth(name: str, source: FeatureSource) -> int:
     name = _require_known_feature_name(name)
-    trade_exact_names = {
-            }
     if source == FeatureSource.EVENT_CONTEXT:
-        return 0
-    if source == FeatureSource.TRADE and name in trade_exact_names:
         return 0
     if source == FeatureSource.TRADE and not any(k in name for k in ("depth", "book", "l1", "l3", "l5", "l10", "vamp", "micro_l", "replenishment")):
         return 0
@@ -411,13 +405,7 @@ def _is_ratio_or_bounded_feature(name: str, unit: FeatureUnit) -> bool:
 
 
 def _is_slow_regime_feature(name: str) -> bool:
-    slow_exact = {
-        "return_std_bps_200000us",
-        "microprice_realized_vol_1000000us",
-        "max_abs_return_bps_500000us",
-        "depth_imbalance_realized_vol_1000000us",
-    }
-    return name in slow_exact or name.startswith("spread_z_") or name.startswith("depth_5bps_z_")
+    return name == "microprice_realized_vol_1000000us"
 
 
 def _is_fast_microstructure_feature(name: str, source: FeatureSource, family: FeatureFamily) -> bool:

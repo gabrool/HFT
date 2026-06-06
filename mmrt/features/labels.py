@@ -224,11 +224,17 @@ class LabelBuilder:
             )
         )
 
-    def mature_ready(self) -> list[LabelResult]:
+    def _mature_ready(self, *, require_timestamp_advanced: bool) -> list[LabelResult]:
         out: list[LabelResult] = []
         while self._pending_start < len(self.pending):
             pend = self.pending[self._pending_start]
-            if self.price_history.latest_local_ts_us is None or self.price_history.latest_local_ts_us < pend.ready_local_ts_us:
+            latest_ts = self.price_history.latest_local_ts_us
+            if latest_ts is None:
+                break
+            if require_timestamp_advanced:
+                if latest_ts <= pend.ready_local_ts_us:
+                    break
+            elif latest_ts < pend.ready_local_ts_us:
                 break
             entry_price = self.price_history.asof_price(pend.decision_key if self.spec.entry_delay_us == 0 else key_at_or_after_timestamp(pend.entry_local_ts_us))
             if entry_price is None:
@@ -248,6 +254,7 @@ class LabelBuilder:
                 # LabelResult uses generic ts field names; values here are local-clock timestamps.
                 LabelResult(
                     decision_ts_us=pend.decision_key.local_ts_us,
+                    decision_event_seq=pend.decision_key.event_seq,
                     entry_ts_us=pend.entry_local_ts_us,
                     horizons_us=self.spec.horizons_us,
                     values_bps=tuple(values),
@@ -259,11 +266,17 @@ class LabelBuilder:
             self._pending_start = 0
         return out
 
+    def mature_ready(self) -> list[LabelResult]:
+        return self._mature_ready(require_timestamp_advanced=True)
+
+    def finalize_at_eof(self) -> list[LabelResult]:
+        return self._mature_ready(require_timestamp_advanced=False)
+
     def label_now_local(self, decision_local_ts_us: int, event_seq: int) -> LabelResult | None:
         decision_key = EventKey(decision_local_ts_us, event_seq)
         entry_local_ts_us = decision_local_ts_us + self.spec.entry_delay_us
         ready_local_ts_us = entry_local_ts_us + max(self.spec.horizons_us)
-        if self.price_history.latest_local_ts_us is None or self.price_history.latest_local_ts_us < ready_local_ts_us:
+        if self.price_history.latest_local_ts_us is None or self.price_history.latest_local_ts_us <= ready_local_ts_us:
             return None
         entry_price = self.price_history.asof_price(decision_key if self.spec.entry_delay_us == 0 else key_at_or_after_timestamp(entry_local_ts_us))
         if entry_price is None:
@@ -276,6 +289,7 @@ class LabelBuilder:
             values.append(_safe_log_return_bps(exit_price, entry_price))
         return LabelResult(
             decision_ts_us=decision_local_ts_us,
+            decision_event_seq=event_seq,
             entry_ts_us=entry_local_ts_us,
             horizons_us=self.spec.horizons_us,
             values_bps=tuple(values),

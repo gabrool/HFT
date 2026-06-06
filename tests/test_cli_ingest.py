@@ -108,8 +108,8 @@ def test_write_matured_labels_uses_values_bps():
         def append_values(self, **kwargs):
             self.kwargs = kwargs
 
-    pending = {10: cli.PendingDecision(1, 10, 10, 1, 100.0, (0.1,))}
-    label = LabelResult(decision_ts_us=10, entry_ts_us=11, horizons_us=(12, 13, 14), values_bps=(1.0, 2.0, 3.0))
+    pending = {(10, 1): cli.PendingDecision(1, 10, 10, 1, 100.0, (0.1,))}
+    label = LabelResult(decision_ts_us=10, decision_event_seq=1, entry_ts_us=11, horizons_us=(12, 13, 14), values_bps=(1.0, 2.0, 3.0))
     counters = cli.IngestCounters()
     w = W()
     cli._write_matured_labels([label], pending, w, counters)

@@ -201,7 +201,7 @@ class ObservationBuilder:
         set_field("inventory_abs_notional", inventory_abs_notional)
         set_field("fees_paid", position.fees_paid)
 
-        bid_order, ask_order = _live_orders_by_side(inputs.live_orders)
+        bid_order, ask_order = _live_orders_by_side(inputs.live_orders, local_ts_us=context.current_local_ts_us)
         if bid_order is not None:
             bid_distance_ticks = max(book_top.best_bid_tick - bid_order.price_tick, 0)
             set_field("has_live_bid", 1.0)
@@ -356,11 +356,11 @@ def _fill_notional(fill: Fill, symbol_spec: SymbolSpec) -> float:
     return symbol_spec.tick_to_price(fill.price_tick) * fill.qty * symbol_spec.contract_size
 
 
-def _live_orders_by_side(orders: tuple[ActiveOrder, ...]) -> tuple[ActiveOrder | None, ActiveOrder | None]:
+def _live_orders_by_side(orders: tuple[ActiveOrder, ...], *, local_ts_us: int) -> tuple[ActiveOrder | None, ActiveOrder | None]:
     bid_order: ActiveOrder | None = None
     ask_order: ActiveOrder | None = None
     for order in orders:
-        if not order.is_live:
+        if not order.is_fillable_at(local_ts_us):
             continue
         if order.side == OrderSide.BUY:
             if bid_order is not None:

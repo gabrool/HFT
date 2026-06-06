@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from mmrt.contracts import AggressorSide
-from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, TradePrint
+from mmrt.execution.contracts import BookLevelSnapshot, BookTop, LatencyConfig, SymbolSpec, TradePrint
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
@@ -212,6 +212,7 @@ def _tiny_env(max_episode_steps: int | None = 4) -> ExecutionEnv:
         linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50),
         config=ExecutionEnvConfig(
             decision_interval_us=50,
+            latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0, cancel_latency_us=0),
             max_episode_steps=max_episode_steps,
         ),
     )

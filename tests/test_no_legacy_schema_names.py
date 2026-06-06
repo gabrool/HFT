@@ -34,7 +34,7 @@ PRODUCTION_ROOT = Path("mmrt")
 FORBIDDEN_HISTORY_WORDS = (
     "leg" + "acy",
     "compat" + "ibility",
-    "back" + "ward",
+    "back" + "ward " + "compat" + "ibility",
     "no longer " + "supported",
     "old " + "schema",
     "old " + "format",

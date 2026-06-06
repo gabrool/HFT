@@ -224,7 +224,7 @@ def simulate_trade_event(
     trade = _require_trade(trade)
     symbol_spec = _require_symbol_spec(symbol_spec)
     config = _require_config(config)
-    _assert_no_duplicate_live_side_price(orders_tuple)
+    _assert_no_duplicate_fillable_side_price(orders_tuple, local_ts_us=trade.local_ts_us)
 
     updated_orders: list[ActiveOrder] = []
     fills: list[Fill] = []
@@ -267,7 +267,7 @@ def simulate_l2_level_update(
     local_ts_us = _require_positive_int(local_ts_us, "local_ts_us")
     symbol_spec = _require_symbol_spec(symbol_spec)
     config = _require_config(config)
-    _assert_no_duplicate_live_side_price(orders_tuple)
+    _assert_no_duplicate_fillable_side_price(orders_tuple, local_ts_us=local_ts_us)
 
     updated_orders: list[ActiveOrder] = []
     fills: list[Fill] = []
@@ -327,7 +327,7 @@ def sync_orders_to_quote(
             updated.append(order)
             continue
         desired_price = target[order.side]
-        if desired_price == order.price_tick:
+        if desired_price == order.price_tick and order.cancel_effective_local_ts_us == 0:
             preserved.add(order.side)
             updated.append(order)
         else:
@@ -555,14 +555,15 @@ def _validate_local_ts_for_order(order: ActiveOrder, local_ts_us: int) -> None:
         raise ValueError("local_ts_us must be >= order.last_update_local_ts_us")
 
 
-def _assert_no_duplicate_live_side_price(orders: tuple[ActiveOrder, ...]) -> None:
+def _assert_no_duplicate_fillable_side_price(orders: tuple[ActiveOrder, ...], *, local_ts_us: int) -> None:
+    local_ts_us = _require_positive_int(local_ts_us, "local_ts_us")
     seen: set[tuple[OrderSide, int]] = set()
     for order in orders:
-        if not order.is_live:
+        if not order.is_fillable_at(local_ts_us):
             continue
         key = (order.side, order.price_tick)
         if key in seen:
-            raise ValueError("duplicate live orders at same side/price are not supported")
+            raise ValueError("duplicate fillable orders at same side/price are not supported")
         seen.add(key)
 
 

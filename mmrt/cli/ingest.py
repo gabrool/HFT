@@ -249,7 +249,7 @@ class IngestCounters:
     input_trade_files: int = 0
     normalized_files: int = 0
     merged_events_seen: int = 0
-    book_events_seen: int = 0
+    book_rows_seen: int = 0
     trade_events_seen: int = 0
     decisions_emitted: int = 0
     labels_matured: int = 0
@@ -263,9 +263,9 @@ class IngestCounters:
         return asdict(self)
 
 
-def _write_matured_labels(label_results, pending_decisions: dict[int, PendingDecision], writer: wr.DecisionRowWriter, counters: IngestCounters) -> None:
+def _write_matured_labels(label_results, pending_decisions: dict[tuple[int, int], PendingDecision], writer: wr.DecisionRowWriter, counters: IngestCounters) -> None:
     for label in label_results:
-        key = int(label.decision_ts_us)
+        key = (int(label.decision_ts_us), int(label.decision_event_seq))
         if key not in pending_decisions:
             raise KeyError(f"missing pending decision for {key}")
         p = pending_decisions.pop(key)
@@ -280,7 +280,7 @@ def _run_causal_ingest_rows(rows: Iterable[Mapping[str, Any]], writer: wr.Decisi
     label_builder = LabelBuilder(pipeline_config.label_spec)
     tcfg = TransformConfig()
     transformer = CausalFeatureTransformer(tcfg)
-    pending_decisions: dict[int, PendingDecision] = {}
+    pending_decisions: dict[tuple[int, int], PendingDecision] = {}
     for row in rows:
         if max_events is not None and counters.merged_events_seen >= max_events:
             break
@@ -295,7 +295,7 @@ def _run_causal_ingest_rows(rows: Iterable[Mapping[str, Any]], writer: wr.Decisi
             engine.on_trade(tr)
             continue
         if code == em.EVENT_TYPE_CODE_BOOK_SNAPSHOT:
-            counters.book_events_seen += 1
+            counters.book_rows_seen += 1
             try:
                 snap = _book_snapshot_input_from_row(row)
             except ValueError as exc:
@@ -308,14 +308,14 @@ def _run_causal_ingest_rows(rows: Iterable[Mapping[str, Any]], writer: wr.Decisi
             if decision is not None:
                 transformed = transformer.transform_one_local(decision.local_ts_us, decision.feature_vector)
                 label_builder.on_decision_local(decision.local_ts_us, decision.event_seq)
-                pending_decisions[decision.local_ts_us] = PendingDecision(decision_index=decision.decision_index, ts_us=decision.ts_us, local_ts_us=decision.local_ts_us, event_seq=decision.event_seq, raw_mid=decision.raw_mid, feature_values=tuple(float(x) for x in transformed))
+                pending_decisions[(decision.local_ts_us, decision.event_seq)] = PendingDecision(decision_index=decision.decision_index, ts_us=decision.ts_us, local_ts_us=decision.local_ts_us, event_seq=decision.event_seq, raw_mid=decision.raw_mid, feature_values=tuple(float(x) for x in transformed))
                 counters.decisions_emitted += 1
 
-    _write_matured_labels(label_builder.mature_ready(), pending_decisions, writer, counters)
+    _write_matured_labels(label_builder.finalize_at_eof(), pending_decisions, writer, counters)
     counters.pending_decisions_at_eof = len(pending_decisions)
     counters.transform_rows_seen = transformer.diagnostics.rows_seen
 
-    if counters.book_events_seen == 0:
+    if counters.book_rows_seen == 0:
         raise ValueError("no book events seen")
     if counters.trade_events_seen == 0:
         raise ValueError("no trade events seen")

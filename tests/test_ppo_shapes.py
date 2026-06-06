@@ -40,7 +40,7 @@ def _synthetic_batch(
 ) -> RolloutBatch:
     return RolloutBatch(
         observations=torch.randn(steps, obs_dim),
-        actions=torch.randn(steps, action_dim),
+        actions=torch.cat((torch.randint(0, 2, (steps, 2), dtype=torch.float32), torch.randn(steps, action_dim - 2)), dim=-1),
         log_probs=torch.zeros(steps),
         values=torch.zeros(steps),
         rewards=torch.randn(steps),
@@ -59,15 +59,21 @@ def test_actor_critic_shapes_and_deterministic_action():
     obs = torch.zeros(3, 4)
 
     forward = policy(obs)
-    assert forward.action_mean.shape == (3, 6)
-    assert forward.action_log_std.shape == (3, 6)
+    assert forward.enable_logits.shape == (3, 2)
+    assert forward.continuous_mean.shape == (3, 4)
+    assert forward.continuous_log_std.shape == (3, 4)
     assert forward.value.shape == (3,)
-    assert torch.isfinite(forward.action_mean).all()
-    assert torch.isfinite(forward.action_log_std).all()
+    assert torch.isfinite(forward.enable_logits).all()
+    assert torch.isfinite(forward.continuous_mean).all()
+    assert torch.isfinite(forward.continuous_log_std).all()
     assert torch.isfinite(forward.value).all()
 
     sample = policy.sample_action(obs, deterministic=True)
-    assert torch.allclose(sample.action, forward.action_mean)
+    assert torch.all(sample.action[:, :2] == 1.0)
+    assert torch.allclose(sample.action[:, 2:], forward.continuous_mean)
+    assert sample.enable_prob.shape == (3, 2)
+    assert sample.continuous_mean.shape == (3, 4)
+    assert sample.continuous_log_std.shape == (3, 4)
     assert sample.log_prob.shape == (3,)
     assert sample.entropy.shape == (3,)
     assert torch.isfinite(sample.action).all()
@@ -92,18 +98,18 @@ def test_actor_critic_shapes_and_deterministic_action():
 
 def test_actor_critic_log_std_clamping():
     config = ActorCriticConfig(
-        policy_log_std_init=10.0,
-        policy_log_std_min=-1.0,
-        policy_log_std_max=1.0,
+        continuous_log_std_init=10.0,
+        continuous_log_std_min=-1.0,
+        continuous_log_std_max=1.0,
     )
     policy = ActorCriticNetwork(obs_dim=4, config=config)
     out = policy(torch.zeros(2, 4))
-    assert torch.allclose(out.action_log_std, torch.ones_like(out.action_log_std))
+    assert torch.allclose(out.continuous_log_std, torch.ones_like(out.continuous_log_std))
 
     with torch.no_grad():
-        policy.action_log_std.fill_(-10.0)
+        policy.continuous_log_std.fill_(-10.0)
     out = policy(torch.zeros(2, 4))
-    assert torch.allclose(out.action_log_std, -torch.ones_like(out.action_log_std))
+    assert torch.allclose(out.continuous_log_std, -torch.ones_like(out.continuous_log_std))
 
 
 def test_diagonal_gaussian_helpers_shapes_and_values():
@@ -230,6 +236,11 @@ def test_training_config_to_dict_is_json_safe():
     assert payload["num_updates"] == 1
     assert payload["rollout_config"]["device"] == "cpu"
     assert payload["rollout_config"]["dtype"].startswith("torch.")
+    net = payload["network_config"]
+    assert "enable_threshold" in net
+    assert "enable_logit_bias_init" in net
+    assert "continuous_log_std_init" in net
+    assert "policy" + "_log_std_init" not in net
 
 
 def test_rl_modules_do_not_import_forbidden_heavy_or_wrong_layers():
