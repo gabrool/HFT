@@ -176,6 +176,7 @@ class ExecutionPolicyEvaluationCLIConfig:
     l2_decrease_weight: float = 0.25
     trade_at_level_weight: float = 0.5
     unknown_level_queue_ahead_qty: float = 1_000_000_000.0
+    dedupe_l2_decrease_with_trade_prints: bool = True
 
     maker_fee_bps: float = -0.5
 
@@ -223,6 +224,7 @@ class ExecutionPolicyEvaluationCLIConfig:
             self.unknown_level_queue_ahead_qty,
             "unknown_level_queue_ahead_qty",
         )
+        _require_bool(self.dedupe_l2_decrease_with_trade_prints, "dedupe_l2_decrease_with_trade_prints")
         _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
         _require_nonnegative_int(self.decision_compute_latency_us, "decision_compute_latency_us")
         _require_nonnegative_int(self.order_entry_latency_us, "order_entry_latency_us")
@@ -268,6 +270,7 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "l2_decrease_weight": config.l2_decrease_weight,
         "trade_at_level_weight": config.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
+        "dedupe_l2_decrease_with_trade_prints": config.dedupe_l2_decrease_with_trade_prints,
         "maker_fee_bps": config.maker_fee_bps,
         "decision_compute_latency_us": config.decision_compute_latency_us,
         "order_entry_latency_us": config.order_entry_latency_us,
@@ -312,6 +315,7 @@ def _env_config_from_cli_config(
                 l2_decrease_weight=config.l2_decrease_weight,
                 trade_at_level_weight=config.trade_at_level_weight,
                 unknown_level_queue_ahead_qty=config.unknown_level_queue_ahead_qty,
+                dedupe_l2_decrease_with_trade_prints=config.dedupe_l2_decrease_with_trade_prints,
             ),
             maker_fee_bps=config.maker_fee_bps,
         ),
@@ -362,6 +366,10 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
     unknown_level_queue_ahead_qty = _require_nonnegative_float(
         raw.get("unknown_level_queue_ahead_qty", 1_000_000_000.0),
         "unknown_level_queue_ahead_qty",
+    )
+    dedupe_l2_decrease_with_trade_prints = _require_bool(
+        raw.get("dedupe_l2_decrease_with_trade_prints", True),
+        "dedupe_l2_decrease_with_trade_prints",
     )
     maker_fee_bps = _require_finite_float(raw.get("maker_fee_bps", -0.5), "maker_fee_bps")
     inventory_penalty_bps = _require_nonnegative_float(
@@ -416,6 +424,7 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
                 l2_decrease_weight=l2_decrease_weight,
                 trade_at_level_weight=trade_at_level_weight,
                 unknown_level_queue_ahead_qty=unknown_level_queue_ahead_qty,
+                dedupe_l2_decrease_with_trade_prints=dedupe_l2_decrease_with_trade_prints,
             ),
             maker_fee_bps=maker_fee_bps,
         ),

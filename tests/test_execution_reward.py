@@ -57,6 +57,7 @@ def _fill(
         order_id=1,
         side=side,
         local_ts_us=200,
+        event_seq=0,
         price_tick=price_tick,
         qty=qty,
         fee=fee,

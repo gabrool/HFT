@@ -14,6 +14,7 @@ from mmrt.execution.contracts import (
     ActiveOrder,
     FillReason,
     OrderSide,
+    OrderStatus,
     QueueModelMode,
     TradePrint,
 )
@@ -75,8 +76,8 @@ def _require_probability(value: float, name: str) -> float:
 
 def _require_live_order(order: ActiveOrder) -> ActiveOrder:
     order = _require_order(order)
-    if not order.is_live:
-        raise ValueError("order must be live")
+    if order.status not in (OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL):
+        raise ValueError("order must be fillable-live")
     return order
 
 
@@ -111,6 +112,7 @@ class QueueModelConfig:
     trade_at_level_weight: float = 0.5
     unknown_level_queue_ahead_qty: float = 1_000_000_000.0
     qty_epsilon: float = 1e-12
+    dedupe_l2_decrease_with_trade_prints: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", _coerce_mode(self.mode))
@@ -122,6 +124,7 @@ class QueueModelConfig:
             _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty"),
         )
         object.__setattr__(self, "qty_epsilon", _require_positive_float(self.qty_epsilon, "qty_epsilon"))
+        object.__setattr__(self, "dedupe_l2_decrease_with_trade_prints", _require_bool(self.dedupe_l2_decrease_with_trade_prints, "dedupe_l2_decrease_with_trade_prints"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,8 +201,7 @@ def update_queue_position(
     *,
     config: QueueModelConfig = QueueModelConfig(),
     trade: TradePrint | None = None,
-    prev_level_qty: float | None = None,
-    curr_level_qty: float | None = None,
+    l2_decrease_qty: float | None = None,
 ) -> QueueModelUpdate:
     order = _require_live_order(order)
     config = _require_config(config)
@@ -235,14 +237,11 @@ def update_queue_position(
 
     if (
         config.mode == QueueModelMode.BALANCED
-        and prev_level_qty is not None
-        and curr_level_qty is not None
+        and l2_decrease_qty is not None
         and fillable_qty < order.remaining_qty
     ):
-        prev_qty = _require_nonnegative_float(prev_level_qty, "prev_level_qty")
-        curr_qty = _require_nonnegative_float(curr_level_qty, "curr_level_qty")
-        visible_decrease = max(prev_qty - curr_qty, 0.0)
-        effective_l2_advance = visible_decrease * config.l2_decrease_weight
+        l2_decrease_qty = _require_nonnegative_float(l2_decrease_qty, "l2_decrease_qty")
+        effective_l2_advance = l2_decrease_qty * config.l2_decrease_weight
         queue_consumed = min(queue_after, effective_l2_advance)
         queue_after = max(queue_after - effective_l2_advance, 0.0)
         leftover = max(effective_l2_advance - queue_consumed, 0.0)

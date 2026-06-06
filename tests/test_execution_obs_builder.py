@@ -88,7 +88,9 @@ def _order(
         queue_ahead_qty=queue_ahead_qty,
         status=status,
         created_local_ts_us=created_local_ts_us,
+        created_event_seq=0,
         last_update_local_ts_us=created_local_ts_us,
+        last_update_event_seq=0,
     )
 
 
@@ -104,6 +106,7 @@ def _fill(
         order_id=1,
         side=side,
         local_ts_us=local_ts_us,
+        event_seq=0,
         price_tick=price_tick,
         qty=qty,
         fee=fee,

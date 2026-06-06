@@ -21,7 +21,9 @@ from mmrt.execution.contracts import (
     LatencyConfig,
     ExecutionStepResult,
     Fill,
+    FillReason,
     OrderSide,
+    OrderStatus,
     PositionState,
     SymbolSpec,
     TradePrint,
@@ -33,6 +35,7 @@ from mmrt.execution.execution_tape import (
 )
 from mmrt.execution.fill_sim import (
     FillSimulatorConfig,
+    activate_pending_orders,
     finalize_effective_cancels,
     simulate_l2_level_update,
     simulate_trade_event,
@@ -48,6 +51,7 @@ from mmrt.execution.obs_builder import (
 )
 from mmrt.execution.obs_schema import ObservationSchema, default_observation_schema
 from mmrt.execution.queue_model import QueueModelConfig, QueueModelMode, estimate_initial_queue_ahead
+from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 from mmrt.execution.quote_geometry import (
     QuoteAction,
     QuoteGeometryConfig,
@@ -243,6 +247,8 @@ class ExecutionEnv:
         self._episode_start_local_ts_us = 0
         self._last_step_fills: tuple[Fill, ...] = ()
         self._peak_equity: float | None = None
+        self._recent_trade_depletion_by_level: dict[tuple[OrderSide, int], float] = {}
+        self._step_diag: dict[str, float | int] = {}
 
     def reset(
         self,
@@ -324,20 +330,43 @@ class ExecutionEnv:
         bid_queue_ahead_qty = self._queue_ahead_for_new_order(OrderSide.BUY, quote.bid_price_tick, state.current_book_ptr) if quote.bid_enabled else 0.0
         ask_queue_ahead_qty = self._queue_ahead_for_new_order(OrderSide.SELL, quote.ask_price_tick, state.current_book_ptr) if quote.ask_enabled else 0.0
 
-        decision_ts = previous_book_top.local_ts_us
-        order_effective_ts = decision_ts + self.config.latency_config.order_activation_delay_us
-        cancel_effective_ts = decision_ts + self.config.latency_config.cancel_effective_delay_us
+        self._recent_trade_depletion_by_level = {}
+        self._step_diag = {
+            "activated_order_count": 0,
+            "post_only_reject_count": 0,
+            "effective_cancel_count": 0,
+            "queue_trade_advance_qty": 0.0,
+            "queue_l2_advance_qty": 0.0,
+            "queue_advanced_qty": 0.0,
+            "queue_fillable_qty": 0.0,
+            "trade_at_level_fill_count": 0,
+            "trade_through_fill_count": 0,
+            "queue_depletion_fill_count": 0,
+            "l2_trade_dedupe_qty": 0.0,
+            "l2_raw_decrease_qty": 0.0,
+            "l2_effective_decrease_qty": 0.0,
+        }
+        decision_key = self._event_key_at_index(state.event_index)
+        decision_ts = decision_key.local_ts_us
+        order_effective_key = self._effective_event_key_for_latency(decision_event_index=state.event_index, target_local_ts_us=decision_ts + self.config.latency_config.order_activation_delay_us)
+        cancel_effective_key = self._effective_event_key_for_latency(decision_event_index=state.event_index, target_local_ts_us=decision_ts + self.config.latency_config.cancel_effective_delay_us)
         replacement_orders, cancel_count = sync_orders_to_quote(
             state.live_orders,
             quote,
             next_order_id=state.next_order_id,
-            decision_local_ts_us=decision_ts,
-            order_effective_local_ts_us=order_effective_ts,
-            cancel_effective_local_ts_us=cancel_effective_ts,
+            decision_key=decision_key,
+            order_effective_key=order_effective_key,
+            cancel_effective_key=cancel_effective_key,
             bid_queue_ahead_qty=bid_queue_ahead_qty,
             ask_queue_ahead_qty=ask_queue_ahead_qty,
+            qty_epsilon=self.config.fill_simulator_config.qty_epsilon,
         )
         state.live_orders = _live_orders_tuple(replacement_orders)
+        activation = activate_pending_orders(state.live_orders, event_key=decision_key, book_top=previous_book_top, post_only_gap_ticks=self.config.quote_geometry_config.post_only_gap_ticks)
+        state.live_orders = _live_orders_tuple(activation.orders)
+        self._step_diag["activated_order_count"] = int(self._step_diag["activated_order_count"]) + activation.activated_count
+        self._step_diag["post_only_reject_count"] = int(self._step_diag["post_only_reject_count"]) + activation.post_only_reject_count
+        self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + activation.already_cancelled_count
         state.next_order_id = _next_order_id_after(replacement_orders, state.next_order_id)
 
         decision_end_local_ts_us = previous_book_top.local_ts_us + self.config.decision_interval_us
@@ -355,8 +384,30 @@ class ExecutionEnv:
 
             event_code = int(events[next_event_index]["event_type_code"])
             event_book_ptr = int(events[next_event_index]["book_ptr"])
-            state.live_orders = _live_orders_tuple(finalize_effective_cancels(state.live_orders, local_ts_us=event_local))
+            event_key = self._event_key_at_index(next_event_index)
+            cancels = finalize_effective_cancels(state.live_orders, event_key=event_key)
+            state.live_orders = _live_orders_tuple(cancels.orders)
+            self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + cancels.cancelled_count
+            if event_key.event_seq > 0:
+                pre_activation_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1)
+            else:
+                pre_activation_key = EventKey(max(event_key.local_ts_us - 1, 1), MAX_EVENT_SEQ)
+            pre_activation = activate_pending_orders(
+                state.live_orders,
+                event_key=pre_activation_key,
+                book_top=self._book_top_from_ptr(state.current_book_ptr),
+                post_only_gap_ticks=self.config.quote_geometry_config.post_only_gap_ticks,
+            )
+            state.live_orders = _live_orders_tuple(pre_activation.orders)
+            self._step_diag["activated_order_count"] = int(self._step_diag["activated_order_count"]) + pre_activation.activated_count
+            self._step_diag["post_only_reject_count"] = int(self._step_diag["post_only_reject_count"]) + pre_activation.post_only_reject_count
+            self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + pre_activation.already_cancelled_count
             fills.extend(self._process_event(next_event_index))
+            post_activation = activate_pending_orders(state.live_orders, event_key=event_key, book_top=self._book_top_from_ptr(state.current_book_ptr), post_only_gap_ticks=self.config.quote_geometry_config.post_only_gap_ticks)
+            state.live_orders = _live_orders_tuple(post_activation.orders)
+            self._step_diag["activated_order_count"] = int(self._step_diag["activated_order_count"]) + post_activation.activated_count
+            self._step_diag["post_only_reject_count"] = int(self._step_diag["post_only_reject_count"]) + post_activation.post_only_reject_count
+            self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + post_activation.already_cancelled_count
             if event_code == EVENT_TYPE_CODE_L2_BATCH and event_book_ptr >= 0:
                 processed_valid_l2 = processed_valid_l2 or self._book_top_from_ptr(event_book_ptr) is not None
             processed_any = True
@@ -395,7 +446,27 @@ class ExecutionEnv:
             "current_book_ptr": state.current_book_ptr,
             "events_processed": events_processed,
             "cancel_count": cancel_count,
+            "cancel_request_count": cancel_count,
+            "pending_cancel_request_count": sum(1 for order in state.live_orders if order.status == OrderStatus.PENDING_CANCEL),
             "num_fills": len(step_fills),
+            "orders_live_count": sum(1 for order in state.live_orders if order.is_live),
+            "orders_pending_new_count": sum(1 for order in state.live_orders if order.status == OrderStatus.PENDING_NEW),
+            "orders_pending_cancel_count": sum(1 for order in state.live_orders if order.status == OrderStatus.PENDING_CANCEL),
+            "orders_active_count": sum(1 for order in state.live_orders if order.status == OrderStatus.ACTIVE),
+            "orders_partially_filled_count": sum(1 for order in state.live_orders if order.status == OrderStatus.PARTIALLY_FILLED),
+            "activated_order_count": int(self._step_diag["activated_order_count"]),
+            "post_only_reject_count": int(self._step_diag["post_only_reject_count"]),
+            "effective_cancel_count": int(self._step_diag["effective_cancel_count"]),
+            "queue_trade_advance_qty": float(self._step_diag["queue_trade_advance_qty"]),
+            "queue_l2_advance_qty": float(self._step_diag["queue_l2_advance_qty"]),
+            "queue_advanced_qty": float(self._step_diag["queue_advanced_qty"]),
+            "queue_fillable_qty": float(self._step_diag["queue_fillable_qty"]),
+            "trade_at_level_fill_count": int(self._step_diag["trade_at_level_fill_count"]),
+            "trade_through_fill_count": int(self._step_diag["trade_through_fill_count"]),
+            "queue_depletion_fill_count": int(self._step_diag["queue_depletion_fill_count"]),
+            "l2_trade_dedupe_qty": float(self._step_diag["l2_trade_dedupe_qty"]),
+            "l2_raw_decrease_qty": float(self._step_diag["l2_raw_decrease_qty"]),
+            "l2_effective_decrease_qty": float(self._step_diag["l2_effective_decrease_qty"]),
             "quote_bid_enabled": quote.bid_enabled,
             "quote_ask_enabled": quote.ask_enabled,
             "quote_bid_price_tick": quote.bid_price_tick,
@@ -427,6 +498,35 @@ class ExecutionEnv:
             reward=reward_step.reward.total_reward * self.config.reward_config.reward_scale,
             execution=execution,
         )
+
+    def _event_key_at_index(self, event_index: int) -> EventKey:
+        row = self.tape.arrays.events[event_index]
+        return EventKey(int(row["local_ts_us"]), int(row["event_seq"]))
+
+    def _effective_event_key_for_latency(self, *, decision_event_index: int, target_local_ts_us: int) -> EventKey:
+        decision_key = self._event_key_at_index(decision_event_index)
+        if target_local_ts_us <= decision_key.local_ts_us:
+            return decision_key
+        events = self.tape.arrays.events
+        for idx in range(decision_event_index + 1, len(events)):
+            row = events[idx]
+            if int(row["local_ts_us"]) >= target_local_ts_us:
+                return EventKey(int(row["local_ts_us"]), int(row["event_seq"]))
+        return EventKey(target_local_ts_us, MAX_EVENT_SEQ)
+
+    def _record_queue_updates(self, result) -> None:
+        for update in result.queue_updates:
+            self._step_diag["queue_trade_advance_qty"] = float(self._step_diag["queue_trade_advance_qty"]) + update.trade_advance_qty
+            self._step_diag["queue_l2_advance_qty"] = float(self._step_diag["queue_l2_advance_qty"]) + update.l2_advance_qty
+            self._step_diag["queue_advanced_qty"] = float(self._step_diag["queue_advanced_qty"]) + update.advanced_qty
+            self._step_diag["queue_fillable_qty"] = float(self._step_diag["queue_fillable_qty"]) + update.fillable_qty
+        for fill in result.fills:
+            if fill.reason == FillReason.TRADE_AT_LEVEL:
+                self._step_diag["trade_at_level_fill_count"] = int(self._step_diag["trade_at_level_fill_count"]) + 1
+            elif fill.reason == FillReason.TRADE_THROUGH:
+                self._step_diag["trade_through_fill_count"] = int(self._step_diag["trade_through_fill_count"]) + 1
+            elif fill.reason == FillReason.QUEUE_DEPLETION:
+                self._step_diag["queue_depletion_fill_count"] = int(self._step_diag["queue_depletion_fill_count"]) + 1
 
     def _build_observation(self) -> np.ndarray:
         state = self._require_state()
@@ -488,12 +588,13 @@ class ExecutionEnv:
     def _process_event(self, event_index: int) -> tuple[Fill, ...]:
         state = self._require_state()
         event = self.tape.arrays.events[event_index]
+        event_key = self._event_key_at_index(event_index)
         code = int(event["event_type_code"])
         old_event_local = int(self.tape.arrays.events[state.event_index]["local_ts_us"])
         fills: tuple[Fill, ...] = ()
         if code == EVENT_TYPE_CODE_L2_BATCH:
             book_ptr = int(event["book_ptr"])
-            fills = self._process_l2_event(book_ptr)
+            fills = self._process_l2_event(book_ptr, event_key=event_key)
             if self._book_top_from_ptr(book_ptr) is not None:
                 state.current_book_ptr = book_ptr
         elif code == EVENT_TYPE_CODE_TRADE:
@@ -501,39 +602,64 @@ class ExecutionEnv:
             result = simulate_trade_event(
                 state.live_orders,
                 trade,
+                event_key=event_key,
                 symbol_spec=self.tape.manifest.symbol_spec,
                 config=self.config.fill_simulator_config,
             )
+            self._record_queue_updates(result)
             state.live_orders = _live_orders_tuple(result.orders)
             fills = result.fills
+            level_side = None
+            if trade.side == AggressorSide.SELL:
+                level_side = OrderSide.BUY
+            elif trade.side == AggressorSide.BUY:
+                level_side = OrderSide.SELL
+            if level_side is not None:
+                key = (level_side, trade.price_tick)
+                self._recent_trade_depletion_by_level[key] = self._recent_trade_depletion_by_level.get(key, 0.0) + trade.amount * self.config.fill_simulator_config.queue_model.trade_at_level_weight
         state.previous_event_local_ts_us = old_event_local
         state.event_index = event_index
         return fills
 
-    def _process_l2_event(self, curr_book_ptr: int) -> tuple[Fill, ...]:
+    def _process_l2_event(self, curr_book_ptr: int, *, event_key: EventKey) -> tuple[Fill, ...]:
         state = self._require_state()
         if curr_book_ptr < 0:
             return ()
-        local_ts_us = int(self.tape.arrays.l2_events[curr_book_ptr]["local_ts_us"])
         updated_orders = state.live_orders
         fills: list[Fill] = []
+        processed_levels: set[tuple[OrderSide, int]] = set()
         for order in tuple(updated_orders):
             if not order.is_live:
                 continue
+            level_key = (order.side, order.price_tick)
+            if level_key in processed_levels:
+                continue
+            processed_levels.add(level_key)
             prev_qty, prev_known = self._level_qty_with_depth_status(book_ptr=state.current_book_ptr, side=order.side, price_tick=order.price_tick)
             curr_qty, curr_known = self._level_qty_with_depth_status(book_ptr=curr_book_ptr, side=order.side, price_tick=order.price_tick)
             if not (prev_known and curr_known):
                 continue
+            raw_decrease = max((prev_qty if prev_qty is not None else 0.0) - (curr_qty if curr_qty is not None else 0.0), 0.0)
+            self._step_diag["l2_raw_decrease_qty"] = float(self._step_diag["l2_raw_decrease_qty"]) + raw_decrease
+            if self.config.fill_simulator_config.queue_model.dedupe_l2_decrease_with_trade_prints:
+                already = self._recent_trade_depletion_by_level.get(level_key, 0.0)
+                deduped = min(raw_decrease, already)
+                l2_decrease_qty = raw_decrease - deduped
+                self._recent_trade_depletion_by_level[level_key] = max(already - deduped, 0.0)
+                self._step_diag["l2_trade_dedupe_qty"] = float(self._step_diag["l2_trade_dedupe_qty"]) + deduped
+            else:
+                l2_decrease_qty = raw_decrease
+            self._step_diag["l2_effective_decrease_qty"] = float(self._step_diag["l2_effective_decrease_qty"]) + l2_decrease_qty
             result = simulate_l2_level_update(
                 updated_orders,
                 side=order.side,
                 price_tick=order.price_tick,
-                prev_level_qty=prev_qty if prev_qty is not None else 0.0,
-                curr_level_qty=curr_qty if curr_qty is not None else 0.0,
-                local_ts_us=local_ts_us,
+                l2_decrease_qty=l2_decrease_qty,
+                event_key=event_key,
                 symbol_spec=self.tape.manifest.symbol_spec,
                 config=self.config.fill_simulator_config,
             )
+            self._record_queue_updates(result)
             updated_orders = _live_orders_tuple(result.orders)
             fills.extend(result.fills)
         state.live_orders = _live_orders_tuple(updated_orders)

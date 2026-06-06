@@ -17,6 +17,7 @@ from typing import Any
 from mmrt.contracts import AggressorSide, BookSide, TardisDataType
 from mmrt.metadata.rule_compatibility import RuleCompatibilityReport
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules
+from mmrt.time_key import EventKey
 
 
 class _StrEnum(str, Enum):
@@ -150,9 +151,10 @@ class QuoteSide(_StrEnum):
 
 
 class OrderStatus(_StrEnum):
-    INACTIVE = "inactive"
+    PENDING_NEW = "pending_new"
     ACTIVE = "active"
     PARTIALLY_FILLED = "partially_filled"
+    PENDING_CANCEL = "pending_cancel"
     FILLED = "filled"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
@@ -556,9 +558,14 @@ class ActiveOrder:
     status: OrderStatus
     created_local_ts_us: int
     last_update_local_ts_us: int
+    created_event_seq: int
+    last_update_event_seq: int
     effective_local_ts_us: int = 0
     cancel_requested_local_ts_us: int = 0
     cancel_effective_local_ts_us: int = 0
+    effective_event_seq: int = -1
+    cancel_requested_event_seq: int = -1
+    cancel_effective_event_seq: int = -1
 
     def __post_init__(self) -> None:
         _require_nonnegative_int(self.order_id, "order_id")
@@ -570,42 +577,104 @@ class ActiveOrder:
             raise ValueError("remaining_qty must be <= qty")
         object.__setattr__(self, "queue_ahead_qty", _require_nonnegative_float(self.queue_ahead_qty, "queue_ahead_qty"))
         object.__setattr__(self, "status", _coerce_enum(OrderStatus, self.status, "status"))
-        if self.status == OrderStatus.FILLED and self.remaining_qty != 0.0:
-            raise ValueError("FILLED order requires remaining_qty == 0")
-        if self.status == OrderStatus.PARTIALLY_FILLED and not (0.0 < self.remaining_qty < self.qty):
-            raise ValueError("PARTIALLY_FILLED order requires 0 < remaining_qty < qty")
-        if self.status == OrderStatus.ACTIVE and self.remaining_qty <= 0.0:
-            raise ValueError("ACTIVE order requires remaining_qty > 0")
         _require_positive_int(self.created_local_ts_us, "created_local_ts_us")
         _require_positive_int(self.last_update_local_ts_us, "last_update_local_ts_us")
-        if self.last_update_local_ts_us < self.created_local_ts_us:
-            raise ValueError("last_update_local_ts_us must be >= created_local_ts_us")
+        _require_nonnegative_int(self.created_event_seq, "created_event_seq")
+        _require_nonnegative_int(self.last_update_event_seq, "last_update_event_seq")
         _require_nonnegative_int(self.effective_local_ts_us, "effective_local_ts_us")
         _require_nonnegative_int(self.cancel_requested_local_ts_us, "cancel_requested_local_ts_us")
         _require_nonnegative_int(self.cancel_effective_local_ts_us, "cancel_effective_local_ts_us")
-        if self.effective_local_ts_us and self.effective_local_ts_us < self.created_local_ts_us:
-            raise ValueError("effective_local_ts_us must be >= created_local_ts_us")
+        for value, name in ((self.effective_event_seq, "effective_event_seq"), (self.cancel_requested_event_seq, "cancel_requested_event_seq"), (self.cancel_effective_event_seq, "cancel_effective_event_seq")):
+            if isinstance(value, bool) or not isinstance(value, int) or value < -1:
+                raise ValueError(f"{name} must be >= -1")
+        if (self.effective_local_ts_us == 0) != (self.effective_event_seq == -1):
+            raise ValueError("effective timestamp/key sentinels must agree")
+        if (self.cancel_requested_local_ts_us == 0) != (self.cancel_requested_event_seq == -1):
+            raise ValueError("cancel requested timestamp/key sentinels must agree")
+        if (self.cancel_effective_local_ts_us == 0) != (self.cancel_effective_event_seq == -1):
+            raise ValueError("cancel effective timestamp/key sentinels must agree")
+
+        created_key = self.created_key
+        if self.last_update_key < created_key:
+            raise ValueError("last_update_key must be >= created_key")
+        if self.effective_local_ts_us and self.effective_key < created_key:
+            raise ValueError("effective_key must be >= created_key")
         if self.cancel_effective_local_ts_us and not self.cancel_requested_local_ts_us:
-            raise ValueError("cancel_effective_local_ts_us requires cancel_requested_local_ts_us")
-        if self.cancel_requested_local_ts_us and self.cancel_effective_local_ts_us < self.cancel_requested_local_ts_us:
-            raise ValueError("cancel_effective_local_ts_us must be >= cancel_requested_local_ts_us")
+            raise ValueError("cancel_effective_key requires cancel_requested_key")
+        if self.cancel_requested_local_ts_us:
+            if self.cancel_requested_key is None or self.cancel_requested_key < created_key:
+                raise ValueError("cancel_requested_key must be >= created_key")
+            if self.cancel_effective_key is None or self.cancel_effective_key < self.cancel_requested_key:
+                raise ValueError("cancel_effective_key must be >= cancel_requested_key")
+
+        if self.status == OrderStatus.PENDING_NEW and self.remaining_qty != self.qty:
+            raise ValueError("PENDING_NEW order requires remaining_qty == qty")
+        if self.status == OrderStatus.FILLED and self.remaining_qty != 0.0:
+            raise ValueError("FILLED order requires remaining_qty == 0")
+        if self.status == OrderStatus.PARTIALLY_FILLED:
+            if not (0.0 < self.remaining_qty < self.qty):
+                raise ValueError("PARTIALLY_FILLED order requires 0 < remaining_qty < qty")
+            if self.cancel_effective_key is not None:
+                raise ValueError("PARTIALLY_FILLED order cannot have pending cancel")
+        if self.status == OrderStatus.ACTIVE and self.remaining_qty <= 0.0:
+            raise ValueError("ACTIVE order requires remaining_qty > 0")
+        if self.status == OrderStatus.PENDING_CANCEL:
+            if self.remaining_qty <= 0.0:
+                raise ValueError("PENDING_CANCEL order requires remaining_qty > 0")
+            if self.cancel_requested_key is None or self.cancel_effective_key is None:
+                raise ValueError("PENDING_CANCEL order requires cancel keys")
+        if self.status == OrderStatus.REJECTED and self.remaining_qty != self.qty:
+            raise ValueError("REJECTED order requires remaining_qty == qty")
 
     @property
     def filled_qty(self) -> float:
         return self.qty - self.remaining_qty
 
     @property
-    def is_live(self) -> bool:
-        return self.status in (OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED)
+    def created_key(self) -> EventKey:
+        return EventKey(self.created_local_ts_us, self.created_event_seq)
 
-    def is_fillable_at(self, local_ts_us: int) -> bool:
-        _require_positive_int(local_ts_us, "local_ts_us")
-        if not self.is_live:
+    @property
+    def last_update_key(self) -> EventKey:
+        return EventKey(self.last_update_local_ts_us, self.last_update_event_seq)
+
+    @property
+    def effective_key(self) -> EventKey:
+        if self.effective_local_ts_us:
+            return EventKey(self.effective_local_ts_us, self.effective_event_seq)
+        return self.created_key
+
+    @property
+    def cancel_requested_key(self) -> EventKey | None:
+        if not self.cancel_requested_local_ts_us:
+            return None
+        return EventKey(self.cancel_requested_local_ts_us, self.cancel_requested_event_seq)
+
+    @property
+    def cancel_effective_key(self) -> EventKey | None:
+        if not self.cancel_effective_local_ts_us:
+            return None
+        return EventKey(self.cancel_effective_local_ts_us, self.cancel_effective_event_seq)
+
+    @property
+    def is_live(self) -> bool:
+        return self.status in (OrderStatus.PENDING_NEW, OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED)
+
+    def is_fillable_at_key(self, key: EventKey) -> bool:
+        if not isinstance(key, EventKey):
+            raise ValueError("key must be EventKey")
+        if self.status not in (OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL):
             return False
-        effective = self.effective_local_ts_us or self.created_local_ts_us
-        if local_ts_us < effective:
+        if key < self.effective_key:
             return False
-        return self.cancel_effective_local_ts_us == 0 or local_ts_us < self.cancel_effective_local_ts_us
+        cancel_key = self.cancel_effective_key
+        if cancel_key is not None and key >= cancel_key:
+            return False
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,6 +682,7 @@ class Fill:
     order_id: int
     side: OrderSide
     local_ts_us: int
+    event_seq: int
     price_tick: int
     qty: float
     fee: float
@@ -624,6 +694,8 @@ class Fill:
         _require_nonnegative_int(self.order_id, "order_id")
         object.__setattr__(self, "side", _coerce_enum(OrderSide, self.side, "side"))
         _require_positive_int(self.local_ts_us, "local_ts_us")
+        _require_nonnegative_int(self.event_seq, "event_seq")
+        EventKey(self.local_ts_us, self.event_seq)
         _require_positive_int(self.price_tick, "price_tick")
         object.__setattr__(self, "qty", _require_positive_float(self.qty, "qty"))
         object.__setattr__(self, "fee", _require_finite_float(self.fee, "fee"))

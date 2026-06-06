@@ -244,23 +244,25 @@ def test_active_order_and_fill_validation_and_properties():
         queue_ahead_qty=1.0,
         status=OrderStatus.PARTIALLY_FILLED,
         created_local_ts_us=100,
+        created_event_seq=0,
         last_update_local_ts_us=110,
+        last_update_event_seq=0,
     )
     assert order.filled_qty == pytest.approx(0.015)
     assert order.is_live
-    assert not ActiveOrder(1, OrderSide.SELL, 1002, 0.02, 0.0, 0.0, OrderStatus.FILLED, 100, 110).is_live
+    assert not ActiveOrder(1, OrderSide.SELL, 1002, 0.02, 0.0, 0.0, OrderStatus.FILLED, 100, 110, 0, 0).is_live
 
-    fill = Fill(1, "buy", 120, 1000, 0.01, -0.001, FillReason.TRADE_AT_LEVEL)
+    fill = Fill(1, "buy", 120, 0, 1000, 0.01, -0.001, FillReason.TRADE_AT_LEVEL)
     assert fill.fee == pytest.approx(-0.001)
 
     with pytest.raises(ValueError):
-        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.03, 0.0, OrderStatus.ACTIVE, 100, 110)
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.03, 0.0, OrderStatus.ACTIVE, 100, 110, 0, 0)
     with pytest.raises(ValueError):
-        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.01, 0.0, OrderStatus.FILLED, 100, 110)
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.01, 0.0, OrderStatus.FILLED, 100, 110, 0, 0)
     with pytest.raises(ValueError):
-        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.02, 0.0, OrderStatus.PARTIALLY_FILLED, 100, 110)
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.02, 0.0, OrderStatus.PARTIALLY_FILLED, 100, 110, 0, 0)
     with pytest.raises(ValueError):
-        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.0, 0.0, OrderStatus.ACTIVE, 100, 110)
+        ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.0, 0.0, OrderStatus.ACTIVE, 100, 110, 0, 0)
 
 
 def test_position_state_mark_to_market_requires_positive_mid():
@@ -290,7 +292,7 @@ def test_reward_components_total_and_penalties():
 
 
 def test_execution_step_result_validation():
-    fill = Fill(1, OrderSide.BUY, 120, 1000, 0.01, -0.001, FillReason.TRADE_AT_LEVEL)
+    fill = Fill(1, OrderSide.BUY, 120, 0, 1000, 0.01, -0.001, FillReason.TRADE_AT_LEVEL)
     result = ExecutionStepResult(
         reward=RewardComponents(1.0),
         position=PositionState(),

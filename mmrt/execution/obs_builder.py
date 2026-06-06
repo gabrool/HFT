@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 from mmrt.execution.contracts import (
     ActiveOrder,
     BookTop,
@@ -360,7 +361,7 @@ def _live_orders_by_side(orders: tuple[ActiveOrder, ...], *, local_ts_us: int) -
     bid_order: ActiveOrder | None = None
     ask_order: ActiveOrder | None = None
     for order in orders:
-        if not order.is_fillable_at(local_ts_us):
+        if not order.is_fillable_at_key(EventKey(local_ts_us, MAX_EVENT_SEQ)):
             continue
         if order.side == OrderSide.BUY:
             if bid_order is not None:
