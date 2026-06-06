@@ -233,7 +233,7 @@ def _write_json_atomic(report: dict[str, object], path: str) -> str:
     if target.suffix != ".json":
         raise ValueError("output path must end with .json")
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(report, sort_keys=True, indent=2, allow_nan=True) + "\n"
+    payload = json.dumps(report, sort_keys=True, indent=2, allow_nan = True) + "\n"
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(payload, encoding="utf-8")
     tmp.replace(target)
@@ -241,7 +241,7 @@ def _write_json_atomic(report: dict[str, object], path: str) -> str:
 
 
 def _print_json(payload: dict[str, object]) -> None:
-    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=True))
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan = True))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

@@ -196,7 +196,7 @@ def test_train_linear_model_end_to_end(tmp_path: Path):
         assert "no_move" in split["diagnostics"]["coefficients"]
         assert "p_no_move" in split["diagnostics"]["predictions"]
         assert "expected_signed_edge_bps" in split["diagnostics"]["predictions"]
-    json.dumps(result.as_dict(), allow_nan=True)
+    json.dumps(result.as_dict(), allow_nan = True)
 
 
 def test_train_linear_model_without_test_split(tmp_path: Path):

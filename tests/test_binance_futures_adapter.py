@@ -1,3 +1,4 @@
+import inspect
 import subprocess
 import sys
 
@@ -8,14 +9,10 @@ from mmrt.data.binance_futures_adapter import (
     BINANCE_FUTURES_BOOK_SIDE_TO_CODE,
     BINANCE_FUTURES_DEFAULT_MERGE_RANKS,
     BINANCE_FUTURES_EXCHANGE,
-    BINANCE_FUTURES_TRADE_SIDE_TO_CODE,
-    BINANCE_FUTURES_ACCEPTED_DATA_TYPES,
-    BINANCE_FUTURES_CONTEXT_DATA_TYPES,
-    BINANCE_FUTURES_SOURCE_DATA_TYPES,
     BINANCE_FUTURES_SYMBOL,
+    BINANCE_FUTURES_TRADE_SIDE_TO_CODE,
     BOOK_SIDE_ASK,
     BOOK_SIDE_BID,
-    BOOK_SIDE_UNKNOWN,
     SIDE_BUY,
     SIDE_SELL,
     SIDE_UNKNOWN,
@@ -23,18 +20,10 @@ from mmrt.data.binance_futures_adapter import (
     binance_futures_book_side_code,
     binance_futures_default_merge_rank,
     binance_futures_trade_side_code,
-    default_binance_futures_accepted_data_types,
-    default_binance_futures_context_data_types,
-    default_binance_futures_source_data_types,
-    is_binance_futures_accepted_data_type,
-    is_binance_futures_context_data_type,
-    is_binance_futures_source_data_type,
     merged_parquet_basename,
     normalize_binance_futures_exchange,
     normalize_binance_futures_symbol,
-    normalize_binance_futures_data_types,
     normalized_parquet_basename,
-    require_binance_futures_data_type,
     validate_binance_futures_market,
 )
 
@@ -42,16 +31,11 @@ from mmrt.data.binance_futures_adapter import (
 def test_constants_match_tardis_policy():
     assert BINANCE_FUTURES_EXCHANGE == "binance-futures"
     assert BINANCE_FUTURES_SYMBOL == "BTCUSDT"
-    assert BINANCE_FUTURES_SOURCE_DATA_TYPES == (
-        TardisDataType.BOOK_SNAPSHOT_25,
-        TardisDataType.TRADES,
-    )
-    assert BINANCE_FUTURES_CONTEXT_DATA_TYPES == (TardisDataType.INCREMENTAL_BOOK_L2,)
-    assert BINANCE_FUTURES_ACCEPTED_DATA_TYPES == (
-        TardisDataType.BOOK_SNAPSHOT_25,
-        TardisDataType.TRADES,
-        TardisDataType.INCREMENTAL_BOOK_L2,
-    )
+    assert BINANCE_FUTURES_DEFAULT_MERGE_RANKS == {
+        TardisDataType.BOOK_SNAPSHOT_25: 0,
+        TardisDataType.INCREMENTAL_BOOK_L2: 1,
+        TardisDataType.TRADES: 2,
+    }
 
 
 def test_local_side_code_constants():
@@ -60,7 +44,6 @@ def test_local_side_code_constants():
     assert SIDE_UNKNOWN == 0
     assert BOOK_SIDE_BID == 1
     assert BOOK_SIDE_ASK == -1
-    assert BOOK_SIDE_UNKNOWN == 0
 
 
 def test_market_dataclass_validation():
@@ -105,59 +88,13 @@ def test_validate_market():
     assert market == BinanceFuturesMarket("binance-futures", "BTCUSDT")
 
 
-def test_data_type_support_predicates():
-    assert is_binance_futures_source_data_type(TardisDataType.BOOK_SNAPSHOT_25)
-    assert is_binance_futures_source_data_type(TardisDataType.TRADES)
-    assert not is_binance_futures_source_data_type(TardisDataType.INCREMENTAL_BOOK_L2)
-    assert is_binance_futures_context_data_type(TardisDataType.INCREMENTAL_BOOK_L2)
-    with pytest.raises(ValueError):
-        is_binance_futures_accepted_data_type("quotes")
-    with pytest.raises(ValueError):
-        is_binance_futures_accepted_data_type("options_chain")
-
-
-def test_require_data_type():
-    assert require_binance_futures_data_type("trades") == TardisDataType.TRADES
-    assert require_binance_futures_data_type(TardisDataType.BOOK_SNAPSHOT_25) == TardisDataType.BOOK_SNAPSHOT_25
-    with pytest.raises(ValueError):
-        require_binance_futures_data_type("quotes")
-    with pytest.raises(ValueError):
-        require_binance_futures_data_type("options_chain")
-    with pytest.raises(ValueError):
-        require_binance_futures_data_type("not-a-type")
-
-
-def test_normalize_data_types_preserves_order_and_rejects_duplicates():
-    got = normalize_binance_futures_data_types(["trades", "book_snapshot_25"])
-    assert got == (TardisDataType.TRADES, TardisDataType.BOOK_SNAPSHOT_25)
-    with pytest.raises(ValueError):
-        normalize_binance_futures_data_types(["trades", "trades"])
-    with pytest.raises(ValueError):
-        normalize_binance_futures_data_types([])
-    with pytest.raises(ValueError):
-        normalize_binance_futures_data_types(["quotes"])
-
-
-def test_default_data_type_functions():
-    assert isinstance(default_binance_futures_source_data_types(), tuple)
-    assert isinstance(default_binance_futures_context_data_types(), tuple)
-    assert isinstance(default_binance_futures_accepted_data_types(), tuple)
-    assert default_binance_futures_source_data_types() == BINANCE_FUTURES_SOURCE_DATA_TYPES
-    assert default_binance_futures_context_data_types() == BINANCE_FUTURES_CONTEXT_DATA_TYPES
-    assert default_binance_futures_accepted_data_types() == BINANCE_FUTURES_ACCEPTED_DATA_TYPES
-
-
 def test_default_merge_rank():
     assert binance_futures_default_merge_rank(TardisDataType.BOOK_SNAPSHOT_25) == 0
     assert binance_futures_default_merge_rank(TardisDataType.INCREMENTAL_BOOK_L2) == 1
     assert binance_futures_default_merge_rank(TardisDataType.TRADES) == 2
     with pytest.raises(ValueError):
         binance_futures_default_merge_rank("quotes")
-    with pytest.raises(ValueError):
-        binance_futures_default_merge_rank("options_chain")
-    for dtype in BINANCE_FUTURES_ACCEPTED_DATA_TYPES:
-        assert isinstance(binance_futures_default_merge_rank(dtype), int)
-    ranks = [binance_futures_default_merge_rank(dtype) for dtype in BINANCE_FUTURES_ACCEPTED_DATA_TYPES]
+    ranks = [binance_futures_default_merge_rank(dtype) for dtype in BINANCE_FUTURES_DEFAULT_MERGE_RANKS]
     assert len(set(ranks)) == len(ranks)
 
 
@@ -166,8 +103,10 @@ def test_trade_side_code():
     assert binance_futures_trade_side_code("BUY") == SIDE_BUY
     assert binance_futures_trade_side_code(" sell ") == SIDE_SELL
     assert binance_futures_trade_side_code("unknown") == SIDE_UNKNOWN
-    assert binance_futures_trade_side_code("") == SIDE_UNKNOWN
-    assert binance_futures_trade_side_code(None) == SIDE_UNKNOWN
+    with pytest.raises(ValueError):
+        binance_futures_trade_side_code("")
+    with pytest.raises(ValueError):
+        binance_futures_trade_side_code(None)
     with pytest.raises(ValueError):
         binance_futures_trade_side_code("bid")
     with pytest.raises(ValueError):
@@ -178,8 +117,10 @@ def test_book_side_code():
     assert binance_futures_book_side_code("bid") == BOOK_SIDE_BID
     assert binance_futures_book_side_code("BID") == BOOK_SIDE_BID
     assert binance_futures_book_side_code(" ask ") == BOOK_SIDE_ASK
-    assert binance_futures_book_side_code("") == BOOK_SIDE_UNKNOWN
-    assert binance_futures_book_side_code(None) == BOOK_SIDE_UNKNOWN
+    with pytest.raises(ValueError):
+        binance_futures_book_side_code("")
+    with pytest.raises(ValueError):
+        binance_futures_book_side_code(None)
     with pytest.raises(ValueError):
         binance_futures_book_side_code("buy")
     with pytest.raises(ValueError):
@@ -219,8 +160,6 @@ def test_adapter_import_smoke():
     import mmrt.data.binance_futures_adapter as adapter
 
     assert adapter.BINANCE_FUTURES_EXCHANGE == "binance-futures"
-
-
 
 
 def test_adapter_does_not_import_heavy_data_modules():
@@ -273,3 +212,24 @@ def test_no_feature_label_or_decision_concepts():
     assert BINANCE_FUTURES_TRADE_SIDE_TO_CODE["buy"] == SIDE_BUY
     assert BINANCE_FUTURES_BOOK_SIDE_TO_CODE["bid"] == BOOK_SIDE_BID
     assert BINANCE_FUTURES_DEFAULT_MERGE_RANKS[TardisDataType.TRADES] == 2
+
+
+def test_adapter_has_no_source_context_accepted_helper_bloat():
+    import mmrt.data.binance_futures_adapter as adapter
+
+    src = inspect.getsource(adapter)
+    forbidden = (
+        "SOURCE" + "_DATA_TYPES",
+        "CONTEXT" + "_DATA_TYPES",
+        "ACCEPTED" + "_DATA_TYPES",
+        "is_binance_futures_source" + "_data_type",
+        "is_binance_futures_context" + "_data_type",
+        "is_binance_futures_accepted" + "_data_type",
+        "default_binance_futures_source" + "_data_types",
+        "default_binance_futures_context" + "_data_types",
+        "default_binance_futures_accepted" + "_data_types",
+        "normalize_binance_futures_data" + "_types",
+        "require_binance_futures_data" + "_type",
+    )
+    for token in forbidden:
+        assert token not in src

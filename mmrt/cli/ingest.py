@@ -387,7 +387,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--trades-csv", action="append", required=True)
     p.add_argument("--exchange", default=cfg.DEFAULT_EXCHANGE)
     p.add_argument("--symbol", default=cfg.DEFAULT_SYMBOL)
-    p.add_argument("--book-data-type", default="book_snapshot_25")
     p.add_argument("--created-at-utc", default=None)
     p.add_argument("--work-dir", default=None)
     p.add_argument("--event-batch-size", type=int, default=65536)
@@ -396,8 +395,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--decision-stride-us", type=int, default=cfg.DEFAULT_DECISION_STRIDE_US)
     p.add_argument("--label-horizons-us", default=",".join(str(x) for x in cfg.DEFAULT_HORIZONS_US))
     p.add_argument("--label-entry-delay-us", type=int, default=cfg.DEFAULT_ENTRY_DELAY_US)
-    p.add_argument("--validate-output", dest="validate_output", action="store_true", default=True)
-    p.add_argument("--no-validate-output", dest="validate_output", action="store_false")
     p.add_argument("--max-events", type=int, default=None)
     p.add_argument("--split-train", default=None)
     p.add_argument("--split-val", default=None)
@@ -412,10 +409,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    if args.book_data_type != "book_snapshot_25":
-        if args.book_data_type == "incremental_book_L2":
-            raise ValueError("cli.ingest supports only book_snapshot_25 book inputs; incremental_book_L2 reconstruction belongs in a later data-layer integration")
-        raise ValueError("cli.ingest supports only book_snapshot_25 book inputs")
     _require_positive_int(args.event_batch_size, "event_batch_size")
     _require_positive_int(args.chunk_rows, "chunk_rows")
     if args.decision_stride_us != cfg.DEFAULT_DECISION_STRIDE_US:
@@ -471,8 +464,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     split_manifest = _maybe_apply_splits(dataset_root, args)
     if split_manifest is not None:
         manifest = split_manifest
-    if args.validate_output:
-        _validate_output_dataset(dataset_root)
+    _validate_output_dataset(dataset_root)
 
     shutil.rmtree(work_dir)
     summary = {

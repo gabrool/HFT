@@ -14,9 +14,6 @@ from mmrt.contracts import (
 )
 from mmrt.features.specs import FEATURE_SCHEMA as DEFAULT_FEATURE_SCHEMA
 
-US_PER_MS = 1_000
-US_PER_SECOND = 1_000_000
-
 DEFAULT_EXCHANGE = "binance-futures"
 DEFAULT_SYMBOL = "BTCUSDT"
 
@@ -260,8 +257,6 @@ def default_label_spec() -> LabelSpec:
 
 
 __all__ = [
-    "US_PER_MS",
-    "US_PER_SECOND",
     "DEFAULT_EXCHANGE",
     "DEFAULT_SYMBOL",
     "DEFAULT_SOURCE_DATA_TYPES",

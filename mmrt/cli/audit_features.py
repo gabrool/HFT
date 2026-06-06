@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             sort_keys=True,
             separators=(",", ":"),
-            allow_nan=True,
+            allow_nan = True,
         )
     )
     return 0
