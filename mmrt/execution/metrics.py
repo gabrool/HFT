@@ -118,6 +118,20 @@ class ExecutionMetricAccumulator:
     all_quotes_disabled_count: int = 0
 
     cancel_count_total: int = 0
+    post_only_reject_count_total: int = 0
+    activated_order_count_total: int = 0
+    effective_cancel_count_total: int = 0
+    pending_cancel_request_count_total: int = 0
+    queue_trade_advance_qty_total: float = 0.0
+    queue_l2_advance_qty_total: float = 0.0
+    queue_advanced_qty_total: float = 0.0
+    queue_fillable_qty_total: float = 0.0
+    trade_at_level_fill_count: int = 0
+    trade_through_fill_count: int = 0
+    queue_depletion_fill_count: int = 0
+    l2_trade_dedupe_qty_total: float = 0.0
+    l2_raw_decrease_qty_total: float = 0.0
+    l2_effective_decrease_qty_total: float = 0.0
     turnover_notional_total: float = 0.0
 
     raw_equity_delta_total: float = 0.0
@@ -181,6 +195,20 @@ class ExecutionMetricAccumulator:
         self.all_quotes_disabled_count += int(not bid_enabled and not ask_enabled)
 
         self.cancel_count_total += _info_int(info, "cancel_count", 0)
+        self.post_only_reject_count_total += _info_int(info, "post_only_reject_count", 0)
+        self.activated_order_count_total += _info_int(info, "activated_order_count", 0)
+        self.effective_cancel_count_total += _info_int(info, "effective_cancel_count", 0)
+        self.pending_cancel_request_count_total += _info_int(info, "pending_cancel_request_count", 0)
+        self.queue_trade_advance_qty_total += _info_float(info, "queue_trade_advance_qty", 0.0)
+        self.queue_l2_advance_qty_total += _info_float(info, "queue_l2_advance_qty", 0.0)
+        self.queue_advanced_qty_total += _info_float(info, "queue_advanced_qty", 0.0)
+        self.queue_fillable_qty_total += _info_float(info, "queue_fillable_qty", 0.0)
+        self.trade_at_level_fill_count += _info_int(info, "trade_at_level_fill_count", 0)
+        self.trade_through_fill_count += _info_int(info, "trade_through_fill_count", 0)
+        self.queue_depletion_fill_count += _info_int(info, "queue_depletion_fill_count", 0)
+        self.l2_trade_dedupe_qty_total += _info_float(info, "l2_trade_dedupe_qty", 0.0)
+        self.l2_raw_decrease_qty_total += _info_float(info, "l2_raw_decrease_qty", 0.0)
+        self.l2_effective_decrease_qty_total += _info_float(info, "l2_effective_decrease_qty", 0.0)
         self.turnover_notional_total += _info_float(info, "turnover_notional", 0.0)
 
         reward = step.reward
@@ -272,10 +300,26 @@ class ExecutionMetricAccumulator:
             "orders": {
                 "cancel_count_total": self.cancel_count_total,
                 "cancel_rate_per_step": self.cancel_count_total / denominator,
+                "post_only_reject_count_total": self.post_only_reject_count_total,
+                "activated_order_count_total": self.activated_order_count_total,
+                "effective_cancel_count_total": self.effective_cancel_count_total,
+                "pending_cancel_request_count_total": self.pending_cancel_request_count_total,
                 "quote_bid_enabled_count": self.quote_bid_enabled_count,
                 "quote_ask_enabled_count": self.quote_ask_enabled_count,
                 "two_sided_quote_count": self.two_sided_quote_count,
                 "all_quotes_disabled_count": self.all_quotes_disabled_count,
+            },
+            "queue": {
+                "trade_advance_qty_total": self.queue_trade_advance_qty_total,
+                "l2_advance_qty_total": self.queue_l2_advance_qty_total,
+                "advanced_qty_total": self.queue_advanced_qty_total,
+                "fillable_qty_total": self.queue_fillable_qty_total,
+                "trade_at_level_fill_count": self.trade_at_level_fill_count,
+                "trade_through_fill_count": self.trade_through_fill_count,
+                "queue_depletion_fill_count": self.queue_depletion_fill_count,
+                "l2_trade_dedupe_qty_total": self.l2_trade_dedupe_qty_total,
+                "l2_raw_decrease_qty_total": self.l2_raw_decrease_qty_total,
+                "l2_effective_decrease_qty_total": self.l2_effective_decrease_qty_total,
             },
             "turnover": {
                 "notional_total": self.turnover_notional_total,

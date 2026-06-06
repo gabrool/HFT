@@ -179,6 +179,7 @@ class ExecutionPPOTrainCLIConfig:
     l2_decrease_weight: float = 0.25
     trade_at_level_weight: float = 0.5
     unknown_level_queue_ahead_qty: float = 1_000_000_000.0
+    dedupe_l2_decrease_with_trade_prints: bool = True
 
     maker_fee_bps: float = -0.5
 
@@ -261,6 +262,7 @@ class ExecutionPPOTrainCLIConfig:
         _require_probability(self.l2_decrease_weight, "l2_decrease_weight")
         _require_probability(self.trade_at_level_weight, "trade_at_level_weight")
         _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty")
+        _require_bool(self.dedupe_l2_decrease_with_trade_prints, "dedupe_l2_decrease_with_trade_prints")
         _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
         _require_nonnegative_int(self.decision_compute_latency_us, "decision_compute_latency_us")
         _require_nonnegative_int(self.order_entry_latency_us, "order_entry_latency_us")
@@ -344,6 +346,7 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "l2_decrease_weight": config.l2_decrease_weight,
         "trade_at_level_weight": config.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
+        "dedupe_l2_decrease_with_trade_prints": config.dedupe_l2_decrease_with_trade_prints,
         "maker_fee_bps": config.maker_fee_bps,
         "decision_compute_latency_us": config.decision_compute_latency_us,
         "order_entry_latency_us": config.order_entry_latency_us,
@@ -419,6 +422,7 @@ def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
                 l2_decrease_weight=config.l2_decrease_weight,
                 trade_at_level_weight=config.trade_at_level_weight,
                 unknown_level_queue_ahead_qty=config.unknown_level_queue_ahead_qty,
+                dedupe_l2_decrease_with_trade_prints=config.dedupe_l2_decrease_with_trade_prints,
             ),
             maker_fee_bps=config.maker_fee_bps,
         ),

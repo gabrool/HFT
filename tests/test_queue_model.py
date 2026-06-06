@@ -4,6 +4,7 @@ import pytest
 
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import ActiveOrder, FillReason, OrderSide, OrderStatus, QueueModelMode, TradePrint
+from mmrt.time_key import EventKey
 from mmrt.execution.queue_model import (
     QueueModelConfig,
     QueueModelUpdate,
@@ -32,7 +33,9 @@ def _order(
         queue_ahead_qty=queue_ahead_qty,
         status=status,
         created_local_ts_us=100,
+        created_event_seq=0,
         last_update_local_ts_us=100,
+        last_update_event_seq=0,
     )
 
 
@@ -169,8 +172,7 @@ def test_conservative_mode_ignores_l2_decreases():
     update = update_queue_position(
         _order(queue_ahead_qty=2.0),
         config=QueueModelConfig(mode=QueueModelMode.CONSERVATIVE),
-        prev_level_qty=5.0,
-        curr_level_qty=1.0,
+        l2_decrease_qty=2.0,
     )
 
     assert update.queue_ahead_after == 2.0
@@ -182,12 +184,11 @@ def test_balanced_mode_l2_decrease_advances_queue():
     update = update_queue_position(
         _order(queue_ahead_qty=2.0, remaining_qty=1.0),
         config=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=0.5),
-        prev_level_qty=5.0,
-        curr_level_qty=3.0,
+        l2_decrease_qty=1.0,
     )
 
-    assert update.queue_ahead_after == 1.0
-    assert update.l2_advance_qty == 1.0
+    assert update.queue_ahead_after == 1.5
+    assert update.l2_advance_qty == 0.5
     assert update.fillable_qty == 0.0
 
 
@@ -195,13 +196,12 @@ def test_balanced_l2_decrease_beyond_queue_creates_fillable_signal():
     update = update_queue_position(
         _order(queue_ahead_qty=0.5, remaining_qty=1.0),
         config=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0, trade_at_level_weight=1.0),
-        prev_level_qty=5.0,
-        curr_level_qty=4.0,
+        l2_decrease_qty=5.0,
     )
 
     assert update.queue_ahead_after == 0.0
     assert update.l2_advance_qty == 0.5
-    assert update.fillable_qty == 0.5
+    assert update.fillable_qty == 1.0
     assert update.fill_reason == FillReason.QUEUE_DEPLETION
 
 
@@ -209,8 +209,7 @@ def test_l2_increase_does_not_worsen_queue():
     update = update_queue_position(
         _order(queue_ahead_qty=2.0),
         config=QueueModelConfig(mode=QueueModelMode.BALANCED),
-        prev_level_qty=1.0,
-        curr_level_qty=5.0,
+        l2_decrease_qty=0.0,
     )
 
     assert update.queue_ahead_after == 2.0
@@ -222,14 +221,13 @@ def test_combined_trade_and_l2_applies_trade_first():
         _order(queue_ahead_qty=2.0, remaining_qty=1.0),
         config=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0, trade_at_level_weight=1.0),
         trade=_trade(side=AggressorSide.SELL, price_tick=1000, amount=1.0),
-        prev_level_qty=5.0,
-        curr_level_qty=4.0,
+        l2_decrease_qty=5.0,
     )
 
     assert update.trade_advance_qty == 1.0
     assert update.l2_advance_qty == 1.0
     assert update.queue_ahead_after == 0.0
-    assert update.fillable_qty == 0.0
+    assert update.fillable_qty == 1.0
 
 
 def test_rejects_non_live_orders():
@@ -240,7 +238,7 @@ def test_rejects_non_live_orders():
         update_queue_position(_order(status=OrderStatus.CANCELLED))
 
     with pytest.raises(ValueError):
-        update_queue_position(_order(status=OrderStatus.INACTIVE))
+        update_queue_position(_order(status=OrderStatus.PENDING_NEW))
 
 
 def test_update_queue_position_does_not_mutate_order():

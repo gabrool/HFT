@@ -184,6 +184,7 @@ class AdverseSelectionTrainCLIConfig:
     l2_decrease_weight: float = 1.0
     trade_at_level_weight: float = 1.0
     unknown_level_queue_ahead_qty: float = 0.0
+    dedupe_l2_decrease_with_trade_prints: bool = True
 
     train_fraction: float = 0.7
     ridge_l2: float = 1e-3
@@ -227,6 +228,7 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "l2_decrease_weight", _require_probability(self.l2_decrease_weight, "l2_decrease_weight"))
         object.__setattr__(self, "trade_at_level_weight", _require_probability(self.trade_at_level_weight, "trade_at_level_weight"))
         object.__setattr__(self, "unknown_level_queue_ahead_qty", _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty"))
+        object.__setattr__(self, "dedupe_l2_decrease_with_trade_prints", _require_bool(self.dedupe_l2_decrease_with_trade_prints, "dedupe_l2_decrease_with_trade_prints"))
         object.__setattr__(self, "train_fraction", _require_probability_exclusive(self.train_fraction, "train_fraction"))
         object.__setattr__(self, "ridge_l2", _require_nonnegative_float(self.ridge_l2, "ridge_l2"))
         object.__setattr__(self, "min_train_samples", _require_positive_int(self.min_train_samples, "min_train_samples"))
@@ -265,6 +267,7 @@ def _build_adverse_selection_config(config: AdverseSelectionTrainCLIConfig) -> A
                 l2_decrease_weight=config.l2_decrease_weight,
                 trade_at_level_weight=config.trade_at_level_weight,
                 unknown_level_queue_ahead_qty=config.unknown_level_queue_ahead_qty,
+                dedupe_l2_decrease_with_trade_prints=config.dedupe_l2_decrease_with_trade_prints,
             ),
         ),
         drop_incomplete_horizon=config.drop_incomplete_horizon,
@@ -301,6 +304,7 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "l2_decrease_weight": config.l2_decrease_weight,
         "trade_at_level_weight": config.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
+        "dedupe_l2_decrease_with_trade_prints": config.dedupe_l2_decrease_with_trade_prints,
         "train_fraction": config.train_fraction,
         "ridge_l2": config.ridge_l2,
         "min_train_samples": config.min_train_samples,

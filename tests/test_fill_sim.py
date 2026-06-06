@@ -24,6 +24,7 @@ from mmrt.execution.fill_sim import (
     simulate_trade_event,
 )
 from mmrt.execution.queue_model import QueueModelConfig
+from mmrt.time_key import EventKey
 
 
 def _spec() -> SymbolSpec:
@@ -62,10 +63,15 @@ def _order(
         queue_ahead_qty=queue_ahead_qty,
         status=status,
         created_local_ts_us=created_local_ts_us,
+        created_event_seq=0,
         last_update_local_ts_us=last_update_local_ts_us,
+        last_update_event_seq=0,
         effective_local_ts_us=effective_local_ts_us,
+        effective_event_seq=0 if effective_local_ts_us else -1,
         cancel_requested_local_ts_us=cancel_requested_local_ts_us,
+        cancel_requested_event_seq=0 if cancel_requested_local_ts_us else -1,
         cancel_effective_local_ts_us=cancel_effective_local_ts_us,
+        cancel_effective_event_seq=0 if cancel_effective_local_ts_us else -1,
     )
 
 
@@ -100,7 +106,7 @@ def test_place_orders_from_two_sided_quote():
     orders = place_orders_from_quote(
         quote,
         next_order_id=10,
-        local_ts_us=100, effective_local_ts_us=100,
+        created_key=EventKey(100, 0), effective_key=EventKey(100, 0),
         bid_queue_ahead_qty=1.5,
         ask_queue_ahead_qty=2.5,
     )
@@ -113,7 +119,7 @@ def test_place_orders_from_two_sided_quote():
     assert bid.qty == 0.01
     assert bid.remaining_qty == 0.01
     assert bid.queue_ahead_qty == 1.5
-    assert bid.status == OrderStatus.ACTIVE
+    assert bid.status == OrderStatus.PENDING_NEW
 
     assert ask.order_id == 11
     assert ask.side == OrderSide.SELL
@@ -130,7 +136,7 @@ def test_place_orders_skips_disabled_sides():
         bid_qty=0.01,
     )
 
-    orders = place_orders_from_quote(quote, next_order_id=5, local_ts_us=100, effective_local_ts_us=100)
+    orders = place_orders_from_quote(quote, next_order_id=5, created_key=EventKey(100, 0), effective_key=EventKey(100, 0))
 
     assert len(orders) == 1
     assert orders[0].order_id == 5
@@ -142,10 +148,10 @@ def test_request_cancel_live_orders_only():
     partial = _order(order_id=2, qty=1.0, remaining_qty=0.5, status=OrderStatus.PARTIALLY_FILLED)
     filled = _order(order_id=3, qty=1.0, remaining_qty=0.0, status=OrderStatus.FILLED)
 
-    out = request_cancel_live_orders([active, partial, filled], request_local_ts_us=200, cancel_effective_local_ts_us=200)
+    out = request_cancel_live_orders([active, partial, filled], request_key=EventKey(200, 0), cancel_effective_key=EventKey(200, 0))
 
-    assert out[0].status == OrderStatus.ACTIVE
-    assert out[1].status == OrderStatus.PARTIALLY_FILLED
+    assert out[0].status == OrderStatus.PENDING_CANCEL
+    assert out[1].status == OrderStatus.PENDING_CANCEL
     assert out[0].cancel_effective_local_ts_us == 200
     assert out[1].cancel_effective_local_ts_us == 200
     assert out[2] == filled
@@ -168,13 +174,13 @@ def test_sync_orders_to_quote_cancels_live_and_appends_new():
         [old],
         quote,
         next_order_id=10,
-        decision_local_ts_us=200,
-        order_effective_local_ts_us=200,
-        cancel_effective_local_ts_us=200,
+        decision_key=EventKey(200, 0),
+        order_effective_key=EventKey(200, 0),
+        cancel_effective_key=EventKey(200, 0),
     )
 
     assert cancel_count == 1
-    assert out[0].status == OrderStatus.ACTIVE
+    assert out[0].status == OrderStatus.PENDING_CANCEL
     assert out[0].cancel_effective_local_ts_us == 200
     assert len(out) == 3
     assert out[1].order_id == 10
@@ -202,9 +208,9 @@ def test_sync_same_price_pending_cancel_places_replacement_without_double_counti
         [pending_cancel],
         quote,
         next_order_id=10,
-        decision_local_ts_us=200,
-        order_effective_local_ts_us=260,
-        cancel_effective_local_ts_us=300,
+        decision_key=EventKey(200, 0),
+        order_effective_key=EventKey(260, 0),
+        cancel_effective_key=EventKey(300, 0),
     )
 
     assert cancel_count == 0
@@ -236,9 +242,9 @@ def test_pending_cancel_and_future_replacement_same_price_not_duplicate_before_o
         effective_local_ts_us=260,
     )
 
-    simulate_trade_event([old, replacement], _trade(local_ts_us=220), symbol_spec=_spec())
-    simulate_trade_event([old, replacement], _trade(local_ts_us=255), symbol_spec=_spec())
-    simulate_trade_event([old, replacement], _trade(local_ts_us=270), symbol_spec=_spec())
+    simulate_trade_event([old, replacement], _trade(local_ts_us=220), event_key=EventKey(220, 0), symbol_spec=_spec())
+    simulate_trade_event([old, replacement], _trade(local_ts_us=255), event_key=EventKey(255, 0), symbol_spec=_spec())
+    simulate_trade_event([old, replacement], _trade(local_ts_us=270), event_key=EventKey(270, 0), symbol_spec=_spec())
 
 
 def test_live_orders_filters_correctly():
@@ -256,7 +262,7 @@ def test_apply_partial_fill_to_order():
         order,
         0.25,
         queue_ahead_after=0.0,
-        local_ts_us=200,
+        event_key=EventKey(200, 0),
     )
 
     assert updated.remaining_qty == 0.75
@@ -272,7 +278,7 @@ def test_apply_full_fill_to_order():
         order,
         0.25,
         queue_ahead_after=0.0,
-        local_ts_us=200,
+        event_key=EventKey(200, 0),
     )
 
     assert updated.remaining_qty == 0.0
@@ -285,6 +291,7 @@ def test_trade_event_irrelevant_trade_preserves_order():
     result = simulate_trade_event(
         [order],
         _trade(side=AggressorSide.BUY, price_tick=1000, amount=10.0),
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
     )
 
@@ -297,6 +304,7 @@ def test_trade_at_level_advances_queue_without_fill():
     result = simulate_trade_event(
         [order],
         _trade(side=AggressorSide.SELL, price_tick=1000, amount=0.5),
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(queue_model=QueueModelConfig(mode="balanced", trade_at_level_weight=1.0)),
     )
@@ -313,6 +321,7 @@ def test_trade_at_level_leftover_creates_fill_and_updates_order():
     result = simulate_trade_event(
         [order],
         _trade(side=AggressorSide.SELL, price_tick=1000, amount=0.75),
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(queue_model=QueueModelConfig(mode="balanced", trade_at_level_weight=1.0)),
     )
@@ -340,6 +349,7 @@ def test_trade_through_fills_full_remaining():
     result = simulate_trade_event(
         [order],
         _trade(side=AggressorSide.SELL, price_tick=999, amount=0.01),
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
     )
 
@@ -359,6 +369,7 @@ def test_maker_fee_bps_applied_to_fill():
     result = simulate_trade_event(
         [order],
         _trade(side=AggressorSide.SELL, price_tick=1000, amount=0.1),
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(maker_fee_bps=1.0, queue_model=QueueModelConfig(mode="balanced", trade_at_level_weight=1.0)),
     )
@@ -370,6 +381,7 @@ def test_maker_fee_bps_applied_to_fill():
     rebate_result = simulate_trade_event(
         [order],
         _trade(side=AggressorSide.SELL, price_tick=1000, amount=0.1),
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(maker_fee_bps=-0.5, queue_model=QueueModelConfig(mode="balanced", trade_at_level_weight=1.0)),
     )
@@ -382,9 +394,8 @@ def test_l2_update_balanced_advances_queue_without_fill():
         [order],
         side=OrderSide.BUY,
         price_tick=1000,
-        prev_level_qty=5.0,
-        curr_level_qty=3.0,
-        local_ts_us=200,
+        l2_decrease_qty=2.0,
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(queue_model=QueueModelConfig(mode="balanced", l2_decrease_weight=0.5)),
     )
@@ -400,9 +411,8 @@ def test_l2_update_balanced_depletion_creates_fill():
         [order],
         side=OrderSide.BUY,
         price_tick=1000,
-        prev_level_qty=5.0,
-        curr_level_qty=4.0,
-        local_ts_us=200,
+        l2_decrease_qty=1.0,
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(queue_model=QueueModelConfig(mode="balanced", l2_decrease_weight=1.0)),
     )
@@ -419,9 +429,8 @@ def test_l2_update_conservative_ignored():
         [order],
         side=OrderSide.BUY,
         price_tick=1000,
-        prev_level_qty=5.0,
-        curr_level_qty=0.0,
-        local_ts_us=200,
+        l2_decrease_qty=5.0,
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(queue_model=QueueModelConfig(mode="conservative")),
     )
@@ -436,9 +445,8 @@ def test_l2_update_nonmatching_level_ignored():
         [order],
         side=OrderSide.SELL,
         price_tick=1000,
-        prev_level_qty=5.0,
-        curr_level_qty=0.0,
-        local_ts_us=200,
+        l2_decrease_qty=5.0,
+        event_key=EventKey(200, 0),
         symbol_spec=_spec(),
         config=FillSimulatorConfig(queue_model=QueueModelConfig(mode="balanced")),
     )
@@ -452,16 +460,15 @@ def test_two_simultaneously_fillable_same_side_price_orders_rejected():
     order2 = _order(order_id=2, side=OrderSide.BUY, price_tick=1000)
 
     with pytest.raises(ValueError, match="duplicate fillable orders"):
-        simulate_trade_event([order1, order2], _trade(side=AggressorSide.SELL, price_tick=1000), symbol_spec=_spec())
+        simulate_trade_event([order1, order2], _trade(side=AggressorSide.SELL, price_tick=1000), event_key=EventKey(200, 0), symbol_spec=_spec())
 
     with pytest.raises(ValueError, match="duplicate fillable orders"):
         simulate_l2_level_update(
             [order1, order2],
             side=OrderSide.BUY,
             price_tick=1000,
-            prev_level_qty=5.0,
-            curr_level_qty=4.0,
-            local_ts_us=200,
+            l2_decrease_qty=1.0,
+            event_key=EventKey(200, 0),
             symbol_spec=_spec(),
         )
 
@@ -470,21 +477,20 @@ def test_local_timestamp_cannot_decrease():
     order = _order(last_update_local_ts_us=300)
 
     with pytest.raises(ValueError):
-        request_cancel_live_orders([order], request_local_ts_us=200, cancel_effective_local_ts_us=200)
+        request_cancel_live_orders([order], request_key=EventKey(200, 0), cancel_effective_key=EventKey(200, 0))
 
     with pytest.raises(ValueError):
         simulate_l2_level_update(
             [order],
             side=OrderSide.BUY,
             price_tick=1000,
-            prev_level_qty=5.0,
-            curr_level_qty=4.0,
-            local_ts_us=200,
+            l2_decrease_qty=1.0,
+            event_key=EventKey(200, 0),
             symbol_spec=_spec(),
         )
 
     with pytest.raises(ValueError):
-        simulate_trade_event([order], _trade(local_ts_us=200), symbol_spec=_spec())
+        simulate_trade_event([order], _trade(local_ts_us=200), event_key=EventKey(200, 0), symbol_spec=_spec())
 
 
 def test_fill_simulation_result_rejects_duplicate_order_ids():
