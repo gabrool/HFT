@@ -324,8 +324,8 @@ def _head_features(artifact: dict[str, object]) -> dict[str, tuple[str, ...]]:
 def _feature_meta(column: str) -> tuple[int, str, str, str, str]:
     if not column.startswith(mf.FEATURE_COLUMN_PREFIX):
         raise ValueError("existing feature column must use x_ prefix")
-    canonical = column[len(mf.FEATURE_COLUMN_PREFIX) :]
-    spec = specs.feature_spec_by_name(canonical)
+    name = column[len(mf.FEATURE_COLUMN_PREFIX) :]
+    spec = specs.feature_spec_by_name(name)
     return spec.index, spec.source.value, spec.owner.value, spec.family.value, spec.transform_key.value
 
 

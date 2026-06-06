@@ -149,7 +149,7 @@ def test_single_feature_subset_family_summary_is_valid(tmp_path: Path):
         assert record.train_high_corr_pair_count == 0.0
 
 
-def test_reversed_feature_columns_are_canonicalized(tmp_path: Path):
+def test_reversed_feature_columns_are_ordered_by_registry(tmp_path: Path):
     root = tmp_path / "reversed"
     _write_feature_audit_ds(root, correlated=True)
 
@@ -274,10 +274,10 @@ def test_dataclass_validation_errors():
         )
     with pytest.raises(ValueError):
         fa.FeatureHealthRecord(
-            "train", "x_a", "a", 0, "s", "o", "f", "u", "t", 0, 1, 1, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, False, "bad"
+            "train", "x_a", 0, "s", "o", "f", "u", "t", 0, 1, 1, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, False, "bad"
         )
     with pytest.raises(ValueError):
-        fa.FeatureCorrelationPairRecord("a", "b", "a", "b", 1, 1, "s", "s", "f", "f", 0.1, 0.1, True, True, "moderate_redundancy")
+        fa.FeatureCorrelationPairRecord("a", "b", 1, 1, "s", "s", "f", "f", 0.1, 0.1, True, True, "moderate_redundancy")
 
 
 def test_artifact_filename_validation(tmp_path: Path):

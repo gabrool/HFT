@@ -29,6 +29,41 @@ ALLOWED_SUBSTRINGS = (
     "DEFAULT_PARQUET_VERSION",
 )
 
+PRODUCTION_ROOT = Path("mmrt")
+
+FORBIDDEN_HISTORY_WORDS = (
+    "leg" + "acy",
+    "compat" + "ibility",
+    "back" + "ward",
+    "no longer " + "supported",
+    "old " + "schema",
+    "old " + "format",
+)
+
+
+def test_no_history_language_in_production_mmrt():
+    offenders = []
+    for path in PRODUCTION_ROOT.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for forbidden in FORBIDDEN_HISTORY_WORDS:
+            for line_no, line in enumerate(text.splitlines(), 1):
+                if forbidden in line.lower():
+                    offenders.append(f"{path}:{line_no}: {line.strip()}")
+    assert offenders == []
+
+
+def test_no_feature_retired_name_layer_symbols():
+    text = Path("mmrt/features/specs.py").read_text(encoding="utf-8")
+    forbidden = (
+        "leg" + "acy_name",
+        "leg" + "acy_feature_names",
+        "canonical_name_for_leg" + "acy",
+        "SOURCE_TO_" + "CANONICAL",
+        "CANONICAL_TO_" + "SOURCE",
+    )
+    offenders = [s for s in forbidden if s in text]
+    assert offenders == []
+
 
 def _iter_py_files():
     for root in ROOTS:
@@ -36,7 +71,7 @@ def _iter_py_files():
             yield path
 
 
-def test_no_internal_legacy_schema_names():
+def test_no_internal_schema_release_names():
     offenders = []
     for path in _iter_py_files():
         text = path.read_text(encoding="utf-8")
@@ -49,7 +84,7 @@ def test_no_internal_legacy_schema_names():
     assert offenders == []
 
 
-def test_linear_signal_npz_rejects_legacy_schema_field(tmp_path):
+def test_linear_signal_npz_rejects_retired_schema_field(tmp_path):
     path = tmp_path / "linear_signals.npz"
     arr = np.ones(1, dtype=np.float32)
     payload = {
@@ -79,7 +114,7 @@ def test_linear_signal_npz_rejects_legacy_schema_field(tmp_path):
         load_linear_signal_artifact_npz(path)
 
 
-def test_checkpoint_rejects_legacy_schema_field(tmp_path):
+def test_checkpoint_rejects_retired_schema_field(tmp_path):
     path = tmp_path / "checkpoint.pt"
     torch = pytest.importorskip("torch")
     from mmrt.cli.evaluate_execution_policy import _load_checkpoint
@@ -89,7 +124,7 @@ def test_checkpoint_rejects_legacy_schema_field(tmp_path):
         _load_checkpoint(path, device=torch.device("cpu"))
 
 
-def test_storage_manifest_rejects_legacy_manifest_schema_field():
+def test_storage_manifest_rejects_retired_manifest_schema_field():
     payload = mf.make_manifest(
         dataset_id="ds",
         created_at_utc="2026-06-06T00:00:00Z",
@@ -111,7 +146,7 @@ def test_storage_manifest_rejects_legacy_manifest_schema_field():
         mf.StorageManifest.from_dict(payload)
 
 
-def test_execution_tape_manifest_rejects_legacy_schema_field():
+def test_execution_tape_manifest_rejects_retired_schema_field():
     payload = {
         "schema" + "_" + "version": "mmrt_execution_tape" + "_" + "v2_book_depth",
         "tape_format": "l2_trades_arrays",

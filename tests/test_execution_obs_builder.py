@@ -133,9 +133,9 @@ def test_default_schema_fields_and_groups():
     assert not schema.has_field("linear_" + "p_up")
     assert not schema.has_field("linear_" + "mag_up_bps")
     assert not schema.has_field("linear_" + "mag_down_bps")
-    legacy_inventory_pnl_name = "_".join(("unrealized", "inventory", "pnl"))
+    retired_inventory_pnl_name = "_".join(("unrealized", "inventory", "pnl"))
     assert schema.has_field("inventory_abs_notional")
-    assert not schema.has_field(legacy_inventory_pnl_name)
+    assert not schema.has_field(retired_inventory_pnl_name)
     assert not schema.has_field("missing")
 
     groups = observation_field_groups()

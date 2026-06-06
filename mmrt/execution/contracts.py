@@ -18,7 +18,7 @@ from mmrt.contracts import AggressorSide, BookSide, TardisDataType
 
 
 class _StrEnum(str, Enum):
-    """Compatibility base for string enums on Python versions without StrEnum."""
+    """String-valued enum base."""
 
 
 def _require_nonempty_str(value: str, name: str) -> str:

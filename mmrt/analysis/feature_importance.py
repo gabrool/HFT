@@ -158,7 +158,7 @@ class FeatureImportanceResult:
 @dataclass(frozen=True, slots=True)
 class _FeatureMeta:
     column: str
-    canonical_name: str
+    name: str
     feature_index: int
     source: str
     owner: str
@@ -172,11 +172,11 @@ def _feature_meta_from_column(column: str) -> _FeatureMeta:
     col = _require_non_empty_str(column, "column")
     if not col.startswith(mf.FEATURE_COLUMN_PREFIX):
         raise ValueError("feature column must have x_ prefix")
-    canonical_name = col[len(mf.FEATURE_COLUMN_PREFIX) :]
-    spec = specs.feature_spec_by_name(canonical_name)
+    name = col[len(mf.FEATURE_COLUMN_PREFIX) :]
+    spec = specs.feature_spec_by_name(name)
     return _FeatureMeta(
         col,
-        canonical_name,
+        name,
         spec.index,
         spec.source.value,
         spec.owner.value,

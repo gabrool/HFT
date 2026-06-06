@@ -128,9 +128,7 @@ class LinearTrainConfig:
         if not isinstance(self.extractor_config, ex.LinearFeatureExtractorConfig):
             raise ValueError("extractor_config must be LinearFeatureExtractorConfig")
         if self.extractor_config.feature_columns is not None:
-            raise ValueError(
-                "extractor_config.feature_columns is no longer supported; use head_feature_config"
-            )
+            raise ValueError("LinearTrainConfig requires head_feature_config for feature selection")
         if not isinstance(self.head_feature_config, hf.HeadFeatureConfig):
             raise ValueError("head_feature_config must be HeadFeatureConfig")
         if not isinstance(self.target_config, tg.LinearTargetConfig):
