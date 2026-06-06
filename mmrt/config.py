@@ -25,11 +25,6 @@ DEFAULT_SOURCE_DATA_TYPES = (
     TardisDataType.TRADES,
 )
 
-DEFAULT_DISABLED_CONTEXT_DATA_TYPES = (
-    TardisDataType.DERIVATIVE_TICKER,
-    TardisDataType.LIQUIDATIONS,
-    TardisDataType.BOOK_TICKER,
-)
 
 DEFAULT_HORIZONS_US = (
     200_000,
@@ -47,9 +42,6 @@ DEFAULT_PIPELINE_SCHEMA = "mmrt_pipeline_config"
 DEFAULT_STORAGE_FORMAT = StorageFormat.FLAT_DECISION_ROWS_US
 DEFAULT_TIME_UNIT = TimeUnit.MICROSECOND
 
-DEFAULT_STRICT_VALIDATION = True
-DEFAULT_FAIL_ON_NON_MONOTONIC_LOCAL_TS = True
-DEFAULT_ALLOW_EQUAL_LOCAL_TS = True
 
 DEFAULT_FEATURE_DTYPE = "float32"
 DEFAULT_LABEL_DTYPE = "float32"
@@ -73,11 +65,6 @@ def _require_nonnegative_int(value: int, name: str) -> int:
         raise ValueError(f"{name} must be a non-negative int")
     return value
 
-
-def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be bool")
-    return value
 
 
 def _tuple_of_unique_data_types(values: Iterable[TardisDataType | str], name: str) -> tuple[TardisDataType, ...]:
@@ -116,23 +103,12 @@ class MarketConfig:
 @dataclass(frozen=True, slots=True)
 class DataConfig:
     source_data_types: tuple[TardisDataType, ...] = DEFAULT_SOURCE_DATA_TYPES
-    disabled_context_data_types: tuple[TardisDataType, ...] = DEFAULT_DISABLED_CONTEXT_DATA_TYPES
-    strict_validation: bool = DEFAULT_STRICT_VALIDATION
-    fail_on_non_monotonic_local_ts: bool = DEFAULT_FAIL_ON_NON_MONOTONIC_LOCAL_TS
-    allow_equal_local_ts: bool = DEFAULT_ALLOW_EQUAL_LOCAL_TS
 
     def __post_init__(self) -> None:
         source = _tuple_of_unique_data_types(self.source_data_types, "source_data_types")
-        if not source:
-            raise ValueError("source_data_types must be non-empty")
-        disabled = _tuple_of_unique_data_types(self.disabled_context_data_types, "disabled_context_data_types")
-        if set(source).intersection(disabled):
-            raise ValueError("source_data_types and disabled_context_data_types must not overlap")
-        _require_bool(self.strict_validation, "strict_validation")
-        _require_bool(self.fail_on_non_monotonic_local_ts, "fail_on_non_monotonic_local_ts")
-        _require_bool(self.allow_equal_local_ts, "allow_equal_local_ts")
+        if set(source) != {TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES}:
+            raise ValueError("source_data_types must be exactly BOOK_SNAPSHOT_25 and TRADES")
         object.__setattr__(self, "source_data_types", source)
-        object.__setattr__(self, "disabled_context_data_types", disabled)
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,13 +241,6 @@ class PipelineConfig:
         if not isinstance(self.storage, StorageConfig):
             raise ValueError("storage must be StorageConfig")
 
-        source = set(self.data.source_data_types)
-        required = {TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES}
-        if not required.issubset(source):
-            raise ValueError("source_data_types must include BOOK_SNAPSHOT_25 and TRADES")
-        forbidden = {TardisDataType.BOOK_SNAPSHOT_5, TardisDataType.QUOTES, TardisDataType.OPTIONS_CHAIN}
-        if source.intersection(forbidden):
-            raise ValueError("source_data_types includes unsupported types")
 
     @property
     def label_spec(self) -> LabelSpec:
@@ -296,7 +265,6 @@ __all__ = [
     "DEFAULT_EXCHANGE",
     "DEFAULT_SYMBOL",
     "DEFAULT_SOURCE_DATA_TYPES",
-    "DEFAULT_DISABLED_CONTEXT_DATA_TYPES",
     "DEFAULT_HORIZONS_US",
     "DEFAULT_ENTRY_DELAY_US",
     "DEFAULT_LOOKBACK_ROWS",

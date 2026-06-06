@@ -16,7 +16,7 @@ from typing import Any, Iterator, Sequence
 import polars as pl
 import pyarrow.parquet as pq
 
-from mmrt.contracts import EventType, TardisDataType
+from mmrt.contracts import TardisDataType
 from mmrt.data.tardis_csv import (
     LOCAL_TS_US,
     RAW_SOURCE_ROW,
@@ -34,18 +34,11 @@ MERGE_INPUT_RANK = "merge_input_rank"
 EVENT_TYPE_CODE_BOOK_SNAPSHOT = 1
 EVENT_TYPE_CODE_BOOK_DELTA = 2
 EVENT_TYPE_CODE_TRADE = 3
-EVENT_TYPE_CODE_BOOK_TICKER = 4
-EVENT_TYPE_CODE_DERIVATIVE_TICKER = 5
-EVENT_TYPE_CODE_LIQUIDATION = 6
 
 MERGED_PAYLOAD_TYPE_ORDER = (
     TardisDataType.BOOK_SNAPSHOT_25,
-    TardisDataType.BOOK_SNAPSHOT_5,
     TardisDataType.INCREMENTAL_BOOK_L2,
     TardisDataType.TRADES,
-    TardisDataType.BOOK_TICKER,
-    TardisDataType.DERIVATIVE_TICKER,
-    TardisDataType.LIQUIDATIONS,
 )
 
 
@@ -73,20 +66,14 @@ def _tuple_of_data_types(values: Sequence[TardisDataType | str], name: str) -> t
     return tuple(_require_supported_merge_data_type(_coerce_data_type(v)) for v in seq)
 
 
-def event_type_for_data_type(data_type: TardisDataType | str) -> EventType:
+def event_type_for_data_type(data_type: TardisDataType | str) -> str:
     dtype = _coerce_data_type(data_type)
-    if dtype in (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_5):
-        return EventType.BOOK_SNAPSHOT
+    if dtype == TardisDataType.BOOK_SNAPSHOT_25:
+        return "book_snapshot"
     if dtype == TardisDataType.INCREMENTAL_BOOK_L2:
-        return EventType.BOOK_DELTA
+        return "book_delta"
     if dtype == TardisDataType.TRADES:
-        return EventType.TRADE
-    if dtype == TardisDataType.BOOK_TICKER:
-        return EventType.BOOK_TICKER
-    if dtype == TardisDataType.DERIVATIVE_TICKER:
-        return EventType.DERIVATIVE_TICKER
-    if dtype == TardisDataType.LIQUIDATIONS:
-        return EventType.LIQUIDATION
+        return "trade"
     raise ValueError(f"unsupported data_type for event mapping: {dtype.value}")
 
 
@@ -95,21 +82,14 @@ def _require_supported_merge_data_type(dtype: TardisDataType) -> TardisDataType:
     return dtype
 
 
-def event_type_code_for_event_type(event_type: EventType | str) -> int:
-    et = EventType(event_type)
-    if et == EventType.BOOK_SNAPSHOT:
+def event_type_code_for_event_type(event_type: str) -> int:
+    if event_type == "book_snapshot":
         return EVENT_TYPE_CODE_BOOK_SNAPSHOT
-    if et == EventType.BOOK_DELTA:
+    if event_type == "book_delta":
         return EVENT_TYPE_CODE_BOOK_DELTA
-    if et == EventType.TRADE:
+    if event_type == "trade":
         return EVENT_TYPE_CODE_TRADE
-    if et == EventType.BOOK_TICKER:
-        return EVENT_TYPE_CODE_BOOK_TICKER
-    if et == EventType.DERIVATIVE_TICKER:
-        return EVENT_TYPE_CODE_DERIVATIVE_TICKER
-    if et == EventType.LIQUIDATION:
-        return EVENT_TYPE_CODE_LIQUIDATION
-    raise ValueError(f"unsupported event_type: {et.value}")
+    raise ValueError(f"unsupported event_type: {event_type}")
 
 
 def event_type_code_for_data_type(data_type: TardisDataType | str) -> int:
@@ -231,7 +211,7 @@ def iter_merged_events_streaming(inputs: Sequence[ParquetEventStreamInput], *, b
         out.update(row)
         out[EVENT_SEQ] = event_seq
         out[EVENT_TYPE_CODE] = event_type_code_for_event_type(event_type)
-        out[EVENT_TYPE] = event_type.value
+        out[EVENT_TYPE] = event_type
         out[MERGE_INPUT_RANK] = inp.input_rank
         yield out
         event_seq += 1
@@ -268,9 +248,6 @@ __all__ = [
     "EVENT_TYPE_CODE_BOOK_SNAPSHOT",
     "EVENT_TYPE_CODE_BOOK_DELTA",
     "EVENT_TYPE_CODE_TRADE",
-    "EVENT_TYPE_CODE_BOOK_TICKER",
-    "EVENT_TYPE_CODE_DERIVATIVE_TICKER",
-    "EVENT_TYPE_CODE_LIQUIDATION",
     "MERGED_PAYLOAD_TYPE_ORDER",
     "ParquetEventStreamInput",
     "event_type_for_data_type",

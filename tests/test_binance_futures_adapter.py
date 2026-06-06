@@ -46,16 +46,12 @@ def test_constants_match_tardis_policy():
         TardisDataType.BOOK_SNAPSHOT_25,
         TardisDataType.TRADES,
     )
-    assert TardisDataType.QUOTES not in BINANCE_FUTURES_ACCEPTED_DATA_TYPES
-    assert TardisDataType.OPTIONS_CHAIN not in BINANCE_FUTURES_ACCEPTED_DATA_TYPES
-    for dtype in (
-        TardisDataType.BOOK_TICKER,
-        TardisDataType.DERIVATIVE_TICKER,
-        TardisDataType.LIQUIDATIONS,
+    assert BINANCE_FUTURES_CONTEXT_DATA_TYPES == (TardisDataType.INCREMENTAL_BOOK_L2,)
+    assert BINANCE_FUTURES_ACCEPTED_DATA_TYPES == (
+        TardisDataType.BOOK_SNAPSHOT_25,
+        TardisDataType.TRADES,
         TardisDataType.INCREMENTAL_BOOK_L2,
-        TardisDataType.BOOK_SNAPSHOT_5,
-    ):
-        assert dtype in BINANCE_FUTURES_ACCEPTED_DATA_TYPES
+    )
 
 
 def test_local_side_code_constants():
@@ -112,23 +108,21 @@ def test_validate_market():
 def test_data_type_support_predicates():
     assert is_binance_futures_source_data_type(TardisDataType.BOOK_SNAPSHOT_25)
     assert is_binance_futures_source_data_type(TardisDataType.TRADES)
-    assert not is_binance_futures_source_data_type(TardisDataType.BOOK_TICKER)
-    assert is_binance_futures_context_data_type(TardisDataType.BOOK_TICKER)
-    assert is_binance_futures_context_data_type(TardisDataType.DERIVATIVE_TICKER)
-    assert is_binance_futures_context_data_type(TardisDataType.LIQUIDATIONS)
+    assert not is_binance_futures_source_data_type(TardisDataType.INCREMENTAL_BOOK_L2)
     assert is_binance_futures_context_data_type(TardisDataType.INCREMENTAL_BOOK_L2)
-    assert is_binance_futures_context_data_type(TardisDataType.BOOK_SNAPSHOT_5)
-    assert not is_binance_futures_accepted_data_type(TardisDataType.QUOTES)
-    assert not is_binance_futures_accepted_data_type(TardisDataType.OPTIONS_CHAIN)
+    with pytest.raises(ValueError):
+        is_binance_futures_accepted_data_type("quotes")
+    with pytest.raises(ValueError):
+        is_binance_futures_accepted_data_type("options_chain")
 
 
 def test_require_data_type():
     assert require_binance_futures_data_type("trades") == TardisDataType.TRADES
     assert require_binance_futures_data_type(TardisDataType.BOOK_SNAPSHOT_25) == TardisDataType.BOOK_SNAPSHOT_25
     with pytest.raises(ValueError):
-        require_binance_futures_data_type(TardisDataType.QUOTES)
+        require_binance_futures_data_type("quotes")
     with pytest.raises(ValueError):
-        require_binance_futures_data_type(TardisDataType.OPTIONS_CHAIN)
+        require_binance_futures_data_type("options_chain")
     with pytest.raises(ValueError):
         require_binance_futures_data_type("not-a-type")
 
@@ -155,16 +149,12 @@ def test_default_data_type_functions():
 
 def test_default_merge_rank():
     assert binance_futures_default_merge_rank(TardisDataType.BOOK_SNAPSHOT_25) == 0
-    assert binance_futures_default_merge_rank(TardisDataType.BOOK_SNAPSHOT_5) == 1
-    assert binance_futures_default_merge_rank(TardisDataType.INCREMENTAL_BOOK_L2) == 2
-    assert binance_futures_default_merge_rank(TardisDataType.TRADES) == 3
-    assert binance_futures_default_merge_rank(TardisDataType.BOOK_TICKER) == 4
-    assert binance_futures_default_merge_rank(TardisDataType.LIQUIDATIONS) == 5
-    assert binance_futures_default_merge_rank(TardisDataType.DERIVATIVE_TICKER) == 6
+    assert binance_futures_default_merge_rank(TardisDataType.INCREMENTAL_BOOK_L2) == 1
+    assert binance_futures_default_merge_rank(TardisDataType.TRADES) == 2
     with pytest.raises(ValueError):
-        binance_futures_default_merge_rank(TardisDataType.QUOTES)
+        binance_futures_default_merge_rank("quotes")
     with pytest.raises(ValueError):
-        binance_futures_default_merge_rank(TardisDataType.OPTIONS_CHAIN)
+        binance_futures_default_merge_rank("options_chain")
     for dtype in BINANCE_FUTURES_ACCEPTED_DATA_TYPES:
         assert isinstance(binance_futures_default_merge_rank(dtype), int)
     ranks = [binance_futures_default_merge_rank(dtype) for dtype in BINANCE_FUTURES_ACCEPTED_DATA_TYPES]
@@ -206,7 +196,7 @@ def test_normalized_parquet_basename():
     with pytest.raises(ValueError):
         normalized_parquet_basename("binance-futures", "ETHUSDT", "trades", "2026-02-22")
     with pytest.raises(ValueError):
-        normalized_parquet_basename("binance-futures", "btcusdt", TardisDataType.QUOTES, "2026-02-22")
+        normalized_parquet_basename("binance-futures", "btcusdt", "quotes", "2026-02-22")
     for bad_date in ("", "20260222", "2026-2-22", "2026-02-2x"):
         with pytest.raises(ValueError):
             normalized_parquet_basename("binance-futures", "btcusdt", "trades", bad_date)
@@ -282,4 +272,4 @@ def test_no_feature_label_or_decision_concepts():
 
     assert BINANCE_FUTURES_TRADE_SIDE_TO_CODE["buy"] == SIDE_BUY
     assert BINANCE_FUTURES_BOOK_SIDE_TO_CODE["bid"] == BOOK_SIDE_BID
-    assert BINANCE_FUTURES_DEFAULT_MERGE_RANKS[TardisDataType.TRADES] == 3
+    assert BINANCE_FUTURES_DEFAULT_MERGE_RANKS[TardisDataType.TRADES] == 2

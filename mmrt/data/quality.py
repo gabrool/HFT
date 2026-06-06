@@ -236,7 +236,7 @@ def analyze_normalized_lazyframe(
     if has_source_file and int(common["missing_source_file_count"]) > 0:
         issues.append(_issue("missing_source_file", QualitySeverity.WARNING, int(common["missing_source_file_count"]), "source_file is null or empty"))
 
-    if dt in (TardisDataType.TRADES, TardisDataType.LIQUIDATIONS) and {"price", "amount", "side_code"}.issubset(actual_set):
+    if dt == TardisDataType.TRADES and {"price", "amount", "side_code"}.issubset(actual_set):
         m = lf.select([
             (pl.col("price").is_null() | (pl.col("price") <= 0)).sum().alias("invalid_price"),
             (pl.col("amount").is_null() | (pl.col("amount") <= 0)).sum().alias("invalid_amount"),
@@ -260,7 +260,7 @@ def analyze_normalized_lazyframe(
                 issues.append(_issue(nm, QualitySeverity.ERROR, int(m[k]), f"{nm} rows found"))
         issues.append(_issue("incremental_snapshot_markers", QualitySeverity.INFO, int(m["snapshot_marker_count"]), "incremental_book_L2 rows marked as snapshots"))
 
-    elif dt in (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_5) and {"bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"}.issubset(actual_set):
+    elif dt == TardisDataType.BOOK_SNAPSHOT_25 and {"bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"}.issubset(actual_set):
         depth = tardis_csv_schema(dt).depth_limit
         assert depth is not None
         cols = [f"{side}_{field}_{i:02d}" for i in range(depth) for side in ("bid", "ask") for field in ("px", "sz")]
@@ -286,26 +286,6 @@ def analyze_normalized_lazyframe(
             issues.append(_issue("crossed_l1_book", QualitySeverity.ERROR, int(m["crossed_l1_book"]), "snapshot L1 is crossed"))
         if int(m["missing_depth"]) > 0:
             issues.append(_issue("missing_snapshot_depth_values", QualitySeverity.WARNING, int(m["missing_depth"]), "snapshot depth contains null values beyond L1"))
-
-    elif dt == TardisDataType.BOOK_TICKER and {"ask_price", "bid_price", "ask_amount", "bid_amount"}.issubset(actual_set):
-        m = lf.select([
-            (((pl.col("ask_price") <= 0) & pl.col("ask_price").is_not_null()) | ((pl.col("bid_price") <= 0) & pl.col("bid_price").is_not_null())).sum().alias("invalid_book_ticker_price"),
-            (((pl.col("ask_amount") < 0) & pl.col("ask_amount").is_not_null()) | ((pl.col("bid_amount") < 0) & pl.col("bid_amount").is_not_null())).sum().alias("invalid_book_ticker_amount"),
-            ((pl.col("bid_price") >= pl.col("ask_price")) & pl.col("bid_price").is_not_null() & pl.col("ask_price").is_not_null()).sum().alias("crossed_book_ticker"),
-        ]).collect().row(0, named=True)
-        for k in ("invalid_book_ticker_price", "invalid_book_ticker_amount", "crossed_book_ticker"):
-            if int(m[k]) > 0:
-                issues.append(_issue(k, QualitySeverity.ERROR, int(m[k]), f"{k} rows found"))
-
-    elif dt == TardisDataType.DERIVATIVE_TICKER and {"open_interest", "last_price", "index_price", "mark_price", "funding_timestamp"}.issubset(actual_set):
-        m = lf.select([
-            ((pl.col("open_interest") < 0) & pl.col("open_interest").is_not_null()).sum().alias("invalid_open_interest"),
-            ((((pl.col("last_price") <= 0) & pl.col("last_price").is_not_null()) | ((pl.col("index_price") <= 0) & pl.col("index_price").is_not_null()) | ((pl.col("mark_price") <= 0) & pl.col("mark_price").is_not_null()))).sum().alias("invalid_derivative_price"),
-            ((pl.col("funding_timestamp") <= 0) & pl.col("funding_timestamp").is_not_null()).sum().alias("invalid_funding_timestamp"),
-        ]).collect().row(0, named=True)
-        for k in ("invalid_open_interest", "invalid_derivative_price", "invalid_funding_timestamp"):
-            if int(m[k]) > 0:
-                issues.append(_issue(k, QualitySeverity.ERROR, int(m[k]), f"{k} rows found"))
 
     return QualityReport(
         data_type=dt,

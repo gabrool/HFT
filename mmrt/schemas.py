@@ -1,9 +1,7 @@
-"""This module contains declarative Tardis CSV and feature-vector schemas for the microsecond-native MMRT pipeline. It is intentionally IO-free: it validates schema metadata and header shapes but does not parse rows, convert timestamps, or compute features."""
+"""Declarative Tardis CSV schemas for the current MMRT raw inputs."""
 
 from dataclasses import dataclass
 from enum import Enum
-import hashlib
-import re
 from typing import Iterable, Sequence
 
 from mmrt.contracts import TardisDataType
@@ -17,7 +15,6 @@ COMMON_TARDIS_COLUMNS = (
 )
 
 BOOK_SNAPSHOT_25_DEPTH = 25
-BOOK_SNAPSHOT_5_DEPTH = 5
 
 CURRENT_REQUIRED_BOOK_DEPTH_LEVELS = (1, 3, 5, 10, 20)
 CURRENT_MAX_REQUIRED_BOOK_DEPTH = 20
@@ -26,19 +23,8 @@ CURRENT_REQUIRED_BOOK_SNAPSHOT_DEPTH = 25
 SUPPORTED_TARDIS_SCHEMA_TYPES = (
     TardisDataType.INCREMENTAL_BOOK_L2,
     TardisDataType.BOOK_SNAPSHOT_25,
-    TardisDataType.BOOK_SNAPSHOT_5,
     TardisDataType.TRADES,
-    TardisDataType.BOOK_TICKER,
-    TardisDataType.DERIVATIVE_TICKER,
-    TardisDataType.LIQUIDATIONS,
 )
-
-UNSUPPORTED_TARDIS_SCHEMA_TYPES = (
-    TardisDataType.OPTIONS_CHAIN,
-    TardisDataType.QUOTES,
-)
-
-_FEATURE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class _StrEnum(str, Enum):
@@ -95,21 +81,6 @@ def _tuple_of_str(values: Iterable[str], name: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _validate_feature_name(name: str) -> str:
-    _require_nonempty_str(name, "name")
-    if _FEATURE_NAME_RE.fullmatch(name) is None:
-        raise ValueError("feature name must match ^[a-z][a-z0-9_]*$")
-    return name
-
-
-def _stable_hash_strings(values: Sequence[str]) -> str:
-    h = hashlib.sha256()
-    for value in values:
-        h.update(value.encode("utf-8"))
-        h.update(b"\n")
-    return h.hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class ColumnSpec:
     name: str
@@ -145,16 +116,11 @@ class TardisCSVSchema:
             raise ValueError(f"first four columns must be {COMMON_TARDIS_COLUMNS!r}")
 
         if data_type not in SUPPORTED_TARDIS_SCHEMA_TYPES:
-            if data_type in UNSUPPORTED_TARDIS_SCHEMA_TYPES:
-                raise ValueError(f"{data_type.value} schema is unsupported in")
             raise ValueError(f"unsupported data_type for schema registry: {data_type.value}")
 
         if data_type == TardisDataType.BOOK_SNAPSHOT_25:
-            if self.depth_limit != 25:
+            if self.depth_limit != BOOK_SNAPSHOT_25_DEPTH:
                 raise ValueError("depth_limit must be 25 for BOOK_SNAPSHOT_25")
-        elif data_type == TardisDataType.BOOK_SNAPSHOT_5:
-            if self.depth_limit != 5:
-                raise ValueError("depth_limit must be 5 for BOOK_SNAPSHOT_5")
         elif self.depth_limit is not None:
             raise ValueError("depth_limit must be None for non-snapshot schemas")
 
@@ -198,11 +164,9 @@ def _common_columns() -> tuple[ColumnSpec, ...]:
     )
 
 
-def book_snapshot_columns(depth: int) -> tuple[ColumnSpec, ...]:
-    if depth not in (5, 25):
-        raise ValueError("depth must be 5 or 25")
+def book_snapshot_25_columns() -> tuple[ColumnSpec, ...]:
     cols = list(_common_columns())
-    for i in range(depth):
+    for i in range(BOOK_SNAPSHOT_25_DEPTH):
         cols.extend(
             (
                 ColumnSpec(f"asks[{i}].price", ColumnKind.FLOAT, nullable=True),
@@ -232,82 +196,29 @@ def trades_columns() -> tuple[ColumnSpec, ...]:
     )
 
 
-def book_ticker_columns() -> tuple[ColumnSpec, ...]:
-    return _common_columns() + (
-        ColumnSpec("ask_amount", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("ask_price", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("bid_amount", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("bid_price", ColumnKind.FLOAT, nullable=True),
-    )
-
-
-def derivative_ticker_columns() -> tuple[ColumnSpec, ...]:
-    return _common_columns() + (
-        ColumnSpec("funding_timestamp", ColumnKind.INT_US, nullable=True),
-        ColumnSpec("funding_rate", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("predicted_funding_rate", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("open_interest", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("last_price", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("index_price", ColumnKind.FLOAT, nullable=True),
-        ColumnSpec("mark_price", ColumnKind.FLOAT, nullable=True),
-    )
-
-
-def liquidations_columns() -> tuple[ColumnSpec, ...]:
-    return _common_columns() + (
-        ColumnSpec("id", ColumnKind.STRING, nullable=True),
-        ColumnSpec("side", ColumnKind.SIDE),
-        ColumnSpec("price", ColumnKind.FLOAT),
-        ColumnSpec("amount", ColumnKind.FLOAT),
-    )
-
-
 INCREMENTAL_BOOK_L2_SCHEMA = TardisCSVSchema(
     data_type=TardisDataType.INCREMENTAL_BOOK_L2,
     columns=incremental_book_l2_columns(),
 )
 BOOK_SNAPSHOT_25_SCHEMA = TardisCSVSchema(
     data_type=TardisDataType.BOOK_SNAPSHOT_25,
-    columns=book_snapshot_columns(25),
-    depth_limit=25,
-)
-BOOK_SNAPSHOT_5_SCHEMA = TardisCSVSchema(
-    data_type=TardisDataType.BOOK_SNAPSHOT_5,
-    columns=book_snapshot_columns(5),
-    depth_limit=5,
+    columns=book_snapshot_25_columns(),
+    depth_limit=BOOK_SNAPSHOT_25_DEPTH,
 )
 TRADES_SCHEMA = TardisCSVSchema(
     data_type=TardisDataType.TRADES,
     columns=trades_columns(),
 )
-BOOK_TICKER_SCHEMA = TardisCSVSchema(
-    data_type=TardisDataType.BOOK_TICKER,
-    columns=book_ticker_columns(),
-)
-DERIVATIVE_TICKER_SCHEMA = TardisCSVSchema(
-    data_type=TardisDataType.DERIVATIVE_TICKER,
-    columns=derivative_ticker_columns(),
-)
-LIQUIDATIONS_SCHEMA = TardisCSVSchema(
-    data_type=TardisDataType.LIQUIDATIONS,
-    columns=liquidations_columns(),
-)
 
 TARDIS_CSV_SCHEMAS = {
     TardisDataType.INCREMENTAL_BOOK_L2: INCREMENTAL_BOOK_L2_SCHEMA,
     TardisDataType.BOOK_SNAPSHOT_25: BOOK_SNAPSHOT_25_SCHEMA,
-    TardisDataType.BOOK_SNAPSHOT_5: BOOK_SNAPSHOT_5_SCHEMA,
     TardisDataType.TRADES: TRADES_SCHEMA,
-    TardisDataType.BOOK_TICKER: BOOK_TICKER_SCHEMA,
-    TardisDataType.DERIVATIVE_TICKER: DERIVATIVE_TICKER_SCHEMA,
-    TardisDataType.LIQUIDATIONS: LIQUIDATIONS_SCHEMA,
 }
 
 
 def tardis_csv_schema(data_type: TardisDataType | str) -> TardisCSVSchema:
     dtype = _coerce_data_type(data_type, "data_type")
-    if dtype in UNSUPPORTED_TARDIS_SCHEMA_TYPES:
-        raise ValueError(f"{dtype.value} schema is explicitly unsupported in")
     try:
         return TARDIS_CSV_SCHEMAS[dtype]
     except KeyError as exc:
@@ -318,116 +229,23 @@ def supported_tardis_schema_types() -> tuple[TardisDataType, ...]:
     return tuple(TARDIS_CSV_SCHEMAS.keys())
 
 
-@dataclass(frozen=True, slots=True)
-class FeatureField:
-    name: str
-    family: str
-    dtype: str = "float32"
-    unit: str = "unitless"
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _validate_feature_name(self.name))
-        object.__setattr__(self, "family", _require_nonempty_str(self.family, "family"))
-        if self.dtype != "float32":
-            raise ValueError("dtype must be 'float32' in")
-        object.__setattr__(self, "unit", _require_nonempty_str(self.unit, "unit"))
-
-
-@dataclass(frozen=True, slots=True)
-class FeatureSchema:
-    version: str
-    fields: tuple[FeatureField, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "version", _require_nonempty_str(self.version, "version"))
-        fields = tuple(self.fields)
-        if not fields:
-            raise ValueError("fields must be non-empty")
-        for idx, field in enumerate(fields):
-            if not isinstance(field, FeatureField):
-                raise ValueError(f"fields[{idx}] must be FeatureField")
-        names = tuple(field.name for field in fields)
-        if len(set(names)) != len(names):
-            raise ValueError("feature names must be unique")
-        object.__setattr__(self, "fields", fields)
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        return tuple(field.name for field in self.fields)
-
-    @property
-    def dim(self) -> int:
-        return len(self.fields)
-
-    @property
-    def names_hash(self) -> str:
-        return feature_names_hash(self.names)
-
-    def index(self, name: str) -> int:
-        target = _validate_feature_name(name)
-        try:
-            return self.names.index(target)
-        except ValueError as exc:
-            raise ValueError(f"feature name {target!r} not found") from exc
-
-    def select_by_family(self, family: str) -> tuple[FeatureField, ...]:
-        target = _require_nonempty_str(family, "family")
-        return tuple(field for field in self.fields if field.family == target)
-
-
-def feature_names_hash(names: Iterable[str]) -> str:
-    normalized = tuple(_validate_feature_name(name) for name in tuple(names))
-    if not normalized:
-        raise ValueError("names must be non-empty")
-    if len(set(normalized)) != len(normalized):
-        raise ValueError("names must be unique")
-    return _stable_hash_strings(normalized)
-
-
-DECISION_ROW_FIXED_COLUMNS = (
-    "ts_us",
-    "local_ts_us",
-    "source_row",
-    "raw_mid",
-    "dt_us",
-)
-
-LABEL_ROW_FIXED_COLUMNS = (
-    "decision_ts_us",
-    "entry_ts_us",
-)
-
 __all__ = [
     "ColumnKind",
     "ColumnSpec",
     "TardisCSVSchema",
     "COMMON_TARDIS_COLUMNS",
     "BOOK_SNAPSHOT_25_DEPTH",
-    "BOOK_SNAPSHOT_5_DEPTH",
     "CURRENT_REQUIRED_BOOK_DEPTH_LEVELS",
     "CURRENT_MAX_REQUIRED_BOOK_DEPTH",
     "CURRENT_REQUIRED_BOOK_SNAPSHOT_DEPTH",
     "SUPPORTED_TARDIS_SCHEMA_TYPES",
-    "UNSUPPORTED_TARDIS_SCHEMA_TYPES",
-    "book_snapshot_columns",
+    "book_snapshot_25_columns",
     "incremental_book_l2_columns",
     "trades_columns",
-    "book_ticker_columns",
-    "derivative_ticker_columns",
-    "liquidations_columns",
     "INCREMENTAL_BOOK_L2_SCHEMA",
     "BOOK_SNAPSHOT_25_SCHEMA",
-    "BOOK_SNAPSHOT_5_SCHEMA",
     "TRADES_SCHEMA",
-    "BOOK_TICKER_SCHEMA",
-    "DERIVATIVE_TICKER_SCHEMA",
-    "LIQUIDATIONS_SCHEMA",
     "TARDIS_CSV_SCHEMAS",
     "tardis_csv_schema",
     "supported_tardis_schema_types",
-    "FeatureField",
-    "FeatureSchema",
-    "feature_names_hash",
-    "DECISION_ROW_FIXED_COLUMNS",
-    "LABEL_ROW_FIXED_COLUMNS",
 ]

@@ -53,9 +53,9 @@ def test_label_config_sorting_and_duplicate_rejection() -> None:
 
 def test_label_config_rejects_unsupported_price_refs() -> None:
     with pytest.raises(ValueError):
-        LabelConfig(price_reference=PriceReference.MICROPRICE)
+        LabelConfig(price_reference="microprice")
     with pytest.raises(ValueError):
-        LabelConfig(price_reference=PriceReference.MARK)
+        LabelConfig(price_reference="mark")
 
 
 def test_data_config_validation() -> None:
@@ -64,14 +64,7 @@ def test_data_config_validation() -> None:
     with pytest.raises(ValueError):
         DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_25))
     with pytest.raises(ValueError):
-        DataConfig(
-            source_data_types=(TardisDataType.BOOK_SNAPSHOT_25,),
-            disabled_context_data_types=(TardisDataType.BOOK_SNAPSHOT_25,),
-        )
-    with pytest.raises(ValueError):
-        DataConfig(strict_validation=1)
-    with pytest.raises(ValueError):
-        DataConfig(allow_equal_local_ts="true")
+        DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25,))
     with pytest.raises(TypeError):
         DataConfig(**{"drop_duplicate_" + "trades": True})
 
@@ -82,7 +75,7 @@ def test_decision_config_constraints() -> None:
     with pytest.raises(ValueError):
         DecisionConfig(policy="scheduled_time")
     with pytest.raises(ValueError):
-        DecisionConfig(reason=DecisionReason.SCHEDULED_TIME)
+        DecisionConfig(reason="scheduled_time")
     with pytest.raises(ValueError):
         DecisionConfig(stride_us=0)
     with pytest.raises(ValueError):
@@ -118,11 +111,11 @@ def test_pipeline_config_invariants() -> None:
     assert cfg.storage.feature_schema == specs.FEATURE_SCHEMA
     assert cfg.label_spec == cfg.labels.to_label_spec()
     with pytest.raises(ValueError):
-        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_5, TardisDataType.TRADES)))
+        PipelineConfig(data=DataConfig(source_data_types=("book_snapshot_5", TardisDataType.TRADES)))
     with pytest.raises(ValueError):
-        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.QUOTES, TardisDataType.TRADES)))
+        PipelineConfig(data=DataConfig(source_data_types=("quotes", TardisDataType.TRADES)))
     with pytest.raises(ValueError):
-        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.OPTIONS_CHAIN, TardisDataType.TRADES)))
+        PipelineConfig(data=DataConfig(source_data_types=("options_chain", TardisDataType.TRADES)))
 
 
 def test_pipeline_config_requires_book_and_trades() -> None:
@@ -132,25 +125,9 @@ def test_pipeline_config_requires_book_and_trades() -> None:
         PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25,)))
 
 
-def test_pipeline_config_allows_additional_supported_source_types() -> None:
-    cfg = PipelineConfig(
-        data=DataConfig(
-            source_data_types=(
-                TardisDataType.BOOK_SNAPSHOT_25,
-                TardisDataType.TRADES,
-                TardisDataType.DERIVATIVE_TICKER,
-            ),
-            disabled_context_data_types=(
-                TardisDataType.LIQUIDATIONS,
-                TardisDataType.BOOK_TICKER,
-            ),
-        )
-    )
-    assert cfg.data.source_data_types == (
-        TardisDataType.BOOK_SNAPSHOT_25,
-        TardisDataType.TRADES,
-        TardisDataType.DERIVATIVE_TICKER,
-    )
+def test_pipeline_config_rejects_additional_source_types() -> None:
+    with pytest.raises(ValueError):
+        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES, TardisDataType.INCREMENTAL_BOOK_L2)))
 
 
 def test_pipeline_config_rejects_invalid_nested_config_objects() -> None:
@@ -185,6 +162,7 @@ def test_retired_surface_removed() -> None:
     assert not hasattr(DecisionConfig(), "stride_" + "rows")
     assert not hasattr(cfg_module, "DEFAULT_DROP_DUPLICATE_" + "TRADES")
     assert not hasattr(DataConfig(), "drop_duplicate_" + "trades")
+    assert not hasattr(DataConfig(), "disabled_" + "context_data_types")
 
 
 def test_default_config_alignment() -> None:

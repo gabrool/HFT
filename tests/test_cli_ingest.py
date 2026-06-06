@@ -394,3 +394,51 @@ def test_subprocess_help_entrypoint():
     assert "--book-csv" in p.stdout
     assert "--trades-csv" in p.stdout
     assert "--split-train" in p.stdout
+
+
+class _NoopWriter:
+    def append_values(self, **kwargs):
+        raise AssertionError("writer should not be called for malformed rows")
+
+
+def _merged_trade_row(price=100.0, amount=1.0):
+    return {
+        cli.em.EVENT_TYPE_CODE: cli.em.EVENT_TYPE_CODE_TRADE,
+        cli.em.EVENT_SEQ: 0,
+        cli.tc.LOCAL_TS_US: 1,
+        cli.tc.TS_US: 1,
+        "price": price,
+        "amount": amount,
+        "side_code": 1,
+    }
+
+
+def _merged_book_row(**overrides):
+    row = {
+        cli.em.EVENT_TYPE_CODE: cli.em.EVENT_TYPE_CODE_BOOK_SNAPSHOT,
+        cli.em.EVENT_SEQ: 0,
+        cli.tc.LOCAL_TS_US: 1,
+        cli.tc.TS_US: 1,
+    }
+    for i in range(25):
+        row[f"bid_px_{i:02d}"] = 99.0 - i * 0.1
+        row[f"bid_sz_{i:02d}"] = 1.0
+        row[f"ask_px_{i:02d}"] = 101.0 + i * 0.1
+        row[f"ask_sz_{i:02d}"] = 1.0
+    row.update(overrides)
+    return row
+
+
+def test_ingest_rejects_bad_trade_price():
+    with pytest.raises(ValueError, match="bad trade row"):
+        cli._run_causal_ingest_rows([_merged_trade_row(price="bad")], _NoopWriter(), cfg.default_config(), None)
+
+
+def test_ingest_rejects_bad_book_top():
+    with pytest.raises(ValueError, match="bad book row"):
+        cli._run_causal_ingest_rows([_merged_book_row(bid_px_00=0.0)], _NoopWriter(), cfg.default_config(), None)
+
+
+def test_ingest_rejects_partial_book_level():
+    with pytest.raises(ValueError, match="bad book row"):
+        cli._run_causal_ingest_rows([_merged_book_row(bid_px_01=0.0, bid_sz_01=1.0)], _NoopWriter(), cfg.default_config(), None)
