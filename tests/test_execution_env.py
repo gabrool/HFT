@@ -40,6 +40,7 @@ from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.queue_model import QueueModelConfig, QueueModelMode
 from mmrt.execution.quote_geometry import QuoteAction, QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
+from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
 
 
@@ -1044,3 +1045,117 @@ def test_balanced_mode_trade_l2_dedupe_enabled_vs_disabled():
     assert enabled_step.info["l2_effective_decrease_qty"] == pytest.approx(0.0)
     assert disabled_step.info["l2_trade_dedupe_qty"] == pytest.approx(0.0)
     assert disabled_step.info["l2_effective_decrease_qty"] == pytest.approx(0.5)
+
+
+def test_same_side_replacement_does_not_overlap_when_entry_latency_shorter_than_cancel_latency():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=200),
+        _l2(seq=2, local_ts_us=300),
+        _l2(seq=3, local_ts_us=400),
+        _l2(seq=4, local_ts_us=600),
+    ]
+    tape = _tape(l2_events, [])
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals(tape),
+        config=_env_config(
+            decision_interval_us=50,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=20,
+                cancel_latency_us=300,
+            ),
+        ),
+    )
+    env.reset()
+
+    first = env.step(_bid_only_action())
+    assert first.info["orders_active_count"] == 1
+
+    larger_bid = QuoteAction(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_raw=-100.0,
+        ask_price_raw=0.0,
+        bid_size_raw=200.0,
+        ask_size_raw=0.0,
+    )
+    env.step(larger_bid)
+
+    live = tuple(env._state.live_orders)
+    bid_orders = [order for order in live if order.side == OrderSide.BUY]
+    assert len(bid_orders) == 2
+
+    old = next(order for order in bid_orders if order.status.name == "PENDING_CANCEL")
+    new = next(order for order in bid_orders if order.status.name == "PENDING_NEW")
+
+    assert new.effective_key >= old.cancel_effective_key
+
+    for key in (EventKey(250, 0), EventKey(300, 0), EventKey(399, MAX_EVENT_SEQ)):
+        assert sum(order.is_fillable_at_key(key) for order in bid_orders) <= 1
+
+
+def test_l2_decrease_for_pending_new_only_level_not_counted_in_diagnostics():
+    l2_events = [
+        _l2(
+            seq=0,
+            local_ts_us=100,
+            bid_ticks=(1000,),
+            bid_sizes=(1.0,),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=1,
+            local_ts_us=150,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(3.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=2,
+            local_ts_us=160,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(2.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=3,
+            local_ts_us=300,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(2.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+    ]
+    tape = _tape(l2_events, [])
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
+        config=_env_config(
+            decision_interval_us=300,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=120,
+                cancel_latency_us=0,
+            ),
+            fill_simulator_config=FillSimulatorConfig(
+                queue_model=QueueModelConfig(
+                    mode=QueueModelMode.BALANCED,
+                    l2_decrease_weight=1.0,
+                    trade_at_level_weight=1.0,
+                ),
+                maker_fee_bps=0.0,
+            ),
+        ),
+    )
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert step.fills == ()
+    assert step.info["l2_raw_decrease_qty"] == pytest.approx(0.0)
+    assert step.info["l2_effective_decrease_qty"] == pytest.approx(0.0)

@@ -100,24 +100,28 @@ def place_orders_from_quote(
     *,
     next_order_id: int,
     created_key: EventKey,
-    effective_key: EventKey,
+    bid_effective_key: EventKey,
+    ask_effective_key: EventKey,
     bid_queue_ahead_qty: float = 0.0,
     ask_queue_ahead_qty: float = 0.0,
 ) -> tuple[ActiveOrder, ...]:
     quote = _require_quote(quote)
     next_order_id = _require_nonnegative_int(next_order_id, "next_order_id")
     created_key = _require_event_key(created_key, "created_key")
-    effective_key = _require_event_key(effective_key, "effective_key")
-    if effective_key < created_key:
-        raise ValueError("effective_key must be >= created_key")
+    bid_effective_key = _require_event_key(bid_effective_key, "bid_effective_key")
+    ask_effective_key = _require_event_key(ask_effective_key, "ask_effective_key")
+    if bid_effective_key < created_key:
+        raise ValueError("bid_effective_key must be >= created_key")
+    if ask_effective_key < created_key:
+        raise ValueError("ask_effective_key must be >= created_key")
     bid_queue_ahead_qty = _require_nonnegative_float(bid_queue_ahead_qty, "bid_queue_ahead_qty")
     ask_queue_ahead_qty = _require_nonnegative_float(ask_queue_ahead_qty, "ask_queue_ahead_qty")
 
     orders: list[ActiveOrder] = []
     if quote.bid_enabled:
-        orders.append(_new_order(next_order_id, OrderSide.BUY, quote.bid_price_tick, quote.bid_qty, bid_queue_ahead_qty, created_key, effective_key))
+        orders.append(_new_order(next_order_id, OrderSide.BUY, quote.bid_price_tick, quote.bid_qty, bid_queue_ahead_qty, created_key, bid_effective_key))
     if quote.ask_enabled:
-        orders.append(_new_order(next_order_id + len(orders), OrderSide.SELL, quote.ask_price_tick, quote.ask_qty, ask_queue_ahead_qty, created_key, effective_key))
+        orders.append(_new_order(next_order_id + len(orders), OrderSide.SELL, quote.ask_price_tick, quote.ask_qty, ask_queue_ahead_qty, created_key, ask_effective_key))
     return tuple(orders)
 
 
@@ -187,7 +191,7 @@ def request_cancel_live_orders(orders: Sequence[ActiveOrder], *, request_key: Ev
             continue
         _validate_event_key_for_order(order, request_key)
         existing = order.cancel_effective_key
-        if existing is not None and existing <= cancel_effective_key:
+        if existing is not None:
             out.append(order)
             continue
         status = order.status
@@ -310,7 +314,7 @@ def sync_orders_to_quote(
     *,
     next_order_id: int,
     decision_key: EventKey,
-    order_effective_key: EventKey,
+    base_order_effective_key: EventKey,
     cancel_effective_key: EventKey,
     bid_queue_ahead_qty: float = 0.0,
     ask_queue_ahead_qty: float = 0.0,
@@ -320,15 +324,19 @@ def sync_orders_to_quote(
     quote = _require_quote(quote)
     next_order_id = _require_nonnegative_int(next_order_id, "next_order_id")
     decision_key = _require_event_key(decision_key, "decision_key")
-    order_effective_key = _require_event_key(order_effective_key, "order_effective_key")
+    base_order_effective_key = _require_event_key(base_order_effective_key, "base_order_effective_key")
     cancel_effective_key = _require_event_key(cancel_effective_key, "cancel_effective_key")
     qty_epsilon = _require_positive_float(qty_epsilon, "qty_epsilon")
-    if order_effective_key < decision_key or cancel_effective_key < decision_key:
+    if base_order_effective_key < decision_key or cancel_effective_key < decision_key:
         raise ValueError("effective keys must be >= decision_key")
 
     target = {
         OrderSide.BUY: (quote.bid_enabled, quote.bid_price_tick, quote.bid_qty),
         OrderSide.SELL: (quote.ask_enabled, quote.ask_price_tick, quote.ask_qty),
+    }
+    side_effective_keys = {
+        OrderSide.BUY: base_order_effective_key,
+        OrderSide.SELL: base_order_effective_key,
     }
     updated: list[ActiveOrder] = []
     cancel_count = 0
@@ -356,7 +364,16 @@ def sync_orders_to_quote(
         else:
             if order.cancel_effective_key is None:
                 cancel_count += 1
-            updated.append(request_cancel_live_orders((order,), request_key=decision_key, cancel_effective_key=cancel_effective_key)[0])
+            cancelled_or_pending = request_cancel_live_orders(
+                (order,),
+                request_key=decision_key,
+                cancel_effective_key=cancel_effective_key,
+            )[0]
+            updated.append(cancelled_or_pending)
+            if enabled:
+                old_cancel_key = cancelled_or_pending.cancel_effective_key
+                if old_cancel_key is not None and side_effective_keys[order.side] < old_cancel_key:
+                    side_effective_keys[order.side] = old_cancel_key
 
     new_quote = QuoteIntent(
         bid_enabled=quote.bid_enabled and OrderSide.BUY not in preserved,
@@ -366,7 +383,15 @@ def sync_orders_to_quote(
         bid_qty=quote.bid_qty if quote.bid_enabled and OrderSide.BUY not in preserved else 0.0,
         ask_qty=quote.ask_qty if quote.ask_enabled and OrderSide.SELL not in preserved else 0.0,
     )
-    new_orders = place_orders_from_quote(new_quote, next_order_id=next_order_id, created_key=decision_key, effective_key=order_effective_key, bid_queue_ahead_qty=bid_queue_ahead_qty, ask_queue_ahead_qty=ask_queue_ahead_qty)
+    new_orders = place_orders_from_quote(
+        new_quote,
+        next_order_id=next_order_id,
+        created_key=decision_key,
+        bid_effective_key=side_effective_keys[OrderSide.BUY],
+        ask_effective_key=side_effective_keys[OrderSide.SELL],
+        bid_queue_ahead_qty=bid_queue_ahead_qty,
+        ask_queue_ahead_qty=ask_queue_ahead_qty,
+    )
     return tuple(updated) + new_orders, cancel_count
 
 

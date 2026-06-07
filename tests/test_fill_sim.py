@@ -131,7 +131,7 @@ def test_place_orders_from_two_sided_quote():
     orders = place_orders_from_quote(
         quote,
         next_order_id=10,
-        created_key=EventKey(100, 0), effective_key=EventKey(100, 0),
+        created_key=EventKey(100, 0), bid_effective_key=EventKey(100, 0), ask_effective_key=EventKey(100, 0),
         bid_queue_ahead_qty=1.5,
         ask_queue_ahead_qty=2.5,
     )
@@ -161,7 +161,7 @@ def test_place_orders_skips_disabled_sides():
         bid_qty=0.01,
     )
 
-    orders = place_orders_from_quote(quote, next_order_id=5, created_key=EventKey(100, 0), effective_key=EventKey(100, 0))
+    orders = place_orders_from_quote(quote, next_order_id=5, created_key=EventKey(100, 0), bid_effective_key=EventKey(100, 0), ask_effective_key=EventKey(100, 0))
 
     assert len(orders) == 1
     assert orders[0].order_id == 5
@@ -213,7 +213,7 @@ def test_sync_orders_to_quote_cancels_live_and_appends_new():
         quote,
         next_order_id=10,
         decision_key=EventKey(200, 0),
-        order_effective_key=EventKey(200, 0),
+        base_order_effective_key=EventKey(200, 0),
         cancel_effective_key=EventKey(200, 0),
     )
 
@@ -224,6 +224,141 @@ def test_sync_orders_to_quote_cancels_live_and_appends_new():
     assert out[1].order_id == 10
     assert out[2].order_id == 11
 
+
+
+def test_sync_same_side_replacement_waits_for_old_cancel_effective_key():
+    old = _order(
+        order_id=1,
+        status=OrderStatus.ACTIVE,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=999,
+        bid_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [old],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(200, 0),
+        base_order_effective_key=EventKey(250, 0),
+        cancel_effective_key=EventKey(500, 0),
+    )
+
+    assert cancel_count == 1
+    assert len(out) == 2
+
+    old_cancel, replacement = out
+    assert old_cancel.order_id == 1
+    assert old_cancel.status == OrderStatus.PENDING_CANCEL
+    assert old_cancel.cancel_effective_key == EventKey(500, 0)
+
+    assert replacement.order_id == 10
+    assert replacement.status == OrderStatus.PENDING_NEW
+    assert replacement.side == OrderSide.BUY
+    assert replacement.price_tick == 999
+    assert replacement.effective_key == EventKey(500, 0)
+
+
+def test_sync_same_side_replacement_uses_base_key_when_base_is_later_than_cancel():
+    old = _order(
+        order_id=1,
+        status=OrderStatus.ACTIVE,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=999,
+        bid_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [old],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(200, 0),
+        base_order_effective_key=EventKey(600, 0),
+        cancel_effective_key=EventKey(500, 0),
+    )
+
+    assert cancel_count == 1
+    replacement = out[1]
+    assert replacement.effective_key == EventKey(600, 0)
+
+
+def test_sync_opposite_side_replacement_not_delayed_by_old_side_cancel():
+    old_bid = _order(
+        order_id=1,
+        status=OrderStatus.ACTIVE,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+    )
+    quote = QuoteIntent(
+        bid_enabled=False,
+        ask_enabled=True,
+        ask_price_tick=1002,
+        ask_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [old_bid],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(200, 0),
+        base_order_effective_key=EventKey(250, 0),
+        cancel_effective_key=EventKey(500, 0),
+    )
+
+    assert cancel_count == 1
+    replacement_ask = out[1]
+    assert replacement_ask.side == OrderSide.SELL
+    assert replacement_ask.effective_key == EventKey(250, 0)
+
+
+def test_sync_pending_cancel_same_side_replacement_waits_for_existing_cancel_key():
+    old = _order(
+        order_id=1,
+        status=OrderStatus.PENDING_CANCEL,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+        cancel_requested_local_ts_us=150,
+        cancel_requested_event_seq=0,
+        cancel_effective_local_ts_us=700,
+        cancel_effective_event_seq=0,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=999,
+        bid_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [old],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(200, 0),
+        base_order_effective_key=EventKey(250, 0),
+        cancel_effective_key=EventKey(500, 0),
+    )
+
+    assert cancel_count == 0
+    replacement = out[1]
+    assert replacement.effective_key == EventKey(700, 0)
 
 def test_sync_same_price_pending_cancel_places_replacement_without_double_counting_cancel():
     pending_cancel = _order(
@@ -248,7 +383,7 @@ def test_sync_same_price_pending_cancel_places_replacement_without_double_counti
         quote,
         next_order_id=10,
         decision_key=EventKey(200, 0),
-        order_effective_key=EventKey(260, 0),
+        base_order_effective_key=EventKey(260, 0),
         cancel_effective_key=EventKey(300, 0),
     )
 
@@ -312,7 +447,7 @@ def test_sync_preserves_same_price_same_qty_pending_new_without_resetting_latenc
         quote,
         next_order_id=10,
         decision_key=EventKey(200, 0),
-        order_effective_key=EventKey(400, 0),
+        base_order_effective_key=EventKey(400, 0),
         cancel_effective_key=EventKey(400, 0),
     )
 
@@ -347,7 +482,7 @@ def test_sync_same_price_different_qty_pending_new_cancel_replaces():
         quote,
         next_order_id=10,
         decision_key=EventKey(200, 0),
-        order_effective_key=EventKey(400, 0),
+        base_order_effective_key=EventKey(400, 0),
         cancel_effective_key=EventKey(400, 0),
     )
 
@@ -393,7 +528,7 @@ def test_sync_does_not_preserve_pending_new_with_cancel_key():
         quote,
         next_order_id=10,
         decision_key=EventKey(250, 0),
-        order_effective_key=EventKey(400, 0),
+        base_order_effective_key=EventKey(400, 0),
         cancel_effective_key=EventKey(400, 0),
     )
 

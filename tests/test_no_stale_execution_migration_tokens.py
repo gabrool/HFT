@@ -60,3 +60,10 @@ def test_dedupe_cli_flag_exposed_in_relevant_clis():
         text = path.read_text(encoding="utf-8")
         assert "--no-dedupe-l2-decrease-with-trade-prints" in text
         assert "dedupe_l2_decrease_with_trade_prints=not args.no_dedupe_l2_decrease_with_trade_prints" in text
+
+
+def test_place_orders_from_quote_uses_side_specific_effective_keys():
+    source = Path("mmrt/execution/fill_sim.py").read_text(encoding="utf-8")
+    place_orders_body = source.split("def place_orders_from_quote(", 1)[1].split("def _new_order", 1)[0]
+    assert "bid_effective_key" in place_orders_body
+    assert "ask_effective_key" in place_orders_body
