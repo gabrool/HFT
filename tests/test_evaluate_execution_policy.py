@@ -731,3 +731,34 @@ def test_parser_dedupe_l2_trade_default_enabled():
     args = parser.parse_args(["--tape-root", "/tmp/tape", "--checkpoint-path", "/tmp/ckpt.pt"])
     config = _config_from_args(args)
     assert config.dedupe_l2_decrease_with_trade_prints is True
+
+
+def test_evaluation_cli_env_config_adverse_runtime_uses_post_only_gap():
+    from mmrt.cli.evaluate_execution_policy import _env_config_from_cli_config
+
+    config = ExecutionPolicyEvaluationCLIConfig(
+        tape_root="/tmp/tape",
+        checkpoint_path="/tmp/checkpoint.pt",
+        adverse_signals_npz="/tmp/adverse.npz",
+        post_only_gap_ticks=2,
+        use_checkpoint_cli_env_config=False,
+    )
+    env_config = _env_config_from_cli_config(config)
+
+    assert env_config.adverse_runtime_config is not None
+    assert env_config.quote_geometry_config.post_only_gap_ticks == 2
+    assert env_config.adverse_runtime_config.post_only_gap_ticks == 2
+
+
+def test_evaluation_checkpoint_env_config_adverse_runtime_uses_checkpoint_post_only_gap():
+    from mmrt.cli.evaluate_execution_policy import _env_config_from_training_cli_config
+
+    raw = {
+        "adverse_signals_npz": "/tmp/adverse.npz",
+        "post_only_gap_ticks": 3,
+    }
+    env_config = _env_config_from_training_cli_config(raw)
+
+    assert env_config.quote_geometry_config.post_only_gap_ticks == 3
+    assert env_config.adverse_runtime_config is not None
+    assert env_config.adverse_runtime_config.post_only_gap_ticks == 3

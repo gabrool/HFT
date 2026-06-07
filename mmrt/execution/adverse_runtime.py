@@ -28,12 +28,15 @@ class AdverseRuntimeConfig:
     executable_edge: ExecutableEdgeConfig = ExecutableEdgeConfig()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "candidate_names", tuple(str(c) for c in self.candidate_names))
-        if not self.candidate_names or any(not c for c in self.candidate_names):
-            raise ValueError("candidate_names must be non-empty strings")
-        if isinstance(self.post_only_gap_ticks, bool) or int(self.post_only_gap_ticks) < 0:
-            raise ValueError("post_only_gap_ticks must be nonnegative int")
-        object.__setattr__(self, "post_only_gap_ticks", int(self.post_only_gap_ticks))
+        candidates = quote_candidate_configs_from_names(self.candidate_names)
+        object.__setattr__(self, "candidate_names", tuple(candidate.name for candidate in candidates))
+
+        if (
+            isinstance(self.post_only_gap_ticks, bool)
+            or not isinstance(self.post_only_gap_ticks, int)
+            or self.post_only_gap_ticks < 0
+        ):
+            raise ValueError("post_only_gap_ticks must be a nonnegative int")
         if not isinstance(self.executable_edge, ExecutableEdgeConfig):
             raise ValueError("executable_edge must be ExecutableEdgeConfig")
 
@@ -60,8 +63,10 @@ def build_adverse_observation_features(
 ) -> dict[str, float]:
     if not isinstance(predictions, Mapping):
         raise ValueError("predictions must be a mapping")
+    candidates = quote_candidate_configs_from_names(candidate_names)
     out: dict[str, float] = {}
-    for c in candidate_names:
+    for candidate in candidates:
+        c = candidate.name
         for side in ("bid", "ask"):
             fill_target = f"{side}_{c}_filled"
             cost_target = f"{side}_{c}_toxic_cost_bps"

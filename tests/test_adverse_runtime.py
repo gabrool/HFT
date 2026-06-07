@@ -64,3 +64,60 @@ def test_missing_edge_targets_raises():
             inventory_qty=0.0,
             config=AdverseRuntimeConfig(candidate_names=("touch",)),
         )
+
+
+def test_adverse_runtime_config_rejects_non_integer_post_only_gap():
+    with pytest.raises(ValueError, match="post_only_gap_ticks"):
+        AdverseRuntimeConfig(post_only_gap_ticks=1.7)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="post_only_gap_ticks"):
+        AdverseRuntimeConfig(post_only_gap_ticks=True)  # type: ignore[arg-type]
+
+
+def test_adverse_runtime_config_rejects_duplicate_or_malformed_candidates():
+    with pytest.raises(ValueError, match="duplicate quote candidate"):
+        AdverseRuntimeConfig(candidate_names=("touch", "touch"))
+
+    with pytest.raises(ValueError, match="malformed quote candidate"):
+        AdverseRuntimeConfig(candidate_names=("inside_x",))
+
+
+def test_adverse_observation_features_reject_duplicate_candidates():
+    with pytest.raises(ValueError, match="duplicate quote candidate"):
+        build_adverse_observation_features(
+            predictions=_preds(),
+            candidate_names=("touch", "touch"),
+        )
+
+
+def test_edge_candidate_validity_respects_runtime_post_only_gap():
+    preds = {
+        "bid_inside_1_filled": 0.5,
+        "ask_inside_1_filled": 0.5,
+        "bid_inside_1_toxic_cost_bps": 0.0,
+        "ask_inside_1_toxic_cost_bps": 0.0,
+    }
+
+    gap1 = build_executable_edge_observation_features(
+        predictions=preds,
+        candidate_names=("inside_1",),
+        best_bid_tick=1000,
+        best_ask_tick=1002,
+        linear_signal=_signal(),
+        inventory_qty=0.0,
+        config=AdverseRuntimeConfig(candidate_names=("inside_1",), post_only_gap_ticks=1),
+    )
+    assert gap1["edge_bid_inside_1_valid"] == 1.0
+    assert gap1["edge_ask_inside_1_valid"] == 1.0
+
+    gap2 = build_executable_edge_observation_features(
+        predictions=preds,
+        candidate_names=("inside_1",),
+        best_bid_tick=1000,
+        best_ask_tick=1002,
+        linear_signal=_signal(),
+        inventory_qty=0.0,
+        config=AdverseRuntimeConfig(candidate_names=("inside_1",), post_only_gap_ticks=2),
+    )
+    assert gap2["edge_bid_inside_1_valid"] == 0.0
+    assert gap2["edge_ask_inside_1_valid"] == 0.0
