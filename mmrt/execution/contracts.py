@@ -614,10 +614,13 @@ class ActiveOrder:
         if self.status == OrderStatus.PARTIALLY_FILLED:
             if not (0.0 < self.remaining_qty < self.qty):
                 raise ValueError("PARTIALLY_FILLED order requires 0 < remaining_qty < qty")
-            if self.cancel_effective_key is not None:
+            if self.cancel_requested_key is not None or self.cancel_effective_key is not None:
                 raise ValueError("PARTIALLY_FILLED order cannot have pending cancel")
-        if self.status == OrderStatus.ACTIVE and self.remaining_qty <= 0.0:
-            raise ValueError("ACTIVE order requires remaining_qty > 0")
+        if self.status == OrderStatus.ACTIVE:
+            if self.remaining_qty <= 0.0:
+                raise ValueError("ACTIVE order requires remaining_qty > 0")
+            if self.cancel_requested_key is not None or self.cancel_effective_key is not None:
+                raise ValueError("ACTIVE order cannot have pending cancel")
         if self.status == OrderStatus.PENDING_CANCEL:
             if self.remaining_qty <= 0.0:
                 raise ValueError("PENDING_CANCEL order requires remaining_qty > 0")

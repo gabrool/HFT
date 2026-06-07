@@ -62,6 +62,11 @@ def _order(
     cancel_requested_event_seq: int | None = None,
     cancel_effective_event_seq: int | None = None,
 ) -> ActiveOrder:
+    has_cancel_keys = bool(cancel_requested_local_ts_us or cancel_effective_local_ts_us)
+    if has_cancel_keys and status in (OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED):
+        raise ValueError(
+            "test helper requires PENDING_CANCEL/PENDING_NEW/CANCELLED/FILLED when cancel keys are supplied"
+        )
     effective_event_seq = effective_event_seq if effective_event_seq is not None else (0 if effective_local_ts_us else -1)
     cancel_requested_event_seq = cancel_requested_event_seq if cancel_requested_event_seq is not None else (0 if cancel_requested_local_ts_us else -1)
     cancel_effective_event_seq = cancel_effective_event_seq if cancel_effective_event_seq is not None else (0 if cancel_effective_local_ts_us else -1)
@@ -84,8 +89,6 @@ def _order(
         cancel_effective_local_ts_us=cancel_effective_local_ts_us,
         cancel_effective_event_seq=cancel_effective_event_seq,
     )
-
-
 
 
 def _book_top(best_bid_tick=1000, best_ask_tick=1002, local_ts_us=200):
@@ -181,6 +184,19 @@ def test_request_cancel_live_orders_only():
     assert out[1].last_update_local_ts_us == 200
 
 
+def test_request_cancel_live_orders_converts_active_to_pending_cancel():
+    active = _order(order_id=1, status=OrderStatus.ACTIVE)
+
+    out = request_cancel_live_orders(
+        [active],
+        request_key=EventKey(200, 0),
+        cancel_effective_key=EventKey(300, 0),
+    )
+
+    assert out[0].status == OrderStatus.PENDING_CANCEL
+    assert out[0].cancel_requested_key == EventKey(200, 0)
+    assert out[0].cancel_effective_key == EventKey(300, 0)
+
 def test_sync_orders_to_quote_cancels_live_and_appends_new():
     old = _order(order_id=1, side=OrderSide.BUY)
     quote = QuoteIntent(
@@ -212,6 +228,7 @@ def test_sync_orders_to_quote_cancels_live_and_appends_new():
 def test_sync_same_price_pending_cancel_places_replacement_without_double_counting_cancel():
     pending_cancel = _order(
         order_id=1,
+        status=OrderStatus.PENDING_CANCEL,
         side=OrderSide.BUY,
         price_tick=1000,
         created_local_ts_us=100,
@@ -249,6 +266,7 @@ def test_sync_same_price_pending_cancel_places_replacement_without_double_counti
 def test_pending_cancel_and_future_replacement_same_price_not_duplicate_before_overlap():
     old = _order(
         order_id=1,
+        status=OrderStatus.PENDING_CANCEL,
         side=OrderSide.BUY,
         price_tick=1000,
         cancel_requested_local_ts_us=150,
@@ -525,6 +543,47 @@ def test_apply_full_fill_to_order():
     assert updated.remaining_qty == 0.0
     assert updated.status == OrderStatus.FILLED
     assert updated.queue_ahead_qty == 0.0
+
+
+def test_order_helper_rejects_active_order_with_cancel_keys():
+    with pytest.raises(ValueError, match="test helper requires"):
+        _order(
+            status=OrderStatus.ACTIVE,
+            cancel_requested_local_ts_us=200,
+            cancel_effective_local_ts_us=300,
+        )
+
+
+def test_pending_cancel_partial_fill_remains_pending_cancel():
+    order = _order(
+        status=OrderStatus.PENDING_CANCEL,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=1.0,
+        remaining_qty=1.0,
+        queue_ahead_qty=0.0,
+        created_local_ts_us=100,
+        last_update_local_ts_us=150,
+        cancel_requested_local_ts_us=150,
+        cancel_requested_event_seq=0,
+        cancel_effective_local_ts_us=300,
+        cancel_effective_event_seq=0,
+    )
+
+    result = simulate_trade_event(
+        [order],
+        _trade(side=AggressorSide.SELL, price_tick=1000, amount=0.25, local_ts_us=200),
+        event_key=EventKey(200, 0),
+        symbol_spec=_spec(),
+        config=FillSimulatorConfig(
+            queue_model=QueueModelConfig(mode="balanced", trade_at_level_weight=1.0),
+        ),
+    )
+
+    assert len(result.fills) == 1
+    assert result.orders[0].status == OrderStatus.PENDING_CANCEL
+    assert result.orders[0].remaining_qty == pytest.approx(0.75)
+    assert result.orders[0].cancel_effective_key == EventKey(300, 0)
 
 
 def test_trade_event_irrelevant_trade_preserves_order():
