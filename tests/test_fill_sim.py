@@ -27,7 +27,7 @@ from mmrt.execution.fill_sim import (
     simulate_trade_event,
 )
 from mmrt.execution.queue_model import QueueModelConfig
-from mmrt.time_key import EventKey
+from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
 
 def _spec() -> SymbolSpec:
@@ -263,7 +263,37 @@ def test_sync_same_side_replacement_waits_for_old_cancel_effective_key():
     assert replacement.status == OrderStatus.PENDING_NEW
     assert replacement.side == OrderSide.BUY
     assert replacement.price_tick == 999
-    assert replacement.effective_key == EventKey(500, 0)
+    assert replacement.effective_key == EventKey(500, MAX_EVENT_SEQ)
+
+
+def test_sync_same_side_replacement_uses_activation_style_key_after_cancel_timestamp():
+    old = _order(
+        order_id=1,
+        status=OrderStatus.ACTIVE,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+    )
+    quote = QuoteIntent(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_tick=999,
+        bid_qty=0.01,
+    )
+
+    out, cancel_count = sync_orders_to_quote(
+        [old],
+        quote,
+        next_order_id=10,
+        decision_key=EventKey(200, 0),
+        base_order_effective_key=EventKey(250, 0),
+        cancel_effective_key=EventKey(500, 0),
+    )
+
+    assert cancel_count == 1
+    replacement = out[1]
+    assert replacement.effective_key == EventKey(500, MAX_EVENT_SEQ)
 
 
 def test_sync_same_side_replacement_uses_base_key_when_base_is_later_than_cancel():
@@ -358,7 +388,7 @@ def test_sync_pending_cancel_same_side_replacement_waits_for_existing_cancel_key
 
     assert cancel_count == 0
     replacement = out[1]
-    assert replacement.effective_key == EventKey(700, 0)
+    assert replacement.effective_key == EventKey(700, MAX_EVENT_SEQ)
 
 def test_sync_same_price_pending_cancel_places_replacement_without_double_counting_cancel():
     pending_cancel = _order(
@@ -496,7 +526,7 @@ def test_sync_same_price_different_qty_pending_new_cancel_replaces():
     assert replacement.status == OrderStatus.PENDING_NEW
     assert replacement.price_tick == 1000
     assert replacement.qty == pytest.approx(0.02)
-    assert replacement.effective_key == EventKey(400, 0)
+    assert replacement.effective_key == EventKey(400, MAX_EVENT_SEQ)
 
 
 def test_sync_does_not_preserve_pending_new_with_cancel_key():

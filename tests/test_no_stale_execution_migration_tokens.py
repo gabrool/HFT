@@ -67,3 +67,9 @@ def test_place_orders_from_quote_uses_side_specific_effective_keys():
     place_orders_body = source.split("def place_orders_from_quote(", 1)[1].split("def _new_order", 1)[0]
     assert "bid_effective_key" in place_orders_body
     assert "ask_effective_key" in place_orders_body
+
+
+def test_same_side_replacement_uses_activation_style_key_after_cancel():
+    source = Path("mmrt/execution/fill_sim.py").read_text(encoding="utf-8")
+    assert "_activation_key_after_cancel" in source
+    assert "MAX_EVENT_SEQ" in source

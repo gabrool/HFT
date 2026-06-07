@@ -1047,6 +1047,58 @@ def test_balanced_mode_trade_l2_dedupe_enabled_vs_disabled():
     assert disabled_step.info["l2_effective_decrease_qty"] == pytest.approx(0.5)
 
 
+def test_same_side_replacement_after_cancel_does_not_fill_later_same_timestamp_event():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+        _l2(seq=1, local_ts_us=200, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+        _l2(seq=2, local_ts_us=500, bid_ticks=(999,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+        _l2(seq=3, local_ts_us=600, bid_ticks=(999,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+    ]
+    trades = [
+        _trade(
+            local_ts_us=500,
+            side=AggressorSide.SELL,
+            price_tick=999,
+            amount=10.0,
+            source_row=0,
+        ),
+    ]
+    tape = _tape(l2_events, trades)
+
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 1, 2, 4], [100, 200, 500, 600]),
+        config=_env_config(
+            decision_interval_us=100,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=20,
+                cancel_latency_us=300,
+            ),
+        ),
+    )
+    env.reset()
+
+    first = env.step(_bid_only_action())
+    assert first.info["orders_active_count"] == 1
+
+    replacement_bid = QuoteAction(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_raw=-100.0,
+        ask_price_raw=0.0,
+        bid_size_raw=200.0,
+        ask_size_raw=0.0,
+    )
+
+    second = env.step(replacement_bid)
+    assert second.fills == ()
+
+    third = env.step(replacement_bid)
+
+    assert all(fill.local_ts_us != 500 for fill in third.fills)
+
+
 def test_same_side_replacement_does_not_overlap_when_entry_latency_shorter_than_cancel_latency():
     l2_events = [
         _l2(seq=0, local_ts_us=100),
@@ -1090,7 +1142,7 @@ def test_same_side_replacement_does_not_overlap_when_entry_latency_shorter_than_
     old = next(order for order in bid_orders if order.status.name == "PENDING_CANCEL")
     new = next(order for order in bid_orders if order.status.name == "PENDING_NEW")
 
-    assert new.effective_key >= old.cancel_effective_key
+    assert new.effective_key == EventKey(old.cancel_effective_key.local_ts_us, MAX_EVENT_SEQ)
 
     for key in (EventKey(250, 0), EventKey(300, 0), EventKey(399, MAX_EVENT_SEQ)):
         assert sum(order.is_fillable_at_key(key) for order in bid_orders) <= 1
