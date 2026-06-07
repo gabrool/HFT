@@ -21,7 +21,7 @@ from mmrt.execution.adverse_selection import (
     build_adverse_selection_dataset,
     summarize_adverse_selection_dataset,
 )
-from mmrt.execution.contracts import QueueModelMode
+from mmrt.execution.contracts import LatencyConfig, QueueModelMode
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
@@ -33,7 +33,6 @@ __all__ = [
     "main",
 ]
 
-_BINARY_TARGETS = frozenset()
 
 
 def _require_nonempty_str(value: str, name: str) -> str:
@@ -153,23 +152,51 @@ def _parse_target_names(value: str | Sequence[str]) -> tuple[str, ...]:
     return tuple(_require_nonempty_str(part, f"target_names[{i}]") for i, part in enumerate(parts))
 
 
+def _candidate_from_token(token: str) -> QuoteCandidateConfig:
+    if token == "touch":
+        return QuoteCandidateConfig("touch", QuoteCandidateMode.TOUCH, 0)
+
+    for prefix, mode in (("inside_", QuoteCandidateMode.INSIDE), ("away_", QuoteCandidateMode.AWAY)):
+        if token.startswith(prefix):
+            suffix = token[len(prefix):]
+            try:
+                offset = int(suffix)
+            except ValueError as exc:
+                raise ValueError(f"malformed quote candidate {token!r}") from exc
+            try:
+                return QuoteCandidateConfig(token, mode, offset)
+            except ValueError as exc:
+                raise ValueError(f"malformed quote candidate {token!r}") from exc
+
+    raise ValueError(f"malformed quote candidate {token!r}")
+
+
 def _parse_quote_candidates(value: str | Sequence[QuoteCandidateConfig]) -> tuple[QuoteCandidateConfig, ...]:
     if isinstance(value, str):
-        parts = [part.strip() for part in value.split(",") if part.strip()]
-        if not parts:
-            raise ValueError("quote_candidates must be non-empty")
-        out: list[QuoteCandidateConfig] = []
-        for part in parts:
-            if part == "touch":
-                out.append(QuoteCandidateConfig("touch", QuoteCandidateMode.TOUCH, 0))
-            elif part.startswith("inside_"):
-                out.append(QuoteCandidateConfig(part, QuoteCandidateMode.INSIDE, int(part.split("_", 1)[1])))
-            elif part.startswith("away_"):
-                out.append(QuoteCandidateConfig(part, QuoteCandidateMode.AWAY, int(part.split("_", 1)[1])))
-            else:
-                raise ValueError(f"malformed quote candidate {part!r}")
-        return tuple(out)
-    return tuple(value)
+        parts = [part.strip() for part in value.split(",")]
+        if not parts or any(part == "" for part in parts):
+            raise ValueError("quote_candidates must be a comma-separated non-empty list")
+        candidates = tuple(_candidate_from_token(part) for part in parts)
+    else:
+        if isinstance(value, (bytes, bytearray)):
+            raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig")
+        try:
+            candidates = tuple(value)
+        except TypeError as exc:
+            raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig") from exc
+
+    if not candidates:
+        raise ValueError("quote_candidates must be non-empty")
+
+    seen: set[str] = set()
+    for i, candidate in enumerate(candidates):
+        if not isinstance(candidate, QuoteCandidateConfig):
+            raise ValueError(f"quote_candidates[{i}] must be QuoteCandidateConfig")
+        if candidate.name in seen:
+            raise ValueError(f"duplicate quote candidate name {candidate.name!r}")
+        seen.add(candidate.name)
+
+    return candidates
 
 
 def _resolve_target_names(dataset, requested: tuple[str, ...] | str) -> tuple[str, ...]:
@@ -205,6 +232,8 @@ class AdverseSelectionTrainCLIConfig:
 
     quote_candidates: tuple[QuoteCandidateConfig, ...] | str = DEFAULT_QUOTE_CANDIDATES
     post_only_gap_ticks: int = 1
+    decision_compute_latency_us: int = 50
+    order_entry_latency_us: int = 500
     invalid_quote_policy: str = "mask"
     order_qty: float = 0.001
     fill_horizon_us: int = 1_000_000
@@ -247,6 +276,16 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "kyle_use_notional_flow", _require_bool(self.kyle_use_notional_flow, "kyle_use_notional_flow"))
         object.__setattr__(self, "quote_candidates", _parse_quote_candidates(self.quote_candidates))
         object.__setattr__(self, "post_only_gap_ticks", _require_nonnegative_int(self.post_only_gap_ticks, "post_only_gap_ticks"))
+        object.__setattr__(
+            self,
+            "decision_compute_latency_us",
+            _require_nonnegative_int(self.decision_compute_latency_us, "decision_compute_latency_us"),
+        )
+        object.__setattr__(
+            self,
+            "order_entry_latency_us",
+            _require_nonnegative_int(self.order_entry_latency_us, "order_entry_latency_us"),
+        )
         if self.invalid_quote_policy not in ("mask", "error"):
             raise ValueError("invalid_quote_policy must be mask or error")
         object.__setattr__(self, "order_qty", _require_positive_float(self.order_qty, "order_qty"))
@@ -289,6 +328,10 @@ def _build_adverse_selection_config(config: AdverseSelectionTrainCLIConfig) -> A
         quote=CounterfactualQuoteConfig(
             quote_candidates=config.quote_candidates,
             post_only_gap_ticks=config.post_only_gap_ticks,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=config.decision_compute_latency_us,
+                order_entry_latency_us=config.order_entry_latency_us,
+            ),
             invalid_quote_policy=config.invalid_quote_policy,
             order_qty=config.order_qty,
             fill_horizon_us=config.fill_horizon_us,
@@ -329,6 +372,8 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "kyle_use_notional_flow": config.kyle_use_notional_flow,
         "quote_candidates": [c.name for c in config.quote_candidates],
         "post_only_gap_ticks": config.post_only_gap_ticks,
+        "decision_compute_latency_us": config.decision_compute_latency_us,
+        "order_entry_latency_us": config.order_entry_latency_us,
         "invalid_quote_policy": config.invalid_quote_policy,
         "order_qty": config.order_qty,
         "fill_horizon_us": config.fill_horizon_us,
@@ -360,13 +405,6 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     tmp_path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     tmp_path.replace(path)
 
-
-def _write_npz_atomic(path: Path, **arrays: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "wb") as f:
-        np.savez(f, **arrays)
-    tmp_path.replace(path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,6 +742,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kyle-use-notional-flow", action="store_true")
     parser.add_argument("--quote-candidates", default="touch,inside_1,away_1", help="Comma-separated quote candidates: touch, inside_1, away_1.")
     parser.add_argument("--post-only-gap-ticks", type=int, default=1)
+    parser.add_argument("--decision-compute-latency-us", type=int, default=50)
+    parser.add_argument("--order-entry-latency-us", type=int, default=500)
     parser.add_argument("--invalid-quote-policy", choices=("mask", "error"), default="mask")
     parser.add_argument("--order-qty", type=float, default=0.001)
     parser.add_argument("--fill-horizon-us", type=int, default=1_000_000)
@@ -748,6 +788,8 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         kyle_use_notional_flow=args.kyle_use_notional_flow,
         quote_candidates=args.quote_candidates,
         post_only_gap_ticks=args.post_only_gap_ticks,
+        decision_compute_latency_us=args.decision_compute_latency_us,
+        order_entry_latency_us=args.order_entry_latency_us,
         invalid_quote_policy=args.invalid_quote_policy,
         order_qty=args.order_qty,
         fill_horizon_us=args.fill_horizon_us,

@@ -73,3 +73,27 @@ def test_same_side_replacement_uses_activation_style_key_after_cancel():
     source = Path("mmrt/execution/fill_sim.py").read_text(encoding="utf-8")
     assert "_activation_key_after_cancel" in source
     assert "MAX_EVENT_SEQ" in source
+
+def test_no_stale_adverse_selection_training_constants():
+    source = Path("mmrt/cli/train_adverse_selection.py").read_text(encoding="utf-8")
+    assert "_BINARY_TARGETS" not in source
+
+
+def test_no_stale_adverse_selection_npz_writer():
+    source = Path("mmrt/cli/train_adverse_selection.py").read_text(encoding="utf-8")
+    assert "_write_npz_atomic" not in source
+    assert "np.savez(f" not in source
+
+
+def test_no_legacy_adverse_selection_quote_distance_paths():
+    production_paths = [
+        Path("mmrt/execution/adverse_selection.py"),
+        Path("mmrt/cli/train_adverse_selection.py"),
+    ]
+    offenders = []
+    for path in production_paths:
+        text = path.read_text(encoding="utf-8")
+        for token in ("quote_distance_ticks", "--quote-distance-ticks"):
+            if token in text:
+                offenders.append(f"{path}: {token}")
+    assert offenders == []
