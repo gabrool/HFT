@@ -10,7 +10,7 @@ import numpy as np
 
 from mmrt.execution.adverse_selection import AdverseSelectionDataset
 
-ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge" + "_" + "v" + "2"
+ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_v2"
 ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_aligned"
 ADVERSE_SELECTION_MODEL_FILENAME = "adverse_selection_model.npz"
 ADVERSE_SELECTION_SIGNALS_FILENAME = "adverse_selection_signals.npz"
@@ -150,8 +150,12 @@ class AdverseSelectionSignalArtifact:
         if any(a.shape[0] != n for a in arrays):
             raise ValueError("decision arrays must have same length")
         names = _names_tuple(self.target_names, "target_names")
+        if not isinstance(self.predictions, Mapping):
+            raise ValueError("predictions must be a mapping")
         preds: dict[str, np.ndarray] = {}
         for name in names:
+            if name not in self.predictions:
+                raise ValueError(f"missing prediction array for target {name!r}")
             arr = np.ascontiguousarray(self.predictions[name], dtype=np.float32)
             if arr.ndim != 1 or arr.shape[0] != n or not np.isfinite(arr).all():
                 raise ValueError("prediction arrays must be finite and aligned")

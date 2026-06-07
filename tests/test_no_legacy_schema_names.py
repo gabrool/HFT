@@ -28,6 +28,7 @@ FORBIDDEN_SUBSTRINGS = (
 ALLOWED_SUBSTRINGS = (
     "parquet_version",
     "DEFAULT_PARQUET_VERSION",
+    "mmrt_adverse_selection_ridge_v2",
 )
 
 PRODUCTION_ROOT = Path("mmrt")

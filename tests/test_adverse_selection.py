@@ -1,5 +1,6 @@
 import inspect
 import json
+from pathlib import Path
 from decimal import Decimal
 from collections import deque
 
@@ -24,6 +25,9 @@ from mmrt.execution.adverse_selection import (
 )
 from mmrt.cli.train_adverse_selection import (
     AdverseSelectionTrainCLIConfig,
+    _build_adverse_selection_config,
+    _config_from_args,
+    build_arg_parser,
     main,
     run_adverse_selection_training,
 )
@@ -300,7 +304,7 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     assert summary["baseline"]["enabled"] is True
     if model_npz.exists():
         npz = np.load(model_npz, allow_pickle=True)
-        assert str(npz["schema"]) == "mmrt_adverse_selection_ridge" + "_" + "v" + "2"
+        assert str(npz["schema"]) == "mmrt_adverse_selection_ridge_v2"
         assert "feature_mean" in npz
         assert "coefficients" in npz
 
@@ -415,6 +419,54 @@ def test_train_adverse_selection_overwrite_guard(tmp_path):
         )
 
 
+def test_quote_candidate_parser_rejects_malformed_offsets():
+    with pytest.raises(ValueError, match="malformed quote candidate"):
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates="inside_x")
+    with pytest.raises(ValueError, match="malformed quote candidate"):
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates="away_0")
+
+
+def test_quote_candidate_parser_rejects_duplicate_names():
+    with pytest.raises(ValueError, match="duplicate quote candidate"):
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates="touch,touch")
+
+
+def test_quote_candidate_parser_validates_sequence_values():
+    with pytest.raises(ValueError, match="QuoteCandidateConfig"):
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates=("touch",))  # type: ignore[arg-type]
+
+
+def test_train_adverse_selection_config_wires_latency_to_counterfactual_config():
+    cfg = AdverseSelectionTrainCLIConfig(
+        tape_root="/tmp/tape",
+        decision_compute_latency_us=7,
+        order_entry_latency_us=11,
+    )
+    adverse_cfg = _build_adverse_selection_config(cfg)
+    assert adverse_cfg.quote.latency_config.decision_compute_latency_us == 7
+    assert adverse_cfg.quote.latency_config.order_entry_latency_us == 11
+
+
+def test_train_adverse_selection_parser_accepts_latency_args():
+    args = build_arg_parser().parse_args([
+        "--tape-root",
+        "/tmp/tape",
+        "--decision-compute-latency-us",
+        "7",
+        "--order-entry-latency-us",
+        "11",
+    ])
+    cfg = _config_from_args(args)
+    assert cfg.decision_compute_latency_us == 7
+    assert cfg.order_entry_latency_us == 11
+
+
+def test_adverse_selection_schema_constant_is_direct_string():
+    source = Path("mmrt/execution/adverse_signal.py").read_text(encoding="utf-8")
+    assert 'ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_v2"' in source
+    assert '"mmrt_adverse_selection_ridge" + "_" + "v" + "2"' not in source
+
+
 def test_config_parses_windows_queue_mode_and_targets():
     cfg = AdverseSelectionTrainCLIConfig(
         tape_root="/tmp/tape",
@@ -433,6 +485,8 @@ def test_config_parses_windows_queue_mode_and_targets():
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", l2_decrease_weight=1.1)
     with pytest.raises(ValueError):
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", target_names="bid_touch_filled,")
+    with pytest.raises(ValueError):
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", order_entry_latency_us=-1)
 
 
 def test_adverse_selection_modules_do_not_import_forbidden_layers():

@@ -3,7 +3,9 @@ import pytest
 
 from mmrt.execution.adverse_signal import (
     ADVERSE_SELECTION_MODEL_SCHEMA,
+    ADVERSE_SELECTION_SIGNALS_SCHEMA,
     AdverseSelectionModelArtifact,
+    AdverseSelectionSignalArtifact,
     predict_adverse_selection,
     save_adverse_selection_model,
     load_adverse_selection_model,
@@ -52,3 +54,26 @@ def test_adverse_model_rejects_old_schema_and_missing_edge_targets():
         )
     with pytest.raises(ValueError, match="missing adverse-selection targets"):
         require_adverse_targets_for_executable_edge(("bid_touch_filled",), ("touch",))
+
+def test_adverse_signal_artifact_rejects_missing_prediction_key():
+    with pytest.raises(ValueError, match="missing prediction array"):
+        AdverseSelectionSignalArtifact(
+            schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+            decision_local_ts_us=np.array([100], dtype=np.int64),
+            decision_event_index=np.array([0], dtype=np.int64),
+            decision_event_seq=np.array([2**31 - 1], dtype=np.int64),
+            target_names=("bid_touch_filled",),
+            predictions={},
+        )
+
+
+def test_adverse_signal_artifact_rejects_non_mapping_predictions():
+    with pytest.raises(ValueError, match="predictions must be a mapping"):
+        AdverseSelectionSignalArtifact(
+            schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+            decision_local_ts_us=np.array([100], dtype=np.int64),
+            decision_event_index=np.array([0], dtype=np.int64),
+            decision_event_seq=np.array([0], dtype=np.int64),
+            target_names=("bid_touch_filled",),
+            predictions=[],  # type: ignore[arg-type]
+        )
