@@ -28,7 +28,7 @@ from mmrt.execution.contracts import (
     RewardComponents,
     SymbolSpec,
 )
-
+from mmrt.time_key import EventKey
 
 
 def _rules(**overrides):
@@ -263,6 +263,72 @@ def test_active_order_and_fill_validation_and_properties():
         ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.02, 0.0, OrderStatus.PARTIALLY_FILLED, 100, 110, 0, 0)
     with pytest.raises(ValueError):
         ActiveOrder(1, OrderSide.BUY, 1000, 0.02, 0.0, 0.0, OrderStatus.ACTIVE, 100, 110, 0, 0)
+
+
+def test_active_order_rejects_pending_cancel_keys():
+    with pytest.raises(ValueError, match="ACTIVE order cannot have pending cancel"):
+        ActiveOrder(
+            order_id=1,
+            side=OrderSide.BUY,
+            price_tick=1000,
+            qty=0.01,
+            remaining_qty=0.01,
+            queue_ahead_qty=0.0,
+            status=OrderStatus.ACTIVE,
+            created_local_ts_us=100,
+            created_event_seq=0,
+            last_update_local_ts_us=200,
+            last_update_event_seq=0,
+            cancel_requested_local_ts_us=200,
+            cancel_requested_event_seq=0,
+            cancel_effective_local_ts_us=300,
+            cancel_effective_event_seq=0,
+        )
+
+
+def test_pending_cancel_order_accepts_cancel_keys():
+    order = ActiveOrder(
+        order_id=1,
+        side=OrderSide.BUY,
+        price_tick=1000,
+        qty=0.01,
+        remaining_qty=0.01,
+        queue_ahead_qty=0.0,
+        status=OrderStatus.PENDING_CANCEL,
+        created_local_ts_us=100,
+        created_event_seq=0,
+        last_update_local_ts_us=200,
+        last_update_event_seq=0,
+        cancel_requested_local_ts_us=200,
+        cancel_requested_event_seq=0,
+        cancel_effective_local_ts_us=300,
+        cancel_effective_event_seq=0,
+    )
+
+    assert order.is_live
+    assert order.cancel_requested_key == EventKey(200, 0)
+    assert order.cancel_effective_key == EventKey(300, 0)
+
+
+def test_partially_filled_order_rejects_pending_cancel_keys():
+    with pytest.raises(ValueError, match="PARTIALLY_FILLED order cannot have pending cancel"):
+        ActiveOrder(
+            order_id=1,
+            side=OrderSide.BUY,
+            price_tick=1000,
+            qty=0.02,
+            remaining_qty=0.01,
+            queue_ahead_qty=0.0,
+            status=OrderStatus.PARTIALLY_FILLED,
+            created_local_ts_us=100,
+            created_event_seq=0,
+            last_update_local_ts_us=200,
+            last_update_event_seq=0,
+            cancel_requested_local_ts_us=200,
+            cancel_requested_event_seq=0,
+            cancel_effective_local_ts_us=300,
+            cancel_effective_event_seq=0,
+        )
 
 
 def test_position_state_mark_to_market_requires_positive_mid():
