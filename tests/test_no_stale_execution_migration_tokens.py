@@ -28,6 +28,7 @@ FORBIDDEN_PRODUCTION_TOKENS = (
     "return_std_bps_200000us",
     "max_abs_return_bps_500000us",
     "depth_imbalance_realized_vol_1000000us",
+    "pending_cancel_request_count",
 )
 
 

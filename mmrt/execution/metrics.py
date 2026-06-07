@@ -121,7 +121,8 @@ class ExecutionMetricAccumulator:
     post_only_reject_count_total: int = 0
     activated_order_count_total: int = 0
     effective_cancel_count_total: int = 0
-    pending_cancel_request_count_total: int = 0
+    orders_pending_cancel_count_total: int = 0
+    orders_pending_cancel_count_max: int = 0
     queue_trade_advance_qty_total: float = 0.0
     queue_l2_advance_qty_total: float = 0.0
     queue_advanced_qty_total: float = 0.0
@@ -198,7 +199,12 @@ class ExecutionMetricAccumulator:
         self.post_only_reject_count_total += _info_int(info, "post_only_reject_count", 0)
         self.activated_order_count_total += _info_int(info, "activated_order_count", 0)
         self.effective_cancel_count_total += _info_int(info, "effective_cancel_count", 0)
-        self.pending_cancel_request_count_total += _info_int(info, "pending_cancel_request_count", 0)
+        orders_pending_cancel_count = _info_int(info, "orders_pending_cancel_count", 0)
+        self.orders_pending_cancel_count_total += orders_pending_cancel_count
+        self.orders_pending_cancel_count_max = max(
+            self.orders_pending_cancel_count_max,
+            orders_pending_cancel_count,
+        )
         self.queue_trade_advance_qty_total += _info_float(info, "queue_trade_advance_qty", 0.0)
         self.queue_l2_advance_qty_total += _info_float(info, "queue_l2_advance_qty", 0.0)
         self.queue_advanced_qty_total += _info_float(info, "queue_advanced_qty", 0.0)
@@ -303,7 +309,9 @@ class ExecutionMetricAccumulator:
                 "post_only_reject_count_total": self.post_only_reject_count_total,
                 "activated_order_count_total": self.activated_order_count_total,
                 "effective_cancel_count_total": self.effective_cancel_count_total,
-                "pending_cancel_request_count_total": self.pending_cancel_request_count_total,
+                "orders_pending_cancel_count_total": self.orders_pending_cancel_count_total,
+                "orders_pending_cancel_count_mean": self.orders_pending_cancel_count_total / denominator,
+                "orders_pending_cancel_count_max": self.orders_pending_cancel_count_max,
                 "quote_bid_enabled_count": self.quote_bid_enabled_count,
                 "quote_ask_enabled_count": self.quote_ask_enabled_count,
                 "two_sided_quote_count": self.two_sided_quote_count,

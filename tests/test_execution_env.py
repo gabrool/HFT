@@ -645,6 +645,137 @@ def test_post_only_safe_at_decision_but_marketable_at_activation_is_rejected():
     assert step.info["orders_live_count"] == 0
 
 
+def test_order_activation_between_events_can_fill_next_trade():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+        _l2(seq=1, local_ts_us=300, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+    ]
+    trades = [
+        _trade(local_ts_us=150, side=AggressorSide.SELL, price_tick=1001, amount=10.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 2], [100, 300]),
+        config=_env_config(
+            decision_interval_us=300,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=20,
+                cancel_latency_us=0,
+            ),
+        ),
+    )
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert len(step.fills) == 1
+    assert step.fills[0].local_ts_us == 150
+
+
+def test_cancel_between_events_blocks_next_trade():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=200),
+        _l2(seq=2, local_ts_us=300),
+    ]
+    trades = [
+        _trade(local_ts_us=250, side=AggressorSide.SELL, price_tick=1001, amount=10.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 1, 3], [100, 200, 300]),
+        config=_env_config(
+            decision_interval_us=50,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=0,
+                cancel_latency_us=20,
+            ),
+        ),
+    )
+    env.reset()
+
+    first = env.step(_bid_only_action())
+    assert first.info["orders_live_count"] >= 1
+
+    second = env.step(_disabled_action())
+
+    assert second.info["effective_cancel_count"] >= 1
+    assert second.fills == ()
+
+
+def test_pending_order_queue_ahead_is_refreshed_at_activation():
+    l2_events = [
+        _l2(
+            seq=0,
+            local_ts_us=100,
+            bid_ticks=(1000,),
+            bid_sizes=(1.0,),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=1,
+            local_ts_us=150,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(3.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=2,
+            local_ts_us=300,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(3.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+    ]
+    trades = [
+        _trade(local_ts_us=200, side=AggressorSide.SELL, price_tick=1001, amount=2.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
+        config=_env_config(
+            decision_interval_us=300,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=80,
+                cancel_latency_us=0,
+            ),
+            fill_simulator_config=FillSimulatorConfig(
+                queue_model=QueueModelConfig(
+                    mode=QueueModelMode.BALANCED,
+                    trade_at_level_weight=1.0,
+                    l2_decrease_weight=1.0,
+                ),
+                maker_fee_bps=0.0,
+            ),
+        ),
+    )
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert step.fills == ()
+    assert len(env._state.live_orders) == 1
+    order = env._state.live_orders[0]
+    assert order.price_tick == 1001
+    assert order.queue_ahead_qty == pytest.approx(1.0)
+
+
+def test_env_no_next_event_latency_snapping_helper():
+    source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
+    assert "_effective_event_key_for_latency" not in source
+    assert "_order_activation_key_for_latency" in source
+    assert "_cancel_effective_key_for_latency" in source
+
+
 def test_activation_at_exact_event_key_does_not_fill_on_that_event():
     l2_events = [
         _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),

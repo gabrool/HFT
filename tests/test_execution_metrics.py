@@ -11,7 +11,7 @@ def test_metric_accumulator_summarizes_order_and_queue_diagnostics():
         "post_only_reject_count": 2,
         "activated_order_count": 3,
         "effective_cancel_count": 4,
-        "pending_cancel_request_count": 5,
+        "orders_pending_cancel_count": 5,
         "queue_trade_advance_qty": 0.1,
         "queue_l2_advance_qty": 0.2,
         "queue_advanced_qty": 0.3,
@@ -39,7 +39,9 @@ def test_metric_accumulator_summarizes_order_and_queue_diagnostics():
     assert summary["orders"]["post_only_reject_count_total"] == 2
     assert summary["orders"]["activated_order_count_total"] == 3
     assert summary["orders"]["effective_cancel_count_total"] == 4
-    assert summary["orders"]["pending_cancel_request_count_total"] == 5
+    assert summary["orders"]["orders_pending_cancel_count_total"] == 5
+    assert summary["orders"]["orders_pending_cancel_count_mean"] == pytest.approx(5.0)
+    assert summary["orders"]["orders_pending_cancel_count_max"] == 5
     assert summary["queue"]["trade_advance_qty_total"] == pytest.approx(0.1)
     assert summary["queue"]["l2_advance_qty_total"] == pytest.approx(0.2)
     assert summary["queue"]["advanced_qty_total"] == pytest.approx(0.3)

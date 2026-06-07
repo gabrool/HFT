@@ -7,7 +7,7 @@ simulates fills, computes rewards, and builds fixed observation vectors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any, Sequence
 
@@ -348,8 +348,14 @@ class ExecutionEnv:
         }
         decision_key = self._event_key_at_index(state.event_index)
         decision_ts = decision_key.local_ts_us
-        order_effective_key = self._effective_event_key_for_latency(decision_event_index=state.event_index, target_local_ts_us=decision_ts + self.config.latency_config.order_activation_delay_us)
-        cancel_effective_key = self._effective_event_key_for_latency(decision_event_index=state.event_index, target_local_ts_us=decision_ts + self.config.latency_config.cancel_effective_delay_us)
+        order_effective_key = self._order_activation_key_for_latency(
+            decision_key=decision_key,
+            target_local_ts_us=decision_ts + self.config.latency_config.order_activation_delay_us,
+        )
+        cancel_effective_key = self._cancel_effective_key_for_latency(
+            decision_key=decision_key,
+            target_local_ts_us=decision_ts + self.config.latency_config.cancel_effective_delay_us,
+        )
         replacement_orders, cancel_count = sync_orders_to_quote(
             state.live_orders,
             quote,
@@ -362,11 +368,7 @@ class ExecutionEnv:
             qty_epsilon=self.config.fill_simulator_config.qty_epsilon,
         )
         state.live_orders = _live_orders_tuple(replacement_orders)
-        activation = activate_pending_orders(state.live_orders, event_key=decision_key, book_top=previous_book_top, post_only_gap_ticks=self.config.quote_geometry_config.post_only_gap_ticks)
-        state.live_orders = _live_orders_tuple(activation.orders)
-        self._step_diag["activated_order_count"] = int(self._step_diag["activated_order_count"]) + activation.activated_count
-        self._step_diag["post_only_reject_count"] = int(self._step_diag["post_only_reject_count"]) + activation.post_only_reject_count
-        self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + activation.already_cancelled_count
+        self._activate_pending_orders_at(event_key=decision_key, book_ptr=state.current_book_ptr)
         state.next_order_id = _next_order_id_after(replacement_orders, state.next_order_id)
 
         decision_end_local_ts_us = previous_book_top.local_ts_us + self.config.decision_interval_us
@@ -392,22 +394,15 @@ class ExecutionEnv:
                 pre_activation_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1)
             else:
                 pre_activation_key = EventKey(max(event_key.local_ts_us - 1, 1), MAX_EVENT_SEQ)
-            pre_activation = activate_pending_orders(
-                state.live_orders,
+            self._activate_pending_orders_at(
                 event_key=pre_activation_key,
-                book_top=self._book_top_from_ptr(state.current_book_ptr),
-                post_only_gap_ticks=self.config.quote_geometry_config.post_only_gap_ticks,
+                book_ptr=state.current_book_ptr,
             )
-            state.live_orders = _live_orders_tuple(pre_activation.orders)
-            self._step_diag["activated_order_count"] = int(self._step_diag["activated_order_count"]) + pre_activation.activated_count
-            self._step_diag["post_only_reject_count"] = int(self._step_diag["post_only_reject_count"]) + pre_activation.post_only_reject_count
-            self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + pre_activation.already_cancelled_count
             fills.extend(self._process_event(next_event_index))
-            post_activation = activate_pending_orders(state.live_orders, event_key=event_key, book_top=self._book_top_from_ptr(state.current_book_ptr), post_only_gap_ticks=self.config.quote_geometry_config.post_only_gap_ticks)
-            state.live_orders = _live_orders_tuple(post_activation.orders)
-            self._step_diag["activated_order_count"] = int(self._step_diag["activated_order_count"]) + post_activation.activated_count
-            self._step_diag["post_only_reject_count"] = int(self._step_diag["post_only_reject_count"]) + post_activation.post_only_reject_count
-            self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + post_activation.already_cancelled_count
+            self._activate_pending_orders_at(
+                event_key=event_key,
+                book_ptr=state.current_book_ptr,
+            )
             if event_code == EVENT_TYPE_CODE_L2_BATCH and event_book_ptr >= 0:
                 processed_valid_l2 = processed_valid_l2 or self._book_top_from_ptr(event_book_ptr) is not None
             processed_any = True
@@ -447,7 +442,6 @@ class ExecutionEnv:
             "events_processed": events_processed,
             "cancel_count": cancel_count,
             "cancel_request_count": cancel_count,
-            "pending_cancel_request_count": sum(1 for order in state.live_orders if order.status == OrderStatus.PENDING_CANCEL),
             "num_fills": len(step_fills),
             "orders_live_count": sum(1 for order in state.live_orders if order.is_live),
             "orders_pending_new_count": sum(1 for order in state.live_orders if order.status == OrderStatus.PENDING_NEW),
@@ -503,16 +497,82 @@ class ExecutionEnv:
         row = self.tape.arrays.events[event_index]
         return EventKey(int(row["local_ts_us"]), int(row["event_seq"]))
 
-    def _effective_event_key_for_latency(self, *, decision_event_index: int, target_local_ts_us: int) -> EventKey:
-        decision_key = self._event_key_at_index(decision_event_index)
+    def _order_activation_key_for_latency(
+        self,
+        *,
+        decision_key: EventKey,
+        target_local_ts_us: int,
+    ) -> EventKey:
+        target_local_ts_us = _require_positive_int(target_local_ts_us, "target_local_ts_us")
         if target_local_ts_us <= decision_key.local_ts_us:
             return decision_key
-        events = self.tape.arrays.events
-        for idx in range(decision_event_index + 1, len(events)):
-            row = events[idx]
-            if int(row["local_ts_us"]) >= target_local_ts_us:
-                return EventKey(int(row["local_ts_us"]), int(row["event_seq"]))
         return EventKey(target_local_ts_us, MAX_EVENT_SEQ)
+
+    def _cancel_effective_key_for_latency(
+        self,
+        *,
+        decision_key: EventKey,
+        target_local_ts_us: int,
+    ) -> EventKey:
+        target_local_ts_us = _require_positive_int(target_local_ts_us, "target_local_ts_us")
+        if target_local_ts_us <= decision_key.local_ts_us:
+            return decision_key
+        return EventKey(target_local_ts_us, 0)
+
+    def _refresh_pending_new_queue_ahead_for_activation(
+        self,
+        orders: tuple[ActiveOrder, ...],
+        *,
+        event_key: EventKey,
+        book_ptr: int,
+    ) -> tuple[ActiveOrder, ...]:
+        refreshed: list[ActiveOrder] = []
+        for order in orders:
+            if order.status != OrderStatus.PENDING_NEW:
+                refreshed.append(order)
+                continue
+            if order.effective_key > event_key:
+                refreshed.append(order)
+                continue
+            cancel_key = order.cancel_effective_key
+            if cancel_key is not None and cancel_key <= event_key:
+                refreshed.append(order)
+                continue
+
+            queue_ahead_qty = self._queue_ahead_for_new_order(
+                order.side,
+                order.price_tick,
+                book_ptr,
+            )
+            if abs(queue_ahead_qty - order.queue_ahead_qty) <= self.config.fill_simulator_config.qty_epsilon:
+                refreshed.append(order)
+                continue
+
+            refreshed.append(replace(order, queue_ahead_qty=queue_ahead_qty))
+        return tuple(refreshed)
+
+    def _activate_pending_orders_at(
+        self,
+        *,
+        event_key: EventKey,
+        book_ptr: int,
+    ) -> None:
+        state = self._require_state()
+        refreshed = self._refresh_pending_new_queue_ahead_for_activation(
+            state.live_orders,
+            event_key=event_key,
+            book_ptr=book_ptr,
+        )
+        activation = activate_pending_orders(
+            refreshed,
+            event_key=event_key,
+            book_top=self._book_top_from_ptr(book_ptr),
+            post_only_gap_ticks=self.config.quote_geometry_config.post_only_gap_ticks,
+        )
+        state.live_orders = _live_orders_tuple(activation.orders)
+        self._step_diag["activated_order_count"] = int(self._step_diag["activated_order_count"]) + activation.activated_count
+        self._step_diag["post_only_reject_count"] = int(self._step_diag["post_only_reject_count"]) + activation.post_only_reject_count
+        self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + activation.already_cancelled_count
 
     def _record_queue_updates(self, result) -> None:
         for update in result.queue_updates:
