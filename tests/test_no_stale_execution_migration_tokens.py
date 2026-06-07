@@ -97,3 +97,21 @@ def test_no_legacy_adverse_selection_quote_distance_paths():
             if token in text:
                 offenders.append(f"{path}: {token}")
     assert offenders == []
+
+
+def test_executable_edge_uses_signed_spread_capture():
+    source = Path("mmrt/execution/executable_edge.py").read_text(encoding="utf-8")
+    assert "max(mid_tick - price_tick, 0.0)" not in source
+    assert "max(price_tick - mid_tick, 0.0)" not in source
+
+
+def test_adverse_selection_signal_build_cli_has_no_rl_dependencies():
+    source = Path("mmrt/cli/build_adverse_selection_signals.py").read_text(encoding="utf-8")
+    for forbidden in ("mmrt.rl", "torch", "gym", "gymnasium", "pandas", "polars", "sklearn"):
+        assert forbidden not in source
+
+
+def test_no_timestamp_only_kyle_mid_helper_left():
+    source = Path("mmrt/execution/adverse_selection.py").read_text(encoding="utf-8")
+    assert "_precompute_kyle_samples" in source
+    assert "_future_mid_and_key_at_or_after_key" in source

@@ -199,14 +199,28 @@ def save_adverse_selection_signals(path: str | Path, artifact: AdverseSelectionS
 
 def load_adverse_selection_signals(path: str | Path) -> AdverseSelectionSignalArtifact:
     with np.load(Path(path), allow_pickle=True) as data:
+        required_keys = ("schema", "decision_local_ts_us", "decision_event_index", "decision_event_seq", "target_names")
+        missing_base = [key for key in required_keys if key not in data.files]
+        if missing_base:
+            raise ValueError(f"missing required arrays in adverse-selection signals artifact: {missing_base}")
         target_names = tuple(str(x) for x in data["target_names"].tolist())
+        predictions: dict[str, np.ndarray] = {}
+        missing_predictions: list[str] = []
+        for name in target_names:
+            key = f"pred_{name}"
+            if key not in data.files:
+                missing_predictions.append(key)
+                continue
+            predictions[name] = np.asarray(data[key])
+        if missing_predictions:
+            raise ValueError(f"missing prediction arrays in adverse-selection signals artifact: {missing_predictions}")
         return AdverseSelectionSignalArtifact(
             schema=str(data["schema"].item()),
             decision_local_ts_us=np.asarray(data["decision_local_ts_us"]),
             decision_event_index=np.asarray(data["decision_event_index"]),
             decision_event_seq=np.asarray(data["decision_event_seq"]),
             target_names=target_names,
-            predictions={name: np.asarray(data[f"pred_{name}"]) for name in target_names},
+            predictions=predictions,
         )
 
 

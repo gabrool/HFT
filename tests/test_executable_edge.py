@@ -35,3 +35,28 @@ def test_executable_edge_bid_ask_alpha_and_costs():
     assert bid.adverse_cost_bps_uncond == pytest.approx(1.0)
     with pytest.raises(ValueError):
         compute_side_executable_edge(candidate_name="away_1", side=OrderSide.BUY, mid_tick=100.0, price_tick=99, linear_signal=_signal(), adverse_predictions=preds)
+
+from pathlib import Path
+
+
+def test_executable_edge_spread_capture_is_signed():
+    preds = {
+        "bid_touch_filled": 1.0,
+        "bid_touch_toxic_cost_bps": 0.0,
+        "ask_touch_filled": 1.0,
+        "ask_touch_toxic_cost_bps": 0.0,
+    }
+    bid_below_mid = compute_side_executable_edge(candidate_name="touch", side=OrderSide.BUY, mid_tick=100.0, price_tick=99, linear_signal=_signal(0.0), adverse_predictions=preds)
+    bid_above_mid = compute_side_executable_edge(candidate_name="touch", side=OrderSide.BUY, mid_tick=100.0, price_tick=101, linear_signal=_signal(0.0), adverse_predictions=preds)
+    ask_above_mid = compute_side_executable_edge(candidate_name="touch", side=OrderSide.SELL, mid_tick=100.0, price_tick=101, linear_signal=_signal(0.0), adverse_predictions=preds)
+    ask_below_mid = compute_side_executable_edge(candidate_name="touch", side=OrderSide.SELL, mid_tick=100.0, price_tick=99, linear_signal=_signal(0.0), adverse_predictions=preds)
+    assert bid_below_mid.spread_capture_bps == pytest.approx(100.0)
+    assert bid_above_mid.spread_capture_bps == pytest.approx(-100.0)
+    assert ask_above_mid.spread_capture_bps == pytest.approx(100.0)
+    assert ask_below_mid.spread_capture_bps == pytest.approx(-100.0)
+
+
+def test_executable_edge_does_not_floor_spread_capture():
+    source = Path("mmrt/execution/executable_edge.py").read_text(encoding="utf-8")
+    assert "max(mid_tick - price_tick, 0.0)" not in source
+    assert "max(price_tick - mid_tick, 0.0)" not in source

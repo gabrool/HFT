@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
-from typing import NamedTuple, Sequence
+from typing import Mapping, NamedTuple, Sequence
 
 import numpy as np
 
@@ -52,6 +52,8 @@ __all__ = [
     "AdverseSelectionDataset",
     "VPINState",
     "RollingKyleLambdaState",
+    "quote_candidate_configs_from_names",
+    "adverse_selection_config_from_training_summary",
     "build_adverse_selection_dataset",
     "summarize_adverse_selection_dataset",
     "adverse_selection_feature_names",
@@ -209,6 +211,104 @@ DEFAULT_QUOTE_CANDIDATES = (
     QuoteCandidateConfig(name="inside_1", mode=QuoteCandidateMode.INSIDE, offset_ticks=1),
     QuoteCandidateConfig(name="away_1", mode=QuoteCandidateMode.AWAY, offset_ticks=1),
 )
+
+
+def _quote_candidate_config_from_name(name: str) -> QuoteCandidateConfig:
+    token = _require_nonempty_str(name, "quote_candidate_name")
+    if token == "touch":
+        return QuoteCandidateConfig("touch", QuoteCandidateMode.TOUCH, 0)
+    for prefix, mode in (("inside_", QuoteCandidateMode.INSIDE), ("away_", QuoteCandidateMode.AWAY)):
+        if token.startswith(prefix):
+            suffix = token[len(prefix):]
+            try:
+                offset = int(suffix)
+            except ValueError as exc:
+                raise ValueError(f"malformed quote candidate {token!r}") from exc
+            try:
+                return QuoteCandidateConfig(token, mode, offset)
+            except ValueError as exc:
+                raise ValueError(f"malformed quote candidate {token!r}") from exc
+    raise ValueError(f"malformed quote candidate {token!r}")
+
+
+def quote_candidate_configs_from_names(names: Sequence[str]) -> tuple[QuoteCandidateConfig, ...]:
+    if isinstance(names, (str, bytes)):
+        raise ValueError("quote_candidates must be a sequence of non-empty strings")
+    try:
+        values = tuple(names)
+    except TypeError as exc:
+        raise ValueError("quote_candidates must be a sequence of non-empty strings") from exc
+    if not values:
+        raise ValueError("quote_candidates must be non-empty")
+    return _quote_candidates_tuple(tuple(_quote_candidate_config_from_name(str(name)) for name in values))
+
+
+def _required(payload: Mapping[str, object], key: str) -> object:
+    if key not in payload:
+        raise ValueError(f"missing required training summary field {key!r}")
+    return payload[key]
+
+
+def _optional_int(payload: Mapping[str, object], key: str) -> int | None:
+    value = _required(payload, key)
+    if value is None:
+        return None
+    return int(value)
+
+
+def adverse_selection_config_from_training_summary(payload: Mapping[str, object]) -> AdverseSelectionConfig:
+    if not isinstance(payload, Mapping):
+        raise ValueError("training summary payload must be a mapping")
+    try:
+        quote_names_obj = _required(payload, "quote_candidates")
+        if isinstance(quote_names_obj, (str, bytes)):
+            quote_names = [part.strip() for part in str(quote_names_obj).split(",") if part.strip()]
+        else:
+            quote_names = [str(x) for x in quote_names_obj]  # type: ignore[union-attr]
+        return AdverseSelectionConfig(
+            decision_interval_us=int(_required(payload, "decision_interval_us")),
+            start_event_index=_optional_int(payload, "start_event_index"),
+            max_decisions=_optional_int(payload, "max_decisions"),
+            flow_windows_us=tuple(int(x) for x in _required(payload, "flow_windows_us")),  # type: ignore[union-attr]
+            drop_incomplete_horizon=bool(_required(payload, "drop_incomplete_horizon")),
+            vpin=VPINConfig(
+                bucket_volume=float(_required(payload, "vpin_bucket_volume")),
+                num_buckets=int(_required(payload, "vpin_num_buckets")),
+                min_completed_buckets=int(_required(payload, "vpin_min_completed_buckets")),
+                use_notional_volume=bool(_required(payload, "vpin_use_notional_volume")),
+            ),
+            kyle=KyleLambdaConfig(
+                sample_interval_us=int(_required(payload, "kyle_sample_interval_us")),
+                response_horizon_us=int(_required(payload, "kyle_response_horizon_us")),
+                windows_us=tuple(int(x) for x in _required(payload, "kyle_windows_us")),  # type: ignore[union-attr]
+                min_samples=int(_required(payload, "kyle_min_samples")),
+                use_notional_flow=bool(_required(payload, "kyle_use_notional_flow")),
+            ),
+            quote=CounterfactualQuoteConfig(
+                quote_candidates=quote_candidate_configs_from_names(quote_names),
+                post_only_gap_ticks=int(_required(payload, "post_only_gap_ticks")),
+                invalid_quote_policy=str(_required(payload, "invalid_quote_policy")),
+                order_qty=float(_required(payload, "order_qty")),
+                fill_horizon_us=int(_required(payload, "fill_horizon_us")),
+                adverse_horizon_us=int(_required(payload, "adverse_horizon_us")),
+                toxic_threshold_bps=float(_required(payload, "toxic_threshold_bps")),
+                latency_config=LatencyConfig(
+                    decision_compute_latency_us=int(payload.get("decision_compute_latency_us", 50)),
+                    order_entry_latency_us=int(payload.get("order_entry_latency_us", 500)),
+                ),
+                queue_model=QueueModelConfig(
+                    mode=str(_required(payload, "queue_mode")),
+                    l2_decrease_weight=float(_required(payload, "l2_decrease_weight")),
+                    trade_at_level_weight=float(_required(payload, "trade_at_level_weight")),
+                    unknown_level_queue_ahead_qty=float(_required(payload, "unknown_level_queue_ahead_qty")),
+                    dedupe_l2_decrease_with_trade_prints=bool(_required(payload, "dedupe_l2_decrease_with_trade_prints")),
+                ),
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith(("missing required", "malformed", "quote_", "decision_", "flow_", "vpin", "kyle", "queue", "invalid_")):
+            raise
+        raise ValueError("malformed adverse-selection training summary config") from exc
 
 
 def _quote_candidates_tuple(values: Sequence[QuoteCandidateConfig]) -> tuple[QuoteCandidateConfig, ...]:
@@ -370,7 +470,7 @@ class VPINState:
 
 
 class _KyleSample(NamedTuple):
-    end_local_ts_us: int
+    end_key: EventKey
     x_flow: float
     y_mid_bps: float
 
@@ -386,7 +486,7 @@ class RollingKyleLambdaState:
     sum_xy: np.ndarray
     sum_yy: np.ndarray
 
-    def add_finalized_sample(self, sample: _KyleSample, current_local_ts_us: int) -> None:
+    def add_finalized_sample(self, sample: _KyleSample, current_key: EventKey) -> None:
         for i in range(len(self.config.windows_us)):
             self.samples_by_window[i].append(sample)
             self.n[i] += 1.0
@@ -395,13 +495,13 @@ class RollingKyleLambdaState:
             self.sum_xx[i] += sample.x_flow * sample.x_flow
             self.sum_xy[i] += sample.x_flow * sample.y_mid_bps
             self.sum_yy[i] += sample.y_mid_bps * sample.y_mid_bps
-        self.expire_old(current_local_ts_us)
+        self.expire_old(current_key)
 
-    def expire_old(self, current_local_ts_us: int) -> None:
+    def expire_old(self, current_key: EventKey) -> None:
         for i, window_us in enumerate(self.config.windows_us):
-            cutoff = current_local_ts_us - window_us
+            cutoff = current_key.local_ts_us - window_us
             q = self.samples_by_window[i]
-            while q and q[0].end_local_ts_us < cutoff:
+            while q and q[0].end_key.local_ts_us < cutoff:
                 sample = q.popleft()
                 self.n[i] -= 1.0
                 self.sum_x[i] -= sample.x_flow
@@ -623,7 +723,7 @@ def _valid_l2_view_from_tape(tape: ExecutionTape) -> _ValidL2View:
     return _ValidL2View(np.asarray(ts, dtype=np.int64), np.asarray(seq, dtype=np.int64), np.asarray(bid, dtype=np.int64), np.asarray(ask, dtype=np.int64))
 
 
-def _future_mid_tick_at_or_after_key(view: _ValidL2View, target_key: EventKey) -> float | None:
+def _future_mid_and_key_at_or_after_key(view: _ValidL2View, target_key: EventKey) -> tuple[float, EventKey] | None:
     ts = view.local_ts_us
     idx = int(np.searchsorted(ts, target_key.local_ts_us, side="left"))
     if idx >= len(ts):
@@ -636,27 +736,16 @@ def _future_mid_tick_at_or_after_key(view: _ValidL2View, target_key: EventKey) -
                 best = j
             j += 1
         if best is not None:
-            return (int(view.best_bid_tick[best]) + int(view.best_ask_tick[best])) * 0.5
+            return (int(view.best_bid_tick[best]) + int(view.best_ask_tick[best])) * 0.5, EventKey(int(ts[best]), int(view.event_seq[best]))
         idx = j
     if idx >= len(ts):
         return None
-    return (int(view.best_bid_tick[idx]) + int(view.best_ask_tick[idx])) * 0.5
+    return (int(view.best_bid_tick[idx]) + int(view.best_ask_tick[idx])) * 0.5, EventKey(int(ts[idx]), int(view.event_seq[idx]))
 
 
-def _future_mid_and_ts_at_or_after(
-    l2_local_ts_us: np.ndarray,
-    l2_best_bid_ticks: np.ndarray,
-    l2_best_ask_ticks: np.ndarray,
-    target_local_ts_us: int,
-) -> tuple[float, int] | None:
-    idx = int(np.searchsorted(l2_local_ts_us, target_local_ts_us, side="left"))
-    while idx < len(l2_local_ts_us):
-        bid = int(l2_best_bid_ticks[idx])
-        ask = int(l2_best_ask_ticks[idx])
-        if bid > 0 and ask > bid:
-            return (bid + ask) * 0.5, int(l2_local_ts_us[idx])
-        idx += 1
-    return None
+def _future_mid_tick_at_or_after_key(view: _ValidL2View, target_key: EventKey) -> float | None:
+    info = _future_mid_and_key_at_or_after_key(view, target_key)
+    return None if info is None else info[0]
 
 
 def _book_top_obj_from_l2_row(tape: ExecutionTape, book_ptr: int) -> BookTop:
@@ -928,36 +1017,91 @@ def _valid_l2_views(tape: ExecutionTape) -> tuple[np.ndarray, np.ndarray, np.nda
     return local_ts[valid], bid_ticks[valid], ask_ticks[valid], bid_sizes[valid], ask_sizes[valid]
 
 
-def _precompute_kyle_samples(tape: ExecutionTape, config: KyleLambdaConfig, tick_size: float) -> list[_KyleSample]:
-    l2_ts, l2_bid, l2_ask, _, _ = _valid_l2_views(tape)
-    if len(l2_ts) == 0:
-        return []
+class _TradeFlowView(NamedTuple):
+    local_ts_us: np.ndarray
+    event_seq: np.ndarray
+    cumulative_flow: np.ndarray
+
+
+def _trade_flow_view_from_tape(
+    tape: ExecutionTape,
+    *,
+    use_notional_flow: bool,
+    tick_size: float,
+) -> _TradeFlowView:
+    events = tape.arrays.events
     trades = tape.arrays.trades
-    trade_ts = np.asarray(trades["local_ts_us"], dtype=np.int64)
-    side = np.asarray(trades["side_code"], dtype=np.int8).astype(np.float64)
-    amount = np.asarray(trades["amount"], dtype=np.float64)
-    price_tick = np.asarray(trades["price_tick"], dtype=np.float64)
-    flow = side * amount
-    if config.use_notional_flow:
-        flow = flow * price_tick * tick_size
-    cflow = np.concatenate((np.array([0.0], dtype=np.float64), np.cumsum(flow, dtype=np.float64)))
+    local_ts: list[int] = []
+    event_seq: list[int] = []
+    flow: list[float] = []
+    for event in events:
+        if int(event["event_type_code"]) != EVENT_TYPE_CODE_TRADE:
+            continue
+        trade_ptr = int(event["trade_ptr"])
+        if trade_ptr < 0:
+            continue
+        trade = trades[trade_ptr]
+        side_code = int(trade["side_code"])
+        if side_code == 0:
+            continue
+        amount = float(trade["amount"])
+        if amount <= 0.0:
+            continue
+        price_tick = int(trade["price_tick"])
+        signed = (1.0 if side_code > 0 else -1.0) * amount
+        if use_notional_flow:
+            signed *= price_tick * tick_size
+        local_ts.append(int(event["local_ts_us"]))
+        event_seq.append(int(event["event_seq"]))
+        flow.append(signed)
+    flow_arr = np.asarray(flow, dtype=np.float64)
+    cumulative = np.concatenate((np.array([0.0], dtype=np.float64), np.cumsum(flow_arr, dtype=np.float64)))
+    return _TradeFlowView(np.asarray(local_ts, dtype=np.int64), np.asarray(event_seq, dtype=np.int64), cumulative)
+
+
+def _upper_bound_event_key(local_ts: np.ndarray, event_seq: np.ndarray, key: EventKey) -> int:
+    lo = 0
+    hi = len(local_ts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if (int(local_ts[mid]), int(event_seq[mid])) <= (key.local_ts_us, key.event_seq):
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _flow_between_keys(view: _TradeFlowView, start_exclusive: EventKey, end_inclusive: EventKey) -> float:
+    if end_inclusive <= start_exclusive:
+        return 0.0
+    left = _upper_bound_event_key(view.local_ts_us, view.event_seq, start_exclusive)
+    right = _upper_bound_event_key(view.local_ts_us, view.event_seq, end_inclusive)
+    return float(view.cumulative_flow[right] - view.cumulative_flow[left])
+
+
+def _precompute_kyle_samples(tape: ExecutionTape, config: KyleLambdaConfig, tick_size: float) -> list[_KyleSample]:
+    l2_view = _valid_l2_view_from_tape(tape)
+    if len(l2_view.local_ts_us) == 0:
+        return []
+    trade_flow = _trade_flow_view_from_tape(tape, use_notional_flow=config.use_notional_flow, tick_size=tick_size)
     samples: list[_KyleSample] = []
-    start = int(l2_ts[0])
-    end = int(l2_ts[-1] - config.response_horizon_us)
+    start = int(l2_view.local_ts_us[0])
+    end = int(l2_view.local_ts_us[-1] - config.response_horizon_us)
     while start <= end:
-        start_info = _future_mid_and_ts_at_or_after(l2_ts, l2_bid, l2_ask, start)
-        response_info = _future_mid_and_ts_at_or_after(l2_ts, l2_bid, l2_ask, start + config.response_horizon_us)
+        start_key = EventKey(start, MAX_EVENT_SEQ)
+        flow_end_key = EventKey(start + config.sample_interval_us, MAX_EVENT_SEQ)
+        response_key = EventKey(start + config.response_horizon_us, MAX_EVENT_SEQ)
+        start_info = _future_mid_and_key_at_or_after_key(l2_view, start_key)
+        response_info = _future_mid_and_key_at_or_after_key(l2_view, response_key)
         if start_info is not None and response_info is not None:
-            start_mid, start_obs_ts = start_info
-            response_mid, response_obs_ts = response_info
-            left = int(np.searchsorted(trade_ts, start, side="left"))
-            right = int(np.searchsorted(trade_ts, start + config.sample_interval_us, side="right"))
-            x_flow = float(cflow[right] - cflow[left])
+            start_mid, start_obs_key = start_info
+            response_mid, response_obs_key = response_info
+            x_flow = _flow_between_keys(trade_flow, start_key, flow_end_key)
             y_mid_bps = _bps_from_ticks(response_mid - start_mid, start_mid)
-            end_ts = max(int(response_obs_ts), int(start_obs_ts), start + config.sample_interval_us)
-            samples.append(_KyleSample(end_ts, x_flow, y_mid_bps))
+            end_key = max(start_obs_key, response_obs_key, flow_end_key)
+            samples.append(_KyleSample(end_key=end_key, x_flow=x_flow, y_mid_bps=y_mid_bps))
         start += config.sample_interval_us
-    samples.sort(key=lambda sample: sample.end_local_ts_us)
+    samples.sort(key=lambda sample: (sample.end_key.local_ts_us, sample.end_key.event_seq))
     return samples
 
 
@@ -1135,26 +1279,27 @@ def build_adverse_selection_dataset(
         first_valid_ts = max(first_valid_ts, int(events[config.start_event_index]["local_ts_us"]))
     next_decision_ts = first_valid_ts
 
-    def update_time_states(current_ts: int) -> None:
+    def update_time_states(current_key: EventKey) -> None:
         nonlocal next_kyle_sample_idx
         for flow_state in flow_states:
-            flow_state.expire(current_ts)
-        while next_kyle_sample_idx < len(kyle_samples) and kyle_samples[next_kyle_sample_idx].end_local_ts_us <= current_ts:
-            kyle_state.add_finalized_sample(kyle_samples[next_kyle_sample_idx], current_ts)
+            flow_state.expire(current_key.local_ts_us)
+        while next_kyle_sample_idx < len(kyle_samples) and kyle_samples[next_kyle_sample_idx].end_key <= current_key:
+            kyle_state.add_finalized_sample(kyle_samples[next_kyle_sample_idx], current_key)
             next_kyle_sample_idx += 1
-        kyle_state.expire_old(current_ts)
+        kyle_state.expire_old(current_key)
 
     def maybe_emit_decisions(up_to_ts: int) -> bool:
         nonlocal next_decision_ts
         while next_decision_ts <= up_to_ts and latest_book_ptr >= 0:
             if next_decision_ts >= first_valid_ts:
-                update_time_states(next_decision_ts)
+                decision_key = EventKey(next_decision_ts, MAX_EVENT_SEQ)
+                update_time_states(decision_key)
                 labels_and_masks = _labels_for_decision(
                     tape,
                     config=config,
                     decision_event_index=last_processed_event_idx,
                     latest_book_ptr=latest_book_ptr,
-                    decision_key=EventKey(next_decision_ts, MAX_EVENT_SEQ),
+                    decision_key=decision_key,
                     l2_view=l2_view,
                 )
                 if labels_and_masks is not None:
@@ -1211,7 +1356,7 @@ def build_adverse_selection_dataset(
                     vpin_state.update_trade(side_code=side_code, price_tick=price_tick, amount=amount, tick_size=spec.tick_size)
             last_processed_event_idx = i
             i += 1
-        update_time_states(group_ts)
+        update_time_states(EventKey(group_ts, MAX_EVENT_SEQ))
         if maybe_emit_decisions(group_ts):
             break
 

@@ -80,11 +80,11 @@ def compute_side_executable_edge(
     adverse_uncond = max(_finite(adverse_predictions[cost_target], cost_target), 0.0)
     if side == OrderSide.BUY:
         alpha_bps = linear_signal.expected_return_bps
-        spread_capture_bps = max(mid_tick - price_tick, 0.0) / mid_tick * 10_000.0
+        spread_capture_bps = (mid_tick - price_tick) / mid_tick * 10_000.0
         inventory_penalty = inventory_qty * config.inventory_skew_bps_per_unit
     else:
         alpha_bps = -linear_signal.expected_return_bps
-        spread_capture_bps = max(price_tick - mid_tick, 0.0) / mid_tick * 10_000.0
+        spread_capture_bps = (price_tick - mid_tick) / mid_tick * 10_000.0
         inventory_penalty = -inventory_qty * config.inventory_skew_bps_per_unit
     maker_rebate_bps = -config.maker_fee_bps
     adverse_cond = adverse_uncond / max(fill_prob, config.probability_epsilon)

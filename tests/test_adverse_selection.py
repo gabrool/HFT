@@ -527,3 +527,58 @@ def test_adverse_selection_modules_do_not_import_forbidden_layers():
         "mmrt.linear",
     ):
         assert forbidden not in cli_source
+
+from mmrt.execution.adverse_selection import _TradeFlowView, _flow_between_keys, _future_mid_tick_at_or_after_key, _valid_l2_view_from_tape
+from mmrt.time_key import EventKey, MAX_EVENT_SEQ
+
+
+def test_kyle_future_mid_uses_last_l2_at_same_timestamp():
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+            _l2(seq=1, local_ts_us=200, bid_ticks=(1010,), bid_sizes=(1.0,), ask_ticks=(1012,), ask_sizes=(1.0,)),
+            _l2(seq=2, local_ts_us=200, bid_ticks=(1020,), bid_sizes=(1.0,), ask_ticks=(1022,), ask_sizes=(1.0,)),
+        ],
+        [],
+    )
+    view = _valid_l2_view_from_tape(tape)
+    assert _future_mid_tick_at_or_after_key(view, EventKey(200, MAX_EVENT_SEQ)) == pytest.approx(1021.0)
+    assert _future_mid_tick_at_or_after_key(view, EventKey(200, 1)) == pytest.approx(1011.0)
+
+
+def test_kyle_flow_between_keys_excludes_start_and_includes_end():
+    view = _TradeFlowView(
+        local_ts_us=np.asarray([100, 100, 200], dtype=np.int64),
+        event_seq=np.asarray([1, 2, 0], dtype=np.int64),
+        cumulative_flow=np.asarray([0.0, 10.0, 15.0, 12.0], dtype=np.float64),
+    )
+    assert _flow_between_keys(view, EventKey(100, 1), EventKey(200, 0)) == pytest.approx(2.0)
+    assert _flow_between_keys(view, EventKey(100, 2), EventKey(200, 0)) == pytest.approx(-3.0)
+
+
+def test_kyle_samples_become_ready_for_dataset_features():
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100),
+            _l2(seq=1, local_ts_us=200, bid_ticks=(1001, 1000), ask_ticks=(1003, 1004)),
+            _l2(seq=2, local_ts_us=300, bid_ticks=(1002, 1001), ask_ticks=(1004, 1005)),
+        ],
+        [_trade(local_ts_us=150, side=AggressorSide.BUY, price_tick=1002, amount=1.0, source_row=0)],
+    )
+    config = _base_config(
+        decision_interval_us=100,
+        max_decisions=2,
+        kyle=KyleLambdaConfig(sample_interval_us=50, response_horizon_us=100, windows_us=(1_000,), min_samples=1),
+        quote=CounterfactualQuoteConfig(
+            order_qty=1.0,
+            fill_horizon_us=100,
+            adverse_horizon_us=100,
+            queue_model=QueueModelConfig(mode=QueueModelMode.CONSERVATIVE),
+            latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0),
+        ),
+        drop_incomplete_horizon=False,
+    )
+    dataset = build_adverse_selection_dataset(tape, config=config)
+    idx = dataset.feature_names.index("kyle_n_1ms")
+    assert dataset.num_decisions >= 2
+    assert dataset.features[-1, idx] >= 1.0

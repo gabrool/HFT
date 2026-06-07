@@ -77,3 +77,26 @@ def test_adverse_signal_artifact_rejects_non_mapping_predictions():
             target_names=("bid_touch_filled",),
             predictions=[],  # type: ignore[arg-type]
         )
+
+from mmrt.execution.adverse_signal import load_adverse_selection_signals
+
+
+def test_load_adverse_selection_signals_rejects_missing_prediction_array(tmp_path):
+    path = tmp_path / "bad_signals.npz"
+    np.savez(
+        path,
+        schema=np.array(ADVERSE_SELECTION_SIGNALS_SCHEMA),
+        decision_local_ts_us=np.array([100], dtype=np.int64),
+        decision_event_index=np.array([0], dtype=np.int64),
+        decision_event_seq=np.array([0], dtype=np.int64),
+        target_names=np.asarray(["bid_touch_filled"], dtype=object),
+    )
+    with pytest.raises(ValueError, match="missing prediction arrays"):
+        load_adverse_selection_signals(path)
+
+
+def test_load_adverse_selection_signals_rejects_missing_base_arrays(tmp_path):
+    path = tmp_path / "bad_signals.npz"
+    np.savez(path, schema=np.array(ADVERSE_SELECTION_SIGNALS_SCHEMA))
+    with pytest.raises(ValueError, match="missing required arrays"):
+        load_adverse_selection_signals(path)
