@@ -46,18 +46,23 @@ __all__ = [
     "QuoteCandidateMode",
     "QuoteCandidateConfig",
     "DEFAULT_QUOTE_CANDIDATES",
+    "DEFAULT_QUOTE_CANDIDATE_NAMES",
     "CounterfactualQuoteConfig",
     "AdverseSelectionConfig",
     "CounterfactualFillResult",
     "AdverseSelectionDataset",
+    "AdverseSelectionFeatureDataset",
     "VPINState",
     "RollingKyleLambdaState",
     "quote_candidate_configs_from_names",
     "adverse_selection_config_from_training_summary",
+    "build_adverse_selection_feature_dataset",
     "build_adverse_selection_dataset",
+    "summarize_adverse_selection_feature_dataset",
     "summarize_adverse_selection_dataset",
     "adverse_selection_feature_names",
     "adverse_selection_label_names",
+    "candidate_price_tick",
 ]
 
 _EPS = 1e-12
@@ -211,6 +216,7 @@ DEFAULT_QUOTE_CANDIDATES = (
     QuoteCandidateConfig(name="inside_1", mode=QuoteCandidateMode.INSIDE, offset_ticks=1),
     QuoteCandidateConfig(name="away_1", mode=QuoteCandidateMode.AWAY, offset_ticks=1),
 )
+DEFAULT_QUOTE_CANDIDATE_NAMES = tuple(candidate.name for candidate in DEFAULT_QUOTE_CANDIDATES)
 
 
 def _quote_candidate_config_from_name(name: str) -> QuoteCandidateConfig:
@@ -330,7 +336,7 @@ def _quote_candidates_tuple(values: Sequence[QuoteCandidateConfig]) -> tuple[Quo
     return result
 
 
-def _candidate_price_tick(*, candidate: QuoteCandidateConfig, side: OrderSide, best_bid: int, best_ask: int, post_only_gap_ticks: int) -> int | None:
+def candidate_price_tick(*, candidate: QuoteCandidateConfig, side: OrderSide, best_bid: int, best_ask: int, post_only_gap_ticks: int) -> int | None:
     if candidate.mode == QuoteCandidateMode.TOUCH:
         return best_bid if side == OrderSide.BUY else best_ask
     if candidate.mode == QuoteCandidateMode.INSIDE:
@@ -606,6 +612,49 @@ class AdverseSelectionDataset:
 
     def as_dict_summary(self) -> dict[str, object]:
         return summarize_adverse_selection_dataset(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AdverseSelectionFeatureDataset:
+    decision_local_ts_us: np.ndarray
+    decision_event_index: np.ndarray
+    decision_event_seq: np.ndarray
+    feature_names: tuple[str, ...]
+    features: np.ndarray
+    config: AdverseSelectionConfig
+
+    def __post_init__(self) -> None:
+        if self.decision_local_ts_us.ndim != 1 or self.decision_local_ts_us.dtype != np.int64:
+            raise ValueError("decision_local_ts_us must be rank-1 int64")
+        if self.decision_event_index.ndim != 1 or self.decision_event_index.dtype != np.int64:
+            raise ValueError("decision_event_index must be rank-1 int64")
+        if self.decision_event_seq.ndim != 1 or self.decision_event_seq.dtype != np.int64:
+            raise ValueError("decision_event_seq must be rank-1 int64")
+        if len(self.decision_event_seq) != len(self.decision_local_ts_us):
+            raise ValueError("decision_event_seq length must match decisions")
+        if len(self.decision_local_ts_us) != len(self.decision_event_index):
+            raise ValueError("decision arrays must have same length")
+        if self.features.ndim != 2 or self.features.dtype != np.float32:
+            raise ValueError("features must be rank-2 float32")
+        if self.features.shape[0] != len(self.decision_local_ts_us):
+            raise ValueError("features row count must match decisions")
+        if len(self.feature_names) != self.features.shape[1]:
+            raise ValueError("feature_names length must match features")
+        if not np.isfinite(self.features).all():
+            raise ValueError("all feature values must be finite")
+        if not isinstance(self.config, AdverseSelectionConfig):
+            raise ValueError("config must be AdverseSelectionConfig")
+
+    @property
+    def num_decisions(self) -> int:
+        return int(len(self.decision_local_ts_us))
+
+    @property
+    def num_features(self) -> int:
+        return int(self.features.shape[1])
+
+    def as_dict_summary(self) -> dict[str, object]:
+        return summarize_adverse_selection_feature_dataset(self)
 
 
 def adverse_selection_feature_names(config: AdverseSelectionConfig) -> tuple[str, ...]:
@@ -1190,7 +1239,7 @@ def _labels_for_decision(
         base = candidate_index * 10
         fills_by_side: dict[bool, CounterfactualFillResult] = {}
         for is_bid, side in ((True, OrderSide.BUY), (False, OrderSide.SELL)):
-            price_tick = _candidate_price_tick(candidate=candidate, side=side, best_bid=best_bid, best_ask=best_ask, post_only_gap_ticks=config.quote.post_only_gap_ticks)
+            price_tick = candidate_price_tick(candidate=candidate, side=side, best_bid=best_bid, best_ask=best_ask, post_only_gap_ticks=config.quote.post_only_gap_ticks)
             filled_idx = base + (0 if is_bid else 1)
             latency_idx = base + (2 if is_bid else 3)
             if not _side_valid_for_candidate(tape, config, side=side, price_tick=price_tick):
@@ -1235,11 +1284,26 @@ def _labels_for_decision(
     return labels, masks
 
 
-def build_adverse_selection_dataset(
+
+@dataclass(frozen=True, slots=True)
+class _AdverseFeatureRows:
+    decision_local_ts_us: np.ndarray
+    decision_event_index: np.ndarray
+    decision_event_seq: np.ndarray
+    feature_names: tuple[str, ...]
+    features: np.ndarray
+    latest_book_ptr_by_row: np.ndarray
+
+    @property
+    def num_decisions(self) -> int:
+        return int(self.decision_local_ts_us.shape[0])
+
+
+def _build_adverse_selection_feature_rows(
     tape: ExecutionTape,
     *,
-    config: AdverseSelectionConfig = AdverseSelectionConfig(),
-) -> AdverseSelectionDataset:
+    config: AdverseSelectionConfig,
+) -> _AdverseFeatureRows:
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
     if not isinstance(config, AdverseSelectionConfig):
@@ -1249,13 +1313,11 @@ def build_adverse_selection_dataset(
         raise ValueError("tape.manifest.symbol_spec must be SymbolSpec")
     if hasattr(spec, "is_valid_qty") and not spec.is_valid_qty(config.quote.order_qty):
         raise ValueError("quote.order_qty is invalid for tape symbol_spec")
-    l2_ts, l2_bid, l2_ask, _, _ = _valid_l2_views(tape)
-    l2_view = _valid_l2_view_from_tape(tape)
+    l2_ts, _, _, _, _ = _valid_l2_views(tape)
     if len(l2_ts) == 0:
         raise ValueError("tape must contain at least one valid two-sided L2 book")
 
     feature_names = adverse_selection_feature_names(config)
-    label_names = adverse_selection_label_names(config)
     vpin_state = VPINState(config.vpin, deque())
     kyle_state = _new_kyle_state(config.kyle)
     kyle_samples = _precompute_kyle_samples(tape, config.kyle, spec.tick_size)
@@ -1266,8 +1328,7 @@ def build_adverse_selection_dataset(
     decision_event_indices: list[int] = []
     decision_event_seq_values: list[int] = []
     feature_rows: list[tuple[float, ...]] = []
-    label_rows: list[list[float]] = []
-    mask_rows: list[list[bool]] = []
+    latest_book_ptr_values: list[int] = []
 
     events = tape.arrays.events
     trades = tape.arrays.trades
@@ -1294,34 +1355,23 @@ def build_adverse_selection_dataset(
             if next_decision_ts >= first_valid_ts:
                 decision_key = EventKey(next_decision_ts, MAX_EVENT_SEQ)
                 update_time_states(decision_key)
-                labels_and_masks = _labels_for_decision(
-                    tape,
-                    config=config,
-                    decision_event_index=last_processed_event_idx,
-                    latest_book_ptr=latest_book_ptr,
-                    decision_key=decision_key,
-                    l2_view=l2_view,
-                )
-                if labels_and_masks is not None:
-                    labels, masks = labels_and_masks
-                    decision_ts_values.append(next_decision_ts)
-                    decision_event_indices.append(last_processed_event_idx)
-                    decision_event_seq_values.append(MAX_EVENT_SEQ)
-                    feature_rows.append(
-                        _feature_row(
-                            tape,
-                            latest_book_ptr=latest_book_ptr,
-                            previous_book_ptr=previous_book_ptr,
-                            spec=spec,
-                            vpin_state=vpin_state,
-                            flow_states=flow_states,
-                            kyle_state=kyle_state,
-                        )
+                decision_ts_values.append(next_decision_ts)
+                decision_event_indices.append(last_processed_event_idx)
+                decision_event_seq_values.append(MAX_EVENT_SEQ)
+                feature_rows.append(
+                    _feature_row(
+                        tape,
+                        latest_book_ptr=latest_book_ptr,
+                        previous_book_ptr=previous_book_ptr,
+                        spec=spec,
+                        vpin_state=vpin_state,
+                        flow_states=flow_states,
+                        kyle_state=kyle_state,
                     )
-                    label_rows.append(labels)
-                    mask_rows.append(masks)
-                    if config.max_decisions is not None and len(decision_ts_values) >= config.max_decisions:
-                        return True
+                )
+                latest_book_ptr_values.append(latest_book_ptr)
+                if config.max_decisions is not None and len(decision_ts_values) >= config.max_decisions:
+                    return True
             next_decision_ts += config.decision_interval_us
         return False
 
@@ -1361,13 +1411,76 @@ def build_adverse_selection_dataset(
             break
 
     features = np.asarray(feature_rows, dtype=np.float32).reshape((len(feature_rows), len(feature_names)))
-    labels = np.asarray(label_rows, dtype=np.float32).reshape((len(label_rows), len(label_names)))
-    masks = np.asarray(mask_rows, dtype=np.bool_).reshape((len(mask_rows), len(label_names)))
-    return AdverseSelectionDataset(
+    return _AdverseFeatureRows(
         decision_local_ts_us=np.asarray(decision_ts_values, dtype=np.int64),
         decision_event_index=np.asarray(decision_event_indices, dtype=np.int64),
         decision_event_seq=np.asarray(decision_event_seq_values, dtype=np.int64),
         feature_names=feature_names,
+        features=features,
+        latest_book_ptr_by_row=np.asarray(latest_book_ptr_values, dtype=np.int64),
+    )
+
+
+def build_adverse_selection_feature_dataset(
+    tape: ExecutionTape,
+    *,
+    config: AdverseSelectionConfig = AdverseSelectionConfig(),
+) -> AdverseSelectionFeatureDataset:
+    rows = _build_adverse_selection_feature_rows(tape, config=config)
+    return AdverseSelectionFeatureDataset(
+        decision_local_ts_us=rows.decision_local_ts_us,
+        decision_event_index=rows.decision_event_index,
+        decision_event_seq=rows.decision_event_seq,
+        feature_names=rows.feature_names,
+        features=rows.features,
+        config=config,
+    )
+
+
+def build_adverse_selection_dataset(
+    tape: ExecutionTape,
+    *,
+    config: AdverseSelectionConfig = AdverseSelectionConfig(),
+) -> AdverseSelectionDataset:
+    rows = _build_adverse_selection_feature_rows(tape, config=config)
+    l2_view = _valid_l2_view_from_tape(tape)
+    label_names = adverse_selection_label_names(config)
+    kept_decision_ts: list[int] = []
+    kept_event_indices: list[int] = []
+    kept_event_seq: list[int] = []
+    kept_features: list[np.ndarray] = []
+    label_rows: list[list[float]] = []
+    mask_rows: list[list[bool]] = []
+
+    for row_idx in range(rows.num_decisions):
+        labels_and_masks = _labels_for_decision(
+            tape,
+            config=config,
+            decision_event_index=int(rows.decision_event_index[row_idx]),
+            latest_book_ptr=int(rows.latest_book_ptr_by_row[row_idx]),
+            decision_key=EventKey(int(rows.decision_local_ts_us[row_idx]), int(rows.decision_event_seq[row_idx])),
+            l2_view=l2_view,
+        )
+        if labels_and_masks is None:
+            if config.drop_incomplete_horizon:
+                continue
+            continue
+        labels, masks = labels_and_masks
+        kept_decision_ts.append(int(rows.decision_local_ts_us[row_idx]))
+        kept_event_indices.append(int(rows.decision_event_index[row_idx]))
+        kept_event_seq.append(int(rows.decision_event_seq[row_idx]))
+        kept_features.append(rows.features[row_idx])
+        label_rows.append(labels)
+        mask_rows.append(masks)
+
+    features = np.asarray(kept_features, dtype=np.float32).reshape((len(kept_features), len(rows.feature_names)))
+    labels = np.asarray(label_rows, dtype=np.float32).reshape((len(label_rows), len(label_names)))
+    masks = np.asarray(mask_rows, dtype=np.bool_).reshape((len(mask_rows), len(label_names)))
+    return AdverseSelectionDataset(
+        decision_local_ts_us=np.asarray(kept_decision_ts, dtype=np.int64),
+        decision_event_index=np.asarray(kept_event_indices, dtype=np.int64),
+        decision_event_seq=np.asarray(kept_event_seq, dtype=np.int64),
+        feature_names=rows.feature_names,
         features=features,
         label_names=label_names,
         labels=labels,
@@ -1380,6 +1493,29 @@ def _masked_mean(values: np.ndarray, masks: np.ndarray) -> float:
     if values.size == 0 or not masks.any():
         return 0.0
     return float(np.mean(values[masks]))
+
+
+
+def summarize_adverse_selection_feature_dataset(
+    dataset: AdverseSelectionFeatureDataset,
+) -> dict[str, object]:
+    if not isinstance(dataset, AdverseSelectionFeatureDataset):
+        raise ValueError("dataset must be AdverseSelectionFeatureDataset")
+    feature_index = {name: i for i, name in enumerate(dataset.feature_names)}
+    features_summary: dict[str, object] = {
+        "finite_fraction": float(np.isfinite(dataset.features).mean()) if dataset.features.size else 1.0,
+    }
+    if "vpin" in feature_index and dataset.num_decisions:
+        features_summary["vpin_mean"] = float(np.mean(dataset.features[:, feature_index["vpin"]]))
+    for name, idx in feature_index.items():
+        if name.startswith("kyle_lambda_") and dataset.num_decisions:
+            features_summary[f"{name}_mean"] = float(np.mean(dataset.features[:, idx]))
+    return {
+        "num_decisions": dataset.num_decisions,
+        "num_features": dataset.num_features,
+        "feature_names": list(dataset.feature_names),
+        "features": features_summary,
+    }
 
 
 def summarize_adverse_selection_dataset(

@@ -8,7 +8,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from mmrt.execution.adverse_selection import AdverseSelectionDataset
+from mmrt.execution.adverse_selection import AdverseSelectionDataset, AdverseSelectionFeatureDataset
 
 ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_v2"
 ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_aligned"
@@ -171,7 +171,9 @@ class AdverseSelectionSignalArtifact:
         object.__setattr__(self, "predictions", preds)
 
 
-def build_adverse_selection_signal_artifact(dataset: AdverseSelectionDataset, model: AdverseSelectionModelArtifact) -> AdverseSelectionSignalArtifact:
+def build_adverse_selection_signal_artifact(dataset: AdverseSelectionDataset | AdverseSelectionFeatureDataset, model: AdverseSelectionModelArtifact) -> AdverseSelectionSignalArtifact:
+    if not isinstance(dataset, (AdverseSelectionDataset, AdverseSelectionFeatureDataset)):
+        raise ValueError("dataset must be AdverseSelectionDataset or AdverseSelectionFeatureDataset")
     if tuple(dataset.feature_names) != tuple(model.feature_names):
         raise ValueError("dataset feature_names must match model feature_names exactly")
     predictions = predict_adverse_selection(model, dataset.features)
@@ -223,6 +225,73 @@ def load_adverse_selection_signals(path: str | Path) -> AdverseSelectionSignalAr
             predictions=predictions,
         )
 
+
+
+def _coerce_grid_array(values: np.ndarray, name: str) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be rank-1")
+    try:
+        return np.ascontiguousarray(arr, dtype=np.int64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be int64-compatible") from exc
+
+
+def validate_decision_grid_alignment(
+    *,
+    left_local_ts_us: np.ndarray,
+    left_event_index: np.ndarray,
+    left_event_seq: np.ndarray,
+    right_local_ts_us: np.ndarray,
+    right_event_index: np.ndarray,
+    right_event_seq: np.ndarray,
+    left_name: str = "left",
+    right_name: str = "right",
+) -> None:
+    left_ts = _coerce_grid_array(left_local_ts_us, f"{left_name}_local_ts_us")
+    left_idx = _coerce_grid_array(left_event_index, f"{left_name}_event_index")
+    left_seq = _coerce_grid_array(left_event_seq, f"{left_name}_event_seq")
+    right_ts = _coerce_grid_array(right_local_ts_us, f"{right_name}_local_ts_us")
+    right_idx = _coerce_grid_array(right_event_index, f"{right_name}_event_index")
+    right_seq = _coerce_grid_array(right_event_seq, f"{right_name}_event_seq")
+    left_len = left_ts.shape[0]
+    if left_idx.shape[0] != left_len or left_seq.shape[0] != left_len:
+        raise ValueError(f"decision grid mismatch between {left_name} and {right_name}: {left_name} arrays have different lengths")
+    right_len = right_ts.shape[0]
+    if right_idx.shape[0] != right_len or right_seq.shape[0] != right_len:
+        raise ValueError(f"decision grid mismatch between {left_name} and {right_name}: {right_name} arrays have different lengths")
+    if left_len != right_len:
+        raise ValueError(f"decision grid mismatch between {left_name} and {right_name}: length differs ({left_len} != {right_len})")
+    mismatches = np.nonzero((left_ts != right_ts) | (left_idx != right_idx) | (left_seq != right_seq))[0]
+    if mismatches.size:
+        i = int(mismatches[0])
+        raise ValueError(
+            f"decision grid mismatch between {left_name} and {right_name}: first mismatch at row {i}: "
+            f"{left_name}=({int(left_ts[i])}, {int(left_idx[i])}, {int(left_seq[i])}) "
+            f"{right_name}=({int(right_ts[i])}, {int(right_idx[i])}, {int(right_seq[i])})"
+        )
+
+
+def validate_adverse_signal_alignment(
+    signals: AdverseSelectionSignalArtifact,
+    *,
+    decision_local_ts_us: np.ndarray,
+    decision_event_index: np.ndarray,
+    decision_event_seq: np.ndarray,
+    right_name: str,
+) -> None:
+    if not isinstance(signals, AdverseSelectionSignalArtifact):
+        raise ValueError("signals must be AdverseSelectionSignalArtifact")
+    validate_decision_grid_alignment(
+        left_local_ts_us=signals.decision_local_ts_us,
+        left_event_index=signals.decision_event_index,
+        left_event_seq=signals.decision_event_seq,
+        right_local_ts_us=decision_local_ts_us,
+        right_event_index=decision_event_index,
+        right_event_seq=decision_event_seq,
+        left_name="adverse_signals",
+        right_name=right_name,
+    )
 
 def required_adverse_targets_for_executable_edge(candidate_names: Sequence[str]) -> tuple[str, ...]:
     names: list[str] = []

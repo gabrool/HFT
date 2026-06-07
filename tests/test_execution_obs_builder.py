@@ -547,3 +547,42 @@ def test_obs_modules_have_no_forbidden_imports():
         assert "mmrt.linear.models" not in source
         assert "mmrt.storage" not in source
         assert "mmrt.rl" not in source
+
+from mmrt.execution.obs_schema import execution_observation_schema
+
+
+def test_execution_observation_schema_includes_adverse_and_edge_fields():
+    schema = execution_observation_schema(include_adverse_selection=True, include_executable_edge=True)
+    assert len(default_observation_schema().field_names) == len(DEFAULT_OBSERVATION_FIELDS)
+    assert schema.has_field("adverse_bid_touch_fill_prob")
+    assert schema.has_field("edge_bid_touch_attempt_bps")
+
+
+def test_observation_builder_fills_adverse_and_edge_feature_maps():
+    schema = execution_observation_schema(include_adverse_selection=True, include_executable_edge=True)
+    obs = build_observation(
+        ObservationInput(
+            symbol_spec=_spec(),
+            book_top=_top(),
+            bid_depth=1,
+            ask_depth=1,
+            linear_signal=_signal(),
+            adverse_features={"adverse_bid_touch_fill_prob": 0.7},
+            executable_edge_features={"edge_bid_touch_attempt_bps": 1.25},
+        ),
+        schema=schema,
+    )
+    assert obs[schema.index("adverse_bid_touch_fill_prob")] == pytest.approx(0.7)
+    assert obs[schema.index("edge_bid_touch_attempt_bps")] == pytest.approx(1.25)
+
+
+def test_observation_builder_rejects_nonfinite_adverse_feature():
+    with pytest.raises(ValueError, match="adverse_features"):
+        ObservationInput(
+            symbol_spec=_spec(),
+            book_top=_top(),
+            bid_depth=1,
+            ask_depth=1,
+            linear_signal=_signal(),
+            adverse_features={"adverse_bid_touch_fill_prob": float("nan")},
+        )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -82,6 +82,8 @@ class ObservationInput:
     bid_depth: int
     ask_depth: int
     linear_signal: LinearSignal
+    adverse_features: Mapping[str, float] = field(default_factory=dict)
+    executable_edge_features: Mapping[str, float] = field(default_factory=dict)
 
     position: PositionState = PositionState()
     live_orders: tuple[ActiveOrder, ...] = ()
@@ -98,6 +100,8 @@ class ObservationInput:
         object.__setattr__(self, "recent_fills", _fills_tuple(self.recent_fills))
         if not isinstance(self.linear_signal, LinearSignal):
             raise ValueError("linear_signal must be LinearSignal")
+        object.__setattr__(self, "adverse_features", _feature_map(self.adverse_features, "adverse_features"))
+        object.__setattr__(self, "executable_edge_features", _feature_map(self.executable_edge_features, "executable_edge_features"))
         if self.context is not None and not isinstance(self.context, ObservationContext):
             raise ValueError("context must be None or ObservationContext")
 
@@ -260,6 +264,11 @@ class ObservationBuilder:
         set_field("local_time_since_start_s", local_time_since_start_s)
         set_field("time_since_last_event_ms", time_since_last_event_ms)
 
+        for name, value in inputs.adverse_features.items():
+            set_field(name, value)
+        for name, value in inputs.executable_edge_features.items():
+            set_field(name, value)
+
         if config.max_abs_observation is not None:
             np.clip(obs, -config.max_abs_observation, config.max_abs_observation, out=obs)
         return validate_observation_vector(obs, schema=self.schema)
@@ -286,6 +295,17 @@ def build_observation(
 ) -> np.ndarray:
     return ObservationBuilder(schema=schema, config=config).build(inputs, out=out)
 
+
+
+def _feature_map(values: Mapping[str, float], name: str) -> dict[str, float]:
+    if not isinstance(values, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    out: dict[str, float] = {}
+    for key, value in values.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{name} keys must be non-empty strings")
+        out[key] = _require_finite_float(value, f"{name}[{key!r}]")
+    return out
 
 def _require_symbol_spec(value: Any) -> SymbolSpec:
     if not isinstance(value, SymbolSpec):
