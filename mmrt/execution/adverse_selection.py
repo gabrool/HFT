@@ -3,24 +3,49 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 import math
 from typing import NamedTuple, Sequence
 
 import numpy as np
 
-from mmrt.execution.contracts import FillReason, OrderSide, QueueModelMode, SymbolSpec
+from mmrt.execution.contracts import (
+    AggressorSide,
+    ActiveOrder,
+    BookTop,
+    Fill,
+    FillReason,
+    LatencyConfig,
+    OrderSide,
+    OrderStatus,
+    QueueModelMode,
+    QuoteIntent,
+    SymbolSpec,
+    TradePrint,
+)
 from mmrt.execution.execution_tape import (
     EVENT_TYPE_CODE_L2_BATCH,
     EVENT_TYPE_CODE_TRADE,
     ExecutionTape,
 )
+from mmrt.execution.fill_sim import (
+    FillSimulatorConfig,
+    activate_pending_orders,
+    place_orders_from_quote,
+    simulate_l2_level_update,
+    simulate_trade_event,
+)
 from mmrt.execution.queue_model import QueueModelConfig
+from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
 
 __all__ = [
     "VPINConfig",
     "KyleLambdaConfig",
+    "QuoteCandidateMode",
+    "QuoteCandidateConfig",
+    "DEFAULT_QUOTE_CANDIDATES",
     "CounterfactualQuoteConfig",
     "AdverseSelectionConfig",
     "CounterfactualFillResult",
@@ -34,6 +59,12 @@ __all__ = [
 ]
 
 _EPS = 1e-12
+
+
+def _require_nonempty_str(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
 
 
 def _require_bool(value: bool, name: str) -> bool:
@@ -140,23 +171,109 @@ class KyleLambdaConfig:
         object.__setattr__(self, "use_notional_flow", _require_bool(self.use_notional_flow, "use_notional_flow"))
 
 
+class QuoteCandidateMode(str, Enum):
+    TOUCH = "touch"
+    INSIDE = "inside"
+    AWAY = "away"
+
+
+def _coerce_quote_candidate_mode(value: QuoteCandidateMode | str) -> QuoteCandidateMode:
+    if isinstance(value, QuoteCandidateMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return QuoteCandidateMode(value)
+        except ValueError as exc:
+            raise ValueError(f"quote candidate mode has invalid value {value!r}") from exc
+    raise ValueError("quote candidate mode must be QuoteCandidateMode or str")
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteCandidateConfig:
+    name: str
+    mode: QuoteCandidateMode | str
+    offset_ticks: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _require_nonempty_str(self.name, "name"))
+        object.__setattr__(self, "mode", _coerce_quote_candidate_mode(self.mode))
+        object.__setattr__(self, "offset_ticks", _require_nonnegative_int(self.offset_ticks, "offset_ticks"))
+        if self.mode in (QuoteCandidateMode.INSIDE, QuoteCandidateMode.AWAY) and self.offset_ticks <= 0:
+            raise ValueError("inside/away quote candidates require offset_ticks > 0")
+        if self.mode == QuoteCandidateMode.TOUCH and self.offset_ticks != 0:
+            raise ValueError("touch quote candidate requires offset_ticks == 0")
+
+
+DEFAULT_QUOTE_CANDIDATES = (
+    QuoteCandidateConfig(name="touch", mode=QuoteCandidateMode.TOUCH, offset_ticks=0),
+    QuoteCandidateConfig(name="inside_1", mode=QuoteCandidateMode.INSIDE, offset_ticks=1),
+    QuoteCandidateConfig(name="away_1", mode=QuoteCandidateMode.AWAY, offset_ticks=1),
+)
+
+
+def _quote_candidates_tuple(values: Sequence[QuoteCandidateConfig]) -> tuple[QuoteCandidateConfig, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig")
+    try:
+        result = tuple(values)
+    except TypeError as exc:
+        raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig") from exc
+    if not result:
+        raise ValueError("quote_candidates must be non-empty")
+    seen: set[str] = set()
+    for idx, candidate in enumerate(result):
+        if not isinstance(candidate, QuoteCandidateConfig):
+            raise ValueError(f"quote_candidates[{idx}] must be QuoteCandidateConfig")
+        if candidate.name in seen:
+            raise ValueError(f"duplicate quote candidate name {candidate.name!r}")
+        seen.add(candidate.name)
+    return result
+
+
+def _candidate_price_tick(*, candidate: QuoteCandidateConfig, side: OrderSide, best_bid: int, best_ask: int, post_only_gap_ticks: int) -> int | None:
+    if candidate.mode == QuoteCandidateMode.TOUCH:
+        return best_bid if side == OrderSide.BUY else best_ask
+    if candidate.mode == QuoteCandidateMode.INSIDE:
+        if side == OrderSide.BUY:
+            price = best_bid + candidate.offset_ticks
+            return price if price <= best_ask - post_only_gap_ticks else None
+        price = best_ask - candidate.offset_ticks
+        return price if price >= best_bid + post_only_gap_ticks else None
+    if candidate.mode == QuoteCandidateMode.AWAY:
+        if side == OrderSide.BUY:
+            price = best_bid - candidate.offset_ticks
+            return price if price > 0 else None
+        return best_ask + candidate.offset_ticks
+    raise ValueError("unsupported quote candidate mode")
+
+
 @dataclass(frozen=True, slots=True)
 class CounterfactualQuoteConfig:
-    quote_distance_ticks: int = 0
+    quote_candidates: tuple[QuoteCandidateConfig, ...] = DEFAULT_QUOTE_CANDIDATES
+    post_only_gap_ticks: int = 1
+    invalid_quote_policy: str = "mask"
     order_qty: float = 0.001
     fill_horizon_us: int = 1_000_000
     adverse_horizon_us: int = 1_000_000
     toxic_threshold_bps: float = 0.0
-    queue_model: QueueModelConfig = QueueModelConfig(mode=QueueModelMode.BALANCED)
+    queue_model: QueueModelConfig = QueueModelConfig()
+    latency_config: LatencyConfig = LatencyConfig()
+    maker_fee_bps: float = -0.5
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "quote_distance_ticks", _require_nonnegative_int(self.quote_distance_ticks, "quote_distance_ticks"))
+        object.__setattr__(self, "quote_candidates", _quote_candidates_tuple(self.quote_candidates))
+        object.__setattr__(self, "post_only_gap_ticks", _require_nonnegative_int(self.post_only_gap_ticks, "post_only_gap_ticks"))
+        if self.invalid_quote_policy not in ("mask", "error"):
+            raise ValueError("invalid_quote_policy must be 'mask' or 'error'")
         object.__setattr__(self, "order_qty", _require_positive_float(self.order_qty, "order_qty"))
         object.__setattr__(self, "fill_horizon_us", _require_positive_int(self.fill_horizon_us, "fill_horizon_us"))
         object.__setattr__(self, "adverse_horizon_us", _require_positive_int(self.adverse_horizon_us, "adverse_horizon_us"))
         object.__setattr__(self, "toxic_threshold_bps", _require_nonnegative_float(self.toxic_threshold_bps, "toxic_threshold_bps"))
         if not isinstance(self.queue_model, QueueModelConfig):
             raise ValueError("queue_model must be QueueModelConfig")
+        if not isinstance(self.latency_config, LatencyConfig):
+            raise ValueError("latency_config must be LatencyConfig")
+        object.__setattr__(self, "maker_fee_bps", _require_finite_float(self.maker_fee_bps, "maker_fee_bps"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +449,7 @@ class CounterfactualFillResult(NamedTuple):
 class AdverseSelectionDataset:
     decision_local_ts_us: np.ndarray
     decision_event_index: np.ndarray
+    decision_event_seq: np.ndarray
     feature_names: tuple[str, ...]
     features: np.ndarray
     label_names: tuple[str, ...]
@@ -344,6 +462,10 @@ class AdverseSelectionDataset:
             raise ValueError("decision_local_ts_us must be rank-1 int64")
         if self.decision_event_index.ndim != 1 or self.decision_event_index.dtype != np.int64:
             raise ValueError("decision_event_index must be rank-1 int64")
+        if self.decision_event_seq.ndim != 1 or self.decision_event_seq.dtype != np.int64:
+            raise ValueError("decision_event_seq must be rank-1 int64")
+        if len(self.decision_event_seq) != len(self.decision_local_ts_us):
+            raise ValueError("decision_event_seq length must match decisions")
         if len(self.decision_local_ts_us) != len(self.decision_event_index):
             raise ValueError("decision arrays must have same length")
         if self.features.ndim != 2 or self.features.dtype != np.float32:
@@ -432,19 +554,25 @@ def adverse_selection_feature_names(config: AdverseSelectionConfig) -> tuple[str
     return tuple(names)
 
 
-def adverse_selection_label_names() -> tuple[str, ...]:
-    return (
-        "bid_filled",
-        "ask_filled",
-        "bid_fill_latency_us",
-        "ask_fill_latency_us",
-        "bid_adverse_bps",
-        "ask_adverse_bps",
-        "bid_toxic_fill",
-        "ask_toxic_fill",
-        "bid_toxic_cost_bps",
-        "ask_toxic_cost_bps",
-    )
+def adverse_selection_label_names(config: AdverseSelectionConfig) -> tuple[str, ...]:
+    if not isinstance(config, AdverseSelectionConfig):
+        raise ValueError("config must be AdverseSelectionConfig")
+    names: list[str] = []
+    for candidate in config.quote.quote_candidates:
+        c = candidate.name
+        names.extend((
+            f"bid_{c}_filled",
+            f"ask_{c}_filled",
+            f"bid_{c}_fill_latency_us",
+            f"ask_{c}_fill_latency_us",
+            f"bid_{c}_adverse_bps",
+            f"ask_{c}_adverse_bps",
+            f"bid_{c}_toxic_fill",
+            f"ask_{c}_toxic_fill",
+            f"bid_{c}_toxic_cost_bps",
+            f"ask_{c}_toxic_cost_bps",
+        ))
+    return tuple(names)
 
 
 def _book_qty_at_price(ticks: np.ndarray, sizes: np.ndarray, price_tick: int) -> float | None:
@@ -468,20 +596,51 @@ def _book_top_from_l2_row(tape: ExecutionTape, book_ptr: int) -> tuple[int, int,
     return best_bid_tick, best_ask_tick, best_bid_size, best_ask_size, (best_bid_tick + best_ask_tick) * 0.5, best_ask_tick - best_bid_tick
 
 
-def _future_mid_tick_at_or_after(
-    l2_local_ts_us: np.ndarray,
-    l2_best_bid_ticks: np.ndarray,
-    l2_best_ask_ticks: np.ndarray,
-    target_local_ts_us: int,
-) -> float | None:
-    idx = int(np.searchsorted(l2_local_ts_us, target_local_ts_us, side="left"))
-    if idx >= len(l2_local_ts_us):
+class _ValidL2View(NamedTuple):
+    local_ts_us: np.ndarray
+    event_seq: np.ndarray
+    best_bid_tick: np.ndarray
+    best_ask_tick: np.ndarray
+
+
+def _valid_l2_view_from_tape(tape: ExecutionTape) -> _ValidL2View:
+    events = tape.arrays.events
+    l2 = tape.arrays.l2_events
+    ts: list[int] = []
+    seq: list[int] = []
+    bid: list[int] = []
+    ask: list[int] = []
+    for event in events:
+        if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
+            continue
+        book_ptr = int(event["book_ptr"])
+        if book_ptr < 0:
+            continue
+        row = l2[book_ptr]
+        b = int(row["best_bid_tick"]); a = int(row["best_ask_tick"])
+        if b > 0 and a > b:
+            ts.append(int(event["local_ts_us"])); seq.append(int(event["event_seq"])); bid.append(b); ask.append(a)
+    return _ValidL2View(np.asarray(ts, dtype=np.int64), np.asarray(seq, dtype=np.int64), np.asarray(bid, dtype=np.int64), np.asarray(ask, dtype=np.int64))
+
+
+def _future_mid_tick_at_or_after_key(view: _ValidL2View, target_key: EventKey) -> float | None:
+    ts = view.local_ts_us
+    idx = int(np.searchsorted(ts, target_key.local_ts_us, side="left"))
+    if idx >= len(ts):
         return None
-    bid = int(l2_best_bid_ticks[idx])
-    ask = int(l2_best_ask_ticks[idx])
-    if bid <= 0 or ask <= bid:
+    if int(ts[idx]) == target_key.local_ts_us:
+        j = idx
+        best: int | None = None
+        while j < len(ts) and int(ts[j]) == target_key.local_ts_us:
+            if int(view.event_seq[j]) <= target_key.event_seq:
+                best = j
+            j += 1
+        if best is not None:
+            return (int(view.best_bid_tick[best]) + int(view.best_ask_tick[best])) * 0.5
+        idx = j
+    if idx >= len(ts):
         return None
-    return (bid + ask) * 0.5
+    return (int(view.best_bid_tick[idx]) + int(view.best_ask_tick[idx])) * 0.5
 
 
 def _future_mid_and_ts_at_or_after(
@@ -500,6 +659,56 @@ def _future_mid_and_ts_at_or_after(
     return None
 
 
+def _book_top_obj_from_l2_row(tape: ExecutionTape, book_ptr: int) -> BookTop:
+    best_bid_tick, best_ask_tick, best_bid_size, best_ask_size, _, _ = _book_top_from_l2_row(tape, book_ptr)
+    return BookTop(
+        local_ts_us=int(tape.arrays.l2_events[book_ptr]["local_ts_us"]),
+        best_bid_tick=best_bid_tick,
+        best_ask_tick=best_ask_tick,
+        best_bid_size=best_bid_size,
+        best_ask_size=best_ask_size,
+    )
+
+
+def _level_qty_with_depth_status(tape: ExecutionTape, *, book_ptr: int, side: OrderSide, price_tick: int) -> tuple[float | None, bool]:
+    if side == OrderSide.BUY:
+        ticks = tape.arrays.book_bid_ticks[book_ptr]; sizes = tape.arrays.book_bid_sizes[book_ptr]
+    else:
+        ticks = tape.arrays.book_ask_ticks[book_ptr]; sizes = tape.arrays.book_ask_sizes[book_ptr]
+    active: list[int] = []
+    for tick, size in zip(ticks, sizes):
+        tick_int = int(tick)
+        if tick_int == 0:
+            break
+        active.append(tick_int)
+        if tick_int == price_tick:
+            return float(size), True
+    if active and min(active) <= price_tick <= max(active):
+        return 0.0, True
+    return None, False
+
+
+def _queue_ahead_for_candidate(tape: ExecutionTape, *, book_ptr: int, side: OrderSide, price_tick: int, queue_model: QueueModelConfig) -> float:
+    top = _book_top_obj_from_l2_row(tape, book_ptr)
+    if top.best_bid_tick < price_tick < top.best_ask_tick:
+        return 0.0
+    qty, known = _level_qty_with_depth_status(tape, book_ptr=book_ptr, side=side, price_tick=price_tick)
+    if known:
+        return 0.0 if qty is None else qty
+    return queue_model.unknown_level_queue_ahead_qty
+
+
+def _activation_key_for_latency(decision_key: EventKey, delay_us: int) -> EventKey:
+    target = decision_key.local_ts_us + delay_us
+    if target <= decision_key.local_ts_us:
+        return decision_key
+    return EventKey(target, MAX_EVENT_SEQ)
+
+
+def _deadline_key(decision_key: EventKey, horizon_us: int) -> EventKey:
+    return EventKey(decision_key.local_ts_us + horizon_us, MAX_EVENT_SEQ)
+
+
 def _clean_fill_result(
     *,
     filled: bool,
@@ -513,14 +722,25 @@ def _clean_fill_result(
     if not filled:
         return CounterfactualFillResult(False, -1, -1, None, -1, queue_ahead_at_start, queue_ahead_before_fill)
     return CounterfactualFillResult(
-        True,
-        int(fill_local_ts_us),
-        int(fill_price_tick),
-        None if fill_reason is None else fill_reason.value,
-        int(fill_local_ts_us - decision_local_ts_us),
-        float(queue_ahead_at_start),
-        float(queue_ahead_before_fill),
+        True, int(fill_local_ts_us), int(fill_price_tick), None if fill_reason is None else fill_reason.value,
+        int(fill_local_ts_us - decision_local_ts_us), float(queue_ahead_at_start), float(queue_ahead_before_fill),
     )
+
+
+def _live_orders(orders: Sequence[ActiveOrder]) -> tuple[ActiveOrder, ...]:
+    return tuple(order for order in orders if order.is_live)
+
+
+def _trade_side_from_code(side_code: int) -> AggressorSide | None:
+    if side_code > 0:
+        return AggressorSide.BUY
+    if side_code < 0:
+        return AggressorSide.SELL
+    return None
+
+
+def _has_fillable_order_at_level(orders: Sequence[ActiveOrder], *, side: OrderSide, price_tick: int, event_key: EventKey) -> bool:
+    return any(order.side == side and order.price_tick == price_tick and order.is_fillable_at_key(event_key) for order in orders)
 
 
 def _counterfactual_fill_one_side(
@@ -528,118 +748,109 @@ def _counterfactual_fill_one_side(
     *,
     start_event_index: int,
     start_book_ptr: int,
-    decision_local_ts_us: int,
+    decision_key: EventKey,
     side: OrderSide,
     price_tick: int,
     qty: float,
-    queue_ahead_qty: float,
-    fill_deadline_us: int,
+    fill_deadline_key: EventKey,
     config: CounterfactualQuoteConfig,
 ) -> CounterfactualFillResult:
-    remaining_qty = float(qty)
-    queue_ahead = max(float(queue_ahead_qty), 0.0)
+    sim_config = FillSimulatorConfig(queue_model=config.queue_model, maker_fee_bps=config.maker_fee_bps)
+    activation_key = _activation_key_for_latency(decision_key, config.latency_config.order_activation_delay_us)
+    queue_ahead = _queue_ahead_for_candidate(tape, book_ptr=start_book_ptr, side=side, price_tick=price_tick, queue_model=config.queue_model)
     queue_at_start = queue_ahead
-    prev_book_ptr = int(start_book_ptr)
-    qm = config.queue_model
+    quote = QuoteIntent(
+        bid_enabled=side == OrderSide.BUY, ask_enabled=side == OrderSide.SELL,
+        bid_price_tick=price_tick if side == OrderSide.BUY else 0, ask_price_tick=price_tick if side == OrderSide.SELL else 0,
+        bid_qty=qty if side == OrderSide.BUY else 0.0, ask_qty=qty if side == OrderSide.SELL else 0.0,
+    )
+    orders = place_orders_from_quote(
+        quote, next_order_id=0, created_key=decision_key, bid_effective_key=activation_key, ask_effective_key=activation_key,
+        bid_queue_ahead_qty=queue_ahead if side == OrderSide.BUY else 0.0,
+        ask_queue_ahead_qty=queue_ahead if side == OrderSide.SELL else 0.0,
+    )
+    current_book_ptr = int(start_book_ptr)
+    recent_trade_depletion_by_level: dict[tuple[OrderSide, int], float] = {}
     events = tape.arrays.events
-    trades = tape.arrays.trades
+
+    def activate_at(event_key: EventKey, book_ptr: int) -> None:
+        nonlocal orders, queue_at_start
+        refreshed: list[ActiveOrder] = []
+        for order in orders:
+            if order.status == OrderStatus.PENDING_NEW and order.effective_key <= event_key:
+                refreshed_q = _queue_ahead_for_candidate(tape, book_ptr=book_ptr, side=order.side, price_tick=order.price_tick, queue_model=config.queue_model)
+                if order.order_id == 0:
+                    queue_at_start = refreshed_q
+                order = replace(order, queue_ahead_qty=refreshed_q)
+            refreshed.append(order)
+        result = activate_pending_orders(refreshed, event_key=event_key, book_top=_book_top_obj_from_l2_row(tape, book_ptr), post_only_gap_ticks=config.post_only_gap_ticks)
+        orders = result.orders
+
+    def return_fill(fill: Fill) -> CounterfactualFillResult:
+        return _clean_fill_result(
+            filled=True, fill_local_ts_us=fill.local_ts_us, fill_price_tick=fill.price_tick, fill_reason=fill.reason,
+            decision_local_ts_us=decision_key.local_ts_us, queue_ahead_at_start=queue_at_start, queue_ahead_before_fill=fill.queue_ahead_before,
+        )
+
+    activate_at(decision_key, current_book_ptr)
     for event_idx in range(start_event_index + 1, len(events)):
         event = events[event_idx]
-        local_ts_us = int(event["local_ts_us"])
-        if local_ts_us > fill_deadline_us:
+        event_key = EventKey(int(event["local_ts_us"]), int(event["event_seq"]))
+        if event_key > fill_deadline_key:
             break
-        event_type = int(event["event_type_code"])
-        if event_type == EVENT_TYPE_CODE_TRADE:
+        pre_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1) if event_key.event_seq > 0 else (EventKey(event_key.local_ts_us - 1, MAX_EVENT_SEQ) if event_key.local_ts_us > 1 else event_key)
+        activate_at(pre_key, current_book_ptr)
+        if int(event["event_type_code"]) == EVENT_TYPE_CODE_TRADE:
             trade_ptr = int(event["trade_ptr"])
-            if trade_ptr < 0:
-                continue
-            trade = trades[trade_ptr]
-            side_code = int(trade["side_code"])
-            if side_code == 0:
-                continue
-            trade_price_tick = int(trade["price_tick"])
-            trade_amount = float(trade["amount"])
-            if trade_amount <= 0.0:
-                continue
-            reason: FillReason | None = None
-            if side == OrderSide.BUY and side_code == -1:
-                if trade_price_tick < price_tick:
-                    reason = FillReason.TRADE_THROUGH
-                elif trade_price_tick == price_tick:
-                    reason = FillReason.TRADE_AT_LEVEL
-            elif side == OrderSide.SELL and side_code == 1:
-                if trade_price_tick > price_tick:
-                    reason = FillReason.TRADE_THROUGH
-                elif trade_price_tick == price_tick:
-                    reason = FillReason.TRADE_AT_LEVEL
-            if reason == FillReason.TRADE_THROUGH:
-                return _clean_fill_result(
-                    filled=True,
-                    fill_local_ts_us=local_ts_us,
-                    fill_price_tick=price_tick,
-                    fill_reason=FillReason.TRADE_THROUGH,
-                    decision_local_ts_us=decision_local_ts_us,
-                    queue_ahead_at_start=queue_at_start,
-                    queue_ahead_before_fill=queue_ahead,
-                )
-            if reason == FillReason.TRADE_AT_LEVEL:
-                effective_trade_qty = trade_amount * qm.trade_at_level_weight
-                queue_before = queue_ahead
-                queue_consumed = min(queue_ahead, effective_trade_qty)
-                queue_ahead = max(queue_ahead - effective_trade_qty, 0.0)
-                leftover = max(effective_trade_qty - queue_consumed, 0.0)
-                fillable_qty = min(remaining_qty, leftover)
-                if fillable_qty > qm.qty_epsilon:
-                    return _clean_fill_result(
-                        filled=True,
-                        fill_local_ts_us=local_ts_us,
-                        fill_price_tick=price_tick,
-                        fill_reason=FillReason.TRADE_AT_LEVEL,
-                        decision_local_ts_us=decision_local_ts_us,
-                        queue_ahead_at_start=queue_at_start,
-                        queue_ahead_before_fill=queue_before,
-                    )
-        elif event_type == EVENT_TYPE_CODE_L2_BATCH:
+            if trade_ptr >= 0:
+                row = tape.arrays.trades[trade_ptr]
+                agg_side = _trade_side_from_code(int(row["side_code"]))
+                if agg_side is not None and float(row["amount"]) > 0.0:
+                    trade = TradePrint(local_ts_us=int(row["local_ts_us"]), ts_us=int(row["ts_us"]), side=agg_side, price_tick=int(row["price_tick"]), amount=float(row["amount"]), trade_id=str(int(row["source_row"])), source_row=int(row["source_row"]))
+                    result = simulate_trade_event(orders, trade, event_key=event_key, symbol_spec=tape.manifest.symbol_spec, config=sim_config)
+                    orders = result.orders
+                    if result.fills:
+                        return return_fill(result.fills[0])
+                    dedupe_qty = sum(u.trade_advance_qty + u.fillable_qty for u in result.queue_updates if u.trade_at_level)
+                    level_side = OrderSide.BUY if agg_side == AggressorSide.SELL else OrderSide.SELL
+                    if dedupe_qty > sim_config.qty_epsilon and config.queue_model.mode == QueueModelMode.BALANCED and config.queue_model.dedupe_l2_decrease_with_trade_prints:
+                        key = (level_side, trade.price_tick)
+                        recent_trade_depletion_by_level[key] = recent_trade_depletion_by_level.get(key, 0.0) + dedupe_qty
+        elif int(event["event_type_code"]) == EVENT_TYPE_CODE_L2_BATCH:
             curr_book_ptr = int(event["book_ptr"])
-            if curr_book_ptr < 0:
-                continue
-            if qm.mode == QueueModelMode.BALANCED and prev_book_ptr >= 0:
-                if side == OrderSide.BUY:
-                    prev_qty = _book_qty_at_price(tape.arrays.book_bid_ticks[prev_book_ptr], tape.arrays.book_bid_sizes[prev_book_ptr], price_tick)
-                    curr_qty = _book_qty_at_price(tape.arrays.book_bid_ticks[curr_book_ptr], tape.arrays.book_bid_sizes[curr_book_ptr], price_tick)
-                else:
-                    prev_qty = _book_qty_at_price(tape.arrays.book_ask_ticks[prev_book_ptr], tape.arrays.book_ask_sizes[prev_book_ptr], price_tick)
-                    curr_qty = _book_qty_at_price(tape.arrays.book_ask_ticks[curr_book_ptr], tape.arrays.book_ask_sizes[curr_book_ptr], price_tick)
-                if prev_qty is not None:
-                    curr_visible_qty = 0.0 if curr_qty is None else curr_qty
-                    visible_decrease = max(prev_qty - curr_visible_qty, 0.0)
-                    if visible_decrease > 0.0:
-                        effective_l2_advance = visible_decrease * qm.l2_decrease_weight
-                        queue_before = queue_ahead
-                        queue_consumed = min(queue_ahead, effective_l2_advance)
-                        queue_ahead = max(queue_ahead - effective_l2_advance, 0.0)
-                        leftover = max(effective_l2_advance - queue_consumed, 0.0)
-                        fillable_qty = min(remaining_qty, leftover)
-                        if fillable_qty > qm.qty_epsilon:
-                            return _clean_fill_result(
-                                filled=True,
-                                fill_local_ts_us=local_ts_us,
-                                fill_price_tick=price_tick,
-                                fill_reason=FillReason.QUEUE_DEPLETION,
-                                decision_local_ts_us=decision_local_ts_us,
-                                queue_ahead_at_start=queue_at_start,
-                                queue_ahead_before_fill=queue_before,
-                            )
-            prev_book_ptr = curr_book_ptr
-    return _clean_fill_result(
-        filled=False,
-        fill_local_ts_us=-1,
-        fill_price_tick=-1,
-        fill_reason=None,
-        decision_local_ts_us=decision_local_ts_us,
-        queue_ahead_at_start=queue_at_start,
-        queue_ahead_before_fill=queue_ahead,
-    )
+            if curr_book_ptr >= 0:
+                updated_orders = orders
+                for order in tuple(updated_orders):
+                    if not order.is_live:
+                        continue
+                    level_key = (order.side, order.price_tick)
+                    if not _has_fillable_order_at_level(updated_orders, side=order.side, price_tick=order.price_tick, event_key=event_key):
+                        continue
+                    prev_qty, prev_known = _level_qty_with_depth_status(tape, book_ptr=current_book_ptr, side=order.side, price_tick=order.price_tick)
+                    curr_qty, curr_known = _level_qty_with_depth_status(tape, book_ptr=curr_book_ptr, side=order.side, price_tick=order.price_tick)
+                    if not (prev_known and curr_known):
+                        continue
+                    raw_decrease = max((prev_qty if prev_qty is not None else 0.0) - (curr_qty if curr_qty is not None else 0.0), 0.0)
+                    if config.queue_model.dedupe_l2_decrease_with_trade_prints:
+                        already = recent_trade_depletion_by_level.get(level_key, 0.0)
+                        deduped = min(raw_decrease, already)
+                        l2_decrease_qty = raw_decrease - deduped
+                        recent_trade_depletion_by_level[level_key] = max(already - deduped, 0.0)
+                    else:
+                        l2_decrease_qty = raw_decrease
+                    result = simulate_l2_level_update(updated_orders, side=order.side, price_tick=order.price_tick, l2_decrease_qty=l2_decrease_qty, event_key=event_key, symbol_spec=tape.manifest.symbol_spec, config=sim_config)
+                    updated_orders = result.orders
+                    if result.fills:
+                        orders = updated_orders
+                        return return_fill(result.fills[0])
+                orders = updated_orders
+                current_book_ptr = curr_book_ptr
+        activate_at(event_key, current_book_ptr)
+        for order in orders:
+            if order.status == OrderStatus.REJECTED:
+                return _clean_fill_result(filled=False, fill_local_ts_us=-1, fill_price_tick=-1, fill_reason=None, decision_local_ts_us=decision_key.local_ts_us, queue_ahead_at_start=queue_at_start, queue_ahead_before_fill=order.queue_ahead_qty)
+    before = orders[0].queue_ahead_qty if orders else queue_at_start
+    return _clean_fill_result(filled=False, fill_local_ts_us=-1, fill_price_tick=-1, fill_reason=None, decision_local_ts_us=decision_key.local_ts_us, queue_ahead_at_start=queue_at_start, queue_ahead_before_fill=before)
 
 
 class _TradeWindowState:
@@ -797,92 +1008,86 @@ def _feature_row(
     return tuple(0.0 if not math.isfinite(value) else float(value) for value in values)
 
 
+def _invalid_quote(config: AdverseSelectionConfig, message: str) -> bool:
+    if config.quote.invalid_quote_policy == "error":
+        raise ValueError(message)
+    return False
+
+
+def _side_valid_for_candidate(tape: ExecutionTape, config: AdverseSelectionConfig, *, side: OrderSide, price_tick: int | None) -> bool:
+    if price_tick is None or price_tick <= 0:
+        return _invalid_quote(config, "candidate quote price is invalid or post-only unsafe")
+    spec = tape.manifest.symbol_spec
+    if not spec.is_valid_qty(config.quote.order_qty):
+        raise ValueError("quote.order_qty is invalid for tape symbol_spec")
+    if not spec.is_valid_notional(config.quote.order_qty, price_tick):
+        return _invalid_quote(config, "candidate quote notional is invalid for tape symbol_spec")
+    return True
+
+
 def _labels_for_decision(
     tape: ExecutionTape,
     *,
     config: AdverseSelectionConfig,
     decision_event_index: int,
     latest_book_ptr: int,
-    decision_ts: int,
-    l2_ts: np.ndarray,
-    l2_bid: np.ndarray,
-    l2_ask: np.ndarray,
+    decision_key: EventKey,
+    l2_view: _ValidL2View,
 ) -> tuple[list[float], list[bool]] | None:
     best_bid, best_ask, _, _, _, _ = _book_top_from_l2_row(tape, latest_book_ptr)
-    bid_price_tick = best_bid - config.quote.quote_distance_ticks
-    ask_price_tick = best_ask + config.quote.quote_distance_ticks
-    if bid_price_tick <= 0 or ask_price_tick <= 0:
+    label_names = adverse_selection_label_names(config)
+    labels = [math.nan] * len(label_names)
+    masks = [False] * len(label_names)
+    fill_deadline_key = _deadline_key(decision_key, config.quote.fill_horizon_us)
+    if config.drop_incomplete_horizon and fill_deadline_key.local_ts_us > int(tape.arrays.events["local_ts_us"][-1]):
         return None
-    bid_visible_qty = _book_qty_at_price(tape.arrays.book_bid_ticks[latest_book_ptr], tape.arrays.book_bid_sizes[latest_book_ptr], bid_price_tick)
-    ask_visible_qty = _book_qty_at_price(tape.arrays.book_ask_ticks[latest_book_ptr], tape.arrays.book_ask_sizes[latest_book_ptr], ask_price_tick)
-    bid_queue = config.quote.queue_model.unknown_level_queue_ahead_qty if bid_visible_qty is None else bid_visible_qty
-    ask_queue = config.quote.queue_model.unknown_level_queue_ahead_qty if ask_visible_qty is None else ask_visible_qty
-    fill_deadline = decision_ts + config.quote.fill_horizon_us
-    if config.drop_incomplete_horizon and fill_deadline > int(tape.arrays.events["local_ts_us"][-1]):
-        return None
-    bid_fill = _counterfactual_fill_one_side(
-        tape,
-        start_event_index=decision_event_index,
-        start_book_ptr=latest_book_ptr,
-        decision_local_ts_us=decision_ts,
-        side=OrderSide.BUY,
-        price_tick=bid_price_tick,
-        qty=config.quote.order_qty,
-        queue_ahead_qty=bid_queue,
-        fill_deadline_us=fill_deadline,
-        config=config.quote,
-    )
-    ask_fill = _counterfactual_fill_one_side(
-        tape,
-        start_event_index=decision_event_index,
-        start_book_ptr=latest_book_ptr,
-        decision_local_ts_us=decision_ts,
-        side=OrderSide.SELL,
-        price_tick=ask_price_tick,
-        qty=config.quote.order_qty,
-        queue_ahead_qty=ask_queue,
-        fill_deadline_us=fill_deadline,
-        config=config.quote,
-    )
-    labels = [math.nan] * 10
-    masks = [False] * 10
-    if fill_deadline <= int(tape.arrays.events["local_ts_us"][-1]):
-        labels[0] = 1.0 if bid_fill.filled else 0.0
-        labels[1] = 1.0 if ask_fill.filled else 0.0
-        masks[0] = True
-        masks[1] = True
-    if bid_fill.filled:
-        labels[2] = float(bid_fill.fill_latency_us)
-        masks[2] = True
-    if ask_fill.filled:
-        labels[3] = float(ask_fill.fill_latency_us)
-        masks[3] = True
 
-    def set_adverse(fill: CounterfactualFillResult, label_idx: int, toxic_idx: int, cost_idx: int, is_bid: bool) -> bool:
-        if not fill.filled:
-            if masks[0 if is_bid else 1]:
-                labels[cost_idx] = 0.0
-                masks[cost_idx] = True
-            return True
-        future_mid = _future_mid_tick_at_or_after(l2_ts, l2_bid, l2_ask, fill.fill_local_ts_us + config.quote.adverse_horizon_us)
-        if future_mid is None:
-            return False
-        if is_bid:
-            adverse_bps = max(0.0, fill.fill_price_tick - future_mid) / fill.fill_price_tick * 10_000.0
-        else:
-            adverse_bps = max(0.0, future_mid - fill.fill_price_tick) / fill.fill_price_tick * 10_000.0
-        labels[label_idx] = adverse_bps
-        labels[toxic_idx] = 1.0 if adverse_bps > config.quote.toxic_threshold_bps else 0.0
-        labels[cost_idx] = adverse_bps
-        masks[label_idx] = True
-        masks[toxic_idx] = True
-        masks[cost_idx] = True
-        return True
+    for candidate_index, candidate in enumerate(config.quote.quote_candidates):
+        base = candidate_index * 10
+        fills_by_side: dict[bool, CounterfactualFillResult] = {}
+        for is_bid, side in ((True, OrderSide.BUY), (False, OrderSide.SELL)):
+            price_tick = _candidate_price_tick(candidate=candidate, side=side, best_bid=best_bid, best_ask=best_ask, post_only_gap_ticks=config.quote.post_only_gap_ticks)
+            filled_idx = base + (0 if is_bid else 1)
+            latency_idx = base + (2 if is_bid else 3)
+            if not _side_valid_for_candidate(tape, config, side=side, price_tick=price_tick):
+                continue
+            assert price_tick is not None
+            fill = _counterfactual_fill_one_side(
+                tape, start_event_index=decision_event_index, start_book_ptr=latest_book_ptr, decision_key=decision_key,
+                side=side, price_tick=price_tick, qty=config.quote.order_qty, fill_deadline_key=fill_deadline_key, config=config.quote,
+            )
+            fills_by_side[is_bid] = fill
+            if fill_deadline_key.local_ts_us <= int(tape.arrays.events["local_ts_us"][-1]):
+                labels[filled_idx] = 1.0 if fill.filled else 0.0
+                masks[filled_idx] = True
+            if fill.filled:
+                labels[latency_idx] = float(fill.fill_latency_us)
+                masks[latency_idx] = True
 
-    bid_ok = set_adverse(bid_fill, 4, 6, 8, True)
-    ask_ok = set_adverse(ask_fill, 5, 7, 9, False)
-    if config.drop_incomplete_horizon and not (bid_ok and ask_ok):
-        return None
+        for is_bid, fill in fills_by_side.items():
+            filled_idx = base + (0 if is_bid else 1)
+            adverse_idx = base + (4 if is_bid else 5)
+            toxic_idx = base + (6 if is_bid else 7)
+            cost_idx = base + (8 if is_bid else 9)
+            if not fill.filled:
+                if masks[filled_idx]:
+                    labels[cost_idx] = 0.0
+                    masks[cost_idx] = True
+                continue
+            future_key = EventKey(fill.fill_local_ts_us + config.quote.adverse_horizon_us, MAX_EVENT_SEQ)
+            future_mid = _future_mid_tick_at_or_after_key(l2_view, future_key)
+            if future_mid is None:
+                if config.drop_incomplete_horizon:
+                    return None
+                continue
+            if is_bid:
+                adverse_bps = max(0.0, fill.fill_price_tick - future_mid) / fill.fill_price_tick * 10_000.0
+            else:
+                adverse_bps = max(0.0, future_mid - fill.fill_price_tick) / fill.fill_price_tick * 10_000.0
+            labels[adverse_idx] = adverse_bps
+            labels[toxic_idx] = 1.0 if adverse_bps > config.quote.toxic_threshold_bps else 0.0
+            labels[cost_idx] = adverse_bps
+            masks[adverse_idx] = masks[toxic_idx] = masks[cost_idx] = True
     return labels, masks
 
 
@@ -901,11 +1106,12 @@ def build_adverse_selection_dataset(
     if hasattr(spec, "is_valid_qty") and not spec.is_valid_qty(config.quote.order_qty):
         raise ValueError("quote.order_qty is invalid for tape symbol_spec")
     l2_ts, l2_bid, l2_ask, _, _ = _valid_l2_views(tape)
+    l2_view = _valid_l2_view_from_tape(tape)
     if len(l2_ts) == 0:
         raise ValueError("tape must contain at least one valid two-sided L2 book")
 
     feature_names = adverse_selection_feature_names(config)
-    label_names = adverse_selection_label_names()
+    label_names = adverse_selection_label_names(config)
     vpin_state = VPINState(config.vpin, deque())
     kyle_state = _new_kyle_state(config.kyle)
     kyle_samples = _precompute_kyle_samples(tape, config.kyle, spec.tick_size)
@@ -914,6 +1120,7 @@ def build_adverse_selection_dataset(
 
     decision_ts_values: list[int] = []
     decision_event_indices: list[int] = []
+    decision_event_seq_values: list[int] = []
     feature_rows: list[tuple[float, ...]] = []
     label_rows: list[list[float]] = []
     mask_rows: list[list[bool]] = []
@@ -947,15 +1154,14 @@ def build_adverse_selection_dataset(
                     config=config,
                     decision_event_index=last_processed_event_idx,
                     latest_book_ptr=latest_book_ptr,
-                    decision_ts=next_decision_ts,
-                    l2_ts=l2_ts,
-                    l2_bid=l2_bid,
-                    l2_ask=l2_ask,
+                    decision_key=EventKey(next_decision_ts, MAX_EVENT_SEQ),
+                    l2_view=l2_view,
                 )
                 if labels_and_masks is not None:
                     labels, masks = labels_and_masks
                     decision_ts_values.append(next_decision_ts)
                     decision_event_indices.append(last_processed_event_idx)
+                    decision_event_seq_values.append(MAX_EVENT_SEQ)
                     feature_rows.append(
                         _feature_row(
                             tape,
@@ -1015,6 +1221,7 @@ def build_adverse_selection_dataset(
     return AdverseSelectionDataset(
         decision_local_ts_us=np.asarray(decision_ts_values, dtype=np.int64),
         decision_event_index=np.asarray(decision_event_indices, dtype=np.int64),
+        decision_event_seq=np.asarray(decision_event_seq_values, dtype=np.int64),
         feature_names=feature_names,
         features=features,
         label_names=label_names,
@@ -1037,16 +1244,23 @@ def summarize_adverse_selection_dataset(
         raise ValueError("dataset must be AdverseSelectionDataset")
     label_index = {name: i for i, name in enumerate(dataset.label_names)}
     feature_index = {name: i for i, name in enumerate(dataset.feature_names)}
-    labels_summary = {
-        "bid_fill_rate": _masked_mean(dataset.labels[:, label_index["bid_filled"]], dataset.label_masks[:, label_index["bid_filled"]]),
-        "ask_fill_rate": _masked_mean(dataset.labels[:, label_index["ask_filled"]], dataset.label_masks[:, label_index["ask_filled"]]),
-        "bid_toxic_fill_rate": _masked_mean(dataset.labels[:, label_index["bid_toxic_fill"]], dataset.label_masks[:, label_index["bid_toxic_fill"]]),
-        "ask_toxic_fill_rate": _masked_mean(dataset.labels[:, label_index["ask_toxic_fill"]], dataset.label_masks[:, label_index["ask_toxic_fill"]]),
-        "bid_adverse_bps_mean_conditional": _masked_mean(dataset.labels[:, label_index["bid_adverse_bps"]], dataset.label_masks[:, label_index["bid_adverse_bps"]]),
-        "ask_adverse_bps_mean_conditional": _masked_mean(dataset.labels[:, label_index["ask_adverse_bps"]], dataset.label_masks[:, label_index["ask_adverse_bps"]]),
-        "bid_toxic_cost_bps_mean_unconditional": _masked_mean(dataset.labels[:, label_index["bid_toxic_cost_bps"]], dataset.label_masks[:, label_index["bid_toxic_cost_bps"]]),
-        "ask_toxic_cost_bps_mean_unconditional": _masked_mean(dataset.labels[:, label_index["ask_toxic_cost_bps"]], dataset.label_masks[:, label_index["ask_toxic_cost_bps"]]),
-    }
+    labels_summary: dict[str, float] = {}
+    for candidate in dataset.config.quote.quote_candidates:
+        c = candidate.name
+        keys = {
+            f"{c}_bid_fill_rate": f"bid_{c}_filled",
+            f"{c}_ask_fill_rate": f"ask_{c}_filled",
+            f"{c}_bid_toxic_fill_rate": f"bid_{c}_toxic_fill",
+            f"{c}_ask_toxic_fill_rate": f"ask_{c}_toxic_fill",
+            f"{c}_bid_adverse_bps_mean_conditional": f"bid_{c}_adverse_bps",
+            f"{c}_ask_adverse_bps_mean_conditional": f"ask_{c}_adverse_bps",
+            f"{c}_bid_toxic_cost_bps_mean_unconditional": f"bid_{c}_toxic_cost_bps",
+            f"{c}_ask_toxic_cost_bps_mean_unconditional": f"ask_{c}_toxic_cost_bps",
+        }
+        for out_name, label_name in keys.items():
+            if label_name in label_index:
+                idx = label_index[label_name]
+                labels_summary[out_name] = _masked_mean(dataset.labels[:, idx], dataset.label_masks[:, idx])
     features_summary: dict[str, object] = {
         "finite_fraction": float(np.isfinite(dataset.features).mean()) if dataset.features.size else 1.0,
     }

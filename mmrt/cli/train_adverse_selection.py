@@ -13,6 +13,9 @@ import numpy as np
 from mmrt.execution.adverse_selection import (
     AdverseSelectionConfig,
     CounterfactualQuoteConfig,
+    DEFAULT_QUOTE_CANDIDATES,
+    QuoteCandidateConfig,
+    QuoteCandidateMode,
     KyleLambdaConfig,
     VPINConfig,
     build_adverse_selection_dataset,
@@ -21,6 +24,7 @@ from mmrt.execution.adverse_selection import (
 from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.queue_model import QueueModelConfig
+from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
 
 __all__ = [
     "AdverseSelectionTrainCLIConfig",
@@ -29,7 +33,7 @@ __all__ = [
     "main",
 ]
 
-_BINARY_TARGETS = frozenset(("bid_filled", "ask_filled", "bid_toxic_fill", "ask_toxic_fill"))
+_BINARY_TARGETS = frozenset()
 
 
 def _require_nonempty_str(value: str, name: str) -> str:
@@ -149,6 +153,31 @@ def _parse_target_names(value: str | Sequence[str]) -> tuple[str, ...]:
     return tuple(_require_nonempty_str(part, f"target_names[{i}]") for i, part in enumerate(parts))
 
 
+def _parse_quote_candidates(value: str | Sequence[QuoteCandidateConfig]) -> tuple[QuoteCandidateConfig, ...]:
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        if not parts:
+            raise ValueError("quote_candidates must be non-empty")
+        out: list[QuoteCandidateConfig] = []
+        for part in parts:
+            if part == "touch":
+                out.append(QuoteCandidateConfig("touch", QuoteCandidateMode.TOUCH, 0))
+            elif part.startswith("inside_"):
+                out.append(QuoteCandidateConfig(part, QuoteCandidateMode.INSIDE, int(part.split("_", 1)[1])))
+            elif part.startswith("away_"):
+                out.append(QuoteCandidateConfig(part, QuoteCandidateMode.AWAY, int(part.split("_", 1)[1])))
+            else:
+                raise ValueError(f"malformed quote candidate {part!r}")
+        return tuple(out)
+    return tuple(value)
+
+
+def _resolve_target_names(dataset, requested: tuple[str, ...] | str) -> tuple[str, ...]:
+    if requested == "auto":
+        return tuple(name for name in dataset.label_names if name.endswith("_filled") or name.endswith("_toxic_cost_bps"))
+    return _parse_target_names(requested)
+
+
 @dataclass(frozen=True, slots=True)
 class AdverseSelectionTrainCLIConfig:
     tape_root: str
@@ -174,27 +203,24 @@ class AdverseSelectionTrainCLIConfig:
     kyle_min_samples: int = 5
     kyle_use_notional_flow: bool = False
 
-    quote_distance_ticks: int = 0
+    quote_candidates: tuple[QuoteCandidateConfig, ...] | str = DEFAULT_QUOTE_CANDIDATES
+    post_only_gap_ticks: int = 1
+    invalid_quote_policy: str = "mask"
     order_qty: float = 0.001
     fill_horizon_us: int = 1_000_000
     adverse_horizon_us: int = 1_000_000
     toxic_threshold_bps: float = 0.0
 
-    queue_mode: QueueModelMode | str = QueueModelMode.BALANCED
-    l2_decrease_weight: float = 1.0
-    trade_at_level_weight: float = 1.0
-    unknown_level_queue_ahead_qty: float = 0.0
+    queue_mode: QueueModelMode | str = QueueModelMode.CONSERVATIVE
+    l2_decrease_weight: float = 0.25
+    trade_at_level_weight: float = 0.5
+    unknown_level_queue_ahead_qty: float = 1_000_000_000.0
     dedupe_l2_decrease_with_trade_prints: bool = True
 
     train_fraction: float = 0.7
     ridge_l2: float = 1e-3
     min_train_samples: int = 10
-    target_names: tuple[str, ...] | str = (
-        "bid_filled",
-        "ask_filled",
-        "bid_toxic_cost_bps",
-        "ask_toxic_cost_bps",
-    )
+    target_names: tuple[str, ...] | str = "auto"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
@@ -219,7 +245,10 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "kyle_windows_us", _parse_int_tuple(self.kyle_windows_us, "kyle_windows_us"))
         object.__setattr__(self, "kyle_min_samples", _require_positive_int(self.kyle_min_samples, "kyle_min_samples"))
         object.__setattr__(self, "kyle_use_notional_flow", _require_bool(self.kyle_use_notional_flow, "kyle_use_notional_flow"))
-        object.__setattr__(self, "quote_distance_ticks", _require_nonnegative_int(self.quote_distance_ticks, "quote_distance_ticks"))
+        object.__setattr__(self, "quote_candidates", _parse_quote_candidates(self.quote_candidates))
+        object.__setattr__(self, "post_only_gap_ticks", _require_nonnegative_int(self.post_only_gap_ticks, "post_only_gap_ticks"))
+        if self.invalid_quote_policy not in ("mask", "error"):
+            raise ValueError("invalid_quote_policy must be mask or error")
         object.__setattr__(self, "order_qty", _require_positive_float(self.order_qty, "order_qty"))
         object.__setattr__(self, "fill_horizon_us", _require_positive_int(self.fill_horizon_us, "fill_horizon_us"))
         object.__setattr__(self, "adverse_horizon_us", _require_positive_int(self.adverse_horizon_us, "adverse_horizon_us"))
@@ -232,7 +261,8 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "train_fraction", _require_probability_exclusive(self.train_fraction, "train_fraction"))
         object.__setattr__(self, "ridge_l2", _require_nonnegative_float(self.ridge_l2, "ridge_l2"))
         object.__setattr__(self, "min_train_samples", _require_positive_int(self.min_train_samples, "min_train_samples"))
-        object.__setattr__(self, "target_names", _parse_target_names(self.target_names))
+        if self.target_names != "auto":
+            object.__setattr__(self, "target_names", _parse_target_names(self.target_names))
         if self.vpin_min_completed_buckets > self.vpin_num_buckets:
             raise ValueError("vpin_min_completed_buckets must be <= vpin_num_buckets")
 
@@ -257,7 +287,9 @@ def _build_adverse_selection_config(config: AdverseSelectionTrainCLIConfig) -> A
             use_notional_flow=config.kyle_use_notional_flow,
         ),
         quote=CounterfactualQuoteConfig(
-            quote_distance_ticks=config.quote_distance_ticks,
+            quote_candidates=config.quote_candidates,
+            post_only_gap_ticks=config.post_only_gap_ticks,
+            invalid_quote_policy=config.invalid_quote_policy,
             order_qty=config.order_qty,
             fill_horizon_us=config.fill_horizon_us,
             adverse_horizon_us=config.adverse_horizon_us,
@@ -295,7 +327,9 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "kyle_windows_us": list(config.kyle_windows_us),
         "kyle_min_samples": config.kyle_min_samples,
         "kyle_use_notional_flow": config.kyle_use_notional_flow,
-        "quote_distance_ticks": config.quote_distance_ticks,
+        "quote_candidates": [c.name for c in config.quote_candidates],
+        "post_only_gap_ticks": config.post_only_gap_ticks,
+        "invalid_quote_policy": config.invalid_quote_policy,
         "order_qty": config.order_qty,
         "fill_horizon_us": config.fill_horizon_us,
         "adverse_horizon_us": config.adverse_horizon_us,
@@ -308,7 +342,7 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "train_fraction": config.train_fraction,
         "ridge_l2": config.ridge_l2,
         "min_train_samples": config.min_train_samples,
-        "target_names": list(config.target_names),
+        "target_names": config.target_names if config.target_names == "auto" else list(config.target_names),
     }
 
 
@@ -437,7 +471,7 @@ def _target_metrics(y_train: np.ndarray, pred_train: np.ndarray, y_val: np.ndarr
         "prediction_mean_val": float(np.mean(pred_val)),
         "skipped": False,
     }
-    if target_name in _BINARY_TARGETS:
+    if target_name.endswith("_filled") or target_name.endswith("_toxic_fill"):
         metrics["train_auc"] = _binary_auc(y_train, pred_train)
         metrics["val_auc"] = _binary_auc(y_val, pred_val)
     return metrics
@@ -595,7 +629,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     dataset_summary = summarize_adverse_selection_dataset(dataset)
     baseline_fit = _fit_baselines(
         dataset,
-        target_names=config.target_names,
+        target_names=_resolve_target_names(dataset, config.target_names),
         train_fraction=config.train_fraction,
         ridge_l2=config.ridge_l2,
         min_train_samples=config.min_train_samples,
@@ -603,15 +637,21 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     baseline_summary = baseline_fit.metrics
     model_written = False
     if baseline_fit.target_names:
-        _write_npz_atomic(
+        save_adverse_selection_model(
             model_npz,
-            schema=np.array("mmrt_adverse_selection_ridge"),
-            feature_names=np.asarray(baseline_fit.feature_names, dtype=object),
-            target_names=np.asarray(baseline_fit.target_names, dtype=object),
-            feature_mean=baseline_fit.feature_mean.astype(np.float32),
-            feature_scale=baseline_fit.feature_scale.astype(np.float32),
-            coefficients=baseline_fit.coefficients.astype(np.float32),
-            intercepts=baseline_fit.intercepts.astype(np.float32),
+            AdverseSelectionModelArtifact(
+                schema=ADVERSE_SELECTION_MODEL_SCHEMA,
+                feature_names=baseline_fit.feature_names,
+                target_names=baseline_fit.target_names,
+                feature_mean=baseline_fit.feature_mean.astype(np.float32),
+                feature_scale=baseline_fit.feature_scale.astype(np.float32),
+                coefficients=baseline_fit.coefficients.astype(np.float32),
+                intercepts=baseline_fit.intercepts.astype(np.float32),
+                config_json=json.dumps(_summary_config(config), sort_keys=True),
+                exchange=tape.manifest.exchange,
+                symbol=tape.manifest.symbol,
+            ),
+            overwrite=config.overwrite,
         )
         model_written = True
     status = "ok" if dataset.num_decisions >= 1 and model_written else "warning"
@@ -662,15 +702,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kyle-windows-us", default="10000000,30000000")
     parser.add_argument("--kyle-min-samples", type=int, default=5)
     parser.add_argument("--kyle-use-notional-flow", action="store_true")
-    parser.add_argument("--quote-distance-ticks", type=int, default=0)
+    parser.add_argument("--quote-candidates", default="touch,inside_1,away_1", help="Comma-separated quote candidates: touch, inside_1, away_1.")
+    parser.add_argument("--post-only-gap-ticks", type=int, default=1)
+    parser.add_argument("--invalid-quote-policy", choices=("mask", "error"), default="mask")
     parser.add_argument("--order-qty", type=float, default=0.001)
     parser.add_argument("--fill-horizon-us", type=int, default=1_000_000)
     parser.add_argument("--adverse-horizon-us", type=int, default=1_000_000)
     parser.add_argument("--toxic-threshold-bps", type=float, default=0.0)
-    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="balanced")
-    parser.add_argument("--l2-decrease-weight", type=float, default=1.0)
-    parser.add_argument("--trade-at-level-weight", type=float, default=1.0)
-    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=0.0)
+    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="conservative")
+    parser.add_argument("--l2-decrease-weight", type=float, default=0.25)
+    parser.add_argument("--trade-at-level-weight", type=float, default=0.5)
+    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=1_000_000_000.0)
     parser.add_argument(
         "--no-dedupe-l2-decrease-with-trade-prints",
         action="store_true",
@@ -679,7 +721,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-fraction", type=float, default=0.7)
     parser.add_argument("--ridge-l2", type=float, default=0.001)
     parser.add_argument("--min-train-samples", type=int, default=10)
-    parser.add_argument("--target-names", default="bid_filled,ask_filled,bid_toxic_cost_bps,ask_toxic_cost_bps")
+    parser.add_argument("--target-names", default="auto")
     return parser
 
 
@@ -704,7 +746,9 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         kyle_windows_us=args.kyle_windows_us,
         kyle_min_samples=args.kyle_min_samples,
         kyle_use_notional_flow=args.kyle_use_notional_flow,
-        quote_distance_ticks=args.quote_distance_ticks,
+        quote_candidates=args.quote_candidates,
+        post_only_gap_ticks=args.post_only_gap_ticks,
+        invalid_quote_policy=args.invalid_quote_policy,
         order_qty=args.order_qty,
         fill_horizon_us=args.fill_horizon_us,
         adverse_horizon_us=args.adverse_horizon_us,

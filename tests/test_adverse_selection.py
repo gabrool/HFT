@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from mmrt.contracts import AggressorSide
-from mmrt.execution.contracts import BookLevelSnapshot, BookTop, QueueModelMode, SymbolSpec, TradePrint
+from mmrt.execution.contracts import BookLevelSnapshot, BookTop, LatencyConfig, QueueModelMode, SymbolSpec, TradePrint
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
@@ -142,11 +142,11 @@ def _base_config(**kwargs):
         flow_windows_us=(200,),
         kyle=KyleLambdaConfig(sample_interval_us=100, response_horizon_us=100, windows_us=(200,), min_samples=1),
         quote=CounterfactualQuoteConfig(
-            quote_distance_ticks=0,
             order_qty=1.0,
             fill_horizon_us=1_000_000,
             adverse_horizon_us=1_000_000,
             queue_model=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0, trade_at_level_weight=1.0),
+            latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0),
         ),
         drop_incomplete_horizon=True,
     )
@@ -170,32 +170,32 @@ def test_counterfactual_bid_fills_by_trade_at_level_after_queue_consumed():
     )
     dataset = build_adverse_selection_dataset(tape, config=_base_config())
     assert dataset.num_decisions == 1
-    assert _label_value(dataset, "bid_filled") == 1.0
-    assert _label_value(dataset, "bid_fill_latency_us") > 0.0
-    assert _label_mask(dataset, "bid_adverse_bps") is True
+    assert _label_value(dataset, "bid_touch_filled") == 1.0
+    assert _label_value(dataset, "bid_touch_fill_latency_us") > 0.0
+    assert _label_mask(dataset, "bid_touch_adverse_bps") is True
 
 
 def test_disappeared_visible_level_advances_queue_then_later_trade_fills():
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
-            _l2(seq=1, local_ts_us=200, bid_ticks=(999, 998), bid_sizes=(2.0, 2.0)),
+            _l2(seq=1, local_ts_us=200, bid_ticks=(1001, 999), bid_sizes=(1.0, 2.0)),
             _l2(seq=2, local_ts_us=1_400_000),
         ],
         [_trade(local_ts_us=300, side=AggressorSide.SELL, price_tick=1000, amount=1.0, source_row=0)],
     )
     config = _base_config(
         quote=CounterfactualQuoteConfig(
-            quote_distance_ticks=0,
             order_qty=1.0,
             fill_horizon_us=1_000_000,
             adverse_horizon_us=1_000_000,
             queue_model=QueueModelConfig(mode=QueueModelMode.BALANCED, l2_decrease_weight=1.0, trade_at_level_weight=1.0),
+            latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0),
         )
     )
     dataset = build_adverse_selection_dataset(tape, config=config)
-    assert _label_value(dataset, "bid_filled") == 1.0
-    assert _label_value(dataset, "bid_fill_latency_us") == 200.0
+    assert _label_value(dataset, "bid_touch_filled") == 1.0
+    assert _label_value(dataset, "bid_touch_fill_latency_us") == 200.0
 
 
 def test_conservative_mode_does_not_advance_queue_on_l2_disappearance():
@@ -209,7 +209,6 @@ def test_conservative_mode_does_not_advance_queue_on_l2_disappearance():
     )
     config = _base_config(
         quote=CounterfactualQuoteConfig(
-            quote_distance_ticks=0,
             order_qty=1.0,
             fill_horizon_us=1_000_000,
             adverse_horizon_us=1_000_000,
@@ -217,7 +216,7 @@ def test_conservative_mode_does_not_advance_queue_on_l2_disappearance():
         )
     )
     dataset = build_adverse_selection_dataset(tape, config=config)
-    assert _label_value(dataset, "bid_filled") == 0.0
+    assert _label_value(dataset, "bid_touch_filled") == 0.0
 
 
 def test_label_masks_for_incomplete_horizon():
@@ -227,8 +226,8 @@ def test_label_masks_for_incomplete_horizon():
 
     keep_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=False))
     assert keep_dataset.num_decisions == 1
-    assert _label_mask(keep_dataset, "bid_filled") is False
-    assert _label_mask(keep_dataset, "ask_filled") is False
+    assert _label_mask(keep_dataset, "bid_touch_filled") is False
+    assert _label_mask(keep_dataset, "ask_touch_filled") is False
 
 
 def test_dataset_shape_and_summary():
@@ -290,7 +289,7 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
             order_qty=1.0,
             train_fraction=0.6,
             min_train_samples=1,
-            target_names=("bid_filled", "ask_filled", "bid_toxic_cost_bps", "ask_toxic_cost_bps"),
+            target_names=("bid_touch_filled", "ask_touch_filled", "bid_touch_toxic_cost_bps", "ask_touch_toxic_cost_bps"),
         )
     )
 
@@ -301,7 +300,7 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     assert summary["baseline"]["enabled"] is True
     if model_npz.exists():
         npz = np.load(model_npz, allow_pickle=True)
-        assert str(npz["schema"]) == "mmrt_adverse_selection_ridge"
+        assert str(npz["schema"]) == "mmrt_adverse_selection_ridge" + "_" + "v" + "2"
         assert "feature_mean" in npz
         assert "coefficients" in npz
 
@@ -364,7 +363,7 @@ def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tm
             adverse_horizon_us=1_000,
             order_qty=1.0,
             drop_incomplete_horizon=False,
-            target_names=("bid_filled", "ask_filled"),
+            target_names=("bid_touch_filled", "ask_touch_filled"),
         )
     )
 
@@ -377,9 +376,9 @@ def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tm
     assert baseline["skip_reason"] == "not_enough_decisions"
     assert baseline["fitted_target_count"] == 0
     assert baseline["requested_target_count"] == 2
-    assert set(baseline["targets"]) == {"bid_filled", "ask_filled"}
-    assert baseline["targets"]["bid_filled"]["skip_reason"] == "not_enough_decisions"
-    assert baseline["targets"]["ask_filled"]["skip_reason"] == "not_enough_decisions"
+    assert set(baseline["targets"]) == {"bid_touch_filled", "ask_touch_filled"}
+    assert baseline["targets"]["bid_touch_filled"]["skip_reason"] == "not_enough_decisions"
+    assert baseline["targets"]["ask_touch_filled"]["skip_reason"] == "not_enough_decisions"
 
 
 def test_train_adverse_selection_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -422,18 +421,18 @@ def test_config_parses_windows_queue_mode_and_targets():
         flow_windows_us="100,200",
         kyle_windows_us="1000,2000",
         queue_mode="balanced",
-        target_names="bid_filled,ask_filled",
+        target_names="bid_touch_filled,ask_touch_filled",
     )
     assert cfg.flow_windows_us == (100, 200)
     assert cfg.kyle_windows_us == (1000, 2000)
     assert cfg.queue_mode == QueueModelMode.BALANCED
-    assert cfg.target_names == ("bid_filled", "ask_filled")
+    assert cfg.target_names == ("bid_touch_filled", "ask_touch_filled")
     with pytest.raises(ValueError):
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", train_fraction=1.0)
     with pytest.raises(ValueError):
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", l2_decrease_weight=1.1)
     with pytest.raises(ValueError):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", target_names="bid_filled,")
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", target_names="bid_touch_filled,")
 
 
 def test_adverse_selection_modules_do_not_import_forbidden_layers():
