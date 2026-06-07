@@ -361,7 +361,7 @@ class ExecutionEnv:
             quote,
             next_order_id=state.next_order_id,
             decision_key=decision_key,
-            order_effective_key=order_effective_key,
+            base_order_effective_key=order_effective_key,
             cancel_effective_key=cancel_effective_key,
             bid_queue_ahead_qty=bid_queue_ahead_qty,
             ask_queue_ahead_qty=ask_queue_ahead_qty,
@@ -717,6 +717,13 @@ class ExecutionEnv:
             if level_key in processed_levels:
                 continue
             processed_levels.add(level_key)
+            if not self._has_fillable_order_at_level(
+                tuple(updated_orders),
+                side=order.side,
+                price_tick=order.price_tick,
+                event_key=event_key,
+            ):
+                continue
             prev_qty, prev_known = self._level_qty_with_depth_status(book_ptr=state.current_book_ptr, side=order.side, price_tick=order.price_tick)
             curr_qty, curr_known = self._level_qty_with_depth_status(book_ptr=curr_book_ptr, side=order.side, price_tick=order.price_tick)
             if not (prev_known and curr_known):
@@ -746,6 +753,21 @@ class ExecutionEnv:
             fills.extend(result.fills)
         state.live_orders = _live_orders_tuple(updated_orders)
         return tuple(fills)
+
+    def _has_fillable_order_at_level(
+        self,
+        orders: tuple[ActiveOrder, ...],
+        *,
+        side: OrderSide,
+        price_tick: int,
+        event_key: EventKey,
+    ) -> bool:
+        return any(
+            order.side == side
+            and order.price_tick == price_tick
+            and order.is_fillable_at_key(event_key)
+            for order in orders
+        )
 
     def _trade_from_ptr(self, trade_ptr: int) -> TradePrint:
         row = self.tape.arrays.trades[trade_ptr]
