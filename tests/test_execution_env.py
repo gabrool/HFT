@@ -876,6 +876,93 @@ def test_repeated_same_quote_before_activation_preserves_pending_new_order():
     assert env._state.live_orders[0].effective_key == effective_key
 
 
+def test_trade_before_activation_does_not_dedupe_later_l2_decrease():
+    l2_events = [
+        # Decision book: bid 1000 / ask 1002, bid 1001 is inside spread.
+        _l2(
+            seq=0,
+            local_ts_us=100,
+            bid_ticks=(1000,),
+            bid_sizes=(1.0,),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        # Before activation, visible queue appears at our future price.
+        _l2(
+            seq=1,
+            local_ts_us=120,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(3.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        # After activation, visible queue drops by 1.0.
+        _l2(
+            seq=2,
+            local_ts_us=200,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(2.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+        _l2(
+            seq=3,
+            local_ts_us=300,
+            bid_ticks=(1001, 1000),
+            bid_sizes=(2.0, 1.0),
+            ask_ticks=(1002,),
+            ask_sizes=(1.0,),
+        ),
+    ]
+    trades = [
+        # This trade is before our order activation. It should not create a
+        # de-dup ledger entry because our order is not fillable yet.
+        _trade(
+            local_ts_us=150,
+            side=AggressorSide.SELL,
+            price_tick=1001,
+            amount=1.0,
+            source_row=0,
+        ),
+    ]
+    tape = _tape(l2_events, trades)
+
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 4], [100, 300]),
+        config=_env_config(
+            decision_interval_us=300,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=80,  # activation target = 180
+                cancel_latency_us=0,
+            ),
+            fill_simulator_config=FillSimulatorConfig(
+                queue_model=QueueModelConfig(
+                    mode=QueueModelMode.BALANCED,
+                    trade_at_level_weight=1.0,
+                    l2_decrease_weight=1.0,
+                    dedupe_l2_decrease_with_trade_prints=True,
+                ),
+                maker_fee_bps=0.0,
+            ),
+        ),
+    )
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert step.fills == ()
+    assert step.info["l2_trade_dedupe_qty"] == pytest.approx(0.0)
+    assert step.info["l2_raw_decrease_qty"] == pytest.approx(1.0)
+    assert step.info["l2_effective_decrease_qty"] == pytest.approx(1.0)
+
+    assert len(env._state.live_orders) == 1
+    order = env._state.live_orders[0]
+    assert order.price_tick == 1001
+    assert order.queue_ahead_qty == pytest.approx(2.0)
+
+
 def test_balanced_mode_trade_l2_dedupe_enabled_vs_disabled():
     l2_events = [
         _l2(
@@ -952,6 +1039,7 @@ def test_balanced_mode_trade_l2_dedupe_enabled_vs_disabled():
         ask_size_raw=0.0,
     ))
 
+    assert enabled_step.info["queue_trade_advance_qty"] > 0.0
     assert enabled_step.info["l2_trade_dedupe_qty"] == pytest.approx(0.5)
     assert enabled_step.info["l2_effective_decrease_qty"] == pytest.approx(0.0)
     assert disabled_step.info["l2_trade_dedupe_qty"] == pytest.approx(0.0)

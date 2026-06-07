@@ -588,6 +588,19 @@ class ExecutionEnv:
             elif fill.reason == FillReason.QUEUE_DEPLETION:
                 self._step_diag["queue_depletion_fill_count"] = int(self._step_diag["queue_depletion_fill_count"]) + 1
 
+    def _trade_l2_dedupe_qty_from_queue_updates(self, result) -> float:
+        """Return same-level trade quantity already applied to our simulated queue.
+
+        Only TRADE_AT_LEVEL queue updates should feed the L2 de-dup ledger.
+        Trade-through fills terminally consume the order and should not create
+        same-level L2 de-dup for future/pending orders.
+        """
+        total = 0.0
+        for update in result.queue_updates:
+            if update.trade_at_level:
+                total += update.trade_advance_qty + update.fillable_qty
+        return total
+
     def _build_observation(self) -> np.ndarray:
         state = self._require_state()
         book_top = self._current_book_top()
@@ -669,14 +682,23 @@ class ExecutionEnv:
             self._record_queue_updates(result)
             state.live_orders = _live_orders_tuple(result.orders)
             fills = result.fills
+            queue_config = self.config.fill_simulator_config.queue_model
+            dedupe_qty = self._trade_l2_dedupe_qty_from_queue_updates(result)
+
             level_side = None
             if trade.side == AggressorSide.SELL:
                 level_side = OrderSide.BUY
             elif trade.side == AggressorSide.BUY:
                 level_side = OrderSide.SELL
-            if level_side is not None:
+
+            if (
+                level_side is not None
+                and dedupe_qty > self.config.fill_simulator_config.qty_epsilon
+                and queue_config.mode == QueueModelMode.BALANCED
+                and queue_config.dedupe_l2_decrease_with_trade_prints
+            ):
                 key = (level_side, trade.price_tick)
-                self._recent_trade_depletion_by_level[key] = self._recent_trade_depletion_by_level.get(key, 0.0) + trade.amount * self.config.fill_simulator_config.queue_model.trade_at_level_weight
+                self._recent_trade_depletion_by_level[key] = self._recent_trade_depletion_by_level.get(key, 0.0) + dedupe_qty
         state.previous_event_local_ts_us = old_event_local
         state.event_index = event_index
         return fills
