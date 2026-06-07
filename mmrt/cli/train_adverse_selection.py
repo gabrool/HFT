@@ -15,8 +15,8 @@ from mmrt.execution.adverse_selection import (
     CounterfactualQuoteConfig,
     DEFAULT_QUOTE_CANDIDATES,
     QuoteCandidateConfig,
-    QuoteCandidateMode,
     KyleLambdaConfig,
+    quote_candidate_configs_from_names,
     VPINConfig,
     build_adverse_selection_dataset,
     summarize_adverse_selection_dataset,
@@ -152,42 +152,20 @@ def _parse_target_names(value: str | Sequence[str]) -> tuple[str, ...]:
     return tuple(_require_nonempty_str(part, f"target_names[{i}]") for i, part in enumerate(parts))
 
 
-def _candidate_from_token(token: str) -> QuoteCandidateConfig:
-    if token == "touch":
-        return QuoteCandidateConfig("touch", QuoteCandidateMode.TOUCH, 0)
-
-    for prefix, mode in (("inside_", QuoteCandidateMode.INSIDE), ("away_", QuoteCandidateMode.AWAY)):
-        if token.startswith(prefix):
-            suffix = token[len(prefix):]
-            try:
-                offset = int(suffix)
-            except ValueError as exc:
-                raise ValueError(f"malformed quote candidate {token!r}") from exc
-            try:
-                return QuoteCandidateConfig(token, mode, offset)
-            except ValueError as exc:
-                raise ValueError(f"malformed quote candidate {token!r}") from exc
-
-    raise ValueError(f"malformed quote candidate {token!r}")
-
-
 def _parse_quote_candidates(value: str | Sequence[QuoteCandidateConfig]) -> tuple[QuoteCandidateConfig, ...]:
     if isinstance(value, str):
         parts = [part.strip() for part in value.split(",")]
         if not parts or any(part == "" for part in parts):
             raise ValueError("quote_candidates must be a comma-separated non-empty list")
-        candidates = tuple(_candidate_from_token(part) for part in parts)
-    else:
-        if isinstance(value, (bytes, bytearray)):
-            raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig")
-        try:
-            candidates = tuple(value)
-        except TypeError as exc:
-            raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig") from exc
-
+        return quote_candidate_configs_from_names(parts)
+    if isinstance(value, (bytes, bytearray)):
+        raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig")
+    try:
+        candidates = tuple(value)
+    except TypeError as exc:
+        raise ValueError("quote_candidates must be a sequence of QuoteCandidateConfig") from exc
     if not candidates:
         raise ValueError("quote_candidates must be non-empty")
-
     seen: set[str] = set()
     for i, candidate in enumerate(candidates):
         if not isinstance(candidate, QuoteCandidateConfig):
@@ -195,9 +173,7 @@ def _parse_quote_candidates(value: str | Sequence[QuoteCandidateConfig]) -> tupl
         if candidate.name in seen:
             raise ValueError(f"duplicate quote candidate name {candidate.name!r}")
         seen.add(candidate.name)
-
     return candidates
-
 
 def _resolve_target_names(dataset, requested: tuple[str, ...] | str) -> tuple[str, ...]:
     if requested == "auto":
