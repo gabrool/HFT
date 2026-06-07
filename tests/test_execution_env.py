@@ -26,6 +26,7 @@ from mmrt.execution.env import (
     ExecutionEnvStep,
     action_array_to_continuous_action,
 )
+from mmrt.execution.adverse_signal import ADVERSE_SELECTION_SIGNALS_SCHEMA, AdverseSelectionSignalArtifact
 from mmrt.execution.fill_sim import FillSimulatorConfig
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -1211,3 +1212,89 @@ def test_l2_decrease_for_pending_new_only_level_not_counted_in_diagnostics():
     assert step.fills == ()
     assert step.info["l2_raw_decrease_qty"] == pytest.approx(0.0)
     assert step.info["l2_effective_decrease_qty"] == pytest.approx(0.0)
+
+
+def _aligned_adverse_signals(linear: LinearSignalArtifact, candidate_names=("touch", "inside_1", "away_1")) -> AdverseSelectionSignalArtifact:
+    target_names = []
+    predictions = {}
+    n_rows = linear.n_rows
+    for candidate in candidate_names:
+        for side in ("bid", "ask"):
+            fill_name = f"{side}_{candidate}_filled"
+            cost_name = f"{side}_{candidate}_toxic_cost_bps"
+            target_names.extend([fill_name, cost_name])
+            predictions[fill_name] = np.full(n_rows, 0.5, dtype=np.float32)
+            predictions[cost_name] = np.zeros(n_rows, dtype=np.float32)
+    return AdverseSelectionSignalArtifact(
+        schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+        decision_local_ts_us=linear.decision_local_ts_us.copy(),
+        decision_event_index=linear.decision_event_index.copy(),
+        decision_event_seq=np.full(n_rows, MAX_EVENT_SEQ, dtype=np.int64),
+        target_names=tuple(target_names),
+        predictions=predictions,
+    )
+
+
+def test_env_default_adverse_runtime_config_inherits_quote_geometry_post_only_gap():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
+        [],
+    )
+    linear = _linear_signals(tape, n_rows=3)
+    adverse = _aligned_adverse_signals(linear)
+    config = _env_config(
+        quote_geometry_config=QuoteGeometryConfig(post_only_gap_ticks=2, default_order_qty=1.0),
+        fill_simulator_config=FillSimulatorConfig(
+            queue_model=QueueModelConfig(
+                mode=QueueModelMode.BALANCED,
+                l2_decrease_weight=1.0,
+                trade_at_level_weight=1.0,
+            ),
+            maker_fee_bps=-0.25,
+        ),
+    )
+
+    env = ExecutionEnv(tape, linear_signals=linear, adverse_signals=adverse, config=config)
+
+    assert env.config.adverse_runtime_config is not None
+    assert env.config.adverse_runtime_config.post_only_gap_ticks == 2
+    assert env.config.adverse_runtime_config.executable_edge.maker_fee_bps == env.config.fill_simulator_config.maker_fee_bps
+
+    env.reset()
+    step = env.step(_disabled_action())
+    assert step.info["adverse_runtime_post_only_gap_ticks"] == 2
+
+
+def test_adverse_signals_do_not_change_fills_rewards_or_position_for_same_actions():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=200),
+        _l2(seq=2, local_ts_us=300),
+        _l2(seq=3, local_ts_us=400),
+    ]
+    trades = [
+        _trade(local_ts_us=150, side=AggressorSide.SELL, price_tick=1000, amount=2.0, source_row=0),
+        _trade(local_ts_us=250, side=AggressorSide.BUY, price_tick=1002, amount=2.0, source_row=1),
+    ]
+    tape = _tape(l2_events, trades)
+    linear = _linear_signals(tape, n_rows=4)
+    adverse = _aligned_adverse_signals(linear)
+
+    config = _env_config(max_episode_steps=3)
+    env_plain = ExecutionEnv(tape, linear_signals=linear, config=config)
+    env_adv = ExecutionEnv(tape, linear_signals=linear, adverse_signals=adverse, config=config)
+
+    env_plain.reset()
+    env_adv.reset()
+
+    actions = [_bid_only_action(), _ask_only_action(), _disabled_action()]
+    for action in actions:
+        plain_step = env_plain.step(action)
+        adv_step = env_adv.step(action)
+
+        assert plain_step.reward == pytest.approx(adv_step.reward)
+        assert plain_step.position == adv_step.position
+        assert [(f.side, f.local_ts_us, f.price_tick, f.qty) for f in plain_step.fills] == [
+            (f.side, f.local_ts_us, f.price_tick, f.qty) for f in adv_step.fills
+        ]
+        assert adv_step.info["adverse_signal_available"] is True

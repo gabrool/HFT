@@ -49,6 +49,7 @@ from mmrt.execution.adverse_runtime import (
     build_adverse_observation_features,
     build_executable_edge_observation_features,
 )
+from mmrt.execution.executable_edge import ExecutableEdgeConfig
 from mmrt.execution.adverse_signal import AdverseSelectionSignalArtifact, validate_adverse_signal_alignment
 from mmrt.execution.obs_builder import (
     ObservationBuilder,
@@ -243,7 +244,12 @@ class ExecutionEnv:
         self.tape = _require_tape(tape)
         explicit_default_schema = tuple(config.observation_schema.field_names) == tuple(DEFAULT_OBSERVATION_FIELDS)
         if adverse_signals is not None and config.adverse_runtime_config is None:
-            runtime_config = AdverseRuntimeConfig()
+            runtime_config = AdverseRuntimeConfig(
+                post_only_gap_ticks=config.quote_geometry_config.post_only_gap_ticks,
+                executable_edge=ExecutableEdgeConfig(
+                    maker_fee_bps=config.fill_simulator_config.maker_fee_bps,
+                ),
+            )
             config = replace(config, adverse_runtime_config=runtime_config)
         if adverse_signals is not None and explicit_default_schema:
             assert config.adverse_runtime_config is not None
@@ -533,6 +539,7 @@ class ExecutionEnv:
                     info[name] = value
             info["adverse_signal_available"] = True
             info["adverse_signal_row"] = row
+            info["adverse_runtime_post_only_gap_ticks"] = runtime_config.post_only_gap_ticks
         else:
             info["adverse_signal_available"] = False
 

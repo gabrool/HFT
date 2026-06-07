@@ -336,6 +336,7 @@ def _env_config_from_cli_config(
             maker_fee_bps=config.maker_fee_bps,
         ),
         adverse_runtime_config=AdverseRuntimeConfig(
+            post_only_gap_ticks=config.post_only_gap_ticks,
             executable_edge=ExecutableEdgeConfig(
                 maker_fee_bps=config.maker_fee_bps,
                 min_executable_edge_bps=config.edge_min_executable_edge_bps,
@@ -453,6 +454,7 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
             maker_fee_bps=maker_fee_bps,
         ),
         adverse_runtime_config=AdverseRuntimeConfig(
+            post_only_gap_ticks=post_only_gap_ticks,
             executable_edge=ExecutableEdgeConfig(
                 maker_fee_bps=maker_fee_bps,
                 min_executable_edge_bps=_require_finite_float(raw.get("edge_min_executable_edge_bps", 0.0), "edge_min_executable_edge_bps"),

@@ -316,6 +316,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
             maker_fee_bps=config.maker_fee_bps,
         ),
         adverse_runtime_config=AdverseRuntimeConfig(
+            post_only_gap_ticks=config.post_only_gap_ticks,
             executable_edge=ExecutableEdgeConfig(
                 maker_fee_bps=config.maker_fee_bps,
                 min_executable_edge_bps=config.edge_min_executable_edge_bps,
