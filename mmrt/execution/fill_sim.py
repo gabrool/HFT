@@ -20,7 +20,7 @@ from mmrt.execution.contracts import (
     TradePrint,
 )
 from mmrt.execution.queue_model import QueueModelConfig, QueueModelUpdate, update_queue_position
-from mmrt.time_key import EventKey
+from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
 
 _INF = float("inf")
@@ -176,6 +176,11 @@ def _is_post_only_safe(order: ActiveOrder, book_top: BookTop | None, post_only_g
     if order.side == OrderSide.SELL:
         return order.price_tick >= book_top.best_bid_tick + post_only_gap_ticks
     return False
+
+
+def _activation_key_after_cancel(cancel_key: EventKey) -> EventKey:
+    cancel_key = _require_event_key(cancel_key, "cancel_key")
+    return EventKey(cancel_key.local_ts_us, MAX_EVENT_SEQ)
 
 
 def request_cancel_live_orders(orders: Sequence[ActiveOrder], *, request_key: EventKey, cancel_effective_key: EventKey) -> tuple[ActiveOrder, ...]:
@@ -372,8 +377,10 @@ def sync_orders_to_quote(
             updated.append(cancelled_or_pending)
             if enabled:
                 old_cancel_key = cancelled_or_pending.cancel_effective_key
-                if old_cancel_key is not None and side_effective_keys[order.side] < old_cancel_key:
-                    side_effective_keys[order.side] = old_cancel_key
+                if old_cancel_key is not None:
+                    replacement_after_cancel_key = _activation_key_after_cancel(old_cancel_key)
+                    if side_effective_keys[order.side] < replacement_after_cancel_key:
+                        side_effective_keys[order.side] = replacement_after_cancel_key
 
     new_quote = QuoteIntent(
         bid_enabled=quote.bid_enabled and OrderSide.BUY not in preserved,
