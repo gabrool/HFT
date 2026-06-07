@@ -100,3 +100,33 @@ def test_load_adverse_selection_signals_rejects_missing_base_arrays(tmp_path):
     np.savez(path, schema=np.array(ADVERSE_SELECTION_SIGNALS_SCHEMA))
     with pytest.raises(ValueError, match="missing required arrays"):
         load_adverse_selection_signals(path)
+
+from mmrt.execution.adverse_selection import AdverseSelectionConfig, AdverseSelectionFeatureDataset
+from mmrt.execution.adverse_signal import build_adverse_selection_signal_artifact, validate_decision_grid_alignment
+
+
+def test_build_adverse_selection_signal_artifact_accepts_feature_dataset():
+    model = _artifact()
+    dataset = AdverseSelectionFeatureDataset(
+        decision_local_ts_us=np.array([100], dtype=np.int64),
+        decision_event_index=np.array([0], dtype=np.int64),
+        decision_event_seq=np.array([2**31 - 1], dtype=np.int64),
+        feature_names=("x",),
+        features=np.array([[1.0]], dtype=np.float32),
+        config=AdverseSelectionConfig(),
+    )
+    signals = build_adverse_selection_signal_artifact(dataset, model)
+    assert signals.decision_local_ts_us.tolist() == [100]
+
+
+def test_validate_decision_grid_alignment_rejects_mismatch():
+    grid = dict(
+        left_local_ts_us=np.array([100], dtype=np.int64),
+        left_event_index=np.array([0], dtype=np.int64),
+        left_event_seq=np.array([1], dtype=np.int64),
+        right_local_ts_us=np.array([101], dtype=np.int64),
+        right_event_index=np.array([0], dtype=np.int64),
+        right_event_seq=np.array([1], dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="first mismatch"):
+        validate_decision_grid_alignment(**grid, left_name="adverse_signals", right_name="linear_signals")

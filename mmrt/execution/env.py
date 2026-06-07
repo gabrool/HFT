@@ -43,13 +43,20 @@ from mmrt.execution.fill_sim import (
 )
 from mmrt.execution.contracts import LinearSignal
 from mmrt.execution.linear_signal import LinearSignalArtifact, linear_signal_at
+from mmrt.execution.adverse_runtime import (
+    AdverseRuntimeConfig,
+    adverse_predictions_for_row,
+    build_adverse_observation_features,
+    build_executable_edge_observation_features,
+)
+from mmrt.execution.adverse_signal import AdverseSelectionSignalArtifact, validate_adverse_signal_alignment
 from mmrt.execution.obs_builder import (
     ObservationBuilder,
     ObservationBuilderConfig,
     ObservationContext,
     ObservationInput,
 )
-from mmrt.execution.obs_schema import ObservationSchema, default_observation_schema
+from mmrt.execution.obs_schema import DEFAULT_OBSERVATION_FIELDS, ObservationSchema, default_observation_schema, execution_observation_schema
 from mmrt.execution.queue_model import QueueModelConfig, QueueModelMode, estimate_initial_queue_ahead
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 from mmrt.execution.quote_geometry import (
@@ -121,6 +128,7 @@ class ExecutionEnvConfig:
     observation_builder_config: ObservationBuilderConfig = field(default_factory=ObservationBuilderConfig)
     initial_position: PositionState = field(default_factory=PositionState)
     max_episode_steps: int | None = None
+    adverse_runtime_config: AdverseRuntimeConfig | None = None
 
     def __post_init__(self) -> None:
         _require_positive_int(self.decision_interval_us, "decision_interval_us")
@@ -140,6 +148,8 @@ class ExecutionEnvConfig:
             raise ValueError("observation_builder_config must be ObservationBuilderConfig")
         _require_position(self.initial_position)
         object.__setattr__(self, "max_episode_steps", _optional_positive_int(self.max_episode_steps, "max_episode_steps"))
+        if self.adverse_runtime_config is not None and not isinstance(self.adverse_runtime_config, AdverseRuntimeConfig):
+            raise ValueError("adverse_runtime_config must be None or AdverseRuntimeConfig")
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,9 +237,25 @@ class ExecutionEnv:
         tape: ExecutionTape,
         *,
         linear_signals: LinearSignalArtifact,
+        adverse_signals: AdverseSelectionSignalArtifact | None = None,
         config: ExecutionEnvConfig = ExecutionEnvConfig(),
     ) -> None:
         self.tape = _require_tape(tape)
+        explicit_default_schema = tuple(config.observation_schema.field_names) == tuple(DEFAULT_OBSERVATION_FIELDS)
+        if adverse_signals is not None and config.adverse_runtime_config is None:
+            runtime_config = AdverseRuntimeConfig()
+            config = replace(config, adverse_runtime_config=runtime_config)
+        if adverse_signals is not None and explicit_default_schema:
+            assert config.adverse_runtime_config is not None
+            config = replace(
+                config,
+                observation_schema=execution_observation_schema(
+                    dtype=config.observation_schema.dtype,
+                    include_adverse_selection=True,
+                    include_executable_edge=True,
+                    candidate_names=config.adverse_runtime_config.candidate_names,
+                ),
+            )
         self.config = _require_config(config)
         if not isinstance(linear_signals, LinearSignalArtifact):
             raise ValueError("linear_signals must be LinearSignalArtifact")
@@ -238,6 +264,17 @@ class ExecutionEnv:
         if config.max_episode_steps is not None and linear_signals.n_rows < config.max_episode_steps + 1:
             raise ValueError("linear_signals must contain at least max_episode_steps + 1 rows")
         self.linear_signals = linear_signals
+        if adverse_signals is not None:
+            if not isinstance(adverse_signals, AdverseSelectionSignalArtifact):
+                raise ValueError("adverse_signals must be AdverseSelectionSignalArtifact")
+            validate_adverse_signal_alignment(
+                adverse_signals,
+                decision_local_ts_us=linear_signals.decision_local_ts_us,
+                decision_event_index=linear_signals.decision_event_index,
+                decision_event_seq=np.full(linear_signals.n_rows, MAX_EVENT_SEQ, dtype=np.int64),
+                right_name="linear_signals",
+            )
+        self.adverse_signals = adverse_signals
         self.observation_builder = ObservationBuilder(
             schema=config.observation_schema,
             config=config.observation_builder_config,
@@ -478,6 +515,27 @@ class ExecutionEnv:
             "order_entry_latency_us": self.config.latency_config.order_entry_latency_us,
             "cancel_latency_us": self.config.latency_config.cancel_latency_us,
         }
+        if self.adverse_signals is not None:
+            row = state.step_index - 1
+            runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
+            predictions = adverse_predictions_for_row(self.adverse_signals, row)
+            edge_features = build_executable_edge_observation_features(
+                predictions=predictions,
+                candidate_names=runtime_config.candidate_names,
+                best_bid_tick=previous_book_top.best_bid_tick,
+                best_ask_tick=previous_book_top.best_ask_tick,
+                linear_signal=linear_signal_at(self.linear_signals.arrays, row),
+                inventory_qty=previous_position.inventory_qty,
+                config=runtime_config,
+            )
+            for name, value in edge_features.items():
+                if name.endswith("_attempt_bps") or name.endswith("_valid"):
+                    info[name] = value
+            info["adverse_signal_available"] = True
+            info["adverse_signal_row"] = row
+        else:
+            info["adverse_signal_available"] = False
+
         execution = ExecutionStepResult(
             reward=reward_step.reward,
             position=reward_step.position,
@@ -628,9 +686,47 @@ class ExecutionEnv:
                 expected_event_index=state.event_index,
                 expected_local_ts_us=book_top.local_ts_us,
             ),
+            adverse_features=self._adverse_observation_features_for_step(state.step_index, book_top),
+            executable_edge_features=self._edge_observation_features_for_step(state.step_index, book_top),
             context=context,
         )
         return self.observation_builder.build(inputs, out=self._obs_buffer)
+
+
+    def _adverse_predictions_for_step(self, step_index: int) -> dict[str, float] | None:
+        if self.adverse_signals is None:
+            return None
+        return adverse_predictions_for_row(self.adverse_signals, step_index)
+
+    def _adverse_observation_features_for_step(self, step_index: int, book_top: BookTop) -> dict[str, float]:
+        predictions = self._adverse_predictions_for_step(step_index)
+        if predictions is None:
+            return {}
+        runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
+        return build_adverse_observation_features(
+            predictions=predictions,
+            candidate_names=runtime_config.candidate_names,
+        )
+
+    def _edge_observation_features_for_step(self, step_index: int, book_top: BookTop) -> dict[str, float]:
+        predictions = self._adverse_predictions_for_step(step_index)
+        if predictions is None:
+            return {}
+        runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
+        linear_signal = self._linear_signal_for_step(
+            step_index,
+            expected_event_index=self._require_state().event_index,
+            expected_local_ts_us=book_top.local_ts_us,
+        )
+        return build_executable_edge_observation_features(
+            predictions=predictions,
+            candidate_names=runtime_config.candidate_names,
+            best_bid_tick=book_top.best_bid_tick,
+            best_ask_tick=book_top.best_ask_tick,
+            linear_signal=linear_signal,
+            inventory_qty=self._require_state().position.inventory_qty,
+            config=runtime_config,
+        )
 
     def _linear_signal_for_step(
         self,

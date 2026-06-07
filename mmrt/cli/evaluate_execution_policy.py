@@ -12,6 +12,9 @@ import torch
 
 from mmrt.execution.contracts import ActionSpec, LatencyConfig, PositionState, QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
+from mmrt.execution.adverse_runtime import AdverseRuntimeConfig
+from mmrt.execution.adverse_signal import load_adverse_selection_signals
+from mmrt.execution.executable_edge import ExecutableEdgeConfig
 from mmrt.execution.execution_tape import load_execution_tape
 from mmrt.execution.fill_sim import FillSimulatorConfig
 from mmrt.execution.linear_signal import (
@@ -161,6 +164,7 @@ class ExecutionPolicyEvaluationCLIConfig:
     checkpoint_path: str
     output_json: str | None = None
     linear_signals_npz: str | None = None
+    adverse_signals_npz: str | None = None
     overwrite: bool = False
     mmap_mode: str | None = "r"
 
@@ -179,6 +183,9 @@ class ExecutionPolicyEvaluationCLIConfig:
     dedupe_l2_decrease_with_trade_prints: bool = True
 
     maker_fee_bps: float = -0.5
+    edge_min_executable_edge_bps: float = 0.0
+    edge_latency_buffer_bps: float = 0.0
+    edge_inventory_skew_bps_per_unit: float = 0.0
 
     decision_compute_latency_us: int = 50
     order_entry_latency_us: int = 500
@@ -207,6 +214,8 @@ class ExecutionPolicyEvaluationCLIConfig:
             _require_nonempty_str(self.output_json, "output_json")
         if self.linear_signals_npz is not None:
             _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
+        if self.adverse_signals_npz is not None:
+            _require_nonempty_str(self.adverse_signals_npz, "adverse_signals_npz")
         _require_bool(self.overwrite, "overwrite")
         if self.mmap_mode not in (None, "r"):
             raise ValueError('mmap_mode must be None or "r"')
@@ -226,6 +235,9 @@ class ExecutionPolicyEvaluationCLIConfig:
         )
         _require_bool(self.dedupe_l2_decrease_with_trade_prints, "dedupe_l2_decrease_with_trade_prints")
         _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
+        _require_finite_float(self.edge_min_executable_edge_bps, "edge_min_executable_edge_bps")
+        _require_nonnegative_float(self.edge_latency_buffer_bps, "edge_latency_buffer_bps")
+        _require_finite_float(self.edge_inventory_skew_bps_per_unit, "edge_inventory_skew_bps_per_unit")
         _require_nonnegative_int(self.decision_compute_latency_us, "decision_compute_latency_us")
         _require_nonnegative_int(self.order_entry_latency_us, "order_entry_latency_us")
         _require_nonnegative_int(self.cancel_latency_us, "cancel_latency_us")
@@ -258,6 +270,7 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "checkpoint_path": config.checkpoint_path,
         "output_json": config.output_json,
         "linear_signals_npz": config.linear_signals_npz,
+        "adverse_signals_npz": config.adverse_signals_npz,
         "overwrite": config.overwrite,
         "mmap_mode": config.mmap_mode,
         "decision_interval_us": config.decision_interval_us,
@@ -272,6 +285,9 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
         "dedupe_l2_decrease_with_trade_prints": config.dedupe_l2_decrease_with_trade_prints,
         "maker_fee_bps": config.maker_fee_bps,
+        "edge_min_executable_edge_bps": config.edge_min_executable_edge_bps,
+        "edge_latency_buffer_bps": config.edge_latency_buffer_bps,
+        "edge_inventory_skew_bps_per_unit": config.edge_inventory_skew_bps_per_unit,
         "decision_compute_latency_us": config.decision_compute_latency_us,
         "order_entry_latency_us": config.order_entry_latency_us,
         "cancel_latency_us": config.cancel_latency_us,
@@ -319,6 +335,14 @@ def _env_config_from_cli_config(
             ),
             maker_fee_bps=config.maker_fee_bps,
         ),
+        adverse_runtime_config=AdverseRuntimeConfig(
+            executable_edge=ExecutableEdgeConfig(
+                maker_fee_bps=config.maker_fee_bps,
+                min_executable_edge_bps=config.edge_min_executable_edge_bps,
+                latency_buffer_bps=config.edge_latency_buffer_bps,
+                inventory_skew_bps_per_unit=config.edge_inventory_skew_bps_per_unit,
+            ),
+        ) if config.adverse_signals_npz is not None else None,
         reward_config=RewardConfig(
             inventory_penalty_bps=config.inventory_penalty_bps,
             turnover_penalty_bps=config.turnover_penalty_bps,
@@ -428,6 +452,14 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
             ),
             maker_fee_bps=maker_fee_bps,
         ),
+        adverse_runtime_config=AdverseRuntimeConfig(
+            executable_edge=ExecutableEdgeConfig(
+                maker_fee_bps=maker_fee_bps,
+                min_executable_edge_bps=_require_finite_float(raw.get("edge_min_executable_edge_bps", 0.0), "edge_min_executable_edge_bps"),
+                latency_buffer_bps=_require_nonnegative_float(raw.get("edge_latency_buffer_bps", 0.0), "edge_latency_buffer_bps"),
+                inventory_skew_bps_per_unit=_require_finite_float(raw.get("edge_inventory_skew_bps_per_unit", 0.0), "edge_inventory_skew_bps_per_unit"),
+            ),
+        ) if raw.get("adverse_signals_npz") is not None else None,
         reward_config=RewardConfig(
             inventory_penalty_bps=inventory_penalty_bps,
             turnover_penalty_bps=turnover_penalty_bps,
@@ -606,6 +638,7 @@ def run_execution_policy_evaluation(
         else _default_linear_signals_npz(config.tape_root)
     )
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
+    adverse_signals = load_adverse_selection_signals(config.adverse_signals_npz) if config.adverse_signals_npz is not None else None
 
     checkpoint_cli_config: Mapping[str, object] | None = None
 
@@ -637,7 +670,7 @@ def run_execution_policy_evaluation(
         min_rows=(env_config.max_episode_steps + 1) if env_config.max_episode_steps is not None else None,
     )
 
-    env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals)
+    env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals, adverse_signals=adverse_signals)
     checkpoint_schema = checkpoint.get("observation_schema")
     if checkpoint_schema is None:
         raise ValueError("checkpoint missing observation_schema")
@@ -735,6 +768,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--linear-signals-npz",
         help="Canonical no-move-gated linear signal NPZ. Defaults to <tape-root>/linear_signals.npz. Required; missing file is an error.",
     )
+    parser.add_argument("--adverse-signals-npz")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
 
@@ -754,6 +788,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable de-duplication of L2 visible decreases already explained by same-level trade prints.",
     )
     parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
+    parser.add_argument("--edge-min-executable-edge-bps", type=float, default=0.0)
+    parser.add_argument("--edge-latency-buffer-bps", type=float, default=0.0)
+    parser.add_argument("--edge-inventory-skew-bps-per-unit", type=float, default=0.0)
     parser.add_argument("--decision-compute-latency-us", type=int, default=50)
     parser.add_argument("--order-entry-latency-us", type=int, default=500)
     parser.add_argument("--cancel-latency-us", type=int, default=500)
@@ -781,6 +818,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         checkpoint_path=args.checkpoint_path,
         output_json=args.output_json,
         linear_signals_npz=args.linear_signals_npz,
+        adverse_signals_npz=args.adverse_signals_npz,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
         decision_interval_us=args.decision_interval_us,
@@ -795,6 +833,9 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
         dedupe_l2_decrease_with_trade_prints=not args.no_dedupe_l2_decrease_with_trade_prints,
         maker_fee_bps=args.maker_fee_bps,
+        edge_min_executable_edge_bps=args.edge_min_executable_edge_bps,
+        edge_latency_buffer_bps=args.edge_latency_buffer_bps,
+        edge_inventory_skew_bps_per_unit=args.edge_inventory_skew_bps_per_unit,
         decision_compute_latency_us=args.decision_compute_latency_us,
         order_entry_latency_us=args.order_entry_latency_us,
         cancel_latency_us=args.cancel_latency_us,

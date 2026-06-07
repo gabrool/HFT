@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 
@@ -11,8 +11,8 @@ import numpy as np
 
 from mmrt.execution.adverse_selection import (
     adverse_selection_config_from_training_summary,
-    build_adverse_selection_dataset,
-    summarize_adverse_selection_dataset,
+    build_adverse_selection_feature_dataset,
+    summarize_adverse_selection_feature_dataset,
 )
 from mmrt.execution.adverse_signal import (
     ADVERSE_SELECTION_SIGNALS_FILENAME,
@@ -50,6 +50,10 @@ class BuildAdverseSelectionSignalsConfig:
     output_json: str | None = None
     overwrite: bool = False
     mmap_mode: str | None = "r"
+    decision_interval_us: int | None = None
+    start_event_index: int | None = None
+    max_decisions: int | None = None
+    use_model_range: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
@@ -61,6 +65,13 @@ class BuildAdverseSelectionSignalsConfig:
         object.__setattr__(self, "overwrite", _require_bool(self.overwrite, "overwrite"))
         if self.mmap_mode not in (None, "r"):
             raise ValueError("mmap_mode must be None or 'r'")
+        if self.decision_interval_us is not None and (isinstance(self.decision_interval_us, bool) or not isinstance(self.decision_interval_us, int) or self.decision_interval_us <= 0):
+            raise ValueError("decision_interval_us must be None or a positive int")
+        if self.start_event_index is not None and (isinstance(self.start_event_index, bool) or not isinstance(self.start_event_index, int) or self.start_event_index < 0):
+            raise ValueError("start_event_index must be None or a nonnegative int")
+        if self.max_decisions is not None and (isinstance(self.max_decisions, bool) or not isinstance(self.max_decisions, int) or self.max_decisions <= 0):
+            raise ValueError("max_decisions must be None or a positive int")
+        object.__setattr__(self, "use_model_range", _require_bool(self.use_model_range, "use_model_range"))
 
 
 def _default_output_npz(tape_root: str) -> Path:
@@ -98,8 +109,21 @@ def build_adverse_selection_signals_from_config(
         raise ValueError("adverse-selection model exchange/symbol must match execution tape")
 
     payload = json.loads(model.config_json)
-    adverse_config = adverse_selection_config_from_training_summary(payload)
-    dataset = build_adverse_selection_dataset(tape, config=adverse_config)
+    model_config = adverse_selection_config_from_training_summary(payload)
+    if config.use_model_range:
+        start_event_index = model_config.start_event_index
+        max_decisions = model_config.max_decisions
+    else:
+        start_event_index = config.start_event_index
+        max_decisions = config.max_decisions
+    decision_interval_us = config.decision_interval_us if config.decision_interval_us is not None else model_config.decision_interval_us
+    adverse_config = replace(
+        model_config,
+        decision_interval_us=decision_interval_us,
+        start_event_index=start_event_index,
+        max_decisions=max_decisions,
+    )
+    dataset = build_adverse_selection_feature_dataset(tape, config=adverse_config)
     if tuple(dataset.feature_names) != tuple(model.feature_names):
         raise ValueError("dataset feature_names must match model feature_names exactly")
     signals = build_adverse_selection_signal_artifact(dataset, model)
@@ -133,7 +157,13 @@ def build_adverse_selection_signals_from_config(
                 for target, arr in signals.predictions.items()
             },
         },
-        "dataset": summarize_adverse_selection_dataset(dataset),
+        "inference_range": {
+            "decision_interval_us": adverse_config.decision_interval_us,
+            "start_event_index": adverse_config.start_event_index,
+            "max_decisions": adverse_config.max_decisions,
+            "use_model_range": config.use_model_range,
+        },
+        "features": summarize_adverse_selection_feature_dataset(dataset),
     }
     _write_json_atomic(output_json, summary, overwrite=config.overwrite)
     return summary
@@ -147,6 +177,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
+    parser.add_argument("--decision-interval-us", type=int)
+    parser.add_argument("--start-event-index", type=int)
+    parser.add_argument("--max-decisions", type=int)
+    parser.add_argument(
+        "--use-model-range",
+        action="store_true",
+        help="Use start_event_index/max_decisions stored in the training model config instead of full-tape signal generation.",
+    )
     return parser
 
 
@@ -158,6 +196,10 @@ def _config_from_args(args: argparse.Namespace) -> BuildAdverseSelectionSignalsC
         output_json=args.output_json,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
+        decision_interval_us=args.decision_interval_us,
+        start_event_index=args.start_event_index,
+        max_decisions=args.max_decisions,
+        use_model_range=args.use_model_range,
     )
 
 

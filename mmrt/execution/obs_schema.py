@@ -19,6 +19,8 @@ POSITION_GROUP = "position"
 ORDERS_GROUP = "orders"
 FILLS_GROUP = "fills"
 TIME_GROUP = "time"
+ADVERSE_SELECTION_GROUP = "adverse_selection"
+EXECUTABLE_EDGE_GROUP = "executable_edge"
 
 DEFAULT_OBSERVATION_DTYPE = "float32"
 ALLOWED_OBSERVATION_DTYPES = ("float32", "float64")
@@ -92,6 +94,8 @@ TIME_FIELDS = (
     "local_time_since_start_s",
     "time_since_last_event_ms",
 )
+
+DEFAULT_ADVERSE_CANDIDATE_NAMES = ("touch", "inside_1", "away_1")
 
 DEFAULT_OBSERVATION_FIELDS = (
     *MARKET_FIELDS,
@@ -167,6 +171,71 @@ def _field_names_tuple(values: Any) -> tuple[str, ...]:
     return names
 
 
+
+def adverse_selection_fields(
+    candidate_names: Sequence[str] = DEFAULT_ADVERSE_CANDIDATE_NAMES,
+) -> tuple[str, ...]:
+    fields: list[str] = []
+    for c in candidate_names:
+        fields.extend((
+            f"adverse_bid_{c}_fill_prob",
+            f"adverse_ask_{c}_fill_prob",
+            f"adverse_bid_{c}_cost_bps",
+            f"adverse_ask_{c}_cost_bps",
+            f"adverse_bid_{c}_valid",
+            f"adverse_ask_{c}_valid",
+        ))
+    return tuple(fields)
+
+
+def executable_edge_fields(
+    candidate_names: Sequence[str] = DEFAULT_ADVERSE_CANDIDATE_NAMES,
+) -> tuple[str, ...]:
+    fields: list[str] = []
+    for c in candidate_names:
+        fields.extend((
+            f"edge_bid_{c}_attempt_bps",
+            f"edge_ask_{c}_attempt_bps",
+            f"edge_bid_{c}_cond_fill_bps",
+            f"edge_ask_{c}_cond_fill_bps",
+            f"edge_bid_{c}_allowed",
+            f"edge_ask_{c}_allowed",
+            f"edge_bid_{c}_valid",
+            f"edge_ask_{c}_valid",
+        ))
+    return tuple(fields)
+
+
+def execution_observation_fields(
+    *,
+    include_adverse_selection: bool = False,
+    include_executable_edge: bool = False,
+    candidate_names: Sequence[str] = DEFAULT_ADVERSE_CANDIDATE_NAMES,
+) -> tuple[str, ...]:
+    fields = list(DEFAULT_OBSERVATION_FIELDS)
+    if include_adverse_selection:
+        fields.extend(adverse_selection_fields(candidate_names))
+    if include_executable_edge:
+        fields.extend(executable_edge_fields(candidate_names))
+    return tuple(fields)
+
+
+def execution_observation_schema(
+    *,
+    dtype: str = DEFAULT_OBSERVATION_DTYPE,
+    include_adverse_selection: bool = False,
+    include_executable_edge: bool = False,
+    candidate_names: Sequence[str] = DEFAULT_ADVERSE_CANDIDATE_NAMES,
+) -> ObservationSchema:
+    return ObservationSchema(
+        field_names=execution_observation_fields(
+            include_adverse_selection=include_adverse_selection,
+            include_executable_edge=include_executable_edge,
+            candidate_names=candidate_names,
+        ),
+        dtype=dtype,
+    )
+
 def default_observation_schema(dtype: str = DEFAULT_OBSERVATION_DTYPE) -> ObservationSchema:
     return ObservationSchema(dtype=dtype)
 
@@ -179,6 +248,8 @@ def observation_field_groups() -> dict[str, tuple[str, ...]]:
         ORDERS_GROUP: ORDERS_FIELDS,
         FILLS_GROUP: FILLS_FIELDS,
         TIME_GROUP: TIME_FIELDS,
+        ADVERSE_SELECTION_GROUP: adverse_selection_fields(),
+        EXECUTABLE_EDGE_GROUP: executable_edge_fields(),
     }
 
 
@@ -207,6 +278,9 @@ __all__ = [
     "ORDERS_GROUP",
     "FILLS_GROUP",
     "TIME_GROUP",
+    "ADVERSE_SELECTION_GROUP",
+    "EXECUTABLE_EDGE_GROUP",
+    "DEFAULT_ADVERSE_CANDIDATE_NAMES",
     "DEFAULT_OBSERVATION_DTYPE",
     "ALLOWED_OBSERVATION_DTYPES",
     "MARKET_FIELDS",
@@ -217,6 +291,10 @@ __all__ = [
     "TIME_FIELDS",
     "DEFAULT_OBSERVATION_FIELDS",
     "ObservationSchema",
+    "adverse_selection_fields",
+    "executable_edge_fields",
+    "execution_observation_fields",
+    "execution_observation_schema",
     "default_observation_schema",
     "observation_field_groups",
     "validate_observation_vector",
