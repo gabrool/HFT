@@ -1,3 +1,4 @@
+from pathlib import Path
 import subprocess
 import sys
 
@@ -108,6 +109,68 @@ def test_no_inactive_book_feature_computation_remains():
     for token in forbidden:
         assert token not in src
 
+
+
+
+def test_fill_book_features_uses_cached_window_helpers_only():
+    source = Path("mmrt/features/book_state.py").read_text(encoding="utf-8")
+    body = source.split("def fill_book_features", 1)[1].split("def book_owned_feature_names", 1)[0]
+
+    forbidden = (
+        "self._rolling_sum(",
+        "self._rolling_mean(",
+        "self._rolling_slope_per_sec(",
+        "self._rolling_mid_slope_bps_per_sec(",
+        "self._rolling_update_rate(",
+        "self._rolling_count(",
+        "self._rolling_realized_vol_bps(",
+        "self._zero_cross_rate(",
+    )
+    offenders = [token for token in forbidden if token in body]
+    assert offenders == []
+
+
+def test_cached_book_feature_values_for_ask_depletion_and_churn():
+    st = bs.BookState()
+    st.apply_snapshot(make_snapshot(local_ts_us=1_000_000, bid_sz0=10.0, ask_sz0=20.0))
+    st.apply_snapshot(make_snapshot(local_ts_us=1_200_000, bid_sz0=12.0, ask_sz0=15.0))
+    st.apply_snapshot(make_snapshot(local_ts_us=1_400_000, bid_sz0=9.0, ask_sz0=18.0))
+
+    out = np.zeros(FEATURE_COUNT, dtype=np.float64)
+    st.fill_book_features(out)
+
+    ask_rem = st.history.values_in_window("ask_l1_rem", st.last_local_ts_us, bs.WINDOW_1000MS_US)
+    bid_add = st.history.values_in_window("bid_l1_add", st.last_local_ts_us, bs.WINDOW_1000MS_US)
+    bid_rem = st.history.values_in_window("bid_l1_rem", st.last_local_ts_us, bs.WINDOW_1000MS_US)
+    ask_add = st.history.values_in_window("ask_l1_add", st.last_local_ts_us, bs.WINDOW_1000MS_US)
+    depth_values = st.history.values_in_window("total_depth_1bps_size", st.last_local_ts_us, bs.WINDOW_1000MS_US)
+
+    ask_depth_1bps = max(st._depth_size_within_bps("ask", 1.0), bs.FLOAT_EPS)
+    mean_depth = max(float(np.mean(depth_values)) if depth_values.size else 0.0, bs.FLOAT_EPS)
+
+    expected_ask_depletion = float(np.sum(ask_rem)) / ask_depth_1bps
+    expected_churn = (
+        float(np.sum(bid_add))
+        + float(np.sum(bid_rem))
+        + float(np.sum(ask_add))
+        + float(np.sum(ask_rem))
+    ) / mean_depth
+
+    assert fv_value(out, "ask_l1_depletion_over_depth_1000000us") == pytest.approx(expected_ask_depletion)
+    assert fv_value(out, "l1_churn_over_depth_1000000us") == pytest.approx(expected_churn)
+
+
+def test_book_state_touched_sections_are_not_semicolon_dense():
+    source = Path("mmrt/features/book_state.py").read_text(encoding="utf-8")
+    body = source.split("class BookSummary", 1)[1].split("__all__", 1)[0]
+    offenders = []
+    for lineno, line in enumerate(body.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ";" in stripped:
+            offenders.append((lineno, stripped))
+    assert offenders == []
 
 def test_book_history_append_requires_exact_active_fields():
     h = bs.BookHistory(capacity=4)

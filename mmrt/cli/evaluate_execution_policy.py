@@ -309,7 +309,6 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
 def _env_config_from_cli_config(
     config: ExecutionPolicyEvaluationCLIConfig,
 ) -> ExecutionEnvConfig:
-    # Shared builder propagates post_only_gap_ticks=config.post_only_gap_ticks.
     return build_execution_env_config_from_attrs(
         config,
         adverse_signals_enabled=config.adverse_signals_npz is not None,

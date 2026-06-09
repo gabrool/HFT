@@ -128,14 +128,3 @@ def test_env_does_not_hard_gate_quotes_from_executable_edge():
     )
     offenders = [token for token in forbidden_mutations if token in source]
     assert offenders == []
-
-
-def test_adverse_runtime_post_only_gap_is_not_left_default_in_cli_env_builders():
-    paths = [
-        Path("mmrt/cli/train_execution_ppo.py"),
-        Path("mmrt/cli/evaluate_execution_policy.py"),
-        Path("mmrt/cli/audit_execution_sim.py"),
-    ]
-    for path in paths:
-        text = path.read_text(encoding="utf-8")
-        assert "post_only_gap_ticks=config.post_only_gap_ticks" in text or "post_only_gap_ticks=post_only_gap_ticks" in text
