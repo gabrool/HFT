@@ -491,6 +491,7 @@ def test_parser_dedupe_l2_trade_default_enabled():
     assert config.dedupe_l2_decrease_with_trade_prints is True
 
 
-def test_audit_adverse_runtime_config_uses_post_only_gap_source_guard():
+def test_audit_env_config_uses_shared_builder_source_guard():
     source = Path("mmrt/cli/audit_execution_sim.py").read_text(encoding="utf-8")
-    assert "post_only_gap_ticks=config.post_only_gap_ticks" in source
+    assert "build_execution_env_config_from_attrs" in source
+    assert "AdverseRuntimeConfig(" not in source

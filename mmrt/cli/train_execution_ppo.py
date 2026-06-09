@@ -498,7 +498,6 @@ def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingCon
     )
 
 def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
-    # Shared builder propagates post_only_gap_ticks=config.post_only_gap_ticks.
     return build_execution_env_config_from_attrs(
         config,
         adverse_signals_enabled=config.adverse_signals_npz is not None,

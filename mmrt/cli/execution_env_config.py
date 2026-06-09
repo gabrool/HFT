@@ -62,6 +62,13 @@ def _require_nonnegative_float(value: float, name: str) -> float:
     return out
 
 
+def _require_probability(value: float, name: str) -> float:
+    out = _require_finite_float(value, name)
+    if out < 0.0 or out > 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    return out
+
+
 def _coerce_queue_mode(value: QueueModelMode | str) -> QueueModelMode:
     if isinstance(value, QueueModelMode):
         return value
@@ -114,8 +121,8 @@ class ExecutionEnvConfigBuildInput:
         object.__setattr__(self, "max_order_qty", _require_positive_float(self.max_order_qty, "max_order_qty"))
         object.__setattr__(self, "default_order_qty", _require_positive_float(self.default_order_qty, "default_order_qty"))
         object.__setattr__(self, "queue_mode", _coerce_queue_mode(self.queue_mode))
-        object.__setattr__(self, "l2_decrease_weight", _require_nonnegative_float(self.l2_decrease_weight, "l2_decrease_weight"))
-        object.__setattr__(self, "trade_at_level_weight", _require_nonnegative_float(self.trade_at_level_weight, "trade_at_level_weight"))
+        object.__setattr__(self, "l2_decrease_weight", _require_probability(self.l2_decrease_weight, "l2_decrease_weight"))
+        object.__setattr__(self, "trade_at_level_weight", _require_probability(self.trade_at_level_weight, "trade_at_level_weight"))
         object.__setattr__(self, "unknown_level_queue_ahead_qty", _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty"))
         object.__setattr__(self, "dedupe_l2_decrease_with_trade_prints", _require_bool(self.dedupe_l2_decrease_with_trade_prints, "dedupe_l2_decrease_with_trade_prints"))
         object.__setattr__(self, "maker_fee_bps", _require_finite_float(self.maker_fee_bps, "maker_fee_bps"))

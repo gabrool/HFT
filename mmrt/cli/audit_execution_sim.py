@@ -287,7 +287,6 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         start_event_index=_effective_start_event_index(config.start_event_index),
         min_rows=(config.max_steps + 1) if config.max_steps is not None else None,
     )
-    # Shared builder propagates post_only_gap_ticks=config.post_only_gap_ticks.
     env_config = build_execution_env_config_from_attrs(
         config,
         adverse_signals_enabled=config.adverse_signals_npz is not None,
