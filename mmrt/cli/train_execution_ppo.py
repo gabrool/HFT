@@ -6,26 +6,21 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import torch
 
-from mmrt.execution.contracts import ActionSpec, LatencyConfig, PositionState, QueueModelMode
+from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
-from mmrt.execution.adverse_runtime import AdverseRuntimeConfig
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
-from mmrt.execution.executable_edge import ExecutableEdgeConfig
 from mmrt.execution.execution_tape import load_execution_tape
-from mmrt.execution.fill_sim import FillSimulatorConfig
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
     load_linear_signal_artifact_npz,
     linear_signal_artifact_summary,
     validate_linear_signal_artifact_metadata,
 )
-from mmrt.execution.queue_model import QueueModelConfig
-from mmrt.execution.quote_geometry import QuoteGeometryConfig
-from mmrt.execution.reward import RewardConfig
+from mmrt.cli.execution_env_config import build_execution_env_config_from_attrs
 from mmrt.rl.normalization import ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.rollout import RolloutConfig
@@ -416,113 +411,18 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
     }
 
 
-def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
-    return ExecutionEnvConfig(
-        decision_interval_us=config.decision_interval_us,
-        action_spec=ActionSpec(
-            max_distance_ticks=config.max_distance_ticks,
-            max_order_qty=config.max_order_qty,
-        ),
-        quote_geometry_config=QuoteGeometryConfig(
-            post_only_gap_ticks=config.post_only_gap_ticks,
-            default_order_qty=config.default_order_qty,
-        ),
-        latency_config=LatencyConfig(
-            decision_compute_latency_us=config.decision_compute_latency_us,
-            order_entry_latency_us=config.order_entry_latency_us,
-            cancel_latency_us=config.cancel_latency_us,
-        ),
-        fill_simulator_config=FillSimulatorConfig(
-            queue_model=QueueModelConfig(
-                mode=config.queue_mode,
-                l2_decrease_weight=config.l2_decrease_weight,
-                trade_at_level_weight=config.trade_at_level_weight,
-                unknown_level_queue_ahead_qty=config.unknown_level_queue_ahead_qty,
-                dedupe_l2_decrease_with_trade_prints=config.dedupe_l2_decrease_with_trade_prints,
-            ),
-            maker_fee_bps=config.maker_fee_bps,
-        ),
-        adverse_runtime_config=AdverseRuntimeConfig(
-            post_only_gap_ticks=config.post_only_gap_ticks,
-            executable_edge=ExecutableEdgeConfig(
-                maker_fee_bps=config.maker_fee_bps,
-                min_executable_edge_bps=config.edge_min_executable_edge_bps,
-                latency_buffer_bps=config.edge_latency_buffer_bps,
-                inventory_skew_bps_per_unit=config.edge_inventory_skew_bps_per_unit,
-            ),
-        ) if config.adverse_signals_npz is not None else None,
-        reward_config=RewardConfig(
-            inventory_penalty_bps=config.inventory_penalty_bps,
-            turnover_penalty_bps=config.turnover_penalty_bps,
-            cancel_penalty=config.cancel_penalty,
-            drawdown_penalty_rate=config.drawdown_penalty_rate,
-            terminal_inventory_penalty_bps=config.terminal_inventory_penalty_bps,
-            reward_scale=config.reward_scale,
-        ),
-        initial_position=PositionState(),
-        max_episode_steps=config.max_episode_steps,
-    )
+def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
-def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingConfig:
-    network_config = ActorCriticConfig(
-        hidden_sizes=config.hidden_sizes,
-        activation=config.activation,
-        layer_norm=config.layer_norm,
-        orthogonal_init=config.orthogonal_init,
-        enable_threshold=config.enable_threshold,
-        enable_logit_bias_init=config.enable_logit_bias_init,
-        continuous_log_std_init=config.continuous_log_std_init,
-        continuous_log_std_min=config.continuous_log_std_min,
-        continuous_log_std_max=config.continuous_log_std_max,
-        policy_head_gain=config.policy_head_gain,
-        value_head_gain=config.value_head_gain,
-    )
-
-    rollout_config = RolloutConfig(
-        rollout_steps=config.rollout_steps,
-        gamma=config.gamma,
-        gae_lambda=config.gae_lambda,
-        deterministic=config.deterministic,
-        reset_on_terminal=config.reset_on_terminal,
-        device=config.device,
-        dtype=config.dtype,
-    )
-
-    ppo_config = PPOConfig(
-        update_epochs=config.update_epochs,
-        minibatch_size=config.minibatch_size,
-        clip_range=config.clip_range,
-        value_clip_range=config.value_clip_range,
-        clip_value_loss=config.clip_value_loss,
-        value_loss_coef=config.value_loss_coef,
-        entropy_coef=config.entropy_coef,
-        max_grad_norm=config.max_grad_norm,
-        normalize_advantages=config.normalize_advantages,
-        target_kl=config.target_kl,
-    )
-
-    obs_norm_config = ObservationNormalizerConfig(
-        enabled=config.observation_normalizer_enabled,
-        update=config.observation_normalizer_update,
-        epsilon=config.observation_normalizer_epsilon,
-        clip=config.observation_normalizer_clip,
-        rms_epsilon=config.observation_normalizer_rms_epsilon,
-    )
-
-    return PPOTrainingConfig(
-        num_updates=config.num_updates,
-        learning_rate=config.learning_rate,
-        adam_eps=config.adam_eps,
-        weight_decay=config.weight_decay,
-        start_event_index=config.start_event_index,
-        seed=config.seed,
-        use_observation_normalizer=config.use_observation_normalizer,
-        network_config=network_config,
-        rollout_config=rollout_config,
-        ppo_config=ppo_config,
-        observation_normalizer_config=obs_norm_config,
-    )
+def _save_checkpoint_atomic(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(dict(payload), tmp)
+    tmp.replace(path)
 
 
 def _default_output_json(tape_root: str) -> Path:
@@ -541,18 +441,68 @@ def _effective_start_event_index(value: int | None) -> int:
     return 0 if value is None else value
 
 
-def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingConfig:
+    network_config = ActorCriticConfig(
+        hidden_sizes=config.hidden_sizes,
+        activation=config.activation,
+        layer_norm=config.layer_norm,
+        orthogonal_init=config.orthogonal_init,
+        enable_threshold=config.enable_threshold,
+        enable_logit_bias_init=config.enable_logit_bias_init,
+        continuous_log_std_init=config.continuous_log_std_init,
+        continuous_log_std_min=config.continuous_log_std_min,
+        continuous_log_std_max=config.continuous_log_std_max,
+        policy_head_gain=config.policy_head_gain,
+        value_head_gain=config.value_head_gain,
+    )
+    rollout_config = RolloutConfig(
+        rollout_steps=config.rollout_steps,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+        deterministic=config.deterministic,
+        reset_on_terminal=config.reset_on_terminal,
+        device=config.device,
+        dtype=config.dtype,
+    )
+    ppo_config = PPOConfig(
+        update_epochs=config.update_epochs,
+        minibatch_size=config.minibatch_size,
+        clip_range=config.clip_range,
+        value_clip_range=config.value_clip_range,
+        clip_value_loss=config.clip_value_loss,
+        value_loss_coef=config.value_loss_coef,
+        entropy_coef=config.entropy_coef,
+        max_grad_norm=config.max_grad_norm,
+        normalize_advantages=config.normalize_advantages,
+        target_kl=config.target_kl,
+    )
+    normalizer_config = ObservationNormalizerConfig(
+        enabled=config.observation_normalizer_enabled,
+        update=config.observation_normalizer_update,
+        epsilon=config.observation_normalizer_epsilon,
+        clip=config.observation_normalizer_clip,
+        rms_epsilon=config.observation_normalizer_rms_epsilon,
+    )
+    return PPOTrainingConfig(
+        num_updates=config.num_updates,
+        learning_rate=config.learning_rate,
+        adam_eps=config.adam_eps,
+        weight_decay=config.weight_decay,
+        start_event_index=config.start_event_index,
+        seed=config.seed,
+        use_observation_normalizer=config.use_observation_normalizer,
+        network_config=network_config,
+        rollout_config=rollout_config,
+        ppo_config=ppo_config,
+        observation_normalizer_config=normalizer_config,
+    )
 
-
-def _save_checkpoint_atomic(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, tmp_path)
-    tmp_path.replace(path)
+def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
+    # Shared builder propagates post_only_gap_ticks=config.post_only_gap_ticks.
+    return build_execution_env_config_from_attrs(
+        config,
+        adverse_signals_enabled=config.adverse_signals_npz is not None,
+    )
 
 
 def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:

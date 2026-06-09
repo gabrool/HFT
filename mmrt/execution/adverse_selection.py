@@ -724,6 +724,22 @@ def adverse_selection_label_names(config: AdverseSelectionConfig) -> tuple[str, 
     return tuple(names)
 
 
+@dataclass(frozen=True, slots=True)
+class _AdverseLabelLayout:
+    label_names: tuple[str, ...]
+    label_count: int
+    candidate_bases: tuple[int, ...]
+
+    @classmethod
+    def from_config(cls, config: AdverseSelectionConfig) -> "_AdverseLabelLayout":
+        names = adverse_selection_label_names(config)
+        return cls(
+            label_names=names,
+            label_count=len(names),
+            candidate_bases=tuple(i * 10 for i in range(len(config.quote.quote_candidates))),
+        )
+
+
 def _book_qty_at_price(ticks: np.ndarray, sizes: np.ndarray, price_tick: int) -> float | None:
     for tick, size in zip(ticks, sizes):
         tick_int = int(tick)
@@ -891,6 +907,7 @@ def _counterfactual_fill_one_side(
     price_tick: int,
     qty: float,
     fill_deadline_key: EventKey,
+    end_event_index: int,
     config: CounterfactualQuoteConfig,
 ) -> CounterfactualFillResult:
     sim_config = FillSimulatorConfig(queue_model=config.queue_model, maker_fee_bps=config.maker_fee_bps)
@@ -930,12 +947,13 @@ def _counterfactual_fill_one_side(
             decision_local_ts_us=decision_key.local_ts_us, queue_ahead_at_start=queue_at_start, queue_ahead_before_fill=fill.queue_ahead_before,
         )
 
+    if fill_deadline_key.event_seq != MAX_EVENT_SEQ:
+        raise ValueError("fill_deadline_key must use MAX_EVENT_SEQ")
     activate_at(decision_key, current_book_ptr)
-    for event_idx in range(start_event_index + 1, len(events)):
+    limit = min(end_event_index, len(events))
+    for event_idx in range(start_event_index + 1, limit):
         event = events[event_idx]
         event_key = EventKey(int(event["local_ts_us"]), int(event["event_seq"]))
-        if event_key > fill_deadline_key:
-            break
         pre_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1) if event_key.event_seq > 0 else (EventKey(event_key.local_ts_us - 1, MAX_EVENT_SEQ) if event_key.local_ts_us > 1 else event_key)
         activate_at(pre_key, current_book_ptr)
         if int(event["event_type_code"]) == EVENT_TYPE_CODE_TRADE:
@@ -1211,8 +1229,6 @@ def _side_valid_for_candidate(tape: ExecutionTape, config: AdverseSelectionConfi
     if price_tick is None or price_tick <= 0:
         return _invalid_quote(config, "candidate quote price is invalid or post-only unsafe")
     spec = tape.manifest.symbol_spec
-    if not spec.is_valid_qty(config.quote.order_qty):
-        raise ValueError("quote.order_qty is invalid for tape symbol_spec")
     if not spec.is_valid_notional(config.quote.order_qty, price_tick):
         return _invalid_quote(config, "candidate quote notional is invalid for tape symbol_spec")
     return True
@@ -1222,21 +1238,24 @@ def _labels_for_decision(
     tape: ExecutionTape,
     *,
     config: AdverseSelectionConfig,
+    layout: _AdverseLabelLayout,
+    last_event_local_ts_us: int,
+    events_local_ts_us: np.ndarray,
     decision_event_index: int,
     latest_book_ptr: int,
     decision_key: EventKey,
     l2_view: _ValidL2View,
 ) -> tuple[list[float], list[bool]] | None:
     best_bid, best_ask, _, _, _, _ = _book_top_from_l2_row(tape, latest_book_ptr)
-    label_names = adverse_selection_label_names(config)
-    labels = [math.nan] * len(label_names)
-    masks = [False] * len(label_names)
+    labels = [math.nan] * layout.label_count
+    masks = [False] * layout.label_count
     fill_deadline_key = _deadline_key(decision_key, config.quote.fill_horizon_us)
-    if config.drop_incomplete_horizon and fill_deadline_key.local_ts_us > int(tape.arrays.events["local_ts_us"][-1]):
+    if config.drop_incomplete_horizon and fill_deadline_key.local_ts_us > last_event_local_ts_us:
         return None
+    end_event_index = int(np.searchsorted(events_local_ts_us, fill_deadline_key.local_ts_us, side="right"))
 
     for candidate_index, candidate in enumerate(config.quote.quote_candidates):
-        base = candidate_index * 10
+        base = layout.candidate_bases[candidate_index]
         fills_by_side: dict[bool, CounterfactualFillResult] = {}
         for is_bid, side in ((True, OrderSide.BUY), (False, OrderSide.SELL)):
             price_tick = candidate_price_tick(candidate=candidate, side=side, best_bid=best_bid, best_ask=best_ask, post_only_gap_ticks=config.quote.post_only_gap_ticks)
@@ -1247,10 +1266,11 @@ def _labels_for_decision(
             assert price_tick is not None
             fill = _counterfactual_fill_one_side(
                 tape, start_event_index=decision_event_index, start_book_ptr=latest_book_ptr, decision_key=decision_key,
-                side=side, price_tick=price_tick, qty=config.quote.order_qty, fill_deadline_key=fill_deadline_key, config=config.quote,
+                side=side, price_tick=price_tick, qty=config.quote.order_qty, fill_deadline_key=fill_deadline_key,
+                end_event_index=end_event_index, config=config.quote,
             )
             fills_by_side[is_bid] = fill
-            if fill_deadline_key.local_ts_us <= int(tape.arrays.events["local_ts_us"][-1]):
+            if fill_deadline_key.local_ts_us <= last_event_local_ts_us:
                 labels[filled_idx] = 1.0 if fill.filled else 0.0
                 masks[filled_idx] = True
             if fill.filled:
@@ -1444,7 +1464,10 @@ def build_adverse_selection_dataset(
 ) -> AdverseSelectionDataset:
     rows = _build_adverse_selection_feature_rows(tape, config=config)
     l2_view = _valid_l2_view_from_tape(tape)
-    label_names = adverse_selection_label_names(config)
+    layout = _AdverseLabelLayout.from_config(config)
+    label_names = layout.label_names
+    last_event_local_ts_us = int(tape.arrays.events["local_ts_us"][-1])
+    events_local_ts_us = np.asarray(tape.arrays.events["local_ts_us"], dtype=np.int64)
     kept_decision_ts: list[int] = []
     kept_event_indices: list[int] = []
     kept_event_seq: list[int] = []
@@ -1456,6 +1479,9 @@ def build_adverse_selection_dataset(
         labels_and_masks = _labels_for_decision(
             tape,
             config=config,
+            layout=layout,
+            last_event_local_ts_us=last_event_local_ts_us,
+            events_local_ts_us=events_local_ts_us,
             decision_event_index=int(rows.decision_event_index[row_idx]),
             latest_book_ptr=int(rows.latest_book_ptr_by_row[row_idx]),
             decision_key=EventKey(int(rows.decision_local_ts_us[row_idx]), int(rows.decision_event_seq[row_idx])),

@@ -1298,3 +1298,9 @@ def test_adverse_signals_do_not_change_fills_rewards_or_position_for_same_action
             (f.side, f.local_ts_us, f.price_tick, f.qty) for f in adv_step.fills
         ]
         assert adv_step.info["adverse_signal_available"] is True
+
+
+def test_env_build_observation_computes_adverse_predictions_once():
+    source = Path("mmrt/execution/env.py").read_text()
+    assert "_adverse_observation_features_for_step" not in source
+    assert "_edge_observation_features_for_step" not in source

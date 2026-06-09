@@ -6,13 +6,14 @@ observation maps. It intentionally does not import RL or environment modules.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Mapping
 
 import numpy as np
 
 from mmrt.execution.adverse_selection import (
     DEFAULT_QUOTE_CANDIDATE_NAMES,
+    QuoteCandidateConfig,
     quote_candidate_configs_from_names,
     candidate_price_tick,
 )
@@ -26,9 +27,11 @@ class AdverseRuntimeConfig:
     candidate_names: tuple[str, ...] = DEFAULT_QUOTE_CANDIDATE_NAMES
     post_only_gap_ticks: int = 1
     executable_edge: ExecutableEdgeConfig = ExecutableEdgeConfig()
+    candidate_configs: tuple[QuoteCandidateConfig, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         candidates = quote_candidate_configs_from_names(self.candidate_names)
+        object.__setattr__(self, "candidate_configs", candidates)
         object.__setattr__(self, "candidate_names", tuple(candidate.name for candidate in candidates))
 
         if (
@@ -59,13 +62,14 @@ def _finite(value: float, name: str) -> float:
 def build_adverse_observation_features(
     *,
     predictions: Mapping[str, float],
-    candidate_names: Sequence[str],
+    config: AdverseRuntimeConfig,
 ) -> dict[str, float]:
     if not isinstance(predictions, Mapping):
         raise ValueError("predictions must be a mapping")
-    candidates = quote_candidate_configs_from_names(candidate_names)
+    if not isinstance(config, AdverseRuntimeConfig):
+        raise ValueError("config must be AdverseRuntimeConfig")
     out: dict[str, float] = {}
-    for candidate in candidates:
+    for candidate in config.candidate_configs:
         c = candidate.name
         for side in ("bid", "ask"):
             fill_target = f"{side}_{c}_filled"
@@ -85,7 +89,6 @@ def build_adverse_observation_features(
 def build_executable_edge_observation_features(
     *,
     predictions: Mapping[str, float],
-    candidate_names: Sequence[str],
     best_bid_tick: int,
     best_ask_tick: int,
     linear_signal: LinearSignal,
@@ -96,10 +99,9 @@ def build_executable_edge_observation_features(
         raise ValueError("linear_signal must be LinearSignal")
     if not isinstance(config, AdverseRuntimeConfig):
         raise ValueError("config must be AdverseRuntimeConfig")
-    candidates = quote_candidate_configs_from_names(candidate_names)
     mid_tick = (int(best_bid_tick) + int(best_ask_tick)) * 0.5
     out: dict[str, float] = {}
-    for candidate in candidates:
+    for candidate in config.candidate_configs:
         c = candidate.name
         for side_name, side in (("bid", OrderSide.BUY), ("ask", OrderSide.SELL)):
             prefix = f"edge_{side_name}_{c}"

@@ -336,3 +336,45 @@ def test_no_future_leakage_public_names():
         obj = getattr(bs, name)
         if callable(obj):
             assert all(x not in name.lower() for x in ("future", "lookahead", "peek", "target"))
+
+
+def _append_book_history_row(history, ts_us, mid):
+    history.append(
+        ts_us=ts_us,
+        mid=mid,
+        microprice=mid + 0.01,
+        micro_minus_mid_bps=1.0,
+        depth_imbalance_5bps=0.1,
+        total_depth_1bps_size=10.0,
+        ofi_l1=1.0,
+        ofi_l10=2.0,
+        bid_l1_add=1.0,
+        bid_l1_rem=0.0,
+        ask_l1_add=0.0,
+        ask_l1_rem=1.0,
+        bid_price_changed=0.0,
+        ask_price_changed=0.0,
+        spread_changed=0.0,
+    )
+
+
+def test_book_history_window_view_matches_values_in_window_unwrapped():
+    h = bs.BookHistory(capacity=8)
+    for t, m in zip((100, 200, 300, 400), (10.0, 20.0, 30.0, 40.0)):
+        _append_book_history_row(h, t, m)
+    view = h.window_view(now_us=400, windows_us=(250,), fields=("ts_us", "mid"))
+    expected = np.array([20.0, 30.0, 40.0])
+    assert np.array_equal(view.values("mid", 250), expected)
+    assert view.count(250) == 3
+    assert np.array_equal(view.values("mid", 250), h.values_in_window("mid", 400, 250))
+
+
+def test_book_history_window_view_matches_values_in_window_wrapped():
+    h = bs.BookHistory(capacity=3)
+    for t, m in zip((100, 200, 300, 400, 500), (10.0, 20.0, 30.0, 40.0, 50.0)):
+        _append_book_history_row(h, t, m)
+    view = h.window_view(now_us=500, windows_us=(250,), fields=("ts_us", "mid"))
+    expected = np.array([30.0, 40.0, 50.0])
+    assert np.array_equal(view.values("mid", 250), expected)
+    assert view.count(250) == 3
+    assert np.array_equal(view.values("mid", 250), h.values_in_window("mid", 500, 250))

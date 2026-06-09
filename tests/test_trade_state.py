@@ -386,3 +386,37 @@ def test_no_invalid_placeholders():
     assert fv_value(v, "max_signed_trade_notional_usd_1000000us") != 0
     assert fv_value(v, "same_side_trade_cluster_notional_1000000us") > 0
     assert fv_value(v, "trade_sign_entropy_3000000us") > 0
+
+
+def _append_trade_history_row(history, ts_us, notional):
+    history.append(
+        ts_us=ts_us,
+        notional=notional,
+        signed_notional=notional,
+        side_code=ts.BUY_SIDE_CODE,
+        tick_sign=1,
+        buy_notional=notional,
+        sell_notional=0.0,
+    )
+
+
+def test_trade_history_window_view_matches_values_in_window_unwrapped():
+    h = ts.TradeHistory(capacity=8)
+    for t, n in zip((100, 200, 300, 400), (1.0, 2.0, 3.0, 4.0)):
+        _append_trade_history_row(h, t, n)
+    view = h.window_view(now_us=400, windows_us=(250,), fields=("ts_us", "notional"))
+    expected = np.array([2.0, 3.0, 4.0])
+    assert np.array_equal(view.values("notional", 250), expected)
+    assert view.count(250) == 3
+    assert np.array_equal(view.values("notional", 250), h.values_in_window("notional", 400, 250))
+
+
+def test_trade_history_window_view_matches_values_in_window_wrapped():
+    h = ts.TradeHistory(capacity=3)
+    for t, n in zip((100, 200, 300, 400, 500), (1.0, 2.0, 3.0, 4.0, 5.0)):
+        _append_trade_history_row(h, t, n)
+    view = h.window_view(now_us=500, windows_us=(250,), fields=("ts_us", "notional"))
+    expected = np.array([3.0, 4.0, 5.0])
+    assert np.array_equal(view.values("notional", 250), expected)
+    assert view.count(250) == 3
+    assert np.array_equal(view.values("notional", 250), h.values_in_window("notional", 500, 250))
