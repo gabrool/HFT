@@ -10,13 +10,10 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from mmrt.execution.contracts import ActionSpec, LatencyConfig, PositionState, QueueModelMode
+from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
-from mmrt.execution.adverse_runtime import AdverseRuntimeConfig
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
-from mmrt.execution.executable_edge import ExecutableEdgeConfig
 from mmrt.execution.execution_tape import load_execution_tape
-from mmrt.execution.fill_sim import FillSimulatorConfig
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNAL_ARTIFACT_SCHEMA,
     LINEAR_SIGNALS_FILENAME,
@@ -24,9 +21,11 @@ from mmrt.execution.linear_signal import (
     linear_signal_artifact_summary,
     validate_linear_signal_artifact_metadata,
 )
-from mmrt.execution.queue_model import QueueModelConfig
-from mmrt.execution.quote_geometry import QuoteGeometryConfig
-from mmrt.execution.reward import RewardConfig
+from mmrt.cli.execution_env_config import (
+    ExecutionEnvConfigBuildInput,
+    build_execution_env_config_from_attrs,
+    build_execution_env_config_from_input,
+)
 from mmrt.rl.evaluate import PolicyEvaluationConfig, evaluate_policy
 from mmrt.rl.normalization import ObservationNormalizer, ObservationNormalizerConfig
 from mmrt.rl.train import PPO_CHECKPOINT_SCHEMA
@@ -310,50 +309,10 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
 def _env_config_from_cli_config(
     config: ExecutionPolicyEvaluationCLIConfig,
 ) -> ExecutionEnvConfig:
-    return ExecutionEnvConfig(
-        decision_interval_us=config.decision_interval_us,
-        action_spec=ActionSpec(
-            max_distance_ticks=config.max_distance_ticks,
-            max_order_qty=config.max_order_qty,
-        ),
-        quote_geometry_config=QuoteGeometryConfig(
-            post_only_gap_ticks=config.post_only_gap_ticks,
-            default_order_qty=config.default_order_qty,
-        ),
-        latency_config=LatencyConfig(
-            decision_compute_latency_us=config.decision_compute_latency_us,
-            order_entry_latency_us=config.order_entry_latency_us,
-            cancel_latency_us=config.cancel_latency_us,
-        ),
-        fill_simulator_config=FillSimulatorConfig(
-            queue_model=QueueModelConfig(
-                mode=config.queue_mode,
-                l2_decrease_weight=config.l2_decrease_weight,
-                trade_at_level_weight=config.trade_at_level_weight,
-                unknown_level_queue_ahead_qty=config.unknown_level_queue_ahead_qty,
-                dedupe_l2_decrease_with_trade_prints=config.dedupe_l2_decrease_with_trade_prints,
-            ),
-            maker_fee_bps=config.maker_fee_bps,
-        ),
-        adverse_runtime_config=AdverseRuntimeConfig(
-            post_only_gap_ticks=config.post_only_gap_ticks,
-            executable_edge=ExecutableEdgeConfig(
-                maker_fee_bps=config.maker_fee_bps,
-                min_executable_edge_bps=config.edge_min_executable_edge_bps,
-                latency_buffer_bps=config.edge_latency_buffer_bps,
-                inventory_skew_bps_per_unit=config.edge_inventory_skew_bps_per_unit,
-            ),
-        ) if config.adverse_signals_npz is not None else None,
-        reward_config=RewardConfig(
-            inventory_penalty_bps=config.inventory_penalty_bps,
-            turnover_penalty_bps=config.turnover_penalty_bps,
-            cancel_penalty=config.cancel_penalty,
-            drawdown_penalty_rate=config.drawdown_penalty_rate,
-            terminal_inventory_penalty_bps=config.terminal_inventory_penalty_bps,
-            reward_scale=config.reward_scale,
-        ),
-        initial_position=PositionState(),
-        max_episode_steps=config.max_episode_steps,
+    # Shared builder propagates post_only_gap_ticks=config.post_only_gap_ticks.
+    return build_execution_env_config_from_attrs(
+        config,
+        adverse_signals_enabled=config.adverse_signals_npz is not None,
     )
 
 
@@ -428,51 +387,34 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
         "cancel_latency_us",
     )
 
-    return ExecutionEnvConfig(
+    params = ExecutionEnvConfigBuildInput(
         decision_interval_us=decision_interval_us,
-        action_spec=ActionSpec(
-            max_distance_ticks=max_distance_ticks,
-            max_order_qty=max_order_qty,
-        ),
-        quote_geometry_config=QuoteGeometryConfig(
-            post_only_gap_ticks=post_only_gap_ticks,
-            default_order_qty=default_order_qty,
-        ),
-        latency_config=LatencyConfig(
-            decision_compute_latency_us=decision_compute_latency_us,
-            order_entry_latency_us=order_entry_latency_us,
-            cancel_latency_us=cancel_latency_us,
-        ),
-        fill_simulator_config=FillSimulatorConfig(
-            queue_model=QueueModelConfig(
-                mode=queue_mode,
-                l2_decrease_weight=l2_decrease_weight,
-                trade_at_level_weight=trade_at_level_weight,
-                unknown_level_queue_ahead_qty=unknown_level_queue_ahead_qty,
-                dedupe_l2_decrease_with_trade_prints=dedupe_l2_decrease_with_trade_prints,
-            ),
-            maker_fee_bps=maker_fee_bps,
-        ),
-        adverse_runtime_config=AdverseRuntimeConfig(
-            post_only_gap_ticks=post_only_gap_ticks,
-            executable_edge=ExecutableEdgeConfig(
-                maker_fee_bps=maker_fee_bps,
-                min_executable_edge_bps=_require_finite_float(raw.get("edge_min_executable_edge_bps", 0.0), "edge_min_executable_edge_bps"),
-                latency_buffer_bps=_require_nonnegative_float(raw.get("edge_latency_buffer_bps", 0.0), "edge_latency_buffer_bps"),
-                inventory_skew_bps_per_unit=_require_finite_float(raw.get("edge_inventory_skew_bps_per_unit", 0.0), "edge_inventory_skew_bps_per_unit"),
-            ),
-        ) if raw.get("adverse_signals_npz") is not None else None,
-        reward_config=RewardConfig(
-            inventory_penalty_bps=inventory_penalty_bps,
-            turnover_penalty_bps=turnover_penalty_bps,
-            cancel_penalty=cancel_penalty,
-            drawdown_penalty_rate=drawdown_penalty_rate,
-            terminal_inventory_penalty_bps=terminal_inventory_penalty_bps,
-            reward_scale=reward_scale,
-        ),
-        initial_position=PositionState(),
+        max_distance_ticks=max_distance_ticks,
+        max_order_qty=max_order_qty,
+        post_only_gap_ticks=post_only_gap_ticks,
+        default_order_qty=default_order_qty,
+        queue_mode=queue_mode,
+        l2_decrease_weight=l2_decrease_weight,
+        trade_at_level_weight=trade_at_level_weight,
+        unknown_level_queue_ahead_qty=unknown_level_queue_ahead_qty,
+        dedupe_l2_decrease_with_trade_prints=dedupe_l2_decrease_with_trade_prints,
+        maker_fee_bps=maker_fee_bps,
+        edge_min_executable_edge_bps=_require_finite_float(raw.get("edge_min_executable_edge_bps", 0.0), "edge_min_executable_edge_bps"),
+        edge_latency_buffer_bps=_require_nonnegative_float(raw.get("edge_latency_buffer_bps", 0.0), "edge_latency_buffer_bps"),
+        edge_inventory_skew_bps_per_unit=_require_finite_float(raw.get("edge_inventory_skew_bps_per_unit", 0.0), "edge_inventory_skew_bps_per_unit"),
+        decision_compute_latency_us=decision_compute_latency_us,
+        order_entry_latency_us=order_entry_latency_us,
+        cancel_latency_us=cancel_latency_us,
+        inventory_penalty_bps=inventory_penalty_bps,
+        turnover_penalty_bps=turnover_penalty_bps,
+        cancel_penalty=cancel_penalty,
+        drawdown_penalty_rate=drawdown_penalty_rate,
+        terminal_inventory_penalty_bps=terminal_inventory_penalty_bps,
+        reward_scale=reward_scale,
         max_episode_steps=max_episode_steps,
+        adverse_signals_enabled=raw.get("adverse_signals_npz") is not None,
     )
+    return build_execution_env_config_from_input(params)
 
 
 def _load_checkpoint(path: str | Path, *, device: torch.device) -> Mapping[str, object]:

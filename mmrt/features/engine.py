@@ -165,6 +165,16 @@ class EngineDecision:
         object.__setattr__(self, "feature_vector", arr)
 
 
+@dataclass(frozen=True, slots=True)
+class EventHistoryWindowView:
+    ts_us: np.ndarray
+    bounds_by_window_us: dict[int, tuple[int, int]]
+
+    def count(self, window_us: int) -> int:
+        start, end = self.bounds_by_window_us[window_us]
+        return max(0, end - start)
+
+
 class EventHistory:
     def __init__(self, capacity: int = DEFAULT_EVENT_HISTORY_CAPACITY):
         self.capacity = _require_positive_capacity(capacity, "capacity")
@@ -184,12 +194,15 @@ class EventHistory:
         self._head = 0
         self.size = 0
 
-    def ordered_ts(self) -> np.ndarray:
+    def ordered_view_ts(self) -> np.ndarray:
         if self.size == 0:
-            return self.ts_us[:0].copy()
+            return self.ts_us[:0]
         if self.size < self.capacity:
-            return self.ts_us[:self.size].copy()
-        return np.concatenate((self.ts_us[self._head:], self.ts_us[:self._head])).copy()
+            return self.ts_us[:self.size]
+        return np.concatenate((self.ts_us[self._head:], self.ts_us[:self._head]))
+
+    def ordered_ts(self) -> np.ndarray:
+        return self.ordered_view_ts()
 
     def ordered_kinds(self) -> np.ndarray:
         if self.size == 0:
@@ -198,16 +211,20 @@ class EventHistory:
             return self.event_kind[:self.size].copy()
         return np.concatenate((self.event_kind[self._head:], self.event_kind[:self._head])).copy()
 
-    def count_in_window(self, now_us: int, window_us: int) -> int:
+    def window_view(self, *, now_us: int, windows_us: tuple[int, ...]) -> EventHistoryWindowView:
         _require_int(now_us, "now_us", positive=True)
-        _require_int(window_us, "window_us", positive=True)
-        ts = self.ordered_ts()
-        if ts.size == 0:
-            return 0
-        lo = now_us - window_us
-        start = int(np.searchsorted(ts, lo, side="left"))
-        end = int(np.searchsorted(ts, now_us, side="right"))
-        return max(0, end - start)
+        ts = self.ordered_view_ts().astype(np.int64, copy=False)
+        bounds = {}
+        for window_us in windows_us:
+            _require_int(window_us, "window_us", positive=True)
+            lo = now_us - window_us
+            start = int(np.searchsorted(ts, lo, side="left"))
+            end = int(np.searchsorted(ts, now_us, side="right"))
+            bounds[window_us] = (start, end)
+        return EventHistoryWindowView(ts_us=ts, bounds_by_window_us=bounds)
+
+    def count_in_window(self, now_us: int, window_us: int) -> int:
+        return self.window_view(now_us=now_us, windows_us=(window_us,)).count(window_us)
 
 
 class FeatureEngine:
@@ -287,22 +304,57 @@ class FeatureEngine:
         return self._build_feature_vector_for_decision(now, self.last_decision_local_ts_us)
 
     def _trade_values(self, field_name: str, window_us: int, now_us: int) -> np.ndarray:
-        return self.trade_state.history.values_in_window(field_name, now_us, window_us)
-    def _trade_sum(self, field_name: str, window_us: int, now_us: int) -> float: return float(np.sum(self._trade_values(field_name, window_us, now_us)))
-    def _trade_buy_notional(self, window_us: int, now_us: int) -> float: return self._trade_sum("buy_notional", window_us, now_us)
-    def _trade_sell_notional(self, window_us: int, now_us: int) -> float: return self._trade_sum("sell_notional", window_us, now_us)
-    def _book_values(self, field_name: str, window_us: int, now_us: int) -> np.ndarray:
-        return self.book_state.history.values_in_window(field_name, now_us, window_us)
-    def _book_sum(self, field_name: str, window_us: int, now_us: int) -> float: return float(np.sum(self._book_values(field_name, window_us, now_us)))
-    def _book_realized_vol_bps(self, field_name: str, window_us: int, now_us: int) -> float:
-        vals = self._book_values(field_name, window_us, now_us)
-        vals = vals[np.isfinite(vals) & (vals > 0.0)]
-        if vals.size < 2: return 0.0
-        ret = np.array([_safe_bps_change(vals[i], vals[i - 1]) for i in range(1, vals.size)], dtype=np.float64)
-        return float(np.std(ret)) if ret.size else 0.0
-    def _book_current_summary(self) -> BookSummary: return self.book_state.current_summary()
-    def _replenishment_ratio(self, add_sum: float, rem_sum: float) -> float: return _safe_div(add_sum, max(add_sum + rem_sum, FLOAT_EPS), 0.0)
+        view = self.trade_state.history.window_view(
+            now_us=now_us,
+            windows_us=(window_us,),
+            fields=("ts_us", field_name),
+        )
+        return view.values(field_name, window_us)
 
+    def _trade_sum(self, field_name: str, window_us: int, now_us: int) -> float:
+        return float(np.sum(self._trade_values(field_name, window_us, now_us)))
+
+    def _trade_buy_notional(self, window_us: int, now_us: int) -> float:
+        return self._trade_sum("buy_notional", window_us, now_us)
+
+    def _trade_sell_notional(self, window_us: int, now_us: int) -> float:
+        return self._trade_sum("sell_notional", window_us, now_us)
+
+    def _book_values(self, field_name: str, window_us: int, now_us: int) -> np.ndarray:
+        view = self.book_state.history.window_view(
+            now_us=now_us,
+            windows_us=(window_us,),
+            fields=("ts_us", field_name),
+        )
+        return view.values(field_name, window_us)
+
+    def _book_sum(self, field_name: str, window_us: int, now_us: int) -> float:
+        return float(np.sum(self._book_values(field_name, window_us, now_us)))
+
+    def _book_realized_vol_bps(self, field_name: str, window_us: int, now_us: int) -> float:
+        view = self.book_state.history.window_view(
+            now_us=now_us,
+            windows_us=(window_us,),
+            fields=("ts_us", field_name),
+        )
+        return self._book_realized_vol_bps_from_view(view, field_name, window_us)
+
+    def _book_current_summary(self) -> BookSummary:
+        return self.book_state.current_summary()
+
+    def _replenishment_ratio(self, add_sum: float, rem_sum: float) -> float:
+        return _safe_div(add_sum, max(add_sum + rem_sum, FLOAT_EPS), 0.0)
+
+    def _book_realized_vol_bps_from_view(self, view, field_name: str, window_us: int) -> float:
+        vals = view.values(field_name, window_us)
+        vals = vals[np.isfinite(vals) & (vals > 0.0)]
+        if vals.size < 2:
+            return 0.0
+        prev = vals[:-1]
+        curr = vals[1:]
+        ret = (curr - prev) / prev * 10_000.0
+        ret = ret[np.isfinite(ret)]
+        return float(np.std(ret)) if ret.size else 0.0
 
     def fill_engine_features(self, out: np.ndarray, *, as_of_local_ts_us: int, previous_decision_local_ts_us: int | None = None) -> np.ndarray:
         if not self.is_ready():
@@ -317,42 +369,68 @@ class FeatureEngine:
             arr[feature_spec_by_name(name).index] = _finite(value)
             assigned.add(name)
 
+        trade_view = self.trade_state.history.window_view(
+            now_us=now,
+            windows_us=ENGINE_EVENT_WINDOWS_US,
+            fields=("ts_us", "buy_notional", "sell_notional"),
+        )
+        book_view = self.book_state.history.window_view(
+            now_us=now,
+            windows_us=ENGINE_EVENT_WINDOWS_US,
+            fields=(
+                "ts_us",
+                "bid_l1_add",
+                "bid_l1_rem",
+                "ask_l1_add",
+                "ask_l1_rem",
+                "ofi_l1",
+                "microprice",
+            ),
+        )
+        event_view = self.event_history.window_view(now_us=now, windows_us=ENGINE_EVENT_WINDOWS_US)
+
+        def trade_sum(field_name: str, window_us: int) -> float:
+            return float(np.sum(trade_view.values(field_name, window_us)))
+
+        def book_sum(field_name: str, window_us: int) -> float:
+            return float(np.sum(book_view.values(field_name, window_us)))
+
         s = self._book_current_summary()
-        buy_n = self._trade_buy_notional(WINDOW_1000MS_US, now)
-        sell_n = self._trade_sell_notional(WINDOW_1000MS_US, now)
+        buy_n = trade_sum("buy_notional", WINDOW_1000MS_US)
+        sell_n = trade_sum("sell_notional", WINDOW_1000MS_US)
         total = buy_n + sell_n
-        bid_add = self._book_sum("bid_l1_add", WINDOW_1000MS_US, now)
-        bid_rem = self._book_sum("bid_l1_rem", WINDOW_1000MS_US, now)
-        ask_add = self._book_sum("ask_l1_add", WINDOW_1000MS_US, now)
-        ask_rem = self._book_sum("ask_l1_rem", WINDOW_1000MS_US, now)
+        bid_add = book_sum("bid_l1_add", WINDOW_1000MS_US)
+        bid_rem = book_sum("bid_l1_rem", WINDOW_1000MS_US)
+        ask_add = book_sum("ask_l1_add", WINDOW_1000MS_US)
+        ask_rem = book_sum("ask_l1_rem", WINDOW_1000MS_US)
         bid_rr = self._replenishment_ratio(bid_add, bid_rem)
         ask_rr = self._replenishment_ratio(ask_add, ask_rem)
         setf("absorption_bid_1000000us", _safe_div(sell_n, max(total, FLOAT_EPS), 0.0) * bid_rr)
         setf("absorption_ask_1000000us", _safe_div(buy_n, max(total, FLOAT_EPS), 0.0) * ask_rr)
-        ofi_pressure = self._book_sum("ofi_l1", WINDOW_1000MS_US, now)
+        ofi_pressure = book_sum("ofi_l1", WINDOW_1000MS_US)
         p_over_d = _safe_div(ofi_pressure, max(s.total_depth_5bps_size, FLOAT_EPS), 0.0)
-        rv = self._book_realized_vol_bps("microprice", WINDOW_1000MS_US, now)
+        rv = self._book_realized_vol_bps_from_view(book_view, "microprice", WINDOW_1000MS_US)
         setf("ofi_l1_pressure_over_realized_vol_1000000us", 0.0 if rv <= FLOAT_EPS else _safe_div(p_over_d, max(rv, FLOAT_EPS), 0.0))
 
-        buy_500 = self._trade_buy_notional(WINDOW_500MS_US, now)
-        sell_500 = self._trade_sell_notional(WINDOW_500MS_US, now)
+        buy_500 = trade_sum("buy_notional", WINDOW_500MS_US)
+        sell_500 = trade_sum("sell_notional", WINDOW_500MS_US)
         total_500 = buy_500 + sell_500
         bid_rr_500 = self._replenishment_ratio(
-            self._book_sum("bid_l1_add", WINDOW_500MS_US, now),
-            self._book_sum("bid_l1_rem", WINDOW_500MS_US, now),
+            book_sum("bid_l1_add", WINDOW_500MS_US),
+            book_sum("bid_l1_rem", WINDOW_500MS_US),
         )
         ask_rr_500 = self._replenishment_ratio(
-            self._book_sum("ask_l1_add", WINDOW_500MS_US, now),
-            self._book_sum("ask_l1_rem", WINDOW_500MS_US, now),
+            book_sum("ask_l1_add", WINDOW_500MS_US),
+            book_sum("ask_l1_rem", WINDOW_500MS_US),
         )
         buy_share = _safe_div(buy_500, max(total_500, FLOAT_EPS), 0.0)
         sell_share = _safe_div(sell_500, max(total_500, FLOAT_EPS), 0.0)
         setf("trade_side_quote_response_asymmetry_500000us", buy_share * ask_rr_500 - sell_share * bid_rr_500)
 
-        setf("log_events_200000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_200MS_US)))
-        setf("log_events_500000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_500MS_US)))
-        setf("log_events_1000000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_1000MS_US)))
-        setf("log_events_3000000us", _safe_log1p(self.event_history.count_in_window(now, WINDOW_3000MS_US)))
+        setf("log_events_200000us", _safe_log1p(event_view.count(WINDOW_200MS_US)))
+        setf("log_events_500000us", _safe_log1p(event_view.count(WINDOW_500MS_US)))
+        setf("log_events_1000000us", _safe_log1p(event_view.count(WINDOW_1000MS_US)))
+        setf("log_events_3000000us", _safe_log1p(event_view.count(WINDOW_3000MS_US)))
 
         missing = ENGINE_FEATURE_NAME_SET - assigned
         extra = assigned - ENGINE_FEATURE_NAME_SET

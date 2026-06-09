@@ -232,6 +232,12 @@ def action_array_to_continuous_action(values: Sequence[float] | np.ndarray) -> Q
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _AdverseRuntimeFeatureMaps:
+    adverse_features: dict[str, float]
+    edge_features: dict[str, float]
+
+
 class ExecutionEnv:
     def __init__(
         self,
@@ -524,17 +530,13 @@ class ExecutionEnv:
         if self.adverse_signals is not None:
             row = state.step_index - 1
             runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
-            predictions = adverse_predictions_for_row(self.adverse_signals, row)
-            edge_features = build_executable_edge_observation_features(
-                predictions=predictions,
-                candidate_names=runtime_config.candidate_names,
-                best_bid_tick=previous_book_top.best_bid_tick,
-                best_ask_tick=previous_book_top.best_ask_tick,
+            runtime_maps = self._adverse_runtime_feature_maps_for_step(
+                step_index=row,
+                book_top=previous_book_top,
                 linear_signal=linear_signal_at(self.linear_signals.arrays, row),
                 inventory_qty=previous_position.inventory_qty,
-                config=runtime_config,
             )
-            for name, value in edge_features.items():
+            for name, value in runtime_maps.edge_features.items():
                 if name.endswith("_attempt_bps") or name.endswith("_valid"):
                     info[name] = value
             info["adverse_signal_available"] = True
@@ -680,6 +682,17 @@ class ExecutionEnv:
             total_events=len(self.tape.arrays.events),
             previous_event_local_ts_us=state.previous_event_local_ts_us,
         )
+        linear_signal = self._linear_signal_for_step(
+            state.step_index,
+            expected_event_index=state.event_index,
+            expected_local_ts_us=book_top.local_ts_us,
+        )
+        runtime_maps = self._adverse_runtime_feature_maps_for_step(
+            step_index=state.step_index,
+            book_top=book_top,
+            linear_signal=linear_signal,
+            inventory_qty=state.position.inventory_qty,
+        )
         inputs = ObservationInput(
             symbol_spec=self.tape.manifest.symbol_spec,
             book_top=book_top,
@@ -688,52 +701,39 @@ class ExecutionEnv:
             position=state.position,
             live_orders=state.live_orders,
             recent_fills=self._last_step_fills,
-            linear_signal=self._linear_signal_for_step(
-                state.step_index,
-                expected_event_index=state.event_index,
-                expected_local_ts_us=book_top.local_ts_us,
-            ),
-            adverse_features=self._adverse_observation_features_for_step(state.step_index, book_top),
-            executable_edge_features=self._edge_observation_features_for_step(state.step_index, book_top),
+            linear_signal=linear_signal,
+            adverse_features=runtime_maps.adverse_features,
+            executable_edge_features=runtime_maps.edge_features,
             context=context,
         )
         return self.observation_builder.build(inputs, out=self._obs_buffer)
 
 
-    def _adverse_predictions_for_step(self, step_index: int) -> dict[str, float] | None:
+    def _adverse_runtime_feature_maps_for_step(
+        self,
+        *,
+        step_index: int,
+        book_top: BookTop,
+        linear_signal: LinearSignal,
+        inventory_qty: float,
+    ) -> _AdverseRuntimeFeatureMaps:
         if self.adverse_signals is None:
-            return None
-        return adverse_predictions_for_row(self.adverse_signals, step_index)
-
-    def _adverse_observation_features_for_step(self, step_index: int, book_top: BookTop) -> dict[str, float]:
-        predictions = self._adverse_predictions_for_step(step_index)
-        if predictions is None:
-            return {}
+            return _AdverseRuntimeFeatureMaps({}, {})
         runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
-        return build_adverse_observation_features(
+        predictions = adverse_predictions_for_row(self.adverse_signals, step_index)
+        adverse_features = build_adverse_observation_features(
             predictions=predictions,
-            candidate_names=runtime_config.candidate_names,
+            config=runtime_config,
         )
-
-    def _edge_observation_features_for_step(self, step_index: int, book_top: BookTop) -> dict[str, float]:
-        predictions = self._adverse_predictions_for_step(step_index)
-        if predictions is None:
-            return {}
-        runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
-        linear_signal = self._linear_signal_for_step(
-            step_index,
-            expected_event_index=self._require_state().event_index,
-            expected_local_ts_us=book_top.local_ts_us,
-        )
-        return build_executable_edge_observation_features(
+        edge_features = build_executable_edge_observation_features(
             predictions=predictions,
-            candidate_names=runtime_config.candidate_names,
             best_bid_tick=book_top.best_bid_tick,
             best_ask_tick=book_top.best_ask_tick,
             linear_signal=linear_signal,
-            inventory_qty=self._require_state().position.inventory_qty,
+            inventory_qty=inventory_qty,
             config=runtime_config,
         )
+        return _AdverseRuntimeFeatureMaps(adverse_features, edge_features)
 
     def _linear_signal_for_step(
         self,

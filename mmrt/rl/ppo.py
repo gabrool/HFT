@@ -97,6 +97,8 @@ class PPOConfig:
     entropy_coef: float = 0.01
 
     max_grad_norm: float | None = 0.5
+    # Applied by update_ppo over the flattened rollout batch. compute_ppo_loss
+    # assumes advantages are already prepared by the caller.
     normalize_advantages: bool = True
     target_kl: float | None = None
 
@@ -302,9 +304,6 @@ def compute_ppo_loss(
     if actions.shape[-1] != policy.action_dim:
         raise ValueError("actions last dimension must equal policy action_dim")
 
-    if config.normalize_advantages:
-        advantages = normalize_advantages(advantages)
-
     evaluation = policy.evaluate_actions(observations, actions)
     new_log_probs = evaluation.log_prob
     new_values = evaluation.value
@@ -377,6 +376,9 @@ def update_ppo(
     shuffle = _require_bool(shuffle, "shuffle")
 
     flat = flatten_rollout_batch(batch)
+    if config.normalize_advantages:
+        flat = dict(flat)
+        flat["advantages"] = normalize_advantages(flat["advantages"])
     policy_device = _policy_device(policy)
     if flat["observations"].device != policy_device:
         raise ValueError("rollout batch device must match policy device")

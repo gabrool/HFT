@@ -148,6 +148,23 @@ class TradeSummary:
     unknown_trade_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class TradeHistoryWindowView:
+    ts_us: np.ndarray
+    data: dict[str, np.ndarray]
+    bounds_by_window_us: dict[int, tuple[int, int]]
+
+    def values(self, field_name: str, window_us: int) -> np.ndarray:
+        if field_name not in self.data:
+            raise KeyError(field_name)
+        start, end = self.bounds_by_window_us[window_us]
+        return self.data[field_name][start:end]
+
+    def count(self, window_us: int) -> int:
+        start, end = self.bounds_by_window_us[window_us]
+        return max(0, end - start)
+
+
 class TradeHistory:
     FIELDS = (
         "ts_us",
@@ -183,7 +200,7 @@ class TradeHistory:
         self._head = (self._head + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def ordered_slice(self, field_name: str) -> np.ndarray:
+    def ordered_view(self, field_name: str) -> np.ndarray:
         data = self._data[field_name]
         if self.size == 0:
             return data[:0]
@@ -191,26 +208,38 @@ class TradeHistory:
             return data[:self.size]
         return np.concatenate((data[self._head:], data[:self._head]))
 
+    def ordered_slice(self, field_name: str) -> np.ndarray:
+        return self.ordered_view(field_name)
+
     def ordered_ts(self) -> np.ndarray:
-        return self.ordered_slice("ts_us")
+        return self.ordered_view("ts_us")
+
+    def window_view(
+        self,
+        *,
+        now_us: int,
+        windows_us: tuple[int, ...],
+        fields: tuple[str, ...] | None = None,
+    ) -> TradeHistoryWindowView:
+        ts = self.ordered_view("ts_us").astype(np.int64, copy=False)
+        if fields is None:
+            fields = self.FIELDS
+        data = {field: self.ordered_view(field) for field in fields}
+        bounds = {}
+        for window_us in windows_us:
+            lo = now_us - window_us
+            start = int(np.searchsorted(ts, lo, side="left"))
+            end = int(np.searchsorted(ts, now_us, side="right"))
+            bounds[window_us] = (start, end)
+        return TradeHistoryWindowView(ts_us=ts, data=data, bounds_by_window_us=bounds)
 
     def values_in_window(self, field_name: str, now_us: int, window_us: int) -> np.ndarray:
-        ts = self.ordered_ts()
-        if ts.size == 0:
-            return self.ordered_slice(field_name)
-        lo = now_us - window_us
-        start = int(np.searchsorted(ts, lo, side="left"))
-        end = int(np.searchsorted(ts, now_us, side="right"))
-        return self.ordered_slice(field_name)[start:end]
+        view = self.window_view(now_us=now_us, windows_us=(window_us,), fields=("ts_us", field_name))
+        return view.values(field_name, window_us)
 
     def ts_in_window(self, now_us: int, window_us: int) -> np.ndarray:
-        ts = self.ordered_ts()
-        if ts.size == 0:
-            return ts
-        lo = now_us - window_us
-        start = int(np.searchsorted(ts, lo, side="left"))
-        end = int(np.searchsorted(ts, now_us, side="right"))
-        return ts[start:end]
+        view = self.window_view(now_us=now_us, windows_us=(window_us,), fields=("ts_us",))
+        return view.values("ts_us", window_us)
 
     def asof_value(self, field_name: str, query_ts_us: int, default: float = 0.0) -> float:
         ts = self.ordered_ts()
@@ -311,11 +340,13 @@ class TradeState:
 
     def _window_values(self, field_name: str, window_us: int, now_us: int | None = None) -> np.ndarray:
         now = self.last_local_ts_us if now_us is None else now_us
-        return self.history.values_in_window(field_name, now, window_us)
+        view = self.history.window_view(now_us=now, windows_us=(window_us,), fields=("ts_us", field_name))
+        return view.values(field_name, window_us)
 
     def _window_ts(self, window_us: int, now_us: int | None = None) -> np.ndarray:
         now = self.last_local_ts_us if now_us is None else now_us
-        return self.history.ts_in_window(now, window_us)
+        view = self.history.window_view(now_us=now, windows_us=(window_us,), fields=("ts_us",))
+        return view.values("ts_us", window_us)
 
     def _trade_count_per_second(self, window_us: int, now_us: int) -> float:
         return _safe_div(float(self._window_ts(window_us, now_us).size), window_us / 1e6)
@@ -391,17 +422,92 @@ class TradeState:
             arr[feature_spec_by_name(name).index] = _finite(value)
             assigned.add(name)
 
-        setf("trade_count_per_second_200000us", self._trade_count_per_second(WINDOW_200MS_US, now))
-        setf("trade_imbalance_notional_500000us", self._trade_imbalance_notional(WINDOW_500MS_US, now))
-        setf("trade_count_per_second_500000us", self._trade_count_per_second(WINDOW_500MS_US, now))
-        setf("zero_tick_fraction_1000000us", self._zero_tick_fraction(WINDOW_1000MS_US, now))
-        setf("trade_count_per_second_1000000us", self._trade_count_per_second(WINDOW_1000MS_US, now))
+        trade_view = self.history.window_view(
+            now_us=now,
+            windows_us=TRADE_WINDOWS_US,
+            fields=(
+                "ts_us",
+                "notional",
+                "signed_notional",
+                "side_code",
+                "tick_sign",
+                "buy_notional",
+                "sell_notional",
+            ),
+        )
+
+        def trade_count_per_second(window_us: int) -> float:
+            return _safe_div(float(trade_view.count(window_us)), window_us / 1e6)
+
+        def trade_imbalance_notional(window_us: int) -> float:
+            buy = float(np.sum(trade_view.values("buy_notional", window_us)))
+            sell = float(np.sum(trade_view.values("sell_notional", window_us)))
+            return _safe_div(buy - sell, buy + sell)
+
+        def zero_tick_fraction(window_us: int) -> float:
+            tick = trade_view.values("tick_sign", window_us)
+            return _safe_div(float(np.sum(tick == 0)), float(tick.size))
+
+        def max_signed_trade_notional(window_us: int) -> float:
+            signed = trade_view.values("signed_notional", window_us)
+            if signed.size == 0:
+                return 0.0
+            idx = int(np.argmax(np.abs(signed)))
+            return float(signed[idx])
+
+        def max_trade_silence_gap(window_us: int) -> float:
+            ts = trade_view.values("ts_us", window_us)
+            if ts.size < 2:
+                return 0.0
+            return float(np.max(np.diff(ts)))
+
+        def trade_sign_entropy(window_us: int) -> float:
+            side = trade_view.values("side_code", window_us)
+            n = side.size
+            if n == 0:
+                return 0.0
+            counts = (
+                np.sum(side == BUY_SIDE_CODE),
+                np.sum(side == SELL_SIDE_CODE),
+                np.sum(side == UNKNOWN_SIDE_CODE),
+            )
+            ent = 0.0
+            for c in counts:
+                ent += _safe_log2_prob(c / n)
+            return _safe_div(ent, math.log2(3.0))
+
+        def same_side_trade_cluster_notional(window_us: int) -> float:
+            side = trade_view.values("side_code", window_us)
+            notional = trade_view.values("notional", window_us)
+            best = 0.0
+            cur = 0.0
+            cur_side = 0
+            for s, n in zip(side, notional):
+                si = int(s)
+                if si == 0:
+                    cur = 0.0
+                    cur_side = 0
+                    continue
+                if si == cur_side:
+                    cur += float(n)
+                else:
+                    cur_side = si
+                    cur = float(n)
+                if cur > best:
+                    best = cur
+            return best
+
+        setf("trade_count_per_second_200000us", trade_count_per_second(WINDOW_200MS_US))
+        setf("trade_imbalance_notional_500000us", trade_imbalance_notional(WINDOW_500MS_US))
+        setf("trade_count_per_second_500000us", trade_count_per_second(WINDOW_500MS_US))
+        setf("zero_tick_fraction_1000000us", zero_tick_fraction(WINDOW_1000MS_US))
+        setf("trade_count_per_second_1000000us", trade_count_per_second(WINDOW_1000MS_US))
         setf("time_since_last_buy_trade_us", float(0 if self.last_buy_trade_ts_us is None else now - self.last_buy_trade_ts_us))
         setf("time_since_last_sell_trade_us", float(0 if self.last_sell_trade_ts_us is None else now - self.last_sell_trade_ts_us))
-        setf("max_signed_trade_notional_usd_1000000us", self._max_signed_trade_notional(WINDOW_1000MS_US, now))
-        setf("same_side_trade_cluster_notional_1000000us", self._same_side_trade_cluster_notional(WINDOW_1000MS_US, now))
-        setf("max_trade_silence_gap_3000000us", self._max_trade_silence_gap(WINDOW_3000MS_US, now))
-        setf("trade_sign_entropy_3000000us", self._trade_sign_entropy(WINDOW_3000MS_US, now))
+        setf("max_signed_trade_notional_usd_1000000us", max_signed_trade_notional(WINDOW_1000MS_US))
+        setf("same_side_trade_cluster_notional_1000000us", same_side_trade_cluster_notional(WINDOW_1000MS_US))
+        setf("max_trade_silence_gap_3000000us", max_trade_silence_gap(WINDOW_3000MS_US))
+        setf("trade_sign_entropy_3000000us", trade_sign_entropy(WINDOW_3000MS_US))
         missing = TRADE_FEATURE_NAME_SET - assigned
         extra = assigned - TRADE_FEATURE_NAME_SET
         if missing or extra:

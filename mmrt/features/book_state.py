@@ -155,6 +155,23 @@ class BookSummary:
     local_ts_us:int; ts_us:int; event_seq:int; best_bid:float; best_ask:float; bid_size_1:float; ask_size_1:float; mid:float; spread_bps:float; microprice:float; micro_minus_mid_bps:float
     bid_depth_5bps_size:float; ask_depth_5bps_size:float; bid_depth_5bps_notional:float; ask_depth_5bps_notional:float; total_depth_5bps_size:float; total_depth_5bps_notional:float; depth_imbalance_5bps:float; is_crossed:bool; update_count:int
 
+
+@dataclass(frozen=True, slots=True)
+class BookHistoryWindowView:
+    ts_us: np.ndarray
+    data: dict[str, np.ndarray]
+    bounds_by_window_us: dict[int, tuple[int, int]]
+
+    def values(self, field_name: str, window_us: int) -> np.ndarray:
+        if field_name not in self.data:
+            raise KeyError(field_name)
+        start, end = self.bounds_by_window_us[window_us]
+        return self.data[field_name][start:end]
+
+    def count(self, window_us: int) -> int:
+        start, end = self.bounds_by_window_us[window_us]
+        return max(0, end - start)
+
 class BookHistory:
     FIELDS = (
         "ts_us",
@@ -189,17 +206,47 @@ class BookHistory:
             a[i] = kwargs[f]
         self.write_pos = (i + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
-    def ordered_slice(self, field_name:str)->np.ndarray:
-        arr=self._arrays[field_name]
-        if self.size==0: return arr[:0].copy()
-        s=(self.write_pos-self.size)%self.capacity
-        return np.concatenate((arr[s:],arr[:self.write_pos])).copy() if s>=self.write_pos else arr[s:self.write_pos].copy()
-    def ordered_ts(self)->np.ndarray: return self.ordered_slice("ts_us")
-    def values_in_window(self, field_name:str, now_us:int, window_us:int)->np.ndarray:
-        ts=self.ordered_ts(); vals=self.ordered_slice(field_name)
-        return vals[ts>=now_us-window_us] if ts.size else vals
-    def ts_in_window(self, now_us:int, window_us:int)->np.ndarray:
-        ts=self.ordered_ts(); return ts[ts>=now_us-window_us] if ts.size else ts
+    def ordered_view(self, field_name: str) -> np.ndarray:
+        arr = self._arrays[field_name]
+        if self.size == 0:
+            return arr[:0]
+        start = (self.write_pos - self.size) % self.capacity
+        if start < self.write_pos:
+            return arr[start:self.write_pos]
+        return np.concatenate((arr[start:], arr[:self.write_pos]))
+
+    def ordered_slice(self, field_name: str) -> np.ndarray:
+        return self.ordered_view(field_name)
+
+    def ordered_ts(self) -> np.ndarray:
+        return self.ordered_view("ts_us")
+
+    def window_view(
+        self,
+        *,
+        now_us: int,
+        windows_us: tuple[int, ...],
+        fields: tuple[str, ...] | None = None,
+    ) -> BookHistoryWindowView:
+        ts = self.ordered_view("ts_us").astype(np.int64, copy=False)
+        if fields is None:
+            fields = self.FIELDS
+        data = {field: self.ordered_view(field) for field in fields}
+        bounds = {}
+        for window_us in windows_us:
+            lo = now_us - window_us
+            start = int(np.searchsorted(ts, lo, side="left"))
+            end = int(np.searchsorted(ts, now_us, side="right"))
+            bounds[window_us] = (start, end)
+        return BookHistoryWindowView(ts_us=ts, data=data, bounds_by_window_us=bounds)
+
+    def values_in_window(self, field_name: str, now_us: int, window_us: int) -> np.ndarray:
+        view = self.window_view(now_us=now_us, windows_us=(window_us,), fields=("ts_us", field_name))
+        return view.values(field_name, window_us)
+
+    def ts_in_window(self, now_us: int, window_us: int) -> np.ndarray:
+        view = self.window_view(now_us=now_us, windows_us=(window_us,), fields=("ts_us",))
+        return view.values("ts_us", window_us)
 
 class BookState:
     def __init__(self, history_capacity:int=DEFAULT_HISTORY_CAPACITY): self._history_capacity=_require_positive_capacity(history_capacity); self.history=BookHistory(self._history_capacity); self.reset()
@@ -369,36 +416,113 @@ class BookState:
             arr[feature_spec_by_name(name).index] = _finite(v)
             assigned.add(name)
 
-        setf("mid_slope_bps_per_sec_1000000us", self._rolling_mid_slope_bps_per_sec(WINDOW_1000MS_US))
+        book_view = self.history.window_view(
+            now_us=now,
+            windows_us=BOOK_WINDOWS_US,
+            fields=(
+                "ts_us",
+                "mid",
+                "microprice",
+                "micro_minus_mid_bps",
+                "depth_imbalance_5bps",
+                "total_depth_1bps_size",
+                "ofi_l10",
+                "bid_l1_add",
+                "bid_l1_rem",
+                "ask_l1_add",
+                "ask_l1_rem",
+                "bid_price_changed",
+                "ask_price_changed",
+                "spread_changed",
+            ),
+        )
+
+        def rolling_values(field_name: str, window_us: int) -> np.ndarray:
+            return book_view.values(field_name, window_us)
+
+        def rolling_ts(window_us: int) -> np.ndarray:
+            return book_view.values("ts_us", window_us)
+
+        def rolling_sum(field_name: str, window_us: int) -> float:
+            return float(np.sum(rolling_values(field_name, window_us)))
+
+        def rolling_mean(field_name: str, window_us: int) -> float:
+            values = rolling_values(field_name, window_us)
+            return float(np.mean(values)) if values.size else 0.0
+
+        def rolling_count(field_name: str, window_us: int) -> float:
+            return float(rolling_values(field_name, window_us).size)
+
+        def rolling_update_rate(window_us: int) -> float:
+            return float(book_view.count(window_us)) / (window_us / 1e6)
+
+        def rolling_slope_per_sec(field_name: str, window_us: int) -> float:
+            values = rolling_values(field_name, window_us)
+            ts = rolling_ts(window_us)
+            if values.size < 2:
+                return 0.0
+            idx = np.where(np.isfinite(values))[0]
+            if idx.size < 2:
+                return 0.0
+            dt = (ts[idx[-1]] - ts[idx[0]]) / 1e6
+            return 0.0 if dt <= FLOAT_EPS else float((values[idx[-1]] - values[idx[0]]) / dt)
+
+        def rolling_mid_slope_bps_per_sec(window_us: int) -> float:
+            values = rolling_values("mid", window_us)
+            ts = rolling_ts(window_us)
+            idx = np.where(np.isfinite(values) & (values > 0))[0]
+            if idx.size < 2:
+                return 0.0
+            dt = (ts[idx[-1]] - ts[idx[0]]) / 1e6
+            return 0.0 if dt <= FLOAT_EPS else _safe_bps_change(values[idx[-1]], values[idx[0]]) / dt
+
+        def rolling_realized_vol_bps(field_name: str, window_us: int) -> float:
+            values = rolling_values(field_name, window_us)
+            values = values[np.isfinite(values) & (values > 0)]
+            if values.size < 2:
+                return 0.0
+            ret = (values[1:] - values[:-1]) / values[:-1] * 10_000.0
+            ret = ret[np.isfinite(ret)]
+            return float(np.std(ret)) if ret.size else 0.0
+
+        def zero_cross_rate(window_us: int) -> float:
+            values = rolling_values("micro_minus_mid_bps", window_us)
+            signs = np.sign(values)
+            signs = signs[signs != 0]
+            if signs.size < 2:
+                return 0.0
+            return float(np.sum(signs[1:] != signs[:-1])) / (window_us / 1e6)
+
+        setf("mid_slope_bps_per_sec_1000000us", rolling_mid_slope_bps_per_sec(WINDOW_1000MS_US))
         setf("time_since_mid_change_us", now - self.last_mid_change_ts_us)
         setf("bid_l1_notional_usd", self.current_bid_px[0] * self.current_bid_sz[0])
         setf("ask_l1_notional_usd", self.current_ask_px[0] * self.current_ask_sz[0])
         setf("total_depth_notional_5bps", s.total_depth_5bps_notional)
         setf("obi_l1", self._obi(1))
-        setf("ofi_l10_sum_over_depth_1000000us", self._rolling_sum("ofi_l10", WINDOW_1000MS_US) / depth)
+        setf("ofi_l10_sum_over_depth_1000000us", rolling_sum("ofi_l10", WINDOW_1000MS_US) / depth)
         setf("micro_l10_minus_mid_bps", self._minus_mid_bps(self._micro_depth(10)))
         setf("ask_depth_within_1bps", ask_depth_1bps)
         setf("depth_imbalance_within_1bps", self._depth_imbalance_within_bps(1.0))
-        setf("ask_l1_depletion_over_depth_200000us", self._rolling_sum("ask_l1_rem", WINDOW_200MS_US) / ask_depth_1bps)
-        setf("ask_l1_depletion_500000us", self._rolling_sum("ask_l1_rem", WINDOW_500MS_US))
-        setf("bid_price_change_rate_1000000us", self._rolling_sum("bid_price_changed", WINDOW_1000MS_US))
-        setf("bid_l1_depletion_1000000us", self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US))
-        setf("bid_l1_depletion_over_depth_1000000us", self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US) / bid_depth_1bps)
+        setf("ask_l1_depletion_over_depth_200000us", rolling_sum("ask_l1_rem", WINDOW_200MS_US) / ask_depth_1bps)
+        setf("ask_l1_depletion_500000us", rolling_sum("ask_l1_rem", WINDOW_500MS_US))
+        setf("bid_price_change_rate_1000000us", rolling_sum("bid_price_changed", WINDOW_1000MS_US))
+        setf("bid_l1_depletion_1000000us", rolling_sum("bid_l1_rem", WINDOW_1000MS_US))
+        setf("bid_l1_depletion_over_depth_1000000us", rolling_sum("bid_l1_rem", WINDOW_1000MS_US) / bid_depth_1bps)
         setf("ask_l1_depletion_over_depth_1000000us", self._rolling_sum("ask_l1_rem", WINDOW_1000MS_US) / ask_depth_1bps)
-        setf("ob_update_rate_200000us", self._rolling_update_rate(WINDOW_200MS_US))
-        setf("ob_update_rate_500000us", self._rolling_update_rate(WINDOW_500MS_US))
-        setf("bid_l1_rem_rate_over_depth_200000us", self._rolling_sum("bid_l1_rem", WINDOW_200MS_US) / (0.2 * bid_depth_1bps))
-        setf("depth_imbalance_5bps_slope_1000000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_1000MS_US))
-        setf("depth_imbalance_5bps_slope_3000000us", self._rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_3000MS_US))
-        setf("microprice_zero_cross_rate_1000000us", self._zero_cross_rate(WINDOW_1000MS_US))
-        setf("l1_churn_over_depth_1000000us", (self._rolling_sum("bid_l1_add", WINDOW_1000MS_US) + self._rolling_sum("bid_l1_rem", WINDOW_1000MS_US) + self._rolling_sum("ask_l1_add", WINDOW_1000MS_US) + self._rolling_sum("ask_l1_rem", WINDOW_1000MS_US)) / max(self._rolling_mean("total_depth_1bps_size", WINDOW_1000MS_US), FLOAT_EPS))
-        setf("touch_flicker_score_3000000us", (self._rolling_sum("bid_price_changed", WINDOW_3000MS_US) + self._rolling_sum("ask_price_changed", WINDOW_3000MS_US)) / max(self._rolling_count("mid", WINDOW_3000MS_US), 1.0))
-        setf("spread_state_transition_rate_3000000us", self._rolling_sum("spread_changed", WINDOW_3000MS_US) / 3.0)
-        setf("microprice_realized_vol_1000000us", self._rolling_realized_vol_bps("microprice", WINDOW_1000MS_US))
+        setf("ob_update_rate_200000us", rolling_update_rate(WINDOW_200MS_US))
+        setf("ob_update_rate_500000us", rolling_update_rate(WINDOW_500MS_US))
+        setf("bid_l1_rem_rate_over_depth_200000us", rolling_sum("bid_l1_rem", WINDOW_200MS_US) / (0.2 * bid_depth_1bps))
+        setf("depth_imbalance_5bps_slope_1000000us", rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_1000MS_US))
+        setf("depth_imbalance_5bps_slope_3000000us", rolling_slope_per_sec("depth_imbalance_5bps", WINDOW_3000MS_US))
+        setf("microprice_zero_cross_rate_1000000us", zero_cross_rate(WINDOW_1000MS_US))
+        setf("l1_churn_over_depth_1000000us", (rolling_sum("bid_l1_add", WINDOW_1000MS_US) + rolling_sum("bid_l1_rem", WINDOW_1000MS_US) + rolling_sum("ask_l1_add", WINDOW_1000MS_US) + self._rolling_sum("ask_l1_rem", WINDOW_1000MS_US)) / max(rolling_mean("total_depth_1bps_size", WINDOW_1000MS_US), FLOAT_EPS))
+        setf("touch_flicker_score_3000000us", (rolling_sum("bid_price_changed", WINDOW_3000MS_US) + rolling_sum("ask_price_changed", WINDOW_3000MS_US)) / max(rolling_count("mid", WINDOW_3000MS_US), 1.0))
+        setf("spread_state_transition_rate_3000000us", rolling_sum("spread_changed", WINDOW_3000MS_US) / 3.0)
+        setf("microprice_realized_vol_1000000us", rolling_realized_vol_bps("microprice", WINDOW_1000MS_US))
         setf("best_bid_size_age_us", now - self.bid_size_age_start_ts_us)
         setf("best_ask_size_age_us", now - self.ask_size_age_start_ts_us)
-        bd = self._rolling_sum("bid_l1_rem", WINDOW_200MS_US)
-        ad = self._rolling_sum("ask_l1_rem", WINDOW_200MS_US)
+        bd = rolling_sum("bid_l1_rem", WINDOW_200MS_US)
+        ad = rolling_sum("ask_l1_rem", WINDOW_200MS_US)
         d = bd + ad
         setf("near_touch_depth_drop_asymmetry", 0.0 if d <= FLOAT_EPS else (ad - bd) / d)
         missing = BOOK_FEATURE_NAME_SET - assigned

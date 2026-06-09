@@ -582,3 +582,15 @@ def test_kyle_samples_become_ready_for_dataset_features():
     idx = dataset.feature_names.index("kyle_n_1ms")
     assert dataset.num_decisions >= 2
     assert dataset.features[-1, idx] >= 1.0
+
+
+def test_labels_for_decision_does_not_recompute_label_names():
+    source = Path("mmrt/execution/adverse_selection.py").read_text()
+    body = source.split("def _labels_for_decision", 1)[1].split("def build_adverse_selection_feature_dataset", 1)[0]
+    assert "adverse_selection_label_names(config)" not in body
+
+
+def test_counterfactual_fill_uses_precomputed_end_event_index():
+    source = Path("mmrt/execution/adverse_selection.py").read_text()
+    assert "end_event_index" in source
+    assert "np.searchsorted(events_local_ts_us" in source
