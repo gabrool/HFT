@@ -20,7 +20,7 @@ from mmrt.execution.adverse_signal import (
     load_adverse_selection_model,
     save_adverse_selection_signals,
 )
-from mmrt.execution.execution_tape import load_execution_tape
+from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 
 __all__ = [
     "BuildAdverseSelectionSignalsConfig",
@@ -103,7 +103,11 @@ def build_adverse_selection_signals_from_config(
     if output_json.exists() and not config.overwrite:
         raise FileExistsError(f"output_json already exists: {output_json}")
 
-    tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode)
+    tape = load_execution_tape(
+        config.tape_root,
+        mmap_mode=config.mmap_mode,
+        validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
+    )
     model = load_adverse_selection_model(config.model_npz)
     if model.exchange != tape.manifest.exchange or model.symbol != tape.manifest.symbol:
         raise ValueError("adverse-selection model exchange/symbol must match execution tape")

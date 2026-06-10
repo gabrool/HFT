@@ -15,7 +15,7 @@ from mmrt.execution.adverse_runtime import AdverseRuntimeConfig
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
 from mmrt.cli.execution_env_config import build_execution_env_config_from_attrs
 from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execution_tape
-from mmrt.execution.execution_tape import load_execution_tape
+from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
     load_linear_signal_artifact_npz,
@@ -262,7 +262,11 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
     if output_path.exists() and not config.overwrite:
         raise FileExistsError(str(output_path))
 
-    tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode)
+    tape = load_execution_tape(
+        config.tape_root,
+        mmap_mode=config.mmap_mode,
+        validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
+    )
     linear_signals_path = (
         Path(config.linear_signals_npz)
         if config.linear_signals_npz is not None

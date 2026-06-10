@@ -25,6 +25,7 @@ from mmrt.execution.execution_tape import (
     BOOK_ASK_TICKS_ARRAY_NAME,
     BOOK_ASK_SIZES_ARRAY_NAME,
     ExecutionTape,
+    ExecutionTapeValidationMode,
     ExecutionTapeArrays,
     build_execution_tape,
     execution_tape_manifest_from_dict,
@@ -605,3 +606,136 @@ def test_explicit_book_depth_pads_snapshots():
     assert tape.arrays.book_bid_sizes[0].tolist() == [1.0, 2.0, 0.0]
     assert tape.manifest.schema == "mmrt_execution_tape_book_depth"
     assert tape.manifest.notes["book_depth"] == "3"
+
+
+def test_load_execution_tape_defaults_to_full_for_in_memory_load(tmp_path):
+    tape = _basic_tape()
+    root = tmp_path / "tape"
+    save_execution_tape(tape, root)
+
+    loaded = load_execution_tape(root)
+
+    assert loaded.arrays.validation_mode is ExecutionTapeValidationMode.FULL
+
+
+def test_load_execution_tape_defaults_to_shape_only_for_mmap_load(tmp_path):
+    tape = _basic_tape()
+    root = tmp_path / "tape"
+    save_execution_tape(tape, root)
+
+    loaded = load_execution_tape(root, mmap_mode="r")
+
+    assert loaded.arrays.validation_mode is ExecutionTapeValidationMode.SHAPE_ONLY
+    assert isinstance(loaded.arrays.events, np.memmap)
+
+
+def test_load_execution_tape_shape_only_skips_full_event_scan(tmp_path, monkeypatch):
+    tape = _basic_tape()
+    root = tmp_path / "tape"
+    save_execution_tape(tape, root)
+
+    import mmrt.execution.execution_tape as execution_tape_module
+
+    def fail_full(*args, **kwargs):
+        raise AssertionError("full validator should not run")
+
+    monkeypatch.setattr(execution_tape_module, "_validate_events_array_full", fail_full)
+    monkeypatch.setattr(execution_tape_module, "_validate_book_depth_arrays_full", fail_full)
+
+    loaded = load_execution_tape(root, mmap_mode="r", validation_mode="shape_only")
+
+    assert loaded.manifest.num_events == tape.manifest.num_events
+    assert loaded.arrays.validation_mode is ExecutionTapeValidationMode.SHAPE_ONLY
+
+
+def test_load_execution_tape_full_calls_full_validators(tmp_path, monkeypatch):
+    tape = _basic_tape()
+    root = tmp_path / "tape"
+    save_execution_tape(tape, root)
+    flags = {"events": False, "book": False}
+
+    import mmrt.execution.execution_tape as execution_tape_module
+
+    def events_full(events, num_l2_events, num_trades):
+        flags["events"] = True
+
+    def book_full(book_bid_ticks, book_bid_sizes, book_ask_ticks, book_ask_sizes, *, num_l2_events):
+        flags["book"] = True
+
+    monkeypatch.setattr(execution_tape_module, "_validate_events_array_full", events_full)
+    monkeypatch.setattr(execution_tape_module, "_validate_book_depth_arrays_full", book_full)
+
+    loaded = load_execution_tape(root, mmap_mode="r", validation_mode="full")
+
+    assert loaded.arrays.validation_mode is ExecutionTapeValidationMode.FULL
+    assert flags == {"events": True, "book": True}
+
+
+def test_shape_only_still_rejects_bad_shapes(tmp_path):
+    tape = _basic_tape()
+    root = tmp_path / "tape"
+    save_execution_tape(tape, root)
+    np.save(root / "arrays" / "book_bid_sizes.npy", np.zeros((len(tape.arrays.l2_events), 3), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="same shape"):
+        load_execution_tape(root, mmap_mode="r", validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY)
+
+
+def test_shape_only_validation_does_not_call_full_validators_for_largeish_tape(tmp_path, monkeypatch):
+    n = 10_000
+    depth = 25
+    root = tmp_path / "tape"
+    arrays_dir = root / "arrays"
+    arrays_dir.mkdir(parents=True)
+    events = np.empty(n * 2, dtype=EVENT_DTYPE)
+    events[0::2]["event_seq"] = np.arange(0, n * 2, 2, dtype=np.int64)
+    events[1::2]["event_seq"] = np.arange(1, n * 2, 2, dtype=np.int64)
+    events["local_ts_us"] = np.arange(100, 100 + n * 2, dtype=np.int64)
+    events["ts_us"] = events["local_ts_us"]
+    events[0::2]["event_type_code"] = EVENT_TYPE_CODE_L2_BATCH
+    events[0::2]["book_ptr"] = np.arange(n, dtype=np.int64)
+    events[0::2]["trade_ptr"] = -1
+    events[1::2]["event_type_code"] = EVENT_TYPE_CODE_TRADE
+    events[1::2]["book_ptr"] = -1
+    events[1::2]["trade_ptr"] = np.arange(n, dtype=np.int64)
+    np.save(arrays_dir / "events.npy", events)
+    np.save(arrays_dir / "l2_events.npy", np.zeros(n, dtype=L2_EVENT_DTYPE))
+    np.save(arrays_dir / "trades.npy", np.zeros(n, dtype=TRADE_DTYPE))
+    np.save(arrays_dir / "book_bid_ticks.npy", np.zeros((n, depth), dtype=np.int64))
+    np.save(arrays_dir / "book_bid_sizes.npy", np.zeros((n, depth), dtype=np.float32))
+    np.save(arrays_dir / "book_ask_ticks.npy", np.zeros((n, depth), dtype=np.int64))
+    np.save(arrays_dir / "book_ask_sizes.npy", np.zeros((n, depth), dtype=np.float32))
+    manifest = _basic_tape().manifest
+    manifest = type(manifest)(
+        schema=manifest.schema,
+        tape_format=manifest.tape_format,
+        exchange=manifest.exchange,
+        symbol=manifest.symbol,
+        symbol_spec=manifest.symbol_spec,
+        symbol_rules=manifest.symbol_rules,
+        source_data_types=manifest.source_data_types,
+        array_names=manifest.array_names,
+        num_events=len(events),
+        num_l2_batches=n,
+        num_trades=n,
+        num_decisions=0,
+        start_local_ts_us=int(events["local_ts_us"][0]),
+        end_local_ts_us=int(events["local_ts_us"][-1]),
+        created_at_utc=manifest.created_at_utc,
+        symbol_rule_compatibility=manifest.symbol_rule_compatibility,
+        notes={"book_depth": str(depth)},
+    )
+    (root / "manifest.json").write_text(json.dumps(execution_tape_manifest_to_dict(manifest)), encoding="utf-8")
+
+    import mmrt.execution.execution_tape as execution_tape_module
+
+    def fail_full(*args, **kwargs):
+        raise AssertionError("full validator should not run")
+
+    monkeypatch.setattr(execution_tape_module, "_validate_events_array_full", fail_full)
+    monkeypatch.setattr(execution_tape_module, "_validate_book_depth_arrays_full", fail_full)
+
+    loaded = load_execution_tape(root, mmap_mode="r", validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY)
+
+    assert loaded.arrays.events.shape == (n * 2,)
+    assert loaded.arrays.book_bid_ticks.shape == (n, depth)

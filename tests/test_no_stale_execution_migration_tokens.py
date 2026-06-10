@@ -207,3 +207,25 @@ def test_build_execution_tape_parser_accepts_repeated_input_flags_source_guard()
     source = Path("mmrt/cli/build_execution_tape.py").read_text(encoding="utf-8")
     assert 'action="append"' in source
     assert 'nargs="+"' in source
+
+
+def test_large_tape_clis_use_shape_only_execution_tape_validation():
+    paths = [
+        Path("mmrt/cli/build_linear_signals.py"),
+        Path("mmrt/cli/train_adverse_selection.py"),
+        Path("mmrt/cli/build_adverse_selection_signals.py"),
+        Path("mmrt/cli/audit_execution_sim.py"),
+        Path("mmrt/cli/train_execution_ppo.py"),
+        Path("mmrt/cli/evaluate_execution_policy.py"),
+    ]
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        if "load_execution_tape(" in text:
+            assert "ExecutionTapeValidationMode.SHAPE_ONLY" in text or 'validation_mode="shape_only"' in text
+
+
+def test_streaming_execution_tape_writer_finalize_does_not_full_validate_by_default():
+    source = Path("mmrt/execution/execution_tape_writer.py").read_text(encoding="utf-8")
+    finalize_body = source.split("def finalize(", 1)[1].split("__all__", 1)[0]
+    assert "self.config.validation_mode" in finalize_body
+    assert "ExecutionTapeArrays(" not in finalize_body

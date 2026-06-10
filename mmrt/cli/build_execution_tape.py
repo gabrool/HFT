@@ -29,6 +29,7 @@ from mmrt.execution.event_merge import (
     ExecutionMergeTiePolicy,
     iter_merged_execution_events,
 )
+from mmrt.execution.execution_tape import ExecutionTapeValidationMode, _coerce_validation_mode
 from mmrt.execution.execution_tape_writer import StreamingExecutionTapeWriter, StreamingExecutionTapeWriterConfig
 from mmrt.execution.l2_reconstructor import (
     L2BookReconstructor,
@@ -68,6 +69,7 @@ class ExecutionTapeBuildConfig:
     chunk_rows: int = 250_000
     cleanup_chunks: bool = True
     created_at_utc: str = ""
+    tape_validation_mode: ExecutionTapeValidationMode | str = ExecutionTapeValidationMode.SHAPE_ONLY
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "l2_inputs", _tuple_of_nonempty_str(self.l2_inputs, "l2_inputs"))
@@ -101,6 +103,7 @@ class ExecutionTapeBuildConfig:
             raise ValueError("cleanup_chunks must be bool")
         if not isinstance(self.created_at_utc, str):
             raise ValueError("created_at_utc must be str")
+        object.__setattr__(self, "tape_validation_mode", _coerce_validation_mode(self.tape_validation_mode))
 
 
 def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[str, object]:
@@ -162,11 +165,13 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
             overwrite=config.overwrite,
             cleanup_chunks=config.cleanup_chunks,
             created_at_utc=config.created_at_utc,
+            validation_mode=config.tape_validation_mode,
             notes={
                 "builder": "mmrt.cli.build_execution_tape",
                 "tie_policy": config.tie_policy.value,
                 "chunk_rows": str(config.chunk_rows),
                 "streaming": "true",
+                "tape_validation_mode": config.tape_validation_mode.value,
             },
         )
     )
@@ -437,6 +442,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-rows", type=int, default=250_000)
     parser.add_argument("--keep-chunks", action="store_true")
     parser.add_argument("--created-at-utc", default="")
+    parser.add_argument(
+        "--tape-validation-mode",
+        choices=[mode.value for mode in ExecutionTapeValidationMode],
+        default=ExecutionTapeValidationMode.SHAPE_ONLY.value,
+    )
     return parser
 
 
@@ -472,6 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         chunk_rows=args.chunk_rows,
         cleanup_chunks=not args.keep_chunks,
         created_at_utc=args.created_at_utc,
+        tape_validation_mode=args.tape_validation_mode,
     )
     summary = build_execution_tape_from_config(config)
     print(json.dumps(_json_safe_summary(summary), sort_keys=True, separators=(",", ":"), allow_nan=False))
@@ -671,6 +682,7 @@ def _build_summary(config, output_root, l2_stats, trade_stats, merge_counters: E
             "chunk_rows": config.chunk_rows,
             "cleanup_chunks": config.cleanup_chunks,
             "chunk_summary": chunk_summary,
+            "tape_validation_mode": config.tape_validation_mode.value,
         },
         "warnings": warnings,
     }

@@ -6,7 +6,7 @@ import pytest
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, TradePrint
 from mmrt.execution.event_merge import iter_merged_execution_events, merge_execution_events
-from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape
+from mmrt.execution.execution_tape import ExecutionTapeValidationMode, build_execution_tape, load_execution_tape
 from mmrt.execution.execution_tape_writer import NpyChunkWriter, StreamingExecutionTapeWriter, StreamingExecutionTapeWriterConfig
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
@@ -143,3 +143,55 @@ def test_streaming_build_output_loads_with_mmap(tmp_path):
     writer.finalize()
     tape = load_execution_tape(tmp_path / "tape", mmap_mode="r")
     assert isinstance(tape.arrays.events, np.memmap)
+
+
+def test_streaming_writer_finalize_uses_shape_only_validation(tmp_path, monkeypatch):
+    import mmrt.execution.execution_tape as execution_tape_module
+
+    def fail_full(*args, **kwargs):
+        raise AssertionError("full validator should not run")
+
+    monkeypatch.setattr(execution_tape_module, "_validate_events_array_full", fail_full)
+    monkeypatch.setattr(execution_tape_module, "_validate_book_depth_arrays_full", fail_full)
+    writer = StreamingExecutionTapeWriter(
+        StreamingExecutionTapeWriterConfig(
+            output_root=str(tmp_path / "tape"), symbol_spec=_spec(), symbol_rules=_rules(), book_depth=2, chunk_rows=1
+        )
+    )
+    for event in iter_merged_execution_events([_l2(100)], [_trade(150)]):
+        writer.append(event)
+
+    result = writer.finalize()
+
+    assert result.tape.arrays.validation_mode is ExecutionTapeValidationMode.SHAPE_ONLY
+
+
+def test_streaming_writer_can_force_full_validation_for_tiny_tape(tmp_path, monkeypatch):
+    flags = {"events": False, "book": False}
+    import mmrt.execution.execution_tape as execution_tape_module
+
+    def events_full(events, num_l2_events, num_trades):
+        flags["events"] = True
+
+    def book_full(book_bid_ticks, book_bid_sizes, book_ask_ticks, book_ask_sizes, *, num_l2_events):
+        flags["book"] = True
+
+    monkeypatch.setattr(execution_tape_module, "_validate_events_array_full", events_full)
+    monkeypatch.setattr(execution_tape_module, "_validate_book_depth_arrays_full", book_full)
+    writer = StreamingExecutionTapeWriter(
+        StreamingExecutionTapeWriterConfig(
+            output_root=str(tmp_path / "tape"),
+            symbol_spec=_spec(),
+            symbol_rules=_rules(),
+            book_depth=2,
+            chunk_rows=1,
+            validation_mode="full",
+        )
+    )
+    for event in iter_merged_execution_events([_l2(100)], [_trade(150)]):
+        writer.append(event)
+
+    result = writer.finalize()
+
+    assert result.tape.arrays.validation_mode is ExecutionTapeValidationMode.FULL
+    assert flags == {"events": True, "book": True}

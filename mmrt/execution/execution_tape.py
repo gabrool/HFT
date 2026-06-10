@@ -8,6 +8,7 @@ or ML/RL work.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import json
 import math
@@ -96,6 +97,24 @@ _EXPECTED_ARRAY_NAMES = (
 _ALLOWED_MMAP_MODES = (None, "r", "r+")
 
 
+class ExecutionTapeValidationMode(str, Enum):
+    FULL = "full"
+    SHAPE_ONLY = "shape_only"
+
+
+def _coerce_validation_mode(
+    value: ExecutionTapeValidationMode | str,
+) -> ExecutionTapeValidationMode:
+    if isinstance(value, ExecutionTapeValidationMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return ExecutionTapeValidationMode(value)
+        except ValueError as exc:
+            raise ValueError(f"invalid execution tape validation mode: {value!r}") from exc
+    raise ValueError("validation_mode must be ExecutionTapeValidationMode or str")
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionTapeArrays:
     events: np.ndarray
@@ -105,19 +124,35 @@ class ExecutionTapeArrays:
     book_bid_sizes: np.ndarray
     book_ask_ticks: np.ndarray
     book_ask_sizes: np.ndarray
+    validation_mode: ExecutionTapeValidationMode | str = ExecutionTapeValidationMode.FULL
 
     def __post_init__(self) -> None:
-        _validate_array(self.events, EVENT_DTYPE, "events")
-        _validate_array(self.l2_events, L2_EVENT_DTYPE, "l2_events")
-        _validate_array(self.trades, TRADE_DTYPE, "trades")
-        _validate_book_depth_arrays(
+        mode = _coerce_validation_mode(self.validation_mode)
+        object.__setattr__(self, "validation_mode", mode)
+
+        _validate_array_shape(self.events, EVENT_DTYPE, "events")
+        _validate_array_shape(self.l2_events, L2_EVENT_DTYPE, "l2_events")
+        _validate_array_shape(self.trades, TRADE_DTYPE, "trades")
+        _validate_book_depth_arrays_shape(
             self.book_bid_ticks,
             self.book_bid_sizes,
             self.book_ask_ticks,
             self.book_ask_sizes,
             num_l2_events=len(self.l2_events),
         )
-        _validate_events_array(self.events, len(self.l2_events), len(self.trades))
+        if mode is ExecutionTapeValidationMode.FULL:
+            _validate_events_array_full(self.events, len(self.l2_events), len(self.trades))
+            _validate_book_depth_arrays_full(
+                self.book_bid_ticks,
+                self.book_bid_sizes,
+                self.book_ask_ticks,
+                self.book_ask_sizes,
+                num_l2_events=len(self.l2_events),
+            )
+        elif mode is ExecutionTapeValidationMode.SHAPE_ONLY:
+            pass
+        else:
+            raise RuntimeError("unhandled execution tape validation mode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,9 +408,28 @@ def save_execution_tape(tape: ExecutionTape, root: str | Path, *, overwrite: boo
     tmp_path.replace(manifest_path)
 
 
-def load_execution_tape(root: str | Path, *, mmap_mode: str | None = None) -> ExecutionTape:
+def load_execution_tape(
+    root: str | Path,
+    *,
+    mmap_mode: str | None = None,
+    validation_mode: ExecutionTapeValidationMode | str | None = None,
+) -> ExecutionTape:
+    """Load an execution tape from disk.
+
+    validation_mode=None means FULL for in-memory loads and SHAPE_ONLY for
+    mmap loads. Use FULL only for small tapes or explicit audits; it scans
+    whole arrays.
+    """
     if mmap_mode not in _ALLOWED_MMAP_MODES:
         raise ValueError("mmap_mode must be None, 'r', or 'r+'")
+    if validation_mode is None:
+        validation_mode = (
+            ExecutionTapeValidationMode.SHAPE_ONLY
+            if mmap_mode is not None
+            else ExecutionTapeValidationMode.FULL
+        )
+    else:
+        validation_mode = _coerce_validation_mode(validation_mode)
     root_path = Path(root)
     payload = json.loads((root_path / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     manifest = execution_tape_manifest_from_dict(payload)
@@ -388,8 +442,23 @@ def load_execution_tape(root: str | Path, *, mmap_mode: str | None = None) -> Ex
         book_bid_sizes=np.load(arrays_dir / f"{BOOK_BID_SIZES_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
         book_ask_ticks=np.load(arrays_dir / f"{BOOK_ASK_TICKS_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
         book_ask_sizes=np.load(arrays_dir / f"{BOOK_ASK_SIZES_ARRAY_NAME}.npy", mmap_mode=mmap_mode),
+        validation_mode=validation_mode,
     )
     return ExecutionTape(manifest=manifest, arrays=arrays)
+
+
+def validate_execution_tape_full(tape: ExecutionTape) -> None:
+    """Run full content validation on an already loaded execution tape."""
+    if not isinstance(tape, ExecutionTape):
+        raise ValueError("tape must be ExecutionTape")
+    _validate_events_array_full(tape.arrays.events, len(tape.arrays.l2_events), len(tape.arrays.trades))
+    _validate_book_depth_arrays_full(
+        tape.arrays.book_bid_ticks,
+        tape.arrays.book_bid_sizes,
+        tape.arrays.book_ask_ticks,
+        tape.arrays.book_ask_sizes,
+        num_l2_events=len(tape.arrays.l2_events),
+    )
 
 
 def merged_event_to_array_row(event: MergedExecutionEvent) -> tuple:
@@ -583,7 +652,7 @@ def _build_book_snapshot_arrays(
     for i, event in enumerate(l2_events):
         bid_ticks[i], bid_sizes[i], ask_ticks[i], ask_sizes[i] = book_snapshot_to_depth_rows(event, book_depth=depth)
 
-    _validate_book_depth_arrays(bid_ticks, bid_sizes, ask_ticks, ask_sizes, num_l2_events=n)
+    _validate_book_depth_arrays_full(bid_ticks, bid_sizes, ask_ticks, ask_sizes, num_l2_events=n)
     return bid_ticks, bid_sizes, ask_ticks, ask_sizes
 
 
@@ -605,7 +674,7 @@ def _trade_side_code(side: AggressorSide) -> int:
 
 
 
-def _validate_book_depth_arrays(
+def _validate_book_depth_arrays_shape(
     book_bid_ticks: np.ndarray,
     book_bid_sizes: np.ndarray,
     book_ask_ticks: np.ndarray,
@@ -624,6 +693,24 @@ def _validate_book_depth_arrays(
         raise ValueError("book depth arrays first dimension must equal l2_events length")
     if shape[1] <= 0:
         raise ValueError("book depth arrays second dimension must be > 0")
+
+
+def _validate_book_depth_arrays_full(
+    book_bid_ticks: np.ndarray,
+    book_bid_sizes: np.ndarray,
+    book_ask_ticks: np.ndarray,
+    book_ask_sizes: np.ndarray,
+    *,
+    num_l2_events: int,
+) -> None:
+    _validate_book_depth_arrays_shape(
+        book_bid_ticks,
+        book_bid_sizes,
+        book_ask_ticks,
+        book_ask_sizes,
+        num_l2_events=num_l2_events,
+    )
+    shape = book_bid_ticks.shape
     if np.any(book_bid_ticks < 0) or np.any(book_ask_ticks < 0):
         raise ValueError("book depth array ticks must be >= 0")
     if not np.all(np.isfinite(book_bid_sizes)) or not np.all(np.isfinite(book_ask_sizes)):
@@ -667,7 +754,7 @@ def _validate_padded_book_side(ticks: np.ndarray, sizes: np.ndarray, *, descendi
         raise ValueError(f"{name} ticks must be strictly ascending")
 
 
-def _validate_array(array: np.ndarray, dtype: np.dtype, name: str) -> None:
+def _validate_array_shape(array: np.ndarray, dtype: np.dtype, name: str) -> None:
     if not isinstance(array, np.ndarray):
         raise ValueError(f"{name} must be a NumPy array")
     if array.dtype != dtype:
@@ -678,7 +765,7 @@ def _validate_array(array: np.ndarray, dtype: np.dtype, name: str) -> None:
         raise ValueError(f"{name} must not use object dtype")
 
 
-def _validate_events_array(events: np.ndarray, num_l2_events: int, num_trades: int) -> None:
+def _validate_events_array_full(events: np.ndarray, num_l2_events: int, num_trades: int) -> None:
     expected_event_seq = np.arange(len(events), dtype=np.int64)
     if not np.array_equal(events["event_seq"], expected_event_seq):
         raise ValueError("events event_seq values must be contiguous from 0")
@@ -792,6 +879,7 @@ __all__ = [
     "EVENT_DTYPE",
     "L2_EVENT_DTYPE",
     "TRADE_DTYPE",
+    "ExecutionTapeValidationMode",
     "ExecutionTapeArrays",
     "ExecutionTape",
     "l2_event_to_array_row",
@@ -803,4 +891,5 @@ __all__ = [
     "build_execution_tape",
     "save_execution_tape",
     "load_execution_tape",
+    "validate_execution_tape_full",
 ]

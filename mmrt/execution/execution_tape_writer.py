@@ -28,8 +28,9 @@ from mmrt.execution.execution_tape import (
     TRADES_ARRAY_NAME,
     TRADE_DTYPE,
     ExecutionTape,
-    ExecutionTapeArrays,
+    ExecutionTapeValidationMode,
     _EXPECTED_ARRAY_NAMES,
+    _coerce_validation_mode,
     book_snapshot_to_depth_rows,
     execution_tape_manifest_to_dict,
     l2_event_to_array_row,
@@ -126,6 +127,7 @@ class StreamingExecutionTapeWriterConfig:
     cleanup_chunks: bool = True
     created_at_utc: str = ""
     notes: Mapping[str, str] | None = None
+    validation_mode: ExecutionTapeValidationMode | str = ExecutionTapeValidationMode.SHAPE_ONLY
 
     def __post_init__(self) -> None:
         if not isinstance(self.output_root, str) or not self.output_root.strip():
@@ -152,6 +154,7 @@ class StreamingExecutionTapeWriterConfig:
             for key, value in self.notes.items():
                 if not isinstance(key, str) or not isinstance(value, str):
                     raise ValueError("notes must be Mapping[str, str]")
+        object.__setattr__(self, "validation_mode", _coerce_validation_mode(self.validation_mode))
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,26 +278,21 @@ class StreamingExecutionTapeWriter:
             symbol_rule_compatibility=symbol_rule_compatibility,
             notes=notes,
         )
-        validation_arrays = ExecutionTapeArrays(
-            events=np.load(self.arrays_dir / f"{EVENTS_ARRAY_NAME}.npy", mmap_mode="r"),
-            l2_events=np.load(self.arrays_dir / f"{L2_EVENTS_ARRAY_NAME}.npy", mmap_mode="r"),
-            trades=np.load(self.arrays_dir / f"{TRADES_ARRAY_NAME}.npy", mmap_mode="r"),
-            book_bid_ticks=np.load(self.arrays_dir / f"{BOOK_BID_TICKS_ARRAY_NAME}.npy", mmap_mode="r"),
-            book_bid_sizes=np.load(self.arrays_dir / f"{BOOK_BID_SIZES_ARRAY_NAME}.npy", mmap_mode="r"),
-            book_ask_ticks=np.load(self.arrays_dir / f"{BOOK_ASK_TICKS_ARRAY_NAME}.npy", mmap_mode="r"),
-            book_ask_sizes=np.load(self.arrays_dir / f"{BOOK_ASK_SIZES_ARRAY_NAME}.npy", mmap_mode="r"),
-        )
-        ExecutionTape(manifest=manifest, arrays=validation_arrays)
         manifest_text = json.dumps(execution_tape_manifest_to_dict(manifest), sort_keys=True, indent=2)
         tmp_path = self.output_root / f"{MANIFEST_FILENAME}.tmp"
         tmp_path.write_text(manifest_text + "\n", encoding="utf-8")
         tmp_path.replace(self.output_root / MANIFEST_FILENAME)
-        tape = load_execution_tape(self.output_root, mmap_mode="r")
+        tape = load_execution_tape(
+            self.output_root,
+            mmap_mode="r",
+            validation_mode=self.config.validation_mode,
+        )
         chunk_summary: dict[str, object] = {
             "chunk_dir": str(self.chunk_dir),
             "chunk_rows": self.config.chunk_rows,
             "row_counts": row_counts,
             "chunk_files": {name: len(writer._chunk_paths) for name, writer in self._writers.items()},
+            "tape_validation_mode": self.config.validation_mode.value,
         }
         self._finalized = True
         if self.config.cleanup_chunks:

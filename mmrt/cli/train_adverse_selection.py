@@ -22,7 +22,7 @@ from mmrt.execution.adverse_selection import (
     summarize_adverse_selection_dataset,
 )
 from mmrt.execution.contracts import LatencyConfig, QueueModelMode
-from mmrt.execution.execution_tape import load_execution_tape
+from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
 
@@ -637,7 +637,11 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     if model_npz.exists() and not config.overwrite:
         raise FileExistsError(f"model_npz already exists: {model_npz}")
 
-    tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode)
+    tape = load_execution_tape(
+        config.tape_root,
+        mmap_mode=config.mmap_mode,
+        validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
+    )
     adverse_config = _build_adverse_selection_config(config)
     dataset = build_adverse_selection_dataset(tape, config=adverse_config)
     dataset_summary = summarize_adverse_selection_dataset(dataset)
