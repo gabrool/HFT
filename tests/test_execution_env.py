@@ -218,7 +218,7 @@ def _linear_signals_for_decisions(tape, decision_event_index, decision_local_ts_
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
         decision_interval_us=100,
-        start_event_index=0,
+        start_event_index=int(decision_event_index[0]),
         n_rows=len(decision_event_index),
     )
     return LinearSignalArtifact(
@@ -480,18 +480,17 @@ def test_execution_env_rejects_insufficient_linear_signal_rows():
         ExecutionEnv(tape, linear_signals=_linear_signals(tape, n_rows=4), config=_env_config(max_episode_steps=4))
 
 
-def test_execution_env_rejects_signal_event_index_mismatch():
+def test_linear_signal_artifact_rejects_metadata_start_event_index_mismatch():
     tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
     artifact = _linear_signals(tape, n_rows=2)
-    bad = LinearSignalArtifact(
-        arrays=artifact.arrays,
-        metadata=artifact.metadata,
-        decision_event_index=np.asarray([1, 2], dtype=np.int64),
-        decision_local_ts_us=artifact.decision_local_ts_us,
-    )
-    env = ExecutionEnv(tape, linear_signals=bad, config=_env_config())
-    with pytest.raises(ValueError, match="decision_event_index mismatch"):
-        env.reset()
+
+    with pytest.raises(ValueError, match="metadata.start_event_index"):
+        LinearSignalArtifact(
+            arrays=artifact.arrays,
+            metadata=artifact.metadata,
+            decision_event_index=np.asarray([1, 2], dtype=np.int64),
+            decision_local_ts_us=artifact.decision_local_ts_us,
+        )
 
 
 def test_execution_env_rejects_signal_local_ts_mismatch():
@@ -1304,3 +1303,14 @@ def test_env_build_observation_computes_adverse_predictions_once():
     source = Path("mmrt/execution/env.py").read_text()
     assert "_adverse_observation_features_for_step" not in source
     assert "_edge_observation_features_for_step" not in source
+
+
+def test_env_reset_rejects_start_event_index_not_on_linear_signal_grid():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
+        [],
+    )
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(tape, start_event_index=1), config=_env_config())
+
+    with pytest.raises(ValueError, match="linear signal decision_event_index"):
+        env.reset(start_event_index=0)

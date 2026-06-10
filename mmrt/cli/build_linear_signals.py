@@ -18,17 +18,10 @@ from mmrt.execution.linear_signal import (
 )
 from mmrt.execution.linear_signal_builder import (
     build_execution_linear_feature_dataset,
-    build_linear_signal_artifact_from_execution_features,
+    build_linear_signal_build_result,
     execution_linear_feature_dataset_summary,
-    linear_prediction_summary,
-    predict_linear_heads_for_execution_features,
 )
-from mmrt.linear.train import (
-    LINEAR_TRAINING_RESULT_SCHEMA,
-    linear_model_bundle_from_train_result,
-    linear_preprocess_states_from_train_result,
-    load_linear_train_result,
-)
+from mmrt.linear.train import LINEAR_TRAINING_RESULT_SCHEMA, load_linear_train_result
 
 __all__ = [
     "BuildLinearSignalsConfig",
@@ -157,21 +150,14 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
         max_decisions=config.max_decisions,
         output_dtype=config.output_dtype,
     )
-    artifact = build_linear_signal_artifact_from_execution_features(
+    build_result = build_linear_signal_build_result(
         tape=tape,
         feature_dataset=features,
         linear_train_result=result,
         signal_config=LinearSignalConfig(magnitude_input=config.magnitude_input),
         output_dtype=config.output_dtype,
     )
-    model_bundle = linear_model_bundle_from_train_result(result)
-    preprocess_states = linear_preprocess_states_from_train_result(result)
-    predictions = predict_linear_heads_for_execution_features(
-        feature_dataset=features,
-        model_bundle=model_bundle,
-        preprocess_states_by_head=preprocess_states,
-        output_dtype=config.output_dtype,
-    )
+    artifact = build_result.artifact
     save_linear_signal_artifact_npz(output_npz, artifact, overwrite=config.overwrite)
 
     summary: dict[str, object] = {
@@ -189,7 +175,13 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
         },
         "feature_dataset": execution_linear_feature_dataset_summary(features),
         "linear_signals": linear_signal_artifact_summary(artifact, path=str(output_npz)),
-        "prediction_summary": linear_prediction_summary(predictions, artifact),
+        "alignment": {
+            "replay_start_event_index": features.replay_start_event_index,
+            "first_signal_event_index": int(artifact.decision_event_index[0]),
+            "first_signal_local_ts_us": int(artifact.decision_local_ts_us[0]),
+            "n_signal_rows": artifact.n_rows,
+        },
+        "prediction_summary": build_result.prediction_summary,
         "config": config.as_dict(),
     }
     _write_json_atomic(output_json, summary, overwrite=config.overwrite)

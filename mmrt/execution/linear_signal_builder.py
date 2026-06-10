@@ -82,6 +82,7 @@ class ExecutionLinearFeatureDataset:
     decision_local_ts_us: np.ndarray
     features: np.ndarray
     feature_names: tuple[str, ...]
+    replay_start_event_index: int
     start_event_index: int
     decision_interval_us: int
 
@@ -115,11 +116,19 @@ class ExecutionLinearFeatureDataset:
         names = _coerce_feature_names(tuple(self.feature_names))
         if len(names) != features.shape[1]:
             raise ValueError("feature_names length must equal features width")
+        replay_start = _require_nonnegative_int(self.replay_start_event_index, "replay_start_event_index")
+        start = _require_nonnegative_int(self.start_event_index, "start_event_index")
+        if event_idx.size:
+            if start != int(event_idx[0]):
+                raise ValueError("start_event_index must equal first decision_event_index when decisions exist")
+            if replay_start > start:
+                raise ValueError("replay_start_event_index must be <= start_event_index")
         object.__setattr__(self, "decision_event_index", event_idx)
         object.__setattr__(self, "decision_local_ts_us", local_ts)
         object.__setattr__(self, "features", features)
         object.__setattr__(self, "feature_names", names)
-        object.__setattr__(self, "start_event_index", _require_nonnegative_int(self.start_event_index, "start_event_index"))
+        object.__setattr__(self, "replay_start_event_index", replay_start)
+        object.__setattr__(self, "start_event_index", start)
         object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
 
     @property
@@ -143,6 +152,7 @@ def execution_linear_feature_dataset_summary(dataset: ExecutionLinearFeatureData
         "first_decision_local_ts_us": int(dataset.decision_local_ts_us[0]) if dataset.num_decisions else None,
         "last_decision_local_ts_us": int(dataset.decision_local_ts_us[-1]) if dataset.num_decisions else None,
         "decision_interval_us": dataset.decision_interval_us,
+        "replay_start_event_index": dataset.replay_start_event_index,
         "start_event_index": dataset.start_event_index,
     }
 
@@ -238,12 +248,14 @@ def build_execution_linear_feature_dataset(
         features = np.ascontiguousarray(np.vstack(feature_rows), dtype=dtype)
     else:
         features = np.empty((0, len(names)), dtype=dtype)
+    effective_start_event_index = int(decision_event_index[0]) if decision_event_index else start
     return ExecutionLinearFeatureDataset(
         decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
         decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
         features=features,
         feature_names=names,
-        start_event_index=start,
+        replay_start_event_index=start,
+        start_event_index=effective_start_event_index,
         decision_interval_us=decision_interval_us,
     )
 
@@ -252,6 +264,7 @@ def build_execution_linear_feature_dataset(
 class LinearSignalBuildResult:
     feature_dataset: ExecutionLinearFeatureDataset
     artifact: LinearSignalArtifact
+    predictions: dict[str, np.ndarray]
     prediction_summary: dict[str, object]
 
 
@@ -306,14 +319,18 @@ def predict_linear_heads_for_execution_features(
     }
 
 
-def build_linear_signal_artifact_from_execution_features(
+def build_linear_signal_build_result(
     *,
     tape: ExecutionTape,
     feature_dataset: ExecutionLinearFeatureDataset,
     linear_train_result: LinearTrainResult,
     signal_config: LinearSignalConfig = LinearSignalConfig(),
     output_dtype: str = "float32",
-) -> LinearSignalArtifact:
+) -> LinearSignalBuildResult:
+    if not isinstance(feature_dataset, ExecutionLinearFeatureDataset):
+        raise ValueError("feature_dataset must be ExecutionLinearFeatureDataset")
+    if feature_dataset.num_decisions <= 0:
+        raise ValueError("feature_dataset must contain at least one decision")
     model_bundle = linear_model_bundle_from_train_result(linear_train_result)
     preprocess_states = linear_preprocess_states_from_train_result(linear_train_result)
     predictions = predict_linear_heads_for_execution_features(
@@ -355,7 +372,29 @@ def build_linear_signal_artifact_from_execution_features(
         decision_interval_us=feature_dataset.decision_interval_us,
         start_event_index=feature_dataset.start_event_index,
     )
-    return artifact
+    return LinearSignalBuildResult(
+        feature_dataset=feature_dataset,
+        artifact=artifact,
+        predictions=predictions,
+        prediction_summary=linear_prediction_summary(predictions, artifact),
+    )
+
+
+def build_linear_signal_artifact_from_execution_features(
+    *,
+    tape: ExecutionTape,
+    feature_dataset: ExecutionLinearFeatureDataset,
+    linear_train_result: LinearTrainResult,
+    signal_config: LinearSignalConfig = LinearSignalConfig(),
+    output_dtype: str = "float32",
+) -> LinearSignalArtifact:
+    return build_linear_signal_build_result(
+        tape=tape,
+        feature_dataset=feature_dataset,
+        linear_train_result=linear_train_result,
+        signal_config=signal_config,
+        output_dtype=output_dtype,
+    ).artifact
 
 
 def _stats(arr: np.ndarray, *, include_std: bool) -> dict[str, object]:
@@ -401,6 +440,7 @@ __all__ = [
     "build_execution_linear_feature_dataset",
     "LinearSignalBuildResult",
     "predict_linear_heads_for_execution_features",
+    "build_linear_signal_build_result",
     "build_linear_signal_artifact_from_execution_features",
     "linear_prediction_summary",
 ]

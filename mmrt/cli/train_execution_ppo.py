@@ -437,8 +437,8 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
-def _effective_start_event_index(value: int | None) -> int:
-    return 0 if value is None else value
+def _effective_start_event_index(value: int | None, linear_signals) -> int:
+    return int(linear_signals.decision_event_index[0]) if value is None else value
 
 
 def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingConfig:
@@ -541,7 +541,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
         decision_interval_us=config.decision_interval_us,
-        start_event_index=_effective_start_event_index(config.start_event_index),
+        start_event_index=_effective_start_event_index(config.start_event_index, linear_signals),
         min_rows=(config.max_episode_steps + 1) if config.max_episode_steps is not None else None,
     )
     env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals, adverse_signals=adverse_signals)
