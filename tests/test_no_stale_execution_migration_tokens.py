@@ -171,3 +171,17 @@ def test_env_computes_signal_end_before_reward_step():
     source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
     step_body = source.split("def step(", 1)[1].split("def _event_key_at_index", 1)[0]
     assert step_body.find("terminal_due_to_signal_end") < step_body.find("compute_reward_step(")
+
+
+def test_execution_env_nonterminal_step_targets_next_linear_signal_row():
+    source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
+    step_body = source.split("def step(", 1)[1].split("def _event_key_at_index", 1)[0]
+
+    assert "target_event_index" in step_body
+    assert "self.linear_signals.decision_event_index[next_signal_row]" in step_body
+    assert "_validate_next_signal_target" in source
+
+    fallback_body = source.split("def _fallback", 1)[1] if "def _fallback" in source else ""
+    old_token = "processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us"
+    if old_token in step_body:
+        assert old_token in fallback_body

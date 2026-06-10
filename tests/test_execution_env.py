@@ -44,7 +44,6 @@ from mmrt.execution.reward import RewardConfig
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
 
-
 def _rules():
     return ExchangeSymbolRules(
         exchange="binance-futures", symbol="BTCUSDT", mode=SymbolRuleMode.CURRENT_RULES_REPLAY,
@@ -628,7 +627,7 @@ def test_post_only_safe_at_decision_but_marketable_at_activation_is_rejected():
     tape = _tape(l2_events, trades)
     env = ExecutionEnv(
         tape,
-        linear_signals=_linear_signals_for_decisions(tape, [0, 2], [100, 150]),
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
         config=_env_config(
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
@@ -781,6 +780,7 @@ def test_activation_at_exact_event_key_does_not_fill_on_that_event():
     l2_events = [
         _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
         _l2(seq=1, local_ts_us=160, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
+        _l2(seq=2, local_ts_us=180, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
     ]
     trades = [
         _trade(local_ts_us=150, side=AggressorSide.SELL, price_tick=1001, amount=10.0, source_row=0),
@@ -789,7 +789,7 @@ def test_activation_at_exact_event_key_does_not_fill_on_that_event():
     tape = _tape(l2_events, trades)
     env = ExecutionEnv(
         tape,
-        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 160]),
+        linear_signals=_linear_signals_for_decisions(tape, [0, 4], [100, 180]),
         config=_env_config(
             decision_interval_us=200,
             latency_config=LatencyConfig(
@@ -1333,7 +1333,101 @@ def test_signal_end_terminal_applies_terminal_inventory_penalty():
 
     assert step.done is True
     assert step.info["terminal_due_to_signal_end"] is True
+    assert step.info["next_signal_row_index"] is None
+    assert step.info["target_signal_event_index"] is None
     assert step.execution.reward.terminal_penalty > 0.0
+
+
+def test_step_advances_to_next_linear_signal_event_not_time_boundary_trade():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=120),
+        _l2(seq=2, local_ts_us=151),
+        _l2(seq=3, local_ts_us=250),
+    ]
+    trades = [
+        _trade(local_ts_us=149, side=AggressorSide.SELL, price_tick=1000, amount=1.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    linear = _linear_signals_for_decisions(tape, [0, 3], [100, 151])
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config(decision_interval_us=50))
+    env.reset()
+
+    step = env.step(_disabled_action())
+
+    assert step.done is False
+    assert step.truncated is False
+    assert step.info["event_index"] == 3
+    assert step.info["current_book_ptr"] == int(tape.arrays.events[3]["book_ptr"])
+    assert step.info["target_signal_event_index"] == 3
+    assert step.info["next_signal_row_index"] == 1
+    assert step.info["terminal_due_to_signal_end"] is False
+    assert step.info["terminal_due_to_tape_end"] is False
+
+
+def test_step_replays_all_events_through_target_signal_event():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=151),
+    ]
+    trades = [
+        _trade(local_ts_us=120, side=AggressorSide.SELL, price_tick=1001, amount=2.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    linear = _linear_signals_for_decisions(tape, [0, 2], [100, 151])
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config(decision_interval_us=50))
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert step.info["events_processed"] == 2
+    assert step.info["event_index"] == 2
+    assert step.info["target_signal_event_index"] == 2
+    assert step.info["num_fills"] >= 1
+
+
+def test_max_episode_steps_truncates_after_full_signal_interval():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=120),
+        _l2(seq=2, local_ts_us=151),
+        _l2(seq=3, local_ts_us=250),
+    ]
+    trades = [
+        _trade(local_ts_us=149, side=AggressorSide.SELL, price_tick=1000, amount=1.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    linear = _linear_signals_for_decisions(tape, [0, 3], [100, 151])
+    env = ExecutionEnv(
+        tape,
+        linear_signals=linear,
+        config=_env_config(decision_interval_us=50, max_episode_steps=1),
+    )
+    env.reset()
+
+    step = env.step(_disabled_action())
+
+    assert step.truncated is True
+    assert step.info["event_index"] == 3
+    assert step.info["target_signal_event_index"] == 3
+    assert step.info["next_signal_row_index"] == 1
+
+
+def test_step_rejects_next_linear_signal_row_that_is_not_l2_event():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=150),
+    ]
+    trades = [
+        _trade(local_ts_us=120, side=AggressorSide.SELL, price_tick=1000, amount=1.0, source_row=0),
+    ]
+    tape = _tape(l2_events, trades)
+    linear = _linear_signals_for_decisions(tape, [0, 1], [100, 120])
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config(decision_interval_us=50))
+    env.reset()
+
+    with pytest.raises(ValueError, match="target event must reference an L2"):
+        env.step(_disabled_action())
 
 
 def test_env_reset_accepts_later_linear_signal_start_row():
