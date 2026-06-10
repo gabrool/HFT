@@ -72,7 +72,6 @@ from mmrt.execution.quote_geometry import (
 from mmrt.execution.reward import RewardConfig, compute_reward_step
 
 
-
 def _require_positive_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an int")
@@ -201,6 +200,12 @@ class ExecutionEnvStep:
     @property
     def position(self) -> PositionState:
         return self.execution.position
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayEventResult:
+    fills: tuple[Fill, ...]
+    processed_valid_l2: bool
 
 
 @dataclass(slots=True)
@@ -424,53 +429,60 @@ class ExecutionEnv:
         self._activate_pending_orders_at(event_key=decision_key, book_ptr=state.current_book_ptr)
         state.next_order_id = _next_order_id_after(replacement_orders, state.next_order_id)
 
-        decision_end_local_ts_us = previous_book_top.local_ts_us + self.config.decision_interval_us
+        next_signal_row = decision_signal_row + 1
+        has_next_signal = next_signal_row < self.linear_signals.n_rows
+        target_event_index: int | None = None
+        if has_next_signal:
+            # Non-terminal stepping targets self.linear_signals.decision_event_index[next_signal_row].
+            target_event_index = self._validate_next_signal_target(
+                next_signal_row=next_signal_row,
+                current_event_index=state.event_index,
+            )
+
         next_event_index = state.event_index + 1
-        processed_any = False
-        processed_valid_l2 = False
         events_processed = 0
         fills: list[Fill] = []
-        truncated = False
 
-        while next_event_index < num_events:
-            event_local = int(events[next_event_index]["local_ts_us"])
-            if processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us:
-                break
+        if has_next_signal:
+            assert target_event_index is not None
+            while next_event_index <= target_event_index:
+                replay = self._replay_one_event_for_step(next_event_index)
+                fills.extend(replay.fills)
+                events_processed += 1
+                next_event_index += 1
 
-            event_code = int(events[next_event_index]["event_type_code"])
-            event_book_ptr = int(events[next_event_index]["book_ptr"])
-            event_key = self._event_key_at_index(next_event_index)
-            cancels = finalize_effective_cancels(state.live_orders, event_key=event_key)
-            state.live_orders = _live_orders_tuple(cancels.orders)
-            self._step_diag["effective_cancel_count"] = int(self._step_diag["effective_cancel_count"]) + cancels.cancelled_count
-            if event_key.event_seq > 0:
-                pre_activation_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1)
-            else:
-                pre_activation_key = EventKey(max(event_key.local_ts_us - 1, 1), MAX_EVENT_SEQ)
-            self._activate_pending_orders_at(
-                event_key=pre_activation_key,
-                book_ptr=state.current_book_ptr,
-            )
-            fills.extend(self._process_event(next_event_index))
-            self._activate_pending_orders_at(
-                event_key=event_key,
-                book_ptr=state.current_book_ptr,
-            )
-            if event_code == EVENT_TYPE_CODE_L2_BATCH and event_book_ptr >= 0:
-                processed_valid_l2 = processed_valid_l2 or self._book_top_from_ptr(event_book_ptr) is not None
-            processed_any = True
-            events_processed += 1
-            next_event_index += 1
+            if state.event_index != target_event_index:
+                raise RuntimeError("execution env failed to advance to target linear signal event")
+            if state.signal_row_index != decision_signal_row:
+                raise RuntimeError("execution env signal row changed during target replay")
+        else:
+            decision_end_local_ts_us = self._fallback_terminal_replay_end_local_ts_us(previous_book_top)
+            processed_any = False
+            processed_valid_l2 = False
+            while next_event_index < num_events:
+                event_local = int(events[next_event_index]["local_ts_us"])
+                if self._fallback_terminal_replay_should_stop(
+                    processed_any=processed_any,
+                    processed_valid_l2=processed_valid_l2,
+                    event_local=event_local,
+                    decision_end_local_ts_us=decision_end_local_ts_us,
+                ):
+                    break
 
-            if self.config.max_episode_steps is not None and state.step_index + 1 >= self.config.max_episode_steps:
-                truncated = True
-                break
+                replay = self._replay_one_event_for_step(next_event_index)
+                fills.extend(replay.fills)
+                processed_any = True
+                processed_valid_l2 = processed_valid_l2 or replay.processed_valid_l2
+                events_processed += 1
+                next_event_index += 1
 
-        next_signal_row = state.signal_row_index + 1
-        terminal_due_to_signal_end = next_signal_row >= self.linear_signals.n_rows
-
-        done = False if truncated else next_event_index >= num_events
-        done = bool(done or terminal_due_to_signal_end)
+        terminal_due_to_signal_end = not has_next_signal
+        terminal_due_to_tape_end = target_event_index is not None and target_event_index + 1 >= num_events
+        truncated = (
+            self.config.max_episode_steps is not None
+            and state.step_index + 1 >= self.config.max_episode_steps
+        )
+        done = bool(terminal_due_to_signal_end or terminal_due_to_tape_end)
         state.done = done
         state.truncated = truncated
 
@@ -491,14 +503,21 @@ class ExecutionEnv:
         self._peak_equity = reward_step.peak_equity
         self._last_step_fills = step_fills
         state.step_index += 1
-        if not terminal_due_to_signal_end:
+        if has_next_signal:
             state.signal_row_index = next_signal_row
+            if state.event_index != int(self.linear_signals.decision_event_index[state.signal_row_index]):
+                raise RuntimeError("execution env state is not aligned to the current linear signal row")
+            if state.signal_row_index != next_signal_row:
+                raise RuntimeError("execution env failed to advance to target linear signal row")
 
         info: dict[str, object] = {
             "step_index": state.step_index - 1,
             "linear_signal_row": decision_signal_row,
             "signal_row_index": decision_signal_row,
+            "next_signal_row_index": None if not has_next_signal else next_signal_row,
+            "target_signal_event_index": target_event_index,
             "terminal_due_to_signal_end": terminal_due_to_signal_end,
+            "terminal_due_to_tape_end": terminal_due_to_tape_end,
             "event_index": state.event_index,
             "current_book_ptr": state.current_book_ptr,
             "events_processed": events_processed,
@@ -568,6 +587,9 @@ class ExecutionEnv:
         if terminal_due_to_signal_end:
             observation = np.array(self._last_observation, copy=True)
         else:
+            expected_event_index = int(self.linear_signals.decision_event_index[state.signal_row_index])
+            if state.event_index != expected_event_index:
+                raise RuntimeError("execution env state is not aligned to the current linear signal row")
             observation = self._build_observation()
             self._last_observation = np.array(observation, copy=True)
         return ExecutionEnvStep(
@@ -575,6 +597,93 @@ class ExecutionEnv:
             reward=reward_step.reward.total_reward * self.config.reward_config.reward_scale,
             execution=execution,
         )
+
+    def _validate_next_signal_target(
+        self,
+        *,
+        next_signal_row: int,
+        current_event_index: int,
+    ) -> int:
+        next_signal_row = _require_nonnegative_int(next_signal_row, "next_signal_row")
+        current_event_index = _require_nonnegative_int(current_event_index, "current_event_index")
+        if next_signal_row >= self.linear_signals.n_rows:
+            raise ValueError("next_signal_row must be < linear_signals.n_rows")
+
+        target_event_index = int(self.linear_signals.decision_event_index[next_signal_row])
+        if target_event_index <= current_event_index:
+            raise ValueError("linear signal decision_event_index must advance strictly between env steps")
+        if target_event_index >= len(self.tape.arrays.events):
+            raise ValueError("linear signal target event index is outside tape events")
+
+        event = self.tape.arrays.events[target_event_index]
+        if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
+            raise ValueError("linear signal target event must reference an L2 batch event")
+
+        book_ptr = int(event["book_ptr"])
+        if book_ptr < 0 or self._book_top_from_ptr(book_ptr) is None:
+            raise ValueError("linear signal target event must reference a valid two-sided L2 book")
+
+        expected_local_ts_us = int(self.linear_signals.decision_local_ts_us[next_signal_row])
+        actual_local_ts_us = int(event["local_ts_us"])
+        if actual_local_ts_us != expected_local_ts_us:
+            raise ValueError("linear signal target local_ts_us must match target tape event local_ts_us")
+
+        return target_event_index
+
+    def _replay_one_event_for_step(self, event_index: int) -> _ReplayEventResult:
+        state = self._require_state()
+        events = self.tape.arrays.events
+
+        event_code = int(events[event_index]["event_type_code"])
+        event_book_ptr = int(events[event_index]["book_ptr"])
+        event_key = self._event_key_at_index(event_index)
+
+        cancels = finalize_effective_cancels(state.live_orders, event_key=event_key)
+        state.live_orders = _live_orders_tuple(cancels.orders)
+        self._step_diag["effective_cancel_count"] = (
+            int(self._step_diag["effective_cancel_count"]) + cancels.cancelled_count
+        )
+
+        if event_key.event_seq > 0:
+            pre_activation_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1)
+        else:
+            pre_activation_key = EventKey(max(event_key.local_ts_us - 1, 1), MAX_EVENT_SEQ)
+
+        self._activate_pending_orders_at(
+            event_key=pre_activation_key,
+            book_ptr=state.current_book_ptr,
+        )
+
+        fills = self._process_event(event_index)
+
+        self._activate_pending_orders_at(
+            event_key=event_key,
+            book_ptr=state.current_book_ptr,
+        )
+
+        processed_valid_l2 = (
+            event_code == EVENT_TYPE_CODE_L2_BATCH
+            and event_book_ptr >= 0
+            and self._book_top_from_ptr(event_book_ptr) is not None
+        )
+
+        return _ReplayEventResult(
+            fills=fills,
+            processed_valid_l2=processed_valid_l2,
+        )
+
+    def _fallback_terminal_replay_end_local_ts_us(self, previous_book_top: BookTop) -> int:
+        return previous_book_top.local_ts_us + self.config.decision_interval_us
+
+    def _fallback_terminal_replay_should_stop(
+        self,
+        *,
+        processed_any: bool,
+        processed_valid_l2: bool,
+        event_local: int,
+        decision_end_local_ts_us: int,
+    ) -> bool:
+        return processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us
 
     def _event_key_at_index(self, event_index: int) -> EventKey:
         row = self.tape.arrays.events[event_index]
