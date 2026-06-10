@@ -5,6 +5,7 @@ import pytest
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import ExecutionEventRef, ExecutionEventType, TradePrint
 from mmrt.execution.event_merge import (
+    ExecutionMergeCounterAccumulator,
     ExecutionMergeTiePolicy,
     MergedExecutionEvent,
     iter_merged_execution_events,
@@ -191,3 +192,19 @@ def test_execution_event_merge_has_no_heavy_imports():
     assert "import pandas" not in source
     assert "import pyarrow" not in source
     assert "import numpy" not in source
+
+
+def test_iter_merged_execution_events_counter_matches_materialized_plan():
+    l2_events = [_l2(100, seq=0), _l2(200, seq=1)]
+    trades = [_trade(100, idx=0), _trade(250, idx=1)]
+    acc = ExecutionMergeCounterAccumulator()
+    streamed = tuple(iter_merged_execution_events(l2_events, trades, counter=acc))
+    materialized = merge_execution_events(l2_events, trades)
+    assert streamed == materialized.events
+    assert acc.as_counters() == materialized.counters
+    assert acc.as_dict() == {
+        "l2_event_count": materialized.counters.l2_event_count,
+        "trade_count": materialized.counters.trade_count,
+        "emitted_event_count": materialized.counters.emitted_event_count,
+        "same_local_ts_tie_count": materialized.counters.same_local_ts_tie_count,
+    }

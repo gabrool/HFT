@@ -83,6 +83,44 @@ class MergedExecutionEvent:
                 raise ValueError("ts_us must equal trade.ts_us")
 
 
+@dataclass(slots=True)
+class ExecutionMergeCounterAccumulator:
+    l2_event_count: int = 0
+    trade_count: int = 0
+    emitted_event_count: int = 0
+    same_local_ts_tie_count: int = 0
+
+    def update_event(self, event: MergedExecutionEvent) -> None:
+        if not isinstance(event, MergedExecutionEvent):
+            raise ValueError("event must be MergedExecutionEvent")
+        if event.l2_event is not None:
+            self.l2_event_count += 1
+        elif event.trade is not None:
+            self.trade_count += 1
+        else:
+            raise ValueError("merged event must contain l2_event or trade")
+        self.emitted_event_count += 1
+
+    def update_tie(self) -> None:
+        self.same_local_ts_tie_count += 1
+
+    def as_counters(self) -> ExecutionMergeCounters:
+        return ExecutionMergeCounters(
+            l2_event_count=self.l2_event_count,
+            trade_count=self.trade_count,
+            emitted_event_count=self.emitted_event_count,
+            same_local_ts_tie_count=self.same_local_ts_tie_count,
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "l2_event_count": self.l2_event_count,
+            "trade_count": self.trade_count,
+            "emitted_event_count": self.emitted_event_count,
+            "same_local_ts_tie_count": self.same_local_ts_tie_count,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionMergePlan:
     events: tuple[MergedExecutionEvent, ...]
@@ -110,10 +148,11 @@ def iter_merged_execution_events(
     trades: Iterable[TradePrint],
     *,
     tie_policy: ExecutionMergeTiePolicy | str = ExecutionMergeTiePolicy.L2_BEFORE_TRADE,
+    counter: ExecutionMergeCounterAccumulator | None = None,
 ) -> Iterator[MergedExecutionEvent]:
     """Stream a stable local-clock merge of reconstructed L2 events and trades."""
     policy = _coerce_tie_policy(tie_policy)
-    yield from _iter_merged_execution_events(l2_events, trades, tie_policy=policy)
+    yield from _iter_merged_execution_events(l2_events, trades, tie_policy=policy, counter=counter)
 
 
 def merge_execution_events(
@@ -127,24 +166,9 @@ def merge_execution_events(
     Large tape builders should prefer :func:`iter_merged_execution_events`.
     """
     policy = _coerce_tie_policy(tie_policy)
-    tie_counter = [0]
-
-    events = tuple(_iter_merged_execution_events(l2_events, trades, tie_policy=policy, tie_counter=tie_counter))
-    l2_event_count = 0
-    trade_count = 0
-    for event in events:
-        if event.l2_event is not None:
-            l2_event_count += 1
-        else:
-            trade_count += 1
-
-    counters = ExecutionMergeCounters(
-        l2_event_count=l2_event_count,
-        trade_count=trade_count,
-        emitted_event_count=len(events),
-        same_local_ts_tie_count=tie_counter[0],
-    )
-    return ExecutionMergePlan(events=events, counters=counters)
+    counter = ExecutionMergeCounterAccumulator()
+    events = tuple(_iter_merged_execution_events(l2_events, trades, tie_policy=policy, counter=counter))
+    return ExecutionMergePlan(events=events, counters=counter.as_counters())
 
 
 def _iter_merged_execution_events(
@@ -152,7 +176,7 @@ def _iter_merged_execution_events(
     trades: Iterable[TradePrint],
     *,
     tie_policy: ExecutionMergeTiePolicy,
-    tie_counter: list[int] | None = None,
+    counter: ExecutionMergeCounterAccumulator | None = None,
 ) -> Iterator[MergedExecutionEvent]:
     l2_iter = _iter_l2_with_index(l2_events)
     trade_iter = _iter_trade_with_index(trades)
@@ -168,20 +192,26 @@ def _iter_merged_execution_events(
             use_l2 = True
         else:
             use_l2, is_tie = _choose_l2(l2_item[1], trade_item[1], tie_policy)
-            if is_tie and tie_counter is not None:
-                tie_counter[0] += 1
+            if is_tie and counter is not None:
+                counter.update_tie()
 
         if use_l2:
             if l2_item is None:
                 raise RuntimeError("merge selected missing L2 event")
             l2_index, l2_event = l2_item
-            yield _make_l2_merged_event(event_seq, l2_index, l2_event)
+            event = _make_l2_merged_event(event_seq, l2_index, l2_event)
+            if counter is not None:
+                counter.update_event(event)
+            yield event
             l2_item = next(l2_iter, None)
         else:
             if trade_item is None:
                 raise RuntimeError("merge selected missing trade event")
             trade_index, trade = trade_item
-            yield _make_trade_merged_event(event_seq, trade_index, trade)
+            event = _make_trade_merged_event(event_seq, trade_index, trade)
+            if counter is not None:
+                counter.update_event(event)
+            yield event
             trade_item = next(trade_iter, None)
         event_seq += 1
 
@@ -293,6 +323,7 @@ def _require_positive_int(value: int, name: str) -> int:
 __all__ = [
     "ExecutionMergeTiePolicy",
     "ExecutionMergeCounters",
+    "ExecutionMergeCounterAccumulator",
     "MergedExecutionEvent",
     "ExecutionMergePlan",
     "iter_merged_execution_events",

@@ -23,11 +23,13 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without pyarrow
 
 from mmrt.contracts import AggressorSide, BookSide
 from mmrt.execution.contracts import L2Update, SymbolSpec, TradePrint
-from mmrt.execution.event_merge import ExecutionMergeTiePolicy, merge_execution_events
-from mmrt.execution.execution_tape import (
-    build_execution_tape as build_execution_tape_object,
-    save_execution_tape,
+from mmrt.execution.event_merge import (
+    ExecutionMergeCounterAccumulator,
+    ExecutionMergeCounters,
+    ExecutionMergeTiePolicy,
+    iter_merged_execution_events,
 )
+from mmrt.execution.execution_tape_writer import StreamingExecutionTapeWriter, StreamingExecutionTapeWriterConfig
 from mmrt.execution.l2_reconstructor import (
     L2BookReconstructor,
     ReconstructedL2Event,
@@ -63,6 +65,8 @@ class ExecutionTapeBuildConfig:
     max_trade_rows: int | None = None
     tie_policy: ExecutionMergeTiePolicy | str = ExecutionMergeTiePolicy.L2_BEFORE_TRADE
     overwrite: bool = False
+    chunk_rows: int = 250_000
+    cleanup_chunks: bool = True
     created_at_utc: str = ""
 
     def __post_init__(self) -> None:
@@ -92,6 +96,9 @@ class ExecutionTapeBuildConfig:
         object.__setattr__(self, "tie_policy", _coerce_tie_policy(self.tie_policy))
         if not isinstance(self.overwrite, bool):
             raise ValueError("overwrite must be bool")
+        object.__setattr__(self, "chunk_rows", _require_positive_int(self.chunk_rows, "chunk_rows"))
+        if not isinstance(self.cleanup_chunks, bool):
+            raise ValueError("cleanup_chunks must be bool")
         if not isinstance(self.created_at_utc, str):
             raise ValueError("created_at_utc must be str")
 
@@ -118,49 +125,238 @@ def build_execution_tape_from_config(config: ExecutionTapeBuildConfig) -> dict[s
     if summary_path.exists() and not config.overwrite:
         raise FileExistsError(f"JSON output already exists: {summary_path}")
 
-    l2_events, l2_stats = load_reconstructed_l2_events(
+    l2_stats = L2StreamStatsAccumulator(book_depth=config.book_depth)
+    trade_stats = TradeStreamStatsAccumulator()
+    merge_counter = ExecutionMergeCounterAccumulator()
+
+    l2_iter = iter_reconstructed_l2_events_streaming(
         l2_paths,
         symbol_spec=symbol_spec,
         batch_size=config.batch_size,
         max_rows=config.max_l2_rows,
         book_depth=config.book_depth,
         compatibility=compat,
+        stats=l2_stats,
     )
-    trades, trade_stats = load_trade_prints(
+    trade_iter = iter_trade_prints_streaming(
         trade_paths,
         symbol_spec=symbol_spec,
         batch_size=config.batch_size,
         max_rows=config.max_trade_rows,
         compatibility=compat,
+        stats=trade_stats,
     )
+    merged_iter = iter_merged_execution_events(
+        l2_iter,
+        trade_iter,
+        tie_policy=config.tie_policy,
+        counter=merge_counter,
+    )
+    writer = StreamingExecutionTapeWriter(
+        StreamingExecutionTapeWriterConfig(
+            output_root=str(output_root),
+            symbol_spec=symbol_spec,
+            symbol_rules=rules,
+            book_depth=config.book_depth,
+            chunk_rows=config.chunk_rows,
+            overwrite=config.overwrite,
+            cleanup_chunks=config.cleanup_chunks,
+            created_at_utc=config.created_at_utc,
+            notes={
+                "builder": "mmrt.cli.build_execution_tape",
+                "tie_policy": config.tie_policy.value,
+                "chunk_rows": str(config.chunk_rows),
+                "streaming": "true",
+            },
+        )
+    )
+    for merged in merged_iter:
+        writer.append(merged)
 
     compatibility_report = compat.report() if config.symbol_rule_compatibility_mode is not RuleCompatibilityMode.OFF else None
-
-    if not l2_events:
-        raise ValueError("cannot build execution tape without reconstructed L2 events")
-    if not trades:
-        raise ValueError("cannot build execution tape without trades")
-
-    plan = merge_execution_events(l2_events, trades, tie_policy=config.tie_policy)
-    tape = build_execution_tape_object(
-        symbol_spec=symbol_spec,
-        symbol_rules=rules,
-        symbol_rule_compatibility=compatibility_report,
-        l2_events=l2_events,
-        trades=trades,
-        merged_events=plan.events,
-        book_depth=config.book_depth,
-        created_at_utc=config.created_at_utc,
-        notes={
-            "builder": "mmrt.cli.build_execution_tape",
-            "tie_policy": config.tie_policy.value,
-        },
+    result = writer.finalize(symbol_rule_compatibility=compatibility_report)
+    tape = result.tape
+    l2_stats_dict = l2_stats.as_dict()
+    trade_stats_dict = trade_stats.as_dict()
+    merge_counters = merge_counter.as_counters()
+    if merge_counter.emitted_event_count != tape.manifest.num_events:
+        raise RuntimeError("merge event count does not match tape manifest")
+    if merge_counter.l2_event_count != tape.manifest.num_l2_batches:
+        raise RuntimeError("merge L2 count does not match tape manifest")
+    if merge_counter.trade_count != tape.manifest.num_trades:
+        raise RuntimeError("merge trade count does not match tape manifest")
+    summary = _build_summary(
+        config,
+        output_root,
+        l2_stats_dict,
+        trade_stats_dict,
+        merge_counters,
+        tape,
+        chunk_summary=result.chunk_summary,
     )
-
-    save_execution_tape(tape, output_root, overwrite=config.overwrite)
-    summary = _build_summary(config, output_root, l2_stats, trade_stats, plan, tape)
     _write_json_atomic(summary, summary_path, overwrite=config.overwrite)
     return summary
+
+@dataclass(slots=True)
+class L2StreamStatsAccumulator:
+    rows_seen: int = 0
+    first_local_ts_us: int | None = None
+    last_local_ts_us: int | None = None
+    scan_limit_hit: bool = False
+    updates_converted: int = 0
+    status: str = "not_ready"
+    is_ready: bool = False
+    batches_seen: int = 0
+    updates_seen: int = 0
+    skipped_pre_snapshot_updates: int = 0
+    snapshot_reset_count: int = 0
+    applied_update_count: int = 0
+    deleted_level_count: int = 0
+    missing_delete_count: int = 0
+    emitted_event_count: int = 0
+    crossed_batch_count: int = 0
+    crossed_repair_count: int = 0
+    crossed_levels_removed: int = 0
+    local_ts_decrease_count: int = 0
+    max_bid_depth: int = 0
+    max_ask_depth: int = 0
+    max_batch_size: int = 0
+    book_depth: int = 25
+
+    def update_from_reconstructor(self, reconstructor: L2BookReconstructor) -> None:
+        counters = reconstructor.counters
+        self.status = reconstructor.status.value
+        self.is_ready = reconstructor.is_ready
+        self.batches_seen = counters.batches_seen
+        self.updates_seen = counters.updates_seen
+        self.skipped_pre_snapshot_updates = counters.skipped_pre_snapshot_updates
+        self.snapshot_reset_count = counters.snapshot_reset_count
+        self.applied_update_count = counters.applied_update_count
+        self.deleted_level_count = counters.deleted_level_count
+        self.missing_delete_count = counters.missing_delete_count
+        self.emitted_event_count = counters.emitted_event_count
+        self.crossed_batch_count = counters.crossed_batch_count
+        self.crossed_repair_count = counters.crossed_repair_count
+        self.crossed_levels_removed = counters.crossed_levels_removed
+        self.local_ts_decrease_count = counters.local_ts_decrease_count
+        self.max_bid_depth = counters.max_bid_depth
+        self.max_ask_depth = counters.max_ask_depth
+        self.max_batch_size = counters.max_batch_size
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "rows_seen": self.rows_seen,
+            "updates_converted": self.updates_converted,
+            "scan_limit_hit": self.scan_limit_hit,
+            "first_local_ts_us": self.first_local_ts_us,
+            "last_local_ts_us": self.last_local_ts_us,
+            "status": self.status,
+            "is_ready": self.is_ready,
+            "batches_seen": self.batches_seen,
+            "updates_seen": self.updates_seen,
+            "skipped_pre_snapshot_updates": self.skipped_pre_snapshot_updates,
+            "snapshot_reset_count": self.snapshot_reset_count,
+            "applied_update_count": self.applied_update_count,
+            "deleted_level_count": self.deleted_level_count,
+            "missing_delete_count": self.missing_delete_count,
+            "emitted_event_count": self.emitted_event_count,
+            "crossed_batch_count": self.crossed_batch_count,
+            "crossed_repair_count": self.crossed_repair_count,
+            "crossed_levels_removed": self.crossed_levels_removed,
+            "local_ts_decrease_count": self.local_ts_decrease_count,
+            "max_bid_depth": self.max_bid_depth,
+            "max_ask_depth": self.max_ask_depth,
+            "max_batch_size": self.max_batch_size,
+            "book_depth": self.book_depth,
+        }
+
+
+def iter_reconstructed_l2_events_streaming(
+    paths: Sequence[Path],
+    *,
+    symbol_spec: SymbolSpec,
+    batch_size: int,
+    max_rows: int | None,
+    book_depth: int,
+    compatibility: RuleCompatibilityAccumulator | None,
+    stats: L2StreamStatsAccumulator,
+) -> Iterator[ReconstructedL2Event]:
+    book_depth = _require_positive_int(book_depth, "book_depth")
+    stats.book_depth = book_depth
+    reconstructor = L2BookReconstructor(symbol_spec, snapshot_depth=book_depth)
+
+    def iter_updates() -> Iterator[L2Update]:
+        for path in paths:
+            for row in _iter_path_rows(path, batch_size=batch_size):
+                if max_rows is not None and stats.rows_seen >= max_rows:
+                    stats.scan_limit_hit = True
+                    return
+                fallback_source_row = stats.rows_seen
+                stats.rows_seen += 1
+                if compatibility is not None:
+                    _observe_l2_row_compatibility(row, compatibility)
+                update = _row_to_l2_update(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
+                stats.updates_converted += 1
+                if stats.first_local_ts_us is None:
+                    stats.first_local_ts_us = update.local_ts_us
+                stats.last_local_ts_us = update.local_ts_us
+                yield update
+
+    try:
+        for batch in iter_l2_update_batches(iter_updates()):
+            event = reconstructor.apply_batch(batch)
+            if event is not None:
+                yield event
+    finally:
+        stats.update_from_reconstructor(reconstructor)
+
+
+@dataclass(slots=True)
+class TradeStreamStatsAccumulator:
+    rows_seen: int = 0
+    trades_converted: int = 0
+    scan_limit_hit: bool = False
+    first_local_ts_us: int | None = None
+    last_local_ts_us: int | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "rows_seen": self.rows_seen,
+            "trades_converted": self.trades_converted,
+            "scan_limit_hit": self.scan_limit_hit,
+            "first_local_ts_us": self.first_local_ts_us,
+            "last_local_ts_us": self.last_local_ts_us,
+        }
+
+
+def iter_trade_prints_streaming(
+    paths: Sequence[Path],
+    *,
+    symbol_spec: SymbolSpec,
+    batch_size: int,
+    max_rows: int | None,
+    compatibility: RuleCompatibilityAccumulator | None,
+    stats: TradeStreamStatsAccumulator,
+) -> Iterator[TradePrint]:
+    prev_local_ts_us: int | None = None
+    for path in paths:
+        for row in _iter_path_rows(path, batch_size=batch_size):
+            if max_rows is not None and stats.rows_seen >= max_rows:
+                stats.scan_limit_hit = True
+                return
+            fallback_source_row = stats.rows_seen
+            stats.rows_seen += 1
+            if compatibility is not None:
+                _observe_trade_row_compatibility(row, compatibility)
+            trade = _row_to_trade_print(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
+            if prev_local_ts_us is not None and trade.local_ts_us < prev_local_ts_us:
+                raise ValueError("trades must be sorted by nondecreasing local_ts_us")
+            if stats.first_local_ts_us is None:
+                stats.first_local_ts_us = trade.local_ts_us
+            stats.last_local_ts_us = trade.local_ts_us
+            prev_local_ts_us = trade.local_ts_us
+            stats.trades_converted += 1
+            yield trade
 
 
 def load_reconstructed_l2_events(
@@ -172,63 +368,17 @@ def load_reconstructed_l2_events(
     book_depth: int = 25,
     compatibility: RuleCompatibilityAccumulator | None = None,
 ) -> tuple[list[ReconstructedL2Event], dict[str, object]]:
-    book_depth = _require_positive_int(book_depth, "book_depth")
-    reconstructor = L2BookReconstructor(symbol_spec, snapshot_depth=book_depth)
-    events: list[ReconstructedL2Event] = []
-    rows_seen = 0
-    first_local_ts_us: int | None = None
-    last_local_ts_us: int | None = None
-    scan_limit_hit = False
-
-    def iter_updates() -> Iterator[L2Update]:
-        nonlocal rows_seen, first_local_ts_us, last_local_ts_us, scan_limit_hit
-        for path in paths:
-            for row in _iter_path_rows(path, batch_size=batch_size):
-                if max_rows is not None and rows_seen >= max_rows:
-                    scan_limit_hit = True
-                    return
-                fallback_source_row = rows_seen
-                rows_seen += 1
-                if compatibility is not None:
-                    _observe_l2_row_compatibility(row, compatibility)
-                update = _row_to_l2_update(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
-                if first_local_ts_us is None:
-                    first_local_ts_us = update.local_ts_us
-                last_local_ts_us = update.local_ts_us
-                yield update
-
-    for batch in iter_l2_update_batches(iter_updates()):
-        event = reconstructor.apply_batch(batch)
-        if event is not None:
-            events.append(event)
-
-    counters = reconstructor.counters
-    stats: dict[str, object] = {
-        "rows_seen": rows_seen,
-        "updates_converted": rows_seen,
-        "scan_limit_hit": scan_limit_hit,
-        "first_local_ts_us": first_local_ts_us,
-        "last_local_ts_us": last_local_ts_us,
-        "status": reconstructor.status.value,
-        "is_ready": reconstructor.is_ready,
-        "batches_seen": counters.batches_seen,
-        "updates_seen": counters.updates_seen,
-        "skipped_pre_snapshot_updates": counters.skipped_pre_snapshot_updates,
-        "snapshot_reset_count": counters.snapshot_reset_count,
-        "applied_update_count": counters.applied_update_count,
-        "deleted_level_count": counters.deleted_level_count,
-        "missing_delete_count": counters.missing_delete_count,
-        "emitted_event_count": counters.emitted_event_count,
-        "crossed_batch_count": counters.crossed_batch_count,
-        "crossed_repair_count": counters.crossed_repair_count,
-        "crossed_levels_removed": counters.crossed_levels_removed,
-        "local_ts_decrease_count": counters.local_ts_decrease_count,
-        "max_bid_depth": counters.max_bid_depth,
-        "max_ask_depth": counters.max_ask_depth,
-        "max_batch_size": counters.max_batch_size,
-        "book_depth": book_depth,
-    }
-    return events, stats
+    stats = L2StreamStatsAccumulator(book_depth=book_depth)
+    events = list(iter_reconstructed_l2_events_streaming(
+        paths,
+        symbol_spec=symbol_spec,
+        batch_size=batch_size,
+        max_rows=max_rows,
+        book_depth=book_depth,
+        compatibility=compatibility,
+        stats=stats,
+    ))
+    return events, stats.as_dict()
 
 
 def load_trade_prints(
@@ -239,52 +389,31 @@ def load_trade_prints(
     max_rows: int | None = None,
     compatibility: RuleCompatibilityAccumulator | None = None,
 ) -> tuple[list[TradePrint], dict[str, object]]:
-    trades: list[TradePrint] = []
-    rows_seen = 0
-    first_local_ts_us: int | None = None
-    last_local_ts_us: int | None = None
-    prev_local_ts_us: int | None = None
-    scan_limit_hit = False
+    stats = TradeStreamStatsAccumulator()
+    trades = list(iter_trade_prints_streaming(
+        paths,
+        symbol_spec=symbol_spec,
+        batch_size=batch_size,
+        max_rows=max_rows,
+        compatibility=compatibility,
+        stats=stats,
+    ))
+    return trades, stats.as_dict()
 
-    for path in paths:
-        for row in _iter_path_rows(path, batch_size=batch_size):
-            if max_rows is not None and rows_seen >= max_rows:
-                scan_limit_hit = True
-                stats = {
-                    "rows_seen": rows_seen,
-                    "trades_converted": len(trades),
-                    "scan_limit_hit": scan_limit_hit,
-                    "first_local_ts_us": first_local_ts_us,
-                    "last_local_ts_us": last_local_ts_us,
-                }
-                return trades, stats
-            fallback_source_row = rows_seen
-            rows_seen += 1
-            if compatibility is not None:
-                _observe_trade_row_compatibility(row, compatibility)
-            trade = _row_to_trade_print(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
-            if prev_local_ts_us is not None and trade.local_ts_us < prev_local_ts_us:
-                raise ValueError("trades must be sorted by nondecreasing local_ts_us")
-            if first_local_ts_us is None:
-                first_local_ts_us = trade.local_ts_us
-            last_local_ts_us = trade.local_ts_us
-            prev_local_ts_us = trade.local_ts_us
-            trades.append(trade)
-
-    stats = {
-        "rows_seen": rows_seen,
-        "trades_converted": len(trades),
-        "scan_limit_hit": scan_limit_hit,
-        "first_local_ts_us": first_local_ts_us,
-        "last_local_ts_us": last_local_ts_us,
-    }
-    return trades, stats
+class _ExecutionTapeArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args: Sequence[str] | None = None, namespace: argparse.Namespace | None = None) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        if parsed.l2_input and isinstance(parsed.l2_input[0], list):
+            parsed.l2_input = list(_flatten_repeated(parsed.l2_input))
+        if parsed.trade_input and isinstance(parsed.trade_input[0], list):
+            parsed.trade_input = list(_flatten_repeated(parsed.trade_input))
+        return parsed
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build an execution tape from Tardis-style L2 and trade inputs.")
-    parser.add_argument("--l2-input", nargs="+", required=True, dest="l2_input")
-    parser.add_argument("--trade-input", nargs="+", required=True, dest="trade_input")
+    parser = _ExecutionTapeArgumentParser(description="Build an execution tape from Tardis-style L2 and trade inputs.")
+    parser.add_argument("--l2-input", nargs="+", action="append", required=True, dest="l2_input")
+    parser.add_argument("--trade-input", nargs="+", action="append", required=True, dest="trade_input")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--exchange", default="binance-futures")
     parser.add_argument("--symbol", default="BTCUSDT")
@@ -305,15 +434,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ExecutionMergeTiePolicy.L2_BEFORE_TRADE.value,
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--chunk-rows", type=int, default=250_000)
+    parser.add_argument("--keep-chunks", action="store_true")
     parser.add_argument("--created-at-utc", default="")
     return parser
 
 
+
+def _flatten_repeated(values: Sequence[Sequence[str]] | Sequence[str]) -> tuple[str, ...]:
+    if not values:
+        return ()
+    first = values[0]
+    if isinstance(first, str):
+        return tuple(values)  # type: ignore[arg-type]
+    return tuple(item for group in values for item in group)  # type: ignore[union-attr]
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     config = ExecutionTapeBuildConfig(
-        l2_inputs=tuple(args.l2_input),
-        trade_inputs=tuple(args.trade_input),
+        l2_inputs=_flatten_repeated(args.l2_input),
+        trade_inputs=_flatten_repeated(args.trade_input),
         output_root=args.output_root,
         exchange=args.exchange,
         symbol=args.symbol,
@@ -329,6 +469,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_trade_rows=args.max_trade_rows,
         tie_policy=args.tie_policy,
         overwrite=args.overwrite,
+        chunk_rows=args.chunk_rows,
+        cleanup_chunks=not args.keep_chunks,
         created_at_utc=args.created_at_utc,
     )
     summary = build_execution_tape_from_config(config)
@@ -427,7 +569,7 @@ def _row_to_trade_print(row: Mapping[str, Any], *, symbol_spec: SymbolSpec, fall
     )
 
 
-def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> dict[str, object]:
+def _build_summary(config, output_root, l2_stats, trade_stats, merge_counters: ExecutionMergeCounters, tape, *, chunk_summary: dict[str, object]) -> dict[str, object]:
     warnings: list[str] = []
     if not bool(l2_stats["is_ready"]):
         warnings.append("no_snapshot_seen")
@@ -443,7 +585,7 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
         warnings.append("crossed_repairs_observed")
     if int(l2_stats["missing_delete_count"]) > 0:
         warnings.append("missing_deletes_observed")
-    if plan.counters.same_local_ts_tie_count > 0:
+    if merge_counters.same_local_ts_tie_count > 0:
         warnings.append("same_local_ts_ties_observed")
 
     return {
@@ -483,7 +625,7 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
             "l2_events_emitted": l2_stats["emitted_event_count"],
             "trade_rows_seen": trade_stats["rows_seen"],
             "trades_converted": trade_stats["trades_converted"],
-            "merged_events": plan.counters.emitted_event_count,
+            "merged_events": merge_counters.emitted_event_count,
             "tape_l2_events": tape.manifest.num_l2_batches,
             "tape_trades": tape.manifest.num_trades,
             "tape_events": tape.manifest.num_events,
@@ -507,10 +649,10 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
         },
         "merge": {
             "tie_policy": config.tie_policy.value,
-            "l2_event_count": plan.counters.l2_event_count,
-            "trade_count": plan.counters.trade_count,
-            "emitted_event_count": plan.counters.emitted_event_count,
-            "same_local_ts_tie_count": plan.counters.same_local_ts_tie_count,
+            "l2_event_count": merge_counters.l2_event_count,
+            "trade_count": merge_counters.trade_count,
+            "emitted_event_count": merge_counters.emitted_event_count,
+            "same_local_ts_tie_count": merge_counters.same_local_ts_tie_count,
         },
         "tape": {
             "schema": tape.manifest.schema,
@@ -523,6 +665,12 @@ def _build_summary(config, output_root, l2_stats, trade_stats, plan, tape) -> di
             "book_depth": config.book_depth,
             "start_local_ts_us": tape.manifest.start_local_ts_us,
             "end_local_ts_us": tape.manifest.end_local_ts_us,
+        },
+        "chunking": {
+            "enabled": True,
+            "chunk_rows": config.chunk_rows,
+            "cleanup_chunks": config.cleanup_chunks,
+            "chunk_summary": chunk_summary,
         },
         "warnings": warnings,
     }
@@ -816,6 +964,7 @@ __all__ = [
     "ExecutionTapeBuildConfig",
     "build_execution_tape_from_config",
     "build_arg_parser",
+    "_flatten_repeated",
     "main",
 ]
 

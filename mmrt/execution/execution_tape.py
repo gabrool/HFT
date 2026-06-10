@@ -392,6 +392,113 @@ def load_execution_tape(root: str | Path, *, mmap_mode: str | None = None) -> Ex
     return ExecutionTape(manifest=manifest, arrays=arrays)
 
 
+def merged_event_to_array_row(event: MergedExecutionEvent) -> tuple:
+    if not isinstance(event, MergedExecutionEvent):
+        raise ValueError("event must be MergedExecutionEvent")
+    if event.ref.event_type == ExecutionEventType.L2_BATCH:
+        if event.ref.book_ptr < 0:
+            raise ValueError("merged L2 event requires book_ptr >= 0")
+        if event.ref.trade_ptr != -1:
+            raise ValueError("merged L2 event trade_ptr must be -1")
+        code = EVENT_TYPE_CODE_L2_BATCH
+    elif event.ref.event_type == ExecutionEventType.TRADE:
+        if event.ref.trade_ptr < 0:
+            raise ValueError("merged trade event requires trade_ptr >= 0")
+        if event.ref.book_ptr != -1:
+            raise ValueError("merged trade event book_ptr must be -1")
+        code = EVENT_TYPE_CODE_TRADE
+    else:
+        raise ValueError("execution tape supports only L2_BATCH and TRADE events")
+    return (
+        event.ref.event_seq,
+        event.local_ts_us,
+        event.ts_us,
+        code,
+        event.ref.book_ptr,
+        event.ref.trade_ptr,
+    )
+
+
+def l2_event_to_array_row(event: ReconstructedL2Event) -> tuple:
+    if not isinstance(event, ReconstructedL2Event):
+        raise ValueError("event must be ReconstructedL2Event")
+    if event.book_top is None:
+        best_bid_tick = -1
+        best_ask_tick = -1
+        best_bid_size = 0.0
+        best_ask_size = 0.0
+    else:
+        best_bid_tick = event.book_top.best_bid_tick
+        best_ask_tick = event.book_top.best_ask_tick
+        best_bid_size = _require_finite_float(event.book_top.best_bid_size, "book_top.best_bid_size")
+        best_ask_size = _require_finite_float(event.book_top.best_ask_size, "book_top.best_ask_size")
+        if best_bid_size < 0.0 or best_ask_size < 0.0:
+            raise ValueError("book_top sizes must be nonnegative")
+    return (
+        event.batch_seq,
+        event.local_ts_us,
+        event.min_ts_us,
+        event.max_ts_us,
+        event.num_updates,
+        event.is_snapshot_batch,
+        best_bid_tick,
+        best_ask_tick,
+        best_bid_size,
+        best_ask_size,
+        event.bid_depth,
+        event.ask_depth,
+        event.crossed_repaired,
+        event.crossed_levels_removed,
+    )
+
+
+def book_snapshot_to_depth_rows(
+    event: ReconstructedL2Event,
+    *,
+    book_depth: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not isinstance(event, ReconstructedL2Event):
+        raise ValueError("event must be ReconstructedL2Event")
+    depth = _require_positive_int(book_depth, "book_depth")
+    snapshot = event.book_snapshot
+    if snapshot is None:
+        raise ValueError("execution tape requires every L2 event to include book_snapshot")
+    if snapshot.local_ts_us != event.local_ts_us:
+        raise ValueError("book_snapshot local_ts_us must match L2 event local_ts_us")
+    if len(snapshot.bid_ticks) > depth or len(snapshot.ask_ticks) > depth:
+        raise ValueError("book_snapshot depth exceeds tape book_depth")
+
+    bid_ticks = np.zeros((depth,), dtype=np.int64)
+    ask_ticks = np.zeros((depth,), dtype=np.int64)
+    bid_sizes = np.zeros((depth,), dtype=np.float32)
+    ask_sizes = np.zeros((depth,), dtype=np.float32)
+    bid_count = len(snapshot.bid_ticks)
+    ask_count = len(snapshot.ask_ticks)
+    if bid_count:
+        bid_ticks[:bid_count] = snapshot.bid_ticks
+        bid_sizes[:bid_count] = snapshot.bid_sizes
+    if ask_count:
+        ask_ticks[:ask_count] = snapshot.ask_ticks
+        ask_sizes[:ask_count] = snapshot.ask_sizes
+    return bid_ticks, bid_sizes, ask_ticks, ask_sizes
+
+
+def trade_print_to_array_row(trade: TradePrint) -> tuple:
+    if not isinstance(trade, TradePrint):
+        raise ValueError("trade must be TradePrint")
+    amount = _require_finite_float(trade.amount, "trade.amount")
+    if amount < 0.0:
+        raise ValueError("trade amount must be nonnegative")
+    return (
+        trade.local_ts_us,
+        trade.ts_us,
+        _trade_side_code(trade.side),
+        trade.price_tick,
+        amount,
+        trade.source_row,
+    )
+
+
 def _build_events_array(
     merged_events: tuple[MergedExecutionEvent, ...],
     l2_events: tuple[ReconstructedL2Event, ...],
@@ -433,14 +540,7 @@ def _build_events_array(
         else:
             raise ValueError("execution tape supports only L2_BATCH and TRADE events")
 
-        events_arr[i] = (
-            event.ref.event_seq,
-            event.local_ts_us,
-            event.ts_us,
-            code,
-            event.ref.book_ptr,
-            event.ref.trade_ptr,
-        )
+        events_arr[i] = merged_event_to_array_row(event)
 
     if not np.all(seen_l2):
         raise ValueError("merged_events do not reference every l2_event")
@@ -452,34 +552,7 @@ def _build_events_array(
 def _build_l2_events_array(l2_events: tuple[ReconstructedL2Event, ...]) -> np.ndarray:
     l2_arr = np.empty(len(l2_events), dtype=L2_EVENT_DTYPE)
     for i, event in enumerate(l2_events):
-        if event.book_top is None:
-            best_bid_tick = -1
-            best_ask_tick = -1
-            best_bid_size = 0.0
-            best_ask_size = 0.0
-        else:
-            best_bid_tick = event.book_top.best_bid_tick
-            best_ask_tick = event.book_top.best_ask_tick
-            best_bid_size = _require_finite_float(event.book_top.best_bid_size, "book_top.best_bid_size")
-            best_ask_size = _require_finite_float(event.book_top.best_ask_size, "book_top.best_ask_size")
-            if best_bid_size < 0.0 or best_ask_size < 0.0:
-                raise ValueError("book_top sizes must be nonnegative")
-        l2_arr[i] = (
-            event.batch_seq,
-            event.local_ts_us,
-            event.min_ts_us,
-            event.max_ts_us,
-            event.num_updates,
-            event.is_snapshot_batch,
-            best_bid_tick,
-            best_ask_tick,
-            best_bid_size,
-            best_ask_size,
-            event.bid_depth,
-            event.ask_depth,
-            event.crossed_repaired,
-            event.crossed_levels_removed,
-        )
+        l2_arr[i] = l2_event_to_array_row(event)
     return l2_arr
 
 
@@ -508,21 +581,7 @@ def _build_book_snapshot_arrays(
     ask_sizes = np.zeros((n, depth), dtype=np.float32)
 
     for i, event in enumerate(l2_events):
-        snapshot = event.book_snapshot
-        if snapshot is None:
-            raise ValueError("execution tape requires every L2 event to include book_snapshot")
-        if snapshot.local_ts_us != event.local_ts_us:
-            raise ValueError("book_snapshot local_ts_us must match L2 event local_ts_us")
-        if len(snapshot.bid_ticks) > depth or len(snapshot.ask_ticks) > depth:
-            raise ValueError("book_snapshot depth exceeds tape book_depth")
-        bid_count = len(snapshot.bid_ticks)
-        ask_count = len(snapshot.ask_ticks)
-        if bid_count:
-            bid_ticks[i, :bid_count] = snapshot.bid_ticks
-            bid_sizes[i, :bid_count] = snapshot.bid_sizes
-        if ask_count:
-            ask_ticks[i, :ask_count] = snapshot.ask_ticks
-            ask_sizes[i, :ask_count] = snapshot.ask_sizes
+        bid_ticks[i], bid_sizes[i], ask_ticks[i], ask_sizes[i] = book_snapshot_to_depth_rows(event, book_depth=depth)
 
     _validate_book_depth_arrays(bid_ticks, bid_sizes, ask_ticks, ask_sizes, num_l2_events=n)
     return bid_ticks, bid_sizes, ask_ticks, ask_sizes
@@ -531,17 +590,7 @@ def _build_book_snapshot_arrays(
 def _build_trades_array(trades: tuple[TradePrint, ...]) -> np.ndarray:
     trade_arr = np.empty(len(trades), dtype=TRADE_DTYPE)
     for i, trade in enumerate(trades):
-        amount = _require_finite_float(trade.amount, "trade.amount")
-        if amount < 0.0:
-            raise ValueError("trade amount must be nonnegative")
-        trade_arr[i] = (
-            trade.local_ts_us,
-            trade.ts_us,
-            _trade_side_code(trade.side),
-            trade.price_tick,
-            amount,
-            trade.source_row,
-        )
+        trade_arr[i] = trade_print_to_array_row(trade)
     return trade_arr
 
 
@@ -745,6 +794,10 @@ __all__ = [
     "TRADE_DTYPE",
     "ExecutionTapeArrays",
     "ExecutionTape",
+    "l2_event_to_array_row",
+    "trade_print_to_array_row",
+    "book_snapshot_to_depth_rows",
+    "merged_event_to_array_row",
     "execution_tape_manifest_to_dict",
     "execution_tape_manifest_from_dict",
     "build_execution_tape",

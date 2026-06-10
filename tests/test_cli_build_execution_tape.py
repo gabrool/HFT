@@ -11,6 +11,7 @@ from mmrt.cli.build_execution_tape import (
     build_execution_tape_from_config,
     load_reconstructed_l2_events,
     main,
+    _flatten_repeated,
     _parse_trade_side,
 )
 from mmrt.contracts import AggressorSide
@@ -631,3 +632,65 @@ def test_config_requires_exactly_one_rules_input(tmp_path):
             symbol_rules_json=rules_path,
             exchange_info_json=str(exchange_info_path),
         )
+
+
+def test_build_execution_tape_parser_accepts_grouped_inputs():
+    args = build_arg_parser().parse_args([
+        "--l2-input", "a.csv", "b.csv",
+        "--trade-input", "t1.csv", "t2.csv",
+        "--output-root", "out",
+        "--symbol-rules-json", "rules.json",
+    ])
+    assert _flatten_repeated(args.l2_input) == ("a.csv", "b.csv")
+    assert _flatten_repeated(args.trade_input) == ("t1.csv", "t2.csv")
+
+
+def test_build_execution_tape_parser_accepts_repeated_inputs():
+    args = build_arg_parser().parse_args([
+        "--l2-input", "a.csv",
+        "--l2-input", "b.csv",
+        "--trade-input", "t1.csv",
+        "--trade-input", "t2.csv",
+        "--output-root", "out",
+        "--symbol-rules-json", "rules.json",
+    ])
+    assert _flatten_repeated(args.l2_input) == ("a.csv", "b.csv")
+    assert _flatten_repeated(args.trade_input) == ("t1.csv", "t2.csv")
+
+
+def test_build_execution_tape_from_config_streaming_multiple_files_matches_expected_counts(tmp_path):
+    l2_a = _write_l2_csv(tmp_path / "l2_a.csv", _good_l2_rows()[:2])
+    l2_b = _write_l2_csv(tmp_path / "l2_b.csv", _good_l2_rows()[2:])
+    t_a = _write_trade_csv(tmp_path / "t_a.csv", _good_trade_rows()[:1])
+    t_b = _write_trade_csv(tmp_path / "t_b.csv", _good_trade_rows()[1:])
+    output_root = tmp_path / "tape_multi"
+    summary = build_execution_tape_from_config(_config(
+        tmp_path,
+        l2_inputs=(str(l2_a), str(l2_b)),
+        trade_inputs=(str(t_a), str(t_b)),
+        output_root=str(output_root),
+        chunk_rows=1,
+    ))
+    assert summary["inputs"]["l2_input_count"] == 2
+    assert summary["inputs"]["trade_input_count"] == 2
+    assert summary["chunking"]["enabled"] is True
+    tape = load_execution_tape(output_root, mmap_mode="r")
+    assert len(tape.arrays.events) == summary["counts"]["tape_events"]
+    assert len(tape.arrays.l2_events) == summary["counts"]["tape_l2_events"]
+    assert len(tape.arrays.trades) == summary["counts"]["tape_trades"]
+
+
+def test_build_execution_tape_streaming_output_loads_with_mmap(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(tmp_path / "trades.csv", _good_trade_rows())
+    output_root = tmp_path / "tape_mmap"
+    build_execution_tape_from_config(_config(
+        tmp_path,
+        l2_inputs=(str(l2_path),),
+        trade_inputs=(str(trade_path),),
+        output_root=str(output_root),
+        chunk_rows=1,
+    ))
+    tape = load_execution_tape(output_root, mmap_mode="r")
+    import numpy as np
+    assert isinstance(tape.arrays.events, np.memmap)
