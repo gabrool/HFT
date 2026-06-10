@@ -541,20 +541,24 @@ def test_evaluate_execution_policy_inherits_checkpoint_start_event_index_when_un
     assert summary["evaluation"]["steps"] > 0
 
 
-def test_evaluate_execution_policy_explicit_start_event_index_override_must_match_signal_metadata(tmp_path):
+def test_evaluate_execution_policy_accepts_explicit_later_linear_signal_start_override(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
 
-    with pytest.raises(ValueError, match="linear signal metadata mismatch"):
-        run_execution_policy_evaluation(
-            ExecutionPolicyEvaluationCLIConfig(
-                tape_root=str(tape_root),
-                checkpoint_path=str(checkpoint_path),
-                output_json=str(tmp_path / "eval_bad_start_override.json"),
-                overwrite=True,
-                max_steps=3,
-                start_event_index=1,
-            )
+    summary = run_execution_policy_evaluation(
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root=str(tape_root),
+            checkpoint_path=str(checkpoint_path),
+            output_json=str(tmp_path / "eval_start_override.json"),
+            overwrite=True,
+            max_steps=3,
+            start_event_index=1,
         )
+    )
+
+    assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
+    assert summary["effective_start_event_index"] == 1
+    assert summary["linear_signal_start"]["event_index"] == 1
+    assert summary["linear_signal_start"]["row_index"] == 1
 
 
 def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path, capsys):

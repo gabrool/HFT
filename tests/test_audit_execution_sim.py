@@ -495,3 +495,31 @@ def test_audit_env_config_uses_shared_builder_source_guard():
     source = Path("mmrt/cli/audit_execution_sim.py").read_text(encoding="utf-8")
     assert "build_execution_env_config_from_attrs" in source
     assert "AdverseRuntimeConfig(" not in source
+
+
+def test_audit_execution_sim_accepts_explicit_later_linear_signal_start(tmp_path):
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
+        [],
+    )
+    tape_root = _save_tape(tmp_path, tape)
+    _save_linear_signals(tape_root, n_rows=3, decision_interval_us=50)
+
+    summary = run_execution_sim_audit(
+        ExecutionSimAuditConfig(
+            tape_root=str(tape_root),
+            output_json=str(tmp_path / "summary.json"),
+            policy="disabled",
+            max_steps=1,
+            start_event_index=1,
+            decision_interval_us=50,
+            overwrite=True,
+        )
+    )
+
+    assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
+    assert summary["linear_signal_start"] == {
+        "event_index": 1,
+        "row_index": 1,
+        "rows_available": 2,
+    }

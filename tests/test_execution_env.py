@@ -207,7 +207,7 @@ def _linear_signals(tape, n_rows: int = 16, *, start_event_index: int = 0) -> Li
 
 
 def _linear_signals_for_decisions(tape, decision_event_index, decision_local_ts_us):
-    arrays = _signal_arrays(max(len(decision_event_index), 2))
+    arrays = _signal_arrays(len(decision_event_index))
     metadata = LinearSignalArtifactMetadata(
         tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
@@ -1314,3 +1314,41 @@ def test_env_reset_rejects_start_event_index_not_on_linear_signal_grid():
 
     with pytest.raises(ValueError, match="linear signal decision_event_index"):
         env.reset(start_event_index=0)
+
+
+def test_signal_end_terminal_applies_terminal_inventory_penalty():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [],
+    )
+    linear = _linear_signals_for_decisions(tape, [0], [100])
+    config = _env_config(
+        reward_config=RewardConfig(terminal_inventory_penalty_bps=10.0),
+        initial_position=PositionState(inventory_qty=1.0),
+    )
+    env = ExecutionEnv(tape, linear_signals=linear, config=config)
+    env.reset()
+
+    step = env.step(_disabled_action())
+
+    assert step.done is True
+    assert step.info["terminal_due_to_signal_end"] is True
+    assert step.execution.reward.terminal_penalty > 0.0
+
+
+def test_env_reset_accepts_later_linear_signal_start_row():
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100),
+            _l2(seq=1, local_ts_us=200),
+            _l2(seq=2, local_ts_us=300),
+        ],
+        [],
+    )
+    linear = _linear_signals_for_decisions(tape, [0, 1, 2], [100, 200, 300])
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
+
+    reset = env.reset(start_event_index=1)
+
+    assert reset.info["event_index"] == 1
+    assert reset.info["signal_row_index"] == 1
