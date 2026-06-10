@@ -185,3 +185,25 @@ def test_execution_env_nonterminal_step_targets_next_linear_signal_row():
     old_token = "processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us"
     if old_token in step_body:
         assert old_token in fallback_body
+
+
+def test_build_execution_tape_cli_uses_streaming_writer_not_materialized_plan():
+    source = Path("mmrt/cli/build_execution_tape.py").read_text(encoding="utf-8")
+    body = source.split("def build_execution_tape_from_config", 1)[1].split("def load_reconstructed_l2_events", 1)[0]
+    forbidden = (
+        "l2_events, l2_stats = load_reconstructed_l2_events",
+        "trades, trade_stats = load_trade_prints",
+        "merge_execution_events(",
+        "build_execution_tape_object(",
+        "save_execution_tape(",
+    )
+    offenders = [token for token in forbidden if token in body]
+    assert offenders == []
+    assert "StreamingExecutionTapeWriter" in body
+    assert "iter_merged_execution_events(" in body
+
+
+def test_build_execution_tape_parser_accepts_repeated_input_flags_source_guard():
+    source = Path("mmrt/cli/build_execution_tape.py").read_text(encoding="utf-8")
+    assert 'action="append"' in source
+    assert 'nargs="+"' in source
