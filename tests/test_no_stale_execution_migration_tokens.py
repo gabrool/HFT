@@ -128,3 +128,15 @@ def test_env_does_not_hard_gate_quotes_from_executable_edge():
     )
     offenders = [token for token in forbidden_mutations if token in source]
     assert offenders == []
+
+
+def test_build_linear_signals_cli_has_no_rl_or_adverse_dependencies():
+    source = Path("mmrt/cli/build_linear_signals.py").read_text(encoding="utf-8")
+    for forbidden in ("mmrt.rl", "torch", "gym", "gymnasium", "adverse_selection", "adverse_signal"):
+        assert forbidden not in source
+
+
+def test_train_execution_ppo_default_linear_signal_filename_has_builder_cli():
+    source = Path("mmrt/cli/build_linear_signals.py").read_text(encoding="utf-8")
+    assert "LINEAR_SIGNALS_FILENAME" in source
+    assert "save_linear_signal_artifact_npz" in source

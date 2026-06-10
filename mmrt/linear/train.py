@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import math
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -205,6 +205,17 @@ class SplitEvaluation:
             name="split_evaluation",
         )
 
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> "SplitEvaluation":
+        if not isinstance(raw, Mapping):
+            raise ValueError("split evaluation must be a mapping")
+        return cls(
+            role=raw["role"],
+            n_rows=int(raw["n_rows"]),
+            evaluation=dict(raw["evaluation"]),
+            diagnostics=dict(raw["diagnostics"]),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class LinearTrainResult:
@@ -253,6 +264,27 @@ class LinearTrainResult:
                 "selection_summary": self.selection_summary,
             },
             name="linear_train_result",
+        )
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> "LinearTrainResult":
+        if not isinstance(raw, Mapping):
+            raise ValueError("linear train result must be a mapping")
+        if raw["schema"] != LINEAR_TRAINING_RESULT_SCHEMA:
+            raise ValueError("invalid schema")
+        splits_raw = raw["splits"]
+        if not isinstance(splits_raw, Mapping):
+            raise ValueError("splits must be a mapping")
+        splits = {str(role): SplitEvaluation.from_dict(value) for role, value in splits_raw.items()}
+        return cls(
+            schema=str(raw["schema"]),
+            dataset_id=str(raw["dataset_id"]),
+            manifest_hash=str(raw["manifest_hash"]),
+            config=dict(raw["config"]),
+            preprocess_state=dict(raw["preprocess_state"]),
+            model_bundle_state=dict(raw["model_bundle_state"]),
+            splits=splits,
+            selection_summary=dict(raw["selection_summary"]),
         )
 
 
@@ -562,6 +594,49 @@ def write_linear_train_artifacts(result: LinearTrainResult, output_dir: str, *, 
     return {"result_json": str(target)}
 
 
+def load_linear_train_result(path: str | Path) -> LinearTrainResult:
+    target = Path(path)
+    if not target.exists():
+        raise FileNotFoundError(str(target))
+    if target.suffix != ".json":
+        raise ValueError("linear train result path must have .json suffix")
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    return LinearTrainResult.from_dict(raw)
+
+
+def linear_model_bundle_from_train_result(result: LinearTrainResult) -> lm.LinearModelBundle:
+    if not isinstance(result, LinearTrainResult):
+        raise ValueError("result must be LinearTrainResult")
+    return lm.LinearModelBundle.from_dict(result.model_bundle_state)
+
+
+def linear_preprocess_states_from_train_result(
+    result: LinearTrainResult,
+) -> dict[str, pp.LinearPreprocessState]:
+    if not isinstance(result, LinearTrainResult):
+        raise ValueError("result must be LinearTrainResult")
+    raw = result.preprocess_state
+    if raw.get("schema") != "mmrt_linear_preprocess":
+        raise ValueError("preprocess_state schema mismatch")
+    states_raw = raw.get("states_by_head")
+    if not isinstance(states_raw, Mapping):
+        raise ValueError("preprocess_state states_by_head must be a mapping")
+    if set(states_raw.keys()) != set(lm.MODEL_HEADS):
+        raise ValueError("preprocess_state heads must exactly match MODEL_HEADS")
+    bundle = linear_model_bundle_from_train_result(result)
+    model_cols = bundle.feature_columns_by_head
+    states: dict[str, pp.LinearPreprocessState] = {}
+    for head in lm.MODEL_HEADS:
+        value = states_raw[head]
+        if not isinstance(value, Mapping):
+            raise ValueError(f"preprocess state for {head!r} must be a mapping")
+        state = pp.LinearPreprocessState.from_dict(dict(value))
+        if state.feature_columns != model_cols[head]:
+            raise ValueError(f"preprocess feature_columns must match model feature_columns for head {head!r}")
+        states[head] = state
+    return states
+
+
 __all__ = [
     "DEFAULT_TRAIN_BATCH_SIZE",
     "DEFAULT_EPOCHS",
@@ -575,4 +650,7 @@ __all__ = [
     "evaluate_model_on_split",
     "train_linear_model",
     "write_linear_train_artifacts",
+    "load_linear_train_result",
+    "linear_model_bundle_from_train_result",
+    "linear_preprocess_states_from_train_result",
 ]
