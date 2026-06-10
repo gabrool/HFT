@@ -26,6 +26,7 @@ from mmrt.execution.linear_signal import (
     predictions_to_signal_arrays,
     save_linear_signal_artifact_npz,
     validate_linear_signal_artifact_metadata,
+    validate_linear_signal_start_event_index,
 )
 
 
@@ -64,6 +65,36 @@ def _artifact(n_rows: int) -> LinearSignalArtifact:
         metadata=metadata,
         decision_event_index=np.arange(n_rows, dtype=np.int64),
         decision_local_ts_us=np.arange(100, 100 + n_rows * 50, 50, dtype=np.int64),
+    )
+
+
+def _linear_artifact_with_decision_event_index(indices: list[int]) -> LinearSignalArtifact:
+    n_rows = len(indices)
+    prediction = {
+        NO_MOVE_PROBA_KEY: np.tile(np.array([[0.8, 0.2]], dtype=np.float32), (n_rows, 1)),
+        DIRECTION_PROBA_KEY: np.tile(np.array([[0.3, 0.7]], dtype=np.float32), (n_rows, 1)),
+        MAGNITUDE_UP_KEY: np.full(n_rows, np.log1p(10.0), dtype=np.float32),
+        MAGNITUDE_DOWN_KEY: np.full(n_rows, np.log1p(5.0), dtype=np.float32),
+    }
+    arrays = predictions_to_signal_arrays(prediction)
+    metadata = LinearSignalArtifactMetadata(
+        tape_schema="tape",
+        exchange="X",
+        symbol="BTC-USD",
+        num_events=max(indices) + 1,
+        num_l2_batches=n_rows,
+        num_trades=0,
+        start_local_ts_us=100,
+        end_local_ts_us=100 + 100 * (n_rows - 1),
+        decision_interval_us=100,
+        start_event_index=indices[0],
+        n_rows=n_rows,
+    )
+    return LinearSignalArtifact(
+        arrays=arrays,
+        metadata=metadata,
+        decision_event_index=np.asarray(indices, dtype=np.int64),
+        decision_local_ts_us=np.arange(100, 100 + n_rows * 100, 100, dtype=np.int64),
     )
 
 
@@ -350,3 +381,33 @@ def test_linear_signal_has_no_metadata_free_artifact_helpers():
     assert "_save_linear_signal_arrays_npz" not in source
     assert "save_linear_signal_arrays_npz" not in source
     assert "load_linear_signal_arrays_npz" not in source
+
+
+def test_validate_linear_signal_start_event_index_accepts_default_and_later_rows():
+    artifact = _linear_artifact_with_decision_event_index([10, 20, 30, 40])
+
+    default = validate_linear_signal_start_event_index(artifact)
+    assert default.event_index == 10
+    assert default.row_index == 0
+    assert default.rows_available == 4
+
+    later = validate_linear_signal_start_event_index(artifact, start_event_index=30)
+    assert later.event_index == 30
+    assert later.row_index == 2
+    assert later.rows_available == 2
+
+
+def test_validate_linear_signal_start_event_index_rejects_non_grid_start():
+    artifact = _linear_artifact_with_decision_event_index([10, 20, 30])
+    with pytest.raises(ValueError, match="decision_event_index"):
+        validate_linear_signal_start_event_index(artifact, start_event_index=25)
+
+
+def test_validate_linear_signal_start_event_index_checks_remaining_rows():
+    artifact = _linear_artifact_with_decision_event_index([10, 20, 30])
+    with pytest.raises(ValueError, match="not contain enough rows"):
+        validate_linear_signal_start_event_index(
+            artifact,
+            start_event_index=30,
+            min_rows=2,
+        )

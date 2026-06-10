@@ -154,3 +154,20 @@ def test_build_linear_signals_cli_does_not_recompute_predictions_for_summary():
     assert "predict_linear_heads_for_execution_features" not in source
     assert "linear_model_bundle_from_train_result" not in source
     assert "linear_preprocess_states_from_train_result" not in source
+
+
+def test_execution_clis_validate_linear_metadata_with_artifact_start_only():
+    for path in (
+        Path("mmrt/cli/train_execution_ppo.py"),
+        Path("mmrt/cli/audit_execution_sim.py"),
+        Path("mmrt/cli/evaluate_execution_policy.py"),
+    ):
+        text = path.read_text(encoding="utf-8")
+        assert "validate_linear_signals_for_execution_tape" in text
+        assert "_effective_start_event_index" not in text
+
+
+def test_env_computes_signal_end_before_reward_step():
+    source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
+    step_body = source.split("def step(", 1)[1].split("def _event_key_at_index", 1)[0]
+    assert step_body.find("terminal_due_to_signal_end") < step_body.find("compute_reward_step(")

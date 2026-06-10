@@ -3,7 +3,8 @@ import json
 import pytest
 
 from mmrt.cli.build_linear_signals import BuildLinearSignalsConfig, _config_from_args, build_arg_parser, build_linear_signals_from_config
-from mmrt.execution.execution_tape import save_execution_tape
+from mmrt.execution.execution_tape import load_execution_tape, save_execution_tape
+from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.linear_signal import LINEAR_SIGNALS_FILENAME, load_linear_signal_artifact_npz
 from mmrt.linear import models as lm
 from tests.test_execution_linear_signal_builder import _tiny_tape, _train_result, _preprocess_state
@@ -31,6 +32,9 @@ def test_build_linear_signals_cli_end_to_end(tmp_path):
     assert (tape_root / "linear_signals_summary.json").exists()
     artifact = load_linear_signal_artifact_npz(tape_root / LINEAR_SIGNALS_FILENAME)
     assert artifact.n_rows == summary["feature_dataset"]["num_decisions"]
+    env = ExecutionEnv(load_execution_tape(tape_root), linear_signals=artifact)
+    reset = env.reset()
+    assert reset.info["event_index"] == int(artifact.decision_event_index[0])
     loaded_summary = json.loads((tape_root / "linear_signals_summary.json").read_text(encoding="utf-8"))
     assert loaded_summary["run_type"] == "build_linear_signals"
 

@@ -42,7 +42,11 @@ from mmrt.execution.fill_sim import (
     sync_orders_to_quote,
 )
 from mmrt.execution.contracts import LinearSignal
-from mmrt.execution.linear_signal import LinearSignalArtifact, linear_signal_at
+from mmrt.execution.linear_signal import (
+    LinearSignalArtifact,
+    linear_signal_at,
+    linear_signal_row_for_event_index,
+)
 from mmrt.execution.adverse_runtime import (
     AdverseRuntimeConfig,
     adverse_predictions_for_row,
@@ -315,7 +319,7 @@ class ExecutionEnv:
         if start >= len(events):
             raise ValueError("start_event_index must be < len(tape.arrays.events)")
 
-        signal_row = self._linear_signal_row_for_event_index(start)
+        signal_row = linear_signal_row_for_event_index(self.linear_signals, start)
         event = events[start]
         if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
             raise ValueError("linear signal start_event_index must reference an L2 batch event")
@@ -462,7 +466,11 @@ class ExecutionEnv:
                 truncated = True
                 break
 
+        next_signal_row = state.signal_row_index + 1
+        terminal_due_to_signal_end = next_signal_row >= self.linear_signals.n_rows
+
         done = False if truncated else next_event_index >= num_events
+        done = bool(done or terminal_due_to_signal_end)
         state.done = done
         state.truncated = truncated
 
@@ -483,17 +491,14 @@ class ExecutionEnv:
         self._peak_equity = reward_step.peak_equity
         self._last_step_fills = step_fills
         state.step_index += 1
-        next_signal_row = state.signal_row_index + 1
-        terminal_due_to_signal_end = next_signal_row >= self.linear_signals.n_rows
-        if terminal_due_to_signal_end:
-            done = True
-            state.done = True
-        else:
+        if not terminal_due_to_signal_end:
             state.signal_row_index = next_signal_row
 
         info: dict[str, object] = {
             "step_index": state.step_index - 1,
             "linear_signal_row": decision_signal_row,
+            "signal_row_index": decision_signal_row,
+            "terminal_due_to_signal_end": terminal_due_to_signal_end,
             "event_index": state.event_index,
             "current_book_ptr": state.current_book_ptr,
             "events_processed": events_processed,
@@ -746,16 +751,6 @@ class ExecutionEnv:
         )
         return _AdverseRuntimeFeatureMaps(adverse_features, edge_features)
 
-
-    def _linear_signal_row_for_event_index(self, event_index: int) -> int:
-        indices = self.linear_signals.decision_event_index
-        pos = int(np.searchsorted(indices, event_index, side="left"))
-        if pos >= len(indices) or int(indices[pos]) != event_index:
-            raise ValueError(
-                "start_event_index must match an existing linear signal decision_event_index; "
-                f"got {event_index}"
-            )
-        return pos
 
     def _linear_signal_for_step(
         self,

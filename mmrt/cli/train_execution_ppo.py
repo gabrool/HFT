@@ -18,9 +18,9 @@ from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
     load_linear_signal_artifact_npz,
     linear_signal_artifact_summary,
-    validate_linear_signal_artifact_metadata,
 )
 from mmrt.cli.execution_env_config import build_execution_env_config_from_attrs
+from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execution_tape
 from mmrt.rl.normalization import ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.rollout import RolloutConfig
@@ -437,9 +437,6 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
-def _effective_start_event_index(value: int | None, linear_signals) -> int:
-    return int(linear_signals.decision_event_index[0]) if value is None else value
-
 
 def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingConfig:
     network_config = ActorCriticConfig(
@@ -530,18 +527,11 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
     adverse_signals = load_adverse_selection_signals(config.adverse_signals_npz) if config.adverse_signals_npz is not None else None
     env_config = _build_env_config(config)
-    validate_linear_signal_artifact_metadata(
-        linear_signals,
-        tape_schema=tape.manifest.schema,
-        exchange=tape.manifest.exchange,
-        symbol=tape.manifest.symbol,
-        num_events=tape.manifest.num_events,
-        num_l2_batches=tape.manifest.num_l2_batches,
-        num_trades=tape.manifest.num_trades,
-        start_local_ts_us=tape.manifest.start_local_ts_us,
-        end_local_ts_us=tape.manifest.end_local_ts_us,
+    linear_start = validate_linear_signals_for_execution_tape(
+        linear_signals=linear_signals,
+        tape=tape,
         decision_interval_us=config.decision_interval_us,
-        start_event_index=_effective_start_event_index(config.start_event_index, linear_signals),
+        requested_start_event_index=config.start_event_index,
         min_rows=(config.max_episode_steps + 1) if config.max_episode_steps is not None else None,
     )
     env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals, adverse_signals=adverse_signals)
@@ -569,6 +559,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         "training": result.summary_dict(),
         "observation_schema": env.config.observation_schema.as_dict(),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
+        "linear_signal_start": linear_start.as_dict(),
     }
 
     if config.save_checkpoint:
@@ -579,6 +570,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         checkpoint_payload["linear_signals"] = linear_signal_artifact_summary(
             linear_signals, path=str(linear_signals_path)
         )
+        checkpoint_payload["linear_signal_start"] = linear_start.as_dict()
         _save_checkpoint_atomic(checkpoint_path, checkpoint_payload)
         summary["checkpoint_saved"] = True
     else:
