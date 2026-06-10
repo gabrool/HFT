@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from mmrt.execution.execution_tape import load_execution_tape
+from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
     MAGNITUDE_INPUT_LOG1P_BPS,
@@ -138,7 +138,11 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
     if output_json.exists() and not config.overwrite:
         raise FileExistsError(f"output_json already exists: {output_json}")
 
-    tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode)
+    tape = load_execution_tape(
+        config.tape_root,
+        mmap_mode=config.mmap_mode,
+        validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
+    )
     result = load_linear_train_result(config.linear_train_result_json)
     if result.schema != LINEAR_TRAINING_RESULT_SCHEMA:
         raise ValueError("linear train result schema mismatch")
