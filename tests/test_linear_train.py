@@ -70,6 +70,7 @@ def test_public_api_boundary():
         "DEFAULT_TRAIN_BATCH_SIZE", "DEFAULT_EPOCHS", "DEFAULT_OUTPUT_FILENAME", "LINEAR_TRAINING_RESULT_SCHEMA",
         "LinearTrainConfig", "SplitEvaluation", "LinearTrainResult", "fit_preprocessors_from_train_split",
         "train_model_bundle_from_train_split", "evaluate_model_on_split", "train_linear_model", "write_linear_train_artifacts",
+        "load_linear_train_result", "linear_model_bundle_from_train_result", "linear_preprocess_states_from_train_result",
     ]
 
 
@@ -522,3 +523,59 @@ def test_make_linear_model_bundle_requires_exact_mapping_keys():
                 "bad": ("x_a",),
             }
         )
+
+
+def _minimal_preprocess_state(cols):
+    from mmrt.linear import preprocess as pp
+    n = len(cols)
+    return pp.LinearPreprocessState(
+        feature_columns=tuple(cols),
+        n_rows_fit=2,
+        mean=np.zeros(n),
+        variance=np.ones(n),
+        scale=np.ones(n),
+        active_mask=np.ones(n, dtype=bool),
+        config=pp.LinearPreprocessConfig(),
+    )
+
+
+def _minimal_train_result(cols_by_head=None):
+    cols_by_head = cols_by_head or {head: ("x_mid_slope_bps_per_sec_1000000us",) for head in lm.MODEL_HEADS}
+    bundle = lm.make_linear_model_bundle(cols_by_head)
+    states = {head: _minimal_preprocess_state(cols_by_head[head]) for head in lm.MODEL_HEADS}
+    return tr.LinearTrainResult(
+        schema=tr.LINEAR_TRAINING_RESULT_SCHEMA,
+        dataset_id="dataset",
+        manifest_hash="hash",
+        config={"resolved_head_features": {"feature_columns_by_head": {h: list(cols_by_head[h]) for h in lm.MODEL_HEADS}}},
+        preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: states[h].as_dict() for h in lm.MODEL_HEADS}},
+        model_bundle_state=bundle.as_dict(),
+        splits={"train": tr.SplitEvaluation("train", 1, {}, {}), "val": tr.SplitEvaluation("val", 1, {}, {})},
+        selection_summary={},
+    )
+
+
+def test_load_linear_train_result_roundtrip(tmp_path):
+    result = _minimal_train_result()
+    path = tmp_path / "linear_train_result.json"
+    path.write_text(json.dumps(result.as_dict(), sort_keys=True, allow_nan=False), encoding="utf-8")
+    loaded = tr.load_linear_train_result(path)
+    assert loaded.schema == result.schema
+    assert loaded.dataset_id == result.dataset_id
+    assert set(loaded.config.keys()) == set(result.config.keys())
+    assert set(loaded.splits.keys()) == {"train", "val"}
+
+
+def test_linear_bundle_and_preprocess_states_from_result_validate_head_columns():
+    cols = ("x_mid_slope_bps_per_sec_1000000us", "x_time_since_mid_change_us")
+    result = _minimal_train_result({head: cols for head in lm.MODEL_HEADS})
+    bundle = tr.linear_model_bundle_from_train_result(result)
+    states = tr.linear_preprocess_states_from_train_result(result)
+    assert bundle.feature_columns_by_head[lm.NO_MOVE_HEAD] == cols
+    assert states[lm.NO_MOVE_HEAD].feature_columns == cols
+
+    raw = result.as_dict()
+    raw["preprocess_state"]["states_by_head"][lm.NO_MOVE_HEAD]["feature_columns"] = ["x_time_since_mid_change_us", "x_bid_l1_notional_usd"]
+    bad = tr.LinearTrainResult.from_dict(raw)
+    with pytest.raises(ValueError, match="feature_columns"):
+        tr.linear_preprocess_states_from_train_result(bad)
