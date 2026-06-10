@@ -535,8 +535,8 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
-def _effective_start_event_index(value: int | None) -> int:
-    return 0 if value is None else value
+def _effective_start_event_index(value: int | None, linear_signals) -> int:
+    return int(linear_signals.decision_event_index[0]) if value is None else value
 
 
 def _resolve_evaluation_start_event_index(
@@ -609,7 +609,7 @@ def run_execution_policy_evaluation(
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
         decision_interval_us=env_config.decision_interval_us,
-        start_event_index=_effective_start_event_index(effective_start_event_index),
+        start_event_index=_effective_start_event_index(effective_start_event_index, linear_signals),
         min_rows=(env_config.max_episode_steps + 1) if env_config.max_episode_steps is not None else None,
     )
 

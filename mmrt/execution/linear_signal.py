@@ -380,6 +380,8 @@ class LinearSignalArtifact:
             raise ValueError("decision_event_index must be strictly increasing")
         if decision_local_ts_us.shape[0] > 1 and (np.diff(decision_local_ts_us) <= 0).any():
             raise ValueError("decision_local_ts_us must be strictly increasing")
+        if self.metadata.start_event_index != int(decision_event_index[0]):
+            raise ValueError("metadata.start_event_index must equal first decision_event_index")
         object.__setattr__(self, "decision_event_index", decision_event_index)
         object.__setattr__(self, "decision_local_ts_us", decision_local_ts_us)
 

@@ -140,3 +140,17 @@ def test_train_execution_ppo_default_linear_signal_filename_has_builder_cli():
     source = Path("mmrt/cli/build_linear_signals.py").read_text(encoding="utf-8")
     assert "LINEAR_SIGNALS_FILENAME" in source
     assert "save_linear_signal_artifact_npz" in source
+
+
+def test_execution_env_default_reset_uses_linear_signal_first_row():
+    source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
+    reset_body = source.split("def reset(", 1)[1].split("def step(", 1)[0]
+    assert "self.linear_signals.decision_event_index[0]" in reset_body
+    assert "start = 0" not in reset_body
+
+
+def test_build_linear_signals_cli_does_not_recompute_predictions_for_summary():
+    source = Path("mmrt/cli/build_linear_signals.py").read_text(encoding="utf-8")
+    assert "predict_linear_heads_for_execution_features" not in source
+    assert "linear_model_bundle_from_train_result" not in source
+    assert "linear_preprocess_states_from_train_result" not in source

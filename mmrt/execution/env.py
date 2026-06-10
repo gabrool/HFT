@@ -205,6 +205,7 @@ class _EnvState:
     current_book_ptr: int
     previous_event_local_ts_us: int | None
     step_index: int
+    signal_row_index: int
     next_order_id: int
     position: PositionState
     live_orders: tuple[ActiveOrder, ...]
@@ -292,6 +293,7 @@ class ExecutionEnv:
             config=config.observation_builder_config,
         )
         self._obs_buffer = np.zeros(config.observation_schema.dim, dtype=config.observation_schema.np_dtype)
+        self._last_observation = np.zeros(config.observation_schema.dim, dtype=config.observation_schema.np_dtype)
         self._state: _EnvState | None = None
         self._episode_start_local_ts_us = 0
         self._last_step_fills: tuple[Fill, ...] = ()
@@ -307,48 +309,45 @@ class ExecutionEnv:
     ) -> ExecutionEnvReset:
         events = self.tape.arrays.events
         if start_event_index is None:
-            start = 0
+            start = int(self.linear_signals.decision_event_index[0])
         else:
             start = _require_nonnegative_int(start_event_index, "start_event_index")
-            if start >= len(events):
-                raise ValueError("start_event_index must be < len(tape.arrays.events)")
+        if start >= len(events):
+            raise ValueError("start_event_index must be < len(tape.arrays.events)")
 
-        found_event_index: int | None = None
-        found_book_ptr: int | None = None
-        for event_index in range(start, len(events)):
-            event = events[event_index]
-            if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
-                continue
-            book_ptr = int(event["book_ptr"])
-            if book_ptr >= 0 and self._book_top_from_ptr(book_ptr) is not None:
-                found_event_index = event_index
-                found_book_ptr = book_ptr
-                break
-        if found_event_index is None or found_book_ptr is None:
-            raise ValueError("execution tape contains no valid two-sided L2 book event")
+        signal_row = self._linear_signal_row_for_event_index(start)
+        event = events[start]
+        if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
+            raise ValueError("linear signal start_event_index must reference an L2 batch event")
+        book_ptr = int(event["book_ptr"])
+        if book_ptr < 0 or self._book_top_from_ptr(book_ptr) is None:
+            raise ValueError("linear signal start_event_index must reference a valid two-sided L2 book event")
 
         position = self.config.initial_position if initial_position is None else _require_position(initial_position)
         self._state = _EnvState(
-            event_index=found_event_index,
-            current_book_ptr=found_book_ptr,
+            event_index=start,
+            current_book_ptr=book_ptr,
             previous_event_local_ts_us=None,
             step_index=0,
+            signal_row_index=signal_row,
             next_order_id=0,
             position=position,
             live_orders=(),
             done=False,
             truncated=False,
         )
-        self._episode_start_local_ts_us = int(self.tape.arrays.l2_events[found_book_ptr]["local_ts_us"])
+        self._episode_start_local_ts_us = int(self.tape.arrays.l2_events[book_ptr]["local_ts_us"])
         self._last_step_fills = ()
         self._peak_equity = None
         observation = self._build_observation()
+        self._last_observation = np.array(observation, copy=True)
         return ExecutionEnvReset(
             observation=observation,
             info={
-                "event_index": found_event_index,
-                "current_book_ptr": found_book_ptr,
+                "event_index": start,
+                "current_book_ptr": book_ptr,
                 "step_index": 0,
+                "signal_row_index": signal_row,
             },
         )
 
@@ -362,6 +361,7 @@ class ExecutionEnv:
         if state.event_index + 1 >= num_events:
             raise RuntimeError("cannot step: no future tape events remain")
 
+        decision_signal_row = state.signal_row_index
         action = _coerce_action(action)
         symbol_spec = self.tape.manifest.symbol_spec
         previous_position = state.position
@@ -483,9 +483,17 @@ class ExecutionEnv:
         self._peak_equity = reward_step.peak_equity
         self._last_step_fills = step_fills
         state.step_index += 1
+        next_signal_row = state.signal_row_index + 1
+        terminal_due_to_signal_end = next_signal_row >= self.linear_signals.n_rows
+        if terminal_due_to_signal_end:
+            done = True
+            state.done = True
+        else:
+            state.signal_row_index = next_signal_row
 
         info: dict[str, object] = {
             "step_index": state.step_index - 1,
+            "linear_signal_row": decision_signal_row,
             "event_index": state.event_index,
             "current_book_ptr": state.current_book_ptr,
             "events_processed": events_processed,
@@ -528,19 +536,18 @@ class ExecutionEnv:
             "cancel_latency_us": self.config.latency_config.cancel_latency_us,
         }
         if self.adverse_signals is not None:
-            row = state.step_index - 1
             runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
             runtime_maps = self._adverse_runtime_feature_maps_for_step(
-                step_index=row,
+                step_index=decision_signal_row,
                 book_top=previous_book_top,
-                linear_signal=linear_signal_at(self.linear_signals.arrays, row),
+                linear_signal=linear_signal_at(self.linear_signals.arrays, decision_signal_row),
                 inventory_qty=previous_position.inventory_qty,
             )
             for name, value in runtime_maps.edge_features.items():
                 if name.endswith("_attempt_bps") or name.endswith("_valid"):
                     info[name] = value
             info["adverse_signal_available"] = True
-            info["adverse_signal_row"] = row
+            info["adverse_signal_row"] = decision_signal_row
             info["adverse_runtime_post_only_gap_ticks"] = runtime_config.post_only_gap_ticks
         else:
             info["adverse_signal_available"] = False
@@ -553,7 +560,11 @@ class ExecutionEnv:
             truncated=truncated,
             info=info,
         )
-        observation = self._build_observation()
+        if terminal_due_to_signal_end:
+            observation = np.array(self._last_observation, copy=True)
+        else:
+            observation = self._build_observation()
+            self._last_observation = np.array(observation, copy=True)
         return ExecutionEnvStep(
             observation=observation,
             reward=reward_step.reward.total_reward * self.config.reward_config.reward_scale,
@@ -683,12 +694,12 @@ class ExecutionEnv:
             previous_event_local_ts_us=state.previous_event_local_ts_us,
         )
         linear_signal = self._linear_signal_for_step(
-            state.step_index,
+            state.signal_row_index,
             expected_event_index=state.event_index,
             expected_local_ts_us=book_top.local_ts_us,
         )
         runtime_maps = self._adverse_runtime_feature_maps_for_step(
-            step_index=state.step_index,
+            step_index=state.signal_row_index,
             book_top=book_top,
             linear_signal=linear_signal,
             inventory_qty=state.position.inventory_qty,
@@ -734,6 +745,17 @@ class ExecutionEnv:
             config=runtime_config,
         )
         return _AdverseRuntimeFeatureMaps(adverse_features, edge_features)
+
+
+    def _linear_signal_row_for_event_index(self, event_index: int) -> int:
+        indices = self.linear_signals.decision_event_index
+        pos = int(np.searchsorted(indices, event_index, side="left"))
+        if pos >= len(indices) or int(indices[pos]) != event_index:
+            raise ValueError(
+                "start_event_index must match an existing linear signal decision_event_index; "
+                f"got {event_index}"
+            )
+        return pos
 
     def _linear_signal_for_step(
         self,

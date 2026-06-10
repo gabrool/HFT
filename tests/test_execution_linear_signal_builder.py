@@ -9,6 +9,7 @@ from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, Tra
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
+from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.linear_signal import load_linear_signal_artifact_npz, save_linear_signal_artifact_npz
 from mmrt.execution.linear_signal_builder import (
     ExecutionLinearFeatureDataset,
@@ -101,6 +102,14 @@ def test_build_execution_linear_feature_dataset_is_causal_and_aligned():
     assert np.isfinite(dataset.features).all()
 
 
+def test_execution_linear_feature_dataset_start_event_index_is_first_decision_not_replay_start():
+    dataset = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50, start_event_index=0)
+
+    assert dataset.replay_start_event_index == 0
+    assert dataset.start_event_index == int(dataset.decision_event_index[0])
+    assert dataset.start_event_index > dataset.replay_start_event_index
+
+
 def test_execution_linear_feature_names_match_storage_linear_prefix_contract():
     dataset = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50)
     assert dataset.feature_names == execution_linear_feature_names()
@@ -125,6 +134,44 @@ def test_build_linear_signal_artifact_from_execution_features_roundtrip(tmp_path
     loaded = load_linear_signal_artifact_npz(path)
     assert loaded.metadata.n_rows == dataset.num_decisions
     assert np.isfinite(loaded.arrays.expected_return_bps).all()
+
+
+def test_linear_signal_artifact_metadata_start_is_first_signal_row():
+    tape = _tiny_tape()
+    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    cols = tuple(dataset.feature_names[:3])
+    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+
+    artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
+
+    assert artifact.metadata.start_event_index == int(artifact.decision_event_index[0])
+
+
+def test_generated_linear_signals_reset_execution_env_without_alignment_error():
+    tape = _tiny_tape()
+    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    cols = tuple(dataset.feature_names[:3])
+    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
+
+    reset = ExecutionEnv(tape, linear_signals=artifact).reset()
+
+    assert reset.info["event_index"] == int(artifact.decision_event_index[0])
+    assert reset.info["signal_row_index"] == 0
+
+
+def test_generated_linear_signals_env_can_step_once():
+    tape = _tiny_tape()
+    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    cols = tuple(dataset.feature_names[:3])
+    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
+    env = ExecutionEnv(tape, linear_signals=artifact, config=ExecutionEnvConfig(decision_interval_us=50))
+
+    env.reset()
+    step = env.step([0, 0, 0, 0, 0, 0])
+
+    assert isinstance(step.reward, float)
 
 
 def test_linear_signal_builder_rejects_missing_feature_columns():
