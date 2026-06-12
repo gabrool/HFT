@@ -17,11 +17,19 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 from mmrt import config as cfg
-from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
+from mmrt.execution.execution_tape import EVENT_TYPE_CODE_TRADE, ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.feature_replay import iter_tape_feature_steps
 from mmrt.features.labels import LabelBuilder
 from mmrt.features.pipeline import DecisionFeaturePipeline, FeaturePipelineConfig
+from mmrt.features.schedule import (
+    DEFAULT_L1_SIZE_CHANGE_FRACTION,
+    DEFAULT_MAX_DECISION_INTERVAL_US,
+    DEFAULT_MIN_DECISION_INTERVAL_US,
+    DecisionScheduleConfig,
+)
 from mmrt.features.transforms import TransformConfig, TransformDiagnostics
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
@@ -91,12 +99,22 @@ def _safe_posix_leaf(name: str) -> str:
     return cleaned or "tape"
 
 
+def _schedule_config_from_args(args: argparse.Namespace) -> DecisionScheduleConfig:
+    return DecisionScheduleConfig(
+        min_decision_interval_us=args.min_decision_interval_us,
+        max_decision_interval_us=args.max_decision_interval_us,
+        wake_on_trade=args.wake_on_trade,
+        wake_on_top_of_book=args.wake_on_top_of_book,
+        l1_size_change_fraction=args.l1_size_change_fraction,
+    )
+
+
 def _build_pipeline_config(args: argparse.Namespace, *, exchange: str, symbol: str, label_horizons_us: tuple[int, ...]) -> cfg.PipelineConfig:
     base = cfg.default_config()
     return cfg.PipelineConfig(
         market=cfg.MarketConfig(exchange=exchange, symbol=symbol),
         data=cfg.DataConfig(),
-        decision=cfg.DecisionConfig(policy=base.decision.policy, reason=base.decision.reason, stride_us=args.decision_stride_us),
+        decision=cfg.DecisionConfig(schedule=_schedule_config_from_args(args)),
         labels=cfg.LabelConfig(horizons_us=label_horizons_us, entry_delay_us=args.label_entry_delay_us),
         runtime=base.runtime,
         storage=base.storage,
@@ -118,6 +136,7 @@ class IngestCounters:
     tape_events: int = 0
     tape_l2_batches: int = 0
     tape_trades: int = 0
+    trade_events_seen: int = 0
     l2_steps_seen: int = 0
     decisions_emitted: int = 0
     labels_matured: int = 0
@@ -154,7 +173,14 @@ def _run_tape_ingest(
     counters.tape_events = int(tape.manifest.num_events)
     counters.tape_l2_batches = int(tape.manifest.num_l2_batches)
     counters.tape_trades = int(tape.manifest.num_trades)
-    feature_pipeline_config = FeaturePipelineConfig(decision_stride_us=pipeline_config.decision.stride_us)
+    events = tape.arrays.events
+    replay_end = len(events) if max_events is None else min(len(events), start_event_index + max_events)
+    counters.trade_events_seen = int(
+        np.count_nonzero(np.asarray(events["event_type_code"][start_event_index:replay_end]) == EVENT_TYPE_CODE_TRADE)
+    )
+    if counters.trade_events_seen == 0:
+        raise ValueError("no trade events seen in replayed tape range")
+    feature_pipeline_config = FeaturePipelineConfig(schedule=pipeline_config.decision.schedule)
     pipeline = DecisionFeaturePipeline(feature_pipeline_config)
     label_builder = LabelBuilder(pipeline_config.label_spec)
     pending_decisions: dict[tuple[int, int], PendingDecision] = {}
@@ -257,7 +283,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--created-at-utc", default=None)
     p.add_argument("--chunk-rows", type=int, default=wr.DEFAULT_CHUNK_ROWS)
     p.add_argument("--row-group-rows", type=int, default=wr.DEFAULT_ROW_GROUP_ROWS)
-    p.add_argument("--decision-stride-us", type=int, default=cfg.DEFAULT_DECISION_STRIDE_US)
+    p.add_argument("--min-decision-interval-us", type=int, default=DEFAULT_MIN_DECISION_INTERVAL_US)
+    p.add_argument("--max-decision-interval-us", type=int, default=DEFAULT_MAX_DECISION_INTERVAL_US)
+    p.add_argument("--no-wake-on-trade", dest="wake_on_trade", action="store_false", default=True)
+    p.add_argument("--no-wake-on-top-of-book", dest="wake_on_top_of_book", action="store_false", default=True)
+    p.add_argument("--l1-size-change-fraction", type=float, default=DEFAULT_L1_SIZE_CHANGE_FRACTION)
     p.add_argument("--label-horizons-us", default=",".join(str(x) for x in cfg.DEFAULT_HORIZONS_US))
     p.add_argument("--label-entry-delay-us", type=int, default=cfg.DEFAULT_ENTRY_DELAY_US)
     p.add_argument("--start-event-index", type=int, default=0)
@@ -276,10 +306,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     _require_positive_int(args.chunk_rows, "chunk_rows")
-    if args.decision_stride_us != cfg.DEFAULT_DECISION_STRIDE_US:
-        raise ValueError("decision_stride_us must be 500_000 for cli.ingest")
     _require_positive_int(args.row_group_rows, "row_group_rows")
-    _require_positive_int(args.decision_stride_us, "decision_stride_us")
+    _require_positive_int(args.min_decision_interval_us, "min_decision_interval_us")
+    _require_positive_int(args.max_decision_interval_us, "max_decision_interval_us")
     _require_nonnegative_int(args.label_entry_delay_us, "label_entry_delay_us")
     _require_positive_int(args.min_rows_per_split, "min_rows_per_split")
     _require_nonnegative_int(args.start_event_index, "start_event_index")
@@ -356,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "decisions_emitted": counters.decisions_emitted, "rows_written": counters.rows_written, "pending_decisions_at_eof": counters.pending_decisions_at_eof,
         "splits_written": bool(manifest.splits), "split_roles": [s.role.value for s in manifest.splits],
         "start_event_index": args.start_event_index,
+        "decision_schedule": dict(manifest.decision_schedule),
     }
     print(json.dumps(summary, sort_keys=True))
     return 0

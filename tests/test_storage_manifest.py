@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from mmrt.features.schedule import DecisionScheduleConfig
 import mmrt.storage.manifest as mf
 from mmrt.config import default_config
 from mmrt.contracts import LabelSpec, SplitRole, StorageFormat, TimeRangeUS, TimeUnit
@@ -43,7 +44,7 @@ def manifest_from_base_with_columns(base, *, feature_columns=None, label_columns
         symbol=base["symbol"],
         storage_format=base["storage_format"],
         time_unit=base["time_unit"],
-        decision_stride_us=base["decision_stride_us"],
+        decision_schedule=base["decision_schedule"],
         feature_columns=list(base["feature_columns"]) if feature_columns is None else feature_columns,
         label_columns=list(base["label_columns"]) if label_columns is None else label_columns,
         required_columns=list(base["required_columns"]) if required_columns is None else required_columns,
@@ -168,7 +169,7 @@ def test_make_manifest_defaults_and_validation():
     assert m.schema == mf.STORAGE_MANIFEST_SCHEMA
     assert m.storage_format == StorageFormat.FLAT_DECISION_ROWS_US
     assert m.time_unit == TimeUnit.MICROSECOND
-    assert m.decision_stride_us == 500_000
+    assert m.decision_schedule == DecisionScheduleConfig().as_dict()
     assert m.exchange == cfg.market.exchange and m.symbol == cfg.market.symbol
     assert m.feature_schema == mf.feature_schema_record()
     assert m.feature_columns == mf.feature_columns()
@@ -271,7 +272,7 @@ def test_manifest_rejects_pipeline_config_inconsistency():
         "feature_schema": "bad",
         "time_unit": "ms",
         "storage_format": "bad",
-        "decision_stride_us": 123,
+        "decision_schedule": 123,
         "exchange": "wrong",
         "symbol": "WRONG",
     }.items():
@@ -279,7 +280,7 @@ def test_manifest_rejects_pipeline_config_inconsistency():
         d["pipeline_config"][k] = v
         with pytest.raises(ValueError): mf.StorageManifest.from_dict(d)
     d = json.loads(json.dumps(base))
-    for k in ("feature_schema", "time_unit", "storage_format", "decision_stride_us", "exchange", "symbol"):
+    for k in ("feature_schema", "time_unit", "storage_format", "decision_schedule", "exchange", "symbol"):
         del d["pipeline_config"][k]
     mf.StorageManifest.from_dict(d)
 
@@ -331,9 +332,9 @@ def test_manifest_split_validation():
 
 def test_pipeline_config_to_manifest_dict():
     d = mf.pipeline_config_to_manifest_dict(default_config())
-    for k in ("exchange", "symbol", "source_data_types", "decision_policy", "decision_reason", "decision_stride_us", "horizons_us", "entry_delay_us", "price_reference", "asof_policy", "lookback_rows", "feature_dtype", "label_dtype", "timestamp_dtype", "storage_format", "time_unit", "pipeline_schema", "feature_schema"):
+    for k in ("exchange", "symbol", "source_data_types", "decision_policy", "decision_reason", "decision_schedule", "horizons_us", "entry_delay_us", "price_reference", "asof_policy", "lookback_rows", "feature_dtype", "label_dtype", "timestamp_dtype", "storage_format", "time_unit", "pipeline_schema", "feature_schema"):
         assert k in d
-    assert d["decision_stride_us"] == 500_000
+    assert d["decision_schedule"] == DecisionScheduleConfig().as_dict()
     assert d["storage_format"] == "flat_decision_rows_us"
     assert d["time_unit"] == "us"
     assert d["feature_schema"] == specs.FEATURE_SCHEMA
@@ -356,7 +357,7 @@ def test_transform_metadata_json_safe():
 
 def test_manifest_from_dict_missing_required_keys_raise_value_error():
     base = manifest_one_segment().to_dict()
-    required = ["schema", "dataset_id", "created_at_utc", "pipeline_config", "writer_metadata", "feature_schema", "label_spec", "transform_config", "transform_diagnostics", "exchange", "symbol", "storage_format", "time_unit", "decision_stride_us", "feature_columns", "label_columns", "required_columns", "segments"]
+    required = ["schema", "dataset_id", "created_at_utc", "pipeline_config", "writer_metadata", "feature_schema", "label_spec", "transform_config", "transform_diagnostics", "exchange", "symbol", "storage_format", "time_unit", "decision_schedule", "feature_columns", "label_columns", "required_columns", "segments"]
     for key in required:
         d = json.loads(json.dumps(base))
         del d[key]

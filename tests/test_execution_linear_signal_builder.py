@@ -21,6 +21,7 @@ from mmrt.execution.linear_signal_builder import (
 from mmrt.linear import models as lm
 from mmrt.linear import preprocess as pp
 from mmrt.linear import train as tr
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features.transforms import TransformConfig
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 
@@ -64,6 +65,9 @@ def _tiny_tape():
     return build_execution_tape(symbol_spec=_spec(), symbol_rules=_rules(), l2_events=l2, trades=trades, merged_events=merge_execution_events(l2, trades).events, book_depth=3, created_at_utc="2026-01-01T00:00:00Z")
 
 
+_SCHED50 = DecisionScheduleConfig(min_decision_interval_us=50, max_decision_interval_us=50)
+
+
 def _preprocess_state(cols):
     n = len(cols)
     return pp.LinearPreprocessState(
@@ -85,6 +89,7 @@ def _train_result(feature_columns_by_head):
         dataset_id="dataset",
         manifest_hash="hash",
         config={},
+        decision_schedule=_SCHED50.as_dict(),
         transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: states[h].as_dict() for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),
@@ -97,7 +102,7 @@ def _train_result(feature_columns_by_head):
 
 
 def test_build_execution_linear_feature_dataset_is_causal_and_aligned():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
     assert dataset.num_decisions > 1
     assert np.all(np.diff(dataset.decision_event_index) > 0)
     assert np.all(np.diff(dataset.decision_local_ts_us) > 0)
@@ -105,7 +110,7 @@ def test_build_execution_linear_feature_dataset_is_causal_and_aligned():
 
 
 def test_execution_linear_feature_dataset_start_event_index_is_first_decision_not_replay_start():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50, start_event_index=0)
+    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50, start_event_index=0)
 
     assert dataset.replay_start_event_index == 0
     assert dataset.start_event_index == int(dataset.decision_event_index[0])
@@ -113,21 +118,21 @@ def test_execution_linear_feature_dataset_start_event_index_is_first_decision_no
 
 
 def test_execution_linear_feature_names_match_storage_linear_prefix_contract():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
     assert dataset.feature_names == execution_linear_feature_names()
     assert all(name.startswith("x_") for name in dataset.feature_names)
     assert "x_mid_slope_bps_per_sec_1000000us" in dataset.feature_names
 
 
 def test_build_execution_linear_feature_dataset_respects_start_and_max_decisions():
-    limited = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50, start_event_index=2, max_decisions=2)
+    limited = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50, start_event_index=2, max_decisions=2)
     assert limited.num_decisions <= 2
     assert int(limited.decision_event_index[0]) >= 2
 
 
 def test_build_linear_signal_artifact_from_execution_features_roundtrip(tmp_path):
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
     cols = tuple(dataset.feature_names[:3])
     result = _train_result({head: cols for head in lm.MODEL_HEADS})
     artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
@@ -140,7 +145,7 @@ def test_build_linear_signal_artifact_from_execution_features_roundtrip(tmp_path
 
 def test_linear_signal_artifact_metadata_start_is_first_signal_row():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
     cols = tuple(dataset.feature_names[:3])
     result = _train_result({head: cols for head in lm.MODEL_HEADS})
 
@@ -151,7 +156,7 @@ def test_linear_signal_artifact_metadata_start_is_first_signal_row():
 
 def test_generated_linear_signals_reset_execution_env_without_alignment_error():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
     cols = tuple(dataset.feature_names[:3])
     result = _train_result({head: cols for head in lm.MODEL_HEADS})
     artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
@@ -164,28 +169,28 @@ def test_generated_linear_signals_reset_execution_env_without_alignment_error():
 
 def test_generated_linear_signals_env_can_step_once():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
     cols = tuple(dataset.feature_names[:3])
     result = _train_result({head: cols for head in lm.MODEL_HEADS})
     artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
-    env = ExecutionEnv(tape, linear_signals=artifact, config=ExecutionEnvConfig(decision_interval_us=50))
+    env = ExecutionEnv(tape, linear_signals=artifact, config=ExecutionEnvConfig())
 
     env.reset()
-    step = env.step([0, 0, 0, 0, 0, 0])
+    step = env.step([0, 0, 0, 0, 0, 0, 0, 0])
 
     assert isinstance(step.reward, float)
 
 
 def test_linear_signal_builder_rejects_missing_feature_columns():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
     result = _train_result({head: ("x_not_produced",) for head in lm.MODEL_HEADS})
     with pytest.raises(ValueError, match="x_not_produced"):
         build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
 
 
 def test_linear_signal_builder_supports_per_head_feature_sets():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
     feature_sets = {
         lm.NO_MOVE_HEAD: tuple(dataset.feature_names[:2]),
         lm.DIRECTION_HEAD: tuple(dataset.feature_names[1:4]),
@@ -202,7 +207,7 @@ def test_linear_signal_builder_supports_per_head_feature_sets():
 
 
 def test_linear_signal_builder_rejects_preprocess_model_feature_mismatch():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), decision_interval_us=50)
+    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
     cols = tuple(dataset.feature_names[:2])
     bundle = lm.make_linear_model_bundle({head: cols for head in lm.MODEL_HEADS})
     bad_state = _preprocess_state(tuple(dataset.feature_names[1:3])).as_dict()
@@ -211,6 +216,7 @@ def test_linear_signal_builder_rejects_preprocess_model_feature_mismatch():
         dataset_id="dataset",
         manifest_hash="hash",
         config={},
+        decision_schedule=DecisionScheduleConfig().as_dict(),
         transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: bad_state for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),

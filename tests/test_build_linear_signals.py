@@ -25,7 +25,6 @@ def test_build_linear_signals_cli_end_to_end(tmp_path):
         BuildLinearSignalsConfig(
             tape_root=str(tape_root),
             linear_train_result_json=str(result_path),
-            decision_interval_us=50,
         )
     )
     assert (tape_root / LINEAR_SIGNALS_FILENAME).exists()
@@ -46,7 +45,7 @@ def test_build_linear_signals_overwrite_guard(tmp_path):
     result_path = _write_result(tmp_path / "linear_train_result.json", _train_result({head: cols for head in lm.MODEL_HEADS}))
     (tape_root / LINEAR_SIGNALS_FILENAME).write_bytes(b"exists")
     with pytest.raises(FileExistsError):
-        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(result_path), decision_interval_us=50))
+        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(result_path)))
 
 
 def test_build_linear_signals_parser_no_mmap():
@@ -64,4 +63,4 @@ def test_build_linear_signals_rejects_feature_mismatch(tmp_path):
     save_execution_tape(_tiny_tape(), tape_root, overwrite=True)
     result_path = _write_result(tmp_path / "linear_train_result.json", _train_result({head: ("x_missing_feature",) for head in lm.MODEL_HEADS}))
     with pytest.raises(ValueError, match="x_missing_feature"):
-        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(result_path), decision_interval_us=50))
+        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(result_path)))

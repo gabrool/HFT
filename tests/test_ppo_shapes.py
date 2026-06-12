@@ -59,7 +59,7 @@ def test_actor_critic_shapes_and_deterministic_action():
     obs = torch.zeros(3, 4)
 
     forward = policy(obs)
-    assert forward.enable_logits.shape == (3, 2)
+    assert forward.enable_logits.shape == (3, 4)
     assert forward.continuous_mean.shape == (3, 4)
     assert forward.continuous_log_std.shape == (3, 4)
     assert forward.value.shape == (3,)
@@ -69,9 +69,9 @@ def test_actor_critic_shapes_and_deterministic_action():
     assert torch.isfinite(forward.value).all()
 
     sample = policy.sample_action(obs, deterministic=True)
-    assert torch.all(sample.action[:, :2] == 1.0)
-    assert torch.allclose(sample.action[:, 2:], forward.continuous_mean)
-    assert sample.enable_prob.shape == (3, 2)
+    assert torch.all(sample.action[:, :4] == 1.0)
+    assert torch.allclose(sample.action[:, 4:], forward.continuous_mean)
+    assert sample.enable_prob.shape == (3, 4)
     assert sample.continuous_mean.shape == (3, 4)
     assert sample.continuous_log_std.shape == (3, 4)
     assert sample.log_prob.shape == (3,)

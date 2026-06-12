@@ -12,6 +12,7 @@ from mmrt.contracts import (
     TardisDataType,
     TimeUnit,
 )
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features.specs import FEATURE_SCHEMA as DEFAULT_FEATURE_SCHEMA
 
 DEFAULT_EXCHANGE = "binance-futures"
@@ -31,9 +32,8 @@ DEFAULT_HORIZONS_US = (
 DEFAULT_ENTRY_DELAY_US = 1_000
 
 DEFAULT_LOOKBACK_ROWS = 10
-DEFAULT_DECISION_REASON = DecisionReason.BOOK_STRIDE
-DEFAULT_DECISION_POLICY = "book_stride"
-DEFAULT_DECISION_STRIDE_US = 500_000
+DEFAULT_DECISION_REASON = DecisionReason.EVENT_SCHEDULE
+DEFAULT_DECISION_POLICY = "event_schedule"
 
 DEFAULT_PIPELINE_SCHEMA = "mmrt_pipeline_config"
 DEFAULT_STORAGE_FORMAT = StorageFormat.FLAT_DECISION_ROWS_US
@@ -112,22 +112,20 @@ class DataConfig:
 class DecisionConfig:
     policy: str = DEFAULT_DECISION_POLICY
     reason: DecisionReason = DEFAULT_DECISION_REASON
-    stride_us: int = DEFAULT_DECISION_STRIDE_US
+    schedule: DecisionScheduleConfig = field(default_factory=DecisionScheduleConfig)
 
     def __post_init__(self) -> None:
         if _require_nonempty_str(self.policy, "policy") != DEFAULT_DECISION_POLICY:
-            raise ValueError("policy must be 'book_stride'")
+            raise ValueError("policy must be 'event_schedule'")
         try:
             reason = DecisionReason(self.reason)
         except ValueError as exc:
-            raise ValueError("reason must be DecisionReason.BOOK_STRIDE") from exc
-        if reason != DecisionReason.BOOK_STRIDE:
-            raise ValueError("reason must be DecisionReason.BOOK_STRIDE")
-        stride_us = _require_positive_int(self.stride_us, "stride_us")
-        if stride_us != DEFAULT_DECISION_STRIDE_US:
-            raise ValueError("stride_us must be 500_000")
+            raise ValueError("reason must be DecisionReason.EVENT_SCHEDULE") from exc
+        if reason != DecisionReason.EVENT_SCHEDULE:
+            raise ValueError("reason must be DecisionReason.EVENT_SCHEDULE")
+        if not isinstance(self.schedule, DecisionScheduleConfig):
+            raise ValueError("schedule must be DecisionScheduleConfig")
         object.__setattr__(self, "reason", reason)
-        object.__setattr__(self, "stride_us", stride_us)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,7 +262,6 @@ __all__ = [
     "DEFAULT_ENTRY_DELAY_US",
     "DEFAULT_LOOKBACK_ROWS",
     "DEFAULT_DECISION_POLICY",
-    "DEFAULT_DECISION_STRIDE_US",
     "DEFAULT_PIPELINE_SCHEMA",
     "DEFAULT_FEATURE_SCHEMA",
     "DEFAULT_FEATURE_DTYPE",

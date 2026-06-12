@@ -21,7 +21,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--linear-signals-npz")
     parser.add_argument("--output-json")
     parser.add_argument("--no-mmap", action="store_true")
-    parser.add_argument("--decision-interval-us", type=int, default=500_000)
     parser.add_argument("--start-event-index", type=int)
     parser.add_argument("--max-decisions", type=int)
     parser.add_argument("--chunk-rows", type=int, default=100_000)
@@ -51,7 +50,6 @@ def _config_from_args(args: argparse.Namespace) -> LinearExecutionFeatureAuditCo
         linear_signals_npz=signals,
         output_json=output,
         mmap_mode=None if args.no_mmap else "r",
-        decision_interval_us=args.decision_interval_us,
         start_event_index=args.start_event_index,
         max_decisions=args.max_decisions,
         chunk_rows=args.chunk_rows,

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, LatencyConfig, SymbolSpec, TradePrint
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
@@ -38,6 +39,10 @@ from mmrt.rl.rollout import RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy
 
+
+
+def _fixed_schedule_payload(stride_us: int) -> dict:
+    return DecisionScheduleConfig(min_decision_interval_us=stride_us, max_decision_interval_us=stride_us).as_dict()
 
 
 def _rules():
@@ -191,7 +196,7 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=decision_interval_us,
+        decision_schedule=_fixed_schedule_payload(decision_interval_us),
         start_event_index=start_event_index,
         n_rows=n_rows,
     )
@@ -224,7 +229,6 @@ def _tiny_env(max_episode_steps: int | None = 4) -> ExecutionEnv:
         tape,
         linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50),
         config=ExecutionEnvConfig(
-            decision_interval_us=50,
             latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0, cancel_latency_us=0),
             max_episode_steps=max_episode_steps,
         ),
@@ -251,7 +255,6 @@ def _train_tiny_checkpoint(tmp_path):
             update_epochs=1,
             minibatch_size=2,
             hidden_sizes=(8,),
-            decision_interval_us=50,
             max_episode_steps=4,
             seed=123,
         )
@@ -314,7 +317,6 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
             update_epochs=1,
             minibatch_size=2,
             hidden_sizes=(8,),
-            decision_interval_us=50,
             max_episode_steps=4,
             seed=123,
         )
@@ -487,7 +489,6 @@ def test_evaluate_execution_policy_can_explicitly_ignore_missing_checkpoint_cli_
             output_json=str(tmp_path / "eval_cli_config.json"),
             overwrite=True,
             max_steps=4,
-            decision_interval_us=50,
             max_episode_steps=4,
             use_checkpoint_cli_env_config=False,
         )
@@ -518,7 +519,6 @@ def test_evaluate_execution_policy_inherits_checkpoint_start_event_index_when_un
             update_epochs=1,
             minibatch_size=1,
             hidden_sizes=(8,),
-            decision_interval_us=50,
             max_episode_steps=4,
             start_event_index=1,
             seed=123,
@@ -666,7 +666,6 @@ def test_evaluate_execution_policy_can_use_cli_env_config_instead_of_checkpoint(
             output_json=str(tmp_path / "eval_cli_env.json"),
             overwrite=True,
             use_checkpoint_cli_env_config=False,
-            decision_interval_us=50,
             max_episode_steps=4,
             max_steps=4,
         )

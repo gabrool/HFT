@@ -10,17 +10,17 @@ This module does not parse market data, read execution tapes, build labels,
 or write storage artifacts.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from mmrt.features.engine import (
-    DECISION_STRIDE_US,
     DEFAULT_EVENT_HISTORY_CAPACITY,
     FeatureEngine,
     FeatureEngineConfig,
 )
 from mmrt.features.book_state import BookSnapshotInput
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features.trade_state import TradeInput
 from mmrt.features.transforms import (
     CausalFeatureTransformer,
@@ -38,15 +38,20 @@ def _require_positive_int(value: int, name: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class FeaturePipelineConfig:
-    decision_stride_us: int = DECISION_STRIDE_US
+    schedule: DecisionScheduleConfig = field(default_factory=DecisionScheduleConfig)
     transform: TransformConfig = TransformConfig()
     event_history_capacity: int = DEFAULT_EVENT_HISTORY_CAPACITY
 
     def __post_init__(self) -> None:
-        _require_positive_int(self.decision_stride_us, "decision_stride_us")
+        if not isinstance(self.schedule, DecisionScheduleConfig):
+            raise ValueError("schedule must be DecisionScheduleConfig")
         if not isinstance(self.transform, TransformConfig):
             raise ValueError("transform must be TransformConfig")
         _require_positive_int(self.event_history_capacity, "event_history_capacity")
+
+    def schedule_identity(self) -> dict[str, object]:
+        """Stable decision schedule payload recorded in downstream artifacts."""
+        return dict(self.schedule.as_dict())
 
     def transform_identity(self) -> dict[str, object]:
         """Stable transform identity payload recorded in downstream artifacts."""
@@ -83,7 +88,7 @@ class DecisionFeaturePipeline:
         self.config = config or FeaturePipelineConfig()
         self.engine = FeatureEngine(
             FeatureEngineConfig(
-                decision_stride_us=self.config.decision_stride_us,
+                schedule=self.config.schedule,
                 event_history_capacity=self.config.event_history_capacity,
             )
         )

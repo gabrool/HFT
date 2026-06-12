@@ -166,7 +166,7 @@ class ExecutionPPOTrainCLIConfig:
     save_checkpoint: bool = True
     mmap_mode: str | None = "r"
 
-    decision_interval_us: int = 500_000
+    cancel_guard_ticks: int = 2
     max_episode_steps: int | None = None
 
     max_distance_ticks: int = 1
@@ -256,7 +256,7 @@ class ExecutionPPOTrainCLIConfig:
         if self.mmap_mode not in (None, "r"):
             raise ValueError('mmap_mode must be None or "r"')
 
-        _require_positive_int(self.decision_interval_us, "decision_interval_us")
+        _require_positive_int(self.cancel_guard_ticks, "cancel_guard_ticks")
         _optional_positive_int(self.max_episode_steps, "max_episode_steps")
         _require_positive_int(self.max_distance_ticks, "max_distance_ticks")
         _require_positive_float(self.max_order_qty, "max_order_qty")
@@ -344,7 +344,7 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "overwrite": config.overwrite,
         "save_checkpoint": config.save_checkpoint,
         "mmap_mode": config.mmap_mode,
-        "decision_interval_us": config.decision_interval_us,
+        "cancel_guard_ticks": config.cancel_guard_ticks,
         "max_episode_steps": config.max_episode_steps,
         "max_distance_ticks": config.max_distance_ticks,
         "max_order_qty": config.max_order_qty,
@@ -534,7 +534,6 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
     linear_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
-        decision_interval_us=config.decision_interval_us,
         requested_start_event_index=config.start_event_index,
         min_rows=(config.max_episode_steps + 1) if config.max_episode_steps is not None else None,
     )
@@ -599,7 +598,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
 
-    parser.add_argument("--decision-interval-us", type=int, default=500_000)
+    parser.add_argument("--cancel-guard-ticks", type=int, default=2)
     parser.add_argument("--max-episode-steps", type=int)
     parser.add_argument("--max-distance-ticks", type=int, default=1)
     parser.add_argument("--max-order-qty", type=float, default=0.001)
@@ -688,7 +687,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         overwrite=args.overwrite,
         save_checkpoint=not args.no_checkpoint,
         mmap_mode=None if args.no_mmap else "r",
-        decision_interval_us=args.decision_interval_us,
+        cancel_guard_ticks=args.cancel_guard_ticks,
         max_episode_steps=args.max_episode_steps,
         max_distance_ticks=args.max_distance_ticks,
         max_order_qty=args.max_order_qty,

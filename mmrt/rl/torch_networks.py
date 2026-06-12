@@ -8,7 +8,12 @@ import torch
 from torch import nn
 
 
-EXECUTION_ACTION_DIM = 6
+# Flat hybrid action layout shared with ExecutionEnv:
+# [bid_enable, ask_enable, bid_cancel_guard, ask_cancel_guard] Bernoulli flags
+# followed by [bid_price_raw, ask_price_raw, bid_size_raw, ask_size_raw].
+EXECUTION_ACTION_DIM = 8
+EXECUTION_ENABLE_DIMS = 4
+EXECUTION_CONTINUOUS_DIMS = EXECUTION_ACTION_DIM - EXECUTION_ENABLE_DIMS
 
 ACTION_COMPONENT_NAMES = (
     "bid_enabled",
@@ -23,6 +28,8 @@ LOG_2PI = math.log(2.0 * math.pi)
 
 __all__ = [
     "EXECUTION_ACTION_DIM",
+    "EXECUTION_ENABLE_DIMS",
+    "EXECUTION_CONTINUOUS_DIMS",
     "ACTION_COMPONENT_NAMES",
     "ActorCriticConfig",
     "ActorCriticOutput",
@@ -246,7 +253,7 @@ class ActorCriticNetwork(nn.Module):
         self.obs_dim = _require_positive_int(obs_dim, "obs_dim")
         self.action_dim = _require_positive_int(action_dim, "action_dim")
         if self.action_dim != EXECUTION_ACTION_DIM:
-            raise ValueError("hybrid execution policy action_dim must be 6")
+            raise ValueError("hybrid execution policy action_dim must be 8")
         self.config = config
 
         self.backbone, features_dim = build_mlp(
@@ -256,11 +263,11 @@ class ActorCriticNetwork(nn.Module):
             layer_norm=config.layer_norm,
         )
 
-        self.enable_head = nn.Linear(features_dim, 2)
-        self.continuous_mean_head = nn.Linear(features_dim, 4)
+        self.enable_head = nn.Linear(features_dim, EXECUTION_ENABLE_DIMS)
+        self.continuous_mean_head = nn.Linear(features_dim, EXECUTION_CONTINUOUS_DIMS)
         self.value_head = nn.Linear(features_dim, 1)
         self.continuous_log_std = nn.Parameter(
-            torch.full((4,), config.continuous_log_std_init)
+            torch.full((EXECUTION_CONTINUOUS_DIMS,), config.continuous_log_std_init)
         )
 
         self.reset_parameters()
@@ -340,8 +347,8 @@ class ActorCriticNetwork(nn.Module):
         output = self.forward(obs)
         if actions.shape != (obs.shape[0], self.action_dim):
             raise ValueError("actions shape must match policy action shape")
-        enable = actions[:, :2]
-        continuous = actions[:, 2:]
+        enable = actions[:, :EXECUTION_ENABLE_DIMS]
+        continuous = actions[:, EXECUTION_ENABLE_DIMS:]
         log_prob = _bernoulli_log_prob(enable, output.enable_logits).sum(dim=-1) + diagonal_gaussian_log_prob(
             continuous, output.continuous_mean, output.continuous_log_std
         )

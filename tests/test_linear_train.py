@@ -15,6 +15,7 @@ from mmrt.storage import reader as rd
 from mmrt.storage import writer as wr
 from mmrt.storage import splits as sp
 from mmrt.linear import train as tr
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features.transforms import TransformConfig
 from mmrt.linear import extractors as ex
 from mmrt.linear import head_features as hf
@@ -155,7 +156,7 @@ def test_train_linear_model_end_to_end(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     cfg = tr.LinearTrainConfig(epochs=2, batch_size=3)
     result = tr.train_linear_model(str(root), config=cfg)
-    assert result.schema == "mmrt_linear_training_result"
+    assert result.schema == "mmrt_linear_training_result_tape25"
     assert result.dataset_id == manifest.dataset_id
     assert result.manifest_hash == rd.open_dataset(str(root)).manifest.content_hash()
     assert set(result.splits.keys()) == {"train", "val", "test"}
@@ -295,7 +296,7 @@ def test_result_dataclass_validation():
     with pytest.raises(ValueError):
         tr.SplitEvaluation(role="bad", n_rows=0, evaluation={}, diagnostics={})
     with pytest.raises(ValueError):
-        tr.LinearTrainResult(schema="bad", dataset_id="d", manifest_hash="h", config={}, transform_config=TransformConfig().as_dict(), preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
+        tr.LinearTrainResult(schema="bad", dataset_id="d", manifest_hash="h", config={}, decision_schedule=DecisionScheduleConfig().as_dict(), transform_config=TransformConfig().as_dict(), preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
 
 
 def test_linear_train_result_rejects_non_dict_splits():
@@ -305,7 +306,7 @@ def test_linear_train_result_rejects_non_dict_splits():
             dataset_id="d1",
             manifest_hash="h1",
             config={},
-            transform_config=TransformConfig().as_dict(),
+            decision_schedule=DecisionScheduleConfig().as_dict(), transform_config=TransformConfig().as_dict(),
             preprocess_state={},
             model_bundle_state={},
             splits=[],  # type: ignore[arg-type]
@@ -550,6 +551,7 @@ def _minimal_train_result(cols_by_head=None):
         dataset_id="dataset",
         manifest_hash="hash",
         config={"resolved_head_features": {"feature_columns_by_head": {h: list(cols_by_head[h]) for h in lm.MODEL_HEADS}}},
+        decision_schedule=DecisionScheduleConfig().as_dict(),
         transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: states[h].as_dict() for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),

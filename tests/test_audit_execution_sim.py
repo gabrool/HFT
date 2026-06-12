@@ -5,6 +5,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import (
     ActionSpec,
@@ -40,6 +41,10 @@ from mmrt.cli.audit_execution_sim import (
     main,
 )
 
+
+
+def _fixed_schedule_payload(stride_us: int) -> dict:
+    return DecisionScheduleConfig(min_decision_interval_us=stride_us, max_decision_interval_us=stride_us).as_dict()
 
 
 def _rules():
@@ -173,7 +178,7 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=decision_interval_us,
+        decision_schedule=_fixed_schedule_payload(decision_interval_us),
         start_event_index=start_event_index,
         n_rows=n_rows,
     )
@@ -219,7 +224,6 @@ def test_disabled_audit_runs_and_warns_no_fills(tmp_path):
             output_json=str(output_json),
             policy="disabled",
             max_steps=2,
-            decision_interval_us=50,
             overwrite=True,
         )
     )
@@ -257,7 +261,6 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
             output_json=str(tmp_path / "summary.json"),
             policy="bid",
             max_steps=2,
-            decision_interval_us=250,
             max_order_qty=1.0,
             default_order_qty=1.0,
             decision_compute_latency_us=0,
@@ -347,8 +350,6 @@ def test_audit_execution_sim_main_writes_summary_and_prints_json(tmp_path, capsy
             "disabled",
             "--max-steps",
             "1",
-            "--decision-interval-us",
-            "50",
             "--overwrite",
         ]
     )
@@ -458,7 +459,7 @@ def test_parser_can_disable_l2_trade_dedupe():
         policy=args.policy,
         max_steps=args.max_steps,
         start_event_index=args.start_event_index,
-        decision_interval_us=args.decision_interval_us,
+        cancel_guard_ticks=args.cancel_guard_ticks,
         mmap_mode=None if args.no_mmap else "r",
         max_distance_ticks=args.max_distance_ticks,
         max_order_qty=args.max_order_qty,
@@ -512,7 +513,6 @@ def test_audit_execution_sim_accepts_explicit_later_linear_signal_start(tmp_path
             policy="disabled",
             max_steps=1,
             start_event_index=1,
-            decision_interval_us=50,
             overwrite=True,
         )
     )

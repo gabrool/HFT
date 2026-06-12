@@ -14,6 +14,7 @@ from mmrt.execution.feature_replay import (
 )
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.features.pipeline import DecisionFeaturePipeline, FeaturePipelineConfig
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.storage import manifest as mf
 
@@ -66,7 +67,7 @@ def _one_sided_l2(seq: int, local_ts_us: int, *, bid: int) -> ReconstructedL2Eve
     )
 
 
-def make_tape(*, n_l2: int = 120, l2_step_us: int = 100_000, base_ts_us: int = 1_000_000, one_sided_at: int | None = None):
+def make_tape(*, n_l2: int = 120, l2_step_us: int = 100_000, base_ts_us: int = 1_000_000, one_sided_at: int | None = None, with_trades: bool = True):
     l2 = []
     for i in range(n_l2):
         ts = base_ts_us + i * l2_step_us
@@ -78,7 +79,7 @@ def make_tape(*, n_l2: int = 120, l2_step_us: int = 100_000, base_ts_us: int = 1
         ask = bid + 2 + (i % 2)
         l2.append(_l2(i, ts, bid=bid, ask=ask, bid_size=1.0 + 0.5 * (i % 3)))
     trades = []
-    for k in range(max(n_l2 // 3, 1)):
+    for k in range(max(n_l2 // 3, 1) if with_trades else 0):
         ts = base_ts_us + 50_000 + k * 3 * l2_step_us
         side = AggressorSide.BUY if k % 2 == 0 else AggressorSide.SELL
         trades.append(TradePrint(ts, ts, side, 1001, 0.02, source_row=k))
@@ -89,13 +90,16 @@ def make_tape(*, n_l2: int = 120, l2_step_us: int = 100_000, base_ts_us: int = 1
     )
 
 
+_SCHED_500MS = DecisionScheduleConfig(min_decision_interval_us=500_000, max_decision_interval_us=500_000)
+
+
 def test_decision_feature_column_names_match_storage_feature_columns():
     assert decision_feature_column_names() == mf.feature_columns()
 
 
 def test_iter_tape_feature_steps_yields_valid_l2_steps_with_decisions():
     tape = make_tape(n_l2=60)
-    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(decision_stride_us=500_000))
+    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_SCHED_500MS))
     steps = list(iter_tape_feature_steps(tape, pipeline=pipeline))
     assert steps
     events = tape.arrays.events
@@ -115,7 +119,7 @@ def test_iter_tape_feature_steps_yields_valid_l2_steps_with_decisions():
 def test_iter_tape_feature_steps_skips_one_sided_books():
     skip_index = 30
     tape = make_tape(n_l2=60, one_sided_at=skip_index)
-    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(decision_stride_us=500_000))
+    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_SCHED_500MS))
     steps = list(iter_tape_feature_steps(tape, pipeline=pipeline))
     skipped_event_indices = {
         int(event["event_seq"])
@@ -130,7 +134,7 @@ def test_iter_tape_feature_steps_skips_one_sided_books():
 
 def test_iter_tape_feature_steps_respects_max_events():
     tape = make_tape(n_l2=60)
-    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(decision_stride_us=500_000))
+    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_SCHED_500MS))
     steps = list(iter_tape_feature_steps(tape, pipeline=pipeline, max_events=10))
     assert all(s.event_index < 10 for s in steps)
 
@@ -146,7 +150,7 @@ def test_iter_tape_feature_steps_validates_inputs():
 
 def test_iter_decision_feature_chunks_chunking_and_alignment():
     tape = make_tape(n_l2=120)
-    config = FeaturePipelineConfig(decision_stride_us=500_000)
+    config = FeaturePipelineConfig(schedule=_SCHED_500MS)
     chunks = list(iter_decision_feature_chunks(tape, pipeline_config=config, chunk_rows=3))
     assert chunks
     assert all(c.features.shape[0] <= 3 for c in chunks)
@@ -163,7 +167,7 @@ def test_iter_decision_feature_chunks_chunking_and_alignment():
 
 def test_iter_decision_feature_chunks_max_decisions():
     tape = make_tape(n_l2=120)
-    config = FeaturePipelineConfig(decision_stride_us=500_000)
+    config = FeaturePipelineConfig(schedule=_SCHED_500MS)
     limited = list(iter_decision_feature_chunks(tape, pipeline_config=config, max_decisions=2))
     total = sum(c.features.shape[0] for c in limited)
     assert total == 2
@@ -171,7 +175,7 @@ def test_iter_decision_feature_chunks_max_decisions():
 
 def test_replay_is_deterministic_across_runs():
     tape = make_tape(n_l2=120)
-    config = FeaturePipelineConfig(decision_stride_us=500_000)
+    config = FeaturePipelineConfig(schedule=_SCHED_500MS)
     a = np.vstack([c.features for c in iter_decision_feature_chunks(tape, pipeline_config=config)])
     b = np.vstack([c.features for c in iter_decision_feature_chunks(tape, pipeline_config=config)])
     np.testing.assert_array_equal(a, b)

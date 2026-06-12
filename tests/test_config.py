@@ -12,6 +12,7 @@ from mmrt.config import (
     default_config,
     default_label_spec,
 )
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.contracts import (
     AsOfPolicy,
     DecisionReason,
@@ -32,7 +33,7 @@ def test_default_config_core_values() -> None:
     assert cfg.labels.entry_delay_us == 1_000
     assert cfg.runtime.lookback_rows == 10
     assert cfg.storage.time_unit == TimeUnit.MICROSECOND
-    assert cfg.decision.stride_us == 500_000
+    assert cfg.decision.schedule == DecisionScheduleConfig()
     assert cfg.storage.feature_schema == specs.FEATURE_SCHEMA
 
 
@@ -70,18 +71,15 @@ def test_data_config_validation() -> None:
 
 
 def test_decision_config_constraints() -> None:
-    assert DecisionConfig().stride_us == 500_000
-    assert DecisionConfig(stride_us=500_000).stride_us == 500_000
+    assert DecisionConfig().schedule == DecisionScheduleConfig()
+    custom = DecisionScheduleConfig(min_decision_interval_us=50_000)
+    assert DecisionConfig(schedule=custom).schedule == custom
     with pytest.raises(ValueError):
         DecisionConfig(policy="scheduled_time")
     with pytest.raises(ValueError):
         DecisionConfig(reason="scheduled_time")
     with pytest.raises(ValueError):
-        DecisionConfig(stride_us=0)
-    with pytest.raises(ValueError):
-        DecisionConfig(stride_us=True)
-    with pytest.raises(ValueError):
-        DecisionConfig(stride_us=1)
+        DecisionConfig(schedule=500_000)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         DecisionConfig(**{"stride_" + "rows": 1})
 
@@ -107,7 +105,7 @@ def test_storage_config_constraints() -> None:
 def test_pipeline_config_invariants() -> None:
     cfg = PipelineConfig()
     assert cfg.source_data_type_values == ("incremental_book_L2", "trades")
-    assert cfg.decision.stride_us == cfg_module.DEFAULT_DECISION_STRIDE_US
+    assert cfg.decision.schedule == DecisionScheduleConfig()
     assert cfg.storage.feature_schema == specs.FEATURE_SCHEMA
     assert cfg.label_spec == cfg.labels.to_label_spec()
     with pytest.raises(ValueError):
@@ -150,9 +148,7 @@ def test_label_config_asof_policy() -> None:
 
 
 def test_public_api_alignment() -> None:
-    assert cfg_module.DEFAULT_DECISION_STRIDE_US == 500_000
     assert cfg_module.DEFAULT_FEATURE_SCHEMA == specs.FEATURE_SCHEMA
-    assert "DEFAULT_DECISION_STRIDE_US" in cfg_module.__all__
     assert "DEFAULT_DECISION_STRIDE_" + "ROWS" not in cfg_module.__all__
     assert "DEFAULT_DROP_DUPLICATE_" + "TRADES" not in cfg_module.__all__
 
@@ -167,5 +163,5 @@ def test_retired_surface_removed() -> None:
 
 def test_default_config_alignment() -> None:
     c = default_config()
-    assert c.decision.stride_us == cfg_module.DEFAULT_DECISION_STRIDE_US
+    assert c.decision.schedule == DecisionScheduleConfig()
     assert c.storage.feature_schema == specs.FEATURE_SCHEMA

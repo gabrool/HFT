@@ -37,6 +37,7 @@ from mmrt.execution.fill_sim import (
     FillSimulatorConfig,
     activate_pending_orders,
     finalize_effective_cancels,
+    request_cancel_live_orders,
     simulate_l2_level_update,
     simulate_trade_event,
     sync_orders_to_quote,
@@ -112,6 +113,7 @@ def _require_position(value: Any) -> PositionState:
     return value
 
 __all__ = [
+    "ACTION_ARRAY_DIM",
     "ExecutionEnvConfig",
     "ExecutionEnvReset",
     "ExecutionEnvStep",
@@ -122,7 +124,7 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class ExecutionEnvConfig:
-    decision_interval_us: int = 500_000
+    cancel_guard_ticks: int = 2
     action_spec: ActionSpec = field(default_factory=ActionSpec)
     quote_geometry_config: QuoteGeometryConfig = field(default_factory=QuoteGeometryConfig)
     fill_simulator_config: FillSimulatorConfig = field(default_factory=FillSimulatorConfig)
@@ -135,7 +137,7 @@ class ExecutionEnvConfig:
     adverse_runtime_config: AdverseRuntimeConfig | None = None
 
     def __post_init__(self) -> None:
-        _require_positive_int(self.decision_interval_us, "decision_interval_us")
+        _require_positive_int(self.cancel_guard_ticks, "cancel_guard_ticks")
         if not isinstance(self.action_spec, ActionSpec):
             raise ValueError("action_spec must be ActionSpec")
         if not isinstance(self.quote_geometry_config, QuoteGeometryConfig):
@@ -220,25 +222,35 @@ class _EnvState:
     live_orders: tuple[ActiveOrder, ...]
     done: bool
     truncated: bool
+    bid_guard_armed: bool = False
+    ask_guard_armed: bool = False
+    guard_reference_mid_tick_x2: int = 0
+
+
+ACTION_ARRAY_DIM = 8
 
 
 def action_array_to_continuous_action(values: Sequence[float] | np.ndarray) -> QuoteAction:
+    """Decode the flat action layout: [bid_enable, ask_enable, bid_guard, ask_guard,
+    bid_price_raw, ask_price_raw, bid_size_raw, ask_size_raw]."""
     if isinstance(values, (str, bytes)):
-        raise ValueError("values must be a sequence or ndarray of six finite numeric values")
+        raise ValueError("values must be a sequence or ndarray of eight finite numeric values")
     try:
         seq = tuple(values)
     except TypeError as exc:
-        raise ValueError("values must be a sequence or ndarray of six finite numeric values") from exc
-    if len(seq) != 6:
-        raise ValueError("values must contain exactly 6 values")
+        raise ValueError("values must be a sequence or ndarray of eight finite numeric values") from exc
+    if len(seq) != ACTION_ARRAY_DIM:
+        raise ValueError("values must contain exactly 8 values")
     cleaned = tuple(_require_finite_float(value, f"values[{i}]") for i, value in enumerate(seq))
     return QuoteAction(
         bid_enabled=cleaned[0] >= 0.5,
         ask_enabled=cleaned[1] >= 0.5,
-        bid_price_raw=cleaned[2],
-        ask_price_raw=cleaned[3],
-        bid_size_raw=cleaned[4],
-        ask_size_raw=cleaned[5],
+        bid_cancel_guard_enabled=cleaned[2] >= 0.5,
+        ask_cancel_guard_enabled=cleaned[3] >= 0.5,
+        bid_price_raw=cleaned[4],
+        ask_price_raw=cleaned[5],
+        bid_size_raw=cleaned[6],
+        ask_size_raw=cleaned[7],
     )
 
 
@@ -388,11 +400,16 @@ class ExecutionEnv:
         bid_queue_ahead_qty = self._queue_ahead_for_new_order(OrderSide.BUY, quote.bid_price_tick, state.current_book_ptr) if quote.bid_enabled else 0.0
         ask_queue_ahead_qty = self._queue_ahead_for_new_order(OrderSide.SELL, quote.ask_price_tick, state.current_book_ptr) if quote.ask_enabled else 0.0
 
+        state.bid_guard_armed = action.bid_cancel_guard_enabled
+        state.ask_guard_armed = action.ask_cancel_guard_enabled
+        state.guard_reference_mid_tick_x2 = previous_book_top.mid_tick_x2
+
         self._recent_trade_depletion_by_level = {}
         self._step_diag = {
             "activated_order_count": 0,
             "post_only_reject_count": 0,
             "effective_cancel_count": 0,
+            "guard_cancel_request_count": 0,
             "queue_trade_advance_qty": 0.0,
             "queue_l2_advance_qty": 0.0,
             "queue_advanced_qty": 0.0,
@@ -488,6 +505,8 @@ class ExecutionEnv:
 
         current_book_top = self._current_book_top()
         step_fills = tuple(fills)
+        guard_cancel_count = int(self._step_diag["guard_cancel_request_count"])
+        total_cancel_count = cancel_count + guard_cancel_count
         reward_step = compute_reward_step(
             previous_position=previous_position,
             fills=step_fills,
@@ -495,7 +514,7 @@ class ExecutionEnv:
             current_book_top=current_book_top,
             symbol_spec=symbol_spec,
             config=self.config.reward_config,
-            cancel_count=cancel_count,
+            cancel_count=total_cancel_count,
             peak_equity=self._peak_equity,
             terminal=done or truncated,
         )
@@ -521,8 +540,13 @@ class ExecutionEnv:
             "event_index": state.event_index,
             "current_book_ptr": state.current_book_ptr,
             "events_processed": events_processed,
-            "cancel_count": cancel_count,
-            "cancel_request_count": cancel_count,
+            "cancel_count": total_cancel_count,
+            "cancel_request_count": total_cancel_count,
+            "quote_cancel_request_count": cancel_count,
+            "guard_cancel_request_count": guard_cancel_count,
+            "bid_cancel_guard_enabled": action.bid_cancel_guard_enabled,
+            "ask_cancel_guard_enabled": action.ask_cancel_guard_enabled,
+            "cancel_guard_ticks": self.config.cancel_guard_ticks,
             "num_fills": len(step_fills),
             "orders_live_count": sum(1 for order in state.live_orders if order.is_live),
             "orders_pending_new_count": sum(1 for order in state.live_orders if order.status == OrderStatus.PENDING_NEW),
@@ -661,6 +685,8 @@ class ExecutionEnv:
             book_ptr=state.current_book_ptr,
         )
 
+        self._fire_cancel_guards(event_key)
+
         processed_valid_l2 = (
             event_code == EVENT_TYPE_CODE_L2_BATCH
             and event_book_ptr >= 0
@@ -673,7 +699,7 @@ class ExecutionEnv:
         )
 
     def _fallback_terminal_replay_end_local_ts_us(self, previous_book_top: BookTop) -> int:
-        return previous_book_top.local_ts_us + self.config.decision_interval_us
+        return previous_book_top.local_ts_us + self.linear_signals.metadata.max_decision_interval_us
 
     def _fallback_terminal_replay_should_stop(
         self,
@@ -684,6 +710,52 @@ class ExecutionEnv:
         decision_end_local_ts_us: int,
     ) -> bool:
         return processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us
+
+    def _fire_cancel_guards(self, event_key: EventKey) -> None:
+        """Standing per-side cancel rule evaluated on every replayed event.
+
+        Models a colocated guard loop that pulls a side's resting orders as
+        soon as the mid moves against them by ``cancel_guard_ticks`` full
+        ticks relative to the mid at decision time, without waiting for the
+        next policy decision. Only the cancel wire latency applies.
+        """
+        state = self._require_state()
+        if not (state.bid_guard_armed or state.ask_guard_armed):
+            return
+        top = self._book_top_from_ptr(state.current_book_ptr)
+        if top is None:
+            return
+        threshold_x2 = 2 * self.config.cancel_guard_ticks
+        moved_down_x2 = state.guard_reference_mid_tick_x2 - top.mid_tick_x2
+        if state.bid_guard_armed and moved_down_x2 >= threshold_x2:
+            state.bid_guard_armed = False
+            self._request_guard_cancel(OrderSide.BUY, event_key)
+        if state.ask_guard_armed and -moved_down_x2 >= threshold_x2:
+            state.ask_guard_armed = False
+            self._request_guard_cancel(OrderSide.SELL, event_key)
+
+    def _request_guard_cancel(self, side: OrderSide, event_key: EventKey) -> None:
+        state = self._require_state()
+        cancel_key = self._cancel_effective_key_for_latency(
+            decision_key=event_key,
+            target_local_ts_us=event_key.local_ts_us + self.config.latency_config.cancel_latency_us,
+        )
+        updated: list[ActiveOrder] = []
+        cancelled = 0
+        for order in state.live_orders:
+            if order.is_live and order.side == side and order.cancel_effective_key is None:
+                order = request_cancel_live_orders(
+                    (order,),
+                    request_key=event_key,
+                    cancel_effective_key=cancel_key,
+                )[0]
+                cancelled += 1
+            updated.append(order)
+        if cancelled:
+            state.live_orders = _live_orders_tuple(updated)
+            self._step_diag["guard_cancel_request_count"] = (
+                int(self._step_diag["guard_cancel_request_count"]) + cancelled
+            )
 
     def _event_key_at_index(self, event_index: int) -> EventKey:
         row = self.tape.arrays.events[event_index]

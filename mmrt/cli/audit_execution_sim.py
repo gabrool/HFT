@@ -138,7 +138,7 @@ def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
         "policy": config.policy,
         "max_steps": config.max_steps,
         "start_event_index": config.start_event_index,
-        "decision_interval_us": config.decision_interval_us,
+        "cancel_guard_ticks": config.cancel_guard_ticks,
         "mmap_mode": config.mmap_mode,
         "max_distance_ticks": config.max_distance_ticks,
         "max_order_qty": config.max_order_qty,
@@ -177,7 +177,7 @@ class ExecutionSimAuditConfig:
     policy: str = "alternate_bid_ask"
     max_steps: int = 1_000
     start_event_index: int | None = None
-    decision_interval_us: int = 500_000
+    cancel_guard_ticks: int = 2
     mmap_mode: str | None = "r"
 
     max_distance_ticks: int = 1
@@ -221,7 +221,7 @@ class ExecutionSimAuditConfig:
             raise ValueError(f"policy must be one of {AUDIT_POLICIES}")
         _require_positive_int(self.max_steps, "max_steps")
         _optional_nonnegative_int(self.start_event_index, "start_event_index")
-        _require_positive_int(self.decision_interval_us, "decision_interval_us")
+        _require_positive_int(self.cancel_guard_ticks, "cancel_guard_ticks")
         if self.mmap_mode not in (None, "r"):
             raise ValueError('mmap_mode must be None or "r"')
         _require_positive_int(self.max_distance_ticks, "max_distance_ticks")
@@ -277,7 +277,6 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
     linear_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
-        decision_interval_us=config.decision_interval_us,
         requested_start_event_index=config.start_event_index,
         min_rows=(config.max_steps + 1) if config.max_steps is not None else None,
     )
@@ -343,7 +342,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy", choices=AUDIT_POLICIES, default="alternate_bid_ask")
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--start-event-index", type=int)
-    parser.add_argument("--decision-interval-us", type=int, default=500000)
+    parser.add_argument("--cancel-guard-ticks", type=int, default=2)
     parser.add_argument("--no-mmap", action="store_true")
     parser.add_argument("--max-distance-ticks", type=int, default=1)
     parser.add_argument("--max-order-qty", type=float, default=0.001)
@@ -386,7 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         policy=args.policy,
         max_steps=args.max_steps,
         start_event_index=args.start_event_index,
-        decision_interval_us=args.decision_interval_us,
+        cancel_guard_ticks=args.cancel_guard_ticks,
         mmap_mode=None if args.no_mmap else "r",
         max_distance_ticks=args.max_distance_ticks,
         max_order_qty=args.max_order_qty,

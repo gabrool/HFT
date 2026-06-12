@@ -148,7 +148,7 @@ def _manifest_summary(manifest: mf.StorageManifest) -> dict[str, object]:
         "symbol": manifest.symbol,
         "storage_format": manifest.storage_format.value,
         "time_unit": manifest.time_unit.value,
-        "decision_stride_us": manifest.decision_stride_us,
+        "decision_schedule": dict(manifest.decision_schedule),
         "feature_count": len(manifest.feature_columns),
         "label_count": len(manifest.label_columns),
         "required_column_count": len(manifest.required_columns),

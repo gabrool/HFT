@@ -15,6 +15,7 @@ from mmrt.execution.linear_signal import load_linear_signal_artifact_npz, linear
 from mmrt.execution.linear_signal_builder import (
     execution_linear_feature_names,
     iter_execution_linear_feature_chunks,
+    schedule_config_from_train_result,
     transform_config_from_train_result,
 )
 from mmrt.linear import models as lm
@@ -42,7 +43,6 @@ class LinearExecutionFeatureAuditConfig:
     linear_signals_npz: str | None = None
     output_json: str | None = None
     mmap_mode: str | None = "r"
-    decision_interval_us: int = 500_000
     start_event_index: int | None = None
     max_decisions: int | None = None
     chunk_rows: int = 100_000
@@ -59,7 +59,6 @@ class LinearExecutionFeatureAuditConfig:
         if self.linear_signals_npz is not None: object.__setattr__(self, "linear_signals_npz", _require_path(self.linear_signals_npz, "linear_signals_npz"))
         if self.output_json is not None: object.__setattr__(self, "output_json", _require_path(self.output_json, "output_json"))
         if self.mmap_mode not in (None, "r"): raise ValueError("mmap_mode must be None or 'r'")
-        if isinstance(self.decision_interval_us, bool) or self.decision_interval_us <= 0: raise ValueError("decision_interval_us must be positive")
         object.__setattr__(self, "start_event_index", _opt_nonneg(self.start_event_index, "start_event_index"))
         object.__setattr__(self, "max_decisions", _opt_pos(self.max_decisions, "max_decisions"))
         if isinstance(self.chunk_rows, bool) or self.chunk_rows <= 0: raise ValueError("chunk_rows must be positive")
@@ -93,8 +92,8 @@ def _prediction_for_head(model, head: str, z: np.ndarray) -> tuple[np.ndarray, n
     else: proba = model.predict_nonnegative(z).astype(np.float64)
     return logits, proba
 
-def _feature_dataset_summary(n: int, nf: int, names: tuple[str, ...], idx: np.ndarray, ts: np.ndarray, decision_interval_us: int, replay_start: int) -> dict[str, object]:
-    return {"num_decisions": n, "num_features": nf, "feature_names": list(names), "first_decision_event_index": int(idx[0]) if n else None, "last_decision_event_index": int(idx[-1]) if n else None, "first_decision_local_ts_us": int(ts[0]) if n else None, "last_decision_local_ts_us": int(ts[-1]) if n else None, "decision_interval_us": decision_interval_us, "replay_start_event_index": replay_start, "start_event_index": int(idx[0]) if n else replay_start}
+def _feature_dataset_summary(n: int, nf: int, names: tuple[str, ...], idx: np.ndarray, ts: np.ndarray, decision_schedule: dict, replay_start: int) -> dict[str, object]:
+    return {"num_decisions": n, "num_features": nf, "feature_names": list(names), "first_decision_event_index": int(idx[0]) if n else None, "last_decision_event_index": int(idx[-1]) if n else None, "first_decision_local_ts_us": int(ts[0]) if n else None, "last_decision_local_ts_us": int(ts[-1]) if n else None, "decision_schedule": dict(decision_schedule), "replay_start_event_index": replay_start, "start_event_index": int(idx[0]) if n else replay_start}
 
 def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAuditConfig) -> dict[str, object]:
     if not isinstance(config, LinearExecutionFeatureAuditConfig): raise ValueError("config must be LinearExecutionFeatureAuditConfig")
@@ -109,7 +108,7 @@ def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAu
     feature_path = work_root / "features.npy"
     # first stream to chunk files, then concatenate into a single memmap without ever making a float64 matrix
     chunks=[]
-    for c in iter_execution_linear_feature_chunks(tape, decision_interval_us=config.decision_interval_us, start_event_index=config.start_event_index, max_decisions=config.max_decisions, chunk_rows=config.chunk_rows, transform_config=transform_config_from_train_result(result)):
+    for c in iter_execution_linear_feature_chunks(tape, schedule_config=schedule_config_from_train_result(result), start_event_index=config.start_event_index, max_decisions=config.max_decisions, chunk_rows=config.chunk_rows, transform_config=transform_config_from_train_result(result)):
         path = work_root / f"chunk_{len(chunks):06d}.npy"; np.save(path, c.features); chunks.append(path); idx_parts.append(c.decision_event_index); ts_parts.append(c.decision_local_ts_us); n += c.features.shape[0]
     feats = np.lib.format.open_memmap(feature_path, mode="w+", dtype=np.float32, shape=(n, nf)); pos=0
     for path in chunks:
@@ -148,7 +147,7 @@ def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAu
     no_move_stats = per_head.get(lm.NO_MOVE_HEAD, {}).get("prediction_stats", {}) if isinstance(per_head.get(lm.NO_MOVE_HEAD), Mapping) else {}
     if isinstance(no_move_stats, Mapping) and ((no_move_stats.get("mean") is not None and float(no_move_stats["mean"]) > 0.98) or (no_move_stats.get("p01") is not None and float(no_move_stats["p01"]) > 0.95)): warnings.append("p_no_move_collapsed")
     manifest=tape.manifest; replay_start=0 if config.start_event_index is None else config.start_event_index
-    payload={"status": "ok" if not warnings else "warning", "run_type": "audit_linear_execution_features", "config": asdict(config), "tape": {"schema": manifest.schema, "exchange": manifest.exchange, "symbol": manifest.symbol, "num_events": manifest.num_events, "num_l2_batches": manifest.num_l2_batches, "num_trades": manifest.num_trades, "start_local_ts_us": manifest.start_local_ts_us, "end_local_ts_us": manifest.end_local_ts_us}, "linear_train_result": {"schema": result.schema, "dataset_id": result.dataset_id, "manifest_hash": result.manifest_hash, "splits": {k:v.as_dict() for k,v in result.splits.items()}, "selection_summary": result.selection_summary}, "linear_signals": signals_summary, "feature_dataset": _feature_dataset_summary(n,nf,names,decision_idx,decision_ts,config.decision_interval_us,replay_start), "per_head": per_head, "combined": {"feature_schema_match": not all_missing, "missing_features": sorted(all_missing), "extra_features": sorted(all_extra), "shared_feature_count": len(set(names)-all_missing), "warnings": sorted(set(warnings))}, "warnings": sorted(set(warnings)), "resource_mode": {"chunked_features": True, "quantile_mode": config.quantile_mode, "chunk_rows": config.chunk_rows, "work_dir": str(work_root)}}
+    payload={"status": "ok" if not warnings else "warning", "run_type": "audit_linear_execution_features", "config": asdict(config), "tape": {"schema": manifest.schema, "exchange": manifest.exchange, "symbol": manifest.symbol, "num_events": manifest.num_events, "num_l2_batches": manifest.num_l2_batches, "num_trades": manifest.num_trades, "start_local_ts_us": manifest.start_local_ts_us, "end_local_ts_us": manifest.end_local_ts_us}, "linear_train_result": {"schema": result.schema, "dataset_id": result.dataset_id, "manifest_hash": result.manifest_hash, "splits": {k:v.as_dict() for k,v in result.splits.items()}, "selection_summary": result.selection_summary}, "linear_signals": signals_summary, "feature_dataset": _feature_dataset_summary(n,nf,names,decision_idx,decision_ts,dict(result.decision_schedule),replay_start), "per_head": per_head, "combined": {"feature_schema_match": not all_missing, "missing_features": sorted(all_missing), "extra_features": sorted(all_extra), "shared_feature_count": len(set(names)-all_missing), "warnings": sorted(set(warnings))}, "warnings": sorted(set(warnings)), "resource_mode": {"chunked_features": True, "quantile_mode": config.quantile_mode, "chunk_rows": config.chunk_rows, "work_dir": str(work_root)}}
     if config.output_json is not None:
         path=Path(config.output_json); path.parent.mkdir(parents=True, exist_ok=True); tmp=path.with_suffix(path.suffix+".tmp"); tmp.write_text(json.dumps(payload, sort_keys=True, indent=2, allow_nan=False)+"\n", encoding="utf-8"); tmp.replace(path)
     else: json.dumps(payload, allow_nan=False)

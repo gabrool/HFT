@@ -84,9 +84,7 @@ def test_ingest_rows_match_execution_feature_replay_exactly(tmp_path):
     )
     dataset_local_ts = np.asarray(table[mf.LOCAL_TS_US_COLUMN], dtype=np.int64)
 
-    serving = build_execution_linear_feature_dataset(
-        tape, decision_interval_us=cfg.DEFAULT_DECISION_STRIDE_US
-    )
+    serving = build_execution_linear_feature_dataset(tape)
     assert serving.feature_names == manifest.feature_columns
     n = dataset_features.shape[0]
     assert 0 < n <= serving.num_decisions
@@ -115,14 +113,25 @@ def test_ingest_applies_chronological_splits(tmp_path):
     assert roles == {"train", "val"}
 
 
-def test_ingest_rejects_non_default_stride(tmp_path):
+def test_ingest_rejects_invalid_schedule_arguments(tmp_path):
     _, tape_root = _saved_tape(tmp_path)
-    with pytest.raises(ValueError, match="decision_stride_us"):
+    with pytest.raises(ValueError, match="max_decision_interval_us"):
         cli.main([
             "--dataset-root", str(tmp_path / "ds"),
             "--dataset-id", "ds",
             "--tape-root", str(tape_root),
-            "--decision-stride-us", "250000",
+            "--min-decision-interval-us", "200000",
+            "--max-decision-interval-us", "100000",
+        ])
+
+
+def test_ingest_rejects_tape_without_trades(tmp_path):
+    _, tape_root = _saved_tape(tmp_path, with_trades=False)
+    with pytest.raises(ValueError, match="no trade events seen"):
+        cli.main([
+            "--dataset-root", str(tmp_path / "ds"),
+            "--dataset-id", "ds",
+            "--tape-root", str(tape_root),
         ])
 
 

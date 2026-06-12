@@ -82,7 +82,7 @@ def _coerce_queue_mode(value: QueueModelMode | str) -> QueueModelMode:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionEnvConfigBuildInput:
-    decision_interval_us: int = 500_000
+    cancel_guard_ticks: int = 2
 
     max_distance_ticks: int = 1
     max_order_qty: float = 0.001
@@ -115,7 +115,7 @@ class ExecutionEnvConfigBuildInput:
     adverse_signals_enabled: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
+        object.__setattr__(self, "cancel_guard_ticks", _require_positive_int(self.cancel_guard_ticks, "cancel_guard_ticks"))
         object.__setattr__(self, "max_distance_ticks", _require_positive_int(self.max_distance_ticks, "max_distance_ticks"))
         object.__setattr__(self, "post_only_gap_ticks", _require_nonnegative_int(self.post_only_gap_ticks, "post_only_gap_ticks"))
         object.__setattr__(self, "max_order_qty", _require_positive_float(self.max_order_qty, "max_order_qty"))
@@ -146,7 +146,7 @@ def build_execution_env_config_from_input(params: ExecutionEnvConfigBuildInput) 
     if not isinstance(params, ExecutionEnvConfigBuildInput):
         raise ValueError("params must be ExecutionEnvConfigBuildInput")
     return ExecutionEnvConfig(
-        decision_interval_us=params.decision_interval_us,
+        cancel_guard_ticks=params.cancel_guard_ticks,
         action_spec=ActionSpec(max_distance_ticks=params.max_distance_ticks, max_order_qty=params.max_order_qty),
         quote_geometry_config=QuoteGeometryConfig(post_only_gap_ticks=params.post_only_gap_ticks, default_order_qty=params.default_order_qty),
         latency_config=LatencyConfig(
@@ -193,7 +193,7 @@ def build_execution_env_config_from_input(params: ExecutionEnvConfigBuildInput) 
 def build_execution_env_config_from_attrs(obj: object, *, adverse_signals_enabled: bool) -> ExecutionEnvConfig:
     max_episode_steps = getattr(obj, "max_episode_steps", getattr(obj, "max_steps", None))
     params = ExecutionEnvConfigBuildInput(
-        decision_interval_us=obj.decision_interval_us,
+        cancel_guard_ticks=obj.cancel_guard_ticks,
         max_distance_ticks=obj.max_distance_ticks,
         max_order_qty=obj.max_order_qty,
         post_only_gap_ticks=obj.post_only_gap_ticks,

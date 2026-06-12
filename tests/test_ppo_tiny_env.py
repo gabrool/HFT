@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, TradePrint
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
@@ -36,6 +37,10 @@ from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy, make_training_checkpoint_payload
 
+
+
+def _fixed_schedule_payload(stride_us: int) -> dict:
+    return DecisionScheduleConfig(min_decision_interval_us=stride_us, max_decision_interval_us=stride_us).as_dict()
 
 
 def _rules():
@@ -189,7 +194,7 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=decision_interval_us,
+        decision_schedule=_fixed_schedule_payload(decision_interval_us),
         start_event_index=start_event_index,
         n_rows=n_rows,
     )
@@ -228,7 +233,6 @@ def _tiny_env() -> ExecutionEnv:
         tape,
         linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50),
         config=ExecutionEnvConfig(
-            decision_interval_us=50,
             max_episode_steps=4,
         ),
     )
@@ -257,7 +261,7 @@ def test_rollout_collector_collects_tiny_env_batch():
 
     assert batch.num_steps == 4
     assert batch.observations.shape == (4, obs_dim)
-    assert batch.actions.shape == (4, 6)
+    assert batch.actions.shape == (4, 8)
     assert batch.log_probs.shape == (4,)
     assert batch.values.shape == (4,)
     assert batch.advantages.shape == (4,)
@@ -321,7 +325,6 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
             update_epochs=1,
             minibatch_size=2,
             hidden_sizes=(8,),
-            decision_interval_us=50,
             max_episode_steps=4,
             seed=123,
         )
@@ -367,8 +370,6 @@ def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsy
             "2",
             "--hidden-sizes",
             "8",
-            "--decision-interval-us",
-            "50",
             "--max-episode-steps",
             "4",
             "--seed",

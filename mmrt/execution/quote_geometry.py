@@ -101,7 +101,13 @@ class QuoteGeometryConfig:
 
 @dataclass(frozen=True, slots=True)
 class QuoteAction:
-    """Hybrid quote action: Bernoulli enable flags plus continuous price/size raw values."""
+    """Hybrid quote action: Bernoulli enable/guard flags plus continuous price/size raw values.
+
+    The cancel-guard flags arm a per-side standing rule evaluated by the
+    execution environment on every replayed event: cancel that side's resting
+    orders without waiting for the next decision when the mid moves against
+    them by at least the configured number of ticks.
+    """
 
     bid_enabled: bool
     ask_enabled: bool
@@ -109,12 +115,13 @@ class QuoteAction:
     ask_price_raw: float
     bid_size_raw: float
     ask_size_raw: float
+    bid_cancel_guard_enabled: bool = False
+    ask_cancel_guard_enabled: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.bid_enabled, bool):
-            raise ValueError("bid_enabled must be bool")
-        if not isinstance(self.ask_enabled, bool):
-            raise ValueError("ask_enabled must be bool")
+        for name in ("bid_enabled", "ask_enabled", "bid_cancel_guard_enabled", "ask_cancel_guard_enabled"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be bool")
         for name in ("bid_price_raw", "ask_price_raw", "bid_size_raw", "ask_size_raw"):
             object.__setattr__(self, name, _require_finite_float(getattr(self, name), name))
 
