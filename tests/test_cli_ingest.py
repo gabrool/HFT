@@ -125,6 +125,16 @@ def test_ingest_rejects_invalid_schedule_arguments(tmp_path):
         ])
 
 
+def test_ingest_rejects_tape_without_trades(tmp_path):
+    _, tape_root = _saved_tape(tmp_path, with_trades=False)
+    with pytest.raises(ValueError, match="no trade events seen"):
+        cli.main([
+            "--dataset-root", str(tmp_path / "ds"),
+            "--dataset-id", "ds",
+            "--tape-root", str(tape_root),
+        ])
+
+
 def test_ingest_rejects_existing_manifest(tmp_path):
     _, tape_root = _saved_tape(tmp_path)
     dataset_root = _run_ingest(tmp_path, tape_root)

@@ -29,7 +29,7 @@ from mmrt.linear import diagnostics as dg
 DEFAULT_TRAIN_BATCH_SIZE = 8192
 DEFAULT_EPOCHS = 5
 DEFAULT_OUTPUT_FILENAME = "linear_train_result.json"
-LINEAR_TRAINING_RESULT_SCHEMA = "mmrt_linear_training_result"
+LINEAR_TRAINING_RESULT_SCHEMA = "mmrt_linear_training_result_tape25"
 
 
 def _require_positive_int(value: int, name: str) -> int:

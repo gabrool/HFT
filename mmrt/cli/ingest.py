@@ -17,8 +17,10 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 from mmrt import config as cfg
-from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
+from mmrt.execution.execution_tape import EVENT_TYPE_CODE_TRADE, ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.feature_replay import iter_tape_feature_steps
 from mmrt.features.labels import LabelBuilder
 from mmrt.features.pipeline import DecisionFeaturePipeline, FeaturePipelineConfig
@@ -134,6 +136,7 @@ class IngestCounters:
     tape_events: int = 0
     tape_l2_batches: int = 0
     tape_trades: int = 0
+    trade_events_seen: int = 0
     l2_steps_seen: int = 0
     decisions_emitted: int = 0
     labels_matured: int = 0
@@ -170,6 +173,13 @@ def _run_tape_ingest(
     counters.tape_events = int(tape.manifest.num_events)
     counters.tape_l2_batches = int(tape.manifest.num_l2_batches)
     counters.tape_trades = int(tape.manifest.num_trades)
+    events = tape.arrays.events
+    replay_end = len(events) if max_events is None else min(len(events), start_event_index + max_events)
+    counters.trade_events_seen = int(
+        np.count_nonzero(np.asarray(events["event_type_code"][start_event_index:replay_end]) == EVENT_TYPE_CODE_TRADE)
+    )
+    if counters.trade_events_seen == 0:
+        raise ValueError("no trade events seen in replayed tape range")
     feature_pipeline_config = FeaturePipelineConfig(schedule=pipeline_config.decision.schedule)
     pipeline = DecisionFeaturePipeline(feature_pipeline_config)
     label_builder = LabelBuilder(pipeline_config.label_spec)

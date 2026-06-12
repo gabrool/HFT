@@ -156,7 +156,7 @@ def test_train_linear_model_end_to_end(tmp_path: Path):
     root, manifest = make_dataset_with_splits(tmp_path)
     cfg = tr.LinearTrainConfig(epochs=2, batch_size=3)
     result = tr.train_linear_model(str(root), config=cfg)
-    assert result.schema == "mmrt_linear_training_result"
+    assert result.schema == "mmrt_linear_training_result_tape25"
     assert result.dataset_id == manifest.dataset_id
     assert result.manifest_hash == rd.open_dataset(str(root)).manifest.content_hash()
     assert set(result.splits.keys()) == {"train", "val", "test"}

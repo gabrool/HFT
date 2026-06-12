@@ -67,7 +67,7 @@ def _one_sided_l2(seq: int, local_ts_us: int, *, bid: int) -> ReconstructedL2Eve
     )
 
 
-def make_tape(*, n_l2: int = 120, l2_step_us: int = 100_000, base_ts_us: int = 1_000_000, one_sided_at: int | None = None):
+def make_tape(*, n_l2: int = 120, l2_step_us: int = 100_000, base_ts_us: int = 1_000_000, one_sided_at: int | None = None, with_trades: bool = True):
     l2 = []
     for i in range(n_l2):
         ts = base_ts_us + i * l2_step_us
@@ -79,7 +79,7 @@ def make_tape(*, n_l2: int = 120, l2_step_us: int = 100_000, base_ts_us: int = 1
         ask = bid + 2 + (i % 2)
         l2.append(_l2(i, ts, bid=bid, ask=ask, bid_size=1.0 + 0.5 * (i % 3)))
     trades = []
-    for k in range(max(n_l2 // 3, 1)):
+    for k in range(max(n_l2 // 3, 1) if with_trades else 0):
         ts = base_ts_us + 50_000 + k * 3 * l2_step_us
         side = AggressorSide.BUY if k % 2 == 0 else AggressorSide.SELL
         trades.append(TradePrint(ts, ts, side, 1001, 0.02, source_row=k))
