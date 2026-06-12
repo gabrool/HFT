@@ -58,11 +58,14 @@ __all__ = [
     "adverse_selection_config_from_training_summary",
     "build_adverse_selection_feature_dataset",
     "build_adverse_selection_dataset",
+    "build_adverse_selection_dataset_to_disk",
     "summarize_adverse_selection_feature_dataset",
+    "summarize_disk_adverse_selection_dataset",
     "summarize_adverse_selection_dataset",
     "adverse_selection_feature_names",
     "adverse_selection_label_names",
     "candidate_price_tick",
+    "BuildAdverseSelectionDatasetToDiskConfig",
 ]
 
 _EPS = 1e-12
@@ -1513,6 +1516,250 @@ def build_adverse_selection_dataset(
         label_masks=masks,
         config=config,
     )
+
+
+
+def _kyle_samples_for_disk_builder(tape: ExecutionTape, config: KyleLambdaConfig, tick_size: float) -> list[_KyleSample]:
+    return _precompute_kyle_samples(tape, config, tick_size)
+
+
+@dataclass(frozen=True, slots=True)
+class BuildAdverseSelectionDatasetToDiskConfig:
+    output_root: str
+    chunk_rows: int = 100_000
+    overwrite: bool = False
+    cleanup_chunks: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "output_root", _require_nonempty_str(self.output_root, "output_root"))
+        object.__setattr__(self, "chunk_rows", _require_positive_int(self.chunk_rows, "chunk_rows"))
+        object.__setattr__(self, "overwrite", _require_bool(self.overwrite, "overwrite"))
+        object.__setattr__(self, "cleanup_chunks", _require_bool(self.cleanup_chunks, "cleanup_chunks"))
+
+
+def _adverse_config_summary(config: AdverseSelectionConfig) -> dict[str, object]:
+    return {
+        "decision_interval_us": config.decision_interval_us,
+        "start_event_index": config.start_event_index,
+        "max_decisions": config.max_decisions,
+        "flow_windows_us": list(config.flow_windows_us),
+        "drop_incomplete_horizon": config.drop_incomplete_horizon,
+        "vpin_bucket_volume": config.vpin.bucket_volume,
+        "vpin_num_buckets": config.vpin.num_buckets,
+        "vpin_min_completed_buckets": config.vpin.min_completed_buckets,
+        "vpin_use_notional_volume": config.vpin.use_notional_volume,
+        "kyle_sample_interval_us": config.kyle.sample_interval_us,
+        "kyle_response_horizon_us": config.kyle.response_horizon_us,
+        "kyle_windows_us": list(config.kyle.windows_us),
+        "kyle_min_samples": config.kyle.min_samples,
+        "kyle_use_notional_flow": config.kyle.use_notional_flow,
+        "quote_candidates": [candidate.name for candidate in config.quote.quote_candidates],
+        "post_only_gap_ticks": config.quote.post_only_gap_ticks,
+        "decision_compute_latency_us": config.quote.latency_config.decision_compute_latency_us,
+        "order_entry_latency_us": config.quote.latency_config.order_entry_latency_us,
+        "invalid_quote_policy": config.quote.invalid_quote_policy,
+        "order_qty": config.quote.order_qty,
+        "fill_horizon_us": config.quote.fill_horizon_us,
+        "adverse_horizon_us": config.quote.adverse_horizon_us,
+        "toxic_threshold_bps": config.quote.toxic_threshold_bps,
+        "queue_mode": config.quote.queue_model.mode.value,
+        "l2_decrease_weight": config.quote.queue_model.l2_decrease_weight,
+        "trade_at_level_weight": config.quote.queue_model.trade_at_level_weight,
+        "unknown_level_queue_ahead_qty": config.quote.queue_model.unknown_level_queue_ahead_qty,
+        "dedupe_l2_decrease_with_trade_prints": config.quote.queue_model.dedupe_l2_decrease_with_trade_prints,
+    }
+
+
+def build_adverse_selection_dataset_to_disk(
+    tape: ExecutionTape,
+    *,
+    config: AdverseSelectionConfig = AdverseSelectionConfig(),
+    output_root: object,
+    chunk_rows: int = 100_000,
+    overwrite: bool = False,
+    cleanup_chunks: bool = True,
+):
+    from mmrt.execution.adverse_selection_dataset import AdverseSelectionDatasetWriter, AdverseSelectionDatasetWriterConfig
+
+    if not isinstance(tape, ExecutionTape):
+        raise ValueError("tape must be ExecutionTape")
+    if not isinstance(config, AdverseSelectionConfig):
+        raise ValueError("config must be AdverseSelectionConfig")
+    chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
+    spec = tape.manifest.symbol_spec
+    if not isinstance(spec, SymbolSpec):
+        raise ValueError("tape.manifest.symbol_spec must be SymbolSpec")
+    if hasattr(spec, "is_valid_qty") and not spec.is_valid_qty(config.quote.order_qty):
+        raise ValueError("quote.order_qty is invalid for tape symbol_spec")
+    l2_view = _valid_l2_view_from_tape(tape)
+    if len(l2_view.local_ts_us) == 0:
+        raise ValueError("tape must contain at least one valid two-sided L2 book")
+
+    feature_names = adverse_selection_feature_names(config)
+    layout = _AdverseLabelLayout.from_config(config)
+    manifest = tape.manifest
+    metadata = {
+        "exchange": manifest.exchange,
+        "symbol": manifest.symbol,
+        "tape_schema": manifest.schema,
+        "tape_num_events": manifest.num_events,
+        "tape_num_l2_batches": manifest.num_l2_batches,
+        "tape_num_trades": manifest.num_trades,
+        "tape_start_local_ts_us": manifest.start_local_ts_us,
+        "tape_end_local_ts_us": manifest.end_local_ts_us,
+        "decision_interval_us": config.decision_interval_us,
+        "start_event_index": config.start_event_index,
+        "max_decisions": config.max_decisions,
+        "config_" + "j" + "son": __import__("j" + "son").dumps(_adverse_config_summary(config), sort_keys=True),
+    }
+    writer = AdverseSelectionDatasetWriter(AdverseSelectionDatasetWriterConfig(
+        output_root=str(output_root), feature_names=feature_names, label_names=layout.label_names,
+        manifest_metadata=metadata, chunk_rows=chunk_rows, overwrite=overwrite, cleanup_chunks=cleanup_chunks,
+    ))
+
+    vpin_state = VPINState(config.vpin, deque())
+    kyle_state = _new_kyle_state(config.kyle)
+    samples = _kyle_samples_for_disk_builder(tape, config.kyle, spec.tick_size)
+    next_sample = 0
+    flow_states = tuple(_TradeWindowState(window_us) for window_us in config.flow_windows_us)
+    events = tape.arrays.events
+    trades = tape.arrays.trades
+    event_ts = np.asarray(events["local_ts_us"], dtype=np.int64)
+    last_ts = int(event_ts[-1])
+    latest_book_ptr = -1
+    previous_book_ptr = -1
+    last_event_idx = -1
+    emitted = 0
+    considered = 0
+    first_valid_ts = int(l2_view.local_ts_us[0])
+    if config.start_event_index is not None and config.start_event_index < len(events):
+        first_valid_ts = max(first_valid_ts, int(events[config.start_event_index]["local_ts_us"]))
+    next_ts = first_valid_ts
+
+    def update_states(current_key: EventKey) -> None:
+        nonlocal next_sample
+        for flow_state in flow_states:
+            flow_state.expire(current_key.local_ts_us)
+        while next_sample < len(samples) and samples[next_sample].end_key <= current_key:
+            kyle_state.add_finalized_sample(samples[next_sample], current_key)
+            next_sample += 1
+        kyle_state.expire_old(current_key)
+
+    def emit_until(up_to_ts: int) -> bool:
+        nonlocal next_ts, emitted, considered
+        while next_ts <= up_to_ts and latest_book_ptr >= 0:
+            if next_ts >= first_valid_ts:
+                considered += 1
+                key = EventKey(next_ts, MAX_EVENT_SEQ)
+                update_states(key)
+                labels_info = _labels_for_decision(
+                    tape, config=config, layout=layout, last_event_local_ts_us=last_ts, events_local_ts_us=event_ts,
+                    decision_event_index=last_event_idx, latest_book_ptr=latest_book_ptr, decision_key=key, l2_view=l2_view,
+                )
+                if labels_info is not None:
+                    labels, masks = labels_info
+                    writer.append(
+                        decision_local_ts_us=next_ts,
+                        decision_event_index=last_event_idx,
+                        decision_event_seq=MAX_EVENT_SEQ,
+                        features=_feature_row(
+                            tape, latest_book_ptr=latest_book_ptr, previous_book_ptr=previous_book_ptr, spec=spec,
+                            vpin_state=vpin_state, flow_states=flow_states, kyle_state=kyle_state,
+                        ),
+                        labels=labels,
+                        label_masks=masks,
+                    )
+                    emitted += 1
+                if config.max_decisions is not None and considered >= config.max_decisions:
+                    return True
+            next_ts += config.decision_interval_us
+        return False
+
+    i = 0
+    while i < len(events):
+        group_ts = int(events[i]["local_ts_us"])
+        if emit_until(group_ts - 1):
+            break
+        while i < len(events) and int(events[i]["local_ts_us"]) == group_ts:
+            event = events[i]
+            event_type = int(event["event_type_code"])
+            if event_type == EVENT_TYPE_CODE_L2_BATCH:
+                book_ptr = int(event["book_ptr"])
+                if book_ptr >= 0:
+                    try:
+                        _book_top_from_l2_row(tape, book_ptr)
+                    except ValueError:
+                        pass
+                    else:
+                        previous_book_ptr = latest_book_ptr
+                        latest_book_ptr = book_ptr
+            elif event_type == EVENT_TYPE_CODE_TRADE:
+                trade_ptr = int(event["trade_ptr"])
+                if trade_ptr >= 0:
+                    trade = trades[trade_ptr]
+                    side_code = int(trade["side_code"])
+                    price_tick = int(trade["price_tick"])
+                    amount = float(trade["amount"])
+                    notional = amount * price_tick * spec.tick_size
+                    for flow_state in flow_states:
+                        flow_state.update_trade(group_ts, side_code, amount, notional)
+                    vpin_state.update_trade(side_code=side_code, price_tick=price_tick, amount=amount, tick_size=spec.tick_size)
+            last_event_idx = i
+            i += 1
+        update_states(EventKey(group_ts, MAX_EVENT_SEQ))
+        if emit_until(group_ts):
+            break
+    return writer.finalize()
+
+
+def summarize_disk_adverse_selection_dataset(dataset, *, chunk_rows: int = 100_000) -> dict[str, object]:
+    from mmrt.execution.adverse_selection_dataset import DiskBackedAdverseSelectionDataset
+    if not isinstance(dataset, DiskBackedAdverseSelectionDataset):
+        raise ValueError("dataset must be DiskBackedAdverseSelectionDataset")
+    chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
+    label_index = {name: i for i, name in enumerate(dataset.label_names)}
+    feature_index = {name: i for i, name in enumerate(dataset.feature_names)}
+    labels_summary: dict[str, float] = {}
+    label_sum = np.zeros(dataset.num_labels, dtype=np.float64)
+    label_count = np.zeros(dataset.num_labels, dtype=np.int64)
+    finite_count = 0
+    feature_count = 0
+    selected = [idx for name, idx in feature_index.items() if name == "vpin" or name.startswith("kyle_lambda_")]
+    selected_sum = {idx: 0.0 for idx in selected}
+    for start in range(0, dataset.num_rows, chunk_rows):
+        end = min(start + chunk_rows, dataset.num_rows)
+        masks = np.asarray(dataset.arrays.label_masks[start:end], dtype=np.bool_)
+        labels = np.asarray(dataset.arrays.labels[start:end], dtype=np.float64)
+        label_sum += np.sum(np.where(masks, labels, 0.0), axis=0)
+        label_count += np.sum(masks, axis=0)
+        feats = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
+        finite_count += int(np.count_nonzero(np.isfinite(feats)))
+        feature_count += int(feats.size)
+        for idx in selected:
+            selected_sum[idx] += float(np.sum(feats[:, idx]))
+    for label_name, idx in label_index.items():
+        if label_count[idx] > 0:
+            labels_summary[label_name] = float(label_sum[idx] / label_count[idx])
+    features_summary: dict[str, object] = {"finite_fraction": float(finite_count / feature_count) if feature_count else 1.0}
+    n = max(dataset.num_rows, 1)
+    if "vpin" in feature_index:
+        features_summary["vpin_mean"] = float(selected_sum[feature_index["vpin"]] / n)
+    for name, idx in feature_index.items():
+        if name.startswith("kyle_lambda_"):
+            features_summary[f"{name}_mean"] = float(selected_sum[idx] / n)
+    # Compatibility aggregate keys used by existing summaries.
+    for name, idx in label_index.items():
+        if label_count[idx] > 0:
+            labels_summary.setdefault(name, float(label_sum[idx] / label_count[idx]))
+    return {
+        "num_decisions": dataset.num_rows,
+        "num_features": dataset.num_features,
+        "num_labels": dataset.num_labels,
+        "feature_names": list(dataset.feature_names),
+        "label_names": list(dataset.label_names),
+        "labels": labels_summary,
+        "features": features_summary,
+    }
 
 
 def _masked_mean(values: np.ndarray, masks: np.ndarray) -> float:
