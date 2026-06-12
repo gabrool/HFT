@@ -196,9 +196,10 @@ class AdverseSelectionTrainCLIConfig:
     work_dir: str | None = None
     chunk_rows: int = 100_000
     keep_dataset: bool = True
-    cleanup_work_dir: bool = True
+    cleanup_work_dir: bool = False
     metrics_mode: str = "approx"
     auc_bins: int = 2000
+    exact_auc_max_rows: int = 1_000_000
 
     decision_interval_us: int = 500_000
     start_event_index: int | None = None
@@ -257,6 +258,7 @@ class AdverseSelectionTrainCLIConfig:
         if self.metrics_mode not in ("approx", "none", "exact"):
             raise ValueError("metrics_mode must be approx, none, or exact")
         object.__setattr__(self, "auc_bins", _require_positive_int(self.auc_bins, "auc_bins"))
+        object.__setattr__(self, "exact_auc_max_rows", _require_positive_int(self.exact_auc_max_rows, "exact_auc_max_rows"))
         object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
         object.__setattr__(self, "start_event_index", _optional_nonnegative_int(self.start_event_index, "start_event_index"))
         object.__setattr__(self, "max_decisions", _optional_positive_int(self.max_decisions, "max_decisions"))
@@ -360,6 +362,7 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "cleanup_work_dir": config.cleanup_work_dir,
         "metrics_mode": config.metrics_mode,
         "auc_bins": config.auc_bins,
+        "exact_auc_max_rows": config.exact_auc_max_rows,
         "decision_interval_us": config.decision_interval_us,
         "start_event_index": config.start_event_index,
         "max_decisions": config.max_decisions,
@@ -672,6 +675,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     )
     adverse_config = _build_adverse_selection_config(config)
     dataset_root = Path(config.dataset_root) if config.dataset_root is not None else Path(config.tape_root) / "adverse_selection_dataset"
+    work_root = (Path(config.work_dir) if config.work_dir is not None else dataset_root.parent) / "adverse_selection_work"
     feature_count = len(adverse_selection_feature_names(adverse_config))
     label_count = len(adverse_selection_label_names(adverse_config))
     duration_us = max(0, int(tape.manifest.end_local_ts_us) - int(tape.manifest.start_local_ts_us))
@@ -681,9 +685,11 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         tape,
         config=adverse_config,
         output_root=dataset_root,
+        work_dir=config.work_dir,
         chunk_rows=config.chunk_rows,
         overwrite=config.overwrite,
         cleanup_chunks=True,
+        cleanup_work_dir=config.cleanup_work_dir,
     )
     dataset_summary = summarize_disk_adverse_selection_dataset(dataset, chunk_rows=config.chunk_rows)
     baseline_fit = fit_adverse_baselines_streaming(
@@ -695,6 +701,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         chunk_rows=config.chunk_rows,
         metrics_mode=config.metrics_mode,
         auc_bins=config.auc_bins,
+        exact_auc_max_rows=config.exact_auc_max_rows,
     )
     baseline_summary = baseline_fit.metrics
     model_written = False
@@ -718,11 +725,18 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         model_written = True
     status = "ok" if dataset.num_decisions >= 1 and model_written else "warning"
     manifest = tape.manifest
+    try:
+        from mmrt.execution.adverse_selection_index import load_adverse_selection_index
+        idx = load_adverse_selection_index(work_root, mmap_mode="r")
+        index_summary = {"valid_l2_count": idx.manifest.valid_l2_count, "trade_flow_count": idx.manifest.trade_flow_count, "kyle_sample_count": idx.manifest.kyle_sample_count}
+    except Exception:
+        index_summary = {"valid_l2_count": None, "trade_flow_count": None, "kyle_sample_count": None}
     summary = {
         "status": status,
         "run_type": "train_adverse_selection",
         "tape_root": str(Path(config.tape_root)),
         "dataset_root": str(dataset_root),
+        "work_dir": str(work_root),
         "output_json": str(output_json),
         "model_npz": str(model_npz) if model_written else None,
         "config": _summary_config(config),
@@ -737,14 +751,18 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
             "end_local_ts_us": manifest.end_local_ts_us,
             "book_depth": manifest.notes.get("book_depth") if manifest.notes is not None else None,
         },
+        "index": index_summary,
         "dataset": dataset_summary,
         "baseline": baseline_summary,
         "resource_mode": {
             "disk_backed_dataset": True,
+            "disk_backed_index": True,
             "chunk_rows": config.chunk_rows,
             "metrics_mode": config.metrics_mode,
             "auc_bins": config.auc_bins,
+            "exact_auc_max_rows": config.exact_auc_max_rows,
             "keep_dataset": config.keep_dataset,
+            "keep_work_dir": not config.cleanup_work_dir,
             "cleanup_work_dir": config.cleanup_work_dir,
         },
         "disk_estimate": disk_estimate,
@@ -768,10 +786,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-rows", type=int, default=100_000)
     parser.add_argument("--keep-dataset", dest="keep_dataset", action="store_true", default=True)
     parser.add_argument("--delete-dataset-after-success", dest="keep_dataset", action="store_false")
-    parser.add_argument("--cleanup-work-dir", dest="cleanup_work_dir", action="store_true", default=True)
+    parser.add_argument("--cleanup-work-dir", dest="cleanup_work_dir", action="store_true", default=False)
     parser.add_argument("--keep-work-dir", dest="cleanup_work_dir", action="store_false")
     parser.add_argument("--metrics-mode", choices=("approx", "none", "exact"), default="approx")
     parser.add_argument("--auc-bins", type=int, default=2000)
+    parser.add_argument("--exact-auc-max-rows", type=int, default=1_000_000)
+    parser.add_argument("--progress-interval", type=int)
     parser.add_argument("--decision-interval-us", type=int, default=500_000)
     parser.add_argument("--start-event-index", type=int)
     parser.add_argument("--max-decisions", type=int)
@@ -825,6 +845,7 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         cleanup_work_dir=args.cleanup_work_dir,
         metrics_mode=args.metrics_mode,
         auc_bins=args.auc_bins,
+        exact_auc_max_rows=args.exact_auc_max_rows,
         decision_interval_us=args.decision_interval_us,
         start_event_index=args.start_event_index,
         max_decisions=args.max_decisions,

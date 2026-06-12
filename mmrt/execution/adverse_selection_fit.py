@@ -64,6 +64,59 @@ def _auc_exact(y: np.ndarray, score: np.ndarray) -> float | None:
     return float((np.sum(ranks[yb]) - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
+
+@dataclass(slots=True)
+class BinaryHistogramAUC:
+    bins: int
+    score_min: float | None = None
+    score_max: float | None = None
+    pos_hist: np.ndarray | None = None
+    neg_hist: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        self.bins = _check_positive(int(self.bins), "bins")
+        if self.score_min is not None and self.score_max is not None:
+            lo = float(self.score_min); hi = float(self.score_max)
+            if not math.isfinite(lo) or not math.isfinite(hi):
+                raise ValueError("score range must be finite")
+            if hi <= lo:
+                hi = lo + 1.0
+            self.score_min = lo; self.score_max = hi
+            self.pos_hist = np.zeros(self.bins, dtype=np.int64)
+            self.neg_hist = np.zeros(self.bins, dtype=np.int64)
+
+    def update_range(self, score: np.ndarray) -> None:
+        if score.size == 0:
+            return
+        lo = float(np.min(score)); hi = float(np.max(score))
+        self.score_min = lo if self.score_min is None else min(float(self.score_min), lo)
+        self.score_max = hi if self.score_max is None else max(float(self.score_max), hi)
+
+    def update(self, y: np.ndarray, score: np.ndarray) -> None:
+        if self.pos_hist is None or self.neg_hist is None or self.score_min is None or self.score_max is None:
+            self.__post_init__()
+        assert self.pos_hist is not None and self.neg_hist is not None and self.score_min is not None and self.score_max is not None
+        if score.size == 0:
+            return
+        span = max(float(self.score_max) - float(self.score_min), 1e-12)
+        idx = np.floor((np.asarray(score, dtype=np.float64) - float(self.score_min)) / span * self.bins).astype(np.int64)
+        idx = np.clip(idx, 0, self.bins - 1)
+        pos = np.asarray(y) > 0.5
+        self.pos_hist += np.bincount(idx[pos], minlength=self.bins).astype(np.int64)
+        self.neg_hist += np.bincount(idx[~pos], minlength=self.bins).astype(np.int64)
+
+    def auc(self) -> float | None:
+        assert self.pos_hist is not None and self.neg_hist is not None
+        n_pos = int(np.sum(self.pos_hist)); n_neg = int(np.sum(self.neg_hist))
+        if n_pos == 0 or n_neg == 0:
+            return None
+        cum_neg = 0
+        total = 0.0
+        for p, n in zip(self.pos_hist, self.neg_hist):
+            total += float(p) * cum_neg + 0.5 * float(p) * float(n)
+            cum_neg += int(n)
+        return float(total / (n_pos * n_neg))
+
 def fit_adverse_baselines_streaming(
     dataset: DiskBackedAdverseSelectionDataset,
     *,
@@ -74,6 +127,7 @@ def fit_adverse_baselines_streaming(
     chunk_rows: int = 100_000,
     metrics_mode: str = "approx",
     auc_bins: int = 2000,
+    exact_auc_max_rows: int = 1_000_000,
 ) -> AdverseBaselineFitResult:
     if not isinstance(dataset, DiskBackedAdverseSelectionDataset):
         raise ValueError("dataset must be DiskBackedAdverseSelectionDataset")
@@ -84,6 +138,7 @@ def fit_adverse_baselines_streaming(
     if metrics_mode not in ("approx", "none", "exact"):
         raise ValueError("metrics_mode must be approx, none, or exact")
     auc_bins = _check_positive(int(auc_bins), "auc_bins")
+    exact_auc_max_rows = _check_positive(int(exact_auc_max_rows), "exact_auc_max_rows")
     n = dataset.num_rows; nf = dataset.num_features
     train_rows_total, val_rows_total = _split(n, train_fraction)
     if n < 2:
@@ -131,9 +186,12 @@ def fit_adverse_baselines_streaming(
             continue
         beta = _solve(XtX + reg, Xty)
         intercept = float(beta[0]); coef = beta[1:].astype(np.float64, copy=False)
-        # Metrics streaming accumulators.
-        acc = {"train": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0, "ys": [], "ps": []},
-               "val": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0, "ys": [], "ps": []}}
+        # Metrics streaming accumulators. Approximate AUC is a bounded-memory two-pass histogram.
+        acc = {"train": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0},
+               "val": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0}}
+        is_binary_target = target_name.endswith("_filled") or target_name.endswith("_toxic_fill")
+        exact_scores = {"train": {"ys": [], "ps": []}, "val": {"ys": [], "ps": []}} if (metrics_mode == "exact" and is_binary_target) else None
+        range_acc = {"train": BinaryHistogramAUC(auc_bins), "val": BinaryHistogramAUC(auc_bins)} if (metrics_mode == "approx" and is_binary_target) else None
         for start in range(0, n, chunk_rows):
             end = min(start + chunk_rows, n)
             masks_all = np.asarray(dataset.arrays.label_masks[start:end, tidx], dtype=np.bool_)
@@ -151,8 +209,31 @@ def fit_adverse_baselines_streaming(
                 a = acc[split_name]
                 a["n"] += len(y); a["se"] += float(np.sum((y - p) ** 2)); a["ae"] += float(np.sum(np.abs(y - p)))
                 a["sum_y"] += float(np.sum(y)); a["sum_y2"] += float(np.sum(y * y)); a["sum_p"] += float(np.sum(p))
-                if metrics_mode == "exact" or (metrics_mode == "approx" and (target_name.endswith("_filled") or target_name.endswith("_toxic_fill"))):
-                    a["ys"].append(y.astype(np.float64)); a["ps"].append(p.astype(np.float64))
+                if exact_scores is not None:
+                    if int(a["n"]) > exact_auc_max_rows:
+                        raise ValueError("metrics_mode='exact' exceeds exact_auc_max_rows; use metrics_mode='approx' or increase exact_auc_max_rows")
+                    exact_scores[split_name]["ys"].append(y.astype(np.float64, copy=True)); exact_scores[split_name]["ps"].append(p.astype(np.float64, copy=True))
+                if range_acc is not None:
+                    range_acc[split_name].update_range(p)
+        hist_acc = None
+        if range_acc is not None:
+            hist_acc = {
+                split: BinaryHistogramAUC(auc_bins, score_min=accum.score_min, score_max=accum.score_max)
+                for split, accum in range_acc.items()
+            }
+            for start in range(0, n, chunk_rows):
+                end = min(start + chunk_rows, n)
+                masks_all = np.asarray(dataset.arrays.label_masks[start:end, tidx], dtype=np.bool_)
+                if not np.any(masks_all):
+                    continue
+                Xall = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
+                pred_all = ((Xall - mean) / scale) @ coef + intercept
+                yall = np.asarray(dataset.arrays.labels[start:end, tidx], dtype=np.float64)
+                row_ids = np.arange(start, end)
+                for split_name, split_mask in (("train", row_ids < train_rows_total), ("val", row_ids >= train_rows_total)):
+                    m = masks_all & split_mask
+                    if np.any(m):
+                        hist_acc[split_name].update(yall[m], pred_all[m])
         def split_metrics(name: str) -> tuple[float, float, float, float, float]:
             a = acc[name]; cnt = max(int(a["n"]), 1)
             mean_y = float(a["sum_y"] / cnt); ss_tot = float(a["sum_y2"] - a["sum_y"] * a["sum_y"] / cnt)
@@ -161,14 +242,18 @@ def fit_adverse_baselines_streaming(
         tr_rmse, tr_mae, tr_r2, tr_ymean, _ = split_metrics("train")
         va_rmse, va_mae, va_r2, va_ymean, va_pmean = split_metrics("val")
         metric: dict[str, object] = {"target_name": target_name, "train_rows": int(acc["train"]["n"]), "val_rows": int(acc["val"]["n"]), "train_rmse": tr_rmse, "val_rmse": va_rmse, "train_mae": tr_mae, "val_mae": va_mae, "train_r2": tr_r2, "val_r2": va_r2, "label_mean_train": tr_ymean, "label_mean_val": va_ymean, "prediction_mean_val": va_pmean, "skipped": False}
-        if target_name.endswith("_filled") or target_name.endswith("_toxic_fill"):
+        if is_binary_target:
             if metrics_mode == "none":
                 metric["train_auc"] = None; metric["val_auc"] = None; metric["auc_mode"] = "none"
+            elif metrics_mode == "exact":
+                assert exact_scores is not None
+                metric["train_auc"] = _auc_exact(np.concatenate(exact_scores["train"]["ys"]), np.concatenate(exact_scores["train"]["ps"])) if exact_scores["train"]["ys"] else None
+                metric["val_auc"] = _auc_exact(np.concatenate(exact_scores["val"]["ys"]), np.concatenate(exact_scores["val"]["ps"])) if exact_scores["val"]["ys"] else None
+                metric["auc_mode"] = "exact"; metric["auc_bins"] = None
             else:
-                metric["train_auc"] = _auc_exact(np.concatenate(acc["train"]["ys"]), np.concatenate(acc["train"]["ps"])) if acc["train"]["ys"] else None
-                metric["val_auc"] = _auc_exact(np.concatenate(acc["val"]["ys"]), np.concatenate(acc["val"]["ps"])) if acc["val"]["ys"] else None
-                metric["auc_mode"] = "exact" if metrics_mode == "exact" else "approx_histogram"
-                metric["auc_bins"] = auc_bins
+                assert hist_acc is not None
+                metric["train_auc"] = hist_acc["train"].auc(); metric["val_auc"] = hist_acc["val"].auc()
+                metric["auc_mode"] = "approx_histogram"; metric["auc_bins"] = auc_bins
         targets_metrics[target_name] = metric
         fitted_names.append(target_name); coefs.append(coef); intercepts.append(intercept)
 

@@ -11,12 +11,15 @@ import numpy as np
 
 from mmrt.execution.adverse_selection import (
     adverse_selection_config_from_training_summary,
-    build_adverse_selection_feature_dataset,
-    summarize_adverse_selection_feature_dataset,
+)
+from mmrt.execution.adverse_selection_feature_store import (
+    build_adverse_selection_features_to_disk,
+    summarize_adverse_selection_feature_store,
 )
 from mmrt.execution.adverse_signal import (
     ADVERSE_SELECTION_SIGNALS_FILENAME,
-    build_adverse_selection_signal_artifact,
+    ADVERSE_SELECTION_SIGNALS_SCHEMA,
+    AdverseSelectionSignalArtifact,
     load_adverse_selection_model,
     save_adverse_selection_signals,
 )
@@ -54,6 +57,11 @@ class BuildAdverseSelectionSignalsConfig:
     start_event_index: int | None = None
     max_decisions: int | None = None
     use_model_range: bool = False
+    feature_dataset_root: str | None = None
+    work_dir: str | None = None
+    chunk_rows: int = 100_000
+    keep_feature_dataset: bool = True
+    cleanup_work_dir: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
@@ -72,6 +80,14 @@ class BuildAdverseSelectionSignalsConfig:
         if self.max_decisions is not None and (isinstance(self.max_decisions, bool) or not isinstance(self.max_decisions, int) or self.max_decisions <= 0):
             raise ValueError("max_decisions must be None or a positive int")
         object.__setattr__(self, "use_model_range", _require_bool(self.use_model_range, "use_model_range"))
+        if self.feature_dataset_root is not None:
+            object.__setattr__(self, "feature_dataset_root", _require_nonempty_str(self.feature_dataset_root, "feature_dataset_root"))
+        if self.work_dir is not None:
+            object.__setattr__(self, "work_dir", _require_nonempty_str(self.work_dir, "work_dir"))
+        if isinstance(self.chunk_rows, bool) or self.chunk_rows <= 0:
+            raise ValueError("chunk_rows must be a positive int")
+        object.__setattr__(self, "keep_feature_dataset", _require_bool(self.keep_feature_dataset, "keep_feature_dataset"))
+        object.__setattr__(self, "cleanup_work_dir", _require_bool(self.cleanup_work_dir, "cleanup_work_dir"))
 
 
 def _default_output_npz(tape_root: str) -> Path:
@@ -127,11 +143,43 @@ def build_adverse_selection_signals_from_config(
         start_event_index=start_event_index,
         max_decisions=max_decisions,
     )
-    dataset = build_adverse_selection_feature_dataset(tape, config=adverse_config)
+    feature_root = Path(config.feature_dataset_root) if config.feature_dataset_root is not None else Path(config.tape_root) / "adverse_selection_feature_dataset"
+    dataset = build_adverse_selection_features_to_disk(
+        tape,
+        config=adverse_config,
+        output_root=feature_root,
+        work_dir=config.work_dir,
+        chunk_rows=config.chunk_rows,
+        overwrite=config.overwrite,
+        cleanup_chunks=not config.keep_feature_dataset,
+        cleanup_work_dir=config.cleanup_work_dir,
+    )
     if tuple(dataset.feature_names) != tuple(model.feature_names):
         raise ValueError("dataset feature_names must match model feature_names exactly")
-    signals = build_adverse_selection_signal_artifact(dataset, model)
+    preds = {name: np.lib.format.open_memmap(output_npz.parent / f".{output_npz.name}.{name}.npy", mode="w+", dtype=np.float32, shape=(dataset.num_rows,)) for name in model.target_names}
+    for start_row in range(0, dataset.num_rows, config.chunk_rows):
+        end_row = min(start_row + config.chunk_rows, dataset.num_rows)
+        X = np.asarray(dataset.features[start_row:end_row], dtype=np.float64)
+        raw = (X - model.feature_mean) / model.feature_scale @ model.coefficients.T + model.intercepts
+        for i, target in enumerate(model.target_names):
+            pred = raw[:, i]
+            if target.endswith("_filled") or target.endswith("_toxic_fill"):
+                pred = np.clip(pred, 0.0, 1.0)
+            elif target.endswith("_toxic_cost_bps") or target.endswith("_adverse_bps") or target.endswith("_fill_latency_us"):
+                pred = np.maximum(pred, 0.0)
+            preds[target][start_row:end_row] = pred.astype(np.float32, copy=False)
+    for arr in preds.values(): arr.flush()
+    signals = AdverseSelectionSignalArtifact(
+        schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+        decision_local_ts_us=np.asarray(dataset.decision_local_ts_us),
+        decision_event_index=np.asarray(dataset.decision_event_index),
+        decision_event_seq=np.asarray(dataset.decision_event_seq),
+        target_names=model.target_names,
+        predictions={name: np.asarray(arr) for name, arr in preds.items()},
+    )
     save_adverse_selection_signals(output_npz, signals, overwrite=config.overwrite)
+    for target in model.target_names:
+        (output_npz.parent / f".{output_npz.name}.{target}.npy").unlink(missing_ok=True)
 
     summary: dict[str, object] = {
         "status": "ok" if signals.decision_local_ts_us.size > 0 else "warning",
@@ -140,6 +188,8 @@ def build_adverse_selection_signals_from_config(
         "model_npz": str(Path(config.model_npz)),
         "output_npz": str(output_npz),
         "output_json": str(output_json),
+        "feature_dataset_root": str(feature_root),
+        "work_dir": str((Path(config.work_dir) if config.work_dir is not None else Path(config.tape_root)) / "adverse_selection_work"),
         "model": {
             "schema": model.schema,
             "exchange": model.exchange,
@@ -167,7 +217,8 @@ def build_adverse_selection_signals_from_config(
             "max_decisions": adverse_config.max_decisions,
             "use_model_range": config.use_model_range,
         },
-        "features": summarize_adverse_selection_feature_dataset(dataset),
+        "feature_dataset": summarize_adverse_selection_feature_store(dataset),
+        "resource_mode": {"disk_backed_features": True, "disk_backed_index": True, "chunk_rows": config.chunk_rows, "keep_feature_dataset": config.keep_feature_dataset, "keep_work_dir": not config.cleanup_work_dir},
     }
     _write_json_atomic(output_json, summary, overwrite=config.overwrite)
     return summary
@@ -184,6 +235,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decision-interval-us", type=int)
     parser.add_argument("--start-event-index", type=int)
     parser.add_argument("--max-decisions", type=int)
+    parser.add_argument("--feature-dataset-root")
+    parser.add_argument("--work-dir")
+    parser.add_argument("--chunk-rows", type=int, default=100_000)
+    parser.add_argument("--keep-feature-dataset", dest="keep_feature_dataset", action="store_true", default=True)
+    parser.add_argument("--delete-feature-dataset-after-success", dest="keep_feature_dataset", action="store_false")
+    parser.add_argument("--cleanup-work-dir", dest="cleanup_work_dir", action="store_true", default=False)
+    parser.add_argument("--keep-work-dir", dest="cleanup_work_dir", action="store_false")
+    parser.add_argument("--progress-interval", type=int)
     parser.add_argument(
         "--use-model-range",
         action="store_true",
@@ -204,6 +263,11 @@ def _config_from_args(args: argparse.Namespace) -> BuildAdverseSelectionSignalsC
         start_event_index=args.start_event_index,
         max_decisions=args.max_decisions,
         use_model_range=args.use_model_range,
+        feature_dataset_root=getattr(args, "feature_dataset_root", None),
+        work_dir=getattr(args, "work_dir", None),
+        chunk_rows=getattr(args, "chunk_rows", 100_000),
+        keep_feature_dataset=getattr(args, "keep_feature_dataset", True),
+        cleanup_work_dir=getattr(args, "cleanup_work_dir", False),
     )
 
 
