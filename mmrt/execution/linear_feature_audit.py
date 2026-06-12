@@ -12,7 +12,11 @@ import numpy as np
 
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import load_linear_signal_artifact_npz, linear_signal_artifact_summary
-from mmrt.execution.linear_signal_builder import iter_execution_linear_feature_chunks, execution_linear_feature_names
+from mmrt.execution.linear_signal_builder import (
+    execution_linear_feature_names,
+    iter_execution_linear_feature_chunks,
+    transform_config_from_train_result,
+)
 from mmrt.linear import models as lm
 from mmrt.linear.train import load_linear_train_result, linear_model_bundle_from_train_result, linear_preprocess_states_from_train_result
 
@@ -105,7 +109,7 @@ def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAu
     feature_path = work_root / "features.npy"
     # first stream to chunk files, then concatenate into a single memmap without ever making a float64 matrix
     chunks=[]
-    for c in iter_execution_linear_feature_chunks(tape, decision_interval_us=config.decision_interval_us, start_event_index=config.start_event_index, max_decisions=config.max_decisions, chunk_rows=config.chunk_rows):
+    for c in iter_execution_linear_feature_chunks(tape, decision_interval_us=config.decision_interval_us, start_event_index=config.start_event_index, max_decisions=config.max_decisions, chunk_rows=config.chunk_rows, transform_config=transform_config_from_train_result(result)):
         path = work_root / f"chunk_{len(chunks):06d}.npy"; np.save(path, c.features); chunks.append(path); idx_parts.append(c.decision_event_index); ts_parts.append(c.decision_local_ts_us); n += c.features.shape[0]
     feats = np.lib.format.open_memmap(feature_path, mode="w+", dtype=np.float32, shape=(n, nf)); pos=0
     for path in chunks:

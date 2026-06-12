@@ -21,6 +21,7 @@ from mmrt.execution.linear_signal_builder import (
 from mmrt.linear import models as lm
 from mmrt.linear import preprocess as pp
 from mmrt.linear import train as tr
+from mmrt.features.transforms import TransformConfig
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 
 
@@ -84,6 +85,7 @@ def _train_result(feature_columns_by_head):
         dataset_id="dataset",
         manifest_hash="hash",
         config={},
+        transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: states[h].as_dict() for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),
         splits={
@@ -209,6 +211,7 @@ def test_linear_signal_builder_rejects_preprocess_model_feature_mismatch():
         dataset_id="dataset",
         manifest_hash="hash",
         config={},
+        transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: bad_state for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),
         splits={"train": tr.SplitEvaluation("train", 1, {}, {}), "val": tr.SplitEvaluation("val", 1, {}, {})},

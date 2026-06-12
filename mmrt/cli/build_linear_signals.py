@@ -20,6 +20,7 @@ from mmrt.execution.linear_signal_builder import (
     build_execution_linear_feature_dataset,
     build_linear_signal_build_result,
     execution_linear_feature_dataset_summary,
+    transform_config_from_train_result,
 )
 from mmrt.linear.train import LINEAR_TRAINING_RESULT_SCHEMA, load_linear_train_result
 
@@ -153,6 +154,7 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
         start_event_index=config.start_event_index,
         max_decisions=config.max_decisions,
         output_dtype=config.output_dtype,
+        transform_config=transform_config_from_train_result(result),
     )
     build_result = build_linear_signal_build_result(
         tape=tape,

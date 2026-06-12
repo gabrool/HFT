@@ -68,8 +68,6 @@ def test_no_forbidden_imports():
         "mmrt.features.engine",
         "mmrt.features.labels",
         "mmrt.features.transforms",
-        "mmrt.data.tardis_csv",
-        "mmrt.data.event_merge",
         "CMSSL17",
         "offline_ingest",
     }

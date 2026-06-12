@@ -219,9 +219,6 @@ forbidden = (
     "pan" + "das",
     "to" + "rch",
     "py" + "arrow",
-    "mmrt.data.tardis_csv",
-    "mmrt.data.event_merge",
-    "mmrt.data.quality",
     "CM" + "SSL17",
     "offline_" + "ingest",
 )

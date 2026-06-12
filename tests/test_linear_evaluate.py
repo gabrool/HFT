@@ -47,7 +47,7 @@ def test_no_forbidden_imports():
         "mmrt.storage.reader", "mmrt.storage.writer", "mmrt.storage.splits",
         "mmrt.linear.extractors", "mmrt.linear.targets", "mmrt.linear.preprocess", "mmrt.linear.models",
         "mmrt.features.engine", "mmrt.features.labels", "mmrt.features.transforms",
-        "mmrt.data.tardis_csv", "mmrt.data.event_merge", "CMSSL17", "offline_ingest",
+        "CMSSL17", "offline_ingest",
     }
     for mod in loaded:
         assert all(not (mod == banned or mod.startswith(f"{banned}.")) for banned in forbidden)

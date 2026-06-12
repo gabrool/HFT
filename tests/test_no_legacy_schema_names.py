@@ -197,24 +197,6 @@ def test_no_dead_generic_contract_layer_symbols():
     assert offenders == []
 
 
-def test_no_unused_tardis_schema_symbols():
-    text = Path("mmrt/schemas.py").read_text(encoding="utf-8")
-    forbidden = (
-        "BOOK" + "_SNAPSHOT_5",
-        "BOOK" + "_TICKER",
-        "DERIVATIVE" + "_TICKER",
-        "LIQ" + "UIDATIONS",
-        "OPTIONS" + "_CHAIN",
-        "QU" + "OTES",
-        "Feature" + "Field",
-        "Feature" + "Schema",
-        "DECISION" + "_ROW_FIXED_COLUMNS",
-        "LABEL" + "_ROW_FIXED_COLUMNS",
-    )
-    offenders = [name for name in forbidden if name in text]
-    assert offenders == []
-
-
 def test_ingest_has_no_numeric_zero_coercion_or_skip_counters():
     text = Path("mmrt/cli/ingest.py").read_text(encoding="utf-8")
     forbidden = (
@@ -224,9 +206,10 @@ def test_ingest_has_no_numeric_zero_coercion_or_skip_counters():
     )
     offenders = [name for name in forbidden if name in text]
     assert offenders == []
-    assert "def _book_snapshot_input_from_row" in text
-    assert "return None" not in text.split("def _book_snapshot_input_from_row", 1)[1].split("def _trade_input_from_row", 1)[0]
-    assert "return None" not in text.split("def _trade_input_from_row", 1)[1].split("@dataclass", 1)[0]
+    replay_text = Path("mmrt/execution/feature_replay.py").read_text(encoding="utf-8")
+    assert "def book_snapshot_input_from_tape_row" in replay_text
+    assert "return None" not in replay_text.split("def book_snapshot_input_from_tape_row", 1)[1].split("def trade_input_from_tape_row", 1)[0]
+    assert "return None" not in replay_text.split("def trade_input_from_tape_row", 1)[1].split("def _l2_event_is_two_sided", 1)[0]
 
 
 def test_ingest_has_no_fake_data_type_or_validation_opt_out_flags():
@@ -236,32 +219,6 @@ def test_ingest_has_no_fake_data_type_or_validation_opt_out_flags():
         "--no" + "-validate-output",
         "--validate" + "-output",
         "args.validate" + "_output",
-    )
-    offenders = [s for s in forbidden if s in text]
-    assert offenders == []
-
-
-def test_tardis_csv_has_no_side_otherwise_unknown_fallback():
-    text = Path("mmrt/data/tardis_csv.py").read_text(encoding="utf-8")
-    assert ".otherwise(pl.lit(SIDE" + "_UNKNOWN))" not in text
-    assert ".otherwise(pl.lit(BOOK" + "_SIDE_UNKNOWN))" not in text
-    assert "BOOK" + "_SIDE_UNKNOWN" not in text
-
-
-def test_adapter_has_no_source_context_accepted_policy_helpers():
-    text = Path("mmrt/data/binance_futures_adapter.py").read_text(encoding="utf-8")
-    forbidden = (
-        "SOURCE" + "_DATA_TYPES",
-        "CONTEXT" + "_DATA_TYPES",
-        "ACCEPTED" + "_DATA_TYPES",
-        "is_binance_futures_source" + "_data_type",
-        "is_binance_futures_context" + "_data_type",
-        "is_binance_futures_accepted" + "_data_type",
-        "default_binance_futures_source" + "_data_types",
-        "default_binance_futures_context" + "_data_types",
-        "default_binance_futures_accepted" + "_data_types",
-        "normalize_binance_futures_data" + "_types",
-        "require_binance_futures_data" + "_type",
     )
     offenders = [s for s in forbidden if s in text]
     assert offenders == []

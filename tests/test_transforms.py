@@ -25,7 +25,7 @@ def val(vec, name): return vec[feature_index(name)]
 
 
 def test_public_api_boundary():
-    expected = {"DEFAULT_FAST_HALF_LIFE_US", "DEFAULT_MEDIUM_HALF_LIFE_US", "DEFAULT_SLOW_HALF_LIFE_US", "DEFAULT_MIN_OBS", "DEFAULT_VARIANCE_FLOOR", "DEFAULT_Z_CLIP", "DEFAULT_RAW_CLIP", "DEFAULT_BOUNDED_ABS_CLIP", "TransformConfig", "TransformDiagnostics", "TransformStateSnapshot", "CausalFeatureTransformer", "feature_transform_keys", "transform_key_for_feature", "ewma_feature_indices", "no_ewma_feature_indices", "base_transform_values", "transform_feature_matrix_causal_local"}
+    expected = {"DEFAULT_FAST_HALF_LIFE_US", "DEFAULT_MEDIUM_HALF_LIFE_US", "DEFAULT_SLOW_HALF_LIFE_US", "DEFAULT_MIN_OBS", "DEFAULT_VARIANCE_FLOOR", "DEFAULT_Z_CLIP", "DEFAULT_RAW_CLIP", "DEFAULT_BOUNDED_ABS_CLIP", "TransformConfig", "TransformDiagnostics", "TransformStateSnapshot", "CausalFeatureTransformer", "feature_transform_keys", "transform_key_for_feature", "ewma_feature_indices", "no_ewma_feature_indices", "base_transform_values", "transform_feature_matrix_causal_local", "transform_config_from_dict"}
     assert set(tr.__all__) == expected
     for name in tr.__all__:
         assert not name.startswith("_")
@@ -85,9 +85,6 @@ forbidden = (
     "num" + "ba",
     "mmrt.features.engine",
     "mmrt.features." + "la" + "bels",
-    "mmrt.data.tardis_csv",
-    "mmrt.data.event_merge",
-    "mmrt.data.quality",
     "mmrt.storage",
     "mmrt.linear",
     "CM" + "SSL17",

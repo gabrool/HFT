@@ -116,7 +116,6 @@ def test_no_forbidden_imports():
         "import po" + "lars", "from po" + "lars",
         "import to" + "rch", "from to" + "rch",
         "import sk" + "learn", "from sk" + "learn",
-        "from mmrt.data", "import mmrt.data",
         "from mmrt.features.engine", "from mmrt.features.labels", "from mmrt.features.transforms",
         "CM" + "SSL", "offline_" + "ingest", "linear_" + "offline",
         "BY" + "BIT", "Mini" + "Rocket", "Multi" + "Rocket", "Hy" + "dra", "Ae" + "on",

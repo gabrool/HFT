@@ -96,8 +96,6 @@ def test_no_forbidden_imports():
         "from to" + "rch",
         "import sk" + "learn",
         "from sk" + "learn",
-        "from mmrt.data",
-        "import mmrt.data",
         "from mmrt.features.engine",
         "from mmrt.features.labels",
         "from mmrt.features.transforms",

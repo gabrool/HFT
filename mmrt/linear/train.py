@@ -223,6 +223,7 @@ class LinearTrainResult:
     dataset_id: str
     manifest_hash: str
     config: dict[str, object]
+    transform_config: dict[str, object]
     preprocess_state: dict[str, object]
     model_bundle_state: dict[str, object]
     splits: dict[str, SplitEvaluation]
@@ -233,9 +234,11 @@ class LinearTrainResult:
             raise ValueError("invalid schema")
         object.__setattr__(self, "dataset_id", _require_non_empty_str(self.dataset_id, "dataset_id"))
         object.__setattr__(self, "manifest_hash", _require_non_empty_str(self.manifest_hash, "manifest_hash"))
-        for name in ("config", "preprocess_state", "model_bundle_state"):
+        for name in ("config", "transform_config", "preprocess_state", "model_bundle_state"):
             if not isinstance(getattr(self, name), dict):
                 raise ValueError(f"{name} must be dict")
+        if not self.transform_config:
+            raise ValueError("transform_config must be a non-empty dict")
         if not isinstance(self.selection_summary, dict):
             raise ValueError("selection_summary must be dict")
         if not isinstance(self.splits, dict):
@@ -258,6 +261,7 @@ class LinearTrainResult:
                 "dataset_id": self.dataset_id,
                 "manifest_hash": self.manifest_hash,
                 "config": self.config,
+                "transform_config": self.transform_config,
                 "preprocess_state": self.preprocess_state,
                 "model_bundle_state": self.model_bundle_state,
                 "splits": {k: v.as_dict() for k, v in self.splits.items()},
@@ -272,6 +276,8 @@ class LinearTrainResult:
             raise ValueError("linear train result must be a mapping")
         if raw["schema"] != LINEAR_TRAINING_RESULT_SCHEMA:
             raise ValueError("invalid schema")
+        if "transform_config" not in raw:
+            raise ValueError("linear train result missing transform_config")
         splits_raw = raw["splits"]
         if not isinstance(splits_raw, Mapping):
             raise ValueError("splits must be a mapping")
@@ -281,6 +287,7 @@ class LinearTrainResult:
             dataset_id=str(raw["dataset_id"]),
             manifest_hash=str(raw["manifest_hash"]),
             config=dict(raw["config"]),
+            transform_config=dict(raw["transform_config"]),
             preprocess_state=dict(raw["preprocess_state"]),
             model_bundle_state=dict(raw["model_bundle_state"]),
             splits=splits,
@@ -552,6 +559,7 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest.content_hash(),
         config={**cfg.as_dict(), "resolved_head_features": resolved_head_features.as_dict()},
+        transform_config=dict(manifest.transform_config),
         preprocess_state=_preprocess_states_as_dict(preprocess_states_by_head),
         model_bundle_state=model_bundle.as_dict(),
         splits=split_evals,

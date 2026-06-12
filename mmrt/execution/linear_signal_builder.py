@@ -1,22 +1,26 @@
 """Build canonical linear signal artifacts from execution-tape feature replay.
 
-This module owns execution-tape feature generation and conversion into aligned
-linear signals. It consumes execution tapes, trained linear artifacts, and the
-shared causal FeatureEngine; it does not read labels, storage datasets, RL code,
-or adverse-selection components.
+This module converts shared decision-feature-pipeline output into aligned
+linear signals. Feature rows come exclusively from
+:mod:`mmrt.execution.feature_replay`, the same path that produces supervised
+training features, and every artifact records the transform identity it was
+built with. It does not read labels, storage datasets, RL code, or
+adverse-selection components.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+import json
+from typing import Iterator, Mapping
 
 import numpy as np
 
-from mmrt.execution.execution_tape import (
-    EVENT_TYPE_CODE_L2_BATCH,
-    EVENT_TYPE_CODE_TRADE,
-    ExecutionTape,
+from mmrt.execution.execution_tape import ExecutionTape
+from mmrt.execution.feature_replay import (
+    DecisionFeatureChunk,
+    decision_feature_column_names,
+    iter_decision_feature_chunks,
 )
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -29,10 +33,8 @@ from mmrt.execution.linear_signal import (
     predictions_to_signal_arrays,
     validate_linear_signal_artifact_metadata,
 )
-from mmrt.features.book_state import BOOK_DEPTH, BookSnapshotInput
-from mmrt.features.engine import FeatureEngine, FeatureEngineConfig
-from mmrt.features.specs import FEATURE_NAMES
-from mmrt.features.trade_state import TradeInput
+from mmrt.features.pipeline import FeaturePipelineConfig
+from mmrt.features.transforms import TransformConfig, transform_config_from_dict
 from mmrt.linear import models as lm
 from mmrt.linear import preprocess as pp
 from mmrt.linear.train import (
@@ -42,6 +44,8 @@ from mmrt.linear.train import (
 )
 
 _ALLOWED_DTYPES = ("float32", "float64")
+
+ExecutionLinearFeatureChunk = DecisionFeatureChunk
 
 
 def _require_positive_int(value: int, name: str) -> int:
@@ -76,6 +80,20 @@ def _coerce_feature_names(values: tuple[str, ...]) -> tuple[str, ...]:
     return names
 
 
+def _coerce_transform_config_payload(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("transform_config must be a mapping")
+    payload = dict(value)
+    # Round-trips the payload through the parser so only reproducible
+    # transform identities (matching the current feature registry) are stored.
+    transform_config_from_dict(payload)
+    return payload
+
+
+def _transform_payloads_equal(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+    return json.dumps(dict(left), sort_keys=True) == json.dumps(dict(right), sort_keys=True)
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionLinearFeatureDataset:
     decision_event_index: np.ndarray
@@ -85,6 +103,7 @@ class ExecutionLinearFeatureDataset:
     replay_start_event_index: int
     start_event_index: int
     decision_interval_us: int
+    transform_config: dict[str, object]
 
     def __post_init__(self) -> None:
         event_idx = np.ascontiguousarray(np.asarray(self.decision_event_index, dtype=np.int64))
@@ -130,6 +149,7 @@ class ExecutionLinearFeatureDataset:
         object.__setattr__(self, "replay_start_event_index", replay_start)
         object.__setattr__(self, "start_event_index", start)
         object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
+        object.__setattr__(self, "transform_config", _coerce_transform_config_payload(self.transform_config))
 
     @property
     def num_decisions(self) -> int:
@@ -154,62 +174,12 @@ def execution_linear_feature_dataset_summary(dataset: ExecutionLinearFeatureData
         "decision_interval_us": dataset.decision_interval_us,
         "replay_start_event_index": dataset.replay_start_event_index,
         "start_event_index": dataset.start_event_index,
+        "transform_config": dict(dataset.transform_config),
     }
 
 
 def execution_linear_feature_names() -> tuple[str, ...]:
-    return tuple(name if name.startswith("x_") else f"x_{name}" for name in FEATURE_NAMES)
-
-
-def _book_snapshot_input_from_tape_row(tape: ExecutionTape, *, event_row: np.void) -> BookSnapshotInput:
-    book_ptr = int(event_row["book_ptr"])
-    if book_ptr < 0:
-        raise ValueError("event row does not reference a book snapshot")
-    tick_size = float(tape.manifest.symbol_spec.tick_size)
-    def padded(values: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
-        out = np.zeros(BOOK_DEPTH, dtype=dtype)
-        src = np.asarray(values, dtype=dtype)[:BOOK_DEPTH]
-        out[: src.shape[0]] = src
-        return out
-
-    bid_ticks = padded(tape.arrays.book_bid_ticks[book_ptr], dtype=np.dtype("float64"))
-    bid_sizes = padded(tape.arrays.book_bid_sizes[book_ptr], dtype=np.dtype("float64"))
-    ask_ticks = padded(tape.arrays.book_ask_ticks[book_ptr], dtype=np.dtype("float64"))
-    ask_sizes = padded(tape.arrays.book_ask_sizes[book_ptr], dtype=np.dtype("float64"))
-    return BookSnapshotInput(
-        local_ts_us=int(event_row["local_ts_us"]),
-        ts_us=int(event_row["ts_us"]),
-        event_seq=int(event_row["event_seq"]),
-        bid_px=bid_ticks * tick_size,
-        bid_sz=bid_sizes,
-        ask_px=ask_ticks * tick_size,
-        ask_sz=ask_sizes,
-    )
-
-
-def _trade_input_from_tape_row(tape: ExecutionTape, *, event_row: np.void) -> TradeInput:
-    trade_ptr = int(event_row["trade_ptr"])
-    if trade_ptr < 0:
-        raise ValueError("event row does not reference a trade")
-    trade = tape.arrays.trades[trade_ptr]
-    price = int(trade["price_tick"]) * float(tape.manifest.symbol_spec.tick_size)
-    return TradeInput(
-        local_ts_us=int(event_row["local_ts_us"]),
-        ts_us=int(event_row["ts_us"]),
-        price=float(price),
-        amount=float(trade["amount"]),
-        side_code=int(trade["side_code"]),
-        event_seq=int(event_row["event_seq"]),
-    )
-
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionLinearFeatureChunk:
-    decision_event_index: np.ndarray
-    decision_local_ts_us: np.ndarray
-    features: np.ndarray
-    feature_names: tuple[str, ...]
+    return decision_feature_column_names()
 
 
 def iter_execution_linear_feature_chunks(
@@ -220,45 +190,21 @@ def iter_execution_linear_feature_chunks(
     max_decisions: int | None = None,
     chunk_rows: int = 100_000,
     output_dtype: str = "float32",
-):
-    if not isinstance(tape, ExecutionTape):
-        raise ValueError("tape must be ExecutionTape")
-    decision_interval_us = _require_positive_int(decision_interval_us, "decision_interval_us")
-    chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
-    dtype = np.dtype(_require_output_dtype(output_dtype))
-    events = tape.arrays.events
-    start = 0 if start_event_index is None else _require_nonnegative_int(start_event_index, "start_event_index")
-    if start >= len(events):
-        raise ValueError("start_event_index must be < len(events)")
-    if max_decisions is not None:
-        max_decisions = _require_positive_int(max_decisions, "max_decisions")
-    engine = FeatureEngine(FeatureEngineConfig(decision_stride_us=decision_interval_us))
-    names = execution_linear_feature_names()
-    idx_buf: list[int] = []
-    ts_buf: list[int] = []
-    feat_buf: list[np.ndarray] = []
-    emitted = 0
-    for event_idx in range(start, len(events)):
-        event_row = events[event_idx]
-        code = int(event_row["event_type_code"])
-        if code == EVENT_TYPE_CODE_TRADE:
-            engine.on_trade(_trade_input_from_tape_row(tape, event_row=event_row))
-        elif code == EVENT_TYPE_CODE_L2_BATCH:
-            decision = engine.on_book_snapshot(_book_snapshot_input_from_tape_row(tape, event_row=event_row))
-            if decision is not None:
-                idx_buf.append(event_idx)
-                ts_buf.append(int(decision.local_ts_us))
-                feat_buf.append(np.asarray(decision.feature_vector, dtype=dtype))
-                emitted += 1
-                if len(feat_buf) >= chunk_rows:
-                    yield ExecutionLinearFeatureChunk(np.asarray(idx_buf, dtype=np.int64), np.asarray(ts_buf, dtype=np.int64), np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype), names)
-                    idx_buf.clear(); ts_buf.clear(); feat_buf.clear()
-                if max_decisions is not None and emitted >= max_decisions:
-                    break
-        else:
-            raise ValueError(f"unsupported execution event_type_code: {code}")
-    if feat_buf:
-        yield ExecutionLinearFeatureChunk(np.asarray(idx_buf, dtype=np.int64), np.asarray(ts_buf, dtype=np.int64), np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype), names)
+    transform_config: TransformConfig | None = None,
+) -> Iterator[ExecutionLinearFeatureChunk]:
+    pipeline_config = FeaturePipelineConfig(
+        decision_stride_us=_require_positive_int(decision_interval_us, "decision_interval_us"),
+        transform=transform_config if transform_config is not None else TransformConfig(),
+    )
+    yield from iter_decision_feature_chunks(
+        tape,
+        pipeline_config=pipeline_config,
+        start_event_index=start_event_index,
+        max_decisions=max_decisions,
+        chunk_rows=chunk_rows,
+        output_dtype=_require_output_dtype(output_dtype),
+    )
+
 
 def build_execution_linear_feature_dataset(
     tape: ExecutionTape,
@@ -267,21 +213,41 @@ def build_execution_linear_feature_dataset(
     start_event_index: int | None = None,
     max_decisions: int | None = None,
     output_dtype: str = "float32",
+    transform_config: TransformConfig | None = None,
 ) -> ExecutionLinearFeatureDataset:
-    chunks = list(iter_execution_linear_feature_chunks(tape, decision_interval_us=decision_interval_us, start_event_index=start_event_index, max_decisions=max_decisions, chunk_rows=100_000, output_dtype=output_dtype))
+    transform = transform_config if transform_config is not None else TransformConfig()
+    chunks = list(
+        iter_execution_linear_feature_chunks(
+            tape,
+            decision_interval_us=decision_interval_us,
+            start_event_index=start_event_index,
+            max_decisions=max_decisions,
+            chunk_rows=100_000,
+            output_dtype=output_dtype,
+            transform_config=transform,
+        )
+    )
     names = execution_linear_feature_names()
     if chunks:
         decision_event_index = np.concatenate([c.decision_event_index for c in chunks])
         decision_local_ts_us = np.concatenate([c.decision_local_ts_us for c in chunks])
         features = np.ascontiguousarray(np.vstack([c.features for c in chunks]), dtype=np.dtype(output_dtype))
     else:
-        start = 0 if start_event_index is None else _require_nonnegative_int(start_event_index, "start_event_index")
         decision_event_index = np.asarray([], dtype=np.int64)
         decision_local_ts_us = np.asarray([], dtype=np.int64)
         features = np.empty((0, len(names)), dtype=np.dtype(output_dtype))
     effective_start_event_index = int(decision_event_index[0]) if decision_event_index.size else (0 if start_event_index is None else int(start_event_index))
     replay_start = 0 if start_event_index is None else int(start_event_index)
-    return ExecutionLinearFeatureDataset(decision_event_index=decision_event_index, decision_local_ts_us=decision_local_ts_us, features=features, feature_names=names, replay_start_event_index=replay_start, start_event_index=effective_start_event_index, decision_interval_us=decision_interval_us)
+    return ExecutionLinearFeatureDataset(
+        decision_event_index=decision_event_index,
+        decision_local_ts_us=decision_local_ts_us,
+        features=features,
+        feature_names=names,
+        replay_start_event_index=replay_start,
+        start_event_index=effective_start_event_index,
+        decision_interval_us=decision_interval_us,
+        transform_config=transform.as_dict(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +268,13 @@ def _head_model(bundle: lm.LinearModelBundle, head: str):
     if head == lm.MAGNITUDE_DOWN_HEAD:
         return bundle.magnitude_down
     raise ValueError("unknown head")
+
+
+def transform_config_from_train_result(result: LinearTrainResult) -> TransformConfig:
+    """Rebuild the exact training transform from a linear train result."""
+    if not isinstance(result, LinearTrainResult):
+        raise ValueError("result must be LinearTrainResult")
+    return transform_config_from_dict(result.transform_config)
 
 
 def predict_linear_heads_for_execution_features(
@@ -355,6 +328,13 @@ def build_linear_signal_build_result(
         raise ValueError("feature_dataset must be ExecutionLinearFeatureDataset")
     if feature_dataset.num_decisions <= 0:
         raise ValueError("feature_dataset must contain at least one decision")
+    if not isinstance(linear_train_result, LinearTrainResult):
+        raise ValueError("linear_train_result must be LinearTrainResult")
+    if not _transform_payloads_equal(feature_dataset.transform_config, linear_train_result.transform_config):
+        raise ValueError(
+            "feature_dataset transform_config does not match linear_train_result transform_config; "
+            "build features with transform_config_from_train_result(linear_train_result)"
+        )
     model_bundle = linear_model_bundle_from_train_result(linear_train_result)
     preprocess_states = linear_preprocess_states_from_train_result(linear_train_result)
     predictions = predict_linear_heads_for_execution_features(
@@ -465,6 +445,7 @@ __all__ = [
     "execution_linear_feature_names",
     "build_execution_linear_feature_dataset",
     "LinearSignalBuildResult",
+    "transform_config_from_train_result",
     "predict_linear_heads_for_execution_features",
     "build_linear_signal_build_result",
     "build_linear_signal_artifact_from_execution_features",
