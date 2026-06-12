@@ -574,6 +574,8 @@ def _validate_event_key_for_order(order: ActiveOrder, event_key: EventKey) -> No
 
 
 def _assert_no_duplicate_fillable_side_price(orders: tuple[ActiveOrder, ...], *, event_key: EventKey) -> None:
+    if len(orders) < 2:
+        return
     seen: set[tuple[OrderSide, int]] = set()
     for order in orders:
         if not order.is_fillable_at_key(event_key):

@@ -288,6 +288,19 @@ class L2Update:
         _require_bool(self.is_snapshot, "is_snapshot")
         _require_nonnegative_int(self.source_row, "source_row")
 
+    @classmethod
+    def from_trusted(cls, *, local_ts_us: int, ts_us: int, side: BookSide, price_tick: int, amount: float, is_snapshot: bool, source_row: int) -> "L2Update":
+        """Construct without re-validation for fields coerced upstream."""
+        self = object.__new__(cls)
+        object.__setattr__(self, "local_ts_us", local_ts_us)
+        object.__setattr__(self, "ts_us", ts_us)
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "price_tick", price_tick)
+        object.__setattr__(self, "amount", amount)
+        object.__setattr__(self, "is_snapshot", is_snapshot)
+        object.__setattr__(self, "source_row", source_row)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class L2UpdateBatch:
@@ -319,6 +332,22 @@ class L2UpdateBatch:
         if self.is_snapshot_batch != any(update.is_snapshot for update in updates):
             raise ValueError("is_snapshot_batch must equal any(update.is_snapshot for update in updates)")
         _require_nonnegative_int(self.batch_seq, "batch_seq")
+
+    @classmethod
+    def from_trusted(cls, *, local_ts_us: int, min_ts_us: int, max_ts_us: int, updates: tuple["L2Update", ...], is_snapshot_batch: bool, batch_seq: int) -> "L2UpdateBatch":
+        """Construct without re-validation for batches grouped upstream.
+
+        Callers must guarantee all updates share ``local_ts_us`` and that
+        the ts bounds and snapshot flag are consistent with ``updates``.
+        """
+        self = object.__new__(cls)
+        object.__setattr__(self, "local_ts_us", local_ts_us)
+        object.__setattr__(self, "min_ts_us", min_ts_us)
+        object.__setattr__(self, "max_ts_us", max_ts_us)
+        object.__setattr__(self, "updates", updates)
+        object.__setattr__(self, "is_snapshot_batch", is_snapshot_batch)
+        object.__setattr__(self, "batch_seq", batch_seq)
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +427,18 @@ class BookLevelSnapshot:
         object.__setattr__(self, "bid_sizes", bid_sizes)
         object.__setattr__(self, "ask_ticks", ask_ticks)
         object.__setattr__(self, "ask_sizes", ask_sizes)
+
+    @classmethod
+    def from_trusted(cls, *, local_ts_us: int, bid_ticks: tuple[int, ...], bid_sizes: tuple[float, ...], ask_ticks: tuple[int, ...], ask_sizes: tuple[float, ...]) -> "BookLevelSnapshot":
+        """Construct without re-validation for levels ordered by construction
+        (e.g. snapshots emitted by the L2 reconstructor's sorted books)."""
+        self = object.__new__(cls)
+        object.__setattr__(self, "local_ts_us", local_ts_us)
+        object.__setattr__(self, "bid_ticks", bid_ticks)
+        object.__setattr__(self, "bid_sizes", bid_sizes)
+        object.__setattr__(self, "ask_ticks", ask_ticks)
+        object.__setattr__(self, "ask_sizes", ask_sizes)
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,10 +713,17 @@ class ActiveOrder:
             raise ValueError("key must be EventKey")
         if self.status not in (OrderStatus.ACTIVE, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL):
             return False
-        if key < self.effective_key:
+        key_ts = key.local_ts_us
+        key_seq = key.event_seq
+        if self.effective_local_ts_us:
+            if (key_ts, key_seq) < (self.effective_local_ts_us, self.effective_event_seq):
+                return False
+        elif (key_ts, key_seq) < (self.created_local_ts_us, self.created_event_seq):
             return False
-        cancel_key = self.cancel_effective_key
-        if cancel_key is not None and key >= cancel_key:
+        if self.cancel_effective_local_ts_us and (key_ts, key_seq) >= (
+            self.cancel_effective_local_ts_us,
+            self.cancel_effective_event_seq,
+        ):
             return False
         return True
 

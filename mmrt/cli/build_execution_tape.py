@@ -502,9 +502,12 @@ def _iter_path_rows(path: Path, *, batch_size: int) -> Iterator[dict[str, Any]]:
 def _iter_csv_rows(path: Path) -> Iterator[dict[str, Any]]:
     open_fn = gzip.open if path.name.endswith(".gz") else open
     with open_fn(path, "rt", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            yield dict(row)
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if header is None:
+            return
+        for values in reader:
+            yield dict(zip(header, values))
 
 
 def _iter_parquet_rows(path: Path, *, batch_size: int) -> Iterator[dict[str, Any]]:
@@ -545,7 +548,9 @@ def _row_to_l2_update(row: Mapping[str, Any], *, symbol_spec: SymbolSpec, fallba
         raise ValueError("amount must be >= 0")
     is_snapshot = _parse_bool(_first_present(row, ("is_snapshot",)))
     source_row = _source_row(row, fallback_source_row)
-    return L2Update(
+    # Fields are fully coerced above; the trusted constructor skips the
+    # redundant dataclass re-validation on this per-row hot path.
+    return L2Update.from_trusted(
         local_ts_us=local_ts_us,
         ts_us=ts_us,
         side=side,

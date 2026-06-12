@@ -122,6 +122,39 @@ class ReconstructedL2Event:
         if not self.crossed_repaired and self.crossed_levels_removed != 0:
             raise ValueError("crossed_levels_removed must be 0 when crossed_repaired is False")
 
+    @classmethod
+    def from_trusted(
+        cls,
+        *,
+        batch_seq: int,
+        local_ts_us: int,
+        min_ts_us: int,
+        max_ts_us: int,
+        num_updates: int,
+        is_snapshot_batch: bool,
+        book_top: BookTop | None,
+        bid_depth: int,
+        ask_depth: int,
+        book_snapshot: BookLevelSnapshot | None,
+        crossed_repaired: bool,
+        crossed_levels_removed: int,
+    ) -> "ReconstructedL2Event":
+        """Construct without re-validation for reconstructor-produced events."""
+        self = object.__new__(cls)
+        object.__setattr__(self, "batch_seq", batch_seq)
+        object.__setattr__(self, "local_ts_us", local_ts_us)
+        object.__setattr__(self, "min_ts_us", min_ts_us)
+        object.__setattr__(self, "max_ts_us", max_ts_us)
+        object.__setattr__(self, "num_updates", num_updates)
+        object.__setattr__(self, "is_snapshot_batch", is_snapshot_batch)
+        object.__setattr__(self, "book_top", book_top)
+        object.__setattr__(self, "bid_depth", bid_depth)
+        object.__setattr__(self, "ask_depth", ask_depth)
+        object.__setattr__(self, "book_snapshot", book_snapshot)
+        object.__setattr__(self, "crossed_repaired", crossed_repaired)
+        object.__setattr__(self, "crossed_levels_removed", crossed_levels_removed)
+        return self
+
 
 class _SideBook:
     __slots__ = ("side", "_qty_by_tick", "_ticks")
@@ -180,11 +213,11 @@ class _SideBook:
 
     def top_ticks_and_sizes(self, depth: int) -> tuple[tuple[int, ...], tuple[float, ...]]:
         if self.side is BookSide.BID:
-            ticks = tuple(reversed(self._ticks[-depth:]))
+            ticks = self._ticks[-depth:][::-1]
         else:
-            ticks = tuple(self._ticks[:depth])
-        sizes = tuple(self._qty_by_tick[tick] for tick in ticks)
-        return ticks, sizes
+            ticks = self._ticks[:depth]
+        qty_by_tick = self._qty_by_tick
+        return tuple(ticks), tuple([qty_by_tick[tick] for tick in ticks])
 
 
 class L2BookReconstructor:
@@ -347,7 +380,7 @@ class L2BookReconstructor:
             self._crossed_batch_count += 1
 
         self._emitted_event_count += 1
-        return ReconstructedL2Event(
+        return ReconstructedL2Event.from_trusted(
             batch_seq=batch.batch_seq,
             local_ts_us=batch.local_ts_us,
             min_ts_us=batch.min_ts_us,
@@ -403,7 +436,15 @@ class L2BookReconstructor:
         effective_local_ts_us = self._effective_local_ts_us(local_ts_us)
         bid_ticks, bid_sizes = self._bids.top_ticks_and_sizes(depth)
         ask_ticks, ask_sizes = self._asks.top_ticks_and_sizes(depth)
-        return BookLevelSnapshot(effective_local_ts_us, bid_ticks, bid_sizes, ask_ticks, ask_sizes)
+        # The side books keep ticks sorted, so the level invariants hold by
+        # construction and per-level re-validation is skipped.
+        return BookLevelSnapshot.from_trusted(
+            local_ts_us=effective_local_ts_us,
+            bid_ticks=bid_ticks,
+            bid_sizes=bid_sizes,
+            ask_ticks=ask_ticks,
+            ask_sizes=ask_sizes,
+        )
 
     def _effective_local_ts_us(self, local_ts_us: int | None) -> int:
         if local_ts_us is None:
@@ -451,7 +492,9 @@ def iter_l2_update_batches(updates: Iterable[L2Update]) -> Iterator[L2UpdateBatc
 def _make_batch(local_ts_us: int, updates: list[L2Update], batch_seq: int) -> L2UpdateBatch:
     min_ts_us = min(update.ts_us for update in updates)
     max_ts_us = max(update.ts_us for update in updates)
-    return L2UpdateBatch(
+    # Grouping by identical local_ts_us guarantees the batch invariants the
+    # validated constructor would re-check per update.
+    return L2UpdateBatch.from_trusted(
         local_ts_us=local_ts_us,
         min_ts_us=min_ts_us,
         max_ts_us=max_ts_us,
