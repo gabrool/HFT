@@ -291,7 +291,7 @@ def apply_split_plan(manifest: mf.StorageManifest, plan: SplitPlan, *, replace_e
         symbol=manifest.symbol,
         storage_format=manifest.storage_format,
         time_unit=manifest.time_unit,
-        decision_stride_us=manifest.decision_stride_us,
+        decision_schedule=manifest.decision_schedule,
         feature_columns=manifest.feature_columns,
         label_columns=manifest.label_columns,
         required_columns=manifest.required_columns,

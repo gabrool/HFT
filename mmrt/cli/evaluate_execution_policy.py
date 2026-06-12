@@ -167,7 +167,7 @@ class ExecutionPolicyEvaluationCLIConfig:
     overwrite: bool = False
     mmap_mode: str | None = "r"
 
-    decision_interval_us: int = 500_000
+    cancel_guard_ticks: int = 2
     max_episode_steps: int | None = None
 
     max_distance_ticks: int = 1
@@ -219,7 +219,7 @@ class ExecutionPolicyEvaluationCLIConfig:
         if self.mmap_mode not in (None, "r"):
             raise ValueError('mmap_mode must be None or "r"')
 
-        _require_positive_int(self.decision_interval_us, "decision_interval_us")
+        _require_positive_int(self.cancel_guard_ticks, "cancel_guard_ticks")
         _optional_positive_int(self.max_episode_steps, "max_episode_steps")
         _require_positive_int(self.max_distance_ticks, "max_distance_ticks")
         _require_positive_float(self.max_order_qty, "max_order_qty")
@@ -272,7 +272,7 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "adverse_signals_npz": config.adverse_signals_npz,
         "overwrite": config.overwrite,
         "mmap_mode": config.mmap_mode,
-        "decision_interval_us": config.decision_interval_us,
+        "cancel_guard_ticks": config.cancel_guard_ticks,
         "max_episode_steps": config.max_episode_steps,
         "max_distance_ticks": config.max_distance_ticks,
         "max_order_qty": config.max_order_qty,
@@ -316,9 +316,9 @@ def _env_config_from_cli_config(
 
 
 def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> ExecutionEnvConfig:
-    decision_interval_us = _require_positive_int(
-        raw.get("decision_interval_us", 500_000),
-        "decision_interval_us",
+    cancel_guard_ticks = _require_positive_int(
+        raw.get("cancel_guard_ticks", 2),
+        "cancel_guard_ticks",
     )
     max_episode_steps = _optional_positive_int(
         raw.get("max_episode_steps"),
@@ -387,7 +387,7 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
     )
 
     params = ExecutionEnvConfigBuildInput(
-        decision_interval_us=decision_interval_us,
+        cancel_guard_ticks=cancel_guard_ticks,
         max_distance_ticks=max_distance_ticks,
         max_order_qty=max_order_qty,
         post_only_gap_ticks=post_only_gap_ticks,
@@ -605,7 +605,6 @@ def run_execution_policy_evaluation(
     linear_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
-        decision_interval_us=env_config.decision_interval_us,
         requested_start_event_index=effective_start_event_index,
         min_rows=requested_min_rows,
     )
@@ -627,6 +626,8 @@ def run_execution_policy_evaluation(
         raise ValueError("checkpoint missing linear signal metadata")
     if checkpoint_linear_schema.get("fields") != linear_signal_artifact_summary(linear_signals)["fields"]:
         raise ValueError("checkpoint linear signal fields mismatch")
+    if dict(checkpoint_linear_metadata) != linear_signals.metadata.as_dict():
+        raise ValueError("checkpoint linear signal metadata mismatch with loaded artifact")
     obs_dim = int(env.config.observation_schema.dim)
     policy = _load_policy_from_checkpoint(
         checkpoint,
@@ -713,7 +714,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
 
-    parser.add_argument("--decision-interval-us", type=int, default=500_000)
+    parser.add_argument("--cancel-guard-ticks", type=int, default=2)
     parser.add_argument("--max-episode-steps", type=int)
     parser.add_argument("--max-distance-ticks", type=int, default=1)
     parser.add_argument("--max-order-qty", type=float, default=0.001)
@@ -762,7 +763,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         adverse_signals_npz=args.adverse_signals_npz,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
-        decision_interval_us=args.decision_interval_us,
+        cancel_guard_ticks=args.cancel_guard_ticks,
         max_episode_steps=args.max_episode_steps,
         max_distance_ticks=args.max_distance_ticks,
         max_order_qty=args.max_order_qty,

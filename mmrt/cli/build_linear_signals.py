@@ -20,6 +20,7 @@ from mmrt.execution.linear_signal_builder import (
     build_execution_linear_feature_dataset,
     build_linear_signal_build_result,
     execution_linear_feature_dataset_summary,
+    schedule_config_from_train_result,
     transform_config_from_train_result,
 )
 from mmrt.linear.train import LINEAR_TRAINING_RESULT_SCHEMA, load_linear_train_result
@@ -72,7 +73,6 @@ class BuildLinearSignalsConfig:
     output_json: str | None = None
     overwrite: bool = False
     mmap_mode: str | None = "r"
-    decision_interval_us: int = 500_000
     start_event_index: int | None = None
     max_decisions: int | None = None
     output_dtype: str = "float32"
@@ -88,7 +88,6 @@ class BuildLinearSignalsConfig:
         object.__setattr__(self, "overwrite", _require_bool(self.overwrite, "overwrite"))
         if self.mmap_mode not in (None, "r"):
             raise ValueError("mmap_mode must be None or 'r'")
-        object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
         object.__setattr__(self, "start_event_index", _require_optional_nonnegative_int(self.start_event_index, "start_event_index"))
         object.__setattr__(self, "max_decisions", _require_optional_positive_int(self.max_decisions, "max_decisions"))
         if self.output_dtype not in ("float32", "float64"):
@@ -104,7 +103,6 @@ class BuildLinearSignalsConfig:
             "output_json": self.output_json,
             "overwrite": self.overwrite,
             "mmap_mode": self.mmap_mode,
-            "decision_interval_us": self.decision_interval_us,
             "start_event_index": self.start_event_index,
             "max_decisions": self.max_decisions,
             "output_dtype": self.output_dtype,
@@ -150,7 +148,7 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
 
     features = build_execution_linear_feature_dataset(
         tape,
-        decision_interval_us=config.decision_interval_us,
+        schedule_config=schedule_config_from_train_result(result),
         start_event_index=config.start_event_index,
         max_decisions=config.max_decisions,
         output_dtype=config.output_dtype,
@@ -202,7 +200,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
-    parser.add_argument("--decision-interval-us", type=int, default=500_000)
     parser.add_argument("--start-event-index", type=int)
     parser.add_argument("--max-decisions", type=int)
     parser.add_argument("--output-dtype", choices=("float32", "float64"), default="float32")
@@ -218,7 +215,6 @@ def _config_from_args(args: argparse.Namespace) -> BuildLinearSignalsConfig:
         output_json=args.output_json,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
-        decision_interval_us=args.decision_interval_us,
         start_event_index=args.start_event_index,
         max_decisions=args.max_decisions,
         output_dtype=args.output_dtype,

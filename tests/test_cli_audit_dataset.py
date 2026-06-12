@@ -60,7 +60,7 @@ def make_dataset(tmp_path: Path, *, rows: int = 5, chunk_rows: int = 2, splits=(
             m0.symbol,
             m0.storage_format,
             m0.time_unit,
-            m0.decision_stride_us,
+            m0.decision_schedule,
             m0.feature_columns,
             m0.label_columns,
             m0.required_columns,
@@ -137,7 +137,7 @@ def test_audit_dataset_with_train_val_test_splits(tmp_path: Path) -> None:
     m2 = mf.StorageManifest(
         manifest.schema, manifest.dataset_id, manifest.created_at_utc, manifest.pipeline_config, manifest.writer_metadata,
         manifest.feature_schema, manifest.label_spec, manifest.transform_config, manifest.transform_diagnostics,
-        manifest.exchange, manifest.symbol, manifest.storage_format, manifest.time_unit, manifest.decision_stride_us,
+        manifest.exchange, manifest.symbol, manifest.storage_format, manifest.time_unit, manifest.decision_schedule,
         manifest.feature_columns, manifest.label_columns, manifest.required_columns, manifest.segments, splits, manifest.notes,
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
@@ -174,7 +174,7 @@ def test_audit_dataset_scan_limit(tmp_path: Path) -> None:
     m1 = mf.StorageManifest(
         m0.schema, m0.dataset_id, m0.created_at_utc, m0.pipeline_config, m0.writer_metadata,
         m0.feature_schema, m0.label_spec, m0.transform_config, m0.transform_diagnostics,
-        m0.exchange, m0.symbol, m0.storage_format, m0.time_unit, m0.decision_stride_us,
+        m0.exchange, m0.symbol, m0.storage_format, m0.time_unit, m0.decision_schedule,
         m0.feature_columns, m0.label_columns, m0.required_columns, m0.segments, split, m0.notes,
     )
     mf.write_manifest_json(m1, root / mf.DEFAULT_MANIFEST_FILENAME)
@@ -209,7 +209,7 @@ def test_audit_dataset_no_scan_splits_does_not_iterate(tmp_path: Path, monkeypat
     m1 = mf.StorageManifest(
         m0.schema, m0.dataset_id, m0.created_at_utc, m0.pipeline_config, m0.writer_metadata,
         m0.feature_schema, m0.label_spec, m0.transform_config, m0.transform_diagnostics,
-        m0.exchange, m0.symbol, m0.storage_format, m0.time_unit, m0.decision_stride_us,
+        m0.exchange, m0.symbol, m0.storage_format, m0.time_unit, m0.decision_schedule,
         m0.feature_columns, m0.label_columns, m0.required_columns, m0.segments, splits, m0.notes,
     )
     mf.write_manifest_json(m1, root / mf.DEFAULT_MANIFEST_FILENAME)
@@ -244,7 +244,7 @@ def test_audit_dataset_uses_streaming_split_batches(tmp_path: Path, monkeypatch:
     m1 = mf.StorageManifest(
         m0.schema, m0.dataset_id, m0.created_at_utc, m0.pipeline_config, m0.writer_metadata,
         m0.feature_schema, m0.label_spec, m0.transform_config, m0.transform_diagnostics,
-        m0.exchange, m0.symbol, m0.storage_format, m0.time_unit, m0.decision_stride_us,
+        m0.exchange, m0.symbol, m0.storage_format, m0.time_unit, m0.decision_schedule,
         m0.feature_columns, m0.label_columns, m0.required_columns, m0.segments, splits, m0.notes,
     )
     mf.write_manifest_json(m1, root / mf.DEFAULT_MANIFEST_FILENAME)

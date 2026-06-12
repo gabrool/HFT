@@ -26,7 +26,7 @@ def test_current_tardis_data_types_only():
 
 
 def test_current_label_enums_only():
-    assert tuple(DecisionReason) == (DecisionReason.BOOK_STRIDE,)
+    assert tuple(DecisionReason) == (DecisionReason.EVENT_SCHEDULE,)
     assert tuple(PriceReference) == (PriceReference.MID,)
     assert tuple(AsOfPolicy) == (AsOfPolicy.LAST_OBSERVATION,)
 

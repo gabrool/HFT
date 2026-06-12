@@ -34,6 +34,7 @@ from mmrt.execution.linear_signal import (
     validate_linear_signal_artifact_metadata,
 )
 from mmrt.features.pipeline import FeaturePipelineConfig
+from mmrt.features.schedule import DecisionScheduleConfig, decision_schedule_config_from_dict
 from mmrt.features.transforms import TransformConfig, transform_config_from_dict
 from mmrt.linear import models as lm
 from mmrt.linear import preprocess as pp
@@ -90,6 +91,14 @@ def _coerce_transform_config_payload(value: object) -> dict[str, object]:
     return payload
 
 
+def _coerce_decision_schedule_payload(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("decision_schedule must be a mapping")
+    payload = dict(value)
+    decision_schedule_config_from_dict(payload)
+    return payload
+
+
 def _transform_payloads_equal(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
     return json.dumps(dict(left), sort_keys=True) == json.dumps(dict(right), sort_keys=True)
 
@@ -102,7 +111,7 @@ class ExecutionLinearFeatureDataset:
     feature_names: tuple[str, ...]
     replay_start_event_index: int
     start_event_index: int
-    decision_interval_us: int
+    decision_schedule: dict[str, object]
     transform_config: dict[str, object]
 
     def __post_init__(self) -> None:
@@ -148,7 +157,7 @@ class ExecutionLinearFeatureDataset:
         object.__setattr__(self, "feature_names", names)
         object.__setattr__(self, "replay_start_event_index", replay_start)
         object.__setattr__(self, "start_event_index", start)
-        object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
+        object.__setattr__(self, "decision_schedule", _coerce_decision_schedule_payload(self.decision_schedule))
         object.__setattr__(self, "transform_config", _coerce_transform_config_payload(self.transform_config))
 
     @property
@@ -171,7 +180,7 @@ def execution_linear_feature_dataset_summary(dataset: ExecutionLinearFeatureData
         "last_decision_event_index": int(dataset.decision_event_index[-1]) if dataset.num_decisions else None,
         "first_decision_local_ts_us": int(dataset.decision_local_ts_us[0]) if dataset.num_decisions else None,
         "last_decision_local_ts_us": int(dataset.decision_local_ts_us[-1]) if dataset.num_decisions else None,
-        "decision_interval_us": dataset.decision_interval_us,
+        "decision_schedule": dict(dataset.decision_schedule),
         "replay_start_event_index": dataset.replay_start_event_index,
         "start_event_index": dataset.start_event_index,
         "transform_config": dict(dataset.transform_config),
@@ -185,7 +194,7 @@ def execution_linear_feature_names() -> tuple[str, ...]:
 def iter_execution_linear_feature_chunks(
     tape: ExecutionTape,
     *,
-    decision_interval_us: int = 500_000,
+    schedule_config: DecisionScheduleConfig | None = None,
     start_event_index: int | None = None,
     max_decisions: int | None = None,
     chunk_rows: int = 100_000,
@@ -193,7 +202,7 @@ def iter_execution_linear_feature_chunks(
     transform_config: TransformConfig | None = None,
 ) -> Iterator[ExecutionLinearFeatureChunk]:
     pipeline_config = FeaturePipelineConfig(
-        decision_stride_us=_require_positive_int(decision_interval_us, "decision_interval_us"),
+        schedule=schedule_config if schedule_config is not None else DecisionScheduleConfig(),
         transform=transform_config if transform_config is not None else TransformConfig(),
     )
     yield from iter_decision_feature_chunks(
@@ -209,17 +218,18 @@ def iter_execution_linear_feature_chunks(
 def build_execution_linear_feature_dataset(
     tape: ExecutionTape,
     *,
-    decision_interval_us: int = 500_000,
+    schedule_config: DecisionScheduleConfig | None = None,
     start_event_index: int | None = None,
     max_decisions: int | None = None,
     output_dtype: str = "float32",
     transform_config: TransformConfig | None = None,
 ) -> ExecutionLinearFeatureDataset:
+    schedule = schedule_config if schedule_config is not None else DecisionScheduleConfig()
     transform = transform_config if transform_config is not None else TransformConfig()
     chunks = list(
         iter_execution_linear_feature_chunks(
             tape,
-            decision_interval_us=decision_interval_us,
+            schedule_config=schedule,
             start_event_index=start_event_index,
             max_decisions=max_decisions,
             chunk_rows=100_000,
@@ -245,7 +255,7 @@ def build_execution_linear_feature_dataset(
         feature_names=names,
         replay_start_event_index=replay_start,
         start_event_index=effective_start_event_index,
-        decision_interval_us=decision_interval_us,
+        decision_schedule=schedule.as_dict(),
         transform_config=transform.as_dict(),
     )
 
@@ -275,6 +285,13 @@ def transform_config_from_train_result(result: LinearTrainResult) -> TransformCo
     if not isinstance(result, LinearTrainResult):
         raise ValueError("result must be LinearTrainResult")
     return transform_config_from_dict(result.transform_config)
+
+
+def schedule_config_from_train_result(result: LinearTrainResult) -> DecisionScheduleConfig:
+    """Rebuild the exact training decision schedule from a linear train result."""
+    if not isinstance(result, LinearTrainResult):
+        raise ValueError("result must be LinearTrainResult")
+    return decision_schedule_config_from_dict(result.decision_schedule)
 
 
 def predict_linear_heads_for_execution_features(
@@ -335,6 +352,11 @@ def build_linear_signal_build_result(
             "feature_dataset transform_config does not match linear_train_result transform_config; "
             "build features with transform_config_from_train_result(linear_train_result)"
         )
+    if not _transform_payloads_equal(feature_dataset.decision_schedule, linear_train_result.decision_schedule):
+        raise ValueError(
+            "feature_dataset decision_schedule does not match linear_train_result decision_schedule; "
+            "build features with schedule_config_from_train_result(linear_train_result)"
+        )
     model_bundle = linear_model_bundle_from_train_result(linear_train_result)
     preprocess_states = linear_preprocess_states_from_train_result(linear_train_result)
     predictions = predict_linear_heads_for_execution_features(
@@ -353,7 +375,7 @@ def build_linear_signal_build_result(
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=feature_dataset.decision_interval_us,
+        decision_schedule=dict(feature_dataset.decision_schedule),
         start_event_index=feature_dataset.start_event_index,
         n_rows=arrays.n_rows,
     )
@@ -373,7 +395,7 @@ def build_linear_signal_build_result(
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=feature_dataset.decision_interval_us,
+        decision_schedule=dict(feature_dataset.decision_schedule),
         start_event_index=feature_dataset.start_event_index,
     )
     return LinearSignalBuildResult(
@@ -446,6 +468,7 @@ __all__ = [
     "build_execution_linear_feature_dataset",
     "LinearSignalBuildResult",
     "transform_config_from_train_result",
+    "schedule_config_from_train_result",
     "predict_linear_heads_for_execution_features",
     "build_linear_signal_build_result",
     "build_linear_signal_artifact_from_execution_features",

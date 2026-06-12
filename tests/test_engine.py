@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import pytest
 
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features import engine as eg
 from mmrt.features import kernels as k
 from mmrt.features.book_state import BOOK_DEPTH, BookSnapshotInput
@@ -65,7 +66,7 @@ def apply_two_books_with_known_l1_changes(eng):
 
 def test_public_api_boundary():
     assert set(eg.__all__) == {
-        "L2_EVENT_CODE", "TRADE_EVENT_CODE", "DECISION_STRIDE_US", "ENGINE_EVENT_WINDOWS_US", "DEFAULT_EVENT_HISTORY_CAPACITY",
+        "L2_EVENT_CODE", "TRADE_EVENT_CODE", "ENGINE_EVENT_WINDOWS_US", "DEFAULT_EVENT_HISTORY_CAPACITY",
         "CROSS_FEATURE_INDICES", "CROSS_FEATURE_NAMES", "EVENT_CONTEXT_FEATURE_INDICES", "EVENT_CONTEXT_FEATURE_NAMES",
         "ENGINE_FEATURE_INDICES", "ENGINE_FEATURE_NAMES", "FeatureEngineConfig", "EngineDecision", "EventHistory", "FeatureEngine",
         "cross_feature_names", "cross_feature_indices", "event_context_feature_names", "event_context_feature_indices",
@@ -131,13 +132,13 @@ if bad:
 
 
 def test_config_validation():
-    assert eg.FeatureEngineConfig().decision_stride_us == 500_000
+    assert eg.FeatureEngineConfig().schedule == DecisionScheduleConfig()
     with pytest.raises(ValueError):
-        eg.FeatureEngineConfig(decision_stride_us=0)
+        eg.FeatureEngineConfig(schedule=0)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         eg.FeatureEngineConfig(event_history_capacity=0)
-    with pytest.raises(TypeError):
-        eg.FeatureEngineConfig(decision_stride_us=True)
+    with pytest.raises(ValueError):
+        eg.FeatureEngineConfig(schedule=True)  # type: ignore[arg-type]
     with pytest.raises((TypeError, ValueError)):
         eg.FeatureEngineConfig(event_history_capacity=True)
 
@@ -240,12 +241,12 @@ def test_long_gap_emits_at_most_one_decision():
     c = e.decision_count
     assert e.on_book_snapshot(make_snapshot(4_000_000)) is not None
     assert e.decision_count == c + 1
-    assert e.next_decision_local_ts_us > 4_000_000
+    assert e.schedule.last_decision_local_ts_us == 4_000_000
 
 
 
 def test_emitted_decision_carries_decision_time_raw_mid():
-    e = eg.FeatureEngine(config=eg.FeatureEngineConfig(decision_stride_us=100_000))
+    e = eg.FeatureEngine(config=eg.FeatureEngineConfig(schedule=DecisionScheduleConfig(min_decision_interval_us=100_000, max_decision_interval_us=100_000)))
     e.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
 
     snap1 = make_snapshot(2_000_000, mid=100.0)
@@ -266,7 +267,7 @@ def test_emitted_decision_carries_decision_time_raw_mid():
 
 
 def test_runner_handoff_payload_uses_decision_raw_mid_without_book_lookup():
-    e = eg.FeatureEngine(config=eg.FeatureEngineConfig(decision_stride_us=100_000))
+    e = eg.FeatureEngine(config=eg.FeatureEngineConfig(schedule=DecisionScheduleConfig(min_decision_interval_us=100_000, max_decision_interval_us=100_000)))
     e.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
     d = e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
     assert d is not None

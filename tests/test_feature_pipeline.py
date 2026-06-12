@@ -3,6 +3,7 @@ import pytest
 
 from mmrt.features.book_state import BOOK_DEPTH, BookSnapshotInput
 from mmrt.features.engine import FeatureEngine, FeatureEngineConfig
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features.pipeline import (
     DecisionFeaturePipeline,
     FeaturePipelineConfig,
@@ -32,6 +33,10 @@ def _snapshot(local_ts_us: int, *, mid: float = 100.0, event_seq: int = -1) -> B
     )
 
 
+def _fixed_schedule(stride_us: int) -> DecisionScheduleConfig:
+    return DecisionScheduleConfig(min_decision_interval_us=stride_us, max_decision_interval_us=stride_us)
+
+
 def _trade(local_ts_us: int, *, side_code: int = 1) -> TradeInput:
     return TradeInput(local_ts_us=local_ts_us, ts_us=local_ts_us, price=100.0, amount=0.25, side_code=side_code, event_seq=-1)
 
@@ -52,10 +57,11 @@ def _drive(consumer_on_trade, consumer_on_snapshot, *, n_decisions: int, stride_
 
 def test_pipeline_config_validation():
     with pytest.raises(ValueError):
-        FeaturePipelineConfig(decision_stride_us=0)
+        FeaturePipelineConfig(schedule=0)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         FeaturePipelineConfig(transform=None)  # type: ignore[arg-type]
     cfg = FeaturePipelineConfig()
+    assert cfg.schedule_identity() == DecisionScheduleConfig().as_dict()
     identity = cfg.transform_identity()
     assert identity["feature_names_hash"] == FEATURE_NAMES_HASH
     assert identity["feature_specs_hash"] == FEATURE_SPECS_HASH
@@ -63,8 +69,8 @@ def test_pipeline_config_validation():
 
 def test_pipeline_output_equals_engine_plus_transformer():
     stride = 500_000
-    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(decision_stride_us=stride))
-    engine = FeatureEngine(FeatureEngineConfig(decision_stride_us=stride))
+    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_fixed_schedule(stride)))
+    engine = FeatureEngine(FeatureEngineConfig(schedule=_fixed_schedule(stride)))
     transformer = CausalFeatureTransformer(TransformConfig())
 
     manual: list[np.ndarray] = []
@@ -88,8 +94,8 @@ def test_pipeline_output_equals_engine_plus_transformer():
 
 def test_pipeline_output_is_transformed_not_raw_engine_output():
     stride = 500_000
-    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(decision_stride_us=stride))
-    raw_engine = FeatureEngine(FeatureEngineConfig(decision_stride_us=stride))
+    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_fixed_schedule(stride)))
+    raw_engine = FeatureEngine(FeatureEngineConfig(schedule=_fixed_schedule(stride)))
     raw_vectors: list[np.ndarray] = []
 
     def raw_on_snapshot(snapshot):
@@ -111,7 +117,7 @@ def test_pipeline_output_is_transformed_not_raw_engine_output():
 
 def test_pipeline_reset_restarts_transform_state():
     stride = 500_000
-    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(decision_stride_us=stride))
+    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_fixed_schedule(stride)))
     first = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=25, stride_us=stride)
     pipeline.reset()
     second = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=25, stride_us=stride)
@@ -122,7 +128,7 @@ def test_pipeline_reset_restarts_transform_state():
 
 def test_pipeline_transform_diagnostics_count_decisions():
     stride = 500_000
-    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(decision_stride_us=stride))
+    pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_fixed_schedule(stride)))
     decisions = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=25, stride_us=stride)
     diag = pipeline.transform_diagnostics_snapshot()
     assert diag.rows_seen == len(decisions) > 0

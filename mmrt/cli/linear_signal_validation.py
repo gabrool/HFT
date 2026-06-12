@@ -15,11 +15,15 @@ def validate_linear_signals_for_execution_tape(
     *,
     linear_signals: LinearSignalArtifact,
     tape: ExecutionTape,
-    decision_interval_us: int,
     requested_start_event_index: int | None,
     min_rows: int | None,
 ) -> LinearSignalStart:
-    """Validate artifact identity separately from the requested run start row."""
+    """Validate artifact identity separately from the requested run start row.
+
+    The artifact's own decision schedule is the source of truth for decision
+    timing; metadata construction re-parses it so only schedules reproducible
+    by the current code are accepted.
+    """
 
     validate_linear_signal_artifact_metadata(
         linear_signals,
@@ -31,7 +35,7 @@ def validate_linear_signals_for_execution_tape(
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=decision_interval_us,
+        decision_schedule=linear_signals.metadata.decision_schedule,
         start_event_index=linear_signals.metadata.start_event_index,
         min_rows=None,
     )

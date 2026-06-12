@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.execution.contracts import LinearSignal
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -28,6 +29,10 @@ from mmrt.execution.linear_signal import (
     validate_linear_signal_artifact_metadata,
     validate_linear_signal_start_event_index,
 )
+
+
+def _fixed_schedule_payload(stride_us: int) -> dict:
+    return DecisionScheduleConfig(min_decision_interval_us=stride_us, max_decision_interval_us=stride_us).as_dict()
 
 
 def _prediction_dict():
@@ -56,7 +61,7 @@ def _artifact(n_rows: int) -> LinearSignalArtifact:
         num_trades=1,
         start_local_ts_us=100,
         end_local_ts_us=200,
-        decision_interval_us=50,
+        decision_schedule=_fixed_schedule_payload(50),
         start_event_index=0,
         n_rows=n_rows,
     )
@@ -86,7 +91,7 @@ def _linear_artifact_with_decision_event_index(indices: list[int]) -> LinearSign
         num_trades=0,
         start_local_ts_us=100,
         end_local_ts_us=100 + 100 * (n_rows - 1),
-        decision_interval_us=100,
+        decision_schedule=_fixed_schedule_payload(100),
         start_event_index=indices[0],
         n_rows=n_rows,
     )
@@ -329,7 +334,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
         num_trades=1,
         start_local_ts_us=100,
         end_local_ts_us=200,
-        decision_interval_us=50,
+        decision_schedule=_fixed_schedule_payload(50),
         start_event_index=0,
         min_rows=2,
     )
@@ -344,7 +349,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
             num_trades=1,
             start_local_ts_us=100,
             end_local_ts_us=200,
-            decision_interval_us=50,
+            decision_schedule=_fixed_schedule_payload(50),
             start_event_index=0,
         )
     with pytest.raises(ValueError, match="linear signal metadata mismatch"):
@@ -358,7 +363,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
             num_trades=1,
             start_local_ts_us=100,
             end_local_ts_us=200,
-            decision_interval_us=100,
+            decision_schedule=_fixed_schedule_payload(100),
             start_event_index=0,
         )
 

@@ -14,7 +14,6 @@ def test_validate_linear_signals_for_execution_tape_accepts_later_start():
     linear_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
-        decision_interval_us=50,
         requested_start_event_index=1,
         min_rows=2,
     )
@@ -36,7 +35,6 @@ def test_validate_linear_signals_for_execution_tape_rejects_non_grid_start():
         validate_linear_signals_for_execution_tape(
             linear_signals=linear_signals,
             tape=tape,
-            decision_interval_us=50,
             requested_start_event_index=2,
             min_rows=None,
         )
@@ -53,7 +51,6 @@ def test_validate_linear_signals_for_execution_tape_checks_remaining_rows_after_
         validate_linear_signals_for_execution_tape(
             linear_signals=linear_signals,
             tape=tape,
-            decision_interval_us=50,
             requested_start_event_index=2,
             min_rows=2,
         )

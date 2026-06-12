@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from mmrt.config import PipelineConfig, default_config
 from mmrt.contracts import AsOfPolicy, LabelSpec, PriceReference, SplitRole, StorageFormat, TimeRangeUS, TimeUnit
 from mmrt.features import specs
+from mmrt.features.schedule import decision_schedule_config_from_dict
 
 STORAGE_MANIFEST_SCHEMA = "mmrt_storage_manifest"
 DEFAULT_MANIFEST_FILENAME = "manifest.json"
@@ -184,7 +185,7 @@ def pipeline_config_to_manifest_dict(config: PipelineConfig) -> dict[str, Any]:
         "source_data_types": [d.value for d in config.data.source_data_types],
         "decision_policy": config.decision.policy,
         "decision_reason": config.decision.reason.value,
-        "decision_stride_us": config.decision.stride_us,
+        "decision_schedule": config.decision.schedule.as_dict(),
         "horizons_us": list(config.labels.horizons_us),
         "entry_delay_us": config.labels.entry_delay_us,
         "price_reference": config.labels.price_reference.value,
@@ -350,7 +351,7 @@ class StorageManifest:
     symbol: str
     storage_format: StorageFormat
     time_unit: TimeUnit
-    decision_stride_us: int
+    decision_schedule: dict[str, Any]
     feature_columns: tuple[str, ...]
     label_columns: tuple[str, ...]
     required_columns: tuple[str, ...]
@@ -366,8 +367,8 @@ class StorageManifest:
             raise ValueError("pipeline_config time_unit drift")
         if "storage_format" in pc and pc["storage_format"] != StorageFormat.FLAT_DECISION_ROWS_US.value:
             raise ValueError("pipeline_config storage_format drift")
-        if "decision_stride_us" in pc and pc["decision_stride_us"] != self.decision_stride_us:
-            raise ValueError("pipeline_config decision_stride_us drift")
+        if "decision_schedule" in pc and pc["decision_schedule"] != self.decision_schedule:
+            raise ValueError("pipeline_config decision_schedule drift")
         if "exchange" in pc and pc["exchange"] != self.exchange:
             raise ValueError("pipeline_config exchange drift")
         if "symbol" in pc and pc["symbol"] != self.symbol:
@@ -396,8 +397,8 @@ class StorageManifest:
             raise ValueError("storage/time/stride invalid")
         if self.time_unit != TimeUnit.MICROSECOND:
             raise ValueError("storage/time/stride invalid")
-        if _require_positive_int(self.decision_stride_us, "decision_stride_us") != 500_000:
-            raise ValueError("storage/time/stride invalid")
+        object.__setattr__(self, "decision_schedule", _json_safe(dict(_require_mapping(self.decision_schedule, "decision_schedule")), "decision_schedule"))
+        decision_schedule_config_from_dict(self.decision_schedule)
         self._validate_pipeline_config_consistency()
 
         feature_cols = tuple(self.feature_columns)
@@ -490,7 +491,7 @@ class StorageManifest:
             "symbol": self.symbol,
             "storage_format": self.storage_format.value,
             "time_unit": self.time_unit.value,
-            "decision_stride_us": self.decision_stride_us,
+            "decision_schedule": self.decision_schedule,
             "feature_columns": list(self.feature_columns),
             "label_columns": list(self.label_columns),
             "required_columns": list(self.required_columns),
@@ -518,7 +519,7 @@ class StorageManifest:
                 "symbol",
                 "storage_format",
                 "time_unit",
-                "decision_stride_us",
+                "decision_schedule",
                 "feature_columns",
                 "label_columns",
                 "required_columns",
@@ -540,7 +541,7 @@ class StorageManifest:
             _required(m, "symbol", "manifest"),
             _required(m, "storage_format", "manifest"),
             _required(m, "time_unit", "manifest"),
-            _required(m, "decision_stride_us", "manifest"),
+            dict(_required(m, "decision_schedule", "manifest")),
             tuple(_required(m, "feature_columns", "manifest")),
             tuple(_required(m, "label_columns", "manifest")),
             tuple(_required(m, "required_columns", "manifest")),
@@ -575,8 +576,7 @@ class StorageManifest:
             raise ValueError("time_unit drift")
         if self.storage_format != StorageFormat.FLAT_DECISION_ROWS_US:
             raise ValueError("storage_format drift")
-        if self.decision_stride_us != 500_000:
-            raise ValueError("decision_stride_us drift")
+        decision_schedule_config_from_dict(self.decision_schedule)
 
 
 def make_manifest(
@@ -605,7 +605,7 @@ def make_manifest(
         cfg.market.symbol,
         cfg.storage.storage_format,
         cfg.storage.time_unit,
-        cfg.decision.stride_us,
+        cfg.decision.schedule.as_dict(),
         feature_columns(),
         label_columns(cfg.label_spec),
         required_row_columns(cfg.label_spec),

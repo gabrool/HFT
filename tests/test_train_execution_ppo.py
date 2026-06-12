@@ -58,7 +58,6 @@ def test_train_execution_ppo_accepts_explicit_later_linear_signal_start():
     linear_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
-        decision_interval_us=config.decision_interval_us,
         requested_start_event_index=config.start_event_index,
         min_rows=(config.max_episode_steps + 1),
     )

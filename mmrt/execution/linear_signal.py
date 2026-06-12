@@ -11,6 +11,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from mmrt.execution.contracts import LinearSignal
+from mmrt.features.schedule import decision_schedule_config_from_dict
 
 MAGNITUDE_INPUT_LOG1P_BPS = "log1p_bps"
 MAGNITUDE_INPUT_BPS = "bps"
@@ -296,7 +297,7 @@ class LinearSignalArtifactMetadata:
     num_trades: int
     start_local_ts_us: int
     end_local_ts_us: int
-    decision_interval_us: int
+    decision_schedule: dict[str, object]
     start_event_index: int
     n_rows: int
 
@@ -312,9 +313,17 @@ class LinearSignalArtifactMetadata:
         object.__setattr__(self, "end_local_ts_us", _require_positive_int(self.end_local_ts_us, "end_local_ts_us"))
         if self.end_local_ts_us < self.start_local_ts_us:
             raise ValueError("end_local_ts_us must be >= start_local_ts_us")
-        object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
+        if not isinstance(self.decision_schedule, Mapping):
+            raise ValueError("decision_schedule must be a mapping")
+        schedule_payload = dict(self.decision_schedule)
+        decision_schedule_config_from_dict(schedule_payload)
+        object.__setattr__(self, "decision_schedule", schedule_payload)
         object.__setattr__(self, "start_event_index", _require_nonnegative_int(self.start_event_index, "start_event_index"))
         object.__setattr__(self, "n_rows", _require_positive_int(self.n_rows, "n_rows"))
+
+    @property
+    def max_decision_interval_us(self) -> int:
+        return int(self.decision_schedule["max_decision_interval_us"])
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -326,7 +335,7 @@ class LinearSignalArtifactMetadata:
             "num_trades": self.num_trades,
             "start_local_ts_us": self.start_local_ts_us,
             "end_local_ts_us": self.end_local_ts_us,
-            "decision_interval_us": self.decision_interval_us,
+            "decision_schedule": dict(self.decision_schedule),
             "start_event_index": self.start_event_index,
             "n_rows": self.n_rows,
         }
@@ -344,7 +353,7 @@ class LinearSignalArtifactMetadata:
             "num_trades",
             "start_local_ts_us",
             "end_local_ts_us",
-            "decision_interval_us",
+            "decision_schedule",
             "start_event_index",
             "n_rows",
         )
@@ -541,7 +550,7 @@ def validate_linear_signal_artifact_metadata(
     num_trades: int,
     start_local_ts_us: int,
     end_local_ts_us: int,
-    decision_interval_us: int,
+    decision_schedule: Mapping[str, object],
     start_event_index: int,
     min_rows: int | None = None,
 ) -> None:
@@ -556,7 +565,7 @@ def validate_linear_signal_artifact_metadata(
         num_trades=num_trades,
         start_local_ts_us=start_local_ts_us,
         end_local_ts_us=end_local_ts_us,
-        decision_interval_us=decision_interval_us,
+        decision_schedule=dict(decision_schedule),
         start_event_index=start_event_index,
         n_rows=artifact.metadata.n_rows,
     )

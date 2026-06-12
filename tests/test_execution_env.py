@@ -5,6 +5,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import (
     ActionSpec,
@@ -42,6 +43,10 @@ from mmrt.execution.queue_model import QueueModelConfig, QueueModelMode
 from mmrt.execution.quote_geometry import QuoteAction, QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
+
+
+def _fixed_schedule_payload(stride_us: int) -> dict:
+    return DecisionScheduleConfig(min_decision_interval_us=stride_us, max_decision_interval_us=stride_us).as_dict()
 
 
 def _rules():
@@ -135,7 +140,6 @@ def _tape(l2_events, trades):
 
 def _env_config(**kwargs) -> ExecutionEnvConfig:
     base = dict(
-        decision_interval_us=100,
         action_spec=ActionSpec(max_distance_ticks=1, max_order_qty=1.0),
         quote_geometry_config=QuoteGeometryConfig(
             post_only_gap_ticks=1,
@@ -193,7 +197,7 @@ def _linear_signals(tape, n_rows: int = 16, *, start_event_index: int = 0) -> Li
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=100,
+        decision_schedule=_fixed_schedule_payload(100),
         start_event_index=start_event_index,
         n_rows=n_rows,
     )
@@ -216,7 +220,7 @@ def _linear_signals_for_decisions(tape, decision_event_index, decision_local_ts_
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_interval_us=100,
+        decision_schedule=_fixed_schedule_payload(100),
         start_event_index=int(decision_event_index[0]),
         n_rows=len(decision_event_index),
     )
@@ -262,17 +266,21 @@ def _disabled_action() -> QuoteAction:
 
 
 def test_action_array_to_continuous_action():
-    action = action_array_to_continuous_action(np.array([1, -1, 0, 0, 2, -2], dtype=np.float32))
+    action = action_array_to_continuous_action(np.array([1, -1, 1, 0, 0, 0, 2, -2], dtype=np.float32))
 
     assert isinstance(action, QuoteAction)
     assert action.bid_enabled is True
     assert action.ask_enabled is False
+    assert action.bid_cancel_guard_enabled is True
+    assert action.ask_cancel_guard_enabled is False
+    assert action.bid_size_raw == 2.0
+    assert action.ask_size_raw == -2.0
 
     with pytest.raises(ValueError):
         action_array_to_continuous_action([1.0, 2.0])
 
     with pytest.raises(ValueError):
-        action_array_to_continuous_action([1.0, 2.0, 3.0, 4.0, 5.0, float("nan")])
+        action_array_to_continuous_action([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, float("nan")])
 
 
 def test_reset_returns_initial_observation():
@@ -410,7 +418,7 @@ def test_repeated_decision_cancels_previous_live_order():
         _l2(seq=2, local_ts_us=300),
     ]
     tape = _tape(l2_events, [])
-    env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=_env_config(decision_interval_us=50))
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=_env_config())
     env.reset()
 
     first = env.step(_bid_only_action())
@@ -658,7 +666,6 @@ def test_order_activation_between_events_can_fill_next_trade():
         tape,
         linear_signals=_linear_signals_for_decisions(tape, [0, 2], [100, 300]),
         config=_env_config(
-            decision_interval_us=300,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=20,
@@ -688,7 +695,6 @@ def test_cancel_between_events_blocks_next_trade():
         tape,
         linear_signals=_linear_signals_for_decisions(tape, [0, 1, 3], [100, 200, 300]),
         config=_env_config(
-            decision_interval_us=50,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=0,
@@ -742,7 +748,6 @@ def test_pending_order_queue_ahead_is_refreshed_at_activation():
         tape,
         linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
         config=_env_config(
-            decision_interval_us=300,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=80,
@@ -791,7 +796,6 @@ def test_activation_at_exact_event_key_does_not_fill_on_that_event():
         tape,
         linear_signals=_linear_signals_for_decisions(tape, [0, 4], [100, 180]),
         config=_env_config(
-            decision_interval_us=200,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=50,
@@ -822,7 +826,6 @@ def test_cancel_exact_event_key_blocks_fill_on_that_event():
         tape,
         linear_signals=_linear_signals(tape),
         config=_env_config(
-            decision_interval_us=50,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=0,
@@ -853,7 +856,6 @@ def test_repeated_same_quote_before_activation_preserves_pending_new_order():
         tape,
         linear_signals=_linear_signals(tape),
         config=_env_config(
-            decision_interval_us=25,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=300,
@@ -932,7 +934,6 @@ def test_trade_before_activation_does_not_dedupe_later_l2_decrease():
         tape,
         linear_signals=_linear_signals_for_decisions(tape, [0, 4], [100, 300]),
         config=_env_config(
-            decision_interval_us=300,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=80,  # activation target = 180
@@ -1069,7 +1070,6 @@ def test_same_side_replacement_after_cancel_does_not_fill_later_same_timestamp_e
         tape,
         linear_signals=_linear_signals_for_decisions(tape, [0, 1, 2, 4], [100, 200, 500, 600]),
         config=_env_config(
-            decision_interval_us=100,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=20,
@@ -1112,7 +1112,6 @@ def test_same_side_replacement_does_not_overlap_when_entry_latency_shorter_than_
         tape,
         linear_signals=_linear_signals(tape),
         config=_env_config(
-            decision_interval_us=50,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=20,
@@ -1188,7 +1187,6 @@ def test_l2_decrease_for_pending_new_only_level_not_counted_in_diagnostics():
         tape,
         linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
         config=_env_config(
-            decision_interval_us=300,
             latency_config=LatencyConfig(
                 decision_compute_latency_us=0,
                 order_entry_latency_us=120,
@@ -1350,7 +1348,7 @@ def test_step_advances_to_next_linear_signal_event_not_time_boundary_trade():
     ]
     tape = _tape(l2_events, trades)
     linear = _linear_signals_for_decisions(tape, [0, 3], [100, 151])
-    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config(decision_interval_us=50))
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
     env.reset()
 
     step = env.step(_disabled_action())
@@ -1375,7 +1373,7 @@ def test_step_replays_all_events_through_target_signal_event():
     ]
     tape = _tape(l2_events, trades)
     linear = _linear_signals_for_decisions(tape, [0, 2], [100, 151])
-    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config(decision_interval_us=50))
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
     env.reset()
 
     step = env.step(_bid_only_action())
@@ -1401,7 +1399,7 @@ def test_max_episode_steps_truncates_after_full_signal_interval():
     env = ExecutionEnv(
         tape,
         linear_signals=linear,
-        config=_env_config(decision_interval_us=50, max_episode_steps=1),
+        config=_env_config(max_episode_steps=1),
     )
     env.reset()
 
@@ -1423,7 +1421,7 @@ def test_step_rejects_next_linear_signal_row_that_is_not_l2_event():
     ]
     tape = _tape(l2_events, trades)
     linear = _linear_signals_for_decisions(tape, [0, 1], [100, 120])
-    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config(decision_interval_us=50))
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
     env.reset()
 
     with pytest.raises(ValueError, match="target event must reference an L2"):
@@ -1446,3 +1444,101 @@ def test_env_reset_accepts_later_linear_signal_start_row():
 
     assert reset.info["event_index"] == 1
     assert reset.info["signal_row_index"] == 1
+
+
+def _bid_with_guard_action() -> QuoteAction:
+    return QuoteAction(
+        bid_enabled=True,
+        ask_enabled=False,
+        bid_price_raw=0.0,
+        ask_price_raw=0.0,
+        bid_size_raw=100.0,
+        ask_size_raw=0.0,
+        bid_cancel_guard_enabled=True,
+    )
+
+
+def _guard_tape():
+    # Decision at ts=100 (mid tick 1001); the book drops 5 mid ticks at ts=200;
+    # a sell trades through the resting bid at ts=250; next decision event ts=300.
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=200, bid_ticks=(995, 994), ask_ticks=(997, 998)),
+        _l2(seq=2, local_ts_us=300, bid_ticks=(995, 994), ask_ticks=(997, 998)),
+    ]
+    trades = [
+        _trade(local_ts_us=250, side=AggressorSide.SELL, price_tick=994, amount=10.0, source_row=0),
+    ]
+    return _tape(l2_events, trades)
+
+
+def test_cancel_guard_pulls_bid_before_adverse_trade():
+    tape = _guard_tape()
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
+        config=_env_config(cancel_guard_ticks=2),
+    )
+    env.reset()
+
+    step = env.step(_bid_with_guard_action())
+
+    assert step.fills == ()
+    assert step.info["guard_cancel_request_count"] == 1
+    assert step.info["cancel_request_count"] == 1
+    assert step.info["bid_cancel_guard_enabled"] is True
+    assert step.info["cancel_guard_ticks"] == 2
+
+
+def test_without_cancel_guard_adverse_trade_fills_resting_bid():
+    tape = _guard_tape()
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
+        config=_env_config(cancel_guard_ticks=2),
+    )
+    env.reset()
+
+    step = env.step(_bid_only_action())
+
+    assert len(step.fills) == 1
+    assert step.info["guard_cancel_request_count"] == 0
+
+
+def test_cancel_guard_respects_cancel_latency():
+    tape = _guard_tape()
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
+        config=_env_config(
+            cancel_guard_ticks=2,
+            latency_config=LatencyConfig(
+                decision_compute_latency_us=0,
+                order_entry_latency_us=0,
+                cancel_latency_us=100,
+            ),
+        ),
+    )
+    env.reset()
+
+    # Guard fires at ts=200 but the cancel lands at ts=300, after the ts=250
+    # trade, so the resting bid is still hit.
+    step = env.step(_bid_with_guard_action())
+
+    assert len(step.fills) == 1
+    assert step.info["guard_cancel_request_count"] == 1
+
+
+def test_cancel_guard_does_not_fire_below_threshold():
+    tape = _guard_tape()
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals_for_decisions(tape, [0, 3], [100, 300]),
+        config=_env_config(cancel_guard_ticks=10),
+    )
+    env.reset()
+
+    step = env.step(_bid_with_guard_action())
+
+    assert len(step.fills) == 1
+    assert step.info["guard_cancel_request_count"] == 0

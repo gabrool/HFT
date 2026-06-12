@@ -59,7 +59,7 @@ def make_dataset(tmp_path, *, rows=5, chunk_rows=2, splits=(), row_fn=row):
             m0.symbol,
             m0.storage_format,
             m0.time_unit,
-            m0.decision_stride_us,
+            m0.decision_schedule,
             m0.feature_columns,
             m0.label_columns,
             m0.required_columns,
@@ -303,7 +303,7 @@ def test_split_entries_and_read_split_table(tmp_path):
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -322,7 +322,7 @@ def test_iter_split_batches(tmp_path):
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -359,7 +359,7 @@ def test_read_split_table_filters_with_internal_row_idx_projection(tmp_path):
         m.symbol,
         m.storage_format,
         m.time_unit,
-        m.decision_stride_us,
+        m.decision_schedule,
         m.feature_columns,
         m.label_columns,
         m.required_columns,
@@ -401,7 +401,7 @@ def test_iter_split_batches_without_row_idx_projection(tmp_path):
         m.symbol,
         m.storage_format,
         m.time_unit,
-        m.decision_stride_us,
+        m.decision_schedule,
         m.feature_columns,
         m.label_columns,
         m.required_columns,
@@ -463,7 +463,7 @@ def test_iter_split_batches_does_not_materialize_split_table(tmp_path, monkeypat
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -479,7 +479,7 @@ def test_iter_split_batches_does_not_call_read_segment_table(tmp_path, monkeypat
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -494,7 +494,7 @@ def test_iter_split_batches_filters_by_row_idx_without_returning_internal_row_id
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -513,7 +513,7 @@ def test_iter_split_batches_returns_row_idx_when_requested(tmp_path):
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -527,7 +527,7 @@ def test_iter_split_batches_preserves_requested_column_order(tmp_path):
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -546,7 +546,7 @@ def test_iter_split_batches_preserves_multiple_split_entry_order(tmp_path):
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))
@@ -560,7 +560,7 @@ def test_iter_split_batches_honors_batch_size(tmp_path):
     m2 = mf.StorageManifest(
         m.schema, m.dataset_id, m.created_at_utc, m.pipeline_config, m.writer_metadata, m.feature_schema,
         m.label_spec, m.transform_config, m.transform_diagnostics, m.exchange, m.symbol, m.storage_format,
-        m.time_unit, m.decision_stride_us, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
+        m.time_unit, m.decision_schedule, m.feature_columns, m.label_columns, m.required_columns, m.segments, splits, m.notes
     )
     mf.write_manifest_json(m2, root / mf.DEFAULT_MANIFEST_FILENAME)
     r = rd.open_dataset(str(root))

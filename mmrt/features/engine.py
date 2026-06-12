@@ -6,7 +6,7 @@ It consumes already-normalized event objects and does not parse market data,
 build labels, apply transforms, or write storage artifacts.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 import numpy as np
@@ -14,6 +14,7 @@ import numpy as np
 from mmrt.contracts import DecisionReason
 from mmrt.features import kernels as k
 from mmrt.features.book_state import BookSnapshotInput, BookState, BookSummary
+from mmrt.features.schedule import DecisionSchedule, DecisionScheduleConfig
 from mmrt.features.trade_state import (
     BUY_SIDE_CODE,
     SELL_SIDE_CODE,
@@ -33,8 +34,6 @@ from mmrt.features.specs import (
 
 L2_EVENT_CODE = 1
 TRADE_EVENT_CODE = 2
-
-DECISION_STRIDE_US = 500_000
 
 WINDOW_200MS_US = 200_000
 WINDOW_500MS_US = 500_000
@@ -134,11 +133,12 @@ def _safe_bps_change(new_value: float, old_value: float) -> float:
 
 @dataclass(frozen=True, slots=True)
 class FeatureEngineConfig:
-    decision_stride_us: int = DECISION_STRIDE_US
+    schedule: DecisionScheduleConfig = field(default_factory=DecisionScheduleConfig)
     event_history_capacity: int = DEFAULT_EVENT_HISTORY_CAPACITY
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "decision_stride_us", _require_int(self.decision_stride_us, "decision_stride_us", positive=True))
+        if not isinstance(self.schedule, DecisionScheduleConfig):
+            raise ValueError("schedule must be DecisionScheduleConfig")
         object.__setattr__(self, "event_history_capacity", _require_positive_capacity(self.event_history_capacity, "event_history_capacity"))
 
 
@@ -233,14 +233,15 @@ class FeatureEngine:
         self.book_state = BookState()
         self.trade_state = TradeState()
         self.event_history = EventHistory(self.config.event_history_capacity)
+        self.schedule = DecisionSchedule(self.config.schedule)
         self.reset()
 
     def reset(self) -> None:
         self.book_state.reset(); self.trade_state.reset(); self.event_history.reset()
+        self.schedule.reset()
         self.decision_count = 0
         self.last_event_local_ts_us = None
         self.last_decision_local_ts_us = None
-        self.next_decision_local_ts_us = None
 
     def has_book(self) -> bool: return self.book_state.has_book()
     def has_trades(self) -> bool: return self.trade_state.has_trades()
@@ -251,6 +252,7 @@ class FeatureEngine:
         self._validate_event_time(trade.local_ts_us)
         self.event_history.append(trade.local_ts_us, TRADE_EVENT_CODE)
         self.trade_state.apply_trade(trade)
+        self.schedule.observe_trade(trade.local_ts_us)
         self.last_event_local_ts_us = trade.local_ts_us
         return None
 
@@ -260,14 +262,19 @@ class FeatureEngine:
         self.event_history.append(snapshot.local_ts_us, L2_EVENT_CODE)
         self.book_state.apply_snapshot(snapshot)
         self.last_event_local_ts_us = snapshot.local_ts_us
+        summary = self.book_state.current_summary()
+        self.schedule.observe_book(
+            snapshot.local_ts_us,
+            best_bid=summary.best_bid,
+            best_ask=summary.best_ask,
+            bid_l1_size=summary.bid_size_1,
+            ask_l1_size=summary.ask_size_1,
+        )
         if not self.is_ready(): return None
-        if self.next_decision_local_ts_us is None:
-            self.next_decision_local_ts_us = snapshot.local_ts_us
-        if snapshot.local_ts_us < self.next_decision_local_ts_us:
+        if not self.schedule.should_fire(snapshot.local_ts_us):
             return None
         decision = self._emit_decision(snapshot.local_ts_us, snapshot.ts_us, snapshot.event_seq)
-        while self.next_decision_local_ts_us <= snapshot.local_ts_us:
-            self.next_decision_local_ts_us += self.config.decision_stride_us
+        self.schedule.mark_decision(snapshot.local_ts_us)
         return decision
 
     def _validate_event_time(self, local_ts_us: int) -> None:
@@ -280,7 +287,7 @@ class FeatureEngine:
         summary = self.book_state.current_summary()
         raw_mid = summary.mid
         fv = self._build_feature_vector_for_decision(local_ts_us, prev)
-        d = EngineDecision(self.decision_count, local_ts_us, ts_us, event_seq, raw_mid, fv, DecisionReason.BOOK_STRIDE.value)
+        d = EngineDecision(self.decision_count, local_ts_us, ts_us, event_seq, raw_mid, fv, DecisionReason.EVENT_SCHEDULE.value)
         self.decision_count += 1
         self.last_decision_local_ts_us = local_ts_us
         return d
@@ -453,7 +460,7 @@ def engine_owned_feature_indices() -> tuple[int, ...]: return ENGINE_FEATURE_IND
 
 
 __all__ = [
-    "L2_EVENT_CODE", "TRADE_EVENT_CODE", "DECISION_STRIDE_US", "ENGINE_EVENT_WINDOWS_US", "DEFAULT_EVENT_HISTORY_CAPACITY",
+    "L2_EVENT_CODE", "TRADE_EVENT_CODE", "ENGINE_EVENT_WINDOWS_US", "DEFAULT_EVENT_HISTORY_CAPACITY",
     "CROSS_FEATURE_INDICES", "CROSS_FEATURE_NAMES", "EVENT_CONTEXT_FEATURE_INDICES", "EVENT_CONTEXT_FEATURE_NAMES",
     "ENGINE_FEATURE_INDICES", "ENGINE_FEATURE_NAMES", "FeatureEngineConfig", "EngineDecision", "EventHistory", "FeatureEngine",
     "cross_feature_names", "cross_feature_indices", "event_context_feature_names", "event_context_feature_indices",
