@@ -203,17 +203,28 @@ def _trade_input_from_tape_row(tape: ExecutionTape, *, event_row: np.void) -> Tr
     )
 
 
-def build_execution_linear_feature_dataset(
+
+@dataclass(frozen=True, slots=True)
+class ExecutionLinearFeatureChunk:
+    decision_event_index: np.ndarray
+    decision_local_ts_us: np.ndarray
+    features: np.ndarray
+    feature_names: tuple[str, ...]
+
+
+def iter_execution_linear_feature_chunks(
     tape: ExecutionTape,
     *,
     decision_interval_us: int = 500_000,
     start_event_index: int | None = None,
     max_decisions: int | None = None,
+    chunk_rows: int = 100_000,
     output_dtype: str = "float32",
-) -> ExecutionLinearFeatureDataset:
+):
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
     decision_interval_us = _require_positive_int(decision_interval_us, "decision_interval_us")
+    chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
     dtype = np.dtype(_require_output_dtype(output_dtype))
     events = tape.arrays.events
     start = 0 if start_event_index is None else _require_nonnegative_int(start_event_index, "start_event_index")
@@ -221,12 +232,12 @@ def build_execution_linear_feature_dataset(
         raise ValueError("start_event_index must be < len(events)")
     if max_decisions is not None:
         max_decisions = _require_positive_int(max_decisions, "max_decisions")
-
     engine = FeatureEngine(FeatureEngineConfig(decision_stride_us=decision_interval_us))
-    decision_event_index: list[int] = []
-    decision_local_ts_us: list[int] = []
-    feature_rows: list[np.ndarray] = []
-
+    names = execution_linear_feature_names()
+    idx_buf: list[int] = []
+    ts_buf: list[int] = []
+    feat_buf: list[np.ndarray] = []
+    emitted = 0
     for event_idx in range(start, len(events)):
         event_row = events[event_idx]
         code = int(event_row["event_type_code"])
@@ -235,29 +246,42 @@ def build_execution_linear_feature_dataset(
         elif code == EVENT_TYPE_CODE_L2_BATCH:
             decision = engine.on_book_snapshot(_book_snapshot_input_from_tape_row(tape, event_row=event_row))
             if decision is not None:
-                decision_event_index.append(event_idx)
-                decision_local_ts_us.append(int(decision.local_ts_us))
-                feature_rows.append(np.asarray(decision.feature_vector, dtype=dtype))
-                if max_decisions is not None and len(feature_rows) >= max_decisions:
+                idx_buf.append(event_idx)
+                ts_buf.append(int(decision.local_ts_us))
+                feat_buf.append(np.asarray(decision.feature_vector, dtype=dtype))
+                emitted += 1
+                if len(feat_buf) >= chunk_rows:
+                    yield ExecutionLinearFeatureChunk(np.asarray(idx_buf, dtype=np.int64), np.asarray(ts_buf, dtype=np.int64), np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype), names)
+                    idx_buf.clear(); ts_buf.clear(); feat_buf.clear()
+                if max_decisions is not None and emitted >= max_decisions:
                     break
         else:
             raise ValueError(f"unsupported execution event_type_code: {code}")
+    if feat_buf:
+        yield ExecutionLinearFeatureChunk(np.asarray(idx_buf, dtype=np.int64), np.asarray(ts_buf, dtype=np.int64), np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype), names)
 
+def build_execution_linear_feature_dataset(
+    tape: ExecutionTape,
+    *,
+    decision_interval_us: int = 500_000,
+    start_event_index: int | None = None,
+    max_decisions: int | None = None,
+    output_dtype: str = "float32",
+) -> ExecutionLinearFeatureDataset:
+    chunks = list(iter_execution_linear_feature_chunks(tape, decision_interval_us=decision_interval_us, start_event_index=start_event_index, max_decisions=max_decisions, chunk_rows=100_000, output_dtype=output_dtype))
     names = execution_linear_feature_names()
-    if feature_rows:
-        features = np.ascontiguousarray(np.vstack(feature_rows), dtype=dtype)
+    if chunks:
+        decision_event_index = np.concatenate([c.decision_event_index for c in chunks])
+        decision_local_ts_us = np.concatenate([c.decision_local_ts_us for c in chunks])
+        features = np.ascontiguousarray(np.vstack([c.features for c in chunks]), dtype=np.dtype(output_dtype))
     else:
-        features = np.empty((0, len(names)), dtype=dtype)
-    effective_start_event_index = int(decision_event_index[0]) if decision_event_index else start
-    return ExecutionLinearFeatureDataset(
-        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
-        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
-        features=features,
-        feature_names=names,
-        replay_start_event_index=start,
-        start_event_index=effective_start_event_index,
-        decision_interval_us=decision_interval_us,
-    )
+        start = 0 if start_event_index is None else _require_nonnegative_int(start_event_index, "start_event_index")
+        decision_event_index = np.asarray([], dtype=np.int64)
+        decision_local_ts_us = np.asarray([], dtype=np.int64)
+        features = np.empty((0, len(names)), dtype=np.dtype(output_dtype))
+    effective_start_event_index = int(decision_event_index[0]) if decision_event_index.size else (0 if start_event_index is None else int(start_event_index))
+    replay_start = 0 if start_event_index is None else int(start_event_index)
+    return ExecutionLinearFeatureDataset(decision_event_index=decision_event_index, decision_local_ts_us=decision_local_ts_us, features=features, feature_names=names, replay_start_event_index=replay_start, start_event_index=effective_start_event_index, decision_interval_us=decision_interval_us)
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +459,8 @@ def linear_prediction_summary(predictions: Mapping[str, np.ndarray], signals: Li
 
 __all__ = [
     "ExecutionLinearFeatureDataset",
+    "ExecutionLinearFeatureChunk",
+    "iter_execution_linear_feature_chunks",
     "execution_linear_feature_dataset_summary",
     "execution_linear_feature_names",
     "build_execution_linear_feature_dataset",

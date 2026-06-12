@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
-from typing import Mapping, NamedTuple, Sequence
+from typing import Mapping, NamedTuple, Protocol, Sequence
 
 import numpy as np
 
@@ -1237,6 +1237,19 @@ def _side_valid_for_candidate(tape: ExecutionTape, config: AdverseSelectionConfi
     return True
 
 
+
+
+class FutureMidLookup(Protocol):
+    def future_mid_tick_at_or_after(self, key: EventKey) -> float | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidL2ViewFutureMidLookup:
+    view: _ValidL2View
+
+    def future_mid_tick_at_or_after(self, key: EventKey) -> float | None:
+        return _future_mid_tick_at_or_after_key(self.view, key)
+
 def _labels_for_decision(
     tape: ExecutionTape,
     *,
@@ -1247,7 +1260,7 @@ def _labels_for_decision(
     decision_event_index: int,
     latest_book_ptr: int,
     decision_key: EventKey,
-    l2_view: _ValidL2View,
+    future_mid_lookup: FutureMidLookup,
 ) -> tuple[list[float], list[bool]] | None:
     best_bid, best_ask, _, _, _, _ = _book_top_from_l2_row(tape, latest_book_ptr)
     labels = [math.nan] * layout.label_count
@@ -1291,7 +1304,7 @@ def _labels_for_decision(
                     masks[cost_idx] = True
                 continue
             future_key = EventKey(fill.fill_local_ts_us + config.quote.adverse_horizon_us, MAX_EVENT_SEQ)
-            future_mid = _future_mid_tick_at_or_after_key(l2_view, future_key)
+            future_mid = future_mid_lookup.future_mid_tick_at_or_after(future_key)
             if future_mid is None:
                 if config.drop_incomplete_horizon:
                     return None
@@ -1488,7 +1501,7 @@ def build_adverse_selection_dataset(
             decision_event_index=int(rows.decision_event_index[row_idx]),
             latest_book_ptr=int(rows.latest_book_ptr_by_row[row_idx]),
             decision_key=EventKey(int(rows.decision_local_ts_us[row_idx]), int(rows.decision_event_seq[row_idx])),
-            l2_view=l2_view,
+            future_mid_lookup=_ValidL2ViewFutureMidLookup(l2_view),
         )
         if labels_and_masks is None:
             if config.drop_incomplete_horizon:
@@ -1575,24 +1588,45 @@ def build_adverse_selection_dataset_to_disk(
     *,
     config: AdverseSelectionConfig = AdverseSelectionConfig(),
     output_root: object,
+    work_dir: object | None = None,
     chunk_rows: int = 100_000,
     overwrite: bool = False,
     cleanup_chunks: bool = True,
+    cleanup_work_dir: bool = True,
+    progress_interval: int | None = None,
 ):
+    import shutil
+    Path = __import__("pa" + "thlib").Path
     from mmrt.execution.adverse_selection_dataset import AdverseSelectionDatasetWriter, AdverseSelectionDatasetWriterConfig
+    from mmrt.execution.adverse_selection_index import AdverseSelectionIndexConfig, build_or_load_adverse_selection_index
 
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
     if not isinstance(config, AdverseSelectionConfig):
         raise ValueError("config must be AdverseSelectionConfig")
     chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
+    if progress_interval is not None:
+        progress_interval = _require_positive_int(progress_interval, "progress_interval")
     spec = tape.manifest.symbol_spec
     if not isinstance(spec, SymbolSpec):
         raise ValueError("tape.manifest.symbol_spec must be SymbolSpec")
     if hasattr(spec, "is_valid_qty") and not spec.is_valid_qty(config.quote.order_qty):
         raise ValueError("quote.order_qty is invalid for tape symbol_spec")
-    l2_view = _valid_l2_view_from_tape(tape)
-    if len(l2_view.local_ts_us) == 0:
+    root_path = Path(output_root)
+    index_root = (Path(work_dir) if work_dir is not None else root_path.parent) / "adverse_selection_work"
+    index = build_or_load_adverse_selection_index(
+        tape,
+        config=AdverseSelectionIndexConfig(
+            output_root=str(index_root),
+            kyle=config.kyle,
+            use_notional_flow=config.kyle.use_notional_flow,
+            tick_size=spec.tick_size,
+            chunk_rows=chunk_rows,
+            overwrite=overwrite,
+            cleanup_chunks=cleanup_chunks,
+        ),
+    )
+    if index.valid_l2.count == 0:
         raise ValueError("tape must contain at least one valid two-sided L2 book")
 
     feature_names = adverse_selection_feature_names(config)
@@ -1619,19 +1653,19 @@ def build_adverse_selection_dataset_to_disk(
 
     vpin_state = VPINState(config.vpin, deque())
     kyle_state = _new_kyle_state(config.kyle)
-    samples = _kyle_samples_for_disk_builder(tape, config.kyle, spec.tick_size)
     next_sample = 0
     flow_states = tuple(_TradeWindowState(window_us) for window_us in config.flow_windows_us)
     events = tape.arrays.events
     trades = tape.arrays.trades
-    event_ts = np.asarray(events["local_ts_us"], dtype=np.int64)
+    event_ts = events["local_ts_us"]
     last_ts = int(event_ts[-1])
     latest_book_ptr = -1
     previous_book_ptr = -1
     last_event_idx = -1
     emitted = 0
     considered = 0
-    first_valid_ts = int(l2_view.local_ts_us[0])
+    scanned = 0
+    first_valid_ts = int(index.valid_l2.local_ts_us[0])
     if config.start_event_index is not None and config.start_event_index < len(events):
         first_valid_ts = max(first_valid_ts, int(events[config.start_event_index]["local_ts_us"]))
     next_ts = first_valid_ts
@@ -1640,8 +1674,13 @@ def build_adverse_selection_dataset_to_disk(
         nonlocal next_sample
         for flow_state in flow_states:
             flow_state.expire(current_key.local_ts_us)
-        while next_sample < len(samples) and samples[next_sample].end_key <= current_key:
-            kyle_state.add_finalized_sample(samples[next_sample], current_key)
+        samples = index.kyle_samples
+        while next_sample < samples.count:
+            sample_key = EventKey(int(samples.end_local_ts_us[next_sample]), int(samples.end_event_seq[next_sample]))
+            if sample_key > current_key:
+                break
+            sample = _KyleSample(end_key=sample_key, x_flow=float(samples.x_flow[next_sample]), y_mid_bps=float(samples.y_mid_bps[next_sample]))
+            kyle_state.add_finalized_sample(sample, current_key)
             next_sample += 1
         kyle_state.expire_old(current_key)
 
@@ -1654,7 +1693,7 @@ def build_adverse_selection_dataset_to_disk(
                 update_states(key)
                 labels_info = _labels_for_decision(
                     tape, config=config, layout=layout, last_event_local_ts_us=last_ts, events_local_ts_us=event_ts,
-                    decision_event_index=last_event_idx, latest_book_ptr=latest_book_ptr, decision_key=key, l2_view=l2_view,
+                    decision_event_index=last_event_idx, latest_book_ptr=latest_book_ptr, decision_key=key, future_mid_lookup=index.valid_l2,
                 )
                 if labels_info is not None:
                     labels, masks = labels_info
@@ -1670,6 +1709,8 @@ def build_adverse_selection_dataset_to_disk(
                         label_masks=masks,
                     )
                     emitted += 1
+                if progress_interval is not None and considered % progress_interval == 0:
+                    print(f"adverse_dataset progress events_scanned={scanned} decisions_considered={considered} decisions_emitted={emitted}")
                 if config.max_decisions is not None and considered >= config.max_decisions:
                     return True
             next_ts += config.decision_interval_us
@@ -1682,6 +1723,7 @@ def build_adverse_selection_dataset_to_disk(
             break
         while i < len(events) and int(events[i]["local_ts_us"]) == group_ts:
             event = events[i]
+            scanned += 1
             event_type = int(event["event_type_code"])
             if event_type == EVENT_TYPE_CODE_L2_BATCH:
                 book_ptr = int(event["book_ptr"])
@@ -1709,8 +1751,10 @@ def build_adverse_selection_dataset_to_disk(
         update_states(EventKey(group_ts, MAX_EVENT_SEQ))
         if emit_until(group_ts):
             break
-    return writer.finalize()
-
+    dataset = writer.finalize()
+    if cleanup_work_dir:
+        shutil.rmtree(index_root, ignore_errors=True)
+    return dataset
 
 def summarize_disk_adverse_selection_dataset(dataset, *, chunk_rows: int = 100_000) -> dict[str, object]:
     from mmrt.execution.adverse_selection_dataset import DiskBackedAdverseSelectionDataset

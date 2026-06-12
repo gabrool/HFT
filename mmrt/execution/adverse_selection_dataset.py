@@ -10,6 +10,8 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from mmrt.execution.execution_tape_writer import NpyChunkWriter
+
 ADVERSE_SELECTION_DATASET_SCHEMA = "mmrt_adverse_selection_dataset" + "_" + "v" + "1"
 
 
@@ -213,13 +215,16 @@ class AdverseSelectionDatasetWriter:
             shutil.rmtree(self.root)
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
         self.arrays_dir.mkdir(parents=True, exist_ok=True)
-        self._decision_ts: list[int] = []
-        self._decision_idx: list[int] = []
-        self._decision_seq: list[int] = []
-        self._features: list[np.ndarray] = []
-        self._labels: list[np.ndarray] = []
-        self._masks: list[np.ndarray] = []
-        self._chunk_count = 0
+        nf = len(config.feature_names)
+        nl = len(config.label_names)
+        self._writers = {
+            "decision_local_ts_us": NpyChunkWriter("decision_local_ts_us", np.int64, (), config.chunk_rows, self.chunks_dir),
+            "decision_event_index": NpyChunkWriter("decision_event_index", np.int64, (), config.chunk_rows, self.chunks_dir),
+            "decision_event_seq": NpyChunkWriter("decision_event_seq", np.int64, (), config.chunk_rows, self.chunks_dir),
+            "features": NpyChunkWriter("features", np.float32, (nf,), config.chunk_rows, self.chunks_dir),
+            "labels": NpyChunkWriter("labels", np.float32, (nl,), config.chunk_rows, self.chunks_dir),
+            "label_masks": NpyChunkWriter("label_masks", np.bool_, (nl,), config.chunk_rows, self.chunks_dir),
+        }
         self._rows = 0
 
     def append(self, *, decision_local_ts_us: int, decision_event_index: int, decision_event_seq: int, features: Sequence[float] | np.ndarray, labels: Sequence[float] | np.ndarray, label_masks: Sequence[bool] | np.ndarray) -> int:
@@ -230,59 +235,50 @@ class AdverseSelectionDatasetWriter:
             raise ValueError("features width mismatch")
         if y.shape != (len(self.config.label_names),) or m.shape != y.shape:
             raise ValueError("labels/masks width mismatch")
-        self._decision_ts.append(int(decision_local_ts_us)); self._decision_idx.append(int(decision_event_index)); self._decision_seq.append(int(decision_event_seq))
-        self._features.append(f.copy()); self._labels.append(y.copy()); self._masks.append(m.copy())
+        row_index = self._rows
+        self._writers["decision_local_ts_us"].append(int(decision_local_ts_us))
+        self._writers["decision_event_index"].append(int(decision_event_index))
+        self._writers["decision_event_seq"].append(int(decision_event_seq))
+        self._writers["features"].append(f)
+        self._writers["labels"].append(y)
+        self._writers["label_masks"].append(m)
         self._rows += 1
-        if len(self._features) >= self.config.chunk_rows:
-            self._flush()
-        return self._rows
-
-    def _flush(self) -> None:
-        if not self._features:
-            return
-        prefix = self.chunks_dir / f"chunk_{self._chunk_count:06d}"
-        np.save(str(prefix) + "_decision_local_ts_us.npy", np.asarray(self._decision_ts, dtype=np.int64))
-        np.save(str(prefix) + "_decision_event_index.npy", np.asarray(self._decision_idx, dtype=np.int64))
-        np.save(str(prefix) + "_decision_event_seq.npy", np.asarray(self._decision_seq, dtype=np.int64))
-        np.save(str(prefix) + "_features.npy", np.vstack(self._features).astype(np.float32, copy=False))
-        np.save(str(prefix) + "_labels.npy", np.vstack(self._labels).astype(np.float32, copy=False))
-        np.save(str(prefix) + "_label_masks.npy", np.vstack(self._masks).astype(np.bool_, copy=False))
-        self._decision_ts.clear(); self._decision_idx.clear(); self._decision_seq.clear(); self._features.clear(); self._labels.clear(); self._masks.clear()
-        self._chunk_count += 1
+        return row_index
 
     def finalize(self) -> DiskBackedAdverseSelectionDataset:
-        self._flush()
-        n = self._rows; nf = len(self.config.feature_names); nl = len(self.config.label_names)
-        specs = {
-            "decision_local_ts_us": (np.int64, (n,)), "decision_event_index": (np.int64, (n,)), "decision_event_seq": (np.int64, (n,)),
-            "features": (np.float32, (n, nf)), "labels": (np.float32, (n, nl)), "label_masks": (np.bool_, (n, nl)),
-        }
-        outs = {name: np.lib.format.open_memmap(self.arrays_dir / f"{name}.npy", mode="w+", dtype=dtype, shape=shape) for name, (dtype, shape) in specs.items()}
-        pos = 0
-        for i in range(self._chunk_count):
-            prefix = self.chunks_dir / f"chunk_{i:06d}"
-            rows = np.load(str(prefix) + "_decision_local_ts_us.npy", mmap_mode="r").shape[0]
-            for name in specs:
-                outs[name][pos:pos+rows] = np.load(str(prefix) + f"_{name}.npy", mmap_mode="r")
-            pos += rows
-        for arr in outs.values():
-            arr.flush()
-        meta = dict(self.config.manifest_metadata)
-        manifest = AdverseSelectionDatasetManifest(
-            schema=ADVERSE_SELECTION_DATASET_SCHEMA,
-            exchange=str(meta["exchange"]), symbol=str(meta["symbol"]), tape_schema=str(meta["tape_schema"]),
-            tape_num_events=int(meta["tape_num_events"]), tape_num_l2_batches=int(meta["tape_num_l2_batches"]), tape_num_trades=int(meta["tape_num_trades"]),
-            tape_start_local_ts_us=int(meta["tape_start_local_ts_us"]), tape_end_local_ts_us=int(meta["tape_end_local_ts_us"]),
-            decision_interval_us=int(meta["decision_interval_us"]), start_event_index=meta.get("start_event_index"), max_decisions=meta.get("max_decisions"),
-            feature_names=self.config.feature_names, label_names=self.config.label_names, num_rows=n, num_features=nf, num_labels=nl,
-            config_json=str(meta.get("config_json", "{}")), created_at_utc=datetime.now(timezone.utc).isoformat(),
-        )
-        (self.root / "manifest.json").write_text(json.dumps(manifest.as_dict(), sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        if self.config.cleanup_chunks:
-            import shutil
-            shutil.rmtree(self.chunks_dir, ignore_errors=True)
-        return load_adverse_selection_dataset(self.root, mmap_mode="r")
-
+        manifest_path = self.root / "manifest.json"
+        manifest_path.unlink(missing_ok=True)
+        n = self._rows
+        nf = len(self.config.feature_names)
+        nl = len(self.config.label_names)
+        try:
+            for name, writer in self._writers.items():
+                rows = writer.finalize(self.arrays_dir / f"{name}.npy")
+                if rows != n:
+                    raise RuntimeError(f"chunk row count mismatch for {name}")
+            meta = dict(self.config.manifest_metadata)
+            manifest = AdverseSelectionDatasetManifest(
+                schema=ADVERSE_SELECTION_DATASET_SCHEMA,
+                exchange=str(meta["exchange"]), symbol=str(meta["symbol"]), tape_schema=str(meta["tape_schema"]),
+                tape_num_events=int(meta["tape_num_events"]), tape_num_l2_batches=int(meta["tape_num_l2_batches"]), tape_num_trades=int(meta["tape_num_trades"]),
+                tape_start_local_ts_us=int(meta["tape_start_local_ts_us"]), tape_end_local_ts_us=int(meta["tape_end_local_ts_us"]),
+                decision_interval_us=int(meta["decision_interval_us"]), start_event_index=meta.get("start_event_index"), max_decisions=meta.get("max_decisions"),
+                feature_names=self.config.feature_names, label_names=self.config.label_names, num_rows=n, num_features=nf, num_labels=nl,
+                config_json=str(meta.get("config_json", "{}")), created_at_utc=datetime.now(timezone.utc).isoformat(),
+            )
+            tmp = self.root / "manifest.json.tmp"
+            tmp.write_text(json.dumps(manifest.as_dict(), sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(manifest_path)
+            if self.config.cleanup_chunks:
+                for writer in self._writers.values():
+                    writer.cleanup()
+                import shutil
+                shutil.rmtree(self.chunks_dir, ignore_errors=True)
+            return load_adverse_selection_dataset(self.root, mmap_mode="r")
+        except Exception:
+            manifest_path.unlink(missing_ok=True)
+            (self.root / "manifest.json.tmp").unlink(missing_ok=True)
+            raise
 
 def load_adverse_selection_dataset(root: str | Path, *, mmap_mode: str | None = "r") -> DiskBackedAdverseSelectionDataset:
     if mmap_mode not in (None, "r"):

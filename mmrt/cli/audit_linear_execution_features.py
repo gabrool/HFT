@@ -27,6 +27,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-rows", type=int, default=100_000)
     parser.add_argument("--z-thresholds", default="3,5,8")
     parser.add_argument("--top-k", type=int, default=25)
+    parser.add_argument("--work-dir")
+    parser.add_argument("--cleanup-work-dir", dest="cleanup_work_dir", action="store_true", default=True)
+    parser.add_argument("--keep-work-dir", dest="cleanup_work_dir", action="store_false")
+    parser.add_argument("--quantile-mode", choices=("exact_memmap", "reservoir"), default="exact_memmap")
+    parser.add_argument("--max-quantile-samples", type=int, default=1_000_000)
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -52,6 +57,10 @@ def _config_from_args(args: argparse.Namespace) -> LinearExecutionFeatureAuditCo
         chunk_rows=args.chunk_rows,
         z_thresholds=_parse_thresholds(args.z_thresholds),
         top_k=args.top_k,
+        work_dir=args.work_dir,
+        cleanup_work_dir=args.cleanup_work_dir,
+        quantile_mode=args.quantile_mode,
+        max_quantile_samples=args.max_quantile_samples,
     )
 
 
