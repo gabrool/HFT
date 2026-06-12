@@ -27,7 +27,7 @@ def test_default_config_core_values() -> None:
     cfg = default_config()
     assert cfg.market.exchange == "binance-futures"
     assert cfg.market.symbol == "BTCUSDT"
-    assert cfg.data.source_data_types == (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES)
+    assert cfg.data.source_data_types == (TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES)
     assert cfg.labels.horizons_us == (200_000, 500_000, 1_000_000)
     assert cfg.labels.entry_delay_us == 1_000
     assert cfg.runtime.lookback_rows == 10
@@ -59,12 +59,12 @@ def test_label_config_rejects_unsupported_price_refs() -> None:
 
 
 def test_data_config_validation() -> None:
-    cfg = DataConfig(source_data_types=("book_snapshot_25", "trades"))
-    assert cfg.source_data_types == (TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES)
+    cfg = DataConfig(source_data_types=("incremental_book_L2", "trades"))
+    assert cfg.source_data_types == (TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES)
     with pytest.raises(ValueError):
-        DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.BOOK_SNAPSHOT_25))
+        DataConfig(source_data_types=(TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.INCREMENTAL_BOOK_L2))
     with pytest.raises(ValueError):
-        DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25,))
+        DataConfig(source_data_types=(TardisDataType.INCREMENTAL_BOOK_L2,))
     with pytest.raises(TypeError):
         DataConfig(**{"drop_duplicate_" + "trades": True})
 
@@ -106,7 +106,7 @@ def test_storage_config_constraints() -> None:
 
 def test_pipeline_config_invariants() -> None:
     cfg = PipelineConfig()
-    assert cfg.source_data_type_values == ("book_snapshot_25", "trades")
+    assert cfg.source_data_type_values == ("incremental_book_L2", "trades")
     assert cfg.decision.stride_us == cfg_module.DEFAULT_DECISION_STRIDE_US
     assert cfg.storage.feature_schema == specs.FEATURE_SCHEMA
     assert cfg.label_spec == cfg.labels.to_label_spec()
@@ -122,12 +122,12 @@ def test_pipeline_config_requires_book_and_trades() -> None:
     with pytest.raises(ValueError):
         PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.TRADES,)))
     with pytest.raises(ValueError):
-        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25,)))
+        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.INCREMENTAL_BOOK_L2,)))
 
 
 def test_pipeline_config_rejects_additional_source_types() -> None:
     with pytest.raises(ValueError):
-        PipelineConfig(data=DataConfig(source_data_types=(TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES, TardisDataType.INCREMENTAL_BOOK_L2)))
+        PipelineConfig(data=DataConfig(source_data_types=("incremental_book_L2", "trades", "trades")))
 
 
 def test_pipeline_config_rejects_invalid_nested_config_objects() -> None:

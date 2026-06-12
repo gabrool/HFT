@@ -296,7 +296,7 @@ def test_output_json_requires_json_suffix() -> None:
 def test_no_bad_imports() -> None:
     src = inspect.getsource(cli)
     forbidden = [
-        "from mmrt.data", "import mmrt.data", "from mmrt.features.engine", "from mmrt.features.labels", "from mmrt.features.transforms",
+        "from mmrt.features.engine", "from mmrt.features.labels", "from mmrt.features.transforms",
         "import pan" + "das", "from pan" + "das", "import to" + "rch", "from to" + "rch", "import sk" + "learn", "from sk" + "learn",
         "CM" + "SSL", "offline_" + "ingest", "linear_" + "offline",
     ]

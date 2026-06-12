@@ -169,7 +169,7 @@ def test_no_inactive_runtime_computation_tokens_remain():
 
 def test_required_windows_and_depth():
     assert specs.SUPPORTED_WINDOWS_US == (100_000, 200_000, 500_000, 1_000_000, 3_000_000)
-    assert specs.REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH == 25
+    assert specs.REQUIRED_BOOK_SNAPSHOT_DEPTH == 25
     assert specs.MAX_REQUIRED_BOOK_FEATURE_DEPTH == 20
 
 
@@ -190,7 +190,7 @@ def test_source_owner_family_examples():
 
 
 def test_feature_schema_is_current_active_schema():
-    assert specs.FEATURE_SCHEMA == "mmrt_features_snapshot25_trades_active44_ctx4_corr90"
+    assert specs.FEATURE_SCHEMA == "mmrt_features_tape25_trades_active44_ctx4_corr90"
     assert "leg" + "acy" not in specs.FEATURE_SCHEMA
 
 

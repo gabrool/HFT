@@ -21,7 +21,6 @@ class TimeUnit(_StrEnum):
 
 class TardisDataType(_StrEnum):
     INCREMENTAL_BOOK_L2 = "incremental_book_L2"
-    BOOK_SNAPSHOT_25 = "book_snapshot_25"
     TRADES = "trades"
 
 

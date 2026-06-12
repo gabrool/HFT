@@ -1,460 +1,163 @@
-import csv
-import gzip
-import inspect
 import json
 from pathlib import Path
-import subprocess
-import sys
 
+import numpy as np
 import pytest
 
 pytest.importorskip("pyarrow")
 pytest.importorskip("pyarrow.parquet")
-pytest.importorskip("polars")
 
 from mmrt import config as cfg
 from mmrt.cli import ingest as cli
-from mmrt.contracts import TardisDataType
-from mmrt.features.labels import LabelResult
-from mmrt.schemas import tardis_csv_schema
+from mmrt.execution.execution_tape import save_execution_tape
+from mmrt.execution.linear_signal_builder import build_execution_linear_feature_dataset
+from mmrt.features.specs import FEATURE_NAMES_HASH, FEATURE_SCHEMA, FEATURE_SPECS_HASH
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
+from tests.test_execution_feature_replay import make_tape
 
 
-def _write_csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
-    if path.suffix == ".gz":
-        with gzip.open(path, "wt", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            w.writerows(rows)
-    else:
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            w.writerows(rows)
+def _saved_tape(tmp_path: Path, **kwargs):
+    tape = make_tape(**kwargs)
+    tape_root = tmp_path / "tape"
+    save_execution_tape(tape, tape_root)
+    return tape, tape_root
 
 
-def _book_trade_files(
-    tmp_path: Path,
-    n_book: int = 8,
-    n_trade: int = 4,
-    symbol: str = cfg.DEFAULT_SYMBOL,
-    step_us: int = cfg.DEFAULT_DECISION_STRIDE_US,
-):
-    b_schema = tardis_csv_schema(TardisDataType.BOOK_SNAPSHOT_25)
-    t_schema = tardis_csv_schema(TardisDataType.TRADES)
-    bh = list(b_schema.column_names)
-    th = list(t_schema.column_names)
-    book = tmp_path / "book.csv"
-    trade = tmp_path / "trades.csv"
-    brows = []
-    for i in range(n_book):
-        row = []
-        for c in bh:
-            if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
-            elif c == "symbol": row.append(symbol)
-            elif c == "timestamp": row.append(1_000_000 + i * step_us)
-            elif c == "local_timestamp": row.append(1_000_000 + i * step_us)
-            elif c.startswith("asks[") and c.endswith("].price"):
-                lvl = int(c.split("[")[1].split("]")[0]); row.append(100.1 + lvl * 0.1 + i * 0.01)
-            elif c.startswith("asks[") and c.endswith("].amount"):
-                row.append(1.0)
-            elif c.startswith("bids[") and c.endswith("].price"):
-                lvl = int(c.split("[")[1].split("]")[0]); row.append(99.9 - lvl * 0.1 + i * 0.01)
-            elif c.startswith("bids[") and c.endswith("].amount"):
-                row.append(1.0)
-            else:
-                row.append("")
-        brows.append(row)
-    trows = []
-    for i in range(n_trade):
-        row = []
-        for c in th:
-            if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
-            elif c == "symbol": row.append(symbol)
-            elif c == "timestamp": row.append(1_000_000 + i * step_us)
-            elif c == "local_timestamp": row.append(1_000_000 + i * step_us)
-            elif c == "price": row.append(100.0 + i * 0.01)
-            elif c == "amount": row.append(0.5)
-            elif c == "side": row.append("buy" if i % 2 == 0 else "sell")
-            elif "id" in c: row.append(str(i + 1))
-            else: row.append("")
-        trows.append(row)
-    _write_csv(book, bh, brows)
-    _write_csv(trade, th, trows)
-    return book, trade
-
-
-def _run_ok(tmp_path: Path, capsys, *extra: str):
-    b, t = _book_trade_files(tmp_path, n_book=12, n_trade=8)
-    root = tmp_path / "ds"
+def _run_ingest(tmp_path: Path, tape_root: Path, *extra_args: str) -> Path:
+    dataset_root = tmp_path / "dataset"
     rc = cli.main([
-        "--dataset-root", str(root), "--dataset-id", "tiny", "--book-csv", str(b), "--trades-csv", str(t),
-        "--label-horizons-us", "1000", "--label-entry-delay-us", "1", "--event-batch-size", "2",
-        "--chunk-rows", "2", "--row-group-rows", "2", *extra,
+        "--dataset-root", str(dataset_root),
+        "--dataset-id", "ds-tape",
+        "--tape-root", str(tape_root),
+        *extra_args,
     ])
     assert rc == 0
-    out = json.loads(capsys.readouterr().out.strip())
-    return root, out
+    return dataset_root
 
 
-def test_public_api_boundary():
-    assert cli.__all__ == ["build_arg_parser", "main"]
+def test_ingest_builds_dataset_from_tape(tmp_path, capsys):
+    tape, tape_root = _saved_tape(tmp_path)
+    dataset_root = _run_ingest(tmp_path, tape_root)
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["status"] == "ok"
+    assert summary["exchange"] == tape.manifest.exchange
+    assert summary["symbol"] == tape.manifest.symbol
+    assert summary["book_data_type"] == "incremental_book_L2"
+    assert summary["rows"] > 0
+    assert summary["decisions_emitted"] >= summary["rows"]
+
+    reader = rd.open_dataset(str(dataset_root), validate_on_open=True)
+    manifest = reader.manifest
+    assert manifest.exchange == tape.manifest.exchange
+    assert manifest.symbol == tape.manifest.symbol
+    assert manifest.feature_schema["schema"] == FEATURE_SCHEMA
+    assert manifest.pipeline_config["source_data_types"] == ["incremental_book_L2", "trades"]
+    assert manifest.transform_config["feature_names_hash"] == FEATURE_NAMES_HASH
+    assert manifest.transform_config["feature_specs_hash"] == FEATURE_SPECS_HASH
+    assert manifest.transform_diagnostics["rows_seen"] == summary["decisions_emitted"]
+    assert manifest.notes["ingest_counters"]["rows_written"] == summary["rows"]
+
+    table = reader.read_table()
+    assert table.num_rows == summary["rows"]
+    features = np.column_stack([np.asarray(table[c]) for c in manifest.feature_columns])
+    assert np.isfinite(features).all()
+    labels = np.column_stack([np.asarray(table[c]) for c in manifest.label_columns])
+    assert np.isfinite(labels).all()
 
 
-def test_write_matured_labels_uses_values_bps():
-    class W:
-        kwargs = None
-        def append_values(self, **kwargs):
-            self.kwargs = kwargs
+def test_ingest_rows_match_execution_feature_replay_exactly(tmp_path):
+    """Training rows and execution-side signal features must be identical.
 
-    pending = {(10, 1): cli.PendingDecision(1, 10, 10, 1, 100.0, (0.1,))}
-    label = LabelResult(decision_ts_us=10, decision_event_seq=1, entry_ts_us=11, horizons_us=(12, 13, 14), values_bps=(1.0, 2.0, 3.0))
-    counters = cli.IngestCounters()
-    w = W()
-    cli._write_matured_labels([label], pending, w, counters)
-    assert w.kwargs["label_values"] == (1.0, 2.0, 3.0)
-    assert pending == {}
-    assert counters.labels_matured == 1
-    assert counters.rows_written == 1
+    This is the train/serve guard: both paths replay the same tape through
+    the same decision feature pipeline, so the stored feature matrix must be
+    a bitwise prefix of the execution feature dataset.
+    """
+    tape, tape_root = _saved_tape(tmp_path)
+    dataset_root = _run_ingest(tmp_path, tape_root)
 
-
-def test_write_matured_labels_missing_full_event_key_raises():
-    class W:
-        def append_values(self, **kwargs):
-            raise AssertionError("writer should not be called")
-
-    pending = {(10, 2): cli.PendingDecision(1, 10, 10, 2, 100.0, (0.1,))}
-    label = LabelResult(decision_ts_us=10, decision_event_seq=1, entry_ts_us=11, horizons_us=(12,), values_bps=(1.0,))
-    counters = cli.IngestCounters()
-
-    with pytest.raises(KeyError):
-        cli._write_matured_labels([label], pending, W(), counters)
-
-    assert pending == {(10, 2): cli.PendingDecision(1, 10, 10, 2, 100.0, (0.1,))}
-    assert counters.labels_matured == 0
-    assert counters.rows_written == 0
-
-
-def test_parser_defaults(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path)
-    args = cli.build_arg_parser().parse_args(["--dataset-root", str(tmp_path / "ds"), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t)])
-    assert args.exchange == cfg.DEFAULT_EXCHANGE
-    assert args.symbol == cfg.DEFAULT_SYMBOL
-    assert not hasattr(args, "book_data_type")
-    assert not hasattr(args, "validate_output")
-    assert args.decision_stride_us == cfg.DEFAULT_DECISION_STRIDE_US
-
-
-def test_rejects_non_default_decision_stride(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path)
-    root, wd = tmp_path / "ds", tmp_path / "wd"
-    with pytest.raises(ValueError, match="500_000"):
-        cli.main([
-            "--dataset-root", str(root),
-            "--dataset-id", "x",
-            "--book-csv", str(b),
-            "--trades-csv", str(t),
-            "--decision-stride-us", "500",
-            "--work-dir", str(wd),
-        ])
-    assert not (root / "manifest.json").exists()
-    assert not wd.exists()
-
-
-def test_parse_us_range():
-    assert cli._parse_us_range("100:200", "x") == (100, 200)
-    for bad in ["200:100", "abc:200", "100", "100:200:300"]:
-        with pytest.raises(ValueError):
-            cli._parse_us_range(bad, "x")
-
-
-def test_no_stale_imports_source_residue():
-    src = inspect.getsource(cli)
-    for token in ["BY" + "BIT", "CM" + "SSL", "offline_" + "ingest", "linear_" + "offline", "Mini" + "Rocket", "Multi" + "Rocket", "Hy" + "dra", "Ae" + "on", "sk" + "learn", "to" + "rch", "P" + "CA", "Standard" + "Scaler", "stage" + "1", "stage" + "2", "stage" + "3", "stage" + "4", "stage" + "5", "pan" + "das"]:
-        assert token not in src
-    for token in ["mmrt." + "linear", "read_" + "split_" + "table", "read_" + "ta" + "ble(", "to_" + "pan" + "das"]:
-        assert token not in src
-
-
-def test_ingest_has_no_fake_data_type_or_validation_opt_out_flags():
-    src = inspect.getsource(cli)
-    assert "--book" + "-data-type" not in src
-    assert "--no" + "-validate-output" not in src
-    assert "--validate" + "-output" not in src
-    assert "args.validate" + "_output" not in src
-
-
-def test_ingest_uses_streaming_merge_only():
-    src = inspect.getsource(cli)
-    forbidden = [
-        "_write_merged_events",
-        "write_merged_events_parquet",
-        "merge_normalized_events(",
-        "merged/events.parquet",
-        "_iter_record_batch_rows",
-    ]
-    for token in forbidden:
-        assert token not in src
-    assert "iter_merged_events_streaming" in src
-
-
-def test_ingest_uses_canonical_market_symbol(tmp_path: Path, capsys):
-    b, t = _book_trade_files(tmp_path)
-    root = tmp_path / "ds"
-    cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--symbol", cfg.DEFAULT_SYMBOL.lower(), "--label-horizons-us", "1000", "--label-entry-delay-us", "1"])
-    out = json.loads(capsys.readouterr().out.strip())
-    man = mf.read_manifest_json(root / "manifest.json")
-    assert man.symbol == cfg.DEFAULT_SYMBOL
-    assert out["symbol"] == cfg.DEFAULT_SYMBOL
-
-
-def test_ingest_rejects_csv_market_mismatch(tmp_path: Path, capsys):
-    b, t = _book_trade_files(tmp_path, symbol="ETHUSDT")
-    root = tmp_path / "ds"
-    with pytest.raises(ValueError, match="market mismatch"):
-        cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t)])
-    assert capsys.readouterr().out.strip() == ""
-    assert not (root / "manifest.json").exists()
-
-
-def test_manifest_notes_include_complete_ingest_counters(tmp_path: Path, capsys):
-    root, _ = _run_ok(tmp_path, capsys)
-    man = mf.read_manifest_json(root / "manifest.json")
-    c = man.notes["ingest_counters"]
-    assert c["input_book_files"] == 1 and c["input_trade_files"] == 1 and c["normalized_files"] == 2
-    assert c["output_segments"] == len(man.segments)
-    assert c["output_rows"] == man.total_rows
-    assert c["rows_written"] == man.total_rows
-
-
-def test_max_events_counts_only_processed_rows(tmp_path: Path, capsys):
-    b, t = _book_trade_files(tmp_path, n_book=12, n_trade=8)
-    root = tmp_path / "ds"
-
-    rc = cli.main([
-        "--dataset-root", str(root),
-        "--dataset-id", "x",
-        "--book-csv", str(b),
-        "--trades-csv", str(t),
-        "--max-events", "18",
-        "--label-horizons-us", "1000",
-        "--label-entry-delay-us", "1",
-        "--event-batch-size", "2",
-        "--chunk-rows", "2",
-        "--row-group-rows", "2",
-    ])
-
-    assert rc == 0
-    out = json.loads(capsys.readouterr().out.strip())
-    man = mf.read_manifest_json(root / "manifest.json")
-
-    assert man.notes["ingest_counters"]["merged_events_seen"] == 18
-    assert out["rows_written"] == man.total_rows
-    assert man.total_rows > 0
-    assert man.segments[0].source_files == ("source/book_snapshot_25/000000_book.csv", "source/trades/000000_trades.csv")
-    all_sources = []
-    for seg in man.segments:
-        all_sources.extend(seg.source_files)
-    assert all_sources
-    assert "source/book_snapshot_25/000000_book.csv" in all_sources
-    assert "source/trades/000000_trades.csv" in all_sources
-    for src in all_sources:
-        assert not src.startswith("/")
-        assert "\\" not in src
-        assert src.startswith("source/")
-
-
-def test_unsorted_raw_csv_ingest_succeeds_and_output_ordered(tmp_path: Path, capsys):
-    b_schema = tardis_csv_schema(TardisDataType.BOOK_SNAPSHOT_25)
-    t_schema = tardis_csv_schema(TardisDataType.TRADES)
-    bh = list(b_schema.column_names)
-    th = list(t_schema.column_names)
-    book = tmp_path / "book_unsorted.csv"
-    trade = tmp_path / "trades_unsorted.csv"
-
-    def book_row(i: int, local_ts: int):
-        row = []
-        for c in bh:
-            if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
-            elif c == "symbol": row.append(cfg.DEFAULT_SYMBOL)
-            elif c == "timestamp": row.append(local_ts)
-            elif c == "local_timestamp": row.append(local_ts)
-            elif c.startswith("asks[") and c.endswith("].price"):
-                lvl = int(c.split("[")[1].split("]")[0]); row.append(100.1 + lvl * 0.1 + i * 0.01)
-            elif c.startswith("asks[") and c.endswith("].amount"): row.append(1.0)
-            elif c.startswith("bids[") and c.endswith("].price"):
-                lvl = int(c.split("[")[1].split("]")[0]); row.append(99.9 - lvl * 0.1 + i * 0.01)
-            elif c.startswith("bids[") and c.endswith("].amount"): row.append(1.0)
-            else: row.append("")
-        return row
-
-    def trade_row(i: int, local_ts: int):
-        row = []
-        for c in th:
-            if c == "exchange": row.append(cfg.DEFAULT_EXCHANGE)
-            elif c == "symbol": row.append(cfg.DEFAULT_SYMBOL)
-            elif c == "timestamp": row.append(local_ts)
-            elif c == "local_timestamp": row.append(local_ts)
-            elif c == "price": row.append(100.0 + i * 0.01)
-            elif c == "amount": row.append(0.5)
-            elif c == "side": row.append("buy" if i % 2 == 0 else "sell")
-            elif "id" in c: row.append(str(i + 1))
-            else: row.append("")
-        return row
-
-    times = [1_000_000 + i * cfg.DEFAULT_DECISION_STRIDE_US for i in range(12)]
-    _write_csv(book, bh, [book_row(i, t) for i, t in reversed(list(enumerate(times)))])
-    _write_csv(trade, th, [trade_row(i, t) for i, t in reversed(list(enumerate(times[:8])))])
-    root = tmp_path / "ds"
-    rc = cli.main([
-        "--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(book), "--trades-csv", str(trade),
-        "--label-horizons-us", "1000", "--label-entry-delay-us", "1", "--event-batch-size", "2",
-        "--chunk-rows", "2", "--row-group-rows", "2",
-    ])
-    assert rc == 0
-    out = json.loads(capsys.readouterr().out.strip())
-    assert out["rows_written"] > 0
-    r = rd.open_dataset(str(root), validate_on_open=True)
-    table = r.read_table(columns=(mf.LOCAL_TS_US_COLUMN, mf.EVENT_SEQ_COLUMN))
-    local = table[mf.LOCAL_TS_US_COLUMN].to_pylist()
-    seq = table[mf.EVENT_SEQ_COLUMN].to_pylist()
-    assert local == sorted(local)
-    assert seq == sorted(seq)
-
-
-def test_work_dir_removed_on_success(tmp_path: Path, capsys):
-    wd = tmp_path / "wd"
-    _, out = _run_ok(tmp_path, capsys, "--work-dir", str(wd))
-    assert not wd.exists()
-    assert out["work_dir_removed"] is True
-
-
-def test_work_dir_preserved_on_failure(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path, symbol="ETHUSDT")
-    root, wd = tmp_path / "ds", tmp_path / "wd"
-    with pytest.raises(ValueError, match="market mismatch"):
-        cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--work-dir", str(wd)])
-    assert wd.exists()
-    assert not (root / "manifest.json").exists()
-
-
-def test_end_to_end_with_explicit_splits(tmp_path: Path, capsys):
-    root, out = _run_ok(tmp_path, capsys, "--split-train", "1000000:3500000", "--split-val", "3500000:6500000")
-    man = mf.read_manifest_json(root / "manifest.json")
-    roles = {s.role.value for s in man.splits}
-    assert "train" in roles and "val" in roles
-    assert out["splits_written"] is True
-    assert "train" in out["split_roles"] and "val" in out["split_roles"]
-
-
-def test_reject_partial_split_args(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path)
-    root, wd = tmp_path / "ds", tmp_path / "wd"
-    with pytest.raises(ValueError, match="both --split-train and --split-val"):
-        cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--split-train", "1:2", "--work-dir", str(wd)])
-    assert not (root / "manifest.json").exists()
-    assert not wd.exists()
-
-
-def test_pending_eof_decisions_are_not_force_labeled(tmp_path: Path, capsys):
-    b, t = _book_trade_files(tmp_path, n_book=12, n_trade=8)
-    root = tmp_path / "ds"
-    cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--label-horizons-us", "1500000", "--label-entry-delay-us", "1"])
-    out = json.loads(capsys.readouterr().out.strip())
-    assert out["pending_decisions_at_eof"] > 0
-    assert out["rows_written"] < out["decisions_emitted"]
-    r = rd.open_dataset(str(root), validate_on_open=True)
-    assert r.total_rows == out["rows_written"]
-
-
-def test_stdout_summary_is_compact_and_has_no_large_state(tmp_path: Path, capsys):
-    _, out = _run_ok(tmp_path, capsys)
-    assert {"status", "dataset_root", "dataset_id", "segments", "rows", "decisions_emitted", "rows_written"}.issubset(out)
-    for k in ["feature_values", "features", "label_values", "model", "preprocess", "diagnostics_state", "transform_state"]:
-        assert k not in out
-    assert len(json.dumps(out)) < 5000
-
-
-def test_existing_manifest_fails_before_work(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path)
-    root, wd = tmp_path / "ds", tmp_path / "wd"
-    root.mkdir(parents=True)
-    (root / "manifest.json").write_text("{}")
-    with pytest.raises(FileExistsError, match="manifest already exists"):
-        cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--work-dir", str(wd)])
-    assert not wd.exists()
-
-
-def test_existing_segments_fail_before_work(tmp_path: Path):
-    b, t = _book_trade_files(tmp_path)
-    root, wd = tmp_path / "ds", tmp_path / "wd"
-    (root / "segments").mkdir(parents=True)
-    (root / "segments" / "x.parquet").write_bytes(b"x")
-    with pytest.raises(FileExistsError, match="existing parquet segments"):
-        cli.main(["--dataset-root", str(root), "--dataset-id", "x", "--book-csv", str(b), "--trades-csv", str(t), "--work-dir", str(wd)])
-    assert not wd.exists()
-
-
-def test_subprocess_help_entrypoint():
-    p = subprocess.run(
-        [sys.executable, "-m", "mmrt.cli.ingest", "--help"],
-        capture_output=True,
-        text=True,
+    reader = rd.open_dataset(str(dataset_root), validate_on_open=True)
+    table = reader.read_table()
+    manifest = reader.manifest
+    dataset_features = np.column_stack(
+        [np.asarray(table[c], dtype=np.float32) for c in manifest.feature_columns]
     )
-    assert p.returncode == 0
-    assert "--dataset-root" in p.stdout
-    assert "--book-csv" in p.stdout
-    assert "--trades-csv" in p.stdout
-    assert "--split-train" in p.stdout
-    assert "--book" + "-data-type" not in p.stdout
-    assert "--validate" + "-output" not in p.stdout
-    assert "--no" + "-validate-output" not in p.stdout
+    dataset_local_ts = np.asarray(table[mf.LOCAL_TS_US_COLUMN], dtype=np.int64)
+
+    serving = build_execution_linear_feature_dataset(
+        tape, decision_interval_us=cfg.DEFAULT_DECISION_STRIDE_US
+    )
+    assert serving.feature_names == manifest.feature_columns
+    n = dataset_features.shape[0]
+    assert 0 < n <= serving.num_decisions
+    np.testing.assert_array_equal(dataset_local_ts, serving.decision_local_ts_us[:n])
+    np.testing.assert_array_equal(dataset_features, serving.features[:n])
 
 
-class _NoopWriter:
-    def append_values(self, **kwargs):
-        raise AssertionError("writer should not be called for malformed rows")
+def test_ingest_applies_chronological_splits(tmp_path):
+    tape, tape_root = _saved_tape(tmp_path)
+    events_ts = np.asarray(tape.arrays.events["local_ts_us"], dtype=np.int64)
+    start = int(events_ts[0])
+    end = int(events_ts[-1]) + 1
+    mid_point = start + (end - start) * 2 // 3
+    dataset_root = _run_ingest(
+        tmp_path,
+        tape_root,
+        "--split-train", f"{start}:{mid_point}",
+        "--split-val", f"{mid_point}:{end}",
+        "--purge-before-us", "0",
+        "--purge-after-us", "0",
+        "--embargo-before-us", "0",
+        "--embargo-after-us", "0",
+    )
+    reader = rd.open_dataset(str(dataset_root), validate_on_open=True)
+    roles = {s.role.value for s in reader.manifest.splits}
+    assert roles == {"train", "val"}
 
 
-def _merged_trade_row(price=100.0, amount=1.0):
-    return {
-        cli.em.EVENT_TYPE_CODE: cli.em.EVENT_TYPE_CODE_TRADE,
-        cli.em.EVENT_SEQ: 0,
-        cli.tc.LOCAL_TS_US: 1,
-        cli.tc.TS_US: 1,
-        "price": price,
-        "amount": amount,
-        "side_code": 1,
-    }
+def test_ingest_rejects_non_default_stride(tmp_path):
+    _, tape_root = _saved_tape(tmp_path)
+    with pytest.raises(ValueError, match="decision_stride_us"):
+        cli.main([
+            "--dataset-root", str(tmp_path / "ds"),
+            "--dataset-id", "ds",
+            "--tape-root", str(tape_root),
+            "--decision-stride-us", "250000",
+        ])
 
 
-def _merged_book_row(**overrides):
-    row = {
-        cli.em.EVENT_TYPE_CODE: cli.em.EVENT_TYPE_CODE_BOOK_SNAPSHOT,
-        cli.em.EVENT_SEQ: 0,
-        cli.tc.LOCAL_TS_US: 1,
-        cli.tc.TS_US: 1,
-    }
-    for i in range(25):
-        row[f"bid_px_{i:02d}"] = 99.0 - i * 0.1
-        row[f"bid_sz_{i:02d}"] = 1.0
-        row[f"ask_px_{i:02d}"] = 101.0 + i * 0.1
-        row[f"ask_sz_{i:02d}"] = 1.0
-    row.update(overrides)
-    return row
+def test_ingest_rejects_existing_manifest(tmp_path):
+    _, tape_root = _saved_tape(tmp_path)
+    dataset_root = _run_ingest(tmp_path, tape_root)
+    with pytest.raises(FileExistsError):
+        cli.main([
+            "--dataset-root", str(dataset_root),
+            "--dataset-id", "ds-again",
+            "--tape-root", str(tape_root),
+        ])
 
 
-def test_ingest_rejects_bad_trade_price():
-    with pytest.raises(ValueError, match="bad trade row"):
-        cli._run_causal_ingest_rows([_merged_trade_row(price="bad")], _NoopWriter(), cfg.default_config(), None)
+def test_ingest_split_args_require_train_and_val(tmp_path):
+    _, tape_root = _saved_tape(tmp_path)
+    with pytest.raises(ValueError, match="split-train"):
+        cli.main([
+            "--dataset-root", str(tmp_path / "ds"),
+            "--dataset-id", "ds",
+            "--tape-root", str(tape_root),
+            "--split-test", "1:2",
+        ])
 
 
-def test_ingest_rejects_bad_book_top():
-    with pytest.raises(ValueError, match="bad book row"):
-        cli._run_causal_ingest_rows([_merged_book_row(bid_px_00=0.0)], _NoopWriter(), cfg.default_config(), None)
-
-
-def test_ingest_rejects_partial_book_level():
-    with pytest.raises(ValueError, match="bad book row"):
-        cli._run_causal_ingest_rows([_merged_book_row(bid_px_01=0.0, bid_sz_01=1.0)], _NoopWriter(), cfg.default_config(), None)
+def test_ingest_max_events_limits_replay(tmp_path, capsys):
+    _, tape_root = _saved_tape(tmp_path, n_l2=240)
+    _run_ingest(tmp_path, tape_root, "--max-events", "200")
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    full_root = tmp_path / "dataset_full"
+    rc = cli.main([
+        "--dataset-root", str(full_root),
+        "--dataset-id", "ds-full",
+        "--tape-root", str(tape_root),
+    ])
+    assert rc == 0
+    full_summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["rows"] < full_summary["rows"]

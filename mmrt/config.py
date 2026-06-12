@@ -18,7 +18,7 @@ DEFAULT_EXCHANGE = "binance-futures"
 DEFAULT_SYMBOL = "BTCUSDT"
 
 DEFAULT_SOURCE_DATA_TYPES = (
-    TardisDataType.BOOK_SNAPSHOT_25,
+    TardisDataType.INCREMENTAL_BOOK_L2,
     TardisDataType.TRADES,
 )
 
@@ -103,8 +103,8 @@ class DataConfig:
 
     def __post_init__(self) -> None:
         source = _tuple_of_unique_data_types(self.source_data_types, "source_data_types")
-        if set(source) != {TardisDataType.BOOK_SNAPSHOT_25, TardisDataType.TRADES}:
-            raise ValueError("source_data_types must be exactly BOOK_SNAPSHOT_25 and TRADES")
+        if set(source) != {TardisDataType.INCREMENTAL_BOOK_L2, TardisDataType.TRADES}:
+            raise ValueError("source_data_types must be exactly INCREMENTAL_BOOK_L2 and TRADES")
         object.__setattr__(self, "source_data_types", source)
 
 

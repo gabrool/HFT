@@ -33,9 +33,6 @@ forbidden = (
     "pan" + "das",
     "tor" + "ch",
     "pya" + "rrow",
-    "mmrt.data.tardis_csv",
-    "mmrt.data.event_merge",
-    "mmrt.data.quality",
     "CM" + "SSL17",
     "offline_" + "ingest",
 )

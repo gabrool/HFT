@@ -59,7 +59,7 @@ after=set(sys.modules)-before
 forbidden=(
  'pan'+'das','po'+'lars','to'+'rch','sk'+'learn','aeon','sktime','num'+'ba',
  'mmrt.features.engine','mmrt.features.la'+'bels','mmrt.features.trans'+'forms',
- 'mmrt.data.tardis_csv','mmrt.data.event_merge','mmrt.storage.reader','mmrt.storage.writer','mmrt.storage.splits',
+ 'mmrt.storage.reader','mmrt.storage.writer','mmrt.storage.splits',
  'CM'+'SSL17','offline_'+'ingest',
 )
 mods='\\n'.join(sorted(after))

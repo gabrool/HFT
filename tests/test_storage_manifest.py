@@ -77,7 +77,7 @@ def test_no_forbidden_imports():
     delta = set(out.splitlines())
     forbidden = {
         "pan" + "das", "po" + "lars", "to" + "rch", "py" + "arrow", "mmrt.features.engine", "mmrt.features.la" + "bels",
-        "mmrt.data.tardis_csv", "mmrt.data.event_merge", "mmrt.data.quality", "mmrt.storage.writer", "mmrt.storage.reader",
+        "mmrt.storage.writer", "mmrt.storage.reader",
         "mmrt.storage.splits", "mmrt.linear", "CM" + "SSL17", "offline_" + "ingest",
     }
     for mod in delta:

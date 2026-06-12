@@ -15,6 +15,7 @@ from mmrt.storage import reader as rd
 from mmrt.storage import writer as wr
 from mmrt.storage import splits as sp
 from mmrt.linear import train as tr
+from mmrt.features.transforms import TransformConfig
 from mmrt.linear import extractors as ex
 from mmrt.linear import head_features as hf
 from mmrt.linear import models as lm
@@ -32,7 +33,7 @@ def label_values(ret_bps: float) -> tuple[float, ...]:
 
 def make_dataset_with_splits(tmp_path: Path, *, with_test: bool = True, with_splits: bool = True, train_only: bool = False, train_zero_rows: bool = False):
     root = tmp_path / "ds"
-    cfg = wr.WriterConfig(dataset_id="d1", created_at_utc="2026-01-01T00:00:00Z", dataset_root=str(root), chunk_rows=4)
+    cfg = wr.WriterConfig(dataset_id="d1", created_at_utc="2026-01-01T00:00:00Z", dataset_root=str(root), transform_config=TransformConfig().as_dict(), chunk_rows=4)
     writer = wr.DecisionRowWriter(cfg)
     rets = [-2.0, -1.0, 0.0, 1.0, 2.0, -3.0, -1.5, 1.5, 0.5, -0.5, 2.5, -2.5]
     for i, ret in enumerate(rets):
@@ -79,7 +80,7 @@ def test_no_forbidden_imports():
     for bad in [
         "import pan" + "das", "from pan" + "das", "import po" + "lars", "from po" + "lars",
         "import to" + "rch", "from to" + "rch", "import sk" + "learn", "from sk" + "learn",
-        "from mmrt.data", "import mmrt.data", "from mmrt.features.engine", "from mmrt.features.labels", "from mmrt.features.transforms",
+        "from mmrt.features.engine", "from mmrt.features.labels", "from mmrt.features.transforms",
         "CM" + "SSL", "offline_" + "ingest", "linear_" + "offline", "BY" + "BIT",
         "Mini" + "Rocket", "Multi" + "Rocket", "Hy" + "dra", "Ae" + "on", "P" + "CA", "Standard" + "Scaler",
         "stage" + "1", "stage" + "2", "stage" + "3", "stage" + "4", "stage" + "5",
@@ -294,7 +295,7 @@ def test_result_dataclass_validation():
     with pytest.raises(ValueError):
         tr.SplitEvaluation(role="bad", n_rows=0, evaluation={}, diagnostics={})
     with pytest.raises(ValueError):
-        tr.LinearTrainResult(schema="bad", dataset_id="d", manifest_hash="h", config={}, preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
+        tr.LinearTrainResult(schema="bad", dataset_id="d", manifest_hash="h", config={}, transform_config=TransformConfig().as_dict(), preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": se}, selection_summary={})
 
 
 def test_linear_train_result_rejects_non_dict_splits():
@@ -304,6 +305,7 @@ def test_linear_train_result_rejects_non_dict_splits():
             dataset_id="d1",
             manifest_hash="h1",
             config={},
+            transform_config=TransformConfig().as_dict(),
             preprocess_state={},
             model_bundle_state={},
             splits=[],  # type: ignore[arg-type]
@@ -548,6 +550,7 @@ def _minimal_train_result(cols_by_head=None):
         dataset_id="dataset",
         manifest_hash="hash",
         config={"resolved_head_features": {"feature_columns_by_head": {h: list(cols_by_head[h]) for h in lm.MODEL_HEADS}}},
+        transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: states[h].as_dict() for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),
         splits={"train": tr.SplitEvaluation("train", 1, {}, {}), "val": tr.SplitEvaluation("val", 1, {}, {})},

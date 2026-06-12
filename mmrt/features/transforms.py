@@ -416,10 +416,55 @@ def transform_feature_matrix_causal_local(local_ts_us: np.ndarray, raw_matrix: n
     transformed = transformer.transform_many_local(local_ts_us, raw_matrix)
     return transformed, transformer.snapshot(), transformer.diagnostics_snapshot()
 
+
+_TRANSFORM_CONFIG_FIELDS = (
+    "fast_half_life_us",
+    "medium_half_life_us",
+    "slow_half_life_us",
+    "min_obs",
+    "variance_floor",
+    "z_clip",
+    "raw_clip",
+    "bounded_abs_clip",
+    "output_dtype",
+)
+
+
+def transform_config_from_dict(payload) -> TransformConfig:
+    """Rebuild a TransformConfig from a stored identity payload.
+
+    The payload must carry the feature name/spec hashes of the code that
+    produced it; a hash mismatch means the stored transform belongs to a
+    different feature registry and cannot be reproduced by this code.
+    """
+    if not isinstance(payload, dict):
+        try:
+            payload = dict(payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("transform config payload must be a mapping") from exc
+    missing = [k for k in (*_TRANSFORM_CONFIG_FIELDS, "feature_names_hash", "feature_specs_hash") if k not in payload]
+    if missing:
+        raise ValueError(f"transform config payload missing fields: {missing}")
+    if payload["feature_names_hash"] != FEATURE_NAMES_HASH:
+        raise ValueError("transform config feature_names_hash does not match current feature registry")
+    if payload["feature_specs_hash"] != FEATURE_SPECS_HASH:
+        raise ValueError("transform config feature_specs_hash does not match current feature registry")
+    return TransformConfig(
+        fast_half_life_us=int(payload["fast_half_life_us"]),
+        medium_half_life_us=int(payload["medium_half_life_us"]),
+        slow_half_life_us=int(payload["slow_half_life_us"]),
+        min_obs=int(payload["min_obs"]),
+        variance_floor=float(payload["variance_floor"]),
+        z_clip=float(payload["z_clip"]),
+        raw_clip=float(payload["raw_clip"]),
+        bounded_abs_clip=float(payload["bounded_abs_clip"]),
+        output_dtype=str(payload["output_dtype"]),
+    )
+
 __all__ = [
     "DEFAULT_FAST_HALF_LIFE_US", "DEFAULT_MEDIUM_HALF_LIFE_US", "DEFAULT_SLOW_HALF_LIFE_US", "DEFAULT_MIN_OBS",
     "DEFAULT_VARIANCE_FLOOR", "DEFAULT_Z_CLIP", "DEFAULT_RAW_CLIP", "DEFAULT_BOUNDED_ABS_CLIP", "TransformConfig",
     "TransformDiagnostics", "TransformStateSnapshot", "CausalFeatureTransformer", "feature_transform_keys",
     "transform_key_for_feature", "ewma_feature_indices", "no_ewma_feature_indices", "base_transform_values",
-    "transform_feature_matrix_causal_local",
+    "transform_feature_matrix_causal_local", "transform_config_from_dict",
 ]

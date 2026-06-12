@@ -79,7 +79,6 @@ mods_after = set(sys.modules)
 new = mods_after - mods_before
 forbidden = [
     'pan'+'das', 'po'+'lars', 'to'+'rch', 'py'+'arrow',
-    'mmrt.data.tardis_csv', 'mmrt.data.event_merge', 'mmrt.data.quality',
     'mmrt.features.'+'engine', 'mmrt.features.'+'trans'+'forms', 'CM'+'SSL17', 'offline_'+'ingest'
 ]
 for f in forbidden:

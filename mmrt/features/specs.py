@@ -11,13 +11,13 @@ import hashlib
 import re
 from typing import Iterable, Mapping, Sequence
 
-FEATURE_SCHEMA = "mmrt_features_snapshot25_trades_active44_ctx4_corr90"
+FEATURE_SCHEMA = "mmrt_features_tape25_trades_active44_ctx4_corr90"
 
 CORE_FEATURE_COUNT = 44
 EVENT_CONTEXT_FEATURE_COUNT = 4
 FEATURE_COUNT = 48
 
-REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH = 25
+REQUIRED_BOOK_SNAPSHOT_DEPTH = 25
 MAX_REQUIRED_BOOK_FEATURE_DEPTH = 20
 
 SUPPORTED_WINDOWS_US = (
@@ -206,7 +206,7 @@ class FeatureSpec:
                 raise ValueError("unsupported window")
         object.__setattr__(self, "windows_us", windows_us)
         required_book_depth = _require_nonnegative_int(self.required_book_depth, "required_book_depth")
-        if required_book_depth > REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH:
+        if required_book_depth > REQUIRED_BOOK_SNAPSHOT_DEPTH:
             raise ValueError("required_book_depth exceeds snapshot depth")
         object.__setattr__(self, "required_book_depth", required_book_depth)
         object.__setattr__(self, "formula_group", _require_nonempty_str(self.formula_group, "formula_group"))
@@ -619,7 +619,7 @@ def required_windows_us() -> tuple[int, ...]:
 def max_required_book_depth() -> int:
     return max(spec.required_book_depth for spec in FEATURE_SPECS)
 
-assert max_required_book_depth() <= REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH
+assert max_required_book_depth() <= REQUIRED_BOOK_SNAPSHOT_DEPTH
 
 def schema_record() -> Mapping[str, object]:
     return {
@@ -629,7 +629,7 @@ def schema_record() -> Mapping[str, object]:
       "feature_specs_hash": FEATURE_SPECS_HASH,
       "feature_dtype": DEFAULT_FEATURE_DTYPE,
       "time_unit": "us",
-      "required_tardis_book_snapshot_depth": REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH,
+      "required_book_snapshot_depth": REQUIRED_BOOK_SNAPSHOT_DEPTH,
       "max_required_book_feature_depth": MAX_REQUIRED_BOOK_FEATURE_DEPTH,
       "source_counts": {s.value: len(feature_indices_by_source(s)) for s in FeatureSource},
       "owner_counts": {o.value: len(feature_indices_by_owner(o)) for o in FeatureOwner},
@@ -638,7 +638,7 @@ def schema_record() -> Mapping[str, object]:
 
 __all__ = [
     "FEATURE_SCHEMA", "CORE_FEATURE_COUNT", "EVENT_CONTEXT_FEATURE_COUNT", "FEATURE_COUNT",
-    "REQUIRED_TARDIS_BOOK_SNAPSHOT_DEPTH", "MAX_REQUIRED_BOOK_FEATURE_DEPTH", "SUPPORTED_WINDOWS_US",
+    "REQUIRED_BOOK_SNAPSHOT_DEPTH", "MAX_REQUIRED_BOOK_FEATURE_DEPTH", "SUPPORTED_WINDOWS_US",
     "DEFAULT_FEATURE_DTYPE", "CORE_FEATURE_NAMES", "EVENT_CONTEXT_FEATURE_NAMES", "FeatureSource",
     "FeatureOwner", "FeatureFamily", "FeatureUnit", "TransformKey", "FeatureSpec", "FEATURE_SPECS",
     "FEATURE_NAMES", "FEATURE_NAME_TO_INDEX", "FEATURE_NAMES_HASH", "FEATURE_SPECS_HASH",

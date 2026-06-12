@@ -21,7 +21,6 @@ from mmrt.contracts import (
 def test_current_tardis_data_types_only():
     assert tuple(TardisDataType) == (
         TardisDataType.INCREMENTAL_BOOK_L2,
-        TardisDataType.BOOK_SNAPSHOT_25,
         TardisDataType.TRADES,
     )
 
