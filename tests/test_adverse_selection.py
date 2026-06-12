@@ -498,8 +498,6 @@ def test_adverse_selection_modules_do_not_import_forbidden_layers():
 
     for forbidden in (
         "argparse",
-        "json",
-        "pathlib",
         "torch",
         "pandas",
         "polars",

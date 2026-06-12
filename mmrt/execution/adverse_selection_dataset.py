@@ -12,7 +12,7 @@ import numpy as np
 
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
 
-ADVERSE_SELECTION_DATASET_SCHEMA = "mmrt_adverse_selection_dataset" + "_" + "v" + "1"
+ADVERSE_SELECTION_DATASET_SCHEMA = "mmrt_adverse_selection_dataset_v2"
 
 
 def _nonempty_str(value: str, name: str) -> str:
@@ -64,6 +64,9 @@ class AdverseSelectionDatasetManifest:
     num_features: int
     num_labels: int
     config_json: str
+    index_schema: str
+    index_manifest_sha256: str
+    index_root: str
     created_at_utc: str
 
     def __post_init__(self) -> None:
@@ -88,6 +91,9 @@ class AdverseSelectionDatasetManifest:
         if self.num_features != len(features) or self.num_labels != len(labels):
             raise ValueError("manifest feature/label counts must match names")
         object.__setattr__(self, "config_json", str(self.config_json))
+        object.__setattr__(self, "index_schema", _nonempty_str(self.index_schema, "index_schema"))
+        object.__setattr__(self, "index_manifest_sha256", _nonempty_str(self.index_manifest_sha256, "index_manifest_sha256"))
+        object.__setattr__(self, "index_root", _nonempty_str(self.index_root, "index_root"))
         object.__setattr__(self, "created_at_utc", _nonempty_str(self.created_at_utc, "created_at_utc"))
 
     def as_dict(self) -> dict[str, object]:
@@ -110,6 +116,9 @@ class AdverseSelectionDatasetManifest:
             "num_features": self.num_features,
             "num_labels": self.num_labels,
             "config_json": self.config_json,
+            "index_schema": self.index_schema,
+            "index_manifest_sha256": self.index_manifest_sha256,
+            "index_root": self.index_root,
             "created_at_utc": self.created_at_utc,
         }
 
@@ -123,6 +132,7 @@ class AdverseSelectionDatasetManifest:
             max_decisions=None if raw.get("max_decisions") is None else int(raw["max_decisions"]),
             feature_names=tuple(raw["feature_names"]), label_names=tuple(raw["label_names"]), num_rows=int(raw["num_rows"]),
             num_features=int(raw["num_features"]), num_labels=int(raw["num_labels"]), config_json=str(raw.get("config_json", "{}")),
+            index_schema=str(raw["index_schema"]), index_manifest_sha256=str(raw["index_manifest_sha256"]), index_root=str(raw["index_root"]),
             created_at_utc=str(raw["created_at_utc"]),
         )
 
@@ -264,7 +274,7 @@ class AdverseSelectionDatasetWriter:
                 tape_start_local_ts_us=int(meta["tape_start_local_ts_us"]), tape_end_local_ts_us=int(meta["tape_end_local_ts_us"]),
                 decision_interval_us=int(meta["decision_interval_us"]), start_event_index=meta.get("start_event_index"), max_decisions=meta.get("max_decisions"),
                 feature_names=self.config.feature_names, label_names=self.config.label_names, num_rows=n, num_features=nf, num_labels=nl,
-                config_json=str(meta.get("config_json", "{}")), created_at_utc=datetime.now(timezone.utc).isoformat(),
+                config_json=str(meta.get("config_json", "{}")), index_schema=str(meta["index_schema"]), index_manifest_sha256=str(meta["index_manifest_sha256"]), index_root=str(meta["index_root"]), created_at_utc=datetime.now(timezone.utc).isoformat(),
             )
             tmp = self.root / "manifest.json.tmp"
             tmp.write_text(json.dumps(manifest.as_dict(), sort_keys=True, indent=2) + "\n", encoding="utf-8")

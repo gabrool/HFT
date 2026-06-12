@@ -22,14 +22,14 @@ from mmrt.execution.adverse_selection import (
     _new_kyle_state,
     adverse_selection_feature_names,
 )
-from mmrt.execution.adverse_selection_index import AdverseSelectionIndexConfig, build_or_load_adverse_selection_index
+from mmrt.execution.adverse_selection_index import AdverseSelectionIndexConfig, adverse_selection_index_manifest_sha256, build_or_load_adverse_selection_index
 from mmrt.execution.contracts import SymbolSpec
 from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_CODE_TRADE, ExecutionTape
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 from collections import deque
 
-ADVERSE_SELECTION_FEATURE_DATASET_SCHEMA = "mmrt_adverse_selection_feature_dataset" + "_" + "v" + "1"
+ADVERSE_SELECTION_FEATURE_DATASET_SCHEMA = "mmrt_adverse_selection_feature_dataset_v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +50,9 @@ class AdverseSelectionFeatureDatasetManifest:
     num_rows: int
     num_features: int
     config_json: str
+    index_schema: str
+    index_manifest_sha256: str
+    index_root: str
     created_at_utc: str
 
     def as_dict(self) -> dict[str, object]:
@@ -59,11 +62,13 @@ class AdverseSelectionFeatureDatasetManifest:
             "tape_start_local_ts_us": self.tape_start_local_ts_us, "tape_end_local_ts_us": self.tape_end_local_ts_us,
             "decision_interval_us": self.decision_interval_us, "start_event_index": self.start_event_index, "max_decisions": self.max_decisions,
             "feature_names": list(self.feature_names), "num_rows": self.num_rows, "num_features": self.num_features,
-            "config_json": self.config_json, "created_at_utc": self.created_at_utc,
+            "config_json": self.config_json, "index_schema": self.index_schema, "index_manifest_sha256": self.index_manifest_sha256, "index_root": self.index_root, "created_at_utc": self.created_at_utc,
         }
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "AdverseSelectionFeatureDatasetManifest":
+        if str(raw["schema"]) != ADVERSE_SELECTION_FEATURE_DATASET_SCHEMA:
+            raise ValueError("invalid adverse-selection feature dataset schema")
         return cls(
             schema=str(raw["schema"]), exchange=str(raw["exchange"]), symbol=str(raw["symbol"]), tape_schema=str(raw["tape_schema"]),
             tape_num_events=int(raw["tape_num_events"]), tape_num_l2_batches=int(raw["tape_num_l2_batches"]), tape_num_trades=int(raw["tape_num_trades"]),
@@ -71,7 +76,7 @@ class AdverseSelectionFeatureDatasetManifest:
             decision_interval_us=int(raw["decision_interval_us"]), start_event_index=None if raw.get("start_event_index") is None else int(raw["start_event_index"]),
             max_decisions=None if raw.get("max_decisions") is None else int(raw["max_decisions"]),
             feature_names=tuple(str(x) for x in raw["feature_names"]), num_rows=int(raw["num_rows"]), num_features=int(raw["num_features"]),
-            config_json=str(raw.get("config_json", "{}")), created_at_utc=str(raw["created_at_utc"]),
+            config_json=str(raw.get("config_json", "{}")), index_schema=str(raw["index_schema"]), index_manifest_sha256=str(raw["index_manifest_sha256"]), index_root=str(raw["index_root"]), created_at_utc=str(raw["created_at_utc"]),
         )
 
 
@@ -120,7 +125,7 @@ class _FeatureWriter:
             tape_num_events=int(m["tape_num_events"]), tape_num_l2_batches=int(m["tape_num_l2_batches"]), tape_num_trades=int(m["tape_num_trades"]),
             tape_start_local_ts_us=int(m["tape_start_local_ts_us"]), tape_end_local_ts_us=int(m["tape_end_local_ts_us"]), decision_interval_us=int(m["decision_interval_us"]),
             start_event_index=m.get("start_event_index"), max_decisions=m.get("max_decisions"), feature_names=self.feature_names, num_rows=self.rows, num_features=len(self.feature_names),
-            config_json=str(m.get("config_json", "{}")), created_at_utc=datetime.now(timezone.utc).isoformat())
+            config_json=str(m.get("config_json", "{}")), index_schema=str(m["index_schema"]), index_manifest_sha256=str(m["index_manifest_sha256"]), index_root=str(m["index_root"]), created_at_utc=datetime.now(timezone.utc).isoformat())
         tmp = self.root / "manifest.json.tmp"; tmp.write_text(json.dumps(manifest.as_dict(), sort_keys=True, indent=2)+"\n", encoding="utf-8"); tmp.replace(manifest_path)
         if self.cleanup_chunks:
             for w in self.writers.values(): w.cleanup()
@@ -131,7 +136,16 @@ class _FeatureWriter:
 def load_adverse_selection_features(root: str | Path, *, mmap_mode: str | None = "r") -> DiskBackedAdverseSelectionFeatureDataset:
     root = Path(root); manifest = AdverseSelectionFeatureDatasetManifest.from_dict(json.loads((root/"manifest.json").read_text()))
     arr = root / "arrays"
-    return DiskBackedAdverseSelectionFeatureDataset(root, manifest, np.load(arr/"decision_local_ts_us.npy", mmap_mode=mmap_mode), np.load(arr/"decision_event_index.npy", mmap_mode=mmap_mode), np.load(arr/"decision_event_seq.npy", mmap_mode=mmap_mode), np.load(arr/"features.npy", mmap_mode=mmap_mode))
+    decision_local_ts_us = np.load(arr/"decision_local_ts_us.npy", mmap_mode=mmap_mode)
+    decision_event_index = np.load(arr/"decision_event_index.npy", mmap_mode=mmap_mode)
+    decision_event_seq = np.load(arr/"decision_event_seq.npy", mmap_mode=mmap_mode)
+    features = np.load(arr/"features.npy", mmap_mode=mmap_mode)
+    n = manifest.num_rows
+    if decision_local_ts_us.dtype != np.int64 or decision_local_ts_us.shape != (n,): raise ValueError("decision_local_ts_us shape/dtype mismatch")
+    if decision_event_index.dtype != np.int64 or decision_event_index.shape != (n,): raise ValueError("decision_event_index shape/dtype mismatch")
+    if decision_event_seq.dtype != np.int64 or decision_event_seq.shape != (n,): raise ValueError("decision_event_seq shape/dtype mismatch")
+    if features.dtype != np.float32 or features.shape != (n, manifest.num_features): raise ValueError("features shape/dtype mismatch")
+    return DiskBackedAdverseSelectionFeatureDataset(root, manifest, decision_local_ts_us, decision_event_index, decision_event_seq, features)
 
 
 def build_adverse_selection_features_to_disk(tape: ExecutionTape, *, config: AdverseSelectionConfig, output_root: str | Path, work_dir: str | Path | None = None, chunk_rows: int = 100_000, overwrite: bool = False, cleanup_chunks: bool = True, cleanup_work_dir: bool = True, progress_interval: int | None = None) -> DiskBackedAdverseSelectionFeatureDataset:
@@ -142,7 +156,7 @@ def build_adverse_selection_features_to_disk(tape: ExecutionTape, *, config: Adv
     if index.valid_l2.count == 0: raise ValueError("tape must contain at least one valid two-sided L2 book")
     feature_names = adverse_selection_feature_names(config)
     manifest = tape.manifest
-    writer = _FeatureWriter(root, feature_names, chunk_rows, overwrite, cleanup_chunks, {"exchange": manifest.exchange, "symbol": manifest.symbol, "tape_schema": manifest.schema, "tape_num_events": manifest.num_events, "tape_num_l2_batches": manifest.num_l2_batches, "tape_num_trades": manifest.num_trades, "tape_start_local_ts_us": manifest.start_local_ts_us, "tape_end_local_ts_us": manifest.end_local_ts_us, "decision_interval_us": config.decision_interval_us, "start_event_index": config.start_event_index, "max_decisions": config.max_decisions, "config_json": json.dumps(_adverse_config_summary(config), sort_keys=True)})
+    writer = _FeatureWriter(root, feature_names, chunk_rows, overwrite, cleanup_chunks, {"exchange": manifest.exchange, "symbol": manifest.symbol, "tape_schema": manifest.schema, "tape_num_events": manifest.num_events, "tape_num_l2_batches": manifest.num_l2_batches, "tape_num_trades": manifest.num_trades, "tape_start_local_ts_us": manifest.start_local_ts_us, "tape_end_local_ts_us": manifest.end_local_ts_us, "decision_interval_us": config.decision_interval_us, "start_event_index": config.start_event_index, "max_decisions": config.max_decisions, "config_json": json.dumps(_adverse_config_summary(config), sort_keys=True), "index_schema": index.manifest.schema, "index_manifest_sha256": adverse_selection_index_manifest_sha256(index.root), "index_root": str(index.root)})
     vpin_state = VPINState(config.vpin, deque()); kyle_state = _new_kyle_state(config.kyle); next_sample = 0
     flow_states = tuple(_TradeWindowState(w) for w in config.flow_windows_us)
     events = tape.arrays.events; trades = tape.arrays.trades

@@ -111,10 +111,64 @@ def test_adverse_selection_signal_build_cli_has_no_rl_dependencies():
         assert forbidden not in source
 
 
-def test_no_timestamp_only_kyle_mid_helper_left():
+def test_disk_adverse_builder_does_not_call_full_copy_helpers():
     source = Path("mmrt/execution/adverse_selection.py").read_text(encoding="utf-8")
-    assert "_precompute_kyle_samples" in source
-    assert "_future_mid_and_key_at_or_after_key" in source
+    body = source.split("def build_adverse_selection_dataset_to_disk", 1)[1]
+    forbidden = [
+        "_valid_l2_view_from_tape(",
+        "_valid_l2_views(",
+        "_trade_flow_view_from_tape(",
+        "_precompute_kyle_samples(",
+        "_kyle_samples_for_disk_builder(",
+        'np.asarray(events["local_ts_us"], dtype=np.int64)',
+        'np.asarray(tape.arrays.events["local_ts_us"], dtype=np.int64)',
+        "feature_rows.append",
+        "label_rows.append",
+        "mask_rows.append",
+        "kept_features.append",
+    ]
+    offenders = [token for token in forbidden if token in body]
+    assert offenders == []
+
+
+def test_build_adverse_selection_signals_large_path_is_disk_backed():
+    source = Path("mmrt/cli/build_adverse_selection_signals.py").read_text(encoding="utf-8")
+    body = source.split("def build_adverse_selection_signals_from_config", 1)[1]
+    assert "build_adverse_selection_features_to_disk" in body
+    assert "build_adverse_selection_feature_dataset(" not in body
+
+
+def test_adverse_streaming_fit_approx_auc_does_not_concatenate_scores():
+    source = Path("mmrt/execution/adverse_selection_fit.py").read_text(encoding="utf-8")
+    body = source.split("def fit_adverse_baselines_streaming", 1)[1]
+    assert "BinaryHistogramAUC" in source
+    assert "approx_histogram" in body
+    if "np.concatenate" in body:
+        assert 'metrics_mode == "exact"' in body or "metrics_mode == 'exact'" in body
+
+
+def test_linear_audit_does_not_accumulate_full_column_lists():
+    source = Path("mmrt/execution/linear_feature_audit.py").read_text(encoding="utf-8")
+    assert "raw_cols" not in source
+    assert "z_cols" not in source
+
+
+def test_train_adverse_selection_progress_interval_is_wired():
+    source = Path("mmrt/cli/train_adverse_selection.py").read_text(encoding="utf-8")
+    assert "progress_interval" in source
+    assert "progress_interval=config.progress_interval" in source
+
+
+def test_build_adverse_selection_signals_progress_interval_is_wired():
+    source = Path("mmrt/cli/build_adverse_selection_signals.py").read_text(encoding="utf-8")
+    assert "--progress-interval" in source
+    assert "progress_interval=config.progress_interval" in source
+
+
+def test_build_adverse_selection_signals_large_path_does_not_construct_full_artifact():
+    source = Path("mmrt/cli/build_adverse_selection_signals.py").read_text(encoding="utf-8")
+    body = source.split("def build_adverse_selection_signals_from_config", 1)[1]
+    assert "AdverseSelectionSignalArtifact(" not in body
 
 
 def test_env_does_not_hard_gate_quotes_from_executable_edge():
