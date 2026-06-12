@@ -18,13 +18,17 @@ from mmrt.execution.adverse_selection import (
     KyleLambdaConfig,
     quote_candidate_configs_from_names,
     VPINConfig,
-    build_adverse_selection_dataset,
-    summarize_adverse_selection_dataset,
+    build_adverse_selection_dataset_to_disk,
+    summarize_disk_adverse_selection_dataset,
+    adverse_selection_feature_names,
+    adverse_selection_label_names,
 )
 from mmrt.execution.contracts import LatencyConfig, QueueModelMode
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
+from mmrt.execution.adverse_selection_dataset import estimate_adverse_dataset_bytes
+from mmrt.execution.adverse_selection_fit import fit_adverse_baselines_streaming
 
 __all__ = [
     "AdverseSelectionTrainCLIConfig",
@@ -188,6 +192,13 @@ class AdverseSelectionTrainCLIConfig:
     model_npz: str | None = None
     overwrite: bool = False
     mmap_mode: str | None = "r"
+    dataset_root: str | None = None
+    work_dir: str | None = None
+    chunk_rows: int = 100_000
+    keep_dataset: bool = True
+    cleanup_work_dir: bool = True
+    metrics_mode: str = "approx"
+    auc_bins: int = 2000
 
     decision_interval_us: int = 500_000
     start_event_index: int | None = None
@@ -236,6 +247,16 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "overwrite", _require_bool(self.overwrite, "overwrite"))
         if self.mmap_mode not in (None, "r"):
             raise ValueError("mmap_mode must be None or 'r'")
+        if self.dataset_root is not None:
+            object.__setattr__(self, "dataset_root", _require_nonempty_str(self.dataset_root, "dataset_root"))
+        if self.work_dir is not None:
+            object.__setattr__(self, "work_dir", _require_nonempty_str(self.work_dir, "work_dir"))
+        object.__setattr__(self, "chunk_rows", _require_positive_int(self.chunk_rows, "chunk_rows"))
+        object.__setattr__(self, "keep_dataset", _require_bool(self.keep_dataset, "keep_dataset"))
+        object.__setattr__(self, "cleanup_work_dir", _require_bool(self.cleanup_work_dir, "cleanup_work_dir"))
+        if self.metrics_mode not in ("approx", "none", "exact"):
+            raise ValueError("metrics_mode must be approx, none, or exact")
+        object.__setattr__(self, "auc_bins", _require_positive_int(self.auc_bins, "auc_bins"))
         object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
         object.__setattr__(self, "start_event_index", _optional_nonnegative_int(self.start_event_index, "start_event_index"))
         object.__setattr__(self, "max_decisions", _optional_positive_int(self.max_decisions, "max_decisions"))
@@ -332,6 +353,13 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "model_npz": config.model_npz,
         "overwrite": config.overwrite,
         "mmap_mode": config.mmap_mode,
+        "dataset_root": config.dataset_root,
+        "work_dir": config.work_dir,
+        "chunk_rows": config.chunk_rows,
+        "keep_dataset": config.keep_dataset,
+        "cleanup_work_dir": config.cleanup_work_dir,
+        "metrics_mode": config.metrics_mode,
+        "auc_bins": config.auc_bins,
         "decision_interval_us": config.decision_interval_us,
         "start_event_index": config.start_event_index,
         "max_decisions": config.max_decisions,
@@ -643,14 +671,30 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
     adverse_config = _build_adverse_selection_config(config)
-    dataset = build_adverse_selection_dataset(tape, config=adverse_config)
-    dataset_summary = summarize_adverse_selection_dataset(dataset)
-    baseline_fit = _fit_baselines(
+    dataset_root = Path(config.dataset_root) if config.dataset_root is not None else Path(config.tape_root) / "adverse_selection_dataset"
+    feature_count = len(adverse_selection_feature_names(adverse_config))
+    label_count = len(adverse_selection_label_names(adverse_config))
+    duration_us = max(0, int(tape.manifest.end_local_ts_us) - int(tape.manifest.start_local_ts_us))
+    decisions_est = 0 if config.decision_interval_us <= 0 else duration_us // config.decision_interval_us + 1
+    disk_estimate = estimate_adverse_dataset_bytes(num_decisions_estimate=decisions_est, num_features=feature_count, num_labels=label_count)
+    dataset = build_adverse_selection_dataset_to_disk(
+        tape,
+        config=adverse_config,
+        output_root=dataset_root,
+        chunk_rows=config.chunk_rows,
+        overwrite=config.overwrite,
+        cleanup_chunks=True,
+    )
+    dataset_summary = summarize_disk_adverse_selection_dataset(dataset, chunk_rows=config.chunk_rows)
+    baseline_fit = fit_adverse_baselines_streaming(
         dataset,
         target_names=_resolve_target_names(dataset, config.target_names),
         train_fraction=config.train_fraction,
         ridge_l2=config.ridge_l2,
         min_train_samples=config.min_train_samples,
+        chunk_rows=config.chunk_rows,
+        metrics_mode=config.metrics_mode,
+        auc_bins=config.auc_bins,
     )
     baseline_summary = baseline_fit.metrics
     model_written = False
@@ -678,6 +722,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         "status": status,
         "run_type": "train_adverse_selection",
         "tape_root": str(Path(config.tape_root)),
+        "dataset_root": str(dataset_root),
         "output_json": str(output_json),
         "model_npz": str(model_npz) if model_written else None,
         "config": _summary_config(config),
@@ -694,8 +739,20 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         },
         "dataset": dataset_summary,
         "baseline": baseline_summary,
+        "resource_mode": {
+            "disk_backed_dataset": True,
+            "chunk_rows": config.chunk_rows,
+            "metrics_mode": config.metrics_mode,
+            "auc_bins": config.auc_bins,
+            "keep_dataset": config.keep_dataset,
+            "cleanup_work_dir": config.cleanup_work_dir,
+        },
+        "disk_estimate": disk_estimate,
     }
     _write_json_atomic(output_json, summary)
+    if not config.keep_dataset:
+        import shutil
+        shutil.rmtree(dataset_root, ignore_errors=True)
     return summary
 
 
@@ -706,6 +763,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-npz")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
+    parser.add_argument("--dataset-root")
+    parser.add_argument("--work-dir")
+    parser.add_argument("--chunk-rows", type=int, default=100_000)
+    parser.add_argument("--keep-dataset", dest="keep_dataset", action="store_true", default=True)
+    parser.add_argument("--delete-dataset-after-success", dest="keep_dataset", action="store_false")
+    parser.add_argument("--cleanup-work-dir", dest="cleanup_work_dir", action="store_true", default=True)
+    parser.add_argument("--keep-work-dir", dest="cleanup_work_dir", action="store_false")
+    parser.add_argument("--metrics-mode", choices=("approx", "none", "exact"), default="approx")
+    parser.add_argument("--auc-bins", type=int, default=2000)
     parser.add_argument("--decision-interval-us", type=int, default=500_000)
     parser.add_argument("--start-event-index", type=int)
     parser.add_argument("--max-decisions", type=int)
@@ -752,6 +818,13 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         model_npz=args.model_npz,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
+        dataset_root=args.dataset_root,
+        work_dir=args.work_dir,
+        chunk_rows=args.chunk_rows,
+        keep_dataset=args.keep_dataset,
+        cleanup_work_dir=args.cleanup_work_dir,
+        metrics_mode=args.metrics_mode,
+        auc_bins=args.auc_bins,
         decision_interval_us=args.decision_interval_us,
         start_event_index=args.start_event_index,
         max_decisions=args.max_decisions,
