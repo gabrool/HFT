@@ -122,6 +122,9 @@ class RuleCompatibilityReport:
         )
 
 
+_RESIDUAL_FLOAT_GUARD = 1e-9
+
+
 def _nearest_integer(value: Decimal) -> Decimal:
     floor = value.to_integral_value(rounding=ROUND_FLOOR)
     ceil = floor + 1
@@ -145,17 +148,38 @@ class RuleCompatibilityAccumulator:
         self.min_qty: float | None = None
         self.max_qty: float | None = None
         self.examples: list[dict[str, object]] = []
+        self._tick_size_float = float(rules.tick_size)
+        self._step_size_float = float(rules.step_size)
+        self._price_tolerance_float = float(config.price_tolerance_ticks)
+        self._qty_tolerance_float = float(config.qty_tolerance_steps)
+        self._price_tolerance_decimal = Decimal(str(config.price_tolerance_ticks))
+        self._qty_tolerance_decimal = Decimal(str(config.qty_tolerance_steps))
+        self._max_price_residual_float = 0.0
+        self._max_qty_residual_float = 0.0
 
     def observe_price(self, price: float, *, source: str, local_ts_us: int | None = None) -> None:
         if self.config.mode is RuleCompatibilityMode.OFF:
             return
         p = float(price)
         self.price_count += 1
-        self.min_price = p if self.min_price is None else min(self.min_price, p)
-        self.max_price = p if self.max_price is None else max(self.max_price, p)
+        if self.min_price is None or p < self.min_price:
+            self.min_price = p
+        if self.max_price is None or p > self.max_price:
+            self.max_price = p
+        # Fast float screen: skip the exact decimal residual when the value is
+        # comfortably on the grid and cannot raise the running maximum.
+        ratio = p / self._tick_size_float
+        residual_float = abs(ratio - round(ratio))
+        if (
+            residual_float + _RESIDUAL_FLOAT_GUARD < self._price_tolerance_float
+            and residual_float + _RESIDUAL_FLOAT_GUARD <= self._max_price_residual_float
+        ):
+            return
         residual = abs((Decimal(str(price)) / self.rules.tick_size) - _nearest_integer(Decimal(str(price)) / self.rules.tick_size))
-        self.max_price_residual = max(self.max_price_residual, residual)
-        if residual > Decimal(str(self.config.price_tolerance_ticks)):
+        if residual > self.max_price_residual:
+            self.max_price_residual = residual
+            self._max_price_residual_float = float(residual) - _RESIDUAL_FLOAT_GUARD
+        if residual > self._price_tolerance_decimal:
             self.price_violations += 1
             self._add_example("price", p, residual, source, local_ts_us)
 
@@ -164,11 +188,22 @@ class RuleCompatibilityAccumulator:
             return
         q = float(qty)
         self.qty_count += 1
-        self.min_qty = q if self.min_qty is None else min(self.min_qty, q)
-        self.max_qty = q if self.max_qty is None else max(self.max_qty, q)
+        if self.min_qty is None or q < self.min_qty:
+            self.min_qty = q
+        if self.max_qty is None or q > self.max_qty:
+            self.max_qty = q
+        ratio = q / self._step_size_float
+        residual_float = abs(ratio - round(ratio))
+        if (
+            residual_float + _RESIDUAL_FLOAT_GUARD < self._qty_tolerance_float
+            and residual_float + _RESIDUAL_FLOAT_GUARD <= self._max_qty_residual_float
+        ):
+            return
         residual = abs((Decimal(str(qty)) / self.rules.step_size) - _nearest_integer(Decimal(str(qty)) / self.rules.step_size))
-        self.max_qty_residual = max(self.max_qty_residual, residual)
-        if residual > Decimal(str(self.config.qty_tolerance_steps)):
+        if residual > self.max_qty_residual:
+            self.max_qty_residual = residual
+            self._max_qty_residual_float = float(residual) - _RESIDUAL_FLOAT_GUARD
+        if residual > self._qty_tolerance_decimal:
             self.qty_violations += 1
             self._add_example("qty", q, residual, source, local_ts_us)
 

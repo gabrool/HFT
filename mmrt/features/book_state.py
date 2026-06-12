@@ -152,6 +152,28 @@ def _safe_bps_change(new_value: float, old_value: float) -> float:
     return _finite(k.bps_change(new_value, old_value))
 
 
+def _side_depth_aggregates(px: np.ndarray, sz: np.ndarray, mid: float, *, is_bid: bool) -> tuple[float, float, float]:
+    """One-pass size within 1bps, size within 5bps, and notional within 5bps.
+
+    Matches the per-level semantics of kernels.depth_within_bps /
+    kernels.notional_depth_within_bps for the internally maintained
+    (finite, nonnegative) book buffers.
+    """
+    if mid <= 0.0:
+        return 0.0, 0.0, 0.0
+    valid = (px > 0.0) & (sz > 0.0)
+    if is_bid:
+        m1 = valid & (px >= mid * (1.0 - 1.0 / 10_000.0))
+        m5 = valid & (px >= mid * (1.0 - 5.0 / 10_000.0))
+    else:
+        m1 = valid & (px <= mid * (1.0 + 1.0 / 10_000.0))
+        m5 = valid & (px <= mid * (1.0 + 5.0 / 10_000.0))
+    s1 = float(sz @ m1)
+    s5 = float(sz @ m5)
+    n5 = float((px * sz) @ m5)
+    return s1, s5, n5
+
+
 @dataclass(frozen=True, slots=True)
 class BookSnapshotInput:
     local_ts_us: int
@@ -190,6 +212,34 @@ class BookSnapshotInput:
         object.__setattr__(self, "bid_sz", bs)
         object.__setattr__(self, "ask_px", ap)
         object.__setattr__(self, "ask_sz", az)
+
+    @classmethod
+    def from_trusted_arrays(
+        cls,
+        *,
+        local_ts_us: int,
+        ts_us: int,
+        event_seq: int,
+        bid_px: np.ndarray,
+        bid_sz: np.ndarray,
+        ask_px: np.ndarray,
+        ask_sz: np.ndarray,
+    ) -> "BookSnapshotInput":
+        """Construct without re-validation for sources validated upstream.
+
+        Callers must pass contiguous float64 arrays of length BOOK_DEPTH whose
+        levels already satisfy the ordering and two-sidedness invariants
+        (e.g. execution-tape book rows validated at tape build time).
+        """
+        self = object.__new__(cls)
+        object.__setattr__(self, "local_ts_us", local_ts_us)
+        object.__setattr__(self, "ts_us", ts_us)
+        object.__setattr__(self, "event_seq", event_seq)
+        object.__setattr__(self, "bid_px", bid_px)
+        object.__setattr__(self, "bid_sz", bid_sz)
+        object.__setattr__(self, "ask_px", ask_px)
+        object.__setattr__(self, "ask_sz", ask_sz)
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +399,7 @@ class BookState:
         self.last_mid_change_ts_us = None
         self.bid_size_age_start_ts_us = None
         self.ask_size_age_start_ts_us = None
+        self._summary = None
 
     def has_book(self) -> bool:
         return self.update_count > 0
@@ -429,16 +480,17 @@ class BookState:
     def _ofi_by_level(self) -> np.ndarray:
         if self.update_count <= 1:
             return np.zeros(10, dtype=np.float64)
-        out = np.zeros(10, dtype=np.float64)
-        for i in range(10):
-            cbp, pbp = self.current_bid_px[i], self.previous_bid_px[i]
-            cas, pas = self.current_ask_px[i], self.previous_ask_px[i]
-            cbs, pbs = self.current_bid_sz[i], self.previous_bid_sz[i]
-            css, pss = self.current_ask_sz[i], self.previous_ask_sz[i]
-            b = cbs if cbp > pbp else (-pbs if cbp < pbp else cbs - pbs)
-            a = -css if cas < pas else (pss if cas > pas else pss - css)
-            out[i] = b + a
-        return out
+        cbp = self.current_bid_px[:10]
+        pbp = self.previous_bid_px[:10]
+        cbs = self.current_bid_sz[:10]
+        pbs = self.previous_bid_sz[:10]
+        cap = self.current_ask_px[:10]
+        pap = self.previous_ask_px[:10]
+        cas = self.current_ask_sz[:10]
+        pas = self.previous_ask_sz[:10]
+        b = np.where(cbp > pbp, cbs, np.where(cbp < pbp, -pbs, cbs - pbs))
+        a = np.where(cap < pap, -cas, np.where(cap > pap, pas, pas - cas))
+        return b + a
 
     def _l1_add_rem(self) -> tuple[float, float, float, float]:
         if self.update_count <= 1:
@@ -483,10 +535,12 @@ class BookState:
         self.update_count += 1
 
         now = snapshot.local_ts_us
-        mid = self._mid()
-        spread = self._spread_bps()
-        micro = self._microprice_l1()
-        micro_minus_mid = self._micro_minus_mid_bps()
+        bb = float(self.current_bid_px[0])
+        ba = float(self.current_ask_px[0])
+        mid = k._mid_price_impl(bb, ba)
+        spread = _finite(k._spread_bps_impl(bb, ba))
+        micro = k._microprice_impl(bb, ba, float(self.current_bid_sz[0]), float(self.current_ask_sz[0]))
+        micro_minus_mid = _safe_bps_change(micro, mid)
         ofi = self._ofi_by_level()
         ofi_l1 = float(ofi[0])
         ofi_l10 = float(np.sum(ofi[:10]))
@@ -501,13 +555,13 @@ class BookState:
         prev_spread = (
             spread
             if first
-            else _finite(k.spread_bps(self.previous_bid_px[0], self.previous_ask_px[0]))
+            else _finite(k._spread_bps_impl(float(self.previous_bid_px[0]), float(self.previous_ask_px[0])))
         )
         spread_changed = 0.0 if first else float(abs(spread - prev_spread) > FLOAT_EPS)
         prev_mid = (
             mid
             if first
-            else _finite(k.mid_price(self.previous_bid_px[0], self.previous_ask_px[0]))
+            else k._mid_price_impl(float(self.previous_bid_px[0]), float(self.previous_ask_px[0]))
         )
         mid_changed = 0.0 if first else float(abs(mid - prev_mid) > FLOAT_EPS)
 
@@ -525,17 +579,14 @@ class BookState:
             or self.current_ask_sz[0] != self.previous_ask_sz[0]
         ):
             self.ask_size_age_start_ts_us = now
-        total_depth_1bps = self._depth_size_within_bps(
-            "bid", 1.0
-        ) + self._depth_size_within_bps("ask", 1.0)
-        bid_depth_5bps_notional = self._depth_notional_within_bps("bid", 5.0)
-        ask_depth_5bps_notional = self._depth_notional_within_bps("ask", 5.0)
-        total_depth_5bps_notional = bid_depth_5bps_notional + ask_depth_5bps_notional
+        b1s, b5s, b5n = _side_depth_aggregates(self.current_bid_px, self.current_bid_sz, mid, is_bid=True)
+        a1s, a5s, a5n = _side_depth_aggregates(self.current_ask_px, self.current_ask_sz, mid, is_bid=False)
+        total_depth_1bps = b1s + a1s
+        total_depth_5bps_notional = b5n + a5n
         depth_imbalance_5bps = (
             0.0
             if total_depth_5bps_notional <= FLOAT_EPS
-            else (bid_depth_5bps_notional - ask_depth_5bps_notional)
-            / total_depth_5bps_notional
+            else (b5n - a5n) / total_depth_5bps_notional
         )
         self.history.append(
             ts_us=now,
@@ -554,40 +605,35 @@ class BookState:
             ask_price_changed=ask_price_changed,
             spread_changed=spread_changed,
         )
-        return self.current_summary()
-
-    def current_summary(self) -> BookSummary:
-        if not self.has_book():
-            raise ValueError("no book")
-        mid = self._mid()
-        b5s = self._depth_size_within_bps("bid", 5.0)
-        a5s = self._depth_size_within_bps("ask", 5.0)
-        b5n = self._depth_notional_within_bps("bid", 5.0)
-        a5n = self._depth_notional_within_bps("ask", 5.0)
         t5s = b5s + a5s
-        t5n = b5n + a5n
-        return BookSummary(
-            self.last_snapshot.local_ts_us,
-            self.last_snapshot.ts_us,
-            self.last_snapshot.event_seq,
-            self.current_bid_px[0],
-            self.current_ask_px[0],
-            self.current_bid_sz[0],
-            self.current_ask_sz[0],
+        self._summary = BookSummary(
+            snapshot.local_ts_us,
+            snapshot.ts_us,
+            snapshot.event_seq,
+            bb,
+            ba,
+            float(self.current_bid_sz[0]),
+            float(self.current_ask_sz[0]),
             mid,
-            self._spread_bps(),
-            self._microprice_l1(),
-            self._micro_minus_mid_bps(),
+            spread,
+            micro,
+            micro_minus_mid,
             b5s,
             a5s,
             b5n,
             a5n,
             t5s,
-            t5n,
-            0.0 if t5n <= FLOAT_EPS else (b5n - a5n) / t5n,
-            self.current_bid_px[0] >= self.current_ask_px[0],
+            total_depth_5bps_notional,
+            depth_imbalance_5bps,
+            bb >= ba,
             self.update_count,
         )
+        return self._summary
+
+    def current_summary(self) -> BookSummary:
+        if self._summary is None:
+            raise ValueError("no book")
+        return self._summary
 
     def _window_values(self, field_name: str, window_us: int) -> np.ndarray:
         return self.history.values_in_window(

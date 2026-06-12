@@ -903,6 +903,203 @@ def _has_fillable_order_at_level(orders: Sequence[ActiveOrder], *, side: OrderSi
     return any(order.side == side and order.price_tick == price_tick and order.is_fillable_at_key(event_key) for order in orders)
 
 
+@dataclass(frozen=True, slots=True)
+class _ConservativeFillIndex:
+    """Per-tape arrays for closed-form conservative counterfactual fills.
+
+    With the conservative queue model, visible L2 decreases never advance the
+    queue, so a passive order's fate is fully determined by the book at its
+    activation moment plus the opposite-side trade prints inside the fill
+    window. That reduces each counterfactual replay to binary searches and a
+    vectorized scan of the window's trades.
+    """
+
+    event_local_ts: np.ndarray
+    last_l2_event_pos: np.ndarray
+    event_book_ptr: np.ndarray
+    trade_event_pos: np.ndarray
+    trade_price_tick: np.ndarray
+    trade_amount: np.ndarray
+    trade_is_buy: np.ndarray
+
+
+def _build_conservative_fill_index(tape: ExecutionTape) -> _ConservativeFillIndex:
+    events = tape.arrays.events
+    event_local_ts = np.ascontiguousarray(events["local_ts_us"], dtype=np.int64)
+    type_codes = np.asarray(events["event_type_code"])
+    book_ptrs = np.ascontiguousarray(events["book_ptr"], dtype=np.int64)
+    trade_ptrs = np.asarray(events["trade_ptr"], dtype=np.int64)
+    n = len(events)
+    positions = np.arange(n, dtype=np.int64)
+    l2_mask = (type_codes == EVENT_TYPE_CODE_L2_BATCH) & (book_ptrs >= 0)
+    last_l2_event_pos = np.maximum.accumulate(np.where(l2_mask, positions, -1))
+
+    trade_mask = (type_codes == EVENT_TYPE_CODE_TRADE) & (trade_ptrs >= 0)
+    trade_event_pos = positions[trade_mask]
+    ptrs = trade_ptrs[trade_mask]
+    trades = tape.arrays.trades
+    side_codes = np.asarray(trades["side_code"], dtype=np.int64)[ptrs]
+    amounts = np.asarray(trades["amount"], dtype=np.float64)[ptrs]
+    effective = (side_codes != 0) & (amounts > 0.0)
+    return _ConservativeFillIndex(
+        event_local_ts=event_local_ts,
+        last_l2_event_pos=last_l2_event_pos,
+        event_book_ptr=book_ptrs,
+        trade_event_pos=np.ascontiguousarray(trade_event_pos[effective]),
+        trade_price_tick=np.ascontiguousarray(np.asarray(trades["price_tick"], dtype=np.int64)[ptrs][effective]),
+        trade_amount=np.ascontiguousarray(amounts[effective]),
+        trade_is_buy=np.ascontiguousarray(side_codes[effective] > 0),
+    )
+
+
+def _conservative_queue_ahead_from_row(
+    tape: ExecutionTape,
+    *,
+    book_ptr: int,
+    side: OrderSide,
+    price_tick: int,
+    best_bid: int,
+    best_ask: int,
+    queue_model: QueueModelConfig,
+) -> float:
+    if best_bid < price_tick < best_ask:
+        return 0.0
+    if side == OrderSide.BUY:
+        ticks = tape.arrays.book_bid_ticks[book_ptr]
+        sizes = tape.arrays.book_bid_sizes[book_ptr]
+    else:
+        ticks = tape.arrays.book_ask_ticks[book_ptr]
+        sizes = tape.arrays.book_ask_sizes[book_ptr]
+    match = np.nonzero(ticks == price_tick)[0]
+    if match.size:
+        return float(sizes[int(match[0])])
+    active = ticks[ticks > 0]
+    if active.size and int(active.min()) <= price_tick <= int(active.max()):
+        return 0.0
+    return queue_model.unknown_level_queue_ahead_qty
+
+
+def _conservative_fill_one_side(
+    index: _ConservativeFillIndex,
+    tape: ExecutionTape,
+    *,
+    start_event_index: int,
+    start_book_ptr: int,
+    decision_key: EventKey,
+    side: OrderSide,
+    price_tick: int,
+    end_event_index: int,
+    config: CounterfactualQuoteConfig,
+) -> CounterfactualFillResult:
+    decision_ts = decision_key.local_ts_us
+    not_filled_queue = _queue_ahead_for_candidate(
+        tape, book_ptr=start_book_ptr, side=side, price_tick=price_tick, queue_model=config.queue_model
+    )
+    end_event_index = min(end_event_index, len(index.event_local_ts))
+
+    delay_us = config.latency_config.order_activation_delay_us
+    if delay_us == 0:
+        activation_book_ptr = start_book_ptr
+        first_fillable_pos = int(np.searchsorted(index.event_local_ts, decision_ts, side="right"))
+    else:
+        first_fillable_pos = int(np.searchsorted(index.event_local_ts, decision_ts + delay_us, side="right"))
+        if first_fillable_pos >= end_event_index:
+            return _clean_fill_result(
+                filled=False, fill_local_ts_us=-1, fill_price_tick=-1, fill_reason=None,
+                decision_local_ts_us=decision_ts, queue_ahead_at_start=not_filled_queue,
+                queue_ahead_before_fill=not_filled_queue,
+            )
+        last_pos = int(index.last_l2_event_pos[first_fillable_pos - 1]) if first_fillable_pos > 0 else -1
+        if last_pos > start_event_index:
+            activation_book_ptr = int(index.event_book_ptr[last_pos])
+        else:
+            activation_book_ptr = start_book_ptr
+    if first_fillable_pos >= end_event_index:
+        return _clean_fill_result(
+            filled=False, fill_local_ts_us=-1, fill_price_tick=-1, fill_reason=None,
+            decision_local_ts_us=decision_ts, queue_ahead_at_start=not_filled_queue,
+            queue_ahead_before_fill=not_filled_queue,
+        )
+
+    best_bid, best_ask, _, _, _, _ = _book_top_from_l2_row(tape, activation_book_ptr)
+    queue_ahead = _conservative_queue_ahead_from_row(
+        tape, book_ptr=activation_book_ptr, side=side, price_tick=price_tick,
+        best_bid=best_bid, best_ask=best_ask, queue_model=config.queue_model,
+    )
+    if side == OrderSide.BUY:
+        post_only_safe = price_tick <= best_ask - config.post_only_gap_ticks
+    else:
+        post_only_safe = price_tick >= best_bid + config.post_only_gap_ticks
+    if not post_only_safe:
+        return _clean_fill_result(
+            filled=False, fill_local_ts_us=-1, fill_price_tick=-1, fill_reason=None,
+            decision_local_ts_us=decision_ts, queue_ahead_at_start=queue_ahead,
+            queue_ahead_before_fill=queue_ahead,
+        )
+
+    t_lo = int(np.searchsorted(index.trade_event_pos, first_fillable_pos, side="left"))
+    t_hi = int(np.searchsorted(index.trade_event_pos, end_event_index, side="left"))
+    if t_lo >= t_hi:
+        return _clean_fill_result(
+            filled=False, fill_local_ts_us=-1, fill_price_tick=-1, fill_reason=None,
+            decision_local_ts_us=decision_ts, queue_ahead_at_start=queue_ahead,
+            queue_ahead_before_fill=queue_ahead,
+        )
+
+    prices = index.trade_price_tick[t_lo:t_hi]
+    is_buy = index.trade_is_buy[t_lo:t_hi]
+    if side == OrderSide.BUY:
+        opp = ~is_buy
+        through = opp & (prices < price_tick)
+    else:
+        opp = is_buy
+        through = opp & (prices > price_tick)
+    at_level = opp & (prices == price_tick)
+
+    through_pos = int(np.argmax(through)) if through.any() else -1
+    fill_pos = -1
+    fill_reason: FillReason | None = None
+    queue_before_fill = queue_ahead
+    weight = config.queue_model.trade_at_level_weight
+    if at_level.any() and weight > 0.0:
+        at_positions = np.nonzero(at_level)[0]
+        cum = np.cumsum(index.trade_amount[t_lo:t_hi][at_positions] * weight)
+        k = int(np.searchsorted(cum, queue_ahead + config.queue_model.qty_epsilon, side="right"))
+        if k < len(at_positions):
+            fill_pos = int(at_positions[k])
+            fill_reason = FillReason.TRADE_AT_LEVEL
+            queue_before_fill = max(queue_ahead - (float(cum[k - 1]) if k > 0 else 0.0), 0.0)
+    if through_pos >= 0 and (fill_pos < 0 or through_pos < fill_pos):
+        fill_pos = through_pos
+        fill_reason = FillReason.TRADE_THROUGH
+        at_before = at_level[:through_pos]
+        if at_before.any():
+            queue_before_fill = max(
+                queue_ahead - float(np.sum(index.trade_amount[t_lo:t_hi][:through_pos][at_before]) * weight),
+                0.0,
+            )
+        else:
+            queue_before_fill = queue_ahead
+    if fill_pos < 0:
+        return _clean_fill_result(
+            filled=False, fill_local_ts_us=-1, fill_price_tick=-1, fill_reason=None,
+            decision_local_ts_us=decision_ts, queue_ahead_at_start=queue_ahead,
+            queue_ahead_before_fill=queue_ahead,
+        )
+
+    fill_event_pos = int(index.trade_event_pos[t_lo + fill_pos])
+    fill_ts = int(index.event_local_ts[fill_event_pos])
+    return _clean_fill_result(
+        filled=True,
+        fill_local_ts_us=fill_ts,
+        fill_price_tick=price_tick,
+        fill_reason=fill_reason,
+        decision_local_ts_us=decision_ts,
+        queue_ahead_at_start=queue_ahead,
+        queue_ahead_before_fill=queue_before_fill,
+    )
+
+
 def _counterfactual_fill_one_side(
     tape: ExecutionTape,
     *,
@@ -1264,6 +1461,7 @@ def _labels_for_decision(
     latest_book_ptr: int,
     decision_key: EventKey,
     future_mid_lookup: FutureMidLookup,
+    fill_index: _ConservativeFillIndex | None = None,
 ) -> tuple[list[float], list[bool]] | None:
     best_bid, best_ask, _, _, _, _ = _book_top_from_l2_row(tape, latest_book_ptr)
     labels = [math.nan] * layout.label_count
@@ -1283,11 +1481,18 @@ def _labels_for_decision(
             if not _side_valid_for_candidate(tape, config, side=side, price_tick=price_tick):
                 continue
             assert price_tick is not None
-            fill = _counterfactual_fill_one_side(
-                tape, start_event_index=decision_event_index, start_book_ptr=latest_book_ptr, decision_key=decision_key,
-                side=side, price_tick=price_tick, qty=config.quote.order_qty, fill_deadline_key=fill_deadline_key,
-                end_event_index=end_event_index, config=config.quote,
-            )
+            if fill_index is not None:
+                fill = _conservative_fill_one_side(
+                    fill_index, tape, start_event_index=decision_event_index, start_book_ptr=latest_book_ptr,
+                    decision_key=decision_key, side=side, price_tick=price_tick,
+                    end_event_index=end_event_index, config=config.quote,
+                )
+            else:
+                fill = _counterfactual_fill_one_side(
+                    tape, start_event_index=decision_event_index, start_book_ptr=latest_book_ptr, decision_key=decision_key,
+                    side=side, price_tick=price_tick, qty=config.quote.order_qty, fill_deadline_key=fill_deadline_key,
+                    end_event_index=end_event_index, config=config.quote,
+                )
             fills_by_side[is_bid] = fill
             if fill_deadline_key.local_ts_us <= last_event_local_ts_us:
                 labels[filled_idx] = 1.0 if fill.filled else 0.0
@@ -1484,6 +1689,11 @@ def build_adverse_selection_dataset(
     rows = _build_adverse_selection_feature_rows(tape, config=config)
     l2_view = _valid_l2_view_from_tape(tape)
     layout = _AdverseLabelLayout.from_config(config)
+    fill_index = (
+        _build_conservative_fill_index(tape)
+        if config.quote.queue_model.mode == QueueModelMode.CONSERVATIVE
+        else None
+    )
     label_names = layout.label_names
     last_event_local_ts_us = int(tape.arrays.events["local_ts_us"][-1])
     events_local_ts_us = np.asarray(tape.arrays.events["local_ts_us"], dtype=np.int64)
@@ -1505,6 +1715,7 @@ def build_adverse_selection_dataset(
             latest_book_ptr=int(rows.latest_book_ptr_by_row[row_idx]),
             decision_key=EventKey(int(rows.decision_local_ts_us[row_idx]), int(rows.decision_event_seq[row_idx])),
             future_mid_lookup=_ValidL2ViewFutureMidLookup(l2_view),
+            fill_index=fill_index,
         )
         if labels_and_masks is None:
             if config.drop_incomplete_horizon:
@@ -1659,6 +1870,11 @@ def build_adverse_selection_dataset_to_disk(
     kyle_state = _new_kyle_state(config.kyle)
     next_sample = 0
     flow_states = tuple(_TradeWindowState(window_us) for window_us in config.flow_windows_us)
+    fill_index = (
+        _build_conservative_fill_index(tape)
+        if config.quote.queue_model.mode == QueueModelMode.CONSERVATIVE
+        else None
+    )
     events = tape.arrays.events
     trades = tape.arrays.trades
     event_ts = events["local_ts_us"]
@@ -1698,6 +1914,7 @@ def build_adverse_selection_dataset_to_disk(
                 labels_info = _labels_for_decision(
                     tape, config=config, layout=layout, last_event_local_ts_us=last_ts, events_local_ts_us=event_ts,
                     decision_event_index=last_event_idx, latest_book_ptr=latest_book_ptr, decision_key=key, future_mid_lookup=index.valid_l2,
+                    fill_index=fill_index,
                 )
                 if labels_info is not None:
                     labels, masks = labels_info

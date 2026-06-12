@@ -161,101 +161,142 @@ def fit_adverse_baselines_streaming(
     intercepts: list[float] = []
     reg = np.eye(nf + 1, dtype=np.float64) * ridge_l2; reg[0, 0] = 0.0
 
+    known = [name for name in target_names if name in label_index]
     for target_name in target_names:
         if target_name not in label_index:
             targets_metrics[target_name] = {"target_name": target_name, "train_rows": 0, "val_rows": 0, "skipped": True, "skip_reason": "unknown_target"}
+    tidx = np.asarray([label_index[name] for name in known], dtype=np.int64)
+    nt = len(known)
+
+    # Pass over the dataset once for all targets: accumulate each target's
+    # masked normal equations from the shared per-chunk design matrix.
+    XtX = np.zeros((nt, nf + 1, nf + 1), dtype=np.float64)
+    Xty = np.zeros((nt, nf + 1), dtype=np.float64)
+    train_valid = np.zeros(nt, dtype=np.int64)
+    val_valid = np.zeros(nt, dtype=np.int64)
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        masks = np.asarray(dataset.arrays.label_masks[start:end][:, tidx], dtype=np.bool_)
+        if not masks.any():
             continue
-        tidx = label_index[target_name]
-        XtX = np.zeros((nf + 1, nf + 1), dtype=np.float64); Xty = np.zeros(nf + 1, dtype=np.float64)
-        train_valid = 0; val_valid = 0
+        row_ids = np.arange(start, end)
+        train_rows = row_ids < train_rows_total
+        val_valid += np.count_nonzero(masks & ~train_rows[:, None], axis=0)
+        train_masks = masks & train_rows[:, None]
+        if not train_masks.any():
+            continue
+        X = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
+        Xz = (X - mean) / scale
+        aug = np.concatenate([np.ones((Xz.shape[0], 1), dtype=np.float64), Xz], axis=1)
+        labels_chunk = np.asarray(dataset.arrays.labels[start:end][:, tidx], dtype=np.float64)
+        for j in range(nt):
+            m = train_masks[:, j]
+            count = int(np.count_nonzero(m))
+            if count == 0:
+                continue
+            rows = aug[m]
+            XtX[j] += rows.T @ rows
+            Xty[j] += rows.T @ labels_chunk[m, j]
+            train_valid[j] += count
+
+    betas = np.zeros((nt, nf + 1), dtype=np.float64)
+    active = np.zeros(nt, dtype=np.bool_)
+    for j, target_name in enumerate(known):
+        if train_valid[j] < min_train_samples or val_valid[j] == 0:
+            targets_metrics[target_name] = {"target_name": target_name, "train_rows": int(train_valid[j]), "val_rows": int(val_valid[j]), "skipped": True, "skip_reason": "not_enough_train_rows" if train_valid[j] < min_train_samples else "no_validation_rows"}
+            continue
+        betas[j] = _solve(XtX[j] + reg, Xty[j])
+        active[j] = True
+
+    # Metrics pass shared across targets: one z-scored design per chunk,
+    # one matmul for all predictions.
+    acc = {target: {"train": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0},
+                    "val": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0}}
+           for target in known}
+    is_binary = {target: target.endswith("_filled") or target.endswith("_toxic_fill") for target in known}
+    exact_scores = {target: {"train": {"ys": [], "ps": []}, "val": {"ys": [], "ps": []}}
+                    for target in known if metrics_mode == "exact" and is_binary[target]}
+    range_acc = {target: {"train": BinaryHistogramAUC(auc_bins), "val": BinaryHistogramAUC(auc_bins)}
+                 for target in known if metrics_mode == "approx" and is_binary[target]}
+
+    def _metrics_chunks():
         for start in range(0, n, chunk_rows):
             end = min(start + chunk_rows, n)
-            mask = np.asarray(dataset.arrays.label_masks[start:end, tidx], dtype=np.bool_)
-            row_ids = np.arange(start, end)
-            train_mask = mask & (row_ids < train_rows_total)
-            val_valid += int(np.count_nonzero(mask & (row_ids >= train_rows_total)))
-            if not np.any(train_mask):
+            masks = np.asarray(dataset.arrays.label_masks[start:end][:, tidx], dtype=np.bool_)
+            if not masks.any():
                 continue
-            X = np.asarray(dataset.arrays.features[start:end][train_mask], dtype=np.float64)
-            Xz = (X - mean) / scale
-            aug = np.concatenate([np.ones((Xz.shape[0], 1), dtype=np.float64), Xz], axis=1)
-            y = np.asarray(dataset.arrays.labels[start:end, tidx][train_mask], dtype=np.float64)
-            XtX += aug.T @ aug; Xty += aug.T @ y; train_valid += len(y)
-        if train_valid < min_train_samples or val_valid == 0:
-            targets_metrics[target_name] = {"target_name": target_name, "train_rows": train_valid, "val_rows": val_valid, "skipped": True, "skip_reason": "not_enough_train_rows" if train_valid < min_train_samples else "no_validation_rows"}
-            continue
-        beta = _solve(XtX + reg, Xty)
-        intercept = float(beta[0]); coef = beta[1:].astype(np.float64, copy=False)
-        # Metrics streaming accumulators. Approximate AUC is a bounded-memory two-pass histogram.
-        acc = {"train": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0},
-               "val": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0}}
-        is_binary_target = target_name.endswith("_filled") or target_name.endswith("_toxic_fill")
-        exact_scores = {"train": {"ys": [], "ps": []}, "val": {"ys": [], "ps": []}} if (metrics_mode == "exact" and is_binary_target) else None
-        range_acc = {"train": BinaryHistogramAUC(auc_bins), "val": BinaryHistogramAUC(auc_bins)} if (metrics_mode == "approx" and is_binary_target) else None
-        for start in range(0, n, chunk_rows):
-            end = min(start + chunk_rows, n)
-            masks_all = np.asarray(dataset.arrays.label_masks[start:end, tidx], dtype=np.bool_)
-            if not np.any(masks_all):
-                continue
-            Xall = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
-            pred_all = ((Xall - mean) / scale) @ coef + intercept
-            yall = np.asarray(dataset.arrays.labels[start:end, tidx], dtype=np.float64)
+            X = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
+            preds = (np.concatenate([np.ones((X.shape[0], 1), dtype=np.float64), (X - mean) / scale], axis=1) @ betas.T)
+            labels_chunk = np.asarray(dataset.arrays.labels[start:end][:, tidx], dtype=np.float64)
             row_ids = np.arange(start, end)
-            for split_name, split_mask in (("train", row_ids < train_rows_total), ("val", row_ids >= train_rows_total)):
-                m = masks_all & split_mask
-                if not np.any(m):
+            yield masks, preds, labels_chunk, row_ids < train_rows_total
+
+    for masks, preds, labels_chunk, train_rows in _metrics_chunks():
+        for j, target_name in enumerate(known):
+            if not active[j]:
+                continue
+            col_mask = masks[:, j]
+            if not col_mask.any():
+                continue
+            for split_name, split_mask in (("train", train_rows), ("val", ~train_rows)):
+                m = col_mask & split_mask
+                if not m.any():
                     continue
-                y = yall[m]; p = pred_all[m]
-                a = acc[split_name]
+                y = labels_chunk[m, j]; p = preds[m, j]
+                a = acc[target_name][split_name]
                 a["n"] += len(y); a["se"] += float(np.sum((y - p) ** 2)); a["ae"] += float(np.sum(np.abs(y - p)))
                 a["sum_y"] += float(np.sum(y)); a["sum_y2"] += float(np.sum(y * y)); a["sum_p"] += float(np.sum(p))
-                if exact_scores is not None:
+                if target_name in exact_scores:
                     if int(a["n"]) > exact_auc_max_rows:
                         raise ValueError("metrics_mode='exact' exceeds exact_auc_max_rows; use metrics_mode='approx' or increase exact_auc_max_rows")
-                    exact_scores[split_name]["ys"].append(y.astype(np.float64, copy=True)); exact_scores[split_name]["ps"].append(p.astype(np.float64, copy=True))
-                if range_acc is not None:
-                    range_acc[split_name].update_range(p)
-        hist_acc = None
-        if range_acc is not None:
-            hist_acc = {
-                split: BinaryHistogramAUC(auc_bins, score_min=accum.score_min, score_max=accum.score_max)
-                for split, accum in range_acc.items()
-            }
-            for start in range(0, n, chunk_rows):
-                end = min(start + chunk_rows, n)
-                masks_all = np.asarray(dataset.arrays.label_masks[start:end, tidx], dtype=np.bool_)
-                if not np.any(masks_all):
+                    exact_scores[target_name][split_name]["ys"].append(y.astype(np.float64, copy=True)); exact_scores[target_name][split_name]["ps"].append(p.astype(np.float64, copy=True))
+                if target_name in range_acc:
+                    range_acc[target_name][split_name].update_range(p)
+
+    hist_acc: dict[str, dict[str, BinaryHistogramAUC]] = {}
+    if range_acc:
+        hist_acc = {
+            target: {split: BinaryHistogramAUC(auc_bins, score_min=accum.score_min, score_max=accum.score_max) for split, accum in splits.items()}
+            for target, splits in range_acc.items()
+        }
+        for masks, preds, labels_chunk, train_rows in _metrics_chunks():
+            for j, target_name in enumerate(known):
+                if not active[j] or target_name not in hist_acc:
                     continue
-                Xall = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
-                pred_all = ((Xall - mean) / scale) @ coef + intercept
-                yall = np.asarray(dataset.arrays.labels[start:end, tidx], dtype=np.float64)
-                row_ids = np.arange(start, end)
-                for split_name, split_mask in (("train", row_ids < train_rows_total), ("val", row_ids >= train_rows_total)):
-                    m = masks_all & split_mask
-                    if np.any(m):
-                        hist_acc[split_name].update(yall[m], pred_all[m])
+                col_mask = masks[:, j]
+                if not col_mask.any():
+                    continue
+                for split_name, split_mask in (("train", train_rows), ("val", ~train_rows)):
+                    m = col_mask & split_mask
+                    if m.any():
+                        hist_acc[target_name][split_name].update(labels_chunk[m, j], preds[m, j])
+
+    for j, target_name in enumerate(known):
+        if not active[j]:
+            continue
+
         def split_metrics(name: str) -> tuple[float, float, float, float, float]:
-            a = acc[name]; cnt = max(int(a["n"]), 1)
+            a = acc[target_name][name]; cnt = max(int(a["n"]), 1)
             mean_y = float(a["sum_y"] / cnt); ss_tot = float(a["sum_y2"] - a["sum_y"] * a["sum_y"] / cnt)
             r2 = 0.0 if ss_tot <= 1e-12 else 1.0 - float(a["se"] / ss_tot)
             return float(np.sqrt(a["se"] / cnt)), float(a["ae"] / cnt), r2, mean_y, float(a["sum_p"] / cnt)
+
         tr_rmse, tr_mae, tr_r2, tr_ymean, _ = split_metrics("train")
         va_rmse, va_mae, va_r2, va_ymean, va_pmean = split_metrics("val")
-        metric: dict[str, object] = {"target_name": target_name, "train_rows": int(acc["train"]["n"]), "val_rows": int(acc["val"]["n"]), "train_rmse": tr_rmse, "val_rmse": va_rmse, "train_mae": tr_mae, "val_mae": va_mae, "train_r2": tr_r2, "val_r2": va_r2, "label_mean_train": tr_ymean, "label_mean_val": va_ymean, "prediction_mean_val": va_pmean, "skipped": False}
-        if is_binary_target:
+        metric: dict[str, object] = {"target_name": target_name, "train_rows": int(acc[target_name]["train"]["n"]), "val_rows": int(acc[target_name]["val"]["n"]), "train_rmse": tr_rmse, "val_rmse": va_rmse, "train_mae": tr_mae, "val_mae": va_mae, "train_r2": tr_r2, "val_r2": va_r2, "label_mean_train": tr_ymean, "label_mean_val": va_ymean, "prediction_mean_val": va_pmean, "skipped": False}
+        if is_binary[target_name]:
             if metrics_mode == "none":
                 metric["train_auc"] = None; metric["val_auc"] = None; metric["auc_mode"] = "none"
             elif metrics_mode == "exact":
-                assert exact_scores is not None
-                metric["train_auc"] = _auc_exact(np.concatenate(exact_scores["train"]["ys"]), np.concatenate(exact_scores["train"]["ps"])) if exact_scores["train"]["ys"] else None
-                metric["val_auc"] = _auc_exact(np.concatenate(exact_scores["val"]["ys"]), np.concatenate(exact_scores["val"]["ps"])) if exact_scores["val"]["ys"] else None
+                scores = exact_scores[target_name]
+                metric["train_auc"] = _auc_exact(np.concatenate(scores["train"]["ys"]), np.concatenate(scores["train"]["ps"])) if scores["train"]["ys"] else None
+                metric["val_auc"] = _auc_exact(np.concatenate(scores["val"]["ys"]), np.concatenate(scores["val"]["ps"])) if scores["val"]["ys"] else None
                 metric["auc_mode"] = "exact"; metric["auc_bins"] = None
             else:
-                assert hist_acc is not None
-                metric["train_auc"] = hist_acc["train"].auc(); metric["val_auc"] = hist_acc["val"].auc()
+                metric["train_auc"] = hist_acc[target_name]["train"].auc(); metric["val_auc"] = hist_acc[target_name]["val"].auc()
                 metric["auc_mode"] = "approx_histogram"; metric["auc_bins"] = auc_bins
         targets_metrics[target_name] = metric
-        fitted_names.append(target_name); coefs.append(coef); intercepts.append(intercept)
+        fitted_names.append(target_name); coefs.append(betas[j, 1:].astype(np.float64, copy=True)); intercepts.append(float(betas[j, 0]))
 
     metrics: dict[str, object] = {"enabled": True, "train_fraction": train_fraction, "ridge_l2": ridge_l2, "min_train_samples": min_train_samples, "train_rows_total": train_rows_total, "val_rows_total": val_rows_total, "fitted_target_count": len(fitted_names), "requested_target_count": len(target_names), "targets": targets_metrics}
     if not fitted_names:

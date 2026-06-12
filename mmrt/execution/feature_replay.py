@@ -122,6 +122,9 @@ class TapeFeatureStep:
     decision: TransformedDecision | None
 
 
+_REPLAY_CHUNK_EVENTS = 131_072
+
+
 def iter_tape_feature_steps(
     tape: ExecutionTape,
     *,
@@ -134,6 +137,10 @@ def iter_tape_feature_steps(
     Trades are fed to the pipeline but not yielded. L2 batch events with a
     one-sided or empty book are skipped entirely (no pipeline update), the
     same validity rule the execution environment applies.
+
+    Event columns are decoded in fixed-size chunks and book inputs are built
+    through the trusted constructor: tape rows were validated at build time,
+    so per-event re-validation is skipped here.
     """
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
@@ -145,31 +152,87 @@ def iter_tape_feature_steps(
         raise ValueError("start_event_index must be < len(tape.arrays.events)")
     if max_events is not None:
         max_events = _require_positive_int(max_events, "max_events")
+    end = len(events) if max_events is None else min(len(events), start + max_events)
 
-    processed = 0
-    for event_idx in range(start, len(events)):
-        if max_events is not None and processed >= max_events:
-            return
-        processed += 1
-        event_row = events[event_idx]
-        code = int(event_row["event_type_code"])
-        if code == EVENT_TYPE_CODE_TRADE:
-            pipeline.on_trade(trade_input_from_tape_row(tape, event_row=event_row))
-            continue
-        if code != EVENT_TYPE_CODE_L2_BATCH:
-            raise ValueError(f"unsupported execution event_type_code: {code}")
-        book_ptr = int(event_row["book_ptr"])
-        if book_ptr < 0 or not _l2_event_is_two_sided(tape, book_ptr):
-            continue
-        decision = pipeline.on_book_snapshot(book_snapshot_input_from_tape_row(tape, event_row=event_row))
-        yield TapeFeatureStep(
-            event_index=event_idx,
-            local_ts_us=int(event_row["local_ts_us"]),
-            ts_us=int(event_row["ts_us"]),
-            event_seq=int(event_row["event_seq"]),
-            mid=pipeline.current_mid(),
-            decision=decision,
-        )
+    tick_size = float(tape.manifest.symbol_spec.tick_size)
+    l2_events = tape.arrays.l2_events
+    best_bid_ticks = np.ascontiguousarray(l2_events["best_bid_tick"])
+    best_ask_ticks = np.ascontiguousarray(l2_events["best_ask_tick"])
+    book_bid_ticks = tape.arrays.book_bid_ticks
+    book_bid_sizes = tape.arrays.book_bid_sizes
+    book_ask_ticks = tape.arrays.book_ask_ticks
+    book_ask_sizes = tape.arrays.book_ask_sizes
+    book_depth = int(book_bid_ticks.shape[1])
+    if book_depth > BOOK_DEPTH:
+        raise ValueError("tape book depth exceeds feature BOOK_DEPTH")
+    trades = tape.arrays.trades
+    trade_price = (np.asarray(trades["price_tick"], dtype=np.float64) * tick_size).tolist()
+    trade_amount = np.asarray(trades["amount"], dtype=np.float64).tolist()
+    trade_side = np.asarray(trades["side_code"], dtype=np.int64).tolist()
+
+    # Reused book input buffers: apply_snapshot copies them immediately and
+    # nothing reads the snapshot object afterwards, so per-event allocation
+    # and re-validation are avoided.
+    bid_px = np.zeros(BOOK_DEPTH, dtype=np.float64)
+    bid_sz = np.zeros(BOOK_DEPTH, dtype=np.float64)
+    ask_px = np.zeros(BOOK_DEPTH, dtype=np.float64)
+    ask_sz = np.zeros(BOOK_DEPTH, dtype=np.float64)
+
+    on_trade = pipeline.on_trade
+    on_book = pipeline.on_book_snapshot
+    for chunk_start in range(start, end, _REPLAY_CHUNK_EVENTS):
+        chunk_end = min(chunk_start + _REPLAY_CHUNK_EVENTS, end)
+        chunk = events[chunk_start:chunk_end]
+        local_ts = chunk["local_ts_us"].tolist()
+        ts = chunk["ts_us"].tolist()
+        seq = chunk["event_seq"].tolist()
+        codes = chunk["event_type_code"].tolist()
+        book_ptrs = chunk["book_ptr"].tolist()
+        trade_ptrs = chunk["trade_ptr"].tolist()
+        for i in range(chunk_end - chunk_start):
+            code = codes[i]
+            if code == EVENT_TYPE_CODE_TRADE:
+                trade_ptr = trade_ptrs[i]
+                if trade_ptr < 0:
+                    raise ValueError("event row does not reference a trade")
+                on_trade(TradeInput(
+                    local_ts_us=local_ts[i],
+                    ts_us=ts[i],
+                    price=trade_price[trade_ptr],
+                    amount=trade_amount[trade_ptr],
+                    side_code=trade_side[trade_ptr],
+                    event_seq=seq[i],
+                ))
+                continue
+            if code != EVENT_TYPE_CODE_L2_BATCH:
+                raise ValueError(f"unsupported execution event_type_code: {code}")
+            book_ptr = book_ptrs[i]
+            if book_ptr < 0:
+                continue
+            bid_tick = int(best_bid_ticks[book_ptr])
+            if bid_tick <= 0 or int(best_ask_ticks[book_ptr]) <= bid_tick:
+                continue
+            np.multiply(book_bid_ticks[book_ptr], tick_size, out=bid_px[:book_depth])
+            np.multiply(book_ask_ticks[book_ptr], tick_size, out=ask_px[:book_depth])
+            bid_sz[:book_depth] = book_bid_sizes[book_ptr]
+            ask_sz[:book_depth] = book_ask_sizes[book_ptr]
+            decision = on_book(BookSnapshotInput.from_trusted_arrays(
+                local_ts_us=local_ts[i],
+                ts_us=ts[i],
+                event_seq=seq[i],
+                bid_px=bid_px,
+                bid_sz=bid_sz,
+                ask_px=ask_px,
+                ask_sz=ask_sz,
+            ))
+            yield TapeFeatureStep(
+                event_index=chunk_start + i,
+                local_ts_us=local_ts[i],
+                ts_us=ts[i],
+                event_seq=seq[i],
+                mid=pipeline.current_mid(),
+                decision=decision,
+            )
 
 
 @dataclass(frozen=True, slots=True)

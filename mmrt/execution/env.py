@@ -316,6 +316,17 @@ class ExecutionEnv:
         self._obs_buffer = np.zeros(config.observation_schema.dim, dtype=config.observation_schema.np_dtype)
         self._last_observation = np.zeros(config.observation_schema.dim, dtype=config.observation_schema.np_dtype)
         self._state: _EnvState | None = None
+        # Column views over the events table avoid per-event structured-row
+        # materialization in the replay loop; one-slot book-top cache avoids
+        # rebuilding the same BookTop several times per event.
+        events_arr = self.tape.arrays.events
+        self._ev_local_ts = events_arr["local_ts_us"]
+        self._ev_event_seq = events_arr["event_seq"]
+        self._ev_type_code = events_arr["event_type_code"]
+        self._ev_book_ptr = events_arr["book_ptr"]
+        self._ev_trade_ptr = events_arr["trade_ptr"]
+        self._book_top_cache_ptr = -1
+        self._book_top_cache: BookTop | None = None
         self._episode_start_local_ts_us = 0
         self._last_step_fills: tuple[Fill, ...] = ()
         self._peak_equity: float | None = None
@@ -656,34 +667,36 @@ class ExecutionEnv:
 
     def _replay_one_event_for_step(self, event_index: int) -> _ReplayEventResult:
         state = self._require_state()
-        events = self.tape.arrays.events
 
-        event_code = int(events[event_index]["event_type_code"])
-        event_book_ptr = int(events[event_index]["book_ptr"])
+        event_code = int(self._ev_type_code[event_index])
+        event_book_ptr = int(self._ev_book_ptr[event_index])
         event_key = self._event_key_at_index(event_index)
 
-        cancels = finalize_effective_cancels(state.live_orders, event_key=event_key)
-        state.live_orders = _live_orders_tuple(cancels.orders)
-        self._step_diag["effective_cancel_count"] = (
-            int(self._step_diag["effective_cancel_count"]) + cancels.cancelled_count
-        )
+        orders = state.live_orders
+        if orders and any(order.cancel_effective_local_ts_us for order in orders):
+            cancels = finalize_effective_cancels(orders, event_key=event_key)
+            state.live_orders = _live_orders_tuple(cancels.orders)
+            self._step_diag["effective_cancel_count"] = (
+                int(self._step_diag["effective_cancel_count"]) + cancels.cancelled_count
+            )
 
-        if event_key.event_seq > 0:
-            pre_activation_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1)
-        else:
-            pre_activation_key = EventKey(max(event_key.local_ts_us - 1, 1), MAX_EVENT_SEQ)
-
-        self._activate_pending_orders_at(
-            event_key=pre_activation_key,
-            book_ptr=state.current_book_ptr,
-        )
+        if any(order.status == OrderStatus.PENDING_NEW for order in state.live_orders):
+            if event_key.event_seq > 0:
+                pre_activation_key = EventKey(event_key.local_ts_us, event_key.event_seq - 1)
+            else:
+                pre_activation_key = EventKey(max(event_key.local_ts_us - 1, 1), MAX_EVENT_SEQ)
+            self._activate_pending_orders_at(
+                event_key=pre_activation_key,
+                book_ptr=state.current_book_ptr,
+            )
 
         fills = self._process_event(event_index)
 
-        self._activate_pending_orders_at(
-            event_key=event_key,
-            book_ptr=state.current_book_ptr,
-        )
+        if any(order.status == OrderStatus.PENDING_NEW for order in state.live_orders):
+            self._activate_pending_orders_at(
+                event_key=event_key,
+                book_ptr=state.current_book_ptr,
+            )
 
         self._fire_cancel_guards(event_key)
 
@@ -758,8 +771,7 @@ class ExecutionEnv:
             )
 
     def _event_key_at_index(self, event_index: int) -> EventKey:
-        row = self.tape.arrays.events[event_index]
-        return EventKey(int(row["local_ts_us"]), int(row["event_seq"]))
+        return EventKey(int(self._ev_local_ts[event_index]), int(self._ev_event_seq[event_index]))
 
     def _order_activation_key_for_latency(
         self,
@@ -961,18 +973,21 @@ class ExecutionEnv:
 
     def _process_event(self, event_index: int) -> tuple[Fill, ...]:
         state = self._require_state()
-        event = self.tape.arrays.events[event_index]
         event_key = self._event_key_at_index(event_index)
-        code = int(event["event_type_code"])
-        old_event_local = int(self.tape.arrays.events[state.event_index]["local_ts_us"])
+        code = int(self._ev_type_code[event_index])
+        old_event_local = int(self._ev_local_ts[state.event_index])
         fills: tuple[Fill, ...] = ()
         if code == EVENT_TYPE_CODE_L2_BATCH:
-            book_ptr = int(event["book_ptr"])
+            book_ptr = int(self._ev_book_ptr[event_index])
             fills = self._process_l2_event(book_ptr, event_key=event_key)
             if self._book_top_from_ptr(book_ptr) is not None:
                 state.current_book_ptr = book_ptr
         elif code == EVENT_TYPE_CODE_TRADE:
-            trade = self._trade_from_ptr(int(event["trade_ptr"]))
+            if not state.live_orders:
+                state.previous_event_local_ts_us = old_event_local
+                state.event_index = event_index
+                return fills
+            trade = self._trade_from_ptr(int(self._ev_trade_ptr[event_index]))
             result = simulate_trade_event(
                 state.live_orders,
                 trade,
@@ -1007,6 +1022,14 @@ class ExecutionEnv:
     def _process_l2_event(self, curr_book_ptr: int, *, event_key: EventKey) -> tuple[Fill, ...]:
         state = self._require_state()
         if curr_book_ptr < 0:
+            return ()
+        if (
+            not state.live_orders
+            or self.config.fill_simulator_config.queue_model.mode != QueueModelMode.BALANCED
+        ):
+            # Outside balanced mode, visible L2 decreases never advance queues
+            # or fill orders, so the per-level depth diff is skipped entirely
+            # (the l2_* step diagnostics stay zero).
             return ()
         updated_orders = state.live_orders
         fills: list[Fill] = []
@@ -1099,10 +1122,10 @@ class ExecutionEnv:
 
     def _price_within_known_depth(self, *, book_ptr: int, side: OrderSide, price_tick: int) -> bool:
         ticks = self.tape.arrays.book_bid_ticks[book_ptr] if side == OrderSide.BUY else self.tape.arrays.book_ask_ticks[book_ptr]
-        active = [int(t) for t in ticks if int(t) > 0]
-        if not active:
+        active = ticks[ticks > 0]
+        if active.size == 0:
             return False
-        return min(active) <= price_tick <= max(active)
+        return int(active.min()) <= price_tick <= int(active.max())
 
     def _level_qty_with_depth_status(self, *, book_ptr: int, side: OrderSide, price_tick: int) -> tuple[float | None, bool]:
         level = self._level_qty(book_ptr=book_ptr, side=side, price_tick=price_tick)
@@ -1121,27 +1144,30 @@ class ExecutionEnv:
             sizes = self.tape.arrays.book_ask_sizes[book_ptr]
         else:
             raise ValueError("side must be OrderSide")
-        for i in range(ticks.shape[0]):
-            tick = int(ticks[i])
-            if tick == 0:
-                break
-            if tick == price_tick:
-                return float(sizes[i])
-        return None
+        match = np.nonzero(ticks == price_tick)[0]
+        if match.size == 0:
+            return None
+        return float(sizes[int(match[0])])
 
     def _book_top_from_ptr(self, book_ptr: int) -> BookTop | None:
+        if book_ptr == self._book_top_cache_ptr:
+            return self._book_top_cache
         row = self.tape.arrays.l2_events[book_ptr]
         best_bid_tick = int(row["best_bid_tick"])
         best_ask_tick = int(row["best_ask_tick"])
         if best_bid_tick <= 0 or best_ask_tick <= 0 or best_bid_tick >= best_ask_tick:
-            return None
-        return BookTop(
-            local_ts_us=int(row["local_ts_us"]),
-            best_bid_tick=best_bid_tick,
-            best_ask_tick=best_ask_tick,
-            best_bid_size=float(row["best_bid_size"]),
-            best_ask_size=float(row["best_ask_size"]),
-        )
+            top = None
+        else:
+            top = BookTop(
+                local_ts_us=int(row["local_ts_us"]),
+                best_bid_tick=best_bid_tick,
+                best_ask_tick=best_ask_tick,
+                best_bid_size=float(row["best_bid_size"]),
+                best_ask_size=float(row["best_ask_size"]),
+            )
+        self._book_top_cache_ptr = book_ptr
+        self._book_top_cache = top
+        return top
 
     def _current_book_top(self) -> BookTop:
         state = self._require_state()
