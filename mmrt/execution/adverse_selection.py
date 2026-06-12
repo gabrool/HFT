@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
+import json
 import math
+from pathlib import Path
+import shutil
 from typing import Mapping, NamedTuple, Protocol, Sequence
 
 import numpy as np
@@ -1595,10 +1598,8 @@ def build_adverse_selection_dataset_to_disk(
     cleanup_work_dir: bool = True,
     progress_interval: int | None = None,
 ):
-    import shutil
-    Path = __import__("pa" + "thlib").Path
     from mmrt.execution.adverse_selection_dataset import AdverseSelectionDatasetWriter, AdverseSelectionDatasetWriterConfig
-    from mmrt.execution.adverse_selection_index import AdverseSelectionIndexConfig, build_or_load_adverse_selection_index
+    from mmrt.execution.adverse_selection_index import AdverseSelectionIndexConfig, adverse_selection_index_manifest_sha256, build_or_load_adverse_selection_index
 
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
@@ -1644,7 +1645,10 @@ def build_adverse_selection_dataset_to_disk(
         "decision_interval_us": config.decision_interval_us,
         "start_event_index": config.start_event_index,
         "max_decisions": config.max_decisions,
-        "config_" + "j" + "son": __import__("j" + "son").dumps(_adverse_config_summary(config), sort_keys=True),
+        "config_json": json.dumps(_adverse_config_summary(config), sort_keys=True),
+        "index_schema": index.manifest.schema,
+        "index_manifest_sha256": adverse_selection_index_manifest_sha256(index.root),
+        "index_root": str(index.root),
     }
     writer = AdverseSelectionDatasetWriter(AdverseSelectionDatasetWriterConfig(
         output_root=str(output_root), feature_names=feature_names, label_names=layout.label_names,

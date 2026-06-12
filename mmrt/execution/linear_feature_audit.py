@@ -125,11 +125,11 @@ def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAu
             per_head[head]={"feature_columns": list(state.feature_columns), "n_features": len(state.feature_columns), "n_rows": n, "warnings": ["feature_schema_mismatch"], "missing_features": missing}; warnings.append("feature_schema_mismatch"); continue
         cols=np.asarray([name_to_idx[c] for c in state.feature_columns], dtype=np.int64); hnf=len(cols)
         raw_stats={}; z_stats={}; clip_frac={}; frac_gt={thr:{} for thr in config.z_thresholds}; absz_sum=np.zeros(hnf); clip_counts=np.zeros(hnf); gt_counts={thr:np.zeros(hnf) for thr in config.z_thresholds}
-        raw_cols=[]; z_cols=[]
         for j,col in enumerate(cols):
-            raw=np.asarray(features[:, col], dtype=np.float64); z=(raw - state.mean[j])/state.scale[j]; raw_cols.append(raw); z_cols.append(z)
+            raw=np.asarray(features[:, col], dtype=np.float64); z=(raw - state.mean[j])/state.scale[j]
             raw_stats[state.feature_columns[j]]=_stats(raw); z_stats[state.feature_columns[j]]=_stats(z); absz=np.abs(z); absz_sum[j]=float(np.mean(absz)) if n else 0.0; clip_counts[j]=float(np.mean(absz > state.config.clip_z)) if n else 0.0
             for thr in config.z_thresholds: gt_counts[thr][j]=float(np.mean(absz > thr)) if n else 0.0
+            del raw, z, absz
         logits_path=work_root/f"{head}_logits.npy"; pred_path=work_root/f"{head}_pred.npy"; logits=np.lib.format.open_memmap(logits_path, mode="w+", dtype=np.float64, shape=(n,)); pred=np.lib.format.open_memmap(pred_path, mode="w+", dtype=np.float64, shape=(n,))
         for start in range(0,n,config.chunk_rows):
             end=min(start+config.chunk_rows,n); X=np.asarray(features[start:end][:, cols], dtype=np.float64); Z=(X-state.mean)/state.scale; Z[:, ~state.active_mask]=0.0; C=np.clip(Z, -float(state.config.clip_z), float(state.config.clip_z)); lo,pr=_prediction_for_head(model, head, C); logits[start:end]=lo; pred[start:end]=pr
@@ -146,7 +146,7 @@ def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAu
     manifest=tape.manifest; replay_start=0 if config.start_event_index is None else config.start_event_index
     payload={"status": "ok" if not warnings else "warning", "run_type": "audit_linear_execution_features", "config": asdict(config), "tape": {"schema": manifest.schema, "exchange": manifest.exchange, "symbol": manifest.symbol, "num_events": manifest.num_events, "num_l2_batches": manifest.num_l2_batches, "num_trades": manifest.num_trades, "start_local_ts_us": manifest.start_local_ts_us, "end_local_ts_us": manifest.end_local_ts_us}, "linear_train_result": {"schema": result.schema, "dataset_id": result.dataset_id, "manifest_hash": result.manifest_hash, "splits": {k:v.as_dict() for k,v in result.splits.items()}, "selection_summary": result.selection_summary}, "linear_signals": signals_summary, "feature_dataset": _feature_dataset_summary(n,nf,names,decision_idx,decision_ts,config.decision_interval_us,replay_start), "per_head": per_head, "combined": {"feature_schema_match": not all_missing, "missing_features": sorted(all_missing), "extra_features": sorted(all_extra), "shared_feature_count": len(set(names)-all_missing), "warnings": sorted(set(warnings))}, "warnings": sorted(set(warnings)), "resource_mode": {"chunked_features": True, "quantile_mode": config.quantile_mode, "chunk_rows": config.chunk_rows, "work_dir": str(work_root)}}
     if config.output_json is not None:
-        path=Path(config.output_json); path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(payload, sort_keys=True, indent=2, allow_nan=False)+"\n", encoding="utf-8")
+        path=Path(config.output_json); path.parent.mkdir(parents=True, exist_ok=True); tmp=path.with_suffix(path.suffix+".tmp"); tmp.write_text(json.dumps(payload, sort_keys=True, indent=2, allow_nan=False)+"\n", encoding="utf-8"); tmp.replace(path)
     else: json.dumps(payload, allow_nan=False)
     if config.cleanup_work_dir: shutil.rmtree(work_root, ignore_errors=True)
     return payload

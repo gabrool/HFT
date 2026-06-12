@@ -29,6 +29,10 @@ ALLOWED_SUBSTRINGS = (
     "parquet_version",
     "DEFAULT_PARQUET_VERSION",
     "mmrt_adverse_selection_ridge_v2",
+    "mmrt_adverse_selection_index_v2",
+    "mmrt_adverse_selection_dataset_v2",
+    "mmrt_adverse_selection_feature_dataset_v2",
+    "mmrt_adverse_selection_index_v1",
 )
 
 PRODUCTION_ROOT = Path("mmrt")

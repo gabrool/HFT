@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -16,10 +17,18 @@ from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_C
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
-ADVERSE_SELECTION_INDEX_SCHEMA = "mmrt_adverse_selection_index" + "_" + "v" + "1"
+ADVERSE_SELECTION_INDEX_SCHEMA = "mmrt_adverse_selection_index_v2"
 MANIFEST_FILENAME = "index_manifest.json"
 ARRAYS_DIRNAME = "arrays"
 _CHUNKS_DIRNAME = "chunks"
+
+
+def adverse_selection_index_manifest_sha256(root: str | Path) -> str:
+    """Return the SHA-256 of canonical index manifest JSON bytes."""
+    manifest_path = Path(root) / MANIFEST_FILENAME
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _positive_int(value: int, name: str) -> int:
@@ -167,11 +176,29 @@ class ValidL2Index:
 
     def future_mid_and_key_at_or_after(self, key: EventKey) -> tuple[float, EventKey] | None:
         idx = int(np.searchsorted(self.local_ts_us, key.local_ts_us, side="left"))
-        while idx < self.count and int(self.local_ts_us[idx]) == key.local_ts_us and int(self.event_seq[idx]) < key.event_seq:
-            idx += 1
         if idx >= self.count:
             return None
-        return float(self.mid_tick[idx]), EventKey(int(self.local_ts_us[idx]), int(self.event_seq[idx]))
+
+        if int(self.local_ts_us[idx]) == key.local_ts_us:
+            j = idx
+            best: int | None = None
+            while j < self.count and int(self.local_ts_us[j]) == key.local_ts_us:
+                if int(self.event_seq[j]) <= key.event_seq:
+                    best = j
+                j += 1
+            if best is not None:
+                return (
+                    float(self.mid_tick[best]),
+                    EventKey(int(self.local_ts_us[best]), int(self.event_seq[best])),
+                )
+            idx = j
+
+        if idx >= self.count:
+            return None
+        return (
+            float(self.mid_tick[idx]),
+            EventKey(int(self.local_ts_us[idx]), int(self.event_seq[idx])),
+        )
 
     def future_mid_tick_at_or_after(self, key: EventKey) -> float | None:
         out = self.future_mid_and_key_at_or_after(key)
@@ -411,9 +438,9 @@ def build_or_load_adverse_selection_index(tape: ExecutionTape, *, config: Advers
     root = Path(config.output_root)
     manifest_path = root / MANIFEST_FILENAME
     if manifest_path.exists():
-        index = load_adverse_selection_index(root, mmap_mode="r")
-        if index.manifest.matches(tape, config):
-            return index
+        manifest = AdverseSelectionIndexManifest.from_dict(json.loads(manifest_path.read_text(encoding="utf-8")))
+        if manifest.matches(tape, config):
+            return load_adverse_selection_index(root, mmap_mode="r")
         if not config.overwrite:
             raise ValueError(f"stale adverse-selection index manifest at {root}; pass overwrite=True to rebuild")
     return build_adverse_selection_index(tape, config=config)

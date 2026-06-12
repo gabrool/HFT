@@ -199,6 +199,94 @@ def save_adverse_selection_signals(path: str | Path, artifact: AdverseSelectionS
     tmp.replace(path)
 
 
+
+def _is_probability_target(name: str) -> bool:
+    return name.endswith("_filled") or name.endswith("_toxic_fill")
+
+
+def _is_nonnegative_target(name: str) -> bool:
+    return name.endswith("_toxic_cost_bps") or name.endswith("_adverse_bps") or name.endswith("_fill_latency_us")
+
+
+def save_adverse_selection_signals_arrays(
+    path: str | Path,
+    *,
+    decision_local_ts_us: np.ndarray,
+    decision_event_index: np.ndarray,
+    decision_event_seq: np.ndarray,
+    target_names: Sequence[str],
+    predictions: Mapping[str, np.ndarray],
+    overwrite: bool = False,
+    validate_chunk_rows: int = 100_000,
+) -> None:
+    """Save an adverse-selection signal NPZ from array-like inputs without artifact copies."""
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(path)
+    if isinstance(validate_chunk_rows, bool) or int(validate_chunk_rows) <= 0:
+        raise ValueError("validate_chunk_rows must be a positive int")
+    validate_chunk_rows = int(validate_chunk_rows)
+    names = _names_tuple(target_names, "target_names")
+
+    decision_arrays = {
+        "decision_local_ts_us": np.asarray(decision_local_ts_us),
+        "decision_event_index": np.asarray(decision_event_index),
+        "decision_event_seq": np.asarray(decision_event_seq),
+    }
+    n: int | None = None
+    for name, arr in decision_arrays.items():
+        if arr.ndim != 1:
+            raise ValueError(f"{name} must be rank-1")
+        if not np.can_cast(arr.dtype, np.int64, casting="same_kind") and arr.dtype.kind not in "iu":
+            raise ValueError(f"{name} must be int64-compatible")
+        if n is None:
+            n = int(arr.shape[0])
+        elif int(arr.shape[0]) != n:
+            raise ValueError("decision arrays must have the same length")
+    assert n is not None
+
+    pred_arrays: dict[str, np.ndarray] = {}
+    missing = [name for name in names if name not in predictions]
+    if missing:
+        raise ValueError(f"missing prediction arrays: {missing}")
+    for target in names:
+        arr = np.asarray(predictions[target])
+        if arr.ndim != 1 or int(arr.shape[0]) != n:
+            raise ValueError(f"pred_{target} must be rank-1 with length {n}")
+        pred_arrays[target] = arr
+
+    for start in range(0, n, validate_chunk_rows):
+        end = min(start + validate_chunk_rows, n)
+        for name, arr in decision_arrays.items():
+            # Conversion validates integer compatibility for the chunk only.
+            np.asarray(arr[start:end], dtype=np.int64)
+        for target, arr in pred_arrays.items():
+            chunk = np.asarray(arr[start:end], dtype=np.float32)
+            if not np.isfinite(chunk).all():
+                raise ValueError(f"pred_{target} must be finite")
+            if _is_probability_target(target):
+                if ((chunk < 0.0) | (chunk > 1.0)).any():
+                    raise ValueError(f"pred_{target} must be in [0, 1]")
+            elif _is_nonnegative_target(target):
+                if (chunk < 0.0).any():
+                    raise ValueError(f"pred_{target} must be >= 0")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {f"pred_{name}": pred_arrays[name] for name in names}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as fh:
+        np.savez_compressed(
+            fh,
+            schema=np.array(ADVERSE_SELECTION_SIGNALS_SCHEMA),
+            decision_local_ts_us=decision_arrays["decision_local_ts_us"],
+            decision_event_index=decision_arrays["decision_event_index"],
+            decision_event_seq=decision_arrays["decision_event_seq"],
+            target_names=np.asarray(names, dtype=object),
+            **payload,
+        )
+    tmp.replace(path)
+
+
 def load_adverse_selection_signals(path: str | Path) -> AdverseSelectionSignalArtifact:
     with np.load(Path(path), allow_pickle=True) as data:
         required_keys = ("schema", "decision_local_ts_us", "decision_event_index", "decision_event_seq", "target_names")

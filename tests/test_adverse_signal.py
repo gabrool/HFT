@@ -130,3 +130,42 @@ def test_validate_decision_grid_alignment_rejects_mismatch():
     )
     with pytest.raises(ValueError, match="first mismatch"):
         validate_decision_grid_alignment(**grid, left_name="adverse_signals", right_name="linear_signals")
+
+from mmrt.execution.adverse_signal import save_adverse_selection_signals, save_adverse_selection_signals_arrays
+
+
+def test_save_adverse_selection_signals_arrays_matches_existing_artifact_writer_tiny(tmp_path):
+    kwargs = dict(
+        decision_local_ts_us=np.array([1, 2], dtype=np.int64),
+        decision_event_index=np.array([0, 1], dtype=np.int64),
+        decision_event_seq=np.array([10, 11], dtype=np.int64),
+        target_names=("bid_touch_filled", "bid_touch_toxic_cost_bps"),
+        predictions={
+            "bid_touch_filled": np.array([0.25, 0.75], dtype=np.float32),
+            "bid_touch_toxic_cost_bps": np.array([1.0, 2.0], dtype=np.float32),
+        },
+    )
+    artifact = AdverseSelectionSignalArtifact(schema=ADVERSE_SELECTION_SIGNALS_SCHEMA, **kwargs)
+    old_path = tmp_path / "old.npz"
+    new_path = tmp_path / "new.npz"
+    save_adverse_selection_signals(old_path, artifact)
+    save_adverse_selection_signals_arrays(new_path, **kwargs, validate_chunk_rows=1)
+    old = load_adverse_selection_signals(old_path)
+    new = load_adverse_selection_signals(new_path)
+    np.testing.assert_array_equal(new.decision_local_ts_us, old.decision_local_ts_us)
+    assert new.target_names == old.target_names
+    for name in old.target_names:
+        np.testing.assert_array_equal(new.predictions[name], old.predictions[name])
+
+
+def test_save_adverse_selection_signals_arrays_validates_probability_bounds_chunked(tmp_path):
+    with pytest.raises(ValueError, match=r"in \[0, 1\]"):
+        save_adverse_selection_signals_arrays(
+            tmp_path / "bad.npz",
+            decision_local_ts_us=np.array([1, 2], dtype=np.int64),
+            decision_event_index=np.array([0, 1], dtype=np.int64),
+            decision_event_seq=np.array([0, 0], dtype=np.int64),
+            target_names=("bid_touch_filled",),
+            predictions={"bid_touch_filled": np.array([0.5, 1.5], dtype=np.float32)},
+            validate_chunk_rows=1,
+        )

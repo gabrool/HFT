@@ -200,6 +200,7 @@ class AdverseSelectionTrainCLIConfig:
     metrics_mode: str = "approx"
     auc_bins: int = 2000
     exact_auc_max_rows: int = 1_000_000
+    progress_interval: int | None = None
 
     decision_interval_us: int = 500_000
     start_event_index: int | None = None
@@ -259,6 +260,7 @@ class AdverseSelectionTrainCLIConfig:
             raise ValueError("metrics_mode must be approx, none, or exact")
         object.__setattr__(self, "auc_bins", _require_positive_int(self.auc_bins, "auc_bins"))
         object.__setattr__(self, "exact_auc_max_rows", _require_positive_int(self.exact_auc_max_rows, "exact_auc_max_rows"))
+        object.__setattr__(self, "progress_interval", _optional_positive_int(self.progress_interval, "progress_interval"))
         object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
         object.__setattr__(self, "start_event_index", _optional_nonnegative_int(self.start_event_index, "start_event_index"))
         object.__setattr__(self, "max_decisions", _optional_positive_int(self.max_decisions, "max_decisions"))
@@ -363,6 +365,7 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "metrics_mode": config.metrics_mode,
         "auc_bins": config.auc_bins,
         "exact_auc_max_rows": config.exact_auc_max_rows,
+        "progress_interval": config.progress_interval,
         "decision_interval_us": config.decision_interval_us,
         "start_event_index": config.start_event_index,
         "max_decisions": config.max_decisions,
@@ -690,6 +693,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         overwrite=config.overwrite,
         cleanup_chunks=True,
         cleanup_work_dir=config.cleanup_work_dir,
+        progress_interval=config.progress_interval,
     )
     dataset_summary = summarize_disk_adverse_selection_dataset(dataset, chunk_rows=config.chunk_rows)
     baseline_fit = fit_adverse_baselines_streaming(
@@ -761,6 +765,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
             "metrics_mode": config.metrics_mode,
             "auc_bins": config.auc_bins,
             "exact_auc_max_rows": config.exact_auc_max_rows,
+        "progress_interval": config.progress_interval,
             "keep_dataset": config.keep_dataset,
             "keep_work_dir": not config.cleanup_work_dir,
             "cleanup_work_dir": config.cleanup_work_dir,
@@ -846,6 +851,7 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         metrics_mode=args.metrics_mode,
         auc_bins=args.auc_bins,
         exact_auc_max_rows=args.exact_auc_max_rows,
+        progress_interval=args.progress_interval,
         decision_interval_us=args.decision_interval_us,
         start_event_index=args.start_event_index,
         max_decisions=args.max_decisions,

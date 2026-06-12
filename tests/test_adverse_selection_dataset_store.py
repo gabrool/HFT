@@ -6,7 +6,7 @@ from mmrt.execution.adverse_selection_dataset import AdverseSelectionDatasetWrit
 
 
 def _meta():
-    return {"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,"decision_interval_us":1,"start_event_index":None,"max_decisions":None,"config_json":"{}"}
+    return {"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,"decision_interval_us":1,"start_event_index":None,"max_decisions":None,"config_json":"{}","index_schema":"mmrt_adverse_selection_index_v2","index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}
 
 
 def test_adverse_dataset_writer_roundtrip_tiny(tmp_path):
