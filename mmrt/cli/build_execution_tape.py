@@ -1,25 +1,29 @@
 """CLI builder for execution replay tapes from Tardis-style L2/trade inputs.
 
 This module intentionally orchestrates existing execution-layer primitives only:
-it reads rows, adapts them into contracts, reconstructs L2 batches, merges L2 and
-trade events, and delegates array/manifest creation to ``execution_tape.py``.
+it decodes input files into typed column chunks, adapts them into contracts,
+reconstructs L2 batches, merges L2 and trade events, and delegates
+array/manifest creation to ``execution_tape.py``.
+
+CSV and Parquet inputs share one columnar decode path: pyarrow parses each
+file into typed record batches and the per-field converters validate whole
+columns with numpy before constructing contract objects.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 from dataclasses import dataclass
-import gzip
 import json
 import math
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-try:  # Optional dependency for Parquet input support.
-    import pyarrow.parquet as pq
-except ModuleNotFoundError:  # pragma: no cover - exercised only without pyarrow
-    pq = None
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.csv as pacsv
+import pyarrow.parquet as pq
 
 from mmrt.contracts import AggressorSide, BookSide
 from mmrt.execution.contracts import L2Update, SymbolSpec, TradePrint
@@ -292,20 +296,32 @@ def iter_reconstructed_l2_events_streaming(
 
     def iter_updates() -> Iterator[L2Update]:
         for path in paths:
-            for row in _iter_path_rows(path, batch_size=batch_size):
-                if max_rows is not None and stats.rows_seen >= max_rows:
-                    stats.scan_limit_hit = True
-                    return
-                fallback_source_row = stats.rows_seen
-                stats.rows_seen += 1
-                if compatibility is not None:
-                    _observe_l2_row_compatibility(row, compatibility)
-                update = _row_to_l2_update(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
-                stats.updates_converted += 1
+            for chunk in _iter_path_column_chunks(path, batch_size=batch_size, columns=_L2_COLUMNS):
+                rows = chunk.num_rows
+                if rows == 0:
+                    continue
+                if max_rows is not None:
+                    remaining = max_rows - stats.rows_seen
+                    if remaining <= 0:
+                        stats.scan_limit_hit = True
+                        return
+                    if rows > remaining:
+                        chunk = chunk.slice(0, remaining)
+                        rows = remaining
+                        stats.scan_limit_hit = True
+                first_fallback_source_row = stats.rows_seen
+                stats.rows_seen += rows
+                updates = _l2_updates_from_chunk(
+                    chunk,
+                    symbol_spec=symbol_spec,
+                    compatibility=compatibility,
+                    first_fallback_source_row=first_fallback_source_row,
+                )
+                stats.updates_converted += rows
                 if stats.first_local_ts_us is None:
-                    stats.first_local_ts_us = update.local_ts_us
-                stats.last_local_ts_us = update.local_ts_us
-                yield update
+                    stats.first_local_ts_us = updates[0].local_ts_us
+                stats.last_local_ts_us = updates[-1].local_ts_us
+                yield from updates
 
     try:
         for batch in iter_l2_update_batches(iter_updates()):
@@ -345,23 +361,36 @@ def iter_trade_prints_streaming(
 ) -> Iterator[TradePrint]:
     prev_local_ts_us: int | None = None
     for path in paths:
-        for row in _iter_path_rows(path, batch_size=batch_size):
-            if max_rows is not None and stats.rows_seen >= max_rows:
-                stats.scan_limit_hit = True
-                return
-            fallback_source_row = stats.rows_seen
-            stats.rows_seen += 1
-            if compatibility is not None:
-                _observe_trade_row_compatibility(row, compatibility)
-            trade = _row_to_trade_print(row, symbol_spec=symbol_spec, fallback_source_row=fallback_source_row)
-            if prev_local_ts_us is not None and trade.local_ts_us < prev_local_ts_us:
+        for chunk in _iter_path_column_chunks(path, batch_size=batch_size, columns=_TRADE_COLUMNS):
+            rows = chunk.num_rows
+            if rows == 0:
+                continue
+            if max_rows is not None:
+                remaining = max_rows - stats.rows_seen
+                if remaining <= 0:
+                    stats.scan_limit_hit = True
+                    return
+                if rows > remaining:
+                    chunk = chunk.slice(0, remaining)
+                    rows = remaining
+                    stats.scan_limit_hit = True
+            first_fallback_source_row = stats.rows_seen
+            stats.rows_seen += rows
+            trades, local_ts = _trade_prints_from_chunk(
+                chunk,
+                symbol_spec=symbol_spec,
+                compatibility=compatibility,
+                first_fallback_source_row=first_fallback_source_row,
+            )
+            unsorted_within = rows > 1 and bool((np.diff(local_ts) < 0).any())
+            if unsorted_within or (prev_local_ts_us is not None and int(local_ts[0]) < prev_local_ts_us):
                 raise ValueError("trades must be sorted by nondecreasing local_ts_us")
             if stats.first_local_ts_us is None:
-                stats.first_local_ts_us = trade.local_ts_us
-            stats.last_local_ts_us = trade.local_ts_us
-            prev_local_ts_us = trade.local_ts_us
-            stats.trades_converted += 1
-            yield trade
+                stats.first_local_ts_us = int(local_ts[0])
+            stats.last_local_ts_us = int(local_ts[-1])
+            prev_local_ts_us = stats.last_local_ts_us
+            stats.trades_converted += rows
+            yield from trades
 
 
 def load_reconstructed_l2_events(
@@ -489,35 +518,254 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _iter_path_rows(path: Path, *, batch_size: int) -> Iterator[dict[str, Any]]:
+# Decompressed bytes handed to the CSV parser per chunk; large enough to keep
+# the per-chunk numpy validation passes amortized, small enough for 16GB hosts.
+_CSV_BLOCK_BYTES = 16 << 20
+
+# Smallest float strictly above every int64-representable tick/timestamp.
+_INT64_BOUND_FLOAT = float(2**63)
+
+# CSV cells are parsed straight into the column types the converters expect.
+# Integer-semantic columns use int64 so microsecond timestamps and row ids
+# stay exact at any magnitude; enum-like and id columns stay strings so the
+# original cell text reaches the existing per-value parsers unchanged.
+_CSV_COLUMN_TYPES: dict[str, pa.DataType] = {
+    "local_ts_us": pa.int64(),
+    "local_timestamp": pa.int64(),
+    "ts_us": pa.int64(),
+    "timestamp": pa.int64(),
+    "price_tick": pa.int64(),
+    "price": pa.float64(),
+    "amount": pa.float64(),
+    "side": pa.string(),
+    "is_snapshot": pa.string(),
+    "side_code": pa.int64(),
+    "trade_id": pa.string(),
+    "raw_source_row": pa.int64(),
+    "source_row": pa.int64(),
+}
+
+_L2_COLUMNS = (
+    "local_ts_us",
+    "local_timestamp",
+    "ts_us",
+    "timestamp",
+    "price_tick",
+    "price",
+    "side",
+    "amount",
+    "is_snapshot",
+    "raw_source_row",
+    "source_row",
+)
+
+_TRADE_COLUMNS = (
+    "local_ts_us",
+    "local_timestamp",
+    "ts_us",
+    "timestamp",
+    "price_tick",
+    "price",
+    "side",
+    "side_code",
+    "amount",
+    "trade_id",
+    "raw_source_row",
+    "source_row",
+)
+
+
+def _iter_path_column_chunks(path: Path, *, batch_size: int, columns: tuple[str, ...]) -> Iterator[pa.RecordBatch]:
     if path.name.endswith(".csv") or path.name.endswith(".csv.gz"):
-        yield from _iter_csv_rows(path)
+        stream = pa.input_stream(str(path), compression="detect")
+        try:
+            reader = pacsv.open_csv(
+                stream,
+                read_options=pacsv.ReadOptions(block_size=_CSV_BLOCK_BYTES),
+                convert_options=pacsv.ConvertOptions(
+                    column_types=_CSV_COLUMN_TYPES,
+                    include_columns=list(columns),
+                    include_missing_columns=True,
+                ),
+            )
+            try:
+                for chunk in reader:
+                    yield chunk
+            finally:
+                reader.close()
+        finally:
+            stream.close()
         return
     if path.suffix == ".parquet":
-        yield from _iter_parquet_rows(path, batch_size=batch_size)
+        parquet_file = pq.ParquetFile(path)
+        names = set(parquet_file.schema_arrow.names)
+        wanted = [name for name in columns if name in names] or None
+        yield from parquet_file.iter_batches(batch_size=batch_size, columns=wanted)
         return
     raise ValueError(f"unsupported input file type: {path}")
 
 
-def _iter_csv_rows(path: Path) -> Iterator[dict[str, Any]]:
-    open_fn = gzip.open if path.name.endswith(".gz") else open
-    with open_fn(path, "rt", encoding="utf-8", newline="") as handle:
-        reader = csv.reader(handle)
-        header = next(reader, None)
-        if header is None:
-            return
-        for values in reader:
-            yield dict(zip(header, values))
+def _chunk_column(chunk: pa.RecordBatch, name: str) -> pa.Array | None:
+    index = chunk.schema.get_field_index(name)
+    if index < 0:
+        return None
+    column = chunk.column(index)
+    if pa.types.is_null(column.type):
+        return None
+    return column
 
 
-def _iter_parquet_rows(path: Path, *, batch_size: int) -> Iterator[dict[str, Any]]:
-    if pq is None:
-        raise ModuleNotFoundError("pyarrow is required to read Parquet input files")
-    parquet_file = pq.ParquetFile(path)
-    for batch in parquet_file.iter_batches(batch_size=batch_size):
-        data = batch.to_pydict()
-        for i in range(batch.num_rows):
-            yield {col: values[i] for col, values in data.items()}
+def _numeric_column_values(column: pa.Array, *, invalid_type_message: str) -> tuple[np.ndarray, np.ndarray | None]:
+    """Decode a numeric column to (int64-or-float64 values, present mask or None).
+
+    A ``None`` mask means every row is present. Slots that are not present
+    hold filler values; callers must resolve or reject those rows before
+    validating values.
+    """
+    kind = column.type
+    if pa.types.is_boolean(kind):
+        raise ValueError(invalid_type_message)
+    if pa.types.is_string(kind) or pa.types.is_large_string(kind):
+        column = pc.if_else(pc.equal(column, ""), pa.scalar(None, kind), column).cast(pa.float64())
+        kind = column.type
+    if pa.types.is_integer(kind):
+        if column.null_count:
+            present = ~column.is_null().to_numpy(zero_copy_only=False)
+            values = column.fill_null(0).to_numpy(zero_copy_only=False)
+        else:
+            present = None
+            values = column.to_numpy(zero_copy_only=False)
+        return values.astype(np.int64, copy=False), present
+    if pa.types.is_floating(kind):
+        if column.null_count:
+            present = ~column.is_null().to_numpy(zero_copy_only=False)
+        else:
+            present = None
+        return column.to_numpy(zero_copy_only=False).astype(np.float64, copy=False), present
+    raise ValueError(invalid_type_message)
+
+
+def _optional_numeric_column(chunk: pa.RecordBatch, name: str, *, invalid_type_message: str) -> tuple[np.ndarray, np.ndarray | None] | None:
+    column = _chunk_column(chunk, name)
+    if column is None or column.null_count == len(column):
+        return None
+    return _numeric_column_values(column, invalid_type_message=invalid_type_message)
+
+
+def _require_positive_int_column(values: np.ndarray, name: str) -> np.ndarray:
+    if values.dtype.kind == "f":
+        ok = np.isfinite(values) & (values > 0.0) & (values == np.floor(values)) & (values < _INT64_BOUND_FLOAT)
+        if not bool(ok.all()):
+            raise ValueError(f"{name} must be a positive int")
+        return values.astype(np.int64)
+    if bool((values <= 0).any()):
+        raise ValueError(f"{name} must be a positive int")
+    return values
+
+
+def _require_int_column(values: np.ndarray, name: str) -> np.ndarray:
+    if values.dtype.kind == "f":
+        ok = np.isfinite(values) & (values == np.floor(values)) & (np.abs(values) < _INT64_BOUND_FLOAT)
+        if not bool(ok.all()):
+            raise ValueError(f"{name} must be int")
+        return values.astype(np.int64)
+    return values
+
+
+def _require_finite_floats(values: np.ndarray, name: str) -> None:
+    if not bool(np.isfinite(values).all()):
+        raise ValueError(f"{name} must be a finite float")
+
+
+def _resolve_required_int_alias(chunk: pa.RecordBatch, names: tuple[str, ...], value_name: str) -> np.ndarray:
+    """Resolve per-row alias fallthrough across columns, first present wins."""
+    invalid_type_message = f"{value_name} must be a positive int"
+    resolved: np.ndarray | None = None
+    have: np.ndarray | None = None
+    for name in names:
+        column = _chunk_column(chunk, name)
+        if column is None or column.null_count == len(column):
+            continue
+        values, present = _numeric_column_values(column, invalid_type_message=invalid_type_message)
+        if resolved is None:
+            resolved = values
+            have = present
+        else:
+            fill = ~have if present is None else (~have & present)
+            if fill.any():
+                if resolved.dtype != values.dtype:
+                    resolved = resolved.astype(np.float64)
+                    values = values.astype(np.float64)
+                resolved = np.where(fill, values, resolved)
+                have = have | fill
+        if have is None or bool(have.all()):
+            have = None
+            break
+    if resolved is None or have is not None:
+        raise ValueError(f"row is missing required field(s): {', '.join(names)}")
+    return _require_positive_int_column(resolved, value_name)
+
+
+def _required_float_column(chunk: pa.RecordBatch, name: str) -> np.ndarray:
+    pair = _optional_numeric_column(chunk, name, invalid_type_message=f"{name} must be a finite float")
+    if pair is None:
+        raise ValueError(f"row is missing required field(s): {name}")
+    values, present = pair
+    if present is not None and not bool(present.all()):
+        raise ValueError(f"row is missing required field(s): {name}")
+    return values.astype(np.float64, copy=False)
+
+
+def _ticks_from_prices(prices: np.ndarray, symbol_spec: SymbolSpec) -> np.ndarray:
+    _require_finite_floats(prices, "price")
+    if bool((prices <= 0.0).any()):
+        raise ValueError("price must be > 0")
+    ticks = np.rint(prices / symbol_spec.tick_size)
+    if bool(((ticks < 1.0) | (ticks >= _INT64_BOUND_FLOAT)).any()):
+        raise ValueError("price_tick must be a positive int")
+    return ticks.astype(np.int64)
+
+
+def _resolve_price_ticks_and_observe(
+    chunk: pa.RecordBatch,
+    n: int,
+    *,
+    symbol_spec: SymbolSpec,
+    compatibility: RuleCompatibilityAccumulator | None,
+    price_source: str,
+    local_ts: np.ndarray,
+) -> np.ndarray:
+    tick_pair = _optional_numeric_column(chunk, "price_tick", invalid_type_message="price_tick must be a positive int")
+    price_pair = _optional_numeric_column(chunk, "price", invalid_type_message="price must be a finite float")
+
+    price_values: np.ndarray | None = None
+    price_present: np.ndarray | None = None
+    if price_pair is not None:
+        price_values = price_pair[0].astype(np.float64, copy=False)
+        price_present = price_pair[1]
+        if compatibility is not None:
+            if price_present is None:
+                _require_finite_floats(price_values, "price")
+                compatibility.observe_price_array(price_values, source=price_source, local_ts_us=local_ts)
+            elif bool(price_present.any()):
+                observed = price_values[price_present]
+                _require_finite_floats(observed, "price")
+                compatibility.observe_price_array(observed, source=price_source, local_ts_us=local_ts[price_present])
+
+    if tick_pair is not None:
+        tick_values, tick_present = tick_pair
+        if tick_present is None:
+            return _require_positive_int_column(tick_values, "price_tick")
+        need = ~tick_present
+        if price_values is None or (price_present is not None and not bool(price_present[need].all())):
+            raise ValueError("row is missing required field(s): price")
+        ticks = np.empty(n, dtype=np.int64)
+        ticks[tick_present] = _require_positive_int_column(tick_values[tick_present], "price_tick")
+        ticks[need] = _ticks_from_prices(price_values[need], symbol_spec)
+        return ticks
+    if price_values is None or (price_present is not None and not bool(price_present.all())):
+        raise ValueError("row is missing required field(s): price")
+    return _ticks_from_prices(price_values, symbol_spec)
 
 
 def _resolve_input_paths(paths: Sequence[str], name: str) -> tuple[Path, ...]:
@@ -535,54 +783,199 @@ def _resolve_input_paths(paths: Sequence[str], name: str) -> tuple[Path, ...]:
     return tuple(resolved)
 
 
-def _row_to_l2_update(row: Mapping[str, Any], *, symbol_spec: SymbolSpec, fallback_source_row: int) -> L2Update:
-    local_ts_us = _coerce_positive_int(_first_present(row, ("local_ts_us", "local_timestamp")), "local_ts_us")
-    ts_us = _coerce_positive_int(_first_present(row, ("ts_us", "timestamp")), "ts_us")
-    if _has_nonempty(row, "price_tick"):
-        price_tick = _coerce_positive_int(row["price_tick"], "price_tick")
+def _l2_sides(chunk: pa.RecordBatch) -> list[BookSide]:
+    column = _chunk_column(chunk, "side")
+    if column is None or column.null_count:
+        raise ValueError("row is missing required field(s): side")
+    encoded = column.dictionary_encode()
+    side_map: list[BookSide] = []
+    for value in encoded.dictionary.to_pylist():
+        if value == "":
+            raise ValueError("row is missing required field(s): side")
+        side_map.append(_parse_book_side(value))
+    return [side_map[i] for i in encoded.indices.to_numpy(zero_copy_only=False).tolist()]
+
+
+def _l2_snapshot_flags(chunk: pa.RecordBatch) -> list[bool]:
+    column = _chunk_column(chunk, "is_snapshot")
+    if column is None or column.null_count:
+        raise ValueError("row is missing required field(s): is_snapshot")
+    if pa.types.is_boolean(column.type):
+        return column.to_pylist()
+    encoded = column.dictionary_encode()
+    flag_map: list[bool] = []
+    for value in encoded.dictionary.to_pylist():
+        if value == "":
+            raise ValueError("row is missing required field(s): is_snapshot")
+        flag_map.append(_parse_bool(value))
+    return [flag_map[i] for i in encoded.indices.to_numpy(zero_copy_only=False).tolist()]
+
+
+def _trade_sides_from_codes(codes: np.ndarray) -> list[AggressorSide]:
+    buy = codes == 1
+    sell = codes == -1
+    unknown = codes == 0
+    bad = ~(buy | sell | unknown)
+    if bool(bad.any()):
+        _parse_trade_side_code(int(codes[int(np.argmax(bad))]))
+    out = np.empty(codes.shape[0], dtype=object)
+    out[buy] = AggressorSide.BUY
+    out[sell] = AggressorSide.SELL
+    out[unknown] = AggressorSide.UNKNOWN
+    return out.tolist()
+
+
+def _trade_sides(chunk: pa.RecordBatch, n: int) -> list[AggressorSide]:
+    side_column = _chunk_column(chunk, "side")
+    sides: list[AggressorSide | None] | None = None
+    if side_column is not None and side_column.null_count != len(side_column):
+        encoded = side_column.dictionary_encode()
+        side_map: list[AggressorSide | None] = []
+        for value in encoded.dictionary.to_pylist():
+            side_map.append(None if value == "" else _parse_trade_side(value))
+        indices = encoded.indices.fill_null(-1).to_numpy(zero_copy_only=False)
+        sides = [None if i < 0 else side_map[i] for i in indices.tolist()]
+        need = np.fromiter((side is None for side in sides), dtype=bool, count=n)
+        if not bool(need.any()):
+            return sides
     else:
-        price_tick = symbol_spec.price_to_tick(_coerce_float(_first_present(row, ("price",)), "price"))
-    side = _parse_book_side(_first_present(row, ("side",)))
-    amount = _coerce_float(_first_present(row, ("amount",)), "amount")
-    if amount < 0:
+        need = np.ones(n, dtype=bool)
+
+    code_pair = _optional_numeric_column(chunk, "side_code", invalid_type_message="side_code must be int")
+    if code_pair is None:
+        raise ValueError("trade row missing side or side_code")
+    code_values, code_present = code_pair
+    if code_present is not None and not bool(code_present[need].all()):
+        raise ValueError("trade row missing side or side_code")
+    code_sides = _trade_sides_from_codes(_require_int_column(code_values[need], "side_code"))
+    if sides is None:
+        return code_sides
+    for index, side in zip(np.flatnonzero(need).tolist(), code_sides):
+        sides[index] = side
+    return sides
+
+
+def _trade_ids(chunk: pa.RecordBatch, n: int) -> list[str]:
+    column = _chunk_column(chunk, "trade_id")
+    if column is None:
+        return [""] * n
+    return ["" if value is None else str(value) for value in column.to_pylist()]
+
+
+def _validated_source_rows(values: np.ndarray) -> np.ndarray:
+    out = _require_int_column(values, "source_row")
+    if bool((out < 0).any()):
+        raise ValueError("source_row must be >= 0")
+    return out
+
+
+def _source_rows(chunk: pa.RecordBatch, n: int, first_fallback_source_row: int) -> np.ndarray:
+    raw_pair = _optional_numeric_column(chunk, "raw_source_row", invalid_type_message="source_row must be int")
+    if raw_pair is not None and raw_pair[1] is None:
+        return _validated_source_rows(raw_pair[0])
+    src_pair = _optional_numeric_column(chunk, "source_row", invalid_type_message="source_row must be int")
+    if raw_pair is None:
+        if src_pair is None:
+            return np.arange(first_fallback_source_row, first_fallback_source_row + n, dtype=np.int64)
+        if src_pair[1] is None:
+            return _validated_source_rows(src_pair[0])
+    resolved = np.arange(first_fallback_source_row, first_fallback_source_row + n, dtype=np.int64)
+    filled = np.zeros(n, dtype=bool)
+    if raw_pair is not None:
+        values, present = raw_pair
+        resolved[present] = _validated_source_rows(values[present])
+        filled |= present
+    if src_pair is not None:
+        values, present = src_pair
+        take = ~filled if present is None else (~filled & present)
+        if bool(take.any()):
+            resolved[take] = _validated_source_rows(values[take])
+    return resolved
+
+
+def _l2_updates_from_chunk(
+    chunk: pa.RecordBatch,
+    *,
+    symbol_spec: SymbolSpec,
+    compatibility: RuleCompatibilityAccumulator | None,
+    first_fallback_source_row: int,
+) -> list[L2Update]:
+    n = chunk.num_rows
+    local_ts = _resolve_required_int_alias(chunk, ("local_ts_us", "local_timestamp"), "local_ts_us")
+    ts = _resolve_required_int_alias(chunk, ("ts_us", "timestamp"), "ts_us")
+    ticks = _resolve_price_ticks_and_observe(
+        chunk, n, symbol_spec=symbol_spec, compatibility=compatibility, price_source="l2.price", local_ts=local_ts
+    )
+    sides = _l2_sides(chunk)
+    amounts = _required_float_column(chunk, "amount")
+    _require_finite_floats(amounts, "amount")
+    if bool((amounts < 0.0).any()):
         raise ValueError("amount must be >= 0")
-    is_snapshot = _parse_bool(_first_present(row, ("is_snapshot",)))
-    source_row = _source_row(row, fallback_source_row)
-    # Fields are fully coerced above; the trusted constructor skips the
+    if compatibility is not None:
+        positive = amounts > 0.0
+        if bool(positive.all()):
+            compatibility.observe_qty_array(amounts, source="l2.amount", local_ts_us=local_ts)
+        else:
+            compatibility.observe_qty_array(amounts[positive], source="l2.amount", local_ts_us=local_ts[positive])
+    snapshots = _l2_snapshot_flags(chunk)
+    source_rows = _source_rows(chunk, n, first_fallback_source_row)
+    # Every column is validated above; the trusted constructor skips the
     # redundant dataclass re-validation on this per-row hot path.
-    return L2Update.from_trusted(
-        local_ts_us=local_ts_us,
-        ts_us=ts_us,
-        side=side,
-        price_tick=price_tick,
-        amount=amount,
-        is_snapshot=is_snapshot,
-        source_row=source_row,
+    from_trusted = L2Update.from_trusted
+    return [
+        from_trusted(
+            local_ts_us=row_local_ts,
+            ts_us=row_ts,
+            side=side,
+            price_tick=tick,
+            amount=amount,
+            is_snapshot=is_snapshot,
+            source_row=source_row,
+        )
+        for row_local_ts, row_ts, side, tick, amount, is_snapshot, source_row in zip(
+            local_ts.tolist(), ts.tolist(), sides, ticks.tolist(), amounts.tolist(), snapshots, source_rows.tolist()
+        )
+    ]
+
+
+def _trade_prints_from_chunk(
+    chunk: pa.RecordBatch,
+    *,
+    symbol_spec: SymbolSpec,
+    compatibility: RuleCompatibilityAccumulator | None,
+    first_fallback_source_row: int,
+) -> tuple[list[TradePrint], np.ndarray]:
+    n = chunk.num_rows
+    local_ts = _resolve_required_int_alias(chunk, ("local_ts_us", "local_timestamp"), "local_ts_us")
+    ts = _resolve_required_int_alias(chunk, ("ts_us", "timestamp"), "ts_us")
+    ticks = _resolve_price_ticks_and_observe(
+        chunk, n, symbol_spec=symbol_spec, compatibility=compatibility, price_source="trade.price", local_ts=local_ts
     )
-
-
-def _row_to_trade_print(row: Mapping[str, Any], *, symbol_spec: SymbolSpec, fallback_source_row: int) -> TradePrint:
-    local_ts_us = _coerce_positive_int(_first_present(row, ("local_ts_us", "local_timestamp")), "local_ts_us")
-    ts_us = _coerce_positive_int(_first_present(row, ("ts_us", "timestamp")), "ts_us")
-    if _has_nonempty(row, "price_tick"):
-        price_tick = _coerce_positive_int(row["price_tick"], "price_tick")
-    else:
-        price_tick = symbol_spec.price_to_tick(_coerce_float(_first_present(row, ("price",)), "price"))
-    amount = _coerce_float(_first_present(row, ("amount",)), "amount")
-    if amount <= 0:
+    amounts = _required_float_column(chunk, "amount")
+    _require_finite_floats(amounts, "amount")
+    if bool((amounts <= 0.0).any()):
         raise ValueError("trade amount must be > 0")
-    side = _parse_trade_side(row)
-    trade_id = "" if not _has_nonempty(row, "trade_id") else str(row["trade_id"])
-    source_row = _source_row(row, fallback_source_row)
-    return TradePrint(
-        local_ts_us=local_ts_us,
-        ts_us=ts_us,
-        side=side,
-        price_tick=price_tick,
-        amount=amount,
-        trade_id=trade_id,
-        source_row=source_row,
-    )
+    if compatibility is not None:
+        compatibility.observe_qty_array(amounts, source="trade.amount", local_ts_us=local_ts)
+    sides = _trade_sides(chunk, n)
+    trade_ids = _trade_ids(chunk, n)
+    source_rows = _source_rows(chunk, n, first_fallback_source_row)
+    from_trusted = TradePrint.from_trusted
+    trades = [
+        from_trusted(
+            local_ts_us=row_local_ts,
+            ts_us=row_ts,
+            side=side,
+            price_tick=tick,
+            amount=amount,
+            trade_id=trade_id,
+            source_row=source_row,
+        )
+        for row_local_ts, row_ts, side, tick, amount, trade_id, source_row in zip(
+            local_ts.tolist(), ts.tolist(), sides, ticks.tolist(), amounts.tolist(), trade_ids, source_rows.tolist()
+        )
+    ]
+    return trades, local_ts
 
 
 def _build_summary(config, output_root, l2_stats, trade_stats, merge_counters: ExecutionMergeCounters, tape, *, chunk_summary: dict[str, object]) -> dict[str, object]:
@@ -779,24 +1172,6 @@ def _is_supported_input_path(path: Path) -> bool:
     return path.name.endswith(".csv") or path.name.endswith(".csv.gz") or path.suffix == ".parquet"
 
 
-def _first_present(row: Mapping[str, Any], names: Sequence[str]) -> Any:
-    for name in names:
-        if _has_nonempty(row, name):
-            return row[name]
-    raise ValueError(f"row is missing required field(s): {', '.join(names)}")
-
-
-def _has_nonempty(row: Mapping[str, Any], name: str) -> bool:
-    if name not in row:
-        return False
-    value = row[name]
-    if value is None:
-        return False
-    if isinstance(value, str) and value == "":
-        return False
-    return True
-
-
 def _coerce_float(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite float")
@@ -806,31 +1181,6 @@ def _coerce_float(value: Any, name: str) -> float:
         raise ValueError(f"{name} must be a finite float") from exc
     if out != out or out in (float("inf"), float("-inf")):
         raise ValueError(f"{name} must be a finite float")
-    return out
-
-
-def _coerce_positive_int(value: Any, name: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a positive int")
-    try:
-        if isinstance(value, float):
-            if not value.is_integer():
-                raise ValueError
-            out = int(value)
-        elif isinstance(value, str):
-            if "." in value:
-                f = float(value)
-                if not f.is_integer():
-                    raise ValueError
-                out = int(f)
-            else:
-                out = int(value)
-        else:
-            out = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a positive int") from exc
-    if out <= 0:
-        raise ValueError(f"{name} must be a positive int")
     return out
 
 
@@ -861,31 +1211,28 @@ def _parse_book_side(value: Any) -> BookSide:
     raise ValueError(f"unsupported L2 side: {value!r}")
 
 
-def _parse_trade_side(row: Mapping[str, Any]) -> AggressorSide:
-    if _has_nonempty(row, "side"):
-        value = row["side"]
-        if isinstance(value, AggressorSide):
-            return value
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized == "buy":
-                return AggressorSide.BUY
-            if normalized == "sell":
-                return AggressorSide.SELL
-            if normalized == "unknown":
-                return AggressorSide.UNKNOWN
-        raise ValueError(f"unsupported trade side: {value!r}")
-
-    if _has_nonempty(row, "side_code"):
-        code = _coerce_int(row["side_code"], "side_code")
-        if code == 1:
+def _parse_trade_side(value: Any) -> AggressorSide:
+    if isinstance(value, AggressorSide):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "buy":
             return AggressorSide.BUY
-        if code == -1:
+        if normalized == "sell":
             return AggressorSide.SELL
-        if code == 0:
+        if normalized == "unknown":
             return AggressorSide.UNKNOWN
-        raise ValueError(f"unsupported side_code: {code!r}")
-    raise ValueError("trade row missing side or side_code")
+    raise ValueError(f"unsupported trade side: {value!r}")
+
+
+def _parse_trade_side_code(code: int) -> AggressorSide:
+    if code == 1:
+        return AggressorSide.BUY
+    if code == -1:
+        return AggressorSide.SELL
+    if code == 0:
+        return AggressorSide.UNKNOWN
+    raise ValueError(f"unsupported side_code: {code!r}")
 
 
 def _coerce_symbol_rules_mode(value: SymbolRuleMode | str) -> SymbolRuleMode:
@@ -919,62 +1266,6 @@ def _load_symbol_rules(config: ExecutionTapeBuildConfig) -> ExchangeSymbolRules:
     if rules.exchange != config.exchange or rules.symbol != config.symbol:
         raise ValueError("symbol rules exchange/symbol must match build config")
     return rules
-
-
-def _observe_l2_row_compatibility(row: Mapping[str, Any], compatibility: RuleCompatibilityAccumulator) -> None:
-    local_ts_us = _compat_local_ts(row)
-    if _has_nonempty(row, "price"):
-        compatibility.observe_price(_coerce_float(row["price"], "price"), source="l2.price", local_ts_us=local_ts_us)
-    if _has_nonempty(row, "amount"):
-        amount = _coerce_float(row["amount"], "amount")
-        if amount > 0:
-            compatibility.observe_qty(amount, source="l2.amount", local_ts_us=local_ts_us)
-
-
-def _observe_trade_row_compatibility(row: Mapping[str, Any], compatibility: RuleCompatibilityAccumulator) -> None:
-    local_ts_us = _compat_local_ts(row)
-    if _has_nonempty(row, "price"):
-        compatibility.observe_price(_coerce_float(row["price"], "price"), source="trade.price", local_ts_us=local_ts_us)
-    if _has_nonempty(row, "amount"):
-        compatibility.observe_qty(_coerce_float(row["amount"], "amount"), source="trade.amount", local_ts_us=local_ts_us)
-
-
-def _compat_local_ts(row: Mapping[str, Any]) -> int | None:
-    if _has_nonempty(row, "local_ts_us"):
-        return _coerce_positive_int(row["local_ts_us"], "local_ts_us")
-    if _has_nonempty(row, "local_timestamp"):
-        return _coerce_positive_int(row["local_timestamp"], "local_timestamp")
-    return None
-
-def _coerce_int(value: Any, name: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be int")
-    try:
-        if isinstance(value, float):
-            if not value.is_integer():
-                raise ValueError
-            return int(value)
-        if isinstance(value, str):
-            f = float(value)
-            if not f.is_integer():
-                raise ValueError
-            return int(f)
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be int") from exc
-
-
-def _source_row(row: Mapping[str, Any], fallback_source_row: int) -> int:
-    if _has_nonempty(row, "raw_source_row"):
-        value = row["raw_source_row"]
-    elif _has_nonempty(row, "source_row"):
-        value = row["source_row"]
-    else:
-        return fallback_source_row
-    out = _coerce_int(value, "source_row")
-    if out < 0:
-        raise ValueError("source_row must be >= 0")
-    return out
 
 
 __all__ = [

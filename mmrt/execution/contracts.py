@@ -370,6 +370,19 @@ class TradePrint:
             raise ValueError("trade_id must be str")
         _require_nonnegative_int(self.source_row, "source_row")
 
+    @classmethod
+    def from_trusted(cls, *, local_ts_us: int, ts_us: int, side: AggressorSide, price_tick: int, amount: float, trade_id: str, source_row: int) -> "TradePrint":
+        """Construct without re-validation for fields coerced upstream."""
+        self = object.__new__(cls)
+        object.__setattr__(self, "local_ts_us", local_ts_us)
+        object.__setattr__(self, "ts_us", ts_us)
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "price_tick", price_tick)
+        object.__setattr__(self, "amount", amount)
+        object.__setattr__(self, "trade_id", trade_id)
+        object.__setattr__(self, "source_row", source_row)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class BookTop:

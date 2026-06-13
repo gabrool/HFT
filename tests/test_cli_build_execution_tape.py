@@ -13,6 +13,7 @@ from mmrt.cli.build_execution_tape import (
     main,
     _flatten_repeated,
     _parse_trade_side,
+    _parse_trade_side_code,
 )
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import SymbolSpec
@@ -455,8 +456,31 @@ def test_build_execution_tape_rejects_missing_trade_side(tmp_path):
 
 
 def test_build_execution_tape_accepts_explicit_unknown_trade_side():
-    assert _parse_trade_side({"side": "unknown"}) is AggressorSide.UNKNOWN
-    assert _parse_trade_side({"side_code": 0}) is AggressorSide.UNKNOWN
+    assert _parse_trade_side("unknown") is AggressorSide.UNKNOWN
+    assert _parse_trade_side_code(0) is AggressorSide.UNKNOWN
+
+
+def test_per_row_alias_fallthrough_and_price_tick_priority(tmp_path):
+    l2_path = _write_l2_csv(tmp_path / "l2.csv", _good_l2_rows())
+    trade_path = _write_trade_csv(
+        tmp_path / "trades.csv",
+        [
+            # price_tick wins over price; side string wins over side_code.
+            {"local_ts_us": 150, "ts_us": 150, "side": "buy", "side_code": "", "price": 999.9, "price_tick": 1002, "amount": 0.01},
+            # Empty cells fall through per row to price and side_code.
+            {"local_ts_us": 250, "ts_us": 250, "side": "", "side_code": -1, "price": 100.1, "price_tick": "", "amount": 0.02},
+        ],
+        columns=["local_ts_us", "ts_us", "side", "side_code", "price", "price_tick", "amount"],
+    )
+
+    build_execution_tape_from_config(
+        _config(tmp_path, l2_inputs=(str(l2_path),), trade_inputs=(str(trade_path),), output_root=str(tmp_path / "tape"))
+    )
+
+    loaded = load_execution_tape(tmp_path / "tape")
+    assert loaded.arrays.trades["price_tick"].tolist() == [1002, 1001]
+    assert loaded.arrays.trades["side_code"].tolist() == [1, -1]
+    assert loaded.arrays.trades["local_ts_us"].tolist() == [150, 250]
 
 
 def test_build_execution_tape_json_is_strict():
