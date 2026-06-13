@@ -8,6 +8,8 @@ from enum import Enum
 import math
 from typing import Mapping
 
+import numpy as np
+
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules
 
 
@@ -175,13 +177,72 @@ class RuleCompatibilityAccumulator:
             and residual_float + _RESIDUAL_FLOAT_GUARD <= self._max_price_residual_float
         ):
             return
-        residual = abs((Decimal(str(price)) / self.rules.tick_size) - _nearest_integer(Decimal(str(price)) / self.rules.tick_size))
+        self._escalate_price(p, source, local_ts_us)
+
+    def observe_price_array(self, prices: np.ndarray, *, source: str, local_ts_us: np.ndarray | None = None) -> None:
+        """Observe a finite float64 price array; state-identical to per-value calls in order.
+
+        The float screen only skips values that are provably on the grid and
+        provably unable to raise the running maximum residual, so screening
+        the whole array against the maximum held before the call escalates a
+        superset of the values the per-value path escalates; the extra values
+        cannot change any counted, reported, or example state.
+        """
+        if self.config.mode is RuleCompatibilityMode.OFF:
+            return
+        n = int(prices.size)
+        if n == 0:
+            return
+        self.price_count += n
+        lo = float(prices.min())
+        hi = float(prices.max())
+        if self.min_price is None or lo < self.min_price:
+            self.min_price = lo
+        if self.max_price is None or hi > self.max_price:
+            self.max_price = hi
+        ratio = prices / self._tick_size_float
+        screened = np.abs(ratio - np.rint(ratio)) + _RESIDUAL_FLOAT_GUARD
+        candidates = ~((screened < self._price_tolerance_float) & (screened <= self._max_price_residual_float))
+        if not candidates.any():
+            return
+        candidate_index = np.flatnonzero(candidates)
+        # Escalate each distinct value once: equal floats share one exact
+        # residual, so violation counts multiply by occurrence and the
+        # capped examples replay the violating rows in order.
+        uniques, inverse = np.unique(prices[candidate_index], return_inverse=True)
+        residuals = [self._exact_price_residual(value) for value in uniques.tolist()]
+        best = max(residuals)
+        if best > self.max_price_residual:
+            self.max_price_residual = best
+            self._max_price_residual_float = float(best) - _RESIDUAL_FLOAT_GUARD
+        violating = np.fromiter((residual > self._price_tolerance_decimal for residual in residuals), dtype=bool, count=len(residuals))
+        if not violating.any():
+            return
+        violating_positions = np.flatnonzero(violating[inverse])
+        self.price_violations += int(violating_positions.size)
+        room = self.config.max_examples - len(self.examples)
+        for position in violating_positions[: max(room, 0)].tolist():
+            row = int(candidate_index[position])
+            self._add_example(
+                "price",
+                float(prices[row]),
+                residuals[int(inverse[position])],
+                source,
+                None if local_ts_us is None else int(local_ts_us[row]),
+            )
+
+    def _exact_price_residual(self, price: float) -> Decimal:
+        ratio = Decimal(str(price)) / self.rules.tick_size
+        return abs(ratio - _nearest_integer(ratio))
+
+    def _escalate_price(self, price: float, source: str, local_ts_us: int | None) -> None:
+        residual = self._exact_price_residual(price)
         if residual > self.max_price_residual:
             self.max_price_residual = residual
             self._max_price_residual_float = float(residual) - _RESIDUAL_FLOAT_GUARD
         if residual > self._price_tolerance_decimal:
             self.price_violations += 1
-            self._add_example("price", p, residual, source, local_ts_us)
+            self._add_example("price", price, residual, source, local_ts_us)
 
     def observe_qty(self, qty: float, *, source: str, local_ts_us: int | None = None) -> None:
         if self.config.mode is RuleCompatibilityMode.OFF:
@@ -199,13 +260,62 @@ class RuleCompatibilityAccumulator:
             and residual_float + _RESIDUAL_FLOAT_GUARD <= self._max_qty_residual_float
         ):
             return
-        residual = abs((Decimal(str(qty)) / self.rules.step_size) - _nearest_integer(Decimal(str(qty)) / self.rules.step_size))
+        self._escalate_qty(q, source, local_ts_us)
+
+    def observe_qty_array(self, qtys: np.ndarray, *, source: str, local_ts_us: np.ndarray | None = None) -> None:
+        """Observe a finite float64 qty array; state-identical to per-value calls in order."""
+        if self.config.mode is RuleCompatibilityMode.OFF:
+            return
+        n = int(qtys.size)
+        if n == 0:
+            return
+        self.qty_count += n
+        lo = float(qtys.min())
+        hi = float(qtys.max())
+        if self.min_qty is None or lo < self.min_qty:
+            self.min_qty = lo
+        if self.max_qty is None or hi > self.max_qty:
+            self.max_qty = hi
+        ratio = qtys / self._step_size_float
+        screened = np.abs(ratio - np.rint(ratio)) + _RESIDUAL_FLOAT_GUARD
+        candidates = ~((screened < self._qty_tolerance_float) & (screened <= self._max_qty_residual_float))
+        if not candidates.any():
+            return
+        candidate_index = np.flatnonzero(candidates)
+        uniques, inverse = np.unique(qtys[candidate_index], return_inverse=True)
+        residuals = [self._exact_qty_residual(value) for value in uniques.tolist()]
+        best = max(residuals)
+        if best > self.max_qty_residual:
+            self.max_qty_residual = best
+            self._max_qty_residual_float = float(best) - _RESIDUAL_FLOAT_GUARD
+        violating = np.fromiter((residual > self._qty_tolerance_decimal for residual in residuals), dtype=bool, count=len(residuals))
+        if not violating.any():
+            return
+        violating_positions = np.flatnonzero(violating[inverse])
+        self.qty_violations += int(violating_positions.size)
+        room = self.config.max_examples - len(self.examples)
+        for position in violating_positions[: max(room, 0)].tolist():
+            row = int(candidate_index[position])
+            self._add_example(
+                "qty",
+                float(qtys[row]),
+                residuals[int(inverse[position])],
+                source,
+                None if local_ts_us is None else int(local_ts_us[row]),
+            )
+
+    def _exact_qty_residual(self, qty: float) -> Decimal:
+        ratio = Decimal(str(qty)) / self.rules.step_size
+        return abs(ratio - _nearest_integer(ratio))
+
+    def _escalate_qty(self, qty: float, source: str, local_ts_us: int | None) -> None:
+        residual = self._exact_qty_residual(qty)
         if residual > self.max_qty_residual:
             self.max_qty_residual = residual
             self._max_qty_residual_float = float(residual) - _RESIDUAL_FLOAT_GUARD
         if residual > self._qty_tolerance_decimal:
             self.qty_violations += 1
-            self._add_example("qty", q, residual, source, local_ts_us)
+            self._add_example("qty", qty, residual, source, local_ts_us)
 
     def _add_example(self, kind: str, value: float, residual: Decimal, source: str, local_ts_us: int | None) -> None:
         if len(self.examples) >= self.config.max_examples:

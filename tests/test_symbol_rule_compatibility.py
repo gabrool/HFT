@@ -56,3 +56,61 @@ def test_compatibility_config_rejects_bad_tolerances(bad):
 def test_compatibility_config_rejects_bad_max_examples(bad):
     with pytest.raises(ValueError):
         RuleCompatibilityConfig(max_examples=bad)
+
+
+def _accumulator_state(acc: RuleCompatibilityAccumulator) -> dict:
+    return {
+        "price_count": acc.price_count,
+        "qty_count": acc.qty_count,
+        "price_violations": acc.price_violations,
+        "qty_violations": acc.qty_violations,
+        "max_price_residual": acc.max_price_residual,
+        "max_qty_residual": acc.max_qty_residual,
+        "min_price": acc.min_price,
+        "max_price": acc.max_price,
+        "min_qty": acc.min_qty,
+        "max_qty": acc.max_qty,
+        "examples": acc.examples,
+        "report": acc.report().to_dict(),
+    }
+
+
+def test_array_observers_match_per_value_observers_exactly():
+    import numpy as np
+
+    prices = np.asarray([100.0, 100.1, 100.05, 100.1, 100.05, 99.9, 100.0000000001, 123456.7], dtype=np.float64)
+    qtys = np.asarray([0.001, 0.0015, 0.002, 0.0015, 1.0, 0.001, 0.30000000004, 0.001], dtype=np.float64)
+    ts = np.arange(1_000, 1_000 + prices.size, dtype=np.int64)
+
+    scalar = RuleCompatibilityAccumulator(_rules(), RuleCompatibilityConfig(max_examples=3))
+    for i in range(prices.size):
+        scalar.observe_price(float(prices[i]), source="p", local_ts_us=int(ts[i]))
+    for i in range(qtys.size):
+        scalar.observe_qty(float(qtys[i]), source="q", local_ts_us=int(ts[i]))
+
+    vector = RuleCompatibilityAccumulator(_rules(), RuleCompatibilityConfig(max_examples=3))
+    vector.observe_price_array(prices, source="p", local_ts_us=ts)
+    vector.observe_qty_array(qtys, source="q", local_ts_us=ts)
+
+    assert _accumulator_state(vector) == _accumulator_state(scalar)
+
+
+def test_array_observers_match_per_value_observers_across_chunks():
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    grid = np.round(rng.integers(1, 2_000_000, 500) * 0.1, 1)
+    off_grid = grid[:25] + 0.05
+    prices = np.concatenate([grid, off_grid])
+    rng.shuffle(prices)
+    ts = np.arange(10_000, 10_000 + prices.size, dtype=np.int64)
+
+    scalar = RuleCompatibilityAccumulator(_rules(), RuleCompatibilityConfig())
+    for i in range(prices.size):
+        scalar.observe_price(float(prices[i]), source="p", local_ts_us=int(ts[i]))
+
+    vector = RuleCompatibilityAccumulator(_rules(), RuleCompatibilityConfig())
+    for start in range(0, prices.size, 100):
+        vector.observe_price_array(prices[start : start + 100], source="p", local_ts_us=ts[start : start + 100])
+
+    assert _accumulator_state(vector) == _accumulator_state(scalar)
