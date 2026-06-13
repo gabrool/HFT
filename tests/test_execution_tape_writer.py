@@ -78,6 +78,20 @@ def test_npy_chunk_writer_finalizes_exact_array_with_small_chunks(tmp_path):
     assert list((tmp_path / "chunks").glob("values_*.npy")) == []
 
 
+def test_npy_chunk_writer_append_many_spans_chunks(tmp_path):
+    writer = NpyChunkWriter("values", np.dtype("<f4"), (2,), 2, tmp_path / "chunks")
+    start, end = writer.append_many(np.asarray([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32))
+    total = writer.finalize(tmp_path / "values.npy")
+
+    assert (start, end) == (0, 3)
+    assert writer.total_rows == 3
+    assert total == 3
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "values.npy"),
+        np.asarray([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32),
+    )
+
+
 def test_streaming_execution_tape_writer_matches_materialized_tape(tmp_path):
     l2 = [_l2(100, 0), _l2(300, 1)]
     trades = [_trade(200, 0), _trade(400, 1)]

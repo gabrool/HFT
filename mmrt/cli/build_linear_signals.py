@@ -13,13 +13,9 @@ from mmrt.execution.linear_signal import (
     MAGNITUDE_INPUT_LOG1P_BPS,
     MAGNITUDE_INPUT_MODES,
     LinearSignalConfig,
-    linear_signal_artifact_summary,
-    save_linear_signal_artifact_npz,
 )
 from mmrt.execution.linear_signal_builder import (
-    build_execution_linear_feature_dataset,
-    build_linear_signal_build_result,
-    execution_linear_feature_dataset_summary,
+    build_linear_signal_artifact_npz_from_execution_feature_chunks,
     schedule_config_from_train_result,
     transform_config_from_train_result,
 )
@@ -77,6 +73,7 @@ class BuildLinearSignalsConfig:
     max_decisions: int | None = None
     output_dtype: str = "float32"
     magnitude_input: str = MAGNITUDE_INPUT_LOG1P_BPS
+    chunk_rows: int = 100_000
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
@@ -94,6 +91,7 @@ class BuildLinearSignalsConfig:
             raise ValueError("output_dtype must be 'float32' or 'float64'")
         if self.magnitude_input not in MAGNITUDE_INPUT_MODES:
             raise ValueError("magnitude_input must be a supported magnitude input mode")
+        object.__setattr__(self, "chunk_rows", _require_positive_int(self.chunk_rows, "chunk_rows"))
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -107,6 +105,7 @@ class BuildLinearSignalsConfig:
             "max_decisions": self.max_decisions,
             "output_dtype": self.output_dtype,
             "magnitude_input": self.magnitude_input,
+            "chunk_rows": self.chunk_rows,
         }
 
 
@@ -146,24 +145,19 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
     if result.schema != LINEAR_TRAINING_RESULT_SCHEMA:
         raise ValueError("linear train result schema mismatch")
 
-    features = build_execution_linear_feature_dataset(
-        tape,
+    disk_result = build_linear_signal_artifact_npz_from_execution_feature_chunks(
+        tape=tape,
+        output_npz=output_npz,
+        linear_train_result=result,
         schedule_config=schedule_config_from_train_result(result),
         start_event_index=config.start_event_index,
         max_decisions=config.max_decisions,
-        output_dtype=config.output_dtype,
-        transform_config=transform_config_from_train_result(result),
-    )
-    build_result = build_linear_signal_build_result(
-        tape=tape,
-        feature_dataset=features,
-        linear_train_result=result,
+        chunk_rows=config.chunk_rows,
         signal_config=LinearSignalConfig(magnitude_input=config.magnitude_input),
         output_dtype=config.output_dtype,
+        transform_config=transform_config_from_train_result(result),
+        overwrite=config.overwrite,
     )
-    artifact = build_result.artifact
-    save_linear_signal_artifact_npz(output_npz, artifact, overwrite=config.overwrite)
-
     summary: dict[str, object] = {
         "status": "ok",
         "run_type": "build_linear_signals",
@@ -177,15 +171,17 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
             "manifest_hash": result.manifest_hash,
             "selection_summary": result.selection_summary,
         },
-        "feature_dataset": execution_linear_feature_dataset_summary(features),
-        "linear_signals": linear_signal_artifact_summary(artifact, path=str(output_npz)),
-        "alignment": {
-            "replay_start_event_index": features.replay_start_event_index,
-            "first_signal_event_index": int(artifact.decision_event_index[0]),
-            "first_signal_local_ts_us": int(artifact.decision_local_ts_us[0]),
-            "n_signal_rows": artifact.n_rows,
+        "feature_dataset": disk_result.feature_dataset_summary,
+        "linear_signals": disk_result.linear_signals_summary,
+        "alignment": disk_result.alignment_summary,
+        "prediction_summary": disk_result.prediction_summary,
+        "resource_mode": {
+            "chunked_features": True,
+            "chunked_signal_writers": True,
+            "disk_backed_signal_writers": True,
+            "single_pass_feature_replay": True,
+            "chunk_rows": config.chunk_rows,
         },
-        "prediction_summary": build_result.prediction_summary,
         "config": config.as_dict(),
     }
     _write_json_atomic(output_json, summary, overwrite=config.overwrite)
@@ -204,6 +200,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-decisions", type=int)
     parser.add_argument("--output-dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--magnitude-input", choices=MAGNITUDE_INPUT_MODES, default=MAGNITUDE_INPUT_LOG1P_BPS)
+    parser.add_argument("--chunk-rows", type=int, default=100_000)
     return parser
 
 
@@ -219,6 +216,7 @@ def _config_from_args(args: argparse.Namespace) -> BuildLinearSignalsConfig:
         max_decisions=args.max_decisions,
         output_dtype=args.output_dtype,
         magnitude_input=args.magnitude_input,
+        chunk_rows=args.chunk_rows,
     )
 
 

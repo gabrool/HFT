@@ -426,6 +426,128 @@ def save_linear_signal_artifact_npz(
     tmp.replace(path)
 
 
+def linear_signal_array_fields() -> tuple[str, ...]:
+    return _LINEAR_SIGNAL_ARRAY_FIELDS
+
+
+def save_linear_signal_artifact_arrays(
+    path: str | Path,
+    *,
+    metadata: LinearSignalArtifactMetadata,
+    decision_event_index: np.ndarray,
+    decision_local_ts_us: np.ndarray,
+    arrays: Mapping[str, np.ndarray],
+    overwrite: bool = False,
+    validate_chunk_rows: int = 100_000,
+) -> None:
+    """Save a linear signal NPZ from array-like inputs without artifact copies."""
+
+    if not isinstance(metadata, LinearSignalArtifactMetadata):
+        raise ValueError("metadata must be LinearSignalArtifactMetadata")
+    if isinstance(validate_chunk_rows, bool) or int(validate_chunk_rows) <= 0:
+        raise ValueError("validate_chunk_rows must be a positive int")
+    validate_chunk_rows = int(validate_chunk_rows)
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(str(path))
+
+    decision_arrays = {
+        "decision_event_index": np.asarray(decision_event_index),
+        "decision_local_ts_us": np.asarray(decision_local_ts_us),
+    }
+    for name, arr in decision_arrays.items():
+        if arr.ndim != 1:
+            raise ValueError(f"{name} must be rank-1")
+        if arr.shape[0] != metadata.n_rows:
+            raise ValueError(f"{name} length must equal metadata.n_rows")
+        if arr.dtype.kind not in "iu":
+            raise ValueError(f"{name} must have integer dtype")
+
+    if not isinstance(arrays, Mapping):
+        raise ValueError("arrays must be a mapping")
+    missing = [name for name in _LINEAR_SIGNAL_ARRAY_FIELDS if name not in arrays]
+    if missing:
+        raise ValueError(f"missing linear signal arrays: {missing}")
+    signal_arrays: dict[str, np.ndarray] = {}
+    dtype: np.dtype | None = None
+    for name in _LINEAR_SIGNAL_ARRAY_FIELDS:
+        arr = np.asarray(arrays[name])
+        if arr.ndim != 1 or arr.shape[0] != metadata.n_rows:
+            raise ValueError(f"{name} must be rank-1 with length {metadata.n_rows}")
+        arr_dtype = np.dtype(arr.dtype)
+        if arr_dtype not in (np.dtype("float32"), np.dtype("float64")):
+            raise ValueError(f"{name} must have float32 or float64 dtype")
+        if dtype is None:
+            dtype = arr_dtype
+        elif arr_dtype != dtype:
+            raise ValueError("all arrays must have the same dtype")
+        signal_arrays[name] = arr
+
+    previous_event_index: int | None = None
+    previous_local_ts_us: int | None = None
+    for start in range(0, metadata.n_rows, validate_chunk_rows):
+        end = min(start + validate_chunk_rows, metadata.n_rows)
+        event_idx = np.asarray(decision_arrays["decision_event_index"][start:end], dtype=np.int64)
+        local_ts = np.asarray(decision_arrays["decision_local_ts_us"][start:end], dtype=np.int64)
+        if (event_idx < 0).any():
+            raise ValueError("decision_event_index must be nonnegative")
+        if (local_ts <= 0).any():
+            raise ValueError("decision_local_ts_us must be positive")
+        if start == 0 and metadata.start_event_index != int(event_idx[0]):
+            raise ValueError("metadata.start_event_index must equal first decision_event_index")
+        if previous_event_index is not None and int(event_idx[0]) <= previous_event_index:
+            raise ValueError("decision_event_index must be strictly increasing")
+        if previous_local_ts_us is not None and int(local_ts[0]) <= previous_local_ts_us:
+            raise ValueError("decision_local_ts_us must be strictly increasing")
+        if event_idx.shape[0] > 1 and (np.diff(event_idx) <= 0).any():
+            raise ValueError("decision_event_index must be strictly increasing")
+        if local_ts.shape[0] > 1 and (np.diff(local_ts) <= 0).any():
+            raise ValueError("decision_local_ts_us must be strictly increasing")
+        previous_event_index = int(event_idx[-1])
+        previous_local_ts_us = int(local_ts[-1])
+
+        chunk = {name: np.asarray(signal_arrays[name][start:end]) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
+        for name, arr in chunk.items():
+            if not np.isfinite(arr).all():
+                raise ValueError(f"{name} must contain only finite values")
+        for name in ("p_no_move", "p_move", "p_up_move", "p_down_move"):
+            arr = chunk[name]
+            if ((arr < 0.0) | (arr > 1.0)).any():
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not np.allclose(
+            chunk["p_no_move"] + chunk["p_move"],
+            1.0,
+            rtol=0.0,
+            atol=_LINEAR_SIGNAL_CONSISTENCY_EPS,
+        ):
+            raise ValueError("p_no_move + p_move must be approximately 1")
+        if not np.allclose(
+            chunk["p_up_move"] + chunk["p_down_move"],
+            chunk["p_move"],
+            rtol=0.0,
+            atol=_LINEAR_SIGNAL_CONSISTENCY_EPS,
+        ):
+            raise ValueError("p_up_move + p_down_move must be approximately p_move")
+        if (np.abs(chunk["signed_move_prob"]) > 1.0 + _LINEAR_SIGNAL_CONSISTENCY_EPS).any():
+            raise ValueError("signed_move_prob must have abs <= 1 + tolerance")
+        for name in ("expected_up_bps", "expected_down_bps", "expected_abs_move_bps", "predicted_vol_bps", "confidence"):
+            if (chunk[name] < 0.0).any():
+                raise ValueError(f"{name} must be nonnegative")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    payload = {name: signal_arrays[name] for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
+    payload["schema"] = np.array(LINEAR_SIGNAL_ARTIFACT_SCHEMA)
+    payload["metadata_json"] = np.array(json.dumps(metadata.as_dict(), sort_keys=True))
+    payload["decision_event_index"] = decision_arrays["decision_event_index"]
+    payload["decision_local_ts_us"] = decision_arrays["decision_local_ts_us"]
+    with tmp.open("wb") as handle:
+        np.savez(handle, **payload)
+    tmp.replace(path)
+
+
 def load_linear_signal_artifact_npz(path: str | Path, *, mmap_mode: str | None = None) -> LinearSignalArtifact:
     """Load a canonical aligned linear signal artifact."""
 
@@ -741,6 +863,8 @@ __all__ = [
     "linear_signal_at",
     "linear_signal_row_for_event_index",
     "save_linear_signal_artifact_npz",
+    "linear_signal_array_fields",
+    "save_linear_signal_artifact_arrays",
     "load_linear_signal_artifact_npz",
     "linear_signal_artifact_summary",
     "validate_linear_signal_artifact_metadata",

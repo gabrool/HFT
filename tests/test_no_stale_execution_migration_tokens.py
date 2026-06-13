@@ -193,7 +193,8 @@ def test_build_linear_signals_cli_has_no_rl_or_adverse_dependencies():
 def test_train_execution_ppo_default_linear_signal_filename_has_builder_cli():
     source = Path("mmrt/cli/build_linear_signals.py").read_text(encoding="utf-8")
     assert "LINEAR_SIGNALS_FILENAME" in source
-    assert "save_linear_signal_artifact_npz" in source
+    assert "build_linear_signal_artifact_npz_from_execution_feature_chunks" in source
+    assert "save_linear_signal_artifact_npz" not in source
 
 
 def test_execution_env_default_reset_uses_linear_signal_first_row():
@@ -208,6 +209,24 @@ def test_build_linear_signals_cli_does_not_recompute_predictions_for_summary():
     assert "predict_linear_heads_for_execution_features" not in source
     assert "linear_model_bundle_from_train_result" not in source
     assert "linear_preprocess_states_from_train_result" not in source
+    assert "iter_execution_linear_feature_chunks" not in source
+    assert "build_linear_signal_build_result" not in source
+
+
+def test_linear_signal_builder_streaming_path_has_no_scan_replay():
+    source = Path("mmrt/execution/linear_signal_builder.py").read_text(encoding="utf-8")
+    body = source.split("def build_linear_signal_artifact_npz_from_execution_feature_chunks", 1)[1].split("__all__", 1)[0]
+    assert body.count("iter_execution_linear_feature_chunks(") == 1
+    assert "_scan_execution_linear_feature_chunks" not in source
+    assert "NpyChunkWriter" in source
+
+
+def test_deprecated_execution_linear_feature_dataset_has_no_chunk_list_vstack_path():
+    source = Path("mmrt/execution/linear_signal_builder.py").read_text(encoding="utf-8")
+    body = source.split("def build_execution_linear_feature_dataset", 1)[1].split("@dataclass", 1)[0]
+    assert "DeprecationWarning" in body
+    assert "chunks = list" not in body
+    assert "np.vstack" not in body
 
 
 def test_execution_clis_validate_linear_metadata_with_artifact_start_only():

@@ -10,10 +10,16 @@ from mmrt.execution.event_merge import merge_execution_events
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
-from mmrt.execution.linear_signal import load_linear_signal_artifact_npz, save_linear_signal_artifact_npz
+from mmrt.execution.linear_signal import (
+    linear_signal_array_fields,
+    load_linear_signal_artifact_npz,
+    save_linear_signal_artifact_npz,
+)
 from mmrt.execution.linear_signal_builder import (
     ExecutionLinearFeatureDataset,
     build_execution_linear_feature_dataset,
+    build_linear_signal_build_result,
+    build_linear_signal_artifact_npz_from_execution_feature_chunks,
     build_linear_signal_artifact_from_execution_features,
     execution_linear_feature_names,
     predict_linear_heads_for_execution_features,
@@ -141,6 +147,37 @@ def test_build_linear_signal_artifact_from_execution_features_roundtrip(tmp_path
     loaded = load_linear_signal_artifact_npz(path)
     assert loaded.metadata.n_rows == dataset.num_decisions
     assert np.isfinite(loaded.arrays.expected_return_bps).all()
+
+
+def test_chunked_linear_signal_disk_builder_matches_eager_artifact(tmp_path):
+    tape = _tiny_tape()
+    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
+    cols = tuple(dataset.feature_names[:3])
+    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    eager_result = build_linear_signal_build_result(
+        tape=tape,
+        feature_dataset=dataset,
+        linear_train_result=result,
+    )
+    eager = eager_result.artifact
+
+    path = tmp_path / "streamed_signals.npz"
+    disk_result = build_linear_signal_artifact_npz_from_execution_feature_chunks(
+        tape=tape,
+        output_npz=path,
+        linear_train_result=result,
+        schedule_config=_SCHED50,
+        chunk_rows=1,
+    )
+    streamed = load_linear_signal_artifact_npz(path)
+
+    assert disk_result.feature_dataset_summary["num_decisions"] == dataset.num_decisions
+    assert disk_result.alignment_summary["n_signal_rows"] == eager.n_rows
+    assert disk_result.prediction_summary == eager_result.prediction_summary
+    np.testing.assert_array_equal(streamed.decision_event_index, eager.decision_event_index)
+    np.testing.assert_array_equal(streamed.decision_local_ts_us, eager.decision_local_ts_us)
+    for name in linear_signal_array_fields():
+        np.testing.assert_array_equal(getattr(streamed.arrays, name), getattr(eager.arrays, name))
 
 
 def test_linear_signal_artifact_metadata_start_is_first_signal_row():
