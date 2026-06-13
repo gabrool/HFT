@@ -7,24 +7,15 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-import numpy as np
-
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
     MAGNITUDE_INPUT_LOG1P_BPS,
     MAGNITUDE_INPUT_MODES,
-    LINEAR_SIGNAL_ARTIFACT_SCHEMA,
-    LinearSignalArtifactMetadata,
     LinearSignalConfig,
-    linear_signal_array_fields,
-    save_linear_signal_artifact_arrays,
 )
 from mmrt.execution.linear_signal_builder import (
-    ExecutionLinearFeatureDataset,
-    build_linear_signal_build_result,
-    execution_linear_feature_names,
-    iter_execution_linear_feature_chunks,
+    build_linear_signal_artifact_npz_from_execution_feature_chunks,
     schedule_config_from_train_result,
     transform_config_from_train_result,
 )
@@ -135,268 +126,6 @@ def _write_json_atomic(path: Path, payload: dict[str, object], *, overwrite: boo
     tmp.replace(path)
 
 
-@dataclass(frozen=True, slots=True)
-class _FeatureScan:
-    num_decisions: int
-    feature_names: tuple[str, ...]
-    first_decision_event_index: int
-    last_decision_event_index: int
-    first_decision_local_ts_us: int
-    last_decision_local_ts_us: int
-    replay_start_event_index: int
-    start_event_index: int
-    decision_schedule: dict[str, object]
-    transform_config: dict[str, object]
-
-    def feature_dataset_summary(self) -> dict[str, object]:
-        return {
-            "num_decisions": self.num_decisions,
-            "num_features": len(self.feature_names),
-            "feature_names": list(self.feature_names),
-            "first_decision_event_index": self.first_decision_event_index,
-            "last_decision_event_index": self.last_decision_event_index,
-            "first_decision_local_ts_us": self.first_decision_local_ts_us,
-            "last_decision_local_ts_us": self.last_decision_local_ts_us,
-            "decision_schedule": dict(self.decision_schedule),
-            "replay_start_event_index": self.replay_start_event_index,
-            "start_event_index": self.start_event_index,
-            "transform_config": dict(self.transform_config),
-        }
-
-
-@dataclass(slots=True)
-class _SignalWriters:
-    n_rows: int
-    decision_event_index: np.memmap
-    decision_local_ts_us: np.memmap
-    arrays: dict[str, np.memmap]
-    temp_paths: tuple[Path, ...]
-    row: int = 0
-
-    @classmethod
-    def create(cls, output_npz: Path, *, n_rows: int, output_dtype: str) -> "_SignalWriters":
-        output_npz.parent.mkdir(parents=True, exist_ok=True)
-        prefix = output_npz.parent / f".{output_npz.name}"
-        event_path = Path(str(prefix) + ".decision_event_index.npy")
-        ts_path = Path(str(prefix) + ".decision_local_ts_us.npy")
-        signal_paths = {name: Path(str(prefix) + f".{name}.npy") for name in linear_signal_array_fields()}
-        temp_paths = (event_path, ts_path, *signal_paths.values())
-        for path in temp_paths:
-            path.unlink(missing_ok=True)
-        event_idx = np.lib.format.open_memmap(event_path, mode="w+", dtype=np.int64, shape=(n_rows,))
-        local_ts = np.lib.format.open_memmap(ts_path, mode="w+", dtype=np.int64, shape=(n_rows,))
-        arrays = {
-            name: np.lib.format.open_memmap(path, mode="w+", dtype=np.dtype(output_dtype), shape=(n_rows,))
-            for name, path in signal_paths.items()
-        }
-        return cls(n_rows=n_rows, decision_event_index=event_idx, decision_local_ts_us=local_ts, arrays=arrays, temp_paths=temp_paths)
-
-    def append(self, dataset: ExecutionLinearFeatureDataset, arrays) -> None:
-        n = int(arrays.n_rows)
-        if dataset.num_decisions != n:
-            raise ValueError("signal rows must match feature chunk rows")
-        end = self.row + n
-        if end > self.n_rows:
-            raise ValueError("too many signal rows appended")
-        self.decision_event_index[self.row:end] = dataset.decision_event_index
-        self.decision_local_ts_us[self.row:end] = dataset.decision_local_ts_us
-        for name in linear_signal_array_fields():
-            self.arrays[name][self.row:end] = getattr(arrays, name)
-        self.row = end
-
-    def flush(self) -> None:
-        self.decision_event_index.flush()
-        self.decision_local_ts_us.flush()
-        for arr in self.arrays.values():
-            arr.flush()
-
-    def close(self) -> None:
-        for arr in (self.decision_event_index, self.decision_local_ts_us, *self.arrays.values()):
-            mmap = getattr(arr, "_mmap", None)
-            if mmap is not None:
-                mmap.close()
-
-    def cleanup(self) -> None:
-        for path in self.temp_paths:
-            path.unlink(missing_ok=True)
-
-
-def _feature_dataset_from_chunk(
-    chunk,
-    *,
-    replay_start_event_index: int,
-    decision_schedule: dict[str, object],
-    transform_config: dict[str, object],
-) -> ExecutionLinearFeatureDataset:
-    return ExecutionLinearFeatureDataset(
-        decision_event_index=chunk.decision_event_index,
-        decision_local_ts_us=chunk.decision_local_ts_us,
-        features=chunk.features,
-        feature_names=tuple(chunk.feature_names),
-        replay_start_event_index=replay_start_event_index,
-        start_event_index=int(chunk.decision_event_index[0]),
-        decision_schedule=dict(decision_schedule),
-        transform_config=dict(transform_config),
-    )
-
-
-def _scan_feature_chunks(
-    tape,
-    *,
-    schedule,
-    transform,
-    start_event_index: int | None,
-    max_decisions: int | None,
-    chunk_rows: int,
-    output_dtype: str,
-) -> _FeatureScan:
-    replay_start = 0 if start_event_index is None else int(start_event_index)
-    schedule_payload = schedule.as_dict()
-    transform_payload = transform.as_dict()
-    expected_names = execution_linear_feature_names()
-    total = 0
-    first_event_index: int | None = None
-    first_local_ts_us: int | None = None
-    last_event_index: int | None = None
-    last_local_ts_us: int | None = None
-    for chunk in iter_execution_linear_feature_chunks(
-        tape,
-        schedule_config=schedule,
-        start_event_index=start_event_index,
-        max_decisions=max_decisions,
-        chunk_rows=chunk_rows,
-        output_dtype=output_dtype,
-        transform_config=transform,
-    ):
-        dataset = _feature_dataset_from_chunk(
-            chunk,
-            replay_start_event_index=replay_start,
-            decision_schedule=schedule_payload,
-            transform_config=transform_payload,
-        )
-        if dataset.feature_names != expected_names:
-            raise ValueError("execution feature names changed during chunk replay")
-        if last_event_index is not None and int(dataset.decision_event_index[0]) <= last_event_index:
-            raise ValueError("decision_event_index must be strictly increasing across chunks")
-        if last_local_ts_us is not None and int(dataset.decision_local_ts_us[0]) <= last_local_ts_us:
-            raise ValueError("decision_local_ts_us must be strictly increasing across chunks")
-        if first_event_index is None:
-            first_event_index = int(dataset.decision_event_index[0])
-            first_local_ts_us = int(dataset.decision_local_ts_us[0])
-        last_event_index = int(dataset.decision_event_index[-1])
-        last_local_ts_us = int(dataset.decision_local_ts_us[-1])
-        total += dataset.num_decisions
-    if total <= 0:
-        raise ValueError("feature_dataset must contain at least one decision")
-    assert first_event_index is not None
-    assert first_local_ts_us is not None
-    assert last_event_index is not None
-    assert last_local_ts_us is not None
-    return _FeatureScan(
-        num_decisions=total,
-        feature_names=expected_names,
-        first_decision_event_index=first_event_index,
-        last_decision_event_index=last_event_index,
-        first_decision_local_ts_us=first_local_ts_us,
-        last_decision_local_ts_us=last_local_ts_us,
-        replay_start_event_index=replay_start,
-        start_event_index=first_event_index,
-        decision_schedule=schedule_payload,
-        transform_config=transform_payload,
-    )
-
-
-def _quantiles_disk_backed(arr: np.ndarray, *, chunk_rows: int, temp_path: Path) -> list[float]:
-    n = int(arr.shape[0])
-    tmp = np.lib.format.open_memmap(temp_path, mode="w+", dtype=np.float64, shape=(n,))
-    try:
-        for start in range(0, n, chunk_rows):
-            end = min(start + chunk_rows, n)
-            tmp[start:end] = np.asarray(arr[start:end], dtype=np.float64)
-        tmp.sort()
-        out: list[float] = []
-        for q in (0.01, 0.50, 0.99):
-            h = (n - 1) * q
-            lo = int(np.floor(h))
-            hi = int(np.ceil(h))
-            out.append(float(tmp[lo]) if lo == hi else float((1.0 - (h - lo)) * tmp[lo] + (h - lo) * tmp[hi]))
-        return out
-    finally:
-        tmp.flush()
-        mmap = getattr(tmp, "_mmap", None)
-        if mmap is not None:
-            mmap.close()
-        temp_path.unlink(missing_ok=True)
-
-
-def _stats_chunked(arr: np.ndarray, *, include_std: bool, chunk_rows: int, quantile_temp_path: Path | None = None) -> dict[str, object]:
-    n = int(arr.shape[0])
-    total = 0.0
-    min_value = float("inf")
-    max_value = float("-inf")
-    for start in range(0, n, chunk_rows):
-        end = min(start + chunk_rows, n)
-        chunk = np.asarray(arr[start:end], dtype=np.float64)
-        total += float(np.sum(chunk, dtype=np.float64))
-        min_value = min(min_value, float(np.min(chunk)))
-        max_value = max(max_value, float(np.max(chunk)))
-    mean = float(total / n)
-    out = {"mean": mean, "min": min_value, "max": max_value}
-    if include_std:
-        ss = 0.0
-        for start in range(0, n, chunk_rows):
-            end = min(start + chunk_rows, n)
-            centered = np.asarray(arr[start:end], dtype=np.float64) - mean
-            ss += float(np.sum(centered * centered, dtype=np.float64))
-        out["std"] = float(np.sqrt(max(ss / n, 0.0)))
-    else:
-        if quantile_temp_path is None:
-            q = np.quantile(np.asarray(arr, dtype=np.float64), [0.01, 0.50, 0.99])
-            values = [float(q[0]), float(q[1]), float(q[2])]
-        else:
-            values = _quantiles_disk_backed(arr, chunk_rows=chunk_rows, temp_path=quantile_temp_path)
-        out.update({"p01": values[0], "p50": values[1], "p99": values[2]})
-    return out
-
-
-def _prediction_summary(arrays: dict[str, np.ndarray], *, n_rows: int, chunk_rows: int, temp_prefix: Path) -> dict[str, object]:
-    def qpath(name: str) -> Path:
-        return Path(str(temp_prefix) + f".summary.{name}.npy")
-
-    return {
-        "n_rows": int(n_rows),
-        "p_no_move": _stats_chunked(arrays["p_no_move"], include_std=False, chunk_rows=chunk_rows, quantile_temp_path=qpath("p_no_move")),
-        "expected_return_bps": _stats_chunked(arrays["expected_return_bps"], include_std=True, chunk_rows=chunk_rows)
-        | {k: v for k, v in _stats_chunked(arrays["expected_return_bps"], include_std=False, chunk_rows=chunk_rows, quantile_temp_path=qpath("expected_return_bps")).items() if k.startswith("p")},
-        "expected_abs_move_bps": _stats_chunked(arrays["expected_abs_move_bps"], include_std=True, chunk_rows=chunk_rows)
-        | {k: v for k, v in _stats_chunked(arrays["expected_abs_move_bps"], include_std=False, chunk_rows=chunk_rows, quantile_temp_path=qpath("expected_abs_move_bps")).items() if k.startswith("p")},
-        "predicted_vol_bps": _stats_chunked(arrays["predicted_vol_bps"], include_std=True, chunk_rows=chunk_rows),
-        "confidence": _stats_chunked(arrays["confidence"], include_std=True, chunk_rows=chunk_rows),
-    }
-
-
-def _linear_signal_summary(
-    *,
-    path: Path,
-    metadata: LinearSignalArtifactMetadata,
-    dtype: str,
-    decision_event_index: np.ndarray,
-    decision_local_ts_us: np.ndarray,
-) -> dict[str, object]:
-    return {
-        "schema": LINEAR_SIGNAL_ARTIFACT_SCHEMA,
-        "path": str(path),
-        "n_rows": metadata.n_rows,
-        "dtype": str(np.dtype(dtype)),
-        "fields": list(linear_signal_array_fields()),
-        "metadata": metadata.as_dict(),
-        "first_decision_event_index": int(decision_event_index[0]),
-        "last_decision_event_index": int(decision_event_index[-1]),
-        "first_decision_local_ts_us": int(decision_local_ts_us[0]),
-        "last_decision_local_ts_us": int(decision_local_ts_us[-1]),
-    }
-
-
 def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[str, object]:
     if not isinstance(config, BuildLinearSignalsConfig):
         raise ValueError("config must be BuildLinearSignalsConfig")
@@ -416,85 +145,19 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
     if result.schema != LINEAR_TRAINING_RESULT_SCHEMA:
         raise ValueError("linear train result schema mismatch")
 
-    schedule = schedule_config_from_train_result(result)
-    transform = transform_config_from_train_result(result)
-    scan = _scan_feature_chunks(
-        tape,
-        schedule=schedule,
-        transform=transform,
+    disk_result = build_linear_signal_artifact_npz_from_execution_feature_chunks(
+        tape=tape,
+        output_npz=output_npz,
+        linear_train_result=result,
+        schedule_config=schedule_config_from_train_result(result),
         start_event_index=config.start_event_index,
         max_decisions=config.max_decisions,
         chunk_rows=config.chunk_rows,
+        signal_config=LinearSignalConfig(magnitude_input=config.magnitude_input),
         output_dtype=config.output_dtype,
+        transform_config=transform_config_from_train_result(result),
+        overwrite=config.overwrite,
     )
-    metadata = LinearSignalArtifactMetadata(
-        tape_schema=tape.manifest.schema,
-        exchange=tape.manifest.exchange,
-        symbol=tape.manifest.symbol,
-        num_events=tape.manifest.num_events,
-        num_l2_batches=tape.manifest.num_l2_batches,
-        num_trades=tape.manifest.num_trades,
-        start_local_ts_us=tape.manifest.start_local_ts_us,
-        end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_schedule=dict(scan.decision_schedule),
-        start_event_index=scan.start_event_index,
-        n_rows=scan.num_decisions,
-    )
-    writers = _SignalWriters.create(output_npz, n_rows=scan.num_decisions, output_dtype=config.output_dtype)
-    try:
-        for chunk in iter_execution_linear_feature_chunks(
-            tape,
-            schedule_config=schedule,
-            start_event_index=config.start_event_index,
-            max_decisions=config.max_decisions,
-            chunk_rows=config.chunk_rows,
-            output_dtype=config.output_dtype,
-            transform_config=transform,
-        ):
-            dataset = _feature_dataset_from_chunk(
-                chunk,
-                replay_start_event_index=scan.replay_start_event_index,
-                decision_schedule=scan.decision_schedule,
-                transform_config=scan.transform_config,
-            )
-            chunk_result = build_linear_signal_build_result(
-                tape=tape,
-                feature_dataset=dataset,
-                linear_train_result=result,
-                signal_config=LinearSignalConfig(magnitude_input=config.magnitude_input),
-                output_dtype=config.output_dtype,
-            )
-            writers.append(dataset, chunk_result.artifact.arrays)
-        if writers.row != scan.num_decisions:
-            raise ValueError("signal row count changed during chunked replay")
-        writers.flush()
-        save_linear_signal_artifact_arrays(
-            output_npz,
-            metadata=metadata,
-            decision_event_index=writers.decision_event_index,
-            decision_local_ts_us=writers.decision_local_ts_us,
-            arrays=writers.arrays,
-            overwrite=config.overwrite,
-            validate_chunk_rows=config.chunk_rows,
-        )
-        prediction_summary = _prediction_summary(
-            writers.arrays,
-            n_rows=scan.num_decisions,
-            chunk_rows=config.chunk_rows,
-            temp_prefix=output_npz.parent / f".{output_npz.name}",
-        )
-        linear_signals_summary = _linear_signal_summary(
-            path=output_npz,
-            metadata=metadata,
-            dtype=config.output_dtype,
-            decision_event_index=writers.decision_event_index,
-            decision_local_ts_us=writers.decision_local_ts_us,
-        )
-    finally:
-        writers.flush()
-        writers.close()
-        writers.cleanup()
-
     summary: dict[str, object] = {
         "status": "ok",
         "run_type": "build_linear_signals",
@@ -508,18 +171,15 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
             "manifest_hash": result.manifest_hash,
             "selection_summary": result.selection_summary,
         },
-        "feature_dataset": scan.feature_dataset_summary(),
-        "linear_signals": linear_signals_summary,
-        "alignment": {
-            "replay_start_event_index": scan.replay_start_event_index,
-            "first_signal_event_index": scan.first_decision_event_index,
-            "first_signal_local_ts_us": scan.first_decision_local_ts_us,
-            "n_signal_rows": scan.num_decisions,
-        },
-        "prediction_summary": prediction_summary,
+        "feature_dataset": disk_result.feature_dataset_summary,
+        "linear_signals": disk_result.linear_signals_summary,
+        "alignment": disk_result.alignment_summary,
+        "prediction_summary": disk_result.prediction_summary,
         "resource_mode": {
             "chunked_features": True,
+            "chunked_signal_writers": True,
             "disk_backed_signal_writers": True,
+            "single_pass_feature_replay": True,
             "chunk_rows": config.chunk_rows,
         },
         "config": config.as_dict(),
