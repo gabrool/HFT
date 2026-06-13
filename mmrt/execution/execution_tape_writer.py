@@ -79,6 +79,27 @@ class NpyChunkWriter:
         self._total_rows += 1
         return row_index
 
+    def append_many(self, rows: Any) -> tuple[int, int]:
+        arr = np.asarray(rows, dtype=self.dtype)
+        if arr.ndim != len(self.row_shape) + 1 or tuple(arr.shape[1:]) != self.row_shape:
+            raise ValueError(f"{self.name} rows must have shape (n, *{self.row_shape!r})")
+        start = self._total_rows
+        offset = 0
+        n_rows = int(arr.shape[0])
+        while offset < n_rows:
+            if self._used >= self.chunk_rows:
+                self.flush()
+            take = min(n_rows - offset, self.chunk_rows - self._used)
+            self._buffer[self._used : self._used + take] = arr[offset : offset + take]
+            self._used += take
+            self._total_rows += take
+            offset += take
+        return start, self._total_rows
+
+    @property
+    def total_rows(self) -> int:
+        return self._total_rows
+
     def flush(self) -> None:
         if self._used == 0:
             return
