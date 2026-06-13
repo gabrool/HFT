@@ -25,12 +25,15 @@ def test_build_linear_signals_cli_end_to_end(tmp_path):
         BuildLinearSignalsConfig(
             tape_root=str(tape_root),
             linear_train_result_json=str(result_path),
+            chunk_rows=1,
         )
     )
     assert (tape_root / LINEAR_SIGNALS_FILENAME).exists()
     assert (tape_root / "linear_signals_summary.json").exists()
     artifact = load_linear_signal_artifact_npz(tape_root / LINEAR_SIGNALS_FILENAME)
     assert artifact.n_rows == summary["feature_dataset"]["num_decisions"]
+    assert summary["resource_mode"]["chunked_features"] is True
+    assert summary["resource_mode"]["disk_backed_signal_writers"] is True
     env = ExecutionEnv(load_execution_tape(tape_root), linear_signals=artifact)
     reset = env.reset()
     assert reset.info["event_index"] == int(artifact.decision_event_index[0])
@@ -53,9 +56,11 @@ def test_build_linear_signals_parser_no_mmap():
         "--tape-root", "tape",
         "--linear-train-result-json", "linear_train_result.json",
         "--no-mmap",
+        "--chunk-rows", "7",
     ])
     cfg = _config_from_args(args)
     assert cfg.mmap_mode is None
+    assert cfg.chunk_rows == 7
 
 
 def test_build_linear_signals_rejects_feature_mismatch(tmp_path):
