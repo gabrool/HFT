@@ -34,6 +34,7 @@ def test_build_linear_signals_cli_end_to_end(tmp_path):
     assert artifact.n_rows == summary["feature_dataset"]["num_decisions"]
     assert summary["resource_mode"]["chunked_features"] is True
     assert summary["resource_mode"]["disk_backed_signal_writers"] is True
+    assert summary["resource_mode"]["single_pass_feature_replay"] is True
     env = ExecutionEnv(load_execution_tape(tape_root), linear_signals=artifact)
     reset = env.reset()
     assert reset.info["event_index"] == int(artifact.decision_event_index[0])
