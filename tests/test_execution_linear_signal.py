@@ -27,8 +27,8 @@ from mmrt.execution.linear_signal import (
     predictions_to_signal_arrays,
     save_linear_signal_artifact_npz,
     validate_linear_signal_artifact_metadata,
-    validate_linear_signal_start_event_index,
 )
+from tests.grid_helpers import grid_identity_fields
 
 
 def _fixed_schedule_payload(stride_us: int) -> dict:
@@ -61,6 +61,7 @@ def _artifact(n_rows: int) -> LinearSignalArtifact:
         num_trades=1,
         start_local_ts_us=100,
         end_local_ts_us=200,
+        **grid_identity_fields(n_rows=n_rows),
         decision_schedule=_fixed_schedule_payload(50),
         start_event_index=0,
         n_rows=n_rows,
@@ -70,6 +71,7 @@ def _artifact(n_rows: int) -> LinearSignalArtifact:
         metadata=metadata,
         decision_event_index=np.arange(n_rows, dtype=np.int64),
         decision_local_ts_us=np.arange(100, 100 + n_rows * 50, 50, dtype=np.int64),
+        decision_event_seq=np.arange(n_rows, dtype=np.int64),
     )
 
 
@@ -91,6 +93,7 @@ def _linear_artifact_with_decision_event_index(indices: list[int]) -> LinearSign
         num_trades=0,
         start_local_ts_us=100,
         end_local_ts_us=100 + 100 * (n_rows - 1),
+        **grid_identity_fields(n_rows=n_rows),
         decision_schedule=_fixed_schedule_payload(100),
         start_event_index=indices[0],
         n_rows=n_rows,
@@ -100,6 +103,7 @@ def _linear_artifact_with_decision_event_index(indices: list[int]) -> LinearSign
         metadata=metadata,
         decision_event_index=np.asarray(indices, dtype=np.int64),
         decision_local_ts_us=np.arange(100, 100 + n_rows * 100, 100, dtype=np.int64),
+        decision_event_seq=np.asarray(indices, dtype=np.int64),
     )
 
 
@@ -312,13 +316,13 @@ def test_npz_round_trip(tmp_path):
     np.testing.assert_allclose(loaded.arrays.expected_abs_move_bps, artifact.arrays.expected_abs_move_bps)
 
 
-def test_metadata_free_old_schema_rejected(tmp_path):
+def test_linear_signal_npz_requires_current_schema(tmp_path):
     path = tmp_path / "bad.npz"
     arrays = predictions_to_signal_arrays(_prediction_dict())
     payload = {name: getattr(arrays, name) for name in linear_signal_artifact_summary(_artifact(2))["fields"]}
-    payload["schema"] = np.array("mmrt_execution_linear_signals_no_move_gated")
+    payload["schema"] = np.array("not_current")
     np.savez(path, **payload)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="schema mismatch"):
         load_linear_signal_artifact_npz(path)
 
 
@@ -334,6 +338,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
         num_trades=1,
         start_local_ts_us=100,
         end_local_ts_us=200,
+        **grid_identity_fields(n_rows=2),
         decision_schedule=_fixed_schedule_payload(50),
         start_event_index=0,
         min_rows=2,
@@ -349,6 +354,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
             num_trades=1,
             start_local_ts_us=100,
             end_local_ts_us=200,
+            **grid_identity_fields(n_rows=2),
             decision_schedule=_fixed_schedule_payload(50),
             start_event_index=0,
         )
@@ -363,6 +369,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
             num_trades=1,
             start_local_ts_us=100,
             end_local_ts_us=200,
+            **grid_identity_fields(n_rows=2),
             decision_schedule=_fixed_schedule_payload(100),
             start_event_index=0,
         )
@@ -386,33 +393,3 @@ def test_linear_signal_has_no_metadata_free_artifact_helpers():
     assert "_save_linear_signal_arrays_npz" not in source
     assert "save_linear_signal_arrays_npz" not in source
     assert "load_linear_signal_arrays_npz" not in source
-
-
-def test_validate_linear_signal_start_event_index_accepts_default_and_later_rows():
-    artifact = _linear_artifact_with_decision_event_index([10, 20, 30, 40])
-
-    default = validate_linear_signal_start_event_index(artifact)
-    assert default.event_index == 10
-    assert default.row_index == 0
-    assert default.rows_available == 4
-
-    later = validate_linear_signal_start_event_index(artifact, start_event_index=30)
-    assert later.event_index == 30
-    assert later.row_index == 2
-    assert later.rows_available == 2
-
-
-def test_validate_linear_signal_start_event_index_rejects_non_grid_start():
-    artifact = _linear_artifact_with_decision_event_index([10, 20, 30])
-    with pytest.raises(ValueError, match="decision_event_index"):
-        validate_linear_signal_start_event_index(artifact, start_event_index=25)
-
-
-def test_validate_linear_signal_start_event_index_checks_remaining_rows():
-    artifact = _linear_artifact_with_decision_event_index([10, 20, 30])
-    with pytest.raises(ValueError, match="not contain enough rows"):
-        validate_linear_signal_start_event_index(
-            artifact,
-            start_event_index=30,
-            min_rows=2,
-        )

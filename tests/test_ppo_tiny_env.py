@@ -14,6 +14,7 @@ from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
+from mmrt.execution.decision_grid import save_decision_grid
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -36,6 +37,7 @@ from mmrt.rl.rollout import RolloutCollector, RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy, make_training_checkpoint_payload
+from tests.grid_helpers import decision_grid_for_tape
 
 
 
@@ -135,6 +137,7 @@ def _tape(l2_events, trades):
 def _save_tape(tmp_path, tape):
     root = tmp_path / "execution_tape"
     save_execution_tape(tape, root, overwrite=True)
+    save_decision_grid(root / "decision_grid", decision_grid_for_tape(tape), overwrite=True)
     return root
 
 
@@ -167,24 +170,11 @@ def _signal_arrays(n_rows: int = 16):
     })
 
 
-def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
+def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0, decision_grid=None):
+    if decision_grid is None:
+        decision_grid = decision_grid_for_tape(tape)
+    n_rows = decision_grid.n_rows
     arrays = _signal_arrays(n_rows)
-    pairs = []
-    for event_index, event in enumerate(tape.arrays.events):
-        if event_index < start_event_index:
-            continue
-        if int(event["event_type_code"]) != 1:
-            continue
-        book_ptr = int(event["book_ptr"])
-        if book_ptr >= 0:
-            pairs.append((event_index, int(tape.arrays.l2_events[book_ptr]["local_ts_us"])))
-    if not pairs:
-        pairs.append((start_event_index, int(tape.manifest.start_local_ts_us)))
-    decision_event_index = [pair[0] for pair in pairs[:n_rows]]
-    decision_local_ts_us = [pair[1] for pair in pairs[:n_rows]]
-    while len(decision_event_index) < n_rows:
-        decision_event_index.append(decision_event_index[-1] + 1)
-        decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
     metadata = LinearSignalArtifactMetadata(
         tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
@@ -194,22 +184,31 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_schedule=_fixed_schedule_payload(decision_interval_us),
-        start_event_index=start_event_index,
+        decision_grid_schema=decision_grid.metadata.schema,
+        decision_grid_hash=decision_grid.decision_grid_hash,
+        decision_grid_n_rows=decision_grid.n_rows,
+        decision_schedule=decision_grid.decision_schedule,
+        start_event_index=int(decision_grid.decision_event_index[0]),
         n_rows=n_rows,
     )
     return LinearSignalArtifact(
         arrays=arrays,
         metadata=metadata,
-        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
-        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+        decision_event_index=decision_grid.decision_event_index.copy(),
+        decision_local_ts_us=decision_grid.decision_local_ts_us.copy(),
+        decision_event_seq=decision_grid.decision_event_seq.copy(),
     )
 
 
 def _save_linear_signals(root, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
     tape = load_execution_tape(root)
+    decision_grid = decision_grid_for_tape(tape)
     artifact = _linear_artifact_for_tape(
-        tape, n_rows=n_rows, decision_interval_us=decision_interval_us, start_event_index=start_event_index
+        tape,
+        n_rows=n_rows,
+        decision_interval_us=decision_interval_us,
+        start_event_index=start_event_index,
+        decision_grid=decision_grid,
     )
     path = root / LINEAR_SIGNALS_FILENAME
     save_linear_signal_artifact_npz(path, artifact, overwrite=True)
@@ -229,9 +228,11 @@ def _tiny_tape_root(tmp_path):
 
 def _tiny_env() -> ExecutionEnv:
     tape = _tiny_tape()
+    decision_grid = decision_grid_for_tape(tape)
     return ExecutionEnv(
         tape,
-        linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50),
+        decision_grid=decision_grid,
+        linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50, decision_grid=decision_grid),
         config=ExecutionEnvConfig(
             max_episode_steps=4,
         ),
@@ -317,6 +318,7 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     summary = run_execution_ppo_training(
         ExecutionPPOTrainCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(output_json),
             checkpoint_path=str(checkpoint_path),
             overwrite=True,
@@ -338,7 +340,7 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["checkpoint_saved"] is True
     assert summary["training"]["updates_completed"] == 1
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
-    assert summary["linear_signals"]["schema"] == "mmrt_execution_linear_signals_aligned"
+    assert summary["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
     assert summary["linear_signals"]["n_rows"] >= 1
 
     ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -347,7 +349,7 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert "policy_state_dict" in ckpt
     assert ckpt["tape"]["symbol"] == "BTCUSDT"
     assert ckpt["observation_schema"] == summary["observation_schema"]
-    assert ckpt["linear_signals"]["schema"] == "mmrt_execution_linear_signals_aligned"
+    assert ckpt["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
 
 
 def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -358,6 +360,8 @@ def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsy
         [
             "--tape-root",
             str(tape_root),
+            "--decision-grid",
+            str(tape_root / "decision_grid"),
             "--output-json",
             str(output_json),
             "--num-updates",
@@ -395,6 +399,7 @@ def test_train_execution_ppo_requires_linear_signals_file(tmp_path):
         run_execution_ppo_training(
             ExecutionPPOTrainCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 output_json=str(tmp_path / "summary.json"),
                 save_checkpoint=False,
                 overwrite=True,
@@ -416,6 +421,7 @@ def test_train_execution_ppo_refuses_overwrite_without_flag(tmp_path):
         run_execution_ppo_training(
             ExecutionPPOTrainCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 output_json=str(output_json),
                 save_checkpoint=False,
                 num_updates=1,
@@ -432,6 +438,7 @@ def test_train_execution_ppo_refuses_overwrite_without_flag(tmp_path):
         run_execution_ppo_training(
             ExecutionPPOTrainCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 output_json=str(tmp_path / "fresh.json"),
                 checkpoint_path=str(checkpoint_path),
                 save_checkpoint=True,
@@ -447,6 +454,7 @@ def test_train_execution_ppo_refuses_overwrite_without_flag(tmp_path):
 def test_train_execution_ppo_cli_config_parses_hidden_sizes_and_dtype():
     cfg = ExecutionPPOTrainCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
         hidden_sizes="8,4",
         dtype="float64",
         queue_mode="balanced",
@@ -455,13 +463,14 @@ def test_train_execution_ppo_cli_config_parses_hidden_sizes_and_dtype():
     assert cfg.dtype is torch.float64
     assert cfg.queue_mode.value == "balanced"
 
-    cfg = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", hidden_sizes="none")
+    cfg = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", hidden_sizes="none")
     assert cfg.hidden_sizes == ()
 
 
 def test_train_execution_ppo_accepts_zero_queue_weights():
     cfg = ExecutionPPOTrainCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
         l2_decrease_weight=0.0,
         trade_at_level_weight=0.0,
     )
@@ -472,10 +481,10 @@ def test_train_execution_ppo_accepts_zero_queue_weights():
 
 def test_train_execution_ppo_rejects_queue_weights_above_one():
     with pytest.raises(ValueError):
-        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", l2_decrease_weight=1.1)
+        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", l2_decrease_weight=1.1)
 
     with pytest.raises(ValueError):
-        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", trade_at_level_weight=1.1)
+        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", trade_at_level_weight=1.1)
 
 
 def test_train_execution_ppo_cli_does_not_import_forbidden_modules():

@@ -5,7 +5,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
-from mmrt.features.schedule import DecisionScheduleConfig
+from mmrt.features.schedule import DecisionScheduleConfig, decision_schedule_config_from_dict
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import (
     ActionSpec,
@@ -19,9 +19,14 @@ from mmrt.execution.contracts import (
 )
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
-from mmrt.execution.execution_tape import build_execution_tape
+from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_CODE_TRADE, build_execution_tape
+from mmrt.execution.decision_grid import (
+    DECISION_GRID_ARRAY_ORDER,
+    DecisionGrid,
+    decision_grid_metadata_from_tape,
+)
 from mmrt.execution.env import (
-    ExecutionEnv,
+    ExecutionEnv as _ExecutionEnv,
     ExecutionEnvConfig,
     ExecutionEnvReset,
     ExecutionEnvStep,
@@ -170,24 +175,94 @@ def _signal_arrays(n_rows: int = 16):
     return predictions_to_signal_arrays(prediction)
 
 
-def _linear_signals(tape, n_rows: int = 16, *, start_event_index: int = 0) -> LinearSignalArtifact:
-    arrays = _signal_arrays(n_rows)
-    valid_pairs = []
+def _decision_grid_for_decisions(
+    tape,
+    decision_event_index,
+    *,
+    schedule_payload: dict[str, object] | None = None,
+    allow_invalid_book_ptr: bool = False,
+) -> DecisionGrid:
+    event_idx = np.asarray(decision_event_index, dtype=np.int64)
+    if event_idx.ndim != 1 or event_idx.shape[0] == 0:
+        raise ValueError("decision_event_index must be a non-empty vector")
+    events = tape.arrays.events
+    if (event_idx < 0).any() or (event_idx >= len(events)).any():
+        raise ValueError("decision_event_index outside tape")
+
+    local_ts = np.asarray([int(events[int(i)]["local_ts_us"]) for i in event_idx], dtype=np.int64)
+    event_seq = np.asarray([int(events[int(i)]["event_seq"]) for i in event_idx], dtype=np.int64)
+    book_ptr_values: list[int] = []
+    for i in event_idx:
+        ptr = int(events[int(i)]["book_ptr"])
+        if ptr < 0 and allow_invalid_book_ptr:
+            ptr = 0
+        book_ptr_values.append(ptr)
+    book_ptr = np.asarray(book_ptr_values, dtype=np.int64)
+
+    reason_code = np.full(event_idx.shape[0], 3, dtype=np.int16)
+    reason_flags = np.full(event_idx.shape[0], 4, dtype=np.int16)
+    reason_code[0] = 1
+    reason_flags[0] = 1
+    elapsed = np.zeros(event_idx.shape[0], dtype=np.int64)
+    events_since = np.zeros(event_idx.shape[0], dtype=np.int64)
+    l2_since = np.zeros(event_idx.shape[0], dtype=np.int64)
+    trade_since = np.zeros(event_idx.shape[0], dtype=np.int64)
+    for row in range(1, event_idx.shape[0]):
+        prev = int(event_idx[row - 1])
+        cur = int(event_idx[row])
+        elapsed[row] = int(local_ts[row] - local_ts[row - 1])
+        events_since[row] = cur - prev
+        window = events[prev + 1 : cur + 1]
+        l2_since[row] = int(np.count_nonzero(window["event_type_code"] == EVENT_TYPE_CODE_L2_BATCH))
+        trade_since[row] = int(np.count_nonzero(window["event_type_code"] == EVENT_TYPE_CODE_TRADE))
+
+    arrays = {
+        "decision_event_index": event_idx,
+        "decision_local_ts_us": local_ts,
+        "decision_event_seq": event_seq,
+        "book_ptr": book_ptr,
+        "reason_code": reason_code,
+        "reason_flags": reason_flags,
+        "elapsed_since_prev_decision_us": elapsed,
+        "events_since_prev_decision": events_since,
+        "l2_events_since_prev_decision": l2_since,
+        "trade_events_since_prev_decision": trade_since,
+    }
+    schedule_config = decision_schedule_config_from_dict(schedule_payload or _fixed_schedule_payload(100))
+    metadata = decision_grid_metadata_from_tape(
+        tape,
+        schedule_config=schedule_config,
+        arrays={name: arrays[name] for name in DECISION_GRID_ARRAY_ORDER},
+        created_at_utc="2026-01-01T00:00:00Z",
+    )
+    return DecisionGrid(metadata=metadata, **arrays)
+
+
+def _valid_decision_event_indices(tape, *, start_event_index: int = 0, n_rows: int | None = None) -> list[int]:
+    out: list[int] = []
     for event_index, event in enumerate(tape.arrays.events):
         if event_index < start_event_index:
             continue
-        if int(event["event_type_code"]) != 1:
+        if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
             continue
         book_ptr = int(event["book_ptr"])
-        if book_ptr >= 0:
-            valid_pairs.append((event_index, int(tape.arrays.l2_events[book_ptr]["local_ts_us"])))
-    if not valid_pairs:
-        valid_pairs.append((start_event_index, int(tape.manifest.start_local_ts_us)))
-    decision_event_index = [pair[0] for pair in valid_pairs[:n_rows]]
-    decision_local_ts_us = [pair[1] for pair in valid_pairs[:n_rows]]
-    while len(decision_event_index) < n_rows:
-        decision_event_index.append(decision_event_index[-1] + 1)
-        decision_local_ts_us.append(decision_local_ts_us[-1] + 100)
+        if book_ptr < 0 or book_ptr >= len(tape.arrays.l2_events):
+            continue
+        book = tape.arrays.l2_events[book_ptr]
+        if int(book["best_bid_tick"]) <= 0 or int(book["best_ask_tick"]) <= int(book["best_bid_tick"]):
+            continue
+        out.append(event_index)
+        if n_rows is not None and len(out) >= n_rows:
+            break
+    if not out:
+        raise ValueError("test tape has no valid decision grid rows")
+    return out
+
+
+def _linear_signals(tape, n_rows: int | None = None, *, start_event_index: int = 0) -> LinearSignalArtifact:
+    decision_event_index = _valid_decision_event_indices(tape, start_event_index=start_event_index, n_rows=n_rows)
+    grid = _decision_grid_for_decisions(tape, decision_event_index)
+    arrays = _signal_arrays(grid.n_rows)
     metadata = LinearSignalArtifactMetadata(
         tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
@@ -197,20 +272,26 @@ def _linear_signals(tape, n_rows: int = 16, *, start_event_index: int = 0) -> Li
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_schedule=_fixed_schedule_payload(100),
-        start_event_index=start_event_index,
-        n_rows=n_rows,
+        decision_grid_schema=grid.metadata.schema,
+        decision_grid_hash=grid.decision_grid_hash,
+        decision_grid_n_rows=grid.n_rows,
+        decision_schedule=grid.decision_schedule,
+        start_event_index=int(grid.decision_event_index[0]),
+        n_rows=grid.n_rows,
     )
     return LinearSignalArtifact(
         arrays=arrays,
         metadata=metadata,
-        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
-        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+        decision_event_index=grid.decision_event_index.copy(),
+        decision_local_ts_us=grid.decision_local_ts_us.copy(),
+        decision_event_seq=grid.decision_event_seq.copy(),
     )
 
 
 def _linear_signals_for_decisions(tape, decision_event_index, decision_local_ts_us):
-    arrays = _signal_arrays(len(decision_event_index))
+    grid = _decision_grid_for_decisions(tape, decision_event_index)
+    decision_local_ts_us = np.asarray(decision_local_ts_us, dtype=np.int64)
+    arrays = _signal_arrays(grid.n_rows)
     metadata = LinearSignalArtifactMetadata(
         tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
@@ -220,15 +301,72 @@ def _linear_signals_for_decisions(tape, decision_event_index, decision_local_ts_
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_schedule=_fixed_schedule_payload(100),
-        start_event_index=int(decision_event_index[0]),
-        n_rows=len(decision_event_index),
+        decision_grid_schema=grid.metadata.schema,
+        decision_grid_hash=grid.decision_grid_hash,
+        decision_grid_n_rows=grid.n_rows,
+        decision_schedule=grid.decision_schedule,
+        start_event_index=int(grid.decision_event_index[0]),
+        n_rows=grid.n_rows,
     )
     return LinearSignalArtifact(
         arrays=arrays,
         metadata=metadata,
-        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
-        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+        decision_event_index=grid.decision_event_index.copy(),
+        decision_local_ts_us=decision_local_ts_us,
+        decision_event_seq=grid.decision_event_seq.copy(),
+    )
+
+
+def _linear_signals_for_grid(tape, grid: DecisionGrid) -> LinearSignalArtifact:
+    arrays = _signal_arrays(grid.n_rows)
+    metadata = LinearSignalArtifactMetadata(
+        tape_schema=tape.manifest.schema,
+        exchange=tape.manifest.exchange,
+        symbol=tape.manifest.symbol,
+        num_events=tape.manifest.num_events,
+        num_l2_batches=tape.manifest.num_l2_batches,
+        num_trades=tape.manifest.num_trades,
+        start_local_ts_us=tape.manifest.start_local_ts_us,
+        end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_grid_schema=grid.metadata.schema,
+        decision_grid_hash=grid.decision_grid_hash,
+        decision_grid_n_rows=grid.n_rows,
+        decision_schedule=grid.decision_schedule,
+        start_event_index=int(grid.decision_event_index[0]),
+        n_rows=grid.n_rows,
+    )
+    return LinearSignalArtifact(
+        arrays=arrays,
+        metadata=metadata,
+        decision_event_index=grid.decision_event_index.copy(),
+        decision_local_ts_us=grid.decision_local_ts_us.copy(),
+        decision_event_seq=grid.decision_event_seq.copy(),
+    )
+
+
+def ExecutionEnv(
+    tape,
+    *,
+    decision_grid: DecisionGrid | None = None,
+    linear_signals: LinearSignalArtifact | None = None,
+    adverse_signals: AdverseSelectionSignalArtifact | None = None,
+    config: ExecutionEnvConfig = ExecutionEnvConfig(),
+) -> _ExecutionEnv:
+    if decision_grid is None:
+        if isinstance(linear_signals, LinearSignalArtifact):
+            decision_grid = _decision_grid_for_decisions(
+                tape,
+                linear_signals.decision_event_index,
+                schedule_payload=linear_signals.metadata.decision_schedule,
+            )
+        else:
+            decision_grid = _decision_grid_for_decisions(tape, _valid_decision_event_indices(tape))
+    return _ExecutionEnv(
+        tape,
+        decision_grid=decision_grid,
+        linear_signals=linear_signals,
+        adverse_signals=adverse_signals,
+        config=config,
     )
 
 
@@ -483,7 +621,7 @@ def test_execution_env_requires_linear_signals():
 
 def test_execution_env_rejects_insufficient_linear_signal_rows():
     tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
-    with pytest.raises(ValueError, match="linear_signals"):
+    with pytest.raises(ValueError, match="decision_grid"):
         ExecutionEnv(tape, linear_signals=_linear_signals(tape, n_rows=4), config=_env_config(max_episode_steps=4))
 
 
@@ -497,6 +635,7 @@ def test_linear_signal_artifact_rejects_metadata_start_event_index_mismatch():
             metadata=artifact.metadata,
             decision_event_index=np.asarray([1, 2], dtype=np.int64),
             decision_local_ts_us=artifact.decision_local_ts_us,
+            decision_event_seq=artifact.decision_event_seq,
         )
 
 
@@ -510,10 +649,10 @@ def test_execution_env_rejects_signal_local_ts_mismatch():
         metadata=artifact.metadata,
         decision_event_index=artifact.decision_event_index,
         decision_local_ts_us=bad_ts,
+        decision_event_seq=artifact.decision_event_seq,
     )
-    env = ExecutionEnv(tape, linear_signals=bad, config=_env_config())
-    with pytest.raises(ValueError, match="decision_local_ts_us mismatch"):
-        env.reset()
+    with pytest.raises(ValueError, match="decision_local_ts_us"):
+        ExecutionEnv(tape, linear_signals=bad, config=_env_config())
 
 
 def test_execution_env_source_has_no_linear_fallback():
@@ -544,10 +683,9 @@ def test_reset_rejects_tape_without_valid_two_sided_book():
         book_snapshot=snapshot,
     )
     tape = _tape([l2_event], [])
-    env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=_env_config())
 
-    with pytest.raises(ValueError, match="valid two-sided"):
-        env.reset()
+    with pytest.raises(ValueError, match="no valid decision grid rows"):
+        _linear_signals(tape)
 
 
 def test_env_step_info_is_json_safe_and_validated_by_contract():
@@ -1226,9 +1364,13 @@ def _aligned_adverse_signals(linear: LinearSignalArtifact, candidate_names=("tou
         schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
         decision_local_ts_us=linear.decision_local_ts_us.copy(),
         decision_event_index=linear.decision_event_index.copy(),
-        decision_event_seq=np.full(n_rows, MAX_EVENT_SEQ, dtype=np.int64),
+        decision_event_seq=linear.decision_event_seq.copy(),
         target_names=tuple(target_names),
         predictions=predictions,
+        decision_grid_schema=linear.metadata.decision_grid_schema,
+        decision_grid_hash=linear.metadata.decision_grid_hash,
+        decision_grid_n_rows=linear.metadata.decision_grid_n_rows,
+        decision_schedule=linear.metadata.decision_schedule,
     )
 
 
@@ -1310,16 +1452,16 @@ def test_env_reset_rejects_start_event_index_not_on_linear_signal_grid():
     )
     env = ExecutionEnv(tape, linear_signals=_linear_signals(tape, start_event_index=1), config=_env_config())
 
-    with pytest.raises(ValueError, match="linear signal decision_event_index"):
+    with pytest.raises(ValueError, match="decision grid row"):
         env.reset(start_event_index=0)
 
 
-def test_signal_end_terminal_applies_terminal_inventory_penalty():
+def test_grid_end_terminal_applies_terminal_inventory_penalty():
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
     )
-    linear = _linear_signals_for_decisions(tape, [0], [100])
+    linear = _linear_signals_for_decisions(tape, [0, 1], [100, 200])
     config = _env_config(
         reward_config=RewardConfig(terminal_inventory_penalty_bps=10.0),
         initial_position=PositionState(inventory_qty=1.0),
@@ -1330,13 +1472,46 @@ def test_signal_end_terminal_applies_terminal_inventory_penalty():
     step = env.step(_disabled_action())
 
     assert step.done is True
-    assert step.info["terminal_due_to_signal_end"] is True
-    assert step.info["next_signal_row_index"] is None
-    assert step.info["target_signal_event_index"] is None
+    assert step.info["terminal_due_to_grid_end"] is True
+    assert step.info["next_decision_grid_row_index"] == 1
+    assert step.info["target_decision_event_index"] == 1
     assert step.execution.reward.terminal_penalty > 0.0
 
 
-def test_step_advances_to_next_linear_signal_event_not_time_boundary_trade():
+def test_reset_rejects_final_decision_grid_row():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [],
+    )
+    linear = _linear_signals_for_decisions(tape, [0, 1], [100, 200])
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
+
+    with pytest.raises(ValueError, match="following decision grid row"):
+        env.reset(start_event_index=1)
+
+
+def test_penultimate_step_reaches_final_decision_grid_row_and_then_rejects_action():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [],
+    )
+    linear = _linear_signals_for_decisions(tape, [0, 1], [100, 200])
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
+    env.reset()
+
+    step = env.step(_disabled_action())
+
+    assert step.done is True
+    assert step.info["terminal_due_to_grid_end"] is True
+    assert step.info["decision_grid_row_index"] == 0
+    assert step.info["next_decision_grid_row_index"] == 1
+    assert step.info["target_decision_event_index"] == 1
+    assert step.info["events_processed"] == 1
+    with pytest.raises(RuntimeError, match="environment is done"):
+        env.step(_disabled_action())
+
+
+def test_step_advances_to_next_decision_grid_event_not_time_boundary_trade():
     l2_events = [
         _l2(seq=0, local_ts_us=100),
         _l2(seq=1, local_ts_us=120),
@@ -1347,7 +1522,7 @@ def test_step_advances_to_next_linear_signal_event_not_time_boundary_trade():
         _trade(local_ts_us=149, side=AggressorSide.SELL, price_tick=1000, amount=1.0, source_row=0),
     ]
     tape = _tape(l2_events, trades)
-    linear = _linear_signals_for_decisions(tape, [0, 3], [100, 151])
+    linear = _linear_signals_for_decisions(tape, [0, 3, 4], [100, 151, 250])
     env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
     env.reset()
 
@@ -1357,13 +1532,13 @@ def test_step_advances_to_next_linear_signal_event_not_time_boundary_trade():
     assert step.truncated is False
     assert step.info["event_index"] == 3
     assert step.info["current_book_ptr"] == int(tape.arrays.events[3]["book_ptr"])
-    assert step.info["target_signal_event_index"] == 3
-    assert step.info["next_signal_row_index"] == 1
-    assert step.info["terminal_due_to_signal_end"] is False
+    assert step.info["target_decision_event_index"] == 3
+    assert step.info["next_decision_grid_row_index"] == 1
+    assert step.info["terminal_due_to_grid_end"] is False
     assert step.info["terminal_due_to_tape_end"] is False
 
 
-def test_step_replays_all_events_through_target_signal_event():
+def test_step_replays_all_events_through_target_decision_grid_event():
     l2_events = [
         _l2(seq=0, local_ts_us=100),
         _l2(seq=1, local_ts_us=151),
@@ -1380,7 +1555,7 @@ def test_step_replays_all_events_through_target_signal_event():
 
     assert step.info["events_processed"] == 2
     assert step.info["event_index"] == 2
-    assert step.info["target_signal_event_index"] == 2
+    assert step.info["target_decision_event_index"] == 2
     assert step.info["num_fills"] >= 1
 
 
@@ -1407,11 +1582,11 @@ def test_max_episode_steps_truncates_after_full_signal_interval():
 
     assert step.truncated is True
     assert step.info["event_index"] == 3
-    assert step.info["target_signal_event_index"] == 3
-    assert step.info["next_signal_row_index"] == 1
+    assert step.info["target_decision_event_index"] == 3
+    assert step.info["next_decision_grid_row_index"] == 1
 
 
-def test_step_rejects_next_linear_signal_row_that_is_not_l2_event():
+def test_step_rejects_next_decision_grid_row_that_is_not_l2_event():
     l2_events = [
         _l2(seq=0, local_ts_us=100),
         _l2(seq=1, local_ts_us=150),
@@ -1420,15 +1595,16 @@ def test_step_rejects_next_linear_signal_row_that_is_not_l2_event():
         _trade(local_ts_us=120, side=AggressorSide.SELL, price_tick=1000, amount=1.0, source_row=0),
     ]
     tape = _tape(l2_events, trades)
-    linear = _linear_signals_for_decisions(tape, [0, 1], [100, 120])
-    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
-    env.reset()
+    grid = _decision_grid_for_decisions(tape, [0, 1], allow_invalid_book_ptr=True)
+    linear = _linear_signals_for_grid(tape, grid)
 
-    with pytest.raises(ValueError, match="target event must reference an L2"):
+    env = ExecutionEnv(tape, decision_grid=grid, linear_signals=linear, config=_env_config())
+    env.reset()
+    with pytest.raises(ValueError, match="decision grid target event"):
         env.step(_disabled_action())
 
 
-def test_env_reset_accepts_later_linear_signal_start_row():
+def test_env_reset_accepts_later_decision_grid_start_row():
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -1443,7 +1619,7 @@ def test_env_reset_accepts_later_linear_signal_start_row():
     reset = env.reset(start_event_index=1)
 
     assert reset.info["event_index"] == 1
-    assert reset.info["signal_row_index"] == 1
+    assert reset.info["decision_grid_row_index"] == 1
 
 
 def _bid_with_guard_action() -> QuoteAction:

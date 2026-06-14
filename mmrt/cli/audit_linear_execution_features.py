@@ -17,12 +17,11 @@ def _parse_thresholds(value: str) -> tuple[float, ...]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
+    parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--linear-train-result-json", required=True)
     parser.add_argument("--linear-signals-npz")
     parser.add_argument("--output-json")
     parser.add_argument("--no-mmap", action="store_true")
-    parser.add_argument("--start-event-index", type=int)
-    parser.add_argument("--max-decisions", type=int)
     parser.add_argument("--chunk-rows", type=int, default=100_000)
     parser.add_argument("--z-thresholds", default="3,5,8")
     parser.add_argument("--top-k", type=int, default=25)
@@ -46,12 +45,11 @@ def _config_from_args(args: argparse.Namespace) -> LinearExecutionFeatureAuditCo
         raise FileExistsError(f"output_json already exists: {output}")
     return LinearExecutionFeatureAuditConfig(
         tape_root=args.tape_root,
+        decision_grid_path=args.decision_grid_path,
         linear_train_result_json=args.linear_train_result_json,
         linear_signals_npz=signals,
         output_json=output,
         mmap_mode=None if args.no_mmap else "r",
-        start_event_index=args.start_event_index,
-        max_decisions=args.max_decisions,
         chunk_rows=args.chunk_rows,
         z_thresholds=_parse_thresholds(args.z_thresholds),
         top_k=args.top_k,

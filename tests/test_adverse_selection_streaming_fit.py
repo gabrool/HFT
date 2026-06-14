@@ -1,11 +1,13 @@
 import numpy as np
 
 from mmrt.execution.adverse_selection_dataset import AdverseSelectionDatasetWriter, AdverseSelectionDatasetWriterConfig
+from mmrt.execution.adverse_selection_index import ADVERSE_SELECTION_INDEX_SCHEMA
 from mmrt.execution.adverse_selection_fit import fit_adverse_baselines_streaming
+from tests.grid_helpers import grid_lineage_fields
 
 
 def _dataset(tmp_path, rows=6):
-    meta={"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,"decision_interval_us":1,"start_event_index":None,"max_decisions":None,"config_json":"{}","index_schema":"mmrt_adverse_selection_index_v2","index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}
+    meta={"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,**grid_lineage_fields(n_rows=rows),"config_json":"{}","index_schema":ADVERSE_SELECTION_INDEX_SCHEMA,"index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}
     w=AdverseSelectionDatasetWriter(AdverseSelectionDatasetWriterConfig(str(tmp_path/"ds"),("x",),("bid_touch_filled","cost"),meta,chunk_rows=2))
     for i in range(rows):
         w.append(decision_local_ts_us=i+1, decision_event_index=i, decision_event_seq=0, features=[float(i)], labels=[float(i%2), float(2*i+1)], label_masks=[True, i != 1])

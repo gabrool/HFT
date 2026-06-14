@@ -1,6 +1,7 @@
 import inspect
 import json
 from decimal import Decimal
+from dataclasses import replace
 
 import numpy as np
 
@@ -14,6 +15,7 @@ from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
+from mmrt.execution.decision_grid import save_decision_grid
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -38,6 +40,7 @@ from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.rollout import RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy
+from tests.grid_helpers import decision_grid_for_tape
 
 
 
@@ -137,6 +140,7 @@ def _tape(l2_events, trades):
 def _save_tape(tmp_path, tape):
     root = tmp_path / "execution_tape"
     save_execution_tape(tape, root, overwrite=True)
+    save_decision_grid(root / "decision_grid", decision_grid_for_tape(tape), overwrite=True)
     return root
 
 
@@ -169,24 +173,11 @@ def _signal_arrays(n_rows: int = 16):
     })
 
 
-def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
+def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0, decision_grid=None):
+    if decision_grid is None:
+        decision_grid = decision_grid_for_tape(tape)
+    n_rows = decision_grid.n_rows
     arrays = _signal_arrays(n_rows)
-    pairs = []
-    for event_index, event in enumerate(tape.arrays.events):
-        if event_index < start_event_index:
-            continue
-        if int(event["event_type_code"]) != 1:
-            continue
-        book_ptr = int(event["book_ptr"])
-        if book_ptr >= 0:
-            pairs.append((event_index, int(tape.arrays.l2_events[book_ptr]["local_ts_us"])))
-    if not pairs:
-        pairs.append((start_event_index, int(tape.manifest.start_local_ts_us)))
-    decision_event_index = [pair[0] for pair in pairs[:n_rows]]
-    decision_local_ts_us = [pair[1] for pair in pairs[:n_rows]]
-    while len(decision_event_index) < n_rows:
-        decision_event_index.append(decision_event_index[-1] + 1)
-        decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
     metadata = LinearSignalArtifactMetadata(
         tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
@@ -196,22 +187,31 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_schedule=_fixed_schedule_payload(decision_interval_us),
-        start_event_index=start_event_index,
+        decision_grid_schema=decision_grid.metadata.schema,
+        decision_grid_hash=decision_grid.decision_grid_hash,
+        decision_grid_n_rows=decision_grid.n_rows,
+        decision_schedule=decision_grid.decision_schedule,
+        start_event_index=int(decision_grid.decision_event_index[0]),
         n_rows=n_rows,
     )
     return LinearSignalArtifact(
         arrays=arrays,
         metadata=metadata,
-        decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
-        decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+        decision_event_index=decision_grid.decision_event_index.copy(),
+        decision_local_ts_us=decision_grid.decision_local_ts_us.copy(),
+        decision_event_seq=decision_grid.decision_event_seq.copy(),
     )
 
 
 def _save_linear_signals(root, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
     tape = load_execution_tape(root)
+    decision_grid = decision_grid_for_tape(tape)
     artifact = _linear_artifact_for_tape(
-        tape, n_rows=n_rows, decision_interval_us=decision_interval_us, start_event_index=start_event_index
+        tape,
+        n_rows=n_rows,
+        decision_interval_us=decision_interval_us,
+        start_event_index=start_event_index,
+        decision_grid=decision_grid,
     )
     path = root / LINEAR_SIGNALS_FILENAME
     save_linear_signal_artifact_npz(path, artifact, overwrite=True)
@@ -225,9 +225,11 @@ def _tiny_tape():
 
 def _tiny_env(max_episode_steps: int | None = 4) -> ExecutionEnv:
     tape = _tiny_tape()
+    decision_grid = decision_grid_for_tape(tape)
     return ExecutionEnv(
         tape,
-        linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50),
+        decision_grid=decision_grid,
+        linear_signals=_linear_artifact_for_tape(tape, decision_interval_us=50, decision_grid=decision_grid),
         config=ExecutionEnvConfig(
             latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0, cancel_latency_us=0),
             max_episode_steps=max_episode_steps,
@@ -247,6 +249,7 @@ def _train_tiny_checkpoint(tmp_path):
     run_execution_ppo_training(
         ExecutionPPOTrainCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(tmp_path / "train_summary.json"),
             checkpoint_path=str(checkpoint_path),
             overwrite=True,
@@ -309,6 +312,7 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     train_summary = run_execution_ppo_training(
         ExecutionPPOTrainCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(tmp_path / "train_summary.json"),
             checkpoint_path=str(tmp_path / "checkpoint.pt"),
             overwrite=True,
@@ -327,6 +331,7 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     summary = run_execution_policy_evaluation(
         ExecutionPolicyEvaluationCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(tmp_path / "checkpoint.pt"),
             output_json=str(output_json),
             overwrite=True,
@@ -353,7 +358,7 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["tape"]["symbol"] == "BTCUSDT"
     assert (
         summary["linear_signals"]["schema"]
-        == "mmrt_execution_linear_signals_aligned"
+        == "mmrt_execution_linear_signals_grid_v1"
     )
     assert summary["linear_signals"]["n_rows"] >= 1
     assert summary["linear_signals"]["fields"] == train_summary["linear_signals"]["fields"]
@@ -367,6 +372,7 @@ def test_evaluate_execution_policy_requires_linear_signals_file(tmp_path):
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(eval_root),
+                decision_grid_path=str(eval_root / "decision_grid"),
                 checkpoint_path=str(checkpoint_path),
                 output_json=str(tmp_path / "eval_summary.json"),
                 overwrite=True,
@@ -389,6 +395,7 @@ def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path)
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
                 output_json=str(tmp_path / "eval_bad_summary.json"),
                 overwrite=True,
@@ -409,6 +416,7 @@ def test_evaluate_execution_policy_rejects_checkpoint_missing_linear_signal_meta
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
                 output_json=str(tmp_path / "eval_missing_linear.json"),
                 overwrite=True,
@@ -430,6 +438,7 @@ def test_evaluate_execution_policy_rejects_linear_signal_field_mismatch(tmp_path
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
                 output_json=str(tmp_path / "eval_bad_linear_fields.json"),
                 overwrite=True,
@@ -441,13 +450,22 @@ def test_evaluate_execution_policy_rejects_linear_signal_field_mismatch(tmp_path
 def test_evaluate_execution_policy_rejects_misaligned_linear_signal_metadata(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
     tape = load_execution_tape(tape_root)
-    artifact = _linear_artifact_for_tape(tape, decision_interval_us=999)
+    artifact = _linear_artifact_for_tape(tape)
+    bad_metadata = replace(artifact.metadata, decision_grid_hash="2" * 64)
+    artifact = LinearSignalArtifact(
+        arrays=artifact.arrays,
+        metadata=bad_metadata,
+        decision_event_index=artifact.decision_event_index,
+        decision_local_ts_us=artifact.decision_local_ts_us,
+        decision_event_seq=artifact.decision_event_seq,
+    )
     save_linear_signal_artifact_npz(tape_root / LINEAR_SIGNALS_FILENAME, artifact, overwrite=True)
 
     with pytest.raises(ValueError, match="linear signal metadata mismatch"):
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(checkpoint_path),
                 output_json=str(tmp_path / "eval_mismatch.json"),
                 overwrite=True,
@@ -467,6 +485,7 @@ def test_evaluate_execution_policy_requires_checkpoint_cli_config_by_default(tmp
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
                 output_json=str(tmp_path / "eval_missing_cli_config.json"),
                 overwrite=True,
@@ -485,6 +504,7 @@ def test_evaluate_execution_policy_can_explicitly_ignore_missing_checkpoint_cli_
     summary = run_execution_policy_evaluation(
         ExecutionPolicyEvaluationCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(bad_checkpoint),
             output_json=str(tmp_path / "eval_cli_config.json"),
             overwrite=True,
@@ -511,6 +531,7 @@ def test_evaluate_execution_policy_inherits_checkpoint_start_event_index_when_un
     run_execution_ppo_training(
         ExecutionPPOTrainCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(tmp_path / "train_start_1_summary.json"),
             checkpoint_path=str(checkpoint_path),
             overwrite=True,
@@ -528,6 +549,7 @@ def test_evaluate_execution_policy_inherits_checkpoint_start_event_index_when_un
     summary = run_execution_policy_evaluation(
         ExecutionPolicyEvaluationCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(checkpoint_path),
             output_json=str(tmp_path / "eval_start_1_summary.json"),
             overwrite=True,
@@ -537,28 +559,31 @@ def test_evaluate_execution_policy_inherits_checkpoint_start_event_index_when_un
 
     assert summary["env_config_source"] == "checkpoint_cli_config"
     assert summary["effective_start_event_index"] == 1
-    assert summary["linear_signals"]["metadata"]["start_event_index"] == 1
+    assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
     assert summary["evaluation"]["steps"] > 0
 
 
-def test_evaluate_execution_policy_accepts_explicit_later_linear_signal_start_override(tmp_path):
+def test_evaluate_execution_policy_accepts_explicit_later_decision_grid_start_override(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
 
     summary = run_execution_policy_evaluation(
         ExecutionPolicyEvaluationCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(checkpoint_path),
             output_json=str(tmp_path / "eval_start_override.json"),
             overwrite=True,
             max_steps=3,
+            max_episode_steps=3,
+            use_checkpoint_cli_env_config=False,
             start_event_index=1,
         )
     )
 
     assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
     assert summary["effective_start_event_index"] == 1
-    assert summary["linear_signal_start"]["event_index"] == 1
-    assert summary["linear_signal_start"]["row_index"] == 1
+    assert summary["decision_grid_start"]["event_index"] == 1
+    assert summary["decision_grid_start"]["decision_grid_row_index"] == 1
 
 
 def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -569,6 +594,8 @@ def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path,
         [
             "--tape-root",
             str(tape_root),
+            "--decision-grid",
+            str(tape_root / "decision_grid"),
             "--checkpoint-path",
             str(checkpoint_path),
             "--output-json",
@@ -590,7 +617,7 @@ def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path,
     assert stdout_payload["evaluation"]["steps"] > 0
     assert (
         stdout_payload["linear_signals"]["schema"]
-        == "mmrt_execution_linear_signals_aligned"
+        == "mmrt_execution_linear_signals_grid_v1"
     )
     assert "observation_schema" in stdout_payload
 
@@ -604,6 +631,7 @@ def test_evaluate_execution_policy_refuses_overwrite_without_flag(tmp_path):
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(checkpoint_path),
                 output_json=str(output_json),
             )
@@ -613,6 +641,7 @@ def test_evaluate_execution_policy_refuses_overwrite_without_flag(tmp_path):
 def test_evaluate_execution_policy_config_parses_dtype_and_queue_mode():
     cfg = ExecutionPolicyEvaluationCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
         checkpoint_path="/tmp/checkpoint.pt",
         dtype="float64",
         queue_mode="balanced",
@@ -623,6 +652,7 @@ def test_evaluate_execution_policy_config_parses_dtype_and_queue_mode():
     with pytest.raises(ValueError):
         ExecutionPolicyEvaluationCLIConfig(
             tape_root="/tmp/tape",
+            decision_grid_path="/tmp/tape/decision_grid",
             checkpoint_path="/tmp/checkpoint.pt",
             dtype="float16",
         )
@@ -631,6 +661,7 @@ def test_evaluate_execution_policy_config_parses_dtype_and_queue_mode():
 def test_evaluate_execution_policy_accepts_zero_queue_weights():
     cfg = ExecutionPolicyEvaluationCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
         checkpoint_path="/tmp/checkpoint.pt",
         l2_decrease_weight=0.0,
         trade_at_level_weight=0.0,
@@ -644,6 +675,7 @@ def test_evaluate_execution_policy_rejects_queue_weights_above_one():
     with pytest.raises(ValueError):
         ExecutionPolicyEvaluationCLIConfig(
             tape_root="/tmp/tape",
+            decision_grid_path="/tmp/tape/decision_grid",
             checkpoint_path="/tmp/checkpoint.pt",
             l2_decrease_weight=1.1,
         )
@@ -651,6 +683,7 @@ def test_evaluate_execution_policy_rejects_queue_weights_above_one():
     with pytest.raises(ValueError):
         ExecutionPolicyEvaluationCLIConfig(
             tape_root="/tmp/tape",
+            decision_grid_path="/tmp/tape/decision_grid",
             checkpoint_path="/tmp/checkpoint.pt",
             trade_at_level_weight=1.1,
         )
@@ -662,6 +695,7 @@ def test_evaluate_execution_policy_can_use_cli_env_config_instead_of_checkpoint(
     summary = run_execution_policy_evaluation(
         ExecutionPolicyEvaluationCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(checkpoint_path),
             output_json=str(tmp_path / "eval_cli_env.json"),
             overwrite=True,
@@ -720,7 +754,7 @@ def test_parser_can_disable_l2_trade_dedupe():
     from mmrt.cli.evaluate_execution_policy import build_arg_parser, _env_config_from_cli_config, _config_from_args
 
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--checkpoint-path", "/tmp/ckpt.pt", "--no-dedupe-l2-decrease-with-trade-prints"])
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--checkpoint-path", "/tmp/ckpt.pt", "--no-dedupe-l2-decrease-with-trade-prints"])
     config = _config_from_args(args)
     env_config = _env_config_from_cli_config(config)
     assert config.dedupe_l2_decrease_with_trade_prints is False
@@ -731,7 +765,7 @@ def test_parser_dedupe_l2_trade_default_enabled():
     from mmrt.cli.evaluate_execution_policy import build_arg_parser, _config_from_args
 
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--checkpoint-path", "/tmp/ckpt.pt"])
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--checkpoint-path", "/tmp/ckpt.pt"])
     config = _config_from_args(args)
     assert config.dedupe_l2_decrease_with_trade_prints is True
 
@@ -741,6 +775,7 @@ def test_evaluation_cli_env_config_adverse_runtime_uses_post_only_gap():
 
     config = ExecutionPolicyEvaluationCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
         checkpoint_path="/tmp/checkpoint.pt",
         adverse_signals_npz="/tmp/adverse.npz",
         post_only_gap_ticks=2,

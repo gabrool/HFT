@@ -41,6 +41,16 @@ def _trade(local_ts_us: int, *, side_code: int = 1) -> TradeInput:
     return TradeInput(local_ts_us=local_ts_us, ts_us=local_ts_us, price=100.0, amount=0.25, side_code=side_code, event_seq=-1)
 
 
+def _engine_decide(engine: FeatureEngine, snapshot: BookSnapshotInput):
+    engine.observe_book_snapshot(snapshot)
+    return engine.force_decision(local_ts_us=snapshot.local_ts_us, ts_us=snapshot.ts_us, event_seq=snapshot.event_seq)
+
+
+def _pipeline_decide(pipeline: DecisionFeaturePipeline, snapshot: BookSnapshotInput):
+    pipeline.on_book_snapshot_without_decision(snapshot)
+    return pipeline.force_decision(local_ts_us=snapshot.local_ts_us, ts_us=snapshot.ts_us, event_seq=snapshot.event_seq)
+
+
 def _drive(consumer_on_trade, consumer_on_snapshot, *, n_decisions: int, stride_us: int):
     """Feed a deterministic event stream and collect decision outputs."""
     out = []
@@ -76,13 +86,11 @@ def test_pipeline_output_equals_engine_plus_transformer():
     manual: list[np.ndarray] = []
 
     def manual_on_snapshot(snapshot):
-        decision = engine.on_book_snapshot(snapshot)
-        if decision is None:
-            return None
+        decision = _engine_decide(engine, snapshot)
         manual.append(transformer.transform_one_local(decision.local_ts_us, decision.feature_vector))
         return decision
 
-    pipeline_decisions = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=30, stride_us=stride)
+    pipeline_decisions = _drive(pipeline.on_trade, lambda snapshot: _pipeline_decide(pipeline, snapshot), n_decisions=30, stride_us=stride)
     _drive(engine.on_trade, manual_on_snapshot, n_decisions=30, stride_us=stride)
 
     assert len(pipeline_decisions) == len(manual) > 20
@@ -99,12 +107,11 @@ def test_pipeline_output_is_transformed_not_raw_engine_output():
     raw_vectors: list[np.ndarray] = []
 
     def raw_on_snapshot(snapshot):
-        decision = raw_engine.on_book_snapshot(snapshot)
-        if decision is not None:
-            raw_vectors.append(decision.feature_vector)
+        decision = _engine_decide(raw_engine, snapshot)
+        raw_vectors.append(decision.feature_vector)
         return decision
 
-    decisions = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=30, stride_us=stride)
+    decisions = _drive(pipeline.on_trade, lambda snapshot: _pipeline_decide(pipeline, snapshot), n_decisions=30, stride_us=stride)
     _drive(raw_engine.on_trade, raw_on_snapshot, n_decisions=30, stride_us=stride)
 
     assert len(decisions) == len(raw_vectors)
@@ -118,9 +125,9 @@ def test_pipeline_output_is_transformed_not_raw_engine_output():
 def test_pipeline_reset_restarts_transform_state():
     stride = 500_000
     pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_fixed_schedule(stride)))
-    first = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=25, stride_us=stride)
+    first = _drive(pipeline.on_trade, lambda snapshot: _pipeline_decide(pipeline, snapshot), n_decisions=25, stride_us=stride)
     pipeline.reset()
-    second = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=25, stride_us=stride)
+    second = _drive(pipeline.on_trade, lambda snapshot: _pipeline_decide(pipeline, snapshot), n_decisions=25, stride_us=stride)
     assert len(first) == len(second)
     for a, b in zip(first, second):
         np.testing.assert_array_equal(a.feature_values, b.feature_values)
@@ -129,7 +136,7 @@ def test_pipeline_reset_restarts_transform_state():
 def test_pipeline_transform_diagnostics_count_decisions():
     stride = 500_000
     pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_fixed_schedule(stride)))
-    decisions = _drive(pipeline.on_trade, pipeline.on_book_snapshot, n_decisions=25, stride_us=stride)
+    decisions = _drive(pipeline.on_trade, lambda snapshot: _pipeline_decide(pipeline, snapshot), n_decisions=25, stride_us=stride)
     diag = pipeline.transform_diagnostics_snapshot()
     assert diag.rows_seen == len(decisions) > 0
 

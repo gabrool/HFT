@@ -9,9 +9,10 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from mmrt.execution.adverse_selection import AdverseSelectionDataset, AdverseSelectionFeatureDataset
+from mmrt.execution.decision_grid import DecisionGrid
 
-ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_v2"
-ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_aligned"
+ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_grid_v1"
+ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_grid_v1"
 ADVERSE_SELECTION_MODEL_FILENAME = "adverse_selection_model.npz"
 ADVERSE_SELECTION_SIGNALS_FILENAME = "adverse_selection_signals.npz"
 
@@ -34,6 +35,19 @@ def _finite_1d(arr: np.ndarray, name: str) -> np.ndarray:
     return arr
 
 
+def _hash64(value: str, name: str) -> str:
+    out = str(value)
+    if len(out) != 64 or any(ch not in "0123456789abcdef" for ch in out):
+        raise ValueError(f"{name} must be 64 lowercase hex characters")
+    return out
+
+
+def _nonempty_str(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
 @dataclass(frozen=True, slots=True)
 class AdverseSelectionModelArtifact:
     schema: str
@@ -46,6 +60,10 @@ class AdverseSelectionModelArtifact:
     config_json: str
     exchange: str
     symbol: str
+    decision_grid_schema: str
+    decision_grid_hash: str
+    decision_grid_n_rows: int
+    decision_schedule: Mapping[str, object]
 
     def __post_init__(self) -> None:
         if self.schema != ADVERSE_SELECTION_MODEL_SCHEMA:
@@ -64,8 +82,18 @@ class AdverseSelectionModelArtifact:
             raise ValueError("target dimensions must match")
         if (fs <= 0.0).any():
             raise ValueError("feature_scale must be > 0")
-        if not isinstance(self.config_json, str) or not isinstance(self.exchange, str) or not isinstance(self.symbol, str):
-            raise ValueError("config_json, exchange, and symbol must be strings")
+        if not isinstance(self.config_json, str):
+            raise ValueError("config_json must be string")
+        object.__setattr__(self, "exchange", _nonempty_str(self.exchange, "exchange"))
+        object.__setattr__(self, "symbol", _nonempty_str(self.symbol, "symbol"))
+        object.__setattr__(self, "decision_grid_schema", _nonempty_str(self.decision_grid_schema, "decision_grid_schema"))
+        object.__setattr__(self, "decision_grid_hash", _hash64(self.decision_grid_hash, "decision_grid_hash"))
+        if isinstance(self.decision_grid_n_rows, bool) or int(self.decision_grid_n_rows) <= 0:
+            raise ValueError("decision_grid_n_rows must be a positive int")
+        object.__setattr__(self, "decision_grid_n_rows", int(self.decision_grid_n_rows))
+        if not isinstance(self.decision_schedule, Mapping):
+            raise ValueError("decision_schedule must be a mapping")
+        object.__setattr__(self, "decision_schedule", dict(self.decision_schedule))
         object.__setattr__(self, "feature_mean", fm)
         object.__setattr__(self, "feature_scale", fs)
         object.__setattr__(self, "coefficients", coef)
@@ -93,6 +121,10 @@ def save_adverse_selection_model(path: str | Path, artifact: AdverseSelectionMod
             config_json=np.array(artifact.config_json),
             exchange=np.array(artifact.exchange),
             symbol=np.array(artifact.symbol),
+            decision_grid_schema=np.array(artifact.decision_grid_schema),
+            decision_grid_hash=np.array(artifact.decision_grid_hash),
+            decision_grid_n_rows=np.array(artifact.decision_grid_n_rows, dtype=np.int64),
+            decision_schedule=np.array(dict(artifact.decision_schedule), dtype=object),
         )
     tmp.replace(path)
 
@@ -110,6 +142,10 @@ def load_adverse_selection_model(path: str | Path) -> AdverseSelectionModelArtif
             config_json=str(data["config_json"].item()),
             exchange=str(data["exchange"].item()),
             symbol=str(data["symbol"].item()),
+            decision_grid_schema=str(data["decision_grid_schema"].item()),
+            decision_grid_hash=str(data["decision_grid_hash"].item()),
+            decision_grid_n_rows=int(data["decision_grid_n_rows"].item()),
+            decision_schedule=dict(data["decision_schedule"].item()),
         )
 
 
@@ -139,6 +175,10 @@ class AdverseSelectionSignalArtifact:
     decision_event_seq: np.ndarray
     target_names: tuple[str, ...]
     predictions: dict[str, np.ndarray]
+    decision_grid_schema: str
+    decision_grid_hash: str
+    decision_grid_n_rows: int
+    decision_schedule: Mapping[str, object]
 
     def __post_init__(self) -> None:
         if self.schema != ADVERSE_SELECTION_SIGNALS_SCHEMA:
@@ -169,6 +209,14 @@ class AdverseSelectionSignalArtifact:
         object.__setattr__(self, "decision_event_seq", arrays[2])
         object.__setattr__(self, "target_names", names)
         object.__setattr__(self, "predictions", preds)
+        object.__setattr__(self, "decision_grid_schema", _nonempty_str(self.decision_grid_schema, "decision_grid_schema"))
+        object.__setattr__(self, "decision_grid_hash", _hash64(self.decision_grid_hash, "decision_grid_hash"))
+        if int(self.decision_grid_n_rows) != n:
+            raise ValueError("decision_grid_n_rows must match signal rows")
+        object.__setattr__(self, "decision_grid_n_rows", int(self.decision_grid_n_rows))
+        if not isinstance(self.decision_schedule, Mapping):
+            raise ValueError("decision_schedule must be a mapping")
+        object.__setattr__(self, "decision_schedule", dict(self.decision_schedule))
 
 
 def build_adverse_selection_signal_artifact(dataset: AdverseSelectionDataset | AdverseSelectionFeatureDataset, model: AdverseSelectionModelArtifact) -> AdverseSelectionSignalArtifact:
@@ -184,6 +232,10 @@ def build_adverse_selection_signal_artifact(dataset: AdverseSelectionDataset | A
         decision_event_seq=dataset.decision_event_seq.copy(),
         target_names=model.target_names,
         predictions=predictions,
+        decision_grid_schema=model.decision_grid_schema,
+        decision_grid_hash=model.decision_grid_hash,
+        decision_grid_n_rows=model.decision_grid_n_rows,
+        decision_schedule=model.decision_schedule,
     )
 
 
@@ -195,7 +247,19 @@ def save_adverse_selection_signals(path: str | Path, artifact: AdverseSelectionS
     payload = {f"pred_{name}": arr for name, arr in artifact.predictions.items()}
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("wb") as fh:
-        np.savez_compressed(fh, schema=np.array(artifact.schema), decision_local_ts_us=artifact.decision_local_ts_us, decision_event_index=artifact.decision_event_index, decision_event_seq=artifact.decision_event_seq, target_names=np.asarray(artifact.target_names, dtype=object), **payload)
+        np.savez_compressed(
+            fh,
+            schema=np.array(artifact.schema),
+            decision_local_ts_us=artifact.decision_local_ts_us,
+            decision_event_index=artifact.decision_event_index,
+            decision_event_seq=artifact.decision_event_seq,
+            target_names=np.asarray(artifact.target_names, dtype=object),
+            decision_grid_schema=np.array(artifact.decision_grid_schema),
+            decision_grid_hash=np.array(artifact.decision_grid_hash),
+            decision_grid_n_rows=np.array(artifact.decision_grid_n_rows, dtype=np.int64),
+            decision_schedule=np.array(dict(artifact.decision_schedule), dtype=object),
+            **payload,
+        )
     tmp.replace(path)
 
 
@@ -216,6 +280,10 @@ def save_adverse_selection_signals_arrays(
     decision_event_seq: np.ndarray,
     target_names: Sequence[str],
     predictions: Mapping[str, np.ndarray],
+    decision_grid_schema: str,
+    decision_grid_hash: str,
+    decision_grid_n_rows: int,
+    decision_schedule: Mapping[str, object],
     overwrite: bool = False,
     validate_chunk_rows: int = 100_000,
 ) -> None:
@@ -227,6 +295,10 @@ def save_adverse_selection_signals_arrays(
         raise ValueError("validate_chunk_rows must be a positive int")
     validate_chunk_rows = int(validate_chunk_rows)
     names = _names_tuple(target_names, "target_names")
+    decision_grid_schema = _nonempty_str(decision_grid_schema, "decision_grid_schema")
+    decision_grid_hash = _hash64(decision_grid_hash, "decision_grid_hash")
+    if not isinstance(decision_schedule, Mapping):
+        raise ValueError("decision_schedule must be a mapping")
 
     decision_arrays = {
         "decision_local_ts_us": np.asarray(decision_local_ts_us),
@@ -244,6 +316,8 @@ def save_adverse_selection_signals_arrays(
         elif int(arr.shape[0]) != n:
             raise ValueError("decision arrays must have the same length")
     assert n is not None
+    if int(decision_grid_n_rows) != n:
+        raise ValueError("decision_grid_n_rows must match signal rows")
 
     pred_arrays: dict[str, np.ndarray] = {}
     missing = [name for name in names if name not in predictions]
@@ -258,7 +332,6 @@ def save_adverse_selection_signals_arrays(
     for start in range(0, n, validate_chunk_rows):
         end = min(start + validate_chunk_rows, n)
         for name, arr in decision_arrays.items():
-            # Conversion validates integer compatibility for the chunk only.
             np.asarray(arr[start:end], dtype=np.int64)
         for target, arr in pred_arrays.items():
             chunk = np.asarray(arr[start:end], dtype=np.float32)
@@ -282,6 +355,10 @@ def save_adverse_selection_signals_arrays(
             decision_event_index=decision_arrays["decision_event_index"],
             decision_event_seq=decision_arrays["decision_event_seq"],
             target_names=np.asarray(names, dtype=object),
+            decision_grid_schema=np.array(decision_grid_schema),
+            decision_grid_hash=np.array(decision_grid_hash),
+            decision_grid_n_rows=np.array(int(decision_grid_n_rows), dtype=np.int64),
+            decision_schedule=np.array(dict(decision_schedule), dtype=object),
             **payload,
         )
     tmp.replace(path)
@@ -289,7 +366,17 @@ def save_adverse_selection_signals_arrays(
 
 def load_adverse_selection_signals(path: str | Path) -> AdverseSelectionSignalArtifact:
     with np.load(Path(path), allow_pickle=True) as data:
-        required_keys = ("schema", "decision_local_ts_us", "decision_event_index", "decision_event_seq", "target_names")
+        required_keys = (
+            "schema",
+            "decision_local_ts_us",
+            "decision_event_index",
+            "decision_event_seq",
+            "target_names",
+            "decision_grid_schema",
+            "decision_grid_hash",
+            "decision_grid_n_rows",
+            "decision_schedule",
+        )
         missing_base = [key for key in required_keys if key not in data.files]
         if missing_base:
             raise ValueError(f"missing required arrays in adverse-selection signals artifact: {missing_base}")
@@ -311,6 +398,10 @@ def load_adverse_selection_signals(path: str | Path) -> AdverseSelectionSignalAr
             decision_event_seq=np.asarray(data["decision_event_seq"]),
             target_names=target_names,
             predictions=predictions,
+            decision_grid_schema=str(data["decision_grid_schema"].item()),
+            decision_grid_hash=str(data["decision_grid_hash"].item()),
+            decision_grid_n_rows=int(data["decision_grid_n_rows"].item()),
+            decision_schedule=dict(data["decision_schedule"].item()),
         )
 
 
@@ -379,6 +470,29 @@ def validate_adverse_signal_alignment(
         right_event_seq=decision_event_seq,
         left_name="adverse_signals",
         right_name=right_name,
+    )
+
+
+def validate_adverse_signals_for_decision_grid(
+    signals: AdverseSelectionSignalArtifact,
+    decision_grid: DecisionGrid,
+) -> None:
+    if not isinstance(signals, AdverseSelectionSignalArtifact):
+        raise ValueError("signals must be AdverseSelectionSignalArtifact")
+    if not isinstance(decision_grid, DecisionGrid):
+        raise ValueError("decision_grid must be DecisionGrid")
+    if signals.decision_grid_schema != decision_grid.metadata.schema:
+        raise ValueError("adverse signals decision_grid_schema mismatch")
+    if signals.decision_grid_hash != decision_grid.decision_grid_hash:
+        raise ValueError("adverse signals decision_grid_hash mismatch")
+    if signals.decision_grid_n_rows != decision_grid.n_rows:
+        raise ValueError("adverse signals decision_grid_n_rows mismatch")
+    validate_adverse_signal_alignment(
+        signals,
+        decision_local_ts_us=decision_grid.decision_local_ts_us,
+        decision_event_index=decision_grid.decision_event_index,
+        decision_event_seq=decision_grid.decision_event_seq,
+        right_name="decision_grid",
     )
 
 def required_adverse_targets_for_executable_edge(candidate_names: Sequence[str]) -> tuple[str, ...]:

@@ -8,11 +8,12 @@ from mmrt.cli.train_execution_ppo import (
     _summary_config,
 )
 from tests.test_audit_execution_sim import _linear_artifact_for_tape, _l2, _tape
+from tests.grid_helpers import decision_grid_for_tape
 
 
 def test_parser_can_disable_l2_trade_dedupe():
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--no-dedupe-l2-decrease-with-trade-prints"])
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--no-dedupe-l2-decrease-with-trade-prints"])
     config = _config_from_args(args)
     env_config = _build_env_config(config)
     assert config.dedupe_l2_decrease_with_trade_prints is False
@@ -22,7 +23,7 @@ def test_parser_can_disable_l2_trade_dedupe():
 
 def test_parser_dedupe_l2_trade_default_enabled():
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape"])
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid"])
     config = _config_from_args(args)
     assert config.dedupe_l2_decrease_with_trade_prints is True
 
@@ -31,6 +32,7 @@ def test_adverse_runtime_config_inherits_post_only_gap_from_ppo_config():
     parser = build_arg_parser()
     args = parser.parse_args([
         "--tape-root", "/tmp/tape",
+        "--decision-grid", "/tmp/tape/decision_grid",
         "--adverse-signals-npz", "/tmp/adverse.npz",
         "--post-only-gap-ticks", "2",
     ])
@@ -43,26 +45,30 @@ def test_adverse_runtime_config_inherits_post_only_gap_from_ppo_config():
     assert env_config.adverse_runtime_config.executable_edge.maker_fee_bps == env_config.fill_simulator_config.maker_fee_bps
 
 
-def test_train_execution_ppo_accepts_explicit_later_linear_signal_start():
+def test_train_execution_ppo_accepts_explicit_later_decision_grid_start():
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
         [],
     )
-    linear_signals = _linear_artifact_for_tape(tape, n_rows=3, decision_interval_us=500_000)
+    decision_grid = decision_grid_for_tape(tape)
+    linear_signals = _linear_artifact_for_tape(tape, n_rows=3, decision_interval_us=500_000, decision_grid=decision_grid)
     config = ExecutionPPOTrainCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
         start_event_index=1,
         max_episode_steps=1,
     )
 
-    linear_start = validate_linear_signals_for_execution_tape(
+    decision_grid_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
+        decision_grid=decision_grid,
         requested_start_event_index=config.start_event_index,
         min_rows=(config.max_episode_steps + 1),
     )
     training_config = _build_training_config(config)
 
     assert linear_signals.metadata.start_event_index == 0
-    assert linear_start.event_index == 1
+    assert decision_grid_start.event_index == 1
+    assert decision_grid_start.decision_grid_row_index == 1
     assert training_config.start_event_index == 1

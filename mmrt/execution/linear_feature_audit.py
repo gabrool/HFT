@@ -11,11 +11,11 @@ from typing import Mapping
 import numpy as np
 
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
-from mmrt.execution.linear_signal import load_linear_signal_artifact_npz, linear_signal_artifact_summary
+from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
+from mmrt.execution.linear_signal import load_linear_signal_artifact_npz, linear_signal_artifact_summary, validate_linear_signals_for_decision_grid
 from mmrt.execution.linear_signal_builder import (
     execution_linear_feature_names,
-    iter_execution_linear_feature_chunks,
-    schedule_config_from_train_result,
+    iter_execution_linear_feature_chunks_for_decision_grid,
     transform_config_from_train_result,
 )
 from mmrt.linear import models as lm
@@ -39,12 +39,11 @@ def _opt_pos(value: int | None, name: str) -> int | None:
 @dataclass(frozen=True, slots=True)
 class LinearExecutionFeatureAuditConfig:
     tape_root: str
+    decision_grid_path: str
     linear_train_result_json: str
     linear_signals_npz: str | None = None
     output_json: str | None = None
     mmap_mode: str | None = "r"
-    start_event_index: int | None = None
-    max_decisions: int | None = None
     chunk_rows: int = 100_000
     z_thresholds: tuple[float, ...] = (3.0, 5.0, 8.0)
     top_k: int = 25
@@ -55,12 +54,11 @@ class LinearExecutionFeatureAuditConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_path(self.tape_root, "tape_root"))
+        object.__setattr__(self, "decision_grid_path", _require_path(self.decision_grid_path, "decision_grid_path"))
         object.__setattr__(self, "linear_train_result_json", _require_path(self.linear_train_result_json, "linear_train_result_json"))
         if self.linear_signals_npz is not None: object.__setattr__(self, "linear_signals_npz", _require_path(self.linear_signals_npz, "linear_signals_npz"))
         if self.output_json is not None: object.__setattr__(self, "output_json", _require_path(self.output_json, "output_json"))
         if self.mmap_mode not in (None, "r"): raise ValueError("mmap_mode must be None or 'r'")
-        object.__setattr__(self, "start_event_index", _opt_nonneg(self.start_event_index, "start_event_index"))
-        object.__setattr__(self, "max_decisions", _opt_pos(self.max_decisions, "max_decisions"))
         if isinstance(self.chunk_rows, bool) or self.chunk_rows <= 0: raise ValueError("chunk_rows must be positive")
         thresholds = tuple(float(x) for x in self.z_thresholds)
         if not thresholds or any(x <= 0.0 or not np.isfinite(x) for x in thresholds) or tuple(sorted(thresholds)) != thresholds: raise ValueError("z_thresholds must be positive, sorted, and non-empty")
@@ -92,34 +90,40 @@ def _prediction_for_head(model, head: str, z: np.ndarray) -> tuple[np.ndarray, n
     else: proba = model.predict_nonnegative(z).astype(np.float64)
     return logits, proba
 
-def _feature_dataset_summary(n: int, nf: int, names: tuple[str, ...], idx: np.ndarray, ts: np.ndarray, decision_schedule: dict, replay_start: int) -> dict[str, object]:
-    return {"num_decisions": n, "num_features": nf, "feature_names": list(names), "first_decision_event_index": int(idx[0]) if n else None, "last_decision_event_index": int(idx[-1]) if n else None, "first_decision_local_ts_us": int(ts[0]) if n else None, "last_decision_local_ts_us": int(ts[-1]) if n else None, "decision_schedule": dict(decision_schedule), "replay_start_event_index": replay_start, "start_event_index": int(idx[0]) if n else replay_start}
+def _feature_dataset_summary(n: int, nf: int, names: tuple[str, ...], idx: np.ndarray, ts: np.ndarray, seq: np.ndarray, decision_grid, replay_start: int) -> dict[str, object]:
+    return {"num_decisions": n, "num_features": nf, "feature_names": list(names), "first_decision_event_index": int(idx[0]) if n else None, "last_decision_event_index": int(idx[-1]) if n else None, "first_decision_local_ts_us": int(ts[0]) if n else None, "last_decision_local_ts_us": int(ts[-1]) if n else None, "first_decision_event_seq": int(seq[0]) if n else None, "last_decision_event_seq": int(seq[-1]) if n else None, "decision_grid_schema": decision_grid.metadata.schema, "decision_grid_hash": decision_grid.decision_grid_hash, "decision_grid_n_rows": decision_grid.n_rows, "decision_schedule": dict(decision_grid.decision_schedule), "replay_start_event_index": replay_start, "start_event_index": int(idx[0]) if n else replay_start}
 
 def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAuditConfig) -> dict[str, object]:
     if not isinstance(config, LinearExecutionFeatureAuditConfig): raise ValueError("config must be LinearExecutionFeatureAuditConfig")
     tape = load_execution_tape(config.tape_root, mmap_mode=config.mmap_mode, validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY)
+    decision_grid = load_decision_grid(config.decision_grid_path)
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
     result = load_linear_train_result(config.linear_train_result_json)
+    if result.decision_grid_hash != decision_grid.decision_grid_hash:
+        raise ValueError("linear_train_result decision_grid_hash does not match decision_grid")
     bundle = linear_model_bundle_from_train_result(result); states = linear_preprocess_states_from_train_result(result)
     work_root = (Path(config.work_dir) if config.work_dir is not None else Path(config.tape_root)) / "linear_execution_feature_audit_work"
     if work_root.exists(): shutil.rmtree(work_root)
     work_root.mkdir(parents=True, exist_ok=True)
     names = execution_linear_feature_names(); nf = len(names)
-    idx_parts=[]; ts_parts=[]; n=0
+    idx_parts=[]; ts_parts=[]; seq_parts=[]; n=0
     feature_path = work_root / "features.npy"
     # first stream to chunk files, then concatenate into a single memmap without ever making a float64 matrix
     chunks=[]
-    for c in iter_execution_linear_feature_chunks(tape, schedule_config=schedule_config_from_train_result(result), start_event_index=config.start_event_index, max_decisions=config.max_decisions, chunk_rows=config.chunk_rows, transform_config=transform_config_from_train_result(result)):
+    for c in iter_execution_linear_feature_chunks_for_decision_grid(tape, decision_grid=decision_grid, chunk_rows=config.chunk_rows, transform_config=transform_config_from_train_result(result)):
         path = work_root / f"chunk_{len(chunks):06d}.npy"; np.save(path, c.features); chunks.append(path); idx_parts.append(c.decision_event_index); ts_parts.append(c.decision_local_ts_us); n += c.features.shape[0]
+        seq_parts.append(decision_grid.decision_event_seq[np.searchsorted(decision_grid.decision_event_index, c.decision_event_index)])
     feats = np.lib.format.open_memmap(feature_path, mode="w+", dtype=np.float32, shape=(n, nf)); pos=0
     for path in chunks:
-        arr=np.load(path, mmap_mode="r"); feats[pos:pos+arr.shape[0]] = arr; pos += arr.shape[0]; path.unlink(missing_ok=True)
+        arr=np.load(path); feats[pos:pos+arr.shape[0]] = arr; pos += arr.shape[0]; path.unlink(missing_ok=True)
     feats.flush(); del feats
     features = np.load(feature_path, mmap_mode="r")
     decision_idx = np.concatenate(idx_parts) if idx_parts else np.asarray([], dtype=np.int64)
     decision_ts = np.concatenate(ts_parts) if ts_parts else np.asarray([], dtype=np.int64)
+    decision_seq = np.concatenate(seq_parts) if seq_parts else np.asarray([], dtype=np.int64)
     signals_summary = None
     if config.linear_signals_npz is not None and Path(config.linear_signals_npz).exists():
-        artifact = load_linear_signal_artifact_npz(config.linear_signals_npz, mmap_mode=config.mmap_mode); signals_summary = linear_signal_artifact_summary(artifact, path=config.linear_signals_npz)
+        artifact = load_linear_signal_artifact_npz(config.linear_signals_npz, mmap_mode=config.mmap_mode); validate_linear_signals_for_decision_grid(artifact, decision_grid); signals_summary = linear_signal_artifact_summary(artifact, path=config.linear_signals_npz)
     per_head={}; all_missing=set(); all_extra=set(); warnings=[]; name_to_idx={name:i for i,name in enumerate(names)}
     for head in lm.MODEL_HEADS:
         state=states[head]; model=_head_model(bundle, head); missing=[c for c in state.feature_columns if c not in name_to_idx]; extra=[c for c in names if c not in state.feature_columns]
@@ -146,8 +150,8 @@ def audit_linear_execution_features_from_config(config: LinearExecutionFeatureAu
         if any(float(v)>0.01 for v in clip_frac.values()): warnings.append("high_clip_fraction")
     no_move_stats = per_head.get(lm.NO_MOVE_HEAD, {}).get("prediction_stats", {}) if isinstance(per_head.get(lm.NO_MOVE_HEAD), Mapping) else {}
     if isinstance(no_move_stats, Mapping) and ((no_move_stats.get("mean") is not None and float(no_move_stats["mean"]) > 0.98) or (no_move_stats.get("p01") is not None and float(no_move_stats["p01"]) > 0.95)): warnings.append("p_no_move_collapsed")
-    manifest=tape.manifest; replay_start=0 if config.start_event_index is None else config.start_event_index
-    payload={"status": "ok" if not warnings else "warning", "run_type": "audit_linear_execution_features", "config": asdict(config), "tape": {"schema": manifest.schema, "exchange": manifest.exchange, "symbol": manifest.symbol, "num_events": manifest.num_events, "num_l2_batches": manifest.num_l2_batches, "num_trades": manifest.num_trades, "start_local_ts_us": manifest.start_local_ts_us, "end_local_ts_us": manifest.end_local_ts_us}, "linear_train_result": {"schema": result.schema, "dataset_id": result.dataset_id, "manifest_hash": result.manifest_hash, "splits": {k:v.as_dict() for k,v in result.splits.items()}, "selection_summary": result.selection_summary}, "linear_signals": signals_summary, "feature_dataset": _feature_dataset_summary(n,nf,names,decision_idx,decision_ts,dict(result.decision_schedule),replay_start), "per_head": per_head, "combined": {"feature_schema_match": not all_missing, "missing_features": sorted(all_missing), "extra_features": sorted(all_extra), "shared_feature_count": len(set(names)-all_missing), "warnings": sorted(set(warnings))}, "warnings": sorted(set(warnings)), "resource_mode": {"chunked_features": True, "quantile_mode": config.quantile_mode, "chunk_rows": config.chunk_rows, "work_dir": str(work_root)}}
+    manifest=tape.manifest; replay_start=0
+    payload={"status": "ok" if not warnings else "warning", "run_type": "audit_linear_execution_features", "config": asdict(config), "tape": {"schema": manifest.schema, "exchange": manifest.exchange, "symbol": manifest.symbol, "num_events": manifest.num_events, "num_l2_batches": manifest.num_l2_batches, "num_trades": manifest.num_trades, "start_local_ts_us": manifest.start_local_ts_us, "end_local_ts_us": manifest.end_local_ts_us}, "decision_grid": {"schema": decision_grid.metadata.schema, "hash": decision_grid.decision_grid_hash, "n_rows": decision_grid.n_rows, "path": config.decision_grid_path}, "linear_train_result": {"schema": result.schema, "dataset_id": result.dataset_id, "manifest_hash": result.manifest_hash, "decision_grid_hash": result.decision_grid_hash, "splits": {k:v.as_dict() for k,v in result.splits.items()}, "selection_summary": result.selection_summary}, "linear_signals": signals_summary, "feature_dataset": _feature_dataset_summary(n,nf,names,decision_idx,decision_ts,decision_seq,decision_grid,replay_start), "per_head": per_head, "combined": {"feature_schema_match": not all_missing, "missing_features": sorted(all_missing), "extra_features": sorted(all_extra), "shared_feature_count": len(set(names)-all_missing), "warnings": sorted(set(warnings))}, "warnings": sorted(set(warnings)), "resource_mode": {"chunked_features": True, "quantile_mode": config.quantile_mode, "chunk_rows": config.chunk_rows, "work_dir": str(work_root)}}
     if config.output_json is not None:
         path=Path(config.output_json); path.parent.mkdir(parents=True, exist_ok=True); tmp=path.with_suffix(path.suffix+".tmp"); tmp.write_text(json.dumps(payload, sort_keys=True, indent=2, allow_nan=False)+"\n", encoding="utf-8"); tmp.replace(path)
     else: json.dumps(payload, allow_nan=False)

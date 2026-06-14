@@ -36,9 +36,13 @@ def _assert_default_env(env_config):
 
 
 def test_execution_cli_defaults_match_core_conservative_latency_reward():
-    audit = ExecutionSimAuditConfig(tape_root="/tmp/tape")
-    train = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape")
-    evaluate = ExecutionPolicyEvaluationCLIConfig(tape_root="/tmp/tape", checkpoint_path="/tmp/ckpt.pt")
+    audit = ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid")
+    train = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid")
+    evaluate = ExecutionPolicyEvaluationCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        checkpoint_path="/tmp/ckpt.pt",
+    )
 
     assert audit.queue_mode == QueueModelMode.CONSERVATIVE
     assert train.queue_mode == QueueModelMode.CONSERVATIVE
@@ -121,6 +125,7 @@ def test_removed_min_distance_ticks_flag_is_rejected_by_execution_parsers():
 
 
 def test_post_only_gap_ticks_flag_is_accepted_by_execution_parsers():
-    assert audit_arg_parser().parse_args(["--tape-root", "/tmp/tape", "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
-    assert train_arg_parser().parse_args(["--tape-root", "/tmp/tape", "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
-    assert eval_arg_parser().parse_args(["--tape-root", "/tmp/tape", "--checkpoint-path", "/tmp/c.pt", "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
+    grid_arg = ["--decision-grid", "/tmp/tape/decision_grid"]
+    assert audit_arg_parser().parse_args(["--tape-root", "/tmp/tape", *grid_arg, "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
+    assert train_arg_parser().parse_args(["--tape-root", "/tmp/tape", *grid_arg, "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
+    assert eval_arg_parser().parse_args(["--tape-root", "/tmp/tape", *grid_arg, "--checkpoint-path", "/tmp/c.pt", "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2

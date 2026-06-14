@@ -11,6 +11,11 @@ from mmrt.execution.adverse_signal import (
     load_adverse_selection_model,
     require_adverse_targets_for_executable_edge,
 )
+from tests.grid_helpers import grid_lineage_fields
+
+
+def _grid_kwargs(n_rows: int = 1):
+    return grid_lineage_fields(n_rows=n_rows)
 
 
 def _artifact():
@@ -25,6 +30,7 @@ def _artifact():
         config_json="{}",
         exchange="x",
         symbol="y",
+        **_grid_kwargs(),
     )
 
 
@@ -38,10 +44,10 @@ def test_adverse_model_roundtrip_and_clipping(tmp_path):
     assert pred["bid_touch_toxic_cost_bps"].tolist() == [0.0, 0.0]
 
 
-def test_adverse_model_rejects_old_schema_and_missing_edge_targets():
+def test_adverse_model_requires_current_schema_and_edge_targets():
     with pytest.raises(ValueError):
         AdverseSelectionModelArtifact(
-            schema="mmrt_adverse_selection_ridge",
+            schema="not_current",
             feature_names=("x",),
             target_names=("bid_touch_filled",),
             feature_mean=np.array([0.0]),
@@ -51,6 +57,7 @@ def test_adverse_model_rejects_old_schema_and_missing_edge_targets():
             config_json="{}",
             exchange="x",
             symbol="y",
+            **_grid_kwargs(),
         )
     with pytest.raises(ValueError, match="missing adverse-selection targets"):
         require_adverse_targets_for_executable_edge(("bid_touch_filled",), ("touch",))
@@ -64,6 +71,7 @@ def test_adverse_signal_artifact_rejects_missing_prediction_key():
             decision_event_seq=np.array([2**31 - 1], dtype=np.int64),
             target_names=("bid_touch_filled",),
             predictions={},
+            **_grid_kwargs(),
         )
 
 
@@ -76,6 +84,7 @@ def test_adverse_signal_artifact_rejects_non_mapping_predictions():
             decision_event_seq=np.array([0], dtype=np.int64),
             target_names=("bid_touch_filled",),
             predictions=[],  # type: ignore[arg-type]
+            **_grid_kwargs(),
         )
 
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
@@ -90,6 +99,10 @@ def test_load_adverse_selection_signals_rejects_missing_prediction_array(tmp_pat
         decision_event_index=np.array([0], dtype=np.int64),
         decision_event_seq=np.array([0], dtype=np.int64),
         target_names=np.asarray(["bid_touch_filled"], dtype=object),
+        decision_grid_schema=np.array(_grid_kwargs()["decision_grid_schema"]),
+        decision_grid_hash=np.array(_grid_kwargs()["decision_grid_hash"]),
+        decision_grid_n_rows=np.array(1, dtype=np.int64),
+        decision_schedule=np.array("{}"),
     )
     with pytest.raises(ValueError, match="missing prediction arrays"):
         load_adverse_selection_signals(path)
@@ -114,6 +127,7 @@ def test_build_adverse_selection_signal_artifact_accepts_feature_dataset():
         feature_names=("x",),
         features=np.array([[1.0]], dtype=np.float32),
         config=AdverseSelectionConfig(),
+        **_grid_kwargs(),
     )
     signals = build_adverse_selection_signal_artifact(dataset, model)
     assert signals.decision_local_ts_us.tolist() == [100]
@@ -145,11 +159,11 @@ def test_save_adverse_selection_signals_arrays_matches_existing_artifact_writer_
             "bid_touch_toxic_cost_bps": np.array([1.0, 2.0], dtype=np.float32),
         },
     )
-    artifact = AdverseSelectionSignalArtifact(schema=ADVERSE_SELECTION_SIGNALS_SCHEMA, **kwargs)
+    artifact = AdverseSelectionSignalArtifact(schema=ADVERSE_SELECTION_SIGNALS_SCHEMA, **kwargs, **_grid_kwargs(n_rows=2))
     old_path = tmp_path / "old.npz"
     new_path = tmp_path / "new.npz"
     save_adverse_selection_signals(old_path, artifact)
-    save_adverse_selection_signals_arrays(new_path, **kwargs, validate_chunk_rows=1)
+    save_adverse_selection_signals_arrays(new_path, **kwargs, **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
     old = load_adverse_selection_signals(old_path)
     new = load_adverse_selection_signals(new_path)
     np.testing.assert_array_equal(new.decision_local_ts_us, old.decision_local_ts_us)
@@ -167,5 +181,6 @@ def test_save_adverse_selection_signals_arrays_validates_probability_bounds_chun
             decision_event_seq=np.array([0, 0], dtype=np.int64),
             target_names=("bid_touch_filled",),
             predictions={"bid_touch_filled": np.array([0.5, 1.5], dtype=np.float32)},
+            **_grid_kwargs(n_rows=2),
             validate_chunk_rows=1,
         )

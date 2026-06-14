@@ -1,4 +1,4 @@
-import inspect
+﻿import inspect
 import json
 from pathlib import Path
 from decimal import Decimal
@@ -14,13 +14,13 @@ from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.queue_model import QueueModelConfig
+from mmrt.execution.decision_grid import save_decision_grid
 from mmrt.execution.adverse_selection import (
     AdverseSelectionConfig,
     CounterfactualQuoteConfig,
     KyleLambdaConfig,
     VPINConfig,
     VPINState,
-    build_adverse_selection_dataset,
     summarize_adverse_selection_dataset,
 )
 from mmrt.cli.train_adverse_selection import (
@@ -31,6 +31,8 @@ from mmrt.cli.train_adverse_selection import (
     main,
     run_adverse_selection_training,
 )
+from tests.grid_helpers import decision_grid_for_tape
+from tests.adverse_helpers import build_tiny_adverse_selection_dataset
 
 
 
@@ -124,6 +126,7 @@ def _tape(l2_events, trades):
 def _save_tape(tmp_path, tape):
     root = tmp_path / "tape"
     save_execution_tape(tape, root, overwrite=True)
+    save_decision_grid(root / "decision_grid", decision_grid_for_tape(tape), overwrite=True)
     return root
 
 
@@ -139,10 +142,13 @@ def _label_mask(dataset, name, row=0):
     return bool(dataset.label_masks[row, dataset.label_names.index(name)])
 
 
+_TEST_MAX_DECISIONS_BY_CONFIG_ID: dict[int, int | None] = {}
+
+
 def _base_config(**kwargs):
+    kwargs.pop("decision_interval_us", None)
+    max_decisions = kwargs.pop("max_decisions", 1)
     params = dict(
-        decision_interval_us=100,
-        max_decisions=1,
         flow_windows_us=(200,),
         kyle=KyleLambdaConfig(sample_interval_us=100, response_horizon_us=100, windows_us=(200,), min_samples=1),
         quote=CounterfactualQuoteConfig(
@@ -155,7 +161,14 @@ def _base_config(**kwargs):
         drop_incomplete_horizon=True,
     )
     params.update(kwargs)
-    return AdverseSelectionConfig(**params)
+    config = AdverseSelectionConfig(**params)
+    _TEST_MAX_DECISIONS_BY_CONFIG_ID[id(config)] = max_decisions
+    return config
+
+
+def build_adverse_selection_dataset(tape, *, config, tmp_path):
+    max_rows = _TEST_MAX_DECISIONS_BY_CONFIG_ID.get(id(config), 1)
+    return build_tiny_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path, max_rows=max_rows)
 
 
 def test_vpin_fractional_bucket_splitting():
@@ -167,19 +180,19 @@ def test_vpin_fractional_bucket_splitting():
     assert state.vpin() == pytest.approx(1.0)
 
 
-def test_counterfactual_bid_fills_by_trade_at_level_after_queue_consumed():
+def test_counterfactual_bid_fills_by_trade_at_level_after_queue_consumed(tmp_path):
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=1_300_000, bid_ticks=(990, 989), ask_ticks=(992, 993))],
         [_trade(local_ts_us=200, side=AggressorSide.SELL, price_tick=1000, amount=2.0, source_row=0)],
     )
-    dataset = build_adverse_selection_dataset(tape, config=_base_config())
+    dataset = build_adverse_selection_dataset(tape, config=_base_config(), tmp_path=tmp_path)
     assert dataset.num_decisions == 1
     assert _label_value(dataset, "bid_touch_filled") == 1.0
     assert _label_value(dataset, "bid_touch_fill_latency_us") > 0.0
     assert _label_mask(dataset, "bid_touch_adverse_bps") is True
 
 
-def test_disappeared_visible_level_advances_queue_then_later_trade_fills():
+def test_disappeared_visible_level_advances_queue_then_later_trade_fills(tmp_path):
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -197,12 +210,12 @@ def test_disappeared_visible_level_advances_queue_then_later_trade_fills():
             latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0),
         )
     )
-    dataset = build_adverse_selection_dataset(tape, config=config)
+    dataset = build_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path)
     assert _label_value(dataset, "bid_touch_filled") == 1.0
     assert _label_value(dataset, "bid_touch_fill_latency_us") == 200.0
 
 
-def test_conservative_mode_does_not_advance_queue_on_l2_disappearance():
+def test_conservative_mode_does_not_advance_queue_on_l2_disappearance(tmp_path):
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -219,27 +232,27 @@ def test_conservative_mode_does_not_advance_queue_on_l2_disappearance():
             queue_model=QueueModelConfig(mode=QueueModelMode.CONSERVATIVE),
         )
     )
-    dataset = build_adverse_selection_dataset(tape, config=config)
+    dataset = build_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path)
     assert _label_value(dataset, "bid_touch_filled") == 0.0
 
 
-def test_label_masks_for_incomplete_horizon():
+def test_label_masks_for_incomplete_horizon(tmp_path):
     tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
-    drop_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=True))
+    drop_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=True), tmp_path=tmp_path)
     assert drop_dataset.num_decisions == 0
 
-    keep_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=False))
+    keep_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=False), tmp_path=tmp_path)
     assert keep_dataset.num_decisions == 1
     assert _label_mask(keep_dataset, "bid_touch_filled") is False
     assert _label_mask(keep_dataset, "ask_touch_filled") is False
 
 
-def test_dataset_shape_and_summary():
+def test_dataset_shape_and_summary(tmp_path):
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=1_300_000)],
         [_trade(local_ts_us=200, side=AggressorSide.SELL, price_tick=1000, amount=2.0, source_row=0)],
     )
-    dataset = build_adverse_selection_dataset(tape, config=_base_config())
+    dataset = build_adverse_selection_dataset(tape, config=_base_config(), tmp_path=tmp_path)
     assert dataset.features.dtype == np.float32
     assert dataset.labels.dtype == np.float32
     assert dataset.label_masks.dtype == np.bool_
@@ -283,11 +296,10 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     summary = run_adverse_selection_training(
         AdverseSelectionTrainCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(output_json),
             model_npz=str(model_npz),
             overwrite=True,
-            decision_interval_us=100,
-            max_decisions=10,
             fill_horizon_us=1_000,
             adverse_horizon_us=1_000,
             order_qty=1.0,
@@ -304,7 +316,7 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     assert summary["baseline"]["enabled"] is True
     if model_npz.exists():
         npz = np.load(model_npz, allow_pickle=True)
-        assert str(npz["schema"]) == "mmrt_adverse_selection_ridge_v2"
+        assert str(npz["schema"]) == "mmrt_adverse_selection_ridge_grid_v1"
         assert "feature_mean" in npz
         assert "coefficients" in npz
 
@@ -317,11 +329,10 @@ def test_adverse_selection_all_unknown_targets_preserves_skip_reasons(tmp_path):
     summary = run_adverse_selection_training(
         AdverseSelectionTrainCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(output_json),
             model_npz=str(model_npz),
             overwrite=True,
-            decision_interval_us=100,
-            max_decisions=10,
             fill_horizon_us=1_000,
             adverse_horizon_us=1_000,
             order_qty=1.0,
@@ -358,11 +369,10 @@ def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tm
     summary = run_adverse_selection_training(
         AdverseSelectionTrainCLIConfig(
             tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(output_json),
             model_npz=str(model_npz),
             overwrite=True,
-            decision_interval_us=100,
-            max_decisions=1,
             fill_horizon_us=1_000,
             adverse_horizon_us=1_000,
             order_qty=1.0,
@@ -377,12 +387,12 @@ def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tm
 
     baseline = summary["baseline"]
     assert baseline["skipped"] is True
-    assert baseline["skip_reason"] == "not_enough_decisions"
+    assert baseline["skip_reason"] == "all_targets_skipped"
     assert baseline["fitted_target_count"] == 0
     assert baseline["requested_target_count"] == 2
     assert set(baseline["targets"]) == {"bid_touch_filled", "ask_touch_filled"}
-    assert baseline["targets"]["bid_touch_filled"]["skip_reason"] == "not_enough_decisions"
-    assert baseline["targets"]["ask_touch_filled"]["skip_reason"] == "not_enough_decisions"
+    assert baseline["targets"]["bid_touch_filled"]["skip_reason"] == "not_enough_train_rows"
+    assert baseline["targets"]["ask_touch_filled"]["skip_reason"] == "not_enough_train_rows"
 
 
 def test_train_adverse_selection_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -391,11 +401,10 @@ def test_train_adverse_selection_main_writes_summary_and_prints_json(tmp_path, c
     model_npz = tmp_path / "model.npz"
     rc = main([
         "--tape-root", str(tape_root),
+        "--decision-grid", str(tape_root / "decision_grid"),
         "--output-json", str(output_json),
         "--model-npz", str(model_npz),
         "--overwrite",
-        "--decision-interval-us", "100",
-        "--max-decisions", "10",
         "--fill-horizon-us", "1000",
         "--adverse-horizon-us", "1000",
         "--order-qty", "1.0",
@@ -415,30 +424,36 @@ def test_train_adverse_selection_overwrite_guard(tmp_path):
     model_npz.write_bytes(b"exists")
     with pytest.raises(FileExistsError):
         run_adverse_selection_training(
-            AdverseSelectionTrainCLIConfig(tape_root=str(tape_root), output_json=str(output_json), model_npz=str(model_npz))
+            AdverseSelectionTrainCLIConfig(
+                tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
+                output_json=str(output_json),
+                model_npz=str(model_npz),
+            )
         )
 
 
 def test_quote_candidate_parser_rejects_malformed_offsets():
     with pytest.raises(ValueError, match="malformed quote candidate"):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates="inside_x")
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", quote_candidates="inside_x")
     with pytest.raises(ValueError, match="malformed quote candidate"):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates="away_0")
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", quote_candidates="away_0")
 
 
 def test_quote_candidate_parser_rejects_duplicate_names():
     with pytest.raises(ValueError, match="duplicate quote candidate"):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates="touch,touch")
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", quote_candidates="touch,touch")
 
 
 def test_quote_candidate_parser_validates_sequence_values():
     with pytest.raises(ValueError, match="QuoteCandidateConfig"):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", quote_candidates=("touch",))  # type: ignore[arg-type]
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", quote_candidates=("touch",))  # type: ignore[arg-type]
 
 
 def test_train_adverse_selection_config_wires_latency_to_counterfactual_config():
     cfg = AdverseSelectionTrainCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/grid",
         decision_compute_latency_us=7,
         order_entry_latency_us=11,
     )
@@ -451,6 +466,8 @@ def test_train_adverse_selection_parser_accepts_latency_args():
     args = build_arg_parser().parse_args([
         "--tape-root",
         "/tmp/tape",
+        "--decision-grid",
+        "/tmp/grid",
         "--decision-compute-latency-us",
         "7",
         "--order-entry-latency-us",
@@ -463,13 +480,14 @@ def test_train_adverse_selection_parser_accepts_latency_args():
 
 def test_adverse_selection_schema_constant_is_direct_string():
     source = Path("mmrt/execution/adverse_signal.py").read_text(encoding="utf-8")
-    assert 'ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_v2"' in source
+    assert 'ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_grid_v1"' in source
     assert '"mmrt_adverse_selection_ridge" + "_" + "v" + "2"' not in source
 
 
 def test_config_parses_windows_queue_mode_and_targets():
     cfg = AdverseSelectionTrainCLIConfig(
         tape_root="/tmp/tape",
+        decision_grid_path="/tmp/grid",
         flow_windows_us="100,200",
         kyle_windows_us="1000,2000",
         queue_mode="balanced",
@@ -480,13 +498,13 @@ def test_config_parses_windows_queue_mode_and_targets():
     assert cfg.queue_mode == QueueModelMode.BALANCED
     assert cfg.target_names == ("bid_touch_filled", "ask_touch_filled")
     with pytest.raises(ValueError):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", train_fraction=1.0)
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", train_fraction=1.0)
     with pytest.raises(ValueError):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", l2_decrease_weight=1.1)
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", l2_decrease_weight=1.1)
     with pytest.raises(ValueError):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", target_names="bid_touch_filled,")
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", target_names="bid_touch_filled,")
     with pytest.raises(ValueError):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", order_entry_latency_us=-1)
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", order_entry_latency_us=-1)
 
 
 def test_adverse_selection_modules_do_not_import_forbidden_layers():
@@ -526,35 +544,21 @@ def test_adverse_selection_modules_do_not_import_forbidden_layers():
     ):
         assert forbidden not in cli_source
 
-from mmrt.execution.adverse_selection import _TradeFlowView, _flow_between_keys, _future_mid_tick_at_or_after_key, _valid_l2_view_from_tape
+from mmrt.execution.adverse_selection_index import ValidL2Index
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
 
 def test_kyle_future_mid_uses_last_l2_at_same_timestamp():
-    tape = _tape(
-        [
-            _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
-            _l2(seq=1, local_ts_us=200, bid_ticks=(1010,), bid_sizes=(1.0,), ask_ticks=(1012,), ask_sizes=(1.0,)),
-            _l2(seq=2, local_ts_us=200, bid_ticks=(1020,), bid_sizes=(1.0,), ask_ticks=(1022,), ask_sizes=(1.0,)),
-        ],
-        [],
+    index = ValidL2Index(
+        local_ts_us=np.asarray([100, 200, 200], dtype=np.int64),
+        event_seq=np.asarray([0, 1, 2], dtype=np.int64),
+        mid_tick=np.asarray([1001.0, 1011.0, 1021.0], dtype=np.float32),
     )
-    view = _valid_l2_view_from_tape(tape)
-    assert _future_mid_tick_at_or_after_key(view, EventKey(200, MAX_EVENT_SEQ)) == pytest.approx(1021.0)
-    assert _future_mid_tick_at_or_after_key(view, EventKey(200, 1)) == pytest.approx(1011.0)
+    assert index.future_mid_tick_at_or_after(EventKey(200, MAX_EVENT_SEQ)) == pytest.approx(1021.0)
+    assert index.future_mid_tick_at_or_after(EventKey(200, 1)) == pytest.approx(1011.0)
 
 
-def test_kyle_flow_between_keys_excludes_start_and_includes_end():
-    view = _TradeFlowView(
-        local_ts_us=np.asarray([100, 100, 200], dtype=np.int64),
-        event_seq=np.asarray([1, 2, 0], dtype=np.int64),
-        cumulative_flow=np.asarray([0.0, 10.0, 15.0, 12.0], dtype=np.float64),
-    )
-    assert _flow_between_keys(view, EventKey(100, 1), EventKey(200, 0)) == pytest.approx(2.0)
-    assert _flow_between_keys(view, EventKey(100, 2), EventKey(200, 0)) == pytest.approx(-3.0)
-
-
-def test_kyle_samples_become_ready_for_dataset_features():
+def test_kyle_samples_become_ready_for_dataset_features(tmp_path):
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -576,7 +580,7 @@ def test_kyle_samples_become_ready_for_dataset_features():
         ),
         drop_incomplete_horizon=False,
     )
-    dataset = build_adverse_selection_dataset(tape, config=config)
+    dataset = build_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path)
     idx = dataset.feature_names.index("kyle_n_1ms")
     assert dataset.num_decisions >= 2
     assert dataset.features[-1, idx] >= 1.0
@@ -584,7 +588,7 @@ def test_kyle_samples_become_ready_for_dataset_features():
 
 def test_labels_for_decision_does_not_recompute_label_names():
     source = Path("mmrt/execution/adverse_selection.py").read_text()
-    body = source.split("def _labels_for_decision", 1)[1].split("def build_adverse_selection_feature_dataset", 1)[0]
+    body = source.split("def _labels_for_decision", 1)[1].split("class _AdverseFeatureRow", 1)[0]
     assert "adverse_selection_label_names(config)" not in body
 
 

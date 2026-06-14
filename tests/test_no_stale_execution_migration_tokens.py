@@ -37,7 +37,7 @@ def test_no_stale_fill_sim_trade_timestamp_fill_path_removed():
     assert "local_ts_us=trade.local_ts_us" not in text
 
 
-def test_no_stale_execution_migration_tokens_in_production():
+def test_no_stale_execution_tokens_in_production():
     offenders = []
     for path in PRODUCTION_ROOT.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
@@ -85,7 +85,7 @@ def test_no_stale_adverse_selection_npz_writer():
     assert "np.savez(f" not in source
 
 
-def test_no_legacy_adverse_selection_quote_distance_paths():
+def test_no_adverse_selection_quote_distance_paths():
     production_paths = [
         Path("mmrt/execution/adverse_selection.py"),
         Path("mmrt/cli/train_adverse_selection.py"),
@@ -197,10 +197,10 @@ def test_train_execution_ppo_default_linear_signal_filename_has_builder_cli():
     assert "save_linear_signal_artifact_npz" not in source
 
 
-def test_execution_env_default_reset_uses_linear_signal_first_row():
+def test_execution_env_default_reset_uses_decision_grid_first_row():
     source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
     reset_body = source.split("def reset(", 1)[1].split("def step(", 1)[0]
-    assert "self.linear_signals.decision_event_index[0]" in reset_body
+    assert "self.decision_grid.decision_event_index[0]" in reset_body
     assert "start = 0" not in reset_body
 
 
@@ -216,17 +216,16 @@ def test_build_linear_signals_cli_does_not_recompute_predictions_for_summary():
 def test_linear_signal_builder_streaming_path_has_no_scan_replay():
     source = Path("mmrt/execution/linear_signal_builder.py").read_text(encoding="utf-8")
     body = source.split("def build_linear_signal_artifact_npz_from_execution_feature_chunks", 1)[1].split("__all__", 1)[0]
-    assert body.count("iter_execution_linear_feature_chunks(") == 1
+    assert body.count("iter_execution_linear_feature_chunks_for_decision_grid(") == 1
     assert "_scan_execution_linear_feature_chunks" not in source
     assert "NpyChunkWriter" in source
 
 
-def test_deprecated_execution_linear_feature_dataset_has_no_chunk_list_vstack_path():
+def test_schedule_based_execution_linear_feature_dataset_path_is_removed():
     source = Path("mmrt/execution/linear_signal_builder.py").read_text(encoding="utf-8")
-    body = source.split("def build_execution_linear_feature_dataset", 1)[1].split("@dataclass", 1)[0]
-    assert "DeprecationWarning" in body
-    assert "chunks = list" not in body
-    assert "np.vstack" not in body
+    assert "def build_execution_linear_feature_dataset" not in source
+    assert "def iter_execution_linear_feature_chunks(" not in source
+    assert "schedule_config_from_train_result" not in source
 
 
 def test_execution_clis_validate_linear_metadata_with_artifact_start_only():
@@ -240,24 +239,20 @@ def test_execution_clis_validate_linear_metadata_with_artifact_start_only():
         assert "_effective_start_event_index" not in text
 
 
-def test_env_computes_signal_end_before_reward_step():
+def test_env_computes_grid_end_before_reward_step():
     source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
     step_body = source.split("def step(", 1)[1].split("def _event_key_at_index", 1)[0]
-    assert step_body.find("terminal_due_to_signal_end") < step_body.find("compute_reward_step(")
+    assert step_body.find("terminal_due_to_grid_end") < step_body.find("compute_reward_step(")
 
 
-def test_execution_env_nonterminal_step_targets_next_linear_signal_row():
+def test_execution_env_nonterminal_step_targets_next_decision_grid_row():
     source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
     step_body = source.split("def step(", 1)[1].split("def _event_key_at_index", 1)[0]
 
     assert "target_event_index" in step_body
-    assert "self.linear_signals.decision_event_index[next_signal_row]" in step_body
-    assert "_validate_next_signal_target" in source
-
-    fallback_body = source.split("def _fallback", 1)[1] if "def _fallback" in source else ""
-    old_token = "processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us"
-    if old_token in step_body:
-        assert old_token in fallback_body
+    assert "self.decision_grid.decision_event_index[next_decision_row]" in step_body
+    assert "_validate_next_grid_target" in source
+    assert "def _fallback" not in source
 
 
 def test_build_execution_tape_cli_uses_streaming_writer_not_materialized_plan():

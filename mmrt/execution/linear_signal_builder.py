@@ -14,18 +14,17 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import shutil
-import tempfile
 from typing import Iterator, Mapping
-import warnings
 
 import numpy as np
 
 from mmrt.execution.execution_tape import ExecutionTape
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
+from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
 from mmrt.execution.feature_replay import (
     DecisionFeatureChunk,
     decision_feature_column_names,
-    iter_decision_feature_chunks,
+    iter_decision_feature_chunks_for_decision_grid,
 )
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -40,9 +39,10 @@ from mmrt.execution.linear_signal import (
     predictions_to_signal_arrays,
     save_linear_signal_artifact_arrays,
     validate_linear_signal_artifact_metadata,
+    validate_linear_signals_for_decision_grid,
 )
 from mmrt.features.pipeline import FeaturePipelineConfig
-from mmrt.features.schedule import DecisionScheduleConfig, decision_schedule_config_from_dict
+from mmrt.features.schedule import decision_schedule_config_from_dict
 from mmrt.features.transforms import TransformConfig, transform_config_from_dict
 from mmrt.linear import models as lm
 from mmrt.linear import preprocess as pp
@@ -66,6 +66,12 @@ def _require_nonnegative_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative int")
     return value
+
+
+def _require_nonempty_str(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
 
 
 def _require_output_dtype(value: str) -> str:
@@ -118,31 +124,40 @@ def _close_memmap(arr: np.ndarray) -> None:
 class ExecutionLinearFeatureDataset:
     decision_event_index: np.ndarray
     decision_local_ts_us: np.ndarray
+    decision_event_seq: np.ndarray
     features: np.ndarray
     feature_names: tuple[str, ...]
     replay_start_event_index: int
     start_event_index: int
+    decision_grid_schema: str
+    decision_grid_hash: str
+    decision_grid_n_rows: int
     decision_schedule: dict[str, object]
     transform_config: dict[str, object]
 
     def __post_init__(self) -> None:
         event_idx = np.ascontiguousarray(np.asarray(self.decision_event_index, dtype=np.int64))
         local_ts = np.ascontiguousarray(np.asarray(self.decision_local_ts_us, dtype=np.int64))
+        event_seq = np.ascontiguousarray(np.asarray(self.decision_event_seq, dtype=np.int64))
         features = np.ascontiguousarray(np.asarray(self.features))
         if event_idx.ndim != 1:
             raise ValueError("decision_event_index must be rank-1")
         if local_ts.ndim != 1:
             raise ValueError("decision_local_ts_us must be rank-1")
+        if event_seq.ndim != 1:
+            raise ValueError("decision_event_seq must be rank-1")
         if features.ndim != 2:
             raise ValueError("features must be rank-2")
         if features.dtype not in (np.dtype("float32"), np.dtype("float64")):
             raise ValueError("features dtype must be float32 or float64")
-        if features.shape[0] != event_idx.shape[0] or features.shape[0] != local_ts.shape[0]:
+        if features.shape[0] != event_idx.shape[0] or features.shape[0] != local_ts.shape[0] or features.shape[0] != event_seq.shape[0]:
             raise ValueError("row count must match decision arrays")
         if event_idx.size and (event_idx < 0).any():
             raise ValueError("decision_event_index must be nonnegative")
         if local_ts.size and (local_ts <= 0).any():
             raise ValueError("decision_local_ts_us must be positive")
+        if event_seq.size and (event_seq < 0).any():
+            raise ValueError("decision_event_seq must be nonnegative")
         if event_idx.size > 1 and (np.diff(event_idx) <= 0).any():
             raise ValueError("decision_event_index must be strictly increasing")
         if local_ts.size > 1 and (np.diff(local_ts) <= 0).any():
@@ -161,10 +176,16 @@ class ExecutionLinearFeatureDataset:
                 raise ValueError("replay_start_event_index must be <= start_event_index")
         object.__setattr__(self, "decision_event_index", event_idx)
         object.__setattr__(self, "decision_local_ts_us", local_ts)
+        object.__setattr__(self, "decision_event_seq", event_seq)
         object.__setattr__(self, "features", features)
         object.__setattr__(self, "feature_names", names)
         object.__setattr__(self, "replay_start_event_index", replay_start)
         object.__setattr__(self, "start_event_index", start)
+        object.__setattr__(self, "decision_grid_schema", _require_nonempty_str(self.decision_grid_schema, "decision_grid_schema"))
+        object.__setattr__(self, "decision_grid_hash", _require_nonempty_str(self.decision_grid_hash, "decision_grid_hash"))
+        object.__setattr__(self, "decision_grid_n_rows", _require_positive_int(self.decision_grid_n_rows, "decision_grid_n_rows"))
+        if self.decision_grid_n_rows < features.shape[0]:
+            raise ValueError("decision_grid_n_rows must cover dataset rows")
         object.__setattr__(self, "decision_schedule", _coerce_decision_schedule_payload(self.decision_schedule))
         object.__setattr__(self, "transform_config", _coerce_transform_config_payload(self.transform_config))
 
@@ -188,6 +209,11 @@ def execution_linear_feature_dataset_summary(dataset: ExecutionLinearFeatureData
         "last_decision_event_index": int(dataset.decision_event_index[-1]) if dataset.num_decisions else None,
         "first_decision_local_ts_us": int(dataset.decision_local_ts_us[0]) if dataset.num_decisions else None,
         "last_decision_local_ts_us": int(dataset.decision_local_ts_us[-1]) if dataset.num_decisions else None,
+        "first_decision_event_seq": int(dataset.decision_event_seq[0]) if dataset.num_decisions else None,
+        "last_decision_event_seq": int(dataset.decision_event_seq[-1]) if dataset.num_decisions else None,
+        "decision_grid_schema": dataset.decision_grid_schema,
+        "decision_grid_hash": dataset.decision_grid_hash,
+        "decision_grid_n_rows": dataset.decision_grid_n_rows,
         "decision_schedule": dict(dataset.decision_schedule),
         "replay_start_event_index": dataset.replay_start_event_index,
         "start_event_index": dataset.start_event_index,
@@ -199,91 +225,30 @@ def execution_linear_feature_names() -> tuple[str, ...]:
     return decision_feature_column_names()
 
 
-def iter_execution_linear_feature_chunks(
+def iter_execution_linear_feature_chunks_for_decision_grid(
     tape: ExecutionTape,
     *,
-    schedule_config: DecisionScheduleConfig | None = None,
-    start_event_index: int | None = None,
-    max_decisions: int | None = None,
+    decision_grid: DecisionGrid,
+    transform_config: TransformConfig | None = None,
     chunk_rows: int = 100_000,
     output_dtype: str = "float32",
-    transform_config: TransformConfig | None = None,
 ) -> Iterator[ExecutionLinearFeatureChunk]:
+    if not isinstance(tape, ExecutionTape):
+        raise ValueError("tape must be ExecutionTape")
+    if not isinstance(decision_grid, DecisionGrid):
+        raise ValueError("decision_grid must be DecisionGrid")
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
+    transform = transform_config if transform_config is not None else TransformConfig()
     pipeline_config = FeaturePipelineConfig(
-        schedule=schedule_config if schedule_config is not None else DecisionScheduleConfig(),
-        transform=transform_config if transform_config is not None else TransformConfig(),
+        schedule=decision_schedule_config_from_dict(decision_grid.decision_schedule),
+        transform=transform,
     )
-    yield from iter_decision_feature_chunks(
+    yield from iter_decision_feature_chunks_for_decision_grid(
         tape,
+        decision_grid=decision_grid,
         pipeline_config=pipeline_config,
-        start_event_index=start_event_index,
-        max_decisions=max_decisions,
         chunk_rows=chunk_rows,
         output_dtype=_require_output_dtype(output_dtype),
-    )
-
-
-def build_execution_linear_feature_dataset(
-    tape: ExecutionTape,
-    *,
-    schedule_config: DecisionScheduleConfig | None = None,
-    start_event_index: int | None = None,
-    max_decisions: int | None = None,
-    chunk_rows: int = 100_000,
-    output_dtype: str = "float32",
-    transform_config: TransformConfig | None = None,
-) -> ExecutionLinearFeatureDataset:
-    warnings.warn(
-        "build_execution_linear_feature_dataset materializes the full feature matrix and is deprecated "
-        "for production signal builds; use iter_execution_linear_feature_chunks or "
-        "build_linear_signal_artifact_npz_from_execution_feature_chunks instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    schedule = schedule_config if schedule_config is not None else DecisionScheduleConfig()
-    transform = transform_config if transform_config is not None else TransformConfig()
-    chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
-    names = execution_linear_feature_names()
-    dtype = np.dtype(_require_output_dtype(output_dtype))
-    with tempfile.TemporaryDirectory(prefix="mmrt_linear_features_") as tmp:
-        chunk_dir = Path(tmp) / "chunks"
-        arrays_dir = Path(tmp) / "arrays"
-        writers = {
-            "decision_event_index": NpyChunkWriter("decision_event_index", np.int64, (), chunk_rows, chunk_dir),
-            "decision_local_ts_us": NpyChunkWriter("decision_local_ts_us", np.int64, (), chunk_rows, chunk_dir),
-            "features": NpyChunkWriter("features", dtype, (len(names),), chunk_rows, chunk_dir),
-        }
-        for chunk in iter_execution_linear_feature_chunks(
-            tape,
-            schedule_config=schedule,
-            start_event_index=start_event_index,
-            max_decisions=max_decisions,
-            chunk_rows=chunk_rows,
-            output_dtype=output_dtype,
-            transform_config=transform,
-        ):
-            if tuple(chunk.feature_names) != names:
-                raise ValueError("execution feature names changed during chunk replay")
-            writers["decision_event_index"].append_many(chunk.decision_event_index)
-            writers["decision_local_ts_us"].append_many(chunk.decision_local_ts_us)
-            writers["features"].append_many(chunk.features)
-        arrays_dir.mkdir(parents=True, exist_ok=True)
-        row_counts = {name: writer.finalize(arrays_dir / f"{name}.npy") for name, writer in writers.items()}
-        if len(set(row_counts.values())) != 1:
-            raise RuntimeError("linear feature chunk row count mismatch")
-        decision_event_index = np.load(arrays_dir / "decision_event_index.npy")
-        decision_local_ts_us = np.load(arrays_dir / "decision_local_ts_us.npy")
-        features = np.load(arrays_dir / "features.npy")
-    effective_start = int(decision_event_index[0]) if decision_event_index.size else (0 if start_event_index is None else int(start_event_index))
-    return ExecutionLinearFeatureDataset(
-        decision_event_index=decision_event_index,
-        decision_local_ts_us=decision_local_ts_us,
-        features=features,
-        feature_names=names,
-        replay_start_event_index=0 if start_event_index is None else int(start_event_index),
-        start_event_index=effective_start,
-        decision_schedule=schedule.as_dict(),
-        transform_config=transform.as_dict(),
     )
 
 
@@ -311,12 +276,6 @@ def transform_config_from_train_result(result: LinearTrainResult) -> TransformCo
     if not isinstance(result, LinearTrainResult):
         raise ValueError("result must be LinearTrainResult")
     return transform_config_from_dict(result.transform_config)
-
-
-def schedule_config_from_train_result(result: LinearTrainResult) -> DecisionScheduleConfig:
-    if not isinstance(result, LinearTrainResult):
-        raise ValueError("result must be LinearTrainResult")
-    return decision_schedule_config_from_dict(result.decision_schedule)
 
 
 def predict_linear_heads_for_execution_features(
@@ -366,7 +325,7 @@ def _validate_train_feature_identity(feature_dataset: ExecutionLinearFeatureData
     if not _payloads_equal(feature_dataset.decision_schedule, linear_train_result.decision_schedule):
         raise ValueError(
             "feature_dataset decision_schedule does not match linear_train_result decision_schedule; "
-            "build features with schedule_config_from_train_result(linear_train_result)"
+            "build features from the same decision grid lineage as the linear_train_result"
         )
 
 
@@ -403,6 +362,9 @@ def build_linear_signal_build_result(
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_grid_schema=feature_dataset.decision_grid_schema,
+        decision_grid_hash=feature_dataset.decision_grid_hash,
+        decision_grid_n_rows=feature_dataset.decision_grid_n_rows,
         decision_schedule=dict(feature_dataset.decision_schedule),
         start_event_index=feature_dataset.start_event_index,
         n_rows=arrays.n_rows,
@@ -412,6 +374,7 @@ def build_linear_signal_build_result(
         metadata=metadata,
         decision_event_index=feature_dataset.decision_event_index,
         decision_local_ts_us=feature_dataset.decision_local_ts_us,
+        decision_event_seq=feature_dataset.decision_event_seq,
     )
     validate_linear_signal_artifact_metadata(
         artifact,
@@ -423,6 +386,9 @@ def build_linear_signal_build_result(
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
+        decision_grid_schema=feature_dataset.decision_grid_schema,
+        decision_grid_hash=feature_dataset.decision_grid_hash,
+        decision_grid_n_rows=feature_dataset.decision_grid_n_rows,
         decision_schedule=dict(feature_dataset.decision_schedule),
         start_event_index=feature_dataset.start_event_index,
     )
@@ -493,6 +459,9 @@ class LinearSignalDiskBuildResult:
 class _StreamStats:
     feature_names: tuple[str, ...]
     replay_start_event_index: int
+    decision_grid_schema: str
+    decision_grid_hash: str
+    decision_grid_n_rows: int
     decision_schedule: dict[str, object]
     transform_config: dict[str, object]
     num_decisions: int = 0
@@ -500,6 +469,8 @@ class _StreamStats:
     last_decision_event_index: int | None = None
     first_decision_local_ts_us: int | None = None
     last_decision_local_ts_us: int | None = None
+    first_decision_event_seq: int | None = None
+    last_decision_event_seq: int | None = None
 
     @property
     def start_event_index(self) -> int:
@@ -517,8 +488,10 @@ class _StreamStats:
         if self.first_decision_event_index is None:
             self.first_decision_event_index = int(dataset.decision_event_index[0])
             self.first_decision_local_ts_us = int(dataset.decision_local_ts_us[0])
+            self.first_decision_event_seq = int(dataset.decision_event_seq[0])
         self.last_decision_event_index = int(dataset.decision_event_index[-1])
         self.last_decision_local_ts_us = int(dataset.decision_local_ts_us[-1])
+        self.last_decision_event_seq = int(dataset.decision_event_seq[-1])
         self.num_decisions += dataset.num_decisions
 
     def require_nonempty(self) -> None:
@@ -535,6 +508,11 @@ class _StreamStats:
             "last_decision_event_index": self.last_decision_event_index,
             "first_decision_local_ts_us": self.first_decision_local_ts_us,
             "last_decision_local_ts_us": self.last_decision_local_ts_us,
+            "first_decision_event_seq": self.first_decision_event_seq,
+            "last_decision_event_seq": self.last_decision_event_seq,
+            "decision_grid_schema": self.decision_grid_schema,
+            "decision_grid_hash": self.decision_grid_hash,
+            "decision_grid_n_rows": self.decision_grid_n_rows,
             "decision_schedule": dict(self.decision_schedule),
             "replay_start_event_index": self.replay_start_event_index,
             "start_event_index": self.start_event_index,
@@ -546,12 +524,14 @@ class _StreamStats:
 class _FinalizedArrays:
     decision_event_index: np.ndarray
     decision_local_ts_us: np.ndarray
+    decision_event_seq: np.ndarray
     arrays: dict[str, np.ndarray]
     row_counts: dict[str, int]
 
     def close(self) -> None:
         _close_memmap(self.decision_event_index)
         _close_memmap(self.decision_local_ts_us)
+        _close_memmap(self.decision_event_seq)
         for arr in self.arrays.values():
             _close_memmap(arr)
 
@@ -576,6 +556,7 @@ class _LinearSignalChunkedWriters:
         writers = {
             "decision_event_index": NpyChunkWriter("decision_event_index", np.int64, (), chunk_rows, chunk_dir),
             "decision_local_ts_us": NpyChunkWriter("decision_local_ts_us", np.int64, (), chunk_rows, chunk_dir),
+            "decision_event_seq": NpyChunkWriter("decision_event_seq", np.int64, (), chunk_rows, chunk_dir),
         }
         writers.update({name: NpyChunkWriter(name, dtype, (), chunk_rows, chunk_dir) for name in linear_signal_array_fields()})
         return cls(chunk_dir=chunk_dir, arrays_dir=arrays_dir, writers=writers)
@@ -585,6 +566,7 @@ class _LinearSignalChunkedWriters:
             raise ValueError("signal rows must match feature chunk rows")
         self.writers["decision_event_index"].append_many(dataset.decision_event_index)
         self.writers["decision_local_ts_us"].append_many(dataset.decision_local_ts_us)
+        self.writers["decision_event_seq"].append_many(dataset.decision_event_seq)
         for name in linear_signal_array_fields():
             self.writers[name].append_many(getattr(signal_arrays, name))
 
@@ -596,6 +578,7 @@ class _LinearSignalChunkedWriters:
         return _FinalizedArrays(
             decision_event_index=np.load(self.arrays_dir / "decision_event_index.npy", mmap_mode="r"),
             decision_local_ts_us=np.load(self.arrays_dir / "decision_local_ts_us.npy", mmap_mode="r"),
+            decision_event_seq=np.load(self.arrays_dir / "decision_event_seq.npy", mmap_mode="r"),
             arrays={name: np.load(self.arrays_dir / f"{name}.npy", mmap_mode="r") for name in linear_signal_array_fields()},
             row_counts=row_counts,
         )
@@ -609,6 +592,7 @@ def _feature_dataset_from_chunk(
     chunk: ExecutionLinearFeatureChunk,
     *,
     replay_start_event_index: int,
+    decision_grid: DecisionGrid,
     decision_schedule: Mapping[str, object],
     transform_config: Mapping[str, object],
 ) -> ExecutionLinearFeatureDataset:
@@ -617,10 +601,14 @@ def _feature_dataset_from_chunk(
     return ExecutionLinearFeatureDataset(
         decision_event_index=chunk.decision_event_index,
         decision_local_ts_us=chunk.decision_local_ts_us,
+        decision_event_seq=chunk.decision_event_seq,
         features=chunk.features,
         feature_names=tuple(chunk.feature_names),
         replay_start_event_index=replay_start_event_index,
         start_event_index=int(chunk.decision_event_index[0]),
+        decision_grid_schema=decision_grid.metadata.schema,
+        decision_grid_hash=decision_grid.decision_grid_hash,
+        decision_grid_n_rows=decision_grid.n_rows,
         decision_schedule=dict(decision_schedule),
         transform_config=dict(transform_config),
     )
@@ -705,6 +693,7 @@ def _linear_signal_summary_from_arrays(
     dtype: np.dtype,
     decision_event_index: np.ndarray,
     decision_local_ts_us: np.ndarray,
+    decision_event_seq: np.ndarray,
 ) -> dict[str, object]:
     return {
         "schema": LINEAR_SIGNAL_ARTIFACT_SCHEMA,
@@ -717,6 +706,8 @@ def _linear_signal_summary_from_arrays(
         "last_decision_event_index": int(decision_event_index[-1]),
         "first_decision_local_ts_us": int(decision_local_ts_us[0]),
         "last_decision_local_ts_us": int(decision_local_ts_us[-1]),
+        "first_decision_event_seq": int(decision_event_seq[0]),
+        "last_decision_event_seq": int(decision_event_seq[-1]),
     }
 
 
@@ -729,18 +720,16 @@ def _validate_stream_identity(decision_schedule: Mapping[str, object], transform
     if not _payloads_equal(decision_schedule, result.decision_schedule):
         raise ValueError(
             "feature_dataset decision_schedule does not match linear_train_result decision_schedule; "
-            "build features with schedule_config_from_train_result(linear_train_result)"
+            "build features from the same decision grid lineage as the linear_train_result"
         )
 
 
 def build_linear_signal_artifact_npz_from_execution_feature_chunks(
     *,
     tape: ExecutionTape,
+    decision_grid: DecisionGrid,
     output_npz: str | Path,
     linear_train_result: LinearTrainResult,
-    schedule_config: DecisionScheduleConfig | None = None,
-    start_event_index: int | None = None,
-    max_decisions: int | None = None,
     chunk_rows: int = 100_000,
     signal_config: LinearSignalConfig = LinearSignalConfig(),
     output_dtype: str = "float32",
@@ -751,18 +740,25 @@ def build_linear_signal_artifact_npz_from_execution_feature_chunks(
         raise ValueError("linear_train_result must be LinearTrainResult")
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
+    if not isinstance(decision_grid, DecisionGrid):
+        raise ValueError("decision_grid must be DecisionGrid")
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
     chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
     dtype = np.dtype(_require_output_dtype(output_dtype))
-    schedule = schedule_config if schedule_config is not None else DecisionScheduleConfig()
     transform = transform_config if transform_config is not None else TransformConfig()
     output_path = Path(output_npz)
     if output_path.exists() and not overwrite:
         raise FileExistsError(str(output_path))
-    _validate_stream_identity(schedule.as_dict(), transform.as_dict(), linear_train_result)
+    _validate_stream_identity(decision_grid.decision_schedule, transform.as_dict(), linear_train_result)
+    if getattr(linear_train_result, "decision_grid_hash", None) != decision_grid.decision_grid_hash:
+        raise ValueError("linear_train_result decision_grid_hash does not match decision_grid")
     stats = _StreamStats(
         feature_names=execution_linear_feature_names(),
-        replay_start_event_index=0 if start_event_index is None else int(start_event_index),
-        decision_schedule=schedule.as_dict(),
+        replay_start_event_index=0,
+        decision_grid_schema=decision_grid.metadata.schema,
+        decision_grid_hash=decision_grid.decision_grid_hash,
+        decision_grid_n_rows=decision_grid.n_rows,
+        decision_schedule=decision_grid.decision_schedule,
         transform_config=transform.as_dict(),
     )
     model_bundle = linear_model_bundle_from_train_result(linear_train_result)
@@ -770,11 +766,9 @@ def build_linear_signal_artifact_npz_from_execution_feature_chunks(
     writers = _LinearSignalChunkedWriters.create(output_path, chunk_rows=chunk_rows, output_dtype=output_dtype)
     finalized: _FinalizedArrays | None = None
     try:
-        for chunk in iter_execution_linear_feature_chunks(
+        for chunk in iter_execution_linear_feature_chunks_for_decision_grid(
             tape,
-            schedule_config=schedule,
-            start_event_index=start_event_index,
-            max_decisions=max_decisions,
+            decision_grid=decision_grid,
             chunk_rows=chunk_rows,
             output_dtype=output_dtype,
             transform_config=transform,
@@ -782,6 +776,7 @@ def build_linear_signal_artifact_npz_from_execution_feature_chunks(
             dataset = _feature_dataset_from_chunk(
                 chunk,
                 replay_start_event_index=stats.replay_start_event_index,
+                decision_grid=decision_grid,
                 decision_schedule=stats.decision_schedule,
                 transform_config=stats.transform_config,
             )
@@ -803,6 +798,9 @@ def build_linear_signal_artifact_npz_from_execution_feature_chunks(
             num_trades=tape.manifest.num_trades,
             start_local_ts_us=tape.manifest.start_local_ts_us,
             end_local_ts_us=tape.manifest.end_local_ts_us,
+            decision_grid_schema=stats.decision_grid_schema,
+            decision_grid_hash=stats.decision_grid_hash,
+            decision_grid_n_rows=stats.decision_grid_n_rows,
             decision_schedule=dict(stats.decision_schedule),
             start_event_index=stats.start_event_index,
             n_rows=stats.num_decisions,
@@ -815,6 +813,7 @@ def build_linear_signal_artifact_npz_from_execution_feature_chunks(
             metadata=metadata,
             decision_event_index=finalized.decision_event_index,
             decision_local_ts_us=finalized.decision_local_ts_us,
+            decision_event_seq=finalized.decision_event_seq,
             arrays=finalized.arrays,
             overwrite=overwrite,
             validate_chunk_rows=chunk_rows,
@@ -834,11 +833,16 @@ def build_linear_signal_artifact_npz_from_execution_feature_chunks(
                 dtype=dtype,
                 decision_event_index=finalized.decision_event_index,
                 decision_local_ts_us=finalized.decision_local_ts_us,
+                decision_event_seq=finalized.decision_event_seq,
             ),
             alignment_summary={
                 "replay_start_event_index": stats.replay_start_event_index,
                 "first_signal_event_index": stats.first_decision_event_index,
                 "first_signal_local_ts_us": stats.first_decision_local_ts_us,
+                "first_signal_event_seq": stats.first_decision_event_seq,
+                "decision_grid_schema": stats.decision_grid_schema,
+                "decision_grid_hash": stats.decision_grid_hash,
+                "decision_grid_n_rows": stats.decision_grid_n_rows,
                 "n_signal_rows": stats.num_decisions,
             },
             prediction_summary=prediction_summary,
@@ -852,13 +856,11 @@ def build_linear_signal_artifact_npz_from_execution_feature_chunks(
 __all__ = [
     "ExecutionLinearFeatureDataset",
     "ExecutionLinearFeatureChunk",
-    "iter_execution_linear_feature_chunks",
+    "iter_execution_linear_feature_chunks_for_decision_grid",
     "execution_linear_feature_dataset_summary",
     "execution_linear_feature_names",
-    "build_execution_linear_feature_dataset",
     "LinearSignalBuildResult",
     "transform_config_from_train_result",
-    "schedule_config_from_train_result",
     "predict_linear_heads_for_execution_features",
     "build_linear_signal_build_result",
     "build_linear_signal_artifact_from_execution_features",

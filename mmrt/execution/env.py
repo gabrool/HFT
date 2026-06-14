@@ -43,10 +43,11 @@ from mmrt.execution.fill_sim import (
     sync_orders_to_quote,
 )
 from mmrt.execution.contracts import LinearSignal
+from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
 from mmrt.execution.linear_signal import (
     LinearSignalArtifact,
     linear_signal_at,
-    linear_signal_row_for_event_index,
+    validate_linear_signals_for_decision_grid,
 )
 from mmrt.execution.adverse_runtime import (
     AdverseRuntimeConfig,
@@ -55,7 +56,7 @@ from mmrt.execution.adverse_runtime import (
     build_executable_edge_observation_features,
 )
 from mmrt.execution.executable_edge import ExecutableEdgeConfig
-from mmrt.execution.adverse_signal import AdverseSelectionSignalArtifact, validate_adverse_signal_alignment
+from mmrt.execution.adverse_signal import AdverseSelectionSignalArtifact, validate_adverse_signals_for_decision_grid
 from mmrt.execution.obs_builder import (
     ObservationBuilder,
     ObservationBuilderConfig,
@@ -207,7 +208,6 @@ class ExecutionEnvStep:
 @dataclass(frozen=True, slots=True)
 class _ReplayEventResult:
     fills: tuple[Fill, ...]
-    processed_valid_l2: bool
 
 
 @dataclass(slots=True)
@@ -216,7 +216,7 @@ class _EnvState:
     current_book_ptr: int
     previous_event_local_ts_us: int | None
     step_index: int
-    signal_row_index: int
+    decision_row_index: int
     next_order_id: int
     position: PositionState
     live_orders: tuple[ActiveOrder, ...]
@@ -265,6 +265,7 @@ class ExecutionEnv:
         self,
         tape: ExecutionTape,
         *,
+        decision_grid: DecisionGrid,
         linear_signals: LinearSignalArtifact,
         adverse_signals: AdverseSelectionSignalArtifact | None = None,
         config: ExecutionEnvConfig = ExecutionEnvConfig(),
@@ -293,21 +294,16 @@ class ExecutionEnv:
         self.config = _require_config(config)
         if not isinstance(linear_signals, LinearSignalArtifact):
             raise ValueError("linear_signals must be LinearSignalArtifact")
-        if linear_signals.n_rows <= 0:
-            raise ValueError("linear_signals must contain at least one row")
-        if config.max_episode_steps is not None and linear_signals.n_rows < config.max_episode_steps + 1:
-            raise ValueError("linear_signals must contain at least max_episode_steps + 1 rows")
+        validate_decision_grid_for_execution_tape(decision_grid, self.tape)
+        validate_linear_signals_for_decision_grid(linear_signals, decision_grid)
+        if config.max_episode_steps is not None and decision_grid.n_rows < config.max_episode_steps + 1:
+            raise ValueError("decision_grid must contain at least max_episode_steps + 1 rows")
+        self.decision_grid = decision_grid
         self.linear_signals = linear_signals
         if adverse_signals is not None:
             if not isinstance(adverse_signals, AdverseSelectionSignalArtifact):
                 raise ValueError("adverse_signals must be AdverseSelectionSignalArtifact")
-            validate_adverse_signal_alignment(
-                adverse_signals,
-                decision_local_ts_us=linear_signals.decision_local_ts_us,
-                decision_event_index=linear_signals.decision_event_index,
-                decision_event_seq=np.full(linear_signals.n_rows, MAX_EVENT_SEQ, dtype=np.int64),
-                right_name="linear_signals",
-            )
+            validate_adverse_signals_for_decision_grid(adverse_signals, decision_grid)
         self.adverse_signals = adverse_signals
         self.observation_builder = ObservationBuilder(
             schema=config.observation_schema,
@@ -341,19 +337,21 @@ class ExecutionEnv:
     ) -> ExecutionEnvReset:
         events = self.tape.arrays.events
         if start_event_index is None:
-            start = int(self.linear_signals.decision_event_index[0])
+            start = int(self.decision_grid.decision_event_index[0])
         else:
             start = _require_nonnegative_int(start_event_index, "start_event_index")
         if start >= len(events):
             raise ValueError("start_event_index must be < len(tape.arrays.events)")
 
-        signal_row = linear_signal_row_for_event_index(self.linear_signals, start)
+        decision_row = self._decision_grid_row_for_event_index(start)
+        if decision_row + 1 >= self.decision_grid.n_rows:
+            raise ValueError("start_event_index must leave at least one following decision grid row")
         event = events[start]
         if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
-            raise ValueError("linear signal start_event_index must reference an L2 batch event")
+            raise ValueError("decision grid start_event_index must reference an L2 batch event")
         book_ptr = int(event["book_ptr"])
         if book_ptr < 0 or self._book_top_from_ptr(book_ptr) is None:
-            raise ValueError("linear signal start_event_index must reference a valid two-sided L2 book event")
+            raise ValueError("decision grid start_event_index must reference a valid two-sided L2 book event")
 
         position = self.config.initial_position if initial_position is None else _require_position(initial_position)
         self._state = _EnvState(
@@ -361,7 +359,7 @@ class ExecutionEnv:
             current_book_ptr=book_ptr,
             previous_event_local_ts_us=None,
             step_index=0,
-            signal_row_index=signal_row,
+            decision_row_index=decision_row,
             next_order_id=0,
             position=position,
             live_orders=(),
@@ -379,7 +377,7 @@ class ExecutionEnv:
                 "event_index": start,
                 "current_book_ptr": book_ptr,
                 "step_index": 0,
-                "signal_row_index": signal_row,
+                "decision_grid_row_index": decision_row,
             },
         )
 
@@ -390,10 +388,8 @@ class ExecutionEnv:
 
         events = self.tape.arrays.events
         num_events = len(events)
-        if state.event_index + 1 >= num_events:
-            raise RuntimeError("cannot step: no future tape events remain")
 
-        decision_signal_row = state.signal_row_index
+        decision_row = state.decision_row_index
         action = _coerce_action(action)
         symbol_spec = self.tape.manifest.symbol_spec
         previous_position = state.position
@@ -457,60 +453,37 @@ class ExecutionEnv:
         self._activate_pending_orders_at(event_key=decision_key, book_ptr=state.current_book_ptr)
         state.next_order_id = _next_order_id_after(replacement_orders, state.next_order_id)
 
-        next_signal_row = decision_signal_row + 1
-        has_next_signal = next_signal_row < self.linear_signals.n_rows
-        target_event_index: int | None = None
-        if has_next_signal:
-            # Non-terminal stepping targets self.linear_signals.decision_event_index[next_signal_row].
-            target_event_index = self._validate_next_signal_target(
-                next_signal_row=next_signal_row,
-                current_event_index=state.event_index,
-            )
+        next_decision_row = decision_row + 1
+        if next_decision_row >= self.decision_grid.n_rows:
+            state.done = True
+            raise RuntimeError("environment is done; call reset() before step()")
+        target_event_index = self._validate_next_grid_target(
+            next_decision_row=next_decision_row,
+            current_event_index=state.event_index,
+        )
 
         next_event_index = state.event_index + 1
         events_processed = 0
         fills: list[Fill] = []
 
-        if has_next_signal:
-            assert target_event_index is not None
-            while next_event_index <= target_event_index:
-                replay = self._replay_one_event_for_step(next_event_index)
-                fills.extend(replay.fills)
-                events_processed += 1
-                next_event_index += 1
+        while next_event_index <= target_event_index:
+            replay = self._replay_one_event_for_step(next_event_index)
+            fills.extend(replay.fills)
+            events_processed += 1
+            next_event_index += 1
 
-            if state.event_index != target_event_index:
-                raise RuntimeError("execution env failed to advance to target linear signal event")
-            if state.signal_row_index != decision_signal_row:
-                raise RuntimeError("execution env signal row changed during target replay")
-        else:
-            decision_end_local_ts_us = self._fallback_terminal_replay_end_local_ts_us(previous_book_top)
-            processed_any = False
-            processed_valid_l2 = False
-            while next_event_index < num_events:
-                event_local = int(events[next_event_index]["local_ts_us"])
-                if self._fallback_terminal_replay_should_stop(
-                    processed_any=processed_any,
-                    processed_valid_l2=processed_valid_l2,
-                    event_local=event_local,
-                    decision_end_local_ts_us=decision_end_local_ts_us,
-                ):
-                    break
+        if state.event_index != target_event_index:
+            raise RuntimeError("execution env failed to advance to target decision grid event")
+        if state.decision_row_index != decision_row:
+            raise RuntimeError("execution env decision grid row changed during target replay")
 
-                replay = self._replay_one_event_for_step(next_event_index)
-                fills.extend(replay.fills)
-                processed_any = True
-                processed_valid_l2 = processed_valid_l2 or replay.processed_valid_l2
-                events_processed += 1
-                next_event_index += 1
-
-        terminal_due_to_signal_end = not has_next_signal
-        terminal_due_to_tape_end = target_event_index is not None and target_event_index + 1 >= num_events
+        terminal_due_to_grid_end = next_decision_row + 1 >= self.decision_grid.n_rows
+        terminal_due_to_tape_end = target_event_index + 1 >= num_events
         truncated = (
             self.config.max_episode_steps is not None
             and state.step_index + 1 >= self.config.max_episode_steps
         )
-        done = bool(terminal_due_to_signal_end or terminal_due_to_tape_end)
+        done = bool(terminal_due_to_grid_end or terminal_due_to_tape_end)
         state.done = done
         state.truncated = truncated
 
@@ -533,20 +506,18 @@ class ExecutionEnv:
         self._peak_equity = reward_step.peak_equity
         self._last_step_fills = step_fills
         state.step_index += 1
-        if has_next_signal:
-            state.signal_row_index = next_signal_row
-            if state.event_index != int(self.linear_signals.decision_event_index[state.signal_row_index]):
-                raise RuntimeError("execution env state is not aligned to the current linear signal row")
-            if state.signal_row_index != next_signal_row:
-                raise RuntimeError("execution env failed to advance to target linear signal row")
+        state.decision_row_index = next_decision_row
+        if state.event_index != int(self.decision_grid.decision_event_index[state.decision_row_index]):
+            raise RuntimeError("execution env state is not aligned to the current decision grid row")
+        if state.decision_row_index != next_decision_row:
+            raise RuntimeError("execution env failed to advance to target decision grid row")
 
         info: dict[str, object] = {
             "step_index": state.step_index - 1,
-            "linear_signal_row": decision_signal_row,
-            "signal_row_index": decision_signal_row,
-            "next_signal_row_index": None if not has_next_signal else next_signal_row,
-            "target_signal_event_index": target_event_index,
-            "terminal_due_to_signal_end": terminal_due_to_signal_end,
+            "decision_grid_row_index": decision_row,
+            "next_decision_grid_row_index": next_decision_row,
+            "target_decision_event_index": target_event_index,
+            "terminal_due_to_grid_end": terminal_due_to_grid_end,
             "terminal_due_to_tape_end": terminal_due_to_tape_end,
             "event_index": state.event_index,
             "current_book_ptr": state.current_book_ptr,
@@ -597,16 +568,16 @@ class ExecutionEnv:
         if self.adverse_signals is not None:
             runtime_config = self.config.adverse_runtime_config or AdverseRuntimeConfig()
             runtime_maps = self._adverse_runtime_feature_maps_for_step(
-                step_index=decision_signal_row,
+                step_index=decision_row,
                 book_top=previous_book_top,
-                linear_signal=linear_signal_at(self.linear_signals.arrays, decision_signal_row),
+                linear_signal=linear_signal_at(self.linear_signals.arrays, decision_row),
                 inventory_qty=previous_position.inventory_qty,
             )
             for name, value in runtime_maps.edge_features.items():
                 if name.endswith("_attempt_bps") or name.endswith("_valid"):
                     info[name] = value
             info["adverse_signal_available"] = True
-            info["adverse_signal_row"] = decision_signal_row
+            info["adverse_signal_row_index"] = decision_row
             info["adverse_runtime_post_only_gap_ticks"] = runtime_config.post_only_gap_ticks
         else:
             info["adverse_signal_available"] = False
@@ -619,57 +590,59 @@ class ExecutionEnv:
             truncated=truncated,
             info=info,
         )
-        if terminal_due_to_signal_end:
-            observation = np.array(self._last_observation, copy=True)
-        else:
-            expected_event_index = int(self.linear_signals.decision_event_index[state.signal_row_index])
-            if state.event_index != expected_event_index:
-                raise RuntimeError("execution env state is not aligned to the current linear signal row")
-            observation = self._build_observation()
-            self._last_observation = np.array(observation, copy=True)
+        expected_event_index = int(self.decision_grid.decision_event_index[state.decision_row_index])
+        if state.event_index != expected_event_index:
+            raise RuntimeError("execution env state is not aligned to the current decision grid row")
+        observation = self._build_observation()
+        self._last_observation = np.array(observation, copy=True)
         return ExecutionEnvStep(
             observation=observation,
             reward=reward_step.reward.total_reward * self.config.reward_config.reward_scale,
             execution=execution,
         )
 
-    def _validate_next_signal_target(
+    def _decision_grid_row_for_event_index(self, event_index: int) -> int:
+        event_index = _require_nonnegative_int(event_index, "event_index")
+        row = int(np.searchsorted(self.decision_grid.decision_event_index, event_index))
+        if row >= self.decision_grid.n_rows or int(self.decision_grid.decision_event_index[row]) != event_index:
+            raise ValueError("start_event_index must reference a decision grid row")
+        return row
+
+    def _validate_next_grid_target(
         self,
         *,
-        next_signal_row: int,
+        next_decision_row: int,
         current_event_index: int,
     ) -> int:
-        next_signal_row = _require_nonnegative_int(next_signal_row, "next_signal_row")
+        next_decision_row = _require_nonnegative_int(next_decision_row, "next_decision_row")
         current_event_index = _require_nonnegative_int(current_event_index, "current_event_index")
-        if next_signal_row >= self.linear_signals.n_rows:
-            raise ValueError("next_signal_row must be < linear_signals.n_rows")
+        if next_decision_row >= self.decision_grid.n_rows:
+            raise ValueError("next_decision_row must be < decision_grid.n_rows")
 
-        target_event_index = int(self.linear_signals.decision_event_index[next_signal_row])
+        target_event_index = int(self.decision_grid.decision_event_index[next_decision_row])
         if target_event_index <= current_event_index:
-            raise ValueError("linear signal decision_event_index must advance strictly between env steps")
+            raise ValueError("decision grid decision_event_index must advance strictly between env steps")
         if target_event_index >= len(self.tape.arrays.events):
-            raise ValueError("linear signal target event index is outside tape events")
+            raise ValueError("decision grid target event index is outside tape events")
 
         event = self.tape.arrays.events[target_event_index]
         if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
-            raise ValueError("linear signal target event must reference an L2 batch event")
+            raise ValueError("decision grid target event must reference an L2 batch event")
 
         book_ptr = int(event["book_ptr"])
         if book_ptr < 0 or self._book_top_from_ptr(book_ptr) is None:
-            raise ValueError("linear signal target event must reference a valid two-sided L2 book")
+            raise ValueError("decision grid target event must reference a valid two-sided L2 book")
 
-        expected_local_ts_us = int(self.linear_signals.decision_local_ts_us[next_signal_row])
+        expected_local_ts_us = int(self.decision_grid.decision_local_ts_us[next_decision_row])
         actual_local_ts_us = int(event["local_ts_us"])
         if actual_local_ts_us != expected_local_ts_us:
-            raise ValueError("linear signal target local_ts_us must match target tape event local_ts_us")
+            raise ValueError("decision grid target local_ts_us must match target tape event local_ts_us")
 
         return target_event_index
 
     def _replay_one_event_for_step(self, event_index: int) -> _ReplayEventResult:
         state = self._require_state()
 
-        event_code = int(self._ev_type_code[event_index])
-        event_book_ptr = int(self._ev_book_ptr[event_index])
         event_key = self._event_key_at_index(event_index)
 
         orders = state.live_orders
@@ -700,29 +673,9 @@ class ExecutionEnv:
 
         self._fire_cancel_guards(event_key)
 
-        processed_valid_l2 = (
-            event_code == EVENT_TYPE_CODE_L2_BATCH
-            and event_book_ptr >= 0
-            and self._book_top_from_ptr(event_book_ptr) is not None
-        )
-
         return _ReplayEventResult(
             fills=fills,
-            processed_valid_l2=processed_valid_l2,
         )
-
-    def _fallback_terminal_replay_end_local_ts_us(self, previous_book_top: BookTop) -> int:
-        return previous_book_top.local_ts_us + self.linear_signals.metadata.max_decision_interval_us
-
-    def _fallback_terminal_replay_should_stop(
-        self,
-        *,
-        processed_any: bool,
-        processed_valid_l2: bool,
-        event_local: int,
-        decision_end_local_ts_us: int,
-    ) -> bool:
-        return processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us
 
     def _fire_cancel_guards(self, event_key: EventKey) -> None:
         """Standing per-side cancel rule evaluated on every replayed event.
@@ -892,12 +845,12 @@ class ExecutionEnv:
             previous_event_local_ts_us=state.previous_event_local_ts_us,
         )
         linear_signal = self._linear_signal_for_step(
-            state.signal_row_index,
+            state.decision_row_index,
             expected_event_index=state.event_index,
             expected_local_ts_us=book_top.local_ts_us,
         )
         runtime_maps = self._adverse_runtime_feature_maps_for_step(
-            step_index=state.signal_row_index,
+            step_index=state.decision_row_index,
             book_top=book_top,
             linear_signal=linear_signal,
             inventory_qty=state.position.inventory_qty,
@@ -955,11 +908,25 @@ class ExecutionEnv:
         if step_index >= self.linear_signals.n_rows:
             raise ValueError("linear_signals does not contain a row for current step_index")
 
+        grid_event_index = int(self.decision_grid.decision_event_index[step_index])
+        if grid_event_index != expected_event_index:
+            raise ValueError(
+                "decision grid event index mismatch: "
+                f"row={step_index} expected={expected_event_index} actual={grid_event_index}"
+            )
+
         actual_event_index = int(self.linear_signals.decision_event_index[step_index])
         if actual_event_index != expected_event_index:
             raise ValueError(
                 "linear signal decision_event_index mismatch: "
                 f"row={step_index} expected={expected_event_index} actual={actual_event_index}"
+            )
+
+        grid_local_ts_us = int(self.decision_grid.decision_local_ts_us[step_index])
+        if grid_local_ts_us != expected_local_ts_us:
+            raise ValueError(
+                "decision grid local_ts_us mismatch: "
+                f"row={step_index} expected={expected_local_ts_us} actual={grid_local_ts_us}"
             )
 
         actual_local_ts_us = int(self.linear_signals.decision_local_ts_us[step_index])

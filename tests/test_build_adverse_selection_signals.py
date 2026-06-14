@@ -39,11 +39,10 @@ def _training_root_and_model(tmp_path):
     run_adverse_selection_training(
         AdverseSelectionTrainCLIConfig(
             tape_root=str(root),
+            decision_grid_path=str(root / "decision_grid"),
             output_json=str(tmp_path / "train.json"),
             model_npz=str(model_npz),
             overwrite=True,
-            decision_interval_us=100,
-            max_decisions=3,
             flow_windows_us=(200,),
             kyle_sample_interval_us=50,
             kyle_response_horizon_us=100,
@@ -67,6 +66,7 @@ def test_build_adverse_selection_signals_end_to_end(tmp_path):
     summary = build_adverse_selection_signals_from_config(
         BuildAdverseSelectionSignalsConfig(
             tape_root=str(root),
+            decision_grid_path=str(root / "decision_grid"),
             model_npz=str(model_npz),
             output_npz=str(output_npz),
             output_json=str(output_json),
@@ -103,10 +103,22 @@ def test_build_adverse_selection_signals_rejects_symbol_mismatch(tmp_path):
             config_json=model.config_json,
             exchange=model.exchange,
             symbol="OTHER",
+            decision_grid_schema=model.decision_grid_schema,
+            decision_grid_hash=model.decision_grid_hash,
+            decision_grid_n_rows=model.decision_grid_n_rows,
+            decision_schedule=model.decision_schedule,
         ),
     )
     with pytest.raises(ValueError, match="exchange/symbol"):
-        build_adverse_selection_signals_from_config(BuildAdverseSelectionSignalsConfig(str(root), str(bad_model), output_npz=str(tmp_path / "x.npz"), output_json=str(tmp_path / "x.json")))
+        build_adverse_selection_signals_from_config(
+            BuildAdverseSelectionSignalsConfig(
+                str(root),
+                str(root / "decision_grid"),
+                str(bad_model),
+                output_npz=str(tmp_path / "x.npz"),
+                output_json=str(tmp_path / "x.json"),
+            )
+        )
 
 
 def test_build_adverse_selection_signals_rejects_feature_name_mismatch(tmp_path):
@@ -127,14 +139,31 @@ def test_build_adverse_selection_signals_rejects_feature_name_mismatch(tmp_path)
             config_json=model.config_json,
             exchange=model.exchange,
             symbol=model.symbol,
+            decision_grid_schema=model.decision_grid_schema,
+            decision_grid_hash=model.decision_grid_hash,
+            decision_grid_n_rows=model.decision_grid_n_rows,
+            decision_schedule=model.decision_schedule,
         ),
     )
     with pytest.raises(ValueError, match="feature_names"):
-        build_adverse_selection_signals_from_config(BuildAdverseSelectionSignalsConfig(str(root), str(bad_model), output_npz=str(tmp_path / "y.npz"), output_json=str(tmp_path / "y.json")))
+        build_adverse_selection_signals_from_config(
+            BuildAdverseSelectionSignalsConfig(
+                str(root),
+                str(root / "decision_grid"),
+                str(bad_model),
+                output_npz=str(tmp_path / "y.npz"),
+                output_json=str(tmp_path / "y.json"),
+            )
+        )
 
 
 def test_build_adverse_selection_signals_parser_no_mmap():
-    args = build_arg_parser().parse_args(["--tape-root", "/tmp/tape", "--model-npz", "/tmp/model.npz", "--no-mmap"])
+    args = build_arg_parser().parse_args([
+        "--tape-root", "/tmp/tape",
+        "--decision-grid", "/tmp/tape/decision_grid",
+        "--model-npz", "/tmp/model.npz",
+        "--no-mmap",
+    ])
     cfg = _config_from_args(args)
     assert cfg.mmap_mode is None
 
@@ -146,7 +175,15 @@ def test_build_adverse_selection_signals_overwrite_guard(tmp_path):
     output_npz.write_bytes(b"exists")
     output_json.write_text("{}", encoding="utf-8")
     with pytest.raises(FileExistsError):
-        build_adverse_selection_signals_from_config(BuildAdverseSelectionSignalsConfig(str(root), str(model_npz), output_npz=str(output_npz), output_json=str(output_json)))
+        build_adverse_selection_signals_from_config(
+            BuildAdverseSelectionSignalsConfig(
+                str(root),
+                str(root / "decision_grid"),
+                str(model_npz),
+                output_npz=str(output_npz),
+                output_json=str(output_json),
+            )
+        )
 
 
 def test_build_adverse_selection_signals_does_not_import_rl():

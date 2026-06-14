@@ -15,6 +15,7 @@ from mmrt.execution.adverse_runtime import AdverseRuntimeConfig
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
 from mmrt.cli.execution_env_config import build_execution_env_config_from_attrs
 from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execution_tape
+from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
@@ -133,6 +134,7 @@ def _coerce_queue_mode(value: QueueModelMode | str) -> QueueModelMode:
 
 def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
     return {
+        "decision_grid_path": config.decision_grid_path,
         "linear_signals_npz": config.linear_signals_npz,
         "adverse_signals_npz": config.adverse_signals_npz,
         "policy": config.policy,
@@ -169,6 +171,7 @@ def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
 @dataclass(frozen=True, slots=True)
 class ExecutionSimAuditConfig:
     tape_root: str
+    decision_grid_path: str
     output_json: str | None = None
     linear_signals_npz: str | None = None
     adverse_signals_npz: str | None = None
@@ -210,6 +213,7 @@ class ExecutionSimAuditConfig:
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
+        _require_nonempty_str(self.decision_grid_path, "decision_grid_path")
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
         if self.linear_signals_npz is not None:
@@ -273,10 +277,13 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         else _default_linear_signals_npz(config.tape_root)
     )
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
+    decision_grid = load_decision_grid(config.decision_grid_path)
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
     adverse_signals = load_adverse_selection_signals(config.adverse_signals_npz) if config.adverse_signals_npz is not None else None
-    linear_start = validate_linear_signals_for_execution_tape(
+    decision_grid_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
+        decision_grid=decision_grid,
         requested_start_event_index=config.start_event_index,
         min_rows=(config.max_steps + 1) if config.max_steps is not None else None,
     )
@@ -285,7 +292,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         adverse_signals_enabled=config.adverse_signals_npz is not None,
     )
 
-    env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals, adverse_signals=adverse_signals)
+    env = ExecutionEnv(tape, config=env_config, decision_grid=decision_grid, linear_signals=linear_signals, adverse_signals=adverse_signals)
     env.reset(start_event_index=config.start_event_index)
 
     acc = ExecutionMetricAccumulator()
@@ -303,6 +310,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         "status": report.status,
         "audit_type": "execution_sim",
         "tape_root": str(Path(config.tape_root)),
+        "decision_grid_path": str(Path(config.decision_grid_path)),
         "output_json": output_path_str,
         "config": _summary_config(config),
         "tape": {
@@ -319,7 +327,13 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
         "metrics": metrics,
         "diagnostics": report.as_dict(),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
-        "linear_signal_start": linear_start.as_dict(),
+        "decision_grid_start": decision_grid_start.as_dict(),
+        "decision_grid": {
+            "schema": decision_grid.metadata.schema,
+            "hash": decision_grid.decision_grid_hash,
+            "n_rows": decision_grid.n_rows,
+            "schedule": decision_grid.decision_schedule,
+        },
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,6 +346,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Audit an execution tape with a deterministic simple quote policy.")
     parser.add_argument("--tape-root", required=True)
+    parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--output-json")
     parser.add_argument(
         "--linear-signals-npz",
@@ -378,6 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     config = ExecutionSimAuditConfig(
         tape_root=args.tape_root,
+        decision_grid_path=args.decision_grid_path,
         output_json=args.output_json,
         linear_signals_npz=args.linear_signals_npz,
         adverse_signals_npz=args.adverse_signals_npz,

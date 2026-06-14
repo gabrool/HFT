@@ -111,6 +111,17 @@ class DecisionFeaturePipeline:
         decision = self.engine.on_book_snapshot(snapshot)
         if decision is None:
             return None
+        return self._transform_decision(decision)
+
+    def on_book_snapshot_without_decision(self, snapshot: BookSnapshotInput) -> None:
+        self.engine.observe_book_snapshot(snapshot)
+
+    def force_decision(self, *, local_ts_us: int, ts_us: int, event_seq: int) -> TransformedDecision:
+        return self._transform_decision(
+            self.engine.force_decision(local_ts_us=local_ts_us, ts_us=ts_us, event_seq=event_seq)
+        )
+
+    def _transform_decision(self, decision) -> TransformedDecision:
         transformed = self.transformer.transform_one_local(
             decision.local_ts_us, decision.feature_vector
         )
