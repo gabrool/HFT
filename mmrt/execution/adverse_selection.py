@@ -477,6 +477,27 @@ class _KyleSample(NamedTuple):
     y_mid_bps: float
 
 
+class _DiskKyleSampleView(Sequence[_KyleSample]):
+    def __init__(self, arrays) -> None:
+        self._arrays = arrays
+        self._count = int(arrays.count)
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __getitem__(self, index: int) -> _KyleSample:
+        if index < 0:
+            index += self._count
+        if index < 0 or index >= self._count:
+            raise IndexError(index)
+        arrays = self._arrays
+        return _KyleSample(
+            end_key=EventKey(int(arrays.end_local_ts_us[index]), int(arrays.end_event_seq[index])),
+            x_flow=float(arrays.x_flow[index]),
+            y_mid_bps=float(arrays.y_mid_bps[index]),
+        )
+
+
 @dataclass(slots=True)
 class RollingKyleLambdaState:
     config: KyleLambdaConfig
@@ -941,9 +962,9 @@ class _ConservativeFillIndex:
 
 def _build_conservative_fill_index(tape: ExecutionTape) -> _ConservativeFillIndex:
     events = tape.arrays.events
-    event_local_ts = np.ascontiguousarray(events["local_ts_us"], dtype=np.int64)
+    event_local_ts = events["local_ts_us"]
     type_codes = np.asarray(events["event_type_code"])
-    book_ptrs = np.ascontiguousarray(events["book_ptr"], dtype=np.int64)
+    book_ptrs = events["book_ptr"]
     trade_ptrs = np.asarray(events["trade_ptr"], dtype=np.int64)
     n = len(events)
     positions = np.arange(n, dtype=np.int64)
@@ -1792,12 +1813,6 @@ def build_adverse_selection_dataset(
         **_decision_grid_lineage_fields(decision_grid),
     )
 
-
-
-def _kyle_samples_for_disk_builder(tape: ExecutionTape, config: KyleLambdaConfig, tick_size: float) -> list[_KyleSample]:
-    return _precompute_kyle_samples(tape, config, tick_size)
-
-
 @dataclass(frozen=True, slots=True)
 class BuildAdverseSelectionDatasetToDiskConfig:
     output_root: str
@@ -1920,18 +1935,11 @@ def build_adverse_selection_dataset_to_disk(
         else None
     )
     events = tape.arrays.events
-    events_local_ts_us = np.ascontiguousarray(events["local_ts_us"], dtype=np.int64)
+    events_local_ts_us = events["local_ts_us"]
     last_ts = int(events_local_ts_us[-1])
     emitted = 0
     considered = 0
-    kyle_samples = [
-        _KyleSample(
-            end_key=EventKey(int(index.kyle_samples.end_local_ts_us[i]), int(index.kyle_samples.end_event_seq[i])),
-            x_flow=float(index.kyle_samples.x_flow[i]),
-            y_mid_bps=float(index.kyle_samples.y_mid_bps[i]),
-        )
-        for i in range(index.kyle_samples.count)
-    ]
+    kyle_samples = _DiskKyleSampleView(index.kyle_samples)
     for row in _iter_adverse_selection_feature_rows_for_decision_grid(
         tape,
         config=config,
@@ -2004,7 +2012,6 @@ def summarize_disk_adverse_selection_dataset(dataset, *, chunk_rows: int = 100_0
     for name, idx in feature_index.items():
         if name.startswith("kyle_lambda_"):
             features_summary[f"{name}_mean"] = float(selected_sum[idx] / n)
-    # Compatibility aggregate keys used by existing summaries.
     for name, idx in label_index.items():
         if label_count[idx] > 0:
             labels_summary.setdefault(name, float(label_sum[idx] / label_count[idx]))

@@ -13,7 +13,7 @@ import numpy as np
 
 from mmrt.execution.adverse_selection import (
     AdverseSelectionConfig,
-    _KyleSample,
+    _DiskKyleSampleView,
     _adverse_config_summary,
     _iter_adverse_selection_feature_rows_for_decision_grid,
     adverse_selection_feature_names,
@@ -23,7 +23,7 @@ from mmrt.execution.contracts import SymbolSpec
 from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTape
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
-from mmrt.time_key import EventKey, MAX_EVENT_SEQ
+from mmrt.time_key import MAX_EVENT_SEQ
 
 ADVERSE_SELECTION_FEATURE_DATASET_SCHEMA = "mmrt_adverse_selection_feature_dataset_grid_v1"
 
@@ -159,10 +159,7 @@ def build_adverse_selection_features_to_disk(tape: ExecutionTape, *, config: Adv
     feature_names = adverse_selection_feature_names(config)
     manifest = tape.manifest
     writer = _FeatureWriter(root, feature_names, chunk_rows, overwrite, cleanup_chunks, {"exchange": manifest.exchange, "symbol": manifest.symbol, "tape_schema": manifest.schema, "tape_num_events": manifest.num_events, "tape_num_l2_batches": manifest.num_l2_batches, "tape_num_trades": manifest.num_trades, "tape_start_local_ts_us": manifest.start_local_ts_us, "tape_end_local_ts_us": manifest.end_local_ts_us, "decision_grid_schema": decision_grid.metadata.schema, "decision_grid_hash": decision_grid.decision_grid_hash, "decision_grid_n_rows": decision_grid.n_rows, "decision_schedule": decision_grid.decision_schedule, "config_json": json.dumps(_adverse_config_summary(config), sort_keys=True), "index_schema": index.manifest.schema, "index_manifest_sha256": adverse_selection_index_manifest_sha256(index.root), "index_root": str(index.root)})
-    kyle_samples = [
-        _KyleSample(EventKey(int(index.kyle_samples.end_local_ts_us[i]), int(index.kyle_samples.end_event_seq[i])), float(index.kyle_samples.x_flow[i]), float(index.kyle_samples.y_mid_bps[i]))
-        for i in range(index.kyle_samples.count)
-    ]
+    kyle_samples = _DiskKyleSampleView(index.kyle_samples)
     for emitted, row in enumerate(_iter_adverse_selection_feature_rows_for_decision_grid(tape, config=config, decision_grid=decision_grid, kyle_samples=kyle_samples), start=1):
         writer.append(row.decision_local_ts_us, row.decision_event_index, row.decision_event_seq, row.features)
         if progress_interval and emitted % progress_interval == 0:

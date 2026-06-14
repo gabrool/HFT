@@ -20,7 +20,7 @@ from typing import Sequence
 import numpy as np
 
 from mmrt import config as cfg
-from mmrt.execution.decision_grid import decision_grid_lineage, load_decision_grid_npz, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import decision_grid_lineage, load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import EVENT_TYPE_CODE_TRADE, ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.feature_replay import iter_tape_feature_steps_for_decision_grid
 from mmrt.features.labels import LabelBuilder
@@ -263,7 +263,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset-root", required=True)
     p.add_argument("--dataset-id", required=True)
     p.add_argument("--tape-root", required=True)
-    p.add_argument("--decision-grid-npz", required=True)
+    p.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     p.add_argument("--created-at-utc", default=None)
     p.add_argument("--chunk-rows", type=int, default=wr.DEFAULT_CHUNK_ROWS)
     p.add_argument("--row-group-rows", type=int, default=wr.DEFAULT_ROW_GROUP_ROWS)
@@ -291,13 +291,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.created_at_utc is not None:
         _require_nonempty_str(args.created_at_utc, "created_at_utc")
     tape_root = Path(_require_nonempty_str(args.tape_root, "tape_root"))
-    decision_grid_path = Path(_require_nonempty_str(args.decision_grid_npz, "decision_grid_npz"))
+    decision_grid_path = Path(_require_nonempty_str(args.decision_grid_path, "decision_grid_path"))
     tape = load_execution_tape(
         str(tape_root),
         mmap_mode="r",
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
-    decision_grid = load_decision_grid_npz(decision_grid_path)
+    decision_grid = load_decision_grid(decision_grid_path)
     validate_decision_grid_for_execution_tape(decision_grid, tape)
     exchange = tape.manifest.exchange
     symbol = tape.manifest.symbol
@@ -364,7 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": "ok", "dataset_root": str(dataset_root), "dataset_id": manifest.dataset_id, "exchange": manifest.exchange,
         "symbol": manifest.symbol, "tape_root": str(tape_root), "tape_schema": tape.manifest.schema,
         "book_data_type": "incremental_book_L2", "trade_data_type": "trades",
-        "decision_grid_npz": str(decision_grid_path), "decision_grid_hash": decision_grid.decision_grid_hash,
+        "decision_grid_path": str(decision_grid_path), "decision_grid_hash": decision_grid.decision_grid_hash,
         "manifest_path": str(dataset_root / mf.DEFAULT_MANIFEST_FILENAME), "segments": len(manifest.segments), "rows": manifest.total_rows,
         "decision_grid_rows": counters.decision_grid_rows, "rows_written": counters.rows_written, "labels_matured": counters.labels_matured, "pending_decisions_at_eof": counters.pending_decisions_at_eof,
         "splits_written": bool(manifest.splits), "split_roles": [s.role.value for s in manifest.splits],

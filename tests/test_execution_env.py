@@ -1456,7 +1456,7 @@ def test_env_reset_rejects_start_event_index_not_on_linear_signal_grid():
         env.reset(start_event_index=0)
 
 
-def test_signal_end_terminal_applies_terminal_inventory_penalty():
+def test_grid_end_terminal_applies_terminal_inventory_penalty():
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
@@ -1472,13 +1472,29 @@ def test_signal_end_terminal_applies_terminal_inventory_penalty():
     step = env.step(_disabled_action())
 
     assert step.done is True
-    assert step.info["terminal_due_to_signal_end"] is True
-    assert step.info["next_signal_row_index"] is None
-    assert step.info["target_signal_event_index"] is None
+    assert step.info["terminal_due_to_grid_end"] is True
+    assert step.info["next_decision_grid_row_index"] is None
+    assert step.info["target_decision_event_index"] is None
     assert step.execution.reward.terminal_penalty > 0.0
 
 
-def test_step_advances_to_next_linear_signal_event_not_time_boundary_trade():
+def test_final_decision_grid_row_terminates_without_future_tape_event():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [],
+    )
+    linear = _linear_signals_for_decisions(tape, [0, 1], [100, 200])
+    env = ExecutionEnv(tape, linear_signals=linear, config=_env_config())
+    env.reset(start_event_index=1)
+
+    step = env.step(_disabled_action())
+
+    assert step.done is True
+    assert step.info["terminal_due_to_grid_end"] is True
+    assert step.info["events_processed"] == 0
+
+
+def test_step_advances_to_next_decision_grid_event_not_time_boundary_trade():
     l2_events = [
         _l2(seq=0, local_ts_us=100),
         _l2(seq=1, local_ts_us=120),
@@ -1499,13 +1515,13 @@ def test_step_advances_to_next_linear_signal_event_not_time_boundary_trade():
     assert step.truncated is False
     assert step.info["event_index"] == 3
     assert step.info["current_book_ptr"] == int(tape.arrays.events[3]["book_ptr"])
-    assert step.info["target_signal_event_index"] == 3
-    assert step.info["next_signal_row_index"] == 1
-    assert step.info["terminal_due_to_signal_end"] is False
+    assert step.info["target_decision_event_index"] == 3
+    assert step.info["next_decision_grid_row_index"] == 1
+    assert step.info["terminal_due_to_grid_end"] is False
     assert step.info["terminal_due_to_tape_end"] is False
 
 
-def test_step_replays_all_events_through_target_signal_event():
+def test_step_replays_all_events_through_target_decision_grid_event():
     l2_events = [
         _l2(seq=0, local_ts_us=100),
         _l2(seq=1, local_ts_us=151),
@@ -1522,7 +1538,7 @@ def test_step_replays_all_events_through_target_signal_event():
 
     assert step.info["events_processed"] == 2
     assert step.info["event_index"] == 2
-    assert step.info["target_signal_event_index"] == 2
+    assert step.info["target_decision_event_index"] == 2
     assert step.info["num_fills"] >= 1
 
 
@@ -1549,11 +1565,11 @@ def test_max_episode_steps_truncates_after_full_signal_interval():
 
     assert step.truncated is True
     assert step.info["event_index"] == 3
-    assert step.info["target_signal_event_index"] == 3
-    assert step.info["next_signal_row_index"] == 1
+    assert step.info["target_decision_event_index"] == 3
+    assert step.info["next_decision_grid_row_index"] == 1
 
 
-def test_step_rejects_next_linear_signal_row_that_is_not_l2_event():
+def test_step_rejects_next_decision_grid_row_that_is_not_l2_event():
     l2_events = [
         _l2(seq=0, local_ts_us=100),
         _l2(seq=1, local_ts_us=150),
@@ -1565,11 +1581,13 @@ def test_step_rejects_next_linear_signal_row_that_is_not_l2_event():
     grid = _decision_grid_for_decisions(tape, [0, 1], allow_invalid_book_ptr=True)
     linear = _linear_signals_for_grid(tape, grid)
 
-    with pytest.raises(ValueError, match="decision grid rows must point to L2"):
-        ExecutionEnv(tape, decision_grid=grid, linear_signals=linear, config=_env_config())
+    env = ExecutionEnv(tape, decision_grid=grid, linear_signals=linear, config=_env_config())
+    env.reset()
+    with pytest.raises(ValueError, match="decision grid target event"):
+        env.step(_disabled_action())
 
 
-def test_env_reset_accepts_later_linear_signal_start_row():
+def test_env_reset_accepts_later_decision_grid_start_row():
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -1584,7 +1602,7 @@ def test_env_reset_accepts_later_linear_signal_start_row():
     reset = env.reset(start_event_index=1)
 
     assert reset.info["event_index"] == 1
-    assert reset.info["signal_row_index"] == 1
+    assert reset.info["decision_grid_row_index"] == 1
 
 
 def _bid_with_guard_action() -> QuoteAction:

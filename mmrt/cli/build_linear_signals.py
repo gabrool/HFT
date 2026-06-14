@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
-from mmrt.execution.decision_grid import DECISION_GRID_FILENAME, load_decision_grid_npz, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import DECISION_GRID_FILENAME, load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
     MAGNITUDE_INPUT_LOG1P_BPS,
@@ -50,7 +50,7 @@ def _require_positive_int(value: int, name: str) -> int:
 @dataclass(frozen=True, slots=True)
 class BuildLinearSignalsConfig:
     tape_root: str
-    decision_grid_npz: str
+    decision_grid_path: str
     linear_train_result_json: str
     output_npz: str | None = None
     output_json: str | None = None
@@ -62,7 +62,7 @@ class BuildLinearSignalsConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
-        object.__setattr__(self, "decision_grid_npz", _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz"))
+        object.__setattr__(self, "decision_grid_path", _require_nonempty_str(self.decision_grid_path, "decision_grid_path"))
         object.__setattr__(self, "linear_train_result_json", _require_nonempty_str(self.linear_train_result_json, "linear_train_result_json"))
         if self.output_npz is not None:
             object.__setattr__(self, "output_npz", _require_nonempty_str(self.output_npz, "output_npz"))
@@ -80,7 +80,7 @@ class BuildLinearSignalsConfig:
     def as_dict(self) -> dict[str, object]:
         return {
             "tape_root": self.tape_root,
-            "decision_grid_npz": self.decision_grid_npz,
+            "decision_grid_path": self.decision_grid_path,
             "linear_train_result_json": self.linear_train_result_json,
             "output_npz": self.output_npz,
             "output_json": self.output_json,
@@ -100,7 +100,7 @@ def _default_output_json(tape_root: str) -> Path:
     return Path(tape_root) / "linear_signals_summary.json"
 
 
-def _default_decision_grid_npz(tape_root: str) -> Path:
+def _default_decision_grid_path(tape_root: str) -> Path:
     return Path(tape_root) / DECISION_GRID_FILENAME
 
 
@@ -128,7 +128,7 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
         mmap_mode=config.mmap_mode,
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
-    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    decision_grid = load_decision_grid(config.decision_grid_path)
     validate_decision_grid_for_execution_tape(decision_grid, tape)
     result = load_linear_train_result(config.linear_train_result_json)
     if result.schema != LINEAR_TRAINING_RESULT_SCHEMA:
@@ -149,7 +149,7 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
         "status": "ok",
         "run_type": "build_linear_signals",
         "tape_root": str(Path(config.tape_root)),
-        "decision_grid_npz": str(Path(config.decision_grid_npz)),
+        "decision_grid_path": str(Path(config.decision_grid_path)),
         "linear_train_result_json": str(Path(config.linear_train_result_json)),
         "output_npz": str(output_npz),
         "output_json": str(output_json),
@@ -180,7 +180,7 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
-    parser.add_argument("--decision-grid-npz", required=True)
+    parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--linear-train-result-json", required=True)
     parser.add_argument("--output-npz")
     parser.add_argument("--output-json")
@@ -195,7 +195,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> BuildLinearSignalsConfig:
     return BuildLinearSignalsConfig(
         tape_root=args.tape_root,
-        decision_grid_npz=args.decision_grid_npz,
+        decision_grid_path=args.decision_grid_path,
         linear_train_result_json=args.linear_train_result_json,
         output_npz=args.output_npz,
         output_json=args.output_json,

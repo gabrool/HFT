@@ -332,7 +332,6 @@ def save_adverse_selection_signals_arrays(
     for start in range(0, n, validate_chunk_rows):
         end = min(start + validate_chunk_rows, n)
         for name, arr in decision_arrays.items():
-            # Conversion validates integer compatibility for the chunk only.
             np.asarray(arr[start:end], dtype=np.int64)
         for target, arr in pred_arrays.items():
             chunk = np.asarray(arr[start:end], dtype=np.float32)

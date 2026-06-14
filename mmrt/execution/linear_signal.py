@@ -332,10 +332,6 @@ class LinearSignalArtifactMetadata:
         if self.decision_grid_n_rows != self.n_rows:
             raise ValueError("decision_grid_n_rows must equal n_rows")
 
-    @property
-    def max_decision_interval_us(self) -> int:
-        return int(self.decision_schedule["max_decision_interval_us"])
-
     def as_dict(self) -> dict[str, object]:
         return {
             "tape_schema": self.tape_schema,
@@ -632,72 +628,6 @@ def linear_signal_artifact_summary(artifact: LinearSignalArtifact, *, path: str 
     }
 
 
-@dataclass(frozen=True, slots=True)
-class LinearSignalStart:
-    event_index: int
-    row_index: int
-    rows_available: int
-
-    def as_dict(self) -> dict[str, int]:
-        return {
-            "event_index": int(self.event_index),
-            "row_index": int(self.row_index),
-            "rows_available": int(self.rows_available),
-        }
-
-
-def linear_signal_row_for_event_index(
-    artifact: LinearSignalArtifact,
-    event_index: int,
-) -> int:
-    if not isinstance(artifact, LinearSignalArtifact):
-        raise ValueError("artifact must be LinearSignalArtifact")
-    event_index = _require_nonnegative_int(event_index, "event_index")
-
-    indices = artifact.decision_event_index
-    pos = int(np.searchsorted(indices, event_index, side="left"))
-    if pos >= indices.shape[0] or int(indices[pos]) != event_index:
-        raise ValueError(
-            "start_event_index must match an existing linear signal decision_event_index; "
-            f"got {event_index}"
-        )
-    return pos
-
-
-def validate_linear_signal_start_event_index(
-    artifact: LinearSignalArtifact,
-    *,
-    start_event_index: int | None = None,
-    min_rows: int | None = None,
-) -> LinearSignalStart:
-    if not isinstance(artifact, LinearSignalArtifact):
-        raise ValueError("artifact must be LinearSignalArtifact")
-
-    if start_event_index is None:
-        event_index = int(artifact.decision_event_index[0])
-        row_index = 0
-    else:
-        event_index = _require_nonnegative_int(start_event_index, "start_event_index")
-        row_index = linear_signal_row_for_event_index(artifact, event_index)
-
-    rows_available = artifact.n_rows - row_index
-
-    if min_rows is not None:
-        min_rows = _require_nonnegative_int(min_rows, "min_rows")
-        if rows_available < min_rows:
-            raise ValueError(
-                "linear signal artifact does not contain enough rows after start_event_index: "
-                f"start_event_index={event_index} row_index={row_index} "
-                f"rows_available={rows_available} min_rows={min_rows}"
-            )
-
-    return LinearSignalStart(
-        event_index=event_index,
-        row_index=row_index,
-        rows_available=rows_available,
-    )
-
-
 def validate_linear_signal_artifact_metadata(
     artifact: LinearSignalArtifact,
     *,
@@ -926,13 +856,11 @@ __all__ = [
     "LinearSignalArrays",
     "LinearSignalArtifactMetadata",
     "LinearSignalArtifact",
-    "LinearSignalStart",
     "magnitude_to_bps",
     "build_gated_linear_signal",
     "prediction_row_to_signal",
     "predictions_to_signal_arrays",
     "linear_signal_at",
-    "linear_signal_row_for_event_index",
     "save_linear_signal_artifact_npz",
     "linear_signal_array_fields",
     "save_linear_signal_artifact_arrays",
@@ -940,5 +868,4 @@ __all__ = [
     "linear_signal_artifact_summary",
     "validate_linear_signal_artifact_metadata",
     "validate_linear_signals_for_decision_grid",
-    "validate_linear_signal_start_event_index",
 ]

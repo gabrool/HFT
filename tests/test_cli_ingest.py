@@ -9,7 +9,7 @@ pytest.importorskip("pyarrow.parquet")
 
 from mmrt import config as cfg
 from mmrt.cli import ingest as cli
-from mmrt.execution.decision_grid import load_decision_grid_npz, save_decision_grid_npz
+from mmrt.execution.decision_grid import load_decision_grid, save_decision_grid
 from mmrt.execution.execution_tape import save_execution_tape
 from mmrt.execution.linear_signal_builder import iter_execution_linear_feature_chunks_for_decision_grid
 from mmrt.features.specs import FEATURE_NAMES_HASH, FEATURE_SCHEMA, FEATURE_SPECS_HASH
@@ -23,7 +23,7 @@ def _saved_tape(tmp_path: Path, **kwargs):
     tape = make_tape(**kwargs)
     tape_root = tmp_path / "tape"
     save_execution_tape(tape, tape_root)
-    save_decision_grid_npz(tape_root / "decision_grid.npz", decision_grid_for_tape(tape), overwrite=True)
+    save_decision_grid(tape_root / "decision_grid", decision_grid_for_tape(tape), overwrite=True)
     return tape, tape_root
 
 
@@ -33,7 +33,7 @@ def _run_ingest(tmp_path: Path, tape_root: Path, *extra_args: str) -> Path:
         "--dataset-root", str(dataset_root),
         "--dataset-id", "ds-tape",
         "--tape-root", str(tape_root),
-        "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
+        "--decision-grid", str(tape_root / "decision_grid"),
         *extra_args,
     ])
     assert rc == 0
@@ -89,7 +89,7 @@ def test_ingest_rows_match_execution_feature_replay_exactly(tmp_path):
     )
     dataset_local_ts = np.asarray(table[mf.LOCAL_TS_US_COLUMN], dtype=np.int64)
 
-    grid = load_decision_grid_npz(tape_root / "decision_grid.npz")
+    grid = load_decision_grid(tape_root / "decision_grid")
     chunks = list(iter_execution_linear_feature_chunks_for_decision_grid(tape, decision_grid=grid))
     serving_features = np.vstack([c.features for c in chunks])
     serving_local_ts = np.concatenate([c.decision_local_ts_us for c in chunks])
@@ -129,7 +129,7 @@ def test_ingest_rejects_invalid_schedule_arguments(tmp_path):
             "--dataset-root", str(tmp_path / "ds"),
             "--dataset-id", "ds",
             "--tape-root", str(tape_root),
-            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
+            "--decision-grid", str(tape_root / "decision_grid"),
             "--min-decision-interval-us", "200000",
             "--max-decision-interval-us", "100000",
         ])
@@ -142,7 +142,7 @@ def test_ingest_rejects_tape_without_trades(tmp_path):
             "--dataset-root", str(tmp_path / "ds"),
             "--dataset-id", "ds",
             "--tape-root", str(tape_root),
-            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
+            "--decision-grid", str(tape_root / "decision_grid"),
         ])
 
 
@@ -154,7 +154,7 @@ def test_ingest_rejects_existing_manifest(tmp_path):
             "--dataset-root", str(dataset_root),
             "--dataset-id", "ds-again",
             "--tape-root", str(tape_root),
-            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
+            "--decision-grid", str(tape_root / "decision_grid"),
         ])
 
 
@@ -165,7 +165,7 @@ def test_ingest_split_args_require_train_and_val(tmp_path):
             "--dataset-root", str(tmp_path / "ds"),
             "--dataset-id", "ds",
             "--tape-root", str(tape_root),
-            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
+            "--decision-grid", str(tape_root / "decision_grid"),
             "--split-test", "1:2",
         ])
 

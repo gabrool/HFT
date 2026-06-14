@@ -13,7 +13,7 @@ import torch
 from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
-from mmrt.execution.decision_grid import load_decision_grid_npz, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNAL_ARTIFACT_SCHEMA,
@@ -161,7 +161,7 @@ def _mapping_get_optional_mapping(
 @dataclass(frozen=True, slots=True)
 class ExecutionPolicyEvaluationCLIConfig:
     tape_root: str
-    decision_grid_npz: str
+    decision_grid_path: str
     checkpoint_path: str
     output_json: str | None = None
     linear_signals_npz: str | None = None
@@ -210,7 +210,7 @@ class ExecutionPolicyEvaluationCLIConfig:
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
-        _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz")
+        _require_nonempty_str(self.decision_grid_path, "decision_grid_path")
         _require_nonempty_str(self.checkpoint_path, "checkpoint_path")
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
@@ -269,7 +269,7 @@ class ExecutionPolicyEvaluationCLIConfig:
 def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, object]:
     return {
         "tape_root": config.tape_root,
-        "decision_grid_npz": config.decision_grid_npz,
+        "decision_grid_path": config.decision_grid_path,
         "checkpoint_path": config.checkpoint_path,
         "output_json": config.output_json,
         "linear_signals_npz": config.linear_signals_npz,
@@ -586,7 +586,7 @@ def run_execution_policy_evaluation(
         else _default_linear_signals_npz(config.tape_root)
     )
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
-    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    decision_grid = load_decision_grid(config.decision_grid_path)
     validate_decision_grid_for_execution_tape(decision_grid, tape)
     adverse_signals = load_adverse_selection_signals(config.adverse_signals_npz) if config.adverse_signals_npz is not None else None
 
@@ -608,7 +608,7 @@ def run_execution_policy_evaluation(
     eval_min_rows = (config.max_steps + 1) if config.max_steps is not None else None
     env_min_rows = (env_config.max_episode_steps + 1) if env_config.max_episode_steps is not None else None
     requested_min_rows = max((x for x in (eval_min_rows, env_min_rows) if x is not None), default=None)
-    linear_start = validate_linear_signals_for_execution_tape(
+    decision_grid_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
         decision_grid=decision_grid,
@@ -675,7 +675,7 @@ def run_execution_policy_evaluation(
         "status": result.status,
         "run_type": "evaluate_execution_policy",
         "tape_root": str(Path(config.tape_root)),
-        "decision_grid_npz": str(Path(config.decision_grid_npz)),
+        "decision_grid_path": str(Path(config.decision_grid_path)),
         "checkpoint_path": str(Path(config.checkpoint_path)),
         "output_json": str(output_json),
         "config": _summary_config(config),
@@ -706,7 +706,7 @@ def run_execution_policy_evaluation(
         "linear_signals": linear_signal_artifact_summary(
             linear_signals, path=str(linear_signals_path)
         ),
-        "linear_signal_start": linear_start.as_dict(),
+        "decision_grid_start": decision_grid_start.as_dict(),
         "decision_grid": {
             "schema": decision_grid.metadata.schema,
             "hash": decision_grid.decision_grid_hash,
@@ -724,7 +724,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Evaluate a saved execution PPO policy checkpoint on an execution tape."
     )
     parser.add_argument("--tape-root", required=True)
-    parser.add_argument("--decision-grid-npz", required=True)
+    parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--checkpoint-path", required=True)
 
     parser.add_argument("--output-json")
@@ -779,7 +779,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIConfig:
     return ExecutionPolicyEvaluationCLIConfig(
         tape_root=args.tape_root,
-        decision_grid_npz=args.decision_grid_npz,
+        decision_grid_path=args.decision_grid_path,
         checkpoint_path=args.checkpoint_path,
         output_json=args.output_json,
         linear_signals_npz=args.linear_signals_npz,

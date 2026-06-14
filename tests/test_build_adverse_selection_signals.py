@@ -39,7 +39,7 @@ def _training_root_and_model(tmp_path):
     run_adverse_selection_training(
         AdverseSelectionTrainCLIConfig(
             tape_root=str(root),
-            decision_grid_npz=str(root / "decision_grid.npz"),
+            decision_grid_path=str(root / "decision_grid"),
             output_json=str(tmp_path / "train.json"),
             model_npz=str(model_npz),
             overwrite=True,
@@ -66,7 +66,7 @@ def test_build_adverse_selection_signals_end_to_end(tmp_path):
     summary = build_adverse_selection_signals_from_config(
         BuildAdverseSelectionSignalsConfig(
             tape_root=str(root),
-            decision_grid_npz=str(root / "decision_grid.npz"),
+            decision_grid_path=str(root / "decision_grid"),
             model_npz=str(model_npz),
             output_npz=str(output_npz),
             output_json=str(output_json),
@@ -113,7 +113,7 @@ def test_build_adverse_selection_signals_rejects_symbol_mismatch(tmp_path):
         build_adverse_selection_signals_from_config(
             BuildAdverseSelectionSignalsConfig(
                 str(root),
-                str(root / "decision_grid.npz"),
+                str(root / "decision_grid"),
                 str(bad_model),
                 output_npz=str(tmp_path / "x.npz"),
                 output_json=str(tmp_path / "x.json"),
@@ -149,7 +149,7 @@ def test_build_adverse_selection_signals_rejects_feature_name_mismatch(tmp_path)
         build_adverse_selection_signals_from_config(
             BuildAdverseSelectionSignalsConfig(
                 str(root),
-                str(root / "decision_grid.npz"),
+                str(root / "decision_grid"),
                 str(bad_model),
                 output_npz=str(tmp_path / "y.npz"),
                 output_json=str(tmp_path / "y.json"),
@@ -160,7 +160,7 @@ def test_build_adverse_selection_signals_rejects_feature_name_mismatch(tmp_path)
 def test_build_adverse_selection_signals_parser_no_mmap():
     args = build_arg_parser().parse_args([
         "--tape-root", "/tmp/tape",
-        "--decision-grid-npz", "/tmp/tape/decision_grid.npz",
+        "--decision-grid", "/tmp/tape/decision_grid",
         "--model-npz", "/tmp/model.npz",
         "--no-mmap",
     ])
@@ -178,7 +178,7 @@ def test_build_adverse_selection_signals_overwrite_guard(tmp_path):
         build_adverse_selection_signals_from_config(
             BuildAdverseSelectionSignalsConfig(
                 str(root),
-                str(root / "decision_grid.npz"),
+                str(root / "decision_grid"),
                 str(model_npz),
                 output_npz=str(output_npz),
                 output_json=str(output_json),

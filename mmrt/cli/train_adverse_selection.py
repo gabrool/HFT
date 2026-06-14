@@ -24,7 +24,7 @@ from mmrt.execution.adverse_selection import (
     adverse_selection_label_names,
 )
 from mmrt.execution.contracts import LatencyConfig, QueueModelMode
-from mmrt.execution.decision_grid import load_decision_grid_npz, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
@@ -189,7 +189,7 @@ def _resolve_target_names(dataset, requested: tuple[str, ...] | str) -> tuple[st
 @dataclass(frozen=True, slots=True)
 class AdverseSelectionTrainCLIConfig:
     tape_root: str
-    decision_grid_npz: str
+    decision_grid_path: str
     output_json: str | None = None
     model_npz: str | None = None
     overwrite: bool = False
@@ -241,7 +241,7 @@ class AdverseSelectionTrainCLIConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
-        object.__setattr__(self, "decision_grid_npz", _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz"))
+        object.__setattr__(self, "decision_grid_path", _require_nonempty_str(self.decision_grid_path, "decision_grid_path"))
         if self.output_json is not None:
             object.__setattr__(self, "output_json", _require_nonempty_str(self.output_json, "output_json"))
         if self.model_npz is not None:
@@ -347,7 +347,7 @@ def _build_adverse_selection_config(config: AdverseSelectionTrainCLIConfig) -> A
 def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]:
     return {
         "tape_root": config.tape_root,
-        "decision_grid_npz": config.decision_grid_npz,
+        "decision_grid_path": config.decision_grid_path,
         "output_json": config.output_json,
         "model_npz": config.model_npz,
         "overwrite": config.overwrite,
@@ -668,7 +668,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         mmap_mode=config.mmap_mode,
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
-    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    decision_grid = load_decision_grid(config.decision_grid_path)
     validate_decision_grid_for_execution_tape(decision_grid, tape)
     adverse_config = _build_adverse_selection_config(config)
     dataset_root = Path(config.dataset_root) if config.dataset_root is not None else Path(config.tape_root) / "adverse_selection_dataset"
@@ -737,7 +737,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         "run_type": "train_adverse_selection",
         "tape_root": str(Path(config.tape_root)),
         "dataset_root": str(dataset_root),
-        "decision_grid_npz": str(Path(config.decision_grid_npz)),
+        "decision_grid_path": str(Path(config.decision_grid_path)),
         "work_dir": str(work_root),
         "output_json": str(output_json),
         "model_npz": str(model_npz) if model_written else None,
@@ -786,7 +786,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
-    parser.add_argument("--decision-grid-npz", required=True)
+    parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--output-json")
     parser.add_argument("--model-npz")
     parser.add_argument("--overwrite", action="store_true")
@@ -841,7 +841,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfig:
     return AdverseSelectionTrainCLIConfig(
         tape_root=args.tape_root,
-        decision_grid_npz=args.decision_grid_npz,
+        decision_grid_path=args.decision_grid_path,
         output_json=args.output_json,
         model_npz=args.model_npz,
         overwrite=args.overwrite,

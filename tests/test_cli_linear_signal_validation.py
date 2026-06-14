@@ -13,7 +13,7 @@ def test_validate_linear_signals_for_execution_tape_accepts_later_start():
     grid = decision_grid_for_tape(tape)
     linear_signals = _linear_artifact_for_tape(tape, decision_grid=grid)
 
-    linear_start = validate_linear_signals_for_execution_tape(
+    decision_grid_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
         decision_grid=grid,
@@ -22,9 +22,9 @@ def test_validate_linear_signals_for_execution_tape_accepts_later_start():
     )
 
     assert linear_signals.metadata.start_event_index == 0
-    assert linear_start.event_index == 1
-    assert linear_start.row_index == 1
-    assert linear_start.rows_available == 2
+    assert decision_grid_start.event_index == 1
+    assert decision_grid_start.decision_grid_row_index == 1
+    assert decision_grid_start.rows_available == 2
 
 
 def test_validate_linear_signals_for_execution_tape_rejects_non_grid_start():
@@ -35,7 +35,7 @@ def test_validate_linear_signals_for_execution_tape_rejects_non_grid_start():
     grid = decision_grid_for_tape(tape, max_rows=2)
     linear_signals = _linear_artifact_for_tape(tape, decision_grid=grid)
 
-    with pytest.raises(ValueError, match="decision_event_index"):
+    with pytest.raises(ValueError, match="decision grid row"):
         validate_linear_signals_for_execution_tape(
             linear_signals=linear_signals,
             tape=tape,

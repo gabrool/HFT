@@ -1,18 +1,19 @@
-"""First-class execution decision-grid artifacts.
+"""Decision-grid artifacts for execution-tape row alignment.
 
-``DecisionScheduleConfig`` describes the live policy for when to decide.
-``decision_grid.npz`` is the deterministic offline realization of that policy
-for one execution tape. Downstream training, signal, adverse-selection, and RL
-code must align by this grid's hash instead of regenerating decision rows.
+``DecisionScheduleConfig`` defines when decisions should occur. A decision
+grid is the realized sequence of valid tape rows for one execution tape, and
+downstream artifacts align by its hash.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from typing import Any, Mapping
 
 import numpy as np
@@ -21,7 +22,9 @@ from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, ExecutionTap
 from mmrt.features.schedule import DecisionScheduleConfig, decision_schedule_config_from_dict
 
 DECISION_GRID_SCHEMA = "mmrt_execution_decision_grid_v1"
-DECISION_GRID_FILENAME = "decision_grid.npz"
+DECISION_GRID_FILENAME = "decision_grid"
+DECISION_GRID_MANIFEST_FILENAME = "manifest.json"
+DECISION_GRID_ARRAYS_DIRNAME = "arrays"
 DECISION_GRID_SUMMARY_FILENAME = "decision_grid_summary.json"
 SCHEDULER_VERSION = "event_schedule_reason_v1"
 
@@ -50,6 +53,23 @@ _ARRAY_DTYPES = {
     "l2_events_since_prev_decision": np.dtype("int64"),
     "trade_events_since_prev_decision": np.dtype("int64"),
 }
+
+_HASH_CHUNK_ROWS = 262_144
+
+
+class DecisionGridValidationMode(str, Enum):
+    METADATA_ONLY = "metadata_only"
+    SHAPE_ONLY = "shape_only"
+    FULL = "full"
+
+
+def _coerce_validation_mode(value: DecisionGridValidationMode | str) -> DecisionGridValidationMode:
+    if isinstance(value, DecisionGridValidationMode):
+        return value
+    try:
+        return DecisionGridValidationMode(str(value))
+    except ValueError as exc:
+        raise ValueError("validation_mode must be metadata_only, shape_only, or full") from exc
 
 
 def _require_nonempty_str(value: str, name: str) -> str:
@@ -97,9 +117,11 @@ def _coerce_grid_array(values: Any, name: str) -> np.ndarray:
     if arr.ndim != 1:
         raise ValueError(f"{name} must be a rank-1 array")
     dtype = _ARRAY_DTYPES[name]
+    if arr.dtype == dtype:
+        return arr
     if not np.can_cast(arr.dtype, dtype, casting="same_kind") and arr.dtype.kind not in "iu":
         raise ValueError(f"{name} must be integer-compatible")
-    return np.ascontiguousarray(arr, dtype=dtype)
+    return arr.astype(dtype, copy=False)
 
 
 def _metadata_without_hash_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -109,20 +131,38 @@ def _metadata_without_hash_fields(metadata: Mapping[str, Any]) -> dict[str, Any]
     return _json_safe(out, "metadata")  # type: ignore[return-value]
 
 
-def compute_decision_grid_hash(metadata: Mapping[str, Any], arrays: Mapping[str, np.ndarray]) -> str:
+def _array_hash_chunks(arr: np.ndarray, dtype: np.dtype, *, chunk_rows: int) -> Any:
+    n = int(arr.shape[0])
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        chunk = np.asarray(arr[start:end])
+        if chunk.dtype != dtype:
+            chunk = chunk.astype(dtype, copy=False)
+        yield chunk.tobytes(order="C")
+
+
+def compute_decision_grid_hash(
+    metadata: Mapping[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    *,
+    chunk_rows: int = _HASH_CHUNK_ROWS,
+) -> str:
     """Hash canonical metadata plus raw arrays in schema order."""
 
+    chunk_rows = _require_positive_int(int(chunk_rows), "chunk_rows")
     h = hashlib.sha256()
     h.update(_canonical_json_bytes(_metadata_without_hash_fields(metadata)))
     for name in DECISION_GRID_ARRAY_ORDER:
-        arr = np.ascontiguousarray(np.asarray(arrays[name], dtype=_ARRAY_DTYPES[name]))
+        arr = _coerce_grid_array(arrays[name], name)
+        dtype = _ARRAY_DTYPES[name]
         h.update(name.encode("ascii"))
         h.update(b"\0")
-        h.update(arr.dtype.str.encode("ascii"))
+        h.update(dtype.str.encode("ascii"))
         h.update(b"\0")
-        h.update(_canonical_json_bytes({"shape": list(arr.shape)}))
+        h.update(_canonical_json_bytes({"shape": [int(arr.shape[0])]}))
         h.update(b"\0")
-        h.update(arr.tobytes(order="C"))
+        for payload in _array_hash_chunks(arr, dtype, chunk_rows=chunk_rows):
+            h.update(payload)
         h.update(b"\0")
     return h.hexdigest()
 
@@ -154,7 +194,7 @@ class DecisionGridMetadata:
 
     def __post_init__(self) -> None:
         if self.schema != DECISION_GRID_SCHEMA:
-            raise ValueError("invalid decision grid schema")
+            raise ValueError("decision grid schema mismatch")
         for name in ("tape_schema", "exchange", "symbol", "scheduler_version", "created_at_utc", "decision_grid_hash"):
             object.__setattr__(self, name, _require_nonempty_str(getattr(self, name), name))
         for name in (
@@ -260,38 +300,27 @@ class DecisionGrid:
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, DecisionGridMetadata):
             raise ValueError("metadata must be DecisionGridMetadata")
-        arrays = self.arrays_dict(copy=False)
-        cleaned = {name: _coerce_grid_array(arrays[name], name) for name in DECISION_GRID_ARRAY_ORDER}
         n_rows = self.metadata.n_rows
+        cleaned = {name: _coerce_grid_array(getattr(self, name), name) for name in DECISION_GRID_ARRAY_ORDER}
         for name, arr in cleaned.items():
             if arr.shape != (n_rows,):
                 raise ValueError(f"{name} length must equal metadata.n_rows")
-        if n_rows <= 0:
-            raise ValueError("decision grid must contain at least one row")
-        idx = cleaned["decision_event_index"]
-        ts = cleaned["decision_local_ts_us"]
-        seq = cleaned["decision_event_seq"]
-        bp = cleaned["book_ptr"]
-        if (idx < 0).any() or (bp < 0).any() or (seq < 0).any():
-            raise ValueError("decision grid row pointers must be nonnegative")
-        if (ts <= 0).any():
-            raise ValueError("decision_local_ts_us must be positive")
-        if n_rows > 1:
-            if (np.diff(idx) <= 0).any():
-                raise ValueError("decision_event_index must be strictly increasing")
-            if (np.diff(ts) <= 0).any():
-                raise ValueError("decision_local_ts_us must be strictly increasing")
-        if int(idx[0]) != self.metadata.first_decision_event_index or int(idx[-1]) != self.metadata.last_decision_event_index:
-            raise ValueError("metadata first/last decision_event_index mismatch")
-        if int(ts[0]) != self.metadata.first_decision_local_ts_us or int(ts[-1]) != self.metadata.last_decision_local_ts_us:
-            raise ValueError("metadata first/last decision_local_ts_us mismatch")
-        if int(seq[0]) != self.metadata.first_decision_event_seq or int(seq[-1]) != self.metadata.last_decision_event_seq:
-            raise ValueError("metadata first/last decision_event_seq mismatch")
-        if int(bp[0]) != self.metadata.first_book_ptr or int(bp[-1]) != self.metadata.last_book_ptr:
-            raise ValueError("metadata first/last book_ptr mismatch")
-        expected_hash = compute_decision_grid_hash(self.metadata.as_dict(), cleaned)
-        if expected_hash != self.metadata.decision_grid_hash:
-            raise ValueError("decision_grid_hash mismatch")
+        if int(cleaned["decision_event_index"][0]) != self.metadata.first_decision_event_index:
+            raise ValueError("metadata first_decision_event_index mismatch")
+        if int(cleaned["decision_event_index"][-1]) != self.metadata.last_decision_event_index:
+            raise ValueError("metadata last_decision_event_index mismatch")
+        if int(cleaned["decision_local_ts_us"][0]) != self.metadata.first_decision_local_ts_us:
+            raise ValueError("metadata first_decision_local_ts_us mismatch")
+        if int(cleaned["decision_local_ts_us"][-1]) != self.metadata.last_decision_local_ts_us:
+            raise ValueError("metadata last_decision_local_ts_us mismatch")
+        if int(cleaned["decision_event_seq"][0]) != self.metadata.first_decision_event_seq:
+            raise ValueError("metadata first_decision_event_seq mismatch")
+        if int(cleaned["decision_event_seq"][-1]) != self.metadata.last_decision_event_seq:
+            raise ValueError("metadata last_decision_event_seq mismatch")
+        if int(cleaned["book_ptr"][0]) != self.metadata.first_book_ptr:
+            raise ValueError("metadata first_book_ptr mismatch")
+        if int(cleaned["book_ptr"][-1]) != self.metadata.last_book_ptr:
+            raise ValueError("metadata last_book_ptr mismatch")
         for name, arr in cleaned.items():
             object.__setattr__(self, name, arr)
 
@@ -312,6 +341,73 @@ class DecisionGrid:
         if copy:
             return {name: np.array(arr, copy=True) for name, arr in out.items()}
         return out
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionGridStart:
+    event_index: int
+    decision_grid_row_index: int
+    rows_available: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "event_index", _require_nonnegative_int(int(self.event_index), "event_index"))
+        object.__setattr__(
+            self,
+            "decision_grid_row_index",
+            _require_nonnegative_int(int(self.decision_grid_row_index), "decision_grid_row_index"),
+        )
+        object.__setattr__(self, "rows_available", _require_positive_int(int(self.rows_available), "rows_available"))
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "event_index": self.event_index,
+            "decision_grid_row_index": self.decision_grid_row_index,
+            "rows_available": self.rows_available,
+        }
+
+
+def decision_grid_row_for_event_index(
+    grid: DecisionGrid,
+    event_index: int,
+) -> int:
+    if not isinstance(grid, DecisionGrid):
+        raise ValueError("grid must be DecisionGrid")
+    event_index = _require_nonnegative_int(event_index, "event_index")
+    indices = grid.decision_event_index
+    pos = int(np.searchsorted(indices, event_index, side="left"))
+    if pos >= indices.shape[0] or int(indices[pos]) != event_index:
+        raise ValueError("start_event_index must reference a decision grid row")
+    return pos
+
+
+def validate_decision_grid_start_event_index(
+    grid: DecisionGrid,
+    *,
+    start_event_index: int | None = None,
+    min_rows: int | None = None,
+) -> DecisionGridStart:
+    if not isinstance(grid, DecisionGrid):
+        raise ValueError("grid must be DecisionGrid")
+    if start_event_index is None:
+        event_index = int(grid.decision_event_index[0])
+        row_index = 0
+    else:
+        event_index = _require_nonnegative_int(start_event_index, "start_event_index")
+        row_index = decision_grid_row_for_event_index(grid, event_index)
+    rows_available = grid.n_rows - row_index
+    if min_rows is not None:
+        min_rows = _require_nonnegative_int(min_rows, "min_rows")
+        if rows_available < min_rows:
+            raise ValueError(
+                "decision grid does not contain enough rows after start_event_index: "
+                f"start_event_index={event_index} decision_grid_row_index={row_index} "
+                f"rows_available={rows_available} min_rows={min_rows}"
+            )
+    return DecisionGridStart(
+        event_index=event_index,
+        decision_grid_row_index=row_index,
+        rows_available=rows_available,
+    )
 
 
 def decision_grid_metadata_from_tape(
@@ -357,42 +453,106 @@ def decision_grid_metadata_from_tape(
     return DecisionGridMetadata.from_dict(base)
 
 
-def save_decision_grid_npz(path: str | Path, grid: DecisionGrid, *, overwrite: bool = False) -> None:
+def _write_manifest(path: Path, metadata: DecisionGridMetadata) -> None:
+    tmp = path / f"{DECISION_GRID_MANIFEST_FILENAME}.tmp"
+    tmp.write_text(json.dumps(metadata.as_dict(), sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    tmp.replace(path / DECISION_GRID_MANIFEST_FILENAME)
+
+
+def write_decision_grid_manifest(path: str | Path, metadata: DecisionGridMetadata) -> None:
+    path = Path(path)
+    if not path.is_dir():
+        raise FileNotFoundError(str(path))
+    _write_manifest(path, metadata)
+
+
+def save_decision_grid(path: str | Path, grid: DecisionGrid, *, overwrite: bool = False) -> None:
     if not isinstance(grid, DecisionGrid):
         raise ValueError("grid must be DecisionGrid")
     path = Path(path)
     if path.exists() and not overwrite:
         raise FileExistsError(str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    tmp = parent / f".{path.name}.tmp"
     if tmp.exists():
-        tmp.unlink()
-    payload = grid.arrays_dict(copy=False)
-    payload["schema"] = np.array(DECISION_GRID_SCHEMA)
-    payload["metadata_json"] = np.array(json.dumps(grid.metadata.as_dict(), sort_keys=True))
-    with tmp.open("wb") as handle:
-        np.savez(handle, **payload)
+        if tmp.is_dir():
+            shutil.rmtree(tmp)
+        else:
+            tmp.unlink()
+    (tmp / DECISION_GRID_ARRAYS_DIRNAME).mkdir(parents=True)
+    for name in DECISION_GRID_ARRAY_ORDER:
+        np.save(tmp / DECISION_GRID_ARRAYS_DIRNAME / f"{name}.npy", getattr(grid, name))
+    _write_manifest(tmp, grid.metadata)
+    if path.exists():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
     tmp.replace(path)
 
 
-def load_decision_grid_npz(path: str | Path, *, mmap_mode: str | None = None) -> DecisionGrid:
+def load_decision_grid_metadata(path: str | Path) -> DecisionGridMetadata:
     path = Path(path)
-    if not path.exists():
+    raw = json.loads((path / DECISION_GRID_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    return DecisionGridMetadata.from_dict(raw)
+
+
+def load_decision_grid(
+    path: str | Path,
+    *,
+    mmap_mode: str | None = "r",
+    validation_mode: DecisionGridValidationMode | str = DecisionGridValidationMode.SHAPE_ONLY,
+) -> DecisionGrid:
+    if mmap_mode not in (None, "r"):
+        raise ValueError("mmap_mode must be None or 'r'")
+    mode = _coerce_validation_mode(validation_mode)
+    path = Path(path)
+    if not path.is_dir():
         raise FileNotFoundError(str(path))
-    with np.load(path, mmap_mode=mmap_mode, allow_pickle=False) as data:
-        keys = set(data.files)
-        if "schema" not in keys:
-            raise ValueError("decision grid NPZ missing schema")
-        schema = str(np.asarray(data["schema"]).item())
-        if schema != DECISION_GRID_SCHEMA:
-            raise ValueError("decision grid schema mismatch")
-        required = set(DECISION_GRID_ARRAY_ORDER) | {"metadata_json"}
-        missing = sorted(required - keys)
-        if missing:
-            raise ValueError(f"decision grid NPZ missing required arrays: {missing}")
-        metadata = DecisionGridMetadata.from_dict(json.loads(str(np.asarray(data["metadata_json"]).item())))
-        arrays = {name: np.array(data[name], copy=True) for name in DECISION_GRID_ARRAY_ORDER}
-    return DecisionGrid(metadata=metadata, **arrays)
+    metadata = load_decision_grid_metadata(path)
+    arrays_dir = path / DECISION_GRID_ARRAYS_DIRNAME
+    arrays = {
+        name: np.load(arrays_dir / f"{name}.npy", mmap_mode=mmap_mode, allow_pickle=False)
+        for name in DECISION_GRID_ARRAY_ORDER
+    }
+    grid = DecisionGrid(metadata=metadata, **arrays)
+    validate_decision_grid_integrity(grid, mode=mode)
+    return grid
+
+
+def validate_decision_grid_integrity(
+    grid: DecisionGrid,
+    *,
+    mode: DecisionGridValidationMode | str = DecisionGridValidationMode.SHAPE_ONLY,
+) -> None:
+    if not isinstance(grid, DecisionGrid):
+        raise ValueError("grid must be DecisionGrid")
+    mode = _coerce_validation_mode(mode)
+    if mode is DecisionGridValidationMode.METADATA_ONLY:
+        return
+    arrays = grid.arrays_dict(copy=False)
+    for name, arr in arrays.items():
+        if arr.dtype != _ARRAY_DTYPES[name] or arr.shape != (grid.n_rows,):
+            raise ValueError(f"{name} must have dtype {_ARRAY_DTYPES[name]} and shape ({grid.n_rows},)")
+    if mode is DecisionGridValidationMode.SHAPE_ONLY:
+        return
+    idx = grid.decision_event_index
+    ts = grid.decision_local_ts_us
+    seq = grid.decision_event_seq
+    bp = grid.book_ptr
+    if (idx < 0).any() or (bp < 0).any() or (seq < 0).any():
+        raise ValueError("decision grid row pointers must be nonnegative")
+    if (ts <= 0).any():
+        raise ValueError("decision_local_ts_us must be positive")
+    if grid.n_rows > 1:
+        if (np.diff(idx) <= 0).any():
+            raise ValueError("decision_event_index must be strictly increasing")
+        if (np.diff(ts) <= 0).any():
+            raise ValueError("decision_local_ts_us must be strictly increasing")
+    expected_hash = compute_decision_grid_hash(grid.metadata.as_dict(), arrays)
+    if expected_hash != grid.metadata.decision_grid_hash:
+        raise ValueError("decision_grid_hash mismatch")
 
 
 def decision_grid_summary(grid: DecisionGrid, *, path: str | None = None) -> dict[str, object]:
@@ -418,7 +578,7 @@ def decision_grid_lineage(grid: DecisionGrid, *, path: str | None = None) -> dic
     if not isinstance(grid, DecisionGrid):
         raise ValueError("grid must be DecisionGrid")
     return {
-        "decision_grid_npz": path,
+        "decision_grid_path": path,
         "decision_grid_schema": grid.metadata.schema,
         "decision_grid_hash": grid.decision_grid_hash,
         "decision_grid_n_rows": grid.n_rows,
@@ -427,11 +587,17 @@ def decision_grid_lineage(grid: DecisionGrid, *, path: str | None = None) -> dic
     }
 
 
-def validate_decision_grid_for_execution_tape(grid: DecisionGrid, tape: ExecutionTape) -> None:
+def validate_decision_grid_for_execution_tape(
+    grid: DecisionGrid,
+    tape: ExecutionTape,
+    *,
+    mode: DecisionGridValidationMode | str = DecisionGridValidationMode.SHAPE_ONLY,
+) -> None:
     if not isinstance(grid, DecisionGrid):
         raise ValueError("grid must be DecisionGrid")
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
+    mode = _coerce_validation_mode(mode)
     meta = grid.metadata
     expected = {
         "tape_schema": tape.manifest.schema,
@@ -446,13 +612,17 @@ def validate_decision_grid_for_execution_tape(grid: DecisionGrid, tape: Executio
     for key, value in expected.items():
         if getattr(meta, key) != value:
             raise ValueError(f"decision grid metadata mismatch for {key}: expected={value!r} actual={getattr(meta, key)!r}")
-
+    if mode is DecisionGridValidationMode.METADATA_ONLY:
+        return
+    validate_decision_grid_integrity(grid, mode=mode)
     events = tape.arrays.events
     l2_events = tape.arrays.l2_events
-    if (grid.decision_event_index >= len(events)).any():
+    if int(grid.decision_event_index[-1]) >= len(events):
         raise ValueError("decision grid contains event indices outside tape")
-    if (grid.book_ptr >= len(l2_events)).any():
+    if int(grid.book_ptr[-1]) >= len(l2_events):
         raise ValueError("decision grid contains book_ptr outside tape")
+    if mode is DecisionGridValidationMode.SHAPE_ONLY:
+        return
     for row in range(grid.n_rows):
         event_index = int(grid.decision_event_index[row])
         event = events[event_index]
@@ -474,15 +644,24 @@ def validate_decision_grid_for_execution_tape(grid: DecisionGrid, tape: Executio
 __all__ = [
     "DECISION_GRID_SCHEMA",
     "DECISION_GRID_FILENAME",
+    "DECISION_GRID_MANIFEST_FILENAME",
+    "DECISION_GRID_ARRAYS_DIRNAME",
     "DECISION_GRID_SUMMARY_FILENAME",
     "SCHEDULER_VERSION",
     "DECISION_GRID_ARRAY_ORDER",
+    "DecisionGridValidationMode",
     "DecisionGridMetadata",
     "DecisionGrid",
+    "DecisionGridStart",
     "compute_decision_grid_hash",
     "decision_grid_metadata_from_tape",
-    "save_decision_grid_npz",
-    "load_decision_grid_npz",
+    "decision_grid_row_for_event_index",
+    "validate_decision_grid_start_event_index",
+    "write_decision_grid_manifest",
+    "save_decision_grid",
+    "load_decision_grid_metadata",
+    "load_decision_grid",
+    "validate_decision_grid_integrity",
     "decision_grid_summary",
     "decision_grid_lineage",
     "validate_decision_grid_for_execution_tape",

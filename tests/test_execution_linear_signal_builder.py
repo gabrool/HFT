@@ -240,7 +240,7 @@ def test_generated_linear_signals_reset_execution_env_without_alignment_error():
     reset = ExecutionEnv(tape, decision_grid=grid, linear_signals=artifact).reset()
 
     assert reset.info["event_index"] == int(artifact.decision_event_index[0])
-    assert reset.info["signal_row_index"] == 0
+    assert reset.info["decision_grid_row_index"] == 0
 
 
 def test_generated_linear_signals_env_can_step_once():

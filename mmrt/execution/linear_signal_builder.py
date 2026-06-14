@@ -601,9 +601,7 @@ def _feature_dataset_from_chunk(
     return ExecutionLinearFeatureDataset(
         decision_event_index=chunk.decision_event_index,
         decision_local_ts_us=chunk.decision_local_ts_us,
-        decision_event_seq=decision_grid.decision_event_seq[
-            np.searchsorted(decision_grid.decision_event_index, chunk.decision_event_index)
-        ],
+        decision_event_seq=chunk.decision_event_seq,
         features=chunk.features,
         feature_names=tuple(chunk.feature_names),
         replay_start_event_index=replay_start_event_index,

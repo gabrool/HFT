@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from mmrt.execution.execution_tape import ExecutionTape
-from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import (
+    DecisionGrid,
+    DecisionGridStart,
+    validate_decision_grid_for_execution_tape,
+    validate_decision_grid_start_event_index,
+)
 from mmrt.execution.linear_signal import (
     LinearSignalArtifact,
-    LinearSignalStart,
     validate_linear_signal_artifact_metadata,
-    validate_linear_signal_start_event_index,
     validate_linear_signals_for_decision_grid,
 )
 
@@ -20,7 +23,7 @@ def validate_linear_signals_for_execution_tape(
     decision_grid: DecisionGrid,
     requested_start_event_index: int | None,
     min_rows: int | None,
-) -> LinearSignalStart:
+) -> DecisionGridStart:
     """Validate artifact identity separately from the requested run start row.
 
     The decision grid is the source of truth for decision timing. Linear signal
@@ -46,8 +49,8 @@ def validate_linear_signals_for_execution_tape(
         min_rows=None,
     )
     validate_linear_signals_for_decision_grid(linear_signals, decision_grid)
-    return validate_linear_signal_start_event_index(
-        linear_signals,
+    return validate_decision_grid_start_event_index(
+        decision_grid,
         start_event_index=requested_start_event_index,
         min_rows=min_rows,
     )

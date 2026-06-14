@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import json
 from decimal import Decimal
 
@@ -20,7 +20,7 @@ from mmrt.execution.contracts import (
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
-from mmrt.execution.decision_grid import save_decision_grid_npz
+from mmrt.execution.decision_grid import save_decision_grid
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -141,7 +141,7 @@ def _tape(l2_events, trades):
 def _save_tape(tmp_path, tape):
     root = tmp_path / "execution_tape"
     save_execution_tape(tape, root, overwrite=True)
-    save_decision_grid_npz(root / "decision_grid.npz", decision_grid_for_tape(tape), overwrite=True)
+    save_decision_grid(root / "decision_grid", decision_grid_for_tape(tape), overwrite=True)
     return root
 
 
@@ -249,7 +249,7 @@ def test_disabled_audit_runs_and_warns_no_fills(tmp_path):
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
             tape_root=str(tape_root),
-            decision_grid_npz=str(tape_root / "decision_grid.npz"),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(output_json),
             policy="disabled",
             max_steps=2,
@@ -287,7 +287,7 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
             tape_root=str(tape_root),
-            decision_grid_npz=str(tape_root / "decision_grid.npz"),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(tmp_path / "summary.json"),
             policy="bid",
             max_steps=1,
@@ -354,7 +354,7 @@ def test_audit_execution_sim_requires_linear_signals_file(tmp_path):
         run_execution_sim_audit(
             ExecutionSimAuditConfig(
                 tape_root=str(tape_root),
-                decision_grid_npz=str(tape_root / "decision_grid.npz"),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 output_json=str(tmp_path / "summary.json"),
                 policy="disabled",
                 max_steps=1,
@@ -375,8 +375,8 @@ def test_audit_execution_sim_main_writes_summary_and_prints_json(tmp_path, capsy
         [
             "--tape-root",
             str(tape_root),
-            "--decision-grid-npz",
-            str(tape_root / "decision_grid.npz"),
+            "--decision-grid",
+            str(tape_root / "decision_grid"),
             "--output-json",
             str(output_json),
             "--policy",
@@ -411,7 +411,7 @@ def test_audit_execution_sim_refuses_overwrite_without_flag(tmp_path):
         run_execution_sim_audit(
             ExecutionSimAuditConfig(
                 tape_root=str(tape_root),
-                decision_grid_npz=str(tape_root / "decision_grid.npz"),
+                decision_grid_path=str(tape_root / "decision_grid"),
                 output_json=str(output_json),
                 policy="disabled",
             )
@@ -420,22 +420,22 @@ def test_audit_execution_sim_refuses_overwrite_without_flag(tmp_path):
 
 def test_execution_sim_audit_config_validation():
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="", decision_grid_npz="/tmp/grid.npz", policy="disabled")
+        ExecutionSimAuditConfig(tape_root="", decision_grid_path="/tmp/grid", policy="disabled")
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="x", decision_grid_npz="/tmp/grid.npz", policy="bad")
+        ExecutionSimAuditConfig(tape_root="x", decision_grid_path="/tmp/grid", policy="bad")
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="x", decision_grid_npz="/tmp/grid.npz", max_steps=0)
+        ExecutionSimAuditConfig(tape_root="x", decision_grid_path="/tmp/grid", max_steps=0)
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="x", decision_grid_npz="/tmp/grid.npz", queue_mode="bad")
+        ExecutionSimAuditConfig(tape_root="x", decision_grid_path="/tmp/grid", queue_mode="bad")
 
 
 def test_audit_execution_sim_accepts_zero_queue_weights():
     cfg = ExecutionSimAuditConfig(
         tape_root="/tmp/tape",
-        decision_grid_npz="/tmp/tape/decision_grid.npz",
+        decision_grid_path="/tmp/tape/decision_grid",
         l2_decrease_weight=0.0,
         trade_at_level_weight=0.0,
     )
@@ -446,10 +446,10 @@ def test_audit_execution_sim_accepts_zero_queue_weights():
 
 def test_audit_execution_sim_rejects_queue_weights_above_one():
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_npz="/tmp/tape/decision_grid.npz", l2_decrease_weight=1.1)
+        ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", l2_decrease_weight=1.1)
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_npz="/tmp/tape/decision_grid.npz", trade_at_level_weight=1.1)
+        ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", trade_at_level_weight=1.1)
 
 
 def test_audit_modules_have_no_forbidden_imports():
@@ -485,10 +485,10 @@ def test_audit_modules_have_no_forbidden_imports():
 
 def test_parser_can_disable_l2_trade_dedupe():
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid-npz", "/tmp/tape/decision_grid.npz", "--no-dedupe-l2-decrease-with-trade-prints"])
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--no-dedupe-l2-decrease-with-trade-prints"])
     config = ExecutionSimAuditConfig(
         tape_root=args.tape_root,
-        decision_grid_npz=args.decision_grid_npz,
+        decision_grid_path=args.decision_grid_path,
         output_json=args.output_json,
         linear_signals_npz=args.linear_signals_npz,
         overwrite=args.overwrite,
@@ -523,8 +523,8 @@ def test_parser_can_disable_l2_trade_dedupe():
 
 def test_parser_dedupe_l2_trade_default_enabled():
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid-npz", "/tmp/tape/decision_grid.npz"])
-    config = ExecutionSimAuditConfig(tape_root=args.tape_root, decision_grid_npz=args.decision_grid_npz)
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid"])
+    config = ExecutionSimAuditConfig(tape_root=args.tape_root, decision_grid_path=args.decision_grid_path)
     assert config.dedupe_l2_decrease_with_trade_prints is True
 
 
@@ -534,7 +534,7 @@ def test_audit_env_config_uses_shared_builder_source_guard():
     assert "AdverseRuntimeConfig(" not in source
 
 
-def test_audit_execution_sim_accepts_explicit_later_linear_signal_start(tmp_path):
+def test_audit_execution_sim_accepts_explicit_later_decision_grid_start(tmp_path):
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
         [],
@@ -545,7 +545,7 @@ def test_audit_execution_sim_accepts_explicit_later_linear_signal_start(tmp_path
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
             tape_root=str(tape_root),
-            decision_grid_npz=str(tape_root / "decision_grid.npz"),
+            decision_grid_path=str(tape_root / "decision_grid"),
             output_json=str(tmp_path / "summary.json"),
             policy="disabled",
             max_steps=1,
@@ -555,8 +555,8 @@ def test_audit_execution_sim_accepts_explicit_later_linear_signal_start(tmp_path
     )
 
     assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
-    assert summary["linear_signal_start"] == {
+    assert summary["decision_grid_start"] == {
         "event_index": 1,
-        "row_index": 1,
+        "decision_grid_row_index": 1,
         "rows_available": 2,
     }

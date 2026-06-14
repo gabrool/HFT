@@ -9,7 +9,8 @@ from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, TradePrint
 from mmrt.execution.decision_grid import (
     DECISION_GRID_SCHEMA,
-    load_decision_grid_npz,
+    load_decision_grid,
+    validate_decision_grid_start_event_index,
     validate_decision_grid_for_execution_tape,
 )
 from mmrt.execution.event_merge import merge_execution_events
@@ -117,12 +118,12 @@ def test_build_decision_grid_records_real_rows_hash_and_reasons():
         tape_root = tmp_path / "tape"
         save_execution_tape(tape, tape_root, overwrite=True)
 
-        npz = tape_root / "decision_grid.npz"
+        grid_path = tape_root / "decision_grid"
         summary_json = tape_root / "decision_grid_summary.json"
         summary = build_decision_grid_from_config(
             BuildDecisionGridConfig(
                 tape_root=str(tape_root),
-                output_npz=str(npz),
+                output_grid=str(grid_path),
                 output_json=str(summary_json),
                 min_decision_interval_us=100,
                 max_decision_interval_us=500,
@@ -131,11 +132,14 @@ def test_build_decision_grid_records_real_rows_hash_and_reasons():
             )
         )
 
-        grid = load_decision_grid_npz(npz)
+        grid = load_decision_grid(grid_path)
         validate_decision_grid_for_execution_tape(grid, tape)
-        loaded_again = load_decision_grid_npz(npz)
+        loaded_again = load_decision_grid(grid_path)
 
         assert grid.metadata.schema == DECISION_GRID_SCHEMA
+        assert (grid_path / "manifest.json").exists()
+        assert (grid_path / "arrays" / "decision_event_index.npy").exists()
+        assert not (grid_path / "chunks").exists()
         assert grid.decision_grid_hash == loaded_again.decision_grid_hash
         assert grid.n_rows == 4
         assert summary["decision_grid"]["decision_grid_hash"] == grid.decision_grid_hash
@@ -147,6 +151,12 @@ def test_build_decision_grid_records_real_rows_hash_and_reasons():
         ]
         assert np.array_equal(grid.decision_event_seq, tape.arrays.events["event_seq"][grid.decision_event_index])
         assert np.all(grid.decision_event_seq < 9_223_372_036_854_775_807)
+        start = validate_decision_grid_start_event_index(grid, start_event_index=int(grid.decision_event_index[1]), min_rows=2)
+        assert start.as_dict() == {
+            "event_index": int(grid.decision_event_index[1]),
+            "decision_grid_row_index": 1,
+            "rows_available": 3,
+        }
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -165,12 +175,12 @@ def test_decision_grid_validation_rejects_tape_mismatch():
                 overwrite=True,
             )
         )
-        grid = load_decision_grid_npz(tape_root / "decision_grid.npz")
+        grid = load_decision_grid(tape_root / "decision_grid")
 
         bad_tape = _tape()
         bad_tape.arrays.events["event_seq"][int(grid.decision_event_index[0])] += 100
         try:
-            validate_decision_grid_for_execution_tape(grid, bad_tape)
+            validate_decision_grid_for_execution_tape(grid, bad_tape, mode="full")
         except ValueError as exc:
             assert "event_seq" in str(exc)
         else:

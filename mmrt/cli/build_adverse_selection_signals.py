@@ -23,7 +23,7 @@ from mmrt.execution.adverse_signal import (
     load_adverse_selection_model,
     save_adverse_selection_signals_arrays,
 )
-from mmrt.execution.decision_grid import load_decision_grid_npz, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 
 __all__ = [
@@ -49,7 +49,7 @@ def _require_bool(value: bool, name: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class BuildAdverseSelectionSignalsConfig:
     tape_root: str
-    decision_grid_npz: str
+    decision_grid_path: str
     model_npz: str
     output_npz: str | None = None
     output_json: str | None = None
@@ -64,7 +64,7 @@ class BuildAdverseSelectionSignalsConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
-        object.__setattr__(self, "decision_grid_npz", _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz"))
+        object.__setattr__(self, "decision_grid_path", _require_nonempty_str(self.decision_grid_path, "decision_grid_path"))
         object.__setattr__(self, "model_npz", _require_nonempty_str(self.model_npz, "model_npz"))
         if self.output_npz is not None:
             object.__setattr__(self, "output_npz", _require_nonempty_str(self.output_npz, "output_npz"))
@@ -138,7 +138,7 @@ def build_adverse_selection_signals_from_config(
         mmap_mode=config.mmap_mode,
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
-    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    decision_grid = load_decision_grid(config.decision_grid_path)
     validate_decision_grid_for_execution_tape(decision_grid, tape)
     model = load_adverse_selection_model(config.model_npz)
     if model.exchange != tape.manifest.exchange or model.symbol != tape.manifest.symbol:
@@ -207,7 +207,7 @@ def build_adverse_selection_signals_from_config(
         "status": "ok" if dataset.num_rows > 0 else "warning",
         "run_type": "build_adverse_selection_signals",
         "tape_root": str(Path(config.tape_root)),
-        "decision_grid_npz": str(Path(config.decision_grid_npz)),
+        "decision_grid_path": str(Path(config.decision_grid_path)),
         "model_npz": str(Path(config.model_npz)),
         "output_npz": str(output_npz),
         "output_json": str(output_json),
@@ -244,7 +244,7 @@ def build_adverse_selection_signals_from_config(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
-    parser.add_argument("--decision-grid-npz", required=True)
+    parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--model-npz", required=True)
     parser.add_argument("--output-npz")
     parser.add_argument("--output-json")
@@ -264,7 +264,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> BuildAdverseSelectionSignalsConfig:
     return BuildAdverseSelectionSignalsConfig(
         tape_root=args.tape_root,
-        decision_grid_npz=args.decision_grid_npz,
+        decision_grid_path=args.decision_grid_path,
         model_npz=args.model_npz,
         output_npz=args.output_npz,
         output_json=args.output_json,

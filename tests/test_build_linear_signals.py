@@ -3,7 +3,7 @@ import json
 import pytest
 
 from mmrt.cli.build_linear_signals import BuildLinearSignalsConfig, _config_from_args, build_arg_parser, build_linear_signals_from_config
-from mmrt.execution.decision_grid import save_decision_grid_npz
+from mmrt.execution.decision_grid import save_decision_grid
 from mmrt.execution.execution_tape import load_execution_tape, save_execution_tape
 from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.linear_signal import LINEAR_SIGNALS_FILENAME, load_linear_signal_artifact_npz
@@ -23,13 +23,13 @@ def test_build_linear_signals_cli_end_to_end(tmp_path):
     tape = _tiny_tape()
     grid = decision_grid_for_tape(tape, schedule_config=_SCHED50)
     save_execution_tape(tape, tape_root, overwrite=True)
-    save_decision_grid_npz(tape_root / "decision_grid.npz", grid, overwrite=True)
+    save_decision_grid(tape_root / "decision_grid", grid, overwrite=True)
     cols = ("x_mid_slope_bps_per_sec_1000000us", "x_time_since_mid_change_us", "x_bid_l1_notional_usd")
     result_path = _write_result(tmp_path / "linear_train_result.json", _train_result({head: cols for head in lm.MODEL_HEADS}, grid=grid))
     summary = build_linear_signals_from_config(
         BuildLinearSignalsConfig(
             tape_root=str(tape_root),
-            decision_grid_npz=str(tape_root / "decision_grid.npz"),
+            decision_grid_path=str(tape_root / "decision_grid"),
             linear_train_result_json=str(result_path),
             chunk_rows=1,
         )
@@ -53,18 +53,18 @@ def test_build_linear_signals_overwrite_guard(tmp_path):
     tape = _tiny_tape()
     grid = decision_grid_for_tape(tape, schedule_config=_SCHED50)
     save_execution_tape(tape, tape_root, overwrite=True)
-    save_decision_grid_npz(tape_root / "decision_grid.npz", grid, overwrite=True)
+    save_decision_grid(tape_root / "decision_grid", grid, overwrite=True)
     cols = ("x_mid_slope_bps_per_sec_1000000us",)
     result_path = _write_result(tmp_path / "linear_train_result.json", _train_result({head: cols for head in lm.MODEL_HEADS}, grid=grid))
     (tape_root / LINEAR_SIGNALS_FILENAME).write_bytes(b"exists")
     with pytest.raises(FileExistsError):
-        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(tape_root / "decision_grid.npz"), str(result_path)))
+        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(tape_root / "decision_grid"), str(result_path)))
 
 
 def test_build_linear_signals_parser_no_mmap():
     args = build_arg_parser().parse_args([
         "--tape-root", "tape",
-        "--decision-grid-npz", "decision_grid.npz",
+        "--decision-grid", "decision_grid",
         "--linear-train-result-json", "linear_train_result.json",
         "--no-mmap",
         "--chunk-rows", "7",
@@ -79,7 +79,7 @@ def test_build_linear_signals_rejects_feature_mismatch(tmp_path):
     tape = _tiny_tape()
     grid = decision_grid_for_tape(tape, schedule_config=_SCHED50)
     save_execution_tape(tape, tape_root, overwrite=True)
-    save_decision_grid_npz(tape_root / "decision_grid.npz", grid, overwrite=True)
+    save_decision_grid(tape_root / "decision_grid", grid, overwrite=True)
     result_path = _write_result(tmp_path / "linear_train_result.json", _train_result({head: ("x_missing_feature",) for head in lm.MODEL_HEADS}, grid=grid))
     with pytest.raises(ValueError, match="x_missing_feature"):
-        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(tape_root / "decision_grid.npz"), str(result_path)))
+        build_linear_signals_from_config(BuildLinearSignalsConfig(str(tape_root), str(tape_root / "decision_grid"), str(result_path)))

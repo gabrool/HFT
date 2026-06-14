@@ -5,7 +5,7 @@ market event stream: wake conditions (trades, top-of-book changes), a minimum
 re-decision interval (throttle), and a maximum interval (heartbeat).
 
 Offline production uses this scheduler only in ``mmrt.cli.build_decision_grid``.
-The resulting ``decision_grid.npz`` is the realized row sequence for one tape,
+The resulting ``decision_grid`` is the realized row sequence for one tape,
 and downstream stages consume that grid instead of re-applying this scheduler.
 
 Decisions can only fire on book events: trades and book changes arm the

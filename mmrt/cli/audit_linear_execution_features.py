@@ -17,7 +17,7 @@ def _parse_thresholds(value: str) -> tuple[float, ...]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
-    parser.add_argument("--decision-grid-npz", required=True)
+    parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--linear-train-result-json", required=True)
     parser.add_argument("--linear-signals-npz")
     parser.add_argument("--output-json")
@@ -45,7 +45,7 @@ def _config_from_args(args: argparse.Namespace) -> LinearExecutionFeatureAuditCo
         raise FileExistsError(f"output_json already exists: {output}")
     return LinearExecutionFeatureAuditConfig(
         tape_root=args.tape_root,
-        decision_grid_npz=args.decision_grid_npz,
+        decision_grid_path=args.decision_grid_path,
         linear_train_result_json=args.linear_train_result_json,
         linear_signals_npz=signals,
         output_json=output,

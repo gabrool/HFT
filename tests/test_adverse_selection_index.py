@@ -44,18 +44,18 @@ def test_future_mid_after_last_timestamp_returns_none():
     assert _direct_index().future_mid_and_key_at_or_after(EventKey(3000, MAX_EVENT_SEQ)) is None
 
 
-def test_disk_index_future_mid_matches_legacy_helper_for_same_timestamp_groups(tmp_path):
+def test_disk_index_future_mid_matches_in_memory_helper_for_same_timestamp_groups(tmp_path):
     tape = _tape([
         _l2(seq=0, local_ts_us=1000, bid_ticks=(100, 99), ask_ticks=(102, 103)),
         _l2(seq=1, local_ts_us=1000, bid_ticks=(101, 100), ask_ticks=(103, 104)),
         _l2(seq=2, local_ts_us=1000, bid_ticks=(102, 101), ask_ticks=(104, 105)),
         _l2(seq=3, local_ts_us=2000, bid_ticks=(200, 199), ask_ticks=(202, 203)),
     ], [])
-    legacy = _valid_l2_view_from_tape(tape)
+    in_memory = _valid_l2_view_from_tape(tape)
     index = build_adverse_selection_index(tape, config=_cfg(tmp_path / "idx", overwrite=True))
     keys = [EventKey(1000, MAX_EVENT_SEQ), EventKey(1000, 1), EventKey(1000, 0), EventKey(1500, MAX_EVENT_SEQ), EventKey(3000, MAX_EVENT_SEQ)]
     for key in keys:
-        assert index.valid_l2.future_mid_and_key_at_or_after(key) == _future_mid_and_key_at_or_after_key(legacy, key)
+        assert index.valid_l2.future_mid_and_key_at_or_after(key) == _future_mid_and_key_at_or_after_key(in_memory, key)
 
 
 def test_kyle_sample_response_uses_last_same_timestamp_l2_for_max_event_seq(tmp_path):

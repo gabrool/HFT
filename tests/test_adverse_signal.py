@@ -44,10 +44,10 @@ def test_adverse_model_roundtrip_and_clipping(tmp_path):
     assert pred["bid_touch_toxic_cost_bps"].tolist() == [0.0, 0.0]
 
 
-def test_adverse_model_rejects_old_schema_and_missing_edge_targets():
+def test_adverse_model_requires_current_schema_and_edge_targets():
     with pytest.raises(ValueError):
         AdverseSelectionModelArtifact(
-            schema="mmrt_adverse_selection_ridge",
+            schema="not_current",
             feature_names=("x",),
             target_names=("bid_touch_filled",),
             feature_mean=np.array([0.0]),
