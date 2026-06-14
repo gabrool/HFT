@@ -45,6 +45,11 @@ def make_trade(local_ts_us=2_000_000, price=100.0, amount=1.0, side_code=BUY_SID
     )
 
 
+def decide_on_snapshot(eng: eg.FeatureEngine, snapshot: BookSnapshotInput) -> eg.EngineDecision:
+    eng.observe_book_snapshot(snapshot)
+    return eng.force_decision(local_ts_us=snapshot.local_ts_us, ts_us=snapshot.ts_us, event_seq=snapshot.event_seq)
+
+
 def fv_value(vec, name):
     return vec[feature_spec_by_name(name).index]
 
@@ -52,7 +57,7 @@ def fv_value(vec, name):
 def feed_ready_engine():
     eng = eg.FeatureEngine()
     eng.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
-    dec = eng.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
+    dec = decide_on_snapshot(eng, make_snapshot(2_000_000, mid=100.0))
     assert dec is not None
     return eng, dec
 
@@ -60,7 +65,7 @@ def feed_ready_engine():
 def apply_two_books_with_known_l1_changes(eng):
     eng.on_book_snapshot(make_snapshot(2_000_000, mid=100.0, bid_sz0=10.0, ask_sz0=12.0))
     snap2 = make_snapshot(2_100_000, mid=100.0, bid_sz0=13.0, ask_sz0=9.0)
-    dec = eng.on_book_snapshot(snap2)
+    dec = decide_on_snapshot(eng, snap2)
     return dec
 
 
@@ -203,13 +208,13 @@ def test_no_decision_before_ready():
     e = eg.FeatureEngine()
     assert e.on_book_snapshot(make_snapshot(2_000_000)) is None
     assert e.on_trade(make_trade(2_000_000)) is None
-    assert e.on_book_snapshot(make_snapshot(2_000_000)) is not None
+    assert decide_on_snapshot(e, make_snapshot(2_000_000)) is not None
 
 
 def test_engine_first_decision_at_early_timestamp_does_not_crash_trade_asof():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(1_000_000, price=100.0, amount=2.0, side_code=BUY_SIDE_CODE))
-    d = e.on_book_snapshot(make_snapshot(1_000_000, mid=100.0))
+    d = decide_on_snapshot(e, make_snapshot(1_000_000, mid=100.0))
 
     assert d is not None
     assert d.local_ts_us == 1_000_000
@@ -228,20 +233,20 @@ def test_trade_events_never_emit_decisions():
 def test_decision_cadence_book_only():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000))
-    assert e.on_book_snapshot(make_snapshot(2_000_000)) is not None
+    assert decide_on_snapshot(e, make_snapshot(2_000_000)) is not None
     assert e.on_book_snapshot(make_snapshot(2_100_000)) is None
     assert e.on_book_snapshot(make_snapshot(2_499_999)) is None
-    assert e.on_book_snapshot(make_snapshot(2_500_000)) is not None
+    assert decide_on_snapshot(e, make_snapshot(2_500_000)) is not None
     assert e.on_book_snapshot(make_snapshot(2_500_000)) is None
-    assert e.on_book_snapshot(make_snapshot(3_000_000)) is not None
+    assert decide_on_snapshot(e, make_snapshot(3_000_000)) is not None
 
 
 def test_long_gap_emits_at_most_one_decision():
     e, _ = feed_ready_engine()
     c = e.decision_count
-    assert e.on_book_snapshot(make_snapshot(4_000_000)) is not None
+    assert decide_on_snapshot(e, make_snapshot(4_000_000)) is not None
     assert e.decision_count == c + 1
-    assert e.schedule.last_decision_local_ts_us == 4_000_000
+    assert e.last_decision_local_ts_us == 4_000_000
 
 
 
@@ -250,7 +255,7 @@ def test_emitted_decision_carries_decision_time_raw_mid():
     e.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
 
     snap1 = make_snapshot(2_000_000, mid=100.0)
-    d1 = e.on_book_snapshot(snap1)
+    d1 = decide_on_snapshot(e, snap1)
     assert d1 is not None
     assert d1.raw_mid == pytest.approx(100.0)
     assert d1.local_ts_us == snap1.local_ts_us
@@ -258,7 +263,7 @@ def test_emitted_decision_carries_decision_time_raw_mid():
     assert d1.event_seq == snap1.event_seq
 
     snap2 = make_snapshot(2_100_000, mid=101.0)
-    d2 = e.on_book_snapshot(snap2)
+    d2 = decide_on_snapshot(e, snap2)
     assert d2 is not None
     assert d2.raw_mid == pytest.approx(101.0)
     assert d2.local_ts_us == snap2.local_ts_us
@@ -269,7 +274,7 @@ def test_emitted_decision_carries_decision_time_raw_mid():
 def test_runner_handoff_payload_uses_decision_raw_mid_without_book_lookup():
     e = eg.FeatureEngine(config=eg.FeatureEngineConfig(schedule=DecisionScheduleConfig(min_decision_interval_us=100_000, max_decision_interval_us=100_000)))
     e.on_trade(make_trade(2_000_000, 100.0, 1.0, BUY_SIDE_CODE))
-    d = e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
+    d = decide_on_snapshot(e, make_snapshot(2_000_000, mid=100.0))
     assert d is not None
 
     row_payload = {
@@ -287,7 +292,7 @@ def test_feature_vector_shape_and_all_finite():
     e.on_trade(make_trade(2_000_000, 100.0, 1.5, BUY_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_000_000, mid=100.0))
     e.on_trade(make_trade(2_100_000, 101.0, 2.0, SELL_SIDE_CODE))
-    d = e.on_book_snapshot(make_snapshot(2_500_000, mid=100.2, bid_sz0=11.0, ask_sz0=9.0))
+    d = decide_on_snapshot(e, make_snapshot(2_500_000, mid=100.2, bid_sz0=11.0, ask_sz0=9.0))
     assert d is not None
     assert d.feature_vector.shape == (FEATURE_COUNT,)
     assert np.all(np.isfinite(d.feature_vector))
@@ -401,9 +406,9 @@ def test_trade_side_quote_response_asymmetry_manual():
 def test_event_context_formulas_manual():
     e = eg.FeatureEngine()
     e.on_trade(make_trade(2_000_000))
-    d1 = e.on_book_snapshot(make_snapshot(2_000_000))
+    d1 = decide_on_snapshot(e, make_snapshot(2_000_000))
     e.on_trade(make_trade(2_300_000, side_code=UNKNOWN_SIDE_CODE))
-    d2 = e.on_book_snapshot(make_snapshot(2_500_000))
+    d2 = decide_on_snapshot(e, make_snapshot(2_500_000))
     assert d1 is not None and d2 is not None
     now = 2_500_000
     for w, name in [
@@ -420,14 +425,14 @@ def test_same_timestamp_ordering_is_caller_order():
     t = 2_000_000
     e = eg.FeatureEngine()
     e.on_trade(make_trade(t, 110.0, 3.0, BUY_SIDE_CODE))
-    d = e.on_book_snapshot(make_snapshot(t, mid=100.0))
+    d = decide_on_snapshot(e, make_snapshot(t, mid=100.0))
     assert d is not None
     assert abs(fv_value(d.feature_vector, "max_signed_trade_notional_usd_1000000us")) > 0.0
 
     e2 = eg.FeatureEngine()
     e2.on_trade(make_trade(t - 500_000, 100.0, 1.0, BUY_SIDE_CODE))
-    e2.on_book_snapshot(make_snapshot(t - 500_000, mid=100.0))
-    d2 = e2.on_book_snapshot(make_snapshot(t, mid=100.0))
+    decide_on_snapshot(e2, make_snapshot(t - 500_000, mid=100.0))
+    d2 = decide_on_snapshot(e2, make_snapshot(t, mid=100.0))
     assert d2 is not None
     pre_max = fv_value(d2.feature_vector, "max_signed_trade_notional_usd_1000000us")
     e2.on_trade(make_trade(t, 140.0, 10.0, BUY_SIDE_CODE))
@@ -484,7 +489,7 @@ def test_all_engine_features_assigned_no_placeholders():
     e.on_trade(make_trade(2_150_000, 99.0, 2.0, SELL_SIDE_CODE))
     e.on_book_snapshot(make_snapshot(2_300_000, mid=100.2, bid_sz0=12.0, ask_sz0=8.0))
     e.on_trade(make_trade(2_450_000, 100.8, 1.0, BUY_SIDE_CODE))
-    d = e.on_book_snapshot(make_snapshot(2_500_000, mid=100.1, bid_sz0=11.0, ask_sz0=9.0))
+    d = decide_on_snapshot(e, make_snapshot(2_500_000, mid=100.1, bid_sz0=11.0, ask_sz0=9.0))
     assert d is not None
     vec = d.feature_vector
     for idx in eg.CROSS_FEATURE_INDICES + eg.EVENT_CONTEXT_FEATURE_INDICES:

@@ -24,6 +24,7 @@ from mmrt.execution.adverse_selection import (
     adverse_selection_label_names,
 )
 from mmrt.execution.contracts import LatencyConfig, QueueModelMode
+from mmrt.execution.decision_grid import load_decision_grid_npz, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
@@ -188,6 +189,7 @@ def _resolve_target_names(dataset, requested: tuple[str, ...] | str) -> tuple[st
 @dataclass(frozen=True, slots=True)
 class AdverseSelectionTrainCLIConfig:
     tape_root: str
+    decision_grid_npz: str
     output_json: str | None = None
     model_npz: str | None = None
     overwrite: bool = False
@@ -202,9 +204,6 @@ class AdverseSelectionTrainCLIConfig:
     exact_auc_max_rows: int = 1_000_000
     progress_interval: int | None = None
 
-    decision_interval_us: int = 500_000
-    start_event_index: int | None = None
-    max_decisions: int | None = None
     flow_windows_us: tuple[int, ...] | str = (200_000, 500_000, 1_000_000)
     drop_incomplete_horizon: bool = True
 
@@ -242,6 +241,7 @@ class AdverseSelectionTrainCLIConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
+        object.__setattr__(self, "decision_grid_npz", _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz"))
         if self.output_json is not None:
             object.__setattr__(self, "output_json", _require_nonempty_str(self.output_json, "output_json"))
         if self.model_npz is not None:
@@ -261,9 +261,6 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "auc_bins", _require_positive_int(self.auc_bins, "auc_bins"))
         object.__setattr__(self, "exact_auc_max_rows", _require_positive_int(self.exact_auc_max_rows, "exact_auc_max_rows"))
         object.__setattr__(self, "progress_interval", _optional_positive_int(self.progress_interval, "progress_interval"))
-        object.__setattr__(self, "decision_interval_us", _require_positive_int(self.decision_interval_us, "decision_interval_us"))
-        object.__setattr__(self, "start_event_index", _optional_nonnegative_int(self.start_event_index, "start_event_index"))
-        object.__setattr__(self, "max_decisions", _optional_positive_int(self.max_decisions, "max_decisions"))
         object.__setattr__(self, "flow_windows_us", _parse_int_tuple(self.flow_windows_us, "flow_windows_us"))
         object.__setattr__(self, "drop_incomplete_horizon", _require_bool(self.drop_incomplete_horizon, "drop_incomplete_horizon"))
         object.__setattr__(self, "vpin_bucket_volume", _require_positive_float(self.vpin_bucket_volume, "vpin_bucket_volume"))
@@ -309,9 +306,6 @@ class AdverseSelectionTrainCLIConfig:
 
 def _build_adverse_selection_config(config: AdverseSelectionTrainCLIConfig) -> AdverseSelectionConfig:
     return AdverseSelectionConfig(
-        decision_interval_us=config.decision_interval_us,
-        start_event_index=config.start_event_index,
-        max_decisions=config.max_decisions,
         flow_windows_us=config.flow_windows_us,
         vpin=VPINConfig(
             bucket_volume=config.vpin_bucket_volume,
@@ -353,6 +347,7 @@ def _build_adverse_selection_config(config: AdverseSelectionTrainCLIConfig) -> A
 def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]:
     return {
         "tape_root": config.tape_root,
+        "decision_grid_npz": config.decision_grid_npz,
         "output_json": config.output_json,
         "model_npz": config.model_npz,
         "overwrite": config.overwrite,
@@ -366,9 +361,6 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "auc_bins": config.auc_bins,
         "exact_auc_max_rows": config.exact_auc_max_rows,
         "progress_interval": config.progress_interval,
-        "decision_interval_us": config.decision_interval_us,
-        "start_event_index": config.start_event_index,
-        "max_decisions": config.max_decisions,
         "flow_windows_us": list(config.flow_windows_us),
         "drop_incomplete_horizon": config.drop_incomplete_horizon,
         "vpin_bucket_volume": config.vpin_bucket_volume,
@@ -676,17 +668,18 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         mmap_mode=config.mmap_mode,
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
+    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
     adverse_config = _build_adverse_selection_config(config)
     dataset_root = Path(config.dataset_root) if config.dataset_root is not None else Path(config.tape_root) / "adverse_selection_dataset"
     work_root = (Path(config.work_dir) if config.work_dir is not None else dataset_root.parent) / "adverse_selection_work"
     feature_count = len(adverse_selection_feature_names(adverse_config))
     label_count = len(adverse_selection_label_names(adverse_config))
-    duration_us = max(0, int(tape.manifest.end_local_ts_us) - int(tape.manifest.start_local_ts_us))
-    decisions_est = 0 if config.decision_interval_us <= 0 else duration_us // config.decision_interval_us + 1
-    disk_estimate = estimate_adverse_dataset_bytes(num_decisions_estimate=decisions_est, num_features=feature_count, num_labels=label_count)
+    disk_estimate = estimate_adverse_dataset_bytes(num_decisions_estimate=decision_grid.n_rows, num_features=feature_count, num_labels=label_count)
     dataset = build_adverse_selection_dataset_to_disk(
         tape,
         config=adverse_config,
+        decision_grid=decision_grid,
         output_root=dataset_root,
         work_dir=config.work_dir,
         chunk_rows=config.chunk_rows,
@@ -723,6 +716,10 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
                 config_json=json.dumps(_summary_config(config), sort_keys=True),
                 exchange=tape.manifest.exchange,
                 symbol=tape.manifest.symbol,
+                decision_grid_schema=decision_grid.metadata.schema,
+                decision_grid_hash=decision_grid.decision_grid_hash,
+                decision_grid_n_rows=decision_grid.n_rows,
+                decision_schedule=decision_grid.decision_schedule,
             ),
             overwrite=config.overwrite,
         )
@@ -740,6 +737,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         "run_type": "train_adverse_selection",
         "tape_root": str(Path(config.tape_root)),
         "dataset_root": str(dataset_root),
+        "decision_grid_npz": str(Path(config.decision_grid_npz)),
         "work_dir": str(work_root),
         "output_json": str(output_json),
         "model_npz": str(model_npz) if model_written else None,
@@ -756,6 +754,12 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
             "book_depth": manifest.notes.get("book_depth") if manifest.notes is not None else None,
         },
         "index": index_summary,
+        "decision_grid": {
+            "schema": decision_grid.metadata.schema,
+            "hash": decision_grid.decision_grid_hash,
+            "n_rows": decision_grid.n_rows,
+            "schedule": decision_grid.decision_schedule,
+        },
         "dataset": dataset_summary,
         "baseline": baseline_summary,
         "resource_mode": {
@@ -782,6 +786,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
+    parser.add_argument("--decision-grid-npz", required=True)
     parser.add_argument("--output-json")
     parser.add_argument("--model-npz")
     parser.add_argument("--overwrite", action="store_true")
@@ -797,9 +802,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auc-bins", type=int, default=2000)
     parser.add_argument("--exact-auc-max-rows", type=int, default=1_000_000)
     parser.add_argument("--progress-interval", type=int)
-    parser.add_argument("--decision-interval-us", type=int, default=500_000)
-    parser.add_argument("--start-event-index", type=int)
-    parser.add_argument("--max-decisions", type=int)
     parser.add_argument("--flow-windows-us", default="200000,500000,1000000")
     parser.add_argument("--keep-incomplete-horizon", action="store_true")
     parser.add_argument("--vpin-bucket-volume", type=float, default=50.0)
@@ -839,6 +841,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfig:
     return AdverseSelectionTrainCLIConfig(
         tape_root=args.tape_root,
+        decision_grid_npz=args.decision_grid_npz,
         output_json=args.output_json,
         model_npz=args.model_npz,
         overwrite=args.overwrite,
@@ -852,9 +855,6 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         auc_bins=args.auc_bins,
         exact_auc_max_rows=args.exact_auc_max_rows,
         progress_interval=args.progress_interval,
-        decision_interval_us=args.decision_interval_us,
-        start_event_index=args.start_event_index,
-        max_decisions=args.max_decisions,
         flow_windows_us=args.flow_windows_us,
         drop_incomplete_horizon=not args.keep_incomplete_horizon,
         vpin_bucket_volume=args.vpin_bucket_volume,

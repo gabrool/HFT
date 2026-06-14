@@ -9,18 +9,21 @@ pytest.importorskip("pyarrow.parquet")
 
 from mmrt import config as cfg
 from mmrt.cli import ingest as cli
+from mmrt.execution.decision_grid import load_decision_grid_npz, save_decision_grid_npz
 from mmrt.execution.execution_tape import save_execution_tape
-from mmrt.execution.linear_signal_builder import build_execution_linear_feature_dataset
+from mmrt.execution.linear_signal_builder import iter_execution_linear_feature_chunks_for_decision_grid
 from mmrt.features.specs import FEATURE_NAMES_HASH, FEATURE_SCHEMA, FEATURE_SPECS_HASH
 from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
 from tests.test_execution_feature_replay import make_tape
+from tests.grid_helpers import decision_grid_for_tape
 
 
 def _saved_tape(tmp_path: Path, **kwargs):
     tape = make_tape(**kwargs)
     tape_root = tmp_path / "tape"
     save_execution_tape(tape, tape_root)
+    save_decision_grid_npz(tape_root / "decision_grid.npz", decision_grid_for_tape(tape), overwrite=True)
     return tape, tape_root
 
 
@@ -30,6 +33,7 @@ def _run_ingest(tmp_path: Path, tape_root: Path, *extra_args: str) -> Path:
         "--dataset-root", str(dataset_root),
         "--dataset-id", "ds-tape",
         "--tape-root", str(tape_root),
+        "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
         *extra_args,
     ])
     assert rc == 0
@@ -45,7 +49,7 @@ def test_ingest_builds_dataset_from_tape(tmp_path, capsys):
     assert summary["symbol"] == tape.manifest.symbol
     assert summary["book_data_type"] == "incremental_book_L2"
     assert summary["rows"] > 0
-    assert summary["decisions_emitted"] >= summary["rows"]
+    assert summary["decision_grid_rows"] >= summary["rows"]
 
     reader = rd.open_dataset(str(dataset_root), validate_on_open=True)
     manifest = reader.manifest
@@ -55,8 +59,9 @@ def test_ingest_builds_dataset_from_tape(tmp_path, capsys):
     assert manifest.pipeline_config["source_data_types"] == ["incremental_book_L2", "trades"]
     assert manifest.transform_config["feature_names_hash"] == FEATURE_NAMES_HASH
     assert manifest.transform_config["feature_specs_hash"] == FEATURE_SPECS_HASH
-    assert manifest.transform_diagnostics["rows_seen"] == summary["decisions_emitted"]
+    assert manifest.transform_diagnostics["rows_seen"] == summary["decision_grid_rows"]
     assert manifest.notes["ingest_counters"]["rows_written"] == summary["rows"]
+    assert manifest.notes["decision_grid"]["decision_grid_hash"] == summary["decision_grid_hash"]
 
     table = reader.read_table()
     assert table.num_rows == summary["rows"]
@@ -84,12 +89,16 @@ def test_ingest_rows_match_execution_feature_replay_exactly(tmp_path):
     )
     dataset_local_ts = np.asarray(table[mf.LOCAL_TS_US_COLUMN], dtype=np.int64)
 
-    serving = build_execution_linear_feature_dataset(tape)
-    assert serving.feature_names == manifest.feature_columns
+    grid = load_decision_grid_npz(tape_root / "decision_grid.npz")
+    chunks = list(iter_execution_linear_feature_chunks_for_decision_grid(tape, decision_grid=grid))
+    serving_features = np.vstack([c.features for c in chunks])
+    serving_local_ts = np.concatenate([c.decision_local_ts_us for c in chunks])
+    serving_feature_names = chunks[0].feature_names
+    assert serving_feature_names == manifest.feature_columns
     n = dataset_features.shape[0]
-    assert 0 < n <= serving.num_decisions
-    np.testing.assert_array_equal(dataset_local_ts, serving.decision_local_ts_us[:n])
-    np.testing.assert_array_equal(dataset_features, serving.features[:n])
+    assert 0 < n <= serving_features.shape[0]
+    np.testing.assert_array_equal(dataset_local_ts, serving_local_ts[:n])
+    np.testing.assert_array_equal(dataset_features, serving_features[:n])
 
 
 def test_ingest_applies_chronological_splits(tmp_path):
@@ -115,11 +124,12 @@ def test_ingest_applies_chronological_splits(tmp_path):
 
 def test_ingest_rejects_invalid_schedule_arguments(tmp_path):
     _, tape_root = _saved_tape(tmp_path)
-    with pytest.raises(ValueError, match="max_decision_interval_us"):
+    with pytest.raises(SystemExit):
         cli.main([
             "--dataset-root", str(tmp_path / "ds"),
             "--dataset-id", "ds",
             "--tape-root", str(tape_root),
+            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
             "--min-decision-interval-us", "200000",
             "--max-decision-interval-us", "100000",
         ])
@@ -132,6 +142,7 @@ def test_ingest_rejects_tape_without_trades(tmp_path):
             "--dataset-root", str(tmp_path / "ds"),
             "--dataset-id", "ds",
             "--tape-root", str(tape_root),
+            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
         ])
 
 
@@ -143,6 +154,7 @@ def test_ingest_rejects_existing_manifest(tmp_path):
             "--dataset-root", str(dataset_root),
             "--dataset-id", "ds-again",
             "--tape-root", str(tape_root),
+            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
         ])
 
 
@@ -153,20 +165,12 @@ def test_ingest_split_args_require_train_and_val(tmp_path):
             "--dataset-root", str(tmp_path / "ds"),
             "--dataset-id", "ds",
             "--tape-root", str(tape_root),
+            "--decision-grid-npz", str(tape_root / "decision_grid.npz"),
             "--split-test", "1:2",
         ])
 
 
 def test_ingest_max_events_limits_replay(tmp_path, capsys):
     _, tape_root = _saved_tape(tmp_path, n_l2=240)
-    _run_ingest(tmp_path, tape_root, "--max-events", "200")
-    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    full_root = tmp_path / "dataset_full"
-    rc = cli.main([
-        "--dataset-root", str(full_root),
-        "--dataset-id", "ds-full",
-        "--tape-root", str(tape_root),
-    ])
-    assert rc == 0
-    full_summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert summary["rows"] < full_summary["rows"]
+    with pytest.raises(SystemExit):
+        _run_ingest(tmp_path, tape_root, "--max-events", "200")

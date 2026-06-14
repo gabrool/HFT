@@ -20,6 +20,7 @@ from mmrt.storage import manifest as mf
 from mmrt.storage import reader as rd
 from mmrt.storage import splits as sp
 from mmrt.storage import writer as wr
+from tests.grid_helpers import grid_lineage_notes
 
 
 def _label_values(ret_bps: float) -> tuple[float, ...]:
@@ -27,9 +28,9 @@ def _label_values(ret_bps: float) -> tuple[float, ...]:
 
 
 def _write_predictive_ds(root: Path, *, train_rows: int = 60, val_rows: int = 30, test_rows: int = 20) -> Path:
-    cfg = wr.WriterConfig(dataset_id="feature_lab_ds", created_at_utc="2026-01-01T00:00:00Z", dataset_root=str(root), transform_config=TransformConfig().as_dict(), chunk_rows=17)
-    writer = wr.DecisionRowWriter(cfg)
     n_rows = train_rows + val_rows + test_rows
+    cfg = wr.WriterConfig(dataset_id="feature_lab_ds", created_at_utc="2026-01-01T00:00:00Z", dataset_root=str(root), transform_config=TransformConfig().as_dict(), chunk_rows=17, notes=grid_lineage_notes(n_rows=n_rows))
+    writer = wr.DecisionRowWriter(cfg)
     for i in range(n_rows):
         mod = i % 6
         if mod == 0:

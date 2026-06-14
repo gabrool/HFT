@@ -200,7 +200,7 @@ def test_train_execution_ppo_default_linear_signal_filename_has_builder_cli():
 def test_execution_env_default_reset_uses_linear_signal_first_row():
     source = Path("mmrt/execution/env.py").read_text(encoding="utf-8")
     reset_body = source.split("def reset(", 1)[1].split("def step(", 1)[0]
-    assert "self.linear_signals.decision_event_index[0]" in reset_body
+    assert "self.decision_grid.decision_event_index[0]" in reset_body
     assert "start = 0" not in reset_body
 
 
@@ -216,17 +216,16 @@ def test_build_linear_signals_cli_does_not_recompute_predictions_for_summary():
 def test_linear_signal_builder_streaming_path_has_no_scan_replay():
     source = Path("mmrt/execution/linear_signal_builder.py").read_text(encoding="utf-8")
     body = source.split("def build_linear_signal_artifact_npz_from_execution_feature_chunks", 1)[1].split("__all__", 1)[0]
-    assert body.count("iter_execution_linear_feature_chunks(") == 1
+    assert body.count("iter_execution_linear_feature_chunks_for_decision_grid(") == 1
     assert "_scan_execution_linear_feature_chunks" not in source
     assert "NpyChunkWriter" in source
 
 
-def test_deprecated_execution_linear_feature_dataset_has_no_chunk_list_vstack_path():
+def test_schedule_based_execution_linear_feature_dataset_path_is_removed():
     source = Path("mmrt/execution/linear_signal_builder.py").read_text(encoding="utf-8")
-    body = source.split("def build_execution_linear_feature_dataset", 1)[1].split("@dataclass", 1)[0]
-    assert "DeprecationWarning" in body
-    assert "chunks = list" not in body
-    assert "np.vstack" not in body
+    assert "def build_execution_linear_feature_dataset" not in source
+    assert "def iter_execution_linear_feature_chunks(" not in source
+    assert "schedule_config_from_train_result" not in source
 
 
 def test_execution_clis_validate_linear_metadata_with_artifact_start_only():
@@ -251,8 +250,8 @@ def test_execution_env_nonterminal_step_targets_next_linear_signal_row():
     step_body = source.split("def step(", 1)[1].split("def _event_key_at_index", 1)[0]
 
     assert "target_event_index" in step_body
-    assert "self.linear_signals.decision_event_index[next_signal_row]" in step_body
-    assert "_validate_next_signal_target" in source
+    assert "self.decision_grid.decision_event_index[next_signal_row]" in step_body
+    assert "_validate_next_grid_target" in source
 
     fallback_body = source.split("def _fallback", 1)[1] if "def _fallback" in source else ""
     old_token = "processed_any and processed_valid_l2 and event_local > decision_end_local_ts_us"

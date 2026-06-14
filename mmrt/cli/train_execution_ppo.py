@@ -13,6 +13,7 @@ import torch
 from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
+from mmrt.execution.decision_grid import load_decision_grid_npz, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
@@ -158,6 +159,7 @@ def _parse_hidden_sizes(value: str | Sequence[int] | tuple[int, ...]) -> tuple[i
 @dataclass(frozen=True, slots=True)
 class ExecutionPPOTrainCLIConfig:
     tape_root: str
+    decision_grid_npz: str
     output_json: str | None = None
     checkpoint_path: str | None = None
     linear_signals_npz: str | None = None
@@ -243,6 +245,7 @@ class ExecutionPPOTrainCLIConfig:
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
+        _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz")
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
         if self.checkpoint_path is not None:
@@ -337,6 +340,7 @@ class ExecutionPPOTrainCLIConfig:
 def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
     return {
         "tape_root": config.tape_root,
+        "decision_grid_npz": config.decision_grid_npz,
         "output_json": config.output_json,
         "checkpoint_path": config.checkpoint_path,
         "linear_signals_npz": config.linear_signals_npz,
@@ -529,15 +533,18 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         else _default_linear_signals_npz(config.tape_root)
     )
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
+    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
     adverse_signals = load_adverse_selection_signals(config.adverse_signals_npz) if config.adverse_signals_npz is not None else None
     env_config = _build_env_config(config)
     linear_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
+        decision_grid=decision_grid,
         requested_start_event_index=config.start_event_index,
         min_rows=(config.max_episode_steps + 1) if config.max_episode_steps is not None else None,
     )
-    env = ExecutionEnv(tape, config=env_config, linear_signals=linear_signals, adverse_signals=adverse_signals)
+    env = ExecutionEnv(tape, config=env_config, decision_grid=decision_grid, linear_signals=linear_signals, adverse_signals=adverse_signals)
     training_config = _build_training_config(config)
     result = train_ppo_policy(env, config=training_config)
 
@@ -545,6 +552,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         "status": "ok",
         "run_type": "train_execution_ppo",
         "tape_root": str(Path(config.tape_root)),
+        "decision_grid_npz": str(Path(config.decision_grid_npz)),
         "output_json": str(output_json),
         "checkpoint_path": None if not config.save_checkpoint else str(checkpoint_path),
         "config": _summary_config(config),
@@ -563,6 +571,12 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         "observation_schema": env.config.observation_schema.as_dict(),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
         "linear_signal_start": linear_start.as_dict(),
+        "decision_grid": {
+            "schema": decision_grid.metadata.schema,
+            "hash": decision_grid.decision_grid_hash,
+            "n_rows": decision_grid.n_rows,
+            "schedule": decision_grid.decision_schedule,
+        },
     }
 
     if config.save_checkpoint:
@@ -574,6 +588,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             linear_signals, path=str(linear_signals_path)
         )
         checkpoint_payload["linear_signal_start"] = linear_start.as_dict()
+        checkpoint_payload["decision_grid"] = summary["decision_grid"]
         _save_checkpoint_atomic(checkpoint_path, checkpoint_payload)
         summary["checkpoint_saved"] = True
     else:
@@ -586,6 +601,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train an execution PPO policy from an existing execution tape.")
     parser.add_argument("--tape-root", required=True)
+    parser.add_argument("--decision-grid-npz", required=True)
 
     parser.add_argument("--output-json")
     parser.add_argument("--checkpoint-path")
@@ -680,6 +696,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
     return ExecutionPPOTrainCLIConfig(
         tape_root=args.tape_root,
+        decision_grid_npz=args.decision_grid_npz,
         output_json=args.output_json,
         checkpoint_path=args.checkpoint_path,
         linear_signals_npz=args.linear_signals_npz,

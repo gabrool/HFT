@@ -14,7 +14,7 @@ import numpy as np
 from mmrt.contracts import DecisionReason
 from mmrt.features import kernels as k
 from mmrt.features.book_state import BookSnapshotInput, BookState, BookSummary
-from mmrt.features.schedule import DecisionSchedule, DecisionScheduleConfig
+from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features.trade_state import (
     BUY_SIDE_CODE,
     SELL_SIDE_CODE,
@@ -233,49 +233,44 @@ class FeatureEngine:
         self.book_state = BookState()
         self.trade_state = TradeState()
         self.event_history = EventHistory(self.config.event_history_capacity)
-        self.schedule = DecisionSchedule(self.config.schedule)
         self.reset()
 
     def reset(self) -> None:
         self.book_state.reset(); self.trade_state.reset(); self.event_history.reset()
-        self.schedule.reset()
         self.decision_count = 0
         self.last_event_local_ts_us = None
         self.last_decision_local_ts_us = None
 
     def has_book(self) -> bool: return self.book_state.has_book()
     def has_trades(self) -> bool: return self.trade_state.has_trades()
-    def is_ready(self) -> bool: return self.has_book() and self.has_trades()
+    def is_ready(self) -> bool: return self.has_book()
 
     def on_trade(self, trade: TradeInput) -> None:
         if not isinstance(trade, TradeInput): raise TypeError("trade")
         self._validate_event_time(trade.local_ts_us)
         self.event_history.append(trade.local_ts_us, TRADE_EVENT_CODE)
         self.trade_state.apply_trade(trade)
-        self.schedule.observe_trade(trade.local_ts_us)
         self.last_event_local_ts_us = trade.local_ts_us
         return None
 
     def on_book_snapshot(self, snapshot: BookSnapshotInput) -> EngineDecision | None:
+        self.observe_book_snapshot(snapshot)
+        return None
+
+    def observe_book_snapshot(self, snapshot: BookSnapshotInput) -> None:
         if not isinstance(snapshot, BookSnapshotInput): raise TypeError("snapshot")
+        self._apply_book_snapshot(snapshot)
+
+    def force_decision(self, *, local_ts_us: int, ts_us: int, event_seq: int) -> EngineDecision:
+        if not self.is_ready():
+            raise ValueError("not_ready")
+        return self._emit_decision(local_ts_us, ts_us, event_seq)
+
+    def _apply_book_snapshot(self, snapshot: BookSnapshotInput) -> None:
         self._validate_event_time(snapshot.local_ts_us)
         self.event_history.append(snapshot.local_ts_us, L2_EVENT_CODE)
         self.book_state.apply_snapshot(snapshot)
         self.last_event_local_ts_us = snapshot.local_ts_us
-        summary = self.book_state.current_summary()
-        self.schedule.observe_book(
-            snapshot.local_ts_us,
-            best_bid=summary.best_bid,
-            best_ask=summary.best_ask,
-            bid_l1_size=summary.bid_size_1,
-            ask_l1_size=summary.ask_size_1,
-        )
-        if not self.is_ready(): return None
-        if not self.schedule.should_fire(snapshot.local_ts_us):
-            return None
-        decision = self._emit_decision(snapshot.local_ts_us, snapshot.ts_us, snapshot.event_seq)
-        self.schedule.mark_decision(snapshot.local_ts_us)
-        return decision
 
     def _validate_event_time(self, local_ts_us: int) -> None:
         _require_int(local_ts_us, "local_ts_us", positive=True)
@@ -295,7 +290,8 @@ class FeatureEngine:
     def _build_feature_vector_for_decision(self, now_us: int, previous_decision_local_ts_us: int | None) -> np.ndarray:
         out = np.zeros(FEATURE_COUNT, dtype=np.float64)
         self.book_state.fill_book_features(out)
-        self.trade_state.fill_trade_features(out, as_of_local_ts_us=now_us)
+        if self.trade_state.has_trades():
+            self.trade_state.fill_trade_features(out, as_of_local_ts_us=now_us)
         self.fill_engine_features(out, as_of_local_ts_us=now_us, previous_decision_local_ts_us=previous_decision_local_ts_us)
         if not np.all(np.isfinite(out)):
             raise RuntimeError("non-finite")
@@ -304,7 +300,9 @@ class FeatureEngine:
     def build_feature_vector(self, as_of_local_ts_us: int | None = None) -> np.ndarray:
         if not self.is_ready(): raise ValueError("not_ready")
         now = self.book_state.last_local_ts_us if as_of_local_ts_us is None else _require_int(as_of_local_ts_us, "as_of_local_ts_us", positive=True)
-        if now < self.book_state.last_local_ts_us or now < self.trade_state.last_local_ts_us:
+        if now < self.book_state.last_local_ts_us:
+            raise ValueError("as_of_local_ts_us")
+        if self.trade_state.last_local_ts_us is not None and now < self.trade_state.last_local_ts_us:
             raise ValueError("as_of_local_ts_us")
         if now != self.book_state.last_local_ts_us:
             raise ValueError("as_of_local_ts_us")

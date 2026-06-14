@@ -2,10 +2,11 @@
 
 This module owns the single definition of when decisions fire on a causal
 market event stream: wake conditions (trades, top-of-book changes), a minimum
-re-decision interval (throttle), and a maximum interval (heartbeat). The
-feature engine drives it during replay, so supervised dataset ingest, linear
-signal building, and execution replay all share one decision grid by
-construction.
+re-decision interval (throttle), and a maximum interval (heartbeat).
+
+Offline production uses this scheduler only in ``mmrt.cli.build_decision_grid``.
+The resulting ``decision_grid.npz`` is the realized row sequence for one tape,
+and downstream stages consume that grid instead of re-applying this scheduler.
 
 Decisions can only fire on book events: trades and book changes arm the
 trigger, and the decision is emitted at the next book event that satisfies
@@ -44,6 +45,25 @@ def _require_positive_float(value: float, name: str) -> float:
 DEFAULT_MIN_DECISION_INTERVAL_US = 100_000
 DEFAULT_MAX_DECISION_INTERVAL_US = 500_000
 DEFAULT_L1_SIZE_CHANGE_FRACTION = 0.5
+
+DECISION_REASON_NONE = 0
+DECISION_REASON_FIRST_VALID_BOOK = 1
+DECISION_REASON_TRADE_WAKE = 2
+DECISION_REASON_TOP_OF_BOOK_WAKE = 3
+DECISION_REASON_HEARTBEAT = 4
+
+DECISION_REASON_FLAG_FIRST_VALID_BOOK = 1 << 0
+DECISION_REASON_FLAG_TRADE_WAKE = 1 << 1
+DECISION_REASON_FLAG_TOP_OF_BOOK_WAKE = 1 << 2
+DECISION_REASON_FLAG_HEARTBEAT = 1 << 3
+
+DECISION_REASON_CODE_NAMES = {
+    DECISION_REASON_NONE: "none",
+    DECISION_REASON_FIRST_VALID_BOOK: "first_valid_book",
+    DECISION_REASON_TRADE_WAKE: "trade_wake",
+    DECISION_REASON_TOP_OF_BOOK_WAKE: "top_of_book_wake",
+    DECISION_REASON_HEARTBEAT: "heartbeat",
+}
 
 _SCHEDULE_PAYLOAD_FIELDS = (
     "min_decision_interval_us",
@@ -85,6 +105,26 @@ class DecisionScheduleConfig:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionFire:
+    should_fire: bool
+    reason_code: int = DECISION_REASON_NONE
+    reason_flags: int = 0
+
+    def __post_init__(self) -> None:
+        _require_bool(self.should_fire, "should_fire")
+        code = int(self.reason_code)
+        if code not in DECISION_REASON_CODE_NAMES:
+            raise ValueError("reason_code is unknown")
+        flags = int(self.reason_flags)
+        if flags < 0:
+            raise ValueError("reason_flags must be nonnegative")
+        if not self.should_fire and code != DECISION_REASON_NONE:
+            raise ValueError("non-firing decisions must use reason_code none")
+        object.__setattr__(self, "reason_code", code)
+        object.__setattr__(self, "reason_flags", flags)
+
+
 def decision_schedule_config_from_dict(payload: Mapping[str, object]) -> DecisionScheduleConfig:
     """Rebuild a DecisionScheduleConfig from a stored identity payload."""
     if not isinstance(payload, Mapping):
@@ -116,7 +156,8 @@ class DecisionSchedule:
     __slots__ = (
         "config",
         "_last_decision_local_ts_us",
-        "_armed",
+        "_trade_armed",
+        "_top_of_book_armed",
         "_prev_best_bid",
         "_prev_best_ask",
         "_prev_bid_l1_size",
@@ -131,7 +172,8 @@ class DecisionSchedule:
 
     def reset(self) -> None:
         self._last_decision_local_ts_us: int | None = None
-        self._armed = False
+        self._trade_armed = False
+        self._top_of_book_armed = False
         self._prev_best_bid: float | None = None
         self._prev_best_ask: float | None = None
         self._prev_bid_l1_size: float | None = None
@@ -143,12 +185,20 @@ class DecisionSchedule:
 
     @property
     def is_armed(self) -> bool:
-        return self._armed
+        return self._trade_armed or self._top_of_book_armed
+
+    @property
+    def trade_wake_armed(self) -> bool:
+        return self._trade_armed
+
+    @property
+    def top_of_book_wake_armed(self) -> bool:
+        return self._top_of_book_armed
 
     def observe_trade(self, local_ts_us: int) -> None:
         _require_positive_int(local_ts_us, "local_ts_us")
         if self.config.wake_on_trade:
-            self._armed = True
+            self._trade_armed = True
 
     def observe_book(
         self,
@@ -172,7 +222,7 @@ class DecisionSchedule:
         self._prev_bid_l1_size = bid_l1_size
         self._prev_ask_l1_size = ask_l1_size
         if changed and self.config.wake_on_top_of_book:
-            self._armed = True
+            self._top_of_book_armed = True
 
     def _l1_size_changed(self, size: float, prev: float | None) -> bool:
         if prev is None:
@@ -181,30 +231,72 @@ class DecisionSchedule:
         return abs(size - prev) / reference >= self.config.l1_size_change_fraction
 
     def should_fire(self, local_ts_us: int) -> bool:
+        return self.fire_reason(local_ts_us).should_fire
+
+    def fire_reason(self, local_ts_us: int) -> DecisionFire:
         _require_positive_int(local_ts_us, "local_ts_us")
         last = self._last_decision_local_ts_us
         if last is None:
-            return True
+            return DecisionFire(
+                should_fire=True,
+                reason_code=DECISION_REASON_FIRST_VALID_BOOK,
+                reason_flags=DECISION_REASON_FLAG_FIRST_VALID_BOOK,
+            )
         elapsed = local_ts_us - last
         if elapsed < self.config.min_decision_interval_us:
-            return False
+            return DecisionFire(should_fire=False)
+
+        flags = 0
+        if self._trade_armed:
+            flags |= DECISION_REASON_FLAG_TRADE_WAKE
+        if self._top_of_book_armed:
+            flags |= DECISION_REASON_FLAG_TOP_OF_BOOK_WAKE
         if elapsed >= self.config.max_decision_interval_us:
-            return True
-        return self._armed
+            flags |= DECISION_REASON_FLAG_HEARTBEAT
+            return DecisionFire(
+                should_fire=True,
+                reason_code=DECISION_REASON_HEARTBEAT,
+                reason_flags=flags,
+            )
+        if self._trade_armed:
+            return DecisionFire(
+                should_fire=True,
+                reason_code=DECISION_REASON_TRADE_WAKE,
+                reason_flags=flags,
+            )
+        if self._top_of_book_armed:
+            return DecisionFire(
+                should_fire=True,
+                reason_code=DECISION_REASON_TOP_OF_BOOK_WAKE,
+                reason_flags=flags,
+            )
+        return DecisionFire(should_fire=False)
 
     def mark_decision(self, local_ts_us: int) -> None:
         _require_positive_int(local_ts_us, "local_ts_us")
         if self._last_decision_local_ts_us is not None and local_ts_us <= self._last_decision_local_ts_us:
             raise ValueError("decision local_ts_us must be strictly increasing")
         self._last_decision_local_ts_us = local_ts_us
-        self._armed = False
+        self._trade_armed = False
+        self._top_of_book_armed = False
 
 
 __all__ = [
     "DEFAULT_MIN_DECISION_INTERVAL_US",
     "DEFAULT_MAX_DECISION_INTERVAL_US",
     "DEFAULT_L1_SIZE_CHANGE_FRACTION",
+    "DECISION_REASON_NONE",
+    "DECISION_REASON_FIRST_VALID_BOOK",
+    "DECISION_REASON_TRADE_WAKE",
+    "DECISION_REASON_TOP_OF_BOOK_WAKE",
+    "DECISION_REASON_HEARTBEAT",
+    "DECISION_REASON_FLAG_FIRST_VALID_BOOK",
+    "DECISION_REASON_FLAG_TRADE_WAKE",
+    "DECISION_REASON_FLAG_TOP_OF_BOOK_WAKE",
+    "DECISION_REASON_FLAG_HEARTBEAT",
+    "DECISION_REASON_CODE_NAMES",
     "DecisionScheduleConfig",
+    "DecisionFire",
     "DecisionSchedule",
     "decision_schedule_config_from_dict",
 ]

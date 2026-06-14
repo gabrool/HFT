@@ -29,6 +29,7 @@ from mmrt.execution.linear_signal import (
     validate_linear_signal_artifact_metadata,
     validate_linear_signal_start_event_index,
 )
+from tests.grid_helpers import grid_identity_fields
 
 
 def _fixed_schedule_payload(stride_us: int) -> dict:
@@ -61,6 +62,7 @@ def _artifact(n_rows: int) -> LinearSignalArtifact:
         num_trades=1,
         start_local_ts_us=100,
         end_local_ts_us=200,
+        **grid_identity_fields(n_rows=n_rows),
         decision_schedule=_fixed_schedule_payload(50),
         start_event_index=0,
         n_rows=n_rows,
@@ -70,6 +72,7 @@ def _artifact(n_rows: int) -> LinearSignalArtifact:
         metadata=metadata,
         decision_event_index=np.arange(n_rows, dtype=np.int64),
         decision_local_ts_us=np.arange(100, 100 + n_rows * 50, 50, dtype=np.int64),
+        decision_event_seq=np.arange(n_rows, dtype=np.int64),
     )
 
 
@@ -91,6 +94,7 @@ def _linear_artifact_with_decision_event_index(indices: list[int]) -> LinearSign
         num_trades=0,
         start_local_ts_us=100,
         end_local_ts_us=100 + 100 * (n_rows - 1),
+        **grid_identity_fields(n_rows=n_rows),
         decision_schedule=_fixed_schedule_payload(100),
         start_event_index=indices[0],
         n_rows=n_rows,
@@ -100,6 +104,7 @@ def _linear_artifact_with_decision_event_index(indices: list[int]) -> LinearSign
         metadata=metadata,
         decision_event_index=np.asarray(indices, dtype=np.int64),
         decision_local_ts_us=np.arange(100, 100 + n_rows * 100, 100, dtype=np.int64),
+        decision_event_seq=np.asarray(indices, dtype=np.int64),
     )
 
 
@@ -334,6 +339,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
         num_trades=1,
         start_local_ts_us=100,
         end_local_ts_us=200,
+        **grid_identity_fields(n_rows=2),
         decision_schedule=_fixed_schedule_payload(50),
         start_event_index=0,
         min_rows=2,
@@ -349,6 +355,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
             num_trades=1,
             start_local_ts_us=100,
             end_local_ts_us=200,
+            **grid_identity_fields(n_rows=2),
             decision_schedule=_fixed_schedule_payload(50),
             start_event_index=0,
         )
@@ -363,6 +370,7 @@ def test_validate_linear_signal_artifact_metadata_rejects_mismatch():
             num_trades=1,
             start_local_ts_us=100,
             end_local_ts_us=200,
+            **grid_identity_fields(n_rows=2),
             decision_schedule=_fixed_schedule_payload(100),
             start_event_index=0,
         )

@@ -33,6 +33,14 @@ ALLOWED_SUBSTRINGS = (
     "mmrt_adverse_selection_dataset_v2",
     "mmrt_adverse_selection_feature_dataset_v2",
     "mmrt_adverse_selection_index_v1",
+    "mmrt_execution_decision_grid_v1",
+    "mmrt_execution_linear_signals_grid_v1",
+    "mmrt_linear_training_result_tape25_grid_v1",
+    "mmrt_adverse_selection_dataset_grid_v1",
+    "mmrt_adverse_selection_feature_dataset_grid_v1",
+    "mmrt_adverse_selection_ridge_grid_v1",
+    "mmrt_adverse_selection_signals_grid_v1",
+    "event_schedule_reason_v1",
 )
 
 PRODUCTION_ROOT = Path("mmrt")

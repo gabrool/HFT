@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+import gc
 import json
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from mmrt.execution.adverse_signal import (
     load_adverse_selection_model,
     save_adverse_selection_signals_arrays,
 )
+from mmrt.execution.decision_grid import load_decision_grid_npz, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 
 __all__ = [
@@ -47,15 +49,12 @@ def _require_bool(value: bool, name: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class BuildAdverseSelectionSignalsConfig:
     tape_root: str
+    decision_grid_npz: str
     model_npz: str
     output_npz: str | None = None
     output_json: str | None = None
     overwrite: bool = False
     mmap_mode: str | None = "r"
-    decision_interval_us: int | None = None
-    start_event_index: int | None = None
-    max_decisions: int | None = None
-    use_model_range: bool = False
     feature_dataset_root: str | None = None
     work_dir: str | None = None
     chunk_rows: int = 100_000
@@ -65,6 +64,7 @@ class BuildAdverseSelectionSignalsConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
+        object.__setattr__(self, "decision_grid_npz", _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz"))
         object.__setattr__(self, "model_npz", _require_nonempty_str(self.model_npz, "model_npz"))
         if self.output_npz is not None:
             object.__setattr__(self, "output_npz", _require_nonempty_str(self.output_npz, "output_npz"))
@@ -73,13 +73,6 @@ class BuildAdverseSelectionSignalsConfig:
         object.__setattr__(self, "overwrite", _require_bool(self.overwrite, "overwrite"))
         if self.mmap_mode not in (None, "r"):
             raise ValueError("mmap_mode must be None or 'r'")
-        if self.decision_interval_us is not None and (isinstance(self.decision_interval_us, bool) or not isinstance(self.decision_interval_us, int) or self.decision_interval_us <= 0):
-            raise ValueError("decision_interval_us must be None or a positive int")
-        if self.start_event_index is not None and (isinstance(self.start_event_index, bool) or not isinstance(self.start_event_index, int) or self.start_event_index < 0):
-            raise ValueError("start_event_index must be None or a nonnegative int")
-        if self.max_decisions is not None and (isinstance(self.max_decisions, bool) or not isinstance(self.max_decisions, int) or self.max_decisions <= 0):
-            raise ValueError("max_decisions must be None or a positive int")
-        object.__setattr__(self, "use_model_range", _require_bool(self.use_model_range, "use_model_range"))
         if self.feature_dataset_root is not None:
             object.__setattr__(self, "feature_dataset_root", _require_nonempty_str(self.feature_dataset_root, "feature_dataset_root"))
         if self.work_dir is not None:
@@ -145,29 +138,23 @@ def build_adverse_selection_signals_from_config(
         mmap_mode=config.mmap_mode,
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
+    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
     model = load_adverse_selection_model(config.model_npz)
     if model.exchange != tape.manifest.exchange or model.symbol != tape.manifest.symbol:
         raise ValueError("adverse-selection model exchange/symbol must match execution tape")
+    if model.decision_grid_hash != decision_grid.decision_grid_hash:
+        raise ValueError("adverse-selection model decision_grid_hash must match decision grid")
+    if model.decision_grid_schema != decision_grid.metadata.schema or model.decision_grid_n_rows != decision_grid.n_rows:
+        raise ValueError("adverse-selection model decision grid metadata must match decision grid")
 
     payload = json.loads(model.config_json)
-    model_config = adverse_selection_config_from_training_summary(payload)
-    if config.use_model_range:
-        start_event_index = model_config.start_event_index
-        max_decisions = model_config.max_decisions
-    else:
-        start_event_index = config.start_event_index
-        max_decisions = config.max_decisions
-    decision_interval_us = config.decision_interval_us if config.decision_interval_us is not None else model_config.decision_interval_us
-    adverse_config = replace(
-        model_config,
-        decision_interval_us=decision_interval_us,
-        start_event_index=start_event_index,
-        max_decisions=max_decisions,
-    )
+    adverse_config = adverse_selection_config_from_training_summary(payload)
     feature_root = Path(config.feature_dataset_root) if config.feature_dataset_root is not None else Path(config.tape_root) / "adverse_selection_feature_dataset"
     dataset = build_adverse_selection_features_to_disk(
         tape,
         config=adverse_config,
+        decision_grid=decision_grid,
         output_root=feature_root,
         work_dir=config.work_dir,
         chunk_rows=config.chunk_rows,
@@ -178,7 +165,8 @@ def build_adverse_selection_signals_from_config(
     )
     if tuple(dataset.feature_names) != tuple(model.feature_names):
         raise ValueError("dataset feature_names must match model feature_names exactly")
-    preds = {name: np.lib.format.open_memmap(output_npz.parent / f".{output_npz.name}.{name}.npy", mode="w+", dtype=np.float32, shape=(dataset.num_rows,)) for name in model.target_names}
+    temp_pred_paths = {name: output_npz.parent / f".{output_npz.name}.{name}.npy" for name in model.target_names}
+    preds = {name: np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(dataset.num_rows,)) for name, path in temp_pred_paths.items()}
     for start_row in range(0, dataset.num_rows, config.chunk_rows):
         end_row = min(start_row + config.chunk_rows, dataset.num_rows)
         X = np.asarray(dataset.features[start_row:end_row], dtype=np.float64)
@@ -192,7 +180,10 @@ def build_adverse_selection_signals_from_config(
             preds[target][start_row:end_row] = pred.astype(np.float32, copy=False)
         if config.progress_interval is not None and (end_row % config.progress_interval == 0 or end_row == dataset.num_rows):
             print(f"adverse_signals progress rows_predicted={end_row}/{dataset.num_rows}")
-    for arr in preds.values(): arr.flush()
+    for arr in preds.values():
+        arr.flush()
+    del arr
+    prediction_summary = _prediction_summary(preds, chunk_rows=config.chunk_rows)
     save_adverse_selection_signals_arrays(
         output_npz,
         decision_local_ts_us=dataset.decision_local_ts_us,
@@ -200,16 +191,23 @@ def build_adverse_selection_signals_from_config(
         decision_event_seq=dataset.decision_event_seq,
         target_names=model.target_names,
         predictions=preds,
+        decision_grid_schema=decision_grid.metadata.schema,
+        decision_grid_hash=decision_grid.decision_grid_hash,
+        decision_grid_n_rows=decision_grid.n_rows,
+        decision_schedule=decision_grid.decision_schedule,
         overwrite=config.overwrite,
         validate_chunk_rows=config.chunk_rows,
     )
-    for target in model.target_names:
-        (output_npz.parent / f".{output_npz.name}.{target}.npy").unlink(missing_ok=True)
+    del preds
+    gc.collect()
+    for path in temp_pred_paths.values():
+        path.unlink(missing_ok=True)
 
     summary: dict[str, object] = {
         "status": "ok" if dataset.num_rows > 0 else "warning",
         "run_type": "build_adverse_selection_signals",
         "tape_root": str(Path(config.tape_root)),
+        "decision_grid_npz": str(Path(config.decision_grid_npz)),
         "model_npz": str(Path(config.model_npz)),
         "output_npz": str(output_npz),
         "output_json": str(output_json),
@@ -222,18 +220,19 @@ def build_adverse_selection_signals_from_config(
             "num_features": len(model.feature_names),
             "num_targets": len(model.target_names),
             "target_names": list(model.target_names),
+            "decision_grid_hash": model.decision_grid_hash,
         },
         "signals": {
             "schema": ADVERSE_SELECTION_SIGNALS_SCHEMA,
             "num_decisions": int(dataset.num_rows),
             "target_names": list(model.target_names),
-            "prediction_summary": _prediction_summary(preds, chunk_rows=config.chunk_rows),
+            "prediction_summary": prediction_summary,
         },
-        "inference_range": {
-            "decision_interval_us": adverse_config.decision_interval_us,
-            "start_event_index": adverse_config.start_event_index,
-            "max_decisions": adverse_config.max_decisions,
-            "use_model_range": config.use_model_range,
+        "decision_grid": {
+            "schema": decision_grid.metadata.schema,
+            "hash": decision_grid.decision_grid_hash,
+            "n_rows": decision_grid.n_rows,
+            "schedule": decision_grid.decision_schedule,
         },
         "feature_dataset": summarize_adverse_selection_feature_store(dataset),
         "resource_mode": {"disk_backed_features": True, "disk_backed_index": True, "chunk_rows": config.chunk_rows, "keep_feature_dataset": config.keep_feature_dataset, "keep_work_dir": not config.cleanup_work_dir},
@@ -245,14 +244,12 @@ def build_adverse_selection_signals_from_config(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
+    parser.add_argument("--decision-grid-npz", required=True)
     parser.add_argument("--model-npz", required=True)
     parser.add_argument("--output-npz")
     parser.add_argument("--output-json")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
-    parser.add_argument("--decision-interval-us", type=int)
-    parser.add_argument("--start-event-index", type=int)
-    parser.add_argument("--max-decisions", type=int)
     parser.add_argument("--feature-dataset-root")
     parser.add_argument("--work-dir")
     parser.add_argument("--chunk-rows", type=int, default=100_000)
@@ -261,26 +258,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cleanup-work-dir", dest="cleanup_work_dir", action="store_true", default=False)
     parser.add_argument("--keep-work-dir", dest="cleanup_work_dir", action="store_false")
     parser.add_argument("--progress-interval", type=int)
-    parser.add_argument(
-        "--use-model-range",
-        action="store_true",
-        help="Use start_event_index/max_decisions stored in the training model config instead of full-tape signal generation.",
-    )
     return parser
 
 
 def _config_from_args(args: argparse.Namespace) -> BuildAdverseSelectionSignalsConfig:
     return BuildAdverseSelectionSignalsConfig(
         tape_root=args.tape_root,
+        decision_grid_npz=args.decision_grid_npz,
         model_npz=args.model_npz,
         output_npz=args.output_npz,
         output_json=args.output_json,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
-        decision_interval_us=args.decision_interval_us,
-        start_event_index=args.start_event_index,
-        max_decisions=args.max_decisions,
-        use_model_range=args.use_model_range,
         feature_dataset_root=getattr(args, "feature_dataset_root", None),
         work_dir=getattr(args, "work_dir", None),
         chunk_rows=getattr(args, "chunk_rows", 100_000),

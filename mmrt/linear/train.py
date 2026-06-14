@@ -29,7 +29,7 @@ from mmrt.linear import diagnostics as dg
 DEFAULT_TRAIN_BATCH_SIZE = 8192
 DEFAULT_EPOCHS = 5
 DEFAULT_OUTPUT_FILENAME = "linear_train_result.json"
-LINEAR_TRAINING_RESULT_SCHEMA = "mmrt_linear_training_result_tape25"
+LINEAR_TRAINING_RESULT_SCHEMA = "mmrt_linear_training_result_tape25_grid_v1"
 
 
 def _require_positive_int(value: int, name: str) -> int:
@@ -100,6 +100,29 @@ def _require_manifest_has_split_roles(manifest: mf.StorageManifest) -> tuple[Spl
         if role in role_set:
             ordered.append(role)
     return tuple(ordered)
+
+
+def _decision_grid_lineage_from_manifest(manifest: mf.StorageManifest) -> dict[str, object]:
+    notes = manifest.notes or {}
+    lineage = notes.get("decision_grid")
+    if not isinstance(lineage, Mapping):
+        raise ValueError("dataset manifest notes must include decision_grid lineage")
+    required = ("decision_grid_schema", "decision_grid_hash", "decision_grid_n_rows", "decision_schedule")
+    missing = [key for key in required if key not in lineage]
+    if missing:
+        raise ValueError(f"dataset manifest decision_grid lineage missing fields: {missing}")
+    schedule = dict(lineage["decision_schedule"])  # type: ignore[arg-type]
+    if schedule != manifest.decision_schedule:
+        raise ValueError("dataset manifest decision_grid schedule must match manifest decision_schedule")
+    decision_grid_hash = _require_non_empty_str(str(lineage["decision_grid_hash"]), "decision_grid_hash")
+    if len(decision_grid_hash) != 64 or any(ch not in "0123456789abcdef" for ch in decision_grid_hash):
+        raise ValueError("decision_grid_hash must be lowercase sha256 hex")
+    return {
+        "decision_grid_schema": _require_non_empty_str(str(lineage["decision_grid_schema"]), "decision_grid_schema"),
+        "decision_grid_hash": decision_grid_hash,
+        "decision_grid_n_rows": _require_positive_int(int(lineage["decision_grid_n_rows"]), "decision_grid_n_rows"),
+        "decision_schedule": schedule,
+    }
 
 
 def _role_to_str(role: SplitRole | str) -> str:
@@ -222,6 +245,9 @@ class LinearTrainResult:
     schema: str
     dataset_id: str
     manifest_hash: str
+    decision_grid_schema: str
+    decision_grid_hash: str
+    decision_grid_n_rows: int
     config: dict[str, object]
     decision_schedule: dict[str, object]
     transform_config: dict[str, object]
@@ -235,6 +261,11 @@ class LinearTrainResult:
             raise ValueError("invalid schema")
         object.__setattr__(self, "dataset_id", _require_non_empty_str(self.dataset_id, "dataset_id"))
         object.__setattr__(self, "manifest_hash", _require_non_empty_str(self.manifest_hash, "manifest_hash"))
+        object.__setattr__(self, "decision_grid_schema", _require_non_empty_str(self.decision_grid_schema, "decision_grid_schema"))
+        object.__setattr__(self, "decision_grid_hash", _require_non_empty_str(self.decision_grid_hash, "decision_grid_hash"))
+        if len(self.decision_grid_hash) != 64 or any(ch not in "0123456789abcdef" for ch in self.decision_grid_hash):
+            raise ValueError("decision_grid_hash must be lowercase sha256 hex")
+        object.__setattr__(self, "decision_grid_n_rows", _require_positive_int(int(self.decision_grid_n_rows), "decision_grid_n_rows"))
         for name in ("config", "decision_schedule", "transform_config", "preprocess_state", "model_bundle_state"):
             if not isinstance(getattr(self, name), dict):
                 raise ValueError(f"{name} must be dict")
@@ -263,6 +294,9 @@ class LinearTrainResult:
                 "schema": self.schema,
                 "dataset_id": self.dataset_id,
                 "manifest_hash": self.manifest_hash,
+                "decision_grid_schema": self.decision_grid_schema,
+                "decision_grid_hash": self.decision_grid_hash,
+                "decision_grid_n_rows": self.decision_grid_n_rows,
                 "config": self.config,
                 "decision_schedule": self.decision_schedule,
                 "transform_config": self.transform_config,
@@ -280,6 +314,9 @@ class LinearTrainResult:
             raise ValueError("linear train result must be a mapping")
         if raw["schema"] != LINEAR_TRAINING_RESULT_SCHEMA:
             raise ValueError("invalid schema")
+        for key in ("decision_grid_schema", "decision_grid_hash", "decision_grid_n_rows"):
+            if key not in raw:
+                raise ValueError(f"linear train result missing {key}")
         if "transform_config" not in raw:
             raise ValueError("linear train result missing transform_config")
         if "decision_schedule" not in raw:
@@ -292,6 +329,9 @@ class LinearTrainResult:
             schema=str(raw["schema"]),
             dataset_id=str(raw["dataset_id"]),
             manifest_hash=str(raw["manifest_hash"]),
+            decision_grid_schema=str(raw["decision_grid_schema"]),
+            decision_grid_hash=str(raw["decision_grid_hash"]),
+            decision_grid_n_rows=int(raw["decision_grid_n_rows"]),
             config=dict(raw["config"]),
             decision_schedule=dict(raw["decision_schedule"]),
             transform_config=dict(raw["transform_config"]),
@@ -534,6 +574,7 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
     reader = rd.open_dataset(root_str, validate_on_open=cfg.validate_dataset_on_open, batch_size=cfg.batch_size)
     manifest = reader.manifest
     manifest.validate_against_current_code()
+    grid_lineage = _decision_grid_lineage_from_manifest(manifest)
     roles = _require_manifest_has_split_roles(manifest)
 
     resolved_head_features = hf.resolve_head_feature_sets(manifest, cfg.head_feature_config)
@@ -565,6 +606,9 @@ def train_linear_model(dataset_root: str, *, config: LinearTrainConfig | None = 
         schema=LINEAR_TRAINING_RESULT_SCHEMA,
         dataset_id=manifest.dataset_id,
         manifest_hash=manifest.content_hash(),
+        decision_grid_schema=str(grid_lineage["decision_grid_schema"]),
+        decision_grid_hash=str(grid_lineage["decision_grid_hash"]),
+        decision_grid_n_rows=int(grid_lineage["decision_grid_n_rows"]),
         config={**cfg.as_dict(), "resolved_head_features": resolved_head_features.as_dict()},
         decision_schedule=dict(manifest.decision_schedule),
         transform_config=dict(manifest.transform_config),

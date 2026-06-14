@@ -31,7 +31,9 @@ def test_feature_engine_feature_vector_stable_with_window_cache():
     engine.on_book_snapshot(_snapshot(1_000_000, 100.0))
     engine.on_trade(TradeInput(1_100_000, 1_100_000, 100.0, 2.0, BUY_SIDE_CODE))
     engine.on_trade(TradeInput(1_200_000, 1_200_000, 100.0, 1.0, SELL_SIDE_CODE))
-    decision = engine.on_book_snapshot(_snapshot(1_500_000, 100.2))
+    snapshot = _snapshot(1_500_000, 100.2)
+    engine.observe_book_snapshot(snapshot)
+    decision = engine.force_decision(local_ts_us=snapshot.local_ts_us, ts_us=snapshot.ts_us, event_seq=snapshot.event_seq)
     assert decision is not None
     fv = decision.feature_vector
     assert np.all(np.isfinite(fv))

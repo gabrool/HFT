@@ -20,6 +20,7 @@ from mmrt.execution.execution_tape import (
     EVENT_TYPE_CODE_TRADE,
     ExecutionTape,
 )
+from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
 from mmrt.features.book_state import BOOK_DEPTH, BookSnapshotInput
 from mmrt.features.pipeline import (
     DecisionFeaturePipeline,
@@ -293,12 +294,170 @@ def iter_decision_feature_chunks(
         )
 
 
+def iter_tape_feature_steps_for_decision_grid(
+    tape: ExecutionTape,
+    *,
+    decision_grid: DecisionGrid,
+    pipeline: DecisionFeaturePipeline,
+) -> Iterator[TapeFeatureStep]:
+    """Replay tape events and emit decisions only at explicit grid rows."""
+
+    if not isinstance(tape, ExecutionTape):
+        raise ValueError("tape must be ExecutionTape")
+    if not isinstance(decision_grid, DecisionGrid):
+        raise ValueError("decision_grid must be DecisionGrid")
+    if not isinstance(pipeline, DecisionFeaturePipeline):
+        raise ValueError("pipeline must be DecisionFeaturePipeline")
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
+
+    events = tape.arrays.events
+    tick_size = float(tape.manifest.symbol_spec.tick_size)
+    l2_events = tape.arrays.l2_events
+    best_bid_ticks = np.ascontiguousarray(l2_events["best_bid_tick"])
+    best_ask_ticks = np.ascontiguousarray(l2_events["best_ask_tick"])
+    book_bid_ticks = tape.arrays.book_bid_ticks
+    book_bid_sizes = tape.arrays.book_bid_sizes
+    book_ask_ticks = tape.arrays.book_ask_ticks
+    book_ask_sizes = tape.arrays.book_ask_sizes
+    book_depth = int(book_bid_ticks.shape[1])
+    if book_depth > BOOK_DEPTH:
+        raise ValueError("tape book depth exceeds feature BOOK_DEPTH")
+    trades = tape.arrays.trades
+    trade_price = (np.asarray(trades["price_tick"], dtype=np.float64) * tick_size).tolist()
+    trade_amount = np.asarray(trades["amount"], dtype=np.float64).tolist()
+    trade_side = np.asarray(trades["side_code"], dtype=np.int64).tolist()
+
+    bid_px = np.zeros(BOOK_DEPTH, dtype=np.float64)
+    bid_sz = np.zeros(BOOK_DEPTH, dtype=np.float64)
+    ask_px = np.zeros(BOOK_DEPTH, dtype=np.float64)
+    ask_sz = np.zeros(BOOK_DEPTH, dtype=np.float64)
+
+    grid_pos = 0
+    next_grid_event_index = int(decision_grid.decision_event_index[grid_pos])
+    last_grid_event_index = int(decision_grid.decision_event_index[-1])
+    on_trade = pipeline.on_trade
+    on_book = pipeline.on_book_snapshot_without_decision
+    for chunk_start in range(0, last_grid_event_index + 1, _REPLAY_CHUNK_EVENTS):
+        chunk_end = min(chunk_start + _REPLAY_CHUNK_EVENTS, last_grid_event_index + 1)
+        chunk = events[chunk_start:chunk_end]
+        local_ts = chunk["local_ts_us"].tolist()
+        ts = chunk["ts_us"].tolist()
+        seq = chunk["event_seq"].tolist()
+        codes = chunk["event_type_code"].tolist()
+        book_ptrs = chunk["book_ptr"].tolist()
+        trade_ptrs = chunk["trade_ptr"].tolist()
+        for i in range(chunk_end - chunk_start):
+            event_index = chunk_start + i
+            if event_index > next_grid_event_index:
+                raise RuntimeError("decision grid row was not reached during tape replay")
+            code = codes[i]
+            if code == EVENT_TYPE_CODE_TRADE:
+                trade_ptr = trade_ptrs[i]
+                if trade_ptr < 0:
+                    raise ValueError("event row does not reference a trade")
+                on_trade(TradeInput(
+                    local_ts_us=local_ts[i],
+                    ts_us=ts[i],
+                    price=trade_price[trade_ptr],
+                    amount=trade_amount[trade_ptr],
+                    side_code=trade_side[trade_ptr],
+                    event_seq=seq[i],
+                ))
+                continue
+            if code != EVENT_TYPE_CODE_L2_BATCH:
+                raise ValueError(f"unsupported execution event_type_code: {code}")
+            book_ptr = book_ptrs[i]
+            if book_ptr < 0:
+                continue
+            bid_tick = int(best_bid_ticks[book_ptr])
+            if bid_tick <= 0 or int(best_ask_ticks[book_ptr]) <= bid_tick:
+                continue
+            np.multiply(book_bid_ticks[book_ptr], tick_size, out=bid_px[:book_depth])
+            np.multiply(book_ask_ticks[book_ptr], tick_size, out=ask_px[:book_depth])
+            bid_sz[:book_depth] = book_bid_sizes[book_ptr]
+            ask_sz[:book_depth] = book_ask_sizes[book_ptr]
+            snapshot = BookSnapshotInput.from_trusted_arrays(
+                local_ts_us=local_ts[i],
+                ts_us=ts[i],
+                event_seq=seq[i],
+                bid_px=bid_px,
+                bid_sz=bid_sz,
+                ask_px=ask_px,
+                ask_sz=ask_sz,
+            )
+            on_book(snapshot)
+            decision = None
+            if event_index == next_grid_event_index:
+                if int(decision_grid.book_ptr[grid_pos]) != book_ptr:
+                    raise ValueError("decision grid book_ptr mismatch during feature replay")
+                decision = pipeline.force_decision(local_ts_us=local_ts[i], ts_us=ts[i], event_seq=seq[i])
+                if int(decision.event_seq) != int(decision_grid.decision_event_seq[grid_pos]):
+                    raise ValueError("decision grid event_seq mismatch during feature replay")
+                grid_pos += 1
+                if grid_pos < decision_grid.n_rows:
+                    next_grid_event_index = int(decision_grid.decision_event_index[grid_pos])
+            yield TapeFeatureStep(
+                event_index=event_index,
+                local_ts_us=local_ts[i],
+                ts_us=ts[i],
+                event_seq=seq[i],
+                mid=pipeline.current_mid(),
+                decision=decision,
+            )
+    if grid_pos != decision_grid.n_rows:
+        raise RuntimeError("not all decision grid rows were replayed")
+
+
+def iter_decision_feature_chunks_for_decision_grid(
+    tape: ExecutionTape,
+    *,
+    decision_grid: DecisionGrid,
+    pipeline_config: FeaturePipelineConfig,
+    chunk_rows: int = 100_000,
+    output_dtype: str = "float32",
+) -> Iterator[DecisionFeatureChunk]:
+    """Yield transformed decision features exactly aligned to decision_grid."""
+
+    if not isinstance(pipeline_config, FeaturePipelineConfig):
+        raise ValueError("pipeline_config must be FeaturePipelineConfig")
+    chunk_rows = _require_positive_int(chunk_rows, "chunk_rows")
+    dtype = _require_output_dtype(output_dtype)
+    pipeline = DecisionFeaturePipeline(pipeline_config)
+    names = decision_feature_column_names()
+    idx_buf: list[int] = []
+    ts_buf: list[int] = []
+    feat_buf: list[np.ndarray] = []
+    for step in iter_tape_feature_steps_for_decision_grid(tape, decision_grid=decision_grid, pipeline=pipeline):
+        if step.decision is None:
+            continue
+        idx_buf.append(step.event_index)
+        ts_buf.append(step.decision.local_ts_us)
+        feat_buf.append(np.asarray(step.decision.feature_values, dtype=dtype))
+        if len(feat_buf) >= chunk_rows:
+            yield DecisionFeatureChunk(
+                np.asarray(idx_buf, dtype=np.int64),
+                np.asarray(ts_buf, dtype=np.int64),
+                np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype),
+                names,
+            )
+            idx_buf.clear(); ts_buf.clear(); feat_buf.clear()
+    if feat_buf:
+        yield DecisionFeatureChunk(
+            np.asarray(idx_buf, dtype=np.int64),
+            np.asarray(ts_buf, dtype=np.int64),
+            np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype),
+            names,
+        )
+
+
 __all__ = [
     "decision_feature_column_names",
     "book_snapshot_input_from_tape_row",
     "trade_input_from_tape_row",
     "TapeFeatureStep",
     "iter_tape_feature_steps",
+    "iter_tape_feature_steps_for_decision_grid",
     "DecisionFeatureChunk",
     "iter_decision_feature_chunks",
+    "iter_decision_feature_chunks_for_decision_grid",
 ]

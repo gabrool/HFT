@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
+from mmrt.execution.decision_grid import DECISION_GRID_FILENAME, load_decision_grid_npz, validate_decision_grid_for_execution_tape
 from mmrt.execution.linear_signal import (
     LINEAR_SIGNALS_FILENAME,
     MAGNITUDE_INPUT_LOG1P_BPS,
@@ -16,7 +17,6 @@ from mmrt.execution.linear_signal import (
 )
 from mmrt.execution.linear_signal_builder import (
     build_linear_signal_artifact_npz_from_execution_feature_chunks,
-    schedule_config_from_train_result,
     transform_config_from_train_result,
 )
 from mmrt.linear.train import LINEAR_TRAINING_RESULT_SCHEMA, load_linear_train_result
@@ -47,36 +47,22 @@ def _require_positive_int(value: int, name: str) -> int:
     return value
 
 
-def _require_optional_nonnegative_int(value: int | None, name: str) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be None or a nonnegative int")
-    return value
-
-
-def _require_optional_positive_int(value: int | None, name: str) -> int | None:
-    if value is None:
-        return None
-    return _require_positive_int(value, name)
-
-
 @dataclass(frozen=True, slots=True)
 class BuildLinearSignalsConfig:
     tape_root: str
+    decision_grid_npz: str
     linear_train_result_json: str
     output_npz: str | None = None
     output_json: str | None = None
     overwrite: bool = False
     mmap_mode: str | None = "r"
-    start_event_index: int | None = None
-    max_decisions: int | None = None
     output_dtype: str = "float32"
     magnitude_input: str = MAGNITUDE_INPUT_LOG1P_BPS
     chunk_rows: int = 100_000
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
+        object.__setattr__(self, "decision_grid_npz", _require_nonempty_str(self.decision_grid_npz, "decision_grid_npz"))
         object.__setattr__(self, "linear_train_result_json", _require_nonempty_str(self.linear_train_result_json, "linear_train_result_json"))
         if self.output_npz is not None:
             object.__setattr__(self, "output_npz", _require_nonempty_str(self.output_npz, "output_npz"))
@@ -85,8 +71,6 @@ class BuildLinearSignalsConfig:
         object.__setattr__(self, "overwrite", _require_bool(self.overwrite, "overwrite"))
         if self.mmap_mode not in (None, "r"):
             raise ValueError("mmap_mode must be None or 'r'")
-        object.__setattr__(self, "start_event_index", _require_optional_nonnegative_int(self.start_event_index, "start_event_index"))
-        object.__setattr__(self, "max_decisions", _require_optional_positive_int(self.max_decisions, "max_decisions"))
         if self.output_dtype not in ("float32", "float64"):
             raise ValueError("output_dtype must be 'float32' or 'float64'")
         if self.magnitude_input not in MAGNITUDE_INPUT_MODES:
@@ -96,13 +80,12 @@ class BuildLinearSignalsConfig:
     def as_dict(self) -> dict[str, object]:
         return {
             "tape_root": self.tape_root,
+            "decision_grid_npz": self.decision_grid_npz,
             "linear_train_result_json": self.linear_train_result_json,
             "output_npz": self.output_npz,
             "output_json": self.output_json,
             "overwrite": self.overwrite,
             "mmap_mode": self.mmap_mode,
-            "start_event_index": self.start_event_index,
-            "max_decisions": self.max_decisions,
             "output_dtype": self.output_dtype,
             "magnitude_input": self.magnitude_input,
             "chunk_rows": self.chunk_rows,
@@ -115,6 +98,10 @@ def _default_output_npz(tape_root: str) -> Path:
 
 def _default_output_json(tape_root: str) -> Path:
     return Path(tape_root) / "linear_signals_summary.json"
+
+
+def _default_decision_grid_npz(tape_root: str) -> Path:
+    return Path(tape_root) / DECISION_GRID_FILENAME
 
 
 def _write_json_atomic(path: Path, payload: dict[str, object], *, overwrite: bool) -> None:
@@ -141,17 +128,17 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
         mmap_mode=config.mmap_mode,
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
+    decision_grid = load_decision_grid_npz(config.decision_grid_npz)
+    validate_decision_grid_for_execution_tape(decision_grid, tape)
     result = load_linear_train_result(config.linear_train_result_json)
     if result.schema != LINEAR_TRAINING_RESULT_SCHEMA:
         raise ValueError("linear train result schema mismatch")
 
     disk_result = build_linear_signal_artifact_npz_from_execution_feature_chunks(
         tape=tape,
+        decision_grid=decision_grid,
         output_npz=output_npz,
         linear_train_result=result,
-        schedule_config=schedule_config_from_train_result(result),
-        start_event_index=config.start_event_index,
-        max_decisions=config.max_decisions,
         chunk_rows=config.chunk_rows,
         signal_config=LinearSignalConfig(magnitude_input=config.magnitude_input),
         output_dtype=config.output_dtype,
@@ -162,6 +149,7 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
         "status": "ok",
         "run_type": "build_linear_signals",
         "tape_root": str(Path(config.tape_root)),
+        "decision_grid_npz": str(Path(config.decision_grid_npz)),
         "linear_train_result_json": str(Path(config.linear_train_result_json)),
         "output_npz": str(output_npz),
         "output_json": str(output_json),
@@ -169,6 +157,7 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
             "schema": result.schema,
             "dataset_id": result.dataset_id,
             "manifest_hash": result.manifest_hash,
+            "decision_grid_hash": result.decision_grid_hash,
             "selection_summary": result.selection_summary,
         },
         "feature_dataset": disk_result.feature_dataset_summary,
@@ -191,13 +180,12 @@ def build_linear_signals_from_config(config: BuildLinearSignalsConfig) -> dict[s
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
+    parser.add_argument("--decision-grid-npz", required=True)
     parser.add_argument("--linear-train-result-json", required=True)
     parser.add_argument("--output-npz")
     parser.add_argument("--output-json")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
-    parser.add_argument("--start-event-index", type=int)
-    parser.add_argument("--max-decisions", type=int)
     parser.add_argument("--output-dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--magnitude-input", choices=MAGNITUDE_INPUT_MODES, default=MAGNITUDE_INPUT_LOG1P_BPS)
     parser.add_argument("--chunk-rows", type=int, default=100_000)
@@ -207,13 +195,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> BuildLinearSignalsConfig:
     return BuildLinearSignalsConfig(
         tape_root=args.tape_root,
+        decision_grid_npz=args.decision_grid_npz,
         linear_train_result_json=args.linear_train_result_json,
         output_npz=args.output_npz,
         output_json=args.output_json,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
-        start_event_index=args.start_event_index,
-        max_decisions=args.max_decisions,
         output_dtype=args.output_dtype,
         magnitude_input=args.magnitude_input,
         chunk_rows=args.chunk_rows,

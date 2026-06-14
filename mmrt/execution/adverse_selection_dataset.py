@@ -12,7 +12,7 @@ import numpy as np
 
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
 
-ADVERSE_SELECTION_DATASET_SCHEMA = "mmrt_adverse_selection_dataset_v2"
+ADVERSE_SELECTION_DATASET_SCHEMA = "mmrt_adverse_selection_dataset_grid_v1"
 
 
 def _nonempty_str(value: str, name: str) -> str:
@@ -31,6 +31,13 @@ def _nonnegative_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative int")
     return value
+
+
+def _hash64(value: str, name: str) -> str:
+    out = _nonempty_str(str(value), name)
+    if len(out) != 64 or any(ch not in "0123456789abcdef" for ch in out):
+        raise ValueError(f"{name} must be 64 lowercase hex characters")
+    return out
 
 
 def _name_tuple(values: Sequence[str], name: str) -> tuple[str, ...]:
@@ -55,9 +62,10 @@ class AdverseSelectionDatasetManifest:
     tape_num_trades: int
     tape_start_local_ts_us: int
     tape_end_local_ts_us: int
-    decision_interval_us: int
-    start_event_index: int | None
-    max_decisions: int | None
+    decision_grid_schema: str
+    decision_grid_hash: str
+    decision_grid_n_rows: int
+    decision_schedule: Mapping[str, object]
     feature_names: tuple[str, ...]
     label_names: tuple[str, ...]
     num_rows: int
@@ -77,11 +85,14 @@ class AdverseSelectionDatasetManifest:
         object.__setattr__(self, "tape_schema", _nonempty_str(self.tape_schema, "tape_schema"))
         for name in ("tape_num_events", "tape_num_l2_batches", "tape_num_trades", "num_rows"):
             object.__setattr__(self, name, _nonnegative_int(int(getattr(self, name)), name))
-        object.__setattr__(self, "decision_interval_us", _positive_int(int(self.decision_interval_us), "decision_interval_us"))
-        if self.start_event_index is not None:
-            object.__setattr__(self, "start_event_index", _nonnegative_int(int(self.start_event_index), "start_event_index"))
-        if self.max_decisions is not None:
-            object.__setattr__(self, "max_decisions", _positive_int(int(self.max_decisions), "max_decisions"))
+        object.__setattr__(self, "decision_grid_schema", _nonempty_str(self.decision_grid_schema, "decision_grid_schema"))
+        object.__setattr__(self, "decision_grid_hash", _hash64(self.decision_grid_hash, "decision_grid_hash"))
+        object.__setattr__(self, "decision_grid_n_rows", _positive_int(int(self.decision_grid_n_rows), "decision_grid_n_rows"))
+        if self.num_rows > self.decision_grid_n_rows:
+            raise ValueError("num_rows cannot exceed decision_grid_n_rows")
+        if not isinstance(self.decision_schedule, Mapping):
+            raise ValueError("decision_schedule must be a mapping")
+        object.__setattr__(self, "decision_schedule", dict(self.decision_schedule))
         features = _name_tuple(self.feature_names, "feature_names")
         labels = _name_tuple(self.label_names, "label_names")
         object.__setattr__(self, "feature_names", features)
@@ -107,9 +118,10 @@ class AdverseSelectionDatasetManifest:
             "tape_num_trades": self.tape_num_trades,
             "tape_start_local_ts_us": self.tape_start_local_ts_us,
             "tape_end_local_ts_us": self.tape_end_local_ts_us,
-            "decision_interval_us": self.decision_interval_us,
-            "start_event_index": self.start_event_index,
-            "max_decisions": self.max_decisions,
+            "decision_grid_schema": self.decision_grid_schema,
+            "decision_grid_hash": self.decision_grid_hash,
+            "decision_grid_n_rows": self.decision_grid_n_rows,
+            "decision_schedule": dict(self.decision_schedule),
             "feature_names": list(self.feature_names),
             "label_names": list(self.label_names),
             "num_rows": self.num_rows,
@@ -128,8 +140,10 @@ class AdverseSelectionDatasetManifest:
             schema=str(raw["schema"]), exchange=str(raw["exchange"]), symbol=str(raw["symbol"]), tape_schema=str(raw["tape_schema"]),
             tape_num_events=int(raw["tape_num_events"]), tape_num_l2_batches=int(raw["tape_num_l2_batches"]), tape_num_trades=int(raw["tape_num_trades"]),
             tape_start_local_ts_us=int(raw["tape_start_local_ts_us"]), tape_end_local_ts_us=int(raw["tape_end_local_ts_us"]),
-            decision_interval_us=int(raw["decision_interval_us"]), start_event_index=None if raw.get("start_event_index") is None else int(raw["start_event_index"]),
-            max_decisions=None if raw.get("max_decisions") is None else int(raw["max_decisions"]),
+            decision_grid_schema=str(raw["decision_grid_schema"]),
+            decision_grid_hash=str(raw["decision_grid_hash"]),
+            decision_grid_n_rows=int(raw["decision_grid_n_rows"]),
+            decision_schedule=dict(raw["decision_schedule"]),  # type: ignore[arg-type]
             feature_names=tuple(raw["feature_names"]), label_names=tuple(raw["label_names"]), num_rows=int(raw["num_rows"]),
             num_features=int(raw["num_features"]), num_labels=int(raw["num_labels"]), config_json=str(raw.get("config_json", "{}")),
             index_schema=str(raw["index_schema"]), index_manifest_sha256=str(raw["index_manifest_sha256"]), index_root=str(raw["index_root"]),
@@ -272,7 +286,10 @@ class AdverseSelectionDatasetWriter:
                 exchange=str(meta["exchange"]), symbol=str(meta["symbol"]), tape_schema=str(meta["tape_schema"]),
                 tape_num_events=int(meta["tape_num_events"]), tape_num_l2_batches=int(meta["tape_num_l2_batches"]), tape_num_trades=int(meta["tape_num_trades"]),
                 tape_start_local_ts_us=int(meta["tape_start_local_ts_us"]), tape_end_local_ts_us=int(meta["tape_end_local_ts_us"]),
-                decision_interval_us=int(meta["decision_interval_us"]), start_event_index=meta.get("start_event_index"), max_decisions=meta.get("max_decisions"),
+                decision_grid_schema=str(meta["decision_grid_schema"]),
+                decision_grid_hash=str(meta["decision_grid_hash"]),
+                decision_grid_n_rows=int(meta["decision_grid_n_rows"]),
+                decision_schedule=dict(meta["decision_schedule"]),  # type: ignore[arg-type]
                 feature_names=self.config.feature_names, label_names=self.config.label_names, num_rows=n, num_features=nf, num_labels=nl,
                 config_json=str(meta.get("config_json", "{}")), index_schema=str(meta["index_schema"]), index_manifest_sha256=str(meta["index_manifest_sha256"]), index_root=str(meta["index_root"]), created_at_utc=datetime.now(timezone.utc).isoformat(),
             )

@@ -9,14 +9,15 @@ from mmrt.execution.event_merge import merge_execution_events
 from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, build_execution_tape
 from mmrt.execution.feature_replay import (
     decision_feature_column_names,
-    iter_decision_feature_chunks,
-    iter_tape_feature_steps,
+    iter_decision_feature_chunks_for_decision_grid,
+    iter_tape_feature_steps_for_decision_grid,
 )
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.features.pipeline import DecisionFeaturePipeline, FeaturePipelineConfig
 from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.storage import manifest as mf
+from tests.grid_helpers import decision_grid_for_tape
 
 
 def _rules():
@@ -100,7 +101,8 @@ def test_decision_feature_column_names_match_storage_feature_columns():
 def test_iter_tape_feature_steps_yields_valid_l2_steps_with_decisions():
     tape = make_tape(n_l2=60)
     pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_SCHED_500MS))
-    steps = list(iter_tape_feature_steps(tape, pipeline=pipeline))
+    grid = decision_grid_for_tape(tape, schedule_config=_SCHED_500MS)
+    steps = list(iter_tape_feature_steps_for_decision_grid(tape, decision_grid=grid, pipeline=pipeline))
     assert steps
     events = tape.arrays.events
     for step in steps:
@@ -109,18 +111,17 @@ def test_iter_tape_feature_steps_yields_valid_l2_steps_with_decisions():
         assert int(row["local_ts_us"]) == step.local_ts_us
         assert step.mid > 0.0
     decisions = [s.decision for s in steps if s.decision is not None]
-    assert len(decisions) > 1
+    assert len(decisions) == grid.n_rows
     decision_ts = [d.local_ts_us for d in decisions]
-    assert decision_ts == sorted(decision_ts)
-    gaps = np.diff(np.asarray(decision_ts))
-    assert (gaps >= 500_000).all()
+    np.testing.assert_array_equal(decision_ts, grid.decision_local_ts_us)
 
 
 def test_iter_tape_feature_steps_skips_one_sided_books():
     skip_index = 30
     tape = make_tape(n_l2=60, one_sided_at=skip_index)
     pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_SCHED_500MS))
-    steps = list(iter_tape_feature_steps(tape, pipeline=pipeline))
+    grid = decision_grid_for_tape(tape, schedule_config=_SCHED_500MS)
+    steps = list(iter_tape_feature_steps_for_decision_grid(tape, decision_grid=grid, pipeline=pipeline))
     skipped_event_indices = {
         int(event["event_seq"])
         for event in tape.arrays.events
@@ -135,23 +136,27 @@ def test_iter_tape_feature_steps_skips_one_sided_books():
 def test_iter_tape_feature_steps_respects_max_events():
     tape = make_tape(n_l2=60)
     pipeline = DecisionFeaturePipeline(FeaturePipelineConfig(schedule=_SCHED_500MS))
-    steps = list(iter_tape_feature_steps(tape, pipeline=pipeline, max_events=10))
-    assert all(s.event_index < 10 for s in steps)
+    grid = decision_grid_for_tape(tape, max_rows=3, schedule_config=_SCHED_500MS)
+    steps = list(iter_tape_feature_steps_for_decision_grid(tape, decision_grid=grid, pipeline=pipeline))
+    assert all(s.event_index <= int(grid.decision_event_index[-1]) for s in steps)
+    assert len([s for s in steps if s.decision is not None]) == 3
 
 
 def test_iter_tape_feature_steps_validates_inputs():
     tape = make_tape(n_l2=10)
     pipeline = DecisionFeaturePipeline()
-    with pytest.raises(ValueError, match="start_event_index"):
-        list(iter_tape_feature_steps(tape, pipeline=pipeline, start_event_index=10_000))
+    grid = decision_grid_for_tape(tape)
     with pytest.raises(ValueError, match="pipeline"):
-        list(iter_tape_feature_steps(tape, pipeline=None))  # type: ignore[arg-type]
+        list(iter_tape_feature_steps_for_decision_grid(tape, decision_grid=grid, pipeline=None))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="decision_grid"):
+        list(iter_tape_feature_steps_for_decision_grid(tape, decision_grid=None, pipeline=pipeline))  # type: ignore[arg-type]
 
 
 def test_iter_decision_feature_chunks_chunking_and_alignment():
     tape = make_tape(n_l2=120)
     config = FeaturePipelineConfig(schedule=_SCHED_500MS)
-    chunks = list(iter_decision_feature_chunks(tape, pipeline_config=config, chunk_rows=3))
+    grid = decision_grid_for_tape(tape, schedule_config=_SCHED_500MS)
+    chunks = list(iter_decision_feature_chunks_for_decision_grid(tape, decision_grid=grid, pipeline_config=config, chunk_rows=3))
     assert chunks
     assert all(c.features.shape[0] <= 3 for c in chunks)
     assert all(c.feature_names == decision_feature_column_names() for c in chunks)
@@ -160,7 +165,7 @@ def test_iter_decision_feature_chunks_chunking_and_alignment():
     features = np.vstack([c.features for c in chunks])
     assert np.isfinite(features).all()
 
-    single = list(iter_decision_feature_chunks(tape, pipeline_config=config, chunk_rows=100_000))
+    single = list(iter_decision_feature_chunks_for_decision_grid(tape, decision_grid=grid, pipeline_config=config, chunk_rows=100_000))
     assert len(single) == 1
     np.testing.assert_array_equal(np.vstack([c.features for c in single]), features)
 
@@ -168,7 +173,8 @@ def test_iter_decision_feature_chunks_chunking_and_alignment():
 def test_iter_decision_feature_chunks_max_decisions():
     tape = make_tape(n_l2=120)
     config = FeaturePipelineConfig(schedule=_SCHED_500MS)
-    limited = list(iter_decision_feature_chunks(tape, pipeline_config=config, max_decisions=2))
+    grid = decision_grid_for_tape(tape, max_rows=2, schedule_config=_SCHED_500MS)
+    limited = list(iter_decision_feature_chunks_for_decision_grid(tape, decision_grid=grid, pipeline_config=config))
     total = sum(c.features.shape[0] for c in limited)
     assert total == 2
 
@@ -176,6 +182,7 @@ def test_iter_decision_feature_chunks_max_decisions():
 def test_replay_is_deterministic_across_runs():
     tape = make_tape(n_l2=120)
     config = FeaturePipelineConfig(schedule=_SCHED_500MS)
-    a = np.vstack([c.features for c in iter_decision_feature_chunks(tape, pipeline_config=config)])
-    b = np.vstack([c.features for c in iter_decision_feature_chunks(tape, pipeline_config=config)])
+    grid = decision_grid_for_tape(tape, schedule_config=_SCHED_500MS)
+    a = np.vstack([c.features for c in iter_decision_feature_chunks_for_decision_grid(tape, decision_grid=grid, pipeline_config=config)])
+    b = np.vstack([c.features for c in iter_decision_feature_chunks_for_decision_grid(tape, decision_grid=grid, pipeline_config=config)])
     np.testing.assert_array_equal(a, b)

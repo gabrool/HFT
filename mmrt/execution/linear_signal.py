@@ -11,6 +11,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from mmrt.execution.contracts import LinearSignal
+from mmrt.execution.decision_grid import DecisionGrid
 from mmrt.features.schedule import decision_schedule_config_from_dict
 
 MAGNITUDE_INPUT_LOG1P_BPS = "log1p_bps"
@@ -25,7 +26,7 @@ NO_MOVE_PROBA_KEY = "no_move_proba"
 MAGNITUDE_UP_KEY = "magnitude_up"
 MAGNITUDE_DOWN_KEY = "magnitude_down"
 
-LINEAR_SIGNAL_ARTIFACT_SCHEMA = "mmrt_execution_linear_signals_aligned"
+LINEAR_SIGNAL_ARTIFACT_SCHEMA = "mmrt_execution_linear_signals_grid_v1"
 LINEAR_SIGNALS_FILENAME = "linear_signals.npz"
 _LINEAR_SIGNAL_CONSISTENCY_EPS = 1e-5
 _LINEAR_SIGNAL_ARRAY_FIELDS = (
@@ -297,6 +298,9 @@ class LinearSignalArtifactMetadata:
     num_trades: int
     start_local_ts_us: int
     end_local_ts_us: int
+    decision_grid_schema: str
+    decision_grid_hash: str
+    decision_grid_n_rows: int
     decision_schedule: dict[str, object]
     start_event_index: int
     n_rows: int
@@ -318,8 +322,15 @@ class LinearSignalArtifactMetadata:
         schedule_payload = dict(self.decision_schedule)
         decision_schedule_config_from_dict(schedule_payload)
         object.__setattr__(self, "decision_schedule", schedule_payload)
+        object.__setattr__(self, "decision_grid_schema", _require_nonempty_str(self.decision_grid_schema, "decision_grid_schema"))
+        object.__setattr__(self, "decision_grid_hash", _require_nonempty_str(self.decision_grid_hash, "decision_grid_hash"))
+        if len(self.decision_grid_hash) != 64 or any(ch not in "0123456789abcdef" for ch in self.decision_grid_hash):
+            raise ValueError("decision_grid_hash must be lowercase sha256 hex")
+        object.__setattr__(self, "decision_grid_n_rows", _require_positive_int(self.decision_grid_n_rows, "decision_grid_n_rows"))
         object.__setattr__(self, "start_event_index", _require_nonnegative_int(self.start_event_index, "start_event_index"))
         object.__setattr__(self, "n_rows", _require_positive_int(self.n_rows, "n_rows"))
+        if self.decision_grid_n_rows != self.n_rows:
+            raise ValueError("decision_grid_n_rows must equal n_rows")
 
     @property
     def max_decision_interval_us(self) -> int:
@@ -335,6 +346,9 @@ class LinearSignalArtifactMetadata:
             "num_trades": self.num_trades,
             "start_local_ts_us": self.start_local_ts_us,
             "end_local_ts_us": self.end_local_ts_us,
+            "decision_grid_schema": self.decision_grid_schema,
+            "decision_grid_hash": self.decision_grid_hash,
+            "decision_grid_n_rows": self.decision_grid_n_rows,
             "decision_schedule": dict(self.decision_schedule),
             "start_event_index": self.start_event_index,
             "n_rows": self.n_rows,
@@ -353,6 +367,9 @@ class LinearSignalArtifactMetadata:
             "num_trades",
             "start_local_ts_us",
             "end_local_ts_us",
+            "decision_grid_schema",
+            "decision_grid_hash",
+            "decision_grid_n_rows",
             "decision_schedule",
             "start_event_index",
             "n_rows",
@@ -369,6 +386,7 @@ class LinearSignalArtifact:
     metadata: LinearSignalArtifactMetadata
     decision_event_index: np.ndarray
     decision_local_ts_us: np.ndarray
+    decision_event_seq: np.ndarray
 
     def __post_init__(self) -> None:
         if not isinstance(self.arrays, LinearSignalArrays):
@@ -377,12 +395,19 @@ class LinearSignalArtifact:
             raise ValueError("metadata must be LinearSignalArtifactMetadata")
         decision_event_index = _coerce_int64_vector(self.decision_event_index, name="decision_event_index")
         decision_local_ts_us = _coerce_int64_vector(self.decision_local_ts_us, name="decision_local_ts_us")
-        if decision_event_index.shape[0] != self.arrays.n_rows or decision_local_ts_us.shape[0] != self.arrays.n_rows:
+        decision_event_seq = _coerce_int64_vector(self.decision_event_seq, name="decision_event_seq")
+        if (
+            decision_event_index.shape[0] != self.arrays.n_rows
+            or decision_local_ts_us.shape[0] != self.arrays.n_rows
+            or decision_event_seq.shape[0] != self.arrays.n_rows
+        ):
             raise ValueError("decision alignment arrays length must equal signal array rows")
         if self.metadata.n_rows != self.arrays.n_rows:
             raise ValueError("metadata.n_rows must equal signal array rows")
         if (decision_event_index < 0).any():
             raise ValueError("decision_event_index must be nonnegative")
+        if (decision_event_seq < 0).any():
+            raise ValueError("decision_event_seq must be nonnegative")
         if (decision_local_ts_us <= 0).any():
             raise ValueError("decision_local_ts_us must be positive")
         if decision_event_index.shape[0] > 1 and (np.diff(decision_event_index) <= 0).any():
@@ -393,6 +418,7 @@ class LinearSignalArtifact:
             raise ValueError("metadata.start_event_index must equal first decision_event_index")
         object.__setattr__(self, "decision_event_index", decision_event_index)
         object.__setattr__(self, "decision_local_ts_us", decision_local_ts_us)
+        object.__setattr__(self, "decision_event_seq", decision_event_seq)
 
     @property
     def n_rows(self) -> int:
@@ -421,6 +447,7 @@ def save_linear_signal_artifact_npz(
     payload["metadata_json"] = np.array(json.dumps(artifact.metadata.as_dict(), sort_keys=True))
     payload["decision_event_index"] = artifact.decision_event_index
     payload["decision_local_ts_us"] = artifact.decision_local_ts_us
+    payload["decision_event_seq"] = artifact.decision_event_seq
     with tmp.open("wb") as handle:
         np.savez(handle, **payload)
     tmp.replace(path)
@@ -436,6 +463,7 @@ def save_linear_signal_artifact_arrays(
     metadata: LinearSignalArtifactMetadata,
     decision_event_index: np.ndarray,
     decision_local_ts_us: np.ndarray,
+    decision_event_seq: np.ndarray,
     arrays: Mapping[str, np.ndarray],
     overwrite: bool = False,
     validate_chunk_rows: int = 100_000,
@@ -454,6 +482,7 @@ def save_linear_signal_artifact_arrays(
     decision_arrays = {
         "decision_event_index": np.asarray(decision_event_index),
         "decision_local_ts_us": np.asarray(decision_local_ts_us),
+        "decision_event_seq": np.asarray(decision_event_seq),
     }
     for name, arr in decision_arrays.items():
         if arr.ndim != 1:
@@ -493,6 +522,9 @@ def save_linear_signal_artifact_arrays(
             raise ValueError("decision_event_index must be nonnegative")
         if (local_ts <= 0).any():
             raise ValueError("decision_local_ts_us must be positive")
+        event_seq = np.asarray(decision_arrays["decision_event_seq"][start:end], dtype=np.int64)
+        if (event_seq < 0).any():
+            raise ValueError("decision_event_seq must be nonnegative")
         if start == 0 and metadata.start_event_index != int(event_idx[0]):
             raise ValueError("metadata.start_event_index must equal first decision_event_index")
         if previous_event_index is not None and int(event_idx[0]) <= previous_event_index:
@@ -543,6 +575,7 @@ def save_linear_signal_artifact_arrays(
     payload["metadata_json"] = np.array(json.dumps(metadata.as_dict(), sort_keys=True))
     payload["decision_event_index"] = decision_arrays["decision_event_index"]
     payload["decision_local_ts_us"] = decision_arrays["decision_local_ts_us"]
+    payload["decision_event_seq"] = decision_arrays["decision_event_seq"]
     with tmp.open("wb") as handle:
         np.savez(handle, **payload)
     tmp.replace(path)
@@ -561,7 +594,7 @@ def load_linear_signal_artifact_npz(path: str | Path, *, mmap_mode: str | None =
         schema = str(np.asarray(data["schema"]).item())
         if schema != LINEAR_SIGNAL_ARTIFACT_SCHEMA:
             raise ValueError("linear signal NPZ schema mismatch")
-        required = set(_LINEAR_SIGNAL_ARRAY_FIELDS) | {"metadata_json", "decision_event_index", "decision_local_ts_us"}
+        required = set(_LINEAR_SIGNAL_ARRAY_FIELDS) | {"metadata_json", "decision_event_index", "decision_local_ts_us", "decision_event_seq"}
         missing = sorted(required - keys)
         if missing:
             raise ValueError(f"linear signal NPZ missing required arrays: {missing}")
@@ -570,11 +603,13 @@ def load_linear_signal_artifact_npz(path: str | Path, *, mmap_mode: str | None =
         arrays = LinearSignalArrays(**{name: np.array(data[name], copy=True) for name in _LINEAR_SIGNAL_ARRAY_FIELDS})
         decision_event_index = np.array(data["decision_event_index"], copy=True)
         decision_local_ts_us = np.array(data["decision_local_ts_us"], copy=True)
+        decision_event_seq = np.array(data["decision_event_seq"], copy=True)
     return LinearSignalArtifact(
         arrays=arrays,
         metadata=metadata,
         decision_event_index=decision_event_index,
         decision_local_ts_us=decision_local_ts_us,
+        decision_event_seq=decision_event_seq,
     )
 
 
@@ -592,6 +627,8 @@ def linear_signal_artifact_summary(artifact: LinearSignalArtifact, *, path: str 
         "last_decision_event_index": int(artifact.decision_event_index[-1]),
         "first_decision_local_ts_us": int(artifact.decision_local_ts_us[0]),
         "last_decision_local_ts_us": int(artifact.decision_local_ts_us[-1]),
+        "first_decision_event_seq": int(artifact.decision_event_seq[0]),
+        "last_decision_event_seq": int(artifact.decision_event_seq[-1]),
     }
 
 
@@ -672,6 +709,9 @@ def validate_linear_signal_artifact_metadata(
     num_trades: int,
     start_local_ts_us: int,
     end_local_ts_us: int,
+    decision_grid_schema: str,
+    decision_grid_hash: str,
+    decision_grid_n_rows: int,
     decision_schedule: Mapping[str, object],
     start_event_index: int,
     min_rows: int | None = None,
@@ -687,6 +727,9 @@ def validate_linear_signal_artifact_metadata(
         num_trades=num_trades,
         start_local_ts_us=start_local_ts_us,
         end_local_ts_us=end_local_ts_us,
+        decision_grid_schema=decision_grid_schema,
+        decision_grid_hash=decision_grid_hash,
+        decision_grid_n_rows=decision_grid_n_rows,
         decision_schedule=dict(decision_schedule),
         start_event_index=start_event_index,
         n_rows=artifact.metadata.n_rows,
@@ -707,6 +750,28 @@ def validate_linear_signal_artifact_metadata(
         min_rows = _require_nonnegative_int(min_rows, "min_rows")
         if artifact.n_rows < min_rows:
             raise ValueError("linear signal artifact does not contain enough rows")
+
+
+def validate_linear_signals_for_decision_grid(
+    artifact: LinearSignalArtifact,
+    decision_grid: DecisionGrid,
+) -> None:
+    if not isinstance(artifact, LinearSignalArtifact):
+        raise ValueError("artifact must be LinearSignalArtifact")
+    if not isinstance(decision_grid, DecisionGrid):
+        raise ValueError("decision_grid must be DecisionGrid")
+    if artifact.metadata.decision_grid_schema != decision_grid.metadata.schema:
+        raise ValueError("linear signal decision_grid_schema mismatch")
+    if artifact.metadata.decision_grid_hash != decision_grid.decision_grid_hash:
+        raise ValueError("linear signal decision_grid_hash mismatch")
+    if artifact.metadata.decision_grid_n_rows != decision_grid.n_rows or artifact.n_rows != decision_grid.n_rows:
+        raise ValueError("linear signal row count must equal decision grid rows")
+    if not np.array_equal(artifact.decision_event_index, decision_grid.decision_event_index):
+        raise ValueError("linear signal decision_event_index does not match decision grid")
+    if not np.array_equal(artifact.decision_local_ts_us, decision_grid.decision_local_ts_us):
+        raise ValueError("linear signal decision_local_ts_us does not match decision grid")
+    if not np.array_equal(artifact.decision_event_seq, decision_grid.decision_event_seq):
+        raise ValueError("linear signal decision_event_seq does not match decision grid")
 
 
 def _require_config(value: Any) -> LinearSignalConfig:
@@ -748,6 +813,12 @@ def _require_positive_int(value: int, name: str) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be > 0")
     return value
+
+
+def _require_nonempty_str(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
 
 
 def _coerce_int64_vector(values: Any, *, name: str) -> np.ndarray:
@@ -868,5 +939,6 @@ __all__ = [
     "load_linear_signal_artifact_npz",
     "linear_signal_artifact_summary",
     "validate_linear_signal_artifact_metadata",
+    "validate_linear_signals_for_decision_grid",
     "validate_linear_signal_start_event_index",
 ]

@@ -20,6 +20,7 @@ from mmrt.execution.contracts import (
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
+from mmrt.execution.decision_grid import save_decision_grid_npz
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.linear_signal import (
     DIRECTION_PROBA_KEY,
@@ -40,6 +41,7 @@ from mmrt.cli.audit_execution_sim import (
     run_execution_sim_audit,
     main,
 )
+from tests.grid_helpers import decision_grid_for_tape, grid_identity_fields
 
 
 
@@ -139,6 +141,7 @@ def _tape(l2_events, trades):
 def _save_tape(tmp_path, tape):
     root = tmp_path / "execution_tape"
     save_execution_tape(tape, root, overwrite=True)
+    save_decision_grid_npz(root / "decision_grid.npz", decision_grid_for_tape(tape), overwrite=True)
     return root
 
 
@@ -151,24 +154,42 @@ def _signal_arrays(n_rows: int = 16):
     })
 
 
-def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
+def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0, decision_grid=None):
+    if decision_grid is not None:
+        n_rows = decision_grid.n_rows
     arrays = _signal_arrays(n_rows)
-    pairs = []
-    for event_index, event in enumerate(tape.arrays.events):
-        if event_index < start_event_index:
-            continue
-        if int(event["event_type_code"]) != 1:
-            continue
-        book_ptr = int(event["book_ptr"])
-        if book_ptr >= 0:
-            pairs.append((event_index, int(tape.arrays.l2_events[book_ptr]["local_ts_us"])))
-    if not pairs:
-        pairs.append((start_event_index, int(tape.manifest.start_local_ts_us)))
-    decision_event_index = [pair[0] for pair in pairs[:n_rows]]
-    decision_local_ts_us = [pair[1] for pair in pairs[:n_rows]]
-    while len(decision_event_index) < n_rows:
-        decision_event_index.append(decision_event_index[-1] + 1)
-        decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
+    if decision_grid is None:
+        pairs = []
+        for event_index, event in enumerate(tape.arrays.events):
+            if event_index < start_event_index:
+                continue
+            if int(event["event_type_code"]) != 1:
+                continue
+            book_ptr = int(event["book_ptr"])
+            if book_ptr >= 0:
+                pairs.append((event_index, int(tape.arrays.l2_events[book_ptr]["local_ts_us"]), int(event["event_seq"])))
+        if not pairs:
+            pairs.append((start_event_index, int(tape.manifest.start_local_ts_us), start_event_index))
+        decision_event_index = [pair[0] for pair in pairs[:n_rows]]
+        decision_local_ts_us = [pair[1] for pair in pairs[:n_rows]]
+        decision_event_seq = [pair[2] for pair in pairs[:n_rows]]
+        while len(decision_event_index) < n_rows:
+            decision_event_index.append(decision_event_index[-1] + 1)
+            decision_local_ts_us.append(decision_local_ts_us[-1] + decision_interval_us)
+            decision_event_seq.append(decision_event_seq[-1] + 1)
+        grid_fields = grid_identity_fields(n_rows=n_rows)
+        decision_schedule = _fixed_schedule_payload(decision_interval_us)
+    else:
+        decision_event_index = decision_grid.decision_event_index
+        decision_local_ts_us = decision_grid.decision_local_ts_us
+        decision_event_seq = decision_grid.decision_event_seq
+        grid_fields = {
+            "decision_grid_schema": decision_grid.metadata.schema,
+            "decision_grid_hash": decision_grid.decision_grid_hash,
+            "decision_grid_n_rows": decision_grid.n_rows,
+        }
+        decision_schedule = decision_grid.decision_schedule
+        start_event_index = int(decision_grid.decision_event_index[0])
     metadata = LinearSignalArtifactMetadata(
         tape_schema=tape.manifest.schema,
         exchange=tape.manifest.exchange,
@@ -178,7 +199,8 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         num_trades=tape.manifest.num_trades,
         start_local_ts_us=tape.manifest.start_local_ts_us,
         end_local_ts_us=tape.manifest.end_local_ts_us,
-        decision_schedule=_fixed_schedule_payload(decision_interval_us),
+        **grid_fields,
+        decision_schedule=decision_schedule,
         start_event_index=start_event_index,
         n_rows=n_rows,
     )
@@ -187,13 +209,19 @@ def _linear_artifact_for_tape(tape, n_rows: int = 16, *, decision_interval_us: i
         metadata=metadata,
         decision_event_index=np.asarray(decision_event_index, dtype=np.int64),
         decision_local_ts_us=np.asarray(decision_local_ts_us, dtype=np.int64),
+        decision_event_seq=np.asarray(decision_event_seq, dtype=np.int64),
     )
 
 
 def _save_linear_signals(root, n_rows: int = 16, *, decision_interval_us: int = 50, start_event_index: int = 0):
     tape = load_execution_tape(root)
+    decision_grid = decision_grid_for_tape(tape)
     artifact = _linear_artifact_for_tape(
-        tape, n_rows=n_rows, decision_interval_us=decision_interval_us, start_event_index=start_event_index
+        tape,
+        n_rows=n_rows,
+        decision_interval_us=decision_interval_us,
+        start_event_index=start_event_index,
+        decision_grid=decision_grid,
     )
     path = root / LINEAR_SIGNALS_FILENAME
     save_linear_signal_artifact_npz(path, artifact, overwrite=True)
@@ -221,6 +249,7 @@ def test_disabled_audit_runs_and_warns_no_fills(tmp_path):
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
             tape_root=str(tape_root),
+            decision_grid_npz=str(tape_root / "decision_grid.npz"),
             output_json=str(output_json),
             policy="disabled",
             max_steps=2,
@@ -258,9 +287,10 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
             tape_root=str(tape_root),
+            decision_grid_npz=str(tape_root / "decision_grid.npz"),
             output_json=str(tmp_path / "summary.json"),
             policy="bid",
-            max_steps=2,
+            max_steps=1,
             max_order_qty=1.0,
             default_order_qty=1.0,
             decision_compute_latency_us=0,
@@ -324,6 +354,7 @@ def test_audit_execution_sim_requires_linear_signals_file(tmp_path):
         run_execution_sim_audit(
             ExecutionSimAuditConfig(
                 tape_root=str(tape_root),
+                decision_grid_npz=str(tape_root / "decision_grid.npz"),
                 output_json=str(tmp_path / "summary.json"),
                 policy="disabled",
                 max_steps=1,
@@ -344,6 +375,8 @@ def test_audit_execution_sim_main_writes_summary_and_prints_json(tmp_path, capsy
         [
             "--tape-root",
             str(tape_root),
+            "--decision-grid-npz",
+            str(tape_root / "decision_grid.npz"),
             "--output-json",
             str(output_json),
             "--policy",
@@ -378,6 +411,7 @@ def test_audit_execution_sim_refuses_overwrite_without_flag(tmp_path):
         run_execution_sim_audit(
             ExecutionSimAuditConfig(
                 tape_root=str(tape_root),
+                decision_grid_npz=str(tape_root / "decision_grid.npz"),
                 output_json=str(output_json),
                 policy="disabled",
             )
@@ -386,21 +420,22 @@ def test_audit_execution_sim_refuses_overwrite_without_flag(tmp_path):
 
 def test_execution_sim_audit_config_validation():
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="", policy="disabled")
+        ExecutionSimAuditConfig(tape_root="", decision_grid_npz="/tmp/grid.npz", policy="disabled")
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="x", policy="bad")
+        ExecutionSimAuditConfig(tape_root="x", decision_grid_npz="/tmp/grid.npz", policy="bad")
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="x", max_steps=0)
+        ExecutionSimAuditConfig(tape_root="x", decision_grid_npz="/tmp/grid.npz", max_steps=0)
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="x", queue_mode="bad")
+        ExecutionSimAuditConfig(tape_root="x", decision_grid_npz="/tmp/grid.npz", queue_mode="bad")
 
 
 def test_audit_execution_sim_accepts_zero_queue_weights():
     cfg = ExecutionSimAuditConfig(
         tape_root="/tmp/tape",
+        decision_grid_npz="/tmp/tape/decision_grid.npz",
         l2_decrease_weight=0.0,
         trade_at_level_weight=0.0,
     )
@@ -411,10 +446,10 @@ def test_audit_execution_sim_accepts_zero_queue_weights():
 
 def test_audit_execution_sim_rejects_queue_weights_above_one():
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="/tmp/tape", l2_decrease_weight=1.1)
+        ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_npz="/tmp/tape/decision_grid.npz", l2_decrease_weight=1.1)
 
     with pytest.raises(ValueError):
-        ExecutionSimAuditConfig(tape_root="/tmp/tape", trade_at_level_weight=1.1)
+        ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_npz="/tmp/tape/decision_grid.npz", trade_at_level_weight=1.1)
 
 
 def test_audit_modules_have_no_forbidden_imports():
@@ -450,9 +485,10 @@ def test_audit_modules_have_no_forbidden_imports():
 
 def test_parser_can_disable_l2_trade_dedupe():
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--no-dedupe-l2-decrease-with-trade-prints"])
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid-npz", "/tmp/tape/decision_grid.npz", "--no-dedupe-l2-decrease-with-trade-prints"])
     config = ExecutionSimAuditConfig(
         tape_root=args.tape_root,
+        decision_grid_npz=args.decision_grid_npz,
         output_json=args.output_json,
         linear_signals_npz=args.linear_signals_npz,
         overwrite=args.overwrite,
@@ -487,8 +523,8 @@ def test_parser_can_disable_l2_trade_dedupe():
 
 def test_parser_dedupe_l2_trade_default_enabled():
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape"])
-    config = ExecutionSimAuditConfig(tape_root=args.tape_root)
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid-npz", "/tmp/tape/decision_grid.npz"])
+    config = ExecutionSimAuditConfig(tape_root=args.tape_root, decision_grid_npz=args.decision_grid_npz)
     assert config.dedupe_l2_decrease_with_trade_prints is True
 
 
@@ -509,6 +545,7 @@ def test_audit_execution_sim_accepts_explicit_later_linear_signal_start(tmp_path
     summary = run_execution_sim_audit(
         ExecutionSimAuditConfig(
             tape_root=str(tape_root),
+            decision_grid_npz=str(tape_root / "decision_grid.npz"),
             output_json=str(tmp_path / "summary.json"),
             policy="disabled",
             max_steps=1,

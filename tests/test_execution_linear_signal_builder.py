@@ -17,11 +17,11 @@ from mmrt.execution.linear_signal import (
 )
 from mmrt.execution.linear_signal_builder import (
     ExecutionLinearFeatureDataset,
-    build_execution_linear_feature_dataset,
     build_linear_signal_build_result,
     build_linear_signal_artifact_npz_from_execution_feature_chunks,
     build_linear_signal_artifact_from_execution_features,
     execution_linear_feature_names,
+    iter_execution_linear_feature_chunks_for_decision_grid,
     predict_linear_heads_for_execution_features,
 )
 from mmrt.linear import models as lm
@@ -30,6 +30,7 @@ from mmrt.linear import train as tr
 from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.features.transforms import TransformConfig
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
+from tests.grid_helpers import decision_grid_for_tape, grid_identity_fields
 
 
 def _rules():
@@ -87,15 +88,48 @@ def _preprocess_state(cols):
     )
 
 
-def _train_result(feature_columns_by_head):
+def _grid(tape, *, max_rows=None):
+    return decision_grid_for_tape(tape, max_rows=max_rows, schedule_config=_SCHED50)
+
+
+def _feature_dataset(tape, *, grid=None):
+    grid = grid or _grid(tape)
+    chunks = list(iter_execution_linear_feature_chunks_for_decision_grid(tape, decision_grid=grid, transform_config=TransformConfig()))
+    return ExecutionLinearFeatureDataset(
+        decision_event_index=np.concatenate([c.decision_event_index for c in chunks]),
+        decision_local_ts_us=np.concatenate([c.decision_local_ts_us for c in chunks]),
+        decision_event_seq=grid.decision_event_seq,
+        features=np.vstack([c.features for c in chunks]),
+        feature_names=chunks[0].feature_names,
+        replay_start_event_index=0,
+        start_event_index=int(grid.decision_event_index[0]),
+        decision_grid_schema=grid.metadata.schema,
+        decision_grid_hash=grid.decision_grid_hash,
+        decision_grid_n_rows=grid.n_rows,
+        decision_schedule=grid.decision_schedule,
+        transform_config=TransformConfig().as_dict(),
+    )
+
+
+def _train_result(feature_columns_by_head, *, grid=None):
     bundle = lm.make_linear_model_bundle(feature_columns_by_head)
     states = {head: _preprocess_state(cols) for head, cols in feature_columns_by_head.items()}
+    grid_fields = (
+        {
+            "decision_grid_schema": grid.metadata.schema,
+            "decision_grid_hash": grid.decision_grid_hash,
+            "decision_grid_n_rows": grid.n_rows,
+        }
+        if grid is not None
+        else grid_identity_fields()
+    )
     return tr.LinearTrainResult(
         schema=tr.LINEAR_TRAINING_RESULT_SCHEMA,
         dataset_id="dataset",
         manifest_hash="hash",
         config={},
         decision_schedule=_SCHED50.as_dict(),
+        **grid_fields,
         transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: states[h].as_dict() for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),
@@ -108,7 +142,8 @@ def _train_result(feature_columns_by_head):
 
 
 def test_build_execution_linear_feature_dataset_is_causal_and_aligned():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
+    tape = _tiny_tape()
+    dataset = _feature_dataset(tape)
     assert dataset.num_decisions > 1
     assert np.all(np.diff(dataset.decision_event_index) > 0)
     assert np.all(np.diff(dataset.decision_local_ts_us) > 0)
@@ -116,31 +151,32 @@ def test_build_execution_linear_feature_dataset_is_causal_and_aligned():
 
 
 def test_execution_linear_feature_dataset_start_event_index_is_first_decision_not_replay_start():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50, start_event_index=0)
+    dataset = _feature_dataset(_tiny_tape())
 
     assert dataset.replay_start_event_index == 0
     assert dataset.start_event_index == int(dataset.decision_event_index[0])
-    assert dataset.start_event_index > dataset.replay_start_event_index
+    assert dataset.start_event_index >= dataset.replay_start_event_index
 
 
 def test_execution_linear_feature_names_match_storage_linear_prefix_contract():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
+    dataset = _feature_dataset(_tiny_tape())
     assert dataset.feature_names == execution_linear_feature_names()
     assert all(name.startswith("x_") for name in dataset.feature_names)
     assert "x_mid_slope_bps_per_sec_1000000us" in dataset.feature_names
 
 
 def test_build_execution_linear_feature_dataset_respects_start_and_max_decisions():
-    limited = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50, start_event_index=2, max_decisions=2)
-    assert limited.num_decisions <= 2
-    assert int(limited.decision_event_index[0]) >= 2
+    tape = _tiny_tape()
+    limited = _feature_dataset(tape, grid=_grid(tape, max_rows=2))
+    assert limited.num_decisions == 2
 
 
 def test_build_linear_signal_artifact_from_execution_features_roundtrip(tmp_path):
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
     cols = tuple(dataset.feature_names[:3])
-    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    result = _train_result({head: cols for head in lm.MODEL_HEADS}, grid=grid)
     artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
     path = tmp_path / "signals.npz"
     save_linear_signal_artifact_npz(path, artifact)
@@ -151,9 +187,10 @@ def test_build_linear_signal_artifact_from_execution_features_roundtrip(tmp_path
 
 def test_chunked_linear_signal_disk_builder_matches_eager_artifact(tmp_path):
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
     cols = tuple(dataset.feature_names[:3])
-    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    result = _train_result({head: cols for head in lm.MODEL_HEADS}, grid=grid)
     eager_result = build_linear_signal_build_result(
         tape=tape,
         feature_dataset=dataset,
@@ -164,9 +201,9 @@ def test_chunked_linear_signal_disk_builder_matches_eager_artifact(tmp_path):
     path = tmp_path / "streamed_signals.npz"
     disk_result = build_linear_signal_artifact_npz_from_execution_feature_chunks(
         tape=tape,
+        decision_grid=grid,
         output_npz=path,
         linear_train_result=result,
-        schedule_config=_SCHED50,
         chunk_rows=1,
     )
     streamed = load_linear_signal_artifact_npz(path)
@@ -182,9 +219,10 @@ def test_chunked_linear_signal_disk_builder_matches_eager_artifact(tmp_path):
 
 def test_linear_signal_artifact_metadata_start_is_first_signal_row():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
     cols = tuple(dataset.feature_names[:3])
-    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    result = _train_result({head: cols for head in lm.MODEL_HEADS}, grid=grid)
 
     artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
 
@@ -193,12 +231,13 @@ def test_linear_signal_artifact_metadata_start_is_first_signal_row():
 
 def test_generated_linear_signals_reset_execution_env_without_alignment_error():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
     cols = tuple(dataset.feature_names[:3])
-    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    result = _train_result({head: cols for head in lm.MODEL_HEADS}, grid=grid)
     artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
 
-    reset = ExecutionEnv(tape, linear_signals=artifact).reset()
+    reset = ExecutionEnv(tape, decision_grid=grid, linear_signals=artifact).reset()
 
     assert reset.info["event_index"] == int(artifact.decision_event_index[0])
     assert reset.info["signal_row_index"] == 0
@@ -206,11 +245,12 @@ def test_generated_linear_signals_reset_execution_env_without_alignment_error():
 
 def test_generated_linear_signals_env_can_step_once():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
     cols = tuple(dataset.feature_names[:3])
-    result = _train_result({head: cols for head in lm.MODEL_HEADS})
+    result = _train_result({head: cols for head in lm.MODEL_HEADS}, grid=grid)
     artifact = build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
-    env = ExecutionEnv(tape, linear_signals=artifact, config=ExecutionEnvConfig())
+    env = ExecutionEnv(tape, decision_grid=grid, linear_signals=artifact, config=ExecutionEnvConfig())
 
     env.reset()
     step = env.step([0, 0, 0, 0, 0, 0, 0, 0])
@@ -220,21 +260,24 @@ def test_generated_linear_signals_env_can_step_once():
 
 def test_linear_signal_builder_rejects_missing_feature_columns():
     tape = _tiny_tape()
-    dataset = build_execution_linear_feature_dataset(tape, schedule_config=_SCHED50)
-    result = _train_result({head: ("x_not_produced",) for head in lm.MODEL_HEADS})
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
+    result = _train_result({head: ("x_not_produced",) for head in lm.MODEL_HEADS}, grid=grid)
     with pytest.raises(ValueError, match="x_not_produced"):
         build_linear_signal_artifact_from_execution_features(tape=tape, feature_dataset=dataset, linear_train_result=result)
 
 
 def test_linear_signal_builder_supports_per_head_feature_sets():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
+    tape = _tiny_tape()
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
     feature_sets = {
         lm.NO_MOVE_HEAD: tuple(dataset.feature_names[:2]),
         lm.DIRECTION_HEAD: tuple(dataset.feature_names[1:4]),
         lm.MAGNITUDE_UP_HEAD: tuple(dataset.feature_names[4:6]),
         lm.MAGNITUDE_DOWN_HEAD: tuple(dataset.feature_names[6:9]),
     }
-    result = _train_result(feature_sets)
+    result = _train_result(feature_sets, grid=grid)
     preds = predict_linear_heads_for_execution_features(
         feature_dataset=dataset,
         model_bundle=tr.linear_model_bundle_from_train_result(result),
@@ -244,7 +287,9 @@ def test_linear_signal_builder_supports_per_head_feature_sets():
 
 
 def test_linear_signal_builder_rejects_preprocess_model_feature_mismatch():
-    dataset = build_execution_linear_feature_dataset(_tiny_tape(), schedule_config=_SCHED50)
+    tape = _tiny_tape()
+    grid = _grid(tape)
+    dataset = _feature_dataset(tape, grid=grid)
     cols = tuple(dataset.feature_names[:2])
     bundle = lm.make_linear_model_bundle({head: cols for head in lm.MODEL_HEADS})
     bad_state = _preprocess_state(tuple(dataset.feature_names[1:3])).as_dict()
@@ -254,6 +299,7 @@ def test_linear_signal_builder_rejects_preprocess_model_feature_mismatch():
         manifest_hash="hash",
         config={},
         decision_schedule=DecisionScheduleConfig().as_dict(),
+        **grid_identity_fields(),
         transform_config=TransformConfig().as_dict(),
         preprocess_state={"schema": "mmrt_linear_preprocess", "states_by_head": {h: bad_state for h in lm.MODEL_HEADS}},
         model_bundle_state=bundle.as_dict(),

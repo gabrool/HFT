@@ -11,6 +11,7 @@ from mmrt.execution.adverse_runtime import (
 )
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_SIGNALS_SCHEMA, AdverseSelectionSignalArtifact
 from mmrt.execution.contracts import LinearSignal
+from tests.grid_helpers import grid_lineage_fields
 
 
 def _signal():
@@ -34,6 +35,7 @@ def test_adverse_predictions_for_row_returns_scalar_dict():
         decision_event_seq=np.array([2**31 - 1], dtype=np.int64),
         target_names=tuple(_preds()),
         predictions={k: np.array([v], dtype=np.float32) for k, v in _preds().items()},
+        **grid_lineage_fields(),
     )
     assert adverse_predictions_for_row(signals, 0)["bid_touch_filled"] == pytest.approx(0.5)
 

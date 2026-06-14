@@ -1,12 +1,14 @@
 import json
+import gc
 import numpy as np
 import pytest
 
 from mmrt.execution.adverse_selection_dataset import AdverseSelectionDatasetWriter, AdverseSelectionDatasetWriterConfig, load_adverse_selection_dataset
+from tests.grid_helpers import grid_lineage_fields
 
 
 def _meta():
-    return {"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,"decision_interval_us":1,"start_event_index":None,"max_decisions":None,"config_json":"{}","index_schema":"mmrt_adverse_selection_index_v2","index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}
+    return {"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,**grid_lineage_fields(n_rows=3),"config_json":"{}","index_schema":"mmrt_adverse_selection_index_v2","index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}
 
 
 def test_adverse_dataset_writer_roundtrip_tiny(tmp_path):
@@ -38,6 +40,11 @@ def test_adverse_dataset_manifest_written_last(tmp_path):
 def test_load_adverse_dataset_rejects_bad_shapes(tmp_path):
     w=AdverseSelectionDatasetWriter(AdverseSelectionDatasetWriterConfig(str(tmp_path/"ds"),("f",),("y",),_meta()))
     ds=w.finalize()
-    np.save(ds.root/"arrays"/"features.npy", np.zeros((2,1), dtype=np.float32))
+    root = ds.root
+    del ds
+    gc.collect()
+    features_path = root/"arrays"/"features.npy"
+    features_path.unlink()
+    np.save(features_path, np.zeros((2,1), dtype=np.float32))
     with pytest.raises(ValueError):
-        load_adverse_selection_dataset(ds.root)
+        load_adverse_selection_dataset(root)

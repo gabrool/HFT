@@ -15,6 +15,7 @@ import mmrt.linear.models as lm
 import mmrt.linear.preprocess as pp
 import mmrt.linear.targets as tg
 import mmrt.linear.train as lt
+from tests.grid_helpers import grid_identity_fields
 
 
 def test_public_api_boundary() -> None:
@@ -144,6 +145,7 @@ def test_main_calls_train_and_writer_and_prints_compact_json(monkeypatch: pytest
         manifest_hash="abc",
         config={},
         decision_schedule=DecisionScheduleConfig().as_dict(),
+        **grid_identity_fields(),
         transform_config=TransformConfig().as_dict(),
         preprocess_state={},
         model_bundle_state={},
@@ -285,7 +287,7 @@ def test_cli_written_artifact_contains_no_move(tmp_path, monkeypatch: pytest.Mon
 
     def fake_train(*args, **kwargs):
         se = lt.SplitEvaluation("train", 1, evaluation={}, diagnostics={})
-        return lt.LinearTrainResult(schema="mmrt_linear_training_result_tape25", dataset_id="d", manifest_hash="h", config={}, decision_schedule=DecisionScheduleConfig().as_dict(), transform_config=TransformConfig().as_dict(), preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": lt.SplitEvaluation("val", 1, evaluation={}, diagnostics={})}, selection_summary={"selection_split": "val", "primary_metrics": {}, "guardrails": {}})
+        return lt.LinearTrainResult(schema=lt.LINEAR_TRAINING_RESULT_SCHEMA, dataset_id="d", manifest_hash="h", config={}, decision_schedule=DecisionScheduleConfig().as_dict(), **grid_identity_fields(), transform_config=TransformConfig().as_dict(), preprocess_state={}, model_bundle_state={}, splits={"train": se, "val": lt.SplitEvaluation("val", 1, evaluation={}, diagnostics={})}, selection_summary={"selection_split": "val", "primary_metrics": {}, "guardrails": {}})
 
     def fake_write(*args, **kwargs):
         result_path.write_text(json.dumps(artifact_payload))
