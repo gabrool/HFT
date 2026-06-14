@@ -147,6 +147,15 @@ def _write_matured_labels(label_results, pending_decisions: dict[tuple[int, int]
         counters.rows_written += 1
 
 
+def _count_event_type_in_range(events: np.ndarray, *, event_type_code: int, end_exclusive: int, chunk_rows: int = 1_000_000) -> int:
+    total = 0
+    codes = events["event_type_code"]
+    for start in range(0, end_exclusive, chunk_rows):
+        end = min(start + chunk_rows, end_exclusive)
+        total += int(np.count_nonzero(codes[start:end] == event_type_code))
+    return total
+
+
 def _run_tape_ingest(
     tape,
     decision_grid,
@@ -159,8 +168,10 @@ def _run_tape_ingest(
     counters.tape_trades = int(tape.manifest.num_trades)
     events = tape.arrays.events
     replay_end = int(decision_grid.decision_event_index[-1]) + 1
-    counters.trade_events_seen = int(
-        np.count_nonzero(np.asarray(events["event_type_code"][:replay_end]) == EVENT_TYPE_CODE_TRADE)
+    counters.trade_events_seen = _count_event_type_in_range(
+        events,
+        event_type_code=EVENT_TYPE_CODE_TRADE,
+        end_exclusive=replay_end,
     )
     if counters.trade_events_seen == 0:
         raise ValueError("no trade events seen in replayed tape range")

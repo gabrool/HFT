@@ -20,11 +20,6 @@ FORBIDDEN_SUBSTRINGS = (
 ALLOWED_SUBSTRINGS = (
     "parquet_version",
     "DEFAULT_PARQUET_VERSION",
-    "mmrt_adverse_selection_ridge_v2",
-    "mmrt_adverse_selection_index_v2",
-    "mmrt_adverse_selection_dataset_v2",
-    "mmrt_adverse_selection_feature_dataset_v2",
-    "mmrt_adverse_selection_index_v1",
     "mmrt_execution_decision_grid_v1",
     "mmrt_execution_linear_signals_grid_v1",
     "mmrt_linear_training_result_tape25_grid_v1",
@@ -32,6 +27,7 @@ ALLOWED_SUBSTRINGS = (
     "mmrt_adverse_selection_feature_dataset_grid_v1",
     "mmrt_adverse_selection_ridge_grid_v1",
     "mmrt_adverse_selection_signals_grid_v1",
+    "mmrt_adverse_selection_index_grid_v1",
     "event_schedule_reason_v1",
 )
 
@@ -41,10 +37,50 @@ FORBIDDEN_HISTORY_WORDS = (
     "leg" + "acy",
     "compat" + "ibility",
     "back" + "ward " + "compat" + "ibility",
+    "migration",
+    "deprecated",
     "no longer " + "supported",
     "old " + "schema",
     "old " + "format",
 )
+
+ALLOWED_HISTORY_SUBSTRINGS_BY_FILE = {
+    Path("mmrt/metadata/__init__.py"): (
+        "RuleCompatibility",
+        "rule_compatibility",
+    ),
+    Path("mmrt/metadata/rule_compatibility.py"): (
+        "Diagnostic grid compatibility checks for market data and symbol rules.",
+        "RuleCompatibility",
+        "compatibility report must be a mapping",
+        "symbol rule compatibility strict mode failed",
+    ),
+    Path("mmrt/execution/contracts.py"): (
+        "RuleCompatibilityReport",
+        "symbol_rule_compatibility",
+    ),
+    Path("mmrt/execution/execution_tape.py"): (
+        "RuleCompatibilityReport",
+        "symbol_rule_compatibility",
+    ),
+    Path("mmrt/execution/execution_tape_writer.py"): (
+        "RuleCompatibilityReport",
+        "symbol_rule_compatibility",
+    ),
+    Path("mmrt/cli/build_execution_tape.py"): (
+        "RuleCompatibility",
+        "rule_compatibility",
+        "symbol_rule_compatibility",
+        "compatibility_report",
+        "_coerce_compatibility_mode",
+        "compatibility=compatibility",
+        "compatibility=compat",
+        "compatibility: RuleCompatibilityAccumulator",
+        "compatibility is not None",
+        "compatibility.observe_price_array",
+        "compatibility.observe_qty_array",
+    ),
+}
 
 
 def test_no_history_language_in_production_mmrt():
@@ -54,7 +90,9 @@ def test_no_history_language_in_production_mmrt():
         for forbidden in FORBIDDEN_HISTORY_WORDS:
             for line_no, line in enumerate(text.splitlines(), 1):
                 if forbidden in line.lower():
-                    if "compatibility" in line.lower() or "compatibility" in path.name:
+                    rel = path
+                    allowed = ALLOWED_HISTORY_SUBSTRINGS_BY_FILE.get(rel, ())
+                    if any(substring in line for substring in allowed):
                         continue
                     offenders.append(f"{path}:{line_no}: {line.strip()}")
     assert offenders == []

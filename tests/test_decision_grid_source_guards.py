@@ -92,6 +92,14 @@ def test_feature_replay_exposes_only_grid_native_replay():
 
 def test_adverse_disk_builders_do_not_materialize_index_samples():
     adverse = _text("mmrt/execution/adverse_selection.py")
+    assert "def build_adverse_selection_feature_dataset(" not in adverse
+    assert "def build_adverse_selection_dataset(" not in adverse
+    assert "def _build_adverse_selection_feature_rows(" not in adverse
+    assert "_precompute_kyle_samples(" not in adverse
+    assert "_trade_flow_view_from_tape(" not in adverse
+    assert "_valid_l2_view_from_tape(" not in adverse
+    assert "_valid_l2_views(" not in adverse
+
     dataset_body = adverse.split("def build_adverse_selection_dataset_to_disk", 1)[1]
     assert "_precompute_kyle_samples(" not in dataset_body
     assert 'np.ascontiguousarray(events["local_ts_us"]' not in dataset_body
@@ -102,6 +110,39 @@ def test_adverse_disk_builders_do_not_materialize_index_samples():
     assert "_precompute_kyle_samples(" not in feature_store
     assert "for i in range(index.kyle_samples.count)" not in feature_store
     assert "[_KyleSample(" not in feature_store
+
+
+def test_large_replay_paths_do_not_use_unbounded_python_materialization():
+    paths = [
+        "mmrt/execution/feature_replay.py",
+        "mmrt/execution/adverse_selection.py",
+        "mmrt/execution/adverse_selection_feature_store.py",
+        "mmrt/execution/adverse_selection_index.py",
+    ]
+    offenders = []
+    for rel in paths:
+        text = _text(rel)
+        for token in (
+            ".tolist()",
+            'np.ascontiguousarray(events["local_ts_us"]',
+            'np.ascontiguousarray(l2_events["',
+            "local_ts = [",
+            "event_seq = [",
+            "flow = [",
+            "trade_price = [",
+            "trade_amount = [",
+            "trade_side = [",
+            "[_KyleSample(",
+        ):
+            if token in text:
+                offenders.append(f"{rel}: {token}")
+    assert offenders == []
+
+
+def test_ingest_trade_counter_is_chunked():
+    text = _text("mmrt/cli/ingest.py")
+    assert 'np.asarray(events["event_type_code"][:replay_end]' not in text
+    assert "def _count_event_type_in_range" in text
 
 
 def test_decision_grid_has_no_npz_loader_or_flag_names():

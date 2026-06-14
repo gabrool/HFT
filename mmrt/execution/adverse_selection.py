@@ -60,8 +60,6 @@ __all__ = [
     "RollingKyleLambdaState",
     "quote_candidate_configs_from_names",
     "adverse_selection_config_from_training_summary",
-    "build_adverse_selection_feature_dataset",
-    "build_adverse_selection_dataset",
     "build_adverse_selection_dataset_to_disk",
     "summarize_adverse_selection_feature_dataset",
     "summarize_disk_adverse_selection_dataset",
@@ -618,15 +616,14 @@ class AdverseSelectionDataset:
             raise ValueError("masked label values must be finite")
         if not isinstance(self.config, AdverseSelectionConfig):
             raise ValueError("config must be AdverseSelectionConfig")
-        if self.decision_grid_hash:
-            if not isinstance(self.decision_grid_schema, str) or not self.decision_grid_schema:
-                raise ValueError("decision_grid_schema must be non-empty when decision_grid_hash is set")
-            if len(self.decision_grid_hash) != 64 or any(ch not in "0123456789abcdef" for ch in self.decision_grid_hash):
-                raise ValueError("decision_grid_hash must be 64 lowercase hex characters")
-            if int(self.decision_grid_n_rows) < self.num_decisions:
-                raise ValueError("decision_grid_n_rows must cover dataset rows")
-            if not isinstance(self.decision_schedule, Mapping):
-                raise ValueError("decision_schedule must be a mapping when decision_grid_hash is set")
+        if not isinstance(self.decision_grid_schema, str) or not self.decision_grid_schema:
+            raise ValueError("decision_grid_schema must be non-empty")
+        if len(self.decision_grid_hash) != 64 or any(ch not in "0123456789abcdef" for ch in self.decision_grid_hash):
+            raise ValueError("decision_grid_hash must be 64 lowercase hex characters")
+        if int(self.decision_grid_n_rows) < self.num_decisions:
+            raise ValueError("decision_grid_n_rows must cover dataset rows")
+        if not isinstance(self.decision_schedule, Mapping):
+            raise ValueError("decision_schedule must be a mapping")
 
     @property
     def num_decisions(self) -> int:
@@ -678,15 +675,14 @@ class AdverseSelectionFeatureDataset:
             raise ValueError("all feature values must be finite")
         if not isinstance(self.config, AdverseSelectionConfig):
             raise ValueError("config must be AdverseSelectionConfig")
-        if self.decision_grid_hash:
-            if not isinstance(self.decision_grid_schema, str) or not self.decision_grid_schema:
-                raise ValueError("decision_grid_schema must be non-empty when decision_grid_hash is set")
-            if len(self.decision_grid_hash) != 64 or any(ch not in "0123456789abcdef" for ch in self.decision_grid_hash):
-                raise ValueError("decision_grid_hash must be 64 lowercase hex characters")
-            if int(self.decision_grid_n_rows) != self.num_decisions:
-                raise ValueError("decision_grid_n_rows must match feature rows")
-            if not isinstance(self.decision_schedule, Mapping):
-                raise ValueError("decision_schedule must be a mapping when decision_grid_hash is set")
+        if not isinstance(self.decision_grid_schema, str) or not self.decision_grid_schema:
+            raise ValueError("decision_grid_schema must be non-empty")
+        if len(self.decision_grid_hash) != 64 or any(ch not in "0123456789abcdef" for ch in self.decision_grid_hash):
+            raise ValueError("decision_grid_hash must be 64 lowercase hex characters")
+        if int(self.decision_grid_n_rows) != self.num_decisions:
+            raise ValueError("decision_grid_n_rows must match feature rows")
+        if not isinstance(self.decision_schedule, Mapping):
+            raise ValueError("decision_schedule must be a mapping")
 
     @property
     def num_decisions(self) -> int:
@@ -802,58 +798,6 @@ def _book_top_from_l2_row(tape: ExecutionTape, book_ptr: int) -> tuple[int, int,
     if best_bid_tick <= 0 or best_ask_tick <= 0 or best_ask_tick <= best_bid_tick or best_bid_size < 0.0 or best_ask_size < 0.0:
         raise ValueError("L2 book must be two-sided and positive-spread")
     return best_bid_tick, best_ask_tick, best_bid_size, best_ask_size, (best_bid_tick + best_ask_tick) * 0.5, best_ask_tick - best_bid_tick
-
-
-class _ValidL2View(NamedTuple):
-    local_ts_us: np.ndarray
-    event_seq: np.ndarray
-    best_bid_tick: np.ndarray
-    best_ask_tick: np.ndarray
-
-
-def _valid_l2_view_from_tape(tape: ExecutionTape) -> _ValidL2View:
-    events = tape.arrays.events
-    l2 = tape.arrays.l2_events
-    ts: list[int] = []
-    seq: list[int] = []
-    bid: list[int] = []
-    ask: list[int] = []
-    for event in events:
-        if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
-            continue
-        book_ptr = int(event["book_ptr"])
-        if book_ptr < 0:
-            continue
-        row = l2[book_ptr]
-        b = int(row["best_bid_tick"]); a = int(row["best_ask_tick"])
-        if b > 0 and a > b:
-            ts.append(int(event["local_ts_us"])); seq.append(int(event["event_seq"])); bid.append(b); ask.append(a)
-    return _ValidL2View(np.asarray(ts, dtype=np.int64), np.asarray(seq, dtype=np.int64), np.asarray(bid, dtype=np.int64), np.asarray(ask, dtype=np.int64))
-
-
-def _future_mid_and_key_at_or_after_key(view: _ValidL2View, target_key: EventKey) -> tuple[float, EventKey] | None:
-    ts = view.local_ts_us
-    idx = int(np.searchsorted(ts, target_key.local_ts_us, side="left"))
-    if idx >= len(ts):
-        return None
-    if int(ts[idx]) == target_key.local_ts_us:
-        j = idx
-        best: int | None = None
-        while j < len(ts) and int(ts[j]) == target_key.local_ts_us:
-            if int(view.event_seq[j]) <= target_key.event_seq:
-                best = j
-            j += 1
-        if best is not None:
-            return (int(view.best_bid_tick[best]) + int(view.best_ask_tick[best])) * 0.5, EventKey(int(ts[best]), int(view.event_seq[best]))
-        idx = j
-    if idx >= len(ts):
-        return None
-    return (int(view.best_bid_tick[idx]) + int(view.best_ask_tick[idx])) * 0.5, EventKey(int(ts[idx]), int(view.event_seq[idx]))
-
-
-def _future_mid_tick_at_or_after_key(view: _ValidL2View, target_key: EventKey) -> float | None:
-    info = _future_mid_and_key_at_or_after_key(view, target_key)
-    return None if info is None else info[0]
 
 
 def _book_top_obj_from_l2_row(tape: ExecutionTape, book_ptr: int) -> BookTop:
@@ -1313,105 +1257,6 @@ def _new_kyle_state(config: KyleLambdaConfig) -> RollingKyleLambdaState:
     )
 
 
-def _valid_l2_views(tape: ExecutionTape) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    l2 = tape.arrays.l2_events
-    local_ts = np.asarray(l2["local_ts_us"], dtype=np.int64)
-    bid_ticks = np.asarray(l2["best_bid_tick"], dtype=np.int64)
-    ask_ticks = np.asarray(l2["best_ask_tick"], dtype=np.int64)
-    bid_sizes = np.asarray(l2["best_bid_size"], dtype=np.float64)
-    ask_sizes = np.asarray(l2["best_ask_size"], dtype=np.float64)
-    valid = (bid_ticks > 0) & (ask_ticks > bid_ticks)
-    return local_ts[valid], bid_ticks[valid], ask_ticks[valid], bid_sizes[valid], ask_sizes[valid]
-
-
-class _TradeFlowView(NamedTuple):
-    local_ts_us: np.ndarray
-    event_seq: np.ndarray
-    cumulative_flow: np.ndarray
-
-
-def _trade_flow_view_from_tape(
-    tape: ExecutionTape,
-    *,
-    use_notional_flow: bool,
-    tick_size: float,
-) -> _TradeFlowView:
-    events = tape.arrays.events
-    trades = tape.arrays.trades
-    local_ts: list[int] = []
-    event_seq: list[int] = []
-    flow: list[float] = []
-    for event in events:
-        if int(event["event_type_code"]) != EVENT_TYPE_CODE_TRADE:
-            continue
-        trade_ptr = int(event["trade_ptr"])
-        if trade_ptr < 0:
-            continue
-        trade = trades[trade_ptr]
-        side_code = int(trade["side_code"])
-        if side_code == 0:
-            continue
-        amount = float(trade["amount"])
-        if amount <= 0.0:
-            continue
-        price_tick = int(trade["price_tick"])
-        signed = (1.0 if side_code > 0 else -1.0) * amount
-        if use_notional_flow:
-            signed *= price_tick * tick_size
-        local_ts.append(int(event["local_ts_us"]))
-        event_seq.append(int(event["event_seq"]))
-        flow.append(signed)
-    flow_arr = np.asarray(flow, dtype=np.float64)
-    cumulative = np.concatenate((np.array([0.0], dtype=np.float64), np.cumsum(flow_arr, dtype=np.float64)))
-    return _TradeFlowView(np.asarray(local_ts, dtype=np.int64), np.asarray(event_seq, dtype=np.int64), cumulative)
-
-
-def _upper_bound_event_key(local_ts: np.ndarray, event_seq: np.ndarray, key: EventKey) -> int:
-    lo = 0
-    hi = len(local_ts)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if (int(local_ts[mid]), int(event_seq[mid])) <= (key.local_ts_us, key.event_seq):
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
-
-
-def _flow_between_keys(view: _TradeFlowView, start_exclusive: EventKey, end_inclusive: EventKey) -> float:
-    if end_inclusive <= start_exclusive:
-        return 0.0
-    left = _upper_bound_event_key(view.local_ts_us, view.event_seq, start_exclusive)
-    right = _upper_bound_event_key(view.local_ts_us, view.event_seq, end_inclusive)
-    return float(view.cumulative_flow[right] - view.cumulative_flow[left])
-
-
-def _precompute_kyle_samples(tape: ExecutionTape, config: KyleLambdaConfig, tick_size: float) -> list[_KyleSample]:
-    l2_view = _valid_l2_view_from_tape(tape)
-    if len(l2_view.local_ts_us) == 0:
-        return []
-    trade_flow = _trade_flow_view_from_tape(tape, use_notional_flow=config.use_notional_flow, tick_size=tick_size)
-    samples: list[_KyleSample] = []
-    start = int(l2_view.local_ts_us[0])
-    end = int(l2_view.local_ts_us[-1] - config.response_horizon_us)
-    while start <= end:
-        start_key = EventKey(start, MAX_EVENT_SEQ)
-        flow_end_key = EventKey(start + config.sample_interval_us, MAX_EVENT_SEQ)
-        response_key = EventKey(start + config.response_horizon_us, MAX_EVENT_SEQ)
-        start_info = _future_mid_and_key_at_or_after_key(l2_view, start_key)
-        response_info = _future_mid_and_key_at_or_after_key(l2_view, response_key)
-        if start_info is not None and response_info is not None:
-            start_mid, start_obs_key = start_info
-            response_mid, response_obs_key = response_info
-            x_flow = _flow_between_keys(trade_flow, start_key, flow_end_key)
-            y_mid_bps = _bps_from_ticks(response_mid - start_mid, start_mid)
-            end_key = max(start_obs_key, response_obs_key, flow_end_key)
-            samples.append(_KyleSample(end_key=end_key, x_flow=x_flow, y_mid_bps=y_mid_bps))
-        start += config.sample_interval_us
-    samples.sort(key=lambda sample: (sample.end_key.local_ts_us, sample.end_key.event_seq))
-    return samples
-
-
 def _book_fragility_values(tape: ExecutionTape, latest_book_ptr: int, previous_book_ptr: int, mid_tick: float) -> tuple[float, float, float, float, float]:
     if previous_book_ptr < 0 or latest_book_ptr < 0:
         return 0.0, 0.0, 0.0, 0.0, 0.0
@@ -1479,13 +1324,6 @@ def _side_valid_for_candidate(tape: ExecutionTape, config: AdverseSelectionConfi
 class FutureMidLookup(Protocol):
     def future_mid_tick_at_or_after(self, key: EventKey) -> float | None: ...
 
-
-@dataclass(frozen=True, slots=True)
-class _ValidL2ViewFutureMidLookup:
-    view: _ValidL2View
-
-    def future_mid_tick_at_or_after(self, key: EventKey) -> float | None:
-        return _future_mid_tick_at_or_after_key(self.view, key)
 
 def _labels_for_decision(
     tape: ExecutionTape,
@@ -1566,20 +1404,6 @@ def _labels_for_decision(
 
 
 
-@dataclass(frozen=True, slots=True)
-class _AdverseFeatureRows:
-    decision_local_ts_us: np.ndarray
-    decision_event_index: np.ndarray
-    decision_event_seq: np.ndarray
-    feature_names: tuple[str, ...]
-    features: np.ndarray
-    latest_book_ptr_by_row: np.ndarray
-
-    @property
-    def num_decisions(self) -> int:
-        return int(self.decision_local_ts_us.shape[0])
-
-
 class _AdverseFeatureRow(NamedTuple):
     decision_local_ts_us: int
     decision_event_index: int
@@ -1588,28 +1412,19 @@ class _AdverseFeatureRow(NamedTuple):
     latest_book_ptr: int
 
 
-def _decision_grid_lineage_fields(decision_grid: DecisionGrid) -> dict[str, object]:
-    if not isinstance(decision_grid, DecisionGrid):
-        raise ValueError("decision_grid must be DecisionGrid")
-    return {
-        "decision_grid_schema": decision_grid.metadata.schema,
-        "decision_grid_hash": decision_grid.decision_grid_hash,
-        "decision_grid_n_rows": decision_grid.n_rows,
-        "decision_schedule": decision_grid.decision_schedule,
-    }
-
-
 def _iter_adverse_selection_feature_rows_for_decision_grid(
     tape: ExecutionTape,
     *,
     config: AdverseSelectionConfig,
     decision_grid: DecisionGrid,
-    kyle_samples: Sequence[_KyleSample] | None = None,
+    kyle_samples: Sequence[_KyleSample],
 ) -> Iterator[_AdverseFeatureRow]:
     if not isinstance(tape, ExecutionTape):
         raise ValueError("tape must be ExecutionTape")
     if not isinstance(config, AdverseSelectionConfig):
         raise ValueError("config must be AdverseSelectionConfig")
+    if kyle_samples is None:
+        raise ValueError("kyle_samples is required")
     validate_decision_grid_for_execution_tape(decision_grid, tape)
     spec = tape.manifest.symbol_spec
     if not isinstance(spec, SymbolSpec):
@@ -1619,8 +1434,6 @@ def _iter_adverse_selection_feature_rows_for_decision_grid(
 
     vpin_state = VPINState(config.vpin, deque())
     kyle_state = _new_kyle_state(config.kyle)
-    if kyle_samples is None:
-        kyle_samples = _precompute_kyle_samples(tape, config.kyle, spec.tick_size)
     next_kyle_sample_idx = 0
     flow_states = tuple(_TradeWindowState(window_us) for window_us in config.flow_windows_us)
 
@@ -1699,119 +1512,6 @@ def _iter_adverse_selection_feature_rows_for_decision_grid(
             break
     raise ValueError(f"adverse replay consumed {next_grid_row} decision grid rows, expected {decision_grid.n_rows}")
 
-
-def _build_adverse_selection_feature_rows(
-    tape: ExecutionTape,
-    *,
-    config: AdverseSelectionConfig,
-    decision_grid: DecisionGrid,
-) -> _AdverseFeatureRows:
-    feature_names = adverse_selection_feature_names(config)
-    decision_ts_values: list[int] = []
-    decision_event_indices: list[int] = []
-    decision_event_seq_values: list[int] = []
-    feature_rows: list[tuple[float, ...]] = []
-    latest_book_ptr_values: list[int] = []
-    for row in _iter_adverse_selection_feature_rows_for_decision_grid(tape, config=config, decision_grid=decision_grid):
-        decision_ts_values.append(row.decision_local_ts_us)
-        decision_event_indices.append(row.decision_event_index)
-        decision_event_seq_values.append(row.decision_event_seq)
-        feature_rows.append(row.features)
-        latest_book_ptr_values.append(row.latest_book_ptr)
-    features = np.asarray(feature_rows, dtype=np.float32).reshape((len(feature_rows), len(feature_names)))
-    return _AdverseFeatureRows(
-        decision_local_ts_us=np.asarray(decision_ts_values, dtype=np.int64),
-        decision_event_index=np.asarray(decision_event_indices, dtype=np.int64),
-        decision_event_seq=np.asarray(decision_event_seq_values, dtype=np.int64),
-        feature_names=feature_names,
-        features=features,
-        latest_book_ptr_by_row=np.asarray(latest_book_ptr_values, dtype=np.int64),
-    )
-
-
-def build_adverse_selection_feature_dataset(
-    tape: ExecutionTape,
-    *,
-    config: AdverseSelectionConfig = AdverseSelectionConfig(),
-    decision_grid: DecisionGrid,
-) -> AdverseSelectionFeatureDataset:
-    rows = _build_adverse_selection_feature_rows(tape, config=config, decision_grid=decision_grid)
-    lineage = _decision_grid_lineage_fields(decision_grid)
-    return AdverseSelectionFeatureDataset(
-        decision_local_ts_us=rows.decision_local_ts_us,
-        decision_event_index=rows.decision_event_index,
-        decision_event_seq=rows.decision_event_seq,
-        feature_names=rows.feature_names,
-        features=rows.features,
-        config=config,
-        **lineage,
-    )
-
-
-def build_adverse_selection_dataset(
-    tape: ExecutionTape,
-    *,
-    config: AdverseSelectionConfig = AdverseSelectionConfig(),
-    decision_grid: DecisionGrid,
-) -> AdverseSelectionDataset:
-    rows = _build_adverse_selection_feature_rows(tape, config=config, decision_grid=decision_grid)
-    l2_view = _valid_l2_view_from_tape(tape)
-    layout = _AdverseLabelLayout.from_config(config)
-    fill_index = (
-        _build_conservative_fill_index(tape)
-        if config.quote.queue_model.mode == QueueModelMode.CONSERVATIVE
-        else None
-    )
-    label_names = layout.label_names
-    last_event_local_ts_us = int(tape.arrays.events["local_ts_us"][-1])
-    events_local_ts_us = np.asarray(tape.arrays.events["local_ts_us"], dtype=np.int64)
-    kept_decision_ts: list[int] = []
-    kept_event_indices: list[int] = []
-    kept_event_seq: list[int] = []
-    kept_features: list[np.ndarray] = []
-    label_rows: list[list[float]] = []
-    mask_rows: list[list[bool]] = []
-
-    for row_idx in range(rows.num_decisions):
-        labels_and_masks = _labels_for_decision(
-            tape,
-            config=config,
-            layout=layout,
-            last_event_local_ts_us=last_event_local_ts_us,
-            events_local_ts_us=events_local_ts_us,
-            decision_event_index=int(rows.decision_event_index[row_idx]),
-            latest_book_ptr=int(rows.latest_book_ptr_by_row[row_idx]),
-            decision_key=EventKey(int(rows.decision_local_ts_us[row_idx]), int(rows.decision_event_seq[row_idx])),
-            future_mid_lookup=_ValidL2ViewFutureMidLookup(l2_view),
-            fill_index=fill_index,
-        )
-        if labels_and_masks is None:
-            if config.drop_incomplete_horizon:
-                continue
-            continue
-        labels, masks = labels_and_masks
-        kept_decision_ts.append(int(rows.decision_local_ts_us[row_idx]))
-        kept_event_indices.append(int(rows.decision_event_index[row_idx]))
-        kept_event_seq.append(int(rows.decision_event_seq[row_idx]))
-        kept_features.append(rows.features[row_idx])
-        label_rows.append(labels)
-        mask_rows.append(masks)
-
-    features = np.asarray(kept_features, dtype=np.float32).reshape((len(kept_features), len(rows.feature_names)))
-    labels = np.asarray(label_rows, dtype=np.float32).reshape((len(label_rows), len(label_names)))
-    masks = np.asarray(mask_rows, dtype=np.bool_).reshape((len(mask_rows), len(label_names)))
-    return AdverseSelectionDataset(
-        decision_local_ts_us=np.asarray(kept_decision_ts, dtype=np.int64),
-        decision_event_index=np.asarray(kept_event_indices, dtype=np.int64),
-        decision_event_seq=np.asarray(kept_event_seq, dtype=np.int64),
-        feature_names=rows.feature_names,
-        features=features,
-        label_names=label_names,
-        labels=labels,
-        label_masks=masks,
-        config=config,
-        **_decision_grid_lineage_fields(decision_grid),
-    )
 
 @dataclass(frozen=True, slots=True)
 class BuildAdverseSelectionDatasetToDiskConfig:

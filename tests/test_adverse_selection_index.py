@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from mmrt.execution.adverse_selection import KyleLambdaConfig, _future_mid_and_key_at_or_after_key, _valid_l2_view_from_tape
+from mmrt.execution.adverse_selection import KyleLambdaConfig
 from mmrt.execution.adverse_selection_index import (
     ADVERSE_SELECTION_INDEX_SCHEMA,
     AdverseSelectionIndexConfig,
@@ -51,11 +51,15 @@ def test_disk_index_future_mid_matches_in_memory_helper_for_same_timestamp_group
         _l2(seq=2, local_ts_us=1000, bid_ticks=(102, 101), ask_ticks=(104, 105)),
         _l2(seq=3, local_ts_us=2000, bid_ticks=(200, 199), ask_ticks=(202, 203)),
     ], [])
-    in_memory = _valid_l2_view_from_tape(tape)
+    expected = ValidL2Index(
+        local_ts_us=np.array([1000, 1000, 1000, 2000], dtype=np.int64),
+        event_seq=np.array([0, 1, 2, 3], dtype=np.int64),
+        mid_tick=np.array([101.0, 102.0, 103.0, 201.0], dtype=np.float32),
+    )
     index = build_adverse_selection_index(tape, config=_cfg(tmp_path / "idx", overwrite=True))
     keys = [EventKey(1000, MAX_EVENT_SEQ), EventKey(1000, 1), EventKey(1000, 0), EventKey(1500, MAX_EVENT_SEQ), EventKey(3000, MAX_EVENT_SEQ)]
     for key in keys:
-        assert index.valid_l2.future_mid_and_key_at_or_after(key) == _future_mid_and_key_at_or_after_key(in_memory, key)
+        assert index.valid_l2.future_mid_and_key_at_or_after(key) == expected.future_mid_and_key_at_or_after(key)
 
 
 def test_kyle_sample_response_uses_last_same_timestamp_l2_for_max_event_seq(tmp_path):
@@ -128,13 +132,13 @@ def test_adverse_selection_index_rebuilds_stale_manifest_with_overwrite(tmp_path
     assert rebuilt.manifest.tape_num_events == tape.manifest.num_events
 
 
-def test_adverse_selection_index_schema_one_is_rejected(tmp_path):
+def test_adverse_selection_index_schema_mismatch_rebuilds_with_overwrite(tmp_path):
     tape = _reuse_tape()
     root = tmp_path / "idx"
     build_or_load_adverse_selection_index(tape, config=_cfg(root, overwrite=True))
     path = root / "index_manifest.json"
     raw = json.loads(path.read_text())
-    raw["schema"] = "mmrt_adverse_selection_index_v1"
+    raw["schema"] = "bad_schema"
     path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="stale adverse-selection index manifest"):
         build_or_load_adverse_selection_index(tape, config=_cfg(root))

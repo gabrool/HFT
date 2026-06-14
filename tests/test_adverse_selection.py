@@ -21,7 +21,6 @@ from mmrt.execution.adverse_selection import (
     KyleLambdaConfig,
     VPINConfig,
     VPINState,
-    build_adverse_selection_dataset as _build_adverse_selection_dataset,
     summarize_adverse_selection_dataset,
 )
 from mmrt.cli.train_adverse_selection import (
@@ -33,6 +32,7 @@ from mmrt.cli.train_adverse_selection import (
     run_adverse_selection_training,
 )
 from tests.grid_helpers import decision_grid_for_tape
+from tests.adverse_helpers import build_tiny_adverse_selection_dataset
 
 
 
@@ -166,9 +166,9 @@ def _base_config(**kwargs):
     return config
 
 
-def build_adverse_selection_dataset(tape, *, config):
+def build_adverse_selection_dataset(tape, *, config, tmp_path):
     max_rows = _TEST_MAX_DECISIONS_BY_CONFIG_ID.get(id(config), 1)
-    return _build_adverse_selection_dataset(tape, config=config, decision_grid=decision_grid_for_tape(tape, max_rows=max_rows))
+    return build_tiny_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path, max_rows=max_rows)
 
 
 def test_vpin_fractional_bucket_splitting():
@@ -180,19 +180,19 @@ def test_vpin_fractional_bucket_splitting():
     assert state.vpin() == pytest.approx(1.0)
 
 
-def test_counterfactual_bid_fills_by_trade_at_level_after_queue_consumed():
+def test_counterfactual_bid_fills_by_trade_at_level_after_queue_consumed(tmp_path):
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=1_300_000, bid_ticks=(990, 989), ask_ticks=(992, 993))],
         [_trade(local_ts_us=200, side=AggressorSide.SELL, price_tick=1000, amount=2.0, source_row=0)],
     )
-    dataset = build_adverse_selection_dataset(tape, config=_base_config())
+    dataset = build_adverse_selection_dataset(tape, config=_base_config(), tmp_path=tmp_path)
     assert dataset.num_decisions == 1
     assert _label_value(dataset, "bid_touch_filled") == 1.0
     assert _label_value(dataset, "bid_touch_fill_latency_us") > 0.0
     assert _label_mask(dataset, "bid_touch_adverse_bps") is True
 
 
-def test_disappeared_visible_level_advances_queue_then_later_trade_fills():
+def test_disappeared_visible_level_advances_queue_then_later_trade_fills(tmp_path):
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -210,12 +210,12 @@ def test_disappeared_visible_level_advances_queue_then_later_trade_fills():
             latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0),
         )
     )
-    dataset = build_adverse_selection_dataset(tape, config=config)
+    dataset = build_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path)
     assert _label_value(dataset, "bid_touch_filled") == 1.0
     assert _label_value(dataset, "bid_touch_fill_latency_us") == 200.0
 
 
-def test_conservative_mode_does_not_advance_queue_on_l2_disappearance():
+def test_conservative_mode_does_not_advance_queue_on_l2_disappearance(tmp_path):
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -232,27 +232,27 @@ def test_conservative_mode_does_not_advance_queue_on_l2_disappearance():
             queue_model=QueueModelConfig(mode=QueueModelMode.CONSERVATIVE),
         )
     )
-    dataset = build_adverse_selection_dataset(tape, config=config)
+    dataset = build_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path)
     assert _label_value(dataset, "bid_touch_filled") == 0.0
 
 
-def test_label_masks_for_incomplete_horizon():
+def test_label_masks_for_incomplete_horizon(tmp_path):
     tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
-    drop_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=True))
+    drop_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=True), tmp_path=tmp_path)
     assert drop_dataset.num_decisions == 0
 
-    keep_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=False))
+    keep_dataset = build_adverse_selection_dataset(tape, config=_base_config(drop_incomplete_horizon=False), tmp_path=tmp_path)
     assert keep_dataset.num_decisions == 1
     assert _label_mask(keep_dataset, "bid_touch_filled") is False
     assert _label_mask(keep_dataset, "ask_touch_filled") is False
 
 
-def test_dataset_shape_and_summary():
+def test_dataset_shape_and_summary(tmp_path):
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=1_300_000)],
         [_trade(local_ts_us=200, side=AggressorSide.SELL, price_tick=1000, amount=2.0, source_row=0)],
     )
-    dataset = build_adverse_selection_dataset(tape, config=_base_config())
+    dataset = build_adverse_selection_dataset(tape, config=_base_config(), tmp_path=tmp_path)
     assert dataset.features.dtype == np.float32
     assert dataset.labels.dtype == np.float32
     assert dataset.label_masks.dtype == np.bool_
@@ -544,35 +544,21 @@ def test_adverse_selection_modules_do_not_import_forbidden_layers():
     ):
         assert forbidden not in cli_source
 
-from mmrt.execution.adverse_selection import _TradeFlowView, _flow_between_keys, _future_mid_tick_at_or_after_key, _valid_l2_view_from_tape
+from mmrt.execution.adverse_selection_index import ValidL2Index
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
 
 def test_kyle_future_mid_uses_last_l2_at_same_timestamp():
-    tape = _tape(
-        [
-            _l2(seq=0, local_ts_us=100, bid_ticks=(1000,), bid_sizes=(1.0,), ask_ticks=(1002,), ask_sizes=(1.0,)),
-            _l2(seq=1, local_ts_us=200, bid_ticks=(1010,), bid_sizes=(1.0,), ask_ticks=(1012,), ask_sizes=(1.0,)),
-            _l2(seq=2, local_ts_us=200, bid_ticks=(1020,), bid_sizes=(1.0,), ask_ticks=(1022,), ask_sizes=(1.0,)),
-        ],
-        [],
+    index = ValidL2Index(
+        local_ts_us=np.asarray([100, 200, 200], dtype=np.int64),
+        event_seq=np.asarray([0, 1, 2], dtype=np.int64),
+        mid_tick=np.asarray([1001.0, 1011.0, 1021.0], dtype=np.float32),
     )
-    view = _valid_l2_view_from_tape(tape)
-    assert _future_mid_tick_at_or_after_key(view, EventKey(200, MAX_EVENT_SEQ)) == pytest.approx(1021.0)
-    assert _future_mid_tick_at_or_after_key(view, EventKey(200, 1)) == pytest.approx(1011.0)
+    assert index.future_mid_tick_at_or_after(EventKey(200, MAX_EVENT_SEQ)) == pytest.approx(1021.0)
+    assert index.future_mid_tick_at_or_after(EventKey(200, 1)) == pytest.approx(1011.0)
 
 
-def test_kyle_flow_between_keys_excludes_start_and_includes_end():
-    view = _TradeFlowView(
-        local_ts_us=np.asarray([100, 100, 200], dtype=np.int64),
-        event_seq=np.asarray([1, 2, 0], dtype=np.int64),
-        cumulative_flow=np.asarray([0.0, 10.0, 15.0, 12.0], dtype=np.float64),
-    )
-    assert _flow_between_keys(view, EventKey(100, 1), EventKey(200, 0)) == pytest.approx(2.0)
-    assert _flow_between_keys(view, EventKey(100, 2), EventKey(200, 0)) == pytest.approx(-3.0)
-
-
-def test_kyle_samples_become_ready_for_dataset_features():
+def test_kyle_samples_become_ready_for_dataset_features(tmp_path):
     tape = _tape(
         [
             _l2(seq=0, local_ts_us=100),
@@ -594,7 +580,7 @@ def test_kyle_samples_become_ready_for_dataset_features():
         ),
         drop_incomplete_horizon=False,
     )
-    dataset = build_adverse_selection_dataset(tape, config=config)
+    dataset = build_adverse_selection_dataset(tape, config=config, tmp_path=tmp_path)
     idx = dataset.feature_names.index("kyle_n_1ms")
     assert dataset.num_decisions >= 2
     assert dataset.features[-1, idx] >= 1.0
@@ -602,7 +588,7 @@ def test_kyle_samples_become_ready_for_dataset_features():
 
 def test_labels_for_decision_does_not_recompute_label_names():
     source = Path("mmrt/execution/adverse_selection.py").read_text()
-    body = source.split("def _labels_for_decision", 1)[1].split("def build_adverse_selection_feature_dataset", 1)[0]
+    body = source.split("def _labels_for_decision", 1)[1].split("class _AdverseFeatureRow", 1)[0]
     assert "adverse_selection_label_names(config)" not in body
 
 

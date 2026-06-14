@@ -17,7 +17,7 @@ from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_C
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
 from mmrt.time_key import EventKey, MAX_EVENT_SEQ
 
-ADVERSE_SELECTION_INDEX_SCHEMA = "mmrt_adverse_selection_index_v2"
+ADVERSE_SELECTION_INDEX_SCHEMA = "mmrt_adverse_selection_index_grid_v1"
 MANIFEST_FILENAME = "index_manifest.json"
 ARRAYS_DIRNAME = "arrays"
 _CHUNKS_DIRNAME = "chunks"

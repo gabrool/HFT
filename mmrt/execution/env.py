@@ -344,6 +344,8 @@ class ExecutionEnv:
             raise ValueError("start_event_index must be < len(tape.arrays.events)")
 
         decision_row = self._decision_grid_row_for_event_index(start)
+        if decision_row + 1 >= self.decision_grid.n_rows:
+            raise ValueError("start_event_index must leave at least one following decision grid row")
         event = events[start]
         if int(event["event_type_code"]) != EVENT_TYPE_CODE_L2_BATCH:
             raise ValueError("decision grid start_event_index must reference an L2 batch event")
@@ -452,33 +454,31 @@ class ExecutionEnv:
         state.next_order_id = _next_order_id_after(replacement_orders, state.next_order_id)
 
         next_decision_row = decision_row + 1
-        has_next_decision = next_decision_row < self.decision_grid.n_rows
-        target_event_index: int | None = None
-        if has_next_decision:
-            target_event_index = self._validate_next_grid_target(
-                next_decision_row=next_decision_row,
-                current_event_index=state.event_index,
-            )
+        if next_decision_row >= self.decision_grid.n_rows:
+            state.done = True
+            raise RuntimeError("environment is done; call reset() before step()")
+        target_event_index = self._validate_next_grid_target(
+            next_decision_row=next_decision_row,
+            current_event_index=state.event_index,
+        )
 
         next_event_index = state.event_index + 1
         events_processed = 0
         fills: list[Fill] = []
 
-        if has_next_decision:
-            assert target_event_index is not None
-            while next_event_index <= target_event_index:
-                replay = self._replay_one_event_for_step(next_event_index)
-                fills.extend(replay.fills)
-                events_processed += 1
-                next_event_index += 1
+        while next_event_index <= target_event_index:
+            replay = self._replay_one_event_for_step(next_event_index)
+            fills.extend(replay.fills)
+            events_processed += 1
+            next_event_index += 1
 
-            if state.event_index != target_event_index:
-                raise RuntimeError("execution env failed to advance to target decision grid event")
-            if state.decision_row_index != decision_row:
-                raise RuntimeError("execution env decision grid row changed during target replay")
+        if state.event_index != target_event_index:
+            raise RuntimeError("execution env failed to advance to target decision grid event")
+        if state.decision_row_index != decision_row:
+            raise RuntimeError("execution env decision grid row changed during target replay")
 
-        terminal_due_to_grid_end = not has_next_decision
-        terminal_due_to_tape_end = target_event_index is not None and target_event_index + 1 >= num_events
+        terminal_due_to_grid_end = next_decision_row + 1 >= self.decision_grid.n_rows
+        terminal_due_to_tape_end = target_event_index + 1 >= num_events
         truncated = (
             self.config.max_episode_steps is not None
             and state.step_index + 1 >= self.config.max_episode_steps
@@ -506,17 +506,16 @@ class ExecutionEnv:
         self._peak_equity = reward_step.peak_equity
         self._last_step_fills = step_fills
         state.step_index += 1
-        if has_next_decision:
-            state.decision_row_index = next_decision_row
-            if state.event_index != int(self.decision_grid.decision_event_index[state.decision_row_index]):
-                raise RuntimeError("execution env state is not aligned to the current decision grid row")
-            if state.decision_row_index != next_decision_row:
-                raise RuntimeError("execution env failed to advance to target decision grid row")
+        state.decision_row_index = next_decision_row
+        if state.event_index != int(self.decision_grid.decision_event_index[state.decision_row_index]):
+            raise RuntimeError("execution env state is not aligned to the current decision grid row")
+        if state.decision_row_index != next_decision_row:
+            raise RuntimeError("execution env failed to advance to target decision grid row")
 
         info: dict[str, object] = {
             "step_index": state.step_index - 1,
             "decision_grid_row_index": decision_row,
-            "next_decision_grid_row_index": None if not has_next_decision else next_decision_row,
+            "next_decision_grid_row_index": next_decision_row,
             "target_decision_event_index": target_event_index,
             "terminal_due_to_grid_end": terminal_due_to_grid_end,
             "terminal_due_to_tape_end": terminal_due_to_tape_end,
@@ -591,14 +590,11 @@ class ExecutionEnv:
             truncated=truncated,
             info=info,
         )
-        if terminal_due_to_grid_end:
-            observation = np.array(self._last_observation, copy=True)
-        else:
-            expected_event_index = int(self.decision_grid.decision_event_index[state.decision_row_index])
-            if state.event_index != expected_event_index:
-                raise RuntimeError("execution env state is not aligned to the current decision grid row")
-            observation = self._build_observation()
-            self._last_observation = np.array(observation, copy=True)
+        expected_event_index = int(self.decision_grid.decision_event_index[state.decision_row_index])
+        if state.event_index != expected_event_index:
+            raise RuntimeError("execution env state is not aligned to the current decision grid row")
+        observation = self._build_observation()
+        self._last_observation = np.array(observation, copy=True)
         return ExecutionEnvStep(
             observation=observation,
             reward=reward_step.reward.total_reward * self.config.reward_config.reward_scale,

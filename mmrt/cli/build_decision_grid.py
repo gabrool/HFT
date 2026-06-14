@@ -110,13 +110,12 @@ class _RunningStats:
 
     def as_dict(self) -> dict[str, object]:
         if self.count == 0:
-            return {"mean": None, "min": None, "max": None, "p50": None, "p95": None}
+            return {"count": 0, "mean": None, "min": None, "max": None}
         return {
+            "count": int(self.count),
             "mean": float(self.total / self.count),
             "min": float(self.minimum),
             "max": float(self.maximum),
-            "p50": None,
-            "p95": None,
         }
 
 

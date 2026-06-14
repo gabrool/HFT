@@ -143,6 +143,15 @@ def test_build_decision_grid_records_real_rows_hash_and_reasons():
         assert grid.decision_grid_hash == loaded_again.decision_grid_hash
         assert grid.n_rows == 4
         assert summary["decision_grid"]["decision_grid_hash"] == grid.decision_grid_hash
+        assert set(summary["interval_stats"]) == {
+            "elapsed_since_prev_decision_us",
+            "events_since_prev_decision",
+            "l2_events_since_prev_decision",
+            "trade_events_since_prev_decision",
+        }
+        for stats in summary["interval_stats"].values():
+            assert list(stats) == ["count", "mean", "min", "max"]
+            assert stats["count"] == grid.n_rows - 1
         assert list(grid.reason_code) == [
             DECISION_REASON_FIRST_VALID_BOOK,
             DECISION_REASON_TRADE_WAKE,
