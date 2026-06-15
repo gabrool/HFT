@@ -331,6 +331,12 @@ def test_batch_labels_match_streaming():
     assert np.allclose(labels, stream)
 
 
+def test_batch_label_key_lookup_stays_vectorized():
+    source = inspect.getsource(lb.build_labels_from_price_event_arrays)
+    assert "np.searchsorted" in source
+    assert "bisect.bisect_right" not in source
+
+
 def test_batch_invalid_rows_for_insufficient_future_context():
     s = spec(horizons=(200_000,), entry_delay=0)
     pts = np.array([1_000_000, 1_100_000])

@@ -24,6 +24,7 @@ from mmrt.features.schedule import (
 )
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.cli.build_decision_grid import BuildDecisionGridConfig, build_decision_grid_from_config
+from mmrt.cli.build_decision_grid import _DecisionGridWriters
 
 
 def _workspace_tmp(name: str) -> Path:
@@ -196,3 +197,29 @@ def test_decision_grid_validation_rejects_tape_mismatch():
             raise AssertionError("expected tape/grid mismatch")
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_decision_grid_writers_buffer_rows_before_chunk_flush(tmp_path):
+    writers = _DecisionGridWriters(tmp_path / "grid", chunk_rows=3)
+    try:
+        for i in range(2):
+            writers.append(
+                decision_event_index=i,
+                decision_local_ts_us=100 + i,
+                decision_event_seq=i,
+                book_ptr=i,
+                reason_code=1,
+                reason_flags=1,
+                elapsed_since_prev_decision_us=i,
+                events_since_prev_decision=i,
+                l2_events_since_prev_decision=i,
+                trade_events_since_prev_decision=0,
+            )
+
+        assert writers.total_rows == 2
+        assert writers.writers["decision_event_index"].total_rows == 0
+        arrays = writers.finalize_arrays()
+        assert writers.writers["decision_event_index"].total_rows == 2
+        np.testing.assert_array_equal(arrays["decision_event_index"], np.array([0, 1], dtype=np.int64))
+    finally:
+        writers.cleanup()

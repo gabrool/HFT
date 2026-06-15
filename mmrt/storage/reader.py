@@ -167,6 +167,7 @@ class StorageDatasetReader:
             )
             for s in self.manifest.segments
         )
+        self._dataset_cache: dict[tuple[str, ...], ds.Dataset] = {}
         if self.config.validate_on_open:
             self.validate_dataset()
 
@@ -213,9 +214,14 @@ class StorageDatasetReader:
         return p
 
     def dataset(self, *, segments: tuple[str, ...] | None = None) -> ds.Dataset:
-        seg_keys = tuple(s.segment_key for s in self.segments) if segments is None else segments
+        seg_keys = tuple(s.segment_key for s in self.segments) if segments is None else tuple(segments)
+        cached = self._dataset_cache.get(seg_keys)
+        if cached is not None:
+            return cached
         paths = [str(self._segment_path(k)) for k in seg_keys]
-        return ds.dataset(paths, format="parquet")
+        dataset = ds.dataset(paths, format="parquet")
+        self._dataset_cache[seg_keys] = dataset
+        return dataset
 
     def available_columns(self) -> tuple[str, ...]:
         return self.required_columns
