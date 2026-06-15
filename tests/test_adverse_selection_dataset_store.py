@@ -30,6 +30,31 @@ def test_adverse_dataset_writer_chunking_multiple_chunks(tmp_path):
     np.testing.assert_array_equal(ds.arrays.decision_event_index, [0,1,2])
 
 
+def test_adverse_dataset_writer_append_many_matches_single_rows(tmp_path):
+    ts = np.asarray([1, 2, 3], dtype=np.int64)
+    idx = np.asarray([0, 1, 2], dtype=np.int64)
+    seq = np.asarray([10, 11, 12], dtype=np.int64)
+    features = np.asarray([[0.5], [1.5], [2.5]], dtype=np.float32)
+    labels = np.asarray([[1.0], [0.0], [1.0]], dtype=np.float32)
+    masks = np.asarray([[True], [False], [True]], dtype=np.bool_)
+
+    single = AdverseSelectionDatasetWriter(AdverseSelectionDatasetWriterConfig(str(tmp_path/"single"),("f",),("y",),_meta(),chunk_rows=2))
+    for i in range(3):
+        single.append(decision_local_ts_us=int(ts[i]), decision_event_index=int(idx[i]), decision_event_seq=int(seq[i]), features=features[i], labels=labels[i], label_masks=masks[i])
+    single_ds = single.finalize()
+
+    batch = AdverseSelectionDatasetWriter(AdverseSelectionDatasetWriterConfig(str(tmp_path/"batch"),("f",),("y",),_meta(),chunk_rows=2))
+    assert batch.append_many(decision_local_ts_us=ts, decision_event_index=idx, decision_event_seq=seq, features=features, labels=labels, label_masks=masks) == (0, 3)
+    batch_ds = batch.finalize()
+
+    np.testing.assert_array_equal(batch_ds.arrays.decision_local_ts_us, single_ds.arrays.decision_local_ts_us)
+    np.testing.assert_array_equal(batch_ds.arrays.decision_event_index, single_ds.arrays.decision_event_index)
+    np.testing.assert_array_equal(batch_ds.arrays.decision_event_seq, single_ds.arrays.decision_event_seq)
+    np.testing.assert_allclose(batch_ds.arrays.features, single_ds.arrays.features)
+    np.testing.assert_allclose(batch_ds.arrays.labels, single_ds.arrays.labels)
+    np.testing.assert_array_equal(batch_ds.arrays.label_masks, single_ds.arrays.label_masks)
+
+
 def test_adverse_dataset_manifest_written_last(tmp_path):
     root=tmp_path/"ds"
     w=AdverseSelectionDatasetWriter(AdverseSelectionDatasetWriterConfig(str(root),("f",),("y",),_meta()))

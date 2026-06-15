@@ -2,6 +2,7 @@ import inspect
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 pytest.importorskip("pyarrow")
@@ -36,6 +37,13 @@ def row(i, *, local_ts_us=None, ts_us=None):
         label_values=label_values(),
         feature_values=feature_values(),
     )
+
+
+def _read_manifest_column(root, manifest, column):
+    out = []
+    for segment in manifest.segments:
+        out.extend(pq.read_table(root / segment.parquet_path, columns=[column]).column(column).to_pylist())
+    return out
 
 
 def test_public_api_boundary():
@@ -141,6 +149,45 @@ def test_writer_chunks_multiple_segments(tmp_path):
     last = m.segments[-1]
     assert last.time_range.end_us == last.time_range.start_us + 1
     assert last.local_time_range.end_us == last.local_time_range.start_us + 1
+
+
+def test_append_many_matches_single_row_writer_across_chunks(tmp_path):
+    rows = [row(i) for i in range(5)]
+    single_root = tmp_path / "single"
+    batch_root = tmp_path / "batch"
+    single = wr.DecisionRowWriter(wr.WriterConfig(dataset_id="d", created_at_utc="2026", dataset_root=str(single_root), chunk_rows=2))
+    for r in rows:
+        single.append(r)
+    single_manifest = single.finalize()
+
+    batch = wr.DecisionRowWriter(wr.WriterConfig(dataset_id="d", created_at_utc="2026", dataset_root=str(batch_root), chunk_rows=2))
+    start, end = batch.append_many(
+        decision_index=np.asarray([r.decision_index for r in rows], dtype=np.int64),
+        ts_us=np.asarray([r.ts_us for r in rows], dtype=np.int64),
+        local_ts_us=np.asarray([r.local_ts_us for r in rows], dtype=np.int64),
+        event_seq=np.asarray([r.event_seq for r in rows], dtype=np.int64),
+        raw_mid=np.asarray([r.raw_mid for r in rows], dtype=np.float64),
+        label_entry_ts_us=np.asarray([r.label_entry_ts_us for r in rows], dtype=np.int64),
+        label_values=np.asarray([r.label_values for r in rows], dtype=np.float64),
+        feature_values=np.asarray([r.feature_values for r in rows], dtype=np.float64),
+    )
+    batch_manifest = batch.finalize()
+
+    assert (start, end) == (0, len(rows))
+    assert [s.row_count for s in batch_manifest.segments] == [2, 2, 1]
+    assert [s.row_count for s in batch_manifest.segments] == [s.row_count for s in single_manifest.segments]
+    for column in (
+        mf.ROW_IDX_COLUMN,
+        mf.DECISION_INDEX_COLUMN,
+        mf.TS_US_COLUMN,
+        mf.LOCAL_TS_US_COLUMN,
+        mf.EVENT_SEQ_COLUMN,
+        mf.RAW_MID_COLUMN,
+        mf.LABEL_ENTRY_TS_US_COLUMN,
+        single_manifest.label_columns[0],
+        mf.feature_columns()[0],
+    ):
+        assert _read_manifest_column(batch_root, batch_manifest, column) == _read_manifest_column(single_root, single_manifest, column)
 
 
 def test_flush_empty_is_noop(tmp_path):

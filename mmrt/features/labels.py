@@ -23,6 +23,7 @@ DEFAULT_PRICE_HISTORY_CAPACITY = 1_000_000
 COMPACT_MIN_START = 4096
 COMPACT_FRACTION = 0.5
 FLOAT_EPS = 1e-12
+EVENT_KEY_DTYPE = np.dtype([("local_ts_us", "<i8"), ("event_seq", "<i8")])
 
 
 def _require_int_us(value: int, name: str, *, positive: bool = False, allow_zero: bool = True) -> int:
@@ -338,9 +339,18 @@ def _validate_key_order(local_ts: np.ndarray, event_seq: np.ndarray, name: str) 
         raise ValueError(f"{name} keys must be strictly increasing by (local_ts_us, event_seq)")
 
 
-def _composite_keys(local_ts: np.ndarray, event_seq: np.ndarray) -> list[int]:
-    scale = MAX_EVENT_SEQ + 1
-    return [int(ts) * scale + int(seq) for ts, seq in zip(local_ts, event_seq, strict=True)]
+def _composite_keys(local_ts: np.ndarray, event_seq: np.ndarray) -> np.ndarray:
+    keys = np.empty(local_ts.shape[0], dtype=EVENT_KEY_DTYPE)
+    keys["local_ts_us"] = local_ts
+    keys["event_seq"] = event_seq
+    return keys
+
+
+def _timestamp_keys(local_ts: np.ndarray, event_seq: int) -> np.ndarray:
+    keys = np.empty(local_ts.shape[0], dtype=EVENT_KEY_DTYPE)
+    keys["local_ts_us"] = local_ts
+    keys["event_seq"] = event_seq
+    return keys
 
 
 def build_labels_from_price_event_arrays(
@@ -375,29 +385,28 @@ def build_labels_from_price_event_arrays(
         return labels, valid
 
     price_keys = _composite_keys(pts, pseq)
-    scale = MAX_EVENT_SEQ + 1
-    for i in range(n):
-        entry_ts = int(dec[i]) + int(spec.entry_delay_us)
-        if spec.entry_delay_us == 0:
-            entry_key = int(dec[i]) * scale + int(dseq[i])
-        else:
-            entry_key = entry_ts * scale + MAX_EVENT_SEQ
-        entry_idx = bisect.bisect_right(price_keys, entry_key) - 1
-        if entry_idx < 0:
-            continue
-        entry_price = pval[entry_idx]
-        vals: list[float] = []
-        ok = True
-        for horizon in spec.horizons_us:
-            exit_key = (entry_ts + int(horizon)) * scale + MAX_EVENT_SEQ
-            exit_idx = bisect.bisect_right(price_keys, exit_key) - 1
-            if exit_idx < 0 or int(pts[-1]) < entry_ts + int(horizon):
-                ok = False
-                break
-            vals.append(_safe_log_return_bps(float(pval[exit_idx]), float(entry_price)))
-        if ok:
-            labels[i, :] = vals
-            valid[i] = True
+    entry_ts = dec + int(spec.entry_delay_us)
+    if spec.entry_delay_us == 0:
+        entry_keys = _composite_keys(dec, dseq)
+    else:
+        entry_keys = _timestamp_keys(entry_ts, MAX_EVENT_SEQ)
+    entry_idx = np.searchsorted(price_keys, entry_keys, side="right") - 1
+    valid_all = entry_idx >= 0
+    exit_indices: list[np.ndarray] = []
+    for horizon in spec.horizons_us:
+        exit_ts = entry_ts + int(horizon)
+        exit_idx = np.searchsorted(price_keys, _timestamp_keys(exit_ts, MAX_EVENT_SEQ), side="right") - 1
+        exit_indices.append(exit_idx)
+        valid_all &= (exit_idx >= 0) & (int(pts[-1]) >= exit_ts)
+
+    valid_rows = np.nonzero(valid_all)[0]
+    for i in valid_rows:
+        entry_price = float(pval[int(entry_idx[i])])
+        labels[i, :] = [
+            _safe_log_return_bps(float(pval[int(exit_idx[i])]), entry_price)
+            for exit_idx in exit_indices
+        ]
+    valid[valid_rows] = True
     return labels, valid
 
 

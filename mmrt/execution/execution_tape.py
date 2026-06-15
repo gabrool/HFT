@@ -523,9 +523,43 @@ def book_snapshot_to_depth_rows(
     *,
     book_depth: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    depth = _require_positive_int(book_depth, "book_depth")
+    bid_ticks = np.zeros((depth,), dtype=np.int64)
+    ask_ticks = np.zeros((depth,), dtype=np.int64)
+    bid_sizes = np.zeros((depth,), dtype=np.float32)
+    ask_sizes = np.zeros((depth,), dtype=np.float32)
+    book_snapshot_to_depth_rows_into(
+        event,
+        book_depth=depth,
+        bid_ticks=bid_ticks,
+        bid_sizes=bid_sizes,
+        ask_ticks=ask_ticks,
+        ask_sizes=ask_sizes,
+    )
+    return bid_ticks, bid_sizes, ask_ticks, ask_sizes
+
+
+def book_snapshot_to_depth_rows_into(
+    event: ReconstructedL2Event,
+    *,
+    book_depth: int,
+    bid_ticks: np.ndarray,
+    bid_sizes: np.ndarray,
+    ask_ticks: np.ndarray,
+    ask_sizes: np.ndarray,
+) -> None:
     if not isinstance(event, ReconstructedL2Event):
         raise ValueError("event must be ReconstructedL2Event")
     depth = _require_positive_int(book_depth, "book_depth")
+    expected_shape = (depth,)
+    if bid_ticks.shape != expected_shape or ask_ticks.shape != expected_shape:
+        raise ValueError("book tick output rows must match book_depth")
+    if bid_sizes.shape != expected_shape or ask_sizes.shape != expected_shape:
+        raise ValueError("book size output rows must match book_depth")
+    if bid_ticks.dtype != np.dtype(np.int64) or ask_ticks.dtype != np.dtype(np.int64):
+        raise ValueError("book tick output rows must be int64")
+    if bid_sizes.dtype != np.dtype(np.float32) or ask_sizes.dtype != np.dtype(np.float32):
+        raise ValueError("book size output rows must be float32")
     snapshot = event.book_snapshot
     if snapshot is None:
         raise ValueError("execution tape requires every L2 event to include book_snapshot")
@@ -534,10 +568,10 @@ def book_snapshot_to_depth_rows(
     if len(snapshot.bid_ticks) > depth or len(snapshot.ask_ticks) > depth:
         raise ValueError("book_snapshot depth exceeds tape book_depth")
 
-    bid_ticks = np.zeros((depth,), dtype=np.int64)
-    ask_ticks = np.zeros((depth,), dtype=np.int64)
-    bid_sizes = np.zeros((depth,), dtype=np.float32)
-    ask_sizes = np.zeros((depth,), dtype=np.float32)
+    bid_ticks.fill(0)
+    ask_ticks.fill(0)
+    bid_sizes.fill(0.0)
+    ask_sizes.fill(0.0)
     bid_count = len(snapshot.bid_ticks)
     ask_count = len(snapshot.ask_ticks)
     if bid_count:
@@ -546,7 +580,6 @@ def book_snapshot_to_depth_rows(
     if ask_count:
         ask_ticks[:ask_count] = snapshot.ask_ticks
         ask_sizes[:ask_count] = snapshot.ask_sizes
-    return bid_ticks, bid_sizes, ask_ticks, ask_sizes
 
 
 def trade_print_to_array_row(trade: TradePrint) -> tuple:
@@ -647,7 +680,14 @@ def _build_book_snapshot_arrays(
     ask_sizes = np.zeros((n, depth), dtype=np.float32)
 
     for i, event in enumerate(l2_events):
-        bid_ticks[i], bid_sizes[i], ask_ticks[i], ask_sizes[i] = book_snapshot_to_depth_rows(event, book_depth=depth)
+        book_snapshot_to_depth_rows_into(
+            event,
+            book_depth=depth,
+            bid_ticks=bid_ticks[i],
+            bid_sizes=bid_sizes[i],
+            ask_ticks=ask_ticks[i],
+            ask_sizes=ask_sizes[i],
+        )
 
     _validate_book_depth_arrays_full(bid_ticks, bid_sizes, ask_ticks, ask_sizes, num_l2_events=n)
     return bid_ticks, bid_sizes, ask_ticks, ask_sizes
@@ -882,6 +922,7 @@ __all__ = [
     "l2_event_to_array_row",
     "trade_print_to_array_row",
     "book_snapshot_to_depth_rows",
+    "book_snapshot_to_depth_rows_into",
     "merged_event_to_array_row",
     "execution_tape_manifest_to_dict",
     "execution_tape_manifest_from_dict",

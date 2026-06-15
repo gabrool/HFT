@@ -149,6 +149,11 @@ class _DecisionGridWriters:
             "l2_events_since_prev_decision": NpyChunkWriter("l2_events_since_prev_decision", np.int64, (), chunk_rows, self.chunk_dir),
             "trade_events_since_prev_decision": NpyChunkWriter("trade_events_since_prev_decision", np.int64, (), chunk_rows, self.chunk_dir),
         }
+        self._buffer = {
+            name: np.empty((chunk_rows,), dtype=writer.dtype)
+            for name, writer in self.writers.items()
+        }
+        self._buffer_used = 0
 
     def append(
         self,
@@ -164,22 +169,34 @@ class _DecisionGridWriters:
         l2_events_since_prev_decision: int,
         trade_events_since_prev_decision: int,
     ) -> None:
-        self.writers["decision_event_index"].append(decision_event_index)
-        self.writers["decision_local_ts_us"].append(decision_local_ts_us)
-        self.writers["decision_event_seq"].append(decision_event_seq)
-        self.writers["book_ptr"].append(book_ptr)
-        self.writers["reason_code"].append(reason_code)
-        self.writers["reason_flags"].append(reason_flags)
-        self.writers["elapsed_since_prev_decision_us"].append(elapsed_since_prev_decision_us)
-        self.writers["events_since_prev_decision"].append(events_since_prev_decision)
-        self.writers["l2_events_since_prev_decision"].append(l2_events_since_prev_decision)
-        self.writers["trade_events_since_prev_decision"].append(trade_events_since_prev_decision)
+        if self._buffer_used >= len(self._buffer["decision_event_index"]):
+            self.flush()
+        i = self._buffer_used
+        self._buffer["decision_event_index"][i] = decision_event_index
+        self._buffer["decision_local_ts_us"][i] = decision_local_ts_us
+        self._buffer["decision_event_seq"][i] = decision_event_seq
+        self._buffer["book_ptr"][i] = book_ptr
+        self._buffer["reason_code"][i] = reason_code
+        self._buffer["reason_flags"][i] = reason_flags
+        self._buffer["elapsed_since_prev_decision_us"][i] = elapsed_since_prev_decision_us
+        self._buffer["events_since_prev_decision"][i] = events_since_prev_decision
+        self._buffer["l2_events_since_prev_decision"][i] = l2_events_since_prev_decision
+        self._buffer["trade_events_since_prev_decision"][i] = trade_events_since_prev_decision
+        self._buffer_used += 1
+
+    def flush(self) -> None:
+        if self._buffer_used == 0:
+            return
+        for name, writer in self.writers.items():
+            writer.append_many(self._buffer[name][: self._buffer_used])
+        self._buffer_used = 0
 
     @property
     def total_rows(self) -> int:
-        return self.writers["decision_event_index"].total_rows
+        return self.writers["decision_event_index"].total_rows + self._buffer_used
 
     def finalize_arrays(self) -> dict[str, np.ndarray]:
+        self.flush()
         row_counts = {name: writer.finalize(self.arrays_dir / f"{name}.npy") for name, writer in self.writers.items()}
         if len(set(row_counts.values())) != 1:
             raise RuntimeError("decision grid chunk row count mismatch")

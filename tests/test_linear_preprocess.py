@@ -116,6 +116,22 @@ def test_running_stats_matches_numpy_multiple_batches():
     np.testing.assert_allclose(stats.variance(), X.var(axis=0, ddof=1))
 
 
+def test_running_stats_reuses_centered_scratch_for_matching_batches():
+    first = np.array([[1.0, 2.0], [2.0, 4.0]], dtype=np.float64)
+    second = np.array([[3.0, 8.0], [6.0, 16.0]], dtype=np.float64)
+    stats = pp.RunningFeatureStats.empty(2)
+
+    stats.update(first)
+    scratch = stats._centered_scratch
+    assert scratch is not None
+
+    stats.update(second)
+    assert stats._centered_scratch is scratch
+    expected = np.vstack([first, second])
+    np.testing.assert_allclose(stats.mean, expected.mean(axis=0))
+    np.testing.assert_allclose(stats.variance(), expected.var(axis=0, ddof=1))
+
+
 def test_running_stats_validation():
     with pytest.raises(ValueError):
         pp.RunningFeatureStats.empty(0)

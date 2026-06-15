@@ -269,6 +269,32 @@ class AdverseSelectionDatasetWriter:
         self._rows += 1
         return row_index
 
+    def append_many(self, *, decision_local_ts_us, decision_event_index, decision_event_seq, features, labels, label_masks) -> tuple[int, int]:
+        ts = np.asarray(decision_local_ts_us, dtype=np.int64)
+        idx = np.asarray(decision_event_index, dtype=np.int64)
+        seq = np.asarray(decision_event_seq, dtype=np.int64)
+        f = np.asarray(features, dtype=np.float32)
+        y = np.asarray(labels, dtype=np.float32)
+        m = np.asarray(label_masks, dtype=np.bool_)
+        if ts.ndim != 1:
+            raise ValueError("decision_local_ts_us must be 1D")
+        n = int(ts.shape[0])
+        if idx.shape != (n,) or seq.shape != (n,):
+            raise ValueError("decision arrays length mismatch")
+        if f.shape != (n, len(self.config.feature_names)):
+            raise ValueError("features width mismatch")
+        if y.shape != (n, len(self.config.label_names)) or m.shape != y.shape:
+            raise ValueError("labels/masks width mismatch")
+        start = self._rows
+        self._writers["decision_local_ts_us"].append_many(ts)
+        self._writers["decision_event_index"].append_many(idx)
+        self._writers["decision_event_seq"].append_many(seq)
+        self._writers["features"].append_many(f)
+        self._writers["labels"].append_many(y)
+        self._writers["label_masks"].append_many(m)
+        self._rows += n
+        return start, self._rows
+
     def finalize(self) -> DiskBackedAdverseSelectionDataset:
         manifest_path = self.root / "manifest.json"
         manifest_path.unlink(missing_ok=True)

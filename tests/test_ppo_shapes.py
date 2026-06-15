@@ -10,6 +10,7 @@ from mmrt.rl.normalization import (
     RunningMeanStd,
     normalize_advantages,
 )
+from mmrt.rl import rollout as rollout_mod
 from mmrt.rl.ppo import (
     PPOConfig,
     compute_ppo_loss,
@@ -190,6 +191,20 @@ def test_compute_gae_shapes_and_terminal_mask():
     assert returns.shape == rewards.shape
     assert torch.allclose(advantages, torch.tensor([2.5, 1.5, 0.5]))
     assert torch.allclose(returns, advantages + values)
+
+
+def test_observation_to_tensor_can_reuse_output_buffer():
+    out = torch.empty(3, dtype=torch.float32)
+    result = rollout_mod._observation_to_tensor(
+        [1.0, 2.0, 3.0],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        obs_dim=3,
+        out=out,
+    )
+
+    assert result is out
+    assert torch.equal(out, torch.tensor([1.0, 2.0, 3.0]))
 
 
 def test_ppo_loss_and_update_shapes_and_stats():

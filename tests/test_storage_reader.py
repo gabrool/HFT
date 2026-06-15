@@ -294,6 +294,20 @@ def test_dataset_uses_manifest_files_only(tmp_path):
         r.dataset(segments=("missing",))
 
 
+def test_dataset_reuses_cached_arrow_dataset_for_same_segments(tmp_path):
+    root, _ = make_dataset(tmp_path, rows=5, chunk_rows=2)
+    r = rd.open_dataset(str(root))
+
+    all_segments = r.dataset()
+    same_all_segments = r.dataset()
+    first_segment = r.dataset(segments=("seg_000000",))
+    same_first_segment = r.dataset(segments=("seg_000000",))
+
+    assert same_all_segments is all_segments
+    assert same_first_segment is first_segment
+    assert first_segment is not all_segments
+
+
 def test_split_entries_and_read_split_table(tmp_path):
     root, m = make_dataset(tmp_path, rows=6, chunk_rows=3)
     splits = (

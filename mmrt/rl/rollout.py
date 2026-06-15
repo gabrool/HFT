@@ -72,12 +72,20 @@ def _observation_to_tensor(
     device: torch.device,
     dtype: torch.dtype,
     obs_dim: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     obs_dim = _require_positive_int(obs_dim, "obs_dim")
     dtype = _require_float_dtype(dtype, "dtype")
     tensor = torch.as_tensor(obs, device=device, dtype=dtype)
     if tuple(tensor.shape) != (obs_dim,):
         raise ValueError(f"observation shape must be ({obs_dim},)")
+    if out is not None:
+        if not isinstance(out, torch.Tensor):
+            raise TypeError("out must be a torch.Tensor")
+        if out.device != device or out.dtype != dtype or tuple(out.shape) != (obs_dim,):
+            raise ValueError("out must match observation device, dtype, and shape")
+        out.copy_(tensor)
+        return out
     return tensor.clone()
 
 
@@ -249,6 +257,7 @@ class RolloutCollector:
         self.dtype = config.dtype
 
         self._current_observation: Any | None = None
+        self._obs_scratch = torch.empty(self.policy.obs_dim, device=self.device, dtype=self.dtype)
         self._has_reset = False
         self.episode_count = 0
 
@@ -266,6 +275,7 @@ class RolloutCollector:
             device=self.device,
             dtype=self.dtype,
             obs_dim=self.policy.obs_dim,
+            out=self._obs_scratch,
         )
 
     def _normalize_obs_for_policy(self, obs: torch.Tensor, *, update: bool) -> torch.Tensor:
