@@ -1640,6 +1640,30 @@ def build_adverse_selection_dataset_to_disk(
     emitted = 0
     considered = 0
     kyle_samples = _DiskKyleSampleView(index.kyle_samples)
+    label_count = len(layout.label_names)
+    feature_count = len(feature_names)
+    batch_ts = np.empty(chunk_rows, dtype=np.int64)
+    batch_event_index = np.empty(chunk_rows, dtype=np.int64)
+    batch_event_seq = np.empty(chunk_rows, dtype=np.int64)
+    batch_features = np.empty((chunk_rows, feature_count), dtype=np.float32)
+    batch_labels = np.empty((chunk_rows, label_count), dtype=np.float32)
+    batch_masks = np.empty((chunk_rows, label_count), dtype=np.bool_)
+    batch_used = 0
+
+    def flush_batch() -> None:
+        nonlocal batch_used
+        if batch_used == 0:
+            return
+        writer.append_many(
+            decision_local_ts_us=batch_ts[:batch_used],
+            decision_event_index=batch_event_index[:batch_used],
+            decision_event_seq=batch_event_seq[:batch_used],
+            features=batch_features[:batch_used],
+            labels=batch_labels[:batch_used],
+            label_masks=batch_masks[:batch_used],
+        )
+        batch_used = 0
+
     for row in _iter_adverse_selection_feature_rows_for_decision_grid(
         tape,
         config=config,
@@ -1661,17 +1685,19 @@ def build_adverse_selection_dataset_to_disk(
         )
         if labels_info is not None:
             labels, masks = labels_info
-            writer.append(
-                decision_local_ts_us=row.decision_local_ts_us,
-                decision_event_index=row.decision_event_index,
-                decision_event_seq=row.decision_event_seq,
-                features=row.features,
-                labels=labels,
-                label_masks=masks,
-            )
+            batch_ts[batch_used] = row.decision_local_ts_us
+            batch_event_index[batch_used] = row.decision_event_index
+            batch_event_seq[batch_used] = row.decision_event_seq
+            batch_features[batch_used] = row.features
+            batch_labels[batch_used] = labels
+            batch_masks[batch_used] = masks
+            batch_used += 1
             emitted += 1
+            if batch_used >= chunk_rows:
+                flush_batch()
         if progress_interval is not None and considered % progress_interval == 0:
             print(f"adverse_dataset progress decision_grid_rows_considered={considered} rows_written={emitted}")
+    flush_batch()
     dataset = writer.finalize()
     if cleanup_work_dir:
         shutil.rmtree(index_root, ignore_errors=True)

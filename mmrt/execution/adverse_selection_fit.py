@@ -187,16 +187,21 @@ def fit_adverse_baselines_streaming(
             continue
         X = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
         Xz = (X - mean) / scale
-        aug = np.concatenate([np.ones((Xz.shape[0], 1), dtype=np.float64), Xz], axis=1)
         labels_chunk = np.asarray(dataset.arrays.labels[start:end][:, tidx], dtype=np.float64)
         for j in range(nt):
             m = train_masks[:, j]
             count = int(np.count_nonzero(m))
             if count == 0:
                 continue
-            rows = aug[m]
-            XtX[j] += rows.T @ rows
-            Xty[j] += rows.T @ labels_chunk[m, j]
+            rows = Xz[m]
+            y = labels_chunk[m, j]
+            row_sums = np.sum(rows, axis=0)
+            XtX[j, 0, 0] += count
+            XtX[j, 0, 1:] += row_sums
+            XtX[j, 1:, 0] += row_sums
+            XtX[j, 1:, 1:] += rows.T @ rows
+            Xty[j, 0] += float(np.sum(y))
+            Xty[j, 1:] += rows.T @ y
             train_valid[j] += count
 
     betas = np.zeros((nt, nf + 1), dtype=np.float64)
@@ -226,7 +231,8 @@ def fit_adverse_baselines_streaming(
             if not masks.any():
                 continue
             X = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
-            preds = (np.concatenate([np.ones((X.shape[0], 1), dtype=np.float64), (X - mean) / scale], axis=1) @ betas.T)
+            Xz = (X - mean) / scale
+            preds = Xz @ betas[:, 1:].T + betas[:, 0]
             labels_chunk = np.asarray(dataset.arrays.labels[start:end][:, tidx], dtype=np.float64)
             row_ids = np.arange(start, end)
             yield masks, preds, labels_chunk, row_ids < train_rows_total

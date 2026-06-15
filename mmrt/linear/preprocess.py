@@ -9,7 +9,7 @@ The preprocessor is intentionally shape-preserving: inactive near-constant
 features are retained and transformed to zero rather than dropped.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -98,6 +98,7 @@ class RunningFeatureStats:
     n_features: int
     mean: np.ndarray
     m2: np.ndarray
+    _centered_scratch: np.ndarray | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.n_rows, int) or self.n_rows < 0:
@@ -129,8 +130,10 @@ class RunningFeatureStats:
             return
         batch_n = Xc.shape[0]
         batch_mean = Xc.mean(axis=0)
-        centered = Xc - batch_mean
-        batch_m2 = np.sum(centered * centered, axis=0)
+        if self._centered_scratch is None or self._centered_scratch.shape != Xc.shape:
+            self._centered_scratch = np.empty_like(Xc, dtype=np.float64)
+        np.subtract(Xc, batch_mean, out=self._centered_scratch)
+        batch_m2 = np.einsum("ij,ij->j", self._centered_scratch, self._centered_scratch, optimize=True)
         total_n = self.n_rows + batch_n
         delta = batch_mean - self.mean
         new_mean = self.mean + delta * (batch_n / total_n)

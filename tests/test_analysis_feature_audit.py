@@ -172,6 +172,22 @@ def test_train_correlation_stats_rejects_invalid_feature_count():
         fa._StreamingTrainCorrelationStats.empty(0)
 
 
+def test_streaming_feature_stats_reuses_centered_scratch():
+    first = np.array([[1.0, 2.0], [3.0, 8.0]], dtype=np.float64)
+    second = np.array([[5.0, 4.0], [7.0, 16.0]], dtype=np.float64)
+    stats = fa._StreamingFeatureStats.empty(2)
+
+    stats.update(first)
+    scratch = stats._centered_scratch
+    assert scratch is not None
+
+    stats.update(second)
+    assert stats._centered_scratch is scratch
+    expected = np.vstack([first, second])
+    np.testing.assert_allclose(stats.mean, expected.mean(axis=0))
+    np.testing.assert_allclose(stats.variance(), expected.var(axis=0, ddof=1))
+
+
 def test_sampling_deterministic(tmp_path: Path):
     root = tmp_path / "deterministic"
     _write_feature_audit_ds(root, train_rows=100, val_rows=100)

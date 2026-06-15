@@ -8,7 +8,7 @@ train models, evaluate predictions, select model features, or mutate storage
 manifests.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import csv
 import json
@@ -200,6 +200,7 @@ class _StreamingFeatureStats:
     m2: np.ndarray
     min_value: np.ndarray
     max_value: np.ndarray
+    _centered_scratch: np.ndarray | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
     def empty(cls, n_features: int) -> "_StreamingFeatureStats":
@@ -222,8 +223,10 @@ class _StreamingFeatureStats:
 
         batch_n = int(arr.shape[0])
         batch_mean = arr.mean(0)
-        centered = arr - batch_mean
-        batch_m2 = np.sum(centered * centered, 0)
+        if self._centered_scratch is None or self._centered_scratch.shape != arr.shape:
+            self._centered_scratch = np.empty_like(arr, dtype=np.float64)
+        np.subtract(arr, batch_mean, out=self._centered_scratch)
+        batch_m2 = np.einsum("ij,ij->j", self._centered_scratch, self._centered_scratch, optimize=True)
 
         if self.n_rows == 0:
             self.mean = batch_mean

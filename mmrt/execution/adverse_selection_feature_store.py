@@ -115,6 +115,19 @@ class _FeatureWriter:
         f = np.asarray(features, dtype=np.float32)
         if f.shape != (len(self.feature_names),): raise ValueError("feature width mismatch")
         self.writers["decision_local_ts_us"].append(ts); self.writers["decision_event_index"].append(idx); self.writers["decision_event_seq"].append(seq); self.writers["features"].append(f); self.rows += 1
+    def append_many(self, ts, idx, seq, features) -> tuple[int, int]:
+        ts_arr = np.asarray(ts, dtype=np.int64)
+        idx_arr = np.asarray(idx, dtype=np.int64)
+        seq_arr = np.asarray(seq, dtype=np.int64)
+        f = np.asarray(features, dtype=np.float32)
+        if ts_arr.ndim != 1: raise ValueError("decision_local_ts_us must be 1D")
+        n = int(ts_arr.shape[0])
+        if idx_arr.shape != (n,) or seq_arr.shape != (n,): raise ValueError("decision arrays length mismatch")
+        if f.shape != (n, len(self.feature_names)): raise ValueError("feature width mismatch")
+        start = self.rows
+        self.writers["decision_local_ts_us"].append_many(ts_arr); self.writers["decision_event_index"].append_many(idx_arr); self.writers["decision_event_seq"].append_many(seq_arr); self.writers["features"].append_many(f)
+        self.rows += n
+        return start, self.rows
     def finalize(self) -> DiskBackedAdverseSelectionFeatureDataset:
         manifest_path = self.root / "manifest.json"; manifest_path.unlink(missing_ok=True)
         for name, writer in self.writers.items():
@@ -160,10 +173,35 @@ def build_adverse_selection_features_to_disk(tape: ExecutionTape, *, config: Adv
     manifest = tape.manifest
     writer = _FeatureWriter(root, feature_names, chunk_rows, overwrite, cleanup_chunks, {"exchange": manifest.exchange, "symbol": manifest.symbol, "tape_schema": manifest.schema, "tape_num_events": manifest.num_events, "tape_num_l2_batches": manifest.num_l2_batches, "tape_num_trades": manifest.num_trades, "tape_start_local_ts_us": manifest.start_local_ts_us, "tape_end_local_ts_us": manifest.end_local_ts_us, "decision_grid_schema": decision_grid.metadata.schema, "decision_grid_hash": decision_grid.decision_grid_hash, "decision_grid_n_rows": decision_grid.n_rows, "decision_schedule": decision_grid.decision_schedule, "config_json": json.dumps(_adverse_config_summary(config), sort_keys=True), "index_schema": index.manifest.schema, "index_manifest_sha256": adverse_selection_index_manifest_sha256(index.root), "index_root": str(index.root)})
     kyle_samples = _DiskKyleSampleView(index.kyle_samples)
+    batch_ts = np.empty(chunk_rows, dtype=np.int64)
+    batch_idx = np.empty(chunk_rows, dtype=np.int64)
+    batch_seq = np.empty(chunk_rows, dtype=np.int64)
+    batch_features = np.empty((chunk_rows, len(feature_names)), dtype=np.float32)
+    batch_used = 0
+
+    def flush_batch() -> None:
+        nonlocal batch_used
+        if batch_used == 0:
+            return
+        writer.append_many(
+            batch_ts[:batch_used],
+            batch_idx[:batch_used],
+            batch_seq[:batch_used],
+            batch_features[:batch_used],
+        )
+        batch_used = 0
+
     for emitted, row in enumerate(_iter_adverse_selection_feature_rows_for_decision_grid(tape, config=config, decision_grid=decision_grid, kyle_samples=kyle_samples), start=1):
-        writer.append(row.decision_local_ts_us, row.decision_event_index, row.decision_event_seq, row.features)
+        batch_ts[batch_used] = row.decision_local_ts_us
+        batch_idx[batch_used] = row.decision_event_index
+        batch_seq[batch_used] = row.decision_event_seq
+        batch_features[batch_used] = row.features
+        batch_used += 1
+        if batch_used >= chunk_rows:
+            flush_batch()
         if progress_interval and emitted % progress_interval == 0:
             print(f"adverse_features progress rows_written={emitted}/{decision_grid.n_rows}")
+    flush_batch()
     ds = writer.finalize()
     if cleanup_work_dir: shutil.rmtree(index_root, ignore_errors=True)
     return ds

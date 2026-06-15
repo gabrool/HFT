@@ -8,6 +8,7 @@ fit preprocessing, inspect row timing fields, evaluate metrics, or run
 training orchestration.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -284,10 +285,10 @@ class BaseLinearHead:
         if not np.isfinite(gb):
             raise ValueError("grad_b must be finite")
         total_w = gw + self.config.l2 * self.weights
-        full_grad = np.concatenate([total_w, np.array([gb], dtype=np.float64)])
-        clipped = _clip_gradient(full_grad, self.config.max_grad_norm)
-        self.weights -= self.config.learning_rate * clipped[:-1]
-        self.intercept -= self.config.learning_rate * float(clipped[-1])
+        grad_norm = math.sqrt(float(np.dot(total_w, total_w)) + gb * gb)
+        grad_scale = self.config.max_grad_norm / grad_norm if grad_norm > self.config.max_grad_norm else 1.0
+        self.weights -= self.config.learning_rate * total_w * grad_scale
+        self.intercept -= self.config.learning_rate * gb * grad_scale
         self.n_updates += 1
         self.n_rows_seen += n_rows
 
@@ -340,8 +341,9 @@ class DirectionLinearHead(BaseLinearHead):
         Xc = _coerce_matrix(X, n_features=len(self.feature_columns))
         scores = Xc @ self.weights + self.intercept
         p_up = _sigmoid(scores)
-        proba = np.column_stack([1.0 - p_up, p_up]).astype(self.config.dtype, copy=False)
-        proba = np.ascontiguousarray(proba)
+        proba = np.empty((p_up.shape[0], 2), dtype=self.config.dtype)
+        proba[:, 0] = 1.0 - p_up
+        proba[:, 1] = p_up
         if not np.isfinite(proba).all():
             raise ValueError("predict_proba produced non-finite values")
         return proba
@@ -381,7 +383,9 @@ class NoMoveLinearHead(BaseLinearHead):
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         p = _sigmoid(_coerce_matrix(X, n_features=len(self.feature_columns)) @ self.weights + self.intercept)
-        proba = np.ascontiguousarray(np.column_stack([1.0 - p, p]).astype(self.config.dtype, copy=False))
+        proba = np.empty((p.shape[0], 2), dtype=self.config.dtype)
+        proba[:, 0] = 1.0 - p
+        proba[:, 1] = p
         if not np.isfinite(proba).all():
             raise ValueError("predict_proba produced non-finite values")
         return proba

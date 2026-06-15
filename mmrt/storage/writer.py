@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import numpy as np
 
 from mmrt.config import PipelineConfig, default_config
 from mmrt.contracts import LabelSpec, StorageFormat, TimeRangeUS, TimeUnit
@@ -163,6 +164,34 @@ def _coerce_float_tuple(values, expected_len: int, name: str) -> tuple[float, ..
     return tuple(_require_finite_float(v, f"{name}[{i}]") for i, v in enumerate(vals))
 
 
+def _coerce_int_array(values, *, name: str, expected_len: int | None = None, min_value: int | None = None) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be a 1D array")
+    if expected_len is not None and arr.shape[0] != expected_len:
+        raise ValueError(f"{name} length mismatch")
+    if arr.dtype == np.dtype(bool) or arr.dtype.kind not in "iu":
+        raise ValueError(f"{name} must contain integers")
+    out = np.asarray(arr, dtype=np.int64)
+    if min_value is not None and np.any(out < min_value):
+        raise ValueError(f"{name} values must be >= {min_value}")
+    return out
+
+
+def _coerce_float_array(values, *, name: str, shape: tuple[int, ...], positive: bool = False) -> np.ndarray:
+    raw = np.asarray(values)
+    if raw.dtype == np.dtype(bool):
+        raise ValueError(f"{name} must contain finite floats")
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.shape != shape:
+        raise ValueError(f"{name} shape mismatch")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{name} must be finite")
+    if positive and np.any(arr <= 0.0):
+        raise ValueError(f"{name} must be > 0")
+    return arr
+
+
 class DecisionRowWriter:
     def __init__(self, config: WriterConfig) -> None:
         self.config = config
@@ -229,6 +258,84 @@ class DecisionRowWriter:
 
         if len(self._columns[mf.ROW_IDX_COLUMN]) >= self.config.chunk_rows:
             self.flush()
+
+    def append_many(
+        self,
+        *,
+        decision_index,
+        ts_us,
+        local_ts_us,
+        event_seq,
+        raw_mid,
+        label_entry_ts_us,
+        label_values,
+        feature_values,
+    ) -> tuple[int, int]:
+        if self._final_manifest is not None:
+            raise RuntimeError("writer already finalized")
+        decision_index_arr = _coerce_int_array(decision_index, name="decision_index", min_value=0)
+        n_rows = int(decision_index_arr.shape[0])
+        ts_us_arr = _coerce_int_array(ts_us, name="ts_us", expected_len=n_rows, min_value=1)
+        local_ts_us_arr = _coerce_int_array(local_ts_us, name="local_ts_us", expected_len=n_rows, min_value=1)
+        event_seq_arr = _coerce_int_array(event_seq, name="event_seq", expected_len=n_rows, min_value=-1)
+        label_entry_ts_us_arr = _coerce_int_array(label_entry_ts_us, name="label_entry_ts_us", expected_len=n_rows, min_value=1)
+        raw_mid_arr = _coerce_float_array(raw_mid, name="raw_mid", shape=(n_rows,), positive=True)
+        labels_arr = _coerce_float_array(label_values, name="label_values", shape=(n_rows, len(self.label_columns)))
+        features_arr = _coerce_float_array(feature_values, name="feature_values", shape=(n_rows, len(self.feature_columns)))
+        if np.any(label_entry_ts_us_arr < local_ts_us_arr):
+            raise ValueError("label_entry_ts_us must be >= local_ts_us")
+        if n_rows > 1:
+            if np.any(decision_index_arr[1:] <= decision_index_arr[:-1]):
+                raise ValueError("decision_index must be strictly increasing")
+            if np.any(local_ts_us_arr[1:] < local_ts_us_arr[:-1]):
+                raise ValueError("local_ts_us must be nondecreasing")
+        if self.previous_decision_index is not None and n_rows and decision_index_arr[0] <= self.previous_decision_index:
+            raise ValueError("decision_index must be strictly increasing")
+        if self.previous_local_ts_us is not None and n_rows and local_ts_us_arr[0] < self.previous_local_ts_us:
+            raise ValueError("local_ts_us must be nondecreasing")
+
+        start_row = self.next_row_idx
+        offset = 0
+        while offset < n_rows:
+            if len(self._columns[mf.ROW_IDX_COLUMN]) >= self.config.chunk_rows:
+                self.flush()
+            capacity = self.config.chunk_rows - len(self._columns[mf.ROW_IDX_COLUMN])
+            take = min(n_rows - offset, capacity)
+            stop = offset + take
+            row_start = self.next_row_idx
+            row_stop = row_start + take
+
+            self._columns[mf.ROW_IDX_COLUMN].extend(range(row_start, row_stop))
+            self._columns[mf.DECISION_INDEX_COLUMN].extend(decision_index_arr[offset:stop].tolist())
+            self._columns[mf.TS_US_COLUMN].extend(ts_us_arr[offset:stop].tolist())
+            self._columns[mf.LOCAL_TS_US_COLUMN].extend(local_ts_us_arr[offset:stop].tolist())
+            self._columns[mf.EVENT_SEQ_COLUMN].extend(event_seq_arr[offset:stop].tolist())
+            self._columns[mf.RAW_MID_COLUMN].extend(raw_mid_arr[offset:stop].tolist())
+            self._columns[mf.LABEL_ENTRY_TS_US_COLUMN].extend(label_entry_ts_us_arr[offset:stop].tolist())
+            for i, col in enumerate(self.label_columns):
+                self._columns[col].extend(labels_arr[offset:stop, i].tolist())
+            for i, col in enumerate(self.feature_columns):
+                self._columns[col].extend(features_arr[offset:stop, i].tolist())
+
+            chunk_ts = ts_us_arr[offset:stop]
+            chunk_local_ts = local_ts_us_arr[offset:stop]
+            self.segment_min_ts_us = int(chunk_ts.min()) if self.segment_min_ts_us is None else min(self.segment_min_ts_us, int(chunk_ts.min()))
+            self.segment_max_ts_us = int(chunk_ts.max()) if self.segment_max_ts_us is None else max(self.segment_max_ts_us, int(chunk_ts.max()))
+            self.segment_min_local_ts_us = int(chunk_local_ts.min()) if self.segment_min_local_ts_us is None else min(self.segment_min_local_ts_us, int(chunk_local_ts.min()))
+            self.segment_max_local_ts_us = int(chunk_local_ts.max()) if self.segment_max_local_ts_us is None else max(self.segment_max_local_ts_us, int(chunk_local_ts.max()))
+            if self.segment_first_row_idx is None:
+                self.segment_first_row_idx = row_start
+            self.segment_last_row_idx = row_stop - 1
+            self.next_row_idx = row_stop
+            offset = stop
+
+            if len(self._columns[mf.ROW_IDX_COLUMN]) >= self.config.chunk_rows:
+                self.flush()
+
+        if n_rows:
+            self.previous_decision_index = int(decision_index_arr[-1])
+            self.previous_local_ts_us = int(local_ts_us_arr[-1])
+        return start_row, self.next_row_idx
 
     def _validate_row(self, row: DecisionRow) -> _ValidatedRow:
         decision_index = _require_nonnegative_int(row.decision_index, "decision_index")

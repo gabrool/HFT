@@ -205,6 +205,11 @@ def test_gradient_clipping_keeps_params_finite():
     assert np.linalg.norm(delta) <= 0.11
 
 
+def test_gradient_clipping_avoids_temporary_concatenate():
+    source = inspect.getsource(lm.BaseLinearHead._apply_gradient)
+    assert "concatenate" not in source
+
+
 def test_l2_regularizes_weights_not_intercept_smoke():
     cfg = lm.LinearModelConfig(learning_rate=0.1, l2=1.0)
     head = lm.MagnitudeLinearHead(lm.MAGNITUDE_UP_HEAD, ("x",), cfg)
@@ -242,6 +247,11 @@ def test_bundle_predictions_and_validation():
         )
     with pytest.raises(ValueError, match="magnitude head"):
         lm.MagnitudeLinearHead("bad_head", ("a",))
+
+
+def test_predict_proba_avoids_column_stack_allocations():
+    assert "column_stack" not in inspect.getsource(lm.DirectionLinearHead.predict_proba)
+    assert "column_stack" not in inspect.getsource(lm.NoMoveLinearHead.predict_proba)
 
 
 def test_no_move_partial_fit_updates_and_reduces_loss():

@@ -114,6 +114,22 @@ def test_clip_and_drift_counts_as_drift_warning(tmp_path: Path):
     assert "drift_review:val" in out.warnings
 
 
+def test_streaming_matrix_stats_reuses_centered_scratch():
+    first = np.array([[1.0, 2.0], [3.0, 8.0]], dtype=np.float64)
+    second = np.array([[5.0, 4.0], [7.0, 16.0]], dtype=np.float64)
+    stats = pa._StreamingMatrixStats.empty(2)
+
+    stats.update(first)
+    scratch = stats._centered_scratch
+    assert scratch is not None
+
+    stats.update(second)
+    assert stats._centered_scratch is scratch
+    expected = np.vstack([first, second])
+    np.testing.assert_allclose(stats.mean, expected.mean(axis=0))
+    np.testing.assert_allclose(stats.variance(), expected.var(axis=0, ddof=1))
+
+
 def test_inactive_detection(tmp_path: Path):
     root = tmp_path / "inactive"
     _write_ds(root, constant=True)

@@ -7,7 +7,7 @@ build labels, create splits, train models, evaluate predictions, or mutate
 storage manifests.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import csv
 import json
@@ -135,6 +135,7 @@ class _StreamingMatrixStats:
     n_features: int
     mean: np.ndarray
     m2: np.ndarray
+    _centered_scratch: np.ndarray | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
     def empty(cls, n_features: int) -> "_StreamingMatrixStats":
@@ -160,8 +161,10 @@ class _StreamingMatrixStats:
 
         batch_n = int(arr.shape[0])
         batch_mean = np.mean(arr, axis=0)
-        centered = arr - batch_mean
-        batch_m2 = np.sum(centered * centered, axis=0)
+        if self._centered_scratch is None or self._centered_scratch.shape != arr.shape:
+            self._centered_scratch = np.empty_like(arr, dtype=np.float64)
+        np.subtract(arr, batch_mean, out=self._centered_scratch)
+        batch_m2 = np.einsum("ij,ij->j", self._centered_scratch, self._centered_scratch, optimize=True)
 
         total_n = self.n_rows + batch_n
         delta = batch_mean - self.mean

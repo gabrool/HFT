@@ -1,6 +1,9 @@
+import inspect
 import numpy as np
 
+import mmrt.execution.adverse_selection as adverse_mod
 from mmrt.execution.adverse_selection import build_adverse_selection_dataset_to_disk
+import mmrt.execution.adverse_selection_feature_store as feature_store_mod
 from tests.adverse_helpers import build_tiny_adverse_selection_dataset
 from tests.test_adverse_selection import _tape, _l2, _trade, _base_config, AggressorSide
 from tests.grid_helpers import decision_grid_for_tape
@@ -20,3 +23,13 @@ def test_build_adverse_selection_dataset_to_disk_matches_in_memory_dataset(tmp_p
     np.testing.assert_allclose(disk.arrays.features, mem.features, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(disk.arrays.labels, mem.labels, rtol=1e-6, atol=1e-6, equal_nan=True)
     np.testing.assert_array_equal(disk.arrays.label_masks, mem.label_masks)
+
+
+def test_adverse_disk_builders_use_batch_writer_hot_paths():
+    dataset_source = inspect.getsource(adverse_mod.build_adverse_selection_dataset_to_disk)
+    assert "writer.append_many(" in dataset_source
+    assert "writer.append(" not in dataset_source
+
+    feature_source = inspect.getsource(feature_store_mod.build_adverse_selection_features_to_disk)
+    assert "writer.append_many(" in feature_source
+    assert "writer.append(" not in feature_source
