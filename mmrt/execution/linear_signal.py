@@ -11,7 +11,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from mmrt.execution.contracts import LinearSignal
-from mmrt.execution.decision_grid import DecisionGrid
+from mmrt.execution.decision_grid import DecisionGrid, validate_decision_key_order
 from mmrt.features.schedule import decision_schedule_config_from_dict
 
 MAGNITUDE_INPUT_LOG1P_BPS = "log1p_bps"
@@ -400,16 +400,11 @@ class LinearSignalArtifact:
             raise ValueError("decision alignment arrays length must equal signal array rows")
         if self.metadata.n_rows != self.arrays.n_rows:
             raise ValueError("metadata.n_rows must equal signal array rows")
-        if (decision_event_index < 0).any():
-            raise ValueError("decision_event_index must be nonnegative")
-        if (decision_event_seq < 0).any():
-            raise ValueError("decision_event_seq must be nonnegative")
-        if (decision_local_ts_us <= 0).any():
-            raise ValueError("decision_local_ts_us must be positive")
-        if decision_event_index.shape[0] > 1 and (np.diff(decision_event_index) <= 0).any():
-            raise ValueError("decision_event_index must be strictly increasing")
-        if decision_local_ts_us.shape[0] > 1 and (np.diff(decision_local_ts_us) <= 0).any():
-            raise ValueError("decision_local_ts_us must be strictly increasing")
+        validate_decision_key_order(
+            decision_event_index=decision_event_index,
+            decision_local_ts_us=decision_local_ts_us,
+            decision_event_seq=decision_event_seq,
+        )
         if self.metadata.start_event_index != int(decision_event_index[0]):
             raise ValueError("metadata.start_event_index must equal first decision_event_index")
         object.__setattr__(self, "decision_event_index", decision_event_index)
@@ -510,29 +505,38 @@ def save_linear_signal_artifact_arrays(
 
     previous_event_index: int | None = None
     previous_local_ts_us: int | None = None
+    previous_event_seq: int | None = None
     for start in range(0, metadata.n_rows, validate_chunk_rows):
         end = min(start + validate_chunk_rows, metadata.n_rows)
         event_idx = np.asarray(decision_arrays["decision_event_index"][start:end], dtype=np.int64)
         local_ts = np.asarray(decision_arrays["decision_local_ts_us"][start:end], dtype=np.int64)
+        event_seq = np.asarray(decision_arrays["decision_event_seq"][start:end], dtype=np.int64)
         if (event_idx < 0).any():
             raise ValueError("decision_event_index must be nonnegative")
         if (local_ts <= 0).any():
             raise ValueError("decision_local_ts_us must be positive")
-        event_seq = np.asarray(decision_arrays["decision_event_seq"][start:end], dtype=np.int64)
         if (event_seq < 0).any():
             raise ValueError("decision_event_seq must be nonnegative")
         if start == 0 and metadata.start_event_index != int(event_idx[0]):
             raise ValueError("metadata.start_event_index must equal first decision_event_index")
         if previous_event_index is not None and int(event_idx[0]) <= previous_event_index:
             raise ValueError("decision_event_index must be strictly increasing")
-        if previous_local_ts_us is not None and int(local_ts[0]) <= previous_local_ts_us:
-            raise ValueError("decision_local_ts_us must be strictly increasing")
+        if previous_local_ts_us is not None:
+            if int(local_ts[0]) < previous_local_ts_us:
+                raise ValueError("decision_local_ts_us must be nondecreasing")
+            if int(local_ts[0]) == previous_local_ts_us and previous_event_seq is not None and int(event_seq[0]) <= previous_event_seq:
+                raise ValueError("decision event key must be strictly increasing")
         if event_idx.shape[0] > 1 and (np.diff(event_idx) <= 0).any():
             raise ValueError("decision_event_index must be strictly increasing")
-        if local_ts.shape[0] > 1 and (np.diff(local_ts) <= 0).any():
-            raise ValueError("decision_local_ts_us must be strictly increasing")
+        if local_ts.shape[0] > 1:
+            local_ts_diff = np.diff(local_ts)
+            if (local_ts_diff < 0).any():
+                raise ValueError("decision_local_ts_us must be nondecreasing")
+            if ((local_ts_diff == 0) & (np.diff(event_seq) <= 0)).any():
+                raise ValueError("decision event key must be strictly increasing")
         previous_event_index = int(event_idx[-1])
         previous_local_ts_us = int(local_ts[-1])
+        previous_event_seq = int(event_seq[-1])
 
         chunk = {name: np.asarray(signal_arrays[name][start:end]) for name in _LINEAR_SIGNAL_ARRAY_FIELDS}
         for name, arr in chunk.items():

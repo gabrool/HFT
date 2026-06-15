@@ -146,7 +146,9 @@ def test_build_execution_linear_feature_dataset_is_causal_and_aligned():
     dataset = _feature_dataset(tape)
     assert dataset.num_decisions > 1
     assert np.all(np.diff(dataset.decision_event_index) > 0)
-    assert np.all(np.diff(dataset.decision_local_ts_us) > 0)
+    ts_diff = np.diff(dataset.decision_local_ts_us)
+    assert np.all(ts_diff >= 0)
+    assert np.all((ts_diff > 0) | (np.diff(dataset.decision_event_seq) > 0))
     assert np.isfinite(dataset.features).all()
 
 

@@ -9,7 +9,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from mmrt.execution.adverse_selection import AdverseSelectionDataset, AdverseSelectionFeatureDataset
-from mmrt.execution.decision_grid import DecisionGrid
+from mmrt.execution.decision_grid import DecisionGrid, validate_decision_key_order
 
 ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_grid_v1"
 ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_grid_v1"
@@ -189,6 +189,11 @@ class AdverseSelectionSignalArtifact:
         n = arrays[0].shape[0]
         if any(a.shape[0] != n for a in arrays):
             raise ValueError("decision arrays must have same length")
+        validate_decision_key_order(
+            decision_event_index=arrays[1],
+            decision_local_ts_us=arrays[0],
+            decision_event_seq=arrays[2],
+        )
         names = _names_tuple(self.target_names, "target_names")
         if not isinstance(self.predictions, Mapping):
             raise ValueError("predictions must be a mapping")
@@ -329,10 +334,38 @@ def save_adverse_selection_signals_arrays(
             raise ValueError(f"pred_{target} must be rank-1 with length {n}")
         pred_arrays[target] = arr
 
+    previous_event_index: int | None = None
+    previous_local_ts_us: int | None = None
+    previous_event_seq: int | None = None
     for start in range(0, n, validate_chunk_rows):
         end = min(start + validate_chunk_rows, n)
-        for name, arr in decision_arrays.items():
-            np.asarray(arr[start:end], dtype=np.int64)
+        local_ts = np.asarray(decision_arrays["decision_local_ts_us"][start:end], dtype=np.int64)
+        event_idx = np.asarray(decision_arrays["decision_event_index"][start:end], dtype=np.int64)
+        event_seq = np.asarray(decision_arrays["decision_event_seq"][start:end], dtype=np.int64)
+        if (event_idx < 0).any():
+            raise ValueError("decision_event_index must be nonnegative")
+        if (local_ts <= 0).any():
+            raise ValueError("decision_local_ts_us must be positive")
+        if (event_seq < 0).any():
+            raise ValueError("decision_event_seq must be nonnegative")
+        if previous_event_index is not None and int(event_idx[0]) <= previous_event_index:
+            raise ValueError("decision_event_index must be strictly increasing")
+        if previous_local_ts_us is not None:
+            if int(local_ts[0]) < previous_local_ts_us:
+                raise ValueError("decision_local_ts_us must be nondecreasing")
+            if int(local_ts[0]) == previous_local_ts_us and previous_event_seq is not None and int(event_seq[0]) <= previous_event_seq:
+                raise ValueError("decision event key must be strictly increasing")
+        if event_idx.shape[0] > 1 and (np.diff(event_idx) <= 0).any():
+            raise ValueError("decision_event_index must be strictly increasing")
+        if local_ts.shape[0] > 1:
+            local_ts_diff = np.diff(local_ts)
+            if (local_ts_diff < 0).any():
+                raise ValueError("decision_local_ts_us must be nondecreasing")
+            if ((local_ts_diff == 0) & (np.diff(event_seq) <= 0)).any():
+                raise ValueError("decision event key must be strictly increasing")
+        previous_event_index = int(event_idx[-1])
+        previous_local_ts_us = int(local_ts[-1])
+        previous_event_seq = int(event_seq[-1])
         for target, arr in pred_arrays.items():
             chunk = np.asarray(arr[start:end], dtype=np.float32)
             if not np.isfinite(chunk).all():

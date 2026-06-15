@@ -12,15 +12,21 @@ def _book(schedule, ts, *, bid=100.0, ask=100.1, bid_sz=1.0, ask_sz=1.0):
 
 
 def test_schedule_config_validation():
+    cfg = DecisionScheduleConfig(min_decision_interval_us=0)
+    assert cfg.min_decision_interval_us == 0
+    assert cfg.l1_size_change_fraction == 0.0
     with pytest.raises(ValueError):
-        DecisionScheduleConfig(min_decision_interval_us=0)
+        DecisionScheduleConfig(min_decision_interval_us=-1)
+    with pytest.raises(ValueError):
+        DecisionScheduleConfig(max_decision_interval_us=0)
     with pytest.raises(ValueError):
         DecisionScheduleConfig(min_decision_interval_us=200, max_decision_interval_us=100)
     with pytest.raises(ValueError):
-        DecisionScheduleConfig(l1_size_change_fraction=0.0)
-    cfg = DecisionScheduleConfig()
-    assert cfg.min_decision_interval_us == 100_000
-    assert cfg.max_decision_interval_us == 500_000
+        DecisionScheduleConfig(l1_size_change_fraction=-0.1)
+    default = DecisionScheduleConfig()
+    assert default.min_decision_interval_us == 0
+    assert default.max_decision_interval_us == 500_000
+    assert default.l1_size_change_fraction == 0.0
 
 
 def test_schedule_payload_round_trip_and_strictness():
@@ -84,6 +90,25 @@ def test_trade_wake_arms_trigger():
     assert schedule.should_fire(1_200_000)
 
 
+def test_zero_min_trade_wake_fires_at_next_valid_book_event():
+    cfg = DecisionScheduleConfig(min_decision_interval_us=0, max_decision_interval_us=500_000)
+    schedule = DecisionSchedule(cfg)
+    _book(schedule, 1_000_000)
+    schedule.mark_decision(1_000_000)
+    schedule.observe_trade(1_000_000)
+    _book(schedule, 1_000_000)
+    assert schedule.should_fire(1_000_000)
+
+
+def test_zero_min_top_of_book_price_change_fires_immediately():
+    cfg = DecisionScheduleConfig(min_decision_interval_us=0, max_decision_interval_us=500_000)
+    schedule = DecisionSchedule(cfg)
+    _book(schedule, 1_000_000)
+    schedule.mark_decision(1_000_000)
+    _book(schedule, 1_000_000, bid=100.1, ask=100.2)
+    assert schedule.should_fire(1_000_000)
+
+
 def test_wake_on_trade_disabled():
     cfg = DecisionScheduleConfig(wake_on_trade=False)
     schedule = DecisionSchedule(cfg)
@@ -106,6 +131,19 @@ def test_l1_size_change_fraction_threshold():
     assert schedule.is_armed
 
 
+def test_zero_l1_size_change_fraction_requires_actual_size_change():
+    cfg = DecisionScheduleConfig(min_decision_interval_us=0, max_decision_interval_us=500_000, l1_size_change_fraction=0.0)
+    schedule = DecisionSchedule(cfg)
+    _book(schedule, 1_000_000, bid_sz=2.0, ask_sz=2.0)
+    schedule.mark_decision(1_000_000)
+    _book(schedule, 1_000_000, bid_sz=2.0, ask_sz=2.0)
+    assert not schedule.is_armed
+    assert not schedule.should_fire(1_000_000)
+    _book(schedule, 1_000_000, bid_sz=2.1, ask_sz=2.0)
+    assert schedule.is_armed
+    assert schedule.should_fire(1_000_000)
+
+
 def test_wake_on_top_of_book_disabled_still_heartbeats():
     cfg = DecisionScheduleConfig(
         min_decision_interval_us=100_000,
@@ -122,11 +160,12 @@ def test_wake_on_top_of_book_disabled_still_heartbeats():
     assert schedule.should_fire(1_300_000)
 
 
-def test_mark_decision_requires_strictly_increasing_ts():
+def test_mark_decision_allows_equal_ts_and_rejects_decreasing_ts():
     schedule = DecisionSchedule()
     schedule.mark_decision(1_000_000)
+    schedule.mark_decision(1_000_000)
     with pytest.raises(ValueError):
-        schedule.mark_decision(1_000_000)
+        schedule.mark_decision(999_999)
 
 
 def test_reset_restores_initial_state():
