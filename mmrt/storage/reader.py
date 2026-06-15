@@ -3,9 +3,9 @@ from pathlib import Path
 from typing import Iterator
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+import numpy as np
 
 from mmrt.contracts import SplitRole, TimeRangeUS
 from mmrt.storage import manifest as mf
@@ -265,35 +265,14 @@ class StorageDatasetReader:
         return tuple(sp for sp in self.manifest.splits if sp.role == role_enum)
 
     def read_split_table(self, role: SplitRole | str, columns: tuple[str, ...] | None = None) -> pa.Table:
-        entries = self.split_entries(role)
-        if not entries:
-            raise ValueError("no split entries for role")
-
-        if columns is None:
-            requested_cols = self.required_columns
-            read_cols = self.required_columns
-        else:
-            requested_cols = tuple(columns)
-            _ensure_columns_exist(requested_cols, self.required_columns)
-            read_cols = requested_cols
-            if mf.ROW_IDX_COLUMN not in read_cols:
-                read_cols = (mf.ROW_IDX_COLUMN,) + read_cols
-
-        read_cols = _unique_preserve_order(tuple(read_cols))
-
-        pieces: list[pa.Table] = []
-        for sp in entries:
-            table = self.read_segment_table(sp.segment_key, columns=read_cols)
-            mask = pc.and_(
-                pc.greater_equal(table[mf.ROW_IDX_COLUMN], sp.start_row),
-                pc.less(table[mf.ROW_IDX_COLUMN], sp.end_row),
-            )
-            filtered = table.filter(mask)
-            if columns is not None:
-                filtered = filtered.select(list(requested_cols))
-            pieces.append(filtered)
-
-        return pa.concat_tables(pieces) if len(pieces) > 1 else pieces[0]
+        requested_cols = self.required_columns if columns is None else tuple(columns)
+        _ensure_columns_exist(requested_cols, self.required_columns)
+        batches = list(self.iter_split_batches(role, columns=columns))
+        if batches:
+            return pa.Table.from_batches(batches)
+        dataset_schema = self.dataset().schema
+        fields = [dataset_schema.field(dataset_schema.get_field_index(name)) for name in requested_cols]
+        return pa.Table.from_batches([], schema=pa.schema(fields))
 
     def iter_split_batches(self, role: SplitRole | str, columns: tuple[str, ...] | None = None, batch_size: int | None = None) -> Iterator[pa.RecordBatch]:
         bs = self.config.batch_size if batch_size is None else _require_positive_int(batch_size, "batch_size")
@@ -341,39 +320,46 @@ class StorageDatasetReader:
             if pf.metadata is None or pf.metadata.num_rows != seg.row_count:
                 raise ValueError(f"row_count mismatch for segment {seg.segment_key}")
             min_cols = [mf.ROW_IDX_COLUMN, mf.DECISION_INDEX_COLUMN, mf.LOCAL_TS_US_COLUMN, mf.TS_US_COLUMN]
-            table = pq.read_table(path, columns=min_cols)
-            row_idx = table[mf.ROW_IDX_COLUMN].to_pylist()
-            decision = table[mf.DECISION_INDEX_COLUMN].to_pylist()
-            local_ts = table[mf.LOCAL_TS_US_COLUMN].to_pylist()
-            ts = table[mf.TS_US_COLUMN].to_pylist()
-            expected_rows = list(range(seg.first_row_idx, seg.last_row_idx + 1))
-            if row_idx != expected_rows:
-                raise ValueError(f"row_idx mismatch in segment {seg.segment_key}")
             if seg.first_row_idx != prev_last_row + 1:
                 raise ValueError("cross-segment row_idx discontinuity")
-            prev_last_row = seg.last_row_idx
-            for i in range(1, len(decision)):
-                if decision[i] <= decision[i - 1]:
+            next_row = seg.first_row_idx
+            rows_seen = 0
+            for batch in pf.iter_batches(columns=min_cols, batch_size=self.config.batch_size):
+                row_idx = np.asarray(batch.column(0).to_numpy(zero_copy_only=False), dtype=np.int64)
+                decision = np.asarray(batch.column(1).to_numpy(zero_copy_only=False), dtype=np.int64)
+                local_ts = np.asarray(batch.column(2).to_numpy(zero_copy_only=False), dtype=np.int64)
+                ts = np.asarray(batch.column(3).to_numpy(zero_copy_only=False), dtype=np.int64)
+                n = int(row_idx.size)
+                if not (decision.size == local_ts.size == ts.size == n):
+                    raise ValueError(f"row_count mismatch for segment {seg.segment_key}")
+                expected_rows = np.arange(next_row, next_row + n, dtype=np.int64)
+                if not np.array_equal(row_idx, expected_rows):
+                    raise ValueError(f"row_idx mismatch in segment {seg.segment_key}")
+                next_row += n
+                rows_seen += n
+                if decision.size > 1 and np.any(np.diff(decision) <= 0):
                     raise ValueError("decision_index must be strictly increasing")
-            if prev_last_decision_index is not None and decision and decision[0] <= prev_last_decision_index:
-                raise ValueError("decision_index must increase across segments")
-            if decision:
-                prev_last_decision_index = decision[-1]
-            for i in range(1, len(local_ts)):
-                if local_ts[i] < local_ts[i - 1]:
+                if prev_last_decision_index is not None and decision.size and int(decision[0]) <= prev_last_decision_index:
+                    raise ValueError("decision_index must increase across segments")
+                if decision.size:
+                    prev_last_decision_index = int(decision[-1])
+                if local_ts.size > 1 and np.any(np.diff(local_ts) < 0):
                     raise ValueError("local_ts_us must be nondecreasing")
-            if prev_last_local_ts is not None and local_ts and local_ts[0] < prev_last_local_ts:
-                raise ValueError("local_ts_us must be nondecreasing across segments")
-            if local_ts:
-                prev_last_local_ts = local_ts[-1]
-            if any(x <= 0 for x in ts):
-                raise ValueError("ts_us must be positive")
-            if any(x <= 0 for x in local_ts):
-                raise ValueError("local_ts_us must be positive")
-            if any(not (seg_meta.time_range.start_us <= x < seg_meta.time_range.end_us) for x in ts):
-                raise ValueError("ts_us out of segment time range")
-            if any(not (seg_meta.local_time_range.start_us <= x < seg_meta.local_time_range.end_us) for x in local_ts):
-                raise ValueError("local_ts_us out of segment local_time_range")
+                if prev_last_local_ts is not None and local_ts.size and int(local_ts[0]) < prev_last_local_ts:
+                    raise ValueError("local_ts_us must be nondecreasing across segments")
+                if local_ts.size:
+                    prev_last_local_ts = int(local_ts[-1])
+                if np.any(ts <= 0):
+                    raise ValueError("ts_us must be positive")
+                if np.any(local_ts <= 0):
+                    raise ValueError("local_ts_us must be positive")
+                if np.any((ts < seg_meta.time_range.start_us) | (ts >= seg_meta.time_range.end_us)):
+                    raise ValueError("ts_us out of segment time range")
+                if np.any((local_ts < seg_meta.local_time_range.start_us) | (local_ts >= seg_meta.local_time_range.end_us)):
+                    raise ValueError("local_ts_us out of segment local_time_range")
+            if rows_seen != seg.row_count:
+                raise ValueError(f"row_count mismatch for segment {seg.segment_key}")
+            prev_last_row = seg.last_row_idx
 
 
 def open_dataset(dataset_root: str, *, validate_on_open: bool = True, batch_size: int = DEFAULT_BATCH_SIZE) -> StorageDatasetReader:
