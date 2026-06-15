@@ -1,9 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-import bisect
 
-import pyarrow as pa
+import numpy as np
 
 from mmrt.contracts import SplitRole, TimeRangeUS
 from mmrt.storage import manifest as mf
@@ -73,8 +72,8 @@ def _assert_nonoverlapping_entries(entries: tuple[mf.SplitMetadata, ...]) -> Non
             raise ValueError("split entries overlap in row space")
 
 
-def _lower_bound(values: list[int], target: int) -> int:
-    return bisect.bisect_left(values, target)
+def _lower_bound(values: np.ndarray, target: int) -> int:
+    return int(np.searchsorted(values, target, side="left"))
 
 
 def _unique_roles(entries: tuple[mf.SplitMetadata, ...]) -> tuple[SplitRole, ...]:
@@ -187,21 +186,37 @@ def chronological_windows(*, train: tuple[int, int], val: tuple[int, int], test:
 def build_split_plan(dataset_root: str, config: SplitConfig) -> SplitPlan:
     reader = open_dataset(dataset_root, validate_on_open=config.validate_dataset_on_open, batch_size=config.batch_size)
     purge_before, purge_after, embargo_before, embargo_after = _resolve_purge_embargo(reader, config)
-    table = reader.read_table(columns=(mf.ROW_IDX_COLUMN, mf.LOCAL_TS_US_COLUMN))
-    if not isinstance(table, pa.Table):
-        raise ValueError("reader.read_table must return pyarrow.Table")
-    row_idx = table[mf.ROW_IDX_COLUMN].to_pylist()
-    local_ts = table[mf.LOCAL_TS_US_COLUMN].to_pylist()
-    if len(row_idx) != reader.total_rows or len(local_ts) != reader.total_rows:
+    local_ts_chunks: list[np.ndarray] = []
+    next_row = 0
+    prev_local_ts: int | None = None
+    for batch in reader.iter_batches(
+        columns=(mf.ROW_IDX_COLUMN, mf.LOCAL_TS_US_COLUMN),
+        batch_size=config.batch_size,
+    ):
+        row_idx = np.asarray(batch.column(0).to_numpy(zero_copy_only=False), dtype=np.int64)
+        local_chunk = np.asarray(batch.column(1).to_numpy(zero_copy_only=False), dtype=np.int64)
+        if row_idx.shape != local_chunk.shape:
+            raise ValueError("row count mismatch")
+        expected = np.arange(next_row, next_row + row_idx.size, dtype=np.int64)
+        if not np.array_equal(row_idx, expected):
+            raise ValueError("row_idx must be contiguous from 0..total_rows-1")
+        if local_chunk.size:
+            if np.any(local_chunk <= 0):
+                raise ValueError("local_ts_us must be positive")
+            if np.any(np.diff(local_chunk) < 0):
+                raise ValueError("local_ts_us must be nondecreasing")
+            if prev_local_ts is not None and int(local_chunk[0]) < prev_local_ts:
+                raise ValueError("local_ts_us must be nondecreasing")
+            prev_local_ts = int(local_chunk[-1])
+            local_ts_chunks.append(local_chunk)
+        next_row += int(row_idx.size)
+    if next_row != reader.total_rows:
         raise ValueError("row count mismatch")
-    if row_idx != list(range(reader.total_rows)):
-        raise ValueError("row_idx must be contiguous from 0..total_rows-1")
-    prev: int | None = None
-    for i, ts in enumerate(local_ts):
-        _require_positive_int(ts, f"local_ts_us[{i}]")
-        if prev is not None and ts < prev:
-            raise ValueError("local_ts_us must be nondecreasing")
-        prev = ts
+    local_ts = (
+        np.concatenate(local_ts_chunks)
+        if local_ts_chunks
+        else np.empty(0, dtype=np.int64)
+    )
 
     entries: list[mf.SplitMetadata] = []
     for window in config.windows:
@@ -227,8 +242,8 @@ def build_split_plan(dataset_root: str, config: SplitConfig) -> SplitPlan:
             seg_end = min(end_pos, seg.last_row_idx + 1)
             if seg_end <= seg_start:
                 continue
-            entry_local_start = local_ts[seg_start]
-            entry_local_end = local_ts[seg_end - 1] + 1
+            entry_local_start = int(local_ts[seg_start])
+            entry_local_end = int(local_ts[seg_end - 1]) + 1
             if entry_local_start < effective_start or entry_local_end > effective_end:
                 raise ValueError("entry local_time_range outside effective window")
             entries.append(

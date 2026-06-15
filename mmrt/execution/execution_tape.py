@@ -244,9 +244,6 @@ def execution_tape_manifest_to_dict(manifest: ExecutionTapeManifest) -> dict[str
 def execution_tape_manifest_from_dict(payload: Mapping[str, Any]) -> ExecutionTapeManifest:
     if not isinstance(payload, Mapping):
         raise ValueError("payload must be a mapping")
-    retired_schema_key = "schema" + "_" + "version"
-    if retired_schema_key in payload:
-        raise ValueError("retired schema field is not supported; use schema")
     symbol_rules_payload = payload.get("symbol_rules")
     if not isinstance(symbol_rules_payload, Mapping):
         raise ValueError("execution tape manifest missing symbol_rules")

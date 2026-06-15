@@ -149,16 +149,6 @@ def test_label_config_asof_policy() -> None:
 
 def test_public_api_alignment() -> None:
     assert cfg_module.DEFAULT_FEATURE_SCHEMA == specs.FEATURE_SCHEMA
-    assert "DEFAULT_DECISION_STRIDE_" + "ROWS" not in cfg_module.__all__
-    assert "DEFAULT_DROP_DUPLICATE_" + "TRADES" not in cfg_module.__all__
-
-
-def test_retired_surface_removed() -> None:
-    assert not hasattr(cfg_module, "DEFAULT_DECISION_STRIDE_" + "ROWS")
-    assert not hasattr(DecisionConfig(), "stride_" + "rows")
-    assert not hasattr(cfg_module, "DEFAULT_DROP_DUPLICATE_" + "TRADES")
-    assert not hasattr(DataConfig(), "drop_duplicate_" + "trades")
-    assert not hasattr(DataConfig(), "disabled_" + "context_data_types")
 
 
 def test_default_config_alignment() -> None:

@@ -258,32 +258,34 @@ def iter_decision_feature_chunks_for_decision_grid(
     dtype = _require_output_dtype(output_dtype)
     pipeline = DecisionFeaturePipeline(pipeline_config)
     names = decision_feature_column_names()
-    idx_buf: list[int] = []
-    ts_buf: list[int] = []
-    seq_buf: list[int] = []
-    feat_buf: list[np.ndarray] = []
+    idx_buf = np.empty(chunk_rows, dtype=np.int64)
+    ts_buf = np.empty(chunk_rows, dtype=np.int64)
+    seq_buf = np.empty(chunk_rows, dtype=np.int64)
+    feat_buf = np.empty((chunk_rows, len(names)), dtype=dtype)
+    used = 0
     for step in iter_tape_feature_steps_for_decision_grid(tape, decision_grid=decision_grid, pipeline=pipeline):
         if step.decision is None:
             continue
-        idx_buf.append(step.event_index)
-        ts_buf.append(step.decision.local_ts_us)
-        seq_buf.append(step.decision.event_seq)
-        feat_buf.append(np.asarray(step.decision.feature_values, dtype=dtype))
-        if len(feat_buf) >= chunk_rows:
+        idx_buf[used] = step.event_index
+        ts_buf[used] = step.decision.local_ts_us
+        seq_buf[used] = step.decision.event_seq
+        feat_buf[used, :] = np.asarray(step.decision.feature_values, dtype=dtype)
+        used += 1
+        if used >= chunk_rows:
             yield DecisionFeatureChunk(
-                np.asarray(idx_buf, dtype=np.int64),
-                np.asarray(ts_buf, dtype=np.int64),
-                np.asarray(seq_buf, dtype=np.int64),
-                np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype),
+                idx_buf.copy(),
+                ts_buf.copy(),
+                seq_buf.copy(),
+                feat_buf.copy(),
                 names,
             )
-            idx_buf.clear(); ts_buf.clear(); seq_buf.clear(); feat_buf.clear()
-    if feat_buf:
+            used = 0
+    if used:
         yield DecisionFeatureChunk(
-            np.asarray(idx_buf, dtype=np.int64),
-            np.asarray(ts_buf, dtype=np.int64),
-            np.asarray(seq_buf, dtype=np.int64),
-            np.ascontiguousarray(np.vstack(feat_buf), dtype=dtype),
+            idx_buf[:used].copy(),
+            ts_buf[:used].copy(),
+            seq_buf[:used].copy(),
+            feat_buf[:used].copy(),
             names,
         )
 
