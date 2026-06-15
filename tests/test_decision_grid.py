@@ -4,12 +4,17 @@ import shutil
 from uuid import uuid4
 
 import numpy as np
+import pytest
 
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, SymbolSpec, TradePrint
 from mmrt.execution.decision_grid import (
     DECISION_GRID_SCHEMA,
+    DECISION_GRID_ARRAY_ORDER,
+    DecisionGrid,
+    decision_grid_metadata_from_tape,
     load_decision_grid,
+    validate_decision_grid_integrity,
     validate_decision_grid_start_event_index,
     validate_decision_grid_for_execution_tape,
 )
@@ -24,7 +29,7 @@ from mmrt.features.schedule import (
 )
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.cli.build_decision_grid import BuildDecisionGridConfig, build_decision_grid_from_config
-from mmrt.cli.build_decision_grid import _DecisionGridWriters
+from mmrt.cli.build_decision_grid import _DecisionGridWriters, build_arg_parser
 
 
 def _workspace_tmp(name: str) -> Path:
@@ -112,6 +117,44 @@ def _tape():
     )
 
 
+def _grid_with_order_arrays(tape, *, local_ts, event_seq):
+    n = len(local_ts)
+    arrays = {
+        "decision_event_index": np.arange(n, dtype=np.int64),
+        "decision_local_ts_us": np.asarray(local_ts, dtype=np.int64),
+        "decision_event_seq": np.asarray(event_seq, dtype=np.int64),
+        "book_ptr": np.arange(n, dtype=np.int64),
+        "reason_code": np.ones(n, dtype=np.int16),
+        "reason_flags": np.ones(n, dtype=np.int16),
+        "elapsed_since_prev_decision_us": np.zeros(n, dtype=np.int64),
+        "events_since_prev_decision": np.zeros(n, dtype=np.int64),
+        "l2_events_since_prev_decision": np.zeros(n, dtype=np.int64),
+        "trade_events_since_prev_decision": np.zeros(n, dtype=np.int64),
+    }
+    metadata = decision_grid_metadata_from_tape(
+        tape,
+        schedule_config=BuildDecisionGridConfig(tape_root="unused").schedule_config(),
+        arrays={name: arrays[name] for name in DECISION_GRID_ARRAY_ORDER},
+        created_at_utc="2026-01-01T00:00:00Z",
+    )
+    return DecisionGrid(metadata=metadata, **arrays)
+
+
+def test_build_decision_grid_default_config_is_unthrottled_event_driven():
+    cfg = BuildDecisionGridConfig(tape_root="tape")
+    assert cfg.min_decision_interval_us == 0
+    assert cfg.max_decision_interval_us == 500_000
+    assert cfg.wake_on_trade is True
+    assert cfg.wake_on_top_of_book is True
+    assert cfg.l1_size_change_fraction == 0.0
+    args = build_arg_parser().parse_args(["--tape-root", "tape"])
+    assert args.min_decision_interval_us == 0
+    assert args.max_decision_interval_us == 500_000
+    assert args.wake_on_trade is True
+    assert args.wake_on_top_of_book is True
+    assert args.l1_size_change_fraction == 0.0
+
+
 def test_build_decision_grid_records_real_rows_hash_and_reasons():
     tmp_path = _workspace_tmp("reasons")
     tape = _tape()
@@ -169,6 +212,18 @@ def test_build_decision_grid_records_real_rows_hash_and_reasons():
         }
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_decision_grid_validation_accepts_same_local_ts_with_increasing_event_seq():
+    grid = _grid_with_order_arrays(_tape(), local_ts=[100, 100], event_seq=[10, 11])
+    validate_decision_grid_integrity(grid, mode="full")
+
+
+@pytest.mark.parametrize("event_seq", ([10, 10], [11, 10]))
+def test_decision_grid_validation_rejects_same_local_ts_without_increasing_event_seq(event_seq):
+    grid = _grid_with_order_arrays(_tape(), local_ts=[100, 100], event_seq=event_seq)
+    with pytest.raises(ValueError, match="decision event key must be strictly increasing"):
+        validate_decision_grid_integrity(grid, mode="full")
 
 
 def test_decision_grid_validation_rejects_tape_mismatch():

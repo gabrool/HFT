@@ -20,7 +20,7 @@ import numpy as np
 
 from mmrt.execution.execution_tape import ExecutionTape
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
-from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape, validate_decision_key_order
 from mmrt.execution.feature_replay import (
     DecisionFeatureChunk,
     decision_feature_column_names,
@@ -152,16 +152,11 @@ class ExecutionLinearFeatureDataset:
             raise ValueError("features dtype must be float32 or float64")
         if features.shape[0] != event_idx.shape[0] or features.shape[0] != local_ts.shape[0] or features.shape[0] != event_seq.shape[0]:
             raise ValueError("row count must match decision arrays")
-        if event_idx.size and (event_idx < 0).any():
-            raise ValueError("decision_event_index must be nonnegative")
-        if local_ts.size and (local_ts <= 0).any():
-            raise ValueError("decision_local_ts_us must be positive")
-        if event_seq.size and (event_seq < 0).any():
-            raise ValueError("decision_event_seq must be nonnegative")
-        if event_idx.size > 1 and (np.diff(event_idx) <= 0).any():
-            raise ValueError("decision_event_index must be strictly increasing")
-        if local_ts.size > 1 and (np.diff(local_ts) <= 0).any():
-            raise ValueError("decision_local_ts_us must be strictly increasing")
+        validate_decision_key_order(
+            decision_event_index=event_idx,
+            decision_local_ts_us=local_ts,
+            decision_event_seq=event_seq,
+        )
         if not np.isfinite(features).all():
             raise ValueError("features must be finite")
         names = _coerce_feature_names(tuple(self.feature_names))
@@ -483,8 +478,12 @@ class _StreamStats:
             raise ValueError("execution feature names changed during chunk replay")
         if self.last_decision_event_index is not None and int(dataset.decision_event_index[0]) <= self.last_decision_event_index:
             raise ValueError("decision_event_index must be strictly increasing across chunks")
-        if self.last_decision_local_ts_us is not None and int(dataset.decision_local_ts_us[0]) <= self.last_decision_local_ts_us:
-            raise ValueError("decision_local_ts_us must be strictly increasing across chunks")
+        if self.last_decision_local_ts_us is not None:
+            first_ts = int(dataset.decision_local_ts_us[0])
+            if first_ts < self.last_decision_local_ts_us:
+                raise ValueError("decision_local_ts_us must be nondecreasing across chunks")
+            if first_ts == self.last_decision_local_ts_us and int(dataset.decision_event_seq[0]) <= int(self.last_decision_event_seq):
+                raise ValueError("decision event key must be strictly increasing across chunks")
         if self.first_decision_event_index is None:
             self.first_decision_event_index = int(dataset.decision_event_index[0])
             self.first_decision_local_ts_us = int(dataset.decision_local_ts_us[0])

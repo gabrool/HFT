@@ -27,7 +27,7 @@ from mmrt.execution.contracts import (
     SymbolSpec,
     TradePrint,
 )
-from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
+from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape, validate_decision_key_order
 from mmrt.execution.execution_tape import (
     EVENT_TYPE_CODE_L2_BATCH,
     EVENT_TYPE_CODE_TRADE,
@@ -593,6 +593,11 @@ class AdverseSelectionDataset:
             raise ValueError("decision_event_seq length must match decisions")
         if len(self.decision_local_ts_us) != len(self.decision_event_index):
             raise ValueError("decision arrays must have same length")
+        validate_decision_key_order(
+            decision_event_index=self.decision_event_index,
+            decision_local_ts_us=self.decision_local_ts_us,
+            decision_event_seq=self.decision_event_seq,
+        )
         if self.features.ndim != 2 or self.features.dtype != np.float32:
             raise ValueError("features must be rank-2 float32")
         if self.labels.ndim != 2 or self.labels.dtype != np.float32:
@@ -665,6 +670,11 @@ class AdverseSelectionFeatureDataset:
             raise ValueError("decision_event_seq length must match decisions")
         if len(self.decision_local_ts_us) != len(self.decision_event_index):
             raise ValueError("decision arrays must have same length")
+        validate_decision_key_order(
+            decision_event_index=self.decision_event_index,
+            decision_local_ts_us=self.decision_local_ts_us,
+            decision_event_seq=self.decision_event_seq,
+        )
         if self.features.ndim != 2 or self.features.dtype != np.float32:
             raise ValueError("features must be rank-2 float32")
         if self.features.shape[0] != len(self.decision_local_ts_us):

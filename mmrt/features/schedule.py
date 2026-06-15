@@ -27,24 +27,30 @@ def _require_positive_int(value: int, name: str) -> int:
     return value
 
 
+def _require_nonnegative_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a nonnegative int")
+    return value
+
+
 def _require_bool(value: bool, name: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{name} must be bool")
     return value
 
 
-def _require_positive_float(value: float, name: str) -> float:
+def _require_nonnegative_float(value: float, name: str) -> float:
     if isinstance(value, bool):
-        raise ValueError(f"{name} must be a positive finite float")
+        raise ValueError(f"{name} must be a nonnegative finite float")
     out = float(value)
-    if not math.isfinite(out) or out <= 0.0:
-        raise ValueError(f"{name} must be a positive finite float")
+    if not math.isfinite(out) or out < 0.0:
+        raise ValueError(f"{name} must be a nonnegative finite float")
     return out
 
 
-DEFAULT_MIN_DECISION_INTERVAL_US = 100_000
+DEFAULT_MIN_DECISION_INTERVAL_US = 0
 DEFAULT_MAX_DECISION_INTERVAL_US = 500_000
-DEFAULT_L1_SIZE_CHANGE_FRACTION = 0.5
+DEFAULT_L1_SIZE_CHANGE_FRACTION = 0.0
 
 DECISION_REASON_NONE = 0
 DECISION_REASON_FIRST_VALID_BOOK = 1
@@ -83,7 +89,7 @@ class DecisionScheduleConfig:
     l1_size_change_fraction: float = DEFAULT_L1_SIZE_CHANGE_FRACTION
 
     def __post_init__(self) -> None:
-        _require_positive_int(self.min_decision_interval_us, "min_decision_interval_us")
+        _require_nonnegative_int(self.min_decision_interval_us, "min_decision_interval_us")
         _require_positive_int(self.max_decision_interval_us, "max_decision_interval_us")
         if self.max_decision_interval_us < self.min_decision_interval_us:
             raise ValueError("max_decision_interval_us must be >= min_decision_interval_us")
@@ -92,7 +98,7 @@ class DecisionScheduleConfig:
         object.__setattr__(
             self,
             "l1_size_change_fraction",
-            _require_positive_float(self.l1_size_change_fraction, "l1_size_change_fraction"),
+            _require_nonnegative_float(self.l1_size_change_fraction, "l1_size_change_fraction"),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -227,6 +233,10 @@ class DecisionSchedule:
     def _l1_size_changed(self, size: float, prev: float | None) -> bool:
         if prev is None:
             return True
+        if size == prev:
+            return False
+        if self.config.l1_size_change_fraction == 0.0:
+            return True
         reference = max(abs(prev), 1e-12)
         return abs(size - prev) / reference >= self.config.l1_size_change_fraction
 
@@ -274,8 +284,8 @@ class DecisionSchedule:
 
     def mark_decision(self, local_ts_us: int) -> None:
         _require_positive_int(local_ts_us, "local_ts_us")
-        if self._last_decision_local_ts_us is not None and local_ts_us <= self._last_decision_local_ts_us:
-            raise ValueError("decision local_ts_us must be strictly increasing")
+        if self._last_decision_local_ts_us is not None and local_ts_us < self._last_decision_local_ts_us:
+            raise ValueError("decision local_ts_us must be nondecreasing")
         self._last_decision_local_ts_us = local_ts_us
         self._trade_armed = False
         self._top_of_book_armed = False

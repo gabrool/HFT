@@ -124,6 +124,36 @@ def _coerce_grid_array(values: Any, name: str) -> np.ndarray:
     return arr.astype(dtype, copy=False)
 
 
+def validate_decision_key_order(
+    *,
+    decision_event_index: np.ndarray,
+    decision_local_ts_us: np.ndarray,
+    decision_event_seq: np.ndarray,
+) -> None:
+    """Validate persisted decision rows by tape order and event key order."""
+
+    idx = _coerce_grid_array(decision_event_index, "decision_event_index")
+    ts = _coerce_grid_array(decision_local_ts_us, "decision_local_ts_us")
+    seq = _coerce_grid_array(decision_event_seq, "decision_event_seq")
+    if idx.shape != ts.shape or idx.shape != seq.shape:
+        raise ValueError("decision key arrays must have matching shapes")
+    if (idx < 0).any() or (seq < 0).any():
+        raise ValueError("decision event key arrays must be nonnegative")
+    if (ts <= 0).any():
+        raise ValueError("decision_local_ts_us must be positive")
+    if idx.shape[0] <= 1:
+        return
+    idx_diff = np.diff(idx)
+    if (idx_diff <= 0).any():
+        raise ValueError("decision_event_index must be strictly increasing")
+    ts_diff = np.diff(ts)
+    if (ts_diff < 0).any():
+        raise ValueError("decision_local_ts_us must be nondecreasing")
+    seq_diff = np.diff(seq)
+    if ((ts_diff == 0) & (seq_diff <= 0)).any():
+        raise ValueError("decision event key must be strictly increasing")
+
+
 def _metadata_without_hash_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(metadata)
     out.pop("created_at_utc", None)
@@ -541,15 +571,13 @@ def validate_decision_grid_integrity(
     ts = grid.decision_local_ts_us
     seq = grid.decision_event_seq
     bp = grid.book_ptr
-    if (idx < 0).any() or (bp < 0).any() or (seq < 0).any():
+    if (bp < 0).any():
         raise ValueError("decision grid row pointers must be nonnegative")
-    if (ts <= 0).any():
-        raise ValueError("decision_local_ts_us must be positive")
-    if grid.n_rows > 1:
-        if (np.diff(idx) <= 0).any():
-            raise ValueError("decision_event_index must be strictly increasing")
-        if (np.diff(ts) <= 0).any():
-            raise ValueError("decision_local_ts_us must be strictly increasing")
+    validate_decision_key_order(
+        decision_event_index=idx,
+        decision_local_ts_us=ts,
+        decision_event_seq=seq,
+    )
     expected_hash = compute_decision_grid_hash(grid.metadata.as_dict(), arrays)
     if expected_hash != grid.metadata.decision_grid_hash:
         raise ValueError("decision_grid_hash mismatch")
@@ -661,6 +689,7 @@ __all__ = [
     "save_decision_grid",
     "load_decision_grid_metadata",
     "load_decision_grid",
+    "validate_decision_key_order",
     "validate_decision_grid_integrity",
     "decision_grid_summary",
     "decision_grid_lineage",

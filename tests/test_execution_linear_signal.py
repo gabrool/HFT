@@ -25,6 +25,7 @@ from mmrt.execution.linear_signal import (
     magnitude_to_bps,
     prediction_row_to_signal,
     predictions_to_signal_arrays,
+    save_linear_signal_artifact_arrays,
     save_linear_signal_artifact_npz,
     validate_linear_signal_artifact_metadata,
 )
@@ -314,6 +315,58 @@ def test_npz_round_trip(tmp_path):
     np.testing.assert_array_equal(loaded.decision_event_index, artifact.decision_event_index)
     np.testing.assert_array_equal(loaded.decision_local_ts_us, artifact.decision_local_ts_us)
     np.testing.assert_allclose(loaded.arrays.expected_abs_move_bps, artifact.arrays.expected_abs_move_bps)
+
+
+def test_linear_signal_artifact_accepts_same_local_ts_with_increasing_event_seq():
+    base = _artifact(2)
+    artifact = LinearSignalArtifact(
+        arrays=base.arrays,
+        metadata=base.metadata,
+        decision_event_index=np.array([0, 1], dtype=np.int64),
+        decision_local_ts_us=np.array([100, 100], dtype=np.int64),
+        decision_event_seq=np.array([7, 8], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(artifact.decision_local_ts_us, np.array([100, 100], dtype=np.int64))
+
+
+@pytest.mark.parametrize("event_seq", ([7, 7], [8, 7]))
+def test_linear_signal_artifact_rejects_same_local_ts_without_increasing_event_seq(event_seq):
+    base = _artifact(2)
+    with pytest.raises(ValueError, match="decision event key must be strictly increasing"):
+        LinearSignalArtifact(
+            arrays=base.arrays,
+            metadata=base.metadata,
+            decision_event_index=np.array([0, 1], dtype=np.int64),
+            decision_local_ts_us=np.array([100, 100], dtype=np.int64),
+            decision_event_seq=np.asarray(event_seq, dtype=np.int64),
+        )
+
+
+def test_save_linear_signal_artifact_arrays_uses_event_key_order(tmp_path):
+    base = _artifact(2)
+    arrays = {name: getattr(base.arrays, name) for name in linear_signal_artifact_summary(base)["fields"]}
+    path = tmp_path / "same_ts.npz"
+    save_linear_signal_artifact_arrays(
+        path,
+        metadata=base.metadata,
+        decision_event_index=np.array([0, 1], dtype=np.int64),
+        decision_local_ts_us=np.array([100, 100], dtype=np.int64),
+        decision_event_seq=np.array([7, 8], dtype=np.int64),
+        arrays=arrays,
+        validate_chunk_rows=1,
+    )
+    loaded = load_linear_signal_artifact_npz(path)
+    np.testing.assert_array_equal(loaded.decision_local_ts_us, np.array([100, 100], dtype=np.int64))
+    with pytest.raises(ValueError, match="decision event key must be strictly increasing"):
+        save_linear_signal_artifact_arrays(
+            tmp_path / "bad_same_ts.npz",
+            metadata=base.metadata,
+            decision_event_index=np.array([0, 1], dtype=np.int64),
+            decision_local_ts_us=np.array([100, 100], dtype=np.int64),
+            decision_event_seq=np.array([8, 7], dtype=np.int64),
+            arrays=arrays,
+            validate_chunk_rows=1,
+        )
 
 
 def test_linear_signal_npz_requires_current_schema(tmp_path):

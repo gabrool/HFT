@@ -87,6 +87,34 @@ def test_adverse_signal_artifact_rejects_non_mapping_predictions():
             **_grid_kwargs(),
         )
 
+
+def test_adverse_signal_artifact_accepts_same_local_ts_with_increasing_event_seq():
+    signals = AdverseSelectionSignalArtifact(
+        schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+        decision_local_ts_us=np.array([100, 100], dtype=np.int64),
+        decision_event_index=np.array([0, 1], dtype=np.int64),
+        decision_event_seq=np.array([7, 8], dtype=np.int64),
+        target_names=("bid_touch_filled",),
+        predictions={"bid_touch_filled": np.array([0.25, 0.75], dtype=np.float32)},
+        **_grid_kwargs(n_rows=2),
+    )
+    np.testing.assert_array_equal(signals.decision_local_ts_us, np.array([100, 100], dtype=np.int64))
+
+
+@pytest.mark.parametrize("event_seq", ([7, 7], [8, 7]))
+def test_adverse_signal_artifact_rejects_same_local_ts_without_increasing_event_seq(event_seq):
+    with pytest.raises(ValueError, match="decision event key must be strictly increasing"):
+        AdverseSelectionSignalArtifact(
+            schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+            decision_local_ts_us=np.array([100, 100], dtype=np.int64),
+            decision_event_index=np.array([0, 1], dtype=np.int64),
+            decision_event_seq=np.asarray(event_seq, dtype=np.int64),
+            target_names=("bid_touch_filled",),
+            predictions={"bid_touch_filled": np.array([0.25, 0.75], dtype=np.float32)},
+            **_grid_kwargs(n_rows=2),
+        )
+
+
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
 
 
@@ -170,6 +198,24 @@ def test_save_adverse_selection_signals_arrays_matches_existing_artifact_writer_
     assert new.target_names == old.target_names
     for name in old.target_names:
         np.testing.assert_array_equal(new.predictions[name], old.predictions[name])
+
+
+def test_save_adverse_selection_signals_arrays_uses_event_key_order(tmp_path):
+    kwargs = dict(
+        decision_local_ts_us=np.array([100, 100], dtype=np.int64),
+        decision_event_index=np.array([0, 1], dtype=np.int64),
+        decision_event_seq=np.array([7, 8], dtype=np.int64),
+        target_names=("bid_touch_filled",),
+        predictions={"bid_touch_filled": np.array([0.25, 0.75], dtype=np.float32)},
+    )
+    path = tmp_path / "same_ts.npz"
+    save_adverse_selection_signals_arrays(path, **kwargs, **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
+    loaded = load_adverse_selection_signals(path)
+    np.testing.assert_array_equal(loaded.decision_local_ts_us, np.array([100, 100], dtype=np.int64))
+    bad = dict(kwargs)
+    bad["decision_event_seq"] = np.array([8, 7], dtype=np.int64)
+    with pytest.raises(ValueError, match="decision event key must be strictly increasing"):
+        save_adverse_selection_signals_arrays(tmp_path / "bad_same_ts.npz", **bad, **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
 
 
 def test_save_adverse_selection_signals_arrays_validates_probability_bounds_chunked(tmp_path):

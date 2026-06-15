@@ -250,7 +250,7 @@ class BuildDecisionGridConfig:
             object.__setattr__(self, "output_grid", _require_nonempty_str(self.output_grid, "output_grid"))
         if self.output_json is not None:
             object.__setattr__(self, "output_json", _require_nonempty_str(self.output_json, "output_json"))
-        _require_positive_int(self.min_decision_interval_us, "min_decision_interval_us")
+        _require_nonnegative_int(self.min_decision_interval_us, "min_decision_interval_us")
         _require_positive_int(self.max_decision_interval_us, "max_decision_interval_us")
         _require_bool(self.wake_on_trade, "wake_on_trade")
         _require_bool(self.wake_on_top_of_book, "wake_on_top_of_book")
