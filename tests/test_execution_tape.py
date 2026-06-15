@@ -28,6 +28,8 @@ from mmrt.execution.execution_tape import (
     ExecutionTapeValidationMode,
     ExecutionTapeArrays,
     build_execution_tape,
+    book_snapshot_to_depth_rows,
+    book_snapshot_to_depth_rows_into,
     execution_tape_manifest_from_dict,
     execution_tape_manifest_to_dict,
     load_execution_tape,
@@ -606,6 +608,27 @@ def test_explicit_book_depth_pads_snapshots():
     assert tape.arrays.book_bid_sizes[0].tolist() == [1.0, 2.0, 0.0]
     assert tape.manifest.schema == "mmrt_execution_tape_book_depth"
     assert tape.manifest.notes["book_depth"] == "3"
+
+
+def test_book_snapshot_to_depth_rows_into_matches_allocating_helper():
+    event = _l2(100, seq=0)
+    expected = book_snapshot_to_depth_rows(event, book_depth=3)
+    bid_ticks = np.full((3,), -99, dtype=np.int64)
+    bid_sizes = np.full((3,), -99.0, dtype=np.float32)
+    ask_ticks = np.full((3,), -99, dtype=np.int64)
+    ask_sizes = np.full((3,), -99.0, dtype=np.float32)
+
+    book_snapshot_to_depth_rows_into(
+        event,
+        book_depth=3,
+        bid_ticks=bid_ticks,
+        bid_sizes=bid_sizes,
+        ask_ticks=ask_ticks,
+        ask_sizes=ask_sizes,
+    )
+
+    for actual, want in zip((bid_ticks, bid_sizes, ask_ticks, ask_sizes), expected, strict=True):
+        np.testing.assert_array_equal(actual, want)
 
 
 def test_load_execution_tape_defaults_to_full_for_in_memory_load(tmp_path):

@@ -31,7 +31,7 @@ from mmrt.execution.execution_tape import (
     ExecutionTapeValidationMode,
     _EXPECTED_ARRAY_NAMES,
     _coerce_validation_mode,
-    book_snapshot_to_depth_rows,
+    book_snapshot_to_depth_rows_into,
     execution_tape_manifest_to_dict,
     l2_event_to_array_row,
     load_execution_tape,
@@ -211,6 +211,10 @@ class StreamingExecutionTapeWriter:
         self.trade_count = 0
         self.first_local_ts_us: int | None = None
         self.last_local_ts_us: int | None = None
+        self._scratch_bid_ticks = np.zeros((config.book_depth,), dtype=np.int64)
+        self._scratch_bid_sizes = np.zeros((config.book_depth,), dtype=np.float32)
+        self._scratch_ask_ticks = np.zeros((config.book_depth,), dtype=np.int64)
+        self._scratch_ask_sizes = np.zeros((config.book_depth,), dtype=np.float32)
         self._finalized = False
 
     def _check_output_paths(self) -> None:
@@ -240,11 +244,18 @@ class StreamingExecutionTapeWriter:
             if event.ref.book_ptr != self.l2_count:
                 raise ValueError("L2 merged event book_ptr must match next L2 row")
             self._writers[L2_EVENTS_ARRAY_NAME].append(l2_event_to_array_row(event.l2_event))
-            bid_ticks, bid_sizes, ask_ticks, ask_sizes = book_snapshot_to_depth_rows(event.l2_event, book_depth=self.config.book_depth)
-            self._writers[BOOK_BID_TICKS_ARRAY_NAME].append(bid_ticks)
-            self._writers[BOOK_BID_SIZES_ARRAY_NAME].append(bid_sizes)
-            self._writers[BOOK_ASK_TICKS_ARRAY_NAME].append(ask_ticks)
-            self._writers[BOOK_ASK_SIZES_ARRAY_NAME].append(ask_sizes)
+            book_snapshot_to_depth_rows_into(
+                event.l2_event,
+                book_depth=self.config.book_depth,
+                bid_ticks=self._scratch_bid_ticks,
+                bid_sizes=self._scratch_bid_sizes,
+                ask_ticks=self._scratch_ask_ticks,
+                ask_sizes=self._scratch_ask_sizes,
+            )
+            self._writers[BOOK_BID_TICKS_ARRAY_NAME].append(self._scratch_bid_ticks)
+            self._writers[BOOK_BID_SIZES_ARRAY_NAME].append(self._scratch_bid_sizes)
+            self._writers[BOOK_ASK_TICKS_ARRAY_NAME].append(self._scratch_ask_ticks)
+            self._writers[BOOK_ASK_SIZES_ARRAY_NAME].append(self._scratch_ask_sizes)
             self._writers[EVENTS_ARRAY_NAME].append(merged_event_to_array_row(event))
             self.l2_count += 1
         elif event.ref.event_type == ExecutionEventType.TRADE:
