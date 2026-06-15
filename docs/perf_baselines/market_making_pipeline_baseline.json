@@ -1,0 +1,375 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 1,
+      "last_result": {
+        "events": 6,
+        "l2_batches": 5
+      },
+      "max_ms": 1.3247,
+      "mean_ms": 1.3247,
+      "min_ms": 1.3247,
+      "name": "execution_tape_materialized"
+    },
+    {
+      "iterations": 1,
+      "last_result": {
+        "chunks_cleaned": true,
+        "events": 6
+      },
+      "max_ms": 167.1416,
+      "mean_ms": 167.1416,
+      "min_ms": 167.1416,
+      "name": "execution_tape_streaming_writer"
+    },
+    {
+      "iterations": 1,
+      "last_result": {
+        "decision_grid_rows": 4
+      },
+      "max_ms": 228.9453,
+      "mean_ms": 228.9453,
+      "min_ms": 228.9453,
+      "name": "decision_grid_build"
+    },
+    {
+      "iterations": 1,
+      "last_result": {
+        "rows": 2,
+        "valid_rows": 2
+      },
+      "max_ms": 0.266,
+      "mean_ms": 0.266,
+      "min_ms": 0.266,
+      "name": "labels_batch"
+    },
+    {
+      "iterations": 1,
+      "last_result": {
+        "rows_seen": 1024,
+        "updates": 8
+      },
+      "max_ms": 1.1242,
+      "mean_ms": 1.1242,
+      "min_ms": 1.1242,
+      "name": "linear_direction_update"
+    },
+    {
+      "iterations": 1,
+      "last_result": {
+        "loss": 0.5131602138280869,
+        "minibatches_processed": 2,
+        "updates": 1
+      },
+      "max_ms": 4901.0269,
+      "mean_ms": 4901.0269,
+      "min_ms": 4901.0269,
+      "name": "ppo_update"
+    }
+  ],
+  "config": {
+    "include_optional": true,
+    "inventory_min_bytes": 13000,
+    "iterations": 1
+  },
+  "golden_outputs": {
+    "decision_grid_hash": "3b44b927fb699d8b3bd90c69b2cb59f30969caf3ea314a794e5a91e8d16c05e1",
+    "fixture": {
+      "decision_grid_rows": 4,
+      "events": 6,
+      "l2_batches": 5,
+      "trades": 1
+    },
+    "hashes": {
+      "book_ask_ticks": "e9449b14bbe59561a9b8d5deca1fbcfad0d69f1ad3f3adf7fb3572d2aa3c73cc",
+      "book_bid_ticks": "810a92af1f93fb22509570dc4a29e958dc14e7ce9a74a49ca8e3f6dfbf7481b9",
+      "decision_event_index": "a67ba4e1d9c29744e149b57bc801bda9a522e6e053fc1a4c21dbfdf71e932753",
+      "decision_local_ts_us": "f0534dd31162650519f53af93eb568040bc4cb6cbcfcefeb05ee580afc806ca7",
+      "events": "238f1fe779831897ac937bc4d2aa5898f2ec54aeed88872f3ceb6de6ba408688",
+      "l2_events": "d4f1ba98e5de45827caf91b7516200ec86a8b6a82187187092cd6bcee7243cc9",
+      "label_mask": "740b20a5710aa7b8dee19f524a211e9ce2503cc09596f4ac1df42893325d137e",
+      "labels": "00d8981165be68a7b1f9ce2e2985a8ef4855e090430c73d251790e9a64250e19",
+      "trades": "5e80c6e574ac475f56a282e0700d3ce885f10109cf42ba356106eaac9cd67f99"
+    },
+    "reason_counts": {
+      "first_valid_book": 1,
+      "heartbeat": 1,
+      "top_of_book_wake": 1,
+      "trade_wake": 1
+    },
+    "schema": "mmrt_performance_baseline_v1"
+  },
+  "heavy_file_inventory": [
+    {
+      "bytes": 84262,
+      "path": "mmrt/execution/adverse_selection.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 55238,
+      "path": "mmrt/execution/env.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 54576,
+      "path": "mmrt/cli/build_execution_tape.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 49839,
+      "path": "mmrt/analysis/feature_audit.py",
+      "subsystem": "analysis"
+    },
+    {
+      "bytes": 48296,
+      "path": "mmrt/analysis/feature_lab.py",
+      "subsystem": "analysis"
+    },
+    {
+      "bytes": 42741,
+      "path": "mmrt/cli/train_adverse_selection.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 42232,
+      "path": "mmrt/execution/linear_signal_builder.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 42076,
+      "path": "mmrt/execution/contracts.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 39180,
+      "path": "mmrt/execution/linear_signal.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 38559,
+      "path": "mmrt/execution/execution_tape.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 37350,
+      "path": "mmrt/cli/train_execution_ppo.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 37152,
+      "path": "mmrt/cli/evaluate_execution_policy.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 34350,
+      "path": "mmrt/linear/train.py",
+      "subsystem": "linear"
+    },
+    {
+      "bytes": 33713,
+      "path": "mmrt/features/book_state.py",
+      "subsystem": "features"
+    },
+    {
+      "bytes": 31633,
+      "path": "mmrt/analysis/preprocess_audit.py",
+      "subsystem": "analysis"
+    },
+    {
+      "bytes": 28457,
+      "path": "mmrt/analysis/feature_importance.py",
+      "subsystem": "analysis"
+    },
+    {
+      "bytes": 28006,
+      "path": "mmrt/storage/manifest.py",
+      "subsystem": "storage"
+    },
+    {
+      "bytes": 27697,
+      "path": "mmrt/execution/decision_grid.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 27573,
+      "path": "mmrt/execution/fill_sim.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 26598,
+      "path": "mmrt/linear/models.py",
+      "subsystem": "linear"
+    },
+    {
+      "bytes": 26100,
+      "path": "mmrt/linear/diagnostics.py",
+      "subsystem": "linear"
+    },
+    {
+      "bytes": 25386,
+      "path": "mmrt/execution/adverse_signal.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 24758,
+      "path": "mmrt/features/specs.py",
+      "subsystem": "features"
+    },
+    {
+      "bytes": 24280,
+      "path": "mmrt/features/transforms.py",
+      "subsystem": "features"
+    },
+    {
+      "bytes": 22595,
+      "path": "mmrt/cli/audit_l2_reconstruction.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 21010,
+      "path": "mmrt/cli/build_decision_grid.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 20996,
+      "path": "mmrt/features/trade_state.py",
+      "subsystem": "features"
+    },
+    {
+      "bytes": 20832,
+      "path": "mmrt/linear/evaluate.py",
+      "subsystem": "linear"
+    },
+    {
+      "bytes": 20693,
+      "path": "mmrt/execution/adverse_selection_index.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 20660,
+      "path": "mmrt/features/kernels.py",
+      "subsystem": "features"
+    },
+    {
+      "bytes": 20357,
+      "path": "mmrt/cli/audit_execution_sim.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 20210,
+      "path": "mmrt/execution/l2_reconstructor.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 20155,
+      "path": "mmrt/features/engine.py",
+      "subsystem": "features"
+    },
+    {
+      "bytes": 18059,
+      "path": "mmrt/execution/obs_builder.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 18011,
+      "path": "mmrt/features/labels.py",
+      "subsystem": "features"
+    },
+    {
+      "bytes": 17721,
+      "path": "mmrt/cli/ingest.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 17590,
+      "path": "mmrt/storage/reader.py",
+      "subsystem": "storage"
+    },
+    {
+      "bytes": 17213,
+      "path": "mmrt/execution/adverse_selection_dataset.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 16919,
+      "path": "mmrt/rl/train.py",
+      "subsystem": "rl"
+    },
+    {
+      "bytes": 16760,
+      "path": "mmrt/metadata/rule_compatibility.py",
+      "subsystem": "metadata"
+    },
+    {
+      "bytes": 16532,
+      "path": "mmrt/execution/adverse_selection_fit.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 16296,
+      "path": "mmrt/analysis/performance_baseline.py",
+      "subsystem": "analysis"
+    },
+    {
+      "bytes": 15975,
+      "path": "mmrt/rl/ppo.py",
+      "subsystem": "rl"
+    },
+    {
+      "bytes": 15657,
+      "path": "mmrt/execution/execution_tape_writer.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 15539,
+      "path": "mmrt/execution/metrics.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 15030,
+      "path": "mmrt/linear/preprocess.py",
+      "subsystem": "linear"
+    },
+    {
+      "bytes": 14983,
+      "path": "mmrt/storage/writer.py",
+      "subsystem": "storage"
+    },
+    {
+      "bytes": 14896,
+      "path": "mmrt/execution/linear_feature_audit.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 14605,
+      "path": "mmrt/storage/splits.py",
+      "subsystem": "storage"
+    },
+    {
+      "bytes": 14376,
+      "path": "mmrt/linear/targets.py",
+      "subsystem": "linear"
+    },
+    {
+      "bytes": 14347,
+      "path": "mmrt/cli/build_adverse_selection_signals.py",
+      "subsystem": "cli"
+    },
+    {
+      "bytes": 14286,
+      "path": "mmrt/execution/quote_geometry.py",
+      "subsystem": "execution"
+    },
+    {
+      "bytes": 13925,
+      "path": "mmrt/rl/torch_networks.py",
+      "subsystem": "rl"
+    },
+    {
+      "bytes": 13661,
+      "path": "mmrt/rl/rollout.py",
+      "subsystem": "rl"
+    }
+  ],
+  "schema": "mmrt_performance_baseline_v1"
+}
