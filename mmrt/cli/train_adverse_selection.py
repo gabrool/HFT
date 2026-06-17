@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import sys
 from typing import Sequence
 
 import numpy as np
@@ -19,6 +20,7 @@ from mmrt.execution.adverse_selection import (
     quote_candidate_configs_from_names,
     VPINConfig,
     build_adverse_selection_dataset_to_disk,
+    profile_adverse_selection_label_generation,
     summarize_disk_adverse_selection_dataset,
     adverse_selection_feature_names,
     adverse_selection_label_names,
@@ -202,7 +204,10 @@ class AdverseSelectionTrainCLIConfig:
     metrics_mode: str = "approx"
     auc_bins: int = 2000
     exact_auc_max_rows: int = 1_000_000
-    progress_interval: int | None = None
+    progress_interval: int | None = 100_000
+    label_engine: str = "auto"
+    profile_rows: int | None = None
+    profile_output_json: str | None = None
 
     flow_windows_us: tuple[int, ...] | str = (200_000, 500_000, 1_000_000)
     drop_incomplete_horizon: bool = True
@@ -261,6 +266,11 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "auc_bins", _require_positive_int(self.auc_bins, "auc_bins"))
         object.__setattr__(self, "exact_auc_max_rows", _require_positive_int(self.exact_auc_max_rows, "exact_auc_max_rows"))
         object.__setattr__(self, "progress_interval", _optional_positive_int(self.progress_interval, "progress_interval"))
+        if self.label_engine not in ("auto", "numba", "scalar"):
+            raise ValueError("label_engine must be auto, numba, or scalar")
+        if self.profile_output_json is not None:
+            object.__setattr__(self, "profile_output_json", _require_nonempty_str(self.profile_output_json, "profile_output_json"))
+        object.__setattr__(self, "profile_rows", _optional_positive_int(self.profile_rows, "profile_rows"))
         object.__setattr__(self, "flow_windows_us", _parse_int_tuple(self.flow_windows_us, "flow_windows_us"))
         object.__setattr__(self, "drop_incomplete_horizon", _require_bool(self.drop_incomplete_horizon, "drop_incomplete_horizon"))
         object.__setattr__(self, "vpin_bucket_volume", _require_positive_float(self.vpin_bucket_volume, "vpin_bucket_volume"))
@@ -361,6 +371,9 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "auc_bins": config.auc_bins,
         "exact_auc_max_rows": config.exact_auc_max_rows,
         "progress_interval": config.progress_interval,
+        "label_engine": config.label_engine,
+        "profile_rows": config.profile_rows,
+        "profile_output_json": config.profile_output_json,
         "flow_windows_us": list(config.flow_windows_us),
         "drop_incomplete_horizon": config.drop_incomplete_horizon,
         "vpin_bucket_volume": config.vpin_bucket_volume,
@@ -406,6 +419,10 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _log_stage(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 
@@ -658,24 +675,73 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         raise ValueError("config must be AdverseSelectionTrainCLIConfig")
     output_json = Path(config.output_json) if config.output_json is not None else _default_output_json(config.tape_root)
     model_npz = Path(config.model_npz) if config.model_npz is not None else _default_model_npz(config.tape_root)
-    if output_json.exists() and not config.overwrite:
+    profile_mode = config.profile_rows is not None
+    if not profile_mode and output_json.exists() and not config.overwrite:
         raise FileExistsError(f"output_json already exists: {output_json}")
-    if model_npz.exists() and not config.overwrite:
+    if not profile_mode and model_npz.exists() and not config.overwrite:
         raise FileExistsError(f"model_npz already exists: {model_npz}")
 
+    _log_stage("train_adverse_selection stage=tape_load")
     tape = load_execution_tape(
         config.tape_root,
         mmap_mode=config.mmap_mode,
         validation_mode=ExecutionTapeValidationMode.SHAPE_ONLY,
     )
+    _log_stage("train_adverse_selection stage=decision_grid_load")
     decision_grid = load_decision_grid(config.decision_grid_path)
+    _log_stage("train_adverse_selection stage=decision_grid_validate")
     validate_decision_grid_for_execution_tape(decision_grid, tape)
     adverse_config = _build_adverse_selection_config(config)
     dataset_root = Path(config.dataset_root) if config.dataset_root is not None else Path(config.tape_root) / "adverse_selection_dataset"
     work_root = (Path(config.work_dir) if config.work_dir is not None else dataset_root.parent) / "adverse_selection_work"
+    if profile_mode:
+        _log_stage("train_adverse_selection stage=profile_label_generation")
+        profile = profile_adverse_selection_label_generation(
+            tape,
+            config=adverse_config,
+            decision_grid=decision_grid,
+            profile_rows=int(config.profile_rows),
+            work_dir=config.work_dir if config.work_dir is not None else str(dataset_root.parent),
+            chunk_rows=config.chunk_rows,
+            overwrite=config.overwrite,
+            cleanup_chunks=True,
+            progress_interval=config.progress_interval,
+            label_engine=config.label_engine,
+        )
+        manifest = tape.manifest
+        summary = {
+            **profile,
+            "tape_root": str(Path(config.tape_root)),
+            "decision_grid_path": str(Path(config.decision_grid_path)),
+            "work_dir": str(work_root),
+            "output_json": None,
+            "model_npz": None,
+            "config": _summary_config(config),
+            "tape": {
+                "schema": manifest.schema,
+                "exchange": manifest.exchange,
+                "symbol": manifest.symbol,
+                "num_events": manifest.num_events,
+                "num_l2_batches": manifest.num_l2_batches,
+                "num_trades": manifest.num_trades,
+                "start_local_ts_us": manifest.start_local_ts_us,
+                "end_local_ts_us": manifest.end_local_ts_us,
+                "book_depth": manifest.notes.get("book_depth") if manifest.notes is not None else None,
+            },
+            "decision_grid": {
+                "schema": decision_grid.metadata.schema,
+                "hash": decision_grid.decision_grid_hash,
+                "n_rows": decision_grid.n_rows,
+                "schedule": decision_grid.decision_schedule,
+            },
+        }
+        if config.profile_output_json is not None:
+            _write_json_atomic(Path(config.profile_output_json), summary)
+        return summary
     feature_count = len(adverse_selection_feature_names(adverse_config))
     label_count = len(adverse_selection_label_names(adverse_config))
     disk_estimate = estimate_adverse_dataset_bytes(num_decisions_estimate=decision_grid.n_rows, num_features=feature_count, num_labels=label_count)
+    _log_stage("train_adverse_selection stage=dataset_build")
     dataset = build_adverse_selection_dataset_to_disk(
         tape,
         config=adverse_config,
@@ -687,8 +753,11 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         cleanup_chunks=True,
         cleanup_work_dir=config.cleanup_work_dir,
         progress_interval=config.progress_interval,
+        label_engine=config.label_engine,
     )
+    _log_stage("train_adverse_selection stage=dataset_summarize")
     dataset_summary = summarize_disk_adverse_selection_dataset(dataset, chunk_rows=config.chunk_rows)
+    _log_stage("train_adverse_selection stage=model_fit")
     baseline_fit = fit_adverse_baselines_streaming(
         dataset,
         target_names=_resolve_target_names(dataset, config.target_names),
@@ -703,6 +772,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     baseline_summary = baseline_fit.metrics
     model_written = False
     if baseline_fit.target_names:
+        _log_stage("train_adverse_selection stage=model_write")
         save_adverse_selection_model(
             model_npz,
             AdverseSelectionModelArtifact(
@@ -769,13 +839,15 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
             "metrics_mode": config.metrics_mode,
             "auc_bins": config.auc_bins,
             "exact_auc_max_rows": config.exact_auc_max_rows,
-        "progress_interval": config.progress_interval,
+            "progress_interval": config.progress_interval,
+            "label_engine": config.label_engine,
             "keep_dataset": config.keep_dataset,
             "keep_work_dir": not config.cleanup_work_dir,
             "cleanup_work_dir": config.cleanup_work_dir,
         },
         "disk_estimate": disk_estimate,
     }
+    _log_stage("train_adverse_selection stage=summary_write")
     _write_json_atomic(output_json, summary)
     if not config.keep_dataset:
         import shutil
@@ -801,7 +873,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metrics-mode", choices=("approx", "none", "exact"), default="approx")
     parser.add_argument("--auc-bins", type=int, default=2000)
     parser.add_argument("--exact-auc-max-rows", type=int, default=1_000_000)
-    parser.add_argument("--progress-interval", type=int)
+    parser.add_argument("--progress-interval", type=int, default=100_000)
+    parser.add_argument("--label-engine", choices=("auto", "numba", "scalar"), default="auto")
+    parser.add_argument("--profile-rows", type=int)
+    parser.add_argument("--profile-output-json")
     parser.add_argument("--flow-windows-us", default="200000,500000,1000000")
     parser.add_argument("--keep-incomplete-horizon", action="store_true")
     parser.add_argument("--vpin-bucket-volume", type=float, default=50.0)
@@ -855,6 +930,9 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         auc_bins=args.auc_bins,
         exact_auc_max_rows=args.exact_auc_max_rows,
         progress_interval=args.progress_interval,
+        label_engine=args.label_engine,
+        profile_rows=args.profile_rows,
+        profile_output_json=args.profile_output_json,
         flow_windows_us=args.flow_windows_us,
         drop_incomplete_horizon=not args.keep_incomplete_horizon,
         vpin_bucket_volume=args.vpin_bucket_volume,
