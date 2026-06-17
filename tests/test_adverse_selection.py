@@ -18,9 +18,16 @@ from mmrt.execution.decision_grid import save_decision_grid
 from mmrt.execution.adverse_selection import (
     AdverseSelectionConfig,
     CounterfactualQuoteConfig,
+    DEFAULT_QUOTE_CANDIDATES,
     KyleLambdaConfig,
     VPINConfig,
     VPINState,
+    _AdverseLabelLayout,
+    _CONSERVATIVE_NUMBA_AVAILABLE,
+    _build_conservative_fill_index,
+    _labels_for_decision,
+    _labels_for_decision_batch_conservative,
+    build_adverse_selection_dataset_to_disk,
     summarize_adverse_selection_dataset,
 )
 from mmrt.cli.train_adverse_selection import (
@@ -321,6 +328,92 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
         assert "coefficients" in npz
 
 
+def test_train_adverse_selection_profile_rows_writes_profile_only(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
+    output_json = tmp_path / "summary.json"
+    model_npz = tmp_path / "model.npz"
+    profile_json = tmp_path / "profile.json"
+
+    summary = run_adverse_selection_training(
+        AdverseSelectionTrainCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            output_json=str(output_json),
+            model_npz=str(model_npz),
+            overwrite=True,
+            profile_rows=3,
+            profile_output_json=str(profile_json),
+            fill_horizon_us=1_000,
+            adverse_horizon_us=1_000,
+            order_qty=1.0,
+            min_train_samples=1,
+        )
+    )
+
+    assert summary["run_type"] == "profile_adverse_selection_label_generation"
+    assert summary["decision_grid_rows_considered"] == 3
+    assert summary["timing"]["rows_per_second"] > 0.0
+    assert profile_json.exists()
+    assert json.loads(profile_json.read_text()) == summary
+    assert not output_json.exists()
+    assert not model_npz.exists()
+
+
+def test_adverse_dataset_reuses_complete_manifest_and_rejects_partial_root(tmp_path):
+    tape = _training_tape_with_multiple_decisions()
+    config = _base_config(
+        quote=CounterfactualQuoteConfig(
+            order_qty=1.0,
+            fill_horizon_us=1_000,
+            adverse_horizon_us=1_000,
+            queue_model=QueueModelConfig(mode=QueueModelMode.CONSERVATIVE),
+            latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=0),
+        ),
+        max_decisions=4,
+    )
+    grid = decision_grid_for_tape(tape, max_rows=4)
+    root = tmp_path / "ds"
+    work_dir = tmp_path / "work"
+    first = build_adverse_selection_dataset_to_disk(
+        tape,
+        config=config,
+        decision_grid=grid,
+        output_root=root,
+        work_dir=work_dir,
+        chunk_rows=4096,
+        overwrite=True,
+        cleanup_work_dir=False,
+        label_engine="scalar",
+    )
+    second = build_adverse_selection_dataset_to_disk(
+        tape,
+        config=config,
+        decision_grid=grid,
+        output_root=root,
+        work_dir=work_dir,
+        chunk_rows=4096,
+        overwrite=False,
+        cleanup_work_dir=False,
+        label_engine="scalar",
+    )
+    assert second.manifest.created_at_utc == first.manifest.created_at_utc
+
+    partial_root = tmp_path / "partial_ds"
+    partial_root.mkdir()
+    with pytest.raises(FileExistsError, match="partial adverse dataset root"):
+        build_adverse_selection_dataset_to_disk(
+            tape,
+            config=config,
+            decision_grid=grid,
+            output_root=partial_root,
+            work_dir=work_dir,
+            chunk_rows=4096,
+            overwrite=False,
+            cleanup_work_dir=False,
+            label_engine="scalar",
+        )
+
+
 def test_adverse_selection_all_unknown_targets_preserves_skip_reasons(tmp_path):
     tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
     output_json = tmp_path / "summary.json"
@@ -478,6 +571,136 @@ def test_train_adverse_selection_parser_accepts_latency_args():
     assert cfg.order_entry_latency_us == 11
 
 
+def _conservative_label_parity_fixture(tmp_path):
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100, bid_ticks=(1000, 999), ask_ticks=(1004, 1005), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=1, local_ts_us=650, bid_ticks=(1000, 999), ask_ticks=(1001, 1002), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=2, local_ts_us=800, bid_ticks=(1001, 1000), ask_ticks=(1003, 1004), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=3, local_ts_us=1_200_000, bid_ticks=(990, 989), ask_ticks=(992, 993), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=4, local_ts_us=2_000_000, bid_ticks=(980, 979), ask_ticks=(982, 983), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+        ],
+        [
+            _trade(local_ts_us=700, side=AggressorSide.SELL, price_tick=1000, amount=2.5, source_row=0),
+            _trade(local_ts_us=720, side=AggressorSide.BUY, price_tick=1004, amount=2.5, source_row=1),
+            _trade(local_ts_us=900, side=AggressorSide.SELL, price_tick=998, amount=1.0, source_row=2),
+            _trade(local_ts_us=920, side=AggressorSide.BUY, price_tick=1005, amount=1.0, source_row=3),
+        ],
+    )
+    config = _base_config(
+        quote=CounterfactualQuoteConfig(
+            quote_candidates=DEFAULT_QUOTE_CANDIDATES,
+            order_qty=1.0,
+            fill_horizon_us=1_000_000,
+            adverse_horizon_us=1_000_000,
+            toxic_threshold_bps=0.1,
+            queue_model=QueueModelConfig(mode=QueueModelMode.CONSERVATIVE, trade_at_level_weight=1.0),
+            latency_config=LatencyConfig(decision_compute_latency_us=250, order_entry_latency_us=250),
+        ),
+        max_decisions=4,
+    )
+    grid = decision_grid_for_tape(tape, max_rows=4)
+    from mmrt.execution.adverse_selection_index import AdverseSelectionIndexConfig, build_or_load_adverse_selection_index
+
+    index = build_or_load_adverse_selection_index(
+        tape,
+        config=AdverseSelectionIndexConfig(
+            output_root=str(tmp_path / "idx"),
+            kyle=config.kyle,
+            use_notional_flow=config.kyle.use_notional_flow,
+            tick_size=tape.manifest.symbol_spec.tick_size,
+            chunk_rows=4096,
+            overwrite=True,
+        ),
+    )
+    return tape, config, grid, index
+
+
+def test_conservative_batch_labels_match_scalar_reference(tmp_path):
+    tape, config, grid, index = _conservative_label_parity_fixture(tmp_path)
+    layout = _AdverseLabelLayout.from_config(config)
+    fill_index = _build_conservative_fill_index(tape)
+    events_ts = tape.arrays.events["local_ts_us"]
+    scalar_labels = []
+    scalar_masks = []
+    scalar_keep = []
+    for row in range(grid.n_rows):
+        out = _labels_for_decision(
+            tape,
+            config=config,
+            layout=layout,
+            last_event_local_ts_us=int(events_ts[-1]),
+            events_local_ts_us=events_ts,
+            decision_event_index=int(grid.decision_event_index[row]),
+            latest_book_ptr=int(grid.book_ptr[row]),
+            decision_key=EventKey(int(grid.decision_local_ts_us[row]), int(grid.decision_event_seq[row])),
+            future_mid_lookup=index.valid_l2,
+            fill_index=fill_index,
+        )
+        scalar_keep.append(out is not None)
+        if out is None:
+            scalar_labels.append([np.nan] * layout.label_count)
+            scalar_masks.append([False] * layout.label_count)
+        else:
+            scalar_labels.append(out[0])
+            scalar_masks.append(out[1])
+
+    labels, masks, keep_rows, backend = _labels_for_decision_batch_conservative(
+        tape,
+        config=config,
+        layout=layout,
+        last_event_local_ts_us=int(events_ts[-1]),
+        events_local_ts_us=events_ts,
+        decision_event_index=grid.decision_event_index,
+        latest_book_ptr=grid.book_ptr,
+        decision_local_ts_us=grid.decision_local_ts_us,
+        decision_event_seq=grid.decision_event_seq,
+        future_mid_lookup=index.valid_l2,
+        fill_index=fill_index,
+        label_engine="scalar",
+    )
+    assert backend == "scalar"
+    np.testing.assert_array_equal(keep_rows, np.asarray(scalar_keep, dtype=np.bool_))
+    np.testing.assert_allclose(labels, np.asarray(scalar_labels, dtype=np.float32), equal_nan=True)
+    np.testing.assert_array_equal(masks, np.asarray(scalar_masks, dtype=np.bool_))
+    label_index = {name: i for i, name in enumerate(layout.label_names)}
+    assert masks[:, label_index["bid_touch_fill_latency_us"]].any()
+    assert masks[:, label_index["ask_touch_fill_latency_us"]].any()
+    assert masks[:, label_index["bid_touch_adverse_bps"]].any()
+    assert masks[:, label_index["ask_touch_toxic_fill"]].any()
+    assert masks[:, label_index["bid_away_1_toxic_cost_bps"]].any()
+
+
+def test_conservative_numba_backend_matches_or_errors_clearly(tmp_path):
+    tape, config, grid, index = _conservative_label_parity_fixture(tmp_path)
+    layout = _AdverseLabelLayout.from_config(config)
+    fill_index = _build_conservative_fill_index(tape)
+    events_ts = tape.arrays.events["local_ts_us"]
+    kwargs = dict(
+        tape=tape,
+        config=config,
+        layout=layout,
+        last_event_local_ts_us=int(events_ts[-1]),
+        events_local_ts_us=events_ts,
+        decision_event_index=grid.decision_event_index,
+        latest_book_ptr=grid.book_ptr,
+        decision_local_ts_us=grid.decision_local_ts_us,
+        decision_event_seq=grid.decision_event_seq,
+        future_mid_lookup=index.valid_l2,
+        fill_index=fill_index,
+    )
+    if not _CONSERVATIVE_NUMBA_AVAILABLE:
+        with pytest.raises(ValueError, match="requires numba"):
+            _labels_for_decision_batch_conservative(**kwargs, label_engine="numba")
+        return
+    scalar = _labels_for_decision_batch_conservative(**kwargs, label_engine="scalar")
+    accelerated = _labels_for_decision_batch_conservative(**kwargs, label_engine="numba")
+    assert accelerated[3] == "numba"
+    np.testing.assert_allclose(accelerated[0], scalar[0], equal_nan=True)
+    np.testing.assert_array_equal(accelerated[1], scalar[1])
+    np.testing.assert_array_equal(accelerated[2], scalar[2])
+
+
 def test_adverse_selection_schema_constant_is_direct_string():
     source = Path("mmrt/execution/adverse_signal.py").read_text(encoding="utf-8")
     assert 'ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_grid_v1"' in source
@@ -491,11 +714,15 @@ def test_config_parses_windows_queue_mode_and_targets():
         flow_windows_us="100,200",
         kyle_windows_us="1000,2000",
         queue_mode="balanced",
+        label_engine="scalar",
+        profile_rows=100,
         target_names="bid_touch_filled,ask_touch_filled",
     )
     assert cfg.flow_windows_us == (100, 200)
     assert cfg.kyle_windows_us == (1000, 2000)
     assert cfg.queue_mode == QueueModelMode.BALANCED
+    assert cfg.label_engine == "scalar"
+    assert cfg.profile_rows == 100
     assert cfg.target_names == ("bid_touch_filled", "ask_touch_filled")
     with pytest.raises(ValueError):
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", train_fraction=1.0)
@@ -505,6 +732,8 @@ def test_config_parses_windows_queue_mode_and_targets():
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", target_names="bid_touch_filled,")
     with pytest.raises(ValueError):
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", order_entry_latency_us=-1)
+    with pytest.raises(ValueError):
+        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", label_engine="bad")
 
 
 def test_adverse_selection_modules_do_not_import_forbidden_layers():
