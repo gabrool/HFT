@@ -10,6 +10,8 @@ import torch
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
 from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.metrics import ExecutionMetricAccumulator
+from mmrt.execution.split_contract import DecisionSplitRange
+from mmrt.rl.device import resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer
 from mmrt.rl.torch_networks import ActorCriticNetwork
 
@@ -63,7 +65,7 @@ def _resolve_device(
     device: str | torch.device | None,
 ) -> torch.device:
     if device is not None:
-        return torch.device(device)
+        return resolve_torch_device(device)
 
     try:
         parameter = next(policy.parameters())
@@ -90,7 +92,9 @@ def _observation_to_tensor(
 @dataclass(frozen=True, slots=True)
 class PolicyEvaluationConfig:
     max_steps: int | None = None
-    start_event_index: int | None = None
+    start_decision_row: int | None = None
+    end_decision_row: int | None = None
+    decision_row_ranges: tuple[DecisionSplitRange, ...] = ()
 
     deterministic: bool = True
     reset_env: bool = True
@@ -111,9 +115,26 @@ class PolicyEvaluationConfig:
         )
         object.__setattr__(
             self,
-            "start_event_index",
-            _optional_nonnegative_int(self.start_event_index, "start_event_index"),
+            "start_decision_row",
+            _optional_nonnegative_int(self.start_decision_row, "start_decision_row"),
         )
+        object.__setattr__(
+            self,
+            "end_decision_row",
+            _optional_nonnegative_int(self.end_decision_row, "end_decision_row"),
+        )
+        if self.start_decision_row is not None and self.end_decision_row is not None:
+            if self.end_decision_row <= self.start_decision_row:
+                raise ValueError("end_decision_row must be greater than start_decision_row")
+        ranges = tuple(self.decision_row_ranges)
+        if ranges:
+            if self.start_decision_row is not None or self.end_decision_row is not None:
+                raise ValueError("decision_row_ranges cannot be combined with start/end_decision_row")
+            if any(not isinstance(item, DecisionSplitRange) for item in ranges):
+                raise TypeError("decision_row_ranges entries must be DecisionSplitRange")
+            if any(item.rollout_step_capacity <= 0 for item in ranges):
+                raise ValueError("decision_row_ranges must each contain at least two decision rows")
+        object.__setattr__(self, "decision_row_ranges", ranges)
         object.__setattr__(
             self,
             "deterministic",
@@ -134,8 +155,8 @@ class PolicyEvaluationConfig:
         )
         if not isinstance(self.diagnostics_config, ExecutionDiagnosticsConfig):
             raise TypeError("diagnostics_config must be ExecutionDiagnosticsConfig")
-        if not self.reset_env and self.start_event_index is not None:
-            raise ValueError("start_event_index requires reset_env=True")
+        if not self.reset_env and self.start_decision_row is not None:
+            raise ValueError("start_decision_row requires reset_env=True")
 
 
 class PolicyEvaluationResult(NamedTuple):
@@ -162,7 +183,9 @@ class PolicyEvaluationResult(NamedTuple):
 def _config_to_dict(config: PolicyEvaluationConfig) -> dict[str, object]:
     values: dict[str, object] = {
         "max_steps": config.max_steps,
-        "start_event_index": config.start_event_index,
+        "start_decision_row": config.start_decision_row,
+        "end_decision_row": config.end_decision_row,
+        "decision_row_ranges": [entry.as_dict() for entry in config.decision_row_ranges],
         "deterministic": config.deterministic,
         "reset_env": config.reset_env,
         "device": None if config.device is None else str(config.device),
@@ -195,8 +218,8 @@ def evaluate_policy(
         raise TypeError("observation_normalizer must be None or ObservationNormalizer")
     if policy.obs_dim != env.config.observation_schema.dim:
         raise ValueError("policy.obs_dim must equal env observation dimension")
-    if not config.reset_env and config.start_event_index is not None:
-        raise ValueError("start_event_index requires reset_env=True")
+    if not config.reset_env and config.start_decision_row is not None:
+        raise ValueError("start_decision_row requires reset_env=True")
     if not config.reset_env:
         raise NotImplementedError("reset_env=False is not supported yet")
 
@@ -209,43 +232,91 @@ def evaluate_policy(
     was_training = policy.training
     policy.eval()
     try:
-        reset = env.reset(start_event_index=config.start_event_index)
-        current_observation = reset.observation
-
         acc = ExecutionMetricAccumulator()
         terminated = False
         truncated = False
         step_count = 0
+        evaluated_start_decision_row: int | None = None
+        evaluated_end_decision_row: int | None = None
+        evaluated_ranges: list[dict[str, object]] = []
 
-        while True:
+        if config.decision_row_ranges:
+            eval_ranges = tuple(
+                (entry.start_decision_row, entry.end_decision_row, entry.as_dict())
+                for entry in config.decision_row_ranges
+            )
+        else:
+            reset_start = 0 if config.start_decision_row is None else config.start_decision_row
+            reset_end = config.end_decision_row
+            eval_ranges = ((reset_start, reset_end, None),)
+
+        for range_start, range_end, range_meta in eval_ranges:
             if config.max_steps is not None and step_count >= config.max_steps:
                 truncated = True
                 break
+            reset = env.reset(start_decision_row=range_start)
+            current_observation = reset.observation
+            current_decision_row = int(reset.info["decision_grid_row_index"])
+            if current_decision_row != range_start:
+                raise RuntimeError("evaluation reset did not land on requested decision row")
+            if evaluated_start_decision_row is None:
+                evaluated_start_decision_row = current_decision_row
+            active_range_start = current_decision_row
+            active_range_end = current_decision_row
 
-            obs = _observation_to_tensor(
-                current_observation,
-                device=device,
-                dtype=dtype,
-                obs_dim=policy.obs_dim,
-            )
-            if observation_normalizer is not None:
-                obs = observation_normalizer.normalize(obs)
+            while True:
+                if config.max_steps is not None and step_count >= config.max_steps:
+                    truncated = True
+                    break
+                if range_end is not None and current_decision_row + 1 >= range_end:
+                    truncated = True
+                    break
 
-            with torch.no_grad():
-                action_out = policy.sample_action(
-                    obs.unsqueeze(0),
-                    deterministic=config.deterministic,
+                obs = _observation_to_tensor(
+                    current_observation,
+                    device=device,
+                    dtype=dtype,
+                    obs_dim=policy.obs_dim,
                 )
-            action = action_out.action.squeeze(0).detach().to("cpu").tolist()
+                if observation_normalizer is not None:
+                    obs = observation_normalizer.normalize(obs)
 
-            step = env.step(action)
-            acc.update(step.execution)
-            step_count += 1
+                with torch.inference_mode():
+                    action_out = policy.sample_action(
+                        obs.unsqueeze(0),
+                        deterministic=config.deterministic,
+                    )
+                action = action_out.action.squeeze(0).detach().to("cpu").tolist()
 
-            current_observation = step.observation
-            if step.done or step.truncated:
-                terminated = bool(step.done)
-                truncated = bool(step.truncated)
+                step = env.step(action)
+                acc.update(step.execution)
+                step_count += 1
+                next_decision_row = int(step.info["next_decision_grid_row_index"])
+                if range_end is not None and next_decision_row >= range_end:
+                    raise RuntimeError("evaluation step crossed split boundary")
+                active_range_end = next_decision_row + 1
+                evaluated_end_decision_row = active_range_end
+
+                current_observation = step.observation
+                current_decision_row = next_decision_row
+                if step.done or step.truncated:
+                    terminated = bool(step.done)
+                    truncated = bool(step.truncated)
+                    break
+                if range_end is not None and current_decision_row + 1 >= range_end:
+                    truncated = True
+                    break
+
+            if active_range_end > active_range_start:
+                evaluated_range = {
+                    "start_decision_row": int(active_range_start),
+                    "end_decision_row": int(active_range_end),
+                    "row_count": int(active_range_end - active_range_start),
+                }
+                if range_meta is not None:
+                    evaluated_range = {**range_meta, **evaluated_range}
+                evaluated_ranges.append(evaluated_range)
+            if terminated or (config.max_steps is not None and step_count >= config.max_steps):
                 break
 
         metrics = acc.as_dict()
@@ -266,7 +337,12 @@ def evaluate_policy(
             truncated=truncated,
             metrics=metrics,
             diagnostics=diagnostics,
-            config=_config_to_dict(config),
+            config={
+                **_config_to_dict(config),
+                "evaluated_start_decision_row": None if evaluated_start_decision_row is None else int(evaluated_start_decision_row),
+                "evaluated_end_decision_row": None if evaluated_end_decision_row is None else int(evaluated_end_decision_row),
+                "evaluated_decision_row_ranges": evaluated_ranges,
+            },
         )
     finally:
         policy.train(was_training)

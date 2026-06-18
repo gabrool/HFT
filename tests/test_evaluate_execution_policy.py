@@ -40,7 +40,7 @@ from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.rollout import RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy
-from tests.grid_helpers import decision_grid_for_tape
+from tests.grid_helpers import decision_grid_for_tape, write_split_source_manifest
 
 
 
@@ -146,11 +146,8 @@ def _save_tape(tmp_path, tape):
 
 def _tiny_events():
     l2_events = [
-        _l2(seq=0, local_ts_us=100),
-        _l2(seq=1, local_ts_us=200),
-        _l2(seq=2, local_ts_us=300),
-        _l2(seq=3, local_ts_us=400),
-        _l2(seq=4, local_ts_us=500),
+        _l2(seq=seq, local_ts_us=100 + seq * 100)
+        for seq in range(8)
     ]
     trades = [
         _trade(
@@ -238,9 +235,15 @@ def _tiny_env(max_episode_steps: int | None = 4) -> ExecutionEnv:
 
 
 def _tiny_tape_root(tmp_path):
-    root = _save_tape(tmp_path, _tiny_tape())
+    tape = _tiny_tape()
+    root = _save_tape(tmp_path, tape)
     _save_linear_signals(root)
+    write_split_source_manifest(root / "split_source", decision_grid_for_tape(tape))
     return root
+
+
+def _split_source_root(tape_root):
+    return tape_root / "split_source"
 
 
 def _train_tiny_checkpoint(tmp_path):
@@ -250,10 +253,13 @@ def _train_tiny_checkpoint(tmp_path):
         ExecutionPPOTrainCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            train_split="train",
             output_json=str(tmp_path / "train_summary.json"),
             checkpoint_path=str(checkpoint_path),
             overwrite=True,
             num_updates=1,
+            num_envs=1,
             rollout_steps=4,
             update_epochs=1,
             minibatch_size=2,
@@ -313,10 +319,13 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
         ExecutionPPOTrainCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            train_split="train",
             output_json=str(tmp_path / "train_summary.json"),
             checkpoint_path=str(tmp_path / "checkpoint.pt"),
             overwrite=True,
             num_updates=1,
+            num_envs=1,
             rollout_steps=4,
             update_epochs=1,
             minibatch_size=2,
@@ -333,10 +342,11 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(tmp_path / "checkpoint.pt"),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
             output_json=str(output_json),
             overwrite=True,
             max_steps=4,
-            start_event_index=0,
         )
     )
 
@@ -351,7 +361,9 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["checkpoint"]["updates_completed"] == 1
     assert summary["checkpoint"]["has_observation_normalizer"] is True
     assert summary["env_config_source"] == "checkpoint_cli_config"
-    assert summary["effective_start_event_index"] == 0
+    assert summary["eval_split"] == "val"
+    assert summary["checkpoint_split_source_matches_current"] is True
+    assert summary["evaluated_start_decision_row"] >= 0
     assert summary["evaluation"]["steps"] > 0
     assert summary["evaluation"]["steps"] <= 4
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
@@ -374,6 +386,8 @@ def test_evaluate_execution_policy_requires_linear_signals_file(tmp_path):
                 tape_root=str(eval_root),
                 decision_grid_path=str(eval_root / "decision_grid"),
                 checkpoint_path=str(checkpoint_path),
+                split_source_dataset_root=str(_split_source_root(eval_root)),
+                eval_split="val",
                 output_json=str(tmp_path / "eval_summary.json"),
                 overwrite=True,
                 max_steps=4,
@@ -397,6 +411,8 @@ def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path)
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
+                split_source_dataset_root=str(_split_source_root(tape_root)),
+                eval_split="val",
                 output_json=str(tmp_path / "eval_bad_summary.json"),
                 overwrite=True,
                 max_steps=4,
@@ -418,6 +434,8 @@ def test_evaluate_execution_policy_rejects_checkpoint_missing_linear_signal_meta
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
+                split_source_dataset_root=str(_split_source_root(tape_root)),
+                eval_split="val",
                 output_json=str(tmp_path / "eval_missing_linear.json"),
                 overwrite=True,
                 max_steps=4,
@@ -440,6 +458,8 @@ def test_evaluate_execution_policy_rejects_linear_signal_field_mismatch(tmp_path
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
+                split_source_dataset_root=str(_split_source_root(tape_root)),
+                eval_split="val",
                 output_json=str(tmp_path / "eval_bad_linear_fields.json"),
                 overwrite=True,
                 max_steps=4,
@@ -467,6 +487,8 @@ def test_evaluate_execution_policy_rejects_misaligned_linear_signal_metadata(tmp
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(checkpoint_path),
+                split_source_dataset_root=str(_split_source_root(tape_root)),
+                eval_split="val",
                 output_json=str(tmp_path / "eval_mismatch.json"),
                 overwrite=True,
                 max_steps=4,
@@ -487,6 +509,8 @@ def test_evaluate_execution_policy_requires_checkpoint_cli_config_by_default(tmp
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(bad_checkpoint),
+                split_source_dataset_root=str(_split_source_root(tape_root)),
+                eval_split="val",
                 output_json=str(tmp_path / "eval_missing_cli_config.json"),
                 overwrite=True,
                 max_steps=4,
@@ -494,96 +518,70 @@ def test_evaluate_execution_policy_requires_checkpoint_cli_config_by_default(tmp
         )
 
 
-def test_evaluate_execution_policy_can_explicitly_ignore_missing_checkpoint_cli_config(tmp_path):
+def test_evaluate_execution_policy_override_env_config_records_diff(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    checkpoint.pop("cli_config", None)
-    bad_checkpoint = tmp_path / "missing_cli_config_allowed.pt"
-    torch.save(checkpoint, bad_checkpoint)
-
     summary = run_execution_policy_evaluation(
         ExecutionPolicyEvaluationCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
-            checkpoint_path=str(bad_checkpoint),
+            checkpoint_path=str(checkpoint_path),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
             output_json=str(tmp_path / "eval_cli_config.json"),
             overwrite=True,
             max_steps=4,
-            max_episode_steps=4,
-            use_checkpoint_cli_env_config=False,
+            max_episode_steps=3,
+            override_env_config=True,
         )
     )
     assert summary["env_config_source"] == "evaluation_cli_config"
-    assert summary["effective_start_event_index"] is None
+    assert summary["env_config_diff"]["max_episode_steps"]["override"] == 3
 
 
-def test_evaluate_execution_policy_inherits_checkpoint_start_event_index_when_unset(tmp_path):
-    tape = _tape([_l2(seq=seq, local_ts_us=100 + seq * 100) for seq in range(8)], [])
-    tape_root = _save_tape(tmp_path, tape)
-
-    _save_linear_signals(
-        tape_root,
-        decision_interval_us=50,
-        start_event_index=1,
-    )
-
-    checkpoint_path = tmp_path / "checkpoint_start_1.pt"
-    run_execution_ppo_training(
-        ExecutionPPOTrainCLIConfig(
-            tape_root=str(tape_root),
-            decision_grid_path=str(tape_root / "decision_grid"),
-            output_json=str(tmp_path / "train_start_1_summary.json"),
-            checkpoint_path=str(checkpoint_path),
-            overwrite=True,
-            num_updates=1,
-            rollout_steps=3,
-            update_epochs=1,
-            minibatch_size=1,
-            hidden_sizes=(8,),
-            max_episode_steps=4,
-            start_event_index=1,
-            seed=123,
-        )
-    )
+def test_evaluate_execution_policy_runs_explicit_test_split(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
 
     summary = run_execution_policy_evaluation(
         ExecutionPolicyEvaluationCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(checkpoint_path),
-            output_json=str(tmp_path / "eval_start_1_summary.json"),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="test",
+            output_json=str(tmp_path / "eval_test_summary.json"),
             overwrite=True,
             max_steps=3,
         )
     )
 
     assert summary["env_config_source"] == "checkpoint_cli_config"
-    assert summary["effective_start_event_index"] == 1
-    assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
+    assert summary["eval_split"] == "test"
+    assert summary["split_lineage"]["eval_split"] == "test"
+    assert all(entry["role"] == "test" for entry in summary["evaluated_decision_row_ranges"])
     assert summary["evaluation"]["steps"] > 0
 
 
-def test_evaluate_execution_policy_accepts_explicit_later_decision_grid_start_override(tmp_path):
+def test_evaluate_execution_policy_rejects_checkpoint_split_contract_mismatch(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint["split_contract"] = dict(checkpoint["split_contract"])
+    checkpoint["split_contract"]["split_source_dataset_id"] = "other-split-source"
+    bad_checkpoint = tmp_path / "bad_split_checkpoint.pt"
+    torch.save(checkpoint, bad_checkpoint)
 
-    summary = run_execution_policy_evaluation(
-        ExecutionPolicyEvaluationCLIConfig(
-            tape_root=str(tape_root),
-            decision_grid_path=str(tape_root / "decision_grid"),
-            checkpoint_path=str(checkpoint_path),
-            output_json=str(tmp_path / "eval_start_override.json"),
-            overwrite=True,
-            max_steps=3,
-            max_episode_steps=3,
-            use_checkpoint_cli_env_config=False,
-            start_event_index=1,
+    with pytest.raises(ValueError, match="checkpoint split_contract"):
+        run_execution_policy_evaluation(
+            ExecutionPolicyEvaluationCLIConfig(
+                tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
+                checkpoint_path=str(bad_checkpoint),
+                split_source_dataset_root=str(_split_source_root(tape_root)),
+                eval_split="val",
+                output_json=str(tmp_path / "eval_bad_split.json"),
+                overwrite=True,
+                max_steps=3,
+            )
         )
-    )
-
-    assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
-    assert summary["effective_start_event_index"] == 1
-    assert summary["decision_grid_start"]["event_index"] == 1
-    assert summary["decision_grid_start"]["decision_grid_row_index"] == 1
 
 
 def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -598,12 +596,14 @@ def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path,
             str(tape_root / "decision_grid"),
             "--checkpoint-path",
             str(checkpoint_path),
+            "--split-source-dataset-root",
+            str(_split_source_root(tape_root)),
+            "--eval-split",
+            "val",
             "--output-json",
             str(output_json),
             "--max-steps",
             "4",
-            "--start-event-index",
-            "0",
             "--overwrite",
         ]
     )
@@ -633,6 +633,8 @@ def test_evaluate_execution_policy_refuses_overwrite_without_flag(tmp_path):
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
                 checkpoint_path=str(checkpoint_path),
+                split_source_dataset_root=str(_split_source_root(tape_root)),
+                eval_split="val",
                 output_json=str(output_json),
             )
         )
@@ -643,6 +645,8 @@ def test_evaluate_execution_policy_config_parses_dtype_and_queue_mode():
         tape_root="/tmp/tape",
         decision_grid_path="/tmp/tape/decision_grid",
         checkpoint_path="/tmp/checkpoint.pt",
+        split_source_dataset_root="/tmp/split-source",
+        eval_split="val",
         dtype="float64",
         queue_mode="balanced",
     )
@@ -654,6 +658,8 @@ def test_evaluate_execution_policy_config_parses_dtype_and_queue_mode():
             tape_root="/tmp/tape",
             decision_grid_path="/tmp/tape/decision_grid",
             checkpoint_path="/tmp/checkpoint.pt",
+            split_source_dataset_root="/tmp/split-source",
+            eval_split="val",
             dtype="float16",
         )
 
@@ -663,6 +669,8 @@ def test_evaluate_execution_policy_accepts_zero_queue_weights():
         tape_root="/tmp/tape",
         decision_grid_path="/tmp/tape/decision_grid",
         checkpoint_path="/tmp/checkpoint.pt",
+        split_source_dataset_root="/tmp/split-source",
+        eval_split="val",
         l2_decrease_weight=0.0,
         trade_at_level_weight=0.0,
     )
@@ -677,6 +685,8 @@ def test_evaluate_execution_policy_rejects_queue_weights_above_one():
             tape_root="/tmp/tape",
             decision_grid_path="/tmp/tape/decision_grid",
             checkpoint_path="/tmp/checkpoint.pt",
+            split_source_dataset_root="/tmp/split-source",
+            eval_split="val",
             l2_decrease_weight=1.1,
         )
 
@@ -685,6 +695,8 @@ def test_evaluate_execution_policy_rejects_queue_weights_above_one():
             tape_root="/tmp/tape",
             decision_grid_path="/tmp/tape/decision_grid",
             checkpoint_path="/tmp/checkpoint.pt",
+            split_source_dataset_root="/tmp/split-source",
+            eval_split="val",
             trade_at_level_weight=1.1,
         )
 
@@ -697,16 +709,17 @@ def test_evaluate_execution_policy_can_use_cli_env_config_instead_of_checkpoint(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
             checkpoint_path=str(checkpoint_path),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
             output_json=str(tmp_path / "eval_cli_env.json"),
             overwrite=True,
-            use_checkpoint_cli_env_config=False,
+            override_env_config=True,
             max_episode_steps=4,
             max_steps=4,
         )
     )
 
     assert summary["env_config_source"] == "evaluation_cli_config"
-    assert summary["effective_start_event_index"] is None
 
 
 def test_evaluate_modules_do_not_import_forbidden_layers():
@@ -754,7 +767,14 @@ def test_parser_can_disable_l2_trade_dedupe():
     from mmrt.cli.evaluate_execution_policy import build_arg_parser, _env_config_from_cli_config, _config_from_args
 
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--checkpoint-path", "/tmp/ckpt.pt", "--no-dedupe-l2-decrease-with-trade-prints"])
+    args = parser.parse_args([
+        "--tape-root", "/tmp/tape",
+        "--decision-grid", "/tmp/tape/decision_grid",
+        "--checkpoint-path", "/tmp/ckpt.pt",
+        "--split-source-dataset-root", "/tmp/split-source",
+        "--eval-split", "val",
+        "--no-dedupe-l2-decrease-with-trade-prints",
+    ])
     config = _config_from_args(args)
     env_config = _env_config_from_cli_config(config)
     assert config.dedupe_l2_decrease_with_trade_prints is False
@@ -765,7 +785,13 @@ def test_parser_dedupe_l2_trade_default_enabled():
     from mmrt.cli.evaluate_execution_policy import build_arg_parser, _config_from_args
 
     parser = build_arg_parser()
-    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--checkpoint-path", "/tmp/ckpt.pt"])
+    args = parser.parse_args([
+        "--tape-root", "/tmp/tape",
+        "--decision-grid", "/tmp/tape/decision_grid",
+        "--checkpoint-path", "/tmp/ckpt.pt",
+        "--split-source-dataset-root", "/tmp/split-source",
+        "--eval-split", "val",
+    ])
     config = _config_from_args(args)
     assert config.dedupe_l2_decrease_with_trade_prints is True
 
@@ -777,9 +803,11 @@ def test_evaluation_cli_env_config_adverse_runtime_uses_post_only_gap():
         tape_root="/tmp/tape",
         decision_grid_path="/tmp/tape/decision_grid",
         checkpoint_path="/tmp/checkpoint.pt",
+        split_source_dataset_root="/tmp/split-source",
+        eval_split="val",
         adverse_signals_npz="/tmp/adverse.npz",
         post_only_gap_ticks=2,
-        use_checkpoint_cli_env_config=False,
+        override_env_config=True,
     )
     env_config = _env_config_from_cli_config(config)
 

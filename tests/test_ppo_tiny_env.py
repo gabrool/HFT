@@ -37,7 +37,7 @@ from mmrt.rl.rollout import RolloutCollector, RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy, make_training_checkpoint_payload
-from tests.grid_helpers import decision_grid_for_tape
+from tests.grid_helpers import decision_grid_for_tape, write_split_source_manifest
 
 
 
@@ -143,11 +143,8 @@ def _save_tape(tmp_path, tape):
 
 def _tiny_events():
     l2_events = [
-        _l2(seq=0, local_ts_us=100),
-        _l2(seq=1, local_ts_us=200),
-        _l2(seq=2, local_ts_us=300),
-        _l2(seq=3, local_ts_us=400),
-        _l2(seq=4, local_ts_us=500),
+        _l2(seq=seq, local_ts_us=100 + seq * 100)
+        for seq in range(8)
     ]
     trades = [
         _trade(
@@ -221,8 +218,10 @@ def _tiny_tape():
 
 
 def _tiny_tape_root(tmp_path):
-    root = _save_tape(tmp_path, _tiny_tape())
+    tape = _tiny_tape()
+    root = _save_tape(tmp_path, tape)
     _save_linear_signals(root)
+    write_split_source_manifest(root / "split_source", decision_grid_for_tape(tape))
     return root
 
 
@@ -252,6 +251,7 @@ def test_rollout_collector_collects_tiny_env_batch():
         policy,
         config=RolloutConfig(
             rollout_steps=4,
+            num_envs=1,
             gamma=0.99,
             gae_lambda=0.95,
             device="cpu",
@@ -261,12 +261,12 @@ def test_rollout_collector_collects_tiny_env_batch():
     batch = collector.collect()
 
     assert batch.num_steps == 4
-    assert batch.observations.shape == (4, obs_dim)
-    assert batch.actions.shape == (4, 8)
-    assert batch.log_probs.shape == (4,)
-    assert batch.values.shape == (4,)
-    assert batch.advantages.shape == (4,)
-    assert batch.returns.shape == (4,)
+    assert batch.observations.shape == (4, 1, obs_dim)
+    assert batch.actions.shape == (4, 1, 8)
+    assert batch.log_probs.shape == (4, 1)
+    assert batch.values.shape == (4, 1)
+    assert batch.advantages.shape == (4, 1)
+    assert batch.returns.shape == (4, 1)
     assert torch.isfinite(batch.observations).all()
     assert torch.isfinite(batch.actions).all()
     assert torch.isfinite(batch.log_probs).all()
@@ -285,6 +285,7 @@ def test_train_ppo_policy_runs_one_update_on_tiny_env():
         network_config=ActorCriticConfig(hidden_sizes=(8,)),
         rollout_config=RolloutConfig(
             rollout_steps=4,
+            num_envs=1,
             device="cpu",
             dtype=torch.float32,
         ),
@@ -319,10 +320,13 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
         ExecutionPPOTrainCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(tape_root / "split_source"),
+            train_split="train",
             output_json=str(output_json),
             checkpoint_path=str(checkpoint_path),
             overwrite=True,
             num_updates=1,
+            num_envs=1,
             rollout_steps=4,
             update_epochs=1,
             minibatch_size=2,
@@ -340,6 +344,9 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["checkpoint_saved"] is True
     assert summary["training"]["updates_completed"] == 1
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
+    assert summary["train_split"] == "train"
+    assert summary["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
+    assert summary["rollout"]["effective_batch_size"] == 4
     assert summary["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
     assert summary["linear_signals"]["n_rows"] >= 1
 
@@ -350,6 +357,8 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert ckpt["tape"]["symbol"] == "BTCUSDT"
     assert ckpt["observation_schema"] == summary["observation_schema"]
     assert ckpt["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
+    assert ckpt["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
+    assert ckpt["train_split"] == "train"
 
 
 def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):
@@ -362,9 +371,17 @@ def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsy
             str(tape_root),
             "--decision-grid",
             str(tape_root / "decision_grid"),
+            "--split-source-dataset-root",
+            str(tape_root / "split_source"),
+            "--train-split",
+            "train",
             "--output-json",
             str(output_json),
+            "--maker-fee-bps",
+            "0.0",
             "--num-updates",
+            "1",
+            "--num-envs",
             "1",
             "--rollout-steps",
             "4",
@@ -400,6 +417,7 @@ def test_train_execution_ppo_requires_linear_signals_file(tmp_path):
             ExecutionPPOTrainCLIConfig(
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
+                split_source_dataset_root=str(tape_root / "split_source"),
                 output_json=str(tmp_path / "summary.json"),
                 save_checkpoint=False,
                 overwrite=True,
@@ -422,6 +440,7 @@ def test_train_execution_ppo_refuses_overwrite_without_flag(tmp_path):
             ExecutionPPOTrainCLIConfig(
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
+                split_source_dataset_root=str(tape_root / "split_source"),
                 output_json=str(output_json),
                 save_checkpoint=False,
                 num_updates=1,
@@ -439,6 +458,7 @@ def test_train_execution_ppo_refuses_overwrite_without_flag(tmp_path):
             ExecutionPPOTrainCLIConfig(
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
+                split_source_dataset_root=str(tape_root / "split_source"),
                 output_json=str(tmp_path / "fresh.json"),
                 checkpoint_path=str(checkpoint_path),
                 save_checkpoint=True,
@@ -455,6 +475,7 @@ def test_train_execution_ppo_cli_config_parses_hidden_sizes_and_dtype():
     cfg = ExecutionPPOTrainCLIConfig(
         tape_root="/tmp/tape",
         decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
         hidden_sizes="8,4",
         dtype="float64",
         queue_mode="balanced",
@@ -463,7 +484,7 @@ def test_train_execution_ppo_cli_config_parses_hidden_sizes_and_dtype():
     assert cfg.dtype is torch.float64
     assert cfg.queue_mode.value == "balanced"
 
-    cfg = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", hidden_sizes="none")
+    cfg = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", split_source_dataset_root="/tmp/split-source", hidden_sizes="none")
     assert cfg.hidden_sizes == ()
 
 
@@ -471,6 +492,7 @@ def test_train_execution_ppo_accepts_zero_queue_weights():
     cfg = ExecutionPPOTrainCLIConfig(
         tape_root="/tmp/tape",
         decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
         l2_decrease_weight=0.0,
         trade_at_level_weight=0.0,
     )
@@ -481,10 +503,10 @@ def test_train_execution_ppo_accepts_zero_queue_weights():
 
 def test_train_execution_ppo_rejects_queue_weights_above_one():
     with pytest.raises(ValueError):
-        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", l2_decrease_weight=1.1)
+        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", split_source_dataset_root="/tmp/split-source", l2_decrease_weight=1.1)
 
     with pytest.raises(ValueError):
-        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", trade_at_level_weight=1.1)
+        ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid", split_source_dataset_root="/tmp/split-source", trade_at_level_weight=1.1)
 
 
 def test_train_execution_ppo_cli_does_not_import_forbidden_modules():

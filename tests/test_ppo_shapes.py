@@ -193,6 +193,54 @@ def test_compute_gae_shapes_and_terminal_mask():
     assert torch.allclose(returns, advantages + values)
 
 
+def test_compute_gae_rank2_keeps_env_boundaries_independent():
+    rewards = torch.tensor([[1.0, 10.0], [1.0, 10.0], [1.0, 10.0]])
+    values = torch.zeros_like(rewards)
+    dones = torch.tensor([[False, False], [True, False], [False, True]])
+
+    advantages, returns = compute_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        last_value=torch.zeros(2),
+        gamma=1.0,
+        gae_lambda=1.0,
+    )
+
+    assert advantages.shape == rewards.shape
+    assert torch.allclose(advantages[:, 0], torch.tensor([2.0, 1.0, 1.0]))
+    assert torch.allclose(advantages[:, 1], torch.tensor([30.0, 20.0, 10.0]))
+    assert torch.allclose(returns, advantages)
+
+
+def test_flatten_rollout_batch_flattens_vectorized_rollout_at_update_time():
+    steps = 3
+    num_envs = 2
+    obs_dim = 4
+    action_dim = EXECUTION_ACTION_DIM
+    batch = RolloutBatch(
+        observations=torch.randn(steps, num_envs, obs_dim),
+        actions=torch.randn(steps, num_envs, action_dim),
+        log_probs=torch.zeros(steps, num_envs),
+        values=torch.zeros(steps, num_envs),
+        rewards=torch.randn(steps, num_envs),
+        dones=torch.zeros(steps, num_envs, dtype=torch.bool),
+        terminated=torch.zeros(steps, num_envs, dtype=torch.bool),
+        truncated=torch.zeros(steps, num_envs, dtype=torch.bool),
+        advantages=torch.randn(steps, num_envs),
+        returns=torch.randn(steps, num_envs),
+        entropies=torch.zeros(steps, num_envs),
+        episode_count=0,
+    )
+
+    flat = flatten_rollout_batch(batch)
+
+    assert batch.num_steps == steps * num_envs
+    assert flat["observations"].shape == (steps * num_envs, obs_dim)
+    assert flat["actions"].shape == (steps * num_envs, action_dim)
+    assert flat["advantages"].shape == (steps * num_envs,)
+
+
 def test_observation_to_tensor_can_reuse_output_buffer():
     out = torch.empty(3, dtype=torch.float32)
     result = rollout_mod._observation_to_tensor(
@@ -245,11 +293,14 @@ def test_iter_minibatch_indices_covers_all_rows():
 def test_training_config_to_dict_is_json_safe():
     cfg = PPOTrainingConfig(
         num_updates=1,
-        rollout_config=RolloutConfig(rollout_steps=4, device="cpu"),
+        rollout_config=RolloutConfig(rollout_steps=4, num_envs=2, device="cpu"),
+        ppo_config=PPOConfig(minibatch_size=4),
     )
     payload = training_config_to_dict(cfg)
     assert payload["num_updates"] == 1
     assert payload["rollout_config"]["device"] == "cpu"
+    assert payload["rollout_config"]["num_envs"] == 2
+    assert payload["rollout_config"]["effective_batch_size"] == 8
     assert payload["rollout_config"]["dtype"].startswith("torch.")
     net = payload["network_config"]
     assert "enable_threshold" in net

@@ -332,18 +332,28 @@ class ExecutionEnv:
     def reset(
         self,
         *,
+        start_decision_row: int | None = None,
         start_event_index: int | None = None,
         initial_position: PositionState | None = None,
     ) -> ExecutionEnvReset:
         events = self.tape.arrays.events
-        if start_event_index is None:
-            start = int(self.decision_grid.decision_event_index[0])
+        if start_decision_row is not None and start_event_index is not None:
+            raise ValueError("start_decision_row and start_event_index cannot both be set")
+        if start_decision_row is not None:
+            decision_row = _require_nonnegative_int(start_decision_row, "start_decision_row")
+            if decision_row + 1 >= self.decision_grid.n_rows:
+                raise ValueError("start_decision_row must leave at least one following decision grid row")
+            start = int(self.decision_grid.decision_event_index[decision_row])
+        elif start_event_index is None:
+            decision_row = 0
+            start = int(self.decision_grid.decision_event_index[decision_row])
         else:
             start = _require_nonnegative_int(start_event_index, "start_event_index")
         if start >= len(events):
             raise ValueError("start_event_index must be < len(tape.arrays.events)")
 
-        decision_row = self._decision_grid_row_for_event_index(start)
+        if start_decision_row is None and start_event_index is not None:
+            decision_row = self._decision_grid_row_for_event_index(start)
         if decision_row + 1 >= self.decision_grid.n_rows:
             raise ValueError("start_event_index must leave at least one following decision grid row")
         event = events[start]

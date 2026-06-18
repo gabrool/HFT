@@ -9,7 +9,8 @@ from typing import Mapping
 
 import numpy as np
 
-from mmrt.execution.adverse_selection_dataset import ADVERSE_SPLIT_CONTRACT_SCHEMA, DiskBackedAdverseSelectionDataset
+from mmrt.execution.adverse_selection_dataset import DiskBackedAdverseSelectionDataset
+from mmrt.execution.split_contract import ranges_for_split, validate_split_contract_payload
 
 _SPLIT_ROLES = ("train", "val", "test")
 
@@ -116,26 +117,7 @@ class BinaryHistogramAUC:
 
 
 def _split_ranges(split_contract: Mapping[str, object], role: str) -> tuple[tuple[int, int], ...]:
-    if not isinstance(split_contract, Mapping):
-        raise ValueError("split_contract must be a mapping")
-    if split_contract.get("schema") != ADVERSE_SPLIT_CONTRACT_SCHEMA:
-        raise ValueError("split_contract schema mismatch")
-    ranges = split_contract.get("ranges")
-    if not isinstance(ranges, Mapping):
-        raise ValueError("split_contract ranges must be a mapping")
-    entries = ranges.get(role)
-    if not isinstance(entries, list) or not entries:
-        raise ValueError(f"split_contract ranges must include {role}")
-    out: list[tuple[int, int]] = []
-    for i, entry in enumerate(entries):
-        if not isinstance(entry, Mapping):
-            raise ValueError(f"split_contract ranges.{role}[{i}] must be a mapping")
-        start = int(entry["start_local_ts_us"])
-        end = int(entry["end_local_ts_us"])
-        if end <= start:
-            raise ValueError(f"split_contract ranges.{role}[{i}] has invalid bounds")
-        out.append((start, end))
-    return tuple(out)
+    return tuple((entry.start_local_ts_us, entry.end_local_ts_us) for entry in ranges_for_split(split_contract, role))
 
 
 def _split_masks_for_local_ts(local_ts_us: np.ndarray, split_contract: Mapping[str, object]) -> tuple[dict[str, np.ndarray], np.ndarray]:
@@ -162,7 +144,7 @@ def split_contract_with_adverse_counts(
     out_of_split_rows: int,
     adverse_dataset_rows_total: int,
 ) -> dict[str, object]:
-    out = deepcopy(dict(split_contract))
+    out = deepcopy(validate_split_contract_payload(split_contract))
     out["adverse_dataset_rows_total"] = int(adverse_dataset_rows_total)
     out["adverse_row_counts"] = {
         "train": int(train_rows),
