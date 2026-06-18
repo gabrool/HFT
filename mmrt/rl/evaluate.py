@@ -11,7 +11,7 @@ from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_exec
 from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.metrics import ExecutionMetricAccumulator
 from mmrt.execution.split_contract import DecisionSplitRange
-from mmrt.rl.device import resolve_torch_device
+from mmrt.rl.device import canonicalize_torch_device, resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer
 from mmrt.rl.torch_networks import ActorCriticNetwork
 
@@ -230,7 +230,7 @@ def evaluate_policy(
     device = _resolve_device(policy, config.device)
     dtype = config.dtype
     policy_device = _resolve_device(policy, None)
-    if device != policy_device:
+    if canonicalize_torch_device(device) != canonicalize_torch_device(policy_device):
         raise ValueError("evaluation device must match policy device")
 
     was_training = policy.training
