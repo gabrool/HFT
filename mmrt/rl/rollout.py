@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
+import random
 import time
 from typing import Any, NamedTuple, Sequence
 
@@ -16,12 +18,17 @@ from mmrt.rl.torch_networks import ActorCriticNetwork
 
 
 __all__ = [
+    "TRAIN_WINDOW_SAMPLING_MODES",
+    "TrainWindowSampler",
     "RolloutConfig",
     "RolloutBatch",
     "compute_gae",
     "RolloutCollector",
     "collect_rollout",
 ]
+
+
+TRAIN_WINDOW_SAMPLING_MODES = ("stratified_random", "cyclic_spread", "chronological")
 
 
 def _require_bool(value: bool, name: str) -> bool:
@@ -44,6 +51,21 @@ def _require_nonnegative_int(value: int, name: str) -> int:
     if value < 0:
         raise ValueError(f"{name} must be a nonnegative int")
     return value
+
+
+def _optional_nonnegative_int(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_nonnegative_int(value, name)
+
+
+def _coerce_train_window_sampling(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("train_window_sampling must be str")
+    normalized = value.strip()
+    if normalized not in TRAIN_WINDOW_SAMPLING_MODES:
+        raise ValueError(f"train_window_sampling must be one of {TRAIN_WINDOW_SAMPLING_MODES}")
+    return normalized
 
 
 def _require_probability(value: float, name: str) -> float:
@@ -117,6 +139,153 @@ def _observations_to_tensor(
     return out
 
 
+class TrainWindowSampler:
+    """Seedable start-row sampler over rollout-capable train split ranges."""
+
+    def __init__(
+        self,
+        decision_row_ranges: Sequence[DecisionSplitRange],
+        *,
+        mode: str = "stratified_random",
+        seed: int | None = None,
+        num_envs: int = 1,
+    ) -> None:
+        ranges = tuple(decision_row_ranges)
+        if not ranges:
+            raise ValueError("decision_row_ranges must be non-empty")
+        if any(not isinstance(item, DecisionSplitRange) for item in ranges):
+            raise TypeError("decision_row_ranges entries must be DecisionSplitRange")
+        if any(item.rollout_step_capacity <= 0 for item in ranges):
+            raise ValueError("decision_row_ranges must each contain at least two decision rows")
+        self.ranges = ranges
+        self.mode = _coerce_train_window_sampling(mode)
+        self.seed = _optional_nonnegative_int(seed, "seed")
+        self.num_envs = _require_positive_int(num_envs, "num_envs")
+        self._rng = random.Random(self.seed)
+        self._reset_counts = [0 for _ in range(self.num_envs)]
+        self._chronological_cursor = 0
+        cumulative: list[int] = []
+        running = 0
+        for entry in ranges:
+            running += int(entry.rollout_step_capacity)
+            cumulative.append(running)
+        self._cumulative_capacity = tuple(cumulative)
+        self.total_capacity_rows = int(running)
+        self.train_row_count = int(sum(entry.row_count for entry in ranges))
+        self._sampled_start_rows: list[int] = []
+        self._sampled_range_indices: list[int] = []
+
+    @property
+    def sampled_start_count(self) -> int:
+        return len(self._sampled_start_rows)
+
+    def range_for_row(self, row: int) -> DecisionSplitRange | None:
+        row = _require_nonnegative_int(row, "row")
+        for entry in self.ranges:
+            if entry.start_decision_row <= row and row + 1 < entry.end_decision_row:
+                return entry
+        return None
+
+    def _range_index_for(self, split_range: DecisionSplitRange) -> int:
+        for index, entry in enumerate(self.ranges):
+            if (
+                entry.role == split_range.role
+                and entry.segment_key == split_range.segment_key
+                and entry.start_decision_row == split_range.start_decision_row
+                and entry.end_decision_row == split_range.end_decision_row
+            ):
+                return index
+        raise ValueError("split_range is not managed by this sampler")
+
+    def _sample_at_capacity_position(self, position: int) -> tuple[int, DecisionSplitRange, int]:
+        if self.total_capacity_rows <= 0:
+            raise RuntimeError("train window sampler has no rollout-capable rows")
+        normalized = int(position) % self.total_capacity_rows
+        range_index = bisect_right(self._cumulative_capacity, normalized)
+        previous_capacity = 0 if range_index == 0 else self._cumulative_capacity[range_index - 1]
+        selected = self.ranges[range_index]
+        offset = normalized - previous_capacity
+        return selected.start_decision_row + offset, selected, range_index
+
+    def _sample_position(self, env_index: int) -> int:
+        env_index = _require_nonnegative_int(env_index, "env_index")
+        if env_index >= self.num_envs:
+            raise ValueError("env_index must be < num_envs")
+        reset_round = self._reset_counts[env_index]
+        total = self.total_capacity_rows
+        if self.mode == "stratified_random":
+            stratum_count = max(1, self.num_envs)
+            stratum = (env_index + reset_round) % stratum_count
+            lo = int(stratum * total / stratum_count)
+            hi = int((stratum + 1) * total / stratum_count)
+            lo = min(lo, total - 1)
+            hi = max(lo + 1, min(hi, total))
+            return self._rng.randrange(lo, hi)
+        if self.mode == "cyclic_spread":
+            position = int((env_index + 0.5) * total / max(1, self.num_envs))
+            return (position + reset_round) % total
+        if self.mode == "chronological":
+            position = self._chronological_cursor
+            self._chronological_cursor += 1
+            return position
+        raise RuntimeError("unreachable train window sampling mode")
+
+    def sample(self, env_index: int) -> tuple[int, DecisionSplitRange]:
+        position = self._sample_position(env_index)
+        row, selected, range_index = self._sample_at_capacity_position(position)
+        self._reset_counts[env_index] += 1
+        self.record(row, selected, range_index=range_index)
+        return row, selected
+
+    def record(
+        self,
+        row: int,
+        split_range: DecisionSplitRange,
+        *,
+        range_index: int | None = None,
+    ) -> None:
+        row = _require_nonnegative_int(row, "row")
+        if not (split_range.start_decision_row <= row and row + 1 < split_range.end_decision_row):
+            raise ValueError("sampled start row must lie inside a rollout-capable split range")
+        if range_index is None:
+            range_index = self._range_index_for(split_range)
+        self._sampled_start_rows.append(row)
+        self._sampled_range_indices.append(int(range_index))
+
+    def stats_since(self, start_index: int = 0) -> dict[str, object]:
+        start_index = _require_nonnegative_int(start_index, "start_index")
+        rows = self._sampled_start_rows[start_index:]
+        range_indices = self._sampled_range_indices[start_index:]
+        stats: dict[str, object] = {
+            "train_window_sampling": self.mode,
+            "seed": self.seed,
+            "sampled_start_count": len(rows),
+            "unique_train_ranges_visited": len(set(range_indices)),
+            "train_row_count": self.train_row_count,
+            "train_capacity_rows": self.total_capacity_rows,
+            "estimated_train_coverage_fraction": (
+                float(len(set(rows)) / self.train_row_count) if self.train_row_count > 0 else 0.0
+            ),
+        }
+        if rows:
+            stats.update(
+                {
+                    "sampled_start_decision_row_min": int(min(rows)),
+                    "sampled_start_decision_row_max": int(max(rows)),
+                    "sampled_start_decision_row_mean": float(sum(rows) / len(rows)),
+                }
+            )
+        else:
+            stats.update(
+                {
+                    "sampled_start_decision_row_min": None,
+                    "sampled_start_decision_row_max": None,
+                    "sampled_start_decision_row_mean": None,
+                }
+            )
+        return stats
+
+
 @dataclass(frozen=True, slots=True)
 class RolloutConfig:
     rollout_steps: int = 1024
@@ -171,6 +340,7 @@ class RolloutBatch(NamedTuple):
     episode_count: int
     decision_rows: torch.Tensor | None = None
     timing: dict[str, float] | None = None
+    sampling_stats: dict[str, object] | None = None
 
     @property
     def num_steps(self) -> int:
@@ -211,6 +381,7 @@ class RolloutBatch(NamedTuple):
             episode_count=self.episode_count,
             decision_rows=None if decision_rows is None else decision_rows.to(device),
             timing=None if self.timing is None else dict(self.timing),
+            sampling_stats=None if self.sampling_stats is None else dict(self.sampling_stats),
         )
 
 
@@ -293,6 +464,8 @@ class RolloutCollector:
         config: RolloutConfig = RolloutConfig(),
         observation_normalizer: ObservationNormalizer | None = None,
         decision_row_ranges: Sequence[DecisionSplitRange] | None = None,
+        train_window_sampling: str = "stratified_random",
+        seed: int | None = None,
     ) -> None:
         envs = _coerce_envs(env)
         if not isinstance(policy, ActorCriticNetwork):
@@ -321,6 +494,7 @@ class RolloutCollector:
 
         if decision_row_ranges is None:
             ranges: tuple[DecisionSplitRange, ...] = ()
+            sampler = None
         else:
             ranges = tuple(decision_row_ranges)
             if not ranges:
@@ -329,8 +503,14 @@ class RolloutCollector:
                 raise TypeError("decision_row_ranges entries must be DecisionSplitRange")
             if any(item.rollout_step_capacity <= 0 for item in ranges):
                 raise ValueError("decision_row_ranges must each contain at least two decision rows")
+            sampler = TrainWindowSampler(
+                ranges,
+                mode=train_window_sampling,
+                seed=seed,
+                num_envs=self.num_envs,
+            )
         self.decision_row_ranges = ranges
-        self._reset_counts = [0 for _ in envs]
+        self._train_window_sampler = sampler
 
         self._current_observations: list[Any | None] = [None for _ in envs]
         self._current_decision_rows = [-1 for _ in envs]
@@ -350,6 +530,8 @@ class RolloutCollector:
 
     def _range_for_row(self, row: int) -> DecisionSplitRange | None:
         row = _require_nonnegative_int(row, "row")
+        if self._train_window_sampler is not None:
+            return self._train_window_sampler.range_for_row(row)
         if not self.decision_row_ranges:
             return None
         for entry in self.decision_row_ranges:
@@ -358,16 +540,9 @@ class RolloutCollector:
         return None
 
     def _next_start_for_env(self, env_index: int) -> tuple[int | None, DecisionSplitRange | None]:
-        if not self.decision_row_ranges:
+        if self._train_window_sampler is None:
             return None, None
-        env_index = _require_nonnegative_int(env_index, "env_index")
-        reset_index = self._reset_counts[env_index]
-        range_index = (env_index + reset_index) % len(self.decision_row_ranges)
-        selected = self.decision_row_ranges[range_index]
-        capacity = selected.rollout_step_capacity
-        offset = (reset_index // len(self.decision_row_ranges)) % capacity
-        self._reset_counts[env_index] += 1
-        return selected.start_decision_row + offset, selected
+        return self._train_window_sampler.sample(env_index)
 
     def _reset_one(self, env_index: int, *, start_decision_row: int | None = None) -> None:
         env = self.envs[env_index]
@@ -383,6 +558,8 @@ class RolloutCollector:
         current_range = selected_range if selected_range is not None else self._range_for_row(decision_row)
         if self.decision_row_ranges and current_range is None:
             raise ValueError("environment reset outside rollout split ranges")
+        if start_decision_row is not None and self._train_window_sampler is not None:
+            self._train_window_sampler.record(decision_row, current_range)  # type: ignore[arg-type]
         self._current_observations[env_index] = reset.observation
         self._current_decision_rows[env_index] = decision_row
         self._current_ranges[env_index] = current_range
@@ -416,6 +593,11 @@ class RolloutCollector:
 
     def collect(self, *, start_decision_rows: Sequence[int] | None = None) -> RolloutBatch:
         config = self.config
+        sample_stat_start = (
+            self._train_window_sampler.sampled_start_count
+            if self._train_window_sampler is not None
+            else 0
+        )
         if not self._has_reset or start_decision_rows is not None:
             self.reset(start_decision_rows=start_decision_rows)
 
@@ -524,6 +706,11 @@ class RolloutCollector:
             "policy_forward_steps_per_sec": float(total_steps / policy_forward_seconds) if policy_forward_seconds > 0.0 else 0.0,
             "total_steps_per_sec": float(total_steps / rollout_seconds) if rollout_seconds > 0.0 else 0.0,
         }
+        sampling_stats = (
+            self._train_window_sampler.stats_since(sample_stat_start)
+            if self._train_window_sampler is not None
+            else None
+        )
 
         return RolloutBatch(
             observations=observations,
@@ -540,7 +727,13 @@ class RolloutCollector:
             episode_count=self.episode_count - episode_count_start,
             decision_rows=decision_rows,
             timing=timing,
+            sampling_stats=sampling_stats,
         )
+
+    def sampling_stats(self) -> dict[str, object] | None:
+        if self._train_window_sampler is None:
+            return None
+        return self._train_window_sampler.stats_since(0)
 
 
 def collect_rollout(
@@ -551,6 +744,8 @@ def collect_rollout(
     observation_normalizer: ObservationNormalizer | None = None,
     start_decision_rows: Sequence[int] | None = None,
     decision_row_ranges: Sequence[DecisionSplitRange] | None = None,
+    train_window_sampling: str = "stratified_random",
+    seed: int | None = None,
 ) -> RolloutBatch:
     collector = RolloutCollector(
         env,
@@ -558,5 +753,7 @@ def collect_rollout(
         config=config,
         observation_normalizer=observation_normalizer,
         decision_row_ranges=decision_row_ranges,
+        train_window_sampling=train_window_sampling,
+        seed=seed,
     )
     return collector.collect(start_decision_rows=start_decision_rows)

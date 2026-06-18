@@ -729,7 +729,8 @@ def run_execution_policy_evaluation(
 
     split_lineage = _split_summary(split_contract, config.eval_split)
     evaluation_payload = result.as_dict()
-    evaluated_ranges = evaluation_payload["config"]["evaluated_decision_row_ranges"]  # type: ignore[index]
+    evaluation_config = evaluation_payload["config"]  # type: ignore[index]
+    evaluated_ranges = evaluation_config["evaluated_decision_row_ranges"]  # type: ignore[index]
     summary = {
         "status": result.status,
         "run_type": "evaluate_execution_policy",
@@ -778,9 +779,14 @@ def run_execution_policy_evaluation(
         "split_contract": split_contract,
         "checkpoint_split_contract": checkpoint_split_contract,
         "split_lineage": split_lineage,
+        "eval_requested_row_count": evaluation_config["eval_requested_row_count"],  # type: ignore[index]
+        "eval_covered_row_count": evaluation_config["eval_covered_row_count"],  # type: ignore[index]
+        "eval_coverage_fraction": evaluation_config["eval_coverage_fraction"],  # type: ignore[index]
         "evaluated_decision_row_ranges": evaluated_ranges,
-        "evaluated_start_decision_row": evaluation_payload["config"]["evaluated_start_decision_row"],  # type: ignore[index]
-        "evaluated_end_decision_row": evaluation_payload["config"]["evaluated_end_decision_row"],  # type: ignore[index]
+        "episode_count": evaluation_config["episode_count"],  # type: ignore[index]
+        "truncation_counts": evaluation_config["truncation_counts"],  # type: ignore[index]
+        "evaluated_start_decision_row": evaluation_config["evaluated_start_decision_row"],  # type: ignore[index]
+        "evaluated_end_decision_row": evaluation_config["evaluated_end_decision_row"],  # type: ignore[index]
         "evaluation": evaluation_payload,
     }
     _write_json_atomic(output_json, summary)

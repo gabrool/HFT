@@ -30,7 +30,7 @@ from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execut
 from mmrt.rl.device import cuda_memory_summary, resolve_torch_device, torch_device_summary
 from mmrt.rl.normalization import ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig
-from mmrt.rl.rollout import RolloutConfig
+from mmrt.rl.rollout import TRAIN_WINDOW_SAMPLING_MODES, RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig
 from mmrt.rl.train import (
     PPOTrainingConfig,
@@ -142,6 +142,15 @@ def _coerce_dtype(value: torch.dtype | str) -> torch.dtype:
     raise ValueError("dtype must be torch.dtype or str")
 
 
+def _coerce_train_window_sampling(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("train_window_sampling must be str")
+    normalized = value.strip()
+    if normalized not in TRAIN_WINDOW_SAMPLING_MODES:
+        raise ValueError(f"train_window_sampling must be one of {TRAIN_WINDOW_SAMPLING_MODES}")
+    return normalized
+
+
 def _parse_hidden_sizes(value: str | Sequence[int] | tuple[int, ...]) -> tuple[int, ...]:
     if isinstance(value, str):
         raw = value.strip()
@@ -212,6 +221,7 @@ class ExecutionPPOTrainCLIConfig:
     weight_decay: float = 0.0
     debug_start_decision_row: int | None = None
     seed: int | None = None
+    train_window_sampling: str = "stratified_random"
 
     num_envs: int = 4
     rollout_steps: int = 2048
@@ -307,6 +317,11 @@ class ExecutionPPOTrainCLIConfig:
         _require_nonnegative_float(self.weight_decay, "weight_decay")
         _optional_nonnegative_int(self.debug_start_decision_row, "debug_start_decision_row")
         _optional_nonnegative_int(self.seed, "seed")
+        object.__setattr__(
+            self,
+            "train_window_sampling",
+            _coerce_train_window_sampling(self.train_window_sampling),
+        )
 
         _require_positive_int(self.num_envs, "num_envs")
         _require_positive_int(self.rollout_steps, "rollout_steps")
@@ -399,6 +414,7 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "weight_decay": config.weight_decay,
         "debug_start_decision_row": config.debug_start_decision_row,
         "seed": config.seed,
+        "train_window_sampling": config.train_window_sampling,
         "num_envs": config.num_envs,
         "rollout_steps": config.rollout_steps,
         "effective_batch_size": config.num_envs * config.rollout_steps,
@@ -524,6 +540,7 @@ def _build_training_config(
         adam_eps=config.adam_eps,
         weight_decay=config.weight_decay,
         seed=config.seed,
+        train_window_sampling=config.train_window_sampling,
         use_observation_normalizer=config.use_observation_normalizer,
         network_config=network_config,
         rollout_config=rollout_config,
@@ -724,6 +741,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
     )
 
     split_lineage = _split_lineage_summary(split_contract, config.train_split)
+    training_summary = result.summary_dict()
     summary: dict[str, object] = {
         "status": "ok",
         "run_type": "profile_execution_ppo_rollout" if profile_mode else "train_execution_ppo",
@@ -748,7 +766,8 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "end_local_ts_us": tape.manifest.end_local_ts_us,
             "book_depth": tape.manifest.notes.get("book_depth") if tape.manifest.notes is not None else None,
         },
-        "training": result.summary_dict(),
+        "training": training_summary,
+        "sampling": training_summary["sampling"],
         "observation_schema": envs[0].config.observation_schema.as_dict(),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
         "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
@@ -765,6 +784,8 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         "train_ranges": split_lineage["selected_ranges"],
         "train_row_count": split_lineage["selected_row_count"],
         "debug_start_decision_row": config.debug_start_decision_row,
+        "train_window_sampling": config.train_window_sampling,
+        "seed": config.seed,
         "rollout": {
             "num_envs": config.num_envs,
             "rollout_steps_per_env": training_config.rollout_config.rollout_steps,
@@ -777,7 +798,8 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         summary["profile"] = {
             "profile_rollout_steps": config.profile_rollout_steps,
             "num_envs": config.num_envs,
-            "timing": result.summary_dict()["final"]["timing"],  # type: ignore[index]
+            "timing": training_summary["final"]["timing"],  # type: ignore[index]
+            "sampling": training_summary["sampling"],
             "resolved_device": str(resolved_device),
         }
     elif config.save_checkpoint:
@@ -796,6 +818,8 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         checkpoint_payload["train_split"] = config.train_split
         checkpoint_payload["train_ranges"] = split_lineage["selected_ranges"]
         checkpoint_payload["train_row_count"] = split_lineage["selected_row_count"]
+        checkpoint_payload["train_window_sampling"] = config.train_window_sampling
+        checkpoint_payload["sampling"] = training_summary["sampling"]
         checkpoint_payload["device"] = summary["device"]
         checkpoint_payload["env_config"] = summary["env_config"]
         _save_checkpoint_atomic(checkpoint_path, checkpoint_payload)
@@ -860,6 +884,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--debug-start-decision-row", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--train-window-sampling",
+        choices=TRAIN_WINDOW_SAMPLING_MODES,
+        default="stratified_random",
+    )
 
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--rollout-steps", type=int, default=2048)
@@ -951,6 +980,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         weight_decay=args.weight_decay,
         debug_start_decision_row=args.debug_start_decision_row,
         seed=args.seed,
+        train_window_sampling=args.train_window_sampling,
         num_envs=args.num_envs,
         rollout_steps=args.rollout_steps,
         gamma=args.gamma,

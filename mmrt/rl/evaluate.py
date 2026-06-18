@@ -198,6 +198,10 @@ def _config_to_dict(config: PolicyEvaluationConfig) -> dict[str, object]:
     return values
 
 
+def _increment_counter(counts: dict[str, int], key: str) -> None:
+    counts[key] = int(counts.get(key, 0)) + 1
+
+
 def evaluate_policy(
     env: ExecutionEnv,
     policy: ActorCriticNetwork,
@@ -236,9 +240,16 @@ def evaluate_policy(
         terminated = False
         truncated = False
         step_count = 0
+        episode_count = 0
         evaluated_start_decision_row: int | None = None
         evaluated_end_decision_row: int | None = None
         evaluated_ranges: list[dict[str, object]] = []
+        truncation_counts: dict[str, int] = {
+            "max_episode_steps": 0,
+            "split_exhausted": 0,
+            "max_steps": 0,
+            "terminal_done": 0,
+        }
 
         if config.decision_row_ranges:
             eval_ranges = tuple(
@@ -250,75 +261,122 @@ def evaluate_policy(
             reset_end = config.end_decision_row
             eval_ranges = ((reset_start, reset_end, None),)
 
+        requested_row_count = int(
+            sum(
+                max(0, int(range_end) - int(range_start) - 1)
+                for range_start, range_end, _range_meta in eval_ranges
+                if range_end is not None
+            )
+        )
+        stop_all_ranges = False
         for range_start, range_end, range_meta in eval_ranges:
-            if config.max_steps is not None and step_count >= config.max_steps:
-                truncated = True
-                break
-            reset = env.reset(start_decision_row=range_start)
-            current_observation = reset.observation
-            current_decision_row = int(reset.info["decision_grid_row_index"])
-            if current_decision_row != range_start:
-                raise RuntimeError("evaluation reset did not land on requested decision row")
-            if evaluated_start_decision_row is None:
-                evaluated_start_decision_row = current_decision_row
-            active_range_start = current_decision_row
-            active_range_end = current_decision_row
-
+            cursor = int(range_start)
             while True:
                 if config.max_steps is not None and step_count >= config.max_steps:
                     truncated = True
+                    _increment_counter(truncation_counts, "max_steps")
+                    stop_all_ranges = True
                     break
+                if range_end is not None and cursor + 1 >= range_end:
+                    truncated = True
+                    _increment_counter(truncation_counts, "split_exhausted")
+                    break
+
+                reset = env.reset(start_decision_row=cursor)
+                current_observation = reset.observation
+                current_decision_row = int(reset.info["decision_grid_row_index"])
+                if current_decision_row != cursor:
+                    raise RuntimeError("evaluation reset did not land on requested decision row")
                 if range_end is not None and current_decision_row + 1 >= range_end:
                     truncated = True
+                    _increment_counter(truncation_counts, "split_exhausted")
                     break
+                if evaluated_start_decision_row is None:
+                    evaluated_start_decision_row = current_decision_row
+                episode_count += 1
+                active_range_start = current_decision_row
+                active_range_end = current_decision_row
 
-                obs = _observation_to_tensor(
-                    current_observation,
-                    device=device,
-                    dtype=dtype,
-                    obs_dim=policy.obs_dim,
-                )
-                if observation_normalizer is not None:
-                    obs = observation_normalizer.normalize(obs)
+                while True:
+                    if config.max_steps is not None and step_count >= config.max_steps:
+                        truncated = True
+                        _increment_counter(truncation_counts, "max_steps")
+                        stop_all_ranges = True
+                        break
+                    if range_end is not None and current_decision_row + 1 >= range_end:
+                        truncated = True
+                        _increment_counter(truncation_counts, "split_exhausted")
+                        cursor = current_decision_row
+                        break
 
-                with torch.inference_mode():
-                    action_out = policy.sample_action(
-                        obs.unsqueeze(0),
-                        deterministic=config.deterministic,
+                    obs = _observation_to_tensor(
+                        current_observation,
+                        device=device,
+                        dtype=dtype,
+                        obs_dim=policy.obs_dim,
                     )
-                action = action_out.action.squeeze(0).detach().to("cpu").tolist()
+                    if observation_normalizer is not None:
+                        obs = observation_normalizer.normalize(obs)
 
-                step = env.step(action)
-                acc.update(step.execution)
-                step_count += 1
-                next_decision_row = int(step.info["next_decision_grid_row_index"])
-                if range_end is not None and next_decision_row >= range_end:
-                    raise RuntimeError("evaluation step crossed split boundary")
-                active_range_end = next_decision_row + 1
-                evaluated_end_decision_row = active_range_end
+                    with torch.inference_mode():
+                        action_out = policy.sample_action(
+                            obs.unsqueeze(0),
+                            deterministic=config.deterministic,
+                        )
+                    action = action_out.action.squeeze(0).detach().to("cpu").tolist()
 
-                current_observation = step.observation
-                current_decision_row = next_decision_row
-                if step.done or step.truncated:
-                    terminated = bool(step.done)
-                    truncated = bool(step.truncated)
+                    action_decision_row = current_decision_row
+                    step = env.step(action)
+                    acc.update(step.execution)
+                    step_count += 1
+                    next_decision_row = int(step.info["next_decision_grid_row_index"])
+                    if range_end is not None and next_decision_row >= range_end:
+                        raise RuntimeError("evaluation step crossed split boundary")
+                    active_range_end = action_decision_row + 1
+                    evaluated_end_decision_row = active_range_end
+
+                    current_observation = step.observation
+                    current_decision_row = next_decision_row
+                    cursor = next_decision_row
+                    if step.done:
+                        terminated = True
+                        _increment_counter(truncation_counts, "terminal_done")
+                        stop_all_ranges = True
+                        break
+                    if step.truncated:
+                        truncated = True
+                        _increment_counter(truncation_counts, "max_episode_steps")
+                        break
+                    if range_end is not None and current_decision_row + 1 >= range_end:
+                        truncated = True
+                        _increment_counter(truncation_counts, "split_exhausted")
+                        break
+
+                if active_range_end > active_range_start:
+                    evaluated_range = {
+                        "start_decision_row": int(active_range_start),
+                        "end_decision_row": int(active_range_end),
+                        "row_count": int(active_range_end - active_range_start),
+                    }
+                    if range_meta is not None:
+                        evaluated_range = {**range_meta, **evaluated_range}
+                    evaluated_ranges.append(evaluated_range)
+                if stop_all_ranges:
                     break
-                if range_end is not None and current_decision_row + 1 >= range_end:
-                    truncated = True
+                if range_end is None:
+                    stop_all_ranges = True
                     break
-
-            if active_range_end > active_range_start:
-                evaluated_range = {
-                    "start_decision_row": int(active_range_start),
-                    "end_decision_row": int(active_range_end),
-                    "row_count": int(active_range_end - active_range_start),
-                }
-                if range_meta is not None:
-                    evaluated_range = {**range_meta, **evaluated_range}
-                evaluated_ranges.append(evaluated_range)
-            if terminated or (config.max_steps is not None and step_count >= config.max_steps):
+                if cursor + 1 >= range_end:
+                    break
+            if stop_all_ranges:
                 break
 
+        covered_row_count = int(sum(int(entry["row_count"]) for entry in evaluated_ranges))
+        coverage_fraction = (
+            float(covered_row_count / requested_row_count)
+            if requested_row_count > 0
+            else 0.0
+        )
         metrics = acc.as_dict()
         diagnostics = None
         status = "ok"
@@ -342,6 +400,11 @@ def evaluate_policy(
                 "evaluated_start_decision_row": None if evaluated_start_decision_row is None else int(evaluated_start_decision_row),
                 "evaluated_end_decision_row": None if evaluated_end_decision_row is None else int(evaluated_end_decision_row),
                 "evaluated_decision_row_ranges": evaluated_ranges,
+                "eval_requested_row_count": requested_row_count,
+                "eval_covered_row_count": covered_row_count,
+                "eval_coverage_fraction": coverage_fraction,
+                "episode_count": int(episode_count),
+                "truncation_counts": truncation_counts,
             },
         )
     finally:

@@ -148,6 +148,7 @@ class ExecutionSplitContract:
             raise ValueError("decision_schedule must be a mapping")
         object.__setattr__(self, "decision_schedule", dict(self.decision_schedule))
         ranges: dict[str, tuple[DecisionSplitRange, ...]] = {}
+        all_entries: list[DecisionSplitRange] = []
         for role in SPLIT_NAMES:
             raw_entries = self.ranges_by_split.get(role) if isinstance(self.ranges_by_split, Mapping) else None
             if raw_entries is None:
@@ -156,14 +157,30 @@ class ExecutionSplitContract:
                 entry if isinstance(entry, DecisionSplitRange) else DecisionSplitRange.from_dict(entry)  # type: ignore[arg-type]
                 for entry in raw_entries
             )
-            if not entries:
-                raise ValueError(f"split contract missing {role} ranges")
             for entry in entries:
                 if entry.role != role:
                     raise ValueError(f"split range role mismatch for {role}")
                 if entry.end_decision_row > self.decision_grid_n_rows:
                     raise ValueError(f"{role} split range exceeds decision_grid_n_rows")
+            previous_end: int | None = None
+            previous_start: int | None = None
+            for entry in entries:
+                if previous_start is not None and entry.start_decision_row < previous_start:
+                    raise ValueError(f"{role} split ranges must be sorted by start_decision_row")
+                if previous_end is not None and entry.start_decision_row < previous_end:
+                    raise ValueError(f"{role} split ranges must not overlap")
+                previous_start = entry.start_decision_row
+                previous_end = entry.end_decision_row
+                all_entries.append(entry)
             ranges[role] = entries
+        for previous, current in zip(
+            sorted(all_entries, key=lambda item: (item.start_decision_row, item.end_decision_row, item.role)),
+            sorted(all_entries, key=lambda item: (item.start_decision_row, item.end_decision_row, item.role))[1:],
+        ):
+            if current.start_decision_row < previous.end_decision_row:
+                raise ValueError(
+                    "train/val/test split ranges must not overlap across roles"
+                )
         object.__setattr__(self, "ranges_by_split", ranges)
 
     @property

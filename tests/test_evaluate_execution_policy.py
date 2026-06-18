@@ -28,6 +28,7 @@ from mmrt.execution.linear_signal import (
     predictions_to_signal_arrays,
     save_linear_signal_artifact_npz,
 )
+from mmrt.execution.split_contract import DecisionSplitRange
 from mmrt.cli.train_execution_ppo import ExecutionPPOTrainCLIConfig, run_execution_ppo_training
 from mmrt.cli.evaluate_execution_policy import (
     ExecutionPolicyEvaluationCLIConfig,
@@ -311,6 +312,103 @@ def test_evaluate_policy_uses_observation_normalizer_read_only():
 
     after = normalizer.running.count
     assert torch.equal(before, after)
+
+
+def test_evaluate_policy_continues_after_max_episode_truncation_inside_split():
+    env = _tiny_env(max_episode_steps=2)
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(obs_dim=obs_dim, config=ActorCriticConfig(hidden_sizes=(8,)))
+    result = evaluate_policy(
+        env,
+        policy,
+        config=PolicyEvaluationConfig(
+            decision_row_ranges=(
+                DecisionSplitRange(
+                    role="val",
+                    segment_key="seg_000",
+                    start_decision_row=2,
+                    end_decision_row=7,
+                    start_local_ts_us=300,
+                    end_local_ts_us=701,
+                ),
+            ),
+            deterministic=True,
+        ),
+    )
+
+    payload = result.as_dict()
+    eval_config = payload["config"]
+    assert result.steps == 4
+    assert eval_config["episode_count"] == 2
+    assert eval_config["eval_requested_row_count"] == 4
+    assert eval_config["eval_covered_row_count"] == 4
+    assert eval_config["eval_coverage_fraction"] == 1.0
+    assert eval_config["truncation_counts"]["max_episode_steps"] >= 1
+    assert eval_config["evaluated_decision_row_ranges"][0]["start_decision_row"] == 2
+    assert eval_config["evaluated_decision_row_ranges"][-1]["end_decision_row"] > 4
+
+
+def test_evaluate_policy_does_not_cross_selected_split_boundary():
+    env = _tiny_env(max_episode_steps=None)
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(obs_dim=obs_dim, config=ActorCriticConfig(hidden_sizes=(8,)))
+    result = evaluate_policy(
+        env,
+        policy,
+        config=PolicyEvaluationConfig(
+            decision_row_ranges=(
+                DecisionSplitRange(
+                    role="test",
+                    segment_key="seg_000",
+                    start_decision_row=4,
+                    end_decision_row=6,
+                    start_local_ts_us=500,
+                    end_local_ts_us=601,
+                ),
+            ),
+            deterministic=True,
+        ),
+    )
+
+    eval_config = result.as_dict()["config"]
+    assert result.steps == 1
+    assert eval_config["eval_covered_row_count"] == 1
+    assert eval_config["truncation_counts"]["split_exhausted"] == 1
+    assert all(
+        entry["start_decision_row"] >= 4 and entry["end_decision_row"] <= 6
+        for entry in eval_config["evaluated_decision_row_ranges"]
+    )
+
+
+def test_evaluate_policy_max_steps_caps_split_coverage():
+    env = _tiny_env(max_episode_steps=None)
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(obs_dim=obs_dim, config=ActorCriticConfig(hidden_sizes=(8,)))
+    result = evaluate_policy(
+        env,
+        policy,
+        config=PolicyEvaluationConfig(
+            max_steps=2,
+            decision_row_ranges=(
+                DecisionSplitRange(
+                    role="val",
+                    segment_key="seg_000",
+                    start_decision_row=1,
+                    end_decision_row=7,
+                    start_local_ts_us=200,
+                    end_local_ts_us=701,
+                ),
+            ),
+            deterministic=True,
+        ),
+    )
+
+    eval_config = result.as_dict()["config"]
+    assert result.steps == 2
+    assert eval_config["eval_requested_row_count"] == 5
+    assert eval_config["eval_covered_row_count"] == 2
+    assert eval_config["eval_coverage_fraction"] < 1.0
+    assert eval_config["truncation_counts"]["max_steps"] == 1
 
 
 def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
@@ -661,6 +759,15 @@ def test_evaluate_execution_policy_config_parses_dtype_and_queue_mode():
             split_source_dataset_root="/tmp/split-source",
             eval_split="val",
             dtype="float16",
+        )
+
+    with pytest.raises(ValueError, match="eval_split"):
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root="/tmp/tape",
+            decision_grid_path="/tmp/tape/decision_grid",
+            checkpoint_path="/tmp/checkpoint.pt",
+            split_source_dataset_root="/tmp/split-source",
+            eval_split="train",
         )
 
 

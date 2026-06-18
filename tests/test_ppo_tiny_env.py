@@ -346,6 +346,11 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
     assert summary["train_split"] == "train"
     assert summary["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
+    assert summary["train_window_sampling"] == "stratified_random"
+    assert summary["sampling"]["train_window_sampling"] == "stratified_random"
+    assert summary["sampling"]["seed"] == 123
+    assert summary["sampling"]["train_row_count"] == summary["train_row_count"]
+    assert summary["sampling"]["sampled_start_decision_row_min"] is not None
     assert summary["rollout"]["effective_batch_size"] == 4
     assert summary["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
     assert summary["linear_signals"]["n_rows"] >= 1
@@ -359,6 +364,8 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert ckpt["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
     assert ckpt["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
     assert ckpt["train_split"] == "train"
+    assert ckpt["train_window_sampling"] == "stratified_random"
+    assert ckpt["sampling"]["train_window_sampling"] == "stratified_random"
 
 
 def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):

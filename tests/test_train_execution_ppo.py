@@ -10,6 +10,7 @@ from mmrt.cli.train_execution_ppo import (
     _summary_config,
 )
 from mmrt.execution.split_contract import DecisionSplitRange
+from mmrt.rl.rollout import TrainWindowSampler
 
 
 REQUIRED_TRAIN_ARGS = [
@@ -36,6 +37,17 @@ def test_parser_dedupe_l2_trade_default_enabled():
     args = parser.parse_args(REQUIRED_TRAIN_ARGS)
     config = _config_from_args(args)
     assert config.dedupe_l2_decrease_with_trade_prints is True
+    assert config.train_window_sampling == "stratified_random"
+
+
+def test_parser_accepts_train_window_sampling_mode():
+    parser = build_arg_parser()
+    args = parser.parse_args([*REQUIRED_TRAIN_ARGS, "--train-window-sampling", "cyclic_spread"])
+    config = _config_from_args(args)
+
+    assert config.train_window_sampling == "cyclic_spread"
+    assert _summary_config(config)["train_window_sampling"] == "cyclic_spread"
+    assert _build_training_config(config).train_window_sampling == "cyclic_spread"
 
 
 def test_adverse_runtime_config_inherits_post_only_gap_from_ppo_config():
@@ -124,6 +136,65 @@ def test_train_execution_ppo_rejects_debug_start_row_outside_train_split():
         assert "selected train split" in str(exc)
     else:
         raise AssertionError("debug_start_decision_row escaped the train split")
+
+
+def test_stratified_train_window_sampler_uses_only_train_rows_and_is_reproducible():
+    ranges = (
+        DecisionSplitRange(
+            role="train",
+            segment_key="seg_000",
+            start_decision_row=0,
+            end_decision_row=4,
+            start_local_ts_us=100,
+            end_local_ts_us=401,
+        ),
+        DecisionSplitRange(
+            role="train",
+            segment_key="seg_001",
+            start_decision_row=10,
+            end_decision_row=14,
+            start_local_ts_us=1000,
+            end_local_ts_us=1401,
+        ),
+    )
+
+    def _sample_rows() -> list[int]:
+        sampler = TrainWindowSampler(ranges, mode="stratified_random", seed=123, num_envs=2)
+        return [sampler.sample(env_index)[0] for _round in range(4) for env_index in range(2)]
+
+    rows = _sample_rows()
+    assert rows == _sample_rows()
+    assert all((0 <= row <= 2) or (10 <= row <= 12) for row in rows)
+    assert all(not (3 <= row < 10) and row < 13 for row in rows)
+
+
+def test_num_envs_stratified_sampler_diversifies_starts_on_multi_range_fixture():
+    ranges = (
+        DecisionSplitRange(
+            role="train",
+            segment_key="seg_000",
+            start_decision_row=0,
+            end_decision_row=5,
+            start_local_ts_us=100,
+            end_local_ts_us=501,
+        ),
+        DecisionSplitRange(
+            role="train",
+            segment_key="seg_001",
+            start_decision_row=20,
+            end_decision_row=25,
+            start_local_ts_us=2000,
+            end_local_ts_us=2501,
+        ),
+    )
+    sampler = TrainWindowSampler(ranges, mode="stratified_random", seed=7, num_envs=2)
+
+    starts = [sampler.sample(env_index)[0] for env_index in range(2)]
+    stats = sampler.stats_since(0)
+
+    assert len(set(starts)) == 2
+    assert stats["unique_train_ranges_visited"] == 2
+    assert stats["train_row_count"] == 10
 
 
 def test_execution_ppo_source_guard_has_no_split_free_cli_path():

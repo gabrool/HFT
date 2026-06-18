@@ -158,12 +158,15 @@ def adverse_split_contract_fields(
     manifest_hash: str = MANIFEST_HASH,
     ranges: Mapping[str, list[Mapping[str, object]]] | None = None,
 ) -> dict[str, object]:
+    contract_n_rows = int(n_rows)
     if ranges is None:
-        def _range(role: str, preferred_start: int) -> dict[str, object]:
-            start = min(preferred_start, max(0, int(n_rows) - 1))
-            end = min(int(n_rows), start + 1)
+        def _ranges(role: str, preferred_start: int) -> list[dict[str, object]]:
+            if preferred_start >= contract_n_rows:
+                return []
+            start = preferred_start
+            end = start + 1
             start_ts = start + 1
-            return {
+            return [{
                 "role": role,
                 "segment_key": "seg_000",
                 "start_decision_row": start,
@@ -173,12 +176,12 @@ def adverse_split_contract_fields(
                 "end_local_ts_us": start_ts + 1,
                 "embargo_before_us": 0,
                 "embargo_after_us": 0,
-            }
+            }]
 
         ranges = {
-            "train": [_range("train", 0)],
-            "val": [_range("val", 1)],
-            "test": [_range("test", 2)],
+            "train": _ranges("train", 0),
+            "val": _ranges("val", 1),
+            "test": _ranges("test", 2),
         }
     row_counts_by_split = {
         role: int(sum(int(entry["row_count"]) for entry in entries))
@@ -194,7 +197,7 @@ def adverse_split_contract_fields(
         "row_counts_by_split": row_counts_by_split,
         "adverse_dataset_rows_total": 0,
         "adverse_row_counts": {"train": 0, "val": 0, "test": 0, "out_of_split": 0},
-        **grid_lineage_fields(n_rows=n_rows, schedule=schedule, grid_hash=grid_hash),
+        **grid_lineage_fields(n_rows=contract_n_rows, schedule=schedule, grid_hash=grid_hash),
     }
     return {
         "split_source_dataset_root": root,
@@ -208,11 +211,13 @@ def adverse_split_contract_for_grid(grid: DecisionGrid, *, root: str = "/tmp/spl
     ts = [int(x) for x in grid.decision_local_ts_us]
     n_rows = int(grid.n_rows)
 
-    def _range(role: str, preferred_start: int) -> dict[str, object]:
-        start = min(preferred_start, max(0, n_rows - 1))
-        end = min(n_rows, start + 1)
+    def _ranges(role: str, preferred_start: int) -> list[dict[str, object]]:
+        if preferred_start >= n_rows:
+            return []
+        start = preferred_start
+        end = start + 1
         start_ts = ts[start]
-        return {
+        return [{
             "role": role,
             "segment_key": "seg_000",
             "start_decision_row": start,
@@ -222,12 +227,12 @@ def adverse_split_contract_for_grid(grid: DecisionGrid, *, root: str = "/tmp/spl
             "end_local_ts_us": start_ts + 1,
             "embargo_before_us": 0,
             "embargo_after_us": 0,
-        }
+        }]
 
     ranges = {
-        "train": [_range("train", 0)],
-        "val": [_range("val", 1)],
-        "test": [_range("test", 2)],
+        "train": _ranges("train", 0),
+        "val": _ranges("val", 1),
+        "test": _ranges("test", 2),
     }
     return adverse_split_contract_fields(
         n_rows=grid.n_rows,
