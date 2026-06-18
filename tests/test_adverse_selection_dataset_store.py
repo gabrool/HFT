@@ -5,11 +5,11 @@ import pytest
 
 from mmrt.execution.adverse_selection_dataset import AdverseSelectionDatasetWriter, AdverseSelectionDatasetWriterConfig, load_adverse_selection_dataset
 from mmrt.execution.adverse_selection_index import ADVERSE_SELECTION_INDEX_SCHEMA
-from tests.grid_helpers import grid_lineage_fields
+from tests.grid_helpers import adverse_split_contract_fields, grid_lineage_fields
 
 
 def _meta():
-    return {"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,**grid_lineage_fields(n_rows=3),"config_json":"{}","index_schema":ADVERSE_SELECTION_INDEX_SCHEMA,"index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}
+    return {"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,**grid_lineage_fields(n_rows=3),**adverse_split_contract_fields(n_rows=3),"config_json":"{}","index_schema":ADVERSE_SELECTION_INDEX_SCHEMA,"index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}
 
 
 def test_adverse_dataset_writer_roundtrip_tiny(tmp_path):

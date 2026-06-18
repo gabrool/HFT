@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import math
+from typing import Mapping
 
 import numpy as np
 
-from mmrt.execution.adverse_selection_dataset import DiskBackedAdverseSelectionDataset
+from mmrt.execution.adverse_selection_dataset import ADVERSE_SPLIT_CONTRACT_SCHEMA, DiskBackedAdverseSelectionDataset
+
+_SPLIT_ROLES = ("train", "val", "test")
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +20,8 @@ class AdverseBaselineFitResult:
     feature_names: tuple[str, ...]
     train_rows: int
     val_rows: int
+    test_rows: int
+    out_of_split_rows: int
     feature_mean: np.ndarray
     feature_scale: np.ndarray
     coefficients: np.ndarray
@@ -27,15 +33,6 @@ def _check_positive(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
-
-
-def _split(n: int, train_fraction: float) -> tuple[int, int]:
-    if not math.isfinite(train_fraction) or train_fraction <= 0.0 or train_fraction >= 1.0:
-        raise ValueError("train_fraction must be in (0, 1)")
-    if n < 2:
-        return 0, n
-    n_train = int(n * train_fraction)
-    return min(max(n_train, 1), n - 1), n - min(max(n_train, 1), n - 1)
 
 
 def _solve(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -117,11 +114,69 @@ class BinaryHistogramAUC:
             cum_neg += int(n)
         return float(total / (n_pos * n_neg))
 
+
+def _split_ranges(split_contract: Mapping[str, object], role: str) -> tuple[tuple[int, int], ...]:
+    if not isinstance(split_contract, Mapping):
+        raise ValueError("split_contract must be a mapping")
+    if split_contract.get("schema") != ADVERSE_SPLIT_CONTRACT_SCHEMA:
+        raise ValueError("split_contract schema mismatch")
+    ranges = split_contract.get("ranges")
+    if not isinstance(ranges, Mapping):
+        raise ValueError("split_contract ranges must be a mapping")
+    entries = ranges.get(role)
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"split_contract ranges must include {role}")
+    out: list[tuple[int, int]] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"split_contract ranges.{role}[{i}] must be a mapping")
+        start = int(entry["start_local_ts_us"])
+        end = int(entry["end_local_ts_us"])
+        if end <= start:
+            raise ValueError(f"split_contract ranges.{role}[{i}] has invalid bounds")
+        out.append((start, end))
+    return tuple(out)
+
+
+def _split_masks_for_local_ts(local_ts_us: np.ndarray, split_contract: Mapping[str, object]) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    ts = np.asarray(local_ts_us, dtype=np.int64)
+    masks: dict[str, np.ndarray] = {}
+    assigned = np.zeros(ts.shape[0], dtype=np.bool_)
+    for role in _SPLIT_ROLES:
+        role_mask = np.zeros(ts.shape[0], dtype=np.bool_)
+        for start, end in _split_ranges(split_contract, role):
+            role_mask |= (ts >= start) & (ts < end)
+        if np.any(assigned & role_mask):
+            raise ValueError("split_contract ranges overlap for adverse dataset rows")
+        masks[role] = role_mask
+        assigned |= role_mask
+    return masks, ~assigned
+
+
+def split_contract_with_adverse_counts(
+    split_contract: Mapping[str, object],
+    *,
+    train_rows: int,
+    val_rows: int,
+    test_rows: int,
+    out_of_split_rows: int,
+    adverse_dataset_rows_total: int,
+) -> dict[str, object]:
+    out = deepcopy(dict(split_contract))
+    out["adverse_dataset_rows_total"] = int(adverse_dataset_rows_total)
+    out["adverse_row_counts"] = {
+        "train": int(train_rows),
+        "val": int(val_rows),
+        "test": int(test_rows),
+        "out_of_split": int(out_of_split_rows),
+    }
+    return out
+
 def fit_adverse_baselines_streaming(
     dataset: DiskBackedAdverseSelectionDataset,
     *,
     target_names: tuple[str, ...],
-    train_fraction: float,
+    split_contract: Mapping[str, object],
     ridge_l2: float,
     min_train_samples: int,
     chunk_rows: int = 100_000,
@@ -140,16 +195,24 @@ def fit_adverse_baselines_streaming(
     auc_bins = _check_positive(int(auc_bins), "auc_bins")
     exact_auc_max_rows = _check_positive(int(exact_auc_max_rows), "exact_auc_max_rows")
     n = dataset.num_rows; nf = dataset.num_features
-    train_rows_total, val_rows_total = _split(n, train_fraction)
-    if n < 2:
-        targets = {name: {"target_name": name, "train_rows": 0, "val_rows": 0, "skipped": True, "skip_reason": "not_enough_decisions"} for name in target_names}
-        return AdverseBaselineFitResult((), dataset.feature_names, 0, 0, np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32), np.empty((0, nf), dtype=np.float64), np.asarray([], dtype=np.float64), {"enabled": True, "train_fraction": train_fraction, "ridge_l2": ridge_l2, "min_train_samples": min_train_samples, "train_rows_total": 0, "val_rows_total": 0, "fitted_target_count": 0, "requested_target_count": len(target_names), "targets": targets, "skipped": True, "skip_reason": "not_enough_decisions"})
 
     sum_x = np.zeros(nf, dtype=np.float64); sum_x2 = np.zeros(nf, dtype=np.float64)
-    for start in range(0, train_rows_total, chunk_rows):
-        end = min(start + chunk_rows, train_rows_total)
-        X = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
+    split_rows = {"train": 0, "val": 0, "test": 0, "out_of_split": 0}
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        split_masks, out_of_split = _split_masks_for_local_ts(dataset.arrays.decision_local_ts_us[start:end], split_contract)
+        for role in _SPLIT_ROLES:
+            split_rows[role] += int(np.count_nonzero(split_masks[role]))
+        split_rows["out_of_split"] += int(np.count_nonzero(out_of_split))
+        train_mask = split_masks["train"]
+        if not train_mask.any():
+            continue
+        X = np.asarray(dataset.arrays.features[start:end][train_mask], dtype=np.float64)
         sum_x += np.sum(X, axis=0); sum_x2 += np.sum(X * X, axis=0)
+    train_rows_total = int(split_rows["train"])
+    val_rows_total = int(split_rows["val"])
+    test_rows_total = int(split_rows["test"])
+    out_of_split_rows = int(split_rows["out_of_split"])
     mean = sum_x / max(train_rows_total, 1)
     var = sum_x2 / max(train_rows_total, 1) - mean * mean
     scale = np.sqrt(np.maximum(var, 0.0)); scale = np.where(scale <= 1e-12, 1.0, scale)
@@ -164,7 +227,7 @@ def fit_adverse_baselines_streaming(
     known = [name for name in target_names if name in label_index]
     for target_name in target_names:
         if target_name not in label_index:
-            targets_metrics[target_name] = {"target_name": target_name, "train_rows": 0, "val_rows": 0, "skipped": True, "skip_reason": "unknown_target"}
+            targets_metrics[target_name] = {"target_name": target_name, "train_rows": 0, "val_rows": 0, "test_rows": 0, "skipped": True, "skip_reason": "unknown_target"}
     tidx = np.asarray([label_index[name] for name in known], dtype=np.int64)
     nt = len(known)
 
@@ -172,17 +235,18 @@ def fit_adverse_baselines_streaming(
     # masked normal equations from the shared per-chunk design matrix.
     XtX = np.zeros((nt, nf + 1, nf + 1), dtype=np.float64)
     Xty = np.zeros((nt, nf + 1), dtype=np.float64)
-    train_valid = np.zeros(nt, dtype=np.int64)
-    val_valid = np.zeros(nt, dtype=np.int64)
+    target_valid = {role: np.zeros(nt, dtype=np.int64) for role in _SPLIT_ROLES}
     for start in range(0, n, chunk_rows):
         end = min(start + chunk_rows, n)
+        if nt == 0:
+            break
         masks = np.asarray(dataset.arrays.label_masks[start:end][:, tidx], dtype=np.bool_)
         if not masks.any():
             continue
-        row_ids = np.arange(start, end)
-        train_rows = row_ids < train_rows_total
-        val_valid += np.count_nonzero(masks & ~train_rows[:, None], axis=0)
-        train_masks = masks & train_rows[:, None]
+        split_masks, _ = _split_masks_for_local_ts(dataset.arrays.decision_local_ts_us[start:end], split_contract)
+        for role in _SPLIT_ROLES:
+            target_valid[role] += np.count_nonzero(masks & split_masks[role][:, None], axis=0)
+        train_masks = masks & split_masks["train"][:, None]
         if not train_masks.any():
             continue
         X = np.asarray(dataset.arrays.features[start:end], dtype=np.float64)
@@ -202,31 +266,47 @@ def fit_adverse_baselines_streaming(
             XtX[j, 1:, 1:] += rows.T @ rows
             Xty[j, 0] += float(np.sum(y))
             Xty[j, 1:] += rows.T @ y
-            train_valid[j] += count
 
     betas = np.zeros((nt, nf + 1), dtype=np.float64)
     active = np.zeros(nt, dtype=np.bool_)
     for j, target_name in enumerate(known):
-        if train_valid[j] < min_train_samples or val_valid[j] == 0:
-            targets_metrics[target_name] = {"target_name": target_name, "train_rows": int(train_valid[j]), "val_rows": int(val_valid[j]), "skipped": True, "skip_reason": "not_enough_train_rows" if train_valid[j] < min_train_samples else "no_validation_rows"}
+        train_valid = int(target_valid["train"][j])
+        val_valid = int(target_valid["val"][j])
+        test_valid = int(target_valid["test"][j])
+        if train_valid < min_train_samples or val_valid == 0 or test_valid == 0:
+            if train_valid < min_train_samples:
+                reason = "not_enough_train_rows"
+            elif val_valid == 0:
+                reason = "no_validation_rows"
+            else:
+                reason = "no_test_rows"
+            targets_metrics[target_name] = {
+                "target_name": target_name,
+                "train_rows": train_valid,
+                "val_rows": val_valid,
+                "test_rows": test_valid,
+                "skipped": True,
+                "skip_reason": reason,
+            }
             continue
         betas[j] = _solve(XtX[j] + reg, Xty[j])
         active[j] = True
 
     # Metrics pass shared across targets: one z-scored design per chunk,
     # one matmul for all predictions.
-    acc = {target: {"train": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0},
-                    "val": {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0}}
+    acc = {target: {role: {"n": 0, "se": 0.0, "ae": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_p": 0.0} for role in _SPLIT_ROLES}
            for target in known}
     is_binary = {target: target.endswith("_filled") or target.endswith("_toxic_fill") for target in known}
-    exact_scores = {target: {"train": {"ys": [], "ps": []}, "val": {"ys": [], "ps": []}}
+    exact_scores = {target: {role: {"ys": [], "ps": []} for role in _SPLIT_ROLES}
                     for target in known if metrics_mode == "exact" and is_binary[target]}
-    range_acc = {target: {"train": BinaryHistogramAUC(auc_bins), "val": BinaryHistogramAUC(auc_bins)}
+    range_acc = {target: {role: BinaryHistogramAUC(auc_bins) for role in _SPLIT_ROLES}
                  for target in known if metrics_mode == "approx" and is_binary[target]}
 
     def _metrics_chunks():
         for start in range(0, n, chunk_rows):
             end = min(start + chunk_rows, n)
+            if nt == 0:
+                return
             masks = np.asarray(dataset.arrays.label_masks[start:end][:, tidx], dtype=np.bool_)
             if not masks.any():
                 continue
@@ -234,17 +314,18 @@ def fit_adverse_baselines_streaming(
             Xz = (X - mean) / scale
             preds = Xz @ betas[:, 1:].T + betas[:, 0]
             labels_chunk = np.asarray(dataset.arrays.labels[start:end][:, tidx], dtype=np.float64)
-            row_ids = np.arange(start, end)
-            yield masks, preds, labels_chunk, row_ids < train_rows_total
+            split_masks, _ = _split_masks_for_local_ts(dataset.arrays.decision_local_ts_us[start:end], split_contract)
+            yield masks, preds, labels_chunk, split_masks
 
-    for masks, preds, labels_chunk, train_rows in _metrics_chunks():
+    for masks, preds, labels_chunk, split_masks in _metrics_chunks():
         for j, target_name in enumerate(known):
             if not active[j]:
                 continue
             col_mask = masks[:, j]
             if not col_mask.any():
                 continue
-            for split_name, split_mask in (("train", train_rows), ("val", ~train_rows)):
+            for split_name in _SPLIT_ROLES:
+                split_mask = split_masks[split_name]
                 m = col_mask & split_mask
                 if not m.any():
                     continue
@@ -265,14 +346,15 @@ def fit_adverse_baselines_streaming(
             target: {split: BinaryHistogramAUC(auc_bins, score_min=accum.score_min, score_max=accum.score_max) for split, accum in splits.items()}
             for target, splits in range_acc.items()
         }
-        for masks, preds, labels_chunk, train_rows in _metrics_chunks():
+        for masks, preds, labels_chunk, split_masks in _metrics_chunks():
             for j, target_name in enumerate(known):
                 if not active[j] or target_name not in hist_acc:
                     continue
                 col_mask = masks[:, j]
                 if not col_mask.any():
                     continue
-                for split_name, split_mask in (("train", train_rows), ("val", ~train_rows)):
+                for split_name in _SPLIT_ROLES:
+                    split_mask = split_masks[split_name]
                     m = col_mask & split_mask
                     if m.any():
                         hist_acc[target_name][split_name].update(labels_chunk[m, j], preds[m, j])
@@ -281,30 +363,117 @@ def fit_adverse_baselines_streaming(
         if not active[j]:
             continue
 
-        def split_metrics(name: str) -> tuple[float, float, float, float, float]:
+        def split_metrics(name: str) -> dict[str, object]:
             a = acc[target_name][name]; cnt = max(int(a["n"]), 1)
             mean_y = float(a["sum_y"] / cnt); ss_tot = float(a["sum_y2"] - a["sum_y"] * a["sum_y"] / cnt)
             r2 = 0.0 if ss_tot <= 1e-12 else 1.0 - float(a["se"] / ss_tot)
-            return float(np.sqrt(a["se"] / cnt)), float(a["ae"] / cnt), r2, mean_y, float(a["sum_p"] / cnt)
+            return {
+                "target_name": target_name,
+                "split": name,
+                "rows": int(a["n"]),
+                "rmse": float(np.sqrt(a["se"] / cnt)),
+                "mae": float(a["ae"] / cnt),
+                "r2": r2,
+                "label_mean": mean_y,
+                "prediction_mean": float(a["sum_p"] / cnt),
+            }
 
-        tr_rmse, tr_mae, tr_r2, tr_ymean, _ = split_metrics("train")
-        va_rmse, va_mae, va_r2, va_ymean, va_pmean = split_metrics("val")
-        metric: dict[str, object] = {"target_name": target_name, "train_rows": int(acc[target_name]["train"]["n"]), "val_rows": int(acc[target_name]["val"]["n"]), "train_rmse": tr_rmse, "val_rmse": va_rmse, "train_mae": tr_mae, "val_mae": va_mae, "train_r2": tr_r2, "val_r2": va_r2, "label_mean_train": tr_ymean, "label_mean_val": va_ymean, "prediction_mean_val": va_pmean, "skipped": False}
+        metric: dict[str, object] = {
+            "target_name": target_name,
+            "train_rows": int(acc[target_name]["train"]["n"]),
+            "val_rows": int(acc[target_name]["val"]["n"]),
+            "test_rows": int(acc[target_name]["test"]["n"]),
+            "train": split_metrics("train"),
+            "val": split_metrics("val"),
+            "test": split_metrics("test"),
+            "skipped": False,
+        }
         if is_binary[target_name]:
             if metrics_mode == "none":
-                metric["train_auc"] = None; metric["val_auc"] = None; metric["auc_mode"] = "none"
+                for role in _SPLIT_ROLES:
+                    metric[role]["auc"] = None  # type: ignore[index]
+                    metric[role]["auc_mode"] = "none"  # type: ignore[index]
             elif metrics_mode == "exact":
                 scores = exact_scores[target_name]
-                metric["train_auc"] = _auc_exact(np.concatenate(scores["train"]["ys"]), np.concatenate(scores["train"]["ps"])) if scores["train"]["ys"] else None
-                metric["val_auc"] = _auc_exact(np.concatenate(scores["val"]["ys"]), np.concatenate(scores["val"]["ps"])) if scores["val"]["ys"] else None
-                metric["auc_mode"] = "exact"; metric["auc_bins"] = None
+                for role in _SPLIT_ROLES:
+                    metric[role]["auc"] = _auc_exact(np.concatenate(scores[role]["ys"]), np.concatenate(scores[role]["ps"])) if scores[role]["ys"] else None  # type: ignore[index]
+                    metric[role]["auc_mode"] = "exact"  # type: ignore[index]
+                    metric[role]["auc_bins"] = None  # type: ignore[index]
             else:
-                metric["train_auc"] = hist_acc[target_name]["train"].auc(); metric["val_auc"] = hist_acc[target_name]["val"].auc()
-                metric["auc_mode"] = "approx_histogram"; metric["auc_bins"] = auc_bins
+                for role in _SPLIT_ROLES:
+                    metric[role]["auc"] = hist_acc[target_name][role].auc()  # type: ignore[index]
+                    metric[role]["auc_mode"] = "approx_histogram"  # type: ignore[index]
+                    metric[role]["auc_bins"] = auc_bins  # type: ignore[index]
         targets_metrics[target_name] = metric
         fitted_names.append(target_name); coefs.append(betas[j, 1:].astype(np.float64, copy=True)); intercepts.append(float(betas[j, 0]))
 
-    metrics: dict[str, object] = {"enabled": True, "train_fraction": train_fraction, "ridge_l2": ridge_l2, "min_train_samples": min_train_samples, "train_rows_total": train_rows_total, "val_rows_total": val_rows_total, "fitted_target_count": len(fitted_names), "requested_target_count": len(target_names), "targets": targets_metrics}
+    def split_target_view(target_metric: object, role: str) -> dict[str, object]:
+        if not isinstance(target_metric, Mapping):
+            return {}
+        if target_metric.get("skipped") is True:
+            return {
+                "target_name": str(target_metric["target_name"]),
+                "split": role,
+                "rows": int(target_metric.get(f"{role}_rows", 0)),
+                "skipped": True,
+                "skip_reason": str(target_metric.get("skip_reason", "unknown")),
+            }
+        split_metric = target_metric[role]
+        if not isinstance(split_metric, Mapping):
+            return {}
+        return dict(split_metric)
+
+    updated_split_contract = split_contract_with_adverse_counts(
+        split_contract,
+        train_rows=train_rows_total,
+        val_rows=val_rows_total,
+        test_rows=test_rows_total,
+        out_of_split_rows=out_of_split_rows,
+        adverse_dataset_rows_total=n,
+    )
+    metrics: dict[str, object] = {
+        "enabled": True,
+        "ridge_l2": ridge_l2,
+        "min_train_samples": min_train_samples,
+        "selection_split": "val",
+        "final_holdout_split": "test",
+        "adverse_dataset_rows_total": n,
+        "adverse_train_rows": train_rows_total,
+        "adverse_val_rows": val_rows_total,
+        "adverse_test_rows": test_rows_total,
+        "out_of_split_rows": out_of_split_rows,
+        "train_rows_total": train_rows_total,
+        "val_rows_total": val_rows_total,
+        "test_rows_total": test_rows_total,
+        "fitted_target_count": len(fitted_names),
+        "requested_target_count": len(target_names),
+        "split_contract": updated_split_contract,
+        "targets": targets_metrics,
+        "train": {
+            "rows_total": train_rows_total,
+            "targets": {name: split_target_view(metric, "train") for name, metric in targets_metrics.items()},
+        },
+        "val": {
+            "rows_total": val_rows_total,
+            "targets": {name: split_target_view(metric, "val") for name, metric in targets_metrics.items()},
+        },
+        "test": {
+            "rows_total": test_rows_total,
+            "targets": {name: split_target_view(metric, "test") for name, metric in targets_metrics.items()},
+        },
+    }
     if not fitted_names:
         metrics["skipped"] = True; metrics["skip_reason"] = "all_targets_skipped"
-    return AdverseBaselineFitResult(tuple(fitted_names), dataset.feature_names, train_rows_total, val_rows_total, mean.astype(np.float32), scale.astype(np.float32), np.vstack(coefs) if coefs else np.empty((0, nf), dtype=np.float64), np.asarray(intercepts, dtype=np.float64), metrics)
+    return AdverseBaselineFitResult(
+        tuple(fitted_names),
+        dataset.feature_names,
+        train_rows_total,
+        val_rows_total,
+        test_rows_total,
+        out_of_split_rows,
+        mean.astype(np.float32),
+        scale.astype(np.float32),
+        np.vstack(coefs) if coefs else np.empty((0, nf), dtype=np.float64),
+        np.asarray(intercepts, dtype=np.float64),
+        metrics,
+    )

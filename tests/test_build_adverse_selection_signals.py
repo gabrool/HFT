@@ -19,7 +19,7 @@ from mmrt.execution.adverse_signal import (
     load_adverse_selection_signals,
     save_adverse_selection_model,
 )
-from tests.test_adverse_selection import _l2, _save_tape, _tape, _trade
+from tests.test_adverse_selection import _l2, _save_tape, _split_source_dataset_root, _tape, _trade
 from mmrt.contracts import AggressorSide
 
 
@@ -35,11 +35,13 @@ def _training_root_and_model(tmp_path):
         [_trade(local_ts_us=150, side=AggressorSide.BUY, price_tick=1002, amount=1.0, source_row=0)],
     )
     root = _save_tape(tmp_path, tape)
+    split_source = _split_source_dataset_root(tmp_path, root)
     model_npz = tmp_path / "model.npz"
     run_adverse_selection_training(
         AdverseSelectionTrainCLIConfig(
             tape_root=str(root),
             decision_grid_path=str(root / "decision_grid"),
+            split_source_dataset_root=str(split_source),
             output_json=str(tmp_path / "train.json"),
             model_npz=str(model_npz),
             overwrite=True,
@@ -52,8 +54,8 @@ def _training_root_and_model(tmp_path):
             order_qty=1.0,
             fill_horizon_us=100,
             adverse_horizon_us=100,
+            drop_incomplete_horizon=False,
             min_train_samples=1,
-            train_fraction=0.5,
         )
     )
     return root, model_npz
@@ -107,6 +109,10 @@ def test_build_adverse_selection_signals_rejects_symbol_mismatch(tmp_path):
             decision_grid_hash=model.decision_grid_hash,
             decision_grid_n_rows=model.decision_grid_n_rows,
             decision_schedule=model.decision_schedule,
+            split_source_dataset_root=model.split_source_dataset_root,
+            split_source_dataset_id=model.split_source_dataset_id,
+            split_source_manifest_hash=model.split_source_manifest_hash,
+            split_contract=model.split_contract,
         ),
     )
     with pytest.raises(ValueError, match="exchange/symbol"):
@@ -143,6 +149,10 @@ def test_build_adverse_selection_signals_rejects_feature_name_mismatch(tmp_path)
             decision_grid_hash=model.decision_grid_hash,
             decision_grid_n_rows=model.decision_grid_n_rows,
             decision_schedule=model.decision_schedule,
+            split_source_dataset_root=model.split_source_dataset_root,
+            split_source_dataset_id=model.split_source_dataset_id,
+            split_source_manifest_hash=model.split_source_manifest_hash,
+            split_contract=model.split_contract,
         ),
     )
     with pytest.raises(ValueError, match="feature_names"):

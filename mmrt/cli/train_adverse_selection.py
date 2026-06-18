@@ -7,10 +7,11 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
+from mmrt.contracts import SplitRole
 from mmrt.execution.adverse_selection import (
     AdverseSelectionConfig,
     CounterfactualQuoteConfig,
@@ -30,8 +31,14 @@ from mmrt.execution.decision_grid import load_decision_grid, validate_decision_g
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
-from mmrt.execution.adverse_selection_dataset import estimate_adverse_dataset_bytes
+from mmrt.execution.adverse_selection_dataset import (
+    ADVERSE_SPLIT_CONTRACT_SCHEMA,
+    adverse_selection_dataset_manifest_with_split_contract,
+    estimate_adverse_dataset_bytes,
+    write_adverse_selection_dataset_manifest,
+)
 from mmrt.execution.adverse_selection_fit import fit_adverse_baselines_streaming
+from mmrt.storage import manifest as storage_manifest
 
 __all__ = [
     "AdverseSelectionTrainCLIConfig",
@@ -106,13 +113,6 @@ def _require_probability(value: float, name: str) -> float:
     value = _require_finite_float(value, name)
     if value < 0.0 or value > 1.0:
         raise ValueError(f"{name} must be in [0, 1]")
-    return value
-
-
-def _require_probability_exclusive(value: float, name: str) -> float:
-    value = _require_finite_float(value, name)
-    if value <= 0.0 or value >= 1.0:
-        raise ValueError(f"{name} must be in (0, 1)")
     return value
 
 
@@ -192,6 +192,7 @@ def _resolve_target_names(dataset, requested: tuple[str, ...] | str) -> tuple[st
 class AdverseSelectionTrainCLIConfig:
     tape_root: str
     decision_grid_path: str
+    split_source_dataset_root: str | None = None
     output_json: str | None = None
     model_npz: str | None = None
     overwrite: bool = False
@@ -239,7 +240,6 @@ class AdverseSelectionTrainCLIConfig:
     unknown_level_queue_ahead_qty: float = 1_000_000_000.0
     dedupe_l2_decrease_with_trade_prints: bool = True
 
-    train_fraction: float = 0.7
     ridge_l2: float = 1e-3
     min_train_samples: int = 10
     target_names: tuple[str, ...] | str = "auto"
@@ -247,6 +247,8 @@ class AdverseSelectionTrainCLIConfig:
     def __post_init__(self) -> None:
         object.__setattr__(self, "tape_root", _require_nonempty_str(self.tape_root, "tape_root"))
         object.__setattr__(self, "decision_grid_path", _require_nonempty_str(self.decision_grid_path, "decision_grid_path"))
+        if self.split_source_dataset_root is not None:
+            object.__setattr__(self, "split_source_dataset_root", _require_nonempty_str(self.split_source_dataset_root, "split_source_dataset_root"))
         if self.output_json is not None:
             object.__setattr__(self, "output_json", _require_nonempty_str(self.output_json, "output_json"))
         if self.model_npz is not None:
@@ -305,7 +307,6 @@ class AdverseSelectionTrainCLIConfig:
         object.__setattr__(self, "trade_at_level_weight", _require_probability(self.trade_at_level_weight, "trade_at_level_weight"))
         object.__setattr__(self, "unknown_level_queue_ahead_qty", _require_nonnegative_float(self.unknown_level_queue_ahead_qty, "unknown_level_queue_ahead_qty"))
         object.__setattr__(self, "dedupe_l2_decrease_with_trade_prints", _require_bool(self.dedupe_l2_decrease_with_trade_prints, "dedupe_l2_decrease_with_trade_prints"))
-        object.__setattr__(self, "train_fraction", _require_probability_exclusive(self.train_fraction, "train_fraction"))
         object.__setattr__(self, "ridge_l2", _require_nonnegative_float(self.ridge_l2, "ridge_l2"))
         object.__setattr__(self, "min_train_samples", _require_positive_int(self.min_train_samples, "min_train_samples"))
         if self.target_names != "auto":
@@ -358,6 +359,7 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
     return {
         "tape_root": config.tape_root,
         "decision_grid_path": config.decision_grid_path,
+        "split_source_dataset_root": config.split_source_dataset_root,
         "output_json": config.output_json,
         "model_npz": config.model_npz,
         "overwrite": config.overwrite,
@@ -399,7 +401,6 @@ def _summary_config(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]
         "trade_at_level_weight": config.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
         "dedupe_l2_decrease_with_trade_prints": config.dedupe_l2_decrease_with_trade_prints,
-        "train_fraction": config.train_fraction,
         "ridge_l2": config.ridge_l2,
         "min_train_samples": config.min_train_samples,
         "target_names": config.target_names if config.target_names == "auto" else list(config.target_names),
@@ -425,249 +426,88 @@ def _log_stage(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-
-@dataclass(frozen=True, slots=True)
-class _BaselineFitResult:
-    target_names: tuple[str, ...]
-    feature_names: tuple[str, ...]
-    train_rows: int
-    val_rows: int
-    feature_mean: np.ndarray
-    feature_scale: np.ndarray
-    coefficients: np.ndarray
-    intercepts: np.ndarray
-    metrics: dict[str, object]
-
-
-def _fit_feature_standardization(X_train: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    mean = X_train.mean(axis=0)
-    scale = X_train.std(axis=0)
-    scale = np.where(scale <= 1e-12, 1.0, scale)
-    return mean.astype(np.float32), scale.astype(np.float32)
-
-
-def _standardize_features(X: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    return ((X - mean) / scale).astype(np.float64, copy=False)
-
-
-def _chronological_split(n: int, train_fraction: float) -> tuple[np.ndarray, np.ndarray]:
-    n_train = int(n * train_fraction)
-    n_train = min(max(n_train, 1), n - 1)
-    train_idx = np.arange(0, n_train, dtype=np.int64)
-    val_idx = np.arange(n_train, n, dtype=np.int64)
-    return train_idx, val_idx
-
-
-def _fit_ridge(X_train: np.ndarray, y_train: np.ndarray, ridge_l2: float) -> tuple[np.ndarray, float]:
-    n = X_train.shape[0]
-    X_aug = np.concatenate([np.ones((n, 1), dtype=np.float64), X_train], axis=1)
-    reg = np.eye(X_aug.shape[1], dtype=np.float64) * ridge_l2
-    reg[0, 0] = 0.0
-    lhs = X_aug.T @ X_aug + reg
-    rhs = X_aug.T @ y_train
-    try:
-        beta = np.linalg.solve(lhs, rhs)
-    except np.linalg.LinAlgError:
-        beta = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
-    return beta[1:].astype(np.float64, copy=False), float(beta[0])
-
-
-def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    ss_tot = float(np.sum((y_true - float(np.mean(y_true))) ** 2))
-    if ss_tot <= 1e-12:
-        return 0.0
-    return 1.0 - ss_res / ss_tot
-
-
-def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-
-
-def _mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.mean(np.abs(y_true - y_pred)))
-
-
-def _binary_auc(y_true: np.ndarray, score: np.ndarray) -> float | None:
-    y = np.asarray(y_true) > 0.5
-    n_pos = int(np.count_nonzero(y))
-    n = len(y)
-    n_neg = n - n_pos
-    if n_pos == 0 or n_neg == 0:
-        return None
-    order = np.argsort(score, kind="mergesort")
-    sorted_score = score[order]
-    ranks_sorted = np.empty(n, dtype=np.float64)
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and sorted_score[j] == sorted_score[i]:
-            j += 1
-        avg_rank = (i + 1 + j) / 2.0
-        ranks_sorted[i:j] = avg_rank
-        i = j
-    ranks = np.empty(n, dtype=np.float64)
-    ranks[order] = ranks_sorted
-    sum_ranks_pos = float(np.sum(ranks[y]))
-    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
-
-
-def _target_metrics(y_train: np.ndarray, pred_train: np.ndarray, y_val: np.ndarray, pred_val: np.ndarray, target_name: str) -> dict[str, object]:
-    metrics: dict[str, object] = {
-        "target_name": target_name,
-        "train_rows": int(len(y_train)),
-        "val_rows": int(len(y_val)),
-        "train_rmse": _rmse(y_train, pred_train),
-        "val_rmse": _rmse(y_val, pred_val),
-        "train_mae": _mae(y_train, pred_train),
-        "val_mae": _mae(y_val, pred_val),
-        "train_r2": _r2_score(y_train, pred_train),
-        "val_r2": _r2_score(y_val, pred_val),
-        "label_mean_train": float(np.mean(y_train)),
-        "label_mean_val": float(np.mean(y_val)),
-        "prediction_mean_val": float(np.mean(pred_val)),
-        "skipped": False,
+def _manifest_decision_grid_lineage(manifest: storage_manifest.StorageManifest) -> dict[str, object]:
+    notes = manifest.notes or {}
+    lineage = notes.get("decision_grid")
+    if not isinstance(lineage, Mapping):
+        raise ValueError("split source manifest notes must include decision_grid lineage")
+    required = ("decision_grid_schema", "decision_grid_hash", "decision_grid_n_rows", "decision_schedule")
+    missing = [key for key in required if key not in lineage]
+    if missing:
+        raise ValueError(f"split source manifest decision_grid lineage missing fields: {missing}")
+    schedule = dict(lineage["decision_schedule"])  # type: ignore[arg-type]
+    if schedule != manifest.decision_schedule:
+        raise ValueError("split source manifest decision_grid schedule must match manifest decision_schedule")
+    return {
+        "decision_grid_schema": _require_nonempty_str(str(lineage["decision_grid_schema"]), "decision_grid_schema"),
+        "decision_grid_hash": _require_nonempty_str(str(lineage["decision_grid_hash"]), "decision_grid_hash"),
+        "decision_grid_n_rows": _require_positive_int(int(lineage["decision_grid_n_rows"]), "decision_grid_n_rows"),
+        "decision_schedule": schedule,
     }
-    if target_name.endswith("_filled") or target_name.endswith("_toxic_fill"):
-        metrics["train_auc"] = _binary_auc(y_train, pred_train)
-        metrics["val_auc"] = _binary_auc(y_val, pred_val)
-    return metrics
 
 
-def _fit_baselines(
-    dataset,
-    *,
-    target_names: tuple[str, ...],
-    train_fraction: float,
-    ridge_l2: float,
-    min_train_samples: int,
-) -> _BaselineFitResult:
-    n = int(dataset.num_decisions)
-    if n < 2:
-        targets_metrics = {
-            target_name: {
-                "target_name": target_name,
-                "train_rows": 0,
-                "val_rows": 0,
-                "skipped": True,
-                "skip_reason": "not_enough_decisions",
-            }
-            for target_name in target_names
-        }
-        return _BaselineFitResult(
-            target_names=(),
-            feature_names=tuple(dataset.feature_names),
-            train_rows=0,
-            val_rows=0,
-            feature_mean=np.asarray([], dtype=np.float32),
-            feature_scale=np.asarray([], dtype=np.float32),
-            coefficients=np.empty((0, dataset.num_features), dtype=np.float64),
-            intercepts=np.asarray([], dtype=np.float64),
-            metrics={
-                "enabled": True,
-                "train_fraction": train_fraction,
-                "ridge_l2": ridge_l2,
-                "min_train_samples": min_train_samples,
-                "train_rows_total": 0,
-                "val_rows_total": 0,
-                "fitted_target_count": 0,
-                "requested_target_count": len(target_names),
-                "targets": targets_metrics,
-                "skipped": True,
-                "skip_reason": "not_enough_decisions",
-            },
-        )
-    train_idx, val_idx = _chronological_split(n, train_fraction)
-    X = dataset.features.astype(np.float64, copy=False)
-    feature_mean, feature_scale = _fit_feature_standardization(X[train_idx])
-    X_std = _standardize_features(X, feature_mean, feature_scale)
-    label_index = {name: i for i, name in enumerate(dataset.label_names)}
-    fitted_names: list[str] = []
-    coefficients: list[np.ndarray] = []
-    intercepts: list[float] = []
-    targets_metrics: dict[str, object] = {}
-    for target_name in target_names:
-        if target_name not in label_index:
-            targets_metrics[target_name] = {
-                "target_name": target_name,
-                "train_rows": 0,
-                "val_rows": 0,
-                "skipped": True,
-                "skip_reason": "unknown_target",
-            }
-            continue
-        target_idx = label_index[target_name]
-        mask = dataset.label_masks[:, target_idx]
-        target_train_idx = train_idx[mask[train_idx]]
-        target_val_idx = val_idx[mask[val_idx]]
-        train_rows = int(len(target_train_idx))
-        val_rows = int(len(target_val_idx))
-        if train_rows < min_train_samples or val_rows == 0:
-            reason = "not_enough_train_rows" if train_rows < min_train_samples else "no_validation_rows"
-            targets_metrics[target_name] = {
-                "target_name": target_name,
-                "train_rows": train_rows,
-                "val_rows": val_rows,
-                "skipped": True,
-                "skip_reason": reason,
-            }
-            continue
-        y_train = dataset.labels[target_train_idx, target_idx].astype(np.float64, copy=False)
-        y_val = dataset.labels[target_val_idx, target_idx].astype(np.float64, copy=False)
-        coef, intercept = _fit_ridge(X_std[target_train_idx], y_train, ridge_l2)
-        pred_train = X_std[target_train_idx] @ coef + intercept
-        pred_val = X_std[target_val_idx] @ coef + intercept
-        fitted_names.append(target_name)
-        coefficients.append(coef)
-        intercepts.append(intercept)
-        targets_metrics[target_name] = _target_metrics(y_train, pred_train, y_val, pred_val, target_name)
-    if not fitted_names:
-        metrics: dict[str, object] = {
-            "enabled": True,
-            "train_fraction": train_fraction,
-            "ridge_l2": ridge_l2,
-            "min_train_samples": min_train_samples,
-            "train_rows_total": int(len(train_idx)),
-            "val_rows_total": int(len(val_idx)),
-            "fitted_target_count": 0,
-            "requested_target_count": len(target_names),
-            "targets": targets_metrics,
-            "skipped": True,
-            "skip_reason": "all_targets_skipped",
-        }
-        return _BaselineFitResult(
-            target_names=(),
-            feature_names=tuple(dataset.feature_names),
-            train_rows=int(len(train_idx)),
-            val_rows=int(len(val_idx)),
-            feature_mean=feature_mean,
-            feature_scale=feature_scale,
-            coefficients=np.empty((0, dataset.num_features), dtype=np.float64),
-            intercepts=np.asarray([], dtype=np.float64),
-            metrics=metrics,
-        )
-    metrics: dict[str, object] = {
-        "enabled": True,
-        "train_fraction": train_fraction,
-        "ridge_l2": ridge_l2,
-        "min_train_samples": min_train_samples,
-        "train_rows_total": int(len(train_idx)),
-        "val_rows_total": int(len(val_idx)),
-        "fitted_target_count": len(fitted_names),
-        "requested_target_count": len(target_names),
-        "targets": targets_metrics,
+def _validate_split_source_lineage(manifest: storage_manifest.StorageManifest, decision_grid) -> dict[str, object]:
+    lineage = _manifest_decision_grid_lineage(manifest)
+    expected = {
+        "decision_grid_schema": decision_grid.metadata.schema,
+        "decision_grid_hash": decision_grid.decision_grid_hash,
+        "decision_grid_n_rows": decision_grid.n_rows,
+        "decision_schedule": decision_grid.decision_schedule,
     }
-    return _BaselineFitResult(
-        target_names=tuple(fitted_names),
-        feature_names=tuple(dataset.feature_names),
-        train_rows=int(len(train_idx)),
-        val_rows=int(len(val_idx)),
-        feature_mean=feature_mean,
-        feature_scale=feature_scale,
-        coefficients=np.vstack(coefficients),
-        intercepts=np.asarray(intercepts, dtype=np.float64),
-        metrics=metrics,
-    )
+    for key, value in expected.items():
+        if lineage[key] != value:
+            raise ValueError(f"split source decision grid mismatch for {key}: expected={value!r} actual={lineage[key]!r}")
+    return lineage
+
+
+def _split_range_payload(split: storage_manifest.SplitMetadata) -> dict[str, object]:
+    return {
+        "segment_key": split.segment_key,
+        "start_row": int(split.start_row),
+        "end_row": int(split.end_row),
+        "row_count": int(split.end_row - split.start_row),
+        "start_local_ts_us": int(split.local_time_range.start_us),
+        "end_local_ts_us": int(split.local_time_range.end_us),
+        "embargo_before_us": int(split.embargo_before_us),
+        "embargo_after_us": int(split.embargo_after_us),
+    }
+
+
+def _split_contract_from_source_dataset(split_source_dataset_root: str, decision_grid) -> dict[str, object]:
+    root = Path(_require_nonempty_str(split_source_dataset_root, "split_source_dataset_root"))
+    manifest_path = root / storage_manifest.DEFAULT_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"split source manifest not found: {manifest_path}")
+    manifest = storage_manifest.read_manifest_json(manifest_path)
+    manifest.validate_against_current_code()
+    lineage = _validate_split_source_lineage(manifest, decision_grid)
+    entries_by_role = {
+        role.value: tuple(split for split in manifest.splits if split.role == role)
+        for role in (SplitRole.TRAIN, SplitRole.VAL, SplitRole.TEST)
+    }
+    missing = [role for role, entries in entries_by_role.items() if not entries]
+    if missing:
+        raise ValueError(f"split source manifest must include train/val/test splits; missing={missing}")
+    ranges = {
+        role: [_split_range_payload(split) for split in entries]
+        for role, entries in entries_by_role.items()
+    }
+    source_row_counts = {
+        role: int(sum(split.end_row - split.start_row for split in entries))
+        for role, entries in entries_by_role.items()
+    }
+    return {
+        "schema": ADVERSE_SPLIT_CONTRACT_SCHEMA,
+        "version": 1,
+        "split_source_dataset_root": str(root),
+        "split_source_dataset_id": manifest.dataset_id,
+        "split_source_manifest_hash": manifest.content_hash(),
+        "ranges": ranges,
+        "source_row_counts": source_row_counts,
+        "adverse_dataset_rows_total": 0,
+        "adverse_row_counts": {"train": 0, "val": 0, "test": 0, "out_of_split": 0},
+        **lineage,
+    }
 
 
 def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]:
@@ -676,6 +516,8 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     output_json = Path(config.output_json) if config.output_json is not None else _default_output_json(config.tape_root)
     model_npz = Path(config.model_npz) if config.model_npz is not None else _default_model_npz(config.tape_root)
     profile_mode = config.profile_rows is not None
+    if not profile_mode and config.split_source_dataset_root is None:
+        raise ValueError("split_source_dataset_root is required for adverse-selection training")
     if not profile_mode and output_json.exists() and not config.overwrite:
         raise FileExistsError(f"output_json already exists: {output_json}")
     if not profile_mode and model_npz.exists() and not config.overwrite:
@@ -738,6 +580,9 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         if config.profile_output_json is not None:
             _write_json_atomic(Path(config.profile_output_json), summary)
         return summary
+    assert config.split_source_dataset_root is not None
+    _log_stage("train_adverse_selection stage=split_source_load")
+    split_contract = _split_contract_from_source_dataset(config.split_source_dataset_root, decision_grid)
     feature_count = len(adverse_selection_feature_names(adverse_config))
     label_count = len(adverse_selection_label_names(adverse_config))
     disk_estimate = estimate_adverse_dataset_bytes(num_decisions_estimate=decision_grid.n_rows, num_features=feature_count, num_labels=label_count)
@@ -746,6 +591,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         tape,
         config=adverse_config,
         decision_grid=decision_grid,
+        split_contract=split_contract,
         output_root=dataset_root,
         work_dir=config.work_dir,
         chunk_rows=config.chunk_rows,
@@ -761,7 +607,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
     baseline_fit = fit_adverse_baselines_streaming(
         dataset,
         target_names=_resolve_target_names(dataset, config.target_names),
-        train_fraction=config.train_fraction,
+        split_contract=split_contract,
         ridge_l2=config.ridge_l2,
         min_train_samples=config.min_train_samples,
         chunk_rows=config.chunk_rows,
@@ -770,6 +616,22 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         exact_auc_max_rows=config.exact_auc_max_rows,
     )
     baseline_summary = baseline_fit.metrics
+    split_contract_with_counts = dict(baseline_summary["split_contract"])  # type: ignore[arg-type]
+    dataset_manifest = adverse_selection_dataset_manifest_with_split_contract(dataset.manifest, split_contract_with_counts)
+    write_adverse_selection_dataset_manifest(dataset.root, dataset_manifest)
+    dataset_summary = {
+        **dataset_summary,
+        "split_source_dataset_root": split_contract_with_counts["split_source_dataset_root"],
+        "split_source_dataset_id": split_contract_with_counts["split_source_dataset_id"],
+        "split_source_manifest_hash": split_contract_with_counts["split_source_manifest_hash"],
+        "split_contract": split_contract_with_counts,
+        "adverse_dataset_rows_total": baseline_summary["adverse_dataset_rows_total"],
+        "adverse_train_rows": baseline_summary["adverse_train_rows"],
+        "adverse_val_rows": baseline_summary["adverse_val_rows"],
+        "adverse_test_rows": baseline_summary["adverse_test_rows"],
+        "out_of_split_rows": baseline_summary["out_of_split_rows"],
+        "dropped_rows": int(decision_grid.n_rows - dataset.num_rows),
+    }
     model_written = False
     if baseline_fit.target_names:
         _log_stage("train_adverse_selection stage=model_write")
@@ -790,6 +652,10 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
                 decision_grid_hash=decision_grid.decision_grid_hash,
                 decision_grid_n_rows=decision_grid.n_rows,
                 decision_schedule=decision_grid.decision_schedule,
+                split_source_dataset_root=str(split_contract_with_counts["split_source_dataset_root"]),
+                split_source_dataset_id=str(split_contract_with_counts["split_source_dataset_id"]),
+                split_source_manifest_hash=str(split_contract_with_counts["split_source_manifest_hash"]),
+                split_contract=split_contract_with_counts,
             ),
             overwrite=config.overwrite,
         )
@@ -830,6 +696,20 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
             "n_rows": decision_grid.n_rows,
             "schedule": decision_grid.decision_schedule,
         },
+        "split_source": {
+            "dataset_root": split_contract_with_counts["split_source_dataset_root"],
+            "dataset_id": split_contract_with_counts["split_source_dataset_id"],
+            "manifest_hash": split_contract_with_counts["split_source_manifest_hash"],
+            "split_contract_schema": split_contract_with_counts["schema"],
+            "split_contract_version": split_contract_with_counts["version"],
+            "ranges": split_contract_with_counts["ranges"],
+            "source_row_counts": split_contract_with_counts["source_row_counts"],
+            "adverse_row_counts": split_contract_with_counts["adverse_row_counts"],
+            "decision_grid_schema": split_contract_with_counts["decision_grid_schema"],
+            "decision_grid_hash": split_contract_with_counts["decision_grid_hash"],
+            "decision_grid_n_rows": split_contract_with_counts["decision_grid_n_rows"],
+            "decision_schedule": split_contract_with_counts["decision_schedule"],
+        },
         "dataset": dataset_summary,
         "baseline": baseline_summary,
         "resource_mode": {
@@ -859,6 +739,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tape-root", required=True)
     parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
+    parser.add_argument("--split-source-dataset-root")
     parser.add_argument("--output-json")
     parser.add_argument("--model-npz")
     parser.add_argument("--overwrite", action="store_true")
@@ -906,7 +787,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable de-duplication of L2 visible decreases already explained by same-level trade prints.",
     )
-    parser.add_argument("--train-fraction", type=float, default=0.7)
     parser.add_argument("--ridge-l2", type=float, default=0.001)
     parser.add_argument("--min-train-samples", type=int, default=10)
     parser.add_argument("--target-names", default="auto")
@@ -917,6 +797,7 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
     return AdverseSelectionTrainCLIConfig(
         tape_root=args.tape_root,
         decision_grid_path=args.decision_grid_path,
+        split_source_dataset_root=args.split_source_dataset_root,
         output_json=args.output_json,
         model_npz=args.model_npz,
         overwrite=args.overwrite,
@@ -958,7 +839,6 @@ def _config_from_args(args: argparse.Namespace) -> AdverseSelectionTrainCLIConfi
         trade_at_level_weight=args.trade_at_level_weight,
         unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
         dedupe_l2_decrease_with_trade_prints=not args.no_dedupe_l2_decrease_with_trade_prints,
-        train_fraction=args.train_fraction,
         ridge_l2=args.ridge_l2,
         min_train_samples=args.min_train_samples,
         target_names=args.target_names,

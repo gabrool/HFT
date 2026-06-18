@@ -11,11 +11,18 @@ from mmrt.execution.adverse_signal import (
     load_adverse_selection_model,
     require_adverse_targets_for_executable_edge,
 )
-from tests.grid_helpers import grid_lineage_fields
+from tests.grid_helpers import adverse_split_contract_fields, grid_lineage_fields
 
 
 def _grid_kwargs(n_rows: int = 1):
     return grid_lineage_fields(n_rows=n_rows)
+
+
+def _model_lineage_kwargs(n_rows: int = 1):
+    return {
+        **grid_lineage_fields(n_rows=n_rows),
+        **adverse_split_contract_fields(n_rows=n_rows),
+    }
 
 
 def _artifact():
@@ -30,7 +37,7 @@ def _artifact():
         config_json="{}",
         exchange="x",
         symbol="y",
-        **_grid_kwargs(),
+        **_model_lineage_kwargs(),
     )
 
 
@@ -57,7 +64,7 @@ def test_adverse_model_requires_current_schema_and_edge_targets():
             config_json="{}",
             exchange="x",
             symbol="y",
-            **_grid_kwargs(),
+            **_model_lineage_kwargs(),
         )
     with pytest.raises(ValueError, match="missing adverse-selection targets"):
         require_adverse_targets_for_executable_edge(("bid_touch_filled",), ("touch",))

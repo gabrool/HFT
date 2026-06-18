@@ -10,7 +10,7 @@ from mmrt.execution.adverse_selection import (
     AdverseSelectionDataset,
     build_adverse_selection_dataset_to_disk,
 )
-from tests.grid_helpers import decision_grid_for_tape
+from tests.grid_helpers import adverse_split_contract_for_grid, decision_grid_for_tape
 
 
 _DATASET_COUNTER = count()
@@ -29,6 +29,7 @@ def build_tiny_adverse_selection_dataset(
         tape,
         config=config,
         decision_grid=grid,
+        split_contract=adverse_split_contract_for_grid(grid, root=str(tmp_path / f"split_source_{dataset_id}"))["split_contract"],
         output_root=tmp_path / f"adverse_ds_{dataset_id}",
         work_dir=tmp_path / f"adverse_work_{dataset_id}",
         chunk_rows=4096,
