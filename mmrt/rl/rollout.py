@@ -12,7 +12,7 @@ import torch
 
 from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.split_contract import DecisionSplitRange
-from mmrt.rl.device import resolve_torch_device
+from mmrt.rl.device import canonicalize_torch_device, resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer
 from mmrt.rl.torch_networks import ActorCriticNetwork
 
@@ -111,13 +111,18 @@ def _observation_to_tensor(
 ) -> torch.Tensor:
     obs_dim = _require_positive_int(obs_dim, "obs_dim")
     dtype = _require_float_dtype(dtype, "dtype")
+    device = canonicalize_torch_device(device)
     tensor = torch.as_tensor(obs, device=device, dtype=dtype)
     if tuple(tensor.shape) != (obs_dim,):
         raise ValueError(f"observation shape must be ({obs_dim},)")
     if out is not None:
         if not isinstance(out, torch.Tensor):
             raise TypeError("out must be a torch.Tensor")
-        if out.device != device or out.dtype != dtype or tuple(out.shape) != (obs_dim,):
+        if (
+            canonicalize_torch_device(out.device) != device
+            or out.dtype != dtype
+            or tuple(out.shape) != (obs_dim,)
+        ):
             raise ValueError("out must match observation device, dtype, and shape")
         out.copy_(tensor)
         return out
