@@ -9,6 +9,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from mmrt.execution.adverse_selection import AdverseSelectionDataset, AdverseSelectionFeatureDataset
+from mmrt.execution.adverse_selection_dataset import ADVERSE_SPLIT_CONTRACT_SCHEMA
 from mmrt.execution.decision_grid import DecisionGrid, validate_decision_key_order
 
 ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_grid_v1"
@@ -48,6 +49,25 @@ def _nonempty_str(value: str, name: str) -> str:
     return value.strip()
 
 
+def _split_contract(value: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("split_contract must be a mapping")
+    out = dict(value)
+    if out.get("schema") != ADVERSE_SPLIT_CONTRACT_SCHEMA:
+        raise ValueError("split_contract schema mismatch")
+    for key in ("split_source_dataset_root", "split_source_dataset_id", "split_source_manifest_hash", "ranges", "source_row_counts", "adverse_row_counts"):
+        if key not in out:
+            raise ValueError(f"split_contract missing {key}")
+    _nonempty_str(str(out["split_source_dataset_root"]), "split_source_dataset_root")
+    _nonempty_str(str(out["split_source_dataset_id"]), "split_source_dataset_id")
+    _hash64(str(out["split_source_manifest_hash"]), "split_source_manifest_hash")
+    if not isinstance(out["ranges"], Mapping):
+        raise ValueError("split_contract ranges must be a mapping")
+    if not isinstance(out["source_row_counts"], Mapping) or not isinstance(out["adverse_row_counts"], Mapping):
+        raise ValueError("split_contract row counts must be mappings")
+    return out
+
+
 @dataclass(frozen=True, slots=True)
 class AdverseSelectionModelArtifact:
     schema: str
@@ -64,6 +84,10 @@ class AdverseSelectionModelArtifact:
     decision_grid_hash: str
     decision_grid_n_rows: int
     decision_schedule: Mapping[str, object]
+    split_source_dataset_root: str
+    split_source_dataset_id: str
+    split_source_manifest_hash: str
+    split_contract: Mapping[str, object]
 
     def __post_init__(self) -> None:
         if self.schema != ADVERSE_SELECTION_MODEL_SCHEMA:
@@ -94,6 +118,17 @@ class AdverseSelectionModelArtifact:
         if not isinstance(self.decision_schedule, Mapping):
             raise ValueError("decision_schedule must be a mapping")
         object.__setattr__(self, "decision_schedule", dict(self.decision_schedule))
+        split_contract = _split_contract(self.split_contract)
+        object.__setattr__(self, "split_source_dataset_root", _nonempty_str(self.split_source_dataset_root, "split_source_dataset_root"))
+        object.__setattr__(self, "split_source_dataset_id", _nonempty_str(self.split_source_dataset_id, "split_source_dataset_id"))
+        object.__setattr__(self, "split_source_manifest_hash", _hash64(self.split_source_manifest_hash, "split_source_manifest_hash"))
+        if split_contract["split_source_dataset_root"] != self.split_source_dataset_root:
+            raise ValueError("split_source_dataset_root must match split_contract")
+        if split_contract["split_source_dataset_id"] != self.split_source_dataset_id:
+            raise ValueError("split_source_dataset_id must match split_contract")
+        if split_contract["split_source_manifest_hash"] != self.split_source_manifest_hash:
+            raise ValueError("split_source_manifest_hash must match split_contract")
+        object.__setattr__(self, "split_contract", split_contract)
         object.__setattr__(self, "feature_mean", fm)
         object.__setattr__(self, "feature_scale", fs)
         object.__setattr__(self, "coefficients", coef)
@@ -125,6 +160,10 @@ def save_adverse_selection_model(path: str | Path, artifact: AdverseSelectionMod
             decision_grid_hash=np.array(artifact.decision_grid_hash),
             decision_grid_n_rows=np.array(artifact.decision_grid_n_rows, dtype=np.int64),
             decision_schedule=np.array(dict(artifact.decision_schedule), dtype=object),
+            split_source_dataset_root=np.array(artifact.split_source_dataset_root),
+            split_source_dataset_id=np.array(artifact.split_source_dataset_id),
+            split_source_manifest_hash=np.array(artifact.split_source_manifest_hash),
+            split_contract=np.array(dict(artifact.split_contract), dtype=object),
         )
     tmp.replace(path)
 
@@ -146,6 +185,10 @@ def load_adverse_selection_model(path: str | Path) -> AdverseSelectionModelArtif
             decision_grid_hash=str(data["decision_grid_hash"].item()),
             decision_grid_n_rows=int(data["decision_grid_n_rows"].item()),
             decision_schedule=dict(data["decision_schedule"].item()),
+            split_source_dataset_root=str(data["split_source_dataset_root"].item()),
+            split_source_dataset_id=str(data["split_source_dataset_id"].item()),
+            split_source_manifest_hash=str(data["split_source_manifest_hash"].item()),
+            split_contract=dict(data["split_contract"].item()),
         )
 
 

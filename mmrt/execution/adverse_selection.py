@@ -2006,6 +2006,21 @@ def _dataset_manifest_matches(
     label_names: tuple[str, ...],
 ) -> bool:
     manifest = dataset.manifest
+    def split_source_view(contract: Mapping[str, object]) -> dict[str, object]:
+        return {key: contract[key] for key in (
+            "schema",
+            "version",
+            "split_source_dataset_root",
+            "split_source_dataset_id",
+            "split_source_manifest_hash",
+            "ranges",
+            "source_row_counts",
+            "decision_grid_schema",
+            "decision_grid_hash",
+            "decision_grid_n_rows",
+            "decision_schedule",
+        )}
+
     return (
         manifest.exchange == metadata["exchange"]
         and manifest.symbol == metadata["symbol"]
@@ -2019,6 +2034,10 @@ def _dataset_manifest_matches(
         and manifest.decision_grid_hash == metadata["decision_grid_hash"]
         and manifest.decision_grid_n_rows == metadata["decision_grid_n_rows"]
         and dict(manifest.decision_schedule) == dict(metadata["decision_schedule"])  # type: ignore[arg-type]
+        and manifest.split_source_dataset_root == metadata["split_source_dataset_root"]
+        and manifest.split_source_dataset_id == metadata["split_source_dataset_id"]
+        and manifest.split_source_manifest_hash == metadata["split_source_manifest_hash"]
+        and split_source_view(manifest.split_contract) == split_source_view(dict(metadata["split_contract"]))  # type: ignore[arg-type]
         and manifest.config_json == metadata["config_json"]
         and manifest.index_schema == metadata["index_schema"]
         and manifest.index_manifest_sha256 == metadata["index_manifest_sha256"]
@@ -2206,6 +2225,7 @@ def build_adverse_selection_dataset_to_disk(
     *,
     config: AdverseSelectionConfig = AdverseSelectionConfig(),
     decision_grid: DecisionGrid,
+    split_contract: Mapping[str, object],
     output_root: object,
     work_dir: object | None = None,
     chunk_rows: int = 100_000,
@@ -2271,6 +2291,10 @@ def build_adverse_selection_dataset_to_disk(
         "decision_grid_hash": decision_grid.decision_grid_hash,
         "decision_grid_n_rows": decision_grid.n_rows,
         "decision_schedule": decision_grid.decision_schedule,
+        "split_source_dataset_root": str(split_contract["split_source_dataset_root"]),
+        "split_source_dataset_id": str(split_contract["split_source_dataset_id"]),
+        "split_source_manifest_hash": str(split_contract["split_source_manifest_hash"]),
+        "split_contract": dict(split_contract),
         "config_json": json.dumps(_adverse_config_summary(config), sort_keys=True),
         "index_schema": index.manifest.schema,
         "index_manifest_sha256": adverse_selection_index_manifest_sha256(index.root),

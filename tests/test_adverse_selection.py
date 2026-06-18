@@ -7,14 +7,14 @@ from collections import deque
 import numpy as np
 import pytest
 
-from mmrt.contracts import AggressorSide
+from mmrt.contracts import AggressorSide, SplitRole, TimeRangeUS
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, LatencyConfig, QueueModelMode, SymbolSpec, TradePrint
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, save_execution_tape
 from mmrt.execution.l2_reconstructor import ReconstructedL2Event
 from mmrt.execution.queue_model import QueueModelConfig
-from mmrt.execution.decision_grid import save_decision_grid
+from mmrt.execution.decision_grid import load_decision_grid, save_decision_grid
 from mmrt.execution.adverse_selection import (
     AdverseSelectionConfig,
     CounterfactualQuoteConfig,
@@ -38,7 +38,8 @@ from mmrt.cli.train_adverse_selection import (
     main,
     run_adverse_selection_training,
 )
-from tests.grid_helpers import decision_grid_for_tape
+from mmrt.storage import manifest as storage_manifest
+from tests.grid_helpers import adverse_split_contract_for_grid, decision_grid_for_tape, grid_lineage_notes
 from tests.adverse_helpers import build_tiny_adverse_selection_dataset
 
 
@@ -139,6 +140,73 @@ def _save_tape(tmp_path, tape):
 
 def _tiny_tape_root(tmp_path, tape=None):
     return _save_tape(tmp_path, tape or _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], []))
+
+
+def _split_source_dataset_root(tmp_path, tape_root, *, missing_roles=(), grid_hash=None):
+    grid = load_decision_grid(tape_root / "decision_grid")
+    assert grid.n_rows >= 3
+    root = tmp_path / f"split_source_{len(list(tmp_path.glob('split_source_*')))}"
+    root.mkdir()
+    first_ts = int(grid.decision_local_ts_us[0])
+    last_ts = int(grid.decision_local_ts_us[-1]) + 1
+    segment = storage_manifest.StorageSegment(
+        segment_key="seg_000",
+        parquet_path="segments/seg_000.parquet",
+        row_count=grid.n_rows,
+        label_count=grid.n_rows,
+        time_range=TimeRangeUS(first_ts, last_ts),
+        local_time_range=TimeRangeUS(first_ts, last_ts),
+        first_row_idx=0,
+        last_row_idx=grid.n_rows - 1,
+    )
+    if grid.n_rows >= 4:
+        train_end = max(1, grid.n_rows - 3)
+        val_end = grid.n_rows - 2
+        test_end = grid.n_rows - 1
+    else:
+        train_end = max(1, grid.n_rows - 2)
+        val_end = grid.n_rows - 1
+        test_end = grid.n_rows
+    bounds = {
+        SplitRole.TRAIN: (0, train_end),
+        SplitRole.VAL: (train_end, val_end),
+        SplitRole.TEST: (val_end, test_end),
+    }
+
+    def split_range(start_row, end_row):
+        start = int(grid.decision_local_ts_us[start_row])
+        end = int(grid.decision_local_ts_us[end_row]) if end_row < grid.n_rows else last_ts
+        if end <= start:
+            end = start + 1
+        return TimeRangeUS(start, end)
+
+    missing = {SplitRole(role) for role in missing_roles}
+    splits = tuple(
+        storage_manifest.SplitMetadata(
+            role=role,
+            segment_key=segment.segment_key,
+            start_row=start_row,
+            end_row=end_row,
+            local_time_range=split_range(start_row, end_row),
+            embargo_before_us=0,
+            embargo_after_us=0,
+        )
+        for role, (start_row, end_row) in bounds.items()
+        if role not in missing
+    )
+    manifest = storage_manifest.make_manifest(
+        dataset_id="split-source",
+        created_at_utc="2026-01-01T00:00:00Z",
+        segments=(segment,),
+        splits=splits,
+        notes=grid_lineage_notes(
+            n_rows=grid.n_rows,
+            schedule=grid.decision_schedule,
+            grid_hash=grid_hash or grid.decision_grid_hash,
+        ),
+    )
+    storage_manifest.write_manifest_json(manifest, root / storage_manifest.DEFAULT_MANIFEST_FILENAME)
+    return root
 
 
 def _label_value(dataset, name, row=0):
@@ -297,6 +365,7 @@ def _training_tape_with_multiple_decisions():
 
 def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
+    split_source = _split_source_dataset_root(tmp_path, tape_root)
     output_json = tmp_path / "summary.json"
     model_npz = tmp_path / "model.npz"
 
@@ -304,13 +373,14 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
         AdverseSelectionTrainCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(split_source),
             output_json=str(output_json),
             model_npz=str(model_npz),
             overwrite=True,
             fill_horizon_us=1_000,
             adverse_horizon_us=1_000,
             order_qty=1.0,
-            train_fraction=0.6,
+            drop_incomplete_horizon=False,
             min_train_samples=1,
             target_names=("bid_touch_filled", "ask_touch_filled", "bid_touch_toxic_cost_bps", "ask_touch_toxic_cost_bps"),
         )
@@ -321,11 +391,28 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     assert summary["run_type"] == "train_adverse_selection"
     assert summary["dataset"]["num_decisions"] > 0
     assert summary["baseline"]["enabled"] is True
+    assert summary["baseline"]["selection_split"] == "val"
+    assert summary["baseline"]["final_holdout_split"] == "test"
+    assert summary["dataset"]["adverse_train_rows"] > 0
+    assert summary["dataset"]["adverse_val_rows"] > 0
+    assert summary["dataset"]["adverse_test_rows"] > 0
+    assert summary["split_source"]["dataset_root"] == str(split_source)
+    assert summary["split_source"]["dataset_id"] == "split-source"
+    assert summary["split_source"]["split_contract_schema"] == "mmrt_adverse_split_contract_v1"
+    assert set(summary["split_source"]["ranges"]) == {"train", "val", "test"}
+    dataset_manifest = json.loads((Path(summary["dataset_root"]) / "manifest.json").read_text(encoding="utf-8"))
+    assert dataset_manifest["split_source_dataset_root"] == str(split_source)
+    assert dataset_manifest["split_source_dataset_id"] == "split-source"
+    assert dataset_manifest["split_contract"]["adverse_row_counts"]["train"] == summary["dataset"]["adverse_train_rows"]
     if model_npz.exists():
         npz = np.load(model_npz, allow_pickle=True)
         assert str(npz["schema"]) == "mmrt_adverse_selection_ridge_grid_v1"
         assert "feature_mean" in npz
         assert "coefficients" in npz
+        assert str(npz["split_source_dataset_root"]) == str(split_source)
+        model_split_contract = dict(npz["split_contract"].item())
+        assert model_split_contract["split_source_dataset_id"] == "split-source"
+        assert model_split_contract["adverse_row_counts"]["test"] == summary["dataset"]["adverse_test_rows"]
 
 
 def test_train_adverse_selection_profile_rows_writes_profile_only(tmp_path):
@@ -359,6 +446,48 @@ def test_train_adverse_selection_profile_rows_writes_profile_only(tmp_path):
     assert not model_npz.exists()
 
 
+def test_train_adverse_selection_requires_split_source_for_training(tmp_path):
+    with pytest.raises(ValueError, match="split_source_dataset_root is required"):
+        run_adverse_selection_training(
+            AdverseSelectionTrainCLIConfig(
+                tape_root=str(tmp_path / "tape"),
+                decision_grid_path=str(tmp_path / "tape" / "decision_grid"),
+            )
+        )
+
+
+def test_train_adverse_selection_rejects_split_source_grid_hash_mismatch(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
+    split_source = _split_source_dataset_root(tmp_path, tape_root, grid_hash="0" * 64)
+    with pytest.raises(ValueError, match="decision_grid_hash"):
+        run_adverse_selection_training(
+            AdverseSelectionTrainCLIConfig(
+                tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
+                split_source_dataset_root=str(split_source),
+                output_json=str(tmp_path / "summary.json"),
+                model_npz=str(tmp_path / "model.npz"),
+                overwrite=True,
+            )
+        )
+
+
+def test_train_adverse_selection_rejects_split_source_missing_named_split(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
+    split_source = _split_source_dataset_root(tmp_path, tape_root, missing_roles=(SplitRole.VAL,))
+    with pytest.raises(ValueError, match="train/val/test"):
+        run_adverse_selection_training(
+            AdverseSelectionTrainCLIConfig(
+                tape_root=str(tape_root),
+                decision_grid_path=str(tape_root / "decision_grid"),
+                split_source_dataset_root=str(split_source),
+                output_json=str(tmp_path / "summary.json"),
+                model_npz=str(tmp_path / "model.npz"),
+                overwrite=True,
+            )
+        )
+
+
 def test_adverse_dataset_reuses_complete_manifest_and_rejects_partial_root(tmp_path):
     tape = _training_tape_with_multiple_decisions()
     config = _base_config(
@@ -372,12 +501,14 @@ def test_adverse_dataset_reuses_complete_manifest_and_rejects_partial_root(tmp_p
         max_decisions=4,
     )
     grid = decision_grid_for_tape(tape, max_rows=4)
+    split_contract = adverse_split_contract_for_grid(grid, root=str(tmp_path / "split_source"))["split_contract"]
     root = tmp_path / "ds"
     work_dir = tmp_path / "work"
     first = build_adverse_selection_dataset_to_disk(
         tape,
         config=config,
         decision_grid=grid,
+        split_contract=split_contract,
         output_root=root,
         work_dir=work_dir,
         chunk_rows=4096,
@@ -389,6 +520,7 @@ def test_adverse_dataset_reuses_complete_manifest_and_rejects_partial_root(tmp_p
         tape,
         config=config,
         decision_grid=grid,
+        split_contract=split_contract,
         output_root=root,
         work_dir=work_dir,
         chunk_rows=4096,
@@ -405,6 +537,7 @@ def test_adverse_dataset_reuses_complete_manifest_and_rejects_partial_root(tmp_p
             tape,
             config=config,
             decision_grid=grid,
+            split_contract=split_contract,
             output_root=partial_root,
             work_dir=work_dir,
             chunk_rows=4096,
@@ -416,6 +549,7 @@ def test_adverse_dataset_reuses_complete_manifest_and_rejects_partial_root(tmp_p
 
 def test_adverse_selection_all_unknown_targets_preserves_skip_reasons(tmp_path):
     tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
+    split_source = _split_source_dataset_root(tmp_path, tape_root)
     output_json = tmp_path / "summary.json"
     model_npz = tmp_path / "model.npz"
 
@@ -423,6 +557,7 @@ def test_adverse_selection_all_unknown_targets_preserves_skip_reasons(tmp_path):
         AdverseSelectionTrainCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(split_source),
             output_json=str(output_json),
             model_npz=str(model_npz),
             overwrite=True,
@@ -452,10 +587,11 @@ def test_adverse_selection_all_unknown_targets_preserves_skip_reasons(tmp_path):
 
 def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tmp_path):
     tape = _tape(
-        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
         [],
     )
     tape_root = _tiny_tape_root(tmp_path, tape)
+    split_source = _split_source_dataset_root(tmp_path, tape_root)
     output_json = tmp_path / "summary.json"
     model_npz = tmp_path / "model.npz"
 
@@ -463,6 +599,7 @@ def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tm
         AdverseSelectionTrainCLIConfig(
             tape_root=str(tape_root),
             decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(split_source),
             output_json=str(output_json),
             model_npz=str(model_npz),
             overwrite=True,
@@ -490,11 +627,13 @@ def test_adverse_selection_not_enough_decisions_preserves_target_skip_reasons(tm
 
 def test_train_adverse_selection_main_writes_summary_and_prints_json(tmp_path, capsys):
     tape_root = _tiny_tape_root(tmp_path, _training_tape_with_multiple_decisions())
+    split_source = _split_source_dataset_root(tmp_path, tape_root)
     output_json = tmp_path / "summary.json"
     model_npz = tmp_path / "model.npz"
     rc = main([
         "--tape-root", str(tape_root),
         "--decision-grid", str(tape_root / "decision_grid"),
+        "--split-source-dataset-root", str(split_source),
         "--output-json", str(output_json),
         "--model-npz", str(model_npz),
         "--overwrite",
@@ -502,6 +641,7 @@ def test_train_adverse_selection_main_writes_summary_and_prints_json(tmp_path, c
         "--adverse-horizon-us", "1000",
         "--order-qty", "1.0",
         "--min-train-samples", "1",
+        "--keep-incomplete-horizon",
     ])
     assert rc == 0
     stdout_summary = json.loads(capsys.readouterr().out)
@@ -520,6 +660,7 @@ def test_train_adverse_selection_overwrite_guard(tmp_path):
             AdverseSelectionTrainCLIConfig(
                 tape_root=str(tape_root),
                 decision_grid_path=str(tape_root / "decision_grid"),
+                split_source_dataset_root=str(tmp_path / "split_source"),
                 output_json=str(output_json),
                 model_npz=str(model_npz),
             )
@@ -707,6 +848,18 @@ def test_adverse_selection_schema_constant_is_direct_string():
     assert '"mmrt_adverse_selection_ridge" + "_" + "v" + "2"' not in source
 
 
+def test_adverse_training_source_guard_has_no_fractional_split_contract():
+    source = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "mmrt/cli/train_adverse_selection.py",
+            "mmrt/execution/adverse_selection_fit.py",
+        )
+    )
+    for forbidden in ("train_fraction", "--train-fraction", "_chronological_split"):
+        assert forbidden not in source
+
+
 def test_config_parses_windows_queue_mode_and_targets():
     cfg = AdverseSelectionTrainCLIConfig(
         tape_root="/tmp/tape",
@@ -724,8 +877,6 @@ def test_config_parses_windows_queue_mode_and_targets():
     assert cfg.label_engine == "scalar"
     assert cfg.profile_rows == 100
     assert cfg.target_names == ("bid_touch_filled", "ask_touch_filled")
-    with pytest.raises(ValueError):
-        AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", train_fraction=1.0)
     with pytest.raises(ValueError):
         AdverseSelectionTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/grid", l2_decrease_weight=1.1)
     with pytest.raises(ValueError):
@@ -768,7 +919,6 @@ def test_adverse_selection_modules_do_not_import_forbidden_layers():
         "gym",
         "gymnasium",
         "mmrt.rl",
-        "mmrt.storage",
         "mmrt.linear",
     ):
         assert forbidden not in cli_source

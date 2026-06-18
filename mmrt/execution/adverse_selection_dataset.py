@@ -13,6 +13,8 @@ import numpy as np
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
 
 ADVERSE_SELECTION_DATASET_SCHEMA = "mmrt_adverse_selection_dataset_grid_v1"
+ADVERSE_SPLIT_CONTRACT_SCHEMA = "mmrt_adverse_split_contract_v1"
+_SPLIT_ROLES = ("train", "val", "test")
 
 
 def _nonempty_str(value: str, name: str) -> str:
@@ -37,6 +39,92 @@ def _hash64(value: str, name: str) -> str:
     out = _nonempty_str(str(value), name)
     if len(out) != 64 or any(ch not in "0123456789abcdef" for ch in out):
         raise ValueError(f"{name} must be 64 lowercase hex characters")
+    return out
+
+
+def _json_safe(value: object, name: str) -> object:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError(f"{name} contains non-finite float")
+        return value
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError(f"{name} contains non-finite float")
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, f"{name}[]") for item in value]
+    if isinstance(value, Mapping):
+        out: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{name} contains non-string key")
+            out[key] = _json_safe(item, f"{name}.{key}")
+        return out
+    raise ValueError(f"{name} is not JSON-safe")
+
+
+def _split_contract(value: Mapping[str, object], name: str = "split_contract") -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    out = _json_safe(dict(value), name)
+    if not isinstance(out, dict):
+        raise ValueError(f"{name} must be a mapping")
+    required = (
+        "schema",
+        "version",
+        "split_source_dataset_root",
+        "split_source_dataset_id",
+        "split_source_manifest_hash",
+        "ranges",
+        "source_row_counts",
+        "adverse_row_counts",
+        "decision_grid_schema",
+        "decision_grid_hash",
+        "decision_grid_n_rows",
+        "decision_schedule",
+    )
+    missing = [key for key in required if key not in out]
+    if missing:
+        raise ValueError(f"{name} missing fields: {missing}")
+    if out["schema"] != ADVERSE_SPLIT_CONTRACT_SCHEMA:
+        raise ValueError("invalid split_contract schema")
+    if int(out["version"]) != 1:
+        raise ValueError("invalid split_contract version")
+    _nonempty_str(str(out["split_source_dataset_root"]), "split_source_dataset_root")
+    _nonempty_str(str(out["split_source_dataset_id"]), "split_source_dataset_id")
+    _hash64(str(out["split_source_manifest_hash"]), "split_source_manifest_hash")
+    _nonempty_str(str(out["decision_grid_schema"]), "decision_grid_schema")
+    _hash64(str(out["decision_grid_hash"]), "decision_grid_hash")
+    _positive_int(int(out["decision_grid_n_rows"]), "decision_grid_n_rows")
+    if not isinstance(out["decision_schedule"], Mapping):
+        raise ValueError("split_contract decision_schedule must be a mapping")
+    ranges = out["ranges"]
+    if not isinstance(ranges, Mapping):
+        raise ValueError("split_contract ranges must be a mapping")
+    source_counts = out["source_row_counts"]
+    adverse_counts = out["adverse_row_counts"]
+    if not isinstance(source_counts, Mapping) or not isinstance(adverse_counts, Mapping):
+        raise ValueError("split_contract row counts must be mappings")
+    for role in _SPLIT_ROLES:
+        entries = ranges.get(role)
+        if not isinstance(entries, list) or not entries:
+            raise ValueError(f"split_contract ranges must include {role}")
+        _nonnegative_int(int(source_counts.get(role, -1)), f"source_row_counts.{role}")
+        _nonnegative_int(int(adverse_counts.get(role, -1)), f"adverse_row_counts.{role}")
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, Mapping):
+                raise ValueError(f"split_contract ranges.{role}[{i}] must be a mapping")
+            start = _nonnegative_int(int(entry.get("start_local_ts_us", -1)), f"ranges.{role}[{i}].start_local_ts_us")
+            end = _nonnegative_int(int(entry.get("end_local_ts_us", -1)), f"ranges.{role}[{i}].end_local_ts_us")
+            if end <= start:
+                raise ValueError(f"ranges.{role}[{i}] end_local_ts_us must be greater than start_local_ts_us")
+            _positive_int(int(entry.get("row_count", 0)), f"ranges.{role}[{i}].row_count")
+    _nonnegative_int(int(adverse_counts.get("out_of_split", -1)), "adverse_row_counts.out_of_split")
     return out
 
 
@@ -66,6 +154,10 @@ class AdverseSelectionDatasetManifest:
     decision_grid_hash: str
     decision_grid_n_rows: int
     decision_schedule: Mapping[str, object]
+    split_source_dataset_root: str
+    split_source_dataset_id: str
+    split_source_manifest_hash: str
+    split_contract: Mapping[str, object]
     feature_names: tuple[str, ...]
     label_names: tuple[str, ...]
     num_rows: int
@@ -93,6 +185,25 @@ class AdverseSelectionDatasetManifest:
         if not isinstance(self.decision_schedule, Mapping):
             raise ValueError("decision_schedule must be a mapping")
         object.__setattr__(self, "decision_schedule", dict(self.decision_schedule))
+        split_contract = _split_contract(self.split_contract)
+        object.__setattr__(self, "split_source_dataset_root", _nonempty_str(self.split_source_dataset_root, "split_source_dataset_root"))
+        object.__setattr__(self, "split_source_dataset_id", _nonempty_str(self.split_source_dataset_id, "split_source_dataset_id"))
+        object.__setattr__(self, "split_source_manifest_hash", _hash64(self.split_source_manifest_hash, "split_source_manifest_hash"))
+        if split_contract["split_source_dataset_root"] != self.split_source_dataset_root:
+            raise ValueError("split_source_dataset_root must match split_contract")
+        if split_contract["split_source_dataset_id"] != self.split_source_dataset_id:
+            raise ValueError("split_source_dataset_id must match split_contract")
+        if split_contract["split_source_manifest_hash"] != self.split_source_manifest_hash:
+            raise ValueError("split_source_manifest_hash must match split_contract")
+        if split_contract["decision_grid_schema"] != self.decision_grid_schema:
+            raise ValueError("split_contract decision_grid_schema mismatch")
+        if split_contract["decision_grid_hash"] != self.decision_grid_hash:
+            raise ValueError("split_contract decision_grid_hash mismatch")
+        if int(split_contract["decision_grid_n_rows"]) != self.decision_grid_n_rows:
+            raise ValueError("split_contract decision_grid_n_rows mismatch")
+        if dict(split_contract["decision_schedule"]) != dict(self.decision_schedule):  # type: ignore[arg-type]
+            raise ValueError("split_contract decision_schedule mismatch")
+        object.__setattr__(self, "split_contract", split_contract)
         features = _name_tuple(self.feature_names, "feature_names")
         labels = _name_tuple(self.label_names, "label_names")
         object.__setattr__(self, "feature_names", features)
@@ -122,6 +233,10 @@ class AdverseSelectionDatasetManifest:
             "decision_grid_hash": self.decision_grid_hash,
             "decision_grid_n_rows": self.decision_grid_n_rows,
             "decision_schedule": dict(self.decision_schedule),
+            "split_source_dataset_root": self.split_source_dataset_root,
+            "split_source_dataset_id": self.split_source_dataset_id,
+            "split_source_manifest_hash": self.split_source_manifest_hash,
+            "split_contract": dict(self.split_contract),
             "feature_names": list(self.feature_names),
             "label_names": list(self.label_names),
             "num_rows": self.num_rows,
@@ -144,6 +259,10 @@ class AdverseSelectionDatasetManifest:
             decision_grid_hash=str(raw["decision_grid_hash"]),
             decision_grid_n_rows=int(raw["decision_grid_n_rows"]),
             decision_schedule=dict(raw["decision_schedule"]),  # type: ignore[arg-type]
+            split_source_dataset_root=str(raw["split_source_dataset_root"]),
+            split_source_dataset_id=str(raw["split_source_dataset_id"]),
+            split_source_manifest_hash=str(raw["split_source_manifest_hash"]),
+            split_contract=dict(raw["split_contract"]),  # type: ignore[arg-type]
             feature_names=tuple(raw["feature_names"]), label_names=tuple(raw["label_names"]), num_rows=int(raw["num_rows"]),
             num_features=int(raw["num_features"]), num_labels=int(raw["num_labels"]), config_json=str(raw.get("config_json", "{}")),
             index_schema=str(raw["index_schema"]), index_manifest_sha256=str(raw["index_manifest_sha256"]), index_root=str(raw["index_root"]),
@@ -316,6 +435,10 @@ class AdverseSelectionDatasetWriter:
                 decision_grid_hash=str(meta["decision_grid_hash"]),
                 decision_grid_n_rows=int(meta["decision_grid_n_rows"]),
                 decision_schedule=dict(meta["decision_schedule"]),  # type: ignore[arg-type]
+                split_source_dataset_root=str(meta["split_source_dataset_root"]),
+                split_source_dataset_id=str(meta["split_source_dataset_id"]),
+                split_source_manifest_hash=str(meta["split_source_manifest_hash"]),
+                split_contract=dict(meta["split_contract"]),  # type: ignore[arg-type]
                 feature_names=self.config.feature_names, label_names=self.config.label_names, num_rows=n, num_features=nf, num_labels=nl,
                 config_json=str(meta.get("config_json", "{}")), index_schema=str(meta["index_schema"]), index_manifest_sha256=str(meta["index_manifest_sha256"]), index_root=str(meta["index_root"]), created_at_utc=datetime.now(timezone.utc).isoformat(),
             )
@@ -350,6 +473,55 @@ def load_adverse_selection_dataset(root: str | Path, *, mmap_mode: str | None = 
     )
     _validate_arrays(manifest, arrays)
     return DiskBackedAdverseSelectionDataset(root=root, manifest=manifest, arrays=arrays)
+
+
+def write_adverse_selection_dataset_manifest(root: str | Path, manifest: AdverseSelectionDatasetManifest) -> None:
+    if not isinstance(manifest, AdverseSelectionDatasetManifest):
+        raise ValueError("manifest must be AdverseSelectionDatasetManifest")
+    root = Path(root)
+    target = root / "manifest.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = root / "manifest.json.tmp"
+    tmp.write_text(json.dumps(manifest.as_dict(), sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(target)
+
+
+def adverse_selection_dataset_manifest_with_split_contract(
+    manifest: AdverseSelectionDatasetManifest,
+    split_contract: Mapping[str, object],
+) -> AdverseSelectionDatasetManifest:
+    if not isinstance(manifest, AdverseSelectionDatasetManifest):
+        raise ValueError("manifest must be AdverseSelectionDatasetManifest")
+    contract = _split_contract(split_contract)
+    return AdverseSelectionDatasetManifest(
+        schema=manifest.schema,
+        exchange=manifest.exchange,
+        symbol=manifest.symbol,
+        tape_schema=manifest.tape_schema,
+        tape_num_events=manifest.tape_num_events,
+        tape_num_l2_batches=manifest.tape_num_l2_batches,
+        tape_num_trades=manifest.tape_num_trades,
+        tape_start_local_ts_us=manifest.tape_start_local_ts_us,
+        tape_end_local_ts_us=manifest.tape_end_local_ts_us,
+        decision_grid_schema=manifest.decision_grid_schema,
+        decision_grid_hash=manifest.decision_grid_hash,
+        decision_grid_n_rows=manifest.decision_grid_n_rows,
+        decision_schedule=manifest.decision_schedule,
+        split_source_dataset_root=str(contract["split_source_dataset_root"]),
+        split_source_dataset_id=str(contract["split_source_dataset_id"]),
+        split_source_manifest_hash=str(contract["split_source_manifest_hash"]),
+        split_contract=contract,
+        feature_names=manifest.feature_names,
+        label_names=manifest.label_names,
+        num_rows=manifest.num_rows,
+        num_features=manifest.num_features,
+        num_labels=manifest.num_labels,
+        config_json=manifest.config_json,
+        index_schema=manifest.index_schema,
+        index_manifest_sha256=manifest.index_manifest_sha256,
+        index_root=manifest.index_root,
+        created_at_utc=manifest.created_at_utc,
+    )
 
 
 def estimate_adverse_dataset_bytes(*, num_decisions_estimate: int, num_features: int, num_labels: int) -> dict[str, int]:

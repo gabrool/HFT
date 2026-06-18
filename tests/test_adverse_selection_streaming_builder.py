@@ -6,7 +6,7 @@ from mmrt.execution.adverse_selection import build_adverse_selection_dataset_to_
 import mmrt.execution.adverse_selection_feature_store as feature_store_mod
 from tests.adverse_helpers import build_tiny_adverse_selection_dataset
 from tests.test_adverse_selection import _tape, _l2, _trade, _base_config, AggressorSide
-from tests.grid_helpers import decision_grid_for_tape
+from tests.grid_helpers import adverse_split_contract_for_grid, decision_grid_for_tape
 
 
 def test_build_adverse_selection_dataset_to_disk_matches_in_memory_dataset(tmp_path):
@@ -14,7 +14,8 @@ def test_build_adverse_selection_dataset_to_disk_matches_in_memory_dataset(tmp_p
     cfg=_base_config()
     grid = decision_grid_for_tape(tape)
     mem=build_tiny_adverse_selection_dataset(tape, config=cfg, tmp_path=tmp_path, max_rows=grid.n_rows)
-    disk=build_adverse_selection_dataset_to_disk(tape, config=cfg, decision_grid=grid, output_root=tmp_path/"ds", chunk_rows=4096)
+    split_contract = adverse_split_contract_for_grid(grid, root=str(tmp_path / "split_source"))["split_contract"]
+    disk=build_adverse_selection_dataset_to_disk(tape, config=cfg, decision_grid=grid, split_contract=split_contract, output_root=tmp_path/"ds", chunk_rows=4096)
     np.testing.assert_array_equal(disk.arrays.decision_local_ts_us, mem.decision_local_ts_us)
     np.testing.assert_array_equal(disk.arrays.decision_event_index, mem.decision_event_index)
     np.testing.assert_array_equal(disk.arrays.decision_event_seq, mem.decision_event_seq)
