@@ -11,9 +11,9 @@ from tests.grid_helpers import adverse_split_contract_fields, grid_lineage_field
 def _dataset(tmp_path, rows=6, *, val_cost=None, test_cost=None):
     train_count = max(rows - 2, 1)
     ranges = {
-        "train": [{"segment_key": "seg_000", "start_row": 0, "end_row": train_count, "row_count": train_count, "start_local_ts_us": 1, "end_local_ts_us": 1 + train_count, "embargo_before_us": 0, "embargo_after_us": 0}],
-        "val": [{"segment_key": "seg_000", "start_row": train_count, "end_row": train_count + 1, "row_count": 1, "start_local_ts_us": 1 + train_count, "end_local_ts_us": 2 + train_count, "embargo_before_us": 0, "embargo_after_us": 0}],
-        "test": [{"segment_key": "seg_000", "start_row": train_count + 1, "end_row": train_count + 2, "row_count": 1, "start_local_ts_us": 2 + train_count, "end_local_ts_us": 3 + train_count, "embargo_before_us": 0, "embargo_after_us": 0}],
+        "train": [{"role": "train", "segment_key": "seg_000", "start_decision_row": 0, "end_decision_row": train_count, "row_count": train_count, "start_local_ts_us": 1, "end_local_ts_us": 1 + train_count, "embargo_before_us": 0, "embargo_after_us": 0}],
+        "val": [{"role": "val", "segment_key": "seg_000", "start_decision_row": train_count, "end_decision_row": train_count + 1, "row_count": 1, "start_local_ts_us": 1 + train_count, "end_local_ts_us": 2 + train_count, "embargo_before_us": 0, "embargo_after_us": 0}],
+        "test": [{"role": "test", "segment_key": "seg_000", "start_decision_row": train_count + 1, "end_decision_row": train_count + 2, "row_count": 1, "start_local_ts_us": 2 + train_count, "end_local_ts_us": 3 + train_count, "embargo_before_us": 0, "embargo_after_us": 0}],
     }
     split_fields = adverse_split_contract_fields(n_rows=rows, ranges=ranges)
     meta={"exchange":"ex","symbol":"SYM","tape_schema":"schema","tape_num_events":1,"tape_num_l2_batches":1,"tape_num_trades":0,"tape_start_local_ts_us":1,"tape_end_local_ts_us":2,**grid_lineage_fields(n_rows=rows),**split_fields,"config_json":"{}","index_schema":ADVERSE_SELECTION_INDEX_SCHEMA,"index_manifest_sha256":"0"*64,"index_root":"/tmp/index"}

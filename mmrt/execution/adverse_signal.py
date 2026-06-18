@@ -9,8 +9,8 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from mmrt.execution.adverse_selection import AdverseSelectionDataset, AdverseSelectionFeatureDataset
-from mmrt.execution.adverse_selection_dataset import ADVERSE_SPLIT_CONTRACT_SCHEMA
 from mmrt.execution.decision_grid import DecisionGrid, validate_decision_key_order
+from mmrt.execution.split_contract import EXECUTION_SPLIT_CONTRACT_SCHEMA, validate_split_contract_payload
 
 ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_grid_v1"
 ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_grid_v1"
@@ -52,19 +52,11 @@ def _nonempty_str(value: str, name: str) -> str:
 def _split_contract(value: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("split_contract must be a mapping")
-    out = dict(value)
-    if out.get("schema") != ADVERSE_SPLIT_CONTRACT_SCHEMA:
+    out = validate_split_contract_payload(value)
+    if out.get("schema") != EXECUTION_SPLIT_CONTRACT_SCHEMA:
         raise ValueError("split_contract schema mismatch")
-    for key in ("split_source_dataset_root", "split_source_dataset_id", "split_source_manifest_hash", "ranges", "source_row_counts", "adverse_row_counts"):
-        if key not in out:
-            raise ValueError(f"split_contract missing {key}")
-    _nonempty_str(str(out["split_source_dataset_root"]), "split_source_dataset_root")
-    _nonempty_str(str(out["split_source_dataset_id"]), "split_source_dataset_id")
-    _hash64(str(out["split_source_manifest_hash"]), "split_source_manifest_hash")
-    if not isinstance(out["ranges"], Mapping):
-        raise ValueError("split_contract ranges must be a mapping")
-    if not isinstance(out["source_row_counts"], Mapping) or not isinstance(out["adverse_row_counts"], Mapping):
-        raise ValueError("split_contract row counts must be mappings")
+    if "adverse_row_counts" not in out:
+        raise ValueError("split_contract missing adverse_row_counts")
     return out
 
 

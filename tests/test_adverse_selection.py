@@ -398,8 +398,8 @@ def test_run_adverse_selection_training_writes_summary_and_model(tmp_path):
     assert summary["dataset"]["adverse_test_rows"] > 0
     assert summary["split_source"]["dataset_root"] == str(split_source)
     assert summary["split_source"]["dataset_id"] == "split-source"
-    assert summary["split_source"]["split_contract_schema"] == "mmrt_adverse_split_contract_v1"
-    assert set(summary["split_source"]["ranges"]) == {"train", "val", "test"}
+    assert summary["split_source"]["split_contract_schema"] == "mmrt_execution_split_contract_v1"
+    assert set(summary["split_source"]["ranges_by_split"]) == {"train", "val", "test"}
     dataset_manifest = json.loads((Path(summary["dataset_root"]) / "manifest.json").read_text(encoding="utf-8"))
     assert dataset_manifest["split_source_dataset_root"] == str(split_source)
     assert dataset_manifest["split_source_dataset_id"] == "split-source"

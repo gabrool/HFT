@@ -384,6 +384,8 @@ def update_ppo(
         raise ValueError("rollout batch device must match policy device")
 
     batch_size = _validate_flat_batch(**flat)
+    if config.minibatch_size > batch_size:
+        raise ValueError("minibatch_size must be <= effective rollout batch size")
 
     loss_sum = 0.0
     policy_loss_sum = 0.0

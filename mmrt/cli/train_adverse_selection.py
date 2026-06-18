@@ -11,7 +11,6 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from mmrt.contracts import SplitRole
 from mmrt.execution.adverse_selection import (
     AdverseSelectionConfig,
     CounterfactualQuoteConfig,
@@ -32,13 +31,12 @@ from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_exec
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_MODEL_SCHEMA, AdverseSelectionModelArtifact, save_adverse_selection_model
 from mmrt.execution.adverse_selection_dataset import (
-    ADVERSE_SPLIT_CONTRACT_SCHEMA,
     adverse_selection_dataset_manifest_with_split_contract,
     estimate_adverse_dataset_bytes,
     write_adverse_selection_dataset_manifest,
 )
 from mmrt.execution.adverse_selection_fit import fit_adverse_baselines_streaming
-from mmrt.storage import manifest as storage_manifest
+from mmrt.execution.split_contract import load_execution_split_contract
 
 __all__ = [
     "AdverseSelectionTrainCLIConfig",
@@ -426,90 +424,6 @@ def _log_stage(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def _manifest_decision_grid_lineage(manifest: storage_manifest.StorageManifest) -> dict[str, object]:
-    notes = manifest.notes or {}
-    lineage = notes.get("decision_grid")
-    if not isinstance(lineage, Mapping):
-        raise ValueError("split source manifest notes must include decision_grid lineage")
-    required = ("decision_grid_schema", "decision_grid_hash", "decision_grid_n_rows", "decision_schedule")
-    missing = [key for key in required if key not in lineage]
-    if missing:
-        raise ValueError(f"split source manifest decision_grid lineage missing fields: {missing}")
-    schedule = dict(lineage["decision_schedule"])  # type: ignore[arg-type]
-    if schedule != manifest.decision_schedule:
-        raise ValueError("split source manifest decision_grid schedule must match manifest decision_schedule")
-    return {
-        "decision_grid_schema": _require_nonempty_str(str(lineage["decision_grid_schema"]), "decision_grid_schema"),
-        "decision_grid_hash": _require_nonempty_str(str(lineage["decision_grid_hash"]), "decision_grid_hash"),
-        "decision_grid_n_rows": _require_positive_int(int(lineage["decision_grid_n_rows"]), "decision_grid_n_rows"),
-        "decision_schedule": schedule,
-    }
-
-
-def _validate_split_source_lineage(manifest: storage_manifest.StorageManifest, decision_grid) -> dict[str, object]:
-    lineage = _manifest_decision_grid_lineage(manifest)
-    expected = {
-        "decision_grid_schema": decision_grid.metadata.schema,
-        "decision_grid_hash": decision_grid.decision_grid_hash,
-        "decision_grid_n_rows": decision_grid.n_rows,
-        "decision_schedule": decision_grid.decision_schedule,
-    }
-    for key, value in expected.items():
-        if lineage[key] != value:
-            raise ValueError(f"split source decision grid mismatch for {key}: expected={value!r} actual={lineage[key]!r}")
-    return lineage
-
-
-def _split_range_payload(split: storage_manifest.SplitMetadata) -> dict[str, object]:
-    return {
-        "segment_key": split.segment_key,
-        "start_row": int(split.start_row),
-        "end_row": int(split.end_row),
-        "row_count": int(split.end_row - split.start_row),
-        "start_local_ts_us": int(split.local_time_range.start_us),
-        "end_local_ts_us": int(split.local_time_range.end_us),
-        "embargo_before_us": int(split.embargo_before_us),
-        "embargo_after_us": int(split.embargo_after_us),
-    }
-
-
-def _split_contract_from_source_dataset(split_source_dataset_root: str, decision_grid) -> dict[str, object]:
-    root = Path(_require_nonempty_str(split_source_dataset_root, "split_source_dataset_root"))
-    manifest_path = root / storage_manifest.DEFAULT_MANIFEST_FILENAME
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"split source manifest not found: {manifest_path}")
-    manifest = storage_manifest.read_manifest_json(manifest_path)
-    manifest.validate_against_current_code()
-    lineage = _validate_split_source_lineage(manifest, decision_grid)
-    entries_by_role = {
-        role.value: tuple(split for split in manifest.splits if split.role == role)
-        for role in (SplitRole.TRAIN, SplitRole.VAL, SplitRole.TEST)
-    }
-    missing = [role for role, entries in entries_by_role.items() if not entries]
-    if missing:
-        raise ValueError(f"split source manifest must include train/val/test splits; missing={missing}")
-    ranges = {
-        role: [_split_range_payload(split) for split in entries]
-        for role, entries in entries_by_role.items()
-    }
-    source_row_counts = {
-        role: int(sum(split.end_row - split.start_row for split in entries))
-        for role, entries in entries_by_role.items()
-    }
-    return {
-        "schema": ADVERSE_SPLIT_CONTRACT_SCHEMA,
-        "version": 1,
-        "split_source_dataset_root": str(root),
-        "split_source_dataset_id": manifest.dataset_id,
-        "split_source_manifest_hash": manifest.content_hash(),
-        "ranges": ranges,
-        "source_row_counts": source_row_counts,
-        "adverse_dataset_rows_total": 0,
-        "adverse_row_counts": {"train": 0, "val": 0, "test": 0, "out_of_split": 0},
-        **lineage,
-    }
-
-
 def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> dict[str, object]:
     if not isinstance(config, AdverseSelectionTrainCLIConfig):
         raise ValueError("config must be AdverseSelectionTrainCLIConfig")
@@ -582,7 +496,11 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         return summary
     assert config.split_source_dataset_root is not None
     _log_stage("train_adverse_selection stage=split_source_load")
-    split_contract = _split_contract_from_source_dataset(config.split_source_dataset_root, decision_grid)
+    split_contract = {
+        **load_execution_split_contract(config.split_source_dataset_root, decision_grid).as_dict(),
+        "adverse_dataset_rows_total": 0,
+        "adverse_row_counts": {"train": 0, "val": 0, "test": 0, "out_of_split": 0},
+    }
     feature_count = len(adverse_selection_feature_names(adverse_config))
     label_count = len(adverse_selection_label_names(adverse_config))
     disk_estimate = estimate_adverse_dataset_bytes(num_decisions_estimate=decision_grid.n_rows, num_features=feature_count, num_labels=label_count)
@@ -702,8 +620,8 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
             "manifest_hash": split_contract_with_counts["split_source_manifest_hash"],
             "split_contract_schema": split_contract_with_counts["schema"],
             "split_contract_version": split_contract_with_counts["version"],
-            "ranges": split_contract_with_counts["ranges"],
-            "source_row_counts": split_contract_with_counts["source_row_counts"],
+            "ranges_by_split": split_contract_with_counts["ranges_by_split"],
+            "row_counts_by_split": split_contract_with_counts["row_counts_by_split"],
             "adverse_row_counts": split_contract_with_counts["adverse_row_counts"],
             "decision_grid_schema": split_contract_with_counts["decision_grid_schema"],
             "decision_grid_hash": split_contract_with_counts["decision_grid_hash"],

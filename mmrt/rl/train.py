@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import NamedTuple
+import time
+from typing import NamedTuple, Sequence
 
 import torch
 
 from mmrt.execution.env import ExecutionEnv
+from mmrt.execution.split_contract import DecisionSplitRange
+from mmrt.rl.device import resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer, ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig, PPOUpdateStats, update_ppo
-from mmrt.rl.rollout import RolloutBatch, RolloutCollector, RolloutConfig
+from mmrt.rl.rollout import TRAIN_WINDOW_SAMPLING_MODES, RolloutBatch, RolloutCollector, RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 
 
@@ -58,6 +61,15 @@ def _optional_nonnegative_int(value: int | None, name: str) -> int | None:
     return _require_nonnegative_int(value, name)
 
 
+def _coerce_train_window_sampling(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("train_window_sampling must be str")
+    normalized = value.strip()
+    if normalized not in TRAIN_WINDOW_SAMPLING_MODES:
+        raise ValueError(f"train_window_sampling must be one of {TRAIN_WINDOW_SAMPLING_MODES}")
+    return normalized
+
+
 def _require_finite_float(value: float, name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise TypeError(f"{name} must be a finite float")
@@ -82,9 +94,7 @@ def _require_nonnegative_float(value: float, name: str) -> float:
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
-    if device is None:
-        return torch.device("cpu")
-    return torch.device(device)
+    return resolve_torch_device(device)
 
 
 def _scalar_float(tensor: torch.Tensor) -> float:
@@ -101,8 +111,8 @@ class PPOTrainingConfig:
     adam_eps: float = 1e-5
     weight_decay: float = 0.0
 
-    start_event_index: int | None = None
     seed: int | None = None
+    train_window_sampling: str = "stratified_random"
 
     use_observation_normalizer: bool = True
 
@@ -136,13 +146,13 @@ class PPOTrainingConfig:
         )
         object.__setattr__(
             self,
-            "start_event_index",
-            _optional_nonnegative_int(self.start_event_index, "start_event_index"),
+            "seed",
+            _optional_nonnegative_int(self.seed, "seed"),
         )
         object.__setattr__(
             self,
-            "seed",
-            _optional_nonnegative_int(self.seed, "seed"),
+            "train_window_sampling",
+            _coerce_train_window_sampling(self.train_window_sampling),
         )
         object.__setattr__(
             self,
@@ -155,6 +165,9 @@ class PPOTrainingConfig:
             raise TypeError("rollout_config must be a RolloutConfig")
         if not isinstance(self.ppo_config, PPOConfig):
             raise TypeError("ppo_config must be a PPOConfig")
+        effective_batch_size = self.rollout_config.rollout_steps * self.rollout_config.num_envs
+        if self.ppo_config.minibatch_size > effective_batch_size:
+            raise ValueError("minibatch_size must be <= rollout_steps * num_envs")
         if not isinstance(
             self.observation_normalizer_config,
             ObservationNormalizerConfig,
@@ -178,8 +191,8 @@ def training_config_to_dict(config: PPOTrainingConfig) -> dict[str, object]:
         "learning_rate": float(config.learning_rate),
         "adam_eps": float(config.adam_eps),
         "weight_decay": float(config.weight_decay),
-        "start_event_index": config.start_event_index,
         "seed": config.seed,
+        "train_window_sampling": config.train_window_sampling,
         "use_observation_normalizer": bool(config.use_observation_normalizer),
         "network_config": {
             "hidden_sizes": list(network_config.hidden_sizes),
@@ -196,6 +209,8 @@ def training_config_to_dict(config: PPOTrainingConfig) -> dict[str, object]:
         },
         "rollout_config": {
             "rollout_steps": int(rollout_config.rollout_steps),
+            "num_envs": int(rollout_config.num_envs),
+            "effective_batch_size": int(rollout_config.rollout_steps * rollout_config.num_envs),
             "gamma": float(rollout_config.gamma),
             "gae_lambda": float(rollout_config.gae_lambda),
             "deterministic": bool(rollout_config.deterministic),
@@ -242,8 +257,17 @@ class PPOTrainingIterationStats(NamedTuple):
     rollout_done_count: int
     rollout_truncated_count: int
     rollout_episode_count: int
+    sampling_stats: dict[str, object]
 
     ppo: PPOUpdateStats
+    rollout_seconds: float
+    env_step_seconds: float
+    policy_forward_seconds: float
+    ppo_update_seconds: float
+    update_total_seconds: float
+    env_steps_per_sec: float
+    policy_forward_steps_per_sec: float
+    total_steps_per_sec: float
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -258,7 +282,18 @@ class PPOTrainingIterationStats(NamedTuple):
                 "truncated_count": int(self.rollout_truncated_count),
                 "episode_count": int(self.rollout_episode_count),
             },
+            "sampling": dict(self.sampling_stats),
             "ppo": self.ppo.as_dict(),
+            "timing": {
+                "rollout_seconds": float(self.rollout_seconds),
+                "env_step_seconds": float(self.env_step_seconds),
+                "policy_forward_seconds": float(self.policy_forward_seconds),
+                "ppo_update_seconds": float(self.ppo_update_seconds),
+                "update_total_seconds": float(self.update_total_seconds),
+                "env_steps_per_sec": float(self.env_steps_per_sec),
+                "policy_forward_steps_per_sec": float(self.policy_forward_steps_per_sec),
+                "total_steps_per_sec": float(self.total_steps_per_sec),
+            },
         }
 
 
@@ -269,12 +304,14 @@ class PPOTrainingResult(NamedTuple):
     history: tuple[PPOTrainingIterationStats, ...]
     updates_completed: int
     config: PPOTrainingConfig
+    sampling_stats: dict[str, object] | None = None
 
     def summary_dict(self) -> dict[str, object]:
         return {
             "status": "ok",
             "updates_completed": int(self.updates_completed),
             "config": training_config_to_dict(self.config),
+            "sampling": None if self.sampling_stats is None else dict(self.sampling_stats),
             "history": [item.as_dict() for item in self.history],
             "final": self.history[-1].as_dict() if self.history else None,
         }
@@ -284,6 +321,8 @@ def _rollout_stats(
     update_index: int,
     batch: RolloutBatch,
     ppo_stats: PPOUpdateStats,
+    *,
+    ppo_update_seconds: float,
 ) -> PPOTrainingIterationStats:
     if not isinstance(batch, RolloutBatch):
         raise TypeError("batch must be a RolloutBatch")
@@ -294,6 +333,11 @@ def _rollout_stats(
     rewards = batch.rewards.detach()
     returns = batch.returns.detach()
     advantages = batch.advantages.detach()
+    timing = batch.timing or {}
+    rollout_seconds = float(timing.get("rollout_seconds", 0.0))
+    ppo_update_seconds = float(ppo_update_seconds)
+    update_total_seconds = rollout_seconds + ppo_update_seconds
+    total_steps = float(batch.num_steps)
 
     return PPOTrainingIterationStats(
         update_index=update_index,
@@ -307,7 +351,16 @@ def _rollout_stats(
             batch.truncated.detach().to(torch.int64).sum().cpu().item()
         ),
         rollout_episode_count=int(batch.episode_count),
+        sampling_stats=dict(batch.sampling_stats or {}),
         ppo=ppo_stats,
+        rollout_seconds=rollout_seconds,
+        env_step_seconds=float(timing.get("env_step_seconds", 0.0)),
+        policy_forward_seconds=float(timing.get("policy_forward_seconds", 0.0)),
+        ppo_update_seconds=ppo_update_seconds,
+        update_total_seconds=update_total_seconds,
+        env_steps_per_sec=float(timing.get("env_steps_per_sec", 0.0)),
+        policy_forward_steps_per_sec=float(timing.get("policy_forward_steps_per_sec", 0.0)),
+        total_steps_per_sec=float(total_steps / update_total_seconds) if update_total_seconds > 0.0 else 0.0,
     )
 
 
@@ -343,24 +396,45 @@ def create_optimizer(
     )
 
 
-def _infer_obs_dim(env: ExecutionEnv) -> int:
-    if not isinstance(env, ExecutionEnv):
-        raise TypeError("env must be an ExecutionEnv")
-    return _require_positive_int(int(env.config.observation_schema.dim), "obs_dim")
+def _coerce_envs(env: ExecutionEnv | Sequence[ExecutionEnv]) -> tuple[ExecutionEnv, ...]:
+    if isinstance(env, ExecutionEnv):
+        return (env,)
+    if isinstance(env, (str, bytes)):
+        raise TypeError("env must be ExecutionEnv or a sequence of ExecutionEnv")
+    envs = tuple(env)
+    if not envs:
+        raise ValueError("envs must be non-empty")
+    for item in envs:
+        if not isinstance(item, ExecutionEnv):
+            raise TypeError("all envs must be ExecutionEnv")
+    return envs
+
+
+def _infer_obs_dim(envs: Sequence[ExecutionEnv]) -> int:
+    if not envs:
+        raise ValueError("envs must be non-empty")
+    obs_dim = _require_positive_int(int(envs[0].config.observation_schema.dim), "obs_dim")
+    for item in envs[1:]:
+        if int(item.config.observation_schema.dim) != obs_dim:
+            raise ValueError("all env observation dimensions must match")
+    return obs_dim
 
 
 def train_ppo_policy(
-    env: ExecutionEnv,
+    env: ExecutionEnv | Sequence[ExecutionEnv],
     *,
     config: PPOTrainingConfig = PPOTrainingConfig(),
     policy: ActorCriticNetwork | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     observation_normalizer: ObservationNormalizer | None = None,
+    decision_row_ranges: Sequence[DecisionSplitRange] | None = None,
+    start_decision_rows: Sequence[int] | None = None,
 ) -> PPOTrainingResult:
-    if not isinstance(env, ExecutionEnv):
-        raise TypeError("env must be an ExecutionEnv")
+    envs = _coerce_envs(env)
     if not isinstance(config, PPOTrainingConfig):
         raise TypeError("config must be a PPOTrainingConfig")
+    if len(envs) != config.rollout_config.num_envs:
+        raise ValueError("config.rollout_config.num_envs must match the number of envs")
     if policy is not None and not isinstance(policy, ActorCriticNetwork):
         raise TypeError("policy must be None or an ActorCriticNetwork")
     if optimizer is not None and not isinstance(optimizer, torch.optim.Optimizer):
@@ -374,7 +448,7 @@ def train_ppo_policy(
     if config.seed is not None:
         torch.manual_seed(config.seed)
 
-    obs_dim = _infer_obs_dim(env)
+    obs_dim = _infer_obs_dim(envs)
     device = _resolve_device(config.rollout_config.device)
 
     if policy is None:
@@ -398,26 +472,29 @@ def train_ppo_policy(
         observation_normalizer = None
 
     collector = RolloutCollector(
-        env,
+        envs,
         policy,
         config=config.rollout_config,
         observation_normalizer=observation_normalizer,
+        decision_row_ranges=decision_row_ranges,
+        train_window_sampling=config.train_window_sampling,
+        seed=config.seed,
     )
 
     policy.train()
     history: list[PPOTrainingIterationStats] = []
 
     for update_index in range(config.num_updates):
-        batch = collector.collect(
-            start_event_index=config.start_event_index if update_index == 0 else None
-        )
+        batch = collector.collect(start_decision_rows=start_decision_rows if update_index == 0 else None)
+        ppo_started = time.perf_counter()
         ppo_stats = update_ppo(
             policy,
             optimizer,
             batch,
             config=config.ppo_config,
         )
-        history.append(_rollout_stats(update_index, batch, ppo_stats))
+        ppo_update_seconds = time.perf_counter() - ppo_started
+        history.append(_rollout_stats(update_index, batch, ppo_stats, ppo_update_seconds=ppo_update_seconds))
 
     return PPOTrainingResult(
         policy=policy,
@@ -426,6 +503,7 @@ def train_ppo_policy(
         history=tuple(history),
         updates_completed=len(history),
         config=config,
+        sampling_stats=collector.sampling_stats(),
     )
 
 

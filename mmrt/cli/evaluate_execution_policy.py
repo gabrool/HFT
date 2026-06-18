@@ -1,4 +1,4 @@
-"""Evaluate a saved execution PPO policy checkpoint on an execution tape."""
+"""Evaluate an execution PPO checkpoint on an explicit val/test split."""
 
 from __future__ import annotations
 
@@ -21,12 +21,19 @@ from mmrt.execution.linear_signal import (
     load_linear_signal_artifact_npz,
     linear_signal_artifact_summary,
 )
+from mmrt.execution.split_contract import (
+    load_execution_split_contract,
+    ranges_for_split,
+    split_contracts_equal,
+    validate_split_contract_payload,
+)
 from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execution_tape
 from mmrt.cli.execution_env_config import (
     ExecutionEnvConfigBuildInput,
     build_execution_env_config_from_attrs,
     build_execution_env_config_from_input,
 )
+from mmrt.rl.device import cuda_memory_summary, resolve_torch_device, torch_device_summary
 from mmrt.rl.evaluate import PolicyEvaluationConfig, evaluate_policy
 from mmrt.rl.normalization import ObservationNormalizer, ObservationNormalizerConfig
 from mmrt.rl.train import PPO_CHECKPOINT_SCHEMA
@@ -60,24 +67,18 @@ def _require_positive_int(value: int, name: str) -> int:
     return value
 
 
-def _require_nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an int")
-    if value < 0:
-        raise ValueError(f"{name} must be >= 0")
-    return value
-
-
 def _optional_positive_int(value: int | None, name: str) -> int | None:
     if value is None:
         return None
     return _require_positive_int(value, name)
 
 
-def _optional_nonnegative_int(value: int | None, name: str) -> int | None:
-    if value is None:
-        return None
-    return _require_nonnegative_int(value, name)
+def _require_nonnegative_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an int")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return value
 
 
 def _require_finite_float(value: float, name: str) -> float:
@@ -163,6 +164,8 @@ class ExecutionPolicyEvaluationCLIConfig:
     tape_root: str
     decision_grid_path: str
     checkpoint_path: str
+    split_source_dataset_root: str
+    eval_split: str
     output_json: str | None = None
     linear_signals_npz: str | None = None
     adverse_signals_npz: str | None = None
@@ -183,7 +186,7 @@ class ExecutionPolicyEvaluationCLIConfig:
     unknown_level_queue_ahead_qty: float = 1_000_000_000.0
     dedupe_l2_decrease_with_trade_prints: bool = True
 
-    maker_fee_bps: float = -0.5
+    maker_fee_bps: float = 0.0
     edge_min_executable_edge_bps: float = 0.0
     edge_latency_buffer_bps: float = 0.0
     edge_inventory_skew_bps_per_unit: float = 0.0
@@ -200,18 +203,20 @@ class ExecutionPolicyEvaluationCLIConfig:
     reward_scale: float = 1.0
 
     max_steps: int | None = None
-    start_event_index: int | None = None
     deterministic: bool = True
-    device: str | None = "cpu"
+    device: str | None = "auto"
     dtype: torch.dtype | str = torch.float32
     include_diagnostics: bool = True
 
-    use_checkpoint_cli_env_config: bool = True
+    override_env_config: bool = False
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
         _require_nonempty_str(self.decision_grid_path, "decision_grid_path")
         _require_nonempty_str(self.checkpoint_path, "checkpoint_path")
+        _require_nonempty_str(self.split_source_dataset_root, "split_source_dataset_root")
+        if self.eval_split not in ("val", "test"):
+            raise ValueError('eval_split must be "val" or "test"')
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
         if self.linear_signals_npz is not None:
@@ -254,16 +259,12 @@ class ExecutionPolicyEvaluationCLIConfig:
         _require_positive_float(self.reward_scale, "reward_scale")
 
         _optional_positive_int(self.max_steps, "max_steps")
-        _optional_nonnegative_int(self.start_event_index, "start_event_index")
         _require_bool(self.deterministic, "deterministic")
         if self.device is not None:
             _require_nonempty_str(self.device, "device")
         object.__setattr__(self, "dtype", _coerce_dtype(self.dtype))
         _require_bool(self.include_diagnostics, "include_diagnostics")
-        _require_bool(
-            self.use_checkpoint_cli_env_config,
-            "use_checkpoint_cli_env_config",
-        )
+        _require_bool(self.override_env_config, "override_env_config")
 
 
 def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, object]:
@@ -271,6 +272,8 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "tape_root": config.tape_root,
         "decision_grid_path": config.decision_grid_path,
         "checkpoint_path": config.checkpoint_path,
+        "split_source_dataset_root": config.split_source_dataset_root,
+        "eval_split": config.eval_split,
         "output_json": config.output_json,
         "linear_signals_npz": config.linear_signals_npz,
         "adverse_signals_npz": config.adverse_signals_npz,
@@ -301,13 +304,60 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "terminal_inventory_penalty_bps": config.terminal_inventory_penalty_bps,
         "reward_scale": config.reward_scale,
         "max_steps": config.max_steps,
-        "start_event_index": config.start_event_index,
         "deterministic": config.deterministic,
         "device": config.device,
         "dtype": str(config.dtype),
         "include_diagnostics": config.include_diagnostics,
-        "use_checkpoint_cli_env_config": config.use_checkpoint_cli_env_config,
+        "override_env_config": config.override_env_config,
     }
+
+
+def _env_config_summary_from_raw(raw: Mapping[str, object]) -> dict[str, object]:
+    keys = (
+        "cancel_guard_ticks",
+        "max_episode_steps",
+        "max_distance_ticks",
+        "max_order_qty",
+        "post_only_gap_ticks",
+        "default_order_qty",
+        "queue_mode",
+        "l2_decrease_weight",
+        "trade_at_level_weight",
+        "unknown_level_queue_ahead_qty",
+        "dedupe_l2_decrease_with_trade_prints",
+        "maker_fee_bps",
+        "edge_min_executable_edge_bps",
+        "edge_latency_buffer_bps",
+        "edge_inventory_skew_bps_per_unit",
+        "decision_compute_latency_us",
+        "order_entry_latency_us",
+        "cancel_latency_us",
+        "inventory_penalty_bps",
+        "turnover_penalty_bps",
+        "cancel_penalty",
+        "drawdown_penalty_rate",
+        "terminal_inventory_penalty_bps",
+        "reward_scale",
+        "adverse_signals_npz",
+    )
+    return {key: raw.get(key) for key in keys}
+
+
+def _env_config_summary_from_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, object]:
+    raw = _summary_config(config)
+    raw["adverse_signals_npz"] = config.adverse_signals_npz
+    return _env_config_summary_from_raw(raw)
+
+
+def _env_config_diff(checkpoint_raw: Mapping[str, object], override: ExecutionPolicyEvaluationCLIConfig) -> dict[str, dict[str, object]]:
+    checkpoint_summary = _env_config_summary_from_raw(checkpoint_raw)
+    override_summary = _env_config_summary_from_config(override)
+    diff: dict[str, dict[str, object]] = {}
+    for key, override_value in override_summary.items():
+        checkpoint_value = checkpoint_summary.get(key)
+        if checkpoint_value != override_value:
+            diff[key] = {"checkpoint": checkpoint_value, "override": override_value}
+    return diff
 
 
 def _env_config_from_cli_config(
@@ -358,7 +408,7 @@ def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> Execution
         raw.get("dedupe_l2_decrease_with_trade_prints", True),
         "dedupe_l2_decrease_with_trade_prints",
     )
-    maker_fee_bps = _require_finite_float(raw.get("maker_fee_bps", -0.5), "maker_fee_bps")
+    maker_fee_bps = _require_finite_float(raw.get("maker_fee_bps", 0.0), "maker_fee_bps")
     inventory_penalty_bps = _require_nonnegative_float(
         raw.get("inventory_penalty_bps", 0.0),
         "inventory_penalty_bps",
@@ -428,6 +478,11 @@ def _load_checkpoint(path: str | Path, *, device: torch.device) -> Mapping[str, 
     _mapping_get_mapping(payload, "config")
     if "policy_state_dict" not in payload:
         raise ValueError("policy_state_dict is required")
+    if "split_contract" not in payload:
+        raise ValueError("checkpoint missing split_contract")
+    validate_split_contract_payload(_mapping_get_mapping(payload, "split_contract"))
+    if payload.get("train_split") != "train":
+        raise ValueError("checkpoint train_split must be train")
     return payload
 
 
@@ -435,15 +490,16 @@ def _actor_critic_config_from_checkpoint(
     training_config: Mapping[str, object],
 ) -> ActorCriticConfig:
     raw = _mapping_get_mapping(training_config, "network_config")
+    stale_keys = ("policy_log_std_init",)
+    present_stale_keys = [key for key in stale_keys if key in raw]
+    if present_stale_keys:
+        raise ValueError(f"unsupported stale network_config keys: {present_stale_keys}")
     hidden_sizes_value = raw.get("hidden_sizes", (128, 128))
     if not isinstance(hidden_sizes_value, Sequence) or isinstance(hidden_sizes_value, str):
         raise ValueError("hidden_sizes must be a sequence of positive ints")
     hidden_sizes = tuple(
         _require_positive_int(value, "hidden_sizes item") for value in hidden_sizes_value
     )
-    stale = {"policy" + "_log_std_init", "policy" + "_log_std_min", "policy" + "_log_std_max"} & set(raw.keys())
-    if stale:
-        raise ValueError(f"checkpoint contains unsupported stale network_config keys: {sorted(stale)}")
     required = (
         "enable_threshold",
         "enable_logit_bias_init",
@@ -539,27 +595,31 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
-
-def _resolve_evaluation_start_event_index(
-    *,
-    config_start_event_index: int | None,
-    checkpoint_cli_config: Mapping[str, object] | None,
-) -> int | None:
-    if config_start_event_index is not None:
-        return _require_nonnegative_int(config_start_event_index, "start_event_index")
-    if checkpoint_cli_config is None:
-        return None
-    return _optional_nonnegative_int(
-        checkpoint_cli_config.get("start_event_index"),
-        "checkpoint cli_config start_event_index",
-    )
-
-
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _split_summary(contract: Mapping[str, object], split: str) -> dict[str, object]:
+    ranges = [entry.as_dict() for entry in ranges_for_split(contract, split)]
+    return {
+        "schema": contract["schema"],
+        "version": contract["version"],
+        "split_source_dataset_root": contract["split_source_dataset_root"],
+        "split_source_dataset_id": contract["split_source_dataset_id"],
+        "split_source_manifest_hash": contract["split_source_manifest_hash"],
+        "decision_grid_schema": contract["decision_grid_schema"],
+        "decision_grid_hash": contract["decision_grid_hash"],
+        "decision_grid_n_rows": contract["decision_grid_n_rows"],
+        "decision_schedule": contract["decision_schedule"],
+        "ranges_by_split": contract["ranges_by_split"],
+        "row_counts_by_split": contract["row_counts_by_split"],
+        "eval_split": split,
+        "eval_ranges": ranges,
+        "eval_row_count": int(contract["row_counts_by_split"][split]),  # type: ignore[index]
+    }
 
 
 def run_execution_policy_evaluation(
@@ -572,9 +632,10 @@ def run_execution_policy_evaluation(
     if output_json.exists() and not config.overwrite:
         raise FileExistsError(str(output_json))
 
-    device = torch.device(config.device) if config.device is not None else torch.device("cpu")
+    device = resolve_torch_device(config.device)
     dtype = _coerce_dtype(config.dtype)
     checkpoint = _load_checkpoint(config.checkpoint_path, device=device)
+    checkpoint_split_contract = validate_split_contract_payload(_mapping_get_mapping(checkpoint, "split_contract"))
     tape = load_execution_tape(
         config.tape_root,
         mmap_mode=config.mmap_mode,
@@ -588,32 +649,29 @@ def run_execution_policy_evaluation(
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
     decision_grid = load_decision_grid(config.decision_grid_path)
     validate_decision_grid_for_execution_tape(decision_grid, tape)
+    split_contract = load_execution_split_contract(config.split_source_dataset_root, decision_grid).as_dict()
+    if not split_contracts_equal(checkpoint_split_contract, split_contract):
+        raise ValueError("checkpoint split_contract does not match evaluation split source")
+    eval_ranges = ranges_for_split(split_contract, config.eval_split)
     adverse_signals = load_adverse_selection_signals(config.adverse_signals_npz) if config.adverse_signals_npz is not None else None
 
-    checkpoint_cli_config: Mapping[str, object] | None = None
-
-    if config.use_checkpoint_cli_env_config:
-        checkpoint_cli_config = _mapping_get_mapping(checkpoint, "cli_config")
-        env_config = _env_config_from_training_cli_config(checkpoint_cli_config)
-        env_config_source = "checkpoint_cli_config"
-    else:
+    checkpoint_cli_config: Mapping[str, object] = _mapping_get_mapping(checkpoint, "cli_config")
+    if config.override_env_config:
         env_config = _env_config_from_cli_config(config)
         env_config_source = "evaluation_cli_config"
+        env_config_diff = _env_config_diff(checkpoint_cli_config, config)
+    else:
+        env_config = _env_config_from_training_cli_config(checkpoint_cli_config)
+        env_config_source = "checkpoint_cli_config"
+        env_config_diff = {}
 
-    effective_start_event_index = _resolve_evaluation_start_event_index(
-        config_start_event_index=config.start_event_index,
-        checkpoint_cli_config=checkpoint_cli_config,
-    )
-
-    eval_min_rows = (config.max_steps + 1) if config.max_steps is not None else None
-    env_min_rows = (env_config.max_episode_steps + 1) if env_config.max_episode_steps is not None else None
-    requested_min_rows = max((x for x in (eval_min_rows, env_min_rows) if x is not None), default=None)
+    requested_start_event_index = int(decision_grid.decision_event_index[eval_ranges[0].start_decision_row])
     decision_grid_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
         decision_grid=decision_grid,
-        requested_start_event_index=effective_start_event_index,
-        min_rows=requested_min_rows,
+        requested_start_event_index=requested_start_event_index,
+        min_rows=2,
     )
 
     env = ExecutionEnv(tape, config=env_config, decision_grid=decision_grid, linear_signals=linear_signals, adverse_signals=adverse_signals)
@@ -635,13 +693,11 @@ def run_execution_policy_evaluation(
         raise ValueError("checkpoint linear signal fields mismatch")
     if dict(checkpoint_linear_metadata) != linear_signals.metadata.as_dict():
         raise ValueError("checkpoint linear signal metadata mismatch with loaded artifact")
-    checkpoint_grid = checkpoint.get("decision_grid")
-    if checkpoint_grid is not None:
-        checkpoint_grid = _require_mapping(checkpoint_grid, "checkpoint decision_grid")
-        if checkpoint_grid.get("hash") != decision_grid.decision_grid_hash:
-            raise ValueError("checkpoint decision grid hash mismatch")
-        if checkpoint_grid.get("schema") != decision_grid.metadata.schema or int(checkpoint_grid.get("n_rows", -1)) != decision_grid.n_rows:
-            raise ValueError("checkpoint decision grid metadata mismatch")
+    checkpoint_grid = _mapping_get_mapping(checkpoint, "decision_grid")
+    if checkpoint_grid.get("hash") != decision_grid.decision_grid_hash:
+        raise ValueError("checkpoint decision grid hash mismatch")
+    if checkpoint_grid.get("schema") != decision_grid.metadata.schema or int(checkpoint_grid.get("n_rows", -1)) != decision_grid.n_rows:
+        raise ValueError("checkpoint decision grid metadata mismatch")
     obs_dim = int(env.config.observation_schema.dim)
     policy = _load_policy_from_checkpoint(
         checkpoint,
@@ -657,7 +713,7 @@ def run_execution_policy_evaluation(
     )
     eval_config = PolicyEvaluationConfig(
         max_steps=config.max_steps,
-        start_event_index=effective_start_event_index,
+        decision_row_ranges=eval_ranges,
         deterministic=config.deterministic,
         reset_env=True,
         device=device,
@@ -671,21 +727,30 @@ def run_execution_policy_evaluation(
         observation_normalizer=observation_normalizer,
     )
 
+    split_lineage = _split_summary(split_contract, config.eval_split)
+    evaluation_payload = result.as_dict()
+    evaluation_config = evaluation_payload["config"]  # type: ignore[index]
+    evaluated_ranges = evaluation_config["evaluated_decision_row_ranges"]  # type: ignore[index]
     summary = {
         "status": result.status,
         "run_type": "evaluate_execution_policy",
+        "eval_split": config.eval_split,
         "tape_root": str(Path(config.tape_root)),
         "decision_grid_path": str(Path(config.decision_grid_path)),
+        "split_source_dataset_root": str(Path(config.split_source_dataset_root)),
         "checkpoint_path": str(Path(config.checkpoint_path)),
         "output_json": str(output_json),
         "config": _summary_config(config),
+        "device": torch_device_summary(requested_device=config.device, resolved_device=device),
+        "cuda_memory": cuda_memory_summary(device),
         "env_config_source": env_config_source,
-        "effective_start_event_index": effective_start_event_index,
+        "env_config_diff": env_config_diff,
+        "checkpoint_split_source_matches_current": True,
         "checkpoint": {
             "schema": checkpoint.get("schema"),
             "updates_completed": checkpoint.get("updates_completed"),
-            "has_observation_normalizer": checkpoint.get("observation_normalizer_state_dict")
-            is not None,
+            "train_split": checkpoint.get("train_split"),
+            "has_observation_normalizer": checkpoint.get("observation_normalizer_state_dict") is not None,
         },
         "tape": {
             "schema": tape.manifest.schema,
@@ -703,9 +768,7 @@ def run_execution_policy_evaluation(
             ),
         },
         "observation_schema": env.config.observation_schema.as_dict(),
-        "linear_signals": linear_signal_artifact_summary(
-            linear_signals, path=str(linear_signals_path)
-        ),
+        "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
         "decision_grid_start": decision_grid_start.as_dict(),
         "decision_grid": {
             "schema": decision_grid.metadata.schema,
@@ -713,7 +776,18 @@ def run_execution_policy_evaluation(
             "n_rows": decision_grid.n_rows,
             "schedule": decision_grid.decision_schedule,
         },
-        "evaluation": result.as_dict(),
+        "split_contract": split_contract,
+        "checkpoint_split_contract": checkpoint_split_contract,
+        "split_lineage": split_lineage,
+        "eval_requested_row_count": evaluation_config["eval_requested_row_count"],  # type: ignore[index]
+        "eval_covered_row_count": evaluation_config["eval_covered_row_count"],  # type: ignore[index]
+        "eval_coverage_fraction": evaluation_config["eval_coverage_fraction"],  # type: ignore[index]
+        "evaluated_decision_row_ranges": evaluated_ranges,
+        "episode_count": evaluation_config["episode_count"],  # type: ignore[index]
+        "truncation_counts": evaluation_config["truncation_counts"],  # type: ignore[index]
+        "evaluated_start_decision_row": evaluation_config["evaluated_start_decision_row"],  # type: ignore[index]
+        "evaluated_end_decision_row": evaluation_config["evaluated_end_decision_row"],  # type: ignore[index]
+        "evaluation": evaluation_payload,
     }
     _write_json_atomic(output_json, summary)
     return summary
@@ -721,11 +795,13 @@ def run_execution_policy_evaluation(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate a saved execution PPO policy checkpoint on an execution tape."
+        description="Evaluate a saved execution PPO policy checkpoint on an explicit val/test split."
     )
     parser.add_argument("--tape-root", required=True)
     parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--checkpoint-path", required=True)
+    parser.add_argument("--split-source-dataset-root", required=True)
+    parser.add_argument("--eval-split", required=True, choices=("val", "test"))
 
     parser.add_argument("--output-json")
     parser.add_argument(
@@ -751,7 +827,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable de-duplication of L2 visible decreases already explained by same-level trade prints.",
     )
-    parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
+    parser.add_argument("--maker-fee-bps", type=float, default=0.0)
     parser.add_argument("--edge-min-executable-edge-bps", type=float, default=0.0)
     parser.add_argument("--edge-latency-buffer-bps", type=float, default=0.0)
     parser.add_argument("--edge-inventory-skew-bps-per-unit", type=float, default=0.0)
@@ -766,12 +842,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reward-scale", type=float, default=1.0)
 
     parser.add_argument("--max-steps", type=int)
-    parser.add_argument("--start-event-index", type=int)
     parser.add_argument("--stochastic", action="store_true")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64", "fp32", "fp64"), default="float32")
     parser.add_argument("--no-diagnostics", action="store_true")
-    parser.add_argument("--no-use-checkpoint-cli-env-config", action="store_true")
+    parser.add_argument("--override-env-config", action="store_true")
 
     return parser
 
@@ -781,6 +856,8 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         tape_root=args.tape_root,
         decision_grid_path=args.decision_grid_path,
         checkpoint_path=args.checkpoint_path,
+        split_source_dataset_root=args.split_source_dataset_root,
+        eval_split=args.eval_split,
         output_json=args.output_json,
         linear_signals_npz=args.linear_signals_npz,
         adverse_signals_npz=args.adverse_signals_npz,
@@ -811,12 +888,11 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         terminal_inventory_penalty_bps=args.terminal_inventory_penalty_bps,
         reward_scale=args.reward_scale,
         max_steps=args.max_steps,
-        start_event_index=args.start_event_index,
         deterministic=not args.stochastic,
         device=args.device,
         dtype=args.dtype,
         include_diagnostics=not args.no_diagnostics,
-        use_checkpoint_cli_env_config=not args.no_use_checkpoint_cli_env_config,
+        override_env_config=args.override_env_config,
     )
 
 

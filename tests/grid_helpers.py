@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 
+from mmrt.config import default_config
+from mmrt.contracts import SplitRole, TimeRangeUS
 from mmrt.execution.decision_grid import (
     DECISION_GRID_ARRAY_ORDER,
     DECISION_GRID_SCHEMA,
     DecisionGrid,
     decision_grid_metadata_from_tape,
 )
-from mmrt.execution.adverse_selection_dataset import ADVERSE_SPLIT_CONTRACT_SCHEMA
+from mmrt.execution.split_contract import EXECUTION_SPLIT_CONTRACT_SCHEMA
 from mmrt.execution.execution_tape import EVENT_TYPE_CODE_L2_BATCH, EVENT_TYPE_CODE_TRADE, ExecutionTape
 from mmrt.features.schedule import (
     DECISION_REASON_FIRST_VALID_BOOK,
@@ -18,6 +22,14 @@ from mmrt.features.schedule import (
     DECISION_REASON_FLAG_HEARTBEAT,
     DECISION_REASON_HEARTBEAT,
     DecisionScheduleConfig,
+    decision_schedule_config_from_dict,
+)
+from mmrt.storage.manifest import (
+    DEFAULT_MANIFEST_FILENAME,
+    SplitMetadata,
+    StorageSegment,
+    make_manifest,
+    write_manifest_json,
 )
 
 GRID_HASH = "1" * 64
@@ -57,6 +69,85 @@ def grid_lineage_notes(
     return {"decision_grid": grid_lineage_fields(n_rows=n_rows, schedule=schedule, grid_hash=grid_hash)}
 
 
+def write_split_source_manifest(
+    root: str | Path,
+    grid: DecisionGrid,
+    *,
+    dataset_id: str = "split-source",
+    split_spans: Mapping[str, tuple[int, int]] | None = None,
+) -> Path:
+    """Write a current storage manifest with train/val/test decision-row splits."""
+
+    target = Path(root)
+    n_rows = int(grid.n_rows)
+    if n_rows < 3:
+        raise ValueError("test split source requires at least three decision rows")
+    if split_spans is None:
+        if n_rows >= 6:
+            split_spans = {
+                "train": (0, n_rows - 4),
+                "val": (n_rows - 4, n_rows - 2),
+                "test": (n_rows - 2, n_rows),
+            }
+        else:
+            split_spans = {
+                "train": (0, n_rows - 2),
+                "val": (n_rows - 2, n_rows - 1),
+                "test": (n_rows - 1, n_rows),
+            }
+
+    first_ts = int(grid.decision_local_ts_us[0])
+    last_ts = int(grid.decision_local_ts_us[-1])
+    segment = StorageSegment(
+        segment_key="seg_000",
+        parquet_path="segments/seg_000.parquet",
+        row_count=n_rows,
+        label_count=n_rows,
+        time_range=TimeRangeUS(first_ts, last_ts + 1),
+        local_time_range=TimeRangeUS(first_ts, last_ts + 1),
+        first_row_idx=0,
+        last_row_idx=n_rows - 1,
+    )
+    splits = []
+    for role in ("train", "val", "test"):
+        start, end = split_spans[role]
+        splits.append(
+            SplitMetadata(
+                role=SplitRole(role),
+                segment_key="seg_000",
+                start_row=int(start),
+                end_row=int(end),
+                local_time_range=TimeRangeUS(
+                    int(grid.decision_local_ts_us[int(start)]),
+                    int(grid.decision_local_ts_us[int(end) - 1]) + 1,
+                ),
+            )
+        )
+
+    cfg = default_config()
+    cfg = replace(
+        cfg,
+        decision=replace(
+            cfg.decision,
+            schedule=decision_schedule_config_from_dict(grid.decision_schedule),
+        ),
+    )
+    manifest = make_manifest(
+        dataset_id=dataset_id,
+        created_at_utc="2026-01-01T00:00:00Z",
+        segments=(segment,),
+        config=cfg,
+        splits=tuple(splits),
+        notes=grid_lineage_notes(
+            n_rows=grid.n_rows,
+            schedule=grid.decision_schedule,
+            grid_hash=grid.decision_grid_hash,
+        ),
+    )
+    write_manifest_json(manifest, target / DEFAULT_MANIFEST_FILENAME)
+    return target
+
+
 def adverse_split_contract_fields(
     *,
     n_rows: int = 3,
@@ -67,27 +158,46 @@ def adverse_split_contract_fields(
     manifest_hash: str = MANIFEST_HASH,
     ranges: Mapping[str, list[Mapping[str, object]]] | None = None,
 ) -> dict[str, object]:
+    contract_n_rows = int(n_rows)
     if ranges is None:
+        def _ranges(role: str, preferred_start: int) -> list[dict[str, object]]:
+            if preferred_start >= contract_n_rows:
+                return []
+            start = preferred_start
+            end = start + 1
+            start_ts = start + 1
+            return [{
+                "role": role,
+                "segment_key": "seg_000",
+                "start_decision_row": start,
+                "end_decision_row": end,
+                "row_count": end - start,
+                "start_local_ts_us": start_ts,
+                "end_local_ts_us": start_ts + 1,
+                "embargo_before_us": 0,
+                "embargo_after_us": 0,
+            }]
+
         ranges = {
-            "train": [{"segment_key": "seg_000", "start_row": 0, "end_row": 1, "row_count": 1, "start_local_ts_us": 1, "end_local_ts_us": 2, "embargo_before_us": 0, "embargo_after_us": 0}],
-            "val": [{"segment_key": "seg_000", "start_row": 1, "end_row": 2, "row_count": 1, "start_local_ts_us": 2, "end_local_ts_us": 3, "embargo_before_us": 0, "embargo_after_us": 0}],
-            "test": [{"segment_key": "seg_000", "start_row": 2, "end_row": 3, "row_count": 1, "start_local_ts_us": 3, "end_local_ts_us": 4, "embargo_before_us": 0, "embargo_after_us": 0}],
+            "train": _ranges("train", 0),
+            "val": _ranges("val", 1),
+            "test": _ranges("test", 2),
         }
-    source_row_counts = {
+    row_counts_by_split = {
         role: int(sum(int(entry["row_count"]) for entry in entries))
         for role, entries in ranges.items()
     }
     contract = {
-        "schema": ADVERSE_SPLIT_CONTRACT_SCHEMA,
+        "schema": EXECUTION_SPLIT_CONTRACT_SCHEMA,
         "version": 1,
         "split_source_dataset_root": root,
         "split_source_dataset_id": dataset_id,
         "split_source_manifest_hash": manifest_hash,
-        "ranges": {role: [dict(entry) for entry in entries] for role, entries in ranges.items()},
-        "source_row_counts": source_row_counts,
+        "ranges_by_split": {role: [dict(entry) for entry in entries] for role, entries in ranges.items()},
+        "row_counts_by_split": row_counts_by_split,
         "adverse_dataset_rows_total": 0,
         "adverse_row_counts": {"train": 0, "val": 0, "test": 0, "out_of_split": 0},
-        **grid_lineage_fields(n_rows=n_rows, schedule=schedule, grid_hash=grid_hash),
+        **grid_lineage_fields(n_rows=contract_n_rows, schedule=schedule, grid_hash=grid_hash),
     }
     return {
         "split_source_dataset_root": root,
@@ -99,11 +209,30 @@ def adverse_split_contract_fields(
 
 def adverse_split_contract_for_grid(grid: DecisionGrid, *, root: str = "/tmp/split_source") -> dict[str, object]:
     ts = [int(x) for x in grid.decision_local_ts_us]
-    first = ts[0]
+    n_rows = int(grid.n_rows)
+
+    def _ranges(role: str, preferred_start: int) -> list[dict[str, object]]:
+        if preferred_start >= n_rows:
+            return []
+        start = preferred_start
+        end = start + 1
+        start_ts = ts[start]
+        return [{
+            "role": role,
+            "segment_key": "seg_000",
+            "start_decision_row": start,
+            "end_decision_row": end,
+            "row_count": end - start,
+            "start_local_ts_us": start_ts,
+            "end_local_ts_us": start_ts + 1,
+            "embargo_before_us": 0,
+            "embargo_after_us": 0,
+        }]
+
     ranges = {
-        "train": [{"segment_key": "seg_000", "start_row": 0, "end_row": 1, "row_count": 1, "start_local_ts_us": first, "end_local_ts_us": first + 1, "embargo_before_us": 0, "embargo_after_us": 0}],
-        "val": [{"segment_key": "seg_000", "start_row": 1, "end_row": 2, "row_count": 1, "start_local_ts_us": first + 1, "end_local_ts_us": first + 2, "embargo_before_us": 0, "embargo_after_us": 0}],
-        "test": [{"segment_key": "seg_000", "start_row": 2, "end_row": 3, "row_count": 1, "start_local_ts_us": first + 2, "end_local_ts_us": first + 3, "embargo_before_us": 0, "embargo_after_us": 0}],
+        "train": _ranges("train", 0),
+        "val": _ranges("val", 1),
+        "test": _ranges("test", 2),
     }
     return adverse_split_contract_fields(
         n_rows=grid.n_rows,

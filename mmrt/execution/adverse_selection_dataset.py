@@ -10,10 +10,11 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from mmrt.execution.split_contract import EXECUTION_SPLIT_CONTRACT_SCHEMA, validate_split_contract_payload
 from mmrt.execution.execution_tape_writer import NpyChunkWriter
 
 ADVERSE_SELECTION_DATASET_SCHEMA = "mmrt_adverse_selection_dataset_grid_v1"
-ADVERSE_SPLIT_CONTRACT_SCHEMA = "mmrt_adverse_split_contract_v1"
+ADVERSE_SPLIT_CONTRACT_SCHEMA = EXECUTION_SPLIT_CONTRACT_SCHEMA
 _SPLIT_ROLES = ("train", "val", "test")
 
 
@@ -71,60 +72,21 @@ def _json_safe(value: object, name: str) -> object:
 def _split_contract(value: Mapping[str, object], name: str = "split_contract") -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be a mapping")
-    out = _json_safe(dict(value), name)
-    if not isinstance(out, dict):
+    safe = _json_safe(dict(value), name)
+    if not isinstance(safe, dict):
         raise ValueError(f"{name} must be a mapping")
-    required = (
-        "schema",
-        "version",
-        "split_source_dataset_root",
-        "split_source_dataset_id",
-        "split_source_manifest_hash",
-        "ranges",
-        "source_row_counts",
-        "adverse_row_counts",
-        "decision_grid_schema",
-        "decision_grid_hash",
-        "decision_grid_n_rows",
-        "decision_schedule",
-    )
+    out = validate_split_contract_payload(safe)
+    required = ("adverse_row_counts", "adverse_dataset_rows_total")
     missing = [key for key in required if key not in out]
     if missing:
         raise ValueError(f"{name} missing fields: {missing}")
-    if out["schema"] != ADVERSE_SPLIT_CONTRACT_SCHEMA:
-        raise ValueError("invalid split_contract schema")
-    if int(out["version"]) != 1:
-        raise ValueError("invalid split_contract version")
-    _nonempty_str(str(out["split_source_dataset_root"]), "split_source_dataset_root")
-    _nonempty_str(str(out["split_source_dataset_id"]), "split_source_dataset_id")
-    _hash64(str(out["split_source_manifest_hash"]), "split_source_manifest_hash")
-    _nonempty_str(str(out["decision_grid_schema"]), "decision_grid_schema")
-    _hash64(str(out["decision_grid_hash"]), "decision_grid_hash")
-    _positive_int(int(out["decision_grid_n_rows"]), "decision_grid_n_rows")
-    if not isinstance(out["decision_schedule"], Mapping):
-        raise ValueError("split_contract decision_schedule must be a mapping")
-    ranges = out["ranges"]
-    if not isinstance(ranges, Mapping):
-        raise ValueError("split_contract ranges must be a mapping")
-    source_counts = out["source_row_counts"]
     adverse_counts = out["adverse_row_counts"]
-    if not isinstance(source_counts, Mapping) or not isinstance(adverse_counts, Mapping):
-        raise ValueError("split_contract row counts must be mappings")
+    if not isinstance(adverse_counts, Mapping):
+        raise ValueError("split_contract adverse_row_counts must be a mapping")
     for role in _SPLIT_ROLES:
-        entries = ranges.get(role)
-        if not isinstance(entries, list) or not entries:
-            raise ValueError(f"split_contract ranges must include {role}")
-        _nonnegative_int(int(source_counts.get(role, -1)), f"source_row_counts.{role}")
         _nonnegative_int(int(adverse_counts.get(role, -1)), f"adverse_row_counts.{role}")
-        for i, entry in enumerate(entries):
-            if not isinstance(entry, Mapping):
-                raise ValueError(f"split_contract ranges.{role}[{i}] must be a mapping")
-            start = _nonnegative_int(int(entry.get("start_local_ts_us", -1)), f"ranges.{role}[{i}].start_local_ts_us")
-            end = _nonnegative_int(int(entry.get("end_local_ts_us", -1)), f"ranges.{role}[{i}].end_local_ts_us")
-            if end <= start:
-                raise ValueError(f"ranges.{role}[{i}] end_local_ts_us must be greater than start_local_ts_us")
-            _positive_int(int(entry.get("row_count", 0)), f"ranges.{role}[{i}].row_count")
     _nonnegative_int(int(adverse_counts.get("out_of_split", -1)), "adverse_row_counts.out_of_split")
+    _nonnegative_int(int(out["adverse_dataset_rows_total"]), "adverse_dataset_rows_total")
     return out
 
 

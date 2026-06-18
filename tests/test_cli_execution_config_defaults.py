@@ -14,12 +14,12 @@ from mmrt.execution.contracts import LatencyConfig, QueueModelMode
 from mmrt.execution.queue_model import QueueModelConfig
 
 
-def assert_execution_defaults(config):
+def assert_execution_defaults(config, *, maker_fee_bps: float):
     assert config.queue_mode.value == "conservative"
     assert config.l2_decrease_weight == 0.25
     assert config.trade_at_level_weight == 0.5
     assert config.unknown_level_queue_ahead_qty == 1_000_000_000.0
-    assert config.maker_fee_bps == -0.5
+    assert config.maker_fee_bps == maker_fee_bps
     assert config.decision_compute_latency_us == 50
     assert config.order_entry_latency_us == 500
     assert config.cancel_latency_us == 500
@@ -27,44 +27,54 @@ def assert_execution_defaults(config):
     assert config.post_only_gap_ticks == 1
 
 
-def _assert_default_env(env_config):
+def _assert_default_env(env_config, *, maker_fee_bps: float):
     assert env_config.latency_config == LatencyConfig()
     assert env_config.fill_simulator_config.queue_model == QueueModelConfig()
     assert env_config.quote_geometry_config.post_only_gap_ticks == 1
     assert env_config.reward_config.reward_scale == 1.0
-    assert env_config.fill_simulator_config.maker_fee_bps == -0.5
+    assert env_config.fill_simulator_config.maker_fee_bps == maker_fee_bps
 
 
 def test_execution_cli_defaults_match_core_conservative_latency_reward():
     audit = ExecutionSimAuditConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid")
-    train = ExecutionPPOTrainCLIConfig(tape_root="/tmp/tape", decision_grid_path="/tmp/tape/decision_grid")
+    train = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
+    )
     evaluate = ExecutionPolicyEvaluationCLIConfig(
         tape_root="/tmp/tape",
         decision_grid_path="/tmp/tape/decision_grid",
         checkpoint_path="/tmp/ckpt.pt",
+        split_source_dataset_root="/tmp/split-source",
+        eval_split="val",
     )
 
     assert audit.queue_mode == QueueModelMode.CONSERVATIVE
     assert train.queue_mode == QueueModelMode.CONSERVATIVE
     assert evaluate.queue_mode == QueueModelMode.CONSERVATIVE
-    assert_execution_defaults(audit)
-    assert_execution_defaults(train)
-    assert_execution_defaults(evaluate)
+    assert_execution_defaults(audit, maker_fee_bps=-0.5)
+    assert_execution_defaults(train, maker_fee_bps=0.0)
+    assert_execution_defaults(evaluate, maker_fee_bps=0.0)
     train_env = train_env_config(train)
     eval_env = _env_config_from_cli_config(evaluate)
-    _assert_default_env(train_env)
-    _assert_default_env(eval_env)
+    _assert_default_env(train_env, maker_fee_bps=0.0)
+    _assert_default_env(eval_env, maker_fee_bps=0.0)
     assert train_env.latency_config.order_entry_latency_us == 500
     assert train_env.fill_simulator_config.queue_model.mode.value == "conservative"
     assert train_env.reward_config.reward_scale == 1.0
 
-    for summary in (audit_summary(audit), train_summary(train), eval_summary(evaluate)):
+    for summary, expected_maker_fee in (
+        (audit_summary(audit), -0.5),
+        (train_summary(train), 0.0),
+        (eval_summary(evaluate), 0.0),
+    ):
         assert summary["post_only_gap_ticks"] == 1
         assert summary["decision_compute_latency_us"] == 50
         assert summary["order_entry_latency_us"] == 500
         assert summary["cancel_latency_us"] == 500
         assert summary["reward_scale"] == 1.0
-        assert summary["maker_fee_bps"] == -0.5
+        assert summary["maker_fee_bps"] == expected_maker_fee
         assert "min" + "_distance_ticks" not in summary
 
 
@@ -114,10 +124,22 @@ def test_checkpoint_network_config_rejects_stale_keys_and_accepts_fresh_schema()
 
 
 def test_removed_min_distance_ticks_flag_is_rejected_by_execution_parsers():
+    train_required = [
+        "--decision-grid", "/tmp/tape/decision_grid",
+        "--split-source-dataset-root", "/tmp/split-source",
+        "--train-split", "train",
+        "--maker-fee-bps", "0.0",
+    ]
+    eval_required = [
+        "--decision-grid", "/tmp/tape/decision_grid",
+        "--checkpoint-path", "/tmp/c.pt",
+        "--split-source-dataset-root", "/tmp/split-source",
+        "--eval-split", "val",
+    ]
     parser_args = (
         (audit_arg_parser(), ["--tape-root", "/tmp/tape", "--min-distance-ticks", "1"]),
-        (train_arg_parser(), ["--tape-root", "/tmp/tape", "--min-distance-ticks", "1"]),
-        (eval_arg_parser(), ["--tape-root", "/tmp/tape", "--checkpoint-path", "/tmp/c.pt", "--min-distance-ticks", "1"]),
+        (train_arg_parser(), ["--tape-root", "/tmp/tape", *train_required, "--min-distance-ticks", "1"]),
+        (eval_arg_parser(), ["--tape-root", "/tmp/tape", *eval_required, "--min-distance-ticks", "1"]),
     )
     for parser, args in parser_args:
         with pytest.raises(SystemExit):
@@ -127,5 +149,19 @@ def test_removed_min_distance_ticks_flag_is_rejected_by_execution_parsers():
 def test_post_only_gap_ticks_flag_is_accepted_by_execution_parsers():
     grid_arg = ["--decision-grid", "/tmp/tape/decision_grid"]
     assert audit_arg_parser().parse_args(["--tape-root", "/tmp/tape", *grid_arg, "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
-    assert train_arg_parser().parse_args(["--tape-root", "/tmp/tape", *grid_arg, "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
-    assert eval_arg_parser().parse_args(["--tape-root", "/tmp/tape", *grid_arg, "--checkpoint-path", "/tmp/c.pt", "--post-only-gap-ticks", "2"]).post_only_gap_ticks == 2
+    assert train_arg_parser().parse_args([
+        "--tape-root", "/tmp/tape",
+        *grid_arg,
+        "--split-source-dataset-root", "/tmp/split-source",
+        "--train-split", "train",
+        "--maker-fee-bps", "0.0",
+        "--post-only-gap-ticks", "2",
+    ]).post_only_gap_ticks == 2
+    assert eval_arg_parser().parse_args([
+        "--tape-root", "/tmp/tape",
+        *grid_arg,
+        "--checkpoint-path", "/tmp/c.pt",
+        "--split-source-dataset-root", "/tmp/split-source",
+        "--eval-split", "val",
+        "--post-only-gap-ticks", "2",
+    ]).post_only_gap_ticks == 2

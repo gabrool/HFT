@@ -1,9 +1,9 @@
-"""Train an execution PPO policy from an existing execution tape."""
+"""Train an execution PPO policy from train split decision-row windows."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -12,7 +12,7 @@ import torch
 
 from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
-from mmrt.execution.adverse_signal import load_adverse_selection_signals
+from mmrt.execution.adverse_signal import AdverseSelectionSignalArtifact, load_adverse_selection_signals
 from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
@@ -20,11 +20,17 @@ from mmrt.execution.linear_signal import (
     load_linear_signal_artifact_npz,
     linear_signal_artifact_summary,
 )
+from mmrt.execution.split_contract import (
+    DecisionSplitRange,
+    load_execution_split_contract,
+    ranges_for_split,
+)
 from mmrt.cli.execution_env_config import build_execution_env_config_from_attrs
 from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execution_tape
+from mmrt.rl.device import cuda_memory_summary, resolve_torch_device, torch_device_summary
 from mmrt.rl.normalization import ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig
-from mmrt.rl.rollout import RolloutConfig
+from mmrt.rl.rollout import TRAIN_WINDOW_SAMPLING_MODES, RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig
 from mmrt.rl.train import (
     PPOTrainingConfig,
@@ -136,6 +142,15 @@ def _coerce_dtype(value: torch.dtype | str) -> torch.dtype:
     raise ValueError("dtype must be torch.dtype or str")
 
 
+def _coerce_train_window_sampling(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("train_window_sampling must be str")
+    normalized = value.strip()
+    if normalized not in TRAIN_WINDOW_SAMPLING_MODES:
+        raise ValueError(f"train_window_sampling must be one of {TRAIN_WINDOW_SAMPLING_MODES}")
+    return normalized
+
+
 def _parse_hidden_sizes(value: str | Sequence[int] | tuple[int, ...]) -> tuple[int, ...]:
     if isinstance(value, str):
         raw = value.strip()
@@ -160,6 +175,8 @@ def _parse_hidden_sizes(value: str | Sequence[int] | tuple[int, ...]) -> tuple[i
 class ExecutionPPOTrainCLIConfig:
     tape_root: str
     decision_grid_path: str
+    split_source_dataset_root: str
+    train_split: str = "train"
     output_json: str | None = None
     checkpoint_path: str | None = None
     linear_signals_npz: str | None = None
@@ -182,7 +199,7 @@ class ExecutionPPOTrainCLIConfig:
     unknown_level_queue_ahead_qty: float = 1_000_000_000.0
     dedupe_l2_decrease_with_trade_prints: bool = True
 
-    maker_fee_bps: float = -0.5
+    maker_fee_bps: float = 0.0
     edge_min_executable_edge_bps: float = 0.0
     edge_latency_buffer_bps: float = 0.0
     edge_inventory_skew_bps_per_unit: float = 0.0
@@ -198,19 +215,21 @@ class ExecutionPPOTrainCLIConfig:
     terminal_inventory_penalty_bps: float = 0.0
     reward_scale: float = 1.0
 
-    num_updates: int = 10
+    num_updates: int = 100
     learning_rate: float = 3e-4
     adam_eps: float = 1e-5
     weight_decay: float = 0.0
-    start_event_index: int | None = None
+    debug_start_decision_row: int | None = None
     seed: int | None = None
+    train_window_sampling: str = "stratified_random"
 
-    rollout_steps: int = 1024
+    num_envs: int = 4
+    rollout_steps: int = 2048
     gamma: float = 0.99
     gae_lambda: float = 0.95
     deterministic: bool = False
     reset_on_terminal: bool = True
-    device: str | None = "cpu"
+    device: str | None = "auto"
     dtype: torch.dtype | str = torch.float32
 
     hidden_sizes: tuple[int, ...] | str = (128, 128)
@@ -226,7 +245,7 @@ class ExecutionPPOTrainCLIConfig:
     value_head_gain: float = 1.0
 
     update_epochs: int = 4
-    minibatch_size: int = 256
+    minibatch_size: int = 1024
     clip_range: float = 0.2
     value_clip_range: float = 0.2
     clip_value_loss: bool = True
@@ -243,9 +262,15 @@ class ExecutionPPOTrainCLIConfig:
     observation_normalizer_clip: float | None = 10.0
     observation_normalizer_rms_epsilon: float = 1e-4
 
+    profile_rollout_steps: int | None = None
+    profile_output_json: str | None = None
+
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
         _require_nonempty_str(self.decision_grid_path, "decision_grid_path")
+        _require_nonempty_str(self.split_source_dataset_root, "split_source_dataset_root")
+        if self.train_split != "train":
+            raise ValueError('train_split must be "train"')
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
         if self.checkpoint_path is not None:
@@ -254,6 +279,8 @@ class ExecutionPPOTrainCLIConfig:
             _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
         if self.adverse_signals_npz is not None:
             _require_nonempty_str(self.adverse_signals_npz, "adverse_signals_npz")
+        if self.profile_output_json is not None:
+            _require_nonempty_str(self.profile_output_json, "profile_output_json")
         _require_bool(self.overwrite, "overwrite")
         _require_bool(self.save_checkpoint, "save_checkpoint")
         if self.mmap_mode not in (None, "r"):
@@ -288,9 +315,15 @@ class ExecutionPPOTrainCLIConfig:
         _require_positive_float(self.learning_rate, "learning_rate")
         _require_positive_float(self.adam_eps, "adam_eps")
         _require_nonnegative_float(self.weight_decay, "weight_decay")
-        _optional_nonnegative_int(self.start_event_index, "start_event_index")
+        _optional_nonnegative_int(self.debug_start_decision_row, "debug_start_decision_row")
         _optional_nonnegative_int(self.seed, "seed")
+        object.__setattr__(
+            self,
+            "train_window_sampling",
+            _coerce_train_window_sampling(self.train_window_sampling),
+        )
 
+        _require_positive_int(self.num_envs, "num_envs")
         _require_positive_int(self.rollout_steps, "rollout_steps")
         _require_positive_float(self.gamma, "gamma")
         _require_positive_float(self.gae_lambda, "gae_lambda")
@@ -335,12 +368,15 @@ class ExecutionPPOTrainCLIConfig:
         if self.observation_normalizer_clip is not None:
             _require_positive_float(self.observation_normalizer_clip, "observation_normalizer_clip")
         _require_positive_float(self.observation_normalizer_rms_epsilon, "observation_normalizer_rms_epsilon")
+        _optional_positive_int(self.profile_rollout_steps, "profile_rollout_steps")
 
 
 def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
     return {
         "tape_root": config.tape_root,
         "decision_grid_path": config.decision_grid_path,
+        "split_source_dataset_root": config.split_source_dataset_root,
+        "train_split": config.train_split,
         "output_json": config.output_json,
         "checkpoint_path": config.checkpoint_path,
         "linear_signals_npz": config.linear_signals_npz,
@@ -376,9 +412,12 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "learning_rate": config.learning_rate,
         "adam_eps": config.adam_eps,
         "weight_decay": config.weight_decay,
-        "start_event_index": config.start_event_index,
+        "debug_start_decision_row": config.debug_start_decision_row,
         "seed": config.seed,
+        "train_window_sampling": config.train_window_sampling,
+        "num_envs": config.num_envs,
         "rollout_steps": config.rollout_steps,
+        "effective_batch_size": config.num_envs * config.rollout_steps,
         "gamma": config.gamma,
         "gae_lambda": config.gae_lambda,
         "deterministic": config.deterministic,
@@ -412,6 +451,8 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "observation_normalizer_epsilon": config.observation_normalizer_epsilon,
         "observation_normalizer_clip": config.observation_normalizer_clip,
         "observation_normalizer_rms_epsilon": config.observation_normalizer_rms_epsilon,
+        "profile_rollout_steps": config.profile_rollout_steps,
+        "profile_output_json": config.profile_output_json,
     }
 
 
@@ -433,6 +474,10 @@ def _default_output_json(tape_root: str) -> Path:
     return Path(tape_root) / "train_execution_ppo_summary.json"
 
 
+def _default_profile_json(tape_root: str) -> Path:
+    return Path(tape_root) / "execution_ppo_profile.json"
+
+
 def _default_checkpoint_path(tape_root: str) -> Path:
     return Path(tape_root) / "execution_ppo_checkpoint.pt"
 
@@ -441,8 +486,12 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
-
-def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingConfig:
+def _build_training_config(
+    config: ExecutionPPOTrainCLIConfig,
+    *,
+    rollout_steps: int | None = None,
+    num_updates: int | None = None,
+) -> PPOTrainingConfig:
     network_config = ActorCriticConfig(
         hidden_sizes=config.hidden_sizes,
         activation=config.activation,
@@ -457,7 +506,8 @@ def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingCon
         value_head_gain=config.value_head_gain,
     )
     rollout_config = RolloutConfig(
-        rollout_steps=config.rollout_steps,
+        rollout_steps=config.rollout_steps if rollout_steps is None else rollout_steps,
+        num_envs=config.num_envs,
         gamma=config.gamma,
         gae_lambda=config.gae_lambda,
         deterministic=config.deterministic,
@@ -485,18 +535,19 @@ def _build_training_config(config: ExecutionPPOTrainCLIConfig) -> PPOTrainingCon
         rms_epsilon=config.observation_normalizer_rms_epsilon,
     )
     return PPOTrainingConfig(
-        num_updates=config.num_updates,
+        num_updates=config.num_updates if num_updates is None else num_updates,
         learning_rate=config.learning_rate,
         adam_eps=config.adam_eps,
         weight_decay=config.weight_decay,
-        start_event_index=config.start_event_index,
         seed=config.seed,
+        train_window_sampling=config.train_window_sampling,
         use_observation_normalizer=config.use_observation_normalizer,
         network_config=network_config,
         rollout_config=rollout_config,
         ppo_config=ppo_config,
         observation_normalizer_config=normalizer_config,
     )
+
 
 def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
     return build_execution_env_config_from_attrs(
@@ -505,11 +556,129 @@ def _build_env_config(config: ExecutionPPOTrainCLIConfig) -> ExecutionEnvConfig:
     )
 
 
+def _make_envs(
+    *,
+    num_envs: int,
+    tape,
+    env_config: ExecutionEnvConfig,
+    decision_grid,
+    linear_signals,
+    adverse_signals,
+) -> tuple[ExecutionEnv, ...]:
+    return tuple(
+        ExecutionEnv(
+            tape,
+            config=env_config,
+            decision_grid=decision_grid,
+            linear_signals=linear_signals,
+            adverse_signals=adverse_signals,
+        )
+        for _ in range(num_envs)
+    )
+
+
+def _rollout_ranges(contract: Mapping[str, object], split: str) -> tuple[DecisionSplitRange, ...]:
+    ranges = tuple(entry for entry in ranges_for_split(contract, split) if entry.rollout_step_capacity > 0)
+    if not ranges:
+        raise ValueError(f"{split} split must contain at least one range with two decision rows")
+    return ranges
+
+
+def _debug_start_rows(config: ExecutionPPOTrainCLIConfig, ranges: Sequence[DecisionSplitRange]) -> tuple[int, ...] | None:
+    if config.debug_start_decision_row is None:
+        return None
+    row = int(config.debug_start_decision_row)
+    if not any(entry.start_decision_row <= row and row + 1 < entry.end_decision_row for entry in ranges):
+        raise ValueError("debug_start_decision_row must lie inside the selected train split")
+    return tuple(row for _ in range(config.num_envs))
+
+
+def _adverse_signal_summary(artifact: AdverseSelectionSignalArtifact | None, path: str | None) -> dict[str, object] | None:
+    if artifact is None:
+        return None
+    return {
+        "path": path,
+        "schema": artifact.schema,
+        "decision_grid_schema": artifact.decision_grid_schema,
+        "decision_grid_hash": artifact.decision_grid_hash,
+        "decision_grid_n_rows": artifact.decision_grid_n_rows,
+        "decision_schedule": dict(artifact.decision_schedule),
+        "target_names": list(artifact.target_names),
+        "n_rows": int(artifact.decision_grid_n_rows),
+    }
+
+
+def _config_warnings(config: ExecutionPPOTrainCLIConfig) -> list[str]:
+    warnings: list[str] = []
+    if config.maker_fee_bps < 0.0 and config.turnover_penalty_bps == 0.0:
+        warnings.append("maker_fee_bps is negative while turnover_penalty_bps is zero")
+    return warnings
+
+
+def _env_config_summary(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
+    return {
+        "cancel_guard_ticks": config.cancel_guard_ticks,
+        "max_episode_steps": config.max_episode_steps,
+        "max_distance_ticks": config.max_distance_ticks,
+        "max_order_qty": config.max_order_qty,
+        "post_only_gap_ticks": config.post_only_gap_ticks,
+        "default_order_qty": config.default_order_qty,
+        "queue_mode": config.queue_mode.value,
+        "l2_decrease_weight": config.l2_decrease_weight,
+        "trade_at_level_weight": config.trade_at_level_weight,
+        "unknown_level_queue_ahead_qty": config.unknown_level_queue_ahead_qty,
+        "dedupe_l2_decrease_with_trade_prints": config.dedupe_l2_decrease_with_trade_prints,
+        "maker_fee_bps": config.maker_fee_bps,
+        "edge_min_executable_edge_bps": config.edge_min_executable_edge_bps,
+        "edge_latency_buffer_bps": config.edge_latency_buffer_bps,
+        "edge_inventory_skew_bps_per_unit": config.edge_inventory_skew_bps_per_unit,
+        "decision_compute_latency_us": config.decision_compute_latency_us,
+        "order_entry_latency_us": config.order_entry_latency_us,
+        "cancel_latency_us": config.cancel_latency_us,
+        "inventory_penalty_bps": config.inventory_penalty_bps,
+        "turnover_penalty_bps": config.turnover_penalty_bps,
+        "cancel_penalty": config.cancel_penalty,
+        "drawdown_penalty_rate": config.drawdown_penalty_rate,
+        "terminal_inventory_penalty_bps": config.terminal_inventory_penalty_bps,
+        "reward_scale": config.reward_scale,
+        "adverse_signals_enabled": config.adverse_signals_npz is not None,
+    }
+
+
+def _split_lineage_summary(contract: Mapping[str, object], split: str) -> dict[str, object]:
+    ranges = [entry.as_dict() for entry in ranges_for_split(contract, split)]
+    return {
+        "schema": contract["schema"],
+        "version": contract["version"],
+        "split_source_dataset_root": contract["split_source_dataset_root"],
+        "split_source_dataset_id": contract["split_source_dataset_id"],
+        "split_source_manifest_hash": contract["split_source_manifest_hash"],
+        "decision_grid_schema": contract["decision_grid_schema"],
+        "decision_grid_hash": contract["decision_grid_hash"],
+        "decision_grid_n_rows": contract["decision_grid_n_rows"],
+        "decision_schedule": contract["decision_schedule"],
+        "ranges_by_split": contract["ranges_by_split"],
+        "row_counts_by_split": contract["row_counts_by_split"],
+        "selected_split": split,
+        "selected_ranges": ranges,
+        "selected_row_count": int(contract["row_counts_by_split"][split]),  # type: ignore[index]
+    }
+
+
 def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
     if not isinstance(config, ExecutionPPOTrainCLIConfig):
         raise ValueError("config must be ExecutionPPOTrainCLIConfig")
 
-    output_json = Path(config.output_json) if config.output_json is not None else _default_output_json(config.tape_root)
+    profile_mode = config.profile_rollout_steps is not None
+    output_json = (
+        Path(config.profile_output_json)
+        if profile_mode and config.profile_output_json is not None
+        else Path(config.output_json)
+        if config.output_json is not None
+        else _default_profile_json(config.tape_root)
+        if profile_mode
+        else _default_output_json(config.tape_root)
+    )
     checkpoint_path = (
         Path(config.checkpoint_path)
         if config.checkpoint_path is not None
@@ -518,8 +687,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
 
     if output_json.exists() and not config.overwrite:
         raise FileExistsError(str(output_json))
-
-    if config.save_checkpoint and checkpoint_path.exists() and not config.overwrite:
+    if not profile_mode and config.save_checkpoint and checkpoint_path.exists() and not config.overwrite:
         raise FileExistsError(str(checkpoint_path))
 
     tape = load_execution_tape(
@@ -535,27 +703,58 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
     linear_signals = load_linear_signal_artifact_npz(linear_signals_path)
     decision_grid = load_decision_grid(config.decision_grid_path)
     validate_decision_grid_for_execution_tape(decision_grid, tape)
+    split_contract = load_execution_split_contract(config.split_source_dataset_root, decision_grid).as_dict()
+    train_ranges = _rollout_ranges(split_contract, config.train_split)
+    start_decision_rows = _debug_start_rows(config, train_ranges)
+
     adverse_signals = load_adverse_selection_signals(config.adverse_signals_npz) if config.adverse_signals_npz is not None else None
     env_config = _build_env_config(config)
+    requested_start_event_index = None
+    if config.debug_start_decision_row is not None:
+        requested_start_event_index = int(decision_grid.decision_event_index[config.debug_start_decision_row])
     decision_grid_start = validate_linear_signals_for_execution_tape(
         linear_signals=linear_signals,
         tape=tape,
         decision_grid=decision_grid,
-        requested_start_event_index=config.start_event_index,
-        min_rows=(config.max_episode_steps + 1) if config.max_episode_steps is not None else None,
+        requested_start_event_index=requested_start_event_index,
+        min_rows=2,
     )
-    env = ExecutionEnv(tape, config=env_config, decision_grid=decision_grid, linear_signals=linear_signals, adverse_signals=adverse_signals)
-    training_config = _build_training_config(config)
-    result = train_ppo_policy(env, config=training_config)
+    envs = _make_envs(
+        num_envs=config.num_envs,
+        tape=tape,
+        env_config=env_config,
+        decision_grid=decision_grid,
+        linear_signals=linear_signals,
+        adverse_signals=adverse_signals,
+    )
+    training_config = _build_training_config(
+        config,
+        rollout_steps=config.profile_rollout_steps if profile_mode else None,
+        num_updates=1 if profile_mode else None,
+    )
+    resolved_device = resolve_torch_device(training_config.rollout_config.device)
+    result = train_ppo_policy(
+        envs,
+        config=training_config,
+        decision_row_ranges=train_ranges,
+        start_decision_rows=start_decision_rows,
+    )
 
+    split_lineage = _split_lineage_summary(split_contract, config.train_split)
+    training_summary = result.summary_dict()
     summary: dict[str, object] = {
         "status": "ok",
-        "run_type": "train_execution_ppo",
+        "run_type": "profile_execution_ppo_rollout" if profile_mode else "train_execution_ppo",
         "tape_root": str(Path(config.tape_root)),
         "decision_grid_path": str(Path(config.decision_grid_path)),
+        "split_source_dataset_root": str(Path(config.split_source_dataset_root)),
         "output_json": str(output_json),
-        "checkpoint_path": None if not config.save_checkpoint else str(checkpoint_path),
+        "checkpoint_path": None if profile_mode or not config.save_checkpoint else str(checkpoint_path),
         "config": _summary_config(config),
+        "config_warnings": _config_warnings(config),
+        "env_config": _env_config_summary(config),
+        "device": torch_device_summary(requested_device=config.device, resolved_device=resolved_device),
+        "cuda_memory": cuda_memory_summary(resolved_device),
         "tape": {
             "schema": tape.manifest.schema,
             "exchange": tape.manifest.exchange,
@@ -567,9 +766,11 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "end_local_ts_us": tape.manifest.end_local_ts_us,
             "book_depth": tape.manifest.notes.get("book_depth") if tape.manifest.notes is not None else None,
         },
-        "training": result.summary_dict(),
-        "observation_schema": env.config.observation_schema.as_dict(),
+        "training": training_summary,
+        "sampling": training_summary["sampling"],
+        "observation_schema": envs[0].config.observation_schema.as_dict(),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
+        "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
         "decision_grid_start": decision_grid_start.as_dict(),
         "decision_grid": {
             "schema": decision_grid.metadata.schema,
@@ -577,18 +778,50 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "n_rows": decision_grid.n_rows,
             "schedule": decision_grid.decision_schedule,
         },
+        "split_contract": split_contract,
+        "split_lineage": split_lineage,
+        "train_split": config.train_split,
+        "train_ranges": split_lineage["selected_ranges"],
+        "train_row_count": split_lineage["selected_row_count"],
+        "debug_start_decision_row": config.debug_start_decision_row,
+        "train_window_sampling": config.train_window_sampling,
+        "seed": config.seed,
+        "rollout": {
+            "num_envs": config.num_envs,
+            "rollout_steps_per_env": training_config.rollout_config.rollout_steps,
+            "effective_batch_size": training_config.rollout_config.rollout_steps * training_config.rollout_config.num_envs,
+        },
     }
 
-    if config.save_checkpoint:
+    if profile_mode:
+        summary["checkpoint_saved"] = False
+        summary["profile"] = {
+            "profile_rollout_steps": config.profile_rollout_steps,
+            "num_envs": config.num_envs,
+            "timing": training_summary["final"]["timing"],  # type: ignore[index]
+            "sampling": training_summary["sampling"],
+            "resolved_device": str(resolved_device),
+        }
+    elif config.save_checkpoint:
         checkpoint_payload = make_training_checkpoint_payload(result)
         checkpoint_payload["cli_config"] = _summary_config(config)
         checkpoint_payload["tape"] = summary["tape"]
-        checkpoint_payload["observation_schema"] = env.config.observation_schema.as_dict()
+        checkpoint_payload["observation_schema"] = envs[0].config.observation_schema.as_dict()
         checkpoint_payload["linear_signals"] = linear_signal_artifact_summary(
             linear_signals, path=str(linear_signals_path)
         )
+        checkpoint_payload["adverse_signals"] = _adverse_signal_summary(adverse_signals, config.adverse_signals_npz)
         checkpoint_payload["decision_grid_start"] = decision_grid_start.as_dict()
         checkpoint_payload["decision_grid"] = summary["decision_grid"]
+        checkpoint_payload["split_contract"] = split_contract
+        checkpoint_payload["split_lineage"] = split_lineage
+        checkpoint_payload["train_split"] = config.train_split
+        checkpoint_payload["train_ranges"] = split_lineage["selected_ranges"]
+        checkpoint_payload["train_row_count"] = split_lineage["selected_row_count"]
+        checkpoint_payload["train_window_sampling"] = config.train_window_sampling
+        checkpoint_payload["sampling"] = training_summary["sampling"]
+        checkpoint_payload["device"] = summary["device"]
+        checkpoint_payload["env_config"] = summary["env_config"]
         _save_checkpoint_atomic(checkpoint_path, checkpoint_payload)
         summary["checkpoint_saved"] = True
     else:
@@ -599,9 +832,11 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train an execution PPO policy from an existing execution tape.")
+    parser = argparse.ArgumentParser(description="Train an execution PPO policy from train split decision-row windows.")
     parser.add_argument("--tape-root", required=True)
     parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
+    parser.add_argument("--split-source-dataset-root", required=True)
+    parser.add_argument("--train-split", required=True, choices=("train",))
 
     parser.add_argument("--output-json")
     parser.add_argument("--checkpoint-path")
@@ -629,7 +864,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable de-duplication of L2 visible decreases already explained by same-level trade prints.",
     )
-    parser.add_argument("--maker-fee-bps", type=float, default=-0.5)
+    parser.add_argument("--maker-fee-bps", type=float, required=True)
     parser.add_argument("--edge-min-executable-edge-bps", type=float, default=0.0)
     parser.add_argument("--edge-latency-buffer-bps", type=float, default=0.0)
     parser.add_argument("--edge-inventory-skew-bps-per-unit", type=float, default=0.0)
@@ -643,19 +878,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--terminal-inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--reward-scale", type=float, default=1.0)
 
-    parser.add_argument("--num-updates", type=int, default=10)
+    parser.add_argument("--num-updates", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--adam-eps", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--start-event-index", type=int)
+    parser.add_argument("--debug-start-decision-row", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--train-window-sampling",
+        choices=TRAIN_WINDOW_SAMPLING_MODES,
+        default="stratified_random",
+    )
 
-    parser.add_argument("--rollout-steps", type=int, default=1024)
+    parser.add_argument("--num-envs", type=int, default=4)
+    parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--no-reset-on-terminal", action="store_true")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64", "fp32", "fp64"), default="float32")
 
     parser.add_argument("--hidden-sizes", default="128,128")
@@ -671,7 +912,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-head-gain", type=float, default=1.0)
 
     parser.add_argument("--update-epochs", type=int, default=4)
-    parser.add_argument("--minibatch-size", type=int, default=256)
+    parser.add_argument("--minibatch-size", type=int, default=1024)
     parser.add_argument("--clip-range", type=float, default=0.2)
     parser.add_argument("--value-clip-range", type=float, default=0.2)
     parser.add_argument("--no-clip-value-loss", action="store_true")
@@ -690,6 +931,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-observation-normalizer-clip", action="store_true")
     parser.add_argument("--observation-normalizer-rms-epsilon", type=float, default=1e-4)
 
+    parser.add_argument("--profile-rollout-steps", type=int)
+    parser.add_argument("--profile-output-json")
+
     return parser
 
 
@@ -697,6 +941,8 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
     return ExecutionPPOTrainCLIConfig(
         tape_root=args.tape_root,
         decision_grid_path=args.decision_grid_path,
+        split_source_dataset_root=args.split_source_dataset_root,
+        train_split=args.train_split,
         output_json=args.output_json,
         checkpoint_path=args.checkpoint_path,
         linear_signals_npz=args.linear_signals_npz,
@@ -732,8 +978,10 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         learning_rate=args.learning_rate,
         adam_eps=args.adam_eps,
         weight_decay=args.weight_decay,
-        start_event_index=args.start_event_index,
+        debug_start_decision_row=args.debug_start_decision_row,
         seed=args.seed,
+        train_window_sampling=args.train_window_sampling,
+        num_envs=args.num_envs,
         rollout_steps=args.rollout_steps,
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
@@ -770,6 +1018,8 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
             None if args.no_observation_normalizer_clip else args.observation_normalizer_clip
         ),
         observation_normalizer_rms_epsilon=args.observation_normalizer_rms_epsilon,
+        profile_rollout_steps=args.profile_rollout_steps,
+        profile_output_json=args.profile_output_json,
     )
 
 
