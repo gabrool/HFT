@@ -8,14 +8,32 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from mmrt.execution.adverse_selection import AdverseSelectionDataset, AdverseSelectionFeatureDataset
+from mmrt.execution.adverse_selection import (
+    AdverseSelectionDataset,
+    AdverseSelectionFeatureDataset,
+    adverse_label_config_from_config,
+)
 from mmrt.execution.decision_grid import DecisionGrid, validate_decision_key_order
 from mmrt.execution.split_contract import EXECUTION_SPLIT_CONTRACT_SCHEMA, validate_split_contract_payload
 
 ADVERSE_SELECTION_MODEL_SCHEMA = "mmrt_adverse_selection_ridge_grid_v1"
-ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_grid_v1"
+ADVERSE_SELECTION_SIGNALS_SCHEMA = "mmrt_adverse_selection_signals_grid_v2"
 ADVERSE_SELECTION_MODEL_FILENAME = "adverse_selection_model.npz"
 ADVERSE_SELECTION_SIGNALS_FILENAME = "adverse_selection_signals.npz"
+ADVERSE_LABEL_CONFIG_KEYS = (
+    "queue_mode",
+    "l2_decrease_weight",
+    "trade_at_level_weight",
+    "dedupe_l2_decrease_with_trade_prints",
+    "unknown_level_queue_ahead_qty",
+    "qty_epsilon",
+    "order_entry_latency_us",
+    "decision_compute_latency_us",
+    "post_only_gap_ticks",
+    "order_qty",
+    "fill_horizon_us",
+    "adverse_horizon_us",
+)
 
 
 def _names_tuple(values: Sequence[str], name: str) -> tuple[str, ...]:
@@ -47,6 +65,89 @@ def _nonempty_str(value: str, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value.strip()
+
+
+def _require_bool(value: object, name: str) -> bool:
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be bool")
+    return bool(value)
+
+
+def _require_finite_float(value: object, name: str) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be finite")
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite") from exc
+    if not np.isfinite(out):
+        raise ValueError(f"{name} must be finite")
+    return out
+
+
+def _require_nonnegative_float(value: object, name: str) -> float:
+    out = _require_finite_float(value, name)
+    if out < 0.0:
+        raise ValueError(f"{name} must be >= 0")
+    return out
+
+
+def _require_probability(value: object, name: str) -> float:
+    out = _require_finite_float(value, name)
+    if out < 0.0 or out > 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    return out
+
+
+def _require_positive_float(value: object, name: str) -> float:
+    out = _require_finite_float(value, name)
+    if out <= 0.0:
+        raise ValueError(f"{name} must be > 0")
+    return out
+
+
+def _require_nonnegative_int(value: object, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a nonnegative int")
+    try:
+        out = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a nonnegative int") from exc
+    if out < 0:
+        raise ValueError(f"{name} must be a nonnegative int")
+    return out
+
+
+def _require_positive_int(value: object, name: str) -> int:
+    out = _require_nonnegative_int(value, name)
+    if out <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return out
+
+
+def _adverse_label_config(value: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("adverse_label_config must be a mapping")
+    missing = [key for key in ADVERSE_LABEL_CONFIG_KEYS if key not in value]
+    if missing:
+        raise ValueError(f"adverse_label_config missing required keys: {missing}")
+    queue_mode = str(value["queue_mode"])
+    if queue_mode not in ("conservative", "balanced"):
+        raise ValueError("adverse_label_config queue_mode must be conservative or balanced")
+    return {
+        "queue_mode": queue_mode,
+        "l2_decrease_weight": _require_probability(value["l2_decrease_weight"], "adverse_label_config.l2_decrease_weight"),
+        "trade_at_level_weight": _require_probability(value["trade_at_level_weight"], "adverse_label_config.trade_at_level_weight"),
+        "dedupe_l2_decrease_with_trade_prints": _require_bool(value["dedupe_l2_decrease_with_trade_prints"], "adverse_label_config.dedupe_l2_decrease_with_trade_prints"),
+        "unknown_level_queue_ahead_qty": _require_nonnegative_float(value["unknown_level_queue_ahead_qty"], "adverse_label_config.unknown_level_queue_ahead_qty"),
+        "qty_epsilon": _require_positive_float(value["qty_epsilon"], "adverse_label_config.qty_epsilon"),
+        "order_entry_latency_us": _require_nonnegative_int(value["order_entry_latency_us"], "adverse_label_config.order_entry_latency_us"),
+        "decision_compute_latency_us": _require_nonnegative_int(value["decision_compute_latency_us"], "adverse_label_config.decision_compute_latency_us"),
+        "post_only_gap_ticks": _require_nonnegative_int(value["post_only_gap_ticks"], "adverse_label_config.post_only_gap_ticks"),
+        "order_qty": _require_positive_float(value["order_qty"], "adverse_label_config.order_qty"),
+        "fill_horizon_us": _require_positive_int(value["fill_horizon_us"], "adverse_label_config.fill_horizon_us"),
+        "adverse_horizon_us": _require_positive_int(value["adverse_horizon_us"], "adverse_label_config.adverse_horizon_us"),
+    }
 
 
 def _split_contract(value: Mapping[str, object]) -> dict[str, object]:
@@ -210,6 +311,7 @@ class AdverseSelectionSignalArtifact:
     decision_event_seq: np.ndarray
     target_names: tuple[str, ...]
     predictions: dict[str, np.ndarray]
+    adverse_label_config: Mapping[str, object]
     decision_grid_schema: str
     decision_grid_hash: str
     decision_grid_n_rows: int
@@ -249,6 +351,7 @@ class AdverseSelectionSignalArtifact:
         object.__setattr__(self, "decision_event_seq", arrays[2])
         object.__setattr__(self, "target_names", names)
         object.__setattr__(self, "predictions", preds)
+        object.__setattr__(self, "adverse_label_config", _adverse_label_config(self.adverse_label_config))
         object.__setattr__(self, "decision_grid_schema", _nonempty_str(self.decision_grid_schema, "decision_grid_schema"))
         object.__setattr__(self, "decision_grid_hash", _hash64(self.decision_grid_hash, "decision_grid_hash"))
         if int(self.decision_grid_n_rows) != n:
@@ -272,6 +375,7 @@ def build_adverse_selection_signal_artifact(dataset: AdverseSelectionDataset | A
         decision_event_seq=dataset.decision_event_seq.copy(),
         target_names=model.target_names,
         predictions=predictions,
+        adverse_label_config=adverse_label_config_from_config(dataset.config),
         decision_grid_schema=model.decision_grid_schema,
         decision_grid_hash=model.decision_grid_hash,
         decision_grid_n_rows=model.decision_grid_n_rows,
@@ -294,6 +398,7 @@ def save_adverse_selection_signals(path: str | Path, artifact: AdverseSelectionS
             decision_event_index=artifact.decision_event_index,
             decision_event_seq=artifact.decision_event_seq,
             target_names=np.asarray(artifact.target_names, dtype=object),
+            adverse_label_config=np.array(dict(artifact.adverse_label_config), dtype=object),
             decision_grid_schema=np.array(artifact.decision_grid_schema),
             decision_grid_hash=np.array(artifact.decision_grid_hash),
             decision_grid_n_rows=np.array(artifact.decision_grid_n_rows, dtype=np.int64),
@@ -320,6 +425,7 @@ def save_adverse_selection_signals_arrays(
     decision_event_seq: np.ndarray,
     target_names: Sequence[str],
     predictions: Mapping[str, np.ndarray],
+    adverse_label_config: Mapping[str, object],
     decision_grid_schema: str,
     decision_grid_hash: str,
     decision_grid_n_rows: int,
@@ -335,6 +441,7 @@ def save_adverse_selection_signals_arrays(
         raise ValueError("validate_chunk_rows must be a positive int")
     validate_chunk_rows = int(validate_chunk_rows)
     names = _names_tuple(target_names, "target_names")
+    label_config = _adverse_label_config(adverse_label_config)
     decision_grid_schema = _nonempty_str(decision_grid_schema, "decision_grid_schema")
     decision_grid_hash = _hash64(decision_grid_hash, "decision_grid_hash")
     if not isinstance(decision_schedule, Mapping):
@@ -423,6 +530,7 @@ def save_adverse_selection_signals_arrays(
             decision_event_index=decision_arrays["decision_event_index"],
             decision_event_seq=decision_arrays["decision_event_seq"],
             target_names=np.asarray(names, dtype=object),
+            adverse_label_config=np.array(label_config, dtype=object),
             decision_grid_schema=np.array(decision_grid_schema),
             decision_grid_hash=np.array(decision_grid_hash),
             decision_grid_n_rows=np.array(int(decision_grid_n_rows), dtype=np.int64),
@@ -440,6 +548,7 @@ def load_adverse_selection_signals(path: str | Path) -> AdverseSelectionSignalAr
             "decision_event_index",
             "decision_event_seq",
             "target_names",
+            "adverse_label_config",
             "decision_grid_schema",
             "decision_grid_hash",
             "decision_grid_n_rows",
@@ -466,6 +575,7 @@ def load_adverse_selection_signals(path: str | Path) -> AdverseSelectionSignalAr
             decision_event_seq=np.asarray(data["decision_event_seq"]),
             target_names=target_names,
             predictions=predictions,
+            adverse_label_config=dict(data["adverse_label_config"].item()),
             decision_grid_schema=str(data["decision_grid_schema"].item()),
             decision_grid_hash=str(data["decision_grid_hash"].item()),
             decision_grid_n_rows=int(data["decision_grid_n_rows"].item()),

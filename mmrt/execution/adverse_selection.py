@@ -76,6 +76,8 @@ __all__ = [
     "candidate_price_tick",
     "BuildAdverseSelectionDatasetToDiskConfig",
     "profile_adverse_selection_label_generation",
+    "adverse_label_config_from_config",
+    "adverse_label_config_from_training_summary",
 ]
 
 _EPS = 1e-12
@@ -83,7 +85,12 @@ _LABEL_ENGINE_AUTO = "auto"
 _LABEL_ENGINE_NUMBA = "numba"
 _LABEL_ENGINE_SCALAR = "scalar"
 _LABEL_ENGINES = (_LABEL_ENGINE_AUTO, _LABEL_ENGINE_NUMBA, _LABEL_ENGINE_SCALAR)
+_BACKEND_CONSERVATIVE_NUMBA = "conservative_numba"
+_BACKEND_CONSERVATIVE_SCALAR = "conservative_scalar"
+_BACKEND_BALANCED_NUMBA = "balanced_numba"
+_BACKEND_BALANCED_SCALAR = "balanced_scalar"
 _CONSERVATIVE_NUMBA_AVAILABLE = _numba_njit is not None
+_BALANCED_NUMBA_AVAILABLE = _numba_njit is not None
 _AUTO_NUMBA_WARNING_EMITTED = False
 
 
@@ -106,23 +113,46 @@ def _coerce_label_engine(value: str) -> str:
     return value
 
 
+def _backend_is_numba(backend: str) -> bool:
+    return backend in (_BACKEND_CONSERVATIVE_NUMBA, _BACKEND_BALANCED_NUMBA)
+
+
 def _resolve_conservative_label_backend(label_engine: str, *, invalid_quote_policy: str) -> str:
     global _AUTO_NUMBA_WARNING_EMITTED
     label_engine = _coerce_label_engine(label_engine)
     if invalid_quote_policy == "error":
-        return _LABEL_ENGINE_SCALAR
+        return _BACKEND_CONSERVATIVE_SCALAR
     if label_engine == _LABEL_ENGINE_SCALAR:
-        return _LABEL_ENGINE_SCALAR
+        return _BACKEND_CONSERVATIVE_SCALAR
     if label_engine == _LABEL_ENGINE_NUMBA:
         if not _CONSERVATIVE_NUMBA_AVAILABLE:
             raise ValueError("label_engine='numba' requires numba to be installed")
-        return _LABEL_ENGINE_NUMBA
+        return _BACKEND_CONSERVATIVE_NUMBA
     if _CONSERVATIVE_NUMBA_AVAILABLE:
-        return _LABEL_ENGINE_NUMBA
+        return _BACKEND_CONSERVATIVE_NUMBA
     if not _AUTO_NUMBA_WARNING_EMITTED:
         _log_stage("adverse_dataset label_engine=auto numba_unavailable using scalar conservative labels")
         _AUTO_NUMBA_WARNING_EMITTED = True
-    return _LABEL_ENGINE_SCALAR
+    return _BACKEND_CONSERVATIVE_SCALAR
+
+
+def _resolve_balanced_label_backend(label_engine: str, *, invalid_quote_policy: str) -> str:
+    global _AUTO_NUMBA_WARNING_EMITTED
+    label_engine = _coerce_label_engine(label_engine)
+    if invalid_quote_policy == "error":
+        return _BACKEND_BALANCED_SCALAR
+    if label_engine == _LABEL_ENGINE_SCALAR:
+        return _BACKEND_BALANCED_SCALAR
+    if label_engine == _LABEL_ENGINE_NUMBA:
+        if not _BALANCED_NUMBA_AVAILABLE:
+            raise ValueError("label_engine='numba' requires numba to be installed")
+        return _BACKEND_BALANCED_NUMBA
+    if _BALANCED_NUMBA_AVAILABLE:
+        return _BACKEND_BALANCED_NUMBA
+    if not _AUTO_NUMBA_WARNING_EMITTED:
+        _log_stage("adverse_dataset label_engine=auto numba_unavailable using scalar balanced labels")
+        _AUTO_NUMBA_WARNING_EMITTED = True
+    return _BACKEND_BALANCED_SCALAR
 
 
 def _require_nonempty_str(value: str, name: str) -> str:
@@ -362,6 +392,7 @@ def adverse_selection_config_from_training_summary(payload: Mapping[str, object]
                     trade_at_level_weight=float(_required(payload, "trade_at_level_weight")),
                     unknown_level_queue_ahead_qty=float(_required(payload, "unknown_level_queue_ahead_qty")),
                     dedupe_l2_decrease_with_trade_prints=bool(_required(payload, "dedupe_l2_decrease_with_trade_prints")),
+                    qty_epsilon=float(payload.get("qty_epsilon", 1e-12)),
                 ),
             ),
         )
@@ -974,6 +1005,22 @@ class _ConservativeFillIndex:
     sell_trade_amount: np.ndarray
 
 
+@dataclass(frozen=True, slots=True)
+class _BalancedFillIndex:
+    """Per-tape primitive arrays for event-replay balanced fills."""
+
+    event_local_ts: np.ndarray
+    event_seq: np.ndarray
+    event_type_code: np.ndarray
+    event_book_ptr: np.ndarray
+    event_trade_ptr: np.ndarray
+    l2_best_bid_tick: np.ndarray
+    l2_best_ask_tick: np.ndarray
+    trade_side_code: np.ndarray
+    trade_price_tick: np.ndarray
+    trade_amount: np.ndarray
+
+
 def _build_conservative_fill_index(tape: ExecutionTape) -> _ConservativeFillIndex:
     events = tape.arrays.events
     event_local_ts = np.ascontiguousarray(events["local_ts_us"], dtype=np.int64)
@@ -1014,6 +1061,23 @@ def _build_conservative_fill_index(tape: ExecutionTape) -> _ConservativeFillInde
         sell_trade_event_pos=np.ascontiguousarray(event_pos[sell]),
         sell_trade_price_tick=np.ascontiguousarray(price_tick[sell]),
         sell_trade_amount=np.ascontiguousarray(amount[sell]),
+    )
+
+
+def _build_balanced_fill_index(tape: ExecutionTape) -> _BalancedFillIndex:
+    events = tape.arrays.events
+    trades = tape.arrays.trades
+    return _BalancedFillIndex(
+        event_local_ts=np.ascontiguousarray(events["local_ts_us"], dtype=np.int64),
+        event_seq=np.ascontiguousarray(events["event_seq"], dtype=np.int64),
+        event_type_code=np.ascontiguousarray(events["event_type_code"], dtype=np.int64),
+        event_book_ptr=np.ascontiguousarray(events["book_ptr"], dtype=np.int64),
+        event_trade_ptr=np.ascontiguousarray(events["trade_ptr"], dtype=np.int64),
+        l2_best_bid_tick=np.ascontiguousarray(tape.arrays.l2_events["best_bid_tick"], dtype=np.int64),
+        l2_best_ask_tick=np.ascontiguousarray(tape.arrays.l2_events["best_ask_tick"], dtype=np.int64),
+        trade_side_code=np.ascontiguousarray(trades["side_code"], dtype=np.int64),
+        trade_price_tick=np.ascontiguousarray(trades["price_tick"], dtype=np.int64),
+        trade_amount=np.ascontiguousarray(trades["amount"], dtype=np.float64),
     )
 
 
@@ -1535,6 +1599,487 @@ def _conservative_labels_kernel_impl(
             keep_rows[row] = True
 
 
+@_maybe_njit
+def _event_key_lte_impl(left_ts: int, left_seq: int, right_ts: int, right_seq: int) -> bool:
+    return left_ts < right_ts or (left_ts == right_ts and left_seq <= right_seq)
+
+
+@_maybe_njit
+def _level_qty_known_from_book_arrays_impl(
+    bid_ticks: np.ndarray,
+    bid_sizes: np.ndarray,
+    ask_ticks: np.ndarray,
+    ask_sizes: np.ndarray,
+    book_ptr: int,
+    side_code: int,
+    price_tick: int,
+) -> tuple[float, int]:
+    ticks = bid_ticks if side_code > 0 else ask_ticks
+    sizes = bid_sizes if side_code > 0 else ask_sizes
+    has_active = False
+    min_tick = 0
+    max_tick = 0
+    for level in range(ticks.shape[1]):
+        tick = int(ticks[book_ptr, level])
+        if tick == price_tick:
+            return float(sizes[book_ptr, level]), 1
+        if tick > 0:
+            if not has_active:
+                min_tick = tick
+                max_tick = tick
+                has_active = True
+            else:
+                if tick < min_tick:
+                    min_tick = tick
+                if tick > max_tick:
+                    max_tick = tick
+    if has_active and min_tick <= price_tick <= max_tick:
+        return 0.0, 1
+    return 0.0, 0
+
+
+@_maybe_njit
+def _post_only_safe_impl(
+    side_code: int,
+    price_tick: int,
+    best_bid: int,
+    best_ask: int,
+    post_only_gap_ticks: int,
+) -> bool:
+    if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+        return False
+    if side_code > 0:
+        return price_tick <= best_ask - post_only_gap_ticks
+    return price_tick >= best_bid + post_only_gap_ticks
+
+
+@_maybe_njit
+def _activate_balanced_order_impl(
+    status: int,
+    effective_ts: int,
+    effective_seq: int,
+    event_ts: int,
+    event_seq: int,
+    current_book_ptr: int,
+    side_code: int,
+    price_tick: int,
+    post_only_gap_ticks: int,
+    unknown_queue: float,
+    bid_ticks: np.ndarray,
+    bid_sizes: np.ndarray,
+    ask_ticks: np.ndarray,
+    ask_sizes: np.ndarray,
+    l2_best_bid_tick: np.ndarray,
+    l2_best_ask_tick: np.ndarray,
+) -> tuple[int, float]:
+    if status != 0:
+        return status, 0.0
+    if not _event_key_lte_impl(effective_ts, effective_seq, event_ts, event_seq):
+        return status, 0.0
+    best_bid = int(l2_best_bid_tick[current_book_ptr])
+    best_ask = int(l2_best_ask_tick[current_book_ptr])
+    queue_ahead = _queue_ahead_from_book_arrays_impl(
+        bid_ticks,
+        bid_sizes,
+        ask_ticks,
+        ask_sizes,
+        current_book_ptr,
+        side_code,
+        price_tick,
+        best_bid,
+        best_ask,
+        unknown_queue,
+    )
+    if not _post_only_safe_impl(side_code, price_tick, best_bid, best_ask, post_only_gap_ticks):
+        return 2, queue_ahead
+    return 1, queue_ahead
+
+
+@_maybe_njit
+def _balanced_fill_one_side_impl(
+    event_local_ts: np.ndarray,
+    event_seq: np.ndarray,
+    event_type_code: np.ndarray,
+    event_book_ptr: np.ndarray,
+    event_trade_ptr: np.ndarray,
+    bid_ticks: np.ndarray,
+    bid_sizes: np.ndarray,
+    ask_ticks: np.ndarray,
+    ask_sizes: np.ndarray,
+    l2_best_bid_tick: np.ndarray,
+    l2_best_ask_tick: np.ndarray,
+    trade_side_code: np.ndarray,
+    trade_price_tick: np.ndarray,
+    trade_amount: np.ndarray,
+    start_event_index: int,
+    start_book_ptr: int,
+    decision_ts: int,
+    decision_seq: int,
+    side_code: int,
+    price_tick: int,
+    end_event_index: int,
+    delay_us: int,
+    post_only_gap_ticks: int,
+    trade_at_level_weight: float,
+    l2_decrease_weight: float,
+    unknown_queue: float,
+    qty_epsilon: float,
+    order_qty: float,
+    dedupe_l2_decrease_with_trade_prints: int,
+) -> tuple[int, int, int, int]:
+    event_count = event_local_ts.shape[0]
+    if end_event_index > event_count:
+        end_event_index = event_count
+    if start_event_index + 1 >= end_event_index:
+        return 0, -1, -1, 0
+
+    max_event_seq = int(MAX_EVENT_SEQ)
+    if delay_us == 0:
+        effective_ts = decision_ts
+        effective_seq = decision_seq
+    else:
+        effective_ts = decision_ts + delay_us
+        effective_seq = max_event_seq
+
+    best_bid = int(l2_best_bid_tick[start_book_ptr])
+    best_ask = int(l2_best_ask_tick[start_book_ptr])
+    queue_ahead = _queue_ahead_from_book_arrays_impl(
+        bid_ticks,
+        bid_sizes,
+        ask_ticks,
+        ask_sizes,
+        start_book_ptr,
+        side_code,
+        price_tick,
+        best_bid,
+        best_ask,
+        unknown_queue,
+    )
+    current_book_ptr = start_book_ptr
+    status = 0  # 0 pending_new, 1 active, 2 rejected
+    activated_status, activated_queue = _activate_balanced_order_impl(
+        status,
+        effective_ts,
+        effective_seq,
+        decision_ts,
+        decision_seq,
+        current_book_ptr,
+        side_code,
+        price_tick,
+        post_only_gap_ticks,
+        unknown_queue,
+        bid_ticks,
+        bid_sizes,
+        ask_ticks,
+        ask_sizes,
+        l2_best_bid_tick,
+        l2_best_ask_tick,
+    )
+    if activated_status != status:
+        status = activated_status
+        queue_ahead = activated_queue
+    if status == 2:
+        return 0, -1, -1, 0
+
+    recent_trade_depletion_qty = 0.0
+    for event_idx in range(start_event_index + 1, end_event_index):
+        ev_ts = int(event_local_ts[event_idx])
+        ev_seq = int(event_seq[event_idx])
+        if ev_seq > 0:
+            pre_ts = ev_ts
+            pre_seq = ev_seq - 1
+        elif ev_ts > 1:
+            pre_ts = ev_ts - 1
+            pre_seq = max_event_seq
+        else:
+            pre_ts = ev_ts
+            pre_seq = ev_seq
+        activated_status, activated_queue = _activate_balanced_order_impl(
+            status,
+            effective_ts,
+            effective_seq,
+            pre_ts,
+            pre_seq,
+            current_book_ptr,
+            side_code,
+            price_tick,
+            post_only_gap_ticks,
+            unknown_queue,
+            bid_ticks,
+            bid_sizes,
+            ask_ticks,
+            ask_sizes,
+            l2_best_bid_tick,
+            l2_best_ask_tick,
+        )
+        if activated_status != status:
+            status = activated_status
+            queue_ahead = activated_queue
+        if status == 2:
+            return 0, -1, -1, 0
+
+        code = int(event_type_code[event_idx])
+        if code == EVENT_TYPE_CODE_TRADE:
+            trade_ptr = int(event_trade_ptr[event_idx])
+            if status == 1 and trade_ptr >= 0:
+                aggressor_side = int(trade_side_code[trade_ptr])
+                amount = float(trade_amount[trade_ptr])
+                if aggressor_side != 0 and amount > 0.0:
+                    relevant = (side_code > 0 and aggressor_side < 0) or (side_code < 0 and aggressor_side > 0)
+                    if relevant:
+                        t_price = int(trade_price_tick[trade_ptr])
+                        if side_code > 0:
+                            if t_price < price_tick:
+                                return 1, ev_ts, int(ev_ts - decision_ts), 1
+                            at_level = t_price == price_tick
+                        else:
+                            if t_price > price_tick:
+                                return 1, ev_ts, int(ev_ts - decision_ts), 1
+                            at_level = t_price == price_tick
+                        if at_level and trade_at_level_weight > 0.0:
+                            effective_qty = amount * trade_at_level_weight
+                            queue_consumed = queue_ahead if queue_ahead < effective_qty else effective_qty
+                            queue_ahead = queue_ahead - effective_qty
+                            if queue_ahead < 0.0:
+                                queue_ahead = 0.0
+                            leftover = effective_qty - queue_consumed
+                            if leftover > qty_epsilon:
+                                return 1, ev_ts, int(ev_ts - decision_ts), 2
+                            if dedupe_l2_decrease_with_trade_prints != 0 and queue_consumed > qty_epsilon:
+                                recent_trade_depletion_qty += queue_consumed
+        elif code == EVENT_TYPE_CODE_L2_BATCH:
+            curr_book_ptr = int(event_book_ptr[event_idx])
+            if curr_book_ptr >= 0:
+                if status == 1:
+                    prev_qty, prev_known = _level_qty_known_from_book_arrays_impl(
+                        bid_ticks,
+                        bid_sizes,
+                        ask_ticks,
+                        ask_sizes,
+                        current_book_ptr,
+                        side_code,
+                        price_tick,
+                    )
+                    curr_qty, curr_known = _level_qty_known_from_book_arrays_impl(
+                        bid_ticks,
+                        bid_sizes,
+                        ask_ticks,
+                        ask_sizes,
+                        curr_book_ptr,
+                        side_code,
+                        price_tick,
+                    )
+                    if prev_known != 0 and curr_known != 0:
+                        raw_decrease = prev_qty - curr_qty
+                        if raw_decrease < 0.0:
+                            raw_decrease = 0.0
+                        if dedupe_l2_decrease_with_trade_prints != 0:
+                            deduped = raw_decrease if raw_decrease < recent_trade_depletion_qty else recent_trade_depletion_qty
+                            l2_decrease_qty = raw_decrease - deduped
+                            recent_trade_depletion_qty = recent_trade_depletion_qty - deduped
+                            if recent_trade_depletion_qty < 0.0:
+                                recent_trade_depletion_qty = 0.0
+                        else:
+                            l2_decrease_qty = raw_decrease
+                        effective_qty = l2_decrease_qty * l2_decrease_weight
+                        if effective_qty > 0.0:
+                            queue_consumed = queue_ahead if queue_ahead < effective_qty else effective_qty
+                            queue_ahead = queue_ahead - effective_qty
+                            if queue_ahead < 0.0:
+                                queue_ahead = 0.0
+                            leftover = effective_qty - queue_consumed
+                            if leftover > qty_epsilon:
+                                return 1, ev_ts, int(ev_ts - decision_ts), 3
+                current_book_ptr = curr_book_ptr
+
+        activated_status, activated_queue = _activate_balanced_order_impl(
+            status,
+            effective_ts,
+            effective_seq,
+            ev_ts,
+            ev_seq,
+            current_book_ptr,
+            side_code,
+            price_tick,
+            post_only_gap_ticks,
+            unknown_queue,
+            bid_ticks,
+            bid_sizes,
+            ask_ticks,
+            ask_sizes,
+            l2_best_bid_tick,
+            l2_best_ask_tick,
+        )
+        if activated_status != status:
+            status = activated_status
+            queue_ahead = activated_queue
+        if status == 2:
+            return 0, -1, -1, 0
+    return 0, -1, -1, 0
+
+
+@_maybe_njit
+def _balanced_labels_kernel_impl(
+    labels: np.ndarray,
+    masks: np.ndarray,
+    keep_rows: np.ndarray,
+    decision_local_ts_us: np.ndarray,
+    decision_event_index: np.ndarray,
+    decision_event_seq: np.ndarray,
+    latest_book_ptr: np.ndarray,
+    event_local_ts: np.ndarray,
+    event_seq: np.ndarray,
+    event_type_code: np.ndarray,
+    event_book_ptr: np.ndarray,
+    event_trade_ptr: np.ndarray,
+    bid_ticks: np.ndarray,
+    bid_sizes: np.ndarray,
+    ask_ticks: np.ndarray,
+    ask_sizes: np.ndarray,
+    l2_best_bid_tick: np.ndarray,
+    l2_best_ask_tick: np.ndarray,
+    trade_side_code: np.ndarray,
+    trade_price_tick: np.ndarray,
+    trade_amount: np.ndarray,
+    valid_l2_local_ts: np.ndarray,
+    valid_l2_event_seq: np.ndarray,
+    valid_l2_mid_tick: np.ndarray,
+    candidate_modes: np.ndarray,
+    candidate_offsets: np.ndarray,
+    fill_horizon_us: int,
+    adverse_horizon_us: int,
+    last_event_local_ts_us: int,
+    drop_incomplete_horizon: int,
+    post_only_gap_ticks: int,
+    delay_us: int,
+    trade_at_level_weight: float,
+    l2_decrease_weight: float,
+    unknown_queue: float,
+    qty_epsilon: float,
+    toxic_threshold_bps: float,
+    order_qty: float,
+    tick_size: float,
+    contract_size: float,
+    min_notional: float,
+    dedupe_l2_decrease_with_trade_prints: int,
+) -> None:
+    row_count = decision_local_ts_us.shape[0]
+    candidate_count = candidate_modes.shape[0]
+    max_event_seq = int(MAX_EVENT_SEQ)
+    for row in range(row_count):
+        decision_ts = int(decision_local_ts_us[row])
+        fill_deadline_ts = decision_ts + fill_horizon_us
+        if drop_incomplete_horizon != 0 and fill_deadline_ts > last_event_local_ts_us:
+            continue
+        end_event_index = _upper_bound_int64(event_local_ts, fill_deadline_ts)
+        book_ptr = int(latest_book_ptr[row])
+        best_bid = int(l2_best_bid_tick[book_ptr])
+        best_ask = int(l2_best_ask_tick[book_ptr])
+        dropped = False
+        for candidate_index in range(candidate_count):
+            mode = int(candidate_modes[candidate_index])
+            offset = int(candidate_offsets[candidate_index])
+            base = candidate_index * 10
+            for side_slot in range(2):
+                side_code = 1 if side_slot == 0 else -1
+                if mode == 0:
+                    price_tick = best_bid if side_code > 0 else best_ask
+                elif mode == 1:
+                    if side_code > 0:
+                        price_tick = best_bid + offset
+                        if price_tick > best_ask - post_only_gap_ticks:
+                            continue
+                    else:
+                        price_tick = best_ask - offset
+                        if price_tick < best_bid + post_only_gap_ticks:
+                            continue
+                else:
+                    if side_code > 0:
+                        price_tick = best_bid - offset
+                        if price_tick <= 0:
+                            continue
+                    else:
+                        price_tick = best_ask + offset
+                if price_tick <= 0:
+                    continue
+                if min_notional > 0.0 and order_qty * float(price_tick) * tick_size * contract_size < min_notional:
+                    continue
+
+                filled_idx = base + side_slot
+                latency_idx = base + 2 + side_slot
+                adverse_idx = base + 4 + side_slot
+                toxic_idx = base + 6 + side_slot
+                cost_idx = base + 8 + side_slot
+                filled, fill_ts, latency, _reason = _balanced_fill_one_side_impl(
+                    event_local_ts,
+                    event_seq,
+                    event_type_code,
+                    event_book_ptr,
+                    event_trade_ptr,
+                    bid_ticks,
+                    bid_sizes,
+                    ask_ticks,
+                    ask_sizes,
+                    l2_best_bid_tick,
+                    l2_best_ask_tick,
+                    trade_side_code,
+                    trade_price_tick,
+                    trade_amount,
+                    int(decision_event_index[row]),
+                    book_ptr,
+                    decision_ts,
+                    int(decision_event_seq[row]),
+                    side_code,
+                    price_tick,
+                    end_event_index,
+                    delay_us,
+                    post_only_gap_ticks,
+                    trade_at_level_weight,
+                    l2_decrease_weight,
+                    unknown_queue,
+                    qty_epsilon,
+                    order_qty,
+                    dedupe_l2_decrease_with_trade_prints,
+                )
+                if fill_deadline_ts <= last_event_local_ts_us:
+                    labels[row, filled_idx] = 1.0 if filled != 0 else 0.0
+                    masks[row, filled_idx] = True
+                if filled == 0:
+                    if masks[row, filled_idx]:
+                        labels[row, cost_idx] = 0.0
+                        masks[row, cost_idx] = True
+                    continue
+                labels[row, latency_idx] = float(latency)
+                masks[row, latency_idx] = True
+
+                future_mid = _future_mid_at_or_after_impl(
+                    valid_l2_local_ts,
+                    valid_l2_event_seq,
+                    valid_l2_mid_tick,
+                    fill_ts + adverse_horizon_us,
+                    max_event_seq,
+                )
+                if math.isnan(future_mid):
+                    if drop_incomplete_horizon != 0:
+                        dropped = True
+                        break
+                    continue
+                if side_code > 0:
+                    adverse_bps = max(0.0, float(price_tick) - future_mid) / float(price_tick) * 10000.0
+                else:
+                    adverse_bps = max(0.0, future_mid - float(price_tick)) / float(price_tick) * 10000.0
+                labels[row, adverse_idx] = adverse_bps
+                labels[row, toxic_idx] = 1.0 if adverse_bps > toxic_threshold_bps else 0.0
+                labels[row, cost_idx] = adverse_bps
+                masks[row, adverse_idx] = True
+                masks[row, toxic_idx] = True
+                masks[row, cost_idx] = True
+            if dropped:
+                break
+        if not dropped:
+            keep_rows[row] = True
+
+
 def _counterfactual_fill_one_side(
     tape: ExecutionTape,
     *,
@@ -1934,7 +2479,7 @@ def _labels_for_decision_batch_conservative(
     label_engine: str = _LABEL_ENGINE_AUTO,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     backend = _resolve_conservative_label_backend(label_engine, invalid_quote_policy=config.quote.invalid_quote_policy)
-    if backend == _LABEL_ENGINE_SCALAR:
+    if backend == _BACKEND_CONSERVATIVE_SCALAR:
         labels, masks, keep_rows = _labels_for_decision_batch_scalar(
             tape,
             config=config,
@@ -1994,6 +2539,88 @@ def _labels_for_decision_batch_conservative(
         spec.tick_size,
         spec.contract_size,
         spec.min_notional,
+    )
+    return labels, masks, keep_rows, backend
+
+
+def _labels_for_decision_batch_balanced(
+    tape: ExecutionTape,
+    *,
+    config: AdverseSelectionConfig,
+    layout: _AdverseLabelLayout,
+    last_event_local_ts_us: int,
+    events_local_ts_us: np.ndarray,
+    decision_event_index: np.ndarray,
+    latest_book_ptr: np.ndarray,
+    decision_local_ts_us: np.ndarray,
+    decision_event_seq: np.ndarray,
+    future_mid_lookup: FutureMidLookup,
+    fill_index: _BalancedFillIndex,
+    label_engine: str = _LABEL_ENGINE_AUTO,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    backend = _resolve_balanced_label_backend(label_engine, invalid_quote_policy=config.quote.invalid_quote_policy)
+    if backend == _BACKEND_BALANCED_SCALAR:
+        labels, masks, keep_rows = _labels_for_decision_batch_scalar(
+            tape,
+            config=config,
+            layout=layout,
+            last_event_local_ts_us=last_event_local_ts_us,
+            events_local_ts_us=events_local_ts_us,
+            decision_event_index=decision_event_index,
+            latest_book_ptr=latest_book_ptr,
+            decision_local_ts_us=decision_local_ts_us,
+            decision_event_seq=decision_event_seq,
+            future_mid_lookup=future_mid_lookup,
+            fill_index=None,
+        )
+        return labels, masks, keep_rows, backend
+
+    labels, masks, keep_rows = _empty_label_batch(int(decision_local_ts_us.shape[0]), layout.label_count)
+    candidate_modes, candidate_offsets = _candidate_kernel_arrays(config)
+    spec = tape.manifest.symbol_spec
+    _balanced_labels_kernel_impl(
+        labels,
+        masks,
+        keep_rows,
+        np.ascontiguousarray(decision_local_ts_us, dtype=np.int64),
+        np.ascontiguousarray(decision_event_index, dtype=np.int64),
+        np.ascontiguousarray(decision_event_seq, dtype=np.int64),
+        np.ascontiguousarray(latest_book_ptr, dtype=np.int64),
+        fill_index.event_local_ts,
+        fill_index.event_seq,
+        fill_index.event_type_code,
+        fill_index.event_book_ptr,
+        fill_index.event_trade_ptr,
+        tape.arrays.book_bid_ticks,
+        tape.arrays.book_bid_sizes,
+        tape.arrays.book_ask_ticks,
+        tape.arrays.book_ask_sizes,
+        fill_index.l2_best_bid_tick,
+        fill_index.l2_best_ask_tick,
+        fill_index.trade_side_code,
+        fill_index.trade_price_tick,
+        fill_index.trade_amount,
+        future_mid_lookup.local_ts_us,  # type: ignore[attr-defined]
+        future_mid_lookup.event_seq,  # type: ignore[attr-defined]
+        future_mid_lookup.mid_tick,  # type: ignore[attr-defined]
+        candidate_modes,
+        candidate_offsets,
+        config.quote.fill_horizon_us,
+        config.quote.adverse_horizon_us,
+        int(last_event_local_ts_us),
+        1 if config.drop_incomplete_horizon else 0,
+        config.quote.post_only_gap_ticks,
+        config.quote.latency_config.order_activation_delay_us,
+        config.quote.queue_model.trade_at_level_weight,
+        config.quote.queue_model.l2_decrease_weight,
+        config.quote.queue_model.unknown_level_queue_ahead_qty,
+        config.quote.queue_model.qty_epsilon,
+        config.quote.toxic_threshold_bps,
+        config.quote.order_qty,
+        spec.tick_size,
+        spec.contract_size,
+        spec.min_notional,
+        1 if config.quote.queue_model.dedupe_l2_decrease_with_trade_prints else 0,
     )
     return labels, masks, keep_rows, backend
 
@@ -2217,7 +2844,31 @@ def _adverse_config_summary(config: AdverseSelectionConfig) -> dict[str, object]
         "trade_at_level_weight": config.quote.queue_model.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.quote.queue_model.unknown_level_queue_ahead_qty,
         "dedupe_l2_decrease_with_trade_prints": config.quote.queue_model.dedupe_l2_decrease_with_trade_prints,
+        "qty_epsilon": config.quote.queue_model.qty_epsilon,
     }
+
+
+def adverse_label_config_from_config(config: AdverseSelectionConfig) -> dict[str, object]:
+    if not isinstance(config, AdverseSelectionConfig):
+        raise ValueError("config must be AdverseSelectionConfig")
+    return {
+        "queue_mode": config.quote.queue_model.mode.value,
+        "l2_decrease_weight": config.quote.queue_model.l2_decrease_weight,
+        "trade_at_level_weight": config.quote.queue_model.trade_at_level_weight,
+        "dedupe_l2_decrease_with_trade_prints": config.quote.queue_model.dedupe_l2_decrease_with_trade_prints,
+        "unknown_level_queue_ahead_qty": config.quote.queue_model.unknown_level_queue_ahead_qty,
+        "qty_epsilon": config.quote.queue_model.qty_epsilon,
+        "order_entry_latency_us": config.quote.latency_config.order_entry_latency_us,
+        "decision_compute_latency_us": config.quote.latency_config.decision_compute_latency_us,
+        "post_only_gap_ticks": config.quote.post_only_gap_ticks,
+        "order_qty": config.quote.order_qty,
+        "fill_horizon_us": config.quote.fill_horizon_us,
+        "adverse_horizon_us": config.quote.adverse_horizon_us,
+    }
+
+
+def adverse_label_config_from_training_summary(payload: Mapping[str, object]) -> dict[str, object]:
+    return adverse_label_config_from_config(adverse_selection_config_from_training_summary(payload))
 
 
 def build_adverse_selection_dataset_to_disk(
@@ -2320,18 +2971,28 @@ def build_adverse_selection_dataset_to_disk(
     ))
 
     fill_index_start = time.perf_counter()
-    fill_index = (
-        _build_conservative_fill_index(tape)
-        if config.quote.queue_model.mode == QueueModelMode.CONSERVATIVE
-        else None
-    )
-    backend_used = "balanced_scalar"
-    if fill_index is not None:
+    conservative_fill_index: _ConservativeFillIndex | None = None
+    balanced_fill_index: _BalancedFillIndex | None = None
+    if config.quote.queue_model.mode == QueueModelMode.CONSERVATIVE:
+        conservative_fill_index = _build_conservative_fill_index(tape)
         backend_used = _resolve_conservative_label_backend(label_engine, invalid_quote_policy=config.quote.invalid_quote_policy)
         _log_stage(
             "adverse_dataset stage=conservative_fill_index_ready "
             f"seconds={time.perf_counter() - fill_index_start:.3f} backend={backend_used}"
         )
+    else:
+        backend_used = _resolve_balanced_label_backend(label_engine, invalid_quote_policy=config.quote.invalid_quote_policy)
+        if backend_used == _BACKEND_BALANCED_NUMBA:
+            balanced_fill_index = _build_balanced_fill_index(tape)
+            _log_stage(
+                "adverse_dataset stage=balanced_fill_index_ready "
+                f"seconds={time.perf_counter() - fill_index_start:.3f} backend={backend_used}"
+            )
+        else:
+            _log_stage(
+                "adverse_dataset stage=balanced_fill_index_skipped "
+                f"seconds=0.000 backend={backend_used}"
+            )
     events = tape.arrays.events
     events_local_ts_us = events["local_ts_us"]
     last_ts = int(events_local_ts_us[-1])
@@ -2371,7 +3032,7 @@ def build_adverse_selection_dataset_to_disk(
         nonlocal batch_used, emitted, backend_used
         if batch_used == 0:
             return
-        if fill_index is not None:
+        if conservative_fill_index is not None:
             labels, masks, keep_rows, backend = _labels_for_decision_batch_conservative(
                 tape,
                 config=config,
@@ -2383,7 +3044,23 @@ def build_adverse_selection_dataset_to_disk(
                 decision_local_ts_us=batch_ts[:batch_used],
                 decision_event_seq=batch_event_seq[:batch_used],
                 future_mid_lookup=index.valid_l2,
-                fill_index=fill_index,
+                fill_index=conservative_fill_index,
+                label_engine=label_engine,
+            )
+            backend_used = backend
+        elif balanced_fill_index is not None:
+            labels, masks, keep_rows, backend = _labels_for_decision_batch_balanced(
+                tape,
+                config=config,
+                layout=layout,
+                last_event_local_ts_us=last_ts,
+                events_local_ts_us=events_local_ts_us,
+                decision_event_index=batch_event_index[:batch_used],
+                latest_book_ptr=batch_book_ptr[:batch_used],
+                decision_local_ts_us=batch_ts[:batch_used],
+                decision_event_seq=batch_event_seq[:batch_used],
+                future_mid_lookup=index.valid_l2,
+                fill_index=balanced_fill_index,
                 label_engine=label_engine,
             )
             backend_used = backend
@@ -2401,7 +3078,7 @@ def build_adverse_selection_dataset_to_disk(
                 future_mid_lookup=index.valid_l2,
                 fill_index=None,
             )
-            backend_used = "balanced_scalar"
+            backend_used = _BACKEND_BALANCED_SCALAR
         kept = int(np.count_nonzero(keep_rows))
         _log_stage(f"adverse_dataset stage=batch_flush rows_considered={batch_used} rows_written={kept} backend={backend_used}")
         if kept == 0:
@@ -2500,15 +3177,24 @@ def profile_adverse_selection_label_generation(
     if index.valid_l2.count == 0:
         raise ValueError("tape must contain at least one valid two-sided L2 book")
 
-    fill_index = None
+    conservative_fill_index: _ConservativeFillIndex | None = None
+    balanced_fill_index: _BalancedFillIndex | None = None
     fill_index_seconds = 0.0
-    backend_used = "balanced_scalar"
     if config.quote.queue_model.mode == QueueModelMode.CONSERVATIVE:
         fill_start = time.perf_counter()
-        fill_index = _build_conservative_fill_index(tape)
+        conservative_fill_index = _build_conservative_fill_index(tape)
         fill_index_seconds = time.perf_counter() - fill_start
         backend_used = _resolve_conservative_label_backend(label_engine, invalid_quote_policy=config.quote.invalid_quote_policy)
         _log_stage(f"adverse_dataset_profile stage=conservative_fill_index_ready seconds={fill_index_seconds:.3f} backend={backend_used}")
+    else:
+        backend_used = _resolve_balanced_label_backend(label_engine, invalid_quote_policy=config.quote.invalid_quote_policy)
+        if backend_used == _BACKEND_BALANCED_NUMBA:
+            fill_start = time.perf_counter()
+            balanced_fill_index = _build_balanced_fill_index(tape)
+            fill_index_seconds = time.perf_counter() - fill_start
+            _log_stage(f"adverse_dataset_profile stage=balanced_fill_index_ready seconds={fill_index_seconds:.3f} backend={backend_used}")
+        else:
+            _log_stage(f"adverse_dataset_profile stage=balanced_fill_index_skipped seconds=0.000 backend={backend_used}")
 
     layout = _AdverseLabelLayout.from_config(config)
     events = tape.arrays.events
@@ -2526,6 +3212,7 @@ def profile_adverse_selection_label_generation(
     emitted = 0
     label_seconds = 0.0
     compile_seconds = 0.0
+    warmed_label_rows = 0
     first_batch = True
     label_start = time.perf_counter()
     last_progress_considered = 0
@@ -2547,11 +3234,12 @@ def profile_adverse_selection_label_generation(
         last_progress_considered = considered
 
     def process_batch() -> None:
-        nonlocal batch_used, emitted, label_seconds, compile_seconds, first_batch, backend_used
+        nonlocal batch_used, emitted, label_seconds, compile_seconds, warmed_label_rows, first_batch, backend_used
         if batch_used == 0:
             return
+        rows_in_batch = batch_used
         start = time.perf_counter()
-        if fill_index is not None:
+        if conservative_fill_index is not None:
             _, _, keep_rows, backend = _labels_for_decision_batch_conservative(
                 tape,
                 config=config,
@@ -2563,7 +3251,23 @@ def profile_adverse_selection_label_generation(
                 decision_local_ts_us=batch_ts[:batch_used],
                 decision_event_seq=batch_event_seq[:batch_used],
                 future_mid_lookup=index.valid_l2,
-                fill_index=fill_index,
+                fill_index=conservative_fill_index,
+                label_engine=label_engine,
+            )
+            backend_used = backend
+        elif balanced_fill_index is not None:
+            _, _, keep_rows, backend = _labels_for_decision_batch_balanced(
+                tape,
+                config=config,
+                layout=layout,
+                last_event_local_ts_us=last_ts,
+                events_local_ts_us=events_local_ts_us,
+                decision_event_index=batch_event_index[:batch_used],
+                latest_book_ptr=batch_book_ptr[:batch_used],
+                decision_local_ts_us=batch_ts[:batch_used],
+                decision_event_seq=batch_event_seq[:batch_used],
+                future_mid_lookup=index.valid_l2,
+                fill_index=balanced_fill_index,
                 label_engine=label_engine,
             )
             backend_used = backend
@@ -2581,12 +3285,13 @@ def profile_adverse_selection_label_generation(
                 future_mid_lookup=index.valid_l2,
                 fill_index=None,
             )
-            backend_used = "balanced_scalar"
+            backend_used = _BACKEND_BALANCED_SCALAR
         elapsed = time.perf_counter() - start
-        if first_batch and backend_used == _LABEL_ENGINE_NUMBA:
+        if first_batch and _backend_is_numba(backend_used):
             compile_seconds = elapsed
         else:
             label_seconds += elapsed
+            warmed_label_rows += rows_in_batch
         first_batch = False
         emitted += int(np.count_nonzero(keep_rows))
         batch_used = 0
@@ -2613,15 +3318,39 @@ def profile_adverse_selection_label_generation(
     log_progress(force=True)
     total_seconds = time.perf_counter() - total_start
     label_wall_seconds = max(time.perf_counter() - label_start, _EPS)
+    label_loop_rows_per_second = considered / label_wall_seconds
+    warmed_label_rows_per_second = (
+        warmed_label_rows / label_seconds if warmed_label_rows > 0 and label_seconds > 0.0 else None
+    )
+    candidate_count = len(config.quote.quote_candidates) * 2
+    production_note = None
+    if config.quote.queue_model.mode == QueueModelMode.BALANCED and backend_used == _BACKEND_BALANCED_SCALAR:
+        production_note = "balanced_scalar is a fallback backend; use balanced_numba before full grid production"
+    estimated_33m_label_loop_seconds = (
+        33_000_000.0 / label_loop_rows_per_second if label_loop_rows_per_second > 0.0 else math.inf
+    )
     return {
         "status": "ok",
         "run_type": "profile_adverse_selection_label_generation",
+        "queue_mode": config.quote.queue_model.mode.value,
         "decision_grid_rows_requested": int(profile_rows),
         "decision_grid_rows_considered": int(considered),
         "rows_kept": int(emitted),
         "rows_dropped": int(considered - emitted),
+        "candidate_count": int(candidate_count),
+        "chunk_rows": int(chunk_rows),
         "label_engine": label_engine,
         "backend": backend_used,
+        "label_loop_rows_per_sec": label_loop_rows_per_second,
+        "rows_per_sec": label_loop_rows_per_second,
+        "warmed_label_rows_per_sec": warmed_label_rows_per_second,
+        "label_seconds": label_seconds,
+        "compile_seconds": compile_seconds,
+        "index_seconds": index_seconds,
+        "fill_index_seconds": fill_index_seconds,
+        "estimated_33m_label_loop_seconds": estimated_33m_label_loop_seconds,
+        "estimated_33m_label_seconds": estimated_33m_label_loop_seconds,
+        "production_note": production_note,
         "timing": {
             "total_seconds": total_seconds,
             "index_seconds": index_seconds,
@@ -2629,7 +3358,10 @@ def profile_adverse_selection_label_generation(
             "compile_seconds": compile_seconds,
             "label_seconds": label_seconds,
             "label_wall_seconds": label_wall_seconds,
-            "rows_per_second": considered / label_wall_seconds,
+            "label_loop_rows_per_second": label_loop_rows_per_second,
+            "rows_per_second": label_loop_rows_per_second,
+            "warmed_label_rows_per_second": warmed_label_rows_per_second,
+            "warmed_label_rows": int(warmed_label_rows),
         },
     }
 

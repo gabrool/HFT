@@ -23,11 +23,18 @@ from mmrt.execution.adverse_selection import (
     VPINConfig,
     VPINState,
     _AdverseLabelLayout,
+    _BALANCED_NUMBA_AVAILABLE,
     _CONSERVATIVE_NUMBA_AVAILABLE,
+    _build_balanced_fill_index,
     _build_conservative_fill_index,
+    _adverse_config_summary,
     _labels_for_decision,
+    _labels_for_decision_batch_balanced,
     _labels_for_decision_batch_conservative,
+    adverse_label_config_from_training_summary,
+    adverse_selection_config_from_training_summary,
     build_adverse_selection_dataset_to_disk,
+    profile_adverse_selection_label_generation,
     summarize_adverse_selection_dataset,
 )
 from mmrt.cli.train_adverse_selection import (
@@ -44,16 +51,16 @@ from tests.adverse_helpers import build_tiny_adverse_selection_dataset
 
 
 
-def _rules():
+def _rules(*, min_notional: Decimal = Decimal("0")):
     return ExchangeSymbolRules(
         exchange="binance-futures", symbol="BTCUSDT", mode=SymbolRuleMode.CURRENT_RULES_REPLAY,
         base_asset="BTC", quote_asset="USDT", margin_asset="USDT", contract_type="PERPETUAL", status="TRADING",
         tick_size=Decimal("0.1"), min_price=Decimal("0.1"), max_price=Decimal("1000000"),
-        step_size=Decimal("0.001"), min_qty=Decimal("0.001"), max_qty=Decimal("100"), min_notional=Decimal("0"),
+        step_size=Decimal("0.001"), min_qty=Decimal("0.001"), max_qty=Decimal("100"), min_notional=min_notional,
         allowed_order_types=("LIMIT",), allowed_time_in_force=("GTC", "GTX"),
     )
 
-def _spec() -> SymbolSpec:
+def _spec(*, min_notional: float = 0.0) -> SymbolSpec:
     return SymbolSpec(
         exchange="binance-futures",
         symbol="BTCUSDT",
@@ -61,7 +68,7 @@ def _spec() -> SymbolSpec:
         step_size=0.001,
         min_qty=0.001,
         max_qty=100.0,
-        min_notional=0.0,
+        min_notional=min_notional,
     )
 
 
@@ -118,11 +125,11 @@ def _trade(
     )
 
 
-def _tape(l2_events, trades):
+def _tape(l2_events, trades, *, min_notional: float = 0.0):
     merged = merge_execution_events(l2_events, trades).events
     return build_execution_tape(
-        symbol_spec=_spec(),
-        symbol_rules=_rules(),
+        symbol_spec=_spec(min_notional=min_notional),
+        symbol_rules=_rules(min_notional=Decimal(str(min_notional))),
         l2_events=tuple(l2_events),
         trades=tuple(trades),
         merged_events=merged,
@@ -439,11 +446,25 @@ def test_train_adverse_selection_profile_rows_writes_profile_only(tmp_path):
 
     assert summary["run_type"] == "profile_adverse_selection_label_generation"
     assert summary["decision_grid_rows_considered"] == 3
+    assert summary["label_loop_rows_per_sec"] == summary["rows_per_sec"]
+    assert summary["estimated_33m_label_loop_seconds"] == summary["estimated_33m_label_seconds"]
     assert summary["timing"]["rows_per_second"] > 0.0
+    assert summary["timing"]["label_loop_rows_per_second"] == summary["rows_per_sec"]
     assert profile_json.exists()
     assert json.loads(profile_json.read_text()) == summary
     assert not output_json.exists()
     assert not model_npz.exists()
+
+
+def test_old_training_summary_defaults_qty_epsilon():
+    payload = _adverse_config_summary(_base_config())
+    assert payload["qty_epsilon"] == pytest.approx(1e-12)
+    old_payload = dict(payload)
+    old_payload.pop("qty_epsilon")
+    config = adverse_selection_config_from_training_summary(old_payload)
+    assert config.quote.queue_model.qty_epsilon == pytest.approx(1e-12)
+    label_config = adverse_label_config_from_training_summary(old_payload)
+    assert label_config["qty_epsilon"] == pytest.approx(1e-12)
 
 
 def test_train_adverse_selection_requires_split_source_for_training(tmp_path):
@@ -800,7 +821,7 @@ def test_conservative_batch_labels_match_scalar_reference(tmp_path):
         fill_index=fill_index,
         label_engine="scalar",
     )
-    assert backend == "scalar"
+    assert backend == "conservative_scalar"
     np.testing.assert_array_equal(keep_rows, np.asarray(scalar_keep, dtype=np.bool_))
     np.testing.assert_allclose(labels, np.asarray(scalar_labels, dtype=np.float32), equal_nan=True)
     np.testing.assert_array_equal(masks, np.asarray(scalar_masks, dtype=np.bool_))
@@ -836,10 +857,262 @@ def test_conservative_numba_backend_matches_or_errors_clearly(tmp_path):
         return
     scalar = _labels_for_decision_batch_conservative(**kwargs, label_engine="scalar")
     accelerated = _labels_for_decision_batch_conservative(**kwargs, label_engine="numba")
-    assert accelerated[3] == "numba"
+    assert accelerated[3] == "conservative_numba"
     np.testing.assert_allclose(accelerated[0], scalar[0], equal_nan=True)
     np.testing.assert_array_equal(accelerated[1], scalar[1])
     np.testing.assert_array_equal(accelerated[2], scalar[2])
+
+
+def _balanced_index(tmp_path, tape, config, name: str):
+    from mmrt.execution.adverse_selection_index import AdverseSelectionIndexConfig, build_or_load_adverse_selection_index
+
+    return build_or_load_adverse_selection_index(
+        tape,
+        config=AdverseSelectionIndexConfig(
+            output_root=str(tmp_path / name),
+            kyle=config.kyle,
+            use_notional_flow=config.kyle.use_notional_flow,
+            tick_size=tape.manifest.symbol_spec.tick_size,
+            chunk_rows=4096,
+            overwrite=True,
+        ),
+    )
+
+
+def _balanced_config(
+    *,
+    trade_at_level_weight: float = 1.0,
+    l2_decrease_weight: float = 1.0,
+    dedupe_l2_decrease_with_trade_prints: bool = True,
+    order_entry_latency_us: int = 40,
+    unknown_level_queue_ahead_qty: float = 1_000_000_000.0,
+    order_qty: float = 1.0,
+    fill_horizon_us: int = 300,
+    adverse_horizon_us: int = 100,
+    max_decisions: int = 4,
+) -> AdverseSelectionConfig:
+    return _base_config(
+        quote=CounterfactualQuoteConfig(
+            quote_candidates=DEFAULT_QUOTE_CANDIDATES,
+            order_qty=order_qty,
+            fill_horizon_us=fill_horizon_us,
+            adverse_horizon_us=adverse_horizon_us,
+            toxic_threshold_bps=0.1,
+            queue_model=QueueModelConfig(
+                mode=QueueModelMode.BALANCED,
+                l2_decrease_weight=l2_decrease_weight,
+                trade_at_level_weight=trade_at_level_weight,
+                unknown_level_queue_ahead_qty=unknown_level_queue_ahead_qty,
+                dedupe_l2_decrease_with_trade_prints=dedupe_l2_decrease_with_trade_prints,
+            ),
+            latency_config=LatencyConfig(decision_compute_latency_us=0, order_entry_latency_us=order_entry_latency_us),
+        ),
+        max_decisions=max_decisions,
+    )
+
+
+def _balanced_label_parity_fixture(
+    tmp_path,
+    *,
+    trade_at_level_weight: float = 1.0,
+    l2_decrease_weight: float = 1.0,
+    dedupe_l2_decrease_with_trade_prints: bool = True,
+    order_entry_latency_us: int = 40,
+):
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100, bid_ticks=(1001, 1000), ask_ticks=(1003, 1004), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=1, local_ts_us=160, bid_ticks=(1001, 1000), ask_ticks=(1003, 1004), bid_sizes=(0.5, 2.0), ask_sizes=(0.6, 2.0)),
+            _l2(seq=2, local_ts_us=400, bid_ticks=(1000, 999), ask_ticks=(1002, 1003), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=3, local_ts_us=800, bid_ticks=(999, 998), ask_ticks=(1001, 1002), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+        ],
+        [
+            _trade(local_ts_us=150, side=AggressorSide.SELL, price_tick=1001, amount=0.5, source_row=0),
+            _trade(local_ts_us=152, side=AggressorSide.BUY, price_tick=1003, amount=0.4, source_row=1),
+            _trade(local_ts_us=170, side=AggressorSide.SELL, price_tick=1001, amount=1.0, source_row=2),
+            _trade(local_ts_us=172, side=AggressorSide.BUY, price_tick=1003, amount=1.0, source_row=3),
+        ],
+    )
+    config = _base_config(
+        quote=_balanced_config(
+            trade_at_level_weight=trade_at_level_weight,
+            l2_decrease_weight=l2_decrease_weight,
+            dedupe_l2_decrease_with_trade_prints=dedupe_l2_decrease_with_trade_prints,
+            order_entry_latency_us=order_entry_latency_us,
+        ).quote,
+        max_decisions=4,
+    )
+    grid = decision_grid_for_tape(tape, max_rows=4)
+    index = _balanced_index(tmp_path, tape, config, "balanced_idx")
+    return tape, config, grid, index
+
+
+def _balanced_post_only_move_fixture(tmp_path):
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100, bid_ticks=(1001, 1000), ask_ticks=(1003, 1004), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=1, local_ts_us=150, bid_ticks=(999, 998), ask_ticks=(1001, 1002), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+            _l2(seq=2, local_ts_us=500, bid_ticks=(999, 998), ask_ticks=(1001, 1002), bid_sizes=(1.0, 2.0), ask_sizes=(1.0, 2.0)),
+        ],
+        [_trade(local_ts_us=250, side=AggressorSide.SELL, price_tick=1001, amount=5.0, source_row=0)],
+    )
+    config = _balanced_config(order_entry_latency_us=100, fill_horizon_us=300, adverse_horizon_us=100, max_decisions=2)
+    grid = decision_grid_for_tape(tape, max_rows=2)
+    index = _balanced_index(tmp_path, tape, config, "balanced_post_only_idx")
+    return tape, config, grid, index
+
+
+def _balanced_unknown_depth_fixture(tmp_path):
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100, bid_ticks=(1001,), ask_ticks=(1003,), bid_sizes=(1.0,), ask_sizes=(1.0,)),
+            _l2(seq=1, local_ts_us=500, bid_ticks=(1001,), ask_ticks=(1003,), bid_sizes=(1.0,), ask_sizes=(1.0,)),
+        ],
+        [
+            _trade(local_ts_us=160, side=AggressorSide.SELL, price_tick=1000, amount=1.0, source_row=0),
+            _trade(local_ts_us=170, side=AggressorSide.BUY, price_tick=1004, amount=1.0, source_row=1),
+        ],
+    )
+    config = _balanced_config(unknown_level_queue_ahead_qty=0.25, order_entry_latency_us=0, fill_horizon_us=300, adverse_horizon_us=100, max_decisions=2)
+    grid = decision_grid_for_tape(tape, max_rows=2)
+    index = _balanced_index(tmp_path, tape, config, "balanced_unknown_depth_idx")
+    return tape, config, grid, index
+
+
+def _balanced_min_notional_fixture(tmp_path):
+    tape = _tape(
+        [
+            _l2(seq=0, local_ts_us=100),
+            _l2(seq=1, local_ts_us=500),
+        ],
+        [_trade(local_ts_us=160, side=AggressorSide.SELL, price_tick=1000, amount=5.0, source_row=0)],
+        min_notional=1_000.0,
+    )
+    config = _balanced_config(order_qty=1.0, order_entry_latency_us=0, fill_horizon_us=300, adverse_horizon_us=100, max_decisions=2)
+    grid = decision_grid_for_tape(tape, max_rows=2)
+    index = _balanced_index(tmp_path, tape, config, "balanced_min_notional_idx")
+    return tape, config, grid, index
+
+
+def _assert_balanced_batch_matches_scalar(tape, config, grid, index):
+    layout = _AdverseLabelLayout.from_config(config)
+    fill_index = _build_balanced_fill_index(tape)
+    events_ts = tape.arrays.events["local_ts_us"]
+    kwargs = dict(
+        tape=tape,
+        config=config,
+        layout=layout,
+        last_event_local_ts_us=int(events_ts[-1]),
+        events_local_ts_us=events_ts,
+        decision_event_index=grid.decision_event_index,
+        latest_book_ptr=grid.book_ptr,
+        decision_local_ts_us=grid.decision_local_ts_us,
+        decision_event_seq=grid.decision_event_seq,
+        future_mid_lookup=index.valid_l2,
+        fill_index=fill_index,
+    )
+    scalar = _labels_for_decision_batch_balanced(**kwargs, label_engine="scalar")
+    assert scalar[3] == "balanced_scalar"
+    if not _BALANCED_NUMBA_AVAILABLE:
+        with pytest.raises(ValueError, match="requires numba"):
+            _labels_for_decision_batch_balanced(**kwargs, label_engine="numba")
+        return layout, scalar, None
+    accelerated = _labels_for_decision_batch_balanced(**kwargs, label_engine="numba")
+    assert accelerated[3] == "balanced_numba"
+    np.testing.assert_allclose(accelerated[0], scalar[0], equal_nan=True)
+    np.testing.assert_array_equal(accelerated[1], scalar[1])
+    np.testing.assert_array_equal(accelerated[2], scalar[2])
+    return layout, scalar, accelerated
+
+
+def test_balanced_batch_labels_match_scalar_reference(tmp_path):
+    tape, config, grid, index = _balanced_label_parity_fixture(tmp_path)
+    layout, scalar, accelerated = _assert_balanced_batch_matches_scalar(tape, config, grid, index)
+    if accelerated is None:
+        return
+    label_index = {name: i for i, name in enumerate(layout.label_names)}
+    assert accelerated[1][:, label_index["bid_touch_fill_latency_us"]].any()
+    assert accelerated[1][:, label_index["ask_touch_fill_latency_us"]].any()
+
+
+@pytest.mark.parametrize(
+    ("dedupe", "trade_weight", "l2_weight", "latency_us"),
+    [
+        (True, 0.0, 0.0, 0),
+        (False, 0.5, 0.25, 40),
+        (True, 1.0, 1.0, 0),
+        (False, 0.0, 1.0, 40),
+        (True, 0.5, 0.0, 40),
+        (False, 1.0, 0.25, 0),
+    ],
+)
+def test_balanced_batch_labels_match_scalar_reference_table(tmp_path, dedupe, trade_weight, l2_weight, latency_us):
+    tape, config, grid, index = _balanced_label_parity_fixture(
+        tmp_path,
+        dedupe_l2_decrease_with_trade_prints=dedupe,
+        trade_at_level_weight=trade_weight,
+        l2_decrease_weight=l2_weight,
+        order_entry_latency_us=latency_us,
+    )
+    layout, scalar, accelerated = _assert_balanced_batch_matches_scalar(tape, config, grid, index)
+    label_index = {name: i for i, name in enumerate(layout.label_names)}
+    assert scalar[1][:, label_index["bid_touch_filled"]].any()
+    assert scalar[1][:, label_index["ask_touch_filled"]].any()
+    assert scalar[1][:, label_index["bid_inside_1_filled"]].any()
+    assert scalar[1][:, label_index["ask_away_1_filled"]].any()
+    if accelerated is not None:
+        assert accelerated[3] == "balanced_numba"
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "fixture_factory"),
+    [
+        ("post_only_move", _balanced_post_only_move_fixture),
+        ("unknown_depth", _balanced_unknown_depth_fixture),
+        ("min_notional", _balanced_min_notional_fixture),
+    ],
+)
+def test_balanced_batch_labels_match_scalar_reference_edge_cases(tmp_path, fixture_name, fixture_factory):
+    tape, config, grid, index = fixture_factory(tmp_path)
+    layout, scalar, accelerated = _assert_balanced_batch_matches_scalar(tape, config, grid, index)
+    label_index = {name: i for i, name in enumerate(layout.label_names)}
+    if fixture_name == "post_only_move":
+        assert scalar[1][:, label_index["bid_touch_filled"]].any()
+        assert float(np.nanmax(scalar[0][:, label_index["bid_touch_filled"]])) == pytest.approx(0.0)
+    elif fixture_name == "unknown_depth":
+        assert scalar[1][:, label_index["bid_away_1_filled"]].any()
+        assert scalar[1][:, label_index["ask_away_1_filled"]].any()
+    elif fixture_name == "min_notional":
+        assert not scalar[1].any()
+    if accelerated is not None:
+        assert accelerated[3] == "balanced_numba"
+
+
+def test_balanced_backend_auto_and_profile_summary(tmp_path):
+    tape, config, grid, _index = _balanced_label_parity_fixture(tmp_path)
+    profile = profile_adverse_selection_label_generation(
+        tape,
+        config=config,
+        decision_grid=grid,
+        profile_rows=3,
+        work_dir=tmp_path,
+        chunk_rows=2,
+        overwrite=True,
+        label_engine="auto",
+    )
+    expected_backend = "balanced_numba" if _BALANCED_NUMBA_AVAILABLE else "balanced_scalar"
+    assert profile["queue_mode"] == "balanced"
+    assert profile["backend"] == expected_backend
+    assert profile["candidate_count"] == len(config.quote.quote_candidates) * 2
+    assert profile["chunk_rows"] == 2
+    assert profile["label_loop_rows_per_sec"] == profile["rows_per_sec"]
+    assert "warmed_label_rows_per_sec" in profile
+    assert profile["estimated_33m_label_loop_seconds"] == profile["estimated_33m_label_seconds"]
+    assert profile["rows_per_sec"] > 0.0
+    assert profile["label_seconds"] >= 0.0
+    assert profile["compile_seconds"] >= 0.0
+    assert profile["index_seconds"] >= 0.0
+    assert profile["fill_index_seconds"] >= 0.0
 
 
 def test_adverse_selection_schema_constant_is_direct_string():

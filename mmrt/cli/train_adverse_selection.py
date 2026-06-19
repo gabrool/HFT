@@ -24,6 +24,7 @@ from mmrt.execution.adverse_selection import (
     summarize_disk_adverse_selection_dataset,
     adverse_selection_feature_names,
     adverse_selection_label_names,
+    adverse_label_config_from_config,
 )
 from mmrt.execution.contracts import LatencyConfig, QueueModelMode
 from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
@@ -473,6 +474,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
             "output_json": None,
             "model_npz": None,
             "config": _summary_config(config),
+            "adverse_label_config": adverse_label_config_from_config(adverse_config),
             "tape": {
                 "schema": manifest.schema,
                 "exchange": manifest.exchange,
@@ -596,6 +598,7 @@ def run_adverse_selection_training(config: AdverseSelectionTrainCLIConfig) -> di
         "output_json": str(output_json),
         "model_npz": str(model_npz) if model_written else None,
         "config": _summary_config(config),
+        "adverse_label_config": adverse_label_config_from_config(adverse_config),
         "tape": {
             "schema": manifest.schema,
             "exchange": manifest.exchange,

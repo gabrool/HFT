@@ -305,6 +305,10 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
 
     metrics = acc.as_dict()
     report = diagnose_execution_metrics(metrics, config=ExecutionDiagnosticsConfig())
+    queue_metrics = metrics.get("queue", {})
+    fill_metrics = metrics.get("fills", {})
+    turnover_metrics = metrics.get("turnover", {})
+    reward_metrics = metrics.get("reward", {})
     output_path_str = str(output_path)
     summary = {
         "status": report.status,
@@ -325,6 +329,16 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
             "book_depth": tape.manifest.notes.get("book_depth") if tape.manifest.notes is not None else None,
         },
         "metrics": metrics,
+        "queue_mode_comparison": {
+            "queue_mode": config.queue_mode.value,
+            "l2_effective_decrease_qty_total": queue_metrics.get("l2_effective_decrease_qty_total"),
+            "l2_trade_dedupe_qty_total": queue_metrics.get("l2_trade_dedupe_qty_total"),
+            "queue_depletion_fill_count": queue_metrics.get("queue_depletion_fill_count"),
+            "fill_reason_counts": fill_metrics.get("reason_counts"),
+            "turnover": turnover_metrics,
+            "reward": reward_metrics,
+            "fill_rate": fill_metrics.get("fill_rate"),
+        },
         "diagnostics": report.as_dict(),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
         "decision_grid_start": decision_grid_start.as_dict(),
