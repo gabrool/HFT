@@ -14,6 +14,7 @@ import numpy as np
 
 
 MARKET_GROUP = "market"
+CONTROL_GROUP = "control"
 LINEAR_SIGNAL_GROUP = "linear_signal"
 POSITION_GROUP = "position"
 ORDERS_GROUP = "orders"
@@ -35,6 +36,30 @@ MARKET_FIELDS = (
     "ask_depth_count",
     "bid_top_size",
     "ask_top_size",
+)
+
+CONTROL_FIELDS = (
+    "depth_bid_qty_5",
+    "depth_ask_qty_5",
+    "depth_imbalance_5",
+    "flow_signed_qty_200ms",
+    "flow_abs_qty_200ms",
+    "flow_trade_count_200ms",
+    "flow_imbalance_ratio_200ms",
+    "flow_signed_qty_500ms",
+    "flow_abs_qty_500ms",
+    "flow_trade_count_500ms",
+    "flow_imbalance_ratio_500ms",
+    "flow_signed_qty_1000ms",
+    "flow_abs_qty_1000ms",
+    "flow_trade_count_1000ms",
+    "flow_imbalance_ratio_1000ms",
+    "bid_touch_depletion_ratio_1000ms",
+    "ask_touch_depletion_ratio_1000ms",
+    "bid_touch_replenishment_ratio_1000ms",
+    "ask_touch_replenishment_ratio_1000ms",
+    "recent_mid_return_bps_200ms",
+    "recent_mid_return_bps_1000ms",
 )
 
 LINEAR_SIGNAL_FIELDS = (
@@ -99,6 +124,7 @@ DEFAULT_ADVERSE_CANDIDATE_NAMES = ("touch", "inside_1", "away_1")
 
 DEFAULT_OBSERVATION_FIELDS = (
     *MARKET_FIELDS,
+    *CONTROL_FIELDS,
     *LINEAR_SIGNAL_FIELDS,
     *POSITION_FIELDS,
     *ORDERS_FIELDS,
@@ -243,6 +269,7 @@ def default_observation_schema(dtype: str = DEFAULT_OBSERVATION_DTYPE) -> Observ
 def observation_field_groups() -> dict[str, tuple[str, ...]]:
     return {
         MARKET_GROUP: MARKET_FIELDS,
+        CONTROL_GROUP: CONTROL_FIELDS,
         LINEAR_SIGNAL_GROUP: LINEAR_SIGNAL_FIELDS,
         POSITION_GROUP: POSITION_FIELDS,
         ORDERS_GROUP: ORDERS_FIELDS,
@@ -273,6 +300,7 @@ def validate_observation_vector(
 
 __all__ = [
     "MARKET_GROUP",
+    "CONTROL_GROUP",
     "LINEAR_SIGNAL_GROUP",
     "POSITION_GROUP",
     "ORDERS_GROUP",
@@ -284,6 +312,7 @@ __all__ = [
     "DEFAULT_OBSERVATION_DTYPE",
     "ALLOWED_OBSERVATION_DTYPES",
     "MARKET_FIELDS",
+    "CONTROL_FIELDS",
     "LINEAR_SIGNAL_FIELDS",
     "POSITION_FIELDS",
     "ORDERS_FIELDS",

@@ -12,6 +12,7 @@ from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.contracts import AggressorSide
 from mmrt.execution.contracts import BookLevelSnapshot, BookTop, LatencyConfig, SymbolSpec, TradePrint
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
+from mmrt.execution.obs_schema import CONTROL_FIELDS
 from mmrt.execution.event_merge import merge_execution_events
 from mmrt.metadata.symbol_rules import ExchangeSymbolRules, SymbolRuleMode
 from mmrt.execution.execution_tape import build_execution_tape, load_execution_tape, save_execution_tape
@@ -571,7 +572,7 @@ def test_evaluate_execution_policy_requires_linear_signals_file(tmp_path):
         )
 
 
-def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path):
+def test_evaluate_execution_policy_rejects_policy_state_schema_dimension_mismatch(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     checkpoint["observation_schema"] = dict(checkpoint["observation_schema"])
@@ -581,7 +582,7 @@ def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path)
     bad_checkpoint = tmp_path / "bad_checkpoint.pt"
     torch.save(checkpoint, bad_checkpoint)
 
-    with pytest.raises(ValueError, match="observation_schema"):
+    with pytest.raises(RuntimeError, match="size mismatch"):
         run_execution_policy_evaluation(
             ExecutionPolicyEvaluationCLIConfig(
                 tape_root=str(tape_root),
@@ -594,6 +595,43 @@ def test_evaluate_execution_policy_rejects_observation_schema_mismatch(tmp_path)
                 max_steps=4,
             )
         )
+
+
+def test_evaluate_execution_policy_uses_checkpoint_schema_without_control_fields(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint["observation_schema"] = dict(checkpoint["observation_schema"])
+    old_fields = [
+        name
+        for name in checkpoint["observation_schema"]["field_names"]
+        if name not in CONTROL_FIELDS
+    ]
+    checkpoint["observation_schema"]["field_names"] = old_fields
+    checkpoint.pop("observation_normalizer_state_dict", None)
+    policy = ActorCriticNetwork(
+        obs_dim=len(old_fields),
+        config=ActorCriticConfig(hidden_sizes=(8,)),
+    )
+    checkpoint["policy_state_dict"] = policy.state_dict()
+    old_checkpoint = tmp_path / "old_schema_checkpoint.pt"
+    torch.save(checkpoint, old_checkpoint)
+
+    summary = run_execution_policy_evaluation(
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            checkpoint_path=str(old_checkpoint),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
+            output_json=str(tmp_path / "old_schema_eval.json"),
+            overwrite=True,
+            max_steps=2,
+        )
+    )
+
+    assert summary["status"] in ("ok", "warning", "error")
+    assert summary["observation_schema"]["field_count"] == len(old_fields)
+    assert summary["checkpoint"]["has_observation_normalizer"] is False
 
 
 def test_evaluate_execution_policy_rejects_checkpoint_missing_linear_signal_metadata(tmp_path):

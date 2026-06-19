@@ -43,6 +43,11 @@ from mmrt.execution.fill_sim import (
     sync_orders_to_quote,
 )
 from mmrt.execution.contracts import LinearSignal
+from mmrt.execution.control_features import (
+    ControlFeatureTracker,
+    ControlFeatureTrackerConfig,
+    depth_shape_features,
+)
 from mmrt.execution.decision_grid import DecisionGrid, validate_decision_grid_for_execution_tape
 from mmrt.execution.linear_signal import (
     LinearSignalArtifact,
@@ -309,6 +314,9 @@ class ExecutionEnv:
             schema=config.observation_schema,
             config=config.observation_builder_config,
         )
+        self._control_tracker = ControlFeatureTracker(
+            ControlFeatureTrackerConfig(size_epsilon=config.observation_builder_config.size_epsilon)
+        )
         self._obs_buffer = np.zeros(config.observation_schema.dim, dtype=config.observation_schema.np_dtype)
         self._last_observation = np.zeros(config.observation_schema.dim, dtype=config.observation_schema.np_dtype)
         self._state: _EnvState | None = None
@@ -379,6 +387,8 @@ class ExecutionEnv:
         self._episode_start_local_ts_us = int(self.tape.arrays.l2_events[book_ptr]["local_ts_us"])
         self._last_step_fills = ()
         self._peak_equity = None
+        self._control_tracker.reset()
+        self._warm_control_tracker(start)
         observation = self._build_observation()
         self._last_observation = np.array(observation, copy=True)
         return ExecutionEnvReset(
@@ -876,12 +886,27 @@ class ExecutionEnv:
             live_orders=state.live_orders,
             recent_fills=self._last_step_fills,
             linear_signal=linear_signal,
+            control_features=self._control_observation_features(
+                current_local_ts_us=current_local_ts_us,
+                book_ptr=state.current_book_ptr,
+            ),
             adverse_features=runtime_maps.adverse_features,
             executable_edge_features=runtime_maps.edge_features,
             context=context,
         )
         return self.observation_builder.build(inputs, out=self._obs_buffer)
 
+    def _control_observation_features(self, *, current_local_ts_us: int, book_ptr: int) -> dict[str, float]:
+        features = self._control_tracker.snapshot(current_local_ts_us)
+        features.update(
+            depth_shape_features(
+                book_ptr=book_ptr,
+                book_bid_sizes=self.tape.arrays.book_bid_sizes,
+                book_ask_sizes=self.tape.arrays.book_ask_sizes,
+                size_epsilon=self.config.observation_builder_config.size_epsilon,
+            )
+        )
+        return features
 
     def _adverse_runtime_feature_maps_for_step(
         self,
@@ -958,15 +983,21 @@ class ExecutionEnv:
         fills: tuple[Fill, ...] = ()
         if code == EVENT_TYPE_CODE_L2_BATCH:
             book_ptr = int(self._ev_book_ptr[event_index])
+            self._record_control_l2_from_ptr(book_ptr)
             fills = self._process_l2_event(book_ptr, event_key=event_key)
             if self._book_top_from_ptr(book_ptr) is not None:
                 state.current_book_ptr = book_ptr
         elif code == EVENT_TYPE_CODE_TRADE:
+            trade = self._trade_from_ptr(int(self._ev_trade_ptr[event_index]))
+            self._control_tracker.record_trade(
+                local_ts_us=trade.local_ts_us,
+                side=trade.side,
+                qty=trade.amount,
+            )
             if not state.live_orders:
                 state.previous_event_local_ts_us = old_event_local
                 state.event_index = event_index
                 return fills
-            trade = self._trade_from_ptr(int(self._ev_trade_ptr[event_index]))
             result = simulate_trade_event(
                 state.live_orders,
                 trade,
@@ -997,6 +1028,59 @@ class ExecutionEnv:
         state.previous_event_local_ts_us = old_event_local
         state.event_index = event_index
         return fills
+
+    def _warm_control_tracker(self, start_event_index: int) -> None:
+        current_ts = int(self._ev_local_ts[start_event_index])
+        cutoff_ts = current_ts - self._control_tracker.max_lookback_us
+        search_start = int(np.searchsorted(self._ev_local_ts, cutoff_ts, side="left"))
+        seed_index = self._last_valid_l2_event_index_at_or_before(
+            cutoff_ts,
+            max_event_index=start_event_index,
+        )
+        if seed_index is not None:
+            self._record_control_l2_event_index(seed_index)
+            search_start = max(search_start, seed_index + 1)
+        search_start = max(0, min(search_start, start_event_index))
+        for event_index in range(search_start, start_event_index + 1):
+            code = int(self._ev_type_code[event_index])
+            if code == EVENT_TYPE_CODE_L2_BATCH:
+                self._record_control_l2_from_ptr(int(self._ev_book_ptr[event_index]))
+            elif code == EVENT_TYPE_CODE_TRADE:
+                trade_ptr = int(self._ev_trade_ptr[event_index])
+                if trade_ptr >= 0:
+                    trade = self._trade_from_ptr(trade_ptr)
+                    self._control_tracker.record_trade(
+                        local_ts_us=trade.local_ts_us,
+                        side=trade.side,
+                        qty=trade.amount,
+                    )
+
+    def _last_valid_l2_event_index_at_or_before(self, local_ts_us: int, *, max_event_index: int) -> int | None:
+        idx = min(max_event_index, int(np.searchsorted(self._ev_local_ts, local_ts_us, side="right")) - 1)
+        while idx >= 0:
+            if int(self._ev_type_code[idx]) == EVENT_TYPE_CODE_L2_BATCH:
+                book_ptr = int(self._ev_book_ptr[idx])
+                if book_ptr >= 0 and self._book_top_from_ptr(book_ptr) is not None:
+                    return idx
+            idx -= 1
+        return None
+
+    def _record_control_l2_event_index(self, event_index: int) -> None:
+        self._record_control_l2_from_ptr(int(self._ev_book_ptr[event_index]))
+
+    def _record_control_l2_from_ptr(self, book_ptr: int) -> None:
+        if book_ptr < 0:
+            return
+        top = self._book_top_from_ptr(book_ptr)
+        if top is None:
+            return
+        self._control_tracker.record_l2_top(
+            local_ts_us=top.local_ts_us,
+            best_bid_tick=top.best_bid_tick,
+            best_bid_size=top.best_bid_size,
+            best_ask_tick=top.best_ask_tick,
+            best_ask_size=top.best_ask_size,
+        )
 
     def _process_l2_event(self, curr_book_ptr: int, *, event_key: EventKey) -> tuple[Fill, ...]:
         state = self._require_state()

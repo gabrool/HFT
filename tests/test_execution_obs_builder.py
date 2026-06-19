@@ -17,6 +17,8 @@ from mmrt.execution.contracts import (
 from mmrt.execution.linear_signal import build_gated_linear_signal
 from mmrt.execution.obs_schema import (
     DEFAULT_OBSERVATION_FIELDS,
+    CONTROL_GROUP,
+    CONTROL_FIELDS,
     MARKET_FIELDS,
     LINEAR_SIGNAL_FIELDS,
     POSITION_FIELDS,
@@ -119,9 +121,12 @@ def _fill(
 def test_default_schema_fields_and_groups():
     schema = default_observation_schema()
 
-    assert schema.dim == 52
+    assert schema.dim == 73
     assert schema.field_names == DEFAULT_OBSERVATION_FIELDS
     assert schema.index("spread_ticks") == 0
+    assert schema.index(CONTROL_FIELDS[0]) == len(MARKET_FIELDS)
+    assert schema.index("linear_p_no_move") == len(MARKET_FIELDS) + len(CONTROL_FIELDS)
+    assert len(schema.field_names) == len(set(schema.field_names))
     assert schema.has_field("linear_p_no_move")
     assert schema.has_field("linear_p_move")
     assert schema.has_field("linear_p_up_move")
@@ -143,6 +148,7 @@ def test_default_schema_fields_and_groups():
 
     groups = observation_field_groups()
     assert groups["market"] == MARKET_FIELDS
+    assert groups[CONTROL_GROUP] == CONTROL_FIELDS
     assert groups["linear_signal"] == LINEAR_SIGNAL_FIELDS
     assert groups["position"] == POSITION_FIELDS
     assert groups["orders"] == ORDERS_FIELDS
@@ -246,6 +252,29 @@ def test_build_observation_uses_linear_signal():
     assert obs[schema.index("linear_expected_abs_move_bps")] == pytest.approx(6.8)
     assert obs[schema.index("linear_predicted_vol_bps")] == pytest.approx(np.sqrt(62.0 - 4.4 * 4.4))
     assert obs[schema.index("linear_confidence")] == pytest.approx(0.32)
+
+
+def test_observation_builder_fills_control_feature_map_and_ignores_unknown_names():
+    schema = default_observation_schema()
+    obs = build_observation(
+        ObservationInput(
+            symbol_spec=_spec(),
+            book_top=_top(),
+            bid_depth=1,
+            ask_depth=1,
+            linear_signal=_signal(),
+            control_features={
+                "depth_bid_qty_5": 7.0,
+                "flow_imbalance_ratio_200ms": -0.25,
+                "unknown_control_feature": 123.0,
+            },
+        ),
+        schema=schema,
+    )
+
+    assert obs[schema.index("depth_bid_qty_5")] == pytest.approx(7.0)
+    assert obs[schema.index("flow_imbalance_ratio_200ms")] == pytest.approx(-0.25)
+    assert "unknown_control_feature" not in schema.field_names
 
 
 def test_build_observation_position_fields():
