@@ -274,6 +274,20 @@ def test_rollout_collector_collects_tiny_env_batch():
     assert torch.isfinite(batch.advantages).all()
     assert torch.isfinite(batch.returns).all()
     assert normalizer.running.count > normalizer.running.initial_epsilon
+    assert batch.telemetry is not None
+    assert batch.telemetry["sample_count"] == 4
+    requested = batch.telemetry["requested_actions"]
+    effective = batch.telemetry["effective_quotes"]
+    assert 0.0 <= requested["requested_bid_enabled_rate"] <= 1.0
+    assert 0.0 <= requested["requested_ask_enabled_rate"] <= 1.0
+    assert (
+        effective["quote_no_quote_rate"]
+        + effective["quote_bid_only_rate"]
+        + effective["quote_ask_only_rate"]
+        + effective["quote_two_sided_rate"]
+    ) == pytest.approx(1.0)
+    training_by_mode = batch.telemetry["training_by_effective_quote_mode"]
+    assert "advantage_mean" in training_by_mode["no_quote"]
 
 
 def test_train_ppo_policy_runs_one_update_on_tiny_env():
@@ -304,6 +318,10 @@ def test_train_ppo_policy_runs_one_update_on_tiny_env():
     summary = result.summary_dict()
     assert summary["status"] == "ok"
     assert summary["updates_completed"] == 1
+    assert summary["telemetry_aggregate"]["sample_count"] == 4
+    assert summary["final"]["telemetry"]["sample_count"] == 4
+    assert "telemetry_brief" in summary["history"][0]
+    assert "reward_mean_by_mode" in summary["history"][0]["telemetry_brief"]
 
     payload = make_training_checkpoint_payload(result)
     assert payload["schema"] == "mmrt_execution_ppo_checkpoint"
@@ -344,6 +362,9 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["checkpoint_saved"] is True
     assert summary["training"]["updates_completed"] == 1
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
+    assert summary["training"]["final"]["telemetry"]["sample_count"] == 4
+    assert summary["training"]["telemetry_aggregate"]["sample_count"] == 4
+    assert "telemetry_brief" in summary["training"]["history"][0]
     assert summary["train_split"] == "train"
     assert summary["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
     assert summary["train_window_sampling"] == "stratified_random"

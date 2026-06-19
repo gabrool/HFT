@@ -10,6 +10,7 @@ import torch
 
 from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.split_contract import DecisionSplitRange
+from mmrt.rl.action_telemetry import ActionTelemetryAccumulator, action_telemetry_brief
 from mmrt.rl.device import resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer, ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig, PPOUpdateStats, update_ppo
@@ -268,9 +269,10 @@ class PPOTrainingIterationStats(NamedTuple):
     env_steps_per_sec: float
     policy_forward_steps_per_sec: float
     total_steps_per_sec: float
+    telemetry: dict[str, object] | None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "update_index": int(self.update_index),
             "rollout": {
                 "reward_sum": float(self.rollout_reward_sum),
@@ -295,6 +297,9 @@ class PPOTrainingIterationStats(NamedTuple):
                 "total_steps_per_sec": float(self.total_steps_per_sec),
             },
         }
+        if self.telemetry is not None:
+            payload["telemetry_brief"] = action_telemetry_brief(self.telemetry)
+        return payload
 
 
 class PPOTrainingResult(NamedTuple):
@@ -305,15 +310,25 @@ class PPOTrainingResult(NamedTuple):
     updates_completed: int
     config: PPOTrainingConfig
     sampling_stats: dict[str, object] | None = None
+    telemetry_aggregate: dict[str, object] | None = None
 
     def summary_dict(self) -> dict[str, object]:
+        history = [item.as_dict() for item in self.history]
+        final = None
+        if self.history:
+            final = self.history[-1].as_dict()
+            if self.history[-1].telemetry is not None:
+                final["telemetry"] = dict(self.history[-1].telemetry)
         return {
             "status": "ok",
             "updates_completed": int(self.updates_completed),
             "config": training_config_to_dict(self.config),
             "sampling": None if self.sampling_stats is None else dict(self.sampling_stats),
-            "history": [item.as_dict() for item in self.history],
-            "final": self.history[-1].as_dict() if self.history else None,
+            "history": history,
+            "final": final,
+            "telemetry_aggregate": (
+                None if self.telemetry_aggregate is None else dict(self.telemetry_aggregate)
+            ),
         }
 
 
@@ -361,6 +376,7 @@ def _rollout_stats(
         env_steps_per_sec=float(timing.get("env_steps_per_sec", 0.0)),
         policy_forward_steps_per_sec=float(timing.get("policy_forward_steps_per_sec", 0.0)),
         total_steps_per_sec=float(total_steps / update_total_seconds) if update_total_seconds > 0.0 else 0.0,
+        telemetry=batch.telemetry,
     )
 
 
@@ -483,9 +499,13 @@ def train_ppo_policy(
 
     policy.train()
     history: list[PPOTrainingIterationStats] = []
+    telemetry_aggregate = ActionTelemetryAccumulator()
 
     for update_index in range(config.num_updates):
-        batch = collector.collect(start_decision_rows=start_decision_rows if update_index == 0 else None)
+        batch = collector.collect(
+            start_decision_rows=start_decision_rows if update_index == 0 else None,
+            aggregate_telemetry=telemetry_aggregate,
+        )
         ppo_started = time.perf_counter()
         ppo_stats = update_ppo(
             policy,
@@ -504,6 +524,7 @@ def train_ppo_policy(
         updates_completed=len(history),
         config=config,
         sampling_stats=collector.sampling_stats(),
+        telemetry_aggregate=telemetry_aggregate.as_dict(),
     )
 
 

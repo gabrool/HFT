@@ -73,6 +73,7 @@ def test_actor_critic_shapes_and_deterministic_action():
     assert torch.all(sample.action[:, :4] == 1.0)
     assert torch.allclose(sample.action[:, 4:], forward.continuous_mean)
     assert sample.enable_prob.shape == (3, 4)
+    assert sample.enable_logits.shape == (3, 4)
     assert sample.continuous_mean.shape == (3, 4)
     assert sample.continuous_log_std.shape == (3, 4)
     assert sample.log_prob.shape == (3,)

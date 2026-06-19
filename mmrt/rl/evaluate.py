@@ -11,6 +11,7 @@ from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_exec
 from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.metrics import ExecutionMetricAccumulator
 from mmrt.execution.split_contract import DecisionSplitRange
+from mmrt.rl.action_telemetry import ActionTelemetryAccumulator
 from mmrt.rl.device import canonicalize_torch_device, resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer
 from mmrt.rl.torch_networks import ActorCriticNetwork
@@ -166,6 +167,7 @@ class PolicyEvaluationResult(NamedTuple):
     truncated: bool
     metrics: dict[str, object]
     diagnostics: dict[str, object] | None
+    telemetry: dict[str, object]
     config: dict[str, object]
 
     def as_dict(self) -> dict[str, object]:
@@ -176,6 +178,7 @@ class PolicyEvaluationResult(NamedTuple):
             "truncated": bool(self.truncated),
             "metrics": self.metrics,
             "diagnostics": self.diagnostics,
+            "telemetry": self.telemetry,
             "config": self.config,
         }
 
@@ -237,6 +240,7 @@ def evaluate_policy(
     policy.eval()
     try:
         acc = ExecutionMetricAccumulator()
+        telemetry = ActionTelemetryAccumulator()
         terminated = False
         truncated = False
         step_count = 0
@@ -323,11 +327,18 @@ def evaluate_policy(
                             obs.unsqueeze(0),
                             deterministic=config.deterministic,
                         )
+                    telemetry.update_policy_action(
+                        action_out,
+                        deterministic=config.deterministic,
+                        enable_threshold=policy.config.enable_threshold,
+                    )
+                    telemetry.update_requested_actions(action_out.action)
                     action = action_out.action.squeeze(0).detach().to("cpu").tolist()
 
                     action_decision_row = current_decision_row
                     step = env.step(action)
                     acc.update(step.execution)
+                    telemetry.update_execution_step(step.execution)
                     step_count += 1
                     next_decision_row = int(step.info["next_decision_grid_row_index"])
                     if range_end is not None and next_decision_row >= range_end:
@@ -395,6 +406,7 @@ def evaluate_policy(
             truncated=truncated,
             metrics=metrics,
             diagnostics=diagnostics,
+            telemetry=telemetry.as_dict(),
             config={
                 **_config_to_dict(config),
                 "evaluated_start_decision_row": None if evaluated_start_decision_row is None else int(evaluated_start_decision_row),
