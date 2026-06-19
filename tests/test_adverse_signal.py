@@ -25,6 +25,22 @@ def _model_lineage_kwargs(n_rows: int = 1):
     }
 
 
+def _label_config(queue_mode: str = "conservative") -> dict[str, object]:
+    return {
+        "queue_mode": queue_mode,
+        "l2_decrease_weight": 0.25,
+        "trade_at_level_weight": 0.5,
+        "dedupe_l2_decrease_with_trade_prints": True,
+        "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "order_entry_latency_us": 500,
+        "decision_compute_latency_us": 50,
+        "post_only_gap_ticks": 1,
+        "order_qty": 0.001,
+        "fill_horizon_us": 1_000_000,
+        "adverse_horizon_us": 1_000_000,
+    }
+
+
 def _artifact():
     return AdverseSelectionModelArtifact(
         schema=ADVERSE_SELECTION_MODEL_SCHEMA,
@@ -78,6 +94,7 @@ def test_adverse_signal_artifact_rejects_missing_prediction_key():
             decision_event_seq=np.array([2**31 - 1], dtype=np.int64),
             target_names=("bid_touch_filled",),
             predictions={},
+            adverse_label_config=_label_config(),
             **_grid_kwargs(),
         )
 
@@ -91,6 +108,7 @@ def test_adverse_signal_artifact_rejects_non_mapping_predictions():
             decision_event_seq=np.array([0], dtype=np.int64),
             target_names=("bid_touch_filled",),
             predictions=[],  # type: ignore[arg-type]
+            adverse_label_config=_label_config(),
             **_grid_kwargs(),
         )
 
@@ -103,6 +121,7 @@ def test_adverse_signal_artifact_accepts_same_local_ts_with_increasing_event_seq
         decision_event_seq=np.array([7, 8], dtype=np.int64),
         target_names=("bid_touch_filled",),
         predictions={"bid_touch_filled": np.array([0.25, 0.75], dtype=np.float32)},
+        adverse_label_config=_label_config(),
         **_grid_kwargs(n_rows=2),
     )
     np.testing.assert_array_equal(signals.decision_local_ts_us, np.array([100, 100], dtype=np.int64))
@@ -118,6 +137,7 @@ def test_adverse_signal_artifact_rejects_same_local_ts_without_increasing_event_
             decision_event_seq=np.asarray(event_seq, dtype=np.int64),
             target_names=("bid_touch_filled",),
             predictions={"bid_touch_filled": np.array([0.25, 0.75], dtype=np.float32)},
+            adverse_label_config=_label_config(),
             **_grid_kwargs(n_rows=2),
         )
 
@@ -138,6 +158,7 @@ def test_load_adverse_selection_signals_rejects_missing_prediction_array(tmp_pat
         decision_grid_hash=np.array(_grid_kwargs()["decision_grid_hash"]),
         decision_grid_n_rows=np.array(1, dtype=np.int64),
         decision_schedule=np.array("{}"),
+        adverse_label_config=np.array(_label_config(), dtype=object),
     )
     with pytest.raises(ValueError, match="missing prediction arrays"):
         load_adverse_selection_signals(path)
@@ -194,11 +215,16 @@ def test_save_adverse_selection_signals_arrays_matches_existing_artifact_writer_
             "bid_touch_toxic_cost_bps": np.array([1.0, 2.0], dtype=np.float32),
         },
     )
-    artifact = AdverseSelectionSignalArtifact(schema=ADVERSE_SELECTION_SIGNALS_SCHEMA, **kwargs, **_grid_kwargs(n_rows=2))
+    artifact = AdverseSelectionSignalArtifact(
+        schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+        adverse_label_config=_label_config(),
+        **kwargs,
+        **_grid_kwargs(n_rows=2),
+    )
     old_path = tmp_path / "old.npz"
     new_path = tmp_path / "new.npz"
     save_adverse_selection_signals(old_path, artifact)
-    save_adverse_selection_signals_arrays(new_path, **kwargs, **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
+    save_adverse_selection_signals_arrays(new_path, **kwargs, adverse_label_config=_label_config(), **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
     old = load_adverse_selection_signals(old_path)
     new = load_adverse_selection_signals(new_path)
     np.testing.assert_array_equal(new.decision_local_ts_us, old.decision_local_ts_us)
@@ -216,13 +242,13 @@ def test_save_adverse_selection_signals_arrays_uses_event_key_order(tmp_path):
         predictions={"bid_touch_filled": np.array([0.25, 0.75], dtype=np.float32)},
     )
     path = tmp_path / "same_ts.npz"
-    save_adverse_selection_signals_arrays(path, **kwargs, **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
+    save_adverse_selection_signals_arrays(path, **kwargs, adverse_label_config=_label_config(), **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
     loaded = load_adverse_selection_signals(path)
     np.testing.assert_array_equal(loaded.decision_local_ts_us, np.array([100, 100], dtype=np.int64))
     bad = dict(kwargs)
     bad["decision_event_seq"] = np.array([8, 7], dtype=np.int64)
     with pytest.raises(ValueError, match="decision event key must be strictly increasing"):
-        save_adverse_selection_signals_arrays(tmp_path / "bad_same_ts.npz", **bad, **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
+        save_adverse_selection_signals_arrays(tmp_path / "bad_same_ts.npz", **bad, adverse_label_config=_label_config(), **_grid_kwargs(n_rows=2), validate_chunk_rows=1)
 
 
 def test_save_adverse_selection_signals_arrays_validates_probability_bounds_chunked(tmp_path):
@@ -234,6 +260,7 @@ def test_save_adverse_selection_signals_arrays_validates_probability_bounds_chun
             decision_event_seq=np.array([0, 0], dtype=np.int64),
             target_names=("bid_touch_filled",),
             predictions={"bid_touch_filled": np.array([0.5, 1.5], dtype=np.float32)},
+            adverse_label_config=_label_config(),
             **_grid_kwargs(n_rows=2),
             validate_chunk_rows=1,
         )

@@ -84,6 +84,10 @@ def test_build_adverse_selection_signals_end_to_end(tmp_path):
     assert signals.schema == ADVERSE_SELECTION_SIGNALS_SCHEMA
     assert signals.decision_event_seq.shape == signals.decision_local_ts_us.shape
     assert set(signals.target_names) == set(model.target_names)
+    assert signals.adverse_label_config["queue_mode"] == "conservative"
+    assert loaded_summary["adverse_label_config"] == signals.adverse_label_config
+    assert loaded_summary["signals"]["adverse_label_config"] == signals.adverse_label_config
+    assert loaded_summary["fill_simulator"] == signals.adverse_label_config
     assert summary["run_type"] == "build_adverse_selection_signals"
     assert loaded_summary["run_type"] == "build_adverse_selection_signals"
 

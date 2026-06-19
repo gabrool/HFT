@@ -32,16 +32,19 @@ from mmrt.execution.split_contract import DecisionSplitRange
 from mmrt.cli.train_execution_ppo import ExecutionPPOTrainCLIConfig, run_execution_ppo_training
 from mmrt.cli.evaluate_execution_policy import (
     ExecutionPolicyEvaluationCLIConfig,
+    _adverse_queue_config_compatibility,
+    _env_config_from_cli_config,
     main,
     run_execution_policy_evaluation,
 )
+from mmrt.execution.adverse_signal import ADVERSE_SELECTION_SIGNALS_SCHEMA, AdverseSelectionSignalArtifact
 from mmrt.rl.evaluate import PolicyEvaluationConfig, evaluate_policy
 from mmrt.rl.normalization import ObservationNormalizer
 from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.rollout import RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy
-from tests.grid_helpers import decision_grid_for_tape, write_split_source_manifest
+from tests.grid_helpers import decision_grid_for_tape, grid_lineage_fields, write_split_source_manifest
 
 
 
@@ -941,6 +944,61 @@ def test_parser_dedupe_l2_trade_default_enabled():
     ])
     config = _config_from_args(args)
     assert config.dedupe_l2_decrease_with_trade_prints is True
+
+
+def _eval_adverse_label_config(queue_mode: str) -> dict[str, object]:
+    return {
+        "queue_mode": queue_mode,
+        "l2_decrease_weight": 0.25,
+        "trade_at_level_weight": 0.5,
+        "dedupe_l2_decrease_with_trade_prints": True,
+        "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "order_entry_latency_us": 500,
+        "decision_compute_latency_us": 50,
+        "post_only_gap_ticks": 1,
+        "order_qty": 0.001,
+        "fill_horizon_us": 1_000_000,
+        "adverse_horizon_us": 1_000_000,
+    }
+
+
+def _eval_adverse_signals(queue_mode: str) -> AdverseSelectionSignalArtifact:
+    return AdverseSelectionSignalArtifact(
+        schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+        decision_local_ts_us=np.array([100], dtype=np.int64),
+        decision_event_index=np.array([0], dtype=np.int64),
+        decision_event_seq=np.array([0], dtype=np.int64),
+        target_names=("bid_touch_filled",),
+        predictions={"bid_touch_filled": np.array([0.5], dtype=np.float32)},
+        adverse_label_config=_eval_adverse_label_config(queue_mode),
+        **grid_lineage_fields(n_rows=1),
+    )
+
+
+def test_evaluation_adverse_signal_queue_guard_allows_only_explicit_mismatch():
+    config = ExecutionPolicyEvaluationCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        checkpoint_path="/tmp/checkpoint.pt",
+        split_source_dataset_root="/tmp/split-source",
+        eval_split="val",
+        queue_mode="balanced",
+        override_env_config=True,
+    )
+    env_config = _env_config_from_cli_config(config)
+    with pytest.raises(ValueError, match="adverse signal queue config mismatch"):
+        _adverse_queue_config_compatibility(
+            _eval_adverse_signals("conservative"),
+            env_config=env_config,
+            allow_mismatch=False,
+        )
+    allowed = _adverse_queue_config_compatibility(
+        _eval_adverse_signals("conservative"),
+        env_config=env_config,
+        allow_mismatch=True,
+    )
+    assert allowed is not None
+    assert allowed["status"] == "mismatch_allowed"
 
 
 def test_evaluation_cli_env_config_adverse_runtime_uses_post_only_gap():

@@ -12,7 +12,7 @@ import torch
 
 from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
-from mmrt.execution.adverse_signal import load_adverse_selection_signals
+from mmrt.execution.adverse_signal import AdverseSelectionSignalArtifact, load_adverse_selection_signals
 from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
 from mmrt.execution.linear_signal import (
@@ -169,6 +169,7 @@ class ExecutionPolicyEvaluationCLIConfig:
     output_json: str | None = None
     linear_signals_npz: str | None = None
     adverse_signals_npz: str | None = None
+    allow_adverse_queue_config_mismatch: bool = False
     overwrite: bool = False
     mmap_mode: str | None = "r"
 
@@ -223,6 +224,7 @@ class ExecutionPolicyEvaluationCLIConfig:
             _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
         if self.adverse_signals_npz is not None:
             _require_nonempty_str(self.adverse_signals_npz, "adverse_signals_npz")
+        _require_bool(self.allow_adverse_queue_config_mismatch, "allow_adverse_queue_config_mismatch")
         _require_bool(self.overwrite, "overwrite")
         if self.mmap_mode not in (None, "r"):
             raise ValueError('mmap_mode must be None or "r"')
@@ -277,6 +279,7 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "output_json": config.output_json,
         "linear_signals_npz": config.linear_signals_npz,
         "adverse_signals_npz": config.adverse_signals_npz,
+        "allow_adverse_queue_config_mismatch": config.allow_adverse_queue_config_mismatch,
         "overwrite": config.overwrite,
         "mmap_mode": config.mmap_mode,
         "cancel_guard_ticks": config.cancel_guard_ticks,
@@ -367,6 +370,80 @@ def _env_config_from_cli_config(
         config,
         adverse_signals_enabled=config.adverse_signals_npz is not None,
     )
+
+
+def _adverse_signal_summary(artifact: AdverseSelectionSignalArtifact | None, path: str | None) -> dict[str, object] | None:
+    if artifact is None:
+        return None
+    return {
+        "path": path,
+        "schema": artifact.schema,
+        "decision_grid_schema": artifact.decision_grid_schema,
+        "decision_grid_hash": artifact.decision_grid_hash,
+        "decision_grid_n_rows": artifact.decision_grid_n_rows,
+        "decision_schedule": dict(artifact.decision_schedule),
+        "target_names": list(artifact.target_names),
+        "n_rows": int(artifact.decision_grid_n_rows),
+        "adverse_label_config": dict(artifact.adverse_label_config),
+    }
+
+
+_ADVERSE_ENV_COMPATIBILITY_KEYS = (
+    "queue_mode",
+    "l2_decrease_weight",
+    "trade_at_level_weight",
+    "dedupe_l2_decrease_with_trade_prints",
+    "unknown_level_queue_ahead_qty",
+    "order_entry_latency_us",
+    "decision_compute_latency_us",
+    "post_only_gap_ticks",
+    "order_qty",
+)
+
+
+def _expected_adverse_label_config_from_env(env_config: ExecutionEnvConfig) -> dict[str, object]:
+    queue = env_config.fill_simulator_config.queue_model
+    return {
+        "queue_mode": queue.mode.value,
+        "l2_decrease_weight": queue.l2_decrease_weight,
+        "trade_at_level_weight": queue.trade_at_level_weight,
+        "dedupe_l2_decrease_with_trade_prints": queue.dedupe_l2_decrease_with_trade_prints,
+        "unknown_level_queue_ahead_qty": queue.unknown_level_queue_ahead_qty,
+        "order_entry_latency_us": env_config.latency_config.order_entry_latency_us,
+        "decision_compute_latency_us": env_config.latency_config.decision_compute_latency_us,
+        "post_only_gap_ticks": env_config.quote_geometry_config.post_only_gap_ticks,
+        "order_qty": env_config.quote_geometry_config.default_order_qty,
+    }
+
+
+def _adverse_queue_config_compatibility(
+    artifact: AdverseSelectionSignalArtifact | None,
+    *,
+    env_config: ExecutionEnvConfig,
+    allow_mismatch: bool,
+) -> dict[str, object] | None:
+    if artifact is None:
+        return None
+    expected = _expected_adverse_label_config_from_env(env_config)
+    actual = dict(artifact.adverse_label_config)
+    mismatches = {
+        key: {"expected": expected[key], "actual": actual.get(key)}
+        for key in _ADVERSE_ENV_COMPATIBILITY_KEYS
+        if actual.get(key) != expected[key]
+    }
+    status = "match" if not mismatches else "mismatch_allowed" if allow_mismatch else "mismatch"
+    result: dict[str, object] = {
+        "status": status,
+        "allow_mismatch": allow_mismatch,
+        "compared_keys": list(_ADVERSE_ENV_COMPATIBILITY_KEYS),
+        "label_only_keys": ["fill_horizon_us", "adverse_horizon_us"],
+        "expected": expected,
+        "actual": actual,
+        "mismatches": mismatches,
+    }
+    if mismatches and not allow_mismatch:
+        raise ValueError(f"adverse signal queue config mismatch: {mismatches}")
+    return result
 
 
 def _env_config_from_training_cli_config(raw: Mapping[str, object]) -> ExecutionEnvConfig:
@@ -664,6 +741,11 @@ def run_execution_policy_evaluation(
         env_config = _env_config_from_training_cli_config(checkpoint_cli_config)
         env_config_source = "checkpoint_cli_config"
         env_config_diff = {}
+    adverse_queue_config = _adverse_queue_config_compatibility(
+        adverse_signals,
+        env_config=env_config,
+        allow_mismatch=config.allow_adverse_queue_config_mismatch,
+    )
 
     requested_start_event_index = int(decision_grid.decision_event_index[eval_ranges[0].start_decision_row])
     decision_grid_start = validate_linear_signals_for_execution_tape(
@@ -769,6 +851,8 @@ def run_execution_policy_evaluation(
         },
         "observation_schema": env.config.observation_schema.as_dict(),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
+        "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
+        "adverse_signal_queue_config": adverse_queue_config,
         "decision_grid_start": decision_grid_start.as_dict(),
         "decision_grid": {
             "schema": decision_grid.metadata.schema,
@@ -810,6 +894,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Canonical no-move-gated linear signal NPZ. Defaults to <tape-root>/linear_signals.npz. Required; missing file is an error.",
     )
     parser.add_argument("--adverse-signals-npz")
+    parser.add_argument(
+        "--allow-adverse-queue-config-mismatch",
+        action="store_true",
+        help="Allow adverse signal queue/fill config to differ from the resolved execution env config; mismatches are errors by default.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
 
@@ -862,6 +951,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         output_json=args.output_json,
         linear_signals_npz=args.linear_signals_npz,
         adverse_signals_npz=args.adverse_signals_npz,
+        allow_adverse_queue_config_mismatch=args.allow_adverse_queue_config_mismatch,
         overwrite=args.overwrite,
         mmap_mode=None if args.no_mmap else "r",
         cancel_guard_ticks=args.cancel_guard_ticks,

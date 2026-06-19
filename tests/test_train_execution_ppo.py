@@ -1,7 +1,11 @@
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 from mmrt.cli.train_execution_ppo import (
     ExecutionPPOTrainCLIConfig,
+    _adverse_queue_config_compatibility,
     build_arg_parser,
     _build_env_config,
     _build_training_config,
@@ -9,8 +13,10 @@ from mmrt.cli.train_execution_ppo import (
     _debug_start_rows,
     _summary_config,
 )
+from mmrt.execution.adverse_signal import ADVERSE_SELECTION_SIGNALS_SCHEMA, AdverseSelectionSignalArtifact
 from mmrt.execution.split_contract import DecisionSplitRange
 from mmrt.rl.rollout import TrainWindowSampler
+from tests.grid_helpers import grid_lineage_fields
 
 
 REQUIRED_TRAIN_ARGS = [
@@ -64,6 +70,68 @@ def test_adverse_runtime_config_inherits_post_only_gap_from_ppo_config():
     assert env_config.quote_geometry_config.post_only_gap_ticks == 2
     assert env_config.adverse_runtime_config.post_only_gap_ticks == 2
     assert env_config.adverse_runtime_config.executable_edge.maker_fee_bps == env_config.fill_simulator_config.maker_fee_bps
+
+
+def _adverse_label_config(queue_mode: str) -> dict[str, object]:
+    return {
+        "queue_mode": queue_mode,
+        "l2_decrease_weight": 0.25,
+        "trade_at_level_weight": 0.5,
+        "dedupe_l2_decrease_with_trade_prints": True,
+        "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "order_entry_latency_us": 500,
+        "decision_compute_latency_us": 50,
+        "post_only_gap_ticks": 1,
+        "order_qty": 0.001,
+        "fill_horizon_us": 1_000_000,
+        "adverse_horizon_us": 1_000_000,
+    }
+
+
+def _adverse_signals(queue_mode: str) -> AdverseSelectionSignalArtifact:
+    return AdverseSelectionSignalArtifact(
+        schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+        decision_local_ts_us=np.array([100], dtype=np.int64),
+        decision_event_index=np.array([0], dtype=np.int64),
+        decision_event_seq=np.array([0], dtype=np.int64),
+        target_names=("bid_touch_filled",),
+        predictions={"bid_touch_filled": np.array([0.5], dtype=np.float32)},
+        adverse_label_config=_adverse_label_config(queue_mode),
+        **grid_lineage_fields(n_rows=1),
+    )
+
+
+def test_ppo_rejects_conservative_adverse_signals_for_balanced_env():
+    config = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
+        queue_mode="balanced",
+    )
+    env_config = _build_env_config(config)
+    with pytest.raises(ValueError, match="adverse signal queue config mismatch"):
+        _adverse_queue_config_compatibility(
+            _adverse_signals("conservative"),
+            env_config=env_config,
+            allow_mismatch=False,
+        )
+
+
+def test_ppo_accepts_balanced_adverse_signals_for_balanced_env():
+    config = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
+        queue_mode="balanced",
+    )
+    env_config = _build_env_config(config)
+    result = _adverse_queue_config_compatibility(
+        _adverse_signals("balanced"),
+        env_config=env_config,
+        allow_mismatch=False,
+    )
+    assert result is not None
+    assert result["status"] == "match"
 
 
 def test_parser_requires_current_split_source_and_maker_fee():

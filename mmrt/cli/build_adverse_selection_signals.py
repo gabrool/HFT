@@ -12,6 +12,7 @@ import numpy as np
 
 from mmrt.execution.adverse_selection import (
     adverse_selection_config_from_training_summary,
+    adverse_label_config_from_config,
 )
 from mmrt.execution.adverse_selection_feature_store import (
     build_adverse_selection_features_to_disk,
@@ -150,6 +151,7 @@ def build_adverse_selection_signals_from_config(
 
     payload = json.loads(model.config_json)
     adverse_config = adverse_selection_config_from_training_summary(payload)
+    adverse_label_config = adverse_label_config_from_config(adverse_config)
     feature_root = Path(config.feature_dataset_root) if config.feature_dataset_root is not None else Path(config.tape_root) / "adverse_selection_feature_dataset"
     dataset = build_adverse_selection_features_to_disk(
         tape,
@@ -191,6 +193,7 @@ def build_adverse_selection_signals_from_config(
         decision_event_seq=dataset.decision_event_seq,
         target_names=model.target_names,
         predictions=preds,
+        adverse_label_config=adverse_label_config,
         decision_grid_schema=decision_grid.metadata.schema,
         decision_grid_hash=decision_grid.decision_grid_hash,
         decision_grid_n_rows=decision_grid.n_rows,
@@ -221,13 +224,17 @@ def build_adverse_selection_signals_from_config(
             "num_targets": len(model.target_names),
             "target_names": list(model.target_names),
             "decision_grid_hash": model.decision_grid_hash,
+            "adverse_label_config": adverse_label_config,
         },
         "signals": {
             "schema": ADVERSE_SELECTION_SIGNALS_SCHEMA,
             "num_decisions": int(dataset.num_rows),
             "target_names": list(model.target_names),
             "prediction_summary": prediction_summary,
+            "adverse_label_config": adverse_label_config,
         },
+        "fill_simulator": adverse_label_config,
+        "adverse_label_config": adverse_label_config,
         "decision_grid": {
             "schema": decision_grid.metadata.schema,
             "hash": decision_grid.decision_grid_hash,

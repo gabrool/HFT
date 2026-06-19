@@ -27,6 +27,22 @@ def _preds():
     }
 
 
+def _label_config() -> dict[str, object]:
+    return {
+        "queue_mode": "conservative",
+        "l2_decrease_weight": 0.25,
+        "trade_at_level_weight": 0.5,
+        "dedupe_l2_decrease_with_trade_prints": True,
+        "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "order_entry_latency_us": 500,
+        "decision_compute_latency_us": 50,
+        "post_only_gap_ticks": 1,
+        "order_qty": 0.001,
+        "fill_horizon_us": 1_000_000,
+        "adverse_horizon_us": 1_000_000,
+    }
+
+
 def test_adverse_predictions_for_row_returns_scalar_dict():
     signals = AdverseSelectionSignalArtifact(
         schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
@@ -35,6 +51,7 @@ def test_adverse_predictions_for_row_returns_scalar_dict():
         decision_event_seq=np.array([2**31 - 1], dtype=np.int64),
         target_names=tuple(_preds()),
         predictions={k: np.array([v], dtype=np.float32) for k, v in _preds().items()},
+        adverse_label_config=_label_config(),
         **grid_lineage_fields(),
     )
     assert adverse_predictions_for_row(signals, 0)["bid_touch_filled"] == pytest.approx(0.5)
