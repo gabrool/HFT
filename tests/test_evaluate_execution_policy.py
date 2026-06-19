@@ -506,8 +506,21 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["evaluation"]["steps"] > 0
     assert summary["evaluation"]["steps"] <= 4
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
-    assert summary["evaluation"]["telemetry"]["sample_count"] == summary["evaluation"]["steps"]
-    assert summary["policy_action_telemetry"] == summary["evaluation"]["telemetry"]
+    assert "telemetry" not in summary["evaluation"]
+    assert summary["policy_action_telemetry"]["sample_count"] == summary["evaluation"]["steps"]
+    assert summary["compact_summary"]["run_type"] == "evaluate_execution_policy"
+    assert summary["horizon_diagnostics"]["enabled"] is True
+    assert summary["horizon_diagnostics"]["horizons_us"] == [250_000, 500_000, 1_000_000]
+    assert "decision_level" in summary["horizon_diagnostics"]
+    assert "fill_markouts" in summary["horizon_diagnostics"]
+    assert "signal_alignment" in summary["horizon_diagnostics"]
+    assert "evaluated_decision_row_ranges" not in summary
+    assert "evaluated_decision_row_ranges" not in summary["evaluation"]["config"]
+    assert "decision_row_ranges" not in summary["evaluation"]["config"]
+    assert summary["evaluated_decision_row_range_count"] >= 0
+    assert "ranges_by_split" not in summary["split_contract"]
+    assert "ranges_by_split" not in summary["split_lineage"]
+    assert "field_names" not in summary["observation_schema"]
     assert summary["tape"]["symbol"] == "BTCUSDT"
     assert (
         summary["linear_signals"]["schema"]
@@ -516,6 +529,28 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["linear_signals"]["n_rows"] >= 1
     assert summary["linear_signals"]["fields"] == train_summary["linear_signals"]["fields"]
     assert summary["observation_schema"] == train_summary["observation_schema"]
+
+    debug_json = tmp_path / "eval_debug.json"
+    debug_summary = run_execution_policy_evaluation(
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            checkpoint_path=str(tmp_path / "checkpoint.pt"),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
+            output_json=str(tmp_path / "eval_summary_with_debug.json"),
+            debug_output_json=str(debug_json),
+            overwrite=True,
+            max_steps=4,
+        )
+    )
+    assert debug_summary["debug_output_json"] == str(debug_json)
+    debug_payload = json.loads(debug_json.read_text())
+    assert "evaluated_decision_row_ranges" in debug_payload["evaluation"]["config"]
+    assert debug_payload["evaluation"]["config"]["evaluated_decision_row_ranges"]
+    assert "ranges_by_split" in debug_payload["split_lineage"]
+    assert "field_names" in debug_payload["observation_schema"]
+    assert debug_payload["evaluation"]["telemetry"] == debug_payload["policy_action_telemetry"]
 
 
 def test_evaluate_execution_policy_requires_linear_signals_file(tmp_path):
@@ -698,8 +733,45 @@ def test_evaluate_execution_policy_runs_explicit_test_split(tmp_path):
     assert summary["env_config_source"] == "checkpoint_cli_config"
     assert summary["eval_split"] == "test"
     assert summary["split_lineage"]["eval_split"] == "test"
-    assert all(entry["role"] == "test" for entry in summary["evaluated_decision_row_ranges"])
+    assert "evaluated_decision_row_ranges" not in summary
+    assert summary["evaluated_decision_row_range_count"] >= 0
     assert summary["evaluation"]["steps"] > 0
+
+
+def test_evaluate_execution_policy_horizon_flags(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+
+    disabled = run_execution_policy_evaluation(
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            checkpoint_path=str(checkpoint_path),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
+            output_json=str(tmp_path / "eval_no_horizon.json"),
+            overwrite=True,
+            max_steps=3,
+            horizon_diagnostics_enabled=False,
+        )
+    )
+    assert disabled["horizon_diagnostics"]["enabled"] is False
+
+    overridden = run_execution_policy_evaluation(
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            checkpoint_path=str(checkpoint_path),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
+            output_json=str(tmp_path / "eval_1s_horizon.json"),
+            overwrite=True,
+            max_steps=3,
+            horizon_diagnostics_us=(1_000_000,),
+        )
+    )
+    assert overridden["horizon_diagnostics"]["enabled"] is True
+    assert overridden["horizon_diagnostics"]["horizons_us"] == [1_000_000]
+    assert set(overridden["horizon_diagnostics"]["decision_level"]["by_horizon"]) == {"1000000"}
 
 
 def test_evaluate_execution_policy_rejects_checkpoint_split_contract_mismatch(tmp_path):
@@ -725,7 +797,7 @@ def test_evaluate_execution_policy_rejects_checkpoint_split_contract_mismatch(tm
         )
 
 
-def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path, capsys):
+def test_evaluate_execution_policy_main_writes_summary_and_prints_compact_default(tmp_path, capsys):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
     output_json = tmp_path / "eval_summary.json"
 
@@ -751,16 +823,76 @@ def test_evaluate_execution_policy_main_writes_summary_and_prints_json(tmp_path,
 
     assert rc == 0
     assert output_json.exists()
-    stdout_payload = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
     disk_payload = json.loads(output_json.read_text())
-    assert stdout_payload == disk_payload
-    assert stdout_payload["run_type"] == "evaluate_execution_policy"
-    assert stdout_payload["evaluation"]["steps"] > 0
+    assert "evaluate_execution_policy: " in stdout
+    assert "horizon_1s:" in stdout
+    assert "ranges_by_split" not in stdout
+    assert "field_names" not in stdout
+    assert len(stdout.splitlines()) < 50
+    assert disk_payload["run_type"] == "evaluate_execution_policy"
+    assert disk_payload["evaluation"]["steps"] > 0
     assert (
-        stdout_payload["linear_signals"]["schema"]
+        disk_payload["linear_signals"]["schema"]
         == "mmrt_execution_linear_signals_grid_v1"
     )
-    assert "observation_schema" in stdout_payload
+    assert "observation_schema" in disk_payload
+
+
+def test_evaluate_execution_policy_stdout_json_and_none_modes(tmp_path, capsys):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    output_json = tmp_path / "eval_summary.json"
+    json_output = tmp_path / "eval_summary_json.json"
+
+    rc = main(
+        [
+            "--tape-root",
+            str(tape_root),
+            "--decision-grid",
+            str(tape_root / "decision_grid"),
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--split-source-dataset-root",
+            str(_split_source_root(tape_root)),
+            "--eval-split",
+            "val",
+            "--output-json",
+            str(json_output),
+            "--max-steps",
+            "4",
+            "--stdout-mode",
+            "json",
+            "--overwrite",
+        ]
+    )
+    assert rc == 0
+    stdout_payload = json.loads(capsys.readouterr().out)
+    disk_payload = json.loads(json_output.read_text())
+    assert stdout_payload == disk_payload
+
+    rc = main(
+        [
+            "--tape-root",
+            str(tape_root),
+            "--decision-grid",
+            str(tape_root / "decision_grid"),
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--split-source-dataset-root",
+            str(_split_source_root(tape_root)),
+            "--eval-split",
+            "val",
+            "--output-json",
+            str(output_json),
+            "--max-steps",
+            "4",
+            "--stdout-mode",
+            "none",
+            "--overwrite",
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_evaluate_execution_policy_refuses_overwrite_without_flag(tmp_path):

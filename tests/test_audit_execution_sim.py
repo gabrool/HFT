@@ -262,8 +262,12 @@ def test_disabled_audit_runs_and_warns_no_fills(tmp_path):
     assert loaded == summary
 
     assert summary["audit_type"] == "execution_sim"
+    assert summary["compact_summary"]["run_type"] == "audit_execution_sim"
+    assert summary["horizon_diagnostics"]["enabled"] is True
+    assert summary["horizon_diagnostics"]["horizons_us"] == [250_000, 500_000, 1_000_000]
     assert summary["metrics"]["steps"]["count"] >= 1
     assert summary["metrics"]["fills"]["count"] == 0
+    assert summary["queue_mode_comparison"]["reward"] == summary["metrics"]["rewards"]
     assert "no_fills_observed" in summary["diagnostics"]["warnings"]
 
 
@@ -306,6 +310,8 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
     assert metrics["fills"]["reason_counts"][FillReason.TRADE_THROUGH.value] == 1
     assert metrics["position"]["final_inventory_qty"] == pytest.approx(1.0)
     assert metrics["rewards"]["total_raw"] == pytest.approx(0.005005)
+    assert summary["queue_mode_comparison"]["reward"]["total_raw"] == metrics["rewards"]["total_raw"]
+    assert "fill_markouts" in summary["horizon_diagnostics"]
 
 
 def test_diagnostics_errors_on_zero_steps():
@@ -362,7 +368,7 @@ def test_audit_execution_sim_requires_linear_signals_file(tmp_path):
             )
         )
 
-def test_audit_execution_sim_main_writes_summary_and_prints_json(tmp_path, capsys):
+def test_audit_execution_sim_main_writes_summary_and_prints_compact_default(tmp_path, capsys):
     tape = _tape(
         [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
         [],
@@ -390,11 +396,68 @@ def test_audit_execution_sim_main_writes_summary_and_prints_json(tmp_path, capsy
     assert rc == 0
     assert output_json.exists()
 
-    stdout_payload = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
     disk_payload = json.loads(output_json.read_text(encoding="utf-8"))
 
+    assert "audit_execution_sim: " in stdout
+    assert "horizon_1s:" in stdout
+    assert "ranges_by_split" not in stdout
+    assert "field_names" not in stdout
+    assert len(stdout.splitlines()) < 50
+    assert disk_payload["audit_type"] == "execution_sim"
+
+
+def test_audit_execution_sim_stdout_json_and_none_modes(tmp_path, capsys):
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
+        [],
+    )
+    tape_root = _save_tape(tmp_path, tape)
+    _save_linear_signals(tape_root)
+
+    json_output = tmp_path / "summary_json.json"
+    rc = main(
+        [
+            "--tape-root",
+            str(tape_root),
+            "--decision-grid",
+            str(tape_root / "decision_grid"),
+            "--output-json",
+            str(json_output),
+            "--policy",
+            "disabled",
+            "--max-steps",
+            "1",
+            "--stdout-mode",
+            "json",
+            "--overwrite",
+        ]
+    )
+    assert rc == 0
+    stdout_payload = json.loads(capsys.readouterr().out)
+    disk_payload = json.loads(json_output.read_text(encoding="utf-8"))
     assert stdout_payload == disk_payload
-    assert stdout_payload["audit_type"] == "execution_sim"
+
+    none_output = tmp_path / "summary_none.json"
+    rc = main(
+        [
+            "--tape-root",
+            str(tape_root),
+            "--decision-grid",
+            str(tape_root / "decision_grid"),
+            "--output-json",
+            str(none_output),
+            "--policy",
+            "disabled",
+            "--max-steps",
+            "1",
+            "--stdout-mode",
+            "none",
+            "--overwrite",
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_audit_execution_sim_refuses_overwrite_without_flag(tmp_path):
@@ -416,6 +479,42 @@ def test_audit_execution_sim_refuses_overwrite_without_flag(tmp_path):
                 policy="disabled",
             )
         )
+
+
+def test_audit_execution_sim_horizon_flags(tmp_path):
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200), _l2(seq=2, local_ts_us=300)],
+        [],
+    )
+    tape_root = _save_tape(tmp_path, tape)
+    _save_linear_signals(tape_root)
+
+    disabled = run_execution_sim_audit(
+        ExecutionSimAuditConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            output_json=str(tmp_path / "summary_no_horizon.json"),
+            policy="disabled",
+            max_steps=1,
+            overwrite=True,
+            horizon_diagnostics_enabled=False,
+        )
+    )
+    assert disabled["horizon_diagnostics"]["enabled"] is False
+
+    overridden = run_execution_sim_audit(
+        ExecutionSimAuditConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            output_json=str(tmp_path / "summary_1s_horizon.json"),
+            policy="disabled",
+            max_steps=1,
+            overwrite=True,
+            horizon_diagnostics_us=(1_000_000,),
+        )
+    )
+    assert overridden["horizon_diagnostics"]["horizons_us"] == [1_000_000]
+    assert set(overridden["horizon_diagnostics"]["decision_level"]["by_horizon"]) == {"1000000"}
 
 
 def test_execution_sim_audit_config_validation():
@@ -554,7 +653,7 @@ def test_audit_execution_sim_accepts_explicit_later_decision_grid_start(tmp_path
         )
     )
 
-    assert summary["linear_signals"]["metadata"]["start_event_index"] == 0
+    assert summary["lineage"]["linear_signals"]["metadata"]["start_event_index"] == 0
     assert summary["decision_grid_start"] == {
         "event_index": 1,
         "decision_grid_row_index": 1,

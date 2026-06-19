@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -12,6 +11,12 @@ import torch
 
 from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
+from mmrt.execution.horizon_diagnostics import (
+    DEFAULT_HORIZONS_US,
+    HorizonDiagnosticsAccumulator,
+    HorizonDiagnosticsConfig,
+    parse_horizon_diagnostics_us,
+)
 from mmrt.execution.adverse_signal import AdverseSelectionSignalArtifact, load_adverse_selection_signals
 from mmrt.execution.decision_grid import load_decision_grid, validate_decision_grid_for_execution_tape
 from mmrt.execution.execution_tape import ExecutionTapeValidationMode, load_execution_tape
@@ -32,6 +37,14 @@ from mmrt.cli.execution_env_config import (
     ExecutionEnvConfigBuildInput,
     build_execution_env_config_from_attrs,
     build_execution_env_config_from_input,
+)
+from mmrt.cli.output import (
+    STDOUT_MODES,
+    compact_eval_summary,
+    compact_json_line,
+    print_human_summary,
+    validate_stdout_mode,
+    write_json_atomic,
 )
 from mmrt.rl.device import cuda_memory_summary, resolve_torch_device, torch_device_summary
 from mmrt.rl.evaluate import PolicyEvaluationConfig, evaluate_policy
@@ -167,6 +180,8 @@ class ExecutionPolicyEvaluationCLIConfig:
     split_source_dataset_root: str
     eval_split: str
     output_json: str | None = None
+    debug_output_json: str | None = None
+    horizon_debug_json: str | None = None
     linear_signals_npz: str | None = None
     adverse_signals_npz: str | None = None
     allow_adverse_queue_config_mismatch: bool = False
@@ -208,6 +223,9 @@ class ExecutionPolicyEvaluationCLIConfig:
     device: str | None = "auto"
     dtype: torch.dtype | str = torch.float32
     include_diagnostics: bool = True
+    horizon_diagnostics_enabled: bool = True
+    horizon_diagnostics_us: tuple[int, ...] = DEFAULT_HORIZONS_US
+    stdout_mode: str = "summary"
 
     override_env_config: bool = False
 
@@ -220,6 +238,10 @@ class ExecutionPolicyEvaluationCLIConfig:
             raise ValueError('eval_split must be "val" or "test"')
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
+        if self.debug_output_json is not None:
+            _require_nonempty_str(self.debug_output_json, "debug_output_json")
+        if self.horizon_debug_json is not None:
+            _require_nonempty_str(self.horizon_debug_json, "horizon_debug_json")
         if self.linear_signals_npz is not None:
             _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
         if self.adverse_signals_npz is not None:
@@ -266,6 +288,13 @@ class ExecutionPolicyEvaluationCLIConfig:
             _require_nonempty_str(self.device, "device")
         object.__setattr__(self, "dtype", _coerce_dtype(self.dtype))
         _require_bool(self.include_diagnostics, "include_diagnostics")
+        _require_bool(self.horizon_diagnostics_enabled, "horizon_diagnostics_enabled")
+        object.__setattr__(
+            self,
+            "horizon_diagnostics_us",
+            parse_horizon_diagnostics_us(tuple(self.horizon_diagnostics_us)),
+        )
+        object.__setattr__(self, "stdout_mode", validate_stdout_mode(self.stdout_mode))
         _require_bool(self.override_env_config, "override_env_config")
 
 
@@ -277,6 +306,8 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "split_source_dataset_root": config.split_source_dataset_root,
         "eval_split": config.eval_split,
         "output_json": config.output_json,
+        "debug_output_json": config.debug_output_json,
+        "horizon_debug_json": config.horizon_debug_json,
         "linear_signals_npz": config.linear_signals_npz,
         "adverse_signals_npz": config.adverse_signals_npz,
         "allow_adverse_queue_config_mismatch": config.allow_adverse_queue_config_mismatch,
@@ -311,6 +342,9 @@ def _summary_config(config: ExecutionPolicyEvaluationCLIConfig) -> dict[str, obj
         "device": config.device,
         "dtype": str(config.dtype),
         "include_diagnostics": config.include_diagnostics,
+        "horizon_diagnostics_enabled": config.horizon_diagnostics_enabled,
+        "horizon_diagnostics_us": list(config.horizon_diagnostics_us),
+        "stdout_mode": config.stdout_mode,
         "override_env_config": config.override_env_config,
     }
 
@@ -674,15 +708,16 @@ def _default_linear_signals_npz(tape_root: str) -> Path:
     return Path(tape_root) / LINEAR_SIGNALS_FILENAME
 
 
-def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+def _observation_schema_summary(schema: Mapping[str, object]) -> dict[str, object]:
+    field_names = schema.get("field_names")
+    field_count = len(field_names) if isinstance(field_names, Sequence) and not isinstance(field_names, (str, bytes)) else None
+    return {
+        "dtype": schema.get("dtype"),
+        "field_count": field_count,
+    }
 
 
-def _split_summary(contract: Mapping[str, object], split: str) -> dict[str, object]:
-    ranges = [entry.as_dict() for entry in ranges_for_split(contract, split)]
+def _split_contract_summary(contract: Mapping[str, object]) -> dict[str, object]:
     return {
         "schema": contract["schema"],
         "version": contract["version"],
@@ -693,12 +728,55 @@ def _split_summary(contract: Mapping[str, object], split: str) -> dict[str, obje
         "decision_grid_hash": contract["decision_grid_hash"],
         "decision_grid_n_rows": contract["decision_grid_n_rows"],
         "decision_schedule": contract["decision_schedule"],
-        "ranges_by_split": contract["ranges_by_split"],
+        "row_counts_by_split": contract["row_counts_by_split"],
+    }
+
+
+def _linear_signal_summary_compact(summary: Mapping[str, object]) -> dict[str, object]:
+    metadata = summary.get("metadata")
+    metadata_summary: dict[str, object] = {}
+    if isinstance(metadata, Mapping):
+        metadata_summary = {
+            "decision_grid_schema": metadata.get("decision_grid_schema"),
+            "decision_grid_hash": metadata.get("decision_grid_hash"),
+            "decision_grid_n_rows": metadata.get("decision_grid_n_rows"),
+            "decision_schedule": metadata.get("decision_schedule"),
+        }
+    return {
+        "schema": summary.get("schema"),
+        "path": summary.get("path"),
+        "n_rows": summary.get("n_rows"),
+        "dtype": summary.get("dtype"),
+        "fields": summary.get("fields"),
+        "first_decision_event_index": summary.get("first_decision_event_index"),
+        "last_decision_event_index": summary.get("last_decision_event_index"),
+        "first_decision_local_ts_us": summary.get("first_decision_local_ts_us"),
+        "last_decision_local_ts_us": summary.get("last_decision_local_ts_us"),
+        "lineage": metadata_summary,
+    }
+
+
+def _split_summary(contract: Mapping[str, object], split: str, *, include_ranges: bool = False) -> dict[str, object]:
+    ranges = [entry.as_dict() for entry in ranges_for_split(contract, split)]
+    payload: dict[str, object] = {
+        "schema": contract["schema"],
+        "version": contract["version"],
+        "split_source_dataset_root": contract["split_source_dataset_root"],
+        "split_source_dataset_id": contract["split_source_dataset_id"],
+        "split_source_manifest_hash": contract["split_source_manifest_hash"],
+        "decision_grid_schema": contract["decision_grid_schema"],
+        "decision_grid_hash": contract["decision_grid_hash"],
+        "decision_grid_n_rows": contract["decision_grid_n_rows"],
+        "decision_schedule": contract["decision_schedule"],
         "row_counts_by_split": contract["row_counts_by_split"],
         "eval_split": split,
-        "eval_ranges": ranges,
+        "eval_range_count": len(ranges),
         "eval_row_count": int(contract["row_counts_by_split"][split]),  # type: ignore[index]
     }
+    if include_ranges:
+        payload["ranges_by_split"] = contract["ranges_by_split"]
+        payload["eval_ranges"] = ranges
+    return payload
 
 
 def run_execution_policy_evaluation(
@@ -804,26 +882,74 @@ def run_execution_policy_evaluation(
         dtype=dtype,
         include_diagnostics=config.include_diagnostics,
     )
+    horizon_config = HorizonDiagnosticsConfig(
+        enabled=config.horizon_diagnostics_enabled,
+        horizons_us=config.horizon_diagnostics_us,
+    )
+    horizon_accumulator = (
+        HorizonDiagnosticsAccumulator.from_execution(
+            decision_grid=decision_grid,
+            tape=tape,
+            linear_signals=linear_signals,
+            config=horizon_config,
+        )
+        if horizon_config.enabled
+        else None
+    )
     result = evaluate_policy(
         env,
         policy,
         config=eval_config,
         observation_normalizer=observation_normalizer,
+        horizon_diagnostics=horizon_accumulator,
     )
 
     split_lineage = _split_summary(split_contract, config.eval_split)
+    full_split_lineage = _split_summary(split_contract, config.eval_split, include_ranges=True)
     evaluation_payload = result.as_dict()
     evaluation_config = evaluation_payload["config"]  # type: ignore[index]
     evaluated_ranges = evaluation_config["evaluated_decision_row_ranges"]  # type: ignore[index]
+    horizon_payload = (
+        horizon_accumulator.as_dict(include_records=False)
+        if horizon_accumulator is not None
+        else {
+            "enabled": False,
+            "horizons_us": list(config.horizon_diagnostics_us),
+            "decision_level": {},
+            "fill_markouts": {},
+            "signal_alignment": {},
+            "warnings": [],
+        }
+    )
+    if config.horizon_debug_json is not None and horizon_accumulator is not None:
+        write_json_atomic(
+            config.horizon_debug_json,
+            horizon_accumulator.as_dict(include_records=True),
+        )
+    linear_summary = linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path))
+    observation_schema_full = env.config.observation_schema.as_dict()
+    evaluation_payload_primary = dict(evaluation_payload)
+    evaluation_payload_primary["config"] = {
+        key: value
+        for key, value in dict(evaluation_config).items()
+        if key not in ("decision_row_ranges", "evaluated_decision_row_ranges")
+    }
+    evaluation_payload_primary.pop("telemetry", None)
+    debug_output_path = Path(config.debug_output_json) if config.debug_output_json is not None else None
     summary = {
         "status": result.status,
         "run_type": "evaluate_execution_policy",
+        "compact_summary": {},
+        "metrics": evaluation_payload["metrics"],
+        "horizon_diagnostics": horizon_payload,
         "eval_split": config.eval_split,
         "tape_root": str(Path(config.tape_root)),
         "decision_grid_path": str(Path(config.decision_grid_path)),
         "split_source_dataset_root": str(Path(config.split_source_dataset_root)),
         "checkpoint_path": str(Path(config.checkpoint_path)),
         "output_json": str(output_json),
+        "debug_output_json": None if debug_output_path is None else str(debug_output_path),
+        "horizon_debug_json": config.horizon_debug_json,
         "config": _summary_config(config),
         "device": torch_device_summary(requested_device=config.device, resolved_device=device),
         "cuda_memory": cuda_memory_summary(device),
@@ -851,8 +977,8 @@ def run_execution_policy_evaluation(
                 else None
             ),
         },
-        "observation_schema": env.config.observation_schema.as_dict(),
-        "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
+        "observation_schema": _observation_schema_summary(observation_schema_full),
+        "linear_signals": _linear_signal_summary_compact(linear_summary),
         "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
         "adverse_signal_queue_config": adverse_queue_config,
         "decision_grid_start": decision_grid_start.as_dict(),
@@ -862,21 +988,55 @@ def run_execution_policy_evaluation(
             "n_rows": decision_grid.n_rows,
             "schedule": decision_grid.decision_schedule,
         },
-        "split_contract": split_contract,
-        "checkpoint_split_contract": checkpoint_split_contract,
+        "lineage": {
+            "decision_grid": {
+                "schema": decision_grid.metadata.schema,
+                "hash": decision_grid.decision_grid_hash,
+                "n_rows": decision_grid.n_rows,
+                "schedule": decision_grid.decision_schedule,
+            },
+            "linear_signals": _linear_signal_summary_compact(linear_summary),
+            "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
+            "split_contract": _split_contract_summary(split_contract),
+        },
+        "split_contract": _split_contract_summary(split_contract),
+        "checkpoint_split_contract": _split_contract_summary(checkpoint_split_contract),
         "split_lineage": split_lineage,
         "eval_requested_row_count": evaluation_config["eval_requested_row_count"],  # type: ignore[index]
         "eval_covered_row_count": evaluation_config["eval_covered_row_count"],  # type: ignore[index]
         "eval_coverage_fraction": evaluation_config["eval_coverage_fraction"],  # type: ignore[index]
-        "evaluated_decision_row_ranges": evaluated_ranges,
+        "evaluated_decision_row_range_count": len(evaluated_ranges),
         "episode_count": evaluation_config["episode_count"],  # type: ignore[index]
         "truncation_counts": evaluation_config["truncation_counts"],  # type: ignore[index]
         "evaluated_start_decision_row": evaluation_config["evaluated_start_decision_row"],  # type: ignore[index]
         "evaluated_end_decision_row": evaluation_config["evaluated_end_decision_row"],  # type: ignore[index]
-        "evaluation": evaluation_payload,
+        "evaluation": evaluation_payload_primary,
         "policy_action_telemetry": evaluation_payload.get("telemetry"),
+        "debug": {
+            "debug_output_json": None if debug_output_path is None else str(debug_output_path),
+            "horizon_debug_json": config.horizon_debug_json,
+        },
     }
-    _write_json_atomic(output_json, summary)
+    summary["compact_summary"] = compact_eval_summary(summary)
+    if debug_output_path is not None:
+        write_json_atomic(
+            debug_output_path,
+            {
+                "status": result.status,
+                "run_type": "evaluate_execution_policy_debug",
+                "primary_output_json": str(output_json),
+                "config": _summary_config(config),
+                "observation_schema": observation_schema_full,
+                "linear_signals": linear_summary,
+                "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
+                "split_contract": split_contract,
+                "checkpoint_split_contract": checkpoint_split_contract,
+                "split_lineage": full_split_lineage,
+                "evaluation": evaluation_payload,
+                "policy_action_telemetry": evaluation_payload.get("telemetry"),
+            },
+        )
+    write_json_atomic(output_json, summary)
     return summary
 
 
@@ -891,6 +1051,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-split", required=True, choices=("val", "test"))
 
     parser.add_argument("--output-json")
+    parser.add_argument("--debug-output-json")
+    parser.add_argument("--horizon-debug-json")
     parser.add_argument(
         "--linear-signals-npz",
         help="Canonical no-move-gated linear signal NPZ. Defaults to <tape-root>/linear_signals.npz. Required; missing file is an error.",
@@ -938,6 +1100,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64", "fp32", "fp64"), default="float32")
     parser.add_argument("--no-diagnostics", action="store_true")
+    parser.add_argument(
+        "--horizon-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable compact future-horizon reward/markout diagnostics.",
+    )
+    parser.add_argument(
+        "--horizon-diagnostics-us",
+        default="250000,500000,1000000",
+        help="Comma-separated positive future horizons in microseconds.",
+    )
+    parser.add_argument("--stdout-mode", choices=STDOUT_MODES, default="summary")
     parser.add_argument("--override-env-config", action="store_true")
 
     return parser
@@ -951,6 +1125,8 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         split_source_dataset_root=args.split_source_dataset_root,
         eval_split=args.eval_split,
         output_json=args.output_json,
+        debug_output_json=args.debug_output_json,
+        horizon_debug_json=args.horizon_debug_json,
         linear_signals_npz=args.linear_signals_npz,
         adverse_signals_npz=args.adverse_signals_npz,
         allow_adverse_queue_config_mismatch=args.allow_adverse_queue_config_mismatch,
@@ -985,6 +1161,9 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPolicyEvaluationCLIC
         device=args.device,
         dtype=args.dtype,
         include_diagnostics=not args.no_diagnostics,
+        horizon_diagnostics_enabled=args.horizon_diagnostics,
+        horizon_diagnostics_us=parse_horizon_diagnostics_us(args.horizon_diagnostics_us),
+        stdout_mode=args.stdout_mode,
         override_env_config=args.override_env_config,
     )
 
@@ -994,7 +1173,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = _config_from_args(args)
     summary = run_execution_policy_evaluation(config)
-    print(json.dumps(summary, sort_keys=True))
+    if config.stdout_mode == "summary":
+        print_human_summary("evaluate_execution_policy", summary)
+    elif config.stdout_mode == "json":
+        print(compact_json_line(summary))
     return 0
 
 
