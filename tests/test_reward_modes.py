@@ -178,7 +178,7 @@ def test_fill_markout_horizon_scores_fills_and_preserves_no_fill_zero():
         _anchor(t_index=2, decision_row=3, next_decision_row=4, decision_local_ts_us=1_000_001),
     )
 
-    result = projector.project(anchors, {(0, 0): {}}, shape=(3, 1))
+    result = projector.project(anchors, {(0, 0): {3: 0.0, 4: 0.0}}, shape=(3, 1))
 
     assert result.valid_mask[:, 0].tolist() == [True, True, True]
     assert result.projected_rewards[0, 0] == pytest.approx(1.9)
@@ -198,7 +198,34 @@ def test_fill_markout_horizon_scores_fills_and_preserves_no_fill_zero():
         shape=(1, 1),
     )
     assert not bool(unavailable.valid_mask[0, 0])
-    assert unavailable.stats["unavailable_reason_counts"] == {"fill_horizon_unavailable": 1}
+    assert unavailable.stats["unavailable_reason_counts"] == {"fill_future_row_unavailable": 1}
+
+
+def test_fill_markout_horizon_requires_same_episode_future_row():
+    projector = _projector("fill_markout_horizon", reward_horizon_us=1_000_000)
+    anchor = _anchor(
+        fills=(_fill(side=OrderSide.BUY, local_ts_us=1, price_tick=100, fee=0.1),),
+    )
+
+    result = projector.project((anchor,), {(0, 0): {}}, shape=(1, 1))
+
+    assert not bool(result.valid_mask[0, 0])
+    assert result.projected_rewards[0, 0] == pytest.approx(0.0)
+    assert result.components["fill_count_scored"][0, 0] == pytest.approx(0.0)
+    assert result.components["fill_count_unavailable"][0, 0] == pytest.approx(1.0)
+    assert result.stats["unavailable_reason_counts"] == {"fill_future_episode_row_unavailable": 1}
+
+
+def test_fill_markout_horizon_no_fill_remains_valid_without_future_row():
+    projector = _projector("fill_markout_horizon", reward_horizon_us=1_000_000)
+    anchor = _anchor(fills=())
+
+    result = projector.project((anchor,), {(0, 0): {}}, shape=(1, 1))
+
+    assert bool(result.valid_mask[0, 0])
+    assert result.projected_rewards[0, 0] == pytest.approx(0.0)
+    assert result.components["fill_count_scored"][0, 0] == pytest.approx(0.0)
+    assert result.components["fill_count_unavailable"][0, 0] == pytest.approx(0.0)
 
 
 def test_horizon_blend_weights_path_and_fill_once():
@@ -222,6 +249,26 @@ def test_horizon_blend_weights_path_and_fill_once():
     assert result.components["fill_markout_pnl_H"][0, 0] == pytest.approx(1.9)
     assert result.components["blended_reward_raw"][0, 0] == pytest.approx(6.95)
     assert result.projected_rewards[0, 0] == pytest.approx(20.85)
+
+
+def test_horizon_blend_invalidates_missing_same_episode_fill_horizon():
+    projector = _projector(
+        "horizon_blend",
+        reward_horizon_us=1_000_000,
+        horizon_path_weight=1.0,
+        fill_markout_weight=1.0,
+    )
+    anchor = _anchor(
+        fills=(_fill(side=OrderSide.BUY, local_ts_us=250_001, price_tick=100, fee=0.1),),
+        previous_equity=0.0,
+    )
+
+    result = projector.project((anchor,), {(0, 0): {3: 3.0}}, shape=(1, 1))
+
+    assert not bool(result.valid_mask[0, 0])
+    assert result.projected_rewards[0, 0] == pytest.approx(0.0)
+    assert "blended_reward_raw" not in result.components
+    assert result.stats["unavailable_reason_counts"] == {"fill_future_episode_row_unavailable": 1}
 
 
 def test_horizon_potential_shaped_uses_phi_delta_and_invalidates_missing_phi():
@@ -276,13 +323,56 @@ def test_fifo_lot_ledger_and_realized_lot_projection():
         realized_lot_pnl=0.8,
     )
 
-    result = projector.project((anchor,), {(0, 0): {}}, shape=(1, 1))
+    result = projector.project((anchor,), {(0, 0): {4: 0.0}}, shape=(1, 1))
 
     assert result.valid_mask[0, 0]
     assert result.components["realized_lot_pnl"][0, 0] == pytest.approx(0.8)
     assert result.components["unrealized_horizon_carry_pnl"][0, 0] == pytest.approx(-2.0)
     assert result.components["fill_markout_pnl_H"][0, 0] == pytest.approx(1.9)
     assert result.projected_rewards[0, 0] == pytest.approx(-0.25)
+
+
+def test_realized_lot_horizon_requires_anchor_future_row():
+    projector = _projector("realized_lot_horizon", reward_horizon_us=1_000_000)
+    anchor = _anchor(fills=())
+
+    result = projector.project((anchor,), {(0, 0): {}}, shape=(1, 1))
+
+    assert not bool(result.valid_mask[0, 0])
+    assert result.stats["unavailable_reason_counts"] == {
+        "realized_lot_future_episode_row_unavailable": 1
+    }
+
+
+def test_realized_lot_horizon_requires_fill_future_row_when_fills_exist():
+    projector = _projector("realized_lot_horizon", reward_horizon_us=1_000_000)
+    anchor = _anchor(
+        fills=(_fill(side=OrderSide.SELL, local_ts_us=250_001, price_tick=101, qty=1.0, fee=0.1),),
+    )
+
+    result = projector.project((anchor,), {(0, 0): {3: 0.0}}, shape=(1, 1))
+
+    assert not bool(result.valid_mask[0, 0])
+    assert result.components["fill_count_scored"][0, 0] == pytest.approx(0.0)
+    assert result.components["fill_count_unavailable"][0, 0] == pytest.approx(1.0)
+    assert result.stats["unavailable_reason_counts"] == {"fill_future_episode_row_unavailable": 1}
+
+
+def test_realized_lot_horizon_no_fill_still_requires_anchor_future_row():
+    projector = _projector("realized_lot_horizon", reward_horizon_us=1_000_000)
+    anchor = _anchor(
+        fills=(),
+        inventory_after_step=1.0,
+        current_mid_after_step=101.0,
+        realized_lot_pnl=0.5,
+    )
+
+    valid = projector.project((anchor,), {(0, 0): {3: 0.0}}, shape=(1, 1))
+    invalid = projector.project((anchor,), {(0, 0): {}}, shape=(1, 1))
+
+    assert bool(valid.valid_mask[0, 0])
+    assert valid.projected_rewards[0, 0] == pytest.approx(1.5)
+    assert not bool(invalid.valid_mask[0, 0])
 
 
 def test_multi_horizon_path_weighted_sum_and_missing_horizon_invalid():

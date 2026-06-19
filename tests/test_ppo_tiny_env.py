@@ -622,6 +622,10 @@ def test_non_equity_rollout_collects_lookahead_tail_without_training_normalizer_
     assert batch.reward_projection_stats["valid_anchor_count"] == 1
     assert batch.reward_projection_stats["tail_step_count"] >= 1
     assert batch.reward_projection_stats["max_tail_step_count"] >= 1
+    assert batch.timing is not None
+    assert batch.timing["total_sim_steps_including_tail"] > batch.num_steps
+    assert batch.timing["total_sim_steps_per_sec"] > 0.0
+    assert batch.timing["anchor_steps_per_sec"] > 0.0
     assert batch.env_rewards is not None
     assert batch.projected_rewards is not None
     assert batch.rewards.shape == (1, 1)
@@ -644,6 +648,31 @@ def test_non_equity_rollout_raises_when_all_horizons_unavailable():
             device="cpu",
             reward_config=TrainingRewardConfig(
                 training_reward_mode="horizon_path_equity",
+                reward_horizon_us=10_000_000,
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="zero valid anchors"):
+        collector.collect()
+
+
+def test_realized_lot_rollout_invalidates_when_episode_ends_before_horizon():
+    env = _tiny_env()
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(
+        obs_dim=obs_dim,
+        config=ActorCriticConfig(hidden_sizes=(8,)),
+    )
+    collector = RolloutCollector(
+        env,
+        policy,
+        config=RolloutConfig(
+            rollout_steps=1,
+            num_envs=1,
+            device="cpu",
+            reward_config=TrainingRewardConfig(
+                training_reward_mode="realized_lot_horizon",
                 reward_horizon_us=10_000_000,
             ),
         ),

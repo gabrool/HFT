@@ -526,26 +526,52 @@ class HorizonRewardProjector:
             anchor.previous_equity if base_equity is None else float(base_equity)
         ), None
 
-    def _future_mid_for_ts(
+    def _future_row_in_anchor_episode(
         self,
+        anchor: RewardAnchor,
+        equity_by_episode: Mapping[tuple[int, int], Mapping[int, float]],
         *,
         ts_us: int,
         horizon_us: int,
-        range_end_row: int,
-    ) -> tuple[float | None, str | None]:
+        reason_prefix: str,
+    ) -> tuple[int | None, str | None]:
         future_row = future_row_for_ts(
             self.decision_local_ts_us,
             int(ts_us),
             int(horizon_us),
-            int(range_end_row),
+            int(anchor.range_end_row),
         )
         if future_row is None:
-            return None, "future_mid_unavailable"
+            return None, f"{reason_prefix}_future_row_unavailable"
+        episode_equity = equity_by_episode.get((anchor.env_index, anchor.episode_id), {})
+        if future_row not in episode_equity:
+            return None, f"{reason_prefix}_future_episode_row_unavailable"
+        return future_row, None
+
+    def _future_mid_for_anchor_episode(
+        self,
+        anchor: RewardAnchor,
+        equity_by_episode: Mapping[tuple[int, int], Mapping[int, float]],
+        *,
+        ts_us: int,
+        horizon_us: int,
+        reason_prefix: str,
+    ) -> tuple[float | None, str | None]:
+        future_row, reason = self._future_row_in_anchor_episode(
+            anchor,
+            equity_by_episode,
+            ts_us=ts_us,
+            horizon_us=horizon_us,
+            reason_prefix=reason_prefix,
+        )
+        if future_row is None:
+            return None, reason
         return float(self.mid_prices[future_row]), None
 
     def _fill_markout_component(
         self,
         anchor: RewardAnchor,
+        equity_by_episode: Mapping[tuple[int, int], Mapping[int, float]],
         *,
         horizon_us: int,
     ) -> tuple[float | None, dict[str, float], str | None]:
@@ -556,31 +582,38 @@ class HorizonRewardProjector:
         }
         if not anchor.fills:
             return 0.0, components, None
-        total = 0.0
-        unavailable = 0
+        fill_futures: list[tuple[Fill, float]] = []
+        unavailable_reason: str | None = None
         for fill in anchor.fills:
-            future_mid, reason = self._future_mid_for_ts(
+            future_mid, reason = self._future_mid_for_anchor_episode(
+                anchor,
+                equity_by_episode,
                 ts_us=fill.local_ts_us,
                 horizon_us=horizon_us,
-                range_end_row=anchor.range_end_row,
+                reason_prefix="fill",
             )
             if future_mid is None:
-                unavailable += 1
+                components["fill_count_unavailable"] += 1.0
+                if unavailable_reason is None:
+                    unavailable_reason = reason
                 continue
+            fill_futures.append((fill, future_mid))
+        if unavailable_reason is not None:
+            return None, components, unavailable_reason
+
+        total = 0.0
+        for fill, future_mid in fill_futures:
             fill_price = float(fill.price_tick) * self.tick_size
             if fill.side == OrderSide.BUY:
                 gross = float(fill.qty) * self.contract_size * (future_mid - fill_price)
             elif fill.side == OrderSide.SELL:
                 gross = float(fill.qty) * self.contract_size * (fill_price - future_mid)
             else:
-                unavailable += 1
-                continue
+                components["fill_count_unavailable"] += 1.0
+                return None, components, "fill_side_unavailable"
             total += gross - float(fill.fee)
             components["fill_count_scored"] += 1.0
         components["fill_markout_pnl_H"] = total
-        components["fill_count_unavailable"] = float(unavailable)
-        if unavailable:
-            return None, components, "fill_horizon_unavailable"
         return total, components, None
 
     def _project_one(
@@ -606,6 +639,7 @@ class HorizonRewardProjector:
         if mode is TrainingRewardMode.FILL_MARKOUT_HORIZON:
             fill, components, reason = self._fill_markout_component(
                 anchor,
+                equity_by_episode,
                 horizon_us=self.config.reward_horizon_us,
             )
             if fill is None:
@@ -620,6 +654,7 @@ class HorizonRewardProjector:
             )
             fill, components, fill_reason = self._fill_markout_component(
                 anchor,
+                equity_by_episode,
                 horizon_us=self.config.reward_horizon_us,
             )
             if path is None:
@@ -657,13 +692,16 @@ class HorizonRewardProjector:
             }, None
 
         if mode is TrainingRewardMode.REALIZED_LOT_HORIZON:
-            future_mid, reason = self._future_mid_for_ts(
+            future_mid, reason = self._future_mid_for_anchor_episode(
+                anchor,
+                equity_by_episode,
                 ts_us=anchor.decision_local_ts_us,
                 horizon_us=self.config.reward_horizon_us,
-                range_end_row=anchor.range_end_row,
+                reason_prefix="realized_lot",
             )
             fill, components, fill_reason = self._fill_markout_component(
                 anchor,
+                equity_by_episode,
                 horizon_us=self.config.reward_horizon_us,
             )
             if future_mid is None:

@@ -1116,6 +1116,8 @@ class RolloutCollector:
 
         rollout_seconds = time.perf_counter() - rollout_started
         total_steps = float(T * N)
+        tail_steps = int(reward_projection_stats["tail_step_count"])
+        total_sim_steps = float(total_steps + tail_steps)
         timing: dict[str, object] = {
             "rollout_seconds": float(rollout_seconds),
             "policy_forward_seconds": float(policy_forward_seconds),
@@ -1123,6 +1125,9 @@ class RolloutCollector:
             "env_steps_per_sec": float(total_steps / env_step_seconds) if env_step_seconds > 0.0 else 0.0,
             "policy_forward_steps_per_sec": float(total_steps / policy_forward_seconds) if policy_forward_seconds > 0.0 else 0.0,
             "total_steps_per_sec": float(total_steps / rollout_seconds) if rollout_seconds > 0.0 else 0.0,
+            "anchor_steps_per_sec": float(total_steps / rollout_seconds) if rollout_seconds > 0.0 else 0.0,
+            "total_sim_steps_including_tail": int(total_sim_steps),
+            "total_sim_steps_per_sec": float(total_sim_steps / rollout_seconds) if rollout_seconds > 0.0 else 0.0,
             "discount_mode": config.discount_mode,
             "discount_horizon_us": int(config.discount_horizon_us),
         }
