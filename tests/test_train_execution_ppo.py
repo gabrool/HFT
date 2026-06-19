@@ -82,6 +82,15 @@ def test_parser_accepts_discount_mode_and_horizon():
     assert summary_config["discount_horizon_us"] == 1_000_000
 
 
+def test_parser_accepts_stdout_mode():
+    parser = build_arg_parser()
+    args = parser.parse_args([*REQUIRED_TRAIN_ARGS, "--stdout-mode", "none"])
+    config = _config_from_args(args)
+
+    assert config.stdout_mode == "none"
+    assert _summary_config(config)["stdout_mode"] == "none"
+
+
 def test_train_execution_ppo_rejects_invalid_discount_config():
     parser = build_arg_parser()
     with pytest.raises(SystemExit):

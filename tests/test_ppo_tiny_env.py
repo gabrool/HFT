@@ -440,7 +440,13 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["config"]["discount_mode"] == "step"
     assert summary["config"]["discount_horizon_us"] == 1_000_000
     assert any("discount_mode=step on an event-driven decision grid" in item for item in summary["config_warnings"])
+    assert summary["compact_summary"]["discount_mode"] == "step"
+    assert summary["compact_summary"]["discount_horizon_us"] == 1_000_000
     assert summary["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
+    assert "ranges_by_split" not in summary["split_contract"]
+    assert "ranges_by_split" not in summary["split_lineage"]
+    assert "train_ranges" not in summary
+    assert "field_names" not in summary["observation_schema"]
     assert summary["train_window_sampling"] == "stratified_random"
     assert summary["sampling"]["train_window_sampling"] == "stratified_random"
     assert summary["sampling"]["seed"] == 123
@@ -455,7 +461,8 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert ckpt["updates_completed"] == 1
     assert "policy_state_dict" in ckpt
     assert ckpt["tape"]["symbol"] == "BTCUSDT"
-    assert ckpt["observation_schema"] == summary["observation_schema"]
+    assert len(ckpt["observation_schema"]["field_names"]) == summary["observation_schema"]["field_count"]
+    assert ckpt["observation_schema"]["dtype"] == summary["observation_schema"]["dtype"]
     assert ckpt["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
     assert ckpt["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
     assert ckpt["train_split"] == "train"
@@ -506,7 +513,7 @@ def test_run_execution_ppo_profile_includes_time_discount_stats(tmp_path):
     assert 0.0 <= discounting["lambda_discount_min"] <= 1.0
 
 
-def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):
+def test_train_execution_ppo_main_writes_summary_and_prints_compact_default(tmp_path, capsys):
     tape_root = _tiny_tape_root(tmp_path)
     output_json = tmp_path / "summary.json"
 
@@ -547,11 +554,62 @@ def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsy
 
     assert rc == 0
     assert output_json.exists()
-    stdout_payload = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
     disk_payload = json.loads(output_json.read_text())
+    assert "train_execution_ppo: ok" in stdout
+    assert "discount=" in stdout
+    assert "ranges_by_split" not in stdout
+    assert "field_names" not in stdout
+    assert "policy_state_dict" not in stdout
+    assert len(stdout.splitlines()) < 50
+    assert disk_payload["checkpoint_saved"] is False
+    assert disk_payload["training"]["updates_completed"] == 1
+
+
+def test_train_execution_ppo_stdout_json_and_none_modes(tmp_path, capsys):
+    tape_root = _tiny_tape_root(tmp_path)
+    json_output = tmp_path / "summary_json.json"
+
+    base_args = [
+        "--tape-root",
+        str(tape_root),
+        "--decision-grid",
+        str(tape_root / "decision_grid"),
+        "--split-source-dataset-root",
+        str(tape_root / "split_source"),
+        "--train-split",
+        "train",
+        "--maker-fee-bps",
+        "0.0",
+        "--num-updates",
+        "1",
+        "--num-envs",
+        "1",
+        "--rollout-steps",
+        "4",
+        "--update-epochs",
+        "1",
+        "--minibatch-size",
+        "2",
+        "--hidden-sizes",
+        "8",
+        "--max-episode-steps",
+        "4",
+        "--seed",
+        "123",
+        "--no-checkpoint",
+        "--overwrite",
+    ]
+    rc = main([*base_args, "--output-json", str(json_output), "--stdout-mode", "json"])
+    assert rc == 0
+    stdout_payload = json.loads(capsys.readouterr().out)
+    disk_payload = json.loads(json_output.read_text())
     assert stdout_payload == disk_payload
-    assert stdout_payload["checkpoint_saved"] is False
-    assert stdout_payload["training"]["updates_completed"] == 1
+
+    none_output = tmp_path / "summary_none.json"
+    rc = main([*base_args, "--output-json", str(none_output), "--stdout-mode", "none"])
+    assert rc == 0
+    assert capsys.readouterr().out == ""
 
 
 

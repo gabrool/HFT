@@ -9,6 +9,7 @@ import torch
 
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
 from mmrt.execution.env import ExecutionEnv
+from mmrt.execution.horizon_diagnostics import HorizonDiagnosticsAccumulator
 from mmrt.execution.metrics import ExecutionMetricAccumulator
 from mmrt.execution.split_contract import DecisionSplitRange
 from mmrt.rl.action_telemetry import ActionTelemetryAccumulator
@@ -211,6 +212,7 @@ def evaluate_policy(
     *,
     config: PolicyEvaluationConfig = PolicyEvaluationConfig(),
     observation_normalizer: ObservationNormalizer | None = None,
+    horizon_diagnostics: HorizonDiagnosticsAccumulator | None = None,
 ) -> PolicyEvaluationResult:
     if not isinstance(env, ExecutionEnv):
         raise TypeError("env must be ExecutionEnv")
@@ -223,6 +225,11 @@ def evaluate_policy(
         ObservationNormalizer,
     ):
         raise TypeError("observation_normalizer must be None or ObservationNormalizer")
+    if horizon_diagnostics is not None and not isinstance(
+        horizon_diagnostics,
+        HorizonDiagnosticsAccumulator,
+    ):
+        raise TypeError("horizon_diagnostics must be None or HorizonDiagnosticsAccumulator")
     if policy.obs_dim != env.config.observation_schema.dim:
         raise ValueError("policy.obs_dim must equal env observation dimension")
     if not config.reset_env and config.start_decision_row is not None:
@@ -287,6 +294,8 @@ def evaluate_policy(
                     break
 
                 reset = env.reset(start_decision_row=cursor)
+                if horizon_diagnostics is not None and horizon_diagnostics.enabled:
+                    horizon_diagnostics.start_episode()
                 current_observation = reset.observation
                 current_decision_row = int(reset.info["decision_grid_row_index"])
                 if current_decision_row != cursor:
@@ -339,6 +348,12 @@ def evaluate_policy(
                     step = env.step(action)
                     acc.update(step.execution)
                     telemetry.update_execution_step(step.execution)
+                    if horizon_diagnostics is not None and horizon_diagnostics.enabled:
+                        horizon_diagnostics.record_step(
+                            step,
+                            requested_bid_enabled=bool(action[0] >= 0.5),
+                            requested_ask_enabled=bool(action[1] >= 0.5),
+                        )
                     step_count += 1
                     next_decision_row = int(step.info["next_decision_grid_row_index"])
                     if range_end is not None and next_decision_row >= range_end:

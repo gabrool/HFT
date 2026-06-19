@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
-import json
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -27,6 +26,14 @@ from mmrt.execution.split_contract import (
 )
 from mmrt.cli.execution_env_config import build_execution_env_config_from_attrs
 from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execution_tape
+from mmrt.cli.output import (
+    STDOUT_MODES,
+    compact_json_line,
+    compact_training_summary,
+    print_human_summary,
+    validate_stdout_mode,
+    write_json_atomic,
+)
 from mmrt.rl.device import cuda_memory_summary, resolve_torch_device, torch_device_summary
 from mmrt.rl.normalization import ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig
@@ -178,6 +185,7 @@ class ExecutionPPOTrainCLIConfig:
     split_source_dataset_root: str
     train_split: str = "train"
     output_json: str | None = None
+    debug_output_json: str | None = None
     checkpoint_path: str | None = None
     linear_signals_npz: str | None = None
     adverse_signals_npz: str | None = None
@@ -267,6 +275,7 @@ class ExecutionPPOTrainCLIConfig:
 
     profile_rollout_steps: int | None = None
     profile_output_json: str | None = None
+    stdout_mode: str = "summary"
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
@@ -276,6 +285,8 @@ class ExecutionPPOTrainCLIConfig:
             raise ValueError('train_split must be "train"')
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
+        if self.debug_output_json is not None:
+            _require_nonempty_str(self.debug_output_json, "debug_output_json")
         if self.checkpoint_path is not None:
             _require_nonempty_str(self.checkpoint_path, "checkpoint_path")
         if self.linear_signals_npz is not None:
@@ -376,6 +387,7 @@ class ExecutionPPOTrainCLIConfig:
             _require_positive_float(self.observation_normalizer_clip, "observation_normalizer_clip")
         _require_positive_float(self.observation_normalizer_rms_epsilon, "observation_normalizer_rms_epsilon")
         _optional_positive_int(self.profile_rollout_steps, "profile_rollout_steps")
+        object.__setattr__(self, "stdout_mode", validate_stdout_mode(self.stdout_mode))
 
 
 def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
@@ -385,6 +397,7 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "split_source_dataset_root": config.split_source_dataset_root,
         "train_split": config.train_split,
         "output_json": config.output_json,
+        "debug_output_json": config.debug_output_json,
         "checkpoint_path": config.checkpoint_path,
         "linear_signals_npz": config.linear_signals_npz,
         "adverse_signals_npz": config.adverse_signals_npz,
@@ -463,14 +476,32 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "observation_normalizer_rms_epsilon": config.observation_normalizer_rms_epsilon,
         "profile_rollout_steps": config.profile_rollout_steps,
         "profile_output_json": config.profile_output_json,
+        "stdout_mode": config.stdout_mode,
     }
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+def _observation_schema_summary(schema: Mapping[str, object]) -> dict[str, object]:
+    field_names = schema.get("field_names")
+    field_count = len(field_names) if isinstance(field_names, Sequence) and not isinstance(field_names, (str, bytes)) else None
+    return {
+        "dtype": schema.get("dtype"),
+        "field_count": field_count,
+    }
+
+
+def _split_contract_summary(contract: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "schema": contract["schema"],
+        "version": contract["version"],
+        "split_source_dataset_root": contract["split_source_dataset_root"],
+        "split_source_dataset_id": contract["split_source_dataset_id"],
+        "split_source_manifest_hash": contract["split_source_manifest_hash"],
+        "decision_grid_schema": contract["decision_grid_schema"],
+        "decision_grid_hash": contract["decision_grid_hash"],
+        "decision_grid_n_rows": contract["decision_grid_n_rows"],
+        "decision_schedule": contract["decision_schedule"],
+        "row_counts_by_split": contract["row_counts_by_split"],
+    }
 
 
 def _save_checkpoint_atomic(path: Path, payload: Mapping[str, object]) -> None:
@@ -737,9 +768,9 @@ def _env_config_summary(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]
     }
 
 
-def _split_lineage_summary(contract: Mapping[str, object], split: str) -> dict[str, object]:
+def _split_lineage_summary(contract: Mapping[str, object], split: str, *, include_ranges: bool = False) -> dict[str, object]:
     ranges = [entry.as_dict() for entry in ranges_for_split(contract, split)]
-    return {
+    payload: dict[str, object] = {
         "schema": contract["schema"],
         "version": contract["version"],
         "split_source_dataset_root": contract["split_source_dataset_root"],
@@ -749,12 +780,15 @@ def _split_lineage_summary(contract: Mapping[str, object], split: str) -> dict[s
         "decision_grid_hash": contract["decision_grid_hash"],
         "decision_grid_n_rows": contract["decision_grid_n_rows"],
         "decision_schedule": contract["decision_schedule"],
-        "ranges_by_split": contract["ranges_by_split"],
         "row_counts_by_split": contract["row_counts_by_split"],
         "selected_split": split,
-        "selected_ranges": ranges,
+        "selected_range_count": len(ranges),
         "selected_row_count": int(contract["row_counts_by_split"][split]),  # type: ignore[index]
     }
+    if include_ranges:
+        payload["ranges_by_split"] = contract["ranges_by_split"]
+        payload["selected_ranges"] = ranges
+    return payload
 
 
 def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
@@ -838,14 +872,19 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
     )
 
     split_lineage = _split_lineage_summary(split_contract, config.train_split)
+    full_split_lineage = _split_lineage_summary(split_contract, config.train_split, include_ranges=True)
     training_summary = result.summary_dict()
+    observation_schema_full = envs[0].config.observation_schema.as_dict()
+    debug_output_path = Path(config.debug_output_json) if config.debug_output_json is not None else None
     summary: dict[str, object] = {
         "status": "ok",
         "run_type": "profile_execution_ppo_rollout" if profile_mode else "train_execution_ppo",
+        "compact_summary": {},
         "tape_root": str(Path(config.tape_root)),
         "decision_grid_path": str(Path(config.decision_grid_path)),
         "split_source_dataset_root": str(Path(config.split_source_dataset_root)),
         "output_json": str(output_json),
+        "debug_output_json": None if debug_output_path is None else str(debug_output_path),
         "checkpoint_path": None if profile_mode or not config.save_checkpoint else str(checkpoint_path),
         "config": _summary_config(config),
         "config_warnings": _config_warnings(config, decision_schedule=decision_grid.decision_schedule),
@@ -865,7 +904,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         },
         "training": training_summary,
         "sampling": training_summary["sampling"],
-        "observation_schema": envs[0].config.observation_schema.as_dict(),
+        "observation_schema": _observation_schema_summary(observation_schema_full),
         "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
         "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
         "adverse_signal_queue_config": adverse_queue_config,
@@ -876,10 +915,20 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "n_rows": decision_grid.n_rows,
             "schedule": decision_grid.decision_schedule,
         },
-        "split_contract": split_contract,
+        "lineage": {
+            "decision_grid": {
+                "schema": decision_grid.metadata.schema,
+                "hash": decision_grid.decision_grid_hash,
+                "n_rows": decision_grid.n_rows,
+                "schedule": decision_grid.decision_schedule,
+            },
+            "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
+            "adverse_signals": _adverse_signal_summary(adverse_signals, config.adverse_signals_npz),
+            "split_contract": _split_contract_summary(split_contract),
+        },
+        "split_contract": _split_contract_summary(split_contract),
         "split_lineage": split_lineage,
         "train_split": config.train_split,
-        "train_ranges": split_lineage["selected_ranges"],
         "train_row_count": split_lineage["selected_row_count"],
         "debug_start_decision_row": config.debug_start_decision_row,
         "train_window_sampling": config.train_window_sampling,
@@ -888,6 +937,9 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "num_envs": config.num_envs,
             "rollout_steps_per_env": training_config.rollout_config.rollout_steps,
             "effective_batch_size": training_config.rollout_config.rollout_steps * training_config.rollout_config.num_envs,
+        },
+        "debug": {
+            "debug_output_json": None if debug_output_path is None else str(debug_output_path),
         },
     }
 
@@ -905,7 +957,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         checkpoint_payload = make_training_checkpoint_payload(result)
         checkpoint_payload["cli_config"] = _summary_config(config)
         checkpoint_payload["tape"] = summary["tape"]
-        checkpoint_payload["observation_schema"] = envs[0].config.observation_schema.as_dict()
+        checkpoint_payload["observation_schema"] = observation_schema_full
         checkpoint_payload["linear_signals"] = linear_signal_artifact_summary(
             linear_signals, path=str(linear_signals_path)
         )
@@ -914,10 +966,10 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         checkpoint_payload["decision_grid_start"] = decision_grid_start.as_dict()
         checkpoint_payload["decision_grid"] = summary["decision_grid"]
         checkpoint_payload["split_contract"] = split_contract
-        checkpoint_payload["split_lineage"] = split_lineage
+        checkpoint_payload["split_lineage"] = full_split_lineage
         checkpoint_payload["train_split"] = config.train_split
-        checkpoint_payload["train_ranges"] = split_lineage["selected_ranges"]
-        checkpoint_payload["train_row_count"] = split_lineage["selected_row_count"]
+        checkpoint_payload["train_ranges"] = full_split_lineage["selected_ranges"]
+        checkpoint_payload["train_row_count"] = full_split_lineage["selected_row_count"]
         checkpoint_payload["train_window_sampling"] = config.train_window_sampling
         checkpoint_payload["sampling"] = training_summary["sampling"]
         checkpoint_payload["device"] = summary["device"]
@@ -927,7 +979,23 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
     else:
         summary["checkpoint_saved"] = False
 
-    _write_json_atomic(output_json, summary)
+    summary["compact_summary"] = compact_training_summary(summary)
+    if debug_output_path is not None:
+        write_json_atomic(
+            debug_output_path,
+            {
+                "status": "ok",
+                "run_type": "profile_execution_ppo_rollout_debug" if profile_mode else "train_execution_ppo_debug",
+                "primary_output_json": str(output_json),
+                "config": _summary_config(config),
+                "observation_schema": observation_schema_full,
+                "split_contract": split_contract,
+                "split_lineage": full_split_lineage,
+                "training": training_summary,
+                "sampling": training_summary["sampling"],
+            },
+        )
+    write_json_atomic(output_json, summary)
     return summary
 
 
@@ -939,6 +1007,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-split", required=True, choices=("train",))
 
     parser.add_argument("--output-json")
+    parser.add_argument("--debug-output-json")
     parser.add_argument("--checkpoint-path")
     parser.add_argument(
         "--linear-signals-npz",
@@ -1040,6 +1109,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--profile-rollout-steps", type=int)
     parser.add_argument("--profile-output-json")
+    parser.add_argument("--stdout-mode", choices=STDOUT_MODES, default="summary")
 
     return parser
 
@@ -1051,6 +1121,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         split_source_dataset_root=args.split_source_dataset_root,
         train_split=args.train_split,
         output_json=args.output_json,
+        debug_output_json=args.debug_output_json,
         checkpoint_path=args.checkpoint_path,
         linear_signals_npz=args.linear_signals_npz,
         adverse_signals_npz=args.adverse_signals_npz,
@@ -1130,6 +1201,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         observation_normalizer_rms_epsilon=args.observation_normalizer_rms_epsilon,
         profile_rollout_steps=args.profile_rollout_steps,
         profile_output_json=args.profile_output_json,
+        stdout_mode=args.stdout_mode,
     )
 
 
@@ -1138,7 +1210,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = _config_from_args(args)
     summary = run_execution_ppo_training(config)
-    print(json.dumps(summary, sort_keys=True))
+    if config.stdout_mode == "summary":
+        print_human_summary(str(summary.get("run_type", "train_execution_ppo")), summary)
+    elif config.stdout_mode == "json":
+        print(compact_json_line(summary))
     return 0
 
 

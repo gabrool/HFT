@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Sequence
 
 from mmrt.execution.contracts import ActionSpec, LatencyConfig, PositionState, QueueModelMode
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
+from mmrt.execution.horizon_diagnostics import (
+    DEFAULT_HORIZONS_US,
+    HorizonDiagnosticsAccumulator,
+    HorizonDiagnosticsConfig,
+    parse_horizon_diagnostics_us,
+)
 from mmrt.execution.adverse_runtime import AdverseRuntimeConfig
 from mmrt.execution.adverse_signal import load_adverse_selection_signals
 from mmrt.cli.execution_env_config import build_execution_env_config_from_attrs
@@ -24,6 +29,14 @@ from mmrt.execution.linear_signal import (
 )
 from mmrt.execution.metrics import ExecutionMetricAccumulator
 from mmrt.execution.quote_geometry import QuoteAction
+from mmrt.cli.output import (
+    STDOUT_MODES,
+    compact_audit_summary,
+    compact_json_line,
+    print_human_summary,
+    validate_stdout_mode,
+    write_json_atomic,
+)
 
 AUDIT_POLICIES = (
     "disabled",
@@ -137,6 +150,8 @@ def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
         "decision_grid_path": config.decision_grid_path,
         "linear_signals_npz": config.linear_signals_npz,
         "adverse_signals_npz": config.adverse_signals_npz,
+        "debug_output_json": config.debug_output_json,
+        "horizon_debug_json": config.horizon_debug_json,
         "policy": config.policy,
         "max_steps": config.max_steps,
         "start_event_index": config.start_event_index,
@@ -165,6 +180,9 @@ def _summary_config(config: "ExecutionSimAuditConfig") -> dict[str, object]:
         "drawdown_penalty_rate": config.drawdown_penalty_rate,
         "terminal_inventory_penalty_bps": config.terminal_inventory_penalty_bps,
         "reward_scale": config.reward_scale,
+        "horizon_diagnostics_enabled": config.horizon_diagnostics_enabled,
+        "horizon_diagnostics_us": list(config.horizon_diagnostics_us),
+        "stdout_mode": config.stdout_mode,
     }
 
 
@@ -173,6 +191,8 @@ class ExecutionSimAuditConfig:
     tape_root: str
     decision_grid_path: str
     output_json: str | None = None
+    debug_output_json: str | None = None
+    horizon_debug_json: str | None = None
     linear_signals_npz: str | None = None
     adverse_signals_npz: str | None = None
     overwrite: bool = False
@@ -210,12 +230,19 @@ class ExecutionSimAuditConfig:
     drawdown_penalty_rate: float = 0.0
     terminal_inventory_penalty_bps: float = 0.0
     reward_scale: float = 1.0
+    horizon_diagnostics_enabled: bool = True
+    horizon_diagnostics_us: tuple[int, ...] = DEFAULT_HORIZONS_US
+    stdout_mode: str = "summary"
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.tape_root, "tape_root")
         _require_nonempty_str(self.decision_grid_path, "decision_grid_path")
         if self.output_json is not None:
             _require_nonempty_str(self.output_json, "output_json")
+        if self.debug_output_json is not None:
+            _require_nonempty_str(self.debug_output_json, "debug_output_json")
+        if self.horizon_debug_json is not None:
+            _require_nonempty_str(self.horizon_debug_json, "horizon_debug_json")
         if self.linear_signals_npz is not None:
             _require_nonempty_str(self.linear_signals_npz, "linear_signals_npz")
         if self.adverse_signals_npz is not None:
@@ -251,6 +278,13 @@ class ExecutionSimAuditConfig:
         _require_nonnegative_float(self.drawdown_penalty_rate, "drawdown_penalty_rate")
         _require_nonnegative_float(self.terminal_inventory_penalty_bps, "terminal_inventory_penalty_bps")
         _require_positive_float(self.reward_scale, "reward_scale")
+        _require_bool(self.horizon_diagnostics_enabled, "horizon_diagnostics_enabled")
+        object.__setattr__(
+            self,
+            "horizon_diagnostics_us",
+            parse_horizon_diagnostics_us(tuple(self.horizon_diagnostics_us)),
+        )
+        object.__setattr__(self, "stdout_mode", validate_stdout_mode(self.stdout_mode))
 
 
 def _default_linear_signals_npz(tape_root: str) -> Path:
@@ -294,12 +328,34 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
 
     env = ExecutionEnv(tape, config=env_config, decision_grid=decision_grid, linear_signals=linear_signals, adverse_signals=adverse_signals)
     env.reset(start_event_index=config.start_event_index)
+    horizon_config = HorizonDiagnosticsConfig(
+        enabled=config.horizon_diagnostics_enabled,
+        horizons_us=config.horizon_diagnostics_us,
+    )
+    horizon_accumulator = (
+        HorizonDiagnosticsAccumulator.from_execution(
+            decision_grid=decision_grid,
+            tape=tape,
+            linear_signals=linear_signals,
+            config=horizon_config,
+        )
+        if horizon_config.enabled
+        else None
+    )
+    if horizon_accumulator is not None:
+        horizon_accumulator.start_episode()
 
     acc = ExecutionMetricAccumulator()
     while True:
         action = _policy_action(config.policy, acc.step_count, action_size_raw=config.action_size_raw)
         step = env.step(action)
         acc.update(step.execution)
+        if horizon_accumulator is not None and horizon_accumulator.enabled:
+            horizon_accumulator.record_step(
+                step,
+                requested_bid_enabled=action.bid_enabled,
+                requested_ask_enabled=action.ask_enabled,
+            )
         if step.done or step.truncated:
             break
 
@@ -310,12 +366,36 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
     turnover_metrics = metrics.get("turnover", {})
     reward_metrics = metrics.get("reward", {})
     output_path_str = str(output_path)
+    horizon_payload = (
+        horizon_accumulator.as_dict(include_records=False)
+        if horizon_accumulator is not None
+        else {
+            "enabled": False,
+            "horizons_us": list(config.horizon_diagnostics_us),
+            "decision_level": {},
+            "fill_markouts": {},
+            "signal_alignment": {},
+            "warnings": [],
+        }
+    )
+    if config.horizon_debug_json is not None and horizon_accumulator is not None:
+        write_json_atomic(
+            config.horizon_debug_json,
+            horizon_accumulator.as_dict(include_records=True),
+        )
+    debug_output_path = Path(config.debug_output_json) if config.debug_output_json is not None else None
+    linear_summary = linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path))
     summary = {
         "status": report.status,
+        "run_type": "audit_execution_sim",
         "audit_type": "execution_sim",
+        "compact_summary": {},
+        "horizon_diagnostics": horizon_payload,
         "tape_root": str(Path(config.tape_root)),
         "decision_grid_path": str(Path(config.decision_grid_path)),
         "output_json": output_path_str,
+        "debug_output_json": None if debug_output_path is None else str(debug_output_path),
+        "horizon_debug_json": config.horizon_debug_json,
         "config": _summary_config(config),
         "tape": {
             "schema": tape.manifest.schema,
@@ -340,7 +420,17 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
             "fill_rate": fill_metrics.get("fill_rate"),
         },
         "diagnostics": report.as_dict(),
-        "linear_signals": linear_signal_artifact_summary(linear_signals, path=str(linear_signals_path)),
+        "linear_signals": {
+            "schema": linear_summary.get("schema"),
+            "path": linear_summary.get("path"),
+            "n_rows": linear_summary.get("n_rows"),
+            "dtype": linear_summary.get("dtype"),
+            "fields": linear_summary.get("fields"),
+            "first_decision_event_index": linear_summary.get("first_decision_event_index"),
+            "last_decision_event_index": linear_summary.get("last_decision_event_index"),
+            "first_decision_local_ts_us": linear_summary.get("first_decision_local_ts_us"),
+            "last_decision_local_ts_us": linear_summary.get("last_decision_local_ts_us"),
+        },
         "decision_grid_start": decision_grid_start.as_dict(),
         "decision_grid": {
             "schema": decision_grid.metadata.schema,
@@ -348,12 +438,41 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
             "n_rows": decision_grid.n_rows,
             "schedule": decision_grid.decision_schedule,
         },
+        "lineage": {
+            "decision_grid": {
+                "schema": decision_grid.metadata.schema,
+                "hash": decision_grid.decision_grid_hash,
+                "n_rows": decision_grid.n_rows,
+                "schedule": decision_grid.decision_schedule,
+            },
+            "linear_signals": {
+                "schema": linear_summary.get("schema"),
+                "path": linear_summary.get("path"),
+                "n_rows": linear_summary.get("n_rows"),
+                "metadata": linear_summary.get("metadata"),
+            },
+        },
+        "debug": {
+            "debug_output_json": None if debug_output_path is None else str(debug_output_path),
+            "horizon_debug_json": config.horizon_debug_json,
+        },
     }
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(output_path)
+    summary["compact_summary"] = compact_audit_summary(summary)
+    if debug_output_path is not None:
+        write_json_atomic(
+            debug_output_path,
+            {
+                "status": report.status,
+                "run_type": "audit_execution_sim_debug",
+                "primary_output_json": output_path_str,
+                "config": _summary_config(config),
+                "metrics": metrics,
+                "diagnostics": report.as_dict(),
+                "linear_signals": linear_summary,
+            },
+        )
+    write_json_atomic(output_path, summary)
     return summary
 
 
@@ -362,6 +481,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tape-root", required=True)
     parser.add_argument("--decision-grid", dest="decision_grid_path", required=True)
     parser.add_argument("--output-json")
+    parser.add_argument("--debug-output-json")
+    parser.add_argument("--horizon-debug-json")
     parser.add_argument(
         "--linear-signals-npz",
         help="Canonical no-move-gated linear signal NPZ. Defaults to <tape-root>/linear_signals.npz. Required; missing file is an error.",
@@ -400,6 +521,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drawdown-penalty-rate", type=float, default=0.0)
     parser.add_argument("--terminal-inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--reward-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--horizon-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable compact future-horizon reward/markout diagnostics.",
+    )
+    parser.add_argument(
+        "--horizon-diagnostics-us",
+        default="250000,500000,1000000",
+        help="Comma-separated positive future horizons in microseconds.",
+    )
+    parser.add_argument("--stdout-mode", choices=STDOUT_MODES, default="summary")
     return parser
 
 
@@ -409,6 +542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         tape_root=args.tape_root,
         decision_grid_path=args.decision_grid_path,
         output_json=args.output_json,
+        debug_output_json=args.debug_output_json,
+        horizon_debug_json=args.horizon_debug_json,
         linear_signals_npz=args.linear_signals_npz,
         adverse_signals_npz=args.adverse_signals_npz,
         overwrite=args.overwrite,
@@ -440,9 +575,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         drawdown_penalty_rate=args.drawdown_penalty_rate,
         terminal_inventory_penalty_bps=args.terminal_inventory_penalty_bps,
         reward_scale=args.reward_scale,
+        horizon_diagnostics_enabled=args.horizon_diagnostics,
+        horizon_diagnostics_us=parse_horizon_diagnostics_us(args.horizon_diagnostics_us),
+        stdout_mode=args.stdout_mode,
     )
     summary = run_execution_sim_audit(config)
-    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+    if config.stdout_mode == "summary":
+        print_human_summary("audit_execution_sim", summary)
+    elif config.stdout_mode == "json":
+        print(compact_json_line(summary))
     return 0
 
 
