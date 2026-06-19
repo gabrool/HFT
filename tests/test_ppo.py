@@ -40,6 +40,27 @@ def test_update_ppo_normalizes_advantages_once_over_flat_batch(monkeypatch):
     assert calls["count"] == 1
 
 
+def test_update_ppo_normalizes_advantages_only_over_valid_reward_anchors(monkeypatch):
+    seen = []
+
+    def counted(advantages):
+        seen.append(advantages.detach().clone())
+        return advantages
+
+    monkeypatch.setattr(ppo, "normalize_advantages", counted)
+    policy = ActorCriticNetwork(obs_dim=4, config=ActorCriticConfig(hidden_sizes=(8,)))
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    batch = _synthetic_batch(steps=5)._replace(
+        advantages=torch.arange(5, dtype=torch.float32),
+        reward_valid_mask=torch.tensor([True, False, True, False, True]),
+    )
+
+    update_ppo(policy, optimizer, batch, config=PPOConfig(update_epochs=1, minibatch_size=3))
+
+    assert len(seen) == 1
+    assert torch.equal(seen[0], torch.tensor([0.0, 2.0, 4.0]))
+
+
 def test_update_ppo_honors_normalize_advantages_false(monkeypatch):
     def forbidden(_advantages):
         raise AssertionError("normalize_advantages should not be called")

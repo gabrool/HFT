@@ -220,6 +220,7 @@ def training_config_to_dict(config: PPOTrainingConfig) -> dict[str, object]:
             "reset_on_terminal": bool(rollout_config.reset_on_terminal),
             "device": None if rollout_config.device is None else str(rollout_config.device),
             "dtype": str(rollout_config.dtype),
+            "reward_config": rollout_config.reward_config.as_dict(),
         },
         "ppo_config": {
             "update_epochs": int(ppo_config.update_epochs),
@@ -273,6 +274,7 @@ class PPOTrainingIterationStats(NamedTuple):
     policy_forward_steps_per_sec: float
     total_steps_per_sec: float
     telemetry: dict[str, object] | None
+    reward_projection_stats: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -303,6 +305,8 @@ class PPOTrainingIterationStats(NamedTuple):
         }
         if self.telemetry is not None:
             payload["telemetry_brief"] = action_telemetry_brief(self.telemetry)
+        if self.reward_projection_stats is not None:
+            payload["reward_projection_stats"] = dict(self.reward_projection_stats)
         return payload
 
 
@@ -381,9 +385,16 @@ def _rollout_stats(
         raise TypeError("ppo_stats must be a PPOUpdateStats")
 
     update_index = _require_nonnegative_int(update_index, "update_index")
-    rewards = batch.rewards.detach()
-    returns = batch.returns.detach()
-    advantages = batch.advantages.detach()
+    valid_mask = (
+        batch.reward_valid_mask.detach()
+        if batch.reward_valid_mask is not None
+        else torch.ones_like(batch.rewards, dtype=torch.bool)
+    )
+    rewards = batch.rewards.detach()[valid_mask]
+    returns = batch.returns.detach()[valid_mask]
+    advantages = batch.advantages.detach()[valid_mask]
+    if rewards.numel() <= 0:
+        raise RuntimeError("rollout stats received zero valid reward anchors")
     timing = batch.timing or {}
     rollout_seconds = float(timing.get("rollout_seconds", 0.0))
     ppo_update_seconds = float(ppo_update_seconds)
@@ -414,6 +425,7 @@ def _rollout_stats(
         policy_forward_steps_per_sec=float(timing.get("policy_forward_steps_per_sec", 0.0)),
         total_steps_per_sec=float(total_steps / update_total_seconds) if update_total_seconds > 0.0 else 0.0,
         telemetry=batch.telemetry,
+        reward_projection_stats=batch.reward_projection_stats,
     )
 
 
