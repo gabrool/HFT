@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -11,6 +11,7 @@ import torch
 
 from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
+from mmrt.execution.obs_schema import ObservationSchema
 from mmrt.execution.horizon_diagnostics import (
     DEFAULT_HORIZONS_US,
     HorizonDiagnosticsAccumulator,
@@ -821,6 +822,11 @@ def run_execution_policy_evaluation(
         env_config = _env_config_from_training_cli_config(checkpoint_cli_config)
         env_config_source = "checkpoint_cli_config"
         env_config_diff = {}
+    checkpoint_schema = checkpoint.get("observation_schema")
+    if checkpoint_schema is None:
+        raise ValueError("checkpoint missing observation_schema")
+    checkpoint_observation_schema = ObservationSchema.from_dict(dict(_require_mapping(checkpoint_schema, "checkpoint observation_schema")))
+    env_config = replace(env_config, observation_schema=checkpoint_observation_schema)
     adverse_queue_config = _adverse_queue_config_compatibility(
         adverse_signals,
         env_config=env_config,
@@ -837,9 +843,6 @@ def run_execution_policy_evaluation(
     )
 
     env = ExecutionEnv(tape, config=env_config, decision_grid=decision_grid, linear_signals=linear_signals, adverse_signals=adverse_signals)
-    checkpoint_schema = checkpoint.get("observation_schema")
-    if checkpoint_schema is None:
-        raise ValueError("checkpoint missing observation_schema")
     if checkpoint_schema != env.config.observation_schema.as_dict():
         raise ValueError("checkpoint observation_schema does not match evaluation env observation_schema")
     checkpoint_linear_schema = checkpoint.get("linear_signals")

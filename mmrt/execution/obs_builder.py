@@ -82,6 +82,7 @@ class ObservationInput:
     bid_depth: int
     ask_depth: int
     linear_signal: LinearSignal
+    control_features: Mapping[str, float] = field(default_factory=dict)
     adverse_features: Mapping[str, float] = field(default_factory=dict)
     executable_edge_features: Mapping[str, float] = field(default_factory=dict)
 
@@ -100,6 +101,7 @@ class ObservationInput:
         object.__setattr__(self, "recent_fills", _fills_tuple(self.recent_fills))
         if not isinstance(self.linear_signal, LinearSignal):
             raise ValueError("linear_signal must be LinearSignal")
+        object.__setattr__(self, "control_features", _feature_map(self.control_features, "control_features"))
         object.__setattr__(self, "adverse_features", _feature_map(self.adverse_features, "adverse_features"))
         object.__setattr__(self, "executable_edge_features", _feature_map(self.executable_edge_features, "executable_edge_features"))
         if self.context is not None and not isinstance(self.context, ObservationContext):
@@ -179,6 +181,9 @@ class ObservationBuilder:
         set_field("ask_depth_count", float(inputs.ask_depth))
         set_field("bid_top_size", bid_top_size)
         set_field("ask_top_size", ask_top_size)
+
+        for name, value in inputs.control_features.items():
+            set_field(name, value)
 
         signal = inputs.linear_signal
         set_field("linear_p_no_move", signal.p_no_move)

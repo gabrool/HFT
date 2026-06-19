@@ -480,6 +480,8 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert ckpt["tape"]["symbol"] == "BTCUSDT"
     assert len(ckpt["observation_schema"]["field_names"]) == summary["observation_schema"]["field_count"]
     assert ckpt["observation_schema"]["dtype"] == summary["observation_schema"]["dtype"]
+    assert "depth_bid_qty_5" in ckpt["observation_schema"]["field_names"]
+    assert "flow_signed_qty_1000ms" in ckpt["observation_schema"]["field_names"]
     assert ckpt["linear_signals"]["schema"] == "mmrt_execution_linear_signals_grid_v1"
     assert ckpt["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
     assert ckpt["train_split"] == "train"

@@ -613,6 +613,90 @@ def test_linear_signal_rows_used_by_step_index():
     assert step.observation[idx] == pytest.approx(0.2)
 
 
+def test_execution_env_reset_warms_control_tracker_from_prior_events():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=1_000_000),
+        _l2(seq=2, local_ts_us=1_100_000),
+    ]
+    trades = [
+        _trade(
+            local_ts_us=900_000,
+            side=AggressorSide.SELL,
+            price_tick=1000,
+            amount=2.0,
+            source_row=0,
+        )
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=_env_config())
+
+    reset = env.reset(start_decision_row=1)
+
+    idx = env.config.observation_schema.index("flow_signed_qty_1000ms")
+    assert reset.observation[idx] == pytest.approx(-2.0)
+
+
+def test_no_live_order_trade_events_update_control_flow_features():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=300),
+    ]
+    trades = [
+        _trade(
+            local_ts_us=150,
+            side=AggressorSide.BUY,
+            price_tick=1002,
+            amount=3.0,
+            source_row=0,
+        )
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=_env_config())
+    env.reset()
+
+    step = env.step(_disabled_action())
+
+    schema = env.config.observation_schema
+    assert step.fills == ()
+    assert step.observation[schema.index("flow_signed_qty_1000ms")] == pytest.approx(3.0)
+    assert step.observation[schema.index("flow_abs_qty_1000ms")] == pytest.approx(3.0)
+    assert step.observation[schema.index("flow_trade_count_1000ms")] == pytest.approx(1.0)
+
+
+def test_conservative_queue_mode_still_updates_control_features():
+    l2_events = [
+        _l2(seq=0, local_ts_us=100),
+        _l2(seq=1, local_ts_us=300),
+    ]
+    trades = [
+        _trade(
+            local_ts_us=150,
+            side=AggressorSide.SELL,
+            price_tick=1000,
+            amount=1.5,
+            source_row=0,
+        )
+    ]
+    tape = _tape(l2_events, trades)
+    env = ExecutionEnv(
+        tape,
+        linear_signals=_linear_signals(tape),
+        config=_env_config(
+            fill_simulator_config=FillSimulatorConfig(
+                queue_model=QueueModelConfig(mode=QueueModelMode.CONSERVATIVE),
+                maker_fee_bps=0.0,
+            )
+        ),
+    )
+    env.reset()
+
+    step = env.step(_disabled_action())
+
+    schema = env.config.observation_schema
+    assert step.observation[schema.index("flow_signed_qty_1000ms")] == pytest.approx(-1.5)
+
+
 def test_execution_env_requires_linear_signals():
     tape = _tape([_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)], [])
     with pytest.raises((TypeError, ValueError)):
