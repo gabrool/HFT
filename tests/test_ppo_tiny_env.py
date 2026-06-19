@@ -33,7 +33,7 @@ from mmrt.cli.train_execution_ppo import (
     run_execution_ppo_training,
 )
 from mmrt.rl.normalization import ObservationNormalizer
-from mmrt.rl.rollout import RolloutCollector, RolloutConfig
+from mmrt.rl.rollout import RolloutCollector, RolloutConfig, compute_discount_factors_from_dt_us
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.ppo import PPOConfig
 from mmrt.rl.train import PPOTrainingConfig, train_ppo_policy, make_training_checkpoint_payload
@@ -267,12 +267,27 @@ def test_rollout_collector_collects_tiny_env_batch():
     assert batch.values.shape == (4, 1)
     assert batch.advantages.shape == (4, 1)
     assert batch.returns.shape == (4, 1)
+    assert batch.step_dt_us is not None
+    assert batch.discounts is not None
+    assert batch.lambda_discounts is not None
+    assert batch.step_dt_us.shape == batch.rewards.shape
+    assert batch.discounts.shape == batch.rewards.shape
+    assert batch.lambda_discounts.shape == batch.rewards.shape
+    assert (batch.step_dt_us >= 0).all()
+    assert torch.allclose(batch.discounts, torch.full_like(batch.rewards, 0.99))
+    assert torch.allclose(batch.lambda_discounts, torch.full_like(batch.rewards, 0.95))
     assert torch.isfinite(batch.observations).all()
     assert torch.isfinite(batch.actions).all()
     assert torch.isfinite(batch.log_probs).all()
     assert torch.isfinite(batch.values).all()
     assert torch.isfinite(batch.advantages).all()
     assert torch.isfinite(batch.returns).all()
+    assert batch.timing is not None
+    assert batch.timing["discount_mode"] == "step"
+    assert batch.timing["discount_horizon_us"] == 1_000_000
+    assert batch.timing["step_dt_us_min"] >= 0.0
+    assert batch.timing["discount_min"] == pytest.approx(0.99)
+    assert batch.timing["lambda_discount_max"] == pytest.approx(0.95)
     assert normalizer.running.count > normalizer.running.initial_epsilon
     assert batch.telemetry is not None
     assert batch.telemetry["sample_count"] == 4
@@ -288,6 +303,54 @@ def test_rollout_collector_collects_tiny_env_batch():
     ) == pytest.approx(1.0)
     training_by_mode = batch.telemetry["training_by_effective_quote_mode"]
     assert "advantage_mean" in training_by_mode["no_quote"]
+
+
+def test_rollout_collector_time_discount_mode_populates_discount_tensors():
+    env = _tiny_env()
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(
+        obs_dim=obs_dim,
+        config=ActorCriticConfig(hidden_sizes=(8,)),
+    )
+    collector = RolloutCollector(
+        env,
+        policy,
+        config=RolloutConfig(
+            rollout_steps=4,
+            num_envs=1,
+            gamma=0.99,
+            gae_lambda=0.95,
+            discount_mode="time",
+            discount_horizon_us=100,
+            device="cpu",
+        ),
+    )
+
+    batch = collector.collect()
+
+    assert batch.step_dt_us is not None
+    assert batch.discounts is not None
+    assert batch.lambda_discounts is not None
+    expected_discounts = compute_discount_factors_from_dt_us(
+        batch.step_dt_us,
+        factor_at_horizon=0.99,
+        horizon_us=100,
+    ).to(dtype=batch.rewards.dtype)
+    expected_lambda_discounts = compute_discount_factors_from_dt_us(
+        batch.step_dt_us,
+        factor_at_horizon=0.95,
+        horizon_us=100,
+    ).to(dtype=batch.rewards.dtype)
+    assert torch.allclose(batch.discounts, expected_discounts)
+    assert torch.allclose(batch.lambda_discounts, expected_lambda_discounts)
+    assert torch.isfinite(batch.discounts).all()
+    assert torch.isfinite(batch.lambda_discounts).all()
+    assert ((batch.discounts >= 0.0) & (batch.discounts <= 1.0)).all()
+    assert ((batch.lambda_discounts >= 0.0) & (batch.lambda_discounts <= 1.0)).all()
+    assert batch.timing is not None
+    assert batch.timing["discount_mode"] == "time"
+    assert batch.timing["discount_horizon_us"] == 100
+    assert batch.timing["discount_min"] <= batch.timing["discount_mean"] <= batch.timing["discount_max"]
 
 
 def test_train_ppo_policy_runs_one_update_on_tiny_env():
@@ -320,6 +383,9 @@ def test_train_ppo_policy_runs_one_update_on_tiny_env():
     assert summary["updates_completed"] == 1
     assert summary["telemetry_aggregate"]["sample_count"] == 4
     assert summary["final"]["telemetry"]["sample_count"] == 4
+    assert summary["config"]["rollout_config"]["discount_mode"] == "step"
+    assert summary["config"]["rollout_config"]["discount_horizon_us"] == 1_000_000
+    assert summary["final"]["rollout"]["discounting"]["discount_mode"] == "step"
     assert "telemetry_brief" in summary["history"][0]
     assert "reward_mean_by_mode" in summary["history"][0]["telemetry_brief"]
 
@@ -363,9 +429,17 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["training"]["updates_completed"] == 1
     assert summary["training"]["final"]["ppo"]["minibatches_processed"] == 2
     assert summary["training"]["final"]["telemetry"]["sample_count"] == 4
+    discounting = summary["training"]["final"]["rollout"]["discounting"]
+    assert discounting["discount_mode"] == "step"
+    assert discounting["discount_horizon_us"] == 1_000_000
+    assert discounting["step_dt_us_min"] >= 0.0
+    assert discounting["discount_min"] == pytest.approx(0.99)
     assert summary["training"]["telemetry_aggregate"]["sample_count"] == 4
     assert "telemetry_brief" in summary["training"]["history"][0]
     assert summary["train_split"] == "train"
+    assert summary["config"]["discount_mode"] == "step"
+    assert summary["config"]["discount_horizon_us"] == 1_000_000
+    assert any("discount_mode=step on an event-driven decision grid" in item for item in summary["config_warnings"])
     assert summary["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
     assert summary["train_window_sampling"] == "stratified_random"
     assert summary["sampling"]["train_window_sampling"] == "stratified_random"
@@ -387,6 +461,49 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert ckpt["train_split"] == "train"
     assert ckpt["train_window_sampling"] == "stratified_random"
     assert ckpt["sampling"]["train_window_sampling"] == "stratified_random"
+    assert ckpt["config"]["rollout_config"]["discount_mode"] == "step"
+    assert ckpt["cli_config"]["discount_horizon_us"] == 1_000_000
+
+
+def test_run_execution_ppo_profile_includes_time_discount_stats(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path)
+    profile_json = tmp_path / "profile.json"
+    summary = run_execution_ppo_training(
+        ExecutionPPOTrainCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(tape_root / "split_source"),
+            train_split="train",
+            profile_output_json=str(profile_json),
+            profile_rollout_steps=4,
+            overwrite=True,
+            save_checkpoint=False,
+            num_envs=1,
+            discount_mode="time",
+            discount_horizon_us=100,
+            gamma=0.99,
+            gae_lambda=0.95,
+            update_epochs=1,
+            minibatch_size=2,
+            hidden_sizes=(8,),
+            max_episode_steps=4,
+            seed=123,
+        )
+    )
+
+    assert profile_json.exists()
+    assert summary["run_type"] == "profile_execution_ppo_rollout"
+    assert summary["checkpoint_saved"] is False
+    assert summary["config"]["discount_mode"] == "time"
+    assert summary["config"]["discount_horizon_us"] == 100
+    assert summary["training"]["config"]["rollout_config"]["discount_mode"] == "time"
+    discounting = summary["profile"]["discounting"]
+    assert discounting["discount_mode"] == "time"
+    assert discounting["discount_horizon_us"] == 100
+    assert discounting["step_dt_us_min"] >= 0.0
+    assert discounting["discount_min"] <= discounting["discount_mean"] <= discounting["discount_max"]
+    assert 0.0 <= discounting["discount_min"] <= 1.0
+    assert 0.0 <= discounting["lambda_discount_min"] <= 1.0
 
 
 def test_train_execution_ppo_main_writes_summary_and_prints_json(tmp_path, capsys):

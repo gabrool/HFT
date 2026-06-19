@@ -228,6 +228,8 @@ class ExecutionPPOTrainCLIConfig:
     rollout_steps: int = 2048
     gamma: float = 0.99
     gae_lambda: float = 0.95
+    discount_mode: str = "step"
+    discount_horizon_us: int = 1_000_000
     deterministic: bool = False
     reset_on_terminal: bool = True
     device: str | None = "auto"
@@ -327,8 +329,11 @@ class ExecutionPPOTrainCLIConfig:
 
         _require_positive_int(self.num_envs, "num_envs")
         _require_positive_int(self.rollout_steps, "rollout_steps")
-        _require_positive_float(self.gamma, "gamma")
-        _require_positive_float(self.gae_lambda, "gae_lambda")
+        _require_probability(self.gamma, "gamma")
+        _require_probability(self.gae_lambda, "gae_lambda")
+        if self.discount_mode not in ("step", "time"):
+            raise ValueError('discount_mode must be "step" or "time"')
+        _require_positive_int(self.discount_horizon_us, "discount_horizon_us")
         _require_bool(self.deterministic, "deterministic")
         _require_bool(self.reset_on_terminal, "reset_on_terminal")
         if self.device is not None:
@@ -423,6 +428,8 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "effective_batch_size": config.num_envs * config.rollout_steps,
         "gamma": config.gamma,
         "gae_lambda": config.gae_lambda,
+        "discount_mode": config.discount_mode,
+        "discount_horizon_us": config.discount_horizon_us,
         "deterministic": config.deterministic,
         "reset_on_terminal": config.reset_on_terminal,
         "device": config.device,
@@ -513,6 +520,8 @@ def _build_training_config(
         num_envs=config.num_envs,
         gamma=config.gamma,
         gae_lambda=config.gae_lambda,
+        discount_mode=config.discount_mode,
+        discount_horizon_us=config.discount_horizon_us,
         deterministic=config.deterministic,
         reset_on_terminal=config.reset_on_terminal,
         device=config.device,
@@ -672,10 +681,29 @@ def _adverse_queue_config_compatibility(
     return result
 
 
-def _config_warnings(config: ExecutionPPOTrainCLIConfig) -> list[str]:
+def _is_event_driven_decision_schedule(decision_schedule: Mapping[str, object] | None) -> bool:
+    if decision_schedule is None:
+        return False
+    wake_on_trade = bool(decision_schedule.get("wake_on_trade", False))
+    wake_on_top_of_book = bool(decision_schedule.get("wake_on_top_of_book", False))
+    min_interval_us = int(decision_schedule.get("min_decision_interval_us", 0))
+    max_interval_us = int(decision_schedule.get("max_decision_interval_us", 0))
+    return wake_on_trade or wake_on_top_of_book or min_interval_us != max_interval_us
+
+
+def _config_warnings(
+    config: ExecutionPPOTrainCLIConfig,
+    *,
+    decision_schedule: Mapping[str, object] | None = None,
+) -> list[str]:
     warnings: list[str] = []
     if config.maker_fee_bps < 0.0 and config.turnover_penalty_bps == 0.0:
         warnings.append("maker_fee_bps is negative while turnover_penalty_bps is zero")
+    if config.discount_mode == "step" and _is_event_driven_decision_schedule(decision_schedule):
+        warnings.append(
+            "discount_mode=step on an event-driven decision grid makes the physical PPO horizon vary with event density; "
+            "use --discount-mode time --discount-horizon-us <signal_horizon_us> for horizon-aligned training."
+        )
     return warnings
 
 
@@ -820,7 +848,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
         "output_json": str(output_json),
         "checkpoint_path": None if profile_mode or not config.save_checkpoint else str(checkpoint_path),
         "config": _summary_config(config),
-        "config_warnings": _config_warnings(config),
+        "config_warnings": _config_warnings(config, decision_schedule=decision_grid.decision_schedule),
         "env_config": _env_config_summary(config),
         "device": torch_device_summary(requested_device=config.device, resolved_device=resolved_device),
         "cuda_memory": cuda_memory_summary(resolved_device),
@@ -869,6 +897,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "profile_rollout_steps": config.profile_rollout_steps,
             "num_envs": config.num_envs,
             "timing": training_summary["final"]["timing"],  # type: ignore[index]
+            "discounting": training_summary["final"]["rollout"]["discounting"],  # type: ignore[index]
             "sampling": training_summary["sampling"],
             "resolved_device": str(resolved_device),
         }
@@ -970,6 +999,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--discount-mode", choices=("step", "time"), default="step")
+    parser.add_argument("--discount-horizon-us", type=int, default=1_000_000)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--no-reset-on-terminal", action="store_true")
     parser.add_argument("--device", default="auto")
@@ -1062,6 +1093,8 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         rollout_steps=args.rollout_steps,
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
+        discount_mode=args.discount_mode,
+        discount_horizon_us=args.discount_horizon_us,
         deterministic=args.deterministic,
         reset_on_terminal=not args.no_reset_on_terminal,
         device=args.device,
