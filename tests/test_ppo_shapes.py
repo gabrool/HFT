@@ -214,6 +214,26 @@ def test_compute_gae_rank2_keeps_env_boundaries_independent():
     assert torch.allclose(returns, advantages)
 
 
+def test_compute_gae_valid_mask_blocks_invalid_bootstrap_and_returns_values():
+    rewards = torch.tensor([1.0, 10.0, 1.0])
+    values = torch.tensor([0.0, 2.0, 0.0])
+    dones = torch.tensor([False, False, False])
+    valid_mask = torch.tensor([True, False, True])
+
+    advantages, returns = compute_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        last_value=torch.tensor(0.0),
+        gamma=1.0,
+        gae_lambda=1.0,
+        valid_mask=valid_mask,
+    )
+
+    assert torch.allclose(advantages, torch.tensor([1.0, 0.0, 1.0]))
+    assert torch.allclose(returns, torch.tensor([1.0, 2.0, 1.0]))
+
+
 def _manual_gae(
     *,
     rewards: torch.Tensor,
@@ -367,6 +387,30 @@ def test_rollout_batch_to_moves_discount_tensors():
     assert moved.lambda_discounts.device.type == "cpu"
 
 
+def test_rollout_batch_to_moves_reward_projection_tensors():
+    batch = _synthetic_batch(steps=3)._replace(
+        env_rewards=torch.tensor([1.0, 2.0, 3.0]),
+        projected_rewards=torch.tensor([1.5, 2.5, 3.5]),
+        reward_valid_mask=torch.tensor([True, False, True]),
+        reward_components={"path_equity_delta_H": torch.tensor([1.0, 0.0, 3.0])},
+        reward_mode="horizon_path_equity",
+        reward_projection_stats={"valid_fraction": 2.0 / 3.0},
+    )
+
+    moved = batch.to("cpu")
+
+    assert moved.env_rewards is not None
+    assert moved.projected_rewards is not None
+    assert moved.reward_valid_mask is not None
+    assert moved.reward_components is not None
+    assert moved.env_rewards.device.type == "cpu"
+    assert moved.projected_rewards.device.type == "cpu"
+    assert moved.reward_valid_mask.device.type == "cpu"
+    assert moved.reward_components["path_equity_delta_H"].device.type == "cpu"
+    assert moved.reward_mode == "horizon_path_equity"
+    assert moved.reward_projection_stats == {"valid_fraction": 2.0 / 3.0}
+
+
 def test_flatten_rollout_batch_flattens_vectorized_rollout_at_update_time():
     steps = 3
     num_envs = 2
@@ -393,6 +437,29 @@ def test_flatten_rollout_batch_flattens_vectorized_rollout_at_update_time():
     assert flat["observations"].shape == (steps * num_envs, obs_dim)
     assert flat["actions"].shape == (steps * num_envs, action_dim)
     assert flat["advantages"].shape == (steps * num_envs,)
+
+
+def test_flatten_rollout_batch_filters_invalid_reward_anchors():
+    batch = _synthetic_batch(steps=5)._replace(
+        advantages=torch.arange(5, dtype=torch.float32),
+        returns=torch.arange(10, 15, dtype=torch.float32),
+        reward_valid_mask=torch.tensor([True, False, True, False, True]),
+    )
+
+    flat = flatten_rollout_batch(batch)
+
+    assert flat["observations"].shape[0] == 3
+    assert torch.equal(flat["advantages"], torch.tensor([0.0, 2.0, 4.0]))
+    assert torch.equal(flat["returns"], torch.tensor([10.0, 12.0, 14.0]))
+
+
+def test_flatten_rollout_batch_rejects_all_invalid_reward_anchors():
+    batch = _synthetic_batch(steps=3)._replace(
+        reward_valid_mask=torch.zeros(3, dtype=torch.bool),
+    )
+
+    with pytest.raises(RuntimeError, match="zero valid reward anchors"):
+        flatten_rollout_batch(batch)
 
 
 def test_observation_to_tensor_can_reuse_output_buffer():

@@ -33,6 +33,7 @@ from mmrt.cli.train_execution_ppo import (
     run_execution_ppo_training,
 )
 from mmrt.rl.normalization import ObservationNormalizer
+from mmrt.rl.reward_modes import TrainingRewardConfig
 from mmrt.rl.rollout import RolloutCollector, RolloutConfig, compute_discount_factors_from_dt_us
 from mmrt.rl.torch_networks import ActorCriticConfig, ActorCriticNetwork
 from mmrt.rl.ppo import PPOConfig
@@ -285,6 +286,15 @@ def test_rollout_collector_collects_tiny_env_batch():
     assert batch.timing is not None
     assert batch.timing["discount_mode"] == "step"
     assert batch.timing["discount_horizon_us"] == 1_000_000
+    assert batch.reward_mode == "equity_delta"
+    assert batch.env_rewards is not None
+    assert batch.projected_rewards is not None
+    assert batch.reward_valid_mask is not None
+    assert torch.all(batch.reward_valid_mask)
+    assert torch.allclose(batch.env_rewards, batch.projected_rewards)
+    assert torch.allclose(batch.rewards, batch.projected_rewards)
+    assert batch.reward_projection_stats is not None
+    assert batch.reward_projection_stats["valid_fraction"] == pytest.approx(1.0)
     assert batch.timing["step_dt_us_min"] >= 0.0
     assert batch.timing["discount_min"] == pytest.approx(0.99)
     assert batch.timing["lambda_discount_max"] == pytest.approx(0.95)
@@ -388,6 +398,8 @@ def test_train_ppo_policy_runs_one_update_on_tiny_env():
     assert summary["final"]["rollout"]["discounting"]["discount_mode"] == "step"
     assert "telemetry_brief" in summary["history"][0]
     assert "reward_mean_by_mode" in summary["history"][0]["telemetry_brief"]
+    assert summary["config"]["rollout_config"]["reward_config"]["training_reward_mode"] == "equity_delta"
+    assert summary["final"]["reward_projection_stats"]["valid_fraction"] == pytest.approx(1.0)
 
     payload = make_training_checkpoint_payload(result)
     assert payload["schema"] == "mmrt_execution_ppo_checkpoint"
@@ -439,9 +451,14 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert summary["train_split"] == "train"
     assert summary["config"]["discount_mode"] == "step"
     assert summary["config"]["discount_horizon_us"] == 1_000_000
+    assert summary["config"]["training_reward_mode"] == "equity_delta"
+    assert summary["config"]["reward_horizon_us"] == 1_000_000
     assert any("discount_mode=step on an event-driven decision grid" in item for item in summary["config_warnings"])
     assert summary["compact_summary"]["discount_mode"] == "step"
     assert summary["compact_summary"]["discount_horizon_us"] == 1_000_000
+    assert summary["compact_summary"]["training_reward_mode"] == "equity_delta"
+    assert summary["compact_summary"]["reward_valid_fraction"] == pytest.approx(1.0)
+    assert summary["training"]["final"]["reward_projection_stats"]["valid_fraction"] == pytest.approx(1.0)
     assert summary["split_contract"]["schema"] == "mmrt_execution_split_contract_v1"
     assert "ranges_by_split" not in summary["split_contract"]
     assert "ranges_by_split" not in summary["split_lineage"]
@@ -469,7 +486,9 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert ckpt["train_window_sampling"] == "stratified_random"
     assert ckpt["sampling"]["train_window_sampling"] == "stratified_random"
     assert ckpt["config"]["rollout_config"]["discount_mode"] == "step"
+    assert ckpt["config"]["rollout_config"]["reward_config"]["training_reward_mode"] == "equity_delta"
     assert ckpt["cli_config"]["discount_horizon_us"] == 1_000_000
+    assert ckpt["cli_config"]["training_reward_mode"] == "equity_delta"
 
 
 def test_run_execution_ppo_profile_includes_time_discount_stats(tmp_path):
@@ -504,6 +523,7 @@ def test_run_execution_ppo_profile_includes_time_discount_stats(tmp_path):
     assert summary["config"]["discount_mode"] == "time"
     assert summary["config"]["discount_horizon_us"] == 100
     assert summary["training"]["config"]["rollout_config"]["discount_mode"] == "time"
+    assert summary["profile"]["reward_projection_stats"]["valid_fraction"] == pytest.approx(1.0)
     discounting = summary["profile"]["discounting"]
     assert discounting["discount_mode"] == "time"
     assert discounting["discount_horizon_us"] == 100
@@ -558,12 +578,79 @@ def test_train_execution_ppo_main_writes_summary_and_prints_compact_default(tmp_
     disk_payload = json.loads(output_json.read_text())
     assert "train_execution_ppo: ok" in stdout
     assert "discount=" in stdout
+    assert "reward_mode=equity_delta" in stdout
+    assert "projected_reward_mean=" in stdout
     assert "ranges_by_split" not in stdout
     assert "field_names" not in stdout
     assert "policy_state_dict" not in stdout
     assert len(stdout.splitlines()) < 50
     assert disk_payload["checkpoint_saved"] is False
     assert disk_payload["training"]["updates_completed"] == 1
+
+
+def test_non_equity_rollout_collects_lookahead_tail_without_training_normalizer_update():
+    env = _tiny_env()
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(
+        obs_dim=obs_dim,
+        config=ActorCriticConfig(hidden_sizes=(8,)),
+    )
+    normalizer = ObservationNormalizer(obs_shape=obs_dim)
+    collector = RolloutCollector(
+        env,
+        policy,
+        config=RolloutConfig(
+            rollout_steps=1,
+            num_envs=1,
+            device="cpu",
+            reward_config=TrainingRewardConfig(
+                training_reward_mode="horizon_path_equity",
+                reward_horizon_us=200,
+            ),
+        ),
+        observation_normalizer=normalizer,
+    )
+
+    batch = collector.collect()
+
+    assert batch.num_steps == 1
+    assert batch.reward_mode == "horizon_path_equity"
+    assert batch.reward_valid_mask is not None
+    assert torch.all(batch.reward_valid_mask)
+    assert batch.reward_projection_stats is not None
+    assert batch.reward_projection_stats["train_anchor_count"] == 1
+    assert batch.reward_projection_stats["valid_anchor_count"] == 1
+    assert batch.reward_projection_stats["tail_step_count"] >= 1
+    assert batch.reward_projection_stats["max_tail_step_count"] >= 1
+    assert batch.env_rewards is not None
+    assert batch.projected_rewards is not None
+    assert batch.rewards.shape == (1, 1)
+    assert normalizer.running.count.item() == pytest.approx(normalizer.running.initial_epsilon + 1.0)
+
+
+def test_non_equity_rollout_raises_when_all_horizons_unavailable():
+    env = _tiny_env()
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(
+        obs_dim=obs_dim,
+        config=ActorCriticConfig(hidden_sizes=(8,)),
+    )
+    collector = RolloutCollector(
+        env,
+        policy,
+        config=RolloutConfig(
+            rollout_steps=1,
+            num_envs=1,
+            device="cpu",
+            reward_config=TrainingRewardConfig(
+                training_reward_mode="horizon_path_equity",
+                reward_horizon_us=10_000_000,
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="zero valid anchors"):
+        collector.collect()
 
 
 def test_train_execution_ppo_stdout_json_and_none_modes(tmp_path, capsys):

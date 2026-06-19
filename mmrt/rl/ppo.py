@@ -243,7 +243,7 @@ def flatten_rollout_batch(batch: RolloutBatch) -> dict[str, torch.Tensor]:
     if not isinstance(batch, RolloutBatch):
         raise TypeError("batch must be a RolloutBatch")
 
-    return {
+    flat = {
         "observations": batch.observations.reshape(batch.num_steps, batch.obs_dim),
         "actions": batch.actions.reshape(batch.num_steps, batch.action_dim),
         "old_log_probs": batch.log_probs.reshape(batch.num_steps),
@@ -251,6 +251,15 @@ def flatten_rollout_batch(batch: RolloutBatch) -> dict[str, torch.Tensor]:
         "returns": batch.returns.reshape(batch.num_steps),
         "advantages": batch.advantages.reshape(batch.num_steps),
     }
+    if batch.reward_valid_mask is None:
+        return flat
+    valid = batch.reward_valid_mask.reshape(batch.num_steps)
+    if valid.dtype is not torch.bool:
+        raise TypeError("batch.reward_valid_mask must be bool")
+    if not bool(valid.any().detach().cpu().item()):
+        raise RuntimeError("PPO update received zero valid reward anchors")
+    valid = valid.to(device=flat["advantages"].device)
+    return {name: tensor[valid] for name, tensor in flat.items()}
 
 
 def iter_minibatch_indices(
@@ -384,8 +393,10 @@ def update_ppo(
         raise ValueError("rollout batch device must match policy device")
 
     batch_size = _validate_flat_batch(**flat)
-    if config.minibatch_size > batch_size:
+    valid_filtered = batch.reward_valid_mask is not None and int(batch.reward_valid_mask.numel()) != batch_size
+    if config.minibatch_size > batch_size and not valid_filtered:
         raise ValueError("minibatch_size must be <= effective rollout batch size")
+    minibatch_size = min(config.minibatch_size, batch_size)
 
     loss_sum = 0.0
     policy_loss_sum = 0.0
@@ -403,7 +414,7 @@ def update_ppo(
     for epoch_index in range(config.update_epochs):
         for idx in iter_minibatch_indices(
             batch_size,
-            config.minibatch_size,
+            minibatch_size,
             device=flat["observations"].device,
             shuffle=shuffle,
         ):

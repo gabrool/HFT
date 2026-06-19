@@ -559,6 +559,7 @@ class ActionTelemetryAccumulator:
         returns: object,
         values: object,
         rewards: object,
+        valid_mask: object | None = None,
     ) -> None:
         modes = np.asarray(effective_mode_ids, dtype=np.int64).reshape(-1)
         adv = _flatten_finite(advantages, name="advantages")
@@ -567,6 +568,15 @@ class ActionTelemetryAccumulator:
         rew = _flatten_finite(rewards, name="rewards")
         if not (modes.size == adv.size == ret.size == val.size == rew.size):
             raise ValueError("training telemetry arrays must have the same flattened size")
+        if valid_mask is not None:
+            mask = np.asarray(valid_mask, dtype=np.bool_).reshape(-1)
+            if mask.size != modes.size:
+                raise ValueError("valid_mask must have the same flattened size")
+            modes = modes[mask]
+            adv = adv[mask]
+            ret = ret[mask]
+            val = val[mask]
+            rew = rew[mask]
         for mode_id, mode in enumerate(QUOTE_MODE_NAMES):
             mask = modes == mode_id
             if not np.any(mask):

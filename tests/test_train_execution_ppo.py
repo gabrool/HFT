@@ -16,6 +16,7 @@ from mmrt.cli.train_execution_ppo import (
 )
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_SIGNALS_SCHEMA, AdverseSelectionSignalArtifact
 from mmrt.execution.split_contract import DecisionSplitRange
+from mmrt.rl.reward_modes import TRAINING_REWARD_MODES
 from mmrt.rl.rollout import TrainWindowSampler
 from tests.grid_helpers import grid_lineage_fields
 
@@ -45,6 +46,7 @@ def test_parser_dedupe_l2_trade_default_enabled():
     config = _config_from_args(args)
     assert config.dedupe_l2_decrease_with_trade_prints is True
     assert config.train_window_sampling == "stratified_random"
+    assert config.training_reward_mode == "equity_delta"
 
 
 def test_parser_accepts_train_window_sampling_mode():
@@ -55,6 +57,103 @@ def test_parser_accepts_train_window_sampling_mode():
     assert config.train_window_sampling == "cyclic_spread"
     assert _summary_config(config)["train_window_sampling"] == "cyclic_spread"
     assert _build_training_config(config).train_window_sampling == "cyclic_spread"
+
+
+def test_parser_accepts_every_training_reward_mode_and_summarizes_config():
+    parser = build_arg_parser()
+    for mode in TRAINING_REWARD_MODES:
+        args = parser.parse_args([*REQUIRED_TRAIN_ARGS, "--training-reward-mode", mode])
+        config = _config_from_args(args)
+        training_config = _build_training_config(config)
+        summary_config = _summary_config(config)
+
+        assert config.training_reward_mode == mode
+        assert training_config.rollout_config.reward_config.mode.value == mode
+        assert summary_config["training_reward_mode"] == mode
+        assert summary_config["reward_horizon_us"] == 1_000_000
+        assert summary_config["horizon_path_weight"] == 1.0
+        assert summary_config["fill_markout_weight"] == 0.25
+        assert summary_config["horizon_potential_weight"] == 1.0
+        assert summary_config["realized_lot_weight"] == 1.0
+        assert summary_config["unrealized_horizon_weight"] == 1.0
+        assert summary_config["multi_horizon_us"] == [250_000, 500_000, 1_000_000]
+        assert summary_config["multi_horizon_weights"] == [0.25, 0.25, 1.0]
+
+
+def test_parser_training_reward_config_overrides():
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            *REQUIRED_TRAIN_ARGS,
+            "--training-reward-mode",
+            "multi_horizon_path",
+            "--reward-horizon-us",
+            "500000",
+            "--horizon-path-weight",
+            "2.0",
+            "--fill-markout-weight",
+            "0.5",
+            "--horizon-potential-weight",
+            "3.0",
+            "--realized-lot-weight",
+            "4.0",
+            "--unrealized-horizon-weight",
+            "5.0",
+            "--multi-horizon-us",
+            "100000,200000",
+            "--multi-horizon-weights",
+            "0.25,0.75",
+        ]
+    )
+    config = _config_from_args(args)
+    reward_config = _build_training_config(config).rollout_config.reward_config
+
+    assert config.training_reward_mode == "multi_horizon_path"
+    assert reward_config.reward_horizon_us == 500_000
+    assert reward_config.horizon_path_weight == 2.0
+    assert reward_config.fill_markout_weight == 0.5
+    assert reward_config.horizon_potential_weight == 3.0
+    assert reward_config.realized_lot_weight == 4.0
+    assert reward_config.unrealized_horizon_weight == 5.0
+    assert reward_config.multi_horizon_us == (100_000, 200_000)
+    assert reward_config.multi_horizon_weights == (0.25, 0.75)
+
+
+def test_parser_rejects_invalid_training_reward_config():
+    parser = build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([*REQUIRED_TRAIN_ARGS, "--training-reward-mode", "unknown"])
+
+    cases = (
+        ["--reward-horizon-us", "0"],
+        ["--horizon-path-weight", "-1.0"],
+        [
+            "--training-reward-mode",
+            "horizon_blend",
+            "--horizon-path-weight",
+            "0.0",
+            "--fill-markout-weight",
+            "0.0",
+        ],
+        [
+            "--training-reward-mode",
+            "realized_lot_horizon",
+            "--realized-lot-weight",
+            "0.0",
+            "--unrealized-horizon-weight",
+            "0.0",
+            "--fill-markout-weight",
+            "0.0",
+        ],
+        ["--multi-horizon-us", "500000,250000"],
+        ["--multi-horizon-us", "250000,250000"],
+        ["--multi-horizon-weights", "0.25,0.25"],
+        ["--multi-horizon-weights", "0,0,0"],
+    )
+    for extra_args in cases:
+        args = parser.parse_args([*REQUIRED_TRAIN_ARGS, *extra_args])
+        with pytest.raises(ValueError):
+            _config_from_args(args)
 
 
 def test_parser_accepts_discount_mode_and_horizon():

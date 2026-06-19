@@ -37,6 +37,7 @@ from mmrt.cli.output import (
 from mmrt.rl.device import cuda_memory_summary, resolve_torch_device, torch_device_summary
 from mmrt.rl.normalization import ObservationNormalizerConfig
 from mmrt.rl.ppo import PPOConfig
+from mmrt.rl.reward_modes import TRAINING_REWARD_MODES, TrainingRewardConfig as PPORewardProjectionConfig
 from mmrt.rl.rollout import TRAIN_WINDOW_SAMPLING_MODES, RolloutConfig
 from mmrt.rl.torch_networks import ActorCriticConfig
 from mmrt.rl.train import (
@@ -178,6 +179,40 @@ def _parse_hidden_sizes(value: str | Sequence[int] | tuple[int, ...]) -> tuple[i
     return tuple(_require_positive_int(size, "hidden_sizes item") for size in values)
 
 
+def _parse_positive_int_tuple(value: str | Sequence[int], name: str) -> tuple[int, ...]:
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw == "":
+            raise ValueError(f"{name} must not be empty")
+        parts = [part.strip() for part in raw.split(",")]
+        if any(part == "" for part in parts):
+            raise ValueError(f"{name} must be a comma-separated list of positive ints")
+        try:
+            values = tuple(int(part) for part in parts)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma-separated list of positive ints") from exc
+    else:
+        values = tuple(value)
+    return tuple(_require_positive_int(item, f"{name} item") for item in values)
+
+
+def _parse_nonnegative_float_tuple(value: str | Sequence[float], name: str) -> tuple[float, ...]:
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw == "":
+            raise ValueError(f"{name} must not be empty")
+        parts = [part.strip() for part in raw.split(",")]
+        if any(part == "" for part in parts):
+            raise ValueError(f"{name} must be a comma-separated list of nonnegative floats")
+        try:
+            values = tuple(float(part) for part in parts)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma-separated list of nonnegative floats") from exc
+    else:
+        values = tuple(float(item) for item in value)
+    return tuple(_require_nonnegative_float(item, f"{name} item") for item in values)
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionPPOTrainCLIConfig:
     tape_root: str
@@ -223,6 +258,15 @@ class ExecutionPPOTrainCLIConfig:
     drawdown_penalty_rate: float = 0.0
     terminal_inventory_penalty_bps: float = 0.0
     reward_scale: float = 1.0
+    training_reward_mode: str = "equity_delta"
+    reward_horizon_us: int = 1_000_000
+    horizon_path_weight: float = 1.0
+    fill_markout_weight: float = 0.25
+    horizon_potential_weight: float = 1.0
+    realized_lot_weight: float = 1.0
+    unrealized_horizon_weight: float = 1.0
+    multi_horizon_us: tuple[int, ...] | str = (250_000, 500_000, 1_000_000)
+    multi_horizon_weights: tuple[float, ...] | str = (0.25, 0.25, 1.0)
 
     num_updates: int = 100
     learning_rate: float = 3e-4
@@ -325,6 +369,32 @@ class ExecutionPPOTrainCLIConfig:
         _require_nonnegative_float(self.drawdown_penalty_rate, "drawdown_penalty_rate")
         _require_nonnegative_float(self.terminal_inventory_penalty_bps, "terminal_inventory_penalty_bps")
         _require_positive_float(self.reward_scale, "reward_scale")
+        multi_horizon_us = _parse_positive_int_tuple(self.multi_horizon_us, "multi_horizon_us")
+        multi_horizon_weights = _parse_nonnegative_float_tuple(
+            self.multi_horizon_weights,
+            "multi_horizon_weights",
+        )
+        reward_config = PPORewardProjectionConfig(
+            training_reward_mode=self.training_reward_mode,
+            reward_horizon_us=self.reward_horizon_us,
+            reward_scale=self.reward_scale,
+            horizon_path_weight=self.horizon_path_weight,
+            fill_markout_weight=self.fill_markout_weight,
+            horizon_potential_weight=self.horizon_potential_weight,
+            realized_lot_weight=self.realized_lot_weight,
+            unrealized_horizon_weight=self.unrealized_horizon_weight,
+            multi_horizon_us=multi_horizon_us,
+            multi_horizon_weights=multi_horizon_weights,
+        )
+        object.__setattr__(self, "training_reward_mode", reward_config.mode.value)
+        object.__setattr__(self, "reward_horizon_us", reward_config.reward_horizon_us)
+        object.__setattr__(self, "horizon_path_weight", reward_config.horizon_path_weight)
+        object.__setattr__(self, "fill_markout_weight", reward_config.fill_markout_weight)
+        object.__setattr__(self, "horizon_potential_weight", reward_config.horizon_potential_weight)
+        object.__setattr__(self, "realized_lot_weight", reward_config.realized_lot_weight)
+        object.__setattr__(self, "unrealized_horizon_weight", reward_config.unrealized_horizon_weight)
+        object.__setattr__(self, "multi_horizon_us", reward_config.multi_horizon_us)
+        object.__setattr__(self, "multi_horizon_weights", reward_config.multi_horizon_weights)
 
         _require_positive_int(self.num_updates, "num_updates")
         _require_positive_float(self.learning_rate, "learning_rate")
@@ -429,6 +499,15 @@ def _summary_config(config: ExecutionPPOTrainCLIConfig) -> dict[str, object]:
         "drawdown_penalty_rate": config.drawdown_penalty_rate,
         "terminal_inventory_penalty_bps": config.terminal_inventory_penalty_bps,
         "reward_scale": config.reward_scale,
+        "training_reward_mode": config.training_reward_mode,
+        "reward_horizon_us": config.reward_horizon_us,
+        "horizon_path_weight": config.horizon_path_weight,
+        "fill_markout_weight": config.fill_markout_weight,
+        "horizon_potential_weight": config.horizon_potential_weight,
+        "realized_lot_weight": config.realized_lot_weight,
+        "unrealized_horizon_weight": config.unrealized_horizon_weight,
+        "multi_horizon_us": list(config.multi_horizon_us),
+        "multi_horizon_weights": list(config.multi_horizon_weights),
         "num_updates": config.num_updates,
         "learning_rate": config.learning_rate,
         "adam_eps": config.adam_eps,
@@ -533,6 +612,18 @@ def _build_training_config(
     rollout_steps: int | None = None,
     num_updates: int | None = None,
 ) -> PPOTrainingConfig:
+    reward_config = PPORewardProjectionConfig(
+        training_reward_mode=config.training_reward_mode,
+        reward_horizon_us=config.reward_horizon_us,
+        reward_scale=config.reward_scale,
+        horizon_path_weight=config.horizon_path_weight,
+        fill_markout_weight=config.fill_markout_weight,
+        horizon_potential_weight=config.horizon_potential_weight,
+        realized_lot_weight=config.realized_lot_weight,
+        unrealized_horizon_weight=config.unrealized_horizon_weight,
+        multi_horizon_us=config.multi_horizon_us,
+        multi_horizon_weights=config.multi_horizon_weights,
+    )
     network_config = ActorCriticConfig(
         hidden_sizes=config.hidden_sizes,
         activation=config.activation,
@@ -557,6 +648,7 @@ def _build_training_config(
         reset_on_terminal=config.reset_on_terminal,
         device=config.device,
         dtype=config.dtype,
+        reward_config=reward_config,
     )
     ppo_config = PPOConfig(
         update_epochs=config.update_epochs,
@@ -950,6 +1042,7 @@ def run_execution_ppo_training(config: ExecutionPPOTrainCLIConfig) -> dict[str, 
             "num_envs": config.num_envs,
             "timing": training_summary["final"]["timing"],  # type: ignore[index]
             "discounting": training_summary["final"]["rollout"]["discounting"],  # type: ignore[index]
+            "reward_projection_stats": training_summary["final"].get("reward_projection_stats"),  # type: ignore[union-attr]
             "sampling": training_summary["sampling"],
             "resolved_device": str(resolved_device),
         }
@@ -1051,6 +1144,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drawdown-penalty-rate", type=float, default=0.0)
     parser.add_argument("--terminal-inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--reward-scale", type=float, default=1.0)
+    parser.add_argument("--training-reward-mode", choices=TRAINING_REWARD_MODES, default="equity_delta")
+    parser.add_argument("--reward-horizon-us", type=int, default=1_000_000)
+    parser.add_argument("--horizon-path-weight", type=float, default=1.0)
+    parser.add_argument("--fill-markout-weight", type=float, default=0.25)
+    parser.add_argument("--horizon-potential-weight", type=float, default=1.0)
+    parser.add_argument("--realized-lot-weight", type=float, default=1.0)
+    parser.add_argument("--unrealized-horizon-weight", type=float, default=1.0)
+    parser.add_argument("--multi-horizon-us", default="250000,500000,1000000")
+    parser.add_argument("--multi-horizon-weights", default="0.25,0.25,1.0")
 
     parser.add_argument("--num-updates", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -1153,6 +1255,15 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionPPOTrainCLIConfig:
         drawdown_penalty_rate=args.drawdown_penalty_rate,
         terminal_inventory_penalty_bps=args.terminal_inventory_penalty_bps,
         reward_scale=args.reward_scale,
+        training_reward_mode=args.training_reward_mode,
+        reward_horizon_us=args.reward_horizon_us,
+        horizon_path_weight=args.horizon_path_weight,
+        fill_markout_weight=args.fill_markout_weight,
+        horizon_potential_weight=args.horizon_potential_weight,
+        realized_lot_weight=args.realized_lot_weight,
+        unrealized_horizon_weight=args.unrealized_horizon_weight,
+        multi_horizon_us=args.multi_horizon_us,
+        multi_horizon_weights=args.multi_horizon_weights,
         num_updates=args.num_updates,
         learning_rate=args.learning_rate,
         adam_eps=args.adam_eps,

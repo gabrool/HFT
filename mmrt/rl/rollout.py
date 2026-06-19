@@ -15,6 +15,13 @@ from mmrt.execution.split_contract import DecisionSplitRange
 from mmrt.rl.action_telemetry import ActionTelemetryAccumulator
 from mmrt.rl.device import canonicalize_torch_device, resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer
+from mmrt.rl.reward_modes import (
+    FifoLotLedger,
+    HorizonRewardProjector,
+    RewardAnchor,
+    TrainingRewardConfig,
+    TrainingRewardMode,
+)
 from mmrt.rl.torch_networks import ActorCriticNetwork
 
 
@@ -348,6 +355,7 @@ class RolloutConfig:
     reset_on_terminal: bool = True
     device: str | torch.device | None = None
     dtype: torch.dtype = torch.float32
+    reward_config: TrainingRewardConfig = TrainingRewardConfig()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -381,6 +389,8 @@ class RolloutConfig:
         if self.device is not None and not isinstance(self.device, (str, torch.device)):
             raise TypeError("device must be None, str, or torch.device")
         object.__setattr__(self, "dtype", _require_float_dtype(self.dtype, "dtype"))
+        if not isinstance(self.reward_config, TrainingRewardConfig):
+            raise TypeError("reward_config must be a TrainingRewardConfig")
 
 
 class RolloutBatch(NamedTuple):
@@ -403,6 +413,12 @@ class RolloutBatch(NamedTuple):
     timing: dict[str, object] | None = None
     sampling_stats: dict[str, object] | None = None
     telemetry: dict[str, object] | None = None
+    env_rewards: torch.Tensor | None = None
+    projected_rewards: torch.Tensor | None = None
+    reward_valid_mask: torch.Tensor | None = None
+    reward_components: dict[str, torch.Tensor] | None = None
+    reward_mode: str = TrainingRewardMode.EQUITY_DELTA.value
+    reward_projection_stats: dict[str, object] | None = None
 
     @property
     def num_steps(self) -> int:
@@ -431,6 +447,7 @@ class RolloutBatch(NamedTuple):
         step_dt_us = self.step_dt_us
         discounts = self.discounts
         lambda_discounts = self.lambda_discounts
+        reward_components = self.reward_components
         return RolloutBatch(
             observations=self.observations.to(device),
             actions=self.actions.to(device),
@@ -451,6 +468,20 @@ class RolloutBatch(NamedTuple):
             timing=None if self.timing is None else dict(self.timing),
             sampling_stats=None if self.sampling_stats is None else dict(self.sampling_stats),
             telemetry=None if self.telemetry is None else dict(self.telemetry),
+            env_rewards=None if self.env_rewards is None else self.env_rewards.to(device),
+            projected_rewards=None if self.projected_rewards is None else self.projected_rewards.to(device),
+            reward_valid_mask=None if self.reward_valid_mask is None else self.reward_valid_mask.to(device),
+            reward_components=(
+                None
+                if reward_components is None
+                else {name: tensor.to(device) for name, tensor in reward_components.items()}
+            ),
+            reward_mode=self.reward_mode,
+            reward_projection_stats=(
+                None
+                if self.reward_projection_stats is None
+                else dict(self.reward_projection_stats)
+            ),
         )
 
 
@@ -503,6 +534,22 @@ def _coerce_discount_tensor(
     return out
 
 
+def _coerce_valid_mask(
+    tensor: torch.Tensor | None,
+    *,
+    rewards: torch.Tensor,
+) -> torch.Tensor:
+    if tensor is None:
+        return torch.ones_like(rewards, dtype=torch.bool)
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("valid_mask must be a torch.Tensor")
+    if tensor.shape != rewards.shape:
+        raise ValueError("valid_mask must have the same shape as rewards")
+    if tensor.dtype is not torch.bool:
+        raise TypeError("valid_mask must be a bool tensor")
+    return tensor.to(device=rewards.device)
+
+
 def compute_gae(
     *,
     rewards: torch.Tensor,
@@ -513,6 +560,7 @@ def compute_gae(
     gae_lambda: float = 0.95,
     discounts: torch.Tensor | None = None,
     lambda_discounts: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rewards = _require_reward_tensor(rewards, "rewards")
     values = _require_reward_tensor(values, "values")
@@ -539,6 +587,7 @@ def compute_gae(
         if lambda_discounts is None
         else _coerce_discount_tensor(lambda_discounts, name="lambda_discounts", rewards=rewards)
     )
+    valid = _coerce_valid_mask(valid_mask, rewards=rewards)
 
     advantages = torch.empty_like(rewards)
     last_value_tensor = torch.as_tensor(last_value, dtype=rewards.dtype, device=rewards.device)
@@ -554,11 +603,17 @@ def compute_gae(
 
     for t in reversed(range(rewards.shape[0])):
         next_value = last_value_tensor if t == rewards.shape[0] - 1 else values[t + 1]
-        nonterminal = (~dones[t]).to(dtype=rewards.dtype)
+        if t == rewards.shape[0] - 1:
+            next_valid = torch.ones_like(valid[t], dtype=rewards.dtype)
+        else:
+            next_valid = valid[t + 1].to(dtype=rewards.dtype)
+        valid_t = valid[t]
+        nonterminal = (~dones[t]).to(dtype=rewards.dtype) * next_valid
         discount_t = gamma if discount_tensor is None else discount_tensor[t]
         lambda_discount_t = gae_lambda if lambda_discount_tensor is None else lambda_discount_tensor[t]
         delta = rewards[t] + discount_t * next_value * nonterminal - values[t]
         next_gae = delta + discount_t * lambda_discount_t * nonterminal * next_gae
+        next_gae = torch.where(valid_t, next_gae, torch.zeros_like(next_gae))
         advantages[t] = next_gae
 
     returns = advantages + values
@@ -642,6 +697,30 @@ class RolloutCollector:
         self._obs_scratch = torch.empty((self.num_envs, self.policy.obs_dim), device=self.device, dtype=self.dtype)
         self._has_reset = False
         self.episode_count = 0
+        self._reward_episode_ids = [-1 for _ in envs]
+        self._lot_ledgers: list[FifoLotLedger | None] = [None for _ in envs]
+
+    def _mid_price_for_decision_row(self, env: ExecutionEnv, row: int) -> float:
+        row = _require_nonnegative_int(row, "row")
+        if row >= env.decision_grid.n_rows:
+            raise ValueError("row must be < decision_grid.n_rows")
+        book_ptr = int(env.decision_grid.book_ptr[row])
+        l2 = env.tape.arrays.l2_events[book_ptr]
+        tick_size = float(env.tape.manifest.symbol_spec.tick_size)
+        return float((int(l2["best_bid_tick"]) + int(l2["best_ask_tick"])) * tick_size * 0.5)
+
+    def _ledger_for_env(self, env_index: int) -> FifoLotLedger:
+        ledger = self._lot_ledgers[env_index]
+        if ledger is None:
+            env = self.envs[env_index]
+            symbol_spec = env.tape.manifest.symbol_spec
+            ledger = FifoLotLedger(
+                tick_size=float(symbol_spec.tick_size),
+                contract_size=float(symbol_spec.contract_size),
+                qty_epsilon=float(env.config.fill_simulator_config.qty_epsilon),
+            )
+            self._lot_ledgers[env_index] = ledger
+        return ledger
 
     def reset(self, *, start_decision_rows: Sequence[int] | None = None) -> torch.Tensor:
         if start_decision_rows is not None and len(start_decision_rows) != self.num_envs:
@@ -687,6 +766,12 @@ class RolloutCollector:
         self._current_observations[env_index] = reset.observation
         self._current_decision_rows[env_index] = decision_row
         self._current_ranges[env_index] = current_range
+        self._reward_episode_ids[env_index] += 1
+        ledger = self._ledger_for_env(env_index)
+        ledger.reset(
+            initial_inventory_qty=float(env.config.initial_position.inventory_qty),
+            entry_price=self._mid_price_for_decision_row(env, decision_row),
+        )
 
     def _can_step(self, env_index: int) -> bool:
         current_range = self._current_ranges[env_index]
@@ -767,6 +852,15 @@ class RolloutCollector:
             if aggregate_telemetry is not None
             else (rollout_telemetry,)
         )
+        reward_config = config.reward_config
+        projector = HorizonRewardProjector.from_execution(
+            decision_grid=self.envs[0].decision_grid,
+            tape=self.envs[0].tape,
+            config=reward_config,
+        )
+        anchors: list[RewardAnchor] = []
+        equity_by_episode: dict[tuple[int, int], dict[int, float]] = {}
+        tail_step_counts = [0 for _ in range(N)]
 
         for t in range(T):
             for env_index in range(N):
@@ -830,6 +924,38 @@ class RolloutCollector:
                     split_boundary = next_row + 1 >= current_range.end_decision_row
                 truncated[t, env_index] = bool(step.truncated or split_boundary)
                 dones[t, env_index] = bool(step.done or step.truncated or split_boundary)
+                episode_id = int(self._reward_episode_ids[env_index])
+                episode_equity = equity_by_episode.setdefault((env_index, episode_id), {})
+                previous_equity = float(step.info["previous_equity"])
+                current_equity = float(step.info["current_equity"])
+                episode_equity.setdefault(current_row, previous_equity)
+                episode_equity[next_row] = current_equity
+                ledger = self._ledger_for_env(env_index)
+                realized_lot_pnl = ledger.apply_fills(step.fills)
+                range_end_row = (
+                    int(env.decision_grid.n_rows)
+                    if current_range is None
+                    else int(current_range.end_decision_row)
+                )
+                anchors.append(
+                    RewardAnchor(
+                        t_index=t,
+                        env_index=env_index,
+                        episode_id=episode_id,
+                        decision_row=current_row,
+                        next_decision_row=next_row,
+                        decision_local_ts_us=current_ts,
+                        next_decision_local_ts_us=next_ts,
+                        range_end_row=range_end_row,
+                        previous_equity=previous_equity,
+                        current_equity=current_equity,
+                        env_reward=float(step.reward),
+                        fills=step.fills,
+                        inventory_after_step=float(step.position.inventory_qty),
+                        current_mid_after_step=self._mid_price_for_decision_row(env, next_row),
+                        realized_lot_pnl=realized_lot_pnl,
+                    )
+                )
 
                 if bool(dones[t, env_index]):
                     self.episode_count += 1
@@ -852,6 +978,71 @@ class RolloutCollector:
             last_value.copy_(last_values)
             last_value[dones[-1]] = 0.0
 
+        def missing_tail_envs() -> list[int]:
+            missing: set[int] = set()
+            for anchor in anchors:
+                if anchor.episode_id != self._reward_episode_ids[anchor.env_index]:
+                    continue
+                episode_equity = equity_by_episode.get((anchor.env_index, anchor.episode_id), {})
+                for required_row in projector.required_rows(anchor):
+                    if required_row not in episode_equity:
+                        missing.add(anchor.env_index)
+                        break
+            return sorted(missing)
+
+        if not reward_config.is_equity_delta:
+            while True:
+                missing_envs = missing_tail_envs()
+                if not missing_envs:
+                    break
+                step_envs = [env_index for env_index in missing_envs if self._can_step(env_index)]
+                if not step_envs:
+                    break
+                raw_obs = self._current_obs_tensor()
+                obs_for_policy = self._normalize_obs_for_policy(raw_obs, update=False)
+                policy_started = time.perf_counter()
+                with torch.inference_mode():
+                    policy_out = self.policy.sample_action(
+                        obs_for_policy,
+                        deterministic=config.deterministic,
+                    )
+                policy_forward_seconds += time.perf_counter() - policy_started
+                action_cpu = policy_out.action.detach().to("cpu").numpy()
+                for env_index in step_envs:
+                    env = self.envs[env_index]
+                    current_row = int(self._current_decision_rows[env_index])
+                    current_ts = int(env.decision_grid.decision_local_ts_us[current_row])
+                    current_range = self._current_ranges[env_index]
+                    step_started = time.perf_counter()
+                    step = env.step(action_cpu[env_index])
+                    env_step_seconds += time.perf_counter() - step_started
+                    tail_step_counts[env_index] += 1
+                    next_row = int(step.info["next_decision_grid_row_index"])
+                    next_ts = int(env.decision_grid.decision_local_ts_us[next_row])
+                    if next_ts < current_ts:
+                        raise RuntimeError("decision grid local timestamps must be nondecreasing")
+                    if current_range is not None and next_row >= current_range.end_decision_row:
+                        raise RuntimeError("tail step crossed split boundary")
+                    episode_id = int(self._reward_episode_ids[env_index])
+                    episode_equity = equity_by_episode.setdefault((env_index, episode_id), {})
+                    episode_equity.setdefault(current_row, float(step.info["previous_equity"]))
+                    episode_equity[next_row] = float(step.info["current_equity"])
+                    self._ledger_for_env(env_index).apply_fills(step.fills)
+                    split_boundary = (
+                        False
+                        if current_range is None
+                        else next_row + 1 >= current_range.end_decision_row
+                    )
+                    done = bool(step.done or step.truncated or split_boundary)
+                    if done:
+                        self.episode_count += 1
+                        if not config.reset_on_terminal:
+                            raise RuntimeError("terminal reached with reset_on_terminal=False")
+                        self._reset_one(env_index, start_decision_row=None)
+                    else:
+                        self._current_observations[env_index] = step.observation
+                        self._current_decision_rows[env_index] = next_row
+
         if config.discount_mode == "time":
             discounts = compute_discount_factors_from_dt_us(
                 step_dt_us,
@@ -871,6 +1062,37 @@ class RolloutCollector:
             discounts_for_gae = None
             lambda_discounts_for_gae = None
 
+        env_rewards = rewards.clone()
+        projection = projector.project(anchors, equity_by_episode, shape=(T, N))
+        projected_rewards = torch.as_tensor(
+            projection.projected_rewards,
+            device=device,
+            dtype=dtype,
+        )
+        reward_valid_mask = torch.as_tensor(
+            projection.valid_mask,
+            device=device,
+            dtype=torch.bool,
+        )
+        if not bool(reward_valid_mask.any().cpu().item()):
+            raise RuntimeError(
+                f"training reward mode {reward_config.mode.value!r} produced zero valid anchors"
+            )
+        reward_components = {
+            name: torch.as_tensor(values, device=device, dtype=dtype)
+            for name, values in projection.components.items()
+        }
+        reward_projection_stats = dict(projection.stats)
+        tail_step_count = int(sum(tail_step_counts))
+        reward_projection_stats.update(
+            {
+                "tail_step_count": tail_step_count,
+                "tail_step_mean_per_env": float(tail_step_count / max(N, 1)),
+                "max_tail_step_count": int(max(tail_step_counts) if tail_step_counts else 0),
+            }
+        )
+        rewards = projected_rewards
+
         advantages, returns = compute_gae(
             rewards=rewards,
             values=values,
@@ -880,6 +1102,7 @@ class RolloutCollector:
             gae_lambda=config.gae_lambda,
             discounts=discounts_for_gae,
             lambda_discounts=lambda_discounts_for_gae,
+            valid_mask=reward_valid_mask,
         )
         for telemetry in telemetry_targets:
             telemetry.update_training_by_effective_quote_mode(
@@ -888,6 +1111,7 @@ class RolloutCollector:
                 returns=returns,
                 values=values,
                 rewards=rewards,
+                valid_mask=reward_valid_mask,
             )
 
         rollout_seconds = time.perf_counter() - rollout_started
@@ -902,6 +1126,10 @@ class RolloutCollector:
             "discount_mode": config.discount_mode,
             "discount_horizon_us": int(config.discount_horizon_us),
         }
+        timing["training_reward_mode"] = reward_config.mode.value
+        timing["reward_horizon_us"] = int(reward_config.reward_horizon_us)
+        timing["reward_valid_fraction"] = float(reward_projection_stats["valid_fraction"])
+        timing["tail_step_count"] = int(reward_projection_stats["tail_step_count"])
         timing.update(_dt_stats_from_tensor(step_dt_us))
         timing.update(_stats_from_tensor("discount", discounts))
         timing.update(_stats_from_tensor("lambda_discount", lambda_discounts))
@@ -931,6 +1159,12 @@ class RolloutCollector:
             timing=timing,
             sampling_stats=sampling_stats,
             telemetry=rollout_telemetry.as_dict(),
+            env_rewards=env_rewards,
+            projected_rewards=projected_rewards,
+            reward_valid_mask=reward_valid_mask,
+            reward_components=reward_components,
+            reward_mode=reward_config.mode.value,
+            reward_projection_stats=reward_projection_stats,
         )
 
     def sampling_stats(self) -> dict[str, object] | None:

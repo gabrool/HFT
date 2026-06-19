@@ -179,6 +179,7 @@ def compact_training_summary(summary: Mapping[str, object]) -> dict[str, object]
     final = _mapping(training.get("final"))
     rollout = _mapping(final.get("rollout"))
     ppo = _mapping(final.get("ppo"))
+    reward_projection = _mapping(final.get("reward_projection_stats"))
     telemetry = _mapping(final.get("telemetry_brief") or final.get("telemetry"))
     effective_rates = _mapping(telemetry.get("effective_quote_rates"))
     if not effective_rates:
@@ -201,6 +202,13 @@ def compact_training_summary(summary: Mapping[str, object]) -> dict[str, object]
         "adverse_queue_config_status": _get(summary, ("adverse_signal_queue_config", "status")),
         "discount_mode": discounting.get("discount_mode", config.get("discount_mode")),
         "discount_horizon_us": discounting.get("discount_horizon_us", config.get("discount_horizon_us")),
+        "training_reward_mode": config.get(
+            "training_reward_mode",
+            _get(training, ("config", "rollout_config", "reward_config", "training_reward_mode")),
+        ),
+        "reward_valid_fraction": reward_projection.get("valid_fraction"),
+        "projected_reward_mean": reward_projection.get("projected_reward_mean"),
+        "env_reward_mean": reward_projection.get("env_reward_mean"),
         "gamma": _get(training, ("config", "rollout_config", "gamma"), config.get("gamma")),
         "gae_lambda": _get(training, ("config", "rollout_config", "gae_lambda"), config.get("gae_lambda")),
         "final_reward_mean": rollout.get("reward_mean"),
@@ -317,6 +325,13 @@ def print_human_summary(kind: str, payload: Mapping[str, object], *, stream: Tex
             f"final_return_mean={_fmt(summary.get('final_return_mean'))} "
             f"final_entropy={_fmt(summary.get('final_entropy'))} "
             f"approx_kl={_fmt(summary.get('approx_kl'))}",
+            file=out,
+        )
+        print(
+            f"reward_mode={_fmt(summary.get('training_reward_mode'))} "
+            f"valid={_fmt(summary.get('reward_valid_fraction'))} "
+            f"projected_reward_mean={_fmt(summary.get('projected_reward_mean'))} "
+            f"env_reward_mean={_fmt(summary.get('env_reward_mean'))}",
             file=out,
         )
         _print_rates("modes_final", _mapping(summary.get("effective_quote_rates")), out)
