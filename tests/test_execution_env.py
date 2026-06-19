@@ -700,9 +700,41 @@ def test_env_step_info_is_json_safe_and_validated_by_contract():
 
     assert isinstance(step.info["quote_bid_enabled"], bool)
     assert isinstance(step.info["quote_bid_disabled_reason"], str)
+    assert isinstance(step.info["quote_ask_disabled_reason"], str)
+    assert isinstance(step.info["quote_bid_offset_ticks"], int)
+    assert isinstance(step.info["quote_ask_offset_ticks"], int)
     assert isinstance(step.info["events_processed"], int)
     assert isinstance(step.info["previous_equity"], float)
     assert step.execution.info is step.info or step.execution.info == step.info
+
+
+def test_env_step_info_includes_quote_offsets_for_enabled_quotes():
+    tape = _tape(
+        [_l2(seq=0, local_ts_us=100), _l2(seq=1, local_ts_us=200)],
+        [],
+    )
+    env = ExecutionEnv(tape, linear_signals=_linear_signals(tape), config=_env_config())
+    env.reset()
+
+    step = env.step(
+        QuoteAction(
+            bid_enabled=True,
+            ask_enabled=True,
+            bid_price_raw=-10.0,
+            ask_price_raw=-10.0,
+            bid_size_raw=100.0,
+            ask_size_raw=100.0,
+        )
+    )
+
+    assert step.info["quote_bid_enabled"] is True
+    assert step.info["quote_ask_enabled"] is True
+    assert isinstance(step.info["quote_bid_offset_ticks"], int)
+    assert isinstance(step.info["quote_ask_offset_ticks"], int)
+    assert step.info["quote_bid_offset_ticks"] >= 0
+    assert step.info["quote_ask_offset_ticks"] >= 0
+    assert isinstance(step.info["quote_bid_disabled_reason"], str)
+    assert isinstance(step.info["quote_ask_disabled_reason"], str)
 
 
 def test_env_has_no_forbidden_imports():

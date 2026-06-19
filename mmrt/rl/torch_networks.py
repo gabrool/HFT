@@ -155,6 +155,7 @@ class PolicyAction(NamedTuple):
     entropy: torch.Tensor
     value: torch.Tensor
     enable_prob: torch.Tensor
+    enable_logits: torch.Tensor
     continuous_mean: torch.Tensor
     continuous_log_std: torch.Tensor
 
@@ -334,6 +335,7 @@ class ActorCriticNetwork(nn.Module):
             entropy=entropy,
             value=output.value,
             enable_prob=enable_prob,
+            enable_logits=output.enable_logits,
             continuous_mean=output.continuous_mean,
             continuous_log_std=output.continuous_log_std,
         )

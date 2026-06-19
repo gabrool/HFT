@@ -788,6 +788,7 @@ def run_execution_policy_evaluation(
         "evaluated_start_decision_row": evaluation_config["evaluated_start_decision_row"],  # type: ignore[index]
         "evaluated_end_decision_row": evaluation_config["evaluated_end_decision_row"],  # type: ignore[index]
         "evaluation": evaluation_payload,
+        "policy_action_telemetry": evaluation_payload.get("telemetry"),
     }
     _write_json_atomic(output_json, summary)
     return summary

@@ -12,6 +12,7 @@ import torch
 
 from mmrt.execution.env import ExecutionEnv
 from mmrt.execution.split_contract import DecisionSplitRange
+from mmrt.rl.action_telemetry import ActionTelemetryAccumulator
 from mmrt.rl.device import canonicalize_torch_device, resolve_torch_device
 from mmrt.rl.normalization import ObservationNormalizer
 from mmrt.rl.torch_networks import ActorCriticNetwork
@@ -346,6 +347,7 @@ class RolloutBatch(NamedTuple):
     decision_rows: torch.Tensor | None = None
     timing: dict[str, float] | None = None
     sampling_stats: dict[str, object] | None = None
+    telemetry: dict[str, object] | None = None
 
     @property
     def num_steps(self) -> int:
@@ -387,6 +389,7 @@ class RolloutBatch(NamedTuple):
             decision_rows=None if decision_rows is None else decision_rows.to(device),
             timing=None if self.timing is None else dict(self.timing),
             sampling_stats=None if self.sampling_stats is None else dict(self.sampling_stats),
+            telemetry=None if self.telemetry is None else dict(self.telemetry),
         )
 
 
@@ -596,7 +599,17 @@ class RolloutCollector:
             return self.observation_normalizer.update_and_normalize(obs)
         return self.observation_normalizer.normalize(obs)
 
-    def collect(self, *, start_decision_rows: Sequence[int] | None = None) -> RolloutBatch:
+    def collect(
+        self,
+        *,
+        start_decision_rows: Sequence[int] | None = None,
+        aggregate_telemetry: ActionTelemetryAccumulator | None = None,
+    ) -> RolloutBatch:
+        if aggregate_telemetry is not None and not isinstance(
+            aggregate_telemetry,
+            ActionTelemetryAccumulator,
+        ):
+            raise TypeError("aggregate_telemetry must be ActionTelemetryAccumulator or None")
         config = self.config
         sample_stat_start = (
             self._train_window_sampler.sampled_start_count
@@ -620,6 +633,8 @@ class RolloutCollector:
         rewards = torch.empty((T, N), device=device, dtype=dtype)
         entropies = torch.empty((T, N), device=device, dtype=dtype)
         decision_rows = torch.empty((T, N), device=device, dtype=torch.int64)
+        requested_mode_ids = torch.empty((T, N), dtype=torch.int64)
+        effective_mode_ids = torch.empty((T, N), dtype=torch.int64)
 
         dones = torch.empty((T, N), device=device, dtype=torch.bool)
         terminated = torch.empty((T, N), device=device, dtype=torch.bool)
@@ -629,6 +644,12 @@ class RolloutCollector:
         policy_forward_seconds = 0.0
         env_step_seconds = 0.0
         rollout_started = time.perf_counter()
+        rollout_telemetry = ActionTelemetryAccumulator()
+        telemetry_targets = (
+            (rollout_telemetry, aggregate_telemetry)
+            if aggregate_telemetry is not None
+            else (rollout_telemetry,)
+        )
 
         for t in range(T):
             for env_index in range(N):
@@ -652,12 +673,26 @@ class RolloutCollector:
             log_probs[t].copy_(policy_out.log_prob)
             values[t].copy_(policy_out.value)
             entropies[t].copy_(policy_out.entropy)
+            for telemetry in telemetry_targets:
+                telemetry.update_policy_action(
+                    policy_out,
+                    deterministic=config.deterministic,
+                    enable_threshold=self.policy.config.enable_threshold,
+                )
+            requested_modes = rollout_telemetry.update_requested_actions(policy_out.action)
+            if aggregate_telemetry is not None:
+                aggregate_telemetry.update_requested_actions(policy_out.action)
+            requested_mode_ids[t].copy_(torch.as_tensor(requested_modes, dtype=torch.int64))
 
             action_cpu = policy_out.action.detach().to("cpu").numpy()
             for env_index, env_action in enumerate(action_cpu):
                 step_started = time.perf_counter()
                 step = self.envs[env_index].step(env_action)
                 env_step_seconds += time.perf_counter() - step_started
+                mode_id = rollout_telemetry.update_execution_step(step.execution)
+                if aggregate_telemetry is not None:
+                    aggregate_telemetry.update_execution_step(step.execution)
+                effective_mode_ids[t, env_index] = mode_id
 
                 rewards[t, env_index] = float(step.reward)
                 terminated[t, env_index] = bool(step.done)
@@ -700,6 +735,14 @@ class RolloutCollector:
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
         )
+        for telemetry in telemetry_targets:
+            telemetry.update_training_by_effective_quote_mode(
+                effective_mode_ids,
+                advantages=advantages,
+                returns=returns,
+                values=values,
+                rewards=rewards,
+            )
 
         rollout_seconds = time.perf_counter() - rollout_started
         total_steps = float(T * N)
@@ -733,6 +776,7 @@ class RolloutCollector:
             decision_rows=decision_rows,
             timing=timing,
             sampling_stats=sampling_stats,
+            telemetry=rollout_telemetry.as_dict(),
         )
 
     def sampling_stats(self) -> dict[str, object] | None:

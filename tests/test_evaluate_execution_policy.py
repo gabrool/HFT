@@ -294,6 +294,44 @@ def test_evaluate_policy_runs_tiny_env_and_preserves_policy_mode():
     assert payload["steps"] == result.steps
     assert "metrics" in payload
     assert "diagnostics" in payload
+    telemetry = payload["telemetry"]
+    assert telemetry["sample_count"] == result.steps
+    assert telemetry["policy_distribution"]["deterministic"] is True
+    assert telemetry["policy_distribution"]["enable_prob"]["bid_enabled"]["count"] == result.steps
+    assert "enable_logit" in telemetry["policy_distribution"]
+    effective = telemetry["effective_quotes"]
+    assert (
+        effective["quote_no_quote_rate"]
+        + effective["quote_bid_only_rate"]
+        + effective["quote_ask_only_rate"]
+        + effective["quote_two_sided_rate"]
+    ) == pytest.approx(1.0)
+
+
+def test_evaluate_policy_stochastic_includes_sampled_requested_telemetry_on_cpu():
+    env = _tiny_env(max_episode_steps=4)
+    obs_dim = env.config.observation_schema.dim
+    policy = ActorCriticNetwork(obs_dim=obs_dim, config=ActorCriticConfig(hidden_sizes=(8,)))
+
+    result = evaluate_policy(
+        env,
+        policy,
+        config=PolicyEvaluationConfig(max_steps=4, deterministic=False, device="cpu"),
+    )
+
+    telemetry = result.as_dict()["telemetry"]
+    requested = telemetry["requested_actions"]
+    effective = telemetry["effective_quotes"]
+    assert telemetry["sample_count"] == result.steps
+    assert telemetry["policy_distribution"]["deterministic"] is False
+    assert 0.0 <= requested["requested_bid_enabled_rate"] <= 1.0
+    assert 0.0 <= requested["requested_ask_enabled_rate"] <= 1.0
+    assert (
+        effective["quote_no_quote_rate"]
+        + effective["quote_bid_only_rate"]
+        + effective["quote_ask_only_rate"]
+        + effective["quote_two_sided_rate"]
+    ) == pytest.approx(1.0)
 
 
 def test_evaluate_policy_uses_observation_normalizer_read_only():
@@ -465,6 +503,8 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["evaluation"]["steps"] > 0
     assert summary["evaluation"]["steps"] <= 4
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
+    assert summary["evaluation"]["telemetry"]["sample_count"] == summary["evaluation"]["steps"]
+    assert summary["policy_action_telemetry"] == summary["evaluation"]["telemetry"]
     assert summary["tape"]["symbol"] == "BTCUSDT"
     assert (
         summary["linear_signals"]["schema"]

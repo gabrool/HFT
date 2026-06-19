@@ -564,6 +564,8 @@ class ExecutionEnv:
             "quote_ask_price_tick": quote.ask_price_tick,
             "quote_bid_qty": quote.bid_qty,
             "quote_ask_qty": quote.ask_qty,
+            "quote_bid_offset_ticks": quote_result.bid_offset_ticks,
+            "quote_ask_offset_ticks": quote_result.ask_offset_ticks,
             "quote_bid_disabled_reason": quote_result.bid_disabled_reason,
             "quote_ask_disabled_reason": quote_result.ask_disabled_reason,
             "previous_equity": reward_step.previous_equity,
