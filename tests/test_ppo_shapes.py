@@ -18,7 +18,7 @@ from mmrt.rl.ppo import (
     iter_minibatch_indices,
     update_ppo,
 )
-from mmrt.rl.rollout import RolloutBatch, RolloutConfig, compute_gae
+from mmrt.rl.rollout import RolloutBatch, RolloutConfig, compute_discount_factors_from_dt_us, compute_gae
 from mmrt.rl.torch_networks import (
     EXECUTION_ACTION_DIM,
     ActorCriticConfig,
@@ -212,6 +212,159 @@ def test_compute_gae_rank2_keeps_env_boundaries_independent():
     assert torch.allclose(advantages[:, 0], torch.tensor([2.0, 1.0, 1.0]))
     assert torch.allclose(advantages[:, 1], torch.tensor([30.0, 20.0, 10.0]))
     assert torch.allclose(returns, advantages)
+
+
+def _manual_gae(
+    *,
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    dones: torch.Tensor,
+    last_value: torch.Tensor,
+    discounts: torch.Tensor,
+    lambda_discounts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    advantages = torch.empty_like(rewards)
+    next_gae = torch.zeros((), dtype=rewards.dtype)
+    for t in reversed(range(rewards.shape[0])):
+        next_value = last_value if t == rewards.shape[0] - 1 else values[t + 1]
+        nonterminal = (~dones[t]).to(dtype=rewards.dtype)
+        delta = rewards[t] + discounts[t] * next_value * nonterminal - values[t]
+        next_gae = delta + discounts[t] * lambda_discounts[t] * nonterminal * next_gae
+        advantages[t] = next_gae
+    return advantages, advantages + values
+
+
+def test_compute_gae_legacy_matches_scalar_formula():
+    rewards = torch.tensor([1.0, 0.5, -0.25, 0.75])
+    values = torch.tensor([0.1, 0.2, -0.1, 0.3])
+    dones = torch.tensor([False, False, True, False])
+    last_value = torch.tensor(0.4)
+    gamma = 0.9
+    gae_lambda = 0.8
+
+    advantages, returns = compute_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        last_value=last_value,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+    )
+    expected_advantages, expected_returns = _manual_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        last_value=last_value,
+        discounts=torch.full_like(rewards, gamma),
+        lambda_discounts=torch.full_like(rewards, gae_lambda),
+    )
+
+    assert torch.allclose(advantages, expected_advantages)
+    assert torch.allclose(returns, expected_returns)
+
+
+def test_compute_gae_constant_time_step_matches_scalar_mode():
+    rewards = torch.tensor([1.0, 0.5, 0.25])
+    values = torch.tensor([0.1, 0.2, 0.3])
+    dones = torch.tensor([False, False, False])
+    last_value = torch.tensor(0.4)
+    horizon_us = 1_000_000
+    dt_us = torch.full_like(rewards, horizon_us, dtype=torch.int64)
+    discounts = compute_discount_factors_from_dt_us(
+        dt_us,
+        factor_at_horizon=0.99,
+        horizon_us=horizon_us,
+    )
+    lambda_discounts = compute_discount_factors_from_dt_us(
+        dt_us,
+        factor_at_horizon=0.95,
+        horizon_us=horizon_us,
+    )
+
+    scalar_advantages, scalar_returns = compute_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        last_value=last_value,
+        gamma=0.99,
+        gae_lambda=0.95,
+    )
+    time_advantages, time_returns = compute_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        last_value=last_value,
+        gamma=0.99,
+        gae_lambda=0.95,
+        discounts=discounts,
+        lambda_discounts=lambda_discounts,
+    )
+
+    assert torch.allclose(discounts, torch.full_like(rewards, 0.99))
+    assert torch.allclose(lambda_discounts, torch.full_like(rewards, 0.95))
+    assert torch.allclose(time_advantages, scalar_advantages)
+    assert torch.allclose(time_returns, scalar_returns)
+
+
+def test_compute_gae_fractional_time_step_uses_sqrt_factors():
+    rewards = torch.tensor([1.0, 2.0, 3.0])
+    values = torch.tensor([0.1, 0.2, 0.3])
+    dones = torch.tensor([False, False, False])
+    last_value = torch.tensor(0.4)
+    dt_us = torch.full_like(rewards, 50, dtype=torch.int64)
+    discounts = compute_discount_factors_from_dt_us(dt_us, factor_at_horizon=0.81, horizon_us=100)
+    lambda_discounts = compute_discount_factors_from_dt_us(dt_us, factor_at_horizon=0.64, horizon_us=100)
+
+    advantages, returns = compute_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        last_value=last_value,
+        gamma=0.81,
+        gae_lambda=0.64,
+        discounts=discounts,
+        lambda_discounts=lambda_discounts,
+    )
+
+    assert torch.allclose(discounts, torch.full_like(rewards, 0.9))
+    assert torch.allclose(lambda_discounts, torch.full_like(rewards, 0.8))
+    assert torch.allclose(advantages, torch.tensor([4.156704, 4.2732, 3.06]))
+    assert torch.allclose(returns, torch.tensor([4.256704, 4.4732, 3.36]))
+
+
+def test_discount_factors_handle_zero_and_variable_dt():
+    zero_dt = torch.tensor([0, 1], dtype=torch.int64)
+    zero_factor_discounts = compute_discount_factors_from_dt_us(
+        zero_dt,
+        factor_at_horizon=0.0,
+        horizon_us=100,
+    )
+    assert torch.equal(zero_factor_discounts, torch.tensor([1.0, 0.0]))
+    assert torch.isfinite(zero_factor_discounts).all()
+
+    dt_us = torch.tensor([0, 50, 100, 200], dtype=torch.int64)
+    discounts = compute_discount_factors_from_dt_us(dt_us, factor_at_horizon=0.81, horizon_us=100)
+    assert torch.isfinite(discounts).all()
+    assert ((discounts >= 0.0) & (discounts <= 1.0)).all()
+    assert torch.all(discounts[1:] <= discounts[:-1])
+
+
+def test_rollout_batch_to_moves_discount_tensors():
+    batch = _synthetic_batch(steps=3)
+    with_discounts = batch._replace(
+        step_dt_us=torch.tensor([0, 50, 100], dtype=torch.int64),
+        discounts=torch.tensor([1.0, 0.9, 0.81]),
+        lambda_discounts=torch.tensor([1.0, 0.8, 0.64]),
+    )
+
+    moved = with_discounts.to("cpu")
+
+    assert moved.step_dt_us is not None
+    assert moved.discounts is not None
+    assert moved.lambda_discounts is not None
+    assert moved.step_dt_us.device.type == "cpu"
+    assert moved.discounts.device.type == "cpu"
+    assert moved.lambda_discounts.device.type == "cpu"
 
 
 def test_flatten_rollout_batch_flattens_vectorized_rollout_at_update_time():

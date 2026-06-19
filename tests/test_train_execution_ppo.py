@@ -10,6 +10,7 @@ from mmrt.cli.train_execution_ppo import (
     _build_env_config,
     _build_training_config,
     _config_from_args,
+    _config_warnings,
     _debug_start_rows,
     _summary_config,
 )
@@ -54,6 +55,71 @@ def test_parser_accepts_train_window_sampling_mode():
     assert config.train_window_sampling == "cyclic_spread"
     assert _summary_config(config)["train_window_sampling"] == "cyclic_spread"
     assert _build_training_config(config).train_window_sampling == "cyclic_spread"
+
+
+def test_parser_accepts_discount_mode_and_horizon():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        *REQUIRED_TRAIN_ARGS,
+        "--discount-mode",
+        "time",
+        "--discount-horizon-us",
+        "1000000",
+        "--gamma",
+        "0.99",
+        "--gae-lambda",
+        "0.95",
+    ])
+    config = _config_from_args(args)
+    training_config = _build_training_config(config)
+    summary_config = _summary_config(config)
+
+    assert config.discount_mode == "time"
+    assert config.discount_horizon_us == 1_000_000
+    assert training_config.rollout_config.discount_mode == "time"
+    assert training_config.rollout_config.discount_horizon_us == 1_000_000
+    assert summary_config["discount_mode"] == "time"
+    assert summary_config["discount_horizon_us"] == 1_000_000
+
+
+def test_train_execution_ppo_rejects_invalid_discount_config():
+    parser = build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([*REQUIRED_TRAIN_ARGS, "--discount-mode", "calendar"])
+
+    args = parser.parse_args([*REQUIRED_TRAIN_ARGS, "--discount-horizon-us", "0"])
+    with pytest.raises(ValueError, match="discount_horizon_us"):
+        _config_from_args(args)
+
+
+def test_step_discount_warning_for_event_driven_schedule():
+    config = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
+        discount_mode="step",
+    )
+
+    warnings = _config_warnings(
+        config,
+        decision_schedule={
+            "min_decision_interval_us": 0,
+            "max_decision_interval_us": 500_000,
+            "wake_on_trade": True,
+            "wake_on_top_of_book": True,
+        },
+    )
+
+    assert any("physical PPO horizon vary with event density" in item for item in warnings)
+    assert _config_warnings(
+        config,
+        decision_schedule={
+            "min_decision_interval_us": 100_000,
+            "max_decision_interval_us": 100_000,
+            "wake_on_trade": False,
+            "wake_on_top_of_book": False,
+        },
+    ) == []
 
 
 def test_adverse_runtime_config_inherits_post_only_gap_from_ppo_config():

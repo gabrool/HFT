@@ -214,6 +214,8 @@ def training_config_to_dict(config: PPOTrainingConfig) -> dict[str, object]:
             "effective_batch_size": int(rollout_config.rollout_steps * rollout_config.num_envs),
             "gamma": float(rollout_config.gamma),
             "gae_lambda": float(rollout_config.gae_lambda),
+            "discount_mode": rollout_config.discount_mode,
+            "discount_horizon_us": int(rollout_config.discount_horizon_us),
             "deterministic": bool(rollout_config.deterministic),
             "reset_on_terminal": bool(rollout_config.reset_on_terminal),
             "device": None if rollout_config.device is None else str(rollout_config.device),
@@ -258,6 +260,7 @@ class PPOTrainingIterationStats(NamedTuple):
     rollout_done_count: int
     rollout_truncated_count: int
     rollout_episode_count: int
+    rollout_discounting: dict[str, object]
     sampling_stats: dict[str, object]
 
     ppo: PPOUpdateStats
@@ -283,6 +286,7 @@ class PPOTrainingIterationStats(NamedTuple):
                 "done_count": int(self.rollout_done_count),
                 "truncated_count": int(self.rollout_truncated_count),
                 "episode_count": int(self.rollout_episode_count),
+                "discounting": dict(self.rollout_discounting),
             },
             "sampling": dict(self.sampling_stats),
             "ppo": self.ppo.as_dict(),
@@ -332,6 +336,38 @@ class PPOTrainingResult(NamedTuple):
         }
 
 
+_ROLLOUT_DISCOUNTING_KEYS = (
+    "discount_mode",
+    "discount_horizon_us",
+    "step_dt_us_min",
+    "step_dt_us_mean",
+    "step_dt_us_p50",
+    "step_dt_us_p90",
+    "step_dt_us_p99",
+    "step_dt_us_max",
+    "discount_min",
+    "discount_mean",
+    "discount_max",
+    "lambda_discount_min",
+    "lambda_discount_mean",
+    "lambda_discount_max",
+)
+
+
+def _rollout_discounting_stats(timing: dict[str, object]) -> dict[str, object]:
+    stats: dict[str, object] = {}
+    for key in _ROLLOUT_DISCOUNTING_KEYS:
+        if key in timing:
+            value = timing[key]
+            if key == "discount_mode":
+                stats[key] = str(value)
+            elif key == "discount_horizon_us":
+                stats[key] = int(value)
+            else:
+                stats[key] = float(value)
+    return stats
+
+
 def _rollout_stats(
     update_index: int,
     batch: RolloutBatch,
@@ -366,6 +402,7 @@ def _rollout_stats(
             batch.truncated.detach().to(torch.int64).sum().cpu().item()
         ),
         rollout_episode_count=int(batch.episode_count),
+        rollout_discounting=_rollout_discounting_stats(timing),
         sampling_stats=dict(batch.sampling_stats or {}),
         ppo=ppo_stats,
         rollout_seconds=rollout_seconds,

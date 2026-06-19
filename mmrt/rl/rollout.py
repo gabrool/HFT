@@ -23,6 +23,7 @@ __all__ = [
     "TrainWindowSampler",
     "RolloutConfig",
     "RolloutBatch",
+    "compute_discount_factors_from_dt_us",
     "compute_gae",
     "RolloutCollector",
     "collect_rollout",
@@ -30,6 +31,7 @@ __all__ = [
 
 
 TRAIN_WINDOW_SAMPLING_MODES = ("stratified_random", "cyclic_spread", "chronological")
+DISCOUNT_MODES = ("step", "time")
 
 
 def _require_bool(value: bool, name: str) -> bool:
@@ -69,6 +71,15 @@ def _coerce_train_window_sampling(value: str) -> str:
     return normalized
 
 
+def _coerce_discount_mode(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("discount_mode must be str")
+    normalized = value.strip()
+    if normalized not in DISCOUNT_MODES:
+        raise ValueError('discount_mode must be "step" or "time"')
+    return normalized
+
+
 def _require_probability(value: float, name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise TypeError(f"{name} must be a probability in [0, 1]")
@@ -76,6 +87,39 @@ def _require_probability(value: float, name: str) -> float:
     if not 0.0 <= float_value <= 1.0:
         raise ValueError(f"{name} must be a probability in [0, 1]")
     return float_value
+
+
+def _stats_from_tensor(prefix: str, tensor: torch.Tensor) -> dict[str, float]:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("tensor must be a torch.Tensor")
+    if tensor.numel() <= 0:
+        raise ValueError("tensor must be non-empty")
+    values = tensor.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+    return {
+        f"{prefix}_min": float(values.min().item()),
+        f"{prefix}_mean": float(values.mean().item()),
+        f"{prefix}_max": float(values.max().item()),
+    }
+
+
+def _dt_stats_from_tensor(tensor: torch.Tensor) -> dict[str, float]:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("tensor must be a torch.Tensor")
+    if tensor.numel() <= 0:
+        raise ValueError("tensor must be non-empty")
+    values = tensor.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+    quantiles = torch.quantile(
+        values,
+        torch.tensor([0.5, 0.9, 0.99], dtype=torch.float64),
+    )
+    return {
+        "step_dt_us_min": float(values.min().item()),
+        "step_dt_us_mean": float(values.mean().item()),
+        "step_dt_us_p50": float(quantiles[0].item()),
+        "step_dt_us_p90": float(quantiles[1].item()),
+        "step_dt_us_p99": float(quantiles[2].item()),
+        "step_dt_us_max": float(values.max().item()),
+    }
 
 
 def _require_float_dtype(dtype: torch.dtype, name: str) -> torch.dtype:
@@ -298,6 +342,8 @@ class RolloutConfig:
     num_envs: int = 1
     gamma: float = 0.99
     gae_lambda: float = 0.95
+    discount_mode: str = "step"
+    discount_horizon_us: int = 1_000_000
     deterministic: bool = False
     reset_on_terminal: bool = True
     device: str | torch.device | None = None
@@ -315,6 +361,12 @@ class RolloutConfig:
             self,
             "gae_lambda",
             _require_probability(self.gae_lambda, "gae_lambda"),
+        )
+        object.__setattr__(self, "discount_mode", _coerce_discount_mode(self.discount_mode))
+        object.__setattr__(
+            self,
+            "discount_horizon_us",
+            _require_positive_int(self.discount_horizon_us, "discount_horizon_us"),
         )
         object.__setattr__(
             self,
@@ -345,7 +397,10 @@ class RolloutBatch(NamedTuple):
     entropies: torch.Tensor
     episode_count: int
     decision_rows: torch.Tensor | None = None
-    timing: dict[str, float] | None = None
+    step_dt_us: torch.Tensor | None = None
+    discounts: torch.Tensor | None = None
+    lambda_discounts: torch.Tensor | None = None
+    timing: dict[str, object] | None = None
     sampling_stats: dict[str, object] | None = None
     telemetry: dict[str, object] | None = None
 
@@ -373,6 +428,9 @@ class RolloutBatch(NamedTuple):
 
     def to(self, device: str | torch.device) -> "RolloutBatch":
         decision_rows = self.decision_rows
+        step_dt_us = self.step_dt_us
+        discounts = self.discounts
+        lambda_discounts = self.lambda_discounts
         return RolloutBatch(
             observations=self.observations.to(device),
             actions=self.actions.to(device),
@@ -387,6 +445,9 @@ class RolloutBatch(NamedTuple):
             entropies=self.entropies.to(device),
             episode_count=self.episode_count,
             decision_rows=None if decision_rows is None else decision_rows.to(device),
+            step_dt_us=None if step_dt_us is None else step_dt_us.to(device),
+            discounts=None if discounts is None else discounts.to(device),
+            lambda_discounts=None if lambda_discounts is None else lambda_discounts.to(device),
             timing=None if self.timing is None else dict(self.timing),
             sampling_stats=None if self.sampling_stats is None else dict(self.sampling_stats),
             telemetry=None if self.telemetry is None else dict(self.telemetry),
@@ -401,6 +462,47 @@ def _require_reward_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
     return tensor
 
 
+def compute_discount_factors_from_dt_us(
+    dt_us: torch.Tensor,
+    *,
+    factor_at_horizon: float,
+    horizon_us: int,
+) -> torch.Tensor:
+    if not isinstance(dt_us, torch.Tensor):
+        raise TypeError("dt_us must be a torch.Tensor")
+    horizon_us = _require_positive_int(horizon_us, "horizon_us")
+    factor_at_horizon = _require_probability(factor_at_horizon, "factor_at_horizon")
+    dt = dt_us.to(dtype=torch.float32 if not dt_us.dtype.is_floating_point else dt_us.dtype)
+    if not torch.isfinite(dt).all():
+        raise ValueError("dt_us must contain finite values")
+    if bool((dt < 0).any().cpu().item()):
+        raise ValueError("dt_us must be nonnegative")
+    return torch.pow(
+        torch.as_tensor(factor_at_horizon, dtype=dt.dtype, device=dt.device),
+        dt / float(horizon_us),
+    )
+
+
+def _coerce_discount_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    rewards: torch.Tensor,
+) -> torch.Tensor:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.dtype is torch.bool:
+        raise TypeError(f"{name} must be floating point or numeric")
+    if tensor.shape != rewards.shape:
+        raise ValueError(f"{name} must have the same shape as rewards")
+    out = tensor.to(device=rewards.device, dtype=rewards.dtype)
+    if not torch.isfinite(out).all():
+        raise ValueError(f"{name} must contain finite values")
+    if bool(((out < 0.0) | (out > 1.0)).any().cpu().item()):
+        raise ValueError(f"{name} must contain values in [0, 1]")
+    return out
+
+
 def compute_gae(
     *,
     rewards: torch.Tensor,
@@ -409,6 +511,8 @@ def compute_gae(
     last_value: torch.Tensor | float,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
+    discounts: torch.Tensor | None = None,
+    lambda_discounts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rewards = _require_reward_tensor(rewards, "rewards")
     values = _require_reward_tensor(values, "values")
@@ -425,6 +529,16 @@ def compute_gae(
         raise TypeError("dones must be a bool tensor")
     gamma = _require_probability(gamma, "gamma")
     gae_lambda = _require_probability(gae_lambda, "gae_lambda")
+    discount_tensor = (
+        None
+        if discounts is None
+        else _coerce_discount_tensor(discounts, name="discounts", rewards=rewards)
+    )
+    lambda_discount_tensor = (
+        None
+        if lambda_discounts is None
+        else _coerce_discount_tensor(lambda_discounts, name="lambda_discounts", rewards=rewards)
+    )
 
     advantages = torch.empty_like(rewards)
     last_value_tensor = torch.as_tensor(last_value, dtype=rewards.dtype, device=rewards.device)
@@ -441,8 +555,10 @@ def compute_gae(
     for t in reversed(range(rewards.shape[0])):
         next_value = last_value_tensor if t == rewards.shape[0] - 1 else values[t + 1]
         nonterminal = (~dones[t]).to(dtype=rewards.dtype)
-        delta = rewards[t] + gamma * next_value * nonterminal - values[t]
-        next_gae = delta + gamma * gae_lambda * nonterminal * next_gae
+        discount_t = gamma if discount_tensor is None else discount_tensor[t]
+        lambda_discount_t = gae_lambda if lambda_discount_tensor is None else lambda_discount_tensor[t]
+        delta = rewards[t] + discount_t * next_value * nonterminal - values[t]
+        next_gae = delta + discount_t * lambda_discount_t * nonterminal * next_gae
         advantages[t] = next_gae
 
     returns = advantages + values
@@ -633,6 +749,7 @@ class RolloutCollector:
         rewards = torch.empty((T, N), device=device, dtype=dtype)
         entropies = torch.empty((T, N), device=device, dtype=dtype)
         decision_rows = torch.empty((T, N), device=device, dtype=torch.int64)
+        step_dt_us = torch.empty((T, N), device=device, dtype=torch.int64)
         requested_mode_ids = torch.empty((T, N), dtype=torch.int64)
         effective_mode_ids = torch.empty((T, N), dtype=torch.int64)
 
@@ -686,8 +803,11 @@ class RolloutCollector:
 
             action_cpu = policy_out.action.detach().to("cpu").numpy()
             for env_index, env_action in enumerate(action_cpu):
+                env = self.envs[env_index]
+                current_row = int(self._current_decision_rows[env_index])
+                current_ts = int(env.decision_grid.decision_local_ts_us[current_row])
                 step_started = time.perf_counter()
-                step = self.envs[env_index].step(env_action)
+                step = env.step(env_action)
                 env_step_seconds += time.perf_counter() - step_started
                 mode_id = rollout_telemetry.update_execution_step(step.execution)
                 if aggregate_telemetry is not None:
@@ -699,6 +819,11 @@ class RolloutCollector:
                 split_boundary = False
                 current_range = self._current_ranges[env_index]
                 next_row = int(step.info["next_decision_grid_row_index"])
+                next_ts = int(env.decision_grid.decision_local_ts_us[next_row])
+                dt_us = next_ts - current_ts
+                if dt_us < 0:
+                    raise RuntimeError("decision grid local timestamps must be nondecreasing")
+                step_dt_us[t, env_index] = dt_us
                 if current_range is not None:
                     if next_row >= current_range.end_decision_row:
                         raise RuntimeError("rollout step crossed split boundary")
@@ -727,6 +852,25 @@ class RolloutCollector:
             last_value.copy_(last_values)
             last_value[dones[-1]] = 0.0
 
+        if config.discount_mode == "time":
+            discounts = compute_discount_factors_from_dt_us(
+                step_dt_us,
+                factor_at_horizon=config.gamma,
+                horizon_us=config.discount_horizon_us,
+            ).to(device=device, dtype=dtype)
+            lambda_discounts = compute_discount_factors_from_dt_us(
+                step_dt_us,
+                factor_at_horizon=config.gae_lambda,
+                horizon_us=config.discount_horizon_us,
+            ).to(device=device, dtype=dtype)
+            discounts_for_gae: torch.Tensor | None = discounts
+            lambda_discounts_for_gae: torch.Tensor | None = lambda_discounts
+        else:
+            discounts = torch.full_like(rewards, float(config.gamma))
+            lambda_discounts = torch.full_like(rewards, float(config.gae_lambda))
+            discounts_for_gae = None
+            lambda_discounts_for_gae = None
+
         advantages, returns = compute_gae(
             rewards=rewards,
             values=values,
@@ -734,6 +878,8 @@ class RolloutCollector:
             last_value=last_value,
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
+            discounts=discounts_for_gae,
+            lambda_discounts=lambda_discounts_for_gae,
         )
         for telemetry in telemetry_targets:
             telemetry.update_training_by_effective_quote_mode(
@@ -746,14 +892,19 @@ class RolloutCollector:
 
         rollout_seconds = time.perf_counter() - rollout_started
         total_steps = float(T * N)
-        timing = {
+        timing: dict[str, object] = {
             "rollout_seconds": float(rollout_seconds),
             "policy_forward_seconds": float(policy_forward_seconds),
             "env_step_seconds": float(env_step_seconds),
             "env_steps_per_sec": float(total_steps / env_step_seconds) if env_step_seconds > 0.0 else 0.0,
             "policy_forward_steps_per_sec": float(total_steps / policy_forward_seconds) if policy_forward_seconds > 0.0 else 0.0,
             "total_steps_per_sec": float(total_steps / rollout_seconds) if rollout_seconds > 0.0 else 0.0,
+            "discount_mode": config.discount_mode,
+            "discount_horizon_us": int(config.discount_horizon_us),
         }
+        timing.update(_dt_stats_from_tensor(step_dt_us))
+        timing.update(_stats_from_tensor("discount", discounts))
+        timing.update(_stats_from_tensor("lambda_discount", lambda_discounts))
         sampling_stats = (
             self._train_window_sampler.stats_since(sample_stat_start)
             if self._train_window_sampler is not None
@@ -774,6 +925,9 @@ class RolloutCollector:
             entropies=entropies,
             episode_count=self.episode_count - episode_count_start,
             decision_rows=decision_rows,
+            step_dt_us=step_dt_us,
+            discounts=discounts,
+            lambda_discounts=lambda_discounts,
             timing=timing,
             sampling_stats=sampling_stats,
             telemetry=rollout_telemetry.as_dict(),
