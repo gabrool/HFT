@@ -32,6 +32,7 @@ def _label_config(queue_mode: str = "conservative") -> dict[str, object]:
         "trade_at_level_weight": 0.5,
         "dedupe_l2_decrease_with_trade_prints": True,
         "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "qty_epsilon": 1e-12,
         "order_entry_latency_us": 500,
         "decision_compute_latency_us": 50,
         "post_only_gap_ticks": 1,
@@ -168,6 +169,28 @@ def test_load_adverse_selection_signals_rejects_missing_base_arrays(tmp_path):
     path = tmp_path / "bad_signals.npz"
     np.savez(path, schema=np.array(ADVERSE_SELECTION_SIGNALS_SCHEMA))
     with pytest.raises(ValueError, match="missing required arrays"):
+        load_adverse_selection_signals(path)
+
+
+def test_load_adverse_selection_signals_rejects_missing_qty_epsilon(tmp_path):
+    path = tmp_path / "bad_label_config.npz"
+    label_config = _label_config()
+    label_config.pop("qty_epsilon")
+    np.savez(
+        path,
+        schema=np.array(ADVERSE_SELECTION_SIGNALS_SCHEMA),
+        decision_local_ts_us=np.array([100], dtype=np.int64),
+        decision_event_index=np.array([0], dtype=np.int64),
+        decision_event_seq=np.array([0], dtype=np.int64),
+        target_names=np.asarray(["bid_touch_filled"], dtype=object),
+        pred_bid_touch_filled=np.array([0.5], dtype=np.float32),
+        adverse_label_config=np.array(label_config, dtype=object),
+        decision_grid_schema=np.array(_grid_kwargs()["decision_grid_schema"]),
+        decision_grid_hash=np.array(_grid_kwargs()["decision_grid_hash"]),
+        decision_grid_n_rows=np.array(1, dtype=np.int64),
+        decision_schedule=np.array(_grid_kwargs()["decision_schedule"], dtype=object),
+    )
+    with pytest.raises(ValueError, match="adverse_label_config missing required keys"):
         load_adverse_selection_signals(path)
 
 from mmrt.execution.adverse_selection import AdverseSelectionConfig, AdverseSelectionFeatureDataset

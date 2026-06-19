@@ -72,13 +72,14 @@ def test_adverse_runtime_config_inherits_post_only_gap_from_ppo_config():
     assert env_config.adverse_runtime_config.executable_edge.maker_fee_bps == env_config.fill_simulator_config.maker_fee_bps
 
 
-def _adverse_label_config(queue_mode: str) -> dict[str, object]:
+def _adverse_label_config(queue_mode: str, *, qty_epsilon: float = 1e-12) -> dict[str, object]:
     return {
         "queue_mode": queue_mode,
         "l2_decrease_weight": 0.25,
         "trade_at_level_weight": 0.5,
         "dedupe_l2_decrease_with_trade_prints": True,
         "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "qty_epsilon": qty_epsilon,
         "order_entry_latency_us": 500,
         "decision_compute_latency_us": 50,
         "post_only_gap_ticks": 1,
@@ -88,7 +89,7 @@ def _adverse_label_config(queue_mode: str) -> dict[str, object]:
     }
 
 
-def _adverse_signals(queue_mode: str) -> AdverseSelectionSignalArtifact:
+def _adverse_signals(queue_mode: str, *, qty_epsilon: float = 1e-12) -> AdverseSelectionSignalArtifact:
     return AdverseSelectionSignalArtifact(
         schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
         decision_local_ts_us=np.array([100], dtype=np.int64),
@@ -96,7 +97,7 @@ def _adverse_signals(queue_mode: str) -> AdverseSelectionSignalArtifact:
         decision_event_seq=np.array([0], dtype=np.int64),
         target_names=("bid_touch_filled",),
         predictions={"bid_touch_filled": np.array([0.5], dtype=np.float32)},
-        adverse_label_config=_adverse_label_config(queue_mode),
+        adverse_label_config=_adverse_label_config(queue_mode, qty_epsilon=qty_epsilon),
         **grid_lineage_fields(n_rows=1),
     )
 
@@ -132,6 +133,31 @@ def test_ppo_accepts_balanced_adverse_signals_for_balanced_env():
     )
     assert result is not None
     assert result["status"] == "match"
+
+
+def test_ppo_rejects_qty_epsilon_mismatch_unless_explicitly_allowed():
+    config = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
+        queue_mode="balanced",
+    )
+    env_config = _build_env_config(config)
+    signals = _adverse_signals("balanced", qty_epsilon=1e-9)
+    with pytest.raises(ValueError, match="adverse signal queue config mismatch"):
+        _adverse_queue_config_compatibility(
+            signals,
+            env_config=env_config,
+            allow_mismatch=False,
+        )
+    allowed = _adverse_queue_config_compatibility(
+        signals,
+        env_config=env_config,
+        allow_mismatch=True,
+    )
+    assert allowed is not None
+    assert allowed["status"] == "mismatch_allowed"
+    assert "qty_epsilon" in allowed["mismatches"]
 
 
 def test_parser_requires_current_split_source_and_maker_fee():

@@ -392,6 +392,7 @@ def adverse_selection_config_from_training_summary(payload: Mapping[str, object]
                     trade_at_level_weight=float(_required(payload, "trade_at_level_weight")),
                     unknown_level_queue_ahead_qty=float(_required(payload, "unknown_level_queue_ahead_qty")),
                     dedupe_l2_decrease_with_trade_prints=bool(_required(payload, "dedupe_l2_decrease_with_trade_prints")),
+                    qty_epsilon=float(payload.get("qty_epsilon", 1e-12)),
                 ),
             ),
         )
@@ -2843,6 +2844,7 @@ def _adverse_config_summary(config: AdverseSelectionConfig) -> dict[str, object]
         "trade_at_level_weight": config.quote.queue_model.trade_at_level_weight,
         "unknown_level_queue_ahead_qty": config.quote.queue_model.unknown_level_queue_ahead_qty,
         "dedupe_l2_decrease_with_trade_prints": config.quote.queue_model.dedupe_l2_decrease_with_trade_prints,
+        "qty_epsilon": config.quote.queue_model.qty_epsilon,
     }
 
 
@@ -2855,6 +2857,7 @@ def adverse_label_config_from_config(config: AdverseSelectionConfig) -> dict[str
         "trade_at_level_weight": config.quote.queue_model.trade_at_level_weight,
         "dedupe_l2_decrease_with_trade_prints": config.quote.queue_model.dedupe_l2_decrease_with_trade_prints,
         "unknown_level_queue_ahead_qty": config.quote.queue_model.unknown_level_queue_ahead_qty,
+        "qty_epsilon": config.quote.queue_model.qty_epsilon,
         "order_entry_latency_us": config.quote.latency_config.order_entry_latency_us,
         "decision_compute_latency_us": config.quote.latency_config.decision_compute_latency_us,
         "post_only_gap_ticks": config.quote.post_only_gap_ticks,
@@ -3209,6 +3212,7 @@ def profile_adverse_selection_label_generation(
     emitted = 0
     label_seconds = 0.0
     compile_seconds = 0.0
+    warmed_label_rows = 0
     first_batch = True
     label_start = time.perf_counter()
     last_progress_considered = 0
@@ -3230,9 +3234,10 @@ def profile_adverse_selection_label_generation(
         last_progress_considered = considered
 
     def process_batch() -> None:
-        nonlocal batch_used, emitted, label_seconds, compile_seconds, first_batch, backend_used
+        nonlocal batch_used, emitted, label_seconds, compile_seconds, warmed_label_rows, first_batch, backend_used
         if batch_used == 0:
             return
+        rows_in_batch = batch_used
         start = time.perf_counter()
         if conservative_fill_index is not None:
             _, _, keep_rows, backend = _labels_for_decision_batch_conservative(
@@ -3286,6 +3291,7 @@ def profile_adverse_selection_label_generation(
             compile_seconds = elapsed
         else:
             label_seconds += elapsed
+            warmed_label_rows += rows_in_batch
         first_batch = False
         emitted += int(np.count_nonzero(keep_rows))
         batch_used = 0
@@ -3312,11 +3318,17 @@ def profile_adverse_selection_label_generation(
     log_progress(force=True)
     total_seconds = time.perf_counter() - total_start
     label_wall_seconds = max(time.perf_counter() - label_start, _EPS)
-    rows_per_second = considered / label_wall_seconds
+    label_loop_rows_per_second = considered / label_wall_seconds
+    warmed_label_rows_per_second = (
+        warmed_label_rows / label_seconds if warmed_label_rows > 0 and label_seconds > 0.0 else None
+    )
     candidate_count = len(config.quote.quote_candidates) * 2
     production_note = None
     if config.quote.queue_model.mode == QueueModelMode.BALANCED and backend_used == _BACKEND_BALANCED_SCALAR:
         production_note = "balanced_scalar is a fallback backend; use balanced_numba before full grid production"
+    estimated_33m_label_loop_seconds = (
+        33_000_000.0 / label_loop_rows_per_second if label_loop_rows_per_second > 0.0 else math.inf
+    )
     return {
         "status": "ok",
         "run_type": "profile_adverse_selection_label_generation",
@@ -3329,12 +3341,15 @@ def profile_adverse_selection_label_generation(
         "chunk_rows": int(chunk_rows),
         "label_engine": label_engine,
         "backend": backend_used,
-        "rows_per_sec": rows_per_second,
+        "label_loop_rows_per_sec": label_loop_rows_per_second,
+        "rows_per_sec": label_loop_rows_per_second,
+        "warmed_label_rows_per_sec": warmed_label_rows_per_second,
         "label_seconds": label_seconds,
         "compile_seconds": compile_seconds,
         "index_seconds": index_seconds,
         "fill_index_seconds": fill_index_seconds,
-        "estimated_33m_label_seconds": 33_000_000.0 / rows_per_second if rows_per_second > 0.0 else math.inf,
+        "estimated_33m_label_loop_seconds": estimated_33m_label_loop_seconds,
+        "estimated_33m_label_seconds": estimated_33m_label_loop_seconds,
         "production_note": production_note,
         "timing": {
             "total_seconds": total_seconds,
@@ -3343,7 +3358,10 @@ def profile_adverse_selection_label_generation(
             "compile_seconds": compile_seconds,
             "label_seconds": label_seconds,
             "label_wall_seconds": label_wall_seconds,
-            "rows_per_second": rows_per_second,
+            "label_loop_rows_per_second": label_loop_rows_per_second,
+            "rows_per_second": label_loop_rows_per_second,
+            "warmed_label_rows_per_second": warmed_label_rows_per_second,
+            "warmed_label_rows": int(warmed_label_rows),
         },
     }
 

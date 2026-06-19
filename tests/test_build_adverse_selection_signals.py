@@ -85,6 +85,7 @@ def test_build_adverse_selection_signals_end_to_end(tmp_path):
     assert signals.decision_event_seq.shape == signals.decision_local_ts_us.shape
     assert set(signals.target_names) == set(model.target_names)
     assert signals.adverse_label_config["queue_mode"] == "conservative"
+    assert signals.adverse_label_config["qty_epsilon"] == pytest.approx(1e-12)
     assert loaded_summary["adverse_label_config"] == signals.adverse_label_config
     assert loaded_summary["signals"]["adverse_label_config"] == signals.adverse_label_config
     assert loaded_summary["fill_simulator"] == signals.adverse_label_config

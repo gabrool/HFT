@@ -1405,6 +1405,7 @@ def _aligned_adverse_signals(linear: LinearSignalArtifact, candidate_names=("tou
             "trade_at_level_weight": 1.0,
             "dedupe_l2_decrease_with_trade_prints": True,
             "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+            "qty_epsilon": 1e-12,
             "order_entry_latency_us": 500,
             "decision_compute_latency_us": 50,
             "post_only_gap_ticks": 1,
