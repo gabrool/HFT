@@ -267,6 +267,7 @@ def test_disabled_audit_runs_and_warns_no_fills(tmp_path):
     assert summary["horizon_diagnostics"]["horizons_us"] == [250_000, 500_000, 1_000_000]
     assert summary["metrics"]["steps"]["count"] >= 1
     assert summary["metrics"]["fills"]["count"] == 0
+    assert summary["queue_mode_comparison"]["reward"] == summary["metrics"]["rewards"]
     assert "no_fills_observed" in summary["diagnostics"]["warnings"]
 
 
@@ -309,6 +310,7 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
     assert metrics["fills"]["reason_counts"][FillReason.TRADE_THROUGH.value] == 1
     assert metrics["position"]["final_inventory_qty"] == pytest.approx(1.0)
     assert metrics["rewards"]["total_raw"] == pytest.approx(0.005005)
+    assert summary["queue_mode_comparison"]["reward"]["total_raw"] == metrics["rewards"]["total_raw"]
     assert "fill_markouts" in summary["horizon_diagnostics"]
 
 

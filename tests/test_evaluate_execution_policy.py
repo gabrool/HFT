@@ -506,14 +506,18 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["evaluation"]["steps"] > 0
     assert summary["evaluation"]["steps"] <= 4
     assert summary["evaluation"]["metrics"]["steps"]["count"] == summary["evaluation"]["steps"]
-    assert summary["evaluation"]["telemetry"]["sample_count"] == summary["evaluation"]["steps"]
-    assert summary["policy_action_telemetry"] == summary["evaluation"]["telemetry"]
+    assert "telemetry" not in summary["evaluation"]
+    assert summary["policy_action_telemetry"]["sample_count"] == summary["evaluation"]["steps"]
     assert summary["compact_summary"]["run_type"] == "evaluate_execution_policy"
     assert summary["horizon_diagnostics"]["enabled"] is True
     assert summary["horizon_diagnostics"]["horizons_us"] == [250_000, 500_000, 1_000_000]
     assert "decision_level" in summary["horizon_diagnostics"]
     assert "fill_markouts" in summary["horizon_diagnostics"]
     assert "signal_alignment" in summary["horizon_diagnostics"]
+    assert "evaluated_decision_row_ranges" not in summary
+    assert "evaluated_decision_row_ranges" not in summary["evaluation"]["config"]
+    assert "decision_row_ranges" not in summary["evaluation"]["config"]
+    assert summary["evaluated_decision_row_range_count"] >= 0
     assert "ranges_by_split" not in summary["split_contract"]
     assert "ranges_by_split" not in summary["split_lineage"]
     assert "field_names" not in summary["observation_schema"]
@@ -525,6 +529,28 @@ def test_run_execution_policy_evaluation_from_checkpoint(tmp_path):
     assert summary["linear_signals"]["n_rows"] >= 1
     assert summary["linear_signals"]["fields"] == train_summary["linear_signals"]["fields"]
     assert summary["observation_schema"] == train_summary["observation_schema"]
+
+    debug_json = tmp_path / "eval_debug.json"
+    debug_summary = run_execution_policy_evaluation(
+        ExecutionPolicyEvaluationCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            checkpoint_path=str(tmp_path / "checkpoint.pt"),
+            split_source_dataset_root=str(_split_source_root(tape_root)),
+            eval_split="val",
+            output_json=str(tmp_path / "eval_summary_with_debug.json"),
+            debug_output_json=str(debug_json),
+            overwrite=True,
+            max_steps=4,
+        )
+    )
+    assert debug_summary["debug_output_json"] == str(debug_json)
+    debug_payload = json.loads(debug_json.read_text())
+    assert "evaluated_decision_row_ranges" in debug_payload["evaluation"]["config"]
+    assert debug_payload["evaluation"]["config"]["evaluated_decision_row_ranges"]
+    assert "ranges_by_split" in debug_payload["split_lineage"]
+    assert "field_names" in debug_payload["observation_schema"]
+    assert debug_payload["evaluation"]["telemetry"] == debug_payload["policy_action_telemetry"]
 
 
 def test_evaluate_execution_policy_requires_linear_signals_file(tmp_path):
@@ -707,7 +733,8 @@ def test_evaluate_execution_policy_runs_explicit_test_split(tmp_path):
     assert summary["env_config_source"] == "checkpoint_cli_config"
     assert summary["eval_split"] == "test"
     assert summary["split_lineage"]["eval_split"] == "test"
-    assert all(entry["role"] == "test" for entry in summary["evaluated_decision_row_ranges"])
+    assert "evaluated_decision_row_ranges" not in summary
+    assert summary["evaluated_decision_row_range_count"] >= 0
     assert summary["evaluation"]["steps"] > 0
 
 

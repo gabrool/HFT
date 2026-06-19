@@ -364,7 +364,7 @@ def run_execution_sim_audit(config: ExecutionSimAuditConfig) -> dict[str, object
     queue_metrics = metrics.get("queue", {})
     fill_metrics = metrics.get("fills", {})
     turnover_metrics = metrics.get("turnover", {})
-    reward_metrics = metrics.get("reward", {})
+    reward_metrics = metrics.get("rewards", {})
     output_path_str = str(output_path)
     horizon_payload = (
         horizon_accumulator.as_dict(include_records=False)

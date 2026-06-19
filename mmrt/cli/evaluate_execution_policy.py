@@ -932,8 +932,9 @@ def run_execution_policy_evaluation(
     evaluation_payload_primary["config"] = {
         key: value
         for key, value in dict(evaluation_config).items()
-        if key != "decision_row_ranges"
+        if key not in ("decision_row_ranges", "evaluated_decision_row_ranges")
     }
+    evaluation_payload_primary.pop("telemetry", None)
     debug_output_path = Path(config.debug_output_json) if config.debug_output_json is not None else None
     summary = {
         "status": result.status,
@@ -1004,7 +1005,7 @@ def run_execution_policy_evaluation(
         "eval_requested_row_count": evaluation_config["eval_requested_row_count"],  # type: ignore[index]
         "eval_covered_row_count": evaluation_config["eval_covered_row_count"],  # type: ignore[index]
         "eval_coverage_fraction": evaluation_config["eval_coverage_fraction"],  # type: ignore[index]
-        "evaluated_decision_row_ranges": evaluated_ranges,
+        "evaluated_decision_row_range_count": len(evaluated_ranges),
         "episode_count": evaluation_config["episode_count"],  # type: ignore[index]
         "truncation_counts": evaluation_config["truncation_counts"],  # type: ignore[index]
         "evaluated_start_decision_row": evaluation_config["evaluated_start_decision_row"],  # type: ignore[index]
