@@ -72,6 +72,9 @@ def test_adverse_and_edge_feature_maps():
     )
     assert edge["edge_bid_touch_valid"] == 1.0
     assert "edge_bid_touch_attempt_bps" in edge
+    assert "edge_bid_touch_allowed" in edge
+    assert "edge_bid_touch_valid" in edge
+    assert "edge_bid_touch_cond_fill_bps" not in edge
 
 
 def test_missing_edge_targets_raises():
@@ -145,3 +148,9 @@ def test_edge_candidate_validity_respects_runtime_post_only_gap():
     )
     assert gap2["edge_bid_inside_1_valid"] == 0.0
     assert gap2["edge_ask_inside_1_valid"] == 0.0
+    assert gap2["edge_bid_inside_1_attempt_bps"] == 0.0
+    assert gap2["edge_ask_inside_1_attempt_bps"] == 0.0
+    assert gap2["edge_bid_inside_1_allowed"] == 0.0
+    assert gap2["edge_ask_inside_1_allowed"] == 0.0
+    assert "edge_bid_inside_1_cond_fill_bps" not in gap2
+    assert "edge_ask_inside_1_cond_fill_bps" not in gap2

@@ -10,6 +10,7 @@ from mmrt.execution.contracts import ActionSpec, LatencyConfig, PositionState, Q
 from mmrt.execution.env import ExecutionEnvConfig
 from mmrt.execution.executable_edge import ExecutableEdgeConfig
 from mmrt.execution.fill_sim import FillSimulatorConfig
+from mmrt.execution.obs_builder import ObservationBuilderConfig
 from mmrt.execution.queue_model import QueueModelConfig
 from mmrt.execution.quote_geometry import QuoteGeometryConfig
 from mmrt.execution.reward import RewardConfig
@@ -200,6 +201,9 @@ def build_execution_env_config_from_input(params: ExecutionEnvConfigBuildInput) 
             drawdown_penalty_rate=params.drawdown_penalty_rate,
             terminal_inventory_penalty_bps=params.terminal_inventory_penalty_bps,
             reward_scale=params.reward_scale,
+        ),
+        observation_builder_config=ObservationBuilderConfig(
+            inventory_qty_reference=params.max_order_qty,
         ),
         initial_position=PositionState(),
         max_episode_steps=params.max_episode_steps,

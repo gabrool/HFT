@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,7 @@ from mmrt.cli.execution_defaults import (
     DEFAULT_CANCEL_LATENCY_US,
     DEFAULT_DECISION_COMPUTE_LATENCY_US,
     DEFAULT_DEFAULT_ORDER_QTY,
+    DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS,
     DEFAULT_L2_DECREASE_WEIGHT,
     DEFAULT_MAKER_FEE_BPS,
     DEFAULT_MAX_DISTANCE_TICKS,
@@ -28,9 +30,19 @@ from mmrt.cli.execution_defaults import (
     DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
 )
 from mmrt.cli.train_execution_ppo import ExecutionPPOTrainCLIConfig, run_execution_ppo_training
+from mmrt.execution.adverse_signal import (
+    ADVERSE_SELECTION_SIGNALS_FILENAME,
+    ADVERSE_SELECTION_SIGNALS_SCHEMA,
+    AdverseSelectionSignalArtifact,
+    save_adverse_selection_signals,
+)
 from mmrt.execution.contracts import QueueModelMode
-from mmrt.execution.linear_signal import LINEAR_SIGNALS_FILENAME
-from mmrt.execution.obs_schema import CONTROL_FIELDS, default_observation_schema
+from mmrt.execution.linear_signal import LINEAR_SIGNALS_FILENAME, load_linear_signal_artifact_npz
+from mmrt.execution.obs_schema import (
+    CONTROL_FIELDS,
+    DEFAULT_ADVERSE_CANDIDATE_NAMES,
+    default_observation_schema,
+)
 from tests.test_ppo_tiny_env import _tiny_tape_root
 
 
@@ -95,6 +107,52 @@ def _tiny_checkpoint(tmp_path):
     return tape_root, checkpoint_path
 
 
+def _save_matching_adverse_signals(tape_root: Path) -> Path:
+    linear = load_linear_signal_artifact_npz(tape_root / LINEAR_SIGNALS_FILENAME)
+    target_names: list[str] = []
+    predictions: dict[str, object] = {}
+    for candidate in DEFAULT_ADVERSE_CANDIDATE_NAMES:
+        for side in ("bid", "ask"):
+            fill_name = f"{side}_{candidate}_filled"
+            cost_name = f"{side}_{candidate}_toxic_cost_bps"
+            target_names.extend((fill_name, cost_name))
+            predictions[fill_name] = [0.5] * linear.n_rows
+            predictions[cost_name] = [0.0] * linear.n_rows
+
+    path = tape_root / ADVERSE_SELECTION_SIGNALS_FILENAME
+    save_adverse_selection_signals(
+        path,
+        AdverseSelectionSignalArtifact(
+            schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
+            decision_local_ts_us=linear.decision_local_ts_us.copy(),
+            decision_event_index=linear.decision_event_index.copy(),
+            decision_event_seq=linear.decision_event_seq.copy(),
+            target_names=tuple(target_names),
+            predictions=predictions,
+            adverse_label_config={
+                "queue_mode": "balanced",
+                "l2_decrease_weight": DEFAULT_L2_DECREASE_WEIGHT,
+                "trade_at_level_weight": DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+                "dedupe_l2_decrease_with_trade_prints": DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS,
+                "unknown_level_queue_ahead_qty": DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
+                "qty_epsilon": DEFAULT_QTY_EPSILON,
+                "order_entry_latency_us": DEFAULT_ORDER_ENTRY_LATENCY_US,
+                "decision_compute_latency_us": DEFAULT_DECISION_COMPUTE_LATENCY_US,
+                "post_only_gap_ticks": DEFAULT_POST_ONLY_GAP_TICKS,
+                "order_qty": DEFAULT_DEFAULT_ORDER_QTY,
+                "fill_horizon_us": 1_000_000,
+                "adverse_horizon_us": 1_000_000,
+            },
+            decision_grid_schema=linear.metadata.decision_grid_schema,
+            decision_grid_hash=linear.metadata.decision_grid_hash,
+            decision_grid_n_rows=linear.metadata.decision_grid_n_rows,
+            decision_schedule=linear.metadata.decision_schedule,
+        ),
+        overwrite=True,
+    )
+    return path
+
+
 def test_parser_accepts_required_args_and_sample_policies(tmp_path):
     parser = build_arg_parser()
     for policy in SAMPLE_POLICIES:
@@ -124,9 +182,39 @@ def test_tiny_env_profile_writes_json_with_sample_fit_stats_and_control_fields(t
     assert "group_summary" in payload
     names = {item["name"] for item in payload["field_stats"]}
     assert set(CONTROL_FIELDS).issubset(names)
+    assert "inventory_order_units" in names
+    assert "inventory_notional_bps" not in names
+    assert not any(name.endswith("_cond_fill_bps") for name in names)
     for item in payload["field_stats"]:
         assert "raw" in item
         assert "normalized" in item
+
+
+def test_tiny_env_profile_with_adverse_edge_has_pruned_field_set(tmp_path):
+    config = _profile_config(
+        tmp_path,
+        adverse_signals_npz=str(tmp_path / "execution_tape" / ADVERSE_SELECTION_SIGNALS_FILENAME),
+    )
+    _save_matching_adverse_signals(Path(config.tape_root))
+
+    summary = run_execution_observation_profile(config)
+    names = {item["name"] for item in summary["field_stats"]}
+
+    assert summary["observation_schema"]["field_count"] == 109
+    assert len(summary["field_stats"]) == 109
+    assert summary["compact_summary"]["raw_nonfinite_count"] == 0
+    assert summary["compact_summary"]["normalized_nonfinite_count"] == 0
+    assert "inventory_order_units" in names
+    assert "inventory_notional_bps" not in names
+    assert not any(name.endswith("_cond_fill_bps") for name in names)
+    assert not any(
+        item.startswith("inventory_notional_bps=") or "_cond_fill_bps=" in item
+        for item in summary["compact_summary"]["top_raw_magnitude_fields"]
+    )
+    assert not any(
+        item.startswith("inventory_notional_bps[")
+        for item in summary["compact_summary"]["top_warning_fields"]
+    )
 
 
 def test_no_checkpoint_env_defaults_are_colocated_balanced(tmp_path):

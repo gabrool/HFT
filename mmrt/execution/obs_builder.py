@@ -60,12 +60,16 @@ class ObservationContext:
 
 @dataclass(frozen=True, slots=True)
 class ObservationBuilderConfig:
-    equity_epsilon: float = 1e-9
+    inventory_qty_reference: float = 0.003
     size_epsilon: float = 1e-12
     max_abs_observation: float | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "equity_epsilon", _require_positive_float(self.equity_epsilon, "equity_epsilon"))
+        object.__setattr__(
+            self,
+            "inventory_qty_reference",
+            _require_positive_float(self.inventory_qty_reference, "inventory_qty_reference"),
+        )
         object.__setattr__(self, "size_epsilon", _require_positive_float(self.size_epsilon, "size_epsilon"))
         if self.max_abs_observation is not None:
             object.__setattr__(
@@ -202,11 +206,11 @@ class ObservationBuilder:
         inventory_notional = position.inventory_qty * mid_price * symbol_spec.contract_size
         inventory_abs_notional = abs(inventory_notional)
         equity = position.mark_to_market(mid_price, symbol_spec.contract_size)
-        inventory_notional_bps = inventory_notional / max(abs(equity), config.equity_epsilon) * 10_000.0
+        inventory_order_units = position.inventory_qty / max(config.inventory_qty_reference, config.size_epsilon)
         set_field("cash", position.cash)
         set_field("inventory_qty", position.inventory_qty)
         set_field("inventory_notional", inventory_notional)
-        set_field("inventory_notional_bps", inventory_notional_bps)
+        set_field("inventory_order_units", inventory_order_units)
         set_field("equity", equity)
         set_field("inventory_abs_notional", inventory_abs_notional)
         set_field("fees_paid", position.fees_paid)

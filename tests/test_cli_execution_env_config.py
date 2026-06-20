@@ -19,6 +19,15 @@ def test_shared_env_config_builder_matches_quote_gap_and_fee():
     assert cfg.adverse_runtime_config.post_only_gap_ticks == 2
     assert cfg.fill_simulator_config.maker_fee_bps == -0.25
     assert cfg.adverse_runtime_config.executable_edge.maker_fee_bps == -0.25
+    assert cfg.observation_builder_config.inventory_qty_reference == cfg.action_spec.max_order_qty
+
+
+def test_shared_env_config_builder_inventory_reference_tracks_max_order_qty():
+    cfg = build_execution_env_config_from_input(
+        ExecutionEnvConfigBuildInput(max_order_qty=0.005)
+    )
+    assert cfg.action_spec.max_order_qty == 0.005
+    assert cfg.observation_builder_config.inventory_qty_reference == 0.005
 
 
 def test_shared_env_config_builder_rejects_queue_weights_above_one():

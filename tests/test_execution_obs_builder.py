@@ -17,6 +17,7 @@ from mmrt.execution.contracts import (
 from mmrt.execution.linear_signal import build_gated_linear_signal
 from mmrt.execution.obs_schema import (
     DEFAULT_OBSERVATION_FIELDS,
+    DEFAULT_ADVERSE_CANDIDATE_NAMES,
     CONTROL_GROUP,
     CONTROL_FIELDS,
     MARKET_FIELDS,
@@ -27,6 +28,9 @@ from mmrt.execution.obs_schema import (
     TIME_FIELDS,
     ObservationSchema,
     default_observation_schema,
+    executable_edge_fields,
+    execution_observation_schema,
+    is_removed_observation_field,
     observation_field_groups,
     validate_observation_vector,
 )
@@ -143,6 +147,8 @@ def test_default_schema_fields_and_groups():
     assert not schema.has_field("linear_" + "mag_down_bps")
     retired_inventory_pnl_name = "_".join(("unrealized", "inventory", "pnl"))
     assert schema.has_field("inventory_abs_notional")
+    assert schema.has_field("inventory_order_units")
+    assert not schema.has_field("inventory_notional_bps")
     assert not schema.has_field(retired_inventory_pnl_name)
     assert not schema.has_field("missing")
 
@@ -168,6 +174,16 @@ def test_observation_schema_validation():
 
     with pytest.raises(ValueError):
         ObservationSchema(dtype="int64")
+
+    with pytest.raises(ValueError, match="inventory_notional_bps was removed"):
+        ObservationSchema(field_names=("cash", "inventory_notional_bps"))
+
+    with pytest.raises(ValueError, match="conditional-fill edge is numerically unstable"):
+        ObservationSchema(field_names=("edge_bid_touch_cond_fill_bps",))
+
+    assert is_removed_observation_field("inventory_notional_bps")
+    assert is_removed_observation_field("edge_ask_inside_1_cond_fill_bps")
+    assert not is_removed_observation_field("edge_ask_inside_1_attempt_bps")
 
 
 def test_observation_schema_round_trip_dict():
@@ -306,9 +322,52 @@ def test_build_observation_position_fields():
     assert obs[schema.index("cash")] == pytest.approx(10.0)
     assert obs[schema.index("inventory_qty")] == pytest.approx(-2.0)
     assert obs[schema.index("inventory_notional")] == pytest.approx(inventory_notional)
+    assert obs[schema.index("inventory_order_units")] == pytest.approx(-2.0 / 0.003)
     assert obs[schema.index("equity")] == pytest.approx(equity)
     assert obs[schema.index("inventory_abs_notional")] == pytest.approx(abs(inventory_notional))
     assert obs[schema.index("fees_paid")] == pytest.approx(0.25)
+
+
+def test_inventory_order_units_uses_configured_reference_qty():
+    schema = default_observation_schema()
+    builder = ObservationBuilder(
+        schema=schema,
+        config=ObservationBuilderConfig(inventory_qty_reference=0.003),
+    )
+    obs = builder.build(
+        ObservationInput(
+            symbol_spec=_spec(),
+            book_top=_top(),
+            bid_depth=1,
+            ask_depth=1,
+            linear_signal=_signal(),
+            position=PositionState(inventory_qty=0.006),
+        )
+    )
+
+    assert obs[schema.index("inventory_order_units")] == pytest.approx(2.0)
+
+
+def test_near_zero_equity_does_not_create_inventory_bps_observation():
+    schema = default_observation_schema()
+    position = PositionState(cash=-0.6006, inventory_qty=0.006)
+
+    obs = build_observation(
+        ObservationInput(
+            symbol_spec=_spec(),
+            book_top=_top(),
+            bid_depth=1,
+            ask_depth=1,
+            linear_signal=_signal(),
+            position=position,
+        ),
+        schema=schema,
+    )
+
+    assert "inventory_notional_bps" not in schema.field_names
+    assert np.isfinite(obs).all()
+    assert abs(obs[schema.index("equity")]) < 1e-9
+    assert obs[schema.index("inventory_order_units")] == pytest.approx(2.0)
 
 
 def test_build_observation_live_order_fields():
@@ -556,8 +615,8 @@ def test_invalid_observation_inputs_rejected():
             episode_start_local_ts_us=2_000_000,
         )
 
-    with pytest.raises(ValueError):
-        ObservationBuilderConfig(equity_epsilon=0.0)
+    with pytest.raises(ValueError, match="inventory_qty_reference"):
+        ObservationBuilderConfig(inventory_qty_reference=0.0)
 
     with pytest.raises(ValueError):
         ObservationBuilderConfig(max_abs_observation=-1.0)
@@ -577,14 +636,23 @@ def test_obs_modules_have_no_forbidden_imports():
         assert "mmrt.storage" not in source
         assert "mmrt.rl" not in source
 
-from mmrt.execution.obs_schema import execution_observation_schema
-
-
 def test_execution_observation_schema_includes_adverse_and_edge_fields():
     schema = execution_observation_schema(include_adverse_selection=True, include_executable_edge=True)
     assert len(default_observation_schema().field_names) == len(DEFAULT_OBSERVATION_FIELDS)
+    assert schema.dim == 109
     assert schema.has_field("adverse_bid_touch_fill_prob")
     assert schema.has_field("edge_bid_touch_attempt_bps")
+    assert not any(name.endswith("_cond_fill_bps") for name in schema.field_names)
+
+    edge_fields = executable_edge_fields()
+    assert not any(name.endswith("_cond_fill_bps") for name in edge_fields)
+    for candidate in DEFAULT_ADVERSE_CANDIDATE_NAMES:
+        for side in ("bid", "ask"):
+            prefix = f"edge_{side}_{candidate}"
+            assert f"{prefix}_attempt_bps" in edge_fields
+            assert f"{prefix}_allowed" in edge_fields
+            assert f"{prefix}_valid" in edge_fields
+            assert f"{prefix}_cond_fill_bps" not in edge_fields
 
 
 def test_observation_builder_fills_adverse_and_edge_feature_maps():
