@@ -163,6 +163,35 @@ def test_parser_accepts_required_args_and_sample_policies(tmp_path):
         assert config.sample_policy == policy
 
 
+def test_parser_accepts_alpha_actionability_markout_args(tmp_path):
+    parser = build_arg_parser()
+    config = _config_from_args(
+        parser.parse_args(
+            [
+                *_required_args(tmp_path),
+                "--alpha-actionability-decision-horizon-us",
+                "250000",
+                "--alpha-actionability-fill-plus-horizon-us",
+                "500000",
+                "--alpha-actionability-correctness-deadband-bps",
+                "0.25",
+            ]
+        )
+    )
+
+    assert config.alpha_actionability_decision_horizon_us == 250_000
+    assert config.alpha_actionability_fill_plus_horizon_us == 500_000
+    assert config.alpha_actionability_correctness_deadband_bps == pytest.approx(0.25)
+
+    for flag, value in (
+        ("--alpha-actionability-decision-horizon-us", "0"),
+        ("--alpha-actionability-fill-plus-horizon-us", "-1"),
+        ("--alpha-actionability-correctness-deadband-bps", "nan"),
+    ):
+        with pytest.raises(ValueError):
+            _config_from_args(parser.parse_args([*_required_args(tmp_path), flag, value]))
+
+
 def test_checkpoint_policies_reject_missing_checkpoint(tmp_path):
     parser = build_arg_parser()
     args = parser.parse_args([*_required_args(tmp_path), "--sample-policy", "checkpoint_stochastic"])
